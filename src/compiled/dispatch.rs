@@ -70,7 +70,7 @@ pub struct KernelStats {
 }
 
 /// Take (and reset) the kernels' counters; the mix diagnostic's slice
-/// counts are written first (`CELESTE_KERNEL_MIX`).
+/// counts are written first (`--kernel-mix`).
 pub fn take_kernel_stats() -> KernelStats {
     fold_hits();
     super::mix::write_calls();

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Aggregate a CELESTE_KERNEL_MIX directory (src/compiled/mix.rs) into the
+"""Aggregate a --kernel-mix directory (src/compiled/mix.rs) into the
 static and dynamic instruction mix of the kernels (plans/kernel-mix.md).
 
   tools/kernel_mix.py DIR                 # static + dynamic (slices x static)

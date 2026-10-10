@@ -1,6 +1,6 @@
 //! LEVEL -1 (plans/level-minus-one.md): a POSITION-ONLY cost-to-go table for
 //! the start room, from the traced frame graphs; the search uses it as a
-//! filter (`CELESTE_LEVEL_MINUS_ONE="H,S"`), `transpile --level-minus-one`
+//! filter (`--level-minus-one H,S`), `transpile --level-minus-one`
 //! checks it (`probe`).
 //!
 //! A node is (heap shape, cell of the player or player spawn); every other
@@ -1050,23 +1050,23 @@ pub fn cost_to_go(root: &FsPath, spd_px: i32, threads: usize) -> Result<CostToGo
 const CACHE_FORMAT: u32 = 1;
 
 /// The cache file under /var/tmp/celeste-l1-cache and its key: the
-/// binary, the cart, `spd_px` and every `CELESTE_*` variable not known to be
-/// irrelevant, so an unknown knob costs a rebuild, never a wrong table.
+/// binary, the cart, `spd_px` and the settings the cart is a function of
+/// (`Settings::cart_key`: what a tree records, and the walk's probe).
 ///
-/// `CELESTE_L1_TABLE=FILE` instead: THAT file, read if it exists, else built
+/// `--l1-table FILE` instead: THAT file, read if it exists, else built
 /// and written there, whatever the binary - a table PINNED by its file. Only
 /// a fixture sets it (tools/fixtures.sh: the table its tree was built
 /// under, recorded by fingerprint in the tree, which `bench-frame` checks),
 /// never a search.
 fn cache_file(root: &FsPath, spd_px: i32) -> Result<(PathBuf, String)> {
     use std::hash::{Hash, Hasher};
-    if let Some(f) = crate::knobs::value("CELESTE_L1_TABLE") {
-        return Ok((PathBuf::from(f), format!("level -1 table pinned by CELESTE_L1_TABLE, format {CACHE_FORMAT}, S = {spd_px}\n")));
+    if let Some(f) = &crate::settings::get().l1_table {
+        return Ok((f.clone(), format!("level -1 table pinned by --l1-table, format {CACHE_FORMAT}, S = {spd_px}\n")));
     }
     let dir = PathBuf::from("/var/tmp/celeste-l1-cache");
     let exe = std::env::current_exe()?;
     let exe_bytes = std::fs::read(&exe).map_err(|e| anyhow!("reading this binary {}: {e}", exe.display()))?;
-    let lua = super::cart::sources_in(root)?;
+    let lua = super::cart::sources_in(root, crate::settings::get())?;
     let mut cart: Vec<(String, Vec<u8>)> = Vec::new();
     for e in std::fs::read_dir(root.join("cart"))? {
         let e = e?;
@@ -1075,19 +1075,9 @@ fn cache_file(root: &FsPath, spd_px: i32) -> Result<(PathBuf, String)> {
         }
     }
     cart.sort();
-    // Knobs the table cannot depend on: scheduling, the filter's horizon,
-    // and the forward's diagnostics (they observe, they change nothing).
-    const IRRELEVANT: [&str; 7] = [
-        "CELESTE_THREADS",
-        "CELESTE_LEVEL_MINUS_ONE",
-        "CELESTE_PHASES",
-        "CELESTE_KERNEL_METRICS",
-        "CELESTE_KERNEL_KEY_CHECK",
-        "CELESTE_EMIT_CAPTURE",
-        "CELESTE_EMIT_CAPTURE_FRAME",
-    ];
-    let mut env: Vec<(String, String)> = std::env::vars().filter(|(k, _)| k.starts_with("CELESTE_") && !IRRELEVANT.contains(&k.as_str())).collect();
-    env.sort();
+    // What the cart is a function of (the settings a tree records, and the
+    // walk's probe): not threads, the filter's horizon or diagnostics.
+    let env = crate::settings::get().cart_key();
     let room = crate::game_runner::start_room();
     // Two 64-bit SipHashes under different prefixes: a 128-bit name.
     let half = |salt: u8| {
@@ -1097,7 +1087,7 @@ fn cache_file(root: &FsPath, spd_px: i32) -> Result<(PathBuf, String)> {
     };
     let name = format!("{:016x}{:016x}", half(1), half(2));
     let key = format!(
-        "level -1 table cache, format {CACHE_FORMAT}\nroom {room:?}, S = {spd_px}\nbinary {} ({} bytes)\nenv {env:?}\ncart files {:?}\n",
+        "level -1 table cache, format {CACHE_FORMAT}\nroom {room:?}, S = {spd_px}\nbinary {} ({} bytes)\nsettings {env}\ncart files {:?}\n",
         exe.display(),
         exe_bytes.len(),
         cart.iter().map(|c| &c.0).collect::<Vec<_>>()
@@ -1960,12 +1950,8 @@ pub fn probe(root: &FsPath, opts: &Opts) -> Result<String> {
             .collect();
         say!(rep, "{:4} {line}", ty as i32 * 8)?;
     }
-    // `CELESTE_L1_PATH="x,y"`: the table's fastest path from that cell.
-    if let Some(s) = crate::knobs::value("CELESTE_L1_PATH") {
-        let (x, y) = s
-            .split_once(',')
-            .and_then(|(a, b)| Some((a.trim().parse::<i16>().ok()?, b.trim().parse::<i16>().ok()?)))
-            .ok_or_else(|| anyhow!("CELESTE_L1_PATH=\"x,y\", not {s:?}"))?;
+    // `--l1-path x,y`: the table's fastest path from that cell.
+    if let Some((x, y)) = crate::settings::get().diag.l1_path {
         let show = |i: usize| format!("({}, {}) shape {} d {}", g1.nodes[i].1, g1.nodes[i].2, g1.nodes[i].0, sound[i]);
         match g1.nodes.iter().enumerate().filter(|(_, n)| n.1 == x && n.2 == y).min_by_key(|(i, _)| sound[*i]).map(|(i, _)| i) {
             None => say!(rep, "\npath from ({x}, {y}): not a table node")?,
@@ -2208,7 +2194,7 @@ mod room_tests {
         if !std::path::Path::new("lua/celeste-minimal.lua").exists() {
             return;
         }
-        std::env::set_var("CELESTE_START_ROOM", "7,1");
+        crate::settings::install(crate::settings::Settings { room: (7, 1), ..Default::default() });
         let t = std::thread::Builder::new()
             .stack_size(256 * 1024 * 1024)
             .spawn(|| super::cost_to_go(std::path::Path::new("."), 5, 8))

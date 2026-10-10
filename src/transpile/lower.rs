@@ -120,7 +120,7 @@ pub(crate) fn specialize_frame(
     decide: bool,
     room: Option<&crate::transpile::graph::Room>,
 ) -> (Graph, Vec<SpecializedBody>) {
-    let trace = crate::knobs::flag("CELESTE_BUILD_TRACE");
+    let trace = crate::settings::get().diag.build_trace;
     let t0 = std::time::Instant::now();
     // --- 1. the forks each outcome depends on: those in its cone (read off
     // the reachable set, so no limit on a frame's fork count) ---
@@ -303,7 +303,7 @@ pub(crate) fn specialize_frame(
             crate::transpile::ival::fold(&sp, &all, room).expect("interval fold");
         build_add(4, t_phase);
         let r1: Vec<NodeId> = all.iter().map(|x| m1[*x as usize]).collect();
-        // DIAGNOSTIC (CELESTE_BUILD_TRACE): a body whose `error` folded to true
+        // DIAGNOSTIC (--build-trace): a body whose `error` folded to true
         // while live somewhere declines every lane it takes. Show the leaves of
         // its `error` Or-tree the interval evaluator decided true.
         if trace {

@@ -209,11 +209,11 @@ pub struct Compiled {
     pub spill_slots: usize,
     /// The stack frame in bytes, for the caller's stack check.
     pub frame_bytes: u32,
-    /// `CELESTE_KERNEL_MIX` only (else empty): per SSA instruction `k`, the
+    /// `--kernel-mix` only (else empty): per SSA instruction `k`, the
     /// graph node it was lowered from (a root store: the root) and its kind;
     /// the text then marks each instruction's lines with a `#@k` line.
     pub prov: Vec<(NodeId, &'static str)>,
-    /// `CELESTE_KERNEL_MIX` only: per SSA instruction, whether plain bit
+    /// `--kernel-mix` only: per SSA instruction, whether plain bit
     /// identities over the stream remove it (`foldable`).
     pub foldable: Vec<bool>,
 }
@@ -2172,7 +2172,7 @@ pub fn compile(
         Vec::new()
     };
     let foldable = if mix { foldable(&lo.insts, lo.next_vreg) } else { Vec::new() };
-    if crate::knobs::flag("CELESTE_BUILD_TRACE") {
+    if crate::settings::get().diag.build_trace {
         eprintln!("[build]   {sym}: {} insts, {} vregs: lower {:.1}s, reschedule {:.1}s", lo.insts.len(), lo.next_vreg, t_lower.as_secs_f64(), t.elapsed().as_secs_f64());
     }
 
@@ -2190,7 +2190,7 @@ pub fn compile(
 
     let t_alloc = std::time::Instant::now();
     let (home, spill_slots) = allocate(&lo.insts, lo.next_vreg, &remat);
-    if crate::knobs::flag("CELESTE_BUILD_TRACE") {
+    if crate::settings::get().diag.build_trace {
         eprintln!("[build]   {sym}: allocate {:.1}s ({spill_slots} spill slots)", t_alloc.elapsed().as_secs_f64());
     }
 
@@ -2292,7 +2292,7 @@ enum Known {
     Alias(Vreg),
 }
 
-/// The instructions plain bit identities REMOVE (`CELESTE_KERNEL_MIX`'s
+/// The instructions plain bit identities REMOVE (`--kernel-mix`'s
 /// estimate; nothing in the build uses it): constants folded through
 /// `x & -1 = x`, `x | -1 = -1`, `x | 0 = x`, `x & 0 = 0`, `c ? t : t = t`, a
 /// select or operation on constants, and so on; then every instruction no

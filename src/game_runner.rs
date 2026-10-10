@@ -3,23 +3,11 @@
 
 use anyhow::{anyhow, Result};
 
-/// The room the search starts in, from `CELESTE_START_ROOM` ("x,y"),
-/// default (1, 0). The single source of truth for the `_init` substitution,
-/// the collision cache's room and the checkpoint fingerprint, which must agree.
+/// The room the search starts in (`--room`, default (1, 0)). The single
+/// source of truth for the `_init` substitution, the collision cache's room
+/// and the checkpoint fingerprint, which must agree.
 pub fn start_room() -> (i16, i16) {
-    static ROOM: std::sync::OnceLock<(i16, i16)> = std::sync::OnceLock::new();
-    *ROOM.get_or_init(|| match crate::knobs::value("CELESTE_START_ROOM") {
-        Some(s) => {
-            let (x, y) = s
-                .split_once(',')
-                .unwrap_or_else(|| panic!("CELESTE_START_ROOM must be \"x,y\", got {:?}", s));
-            (
-                x.trim().parse().expect("CELESTE_START_ROOM x must be an integer"),
-                y.trim().parse().expect("CELESTE_START_ROOM y must be an integer"),
-            )
-        }
-        None => (1, 0),
-    })
+    crate::settings::get().room
 }
 
 /// The room that means "won": the one the cart's `next_room` loads after
@@ -39,44 +27,18 @@ pub fn level_index(x: i16, y: i16) -> i16 {
     x % 8 + y * 8
 }
 
-/// `CELESTE_GEMSKIP`: the gemskip categories skip the orb - the orb room
+/// `--gemskip`: the gemskip categories skip the orb - the orb room
 /// is won without it and every later room starts with ONE dash.
 pub fn gemskip() -> bool {
-    crate::knobs::flag("CELESTE_GEMSKIP")
+    crate::settings::get().gemskip
 }
 
-/// `CELESTE_HUNDRED`: the 100% category - a room is won only by exiting with
+/// `--hundred`: the 100% category - a room is won only by exiting with
 /// its berry taken (`frame::got_fruit`).
 pub fn hundred() -> bool {
-    crate::knobs::flag("CELESTE_HUNDRED")
+    crate::settings::get().hundred
 }
 
-/// `CELESTE_LOADING_JANK=J`: start the room as REAL PLAY enters it - the
-/// transition's loading frame updates the new room's objects from the
-/// leaving player's index J on (`trace::cart::apply_loading_frame`; J as
-/// `pico8_diff/chain.py` reports it, in the original cart's object order).
-/// Unset (or `none`): the IL load, the room alone - UniversalClassicTas's
-/// start, which real play does not have where an object updated by the
-/// loading frame changes (room (6,2)'s fly fruit, 2026-10-08: a 63 that dies
-/// in real play). tools/category_runner.py always sets it.
-pub fn loading_jank() -> Option<usize> {
-    static J: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
-    *J.get_or_init(|| {
-        let j = match crate::knobs::value("CELESTE_LOADING_JANK") {
-            Some(s) if s != "none" => {
-                let j: usize = s.trim().parse().unwrap_or_else(|_| panic!("CELESTE_LOADING_JANK must be an object index >= 1 or `none`, got {s:?}"));
-                assert!(j >= 1, "CELESTE_LOADING_JANK must be >= 1");
-                Some(j)
-            }
-            _ => None,
-        };
-        match j {
-            Some(j) => eprintln!("[start] the room as real play enters it: its loading frame from object {j}"),
-            None => eprintln!("[start] IL load: no loading frame (CELESTE_LOADING_JANK unset) - not real play where the room's objects move on it"),
-        }
-        j
-    })
-}
 
 /// The level whose big chest holds the orb (`max_djump=2`): room (5,2).
 pub const ORB_LEVEL: i16 = 21;
@@ -84,7 +46,7 @@ pub const ORB_LEVEL: i16 = 21;
 /// Point the game's `_init` at the configured start room. Strict: the lua
 /// must contain the default call exactly once, so an edit cannot silently
 /// disable the substitution.
-pub fn apply_start_room(game_lua: &str) -> Result<String> {
+pub fn apply_start_room(game_lua: &str, s: &crate::settings::Settings) -> Result<String> {
     const PAT: &str = "load_room(1, 0)";
     let count = game_lua.matches(PAT).count();
     if count != 1 {
@@ -94,10 +56,10 @@ pub fn apply_start_room(game_lua: &str) -> Result<String> {
             count
         ));
     }
-    let (x, y) = start_room();
+    let (x, y) = s.room;
     // The orb sets `max_djump=2` for the rest of the game; a later room
     // must start as a play-through reaches it, with the orb taken.
-    let orb = if level_index(x, y) > ORB_LEVEL && !gemskip() { "max_djump=2 " } else { "" };
+    let orb = if level_index(x, y) > ORB_LEVEL && !s.gemskip { "max_djump=2 " } else { "" };
     Ok(game_lua.replacen(PAT, &format!("{}load_room({}, {})", orb, x, y), 1))
 }
 
@@ -105,7 +67,7 @@ pub fn apply_start_room(game_lua: &str) -> Result<String> {
 mod tests {
     use super::apply_start_room;
 
-    // start_room() is a process-wide OnceLock: tests see only room (1,0).
+    // The default settings: room (1,0).
     #[test]
     fn win_room_of_the_default_room() {
         assert_eq!(super::win_room(), (2, 0));
@@ -115,7 +77,7 @@ mod tests {
     #[test]
     fn apply_start_room_is_identity_for_default_room() {
         let src = "function _init()\n\tload_room(1, 0)\nend\n";
-        assert_eq!(apply_start_room(src).unwrap(), src);
+        assert_eq!(apply_start_room(src, &Default::default()).unwrap(), src);
     }
 
     /// A room past the orb's starts with the second dash; the orb's room and
@@ -129,7 +91,7 @@ mod tests {
 
     #[test]
     fn apply_start_room_rejects_missing_or_duplicated_call() {
-        assert!(apply_start_room("load_room(7,3)").is_err());
-        assert!(apply_start_room("load_room(1, 0) load_room(1, 0)").is_err());
+        assert!(apply_start_room("load_room(7,3)", &Default::default()).is_err());
+        assert!(apply_start_room("load_room(1, 0) load_room(1, 0)", &Default::default()).is_err());
     }
 }

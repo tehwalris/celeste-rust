@@ -48,8 +48,9 @@ pub fn inject_tile_flag_at<D: Domain>(st: &mut State<D>) {
         .insert("tile_flag_at".to_string(), Value::Builtin("tile_flag_at"));
 }
 
-pub fn sources() -> Result<String> {
-    sources_in(std::path::Path::new("."))
+/// The cart's Lua under settings `s`, read from the checkout.
+pub fn sources(s: &crate::settings::Settings) -> Result<String> {
+    sources_in(std::path::Path::new("."), s)
 }
 
 
@@ -60,31 +61,37 @@ pub fn sources() -> Result<String> {
 /// `spd.x = 0`) lives in the player's `draw`.
 pub const FRAME_CODE: &str = "_update()\n_draw()";
 
-/// The cart's Lua, read relative to `root`.
-pub fn sources_in(root: &std::path::Path) -> Result<String> {
+/// The cart's Lua under settings `s` (the room, the category's patches, the
+/// loading frame, the balloon seeds, the split cart), read relative to `root`.
+pub fn sources_in(root: &std::path::Path, s: &crate::settings::Settings) -> Result<String> {
     let read = |p: &str| std::fs::read_to_string(root.join(p));
     let b3 = read("lua/builtin_level_3.lua")?;
     let b4 = read("lua/builtin_level_4.lua")?;
-    // `CELESTE_SPLIT_FRAME`: the split-frame prototype, one frame as two steps.
-    let lua = if crate::knobs::flag("CELESTE_SPLIT_FRAME") { "lua/celeste-minimal-split.lua" } else { "lua/celeste-minimal.lua" };
-    let mut game = crate::game_runner::apply_start_room(&read(lua)?)?;
-    anyhow::ensure!(!(nodiag() && onlydiag()), "CELESTE_NODIAG and CELESTE_ONLYDIAG exclude each other");
-    if let Some(j) = crate::game_runner::loading_jank() {
-        game = apply_loading_frame(&game, j, root)?;
+    // `--split-frame`: the split-frame prototype, one frame as two steps.
+    let lua = if s.split_frame { "lua/celeste-minimal-split.lua" } else { "lua/celeste-minimal.lua" };
+    let mut game = crate::game_runner::apply_start_room(&read(lua)?, s)?;
+    anyhow::ensure!(!(s.nodiag && s.onlydiag), "--nodiag and --onlydiag exclude each other");
+    static SAID: std::sync::Once = std::sync::Once::new();
+    SAID.call_once(|| match s.loading_jank {
+        Some(j) => eprintln!("[start] the room as real play enters it: its loading frame from object {j}"),
+        None => eprintln!("[start] IL load: no loading frame (no --loading-jank) - not real play where the room's objects move on it"),
+    });
+    if let Some(j) = s.loading_jank {
+        game = apply_loading_frame(&game, j, root, s.room)?;
     }
-    if nodiag() {
+    if s.nodiag {
         game = forbid_diagonal_dashes(&game)?;
     }
-    if onlydiag() {
+    if s.onlydiag {
         game = forbid_straight_dashes(&game)?;
     }
-    if let Some(seeds) = crate::knobs::value("CELESTE_BALLOON_SEEDS") {
-        game = fix_balloon_seeds(&game, &seeds, root)?;
+    if let Some(seeds) = &s.balloon_seeds {
+        game = fix_balloon_seeds(&game, seeds, root, s.room)?;
     }
     Ok(format!("{}\n{}\n{}\n", b3, b4, game))
 }
 
-/// `CELESTE_BALLOON_SEEDS="s1,s2,.."`: the start room's balloons' phases
+/// `--balloon-seeds "s1,s2,.."`: the start room's balloons' phases
 /// FIXED, in creation order, as the TAS tool (UniversalClassicTas) and a
 /// tasdatabase file's `[seeds]` fix them - instead of `rnd(1)`, an interval
 /// at every level, under which a witness may mix branches no single seed
@@ -92,12 +99,11 @@ pub fn sources_in(root: &std::path::Path) -> Result<String> {
 /// No new global (the name table is frozen): each balloon's seed is inlined,
 /// chosen by its position; creation order is `load_room`'s tile loop
 /// (x outer, y inner).
-fn fix_balloon_seeds(game: &str, seeds: &str, root: &std::path::Path) -> Result<String> {
+fn fix_balloon_seeds(game: &str, seeds: &str, root: &std::path::Path, (rx, ry): (i16, i16)) -> Result<String> {
     const PAT: &str = "this.offset=rnd(1)";
-    anyhow::ensure!(game.matches(PAT).count() == 1, "CELESTE_BALLOON_SEEDS: the balloon's `{PAT}` was not found exactly once");
-    let seeds: Vec<f64> = seeds.split(',').map(str::trim).filter(|s| !s.is_empty()).map(|s| s.parse::<f64>().with_context(|| format!("CELESTE_BALLOON_SEEDS: {s:?}"))).collect::<Result<_>>()?;
+    anyhow::ensure!(game.matches(PAT).count() == 1, "--balloon-seeds: the balloon's `{PAT}` was not found exactly once");
+    let seeds: Vec<f64> = seeds.split(',').map(str::trim).filter(|s| !s.is_empty()).map(|s| s.parse::<f64>().with_context(|| format!("--balloon-seeds: {s:?}"))).collect::<Result<_>>()?;
     let cart = celeste_core::cart_data::CartData::load(root.join("cart"))?;
-    let (rx, ry) = crate::game_runner::start_room();
     // The tool's seed list runs over balloons (tile 22) AND chests (tile 20)
     // in creation order; only the balloons' phases are fixed here (a chest's
     // shake decides only where its berry appears).
@@ -144,19 +150,18 @@ const OBJECT_TILES: &[(u8, bool)] = &[
 ];
 
 /// The start room's LOADING FRAME as a real transition runs it
-/// (`CELESTE_LOADING_JANK=J`, `game_runner::loading_jank`): the leaving
+/// (`--loading-jank J`): the leaving
 /// player's `_update` loads the room, and the frame's `foreach` goes on over
 /// the NEW room's objects from the player's index J - one update each
 /// (move, then update) - then the frame draws. J counts the ORIGINAL cart's
 /// objects (pico8_diff/chain.py reports it); it is translated to the minimal
 /// cart's list, which lacks `message` and `flag`. Measured against a real
 /// PICO-8 chain field by field (`pico8_diff/chain.py --modes`).
-fn apply_loading_frame(game: &str, j: usize, root: &std::path::Path) -> Result<String> {
+fn apply_loading_frame(game: &str, j: usize, root: &std::path::Path, (rx, ry): (i16, i16)) -> Result<String> {
     let cart = celeste_core::cart_data::CartData::load(root.join("cart"))?;
-    let (rx, ry) = crate::game_runner::start_room();
     let first = minimal_index(&cart, (rx, ry), j);
     let call = format!("load_room({}, {})", rx, ry);
-    anyhow::ensure!(game.matches(&call).count() == 1, "CELESTE_LOADING_JANK: the start room's `{call}` was not found exactly once");
+    anyhow::ensure!(game.matches(&call).count() == 1, "--loading-jank: the start room's `{call}` was not found exactly once");
     let frame = format!(
         "{call} for i={first},#objects do local o=objects[i] if o.spd.x ~= 0 or o.spd.y ~= 0 then o.move(o.spd.x,o.spd.y) end if o.type.update~=nil then o.type.update(o) end end _draw()"
     );
@@ -199,28 +204,14 @@ mod loading_frame_tests {
     }
 }
 
-/// `CELESTE_NODIAG`: the No Diagonal Dashes category. A dash may not START
-/// with both a horizontal and a vertical direction held.
-pub fn nodiag() -> bool {
-    crate::knobs::flag("CELESTE_NODIAG")
-}
-
 /// Make the diagonal arm of the player's dash start RAISE (`nil > 0`): a raise
 /// has no successor (`Interp::poison`), so a diagonal dash leaves the search
 /// exactly, at every level and in the reference engine alike. A dash with no
 /// direction held (horizontal, facing direction) stays legal.
 fn forbid_diagonal_dashes(game: &str) -> Result<String> {
     const ARM: &str = "if input~=0 then\n\t\t  \tif v_input~=0 then\n";
-    anyhow::ensure!(game.matches(ARM).count() == 1, "CELESTE_NODIAG: the cart's diagonal dash arm was not found exactly once");
+    anyhow::ensure!(game.matches(ARM).count() == 1, "--nodiag: the cart's diagonal dash arm was not found exactly once");
     Ok(game.replacen(ARM, &format!("{ARM}\t\t   \tlocal nodiag_violation = nil > 0\n"), 1))
-}
-
-/// `CELESTE_ONLYDIAG`: every dash diagonal, the inverse of `CELESTE_NODIAG`.
-/// A dash may only START with both a horizontal and a vertical direction
-/// held; a dash with no direction held (horizontal, facing direction) is not
-/// diagonal.
-pub fn onlydiag() -> bool {
-    crate::knobs::flag("CELESTE_ONLYDIAG")
 }
 
 /// Make the three non-diagonal arms of the player's dash start (horizontal
@@ -234,7 +225,7 @@ fn forbid_straight_dashes(game: &str) -> Result<String> {
     ];
     let mut game = game.to_string();
     for arm in ARMS {
-        anyhow::ensure!(game.matches(arm).count() == 1, "CELESTE_ONLYDIAG: a dash arm was not found exactly once: {arm:?}");
+        anyhow::ensure!(game.matches(arm).count() == 1, "--onlydiag: a dash arm was not found exactly once: {arm:?}");
         let head = &arm[..=arm.find('\n').expect("an arm is two lines")];
         game = game.replacen(arm, &format!("{head}\t\t   \tlocal onlydiag_violation = nil > 0\n{}", &arm[head.len()..]), 1);
     }
@@ -376,25 +367,19 @@ mod tests {
         const RIGHT: u8 = 2;
         const UP: u8 = 4;
         let starts = [DASH | RIGHT | UP, DASH | RIGHT, DASH | UP, DASH];
-        // The cart is read when an engine is built (nextest: own process).
-        let successors = |mode: Option<&str>| -> Vec<usize> {
-            for m in ["CELESTE_NODIAG", "CELESTE_ONLYDIAG"] {
-                std::env::remove_var(m);
-            }
-            if let Some(m) = mode {
-                std::env::set_var(m, "1");
-            }
-            let mut eng = RefEngine::new().expect("engine");
+        // The cart is read when an engine is built, under its settings.
+        let successors = |s: crate::settings::Settings| -> Vec<usize> {
+            let mut eng = RefEngine::with(&s).expect("engine");
             let mut row = eng.initial().expect("initial");
             for _ in 0..40 {
                 row = eng.step_one(&row, 0).expect("idle frame").into_rt2();
             }
             starts.iter().map(|&b| eng.step(&row, b).expect("dash frame").len()).collect()
         };
-        assert_eq!(successors(None), [1, 1, 1, 1], "any%: every dash start");
-        assert_eq!(successors(Some("CELESTE_NODIAG")), [0, 1, 1, 1], "nodiag: all but the diagonal");
-        assert_eq!(successors(Some("CELESTE_ONLYDIAG")), [1, 0, 0, 0], "onlydiag: the diagonal only");
-        std::env::set_var("CELESTE_NODIAG", "1");
-        assert!(RefEngine::new().is_err(), "both modes at once must be refused");
+        use crate::settings::Settings;
+        assert_eq!(successors(Settings::default()), [1, 1, 1, 1], "any%: every dash start");
+        assert_eq!(successors(Settings { nodiag: true, ..Default::default() }), [0, 1, 1, 1], "nodiag: all but the diagonal");
+        assert_eq!(successors(Settings { onlydiag: true, ..Default::default() }), [1, 0, 0, 0], "onlydiag: the diagonal only");
+        assert!(RefEngine::with(&Settings { nodiag: true, onlydiag: true, ..Default::default() }).is_err(), "both modes at once must be refused");
     }
 }

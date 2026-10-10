@@ -10,7 +10,7 @@ use celeste_engine::runtime2::{Col, Rt2};
 
 use crate::storage::StateId;
 
-/// Wave phase timers (`CELESTE_PHASES=1`): TSC ticks summed over workers,
+/// Wave phase timers (`--phases`): TSC ticks summed over workers,
 /// printed by `print_phases`. Off, `phase_start` is one load and a branch.
 pub mod phases {
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -26,7 +26,7 @@ pub mod phases {
     static TICKS: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
     fn on() -> bool {
         static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        *ON.get_or_init(|| crate::knobs::flag("CELESTE_PHASES"))
+        *ON.get_or_init(|| crate::settings::get().diag.phases)
     }
     #[inline]
     pub fn start() -> u64 {
@@ -437,7 +437,7 @@ pub fn orb_required() -> bool {
     crate::game_runner::level_index(x, y) == crate::game_runner::ORB_LEVEL && !crate::game_runner::gemskip()
 }
 
-/// `CELESTE_TRIM_ROWS=1`: a frame's checkpoint files keep only keys, cells
+/// `--trim-rows`: a frame's checkpoint files keep only keys, cells
 /// and wins once a later frame's runs are complete (`checkpoint::trim`) -
 /// what the search reads of them, and what a resume and `export-ui` read.
 /// The rows' values are most of a frame's files: room (2,3) gemskip h137,
@@ -445,39 +445,31 @@ pub fn orb_required() -> bool {
 /// B, of which the key is 16). The diagnostics that load old rows
 /// (`rerun-row`, `follow`, `arc-check`, ...) refuse a trimmed tree.
 pub fn trim_rows() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| crate::knobs::flag("CELESTE_TRIM_ROWS"))
+    crate::settings::get().trim_rows
 }
 
 /// Search steps per game frame: 2 under the split frame
-/// (`CELESTE_SPLIT_FRAME`: part a up to and including the player's move,
+/// (`--split-frame`: part a up to and including the player's move,
 /// part b the rest; step `2k` is the end of frame `k`), else 1.
 pub fn steps_per_frame() -> u32 {
-    if crate::knobs::flag("CELESTE_SPLIT_FRAME") {
+    if crate::settings::get().split_frame {
         2
     } else {
         1
     }
 }
 
-/// Worker count: `CELESTE_THREADS`, else one per physical core (AVX-512 units
+/// Worker count: `--threads`, else one per physical core (AVX-512 units
 /// are shared by SMT siblings).
 pub fn threads() -> usize {
-    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *N.get_or_init(|| {
-        crate::knobs::number::<usize>("CELESTE_THREADS")
-            .inspect(|&n| assert!(n >= 1, "CELESTE_THREADS=0"))
-            .unwrap_or_else(|| {
-                (std::thread::available_parallelism().map(|n| n.get()).unwrap_or(2) / 2).max(1)
-            })
-    })
+    crate::settings::get().threads.unwrap_or_else(|| (std::thread::available_parallelism().map(|n| n.get()).unwrap_or(2) / 2).max(1))
 }
 
-/// THE LEVEL -1 FILTER at a horizon (`CELESTE_LEVEL_MINUS_ONE="H,S"`, H in
-/// search steps): drop a queue when the table proves its cell cannot exit
+/// THE LEVEL -1 FILTER at a horizon (`--level-minus-one H,S`, H in search
+/// steps): drop a queue when the table proves its cell cannot exit
 /// by `h` (sound: inductive ranges, clipped successors and deaths
 /// accounted). A tree records the filter its frames were built under
-/// (`TreeFilter`); a forward runs under its tree's, not the environment's.
+/// (`TreeFilter`); a forward runs under its tree's, not the run's flag.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MinusOne {
     pub h: u32,
@@ -486,14 +478,9 @@ pub struct MinusOne {
 }
 
 impl MinusOne {
-    /// `CELESTE_LEVEL_MINUS_ONE="H,S"`, if set.
-    pub fn from_env() -> Option<MinusOne> {
-        let s = crate::knobs::value("CELESTE_LEVEL_MINUS_ONE")?;
-        let (h, sp) = s.split_once(',').expect("CELESTE_LEVEL_MINUS_ONE=\"H,S\"");
-        let h: u32 = h.trim().parse().expect("CELESTE_LEVEL_MINUS_ONE horizon");
-        let speed: i32 = sp.trim().parse().expect("CELESTE_LEVEL_MINUS_ONE speed bound (px per frame)");
-        assert!(h < u32::MAX, "CELESTE_LEVEL_MINUS_ONE horizon {h}");
-        Some(MinusOne { h, speed })
+    /// The run's `--level-minus-one H,S`, if given.
+    pub fn of_run() -> Option<MinusOne> {
+        crate::settings::get().level_minus_one.map(|(h, speed)| MinusOne { h, speed })
     }
 
     /// The start room's table at this speed bound (one per process).
@@ -508,7 +495,7 @@ fn minus_one_table(speed: i32) -> &'static crate::trace::level_minus_one::CostTo
     static TABLE: std::sync::OnceLock<(i32, crate::trace::level_minus_one::CostToGo)> = std::sync::OnceLock::new();
     let (sp, table) = TABLE.get_or_init(|| {
         // The table measures the EXIT: unsound for a position win.
-        assert!(win_rect().is_none(), "CELESTE_LEVEL_MINUS_ONE: the table measures the room exit; this room's win is a position");
+        assert!(win_rect().is_none(), "--level-minus-one: the table measures the room exit; this room's win is a position");
         let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
         let t = std::time::Instant::now();
         let table = std::thread::Builder::new()
@@ -919,7 +906,7 @@ impl ForwardState {
         }
         let filter = TreeFilter::of(minus_one);
         filter.write(dir)?;
-        crate::settings::Settings::current().write(dir, level)?;
+        crate::settings::get().write(dir, level)?;
         let mut visited = crate::storage::visited::VisitedSet::new(*crate::storage::geometry());
         let meta = crate::storage::wave::seed(&mut visited, &mut initial, level)?;
         let won = checkpoint_frontier(dir, 0, &mut initial, true)?;
@@ -990,17 +977,17 @@ impl ForwardState {
     /// Refused under other settings or at another `level` than the tree's
     /// (`settings::Settings::check`).
     pub fn at(dir: &std::path::Path, last: u32, record: bool, level: crate::abstraction::Level) -> Result<Self> {
-        crate::settings::Settings::current().check(dir, level)?;
+        crate::settings::get().check(dir, level)?;
         let edges_dir = dir.join("edges");
         let filter = TreeFilter::read(dir)?;
         let (visited, win_frame) = restore_visited(dir, last)?;
         let xfers = crate::storage::edges::XferTable::load(&edges_dir)?;
         // The frontier: the last layer minus the rows the forward does not
         // expand (`expandable`, as `extend` decides it; a tree without a
-        // record by the environment's ceiling, as it was built).
+        // record by the run's ceiling, as it was built).
         let ceiling = match filter {
             Some(f) => f.ceiling(),
-            None => MinusOne::from_env().map(|m| m.h),
+            None => MinusOne::of_run().map(|m| m.h),
         };
         let frontier = expandable(load_frame(dir, last)?, last, ceiling)?;
         let observer = if record {
@@ -1059,7 +1046,7 @@ impl ForwardState {
         if let (Some(TreeFilter::MinusOne { table, .. }), Some(m)) = (self.filter, minus_one) {
             anyhow::ensure!(
                 m.table().fingerprint() == table,
-                "{}: the level -1 table is not the one the tree was built under (fingerprint {:016x}, the tree's {table:016x}; a fixture pins its table: CELESTE_L1_TABLE)",
+                "{}: the level -1 table is not the one the tree was built under (fingerprint {:016x}, the tree's {table:016x}; a fixture pins its table: --l1-table)",
                 dir.display(),
                 m.table().fingerprint()
             );
@@ -1200,7 +1187,7 @@ impl ForwardState {
             for (_, file) in frame_files(dir, t - 1)? {
                 anyhow::ensure!(
                     !file.trimmed() || redo.iter().all(|&id| file.find_row(id).is_none()),
-                    "{}: frame {}'s rows were trimmed (CELESTE_TRIM_ROWS) and the raise must re-expand some: delete the tree",
+                    "{}: frame {}'s rows were trimmed (--trim-rows) and the raise must re-expand some: delete the tree",
                     dir.display(),
                     t - 1
                 );
@@ -1298,7 +1285,7 @@ impl ForwardState {
 }
 
 /// A level's tree through step `to` under the run's level -1 filter `want`
-/// (`CELESTE_LEVEL_MINUS_ONE`): used as it is when it reaches `to` under a
+/// (`--level-minus-one`): used as it is when it reaches `to` under a
 /// filter that serves it (none, or one at a horizon >= `to`); else resumed -
 /// RAISED to `want` first when its filter is below `to` - and extended under
 /// its filter, or started under `want`. A tree is never filtered lower than
@@ -1315,10 +1302,10 @@ pub fn grow_tree(
     initial: impl FnOnce() -> Result<Vec<Block>>,
 ) -> Result<ForwardResult> {
     if dir.join("frames").join("f000").is_dir() {
-        crate::settings::Settings::current().check(dir, level)?;
+        crate::settings::get().check(dir, level)?;
     }
     if let Some(w) = want {
-        anyhow::ensure!(to <= w.h, "CELESTE_LEVEL_MINUS_ONE at step {} is below the horizon, step {to}", w.h);
+        anyhow::ensure!(to <= w.h, "--level-minus-one at step {} is below the horizon, step {to}", w.h);
     }
     let complete = tree_first_win_through(dir, to)?;
     let raise_to: Option<Option<MinusOne>> = if !dir.join("frames").join("f000").is_dir() {
@@ -1424,7 +1411,7 @@ pub fn forward_run(
 }
 
 /// Stop the forward before the checkpoint disk fills: below
-/// `CELESTE_MIN_FREE_GB` (default 20) plus three times what the last frame
+/// `--min-free-gb` (default 20) plus three times what the last frame
 /// wrote, free on `dir`'s filesystem, an error -
 /// a full disk otherwise fails a worker mid-write (room (5,1) nodiag,
 /// 2026-10-06) and starves everything else on the machine. `last_free`: the
@@ -1434,7 +1421,7 @@ pub fn forward_run(
 /// second level at its first frame, 2026-10-07).
 fn ensure_disk_space(dir: &std::path::Path, last_free: &mut Option<u64>) -> Result<()> {
     use std::os::unix::ffi::OsStrExt;
-    let min_gb: u64 = crate::knobs::number("CELESTE_MIN_FREE_GB").unwrap_or(20);
+    let min_gb: u64 = crate::settings::get().min_free_gb;
     let path = std::ffi::CString::new(dir.as_os_str().as_bytes())?;
     // SAFETY: `path` is NUL-terminated; `st` is a valid out-parameter that
     // statvfs fills on success.
@@ -1447,7 +1434,7 @@ fn ensure_disk_space(dir: &std::path::Path, last_free: &mut Option<u64>) -> Resu
     let need = (min_gb << 30) + 3 * frame_bytes;
     anyhow::ensure!(
         free >= need,
-        "only {} GB free on {}'s filesystem, the last frame used {} GB (CELESTE_MIN_FREE_GB = {min_gb}, plus 3 frames): stopping the forward before the disk fills",
+        "only {} GB free on {}'s filesystem, the last frame used {} GB (--min-free-gb {min_gb}, plus 3 frames): stopping the forward before the disk fills",
         free >> 30,
         dir.display(),
         frame_bytes >> 30
@@ -1924,8 +1911,7 @@ mod tests {
     /// 0), a resume always: a resumed 100% run expanded fewer rows.
     #[test]
     fn a_resume_expands_what_the_uninterrupted_forward_expands() {
-        std::env::set_var("CELESTE_START_ROOM", "1,0");
-        std::env::set_var("CELESTE_HUNDRED", "1");
+        crate::settings::install(crate::settings::Settings { hundred: true, ..Default::default() });
         let dir = std::env::temp_dir().join(format!("celeste-resume-frontier-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let e = RefEngine::new().expect("engine");
@@ -1955,7 +1941,7 @@ mod tests {
     /// and the transfer count; nothing else claims trust.
     #[test]
     fn a_frame_killed_before_its_done_marker_is_rerun() {
-        std::env::set_var("CELESTE_START_ROOM", "1,0");
+        crate::settings::install(crate::settings::Settings::default());
         let base = std::env::temp_dir().join(format!("celeste-done-marker-{}", std::process::id()));
         let (a, b) = (base.join("uninterrupted"), base.join("killed"));
         let _ = std::fs::remove_dir_all(&base);
@@ -2070,7 +2056,7 @@ mod tests {
     #[test]
     fn room_02_spawn_frame_kernels_make_the_reference_successors() {
         use crate::abstraction::Level;
-        std::env::set_var("CELESTE_START_ROOM", "0,2");
+        crate::settings::install(crate::settings::Settings { room: (0, 2), ..Default::default() });
         let kernels = crate::compiled::FrameEngine::new_for_start_room(Level::EXACT).expect("kernels");
         let reference = Mutex::new(RefEngine::new().expect("ref engine"));
         // 25 frames of no input: the spawn's last frame is the 26th.
@@ -2100,7 +2086,7 @@ mod tests {
     #[test]
     fn a_lane_outside_its_kernels_bounds_declines() {
         use crate::abstraction::Level;
-        std::env::set_var("CELESTE_START_ROOM", "1,0");
+        crate::settings::install(crate::settings::Settings::default());
         let level = Level::parse("r0sxh").expect("level");
         let grid = crate::trace::kernel::region_grid().expect("the default region grid");
         let _kernels = crate::compiled::FrameEngine::new_for_start_room(level).expect("kernels");
@@ -2161,7 +2147,7 @@ mod tests {
     #[test]
     fn a_lane_outside_its_platform_bounds_declines() {
         use crate::abstraction::Level;
-        std::env::set_var("CELESTE_START_ROOM", "2,1");
+        crate::settings::install(crate::settings::Settings { room: (2, 1), ..Default::default() });
         let level = Level::parse("r0sxhnp").expect("level");
         let _kernels = crate::compiled::FrameEngine::new_for_start_room(level).expect("kernels");
         let mut reference = RefEngine::new().expect("ref engine");
@@ -2221,7 +2207,7 @@ mod tests {
     #[test]
     fn room_13_exit_frame_keys_the_concrete_exit() {
         use crate::abstraction::Level;
-        std::env::set_var("CELESTE_START_ROOM", "1,3");
+        crate::settings::install(crate::settings::Settings { room: (1, 3), ..Default::default() });
         let level = Level::parse("r0sxh").expect("level");
         let kernels = crate::compiled::FrameEngine::new_for_start_room(level).expect("kernels");
         let text = std::fs::read_to_string("tas/room_1_3_reference_frame_127.txt").expect("the reference solution");
@@ -2259,7 +2245,7 @@ mod tests {
     /// The summit wins at the flag: the TAS31 reference wins at frame 55, not before.
     #[test]
     fn the_summit_reference_wins_at_the_flag() {
-        std::env::set_var("CELESTE_START_ROOM", "6,3");
+        crate::settings::install(crate::settings::Settings { room: (6, 3), ..Default::default() });
         assert_eq!(win_rect(), Some((55, 67, 41, 52)), "the flag at (61, 48)");
         let text = std::fs::read_to_string("tas/room_6_3_reference_frame_55.txt").expect("the reference");
         let inputs: Vec<u8> = text
@@ -2284,8 +2270,7 @@ mod tests {
     #[test]
     fn split_frame_reaches_the_unsplit_frontier_at_a_near_level() {
         use crate::abstraction::Level;
-        std::env::set_var("CELESTE_START_ROOM", "2,1");
-        std::env::set_var("CELESTE_SPLIT_FRAME", "1");
+        crate::settings::install(crate::settings::Settings { room: (2, 1), split_frame: true, ..Default::default() });
         let level = Level::parse("r0sxhn").expect("level");
         let dir = std::path::Path::new("/var/tmp/celeste-frame-split-near-test");
         let _ = std::fs::remove_dir_all(dir);

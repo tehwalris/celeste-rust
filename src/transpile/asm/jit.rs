@@ -123,7 +123,7 @@ impl Loaded {
         })
     }
 
-    /// The loaded shared object (`CELESTE_KERNEL_MIX` keeps a copy).
+    /// The loaded shared object (`--kernel-mix` keeps a copy).
     pub fn path(&self) -> &Path {
         &self.path
     }

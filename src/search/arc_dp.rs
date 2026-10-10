@@ -1121,21 +1121,17 @@ pub(super) fn rem_of(rt2: &celeste_engine::runtime2::Rt2) -> anyhow::Result<(u32
 }
 
 /// `n` reference engines for concrete steps, and whether they run seeded:
-/// `CELESTE_CONCRETE_BALLOON_SEEDS` fixes the balloons' phases (a
-/// tasdatabase file's seeds), so a concrete run is one real run under them -
-/// the tree and W keep the phase an interval (sound for every seed), and a
-/// concrete state's key maps its phase to that interval (`lookup_view`).
-/// Built under the global level: `_init` runs under it.
+/// `--concrete-balloon-seeds` fixes the balloons' phases (a tasdatabase
+/// file's seeds), so a concrete run is one real run under them - the tree
+/// and W keep the phase an interval (sound for every seed), and a concrete
+/// state's key maps its phase to that interval (`lookup_view`). Built under
+/// the global level: `_init` runs under it.
 pub(super) fn concrete_engines(n: usize) -> anyhow::Result<(Vec<crate::trace::refengine::RefEngine>, bool)> {
-    let seeds = crate::knobs::value("CELESTE_CONCRETE_BALLOON_SEEDS");
-    if let Some(s) = &seeds {
-        std::env::set_var("CELESTE_BALLOON_SEEDS", s);
-    }
-    let engines: anyhow::Result<Vec<_>> = (0..n).map(|_| crate::trace::refengine::RefEngine::new()).collect();
-    if seeds.is_some() {
-        std::env::remove_var("CELESTE_BALLOON_SEEDS");
-    }
-    Ok((engines?, seeds.is_some()))
+    let run = crate::settings::get();
+    let seeded = run.concrete_balloon_seeds.is_some();
+    let s = crate::settings::Settings { balloon_seeds: run.concrete_balloon_seeds.clone().or_else(|| run.balloon_seeds.clone()), ..run.clone() };
+    let engines = (0..n).map(|_| crate::trace::refengine::RefEngine::with(&s)).collect::<anyhow::Result<Vec<_>>>()?;
+    Ok((engines, seeded))
 }
 
 /// The inputs a state has been stepped under, each with the buttons its
@@ -1491,7 +1487,7 @@ pub fn solve(
     known: Option<&super::known::Route>,
 ) -> anyhow::Result<Solved> {
     use crate::frame::{mark_row, save_marks, MarkRow, Visited};
-    crate::settings::Settings::current().check(dir, level)?;
+    crate::settings::get().check(dir, level)?;
     crate::metrics::mem_phase("arc: start");
     let Loaded { graph, start, marks, wins, .. } = load(dir, horizon)?;
     let g = &graph;

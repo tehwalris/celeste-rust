@@ -191,7 +191,7 @@ def entry_jank(cat, level):
 
 def check_start(cat, level, binary):
     """The SEARCH's start state for `level` (`concrete_run --dump-start`
-    under CELESTE_LOADING_JANK = the boot chain's J) against the boot
+    under --loading-jank = the boot chain's J) against the boot
     chain's room entry on a real PICO-8, field by field: the objects both
     carts have (the minimal one lacks room_title, message and flag), the
     fields both have. Returns (J, differences, fields only one side has)."""
@@ -199,11 +199,9 @@ def check_start(cat, level, binary):
     j = entry_jank(cat, level)
     _, _, ref = parse(chain(cat, level, [], [0], 1))
     rx, ry = room_of(level)
-    env = dict(os.environ, CELESTE_START_ROOM=f"{rx},{ry}", CELESTE_LOADING_JANK=str(j) if j else "none", CELESTE_BALLOON_SEEDS="0")
-    if cat.startswith("gemskip"):
-        env["CELESTE_GEMSKIP"] = "1"
+    flags = ["--room", f"{rx},{ry}", "--loading-jank", str(j) if j else "none", "--balloon-seeds", "0"] + (["--gemskip"] if cat.startswith("gemskip") else [])
     root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    ours = subprocess.run([binary, "-i", "0", "--dump-start"], capture_output=True, text=True, env=env, cwd=root, check=True).stdout.splitlines()
+    ours = subprocess.run([binary, "-i", "0", "--dump-start"] + flags, capture_output=True, text=True, cwd=root, check=True).stdout.splitlines()
     skip = ("room_title", "message", "flag")
     pico = [fields(l) for l in ref if l.startswith("obj ") and l.split()[2] not in skip]
     mine = [fields(l) for l in ours if l.startswith("obj ")]
@@ -276,11 +274,9 @@ def start_classes(level, binary, cat="any"):
     rx, ry = room_of(level)
     classes = {}
     for j in feasible_janks(level):
-        env = dict(os.environ, CELESTE_START_ROOM=f"{rx},{ry}", CELESTE_LOADING_JANK=str(j), CELESTE_BALLOON_SEEDS="0")
-        if cat.startswith("gemskip"):
-            env["CELESTE_GEMSKIP"] = "1"
+        flags = ["--room", f"{rx},{ry}", "--loading-jank", str(j), "--balloon-seeds", "0"] + (["--gemskip"] if cat.startswith("gemskip") else [])
         root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        dump = subprocess.run([binary, "-i", "0", "--dump-start"], capture_output=True, text=True, env=env, cwd=root, check=True).stdout
+        dump = subprocess.run([binary, "-i", "0", "--dump-start"] + flags, capture_output=True, text=True, cwd=root, check=True).stdout
         classes.setdefault(dump, []).append(j)
     return list(classes.values())
 

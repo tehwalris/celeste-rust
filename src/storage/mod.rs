@@ -12,7 +12,7 @@
 //!   * `marks`   - the backward's marks over state ids, and the resolver of
 //!                 an id to its (shape, key, cell)
 //!   * `meta`    - per frame, the shapes and entries it created
-//!   * `bench`   - `CELESTE_EMIT_CAPTURE` and `rewrite bench-storage`
+//!   * `bench`   - `--emit-capture` and `rewrite bench-storage`
 //!   * `census`  - `rewrite storage-census` (plans/storage-unify.md)
 //!
 //! A state is `(shape, key, cell)` (the key holds no position:
@@ -29,7 +29,7 @@ pub mod wave;
 
 use crate::search::pos_graph::{GRID, NO_CELL};
 
-/// The storage regions: `side` x `side` cells (`CELESTE_STORAGE_REGION`, 8
+/// The storage regions: `side` x `side` cells (`--storage-region`, 8
 /// or 16), aligned at 0 as the kernels' `RegionGrid::of` (`div_euclid`; the
 /// grid's origin -64 is a multiple of both), each nested in one kernel
 /// region. A region's SLOT is its place on the grid, row-major, `NO_CELL`
@@ -81,18 +81,18 @@ impl Geometry {
     }
 }
 
-/// The process's storage geometry: `CELESTE_STORAGE_REGION` (8 default, or
+/// The process's storage geometry: `--storage-region` (8 default, or
 /// 16). A storage region must nest in one kernel region: the kernels' px
-/// (`CELESTE_REGION`) a multiple of the side - else refused.
+/// (`--region`) a multiple of the side - else refused.
 pub fn geometry() -> &'static Geometry {
     static G: std::sync::OnceLock<Geometry> = std::sync::OnceLock::new();
     G.get_or_init(|| {
-        let side: u32 = crate::knobs::number("CELESTE_STORAGE_REGION").unwrap_or(8);
+        let side: u32 = crate::settings::get().storage_region;
         let g = Geometry::new(side);
         if let Some(k) = crate::trace::kernel::region_grid() {
             assert!(
                 k.px % side as i32 == 0,
-                "CELESTE_STORAGE_REGION={side}: a storage region must nest in one kernel region, and the kernels' regions are {} px (CELESTE_REGION)",
+                "--storage-region {side}: a storage region must nest in one kernel region, and the kernels' regions are {} px (--region)",
                 k.px
             );
         }

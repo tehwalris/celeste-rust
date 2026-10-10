@@ -9,9 +9,9 @@ not a bound: a spring snaps the player up to 8 px and `spd.y = -3` moves it
 
 ```bash
 # as a filter inside a search (H = the ceiling, S = the speed bound in px/frame)
-CELESTE_LEVEL_MINUS_ONE="95,5" ./safe-run.sh -- ./target/release/rewrite search --room 2,0 --ceiling 95
+./safe-run.sh -- ./target/release/rewrite search --room 2,0 --ceiling 95 --level-minus-one 95,5
 # as a probe: the table against a level-0 tree, with the too-late share per frame
-CELESTE_START_ROOM=2,0 ./safe-run.sh -- ./target/quick/transpile \
+./safe-run.sh -- ./target/quick/transpile --room 2,0 \
     --level-minus-one S LEVEL_DIR CEILING FROM TO [MARKS]
 ```
 
@@ -73,7 +73,7 @@ makes it sound where the probe only counted:
   so a raise to H' re-expands just the sources with `f + d <= H'` and what
   they add, frame by frame, and ends as exactly the tree a fresh run at H'
   makes (plans/architecture.md, "Raising the horizon"). Count-ups (`--to H`,
-  H+1, ...) with `CELESTE_LEVEL_MINUS_ONE` = each horizon pay the forward
+  H+1, ...) with `--level-minus-one` = each horizon pay the forward
   once.
 
 The table is horizon-independent: one per room.
@@ -90,7 +90,7 @@ The table is horizon-independent: one per room.
 - Room (0,2): 288,366 recorded in-room transitions of an unfiltered `r0sxhn`
   tree, 0 not in the table.
 
-- A known solution against the table: `CELESTE_START_ROOM=X,Y rewrite
+- A known solution against the table: `rewrite --room X,Y
   l1-check --inputs tas/FILE --horizon EXIT` steps it with the reference
   engine and fails if any state of the exiting lineage is too late. 0 too
   late (2026-10-07): (1,0) at 99, (5,0) at 77, (2,3) at 106, (6,2) at 75,
@@ -141,7 +141,7 @@ unfiltered counts at f50 (d = 31 against the real 46); that needed `p`.
   "maybe collected, maybe gone" everywhere, which only weakens d. The spawn
   prefix stays exact (one concrete chain). Room (3,0): 64,650 nodes, start
   d 45, 5:38; room (6,2): 62,484 nodes, start d 45, 2:25 (the same table with
-  `CELESTE_GEMSKIP=1`).
+  `--gemskip`).
 - **A start slot only a later frame writes an interval to** (rooms (5,0),
   (2,3): the balloon's bob `y`, "not a literal range"): the start state holds
   a constant there; only slots the start state itself holds as an interval
@@ -165,7 +165,7 @@ refinement), so `_update`'s "moved" and `_draw`'s "clamp skipped" join every
 frame, with a dash every frame. Chosen fix (C, not built): small counters
 exact per node - a node is (shape, cell, `freeze`, `djump`) - up to 6x the
 nodes; the filter would take the minimum d over a cell's counters. Check with
-`CELESTE_L1_PATH="16,48"`. Bigger: speed per node instead of [-S, S]
+`--l1-path 16,48`. Bigger: speed per node instead of [-S, S]
 everywhere (would bend the top's straight cut along gravity and walls).
 
 ## Limits

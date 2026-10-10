@@ -321,16 +321,16 @@ the project's cleanup phase. Until then both must pass.
 ## How to run a room (the arc search, 2026-10-05)
 
 ```
-CELESTE_LEVEL_MINUS_ONE="C,5" \
-  ./safe-run.sh -- ./target/release/rewrite search --room X,Y --level r0sxhn \
-  --ceiling C --checkpoint-dir DIR [--save-marks UIDIR]
+./safe-run.sh -- ./target/release/rewrite search --room X,Y --level r0sxhn \
+  --ceiling C --level-minus-one C,5 --checkpoint-dir DIR [--save-marks UIDIR]
+  [--hundred | --nodiag | --gemskip ...] [--loading-jank J]
 ```
 
 - The level: `r0sx` for a room without objects, `r0sxhn` with springs, fall
   floors, balloons, key and chest (everything abstract but where the player
   overlaps a floor; held buttons unknown); `f` for the fly fruit. The
   concrete search refutes what the level invents. `p` for moving platforms
-  (with `n`: `r0sxhnp`). `CELESTE_SPLIT_FRAME=1` where the unsplit kernels
+  (with `n`: `r0sxhnp`). `--split-frame` where the unsplit kernels
   are too big (rooms (6,0), (6,1)): `--ceiling` stays in frames, level -1's
   horizon is in steps (`2 x C`).
 - **When the level-0 bound is well below the reference** (room (7,0):

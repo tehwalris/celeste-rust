@@ -1,5 +1,5 @@
 //! THE STORAGE MICROBENCHMARK: one real frame's emissions, captured in the
-//! forward (`CELESTE_EMIT_CAPTURE=DIR`, optionally `CELESTE_EMIT_CAPTURE_FRAME=F`),
+//! forward (`--emit-capture DIR`, optionally `--emit-capture-frame F`),
 //! replayed through the REAL storage code (`UnitSink`, the translation, the
 //! layer's gather, the edge file) by `rewrite bench-storage`, against the
 //! tree's visited set at the frame before - without the kernels, so a tweak
@@ -25,16 +25,10 @@ use super::unit::{RowBuf, UnitSink};
 use super::visited::{Key, VisitedSet};
 use super::StateId;
 
-/// The capture directory and frame (`CELESTE_EMIT_CAPTURE`,
-/// `CELESTE_EMIT_CAPTURE_FRAME`: any frame when unset).
+/// The capture directory and frame (`--emit-capture`,
+/// `--emit-capture-frame`: any frame when unset).
 fn capture_target() -> Option<&'static (PathBuf, Option<u32>)> {
-    static T: std::sync::OnceLock<Option<(PathBuf, Option<u32>)>> = std::sync::OnceLock::new();
-    T.get_or_init(|| {
-        let dir = crate::knobs::value("CELESTE_EMIT_CAPTURE")?;
-        let frame = crate::knobs::number("CELESTE_EMIT_CAPTURE_FRAME");
-        Some((PathBuf::from(dir), frame))
-    })
-    .as_ref()
+    crate::settings::get().diag.emit_capture.as_ref()
 }
 
 /// One wave worker's capture stream.
@@ -55,8 +49,7 @@ impl CaptureWriter {
         let dir = root.join(format!("f{frame:03}"));
         std::fs::create_dir_all(&dir).expect("the capture dir");
         if worker == 0 {
-            let vars: Vec<String> = std::env::vars().filter(|(k, _)| k.starts_with("CELESTE_")).map(|(k, v)| format!("{k}={v}")).collect();
-            std::fs::write(dir.join("env.txt"), format!("frame {frame}\nlevel {level}\n{}\n", vars.join("\n"))).expect("the capture's env");
+            std::fs::write(dir.join("env.txt"), format!("frame {frame}\nlevel {level}\nsettings {}\n", crate::settings::get().cart_key())).expect("the capture's env");
         }
         let f = std::fs::File::create(dir.join(format!("w{worker:03}.bin"))).expect("a capture stream");
         Some(CaptureWriter { dir, worker, out: std::io::BufWriter::with_capacity(8 << 20, f) })

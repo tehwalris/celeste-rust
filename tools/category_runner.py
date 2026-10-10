@@ -6,7 +6,8 @@ and verify every result end to end.
 
 JOBS.json: a list of {"cat": "nodiag", "room": "0,0", "name": "100m",
 "offset": 27, "levels": "r0sxhn,r0sxh", "l1": true, "mem": "60G"} (optional:
-"env" for the search, e.g. {"CELESTE_TRIM_ROWS": "1"}; "tag"; "timeout"; "reuse": a level-0 tree directory, moved in when it exists and moved back
+"flags": more flags for the search, e.g. ["--trim-rows"] (a job's old "env"
+of CELESTE_* variables is translated: the binaries refuse the environment); "tag"; "timeout"; "reuse": a level-0 tree directory, moved in when it exists and moved back
 there when the job ends - so jobs can count horizons up on one kept tree;
 "to": a horizon H instead of the reference - `--to H`, level -1 at H, and a
 refutation is a result (the optimum is above H); "keep_tree": leave the tree
@@ -18,12 +19,11 @@ already in OUTDIR/results.jsonl is skipped.
 Per job:
  0. the room's start as real play enters it: its loading frame from object
     J (pico8_diff/chain.py entry_jank: the category's boot chain; a job's
-    "jank": J or "none"), for the search (CELESTE_LOADING_JANK) and every replay;
+    "jank": J or "none"), for the search (--loading-jank) and every replay;
  1. the reference: the community TAS replayed in the ORIGINAL cart behind the
     room's prologue (the earliest offset around `offset` that exits);
  2. `rewrite search --ceiling REF --prefer <the community TAS>` with the
-    category's mode (CELESTE_NODIAG / CELESTE_ONLYDIAG / CELESTE_GEMSKIP /
-    CELESTE_HUNDRED) and
+    category's mode (--nodiag / --onlydiag / --gemskip / --hundred) and
     the level -1 filter if `l1` (retried without it if its table refuses);
     `--to H` instead with a job's "to";
  3. our witness replayed in the original cart (must exit at the optimum; no
@@ -47,17 +47,36 @@ UI = "/var/tmp/celeste-ui/data"
 CAT_LABEL = {"nodiag": "No Diagonal Dashes", "gemskipany": "Gemskip any%", "gemskipnodiag": "Gemskip No Diagonal Dashes", "100": "100%", "onlydiag": "Only Diagonal Dashes"}
 
 
-def mode_env(cat):
-    env = {}
+def mode_flags(cat):
+    flags = []
     if "nodiag" in cat:
-        env["CELESTE_NODIAG"] = "1"
+        flags.append("--nodiag")
     if "onlydiag" in cat:
-        env["CELESTE_ONLYDIAG"] = "1"
+        flags.append("--onlydiag")
     if cat.startswith("gemskip"):
-        env["CELESTE_GEMSKIP"] = "1"
+        flags.append("--gemskip")
     if cat in ("100", "gemskip100"):
-        env["CELESTE_HUNDRED"] = "1"
-    return env
+        flags.append("--hundred")
+    return flags
+
+
+# A job's old "env" (CELESTE_* variables, before the settings were flags).
+ENV_FLAGS = {"CELESTE_TRIM_ROWS": "--trim-rows", "CELESTE_SPLIT_FRAME": "--split-frame", "CELESTE_THREADS": "--threads", "CELESTE_REGION": "--region", "CELESTE_STORAGE_REGION": "--storage-region", "CELESTE_MIN_FREE_GB": "--min-free-gb"}
+
+
+def job_flags(job):
+    flags = list(job.get("flags", []))
+    for k, v in job.get("env", {}).items():
+        if k not in ENV_FLAGS:
+            raise SystemExit(f"job {job}: env {k} has no flag here: give it in \"flags\"")
+        flag = ENV_FLAGS[k]
+        if flag in ("--trim-rows", "--split-frame"):
+            if v != "1":
+                raise SystemExit(f"job {job}: {k}={v!r}: a flag is 1")
+            flags.append(flag)
+        else:
+            flags += [flag, v]
+    return flags
 
 
 def replay_args(cat):
@@ -244,15 +263,15 @@ def run(job, outdir, binary):
     open(prefer, "w").write(",".join(map(str, [0] * prologue + dbin)))
     # 2. the search
     def search(l1):
-        env = dict(os.environ, **mode_env(cat), **job.get("env", {}))
-        env["CELESTE_LOADING_JANK"] = str(jank) if jank else "none"
+        flags = mode_flags(cat) + job_flags(job)
+        flags += ["--loading-jank", str(jank) if jank else "none"]
         # The concrete steps under the community file's balloon seeds ([]: 0):
         # the witness is then one real run under them.
-        env["CELESTE_CONCRETE_BALLOON_SEEDS"] = seeds
+        flags += [f"--concrete-balloon-seeds={seeds}"]
         if l1:
             # Level -1 counts search steps: two a frame under the split frame.
-            steps = horizon * (2 if env.get("CELESTE_SPLIT_FRAME") else 1)
-            env["CELESTE_LEVEL_MINUS_ONE"] = f"{steps},5"
+            steps = horizon * (2 if "--split-frame" in flags else 1)
+            flags += ["--level-minus-one", f"{steps},5"]
         log = os.path.join(jd, "search.log")
         tree = os.path.join(jd, "tree")
         release_tree()
@@ -262,10 +281,10 @@ def run(job, outdir, binary):
         if job.get("reuse") and os.path.isdir(job["reuse"]):
             os.makedirs(tree)
             shutil.move(job["reuse"], os.path.join(tree, "level00"))
-        cmd = [f"{M}/safe-run.sh", "--memory", job.get("mem", "60G"), "--", binary, "search", "--room", room, "--to" if "to" in job else "--ceiling", str(horizon), "--level", job["levels"], "--prefer", prefer, "--save-marks", os.path.join(jd, "marks"), "--checkpoint-dir", os.path.join(jd, "tree")]
+        cmd = [f"{M}/safe-run.sh", "--memory", job.get("mem", "60G"), "--", binary, "search", "--room", room, "--to" if "to" in job else "--ceiling", str(horizon), "--level", job["levels"], "--prefer", prefer, "--save-marks", os.path.join(jd, "marks"), "--checkpoint-dir", os.path.join(jd, "tree")] + flags
         t = time.time()
         with open(log, "w") as f:
-            rc = subprocess.run(cmd, stdout=f, stderr=subprocess.STDOUT, env=env, cwd=M, timeout=job.get("timeout", 4 * 3600)).returncode
+            rc = subprocess.run(cmd, stdout=f, stderr=subprocess.STDOUT, cwd=M, timeout=job.get("timeout", 4 * 3600)).returncode
         return rc, open(log, errors="replace").read(), time.time() - t
     horizon = job.get("to", ref)
     keep = job.get("keep_tree")

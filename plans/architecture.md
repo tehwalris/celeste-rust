@@ -87,7 +87,7 @@ crates/celeste-engine    Rt2 block model, boundary/keys, lane primitives        
 The traced program is `lua/builtin_level_3.lua` + `lua/builtin_level_4.lua` +
 `lua/celeste-minimal.lua` (`cart::sources_in`). Measure THAT, not the OCaml
 project's reference cart (`celeste_ocaml/celeste.lua`), which is right for
-semantics and wrong for counting anything. `CELESTE_SPLIT_FRAME=1` loads
+semantics and wrong for counting anything. `--split-frame` loads
 `lua/celeste-minimal-split.lua` instead: `_update` as two steps around the
 player's move (part a: timers, freeze, objects up to and including the
 player's `move`; part b: the player's update - the buttons - and the rest), so
@@ -198,7 +198,7 @@ commutative, so no operand order can protect another.
 from the start state, walk (shape, region) nodes in parallel rounds, each
 traced against the round's lattice snapshot in a fresh copy of the walk's
 arena (reproducible node counts); narrowings re-trace a shape's regions only
-once no new region is left. A region (`RegionGrid`, `CELESTE_REGION`, default
+once no new region is left. A region (`RegionGrid`, `--region`, default
 16 px) bounds the player's whole-pixel `x`/`y` (and `rem` to [-0.5, 0.5),
 speed to [-S, S], S <= 7 because `move`'s loop is unrolled for `abs(amount)
 <= 8`), all guarded per lane; the range analysis folds the far objects'
@@ -277,7 +277,7 @@ in the dictionaries (read-only during a wave); a code they lack makes the
 state new and its key PROVISIONAL (its content interned), made final by
 the translation, which appends the frame's new codes sorted - so keys stay
 canonical. Checked per row against `Rt2::boundary_canonicalize` keyed in
-the same dictionaries by `CELESTE_KERNEL_KEY_CHECK=1`. FIELD_NAMES' order
+the same dictionaries by `--key-check`. FIELD_NAMES' order
 feeds the shape hash (a shape's name; its signature is stored and compared)
 and the cell numbering: a reordering is a different search. The key holds
 NO POSITION (`29d8364`): the position object's (player, else
@@ -321,7 +321,7 @@ the unit row cache, the raw edge records and the inversion):
 
 - **The visited set** (`storage::visited`): per (shape, storage REGION) a
   table of ENTRIES - a position-free key and a mask over the region's cells.
-  A storage region is `CELESTE_STORAGE_REGION` (8 default, or 16) cells
+  A storage region is `--storage-region` (8 default, or 16) cells
   square, aligned as the kernels' regions (`div_euclid`) and nested in one
   (the kernels' px a multiple of it, else refused); `NO_CELL` is one more
   region per shape. Room (6,2) 100% f57: 43.8M states in 2.19M entries,
@@ -357,7 +357,7 @@ the unit row cache, the raw edge records and the inversion):
 The result is a function of the frame, not of scheduling: identical at 3
 and 32 threads (states and edge content, room (1,0) f0-f50), over a resume,
 and under `gates/raise.sh`. `rewrite bench-storage` replays one captured
-frame (`CELESTE_EMIT_CAPTURE`) through this code without the kernels, and
+frame (`--emit-capture`) through this code without the kernels, and
 reproduces the real tree's `ckhash` lines of that frame.
 
 ## The recorded graph (storage v2, 2026-10-10)
@@ -400,7 +400,7 @@ kernel. An edge recorded at frame f leaves a state of layer f - 1.
 `rewrite search --to H | --ceiling H [--level SPEC[,SPEC...]]`, per level of
 the list (coarsest first; one level is the usual case):
 
-1. **[Level -1]** (`CELESTE_LEVEL_MINUS_ONE="H,S"`, plans/level-minus-one.md):
+1. **[Level -1]** (`--level-minus-one H,S`, plans/level-minus-one.md):
    cells that provably cannot exit by H are dropped at the flush.
 2. **The forward** at the level (default `r0sx`; `r0sxhn` for an object
    room), to H, into `<dir>/level{i:02}` (`ForwardState`: resumed from its
@@ -506,14 +506,14 @@ f1-f97: 6.3M sources re-expanded, 6.1M states added; the door's reload
 tree is identical (`ckhash --edges`, pos graph). The notes
 cost the forward nothing measurable (fresh 98: 265 s, the build before
 them 272 s) and 82 MB on a 29 GB tree. Refused, loudly: a trimmed tree
-(`CELESTE_TRIM_ROWS`: the sources' values are gone), the orb room (its
+(`--trim-rows`: the sources' values are gone), the orb room (its
 not-expanded rows depend on the horizon), another S or a changed table, a
 tree without a record (only used where complete), and a tree whose raise was
 interrupted (`raising.txt`: half raised, delete it). A FINER level's tree
 (the objects ladder) is filtered by the coarser marks for one horizon; it is
 kept only for the same marks (with deadlines), horizon and level -1
 (`filtered_for.txt`), else built again - it is the cheap one.
-`CELESTE_TRIM_ROWS=1` (2026-10-07) trims every frame's checkpoint files to
+`--trim-rows` (2026-10-07) trims every frame's checkpoint files to
 keys, ids, cells and wins once a later frame is complete
 (`checkpoint::trim`): the search, a resume and `export-ui` read nothing
 else of an old frame, and the rows' values are most of a tree's frames
@@ -528,7 +528,7 @@ forward starts it, with the room, category and region settings;
 reuse, a raise, the arc phase and the diagnostics; a tree without the record
 is refused). One kernel set is resident; a call at another level drops it and builds
 that level's. Fused graphs are dropped
-after assembly unless `CELESTE_KERNEL_EXPLAIN`.
+after assembly unless `--kernel-explain`.
 
 **The concrete search runs at the LAST level only** (2026-10-08). A coarser
 level's try at its bound almost never wins (its bound is loose wherever its
@@ -568,7 +568,7 @@ ladder".
 Win conditions: the room exit (`game_runner::win_room()`, including the wrap
 from a row's last room to (0, y+1)); the summit's flag rect
 (`frame::win_rect`, `c195f8c`); the orb room's exit WITH the orb
-(`frame::orb_required`, `2dc116d`); a synthetic `CELESTE_WIN_AT_XY` /
+(`frame::orb_required`, `2dc116d`); a synthetic
 `--win-at` for experiments. Rooms past (5,2) start with
 `max_djump = 2` (`26a0e54`).
 
@@ -692,7 +692,7 @@ new `objects`. So the new room's objects from the leaving player's index J
 on get one update (move, then update) on the loading frame, and then the
 frame draws.
 
-`CELESTE_LOADING_JANK=J` (`trace::cart::apply_loading_frame`) appends that
+`--loading-jank J` (`trace::cart::apply_loading_frame`) appends that
 loop and a `_draw()` to the start room's load. J counts the ORIGINAL cart's
 objects; it is translated past the `message` and `flag` that the minimal cart
 lacks (`minimal_index`). Unset, the start is the IL load, and the binary says

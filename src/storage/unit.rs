@@ -352,7 +352,7 @@ pub struct UnitOut {
 /// The states requested in a wave, across its units: the first unit to
 /// request one copies its row and hands it to the translation; another
 /// unit's lid of it finds it after the translation (`wave::resolve_lids`).
-/// Under `CELESTE_KERNEL_KEY_CHECK=1` every request goes through, so the
+/// Under `--key-check` every request goes through, so the
 /// translation compares their rows.
 pub struct Claims {
     shards: Vec<std::sync::Mutex<rustc_hash::FxHashSet<(u64, u32, Key, u32)>>>,
@@ -462,7 +462,7 @@ pub struct UnitSink<'a> {
     /// Some (lid, cell) of the unit was disallowed: its edges and requests
     /// go at the unit's end.
     disallowed: bool,
-    /// `CELESTE_KERNEL_KEY_CHECK=1`: every emission's row, checked in batches.
+    /// `--key-check`: every emission's row, checked in batches.
     check: Vec<RowBuf>,
     drop_last: Option<((u64, u32), Option<u32>)>,
     xfer_ids: rustc_hash::FxHashMap<crate::search::arc_edges::Pair, u32>,
@@ -484,7 +484,7 @@ pub struct UnitSink<'a> {
     pending: Vec<u32>,
     /// TSC ticks of the units' ends (sort and encode), `phases`.
     pub end_ticks: u64,
-    /// `CELESTE_EMIT_CAPTURE`: this worker's stream (`bench`).
+    /// `--emit-capture`: this worker's stream (`bench`).
     capture: Option<super::bench::CaptureWriter>,
     /// The shapes this worker noted (`note_shape`).
     noted: rustc_hash::FxHashSet<u64>,
@@ -925,7 +925,7 @@ impl<'a> UnitSink<'a> {
     }
 
     /// The worker's units are over: its blocks file complete, its capture
-    /// stream and transfer table written (`CELESTE_EMIT_CAPTURE`).
+    /// stream and transfer table written (`--emit-capture`).
     pub fn finish(&mut self) -> Result<()> {
         if let Some(b) = self.blocks.take() {
             b.finish()?;

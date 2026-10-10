@@ -26,6 +26,9 @@ const DEFAULT_CHECKPOINT_DIR: &str = "/var/tmp/celeste-checkpoints";
 struct Cli {
     #[command(subcommand)]
     command: Command,
+    /// The run's settings (`settings::SettingsArgs`): given anywhere on the line.
+    #[command(flatten)]
+    settings: celeste_rust::settings::SettingsArgs,
 }
 
 #[derive(Subcommand)]
@@ -55,12 +58,6 @@ enum Command {
         /// The checkpoint dir: level i's tree goes to `level{i:02}/` under it.
         #[arg(long, default_value = DEFAULT_CHECKPOINT_DIR)]
         checkpoint_dir: String,
-        /// Start room "x,y".
-        #[arg(long, default_value = "1,0")]
-        room: String,
-        /// Optional synthetic win "x,y" (CELESTE_WIN_AT_XY) for a cheap run.
-        #[arg(long)]
-        win_at: Option<String>,
         /// Stop at the arc bound (no concrete search).
         #[arg(long)]
         no_witness: bool,
@@ -85,8 +82,8 @@ enum Command {
     },
     /// A KNOWN solution against the pruning of finished search trees
     /// (`search::known`): stepped through the reference engine, at every
-    /// step it must pass level -1 (`CELESTE_LEVEL_MINUS_ONE`, as the search
-    /// ran) and the objects ladder's filter, and at every frame boundary
+    /// step it must pass level -1 (the filter the tree recorded) and the
+    /// objects ladder's filter, and at every frame boundary
     /// project onto an arc-graph node whose W holds its exact remainder,
     /// reached (at a level that filters the next) - per level of `--level`,
     /// the arc phase rerun over `<checkpoint-dir>/level{i:02}` as `search`
@@ -106,12 +103,6 @@ enum Command {
         /// The search's horizon in frames (the trees must reach it).
         #[arg(long)]
         horizon: u32,
-        /// Start room "x,y".
-        #[arg(long, default_value = "1,0")]
-        room: String,
-        /// The synthetic win "x,y" the search ran with, if any.
-        #[arg(long)]
-        win_at: Option<String>,
     },
     /// ONE forward pass at ONE level, exactly as the search runs it, with the
     /// per-frame timing line. The profiling entry point for the forward.
@@ -125,9 +116,6 @@ enum Command {
         /// Checkpoint dir (frames land under it).
         #[arg(long, default_value = DEFAULT_CHECKPOINT_DIR)]
         checkpoint_dir: String,
-        /// Start room "x,y".
-        #[arg(long, default_value = "1,0")]
-        room: String,
         /// Run the REFERENCE engine instead of the kernels: `ckhash` of the
         /// two trees must agree. Slow. Not at held-unknown levels.
         #[arg(long)]
@@ -152,8 +140,6 @@ enum Command {
         from: u32,
         #[arg(long)]
         to: u32,
-        #[arg(long, default_value = "1,0")]
-        room: String,
         /// The fine level's marks (`hNNN/levelNN.marks.bin`): only its
         /// marked rows are projected.
         #[arg(long)]
@@ -172,9 +158,6 @@ enum Command {
         /// Last frame to fingerprint.
         #[arg(long)]
         to: u32,
-        /// Start room "x,y" (the cell numbering depends on it).
-        #[arg(long, default_value = "1,0")]
-        room: String,
         /// Also list the N most populated player positions at frame `to`
         /// (to pick a synthetic `--win-at` target with real fan-out).
         #[arg(long)]
@@ -202,7 +185,7 @@ enum Command {
     /// lines for F+1 - `f{F+1}` of the new states and, with `--edges`,
     /// `e{F+1}` of the edges - so a tree extended past F checks it; per rep
     /// (stderr) the wave, translation and layer + edge file walls and the
-    /// workers' phases (`CELESTE_PHASES`: pack, kernel, emit, unit end);
+    /// workers' phases (`--phases`: pack, kernel, emit, unit end);
     /// `kernel lanes: ... missed 0`. With `--metrics FILE`, the EXACT
     /// metrics of the first rep (kernel census and dynamic instructions,
     /// lanes, emissions, states, edges: `tools/metrics_diff.py` compares
@@ -216,8 +199,6 @@ enum Command {
         frame: Option<u32>,
         #[arg(long, default_value_t = 1)]
         reps: usize,
-        #[arg(long, default_value = "1,0")]
-        room: String,
         /// The level to run at (the tree's).
         #[arg(long, value_parser = Level::parse, default_value = "r0sx")]
         level: Level,
@@ -225,9 +206,6 @@ enum Command {
         /// deleted per rep), as the search's forward does.
         #[arg(long, default_value_t = false)]
         edges: bool,
-        /// Worker threads (`CELESTE_THREADS`; the metrics' units and slices depend on it).
-        #[arg(long)]
-        threads: Option<usize>,
         /// Write the first rep's exact metrics to this file.
         #[arg(long)]
         metrics: Option<String>,
@@ -251,13 +229,6 @@ enum Command {
         frame: u32,
         #[arg(long, default_value_t = 1)]
         reps: usize,
-        #[arg(long, default_value = "1,0")]
-        room: String,
-        /// A synthetic win "x,y" (CELESTE_WIN_AT_XY), as the tree was run.
-        #[arg(long)]
-        win_at: Option<String>,
-        #[arg(long)]
-        threads: Option<usize>,
     },
     /// A finished tree's edges counted against the target layouts of
     /// plans/storage-unify.md (built lids, unified per-region sets, hybrids):
@@ -272,15 +243,15 @@ enum Command {
         encode: String,
     },
     /// BENCH: replay one captured frame through the REAL storage code
-    /// (`storage::bench`): a forward run with `CELESTE_EMIT_CAPTURE=DIR`
-    /// (and `CELESTE_EMIT_CAPTURE_FRAME=F`) writes `DIR/f{F}/`; this replays
+    /// (`storage::bench`): a forward run with `--emit-capture DIR`
+    /// (and `--emit-capture-frame F`) writes `DIR/f{F}/`; this replays
     /// its units against `--tree`'s visited set at frame F-1 - the sinks,
     /// then (`--phase translate|all`) the translation and the layer, then
     /// (`all`) the edge file - printing per rep each phase's wall time and the
     /// validation: requests, lids, edges, new states, and the `ckhash` lines
     /// of the new states (`f`) and of the edges (`e`), to compare with the
-    /// real tree's (`ckhash --edges`). Run it under the capture's env
-    /// (`DIR/f{F}/env.txt`: the room, the level, CELESTE_HUNDRED, ...).
+    /// real tree's (`ckhash --edges`). Run it with the capture's settings
+    /// (`DIR/f{F}/env.txt`: the level and the settings line).
     BenchStorage {
         /// A captured frame's directory (`DIR/f{F}`).
         #[arg(long)]
@@ -288,12 +259,8 @@ enum Command {
         /// The level dir the capture's frame was run on (its frames to F-1).
         #[arg(long)]
         tree: String,
-        #[arg(long, default_value = "1,0")]
-        room: String,
         #[arg(long, value_parser = Level::parse, default_value = "r0sx")]
         level: Level,
-        #[arg(long)]
-        threads: Option<usize>,
         /// `units`, `translate` (and the layer) or `all` (and the edge file).
         #[arg(long, default_value = "all")]
         phase: String,
@@ -312,11 +279,6 @@ enum Command {
     ArcCheck {
         #[arg(long)]
         level_dir: String,
-        #[arg(long, default_value = "1,0")]
-        room: String,
-        /// A synthetic win "x,y" (CELESTE_WIN_AT_XY), as the tree was run.
-        #[arg(long)]
-        win_at: Option<String>,
         #[arg(long, default_value_t = 1)]
         from: u32,
         #[arg(long)]
@@ -331,9 +293,6 @@ enum Command {
         /// lowest point dropped), which must make it fail.
         #[arg(long)]
         fault: Option<String>,
-        /// Worker threads, a reference engine each (`CELESTE_THREADS`).
-        #[arg(long)]
-        threads: Option<usize>,
         /// At most this many reference fork paths a step: a sample whose
         /// source takes more is SKIPPED (counted and reported; it bounds a
         /// sample's time and memory where widened objects fork the
@@ -392,9 +351,6 @@ enum Command {
         frame: u32,
         #[arg(long, value_parser = Level::parse)]
         level: Level,
-        /// Start room "x,y" (`CELESTE_START_ROOM` when not given).
-        #[arg(long)]
-        room: Option<String>,
         #[arg(long, default_value_t = 0)]
         emitted: usize,
     },
@@ -418,12 +374,6 @@ enum Command {
         /// Show up to this many differing successors per row and side.
         #[arg(long, default_value_t = 3)]
         show: usize,
-        /// Start room "x,y" (`CELESTE_START_ROOM` when not given).
-        #[arg(long)]
-        room: Option<String>,
-        /// Rows checked in parallel, a reference engine each (`CELESTE_THREADS`).
-        #[arg(long)]
-        threads: Option<usize>,
         /// At most this many reference fork paths a row: a row that takes
         /// more is SKIPPED (counted and reported), as in `arc-check`.
         #[arg(long)]
@@ -490,19 +440,16 @@ enum Command {
     },
     /// AUDIT: did any kernel ever take a lane outside its bounds? Every
     /// stored row of every frame (a kernel's inputs are stored rows): the
-    /// player's `spd.x`/`spd.y` outside `[-S, S]` px (`CELESTE_REGION`'s S)
+    /// player's `spd.x`/`spd.y` outside `[-S, S]` px (`--region`'s S)
     /// and `rem.x`/`rem.y` outside `[-0.5, 0.5)`; a moving platform's `x`/
     /// `last` outside its path, `rem.x` outside `[-0.5, 0.5)`, `spd.x` outside
     /// its range over the platform worlds (`--room` needed); a fly fruit's
     /// `spd.y`/`rem.y` outside the `f` level's literals. Until `Op::Restrict`
     /// a kernel did not check these; frames whose rows were trimmed
-    /// (`CELESTE_TRIM_ROWS`) are counted, not read.
+    /// (`--trim-rows`) are counted, not read.
     BoundsAudit {
         #[arg(long)]
         level_dir: String,
-        /// The tree's room: the platform worlds come from it.
-        #[arg(long)]
-        room: Option<String>,
     },
     /// DIAGNOSTIC: per-column cardinalities of one frame, streamed. Per
     /// shape: rows, every varying column's distinct value count (capped at
@@ -539,8 +486,6 @@ enum Command {
         /// Output directory (the UI serves it as `data/`).
         #[arg(long, default_value = "/var/tmp/celeste-ui/data")]
         out: String,
-        #[arg(long, default_value = "1,0")]
-        room: String,
         /// The search's `--save-marks` directory: the remainder-free and the
         /// arc backward's marks over the last level's tree (and the witness).
         #[arg(long)]
@@ -572,8 +517,6 @@ enum Command {
         /// abstract chain to realize (`ancestry --chain-out` writes one).
         #[arg(long)]
         trajectory: String,
-        #[arg(long, default_value = "1,0")]
-        room: String,
         /// Stop once a win is reached (default), else follow to the end.
         #[arg(long, default_value_t = true)]
         stop_at_win: bool,
@@ -602,7 +545,18 @@ enum Command {
         #[arg(long, default_value_t = 5)]
         show: usize,
     },
-    /// The level -1 table (`CELESTE_START_ROOM`) against a known solution:
+    /// Record the settings of a tree built before trees recorded them
+    /// (`settings::Settings`), so it can be resumed or reused: give the
+    /// flags and `--level` it WAS built with - nothing can check them, which
+    /// is why a tree without the record is refused. Refuses a tree that has
+    /// one.
+    AdoptSettings {
+        #[arg(long)]
+        level_dir: String,
+        #[arg(long, value_parser = Level::parse)]
+        level: Level,
+    },
+    /// The level -1 table (`--room`) against a known solution:
     /// its concrete states (reference engine) at every frame f before the
     /// exit, each with the table's d. One that is too late for `--horizon`
     /// (f + d > H, H the solution's exit frame) is a SOUNDNESS violation of
@@ -693,18 +647,33 @@ fn rerun(engine: &dyn FrameStep, rt2: Rt2, layer: u32) -> Result<(Vec<Block>, bo
     Ok((wave.next, won))
 }
 
+/// The run's room, "x,y" (`--room`).
+fn room_text() -> String {
+    let (x, y) = celeste_rust::settings::get().room;
+    format!("{x},{y}")
+}
+
+/// The run's `--win-at`, as given (`x,y` or `x0..x1,y0..y1`).
+fn win_at_text() -> Option<String> {
+    let r = |a: i16, b: i16| if a == b { a.to_string() } else { format!("{a}..{b}") };
+    celeste_rust::settings::get().win_at.map(|(x0, x1, y0, y1)| format!("{},{}", r(x0, x1), r(y0, y1)))
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    celeste_rust::knobs::startup()?;
+    // `bench-frame` times the workers' phases; `--metrics` counts the
+    // kernels' census and slices (read when the kernels are built).
+    celeste_rust::settings::startup(&cli.settings, |s| {
+        if let Command::BenchFrame { metrics, .. } = &cli.command {
+            s.diag.phases = true;
+            s.diag.kernel_metrics = metrics.is_some();
+        }
+    })?;
 
     match cli.command {
-        Command::Search { to, ceiling, level, checkpoint_dir, room, win_at, no_witness, save_marks, prefer } => {
+        Command::Search { to, ceiling, level, checkpoint_dir, no_witness, save_marks, prefer } => {
             let prefer: Option<Vec<u8>> = prefer.as_deref().map(celeste_rust::concrete::read_inputs).transpose()?;
             use celeste_rust::search::arc_dp::solve;
-            std::env::set_var("CELESTE_START_ROOM", &room);
-            if let Some(xy) = &win_at {
-                std::env::set_var("CELESTE_WIN_AT_XY", xy);
-            }
             let horizon = match (ceiling, to) {
                 (Some(h), None) | (None, Some(h)) => h,
                 _ => anyhow::bail!("give the horizon: --to H, or --ceiling H for a known solution"),
@@ -713,6 +682,7 @@ fn main() -> Result<()> {
             // count search steps (two a frame under the split frame).
             let steps = horizon * celeste_rust::frame::steps_per_frame();
             let levels: Vec<Level> = level.split(',').map(Level::parse).collect::<std::result::Result<_, _>>().map_err(|e| anyhow::anyhow!(e))?;
+            let room = room_text();
             eprintln!("[search] room {room}, levels {level}, horizon {horizon}");
             let t0 = std::time::Instant::now();
             let base = std::path::Path::new(&checkpoint_dir);
@@ -727,7 +697,7 @@ fn main() -> Result<()> {
                 // horizon: kept only for the same marks, horizon and level
                 // -1, else built again (it is the cheap one).
                 let t = std::time::Instant::now();
-                let want = MinusOne::from_env();
+                let want = MinusOne::of_run();
                 let filter = prev.as_ref().map(|(m, l)| celeste_rust::frame::MarkFilter::new(m, *l));
                 if let Some((m, _)) = &prev {
                     let key = format!("steps {steps} level-1 {want:?} marks {} {:016x}\n", m.len(), m.filter_fingerprint());
@@ -779,7 +749,7 @@ fn main() -> Result<()> {
                             "# Room ({room}): the concrete witness of `rewrite search --level {level} --to {horizon}`{}.\n\
                              # Arc bound f{bound} (level {li}, {lvl}); no concrete win before f{f} inside the winning sets (exhaustive).\n\
                              # A balloon room's win may hold for some `rnd` draws only: replay with seeds.\n{}\n",
-                            win_at.as_ref().map_or(String::new(), |w| format!(" --win-at {w}")),
+                            win_at_text().map_or(String::new(), |w| format!(" --win-at {w}")),
                             w.inputs_text()
                         ),
                     )?;
@@ -797,12 +767,8 @@ fn main() -> Result<()> {
                 prev = Some((s.arc_marks.expect("asked for"), lvl));
             }
         }
-        Command::CheckKnown { checkpoint_dir, level, inputs, horizon, room, win_at } => {
+        Command::CheckKnown { checkpoint_dir, level, inputs, horizon } => {
             use celeste_rust::search::arc_dp::solve;
-            std::env::set_var("CELESTE_START_ROOM", &room);
-            if let Some(xy) = &win_at {
-                std::env::set_var("CELESTE_WIN_AT_XY", xy);
-            }
             let inputs = celeste_rust::concrete::read_inputs(&inputs)?;
             let steps = horizon * celeste_rust::frame::steps_per_frame();
             let levels: Vec<Level> = level.split(',').map(Level::parse).collect::<std::result::Result<_, _>>().map_err(|e| anyhow::anyhow!(e))?;
@@ -832,10 +798,8 @@ fn main() -> Result<()> {
             to,
             level,
             checkpoint_dir,
-            room,
             reference,
         } => {
-            std::env::set_var("CELESTE_START_ROOM", &room);
             let t = std::time::Instant::now();
             let engine: Box<dyn FrameStep> = if reference {
                 Box::new(std::sync::Mutex::new(celeste_rust::trace::refengine::RefEngine::new()?.at_level(level)))
@@ -849,7 +813,7 @@ fn main() -> Result<()> {
             let fwd = celeste_rust::frame::grow_tree(
                 dir,
                 to,
-                MinusOne::from_env(),
+                MinusOne::of_run(),
                 None,
                 level,
                 || Ok(engine),
@@ -866,9 +830,8 @@ fn main() -> Result<()> {
             }
             celeste_rust::metrics::dump("forward", Some(dir), &[("level", level.to_string())]);
         }
-        Command::DiagProject { fine_dir, coarse_dir, level, from, to, room, fine_marks, coarse_marks } => {
+        Command::DiagProject { fine_dir, coarse_dir, level, from, to, fine_marks, coarse_marks } => {
             use celeste_rust::frame::load_frame;
-            std::env::set_var("CELESTE_START_ROOM", &room);
             let load_marks = |p: Option<String>| p.map(|p| Visited::load(std::path::Path::new(&p))).transpose();
             let (fine_marks, coarse_marks) = (load_marks(fine_marks)?, load_marks(coarse_marks)?);
             let (fine, coarse) = (std::path::Path::new(&fine_dir), std::path::Path::new(&coarse_dir));
@@ -920,13 +883,11 @@ fn main() -> Result<()> {
         Command::Ckhash {
             checkpoint_dir,
             to,
-            room,
             cells: top_cells,
             edges,
             dropped,
             dump_edges,
         } => {
-            std::env::set_var("CELESTE_START_ROOM", &room);
             let dir = std::path::Path::new(&checkpoint_dir);
             // Fingerprints over CONTENT (`exact::ContentHash`): a raised tree's
             // dictionaries grew in another order than a fresh one's.
@@ -1034,18 +995,8 @@ fn main() -> Result<()> {
                 }
             }
         }
-        Command::BenchFrame { level_dir, frame, reps, room, level, edges, threads, metrics } => {
+        Command::BenchFrame { level_dir, frame, reps, level, edges, metrics } => {
             use celeste_rust::compiled::dispatch::{print_stats, take_kernel_stats};
-            std::env::set_var("CELESTE_START_ROOM", &room);
-            if let Some(n) = threads {
-                std::env::set_var("CELESTE_THREADS", n.to_string());
-            }
-            // The workers' phase timers, and the kernels' census and slice
-            // counters (read once, before the engine exists).
-            std::env::set_var("CELESTE_PHASES", "1");
-            if metrics.is_some() {
-                std::env::set_var("CELESTE_KERNEL_METRICS", "1");
-            }
             let dir = std::path::PathBuf::from(&level_dir);
             let frame = match frame {
                 Some(f) => f,
@@ -1108,7 +1059,7 @@ fn main() -> Result<()> {
                         let slices: u64 = kernels.iter().map(|k| k.1).sum();
                         let insts: u64 = kernels.iter().map(|(_, n, c)| n * c.get("insts").copied().unwrap_or(0)).sum();
                         eprintln!("[bench] kernels: {insts} dynamic instructions over {slices} slices ({} a slice; call-outs' callees aside)", insts.checked_div(slices).unwrap_or(0));
-                        let text = frame_metrics(&room, level, frame, w, &ks);
+                        let text = frame_metrics(&room_text(), level, frame, w, &ks);
                         std::fs::write(path, text).with_context(|| path.clone())?;
                     }
                     celeste_rust::compiled::mix::reset_slices();
@@ -1119,14 +1070,7 @@ fn main() -> Result<()> {
             let ks = take_kernel_stats();
             anyhow::ensure!(ks.missed == 0, "KERNEL COVERAGE GAP: {} lanes missed", ks.missed);
         }
-        Command::BenchBackward { level_dir, horizon, frame, reps, room, win_at, threads } => {
-            std::env::set_var("CELESTE_START_ROOM", &room);
-            if let Some(xy) = &win_at {
-                std::env::set_var("CELESTE_WIN_AT_XY", xy);
-            }
-            if let Some(n) = threads {
-                std::env::set_var("CELESTE_THREADS", n.to_string());
-            }
+        Command::BenchBackward { level_dir, horizon, frame, reps } => {
             anyhow::ensure!(frame < horizon, "--frame {frame}: below the horizon {horizon}");
             let dir = std::path::Path::new(&level_dir);
             let t = std::time::Instant::now();
@@ -1171,10 +1115,9 @@ fn main() -> Result<()> {
             let encode: Vec<u32> = encode.split(',').filter(|s| !s.is_empty()).map(|s| s.parse()).collect::<Result<_, _>>()?;
             celeste_rust::storage::census::census(&celeste_rust::storage::census::CensusArgs { dir: std::path::Path::new(&level_dir), to, encode: &encode })?;
         }
-        Command::BenchStorage { capture, tree, room, level, threads, phase, reps } => {
-            std::env::set_var("CELESTE_START_ROOM", &room);
-            let threads = threads.unwrap_or_else(celeste_rust::frame::threads);
-            celeste_rust::settings::Settings::current().check(std::path::Path::new(&tree), level)?;
+        Command::BenchStorage { capture, tree, level, phase, reps } => {
+            let threads = celeste_rust::frame::threads();
+            celeste_rust::settings::get().check(std::path::Path::new(&tree), level)?;
             celeste_rust::storage::bench::bench_storage(&celeste_rust::storage::bench::BenchArgs {
                 capture: std::path::Path::new(&capture),
                 tree: std::path::Path::new(&tree),
@@ -1262,18 +1205,11 @@ fn main() -> Result<()> {
                 states_in[3]
             );
         }
-        Command::ArcCheck { level_dir, room, win_at, from, to, samples, level, fault, threads, path_cap } => {
+        Command::ArcCheck { level_dir, from, to, samples, level, fault, path_cap } => {
             use celeste_engine::runtime2::{Col, AV};
             use celeste_rust::search::arcs::{point, Rect, Rects, Set, CIRCLE};
-            std::env::set_var("CELESTE_START_ROOM", &room);
-            if let Some(xy) = &win_at {
-                std::env::set_var("CELESTE_WIN_AT_XY", xy);
-            }
-            if let Some(n) = threads {
-                std::env::set_var("CELESTE_THREADS", n.to_string());
-            }
             let dir = std::path::Path::new(&level_dir);
-            celeste_rust::settings::Settings::current().check(dir, level)?;
+            celeste_rust::settings::get().check(dir, level)?;
             let edges_dir = dir.join("edges");
             let ids = celeste_rust::compiled::ids();
             let graph = celeste_rust::storage::edges::EdgeStore::open(&edges_dir, to)?;
@@ -1545,16 +1481,13 @@ fn main() -> Result<()> {
                 println!("f{frame:03}: {rows} rows -> {n} states ({:.2}x fewer); {} states through f{frame:03}", rows as f64 / n.max(1) as f64, through.len());
             }
         }
-        Command::WidenCheck { level_dir, frame, level, room, emitted } => {
-            if let Some(r) = &room {
-                std::env::set_var("CELESTE_START_ROOM", r);
-            }
+        Command::WidenCheck { level_dir, frame, level, emitted } => {
             anyhow::ensure!(
                 !(level.floors_near && frame % celeste_rust::frame::steps_per_frame() != 0),
                 "step {frame} is mid split frame at a near level: the graph side keeps a floor's computed `collideable` there, the block side does not"
             );
             let dir = std::path::Path::new(&level_dir);
-            celeste_rust::settings::Settings::current().check(dir, level)?;
+            celeste_rust::settings::get().check(dir, level)?;
             let ids = celeste_rust::compiled::ids();
             // Every lane of `rt2` against its block-side widening, exactly:
             // the lanes it moved (the first few printed, `shown` so far).
@@ -1604,15 +1537,9 @@ fn main() -> Result<()> {
             println!("[widen-check] step {frame} at {level}: {stored} stored rows, {emitted_rows} emitted from {emitted}; {moved} moved by the block side's widening");
             anyhow::ensure!(moved == 0, "widen-check: {moved} rows the block side's widening changes (the table's two sides disagree)");
         }
-        Command::RefCheck { level_dir, frame, level, samples, cell, show, room, threads, path_cap } => {
-            if let Some(r) = &room {
-                std::env::set_var("CELESTE_START_ROOM", r);
-            }
-            if let Some(n) = threads {
-                std::env::set_var("CELESTE_THREADS", n.to_string());
-            }
+        Command::RefCheck { level_dir, frame, level, samples, cell, show, path_cap } => {
             let dir = std::path::Path::new(&level_dir);
-            celeste_rust::settings::Settings::current().check(dir, level)?;
+            celeste_rust::settings::get().check(dir, level)?;
             let kernels = celeste_rust::compiled::FrameEngine::new_for_start_room(level)?;
             kernels.warm();
             let only = cell.map(cell_at).transpose()?;
@@ -1711,7 +1638,7 @@ fn main() -> Result<()> {
             let erase = prefixes(&erase);
             let parts: Vec<u32> = row.split(':').map(|s| s.trim().parse()).collect::<Result<_, _>>()?;
             let [layer, seq, r] = parts[..] else { anyhow::bail!("--row L:S:R") };
-            celeste_rust::settings::Settings::current().check(dir, level)?;
+            celeste_rust::settings::get().check(dir, level)?;
             let engine = celeste_rust::compiled::FrameEngine::new_for_start_room(level)?;
             let (_, f) = frame_files(dir, layer)?.into_iter().find(|(s, _)| *s == seq).ok_or_else(|| anyhow::anyhow!("no file l{layer} s{seq}"))?;
             anyhow::ensure!(r < f.width(), "row {r} past the file's {}", f.width());
@@ -1952,13 +1879,12 @@ fn main() -> Result<()> {
             println!("pairs whose transfers are exactly x-pieces x y-pieces: {product} ({:.1}%); x part constant {x_const} ({:.1}%), y part constant {y_const} ({:.1}%)", 100.0 * product as f64 / n_pairs as f64, 100.0 * x_const as f64 / n_pairs as f64, 100.0 * y_const as f64 / n_pairs as f64);
             println!("distinct transfer sets {}, x sets {}, y sets {} (the tree's table: {} pairs)", sets.len(), xsets.len(), ysets.len(), pairs.len());
         }
-        Command::BoundsAudit { level_dir, room } => {
+        Command::BoundsAudit { level_dir } => {
             use celeste_engine::runtime2::{Col, AV};
             use celeste_engine::widening::{FLY_FRUIT_SPD_Y, PLATFORM_PATH, REM as PLATFORM_REM, REM as FLY_FRUIT_REM_Y};
-            if let Some(room) = &room {
-                std::env::set_var("CELESTE_START_ROOM", room);
-            }
             let dir = std::path::Path::new(&level_dir);
+            // The platform worlds come from the room: the tree's.
+            celeste_rust::settings::get().check_any_level(dir)?;
             let ids = celeste_rust::compiled::ids();
             let speed = celeste_rust::trace::kernel::region_grid().map_or(7, |g| g.speed);
             let (spd_max, rem) = ((speed as i64) << 16, (-0x8000i64, 0x7fffi64));
@@ -2009,7 +1935,6 @@ fn main() -> Result<()> {
                         }
                         let platforms = rt2.objects_of_type(ids, ids.g_platform);
                         if !platforms.is_empty() && worlds.is_none() {
-                            anyhow::ensure!(room.is_some(), "the tree holds moving platforms: --room gives their worlds");
                             worlds = Some(celeste_rust::concrete::platform_worlds(celeste_rust::trace::kernel::PLATFORM_WORLD_FRAMES)?);
                         }
                         for &obj in &platforms {
@@ -2193,7 +2118,6 @@ fn main() -> Result<()> {
             checkpoint_dir,
             log,
             out,
-            room,
             arc,
             witness,
             reference,
@@ -2206,10 +2130,7 @@ fn main() -> Result<()> {
             if paths_only {
                 celeste_rust::search::ui_export::update_paths(std::path::Path::new(&out), paths)?;
             } else {
-                let (rx, ry) = room
-                    .split_once(',')
-                    .and_then(|(a, b)| Some((a.parse::<i16>().ok()?, b.parse::<i16>().ok()?)))
-                    .ok_or_else(|| anyhow::anyhow!("--room must be \"x,y\", got {room:?}"))?;
+                let (rx, ry) = celeste_rust::settings::get().room;
                 celeste_rust::search::ui_export::export(
                     std::path::Path::new(&checkpoint_dir),
                     std::path::Path::new(log.as_deref().expect("clap: --log is required without --paths-only")),
@@ -2222,12 +2143,10 @@ fn main() -> Result<()> {
         }
         Command::Trajectory {
             trajectory,
-            room,
             stop_at_win,
             spec,
             tree,
         } => {
-            std::env::set_var("CELESTE_START_ROOM", &room);
             let lines: Vec<(Option<(i32, i32)>, Option<(u64, u64)>)> = std::fs::read_to_string(&trajectory)?
                 .lines()
                 .map(|l| l.trim())
@@ -2343,7 +2262,7 @@ fn main() -> Result<()> {
         Command::Follow { level_dir, level, inputs, show } => {
             let dir = std::path::Path::new(&level_dir);
             let lvl = level;
-            celeste_rust::settings::Settings::current().check(dir, lvl)?;
+            celeste_rust::settings::get().check(dir, lvl)?;
             let bytes = celeste_rust::concrete::read_inputs(&inputs)?;
             // (key, cell) -> (layer, seq, row): where the tree first has it.
             let mut at: rustc_hash::FxHashMap<(u64, u64, u32), (u32, u32, u32)> = Default::default();
@@ -2428,6 +2347,14 @@ fn main() -> Result<()> {
                 states = next.into_iter().map(Block::into_rt2).collect();
             }
             println!("[follow] every frame is in the tree");
+        }
+        Command::AdoptSettings { level_dir, level } => {
+            let dir = std::path::Path::new(&level_dir);
+            anyhow::ensure!(dir.join("frames").join("f000").is_dir(), "{level_dir}: not a tree");
+            let path = celeste_rust::settings::path(dir);
+            anyhow::ensure!(!path.exists(), "{}: the tree records its settings already", path.display());
+            celeste_rust::settings::get().write(dir, level)?;
+            println!("[adopt-settings] {}:\n{}", path.display(), std::fs::read_to_string(&path)?);
         }
         Command::L1Check { inputs, horizon, spd } => {
             let bytes = celeste_rust::concrete::read_inputs(&inputs)?;

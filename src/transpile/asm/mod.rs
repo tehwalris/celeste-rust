@@ -42,7 +42,7 @@ pub fn compile_and_load_reprs(
     let so: PathBuf = assemble(&compiled.asm, tag)?;
     let t_asm = t1.elapsed();
     let loaded = Loaded::open(&so, &sym)?;
-    if crate::knobs::flag("CELESTE_BUILD_TRACE") {
+    if crate::settings::get().diag.build_trace {
         eprintln!(
             "[build] {tag}: {} roots, asm text {:.1} MB: compile {:.1}s, gcc+load {:.1}s",
             roots.len(),
@@ -59,12 +59,12 @@ pub fn compile_and_load_reprs(
     Ok((compiled, loaded))
 }
 
-/// `CELESTE_KERNEL_MIX=DIR`: the instruction-mix diagnostic
+/// `--kernel-mix DIR`: the instruction-mix diagnostic
 /// (`compiled::mix`) - provenance in the assembly, a report per kernel;
-/// `CELESTE_KERNEL_METRICS=1`: its census and slice counts only.
+/// `bench-frame --metrics`: its census and slice counts only.
 pub fn mix_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| crate::knobs::value("CELESTE_KERNEL_MIX").is_some() || crate::compiled::mix::metrics_on())
+    *ON.get_or_init(|| crate::settings::get().diag.kernel_mix.is_some() || crate::compiled::mix::metrics_on())
 }
 
 #[cfg(test)]

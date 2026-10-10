@@ -239,7 +239,7 @@ Room (3,3) at h172 (from the repo root: it loads cart/ for the
 tiles):
 
 ```bash
-CELESTE_LEVEL_MINUS_ONE="172,5" ./safe-run.sh -- ./target/quick/rewrite search \
+./safe-run.sh -- ./target/quick/rewrite search --level-minus-one 172,5 \
     --checkpoint-dir /var/tmp/arc33-172 --to 172 --room 3,3 --level r0sxhn \
     --save-marks /var/tmp/arc33-172-ui 2> /var/tmp/celeste-ui/room33arc172.log
 ./safe-run.sh -- ./target/quick/rewrite export-ui --checkpoint-dir /var/tmp/arc33-172 \

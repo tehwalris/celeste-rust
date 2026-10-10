@@ -32,7 +32,7 @@ F=${CELESTE_FIXTURES:-/var/tmp/celeste-fixtures}
 G=gates/fixtures
 C=${CHECK_DIR:-/var/tmp/celeste-check}
 TH=${THREADS:-16}
-L1_62="CELESTE_HUNDRED=1 CELESTE_LOADING_JANK=2 CELESTE_LEVEL_MINUS_ONE=94,5"
+L1_62="--hundred --loading-jank 2 --level-minus-one 94,5"
 FAILED=()
 mkdir -p "$C"
 LOG=$C/log
@@ -60,11 +60,11 @@ same() {
     fi
 }
 
-# frame NAME FRAME ROOM LEVEL ENV...: one forward frame from a fixture, its
+# frame NAME FRAME ROOM LEVEL FLAGS...: one forward frame from a fixture, its
 # f/e lines and exact metrics against the pins; timings shown.
 frame() {
     local name=$1 f=$2 room=$3 level=$4; shift 4
-    env "$@" CELESTE_L1_TABLE="$F/$name/l1-table.bin" ./safe-run.sh -- "$B" bench-frame --level-dir "$F/$name" --frame "$f" --room "$room" --level "$level" --edges --threads "$TH" --metrics "$C/$name.metrics" > "$C/$name.frame" || return 1
+    ./safe-run.sh -- "$B" bench-frame --level-dir "$F/$name" --frame "$f" --room "$room" --level "$level" --edges --threads "$TH" --metrics "$C/$name.metrics" --l1-table "$F/$name/l1-table.bin" "$@" > "$C/$name.frame" || return 1
     same "$C/$name.frame" "$G/$name.frame" || return 1
     if [[ $PIN == --pin ]]; then
         same "$C/$name.metrics" "$G/$name.metrics"
@@ -89,11 +89,11 @@ t1() {
     # The forward, one frame each, exact (and the run's timings).
     step frame-r10 frame r10 55 1,0 r0sxh
     step frame-r62h frame r62h 50 6,2 r0sxhf $L1_62
-    step frame-r42n frame r42n 60 4,2 r0sxhn CELESTE_LEVEL_MINUS_ONE=71,5
+    step frame-r42n frame r42n 60 4,2 r0sxhn --level-minus-one 71,5
     for n in r10 r62h r42n; do grep -hE '^\[bench\] rep 0' "$C/frame-$n.err" | sed "s/^/    $n /" | cut -c1-200; done
     # Every emitted row's key recomputed from its fields (the boundary's).
     step keycheck-r10 keycheck r10 55 1,0 r0sxh
-    step keycheck-r42n keycheck r42n 60 4,2 r0sxhn CELESTE_LEVEL_MINUS_ONE=71,5
+    step keycheck-r42n keycheck r42n 60 4,2 r0sxhn --level-minus-one 71,5
     # One backward frame (W f45 of h56), as the arc gate fingerprints it.
     step backward-r10arc backward
     grep -h '^\[bench-backward\] rep 0' "$C/backward-r10arc.err" | sed 's/^/    /'
@@ -101,7 +101,7 @@ t1() {
     step storage-r10 storage r10 56 1,0 r0sxh
     # The kernels against the reference engine, sampled rows of one frame.
     step refcheck-r10 ./safe-run.sh -- "$B" ref-check --level-dir "$F/r10" --frame 55 --level r0sxh --room 1,0 --samples 32 --threads "$TH"
-    step refcheck-r42x env CELESTE_LEVEL_MINUS_ONE=71,5 ./safe-run.sh -- "$B" ref-check --level-dir "$F/r42x" --frame 55 --level r0sxh --room 4,2 --samples 32 --threads "$TH"
+    step refcheck-r42x ./safe-run.sh -- "$B" ref-check --level-dir "$F/r42x" --frame 55 --level r0sxh --room 4,2 --samples 32 --threads "$TH" --level-minus-one 71,5
     # The recorded transfers against the reference engine, sampled records.
     step arccheck-r10 ./safe-run.sh -- "$B" arc-check --level-dir "$F/r10" --room 1,0 --from 56 --to 56 --samples 32 --level r0sxh --threads "$TH" --path-cap 4096
     step arccheck-r42x ./safe-run.sh -- "$B" arc-check --level-dir "$F/r42x" --room 4,2 --from 56 --to 56 --samples 32 --level r0sxh --threads "$TH" --path-cap 4096
@@ -109,25 +109,25 @@ t1() {
     # kernels emit from 64 of them, kept as they are by the block side.
     step widen-r10 widencheck r10 55 1,0 r0sxh
     step widen-r62h widencheck r62h 50 6,2 r0sxhf $L1_62
-    step widen-r42n widencheck r42n 60 4,2 r0sxhn CELESTE_LEVEL_MINUS_ONE=71,5
+    step widen-r42n widencheck r42n 60 4,2 r0sxhn --level-minus-one 71,5
     grep -h '^\[widen-check\] step' "$C"/widen-r*.out | sed 's/^/    /'
     for s in refcheck-r10 refcheck-r42x; do grep -h '^\[ref-check\] [0-9]' "$C/$s.out" | sed "s/^/    /"; done
     for s in arccheck-r10 arccheck-r42x; do grep -h '^agreement' "$C/$s.out" | sed "s/^/    /" | cut -c1-200; done
 }
 
-# keycheck NAME FRAME ROOM LEVEL ENV...: frame's rows' keys recomputed
-# (CELESTE_KERNEL_KEY_CHECK), and the same f/e lines.
+# keycheck NAME FRAME ROOM LEVEL FLAGS...: frame's rows' keys recomputed
+# (--key-check), and the same f/e lines.
 keycheck() {
     local name=$1 f=$2 room=$3 level=$4; shift 4
-    env "$@" CELESTE_KERNEL_KEY_CHECK=1 CELESTE_L1_TABLE="$F/$name/l1-table.bin" ./safe-run.sh -- "$B" bench-frame --level-dir "$F/$name" --frame "$f" --room "$room" --level "$level" --edges --threads "$TH" > "$C/keycheck-$name.frame" || return 1
+    ./safe-run.sh -- "$B" bench-frame --level-dir "$F/$name" --frame "$f" --room "$room" --level "$level" --edges --threads "$TH" --key-check --l1-table "$F/$name/l1-table.bin" "$@" > "$C/keycheck-$name.frame" || return 1
     diff "$G/$name.frame" "$C/keycheck-$name.frame" >&2
 }
 
-# widencheck NAME FRAME ROOM LEVEL ENV...: `rewrite widen-check` of a
+# widencheck NAME FRAME ROOM LEVEL FLAGS...: `rewrite widen-check` of a
 # fixture's frame (the stored rows, and 64 rows' emissions).
 widencheck() {
     local name=$1 f=$2 room=$3 level=$4; shift 4
-    env "$@" CELESTE_L1_TABLE="$F/$name/l1-table.bin" ./safe-run.sh -- "$B" widen-check --level-dir "$F/$name" --frame "$f" --room "$room" --level "$level" --emitted 64
+    ./safe-run.sh -- "$B" widen-check --level-dir "$F/$name" --frame "$f" --room "$room" --level "$level" --emitted 64 --l1-table "$F/$name/l1-table.bin" "$@"
 }
 
 backward() {
@@ -135,11 +135,11 @@ backward() {
     same "$C/backward.txt" "$G/r10arc.backward"
 }
 
-# storage TREE FRAME ROOM LEVEL ENV...: the capture of TREE's frame FRAME
+# storage TREE FRAME ROOM LEVEL FLAGS...: the capture of TREE's frame FRAME
 # replayed; its new states and edges are the frame check's (TREE.frame).
 storage() {
     local tree=$1 f=$2 room=$3 level=$4; shift 4
-    env "$@" ./safe-run.sh -- "$B" bench-storage --capture "$F/cap-$tree/f$(printf %03d "$f")" --tree "$F/$tree" --room "$room" --level "$level" --threads "$TH" --reps 1 > "$C/storage-$tree.txt" || return 1
+    ./safe-run.sh -- "$B" bench-storage --capture "$F/cap-$tree/f$(printf %03d "$f")" --tree "$F/$tree" --room "$room" --level "$level" --threads "$TH" --reps 1 "$@" > "$C/storage-$tree.txt" || return 1
     cat "$C/storage-$tree.txt" >&2
     { grep -o "f$(printf %03d "$f") [0-9]* [0-9a-f]*" "$C/storage-$tree.txt"; grep -o "e$(printf %03d "$f") [0-9]* [0-9a-f]*" "$C/storage-$tree.txt"; } | diff "$G/$tree.frame" - >&2
 }
@@ -164,7 +164,7 @@ t2() {
     # The platform kernels' frame and exact metrics (their build is the
     # cost: ~20 s of tracing, hence here and not in t1).
     step fixtures-r60s tools/fixtures.sh ensure r60s
-    step frame-r60s frame r60s 70 6,0 r0sxhfp CELESTE_SPLIT_FRAME=1
+    step frame-r60s frame r60s 70 6,0 r0sxhfp --split-frame
     # The widening table's two sides at `p`, a boundary and a mid-frame step
     # (stored rows only: the emissions would build the kernels again).
     step widen-r60s widen60
@@ -191,13 +191,13 @@ search42() {
 # A platform room (platforms unknown, split frame) to step 71: the tree's
 # fingerprint is the r60s fixture's pin.
 forward60() {
-    CELESTE_SPLIT_FRAME=1 ./safe-run.sh -- "$B" forward --room 6,0 --level r0sxhfp --to 71 --checkpoint-dir "$C/t2/p60" > /dev/null || return 1
+    ./safe-run.sh -- "$B" forward --room 6,0 --level r0sxhfp --to 71 --split-frame --checkpoint-dir "$C/t2/p60" > /dev/null || return 1
     "$B" ckhash --room 6,0 --to 71 --edges --checkpoint-dir "$C/t2/p60" 2> /dev/null | diff "$G/r60s.ckhash" - >&2
 }
 
 widen60() {
     for f in 70 71; do
-        CELESTE_SPLIT_FRAME=1 ./safe-run.sh -- "$B" widen-check --level-dir "$F/r60s" --frame $f --room 6,0 --level r0sxhfp || return 1
+        ./safe-run.sh -- "$B" widen-check --level-dir "$F/r60s" --frame $f --room 6,0 --level r0sxhfp --split-frame || return 1
     done
 }
 

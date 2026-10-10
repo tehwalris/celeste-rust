@@ -10,7 +10,8 @@
 #   gates/raise.sh 1,0 /var/tmp/raise-gate 55 56 58      # forwards only
 #   gates/raise.sh --search --level r0sxhn,r0sxh 7,0 /var/tmp/raise-gate70 82 83 84
 #
-# Env: CELESTE_THREADS etc. pass through; S (the level -1 speed bound) is 5.
+# --extra passes more flags (e.g. "--threads 8") to search; S (the level -1
+# speed bound) is 5.
 set -u
 cd "$(dirname "$0")/.."
 SEARCH=0; LEVEL=""; EXTRA=""; B=./target/quick/rewrite
@@ -31,10 +32,10 @@ for H in "$@"; do
         T=$DIR/$KIND; [[ $KIND == fresh ]] && { T=$DIR/fresh$H; rm -rf "$T"; }
         LOG=$DIR/$KIND-$H.log
         if [[ $SEARCH == 1 ]]; then
-            CELESTE_LEVEL_MINUS_ONE="$H,5" /usr/bin/time -f "%e s %M KB" ./safe-run.sh --memory 25G -- $B search --room "$ROOM" --to "$H" ${LEVEL:+--level $LEVEL} $EXTRA --checkpoint-dir "$T" > "$LOG.out" 2> "$LOG" || { echo "$KIND h$H FAILED (see $LOG)"; FAIL=1; continue; }
+            /usr/bin/time -f "%e s %M KB" ./safe-run.sh --memory 25G -- $B search --room "$ROOM" --to "$H" --level-minus-one "$H,5" ${LEVEL:+--level $LEVEL} $EXTRA --checkpoint-dir "$T" > "$LOG.out" 2> "$LOG" || { echo "$KIND h$H FAILED (see $LOG)"; FAIL=1; continue; }
             L0=$T/level00
         else
-            CELESTE_LEVEL_MINUS_ONE="$H,5" /usr/bin/time -f "%e s %M KB" ./safe-run.sh --memory 25G -- $B forward --room "$ROOM" --to "$H" ${LEVEL:+--level ${LEVEL%%,*}} --checkpoint-dir "$T" > "$LOG.out" 2> "$LOG" || { echo "$KIND h$H FAILED (see $LOG)"; FAIL=1; continue; }
+            /usr/bin/time -f "%e s %M KB" ./safe-run.sh --memory 25G -- $B forward --room "$ROOM" --to "$H" --level-minus-one "$H,5" ${LEVEL:+--level ${LEVEL%%,*}} $EXTRA --checkpoint-dir "$T" > "$LOG.out" 2> "$LOG" || { echo "$KIND h$H FAILED (see $LOG)"; FAIL=1; continue; }
             L0=$T
         fi
         $B ckhash --room "$ROOM" --to "$H" --edges --checkpoint-dir "$L0" > "$DIR/$KIND-$H.ck" 2>/dev/null || { echo "$KIND h$H ckhash FAILED"; FAIL=1; }

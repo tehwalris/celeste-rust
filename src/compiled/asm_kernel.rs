@@ -2,7 +2,7 @@
 //! assemble each (shape, region)'s fused fork-free graph, and dispatch
 //! chunks to it. The APPEND step emits each `live & !error` lane at the
 //! boundary: canonical structure, its row key exactly as
-//! `Rt2::boundary_finish` (`CELESTE_KERNEL_KEY_CHECK=1`), its pos-graph edge
+//! `Rt2::boundary_finish` (`--key-check`), its pos-graph edge
 //! and its transfer.
 
 use crate::search::arc_edges::{decode_axis, RawAxis};
@@ -38,7 +38,7 @@ struct AsmBody {
     /// The fork configuration (two bits per fork), for diagnostics.
     splits: Vec<u8>,
     fields: Vec<AsmField>,
-    /// `error`'s slot (`CELESTE_KERNEL_EXPLAIN`).
+    /// `error`'s slot (`--kernel-explain`).
     error_root: usize,
     error_off: usize,
     live_off: usize,
@@ -414,7 +414,7 @@ struct AsmKernel {
     fused_nodes: usize,
     /// Per input cell, its traced path (named by packing failures).
     input_names: Vec<String>,
-    /// `CELESTE_KERNEL_MIX`: the slices this kernel ran (`compiled::mix`).
+    /// `--kernel-mix`: the slices this kernel ran (`compiled::mix`).
     mix_slices: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
 }
 
@@ -538,7 +538,7 @@ impl AsmKernel {
                     );
                     match self.flat_roots.get(body.error_root) {
                         Some(&error_node) => self.explain_error(chunk, lanes[declined.trailing_zeros() as usize], error_node),
-                        None => eprintln!("[kernel] rerun with CELESTE_KERNEL_EXPLAIN=1 for the error the lane holds"),
+                        None => eprintln!("[kernel] rerun with --kernel-explain for the error the lane holds"),
                     }
                     sc.put_back();
                     return false;
@@ -1084,7 +1084,7 @@ impl<'c> InputView<'c> {
     }
 }
 
-/// `CELESTE_KERNEL_KEY_CHECK=1`: the real boundary
+/// `--key-check`: the real boundary
 /// (`Rt2::boundary_canonicalize`) over a copy of an emitted block must
 /// change nothing (structure, shape hash), and every row's key must be what
 /// the key space makes of the boundary's row - packed, or for a provisional
@@ -1133,7 +1133,7 @@ pub(crate) fn key_check(slot: &crate::storage::unit::RowBuf, keys: &KeySpace, pr
     );
 }
 
-/// `CELESTE_KERNEL_KEY_CHECK=1` on a block the forward STORES (a layer's
+/// `--key-check` on a block the forward STORES (a layer's
 /// piece, `storage::wave::gather_layer`, keys final): the boundary over a
 /// copy must keep its shape and structure, and the key space key its rows
 /// as stored - its gather moved rows, not values.
@@ -1156,17 +1156,17 @@ pub(crate) fn key_check_block(blk: &Rt2, keys: &KeySpace) {
     );
 }
 
-/// `CELESTE_KERNEL_KEY_CHECK=1` (see `key_check`).
+/// `--key-check` (see `key_check`).
 pub(crate) fn key_check_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| crate::knobs::flag("CELESTE_KERNEL_KEY_CHECK"))
+    *ON.get_or_init(|| crate::settings::get().diag.key_check)
 }
 
 /// Whether kernels keep their fused graphs after assembly
-/// (`CELESTE_KERNEL_EXPLAIN`): a decline then names the premise it failed.
+/// (`--kernel-explain`): a decline then names the premise it failed.
 fn kernel_graph_kept() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| crate::knobs::flag("CELESTE_KERNEL_EXPLAIN"))
+    *ON.get_or_init(|| crate::settings::get().diag.kernel_explain)
 }
 
 fn num_raw(av: AV) -> i32 {

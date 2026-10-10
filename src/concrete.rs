@@ -92,7 +92,7 @@ pub fn platform_worlds(frames: usize) -> Result<Vec<Vec<[i32; WORLD_FIELDS]>>> {
 mod tests {
     use super::*;
 
-    /// The split frame (`CELESTE_SPLIT_FRAME`) must run exactly the original
+    /// The split frame (`--split-frame`) must run exactly the original
     /// frame, down to the SHAPE (equal states in two shapes never dedupe).
     /// The witness's dash on frame 24 covers the freeze path, where part b
     /// clears `__frozen` (a global set to nil must be removed, as in Lua).
@@ -105,12 +105,9 @@ mod tests {
             c.canonical();
             (r.shape_hash_of(), celeste_engine::exact::exact_rows(&c, crate::compiled::ids()), crate::search::pos_graph::block_cells(r).expect("cells"))
         };
-        // The cart is read when an engine is built (nextest: own process).
-        std::env::remove_var("CELESTE_SPLIT_FRAME");
+        // The cart is read when an engine is built, under its settings.
         let mut whole = RefEngine::new().expect("engine");
-        std::env::set_var("CELESTE_SPLIT_FRAME", "1");
-        let mut split = RefEngine::new().expect("split engine");
-        std::env::remove_var("CELESTE_SPLIT_FRAME");
+        let mut split = RefEngine::with(&crate::settings::Settings { split_frame: true, ..Default::default() }).expect("split engine");
 
         let mut a = whole.initial().expect("init");
         let mut b = split.initial().expect("split init");

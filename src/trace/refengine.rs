@@ -46,17 +46,24 @@ pub struct RefEngine {
 unsafe impl Send for RefEngine {}
 
 impl RefEngine {
-    /// Parse the cart, run its toplevel and `_init` for the start room.
+    /// Parse the cart, run its toplevel and `_init` for the start room,
+    /// under the process's settings.
     pub fn new() -> Result<Self> {
+        Self::with(crate::settings::get())
+    }
+
+    /// The same under settings `s` (the concrete phase's seeded engines; a
+    /// test's other configuration).
+    pub fn with(s: &crate::settings::Settings) -> Result<Self> {
         let leak = |src: &str| -> Result<&'static ast::Ast> { Ok(Box::leak(Box::new(full_moon::parse(src)?))) };
-        let top = leak(&crate::trace::cart::sources()?)?;
+        let top = leak(&crate::trace::cart::sources(s)?)?;
         crate::trace::cart::check_absent_fields(top)?;
         let init = leak("_init()")?;
         let body = leak("__reset_button_states()\n_update()\n_draw()")?;
         let body_concrete = leak("_update()\n_draw()")?;
 
         let cart = Arc::new(CartData::load("cart")?);
-        let (rx, ry) = crate::game_runner::start_room();
+        let (rx, ry) = s.room;
         let cache = Arc::new(CollisionCache::new(&cart, rx, ry)?);
 
         let mut it = fresh_interp(cart, cache);
@@ -360,7 +367,7 @@ mod tests {
     /// for all 64 inputs at states along room (1,0)'s 99-frame exit.
     #[test]
     fn inputs_agreeing_on_the_buttons_read_make_the_same_successors() {
-        std::env::set_var("CELESTE_START_ROOM", "1,0");
+        crate::settings::install(crate::settings::Settings::default());
         let inputs = crate::concrete::read_inputs("tas/room_1_0_exit_frame_99.txt").expect("the exit's inputs");
         let mut eng = RefEngine::new().expect("ref engine");
         let exact = |bs: Vec<Block>| -> Vec<(celeste_engine::exact::ExactRow, u32)> { bs.iter().map(|b| (celeste_engine::exact::exact_rows(b.rt2(), crate::compiled::ids()).swap_remove(0), b.positions().expect("cells")[0])).collect() };
@@ -393,11 +400,8 @@ mod tests {
     /// the same successors projected onto it, for every input (`all_inputs`,
     /// else the route's own), with `step_at`'s pins as without them. Returns
     /// (states with a `what`, leaves pinned, leaves without).
-    fn pins_keep_the_projected_successors(room: &str, env: &[(&str, &str)], route: &str, stride: usize, all_inputs: bool, level: &str, what: &str) -> (usize, usize, usize) {
-        std::env::set_var("CELESTE_START_ROOM", room);
-        for (k, v) in env {
-            std::env::set_var(k, v);
-        }
+    fn pins_keep_the_projected_successors(settings: crate::settings::Settings, route: &str, stride: usize, all_inputs: bool, level: &str, what: &str) -> (usize, usize, usize) {
+        crate::settings::install(settings);
         let level = Level::parse(level).expect("level");
         let inputs = crate::concrete::read_inputs(route).expect("the route's inputs");
         let mut eng = RefEngine::new().expect("ref engine");
@@ -465,8 +469,8 @@ mod tests {
     /// saves most of the reference's paths, which is its point.
     #[test]
     fn pinning_the_fly_fruits_motion_keeps_the_projected_successors() {
-        let env = [("CELESTE_HUNDRED", "1"), ("CELESTE_LOADING_JANK", "2")];
-        let (with, pinned, full) = pins_keep_the_projected_successors("6,2", &env, "tas/room_6_2_hundred_frame_93.txt", 5, true, "r0sxhf", "fly_fruit");
+        let settings = crate::settings::Settings { room: (6, 2), hundred: true, loading_jank: Some(2), ..Default::default() };
+        let (with, pinned, full) = pins_keep_the_projected_successors(settings, "tas/room_6_2_hundred_frame_93.txt", 5, true, "r0sxhf", "fly_fruit");
         assert!(with >= 8, "only {with} sampled states have the fly fruit");
         assert!(4 * pinned < full, "pinning saved little: {pinned} leaves against {full}");
     }
@@ -479,7 +483,7 @@ mod tests {
     #[test]
     #[ignore]
     fn pinning_isolated_floors_keeps_the_projected_successors() {
-        let (with, pinned, full) = pins_keep_the_projected_successors("1,1", &[], "tas/room_1_1_exit_frame_94.txt", 4, false, "r0sxhn", "fall_floor");
+        let (with, pinned, full) = pins_keep_the_projected_successors(crate::settings::Settings { room: (1, 1), ..Default::default() }, "tas/room_1_1_exit_frame_94.txt", 4, false, "r0sxhn", "fall_floor");
         assert!(with >= 20, "only {with} sampled states have a fall floor");
         assert!(10 * pinned < full, "pinning saved little: {pinned} leaves against {full}");
     }

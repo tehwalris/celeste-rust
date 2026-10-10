@@ -757,8 +757,8 @@ mod tests {
         if !std::path::Path::new("lua/celeste-minimal.lua").exists() {
             return;
         }
-        std::env::set_var("CELESTE_START_ROOM", "4,0");
-        let src = cart::sources().expect("sources");
+        crate::settings::install(crate::settings::Settings { room: (4, 0), ..Default::default() });
+        let src = cart::sources(crate::settings::get()).expect("sources");
         let top = full_moon::parse(&src).expect("parse");
         let init = full_moon::parse("_init()").expect("parse _init");
         let reset = full_moon::parse("__reset_button_states()").expect("parse reset");

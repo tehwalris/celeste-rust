@@ -15,7 +15,7 @@
 #   tools/fixtures.sh list
 #
 # A fixture under level -1 keeps the table it was built under
-# (NAME/l1-table.bin, CELESTE_L1_TABLE): the table cache is keyed on the
+# (NAME/l1-table.bin, --l1-table): the table cache is keyed on the
 # binary, so without it every rebuild of the binary would rebuild the table
 # (12-60 s) before the frame; the tree records the table's fingerprint and
 # `bench-frame` refuses another.
@@ -30,34 +30,34 @@ ROOT=${CELESTE_FIXTURES:-/var/tmp/celeste-fixtures}
 B=${BIN:-${CARGO_TARGET_DIR:-./target}/quick/rewrite}
 PINS=gates/fixtures
 
-L1_62="CELESTE_HUNDRED=1 CELESTE_LOADING_JANK=2 CELESTE_LEVEL_MINUS_ONE=94,5"
-# NAME -> ENV | ROOM | COMMAND | TREE (the level dir under the fixture) | LAST
+L1_62="--hundred --loading-jank 2 --level-minus-one 94,5"
+# NAME -> FLAGS (the settings) | ROOM | COMMAND | TREE (the level dir under the fixture) | LAST
 # frame (the tree's) | DEPENDS (a capture's tree fixture).
 spec() {
-    DEP=""; TREE=.
+    DEP=""; TREE=.; FLAGS=""
     case $1 in
         # Room (1,0) 200m r0sxh, the mid frame f55 -> f56 (14.5M edges).
-        r10) ENV=""; ROOM=1,0; CMD="forward --room 1,0 --level r0sxh --to 56"; LAST=56 ;;
+        r10) ROOM=1,0; CMD="forward --room 1,0 --level r0sxh --to 56"; LAST=56 ;;
         # Room (6,2) 100% 2300m r0sxhf under level -1 (94,5), f50 -> f51
         # (1.8M lanes in, 72M emissions); the reference frame is r62h57.
-        r62h) ENV=$L1_62; ROOM=6,2; CMD="forward --room 6,2 --level r0sxhf --to 51"; LAST=51 ;;
+        r62h) FLAGS=$L1_62; ROOM=6,2; CMD="forward --room 6,2 --level r0sxhf --to 51"; LAST=51 ;;
         # Room (4,2) 2100m at the object level r0sxhn under level -1 (71,5), f60 -> f61.
-        r42n) ENV="CELESTE_LEVEL_MINUS_ONE=71,5"; ROOM=4,2; CMD="forward --room 4,2 --level r0sxhn --to 61"; LAST=61 ;;
+        r42n) FLAGS="--level-minus-one 71,5"; ROOM=4,2; CMD="forward --room 4,2 --level r0sxhn --to 61"; LAST=61 ;;
         # The same room with its objects exact (r0sxh): the reference
         # checks' object room (the reference forks r0sxhn's widened objects
         # into thousands of paths a row: plans/devloop.md).
-        r42x) ENV="CELESTE_LEVEL_MINUS_ONE=71,5"; ROOM=4,2; CMD="forward --room 4,2 --level r0sxh --to 56"; LAST=56 ;;
+        r42x) FLAGS="--level-minus-one 71,5"; ROOM=4,2; CMD="forward --room 4,2 --level r0sxh --to 56"; LAST=56 ;;
         # Room (6,0) 700m, platforms unknown, split frame: steps 70 -> 71.
-        r60s) ENV="CELESTE_SPLIT_FRAME=1"; ROOM=6,0; CMD="forward --room 6,0 --level r0sxhfp --to 71"; LAST=71 ;;
+        r60s) FLAGS="--split-frame"; ROOM=6,0; CMD="forward --room 6,0 --level r0sxhfp --to 71"; LAST=71 ;;
         # A finished search for the backward: room (1,0) r0sxh, synthetic
         # win at (40,64) (first win f47, optimum 49), horizon 56.
-        r10arc) ENV=""; ROOM=1,0; CMD="search --room 1,0 --level r0sxh --to 56 --win-at 40,64"; TREE=level00; LAST=56 ;;
+        r10arc) ROOM=1,0; CMD="search --room 1,0 --level r0sxh --to 56 --win-at 40,64"; TREE=level00; LAST=56 ;;
         # The storage replay's capture: r10's f56 emissions (bench-storage).
-        cap-r10) DEP=r10; ENV=""; ROOM=1,0; CMD="capture 56"; LAST=56 ;;
+        cap-r10) DEP=r10; ROOM=1,0; CMD="capture 56"; LAST=56 ;;
         # BIG (minutes, ~10 GB): the reference frame (6,2) 100% f56 -> f57,
         # and its 12 GB capture.
-        r62h57) ENV=$L1_62; ROOM=6,2; CMD="forward --room 6,2 --level r0sxhf --to 57"; LAST=57 ;;
-        cap-r62h57) DEP=r62h57; ENV=$L1_62; ROOM=6,2; CMD="capture 57"; LAST=57 ;;
+        r62h57) FLAGS=$L1_62; ROOM=6,2; CMD="forward --room 6,2 --level r0sxhf --to 57"; LAST=57 ;;
+        cap-r62h57) DEP=r62h57; FLAGS=$L1_62; ROOM=6,2; CMD="capture 57"; LAST=57 ;;
         *) echo "fixtures: no fixture $1 (tools/fixtures.sh list)" >&2; exit 2 ;;
     esac
 }
@@ -76,7 +76,7 @@ sources() {
 # The tree's fingerprint (as pinned).
 fingerprint() {
     local dir=$1/$TREE extra=""
-    [[ $ENV == *LEVEL_MINUS_ONE* ]] && extra=--dropped
+    [[ $FLAGS == *level-minus-one* ]] && extra=--dropped
     "$B" ckhash --room "$ROOM" --to "$LAST" --edges $extra --checkpoint-dir "$dir" 2>/dev/null
 }
 
@@ -85,14 +85,14 @@ build() {
     spec "$name"
     local dir=$ROOT/$name tmp=$ROOT/$name.tmp
     [[ -n $DEP ]] && ensure "$DEP" && spec "$name"
-    echo "[fixtures] building $name: $ENV $CMD" >&2
+    echo "[fixtures] building $name: $CMD $FLAGS" >&2
     rm -rf "$tmp" "$dir"
     mkdir -p "$tmp"
     local t0=$SECONDS
     if [[ $CMD == capture* ]]; then
-        # One wave of the tree fixture, captured (CELESTE_EMIT_CAPTURE).
+        # One wave of the tree fixture, captured (--emit-capture).
         local f=${CMD#capture }
-        env $ENV CELESTE_L1_TABLE="$ROOT/$DEP/l1-table.bin" CELESTE_EMIT_CAPTURE="$tmp" CELESTE_EMIT_CAPTURE_FRAME="$f" ./safe-run.sh -- "$B" bench-frame --level-dir "$ROOT/$DEP" --frame $((f - 1)) --edges --room "$ROOM" --level "$(level_of "$DEP")" > "$tmp/build.out" 2> "$tmp/build.log" \
+        ./safe-run.sh -- "$B" bench-frame --level-dir "$ROOT/$DEP" --frame $((f - 1)) --edges --room "$ROOM" --level "$(level_of "$DEP")" $FLAGS --l1-table "$ROOT/$DEP/l1-table.bin" --emit-capture "$tmp" --emit-capture-frame "$f" > "$tmp/build.out" 2> "$tmp/build.log" \
             || { echo "[fixtures] $name: the capture FAILED (see $tmp/build.log)" >&2; exit 1; }
         # The captured wave is the tree fixture's frame check: the same lines.
         if [[ -z $pin && -f $PINS/$DEP.frame ]] && ! diff -q "$PINS/$DEP.frame" "$tmp/build.out" > /dev/null; then
@@ -100,7 +100,7 @@ build() {
             exit 1
         fi
     else
-        env $ENV CELESTE_L1_TABLE="$tmp/l1-table.bin" ./safe-run.sh -- "$B" $CMD --checkpoint-dir "$tmp" > "$tmp/build.out" 2> "$tmp/build.log" \
+        ./safe-run.sh -- "$B" $CMD $FLAGS --l1-table "$tmp/l1-table.bin" --checkpoint-dir "$tmp" > "$tmp/build.out" 2> "$tmp/build.log" \
             || { echo "[fixtures] $name: the build FAILED (see $tmp/build.log)" >&2; exit 1; }
         fingerprint "$tmp" > "$tmp/ckhash.txt"
         if [[ -n $pin || ! -f $PINS/$name.ckhash ]]; then
@@ -115,7 +115,7 @@ build() {
     fi
     {
         echo "name $name"
-        echo "spec $ENV | $CMD"
+        echo "spec $FLAGS | $CMD"
         echo "formats $(formats)"
         echo "sources $(sources)"
         echo "commit $(git rev-parse --short HEAD)$(git diff --quiet HEAD -- src crates lua cart || echo +dirty)"
@@ -140,7 +140,7 @@ ensure() {
         return
     fi
     local why=""
-    grep -qxF "spec $ENV | $CMD" "$m" || why="its spec changed"
+    grep -qxF "spec $FLAGS | $CMD" "$m" || why="its spec changed"
     grep -qxF "formats $(formats)" "$m" || why="${why:+$why, }the file formats changed ($(grep ^formats "$m" | cut -d' ' -f2-) -> $(formats))"
     if [[ -n $why ]]; then
         echo "[fixtures] STALE fixture $name: $why - REBUILDING" >&2

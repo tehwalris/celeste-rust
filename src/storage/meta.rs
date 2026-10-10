@@ -64,7 +64,7 @@ pub fn load_frame(dir: &Path, frame: u32) -> Result<Vec<FrameMeta>> {
         .iter()
         .map(|p| {
             let m: FrameMeta = crate::search::checkpoint::load_value_from(p).with_context(|| p.display().to_string())?;
-            anyhow::ensure!(m.side == side, "{}: built with storage regions of {} cells, this process uses {side} (CELESTE_STORAGE_REGION)", p.display(), m.side);
+            anyhow::ensure!(m.side == side, "{}: built with storage regions of {} cells, this process uses {side} (--storage-region)", p.display(), m.side);
             Ok(m)
         })
         .collect()

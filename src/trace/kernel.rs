@@ -118,27 +118,17 @@ pub struct RegionGrid {
     pub speed: i32,
 }
 
-/// The region grid of every kernel set: `CELESTE_REGION="px,S"`, `off` for
-/// none, default 16 px / speed 6. `S <= 7` because the move loop unrolls
-/// for `abs(amount) <= 8` and `amount = flr(rem + spd + 0.5)`.
+/// The region grid of every kernel set (`--region "px,S"`, `off` for none,
+/// default 16 px / speed 6). `S <= 7` because the move loop unrolls for
+/// `abs(amount) <= 8` and `amount = flr(rem + spd + 0.5)`.
 pub fn region_grid() -> Option<RegionGrid> {
-    static GRID: std::sync::OnceLock<Option<RegionGrid>> = std::sync::OnceLock::new();
-    *GRID.get_or_init(|| {
-        let g = match crate::knobs::value("CELESTE_REGION").as_deref() {
-            Some("off") => None,
-            Some(s) => {
-                let v: Vec<i32> = s.split(',').map(|t| t.trim().parse().expect("CELESTE_REGION=\"px,S\" or off")).collect();
-                assert!(v.len() == 2 && v[0] >= 1 && (1..=7).contains(&v[1]), "CELESTE_REGION=\"px,S\" with px >= 1 and 1 <= S <= 7, not {s:?}");
-                Some(RegionGrid { px: v[0], speed: v[1] })
-            }
-            None => Some(RegionGrid { px: 16, speed: 6 }),
-        };
-        match g {
-            Some(g) => eprintln!("[region] kernels keyed on a {} px grid, player speed asserted within [-{}, {}] px", g.px, g.speed, g.speed),
-            None => eprintln!("[region] no region key (CELESTE_REGION=off)"),
-        }
-        g
-    })
+    let g = crate::settings::get().region.map(|(px, speed)| RegionGrid { px, speed });
+    static SAID: std::sync::Once = std::sync::Once::new();
+    SAID.call_once(|| match g {
+        Some(g) => eprintln!("[region] kernels keyed on a {} px grid, player speed asserted within [-{}, {}] px", g.px, g.speed, g.speed),
+        None => eprintln!("[region] no region key (--region off)"),
+    });
+    g
 }
 
 impl RegionGrid {
@@ -212,19 +202,8 @@ fn successor_regions(
         anyhow::ensure!(hull[axis].0 <= hull[axis].1, "{}: its range lies outside the screen window {window:?}", iface::show(&p));
     }
     let (a, b) = (g.of(hull[0].0 as i32, hull[1].0 as i32), g.of(hull[0].1 as i32, hull[1].1 as i32));
-    // Probe only: `CELESTE_WALK_REGIONS="(ix,iy) .."` traces just those.
-    static ONLY: std::sync::OnceLock<Option<Vec<(i16, i16)>>> = std::sync::OnceLock::new();
-    let only = ONLY.get_or_init(|| {
-        crate::knobs::value("CELESTE_WALK_REGIONS").map(|v| {
-            v.split_whitespace()
-                .map(|t| {
-                    let t = t.trim_matches(|c| c == '(' || c == ')');
-                    let (x, y) = t.split_once(',').expect("CELESTE_WALK_REGIONS=\"(ix,iy) ..\"");
-                    (x.parse().expect("ix"), y.parse().expect("iy"))
-                })
-                .collect()
-        })
-    });
+    // Probe only: `--walk-regions "(ix,iy) .."` traces just those.
+    let only = &crate::settings::get().diag.walk_regions;
     if let Some(o) = only {
         return Ok(o.iter().map(|&(ix, iy)| Some(Region { ix, iy })).collect());
     }
@@ -355,8 +334,11 @@ mod tests {
         if !std::path::Path::new("lua/celeste-minimal.lua").exists() {
             return;
         }
-        std::env::set_var("CELESTE_START_ROOM", "6,1");
-        std::env::set_var("CELESTE_WALK_REGIONS", "(3,6) (4,6)");
+        crate::settings::install(crate::settings::Settings {
+            room: (6, 1),
+            diag: crate::settings::Diagnostics { walk_regions: Some(vec![(3, 6), (4, 6)]), ..Default::default() },
+            ..Default::default()
+        });
         let opts = crate::abstraction::Level { held: true, floors_near: true, ..crate::abstraction::Level::EXACT };
         let lw = super::room_constant_lattice(std::path::Path::new("."), opts).unwrap_or_else(|e| panic!("{e:#}"));
         let mut traced = 0;
@@ -385,7 +367,7 @@ pub fn room_constant_lattice(
     use anyhow::{anyhow, bail};
     type Cmap = std::collections::BTreeMap<super::iface::Path, super::iface::Conc>;
 
-    let src = cart::sources_in(root)?;
+    let src = cart::sources_in(root, crate::settings::get())?;
     // Leaked: the kept tracer's `Interp` borrows the ASTs.
     let leak = |a: full_moon::ast::Ast| -> &'static full_moon::ast::Ast { Box::leak(Box::new(a)) };
     let top = leak(full_moon::parse(&src).map_err(|e| anyhow!("parse: {:?}", e))?);
@@ -396,7 +378,7 @@ pub fn room_constant_lattice(
 
     let mut it: Interp<'static, Symbolic> = Interp::new(Symbolic::default());
     let cart_data = std::sync::Arc::new(celeste_core::cart_data::CartData::load(root.join("cart"))?);
-    let (rx, ry) = crate::game_runner::start_room();
+    let (rx, ry) = crate::settings::get().room;
     let cache = std::sync::Arc::new(celeste_core::collision_cache::CollisionCache::new(&cart_data, rx, ry)?);
     it.cache = Some(cache.clone());
     it.cart = Some(cart_data.clone());
@@ -432,7 +414,7 @@ pub fn room_constant_lattice(
         Some(_) => no_player_ranges(&mut it, reset, fr, &start, opts)?,
         None => NoPlayer::default(),
     };
-    if crate::knobs::flag("CELESTE_BUILD_TRACE") {
+    if crate::settings::get().diag.build_trace {
         let show = |b: &Bounds| b.iter().map(|(p, (a, b))| format!("{} [{:.2}, {:.2}]", super::iface::show(p), *a as f64 / 65536.0, *b as f64 / 65536.0)).collect::<Vec<_>>();
         for (i, (_, b)) in no_player.shapes.iter().enumerate() {
             eprintln!("[walk] no-player shape {i} ranges: {:?}", show(b));
@@ -453,7 +435,7 @@ pub fn room_constant_lattice(
                 if it.d.as_const(&n).is_some() {
                     continue;
                 }
-                // Under the loading jank (CELESTE_LOADING_JANK) the start's
+                // Under the loading jank (--loading-jank) the start's
                 // `rnd` draw has had one update (a balloon's `offset += 0.01`,
                 // its `y` from `sin(offset)`): not a literal but a function of
                 // one. Its static range's hull stands for it - a superset of
@@ -479,7 +461,7 @@ pub fn room_constant_lattice(
     let mut regions: std::collections::BTreeMap<String, std::collections::BTreeSet<Option<Region>>> = Default::default();
     regions.insert(sk.clone(), start_regions.iter().copied().collect());
     let room0 = shapes::room_of(&start, &it.d);
-    let lattice_trace = crate::knobs::flag("CELESTE_BUILD_TRACE");
+    let lattice_trace = crate::settings::get().diag.build_trace;
 
     // THE ROUNDS: each traces its frontier in parallel against a lattice
     // snapshot; results apply in node order between rounds. Each frame is

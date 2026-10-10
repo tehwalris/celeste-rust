@@ -33,6 +33,9 @@ struct Cli {
     /// (`pico8_diff/chain.py --check-start`).
     #[arg(long)]
     dump_start: bool,
+
+    #[command(flatten)]
+    settings: celeste_rust::settings::SettingsArgs,
 }
 
 /// The object types `--dump-start` names (pico8_diff/replay.py TYPES).
@@ -171,7 +174,7 @@ fn print_frame(st: &Rt2, frame_num: u32, input_byte: u8) {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    celeste_rust::knobs::startup()?;
+    celeste_rust::settings::startup(&cli.settings, |_| {})?;
     if cli.dump_start {
         dump_start(&RefEngine::new()?.initial()?);
         return Ok(());

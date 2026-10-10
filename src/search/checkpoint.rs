@@ -449,7 +449,7 @@ impl FrameFile {
             return Ok(None);
         }
         let h = &self.header;
-        ensure!(!h.trimmed, "a trimmed checkpoint (CELESTE_TRIM_ROWS: keys, cells and wins only): its rows are gone");
+        ensure!(!h.trimmed, "a trimmed checkpoint (--trim-rows: keys, cells and wins only): its rows are gone");
         let (cart, cache) = crate::compiled::room_context()?;
         let mut rt2 = Rt2::empty(total, h.globals.len(), &[], cart, cache);
         rt2.structure = h.structure.clone();

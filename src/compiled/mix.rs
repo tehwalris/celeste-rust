@@ -1,4 +1,4 @@
-//! `CELESTE_KERNEL_MIX=DIR`: what the assembled kernels spend their
+//! `--kernel-mix DIR`: what the assembled kernels spend their
 //! instructions on (plans/kernel-mix.md). A diagnostic only: nothing in the
 //! search reads it.
 //!
@@ -60,14 +60,14 @@ pub(crate) const ROLE_ARC: u8 = 8;
 
 /// The directory, when on.
 pub(crate) fn dir() -> Option<PathBuf> {
-    crate::knobs::value("CELESTE_KERNEL_MIX").map(PathBuf::from)
+    crate::settings::get().diag.kernel_mix.clone()
 }
 
-/// `CELESTE_KERNEL_METRICS=1`: the census and the slice counters without
+/// `bench-frame --metrics`: the census and the slice counters without
 /// the files (`rewrite bench-frame --metrics`: `kernel_metrics`).
 pub fn metrics_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| crate::knobs::flag("CELESTE_KERNEL_METRICS"))
+    *ON.get_or_init(|| crate::settings::get().diag.kernel_metrics)
 }
 
 /// One kernel's census (`report`): its static counts, `key -> value`.
@@ -324,7 +324,7 @@ fn category(mn: &str, ops: &str, kind: &str, node_op: &Op, store_role: &str) -> 
     c.to_string()
 }
 
-/// One kernel's census and, with `CELESTE_KERNEL_MIX=DIR`, its report.
+/// One kernel's census and, with `--kernel-mix DIR`, its report.
 pub(crate) fn report(inp: &Input) -> Result<Census> {
     let dir = dir();
     if let Some(dir) = &dir {

@@ -15,6 +15,14 @@ say why in the commit). Timings are reported, never pinned.
 This file replaces CLAUDE.md's "Gates" and "Iterating quickly" sections
 once reviewed; until then both hold.
 
+**Settings are flags** (2026-10-10, branch `footguns`): every setting of a
+run is a command-line flag of the binaries (`--room`, `--hundred`,
+`--level-minus-one H,S`, `--split-frame`, `--threads`, `--key-check`, ...;
+`rewrite --help`), and a binary REFUSES any `CELESTE_*` variable in its
+environment (naming the flag that replaced it). Only `CELESTE_FIXTURES`,
+read by the shell tools, remains. A tree records the settings that change
+it (`<level>/settings.txt`) and refuses a run under other ones.
+
 ## The ladder
 
 Times: quick profile, 16 threads, on the shared 32-thread machine with other
@@ -69,7 +77,7 @@ The two `#[ignore]`d tests (resume, level -1 balloon) are t3.
 | frame-r10 | `bench-frame --level-dir F/r10 --frame 55 --edges --metrics` | room (1,0) r0sxh f55 -> f56: 451,316 new states, 14,537,665 edges; f/e lines and exact metrics | 1.6 s |
 | frame-r62h | same, room (6,2) 100% r0sxhf f50 -> f51, level -1 | 2,597,457 states, 88,076,797 edges | 6.7 s (kernels 4 s, the 88M-edge fingerprint, the wave 0.7 s) |
 | frame-r42n | same, room (4,2) r0sxhn f60 -> f61, level -1 | the object level's kernels: 553,666 states | 2.5 s |
-| keycheck-r10 | `CELESTE_KERNEL_KEY_CHECK=1 bench-frame` r10 f55 | every emitted row's key recomputed from its fields | 2.7 s |
+| keycheck-r10 | `bench-frame --key-check` r10 f55 | every emitted row's key recomputed from its fields | 2.7 s |
 | keycheck-r42n | the same, r42n f60 | the object level's rows | 4.4 s |
 | backward-r10arc | `bench-backward --horizon 56 --frame 45` | one arc backward step (W f45 of a synthetic-win h56 search; the gate's W line) | 0.4 s |
 | storage-r10 | `bench-storage` of r10's f56 capture | the storage alone; its f/e lines must equal frame-r10's | 0.4 s |
@@ -100,8 +108,8 @@ are `ckhash --edges`'s for the frame, so they equal the real tree's
 
 ### big: the reference frame
 
-Room (6,2) 100% (`CELESTE_HUNDRED=1 CELESTE_LOADING_JANK=2
-CELESTE_LEVEL_MINUS_ONE=94,5`) r0sxhf f56 -> f57: 5,857,035 lanes in,
+Room (6,2) 100% (`--hundred --loading-jank 2
+--level-minus-one 94,5`) r0sxhf f56 -> f57: 5,857,035 lanes in,
 6,735,699 new states, 257,724,013 edges, 2,660,121,881 dynamic kernel
 instructions over 366,186 slices (7,264 a slice: plans/kernel-opt-decisions.md
 measured 2.660G and 7,264). frame-r62h57 8.2-11.1 s (kernels 4.1 s, the f56
@@ -138,7 +146,7 @@ fingerprint, and a change to the forward shows in the frame checks and in
 t2's full-room gates. When a deliberate change moves a fixture's own
 frames, `tools/fixtures.sh pin NAME` rebuilds it and re-pins.
 
-Level -1 fixtures keep their table (`NAME/l1-table.bin`, `CELESTE_L1_TABLE`):
+Level -1 fixtures keep their table (`NAME/l1-table.bin`, `--l1-table`):
 the table cache is keyed on the binary's bytes, so every rebuild of the
 binary rebuilt the table (room (4,2) 12 s, (6,2) 37-61 s) before the first
 frame. `bench-frame` refuses a table whose fingerprint is not the one the
@@ -151,7 +159,7 @@ tree recorded.
 | r42n | room (4,2) 2100m `r0sxhn`, level -1 (71,5) | f0-f61; frame 60 -> 61 | 18-28 s | 450 MB |
 | r42x | room (4,2) `r0sxh` (objects exact), level -1 | f0-f56 | 9-16 s | 140 MB |
 | r10arc | room (1,0) `search --level r0sxh --to 56 --win-at 40,64` | the level-0 tree to h56 | 9-15 s | 773 MB |
-| cap-r10 | r10's f56 emissions (`CELESTE_EMIT_CAPTURE`) | f56 | 2-3 s | 518 MB |
+| cap-r10 | r10's f56 emissions (`--emit-capture`) | f56 | 2-3 s | 518 MB |
 | r60s | room (6,0) 700m `r0sxhfp`, split frame | steps 0-71; 70 -> 71 | 26-33 s | 186 MB |
 | r62h57 (big) | room (6,2) 100%, as r62h | f0-f57; the reference frame 56 -> 57 | 143-151 s | 8.1 GB |
 | cap-r62h57 (big) | its f57 capture | f57 | 12-14 s | 12 GB |
@@ -190,7 +198,7 @@ mlock budget for perf's buffers is per user, and another agent's perf can
 hold it: "Permission error mapping pages"). The kernels are their own
 `.so`s in `$TMPDIR/asm-scratch/PID/`, removed by the next process that
 starts: run `perf report` before the next run, or keep them with
-`CELESTE_KERNEL_MIX=DIR`. The kernel build is in the profile too; use
+`--kernel-mix DIR`. The kernel build is in the profile too; use
 `--reps` or `perf record -D MS` to weight the wave.
 
 ## The metrics check
@@ -257,7 +265,7 @@ walk 20-26 s). The level -1 table without a cached file: (4,2) 12 s, (6,2)
 | old | now | why |
 |---|---|---|
 | the three room (1,0) oracles (CLAUDE.md "Gates") | t2, unchanged | cheap: 2.7 + 2.1 s |
-| `CELESTE_KERNEL_KEY_CHECK=1` on a forward f0-f44 | one frame, r10 f55 (451k states) | the same check per emitted row, on a bigger frame, in 2-3 s |
+| `--key-check` (was `CELESTE_KERNEL_KEY_CHECK=1`) on a forward f0-f44 | one frame, r10 f55 (451k states) | the same check per emitted row, on a bigger frame, in 2-3 s |
 | `ref-check` 8 samples x 30 rows, two rooms, single-threaded | 32 rows each of r10 f55 and r42x f55, in parallel, exit code on a soundness gap | was ~0.5 s a row on one thread; now 3-6 s a room |
 | `arc-check` of the gate tree, every frame x 20 samples | 32 records of one frame each of r10 and r42x, in parallel | sampled, one frame: t3 keeps the whole-tree check |
 | the object-level arc-check (r0sxhn, hours, never finished) | NOT covered at r0sxhn: t1 checks the object room at r0sxh (objects exact) | the reference engine forks the n level's widened objects into thousands of paths a step (below) |
