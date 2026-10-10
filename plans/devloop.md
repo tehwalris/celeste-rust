@@ -18,31 +18,35 @@ once reviewed; until then both hold.
 ## The ladder
 
 Times: quick profile, 16 threads, on the shared 32-thread machine with other
-agents' searches running (load in brackets: 1-minute average at the start;
-it moved between 10 and 47 during these runs, and the times with it).
+agents' searches running (load: the 1-minute average at the start; it moved
+between 6 and 47 during these runs, and the times with it). Measured on
+develop 79b2479 (exact keys, tree format 13) plus this branch, after the
+rebase; earlier format-12 numbers where noted.
 
 | tier | command | runs | protects | measured |
 |---|---|---|---|---|
-| t0 | `./check.sh t0` | nextest, quick profile (173 tests) | the unit level: interpreter, tracer, lowering, codegen, storage, arcs | 29-33 s run + 5-15 s build (load 14-28) |
-| t1 | `./check.sh t1` | one frame from each of three fixtures; KEY_CHECK on two; one backward frame; the storage replay; ref-check and arc-check samples | the forward's exact output and cost, the kernels' keys, the backward, the storage, the kernels and transfers against the reference | 28 s (load 10); 29-41 s (load 25-47) |
-| t2 | `./check.sh t2` | the room (1,0) gates; an objects-ladder search at a synthetic win; a platform room's forward and one frame of it | end to end: forward, arcs, concrete search, known route, platforms | 36-55 s without the platform frame, 84 s with it (load 35) |
-| big | `./check.sh big` | the reference frame (6,2) 100% f56 -> f57 and its 12 GB capture | the frame every kernel/storage measurement used | 11-14 s (fixtures: 2:43 once) |
+| t0 | `./check.sh t0` | nextest, quick profile (182 tests) | the unit level: interpreter, tracer, lowering, codegen, storage, arcs | 20 s run (load 6-14) + 12 s test build after an edit |
+| t1 | `./check.sh t1` | one frame from each of three fixtures; KEY_CHECK on two; one backward frame; the storage replay; ref-check and arc-check samples | the forward's exact output and cost, the kernels' keys, the backward, the storage, the kernels and transfers against the reference | 32 s (load 26); 28-41 s over the day (load 10-47) |
+| t2 | `./check.sh t2` | the room (1,0) gates; an objects-ladder search at a synthetic win; a platform room's forward and one frame of it | end to end: forward, arcs, concrete search, known route, platforms | 60 s (load 21), 50 s of it the two platform steps |
+| big | `./check.sh big` | the reference frame (6,2) 100% f56 -> f57 and its 12 GB capture | the frame every kernel/storage measurement used | 17 s (fixtures: 2:38 once) |
 | t3 | by hand, deliberately | see "t3" below | the rest of the old gates | minutes |
 
 ### t0: the unit tests
 
 `./safe-run.sh -- ./one-cargo.sh cargo nextest run --cargo-profile quick`.
-The wall is the slowest test's, and those are now all KERNEL BUILDS: each
-builds a whole room's registry (walk + trace + assemble) to run a few rows,
-and they build concurrently under nextest, so each takes 2-3x its solo time:
+The wall is the slowest test's, and those are now KERNEL BUILDS: each builds
+a whole room's registry (walk + trace + assemble) to run a few rows, and
+they build concurrently under nextest, so each takes ~1.5-2.5x its solo time
+(times in the suite at load 6-14):
 
 | test | solo | in the suite | what costs |
 |---|---|---|---|
-| `a_lane_outside_its_platform_bounds_declines` | 13.0 s | 29-32 s | room (2,1) `r0sxhnp` kernels: the walk 7.8 s, trace 11 s |
-| `near_floors_side_by_side_split_only_what_collisions_read` | | 26-29 s | room (6,1) `r0sxhn` lattice walk |
-| `room_13_exit_frame_keys_the_concrete_exit` | | 22-26 s | room (1,3) `r0sxh` registry for ONE row |
-| `split_frame_reaches_the_unsplit_frontier_at_a_near_level` | | 20-23 s | room (2,1), two kernel sets |
-| `room_02_spawn_frame_kernels_make_the_reference_successors` | | 19-21 s | room (0,2) registry |
+| `a_lane_outside_its_platform_bounds_declines` | 13.0 s | 19.8 s | room (2,1) `r0sxhnp` kernels: the walk 7.8 s, trace 11 s |
+| `near_floors_side_by_side_split_only_what_collisions_read` | | 17.9 s | room (6,1) `r0sxhn` lattice walk |
+| `room_13_exit_frame_keys_the_concrete_exit` | | 16.8 s | room (1,3) `r0sxh` registry for ONE row |
+| `split_frame_reaches_the_unsplit_frontier_at_a_near_level` | | 15.6 s | room (2,1), two kernel sets |
+| `room_02_spawn_frame_kernels_make_the_reference_successors` | | 14.5 s | room (0,2) registry |
+| `pinning_the_fly_fruits_motion_keeps_the_projected_successors` | 7.4 s | 14.1 s | the reference's unpinned steps along the route |
 
 Made faster here (solo, quick): `a_traced_frame_agrees_with_the_oracle` 24
 -> 3.2 s, `ice_at_answers_the_tile_scan_in_every_room` 20 -> 3.3 s,
@@ -50,8 +54,9 @@ Made faster here (solo, quick): `a_traced_frame_agrees_with_the_oracle` 24
 7.4 s (their sweeps in parallel, one interpreter or engine per worker,
 the assertions unchanged); `one_backward_gives_the_optimum` 8.1 -> 0.15 s
 (a backward step spawned 16 workers for a 15-node graph, ~90k thread
-spawns). Suite wall 26.6 s -> 29-32 s at a much higher load: the
-kernel-building tests set it now. What would cut them: building only the
+spawns). Suite wall: 26.6 s for 173 tests at the start (load 3-8) -> 20 s
+for 182 tests after the rebase (load 6-14); the kernel-building tests set it
+now. What would cut them: building only the
 (shape, region) kernels a test touches (a lazy registry), or a cached
 walk. Not done (the registry is built whole by design).
 
@@ -61,17 +66,20 @@ The two `#[ignore]`d tests (resume, level -1 balloon) are t3.
 
 | step | command (abridged) | protects | time |
 |---|---|---|---|
-| frame-r10 | `bench-frame --level-dir F/r10 --frame 55 --edges --metrics` | room (1,0) r0sxh f55 -> f56: 451,316 new states, 14,537,665 edges; f/e lines and exact metrics | 1.5-3.3 s |
-| frame-r62h | same, room (6,2) 100% r0sxhf f50 -> f51, level -1 | 2,597,457 states, 88,076,797 edges | 5.6-14.7 s (11.8 at load 47) |
-| frame-r42n | same, room (4,2) r0sxhn f60 -> f61, level -1 | the object level's kernels: 553,666 states | 2.3-4.9 s |
-| keycheck-r10 | `CELESTE_KERNEL_KEY_CHECK=1 bench-frame` r10 f55 | every emitted row's key recomputed from its fields | 1.6-3.1 s |
-| keycheck-r42n | the same, r42n f60 | the object level's rows | 2.5 s |
-| backward-r10arc | `bench-backward --horizon 56 --frame 45` | one arc backward step (W f45 of a synthetic-win h56 search; the gate's W line) | 0.4-0.7 s |
-| storage-r10 | `bench-storage` of r10's f56 capture | the storage alone; its f/e lines must equal frame-r10's | 0.2-1.7 s |
-| refcheck-r10 | `ref-check` 32 rows of r10 f55 | kernels against the reference engine, row by row | 2.7-3.5 s |
-| refcheck-r42x | same, room (4,2) objects exact f55 | the same in an object room | 5.0-6.5 s |
-| arccheck-r10 | `arc-check` 32 records of r10 f56, `--path-cap 4096` | the recorded transfers against the reference | 3.0-3.8 s |
-| arccheck-r42x | same, (4,2) objects exact f56 | the same in an object room | 2.7-2.9 s |
+| frame-r10 | `bench-frame --level-dir F/r10 --frame 55 --edges --metrics` | room (1,0) r0sxh f55 -> f56: 451,316 new states, 14,537,665 edges; f/e lines and exact metrics | 1.6 s |
+| frame-r62h | same, room (6,2) 100% r0sxhf f50 -> f51, level -1 | 2,597,457 states, 88,076,797 edges | 6.7 s (kernels 4 s, the 88M-edge fingerprint, the wave 0.7 s) |
+| frame-r42n | same, room (4,2) r0sxhn f60 -> f61, level -1 | the object level's kernels: 553,666 states | 2.5 s |
+| keycheck-r10 | `CELESTE_KERNEL_KEY_CHECK=1 bench-frame` r10 f55 | every emitted row's key recomputed from its fields | 2.7 s |
+| keycheck-r42n | the same, r42n f60 | the object level's rows | 4.4 s |
+| backward-r10arc | `bench-backward --horizon 56 --frame 45` | one arc backward step (W f45 of a synthetic-win h56 search; the gate's W line) | 0.4 s |
+| storage-r10 | `bench-storage` of r10's f56 capture | the storage alone; its f/e lines must equal frame-r10's | 0.4 s |
+| refcheck-r10 | `ref-check` 32 rows of r10 f55 | kernels against the reference engine, row by row | 2.5 s |
+| refcheck-r42x | same, room (4,2) objects exact f55 | the same in an object room | 4.9 s |
+| arccheck-r10 | `arc-check` 32 records of r10 f56, `--path-cap 4096` | the recorded transfers against the reference | 3.0 s |
+| arccheck-r42x | same, (4,2) objects exact f56 | the same in an object room | 2.6 s |
+
+(Times of the run at load 26; at load 10-47 over the day the steps moved by
+up to 2x.)
 
 Every frame step checks the frame twice over: `bench-frame` runs `--reps`
 times and refuses a rep whose lines differ (determinism), and the lines
@@ -82,11 +90,11 @@ are `ckhash --edges`'s for the frame, so they equal the real tree's
 
 | step | protects | time |
 |---|---|---|
-| gate10-forward | `forward --to 44`, posgraph and ckhash against gates/ (CLAUDE.md's oracles 1-2) | 2.7-8.9 s |
-| gate10-arc | `search --to 35 --win-at 9,101 --prefer` (oracle 3 and the known route) | 1.7-7.1 s |
-| search42-objects | room (4,2) `r0sxhn,r0sxh` (the objects ladder) to f50 at a synthetic win (32,56): arc bounds 47/47, concrete optimum 47; its witness as the known route; every `[gate]` line pinned | 4.9-6.8 s |
-| forward60-platforms | room (6,0) `r0sxhfp` split frame to step 71: `ckhash --edges` = the r60s fixture's pin | 26-44 s (the platform kernels' walk ~20 s) |
-| frame-r60s | one platform frame (step 70 -> 71) and its exact metrics | 32 s (the same walk again) |
+| gate10-forward | `forward --to 44`, posgraph and ckhash against gates/ (CLAUDE.md's oracles 1-2) | 2.8 s |
+| gate10-arc | `search --to 35 --win-at 9,101 --prefer` (oracle 3 and the known route) | 1.8 s |
+| search42-objects | room (4,2) `r0sxhn,r0sxh` (the objects ladder) to f50 at a synthetic win (32,56): arc bounds 47/47, concrete optimum 47; its witness as the known route; every `[gate]` line pinned | 5.0 s |
+| forward60-platforms | room (6,0) `r0sxhfp` split frame to step 71: `ckhash --edges` = the r60s fixture's pin | 25.5 s (the platform kernels' walk ~20 s) |
+| frame-r60s | one platform frame (step 70 -> 71) and its exact metrics: 49,469 kernel instructions a slice | 25.0 s (the same walk again) |
 
 ### big: the reference frame
 
@@ -94,10 +102,11 @@ Room (6,2) 100% (`CELESTE_HUNDRED=1 CELESTE_LOADING_JANK=2
 CELESTE_LEVEL_MINUS_ONE=94,5`) r0sxhf f56 -> f57: 5,857,035 lanes in,
 6,735,699 new states, 257,724,013 edges, 2,660,121,881 dynamic kernel
 instructions over 366,186 slices (7,264 a slice: plans/kernel-opt-decisions.md
-measured 2.660G and 7,264). frame-r62h57 8.2-10.5 s (kernels 4.1 s, the f56
+measured 2.660G and 7,264). frame-r62h57 8.2-11.1 s (kernels 4.1 s, the f56
 tree 0.6 s, the wave 2.2 s, 37M-state visited set copied per rep);
-storage-r62h57 3.0 s (`bench-storage` of the 12 GB capture: units 1.23 s,
-translation 0.16 s, layer 0.11 s, edge file 0.11 s at 16 threads).
+storage-r62h57 3.0-5.8 s (`bench-storage` of the 12 GB capture: units
+1.23 s, translation 0.16 s, layer 0.11 s, edge file 0.11 s at 16 threads,
+format 12).
 
 ### t3: deliberate, by hand
 
@@ -133,19 +142,19 @@ binary rebuilt the table (room (4,2) 12 s, (6,2) 37-61 s) before the first
 frame. `bench-frame` refuses a table whose fingerprint is not the one the
 tree recorded.
 
-| fixture | what | frames | build (load ~10-40) | size |
+| fixture | what | frames | build (load 5-20) | size |
 |---|---|---|---|---|
-| r10 | room (1,0) 200m `r0sxh` | f0-f56; frame 55 -> 56 | 14 s | 800 MB |
-| r62h | room (6,2) 100% `r0sxhf`, level -1 (94,5) | f0-f51; frame 50 -> 51 | 62-74 s (the table ~60 s of it) | 2.8 GB |
-| r42n | room (4,2) 2100m `r0sxhn`, level -1 (71,5) | f0-f61; frame 60 -> 61 | 18-28 s | 464 MB |
-| r42x | room (4,2) `r0sxh` (objects exact), level -1 | f0-f56 | 9-16 s | 143 MB |
-| r10arc | room (1,0) `search --level r0sxh --to 56 --win-at 40,64` | the level-0 tree to h56 | 15 s | 800 MB |
-| cap-r10 | r10's f56 emissions (`CELESTE_EMIT_CAPTURE`) | f56 | 3 s | 518 MB |
-| r60s | room (6,0) 700m `r0sxhfp`, split frame | steps 0-71; 70 -> 71 | 33 s | 187 MB |
-| r62h57 (big) | room (6,2) 100%, as r62h | f0-f57; the reference frame 56 -> 57 | 151 s | 8.4 GB |
-| cap-r62h57 (big) | its f57 capture | f57 | 12 s | 12 GB |
+| r10 | room (1,0) 200m `r0sxh` | f0-f56; frame 55 -> 56 | 8-14 s | 773 MB |
+| r62h | room (6,2) 100% `r0sxhf`, level -1 (94,5) | f0-f51; frame 50 -> 51 | 62-76 s (the table ~60 s of it) | 2.7 GB |
+| r42n | room (4,2) 2100m `r0sxhn`, level -1 (71,5) | f0-f61; frame 60 -> 61 | 18-28 s | 450 MB |
+| r42x | room (4,2) `r0sxh` (objects exact), level -1 | f0-f56 | 9-16 s | 140 MB |
+| r10arc | room (1,0) `search --level r0sxh --to 56 --win-at 40,64` | the level-0 tree to h56 | 9-15 s | 773 MB |
+| cap-r10 | r10's f56 emissions (`CELESTE_EMIT_CAPTURE`) | f56 | 2-3 s | 518 MB |
+| r60s | room (6,0) 700m `r0sxhfp`, split frame | steps 0-71; 70 -> 71 | 26-33 s | 186 MB |
+| r62h57 (big) | room (6,2) 100%, as r62h | f0-f57; the reference frame 56 -> 57 | 143-151 s | 8.1 GB |
+| cap-r62h57 (big) | its f57 capture | f57 | 12-14 s | 12 GB |
 
-All of `all`: 2:20 at load 15-20 (most of it r62h's table). Using a fixture
+All of `all`: 2:37 at load 5-15 (most of it r62h's table); `big` 2:38. Using a fixture
 is fast: frame F loads in 0.02-0.06 s (r10, r42n), 0.25 s (r62h f50, 12.6M
 visited states), 0.62 s (r62h57 f56, 37M).
 
@@ -219,18 +228,21 @@ minimum either way). The census costs the build ~0.6 s for room (6,0)'s
 
 ## Costs measured
 
-Incremental quick builds after `touch`ing one file (binaries, then the test
-binaries on top; load 12-38, so the spread is load as much as the file):
+Incremental quick builds after `touch`ing one file (the binaries, then the
+test binaries on top), at load 6-10 (at load 12-38 the same took 14-38 s):
 
 | touched | `cargo build --profile quick --bins` | + `nextest --no-run` |
 |---|---|---|
-| src/bin/rewrite.rs | 38 s (load 38) | 18 s |
-| src/frame.rs | 24 s | 12 s |
-| src/storage/wave.rs | 20 s | 16 s |
-| src/trace/interp.rs | 19 s | 13 s |
-| src/transpile/asm/codegen.rs | 14 s | 11 s |
-| crates/celeste-engine/src/runtime2.rs | 15 s | 12 s |
-| crates/celeste-core/src/pico8_num.rs | 15 s (load 12) | 13 s |
+| src/bin/rewrite.rs | 4.2 s | 0.8 s |
+| src/frame.rs | 14.2 s | 11.5 s |
+| src/storage/wave.rs | 14.2 s | 11.6 s |
+| src/trace/interp.rs | 14.4 s | 11.6 s |
+| src/transpile/asm/codegen.rs | 14.4 s | 11.6 s |
+| crates/celeste-engine/src/runtime2.rs | 14.7 s | 11.7 s |
+| crates/celeste-core/src/pico8_num.rs | 14.7 s | 11.7 s |
+
+Any library edit costs ~14 s of binary and ~12 s of test build: the
+`celeste-rust` crate is one codegen unit set, whichever file moved.
 
 Kernel registry at startup (every process; walk + trace + assemble):
 room (1,0) r0sx/r0sxh 0.9-1.4 s (102 kernels), (4,2) r0sxhn 1.8-1.9 s
@@ -277,6 +289,10 @@ walk 20-26 s). The level -1 table without a cached file: (4,2) 12 s, (6,2)
   sources instead (a build-time hash) would be sound only if the build is
   deterministic in them; not changed.
 - **Edge bytes are not exact** (the per-worker transfer ids, above).
+- **The fixtures follow the format**: a format change (exact keys: 12 ->
+  13) rebuilds every fixture (`ensure` does it) and moves every hash pin
+  (`pin all`, `pin big`, then `t1/t2/big --pin`, ~8 min); the counts are the
+  evidence (done for 79b2479: every state, edge and drop count identical).
 
 ## Re-pinning
 
