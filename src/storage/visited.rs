@@ -70,6 +70,7 @@ impl RegionTable {
     pub fn push_key(&mut self, words: usize, k: Key) -> u32 {
         debug_assert!(self.find(k).is_none());
         let e = self.keys.len() as u32;
+        assert!(e < 1 << super::ENTRY_BITS, "a region with {e} entries, past the {} bits an id holds", super::ENTRY_BITS);
         self.keys.push(k);
         self.masks.extend(std::iter::repeat_n(0, words));
         if (self.keys.len() + 1) * 2 > self.index.len() {

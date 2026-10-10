@@ -1891,7 +1891,7 @@ mod tests {
             assert!(grid.of_cell(cells[0]).is_some(), "the lane has a region");
             let visited = crate::storage::visited::VisitedSet::new(*crate::storage::geometry());
             let mut sink = crate::storage::unit::UnitSink::new(&visited, Filters::default(), 1, 0, false, false, None, None);
-            sink.begin(0, 0, &[0], None, false);
+            sink.begin(0, 0, 0, &[0], None, false);
             crate::compiled::dispatch::run_chunk_kernel(r, &cells, &[0], &mut sink)
         };
         let px = |n: i16| P8::from_i16(n);
@@ -1952,7 +1952,7 @@ mod tests {
             let cells = crate::search::pos_graph::block_cells(r).expect("cells");
             let visited = crate::storage::visited::VisitedSet::new(*crate::storage::geometry());
             let mut sink = crate::storage::unit::UnitSink::new(&visited, Filters::default(), 1, 0, false, false, None, None);
-            sink.begin(0, 0, &[0], None, false);
+            sink.begin(0, 0, 0, &[0], None, false);
             crate::compiled::dispatch::run_chunk_kernel(r, &cells, &[0], &mut sink)
         };
         let px = |n: i16| P8::from_i16(n);

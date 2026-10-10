@@ -215,6 +215,35 @@ enum Command {
         #[arg(long, default_value_t = false)]
         edges: bool,
     },
+    /// BENCH: replay one captured frame through the REAL storage code
+    /// (`storage::bench`): a forward run with `CELESTE_EMIT_CAPTURE=DIR`
+    /// (and `CELESTE_EMIT_CAPTURE_FRAME=F`) writes `DIR/f{F}/`; this replays
+    /// its units against `--tree`'s visited set at frame F-1 - the sinks,
+    /// then (`--phase translate|all`) the translation and the layer, then
+    /// (`all`) the edge file - printing per rep each phase's wall time and the
+    /// validation: requests, lids, edges, new states, and the `ckhash` lines
+    /// of the new states (`f`) and of the edges (`e`), to compare with the
+    /// real tree's (`ckhash --edges`). Run it under the capture's env
+    /// (`DIR/f{F}/env.txt`: the room, the level, CELESTE_HUNDRED, ...).
+    BenchStorage {
+        /// A captured frame's directory (`DIR/f{F}`).
+        #[arg(long)]
+        capture: String,
+        /// The level dir the capture's frame was run on (its frames to F-1).
+        #[arg(long)]
+        tree: String,
+        #[arg(long, default_value = "1,0")]
+        room: String,
+        #[arg(long, value_parser = Level::parse, default_value = "r0sx")]
+        level: Level,
+        #[arg(long)]
+        threads: Option<usize>,
+        /// `units`, `translate` (and the layer) or `all` (and the edge file).
+        #[arg(long, default_value = "all")]
+        phase: String,
+        #[arg(long, default_value_t = 3)]
+        reps: usize,
+    },
     /// DIAGNOSTIC: the TRANSFERS of a level-0 tree's edges, checked. Every
     /// recorded edge carries a transfer; then `--samples` records per frame,
     /// the source row stepped by the REFERENCE engine at the level (all 64
@@ -948,6 +977,18 @@ fn main() -> Result<()> {
             }
             let _ = std::fs::remove_dir_all(&edges_dir);
             celeste_rust::compiled::dispatch::print_kernel_hits();
+        }
+        Command::BenchStorage { capture, tree, room, level, threads, phase, reps } => {
+            std::env::set_var("CELESTE_START_ROOM", &room);
+            set_level(level);
+            let threads = threads.unwrap_or_else(celeste_rust::frame::threads);
+            celeste_rust::storage::bench::bench_storage(&celeste_rust::storage::bench::BenchArgs {
+                capture: std::path::Path::new(&capture),
+                tree: std::path::Path::new(&tree),
+                threads,
+                phase: &phase,
+                reps,
+            })?;
         }
         Command::CellGrowth { level_dir, from, to, top, at, by_age } => {
             let dir = std::path::Path::new(&level_dir);

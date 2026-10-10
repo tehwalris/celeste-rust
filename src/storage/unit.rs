@@ -183,6 +183,61 @@ impl RowBuf {
         b
     }
 
+    /// Do `self` and `other` lay rows out alike: the same skeleton values
+    /// and the same typed cells (a shape's buffers from one engine do)?
+    pub fn same_layout(&self, other: &RowBuf) -> bool {
+        self.skeleton.cols == other.skeleton.cols && self.cols.len() == other.cols.len() && self.cols.iter().zip(&other.cols).all(|(a, b)| a.0 == b.0)
+    }
+
+    /// The rows `rows` (`(buffer, row)` into `bufs`, one shape, one layout:
+    /// `same_layout`) as one block, every column canonical
+    /// (`collapse_uniform`): a function of the rows' values.
+    pub fn gather_rows(bufs: &[&RowBuf], rows: &[(u32, u32)]) -> Rt2 {
+        use celeste_engine::runtime2::collapse_uniform;
+        let t = bufs[0];
+        debug_assert!(bufs.iter().all(|b| b.same_layout(t)));
+        let mut piece = t.empty_piece();
+        for (k, (cell, tcol)) in t.cols.iter().enumerate() {
+            let col = match tcol {
+                TCol::Num(_) => Col::N(
+                    rows.iter()
+                        .map(|&(b, r)| match &bufs[b as usize].cols[k].1 {
+                            TCol::Num(v) => P8::from_raw(v[r as usize] as i32),
+                            _ => unreachable!("one layout"),
+                        })
+                        .collect(),
+                ),
+                TCol::Ival(_) => Col::I(
+                    rows.iter()
+                        .map(|&(b, r)| match &bufs[b as usize].cols[k].1 {
+                            TCol::Ival(v) => {
+                                let (a, c) = v[r as usize];
+                                (P8::from_raw(a as i32), P8::from_raw(c as i32))
+                            }
+                            _ => unreachable!("one layout"),
+                        })
+                        .collect(),
+                ),
+                TCol::Bool(_) => Col::V(
+                    rows.iter()
+                        .map(|&(b, r)| match &bufs[b as usize].cols[k].1 {
+                            TCol::Bool(v) => match v[r as usize] {
+                                0 => AV::Bool(false),
+                                1 => AV::Bool(true),
+                                _ => AV::UBool,
+                            },
+                            _ => unreachable!("one layout"),
+                        })
+                        .collect(),
+                ),
+            };
+            piece.cols[*cell] = collapse_uniform(col);
+        }
+        piece.row_keys = rows.iter().map(|&(b, r)| bufs[b as usize].keys[r as usize]).collect();
+        piece.width = rows.len();
+        piece
+    }
+
     /// Do rows `a` and `b` hold the same values (key and cell included)?
     pub fn same_row(&self, a: u32, other: &RowBuf, b: u32) -> bool {
         let (a, b) = (a as usize, b as usize);
@@ -340,6 +395,8 @@ pub struct UnitSink<'a> {
     pub n_lids: u64,
     /// TSC ticks of the units' ends (sort and encode), `phases`.
     pub end_ticks: u64,
+    /// `CELESTE_EMIT_CAPTURE`: this worker's stream (`bench`).
+    capture: Option<super::bench::CaptureWriter>,
 }
 
 impl<'a> UnitSink<'a> {
@@ -389,6 +446,7 @@ impl<'a> UnitSink<'a> {
             n_requests: 0,
             n_lids: 0,
             end_ticks: 0,
+            capture: super::bench::CaptureWriter::open(frame, worker),
         }
     }
 
@@ -398,9 +456,13 @@ impl<'a> UnitSink<'a> {
         self.record_edges
     }
 
-    /// Start a unit: lanes `lo..lo + sources.len()` of frontier block `block`.
-    pub fn begin(&mut self, block: u32, lo: usize, sources: &[StateId], skip: Option<&'a [bool]>, sources_old: bool) {
+    /// Start unit `unit` of the wave: lanes `lo..lo + sources.len()` of
+    /// frontier block `block`.
+    pub fn begin(&mut self, unit: u32, block: u32, lo: usize, sources: &[StateId], skip: Option<&'a [bool]>, sources_old: bool) {
         assert!(sources.len() <= MAX_UNIT_LANES, "a unit of {} lanes: at most {MAX_UNIT_LANES}", sources.len());
+        if let Some(c) = &mut self.capture {
+            c.unit(unit, block, lo, sources, sources_old);
+        }
         self.block = block;
         self.lo = lo;
         self.sources.clear();
@@ -442,6 +504,9 @@ impl<'a> UnitSink<'a> {
     /// the smallest horizon admitting it), in a level-0 tree a raise extends.
     #[inline]
     pub fn dropped(&mut self, lane: usize, from: u32) {
+        if let Some(c) = &mut self.capture {
+            c.dropped((lane - self.lo) as u32, from);
+        }
         if let (true, Some(d)) = (self.note_drops, self.drops) {
             d.note(self.block, lane, from);
         }
@@ -571,6 +636,9 @@ impl<'a> UnitSink<'a> {
             }
         }
         self.emitted += 1;
+        if let Some(c) = &mut self.capture {
+            c.emit(shape, cell, key, (lane - self.lo) as u32, xfer);
+        }
         if crate::compiled::asm_kernel::key_check_on() {
             let i = Self::buf_of(&mut self.check, shape, &init);
             push(&mut self.check[i]);
@@ -652,6 +720,15 @@ impl<'a> UnitSink<'a> {
         };
         let key = row.row_keys[0];
         self.emit(row.shape_hash, cell, key, self.lo, None, init, |b| b.push_row(row, key, cell))
+    }
+
+    /// The worker's units are over: its capture stream and transfer table
+    /// written (`CELESTE_EMIT_CAPTURE`).
+    pub fn finish_capture(&mut self) -> Result<()> {
+        match self.capture.take() {
+            Some(c) => c.finish(&self.xfer_tab),
+            None => Ok(()),
+        }
     }
 
     /// The unit is over: its edges sorted, deduplicated and encoded; its

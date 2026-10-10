@@ -12,10 +12,12 @@
 //!   * `marks`   - the backward's marks over state ids, and the resolver of
 //!                 an id to its (shape, key, cell)
 //!   * `meta`    - per frame, the shapes and entries it created
+//!   * `bench`   - `CELESTE_EMIT_CAPTURE` and `rewrite bench-storage`
 //!
 //! A state is `(shape, key, cell)` (the key holds no position:
 //! `runtime2::pos_code`); its id is `(region, entry, cell in region)`.
 
+pub mod bench;
 pub mod edges;
 pub mod marks;
 pub mod meta;
@@ -100,27 +102,30 @@ pub fn geometry() -> &'static Geometry {
 }
 
 /// A state's id: its region (shape index * slots + slot), its entry number
-/// in the region, its cell's index in the region - `region << 40 | entry <<
+/// in the region, its cell's index in the region - `region << 38 | entry <<
 /// 8 | local`. Ids sort by shape, then position (regions row-major), then
 /// entry: a layer is stored in id order.
 pub type StateId = u64;
 
-pub const REGION_BITS: u32 = 24;
+/// Bits of an id's region (4096 shapes at 16 px regions, 16k at 8 px).
+pub const REGION_BITS: u32 = 26;
+/// Bits of an id's entry number (a region's entries).
+pub const ENTRY_BITS: u32 = 30;
 
 #[inline]
 pub fn state_id(region: u32, entry: u32, local: u32) -> StateId {
-    debug_assert!(region < 1 << REGION_BITS && local < 256);
-    (region as u64) << 40 | (entry as u64) << 8 | local as u64
+    debug_assert!(region < 1 << REGION_BITS && entry < 1 << ENTRY_BITS && local < 256);
+    (region as u64) << (ENTRY_BITS + 8) | (entry as u64) << 8 | local as u64
 }
 
 #[inline]
 pub fn id_region(id: StateId) -> u32 {
-    (id >> 40) as u32
+    (id >> (ENTRY_BITS + 8)) as u32
 }
 
 #[inline]
 pub fn id_entry(id: StateId) -> u32 {
-    (id >> 8) as u32
+    (id >> 8) as u32 & ((1 << ENTRY_BITS) - 1)
 }
 
 #[inline]

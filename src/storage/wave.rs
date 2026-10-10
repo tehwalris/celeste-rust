@@ -251,13 +251,14 @@ pub fn run_wave(engine: &dyn FrameStep, frontier: Vec<Block>, cx: WaveCtx) -> Re
                             &b.ids()[first..=last]
                         };
                         let old = raised.is_some_and(|r| b.seq() < r.old_seqs);
-                        sink.begin(bi as u32, first, sources, (!b.skip().is_empty()).then_some(b.skip()), old);
+                        sink.begin(u as u32, bi as u32, first, sources, (!b.skip().is_empty()).then_some(b.skip()), old);
                         let t_unit = phases::start();
                         engine.run(b, &cells[bi], &order[bi][lo..hi], &mut sink)?;
                         phases::add(phases::UNIT, t_unit);
                         sink.end();
                     }
                     crate::compiled::dispatch::fold_hits();
+                    sink.finish_capture()?;
                     Ok(Done {
                         outs: std::mem::take(&mut sink.outs),
                         xfer_tab: std::mem::take(&mut sink.xfer_tab),
@@ -333,7 +334,7 @@ pub fn run_wave(engine: &dyn FrameStep, frontier: Vec<Block>, cx: WaveCtx) -> Re
 }
 
 /// A new state: its id and its row (unit, buffer, row).
-type NewState = (StateId, u32, u32, u32);
+pub(crate) type NewState = (StateId, u32, u32, u32);
 
 /// THE TRANSLATION: the units' requests into the visited set. New shapes
 /// numbered first (in hash order), then each target region on one worker:
@@ -342,7 +343,7 @@ type NewState = (StateId, u32, u32, u32);
 /// distinct (entry, cell) a NEW state, its row the first request's; every
 /// request's lid gets its owner. Returns the new states by id, and the
 /// frame's metadata.
-fn translate(visited: &mut VisitedSet, outs: &mut [UnitOut], frame: u32) -> Result<(Vec<NewState>, FrameMeta)> {
+pub(crate) fn translate(visited: &mut VisitedSet, outs: &mut [UnitOut], frame: u32) -> Result<(Vec<NewState>, FrameMeta)> {
     let mut meta = FrameMeta::default();
     let mut new_shapes: Vec<u64> = outs.iter().flat_map(|u| u.requests.iter().map(|r| u.lids[r.lid as usize].shape)).filter(|s| visited.shape_index(*s).is_none()).collect();
     new_shapes.sort_unstable();
@@ -352,57 +353,72 @@ fn translate(visited: &mut VisitedSet, outs: &mut [UnitOut], frame: u32) -> Resu
         meta.shapes.push((i, s));
     }
     let geo = visited.geo;
-    // Every request as (region, unit, request), sorted by region.
-    ensure!(outs.len() < 1 << 20, "frame {frame}: {} units, past the 20 bits a request names", outs.len());
-    let mut reqs: Vec<u64> = Vec::with_capacity(outs.iter().map(|u| u.requests.len()).sum());
-    for (ui, u) in outs.iter().enumerate() {
-        ensure!(u.requests.len() < 1 << 20, "frame {frame}: a unit with {} requests, past 20 bits", u.requests.len());
-        for (k, r) in u.requests.iter().enumerate() {
-            let l = &u.lids[r.lid as usize];
-            let region = region_of(&geo, visited.shape_index(l.shape).expect("numbered above"), l.slot);
-            reqs.push((region as u64) << 40 | (ui as u64) << 20 | k as u64);
+    // Per unit its requests as `region << 32 | request`, sorted (in
+    // parallel); per region the units' ranges are gathered by its job.
+    ensure!(outs.len() < 1 << 32, "frame {frame}: {} units", outs.len());
+    let threads = crate::frame::threads();
+    let unit_reqs: Vec<Vec<u64>> = {
+        let v: &VisitedSet = visited;
+        par_map(outs, threads, |u| {
+            let mut x: Vec<u64> = u
+                .requests
+                .iter()
+                .enumerate()
+                .map(|(k, r)| {
+                    let l = &u.lids[r.lid as usize];
+                    (region_of(&geo, v.shape_index(l.shape).expect("numbered above"), l.slot) as u64) << 32 | k as u64
+                })
+                .collect();
+            x.sort_unstable();
+            x
+        })
+    };
+    // Per region its request count, heaviest first; the tables taken out to
+    // be filled one region a worker.
+    let mut counts: rustc_hash::FxHashMap<u32, usize> = Default::default();
+    for x in &unit_reqs {
+        let mut i = 0;
+        while i < x.len() {
+            let r = (x[i] >> 32) as u32;
+            let j = i + x[i..].partition_point(|&y| (y >> 32) as u32 == r);
+            *counts.entry(r).or_default() += j - i;
+            i = j;
         }
     }
-    reqs.sort_unstable();
-    // Per region its range, heaviest first; the tables taken out to be
-    // filled one region a worker.
-    let mut ranges: Vec<(u32, usize, usize)> = Vec::new();
-    let mut i = 0;
-    while i < reqs.len() {
-        let r = (reqs[i] >> 40) as u32;
-        let j = i + reqs[i..].partition_point(|&x| (x >> 40) as u32 == r);
-        ranges.push((r, i, j));
-        i = j;
-    }
-    ranges.sort_by_key(|&(r, i, j)| (std::cmp::Reverse(j - i), r));
+    let mut ranges: Vec<(u32, usize)> = counts.into_iter().collect();
+    ranges.sort_by_key(|&(r, n)| (std::cmp::Reverse(n), r));
     let tables = visited.tables_mut();
-    for &(r, ..) in &ranges {
+    for &(r, _) in &ranges {
         tables[r as usize].get_or_insert_with(Default::default);
     }
     // `&mut` to each table in `ranges`' order (disjoint regions).
     let mut by_region: Vec<Option<&mut RegionTable>> = tables.iter_mut().map(|t| t.as_deref_mut()).collect();
-    let jobs: Vec<(u32, usize, usize, &mut RegionTable)> = ranges.iter().map(|&(r, i, j)| (r, i, j, by_region[r as usize].take().expect("a table per region"))).collect();
+    let jobs: Vec<(u32, &mut RegionTable)> = ranges.iter().map(|&(r, _)| (r, by_region[r as usize].take().expect("a table per region"))).collect();
     let jobs = std::sync::Mutex::new(jobs.into_iter().rev().collect::<Vec<_>>());
     let check = crate::compiled::asm_kernel::key_check_on();
     let words = geo.words;
     type Part = (Vec<NewState>, Vec<(u32, u32, u32, u32)>, Vec<(u32, u32, Key)>);
     let outs_ref: &[UnitOut] = outs;
     let parts: Vec<Part> = std::thread::scope(|scope| {
-        let hs: Vec<_> = (0..crate::frame::threads())
+        let hs: Vec<_> = (0..threads)
             .map(|_| {
-                let (jobs, reqs) = (&jobs, &reqs);
+                let (jobs, unit_reqs) = (&jobs, &unit_reqs);
                 scope.spawn(move || -> Result<Part> {
                     let (mut news, mut owners, mut entries) = (Vec::new(), Vec::new(), Vec::new());
                     let mut items: Vec<(Key, u32, u32, u32)> = Vec::new();
                     loop {
-                        let Some((region, i, j, table)) = jobs.lock().expect("translation jobs").pop() else { break };
+                        let Some((region, table)) = jobs.lock().expect("translation jobs").pop() else { break };
                         items.clear();
-                        items.extend(reqs[i..j].iter().map(|&x| {
-                            let (ui, k) = ((x >> 20) as u32 & 0xf_ffff, x as u32 & 0xf_ffff);
-                            let u = &outs_ref[ui as usize];
-                            let r = &u.requests[k as usize];
-                            (u.lids[r.lid as usize].key, r.local, ui, k)
-                        }));
+                        for (ui, x) in unit_reqs.iter().enumerate() {
+                            let lo = x.partition_point(|&y| ((y >> 32) as u32) < region);
+                            let hi = lo + x[lo..].partition_point(|&y| (y >> 32) as u32 == region);
+                            let u = &outs_ref[ui];
+                            items.extend(x[lo..hi].iter().map(|&y| {
+                                let k = y as u32;
+                                let r = &u.requests[k as usize];
+                                (u.lids[r.lid as usize].key, r.local, ui as u32, k)
+                            }));
+                        }
                         items.sort_unstable();
                         let mut a = 0;
                         while a < items.len() {
@@ -461,7 +477,7 @@ fn translate(visited: &mut VisitedSet, outs: &mut [UnitOut], frame: u32) -> Resu
 /// The new LAYER: per shape its new states in id order, gathered from the
 /// units' row buffers, cut into pieces (`PIECE_ROWS`) numbered from
 /// `first_seq`, each row with its id.
-fn gather_layer(visited: &VisitedSet, outs: &[UnitOut], news: &[NewState], frame: u32, first_seq: u32) -> Result<Vec<Block>> {
+pub(crate) fn gather_layer(visited: &VisitedSet, outs: &[UnitOut], news: &[NewState], frame: u32, first_seq: u32) -> Result<Vec<Block>> {
     let geo = visited.geo;
     // Per shape (ids sort by shape first) its range of `news`.
     let mut shapes: Vec<(usize, usize)> = Vec::new();
@@ -486,14 +502,23 @@ fn gather_layer(visited: &VisitedSet, outs: &[UnitOut], news: &[NewState], frame
     }
     par_map(&jobs, crate::frame::threads(), |&(lo, hi, seq)| -> Result<Block> {
         let part = &news[lo..hi];
-        // The row buffers the piece reads, each once, as blocks.
+        // The row buffers the piece reads: in one layout (one engine), read
+        // in place; else (a shape's skeleton differing between buffers) as
+        // blocks through the general gather.
         let mut bufs: Vec<(u32, u32)> = part.iter().map(|n| (n.1, n.2)).collect();
         bufs.sort_unstable();
         bufs.dedup();
-        let srcs: Vec<Rt2> = bufs.iter().map(|&(u, b)| outs[u as usize].bufs[b as usize].to_rt2()).collect();
-        let src_refs: Vec<&Rt2> = srcs.iter().collect();
-        let rows: Vec<u64> = part.iter().map(|n| (bufs.binary_search(&(n.1, n.2)).expect("a gathered buffer") as u64) << 32 | n.3 as u64).collect();
-        let rt2 = gather(&src_refs, &rows);
+        let refs: Vec<&super::unit::RowBuf> = bufs.iter().map(|&(u, b)| &outs[u as usize].bufs[b as usize]).collect();
+        let at = |n: &NewState| bufs.binary_search(&(n.1, n.2)).expect("a gathered buffer") as u32;
+        let rt2 = if refs.iter().all(|b| b.same_layout(refs[0])) {
+            let rows: Vec<(u32, u32)> = part.iter().map(|n| (at(n), n.3)).collect();
+            super::unit::RowBuf::gather_rows(&refs, &rows)
+        } else {
+            let srcs: Vec<Rt2> = refs.iter().map(|b| b.to_rt2()).collect();
+            let src_refs: Vec<&Rt2> = srcs.iter().collect();
+            let rows: Vec<u64> = part.iter().map(|n| (at(n) as u64) << 32 | n.3 as u64).collect();
+            gather(&src_refs, &rows)
+        };
         let ids: Vec<StateId> = part.iter().map(|n| n.0).collect();
         crate::compiled::asm_kernel::key_check_block(&rt2);
         let b = Block::with_ids(rt2, ids, seq);
