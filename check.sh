@@ -8,6 +8,9 @@
 #                          kernels and the transfers against the reference
 #   ./check.sh t2 [--pin]  short end-to-end runs: the room (1,0) gates, an
 #                          objects-ladder search, a platform room's forward
+#                          and one frame of it with its exact metrics
+#   ./check.sh big [--pin] the reference frame (6,2) 100% f56 -> f57 and its
+#                          12 GB capture replayed (fixtures: minutes, once)
 #   ./check.sh all         t0, t1, t2
 #
 # Every step prints ok/FAIL and its wall time; the run exits non-zero if any
@@ -93,7 +96,7 @@ t1() {
     step backward-r10arc backward
     grep -h '^\[bench-backward\] rep 0' "$C/backward-r10arc.err" | sed 's/^/    /'
     # The storage alone: r10's f56 emissions replayed (`bench-storage`).
-    step storage-r10 storage
+    step storage-r10 storage r10 56 1,0 r0sxh
     # The kernels against the reference engine, sampled rows of one frame.
     step refcheck-r10 ./safe-run.sh -- "$B" ref-check --level-dir "$F/r10" --frame 55 --level r0sxh --room 1,0 --samples 32 --threads "$TH"
     step refcheck-r42x env CELESTE_LEVEL_MINUS_ONE=71,5 ./safe-run.sh -- "$B" ref-check --level-dir "$F/r42x" --frame 55 --level r0sxh --room 4,2 --samples 32 --threads "$TH"
@@ -114,11 +117,22 @@ backward() {
     same "$C/backward.txt" "$G/r10arc.backward"
 }
 
+# storage TREE FRAME ROOM LEVEL ENV...: the capture of TREE's frame FRAME
+# replayed; its new states and edges are the frame check's (TREE.frame).
 storage() {
-    ./safe-run.sh -- "$B" bench-storage --capture "$F/cap-r10/f056" --tree "$F/r10" --room 1,0 --level r0sxh --threads "$TH" --reps 1 > "$C/storage.txt" || return 1
-    cat "$C/storage.txt" >&2
-    # Its new states and edges are the frame check's.
-    { grep -o 'f056 [0-9]* [0-9a-f]*' "$C/storage.txt"; grep -o 'e056 [0-9]* [0-9a-f]*' "$C/storage.txt"; } | diff "$G/r10.frame" - >&2
+    local tree=$1 f=$2 room=$3 level=$4; shift 4
+    env "$@" ./safe-run.sh -- "$B" bench-storage --capture "$F/cap-$tree/f$(printf %03d "$f")" --tree "$F/$tree" --room "$room" --level "$level" --threads "$TH" --reps 1 > "$C/storage-$tree.txt" || return 1
+    cat "$C/storage-$tree.txt" >&2
+    { grep -o "f$(printf %03d "$f") [0-9]* [0-9a-f]*" "$C/storage-$tree.txt"; grep -o "e$(printf %03d "$f") [0-9]* [0-9a-f]*" "$C/storage-$tree.txt"; } | diff "$G/$tree.frame" - >&2
+}
+
+big() {
+    build
+    step fixtures-big tools/fixtures.sh ensure r62h57 cap-r62h57
+    step frame-r62h57 frame r62h57 56 6,2 r0sxhf $L1_62
+    grep -hE '^\[bench\] (kernels|rep)|^\[phases\]' "$C/frame-r62h57.err" | sed 's/^/    /' | cut -c1-220
+    step storage-r62h57 storage r62h57 57 6,2 r0sxhf $L1_62
+    sed 's/^/    /' "$C/storage-r62h57.txt" | cut -c1-220
 }
 
 t2() {
@@ -129,6 +143,11 @@ t2() {
     step gate10-arc gate10_arc
     step search42-objects search42
     step forward60-platforms forward60
+    # The platform kernels' frame and exact metrics (their build is the
+    # cost: ~20 s of tracing, hence here and not in t1).
+    step fixtures-r60s tools/fixtures.sh ensure r60s
+    step frame-r60s frame r60s 70 6,0 r0sxhfp CELESTE_SPLIT_FRAME=1
+    grep -hE '^\[bench\] (kernels|rep)' "$C/frame-r60s.err" | sed 's/^/    /' | cut -c1-200
 }
 
 # The three pinned room (1,0) oracles (CLAUDE.md "Gates").
@@ -161,6 +180,7 @@ case $TIER in
     t0) t0 ;;
     t1) t1 ;;
     t2) t2 ;;
+    big) big ;;
     all) TIER=t0; t0; TIER=t1; t1; TIER=t2; t2 ;;
     *) sed -n '2,20p' "$0"; exit 2 ;;
 esac
