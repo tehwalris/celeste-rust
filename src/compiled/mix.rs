@@ -246,7 +246,9 @@ fn category(mn: &str, ops: &str, kind: &str, node_op: &Op, store_role: &str) -> 
                 "c.remat"
             }
         }
+        // A constant, at its def or rematerialized at a use (`Emitter::constant`).
         _ if mn == "vpbroadcastd" => "c.const",
+        _ if mn == "vpxord" && ops.split(", ").all(|o| Some(o) == ops.split(", ").next()) => "c.const",
         _ if mn == "vmovdqa64" => "c.move",
         "store" | "storemask" => return format!("d.store-{store_role}"),
         "load" | "loadmask" => "c.load",

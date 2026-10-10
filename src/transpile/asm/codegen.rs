@@ -1656,8 +1656,23 @@ impl<'a> Emitter<'a> {
             Inst::Load { off, .. } => {
                 writeln!(self.out, "    vmovdqu64 {}(%r13), %zmm{}", off, dst).unwrap();
             }
+            &Inst::BcastD { val, .. } => self.constant(val, dst),
             other => {
                 unreachable!("non-rematerializable def marked remat: {:?}", std::mem::discriminant(other))
+            }
+        }
+    }
+
+    /// The constant `val` in every lane of `dst`: zero by the zeroing idiom
+    /// (no memory, no dependency), anything else broadcast from the pool (a
+    /// load, like the reload it replaces; `vpternlogd $0xff` for all-ones
+    /// would take a logic port, the kernels' busiest, and depends on `dst`).
+    fn constant(&mut self, val: i32, dst: u8) {
+        match val {
+            0 => writeln!(self.out, "    vpxord %zmm{dst}, %zmm{dst}, %zmm{dst}").unwrap(),
+            _ => {
+                let l = self.pool.d(val);
+                writeln!(self.out, "    vpbroadcastd {l}(%rip), %zmm{dst}").unwrap();
             }
         }
     }
@@ -1715,10 +1730,11 @@ impl<'a> Emitter<'a> {
                 self.store_def(*dst, d);
             }
             Inst::BcastD { dst, val } => {
-                let l = self.pool.d(*val);
+                if self.skip_def(*dst) {
+                    return;
+                }
                 let d = self.def_reg(*dst);
-                writeln!(self.out, "    vpbroadcastd {}(%rip), %zmm{}", l, d).unwrap();
-                self.store_def(*dst, d);
+                self.constant(*val, d);
             }
             Inst::RBin { dst, op, a, b } => {
                 let ra = self.use_reg(*a, OPA);
@@ -1915,10 +1931,12 @@ impl<'a> Emitter<'a> {
     }
 }
 
-/// Drop stack reloads into a register that already holds that slot. A
-/// register holds a slot from its reload/spill until written (last AT&T
-/// operand); a spill stales other holders; any other stack access, label,
-/// jump, call, ret or `vzeroupper` forgets everything.
+/// Drop stack reloads into a register that already holds that slot, and
+/// constant materializations (`Emitter::constant`) into a register that
+/// already holds that constant. A register holds a slot from its
+/// reload/spill, a constant from its materialization, until written (last
+/// AT&T operand); a spill stales other holders of its slot; any other stack
+/// access, label, jump, call, ret or `vzeroupper` forgets everything.
 fn drop_redundant_reloads(body: &str) -> String {
     let reg = |s: &str| -> Option<usize> {
         let s = s.strip_prefix("%zmm").or_else(|| s.strip_prefix("%ymm")).or_else(|| s.strip_prefix("%xmm"))?;
@@ -1946,6 +1964,13 @@ fn drop_redundant_reloads(body: &str) -> String {
             } else {
                 forget(&mut holds);
             }
+        } else if let Some(k) = constant_key(mn, ops, a).filter(|_| reg(b).is_some_and(|r| r < 32)) {
+            // A constant into a register: dropped if it holds it already.
+            let r = reg(b).expect("filtered");
+            if holds[r].as_deref() == Some(k.as_str()) {
+                continue;
+            }
+            holds[r] = Some(k);
         } else if mn == "vmovdqu64" && a.starts_with("%zmm") && slot(b).is_some() {
             // A spill: `vmovdqu64 %zmmR, OFF(%rsp)`.
             let s = slot(b).unwrap();
@@ -1969,6 +1994,21 @@ fn drop_redundant_reloads(body: &str) -> String {
         out.push('\n');
     }
     out
+}
+
+/// The constant a line materializes (`Emitter::constant`), as a key no
+/// stack slot (a bare offset) can equal: the pool label of a broadcast, or
+/// `$zero` for the zeroing idiom.
+fn constant_key(mn: &str, ops: &str, a: &str) -> Option<String> {
+    match mn {
+        "vpbroadcastd" if a.ends_with("(%rip)") => Some(a.to_string()),
+        "vpxord" => {
+            let mut it = ops.split(", ");
+            let first = it.next()?;
+            (it.clone().count() == 2 && it.all(|o| o == first)).then(|| "$zero".to_string())
+        }
+        _ => None,
+    }
 }
 
 /// Compile `roots` of `g` into AVX-512 assembly, with the buffer layouts.
@@ -2129,8 +2169,9 @@ pub fn compile(
     for (i, inst) in lo.insts.iter().enumerate() {
         if let Some(d) = inst_def(inst) {
             def_of[d as usize] = i as u32;
-            // A load is rematerializable (reads `%r13`); nothing else is.
-            remat[d as usize] = matches!(inst, Inst::Load { .. });
+            // A load (reads `%r13`) and a constant are rematerializable;
+            // nothing else is.
+            remat[d as usize] = matches!(inst, Inst::Load { .. } | Inst::BcastD { .. });
         }
     }
 

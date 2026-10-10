@@ -995,3 +995,37 @@ fn values_held_across_a_run_of_calls_survive_it() {
         }
     }
 }
+
+/// Constants under register pressure: 48 select chains whose arms are
+/// broadcast constants (all-ones, zero and others) still live at the end,
+/// so the allocator spills some and REMATERIALIZES them at their uses
+/// (`Emitter::constant`). Bit-exact against the primitives.
+#[test]
+fn rematerialized_constants_under_pressure_are_bit_exact() {
+    let mut g = Graph::new();
+    let cells: Vec<u32> = (0..48u32).collect();
+    let cs: Vec<NodeId> = cells.iter().map(|c| g.leaf(Op::Cell(*c))).collect();
+    let ks: Vec<NodeId> = [-1i32, 0, 1, 0x10000, -0x8000, 7, 0x7fff_ffff, i32::MIN]
+        .iter()
+        .map(|&k| g.leaf(Op::Const(k, k)))
+        .collect();
+    let mut firsts = Vec::new();
+    for (i, &x) in cs.iter().enumerate() {
+        let y = cs[(i + 1) % cs.len()];
+        let lt = g.add(Op::Lt, vec![x, y]);
+        firsts.push(g.add(Op::Sel, vec![lt, ks[i % ks.len()], ks[(i + 3) % ks.len()]]));
+    }
+    // Their minimum, then every first select again beside more constants:
+    // all 48 are live until the minimum is known.
+    let min = firsts.iter().skip(1).fold(firsts[0], |m, &s| g.add(Op::Min, vec![m, s]));
+    let mut roots = vec![min];
+    for (i, &s) in firsts.iter().enumerate() {
+        let ge = g.add(Op::Ge, vec![cs[i], min]);
+        roots.push(g.add(Op::Sel, vec![ge, ks[(i + 5) % ks.len()], s]));
+    }
+    let text = crate::transpile::asm::compile(&g, &roots, "remat", &HashMap::new()).expect("compile").asm;
+    let consts = text.lines().filter(|l| l.contains("vpbroadcastd") || l.contains("vpternlogd $0xff") || l.trim_start().starts_with("vpxord")).count();
+    assert!(text.contains("(%rsp)") && consts > ks.len(), "the test needs spilled constants: {consts} materializations");
+    let mut rng = Lcg(0x4e3a_7a7e);
+    check(&g, &roots, "remat", &mut rng, random_columns, std::ptr::null(), None);
+}
