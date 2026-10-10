@@ -771,6 +771,23 @@ impl TreeFilter {
         }
     }
 
+    /// The filter a forward extending the tree runs under, its table checked
+    /// against the one the tree recorded: a table built under other
+    /// settings (`--override-settings`) or by another binary would filter
+    /// the new frames otherwise than the tree's.
+    fn checked_minus_one(&self, dir: &std::path::Path, s: &crate::settings::Settings) -> Result<Option<MinusOne>> {
+        let m = self.minus_one(dir)?;
+        if let (TreeFilter::MinusOne { table, .. }, Some(m)) = (self, m) {
+            let got = m.table(s).fingerprint();
+            anyhow::ensure!(
+                got == *table,
+                "{}: the level -1 table is not the one the tree was built under (fingerprint {got:016x}, the tree's {table:016x}; a fixture pins its table: --l1-table)",
+                dir.display()
+            );
+        }
+        Ok(m)
+    }
+
     /// The level -1 filter the tree in `dir` was built under, its table
     /// checked against the recorded fingerprint: what a check of the tree
     /// (`search::known`) must apply, whatever the environment says. Refused
@@ -1029,20 +1046,11 @@ impl ForwardState {
         dir: &std::path::Path,
         edges_dir: Option<&std::path::Path>,
     ) -> Result<(crate::storage::wave::Wave, crate::storage::visited::VisitedSet, crate::storage::edges::XferTable)> {
+        // The frame the tree would make: under the table it was built with.
         let minus_one = match self.filter {
-            Some(f) => f.minus_one(dir)?,
+            Some(f) => f.checked_minus_one(dir, &engine.settings())?,
             None => anyhow::bail!("{}: no level -1 record (a tree from before records)", dir.display()),
         };
-        // The frame the tree would make: under the table it was built with.
-        if let (Some(TreeFilter::MinusOne { table, .. }), Some(m)) = (self.filter, minus_one) {
-            let s = &engine.settings();
-            anyhow::ensure!(
-                m.table(s).fingerprint() == table,
-                "{}: the level -1 table is not the one the tree was built under (fingerprint {:016x}, the tree's {table:016x}; a fixture pins its table: --l1-table)",
-                dir.display(),
-                m.table(s).fingerprint()
-            );
-        }
         let frontier: Vec<Block> = self
             .frontier
             .iter()
@@ -1079,12 +1087,12 @@ impl ForwardState {
         to: u32,
         marks: Option<&MarkFilter>,
     ) -> Result<()> {
+        let s = &engine.settings();
         let minus_one = match self.filter {
-            Some(f) => f.minus_one(dir)?,
+            Some(f) => f.checked_minus_one(dir, s)?,
             None => anyhow::bail!("{}: no level -1 record (a tree from before records): it cannot be extended (delete it)", dir.display()),
         };
         let filters = Filters { marks, minus_one };
-        let s = &engine.settings();
         let mut last_free = None;
         while self.frames < to && !self.frontier.is_empty() {
             let frame = self.frames + 1;

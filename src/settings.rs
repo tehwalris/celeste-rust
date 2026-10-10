@@ -68,6 +68,9 @@ pub struct Settings {
     pub threads: Option<usize>,
     /// The level -1 table pinned by its file (the fixtures).
     pub l1_table: Option<PathBuf>,
+    /// A tree recorded under other `OVERRIDABLE` settings is used under
+    /// these, loudly (`--override-settings`).
+    pub override_settings: bool,
     pub diag: Diagnostics,
 }
 
@@ -109,6 +112,7 @@ impl Default for Settings {
             trim_rows: false,
             threads: None,
             l1_table: None,
+            override_settings: false,
             diag: Diagnostics::default(),
         }
     }
@@ -229,15 +233,36 @@ impl Settings {
         // was fixed at 8 (`storage::GEOMETRY`); any other side is refused.
         let legacy = |k: &str| k == "storage_region" && rec.get(k) == Some(&"8");
         diffs.extend(rec.keys().filter(|k| !mine.iter().any(|(m, _)| m == *k) && !legacy(k)).map(|k| (*k, format!("{k}: in the tree's record, not a setting"))));
+        if diffs.is_empty() {
+            return Ok(());
+        }
+        let show = |d: &[(&str, String)]| d.iter().map(|(_, s)| s.as_str()).collect::<Vec<_>>().join("\n  ");
+        let (soft, hard): (Vec<_>, Vec<_>) = diffs.into_iter().partition(|(k, _)| OVERRIDABLE.contains(k));
         anyhow::ensure!(
-            diffs.is_empty(),
-            "{}: the tree was built under other settings than this run's:\n  {}\n(a tree's frames are one search: delete it, or run with its flags)",
+            hard.is_empty(),
+            "{}: the tree was built under other settings than this run's:\n  {}\n(a tree's frames are one search: delete it, or run with its flags; --override-settings overrides only {OVERRIDABLE:?})",
             dir.display(),
-            diffs.iter().map(|(_, s)| s.as_str()).collect::<Vec<_>>().join("\n  ")
+            show(&[hard, soft].concat())
         );
+        anyhow::ensure!(
+            self.override_settings,
+            "{}: the tree was built under other settings than this run's:\n  {}\n(they do not change what the tree holds: --override-settings proceeds under this run's, or run with the tree's flags)",
+            dir.display(),
+            show(&soft)
+        );
+        eprintln!("[settings] OVERRIDE (--override-settings) {}: the tree's record stays, this run proceeds under its own:\n  {}", dir.display(), show(&soft));
         Ok(())
     }
 }
+
+/// The recorded settings `--override-settings` may override: those that do
+/// not change what a tree holds. The kernels' region grid (`--region`) only
+/// specializes the kernels: they are exact on every grid, and a lane outside
+/// a grid's bounds is a fatal coverage gap, never another successor (room
+/// (1,0) r0sxh to f44 under `16,6` and `off`: `ckhash --edges` identical,
+/// 2026-10-10). Every other line - the room, the win, the split frame, the
+/// category, the loading jank, the balloons, the level - is the search.
+pub const OVERRIDABLE: &[&str] = &["region"];
 
 /// The record's file in a level's tree.
 pub fn path(dir: &Path) -> PathBuf {
@@ -322,6 +347,13 @@ pub struct SettingsArgs {
     /// there): the fixtures', never a search's.
     #[arg(long, global = true)]
     pub l1_table: Option<PathBuf>,
+    /// Use a tree recorded under other settings that do not change what it
+    /// holds (only `--region`), under this run's; every difference is logged.
+    /// Any other difference (room, win, split frame, category, loading jank,
+    /// balloons, level) is still refused. A tree without a record: `rewrite
+    /// adopt-settings`.
+    #[arg(long, global = true)]
+    pub override_settings: bool,
     /// DIAGNOSTIC: every emitted row's key recomputed by the boundary, and
     /// every unit's copy of a new state compared (claims off: every copy
     /// reaches the translation).
@@ -392,6 +424,7 @@ impl SettingsArgs {
             trim_rows: self.trim_rows,
             threads: self.threads,
             l1_table: self.l1_table.clone(),
+            override_settings: self.override_settings,
             diag: Diagnostics {
                 key_check: self.key_check,
                 kernel_explain: self.kernel_explain,
@@ -475,6 +508,7 @@ pub fn startup(args: &SettingsArgs, adjust: impl FnOnce(&mut Settings)) -> Resul
     note("--level-minus-one ", s.level_minus_one.is_some(), s.level_minus_one.map_or(String::new(), |(h, v)| format!("{h},{v}")));
     note("--trim-rows", s.trim_rows, String::new());
     note("--threads ", s.threads.is_some(), format!("{}", s.threads.unwrap_or_default()));
+    note("--override-settings", s.override_settings, String::new());
     note("--l1-table ", s.l1_table.is_some(), format!("{}", s.l1_table.as_deref().unwrap_or(Path::new("")).display()));
     note("--key-check", s.diag.key_check, String::new());
     note("--kernel-explain", s.diag.kernel_explain, String::new());
@@ -538,6 +572,13 @@ mod tests {
             assert!(e.contains(k), "{k} not in {e}");
         }
         assert!(!e.contains("room:"), "{e}");
+        // `--override-settings`: only the region grid, and only with the flag.
+        let grid = Settings { region: None, ..sample.clone() };
+        let e = grid.check_at(&dir, "r0sxhf").expect_err("another grid, no override").to_string();
+        assert!(e.contains("region: the tree's 16,6, this run's none") && e.contains("--override-settings proceeds"), "{e}");
+        Settings { override_settings: true, ..grid.clone() }.check_at(&dir, "r0sxhf").expect("the grid overridden");
+        let e = Settings { override_settings: true, hundred: false, ..grid }.check_at(&dir, "r0sxhf").expect_err("a category is not overridable").to_string();
+        assert!(e.contains("hundred: the tree's 1, this run's 0") && e.contains("region:"), "{e}");
         // A record from before the storage side was fixed: `storage_region 8`
         // is accepted, another side is not.
         for (side, ok) in [("8", true), ("16", false)] {
