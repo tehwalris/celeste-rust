@@ -343,8 +343,9 @@ pub static TABLE: &[Entry] = &[
         slots: &[slot(&["dash_effect_time"], Stored::AtLeast(0), Input::Stored)],
         kind: Kind::Exact,
         hook: None,
-        why: "`dash_effect_time` decrements every frame and is read only as `dash_effect_time > 0`, \
-              so every value <= 0 behaves alike and `max(v, 0)` keeps every read.",
+        why: "`dash_effect_time` decrements every frame; the traced cart reads it only to decrement \
+              it (and the original cart only as `dash_effect_time > 0`), so every value <= 0 behaves \
+              alike and `max(v, 0)` keeps every read.",
     },
     Entry {
         name: "strawberry bob",
@@ -377,7 +378,9 @@ pub static TABLE: &[Entry] = &[
         hook: None,
         why: "DEAD fields: the cart reads `frames`, `seconds`, `minutes` and `deaths` only to update \
               each other and the key's sprite (below), never in anything a state's successors or the \
-              search's tests depend on, so every value of them behaves alike.",
+              search's tests depend on, so every value of them behaves alike. Checked: traced as free \
+              input cells along room (4,0)'s 100% route, no other stored field, guard, error or raise \
+              reads them (`trace::widen::tests::dead_fields_are_unread`).",
     },
     Entry {
         name: "key sprite",
@@ -387,7 +390,7 @@ pub static TABLE: &[Entry] = &[
         kind: Kind::Exact,
         hook: None,
         why: "DEAD fields: the key's `spr` (from `frames`) and `flip.x` (from `spr`) are read only by \
-              each other and the draw, so every value behaves alike.",
+              each other and the draw, so every value behaves alike. Checked with the timers.",
     },
     Entry {
         name: "fly fruit",

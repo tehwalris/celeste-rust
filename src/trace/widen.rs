@@ -732,3 +732,87 @@ fn bounds(d: &Symbolic, n: NodeId, facts: &[(NodeId, i64, i64)]) -> Option<(i64,
     }
     Some(r)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::trace::cart;
+    use crate::trace::interp::Interp;
+    use crate::trace::verify::{run_one, trace_frame};
+
+    /// THE DEAD FIELDS are unread: the slots the table stores as a constant
+    /// (`Stored::Num`/`Bool`: the timers, the key's sprite) are traced as
+    /// free input cells, every other slot concrete, and no stored field
+    /// outside them, no guard, error or raise reads one of those cells - so
+    /// every value of them makes the same successors, and the constant the
+    /// table stores loses nothing (an EXACT canonicalization). Every frame
+    /// of room (4,0)'s 100% route (the player runs and dashes, takes the
+    /// key and opens the chest with it).
+    #[test]
+    fn dead_fields_are_unread() {
+        if !std::path::Path::new("lua/celeste-minimal.lua").exists() {
+            return;
+        }
+        std::env::set_var("CELESTE_START_ROOM", "4,0");
+        let src = cart::sources().expect("sources");
+        let top = full_moon::parse(&src).expect("parse");
+        let init = full_moon::parse("_init()").expect("parse _init");
+        let reset = full_moon::parse("__reset_button_states()").expect("parse reset");
+        let frame = full_moon::parse(cart::FRAME_CODE).expect("parse frame");
+        let mut it: Interp<Symbolic> = Interp::new(Symbolic::default());
+        let cd = std::sync::Arc::new(celeste_core::cart_data::CartData::load("cart").expect("cart"));
+        let (rx, ry) = crate::game_runner::start_room();
+        it.cache = Some(std::sync::Arc::new(celeste_core::collision_cache::CollisionCache::new(&cd, rx, ry).expect("cache")));
+        it.cart = Some(cd);
+        let st = cart::fresh_state::<Symbolic>(&mut it.d);
+        let mut st = run_one(&mut it, &top, st).expect("toplevel");
+        cart::inject_tile_flag_at(&mut st);
+        let mut st = run_one(&mut it, &init, st).expect("_init");
+        let dead = |s: &Slot| matches!(s.stored, Stored::Num(_) | Stored::Bool(_));
+        // The 100% route: the player runs, dashes, takes the key and opens
+        // the chest with it.
+        let route = crate::concrete::read_inputs("tas/room_4_0_hundred_frame_152.txt").expect("the route");
+        let (mut traced, mut with_key, mut with_player, mut has_key) = (0, 0, 0, false);
+        for &byte in &route {
+            let roots = slots_where(&st, Level::EXACT, dead);
+            with_key += roots.iter().any(|p| p.last() == Some(&iface::key("spr"))) as usize;
+            with_player += !objects_of_type(&st, "player").is_empty() as usize;
+            let f = trace_frame(&mut it, &reset, &frame, st.clone(), &roots, &[], &[], false, &[]).expect("trace");
+            // Everything a successor depends on, its booleans decided as far as a
+            // BDD over independent atoms can (a guard re-merged after a branch on
+            // `frames` is `c or not c`, true).
+            let mut roots_in = vec![f.raise];
+            let mut what = vec!["the raise".to_string()];
+            for (k, o) in f.outs.iter().enumerate() {
+                roots_in.extend([o.guard, o.error]);
+                what.extend([format!("outcome {k}'s guard"), format!("outcome {k}'s error")]);
+                // The dead slots as the outcome names them (objects move in
+                // `objects` when one before them is destroyed).
+                let dead_out = slots_where(&o.st, Level::EXACT, dead);
+                for (p, n, _) in &o.fields {
+                    if !dead_out.contains(p) {
+                        roots_in.push(*n);
+                        what.push(iface::show(p));
+                    }
+                }
+            }
+            let (g, map, _) = crate::transpile::bdd::simplify_local(&it.d.graph, &roots_in, crate::transpile::bdd::LOCAL_CAP, crate::transpile::bdd::LOCAL_EXPAND);
+            for (r, w) in roots_in.iter().zip(&what) {
+                let cone = crate::transpile::bdd::reachable(&g, &[map[*r as usize]]);
+                let reads = (0..g.len()).any(|m| cone[m] && matches!(g.get(m as NodeId).op, Op::Cell(_)));
+                assert!(!reads, "{w} reads a dead field");
+            }
+            traced += 1;
+            for b in 0..6 {
+                let v = it.d.boolean(byte >> b & 1 == 1);
+                iface::set(&mut st, &[iface::key("__button_states"), Step::Idx(b)], Value::Bool(v)).expect("a button");
+            }
+            // Until the chest's `rnd` makes the concrete frame two (the key
+            // is taken and the chest opened by then).
+            let Ok(next) = run_one(&mut it, &frame, st) else { break };
+            st = next;
+            has_key |= matches!(iface::get(&st, &[iface::key("has_key")]), Some(Value::Bool(b)) if it.d.decide(&b) == Some(true));
+        }
+        assert!(has_key && with_key > 60 && with_player > 60, "{traced} frames traced: {with_key} with the key, {with_player} with the player, the key taken: {has_key}");
+    }
+}
