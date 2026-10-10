@@ -307,4 +307,7 @@ where the unit's block was whole: (1,0) 50 GB, (6,2) 67 GB.
   (f38-60, 20 samples; and f44-47, 5 samples) but the reference engine on
   widened object states ran for over 1.5 h without finishing; the r0sx
   arc-checks (gate tree, 0 bad) and ref-checks pass. Rerun it with fewer
-  samples or a faster reference before relying on it.
+  samples or a faster reference before relying on it. The `ref-check
+  --frame 46 --level r0sxhn` that followed the small run was killed at the
+  60 GB cap (safe-run reported OOM; its tree had been deleted under it, so
+  unconfirmed whether that is a real blowup) - rerun it too.
