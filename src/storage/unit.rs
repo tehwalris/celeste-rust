@@ -462,8 +462,15 @@ pub struct UnitSink<'a> {
     /// Some (lid, cell) of the unit was disallowed: its edges and requests
     /// go at the unit's end.
     disallowed: bool,
-    /// `--key-check`: every emission's row, checked in batches.
+    /// `--key-check`: every emission's row, checked in batches; claims off
+    /// (every unit's copy of a new state reaches the translation).
+    key_check: bool,
     check: Vec<RowBuf>,
+    /// `--phases`: the wave's phase timers (`frame::phases`).
+    pub phases: bool,
+    /// The level -1 table of `filters.minus_one` (or a raise's old filter:
+    /// the same table), resolved once.
+    l1: Option<&'static crate::trace::level_minus_one::CostToGo>,
     drop_last: Option<((u64, u32), Option<u32>)>,
     xfer_ids: rustc_hash::FxHashMap<crate::search::arc_edges::Pair, u32>,
     xfer_cache: Vec<(crate::compiled::asm_kernel::RawWords, u32)>,
@@ -507,7 +514,9 @@ impl<'a> UnitSink<'a> {
         edges_on: bool,
         drops: Option<&'a super::wave::DropNotes>,
         raise: Option<RaiseCtx<'a>>,
+        s: &crate::settings::Settings,
     ) -> Self {
+        let l1 = filters.minus_one.or(raise.as_ref().map(|r| r.raised.old)).map(|m| m.table(s));
         UnitSink {
             visited,
             claims,
@@ -542,7 +551,10 @@ impl<'a> UnitSink<'a> {
             scratch: Vec::new(),
             scratch_at: Vec::new(),
             disallowed: false,
+            key_check: s.diag.key_check,
             check: Vec::new(),
+            phases: s.diag.phases,
+            l1,
             drop_last: None,
             xfer_ids: Default::default(),
             xfer_cache: Vec::new(),
@@ -556,7 +568,7 @@ impl<'a> UnitSink<'a> {
             claimed_elsewhere: 0,
             pending: Vec::new(),
             end_ticks: 0,
-            capture: super::bench::CaptureWriter::open(frame, worker, level),
+            capture: super::bench::CaptureWriter::open(frame, worker, level, s),
             noted: Default::default(),
             blocks: None,
         }
@@ -642,7 +654,7 @@ impl<'a> UnitSink<'a> {
                 return r;
             }
         }
-        let from = m.table().admitted_from(shape, cell, self.frame);
+        let from = self.l1.expect("the level -1 table").admitted_from(shape, cell, self.frame);
         let r = (from > m.h).then_some(from);
         self.drop_last = Some(((shape, cell), r));
         r
@@ -781,7 +793,7 @@ impl<'a> UnitSink<'a> {
         // filter admitted this cell, the edges are recorded already and the
         // state is in the tree.
         if let Some(r) = &self.raise {
-            if self.sources_old && r.raised.old.table().admitted_from(shape, cell, self.frame) <= r.raised.old.h {
+            if self.sources_old && self.l1.expect("the level -1 table").admitted_from(shape, cell, self.frame) <= r.raised.old.h {
                 return Ok(());
             }
         }
@@ -789,7 +801,7 @@ impl<'a> UnitSink<'a> {
         if let Some(c) = &mut self.capture {
             c.emit(shape, cell, key, (lane - self.lo) as u32, xfer, is_provisional(key).then(|| self.prov.content(key)));
         }
-        if crate::compiled::asm_kernel::key_check_on() {
+        if self.key_check {
             let i = Self::buf_of(&mut self.check, shape, &init);
             push(&mut self.check[i]);
             if self.check[i].rows() >= 256 {
@@ -840,7 +852,7 @@ impl<'a> UnitSink<'a> {
             self.lid_masks[base + words + w] |= b;
             // Another unit may hold the state's row already: only the
             // first copies it (`Claims`).
-            if !crate::compiled::asm_kernel::key_check_on() && !self.claims.claim(shape, slot, key, local) {
+            if !self.key_check && !self.claims.claim(shape, slot, key, local) {
                 self.claimed_elsewhere += 1;
                 if self.lid_owners[lid as usize] == NO_OWNER {
                     // Marked pending once: its owner slot says so.
@@ -939,7 +951,7 @@ impl<'a> UnitSink<'a> {
     /// The unit is over: its edges sorted, deduplicated and encoded; its
     /// lids, requests and rows kept for the translation.
     pub fn end(&mut self) -> Result<()> {
-        let t = crate::frame::phases::start();
+        let t = crate::frame::phases::start(self.phases);
         for b in &self.check {
             crate::compiled::asm_kernel::key_check(b, &self.visited.keys, self.prov);
         }

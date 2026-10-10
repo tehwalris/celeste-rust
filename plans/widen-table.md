@@ -110,7 +110,7 @@ assumptions, never a stored value), the seeded balloons' lookup view
 ## The level is a value
 
 `abstraction::{set_level, current_level}` and their Mutex are gone. The
-engines carry the level (`FrameEngine::new_for_start_room(level)`,
+engines carry the level (`FrameEngine::new(settings, level)`,
 `RefEngine::at_level`, `FrameStep::level`); the kernel registry, the wave,
 the sink's reference-row key view, frame 0's keys and the capture's env
 read it from the engine; `Symbolic` carries a `Level` (the four bools are

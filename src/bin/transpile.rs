@@ -28,8 +28,8 @@ struct Cli {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    celeste_rust::settings::startup(&cli.settings, |_| {})?;
-    let threads_or = |n: usize| celeste_rust::settings::get().threads.unwrap_or(n);
+    let cfg = celeste_rust::settings::startup(&cli.settings, |_| {})?;
+    let threads_or = |n: usize| cfg.threads.unwrap_or(n);
     match (cli.level_minus_one, cli.level_minus_one_table) {
         (Some(args), None) => {
             let mut args = args.into_iter();
@@ -44,7 +44,7 @@ fn main() -> Result<()> {
             // The tracer recurses through the cart's AST: a big stack.
             let report = std::thread::Builder::new()
                 .stack_size(256 * 1024 * 1024)
-                .spawn(move || celeste_rust::trace::level_minus_one::probe(std::path::Path::new("."), &opts))
+                .spawn(move || celeste_rust::trace::level_minus_one::probe(std::path::Path::new("."), &opts, &cfg))
                 .context("spawn the level -1 probe")?
                 .join()
                 .map_err(|_| anyhow!("the level -1 probe panicked"))??;
@@ -56,7 +56,7 @@ fn main() -> Result<()> {
             let t = std::time::Instant::now();
             let table = std::thread::Builder::new()
                 .stack_size(256 * 1024 * 1024)
-                .spawn(move || celeste_rust::trace::level_minus_one::cost_to_go(std::path::Path::new("."), spd_px, threads))
+                .spawn(move || celeste_rust::trace::level_minus_one::cost_to_go(std::path::Path::new("."), spd_px, threads, &cfg))
                 .context("spawn the level -1 builder")?
                 .join()
                 .map_err(|_| anyhow!("the level -1 builder panicked"))??;

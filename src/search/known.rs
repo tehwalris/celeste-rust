@@ -30,7 +30,7 @@
 //! the check that failed, the node and the state, and the search FAILS.
 
 use super::arc_dp::{concrete_engines, exact_state, lookup_keys, lookup_view, rem_of, NodeKeys, Winning};
-use crate::frame::{steps_per_frame, wins_of, Block, MarkFilter, Visited};
+use crate::frame::{wins_of, Block, MarkFilter, Visited};
 
 /// A known solution to check, and the filter the level's forward ran under.
 pub struct Route<'a> {
@@ -40,6 +40,8 @@ pub struct Route<'a> {
 
 /// What the arc phase holds for the check (`arc_dp::solve`).
 pub struct Pruning<'a> {
+    /// The search's settings (its room, category, split frame).
+    pub settings: &'a crate::settings::Settings,
     pub level: crate::abstraction::Level,
     /// In search steps.
     pub horizon: u32,
@@ -66,9 +68,9 @@ struct Run {
     exit: Option<(u32, Vec<u32>)>,
 }
 
-fn run(inputs: &[u8], horizon: u32) -> anyhow::Result<(Run, bool)> {
-    let spf = steps_per_frame();
-    let (mut engines, seeded) = concrete_engines(1)?;
+fn run(inputs: &[u8], horizon: u32, settings: &crate::settings::Settings) -> anyhow::Result<(Run, bool)> {
+    let spf = settings.steps_per_frame();
+    let (mut engines, seeded) = concrete_engines(1, settings)?;
     let eng = &mut engines[0];
     let mut layers: Vec<Vec<(u32, Block)>> = vec![vec![(0, Block::canonical(eng.initial()?)?)]];
     for s in 0..horizon {
@@ -76,7 +78,7 @@ fn run(inputs: &[u8], horizon: u32) -> anyhow::Result<(Run, bool)> {
         let (mut next, mut seen, mut won) = (Vec::new(), rustc_hash::FxHashSet::default(), Vec::new());
         for (p, (_, b)) in layers.last().expect("the start").iter().enumerate() {
             for c in eng.step(b.rt2(), byte)? {
-                if wins_of(c.rt2())?.iter().any(|&x| x) {
+                if wins_of(c.rt2(), settings)?.iter().any(|&x| x) {
                     won.push(p as u32);
                 } else if seen.insert(exact_state(&c, c.positions()?[0])) {
                     next.push((p as u32, c));
@@ -99,14 +101,14 @@ fn run(inputs: &[u8], horizon: u32) -> anyhow::Result<(Run, bool)> {
 /// `f` and survives everything; an error: it is PRUNED (the report printed).
 pub fn check(route: &Route, p: &Pruning) -> anyhow::Result<Option<u32>> {
     let t0 = std::time::Instant::now();
-    let spf = steps_per_frame();
-    let (run, seeded) = run(route.inputs, p.horizon)?;
+    let spf = p.settings.steps_per_frame();
+    let (run, seeded) = run(route.inputs, p.horizon, p.settings)?;
     let Some((exit, winners)) = &run.exit else {
         eprintln!("[known] the known route does not exit by f{} ({} inputs): not checked", p.horizon / spf, route.inputs.len());
         return Ok(None);
     };
     let frame = exit.div_ceil(spf);
-    let l1 = p.minus_one.map(|m| (m.h, m.table()));
+    let l1 = p.minus_one.map(|m| (m.h, m.table(p.settings)));
     // Per step and state: the first check it fails (`None`: it passes).
     let mut verdicts: Vec<Vec<Option<Miss>>> = Vec::with_capacity(run.layers.len());
     for (s, layer) in run.layers.iter().enumerate() {
@@ -235,7 +237,7 @@ fn verdict(b: &Block, s: u32, seeded: bool, l1: Option<(u32, &crate::trace::leve
             }
         }
     }
-    if s % steps_per_frame() != 0 {
+    if s % p.settings.steps_per_frame() != 0 {
         return Ok(None);
     }
     let Some(i) = (if s == 0 { Some(p.start) } else { p.node.get(shape, key, cell) }) else {

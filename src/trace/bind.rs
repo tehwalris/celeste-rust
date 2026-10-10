@@ -394,7 +394,7 @@ mod tests {
         let cart = std::sync::Arc::new(
             celeste_core::cart_data::CartData::load("cart").expect("cart"),
         );
-        let (rx, ry) = crate::game_runner::start_room();
+        let (rx, ry) = crate::settings::Settings::default().room;
         let cache = std::sync::Arc::new(
             celeste_core::collision_cache::CollisionCache::new(&cart, rx, ry).expect("cache"),
         );
@@ -499,7 +499,7 @@ mod tests {
     fn the_structure_a_traced_state_becomes_is_already_canonical() {
         use crate::trace::{cart, domain::Symbolic, interp::Interp, verify::run_one};
 
-        let src = cart::sources(crate::settings::get()).expect("sources");
+        let src = cart::sources(&crate::settings::Settings::default()).expect("sources");
         let top = full_moon::parse(&src).expect("parse");
         let init = full_moon::parse("_init()").expect("parse _init");
         let frame = full_moon::parse(cart::FRAME_CODE).expect("parse frame");
@@ -507,7 +507,7 @@ mod tests {
         let cd = std::sync::Arc::new(
             celeste_core::cart_data::CartData::load("cart").expect("cart"),
         );
-        let (rx, ry) = crate::game_runner::start_room();
+        let (rx, ry) = crate::settings::Settings::default().room;
         let cache = std::sync::Arc::new(
             celeste_core::collision_cache::CollisionCache::new(&cd, rx, ry).expect("cache"),
         );
@@ -552,7 +552,7 @@ mod tests {
     fn a_traced_state_becomes_a_structure_every_path_can_walk() {
         use crate::trace::{cart, domain::Symbolic, interp::Interp, verify::run_one};
 
-        let src = cart::sources(crate::settings::get()).expect("sources");
+        let src = cart::sources(&crate::settings::Settings::default()).expect("sources");
         let top = full_moon::parse(&src).expect("parse");
         let init = full_moon::parse("_init()").expect("parse _init");
         let frame = full_moon::parse(cart::FRAME_CODE).expect("parse frame");
@@ -560,7 +560,7 @@ mod tests {
         let cd = std::sync::Arc::new(
             celeste_core::cart_data::CartData::load("cart").expect("cart"),
         );
-        let (rx, ry) = crate::game_runner::start_room();
+        let (rx, ry) = crate::settings::Settings::default().room;
         let cache = std::sync::Arc::new(
             celeste_core::collision_cache::CollisionCache::new(&cd, rx, ry).expect("cache"),
         );

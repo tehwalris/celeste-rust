@@ -369,7 +369,7 @@ mod tests {
         let starts = [DASH | RIGHT | UP, DASH | RIGHT, DASH | UP, DASH];
         // The cart is read when an engine is built, under its settings.
         let successors = |s: crate::settings::Settings| -> Vec<usize> {
-            let mut eng = RefEngine::with(&s).expect("engine");
+            let mut eng = RefEngine::new(&s).expect("engine");
             let mut row = eng.initial().expect("initial");
             for _ in 0..40 {
                 row = eng.step_one(&row, 0).expect("idle frame").into_rt2();
@@ -380,6 +380,6 @@ mod tests {
         assert_eq!(successors(Settings::default()), [1, 1, 1, 1], "any%: every dash start");
         assert_eq!(successors(Settings { nodiag: true, ..Default::default() }), [0, 1, 1, 1], "nodiag: all but the diagonal");
         assert_eq!(successors(Settings { onlydiag: true, ..Default::default() }), [1, 0, 0, 0], "onlydiag: the diagonal only");
-        assert!(RefEngine::with(&Settings { nodiag: true, onlydiag: true, ..Default::default() }).is_err(), "both modes at once must be refused");
+        assert!(RefEngine::new(&Settings { nodiag: true, onlydiag: true, ..Default::default() }).is_err(), "both modes at once must be refused");
     }
 }

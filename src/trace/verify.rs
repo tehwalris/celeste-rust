@@ -330,11 +330,11 @@ pub fn trace_frame<'a>(
     for (o, e) in outs.iter_mut().zip(super::error::for_outcomes(&mut it.d, &roots)) {
         o.error = it.d.graph.fold(crate::transpile::graph::Op::Or, vec![o.error, e]);
     }
-    if crate::settings::get().diag.build_trace {
+    if it.d.build_trace {
         eprintln!("[build] trace_frame (widen {widen}): {} forks at the end, {} outcomes, {} pins", it.d.forks, outs.len(), pin.len());
     }
     // DIAGNOSTIC: forks by origin, and how many each outcome sees.
-    if crate::settings::get().diag.build_trace {
+    if it.d.build_trace {
         let mut by: std::collections::BTreeMap<&str, usize> = Default::default();
         for (_, o) in &it.d.fork_origins {
             *by.entry(o.as_str()).or_default() += 1;
@@ -1030,7 +1030,7 @@ fn split_undecided_selects(d: &mut Symbolic, outs: Vec<FrameOut>, mut points: Op
         }
         n_rest += 1;
     }
-    if crate::settings::get().diag.build_trace {
+    if d.build_trace {
         eprintln!("[build] split_undecided_selects: {n_in} outcomes, {n_splits} splits, {n_decided} decided by the points, {n_rest} absorbed by a case split, {} out", done.len());
     }
     // Each outcome whole again; only its pixels reach the kernel.
@@ -1181,13 +1181,13 @@ fn three_valued(d: &mut Symbolic, root: NodeId) -> NodeId {
                 }
                 None if boolean_op => {
                     let u = d.unknown_bool_atom();
-                    if crate::settings::get().diag.build_trace {
+                    if d.build_trace {
                         eprintln!("[build] three_valued: {op:?} past {ARMS} arms, unknown {:?}", d.graph.get(u).op);
                     }
                     u
                 }
                 None => {
-                    if crate::settings::get().diag.build_trace {
+                    if d.build_trace {
                         eprintln!("[build] three_valued: {op:?} past {ARMS} arms, the whole range");
                     }
                     d.graph.leaf(Op::Const(i32::MIN, i32::MAX))
@@ -1598,7 +1598,7 @@ mod tests {
     /// one pinned cell and `pin_guard`'s negation must decline the lane.
     #[test]
     fn a_body_pinned_to_a_pm1_key_refuses_any_other_key() {
-        let src = cart::sources(crate::settings::get()).expect("sources");
+        let src = cart::sources(&crate::settings::Settings::default()).expect("sources");
         let top = full_moon::parse(&src).expect("parse");
         let init = full_moon::parse("_init()").expect("parse _init");
         let reset = full_moon::parse("__reset_button_states()").expect("parse reset");
@@ -1606,7 +1606,7 @@ mod tests {
         let mut it: Interp<Symbolic> = Interp::new(Symbolic::default());
         let cd =
             std::sync::Arc::new(celeste_core::cart_data::CartData::load("cart").expect("cart"));
-        let (rx, ry) = crate::game_runner::start_room();
+        let (rx, ry) = crate::settings::Settings::default().room;
         it.cache = Some(std::sync::Arc::new(
             celeste_core::collision_cache::CollisionCache::new(&cd, rx, ry).expect("cache"),
         ));
@@ -1670,7 +1670,7 @@ mod tests {
     /// room: true somewhere in rooms with ice, false everywhere in others.
     #[test]
     fn ice_at_answers_the_tile_scan_in_every_room() {
-        let src = cart::sources(crate::settings::get()).expect("sources");
+        let src = cart::sources(&crate::settings::Settings::default()).expect("sources");
         let top = full_moon::parse(&src).expect("parse");
         let init = full_moon::parse("_init()").expect("parse _init");
         let cd =
@@ -1685,7 +1685,7 @@ mod tests {
             .map(|(x, y, w, h)| full_moon::parse(&format!("ice_probe = ice_at({x},{y},{w},{h})")).expect("parse probe"))
             .collect();
         let mut it: Interp<Symbolic> = Interp::new(Symbolic::default());
-        let (rx0, ry0) = crate::game_runner::start_room();
+        let (rx0, ry0) = crate::settings::Settings::default().room;
         it.cache = Some(std::sync::Arc::new(
             celeste_core::collision_cache::CollisionCache::new(&cd, rx0, ry0).expect("cache"),
         ));
@@ -1811,7 +1811,7 @@ end
     /// DECLINED point is a counted refusal, not a wrong answer.
     #[test]
     fn a_traced_frame_agrees_with_the_oracle() {
-        let src = cart::sources(crate::settings::get()).expect("sources");
+        let src = cart::sources(&crate::settings::Settings::default()).expect("sources");
         let top = full_moon::parse(&src).expect("parse");
         let init = full_moon::parse("_init()").expect("parse _init");
         let reset = full_moon::parse("__reset_button_states()").expect("parse reset");
@@ -1819,7 +1819,7 @@ end
 
         let mut it: Interp<Symbolic> = Interp::new(Symbolic::default());
         let cd = std::sync::Arc::new(celeste_core::cart_data::CartData::load("cart").expect("cart"));
-        let (rx, ry) = crate::game_runner::start_room();
+        let (rx, ry) = crate::settings::Settings::default().room;
         it.cache = Some(std::sync::Arc::new(
             celeste_core::collision_cache::CollisionCache::new(&cd, rx, ry).expect("cache"),
         ));

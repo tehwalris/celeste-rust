@@ -47,9 +47,9 @@ names the first exit WITH the berry.)
 Every setting is a flag of the binaries (`settings::SettingsArgs`,
 flattened `global` into `rewrite`, and into `transpile` and
 `concrete_run`), parsed and validated into ONE `settings::Settings`, which
-is also what a tree records (its search-changing part). Installed once per
-process (`settings::install`, by `settings::startup`); a second install of
-other settings, or an install after a read, panics.
+is also what a tree records (its search-changing part). Made once per
+process by `settings::startup` and PASSED to what reads it (no global
+since branch `settings-explicit`, below).
 
 | flag | was | recorded in a tree |
 |---|---|---|
@@ -57,7 +57,7 @@ other settings, or an install after a read, panics.
 | `--win-at x,y \| x0..x1,y0..y1` | CELESTE_WIN_AT_XY (and `--win-at`) | yes |
 | `--split-frame` | CELESTE_SPLIT_FRAME | yes |
 | `--region px,S \| off` | CELESTE_REGION | yes |
-| `--storage-region 8\|16` | CELESTE_STORAGE_REGION (was also checked by the metas) | yes |
+| ~~`--storage-region 8\|16`~~ (cut: fixed at 8) | CELESTE_STORAGE_REGION (was also checked by the metas) | old records' `storage_region 8` accepted |
 | `--hundred`, `--nodiag`, `--onlydiag`, `--gemskip` | CELESTE_* | yes |
 | `--loading-jank J\|none` | CELESTE_LOADING_JANK | yes |
 | `--balloon-seeds S` | CELESTE_BALLOON_SEEDS | yes |
@@ -65,12 +65,13 @@ other settings, or an install after a read, panics.
 | `--level-minus-one H,S` | CELESTE_LEVEL_MINUS_ONE | its own record (`TreeFilter`: a raise changes it) |
 | `--trim-rows` | CELESTE_TRIM_ROWS | no (the files say which rows are trimmed) |
 | `--threads N` | CELESTE_THREADS (and per-command `--threads`) | no |
-| `--min-free-gb N` | CELESTE_MIN_FREE_GB | no |
+| ~~`--min-free-gb N`~~ (cut: 20 GB, `frame::MIN_FREE_GB`) | CELESTE_MIN_FREE_GB | no |
 | `--l1-table FILE` | CELESTE_L1_TABLE | no (the tree records the table's fingerprint) |
 | `--key-check` | CELESTE_KERNEL_KEY_CHECK | no |
 | `--kernel-explain`, `--kernel-mix DIR`, `--build-trace`, `--phases` | CELESTE_* | no |
-| `--emit-capture DIR`, `--emit-capture-frame F` | CELESTE_EMIT_CAPTURE(_FRAME) | no |
-| `--walk-regions "(ix,iy) .."`, `--l1-path x,y` | CELESTE_WALK_REGIONS, CELESTE_L1_PATH | no |
+| `--emit-capture DIR` (every wave; ~~`--emit-capture-frame F`~~ cut) | CELESTE_EMIT_CAPTURE(_FRAME) | no |
+| ~~`--walk-regions`~~, ~~`--l1-path x,y`~~ (cut) | CELESTE_WALK_REGIONS, CELESTE_L1_PATH | no |
+| `--override-settings` (new) | - | no |
 | (internal) | CELESTE_KERNEL_METRICS, CELESTE_PHASES set by `bench-frame` itself | - |
 
 **Knob count: 36 `CELESTE_*` variables read in code before; 0 after; 26

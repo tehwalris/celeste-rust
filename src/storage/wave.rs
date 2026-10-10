@@ -171,8 +171,8 @@ pub fn run_wave(engine: &dyn FrameStep, frontier: Vec<Block>, cx: WaveCtx) -> Re
     use std::time::Instant;
     let WaveCtx { visited, xfers, pos, filters, frame, edges_dir, layer, layers } = cx;
     // A platforms-unknown level knows only `PLATFORM_WORLD_FRAMES` worlds.
-    let level = engine.level();
-    let game_frame = frame.div_ceil(crate::frame::steps_per_frame());
+    let (level, s) = (engine.level(), &engine.settings());
+    let game_frame = frame.div_ceil(s.steps_per_frame());
     ensure!(
         !level.platforms || game_frame as usize <= crate::trace::kernel::PLATFORM_WORLD_FRAMES,
         "frame {frame} at {level}: the platform worlds cover {} frames",
@@ -181,14 +181,14 @@ pub fn run_wave(engine: &dyn FrameStep, frontier: Vec<Block>, cx: WaveCtx) -> Re
     let t_warm = Instant::now();
     engine.warm();
     if let Some(m) = filters.minus_one {
-        let _ = m.table();
+        let _ = m.table(s);
     }
     if t_warm.elapsed().as_secs_f64() > 0.5 {
         // Not `[fwd] f...`: log readers (`export-ui`) parse those as frames.
         eprintln!("[warm] f{frame}: engine and level -1 table built in {:.1} s, before the wave", t_warm.elapsed().as_secs_f64());
     }
     let mut st = FrameStats::default();
-    let workers = crate::frame::threads();
+    let workers = s.threads();
     let t_frame = Instant::now();
     st.blocks_in = frontier.len();
     st.lanes_in = frontier.iter().map(Block::lanes).sum();
@@ -233,7 +233,7 @@ pub fn run_wave(engine: &dyn FrameStep, frontier: Vec<Block>, cx: WaveCtx) -> Re
                     crate::compiled::asm_kernel::set_thread_stack(WORKER_STACK);
                     let t = Instant::now();
                     let raise = raised.map(|r| RaiseCtx { raised: r, layers: layers.expect("checked") });
-                    let mut sink = UnitSink::new(shared, claims, prov, filters, frame, level, w as u32, record, pos.is_some(), notes, raise);
+                    let mut sink = UnitSink::new(shared, claims, prov, filters, frame, level, w as u32, record, pos.is_some(), notes, raise, s);
                     if let Some(p) = index_path {
                         sink.stream_blocks(p)?;
                     }
@@ -253,7 +253,7 @@ pub fn run_wave(engine: &dyn FrameStep, frontier: Vec<Block>, cx: WaveCtx) -> Re
                         // A whole layer piece's rows are named by their range.
                         let range = b.is_whole().then_some((b.seq(), first as u32));
                         sink.begin(u as u32, bi as u32, first, sources, range, (!b.skip().is_empty()).then_some(b.skip()), old);
-                        let t_unit = phases::start();
+                        let t_unit = phases::start(s.diag.phases);
                         engine.run(b, &cells[bi], &order[bi][lo..hi], &mut sink)?;
                         phases::add(phases::UNIT, t_unit);
                         sink.end()?;
@@ -295,27 +295,27 @@ pub fn run_wave(engine: &dyn FrameStep, frontier: Vec<Block>, cx: WaveCtx) -> Re
 
     // THE TRANSLATION.
     let t = Instant::now();
-    let tr = phases::start();
+    let tr = phases::start(s.diag.phases);
     drop(claims);
-    let (new_states, meta) = translate(visited, &mut outs, &prov, frame)?;
+    let (new_states, meta) = translate(visited, &mut outs, &prov, frame, s)?;
     drop(prov);
     (st.key_bits, st.key_codes, st.new_codes) = (visited.keys.max_bits(), visited.keys.codes(), meta.keys.codes.len());
-    resolve_lids(visited, &outs, frame)?;
+    resolve_lids(visited, &outs, frame, workers)?;
     phases::add(phases::TRANSLATE, tr);
     st.t_translate = t.elapsed();
 
     // THE LAYER, and the frame's edges.
     let t = Instant::now();
-    let tl = phases::start();
+    let tl = phases::start(s.diag.phases);
     let first_seq = match layer {
         Layer::New => 0,
         Layer::Raised(r) => r.first_seq,
     };
-    let next = gather_layer(visited, &outs, &new_states, frame, first_seq)?;
+    let next = gather_layer(visited, &outs, &new_states, frame, first_seq, s)?;
     st.lanes_kept = new_states.len();
     if let (Some(dir), Some(path)) = (edges_dir, &index_path) {
         let remaps = xfers.merge(Some(dir), &tables)?;
-        st.edge_bytes = super::edges::write_file(path, frame, &outs, remaps)? + outs.iter().filter(|u| u.block_at.is_some()).map(|u| u.block_len).sum::<u64>();
+        st.edge_bytes = super::edges::write_file(path, frame, &outs, remaps, workers)? + outs.iter().filter(|u| u.block_at.is_some()).map(|u| u.block_len).sum::<u64>();
     }
     drop(outs);
     phases::add(phases::LAYER, tl);
@@ -326,7 +326,7 @@ pub fn run_wave(engine: &dyn FrameStep, frontier: Vec<Block>, cx: WaveCtx) -> Re
     st.blocks_out = next.len();
     st.lanes_out = next.iter().map(Block::lanes).sum();
     let dropped = notes.map_or_else(Vec::new, DropNotes::into_sorted);
-    phases::print_phases(t_frame.elapsed(), workers);
+    phases::print_phases(s.diag.phases, t_frame.elapsed(), workers);
     Ok(Wave { next, stats: st, dropped, meta })
 }
 
@@ -338,7 +338,7 @@ pub(crate) type NewState = (StateId, u32, u32, u32);
 /// and appended (new shapes first, by hash), then every provisional key in
 /// the units - lids and row buffers - replaced by its packed key. The
 /// dictionaries then are a function of the frame's new states.
-fn finalize_keys(visited: &mut VisitedSet, outs: &mut [UnitOut], prov: &Provisional, meta: &mut FrameMeta) {
+fn finalize_keys(visited: &mut VisitedSet, outs: &mut [UnitOut], prov: &Provisional, meta: &mut FrameMeta, threads: usize) {
     let mut keys: Vec<Key> = outs.iter().flat_map(|u| u.requests.iter().map(|r| u.lids[r.lid as usize].key)).filter(|&k| is_provisional(k)).collect();
     keys.sort_unstable();
     keys.dedup();
@@ -370,8 +370,7 @@ fn finalize_keys(visited: &mut VisitedSet, outs: &mut [UnitOut], prov: &Provisio
             }
         }
     };
-    let threads = crate::frame::threads().max(1);
-    let per = outs.len().div_ceil(threads).max(1);
+    let per = outs.len().div_ceil(threads.max(1)).max(1);
     std::thread::scope(|sc| {
         for part in outs.chunks_mut(per) {
             let fin = &fin;
@@ -394,10 +393,11 @@ fn finalize_keys(visited: &mut VisitedSet, outs: &mut [UnitOut], prov: &Provisio
 /// found or appended as an entry (in key order: canonical numbers), each
 /// distinct (entry, cell) a NEW state, its row the first request's; every
 /// request's lid gets its owner. Returns the new states by id, and the
-/// frame's metadata.
-pub(crate) fn translate(visited: &mut VisitedSet, outs: &mut [UnitOut], prov: &Provisional, frame: u32) -> Result<(Vec<NewState>, FrameMeta)> {
+/// frame's metadata. `s`: the threads, `--key-check`.
+pub(crate) fn translate(visited: &mut VisitedSet, outs: &mut [UnitOut], prov: &Provisional, frame: u32, s: &crate::settings::Settings) -> Result<(Vec<NewState>, FrameMeta)> {
     let mut meta = FrameMeta::new();
-    finalize_keys(visited, outs, prov, &mut meta);
+    let threads = s.threads();
+    finalize_keys(visited, outs, prov, &mut meta, threads);
     let mut new_shapes: Vec<u64> = outs.iter().flat_map(|u| u.requests.iter().map(|r| u.lids[r.lid as usize].shape)).filter(|s| visited.shape_index(*s).is_none()).collect();
     new_shapes.sort_unstable();
     new_shapes.dedup();
@@ -409,7 +409,6 @@ pub(crate) fn translate(visited: &mut VisitedSet, outs: &mut [UnitOut], prov: &P
     // Per unit its requests as `region << 32 | request`, sorted (in
     // parallel); per region the units' ranges are gathered by its job.
     ensure!(outs.len() < 1 << 32, "frame {frame}: {} units", outs.len());
-    let threads = crate::frame::threads();
     let unit_reqs: Vec<Vec<u64>> = {
         let v: &VisitedSet = visited;
         par_map(outs, threads, |u| {
@@ -448,7 +447,7 @@ pub(crate) fn translate(visited: &mut VisitedSet, outs: &mut [UnitOut], prov: &P
     let mut by_region: Vec<Option<&mut RegionTable>> = tables.iter_mut().map(|t| t.as_deref_mut()).collect();
     let jobs: Vec<(u32, &mut RegionTable)> = ranges.iter().map(|&(r, _)| (r, by_region[r as usize].take().expect("a table per region"))).collect();
     let jobs = std::sync::Mutex::new(jobs.into_iter().rev().collect::<Vec<_>>());
-    let check = crate::compiled::asm_kernel::key_check_on();
+    let check = s.diag.key_check;
     let words = geo.words;
     /// Per region job: the region, its new states (by id), its new entries.
     type Part = Vec<(u32, Vec<NewState>, Vec<(u32, u32, Key)>)>;
@@ -534,8 +533,8 @@ pub(crate) fn translate(visited: &mut VisitedSet, outs: &mut [UnitOut], prov: &P
 /// The lids whose state another unit claimed (`unit::Claims`): their
 /// owners, found in the visited set the translation filled. Each must be
 /// there: its state was requested.
-pub(crate) fn resolve_lids(visited: &VisitedSet, outs: &[UnitOut], frame: u32) -> Result<()> {
-    let r: Vec<Result<()>> = par_map(outs, crate::frame::threads(), |u| {
+pub(crate) fn resolve_lids(visited: &VisitedSet, outs: &[UnitOut], frame: u32, threads: usize) -> Result<()> {
+    let r: Vec<Result<()>> = par_map(outs, threads, |u| {
         for &l in &u.pending {
             let o = &u.owners[l as usize];
             if o.load(Ordering::Relaxed) != super::unit::NO_OWNER {
@@ -552,8 +551,8 @@ pub(crate) fn resolve_lids(visited: &VisitedSet, outs: &[UnitOut], frame: u32) -
 
 /// The new LAYER: per shape its new states in id order, gathered from the
 /// units' row buffers, cut into pieces (`PIECE_ROWS`) numbered from
-/// `first_seq`, each row with its id.
-pub(crate) fn gather_layer(visited: &VisitedSet, outs: &[UnitOut], news: &[NewState], frame: u32, first_seq: u32) -> Result<Vec<Block>> {
+/// `first_seq`, each row with its id. `s`: the threads, `--key-check`.
+pub(crate) fn gather_layer(visited: &VisitedSet, outs: &[UnitOut], news: &[NewState], frame: u32, first_seq: u32, s: &crate::settings::Settings) -> Result<Vec<Block>> {
     let geo = visited.geo;
     // Per shape (ids sort by shape first) its range of `news`.
     let mut shapes: Vec<(usize, usize)> = Vec::new();
@@ -576,7 +575,7 @@ pub(crate) fn gather_layer(visited: &VisitedSet, outs: &[UnitOut], news: &[NewSt
             lo = hi;
         }
     }
-    par_map(&jobs, crate::frame::threads(), |&(lo, hi, seq)| -> Result<Block> {
+    par_map(&jobs, s.threads(), |&(lo, hi, seq)| -> Result<Block> {
         let part = &news[lo..hi];
         // The row buffers the piece reads: in one layout (one engine), read
         // in place; else (a shape's skeleton differing between buffers) as
@@ -596,9 +595,11 @@ pub(crate) fn gather_layer(visited: &VisitedSet, outs: &[UnitOut], news: &[NewSt
             gather(&src_refs, &rows)
         };
         let ids: Vec<StateId> = part.iter().map(|n| n.0).collect();
-        crate::compiled::asm_kernel::key_check_block(&rt2, &visited.keys);
+        if s.diag.key_check {
+            crate::compiled::asm_kernel::key_check_block(&rt2, &visited.keys);
+        }
         let b = Block::layer_piece(rt2, ids, seq);
-        if crate::compiled::asm_kernel::key_check_on() {
+        if s.diag.key_check {
             let cells = b.positions()?;
             for (id, c) in b.ids().iter().zip(&cells) {
                 ensure!(super::id_cell(&geo, *id) == *c, "frame {frame}: state {} stored at cell {c}", super::show_id(*id));

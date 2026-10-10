@@ -47,8 +47,9 @@ fn name_cells(f: &super::verify::Frame, e: anyhow::Error) -> anyhow::Error {
 pub(crate) fn lattice_kernel_refs(
     root: &std::path::Path,
     opts: crate::abstraction::Level,
+    s: &crate::settings::Settings,
 ) -> Result<Vec<(Option<Region>, Reference)>> {
-    let mut lw = room_constant_lattice(root, opts, None)?;
+    let mut lw = room_constant_lattice(root, opts, &Walk { settings: s, only: None })?;
     let room = crate::transpile::graph::Room { cart: lw.cart.clone(), cache: lw.cache.clone() };
     // Each frame was bound by the walk in the worker arena it was traced in.
     let frames: Vec<(Option<Region>, super::verify::Frame, Bound)> = std::mem::take(&mut lw.frames)
@@ -79,7 +80,7 @@ pub(crate) fn lattice_kernel_refs(
                             let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                             let Some((key, f, bound)) = slots.get(i).and_then(|m| m.lock().unwrap().take()) else { break };
                             let r = (|| -> Result<(Option<Region>, Reference)> {
-                                let lowered = super::emit::lower_frame(&bound, Some(room.clone()))
+                                let lowered = super::emit::lower_frame(&bound, Some(room.clone()), s.diag.build_trace)
                                     .map_err(|e| anyhow::anyhow!("lattice frame {} ({:?}) lower: {:#}", i, key, name_cells(&f, e)))?;
                                 Ok((key, Reference { frame: f, bound, lowered, cart: cart.clone(), cache: cache.clone() }))
                             })();
@@ -111,24 +112,14 @@ pub struct Region {
     pub iy: i16,
 }
 
-/// The grid a region key is taken on (`region_grid`).
+/// The grid a region key is taken on (`--region "px,S"`, `off` for none,
+/// default 16 px / speed 6: `Settings::region_grid`). `S <= 7` because the
+/// move loop unrolls for `abs(amount) <= 8` and `amount = flr(rem + spd +
+/// 0.5)`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct RegionGrid {
     pub px: i32,
     pub speed: i32,
-}
-
-/// The region grid of every kernel set (`--region "px,S"`, `off` for none,
-/// default 16 px / speed 6). `S <= 7` because the move loop unrolls for
-/// `abs(amount) <= 8` and `amount = flr(rem + spd + 0.5)`.
-pub fn region_grid() -> Option<RegionGrid> {
-    let g = crate::settings::get().region.map(|(px, speed)| RegionGrid { px, speed });
-    static SAID: std::sync::Once = std::sync::Once::new();
-    SAID.call_once(|| match g {
-        Some(g) => eprintln!("[region] kernels keyed on a {} px grid, player speed asserted within [-{}, {}] px", g.px, g.speed, g.speed),
-        None => eprintln!("[region] no region key (--region off)"),
-    });
-    g
 }
 
 impl RegionGrid {
@@ -334,13 +325,10 @@ mod tests {
         if !std::path::Path::new("lua/celeste-minimal.lua").exists() {
             return;
         }
-        crate::settings::install(crate::settings::Settings {
-            room: (6, 1),
-            ..Default::default()
-        });
+        let s = crate::settings::Settings { room: (6, 1), ..Default::default() };
         let opts = crate::abstraction::Level { held: true, floors_near: true, ..crate::abstraction::Level::EXACT };
         let only = [super::Region { ix: 3, iy: 6 }, super::Region { ix: 4, iy: 6 }];
-        let lw = super::room_constant_lattice(std::path::Path::new("."), opts, Some(&only)).unwrap_or_else(|e| panic!("{e:#}"));
+        let lw = super::room_constant_lattice(std::path::Path::new("."), opts, &super::Walk { settings: &s, only: Some(&only) }).unwrap_or_else(|e| panic!("{e:#}"));
         let mut traced = 0;
         for ((shape, region), f) in &lw.frames {
             let Some(r) = region else { continue };
@@ -356,12 +344,10 @@ mod tests {
 /// INTERSECT each outcome's constants into its shape's lattice, re-trace a
 /// shape that shrinks. Monotone (constant -> abstract only), so it
 /// terminates. Every frame is traced under `opts`, the kernels' level.
-/// `only`: the player's regions the walk traces (a test's; `None`: every
-/// region a state can be in).
 pub fn room_constant_lattice(
     root: &std::path::Path,
     opts: crate::abstraction::Level,
-    only: Option<&[Region]>,
+    walk: &Walk,
 ) -> Result<LatticeWalk> {
     use super::domain::Symbolic;
     use super::interp::Interp;
@@ -370,7 +356,8 @@ pub fn room_constant_lattice(
     use anyhow::{anyhow, bail};
     type Cmap = std::collections::BTreeMap<super::iface::Path, super::iface::Conc>;
 
-    let src = cart::sources_in(root, crate::settings::get())?;
+    let (s, only) = (walk.settings, walk.only);
+    let src = cart::sources_in(root, s)?;
     // Leaked: the kept tracer's `Interp` borrows the ASTs.
     let leak = |a: full_moon::ast::Ast| -> &'static full_moon::ast::Ast { Box::leak(Box::new(a)) };
     let top = leak(full_moon::parse(&src).map_err(|e| anyhow!("parse: {:?}", e))?);
@@ -381,14 +368,15 @@ pub fn room_constant_lattice(
 
     let mut it: Interp<'static, Symbolic> = Interp::new(Symbolic::default());
     let cart_data = std::sync::Arc::new(celeste_core::cart_data::CartData::load(root.join("cart"))?);
-    let (rx, ry) = crate::settings::get().room;
+    let (rx, ry) = s.room;
     let cache = std::sync::Arc::new(celeste_core::collision_cache::CollisionCache::new(&cart_data, rx, ry)?);
     it.cache = Some(cache.clone());
     it.cart = Some(cart_data.clone());
+    it.d.build_trace = s.diag.build_trace;
     // The level's widenings, for every frame this walk traces.
     it.d.level = opts;
     if opts.platforms {
-        it.d.worlds = Some(std::sync::Arc::new(crate::concrete::platform_worlds(PLATFORM_WORLD_FRAMES)?));
+        it.d.worlds = Some(std::sync::Arc::new(crate::concrete::platform_worlds(PLATFORM_WORLD_FRAMES, s)?));
     }
 
     let st = cart::fresh_state::<Symbolic>(&mut it.d);
@@ -413,11 +401,11 @@ pub fn room_constant_lattice(
 
     let sk = key(&start)?;
     let start_key = sk.clone();
-    let no_player = match region_grid() {
+    let no_player = match s.region_grid() {
         Some(_) => no_player_ranges(&mut it, reset, fr, &start, opts)?,
         None => NoPlayer::default(),
     };
-    if crate::settings::get().diag.build_trace {
+    if s.diag.build_trace {
         let show = |b: &Bounds| b.iter().map(|(p, (a, b))| format!("{} [{:.2}, {:.2}]", super::iface::show(p), *a as f64 / 65536.0, *b as f64 / 65536.0)).collect::<Vec<_>>();
         for (i, (_, b)) in no_player.shapes.iter().enumerate() {
             eprintln!("[walk] no-player shape {i} ranges: {:?}", show(b));
@@ -459,12 +447,12 @@ pub fn room_constant_lattice(
         }
     }
     // A node is (shape, region); the lattice stays per shape.
-    let grid = region_grid();
+    let grid = s.region_grid();
     let start_regions = successor_regions(&start, &mut it.d, grid, only)?;
     let mut regions: std::collections::BTreeMap<String, std::collections::BTreeSet<Option<Region>>> = Default::default();
     regions.insert(sk.clone(), start_regions.iter().copied().collect());
     let room0 = shapes::room_of(&start, &it.d);
-    let lattice_trace = crate::settings::get().diag.build_trace;
+    let lattice_trace = s.diag.build_trace;
 
     // THE ROUNDS: each traces its frontier in parallel against a lattice
     // snapshot; results apply in node order between rounds. Each frame is
@@ -855,6 +843,14 @@ pub struct Tracer {
 // SAFETY: the raw pointers inside point into the leaked `'static` ASTs,
 // immutable and never freed, so a copy can move to a worker.
 unsafe impl Send for Tracer {}
+
+/// What a lattice walk runs under: the run's settings (the cart, the room,
+/// the region grid, `--build-trace`) and, for a test, `only` the player
+/// regions it traces (`None`: every region a state can be in).
+pub struct Walk<'a> {
+    pub settings: &'a crate::settings::Settings,
+    pub only: Option<&'a [Region]>,
+}
 
 /// The output of `room_constant_lattice`.
 pub struct LatticeWalk {

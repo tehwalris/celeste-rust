@@ -286,10 +286,11 @@ fn asm_fused_of(
 
 /// Lower a traced frame - ALL of its output shapes together, so the part
 /// of the frame before outcomes diverge is emitted once (one graph, each
-/// node bound once).
+/// node bound once). `build_trace`: `--build-trace`.
 pub fn lower_frame(
     bound: &Bound,
     room: Option<crate::transpile::graph::Room>,
+    build_trace: bool,
 ) -> Result<Lowered> {
     let (graph, outcomes, forks) = (&bound.graph, &bound.outcomes, bound.forks);
     let mut e = Emit::bare(graph.clone());
@@ -321,7 +322,7 @@ pub fn lower_frame(
             arc: o.arc.clone(),
         })
         .collect();
-    let spec = crate::transpile::lower::lower_outcomes(&e, &mut outs);
+    let spec = crate::transpile::lower::lower_outcomes(&e, &mut outs, build_trace);
     let bodies = spec.1.len();
     Ok(Lowered { outs: outs.into_iter().map(|o| o.of).collect(), bodies, spec })
 }

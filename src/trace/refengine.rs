@@ -38,6 +38,8 @@ pub struct RefEngine {
     /// The level `run_lane` (the engine as a `FrameStep`) forks a row's
     /// unknowns at: `Level::EXACT` unless `at_level`.
     level: Level,
+    /// The settings it was made under (its room, category, split frame).
+    settings: std::sync::Arc<crate::settings::Settings>,
 }
 
 // The raw pointers inside (`Interp`'s AST references) point into the
@@ -46,15 +48,9 @@ pub struct RefEngine {
 unsafe impl Send for RefEngine {}
 
 impl RefEngine {
-    /// Parse the cart, run its toplevel and `_init` for the start room,
-    /// under the process's settings.
-    pub fn new() -> Result<Self> {
-        Self::with(crate::settings::get())
-    }
-
-    /// The same under settings `s` (the concrete phase's seeded engines; a
-    /// test's other configuration).
-    pub fn with(s: &crate::settings::Settings) -> Result<Self> {
+    /// Parse the cart, run its toplevel and `_init` for the start room of
+    /// settings `s`, the engine's settings from then on.
+    pub fn new(s: &crate::settings::Settings) -> Result<Self> {
         let leak = |src: &str| -> Result<&'static ast::Ast> { Ok(Box::leak(Box::new(full_moon::parse(src)?))) };
         let top = leak(&crate::trace::cart::sources(s)?)?;
         crate::trace::cart::check_absent_fields(top)?;
@@ -72,7 +68,7 @@ impl RefEngine {
         crate::trace::cart::inject_tile_flag_at(&mut st0);
         let base = run_one(&mut it, init, st0)?;
         let fn_info = fn_info_of(&base)?;
-        Ok(RefEngine { it, body, body_concrete, base, fn_info, path_cap: 1_000_000, level: Level::EXACT })
+        Ok(RefEngine { it, body, body_concrete, base, fn_info, path_cap: 1_000_000, level: Level::EXACT, settings: std::sync::Arc::new(s.clone()) })
     }
 
     /// The engine with `run_lane` at `level`.
@@ -89,7 +85,7 @@ impl RefEngine {
 
     /// The room's start (post-`_init`) as a one-row block, without keys.
     pub fn initial(&self) -> Result<Rt2> {
-        to_block(&self.base)
+        to_block(&self.base, self.settings.room)
     }
 
     /// One CONCRETE frame of row 0 of `row` under input `byte`: every leaf,
@@ -110,12 +106,12 @@ impl RefEngine {
         self.it.button_reads = Some((buttons, 0));
         let leaves = run_frame_all(&mut self.it, self.body_concrete, &st, &[], Level::EXACT, self.path_cap);
         let (_, mask) = self.it.button_reads.take().expect("set above");
-        let out = leaves?.iter().map(|l| Block::canonical(to_block(l)?)).collect::<Result<_>>()?;
+        let out = leaves?.iter().map(|l| Block::canonical(to_block(l, self.settings.room)?)).collect::<Result<_>>()?;
         Ok((out, mask))
     }
 
     /// One whole GAME frame: `step` once, or under the split frame
-    /// (`frame::steps_per_frame`) its two parts, both under `byte` (the
+    /// (`Settings::steps_per_frame`) its two parts, both under `byte` (the
     /// buttons are the frame's; part a reads none). Every leaf of both.
     pub fn frame(&mut self, row: &Rt2, byte: u8) -> Result<Vec<Block>> {
         Ok(self.frame_reads(row, byte)?.0)
@@ -126,7 +122,7 @@ impl RefEngine {
     /// has the same successors, so the concrete search runs one of them.
     pub fn frame_reads(&mut self, row: &Rt2, byte: u8) -> Result<(Vec<Block>, u8)> {
         let (mut out, mut mask) = self.step_reads(row, byte)?;
-        for _ in 1..crate::frame::steps_per_frame() {
+        for _ in 1..self.settings.steps_per_frame() {
             let mut next = Vec::new();
             for b in &out {
                 let (o, m) = self.step_reads(b.rt2(), byte)?;
@@ -191,7 +187,7 @@ impl RefEngine {
                 }
             }
         }
-        let out = leaves.iter().map(|l| Block::canonical(to_block(l)?)).collect::<Result<_>>()?;
+        let out = leaves.iter().map(|l| Block::canonical(to_block(l, self.settings.room)?)).collect::<Result<_>>()?;
         Ok((out, mask))
     }
 
@@ -208,7 +204,7 @@ impl RefEngine {
     pub fn run_lane(&mut self, block: &Rt2, lane: usize) -> Result<Vec<Block>> {
         let (st, unknown) = from_block(block, lane, &self.fn_info, &self.base)?;
         let leaves = run_frame_all(&mut self.it, self.body, &st, &unknown, self.level, self.path_cap)?;
-        leaves.iter().map(|l| Block::canonical(to_block(l)?)).collect()
+        leaves.iter().map(|l| Block::canonical(to_block(l, self.settings.room)?)).collect()
     }
 }
 
@@ -355,6 +351,10 @@ impl crate::frame::FrameStep for std::sync::Mutex<RefEngine> {
     fn level(&self) -> Level {
         self.lock().expect("reference engine lock").level
     }
+
+    fn settings(&self) -> std::sync::Arc<crate::settings::Settings> {
+        self.lock().expect("reference engine lock").settings.clone()
+    }
 }
 
 #[cfg(test)]
@@ -367,9 +367,8 @@ mod tests {
     /// for all 64 inputs at states along room (1,0)'s 99-frame exit.
     #[test]
     fn inputs_agreeing_on_the_buttons_read_make_the_same_successors() {
-        crate::settings::install(crate::settings::Settings::default());
         let inputs = crate::concrete::read_inputs("tas/room_1_0_exit_frame_99.txt").expect("the exit's inputs");
-        let mut eng = RefEngine::new().expect("ref engine");
+        let mut eng = RefEngine::new(&Default::default()).expect("ref engine");
         let exact = |bs: Vec<Block>| -> Vec<(celeste_engine::exact::ExactRow, u32)> { bs.iter().map(|b| (celeste_engine::exact::exact_rows(b.rt2(), crate::compiled::ids()).swap_remove(0), b.positions().expect("cells")[0])).collect() };
         let mut row = eng.initial().expect("initial state");
         let (mut runs, mut checked) = (0, 0);
@@ -401,10 +400,9 @@ mod tests {
     /// else the route's own), with `step_at`'s pins as without them. Returns
     /// (states with a `what`, leaves pinned, leaves without).
     fn pins_keep_the_projected_successors(settings: crate::settings::Settings, route: &str, stride: usize, all_inputs: bool, level: &str, what: &str) -> (usize, usize, usize) {
-        crate::settings::install(settings);
         let level = Level::parse(level).expect("level");
         let inputs = crate::concrete::read_inputs(route).expect("the route's inputs");
-        let mut eng = RefEngine::new().expect("ref engine");
+        let mut eng = RefEngine::new(&settings).expect("ref engine");
         // The projections compared EXACTLY (their canonical bytes).
         let projected = |bs: &[Block]| -> std::collections::BTreeSet<(celeste_engine::exact::ExactRow, u32)> {
             bs.iter()
@@ -438,7 +436,7 @@ mod tests {
             let hs: Vec<_> = (0..workers)
                 .map(|_| {
                     sc.spawn(|| {
-                        let mut eng = RefEngine::new().expect("ref engine");
+                        let mut eng = RefEngine::new(&settings).expect("ref engine");
                         let (mut pinned_n, mut full_n) = (0, 0);
                         while let Some((f, abs)) = sampled.get(next.fetch_add(1, std::sync::atomic::Ordering::Relaxed)) {
                             let mut ran: Vec<(u8, u8)> = Vec::new();

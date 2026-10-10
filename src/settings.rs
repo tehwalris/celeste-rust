@@ -1,6 +1,10 @@
 //! THE RUN'S SETTINGS: every setting of a run, from its COMMAND LINE
-//! (`SettingsArgs`, flattened into every binary's arguments), in ONE struct
-//! installed once per process (`install`, before anything reads it; `get`).
+//! (`SettingsArgs`, flattened into every binary's arguments), in ONE value
+//! (`Settings`, made by `startup`) that the binary PASSES to what reads it.
+//! There is no global: an engine (`FrameEngine`, `RefEngine`) owns its
+//! settings, and the wave, the storage and the search take them from it or
+//! as a parameter; the kernel registry and the level -1 table, cached per
+//! process, are keyed on them.
 //! Nothing reads the environment: a `CELESTE_*` variable is refused at
 //! startup (`refuse_env`, with the flag that replaced it).
 //!
@@ -19,11 +23,11 @@
 //! a line of the record: a tree used at another level is refused like any
 //! other difference.
 //!
-//! Readers deep in the code (the cart patches, the kernel build, the
-//! storage geometry) read the installed struct through their accessors
-//! (`game_runner::start_room`, `frame::steps_per_frame`, ...); what needs
-//! two configurations in one process takes a `&Settings` (`cart::sources`,
-//! `RefEngine::with`: the concrete phase's seeded engines, the tests).
+//! The deep diagnostics have owners: `--key-check` and `--phases` the
+//! wave's sinks (`storage::unit::UnitSink`), `--build-trace`,
+//! `--kernel-explain`, `--kernel-mix` and the metrics the kernel build's
+//! options (`compiled::asm_kernel::BuildOptions`), `--emit-capture` the
+//! sinks' capture writers.
 
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
@@ -110,22 +114,39 @@ impl Default for Settings {
     }
 }
 
-static SETTINGS: std::sync::OnceLock<Settings> = std::sync::OnceLock::new();
-
-/// Install the process's settings: once, before anything reads them (a
-/// second install of other settings, or one after a read, panics).
-pub fn install(s: Settings) {
-    let want = s.clone();
-    let got = SETTINGS.get_or_init(|| s);
-    assert!(*got == want, "settings installed twice, or read before they were installed: {got:?} then {want:?}");
-}
-
-/// The process's settings (the defaults when none were installed: a test).
-pub fn get() -> &'static Settings {
-    SETTINGS.get_or_init(Settings::default)
-}
-
 impl Settings {
+    /// Worker threads: `--threads`, else one per physical core (AVX-512
+    /// units are shared by SMT siblings).
+    pub fn threads(&self) -> usize {
+        self.threads.unwrap_or_else(|| (std::thread::available_parallelism().map(|n| n.get()).unwrap_or(2) / 2).max(1))
+    }
+
+    /// Search steps per game frame: 2 under the split frame
+    /// (`--split-frame`: part a up to and including the player's move,
+    /// part b the rest; step `2k` is the end of frame `k`), else 1.
+    pub fn steps_per_frame(&self) -> u32 {
+        if self.split_frame {
+            2
+        } else {
+            1
+        }
+    }
+
+    /// The room that means "won" (`game_runner::win_room` of `--room`).
+    pub fn win_room(&self) -> (i16, i16) {
+        crate::game_runner::win_room(self.room)
+    }
+
+    /// The kernels' region grid (`--region`; `None`: off).
+    pub fn region_grid(&self) -> Option<crate::trace::kernel::RegionGrid> {
+        self.region.map(|(px, speed)| crate::trace::kernel::RegionGrid { px, speed })
+    }
+
+    /// The run's level -1 filter (`--level-minus-one H,S`), if given.
+    pub fn minus_one(&self) -> Option<crate::frame::MinusOne> {
+        self.level_minus_one.map(|(h, speed)| crate::frame::MinusOne { h, speed })
+    }
+
     /// The record's lines, `(key, value)`, in a fixed order: what changes a
     /// tree. `level`: the tree's level spec.
     fn recorded(&self, level: &str) -> Vec<(&'static str, String)> {
@@ -199,20 +220,20 @@ impl Settings {
         anyhow::ensure!(head == format!("tree settings {VERSION}"), "{}: {head:?} is not a settings record of format {VERSION}", p.display());
         let rec: std::collections::BTreeMap<&str, &str> = rec.filter_map(|l| l.split_once(' ')).collect();
         let mine = self.recorded(level);
-        let mut diffs: Vec<String> = mine
+        let mut diffs: Vec<(&str, String)> = mine
             .iter()
             .filter(|(k, v)| rec.get(k) != Some(&v.as_str()))
-            .map(|(k, v)| format!("{k}: the tree's {}, this run's {v}", rec.get(k).copied().unwrap_or("(missing)")))
+            .map(|(k, v)| (*k, format!("{k}: the tree's {}, this run's {v}", rec.get(k).copied().unwrap_or("(missing)"))))
             .collect();
         // `storage_region 8`: a line of the records written before the side
         // was fixed at 8 (`storage::GEOMETRY`); any other side is refused.
         let legacy = |k: &str| k == "storage_region" && rec.get(k) == Some(&"8");
-        diffs.extend(rec.keys().filter(|k| !mine.iter().any(|(m, _)| m == *k) && !legacy(k)).map(|k| format!("{k}: in the tree's record, not a setting")));
+        diffs.extend(rec.keys().filter(|k| !mine.iter().any(|(m, _)| m == *k) && !legacy(k)).map(|k| (*k, format!("{k}: in the tree's record, not a setting"))));
         anyhow::ensure!(
             diffs.is_empty(),
             "{}: the tree was built under other settings than this run's:\n  {}\n(a tree's frames are one search: delete it, or run with its flags)",
             dir.display(),
-            diffs.join("\n  ")
+            diffs.iter().map(|(_, s)| s.as_str()).collect::<Vec<_>>().join("\n  ")
         );
         Ok(())
     }
@@ -426,9 +447,10 @@ pub fn refuse_env() -> Result<()> {
     Ok(())
 }
 
-/// A binary's settings from its flags, installed, and logged: one
-/// `[settings]` line with every setting not at its default.
-pub fn startup(args: &SettingsArgs, adjust: impl FnOnce(&mut Settings)) -> Result<()> {
+/// A binary's settings from its flags (the environment refused), logged:
+/// one `[settings]` line with every setting not at its default. The binary
+/// passes them to everything that reads them; nothing reads a global.
+pub fn startup(args: &SettingsArgs, adjust: impl FnOnce(&mut Settings)) -> Result<Settings> {
     refuse_env()?;
     let mut s = args.settings()?;
     adjust(&mut s);
@@ -464,8 +486,7 @@ pub fn startup(args: &SettingsArgs, adjust: impl FnOnce(&mut Settings)) -> Resul
     if !set.is_empty() {
         eprintln!("[settings] {}", set.join(" "));
     }
-    install(s);
-    Ok(())
+    Ok(s)
 }
 
 #[cfg(test)]
@@ -517,6 +538,12 @@ mod tests {
             assert!(e.contains(k), "{k} not in {e}");
         }
         assert!(!e.contains("room:"), "{e}");
+        // A record from before the storage side was fixed: `storage_region 8`
+        // is accepted, another side is not.
+        for (side, ok) in [("8", true), ("16", false)] {
+            std::fs::write(path(&dir), format!("{}storage_region {side}\n", sample.text("r0sxhf"))).expect("write");
+            assert_eq!(sample.check_at(&dir, "r0sxhf").is_ok(), ok, "storage_region {side}");
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

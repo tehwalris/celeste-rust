@@ -141,7 +141,7 @@ mod tests {
         let cart = std::sync::Arc::new(
             celeste_core::cart_data::CartData::load("cart").expect("cart"),
         );
-        let (rx, ry) = crate::game_runner::start_room();
+        let (rx, ry) = crate::settings::Settings::default().room;
         let cache = std::sync::Arc::new(
             celeste_core::collision_cache::CollisionCache::new(&cart, rx, ry).expect("cache"),
         );

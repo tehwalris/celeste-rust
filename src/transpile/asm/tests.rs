@@ -540,7 +540,7 @@ fn asm_bool_input_matches_primitives() {
     let mut reprs = HashMap::new();
     reprs.insert(1u32, CellRepr::Bool);
     let (compiled, loaded) =
-        compile_and_load_reprs(&g, &roots, "boolin", &reprs).expect("compile+load");
+        compile_and_load_reprs(&g, &roots, "boolin", &reprs, Default::default()).expect("compile+load");
     assert_eq!(
         compiled.root_kinds,
         vec![RootKind::Num, RootKind::Num, RootKind::Bool, RootKind::Bool]
@@ -610,7 +610,7 @@ fn asm_ubool_input_carries_its_known_mask() {
     let roots = vec![known, cb];
     let mut reprs = HashMap::new();
     reprs.insert(0u32, CellRepr::UBool);
-    let (compiled, loaded) = compile_and_load_reprs(&g, &roots, "uboolin", &reprs).expect("compile+load");
+    let (compiled, loaded) = compile_and_load_reprs(&g, &roots, "uboolin", &reprs, Default::default()).expect("compile+load");
     assert_eq!(compiled.root_kinds, vec![RootKind::Bool, RootKind::Bool]);
     let mut rng = Lcg(0x0b00_1ea4);
     for trial in 0..8 {
@@ -642,7 +642,7 @@ fn asm_ival_input_matches_primitives() {
     let mut reprs = HashMap::new();
     reprs.insert(0u32, CellRepr::Ival);
     let (compiled, loaded) =
-        compile_and_load_reprs(&g, &roots, "ivalin", &reprs).expect("compile+load");
+        compile_and_load_reprs(&g, &roots, "ivalin", &reprs, Default::default()).expect("compile+load");
     assert_eq!(
         compiled.root_kinds,
         vec![RootKind::Ival, RootKind::Num, RootKind::Ival]
@@ -707,7 +707,7 @@ fn asm_interval_overflow_declines() {
     let roots = vec![add, sub, neg, ok[0], ok[1], ok[2]];
     let mut reprs = HashMap::new();
     reprs.insert(0u32, CellRepr::Ival);
-    let (compiled, loaded) = compile_and_load_reprs(&g, &roots, "ivalovf", &reprs).expect("compile+load");
+    let (compiled, loaded) = compile_and_load_reprs(&g, &roots, "ivalovf", &reprs, Default::default()).expect("compile+load");
     let one = 0x1_0000;
     // Per lane (lo, hi, num): the whole range plus/minus one, a top end that
     // overflows on +1, a bottom end on -1, MIN negated, and lanes right up to
@@ -810,9 +810,9 @@ fn asm_interval_scale_and_divide_overflow_declines() {
     let roots: Vec<NodeId> = ops.iter().chain(&oks).copied().collect();
     let mut reprs = HashMap::new();
     reprs.insert(0u32, CellRepr::Ival);
-    let (compiled, loaded) = compile_and_load_reprs(&g, &roots, "ivalscale", &reprs).expect("compile+load");
+    let (compiled, loaded) = compile_and_load_reprs(&g, &roots, "ivalscale", &reprs, Default::default()).expect("compile+load");
     let ctx = crate::transpile::asm::AsmCtx::new(std::ptr::null());
-    let text = crate::transpile::asm::compile(&g, &roots, "ivalscale", &reprs).expect("compile").asm;
+    let text = crate::transpile::asm::compile(&g, &roots, "ivalscale", &reprs, Default::default()).expect("compile").asm;
     let compares = text.lines().filter(|l| l.trim_start().starts_with("vpcmpd")).count();
     // One per distinct bound a literal can cross (`*2` and `/0.5` share
     // theirs, `*1.00002` and `/0.99998` their low one), none for the rest.
@@ -913,7 +913,7 @@ fn asm_bool_layer_with_decided_planes_is_bit_exact() {
         }
     }
     let reprs = HashMap::from([(0u32, CellRepr::UBool), (1u32, CellRepr::Bool)]);
-    let (compiled, loaded) = compile_and_load_reprs(&g, &roots, "decided", &reprs).expect("compile+load");
+    let (compiled, loaded) = compile_and_load_reprs(&g, &roots, "decided", &reprs, Default::default()).expect("compile+load");
     let mut rng = Lcg(0xdec1_dedd);
     for trial in 0..16 {
         let (uv, uk, bv) = ((rng.next_u64() & 0xFFFF) as u16, (rng.next_u64() & 0xFFFF) as u16, (rng.next_u64() & 0xFFFF) as u16);
@@ -1001,7 +1001,7 @@ fn inline_div_rem_by_a_power_of_two_is_pico8s() {
     }
     let (compiled, loaded) = compile_and_load(&g, &roots, "pow2").expect("compile+load");
     // (`compile_and_load` drops the text once loaded.)
-    let text = crate::transpile::asm::compile(&g, &roots, "pow2", &HashMap::new()).expect("compile").asm;
+    let text = crate::transpile::asm::compile(&g, &roots, "pow2", &HashMap::new(), Default::default()).expect("compile").asm;
     assert!(!text.contains("call"), "a power-of-two divisor is inline");
     let mut edges: Vec<i32> = vec![i32::MIN, i32::MIN + 1, i32::MAX, i32::MAX - 1, 0, 1, -1];
     for k in 0..31 {
@@ -1053,7 +1053,7 @@ fn a_call_out_preserves_what_is_live_across_it() {
     let sum = g.add(Op::Add, vec![before, n]);
     let roots = vec![sum, before];
     let (compiled, loaded) = compile_and_load(&g, &roots, "livecall").expect("compile+load");
-    let text = crate::transpile::asm::compile(&g, &roots, "livecall", &HashMap::new()).expect("compile").asm;
+    let text = crate::transpile::asm::compile(&g, &roots, "livecall", &HashMap::new(), Default::default()).expect("compile").asm;
     // Stores to the stack: the call's two arguments and the saves.
     let stores = text.lines().filter(|l| l.contains("vmovdqu64 %zmm") && l.contains("(%rsp)")).count();
     assert!(text.contains("call") && (3..32).contains(&stores), "{stores} stack stores around the call");
@@ -1092,7 +1092,7 @@ fn values_held_across_a_run_of_calls_survive_it() {
     }).collect();
     let mut roots = held.clone();
     roots.extend(qs.iter().copied());
-    let text = crate::transpile::asm::compile(&g, &roots, "callrun", &HashMap::new()).expect("compile").asm;
+    let text = crate::transpile::asm::compile(&g, &roots, "callrun", &HashMap::new(), Default::default()).expect("compile").asm;
     let calls = text.matches("call *%rax").count();
     assert_eq!(calls, 8, "eight call-outs");
     let (compiled, loaded) = compile_and_load(&g, &roots, "callrun").expect("compile+load");
@@ -1138,7 +1138,7 @@ fn rematerialized_constants_under_pressure_are_bit_exact() {
         let ge = g.add(Op::Ge, vec![cs[i], min]);
         roots.push(g.add(Op::Sel, vec![ge, ks[(i + 5) % ks.len()], s]));
     }
-    let text = crate::transpile::asm::compile(&g, &roots, "remat", &HashMap::new()).expect("compile").asm;
+    let text = crate::transpile::asm::compile(&g, &roots, "remat", &HashMap::new(), Default::default()).expect("compile").asm;
     let consts = text.lines().filter(|l| l.contains("vpbroadcastd") || l.contains("vpternlogd $0xff") || l.trim_start().starts_with("vpxord")).count();
     assert!(text.contains("(%rsp)") && consts > ks.len(), "the test needs spilled constants: {consts} materializations");
     let mut rng = Lcg(0x4e3a_7a7e);

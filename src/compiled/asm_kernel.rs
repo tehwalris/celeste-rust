@@ -407,7 +407,7 @@ struct AsmKernel {
     /// Per body: where its roots go in the shape's union columns (`unify`).
     body_cols: Vec<BodyCols>,
     /// The fused graph, roots and room for `explain_error`; empty unless
-    /// `kernel_graph_kept()` (gigabytes per set).
+    /// `--kernel-explain` (`BuildOptions::keep_graphs`; gigabytes per set).
     fused: crate::transpile::graph::Graph,
     flat_roots: Vec<crate::transpile::graph::NodeId>,
     room: Room,
@@ -450,7 +450,7 @@ impl AsmKernel {
         only: u16,
         sink: &mut crate::storage::unit::UnitSink,
     ) -> bool {
-        let t_setup = crate::frame::phases::start();
+        let t_setup = crate::frame::phases::start(sink.phases);
         let n = lanes.len();
         debug_assert!((1..=16).contains(&n));
         if let Some(c) = &self.mix_slices {
@@ -574,7 +574,7 @@ impl AsmKernel {
                 while m != 0 {
                     let i = m.trailing_zeros() as usize;
                     m &= m - 1;
-                    let cout = cell_out(body, outbuf, i);
+                    let cout = cell_out(body, outbuf, i, (self.room.cache.room_x, self.room.cache.room_y));
                     couts[i] = cout;
                     if let Some(from) = sink.minus_one_drop(shape, cout) {
                         take &= !(1 << i);
@@ -1091,9 +1091,6 @@ impl<'c> InputView<'c> {
 /// key the same exact content: the gate that the append's keys are exact.
 pub(crate) fn key_check(slot: &crate::storage::unit::RowBuf, keys: &KeySpace, prov: &Provisional) {
     use celeste_engine::exact::{is_provisional, RowKey};
-    if !key_check_on() {
-        return;
-    }
     let acc = slot.to_rt2();
     let mut b = acc.clone_block();
     b.boundary_canonicalize(super::ids());
@@ -1138,9 +1135,6 @@ pub(crate) fn key_check(slot: &crate::storage::unit::RowBuf, keys: &KeySpace, pr
 /// copy must keep its shape and structure, and the key space key its rows
 /// as stored - its gather moved rows, not values.
 pub(crate) fn key_check_block(blk: &Rt2, keys: &KeySpace) {
-    if !key_check_on() {
-        return;
-    }
     let mut b = blk.clone_block();
     b.boundary_canonicalize(super::ids());
     let got: Vec<Option<(u64, u64)>> = keys.lookup_keys(&b, super::ids());
@@ -1154,19 +1148,6 @@ pub(crate) fn key_check_block(blk: &Rt2, keys: &KeySpace) {
         if b.structure == blk.structure { "same" } else { "DIFFERENT" },
         if same { "same" } else { "DIFFERENT" },
     );
-}
-
-/// `--key-check` (see `key_check`).
-pub(crate) fn key_check_on() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| crate::settings::get().diag.key_check)
-}
-
-/// Whether kernels keep their fused graphs after assembly
-/// (`--kernel-explain`): a decline then names the premise it failed.
-fn kernel_graph_kept() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| crate::settings::get().diag.kernel_explain)
 }
 
 fn num_raw(av: AV) -> i32 {
@@ -1203,6 +1184,18 @@ pub(crate) struct Registry {
     kernels: HashMap<(u64, Option<Region>), AsmKernel>,
     /// The region grid the set was built on.
     grid: Option<crate::trace::kernel::RegionGrid>,
+}
+
+/// What a kernel set is built with besides its level and the settings that
+/// shape the cart: the build's diagnostics.
+struct BuildOptions {
+    asm: crate::transpile::asm::AsmOptions,
+    /// `--kernel-explain`: kernels keep their fused graphs, so a decline
+    /// names its premise.
+    keep_graphs: bool,
+    /// `--kernel-mix DIR`: the per-kernel reports' directory.
+    mix_dir: Option<std::path::PathBuf>,
+    room: (i16, i16),
 }
 
 use crate::trace::kernel::Region;
@@ -1284,10 +1277,24 @@ impl Registry {
         }
     }
 
-    /// Retrace the start room and assemble every shape for `opts` (`root`: repo).
-    pub fn build_for_start_room(root: &Path, opts: crate::abstraction::Level) -> Result<Registry> {
+    /// Retrace the start room and assemble every shape for `opts` (`root`:
+    /// repo) under settings `s` (the cart, the room, the region grid, the
+    /// build's diagnostics).
+    pub fn build_for_start_room(root: &Path, opts: crate::abstraction::Level, s: &crate::settings::Settings) -> Result<Registry> {
+        let grid = s.region_grid();
+        match grid {
+            Some(g) => eprintln!("[region] kernels keyed on a {} px grid, player speed asserted within [-{}, {}] px", g.px, g.speed, g.speed),
+            None => eprintln!("[region] no region key (--region off)"),
+        }
+        let build = BuildOptions {
+            asm: crate::transpile::asm::AsmOptions { trace: s.diag.build_trace, mix: s.diag.kernel_mix.is_some() || s.diag.kernel_metrics },
+            keep_graphs: s.diag.kernel_explain,
+            mix_dir: s.diag.kernel_mix.clone(),
+            room: s.room,
+        };
+        let build = &build;
         let t_trace = std::time::Instant::now();
-        let refs = crate::trace::kernel::lattice_kernel_refs(root, opts)
+        let refs = crate::trace::kernel::lattice_kernel_refs(root, opts, s)
             .context("retracing the start room for ASM kernels")?;
         let trace_s = t_trace.elapsed().as_secs_f64();
         let t_asm = std::time::Instant::now();
@@ -1312,7 +1319,7 @@ impl Registry {
                                     break;
                                 }
                                 let (key, r) = &refs_ref[si];
-                                out.push((si, build_one_shape(r, si, &format!("_{si}")).map(|(shape, kernel)| (shape, *key, kernel))));
+                                out.push((si, build_one_shape(r, si, &format!("_{si}"), build).map(|(shape, kernel)| (shape, *key, kernel))));
                             }
                             out
                         })
@@ -1346,7 +1353,7 @@ impl Registry {
             n_workers,
         );
         eprintln!("[asm build]   phases, summed over workers and concurrent builds: {}", crate::transpile::lower::build_profile());
-        Ok(Registry { kernels, grid: crate::trace::kernel::region_grid() })
+        Ok(Registry { kernels, grid })
     }
 }
 
@@ -1466,7 +1473,7 @@ fn apply_union(kernel: &mut AsmKernel, unions: &HashMap<u64, std::sync::Arc<Rt2>
 
 /// Assemble ONE frame (gcc + dlopen) and map its bodies onto output slots;
 /// `tag` distinguishes a shape's region kernels.
-fn build_one_shape(r: &crate::trace::kernel::Reference, si: usize, tag: &str) -> Result<(u64, AsmKernel)> {
+fn build_one_shape(r: &crate::trace::kernel::Reference, si: usize, tag: &str, build: &BuildOptions) -> Result<(u64, AsmKernel)> {
     let shape = r.frame.in_rt2.shape_hash_of();
     let room = Room { cart: r.cart.clone(), cache: r.cache.clone() };
     let t_fuse = std::time::Instant::now();
@@ -1496,6 +1503,7 @@ fn build_one_shape(r: &crate::trace::kernel::Reference, si: usize, tag: &str) ->
         &flat_roots,
         &format!("k{shape:016x}{tag}"),
         &reprs,
+        build.asm,
     )
     .with_context(|| format!("assembling shape {si} (hash {shape:#x})"))?;
     crate::transpile::lower::build_add(8, t_asm);
@@ -1587,7 +1595,7 @@ fn build_one_shape(r: &crate::trace::kernel::Reference, si: usize, tag: &str) ->
         })
         .collect();
     let mut compiled = compiled;
-    let mix_slices = if crate::transpile::asm::mix_on() {
+    let mix_slices = if build.asm.mix {
         let mut roles = vec![0u8; flat_roots.len()];
         let mut guards = Vec::with_capacity(asm_bodies.len());
         let mut off = 0usize;
@@ -1615,10 +1623,12 @@ fn build_one_shape(r: &crate::trace::kernel::Reference, si: usize, tag: &str) ->
             so: loaded.path(),
             names: &names,
             cart: &room.cart,
+            room: build.room,
+            dir: build.mix_dir.as_deref(),
         })
         .with_context(|| format!("the mix report of {}", compiled.sym))?;
         compiled.asm = String::new();
-        Some(crate::compiled::mix::counter(&compiled.sym, census))
+        Some(crate::compiled::mix::counter(&compiled.sym, census, build.mix_dir.clone()))
     } else {
         None
     };
@@ -1633,8 +1643,8 @@ fn build_one_shape(r: &crate::trace::kernel::Reference, si: usize, tag: &str) ->
             body_cols: Vec::new(),
             fused_nodes: fused.len(),
             mix_slices,
-            fused: if kernel_graph_kept() { fused } else { crate::transpile::graph::Graph::new() },
-            flat_roots: if kernel_graph_kept() { flat_roots } else { Vec::new() },
+            fused: if build.keep_graphs { fused } else { crate::transpile::graph::Graph::new() },
+            flat_roots: if build.keep_graphs { flat_roots } else { Vec::new() },
             room,
             input_names,
         },
@@ -1738,9 +1748,10 @@ fn pos_sources(template: &Rt2, fields: &[AsmField]) -> Result<Option<[PosSrc; 4]
     Ok(Some([px, py, rx, ry]))
 }
 
-/// The position cell of lane `i` of a body's output.
+/// The position cell of lane `i` of a body's output (`start`: the kernel's
+/// room).
 #[inline]
-fn cell_out(body: &AsmBody, buf: &[u8], i: usize) -> u32 {
+fn cell_out(body: &AsmBody, buf: &[u8], i: usize, start: (i16, i16)) -> u32 {
     use crate::search::pos_graph::{cell_of, room_offset, NO_CELL};
     let Some(srcs) = &body.pos else {
         return NO_CELL;
@@ -1756,7 +1767,7 @@ fn cell_out(body: &AsmBody, buf: &[u8], i: usize) -> u32 {
     };
     let (px, py, rx, ry) = (read(srcs[0]), read(srcs[1]), read(srcs[2]), read(srcs[3]));
     // The same labelling as `pos_graph::block_cells` (`room_offset`).
-    let (ox, oy) = room_offset(rx, ry).unwrap_or_else(|e| panic!("emitted row: {e:#}"));
+    let (ox, oy) = room_offset(start, rx, ry).unwrap_or_else(|e| panic!("emitted row: {e:#}"));
     cell_of(px as i32 + ox, py as i32 + oy).unwrap_or_else(|e| panic!("emitted row: {e}"))
 }
 
@@ -1874,18 +1885,19 @@ pub(crate) fn take_call_stats() -> [u64; 7] {
     std::array::from_fn(|i| CALL_STATS[i].swap(0, std::sync::atomic::Ordering::Relaxed))
 }
 
-/// `level`'s kernel set, built on first use. ONE set is resident (GBs):
-/// another level replaces it; callers hold theirs by `Arc`.
-pub(crate) fn registry(level: crate::abstraction::Level) -> Option<std::sync::Arc<Registry>> {
-    type Resident = Option<(crate::abstraction::Level, Option<std::sync::Arc<Registry>>)>;
+/// `level`'s kernel set under settings `s`, built on first use. ONE set is
+/// resident (GBs), keyed on the level AND the settings it was built under:
+/// another key replaces it; callers hold theirs by `Arc`.
+pub(crate) fn registry(level: crate::abstraction::Level, s: &crate::settings::Settings) -> std::sync::Arc<Registry> {
+    type Resident = Option<(crate::abstraction::Level, crate::settings::Settings, std::sync::Arc<Registry>)>;
     static SET: std::sync::Mutex<Resident> = std::sync::Mutex::new(None);
     let mut set = SET.lock().unwrap();
     match &*set {
-        Some((l, r)) if *l == level => r.clone(),
+        Some((l, k, r)) if *l == level && k == s => r.clone(),
         _ => {
             *set = None;
-            let built = build_registry_for_level(level).map(std::sync::Arc::new);
-            *set = Some((level, built.clone()));
+            let built = std::sync::Arc::new(build_registry_for_level(level, s));
+            *set = Some((level, s.clone(), built.clone()));
             built
         }
     }
@@ -1933,34 +1945,20 @@ impl Drop for BuildPurgeDelay {
     }
 }
 
-fn build_registry_for_level(level: crate::abstraction::Level) -> Option<Registry> {
+fn build_registry_for_level(level: crate::abstraction::Level, s: &crate::settings::Settings) -> Registry {
     let _purge = BuildPurgeDelay::start();
+    let s = s.clone();
     let built = std::thread::Builder::new()
         .stack_size(256 * 1024 * 1024)
-        .spawn(move || Registry::build_for_start_room(Path::new("."), level))
+        .spawn(move || Registry::build_for_start_room(Path::new("."), level, &s))
         .expect("spawn asm-kernel builder")
         .join()
         .expect("asm-kernel builder panicked");
     match built {
         Ok(reg) => {
             eprintln!("ASM kernels ENABLED ({level}): {} start-room shapes assembled", reg.len());
-            Some(reg)
+            reg
         }
         Err(e) => panic!("building ASM kernels for {level}: {e:#}"),
-    }
-}
-
-/// Run one chunk through `level`'s kernels; `false` (miss or decline) is
-/// fatal.
-pub(crate) fn run_chunk(
-    level: crate::abstraction::Level,
-    chunk: &Rt2,
-    cell_in: &[u32],
-    lanes: &[usize],
-    sink: &mut crate::storage::unit::UnitSink,
-) -> bool {
-    match registry(level) {
-        Some(reg) => reg.run_chunk(chunk, cell_in, lanes, sink),
-        None => false,
     }
 }

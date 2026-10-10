@@ -174,9 +174,9 @@ fn print_frame(st: &Rt2, frame_num: u32, input_byte: u8) {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    celeste_rust::settings::startup(&cli.settings, |_| {})?;
+    let cfg = celeste_rust::settings::startup(&cli.settings, |_| {})?;
     if cli.dump_start {
-        dump_start(&RefEngine::new()?.initial()?);
+        dump_start(&RefEngine::new(&cfg)?.initial()?);
         return Ok(());
     }
 
@@ -194,7 +194,7 @@ fn main() -> Result<()> {
     println!();
 
     println!("Running game init...");
-    let mut eng = RefEngine::new()?;
+    let mut eng = RefEngine::new(&cfg)?;
     let mut state = eng.initial()?;
     println!("Init complete.\n");
 

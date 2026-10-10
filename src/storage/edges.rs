@@ -309,9 +309,8 @@ fn unit_bytes(u: &UnitOut, remap: &[u32], frame: u32) -> Result<UnitBytes> {
 /// Write frame `frame`'s edge file from its units (owners resolved) and
 /// the workers' transfer remaps: the sections built per unit and written at
 /// their offsets, in parallel. Atomic (renamed into place). Returns its bytes.
-pub fn write_file(path: &Path, frame: u32, outs: &[UnitOut], remaps: Vec<Vec<u32>>) -> Result<u64> {
+pub fn write_file(path: &Path, frame: u32, outs: &[UnitOut], remaps: Vec<Vec<u32>>, threads: usize) -> Result<u64> {
     use std::os::unix::fs::FileExt;
-    let threads = crate::frame::threads();
     let bytes: Vec<UnitBytes> = super::wave::par_map(outs, threads, |u| unit_bytes(u, &remaps[u.worker as usize], frame)).into_iter().collect::<Result<_>>()?;
     // The data region's layout: per unit its sections, in unit order.
     let mut units = Vec::with_capacity(outs.len());
@@ -613,9 +612,10 @@ impl EdgeStore {
         }
     }
 
-    /// Every edge recorded at frame `frame`, unit by unit.
-    pub fn scan(&self, frame: u32, mut f: impl FnMut(Edge)) {
-        let owners = self.owners(frame);
+    /// Every edge recorded at frame `frame`, unit by unit (`threads`: the
+    /// owner index's scatter).
+    pub fn scan(&self, frame: u32, threads: usize, mut f: impl FnMut(Edge)) {
+        let owners = self.owners(frame, threads);
         for (fi, unit) in self.units(frame) {
             let u = self.unit(frame, &owners, fi, unit);
             u.edges(|lid, c, s, x| {
@@ -629,7 +629,7 @@ impl EdgeStore {
     /// takes into its own accumulator (`init()`); the accumulators, in no
     /// particular order (fold them with something commutative).
     pub fn par_scan<A: Send>(&self, frame: u32, threads: usize, init: impl Fn() -> A + Sync, f: impl Fn(&mut A, Edge) + Sync) -> Vec<A> {
-        let owners = self.owners(frame);
+        let owners = self.owners(frame, threads);
         let units = self.units(frame);
         let next = std::sync::atomic::AtomicUsize::new(0);
         std::thread::scope(|sc| {
@@ -675,8 +675,9 @@ impl EdgeStore {
 
     /// Frame `frame`'s lids' owners, by unit and lid, from the files' owner
     /// indexes (`pack_owner`, `NO_OWNER`): held while the frame is read unit
-    /// by unit, then dropped (8 B a lid; on disk only the index).
-    pub fn owners(&self, frame: u32) -> FrameOwners {
+    /// by unit, then dropped (8 B a lid; on disk only the index). Scattered
+    /// on `threads` workers.
+    pub fn owners(&self, frame: u32, threads: usize) -> FrameOwners {
         let mut files = Vec::new();
         for file in self.frames.get(frame as usize).into_iter().flatten() {
             let mut starts = Vec::with_capacity(file.head.units.len() + 1);
@@ -691,8 +692,7 @@ impl EdgeStore {
             use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
             let owners: Vec<AtomicU64> = (0..n).map(|_| AtomicU64::new(super::unit::NO_OWNER)).collect();
             let m = file.head.n_owner_index as usize;
-            let threads = crate::frame::threads().max(1);
-            let chunk = m.div_ceil(threads).max(1 << 16);
+            let chunk = m.div_ceil(threads.max(1)).max(1 << 16);
             std::thread::scope(|sc| {
                 for lo in (0..m).step_by(chunk) {
                     let (owners, starts) = (&owners, &starts);
@@ -720,9 +720,9 @@ impl EdgeStore {
     }
 
     /// `scan` as a list.
-    pub fn edges_at(&self, frame: u32) -> Vec<Edge> {
+    pub fn edges_at(&self, frame: u32, threads: usize) -> Vec<Edge> {
         let mut v = Vec::new();
-        self.scan(frame, |e| v.push(e));
+        self.scan(frame, threads, |e| v.push(e));
         v
     }
 }
@@ -964,7 +964,7 @@ mod tests {
         let u0 = unit(0, (0..300).map(|s| state_id(1, s, 0)).collect(), vec![(r1, 7), (r2, 2)], e0);
         let u1 = unit(1, vec![state_id(2, 0, 1), state_id(2, 1, 1)], vec![(r2, 3), (r1, 7)], vec![pack_edge(1, 3, 1, 0), pack_edge(0, 63, 0, 0)]);
         let path = file_path(&dir, 4, None);
-        write_file(&path, 4, &[u0, u1], vec![vec![10, 11], vec![20]]).unwrap();
+        write_file(&path, 4, &[u0, u1], vec![vec![10, 11], vec![20]], 2).unwrap();
         let mut xt = XferTable::default();
         let mut pairs = Vec::new();
         for i in 0..21u32 {
@@ -986,7 +986,7 @@ mod tests {
         assert!(got.is_empty(), "another cell of the entry");
         store.preds_at(state_id(r2, 3, 63), 4, &mut got);
         assert_eq!(got, vec![InEdge { src: state_id(2, 0, 1), xfer: 20 }]);
-        let all = store.edges_at(4);
+        let all = store.edges_at(4, 2);
         assert_eq!(all.len(), 603);
         assert!(all.contains(&Edge { src: state_id(1, 4, 0), dst: state_id(r2, 2, 0), xfer: 11 }));
         assert_eq!(XferTable::load(&dir).unwrap().pairs.len(), 21);

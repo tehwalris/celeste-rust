@@ -441,16 +441,16 @@ impl FrameFile {
         )
     }
 
-    /// Gather `ranges` (ascending, disjoint) into a block. `None` if they
-    /// are all empty.
-    pub fn load_rows(&self, ranges: &[std::ops::Range<u32>]) -> Result<Option<Rt2>> {
+    /// Gather `ranges` (ascending, disjoint) into a block of a search from
+    /// `room` (its cart and collision cache). `None` if they are all empty.
+    pub fn load_rows(&self, ranges: &[std::ops::Range<u32>], room: (i16, i16)) -> Result<Option<Rt2>> {
         let total: usize = ranges.iter().map(|r| r.len()).sum();
         if total == 0 {
             return Ok(None);
         }
         let h = &self.header;
         ensure!(!h.trimmed, "a trimmed checkpoint (--trim-rows: keys, cells and wins only): its rows are gone");
-        let (cart, cache) = crate::compiled::room_context()?;
+        let (cart, cache) = crate::compiled::room_context(room)?;
         let mut rt2 = Rt2::empty(total, h.globals.len(), &[], cart, cache);
         rt2.structure = h.structure.clone();
         rt2.globals = h.globals.clone();
@@ -494,8 +494,8 @@ impl FrameFile {
     }
 
     /// The whole file as one block.
-    pub fn load_all(&self) -> Result<Option<Rt2>> {
-        self.load_rows(&[0..self.header.width])
+    pub fn load_all(&self, room: (i16, i16)) -> Result<Option<Rt2>> {
+        self.load_rows(&[0..self.header.width], room)
     }
 }
 

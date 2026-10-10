@@ -365,6 +365,8 @@ impl Domain for Concrete {
 #[derive(Default, Clone)]
 pub struct Symbolic {
     pub graph: Graph,
+    /// `--build-trace`: the tracer's progress lines (`trace::verify`).
+    pub build_trace: bool,
     /// FORK choices handed out this frame (the fork ids), buttons included.
     pub forks: u8,
     /// `flr_ways` takes a static range's full width (level -1, whose speed
