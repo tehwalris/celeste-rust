@@ -31,3 +31,21 @@ BENCHMARK_DATA.md.
   floor of any fraction in it, so it is a superset either way.
 - **Out-of-map coordinates** read 0, as `mget_whole`: the rectangle is
   clipped to the map plus one "outside" row/column per side.
+
+## 2. Decided planes folded in the codegen
+
+- **Folded on `MaskVal`, at lowering** (`Lower::m_and`, `m_or`, `m_andn`,
+  `m_xor`, `m_not`, `m_sel`, `n_sel`), not as a peephole over the emitted
+  stream: a constant plane never becomes a register, so neither the
+  broadcast nor its spill exists. Every rule is a bit identity (`x & -1 =
+  x`, `x | -1 = -1`, `x & 0 = 0`, `x & x = x`, `x ^ x = 0`, `c ? t : t = t`,
+  a select with a constant arm as and/or/andn), so the folded kernel's
+  output is the same BITS in every lane - including the `val` plane on
+  lanes whose `known` is false, which nothing reads but which the test
+  checks anyway (`asm_bool_layer_with_decided_planes_is_bit_exact`).
+- **The select's known plane** stays `c ? tk : fk` (ignoring `c`'s own
+  known plane), exactly as before: an undecided condition is the select's
+  own error, elsewhere.
+- `codegen::foldable` (the mix diagnostic's estimate) is kept: it now
+  measures what bit identities would STILL remove (near nothing), which is
+  the check that the fold is complete.

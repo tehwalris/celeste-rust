@@ -48,7 +48,7 @@ const FLR_MASK: i32 = 0xffff_0000u32 as i32;
 type Vreg = u32;
 
 /// A numeric (ZN) node value: a live register or a broadcast constant.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq)]
 enum NumVal {
     Reg(Vreg),
     ConstI32(i32),
@@ -56,7 +56,7 @@ enum NumVal {
 
 /// One plane of a tri-state boolean: a per-lane VECTOR mask (all-ones or
 /// zero), not a k-register, so booleans share the zmm allocator.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq)]
 enum MaskVal {
     Reg(Vreg),
     Const(bool),
@@ -357,6 +357,97 @@ impl<'a> Lower<'a> {
     /// Vector-mask select `c ? t : f` (one plane), via `vpternlogd 0xca`.
     fn vsel(&mut self, c: Vreg, t: Vreg, f: Vreg) -> Vreg {
         self.ternlog(c, t, f, 0xca)
+    }
+
+    // ---- mask planes with the bit identities folded ----
+    //
+    // A plane that is a compile-time constant (`MaskVal::Const`: all-ones or
+    // zero in every lane) or the same register on both sides is folded by an
+    // identity that holds BIT FOR BIT in every lane (`x & -1 = x`, `x | -1 =
+    // -1`, `x & 0 = 0`, `x & x = x`, `c ? t : t = t`, ...), so the folded
+    // kernel computes exactly what the unfolded one did; nothing is decided
+    // that was not already a constant.
+
+    /// `p & q`.
+    fn m_and(&mut self, p: MaskVal, q: MaskVal) -> MaskVal {
+        match (p, q) {
+            (MaskVal::Const(false), _) | (_, MaskVal::Const(false)) => MaskVal::Const(false),
+            (MaskVal::Const(true), x) | (x, MaskVal::Const(true)) => x,
+            (MaskVal::Reg(a), MaskVal::Reg(b)) if a == b => p,
+            (MaskVal::Reg(a), MaskVal::Reg(b)) => MaskVal::Reg(self.dbin(ROp::AndD, a, b)),
+        }
+    }
+
+    /// `p | q`.
+    fn m_or(&mut self, p: MaskVal, q: MaskVal) -> MaskVal {
+        match (p, q) {
+            (MaskVal::Const(true), _) | (_, MaskVal::Const(true)) => MaskVal::Const(true),
+            (MaskVal::Const(false), x) | (x, MaskVal::Const(false)) => x,
+            (MaskVal::Reg(a), MaskVal::Reg(b)) if a == b => p,
+            (MaskVal::Reg(a), MaskVal::Reg(b)) => MaskVal::Reg(self.dbin(ROp::OrD, a, b)),
+        }
+    }
+
+    /// `~p & q`.
+    fn m_andn(&mut self, p: MaskVal, q: MaskVal) -> MaskVal {
+        match (p, q) {
+            (MaskVal::Const(true), _) | (_, MaskVal::Const(false)) => MaskVal::Const(false),
+            (MaskVal::Const(false), x) => x,
+            (x, MaskVal::Const(true)) => self.m_not(x),
+            (MaskVal::Reg(a), MaskVal::Reg(b)) if a == b => MaskVal::Const(false),
+            (MaskVal::Reg(a), MaskVal::Reg(b)) => MaskVal::Reg(self.dbin(ROp::AndnD, a, b)),
+        }
+    }
+
+    /// `p ^ q`.
+    fn m_xor(&mut self, p: MaskVal, q: MaskVal) -> MaskVal {
+        match (p, q) {
+            (MaskVal::Const(a), MaskVal::Const(b)) => MaskVal::Const(a != b),
+            (MaskVal::Const(false), x) | (x, MaskVal::Const(false)) => x,
+            (MaskVal::Const(true), x) | (x, MaskVal::Const(true)) => self.m_not(x),
+            (MaskVal::Reg(a), MaskVal::Reg(b)) if a == b => MaskVal::Const(false),
+            (MaskVal::Reg(a), MaskVal::Reg(b)) => MaskVal::Reg(self.dbin(ROp::XorD, a, b)),
+        }
+    }
+
+    /// `~p`.
+    fn m_not(&mut self, p: MaskVal) -> MaskVal {
+        match p {
+            MaskVal::Const(b) => MaskVal::Const(!b),
+            MaskVal::Reg(a) => MaskVal::Reg(self.not_mask(a)),
+        }
+    }
+
+    /// `c ? t : f`, one plane.
+    fn m_sel(&mut self, c: MaskVal, t: MaskVal, f: MaskVal) -> MaskVal {
+        match (c, t, f) {
+            (MaskVal::Const(true), t, _) => t,
+            (MaskVal::Const(false), _, f) => f,
+            (_, t, f) if t == f => t,
+            (c, MaskVal::Const(true), MaskVal::Const(false)) => c,
+            (c, MaskVal::Const(false), MaskVal::Const(true)) => self.m_not(c),
+            (c, MaskVal::Const(true), f) => self.m_or(c, f),
+            (c, MaskVal::Const(false), f) => self.m_andn(c, f),
+            (c, t, MaskVal::Const(true)) => {
+                let nc = self.m_not(c);
+                self.m_or(nc, t)
+            }
+            (c, t, MaskVal::Const(false)) => self.m_and(c, t),
+            (MaskVal::Reg(c), MaskVal::Reg(t), MaskVal::Reg(f)) => MaskVal::Reg(self.vsel(c, t, f)),
+        }
+    }
+
+    /// `c ? t : f` on a numeric plane.
+    fn n_sel(&mut self, c: MaskVal, t: NumVal, f: NumVal) -> NumVal {
+        match c {
+            MaskVal::Const(true) => t,
+            MaskVal::Const(false) => f,
+            _ if t == f => t,
+            MaskVal::Reg(c) => {
+                let (tr, fr) = (self.num_reg(t), self.num_reg(f));
+                NumVal::Reg(self.vsel(c, tr, fr))
+            }
+        }
     }
 
     // ---- interval layer (ZI as two i32 planes) ----
@@ -817,13 +908,11 @@ impl<'a> Lower<'a> {
                     }
                     1 => {
                         let (p, q) = (self.as_bool(a[0])?, self.as_bool(a[1])?);
-                        let (pv, qv) = (self.mask_reg(p[0]), self.mask_reg(q[0]));
-                        // val = ~(pv ^ qv)
-                        let x = self.dbin(ROp::XorD, pv, qv);
-                        let val = self.not_mask(x);
-                        let (pk, qk) = (self.mask_reg(p[1]), self.mask_reg(q[1]));
-                        let known = self.dbin(ROp::AndD, pk, qk);
-                        Value::Bool([MaskVal::Reg(val), MaskVal::Reg(known)])
+                        // val = ~(pv ^ qv), known = pk & qk
+                        let x = self.m_xor(p[0], q[0]);
+                        let val = self.m_not(x);
+                        let known = self.m_and(p[1], q[1]);
+                        Value::Bool([val, known])
                     }
                     _ => {
                         let x = self.as_num(a[0])?;
@@ -836,32 +925,30 @@ impl<'a> Lower<'a> {
             }
             Op::Not => {
                 let b = self.as_bool(a[0])?;
-                let v = self.mask_reg(b[0]);
-                let nv = self.not_mask(v);
-                Value::Bool([MaskVal::Reg(nv), b[1]])
+                let nv = self.m_not(b[0]);
+                Value::Bool([nv, b[1]])
             }
             op @ (Op::And | Op::Or) => {
                 let (p, q) = (self.as_bool(a[0])?, self.as_bool(a[1])?);
-                let (pv, qv) = (self.mask_reg(p[0]), self.mask_reg(q[0]));
-                let (pk, qk) = (self.mask_reg(p[1]), self.mask_reg(q[1]));
+                let ([pv, pk], [qv, qk]) = (p, q);
+                // Kleene, per lane; the identities fold decided planes.
+                let kk = self.m_and(pk, qk);
                 if matches!(op, Op::And) {
                     // known = (pk & qk) | (~pv & pk) | (~qv & qk)
-                    let val = self.dbin(ROp::AndD, pv, qv);
-                    let kfa = self.dbin(ROp::AndnD, pv, pk);
-                    let kfb = self.dbin(ROp::AndnD, qv, qk);
-                    let kf = self.dbin(ROp::OrD, kfa, kfb);
-                    let kk = self.dbin(ROp::AndD, pk, qk);
-                    let known = self.dbin(ROp::OrD, kk, kf);
-                    Value::Bool([MaskVal::Reg(val), MaskVal::Reg(known)])
+                    let val = self.m_and(pv, qv);
+                    let kfa = self.m_andn(pv, pk);
+                    let kfb = self.m_andn(qv, qk);
+                    let kf = self.m_or(kfa, kfb);
+                    let known = self.m_or(kk, kf);
+                    Value::Bool([val, known])
                 } else {
                     // known = (pk & qk) | (pv & pk) | (qv & qk)
-                    let val = self.dbin(ROp::OrD, pv, qv);
-                    let kta = self.dbin(ROp::AndD, pv, pk);
-                    let ktb = self.dbin(ROp::AndD, qv, qk);
-                    let kt = self.dbin(ROp::OrD, kta, ktb);
-                    let kk = self.dbin(ROp::AndD, pk, qk);
-                    let known = self.dbin(ROp::OrD, kk, kt);
-                    Value::Bool([MaskVal::Reg(val), MaskVal::Reg(known)])
+                    let val = self.m_or(pv, qv);
+                    let kta = self.m_and(pv, pk);
+                    let ktb = self.m_and(qv, qk);
+                    let kt = self.m_or(kta, ktb);
+                    let known = self.m_or(kk, kt);
+                    Value::Bool([val, known])
                 }
             }
             Op::Known => {
@@ -905,31 +992,24 @@ impl<'a> Lower<'a> {
                 }
             }
             Op::Sel => {
-                let c = self.as_bool(a[0])?;
-                let cv = self.mask_reg(c[0]);
+                let cv = self.as_bool(a[0])?[0];
                 // On the JOINED arm domain (a number beside an interval is [n, n]).
                 match self.dom(a[1]).max(self.dom(a[2])) {
                     1 => {
                         let (t, f) = (self.as_bool(a[1])?, self.as_bool(a[2])?);
-                        let (tv, fv) = (self.mask_reg(t[0]), self.mask_reg(f[0]));
-                        let (tk, fk) = (self.mask_reg(t[1]), self.mask_reg(f[1]));
-                        let val = self.vsel(cv, tv, fv);
-                        let known = self.vsel(cv, tk, fk);
-                        Value::Bool([MaskVal::Reg(val), MaskVal::Reg(known)])
+                        let val = self.m_sel(cv, t[0], f[0]);
+                        let known = self.m_sel(cv, t[1], f[1]);
+                        Value::Bool([val, known])
                     }
                     2 => {
                         let (t, f) = (self.as_ival(a[1])?, self.as_ival(a[2])?);
-                        let (tl, fl) = (self.num_reg(t[0]), self.num_reg(f[0]));
-                        let (th, fh) = (self.num_reg(t[1]), self.num_reg(f[1]));
-                        let lo = self.vsel(cv, tl, fl);
-                        let hi = self.vsel(cv, th, fh);
-                        Value::Ival([NumVal::Reg(lo), NumVal::Reg(hi)])
+                        let lo = self.n_sel(cv, t[0], f[0]);
+                        let hi = self.n_sel(cv, t[1], f[1]);
+                        Value::Ival([lo, hi])
                     }
                     _ => {
-                        let t = self.as_num(a[1])?;
-                        let f = self.as_num(a[2])?;
-                        let (tr, fr) = (self.num_reg(t), self.num_reg(f));
-                        Value::Num(NumVal::Reg(self.vsel(cv, tr, fr)))
+                        let (t, f) = (self.as_num(a[1])?, self.as_num(a[2])?);
+                        Value::Num(self.n_sel(cv, t, f))
                     }
                 }
             }

@@ -765,3 +765,93 @@ fn asm_interval_overflow_declines() {
         }
     }
 }
+
+/// The tri-state layer with DECIDED planes: a maybe-unknown input, a bool
+/// input, a comparison (known everywhere), the two literals and an undecided
+/// constant, combined pairwise by `And`/`Or`/`Eq`/`Not` and as `Sel`
+/// conditions and arms. The codegen folds the decided planes by bit identities
+/// (`codegen::Lower::m_and` ...); every root must still equal the `zb_*`
+/// primitives on EVERY bit of both planes, not only on the known lanes.
+#[test]
+fn asm_bool_layer_with_decided_planes_is_bit_exact() {
+    use crate::transpile::asm::{compile_and_load_reprs, CellRepr};
+    let mut g = Graph::new();
+    let u = g.leaf(Op::Cell(0));
+    let b = g.leaf(Op::Cell(1));
+    let (x, y) = (g.leaf(Op::Cell(2)), g.leaf(Op::Cell(3)));
+    let c = g.add(Op::Lt, vec![x, y]);
+    let t = g.leaf(Op::ConstBool(true));
+    let f = g.leaf(Op::ConstBool(false));
+    let k = g.leaf(Op::UnknownBool(0));
+    let leaves = [u, b, c, t, f, k];
+    let mut roots = Vec::new();
+    for &p in &leaves {
+        roots.push(g.add(Op::Not, vec![p]));
+        roots.push(g.add(Op::Sel, vec![p, x, y]));
+        for &q in &leaves {
+            for op in [Op::And, Op::Or, Op::Eq] {
+                roots.push(g.add(op, vec![p, q]));
+            }
+            for &r in &leaves {
+                roots.push(g.add(Op::Sel, vec![p, q, r]));
+            }
+        }
+    }
+    let reprs = HashMap::from([(0u32, CellRepr::UBool), (1u32, CellRepr::Bool)]);
+    let (compiled, loaded) = compile_and_load_reprs(&g, &roots, "decided", &reprs).expect("compile+load");
+    let mut rng = Lcg(0xdec1_dedd);
+    for trial in 0..16 {
+        let (uv, uk, bv) = ((rng.next_u64() & 0xFFFF) as u16, (rng.next_u64() & 0xFFFF) as u16, (rng.next_u64() & 0xFFFF) as u16);
+        let (xs, ys): ([i32; 16], [i32; 16]) = (std::array::from_fn(|_| rng.i32() % 4), std::array::from_fn(|_| rng.i32() % 4));
+        let mut input = vec![0u8; compiled.input_bytes as usize];
+        for (ci, cell) in compiled.input_cells.iter().enumerate() {
+            let at = compiled.input_offsets[ci] as usize;
+            match cell {
+                0 => {
+                    input[at..at + 2].copy_from_slice(&uv.to_le_bytes());
+                    input[at + 2..at + 4].copy_from_slice(&uk.to_le_bytes());
+                }
+                1 => input[at..at + 2].copy_from_slice(&bv.to_le_bytes()),
+                _ => {
+                    let col = if *cell == 2 { &xs } else { &ys };
+                    for (l, v) in col.iter().enumerate() {
+                        input[at + l * 4..at + l * 4 + 4].copy_from_slice(&v.to_le_bytes());
+                    }
+                }
+            }
+        }
+        let out = run_asm_raw(&loaded, &input, compiled.out_bytes, std::ptr::null());
+        let zn = |a: &[i32; 16]| ZN::from_array(std::array::from_fn(|i| P8::from_raw(a[i])));
+        let (zx, zy) = (zn(&xs), zn(&ys));
+        // The oracle, per node: each leaf's planes as the codegen holds them.
+        let mut vals: HashMap<NodeId, ZB> = HashMap::new();
+        vals.insert(u, ZB { val: uv, known: uk });
+        vals.insert(b, ZB { val: bv, known: ALL });
+        vals.insert(c, zn_lt(zx, zy));
+        vals.insert(t, ZB { val: ALL, known: ALL });
+        vals.insert(f, ZB { val: 0, known: ALL });
+        vals.insert(k, ZB { val: 0, known: 0 });
+        for (ri, &r) in roots.iter().enumerate() {
+            let node = g.get(r);
+            let a = |i: usize| vals[&node.args[i]];
+            let o = compiled.root_offsets[ri] as usize;
+            let word = |at: usize| u16::from_le_bytes([out[at], out[at + 1]]);
+            if node.op == Op::Sel && !matches!(g.get(node.args[1]).op, Op::Cell(2) | Op::Cell(3)) {
+                let want = zsel_b(a(0), a(1), a(2));
+                assert_eq!((word(o), word(o + 2)), (want.val, want.known), "trial {trial}: root {ri} {:?}", node);
+                continue;
+            }
+            if node.op == Op::Sel {
+                assert_eq!(&out[o..o + 64], &zn_bytes(zsel_n(a(0), zx, zy)), "trial {trial}: root {ri} numeric select");
+                continue;
+            }
+            let want = match node.op {
+                Op::Not => zb_not(a(0)),
+                Op::And => zb_and(a(0), a(1)),
+                Op::Or => zb_or(a(0), a(1)),
+                _ => zb_eq(a(0), a(1)),
+            };
+            assert_eq!((word(o), word(o + 2)), (want.val, want.known), "trial {trial}: root {ri} {:?}", node);
+        }
+    }
+}
