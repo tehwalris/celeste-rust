@@ -10,7 +10,8 @@
 //! the horizon must survive every one of them, so it is stepped through the
 //! reference engine and checked at every search step `s`:
 //!
-//! * level -1 does not call its cell too late (every step past the start);
+//! * level -1 (the filter the TREE recorded, `TreeFilter::of_tree`, not the
+//!   environment's) does not call its cell too late (every step past the start);
 //! * the ladder's filter admits it (`MarkFilter::allowed`, every step past
 //!   the start: mid-frame steps pass by construction, the boundaries are
 //!   filtered);
@@ -51,6 +52,8 @@ pub struct Pruning<'a> {
     pub w: &'a Winning,
     /// This level's reached nodes (the next level's filter), if it has one.
     pub reached: Option<&'a Visited>,
+    /// The level -1 filter the tree was built under (`TreeFilter::of_tree`).
+    pub minus_one: Option<crate::frame::MinusOne>,
     /// The tree's frame files `(layer, seq, file)`, for the report.
     pub files: &'a [(u32, u32, super::checkpoint::FrameFile)],
 }
@@ -103,7 +106,7 @@ pub fn check(route: &Route, p: &Pruning) -> anyhow::Result<Option<u32>> {
         return Ok(None);
     };
     let frame = exit.div_ceil(spf);
-    let l1 = crate::frame::MinusOne::from_env().map(|m| (m.h, m.table()));
+    let l1 = p.minus_one.map(|m| (m.h, m.table()));
     // Per step and state: the first check it fails (`None`: it passes).
     let mut verdicts: Vec<Vec<Option<Miss>>> = Vec::with_capacity(run.layers.len());
     for (s, layer) in run.layers.iter().enumerate() {

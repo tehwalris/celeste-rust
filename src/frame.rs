@@ -775,6 +775,28 @@ impl TreeFilter {
         }
     }
 
+    /// The level -1 filter the tree in `dir` was built under, its table
+    /// checked against the recorded fingerprint: what a check of the tree
+    /// (`search::known`) must apply, whatever the environment says. Refused
+    /// without a record or for a legacy one (its table is unknown).
+    pub fn of_tree(dir: &std::path::Path) -> Result<Option<MinusOne>> {
+        match TreeFilter::read(dir)? {
+            None => anyhow::bail!("{}: no level -1 record (a tree from before records): its filter is unknown", dir.display()),
+            Some(TreeFilter::Off) => Ok(None),
+            Some(TreeFilter::Legacy(h)) => anyhow::bail!("{}: filtered by level -1 at step {h} before the table was recorded: its filter is unknown", dir.display()),
+            Some(TreeFilter::MinusOne { m, table }) => {
+                anyhow::ensure!(
+                    m.table().fingerprint() == table,
+                    "{}: the level -1 table (S = {}) is not the one the tree was built under (fingerprint {:016x}, the tree's {table:016x})",
+                    dir.display(),
+                    m.speed,
+                    m.table().fingerprint()
+                );
+                Ok(Some(m))
+            }
+        }
+    }
+
     /// The horizon the tree's frames were filtered for (`None`: none).
     fn ceiling(&self) -> Option<u32> {
         match *self {
@@ -1875,6 +1897,11 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("celeste-tree-filter-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         assert_eq!(TreeFilter::read(&dir).expect("read"), None, "no record: unknown");
+        assert!(TreeFilter::of_tree(&dir).is_err(), "a check refuses an unknown filter");
+        TreeFilter::Off.write(&dir).expect("write");
+        assert_eq!(TreeFilter::of_tree(&dir).expect("off"), None, "a check of an unfiltered tree applies no level -1");
+        TreeFilter::Legacy(111).write(&dir).expect("write");
+        assert!(TreeFilter::of_tree(&dir).is_err(), "a legacy record's table is unknown");
         for f in [TreeFilter::Off, TreeFilter::MinusOne { m: MinusOne { h: 186, speed: 5 }, table: 0x0123_4567_89ab_cdef }, TreeFilter::Legacy(111)] {
             f.write(&dir).expect("write");
             assert_eq!(TreeFilter::read(&dir).expect("read"), Some(f));
