@@ -1,5 +1,8 @@
 # Format study: a compact level-0 graph (2026-10-09)
 
+> Historical: `rewrite format-study` read the pre-storage-v2 tree (the door's
+> ids, `EdgeGraph`) and was not merged; it lives on branch `format-study`.
+
 One real mid-run tree, re-encoded as drafts. `rewrite format-study` sizes
 each format (nothing is written) and times a varint round trip:
 
