@@ -124,7 +124,7 @@ impl Block {
     pub fn keyed(mut rt2: Rt2) -> Result<Self> {
         let level = crate::abstraction::Level { held: crate::abstraction::current_level().held, ..crate::abstraction::Level::EXACT };
         let (_, keys, _) = widened_keys_rt2(&rt2, level)?;
-        rt2.row_keys_canonical();
+        rt2.row_keys_canonical(crate::compiled::ids());
         rt2.row_keys = keys;
         Ok(Block { rt2, ids: Vec::new(), seq: 0, skip: Vec::new() })
     }
@@ -1295,7 +1295,7 @@ impl<'a> ForwardSink<'a> {
                     } else {
                         celeste_engine::kernel::RowCache::ID_FLAG | ids_buf[u as usize]
                     };
-                    self.seen.set_ref(*key, v);
+                    self.seen.set_ref(*key, slot.cells[r], v);
                 }
                 self.t_edges += t_e.elapsed();
             }
@@ -1597,7 +1597,7 @@ pub fn widened_keys_rt2(
 ) -> Result<(u64, Vec<(u64, u64)>, Vec<u32>)> {
     let mut w = rt2.clone_block();
     widen_rt2_to(&mut w, coarser);
-    let keys = w.row_keys_canonical();
+    let keys = w.row_keys_canonical(crate::compiled::ids());
     let cells = crate::search::pos_graph::block_cells(&w)?;
     anyhow::ensure!(
         keys.len() == rt2.width && cells.len() == rt2.width,
@@ -3285,7 +3285,7 @@ mod tests {
         let mut made: std::collections::BTreeSet<(u64, (u64, u64), u32)> = Default::default();
         for b in &next {
             let stored = b.keys().to_vec();
-            let canonical = b.rt2().clone_block().row_keys_canonical();
+            let canonical = b.rt2().clone_block().row_keys_canonical(crate::compiled::ids());
             assert_eq!(stored, canonical, "an emitted row's key is not its columns' key (shape {:#x})", b.rt2().shape_hash);
             let (shape, keys, cells) = widened_keys(b, level).expect("keys");
             made.extend(keys.into_iter().zip(cells).map(|(k, c)| (shape, k, c)));

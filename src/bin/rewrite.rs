@@ -1462,7 +1462,7 @@ fn main() -> Result<()> {
                     }
                 }
                 // (frame, cell, key) along the chain, for `--chain-out`.
-                let mut chain: Vec<(u32, u32, (u64, u64))> = vec![(id_layer(id), c, rt2.clone_block().row_keys_canonical()[0])];
+                let mut chain: Vec<(u32, u32, (u64, u64))> = vec![(id_layer(id), c, rt2.clone_block().row_keys_canonical(celeste_rust::compiled::ids())[0])];
                 let mut found = false;
                 for _ in 0..depth {
                     if id_layer(id) == 0 {
@@ -1501,7 +1501,7 @@ fn main() -> Result<()> {
                         break;
                     }
                     println!("  <- f{:03} {} [{}:{}:{}] ({} preds){}: {}", id_layer(p), where_(pc), id_layer(p), id_seq(p), id_row(p), preds.len(), if real.is_some() { " still spurious" } else { "" }, changed.join(", "));
-                    chain.push((id_layer(p), pc, rt.clone_block().row_keys_canonical()[0]));
+                    chain.push((id_layer(p), pc, rt.clone_block().row_keys_canonical(celeste_rust::compiled::ids())[0]));
                     id = p;
                     cur = pp;
                 }
@@ -1945,7 +1945,7 @@ fn main() -> Result<()> {
                                 }
                             }
                             // Deduplicated on the EXACT state's key.
-                            let key = block.rt2().clone_block().row_keys_canonical()[0];
+                            let key = block.rt2().clone_block().row_keys_canonical(celeste_rust::compiled::ids())[0];
                             if !seen.insert((key.0, key.1, cell)) {
                                 continue;
                             }

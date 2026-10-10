@@ -73,7 +73,7 @@ fn run(inputs: &[u8], horizon: u32) -> anyhow::Result<(Run, bool)> {
             for c in eng.step(b.rt2(), byte)? {
                 if wins_of(c.rt2())?.iter().any(|&x| x) {
                     won.push(p as u32);
-                } else if seen.insert((c.rt2().clone_block().row_keys_canonical()[0], c.positions()?[0])) {
+                } else if seen.insert((c.rt2().clone_block().row_keys_canonical(crate::compiled::ids())[0], c.positions()?[0])) {
                     next.push((p as u32, c));
                 }
             }

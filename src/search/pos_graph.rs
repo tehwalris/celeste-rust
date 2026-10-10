@@ -92,11 +92,7 @@ pub fn whole_range_col(rt2: &Rt2, cell: u32) -> Option<Vec<(i16, i16)>> {
 /// The block's player object (`player`, else `player_spawn`), if any. Per
 /// block: lanes share structure.
 pub fn player_object(rt2: &Rt2) -> Option<u32> {
-    let ids = crate::compiled::ids();
-    rt2.player_objects(ids)
-        .first()
-        .copied()
-        .or_else(|| rt2.objects_of_type(ids, ids.g_player_spawn).first().copied())
+    rt2.position_object(crate::compiled::ids())
 }
 
 /// Per-lane cell of a block. `room.x`/`room.y` must be numbers; no player

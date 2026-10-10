@@ -531,7 +531,7 @@ pub fn zn_tile_flag_at_lanes(
     ZB { val, known: ALL }
 }
 
-/// The within-call dedup cache, keyed by the row key, with one `u32` tag
+/// The within-call dedup cache, keyed by the state (row key and cell), with one `u32` tag
 /// per key: what the row's first emission learned that a re-emission needs,
 /// so the re-emission materializes nothing (`compiled::asm_kernel`).
 ///
@@ -579,10 +579,19 @@ impl RowCache {
     }
 
 
-    /// Set the ref of `k`'s entry. A miss (evicted since) is fine: the
-    /// next emission of `k` will push the row again.
+    /// The cache's key of the state `(k, cell)`: the row key holds no
+    /// position (`runtime2::pos_code`), the cell does.
     #[inline(always)]
-    pub fn set_ref(&mut self, k: (u64, u64), r: u64) {
+    fn with_cell(k: (u64, u64), cell: u32) -> (u64, u64) {
+        use crate::runtime2::mix64;
+        (k.0 ^ mix64(cell as u64 | 1 << 40), k.1 ^ mix64(cell as u64 | 1 << 41))
+    }
+
+    /// Set the ref of `(k, cell)`'s entry. A miss (evicted since) is fine:
+    /// the next emission of it will push the row again.
+    #[inline(always)]
+    pub fn set_ref(&mut self, k: (u64, u64), cell: u32, r: u64) {
+        let k = Self::with_cell(k, cell);
         let base = k.0 as usize;
         for p in 0..Self::PROBES {
             let i = (base + p) & self.mask;
@@ -594,11 +603,12 @@ impl RowCache {
         }
     }
 
-    /// Insert `k` with `tag` and ref `r`: `None` if it was not present (it
-    /// is now, or it evicted the first slot of its probe window), `Some((tag,
-    /// ref) of the first insert)` if it was.
+    /// Insert the state `(k, cell)` with `tag` and ref `r`: `None` if it was
+    /// not present (it is now, or it evicted the first slot of its probe
+    /// window), `Some((tag, ref) of the first insert)` if it was.
     #[inline(always)]
-    pub fn insert_ref(&mut self, k: (u64, u64), tag: u32, r: u64) -> Option<(u32, u64)> {
+    pub fn insert_ref(&mut self, k: (u64, u64), cell: u32, tag: u32, r: u64) -> Option<(u32, u64)> {
+        let k = Self::with_cell(k, cell);
         let base = k.0 as usize;
         let mut victim = base & self.mask;
         for p in 0..Self::PROBES {

@@ -336,7 +336,7 @@ mod tests {
         std::env::set_var("CELESTE_START_ROOM", "1,0");
         let inputs = crate::concrete::read_inputs("tas/room_1_0_exit_frame_99.txt").expect("the exit's inputs");
         let mut eng = RefEngine::new().expect("ref engine");
-        let exact = |bs: Vec<Block>| -> Vec<((u64, u64), u32)> { bs.iter().map(|b| (b.rt2().clone_block().row_keys_canonical()[0], b.positions().expect("cells")[0])).collect() };
+        let exact = |bs: Vec<Block>| -> Vec<((u64, u64), u32)> { bs.iter().map(|b| (b.rt2().clone_block().row_keys_canonical(crate::compiled::ids())[0], b.positions().expect("cells")[0])).collect() };
         let mut row = eng.initial().expect("initial state");
         let (mut runs, mut checked) = (0, 0);
         for (f, &byte) in inputs.iter().enumerate() {

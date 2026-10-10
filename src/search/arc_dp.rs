@@ -1181,7 +1181,7 @@ pub fn concrete_search(
                         cx.path.push((byte, cell));
                         return Ok(Some(true));
                     }
-                    let exact = (b.rt2().clone_block().row_keys_canonical()[0], cell, k + 1);
+                    let exact = (b.rt2().clone_block().row_keys_canonical(crate::compiled::ids())[0], cell, k + 1);
                     if cx.dead.contains(&exact) {
                         continue;
                     }
@@ -1266,7 +1266,7 @@ pub fn concrete_search(
                                         // Dedup on the EXACT key, never `b.keys()` (the
                                         // level's widened key): states sharing it need
                                         // not share their fate (`522de36`).
-                                        let exact = b.rt2().clone_block().row_keys_canonical()[0];
+                                        let exact = b.rt2().clone_block().row_keys_canonical(crate::compiled::ids())[0];
                                         let win = wins_of(b.rt2())?.iter().any(|&x| x);
                                         if !win && chunk_seen.contains(&(exact, cell)) {
                                             continue;

@@ -8,7 +8,6 @@ use std::sync::Arc;
 use celeste_core::cart_data::CartData;
 use celeste_core::collision_cache::CollisionCache;
 use celeste_core::pico8_num::Pico8Num;
-use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
 
 pub type P8 = Pico8Num;
@@ -66,6 +65,39 @@ pub const MIX_C2: u64 = 0x94d0_49bb_1331_11eb;
 #[inline]
 pub fn cell_mix(c: u64, v: AV, seed: u64) -> u64 {
     mix64(seed ^ c.wrapping_mul(CELL_K) ^ av_code(v))
+}
+
+/// The whole pixels of a position coordinate (raw 16.16): the bits the
+/// CELL holds (`flr` of the low end), so the row key takes the rest only.
+pub const POS_WHOLE: u32 = 0xffff_0000;
+
+/// What a POSITION coordinate (the position object's `x`/`y`) contributes
+/// to the row key: the value less its low end's whole pixels. The cell
+/// (`search::pos_graph`) holds those, and the room (its offset) is in the
+/// key, so `(shape, key, cell)` still names one state: the key is the
+/// state WITHOUT its position (plans/storage-v2.md). An integer position,
+/// the normal case, codes as 0. Not a number: fatal (the cell would be
+/// `NO_CELL` and the position lost).
+#[inline]
+pub fn pos_code(v: AV) -> u64 {
+    match v {
+        AV::Num(n) => num_code(n.to_bits() & !POS_WHOLE),
+        AV::Ival(a, b) => pos_ival_code(a.to_bits(), b.to_bits()),
+        other => panic!("a position coordinate holds {other:?}, not a number: its cell and key would lose it"),
+    }
+}
+
+/// `pos_code` of the interval `[lo, hi]` (raw).
+#[inline]
+pub fn pos_ival_code(lo: u32, hi: u32) -> u64 {
+    let whole = lo & POS_WHOLE;
+    ival_code(lo.wrapping_sub(whole), hi.wrapping_sub(whole))
+}
+
+/// `cell_mix` of a position coordinate (`pos_code`).
+#[inline]
+pub fn pos_mix(c: u64, v: AV, seed: u64) -> u64 {
+    mix64(seed ^ c.wrapping_mul(CELL_K) ^ pos_code(v))
 }
 
 /// One lane's abstract value. `Copy`, 12 bytes + tag.
@@ -469,6 +501,19 @@ impl Rt2 {
         out
     }
 
+    /// The POSITION object: the first player instance, else the first
+    /// `player_spawn` (`search::pos_graph::player_object`'s rule: its
+    /// whole-pixel `x`/`y` make the row's cell).
+    pub fn position_object(&self, ids: &BoundaryIds) -> Option<u32> {
+        self.player_objects(ids).first().copied().or_else(|| self.objects_of_type(ids, ids.g_player_spawn).first().copied())
+    }
+
+    /// The position object's `x` and `y` cells (`position_object`).
+    pub fn position_cells(&self, ids: &BoundaryIds) -> Option<(u32, u32)> {
+        let obj = self.position_object(ids)?;
+        Some((self.obj_field_cell(obj, ids.f_x)?, self.obj_field_cell(obj, ids.f_y)?))
+    }
+
     /// The first player INSTANCE's `x`/`y` cells of its table field `f`
     /// (`rem`, `spd`) - not `player_spawn`'s, whose remainder is real state.
     pub fn player_xy_cells(&self, ids: &BoundaryIds, f: u32) -> Option<(usize, usize)> {
@@ -517,13 +562,6 @@ impl Rt2 {
             h.write_u32(*g);
         }
         h.finish()
-    }
-
-    /// The boundary: level-0 widenings, canonical renumbering (the GC), row
-    /// keys, and in-block dedup. Returns the surviving lane count.
-    pub fn boundary(&mut self, ids: &BoundaryIds) -> usize {
-        self.boundary_canonicalize(ids);
-        self.boundary_dedup()
     }
 
     /// Renumber every cell into CANONICAL order (BFS discovery from the
@@ -654,20 +692,20 @@ impl Rt2 {
         self.cols = new_cols;
     }
 
-    /// The boundary without the dedup: every lane keeps its row key.
+    /// The BOUNDARY: level-0 widenings, canonical renumbering (the GC),
+    /// shape hash and per-lane row keys, lanes kept (a row key holds no
+    /// position, so equal keys at two cells are two states).
     pub fn boundary_canonicalize(&mut self, ids: &BoundaryIds) {
         self.boundary_prepare();
         self.boundary_widen(ids);
-        self.boundary_finish();
+        self.boundary_finish(ids);
     }
-
-
 
     /// Per-lane row keys without widening or dedup: the search's ONE row key,
     /// recomputed for a state as it is (stored or concrete).
-    pub fn row_keys_canonical(&mut self) -> Vec<(u64, u64)> {
+    pub fn row_keys_canonical(&mut self, ids: &BoundaryIds) -> Vec<(u64, u64)> {
         self.boundary_prepare();
-        self.boundary_finish();
+        self.boundary_finish(ids);
         self.row_keys.clone()
     }
 
@@ -1029,7 +1067,7 @@ impl Rt2 {
     }
 
     /// Shared boundary tail: canonical ids, shape hash, per-lane row keys.
-    fn boundary_finish(&mut self) {
+    fn boundary_finish(&mut self, ids: &BoundaryIds) {
         assert!(self.prints.is_empty(), "prints at a frame boundary: {:?}", self.prints);
 
         self.canonicalize_ids();
@@ -1039,7 +1077,9 @@ impl Rt2 {
 
         // 128-bit row key: per-cell mixes SUMMED, so uniform cells fold once
         // and keys agree whichever cells are uniform. The kernels match this.
+        // The position's whole pixels are the cell's, not the key's (`pos_code`).
         let w = self.width;
+        let pos = self.position_cells(ids);
         let mut part1: u64 = shape_hash;
         let mut part2: u64 = 0xa076_1d64_78bd_642f ^ shape_hash;
         let mut h1: Vec<u64> = vec![0; w];
@@ -1049,6 +1089,22 @@ impl Rt2 {
                 continue;
             }
             let ci = c as u64;
+            if pos.is_some_and(|(x, y)| c as u32 == x || c as u32 == y) {
+                match &self.cols[c] {
+                    Col::U(v) => {
+                        part1 = part1.wrapping_add(pos_mix(ci, *v, KEY_SEED1));
+                        part2 = part2.wrapping_add(pos_mix(ci, *v, KEY_SEED2));
+                    }
+                    col => {
+                        for i in 0..w {
+                            let v = col.at(i);
+                            h1[i] = h1[i].wrapping_add(pos_mix(ci, v, KEY_SEED1));
+                            h2[i] = h2[i].wrapping_add(pos_mix(ci, v, KEY_SEED2));
+                        }
+                    }
+                }
+                continue;
+            }
             match &self.cols[c] {
                 Col::U(v) => {
                     part1 = part1.wrapping_add(cell_mix(ci, *v, KEY_SEED1));
@@ -1085,23 +1141,6 @@ impl Rt2 {
                 mix64(part2.wrapping_add(h2[i])),
             ))
             .collect();
-    }
-
-    /// In-block dedup, keeping the first lane of each row key.
-    fn boundary_dedup(&mut self) -> usize {
-        let w = self.width;
-        let mut keep: Vec<u32> = Vec::new();
-        let mut seen_rows: FxHashMap<(u64, u64), ()> = FxHashMap::default();
-        for i in 0..w {
-            if let std::collections::hash_map::Entry::Vacant(e) =
-                seen_rows.entry(self.row_keys[i])
-            {
-                e.insert(());
-                keep.push(i as u32);
-            }
-        }
-        self.retain_lanes(&keep);
-        self.width
     }
 
     /// Keep only the given lanes (ascending) in every column and row key.
@@ -1181,6 +1220,25 @@ mod tests {
         assert_ne!(av_code(AV::Ival(a, b)), av_code(AV::Num(a)));
         assert_ne!(av_code(AV::Ival(a, b)), av_code(AV::Num(b)));
         assert_ne!(av_code(AV::Ival(a, b)), av_code(AV::Ival(b, b)));
+    }
+
+    /// A position coordinate keys without its low end's whole pixels: every
+    /// integer alike, an interval by its offsets from its low pixel, and a
+    /// fraction is still the key's (the cell holds only `flr`).
+    #[test]
+    fn a_position_keys_without_its_whole_pixels() {
+        let px = |raw: i32| P8::from_raw(raw);
+        for whole in [-64i32, -1, 0, 5, 300] {
+            assert_eq!(pos_code(AV::Num(px(whole << 16))), pos_code(AV::Num(px(0))), "x = {whole}");
+            assert_eq!(pos_code(AV::Num(px((whole << 16) + 0x4000))), pos_code(AV::Num(px(0x4000))), "x = {whole}.25");
+            let iv = AV::Ival(px((whole << 16) + 0x8000), px(((whole + 2) << 16) + 0x4000));
+            assert_eq!(pos_code(iv), pos_code(AV::Ival(px(0x8000), px((2 << 16) + 0x4000))), "[{whole}.5, {}.25]", whole + 2);
+            // A point interval keys as its number, as `av_code` has it.
+            assert_eq!(pos_code(AV::Ival(px(whole << 16), px(whole << 16))), pos_code(AV::Num(px(0))));
+        }
+        assert_ne!(pos_code(AV::Num(px(0x4000))), pos_code(AV::Num(px(0))), "a fraction is the key's");
+        assert_ne!(pos_code(AV::Ival(px(0), px(1 << 16))), pos_code(AV::Ival(px(0), px(2 << 16))), "an interval's width is the key's");
+        assert_ne!(pos_code(AV::Num(px(0))), av_code(AV::Num(px(1 << 16))), "the code is not the value's");
     }
 
     /// `floor_player_window` is the cart's `floor.collide(player, 0, 0)` at
