@@ -6,7 +6,8 @@ and verify every result end to end.
 
 JOBS.json: a list of {"cat": "nodiag", "room": "0,0", "name": "100m",
 "offset": 27, "levels": "r0sxhn,r0sxh", "l1": true, "mem": "60G"} (optional:
-"env" for the search, e.g. {"CELESTE_TRIM_ROWS": "1"}; "tag"; "timeout"; "reuse": a level-0 tree to reuse;
+"env" for the search, e.g. {"CELESTE_TRIM_ROWS": "1"}; "tag"; "timeout"; "reuse": a level-0 tree directory, moved in when it exists and moved back
+there when the job ends - so jobs can count horizons up on one kept tree;
 "to": a horizon H instead of the reference - `--to H`, level -1 at H, and a
 refutation is a result (the optimum is above H); "keep_tree": leave the tree
 in OUTDIR for a later job's "reuse"; "witness": a file of our inputs to verify,
@@ -233,11 +234,11 @@ def run(job, outdir, binary):
         # PICO-8 (the tool is a reimplementation): its count is the reference.
         level = int(name.rstrip("m")) // 100 if name.endswith("m") else None
         ok, n, _, _ = uct(level, f"{DB}/classic/{cat}/{entry['file']}", cat) if level else (False, None, None, None)
-        if not ok:
+        if not ok and "to" not in job:
             return {**res, "status": "the community TAS does not exit in the original cart nor in UniversalClassicTas"}
         prologue = job["offset"]
-        ref = prologue + n
-        res["ref_source"] = "UniversalClassicTas only (does not finish on a real PICO-8)"
+        ref = prologue + n if ok else None
+        res["ref_source"] = "UniversalClassicTas only (does not finish on a real PICO-8)" if ok else "none: the community TAS finishes nowhere"
     res["ref"], res["prologue"] = ref, prologue
     prefer = os.path.join(jd, "prefer.txt")
     open(prefer, "w").write(",".join(map(str, [0] * prologue + dbin)))
@@ -254,9 +255,10 @@ def run(job, outdir, binary):
             env["CELESTE_LEVEL_MINUS_ONE"] = f"{steps},5"
         log = os.path.join(jd, "search.log")
         tree = os.path.join(jd, "tree")
-        shutil.rmtree(tree, ignore_errors=True)
-        # `reuse`: a finished level-0 tree of this room, level and horizon (a
-        # retry with a longer objects ladder), moved in so `search` reuses it.
+        release_tree()
+        # `reuse`: a level-0 tree of this room and level (a retry with a
+        # longer objects ladder, or another horizon: the search raises a tree
+        # filtered by level -1 below it), moved in so `search` reuses it.
         if job.get("reuse") and os.path.isdir(job["reuse"]):
             os.makedirs(tree)
             shutil.move(job["reuse"], os.path.join(tree, "level00"))
@@ -267,7 +269,16 @@ def run(job, outdir, binary):
         return rc, open(log, errors="replace").read(), time.time() - t
     horizon = job.get("to", ref)
     keep = job.get("keep_tree")
-    drop_tree = lambda: None if keep else shutil.rmtree(os.path.join(jd, "tree"), ignore_errors=True)
+
+    def release_tree():
+        """Delete the job's tree; its level 0 goes back to `reuse` (or there for the first time)."""
+        tree = os.path.join(jd, "tree")
+        back = job.get("reuse")
+        if back and os.path.isdir(os.path.join(tree, "level00")) and not os.path.exists(back):
+            shutil.move(os.path.join(tree, "level00"), back)
+        shutil.rmtree(tree, ignore_errors=True)
+
+    drop_tree = lambda: None if keep else release_tree()
     if job.get("witness"):
         ours = [int(x) for x in re.findall(r"\d+", "".join(l for l in open(job["witness"]) if not l.startswith("#")))]
         opt, res["witness_from"] = len(ours), job["witness"]
@@ -385,10 +396,10 @@ def run(job, outdir, binary):
                 st = re.search(r"(finished, clean save|DID NOT FINISH[^,]*)", out)
                 res["uct_ours"] = f"{'finished' if ok else (st.group(1) if st else 'NOT finished')} {n} inputs (information only)"
                 break
-    res["status"] = "IMPROVED" if opt < ref else ("tie" if opt == ref else "WORSE?")
+    res["status"] = "no reference" if ref is None else "IMPROVED" if opt < ref else ("tie" if opt == ref else "WORSE?")
     res["verified"] = (e == opt) and not res.get("diagonal_dashes") and res.get("berry", True) and bool(res.get("upload"))
     # 5. the UI
-    if opt < ref and not job.get("witness"):
+    if ref is not None and opt < ref and not job.get("witness"):
         try:
             paths = os.path.join(jd, "paths")
             # The paths start the room as the search and the replays do (its loading frame).
