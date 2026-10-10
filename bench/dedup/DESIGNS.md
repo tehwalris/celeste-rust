@@ -780,3 +780,59 @@ per-owner hash rebuilds) is the rest. Cheaper next: a tighter edge format
 (per-unit transfer dictionary, fixed-width lid / cell fields: ~4 B), an 8-B
 emission, and the translation against the owners' tables kept from the own
 pass instead of rebuilt.
+
+### N3. Tight edges, 8-B emissions, owner-list translation (`ghost2`; 2026-10-10, load 1.9-4.0)
+
+(2) Emission = u64: target key 32 | transfer 17 | overflow 1 | 14 (the
+target's cell in the source region's 16x16 window, or an index into the
+unit's side list of overflow owner cells). The SOURCE is not a per-emission
+field: a kernel call expands a few source rows (its lanes), so the source is
+the call's context; the harness carries it as per-unit runs (src local,
+count). In the capture's order runs are short (~1.2 emissions: bodies x
+lanes interleave), so the runs stream is 1.7 GB of the harness's 3.77 GB -
+an artifact; a kernel producing into the unit in cache would give the lane.
+
+(1) Edge bit stream per unit (gamma codes LSB-first): source - '1' the
+previous edge's, '01' + its slot in a 64-entry direct-mapped cache, '00' +
+24 raw bits; overflow flag; target lid as gamma(zigzag(lid - previous lid));
+then the (transfer, shift) COMBO through the set of combos this (source
+entry, target entry) pair used before (<= 4, a generation-cleared
+open-addressing pair table): hit = 3 bits, miss = the shift's two gammas +
+the transfer through a per-unit dictionary (adaptive fixed width; new = 17
+raw bits). Bits an edge: source 12.3, flag 1.0, target lid 1.8, transfer +
+shift 7.0 -> **2.76 B an edge + 0.25 B of unit tables (lid keys, overflow
+cells, transfer dictionary) = 3.0 B**, against N2's 7.2 and the target-side
+relation's 1.95. Tried and dropped: the source as a zigzag delta (30 bits),
+an MRU-16 of transfers (14.7), the target's last transfer (15.0); source
+MRU-16 9.9 bits but slower. The source bits are the harness's (split units
+by target hash scatter a source's emissions); a call's lane would cost ~4.
+
+(3) Translation: the own pass keeps each unit's own entries SORTED (the
+re-encode order); per owner (parallel) its requests are gathered and sorted,
+each binary-searched in the owner's part list (part = hash of the key);
+misses go to a ghost-new list. No per-owner hash rebuild: 0.055-0.062 s at
+16-32 threads (N2's first gather was serial: 0.24 s).
+
+Validated as before (first run of every configuration while developing):
+6,735,699 new (5,440,972 own + 1,294,727 via ghosts); every unit's bit stream
+decoded through its tables and the translation = the capture's 257,724,013
+edges (fingerprint fca41b0f1a28b51d); 6,108,841 translations, 0 wrong; id
+bijection over 43,841,605 states, 0 violations.
+
+Wall, 3 interleaved reps, 25k-emission units (own pass + translation):
+
+| threads | edges (3.0 B) | no edges | reading the 8-B stream + runs alone |
+|---|---|---|---|
+| 1 | 4.34-4.36 + 0.32 = 4.66-4.68 s (18.1 ns an edge) | 1.66-1.67 + 0.32 = 1.98-1.99 s | 0.099-0.106 s |
+| 8 | 0.578-0.581 + 0.077 = 0.655-0.659 | 0.212 + 0.073-0.076 = 0.285-0.288 | 0.083-0.087 |
+| 16 | 0.317-0.318 + 0.061-0.062 = **0.378-0.380** | 0.112 + 0.060-0.062 = 0.172-0.173 | 0.086-0.087 |
+| 32 | 0.271-0.272 + 0.059-0.060 = **0.330-0.333** | 0.104-0.105 + 0.055-0.058 = 0.159-0.162 | 0.087-0.089 |
+
+Harness artifacts: the stream read is 0.087 s at 16 threads (DRAM-bound;
+3.77 GB of which 1.7 GB are the runs). Without it (an in-cache producer):
+dedup ~0.025 s + translation 0.06 = ~0.085 s; with edges ~0.23 + 0.06 =
+~0.29 s. Edges at 16 threads cost 2.2x the dedup (0.378 against 0.172 s),
+3.4x without the stream: the tight coder is CPU (10.5 ns an edge single-
+threaded: the pair table probe, the transfer dictionary, the bit writes), not
+bandwidth. Next for speed: SIMD bit packing per 16-lane call, the pair set
+folded into the target entry for own targets.

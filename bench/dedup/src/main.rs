@@ -17,6 +17,7 @@ mod regionpar;
 mod edgecensus;
 mod regionedge;
 mod ghost;
+mod ghost2;
 
 const REC: usize = 48;
 const PAYLOAD: usize = 64;
@@ -94,6 +95,7 @@ fn main() {
         "edgecensus" => edgecensus::edgecensus(args.get(3).map_or(dir.as_str(), |s| s.as_str()), dir, &door, &maps),
         "edgepairs" => edgecensus::edgepairs(args.get(3).map_or(dir.as_str(), |s| s.as_str()), dir, &door, &maps),
         "edgeregions" => edgecensus::edgeregions(args.get(3).map_or(dir.as_str(), |s| s.as_str()), dir, &door, &maps, args.get(4).map_or(8, |s| s.parse().unwrap())),
+        "ghost2" => ghost2::ghost2(&args[3], dir, &door, &maps, &args[4..]),
         "ghost" => ghost::ghost(&args[3], dir, &door, &maps, &args[4..]),
         "regionedge" => regionedge::regionedge(&args[3], dir, &door, &maps, &args[4..]),
         "regionpar" => regionpar::regionpar(dir, door.len() / 40, &args[3..]),
