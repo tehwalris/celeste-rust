@@ -261,7 +261,7 @@ fn no_player_ranges(
     // The chain runs with the fly fruit EXACT (unknown, its `fly` and `y`
     // fork every frame into outcomes, and the chain needs one), and the
     // fruit's fields, unknown at a fruit level, bound nothing there.
-    let fruit = std::mem::replace(&mut it.d.fruit_unknown, false);
+    let fruit = std::mem::replace(&mut it.d.level.fruit, false);
     let chain_opts = crate::abstraction::Level { fruit: false, ..opts };
     let mut ended = false;
     let run = (|| -> Result<()> {
@@ -303,7 +303,7 @@ fn no_player_ranges(
         }
         Ok(())
     })();
-    it.d.fruit_unknown = fruit;
+    it.d.level.fruit = fruit;
     run?;
     if !ended {
         return Ok(NoPlayer::default());
@@ -406,10 +406,7 @@ pub fn room_constant_lattice(
     it.cache = Some(cache.clone());
     it.cart = Some(cart_data.clone());
     // The level's widenings, for every frame this walk traces.
-    it.d.held_unknown = opts.held;
-    it.d.fruit_unknown = opts.fruit;
-    it.d.floors_near = opts.floors_near;
-    it.d.platforms_unknown = opts.platforms;
+    it.d.level = opts;
     if opts.platforms {
         it.d.worlds = Some(std::sync::Arc::new(crate::concrete::platform_worlds(PLATFORM_WORLD_FRAMES)?));
     }
@@ -715,27 +712,11 @@ pub fn room_constant_lattice(
     Ok(LatticeWalk { lattice, reps, forks, frames, graph, cart: cart_data, cache, forkops, tracer: Tracer { it, reset, fr }, by_hash, opts, start_key, ival_extra, start_ivals })
 }
 
-/// The interval inputs the BOUNDARY widens (`rem`, the level's widened
-/// objects); `rnd`-derived ones come on top (`with_extra`).
+/// The interval inputs the level's widenings make (`widen::interval_input`:
+/// `rem`, the level's widened objects); `rnd`-derived ones come on top
+/// (`with_extra`).
 fn boundary_ival(st: &super::state::State<super::domain::Symbolic>, opts: crate::abstraction::Level) -> Vec<super::iface::Path> {
-    let mut ival = super::shapes::ival_paths(st);
-    // The moving platforms' `x`, `last` and `rem.x` at a platforms-unknown
-    // level. The body reads `rem.x` only to check that the literal standing
-    // for it covers the lane (`widen::platform_inputs`).
-    if opts.platforms {
-        ival.extend(super::widen::platform_paths(st).all().cloned());
-    }
-    // The fly fruit's `spd.y`/`rem.y`, likewise (`widen::fork_fruit_inputs`).
-    if opts.fruit {
-        ival.extend(super::widen::fly_fruit_paths(st).ranges.into_iter().map(|(p, _)| p));
-    }
-    // Near level: floors and object phases (countdowns are the unknown
-    // number instead, `widen::forget_countdown_inputs`).
-    if opts.floors_near {
-        ival.extend(super::widen::near_floor_paths(st).all().cloned());
-        ival.extend(super::widen::phase_paths(st).into_iter().filter(|(_, r)| !matches!(r, super::widen::PhaseRange::Countdown)).map(|(p, _)| p));
-    }
-    ival
+    super::widen::slots_where(st, opts, super::widen::interval_input)
 }
 
 /// `ival` plus a shape's discovered interval slots, each once.
@@ -860,10 +841,9 @@ fn walk_trace(
         // An interval beyond the boundary's widenings came from `rnd`.
         let mut ival = Vec::new();
         {
-            let widened = boundary_ival(&o.st, opts);
-            let fruit = shapes::level_widened_paths(&o.st, &opts);
+            let widened = super::widen::slots_where(&o.st, opts, |s| super::widen::interval_input(s) || super::widen::stores_widened(s));
             for p in shapes::state_paths(&o.st)? {
-                if widened.contains(&p) || fruit.contains(&p) {
+                if widened.contains(&p) {
                     continue;
                 }
                 if let Some(super::heap::Value::Num(n)) = super::iface::get(&o.st, &p) {

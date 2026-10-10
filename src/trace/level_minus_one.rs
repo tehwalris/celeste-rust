@@ -402,19 +402,19 @@ impl<'a> Table<'a> {
         let pin_list: Vec<(Path, Conc)> = pins.iter().map(|(p, c)| (p.clone(), *c)).collect();
         let bound_list: Vec<(Path, (i32, i32))> = bounds.iter().map(|(p, r)| (p.clone(), (r.0 as i32, r.1 as i32))).collect();
         // Held trails are unknown booleans, not forks.
-        tr.it.d.held_unknown = false;
+        tr.it.d.level.held = false;
         // Move-fork arity from the ranges' full width; restored below.
         tr.it.d.uncapped_ways = true;
         // Undecided selects stay selects (joined here, no extra configurations).
         tr.it.d.no_known_forks = true;
-        // A fly fruit as the `f` level stores it (`widen::fork_fruit_inputs`):
+        // A fly fruit as the `f` level stores it (the table's "fly fruit"):
         // `step`/`y` unknown, `spd.y`/`rem.y` their literal ranges, `fly`
         // unknown. Exact, its flight's speed grows past every inductive range
         // and its `move` fork past any arity. Only the player is measured, so
         // a forgotten fruit only weakens d. The spawn prefix (no player) stays
         // exact: it is one concrete chain.
-        let fruit_before = tr.it.d.fruit_unknown;
-        tr.it.d.fruit_unknown = player.is_some() && !super::widen::objects_of_type(&st, "fly_fruit").is_empty();
+        let fruit_before = tr.it.d.level.fruit;
+        tr.it.d.level.fruit = player.is_some() && !super::widen::objects_of_type(&st, "fly_fruit").is_empty();
         let f = super::verify::trace_frame(
             &mut tr.it,
             tr.reset,
@@ -429,7 +429,7 @@ impl<'a> Table<'a> {
         .map_err(|e| anyhow!("level -1 trace of shape {id}: {e:#}"));
         tr.it.d.uncapped_ways = false;
         tr.it.d.no_known_forks = false;
-        tr.it.d.fruit_unknown = fruit_before;
+        tr.it.d.level.fruit = fruit_before;
         let f = f?;
         let t_trace = t0.elapsed();
         let n_slots = f.iface.slots.len();

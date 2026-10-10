@@ -222,7 +222,7 @@ pub trait Domain {
     }
 
     /// The next comparisons read a COUNTDOWN (the interpreter's hint, from
-    /// the field read: `COUNTDOWN_FIELDS`): an unknown number there mints a
+    /// the field read: `widen::countdown_fields`): an unknown number there mints a
     /// countdown atom (`Symbolic::countdown_atom`) also with the fly fruit
     /// unknown, where an unknown number may be the fruit's.
     fn set_countdown_hint(&mut self, _on: bool) {}
@@ -361,11 +361,6 @@ impl Domain for Concrete {
 
 // ---------------------------------------------------------------- symbolic
 
-/// The fields the cart counts down and compares with 0, a near level's
-/// unknown numbers (`widen::floor_timer_paths`, `widen::phase_paths`): a
-/// comparison reading one is a countdown's (`Domain::set_countdown_hint`).
-pub const COUNTDOWN_FIELDS: [&str; 4] = ["delay", "timer", "hide_in", "hide_for"];
-
 /// The tracing domain. Owns the graph it is building.
 #[derive(Default, Clone)]
 pub struct Symbolic {
@@ -375,16 +370,10 @@ pub struct Symbolic {
     /// `flr_ways` takes a static range's full width (level -1, whose speed
     /// is a range at every node).
     pub uncapped_ways: bool,
-    /// Held buttons unknown (`Level::held`).
-    pub held_unknown: bool,
-    /// The fly fruit unknown (`Level::fruit`): inputs replaced, literal
-    /// arithmetic folds, undecidable merges join literal arms.
-    pub fruit_unknown: bool,
-    /// Fall floors widened except where the player overlaps one
-    /// (`Level::floors_near`, `widen::widen_near_floors`).
-    pub floors_near: bool,
-    /// Moving platforms unknown (`Level::platforms`).
-    pub platforms_unknown: bool,
+    /// The level traced (`widening::TABLE`'s entries it applies, in and
+    /// out). With the fly fruit unknown, literal arithmetic folds and
+    /// undecidable merges join literal arms.
+    pub level: celeste_engine::widening::Level,
     /// How many `Op::UnknownBool` atoms this frame handed out.
     pub unknown_atoms: u32,
     /// `Domain::set_countdown_hint`.
@@ -623,7 +612,7 @@ impl Symbolic {
     /// Is anything unknown in the traced set (fly fruit, platforms)? Enables
     /// literal folding, independent joins and literal splits.
     pub fn unknowns(&self) -> bool {
-        self.fruit_unknown || self.platforms_unknown
+        self.level.fruit || self.level.platforms
     }
 
     /// `n` as `base + literal` (either side), else `n + 0`.
@@ -1060,7 +1049,7 @@ impl Domain for Symbolic {
         }
         // With an unknown number nothing is decided.
         if self.is_unknown_num(*a) || self.is_unknown_num(*b) {
-            return Ok(if self.countdown_hint || !self.fruit_unknown { self.countdown_atom() } else { self.unknown_bool_atom() });
+            return Ok(if self.countdown_hint || !self.level.fruit { self.countdown_atom() } else { self.unknown_bool_atom() });
         }
         if let Some((c, t, f)) = self.unknown_select(*a) {
             let (x, y) = (self.compare(op, &t, b)?, self.compare(op, &f, b)?);
@@ -1582,7 +1571,7 @@ mod tests {
         let one = 1 << 16;
         for fruit_unknown in [false, true] {
             let answers = |lo: i32, hi: i32| {
-                let mut d = Symbolic { fruit_unknown, ..Default::default() };
+                let mut d = Symbolic { level: celeste_engine::widening::Level { fruit: fruit_unknown, ..Default::default() }, ..Default::default() };
                 let x = d.graph.leaf(Op::Const(lo, hi));
                 let k = d.graph.leaf(Op::Const(one, one));
                 let eq = d.graph.fold(Op::Eq, vec![x, k]);
@@ -1599,7 +1588,7 @@ mod tests {
             assert_eq!(answers(0, 0), (Some(false), Some(true)), "[0, 0] only unequal");
         }
         // An operand reading an unknown: no ends to read, both ways.
-        let mut d = Symbolic { fruit_unknown: true, ..Default::default() };
+        let mut d = Symbolic { level: celeste_engine::widening::Level { fruit: true, ..Default::default() }, ..Default::default() };
         let u = d.unknown_bool_atom();
         let (a, b) = (d.graph.leaf(Op::Const(0, 2 * one)), d.graph.leaf(Op::Const(one, one)));
         let x = d.graph.fold(Op::Sel, vec![u, a, b]);

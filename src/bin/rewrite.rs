@@ -1864,7 +1864,8 @@ fn main() -> Result<()> {
             println!("distinct transfer sets {}, x sets {}, y sets {} (the tree's table: {} pairs)", sets.len(), xsets.len(), ysets.len(), pairs.len());
         }
         Command::BoundsAudit { level_dir, room } => {
-            use celeste_engine::runtime2::{Col, AV, FLY_FRUIT_REM_Y, FLY_FRUIT_SPD_Y, PLATFORM_PATH, PLATFORM_REM};
+            use celeste_engine::runtime2::{Col, AV};
+            use celeste_engine::widening::{FLY_FRUIT_SPD_Y, PLATFORM_PATH, REM as PLATFORM_REM, REM as FLY_FRUIT_REM_Y};
             if let Some(room) = &room {
                 std::env::set_var("CELESTE_START_ROOM", room);
             }

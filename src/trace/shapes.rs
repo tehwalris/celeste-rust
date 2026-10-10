@@ -216,56 +216,13 @@ pub fn room_of(st: &State<Symbolic>, d: &Symbolic) -> (i16, i16) {
     (at("x"), at("y"))
 }
 
-/// The scalar fields the BOUNDARY (or the level) widens, so never
-/// compile-time constants whatever a trace computes: the player's `rem`,
-/// a live fruit's `off`/`y`, the level's object fields, the held trails.
-/// The lattice must not bake these, or a widened block will not bind.
+/// The scalar fields the level's widenings store as something other than
+/// one value per state (`widen::stores_widened`: the player's `rem`, a live
+/// fruit's `off`/`y`, the level's object fields, the held trails), so never
+/// compile-time constants whatever a trace computes. The lattice must not
+/// bake these, or a widened block will not bind.
 pub fn boundary_widened_paths(st: &State<Symbolic>, opts: &crate::abstraction::Level) -> std::collections::BTreeSet<Path> {
-    let mut out: std::collections::BTreeSet<Path> = ival_paths(st).into_iter().collect();
-    // The fields a level widens beyond the boundary's own.
-    out.extend(level_widened_paths(st, opts));
-    // Held buttons unknown: the boundary writes the trails unknown.
-    if opts.held {
-        if let Some(pl) = player_path(st) {
-            for f in ["p_jump", "p_dash"] {
-                let mut p = pl.clone();
-                p.push(iface::key(f));
-                out.insert(p);
-            }
-        }
-    }
-    let Some(Value::Table(fruit)) = iface::get(st, &[iface::key("fruit")]) else { return out };
-    let Some(Value::Table(objects)) = iface::get(st, &[iface::key("objects")]) else { return out };
-    let n = st.heap.tables[&objects].arr.len();
-    for i in 0..n {
-        let base = vec![iface::key("objects"), Step::Idx(i)];
-        let mut ty = base.clone(); ty.push(iface::key("type"));
-        if iface::get(st, &ty) != Some(Value::Table(fruit)) { continue; }
-        for f in ["off", "y"] {
-            let mut p = base.clone(); p.push(iface::key(f));
-            if iface::get(st, &p).is_some() { out.insert(p); }
-        }
-    }
-    out
-}
-
-/// The object fields a level widens (the moving platforms, the fly fruit,
-/// the fall floors, at the levels that widen them): never compile-time
-/// constants, whatever a trace computes.
-pub fn level_widened_paths(st: &State<Symbolic>, opts: &crate::abstraction::Level) -> Vec<Path> {
-    let mut out = Vec::new();
-    if opts.platforms {
-        out.extend(super::widen::platform_paths(st).all().cloned());
-    }
-    if opts.fruit {
-        out.extend(super::widen::fly_fruit_paths(st).all().cloned());
-    }
-    if opts.floors_near {
-        out.extend(super::widen::floor_timer_paths(st));
-        out.extend(super::widen::near_floor_paths(st).all().cloned());
-        out.extend(super::widen::phase_paths(st).into_iter().map(|(p, _)| p));
-    }
-    out
+    super::widen::slots_where(st, *opts, super::widen::stores_widened).into_iter().collect()
 }
 
 /// The scalar fields of `st` that are compile-time constants (exact
@@ -313,48 +270,11 @@ pub fn player_path(st: &State<Symbolic>) -> Option<Path> {
         })
 }
 
-/// The slots the boundary WIDENS to an interval: the player's
-/// `rem.x` and `rem.y` (and a live fruit's `off`/`y`).
-///
-/// Found by `type` (as `Rt2::mark_walk` does), not by index: which object
-/// is the player changes within a room.
+/// The slots every level's widenings make INTERVAL inputs
+/// (`widen::interval_input` of the `Flag::Always` entries: the player's
+/// `rem.x` and `rem.y`, a live fruit's `y`/`off`), so a kernel expecting
+/// `num` binds. Found by `type`, not by index: which object is the player
+/// changes within a room.
 pub fn ival_paths(st: &State<Symbolic>) -> Vec<Path> {
-    let Some(Value::Table(player)) = iface::get(st, &[iface::key("player")]) else {
-        return Vec::new();
-    };
-    let Some(Value::Table(objects)) = iface::get(st, &[iface::key("objects")]) else {
-        return Vec::new();
-    };
-    let n = st.heap.tables[&objects].arr.len();
-    let mut out = Vec::new();
-    for i in 0..n {
-        let base = vec![iface::key("objects"), Step::Idx(i)];
-        let mut ty = base.clone();
-        ty.push(iface::key("type"));
-        if iface::get(st, &ty) != Some(Value::Table(player)) {
-            continue;
-        }
-        for f in ["x", "y"] {
-            let mut p = base.clone();
-            p.push(iface::key("rem"));
-            p.push(iface::key(f));
-            if iface::get(st, &p).is_some() {
-                out.push(p);
-            }
-        }
-    }
-    // A live fruit's `off` and `y` are widened by the boundary, so they
-    // must be ival INPUTS or a kernel expecting `num` will not bind.
-    if let Some(Value::Table(fruit)) = iface::get(st, &[iface::key("fruit")]) {
-        for i in 0..n {
-            let base = vec![iface::key("objects"), Step::Idx(i)];
-            let mut ty = base.clone(); ty.push(iface::key("type"));
-            if iface::get(st, &ty) != Some(Value::Table(fruit)) { continue; }
-            for f in ["off", "y"] {
-                let mut p = base.clone(); p.push(iface::key(f));
-                if iface::get(st, &p).is_some() { out.push(p); }
-            }
-        }
-    }
-    out
+    super::widen::slots_where(st, crate::abstraction::Level::EXACT, super::widen::interval_input)
 }

@@ -2098,7 +2098,7 @@ mod tests {
             crate::compiled::dispatch::run_chunk_kernel(r, &cells, &[0], &mut sink)
         };
         let px = |n: i16| P8::from_i16(n);
-        let (path_lo, path_hi) = (px(celeste_engine::runtime2::PLATFORM_PATH.0), px(celeste_engine::runtime2::PLATFORM_PATH.1));
+        let (path_lo, path_hi) = (px(celeste_engine::widening::PLATFORM_PATH.0), px(celeste_engine::widening::PLATFORM_PATH.1));
         let half = P8::from_parts(0, 0x8000);
         let Col::U(AV::Num(speed)) = row.cols[spd] else { panic!("the platform's spd.x is not a number") };
         assert!(runs(&row), "the lane as played runs");

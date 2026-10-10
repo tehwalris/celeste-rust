@@ -995,11 +995,11 @@ impl<'a, D: Domain> Interp<'a, D> {
             return Ok(out);
         }
         let mut out = Vec::new();
-        // An operand that reads a countdown field (`domain::COUNTDOWN_FIELDS`)
+        // An operand that reads a countdown field (`widen::countdown_fields`)
         // as `<name>.<field>`.
         let countdown = |e: &ast::Expression| match e {
             ast::Expression::Var(v) => target_hint(v).is_some_and(|t| {
-                t.rsplit_once('.').is_some_and(|(_, f)| crate::trace::domain::COUNTDOWN_FIELDS.contains(&f))
+                t.rsplit_once('.').is_some_and(|(_, f)| crate::trace::widen::countdown_fields().contains(&f))
             }),
             _ => false,
         };
@@ -1139,8 +1139,8 @@ impl<'a, D: Domain> Interp<'a, D> {
             Value::Str(s) => {
                 // `cart::check_absent_fields` sees only `.field`, so refuse a
                 // computed key naming an absent-as-zero field here.
-                if let Some((_, f)) = crate::trace::widen::ABSENT_AS_ZERO.iter().find(|(_, f)| s.to_string() == **f) {
-                    bail!("`[\"{f}\"]` indexes an absent-as-zero field (widen::ABSENT_AS_ZERO) outside what cart::check_absent_fields checks");
+                if let Some((_, f)) = celeste_engine::widening::absent_as_zero().find(|(_, f)| s.to_string() == *f) {
+                    bail!("`[\"{f}\"]` indexes an absent-as-zero field (`Stored::AbsentAsZero`) outside what cart::check_absent_fields checks");
                 }
                 Key::Field(s.to_string())
             }
@@ -2084,7 +2084,7 @@ mod tests {
             "#,
         );
         let mut d = Symbolic::default();
-        d.fruit_unknown = true;
+        d.level.fruit = true;
         // The literal [-4, 1): the fruit's `rem.y + spd.y`.
         let input = d.graph.leaf(Op::Const(-4 << 16, (1 << 16) - 1));
         let mut it = Interp::new(d);
@@ -2113,7 +2113,7 @@ mod tests {
     fn a_literal_split_past_max_ways_is_refused() {
         let ast = parse("result = __split_by_flr(input)");
         let mut d = Symbolic::default();
-        d.fruit_unknown = true;
+        d.level.fruit = true;
         let input = d.graph.leaf(Op::Const(0, (300 << 16) - 1));
         let mut it = Interp::new(d);
         let mut st = fresh::<Symbolic>(&mut it.d);

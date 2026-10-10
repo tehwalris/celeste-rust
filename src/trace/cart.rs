@@ -241,7 +241,7 @@ fn forbid_straight_dashes(game: &str) -> Result<String> {
     Ok(game)
 }
 
-/// Refuse a program that could tell an `ABSENT_AS_ZERO` field's missing
+/// Refuse a program that could tell an absent-as-zero field's missing
 /// value (nil) from the 0 every frame writes there
 /// (`widen::materialize_absent_fields`). Every `.field` must be an assignment
 /// target or a DIRECT operand of arithmetic or an ordering comparison: on nil
@@ -305,12 +305,12 @@ pub fn check_absent_fields(ast: &full_moon::ast::Ast) -> Result<()> {
             }
         }
     }
-    for (_, field) in super::widen::ABSENT_AS_ZERO {
+    for (_, field) in celeste_engine::widening::absent_as_zero() {
         let mut c = Count { field, all: 0, safe: 0 };
         c.visit_ast(ast);
         anyhow::ensure!(
             c.all == c.safe,
-            "`.{field}` is absent-as-zero (widen::ABSENT_AS_ZERO), but {} of its {} uses could tell nil from 0 (not an assignment target, arithmetic or an ordering comparison)",
+            "`.{field}` is absent-as-zero (`Stored::AbsentAsZero`), but {} of its {} uses could tell nil from 0 (not an assignment target, arithmetic or an ordering comparison)",
             c.all - c.safe,
             c.all
         );

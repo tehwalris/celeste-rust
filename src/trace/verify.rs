@@ -77,11 +77,6 @@ impl Clone for FrameOut {
 
 pub struct Frame {
     pub iface: Iface,
-    /// Traced with held buttons unknown: every outcome writes `p_jump` /
-    /// `p_dash` unknown.
-    pub held_unknown: bool,
-    /// Traced with the fly fruit unknown: every outcome writes `fly` unknown.
-    pub fruit_unknown: bool,
     /// What each both-values fork was minted for, for the kernel dump.
     pub fork_origins: Vec<(u8, String)>,
     /// How many FORK choices this frame made; the emitter enumerates them.
@@ -129,7 +124,7 @@ fn out_fields(
     let mut ubool = Vec::new();
     // A near level's floor `state`s are an interval column in every outcome
     // (the column type is per shape).
-    let ival_always: Vec<Path> = if d.floors_near { super::widen::near_floor_paths(st).state } else { Vec::new() };
+    let ival_always: Vec<Path> = super::widen::near_floor_states(st, d.level);
     for p in iface::scalars(st, &[])? {
         if p.first() == Some(&iface::key("__button_states")) {
             ubool.push(p);
@@ -234,34 +229,13 @@ pub fn trace_frame<'a>(
     let in_rt2 = super::bind::structure_of(&st, cart.clone(), cache.clone())?;
     let in_cells = super::bind::bind_inputs(&in_rt2, &iface)?;
     let mut st = st;
-    // Held trails forked both ways, after the input shape, before any read.
-    if it.d.held_unknown {
-        super::widen::fork_held_inputs(&mut st, &mut it.d)?;
-    }
-    // The fly fruit's widened fields replaced before any read.
-    if it.d.fruit_unknown {
-        for ob in super::widen::fork_fruit_inputs(&mut st, &mut it.d)? {
-            admissible = it.d.graph.fold(crate::transpile::graph::Op::And, vec![admissible, ob]);
-        }
-    }
-    // Near floors: `collideable` derived from `state`, except mid split frame
-    // (read as stored, an unknown one forked).
-    if it.d.floors_near {
-        if super::widen::mid_frame(&st) {
-            super::widen::fork_unknown_near_collideables(&mut st, &mut it.d)?;
-        } else {
-            super::widen::fork_near_floor_inputs(&mut st, &mut it.d)?;
-        }
-    }
-    // Near-level countdowns: the unknown number. After the near floors,
-    // which materialize the absent fields.
-    super::widen::forget_countdown_inputs(&mut st, &mut it.d)?;
-    // Platform input cells, decided per world by the split pass.
-    it.d.platform_cells.clear();
-    if it.d.platforms_unknown {
-        for ob in super::widen::platform_inputs(&mut st, &mut it.d)? {
-            admissible = it.d.graph.fold(crate::transpile::graph::Op::And, vec![admissible, ob]);
-        }
+    // The level's widened slots read as the table says (held trails forked
+    // both ways, the fly fruit's replaced, near floors' `collideable`
+    // derived, countdowns unknown, platform cells decided per world by the
+    // split pass), after the input shape, before any read. What they owe
+    // per lane is an error of the whole frame.
+    for ob in super::widen::read_inputs(&mut st, &mut it.d)? {
+        admissible = it.d.graph.fold(crate::transpile::graph::Op::And, vec![admissible, ob]);
     }
     // The arc capture is per FRAME; drop a representative's old one.
     st.arc = if it.arc_capture {
@@ -340,7 +314,7 @@ pub fn trace_frame<'a>(
     }
     // Split selects on conditions a lane can hold undecided, until none is.
     if !it.d.no_known_forks {
-        let points = if it.d.platforms_unknown { Some(Points::new(&it.d, position)?) } else { None };
+        let points = if it.d.level.platforms { Some(Points::new(&it.d, position)?) } else { None };
         let room = crate::transpile::graph::Room { cart: cart.clone(), cache: cache.clone() };
         outs = split_undecided_selects(&mut it.d, outs, points, Some(&room))?;
         // The conditions operators were EVALUATED under are read by the error
@@ -399,7 +373,7 @@ pub fn trace_frame<'a>(
         }
         r
     };
-    Ok(Frame { iface, held_unknown: it.d.held_unknown, fruit_unknown: it.d.fruit_unknown, fork_origins: it.d.fork_origins.clone(), forks: it.d.forks, fork_ways, outs, raise, in_cells, in_rt2 })
+    Ok(Frame { iface, fork_origins: it.d.fork_origins.clone(), forks: it.d.forks, fork_ways, outs, raise, in_cells, in_rt2 })
 }
 
 /// An outcome's row as `Waiting` indexes it: its shape class and its fields.

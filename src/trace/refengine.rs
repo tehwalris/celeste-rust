@@ -208,16 +208,21 @@ impl RefEngine {
 /// `pinning_the_fly_fruits_motion_keeps_the_projected_successors` checks the
 /// sets agree.
 fn pin_fly_fruit_motion(st: &mut State<RefDomain>) -> Result<()> {
-    let fp = crate::trace::widen::fly_fruit_paths(st);
-    for p in &fp.unknown {
-        ensure!(
-            matches!(iface::get(st, p), Some(Value::Num(v)) if v.low == P8::from_raw(i32::MIN) && v.high == P8::from_raw(i32::MAX)),
-            "pinning the fly fruit's motion: {} is not the unknown number",
-            iface::show(p)
-        );
-    }
-    for (p, _) in &fp.ranges {
-        iface::set(st, p, Value::Num(Iv::from_number(P8::from_i16(0))))?;
+    use celeste_engine::widening::{Flag, Stored, TABLE};
+    for e in TABLE.iter().filter(|e| e.flag == Flag::Fruit) {
+        for paths in crate::trace::widen::entry_paths(st, e) {
+            for (s, p) in e.slots.iter().zip(&paths) {
+                match s.stored {
+                    Stored::UnknownNum => ensure!(
+                        matches!(iface::get(st, p), Some(Value::Num(v)) if v.low == P8::from_raw(i32::MIN) && v.high == P8::from_raw(i32::MAX)),
+                        "pinning the fly fruit's motion: {} is not the unknown number",
+                        iface::show(p)
+                    ),
+                    Stored::Range { .. } => iface::set(st, p, Value::Num(Iv::from_number(P8::from_i16(0))))?,
+                    _ => {}
+                }
+            }
+        }
     }
     Ok(())
 }

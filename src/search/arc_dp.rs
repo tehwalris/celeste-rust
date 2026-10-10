@@ -1087,7 +1087,8 @@ pub(super) fn exact_state(b: &crate::frame::Block, cell: u32) -> celeste_engine:
 /// interval phase every frame); the view maps them there, so its key is the
 /// node that over-approximates the state.
 pub(super) fn lookup_view(row: &celeste_engine::runtime2::Rt2, seeded: bool) -> anyhow::Result<celeste_engine::runtime2::Rt2> {
-    use celeste_engine::runtime2::{Col, AV, BALLOON_BOB_RAW, BALLOON_PERIOD_RAW};
+    use celeste_engine::runtime2::{Col, AV};
+    use celeste_engine::widening::{BALLOON_BOB_RAW, BALLOON_PERIOD_RAW};
     use crate::pico8_num::Pico8Num as P8;
     let mut rt2 = row.clone_block();
     if !seeded {

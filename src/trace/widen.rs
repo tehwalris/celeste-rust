@@ -1,34 +1,30 @@
-//! The boundary's widenings, applied INSIDE the traced frame so the graph
-//! computes the row it stores (canonical rows; a kernel dedups its own
-//! output). Each widening CHECKS that the replaced value lies inside what it
-//! writes (`SlotErrors`), so a violating lane declines loudly. `Rt2::widen_to`
-//! must store what these output widenings store.
+//! The WIDENING TABLE (`celeste_engine::widening::TABLE`) in the traced
+//! graph: at the frame's end every entry of the tracer's level becomes graph
+//! ops writing what the entry stores, with the containment it owes as the
+//! widening's own per-lane error (`SlotErrors`); at the frame's start
+//! (`read_inputs`) every entry's slots are read as its `Input` says. The
+//! block side (`Rt2::widen_to`) interprets the same table; nothing here may
+//! widen what the table does not name. The two hooks (`Hook::NearFloor`,
+//! `Hook::PlatformInputs`) are implemented below.
 
 use anyhow::{bail, Result};
 
 use celeste_core::pico8_num::Pico8Num as P8;
+use celeste_engine::widening::{floor_player_window, Entry, Flag, Hook, Input, Level, Proof, Slot, Stored, Target, FLOOR_HITBOX, PLATFORM_PATH, PLAYER_HITBOX, REM, TABLE};
 
 use super::domain::{Domain, Symbolic};
 use super::heap::Value;
 use super::iface::{self, Path, Step};
 use super::state::State;
-use crate::transpile::graph::Op;
+use crate::transpile::graph::{NodeId, Op};
 
-/// THE ABSENT NUMBER FIELDS: `(type global, field)` that `init` leaves unset
-/// and a later update adds as a number (else "which floors have broken" is
-/// heap SHAPE). Every outcome writes the missing field as 0. Sound because
-/// the cart cannot tell nil from 0 here: `cart::check_absent_fields` refuses
-/// any read but arithmetic or ordering (which halt PICO-8 on nil), and
-/// `Interp::index_key` refuses a computed `t[k]` naming it.
-// TODO(Philippe): writing the missing field as 0 is a hack; revisit.
-pub const ABSENT_AS_ZERO: &[(&str, &str)] = &[("fall_floor", "delay"), ("spring", "delay")];
-
-/// Write every `ABSENT_AS_ZERO` field an object lacks as the number 0.
+/// Write every `Stored::AbsentAsZero` field an object lacks as the number 0
+/// (every frame's outcome, widened or not: it is heap shape).
 pub fn materialize_absent_fields<D: Domain>(st: &mut State<D>, d: &mut D) -> Result<()> {
-    for (ty, f) in ABSENT_AS_ZERO {
+    for (ty, f) in celeste_engine::widening::absent_as_zero() {
         for obj in objects_of_type(st, ty) {
             let Some(Value::Table(t)) = iface::get(st, &obj) else { bail!("{}: not a table", iface::show(&obj)) };
-            match st.heap.tables[&t].hash.get(*f) {
+            match st.heap.tables[&t].hash.get(f) {
                 None | Some(Value::Nil) => {
                     let zero = Value::Num(d.num(P8::from_raw(0)));
                     st.heap.tables.get_mut(&t).unwrap().hash.insert(f.to_string(), zero);
@@ -71,9 +67,66 @@ pub(crate) fn field(base: &Path, names: &[&str]) -> Path {
     p
 }
 
-/// A constant interval `[lo, hi]` as one graph node (`Op::Const(lo, hi)`).
-fn ival(d: &mut Symbolic, lo: P8, hi: P8) -> <Symbolic as Domain>::Num {
-    d.graph.leaf(Op::Const(lo.as_raw_u32() as i32, hi.as_raw_u32() as i32))
+/// Entry `e`'s slots in `st`: per instance (one for `Target::Globals`), the
+/// path of each slot, in the entry's slot order.
+pub fn entry_paths<D: Domain>(st: &State<D>, e: &Entry) -> Vec<Vec<Path>> {
+    let bases = match e.target {
+        Target::Objects(ty) => objects_of_type(st, ty),
+        Target::Globals => vec![Vec::new()],
+    };
+    bases.iter().map(|b| e.slots.iter().map(|s| field(b, s.field)).collect()).collect()
+}
+
+/// The slots of `st` that `level`'s entries name and `pred` picks (present
+/// ones; an optional slot may be absent), entry by entry.
+pub fn slots_where<D: Domain>(st: &State<D>, level: Level, pred: impl Fn(&Slot) -> bool) -> Vec<Path> {
+    let mut out = Vec::new();
+    for e in level.entries() {
+        for paths in entry_paths(st, e) {
+            for (s, p) in e.slots.iter().zip(paths) {
+                if pred(s) && iface::get(st, &p).is_some() {
+                    out.push(p);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Does a slot store something other than one value per state (so it is
+/// never a compile-time constant of a shape, whatever a trace computes)?
+pub fn stores_widened(s: &Slot) -> bool {
+    !matches!(s.stored, Stored::Num(_) | Stored::Bool(_) | Stored::AtLeast(_) | Stored::FullPeriod(_) | Stored::AbsentAsZero)
+}
+
+/// Is a slot an INTERVAL input cell (a number slot holding an interval, a
+/// boolean slot a lane may hold unknown), read as stored?
+pub fn interval_input(s: &Slot) -> bool {
+    matches!(s.input, Input::Stored | Input::Literal | Input::Hook)
+        && matches!(s.stored, Stored::Range { .. } | Stored::Band { .. } | Stored::Phase { .. } | Stored::UnknownBool | Stored::SameAs(_))
+}
+
+/// The countdown FIELD NAMES a near level stores as the unknown number (the
+/// interpreter's hint, `Domain::set_countdown_hint`).
+pub fn countdown_fields() -> &'static [&'static str] {
+    static F: std::sync::OnceLock<Vec<&'static str>> = std::sync::OnceLock::new();
+    F.get_or_init(|| {
+        let mut out: Vec<&'static str> = TABLE
+            .iter()
+            .filter(|e| e.flag == Flag::Near)
+            .flat_map(|e| e.slots.iter())
+            .filter(|s| s.stored == Stored::UnknownNum)
+            .map(|s| *s.field.last().expect("a field"))
+            .collect();
+        out.sort_unstable();
+        out.dedup();
+        out
+    })
+}
+
+/// A constant interval `[lo, hi]` (raw) as one graph node.
+fn ival(d: &mut Symbolic, lo: i32, hi: i32) -> NodeId {
+    d.graph.leaf(Op::Const(lo, hi))
 }
 
 /// What the output widenings OWE: per widened slot, the condition that the
@@ -86,92 +139,240 @@ fn owe(errs: &mut SlotErrors, d: &mut Symbolic, p: &Path, holds: <Symbolic as Do
     errs.push((p.clone(), e));
 }
 
-
-
 /// A state between the two steps of a split frame (`__phase` holds a table).
 pub fn mid_frame<D: Domain>(st: &State<D>) -> bool {
     st.heap.tables[&st.globals].hash.contains_key("__phase")
 }
 
-/// Apply the boundary widenings to `st`: the remainder, the always-on pins
-/// and clamps, and the objects as the level's flags say.
+/// Apply the tracer's level's entries (`TABLE`, in order) to `st` at the
+/// frame's end: each slot written as its entry stores it, the containment
+/// it owes returned per slot. `AbsentAsZero` is `materialize_absent_fields`'.
 pub fn widen(st: &mut State<Symbolic>, d: &mut Symbolic) -> Result<SlotErrors> {
     let mut errs = SlotErrors::new();
-    widen_rem(st, d, &mut errs)?;
-    widen_dash(st, d)?;
-    widen_fruit(st, d, &mut errs)?;
-    widen_timers(st, d)?;
-    widen_fly_fruit(st, d, &mut errs)?;
-    widen_floor_timers(st, d)?;
-    widen_near_floors(st, d, &mut errs, mid_frame(st))?;
-    widen_platforms(st, d, &mut errs)?;
-    canon_balloon_offset(st, d, &mut errs)?;
-    widen_held(st, d)?;
+    let mid = mid_frame(st);
+    for e in d.level.entries() {
+        match e.hook {
+            Some(Hook::NearFloor) => widen_near_floors(st, d, e, &mut errs, mid)?,
+            _ => widen_entry(st, d, e, &mut errs)?,
+        }
+    }
     Ok(errs)
 }
 
-/// The player's remainder := [-1/2, 1/2); the edge's transfer
-/// (`search::arc_edges`) carries what the frame did to it.
-fn widen_rem(st: &mut State<Symbolic>, d: &mut Symbolic, errs: &mut SlotErrors) -> Result<()> {
-    let half = P8::from_parts(0, 0x8000);
-    let neg_half = -half;
-    let half_below = half.next_smallest();
-    for obj in objects_of_type(st, "player") {
-        for f in ["x", "y"] {
-            let p = field(&obj, &["rem", f]);
-            let Some(Value::Num(old)) = iface::get(st, &p) else {
-                bail!("{}: rem is not a number", iface::show(&p));
+/// One entry's slots, per instance, as stored (`Stored`).
+fn widen_entry(st: &mut State<Symbolic>, d: &mut Symbolic, e: &Entry, errs: &mut SlotErrors) -> Result<()> {
+    for paths in entry_paths(st, e) {
+        // Per slot so far: its value before the widening, and what it owed.
+        let mut seen: Vec<(Option<Value<Symbolic>>, Option<NodeId>)> = Vec::new();
+        for (s, p) in e.slots.iter().zip(&paths) {
+            let old = iface::get(st, p);
+            let Some(old_v) = old.clone() else {
+                anyhow::ensure!(s.optional, "{}: widening {:?} has no such slot", iface::show(p), e.name);
+                seen.push((None, None));
+                continue;
             };
-            let lo = d.num(neg_half);
-            let hi = d.num(half_below);
-            let a = d.compare(super::domain::Cmp::Ge, &old, &lo)?;
-            let b = d.compare(super::domain::Cmp::Le, &old, &hi)?;
-            let inside = d.and(&a, &b);
-            owe(errs, d, &p, inside);
-            let wide = ival(d, neg_half, half_below);
-            iface::set(st, &p, Value::Num(wide))?;
+            let num = || match &old_v {
+                Value::Num(n) => Ok(*n),
+                _ => Err(anyhow::anyhow!("{}: not a number (widening {:?})", iface::show(p), e.name)),
+            };
+            let mut owed = None;
+            let new = match s.stored {
+                Stored::Range { lo, hi, proof } => {
+                    owed = range_holds(d, num()?, (lo, hi), proof)?;
+                    if let Some(h) = owed {
+                        owe(errs, d, p, h);
+                    }
+                    Value::Num(ival(d, lo, hi))
+                }
+                Stored::Band { around, radius, proof } => {
+                    let sp = field(&p[..p.len() - 1].to_vec(), &[around]);
+                    let Some(Value::Num(centre)) = iface::get(st, &sp) else { bail!("{}: not a number", iface::show(&sp)) };
+                    let v = num()?;
+                    match proof {
+                        // The band as the centre's own arithmetic, per lane.
+                        Proof::PerLane => {
+                            let amp = d.num(P8::from_raw(radius));
+                            let l = d.arith(super::domain::Arith::Sub, &centre, &amp)?;
+                            let h = d.arith(super::domain::Arith::Add, &centre, &amp)?;
+                            let a = d.compare(super::domain::Cmp::Ge, &v, &l)?;
+                            let b = d.compare(super::domain::Cmp::Le, &v, &h)?;
+                            let inside = d.and(&a, &b);
+                            owe(errs, d, p, inside);
+                            owed = Some(inside);
+                            Value::Num(d.graph.fold(Op::Span, vec![l, h]))
+                        }
+                        // A constant centre: the band is a literal range.
+                        Proof::Static | Proof::Literals => {
+                            let Some(c) = d.as_const(&centre) else { bail!("{}: not a constant", iface::show(&sp)) };
+                            let (lo, hi) = (c.to_bits() as i32 - radius, c.to_bits() as i32 + radius);
+                            owed = range_holds(d, v, (lo, hi), proof)?;
+                            if let Some(h) = owed {
+                                owe(errs, d, p, h);
+                            }
+                            Value::Num(ival(d, lo, hi))
+                        }
+                    }
+                }
+                Stored::Phase { lo, hi } => Value::Num(ival(d, lo, hi)),
+                Stored::AtLeast(k) => {
+                    let v = num()?;
+                    let k = d.num(P8::from_raw(k));
+                    Value::Num(d.fun2(super::domain::Fun2::Max, &v, &k)?)
+                }
+                Stored::UnknownNum => {
+                    num()?;
+                    Value::Num(d.unknown_num())
+                }
+                Stored::UnknownBool => {
+                    let Value::Bool(_) = old_v else { bail!("{}: not a boolean (widening {:?})", iface::show(p), e.name) };
+                    Value::Bool(d.unknown_bool_output())
+                }
+                Stored::Num(k) => Value::Num(d.num(P8::from_raw(k))),
+                Stored::Bool(b) => Value::Bool(d.boolean(b)),
+                Stored::FullPeriod(period) => {
+                    let v = num()?;
+                    if !d.is_interval(&v) {
+                        seen.push((old, None));
+                        continue;
+                    }
+                    let (lo, hi) = (d.graph.fold(Op::Lo, vec![v]), d.graph.fold(Op::Hi, vec![v]));
+                    let width = d.graph.fold(Op::Sub, vec![hi, lo]);
+                    let full_period = d.graph.leaf(Op::Const(period, period));
+                    let full = d.graph.fold(Op::Ge, vec![width, full_period]);
+                    owe(errs, d, p, full);
+                    Value::Num(ival(d, 0, period))
+                }
+                // Its twin's stored value; owed: its twin's obligation, the
+                // two being one node at every frame's end.
+                Stored::SameAs(other) => {
+                    let j = e.slots.iter().position(|t| t.field == [other]).expect("SameAs names a slot of its entry");
+                    let (twin_old, twin_owed) = seen[j].clone();
+                    anyhow::ensure!(twin_old == Some(old_v.clone()), "{}: not its `{other}` at the frame's end (widening {:?})", iface::show(p), e.name);
+                    owed = twin_owed;
+                    if let Some(h) = owed {
+                        owe(errs, d, p, h);
+                    }
+                    iface::get(st, &paths[j]).expect("the twin, widened")
+                }
+                Stored::AbsentAsZero => {
+                    seen.push((old, None));
+                    continue;
+                }
+            };
+            iface::set(st, p, new)?;
+            seen.push((old, owed));
         }
     }
     Ok(())
 }
 
-/// The balloon's `rnd` phase `offset`, a full-period interval. Its one reader
-/// is `sin(offset)`, `[-1, 1]` on any full period, so storing the canonical
-/// `[0, 1)` is EXACT; that it is a full period is owed. `Rt2::widen_to` agrees.
-fn canon_balloon_offset(st: &mut State<Symbolic>, d: &mut Symbolic, errs: &mut SlotErrors) -> Result<()> {
-    for obj in objects_of_type(st, "balloon") {
-        let p = field(&obj, &["offset"]);
-        let Some(Value::Num(v)) = iface::get(st, &p) else { bail!("{}: not a number", iface::show(&p)) };
-        if !d.is_interval(&v) {
-            continue;
+/// `v` inside `[lo, hi]` (raw) as `proof` shows it: `None` if proved, else
+/// the per-lane condition.
+fn range_holds(d: &mut Symbolic, v: NodeId, (lo, hi): (i32, i32), proof: Proof) -> Result<Option<NodeId>> {
+    Ok(match proof {
+        Proof::PerLane => {
+            let (klo, khi) = (d.num(P8::from_raw(lo)), d.num(P8::from_raw(hi)));
+            let a = d.compare(super::domain::Cmp::Ge, &v, &klo)?;
+            let b = d.compare(super::domain::Cmp::Le, &v, &khi)?;
+            Some(d.and(&a, &b))
         }
-        let (lo, hi) = (d.graph.fold(Op::Lo, vec![v]), d.graph.fold(Op::Hi, vec![v]));
-        let width = d.graph.fold(Op::Sub, vec![hi, lo]);
-        let period = d.graph.leaf(Op::Const(BALLOON_PERIOD_RAW, BALLOON_PERIOD_RAW));
-        let full = d.graph.fold(Op::Ge, vec![width, period]);
-        owe(errs, d, &p, full);
-        let canon = d.graph.leaf(Op::Const(0, BALLOON_PERIOD_RAW));
-        iface::set(st, &p, Value::Num(canon))?;
-    }
-    Ok(())
+        Proof::Static => contain(d, v, (lo as i64, hi as i64)),
+        Proof::Literals => {
+            let mut arms = Vec::new();
+            if literal_arms(&d.graph, v, &mut arms) && arms.iter().all(|(a, b)| lo <= *a && *b <= hi) {
+                None
+            } else {
+                Some(bounds_inside(d, v, lo, hi))
+            }
+        }
+    })
 }
 
-use celeste_engine::runtime2::{floor_player_window, BALLOON_PERIOD_RAW, FLOOR_HITBOX, FLOOR_STATE_RANGE, SPRING_SPR_RANGE, BALLOON_SPR_RANGE, BALLOON_BOB_RAW, PLATFORM_PATH, PLATFORM_REM, PLAYER_HITBOX};
-
-/// Held buttons unknown: the trails leave the frame as the canonical unknown.
-fn widen_held(st: &mut State<Symbolic>, d: &mut Symbolic) -> Result<()> {
-    if !d.held_unknown {
-        return Ok(());
+/// Every value a lane can hold: a literal, or a select over such values.
+fn literal_arms(g: &crate::transpile::graph::Graph, n: NodeId, out: &mut Vec<(i32, i32)>) -> bool {
+    let node = g.get(n);
+    match node.op {
+        Op::Const(a, b) => {
+            out.push((a, b));
+            true
+        }
+        Op::Sel => literal_arms(g, node.args[1], out) && literal_arms(g, node.args[2], out),
+        _ => false,
     }
-    for obj in objects_of_type(st, "player") {
-        for f in ["p_jump", "p_dash"] {
-            let p = field(&obj, &[f]);
-            let Some(Value::Bool(_)) = iface::get(st, &p) else { bail!("{}: not a boolean", iface::show(&p)) };
-            let b = d.unknown_bool_output();
-            iface::set(st, &p, Value::Bool(b))?;
+}
+
+/// `lo <= Lo(v) and Hi(v) <= hi`, per lane.
+fn bounds_inside(d: &mut Symbolic, v: NodeId, lo: i32, hi: i32) -> NodeId {
+    let (klo, khi) = (d.graph.leaf(Op::Const(lo, lo)), d.graph.leaf(Op::Const(hi, hi)));
+    let (vlo, vhi) = (d.graph.fold(Op::Lo, vec![v]), d.graph.fold(Op::Hi, vec![v]));
+    let above = d.graph.fold(Op::Ge, vec![vlo, klo]);
+    let below = d.graph.fold(Op::Le, vec![vhi, khi]);
+    d.graph.fold(Op::And, vec![above, below])
+}
+
+/// `v` in `[lo, hi]` (raw): `None` if proved statically, else the per-lane
+/// condition.
+fn contain(d: &mut Symbolic, v: NodeId, (lo, hi): (i64, i64)) -> Option<<Symbolic as Domain>::Bool> {
+    if within(d, v, (lo, hi), &mut Vec::new()) {
+        return None;
+    }
+    Some(bounds_inside(d, v, lo as i32, hi as i32))
+}
+
+/// The INPUT side: every entry of the tracer's level read as its slots'
+/// `Input` says, in table order, before the frame reads anything. Returned:
+/// the per-lane obligations on the raw inputs (a `Literal`'s containment,
+/// the platforms' hook's), which the caller makes errors of the whole frame.
+pub fn read_inputs(st: &mut State<Symbolic>, d: &mut Symbolic) -> Result<Vec<NodeId>> {
+    let mut obligations = Vec::new();
+    let mid = mid_frame(st);
+    // A near level reads an absent countdown as the unknown number too: the
+    // absent field is 0 (`Stored::AbsentAsZero`), which the unknown holds.
+    // Mid split frame the countdowns stay as the first step left them.
+    if d.level.floors_near && !mid {
+        materialize_absent_fields(st, d)?;
+    }
+    d.platform_cells.clear();
+    for e in d.level.entries() {
+        match e.hook {
+            Some(Hook::NearFloor) => read_near_floors(st, d, e, mid)?,
+            // Once, for both platform entries.
+            Some(Hook::PlatformInputs) if e.slots[0].field == ["x"] => obligations.extend(platform_inputs(st, d)?),
+            Some(Hook::PlatformInputs) => {}
+            None => {
+                for paths in entry_paths(st, e) {
+                    for (s, p) in e.slots.iter().zip(&paths) {
+                        obligations.extend(read_slot(st, d, e, s, p)?);
+                    }
+                }
+            }
         }
     }
-    Ok(())
+    Ok(obligations)
+}
+
+/// One slot's input (`Input`), and its obligation if it owes one.
+fn read_slot(st: &mut State<Symbolic>, d: &mut Symbolic, e: &Entry, s: &Slot, p: &Path) -> Result<Option<NodeId>> {
+    let what = |kind: &str| anyhow::anyhow!("{}: not a {kind} (widening {:?})", iface::show(p), e.name);
+    let new = match (s.input, iface::get(st, p)) {
+        (Input::Stored, _) => return Ok(None),
+        (Input::Hook, _) => bail!("{}: widening {:?} reads it in a hook it does not have", iface::show(p), e.name),
+        (_, None) if s.optional => return Ok(None),
+        (Input::BothWays, Some(Value::Bool(_))) => Value::Bool(d.both_values(s.field.last().expect("a field"))),
+        (Input::Atom, Some(Value::Bool(_))) => Value::Bool(d.unknown_bool_atom()),
+        (Input::BothWays | Input::Atom, _) => return Err(what("boolean")),
+        (Input::Unknown, Some(Value::Num(_))) => Value::Num(d.unknown_num()),
+        (Input::Literal, Some(Value::Num(v))) => {
+            let Stored::Range { lo, hi, .. } = s.stored else { bail!("{}: a literal input reads a range", iface::show(p)) };
+            let owed = contain(d, v, (lo as i64, hi as i64));
+            let r = ival(d, lo, hi);
+            iface::set(st, p, Value::Num(r))?;
+            return Ok(owed);
+        }
+        (Input::Unknown | Input::Literal, _) => return Err(what("number")),
+    };
+    iface::set(st, p, new)?;
+    Ok(None)
 }
 
 /// An object's `(x, y)`: constants, floors and springs never move.
@@ -186,172 +387,40 @@ fn position<D: Domain>(st: &State<D>, d: &D, obj: &Path) -> Result<(P8, P8)> {
     Ok((get("x")?, get("y")?))
 }
 
-/// The object PHASES a near level widens, each with its stored range: the
-/// spring's `spr` and countdowns, the balloon's `spr` and `y`. Their updates
-/// become "maybe bounce" / "maybe refill the dash". The balloon's `y` is the
-/// bob band `start +- BALLOON_BOB_RAW`, since its bob runs only when
-/// `spr == 22` and an exact `y` would give every state a twin.
-pub fn phase_paths<D: Domain>(st: &State<D>) -> Vec<(Path, PhaseRange)> {
-    let mut out = Vec::new();
-    for obj in objects_of_type(st, "spring") {
-        out.push((field(&obj, &["spr"]), PhaseRange::Fixed(SPRING_SPR_RANGE)));
-        for f in ["delay", "hide_in", "hide_for"] {
-            out.push((field(&obj, &[f]), PhaseRange::Countdown));
-        }
-    }
-    for obj in objects_of_type(st, "balloon") {
-        out.push((field(&obj, &["spr"]), PhaseRange::Fixed(BALLOON_SPR_RANGE)));
-        out.push((field(&obj, &["y"]), PhaseRange::AroundStart(field(&obj, &["start"]), BALLOON_BOB_RAW)));
-    }
-    out
+/// The slots a hook stores as an interval on some lanes and exact on others
+/// (a near floor's `state`): an interval column in every outcome (the
+/// column type is per shape).
+pub fn near_floor_states(st: &State<Symbolic>, level: Level) -> Vec<Path> {
+    level.entries().filter(|e| e.hook == Some(Hook::NearFloor)).flat_map(|e| entry_paths(st, e)).map(|paths| paths[0].clone()).collect()
 }
 
-/// How a near level stores a phase: a fixed range, `start` +- a radius
-/// (raw 16.16), or the unknown number.
-pub enum PhaseRange {
-    Fixed((i32, i32)),
-    AroundStart(Path, i32),
-    Countdown,
-}
-
-/// The countdowns a near level widens: fall floor `delay`, balloon `timer`.
-pub fn floor_timer_paths<D: Domain>(st: &State<D>) -> Vec<Path> {
-    let mut out = Vec::new();
-    for obj in objects_of_type(st, "fall_floor") {
-        let p = field(&obj, &["delay"]);
-        if iface::get(st, &p).is_some() {
-            out.push(p);
-        }
-    }
-    for obj in objects_of_type(st, "balloon") {
-        out.push(field(&obj, &["timer"]));
-    }
-    out
-}
-
-/// The countdowns' OUTPUT side at a near level: THE UNKNOWN NUMBER (the cart
-/// only decrements them and compares with 0; no premise needed). Not the
-/// interval [MIN, MAX]: `delay - 1` of it overflows (`Op::NoWrap`) and every
-/// lane would decline.
-fn widen_floor_timers(st: &mut State<Symbolic>, d: &mut Symbolic) -> Result<()> {
-    if !d.floors_near {
-        return Ok(());
-    }
-    for p in floor_timer_paths(st) {
-        let Some(Value::Num(_)) = iface::get(st, &p) else { bail!("{}: not a number", iface::show(&p)) };
-        let u = d.unknown_num();
-        iface::set(st, &p, Value::Num(u))?;
-    }
-    Ok(())
-}
-
-/// The countdowns a level stores as the unknown number.
-pub fn countdown_paths(st: &State<Symbolic>, d: &Symbolic) -> Vec<Path> {
-    let mut out = Vec::new();
-    if d.floors_near {
-        out.extend(floor_timer_paths(st));
-        out.extend(phase_paths(st).into_iter().filter(|(_, r)| matches!(r, PhaseRange::Countdown)).map(|(p, _)| p));
-    }
-    out
-}
-
-/// The countdowns' INPUT side: the unknown number; an absent slot stays absent.
-pub fn forget_countdown_inputs(st: &mut State<Symbolic>, d: &mut Symbolic) -> Result<()> {
-    for p in countdown_paths(st, d) {
-        match iface::get(st, &p) {
-            None => {}
-            Some(Value::Num(_)) => {
-                let u = d.unknown_num();
-                iface::set(st, &p, Value::Num(u))?;
-            }
-            Some(_) => bail!("{}: not a number", iface::show(&p)),
-        }
-    }
-    Ok(())
-}
-
-/// Per fall floor, the fields a near level widens except where the player
-/// overlaps it.
-pub struct NearFloorPaths {
-    pub floors: Vec<Path>,
-    /// `state`: the interval `FLOOR_STATE_RANGE`, or exact.
-    pub state: Vec<Path>,
-    /// `collideable`: unknown, or exact.
-    pub collideable: Vec<Path>,
-}
-
-impl NearFloorPaths {
-    pub fn all(&self) -> impl Iterator<Item = &Path> {
-        self.state.iter().chain(self.collideable.iter())
-    }
-}
-
-pub fn near_floor_paths(st: &State<Symbolic>) -> NearFloorPaths {
-    let mut out = NearFloorPaths { floors: Vec::new(), state: Vec::new(), collideable: Vec::new() };
-    for obj in objects_of_type(st, "fall_floor") {
-        out.state.push(field(&obj, &["state"]));
-        out.collideable.push(field(&obj, &["collideable"]));
-        out.floors.push(obj);
-    }
-    out
-}
-
-/// The phases' OUTPUT side at a near level: intervals (so `spr == 18` splits
-/// like a floor's `state == k`), countdowns unknown; containment is owed.
-fn widen_near_phases(st: &mut State<Symbolic>, d: &mut Symbolic, errs: &mut SlotErrors) -> Result<()> {
-    for (p, range) in phase_paths(st) {
-        let (lo, hi) = match range {
-            PhaseRange::Countdown => {
-                let Some(Value::Num(_)) = iface::get(st, &p) else { bail!("{}: not a number", iface::show(&p)) };
-                let u = d.unknown_num();
-                iface::set(st, &p, Value::Num(u))?;
-                continue;
-            }
-            PhaseRange::Fixed(r) => r,
-            PhaseRange::AroundStart(sp, radius) => {
-                let Some(Value::Num(s)) = iface::get(st, &sp) else { bail!("{}: not a number", iface::show(&sp)) };
-                let Some(s) = d.as_const(&s) else { bail!("{}: not a constant", iface::show(&sp)) };
-                (s.to_bits() as i32 - radius, s.to_bits() as i32 + radius)
-            }
-        };
-        let Some(Value::Num(v)) = iface::get(st, &p) else { bail!("{}: not a number", iface::show(&p)) };
-        if let Some(holds) = contain(d, v, (lo as i64, hi as i64)) {
-            owe(errs, d, &p, holds);
-        }
-        let r = d.graph.leaf(Op::Const(lo, hi));
-        iface::set(st, &p, Value::Num(r))?;
-    }
-    Ok(())
-}
-
-/// A near level's INPUT side: a floor's `state` as stored (split by
-/// `verify::split_undecided_selects`), `collideable` DERIVED as `state ~= 2`.
-/// The cart keeps them in step; an independent unknown `collideable` would
-/// admit players inside solid floors.
-pub fn fork_near_floor_inputs(st: &mut State<Symbolic>, d: &mut Symbolic) -> Result<()> {
+/// `Hook::NearFloor`, INPUT: a floor's `state` as stored (split by
+/// `verify::split_undecided_selects`), `collideable` DERIVED as `state ~= 2`
+/// (the cart keeps them in step; an independent unknown `collideable` would
+/// admit players inside solid floors). Mid split frame a lane may hold an
+/// unknown `collideable`, but a boolean slot binds as a decided cell that
+/// would read it as false: the cell where the lane knows it, else a fork of
+/// both values.
+fn read_near_floors(st: &mut State<Symbolic>, d: &mut Symbolic, e: &Entry, mid: bool) -> Result<()> {
     use super::domain::Cmp;
-    materialize_absent_fields(st, d)?;
-    let fp = near_floor_paths(st);
-    let two = d.num(P8::from_i16(2));
-    for (ps, pc) in fp.state.iter().zip(&fp.collideable) {
-        let Some(Value::Num(state)) = iface::get(st, ps) else { bail!("{}: not a number", iface::show(ps)) };
-        let hidden = d.compare(Cmp::Eq, &state, &two)?;
-        let solid = d.not(&hidden);
-        iface::set(st, pc, Value::Bool(solid))?;
-    }
-    Ok(())
-}
-
-/// Mid split frame, a lane may hold an unknown `collideable`, but a boolean
-/// slot binds as a decided cell that would read it as false. So: the cell
-/// where the lane knows it, else a fork of both values.
-pub fn fork_unknown_near_collideables(st: &mut State<Symbolic>, d: &mut Symbolic) -> Result<()> {
-    for pc in near_floor_paths(st).collideable {
-        let Some(Value::Bool(c)) = iface::get(st, &pc) else { bail!("{}: not a boolean", iface::show(&pc)) };
-        let known = d.graph.fold(Op::Known, vec![c]);
-        let both = d.both_values(&format!("{} unknown", iface::show(&pc)));
-        let v = d.sel_bool(&known, &c, &both);
-        iface::set(st, &pc, Value::Bool(v))?;
+    let two = if mid { None } else { Some(d.num(P8::from_i16(2))) };
+    for paths in entry_paths(st, e) {
+        let [ps, pc] = &paths[..] else { bail!("the near floors' entry has two slots") };
+        match two {
+            None => {
+                let Some(Value::Bool(c)) = iface::get(st, pc) else { bail!("{}: not a boolean", iface::show(pc)) };
+                let known = d.graph.fold(Op::Known, vec![c]);
+                let both = d.both_values(&format!("{} unknown", iface::show(pc)));
+                let v = d.sel_bool(&known, &c, &both);
+                iface::set(st, pc, Value::Bool(v))?;
+            }
+            Some(two) => {
+                let Some(Value::Num(state)) = iface::get(st, ps) else { bail!("{}: not a number", iface::show(ps)) };
+                let hidden = d.compare(Cmp::Eq, &state, &two)?;
+                let solid = d.not(&hidden);
+                iface::set(st, pc, Value::Bool(solid))?;
+            }
+        }
     }
     Ok(())
 }
@@ -360,22 +429,19 @@ pub fn fork_unknown_near_collideables(st: &mut State<Symbolic>, d: &mut Symbolic
 /// -3..=3, `oy` in 0..=1), as offsets to the overlap window's ends.
 pub const PLAYER_PROBE: [(i16, i16); 2] = [(-3, 3), (-1, 0)];
 
-/// A near level's OUTPUT side: every fall floor stores `state` as
-/// `FLOOR_STATE_RANGE` and `collideable` unknown, EXCEPT where the player
-/// overlaps it; countdowns are widened regardless (unread while inside). An
-/// overlapped floor stores the CART'S INVARIANT (hidden: `state` 2,
-/// `collideable` false, the player cannot be inside a solid floor), with the
-/// computed value owed; storing the computed value makes the split resolve
-/// every floor the player MIGHT overlap (room (6,1): 3,638 outcomes vs 108)
-/// - except with the platforms unknown, where it stores the computed value
+/// `Hook::NearFloor`, OUTPUT: every fall floor stores its slots (`state` the
+/// range, `collideable` unknown), EXCEPT where the player overlaps it;
+/// countdowns are widened regardless (unread while inside). An overlapped
+/// floor stores the CART'S INVARIANT (hidden: `state` 2, `collideable`
+/// false, the player cannot be inside a solid floor), with the computed
+/// value owed; storing the computed value makes the split resolve every
+/// floor the player MIGHT overlap (room (6,1): 3,638 outcomes vs 108) -
+/// except with the platforms unknown, where it stores the computed value
 /// (below). Mid split frame (`mid`), `collideable` also stays computed in the
 /// `PLAYER_PROBE` window: widening there would let the second step reach
 /// states the unsplit frame does not. `Rt2::widen_to` agrees.
-fn widen_near_floors(st: &mut State<Symbolic>, d: &mut Symbolic, errs: &mut SlotErrors, mid: bool) -> Result<()> {
+fn widen_near_floors(st: &mut State<Symbolic>, d: &mut Symbolic, e: &Entry, errs: &mut SlotErrors, mid: bool) -> Result<()> {
     use super::domain::Cmp;
-    if !d.floors_near {
-        return Ok(());
-    }
     // The hitboxes `floor_player_window` assumes, checked on the state.
     let hitbox = |st: &State<Symbolic>, d: &Symbolic, obj: &Path, want: [i16; 4]| -> Result<()> {
         for (f, w) in ["x", "y", "w", "h"].iter().zip(want) {
@@ -391,7 +457,7 @@ fn widen_near_floors(st: &mut State<Symbolic>, d: &mut Symbolic, errs: &mut Slot
     let mut players = Vec::new();
     for obj in objects_of_type(st, "player") {
         hitbox(st, d, &obj, PLAYER_HITBOX)?;
-        let coord = |f: &str| -> Result<crate::transpile::graph::NodeId> {
+        let coord = |f: &str| -> Result<NodeId> {
             let p = field(&obj, &[f]);
             match iface::get(st, &p) {
                 Some(Value::Num(v)) => Ok(v),
@@ -400,16 +466,16 @@ fn widen_near_floors(st: &mut State<Symbolic>, d: &mut Symbolic, errs: &mut Slot
         };
         players.push((coord("x")?, coord("y")?));
     }
-    widen_near_phases(st, d, errs)?;
-    let fp = near_floor_paths(st);
-    let (slo, shi) = FLOOR_STATE_RANGE;
-    for ((obj, ps), pc) in fp.floors.iter().zip(&fp.state).zip(&fp.collideable) {
-        hitbox(st, d, obj, FLOOR_HITBOX)?;
-        let at = position(st, d, obj)?;
+    let Stored::Range { lo: slo, hi: shi, .. } = e.slots[0].stored else { bail!("the near floors' `state` stores a range") };
+    let Target::Objects(ty) = e.target else { bail!("the near floors are objects") };
+    for (obj, paths) in objects_of_type(st, ty).into_iter().zip(entry_paths(st, e)) {
+        let [ps, pc] = &paths[..] else { bail!("the near floors' entry has two slots") };
+        hitbox(st, d, &obj, FLOOR_HITBOX)?;
+        let at = position(st, d, &obj)?;
         let [(xlo, xhi), (ylo, yhi)] = floor_player_window(at);
         // `lo < v < hi` for every value a lane may hold (straddling is no
-        // overlap, the safe side), as `runtime2::player_overlaps_floor`.
-        let inside = |d: &mut Symbolic, v: crate::transpile::graph::NodeId, lo: P8, hi: P8| -> Result<crate::transpile::graph::NodeId> {
+        // overlap, the safe side), as `widening::player_overlaps_floor`.
+        let inside = |d: &mut Symbolic, v: NodeId, lo: P8, hi: P8| -> Result<NodeId> {
             let (a, b) = if d.is_interval(&v) { (d.graph.fold(Op::Lo, vec![v]), d.graph.fold(Op::Hi, vec![v])) } else { (v, v) };
             let (klo, khi) = (d.num(lo), d.num(hi));
             let above = d.compare(Cmp::Gt, &a, &klo)?;
@@ -450,7 +516,7 @@ fn widen_near_floors(st: &mut State<Symbolic>, d: &mut Symbolic, errs: &mut Slot
         // computes the overlapped floor solid), which the near level alone
         // never meets. A stored computed `state`/`collideable` agrees with
         // `Rt2::widen_to` (it keeps an overlapped floor's values as they are).
-        let computed = d.platforms_unknown;
+        let computed = d.level.platforms;
         let state = d.sel_num(&overlap, if computed { &state } else { &two }, &range);
         iface::set(st, ps, Value::Num(state))?;
         let Some(Value::Bool(coll)) = iface::get(st, pc) else { bail!("{}: not a boolean", iface::show(pc)) };
@@ -470,46 +536,25 @@ fn widen_near_floors(st: &mut State<Symbolic>, d: &mut Symbolic, errs: &mut Slot
     Ok(())
 }
 
-/// The fields a platforms-unknown level widens, per moving platform.
-pub struct PlatformPaths {
-    pub x: Vec<Path>,
-    pub last: Vec<Path>,
-    pub rem_x: Vec<Path>,
-}
-
-impl PlatformPaths {
-    pub fn all(&self) -> impl Iterator<Item = &Path> {
-        self.x.iter().chain(self.last.iter()).chain(self.rem_x.iter())
-    }
-}
-
-pub fn platform_paths<D: Domain>(st: &State<D>) -> PlatformPaths {
-    let mut out = PlatformPaths { x: Vec::new(), last: Vec::new(), rem_x: Vec::new() };
-    for obj in objects_of_type(st, "platform") {
-        out.x.push(field(&obj, &["x"]));
-        out.last.push(field(&obj, &["last"]));
-        out.rem_x.push(field(&obj, &["rem", "x"]));
-    }
-    out
-}
-
-/// The platforms' INPUT side at a platforms-unknown level: `x` an input cell
-/// over the whole path, `last` read as `x` (checked by `widen_platforms`),
-/// `rem.x` the literal whole remainder (a literal's floor rejoins as
-/// fragments; the price is a pixel of slack at this level). The `x` cells are
-/// recorded so the split decides player-vs-platform comparisons per PLATFORM
-/// WORLD, keeping platforms mutually consistent. `x` is read through its
-/// restriction to the path and each unpinned `spd.x` through its range over
-/// the worlds (`Op::Restrict`: the range analyses read the range off the
-/// node, its own error checks the raw cell). Returned: per-lane obligations
-/// (the no-player speed; `rem.x` inside the literal that replaces it).
-pub fn platform_inputs(st: &mut State<Symbolic>, d: &mut Symbolic) -> Result<Vec<crate::transpile::graph::NodeId>> {
+/// `Hook::PlatformInputs`: the platforms' INPUT side at a platforms-unknown
+/// level. Which world platform each is, by constant `y` and `dir` (rows are
+/// in canonical order; platforms alike in both are interchangeable); `x` an
+/// input cell restricted to the path (`Op::Restrict`) and recorded as the
+/// world's cell, so the split decides player-vs-platform comparisons per
+/// PLATFORM WORLD, keeping platforms mutually consistent; `last` read as `x`
+/// (checked at the output, `Stored::SameAs`); `rem.x` the literal whole
+/// remainder (as `Input::Literal`: a literal's floor rejoins as fragments;
+/// the price is a pixel of slack at this level); each unpinned `spd.x`
+/// through its range over the worlds - with no player, as the literal of its
+/// one moving speed. Not table slots: all of it is per WORLD (which world
+/// platform an object is, and what its inputs may be there), which a slot
+/// cannot say. Returned: per-lane obligations (the no-player speed; `rem.x`
+/// inside its literal).
+pub fn platform_inputs(st: &mut State<Symbolic>, d: &mut Symbolic) -> Result<Vec<NodeId>> {
     let worlds = d.worlds.clone().ok_or_else(|| anyhow::anyhow!("the platforms are unknown but there is no world table"))?;
     let platforms = objects_of_type(st, "platform");
     let first = worlds.first().ok_or_else(|| anyhow::anyhow!("no platform world"))?;
     anyhow::ensure!(first.len() == platforms.len(), "a platform world has {} platforms, the state {}", first.len(), platforms.len());
-    // WHICH world platform each is, by constant `y` and `dir` (rows are in
-    // canonical order); platforms alike in both are interchangeable.
     fn konst(st: &State<Symbolic>, d: &Symbolic, p: &Path) -> Result<i32> {
         match iface::get(st, p) {
             Some(Value::Num(n)) => match d.graph.get(n).op {
@@ -520,7 +565,7 @@ pub fn platform_inputs(st: &mut State<Symbolic>, d: &mut Symbolic) -> Result<Vec
         }
     }
     let mut taken = vec![false; platforms.len()];
-    let mut cells: Vec<Option<crate::transpile::graph::NodeId>> = vec![None; platforms.len()];
+    let mut cells: Vec<Option<NodeId>> = vec![None; platforms.len()];
     let mut obligations = Vec::new();
     for obj in &platforms {
         let (y, dir) = (konst(st, d, &field(obj, &["y"]))?, konst(st, d, &field(obj, &["dir"]))?);
@@ -562,8 +607,8 @@ pub fn platform_inputs(st: &mut State<Symbolic>, d: &mut Symbolic) -> Result<Vec
         // `rem.x` is replaced by the literal whole remainder: sound for a
         // lane whose own lies inside, which is owed.
         let Some(Value::Num(rv)) = iface::get(st, &rem) else { bail!("{}: not a number", iface::show(&rem)) };
-        obligations.extend(contain(d, rv, (PLATFORM_REM.0 as i64, PLATFORM_REM.1 as i64)));
-        let r = d.graph.leaf(Op::Const(PLATFORM_REM.0, PLATFORM_REM.1));
+        obligations.extend(contain(d, rv, (REM.0 as i64, REM.1 as i64)));
+        let r = ival(d, REM.0, REM.1);
         iface::set(st, &rem, Value::Num(r))?;
         cells[j] = Some(xv);
     }
@@ -571,57 +616,10 @@ pub fn platform_inputs(st: &mut State<Symbolic>, d: &mut Symbolic) -> Result<Vec
     Ok(obligations)
 }
 
-/// The platforms' OUTPUT side: `x` and `last` the whole path's interval,
-/// `rem.x` the whole remainder (as `Rt2::widen_to`). The output `last` must
-/// BE the output `x` (the input alias's induction), and containment is
-/// proved (`within`) or owed.
-fn widen_platforms(st: &mut State<Symbolic>, d: &mut Symbolic, errs: &mut SlotErrors) -> Result<()> {
-    if !d.platforms_unknown {
-        return Ok(());
-    }
-    let pp = platform_paths(st);
-    let path = ((PLATFORM_PATH.0 as i64) << 16, (PLATFORM_PATH.1 as i64) << 16);
-    for (x, last) in pp.x.iter().zip(&pp.last) {
-        let Some(Value::Num(xv)) = iface::get(st, x) else { bail!("{}: not a number", iface::show(x)) };
-        let Some(Value::Num(lv)) = iface::get(st, last) else { bail!("{}: not a number", iface::show(last)) };
-        anyhow::ensure!(xv == lv, "{}: a platform's `last` is not its `x` at the frame's end", iface::show(last));
-        if let Some(inside) = contain(d, xv, path) {
-            owe(errs, d, x, inside);
-            owe(errs, d, last, inside);
-        }
-        let hull = d.graph.leaf(Op::Const(path.0 as i32, path.1 as i32));
-        iface::set(st, x, Value::Num(hull))?;
-        iface::set(st, last, Value::Num(hull))?;
-    }
-    let rem = (PLATFORM_REM.0 as i64, PLATFORM_REM.1 as i64);
-    for p in &pp.rem_x {
-        let Some(Value::Num(v)) = iface::get(st, p) else { bail!("{}: not a number", iface::show(p)) };
-        if let Some(inside) = contain(d, v, rem) {
-            owe(errs, d, p, inside);
-        }
-        let r = d.graph.leaf(Op::Const(PLATFORM_REM.0, PLATFORM_REM.1));
-        iface::set(st, p, Value::Num(r))?;
-    }
-    Ok(())
-}
-
-/// `v` in `[lo, hi]` (raw): `None` if proved statically, else the per-lane
-/// condition.
-fn contain(d: &mut Symbolic, v: crate::transpile::graph::NodeId, (lo, hi): (i64, i64)) -> Option<<Symbolic as Domain>::Bool> {
-    if within(d, v, (lo, hi), &mut Vec::new()) {
-        return None;
-    }
-    let (klo, khi) = (d.graph.leaf(Op::Const(lo as i32, lo as i32)), d.graph.leaf(Op::Const(hi as i32, hi as i32)));
-    let (vlo, vhi) = (d.graph.fold(Op::Lo, vec![v]), d.graph.fold(Op::Hi, vec![v]));
-    let above = d.graph.fold(Op::Ge, vec![vlo, klo]);
-    let below = d.graph.fold(Op::Le, vec![vhi, khi]);
-    Some(d.graph.fold(Op::And, vec![above, below]))
-}
-
 /// Does `v` provably lie in `[lo, hi]` (raw)? Through select arms and under
 /// point-split branches with what they say about the compared value (so a
 /// wrap `x < -16 ? 128 : ...` is bounded). Static; `false` if unsure.
-fn within(d: &Symbolic, v: crate::transpile::graph::NodeId, (lo, hi): (i64, i64), facts: &mut Vec<(crate::transpile::graph::NodeId, i64, i64)>) -> bool {
+fn within(d: &Symbolic, v: NodeId, (lo, hi): (i64, i64), facts: &mut Vec<(NodeId, i64, i64)>) -> bool {
     // Its own bounds first: the enclosing branch may bound a select whole.
     if let Some((a, b)) = bounds(d, v, facts) {
         if lo <= a && b <= hi {
@@ -651,9 +649,9 @@ fn within(d: &Symbolic, v: crate::transpile::graph::NodeId, (lo, hi): (i64, i64)
 
 /// `c` as `x op k` (`k` a literal point, either side): `x` and its raw range
 /// `(when true, when false)`.
-fn comparison_facts(d: &Symbolic, c: crate::transpile::graph::NodeId) -> Option<(crate::transpile::graph::NodeId, (i64, i64), (i64, i64))> {
+fn comparison_facts(d: &Symbolic, c: NodeId) -> Option<(NodeId, (i64, i64), (i64, i64))> {
     let node = d.graph.get(c);
-    let point = |n: crate::transpile::graph::NodeId| match d.graph.get(n).op {
+    let point = |n: NodeId| match d.graph.get(n).op {
         Op::Const(a, b) if a == b => Some(a as i64),
         _ => None,
     };
@@ -686,7 +684,7 @@ fn comparison_facts(d: &Symbolic, c: crate::transpile::graph::NodeId) -> Option<
 
 /// A static raw range of `n` (literals, a bounded input - a platform's
 /// `x` among them -, sums and differences), narrowed by the enclosing branches; `None` otherwise.
-fn bounds(d: &Symbolic, n: crate::transpile::graph::NodeId, facts: &[(crate::transpile::graph::NodeId, i64, i64)]) -> Option<(i64, i64)> {
+fn bounds(d: &Symbolic, n: NodeId, facts: &[(NodeId, i64, i64)]) -> Option<(i64, i64)> {
     let node = d.graph.get(n);
     let structural = || -> Option<(i64, i64)> {
         Some(match node.op {
@@ -733,209 +731,4 @@ fn bounds(d: &Symbolic, n: crate::transpile::graph::NodeId, facts: &[(crate::tra
         }
     }
     Some(r)
-}
-
-/// The fly fruit's `spd.y`/`rem.y` ranges: ONE definition, shared with
-/// `Rt2::widen_to`, or the concrete search's node lookup misses.
-use celeste_engine::runtime2::{FLY_FRUIT_REM_Y as FRUIT_REM_Y, FLY_FRUIT_SPD_Y as FRUIT_SPD_Y};
-
-/// The fields a fruit-unknown level widens, per live fly fruit.
-pub struct FlyFruitPaths {
-    /// `step` and `y`: the unknown number.
-    pub unknown: Vec<Path>,
-    /// `spd.y` and `rem.y`, with their ranges (raw 16.16, inclusive).
-    pub ranges: Vec<(Path, (i32, i32))>,
-    /// `fly`: an unknown boolean.
-    pub fly: Vec<Path>,
-}
-
-impl FlyFruitPaths {
-    pub fn all(&self) -> impl Iterator<Item = &Path> {
-        self.unknown.iter().chain(self.ranges.iter().map(|(p, _)| p)).chain(self.fly.iter())
-    }
-}
-
-pub fn fly_fruit_paths<D: Domain>(st: &State<D>) -> FlyFruitPaths {
-    let mut out = FlyFruitPaths { unknown: Vec::new(), ranges: Vec::new(), fly: Vec::new() };
-    for obj in objects_of_type(st, "fly_fruit") {
-        out.unknown.push(field(&obj, &["step"]));
-        out.unknown.push(field(&obj, &["y"]));
-        out.ranges.push((field(&obj, &["spd", "y"]), FRUIT_SPD_Y));
-        out.ranges.push((field(&obj, &["rem", "y"]), FRUIT_REM_Y));
-        out.fly.push(field(&obj, &["fly"]));
-    }
-    out
-}
-
-/// The fly fruit's INPUT side at a fruit-unknown level: `step`/`y` unknown,
-/// `spd.y`/`rem.y` their ranges as literals, `fly` an undecided atom. The
-/// literal stands for the lane's value only where that lies inside: returned
-/// as per-lane obligations on the raw input (the stored rows hold the
-/// literal itself, but nothing else made the start state's values checked).
-pub fn fork_fruit_inputs(st: &mut State<Symbolic>, d: &mut Symbolic) -> Result<Vec<crate::transpile::graph::NodeId>> {
-    let fp = fly_fruit_paths(st);
-    let mut obligations = Vec::new();
-    for p in &fp.unknown {
-        let Some(Value::Num(_)) = iface::get(st, p) else { bail!("{}: not a number", iface::show(p)) };
-        let u = d.unknown_num();
-        iface::set(st, p, Value::Num(u))?;
-    }
-    for (p, (lo, hi)) in &fp.ranges {
-        let Some(Value::Num(v)) = iface::get(st, p) else { bail!("{}: not a number", iface::show(p)) };
-        obligations.extend(contain(d, v, (*lo as i64, *hi as i64)));
-        let r = d.graph.leaf(Op::Const(*lo, *hi));
-        iface::set(st, p, Value::Num(r))?;
-    }
-    for p in &fp.fly {
-        let Some(Value::Bool(_)) = iface::get(st, p) else { bail!("{}: not a boolean", iface::show(p)) };
-        let b = d.unknown_bool_atom();
-        iface::set(st, p, Value::Bool(b))?;
-    }
-    Ok(obligations)
-}
-
-/// The fly fruit's OUTPUT side: as the input side. A range replaces only
-/// values visibly inside it (literals or selects of them); anything else
-/// owes containment per lane.
-fn widen_fly_fruit(st: &mut State<Symbolic>, d: &mut Symbolic, errs: &mut SlotErrors) -> Result<()> {
-    if !d.fruit_unknown {
-        return Ok(());
-    }
-    // Every value a lane can hold: a literal, or a select over such values.
-    fn literal_arms(g: &crate::transpile::graph::Graph, n: crate::transpile::graph::NodeId, out: &mut Vec<(i32, i32)>) -> bool {
-        let node = g.get(n);
-        match node.op {
-            Op::Const(a, b) => {
-                out.push((a, b));
-                true
-            }
-            Op::Sel => literal_arms(g, node.args[1], out) && literal_arms(g, node.args[2], out),
-            _ => false,
-        }
-    }
-    let fp = fly_fruit_paths(st);
-    for (p, (lo, hi)) in &fp.ranges {
-        let Some(Value::Num(v)) = iface::get(st, p) else { bail!("{}: not a number", iface::show(p)) };
-        let mut arms = Vec::new();
-        match literal_arms(&d.graph, v, &mut arms) {
-            true if arms.iter().all(|(a, b)| *lo <= *a && *b <= *hi) => {}
-            // Not visibly inside: owed, checked per lane.
-            _ => {
-                let (klo, khi) = (d.graph.leaf(Op::Const(*lo, *lo)), d.graph.leaf(Op::Const(*hi, *hi)));
-                let (vlo, vhi) = (d.graph.fold(Op::Lo, vec![v]), d.graph.fold(Op::Hi, vec![v]));
-                let above = d.graph.fold(Op::Ge, vec![vlo, klo]);
-                let below = d.graph.fold(Op::Le, vec![vhi, khi]);
-                let inside = d.graph.fold(Op::And, vec![above, below]);
-                owe(errs, d, p, inside);
-            }
-        }
-        let r = d.graph.leaf(Op::Const(*lo, *hi));
-        iface::set(st, p, Value::Num(r))?;
-    }
-    for p in &fp.unknown {
-        let u = d.unknown_num();
-        iface::set(st, p, Value::Num(u))?;
-    }
-    for p in &fp.fly {
-        let Some(Value::Bool(_)) = iface::get(st, p) else { bail!("{}: not a boolean", iface::show(p)) };
-        let b = d.unknown_bool_output();
-        iface::set(st, p, Value::Bool(b))?;
-    }
-    Ok(())
-}
-
-/// `player.dash_effect_time` := max(0, it): it decrements forever and is
-/// only read `> 0`, so every value <= 0 behaves alike.
-fn widen_dash(st: &mut State<Symbolic>, d: &mut Symbolic) -> Result<()> {
-    let zero = P8::from_i16(0);
-    for obj in objects_of_type(st, "player") {
-        let p = field(&obj, &["dash_effect_time"]);
-        let Some(Value::Num(old)) = iface::get(st, &p) else {
-            bail!("{}: dash_effect_time is not a number", iface::show(&p));
-        };
-        let z = d.num(zero);
-        let clamped = d.fun2(super::domain::Fun2::Max, &old, &z)?;
-        iface::set(st, &p, Value::Num(clamped))?;
-    }
-    Ok(())
-}
-
-/// A live fruit's `off` := [0, 39] and `y` := start +- 2.5, TOGETHER (one
-/// without the other is a row no level has). Applied at every level.
-fn widen_fruit(st: &mut State<Symbolic>, d: &mut Symbolic, errs: &mut SlotErrors) -> Result<()> {
-    let amplitude = P8::from_parts(2, 0x8000);
-    for obj in objects_of_type(st, "fruit") {
-        let (po, py, ps) = (
-            field(&obj, &["off"]),
-            field(&obj, &["y"]),
-            field(&obj, &["start"]),
-        );
-        let Some(Value::Num(start)) = iface::get(st, &ps) else {
-            bail!("{}: fruit has no numeric `start`", iface::show(&ps));
-        };
-        // The band's bounds are expressions of `start` (an input column), so
-        // the band is per-lane `Op::Span`.
-        let Some(Value::Num(old_y)) = iface::get(st, &py) else {
-            bail!("{}: fruit `y` is not a number", iface::show(&py));
-        };
-        let amp = d.num(amplitude);
-        let l = d.arith(super::domain::Arith::Sub, &start, &amp)?;
-        let h = d.arith(super::domain::Arith::Add, &start, &amp)?;
-        // Owed: `y` inside the band (checked per lane).
-        let a = d.compare(super::domain::Cmp::Ge, &old_y, &l)?;
-        let b = d.compare(super::domain::Cmp::Le, &old_y, &h)?;
-        let inside = d.and(&a, &b);
-        owe(errs, d, &py, inside);
-        let band = d.graph.fold(Op::Span, vec![l, h]);
-        iface::set(st, &py, Value::Num(band))?;
-        let all = ival(d, P8::from_i16(0), P8::from_i16(39));
-        iface::set(st, &po, Value::Num(all))?;
-    }
-    Ok(())
-}
-
-/// The gameplay-dead timer globals pinned to zero, and with them each key's
-/// `frames`-derived `spr` (8) and `flip.x` (false). Every level.
-fn widen_timers(st: &mut State<Symbolic>, d: &mut Symbolic) -> Result<()> {
-    let zero = P8::from_i16(0);
-    for g in ["frames", "seconds", "minutes", "deaths"] {
-        let p = vec![iface::key(g)];
-        if iface::get(st, &p).is_none() {
-            bail!("timer global {} is missing - the pin would silently not apply", g);
-        }
-        let z = d.num(zero);
-        iface::set(st, &p, Value::Num(z))?;
-    }
-    for obj in objects_of_type(st, "key") {
-        let spr = field(&obj, &["spr"]);
-        if iface::get(st, &spr).is_none() {
-            bail!("{}: a key without `spr` - the pin would silently not apply", iface::show(&spr));
-        }
-        let tile = d.num(P8::from_i16(8));
-        iface::set(st, &spr, Value::Num(tile))?;
-        let fx = field(&obj, &["flip", "x"]);
-        if iface::get(st, &fx).is_none() {
-            bail!("{}: a key without `flip.x` - the pin would silently not apply", iface::show(&fx));
-        }
-        let f = d.boolean(false);
-        iface::set(st, &fx, Value::Bool(f))?;
-    }
-    Ok(())
-}
-
-/// The held trails' INPUT side at a held-unknown level: `p_jump`/`p_dash` each
-/// an independent 2-way fork. Every configuration is valid for every lane (a
-/// decided trail only over-approximates), so no premise.
-pub fn fork_held_inputs(st: &mut State<Symbolic>, d: &mut Symbolic) -> Result<()> {
-    for obj in objects_of_type(st, "player") {
-        for f in ["p_jump", "p_dash"] {
-            let p = field(&obj, &[f]);
-            let Some(Value::Bool(_)) = iface::get(st, &p) else {
-                bail!("{}: not a boolean", iface::show(&p));
-            };
-            let held = d.both_values(f);
-            iface::set(st, &p, Value::Bool(held))?;
-        }
-    }
-    Ok(())
 }
