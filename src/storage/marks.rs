@@ -127,11 +127,13 @@ impl RegionRanks<'_> {
 }
 
 /// An id's `(shape, key, cell)`: the shapes by index and every entry's key,
-/// from a tree's storage metadata (`storage::meta`).
+/// from a tree's storage metadata (`storage::meta`), and the tree's key
+/// space (to key other rows as the tree's: the concrete search, `known`).
 pub struct Resolver {
     geo: Geometry,
     shapes: Vec<u64>,
     keys: FxHashMap<u32, Vec<Key>>,
+    pub space: celeste_engine::exact::KeySpace,
 }
 
 impl Resolver {
@@ -141,6 +143,7 @@ impl Resolver {
         let geo = *super::geometry();
         let mut shapes: Vec<(u32, u64)> = Vec::new();
         let mut entries: Vec<(u32, u32, Key)> = Vec::new();
+        let mut adds = celeste_engine::exact::KeyAdditions::default();
         for f in 0..=last {
             if !dir.join("frames").join(format!("f{f:03}")).is_dir() {
                 continue;
@@ -148,8 +151,10 @@ impl Resolver {
             for m in super::meta::load_frame(dir, f).with_context(|| format!("{}: frame {f}'s storage metadata", dir.display()))? {
                 shapes.extend(m.shapes);
                 entries.extend(m.entries);
+                adds.extend(m.keys);
             }
         }
+        let space = celeste_engine::exact::KeySpace::from_additions(adds).with_context(|| format!("{}: the key space", dir.display()))?;
         shapes.sort_unstable();
         anyhow::ensure!(shapes.iter().enumerate().all(|(i, s)| s.0 as usize == i), "{}: the shapes are not numbered 0..{}", dir.display(), shapes.len());
         entries.sort_unstable();
@@ -159,7 +164,7 @@ impl Resolver {
             anyhow::ensure!(e as usize == v.len(), "{}: region {r}'s entries are not numbered densely", dir.display());
             v.push(k);
         }
-        Ok(Resolver { geo, shapes: shapes.into_iter().map(|s| s.1).collect(), keys })
+        Ok(Resolver { geo, shapes: shapes.into_iter().map(|s| s.1).collect(), keys, space })
     }
 
     /// `id`'s `(shape, key, cell)`.

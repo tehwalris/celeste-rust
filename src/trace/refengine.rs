@@ -86,7 +86,7 @@ impl RefEngine {
         self.it.button_reads = Some((buttons, 0));
         let leaves = run_frame_all(&mut self.it, self.body_concrete, &st, &[], Level::EXACT);
         let (_, mask) = self.it.button_reads.take().expect("set above");
-        let out = leaves?.iter().map(|l| Block::keyed(to_block(l)?)).collect::<Result<_>>()?;
+        let out = leaves?.iter().map(|l| Block::canonical(to_block(l)?)).collect::<Result<_>>()?;
         Ok((out, mask))
     }
 
@@ -167,7 +167,7 @@ impl RefEngine {
                 }
             }
         }
-        let out = leaves.iter().map(|l| Block::keyed(to_block(l)?)).collect::<Result<_>>()?;
+        let out = leaves.iter().map(|l| Block::canonical(to_block(l)?)).collect::<Result<_>>()?;
         Ok((out, mask))
     }
 
@@ -183,7 +183,7 @@ impl RefEngine {
     pub fn run_lane(&mut self, block: &Rt2, lane: usize) -> Result<Vec<Block>> {
         let (st, unknown) = from_block(block, lane, &self.fn_info, &self.base)?;
         let leaves = run_frame_all(&mut self.it, self.body, &st, &unknown, current_level())?;
-        leaves.iter().map(|l| Block::keyed(to_block(l)?)).collect()
+        leaves.iter().map(|l| Block::canonical(to_block(l)?)).collect()
     }
 }
 
@@ -336,12 +336,12 @@ mod tests {
         std::env::set_var("CELESTE_START_ROOM", "1,0");
         let inputs = crate::concrete::read_inputs("tas/room_1_0_exit_frame_99.txt").expect("the exit's inputs");
         let mut eng = RefEngine::new().expect("ref engine");
-        let exact = |bs: Vec<Block>| -> Vec<((u64, u64), u32)> { bs.iter().map(|b| (b.rt2().clone_block().row_keys_canonical(crate::compiled::ids())[0], b.positions().expect("cells")[0])).collect() };
+        let exact = |bs: Vec<Block>| -> Vec<(celeste_engine::exact::ExactRow, u32)> { bs.iter().map(|b| (celeste_engine::exact::exact_rows(b.rt2(), crate::compiled::ids()).swap_remove(0), b.positions().expect("cells")[0])).collect() };
         let mut row = eng.initial().expect("initial state");
         let (mut runs, mut checked) = (0, 0);
         for (f, &byte) in inputs.iter().enumerate() {
             if f % 4 == 0 {
-                let mut ran: Vec<(u8, u8, Vec<((u64, u64), u32)>)> = Vec::new();
+                let mut ran: Vec<(u8, u8, Vec<(celeste_engine::exact::ExactRow, u32)>)> = Vec::new();
                 for b in 0..64u8 {
                     let (succ, read) = eng.frame_reads(&row, b).expect("frame");
                     let succ = exact(succ);
@@ -374,11 +374,14 @@ mod tests {
         let level = Level::parse(level).expect("level");
         let inputs = crate::concrete::read_inputs(route).expect("the route's inputs");
         let mut eng = RefEngine::new().expect("ref engine");
-        let projected = |bs: &[Block]| -> std::collections::BTreeSet<(u64, (u64, u64), u32)> {
+        // The projections compared EXACTLY (their canonical bytes).
+        let projected = |bs: &[Block]| -> std::collections::BTreeSet<(celeste_engine::exact::ExactRow, u32)> {
             bs.iter()
                 .map(|b| {
-                    let (shape, keys, cells) = crate::frame::widened_keys(b, level).expect("projection");
-                    (shape, keys[0], cells[0])
+                    let mut w = b.rt2().clone_block();
+                    crate::frame::widen_rt2_to(&mut w, level);
+                    w.canonical();
+                    (celeste_engine::exact::exact_rows(&w, crate::compiled::ids()).swap_remove(0), crate::search::pos_graph::block_cells(&w).expect("cells")[0])
                 })
                 .collect()
         };

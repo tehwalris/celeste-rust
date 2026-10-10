@@ -372,7 +372,9 @@ impl MarksMap {
         anyhow::ensure!(payload.len() >= 8, "{}: too short for a marks file", path.display());
         let n = u64::from_le_bytes(payload[0..8].try_into().unwrap());
         let body = payload.len() as u64 - 8;
-        anyhow::ensure!(n.checked_mul(32).and_then(|b| b.checked_add(4)) == Some(body), "{}: {n} rows do not fit {body} payload bytes", path.display());
+        // The rows, the horizon, then the tree's key space (the keys are the
+        // tree's, as its frame rows').
+        anyhow::ensure!(n.checked_mul(32).and_then(|b| b.checked_add(4)).is_some_and(|b| b <= body), "{}: {n} rows do not fit {body} payload bytes", path.display());
         Ok(MarksMap { map, rows: n as usize })
     }
 
@@ -997,7 +999,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("celeste-ui-marks-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let save = |name: &str, rows: &[((u64, u64), u32, u64, u16)]| {
-            let mut v = crate::frame::Visited::new();
+            let mut v = crate::frame::Visited::new(Default::default());
             for &(key, cell, shape, deadline) in rows {
                 v.insert_until(shape, key, cell, deadline);
             }

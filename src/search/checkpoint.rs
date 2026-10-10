@@ -22,8 +22,9 @@ use celeste_engine::runtime2::{Cell2, Col, Rt2, AV};
 
 const MAGIC: &[u8; 4] = b"C8TB";
 /// Bump whenever the meaning or layout of ANY checkpoint content changes
-/// (older trees are refused; history in git).
-pub const FORMAT_VERSION: u32 = 12;
+/// (older trees are refused; history in git). 13: exact packed keys, the
+/// key space and the storage region side in the metadata (plans/exact-keys.md).
+pub const FORMAT_VERSION: u32 = 13;
 
 /// Where one column lives: uniform (in the header) or raw in the data
 /// region at a byte offset, `width` entries of the kind's fixed width.

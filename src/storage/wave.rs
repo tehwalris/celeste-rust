@@ -15,6 +15,7 @@ use super::edges::XferTable;
 use super::meta::FrameMeta;
 use super::unit::{RaiseCtx, UnitOut, UnitSink};
 use super::visited::{Key, RegionTable, VisitedSet};
+use celeste_engine::exact::{is_provisional, Code, MissKey, Provisional};
 use super::{id_region, region_of, state_id, StateId};
 use crate::frame::{phases, Block, Filters, FrameStats, FrameStep, Layer};
 
@@ -232,15 +233,16 @@ pub fn run_wave(engine: &dyn FrameStep, frontier: Vec<Block>, cx: WaveCtx) -> Re
     }
     let shared: &VisitedSet = visited;
     let claims = super::unit::Claims::default();
+    let prov = Provisional::default();
     let done: Vec<Done> = std::thread::scope(|scope| {
         let handles: Vec<_> = (0..workers)
             .map(|w| {
-                let (frontier, cells, order, units, next_unit, notes, claims, index_path) = (&frontier, &cells, &order, &units, &next_unit, notes.as_ref(), &claims, &index_path);
+                let (frontier, cells, order, units, next_unit, notes, claims, prov, index_path) = (&frontier, &cells, &order, &units, &next_unit, notes.as_ref(), &claims, &prov, &index_path);
                 std::thread::Builder::new().stack_size(WORKER_STACK).spawn_scoped(scope, move || -> Result<Done> {
                     crate::compiled::asm_kernel::set_thread_stack(WORKER_STACK);
                     let t = Instant::now();
                     let raise = raised.map(|r| RaiseCtx { raised: r, layers: layers.expect("checked") });
-                    let mut sink = UnitSink::new(shared, claims, filters, frame, w as u32, record, pos.is_some(), notes, raise);
+                    let mut sink = UnitSink::new(shared, claims, prov, filters, frame, w as u32, record, pos.is_some(), notes, raise);
                     if let Some(p) = index_path {
                         sink.stream_blocks(p)?;
                     }
@@ -304,7 +306,9 @@ pub fn run_wave(engine: &dyn FrameStep, frontier: Vec<Block>, cx: WaveCtx) -> Re
     let t = Instant::now();
     let tr = phases::start();
     drop(claims);
-    let (new_states, meta) = translate(visited, &mut outs, frame)?;
+    let (new_states, meta) = translate(visited, &mut outs, &prov, frame)?;
+    drop(prov);
+    (st.key_bits, st.key_codes, st.new_codes) = (visited.keys.max_bits(), visited.keys.codes(), meta.keys.codes.len());
     resolve_lids(visited, &outs, frame)?;
     phases::add(phases::TRANSLATE, tr);
     st.t_translate = t.elapsed();
@@ -342,15 +346,71 @@ pub fn run_wave(engine: &dyn FrameStep, frontier: Vec<Block>, cx: WaveCtx) -> Re
 /// A new state: its id and its row (unit, buffer, row).
 pub(crate) type NewState = (StateId, u32, u32, u32);
 
-/// THE TRANSLATION: the units' requests into the visited set. New shapes
+/// The frame's PROVISIONAL keys made final (plans/exact-keys.md): the
+/// requested states' codes the key space lacks, per (shape, field) SORTED
+/// and appended (new shapes first, by hash), then every provisional key in
+/// the units - lids and row buffers - replaced by its packed key. The
+/// dictionaries then are a function of the frame's new states.
+fn finalize_keys(visited: &mut VisitedSet, outs: &mut [UnitOut], prov: &Provisional, meta: &mut FrameMeta) {
+    let mut keys: Vec<Key> = outs.iter().flat_map(|u| u.requests.iter().map(|r| u.lids[r.lid as usize].key)).filter(|&k| is_provisional(k)).collect();
+    keys.sort_unstable();
+    keys.dedup();
+    if keys.is_empty() {
+        return;
+    }
+    let contents: Vec<MissKey> = keys.iter().map(|&k| prov.content(k)).collect();
+    let mut new_shapes: Vec<u64> = contents.iter().map(|m| m.shape).filter(|&s| visited.keys.shape(s).is_none()).collect();
+    new_shapes.sort_unstable();
+    new_shapes.dedup();
+    for s in new_shapes {
+        let r = prov.shape_record(s).unwrap_or_else(|| panic!("exact keys: the new shape {s:#x} was not noted"));
+        visited.keys.add_shape(&r, &mut meta.keys);
+    }
+    let mut codes: std::collections::BTreeMap<(u64, u32), std::collections::BTreeSet<Code>> = Default::default();
+    for m in &contents {
+        for &(c, code) in &m.missing {
+            codes.entry((m.shape, c)).or_default().insert(code);
+        }
+    }
+    for ((shape, cell), set) in codes {
+        visited.keys.add_codes(shape, cell, &set.into_iter().collect::<Vec<_>>(), &mut meta.keys);
+    }
+    let map: rustc_hash::FxHashMap<Key, Key> = keys.iter().zip(&contents).map(|(&k, m)| (k, visited.keys.complete(m))).collect();
+    let fin = |k: &mut Key| {
+        if is_provisional(*k) {
+            if let Some(f) = map.get(k) {
+                *k = *f;
+            }
+        }
+    };
+    let threads = crate::frame::threads().max(1);
+    let per = outs.len().div_ceil(threads).max(1);
+    std::thread::scope(|sc| {
+        for part in outs.chunks_mut(per) {
+            let fin = &fin;
+            sc.spawn(move || {
+                for u in part {
+                    u.lids.iter_mut().for_each(|l| fin(&mut l.key));
+                    for b in &mut u.bufs {
+                        b.keys.iter_mut().for_each(fin);
+                    }
+                }
+            });
+        }
+    });
+}
+
+/// THE TRANSLATION: the units' requests into the visited set, their
+/// provisional keys made final first (`finalize_keys`). New shapes
 /// numbered first (in hash order), then each target region on one worker:
 /// its requests sorted by (key, cell, unit, request), each distinct key
 /// found or appended as an entry (in key order: canonical numbers), each
 /// distinct (entry, cell) a NEW state, its row the first request's; every
 /// request's lid gets its owner. Returns the new states by id, and the
 /// frame's metadata.
-pub(crate) fn translate(visited: &mut VisitedSet, outs: &mut [UnitOut], frame: u32) -> Result<(Vec<NewState>, FrameMeta)> {
-    let mut meta = FrameMeta::default();
+pub(crate) fn translate(visited: &mut VisitedSet, outs: &mut [UnitOut], prov: &Provisional, frame: u32) -> Result<(Vec<NewState>, FrameMeta)> {
+    let mut meta = FrameMeta::new();
+    finalize_keys(visited, outs, prov, &mut meta);
     let mut new_shapes: Vec<u64> = outs.iter().flat_map(|u| u.requests.iter().map(|r| u.lids[r.lid as usize].shape)).filter(|s| visited.shape_index(*s).is_none()).collect();
     new_shapes.sort_unstable();
     new_shapes.dedup();
@@ -549,7 +609,7 @@ pub(crate) fn gather_layer(visited: &VisitedSet, outs: &[UnitOut], news: &[NewSt
             gather(&src_refs, &rows)
         };
         let ids: Vec<StateId> = part.iter().map(|n| n.0).collect();
-        crate::compiled::asm_kernel::key_check_block(&rt2);
+        crate::compiled::asm_kernel::key_check_block(&rt2, &visited.keys);
         let b = Block::layer_piece(rt2, ids, seq);
         if crate::compiled::asm_kernel::key_check_on() {
             let cells = b.positions()?;
@@ -686,7 +746,31 @@ fn gather(srcs: &[&Rt2], rows: &[u64]) -> Rt2 {
 /// reordered by id and given its ids (seq: its place); the metadata.
 pub fn seed(visited: &mut VisitedSet, blocks: &mut [Block]) -> Result<FrameMeta> {
     let geo = visited.geo;
-    let mut meta = FrameMeta::default();
+    let mut meta = FrameMeta::new();
+    // The key space: every initial code, per field sorted; then the keys.
+    // A row is keyed as the forward keys a reference row (`UnitSink::row_key`:
+    // the level's held buttons widened) and stored as it is.
+    let ids = crate::compiled::ids();
+    let level = crate::abstraction::Level { held: crate::abstraction::current_level().held, ..crate::abstraction::Level::EXACT };
+    let mut canon: Vec<Rt2> = Vec::with_capacity(blocks.len());
+    let mut views: Vec<Rt2> = Vec::with_capacity(blocks.len());
+    for b in blocks.iter() {
+        let mut r = b.rt2().clone_block();
+        r.canonical();
+        let mut v = r.clone_block();
+        crate::frame::widen_rt2_to(&mut v, level);
+        v.canonical();
+        ensure!(v.shape_hash == r.shape_hash, "an initial row's key view changed its shape");
+        canon.push(r);
+        views.push(v);
+    }
+    meta.keys = visited.keys.absorb(&views.iter().collect::<Vec<_>>(), ids);
+    let keys: Vec<Vec<Key>> = views
+        .iter()
+        .map(|r| {
+            visited.keys.lookup_keys(r, ids).into_iter().map(|k| k.expect("seeded codes")).collect()
+        })
+        .collect();
     let mut shapes: Vec<u64> = blocks.iter().map(Block::shard_shape).filter(|s| visited.shape_index(*s).is_none()).collect();
     shapes.sort_unstable();
     shapes.dedup();
@@ -698,7 +782,7 @@ pub fn seed(visited: &mut VisitedSet, blocks: &mut [Block]) -> Result<FrameMeta>
     let mut rows: Vec<(u32, Key, u32, usize, usize)> = Vec::new();
     for (bi, b) in blocks.iter().enumerate() {
         let si = visited.shape_index(b.shard_shape()).expect("numbered above");
-        for (lane, (&cell, &key)) in b.positions()?.iter().zip(b.keys()).enumerate() {
+        for (lane, (&cell, &key)) in b.positions()?.iter().zip(&keys[bi]).enumerate() {
             let (slot, local) = geo.slot_local(cell);
             rows.push((region_of(&geo, si, slot), key, local, bi, lane));
         }
@@ -722,7 +806,9 @@ pub fn seed(visited: &mut VisitedSet, blocks: &mut [Block]) -> Result<FrameMeta>
         let mut order: Vec<u32> = (0..b.lanes() as u32).collect();
         order.sort_unstable_by_key(|&l| ids[l as usize]);
         let sorted: Vec<StateId> = order.iter().map(|&l| ids[l as usize]).collect();
-        let mut rt2 = b.rt2().clone_block();
+        ensure!(canon[seq].shape_hash == b.shard_shape(), "an initial block is not canonical");
+        let mut rt2 = canon[seq].clone_block();
+        rt2.row_keys = keys[seq].clone();
         rt2.gather_lanes(&order);
         *b = Block::layer_piece(rt2, sorted, seq as u32);
     }

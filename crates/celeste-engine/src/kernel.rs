@@ -14,7 +14,7 @@ use std::arch::x86_64::*;
 
 pub const W: usize = 16;
 
-pub use crate::runtime2::{cell_mix, mix64};
+pub use crate::runtime2::mix64;
 
 /// One num column: 16 `Pico8Num`s = 16 raw `i32`s = one zmm register.
 ///

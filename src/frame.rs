@@ -80,25 +80,23 @@ pub struct Block {
 }
 
 impl Block {
-    /// Wrap an engine block; its key column must be present (nothing re-hashes).
+    /// Wrap an engine block: a stored piece with its key column, or rows
+    /// with none (keys are a key space's: `exact::KeySpace`).
     pub fn from_rt2(rt2: Rt2) -> Self {
-        assert_eq!(
-            rt2.row_keys.len(),
-            rt2.width,
-            "block without its key column ({} keys for {} lanes)",
+        assert!(
+            rt2.row_keys.is_empty() || rt2.row_keys.len() == rt2.width,
+            "block with a partial key column ({} keys for {} lanes)",
             rt2.row_keys.len(),
             rt2.width
         );
         Block { rt2, ids: Vec::new(), seq: 0, skip: Vec::new(), whole: false }
     }
 
-    /// A reference-engine block keyed as the level's kernels key it (held
-    /// buttons widened; objects stay decided, which is exact).
-    pub fn keyed(mut rt2: Rt2) -> Result<Self> {
-        let level = crate::abstraction::Level { held: crate::abstraction::current_level().held, ..crate::abstraction::Level::EXACT };
-        let (_, keys, _) = widened_keys_rt2(&rt2, level)?;
-        rt2.row_keys_canonical(crate::compiled::ids());
-        rt2.row_keys = keys;
+    /// A reference-engine block, CANONICAL (ids, shape hash), without keys:
+    /// a tree keys its rows (`UnitSink::row_key`), the concrete search
+    /// compares them whole (`exact::exact_rows`).
+    pub fn canonical(mut rt2: Rt2) -> Result<Self> {
+        rt2.canonical();
         Ok(Block { rt2, ids: Vec::new(), seq: 0, skip: Vec::new(), whole: false })
     }
 
@@ -110,8 +108,9 @@ impl Block {
         &self.rt2
     }
 
-    /// The 128-bit canonical row key per lane: the identity everywhere.
+    /// A stored piece's EXACT keys per lane (its tree's key space).
     pub fn keys(&self) -> &[(u64, u64)] {
+        assert_eq!(self.rt2.row_keys.len(), self.rt2.width, "a block without its key column");
         &self.rt2.row_keys
     }
 
@@ -545,6 +544,8 @@ pub(crate) fn cell_too_late(cell: u32, frame: u32, h: u32, px: i32) -> bool {
 /// its projection (`Rt2::widen_to`) is a coarse node ARC-MARKED with deadline
 /// >= t. Sound: a fine state winning from t with remainder r projects to a
 /// coarse node winning from t with r (coarse over-approximates, r exact).
+/// The projection is keyed in the COARSE tree's key space (the marks'): a
+/// code it lacks is a state the coarse tree never reached.
 pub struct MarkFilter<'a> {
     marked: &'a Visited,
     coarser: crate::abstraction::Level,
@@ -573,8 +574,8 @@ impl<'a> MarkFilter<'a> {
     /// Per lane of `rt2`, its projection's deadline at the coarser level
     /// (`None`: not marked there).
     pub fn deadlines(&self, rt2: &Rt2) -> Result<Vec<Option<u16>>> {
-        let (shape, keys, cells) = widened_keys_rt2(rt2, self.coarser)?;
-        Ok(keys.iter().zip(&cells).map(|(k, &c)| self.marked.deadline(shape, *k, c)).collect())
+        let (shape, keys, cells) = widened_keys_rt2(rt2, self.coarser, self.marked.keys())?;
+        Ok(keys.iter().zip(&cells).map(|(k, &c)| k.and_then(|k| self.marked.deadline(shape, k, c))).collect())
     }
 
     /// The coarser level.
@@ -583,12 +584,14 @@ impl<'a> MarkFilter<'a> {
     }
 }
 
-/// Each lane's `(shape, key, cell)` at the `coarser` level (its node there).
+/// Each lane's `(shape, key, cell)` at the `coarser` level (its node there)
+/// in the key space `keys` (`None`: a code the space lacks - no node).
 pub fn widened_keys(
     block: &Block,
     coarser: crate::abstraction::Level,
-) -> Result<(u64, Vec<(u64, u64)>, Vec<u32>)> {
-    widened_keys_rt2(&block.rt2, coarser)
+    keys: &celeste_engine::exact::KeySpace,
+) -> Result<(u64, Vec<Option<(u64, u64)>>, Vec<u32>)> {
+    widened_keys_rt2(&block.rt2, coarser, keys)
 }
 
 /// `rt2` projected IN PLACE onto `level`, as its kernels would store it.
@@ -596,14 +599,17 @@ pub fn widen_rt2_to(rt2: &mut Rt2, level: crate::abstraction::Level) {
     rt2.widen_to(crate::compiled::ids(), level.held, level.fruit, level.floors_near, level.platforms);
 }
 
-/// `(shape, keys, cells)` of the widened rows (the widened block's shape).
+/// `(shape, keys, cells)` of the widened rows (the widened block's shape),
+/// keyed in `keys`.
 pub fn widened_keys_rt2(
     rt2: &Rt2,
     coarser: crate::abstraction::Level,
-) -> Result<(u64, Vec<(u64, u64)>, Vec<u32>)> {
+    keys: &celeste_engine::exact::KeySpace,
+) -> Result<(u64, Vec<Option<(u64, u64)>>, Vec<u32>)> {
     let mut w = rt2.clone_block();
     widen_rt2_to(&mut w, coarser);
-    let keys = w.row_keys_canonical(crate::compiled::ids());
+    w.canonical();
+    let keys = keys.lookup_keys(&w, crate::compiled::ids());
     let cells = crate::search::pos_graph::block_cells(&w)?;
     anyhow::ensure!(
         keys.len() == rt2.width && cells.len() == rt2.width,
@@ -683,6 +689,11 @@ pub struct FrameStats {
     pub rss_end: f64,
     /// File-backed resident pages at the end of the frame.
     pub rss_file: f64,
+    /// The key space after the frame: its widest shape's key bits, its codes,
+    /// and the codes the frame added (`exact::KeySpace`).
+    pub key_bits: u32,
+    pub key_codes: usize,
+    pub new_codes: usize,
 }
 
 /// The level -1 filter a tree's frames were built under
@@ -1369,7 +1380,8 @@ fn log_frame(
         "[fwd] f{frame:03} in {}/{} raw {} kept {} out {}/{} visited {} | \
          wave {:.0} (idle {:.0}%) translate {:.0} layer {:.0} ckpt {:.0} pos {:.0} total {:.0} ms | \
          units {} requests {} lids {} edges {} ({:.2} B) | \
-         in {:.2} visited {:.2} GB rss start {:.2} wave {:.2} end {:.2} peak {:.2} GB (anon; file {:.2})",
+         in {:.2} visited {:.2} GB rss start {:.2} wave {:.2} end {:.2} peak {:.2} GB (anon; file {:.2}) | \
+         keys {} bits, {} codes (+{})",
         st.blocks_in,
         st.lanes_in,
         st.lanes_raw,
@@ -1396,6 +1408,9 @@ fn log_frame(
         st.rss_end,
         crate::metrics::peak_rss_gb(),
         st.rss_file,
+        st.key_bits,
+        st.key_codes,
+        st.new_codes,
     );
     crate::metrics::record("fwd.wave", st.t_wave);
     crate::metrics::record("fwd.translate", st.t_translate);
@@ -1504,6 +1519,7 @@ pub fn restore_visited(dir: &std::path::Path, last: u32) -> Result<(crate::stora
     let geo = *crate::storage::geometry();
     let mut visited = crate::storage::visited::VisitedSet::new(geo);
     let metas = crate::storage::meta::load_tree(dir, last)?;
+    visited.keys = crate::storage::meta::key_space(&metas)?;
     let mut shapes: Vec<(u32, u64)> = metas.iter().flat_map(|m| m.shapes.iter().copied()).collect();
     shapes.sort_unstable();
     for (i, s) in shapes {
@@ -1550,44 +1566,61 @@ pub fn mark_row(shape: u64, key: (u64, u64), cell: u32, deadline: u16, horizon: 
 }
 
 /// A marks file (`Visited::save`) from its rows, in any order, each state
-/// once.
-pub fn save_marks(path: &std::path::Path, mut rows: Vec<MarkRow>, horizon: u32) -> Result<()> {
+/// once, with the key space its keys are in.
+pub fn save_marks(path: &std::path::Path, mut rows: Vec<MarkRow>, horizon: u32, keys: &celeste_engine::exact::KeySpace) -> Result<()> {
     rows.sort_unstable();
-    crate::search::checkpoint::save_value_to(path, &(rows, horizon))
+    crate::search::checkpoint::save_value_to(path, &(rows, horizon, keys.to_additions()))
+}
+
+/// A marks file's rows, horizon and key space.
+pub fn load_marks(path: &std::path::Path) -> Result<(Vec<MarkRow>, u32, celeste_engine::exact::KeySpace)> {
+    let bytes = std::fs::read(path)?;
+    let payload = crate::search::checkpoint::value_payload(&bytes, path)?;
+    let (rows, horizon, adds): (Vec<MarkRow>, u32, celeste_engine::exact::KeyAdditions) = bincode::deserialize(payload).with_context(|| format!("deserializing {}", path.display()))?;
+    Ok((rows, horizon, celeste_engine::exact::KeySpace::from_additions(adds).with_context(|| format!("{}: its key space", path.display()))?))
 }
 
 /// An in-memory set of states `(shape, cell, key)` (a level's MARKED states
-/// or a diagnostic's), saved as a marks file.
+/// or a diagnostic's), saved as a marks file; its keys are in the key space
+/// of the tree it names.
 #[derive(Default)]
 pub struct Visited {
     /// Sharded by (shape, cell); each key maps to its DEADLINE, the last frame
     /// from which it still wins by the horizon (`u16::MAX`: none).
     shards: rustc_hash::FxHashMap<(u64, u32), rustc_hash::FxHashMap<(u64, u64), u16>>,
+    keys: celeste_engine::exact::KeySpace,
 }
 
 impl Visited {
-    pub fn new() -> Self {
-        Self::default()
+    /// An empty set over the key space `keys`.
+    pub fn new(keys: celeste_engine::exact::KeySpace) -> Self {
+        Visited { shards: Default::default(), keys }
     }
-    /// `(entries, order-independent hash of the (key, cell) set)`.
+    /// The key space the keys are in.
+    pub fn keys(&self) -> &celeste_engine::exact::KeySpace {
+        &self.keys
+    }
+    /// `(entries, order-independent CONTENT hash of the (shape, key, cell)
+    /// set)` (`exact::ContentHash`).
     pub fn fingerprint(&self) -> (usize, u64) {
-        use celeste_engine::runtime2::mix64;
+        let h = self.keys.content_hash();
         let mut acc = 0u64;
-        for ((_shape, cell), keys) in &self.shards {
-            for &(k0, k1) in keys.keys() {
-                acc = acc.wrapping_add(mix64(k0 ^ mix64(k1 ^ (*cell as u64) << 1)));
+        for ((shape, cell), keys) in &self.shards {
+            for &k in keys.keys() {
+                acc = acc.wrapping_add(h.state(*shape, k, *cell));
             }
         }
         (self.len(), acc)
     }
-    /// An order-independent hash of every `(shape, cell, key, deadline)`:
-    /// equal values filter alike (`MarkFilter`).
+    /// An order-independent content hash of every `(shape, cell, key,
+    /// deadline)`: equal values filter alike (`MarkFilter`).
     pub fn filter_fingerprint(&self) -> u64 {
         use celeste_engine::runtime2::mix64;
+        let h = self.keys.content_hash();
         let mut acc = 0u64;
         for ((shape, cell), keys) in &self.shards {
-            for (&(k0, k1), &d) in keys {
-                acc = acc.wrapping_add(mix64(k0 ^ mix64(k1 ^ mix64(*shape ^ ((*cell as u64) << 16 | d as u64)))));
+            for (&k, &d) in keys {
+                acc = acc.wrapping_add(mix64(h.state(*shape, k, *cell) ^ (d as u64) << 3));
             }
         }
         acc
@@ -1629,15 +1662,13 @@ impl Visited {
         for ((shape, cell), keys) in &self.shards {
             rows.extend(keys.iter().map(|(&key, &d)| mark_row(*shape, key, *cell, d, horizon)));
         }
-        save_marks(path, rows, horizon)
+        save_marks(path, rows, horizon, &self.keys)
     }
 
     /// A marks file (`save`).
     pub fn load(path: &std::path::Path) -> Result<Self> {
-        let bytes = std::fs::read(path)?;
-        let payload = crate::search::checkpoint::value_payload(&bytes, path)?;
-        let (rows, horizon): (Vec<MarkRow>, u32) = bincode::deserialize(payload).with_context(|| format!("deserializing {}", path.display()))?;
-        let mut out = Self::new();
+        let (rows, horizon, keys) = load_marks(path)?;
+        let mut out = Self::new(keys);
         for (shape, cell, k0, k1, dist) in rows {
             anyhow::ensure!(dist <= horizon, "{}: a mark {dist} frames before h{horizon}", path.display());
             out.insert_until(shape, (k0, k1), cell, u16::try_from(horizon - dist).unwrap_or(u16::MAX));
@@ -1674,15 +1705,22 @@ mod tests {
     fn the_mark_filter_admits_up_to_the_deadline() {
         use crate::abstraction::Level;
         let engine = RefEngine::new().expect("ref engine");
-        let block = Block::keyed(engine.initial().expect("initial state")).expect("block");
+        let block = Block::canonical(engine.initial().expect("initial state")).expect("block");
         let coarse = Level::parse("r0sxh").expect("level");
-        let (shape, keys, cells) = widened_keys(&block, coarse).expect("keys");
-        let mut marked = Visited::new();
-        marked.insert_until(shape, keys[0], cells[0], 5);
+        // The coarse key space holds the projection's codes.
+        let mut w = block.rt2().clone_block();
+        widen_rt2_to(&mut w, coarse);
+        w.canonical();
+        let mut space = celeste_engine::exact::KeySpace::new();
+        space.absorb(&[&w], crate::compiled::ids());
+        let (shape, keys, cells) = widened_keys(&block, coarse, &space).expect("keys");
+        let mut marked = Visited::new(space.clone());
+        marked.insert_until(shape, keys[0].expect("keyed"), cells[0], 5);
         let f = MarkFilter::new(&marked, coarse);
         assert_eq!(f.allowed(block.rt2(), 5).expect("filter"), vec![true], "at the deadline");
         assert_eq!(f.allowed(block.rt2(), 6).expect("filter"), vec![false], "past it");
-        let empty = Visited::new();
+        assert_eq!(MarkFilter::new(&Visited::new(Default::default()), coarse).allowed(block.rt2(), 0).expect("filter"), vec![false], "a key space without its codes");
+        let empty = Visited::new(space);
         assert_eq!(MarkFilter::new(&empty, coarse).allowed(block.rt2(), 0).expect("filter"), vec![false], "not marked");
     }
 
@@ -1697,7 +1735,7 @@ mod tests {
     #[test]
     fn a_fresh_forward_clears_what_a_killed_run_left() {
         let engine = RefEngine::new().expect("ref engine");
-        let init = vec![Block::keyed(engine.initial().expect("initial state")).expect("block")];
+        let init = vec![Block::canonical(engine.initial().expect("initial state")).expect("block")];
         let dir = std::path::Path::new("/var/tmp/celeste-frame-fresh-start-test");
         let _ = std::fs::remove_dir_all(dir);
         let stale = [dir.join("edges/f009.bin"), dir.join("edges/xfer.bin"), dir.join("frames/f009/b0_s0.bin")];
@@ -1719,7 +1757,7 @@ mod tests {
     #[test]
     fn a_trimmed_frame_keeps_its_keys_cells_and_wins() {
         let engine = std::sync::Mutex::new(RefEngine::new().expect("ref engine"));
-        let init = vec![Block::keyed(engine.lock().unwrap().initial().expect("initial state")).expect("block")];
+        let init = vec![Block::canonical(engine.lock().unwrap().initial().expect("initial state")).expect("block")];
         let dir = std::path::Path::new("/var/tmp/celeste-frame-trim-test");
         let _ = std::fs::remove_dir_all(dir);
         let mut st = ForwardState::start(init, dir, true, None).expect("start");
@@ -1761,17 +1799,24 @@ mod tests {
     #[test]
     fn marks_files_keep_their_deadlines() {
         let path = std::env::temp_dir().join(format!("celeste-marks-roundtrip-{}.bin", std::process::id()));
-        let mut v = Visited::new();
-        v.insert_until(1, (2, 3), 4, 7);
-        v.insert_until(1, (5, 6), 4, 12);
-        v.insert(9, (2, 3), 8);
+        // A key space with shapes 1 and 9, two codes in one field each.
+        let mut space = celeste_engine::exact::KeySpace::new();
+        let mut adds = Default::default();
+        for shape in [1, 9] {
+            space.add_shape(&celeste_engine::exact::ShapeRecord { hash: shape, sig: vec![1, u32::MAX], pos: None }, &mut adds);
+            space.add_codes(shape, 0, &[celeste_engine::exact::Code::num(0, 0), celeste_engine::exact::Code::num(1, 1)], &mut adds);
+        }
+        let mut v = Visited::new(space);
+        v.insert_until(1, (0, 0), 4, 7);
+        v.insert_until(1, (0, 1), 4, 12);
+        v.insert(9, (0, 0), 8);
         v.save(&path, 12).expect("save");
         let w = Visited::load(&path).expect("load");
         std::fs::remove_file(&path).expect("rm");
         assert_eq!(w.fingerprint(), v.fingerprint());
-        assert_eq!(w.deadline(1, (2, 3), 4), Some(7));
-        assert_eq!(w.deadline(1, (5, 6), 4), Some(12));
-        assert_eq!(w.deadline(9, (2, 3), 8), Some(12), "no deadline: the horizon");
+        assert_eq!(w.deadline(1, (0, 0), 4), Some(7));
+        assert_eq!(w.deadline(1, (0, 1), 4), Some(12));
+        assert_eq!(w.deadline(9, (0, 0), 8), Some(12), "no deadline: the horizon");
     }
 
     /// Extending frame by frame and resuming reproduce a fresh run's key sets.
@@ -1792,7 +1837,7 @@ mod tests {
 
         {
             let e = RefEngine::new().expect("engine");
-            let init = vec![Block::keyed(e.initial().expect("init")).expect("block")];
+            let init = vec![Block::canonical(e.initial().expect("init")).expect("block")];
             forward_run(&Mutex::new(e), init, dir, 4, true).expect("fresh");
         }
         let fresh4 = keyset(4);
@@ -1801,7 +1846,7 @@ mod tests {
         // The same run extended one frame at a time.
         {
             let e = RefEngine::new().expect("engine");
-            let init = vec![Block::keyed(e.initial().expect("init")).expect("block")];
+            let init = vec![Block::canonical(e.initial().expect("init")).expect("block")];
             let e = Mutex::new(e);
             let mut st = ForwardState::start(init, dir, true, None).expect("start");
             assert_eq!(pos_graph_frame(dir), Some(0), "start must leave a graph beside f0");
@@ -1822,7 +1867,7 @@ mod tests {
         std::fs::create_dir_all(fresh_dir).expect("mkdir");
         {
             let e = RefEngine::new().expect("engine");
-            let init = vec![Block::keyed(e.initial().expect("init")).expect("block")];
+            let init = vec![Block::canonical(e.initial().expect("init")).expect("block")];
             forward_run(&Mutex::new(e), init, fresh_dir, 6, true).expect("fresh 6");
         }
         {
@@ -1917,7 +1962,8 @@ mod tests {
             assert!(grid.of_cell(cells[0]).is_some(), "the lane has a region");
             let visited = crate::storage::visited::VisitedSet::new(*crate::storage::geometry());
             let claims = crate::storage::unit::Claims::default();
-            let mut sink = crate::storage::unit::UnitSink::new(&visited, &claims, Filters::default(), 1, 0, false, false, None, None);
+            let prov = celeste_engine::exact::Provisional::default();
+            let mut sink = crate::storage::unit::UnitSink::new(&visited, &claims, &prov, Filters::default(), 1, 0, false, false, None, None);
             sink.begin(0, 0, 0, &[0], None, None, false);
             crate::compiled::dispatch::run_chunk_kernel(r, &cells, &[0], &mut sink)
         };
@@ -1979,7 +2025,8 @@ mod tests {
             let cells = crate::search::pos_graph::block_cells(r).expect("cells");
             let visited = crate::storage::visited::VisitedSet::new(*crate::storage::geometry());
             let claims = crate::storage::unit::Claims::default();
-            let mut sink = crate::storage::unit::UnitSink::new(&visited, &claims, Filters::default(), 1, 0, false, false, None, None);
+            let prov = celeste_engine::exact::Provisional::default();
+            let mut sink = crate::storage::unit::UnitSink::new(&visited, &claims, &prov, Filters::default(), 1, 0, false, false, None, None);
             sink.begin(0, 0, 0, &[0], None, None, false);
             crate::compiled::dispatch::run_chunk_kernel(r, &cells, &[0], &mut sink)
         };
@@ -2020,17 +2067,20 @@ mod tests {
         assert!(wins_of(exit.rt2()).expect("wins")[0], "the reference solution exits at frame 127");
         let mut parent = st;
         widen_rt2_to(&mut parent, level);
-        let next = crate::storage::wave::one_frame(&kernels, vec![Block::from_rt2(parent)], 127).expect("frame").next;
-        let mut made: std::collections::BTreeSet<(u64, (u64, u64), u32)> = Default::default();
-        for b in &next {
-            let stored = b.keys().to_vec();
-            let canonical = b.rt2().clone_block().row_keys_canonical(crate::compiled::ids());
-            assert_eq!(stored, canonical, "an emitted row's key is not its columns' key (shape {:#x})", b.rt2().shape_hash);
-            let (shape, keys, cells) = widened_keys(b, level).expect("keys");
+        let wave = crate::storage::wave::one_frame(&kernels, vec![Block::from_rt2(parent)], 127).expect("frame");
+        // The wave's key space (it started empty): its codes are the frame's.
+        let space = celeste_engine::exact::KeySpace::from_additions(wave.meta.keys.clone()).expect("the key space");
+        let mut made: std::collections::BTreeSet<(u64, Option<(u64, u64)>, u32)> = Default::default();
+        for b in &wave.next {
+            let stored: Vec<Option<(u64, u64)>> = b.keys().iter().map(|&k| Some(k)).collect();
+            let mut canonical = b.rt2().clone_block();
+            canonical.canonical();
+            assert_eq!(stored, space.lookup_keys(&canonical, crate::compiled::ids()), "an emitted row's key is not its columns' key (shape {:#x})", b.rt2().shape_hash);
+            let (shape, keys, cells) = widened_keys(b, level, &space).expect("keys");
             made.extend(keys.into_iter().zip(cells).map(|(k, c)| (shape, k, c)));
         }
-        let (shape, keys, cells) = widened_keys(&exit, level).expect("keys");
-        assert!(made.contains(&(shape, keys[0], cells[0])), "the kernels do not make the concrete exit's state ({} successors)", made.len());
+        let (shape, keys, cells) = widened_keys(&exit, level, &space).expect("keys");
+        assert!(keys[0].is_some() && made.contains(&(shape, keys[0], cells[0])), "the kernels do not make the concrete exit's state ({} successors)", made.len());
     }
 
     /// The summit wins at the flag: the TAS31 reference wins at frame 55, not before.
@@ -2068,7 +2118,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
         std::fs::create_dir_all(dir).expect("checkpoint dir");
         let engine = crate::compiled::FrameEngine::new_for_start_room().expect("engine");
-        let init = vec![Block::keyed(RefEngine::new().expect("ref").initial().expect("init")).expect("block")];
+        let init = vec![Block::canonical(RefEngine::new().expect("ref").initial().expect("init")).expect("block")];
         // Unsplit, frame by frame: 1 state a frame through the spawn, then these.
         let unsplit: Vec<(u32, usize)> = (0..24).map(|f| (f, 1)).chain([(24, 27), (25, 308), (26, 1576), (27, 5559), (28, 15348)]).collect();
         let last = unsplit.last().unwrap().0;

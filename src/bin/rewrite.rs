@@ -10,7 +10,7 @@ use celeste_rust::trace::refengine::RefEngine;
 use celeste_rust::frame::{frame_files, frame_paths, load_row, widen_rt2_to, widened_keys, wins_of, Block, FrameStep, MinusOne, Visited};
 use celeste_rust::storage::{show_id, StateId};
 use celeste_rust::abstraction::{set_level, Level};
-use celeste_rust::search::inspect::{brief, cell_names, parse_xy, player_summary, project_all, project_onto, project_row, projection_key, Proj};
+use celeste_rust::search::inspect::{brief, cell_names, parse_xy, player_summary, project_all, project_onto, project_row, Proj};
 use clap::{Parser, Subcommand};
 
 /// mimalloc, not glibc: glibc retains gigabytes of freed slot chunks across
@@ -384,7 +384,8 @@ enum Command {
         #[arg(long, default_value_t = 40)]
         depth: u32,
         /// Write sample 0's chain, frame 1 to `step`, as a keyed trajectory
-        /// (`trajectory --trajectory FILE --spec LEVEL` realizes it). Not
+        /// (`trajectory --trajectory FILE --spec LEVEL --tree COARSE` realizes
+        /// it: the keys are the coarse tree's). Not
         /// with `--real`.
         #[arg(long)]
         chain_out: Option<String>,
@@ -494,6 +495,10 @@ enum Command {
         /// The level the keyed lines are projections onto (e.g. `r0sxhn`).
         #[arg(long, value_parser = Level::parse)]
         spec: Option<Level>,
+        /// The tree (level dir) whose key space the keyed lines' keys are in
+        /// (exact keys are a tree's dictionaries' indices).
+        #[arg(long)]
+        tree: Option<String>,
     },
     /// DIAGNOSTIC: follow a CONCRETE input sequence through one level's tree:
     /// per frame, whether the projected concrete state is a row of the tree.
@@ -529,14 +534,14 @@ enum Command {
     },
 }
 
-/// `coarse-census`: one frame's states as hashes, the named value cells
-/// under an `erase` prefix left out (pointers count as structure); and the
-/// frame's row count.
-fn erased_states(dir: &std::path::Path, frame: u32, erase: &[String]) -> Result<(u64, rustc_hash::FxHashSet<u64>)> {
-    use celeste_engine::runtime2::{av_code, mix64, Cell2, Col, AV};
+/// `coarse-census`: one frame's states EXACTLY (each row's named value
+/// cells and their codes, by name), the named value cells under an `erase`
+/// prefix left out (pointers count as structure); and the frame's row count.
+fn erased_states(dir: &std::path::Path, frame: u32, erase: &[String]) -> Result<(u64, rustc_hash::FxHashSet<Box<[u8]>>)> {
+    use celeste_engine::exact::Code;
+    use celeste_engine::runtime2::{Cell2, AV};
     let ids = celeste_rust::compiled::ids();
-    let name_hash = |s: &str| -> u64 { s.bytes().fold(0x9e37_79b9_7f4a_7c15u64, |h, b| mix64(h ^ b as u64)) };
-    let code = |v: AV| -> u64 { av_code(if let AV::Ptr(_) = v { AV::Ptr(0) } else { v }) };
+    let code = |v: AV| -> Code { Code::of(if let AV::Ptr(_) = v { AV::Ptr(0) } else { v }) };
     let (mut rows, mut states) = (0u64, rustc_hash::FxHashSet::default());
     for (_, path) in frame_paths(dir, frame)? {
         let ff = celeste_rust::search::checkpoint::FrameFile::open(&path)?;
@@ -545,23 +550,23 @@ fn erased_states(dir: &std::path::Path, frame: u32, erase: &[String]) -> Result<
             let Some(rt2) = ff.load_rows(&[lo..(lo + (1 << 20)).min(width)])? else { break };
             rows += rt2.width as u64;
             let names = cell_names(&rt2, ids);
-            let cells: Vec<(u64, usize)> = (0..rt2.cols.len())
+            let mut cells: Vec<(String, usize)> = (0..rt2.cols.len())
                 .filter(|&c| matches!(rt2.structure[c], Cell2::Val))
-                .map(|c| (c, names.get(&c).cloned().unwrap_or_else(|| format!("cell{c}"))))
-                .filter(|(_, nm)| !erase.iter().any(|p| nm.starts_with(p.as_str())))
-                .map(|(c, nm)| (name_hash(&nm), c))
+                .map(|c| (names.get(&c).cloned().unwrap_or_else(|| format!("cell{c}")), c))
+                .filter(|(nm, _)| !erase.iter().any(|p| nm.starts_with(p.as_str())))
                 .collect();
-            // The block's uniform cells once; the rest per row.
-            let mut base = 0u64;
-            let mut varying = Vec::new();
-            for &(h, c) in &cells {
-                match &rt2.cols[c] {
-                    Col::U(v) => base = base.wrapping_add(mix64(h ^ code(*v))),
-                    _ => varying.push((h, c)),
-                }
-            }
+            cells.sort();
             for r in 0..rt2.width {
-                states.insert(varying.iter().fold(base, |acc, &(h, c)| acc.wrapping_add(mix64(h ^ code(rt2.cols[c].at(r))))));
+                let mut b: Vec<u8> = Vec::new();
+                for (nm, c) in &cells {
+                    let k = code(rt2.cols[*c].at(r));
+                    b.extend_from_slice(nm.as_bytes());
+                    b.push(0);
+                    b.push(k.kind);
+                    b.extend_from_slice(&k.a.to_le_bytes());
+                    b.extend_from_slice(&k.b.to_le_bytes());
+                }
+                states.insert(b.into_boxed_slice());
             }
         }
     }
@@ -653,7 +658,7 @@ fn main() -> Result<()> {
                     want,
                     filter.as_ref(),
                     || Ok(Box::new(celeste_rust::compiled::FrameEngine::new_for_start_room()?)),
-                    || Ok(vec![Block::keyed(RefEngine::new()?.initial()?)?]),
+                    || Ok(vec![Block::canonical(RefEngine::new()?.initial()?)?]),
                 )?
                 .win_frame;
                 // `f` counts search steps (`ui_export::parse_log` reads this line).
@@ -759,7 +764,7 @@ fn main() -> Result<()> {
                 MinusOne::from_env(),
                 None,
                 || Ok(engine),
-                || Ok(vec![Block::keyed(RefEngine::new()?.initial()?)?]),
+                || Ok(vec![Block::canonical(RefEngine::new()?.initial()?)?]),
             )?;
             let wall = t.elapsed().as_secs_f64();
             match fwd.win_frame {
@@ -778,7 +783,8 @@ fn main() -> Result<()> {
             let load_marks = |p: Option<String>| p.map(|p| Visited::load(std::path::Path::new(&p))).transpose();
             let (fine_marks, coarse_marks) = (load_marks(fine_marks)?, load_marks(coarse_marks)?);
             let (fine, coarse) = (std::path::Path::new(&fine_dir), std::path::Path::new(&coarse_dir));
-            let mut reached = Visited::new();
+            // The fine rows' projections keyed in the COARSE tree's key space.
+            let mut reached = Visited::new(celeste_rust::storage::meta::tree_keys(coarse, to)?);
             let (mut total, mut missed, mut unmarked) = (0usize, 0usize, 0usize);
             let mut misses: Vec<String> = Vec::new();
             for f in 0..=to {
@@ -794,18 +800,20 @@ fn main() -> Result<()> {
                 let (mut n, mut miss, mut unm) = (0usize, 0usize, 0usize);
                 for block in load_frame(fine, f)? {
                     let cells = block.positions()?;
-                    let (ws, wk, wc) = widened_keys(&block, level)?;
+                    let (ws, wk, wc) = widened_keys(&block, level, reached.keys())?;
                     for i in 0..block.lanes() {
                         if fine_marks.as_ref().is_some_and(|m| !m.contains(block.shard_shape(), block.keys()[i], cells[i])) {
                             continue;
                         }
                         n += 1;
-                        if !reached.contains(ws, wk[i], wc[i]) {
+                        let Some(k) = wk[i].filter(|&k| reached.contains(ws, k, wc[i])) else {
                             miss += 1;
                             if misses.len() < 8 {
-                                misses.push(format!("f{f:03}: a fine row at {} projects to key {:016x}{:016x}, which the coarse tree has not reached", where_(wc[i]), wk[i].0, wk[i].1));
+                                misses.push(format!("f{f:03}: a fine row at {} projects to {}, which the coarse tree has not reached", where_(wc[i]), wk[i].map_or("a code the coarse tree never stored".to_string(), |k| format!("key {:016x}{:016x}", k.0, k.1))));
                             }
-                        } else if coarse_marks.as_ref().is_some_and(|m| !m.contains(ws, wk[i], wc[i])) {
+                            continue;
+                        };
+                        if coarse_marks.as_ref().is_some_and(|m| !m.contains(ws, k, wc[i])) {
                             unm += 1;
                         }
                     }
@@ -830,6 +838,9 @@ fn main() -> Result<()> {
         } => {
             std::env::set_var("CELESTE_START_ROOM", &room);
             let dir = std::path::Path::new(&checkpoint_dir);
+            // Fingerprints over CONTENT (`exact::ContentHash`): a raised tree's
+            // dictionaries grew in another order than a fresh one's.
+            let content = celeste_rust::storage::meta::tree_keys(dir, to)?.content_hash();
             let mut by_cell: rustc_hash::FxHashMap<u32, usize> = Default::default();
             let mut died = false;
             for frame in 0..=to {
@@ -843,9 +854,7 @@ fn main() -> Result<()> {
                 for block in celeste_rust::frame::load_frame(dir, frame)? {
                     let cells = block.positions()?;
                     for (k, &c) in block.keys().iter().zip(&cells) {
-                        acc = acc.wrapping_add(celeste_engine::runtime2::mix64(
-                            k.0 ^ celeste_engine::runtime2::mix64(k.1 ^ (c as u64) << 1),
-                        ));
+                        acc = acc.wrapping_add(content.state(block.shard_shape(), *k, c));
                         n += 1;
                         if frame == to && top_cells.is_some() {
                             *by_cell.entry(c).or_default() += 1;
@@ -862,8 +871,7 @@ fn main() -> Result<()> {
             let resolver = (edges || dropped).then(|| celeste_rust::storage::marks::Resolver::load(dir, to)).transpose()?;
             let node = |id: StateId| -> Result<u64> {
                 let (shape, k, cell) = resolver.as_ref().expect("loaded for edges and drops").resolve(id)?;
-                let mix = celeste_engine::runtime2::mix64;
-                Ok(mix(k.0 ^ mix(k.1 ^ mix(shape ^ cell as u64))))
+                Ok(content.state(shape, k, cell))
             };
             if edges {
                 let eg = celeste_rust::storage::edges::EdgeStore::open(&dir.join("edges"), to)?;
@@ -1102,7 +1110,10 @@ fn main() -> Result<()> {
             let row_of = |id: StateId| -> Result<Block> { Ok(Block::from_rt2(load_row(dir, id)?.0)) };
             // Every successor of `row` at remainder `rem` over all 64 inputs:
             // its projection onto the level and its player's remainder.
-            type Succ = ((u64, (u64, u64), u32), Option<(u32, u32)>);
+            type Succ = ((u64, Option<(u64, u64)>, u32), Option<(u32, u32)>);
+            // The tree's key space: projections keyed as its rows (`None`: a
+            // code it never stored).
+            let space = celeste_rust::storage::meta::tree_keys(dir, to)?;
             let steps = std::cell::Cell::new(0u64);
             let mut successors = |row: &Block, rem: (u32, u32)| -> Result<Vec<Succ>> {
                 // As the kernels read it: projected onto the level (the start
@@ -1137,7 +1148,7 @@ fn main() -> Result<()> {
                             }
                             None => None,
                         };
-                        let (shape, keys, cells) = widened_keys(&blk, level)?;
+                        let (shape, keys, cells) = widened_keys(&blk, level, &space)?;
                         out.push(((shape, keys[0], cells[0]), q));
                     }
                 }
@@ -1194,7 +1205,8 @@ fn main() -> Result<()> {
                     let src = r.src;
                     let src_row = row_of(src)?;
                     let tgt_row = row_of(r.target)?;
-                    let (tshape, tkeys, tcells) = widened_keys(&tgt_row, level)?;
+                    let (tshape, tkeys, tcells) = widened_keys(&tgt_row, level, &space)?;
+                    anyhow::ensure!(tkeys[0].is_some(), "arc-check: the target {} does not key in its own tree", show_id(r.target));
                     let target = (tshape, tkeys[0], tcells[0]);
                     let (gx, gy) = (r.x.guard, r.y.guard);
                     // Every record of this (pred, target), and its guards as rectangles.
@@ -1281,7 +1293,7 @@ fn main() -> Result<()> {
         }
         Command::CoarseCensus { level_dir, from, to, erase } => {
             let erase = prefixes(&erase);
-            let mut through: rustc_hash::FxHashSet<u64> = Default::default();
+            let mut through: rustc_hash::FxHashSet<Box<[u8]>> = Default::default();
             for frame in from..=to {
                 let (rows, states) = erased_states(std::path::Path::new(&level_dir), frame, &erase)?;
                 let n = states.len();
@@ -1397,14 +1409,15 @@ fn main() -> Result<()> {
                 }
             };
             // The real tree's projections per cell with their first step.
-            let mut real_cells: HashMap<u32, HashMap<u64, u32>> = Default::default();
+            // Projections compared EXACTLY (the projection itself as the key).
+            let mut real_cells: HashMap<u32, HashMap<Proj, u32>> = Default::default();
             let mut real_vals = Dist::new();
-            let mut real_of = |c: u32, vals: Option<&mut Dist>| -> Result<HashMap<u64, u32>> {
+            let mut real_of = |c: u32, vals: Option<&mut Dist>| -> Result<HashMap<Proj, u32>> {
                 if let Some(m) = real_cells.get(&c) {
                     return Ok(m.clone());
                 }
                 let (Some(real), mut vals) = (real, vals) else { return Ok(HashMap::new()) };
-                let mut m: HashMap<u64, u32> = Default::default();
+                let mut m: HashMap<Proj, u32> = Default::default();
                 for s in 0..=step {
                     for (_, f) in frame_files(real, s)? {
                         for range in f.rows_of_cell(c) {
@@ -1414,7 +1427,7 @@ fn main() -> Result<()> {
                                 if let (Some(vals), true) = (vals.as_deref_mut(), s == step) {
                                     tally(vals, &p);
                                 }
-                                m.entry(projection_key(&p)).or_insert(s);
+                                m.entry(p).or_insert(s);
                             }
                         }
                     }
@@ -1434,7 +1447,7 @@ fn main() -> Result<()> {
                         for r in 0..rt2.width {
                             total += 1;
                             let p = project(&rt2, r as u32);
-                            let is_real = real.is_some() && here_real.get(&projection_key(&p)).is_some_and(|&s| s <= step);
+                            let is_real = real.is_some() && here_real.get(&p).is_some_and(|&s| s <= step);
                             tally(if is_real { &mut co_vals } else { &mut sp_vals }, &p);
                             if !is_real {
                                 chosen.push(f.id_at(lo + r as u32));
@@ -1480,7 +1493,7 @@ fn main() -> Result<()> {
                     }
                 }
                 // (frame, cell, key) along the chain, for `--chain-out`.
-                let mut chain: Vec<(u32, u32, (u64, u64))> = vec![(layer, c, rt2.clone_block().row_keys_canonical(celeste_rust::compiled::ids())[0])];
+                let mut chain: Vec<(u32, u32, (u64, u64))> = vec![(layer, c, rt2.row_keys[0])];
                 let mut found = false;
                 for _ in 0..depth {
                     if layer == 0 {
@@ -1493,7 +1506,7 @@ fn main() -> Result<()> {
                     for &p in &preds {
                         let (rt, _, pc, _) = load_row(coarse, p)?;
                         let pp = project(&rt, 0);
-                        let is_real = real.is_some() && real_of(pc, None)?.get(&projection_key(&pp)).is_some_and(|&s| s < layer);
+                        let is_real = real.is_some() && real_of(pc, None)?.get(&pp).is_some_and(|&s| s < layer);
                         if is_real || pick.is_none() {
                             pick = Some((p, rt, pp, pc, is_real));
                         }
@@ -1519,7 +1532,7 @@ fn main() -> Result<()> {
                         break;
                     }
                     println!("  <- f{:03} {} [{}] ({} preds){}: {}", layer - 1, where_(pc), show_id(p), preds.len(), if real.is_some() { " still spurious" } else { "" }, changed.join(", "));
-                    chain.push((layer - 1, pc, rt.clone_block().row_keys_canonical(celeste_rust::compiled::ids())[0]));
+                    chain.push((layer - 1, pc, rt.row_keys[0]));
                     id = p;
                     layer -= 1;
                     cur = pp;
@@ -1709,17 +1722,18 @@ fn main() -> Result<()> {
             }
         }
         Command::ColCensus { level_dir, frame, cap, cell, erase, every } => {
-            use celeste_engine::runtime2::{av_code, num_code, Cell2, Col, AV};
+            use celeste_engine::exact::Code;
+            use celeste_engine::runtime2::{Cell2, Col, AV};
             let only_cell = cell.map(cell_at).transpose()?;
             let dir = std::path::Path::new(&level_dir);
             let ids = celeste_rust::compiled::ids();
             // shape -> (rows, per-column sets, player field names, spd pairs)
             struct S {
                 rows: u64,
-                cols: Vec<rustc_hash::FxHashSet<u64>>,
+                cols: Vec<rustc_hash::FxHashSet<Code>>,
                 varying: Vec<bool>,
                 names: std::collections::HashMap<usize, String>,
-                spd: rustc_hash::FxHashSet<u64>,
+                spd: rustc_hash::FxHashSet<(Code, Code)>,
                 /// Per column: rows holding an interval, rows holding an unknown bool.
                 ivals: Vec<u64>,
                 ubools: Vec<u64>,
@@ -1747,7 +1761,7 @@ fn main() -> Result<()> {
                         match col {
                             Col::U(v) => {
                                 if st.cols[c].len() < cap {
-                                    st.cols[c].insert(av_code(*v));
+                                    st.cols[c].insert(Code::of(*v));
                                 }
                             }
                             _ => {
@@ -1761,7 +1775,7 @@ fn main() -> Result<()> {
                                         _ => {}
                                     }
                                     if set.len() < cap {
-                                        set.insert(av_code(v));
+                                        set.insert(Code::of(v));
                                     }
                                 }
                             }
@@ -1773,7 +1787,7 @@ fn main() -> Result<()> {
                             if st.spd.len() >= cap {
                                 break;
                             }
-                            st.spd.insert(av_code(rt2.cols[sx].at(r)).rotate_left(32) ^ av_code(rt2.cols[sy].at(r)));
+                            st.spd.insert((Code::of(rt2.cols[sx].at(r)), Code::of(rt2.cols[sy].at(r))));
                         }
                     }
                 }
@@ -1787,7 +1801,7 @@ fn main() -> Result<()> {
                     println!("  c{c:<4} {n:>10} {:<18} intervals {:>10} unknown-bools {:>10}", st.names.get(&c).map(|s| s.as_str()).unwrap_or(""), st.ivals[c], st.ubools[c]);
                     // One cell's census lists the numbers themselves.
                     if only_cell.is_some() && n <= 64 {
-                        let mut vals: Vec<f64> = st.cols[c].iter().filter(|&&v| v == num_code(v as u32)).map(|&v| v as u32 as i32 as f64 / 65536.0).collect();
+                        let mut vals: Vec<f64> = st.cols[c].iter().filter(|v| v.kind == 0 && v.a == v.b).map(|v| v.a as i32 as f64 / 65536.0).collect();
                         vals.sort_by(|a, b| a.total_cmp(b));
                         if !vals.is_empty() {
                             println!("        {}", vals.iter().map(|v| format!("{v:.4}")).collect::<Vec<_>>().join(" "));
@@ -1798,7 +1812,7 @@ fn main() -> Result<()> {
             // Does the position saturate?
             if let Some(want) = only_cell {
                 let erase = prefixes(&erase);
-                let (mut all, mut spd, mut inner) = (rustc_hash::FxHashSet::<u64>::default(), rustc_hash::FxHashSet::<u64>::default(), rustc_hash::FxHashSet::<u64>::default());
+                let (mut all, mut spd, mut inner) = (rustc_hash::FxHashSet::<Proj>::default(), rustc_hash::FxHashSet::<Proj>::default(), rustc_hash::FxHashSet::<Proj>::default());
                 let mut first: Option<u32> = None;
                 println!("step | new | distinct states | speed pairs | inner (no speed)");
                 for s in 0..=frame {
@@ -1810,10 +1824,10 @@ fn main() -> Result<()> {
                             for r in 0..rt2.width {
                                 let mut p = project_row(&rt2, &names, r as u32, &erase);
                                 new += 1;
-                                all.insert(projection_key(&p));
+                                all.insert(p.clone());
                                 let sp: Proj = ["spd.x", "spd.y"].iter().map(|k| (k.to_string(), p.remove(*k).unwrap_or_default())).collect();
-                                spd.insert(projection_key(&sp));
-                                inner.insert(projection_key(&p));
+                                spd.insert(sp);
+                                inner.insert(p);
                             }
                         }
                     }
@@ -1862,6 +1876,7 @@ fn main() -> Result<()> {
             room,
             stop_at_win,
             spec,
+            tree,
         } => {
             std::env::set_var("CELESTE_START_ROOM", &room);
             let lines: Vec<(Option<(i32, i32)>, Option<(u64, u64)>)> = std::fs::read_to_string(&trajectory)?
@@ -1888,13 +1903,24 @@ fn main() -> Result<()> {
             let keyed: Vec<Option<(u64, u64)>> = lines.iter().map(|(_, k)| *k).collect();
             let level = spec;
             anyhow::ensure!(level.is_some() || keyed.iter().all(|k| k.is_none()), "keyed trajectory lines need --spec");
+            let space = match &tree {
+                Some(t) => {
+                    let t = std::path::Path::new(t);
+                    let last = (0..).take_while(|f| t.join("frames").join(format!("f{f:03}")).is_dir()).last().unwrap_or(0);
+                    celeste_rust::storage::meta::tree_keys(t, last)?
+                }
+                None => {
+                    anyhow::ensure!(keyed.iter().all(|k| k.is_none()), "keyed trajectory lines need --tree (the tree their keys are in)");
+                    Default::default()
+                }
+            };
             let mut eng = RefEngine::new()?;
             // (state, the inputs that led to it)
             let mut layer: Vec<(Rt2, Vec<u8>)> = vec![(eng.initial()?, Vec::new())];
             for (i, want) in traj.iter().enumerate() {
                 let f = i as u32 + 1;
                 let mut next: Vec<(Rt2, Vec<u8>)> = Vec::new();
-                let mut seen: rustc_hash::FxHashSet<(u64, u64, u32)> = Default::default();
+                let mut seen: rustc_hash::FxHashSet<celeste_engine::exact::ExactRow> = Default::default();
                 let mut tried = 0usize;
                 // Where the successors went: reported when none is at `want`.
                 let mut reached: std::collections::BTreeMap<Option<(i32, i32)>, usize> = Default::default();
@@ -1919,16 +1945,17 @@ fn main() -> Result<()> {
                                 }
                             }
                             if let (Some(k), Some(l)) = (keyed[i], level) {
-                                let (_, keys, _) = widened_keys(&block, l)?;
-                                if keys[0] != k {
+                                let (_, keys, _) = widened_keys(&block, l, &space)?;
+                                if keys[0] != Some(k) {
                                     off_chain += 1;
                                     off_chain_sample.get_or_insert_with(|| block.rt2().clone_block());
                                     continue;
                                 }
                             }
-                            // Deduplicated on the EXACT state's key.
-                            let key = block.rt2().clone_block().row_keys_canonical(celeste_rust::compiled::ids())[0];
-                            if !seen.insert((key.0, key.1, cell)) {
+                            // Deduplicated on the EXACT state.
+                            let mut exact = celeste_engine::exact::exact_rows(block.rt2(), celeste_rust::compiled::ids()).swap_remove(0).into_vec();
+                            exact.extend_from_slice(&cell.to_le_bytes());
+                            if !seen.insert(exact.into_boxed_slice()) {
                                 continue;
                             }
                             let mut p = path.clone();
@@ -1984,6 +2011,7 @@ fn main() -> Result<()> {
                 }
                 layers += 1;
             }
+            let space = celeste_rust::storage::meta::tree_keys(dir, layers.saturating_sub(1))?;
             eprintln!("[follow] {} rows in {layers} layers, {} inputs", at.len(), bytes.len());
             let mut eng = RefEngine::new()?;
             let mut states = vec![eng.initial()?];
@@ -2002,8 +2030,8 @@ fn main() -> Result<()> {
                     if wins_of(block.rt2())?.iter().any(|&w| w) {
                         won = true;
                     }
-                    let (_, keys, cells) = widened_keys(block, lvl)?;
-                    if let Some(&loc) = at.get(&(keys[0].0, keys[0].1, cells[0])) {
+                    let (_, keys, cells) = widened_keys(block, lvl, &space)?;
+                    if let Some(&loc) = keys[0].and_then(|k| at.get(&(k.0, k.1, cells[0]))) {
                         found = Some(loc);
                     }
                 }

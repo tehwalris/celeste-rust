@@ -13,7 +13,8 @@ use std::path::Path;
 use anyhow::{Context, Result};
 
 use celeste_core::pico8_num::Pico8Num as P8;
-use celeste_engine::runtime2::{self, Col, Rt2, AV};
+use celeste_engine::exact::{Code, FieldDict, KeySpace, MissKey, Provisional, ShapeKeys, ShapeRecord};
+use celeste_engine::runtime2::{Col, Rt2, AV};
 use celeste_engine::slots::reshape;
 
 use crate::transpile::asm::{AsmCtx, CellRepr, CollisionEnv, Compiled, Loaded, RootKind};
@@ -41,7 +42,7 @@ struct AsmBody {
     error_root: usize,
     error_off: usize,
     live_off: usize,
-    /// The per-row fields the row key folds; the rest are in the template's `part`.
+    /// The per-row fields of the key; the rest are the template's `uniform`.
     key_fields: Vec<KeyField>,
     /// Sources of player x/y and room x/y, for the row's cell (`pos_sources`).
     pos: Option<[PosSrc; 4]>,
@@ -168,16 +169,16 @@ impl ArcSlots {
     }
 }
 
-/// One field of a body's row key, specialized: `c` is `seed ^ cell * CELL_K`
-/// per half, `read` yields `runtime2::av_code` without building an `AV`.
+/// One per-row field of a body's key: its cell (the shape's dictionary)
+/// and output slot.
 struct KeyField {
-    c: [u64; 2],
+    cell: u32,
     root: usize,
     read: KeyRead,
 }
 
-/// How a key field's slot becomes its `av_code` (a position coordinate's:
-/// `runtime2::pos_code`).
+/// How a key field's slot becomes its code (a position coordinate's:
+/// `exact::Code::pos`).
 #[derive(Clone, Copy)]
 enum KeyRead {
     Num,
@@ -190,9 +191,7 @@ enum KeyRead {
 impl KeyField {
     /// `pos`: the cell is a position coordinate (`Rt2::position_cells`),
     /// which keys without its whole pixels.
-    fn new(cell: u64, root: usize, kind: RootKind, pos: bool) -> Result<KeyField> {
-        use celeste_engine::runtime2::CELL_K;
-        let ck = cell.wrapping_mul(CELL_K);
+    fn new(cell: u32, root: usize, kind: RootKind, pos: bool) -> Result<KeyField> {
         let read = match (kind, pos) {
             (RootKind::Num, false) => KeyRead::Num,
             (RootKind::Ival, false) => KeyRead::Ival,
@@ -201,72 +200,133 @@ impl KeyField {
             (RootKind::Ival, true) => KeyRead::PosIval,
             (RootKind::Bool, true) => anyhow::bail!("position cell {cell} is a boolean output: its row would have no cell"),
         };
-        Ok(KeyField { c: [KEY_SEED1 ^ ck, KEY_SEED2 ^ ck], root, read })
+        Ok(KeyField { cell, root, read })
     }
 
-    /// `runtime2::av_code` of every lane's value, off the output slot.
     #[inline]
-    fn codes(&self, buf: &[u8], out: &mut [u64; 16]) {
-        use celeste_engine::runtime2::{ival_code, num_code, pos_ival_code, POS_WHOLE};
+    fn words(buf: &[u8], o: usize) -> [u32; 16] {
+        let b: &[u8; 64] = buf[o..o + 64].try_into().unwrap();
+        std::array::from_fn(|i| u32::from_le_bytes([b[4 * i], b[4 * i + 1], b[4 * i + 2], b[4 * i + 3]]))
+    }
+
+    /// Each lane of `take`: its code's placed bits in `d` ORed into `k`, or
+    /// its bit in `miss` where `d` lacks the code. A field of at most a few
+    /// numbers is matched lane-parallel, code by code.
+    #[inline]
+    fn place16(&self, buf: &[u8], d: &FieldDict, take: u16, k: &mut [u128; 16], miss: &mut u16) {
+        use celeste_engine::runtime2::POS_WHOLE;
         let base = self.root;
-        let words = |o: usize| -> [u32; 16] {
-            let b: &[u8; 64] = buf[o..o + 64].try_into().unwrap();
-            std::array::from_fn(|i| u32::from_le_bytes([b[4 * i], b[4 * i + 1], b[4 * i + 2], b[4 * i + 3]]))
-        };
-        match self.read {
+        let (lo, hi) = match self.read {
             KeyRead::Num => {
-                let w = words(base);
-                for i in 0..16 {
-                    out[i] = num_code(w[i]);
-                }
+                let w = Self::words(buf, base);
+                (w, w)
             }
-            KeyRead::Ival => {
-                let (lo, hi) = (words(base), words(base + 64));
-                for i in 0..16 {
-                    out[i] = ival_code(lo[i], hi[i]);
-                }
+            KeyRead::Ival => (Self::words(buf, base), Self::words(buf, base + 64)),
+            KeyRead::PosNum => {
+                let w = Self::words(buf, base).map(|x| x & !POS_WHOLE);
+                (w, w)
+            }
+            KeyRead::PosIval => {
+                let (lo, hi) = (Self::words(buf, base), Self::words(buf, base + 64));
+                let whole: [u32; 16] = std::array::from_fn(|i| lo[i] & POS_WHOLE);
+                (std::array::from_fn(|i| lo[i].wrapping_sub(whole[i])), std::array::from_fn(|i| hi[i].wrapping_sub(whole[i])))
             }
             KeyRead::Bool => {
                 let val = u16::from_le_bytes([buf[base], buf[base + 1]]);
                 let known = u16::from_le_bytes([buf[base + 2], buf[base + 3]]);
-                for (i, o) in out.iter_mut().enumerate() {
-                    *o = if known & (1 << i) != 0 { 3u64 << 56 | (val >> i & 1) as u64 } else { 4u64 << 56 };
+                let mut m = take;
+                while m != 0 {
+                    let i = m.trailing_zeros() as usize;
+                    m &= m - 1;
+                    let tri = if known >> i & 1 == 1 { (val >> i & 1) as usize } else { 2 };
+                    match d.find_bool_placed(tri) {
+                        Some(p) => k[i] |= p,
+                        None => *miss |= 1 << i,
+                    }
                 }
+                return;
             }
-            KeyRead::PosNum => {
-                let w = words(base);
+        };
+        if let Some(small) = d.small_nums() {
+            let mut hit = 0u16;
+            for &(word, placed) in small {
+                let (a, b) = ((word >> 32) as u32, word as u32);
+                let mut eq = 0u16;
                 for i in 0..16 {
-                    out[i] = num_code(w[i] & !POS_WHOLE);
+                    eq |= (((lo[i] == a) & (hi[i] == b)) as u16) << i;
+                }
+                eq &= take;
+                hit |= eq;
+                if placed != 0 {
+                    while eq != 0 {
+                        let i = eq.trailing_zeros() as usize;
+                        eq &= eq - 1;
+                        k[i] |= placed;
+                    }
                 }
             }
-            KeyRead::PosIval => {
-                let (lo, hi) = (words(base), words(base + 64));
-                for i in 0..16 {
-                    out[i] = pos_ival_code(lo[i], hi[i]);
-                }
+            *miss |= take & !hit;
+            return;
+        }
+        let mut m = take;
+        while m != 0 {
+            let i = m.trailing_zeros() as usize;
+            m &= m - 1;
+            match d.find_num_placed(Code::num(lo[i], hi[i]).word()) {
+                Some(p) => k[i] |= p,
+                None => *miss |= 1 << i,
             }
+        }
+    }
+
+    /// Lane `i`'s code.
+    fn code(&self, buf: &[u8], i: usize) -> Code {
+        let w = |o: usize| u32::from_le_bytes(buf[o + 4 * i..o + 4 * i + 4].try_into().unwrap());
+        let base = self.root;
+        match self.read {
+            KeyRead::Num => Code::num(w(base), w(base)),
+            KeyRead::Ival => Code::num(w(base), w(base + 64)),
+            KeyRead::Bool => {
+                let val = u16::from_le_bytes([buf[base], buf[base + 1]]);
+                let known = u16::from_le_bytes([buf[base + 2], buf[base + 3]]);
+                Code::boolean((known >> i & 1 == 1).then_some(val >> i & 1 == 1))
+            }
+            KeyRead::PosNum => Code::pos(w(base), w(base)),
+            KeyRead::PosIval => Code::pos(w(base), w(base + 64)),
         }
     }
 }
 
 impl AsmBody {
-    /// Every lane's `Σ cell_mix` per half (`mix64(part + h)` is the boundary's
-    /// key), LANE-MAJOR so it vectorizes: one pass per field over 16 lanes
-    /// (a body that fires averages ~7 live lanes; one key per emission
-    /// in scalar code was a third of the forward, room (6,2) 100% f57).
+    /// Every lane of `take`'s packed key over the body's per-row fields,
+    /// OR'd onto the outcome's uniform part, and the lanes where a code is
+    /// not in its dictionary (all of them for a shape the key space lacks).
+    /// Lane by lane per field (a body that fires averages ~7 live lanes).
     #[inline]
-    fn key_words16(&self, buf: &[u8]) -> ([u64; 16], [u64; 16]) {
-        use celeste_engine::runtime2::mix64;
-        let (mut h1, mut h2) = ([0u64; 16], [0u64; 16]);
-        let mut code = [0u64; 16];
+    fn keys16(&self, buf: &[u8], sk: Option<&ShapeKeys>, part: u128, take: u16) -> ([u128; 16], u16) {
+        let mut k = [part; 16];
+        let Some(sk) = sk else { return (k, take) };
+        let mut miss = 0u16;
         for f in &self.key_fields {
-            f.codes(buf, &mut code);
-            for i in 0..16 {
-                h1[i] = h1[i].wrapping_add(mix64(f.c[0] ^ code[i]));
-                h2[i] = h2[i].wrapping_add(mix64(f.c[1] ^ code[i]));
+            let d = sk.field(f.cell as usize).unwrap_or_else(|| panic!("key field cell {} is not a value cell of shape {:#x}", f.cell, sk.record.hash));
+            f.place16(buf, d, take, &mut k, &mut miss);
+        }
+        (k, miss)
+    }
+
+    /// Lane `i`'s exact content where a code is missing: its fields that
+    /// hit packed (`partial`), the outcome's and the body's missing codes.
+    fn miss_key(&self, buf: &[u8], i: usize, sk: Option<&ShapeKeys>, shape: u64, partial: u128, part_missing: &[(u32, Code)]) -> MissKey {
+        use celeste_engine::exact::NONE;
+        let mut missing: Vec<(u32, Code)> = part_missing.to_vec();
+        for f in &self.key_fields {
+            let c = f.code(buf, i);
+            if sk.is_none_or(|sk| sk.field(f.cell as usize).is_none_or(|d| d.find(c) == NONE)) {
+                missing.push((f.cell, c));
             }
         }
-        (h1, h2)
+        missing.sort_unstable_by_key(|m| m.0);
+        MissKey { shape, partial: ((partial >> 64) as u64, partial as u64), missing }
     }
 }
 
@@ -291,9 +351,11 @@ struct AccTemplate {
     skeleton: Rt2,
     inits: Vec<(usize, ColInit)>,
     shape_hash: u64,
-    /// The key's uniform part: the shape hash plus every cell uniform at the
-    /// boundary, at its WIDENED value; a row's key is `mix64(part + h)`.
-    part: (u64, u64),
+    /// The key's uniform fields: every value cell uniform at the boundary,
+    /// at its WIDENED value, as `(cell, code)` by cell.
+    uniform: Vec<(u32, Code)>,
+    /// The shape as a key space records it (checked against its record).
+    record: ShapeRecord,
     /// This outcome's own skeleton, for cells the union makes typed.
     own: Rt2,
     /// The SHAPE's skeleton, typed wherever any outcome varies a cell: every
@@ -401,7 +463,9 @@ impl AsmKernel {
         let ctx = AsmCtx::new(&env as *const CollisionEnv as *const c_void);
         // Per-thread reused buffers: a fresh allocation faults every page.
         let mut sc = Scratch::take(self);
-        let Scratch { inbuf, outbuf, took, .. } = &mut sc;
+        let Scratch { inbuf, outbuf, took, parts, .. } = &mut sc;
+        let keys = sink.keys();
+        let generation = keys.generation();
         let body_cols = &self.body_cols;
 
         // Utilization tallies, folded into `CALL_STATS[3..]` at the end.
@@ -525,16 +589,26 @@ impl AsmKernel {
                 if take == 0 {
                     continue;
                 }
-                let keys = body.key_words16(outbuf);
+                // THE KEY: the outcome's uniform fields (once per key space
+                // generation), the body's per-row fields per lane; a code the
+                // key space lacks makes the state new: a provisional key.
+                let sk = keys.shape(shape);
+                if sk.is_none() {
+                    sink.note_shape(&template.record);
+                }
+                if parts[body.outcome].0 != generation {
+                    parts[body.outcome] = (generation, PartKey::of(template, sk));
+                }
+                let part = &parts[body.outcome].1;
+                let (packed, miss) = body.keys16(outbuf, sk, part.key, take);
                 while take != 0 {
                     let i = take.trailing_zeros() as usize;
                     take &= take - 1;
-                    let (h1, h2) = (keys.0[i], keys.1[i]);
-                    let part = template.part;
-                    let key = (
-                        runtime2::mix64(part.0.wrapping_add(h1)),
-                        runtime2::mix64(part.1.wrapping_add(h2)),
-                    );
+                    let key = if miss >> i & 1 == 0 && part.missing.is_empty() {
+                        ((packed[i] >> 64) as u64, packed[i] as u64)
+                    } else {
+                        sink.provisional().intern(body.miss_key(outbuf, i, sk, shape, packed[i], &part.missing))
+                    };
                     let (cin, cout) = (cell_in[lanes[i]], couts[i]);
                     // THE TRANSFER: per producer, on the edge, never in the row.
                     let xfer = record.then(|| {
@@ -803,6 +877,36 @@ struct Scratch {
     outbuf: Vec<u8>,
     /// Per body, the lanes it took this slice before `dup_refs` masking.
     took: Vec<u16>,
+    /// Per outcome, its uniform fields keyed in the key space of generation
+    /// `.0` (`PartKey`).
+    parts: Vec<(u64, PartKey)>,
+}
+
+/// An outcome's uniform fields in a key space: the packed codes that hit,
+/// the `(cell, code)` of those that miss.
+#[derive(Default)]
+struct PartKey {
+    key: u128,
+    missing: Vec<(u32, Code)>,
+}
+
+impl PartKey {
+    /// `t`'s uniform fields in `sk` (`None`: a shape the key space lacks),
+    /// the template's signature checked against the key space's.
+    fn of(t: &AccTemplate, sk: Option<&ShapeKeys>) -> PartKey {
+        use celeste_engine::exact::NONE;
+        let Some(sk) = sk else { return PartKey { key: 0, missing: t.uniform.clone() } };
+        assert!(sk.record == t.record, "exact keys: two shapes under the hash {:#x} (a shape-hash collision)", t.shape_hash);
+        let mut p = PartKey::default();
+        for &(c, code) in &t.uniform {
+            let d = sk.field(c as usize).unwrap_or_else(|| panic!("uniform cell {c} is not a value cell of shape {:#x}", t.shape_hash));
+            match d.find(code) {
+                NONE => p.missing.push((c, code)),
+                i => p.key |= d.place(i),
+            }
+        }
+        p
+    }
 }
 
 thread_local! {
@@ -822,6 +926,7 @@ impl Scratch {
                     inbuf: vec![0u8; k.compiled.input_bytes as usize],
                     outbuf: vec![0u8; k.compiled.out_bytes as usize],
                     took: vec![0u16; k.bodies.len()],
+                    parts: (0..k.acc_templates.len()).map(|_| (0, PartKey::default())).collect(),
                 },
             }
         })
@@ -981,16 +1086,25 @@ impl<'c> InputView<'c> {
 
 /// `CELESTE_KERNEL_KEY_CHECK=1`: the real boundary
 /// (`Rt2::boundary_canonicalize`) over a copy of an emitted block must
-/// change nothing (structure, shape hash, every row's key): the gate that
-/// the append's keys are exact.
-pub(crate) fn key_check(slot: &crate::storage::unit::RowBuf) {
+/// change nothing (structure, shape hash), and every row's key must be what
+/// the key space makes of the boundary's row - packed, or for a provisional
+/// key the same exact content: the gate that the append's keys are exact.
+pub(crate) fn key_check(slot: &crate::storage::unit::RowBuf, keys: &KeySpace, prov: &Provisional) {
+    use celeste_engine::exact::{is_provisional, RowKey};
     if !key_check_on() {
         return;
     }
     let acc = slot.to_rt2();
     let mut b = acc.clone_block();
-    b.boundary_canonicalize(&super::boundary_ids());
-    if b.shape_hash == acc.shape_hash && b.structure == acc.structure && b.row_keys == acc.row_keys {
+    b.boundary_canonicalize(super::ids());
+    let want = keys.row_keys(&b, super::ids());
+    let bad: Vec<usize> = (0..acc.width)
+        .filter(|&i| match &want[i] {
+            RowKey::Hit(k) => acc.row_keys[i] != *k,
+            RowKey::Miss(m) => !is_provisional(acc.row_keys[i]) || prov.content(acc.row_keys[i]) != *m,
+        })
+        .collect();
+    if b.shape_hash == acc.shape_hash && b.structure == acc.structure && bad.is_empty() {
         return;
     }
     // Say WHICH rows and cells differ.
@@ -998,48 +1112,47 @@ pub(crate) fn key_check(slot: &crate::storage::unit::RowBuf) {
         .filter(|&c| matches!(acc.structure.get(c), Some(celeste_engine::runtime2::Cell2::Val)))
         .filter(|&c| (1..acc.width).any(|i| acc.cols[c].at(i) != acc.cols[c].at(0)))
         .collect();
-    let rows = |blk: &Rt2| -> String {
-        (0..blk.width.min(8))
-            .map(|i| {
-                let cells: Vec<String> = varying.iter().filter(|&&c| c < blk.cols.len()).map(|&c| format!("{c}={:?}", blk.cols[c].at(i))).collect();
-                format!("    row {i} key {:?}: {}", blk.row_keys.get(i), cells.join(" "))
-            })
-            .collect::<Vec<_>>()
-            .join("\n")
-    };
+    let rows: Vec<String> = bad
+        .iter()
+        .take(8)
+        .map(|&i| {
+            let cells: Vec<String> = varying.iter().map(|&c| format!("{c}={:?}", acc.cols[c].at(i))).collect();
+            format!("    row {i} append key {:?}, boundary {:?}: {}", acc.row_keys[i], want[i], cells.join(" "))
+        })
+        .collect();
     panic!(
         "KERNEL KEY CHECK: shape {:#x}: the boundary disagrees with the append step \
-         (width {} vs {}, shape {:#x} vs {:#x}, structure {}, keys {})\n  append step:\n{}\n  boundary:\n{}",
+         (width {}, shape {:#x} vs {:#x}, structure {}, {} keys differ)\n{}",
         acc.shape_hash,
-        b.width,
         acc.width,
         b.shape_hash,
         acc.shape_hash,
         if b.structure == acc.structure { "same" } else { "DIFFERENT" },
-        if b.row_keys == acc.row_keys { "same" } else { "DIFFERENT" },
-        rows(&acc),
-        rows(&b),
+        bad.len(),
+        rows.join("\n"),
     );
 }
 
 /// `CELESTE_KERNEL_KEY_CHECK=1` on a block the forward STORES (a layer's
-/// piece, `storage::wave::gather_layer`): the boundary over a copy must keep its
-/// shape, structure and keys - its gather moved rows, not values.
-pub(crate) fn key_check_block(blk: &Rt2) {
+/// piece, `storage::wave::gather_layer`, keys final): the boundary over a
+/// copy must keep its shape and structure, and the key space key its rows
+/// as stored - its gather moved rows, not values.
+pub(crate) fn key_check_block(blk: &Rt2, keys: &KeySpace) {
     if !key_check_on() {
         return;
     }
     let mut b = blk.clone_block();
-    b.boundary_canonicalize(&super::boundary_ids());
-    let (want, got) = (&blk.row_keys, &b.row_keys);
+    b.boundary_canonicalize(super::ids());
+    let got: Vec<Option<(u64, u64)>> = keys.lookup_keys(&b, super::ids());
+    let same = got.iter().zip(&blk.row_keys).all(|(g, w)| *g == Some(*w));
     assert!(
-        b.shape_hash == blk.shape_hash && b.structure == blk.structure && got == want,
-        "KERNEL KEY CHECK: a stored piece of shape {:#x} ({} rows) is not what the boundary keys it as (shape {:#x}, structure {}, {} keys)",
+        b.shape_hash == blk.shape_hash && b.structure == blk.structure && same,
+        "KERNEL KEY CHECK: a stored piece of shape {:#x} ({} rows) is not what the boundary keys it as (shape {:#x}, structure {}, keys {})",
         blk.shape_hash,
         blk.width,
         b.shape_hash,
         if b.structure == blk.structure { "same" } else { "DIFFERENT" },
-        if got == want { "same" } else { "DIFFERENT" },
+        if same { "same" } else { "DIFFERENT" },
     );
 }
 
@@ -1081,8 +1194,6 @@ fn read_zb_may(buf: &[u8], off: usize) -> u16 {
     val | !known
 }
 
-/// The boundary's row-key mix seeds (`runtime2::boundary_finish`).
-use celeste_engine::runtime2::{KEY_SEED1, KEY_SEED2};
 
 
 
@@ -1435,7 +1546,7 @@ fn build_one_shape(r: &crate::trace::kernel::Reference, si: usize, tag: &str) ->
                 let cell = outputs[j].0;
                 let pos = pos_cells[b.outcome].is_some_and(|(x, y)| cell == x || cell == y);
                 // A number stored `[v, v]` keys as the number.
-                Some(KeyField::new(cell as u64, compiled.root_offsets[root] as usize, compiled.root_kinds[root], pos))
+                Some(KeyField::new(cell, compiled.root_offsets[root] as usize, compiled.root_kinds[root], pos))
             })
             .collect::<Result<Vec<_>>>()?;
         // Every body computes its transfer (the rotation graph needs it).
@@ -1648,7 +1759,8 @@ fn cell_out(body: &AsmBody, buf: &[u8], i: usize) -> u32 {
     cell_of(px as i32 + ox, py as i32 + oy).unwrap_or_else(|e| panic!("emitted row: {e}"))
 }
 
-/// The accumulator recipe for one outcome, with `shape_hash` and `part`.
+/// The accumulator recipe for one outcome, with `shape_hash` and its key's
+/// uniform fields.
 fn acc_template(r: &crate::trace::kernel::Reference, oi: usize) -> Result<AccTemplate> {
     let skeleton = reshape(&r.frame.outs[oi].rt2, 0);
     // The structure must be canonical already (checked, not trusted).
@@ -1664,7 +1776,7 @@ fn acc_template(r: &crate::trace::kernel::Reference, oi: usize) -> Result<AccTem
     let mut inits: Vec<(usize, ColInit)> = Vec::new();
     for f in &r.lowered.outs[oi].fields {
         let cell = f.cell as usize;
-        // A widened-to-uniform cell holds its widened value (as `part` folds).
+        // A widened-to-uniform cell holds its widened value (as `uniform` codes it).
         if let Some(av) = f.widen_uniform.or(f.konst_av) {
             inits.push((cell, ColInit::Uniform(av)));
         } else {
@@ -1687,18 +1799,17 @@ fn acc_template(r: &crate::trace::kernel::Reference, oi: usize) -> Result<AccTem
         skeleton,
         inits,
         shape_hash,
-        part: (0, 0),
+        uniform: Vec::new(),
+        record: ShapeRecord { hash: 0, sig: Vec::new(), pos: None },
         own: empty0.clone_block(),
         union: std::sync::Arc::new(empty0),
     };
     t.own = t.build();
     t.union = std::sync::Arc::new(t.build());
-    // The key's uniform part, exactly as `boundary_finish` folds it.
+    // The key's uniform fields, at their widened values.
     let widen = &r.bound.outcomes[oi].widen;
     let empty = t.build();
     let pos = empty.position_cells(crate::compiled::ids());
-    let mut part1: u64 = shape_hash;
-    let mut part2: u64 = 0xa076_1d64_78bd_642f ^ shape_hash;
     for (c, cell) in empty.structure.iter().enumerate() {
         if !matches!(cell, celeste_engine::runtime2::Cell2::Val) {
             continue;
@@ -1711,16 +1822,13 @@ fn acc_template(r: &crate::trace::kernel::Reference, oi: usize) -> Result<AccTem
             },
         };
         if let Some(v) = uniform {
-            if pos.is_some_and(|(x, y)| c as u32 == x || c as u32 == y) {
-                part1 = part1.wrapping_add(runtime2::pos_mix(c as u64, v, KEY_SEED1));
-                part2 = part2.wrapping_add(runtime2::pos_mix(c as u64, v, KEY_SEED2));
-            } else {
-                part1 = part1.wrapping_add(runtime2::cell_mix(c as u64, v, KEY_SEED1));
-                part2 = part2.wrapping_add(runtime2::cell_mix(c as u64, v, KEY_SEED2));
-            }
+            let pos = pos.is_some_and(|(x, y)| c as u32 == x || c as u32 == y);
+            t.uniform.push((c as u32, if pos { Code::of_pos(v) } else { Code::of(v) }));
         }
     }
-    t.part = (part1, part2);
+    let mut canon = empty.clone_block();
+    canon.shape_hash = shape_hash;
+    t.record = ShapeRecord::of(&canon, crate::compiled::ids());
     Ok(t)
 }
 

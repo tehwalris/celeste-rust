@@ -324,7 +324,7 @@ impl ToBlock<'_> {
 }
 
 /// A reference state as a one-lane block in canonical cell order (no row
-/// keys: `frame::Block::keyed` adds the level's).
+/// keys: `frame::Block::canonical` makes them canonical; a tree keys them).
 pub fn to_block(st: &State<RefDomain>) -> Result<Rt2> {
     let (cart, cache) = crate::compiled::room_context()?;
     let rt2 = Rt2::empty(1, gen::GLOBAL_NAMES.len(), gen::STRINGS, cart, cache);

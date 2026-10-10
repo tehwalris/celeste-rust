@@ -100,7 +100,11 @@ mod tests {
     fn split_frame_lands_on_the_unsplit_states_through_a_dash_freeze() {
         let bytes = read_inputs("tas/room_1_0_exit_frame_99.txt").expect("tas");
         assert_eq!(bytes.len(), 99);
-        let fingerprint = |r: &Rt2| (r.shape_hash_of(), r.clone_block().row_keys_canonical(crate::compiled::ids()), crate::search::pos_graph::block_cells(r).expect("cells"));
+        let fingerprint = |r: &Rt2| {
+            let mut c = r.clone_block();
+            c.canonical();
+            (r.shape_hash_of(), celeste_engine::exact::exact_rows(&c, crate::compiled::ids()), crate::search::pos_graph::block_cells(r).expect("cells"))
+        };
         // The cart is read when an engine is built (nextest: own process).
         std::env::remove_var("CELESTE_SPLIT_FRAME");
         let mut whole = RefEngine::new().expect("engine");

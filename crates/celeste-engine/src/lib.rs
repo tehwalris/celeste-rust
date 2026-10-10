@@ -10,6 +10,7 @@
 //! (`FIELD_NAMES`). Translating reference states into blocks is
 //! `trace::refbridge` in `celeste-rust`.
 
+pub mod exact;
 pub mod kernel;
 pub mod runtime2;
 pub mod slots;
