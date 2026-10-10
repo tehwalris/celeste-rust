@@ -60,6 +60,7 @@ dependencies = [
 name = "celeste-engine"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "celeste-core",
  "celeste-names",
  "rustc-hash 2.1.3",

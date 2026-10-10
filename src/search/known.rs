@@ -28,7 +28,7 @@
 //! Otherwise the first failing step of each winning lineage is reported with
 //! the check that failed, the node and the state, and the search FAILS.
 
-use super::arc_dp::{concrete_engines, lookup_keys, lookup_view, rem_of, NodeKeys, Winning};
+use super::arc_dp::{concrete_engines, exact_state, lookup_keys, lookup_view, rem_of, NodeKeys, Winning};
 use crate::frame::{steps_per_frame, wins_of, Block, MarkFilter, Visited};
 
 /// A known solution to check, and the filter the level's forward ran under.
@@ -43,6 +43,8 @@ pub struct Pruning<'a> {
     /// In search steps.
     pub horizon: u32,
     pub node: &'a NodeKeys,
+    /// The tree's key space (concrete states keyed as its rows).
+    pub keys: &'a celeste_engine::exact::KeySpace,
     /// The start's node: the tree holds the start as the engine made it,
     /// unwidened, so it is not looked up by its projection.
     pub start: u32,
@@ -65,7 +67,7 @@ fn run(inputs: &[u8], horizon: u32) -> anyhow::Result<(Run, bool)> {
     let spf = steps_per_frame();
     let (mut engines, seeded) = concrete_engines(1)?;
     let eng = &mut engines[0];
-    let mut layers: Vec<Vec<(u32, Block)>> = vec![vec![(0, Block::keyed(eng.initial()?)?)]];
+    let mut layers: Vec<Vec<(u32, Block)>> = vec![vec![(0, Block::canonical(eng.initial()?)?)]];
     for s in 0..horizon {
         let Some(&byte) = inputs.get((s / spf) as usize) else { break };
         let (mut next, mut seen, mut won) = (Vec::new(), rustc_hash::FxHashSet::default(), Vec::new());
@@ -73,7 +75,7 @@ fn run(inputs: &[u8], horizon: u32) -> anyhow::Result<(Run, bool)> {
             for c in eng.step(b.rt2(), byte)? {
                 if wins_of(c.rt2())?.iter().any(|&x| x) {
                     won.push(p as u32);
-                } else if seen.insert((c.rt2().clone_block().row_keys_canonical(crate::compiled::ids())[0], c.positions()?[0])) {
+                } else if seen.insert(exact_state(&c, c.positions()?[0])) {
                     next.push((p as u32, c));
                 }
             }
@@ -204,9 +206,12 @@ fn backward(what: String) -> Option<Miss> {
 
 /// The first check state `b` at step `s` fails.
 fn verdict(b: &Block, s: u32, seeded: bool, l1: Option<(u32, &crate::trace::level_minus_one::CostToGo)>, route: &Route, p: &Pruning) -> anyhow::Result<Option<Miss>> {
-    let (shape, keys, cells) = lookup_keys(b, p.level, seeded)?;
+    let (shape, keys, cells) = lookup_keys(b, p.level, seeded, p.keys)?;
     let (key, cell) = (keys[0], cells[0]);
-    let node = format!("node shape {shape:#x} key {:#x}:{:#x} cell {cell} {:?}", key.0, key.1, super::pos_graph::cell_xy(cell));
+    let node = match key {
+        Some(k) => format!("node shape {shape:#x} key {:#x}:{:#x} cell {cell} {:?}", k.0, k.1, super::pos_graph::cell_xy(cell)),
+        None => format!("shape {shape:#x}, a code the tree never stored, cell {cell} {:?}", super::pos_graph::cell_xy(cell)),
+    };
     // The forward's filters run at every flush, so on every step but the
     // start (the initial block is never flushed).
     if s > 0 {
@@ -231,7 +236,7 @@ fn verdict(b: &Block, s: u32, seeded: bool, l1: Option<(u32, &crate::trace::leve
         return Ok(None);
     }
     let Some(i) = (if s == 0 { Some(p.start) } else { p.node.get(shape, key, cell) }) else {
-        return Ok(match in_tree(p.files, s, shape, key, cell) {
+        return Ok(match key.and_then(|key| in_tree(p.files, s, shape, key, cell)) {
             Some((layer, seq, row)) => backward(format!(
                 "NOT MARKED: in the tree (layer {layer} s{seq} r{row}) but the remainder-free BFS finds no recorded path from it to a win by step {} - a successor on the route was lost ({node})",
                 p.horizon
@@ -247,7 +252,7 @@ fn verdict(b: &Block, s: u32, seeded: bool, l1: Option<(u32, &crate::trace::leve
     }
     // The start is reached whenever its W holds it (`arc_dp::reach`).
     if let Some(m) = p.reached.filter(|_| s > 0) {
-        let d = m.deadline(shape, key, cell);
+        let d = key.and_then(|key| m.deadline(shape, key, cell));
         if !d.is_some_and(|d| u32::from(d) >= s) {
             return Ok(backward(format!("NOT REACHED inside W (`arc_dp::reach`): deadline {d:?}, step {s} needs one >= {s} - the next level's filter drops it ({node})")));
         }

@@ -692,21 +692,20 @@ impl Rt2 {
         self.cols = new_cols;
     }
 
-    /// The BOUNDARY: level-0 widenings, canonical renumbering (the GC),
-    /// shape hash and per-lane row keys, lanes kept (a row key holds no
-    /// position, so equal keys at two cells are two states).
+
+    /// The BOUNDARY: level-0 widenings, canonical renumbering (the GC) and
+    /// the shape hash, lanes kept.
     pub fn boundary_canonicalize(&mut self, ids: &BoundaryIds) {
         self.boundary_prepare();
         self.boundary_widen(ids);
-        self.boundary_finish(ids);
+        self.boundary_finish();
     }
 
-    /// Per-lane row keys without widening or dedup: the search's ONE row key,
-    /// recomputed for a state as it is (stored or concrete).
-    pub fn row_keys_canonical(&mut self, ids: &BoundaryIds) -> Vec<(u64, u64)> {
+    /// The block as it is, CANONICAL (ids, shape hash; no widening): what a
+    /// key space keys (`exact::KeySpace::row_keys`, `exact::exact_rows`).
+    pub fn canonical(&mut self) {
         self.boundary_prepare();
-        self.boundary_finish(ids);
-        self.row_keys.clone()
+        self.boundary_finish();
     }
 
     /// Shared boundary head: check every column is at block width.
@@ -1066,15 +1065,21 @@ impl Rt2 {
         }
     }
 
-    /// Shared boundary tail: canonical ids, shape hash, per-lane row keys.
-    fn boundary_finish(&mut self, ids: &BoundaryIds) {
+    /// Shared boundary tail: canonical ids and the shape hash. Row keys are
+    /// the storage's (`exact::KeySpace`): a boundary clears them.
+    fn boundary_finish(&mut self) {
         assert!(self.prints.is_empty(), "prints at a frame boundary: {:?}", self.prints);
-
         self.canonicalize_ids();
+        self.shape_hash = self.shape_hash_of();
+        self.row_keys.clear();
+    }
 
+    /// TEMPORARY (the exact-keys bijection check): the develop hash keys.
+    pub fn legacy_hash_keys(&mut self, ids: &BoundaryIds) -> Vec<(u64, u64)> {
+        self.boundary_prepare();
+        self.canonicalize_ids();
         let shape_hash = self.shape_hash_of();
         self.shape_hash = shape_hash;
-
         // 128-bit row key: per-cell mixes SUMMED, so uniform cells fold once
         // and keys agree whichever cells are uniform. The kernels match this.
         // The position's whole pixels are the cell's, not the key's (`pos_code`).
@@ -1135,12 +1140,12 @@ impl Rt2 {
                 }
             }
         }
-        self.row_keys = (0..w)
+        (0..w)
             .map(|i| (
                 mix64(part1.wrapping_add(h1[i])),
                 mix64(part2.wrapping_add(h2[i])),
             ))
-            .collect();
+            .collect()
     }
 
     /// Keep only the given lanes (ascending) in every column and row key.

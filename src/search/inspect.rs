@@ -131,14 +131,6 @@ pub fn project_onto(rt2: &mut Rt2, level: crate::abstraction::Level) -> Vec<Proj
     project_all(rt2)
 }
 
-/// A projection's hash, for set membership.
-pub fn projection_key(p: &Proj) -> u64 {
-    use std::hash::{Hash, Hasher};
-    let mut h = rustc_hash::FxHasher::default();
-    p.hash(&mut h);
-    h.finish()
-}
-
 /// The player's fields of a projection, for reading.
 pub fn brief(p: &Proj) -> String {
     p.iter()

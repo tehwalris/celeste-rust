@@ -9,7 +9,10 @@
 //! unit order - UNIT (`1`, unit index u32, block u32, first lane u64, source
 //! count u32, sources old u8, the source ids u64 each), EMIT (`2`, shape u64,
 //! key u64 u64, cell u32, lane u32 (from the unit's first), transfer u32
-//! (`u32::MAX`: none)), DROP (`3`, lane u32, from u32) - and its transfer
+//! (`u32::MAX`: none)), DROP (`3`, lane u32, from u32), MISS (`4`, length
+//! u32, a bincode `exact::MissKey`: the content of the next EMIT's
+//! provisional key, re-interned by the replay) and SHAPE (`5`, length u32,
+//! a bincode `exact::ShapeRecord`: a shape the key space lacks) - and its transfer
 //! table `x{n}.bin` (`encode_pair` each, the EMIT ids index it); `env.txt`.
 //! Rows are not captured: the replay copies a row of 16 numbers (the key
 //! and cell spread over them), about a real row's size.
@@ -73,8 +76,26 @@ impl CaptureWriter {
         self.out.write_all(&b).expect("a capture write");
     }
 
+    /// A tagged variable-length record (`MISS`, `SHAPE`).
+    fn blob(&mut self, tag: u8, v: &impl serde::Serialize) {
+        let bytes = bincode::serialize(v).expect("a capture record");
+        let mut b = Vec::with_capacity(5 + bytes.len());
+        b.push(tag);
+        b.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+        b.extend_from_slice(&bytes);
+        self.out.write_all(&b).expect("a capture write");
+    }
+
+    /// A shape the key space lacks.
+    pub fn shape(&mut self, r: &celeste_engine::exact::ShapeRecord) {
+        self.blob(5, r);
+    }
+
     #[inline]
-    pub fn emit(&mut self, shape: u64, cell: u32, key: Key, lane: u32, xfer: Option<u32>) {
+    pub fn emit(&mut self, shape: u64, cell: u32, key: Key, lane: u32, xfer: Option<u32>, miss: Option<celeste_engine::exact::MissKey>) {
+        if let Some(m) = miss {
+            self.blob(4, &m);
+        }
         let mut b = [0u8; 37];
         b[0] = 2;
         b[1..9].copy_from_slice(&shape.to_le_bytes());
@@ -165,6 +186,7 @@ impl Capture {
                             emits += 1;
                         }
                         3 => pos += 9,
+                        4 | 5 => pos += 5 + u32_at(pos + 1) as usize,
                         t => anyhow::bail!("{}: record tag {t} at byte {pos}", p.display()),
                     }
                 }
@@ -246,13 +268,14 @@ pub fn bench_storage(a: &BenchArgs) -> Result<()> {
         let next = std::sync::atomic::AtomicUsize::new(0);
         let shared: &VisitedSet = &visited;
         let claims = super::unit::Claims::default();
+        let prov = celeste_engine::exact::Provisional::default();
         type Done = (Vec<super::unit::UnitOut>, Vec<crate::search::arc_edges::Pair>, u64, u64);
         let done: Vec<Done> = std::thread::scope(|scope| {
             let hs: Vec<_> = (0..a.threads)
                 .map(|w| {
-                    let (cap, order, next, claims, index) = (&cap, &order, &next, &claims, &index);
+                    let (cap, order, next, claims, prov, index) = (&cap, &order, &next, &claims, &prov, &index);
                     scope.spawn(move || -> Result<Done> {
-                        let mut sink = UnitSink::new(shared, claims, crate::frame::Filters::default(), frame, w as u32, true, false, None, None);
+                        let mut sink = UnitSink::new(shared, claims, prov, crate::frame::Filters::default(), frame, w as u32, true, false, None, None);
                         if do_edges {
                             sink.stream_blocks(&index)?;
                         }
@@ -286,7 +309,7 @@ pub fn bench_storage(a: &BenchArgs) -> Result<()> {
         let mut line = format!("[bench-storage] rep {rep}: units {:.3} s ({} threads; requests {requests} lids {lids} edges {edges})", t_units.as_secs_f64(), a.threads);
         if do_translate {
             let t = Instant::now();
-            let (news, _meta) = super::wave::translate(&mut visited, &mut outs, frame)?;
+            let (news, _meta) = super::wave::translate(&mut visited, &mut outs, &prov, frame)?;
             super::wave::resolve_lids(&visited, &outs, frame)?;
             let t_tr = t.elapsed();
             let t = Instant::now();
@@ -297,8 +320,7 @@ pub fn bench_storage(a: &BenchArgs) -> Result<()> {
             let mut acc = 0u64;
             for b in &layer {
                 for (k, id) in b.keys().iter().zip(b.ids()) {
-                    let c = super::id_cell(&visited.geo, *id);
-                    acc = acc.wrapping_add(celeste_engine::runtime2::mix64(k.0 ^ celeste_engine::runtime2::mix64(k.1 ^ (c as u64) << 1)));
+                    acc = acc.wrapping_add(crate::frame::state_hash(b.shard_shape(), *k, super::id_cell(&visited.geo, *id)));
                 }
             }
             line += &format!(" | f{frame:03} {} {acc:016x}", news.len());
@@ -343,13 +365,30 @@ fn replay_unit(sink: &mut UnitSink, cap: &Capture, u: &CapUnit, xmap: &mut Vec<u
     let u32_at = |o: usize| u32::from_le_bytes(b[o..o + 4].try_into().unwrap());
     let u64_at = |o: usize| u64::from_le_bytes(b[o..o + 8].try_into().unwrap());
     let mut pos = 0usize;
+    // The next emission's provisional key, re-interned (a MISS record).
+    let mut miss: Option<Key> = None;
     while pos < b.len() {
-        if b[pos] == 3 {
-            sink.dropped(u.lo as usize + u32_at(pos + 1) as usize, u32_at(pos + 5));
-            pos += 9;
-            continue;
+        match b[pos] {
+            3 => {
+                sink.dropped(u.lo as usize + u32_at(pos + 1) as usize, u32_at(pos + 5));
+                pos += 9;
+                continue;
+            }
+            4 | 5 => {
+                let n = u32_at(pos + 1) as usize;
+                let bytes = &b[pos + 5..pos + 5 + n];
+                if b[pos] == 4 {
+                    miss = Some(sink.provisional().intern(bincode::deserialize(bytes)?));
+                } else {
+                    sink.note_shape(&bincode::deserialize(bytes)?);
+                }
+                pos += 5 + n;
+                continue;
+            }
+            _ => {}
         }
         let (shape, key, cell, lane, x) = (u64_at(pos + 1), (u64_at(pos + 9), u64_at(pos + 17)), u32_at(pos + 25), u32_at(pos + 29), u32_at(pos + 33));
+        let key = miss.take().unwrap_or(key);
         pos += 37;
         let xfer = (x != u32::MAX).then(|| {
             if xmap.len() <= x as usize {

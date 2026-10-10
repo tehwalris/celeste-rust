@@ -8,7 +8,9 @@ use rustc_hash::FxHashMap;
 
 use super::{region_of, Geometry};
 
-pub type Key = (u64, u64);
+/// A state's EXACT packed key within its shape (`celeste_engine::exact`).
+pub use celeste_engine::exact::Key;
+use celeste_engine::exact::{slot_hash, KeySpace};
 
 /// One region's entries: key and mask by entry number, an open-addressing
 /// index on the key (entry + 1, 0 empty).
@@ -36,7 +38,7 @@ impl RegionTable {
             return None;
         }
         let m = self.index.len() - 1;
-        let mut i = (k.0 as usize) & m;
+        let mut i = slot_hash(k) as usize & m;
         loop {
             let e = self.index[i];
             if e == 0 {
@@ -103,7 +105,7 @@ impl RegionTable {
 
     fn place(&mut self, e: u32) {
         let m = self.index.len() - 1;
-        let mut i = (self.keys[e as usize].0 as usize) & m;
+        let mut i = slot_hash(self.keys[e as usize]) as usize & m;
         while self.index[i] != 0 {
             i = (i + 1) & m;
         }
@@ -131,10 +133,12 @@ impl RegionTable {
 }
 
 /// The visited set: the shapes (index -> hash, in the order the tree
-/// numbered them) and a table per region (`StateId`'s region index).
+/// numbered them), a table per region (`StateId`'s region index), and the
+/// key space its keys are in (read-only during a wave).
 #[derive(Clone)]
 pub struct VisitedSet {
     pub geo: Geometry,
+    pub keys: KeySpace,
     shapes: Vec<u64>,
     shape_idx: FxHashMap<u64, u32>,
     regions: Vec<Option<Box<RegionTable>>>,
@@ -142,7 +146,7 @@ pub struct VisitedSet {
 
 impl VisitedSet {
     pub fn new(geo: Geometry) -> Self {
-        VisitedSet { geo, shapes: Vec::new(), shape_idx: FxHashMap::default(), regions: Vec::new() }
+        VisitedSet { geo, keys: KeySpace::new(), shapes: Vec::new(), shape_idx: FxHashMap::default(), regions: Vec::new() }
     }
 
     pub fn shape_index(&self, shape: u64) -> Option<u32> {

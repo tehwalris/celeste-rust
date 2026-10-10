@@ -971,8 +971,8 @@ impl NodeKeys {
         v.dedup_by_key(|e| (e.0, e.1, e.2));
         NodeKeys(v)
     }
-    pub(super) fn get(&self, shape: u64, key: (u64, u64), cell: u32) -> Option<u32> {
-        let k = (shape, key, cell);
+    pub(super) fn get(&self, shape: u64, key: Option<(u64, u64)>, cell: u32) -> Option<u32> {
+        let k = (shape, key?, cell);
         self.0.binary_search_by(|e| (e.0, e.1, e.2).cmp(&k)).ok().map(|j| self.0[j].3)
     }
     pub fn len(&self) -> usize {
@@ -983,12 +983,22 @@ impl NodeKeys {
     }
 }
 
-/// A concrete state's node key at `level` (`lookup_view`, widened).
-pub(super) fn lookup_keys(b: &crate::frame::Block, level: crate::abstraction::Level, seeded: bool) -> anyhow::Result<(u64, Vec<(u64, u64)>, Vec<u32>)> {
+/// A concrete state's node key at `level` (`lookup_view`, widened) in the
+/// tree's key space (`None`: a code the tree never stored - no node).
+pub(super) fn lookup_keys(b: &crate::frame::Block, level: crate::abstraction::Level, seeded: bool, keys: &celeste_engine::exact::KeySpace) -> anyhow::Result<(u64, Vec<Option<(u64, u64)>>, Vec<u32>)> {
     if !seeded {
-        return crate::frame::widened_keys(b, level);
+        return crate::frame::widened_keys(b, level, keys);
     }
-    crate::frame::widened_keys_rt2(&lookup_view(b.rt2(), seeded)?, level)
+    crate::frame::widened_keys_rt2(&lookup_view(b.rt2(), seeded)?, level, keys)
+}
+
+/// A concrete state's EXACT identity, UNWIDENED: its canonical bytes
+/// (`exact::exact_rows`) and its cell. Never the level's widened key:
+/// states sharing it need not share their fate (`522de36`).
+pub(super) fn exact_state(b: &crate::frame::Block, cell: u32) -> celeste_engine::exact::ExactRow {
+    let mut v = celeste_engine::exact::exact_rows(b.rt2(), crate::compiled::ids()).swap_remove(0).into_vec();
+    v.extend_from_slice(&cell.to_le_bytes());
+    v.into_boxed_slice()
 }
 
 /// A concrete state as the tree holds it before the level's widening. With
@@ -1095,6 +1105,7 @@ pub fn concrete_search(
     level: crate::abstraction::Level,
     horizon: u32,
     node: &NodeKeys,
+    keys: &celeste_engine::exact::KeySpace,
     w: &Winning,
     bound: u32,
     prefer: Option<&[u8]>,
@@ -1125,11 +1136,11 @@ pub fn concrete_search(
         byte: u8,
         cell: u32,
         win: bool,
-        exact: (u64, u64),
+        exact: celeste_engine::exact::ExactRow,
         /// `None` for a win (its state is never expanded).
         row: Option<Rt2>,
     }
-    let start = Block::keyed(initial)?;
+    let start = Block::canonical(initial)?;
     let start_cell = start.positions()?[0];
     // THE FAST PATH: a budgeted depth-first search for a win AT the bound,
     // inside `W_{H - bound + k}`, on one engine. Sound: a win here is at the
@@ -1139,11 +1150,13 @@ pub fn concrete_search(
         struct Dfs<'a> {
             eng: &'a mut RefEngine,
             node: &'a NodeKeys,
+            keys: &'a celeste_engine::exact::KeySpace,
             w: &'a Winning,
             level: crate::abstraction::Level,
             from: u32,
             frames: u32,
-            dead: FxHashSet<((u64, u64), u32, u32)>,
+            /// Exhausted states by (exact state, frame).
+            dead: FxHashSet<(celeste_engine::exact::ExactRow, u32)>,
             path: Vec<(u8, u32)>,
             steps: u64,
             prefer: Option<&'a [u8]>,
@@ -1174,12 +1187,12 @@ pub fn concrete_search(
                         cx.path.push((byte, cell));
                         return Ok(Some(true));
                     }
-                    let exact = (b.rt2().clone_block().row_keys_canonical(crate::compiled::ids())[0], cell, k + 1);
+                    let exact = (exact_state(&b, cell), k + 1);
                     if cx.dead.contains(&exact) {
                         continue;
                     }
-                    let (shape, keys, cells) = lookup_keys(&b, cx.level, cx.seeded)?;
-                    let Some(i) = cx.node.get(shape, keys[0], cells[0]) else { continue };
+                    let (shape, nk, cells) = lookup_keys(&b, cx.level, cx.seeded, cx.keys)?;
+                    let Some(i) = cx.node.get(shape, nk[0], cells[0]) else { continue };
                     let q = rem_of(b.rt2())?;
                     if !cx.w.at(cx.spf * (cx.from + k + 1), i).is_some_and(|r| r.contains(q.0, q.1)) {
                         continue;
@@ -1200,7 +1213,7 @@ pub fn concrete_search(
         const DFS_BUDGET: u64 = 200_000;
         let t = std::time::Instant::now();
         let mut eng = engines[0].lock().expect("an engine");
-        let mut cx = Dfs { eng: &mut eng, node, w, level, from: frames - bound, frames: bound, dead: FxHashSet::default(), path: Vec::new(), steps: 0, prefer, seeded, spf };
+        let mut cx = Dfs { eng: &mut eng, node, keys, w, level, from: frames - bound, frames: bound, dead: FxHashSet::default(), path: Vec::new(), steps: 0, prefer, seeded, spf };
         let found = dfs(&mut cx, start.rt2(), 0)?;
         eprintln!(
             "[concrete] depth-first at the bound f{bound}: {} after {} steps, {:.1} s",
@@ -1244,7 +1257,7 @@ pub fn concrete_search(
                             // order, as the merge keeps it): most successors
                             // are repeats.
                             let mut got = Vec::new();
-                            let mut chunk_seen: FxHashSet<((u64, u64), u32)> = FxHashSet::default();
+                            let mut chunk_seen: FxHashSet<celeste_engine::exact::ExactRow> = FxHashSet::default();
                             'chunk: for (p, row) in cur.iter().enumerate().skip(lo).take(CHUNK) {
                                 let mut ran = Covered::default();
                                 for byte in input_order(prefer, k) {
@@ -1256,23 +1269,22 @@ pub fn concrete_search(
                                     for b in succ {
                                         steps += 1;
                                         let cell = b.positions()?[0];
-                                        // Dedup on the EXACT key, never `b.keys()` (the
-                                        // level's widened key): states sharing it need
-                                        // not share their fate (`522de36`).
-                                        let exact = b.rt2().clone_block().row_keys_canonical(crate::compiled::ids())[0];
+                                        // Dedup on the EXACT state, never the level's
+                                        // widened key (`exact_state`).
+                                        let exact = exact_state(&b, cell);
                                         let win = wins_of(b.rt2())?.iter().any(|&x| x);
-                                        if !win && chunk_seen.contains(&(exact, cell)) {
+                                        if !win && chunk_seen.contains(&exact) {
                                             continue;
                                         }
                                         if !win {
-                                            let (shape, keys, cells) = lookup_keys(&b, level, seeded)?;
-                                            let Some(i) = node.get(shape, keys[0], cells[0]) else { continue };
+                                            let (shape, nk, cells) = lookup_keys(&b, level, seeded, keys)?;
+                                            let Some(i) = node.get(shape, nk[0], cells[0]) else { continue };
                                             let q = rem_of(b.rt2())?;
                                             if !w.at(t_w, i).is_some_and(|r| r.contains(q.0, q.1)) {
                                                 continue;
                                             }
                                         }
-                                        chunk_seen.insert((exact, cell));
+                                        chunk_seen.insert(exact.clone());
                                         // A win keeps no state (only its link), and the chunk
                                         // ends at its first: the earliest win (chunks merge in
                                         // order) ends the search. Every successor of the last
@@ -1301,7 +1313,7 @@ pub fn concrete_search(
         chunks.sort_unstable_by_key(|c| c.0);
         let succs = chunks.into_iter().flat_map(|c| c.1);
         // Each exact state once, in order; the first win ends the search.
-        let mut seen: FxHashSet<((u64, u64), u32)> = FxHashSet::default();
+        let mut seen: FxHashSet<celeste_engine::exact::ExactRow> = FxHashSet::default();
         let (mut next, mut links): (Vec<Rt2>, Vec<(u32, u8, u32)>) = (Vec::new(), Vec::new());
         let mut won: Option<(u32, u8, u32)> = None;
         for s in succs {
@@ -1309,7 +1321,7 @@ pub fn concrete_search(
                 won = Some((s.parent, s.byte, s.cell));
                 break;
             }
-            if seen.insert((s.exact, s.cell)) {
+            if seen.insert(s.exact) {
                 next.push(s.row.expect("a non-winning successor keeps its state"));
                 links.push((s.parent, s.byte, s.cell));
             }
@@ -1418,9 +1430,10 @@ pub fn solve(
     let mut fp = 0u64;
     for &(id, d) in &marks {
         let (shape, key, cell) = resolver.resolve(id)?;
-        node_key.push(mix64(shape ^ mix64(key.0 ^ mix64(key.1 ^ (cell as u64) << 1))));
         // `Visited::fingerprint`: the marks are distinct states.
-        fp = fp.wrapping_add(mix64(key.0 ^ mix64(key.1 ^ (cell as u64) << 1)));
+        let h = crate::frame::state_hash(shape, key, cell);
+        node_key.push(h);
+        fp = fp.wrapping_add(h);
         if keyed {
             keys.push((shape, key, cell, keys.len() as u32));
         }
@@ -1432,7 +1445,7 @@ pub fn solve(
     drop(marks);
     if let Some(out) = save {
         std::fs::create_dir_all(out)?;
-        save_marks(&out.join("level0.marks.bin"), std::mem::take(&mut rows), horizon)?;
+        save_marks(&out.join("level0.marks.bin"), std::mem::take(&mut rows), horizon, &resolver.space)?;
     }
     // Per frame, the nodes with a set and the sum of their (node, set) hashes.
     let mut per_frame = vec![(0usize, 0u64); horizon as usize + 1];
@@ -1457,7 +1470,7 @@ pub fn solve(
     crate::metrics::mem_phase("arc: fingerprints");
     // Per node the LAST frame it is reached inside W from the start (`reach`;
     // at most its W deadline): the next level's filter, and the UI's arc marks.
-    let mut arc_marks = want_marks.then(Visited::new);
+    let mut arc_marks = want_marks.then(|| Visited::new(resolver.space.clone()));
     if want_marks || save.is_some() {
         let tr = std::time::Instant::now();
         let last = reach(g, &w, start, p0, horizon);
@@ -1476,7 +1489,7 @@ pub fn solve(
         }
     }
     if let Some(out) = save {
-        save_marks(&out.join("arc.marks.bin"), rows, horizon)?;
+        save_marks(&out.join("arc.marks.bin"), rows, horizon, &resolver.space)?;
         let first_win = wins.iter().map(|&(_, f)| f).min();
         let show = |v: Option<u32>| v.map_or("none".to_string(), |f| f.to_string());
         std::fs::write(out.join("arc.txt"), format!("horizon {horizon}\nlevel {level}\nlevel0_first_win {}\noptimal {}\n", show(first_win), show(arc)))?;
@@ -1484,7 +1497,7 @@ pub fn solve(
     let node = NodeKeys::new(keys);
     let known = match known {
         Some(route) => {
-            let p = super::known::Pruning { level, horizon, node: &node, start, w: &w, reached: arc_marks.as_ref(), files: &files };
+            let p = super::known::Pruning { level, horizon, node: &node, keys: &resolver.space, start, w: &w, reached: arc_marks.as_ref(), files: &files };
             super::known::check(route, &p)?
         }
         None => None,
@@ -1494,7 +1507,7 @@ pub fn solve(
     drop(graph);
     crate::metrics::mem_phase("arc: marks for the next level, graph dropped");
     let found = match (concrete, arc) {
-        (true, Some(f)) => concrete_search(level, horizon, &node, &w, f, prefer)?,
+        (true, Some(f)) => concrete_search(level, horizon, &node, &resolver.space, &w, f, prefer)?,
         _ => None,
     };
     if let Some(wt) = &found {

@@ -15,6 +15,7 @@ use celeste_core::pico8_num::Pico8Num as P8;
 use celeste_engine::runtime2::{Col, Rt2, AV};
 
 use super::visited::{Key, VisitedSet};
+use celeste_engine::exact::{is_provisional, slot_hash, KeySpace, Provisional, RowKey};
 use super::{Geometry, StateId};
 use crate::frame::{Filters, Raised};
 
@@ -58,6 +59,7 @@ impl RowBuf {
     pub fn rows(&self) -> usize {
         self.keys.len()
     }
+
 
     /// Bytes allocated for the rows (capacities).
     pub fn alloc_bytes(&self) -> usize {
@@ -368,7 +370,7 @@ impl Claims {
     /// Is this the first request of `(shape, slot, key, cell)` this wave?
     #[inline]
     pub fn claim(&self, shape: u64, slot: u32, key: Key, local: u32) -> bool {
-        let h = key.0 ^ celeste_engine::runtime2::mix64(shape ^ (slot as u64) << 8 ^ (local as u64) << 40);
+        let h = slot_hash(key) ^ celeste_engine::runtime2::mix64(shape ^ (slot as u64) << 8 ^ (local as u64) << 40);
         self.shards[(h >> 52) as usize & (CLAIM_SHARDS - 1)].lock().expect("a claims shard").insert((shape, slot, key, local))
     }
 }
@@ -411,6 +413,9 @@ pub struct RaiseCtx<'a> {
 pub struct UnitSink<'a> {
     visited: &'a VisitedSet,
     claims: &'a Claims,
+    /// The wave's provisional keys (states holding a code the key space
+    /// lacks: new by construction).
+    prov: &'a Provisional,
     geo: Geometry,
     filters: Filters<'a>,
     frame: u32,
@@ -479,6 +484,8 @@ pub struct UnitSink<'a> {
     pub end_ticks: u64,
     /// `CELESTE_EMIT_CAPTURE`: this worker's stream (`bench`).
     capture: Option<super::bench::CaptureWriter>,
+    /// The shapes this worker noted (`note_shape`).
+    noted: rustc_hash::FxHashSet<u64>,
     /// The worker's blocks file (`edges::blocks_path`): units' blocks go
     /// there as they end; `None`: kept in memory.
     blocks: Option<super::edges::BlockWriter>,
@@ -489,6 +496,7 @@ impl<'a> UnitSink<'a> {
     pub fn new(
         visited: &'a VisitedSet,
         claims: &'a Claims,
+        prov: &'a Provisional,
         filters: Filters<'a>,
         frame: u32,
         worker: u32,
@@ -500,6 +508,7 @@ impl<'a> UnitSink<'a> {
         UnitSink {
             visited,
             claims,
+            prov,
             geo: visited.geo,
             filters,
             frame,
@@ -544,6 +553,7 @@ impl<'a> UnitSink<'a> {
             pending: Vec::new(),
             end_ticks: 0,
             capture: super::bench::CaptureWriter::open(frame, worker),
+            noted: Default::default(),
             blocks: None,
         }
     }
@@ -553,6 +563,29 @@ impl<'a> UnitSink<'a> {
     pub fn stream_blocks(&mut self, index: &std::path::Path) -> Result<()> {
         self.blocks = Some(super::edges::BlockWriter::create(&super::edges::blocks_path(index, self.worker))?);
         Ok(())
+    }
+
+    /// The tree's key space (read-only during the wave).
+    #[inline]
+    pub fn keys(&self) -> &'a KeySpace {
+        &self.visited.keys
+    }
+
+    /// The wave's provisional keys.
+    #[inline]
+    pub fn provisional(&self) -> &'a Provisional {
+        self.prov
+    }
+
+    /// A shape the key space lacks, emitted (`Provisional::note_shape`,
+    /// once a worker).
+    pub fn note_shape(&mut self, r: &celeste_engine::exact::ShapeRecord) {
+        if self.noted.insert(r.hash) {
+            self.prov.note_shape(r);
+            if let Some(c) = &mut self.capture {
+                c.shape(r);
+            }
+        }
     }
 
     /// Are edges recorded (an edges dir, ids on the frontier)?
@@ -664,7 +697,7 @@ impl<'a> UnitSink<'a> {
     fn lid(&mut self, shape: u64, slot: u32, key: Key) -> u32 {
         let words = self.geo.words;
         let m = self.lid_index.len() - 1;
-        let h = key.0 ^ celeste_engine::runtime2::mix64(shape ^ (slot as u64) << 7);
+        let h = slot_hash(key) ^ celeste_engine::runtime2::mix64(shape ^ (slot as u64) << 7);
         let mut i = (h as usize) & m;
         loop {
             let l = self.lid_index[i];
@@ -679,7 +712,8 @@ impl<'a> UnitSink<'a> {
         }
         let l = self.lids.len() as u32;
         assert!(l < 1 << LID_BITS, "a unit with {l} distinct target entries, past the {LID_BITS} bits an edge holds");
-        let (region, entry) = self.visited.find(shape, slot, key).unwrap_or((NONE, NONE));
+        // A provisional key is a new state: no lookup.
+        let (region, entry) = if is_provisional(key) { (NONE, NONE) } else { self.visited.find(shape, slot, key).unwrap_or((NONE, NONE)) };
         self.lids.push(Lid { shape, slot, key });
         self.lid_owners.push(if entry == NONE { NO_OWNER } else { pack_owner(region, entry) });
         match entry {
@@ -702,7 +736,7 @@ impl<'a> UnitSink<'a> {
         self.lid_index = vec![0; cap];
         let m = cap - 1;
         for (l, x) in self.lids.iter().enumerate() {
-            let h = x.key.0 ^ celeste_engine::runtime2::mix64(x.shape ^ (x.slot as u64) << 7);
+            let h = slot_hash(x.key) ^ celeste_engine::runtime2::mix64(x.shape ^ (x.slot as u64) << 7);
             let mut i = (h as usize) & m;
             while self.lid_index[i] != 0 {
                 i = (i + 1) & m;
@@ -749,13 +783,13 @@ impl<'a> UnitSink<'a> {
         }
         self.emitted += 1;
         if let Some(c) = &mut self.capture {
-            c.emit(shape, cell, key, (lane - self.lo) as u32, xfer);
+            c.emit(shape, cell, key, (lane - self.lo) as u32, xfer, is_provisional(key).then(|| self.prov.content(key)));
         }
         if crate::compiled::asm_kernel::key_check_on() {
             let i = Self::buf_of(&mut self.check, shape, &init);
             push(&mut self.check[i]);
             if self.check[i].rows() >= 256 {
-                crate::compiled::asm_kernel::key_check(&self.check[i]);
+                crate::compiled::asm_kernel::key_check(&self.check[i], &self.visited.keys, self.prov);
                 self.check[i].clear();
             }
         }
@@ -843,10 +877,26 @@ impl<'a> UnitSink<'a> {
         Ok(())
     }
 
+    /// A reference row's key (a CANONICAL row): the level's held buttons
+    /// widened, as its kernels key it, in the tree's dictionaries -
+    /// provisional where a code is new.
+    pub fn row_key(&mut self, row: &Rt2) -> Key {
+        let level = crate::abstraction::Level { held: crate::abstraction::current_level().held, ..crate::abstraction::Level::EXACT };
+        let mut w = row.clone_block();
+        crate::frame::widen_rt2_to(&mut w, level);
+        w.canonical();
+        if self.visited.keys.shape(w.shape_hash).is_none() {
+            self.note_shape(&celeste_engine::exact::ShapeRecord::of(&w, crate::compiled::ids()));
+        }
+        match self.visited.keys.row_keys(&w, crate::compiled::ids()).swap_remove(0) {
+            RowKey::Hit(k) => k,
+            RowKey::Miss(m) => self.prov.intern(m),
+        }
+    }
+
     /// The reference engine's emission: one materialized row, no edge.
     pub fn emit_row(&mut self, row: &Rt2, cell: u32) -> Result<()> {
         debug_assert_eq!(row.width, 1);
-        debug_assert_eq!(row.row_keys.len(), 1, "an emitted row carries its key");
         if self.minus_one_drop(row.shape_hash, cell).is_some() {
             return Ok(());
         }
@@ -866,7 +916,7 @@ impl<'a> UnitSink<'a> {
             b.shape_hash = row.shape_hash;
             b
         };
-        let key = row.row_keys[0];
+        let key = self.row_key(row);
         self.emit(row.shape_hash, cell, key, self.lo, None, init, |b| b.push_row(row, key, cell))
     }
 
@@ -887,7 +937,7 @@ impl<'a> UnitSink<'a> {
     pub fn end(&mut self) -> Result<()> {
         let t = crate::frame::phases::start();
         for b in &self.check {
-            crate::compiled::asm_kernel::key_check(b);
+            crate::compiled::asm_kernel::key_check(b, &self.visited.keys, self.prov);
         }
         self.check.iter_mut().for_each(RowBuf::clear);
         // The last verdicts; a disallowed target's edges and requests go.
