@@ -187,7 +187,42 @@ impl XferTable {
 }
 
 const MAGIC: &[u8; 4] = b"CSE1";
-const VERSION: u32 = 1;
+const VERSION: u32 = 2;
+
+/// The blocks file a wave's worker streams its units' blocks into, beside
+/// the frame's index file `index` (`f{frame}.bin` -> `f{frame}.w{worker}.blk`).
+pub fn blocks_path(index: &Path, worker: u32) -> PathBuf {
+    let name = index.file_name().and_then(|s| s.to_str()).expect("an edge file name");
+    index.with_file_name(format!("{}.w{worker:03}.blk", name.strip_suffix(".bin").expect("an edge index is a .bin")))
+}
+
+/// A worker's blocks file, appended unit by unit during the wave.
+pub struct BlockWriter {
+    out: std::io::BufWriter<std::fs::File>,
+    at: u64,
+}
+
+impl BlockWriter {
+    pub fn create(path: &Path) -> Result<Self> {
+        std::fs::create_dir_all(path.parent().expect("an edges dir"))?;
+        Ok(BlockWriter { out: std::io::BufWriter::with_capacity(1 << 20, std::fs::File::create(path).with_context(|| path.display().to_string())?), at: 0 })
+    }
+
+    /// Append a block; its offset.
+    pub fn append(&mut self, b: &[u8]) -> Result<u64> {
+        use std::io::Write;
+        self.out.write_all(b)?;
+        let at = self.at;
+        self.at += b.len() as u64;
+        Ok(at)
+    }
+
+    pub fn finish(mut self) -> Result<()> {
+        use std::io::Write;
+        self.out.flush()?;
+        Ok(())
+    }
+}
 
 /// One unit's place in an edge file (offsets into its data region).
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -196,6 +231,9 @@ struct UnitHead {
     /// `n_sources` source ids, u64 each.
     sources: u64,
     n_sources: u32,
+    /// The block: in the worker's blocks file (`blocks_path`), or with
+    /// `inline`, in this file's data region.
+    inline: bool,
     block: u64,
     block_len: u64,
     edges: u64,
@@ -303,8 +341,12 @@ pub fn write_file(path: &Path, frame: u32, outs: &[UnitOut], remaps: Vec<Vec<u32
             worker: u.worker,
             sources: place(b.sources.len()),
             n_sources: u.sources.len() as u32,
-            block: place(u.block.len()),
-            block_len: u.block.len() as u64,
+            inline: u.block_at.is_none(),
+            block: match u.block_at {
+                Some(at) => at,
+                None => place(u.block.len()),
+            },
+            block_len: u.block_len,
             edges: u.edges,
             index: place(b.index.len()),
             n_index: u.index.len() as u32,
@@ -332,7 +374,9 @@ pub fn write_file(path: &Path, frame: u32, outs: &[UnitOut], remaps: Vec<Vec<u32
     super::wave::par_map(&order, threads, |&k| -> Result<()> {
         let (h, b, u) = (&head.units[k], &bytes[k], &outs[k]);
         file.write_all_at(&b.sources, base + h.sources)?;
-        file.write_all_at(&u.block, base + h.block)?;
+        if h.inline {
+            file.write_all_at(&u.block, base + h.block)?;
+        }
         file.write_all_at(&b.index, base + h.index)?;
         file.write_all_at(&b.lids, base + h.lids)?;
         file.write_all_at(&b.owners, base + h.owners)?;
@@ -345,11 +389,13 @@ pub fn write_file(path: &Path, frame: u32, outs: &[UnitOut], remaps: Vec<Vec<u32
     Ok(base + at)
 }
 
-/// One edge file, mapped.
+/// One edge file, mapped, with its workers' blocks files.
 struct EdgeFile {
     map: memmap2::Mmap,
     head: FileHead,
     data: usize,
+    /// Per worker its blocks file, where a unit's block is there.
+    blocks: Vec<Option<memmap2::Mmap>>,
 }
 
 impl EdgeFile {
@@ -365,7 +411,23 @@ impl EdgeFile {
         ensure!(map.len() >= 16 + n, "{}: truncated header", path.display());
         let head: FileHead = bincode::deserialize(&map[16..16 + n]).with_context(|| path.display().to_string())?;
         ensure!(head.frame == frame, "{}: the edges of frame {}, not {frame}", path.display(), head.frame);
-        Ok(EdgeFile { map, head, data: 16 + n })
+        let mut blocks: Vec<Option<memmap2::Mmap>> = Vec::new();
+        for u in head.units.iter().filter(|u| !u.inline) {
+            let w = u.worker as usize;
+            if blocks.len() <= w {
+                blocks.resize_with(w + 1, || None);
+            }
+            if blocks[w].is_none() {
+                let p = blocks_path(path, u.worker);
+                let f = std::fs::File::open(&p).with_context(|| p.display().to_string())?;
+                // SAFETY: a blocks file is complete once its frame's index
+                // is in place, and never modified afterwards.
+                blocks[w] = Some(unsafe { memmap2::Mmap::map(&f)? });
+            }
+            let len = blocks[w].as_ref().expect("mapped").len() as u64;
+            ensure!(u.block + u.block_len <= len, "{}: a unit's block past its blocks file", path.display());
+        }
+        Ok(EdgeFile { map, head, data: 16 + n, blocks })
     }
 
     #[inline]
@@ -381,7 +443,11 @@ impl EdgeFile {
     }
 
     fn block<'b>(&'b self, u: &'b UnitHead) -> (&'b [u8], MappedIndex<'b>) {
-        let b = &self.map[self.data + u.block as usize..self.data + (u.block + u.block_len) as usize];
+        let b = if u.inline {
+            &self.map[self.data + u.block as usize..self.data + (u.block + u.block_len) as usize]
+        } else {
+            &self.blocks[u.worker as usize].as_ref().expect("mapped at open")[u.block as usize..(u.block + u.block_len) as usize]
+        };
         (b, MappedIndex { file: self, u })
     }
 
@@ -462,7 +528,7 @@ impl EdgeStore {
             }
             let file = EdgeFile::open(&p, f)?;
             edges += file.head.units.iter().map(|u| u.edges).sum::<u64>();
-            bytes += file.map.len() as u64;
+            bytes += file.map.len() as u64 + file.blocks.iter().flatten().map(|m| m.len() as u64).sum::<u64>();
             frames[f as usize].push(file);
         }
         let xfers = XferTable::load(dir)?.pairs;
@@ -641,11 +707,14 @@ mod tests {
         edges.dedup();
         let (block, index) = encode_block(&edges);
         UnitOut {
+            block_at: None,
+            block_len: block.len() as u64,
             worker,
             sources,
             lids: lids.iter().map(|_| Lid { shape: 0, slot: 0, key: (0, 0) }).collect(),
             owners: lids.iter().map(|&(r, e)| std::sync::atomic::AtomicU64::new(super::super::unit::pack_owner(r, e))).collect(),
             requests: Vec::new(),
+            pending: Vec::new(),
             bufs: Vec::new(),
             block,
             index,

@@ -237,19 +237,25 @@ pub fn bench_storage(a: &BenchArgs) -> Result<()> {
         let mut visited = base.clone();
         let mut xfers = base_xfers.clone();
         let _ = std::fs::remove_dir_all(&scratch);
-        // THE UNITS: each replayed on a worker's sink, heaviest first.
+        let index = super::edges::file_path(&scratch, frame, None);
+        // THE UNITS: each replayed on a worker's sink, heaviest first; with
+        // the edge file, their blocks streamed to the workers' files.
         let t0 = Instant::now();
         let mut order: Vec<usize> = (0..cap.units.len()).collect();
         order.sort_by_key(|&i| std::cmp::Reverse(cap.units[i].emits));
         let next = std::sync::atomic::AtomicUsize::new(0);
         let shared: &VisitedSet = &visited;
+        let claims = super::unit::Claims::default();
         type Done = (Vec<super::unit::UnitOut>, Vec<crate::search::arc_edges::Pair>, u64, u64);
         let done: Vec<Done> = std::thread::scope(|scope| {
             let hs: Vec<_> = (0..a.threads)
                 .map(|w| {
-                    let (cap, order, next) = (&cap, &order, &next);
+                    let (cap, order, next, claims, index) = (&cap, &order, &next, &claims, &index);
                     scope.spawn(move || -> Result<Done> {
-                        let mut sink = UnitSink::new(shared, crate::frame::Filters::default(), frame, w as u32, true, false, None, None);
+                        let mut sink = UnitSink::new(shared, claims, crate::frame::Filters::default(), frame, w as u32, true, false, None, None);
+                        if do_edges {
+                            sink.stream_blocks(&index)?;
+                        }
                         let mut xmap: Vec<Vec<u32>> = vec![Vec::new(); cap.maps.len()];
                         loop {
                             let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -257,8 +263,9 @@ pub fn bench_storage(a: &BenchArgs) -> Result<()> {
                             let u = &cap.units[ui];
                             sink.begin(u.unit, u.block, u.lo as usize, &u.sources, None, u.old);
                             replay_unit(&mut sink, cap, u, &mut xmap[u.stream])?;
-                            sink.end();
+                            sink.end()?;
                         }
+                        sink.finish()?;
                         Ok((std::mem::take(&mut sink.outs), std::mem::take(&mut sink.xfer_tab), sink.n_requests, sink.n_lids))
                     })
                 })
@@ -280,6 +287,7 @@ pub fn bench_storage(a: &BenchArgs) -> Result<()> {
         if do_translate {
             let t = Instant::now();
             let (news, _meta) = super::wave::translate(&mut visited, &mut outs, frame)?;
+            super::wave::resolve_lids(&visited, &outs, frame)?;
             let t_tr = t.elapsed();
             let t = Instant::now();
             let layer = super::wave::gather_layer(&visited, &outs, &news, frame, 0)?;
@@ -297,7 +305,7 @@ pub fn bench_storage(a: &BenchArgs) -> Result<()> {
             if do_edges {
                 let t = Instant::now();
                 let remaps = xfers.merge(Some(&scratch), &tables)?;
-                let bytes = super::edges::write_file(&super::edges::file_path(&scratch, frame, None), frame, &outs, remaps)?;
+                let bytes = super::edges::write_file(&index, frame, &outs, remaps)? + outs.iter().map(|u| u.block_len).sum::<u64>();
                 let t_e = t.elapsed();
                 line += &format!(" | edge file {:.3} s, {:.2} B an edge", t_e.as_secs_f64(), bytes as f64 / edges.max(1) as f64);
                 // The edges' fingerprint, as `ckhash --edges`'s `e` line.

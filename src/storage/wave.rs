@@ -216,6 +216,8 @@ pub fn run_wave(engine: &dyn FrameStep, frontier: Vec<Block>, cx: WaveCtx) -> Re
         Layer::Raised(r) => Some(r),
     };
     ensure!(raised.is_none() || layers.is_some(), "frame {frame}: a raise needs the tree's layers");
+    // The frame's edge file (a raise's beside the frame's own).
+    let index_path = edges_dir.map(|d| super::edges::file_path(d, frame, raised.map(|r| r.first_seq)));
 
     // THE UNITS.
     let t = Instant::now();
@@ -229,15 +231,19 @@ pub fn run_wave(engine: &dyn FrameStep, frontier: Vec<Block>, cx: WaveCtx) -> Re
         busy: std::time::Duration,
     }
     let shared: &VisitedSet = visited;
+    let claims = super::unit::Claims::default();
     let done: Vec<Done> = std::thread::scope(|scope| {
         let handles: Vec<_> = (0..workers)
             .map(|w| {
-                let (frontier, cells, order, units, next_unit, notes) = (&frontier, &cells, &order, &units, &next_unit, notes.as_ref());
+                let (frontier, cells, order, units, next_unit, notes, claims, index_path) = (&frontier, &cells, &order, &units, &next_unit, notes.as_ref(), &claims, &index_path);
                 std::thread::Builder::new().stack_size(WORKER_STACK).spawn_scoped(scope, move || -> Result<Done> {
                     crate::compiled::asm_kernel::set_thread_stack(WORKER_STACK);
                     let t = Instant::now();
                     let raise = raised.map(|r| RaiseCtx { raised: r, layers: layers.expect("checked") });
-                    let mut sink = UnitSink::new(shared, filters, frame, w as u32, record, pos.is_some(), notes, raise);
+                    let mut sink = UnitSink::new(shared, claims, filters, frame, w as u32, record, pos.is_some(), notes, raise);
+                    if let Some(p) = index_path {
+                        sink.stream_blocks(p)?;
+                    }
                     loop {
                         let u = next_unit.fetch_add(1, Ordering::Relaxed);
                         let Some(&(bi, lo, hi)) = units.get(u) else { break };
@@ -255,10 +261,10 @@ pub fn run_wave(engine: &dyn FrameStep, frontier: Vec<Block>, cx: WaveCtx) -> Re
                         let t_unit = phases::start();
                         engine.run(b, &cells[bi], &order[bi][lo..hi], &mut sink)?;
                         phases::add(phases::UNIT, t_unit);
-                        sink.end();
+                        sink.end()?;
                     }
                     crate::compiled::dispatch::fold_hits();
-                    sink.finish_capture()?;
+                    sink.finish()?;
                     Ok(Done {
                         outs: std::mem::take(&mut sink.outs),
                         xfer_tab: std::mem::take(&mut sink.xfer_tab),
@@ -295,7 +301,9 @@ pub fn run_wave(engine: &dyn FrameStep, frontier: Vec<Block>, cx: WaveCtx) -> Re
     // THE TRANSLATION.
     let t = Instant::now();
     let tr = phases::start();
+    drop(claims);
     let (new_states, meta) = translate(visited, &mut outs, frame)?;
+    resolve_lids(visited, &outs, frame)?;
     phases::add(phases::TRANSLATE, tr);
     st.t_translate = t.elapsed();
 
@@ -312,13 +320,9 @@ pub fn run_wave(engine: &dyn FrameStep, frontier: Vec<Block>, cx: WaveCtx) -> Re
     for b in &next {
         won |= b.wins()?.iter().any(|&w| w);
     }
-    if let Some(dir) = edges_dir {
+    if let (Some(dir), Some(path)) = (edges_dir, &index_path) {
         let remaps = xfers.merge(Some(dir), &tables)?;
-        let raised = match layer {
-            Layer::New => None,
-            Layer::Raised(r) => Some(r.first_seq),
-        };
-        st.edge_bytes = super::edges::write_file(&super::edges::file_path(dir, frame, raised), frame, &outs, remaps)?;
+        st.edge_bytes = super::edges::write_file(path, frame, &outs, remaps)? + outs.iter().filter(|u| u.block_at.is_some()).map(|u| u.block_len).sum::<u64>();
     }
     drop(outs);
     phases::add(phases::LAYER, tl);
@@ -476,6 +480,25 @@ pub(crate) fn translate(visited: &mut VisitedSet, outs: &mut [UnitOut], frame: u
         meta.entries.extend(entries);
     }
     Ok((news, meta))
+}
+
+/// The lids whose state another unit claimed (`unit::Claims`): their
+/// owners, found in the visited set the translation filled. Each must be
+/// there: its state was requested.
+pub(crate) fn resolve_lids(visited: &VisitedSet, outs: &[UnitOut], frame: u32) -> Result<()> {
+    let r: Vec<Result<()>> = par_map(outs, crate::frame::threads(), |u| {
+        for &l in &u.pending {
+            let o = &u.owners[l as usize];
+            if o.load(Ordering::Relaxed) != super::unit::NO_OWNER {
+                continue;
+            }
+            let lid = &u.lids[l as usize];
+            let (region, entry) = visited.find(lid.shape, lid.slot, lid.key).ok_or_else(|| anyhow::anyhow!("frame {frame}: a requested entry is not in the visited set after the translation"))?;
+            o.store(super::unit::pack_owner(region, entry), Ordering::Relaxed);
+        }
+        Ok(())
+    });
+    r.into_iter().collect()
 }
 
 /// The new LAYER: per shape its new states in id order, gathered from the

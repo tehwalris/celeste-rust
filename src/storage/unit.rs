@@ -295,6 +295,10 @@ pub fn pack_owner(region: u32, entry: u32) -> u64 {
 
 pub const NO_OWNER: u64 = u64::MAX;
 
+/// A unit's lid owner while the unit runs: no owner, and another unit
+/// claimed one of its states (`Claims`).
+const PENDING: u64 = u64::MAX - 1;
+
 /// A cell of a lid the unit asked the translation to add: its row is row
 /// `row` of the unit's buffer `buf`.
 #[derive(Clone, Copy, Debug)]
@@ -317,11 +321,43 @@ pub struct UnitOut {
     /// none.
     pub owners: Vec<std::sync::atomic::AtomicU64>,
     pub requests: Vec<Request>,
+    /// Lids without an owner whose state another unit claimed (`Claims`).
+    pub pending: Vec<u32>,
     pub bufs: Vec<RowBuf>,
-    /// The encoded edges (`edges::encode_block`), its index, its edge count.
+    /// The encoded edges (`edges::encode_block`): in the worker's blocks
+    /// file at `block_at` (the wave's), or here (`block`); its length, its
+    /// index, its edge count.
+    pub block_at: Option<u64>,
+    pub block_len: u64,
     pub block: Vec<u8>,
     pub index: Vec<(u32, u32)>,
     pub edges: u64,
+}
+
+/// The states requested in a wave, across its units: the first unit to
+/// request one copies its row and hands it to the translation; another
+/// unit's lid of it finds it after the translation (`wave::resolve_lids`).
+/// Under `CELESTE_KERNEL_KEY_CHECK=1` every request goes through, so the
+/// translation compares their rows.
+pub struct Claims {
+    shards: Vec<std::sync::Mutex<rustc_hash::FxHashSet<(u64, u32, Key, u32)>>>,
+}
+
+impl Default for Claims {
+    fn default() -> Self {
+        Claims { shards: (0..CLAIM_SHARDS).map(|_| Default::default()).collect() }
+    }
+}
+
+const CLAIM_SHARDS: usize = 1 << 12;
+
+impl Claims {
+    /// Is this the first request of `(shape, slot, key, cell)` this wave?
+    #[inline]
+    pub fn claim(&self, shape: u64, slot: u32, key: Key, local: u32) -> bool {
+        let h = key.0 ^ celeste_engine::runtime2::mix64(shape ^ (slot as u64) << 8 ^ (local as u64) << 40);
+        self.shards[(h >> 52) as usize & (CLAIM_SHARDS - 1)].lock().expect("a claims shard").insert((shape, slot, key, local))
+    }
 }
 
 /// Bits of a packed edge (`lid | cell | source | transfer`, a u64 that sorts
@@ -361,6 +397,7 @@ pub struct RaiseCtx<'a> {
 /// One worker's sink for a frame's units (module doc).
 pub struct UnitSink<'a> {
     visited: &'a VisitedSet,
+    claims: &'a Claims,
     geo: Geometry,
     filters: Filters<'a>,
     frame: u32,
@@ -409,16 +446,25 @@ pub struct UnitSink<'a> {
     pub emitted: u64,
     pub n_requests: u64,
     pub n_lids: u64,
+    /// Requests another unit had claimed (`Claims`).
+    pub claimed_elsewhere: u64,
+    /// The unit's lids without an owner whose state another unit claimed:
+    /// resolved after the translation (`wave::resolve_lids`).
+    pending: Vec<u32>,
     /// TSC ticks of the units' ends (sort and encode), `phases`.
     pub end_ticks: u64,
     /// `CELESTE_EMIT_CAPTURE`: this worker's stream (`bench`).
     capture: Option<super::bench::CaptureWriter>,
+    /// The worker's blocks file (`edges::blocks_path`): units' blocks go
+    /// there as they end; `None`: kept in memory.
+    blocks: Option<super::edges::BlockWriter>,
 }
 
 impl<'a> UnitSink<'a> {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         visited: &'a VisitedSet,
+        claims: &'a Claims,
         filters: Filters<'a>,
         frame: u32,
         worker: u32,
@@ -429,6 +475,7 @@ impl<'a> UnitSink<'a> {
     ) -> Self {
         UnitSink {
             visited,
+            claims,
             geo: visited.geo,
             filters,
             frame,
@@ -464,9 +511,19 @@ impl<'a> UnitSink<'a> {
             emitted: 0,
             n_requests: 0,
             n_lids: 0,
+            claimed_elsewhere: 0,
+            pending: Vec::new(),
             end_ticks: 0,
             capture: super::bench::CaptureWriter::open(frame, worker),
+            blocks: None,
         }
+    }
+
+    /// Stream the units' blocks into `blocks` (the frame's index path's
+    /// worker file) instead of keeping them.
+    pub fn stream_blocks(&mut self, index: &std::path::Path) -> Result<()> {
+        self.blocks = Some(super::edges::BlockWriter::create(&super::edges::blocks_path(index, self.worker))?);
+        Ok(())
     }
 
     /// Are edges recorded (an edges dir, ids on the frontier)?
@@ -498,6 +555,7 @@ impl<'a> UnitSink<'a> {
             self.lid_index.fill(0);
         }
         self.edges.clear();
+        self.pending.clear();
         self.requests.clear();
         self.bufs = Vec::new();
         self.verdicts.clear();
@@ -705,6 +763,20 @@ impl<'a> UnitSink<'a> {
             }
         } else if self.lid_masks[base + words + w] & b == 0 {
             self.lid_masks[base + words + w] |= b;
+            // Another unit may hold the state's row already: only the
+            // first copies it (`Claims`).
+            if !crate::compiled::asm_kernel::key_check_on() && !self.claims.claim(shape, slot, key, local) {
+                self.claimed_elsewhere += 1;
+                if self.lid_owners[lid as usize] == NO_OWNER {
+                    // Marked pending once: its owner slot says so.
+                    self.lid_owners[lid as usize] = PENDING;
+                    self.pending.push(lid);
+                }
+                if let (Some(x), true) = (xfer, self.record_edges) {
+                    self.edges.push(pack_edge(lid, local, (lane - self.lo) as u32, x));
+                }
+                return Ok(());
+            }
             let i = Self::buf_of(&mut self.bufs, shape, &init);
             push(&mut self.bufs[i]);
             debug_assert_eq!(self.bufs[i].cells.last(), Some(&cell));
@@ -743,9 +815,12 @@ impl<'a> UnitSink<'a> {
         self.emit(row.shape_hash, cell, key, self.lo, None, init, |b| b.push_row(row, key, cell))
     }
 
-    /// The worker's units are over: its capture stream and transfer table
-    /// written (`CELESTE_EMIT_CAPTURE`).
-    pub fn finish_capture(&mut self) -> Result<()> {
+    /// The worker's units are over: its blocks file complete, its capture
+    /// stream and transfer table written (`CELESTE_EMIT_CAPTURE`).
+    pub fn finish(&mut self) -> Result<()> {
+        if let Some(b) = self.blocks.take() {
+            b.finish()?;
+        }
         match self.capture.take() {
             Some(c) => c.finish(&self.xfer_tab),
             None => Ok(()),
@@ -754,7 +829,7 @@ impl<'a> UnitSink<'a> {
 
     /// The unit is over: its edges sorted, deduplicated and encoded; its
     /// lids, requests and rows kept for the translation.
-    pub fn end(&mut self) {
+    pub fn end(&mut self) -> Result<()> {
         let t = crate::frame::phases::start();
         for b in &self.check {
             crate::compiled::asm_kernel::key_check(b);
@@ -788,22 +863,35 @@ impl<'a> UnitSink<'a> {
             }
         }
         self.sorted.dedup();
-        let (block, index) = super::edges::encode_block(&self.sorted);
+        let (mut block, index) = super::edges::encode_block(&self.sorted);
+        let block_len = block.len() as u64;
+        let block_at = match &mut self.blocks {
+            Some(w) => {
+                let at = w.append(&block)?;
+                block = Vec::new();
+                Some(at)
+            }
+            None => None,
+        };
         self.n_requests += self.requests.len() as u64;
         self.n_lids += self.lids.len() as u64;
         self.outs.push(UnitOut {
             worker: self.worker,
             sources: std::mem::take(&mut self.sources),
             lids: std::mem::take(&mut self.lids),
-            owners: self.lid_owners.drain(..).map(std::sync::atomic::AtomicU64::new).collect(),
+            owners: self.lid_owners.drain(..).map(|o| std::sync::atomic::AtomicU64::new(if o == PENDING { NO_OWNER } else { o })).collect(),
             requests: std::mem::take(&mut self.requests),
+            pending: std::mem::take(&mut self.pending),
             bufs: std::mem::take(&mut self.bufs),
+            block_at,
+            block_len,
             block,
             index,
             edges: self.sorted.len() as u64,
         });
         let t1 = crate::frame::phases::add(crate::frame::phases::END_UNIT, t);
         self.end_ticks += t1.saturating_sub(t);
+        Ok(())
     }
 }
 

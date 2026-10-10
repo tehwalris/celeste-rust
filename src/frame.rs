@@ -1890,7 +1890,8 @@ mod tests {
             let cells = crate::search::pos_graph::block_cells(r).expect("cells");
             assert!(grid.of_cell(cells[0]).is_some(), "the lane has a region");
             let visited = crate::storage::visited::VisitedSet::new(*crate::storage::geometry());
-            let mut sink = crate::storage::unit::UnitSink::new(&visited, Filters::default(), 1, 0, false, false, None, None);
+            let claims = crate::storage::unit::Claims::default();
+            let mut sink = crate::storage::unit::UnitSink::new(&visited, &claims, Filters::default(), 1, 0, false, false, None, None);
             sink.begin(0, 0, 0, &[0], None, false);
             crate::compiled::dispatch::run_chunk_kernel(r, &cells, &[0], &mut sink)
         };
@@ -1951,7 +1952,8 @@ mod tests {
         let runs = |r: &Rt2| -> bool {
             let cells = crate::search::pos_graph::block_cells(r).expect("cells");
             let visited = crate::storage::visited::VisitedSet::new(*crate::storage::geometry());
-            let mut sink = crate::storage::unit::UnitSink::new(&visited, Filters::default(), 1, 0, false, false, None, None);
+            let claims = crate::storage::unit::Claims::default();
+            let mut sink = crate::storage::unit::UnitSink::new(&visited, &claims, Filters::default(), 1, 0, false, false, None, None);
             sink.begin(0, 0, 0, &[0], None, false);
             crate::compiled::dispatch::run_chunk_kernel(r, &cells, &[0], &mut sink)
         };

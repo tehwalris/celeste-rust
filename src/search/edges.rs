@@ -100,7 +100,7 @@ mod tests {
         let (block, index) = encode_block(&packed);
         let lids = targets.iter().map(|_| Lid { shape: 0, slot: 0, key: (0, 0) }).collect();
         let owners = targets.iter().map(|&t| std::sync::atomic::AtomicU64::new(pack_owner(crate::storage::id_region(t), crate::storage::id_entry(t)))).collect();
-        let u = UnitOut { worker: 0, sources, lids, owners, requests: Vec::new(), bufs: Vec::new(), block, index, edges: packed.len() as u64 };
+        let u = UnitOut { worker: 0, sources, lids, owners, requests: Vec::new(), pending: Vec::new(), bufs: Vec::new(), block_at: None, block_len: block.len() as u64, block, index, edges: packed.len() as u64 };
         write_file(&file_path(dir, frame, None), frame, &[u], vec![vec![0]]).unwrap();
     }
 
