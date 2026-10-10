@@ -309,10 +309,8 @@ pub fn wins_of(rt2: &Rt2) -> Result<Vec<bool>> {
 }
 
 /// Per lane: the win target met, the berry aside (`wins_of` without its
-/// 100% condition): the forward's "first win", whose frame turns on the
-/// not-expanded filter (`not_expanded`) - a 100% exit without the berry is
-/// no win, and is not expanded either.
-pub fn reaches_win(rt2: &Rt2) -> Result<Vec<bool>> {
+/// 100% condition).
+fn reaches_win(rt2: &Rt2) -> Result<Vec<bool>> {
     use celeste_engine::runtime2::AV;
     let exits = exits_of(rt2)?;
     if win_rect().is_some() || !orb_required() {
@@ -388,9 +386,8 @@ pub fn berry_lost(rt2: &Rt2) -> Result<Vec<bool>> {
 /// for the next room; a win or a `--win-at` exit), a 100% row whose berry is
 /// lost (`berry_lost`), and in the orb room a row whose chest is still closed
 /// too late for the ceiling (`orb_deadline_skip`).
-/// The forward and a resume both take the frontier through this, so a resumed
-/// run expands exactly the rows an uninterrupted one does. `minus_one`: the
-/// tree's level -1 horizon, the orb deadline's ceiling.
+/// Applied to every frame's layer (`expandable`). `ceiling`: the tree's level
+/// -1 horizon, the orb deadline's.
 pub fn not_expanded(b: &Block, frame: u32, ceiling: Option<u32>) -> Result<Vec<bool>> {
     let mut skip = b.exits()?;
     // Under a win rectangle (`--win-at`, the summit's flag) a row that LEFT
@@ -410,6 +407,27 @@ pub fn not_expanded(b: &Block, frame: u32, ceiling: Option<u32>) -> Result<Vec<b
         }
     }
     Ok(skip)
+}
+
+/// A frame's layer as the frontier the forward expands: each block's rows
+/// `not_expanded` masked, in parallel. THE one place the decision is made:
+/// the forward's every frame (`extend`, frame 0 in `start`, a `raise`) and
+/// a resume (`ForwardState::at`) all take their frontier through it, so a
+/// resumed run expands exactly the rows an uninterrupted one does.
+fn expandable(layer: Vec<Block>, frame: u32, ceiling: Option<u32>) -> Result<Vec<Block>> {
+    std::thread::scope(|scope| {
+        let handles: Vec<_> = layer
+            .into_iter()
+            .map(|mut b| {
+                scope.spawn(move || -> Result<Block> {
+                    let skip = not_expanded(&b, frame, ceiling)?;
+                    b.set_skip(skip);
+                    Ok(b)
+                })
+            })
+            .collect();
+        handles.into_iter().map(|h| h.join().expect("not-expanded worker panicked")).collect()
+    })
 }
 
 /// Is the start room the orb room (5,2)? A win there also needs the orb
@@ -904,7 +922,7 @@ impl ForwardState {
         std::fs::write(dir.join("level.txt"), format!("{level}\n"))?;
         let mut visited = crate::storage::visited::VisitedSet::new(*crate::storage::geometry());
         let meta = crate::storage::wave::seed(&mut visited, &mut initial, level)?;
-        checkpoint_frontier(dir, 0, &mut initial, true)?;
+        let won = checkpoint_frontier(dir, 0, &mut initial, true)?;
         crate::storage::meta::save(dir, 0, None, &meta)?;
         crate::storage::edges::set_done_frame(&dir.join("edges"), 0)?;
         let observer = record.then(crate::search::pos_graph::PosObserver::default);
@@ -913,12 +931,12 @@ impl ForwardState {
             save_pos_graph(dir, &o.snapshot(), 0)?;
         }
         Ok(ForwardState {
-            frontier: initial,
+            frontier: expandable(initial, 0, filter.ceiling())?,
             visited,
             xfers: Default::default(),
             observer,
             frames: 0,
-            win_frame: None,
+            win_frame: won.then_some(0),
             filter: Some(filter),
         })
     }
@@ -977,17 +995,13 @@ impl ForwardState {
         let (visited, win_frame) = restore_visited(dir, last)?;
         let xfers = crate::storage::edges::XferTable::load(&edges_dir)?;
         // The frontier: the last layer minus the rows the forward does not
-        // expand (`not_expanded`, as `extend` decides it; a tree without a
+        // expand (`expandable`, as `extend` decides it; a tree without a
         // record by the environment's ceiling, as it was built).
         let ceiling = match filter {
             Some(f) => f.ceiling(),
             None => MinusOne::from_env().map(|m| m.h),
         };
-        let mut frontier: Vec<Block> = load_frame(dir, last)?;
-        for b in &mut frontier {
-            let skip = not_expanded(b, last, ceiling)?;
-            b.set_skip(skip);
-        }
+        let frontier = expandable(load_frame(dir, last)?, last, ceiling)?;
         let observer = if record {
             let path = pos_graph_path(dir);
             let graph = crate::search::pos_graph::PosGraph::load(&path)
@@ -1106,13 +1120,13 @@ impl ForwardState {
                 layers: None,
             };
             let wave = crate::storage::wave::run_wave(engine, frontier, cx)?;
-            let (mut next, won, st) = (wave.next, wave.won, wave.stats);
+            let (mut next, st) = (wave.next, wave.stats);
             // Before the frame is trusted (its checkpoint, then done.txt).
             if filters.notes_drops() {
                 crate::search::checkpoint::save_value_to(&dropped_path(dir, frame), &wave.dropped)?;
             }
             let t = std::time::Instant::now();
-            checkpoint_frontier(dir, frame, &mut next, true)?;
+            let won = checkpoint_frontier(dir, frame, &mut next, true)?;
             crate::storage::meta::save(dir, frame, None, &wave.meta)?;
             let t_ckpt = t.elapsed();
             crate::storage::edges::set_done_frame(&edges_dir, frame)?;
@@ -1135,30 +1149,7 @@ impl ForwardState {
                 self.win_frame = Some(frame);
                 eprintln!("[fwd] first win at f{frame}");
             }
-            // Exited rows are checkpointed but never expanded; nor are orb
-            // rows past their deadline (`not_expanded`).
-            let orb = orb_required();
-            let ceiling = minus_one.map(|m| m.h);
-            self.frontier = if won || orb {
-                std::thread::scope(|scope| {
-                    let handles: Vec<_> = next
-                        .into_iter()
-                        .map(|mut b| {
-                            scope.spawn(move || -> Result<Block> {
-                                let skip = not_expanded(&b, frame, ceiling)?;
-                                b.set_skip(skip);
-                                Ok(b)
-                            })
-                        })
-                        .collect();
-                    handles
-                        .into_iter()
-                        .map(|h| h.join().expect("win-skip worker panicked"))
-                        .collect::<Result<Vec<_>>>()
-                })?
-            } else {
-                next
-            };
+            self.frontier = expandable(next, frame, minus_one.map(|m| m.h))?;
         }
         if let Some(o) = self.observer.as_ref() {
             save_pos_graph(dir, &o.snapshot(), self.frames)?;
@@ -1249,7 +1240,7 @@ impl ForwardState {
             let wave = crate::storage::wave::run_wave(engine, frontier, cx)?;
             old_seqs = first_seq;
             let mut next = wave.next;
-            checkpoint_frontier(dir, t, &mut next, false)?;
+            let won = checkpoint_frontier(dir, t, &mut next, false)?;
             crate::storage::meta::save(dir, t, Some(first_seq), &wave.meta)?;
             for b in &next {
                 for &id in b.ids() {
@@ -1264,7 +1255,7 @@ impl ForwardState {
                 kept.dedup_by_key(|e| e.0);
                 crate::search::checkpoint::save_value_to(&dropped_path(dir, t), &kept)?;
             }
-            if wave.won {
+            if won {
                 self.win_frame = Some(self.win_frame.map_or(t, |w| w.min(t)));
             }
             let kept = next.iter().map(Block::lanes).sum::<usize>();
@@ -1277,11 +1268,7 @@ impl ForwardState {
             );
             redone += redo.len();
             added += kept;
-            for b in &mut next {
-                let skip = not_expanded(b, t, to.map(|m| m.h))?;
-                b.set_skip(skip);
-            }
-            new_prev = next;
+            new_prev = expandable(next, t, to.map(|m| m.h))?;
         }
         // The last layer's new states join the frontier `extend` expands.
         self.frontier.append(&mut new_prev);
@@ -1517,7 +1504,9 @@ fn log_frame(
 /// Checkpoint a frontier: `frames/fNNN/s{shape}_{seq}.bin` per piece, rows
 /// in id order. `fresh`: a new frame (any old files go); else pieces a raise
 /// adds to the frame, beside its own.
-fn checkpoint_frontier(dir: &std::path::Path, frame: u32, frontier: &mut [Block], fresh: bool) -> Result<()> {
+/// Returns whether a row wins (`wins_of`, the files' win rows): the
+/// forward's first win is read off the same rows a resume reads it from.
+fn checkpoint_frontier(dir: &std::path::Path, frame: u32, frontier: &mut [Block], fresh: bool) -> Result<bool> {
     let fdir = dir.join("frames").join(format!("f{:03}", frame));
     // A re-run frame must not leave stale files behind.
     if fresh {
@@ -1535,20 +1524,22 @@ fn checkpoint_frontier(dir: &std::path::Path, frame: u32, frontier: &mut [Block]
             .iter_mut()
             .map(|block| {
                 let fdir = &fdir;
-                scope.spawn(move || -> Result<()> {
+                scope.spawn(move || -> Result<bool> {
                     anyhow::ensure!(block.ids.len() == block.lanes(), "checkpoint f{frame}: a block without its ids");
                     let cells = block.positions()?;
                     let wins = block.wins()?;
                     let path = fdir.join(format!("s{:016x}_{:04}.bin", block.shard_shape(), block.seq));
                     anyhow::ensure!(fresh || !path.exists(), "checkpoint f{frame}: {} exists", path.display());
-                    crate::search::checkpoint::save_block(&path, &block.rt2, &block.ids, &cells, &wins)
+                    crate::search::checkpoint::save_block(&path, &block.rt2, &block.ids, &cells, &wins)?;
+                    Ok(wins.contains(&true))
                 })
             })
             .collect();
-        handles
+        let won: Vec<bool> = handles
             .into_iter()
             .map(|h| h.join().expect("checkpoint worker panicked"))
-            .collect::<Result<()>>()
+            .collect::<Result<_>>()?;
+        Ok(won.contains(&true))
     })
 }
 
@@ -1935,6 +1926,37 @@ mod tests {
         assert_eq!(w.deadline(1, (0, 0), 4), Some(7));
         assert_eq!(w.deadline(1, (0, 1), 4), Some(12));
         assert_eq!(w.deadline(9, (0, 0), 8), Some(12), "no deadline: the horizon");
+    }
+
+    /// A resume (`ForwardState::at`) takes the frontier the uninterrupted
+    /// forward expands, at every frame. 100% in room (1,0), which has no
+    /// berry: every row's berry is lost from frame 0 on. The forward used to
+    /// skip `not_expanded` rows only on a frame with a win (and never at frame
+    /// 0), a resume always: a resumed 100% run expanded fewer rows.
+    #[test]
+    fn a_resume_expands_what_the_uninterrupted_forward_expands() {
+        std::env::set_var("CELESTE_START_ROOM", "1,0");
+        std::env::set_var("CELESTE_HUNDRED", "1");
+        let dir = std::env::temp_dir().join(format!("celeste-resume-frontier-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let e = RefEngine::new().expect("engine");
+        let init = vec![Block::canonical(e.initial().expect("init")).expect("block")];
+        let e = Mutex::new(e);
+        let frontier = |st: &ForwardState| -> Vec<(Vec<StateId>, Vec<bool>)> {
+            let mut v: Vec<_> = st.frontier.iter().map(|b| (b.ids().to_vec(), b.skip().to_vec())).collect();
+            v.sort();
+            v
+        };
+        let mut st = ForwardState::start(init, &dir, true, None, crate::abstraction::Level::EXACT).expect("start");
+        assert!(st.frontier.iter().all(|b| b.skip().iter().all(|&s| s)), "frame 0: the berry is lost");
+        for to in 0..=3 {
+            st.extend(&e, &dir, to, None).expect("extend");
+            let resumed = ForwardState::at(&dir, st.frames, true, crate::abstraction::Level::EXACT).expect("at");
+            assert_eq!(frontier(&st), frontier(&resumed), "f{}: the resume's frontier is not the forward's", st.frames);
+            assert_eq!(st.win_frame, resumed.win_frame, "f{}: the first win", st.frames);
+        }
+        assert_eq!(st.frames, 1, "nothing expanded past frame 0");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Extending frame by frame and resuming reproduce a fresh run's key sets.

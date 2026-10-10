@@ -100,7 +100,6 @@ impl StateLayers {
 pub struct Wave {
     /// The new states, as pieces with their ids, in id order.
     pub next: Vec<Block>,
-    pub won: bool,
     pub stats: FrameStats,
     /// The level -1 drops' sources (`Filters::notes_drops`): `(id, the
     /// smallest horizon admitting one of its dropped successors)`, by id.
@@ -314,10 +313,6 @@ pub fn run_wave(engine: &dyn FrameStep, frontier: Vec<Block>, cx: WaveCtx) -> Re
     };
     let next = gather_layer(visited, &outs, &new_states, frame, first_seq)?;
     st.lanes_kept = new_states.len();
-    let mut won = false;
-    for b in &next {
-        won |= crate::frame::reaches_win(b.rt2())?.iter().any(|&w| w);
-    }
     if let (Some(dir), Some(path)) = (edges_dir, &index_path) {
         let remaps = xfers.merge(Some(dir), &tables)?;
         st.edge_bytes = super::edges::write_file(path, frame, &outs, remaps)? + outs.iter().filter(|u| u.block_at.is_some()).map(|u| u.block_len).sum::<u64>();
@@ -332,7 +327,7 @@ pub fn run_wave(engine: &dyn FrameStep, frontier: Vec<Block>, cx: WaveCtx) -> Re
     st.lanes_out = next.iter().map(Block::lanes).sum();
     let dropped = notes.map_or_else(Vec::new, DropNotes::into_sorted);
     phases::print_phases(t_frame.elapsed(), workers);
-    Ok(Wave { next, won, stats: st, dropped, meta })
+    Ok(Wave { next, stats: st, dropped, meta })
 }
 
 /// A new state: its id and its row (unit, buffer, row).

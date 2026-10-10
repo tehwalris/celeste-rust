@@ -686,7 +686,11 @@ fn preds_of(edges: &celeste_rust::storage::edges::EdgeStore, id: StateId, layer:
 /// one wins.
 fn rerun(engine: &dyn FrameStep, rt2: Rt2, layer: u32) -> Result<(Vec<Block>, bool)> {
     let wave = celeste_rust::storage::wave::one_frame(engine, vec![Block::from_rt2(rt2)], layer + 1)?;
-    Ok((wave.next, wave.won))
+    let mut won = false;
+    for b in &wave.next {
+        won |= wins_of(b.rt2())?.contains(&true);
+    }
+    Ok((wave.next, won))
 }
 
 fn main() -> Result<()> {
