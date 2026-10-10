@@ -1,6 +1,6 @@
 //! LEVEL -1 (plans/level-minus-one.md): a POSITION-ONLY cost-to-go table for
 //! the start room, from the traced frame graphs; the search uses it as a
-//! filter (`--level-minus-one H,S`), `transpile --level-minus-one`
+//! filter (`--level-minus-one H,S`), `transpile --probe`
 //! checks it (`probe`).
 //!
 //! A node is (heap shape, cell of the player or player spawn); every other

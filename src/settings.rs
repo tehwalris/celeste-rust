@@ -316,7 +316,8 @@ pub struct SettingsArgs {
     /// No Diagonal Dashes: a dash may not start diagonal.
     #[arg(long, global = true)]
     pub nodiag: bool,
-    /// Only Diagonal Dashes.
+    /// Only Diagonal Dashes: a dash must start diagonal (the straight and
+    /// facing-only dash arms raise).
     #[arg(long, global = true)]
     pub onlydiag: bool,
     /// The gemskip categories: the orb room won without the orb, one dash after it.
@@ -436,6 +437,37 @@ impl SettingsArgs {
             },
         })
     }
+}
+
+/// The long flags a command line defines twice, per (sub)command, the
+/// shared settings' global ones included: a binary's own flag must not
+/// shadow a setting (`transpile --level-minus-one` once did). Checked by
+/// each binary's test, in every profile (`clap`'s own assertion of it runs
+/// only with debug assertions).
+pub fn duplicate_flags(cmd: &clap::Command) -> Vec<String> {
+    fn walk(cmd: &clap::Command, inherited: &[String], out: &mut Vec<String>) {
+        let mut seen: Vec<String> = inherited.to_vec();
+        let mut globals = inherited.to_vec();
+        for a in cmd.get_arguments() {
+            let Some(l) = a.get_long() else { continue };
+            if inherited.iter().any(|g| g == l) && a.is_global_set() {
+                continue;
+            }
+            if seen.iter().any(|s| s == l) {
+                out.push(format!("{}: --{l}", cmd.get_name()));
+            }
+            seen.push(l.to_string());
+            if a.is_global_set() {
+                globals.push(l.to_string());
+            }
+        }
+        for sub in cmd.get_subcommands() {
+            walk(sub, &globals, out);
+        }
+    }
+    let mut out = Vec::new();
+    walk(cmd, &[], &mut out);
+    out
 }
 
 /// A binary's first step: refuse every `CELESTE_*` variable in the

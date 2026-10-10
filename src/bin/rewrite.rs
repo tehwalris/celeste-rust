@@ -21,8 +21,42 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 /// On DISK, not the tmpfs at `/tmp`: a full-room tree is gigabytes.
 const DEFAULT_CHECKPOINT_DIR: &str = "/var/tmp/celeste-checkpoints";
 
+/// `rewrite --help`'s overview: the pipeline, the settings, the checks.
+const LONG_ABOUT: &str = "The abstract TAS search for PICO-8 Celeste, and its diagnostics.
+
+`search` runs the whole pipeline per level of `--level`: the level-0 forward
+(abstract states, every edge with its remainder transfer), the backward over
+the rotation graph (an exact-in-the-remainder lower bound), then the
+exhaustive concrete search inside its winning sets. Its first concrete win is
+the optimum; the witness goes to <checkpoint-dir>/witness_frame_F.txt.
+
+THE SETTINGS are the flags below (Options), given anywhere on the line. A
+tree records the ones that change it (<level dir>/settings.txt) and refuses a
+run under others; flags never default to the record. --override-settings
+proceeds past a different --region only. CELESTE_* environment variables are
+refused. Run everything under ./safe-run.sh (a memory cap).
+
+Checking a change: ./check.sh t0|t1|t2|big (plans/devloop.md).";
+
+/// `rewrite --help`'s examples.
+const EXAMPLES: &str = "Examples:
+  # A room's optimum, a known solution's length as the horizon:
+  ./safe-run.sh -- target/release/rewrite search --room 1,0 --ceiling 99 --checkpoint-dir DIR
+  # A room with objects, level -1 filtered at the horizon, a category, the real-play entry
+  # (plans/results.md \"How to run a room\"); --prefer FILE checks a known route too:
+  ./safe-run.sh -- target/release/rewrite search --room X,Y --level r0sxhn --ceiling C \\
+      --level-minus-one C,5 [--hundred | --nodiag | --gemskip] [--loading-jank J] --checkpoint-dir DIR
+  # The objects ladder where r0sxhn's bound is loose (room (7,0): 80 against 84):
+  ./safe-run.sh -- target/release/rewrite search --room 7,0 --level r0sxhn,r0sxh \\
+      --level-minus-one 84,5 --ceiling 84 --checkpoint-dir DIR
+  # One forward and its fingerprint (the room (1,0) gate):
+  ./safe-run.sh -- target/quick/rewrite forward --room 1,0 --to 44 --checkpoint-dir D
+  target/quick/rewrite ckhash --room 1,0 --to 44 --checkpoint-dir D --edges
+  # Help on one command:
+  target/quick/rewrite search --help";
+
 #[derive(Parser)]
-#[command(about = "The abstract TAS search")]
+#[command(about = "The abstract TAS search", long_about = LONG_ABOUT, after_long_help = EXAMPLES)]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -129,15 +163,19 @@ enum Command {
     /// projections not reached (a forward loss) and those reached but
     /// unmarked (a backward loss); then the first misses' cells.
     DiagProject {
+        /// The FINE level's tree.
         #[arg(long)]
         fine_dir: String,
+        /// The COARSE level's tree.
         #[arg(long)]
         coarse_dir: String,
         /// The coarse level.
         #[arg(long, value_parser = Level::parse)]
         level: Level,
+        /// The first frame checked.
         #[arg(long, default_value_t = 1)]
         from: u32,
+        /// The last frame checked (both trees must reach it).
         #[arg(long)]
         to: u32,
         /// The fine level's marks (`hNNN/levelNN.marks.bin`): only its
@@ -153,6 +191,8 @@ enum Command {
     /// order-independent hash of its (row key, cell) set, independent of the
     /// storage format.
     Ckhash {
+        /// The tree (the dir holding `frames/`: a `forward` checkpoint dir, or a
+        /// search's `levelNN`).
         #[arg(long, default_value = DEFAULT_CHECKPOINT_DIR)]
         checkpoint_dir: String,
         /// Last frame to fingerprint.
@@ -197,6 +237,8 @@ enum Command {
         /// The frame F to run F -> F+1 from (default: the tree's last).
         #[arg(long)]
         frame: Option<u32>,
+        /// Run the wave this many times, each from a copy (every rep's lines must
+        /// agree).
         #[arg(long, default_value_t = 1)]
         reps: usize,
         /// The level to run at (the tree's).
@@ -222,11 +264,14 @@ enum Command {
         /// The level-0 tree (`frames/`, `edges/` under it).
         #[arg(long)]
         level_dir: String,
+        /// The search's horizon, in steps: the tree must reach it; the graph and
+        /// the winning sets are built for it.
         #[arg(long)]
         horizon: u32,
         /// The frame F whose winning sets are computed (from F+1's).
         #[arg(long)]
         frame: u32,
+        /// Compute W_F this many times, each from a copy.
         #[arg(long, default_value_t = 1)]
         reps: usize,
     },
@@ -234,8 +279,11 @@ enum Command {
     /// plans/storage-unify.md (built lids, unified per-region sets, hybrids):
     /// per frame a line, then totals and the persistent structures' reuse.
     StorageCensus {
+        /// The level's tree (the dir holding `frames/` and `edges/`; a search's
+        /// `<checkpoint-dir>/levelNN`).
         #[arg(long)]
         level_dir: String,
+        /// The last frame counted.
         #[arg(long)]
         to: u32,
         /// Frames whose unified-layout edges are encoded exactly (comma list).
@@ -259,11 +307,13 @@ enum Command {
         /// The level dir the capture's frame was run on (its frames to F-1).
         #[arg(long)]
         tree: String,
+        /// The level the capture was run at (its `env.txt`).
         #[arg(long, value_parser = Level::parse, default_value = "r0sx")]
         level: Level,
         /// `units`, `translate` (and the layer) or `all` (and the edge file).
         #[arg(long, default_value = "all")]
         phase: String,
+        /// Replay the capture this many times.
         #[arg(long, default_value_t = 3)]
         reps: usize,
     },
@@ -277,12 +327,17 @@ enum Command {
     /// the point predicts, and at points no record of the pair covers none
     /// may. Fails (exit != 0) on any disagreement.
     ArcCheck {
+        /// The level's tree (the dir holding `frames/` and `edges/`; a search's
+        /// `<checkpoint-dir>/levelNN`).
         #[arg(long)]
         level_dir: String,
+        /// The first frame whose records are checked.
         #[arg(long, default_value_t = 1)]
         from: u32,
+        /// The last frame whose records are checked.
         #[arg(long)]
         to: u32,
+        /// Records sampled per frame.
         #[arg(long, default_value_t = 20)]
         samples: usize,
         /// The tree's level (what a successor is projected onto).
@@ -305,12 +360,17 @@ enum Command {
     /// names start with any `--erase` prefix left out (comma-separated, e.g.
     /// `spd.,rem.,player[3].dash`), and cumulatively through that frame.
     CoarseCensus {
+        /// The level's tree (the dir holding `frames/` and `edges/`; a search's
+        /// `<checkpoint-dir>/levelNN`).
         #[arg(long)]
         level_dir: String,
+        /// The first frame counted.
         #[arg(long)]
         from: u32,
+        /// The last frame counted.
         #[arg(long)]
         to: u32,
+        /// Named-cell prefixes left out, comma-separated (e.g. `spd.,rem.`).
         #[arg(long, default_value = "")]
         erase: String,
     },
@@ -319,14 +379,20 @@ enum Command {
     /// visited count (and `--at x,y`) with their new states per frame, and
     /// every cell's new states at `to` as a share of its visited set.
     CellGrowth {
+        /// The level's tree (the dir holding `frames/` and `edges/`; a search's
+        /// `<checkpoint-dir>/levelNN`).
         #[arg(long)]
         level_dir: String,
+        /// The first frame read.
         #[arg(long, default_value_t = 0)]
         from: u32,
+        /// The last frame read (the shares are taken there).
         #[arg(long)]
         to: u32,
+        /// How many of the most visited cells to list.
         #[arg(long, default_value_t = 8)]
         top: usize,
+        /// Also list the cell at player position "x,y".
         #[arg(long, value_parser = parse_xy)]
         at: Option<(i32, i32)>,
         /// Also the growth by AGE (frames since a cell's first state, in
@@ -345,12 +411,18 @@ enum Command {
     /// graph side keeps a floor's computed `collideable` in the player's
     /// probe window, which a frame boundary's widening does not.)
     WidenCheck {
+        /// The level's tree (the dir holding `frames/` and `edges/`; a search's
+        /// `<checkpoint-dir>/levelNN`).
         #[arg(long)]
         level_dir: String,
+        /// The step whose stored rows are checked.
         #[arg(long)]
         frame: u32,
+        /// The tree's level (the widening checked).
         #[arg(long, value_parser = Level::parse)]
         level: Level,
+        /// Also run this many of the rows (evenly spaced) through the kernels and
+        /// check what they emit.
         #[arg(long, default_value_t = 0)]
         emitted: usize,
     },
@@ -361,14 +433,21 @@ enum Command {
     /// reference successor the kernels miss is a SOUNDNESS gap; a kernel
     /// successor the reference never makes is a PRECISION gap.
     RefCheck {
+        /// The level's tree (the dir holding `frames/` and `edges/`; a search's
+        /// `<checkpoint-dir>/levelNN`).
         #[arg(long)]
         level_dir: String,
+        /// The step whose rows (first reached there) are sampled.
         #[arg(long)]
         frame: u32,
+        /// The tree's level (the kernels run, and both sides are projected onto
+        /// it).
         #[arg(long, value_parser = Level::parse)]
         level: Level,
+        /// Rows sampled.
         #[arg(long, default_value_t = 20)]
         samples: usize,
+        /// Only rows at player position "x,y".
         #[arg(long, value_parser = parse_xy)]
         cell: Option<(i32, i32)>,
         /// Show up to this many differing successors per row and side.
@@ -384,12 +463,19 @@ enum Command {
     /// state itself: what the kernel makes of a single row. `--row L:S:R` is
     /// the row's (layer, seq, row) in the tree's frame files.
     RerunRow {
+        /// The level's tree (the dir holding `frames/` and `edges/`; a search's
+        /// `<checkpoint-dir>/levelNN`).
         #[arg(long)]
         level_dir: String,
+        /// The row, `LAYER:SEQ:ROW` (its frame, its file's seq, its index in the
+        /// file).
         #[arg(long)]
         row: String,
+        /// The level whose kernels run it (the tree's).
         #[arg(long, value_parser = Level::parse)]
         level: Level,
+        /// Named-cell prefixes left out of the printed projections, comma-
+        /// separated.
         #[arg(long, default_value = "fall_floor")]
         erase: String,
     },
@@ -403,19 +489,26 @@ enum Command {
     /// distributions are compared, and each walk stops at the first
     /// predecessor the real tree did reach - the first spurious transition.
     Spurious {
+        /// The coarse level's tree, whose states are walked back.
         #[arg(long)]
         coarse: String,
+        /// A finer level's tree (the real states the coarse ones should project
+        /// from).
         #[arg(long)]
         real: Option<String>,
+        /// The step at which the sampled states were first reached.
         #[arg(long)]
         step: u32,
         /// The player cell `x,y`, or a rect `x0,x1,y0,y1` of cells (inclusive).
         #[arg(long)]
         cell: String,
+        /// Named-cell prefixes left out of what changed, comma-separated.
         #[arg(long, default_value = "fall_floor")]
         erase: String,
+        /// States sampled.
         #[arg(long, default_value_t = 8)]
         samples: usize,
+        /// Steps walked back per sample.
         #[arg(long, default_value_t = 40)]
         depth: u32,
         /// Write sample 0's chain, frame 1 to `step`, as a keyed trajectory
@@ -431,10 +524,14 @@ enum Command {
     /// per-axis pieces?), and how many distinct transfer SETS there are (what
     /// one edge per pair with an interned set would store).
     EdgeCensus {
+        /// The level's tree (the dir holding `frames/` and `edges/`; a search's
+        /// `<checkpoint-dir>/levelNN`).
         #[arg(long)]
         level_dir: String,
+        /// The frame whose recorded edges are grouped.
         #[arg(long)]
         frame: u32,
+        /// The last frame of the tree's edge files to open (at least `--frame`).
         #[arg(long)]
         horizon: u32,
     },
@@ -448,6 +545,8 @@ enum Command {
     /// a kernel did not check these; frames whose rows were trimmed
     /// (`--trim-rows`) are counted, not read.
     BoundsAudit {
+        /// The level's tree (the dir holding `frames/` and `edges/`; a search's
+        /// `<checkpoint-dir>/levelNN`).
         #[arg(long)]
         level_dir: String,
     },
@@ -460,16 +559,25 @@ enum Command {
     /// distinct states (without the `--erase` prefixes), speed pairs, and
     /// states without speed.
     ColCensus {
+        /// The level's tree (the dir holding `frames/` and `edges/`; a search's
+        /// `<checkpoint-dir>/levelNN`).
         #[arg(long)]
         level_dir: String,
+        /// The frame (step) whose rows are counted.
         #[arg(long)]
         frame: u32,
+        /// Stop counting a column's distinct values past this many.
         #[arg(long, default_value_t = 1 << 24)]
         cap: usize,
+        /// Only the rows at player position "x,y", and its saturation over the
+        /// steps.
         #[arg(long, value_parser = parse_xy)]
         cell: Option<(i32, i32)>,
+        /// With `--cell`: named-cell prefixes left out of a state, comma-
+        /// separated.
         #[arg(long, default_value = "")]
         erase: String,
+        /// With `--cell`: report the saturation every this many steps.
         #[arg(long, default_value_t = 4)]
         every: u32,
     },
@@ -535,13 +643,17 @@ enum Command {
     /// next to the closest kernel successors: no equal one is a SOUNDNESS
     /// gap; an equal one was not stored (a win, or the level -1 filter).
     Follow {
+        /// The level's tree (the dir holding `frames/` and `edges/`; a search's
+        /// `<checkpoint-dir>/levelNN`).
         #[arg(long)]
         level_dir: String,
+        /// The tree's level (the concrete states are projected onto it).
         #[arg(long, value_parser = Level::parse)]
         level: Level,
         /// The input bytes: a file in the `tas/` format, or a comma list.
         #[arg(long)]
         inputs: String,
+        /// How many of the closest kernel successors to print.
         #[arg(long, default_value_t = 5)]
         show: usize,
     },
@@ -551,8 +663,10 @@ enum Command {
     /// is why a tree without the record is refused. Refuses a tree that has
     /// one.
     AdoptSettings {
+        /// The tree to record the settings of (a level's dir).
         #[arg(long)]
         level_dir: String,
+        /// The level the tree WAS built at.
         #[arg(long, value_parser = Level::parse)]
         level: Level,
     },
@@ -565,6 +679,8 @@ enum Command {
         /// The input bytes: a file in the `tas/` format, or a comma list.
         #[arg(long)]
         inputs: String,
+        /// H: the frame the solution exits at (a state with f + d > H is too
+        /// late).
         #[arg(long)]
         horizon: u32,
         /// The table's speed bound S (px per frame).
@@ -2493,4 +2609,18 @@ fn frame_metrics(room: &str, level: Level, frame: u32, w: &celeste_rust::frame::
         writeln!(out, "{k} {v}").unwrap();
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    /// The command line is well-formed: no flag defined twice (a
+    /// subcommand's own against the shared settings), every one parseable
+    /// (`clap`'s debug assertions, which a release build skips).
+    #[test]
+    fn the_command_line_is_well_formed() {
+        use clap::CommandFactory;
+        let cmd = super::Cli::command();
+        assert_eq!(celeste_rust::settings::duplicate_flags(&cmd), Vec::<String>::new(), "flags defined twice");
+        cmd.debug_assert();
+    }
 }

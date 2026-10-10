@@ -12,8 +12,8 @@ per step, exits non-zero on any failure). `t1 --pin`, `t2 --pin` and
 `big --pin` write the outputs as the new pins instead (only on evidence;
 say why in the commit). Timings are reported, never pinned.
 
-This file replaces CLAUDE.md's "Gates" and "Iterating quickly" sections
-once reviewed; until then both hold.
+CLAUDE.md's "Checking a change" points here (it replaced CLAUDE.md's
+"Gates" and "Iterating quickly" sections, branch `settings-explicit`).
 
 **Settings are flags** (2026-10-10, branch `footguns`): every setting of a
 run is a command-line flag of the binaries (`--room`, `--hundred`,
@@ -21,7 +21,10 @@ run is a command-line flag of the binaries (`--room`, `--hundred`,
 `rewrite --help`), and a binary REFUSES any `CELESTE_*` variable in its
 environment (naming the flag that replaced it). Only `CELESTE_FIXTURES`,
 read by the shell tools, remains. A tree records the settings that change
-it (`<level>/settings.txt`) and refuses a run under other ones.
+it (`<level>/settings.txt`) and refuses a run under other ones
+(`--override-settings` proceeds past a different `--region` only; a tree
+without a record: `rewrite adopt-settings`). Nothing reads a global: the
+binaries pass the settings (plans/footguns.md, "Follow-ups").
 
 ## The ladder
 
