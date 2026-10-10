@@ -32,7 +32,7 @@ pub struct FrameMeta {
 impl FrameMeta {
     /// An empty record for the process's storage geometry.
     pub fn new() -> Self {
-        FrameMeta { side: super::geometry().side, ..Default::default() }
+        FrameMeta { side: super::GEOMETRY.side, ..Default::default() }
     }
 }
 
@@ -59,12 +59,12 @@ pub fn load_frame(dir: &Path, frame: u32) -> Result<Vec<FrameMeta>> {
         .collect();
     paths.sort();
     anyhow::ensure!(paths.first().is_some_and(|p| p.ends_with("meta.bin")), "{}: no meta.bin (a tree from before storage v2?)", fdir.display());
-    let side = super::geometry().side;
+    let side = super::GEOMETRY.side;
     paths
         .iter()
         .map(|p| {
             let m: FrameMeta = crate::search::checkpoint::load_value_from(p).with_context(|| p.display().to_string())?;
-            anyhow::ensure!(m.side == side, "{}: built with storage regions of {} cells, this process uses {side} (--storage-region)", p.display(), m.side);
+            anyhow::ensure!(m.side == side, "{}: built with storage regions of {} cells, this process uses {side} (`storage::GEOMETRY`)", p.display(), m.side);
             Ok(m)
         })
         .collect()

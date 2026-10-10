@@ -165,7 +165,8 @@ refinement), so `_update`'s "moved" and `_draw`'s "clamp skipped" join every
 frame, with a dash every frame. Chosen fix (C, not built): small counters
 exact per node - a node is (shape, cell, `freeze`, `djump`) - up to 6x the
 nodes; the filter would take the minimum d over a cell's counters. Check with
-`--l1-path 16,48`. Bigger: speed per node instead of [-S, S]
+the table's fastest path from (16, 48) (the `--l1-path` probe printed it;
+cut 2026-10-10, branch `settings-explicit`). Bigger: speed per node instead of [-S, S]
 everywhere (would bend the top's straight cut along gravity and walls).
 
 ## Limits

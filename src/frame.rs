@@ -853,7 +853,7 @@ fn load_sources(dir: &std::path::Path, layer: u32, ids: &[StateId]) -> Result<Ve
 
 /// Every state's layer (a raise's refusal of a hit from a later layer).
 fn state_layers(dir: &std::path::Path, last: u32) -> Result<crate::storage::wave::StateLayers> {
-    let geo = crate::storage::geometry();
+    let geo = &crate::storage::GEOMETRY;
     let mut layers = crate::storage::wave::StateLayers::new((geo.side * geo.side) as usize);
     for f in 0..=last {
         for (_, file) in frame_files(dir, f)? {
@@ -907,7 +907,7 @@ impl ForwardState {
         let filter = TreeFilter::of(minus_one);
         filter.write(dir)?;
         crate::settings::get().write(dir, level)?;
-        let mut visited = crate::storage::visited::VisitedSet::new(*crate::storage::geometry());
+        let mut visited = crate::storage::visited::VisitedSet::new(crate::storage::GEOMETRY);
         let meta = crate::storage::wave::seed(&mut visited, &mut initial, level)?;
         let won = checkpoint_frontier(dir, 0, &mut initial, true)?;
         crate::storage::meta::save(dir, 0, None, &meta)?;
@@ -1410,8 +1410,11 @@ pub fn forward_run(
     Ok(ForwardResult { win_frame: st.win_frame, frames: st.frames, pos_graph: st.pos_graph() })
 }
 
+/// The free disk the forward keeps, GB (`ensure_disk_space`).
+const MIN_FREE_GB: u64 = 20;
+
 /// Stop the forward before the checkpoint disk fills: below
-/// `--min-free-gb` (default 20) plus three times what the last frame
+/// `MIN_FREE_GB` plus three times what the last frame
 /// wrote, free on `dir`'s filesystem, an error -
 /// a full disk otherwise fails a worker mid-write (room (5,1) nodiag,
 /// 2026-10-06) and starves everything else on the machine. `last_free`: the
@@ -1421,7 +1424,7 @@ pub fn forward_run(
 /// second level at its first frame, 2026-10-07).
 fn ensure_disk_space(dir: &std::path::Path, last_free: &mut Option<u64>) -> Result<()> {
     use std::os::unix::ffi::OsStrExt;
-    let min_gb: u64 = crate::settings::get().min_free_gb;
+    let min_gb = MIN_FREE_GB;
     let path = std::ffi::CString::new(dir.as_os_str().as_bytes())?;
     // SAFETY: `path` is NUL-terminated; `st` is a valid out-parameter that
     // statvfs fills on success.
@@ -1434,7 +1437,7 @@ fn ensure_disk_space(dir: &std::path::Path, last_free: &mut Option<u64>) -> Resu
     let need = (min_gb << 30) + 3 * frame_bytes;
     anyhow::ensure!(
         free >= need,
-        "only {} GB free on {}'s filesystem, the last frame used {} GB (--min-free-gb {min_gb}, plus 3 frames): stopping the forward before the disk fills",
+        "only {} GB free on {}'s filesystem, the last frame used {} GB (the floor {min_gb} GB, plus 3 frames): stopping the forward before the disk fills",
         free >> 30,
         dir.display(),
         frame_bytes >> 30
@@ -1596,7 +1599,7 @@ pub fn load_row(dir: &std::path::Path, id: StateId) -> Result<(Rt2, u64, u32, u3
 /// shapes and entries, the frame files' ids for the cells), and its first
 /// win. A row whose key is not its entry's is a collision, fatal.
 pub fn restore_visited(dir: &std::path::Path, last: u32) -> Result<(crate::storage::visited::VisitedSet, Option<u32>)> {
-    let geo = *crate::storage::geometry();
+    let geo = crate::storage::GEOMETRY;
     let mut visited = crate::storage::visited::VisitedSet::new(geo);
     let metas = crate::storage::meta::load_tree(dir, last)?;
     visited.keys = crate::storage::meta::key_space(&metas)?;
@@ -2121,7 +2124,7 @@ mod tests {
         let runs = |r: &Rt2| -> bool {
             let cells = crate::search::pos_graph::block_cells(r).expect("cells");
             assert!(grid.of_cell(cells[0]).is_some(), "the lane has a region");
-            let visited = crate::storage::visited::VisitedSet::new(*crate::storage::geometry());
+            let visited = crate::storage::visited::VisitedSet::new(crate::storage::GEOMETRY);
             let claims = crate::storage::unit::Claims::default();
             let prov = celeste_engine::exact::Provisional::default();
             let mut sink = crate::storage::unit::UnitSink::new(&visited, &claims, &prov, Filters::default(), 1, level, 0, false, false, None, None);
@@ -2183,7 +2186,7 @@ mod tests {
         };
         let runs = |r: &Rt2| -> bool {
             let cells = crate::search::pos_graph::block_cells(r).expect("cells");
-            let visited = crate::storage::visited::VisitedSet::new(*crate::storage::geometry());
+            let visited = crate::storage::visited::VisitedSet::new(crate::storage::GEOMETRY);
             let claims = crate::storage::unit::Claims::default();
             let prov = celeste_engine::exact::Provisional::default();
             let mut sink = crate::storage::unit::UnitSink::new(&visited, &claims, &prov, Filters::default(), 1, level, 0, false, false, None, None);

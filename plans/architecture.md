@@ -321,8 +321,8 @@ the unit row cache, the raw edge records and the inversion):
 
 - **The visited set** (`storage::visited`): per (shape, storage REGION) a
   table of ENTRIES - a position-free key and a mask over the region's cells.
-  A storage region is `--storage-region` (8 default, or 16) cells
-  square, aligned as the kernels' regions (`div_euclid`) and nested in one
+  A storage region is 8 cells square (`storage::GEOMETRY`; 16 was the
+  other measured choice), aligned as the kernels' regions (`div_euclid`) and nested in one
   (the kernels' px a multiple of it, else refused); `NO_CELL` is one more
   region per shape. Room (6,2) 100% f57: 43.8M states in 2.19M entries,
   0.10 GB (the door: 1.08 GB).

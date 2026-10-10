@@ -140,7 +140,7 @@ impl Resolver {
     /// The metadata of the tree in `dir` through frame `last` (frames past
     /// a dead frontier have none).
     pub fn load(dir: &std::path::Path, last: u32) -> Result<Self> {
-        let geo = *super::geometry();
+        let geo = super::GEOMETRY;
         let mut shapes: Vec<(u32, u64)> = Vec::new();
         let mut entries: Vec<(u32, u32, Key)> = Vec::new();
         let mut adds = celeste_engine::exact::KeyAdditions::default();

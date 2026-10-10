@@ -1590,7 +1590,7 @@ impl Graph1 {
 fn build(root: &FsPath, spd_px: i32, threads: usize, rep: &mut String) -> Result<Built> {
     let t_all = std::time::Instant::now();
     let room0 = crate::game_runner::start_room();
-    let lw = super::kernel::room_constant_lattice(root, crate::abstraction::Level { held: true, ..crate::abstraction::Level::EXACT })?;
+    let lw = super::kernel::room_constant_lattice(root, crate::abstraction::Level { held: true, ..crate::abstraction::Level::EXACT }, None)?;
     say!(rep, "room {room0:?}: lattice walk {} shapes, {:.1} s", lw.lattice.len(), t_all.elapsed().as_secs_f64())?;
     let mut tr = lw.tracer.clone();
     let mut table = Table {
@@ -1949,25 +1949,6 @@ pub fn probe(root: &FsPath, opts: &Opts) -> Result<String> {
             })
             .collect();
         say!(rep, "{:4} {line}", ty as i32 * 8)?;
-    }
-    // `--l1-path x,y`: the table's fastest path from that cell.
-    if let Some((x, y)) = crate::settings::get().diag.l1_path {
-        let show = |i: usize| format!("({}, {}) shape {} d {}", g1.nodes[i].1, g1.nodes[i].2, g1.nodes[i].0, sound[i]);
-        match g1.nodes.iter().enumerate().filter(|(_, n)| n.1 == x && n.2 == y).min_by_key(|(i, _)| sound[*i]).map(|(i, _)| i) {
-            None => say!(rep, "\npath from ({x}, {y}): not a table node")?,
-            Some(mut i) => {
-                let mut steps = vec![show(i)];
-                while sound[i] > 1 && sound[i] != u32::MAX && steps.len() < 64 {
-                    let Some(&next) = g1.edges[i].iter().find(|&&e| sound[e as usize] == sound[i] - 1) else {
-                        steps.push("(no successor of d - 1: a death seed)".to_string());
-                        break;
-                    };
-                    i = next as usize;
-                    steps.push(show(i));
-                }
-                say!(rep, "\npath from ({x}, {y}), the table's fastest:\n  {}{}", steps.join("\n  "), if g1.exits[i] { "\n  EXIT" } else { "" })?;
-            }
-        }
     }
 
     // The soundness check against the recorded transitions.

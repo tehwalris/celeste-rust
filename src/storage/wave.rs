@@ -807,7 +807,7 @@ pub fn seed(visited: &mut VisitedSet, blocks: &mut [Block], level: crate::abstra
 /// ONE frame of `frontier` against an EMPTY visited set, no edges: every
 /// successor is new (the diagnostics' `rerun`, the tests).
 pub fn one_frame(engine: &dyn FrameStep, frontier: Vec<Block>, frame: u32) -> Result<Wave> {
-    let mut visited = VisitedSet::new(*super::geometry());
+    let mut visited = VisitedSet::new(super::GEOMETRY);
     let mut xfers = XferTable::default();
     let cx = WaveCtx { visited: &mut visited, xfers: &mut xfers, pos: None, filters: Filters::default(), frame, edges_dir: None, layer: Layer::New, layers: None };
     run_wave(engine, frontier, cx)

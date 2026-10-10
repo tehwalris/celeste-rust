@@ -48,7 +48,7 @@ pub(crate) fn lattice_kernel_refs(
     root: &std::path::Path,
     opts: crate::abstraction::Level,
 ) -> Result<Vec<(Option<Region>, Reference)>> {
-    let mut lw = room_constant_lattice(root, opts)?;
+    let mut lw = room_constant_lattice(root, opts, None)?;
     let room = crate::transpile::graph::Room { cart: lw.cart.clone(), cache: lw.cache.clone() };
     // Each frame was bound by the walk in the worker arena it was traced in.
     let frames: Vec<(Option<Region>, super::verify::Frame, Bound)> = std::mem::take(&mut lw.frames)
@@ -182,6 +182,7 @@ fn successor_regions(
     st: &super::state::State<super::domain::Symbolic>,
     d: &mut super::domain::Symbolic,
     grid: Option<RegionGrid>,
+    only: Option<&[Region]>,
 ) -> Result<Vec<Option<Region>>> {
     use super::{iface, shapes};
     let (Some(g), Some(pl)) = (grid, shapes::player_path(st)) else { return Ok(vec![None]) };
@@ -202,10 +203,9 @@ fn successor_regions(
         anyhow::ensure!(hull[axis].0 <= hull[axis].1, "{}: its range lies outside the screen window {window:?}", iface::show(&p));
     }
     let (a, b) = (g.of(hull[0].0 as i32, hull[1].0 as i32), g.of(hull[0].1 as i32, hull[1].1 as i32));
-    // Probe only: `--walk-regions "(ix,iy) .."` traces just those.
-    let only = &crate::settings::get().diag.walk_regions;
+    // A test's walk traces just these (`room_constant_lattice`'s `only`).
     if let Some(o) = only {
-        return Ok(o.iter().map(|&(ix, iy)| Some(Region { ix, iy })).collect());
+        return Ok(o.iter().map(|&r| Some(r)).collect());
     }
     Ok((a.iy..=b.iy).flat_map(|iy| (a.ix..=b.ix).map(move |ix| Some(Region { ix, iy }))).collect())
 }
@@ -336,11 +336,11 @@ mod tests {
         }
         crate::settings::install(crate::settings::Settings {
             room: (6, 1),
-            diag: crate::settings::Diagnostics { walk_regions: Some(vec![(3, 6), (4, 6)]), ..Default::default() },
             ..Default::default()
         });
         let opts = crate::abstraction::Level { held: true, floors_near: true, ..crate::abstraction::Level::EXACT };
-        let lw = super::room_constant_lattice(std::path::Path::new("."), opts).unwrap_or_else(|e| panic!("{e:#}"));
+        let only = [super::Region { ix: 3, iy: 6 }, super::Region { ix: 4, iy: 6 }];
+        let lw = super::room_constant_lattice(std::path::Path::new("."), opts, Some(&only)).unwrap_or_else(|e| panic!("{e:#}"));
         let mut traced = 0;
         for ((shape, region), f) in &lw.frames {
             let Some(r) = region else { continue };
@@ -356,9 +356,12 @@ mod tests {
 /// INTERSECT each outcome's constants into its shape's lattice, re-trace a
 /// shape that shrinks. Monotone (constant -> abstract only), so it
 /// terminates. Every frame is traced under `opts`, the kernels' level.
+/// `only`: the player's regions the walk traces (a test's; `None`: every
+/// region a state can be in).
 pub fn room_constant_lattice(
     root: &std::path::Path,
     opts: crate::abstraction::Level,
+    only: Option<&[Region]>,
 ) -> Result<LatticeWalk> {
     use super::domain::Symbolic;
     use super::interp::Interp;
@@ -457,7 +460,7 @@ pub fn room_constant_lattice(
     }
     // A node is (shape, region); the lattice stays per shape.
     let grid = region_grid();
-    let start_regions = successor_regions(&start, &mut it.d, grid)?;
+    let start_regions = successor_regions(&start, &mut it.d, grid, only)?;
     let mut regions: std::collections::BTreeMap<String, std::collections::BTreeSet<Option<Region>>> = Default::default();
     regions.insert(sk.clone(), start_regions.iter().copied().collect());
     let room0 = shapes::room_of(&start, &it.d);
@@ -520,7 +523,7 @@ pub fn room_constant_lattice(
                                 // A FRESH arena per job, so a graph depends on
                                 // the job, not scheduling (`renumber_cells`).
                                 let mut fresh = Tracer { it: tr.it.clone(), reset: tr.reset, fr: tr.fr };
-                                done.push((i, walk_trace(&mut fresh, job, opts, grid, room0)?));
+                                done.push((i, walk_trace(&mut fresh, job, opts, grid, only, room0)?));
                             }
                             Ok(done)
                         })
@@ -761,6 +764,7 @@ fn walk_trace(
     job: &WalkJob,
     opts: crate::abstraction::Level,
     grid: Option<RegionGrid>,
+    only: Option<&[Region]>,
     room0: (i16, i16),
 ) -> Result<WalkTraced> {
     use super::domain::Domain;
@@ -829,7 +833,7 @@ fn walk_trace(
                 }
             }
         }
-        let regions = successor_regions(&o.st, &mut tr.it.d, grid)?;
+        let regions = successor_regions(&o.st, &mut tr.it.d, grid, only)?;
         let heap_constants = shapes::heap_constants(&o.st, &tr.it.d);
         outs.push(WalkOutcome { key, constants, ival, regions, st: o.st.clone(), heap_constants });
     }

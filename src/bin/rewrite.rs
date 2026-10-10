@@ -243,8 +243,8 @@ enum Command {
         encode: String,
     },
     /// BENCH: replay one captured frame through the REAL storage code
-    /// (`storage::bench`): a forward run with `--emit-capture DIR`
-    /// (and `--emit-capture-frame F`) writes `DIR/f{F}/`; this replays
+    /// (`storage::bench`): a forward or `bench-frame` run with
+    /// `--emit-capture DIR` writes each wave's `DIR/f{F}/`; this replays
     /// its units against `--tree`'s visited set at frame F-1 - the sinks,
     /// then (`--phase translate|all`) the translation and the layer, then
     /// (`all`) the edge file - printing per rep each phase's wall time and the

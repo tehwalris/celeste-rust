@@ -1,5 +1,6 @@
 //! THE STORAGE MICROBENCHMARK: one real frame's emissions, captured in the
-//! forward (`--emit-capture DIR`, optionally `--emit-capture-frame F`),
+//! forward (`--emit-capture DIR`: every wave, `DIR/f{F}/`; `bench-frame`
+//! runs one),
 //! replayed through the REAL storage code (`UnitSink`, the translation, the
 //! layer's gather, the edge file) by `rewrite bench-storage`, against the
 //! tree's visited set at the frame before - without the kernels, so a tweak
@@ -25,9 +26,8 @@ use super::unit::{RowBuf, UnitSink};
 use super::visited::{Key, VisitedSet};
 use super::StateId;
 
-/// The capture directory and frame (`--emit-capture`,
-/// `--emit-capture-frame`: any frame when unset).
-fn capture_target() -> Option<&'static (PathBuf, Option<u32>)> {
+/// The capture directory (`--emit-capture`).
+fn capture_target() -> Option<&'static PathBuf> {
     crate::settings::get().diag.emit_capture.as_ref()
 }
 
@@ -39,13 +39,10 @@ pub struct CaptureWriter {
 }
 
 impl CaptureWriter {
-    /// The stream of `worker` at `frame`, if this frame is captured
+    /// The stream of `worker` at `frame`, if the run captures
     /// (`DIR/f{frame}/`).
     pub fn open(frame: u32, worker: u32, level: crate::abstraction::Level) -> Option<Self> {
-        let (root, only) = capture_target()?;
-        if only.is_some_and(|f| f != frame) {
-            return None;
-        }
+        let root = capture_target()?;
         let dir = root.join(format!("f{frame:03}"));
         std::fs::create_dir_all(&dir).expect("the capture dir");
         if worker == 0 {

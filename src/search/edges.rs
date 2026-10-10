@@ -22,7 +22,7 @@ pub struct BfsStats {
 /// sequential in frontier order: the marks are a function of the graph.
 pub fn bfs(store: &EdgeStore, horizon: u32, seeds: impl IntoIterator<Item = (StateId, u32)>) -> (Marks, BfsStats) {
     let t = std::time::Instant::now();
-    let mut marks = Marks::new(crate::storage::geometry());
+    let mut marks = Marks::new(&crate::storage::GEOMETRY);
     let mut frontier: Vec<(StateId, u32)> = Vec::new();
     for (s, layer) in seeds {
         if layer <= horizon && marks.insert(s, horizon, layer) {

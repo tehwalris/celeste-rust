@@ -44,8 +44,6 @@ pub struct Settings {
     pub split_frame: bool,
     /// The kernels' region grid `(px, S)` (`--region`; `None`: off).
     pub region: Option<(i32, i32)>,
-    /// The storage region side (`--storage-region`).
-    pub storage_region: u32,
     pub hundred: bool,
     pub nodiag: bool,
     pub onlydiag: bool,
@@ -64,8 +62,6 @@ pub struct Settings {
     pub trim_rows: bool,
     /// Worker threads (`None`: one per physical core).
     pub threads: Option<usize>,
-    /// The forward stops below this much free disk (plus 3x a frame).
-    pub min_free_gb: u64,
     /// The level -1 table pinned by its file (the fixtures).
     pub l1_table: Option<PathBuf>,
     pub diag: Diagnostics,
@@ -87,12 +83,8 @@ pub struct Diagnostics {
     pub build_trace: bool,
     /// The wave workers' phase timings.
     pub phases: bool,
-    /// Capture the wave's emissions into this dir (at this frame only).
-    pub emit_capture: Option<(PathBuf, Option<u32>)>,
-    /// The lattice walk traces only these regions (a probe).
-    pub walk_regions: Option<Vec<(i16, i16)>>,
-    /// The level -1 probe prints the fastest path from this cell.
-    pub l1_path: Option<(i16, i16)>,
+    /// Capture the wave's emissions into this dir (`DIR/f{F}/` per frame).
+    pub emit_capture: Option<PathBuf>,
 }
 
 impl Default for Settings {
@@ -102,7 +94,6 @@ impl Default for Settings {
             win_at: None,
             split_frame: false,
             region: Some((16, 6)),
-            storage_region: 8,
             hundred: false,
             nodiag: false,
             onlydiag: false,
@@ -113,7 +104,6 @@ impl Default for Settings {
             concrete_balloon_seeds: None,
             trim_rows: false,
             threads: None,
-            min_free_gb: 20,
             l1_table: None,
             diag: Diagnostics::default(),
         }
@@ -145,7 +135,6 @@ impl Settings {
             ("win_at", opt(self.win_at.map(|(x0, x1, y0, y1)| format!("{x0}..{x1},{y0}..{y1}")))),
             ("split_frame", u8::from(self.split_frame).to_string()),
             ("region", opt(self.region.map(|(px, s)| format!("{px},{s}")))),
-            ("storage_region", self.storage_region.to_string()),
             ("hundred", u8::from(self.hundred).to_string()),
             ("nodiag", u8::from(self.nodiag).to_string()),
             ("onlydiag", u8::from(self.onlydiag).to_string()),
@@ -159,8 +148,7 @@ impl Settings {
     /// What the cart (so the kernels and the level -1 table) is a function
     /// of, besides the sources: the cache key of a level -1 table.
     pub fn cart_key(&self) -> String {
-        let mut s: Vec<String> = self.recorded("").into_iter().filter(|(k, _)| *k != "level").map(|(k, v)| format!("{k}={v}")).collect();
-        s.push(format!("walk_regions={:?}", self.diag.walk_regions));
+        let s: Vec<String> = self.recorded("").into_iter().filter(|(k, _)| *k != "level").map(|(k, v)| format!("{k}={v}")).collect();
         s.join(" ")
     }
 
@@ -216,7 +204,10 @@ impl Settings {
             .filter(|(k, v)| rec.get(k) != Some(&v.as_str()))
             .map(|(k, v)| format!("{k}: the tree's {}, this run's {v}", rec.get(k).copied().unwrap_or("(missing)")))
             .collect();
-        diffs.extend(rec.keys().filter(|k| !mine.iter().any(|(m, _)| m == *k)).map(|k| format!("{k}: in the tree's record, not a setting")));
+        // `storage_region 8`: a line of the records written before the side
+        // was fixed at 8 (`storage::GEOMETRY`); any other side is refused.
+        let legacy = |k: &str| k == "storage_region" && rec.get(k) == Some(&"8");
+        diffs.extend(rec.keys().filter(|k| !mine.iter().any(|(m, _)| m == *k) && !legacy(k)).map(|k| format!("{k}: in the tree's record, not a setting")));
         anyhow::ensure!(
             diffs.is_empty(),
             "{}: the tree was built under other settings than this run's:\n  {}\n(a tree's frames are one search: delete it, or run with its flags)",
@@ -273,9 +264,6 @@ pub struct SettingsArgs {
     /// The kernels' region grid "px,S" (1 <= S <= 7), or `off`.
     #[arg(long, global = true, default_value = "16,6")]
     pub region: String,
-    /// The storage region side: 8 or 16 (it must divide the kernels' px).
-    #[arg(long, global = true, default_value_t = 8)]
-    pub storage_region: u32,
     /// 100%: a room is won only with its berry taken.
     #[arg(long, global = true)]
     pub hundred: bool,
@@ -309,9 +297,6 @@ pub struct SettingsArgs {
     /// Worker threads (default: one per physical core).
     #[arg(long, global = true)]
     pub threads: Option<usize>,
-    /// Stop the forward below this much free disk (GB, plus 3x the last frame).
-    #[arg(long, global = true, default_value_t = 20)]
-    pub min_free_gb: u64,
     /// The level -1 table pinned by its FILE (read if it exists, else built
     /// there): the fixtures', never a search's.
     #[arg(long, global = true)]
@@ -333,18 +318,9 @@ pub struct SettingsArgs {
     /// DIAGNOSTIC: the wave workers' phase timings.
     #[arg(long, global = true)]
     pub phases: bool,
-    /// DIAGNOSTIC: capture the wave's emissions into DIR (`bench-storage`).
+    /// DIAGNOSTIC: capture every wave's emissions into DIR/f{F}/ (`bench-storage`).
     #[arg(long, global = true)]
     pub emit_capture: Option<PathBuf>,
-    /// DIAGNOSTIC: capture only this frame (default: every frame).
-    #[arg(long, global = true)]
-    pub emit_capture_frame: Option<u32>,
-    /// PROBE: the lattice walk traces only these regions, "(ix,iy) ..".
-    #[arg(long, global = true)]
-    pub walk_regions: Option<String>,
-    /// DIAGNOSTIC: the level -1 probe prints the table's fastest path from "x,y".
-    #[arg(long, global = true, value_parser = |s: &str| pair::<i16>(s, "--l1-path"))]
-    pub l1_path: Option<(i16, i16)>,
 }
 
 impl SettingsArgs {
@@ -358,13 +334,9 @@ impl SettingsArgs {
                 Some((px, sp))
             }
         };
-        anyhow::ensure!(matches!(self.storage_region, 8 | 16), "--storage-region {}: 8 or 16", self.storage_region);
         if let Some((px, _)) = region {
-            anyhow::ensure!(
-                px % self.storage_region as i32 == 0,
-                "--storage-region {}: a storage region must nest in one kernel region, and the kernels' regions are {px} px (--region)",
-                self.storage_region
-            );
+            let side = crate::storage::GEOMETRY.side as i32;
+            anyhow::ensure!(px % side == 0, "--region {px},..: a kernel region must hold whole storage regions ({side} px)");
         }
         anyhow::ensure!(!(self.nodiag && self.onlydiag), "--nodiag and --onlydiag exclude each other");
         let loading_jank = match self.loading_jank.as_str() {
@@ -383,21 +355,11 @@ impl SettingsArgs {
             None => None,
         };
         anyhow::ensure!(self.threads != Some(0), "--threads 0");
-        let walk_regions = match &self.walk_regions {
-            None => None,
-            Some(v) => Some(
-                v.split_whitespace()
-                    .map(|t| pair::<i16>(t.trim_matches(|c| c == '(' || c == ')'), "--walk-regions").map_err(anyhow::Error::msg))
-                    .collect::<Result<Vec<_>>>()?,
-            ),
-        };
-        anyhow::ensure!(self.emit_capture_frame.is_none() || self.emit_capture.is_some(), "--emit-capture-frame without --emit-capture");
         Ok(Settings {
             room: self.room,
             win_at: self.win_at,
             split_frame: self.split_frame,
             region,
-            storage_region: self.storage_region,
             hundred: self.hundred,
             nodiag: self.nodiag,
             onlydiag: self.onlydiag,
@@ -408,7 +370,6 @@ impl SettingsArgs {
             concrete_balloon_seeds: self.concrete_balloon_seeds.clone(),
             trim_rows: self.trim_rows,
             threads: self.threads,
-            min_free_gb: self.min_free_gb,
             l1_table: self.l1_table.clone(),
             diag: Diagnostics {
                 key_check: self.key_check,
@@ -417,9 +378,7 @@ impl SettingsArgs {
                 kernel_metrics: false,
                 build_trace: self.build_trace,
                 phases: self.phases,
-                emit_capture: self.emit_capture.clone().map(|d| (d, self.emit_capture_frame)),
-                walk_regions,
-                l1_path: self.l1_path,
+                emit_capture: self.emit_capture.clone(),
             },
         })
     }
@@ -435,7 +394,6 @@ pub fn refuse_env() -> Result<()> {
         ("CELESTE_WIN_AT_XY", "--win-at"),
         ("CELESTE_SPLIT_FRAME", "--split-frame"),
         ("CELESTE_REGION", "--region"),
-        ("CELESTE_STORAGE_REGION", "--storage-region"),
         ("CELESTE_HUNDRED", "--hundred"),
         ("CELESTE_NODIAG", "--nodiag"),
         ("CELESTE_ONLYDIAG", "--onlydiag"),
@@ -446,7 +404,6 @@ pub fn refuse_env() -> Result<()> {
         ("CELESTE_LEVEL_MINUS_ONE", "--level-minus-one H,S"),
         ("CELESTE_TRIM_ROWS", "--trim-rows"),
         ("CELESTE_THREADS", "--threads"),
-        ("CELESTE_MIN_FREE_GB", "--min-free-gb"),
         ("CELESTE_L1_TABLE", "--l1-table"),
         ("CELESTE_KERNEL_KEY_CHECK", "--key-check"),
         ("CELESTE_KERNEL_EXPLAIN", "--kernel-explain"),
@@ -455,9 +412,6 @@ pub fn refuse_env() -> Result<()> {
         ("CELESTE_BUILD_TRACE", "--build-trace"),
         ("CELESTE_PHASES", "--phases"),
         ("CELESTE_EMIT_CAPTURE", "--emit-capture"),
-        ("CELESTE_EMIT_CAPTURE_FRAME", "--emit-capture-frame"),
-        ("CELESTE_WALK_REGIONS", "--walk-regions"),
-        ("CELESTE_L1_PATH", "--l1-path"),
     ];
     let mut bad: Vec<String> = std::env::vars_os()
         .filter_map(|(k, _)| k.to_str().map(str::to_string))
@@ -489,7 +443,6 @@ pub fn startup(args: &SettingsArgs, adjust: impl FnOnce(&mut Settings)) -> Resul
     note("--win-at ", s.win_at.is_some(), s.win_at.map_or(String::new(), |(x0, x1, y0, y1)| format!("{x0}..{x1},{y0}..{y1}")));
     note("--split-frame", s.split_frame, String::new());
     note("--region ", s.region != d.region, s.region.map_or("off".to_string(), |(p, v)| format!("{p},{v}")));
-    note("--storage-region ", s.storage_region != d.storage_region, s.storage_region.to_string());
     note("--hundred", s.hundred, String::new());
     note("--nodiag", s.nodiag, String::new());
     note("--onlydiag", s.onlydiag, String::new());
@@ -500,7 +453,6 @@ pub fn startup(args: &SettingsArgs, adjust: impl FnOnce(&mut Settings)) -> Resul
     note("--level-minus-one ", s.level_minus_one.is_some(), s.level_minus_one.map_or(String::new(), |(h, v)| format!("{h},{v}")));
     note("--trim-rows", s.trim_rows, String::new());
     note("--threads ", s.threads.is_some(), format!("{}", s.threads.unwrap_or_default()));
-    note("--min-free-gb ", s.min_free_gb != d.min_free_gb, s.min_free_gb.to_string());
     note("--l1-table ", s.l1_table.is_some(), format!("{}", s.l1_table.as_deref().unwrap_or(Path::new("")).display()));
     note("--key-check", s.diag.key_check, String::new());
     note("--kernel-explain", s.diag.kernel_explain, String::new());
@@ -509,8 +461,6 @@ pub fn startup(args: &SettingsArgs, adjust: impl FnOnce(&mut Settings)) -> Resul
     note("--build-trace", s.diag.build_trace, String::new());
     note("--phases", s.diag.phases, String::new());
     note("--emit-capture ", s.diag.emit_capture.is_some(), format!("{:?}", s.diag.emit_capture));
-    note("--walk-regions ", s.diag.walk_regions.is_some(), format!("{:?}", s.diag.walk_regions));
-    note("--l1-path ", s.diag.l1_path.is_some(), format!("{:?}", s.diag.l1_path));
     if !set.is_empty() {
         eprintln!("[settings] {}", set.join(" "));
     }
@@ -541,7 +491,7 @@ mod tests {
         assert_eq!(parse(&[]).expect("defaults"), Settings::default());
         let s = parse(&["--room", "6,2", "--hundred", "--loading-jank", "2", "--level-minus-one", "94,5", "--win-at", "8..10,64"]).expect("flags");
         assert_eq!((s.room, s.hundred, s.loading_jank, s.level_minus_one, s.win_at), ((6, 2), true, Some(2), Some((94, 5)), Some((8, 10, 64, 64))));
-        for bad in [&["--room", "6"][..], &["--region", "16,9"], &["--storage-region", "12"], &["--nodiag", "--onlydiag"], &["--loading-jank", "0"], &["--win-at", "9..8,1"], &["--threads", "0"], &["--region", "12,6", "--storage-region", "8"]] {
+        for bad in [&["--room", "6"][..], &["--region", "16,9"], &["--nodiag", "--onlydiag"], &["--loading-jank", "0"], &["--win-at", "9..8,1"], &["--threads", "0"], &["--region", "12,6"]] {
             assert!(parse(bad).is_err(), "{bad:?}");
         }
         assert_eq!(parse(&["--region", "off"]).expect("off").region, None);

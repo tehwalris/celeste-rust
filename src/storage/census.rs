@@ -254,7 +254,7 @@ pub struct CensusArgs<'a> {
 
 pub fn census(a: &CensusArgs) -> Result<()> {
     let dir = a.dir;
-    let geo = *super::geometry();
+    let geo = super::GEOMETRY;
     let eg = EdgeStore::open(&dir.join("edges"), a.to)?;
     let threads = crate::frame::threads();
     // (shape index, key) -> g; per region its entries' g; (R, g) -> own entry.
