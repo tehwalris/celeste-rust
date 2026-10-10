@@ -414,10 +414,12 @@ pub struct Symbolic {
     beneath_memo: std::cell::RefCell<rustc_hash::FxHashMap<NodeId, bool>>,
     /// `may_answers`'s memo: `(may_true, may_false)`.
     may_memo: std::cell::RefCell<rustc_hash::FxHashMap<NodeId, (NodeId, NodeId)>>,
-    /// The frame's `Op::Restrict` nodes (`restrict`): its bounded inputs, the
-    /// only source of a static range (no cell is seeded with one). Their own
-    /// errors are charged to every outcome (`trace::error`). Per frame.
-    pub restricts: Vec<NodeId>,
+    /// The frame's INPUT ASSUMPTIONS, in the order made: `Op::Restrict`
+    /// (`restrict`: a bounded input, the only source of a static range - no
+    /// cell is seeded with one) and `Op::Pin` (`pin`: an input the body was
+    /// specialized on). Each is charged to every outcome (`trace::error`).
+    /// Per frame.
+    pub assumptions: Vec<NodeId>,
     /// `range_of`'s memo; a comparison the ranges decide folds.
     range_memo: std::collections::HashMap<NodeId, Option<Pieces>>,
     /// Comparisons decided from ranges this frame (a probe stat).
@@ -429,7 +431,7 @@ pub use crate::transpile::graph::Pieces;
 impl Symbolic {
     /// Forget the static ranges (a new frame, new cells).
     pub fn clear_ranges(&mut self) {
-        self.restricts.clear();
+        self.assumptions.clear();
         self.range_memo.clear();
         self.range_folds = 0;
     }
@@ -549,6 +551,8 @@ impl Symbolic {
                 Op::Add | Op::Sub | Op::Mul | Op::Div | Op::Rem | Op::Neg | Op::Abs | Op::Min | Op::Max | Op::Sin => any(memo, &args),
                 // The operand's, narrowed.
                 Op::Restrict(..) => any(memo, &args),
+                // No data output (its uses read the constant).
+                Op::Pin(_) => false,
                 Op::Lt | Op::Le | Op::Gt | Op::Ge | Op::Eq => any(memo, &args),
                 Op::Not | Op::And | Op::Or => any(memo, &args),
                 // The condition counts.
@@ -570,17 +574,29 @@ impl Symbolic {
     /// Does anything give this frame a static range (a restriction)?
     /// Without, no comparison is decided by one.
     fn has_ranges(&self) -> bool {
-        !self.restricts.is_empty()
+        self.assumptions.iter().any(|a| matches!(self.graph.get(*a).op, Op::Restrict(..)))
     }
 
-    /// `x` restricted to `[lo, hi]` (`Op::Restrict`), recorded so its own
-    /// error is charged to every outcome.
+    /// THE RANGE ASSUMPTION: `x` restricted to `[lo, hi]` (`Op::Restrict`),
+    /// recorded so its own error is charged to every outcome. Its value is
+    /// `x`'s, passed through with the range attached: read it in `x`'s place.
     pub fn restrict(&mut self, x: NodeId, lo: i32, hi: i32) -> NodeId {
         let r = self.graph.add(Op::Restrict(lo, hi), vec![x]);
-        if !self.restricts.contains(&r) {
-            self.restricts.push(r);
+        if !self.assumptions.contains(&r) {
+            self.assumptions.push(r);
         }
         r
+    }
+
+    /// THE POINT ASSUMPTION: the input `x` holds exactly `c` (`Op::Pin`),
+    /// recorded so its check is charged to every outcome. It has no data
+    /// output: the caller makes every use of the input read the constant
+    /// instead, so `x` feeds this check alone.
+    pub fn pin(&mut self, x: NodeId, c: crate::transpile::graph::Point) {
+        let p = self.graph.add(Op::Pin(c), vec![x]);
+        if !self.assumptions.contains(&p) {
+            self.assumptions.push(p);
+        }
     }
 
     /// The unknown number (`Op::UnknownNum`).

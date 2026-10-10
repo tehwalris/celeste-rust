@@ -37,13 +37,50 @@
 //! declines rather than drops. This is cheaper than an exact Kleene-lazy
 //! derivation, which would copy the guard and value DAG above every source.
 //!
+//! A PIN (`Pin(c)(x)`, the point assumption) has no data output: every use
+//! of its input reads the constant `c`, so nothing reaches the node and its
+//! check, `x == c` on the raw input, is the frame's own (`pins_hold`), ORed
+//! into every outcome's error by `verify::trace_frame`. Charged once there
+//! rather than per outcome as a restriction is: the same lanes decline, and
+//! the kernels are smaller (the per-outcome form cost up to +0.3% dynamic
+//! instructions, plans/widen-table.md).
+//!
 //! Not here: what no graph operator carries (an output widening's
-//! containment, the pins, an unfinished unrolled loop). The tracer states those and ORs them into the outcome's error
+//! containment, an unfinished unrolled loop). The tracer states those and ORs them into the outcome's error
 //! (`verify::trace_frame`).
 
 use crate::transpile::graph::{NodeId, Op};
 
 use super::domain::{Domain, Symbolic};
+
+/// Every PIN of the frame holds (`Symbolic::pin`, in the order made): the
+/// conjunction of `x == c` on the raw inputs; `true` without pins. Its
+/// negation is an error of the whole frame, never a guard: a disagreeing lane
+/// is real and must decline loudly.
+pub fn pins_hold(d: &mut Symbolic) -> NodeId {
+    use crate::transpile::graph::Point;
+    let pins: Vec<(NodeId, Point)> = d
+        .assumptions
+        .iter()
+        .filter_map(|a| match d.graph.get(*a).op {
+            Op::Pin(c) => Some((d.graph.get(*a).args[0], c)),
+            _ => None,
+        })
+        .collect();
+    let mut acc = d.graph.leaf(Op::ConstBool(true));
+    for (x, c) in pins {
+        let t = match c {
+            Point::Num(v) => {
+                let k = d.graph.leaf(Op::Const(v, v));
+                d.graph.fold(Op::Eq, vec![x, k])
+            }
+            Point::Bool(true) => x,
+            Point::Bool(false) => d.graph.fold(Op::Not, vec![x]),
+        };
+        acc = d.graph.fold(Op::And, vec![acc, t]);
+    }
+    acc
+}
 
 /// The error of the values `roots` (`for_outcomes`, one outcome).
 pub fn of(d: &mut Symbolic, roots: &[NodeId]) -> NodeId {
@@ -60,8 +97,9 @@ pub fn of(d: &mut Symbolic, roots: &[NodeId]) -> NodeId {
 /// would be outcomes x graph.
 pub fn for_outcomes(d: &mut Symbolic, outcomes: &[Vec<NodeId>]) -> Vec<NodeId> {
     let sites: Vec<NodeId> = d.evaluated.values().copied().collect();
-    // Every outcome reads every restriction (the module doc).
-    let assumed = d.restricts.clone();
+    // Every outcome reads every restriction (the module doc); the pins are
+    // charged once for the frame (`pins_hold`).
+    let assumed: Vec<NodeId> = d.assumptions.iter().copied().filter(|a| matches!(d.graph.get(*a).op, Op::Restrict(..))).collect();
     let all: Vec<NodeId> = outcomes.iter().flatten().copied().chain(sites).chain(assumed.iter().copied()).collect();
     let reach = crate::transpile::bdd::reachable(&d.graph, &all);
     // The sources and their own errors, in node order.

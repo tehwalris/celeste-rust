@@ -109,7 +109,7 @@ pub(crate) fn op_kind(op: &Op) -> &'static str {
         Op::Lt | Op::Le | Op::Gt | Op::Ge | Op::Eq => "cmp",
         Op::Not | Op::And | Op::Or | Op::Known | Op::SplitValid(_) | Op::FragOk(_) | Op::SplitOk(_) | Op::NoWrap => "bool",
         Op::Sel => "sel",
-        Op::Restrict(..) => "restrict",
+        Op::Restrict(..) | Op::Pin(_) => "restrict",
         Op::Mget | Op::TileFlagAt => "call",
         Op::Split(_) | Op::Add | Op::Sub | Op::Mul | Op::Div | Op::Rem | Op::Neg | Op::Abs | Op::Flr | Op::Sin | Op::Min | Op::Max | Op::Span | Op::Frag(_) | Op::SplitInt(_) | Op::IntFrag(_) | Op::Lo | Op::Hi => "num",
     }

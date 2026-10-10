@@ -186,9 +186,18 @@ pub fn trace_frame<'a>(
     it.d.fork_origins.clear();
     it.d.evaluated.clear();
     let iface = iface::symbolize(&mut it.d, &mut st, roots, pin, ival)?;
-    // THE KERNEL'S ADMISSIBLE INPUTS: the pins, a lane outside is an error
-    // of the whole frame.
-    let mut admissible = iface::pin_guard(&mut it.d, &iface);
+    // THE KERNEL'S ADMISSIBLE INPUTS: the pins (`symbolize` made their
+    // slots read the constants; the raw cells feed only these checks), a
+    // lane outside is an error of the whole frame.
+    for (i, c) in &iface.pins {
+        let cell = it.d.graph.leaf(crate::transpile::graph::Op::Cell(*i as u32));
+        let c = match *c {
+            iface::Conc::Num(v) => crate::transpile::graph::Point::Num(v.as_raw_u32() as i32),
+            iface::Conc::Bool(b) => crate::transpile::graph::Point::Bool(b),
+        };
+        it.d.pin(cell, c);
+    }
+    let mut admissible = super::error::pins_hold(&mut it.d);
     // The BOUNDED inputs (the region's square, speed and remainder; the
     // no-player phase's hulls): the body reads each through its restriction,
     // whose own error is the bound's check. Nothing seeds the raw cell, so
@@ -327,7 +336,26 @@ pub fn trace_frame<'a>(
         .iter()
         .map(|o| o.fields.iter().map(|(_, n, _)| *n).chain([o.guard, o.error]).collect())
         .collect();
-    for (o, e) in outs.iter_mut().zip(super::error::for_outcomes(&mut it.d, &roots)) {
+    let derived = super::error::for_outcomes(&mut it.d, &roots);
+    // A PIN DISCONNECTS its input: nothing the outcomes compute - values,
+    // guards, transfers, derived errors - may read a pinned raw cell; only
+    // the pin's own check does (`error::pins_hold`, in `global`).
+    {
+        let pinned: rustc_hash::FxHashSet<u32> = iface.pins.iter().map(|(i, _)| *i as u32).collect();
+        if !pinned.is_empty() {
+            let mut reads: Vec<NodeId> = derived.clone();
+            for o in &outs {
+                reads.extend(o.fields.iter().map(|(_, n, _)| *n).chain([o.guard]).chain(o.arc.iter().copied()));
+            }
+            let reach = crate::transpile::bdd::reachable(&it.d.graph, &reads);
+            for (n, r) in reach.iter().enumerate() {
+                if let (true, crate::transpile::graph::Op::Cell(c)) = (*r, &it.d.graph.get(n as NodeId).op) {
+                    anyhow::ensure!(!pinned.contains(c), "pinned input {} is read past its pin", iface::show(&iface.slots[*c as usize]));
+                }
+            }
+        }
+    }
+    for (o, e) in outs.iter_mut().zip(derived) {
         o.error = it.d.graph.fold(crate::transpile::graph::Op::Or, vec![o.error, e]);
     }
     if crate::settings::get().diag.build_trace {
@@ -1595,7 +1623,7 @@ mod tests {
     use super::find_player;
 
     /// A body compiled for one pm1 key must REFUSE a state in another: perturb
-    /// one pinned cell and `pin_guard`'s negation must decline the lane.
+    /// one pinned cell and its `Op::Pin` check (`error::pins_hold`) must decline the lane.
     #[test]
     fn a_body_pinned_to_a_pm1_key_refuses_any_other_key() {
         let src = cart::sources(crate::settings::get()).expect("sources");

@@ -11,7 +11,7 @@ use std::collections::BTreeSet;
 use anyhow::{anyhow, bail, Result};
 
 use crate::pico8_num::Pico8Num as P8;
-use crate::transpile::graph::{NodeId, Op};
+use crate::transpile::graph::Op;
 
 use super::domain::{Domain, Symbolic};
 use super::heap::Value;
@@ -150,7 +150,7 @@ fn collect<D: Domain>(
 /// held `init[i]` before it was replaced by a graph leaf.
 ///
 /// `pins`: `(cell index, value)` for inputs BAKED INTO the body. The cell is
-/// still an input, so `pin_guard` can check that the state agrees.
+/// still an input, read only by its `Op::Pin` check (`error::pins_hold`).
 pub struct Iface {
     pub slots: Vec<Path>,
     pub init: Vec<Conc>,
@@ -171,7 +171,7 @@ pub struct Iface {
 ///
 /// `pin` holds slots at the CALLER's value instead of reading a cell, so the
 /// trace folds through the constant. A pinned slot is still an input cell,
-/// read only by `pin_guard`, which turns the assumption into a check.
+/// read only by its `Op::Pin` (`trace_frame`), whose check is the assumption.
 pub fn symbolize(
     d: &mut Symbolic,
     st: &mut State<Symbolic>,
@@ -248,29 +248,6 @@ pub fn symbolize(
         .collect();
     d.forget_intervals();
     Ok(Iface { slots, init, pins, ival })
-}
-
-/// The obligation a pinned body carries: every pinned cell holds the
-/// value the body was compiled for.
-///
-/// Its negation is an ERROR of the frame, not a `guard`: a disagreeing lane
-/// is real and must be declined loudly; a guard would silently drop it.
-/// `ConstBool(true)` when nothing is pinned.
-pub fn pin_guard(d: &mut Symbolic, iface: &Iface) -> NodeId {
-    let mut acc = d.graph.leaf(Op::ConstBool(true));
-    for (i, c) in &iface.pins {
-        let cell = d.graph.leaf(Op::Cell(*i as u32));
-        let t = match c {
-            Conc::Num(v) => {
-                let k = d.num(*v);
-                d.graph.fold(Op::Eq, vec![cell, k])
-            }
-            Conc::Bool(true) => cell,
-            Conc::Bool(false) => d.graph.fold(Op::Not, vec![cell]),
-        };
-        acc = d.graph.fold(Op::And, vec![acc, t]);
-    }
-    acc
 }
 
 /// Read every scalar under `root` as a CONCRETE value (the oracle side of the

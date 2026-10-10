@@ -66,6 +66,13 @@ pub struct Room {
     pub cache: Arc<CollisionCache>,
 }
 
+/// A `Pin`'s value.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum Point {
+    Num(i32),
+    Bool(bool),
+}
+
 /// The op vocabulary: one variant per MEANING, not per emitted form.
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub enum Op {
@@ -105,6 +112,13 @@ pub enum Op {
     /// raw operand (`trace::error`), charged to every outcome of the frame,
     /// because a comparison the range decided no longer reads the node.
     Restrict(i32, i32),
+    /// `Pin(c)(x)`: the input `x` ASSUMED to hold exactly `c` (a number, raw
+    /// 16.16, or a boolean): the point twin of `Restrict`. The body was
+    /// specialized on `c`: every USE of the input reads the constant, never
+    /// this node, so the node exists for its own error, `x != c` on the raw
+    /// input, charged to every outcome of the frame (`trace::error::
+    /// assumptions_hold`). A shape's lattice constants enter a kernel this way.
+    Pin(Point),
     /// THE UNKNOWN NUMBER. Not the full-range interval (interval arithmetic
     /// at the extremes raises): it stays unknown under every operation and a
     /// comparison with it is an `UnknownBool`. It never reaches a kernel: it
@@ -656,6 +670,8 @@ impl Graph {
                 Op::UnknownBool(_) => Val::Bool(None),
                 // No interval holds it: unmodelled (TOP when lenient).
                 Op::UnknownNum => bail!("node {}: an unknown number has no interval", i),
+                // No data output: its uses read the constant.
+                Op::Pin(_) => bail!("node {}: a pin has no value (its uses read the constant)", i),
                 // The hull (`fold`'s two-constant rule agrees). Tolerant of `lo > hi`.
                 Op::Span => {
                     let (lo, hi) = (a!(0).as_num("Span")?.low, a!(1).as_num("Span")?.high);
