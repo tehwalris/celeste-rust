@@ -732,10 +732,21 @@ impl UnitView<'_> {
     /// Every edge, by target: `f(lid, cell, source (its index, `source`),
     /// global transfer)`.
     pub fn edges(&self, mut f: impl FnMut(u32, u32, u32, u32)) {
+        self.edges_ranked(|lid, c, s, _, x| f(lid, c, s, x));
+    }
+
+    /// Entries of the unit's transfer table (rank -> global id, 4 B each).
+    pub fn n_xfers(&self) -> usize {
+        self.u.n_xfers as usize
+    }
+
+    /// `edges`, with the transfer's RANK in the unit's table (the field the
+    /// block stores) before its global id: `f(lid, cell, source, rank, global)`.
+    pub fn edges_ranked(&self, mut f: impl FnMut(u32, u32, u32, u32, u32)) {
         let block = self.file.block(self.u);
         for lid in 0..self.u.n_lids {
             decode_lid(self.file.lid_edges(self.u, block, lid), |c, s, x| {
-                f(lid, c, s, self.file.u32_at(self.u.xfers, x as usize));
+                f(lid, c, s, x, self.file.u32_at(self.u.xfers, x as usize));
                 true
             });
         }

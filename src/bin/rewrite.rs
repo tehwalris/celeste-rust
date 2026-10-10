@@ -390,6 +390,26 @@ enum Command {
         #[arg(long)]
         horizon: u32,
     },
+    /// DIAGNOSTIC: how the recorded edges' transfers are distributed
+    /// (`storage::xfer_census`): distinct, top-k, entropy, the most common
+    /// decoded, the x/y factorisation, the entropy given simple context, and
+    /// storage v2's per-unit rank field. Either a storage-v2 level dir
+    /// (frames `--from..=--to`, default all done) or an `emit-capture`
+    /// branch capture (`--capture48 DIR`).
+    XferCensus {
+        #[arg(long)]
+        level_dir: Option<String>,
+        #[arg(long)]
+        capture48: Option<String>,
+        #[arg(long, default_value_t = 1)]
+        from: u32,
+        #[arg(long)]
+        to: Option<u32>,
+        /// Rank each unit's transfers by count here rather than read the
+        /// tree's ranks (what a capture gets; a check of it).
+        #[arg(long)]
+        simulate_ranks: bool,
+    },
     /// AUDIT: did any kernel ever take a lane outside its bounds? Every
     /// stored row of every frame (a kernel's inputs are stored rows): the
     /// player's `spd.x`/`spd.y` outside `[-S, S]` px (`CELESTE_REGION`'s S)
@@ -1525,6 +1545,22 @@ fn main() -> Result<()> {
                     println!("[spurious] wrote the chain (frames 1..={step}) to {path}");
                 }
             }
+        }
+        Command::XferCensus { level_dir, capture48, from, to, simulate_ranks } => {
+            use celeste_rust::storage::xfer_census;
+            let c = match (level_dir, capture48) {
+                (Some(d), None) => {
+                    let d = std::path::Path::new(&d);
+                    let to = match to {
+                        Some(t) => t,
+                        None => celeste_rust::storage::edges::done_frame(&d.join("edges")).context("no edges/done.txt: give --to")?,
+                    };
+                    xfer_census::census_tree(d, from, to, simulate_ranks)?
+                }
+                (None, Some(d)) => xfer_census::census_capture48(std::path::Path::new(&d))?,
+                _ => anyhow::bail!("xfer-census: give one of --level-dir and --capture48"),
+            };
+            c.print();
         }
         Command::EdgeCensus { level_dir, frame, horizon } => {
             let g = celeste_rust::storage::edges::EdgeStore::open(&std::path::Path::new(&level_dir).join("edges"), horizon)?;

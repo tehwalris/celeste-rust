@@ -13,6 +13,7 @@
 //!                 an id to its (shape, key, cell)
 //!   * `meta`    - per frame, the shapes and entries it created
 //!   * `bench`   - `CELESTE_EMIT_CAPTURE` and `rewrite bench-storage`
+//!   * `xfer_census` - `rewrite xfer-census`: the transfers' distribution
 //!
 //! A state is `(shape, key, cell)` (the key holds no position:
 //! `runtime2::pos_code`); its id is `(region, entry, cell in region)`.
@@ -24,6 +25,7 @@ pub mod meta;
 pub mod unit;
 pub mod visited;
 pub mod wave;
+pub mod xfer_census;
 
 use crate::search::pos_graph::{GRID, NO_CELL};
 
