@@ -111,7 +111,7 @@ impl std::fmt::Display for TooManyPaths {
 impl std::error::Error for TooManyPaths {}
 
 /// A near level's floors, concretized per path as the kernels read them
-/// (`widen::fork_near_floor_inputs`): a widened `state` (an interval) is each
+/// (`Hook::NearFloor`'s input, `widen::read_near_floors`): a widened `state` (an interval) is each
 /// whole number in it, by the cursor, and `collideable` is `state ~= 2` - the
 /// cart keeps the two in step, so a stored unknown `collideable` is not a
 /// separate choice.

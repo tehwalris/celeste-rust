@@ -107,44 +107,24 @@ pub struct BoundaryIds {
     pub f_x: u32,
     pub f_y: u32,
     pub f_dash_effect_time: u32,
-    /// Fruit-off widening ids (`widen::widen_fruit`).
+    /// The berry's sources (`frame::berry_lost`): the strawberry, the fly
+    /// fruit, the key, the chest the key opens (its `state`), and the fake
+    /// wall that drops one when broken.
     pub g_fruit: u32,
-    pub f_off: u32,
-    pub f_start: u32,
-    /// The key and its two `frames`-derived fields, pinned with the timers.
-    pub g_key: u32,
-    pub f_spr: u32,
-    pub f_flip: u32,
-    /// The player's held-button trails (`abstraction::HeldPrecision`).
-    pub f_p_jump: u32,
-    pub f_p_dash: u32,
-    /// The fly fruit at a fruit-unknown level (`abstraction::FruitPrecision`).
     pub g_fly_fruit: u32,
-    pub f_step: u32,
-    pub f_fly: u32,
-    /// Moving platforms at a platforms-unknown level (`PlatformsPrecision`).
-    pub g_platform: u32,
-    pub f_last: u32,
-    /// The fall floors at a floors-unknown level (`abstraction::FloorsPrecision`).
-    pub g_fall_floor: u32,
-    /// The orb room's big chest (`frame::orb_deadline_skip`).
-    pub g_big_chest: u32,
-    /// The berry's other sources (`frame::berry_lost`): the chest the key
-    /// opens, and the fake wall that drops one when broken.
+    pub g_key: u32,
     pub g_chest: u32,
     pub g_fake_wall: u32,
     pub f_state: u32,
-    pub f_delay: u32,
-    pub f_collideable: u32,
-    /// The balloon, whose `timer` a floors-unknown level widens.
+    /// The orb room's big chest (`frame::orb_deadline_skip`).
+    pub g_big_chest: u32,
+    /// The moving platforms (diagnostics: `bounds-audit`, a frame test).
+    pub g_platform: u32,
+    pub f_last: u32,
+    /// The balloon's phase and bob (`arc_dp::lookup_view`, a seeded state).
     pub g_balloon: u32,
-    pub f_timer: u32,
-    /// Its phase, stored canonical at every level (`widen::canon_balloon_offset`).
     pub f_offset: u32,
-    /// The spring, whose phase a floors-unknown level widens.
-    pub g_spring: u32,
-    pub f_hide_in: u32,
-    pub f_hide_for: u32,
+    pub f_start: u32,
 }
 
 pub struct Rt2 {

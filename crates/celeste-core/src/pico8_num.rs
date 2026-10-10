@@ -147,7 +147,7 @@ impl Pico8Num {
     /// input, the console's `sin` is constant over pairs of adjacent inputs
     /// and `sin(x + 0.5) == -sin(x)` exactly (but `sin(0.5 - x) == sin(x)`
     /// does NOT hold). Periodicity mod one turn is exact by construction,
-    /// which `widen::widen_fruit` depends on.
+    /// which the "strawberry bob" widening depends on.
     pub fn pico8_sin(self) -> Self {
         // Two's-complement masking IS floored mod 1.0: -0.25 -> 0.75.
         let frac = (self.0 & 0xffff) as u32;
@@ -521,7 +521,7 @@ mod tests {
         );
     }
 
-    /// Pins the invariance `widen::widen_fruit` relies on: for every
+    /// Pins the invariance the "strawberry bob" widening relies on: for every
     /// nonnegative integer `off`, `sin(off/40) == sin((off mod 40)/40)`
     /// bit-exactly, checked exhaustively rather than argued.
     #[test]

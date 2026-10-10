@@ -230,7 +230,7 @@ the restriction. Two INPUT LITERALS remain, and are owed, not assumed: a
 platform's `rem.x` and the fly fruit's `spd.y`/`rem.y` are READ as their
 whole literal range (no merge across them otherwise), which stands for the
 lane only where the lane's own value lies inside; the frame owes that per
-lane on the raw cell (`widen::platform_inputs`, `fork_fruit_inputs`; the
+lane on the raw cell (`widen::platform_inputs`, the table's `Input::Literal`; the
 cells are typed interval inputs for it). A stored row holds the literal
 itself, so it never fires on the search's own rows; it is what makes a row
 from elsewhere (a start state, a test) decline instead of being computed as
@@ -301,7 +301,7 @@ replaced the whole-range rule): an overflowing interval Add/Sub/Neg is a
 lane's OWN ERROR (`Op::NoWrap`), so the lane declines loudly; and a countdown
 that spans everything (floor `delay`, balloon `timer`, at `n` the spring's
 `delay`/`hide_in`/`hide_for`) is stored and read as the unknown number
-(`AV::UNum`, `widen::forget_countdown_inputs`), never as the interval [MIN,
+(`AV::UNum`, the table's `Input::Unknown`), never as the interval [MIN,
 MAX]. (`72fdea7` on branch `asm-interval-wrap` was a rejected first version.)
 Interval `Mul`/`Div` by a positive literal got the same own error on
 2026-10-10 (branch `mul-nowrap`): the operation is monotone, so the check is

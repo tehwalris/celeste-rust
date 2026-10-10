@@ -135,7 +135,7 @@ unfiltered counts at f50 (d = 31 against the real 46); that needed `p`.
   pass until the widening jumps to the 16.16 extreme; its `move` fork then
   spans 65,536 floors at arity 2 and `rem.y` leaves [-0.5, 0.5). Now a shape
   with a player and a fly fruit is traced with the `f` level's fruit
-  (`widen::fork_fruit_inputs`: `step`/`y` unknown, `spd.y`/`rem.y` their
+  (the widening table's "fly fruit": `step`/`y` unknown, `spd.y`/`rem.y` their
   literal ranges, `fly` unknown; the evaluator reads the unknown number as
   TOP). Sound because only the player is measured: a forgotten fruit is
   "maybe collected, maybe gone" everywhere, which only weakens d. The spawn

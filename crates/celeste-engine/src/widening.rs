@@ -544,6 +544,90 @@ pub fn absent_as_zero() -> impl Iterator<Item = (&'static str, &'static str)> {
     })
 }
 
+/// A raw 16.16 number for reading: an integer, else its decimal value.
+fn show_raw(r: i32) -> String {
+    if r % 0x1_0000 == 0 {
+        format!("{}", r >> 16)
+    } else {
+        let v = format!("{:.5}", r as f64 / 65536.0);
+        v.trim_end_matches('0').to_string()
+    }
+}
+
+impl std::fmt::Display for Stored {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let proof = |p: &Proof| match p {
+            Proof::PerLane => "per lane",
+            Proof::Static => "proved statically, else per lane",
+            Proof::Literals => "proved on literal arms, else per lane",
+        };
+        match self {
+            Stored::Range { lo, hi, proof: p } => write!(f, "[{}, {}]; owed: inside ({})", show_raw(*lo), show_raw(*hi), proof(p)),
+            Stored::Band { around, radius, proof: p } => write!(f, "`{around}` +- {}; owed: inside ({})", show_raw(*radius), proof(p)),
+            Stored::Phase { lo, hi } => write!(f, "one period [{}, {}]", show_raw(*lo), show_raw(*hi)),
+            Stored::AtLeast(k) => write!(f, "max(v, {})", show_raw(*k)),
+            Stored::UnknownNum => write!(f, "the unknown number"),
+            Stored::UnknownBool => write!(f, "the unknown boolean"),
+            Stored::Num(k) => write!(f, "{} (dead)", show_raw(*k)),
+            Stored::Bool(b) => write!(f, "{b} (dead)"),
+            Stored::FullPeriod(p) => write!(f, "a full period as [0, {}]; owed: the width", show_raw(*p)),
+            Stored::SameAs(x) => write!(f, "`{x}`'s; owed: equal to `{x}`"),
+            Stored::AbsentAsZero => write!(f, "0 where absent"),
+        }
+    }
+}
+
+impl std::fmt::Display for Input {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Input::Stored => "as stored",
+            Input::BothWays => "both ways, every lane",
+            Input::Atom => "an undecided atom",
+            Input::Unknown => "the unknown number",
+            Input::Literal => "the literal; owed: inside",
+            Input::Hook => "by the hook",
+        })
+    }
+}
+
+/// THE TABLE as plans/abstractions.md lists it (a test keeps the two equal).
+pub fn render_markdown() -> String {
+    let mut out = String::new();
+    out += "| entry | level | objects | slot | stored | read as | kind |\n|---|---|---|---|---|---|---|\n";
+    for e in TABLE {
+        let flag = match e.flag {
+            Flag::Always => "every",
+            Flag::Held => "`h`",
+            Flag::Fruit => "`f`",
+            Flag::Near => "`n`",
+            Flag::Platforms => "`p`",
+        };
+        let target = match e.target {
+            Target::Objects(t) => format!("`{t}`"),
+            Target::Globals => "globals".to_string(),
+        };
+        let kind = match (e.kind, e.hook) {
+            (Kind::Exact, _) => "exact".to_string(),
+            (Kind::Over, None) => "over".to_string(),
+            (Kind::Over, Some(h)) => format!("over, hook `{h:?}`"),
+        };
+        for (k, s) in e.slots.iter().enumerate() {
+            let (name, flag, target, kind) = if k == 0 { (e.name, flag, target.as_str(), kind.as_str()) } else { ("", "", "", "") };
+            let opt = if s.optional { " (may be absent)" } else { "" };
+            out += &format!("| {name} | {flag} | {target} | `{}`{opt} | {} | {} | {kind} |\n", s.field.join("."), s.stored, s.input);
+        }
+    }
+    out += "\n";
+    for e in TABLE {
+        let kind = match e.kind {
+            Kind::Exact => "EXACT",
+            Kind::Over => "over-approximation",
+        };
+        out += &format!("- **{}** ({kind}). {}\n", e.name, e.why.split_whitespace().collect::<Vec<_>>().join(" "));
+    }
+    out
+}
+
 // ------------------------------------------------------------ on blocks
 
 /// An entry's names resolved to the engine's ids (`celeste_names`).
@@ -860,6 +944,24 @@ mod tests {
         // A bucket straddling the window's edge is no overlap.
         let (a, b) = (P8::from_i16(fx - 7), P8::from_i16(fx - 6));
         assert!(!player_overlaps_floor(window, (a, b), (P8::from_i16(fy), P8::from_i16(fy))));
+    }
+
+    /// plans/abstractions.md lists exactly the table (`render_markdown`,
+    /// between its markers). `CELESTE_REGENERATE=1` rewrites the doc's copy.
+    #[test]
+    fn the_abstractions_doc_lists_the_table() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../plans/abstractions.md");
+        let doc = std::fs::read_to_string(path).expect("plans/abstractions.md");
+        let (begin, end) = ("<!-- THE WIDENING TABLE", "<!-- END OF THE WIDENING TABLE -->");
+        let a = doc.find(begin).expect("the table's begin marker");
+        let a = a + doc[a..].find('\n').expect("the marker's line") + 1;
+        let b = doc.find(end).expect("the table's end marker");
+        let want = render_markdown();
+        if std::env::var_os("CELESTE_REGENERATE").is_some() {
+            std::fs::write(path, format!("{}{want}{}", &doc[..a], &doc[b..])).expect("rewrite plans/abstractions.md");
+            return;
+        }
+        assert!(doc[a..b] == want, "plans/abstractions.md does not list the widening table; regenerate with CELESTE_REGENERATE=1 (this test), then review:\n{want}");
     }
 
     /// Every name in the table resolves, and a `SameAs` names an earlier
