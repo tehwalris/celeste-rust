@@ -90,6 +90,12 @@ pub struct MarkRanks {
 }
 
 impl MarkRanks {
+    /// Region `region`'s members, for ranks by (entry, cell) without a
+    /// map lookup each.
+    pub fn region(&self, region: u32) -> Option<RegionRanks<'_>> {
+        self.by_region.get(&region).map(|(masks, before)| RegionRanks { words: self.words, masks, before })
+    }
+
     /// `id`'s rank among the members (`None`: not one).
     #[inline]
     pub fn rank(&self, id: StateId) -> Option<u32> {
@@ -98,6 +104,25 @@ impl MarkRanks {
         let b = id_local(id) % 64;
         let word = *masks.get(w)?;
         (word >> b & 1 == 1).then(|| before[w] + (word & ((1u64 << b) - 1)).count_ones())
+    }
+}
+
+/// One region's ranks (`MarkRanks::region`).
+#[derive(Clone, Copy)]
+pub struct RegionRanks<'a> {
+    words: usize,
+    masks: &'a [u64],
+    before: &'a [u32],
+}
+
+impl RegionRanks<'_> {
+    /// The rank of the region's state `(entry, local)` (`None`: not a member).
+    #[inline]
+    pub fn rank(&self, entry: u32, local: u32) -> Option<u32> {
+        let w = entry as usize * self.words + (local / 64) as usize;
+        let b = local % 64;
+        let word = *self.masks.get(w)?;
+        (word >> b & 1 == 1).then(|| self.before[w] + (word & ((1u64 << b) - 1)).count_ones())
     }
 }
 

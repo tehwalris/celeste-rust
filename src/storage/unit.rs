@@ -274,19 +274,26 @@ impl RowBuf {
     }
 }
 
-/// A unit's name for one target entry, and its owner once known: found in
-/// the visited set when the lid was made, or given by the translation.
+/// A unit's name for one target entry. Its OWNER (`UnitOut::owners`) is
+/// found in the visited set when the lid is made, or given by the
+/// translation.
 #[derive(Clone, Copy, Debug)]
 pub struct Lid {
     pub shape: u64,
     pub slot: u32,
     pub key: Key,
-    pub region: u32,
-    pub entry: u32,
 }
 
 /// No owner (yet).
 pub const NONE: u32 = u32::MAX;
+
+/// A lid's owner `(region, entry)` packed in a u64 (`NO_OWNER`: none).
+#[inline]
+pub fn pack_owner(region: u32, entry: u32) -> u64 {
+    (region as u64) << 32 | entry as u64
+}
+
+pub const NO_OWNER: u64 = u64::MAX;
 
 /// A cell of a lid the unit asked the translation to add: its row is row
 /// `row` of the unit's buffer `buf`.
@@ -305,6 +312,10 @@ pub struct UnitOut {
     /// source by its index here).
     pub sources: Vec<StateId>,
     pub lids: Vec<Lid>,
+    /// Per lid its owner (`pack_owner`, `NO_OWNER`): set once, by the
+    /// translation's worker of the lid's region where the visited set had
+    /// none.
+    pub owners: Vec<std::sync::atomic::AtomicU64>,
     pub requests: Vec<Request>,
     pub bufs: Vec<RowBuf>,
     /// The encoded edges (`edges::encode_block`), its index, its edge count.
@@ -367,11 +378,16 @@ pub struct UnitSink<'a> {
     /// Lanes of the block being run that must not be expanded.
     pub skip_in: Option<&'a [bool]>,
     lids: Vec<Lid>,
+    /// Per lid its owner where the visited set has it (`pack_owner`).
+    lid_owners: Vec<u64>,
     /// Per lid, `2 * words`: the owner's mask at the wave's start, then the
     /// cells this unit requested.
     lid_masks: Vec<u64>,
     lid_index: Vec<u32>,
     edges: Vec<u64>,
+    /// The end's counting sort: per lid its edges' start, and the sorted edges.
+    sort_at: Vec<u32>,
+    sorted: Vec<u64>,
     requests: Vec<Request>,
     bufs: Vec<RowBuf>,
     /// Per (lid, cell) the coarser level's verdict (`MarkFilter`), once a unit.
@@ -427,9 +443,12 @@ impl<'a> UnitSink<'a> {
             sources_old: false,
             skip_in: None,
             lids: Vec::new(),
+            lid_owners: Vec::new(),
             lid_masks: Vec::new(),
             lid_index: Vec::new(),
             edges: Vec::new(),
+            sort_at: Vec::new(),
+            sorted: Vec::new(),
             requests: Vec::new(),
             bufs: Vec::new(),
             verdicts: Default::default(),
@@ -470,6 +489,7 @@ impl<'a> UnitSink<'a> {
         self.skip_in = skip;
         self.sources_old = sources_old;
         self.lids.clear();
+        self.lid_owners.clear();
         self.lid_masks.clear();
         let cap = (sources.len() * 16).next_power_of_two().max(1024);
         if self.lid_index.len() != cap {
@@ -569,7 +589,8 @@ impl<'a> UnitSink<'a> {
         let l = self.lids.len() as u32;
         assert!(l < 1 << LID_BITS, "a unit with {l} distinct target entries, past the {LID_BITS} bits an edge holds");
         let (region, entry) = self.visited.find(shape, slot, key).unwrap_or((NONE, NONE));
-        self.lids.push(Lid { shape, slot, key, region, entry });
+        self.lids.push(Lid { shape, slot, key });
+        self.lid_owners.push(if entry == NONE { NO_OWNER } else { pack_owner(region, entry) });
         match entry {
             NONE => self.lid_masks.extend(std::iter::repeat_n(0, 2 * words)),
             e => {
@@ -673,8 +694,8 @@ impl<'a> UnitSink<'a> {
         if self.lid_masks[base + w] & b != 0 {
             // An old state; a raise refuses one from a later layer.
             if let Some(r) = &self.raise {
-                let l = &self.lids[lid as usize];
-                let layer = r.layers.layer(super::state_id(l.region, l.entry, local));
+                let o = self.lid_owners[lid as usize];
+                let layer = r.layers.layer(super::state_id((o >> 32) as u32, o as u32, local));
                 anyhow::ensure!(
                     layer <= self.frame,
                     "frame {}: a state the tree first reached at frame {layer} is reached at frame {}: the raised tree would move it to an earlier layer (the level -1 table is not consistent along this edge), so it cannot be extended exactly - delete the tree",
@@ -739,20 +760,47 @@ impl<'a> UnitSink<'a> {
             crate::compiled::asm_kernel::key_check(b);
         }
         self.check.iter_mut().for_each(RowBuf::clear);
-        self.edges.sort_unstable();
-        self.edges.dedup();
-        let (block, index) = super::edges::encode_block(&self.edges);
+        // By target: a counting sort on the lid (dense in the unit), then
+        // each lid's few edges sorted (cell, source, transfer); duplicates go.
+        let n = self.lids.len();
+        self.sort_at.clear();
+        self.sort_at.resize(n + 1, 0);
+        for &e in &self.edges {
+            self.sort_at[unpack_edge(e).0 as usize + 1] += 1;
+        }
+        for l in 0..n {
+            self.sort_at[l + 1] += self.sort_at[l];
+        }
+        self.sorted.clear();
+        self.sorted.resize(self.edges.len(), 0);
+        {
+            let mut cur = self.sort_at.clone();
+            for &e in &self.edges {
+                let l = unpack_edge(e).0 as usize;
+                self.sorted[cur[l] as usize] = e;
+                cur[l] += 1;
+            }
+        }
+        for l in 0..n {
+            let g = &mut self.sorted[self.sort_at[l] as usize..self.sort_at[l + 1] as usize];
+            if g.len() > 1 {
+                g.sort_unstable();
+            }
+        }
+        self.sorted.dedup();
+        let (block, index) = super::edges::encode_block(&self.sorted);
         self.n_requests += self.requests.len() as u64;
         self.n_lids += self.lids.len() as u64;
         self.outs.push(UnitOut {
             worker: self.worker,
             sources: std::mem::take(&mut self.sources),
             lids: std::mem::take(&mut self.lids),
+            owners: self.lid_owners.drain(..).map(std::sync::atomic::AtomicU64::new).collect(),
             requests: std::mem::take(&mut self.requests),
             bufs: std::mem::take(&mut self.bufs),
             block,
             index,
-            edges: self.edges.len() as u64,
+            edges: self.sorted.len() as u64,
         });
         let t1 = crate::frame::phases::add(crate::frame::phases::END_UNIT, t);
         self.end_ticks += t1.saturating_sub(t);

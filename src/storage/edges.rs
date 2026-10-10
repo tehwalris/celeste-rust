@@ -228,60 +228,121 @@ pub fn file_path(dir: &Path, frame: u32, raised: Option<u32>) -> PathBuf {
     }
 }
 
+/// One unit's sections of an edge file, built apart (in parallel).
+struct UnitBytes {
+    sources: Vec<u8>,
+    index: Vec<u8>,
+    lids: Vec<u8>,
+    owners: Vec<u8>,
+    n_owners: u32,
+    regions: Vec<u32>,
+}
+
+fn le32(v: &mut Vec<u8>, x: u32) {
+    v.extend_from_slice(&x.to_le_bytes());
+}
+
+/// Unit `u`'s sections: its sources, index, lid owners by lid and sorted by
+/// owner, the regions it names.
+fn unit_bytes(u: &UnitOut, frame: u32) -> Result<UnitBytes> {
+    let mut sources = Vec::with_capacity(8 * u.sources.len());
+    for s in &u.sources {
+        sources.extend_from_slice(&s.to_le_bytes());
+    }
+    let mut index = Vec::with_capacity(8 * u.index.len());
+    for &(t, o) in &u.index {
+        le32(&mut index, t);
+        le32(&mut index, o);
+    }
+    let mut lids = Vec::with_capacity(8 * u.lids.len());
+    let mut owned: Vec<(u32, u32, u32)> = Vec::new();
+    for (l, o) in u.owners.iter().enumerate() {
+        let (r, e) = match o.load(std::sync::atomic::Ordering::Relaxed) {
+            super::unit::NO_OWNER => (super::unit::NONE, super::unit::NONE),
+            o => {
+                owned.push(((o >> 32) as u32, o as u32, l as u32));
+                ((o >> 32) as u32, o as u32)
+            }
+        };
+        le32(&mut lids, r);
+        le32(&mut lids, e);
+    }
+    owned.sort_unstable();
+    ensure!(owned.windows(2).all(|w| (w[0].0, w[0].1) != (w[1].0, w[1].1)), "frame {frame}: a unit names one entry by two lids");
+    let mut owners = Vec::with_capacity(12 * owned.len());
+    let mut regions: Vec<u32> = Vec::new();
+    for &(r, e, l) in &owned {
+        le32(&mut owners, r);
+        le32(&mut owners, e);
+        le32(&mut owners, l);
+        if regions.last() != Some(&r) {
+            regions.push(r);
+        }
+    }
+    Ok(UnitBytes { sources, index, lids, owners, n_owners: owned.len() as u32, regions })
+}
+
 /// Write frame `frame`'s edge file from its units (owners resolved) and
-/// the workers' transfer remaps. Atomic. Returns its bytes.
+/// the workers' transfer remaps: the sections built per unit and written at
+/// their offsets, in parallel. Atomic (renamed into place). Returns its bytes.
 pub fn write_file(path: &Path, frame: u32, outs: &[UnitOut], remaps: Vec<Vec<u32>>) -> Result<u64> {
-    use std::io::Write;
-    let mut data: Vec<u8> = Vec::new();
+    use std::os::unix::fs::FileExt;
+    let threads = crate::frame::threads();
+    let bytes: Vec<UnitBytes> = super::wave::par_map(outs, threads, |u| unit_bytes(u, frame)).into_iter().collect::<Result<_>>()?;
+    // The data region's layout: per unit its sections, in unit order.
     let mut units = Vec::with_capacity(outs.len());
     let mut region_units: Vec<(u32, u32)> = Vec::new();
-    let put = |data: &mut Vec<u8>, bytes: &[u8]| -> u64 {
-        let at = data.len() as u64;
-        data.extend_from_slice(bytes);
-        at
+    let mut at = 0u64;
+    let mut place = |n: usize| -> u64 {
+        let o = at;
+        at += n as u64;
+        o
     };
-    for (ui, u) in outs.iter().enumerate() {
-        let sources = put(&mut data, &u.sources.iter().flat_map(|s| s.to_le_bytes()).collect::<Vec<u8>>());
-        let block = put(&mut data, &u.block);
-        let index = put(&mut data, &u.index.iter().flat_map(|&(t, o)| [t.to_le_bytes(), o.to_le_bytes()].concat()).collect::<Vec<u8>>());
-        let lids = put(&mut data, &u.lids.iter().flat_map(|l| [l.region.to_le_bytes(), l.entry.to_le_bytes()].concat()).collect::<Vec<u8>>());
-        let mut owned: Vec<(u32, u32, u32)> = u.lids.iter().enumerate().filter(|(_, l)| l.entry != super::unit::NONE).map(|(i, l)| (l.region, l.entry, i as u32)).collect();
-        owned.sort_unstable();
-        ensure!(owned.windows(2).all(|w| (w[0].0, w[0].1) != (w[1].0, w[1].1)), "frame {frame}: a unit names one entry by two lids");
-        let owners = put(&mut data, &owned.iter().flat_map(|&(r, e, l)| [r.to_le_bytes(), e.to_le_bytes(), l.to_le_bytes()].concat()).collect::<Vec<u8>>());
-        let mut regions: Vec<u32> = owned.iter().map(|o| o.0).collect();
-        regions.dedup();
-        region_units.extend(regions.into_iter().map(|r| (r, ui as u32)));
+    for (ui, (u, b)) in outs.iter().zip(&bytes).enumerate() {
         units.push(UnitHead {
             worker: u.worker,
-            sources,
+            sources: place(b.sources.len()),
             n_sources: u.sources.len() as u32,
-            block,
+            block: place(u.block.len()),
             block_len: u.block.len() as u64,
             edges: u.edges,
-            index,
+            index: place(b.index.len()),
             n_index: u.index.len() as u32,
-            lids,
+            lids: place(b.lids.len()),
             n_lids: u.lids.len() as u32,
-            owners,
-            n_owners: owned.len() as u32,
+            owners: place(b.owners.len()),
+            n_owners: b.n_owners,
         });
+        region_units.extend(b.regions.iter().map(|&r| (r, ui as u32)));
     }
     region_units.sort_unstable();
     let head = bincode::serialize(&FileHead { frame, units, region_units, remaps }).context("serializing an edge file header")?;
+    let base = 16 + head.len() as u64;
     std::fs::create_dir_all(path.parent().expect("an edges dir"))?;
     let tmp = path.with_extension("tmp");
-    {
-        let mut w = std::io::BufWriter::with_capacity(1 << 20, std::fs::File::create(&tmp)?);
-        w.write_all(MAGIC)?;
-        w.write_all(&VERSION.to_le_bytes())?;
-        w.write_all(&(head.len() as u64).to_le_bytes())?;
-        w.write_all(&head)?;
-        w.write_all(&data)?;
-        w.flush()?;
-    }
+    let file = std::fs::File::create(&tmp)?;
+    let mut prefix = Vec::with_capacity(16 + head.len());
+    prefix.extend_from_slice(MAGIC);
+    prefix.extend_from_slice(&VERSION.to_le_bytes());
+    prefix.extend_from_slice(&(head.len() as u64).to_le_bytes());
+    prefix.extend_from_slice(&head);
+    file.write_all_at(&prefix, 0)?;
+    let head: FileHead = bincode::deserialize(&head).context("the header just written")?;
+    let order: Vec<usize> = (0..outs.len()).collect();
+    super::wave::par_map(&order, threads, |&k| -> Result<()> {
+        let (h, b, u) = (&head.units[k], &bytes[k], &outs[k]);
+        file.write_all_at(&b.sources, base + h.sources)?;
+        file.write_all_at(&u.block, base + h.block)?;
+        file.write_all_at(&b.index, base + h.index)?;
+        file.write_all_at(&b.lids, base + h.lids)?;
+        file.write_all_at(&b.owners, base + h.owners)?;
+        Ok(())
+    })
+    .into_iter()
+    .collect::<Result<()>>()?;
+    drop(file);
     std::fs::rename(&tmp, path)?;
-    Ok((16 + head.len() + data.len()) as u64)
+    Ok(base + at)
 }
 
 /// One edge file, mapped.
@@ -473,11 +534,71 @@ impl EdgeStore {
         }
     }
 
+    /// Every unit of frames `1..=horizon`: `(frame, file, unit)`, for
+    /// `unit` (a pass over the graph unit by unit, in parallel).
+    pub fn units(&self) -> Vec<(u32, u32, u32)> {
+        let mut v = Vec::new();
+        for (f, files) in self.frames.iter().enumerate() {
+            for (fi, file) in files.iter().enumerate() {
+                v.extend((0..file.head.units.len() as u32).map(|u| (f as u32, fi as u32, u)));
+            }
+        }
+        v
+    }
+
+    /// One unit (`units`), read in place.
+    pub fn unit(&self, (frame, file, unit): (u32, u32, u32)) -> UnitView<'_> {
+        let file = &self.frames[frame as usize][file as usize];
+        let u = &file.head.units[unit as usize];
+        UnitView { file, u, remap: &file.head.remaps[u.worker as usize] }
+    }
+
     /// `scan` as a list.
     pub fn edges_at(&self, frame: u32) -> Vec<Edge> {
         let mut v = Vec::new();
         self.scan(frame, |e| v.push(e));
         v
+    }
+}
+
+/// One recorded unit: its sources, its lids' owners, its edges.
+pub struct UnitView<'a> {
+    file: &'a EdgeFile,
+    u: &'a UnitHead,
+    remap: &'a [u32],
+}
+
+impl UnitView<'_> {
+    pub fn n_sources(&self) -> usize {
+        self.u.n_sources as usize
+    }
+
+    /// Source `s` (by its lane from the unit's first).
+    pub fn source(&self, s: u32) -> StateId {
+        self.file.source(self.u, s)
+    }
+
+    pub fn n_lids(&self) -> usize {
+        self.u.n_lids as usize
+    }
+
+    /// Lid `l`'s owner `(region, entry)` (`None`: a lid no edge names).
+    pub fn lid_owner(&self, l: u32) -> Option<(u32, u32)> {
+        let e = self.file.u32_at(self.u.lids, 2 * l as usize + 1);
+        (e != super::unit::NONE).then(|| (self.file.u32_at(self.u.lids, 2 * l as usize), e))
+    }
+
+    pub fn n_edges(&self) -> u64 {
+        self.u.edges
+    }
+
+    /// Every edge, by target: `f(lid, cell, source, global transfer)`.
+    pub fn edges(&self, mut f: impl FnMut(u32, u32, u32, u32)) {
+        let (b, index) = self.file.block(self.u);
+        decode_block(b, &index, 0, |t, s, x| {
+            f(t >> 8, t & 0xff, s, self.remap[x as usize]);
+            true
+        });
     }
 }
 
@@ -522,7 +643,8 @@ mod tests {
         UnitOut {
             worker,
             sources,
-            lids: lids.into_iter().map(|(region, entry)| Lid { shape: 0, slot: 0, key: (0, 0), region, entry }).collect(),
+            lids: lids.iter().map(|_| Lid { shape: 0, slot: 0, key: (0, 0) }).collect(),
+            owners: lids.iter().map(|&(r, e)| std::sync::atomic::AtomicU64::new(super::super::unit::pack_owner(r, e))).collect(),
             requests: Vec::new(),
             bufs: Vec::new(),
             block,

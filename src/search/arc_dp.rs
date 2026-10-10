@@ -244,11 +244,11 @@ fn tree_frames(dir: &std::path::Path, horizon: u32) -> anyhow::Result<Vec<Vec<(u
 /// carry its transfer.
 ///
 /// MEMORY: the nodes are the BFS's marks, numbered by their rank in its own
-/// bitmaps (`edges::MarkRanks`, no hash map), and the edges are read TWICE -
-/// a pass counting each node's in- and out-degree, then a pass filling the
-/// two adjacencies in place - so no edge list is ever held beside the graph:
-/// 12 B an edge, the graph's own (room (2,3) gemskip h137, 373M edges: 28 B
-/// an edge and a 12.1 GB peak before).
+/// masks (`storage::marks::MarkRanks`), and the edges are read TWICE, unit
+/// by unit as recorded - a pass counting each node's in- and out-degree,
+/// then a pass filling the two adjacencies in place - so no edge list is
+/// ever held beside the graph: 12 B an edge, the graph's own (room (2,3)
+/// gemskip h137, 373M edges: 28 B an edge and a 12.1 GB peak before).
 pub fn load(dir: &std::path::Path, horizon: u32) -> anyhow::Result<Loaded> {
     use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
     let t0 = std::time::Instant::now();
@@ -292,37 +292,45 @@ pub fn load(dir: &std::path::Path, horizon: u32) -> anyhow::Result<Loaded> {
     crate::metrics::mem_phase("arc: bfs, node numbers");
     // The transfers: the tree's global table.
     let xfers: Vec<(Transfer, Transfer)> = eg.pairs().iter().map(|p| (p.0.transfer(), p.1.transfer())).collect();
-    // Node `dst`'s in-edges from nodes, frames layer..=horizon: `f(src, xfer)`
-    // in the files' order.
-    let in_edges = |dst: u32, buf: &mut Vec<crate::storage::edges::InEdge>, f: &mut dyn FnMut(u32, u32)| -> anyhow::Result<()> {
-        let target = marks[dst as usize].0;
-        for frame in layers[dst as usize].max(1)..=horizon {
-            buf.clear();
-            eg.preds_at(target, frame, buf);
-            for e in buf.iter() {
-                anyhow::ensure!((e.xfer as usize) < xfers.len(), "{}: an edge at f{frame} into {} has transfer {} past the table", dir.display(), crate::storage::show_id(target), e.xfer);
-                if let Some(src) = ranks.rank(e.src) {
-                    f(src, e.xfer);
-                }
-            }
+    // The edges between nodes, read UNIT BY UNIT (source-side, as recorded:
+    // no probe per node and frame): `f(src, dst, xfer)` per edge whose source
+    // and target are both nodes. A unit with no node among its sources is
+    // skipped whole; a lid's region ranks are looked up once a unit.
+    let units = eg.units();
+    let each_edge = |k: usize, f: &mut dyn FnMut(u32, u32, u32)| -> anyhow::Result<()> {
+        let u = eg.unit(units[k]);
+        let src: Vec<Option<u32>> = (0..u.n_sources() as u32).map(|s| ranks.rank(u.source(s))).collect();
+        if src.iter().all(Option::is_none) {
+            return Ok(());
         }
+        let owners: Vec<Option<(crate::storage::marks::RegionRanks, u32)>> =
+            (0..u.n_lids() as u32).map(|l| u.lid_owner(l).and_then(|(r, e)| ranks.region(r).map(|rr| (rr, e)))).collect();
+        let mut bad = None;
+        u.edges(|lid, local, s, x| {
+            let (Some(s), Some((rr, e))) = (src[s as usize], owners[lid as usize]) else { return };
+            if (x as usize) >= xfers.len() {
+                bad = Some(x);
+                return;
+            }
+            if let Some(d) = rr.rank(e, local) {
+                f(s, d, x);
+            }
+        });
+        anyhow::ensure!(bad.is_none(), "{}: an edge with transfer {bad:?} past the table", dir.display());
         Ok(())
     };
     // Pass 1: the degrees.
     let t1 = std::time::Instant::now();
     let out_deg: Vec<AtomicU64> = (0..n).map(|_| AtomicU64::new(0)).collect();
-    let in_deg: Vec<Vec<u64>> = par_chunks(n, |lo, hi| {
-        let mut buf = Vec::new();
-        (lo..hi)
-            .map(|dst| {
-                let mut k = 0u64;
-                in_edges(dst as u32, &mut buf, &mut |src, _| {
-                    out_deg[src as usize].fetch_add(1, Relaxed);
-                    k += 1;
-                })?;
-                Ok(k)
-            })
-            .collect()
+    let in_deg: Vec<AtomicU64> = (0..n).map(|_| AtomicU64::new(0)).collect();
+    par_chunks(units.len(), |lo, hi| {
+        for k in lo..hi {
+            each_edge(k, &mut |s, d, _| {
+                out_deg[s as usize].fetch_add(1, Relaxed);
+                in_deg[d as usize].fetch_add(1, Relaxed);
+            })?;
+        }
+        Ok(())
     })?;
     let prefix = |deg: &mut dyn Iterator<Item = u64>| -> Vec<u64> {
         let mut at = Vec::with_capacity(n + 1);
@@ -334,50 +342,49 @@ pub fn load(dir: &std::path::Path, horizon: u32) -> anyhow::Result<Loaded> {
         }
         at
     };
-    let pred_at = prefix(&mut in_deg.into_iter().flatten());
+    let pred_at = prefix(&mut in_deg.into_iter().map(|d| d.into_inner()));
     let out_at = prefix(&mut out_deg.into_iter().map(|d| d.into_inner()));
     let edges = pred_at[n] as usize;
     anyhow::ensure!(out_at[n] as usize == edges, "the edge count pass disagrees with itself");
-    // Pass 2: the adjacencies, filled in place. `preds` by target, each
-    // target's chunk owned by one worker; `out` by source through a cursor per
-    // source, then each source's edges sorted (deterministic whatever the
-    // scheduling).
+    // Pass 2: the adjacencies, filled in place through a cursor per node,
+    // then each node's edges sorted (deterministic whatever the scheduling).
     let mut preds: Vec<u32> = vec![0; edges];
     let mut out: Vec<Out> = vec![Out { dst: 0, xfer: 0 }; edges];
     {
-        let cursor: Vec<AtomicU64> = out_at[..n].iter().map(|&a| AtomicU64::new(a)).collect();
+        let out_cursor: Vec<AtomicU64> = out_at[..n].iter().map(|&a| AtomicU64::new(a)).collect();
+        let pred_cursor: Vec<AtomicU64> = pred_at[..n].iter().map(|&a| AtomicU64::new(a)).collect();
         let (preds_ptr, out_ptr) = (preds.as_mut_ptr() as usize, out.as_mut_ptr() as usize);
-        par_chunks(n, |lo, hi| {
-            let mut buf = Vec::new();
-            for dst in lo..hi {
-                let mut at = pred_at[dst];
-                in_edges(dst as u32, &mut buf, &mut |src, xfer| {
-                    let slot = cursor[src as usize].fetch_add(1, Relaxed);
-                    assert!(at < pred_at[dst + 1] && slot < out_at[src as usize + 1], "the edge fill pass disagrees with the count");
-                    // SAFETY: `at` is in `dst`'s range, which only this
-                    // worker writes; `slot` was claimed once from `src`'s
-                    // range by the atomic cursor. Both are below `edges`.
+        par_chunks(units.len(), |lo, hi| {
+            for k in lo..hi {
+                each_edge(k, &mut |s, d, xfer| {
+                    let slot = out_cursor[s as usize].fetch_add(1, Relaxed);
+                    let at = pred_cursor[d as usize].fetch_add(1, Relaxed);
+                    assert!(at < pred_at[d as usize + 1] && slot < out_at[s as usize + 1], "the edge fill pass disagrees with the count");
+                    // SAFETY: `slot` and `at` were each claimed once, by
+                    // their atomic cursors, from their node's range; both
+                    // are below `edges`.
                     unsafe {
-                        (preds_ptr as *mut u32).add(at as usize).write(src);
-                        (out_ptr as *mut Out).add(slot as usize).write(Out { dst: dst as u32, xfer });
+                        (preds_ptr as *mut u32).add(at as usize).write(s);
+                        (out_ptr as *mut Out).add(slot as usize).write(Out { dst: d, xfer });
                     }
-                    at += 1;
                 })?;
-                anyhow::ensure!(at == pred_at[dst + 1], "the edge fill pass disagrees with the count");
             }
             Ok(())
         })?;
-        anyhow::ensure!(cursor.iter().zip(&out_at[1..]).all(|(c, &e)| c.load(Relaxed) == e), "the edge fill pass disagrees with the count");
+        anyhow::ensure!(out_cursor.iter().zip(&out_at[1..]).all(|(c, &e)| c.load(Relaxed) == e), "the edge fill pass disagrees with the count");
+        anyhow::ensure!(pred_cursor.iter().zip(&pred_at[1..]).all(|(c, &e)| c.load(Relaxed) == e), "the edge fill pass disagrees with the count");
     }
     {
-        let (out_ref, out_at_ref) = (out.as_mut_ptr() as usize, &out_at);
+        let (out_ref, preds_ref, out_at_ref, pred_at_ref) = (out.as_mut_ptr() as usize, preds.as_mut_ptr() as usize, &out_at, &pred_at);
         par_chunks(n, |lo, hi| {
-            // SAFETY: the sources `lo..hi` own the disjoint range
-            // `out_at[lo]..out_at[hi]`.
-            let s = unsafe { std::slice::from_raw_parts_mut((out_ref as *mut Out).add(out_at_ref[lo] as usize), (out_at_ref[hi] - out_at_ref[lo]) as usize) };
-            let base = out_at_ref[lo];
-            for src in lo..hi {
-                s[(out_at_ref[src] - base) as usize..(out_at_ref[src + 1] - base) as usize].sort_unstable_by_key(|o| (o.dst, o.xfer));
+            // SAFETY: the nodes `lo..hi` own the disjoint ranges
+            // `out_at[lo]..out_at[hi]` and `pred_at[lo]..pred_at[hi]`.
+            let o = unsafe { std::slice::from_raw_parts_mut((out_ref as *mut Out).add(out_at_ref[lo] as usize), (out_at_ref[hi] - out_at_ref[lo]) as usize) };
+            let p = unsafe { std::slice::from_raw_parts_mut((preds_ref as *mut u32).add(pred_at_ref[lo] as usize), (pred_at_ref[hi] - pred_at_ref[lo]) as usize) };
+            let (ob, pb) = (out_at_ref[lo], pred_at_ref[lo]);
+            for i in lo..hi {
+                o[(out_at_ref[i] - ob) as usize..(out_at_ref[i + 1] - ob) as usize].sort_unstable_by_key(|o| (o.dst, o.xfer));
+                p[(pred_at_ref[i] - pb) as usize..(pred_at_ref[i + 1] - pb) as usize].sort_unstable();
             }
             Ok(())
         })?;

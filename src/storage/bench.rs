@@ -311,7 +311,8 @@ pub fn bench_storage(a: &BenchArgs) -> Result<()> {
                 };
                 let (mut n, mut acc) = (0u64, 0u64);
                 store.scan(frame, |e| {
-                    let pair = store.pair(e.xfer).expect("a transfer of the table");
+                    // The merged table in memory (the scratch dir's holds the new pairs only).
+                    let pair = xfers.pairs[e.xfer as usize];
                     let mut b = Vec::new();
                     crate::search::arc_edges::encode_pair(&mut b, &pair);
                     let p = b.iter().fold(0u64, |h, &x| celeste_engine::runtime2::mix64(h ^ x as u64));

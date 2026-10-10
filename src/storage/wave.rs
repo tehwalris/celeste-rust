@@ -397,17 +397,19 @@ pub(crate) fn translate(visited: &mut VisitedSet, outs: &mut [UnitOut], frame: u
     let jobs = std::sync::Mutex::new(jobs.into_iter().rev().collect::<Vec<_>>());
     let check = crate::compiled::asm_kernel::key_check_on();
     let words = geo.words;
-    type Part = (Vec<NewState>, Vec<(u32, u32, u32, u32)>, Vec<(u32, u32, Key)>);
+    /// Per region job: the region, its new states (by id), its new entries.
+    type Part = Vec<(u32, Vec<NewState>, Vec<(u32, u32, Key)>)>;
     let outs_ref: &[UnitOut] = outs;
     let parts: Vec<Part> = std::thread::scope(|scope| {
         let hs: Vec<_> = (0..threads)
             .map(|_| {
                 let (jobs, unit_reqs) = (&jobs, &unit_reqs);
                 scope.spawn(move || -> Result<Part> {
-                    let (mut news, mut owners, mut entries) = (Vec::new(), Vec::new(), Vec::new());
+                    let mut done: Part = Vec::new();
                     let mut items: Vec<(Key, u32, u32, u32)> = Vec::new();
                     loop {
                         let Some((region, table)) = jobs.lock().expect("translation jobs").pop() else { break };
+                        let (mut news, mut entries) = (Vec::new(), Vec::new());
                         items.clear();
                         for (ui, x) in unit_reqs.iter().enumerate() {
                             let lo = x.partition_point(|&y| ((y >> 32) as u32) < region);
@@ -442,7 +444,10 @@ pub(crate) fn translate(visited: &mut VisitedSet, outs: &mut [UnitOut], frame: u
                                 news.push((state_id(region, e, local), u0, r0.buf, r0.row));
                                 for &(_, _, ui, k) in &items[c..d] {
                                     let r = &outs_ref[ui as usize].requests[k as usize];
-                                    owners.push((ui, r.lid, region, e));
+                                    // A lid is of one region: only this job sets it.
+                                    let o = &outs_ref[ui as usize].owners[r.lid as usize];
+                                    let was = o.swap(super::unit::pack_owner(region, e), Ordering::Relaxed);
+                                    ensure!(was == super::unit::NO_OWNER || was == super::unit::pack_owner(region, e), "frame {frame}: a lid with two owners");
                                     if check {
                                         let (x, y) = (&outs_ref[u0 as usize].bufs[r0.buf as usize], &outs_ref[ui as usize].bufs[r.buf as usize]);
                                         ensure!(x.same_row(r0.row, y, r.row), "frame {frame}: two rows of state {} differ: a key collision", super::show_id(state_id(region, e, local)));
@@ -452,25 +457,24 @@ pub(crate) fn translate(visited: &mut VisitedSet, outs: &mut [UnitOut], frame: u
                             }
                             a = b;
                         }
+                        news.sort_unstable();
+                        done.push((region, news, entries));
                     }
-                    Ok((news, owners, entries))
+                    Ok(done)
                 })
             })
             .collect();
         hs.into_iter().map(|h| h.join().expect("translation worker panicked")).collect::<Result<Vec<_>>>()
     })?;
-    let mut news: Vec<NewState> = Vec::new();
-    for (n, owners, entries) in parts {
+    // The regions in index order: the new states by id, the entries by
+    // (region, entry).
+    let mut parts: Vec<(u32, Vec<NewState>, Vec<(u32, u32, Key)>)> = parts.into_iter().flatten().collect();
+    parts.sort_unstable_by_key(|p| p.0);
+    let mut news: Vec<NewState> = Vec::with_capacity(parts.iter().map(|p| p.1.len()).sum());
+    for (_, n, entries) in parts {
         news.extend(n);
-        for (ui, lid, region, e) in owners {
-            let l = &mut outs[ui as usize].lids[lid as usize];
-            ensure!(l.entry == super::unit::NONE || (l.region, l.entry) == (region, e), "frame {frame}: a lid with two owners");
-            (l.region, l.entry) = (region, e);
-        }
         meta.entries.extend(entries);
     }
-    news.sort_unstable();
-    meta.entries.sort_unstable();
     Ok((news, meta))
 }
 
