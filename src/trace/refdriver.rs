@@ -40,12 +40,16 @@ pub fn fresh_interp<'a>(cart: Arc<CartData>, cache: Arc<CollisionCache>) -> Inte
 ///
 /// `unknown` names the input's unknown-boolean fields (`refbridge::from_block`):
 /// each is a cursor choice made before the frame runs, as the kernels fork them.
+///
+/// More than `cap` paths is an error, `TooManyPaths` (every path's output is
+/// held: the cap bounds the memory).
 pub fn run_frame_all<'a>(
     it: &mut Interp<'a, RefDomain>,
     body: &'a ast::Ast,
     input: &State<RefDomain>,
     unknown: &[(crate::trace::heap::TableId, String)],
     level: crate::abstraction::Level,
+    cap: usize,
 ) -> Result<Vec<State<RefDomain>>> {
     it.d.cursor = Cursor::new();
     let mut outputs = Vec::new();
@@ -84,8 +88,8 @@ pub fn run_frame_all<'a>(
             n => bail!("a frame path ended in {n} states (expected one, or none after a raise)"),
         }
         paths += 1;
-        if paths > 1_000_000 {
-            bail!("run_frame_all: >1M paths - fork tree did not terminate");
+        if paths > cap {
+            return Err(TooManyPaths(cap).into());
         }
         if !it.d.cursor.advance() {
             break;
@@ -93,6 +97,18 @@ pub fn run_frame_all<'a>(
     }
     Ok(outputs)
 }
+
+/// `run_frame_all` stopped at its path cap.
+#[derive(Debug)]
+pub struct TooManyPaths(pub usize);
+
+impl std::fmt::Display for TooManyPaths {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(f, "run_frame_all: more than {} fork paths in one frame", self.0)
+    }
+}
+
+impl std::error::Error for TooManyPaths {}
 
 /// A near level's floors, concretized per path as the kernels read them
 /// (`widen::fork_near_floor_inputs`): a widened `state` (an interval) is each

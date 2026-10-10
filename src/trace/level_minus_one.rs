@@ -1056,8 +1056,17 @@ const CACHE_FORMAT: u32 = 1;
 /// The cache file under `CELESTE_L1_CACHE` (`off` disables) and its key: the
 /// binary, the cart, `spd_px` and every `CELESTE_*` variable not known to be
 /// irrelevant, so an unknown knob costs a rebuild, never a wrong table.
+///
+/// `CELESTE_L1_TABLE=FILE` instead: THAT file, read if it exists, else built
+/// and written there, whatever the binary - a table PINNED by its file. Only
+/// a fixture sets it (tools/fixtures.sh: the table its tree was built
+/// under, recorded by fingerprint in the tree, which `bench-frame` checks),
+/// never a search.
 fn cache_file(root: &FsPath, spd_px: i32) -> Result<Option<(PathBuf, String)>> {
     use std::hash::{Hash, Hasher};
+    if let Some(f) = std::env::var_os("CELESTE_L1_TABLE") {
+        return Ok(Some((PathBuf::from(f), format!("level -1 table pinned by CELESTE_L1_TABLE, format {CACHE_FORMAT}, S = {spd_px}\n"))));
+    }
     let dir = match std::env::var("CELESTE_L1_CACHE") {
         Ok(s) if s == "off" => return Ok(None),
         Ok(s) => PathBuf::from(s),
@@ -1074,7 +1083,19 @@ fn cache_file(root: &FsPath, spd_px: i32) -> Result<Option<(PathBuf, String)>> {
         }
     }
     cart.sort();
-    const IRRELEVANT: [&str; 5] = ["CELESTE_THREADS", "CELESTE_LEVEL_MINUS_ONE", "CELESTE_L1_CACHE", "CELESTE_PHASES", "CELESTE_UNIT_LANES"];
+    // Knobs the table cannot depend on: scheduling, the filter's horizon,
+    // and the forward's diagnostics (they observe, they change nothing).
+    const IRRELEVANT: [&str; 9] = [
+        "CELESTE_THREADS",
+        "CELESTE_LEVEL_MINUS_ONE",
+        "CELESTE_L1_CACHE",
+        "CELESTE_PHASES",
+        "CELESTE_UNIT_LANES",
+        "CELESTE_KERNEL_METRICS",
+        "CELESTE_KERNEL_KEY_CHECK",
+        "CELESTE_EMIT_CAPTURE",
+        "CELESTE_EMIT_CAPTURE_FRAME",
+    ];
     let mut env: Vec<(String, String)> = std::env::vars().filter(|(k, _)| k.starts_with("CELESTE_") && !IRRELEVANT.contains(&k.as_str())).collect();
     env.sort();
     let room = crate::game_runner::start_room();

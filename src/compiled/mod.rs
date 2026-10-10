@@ -12,7 +12,7 @@ use celeste_names as gen;
 
 pub(crate) mod asm_kernel;
 pub mod dispatch;
-pub(crate) mod mix;
+pub mod mix;
 
 pub(crate) fn boundary_ids() -> runtime2::BoundaryIds {
     let g = |name: &str| gen::global_id(name).unwrap_or_else(|| panic!("no global {}", name));

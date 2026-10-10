@@ -926,6 +926,26 @@ impl ForwardState {
             last = done;
         }
         crate::storage::edges::discard_after(&edges_dir, last)?;
+        let st = Self::at(dir, last, record)?;
+        eprintln!(
+            "[resume] {}: f{last} ({} lanes), visited {} states in {} entries, first win {:?}, level -1 {:?}, {:.1} s",
+            dir.display(),
+            st.frontier.iter().map(Block::lanes).sum::<usize>(),
+            st.visited.len(),
+            st.visited.entries(),
+            st.win_frame,
+            st.filter,
+            t.elapsed().as_secs_f64()
+        );
+        Ok(Some(st))
+    }
+
+    /// The forward as it stood after frame `last` of the tree in `dir`,
+    /// READ-ONLY: frames after `last` are ignored, not discarded (`resume`
+    /// discards them first). What `extend` runs its next wave from, so
+    /// `bench_wave` from here is frame `last + 1` of the real forward.
+    pub fn at(dir: &std::path::Path, last: u32, record: bool) -> Result<Self> {
+        let edges_dir = dir.join("edges");
         let filter = TreeFilter::read(dir)?;
         let (visited, win_frame) = restore_visited(dir, last)?;
         let xfers = crate::storage::edges::XferTable::load(&edges_dir)?;
@@ -957,17 +977,7 @@ impl ForwardState {
         } else {
             None
         };
-        eprintln!(
-            "[resume] {}: f{last} ({} lanes), visited {} states in {} entries, first win {:?}, level -1 {:?}, {:.1} s",
-            dir.display(),
-            frontier.iter().map(Block::lanes).sum::<usize>(),
-            visited.len(),
-            visited.entries(),
-            win_frame,
-            filter,
-            t.elapsed().as_secs_f64()
-        );
-        Ok(Some(ForwardState { frontier, visited, xfers, observer, frames: last, win_frame, filter }))
+        Ok(ForwardState { frontier, visited, xfers, observer, frames: last, win_frame, filter })
     }
 
     /// The visited set's size: every distinct state reached so far.
@@ -978,6 +988,63 @@ impl ForwardState {
     /// The visited set (`bench-frame`, `bench-storage`).
     pub fn visited(&self) -> &crate::storage::visited::VisitedSet {
         &self.visited
+    }
+
+    /// The input frontier's rows (`bench-frame`).
+    pub fn frontier_lanes(&self) -> usize {
+        self.frontier.iter().map(Block::lanes).sum()
+    }
+
+    /// ONE WAVE of `extend` - frame `frames + 1`, under the tree's level -1
+    /// filter, its pos graph fed when recording - without the checkpoint:
+    /// the state is left as it was (the frontier, the visited set and the
+    /// transfer table are copied), the edges go to `edges_dir` (a scratch
+    /// dir; `None`: not recorded). Returns the wave with the visited set and
+    /// transfer table it ran against, which hold its new states and pairs
+    /// (`bench-frame`, run per rep).
+    pub fn bench_wave(
+        &self,
+        engine: &dyn FrameStep,
+        dir: &std::path::Path,
+        edges_dir: Option<&std::path::Path>,
+    ) -> Result<(crate::storage::wave::Wave, crate::storage::visited::VisitedSet, crate::storage::edges::XferTable)> {
+        let minus_one = match self.filter {
+            Some(f) => f.minus_one(dir)?,
+            None => anyhow::bail!("{}: no level -1 record (a tree from before records)", dir.display()),
+        };
+        // The frame the tree would make: under the table it was built with.
+        if let (Some(TreeFilter::MinusOne { table, .. }), Some(m)) = (self.filter, minus_one) {
+            anyhow::ensure!(
+                m.table().fingerprint() == table,
+                "{}: the level -1 table is not the one the tree was built under (fingerprint {:016x}, the tree's {table:016x}; a fixture pins its table: CELESTE_L1_TABLE)",
+                dir.display(),
+                m.table().fingerprint()
+            );
+        }
+        let frontier: Vec<Block> = self
+            .frontier
+            .iter()
+            .map(|b| {
+                let mut c = Block::layer_piece(b.rt2().clone_block(), b.ids().to_vec(), b.seq());
+                if !b.skip().is_empty() {
+                    c.set_skip(b.skip().to_vec());
+                }
+                c
+            })
+            .collect();
+        let (mut visited, mut xfers) = (self.visited.clone(), self.xfers.clone());
+        let cx = crate::storage::wave::WaveCtx {
+            visited: &mut visited,
+            xfers: &mut xfers,
+            pos: self.observer.as_ref(),
+            filters: Filters { marks: None, minus_one },
+            frame: self.frames + 1,
+            edges_dir,
+            layer: Layer::New,
+            layers: None,
+        };
+        let wave = crate::storage::wave::run_wave(engine, frontier, cx)?;
+        Ok((wave, visited, xfers))
     }
 
     /// Compute and checkpoint frames `frames+1 ..= to` under the tree's

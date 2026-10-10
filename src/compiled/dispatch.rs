@@ -51,18 +51,44 @@ pub fn missed_lanes() -> u64 {
     KERNEL_HITS[1].load(std::sync::atomic::Ordering::Relaxed)
 }
 
-pub fn print_kernel_hits() {
+/// The kernels' counters since the last take: lanes run and missed, and
+/// the calls' shape (`asm_kernel::take_call_stats`).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct KernelStats {
+    pub traced: u64,
+    pub missed: u64,
+    pub calls: u64,
+    pub rows: u64,
+    pub slice_lanes: u64,
+    /// (body, slice) evaluations, and those that took a lane.
+    pub bodies: u64,
+    pub bodies_taken: u64,
+    /// Lane emissions, and those left after the call's dedup cache.
+    pub lane_emits: u64,
+    pub unique: u64,
+}
+
+/// Take (and reset) the kernels' counters; the mix diagnostic's slice
+/// counts are written first (`CELESTE_KERNEL_MIX`).
+pub fn take_kernel_stats() -> KernelStats {
     fold_hits();
     super::mix::write_calls();
-    let v: Vec<u64> = KERNEL_HITS
-        .iter()
-        .map(|a| a.swap(0, std::sync::atomic::Ordering::Relaxed))
-        .collect();
-    if v.iter().any(|x| *x > 0) {
-        eprintln!("kernel lanes: traced {} missed {}", v[0], v[1]);
+    let [traced, missed] = std::array::from_fn(|i| KERNEL_HITS[i].swap(0, std::sync::atomic::Ordering::Relaxed));
+    let [calls, rows, slice_lanes, bodies, bodies_taken, lane_emits, unique] = super::asm_kernel::take_call_stats();
+    KernelStats { traced, missed, calls, rows, slice_lanes, bodies, bodies_taken, lane_emits, unique }
+}
+
+pub fn print_kernel_hits() {
+    print_stats(&take_kernel_stats());
+}
+
+/// The `kernel lanes:` (`missed 0` is what every log must say), `kernel
+/// calls:` and `kernel utilization:` lines.
+pub fn print_stats(s: &KernelStats) {
+    if s.traced > 0 || s.missed > 0 {
+        eprintln!("kernel lanes: traced {} missed {}", s.traced, s.missed);
     }
-    let [calls, rows, slice_lanes, bodies, bodies_taken, lane_emits, unique] =
-        super::asm_kernel::take_call_stats();
+    let KernelStats { calls, rows, slice_lanes, bodies, bodies_taken, lane_emits, unique, .. } = *s;
     if calls > 0 {
         eprintln!(
             "kernel calls: {} calls, {} rows ({:.1} rows/call), {} slice-lanes executed \

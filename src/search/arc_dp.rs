@@ -426,7 +426,7 @@ pub fn load(dir: &std::path::Path, horizon: u32) -> anyhow::Result<Loaded> {
 /// One frame's winning sets: the nodes (sorted) and their sets (indices
 /// into the backward's arena), with the last frame of each set's span so far
 /// (the backward runs down in `t`).
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct Frame {
     nodes: Vec<u32>,
     sets: Vec<u32>,
@@ -435,6 +435,7 @@ struct Frame {
 
 /// Node `node`'s winning set (`Winning::sets[set]`) over the frames
 /// `lo..=hi`, where it does not change.
+#[derive(Clone)]
 struct Span {
     node: u32,
     lo: u16,
@@ -492,49 +493,115 @@ fn pull<'a>(g: &Graph, i: u32, next: impl Fn(u32) -> Option<&'a Region>, pieces:
 
 /// BACKWARD: `W_t` for `t = horizon` down to 0. A win node's set is the whole
 /// torus from its layer on; any other's is the union of its out-edges'
-/// preimages of `W_{t+1}`, while it is live.
-///
-/// INCREMENTAL: `W_t(i) = W_{t+1}(i)` when `i` is live at both and none of
-/// its successors' sets changed, so a frame recomputes (a parallel PULL per
-/// node) only the predecessors of changed nodes and the nodes that become
-/// live at `t`; the rest share the next frame's set. Prints the sets'
-/// fragmentation every 4th frame.
+/// preimages of `W_{t+1}`, while it is live (`Backward::step`, a frame at a
+/// time). Prints the step totals and the sets' fragmentation every 4th frame.
 pub fn backward(g: &Graph, horizon: u32) -> Winning {
-    let n = g.len();
-    assert!(horizon < u16::MAX as u32, "a horizon past u16");
-    let threads = crate::frame::threads();
-    // The ARENA of sets, equal sets once (found by hash; a collision with a
-    // different set is stored apart). Index 0: the whole torus.
-    let mut sets: Vec<Region> = vec![Region::full()];
-    let mut interned: FxHashMap<u64, u32> = FxHashMap::default();
-    let hash_of = |r: &Region| {
-        use std::hash::{Hash, Hasher};
-        let mut hs = rustc_hash::FxHasher::default();
-        r.hash(&mut hs);
-        hs.finish()
-    };
-    interned.insert(hash_of(&sets[0]), 0);
-    let mut spans: Vec<Span> = Vec::new();
-    let mut next = Frame::default();
-    for i in 0..n as u32 {
-        if g.win[i as usize] && g.layer[i as usize] <= horizon {
-            next.nodes.push(i);
-            next.sets.push(0);
-            next.his.push(horizon as u16);
+    let mut b = Backward::new(g, horizon);
+    for t in (0..horizon).rev() {
+        b.step(t);
+    }
+    b.finish()
+}
+
+/// The backward between two frames: `W_{t+1}` (the frame done last) with
+/// the spans closed so far. `rewrite bench-backward` times one `step` from
+/// a clone.
+#[derive(Clone)]
+pub struct Backward<'g> {
+    g: &'g Graph,
+    horizon: u32,
+    threads: usize,
+    /// The ARENA of sets, equal sets once (found by hash; a collision with a
+    /// different set is stored apart). Index 0: the whole torus.
+    sets: Vec<Region>,
+    interned: FxHashMap<u64, u32>,
+    spans: Vec<Span>,
+    /// The frame done last: its nodes with a set.
+    next: Frame,
+    /// The nodes whose set changed at the frame done last.
+    changed: Vec<u32>,
+    /// `pos[i]`: i's position in `next`'s lists (u32::MAX: no set).
+    pos: Vec<u32>,
+    /// `stamp[i] == t`: i is already a candidate at t.
+    stamp: Vec<u32>,
+    n_cand: u64,
+    n_same: u64,
+    n_scan: u64,
+    d_cand: std::time::Duration,
+    d_pull: std::time::Duration,
+    d_merge: std::time::Duration,
+    fragments: Vec<String>,
+}
+
+fn region_hash(r: &Region) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hs = rustc_hash::FxHasher::default();
+    r.hash(&mut hs);
+    hs.finish()
+}
+
+impl<'g> Backward<'g> {
+    /// `W_horizon`: the win nodes present by the horizon.
+    pub fn new(g: &'g Graph, horizon: u32) -> Self {
+        let n = g.len();
+        assert!(horizon < u16::MAX as u32, "a horizon past u16");
+        let sets: Vec<Region> = vec![Region::full()];
+        let mut interned: FxHashMap<u64, u32> = FxHashMap::default();
+        interned.insert(region_hash(&sets[0]), 0);
+        let mut next = Frame::default();
+        for i in 0..n as u32 {
+            if g.win[i as usize] && g.layer[i as usize] <= horizon {
+                next.nodes.push(i);
+                next.sets.push(0);
+                next.his.push(horizon as u16);
+            }
+        }
+        let changed: Vec<u32> = next.nodes.clone();
+        let mut pos = vec![u32::MAX; n];
+        for (k, &i) in next.nodes.iter().enumerate() {
+            pos[i as usize] = k as u32;
+        }
+        Backward {
+            g,
+            horizon,
+            threads: crate::frame::threads(),
+            sets,
+            interned,
+            spans: Vec::new(),
+            next,
+            changed,
+            pos,
+            stamp: vec![u32::MAX; n],
+            n_cand: 0,
+            n_same: 0,
+            n_scan: 0,
+            d_cand: std::time::Duration::ZERO,
+            d_pull: std::time::Duration::ZERO,
+            d_merge: std::time::Duration::ZERO,
+            fragments: Vec::new(),
         }
     }
-    let mut changed: Vec<u32> = next.nodes.clone();
-    // `pos[i]`: i's position in the next frame's lists (u32::MAX: no set).
-    let mut pos = vec![u32::MAX; n];
-    for (k, &i) in next.nodes.iter().enumerate() {
-        pos[i as usize] = k as u32;
+
+    /// The frame done last's nodes with a set, and each one's set.
+    pub fn current(&self) -> impl Iterator<Item = (u32, &Region)> + '_ {
+        self.next.nodes.iter().zip(&self.next.sets).map(|(&i, &s)| (i, &self.sets[s as usize]))
     }
-    // `stamp[i] == t`: i is already a candidate at t.
-    let mut stamp = vec![u32::MAX; n];
-    let (mut n_cand, mut n_same, mut n_scan) = (0u64, 0u64, 0u64);
-    let (mut d_cand, mut d_pull, mut d_merge) = (std::time::Duration::ZERO, std::time::Duration::ZERO, std::time::Duration::ZERO);
-    let mut fragments: Vec<String> = Vec::new();
-    for t in (0..horizon).rev() {
+
+    /// The candidates, pull and merge walls so far.
+    pub fn walls(&self) -> [std::time::Duration; 3] {
+        [self.d_cand, self.d_pull, self.d_merge]
+    }
+
+    /// `W_t` from `W_{t + 1}` (the frame done last; `t` counts down from
+    /// `horizon - 1`). INCREMENTAL: `W_t(i) = W_{t+1}(i)` when `i` is live at
+    /// both and none of its successors' sets changed, so a frame recomputes
+    /// (a parallel PULL per node) only the predecessors of changed nodes and
+    /// the nodes that become live at `t`; the rest share the next frame's set.
+    pub fn step(&mut self, t: u32) {
+        let g = self.g;
+        let horizon = self.horizon;
+        let threads = self.threads;
+        let Backward { sets, interned, spans, next, changed, pos, stamp, .. } = self;
         let t0 = std::time::Instant::now();
         let mut cand: Vec<u32> = Vec::new();
         let mut take = |p: u32, cand: &mut Vec<u32>| {
@@ -543,7 +610,7 @@ pub fn backward(g: &Graph, horizon: u32) -> Winning {
                 cand.push(p);
             }
         };
-        for &c in &changed {
+        for &c in changed.iter() {
             for &p in g.preds_of(c) {
                 take(p, &mut cand);
             }
@@ -554,20 +621,23 @@ pub fn backward(g: &Graph, horizon: u32) -> Winning {
             }
         }
         cand.sort_unstable();
-        n_cand += cand.len() as u64;
-        d_cand += t0.elapsed();
+        self.n_cand += cand.len() as u64;
+        self.d_cand += t0.elapsed();
         let t0 = std::time::Instant::now();
         // Recompute the candidates, each against its set at t + 1.
         const CHUNK: usize = 256;
         let at = std::sync::atomic::AtomicUsize::new(0);
-        let (pos_ref, next_ref, sets_ref, interned_ref) = (&pos, &next, &sets, &interned);
+        let (pos_ref, next_ref, sets_ref, interned_ref) = (&*pos, &*next, &*sets, &*interned);
         let lookup = |d: u32| {
             let k = pos_ref[d as usize];
             (k != u32::MAX).then(|| &sets_ref[next_ref.sets[k as usize] as usize])
         };
         type Part = (usize, Vec<u32>, Vec<(Region, u64)>, u64);
+        // No more workers than chunks: a small frame (most frames of a
+        // small graph) spawns one, not `threads`.
+        let workers = threads.min(cand.len().div_ceil(CHUNK)).max(1);
         let mut parts: Vec<Part> = std::thread::scope(|sc| {
-            let hs: Vec<_> = (0..threads)
+            let hs: Vec<_> = (0..workers)
                 .map(|_| {
                     sc.spawn(|| {
                         let (mut out, mut pieces, mut scratch) = (Vec::new(), Vec::new(), Vec::new());
@@ -589,7 +659,7 @@ pub fn backward(g: &Graph, horizon: u32) -> Winning {
                                         SAME
                                     } else {
                                         // Looked up (and a duplicate freed) here, in parallel.
-                                        let h = hash_of(&r);
+                                        let h = region_hash(&r);
                                         match interned_ref.get(&h) {
                                             Some(&s) if sets_ref[s as usize] == r => s,
                                             _ => {
@@ -612,9 +682,9 @@ pub fn backward(g: &Graph, horizon: u32) -> Winning {
         for (_, c, nw, sc) in parts {
             codes.extend(c);
             news.extend(nw);
-            n_scan += sc;
+            self.n_scan += sc;
         }
-        d_pull += t0.elapsed();
+        self.d_pull += t0.elapsed();
         let t0 = std::time::Instant::now();
         // Merge: the next frame's persisting sets, overridden by the
         // candidates. A set that ends at t + 1 closes its span.
@@ -636,7 +706,7 @@ pub fn backward(g: &Graph, horizon: u32) -> Winning {
                 let set = match codes.next().expect("one result per candidate") {
                     EMPTY => None,
                     SAME => {
-                        n_same += 1;
+                        self.n_same += 1;
                         cur.nodes.push(ib);
                         cur.sets.push(next.sets[a]);
                         cur.his.push(next.his[a]);
@@ -666,7 +736,7 @@ pub fn backward(g: &Graph, horizon: u32) -> Winning {
                 };
                 if had {
                     new_changed.push(ib);
-                    close(a, &mut spans);
+                    close(a, spans);
                     a += 1;
                 }
                 if let Some(s) = set {
@@ -685,7 +755,7 @@ pub fn backward(g: &Graph, horizon: u32) -> Winning {
                     cur.his.push(next.his[a]);
                 } else {
                     new_changed.push(ia);
-                    close(a, &mut spans);
+                    close(a, spans);
                 }
                 a += 1;
             }
@@ -703,31 +773,39 @@ pub fn backward(g: &Graph, horizon: u32) -> Winning {
         for (k, &i) in cur.nodes.iter().enumerate() {
             pos[i as usize] = k as u32;
         }
-        changed = new_changed;
-        next = cur;
-        d_merge += t0.elapsed();
+        *changed = new_changed;
+        *next = cur;
+        self.d_merge += t0.elapsed();
         if (horizon - 1 - t) % 4 == 0 {
-            let (k, med, p90, max) = fragmentation(next.nodes.iter().zip(&next.sets).filter(|&(&i, _)| !g.is_win(i)).map(|(_, &s)| &sets[s as usize]));
-            fragments.push(format!("[arc] W frame {t:3}: {k} non-win nodes can win; rectangles per node med {med} p90 {p90} max {max}"));
+            let (k, med, p90, max) = fragmentation(self.next.nodes.iter().zip(&self.next.sets).filter(|&(&i, _)| !g.is_win(i)).map(|(_, &s)| &self.sets[s as usize]));
+            self.fragments.push(format!("[arc] W frame {t:3}: {k} non-win nodes can win; rectangles per node med {med} p90 {p90} max {max}"));
         }
     }
-    for a in 0..next.nodes.len() {
-        spans.push(Span { node: next.nodes[a], lo: 0, hi: next.his[a], set: next.sets[a] });
+
+    /// The spans, once every frame down to 0 is done.
+    pub fn finish(self) -> Winning {
+        let Backward { mut spans, sets, next, fragments, .. } = self;
+        for a in 0..next.nodes.len() {
+            spans.push(Span { node: next.nodes[a], lo: 0, hi: next.his[a], set: next.sets[a] });
+        }
+        drop(next);
+        spans.sort_unstable_by_key(|s| (s.node, s.lo));
+        eprintln!(
+            "[arc] backward: {} recomputations ({} unchanged), {} out-edges scanned; candidates {:.2} s, pull {:.2} s, merge {:.2} s; {} spans, {} distinct sets",
+            self.n_cand,
+            self.n_same,
+            self.n_scan,
+            self.d_cand.as_secs_f64(),
+            self.d_pull.as_secs_f64(),
+            self.d_merge.as_secs_f64(),
+            spans.len(),
+            sets.len()
+        );
+        for f in fragments {
+            eprintln!("{f}");
+        }
+        Winning { spans, sets }
     }
-    drop(next);
-    spans.sort_unstable_by_key(|s| (s.node, s.lo));
-    eprintln!(
-        "[arc] backward: {n_cand} recomputations ({n_same} unchanged), {n_scan} out-edges scanned; candidates {:.2} s, pull {:.2} s, merge {:.2} s; {} spans, {} distinct sets",
-        d_cand.as_secs_f64(),
-        d_pull.as_secs_f64(),
-        d_merge.as_secs_f64(),
-        spans.len(),
-        sets.len()
-    );
-    for f in fragments {
-        eprintln!("{f}");
-    }
-    Winning { spans, sets }
 }
 
 /// FORWARD inside W: `R_t(i)`, the remainders with which node `i` is reached
@@ -1379,6 +1457,21 @@ pub struct Solved {
     pub known: Option<u32>,
 }
 
+/// One node's term of the gate's `W f{t}` line: the node's content hash
+/// (`exact::ContentHash::state`) folded with its set's rectangles
+/// (`rewrite bench-backward` prints the same line for one frame).
+pub fn gate_w_hash(node: u64, r: &Region) -> u64 {
+    use celeste_engine::runtime2::mix64;
+    let mut h = node;
+    for (y, xs) in r.slabs() {
+        h = mix64(h ^ ((y.lo as u64) << 32 | y.hi as u64));
+        for x in xs {
+            h = mix64(h ^ ((x.lo as u64) << 32 | x.hi as u64));
+        }
+    }
+    h
+}
+
 /// THE ARC PHASE over a finished tree in `dir`: `load`, `backward`,
 /// `optimum`, and as much of `concrete_search` as `concrete` says. Prints
 /// the `[gate]` fingerprints (over (shape, key, cell), independent of
@@ -1399,7 +1492,6 @@ pub fn solve(
     known: Option<&super::known::Route>,
 ) -> anyhow::Result<Solved> {
     use crate::frame::{mark_row, save_marks, MarkRow, Visited};
-    use celeste_engine::runtime2::mix64;
     crate::metrics::mem_phase("arc: start");
     let Loaded { graph, start, marks, wins, .. } = load(dir, horizon)?;
     let g = &graph;
@@ -1453,13 +1545,7 @@ pub fn solve(
     // Per frame, the nodes with a set and the sum of their (node, set) hashes.
     let mut per_frame = vec![(0usize, 0u64); horizon as usize + 1];
     for (i, lo, hi, r) in w.spans() {
-        let mut h = node_key[i as usize];
-        for (y, xs) in r.slabs() {
-            h = mix64(h ^ ((y.lo as u64) << 32 | y.hi as u64));
-            for x in xs {
-                h = mix64(h ^ ((x.lo as u64) << 32 | x.hi as u64));
-            }
-        }
+        let h = gate_w_hash(node_key[i as usize], r);
         for f in &mut per_frame[lo as usize..=hi as usize] {
             f.0 += 1;
             f.1 = f.1.wrapping_add(h);

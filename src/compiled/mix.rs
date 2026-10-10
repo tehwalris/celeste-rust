@@ -63,21 +63,63 @@ pub(crate) fn dir() -> Option<PathBuf> {
     std::env::var_os("CELESTE_KERNEL_MIX").map(PathBuf::from)
 }
 
-/// Every kernel built while on: its symbol and its slice counter.
-static KERNELS: Mutex<Vec<(String, Arc<AtomicU64>)>> = Mutex::new(Vec::new());
+/// `CELESTE_KERNEL_METRICS=1`: the census and the slice counters without
+/// the files (`rewrite bench-frame --metrics`: `kernel_metrics`).
+pub fn metrics_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("CELESTE_KERNEL_METRICS").is_ok_and(|v| v == "1"))
+}
 
-/// A fresh slice counter for kernel `sym`.
-pub(crate) fn counter(sym: &str) -> Arc<AtomicU64> {
+/// One kernel's census (`report`): its static counts, `key -> value`.
+pub type Census = BTreeMap<String, u64>;
+
+/// Every kernel built while on: its symbol, its slice counter, its census.
+static KERNELS: Mutex<Vec<(String, Arc<AtomicU64>, Census)>> = Mutex::new(Vec::new());
+
+/// A fresh slice counter for kernel `sym`, with its census.
+pub(crate) fn counter(sym: &str, census: Census) -> Arc<AtomicU64> {
     let c = Arc::new(AtomicU64::new(0));
-    KERNELS.lock().unwrap().push((sym.to_string(), c.clone()));
+    KERNELS.lock().unwrap().push((sym.to_string(), c.clone(), census));
     c
+}
+
+/// Every kernel built so far: its symbol, the slices it ran, its census
+/// (`insts` the static instruction count: a kernel is straight-line code, so
+/// slices x insts is its dynamic count, call-outs' callees aside), by symbol.
+pub fn kernel_metrics() -> Vec<(String, u64, Census)> {
+    let mut v: Vec<(String, u64, Census)> = KERNELS.lock().unwrap().iter().map(|(s, c, m)| (s.clone(), c.load(Ordering::Relaxed), m.clone())).collect();
+    v.sort_by(|a, b| a.0.cmp(&b.0));
+    v
+}
+
+/// Zero every kernel's slice counter (a bench's warm-up done).
+pub fn reset_slices() {
+    for (_, c, _) in KERNELS.lock().unwrap().iter() {
+        c.store(0, Ordering::Relaxed);
+    }
+}
+
+/// A graph op's KIND, for the metrics: `leaf` (literals, cells, unknowns),
+/// `num` (number -> number, an interval's ends, a fork's fragments), `cmp`
+/// (number -> bool), `bool` (bool -> bool, the errors' validity tests),
+/// `sel`, `restrict`, `call` (a cart lookup: a call-out in the kernel).
+pub(crate) fn op_kind(op: &Op) -> &'static str {
+    match op {
+        Op::Const(..) | Op::ConstBool(_) | Op::Cell(_) | Op::UnknownNum | Op::UnknownBool(_) => "leaf",
+        Op::Lt | Op::Le | Op::Gt | Op::Ge | Op::Eq => "cmp",
+        Op::Not | Op::And | Op::Or | Op::Known | Op::SplitValid(_) | Op::FragOk(_) | Op::SplitOk(_) | Op::NoWrap => "bool",
+        Op::Sel => "sel",
+        Op::Restrict(..) => "restrict",
+        Op::Mget | Op::TileFlagAt => "call",
+        Op::Split(_) | Op::Add | Op::Sub | Op::Mul | Op::Div | Op::Rem | Op::Neg | Op::Abs | Op::Flr | Op::Sin | Op::Min | Op::Max | Op::Span | Op::Frag(_) | Op::SplitInt(_) | Op::IntFrag(_) | Op::Lo | Op::Hi => "num",
+    }
 }
 
 /// `DIR/calls.tsv`: per kernel the slices it ran so far.
 pub(crate) fn write_calls() {
     let Some(dir) = dir() else { return };
     let mut out = String::from("sym\tslices\n");
-    for (sym, c) in KERNELS.lock().unwrap().iter() {
+    for (sym, c, _) in KERNELS.lock().unwrap().iter() {
         writeln!(out, "{sym}\t{}", c.load(Ordering::Relaxed)).unwrap();
     }
     if let Err(e) = std::fs::write(dir.join("calls.tsv"), out) {
@@ -87,6 +129,8 @@ pub(crate) fn write_calls() {
 
 /// One kernel's inputs to the report.
 pub(crate) struct Input<'a> {
+    /// The traced frame's graph, before specialization and fusion.
+    pub traced: &'a Graph,
     pub fused: &'a Graph,
     /// The distinct root slots and each one's roles (bits).
     pub roots: &'a [NodeId],
@@ -280,10 +324,12 @@ fn category(mn: &str, ops: &str, kind: &str, node_op: &Op, store_role: &str) -> 
     c.to_string()
 }
 
-/// Write one kernel's report.
-pub(crate) fn report(inp: &Input) -> Result<()> {
-    let Some(dir) = dir() else { return Ok(()) };
-    std::fs::create_dir_all(&dir)?;
+/// One kernel's census and, with `CELESTE_KERNEL_MIX=DIR`, its report.
+pub(crate) fn report(inp: &Input) -> Result<Census> {
+    let dir = dir();
+    if let Some(dir) = &dir {
+        std::fs::create_dir_all(dir)?;
+    }
     let (g, comp) = (inp.fused, inp.compiled);
     let sym = &comp.sym;
     let n = g.len();
@@ -335,7 +381,7 @@ pub(crate) fn report(inp: &Input) -> Result<()> {
         }
     }
     // `<sym>.guards`: each distinct error root's terms and live root, readable.
-    {
+    if let Some(dir) = &dir {
         let mut out = String::new();
         let mut done = std::collections::HashSet::new();
         for &(err, live) in inp.bodies {
@@ -441,6 +487,16 @@ pub(crate) fn report(inp: &Input) -> Result<()> {
         }
     }
     bump(&mut t, "nodes".into(), reach_n);
+    for id in 0..n {
+        if role[id] != 0 {
+            bump(&mut t, format!("kind.{}", op_kind(&g.get(id as NodeId).op)), 1);
+        }
+    }
+    bump(&mut t, "fused_nodes".into(), n as u64);
+    bump(&mut t, "traced.nodes".into(), inp.traced.len() as u64);
+    for id in 0..inp.traced.len() {
+        bump(&mut t, format!("traced.kind.{}", op_kind(&inp.traced.get(id as NodeId).op)), 1);
+    }
     bump(&mut t, "bodies".into(), inp.bodies.len() as u64);
     let distinct = |f: &dyn Fn(&(NodeId, NodeId)) -> NodeId| inp.bodies.iter().map(f).collect::<std::collections::HashSet<_>>().len() as u64;
     bump(&mut t, "bodies.distinct_error".into(), distinct(&|b| b.0));
@@ -704,13 +760,15 @@ pub(crate) fn report(inp: &Input) -> Result<()> {
     }
     bump(&mut t, "fold.ssa".into(), comp.foldable.iter().filter(|f| **f).count() as u64);
     // A started `#@end` after the body: the epilogue is `c.frame` (`cur` None).
-    let mut tsv = String::new();
-    for (k, v) in &t {
-        writeln!(tsv, "{k}\t{v}").unwrap();
+    if let Some(dir) = &dir {
+        let mut tsv = String::new();
+        for (k, v) in &t {
+            writeln!(tsv, "{k}\t{v}").unwrap();
+        }
+        std::fs::write(dir.join(format!("{sym}.tsv")), tsv)?;
+        std::fs::write(dir.join(format!("{sym}.lines")), lines)?;
+        std::fs::write(dir.join(format!("{sym}.s")), &comp.asm)?;
+        std::fs::copy(inp.so, dir.join(format!("{sym}.so"))).with_context(|| format!("copying {}", inp.so.display()))?;
     }
-    std::fs::write(dir.join(format!("{sym}.tsv")), tsv)?;
-    std::fs::write(dir.join(format!("{sym}.lines")), lines)?;
-    std::fs::write(dir.join(format!("{sym}.s")), &comp.asm)?;
-    std::fs::copy(inp.so, dir.join(format!("{sym}.so"))).with_context(|| format!("copying {}", inp.so.display()))?;
-    Ok(())
+    Ok(t)
 }

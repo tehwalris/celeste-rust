@@ -317,13 +317,7 @@ pub fn bench_storage(a: &BenchArgs) -> Result<()> {
             let t_layer = t.elapsed();
             line += &format!(" | translate {:.3} s, new {} | layer {:.3} s, {} pieces", t_tr.as_secs_f64(), news.len(), t_layer.as_secs_f64(), layer.len());
             // The new states' fingerprint, as `ckhash`'s `f` line.
-            let mut acc = 0u64;
-            let content = visited.keys.content_hash();
-            for b in &layer {
-                for (k, id) in b.keys().iter().zip(b.ids()) {
-                    acc = acc.wrapping_add(content.state(b.shard_shape(), *k, super::id_cell(&visited.geo, *id)));
-                }
-            }
+            let (_, acc) = layer_fingerprint(&layer, &visited);
             line += &format!(" | f{frame:03} {} {acc:016x}", news.len());
             if do_edges {
                 let t = Instant::now();
@@ -332,23 +326,7 @@ pub fn bench_storage(a: &BenchArgs) -> Result<()> {
                 let t_e = t.elapsed();
                 line += &format!(" | edge file {:.3} s, {:.2} B an edge", t_e.as_secs_f64(), bytes as f64 / edges.max(1) as f64);
                 // The edges' fingerprint, as `ckhash --edges`'s `e` line.
-                let store = super::edges::EdgeStore::open(&scratch, frame)?;
-                let node = |id: StateId| -> u64 {
-                    let r = super::id_region(id);
-                    let shape = visited.shape_hash(r / visited.geo.slots);
-                    let k = visited.table(r).expect("a region of the set").key(super::id_entry(id));
-                    content.state(shape, k, super::id_cell(&visited.geo, id))
-                };
-                let (mut n, mut acc) = (0u64, 0u64);
-                store.scan(frame, |e| {
-                    // The merged table in memory (the scratch dir's holds the new pairs only).
-                    let pair = xfers.pairs[e.xfer as usize];
-                    let mut b = Vec::new();
-                    crate::search::arc_edges::encode_pair(&mut b, &pair);
-                    let p = b.iter().fold(0u64, |h, &x| celeste_engine::runtime2::mix64(h ^ x as u64));
-                    acc = acc.wrapping_add(celeste_engine::runtime2::mix64(node(e.dst) ^ node(e.src).rotate_left(21) ^ p.rotate_left(42)));
-                    n += 1;
-                });
+                let (n, acc) = edge_fingerprint(&scratch, frame, &xfers, &visited)?;
                 line += &format!(" | e{frame:03} {n} {acc:016x}");
             }
         }
@@ -356,6 +334,52 @@ pub fn bench_storage(a: &BenchArgs) -> Result<()> {
     }
     let _ = std::fs::remove_dir_all(&scratch);
     Ok(())
+}
+
+/// `rewrite ckhash`'s `f{frame}` line over a new layer: its states'
+/// count and the order-independent sum of their (key, cell) hashes.
+pub fn layer_fingerprint(layer: &[crate::frame::Block], visited: &VisitedSet) -> (u64, u64) {
+    let content = visited.keys.content_hash();
+    let (mut n, mut acc) = (0u64, 0u64);
+    for b in layer {
+        for (k, id) in b.keys().iter().zip(b.ids()) {
+            acc = acc.wrapping_add(content.state(b.shard_shape(), *k, super::id_cell(&visited.geo, *id)));
+            n += 1;
+        }
+    }
+    (n, acc)
+}
+
+/// `rewrite ckhash --edges`'s `e{frame}` line over the frame's edge file in
+/// `edges_dir`: each edge by the (shape, key, cell) of its target and
+/// source (looked up in `visited`, which holds both) and its transfer pair
+/// (`xfers`, the merged table in memory: the dir's file may hold only the
+/// frame's new pairs).
+pub fn edge_fingerprint(edges_dir: &Path, frame: u32, xfers: &super::edges::XferTable, visited: &VisitedSet) -> Result<(u64, u64)> {
+    let mix = celeste_engine::runtime2::mix64;
+    let store = super::edges::EdgeStore::open(edges_dir, frame)?;
+    let content = visited.keys.content_hash();
+    let node = |id: StateId| -> u64 {
+        let r = super::id_region(id);
+        let shape = visited.shape_hash(r / visited.geo.slots);
+        let k = visited.table(r).expect("a region of the set").key(super::id_entry(id));
+        content.state(shape, k, super::id_cell(&visited.geo, id))
+    };
+    // A pair's hash once, not per edge.
+    let pair_hash: Vec<u64> = xfers
+        .pairs
+        .iter()
+        .map(|pair| {
+            let mut b = Vec::new();
+            crate::search::arc_edges::encode_pair(&mut b, pair);
+            b.iter().fold(0u64, |h, &x| mix(h ^ x as u64))
+        })
+        .collect();
+    let parts = store.par_scan(frame, crate::frame::threads(), || (0u64, 0u64), |(n, acc), e| {
+        *acc = acc.wrapping_add(mix(node(e.dst) ^ node(e.src).rotate_left(21) ^ pair_hash[e.xfer as usize].rotate_left(42)));
+        *n += 1;
+    });
+    Ok(parts.into_iter().fold((0, 0), |(n, acc), (m, a)| (n + m, acc.wrapping_add(a))))
 }
 
 /// Replay one unit's records into the sink (`xmap`: the stream's transfer

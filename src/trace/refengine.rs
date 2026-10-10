@@ -33,6 +33,8 @@ pub struct RefEngine {
     /// The post-`_init` state: the room's start, and what a block does not carry.
     base: State<RefDomain>,
     fn_info: FnInfo,
+    /// The most fork paths one frame may take (`refdriver::TooManyPaths`).
+    path_cap: usize,
 }
 
 // The raw pointers inside (`Interp`'s AST references) point into the
@@ -60,7 +62,13 @@ impl RefEngine {
         crate::trace::cart::inject_tile_flag_at(&mut st0);
         let base = run_one(&mut it, init, st0)?;
         let fn_info = fn_info_of(&base)?;
-        Ok(RefEngine { it, body, body_concrete, base, fn_info })
+        Ok(RefEngine { it, body, body_concrete, base, fn_info, path_cap: 1_000_000 })
+    }
+
+    /// At most `cap` fork paths a frame, else `refdriver::TooManyPaths`
+    /// (default 1M): a sampled check's bound on one step's time and memory.
+    pub fn set_path_cap(&mut self, cap: usize) {
+        self.path_cap = cap;
     }
 
     /// The room's start (post-`_init`) as a one-row block, without keys.
@@ -84,7 +92,7 @@ impl RefEngine {
         let (mut st, _) = from_block(row, 0, &self.fn_info, &self.base)?;
         let buttons = set_buttons(&mut st, byte)?;
         self.it.button_reads = Some((buttons, 0));
-        let leaves = run_frame_all(&mut self.it, self.body_concrete, &st, &[], Level::EXACT);
+        let leaves = run_frame_all(&mut self.it, self.body_concrete, &st, &[], Level::EXACT, self.path_cap);
         let (_, mask) = self.it.button_reads.take().expect("set above");
         let out = leaves?.iter().map(|l| Block::canonical(to_block(l)?)).collect::<Result<_>>()?;
         Ok((out, mask))
@@ -152,7 +160,7 @@ impl RefEngine {
         }
         let buttons = set_buttons(&mut st, byte)?;
         self.it.button_reads = Some((buttons, 0));
-        let leaves = run_frame_all(&mut self.it, self.body_concrete, &st, &unknown, level);
+        let leaves = run_frame_all(&mut self.it, self.body_concrete, &st, &unknown, level, self.path_cap);
         let (_, mask) = self.it.button_reads.take().expect("set above");
         let leaves = leaves?;
         if pinned_floors {
@@ -182,7 +190,7 @@ impl RefEngine {
     /// buttons, and each unknown boolean of the row, are forked per path).
     pub fn run_lane(&mut self, block: &Rt2, lane: usize) -> Result<Vec<Block>> {
         let (st, unknown) = from_block(block, lane, &self.fn_info, &self.base)?;
-        let leaves = run_frame_all(&mut self.it, self.body, &st, &unknown, current_level())?;
+        let leaves = run_frame_all(&mut self.it, self.body, &st, &unknown, current_level(), self.path_cap)?;
         leaves.iter().map(|l| Block::canonical(to_block(l)?)).collect()
     }
 }

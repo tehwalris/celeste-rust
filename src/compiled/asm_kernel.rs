@@ -1605,7 +1605,8 @@ fn build_one_shape(r: &crate::trace::kernel::Reference, si: usize, tag: &str) ->
             off += b.roots.len();
         }
         let names: HashMap<u32, String> = compiled.input_cells.iter().copied().zip(input_names.iter().cloned()).collect();
-        crate::compiled::mix::report(&crate::compiled::mix::Input {
+        let census = crate::compiled::mix::report(&crate::compiled::mix::Input {
+            traced: &r.bound.graph,
             fused: &fused,
             roots: &flat_roots,
             roles: &roles,
@@ -1617,7 +1618,7 @@ fn build_one_shape(r: &crate::trace::kernel::Reference, si: usize, tag: &str) ->
         })
         .with_context(|| format!("the mix report of {}", compiled.sym))?;
         compiled.asm = String::new();
-        Some(crate::compiled::mix::counter(&compiled.sym))
+        Some(crate::compiled::mix::counter(&compiled.sym, census))
     } else {
         None
     };

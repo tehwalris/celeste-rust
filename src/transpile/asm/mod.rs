@@ -95,10 +95,11 @@ pub fn compile_and_load_reprs(
 }
 
 /// `CELESTE_KERNEL_MIX=DIR`: the instruction-mix diagnostic
-/// (`compiled::mix`) - provenance in the assembly, a report per kernel.
+/// (`compiled::mix`) - provenance in the assembly, a report per kernel;
+/// `CELESTE_KERNEL_METRICS=1`: its census and slice counts only.
 pub fn mix_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("CELESTE_KERNEL_MIX").is_some())
+    *ON.get_or_init(|| std::env::var_os("CELESTE_KERNEL_MIX").is_some() || crate::compiled::mix::metrics_on())
 }
 
 #[cfg(test)]

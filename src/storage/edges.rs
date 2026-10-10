@@ -621,6 +621,34 @@ impl EdgeStore {
         }
     }
 
+    /// `scan` on `threads` workers: each folds the edges of the units it
+    /// takes into its own accumulator (`init()`); the accumulators, in no
+    /// particular order (fold them with something commutative).
+    pub fn par_scan<A: Send>(&self, frame: u32, threads: usize, init: impl Fn() -> A + Sync, f: impl Fn(&mut A, Edge) + Sync) -> Vec<A> {
+        let owners = self.owners(frame);
+        let units = self.units(frame);
+        let next = std::sync::atomic::AtomicUsize::new(0);
+        std::thread::scope(|sc| {
+            let hs: Vec<_> = (0..threads.max(1))
+                .map(|_| {
+                    sc.spawn(|| {
+                        let mut acc = init();
+                        loop {
+                            let k = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            let Some(&(fi, unit)) = units.get(k) else { return acc };
+                            let u = self.unit(frame, &owners, fi, unit);
+                            u.edges(|lid, c, s, x| {
+                                let (region, entry) = u.lid_owner(lid).expect("an edge names an owned lid");
+                                f(&mut acc, Edge { src: u.source(s), dst: state_id(region, entry, c), xfer: x });
+                            });
+                        }
+                    })
+                })
+                .collect();
+            hs.into_iter().map(|h| h.join().expect("an edge scan worker panicked")).collect()
+        })
+    }
+
     /// Frame `frame`'s files (`storage-census`): per file its index file's
     /// bytes, its owner index's entries and its units.
     pub fn file_sizes(&self, frame: u32) -> Vec<(u64, u64, usize)> {
