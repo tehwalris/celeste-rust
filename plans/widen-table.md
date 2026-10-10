@@ -167,7 +167,11 @@ player's remainder declared dead instead it fails. No output moved.
 
 ## Decisions for Philippe
 
-1. **Pins as `Restrict(c, c)` are not free** (not done). Semantically equal
+1. **DONE on branch `input-assumptions`** (Philippe: a pin disconnects its
+   input, uses read the constant, the input feeds only `input == c`): pins
+   were already that underneath; they are `Op::Pin` nodes now, beside
+   `Restrict`, in one family (`Symbolic::assumptions`), byte-identical.
+   The measurement that decided it: **Pins as `Restrict(c, c)` are not free**. Semantically equal
    (every frame's states and edges identical), but the kernels move:
    - numeric pins as `Restrict(v, v)` with the generic own error (`Lo < v or
      Hi > v`): dynamic kernel instructions +0.15% (r10), +0.51% (r62h),
@@ -179,7 +183,10 @@ player's remainder declared dead instead it fails. No output moved.
      mechanism unless `Restrict` gains a boolean twin.
    Options: keep pins (today); adopt the second variant with a re-pin (+0-0.3%)
    and keep boolean pins; or add a boolean restriction too.
-2. **Owed input literals as `Restrict` assumptions** (not done): the fly
+2. **DONE on branch `input-assumptions`**, as PINS to the literal interval
+   (`Pinned::Num(lo, hi)`), not as `Restrict`: the input is read as the
+   literal (disconnected), so it is the pin kind; byte-identical, metrics
+   included. The earlier measurement: **Owed input literals as `Restrict` assumptions**: the fly
    fruit's `spd.y`/`rem.y` and a platform's `rem.x` read as their literal
    range, their containment owed through `admissible`. Done as a
    `Restrict(lo, hi)` on the raw cell beside the literal: r62h states
@@ -189,7 +196,7 @@ player's remainder declared dead instead it fails. No output moved.
    replacement, a nil-or-number field (a per-row presence tag), changes
    shapes and keys (a re-pin of everything) and needs kernel support for a
    nil-or-number column. Not attempted.
-4. **Three `Proof`s** (per lane, static, literal arms) mirror the three
+4. **DONE (merged into `input-assumptions`)**: **Three `Proof`s** (per lane, static, literal arms) mirror the three
    constructions the code had. Unified on `Static` (`widen::within`, else
    the interval's exact containment per lane), every frame's states and
    edges stay identical and the kernels SHRINK: dynamic instructions

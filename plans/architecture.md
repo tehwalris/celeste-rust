@@ -165,7 +165,8 @@ OR(error(args))`, materialized once, after fusion:
 | interval `Mul`/`Div` by a positive literal | `not NoWrap(op)`: an endpoint left 16.16 (`*` wraps, `/` saturates) where `Pico8NumInterval`'s checked operation has none (branch `mul-nowrap`; two compares against `graph::Scaled::fits`; none for a factor at most 1 or a divisor at least 1, so never for `div_pow2`; skipped where the operand's static range fits) |
 | a widening | containment of the slot it writes (`widen::SlotErrors`), only where stored |
 | `Restrict(lo, hi)(x)` (a bounded input) | `Lo(x) < lo or Hi(x) > hi` on the raw input, charged to EVERY outcome |
-| the frame | inputs outside the kernel's pins |
+| `Pin(c)(x)` (a pinned input) | `x` outside `c` on the raw input, an error of the whole frame (`error::pins_hold`) |
+| the frame | what the platforms' input hook owes (a no-player speed `0 or v`) |
 
 An own error holds where its operator was EVALUATED (`own and at`, `at` the
 path's decisions at its site, `Symbolic::evaluated`): the kernel evaluates
@@ -226,17 +227,35 @@ were `Symbolic::ranges` entries - `x`'s checked nowhere, `spd.x`'s by a
 separate obligation. Both are restrictions now, and `Symbolic::ranges`, the
 seeds of `pieces_of` and of `ival::seed_cells` are gone: no input cell has a
 range, only a node does. `Points` pins a world's `x` on the raw cell beneath
-the restriction. Two INPUT LITERALS remain, and are owed, not assumed: a
-platform's `rem.x` and the fly fruit's `spd.y`/`rem.y` are READ as their
-whole literal range (no merge across them otherwise), which stands for the
-lane only where the lane's own value lies inside; the frame owes that per
-lane on the raw cell (`widen::platform_inputs`, the table's `Input::Literal`; the
-cells are typed interval inputs for it). A stored row holds the literal
-itself, so it never fires on the search's own rows; it is what makes a row
-from elsewhere (a start state, a test) decline instead of being computed as
-something it is not. `rewrite bounds-audit --room` audits all of these.
-The no-player phase's `spd.x` (the literal, owing `0 or v`) is a pin, not a
-range.
+the restriction.
+
+**Input assumptions: one family, two kinds** (2026-10-10, branch
+`input-assumptions`). Everything a kernel assumes about an input is a node
+on the raw input, recorded in `Symbolic::assumptions` and checked per lane:
+- `Restrict(lo, hi)(x)`, the RANGE: the value PASSES THROUGH, its range
+  attached; downstream reads the node. Its own error is charged to every
+  outcome (`error::for_outcomes`).
+- `Pin(c)(x)`, the PIN: the input is DISCONNECTED; every use reads the
+  constant `c` (`Pinned`: a point number, a literal interval, a boolean),
+  so the node has no data output and `x` feeds only its check, `x` inside
+  `c`, an error of the whole frame (`error::pins_hold`). `trace_frame`
+  asserts that no outcome's values, guards, transfers or derived errors
+  reach a pinned input. Pins are (1) a shape's lattice constants
+  (`iface::symbolize` makes the slot read the constant; the cell stays an
+  input for the check), (2) inputs READ AS their whole literal range so that
+  lanes merge across them: a platform's `rem.x`, the fly fruit's `spd.y`/
+  `rem.y` (the table's `Input::Literal`; the cells are typed interval
+  inputs). A stored row holds the literal itself, so a literal pin never
+  fires on the search's own rows; it makes a row from elsewhere (a start
+  state, a test) decline instead of being computed as something it is not.
+Before, the lattice pins were `iface::pin_guard` and the literals owed
+obligations: the same checks, built the same way (kernels byte-identical,
+metrics included). Charging a pin per outcome as a restriction cost up to
++0.3% dynamic instructions, so the two kinds keep their charging. The one
+assumption left outside the family: the no-player phase's `spd.x`, read as
+its one moving speed `v` and owed `0 or v` per lane (a two-point set; a pin
+to the hull would admit speeds in between). `rewrite bounds-audit --room`
+audits these.
 
 **The map folds by range** (`spikes_at`, 2026-10-10, branch `kernel-opt`).
 `tile_flag_at` is an intrinsic whose interval reading (`Graph::tile_flag_over`)
