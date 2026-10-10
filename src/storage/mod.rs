@@ -13,11 +13,13 @@
 //!                 an id to its (shape, key, cell)
 //!   * `meta`    - per frame, the shapes and entries it created
 //!   * `bench`   - `CELESTE_EMIT_CAPTURE` and `rewrite bench-storage`
+//!   * `census`  - `rewrite storage-census` (plans/storage-unify.md)
 //!
 //! A state is `(shape, key, cell)` (the key holds no position:
 //! `runtime2::pos_code`); its id is `(region, entry, cell in region)`.
 
 pub mod bench;
+pub mod census;
 pub mod edges;
 pub mod marks;
 pub mod meta;

@@ -215,6 +215,18 @@ enum Command {
         #[arg(long, default_value_t = false)]
         edges: bool,
     },
+    /// A finished tree's edges counted against the target layouts of
+    /// plans/storage-unify.md (built lids, unified per-region sets, hybrids):
+    /// per frame a line, then totals and the persistent structures' reuse.
+    StorageCensus {
+        #[arg(long)]
+        level_dir: String,
+        #[arg(long)]
+        to: u32,
+        /// Frames whose unified-layout edges are encoded exactly (comma list).
+        #[arg(long, default_value = "")]
+        encode: String,
+    },
     /// BENCH: replay one captured frame through the REAL storage code
     /// (`storage::bench`): a forward run with `CELESTE_EMIT_CAPTURE=DIR`
     /// (and `CELESTE_EMIT_CAPTURE_FRAME=F`) writes `DIR/f{F}/`; this replays
@@ -977,6 +989,10 @@ fn main() -> Result<()> {
             }
             let _ = std::fs::remove_dir_all(&edges_dir);
             celeste_rust::compiled::dispatch::print_kernel_hits();
+        }
+        Command::StorageCensus { level_dir, to, encode } => {
+            let encode: Vec<u32> = encode.split(',').filter(|s| !s.is_empty()).map(|s| s.parse()).collect::<Result<_, _>>()?;
+            celeste_rust::storage::census::census(&celeste_rust::storage::census::CensusArgs { dir: std::path::Path::new(&level_dir), to, encode: &encode })?;
         }
         Command::BenchStorage { capture, tree, room, level, threads, phase, reps } => {
             std::env::set_var("CELESTE_START_ROOM", &room);
