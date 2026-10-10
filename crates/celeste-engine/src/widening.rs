@@ -124,28 +124,16 @@ pub enum Target {
     Globals,
 }
 
-/// How a containment obligation is discharged in the traced graph. On
-/// blocks every one is a per-lane check (an assertion).
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Proof {
-    /// Checked per lane, always (the domain's own comparisons).
-    PerLane,
-    /// Proved from the graph where it can be (literals, bounded inputs,
-    /// sums, select arms under their branches' facts), else per lane.
-    Static,
-    /// Proved where every value a lane can hold is a literal inside (a
-    /// select tree of literals), else per lane on the value's bounds.
-    Literals,
-}
-
 /// What a slot STORES at the frame's end.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Stored {
-    /// The interval `[lo, hi]` (raw 16.16); owed: the value lies inside.
-    Range { lo: i32, hi: i32, proof: Proof },
+    /// The interval `[lo, hi]` (raw 16.16); owed: the value lies inside
+    /// (proved from the graph where it can be, else checked per lane; on
+    /// blocks an assertion).
+    Range { lo: i32, hi: i32 },
     /// `[s - radius, s + radius]` around the object's number field
-    /// `around` (`s`); owed: the value lies inside.
-    Band { around: &'static str, radius: i32, proof: Proof },
+    /// `around` (`s`, a constant of the shape); owed as `Range`.
+    Band { around: &'static str, radius: i32 },
     /// A PHASE: an integer read only through a function periodic in it, as
     /// the interval `[lo, hi]` of one period. Nothing owed: the entry's
     /// `why` names the periodicity.
@@ -327,8 +315,8 @@ pub static TABLE: &[Entry] = &[
         flag: Flag::Always,
         target: Target::Objects("player"),
         slots: &[
-            slot(&["rem", "x"], Stored::Range { lo: REM.0, hi: REM.1, proof: Proof::PerLane }, Input::Stored),
-            slot(&["rem", "y"], Stored::Range { lo: REM.0, hi: REM.1, proof: Proof::PerLane }, Input::Stored),
+            slot(&["rem", "x"], Stored::Range { lo: REM.0, hi: REM.1 }, Input::Stored),
+            slot(&["rem", "y"], Stored::Range { lo: REM.0, hi: REM.1 }, Input::Stored),
         ],
         kind: Kind::Over,
         hook: None,
@@ -352,7 +340,7 @@ pub static TABLE: &[Entry] = &[
         flag: Flag::Always,
         target: Target::Objects("fruit"),
         slots: &[
-            slot(&["y"], Stored::Band { around: "start", radius: FRUIT_BOB_RAW, proof: Proof::PerLane }, Input::Stored),
+            slot(&["y"], Stored::Band { around: "start", radius: FRUIT_BOB_RAW }, Input::Stored),
             slot(&["off"], Stored::Phase { lo: FRUIT_OFF.0, hi: FRUIT_OFF.1 }, Input::Stored),
         ],
         kind: Kind::Over,
@@ -399,8 +387,8 @@ pub static TABLE: &[Entry] = &[
         slots: &[
             slot(&["step"], Stored::UnknownNum, Input::Unknown),
             slot(&["y"], Stored::UnknownNum, Input::Unknown),
-            slot(&["spd", "y"], Stored::Range { lo: FLY_FRUIT_SPD_Y.0, hi: FLY_FRUIT_SPD_Y.1, proof: Proof::Literals }, Input::Literal),
-            slot(&["rem", "y"], Stored::Range { lo: REM.0, hi: REM.1, proof: Proof::Literals }, Input::Literal),
+            slot(&["spd", "y"], Stored::Range { lo: FLY_FRUIT_SPD_Y.0, hi: FLY_FRUIT_SPD_Y.1 }, Input::Literal),
+            slot(&["rem", "y"], Stored::Range { lo: REM.0, hi: REM.1 }, Input::Literal),
             slot(&["fly"], Stored::UnknownBool, Input::Atom),
         ],
         kind: Kind::Over,
@@ -435,7 +423,7 @@ pub static TABLE: &[Entry] = &[
         flag: Flag::Near,
         target: Target::Objects("spring"),
         slots: &[
-            slot(&["spr"], Stored::Range { lo: SPRING_SPR_RANGE.0, hi: SPRING_SPR_RANGE.1, proof: Proof::Static }, Input::Stored),
+            slot(&["spr"], Stored::Range { lo: SPRING_SPR_RANGE.0, hi: SPRING_SPR_RANGE.1 }, Input::Stored),
             Slot { field: &["delay"], stored: Stored::UnknownNum, input: Input::Unknown, optional: true },
             slot(&["hide_in"], Stored::UnknownNum, Input::Unknown),
             slot(&["hide_for"], Stored::UnknownNum, Input::Unknown),
@@ -451,8 +439,8 @@ pub static TABLE: &[Entry] = &[
         flag: Flag::Near,
         target: Target::Objects("balloon"),
         slots: &[
-            slot(&["spr"], Stored::Range { lo: BALLOON_SPR_RANGE.0, hi: BALLOON_SPR_RANGE.1, proof: Proof::Static }, Input::Stored),
-            slot(&["y"], Stored::Band { around: "start", radius: BALLOON_BOB_RAW, proof: Proof::Static }, Input::Stored),
+            slot(&["spr"], Stored::Range { lo: BALLOON_SPR_RANGE.0, hi: BALLOON_SPR_RANGE.1 }, Input::Stored),
+            slot(&["y"], Stored::Band { around: "start", radius: BALLOON_BOB_RAW }, Input::Stored),
         ],
         kind: Kind::Over,
         hook: None,
@@ -466,7 +454,7 @@ pub static TABLE: &[Entry] = &[
         flag: Flag::Near,
         target: Target::Objects("fall_floor"),
         slots: &[
-            slot(&["state"], Stored::Range { lo: FLOOR_STATE_RANGE.0, hi: FLOOR_STATE_RANGE.1, proof: Proof::Static }, Input::Hook),
+            slot(&["state"], Stored::Range { lo: FLOOR_STATE_RANGE.0, hi: FLOOR_STATE_RANGE.1 }, Input::Hook),
             slot(&["collideable"], Stored::UnknownBool, Input::Hook),
         ],
         kind: Kind::Over,
@@ -482,7 +470,7 @@ pub static TABLE: &[Entry] = &[
         flag: Flag::Platforms,
         target: Target::Objects("platform"),
         slots: &[
-            slot(&["x"], Stored::Range { lo: PATH_RAW.0, hi: PATH_RAW.1, proof: Proof::Static }, Input::Hook),
+            slot(&["x"], Stored::Range { lo: PATH_RAW.0, hi: PATH_RAW.1 }, Input::Hook),
             slot(&["last"], Stored::SameAs("x"), Input::Hook),
         ],
         kind: Kind::Over,
@@ -497,7 +485,7 @@ pub static TABLE: &[Entry] = &[
         name: "platform remainder",
         flag: Flag::Platforms,
         target: Target::Objects("platform"),
-        slots: &[slot(&["rem", "x"], Stored::Range { lo: REM.0, hi: REM.1, proof: Proof::Static }, Input::Hook)],
+        slots: &[slot(&["rem", "x"], Stored::Range { lo: REM.0, hi: REM.1 }, Input::Hook)],
         kind: Kind::Over,
         hook: Some(Hook::PlatformInputs),
         why: "A platform's `rem.x` the whole remainder, read as the literal (owed per lane): a \
@@ -559,14 +547,9 @@ fn show_raw(r: i32) -> String {
 
 impl std::fmt::Display for Stored {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let proof = |p: &Proof| match p {
-            Proof::PerLane => "per lane",
-            Proof::Static => "proved statically, else per lane",
-            Proof::Literals => "proved on literal arms, else per lane",
-        };
         match self {
-            Stored::Range { lo, hi, proof: p } => write!(f, "[{}, {}]; owed: inside ({})", show_raw(*lo), show_raw(*hi), proof(p)),
-            Stored::Band { around, radius, proof: p } => write!(f, "`{around}` +- {}; owed: inside ({})", show_raw(*radius), proof(p)),
+            Stored::Range { lo, hi } => write!(f, "[{}, {}]; owed: inside", show_raw(*lo), show_raw(*hi)),
+            Stored::Band { around, radius } => write!(f, "`{around}` +- {}; owed: inside", show_raw(*radius)),
             Stored::Phase { lo, hi } => write!(f, "one period [{}, {}]", show_raw(*lo), show_raw(*hi)),
             Stored::AtLeast(k) => write!(f, "max(v, {})", show_raw(*k)),
             Stored::UnknownNum => write!(f, "the unknown number"),
