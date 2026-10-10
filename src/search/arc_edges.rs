@@ -7,9 +7,8 @@
 //! (`trace::verify::FrameOut::arc`); the kernel computes them beside the row
 //! (no key, column, dedup or checkpoint sees them) and each producer's
 //! transfer is decoded here. The forward interns the (x, y) pair per worker
-//! (`ForwardSink::xfer_id`); the compaction merges the ids into one table
-//! per frame (`search::edges`), so a mask is OR-ed only across equal
-//! transfers.
+//! (`storage::unit::UnitSink::xfer_id`); each frame merges the workers' ids
+//! into the tree's one table, content-canonical (`storage::edges::XferTable`).
 //!
 //! ## What the kernel computes per axis (`RawAxis`)
 //!

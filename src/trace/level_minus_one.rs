@@ -956,7 +956,7 @@ fn sound_d(g: &Graph1, rev: &[Vec<u32>], chain_frames: u32, end_node: u32) -> Ve
 /// THE LEVEL -1 FILTER's table (`frame::level_minus_one`): per (block shape
 /// hash, player cell), a lower bound on the frames to an exit (`sound_d`).
 pub struct CostToGo {
-    /// Fx, not SipHash: probed per emitted row (`ForwardSink::minus_one_drop`).
+    /// Fx, not SipHash: probed per emitted row (`UnitSink::minus_one_drop`).
     /// Every iteration sorts first (`fingerprint`, `save`).
     d: rustc_hash::FxHashMap<(u64, i16, i16), u32>,
     /// The start state's d: no exit is sooner than this.

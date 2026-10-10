@@ -1,7 +1,6 @@
 //! The 16-lane primitives: the reference semantics the ASM codegen's ops
 //! are checked against (`transpile::asm::tests`), the call-outs the
-//! assembled kernels make (collisions, map reads), and the kernels' per-call
-//! dedup cache (`RowCache`).
+//! assembled kernels make (collisions, map reads).
 //!
 //! Types are static; lanes are rows (W = 16 x i32 = one zmm). Each op must
 //! agree bit-exactly with `Pico8Num`'s scalar operator (the tests check it).
@@ -529,102 +528,6 @@ pub fn zn_tile_flag_at_lanes(
         }
     }
     ZB { val, known: ALL }
-}
-
-/// The within-call dedup cache, keyed by the state (row key and cell), with one `u32` tag
-/// per key: what the row's first emission learned that a re-emission needs,
-/// so the re-emission materializes nothing (`compiled::asm_kernel`).
-///
-/// A cache, not a set: fixed capacity, a short probe, a colliding new key
-/// evicts. Duplicates come from neighbouring input lanes (inputs are sorted
-/// by cell), so a bounded L2-resident table catches most; a miss reaches
-/// the door, which is the dedup of record.
-pub struct RowCache {
-    /// `(key.1, ref, generation, tag)`; the slot index comes from `key.0`.
-    /// The ref is the queued row, or once flushed the state's id
-    /// (`ID_FLAG`), so a later emission of the key can record its edge.
-    slots: Vec<(u64, u64, u32, u32)>,
-    mask: usize,
-    gen: u32,
-}
-
-impl Default for RowCache {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl RowCache {
-    /// 32k entries of 24 bytes: 768 KB, most of a core's L2.
-    pub const CAPACITY: usize = 1 << 15;
-    const PROBES: usize = 4;
-
-    pub fn new() -> Self {
-        RowCache { slots: vec![(0, 0, 0, 0); Self::CAPACITY], mask: Self::CAPACITY - 1, gen: 1 }
-    }
-
-    /// The ref of a flushed row: the state's id, flagged.
-    pub const ID_FLAG: u64 = 1 << 63;
-    /// The ref of a row a filter dropped: no edge to record; the low 32 bits
-    /// are the smallest horizon level -1 would admit it at (a raise's note).
-    pub const DROP_FLAG: u64 = 1 << 62;
-
-    /// Forget every key (O(1): bumps the generation).
-    pub fn clear(&mut self) {
-        self.gen = self.gen.wrapping_add(1);
-        if self.gen == 0 {
-            self.slots.iter_mut().for_each(|s| s.1 = 0);
-            self.gen = 1;
-        }
-    }
-
-
-    /// The cache's key of the state `(k, cell)`: the row key holds no
-    /// position (`runtime2::pos_code`), the cell does.
-    #[inline(always)]
-    fn with_cell(k: (u64, u64), cell: u32) -> (u64, u64) {
-        use crate::runtime2::mix64;
-        (k.0 ^ mix64(cell as u64 | 1 << 40), k.1 ^ mix64(cell as u64 | 1 << 41))
-    }
-
-    /// Set the ref of `(k, cell)`'s entry. A miss (evicted since) is fine:
-    /// the next emission of it will push the row again.
-    #[inline(always)]
-    pub fn set_ref(&mut self, k: (u64, u64), cell: u32, r: u64) {
-        let k = Self::with_cell(k, cell);
-        let base = k.0 as usize;
-        for p in 0..Self::PROBES {
-            let i = (base + p) & self.mask;
-            let s = &mut self.slots[i];
-            if s.2 == self.gen && s.0 == k.1 {
-                s.1 = r;
-                return;
-            }
-        }
-    }
-
-    /// Insert the state `(k, cell)` with `tag` and ref `r`: `None` if it was
-    /// not present (it is now, or it evicted the first slot of its probe
-    /// window), `Some((tag, ref) of the first insert)` if it was.
-    #[inline(always)]
-    pub fn insert_ref(&mut self, k: (u64, u64), cell: u32, tag: u32, r: u64) -> Option<(u32, u64)> {
-        let k = Self::with_cell(k, cell);
-        let base = k.0 as usize;
-        let mut victim = base & self.mask;
-        for p in 0..Self::PROBES {
-            let i = (base + p) & self.mask;
-            let s = self.slots[i];
-            if s.2 != self.gen {
-                victim = i;
-                break;
-            }
-            if s.0 == k.1 {
-                return Some((s.3, s.1));
-            }
-        }
-        self.slots[victim] = (k.1, r, self.gen, tag);
-        None
-    }
 }
 
 #[cfg(test)]

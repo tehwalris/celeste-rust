@@ -4,7 +4,7 @@
 //! The search prunes by several things - level -1, the objects ladder's
 //! filter (the coarser level's REACHED nodes), the remainder-free BFS
 //! marks, the winning sets `W_t` the concrete search looks states up in -
-//! and each of them over a tree the kernels and the door built. If any is
+//! and each of them over a tree the kernels and the visited set built. If any is
 //! wrong it silently removes real winners: a wrong "optimal" or a tie, never
 //! a fake improvement (witnesses are replayed). A known route that wins by
 //! the horizon must survive every one of them, so it is stepped through the
@@ -236,7 +236,7 @@ fn verdict(b: &Block, s: u32, seeded: bool, l1: Option<(u32, &crate::trace::leve
                 "NOT MARKED: in the tree (layer {layer} s{seq} r{row}) but the remainder-free BFS finds no recorded path from it to a win by step {} - a successor on the route was lost ({node})",
                 p.horizon
             )),
-            None => forward(format!("NOT IN THE TREE by step {s}: the forward lost it since the step before (the kernels, the door, or a filter on a mid-frame step; `rewrite follow` shows its parent's kernel successors) ({node})")),
+            None => forward(format!("NOT IN THE TREE by step {s}: the forward lost it since the step before (the kernels, the visited set, or a filter on a mid-frame step; `rewrite follow` shows its parent's kernel successors) ({node})")),
         });
     };
     let (x, y) = rem_of(b.rt2())?;

@@ -101,7 +101,7 @@ impl DupRef {
 /// `ArcSlots::words`: two words per transfer root, then the outcome's
 /// `fin` flag - the words alone do not decode: without a fin root its words
 /// are 0 and the axis has no `fin`, with one they are `fin = Some((0, 0))`.
-/// Keyed on the words alone, `ForwardSink::xfer_id_raw`'s cache gave a lane
+/// Keyed on the words alone, `UnitSink::xfer_id_raw`'s cache gave a lane
 /// whichever body's transfer was interned first (a scheduling-dependent edge,
 /// room (1,0) f61, 2026-10-09).
 pub(crate) const RAW_WORDS: usize = 4 * crate::trace::verify::ARC_AXIS_ROOTS + 1;
@@ -1017,8 +1017,8 @@ pub(crate) fn key_check(slot: &crate::storage::unit::RowBuf) {
     );
 }
 
-/// `CELESTE_KERNEL_KEY_CHECK=1` on a block the forward STORES (a canonical
-/// piece, `canon::canonical_layer`): the boundary over a copy must keep its
+/// `CELESTE_KERNEL_KEY_CHECK=1` on a block the forward STORES (a layer's
+/// piece, `storage::wave::gather_layer`): the boundary over a copy must keep its
 /// shape, structure and keys - its gather moved rows, not values.
 pub(crate) fn key_check_block(blk: &Rt2) {
     if !key_check_on() {

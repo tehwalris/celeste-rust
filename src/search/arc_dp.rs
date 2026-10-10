@@ -1412,7 +1412,7 @@ pub fn solve(
     for &(id, d) in &marks {
         let (shape, key, cell) = resolver.resolve(id)?;
         node_key.push(mix64(shape ^ mix64(key.0 ^ mix64(key.1 ^ (cell as u64) << 1))));
-        // `Visited::fingerprint`: the marks are distinct states (the door).
+        // `Visited::fingerprint`: the marks are distinct states.
         fp = fp.wrapping_add(mix64(key.0 ^ mix64(key.1 ^ (cell as u64) << 1)));
         if keyed {
             keys.push((shape, key, cell, keys.len() as u32));
