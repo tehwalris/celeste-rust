@@ -51,7 +51,9 @@ def celia(level, path, gemskip):
 
 
 def cat_of(path, cat):
-    c = cat or os.path.basename(os.path.dirname(os.path.abspath(path)))
+    d = os.path.dirname(os.path.abspath(path))
+    # `<cat>/TAS<n>.tas`, or `<cat>/upload/TAS<n>.tas` (tas/tasdatabase).
+    c = cat or os.path.basename(os.path.dirname(d) if os.path.basename(d) == "upload" else d)
     if c not in chain.FALLBACK:
         raise SystemExit(f"{path}: category {c!r} unknown (--cat)")
     return c
