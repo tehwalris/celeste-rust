@@ -333,12 +333,16 @@ pub fn read_inputs(st: &mut State<Symbolic>, d: &mut Symbolic) -> Result<Vec<Nod
         materialize_absent_fields(st, d)?;
     }
     d.platform_cells.clear();
+    let mut platforms_read = false;
     for e in d.level.entries() {
         match e.hook {
             Some(Hook::NearFloor) => read_near_floors(st, d, e, mid)?,
-            // Once, for both platform entries.
-            Some(Hook::PlatformInputs) if e.slots[0].field == ["x"] => obligations.extend(platform_inputs(st, d)?),
-            Some(Hook::PlatformInputs) => {}
+            // One hook for both platform entries: once.
+            Some(Hook::PlatformInputs) => {
+                if !std::mem::replace(&mut platforms_read, true) {
+                    obligations.extend(platform_inputs(st, d)?);
+                }
+            }
             None => {
                 for paths in entry_paths(st, e) {
                     for (s, p) in e.slots.iter().zip(&paths) {
