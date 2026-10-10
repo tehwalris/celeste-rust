@@ -79,3 +79,65 @@ BENCHMARK_DATA.md.
   neighbours) and random raws (`inline_div_rem_by_a_power_of_two_is_pico8s`).
 - The stack frame keeps its 32-register save area (unchanged layout; only
   fewer moves).
+
+## 4. Constants rematerialized
+
+- **A constant (`BcastD`) is rematerializable like an input load**: spilled,
+  it takes no slot and no store, and each use recomputes it - `vpxord` for
+  zero (the zeroing idiom), else `vpbroadcastd` from the pool. Not
+  `vpternlogd $0xff` for all-ones: it takes a logic port (the kernels'
+  busiest) and depends on its destination; a broadcast is a load, like the
+  reload it replaces.
+- **The reload pass also drops a repeated constant** (`constant_key` in
+  `drop_redundant_reloads`): without it rematerialization cost MORE
+  instructions than the reloads it replaced (repeated reloads of one slot
+  into one scratch were already dropped).
+- **Tried and dropped: making the allocator evict a rematerializable value
+  first.** 2.66064G against 2.65981G dynamic instructions without it: no
+  gain, more code.
+- Result: a wash in instructions (-0.4%); kept because it is exact, smaller
+  (no slot, no spill store for constants) and the brief asked for it.
+
+## 5. Spills: no allocator work
+
+- After (1)-(4) spill + reload are 21.6% of the kernels' remaining dynamic
+  instructions, but the kernel phase is ~2% of the reference frame's wave
+  worker-time (9% before). Even removing every spill would buy ~0.4% of the
+  wave. The reloads are of long-lived values far from their spill (~90%
+  more than 32 instructions after it), which only interval splitting plus a
+  farthest-next-use policy would address: a real allocator, for nothing
+  measurable. Written down instead (plans/kernel-mix.md "After").
+
+## Overlap with `storage-v2`
+
+None in code: the changes are in `transpile/graph.rs` (the evaluator),
+`transpile/ival.rs` (one call), `transpile/lower.rs` (one call, a
+diagnostic) and `transpile/asm/codegen.rs` + its tests; `compiled/mix.rs`
+(the diagnostic from `kernel-mix`) gained one classification line. Nothing
+touches the frame loop, the door, the edges, or `asm_kernel.rs`'s key
+computation (`key_words16`). The kernels' inputs, outputs and buffer
+layouts are unchanged, so the storage branch's key change composes.
+
+## Region size (Philippe's addition): kernels stay at 16 px
+
+Measured 8 against 16 (plans/kernel-mix.md "Kernel region 8 px against 16
+px", BENCHMARK_DATA.md): identical outputs, -20% instructions per slice at
+8, no measurable wave difference (the kernels are ~2% of the wave), and
+3.2x the kernels with +1.4 s (room (1,0)) to +5.6 s (room (6,2)) at every
+process start. Recommendation: storage at 16 to match; the default is NOT
+changed. If storage must be 8, kernels at 8 are safe and cost only startup.
+
+## Not done / follow-ups
+
+- **`tile_flag_at` inline** (a precomputed per-(box, flag) bitmap and a
+  gather instead of the call-out): after (1)-(3) the callee is about half of
+  the remaining kernel time. Small in the wave (~1%).
+- **The select's register move** (`vmovdqa64` before every `vpternlogd`
+  select, 13% of the remaining instructions): freeing a dying operand's
+  register for the result would let the select permute its LUT instead. On
+  CPUs that eliminate zmm moves at rename it is free; not measured.
+- **Spills**: see 5.
+- The emission (`emit`, ~70% of the wave's worker-time, 87 lane emissions
+  per input row) is where the reference frame's time is now.
+- Steps 3 and 4 were not perf-profiled (perf's mmap failed while another
+  agent profiled); their cycles are the `[phases]` kernel phase.

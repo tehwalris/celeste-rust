@@ -136,7 +136,7 @@ tile loop with four tile kinds, `%8` and `/8` call-outs and its loop-end
 checks, evaluated at every post-move position of every path, feeding the
 death outcome's `live`.
 
-### Simplifications (estimates; nothing implemented)
+### Simplifications (estimates, before; implemented on `kernel-opt`: "After" below)
 
 1. **Fold `spikes_at` where the region cannot reach a spike** (or make it an
    intrinsic `SpikesAt` like `TileFlagAt`, with a range fold like
@@ -198,3 +198,84 @@ Caveats: perf skid attributes a sample to a neighbouring instruction; the
 dynamic count excludes callees (measured separately in the same window); the
 spike-fold estimate assumes nothing else reads `mget` (true in this program)
 and keeps the loop-end terms (so it is a lower bound for the intrinsic).
+
+## After: the simplifications implemented (2026-10-10, branch `kernel-opt`)
+
+Same frame (f56 -> f57 of `/var/tmp/canon-h62-f56`, 366,133 slices, 86 of
+306 kernels ran), release builds, each step on top of the previous one,
+every step's outputs byte-identical to `fg-2300` (plans/kernel-opt-decisions.md
+has the verification and the decisions). Dynamic instructions are exact
+(slices x static); `kernel` is the `[phases]` kernel phase in worker-seconds
+(bodies and call-outs, 16 workers), the cycle measure under load; wave times
+are interleaved `tools/bench_step.sh` reps (see BENCHMARK_DATA.md).
+
+| step | static insts | dynamic insts | per slice | reload / spill | call-out marshalling |
+|---|---|---|---|---|---|
+| fg-2300 | 3,313,993 | 16.36G | 44,692 | 5.39G / 1.90G | 2.81G |
+| 1 `spikes_at` folded by range | 818,789 | 4.12G | 11,239 | 0.72G / 0.14G | 1.50G |
+| 2 decided planes folded | 711,206 | 3.72G | 10,161 | 0.56G / 0.11G | 1.49G |
+| 3 live-register saves, `/8` `%8` inline | 533,938 | 2.67G | 7,292 | 0.56G / 0.10G | 0.43G |
+| 4 constants rematerialized | 531,516 | 2.66G | 7,264 | 0.47G / 0.10G (+0.08G constants) | 0.43G |
+
+(1) The set reading of `mget` decides the spike tests in 74 of the 86
+kernels; what the estimate called removable is gone (the `spikefold`
+estimate on the new kernels: 0.4% of what is left, all in the 12 kernels
+whose region reaches a spike tile). Bodies per hot kernel 208 -> 192: the
+death outcome's bodies are live nowhere there and drop. (2) After it, bit
+identities find 0.9% more (`codegen::foldable`). (3) The hot kernels call
+`tile_flag_at` back to back (the player's `is_solid` probes, ~40 a slice):
+saving only the registers live across a call took the marshalling from
+~64 to ~17 moves a call, and keeping a value saved across a run of calls
+that does not read it halved it again. (4) Is a wash in instructions: the
+spilled constants' reloads became broadcasts one for one (the reload
+pass dropped repeated reloads; it now drops repeated broadcasts too), and
+preferring to evict a rematerializable value (tried, then dropped) gained
+nothing more.
+
+**Spills after (5).** Spill + reload are 21.6% of the remaining dynamic
+instructions (0.57G), almost all reloads of long-lived values far from
+their spill (>32 instructions: ~90% of the reloads; spilled and reloaded
+within 2 instructions: 2%). The kernel phase is ~2% of the wave's
+worker-time now (9% before), so a better allocator (interval splitting,
+farthest-next-use eviction) could win at most ~0.4% of the wave. Not done:
+the time is in emission (`emit` 70% of the wave's worker-time, 87 lane
+emissions per input row, 6% kept by the call's dedup cache).
+
+## Kernel region 8 px against 16 px (2026-10-10, for the storage regions)
+
+The storage redesign (`storage-v2`) keys 8x8-cell storage regions; the
+kernels key 16 px regions (`CELESTE_REGION`, default `16,6`). Measured with
+the kernels after (1) (and the step-4 binary for times), reference frame
+and room (1,0); numbers in BENCHMARK_DATA.md (2026-10-10).
+
+- **Outputs: identical.** Room (1,0) r0sxh f0-f62 and (6,2) 100% r0sxhf
+  f0-f50, `ckhash --edges` (and `--dropped`) equal at 8 and 16: the tighter
+  constant lattice changes what the kernels compute internally, not the
+  rows (here). The choice is cost only.
+- **Kernels and startup:** 3.2x the kernels (room (6,2) 978 against 306,
+  253 against 86 run on the frame; room (1,0) 326 against 102). Startup
+  (walk + trace + assemble, 32 workers): (6,2) ~15 s against ~6 s, process
+  +5.6 s; (1,0) +1.4 s. Paid at every process start (every resume, every
+  level of a search, every diagnostic). Rooms with many shapes and the split
+  frame (room (6,0): 914 traces at 16 px) would pay ~3x of a bigger number.
+- **Instructions per slice: -20% at 8** (after (1): 8,962 against 11,239;
+  before (1): 38,431 against 44,692). The spike fold removes about the same
+  share at both (estimate 66.4% at 8, 64.6% at 16; measured 14.09G -> 3.29G
+  at 8, 16.36G -> 4.12G at 16): the 16 px squares already separate the
+  spike rows from the rest of room (6,2).
+- **Slices: padding 0.0% -> 0.2-0.3%**, rows per call unchanged (a call is
+  a dispatch group, not a kernel).
+- **Kernel cycles:** the kernel phase 1.1 -> 0.8 worker-s on (6,2), 1.7-1.8
+  -> 1.6-1.7 on (1,0): about the instruction ratio, on what is now ~2% of
+  the wave.
+- **Wave: no measurable difference** ((6,2) 3201-3283 against 3147-3197 ms;
+  (1,0) waves summed 3611-3681 against 3620-3688 ms; the noise is larger
+  than the kernel phase's 0.3 worker-s / 16 workers).
+
+**Recommendation: keep the kernels at 16 px and make the storage regions
+16 px**, if the storage side's own measurements allow (its region size is
+what trades there: index size against scan width). Kernels at 8 buy nothing
+measurable in the wave now that the kernels are ~2% of it, and cost ~3x the
+kernels at every process start. If storage needs 8, kernels at 8 are safe
+(identical outputs) and cost only the startup; the default stays 16 until
+that is decided. Not changed.

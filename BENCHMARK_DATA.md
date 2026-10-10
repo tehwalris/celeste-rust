@@ -1,5 +1,57 @@
 > STALE in parts: dated sections, newest first, each measured on the code of its date (before 2026-08-31: the deleted pre-rebuild search; plans/ links may name merged or deleted docs, see plans/architecture.md "Where the old plans went") - re-measure before relying on a number.
 
+# The kernels after the instruction-mix simplifications, 2026-10-10 (release, 16 threads, branch `kernel-opt`)
+
+Reference frame: room (6,2) 100% (`CELESTE_HUNDRED=1 CELESTE_LOADING_JANK=2
+CELESTE_LEVEL_MINUS_ONE=94,5`), `r0sxhf`, f56 -> f57 of
+`/var/tmp/canon-h62-f56` (366,133 slices, 86 kernels run). Each step on top
+of the previous; outputs byte-identical to fg-2300 at every step
+(plans/kernel-opt-decisions.md). Instruction counts from
+`CELESTE_KERNEL_MIX` (exact: slices x static), the kernel phase from
+`CELESTE_PHASES` (worker-seconds, call-out callees included), waves from
+`tools/bench_step.sh`, binaries interleaved in rounds (load 2-4 unless
+noted; another agent's runs on the machine).
+
+| binary | dynamic insts | per slice | kernel phase (3 rounds) | wave ms (3 rounds) |
+|---|---|---|---|---|
+| fg-2300 (+ the mix diagnostic) | 16.36G | 44,692 | 5.1 / 7.1 / 5.3 s (9%) | 3202 / 4434 (load 15 at 5 min) / 3362 |
+| 1 spikes_at folded | 4.12G | 11,239 | 1.4 / 1.5 / 1.6 s (3%) | 2858 / 3051 / 3421 |
+| 2 decided planes folded | 3.72G | 10,161 | 1.5 / 1.4 / 1.5 s (3%) | 3280 / 2999 / 3116 |
+| 3 live saves, /8 %8 inline | 2.67G | 7,292 | 1.0 / 1.0 / 1.1 s (2%) | 3042 / 2993 / 3117 |
+| 4 constants rematerialized | 2.66G | 7,264 | 0.9 / 1.0 / 1.1 s (2%) | 2788 / 2951 / 3110 |
+
+The kernel phase falls ~5x (9% -> 2% of the wave's worker-time); the wave
+(~3.0-3.4 s, noise ~ +-0.2 s at this load) moves by about what the kernel
+phase gave back (~4 worker-s / 16 = 0.25 s). The wave is emission-bound:
+`emit` is ~70% of its worker-time.
+
+**A/B, fg-2300 against step 4**, interleaved, load 3.7-3.9: waves 3676 /
+3544 / 3437 ms (mean 3552) against 3118 / 3185 / 3041 ms (mean 3115):
+**-12%**; kernel phase 5.4-5.7 -> 1.0 worker-s.
+
+**Kernel cycles** (`perf record -F 8000` under `CELESTE_KERNEL_MIX`, samples
+inside the wave's kernel window: first to last sample in a kernel `.so`):
+fg-2300 46,937 samples (bodies 38,928 + call-out callees 8,009; 10.9% of
+the window's samples), step 1 14,899 (8,951 + 5,948; 3.3%), step 2 12,506
+(6,848 + 5,658; 3.2%). Steps 3 and 4 not profiled (perf's mmap failed while
+another agent profiled); their kernel phase is above. After step 1 the
+`tile_flag_at` callee (the player's `is_solid` probes, ~40 calls a slice)
+is about half the kernel time.
+
+**Region 8 px against 16 px** (`CELESTE_REGION`, step 4 binary,
+interleaved, 3 rounds, load 3.8-3.9; outputs identical at both - room (1,0)
+r0sxh f62 and (6,2) 100% f50 `ckhash --edges` equal):
+
+| | kernels (ran) | walk + trace + assemble | process | wave / waves | kernel phase |
+|---|---|---|---|---|---|
+| (6,2) f56->f57, 16 px | 306 (86) | 2.7 + 3.1 + 0.5 s | 9.8 s | 3283 / 3201 / 3213 ms | 1.1 s |
+| (6,2) f56->f57, 8 px | 978 (253) | 6.3 + 7.5 + 1.4 s | 15.4 s | 3147 / 3177 / 3197 ms | 0.8 s |
+| (1,0) f0-f62, 16 px | 102 | 0.6 + 0.75 + 0.17 s | 9.0-9.1 s | 3611-3681 ms (sum) | 1.7-1.8 s |
+| (1,0) f0-f62, 8 px | 326 | 2.2 + 1.7 + 0.5 s | 10.4 s | 3620-3688 ms (sum) | 1.6-1.7 s |
+
+Rows per call are the same (calls are per dispatch); slice padding 0.0% ->
+0.2-0.3%. Analysis and recommendation: plans/kernel-mix.md.
+
 # The edges inverted once, 2026-10-09 (release, 16 threads, branch `edge-inversion`)
 
 The forward keeps its raw edge records (64k-record chunks, `edges::write_chunk`)
