@@ -47,10 +47,10 @@ all.traced.kind.num 30122
 all.traced.kind.restrict 600
 all.traced.kind.sel 22909
 all.traced.nodes 204620
-approx.frame.edge_bytes 41772837
-approx.frame.edge_millibytes_per_edge 3271
+approx.frame.edge_bytes 38817304
+approx.frame.edge_millibytes_per_edge 3040
 calls.bodies 3255928
-calls.bodies_taken 1494917
+calls.bodies_taken 1195812
 calls.calls 261
 calls.lane_emits 14386437
 calls.lanes_missed 0
@@ -81,7 +81,7 @@ frame.edges 12766799
 frame.emissions 12772641
 frame.kept 553666
 frame.lanes_in 495272
-frame.lids 256071
+frame.lids 219469
 frame.requests 553666
 frame.units 261
 k.kernel_k52c4b05649e9451a_13.dyn_insts 999369

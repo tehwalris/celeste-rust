@@ -95,7 +95,7 @@ build() {
         env $ENV CELESTE_L1_TABLE="$ROOT/$DEP/l1-table.bin" CELESTE_EMIT_CAPTURE="$tmp" CELESTE_EMIT_CAPTURE_FRAME="$f" ./safe-run.sh -- "$B" bench-frame --level-dir "$ROOT/$DEP" --frame $((f - 1)) --edges --room "$ROOM" --level "$(level_of "$DEP")" > "$tmp/build.out" 2> "$tmp/build.log" \
             || { echo "[fixtures] $name: the capture FAILED (see $tmp/build.log)" >&2; exit 1; }
         # The captured wave is the tree fixture's frame check: the same lines.
-        if [[ -f $PINS/$DEP.frame ]] && ! diff -q "$PINS/$DEP.frame" "$tmp/build.out" > /dev/null; then
+        if [[ -z $pin && -f $PINS/$DEP.frame ]] && ! diff -q "$PINS/$DEP.frame" "$tmp/build.out" > /dev/null; then
             echo "[fixtures] $name: the captured wave's f/e lines differ from $PINS/$DEP.frame" >&2
             exit 1
         fi
