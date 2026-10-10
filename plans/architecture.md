@@ -31,24 +31,25 @@ kernels come from the **tracer** via one hand-off.
 ## The three interfaces - the only things that cross between parts
 
 1. **The frame step** (`frame::FrameStep`). A range of input lanes of one
-   block in; every output row out through a `ForwardSink`, each row already
-   carrying its KEY and its CELL (player position), already widened for the
-   level. Branching, widening and keying happen inside. Two impls: the
+   block in; every output row out through the storage's `UnitSink`
+   (`storage::unit`), each row already carrying its KEY and its CELL (player
+   position), already widened for the level. Branching, widening and keying happen inside. Two impls: the
    compiled `compiled::FrameEngine` and the reference `trace::refengine`
    (`RefEngine`: the tracer's interpreter over `RefDomain`, one lane and one
    fork path at a time; `trace::refbridge` turns a block's lane into its
    state and each leaf back into a one-row block, boxes and all, so its rows
    key like the kernels'). The loop never touches an interpreter state.
 2. **The block** (`Rt2` in `celeste-engine`, `frame::Block` = an `Rt2` with its
-   key column and its rows' ids). Columnar; key and cell are exposed, the
-   fields are opaque columns. Serialized whole (`search::checkpoint`).
+   key column and its rows' ids, `storage::StateId`). Columnar; key and cell
+   are exposed, the fields are opaque columns. Serialized whole
+   (`search::checkpoint`).
 3. **The kernel set** (`compiled::asm_kernel::Registry`). The tracer's whole
    output for one level: one assembled AVX-512 kernel per (shape, region),
    built at startup with gcc + dlopen. There is no checked-in kernel artifact.
 
-To the outer loop a state is OPAQUE: it touches a row's key (dedup, door,
-checkpoint, marks) and its cell (wave order, sharding, the pos graph, level
--1). The frame step is the only thing that opens a state.
+To the outer loop a state is OPAQUE: it touches a row's key (the visited
+set, checkpoint, marks) and its cell (regions, the pos graph, level -1). The
+frame step is the only thing that opens a state.
 
 ## Code layout
 
@@ -58,14 +59,18 @@ crates/celeste-names     FROZEN name tables (FIELD_NAMES order = canonical      
                          field order; append only)
 crates/celeste-engine    Rt2 block model, boundary/keys, lane primitives        deps: core, names
 .  (celeste-rust)        everything else                                         deps: all
-  src/frame.rs           Block, FrameStep, ForwardSink (queues, door, edge
-                         records with transfers), forward_frame,
-                         ForwardState (extend, resume), MarkFilter  ~2.7k lines
-  src/search/            checkpoint, door, edges (recorded graph + BFS +
-                         transfer tables), arc_edges (the transfer decode),
-                         arcs (remainder sets), arc_dp (THE SEARCH: load,
-                         backward, optimum, concrete search), pos_graph,
-                         ui_export
+  src/frame.rs           Block, FrameStep, ForwardState (start, resume,
+                         extend, raise), MarkFilter, the frame files
+  src/storage/           THE STORAGE (plans/storage-v2.md): visited (posmask
+                         region tables), unit (UnitSink: the kernels'
+                         emissions), wave (units, translation, the layer),
+                         edges (edge files, transfers, EdgeStore), marks
+                         (BFS marks, Resolver), meta, bench (the capture and
+                         `bench-storage`)
+  src/search/            checkpoint, edges (the BFS), arc_edges (the transfer
+                         decode), arcs (remainder sets), arc_dp (THE SEARCH:
+                         load, backward, optimum, concrete search), known,
+                         pos_graph, ui_export
   src/trace/             the AST tracer (Lua -> transpile::graph::Graph), the
                          constant-lattice walk (kernel.rs), widen.rs, verify.rs
                          (split pass), error.rs, level_minus_one.rs, the
@@ -234,10 +239,15 @@ range.
 
 **Keys.** The row key is folded per EMITTED row in the append step
 (`AsmBody::key_words`: `Σ cell_mix` over the key fields read off the packed
-output buffer), checked per row against `Rt2::boundary` by
+output buffer), checked per row against `Rt2::boundary_canonicalize` by
 `CELESTE_KERNEL_KEY_CHECK=1`. A number and its point interval key alike
 (`592c72f`). FIELD_NAMES' order feeds the shape hash and every key: a
-reordering is a different search.
+reordering is a different search. The key holds NO POSITION (2026-10-10,
+`29d8364`): the position object's (player, else `player_spawn`) `x`/`y`
+contribute only their part past the low end's whole pixel
+(`runtime2::pos_code`), which the cell holds; the room is in the key, so a
+state is still `(shape, key, cell)`, and states sharing everything but the
+position share a key - the storage's entries (below).
 
 **Where it still diverges / is open.** The re-trace per level (above). The
 platform tension: storing a platform's `x` as its whole path is what lets
@@ -259,150 +269,86 @@ STILL UNCHECKED: interval `Mul`/`Div` by a positive constant (its known
 source, the rem rungs' scale, is gone) can still wrap - an open item. Which
 results ran before the fix: plans/results.md.
 
-## The frame: waves (2026-09-13)
+## The forward frame and the storage (storage v2, 2026-10-10)
 
-One pass per frame, no owners, no budget, one barrier.
+One storage system (plans/storage-v2.md; it replaced the door, the queues,
+the unit row cache, the raw edge records and the inversion):
 
-1. **Units in cell order.** The frontier is the workers' pieces of the
-   previous frame, each sorted by (cell, key) and checkpointed in FLUSH order
-   (format v10, a run index of `(cell, start, len)` per file; v10 stores a
-   mixed column in 9 B a row and a boolean-like one in 1 B, against 16 B).
-   Units of
-   `unit_lanes()` lanes (1024 since 2026-09-18; `CELESTE_UNIT_LANES`, a
-   multiple of 64) are pulled by `threads()` workers (default one per physical
-   core, `CELESTE_THREADS`) in cell order across pieces: the wave. A unit is
-   also the kernel call's within-call dedup window (`ForwardSink::seen`): 16k
-   lanes deduped slightly more, but a few heavy units outlasted the rest
-   (room (3,0) f44: 2.23 s / 45% idle at 16k, 1.47 s / 9% at 1024, the same
-   kept set).
-2. **Queues.** Each worker's `ForwardSink` holds a fixed pool of small queues
-   (`POOL_QUEUES` 256 x `QUEUE_ROWS` 256) keyed by (shape, cell); every queue
-   of a shape has the shape's skeleton (the union of its outcome templates'
-   varying cells). Small queues won: 128-256 rows beat 4096 by 1.9x (the pool
-   stays cache-resident); the frame's whole transient is ~60-80 MB.
-3. **Flush** (when a queue fills or is evicted, by the worker holding it):
-   the level -1 filter, sort, `Door::admit` under the shard's lock
-   only, survivors gathered into the worker's piece, the win check, the
-   edge records. **A flush is idempotent** - the door is a set - so nothing
-   needs to know when a cell is "done"; eviction policy changes only the
-   flush count.
-4. **The door** (`search::door::Door`): per (shape, cell) a sorted `base`
-   (every earlier frame, read-only during the frame) plus a small sorted
-   per-frame `delta`, a bucket index on the key's top bits with software
-   prefetch, 16 B/entry plus the state's id. `end_frame` merges deltas once,
-   in parallel (~1.4 ns/entry). A flush must read `base` (~88% of emitted rows
-   are old) and `delta` (the same state twice in one frame would be two
-   frontier rows).
-5. **End of frame**: the door merges, the pieces are the next frontier, the
-   checkpoint is written, `edges/done.txt` names the frame (its raw edge
-   records are complete; they are inverted only by the backward).
+- **The visited set** (`storage::visited`): per (shape, storage REGION) a
+  table of ENTRIES - a position-free key and a mask over the region's cells.
+  A storage region is `CELESTE_STORAGE_REGION` (8 default, or 16) cells
+  square, aligned as the kernels' regions (`div_euclid`) and nested in one
+  (the kernels' px a multiple of it, else refused); `NO_CELL` is one more
+  region per shape. Room (6,2) 100% f57: 43.8M states in 2.19M entries,
+  0.10 GB (the door: 1.08 GB).
+- **Ids** (`storage::StateId`): (region, entry, cell in region), region =
+  shape index x slots + slot, so ids sort by shape and position. Entry
+  numbers are assigned by the translation in KEY order among a frame's new
+  entries: canonical when assigned, whatever the threads or the units. A
+  layer is stored in id order (checkpoint v12: id and cell columns); the
+  frame's metadata (`storage::meta`, `frames/fNNN/meta.bin`) lists the shapes
+  and entries (with keys) it created - with the files' ids, the visited set.
+- **The wave** (`storage::wave::run_wave`): the frontier cut into UNITS of
+  contiguous rows (1024-4096 lanes), pulled by `threads()` workers. Per
+  emission the unit's sink (`storage::unit::UnitSink`) drops level -1's
+  rows (noting their sources), keys the row, decodes its transfer, and
+  probes its TARGET TABLE keyed by (shape, region slot, key): a LID per
+  distinct target entry, looked up in the visited set once (read-only
+  during the wave) with the owner's mask. A cell the owner holds is an old
+  state: an edge only. Else a REQUEST: the first unit to request the state
+  this wave copies its row (`Claims`); the others only name it. The unit's
+  edges `(lid, cell, source, transfer)` are sorted by target and encoded at
+  its end and streamed into the worker's blocks file.
+- **The translation** (`wave::translate`): the requests grouped by target
+  region, one worker a region: sorted by (key, cell), each new key an entry
+  (key order), each new cell a NEW state; every lid gets its owner (others'
+  lids of claimed states are found after it, `resolve_lids`). The only
+  writer of the visited set.
+- **The layer** (`gather_layer`): the new states in id order gathered from
+  the units' row buffers into pieces (`PIECE_ROWS`), checkpointed with their
+  ids, cells, keys and wins; the frame's edge file (below); the metadata;
+  the drop notes; the pos graph; then `done.txt`.
 
-The result is a function of the frame, not of scheduling: the gates are
-identical at 1, 16 and 32 threads. Room (1,0) f0-f70: same speed as the
-two-phase frame it replaced, peak RSS 4.08 GB against 9.45 GB; room (0,0) to
-f90: 14.15 GB against 24.8 GB (44 GB under glibc - mimalloc is the global
-allocator, and `safe-run.sh` sets `MIMALLOC_PURGE_DELAY=0`). The wave is
-kernel-bound.
+The result is a function of the frame, not of scheduling: identical at 3
+and 32 threads (states and edge content, room (1,0) f0-f50), over a resume,
+and under `gates/raise.sh`. `rewrite bench-storage` replays one captured
+frame (`CELESTE_EMIT_CAPTURE`) through this code without the kernels, and
+reproduces the real tree's `ckhash` lines of that frame.
 
-### Invariants of the data flow (from plans/buckets.md, 2026-09-12)
-
-1. **The unit of storage is the unit of kernel invocation**: a bucket is
-   one shape's packed `Rt2`. Position is a column, not part of the key. (The
-   per-class split on freeze / moving key / pm1 cells was the generated
-   kernels' premise; dropping it took room (1,0) f0-f44 from 879 kernel calls
-   to 44 with every gate identical.)
-2. **Rows are routed on emission, never regrouped**: the append step puts a
-   row straight into its (shape, cell) queue. No regroup, no merge, no
-   per-block `boundary`.
-3. **Canonicalization is precomputed per outcome shape**: the accumulator
-   template IS the canonical structure.
-4. **Provenance is consumed at emission and never stored**: the source lane
-   is the slice bit being iterated; the pos-graph edge and the backward edge
-   record are written there.
-5. **Dedup happens once, at the door.**
-6. **Checkpoint per (frame, shape)** (pieces), rows by (cell, key) with a
-   cell index, raw fixed-width columns, mmapped: the backward reads a cell's
-   rows as a range. (One file per cell-uniform block was ~17k files a frame;
-   zstd-bincode layers cost the H=89 backward 35 s per iteration to decode.)
-
-The initial state (`RefEngine::initial` -> one bucket) and the
-reference oracle are the only places the interpreter meets the loop. A row's
-projection onto a level is on the columns (`Rt2::widen_to`); exporting
-buckets through `State` once reached 62.8 GB at H=55.
-
-## The recorded graph (2026-09-13; transfers 2026-10-05)
+## The recorded graph (storage v2, 2026-10-10)
 
 The forward records every edge once, with what the frame did to the
-remainder; every backward reads the records and re-runs no kernel
-(`search::edges`).
+remainder (its transfer); the backward reads the edge files and re-runs no
+kernel. An edge recorded at frame f leaves a state of layer f - 1.
 
-- **Ids.** `frame::pack_id(layer, seq, row)`: the checkpoint file and the
-  row in it. The door stores the id with the key, so a re-emission of an old
-  state resolves to its id; a resume rebuilds that from the files. A layer
-  is stored CANONICAL (`canon`, 2026-10-09): per shape by (region, cell,
-  key), pieces of at most 2^17 rows, so ids do not depend on the
-  scheduling and the frontier is in position order. During the wave a new
-  state carries its FLUSH id (worker piece, flush order); at the wave's end
-  `canon::Renumber` maps those to the canonical ones in the door
-  (`end_frame`) and, saved as `edges/raw/f{frame}/renumber.bin`, in the
-  targets of the frame's records into its own layer where the compaction
-  decodes them. Sources are the previous layer's, canonical already.
-- **Recording.** A queued row carries `(pred_base, pred_xfer, pred_mask)`: a
-  64-lane predecessor group, the TRANSFER of those lanes (the worker's
-  interned id of the (x, y) pair the kernel decoded, `ForwardSink::xfer_id`)
-  and the lanes; a re-emission ORs its bit in only under an equal transfer,
-  else it is an extra entry; after the flush the cache holds the door's id
-  so later re-emissions go through a direct-mapped `(target, base, transfer)
-  -> mask` merge. Records go to `edges/raw/f{frame}/`, one per lane
-  (layer-local: target, source, transfer), per worker and target layer, in
-  CHUNKS of 64k (`edges::write_chunk`: varint deltas of target and source
-  in the order recorded, the transfer behind a per-chunk predictor keyed
-  by the source; ~3.6 B a record against 16 for the plain record), each
-  worker's transfer table beside them. They STAY raw through the forward
-  (2026-10-09, branch `edge-inversion`): no compaction beside the waves.
-- **Runs.** The graph is INVERTED once, when it is first read
-  (`EdgeGraph::open` -> `edges::invert`: the search's arc phase, and every
-  diagnostic that reads edges): every (frame, layer) is one single-threaded
-  job (`edges::compact_frames`), largest first, on every hardware thread,
-  the layers in flight bounded by memory (`INVERT_MEM`). Per frame the
-  workers' tables merge into the frame's (`edges/xfer/f{frame}.bin`, sorted
-  by value: a function of the frame, not the scheduling); a job decodes its
-  layer's chunks twice (the frame's renumbering, `canon::Renumber`, applied
-  to targets in the frame's own layer): counts per target and the run's
-  tables, then a counting sort that scatters each edge as it is encoded
-  (dense source, transfer rank: 8 B) into its target's slot; and encodes
-  the layer in 256-edge blocks with an index:
-  `<level>/edges/l{layer}/f{frame}.bin` (run v5, 2026-10-07). Per edge a
-  varint head (a new target's delta, or the source's delta under the same
-  target), the source as a DENSE number (the source pieces laid end to end,
-  a table in the header) when the target is new, and the transfer's RANK in
-  the run (its transfers by descending use, a table in the header): ~4 B an
-  edge, against 8.8 B a v4 record (lanes per record: 1.006) - room (2,3)
-  gemskip f0-f137 8.27 -> 4.00 GB, room (1,0) f0-f44 433 -> 292 MB. A run is
-  read in place (mmap), index and tables included. `edges/done.txt` names
-  the last frame whose records are complete (set after its checkpoint); a
-  resume trusts frames up to it and discards the rest (at most one), raw
-  records of later frames included. A frame is inverted once its raw dir
-  is gone; an inversion killed midway resumes (a layer whose run is in
-  place is done - runs are renamed into place complete - and its leftover
-  raw files go). A raise inverts the tree first. Room (1,0) f0-f44: 408 MB of runs against
-  216 MB without transfers and 2.8 GB for the separate arc-record stream it
-  replaced (`d7c373a`).
-- **The BFS** (`edges::bfs`). Seeds: the win rows of EVERY layer <= H (a win
-  reached at H is filed under the layer that first reached the state). For
-  i = H-1 down to 1, each newly marked state's runs f = layer..=i+1 are looked
-  up; lookups parallel, inserts sequential in frontier order (the marks are a
-  function of the graph). Iteration i marks exactly the states that win by H
-  from frame i but not i+1 - with SOME remainder: i is the state's DEADLINE.
-- **Checks.** `rewrite arc-check` (every record has a transfer; sampled
-  transfers probed with the reference engine at the tree's level -
-  `RefEngine::step_at`, the row's unknowns forked as the kernels fork them -
-  inside and outside their guards: inside, some input reaches the target
-  with the predicted remainder and every one that reaches it lands where a
-  record of the pair taking the point predicts; outside, none reaches it.
-  `--fault action|guard` corrupts every transfer first, to see it fail). The kernel re-run backward that was the BFS's oracle
-  (`bench-backward --diff`, which found every graph bug of 2026-09) is gone
-  with the ladder (2026-10-05); the arc gate pins the BFS's marks.
+- **The edge file** (`storage::edges`): per frame `edges/f{frame}.bin`
+  (a raise adds `f{frame}.r{seq}.bin`), and per worker its blocks file
+  `f{frame}.w{n}.blk`. Per unit: its sources (ids), its BLOCK - its edges
+  lid by lid (a cell byte, varint source deltas, the transfer's rank in the
+  unit; ~3.7 B an edge with the tables, room (6,2) 100% f57) with per lid
+  its start - its lids' owners by lid and sorted by owner (the translation
+  table: the REVERSE WALK), its transfer ranks' global ids; per region the
+  units naming it. The transfers: ONE table for the tree,
+  `edges/xfer.bin`, content-canonical (each wave appends its new pairs in
+  value order).
+- **`EdgeStore`**: `preds_at(target, frame)` - the units naming the target's
+  region, each one's lid of its entry (a binary search of the owner
+  table), that lid's edges (decoded alone) into the target's cell: nothing
+  is inverted. `scan(frame)` and `units`/`unit`: every edge, unit by unit.
+- **The BFS** (`search::edges::bfs`): seeds the win rows of every layer <= H
+  with their layers. For i = H-1 down to 1, each newly marked state's
+  in-edges at frames layer..=i+1 (`preds_at`, in parallel; inserts in
+  frontier order); a predecessor's layer is its edge's frame - 1. Iteration i
+  marks exactly the states that win by H from frame i but not i+1 - with
+  SOME remainder: i is the state's DEADLINE. The marks are masks per entry
+  (`storage::marks::Marks`), ranked by prefix popcounts.
+- **The graph load** (`arc_dp::load`): the edges between marked nodes read
+  UNIT BY UNIT (sources ranked once a unit, a lid's region once), two
+  passes (degrees, then the adjacencies in place). Room (6,2) 100% h94:
+  BFS 2.2 s and load 1.0 s against 56.4 s (with the inversion) and 38.6 s.
+- **Checks.** `rewrite arc-check` (every edge has a transfer; sampled
+  transfers probed with the reference engine at the tree's level inside and
+  outside their guards); `ckhash --edges` (each frame's edges by content).
 
 ## The search (2026-10-05, branch `arc-only`)
 
@@ -432,20 +378,20 @@ the list (coarsest first; one level is the usual case):
    past 32 segments is replaced by W_t (a superset: the filter only
    loosens). The UI's `arc.marks.bin` are the same reached nodes.
 3. **The arc phase** (`arc_dp::solve`): the remainder-free BFS marks the
-   nodes that can win by H at all, with their deadlines; only the edges into
-   them, from them, are loaded (`preds_at`, the BFS's lookup), each with an
-   index into the merged transfer table; `arc_dp::backward` computes the
+   nodes that can win by H at all, with their deadlines; only the edges
+   between them are loaded (unit by unit, `arc_dp::load`), each with its
+   global transfer id; `arc_dp::backward` computes the
    winning sets `W_t`; `arc_dp::optimum` reads the optimum off them. That
    optimum is exact in the remainder and over-approximates the level's other
    widenings (and `rnd`): a LOWER BOUND, and no win REFUTES H.
    MEMORY (2026-10-07, `[mem]` lines at every phase boundary): a node is the
-   rank of its mark in the BFS's own bitmaps (`edges::MarkRanks`, no hash
-   map); the edges are read twice, counting then filling the two adjacencies
+   rank of its mark in the BFS's own masks (`storage::marks::MarkRanks`);
+   the edges are read twice, counting then filling the two adjacencies
    in place (12 B an edge, nothing held beside them); W is kept as SPANS
    (node, frames, set: 12 B per unchanged run) into an arena of the distinct
-   sets instead of a table per frame of `Arc`s; one pass over the frame
-   files yields the gate's fingerprints, the marks files and the concrete
-   search's sorted node keys (no hash maps). Room (2,3) gemskip h137, level
+   sets instead of a table per frame of `Arc`s; the storage metadata
+   (`storage::marks::Resolver`) gives the gate's fingerprints, the marks
+   files and the concrete search's sorted node keys. Room (2,3) gemskip h137, level
    0 (18.6M nodes, 373M edges, 18.5M spans over 2.9M distinct sets): arc
    phase peak 14.2 -> 8.1 GB anonymous, 20.2 -> 9.3 GB with the mapped runs;
    W 4.4 -> 0.9 GB; the graph's build 12.1 -> 5.4 GB. Level 1 (22.9M nodes,
@@ -483,39 +429,36 @@ tree is filtered alike at every frame (`--to H` under a tree filtered at
 H2 >= H just uses it, as before). A level-0 forward under level -1 NOTES the
 SOURCES of every dropped row: `dropped/f{t}.bin`, per source id (a row of
 layer t-1) the smallest horizon that admits one of its dropped successors
-(`CostToGo::admitted_from` = f + d; the kernels' within-call cache carries it
-for a re-emission, `RowCache::DROP_FLAG`). A search past the tree's H then
-RAISES it to the run's H' before extending: frame by frame from 1, the
-sources whose note is <= H' (their files' 64-row id groups, the other rows
-skipped) and the states the raise added one frame earlier run one wave under
-H', against the WHOLE tree's door. A new state joins the frame's layer (new
-pieces numbered after its own, `Layer::Raised`), an old one gets its edge; a
-re-expanded source's edges into queues the OLD filter admitted exist already
-and are not recorded again (a kernel call runs one block, so its sources are
-all the tree's or all the raise's). The new edges go into the frame's RAISED
-runs, `l{layer}/f{frame}.raised.bin` beside the runs, their new transfers
-appended to the frame's table (`edges::compact_raised`; a later raise reopens
-and merges them, so a frame has one per layer); `EdgeGraph` reads both. The
-notes of the frame are rewritten (the untouched sources keep theirs). (A
-first version reopened and recompacted each touched frame's whole runs:
-room (1,0) 97 -> 98 took 121 s against a fresh 264 s, most of it rewriting
-runs.) The result is the tree a fresh forward under
-H' makes: the same (key, cell) set per frame, the same edges, the same pos
-graph, the same notes - unless H' reaches a state SOONER than the tree did,
-which would renumber it: the flush refuses a door hit from a later layer
-(possible only where the table's d is not consistent along a real edge; it
-has not fired). Checked by `gates/raise.sh` (a tree raised H1 -> H2 -> ...
+(`CostToGo::admitted_from` = f + d, per frontier row: `wave::DropNotes`). A
+search past the tree's H then RAISES it to the run's H' before extending:
+frame by frame from 1, the sources whose note is <= H' and the states the
+raise added one frame earlier run one wave under H', against the WHOLE
+tree's visited set. A new state joins the frame's layer (new pieces numbered
+after its own, `Layer::Raised`; new entries numbered after every entry,
+`meta.r{seq}.bin`), an old one gets its edge; a re-expanded source's edges
+into cells the OLD filter admitted exist already and are not recorded again
+(a unit runs one block, so its sources are all the tree's or all the
+raise's). The new edges go into the frame's RAISED edge file
+`f{frame}.r{seq}.bin` beside its own; `EdgeStore` reads both. The notes of
+the frame are rewritten (the untouched sources keep theirs). The result is
+the tree a fresh forward under H' makes: the same (key, cell) set per frame,
+the same edges, the same pos graph, the same notes - unless H' reaches a
+state SOONER than the tree did, which would move it to an earlier layer: a
+hit on a state of a later layer is refused (`UnitSink::emit`, through every
+state's layer, `wave::StateLayers`, built for the raise; possible only where
+the table's d is not consistent along a real edge; it has not fired). Checked by `gates/raise.sh` (a tree raised H1 -> H2 -> ...
 against a fresh tree per horizon: `ckhash --edges`, the pos graph, the
 search's `[gate]` lines and answer): room (1,0) 55 -> 56 -> 58 and 60 -> 61
 -> 65; room (4,2) `r0sxhn,r0sxh --no-witness` 70 -> 71 -> 73 (level 1
 rebuilt each time) and with the concrete search 69 -> 70 -> 71 -> 72
 (REFUTED, REFUTED, the same 71-frame witness twice); a raise to OFF (no
 level -1) 48 -> 50; `arc-check` on the raised (1,0) tree, 0
-disagreements. MEASURED (release, 8 threads, room
-(1,0) `forward`, level -1 at 97 then 98): the raise 97 -> 98 took 29 s
-(22.6 s raising f1-f97: 6.3M sources re-expanded, 6.1M states added; the
-door's reload 6 s) and 4.8 GB peak, against 265 s and 6.0 GB for a fresh
-98 - and its tree is identical (`ckhash --edges`, pos graph). The notes
+disagreements; on storage v2 `gates/raise.sh 1,0 55 56 58` again.
+MEASURED (release, 8 threads, room (1,0) `forward`, level -1 at 97 then
+98, before storage v2): the raise 97 -> 98 took 29 s (22.6 s raising
+f1-f97: 6.3M sources re-expanded, 6.1M states added; the door's reload
+6 s) and 4.8 GB peak, against 265 s and 6.0 GB for a fresh 98 - and its
+tree is identical (`ckhash --edges`, pos graph). The notes
 cost the forward nothing measurable (fresh 98: 265 s, the build before
 them 272 s) and 82 MB on a 29 GB tree. Refused, loudly: a trimmed tree
 (`CELESTE_TRIM_ROWS`: the sources' values are gone), the orb room (its
@@ -526,7 +469,7 @@ interrupted (`raising.txt`: half raised, delete it). A FINER level's tree
 kept only for the same marks (with deadlines), horizon and level -1
 (`filtered_for.txt`), else built again - it is the cheap one.
 `CELESTE_TRIM_ROWS=1` (2026-10-07) trims every frame's checkpoint files to
-keys, cells and wins once a later frame's runs are complete
+keys, ids, cells and wins once a later frame is complete
 (`checkpoint::trim`): the search, a resume and `export-ui` read nothing
 else of an old frame, and the rows' values are most of a tree's frames
 (room (2,3) gemskip h137, level 0: 3.03 -> 0.78 GB; the tree 7.0 -> 4.8
@@ -737,13 +680,13 @@ and the concrete witness; it replaced the ladder's marks gate on
 recording `arc-check`. A kernels-against-interpreter check: `rewrite
 ref-check` (row by row; the kernels over-approximate where the reference
 splits an interval, so ckhash equality with the reference engine is no
-test). After a change to the forward's filters, the notes or the runs:
+test). After a change to the forward's filters, the notes or the edge files:
 `gates/raise.sh` (a raised tree against fresh ones, "Raising the horizon").
 
 **A known solution against the pruning** (`search::known`, 2026-10-08).
 Every pruning step of the search - level -1, the objects ladder's filter,
 the remainder-free BFS, the winning sets the concrete search looks states up
-in, and under them the kernels' successors, the door and the split frame's
+in, and under them the kernels' successors, the visited set and the split frame's
 mid-frame steps - removes real winners silently if it is wrong: the result
 is a wrong optimum or a false tie, never a fake improvement (witnesses are
 replayed), so nothing else notices. Room (6,1) nodiag `r0sxhn,r0sxh` REFUTED

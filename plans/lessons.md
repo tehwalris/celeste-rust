@@ -93,6 +93,19 @@ room (0,0) f90 24.8 -> 14.2 GB. Before batching, room (0,0) died at f88 with
 10.5 GB of raw rows in the slots; glibc retained ~23 GB more than mimalloc
 (44 vs 24.8 GB at f90) - mimalloc is the global allocator since.
 
+**The door, the queues and the inverted runs** (2026-09-13 .. 2026-10-10;
+replaced by storage v2, plans/storage-v2.md). The waves frame's storage:
+per worker a pool of (shape, cell) queues behind a per-unit row cache,
+flushed into a door of sorted per-(shape, cell) shards (24 B a state and
+its id), ids `(layer, piece, row)` renumbered at the wave's end (`canon`),
+raw edge records per worker inverted into per-(layer, frame) runs once by
+the backward. It worked; what it cost on room (6,2) 100% h94 (fg-2300,
+shared machine): the inversion 54 s, the BFS and the graph load another
+40 s, peak 27.2 GB (the door 1.1 GB at f57 and the runs mapped), a search
+312 s; storage v2 (posmask entries, region ids, source-side blocks with
+their translation tables, no inversion): 212 s, peak 8.9 GB, the same
+answer. The research behind it: branch `emit-capture`, bench/dedup/DESIGNS.md.
+
 **Other frame shapes rejected on paper** (plans of 2026-09-13): lockstep per
 input cell (150-lane kernel calls per worker, the dedup window collapses, raw
 rows 2x), streaming owners (hides <= 10% of a frame), two-pass emit-keys-then-

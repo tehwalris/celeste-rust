@@ -428,8 +428,10 @@ pub struct UnitSink<'a> {
     /// The end's counting sort: per lid its edges' start, and the sorted edges.
     sort_at: Vec<u32>,
     sorted: Vec<u64>,
-    /// The end's transfer ranks: per worker id its count, then its rank.
+    /// The end's transfer ranks: per worker id its count, then its rank;
+    /// the last unit's distinct transfers (a capacity).
     xfer_use: Vec<u32>,
+    last_used: usize,
     requests: Vec<Request>,
     bufs: Vec<RowBuf>,
     /// Per (lid, cell) the coarser level's verdict (`MarkFilter`), once a unit.
@@ -502,6 +504,7 @@ impl<'a> UnitSink<'a> {
             sort_at: Vec::new(),
             sorted: Vec::new(),
             xfer_use: Vec::new(),
+            last_used: 0,
             requests: Vec::new(),
             bufs: Vec::new(),
             verdicts: Default::default(),
@@ -841,76 +844,73 @@ impl<'a> UnitSink<'a> {
             crate::compiled::asm_kernel::key_check(b);
         }
         self.check.iter_mut().for_each(RowBuf::clear);
-        // The unit's transfers by use (common ones code in a byte): each
-        // edge's transfer field becomes its rank.
+        // One pass: per (lid, cell) its edges' count, per transfer its use.
+        let cells = (self.geo.side * self.geo.side) as usize;
+        let n = self.lids.len();
         if self.xfer_use.len() < self.xfer_tab.len() {
             self.xfer_use.resize(self.xfer_tab.len(), 0);
         }
-        let mut used: Vec<u32> = Vec::new();
+        self.sort_at.clear();
+        self.sort_at.resize(n * cells + 1, 0);
+        let mut used: Vec<u32> = Vec::with_capacity(self.last_used);
         for &e in &self.edges {
-            let x = unpack_edge(e).3 as usize;
-            if self.xfer_use[x] == 0 {
-                used.push(x as u32);
+            let (lid, local, _, x) = unpack_edge(e);
+            self.sort_at[lid as usize * cells + local as usize + 1] += 1;
+            if self.xfer_use[x as usize] == 0 {
+                used.push(x);
             }
-            self.xfer_use[x] += 1;
+            self.xfer_use[x as usize] += 1;
         }
+        // The unit's transfers by use (common ones code in a byte): each
+        // edge's transfer field becomes its rank.
         used.sort_unstable_by_key(|&x| (std::cmp::Reverse(self.xfer_use[x as usize]), x));
         for (r, &x) in used.iter().enumerate() {
             self.xfer_use[x as usize] = r as u32;
         }
-        let xmask = (1u64 << XFER_BITS) - 1;
-        for e in self.edges.iter_mut() {
-            *e = *e & !xmask | self.xfer_use[(*e & xmask) as usize] as u64;
+        for k in 0..n * cells {
+            self.sort_at[k + 1] += self.sort_at[k];
+        }
+        // By target (a counting sort on (lid, cell)), the rank in place of
+        // the transfer; each target's few edges sorted (source, transfer),
+        // duplicates dropped.
+        self.sorted.clear();
+        self.sorted.resize(self.edges.len(), 0);
+        {
+            let xmask = (1u64 << XFER_BITS) - 1;
+            let mut cur = self.sort_at.clone();
+            for &e in &self.edges {
+                let (lid, local, _, x) = unpack_edge(e);
+                let k = lid as usize * cells + local as usize;
+                self.sorted[cur[k] as usize] = e & !xmask | self.xfer_use[x as usize] as u64;
+                cur[k] += 1;
+            }
         }
         for &x in &used {
             self.xfer_use[x as usize] = 0;
         }
-        // By target: a counting sort on the lid (dense in the unit), then
-        // each lid's few edges sorted (cell, source, transfer); duplicates go.
-        let n = self.lids.len();
-        self.sort_at.clear();
-        self.sort_at.resize(n + 1, 0);
-        for &e in &self.edges {
-            self.sort_at[unpack_edge(e).0 as usize + 1] += 1;
-        }
-        for l in 0..n {
-            self.sort_at[l + 1] += self.sort_at[l];
-        }
-        self.sorted.clear();
-        self.sorted.resize(self.edges.len(), 0);
-        {
-            let mut cur = self.sort_at.clone();
-            for &e in &self.edges {
-                let l = unpack_edge(e).0 as usize;
-                self.sorted[cur[l] as usize] = e;
-                cur[l] += 1;
-            }
-        }
-        for l in 0..n {
-            let g = &mut self.sorted[self.sort_at[l] as usize..self.sort_at[l + 1] as usize];
-            if g.len() > 1 {
-                g.sort_unstable();
+        self.last_used = used.len();
+        for k in 0..n * cells {
+            let (a, b) = (self.sort_at[k] as usize, self.sort_at[k + 1] as usize);
+            if b - a > 1 {
+                self.sorted[a..b].sort_unstable();
             }
         }
         self.sorted.dedup();
-        let (mut block, starts) = super::edges::encode_block(&self.sorted, self.lids.len());
+        let (block, starts) = super::edges::encode_block(&self.sorted, n);
         let block_len = block.len() as u64;
-        let block_at = match &mut self.blocks {
-            Some(w) => {
-                let at = w.append(&block)?;
-                block = Vec::new();
-                Some(at)
-            }
-            None => None,
+        let (block_at, block) = match &mut self.blocks {
+            Some(w) => (Some(w.append(&block)?), Vec::new()),
+            None => (None, block),
         };
-        self.n_requests += self.requests.len() as u64;
+        let n_requests = self.requests.len();
+        self.n_requests += n_requests as u64;
         self.n_lids += self.lids.len() as u64;
         self.outs.push(UnitOut {
             worker: self.worker,
             sources: std::mem::take(&mut self.sources),
-            lids: std::mem::take(&mut self.lids),
+            lids: std::mem::replace(&mut self.lids, Vec::with_capacity(n)),
             owners: self.lid_owners.drain(..).map(|o| std::sync::atomic::AtomicU64::new(if o == PENDING { NO_OWNER } else { o })).collect(),
-            requests: std::mem::take(&mut self.requests),
+            requests: std::mem::replace(&mut self.requests, Vec::with_capacity(n_requests)),
             pending: std::mem::take(&mut self.pending),
             bufs: std::mem::take(&mut self.bufs),
             block_at,

@@ -227,3 +227,47 @@ included).
 - **Raise**: a per-state layer index (2 B a state) only while raising.
 - **Collisions** are undetectable in general (as today); the detectable
   ones are fatal (above).
+
+## As built (2026-10-10, branch `storage-v2`)
+
+Where the code differs from the design above, and why:
+
+- **Units are runs of frontier rows**, not source regions: the frontier is
+  in id order (shape, then position), so a unit of 1024-4096 rows is a few
+  neighbouring regions, and a heavy region is simply several units. No unit
+  writes the visited set (it is read-only during the wave), so there is no
+  split by key hash and no lock-free table: every insert is the
+  translation's, one worker per target region.
+- **Lids are wrapped**: a lid is (target shape, target region slot, key),
+  its cells in the OWNER's coordinates; an old state's owner is found when
+  the lid is made, a new one's by the translation. **Claims**
+  (`unit::Claims`): the first unit to request a new state copies its row;
+  the others' lids are resolved after the translation (`resolve_lids`).
+  Room (6,2) 100% f57: 12.7M requests -> exactly the 6.7M new states.
+- **Halo, not built.** On the f57 capture the units name 3.80M lids
+  (unit, shape, slot, key) against 1.68M distinct (unit, shape, key): a halo
+  (one name per key over a window) would make 2.1M fewer lids. A lid costs
+  one visited-set lookup when made (~0.1-0.2 us), so the halo's saving is
+  bounded by ~0.3-0.4 CPU-s, ~20-30 ms of a 0.86 s units phase at 16
+  threads (3%), against a lid that spans up to four owner regions (an owner
+  per cell quadrant). Every emission probes one table either way. Kept
+  wrapped (Philippe's preference).
+- **Blocks are lid by lid** with per-lid starts (a reverse probe decodes
+  its lid only) and per-unit transfer ranks; streamed to per-worker blocks
+  files during the wave. 3.68 B an edge with every table (f57), fg-2300's
+  runs ~3.4 B.
+- **The backward**: the BFS walks back through the owner tables
+  (`EdgeStore::preds_at`); the graph load streams the blocks unit by unit -
+  per SOURCE unit, the pull order - and keeps only edges between marked
+  nodes.
+- **`bench-storage --phase units|translate|all`** (not dedup|edges): units
+  (sinks, edges, blocks), then the translation and the layer, then the edge
+  file. Its `f`/`e` lines are `ckhash`'s, comparable with the real tree.
+
+Verified (the commits say which): position-free keys (sets identical to
+fg-2300 by rekeying its trees); room (1,0) f0-f62 and (6,2) 100% f0-f57 kept
+counts, ckhash and pos graphs identical; the three pinned gates; KEY_CHECK;
+arc-check at r0sx and r0sxhn; 3 vs 32 threads and a resume identical
+(states and edge content); `gates/raise.sh`; the ignored tests; end to end
+room (1,0) `--ceiling 99`, (6,2) 100% `r0sxhf,r0sxh --ceiling 94` and (4,2)
+`r0sxhn,r0sxh --ceiling 71`: the same optima, witnesses and `[gate]` counts.
