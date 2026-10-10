@@ -326,15 +326,14 @@ kernel. An edge recorded at frame f leaves a state of layer f - 1.
   `f{frame}.w{n}.blk`. Per unit: its sources (ids), its BLOCK - its edges
   lid by lid (a cell byte, varint source deltas, the transfer's rank in the
   unit; ~3.7 B an edge with the tables, room (6,2) 100% f57) with per lid
-  its start - its lids' owners by lid and sorted by owner (the translation
-  table: the REVERSE WALK), its transfer ranks' global ids; per region the
-  units naming it. The transfers: ONE table for the tree,
+  its start - its lids' owners by lid (the translation table), its transfer
+  ranks' global ids; and per file the OWNER INDEX, `(region, entry, unit,
+  lid)` sorted: the translation tables inverted, the REVERSE WALK. The transfers: ONE table for the tree,
   `edges/xfer.bin`, content-canonical (each wave appends its new pairs in
   value order).
-- **`EdgeStore`**: `preds_at(target, frame)` - the units naming the target's
-  region, each one's lid of its entry (a binary search of the owner
-  table), that lid's edges (decoded alone) into the target's cell: nothing
-  is inverted. `scan(frame)` and `units`/`unit`: every edge, unit by unit.
+- **`EdgeStore`**: `preds_at(target, frame)` - the owner index's entries of
+  the target's (region, entry) (a binary search), each a (unit, lid) whose
+  edges are decoded alone, into the target's cell: nothing is inverted. `scan(frame)` and `units`/`unit`: every edge, unit by unit.
 - **The BFS** (`search::edges::bfs`): seeds the win rows of every layer <= H
   with their layers. For i = H-1 down to 1, each newly marked state's
   in-edges at frames layer..=i+1 (`preds_at`, in parallel; inserts in

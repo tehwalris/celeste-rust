@@ -141,12 +141,6 @@ pub fn region_of(geo: &Geometry, shape_idx: u32, slot: u32) -> u32 {
     r as u32
 }
 
-/// An id's shape index and slot.
-#[inline]
-pub fn region_parts(geo: &Geometry, region: u32) -> (u32, u32) {
-    (region / geo.slots, region % geo.slots)
-}
-
 /// An id's cell.
 #[inline]
 pub fn id_cell(geo: &Geometry, id: StateId) -> u32 {

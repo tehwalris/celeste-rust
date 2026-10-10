@@ -174,7 +174,7 @@ impl XferTable {
 }
 
 const MAGIC: &[u8; 4] = b"CSE1";
-const VERSION: u32 = 2;
+const VERSION: u32 = 3;
 
 /// The blocks file a wave's worker streams its units' blocks into, beside
 /// the frame's index file `index` (`f{frame}.bin` -> `f{frame}.w{worker}.blk`).
@@ -230,9 +230,6 @@ struct UnitHead {
     /// Per lid its owner `(region, entry)` (u32 each; `unit::NONE`: unused).
     lids: u64,
     n_lids: u32,
-    /// `(region, entry, lid)` (u32 each) sorted: the owners named.
-    owners: u64,
-    n_owners: u32,
     /// Per transfer rank (the edges' field) its global id, u32 each.
     xfers: u64,
     n_xfers: u32,
@@ -242,8 +239,10 @@ struct UnitHead {
 struct FileHead {
     frame: u32,
     units: Vec<UnitHead>,
-    /// `(region, unit)`: the units naming an entry of the region, sorted.
-    region_units: Vec<(u32, u32)>,
+    /// The OWNER INDEX: `(region, entry, unit, lid)` (u32 each) per lid with
+    /// an owner, sorted - the translation tables inverted, the reverse walk.
+    owner_index: u64,
+    n_owner_index: u64,
 }
 
 /// The edge file of frame `frame` (`raised`: a raise's, by its first seq).
@@ -260,9 +259,8 @@ struct UnitBytes {
     xfers: Vec<u8>,
     starts: Vec<u8>,
     lids: Vec<u8>,
-    owners: Vec<u8>,
-    n_owners: u32,
-    regions: Vec<u32>,
+    /// `(region, entry, lid)` per lid with an owner, sorted.
+    owned: Vec<(u32, u32, u32)>,
 }
 
 fn le32(v: &mut Vec<u8>, x: u32) {
@@ -270,8 +268,8 @@ fn le32(v: &mut Vec<u8>, x: u32) {
 }
 
 /// Unit `u`'s sections: its sources, transfers (global ids, through its
-/// worker's `remap`), index, lid owners by lid and sorted by owner, the
-/// regions it names.
+/// worker's `remap`), per-lid starts, lid owners by lid, and the owners
+/// it names (sorted, for the owner index).
 fn unit_bytes(u: &UnitOut, remap: &[u32], frame: u32) -> Result<UnitBytes> {
     let mut sources = Vec::with_capacity(8 * u.sources.len());
     for s in &u.sources {
@@ -300,17 +298,7 @@ fn unit_bytes(u: &UnitOut, remap: &[u32], frame: u32) -> Result<UnitBytes> {
     }
     owned.sort_unstable();
     ensure!(owned.windows(2).all(|w| (w[0].0, w[0].1) != (w[1].0, w[1].1)), "frame {frame}: a unit names one entry by two lids");
-    let mut owners = Vec::with_capacity(12 * owned.len());
-    let mut regions: Vec<u32> = Vec::new();
-    for &(r, e, l) in &owned {
-        le32(&mut owners, r);
-        le32(&mut owners, e);
-        le32(&mut owners, l);
-        if regions.last() != Some(&r) {
-            regions.push(r);
-        }
-    }
-    Ok(UnitBytes { sources, xfers, starts, lids, owners, n_owners: owned.len() as u32, regions })
+    Ok(UnitBytes { sources, xfers, starts, lids, owned })
 }
 
 /// Write frame `frame`'s edge file from its units (owners resolved) and
@@ -322,14 +310,13 @@ pub fn write_file(path: &Path, frame: u32, outs: &[UnitOut], remaps: Vec<Vec<u32
     let bytes: Vec<UnitBytes> = super::wave::par_map(outs, threads, |u| unit_bytes(u, &remaps[u.worker as usize], frame)).into_iter().collect::<Result<_>>()?;
     // The data region's layout: per unit its sections, in unit order.
     let mut units = Vec::with_capacity(outs.len());
-    let mut region_units: Vec<(u32, u32)> = Vec::new();
     let mut at = 0u64;
     let mut place = |n: usize| -> u64 {
         let o = at;
         at += n as u64;
         o
     };
-    for (ui, (u, b)) in outs.iter().zip(&bytes).enumerate() {
+    for (u, b) in outs.iter().zip(&bytes) {
         units.push(UnitHead {
             worker: u.worker,
             sources: place(b.sources.len()),
@@ -344,15 +331,16 @@ pub fn write_file(path: &Path, frame: u32, outs: &[UnitOut], remaps: Vec<Vec<u32
             starts: place(b.starts.len()),
             lids: place(b.lids.len()),
             n_lids: u.lids.len() as u32,
-            owners: place(b.owners.len()),
-            n_owners: b.n_owners,
             xfers: place(b.xfers.len()),
             n_xfers: u.xfers.len() as u32,
         });
-        region_units.extend(b.regions.iter().map(|&r| (r, ui as u32)));
     }
-    region_units.sort_unstable();
-    let head = bincode::serialize(&FileHead { frame, units, region_units }).context("serializing an edge file header")?;
+    // The owner index: the units' sorted owners merged, a region range a
+    // thread (the ranges cut at the units' region quantiles).
+    let index = owner_index(&bytes, threads);
+    let n_owner_index = (index.len() / 16) as u64;
+    let owner_index_at = place(index.len());
+    let head = bincode::serialize(&FileHead { frame, units, owner_index: owner_index_at, n_owner_index }).context("serializing an edge file header")?;
     let base = 16 + head.len() as u64;
     std::fs::create_dir_all(path.parent().expect("an edges dir"))?;
     let tmp = path.with_extension("tmp");
@@ -363,6 +351,7 @@ pub fn write_file(path: &Path, frame: u32, outs: &[UnitOut], remaps: Vec<Vec<u32
     prefix.extend_from_slice(&(head.len() as u64).to_le_bytes());
     prefix.extend_from_slice(&head);
     file.write_all_at(&prefix, 0)?;
+    file.write_all_at(&index, base + owner_index_at)?;
     let head: FileHead = bincode::deserialize(&head).context("the header just written")?;
     let order: Vec<usize> = (0..outs.len()).collect();
     super::wave::par_map(&order, threads, |&k| -> Result<()> {
@@ -373,7 +362,6 @@ pub fn write_file(path: &Path, frame: u32, outs: &[UnitOut], remaps: Vec<Vec<u32
         }
         file.write_all_at(&b.starts, base + h.starts)?;
         file.write_all_at(&b.lids, base + h.lids)?;
-        file.write_all_at(&b.owners, base + h.owners)?;
         file.write_all_at(&b.xfers, base + h.xfers)?;
         Ok(())
     })
@@ -382,6 +370,46 @@ pub fn write_file(path: &Path, frame: u32, outs: &[UnitOut], remaps: Vec<Vec<u32
     drop(file);
     std::fs::rename(&tmp, path)?;
     Ok(base + at)
+}
+
+/// The owner index's bytes: every unit's `(region, entry, lid)` with the
+/// unit, sorted by `(region, entry, unit)`, 16 B each. Built in parallel:
+/// the region space cut into ranges, each gathered from every unit's sorted
+/// owners and sorted.
+fn owner_index(bytes: &[UnitBytes], threads: usize) -> Vec<u8> {
+    let total: usize = bytes.iter().map(|b| b.owned.len()).sum();
+    if total == 0 {
+        return Vec::new();
+    }
+    // Cuts: regions at evenly spaced positions of a sample.
+    let mut sample: Vec<u32> = bytes.iter().flat_map(|b| b.owned.iter().step_by(64).map(|o| o.0)).collect();
+    sample.sort_unstable();
+    let parts = (threads * 4).max(1);
+    let mut cuts: Vec<u32> = (1..parts).map(|k| sample[k * sample.len() / parts]).collect();
+    cuts.dedup();
+    let mut bounds = vec![0u32];
+    bounds.extend(cuts);
+    bounds.push(u32::MAX);
+    bounds.dedup();
+    let ranges: Vec<(u32, u32)> = bounds.windows(2).map(|w| (w[0], w[1])).collect();
+    let pieces: Vec<Vec<u8>> = super::wave::par_map(&ranges, threads, |&(lo, hi)| {
+        let mut v: Vec<(u32, u32, u32, u32)> = Vec::new();
+        for (ui, b) in bytes.iter().enumerate() {
+            let a = b.owned.partition_point(|o| o.0 < lo);
+            let z = b.owned.partition_point(|o| o.0 < hi);
+            v.extend(b.owned[a..z].iter().map(|&(r, e, l)| (r, e, ui as u32, l)));
+        }
+        v.sort_unstable();
+        let mut out = Vec::with_capacity(16 * v.len());
+        for (r, e, u, l) in v {
+            le32(&mut out, r);
+            le32(&mut out, e);
+            le32(&mut out, u);
+            le32(&mut out, l);
+        }
+        out
+    });
+    pieces.concat()
 }
 
 /// One edge file, mapped, with its workers' blocks files.
@@ -452,27 +480,26 @@ impl EdgeFile {
         &block[a as usize..b as usize]
     }
 
-    /// Unit `u`'s lid naming `(region, entry)`.
-    fn lid_of(&self, u: &UnitHead, region: u32, entry: u32) -> Option<u32> {
-        let (mut lo, mut hi) = (0usize, u.n_owners as usize);
-        while lo < hi {
-            let mid = (lo + hi) / 2;
-            let k = (self.u32_at(u.owners, 3 * mid), self.u32_at(u.owners, 3 * mid + 1));
-            match k.cmp(&(region, entry)) {
-                std::cmp::Ordering::Less => lo = mid + 1,
-                std::cmp::Ordering::Greater => hi = mid,
-                std::cmp::Ordering::Equal => return Some(self.u32_at(u.owners, 3 * mid + 2)),
-            }
-        }
-        None
+    /// The owner index's entry `k`: `(region, entry, unit, lid)`.
+    #[inline]
+    fn owner_at(&self, k: usize) -> (u32, u32, u32, u32) {
+        let o = self.head.owner_index;
+        (self.u32_at(o, 4 * k), self.u32_at(o, 4 * k + 1), self.u32_at(o, 4 * k + 2), self.u32_at(o, 4 * k + 3))
     }
 
-    /// The units naming an entry of `region`.
-    fn units_of(&self, region: u32) -> &[(u32, u32)] {
-        let ru = &self.head.region_units;
-        let lo = ru.partition_point(|e| e.0 < region);
-        let hi = ru.partition_point(|e| e.0 <= region);
-        &ru[lo..hi]
+    /// The owner index's entries naming `(region, entry)`: their first.
+    fn owners_of(&self, region: u32, entry: u32) -> usize {
+        let (mut lo, mut hi) = (0usize, self.head.n_owner_index as usize);
+        while lo < hi {
+            let mid = (lo + hi) / 2;
+            let (r, e, ..) = self.owner_at(mid);
+            if (r, e) < (region, entry) {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        lo
     }
 }
 
@@ -543,9 +570,14 @@ impl EdgeStore {
     pub fn preds_at(&self, target: StateId, frame: u32, out: &mut Vec<InEdge>) {
         let (region, entry, local) = (id_region(target), id_entry(target), id_local(target));
         for file in self.frames.get(frame as usize).into_iter().flatten() {
-            for &(_, ui) in file.units_of(region) {
+            let mut k = file.owners_of(region, entry);
+            while k < file.head.n_owner_index as usize {
+                let (r, e, ui, lid) = file.owner_at(k);
+                if (r, e) != (region, entry) {
+                    break;
+                }
+                k += 1;
                 let u = &file.head.units[ui as usize];
-                let Some(lid) = file.lid_of(u, region, entry) else { continue };
                 let block = file.block(u);
                 decode_lid(file.lid_edges(u, block, lid), |c, s, x| {
                     if c == local {
@@ -624,10 +656,6 @@ impl UnitView<'_> {
     pub fn lid_owner(&self, l: u32) -> Option<(u32, u32)> {
         let e = self.file.u32_at(self.u.lids, 2 * l as usize + 1);
         (e != super::unit::NONE).then(|| (self.file.u32_at(self.u.lids, 2 * l as usize), e))
-    }
-
-    pub fn n_edges(&self) -> u64 {
-        self.u.edges
     }
 
     /// Every edge, by target: `f(lid, cell, source, global transfer)`.

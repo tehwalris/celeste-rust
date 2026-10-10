@@ -256,8 +256,9 @@ Where the code differs from the design above, and why:
   its lid only) and per-unit transfer ranks; streamed to per-worker blocks
   files during the wave. 3.68 B an edge with every table (f57), fg-2300's
   runs ~3.4 B.
-- **The backward**: the BFS walks back through the owner tables
-  (`EdgeStore::preds_at`); the graph load streams the blocks unit by unit -
+- **The backward**: the BFS walks back through the frame's owner index
+  (the units' translation tables inverted at the frame's end, 16 B a lid:
+  `EdgeStore::preds_at`); the graph load streams the blocks unit by unit -
   per SOURCE unit, the pull order - and keeps only edges between marked
   nodes.
 - **Storage regions of 16** (`CELESTE_STORAGE_REGION=16`) are exact too

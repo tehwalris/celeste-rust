@@ -1,5 +1,56 @@
 > STALE in parts: dated sections, newest first, each measured on the code of its date (before 2026-08-31: the deleted pre-rebuild search; plans/ links may name merged or deleted docs, see plans/architecture.md "Where the old plans went") - re-measure before relying on a number.
 
+# Storage v2, 2026-10-10 (release, 16 threads, branch `storage-v2`)
+
+Posmask regions, region ids, source-side edge files; no door, no inversion
+(plans/storage-v2.md). Against fg-2300 cc83334 (`/var/tmp/sv2-base`), a
+shared machine (load 6-24 throughout, other agents' runs): A and B
+interleaved, each pair back to back. Every run below has the same answer,
+witness and `[gate]` counts as its pair.
+
+**End to end** (`rewrite search`, the tree built from nothing):
+
+| case | run | wall | user CPU | peak | tree |
+|---|---|---|---|---|---|
+| room (1,0) `--ceiling 99` (r0sx) | fg-2300 | 196.1 / 186.9 s | 2721 / 2765 s | 21.1 / 21.5 GB | 46 GB |
+| | storage v2 (601a29d..bfca54e) | 128.4 / 130.6 s | 1535 / 1572 s | 13.5 / 13.5 GB | 52 GB |
+| room (6,2) 100% 2300m `r0sxhf,r0sxh --ceiling 94` (J 2, L-1 94,5, `--prefer`) | fg-2300 | 301.4 / 325.9 s | 4252 / 4336 s | 28.0 / 28.2 GB | 66 GB |
+| | storage v2 | 221.5* / 184.1 s | 3065* / 2347 s | 8.85 / 8.85 GB | 70 GB |
+
+\* the level -1 table rebuilt (34.9 s): the new binary missed the table cache.
+
+Where the time went, room (6,2) (fg-2300 against storage v2, rep 2): the
+level-0 frames 230.6 against ~172 s (the frames' own totals; `[fwd]` lines);
+the inversion 51.1 s against none; the BFS 53.7 s (with the inversion)
+against 2.2 s; the graph load 34.4 against 1.1 s. Level 1 (the objects
+ladder's filtered forward) 4.8 against 8.4 s - its coarser-marks filter was
+projected a row at a time; batched since (below). Room (1,0): the BFS
+38-42 s (with the inversion) against 14 s, the graph load 14.8 against
+1.9 s.
+
+Then (5d.. below, one run each, load 14-18): the reverse walk through one
+OWNER INDEX per frame file instead of each unit's owner table, and the
+coarser-marks filter decided in batches: room (1,0) 119.9 s, BFS 2.9 s
+(14 s before); room (6,2) 216.7 s (the level -1 table rebuilt again), BFS
+1.5 s, level 1 4.4 s (8.4 before, fg-2300 4.8); room (4,2) `r0sxhn,r0sxh
+--ceiling 71` 20.8 s (fg-2300 21.9 s). Same answers, witnesses and `[gate]`
+counts.
+
+**The reference frame** (6,2) 100% f56 -> f57 (`bench-frame --edges`, no
+filter: 17.2M new states, 512M edges; three interleaved reps, load 6-16):
+fg-2300 wave 5.07-5.15 s, frame 5.80-5.85 s, then 7.4 s to invert the
+frame's 512M records (a run of the later inversion); storage v2 wave
+3.91-3.94 s, translation 0.40 s, layer and edge file 0.45 s, frame
+4.91-4.92 s, nothing to invert. Worker-seconds (`CELESTE_PHASES=1`): emit
+and flush 75 against emit 47.5 and the units' ends 8.6.
+
+**The storage alone** (`bench-storage`, the f57 capture with level -1,
+257.7M edges, 6.7M new states; reproduces the real tree's `ckhash` `f057`
+and `e057` lines every rep): 16 threads, units 1.17-1.21 s (1 thread
+10.4 s; the capture's 9.5 GB read is in it), translation 0.16 s, layer
+0.11 s, edge file 0.09 s; 3.68 B an edge. Storage regions of 16: units
+1.31-1.33 s, translation 0.21-0.22 s, 3.41 B an edge (8 stays the default).
+
 # The edges inverted once, 2026-10-09 (release, 16 threads, branch `edge-inversion`)
 
 The forward keeps its raw edge records (64k-record chunks, `edges::write_chunk`)

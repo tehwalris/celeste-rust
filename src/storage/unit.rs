@@ -287,6 +287,13 @@ pub struct Lid {
 /// No owner (yet).
 pub const NONE: u32 = u32::MAX;
 
+/// A target's verdict under the coarser level's filter (`UnitSink::decide`).
+const VERDICT_PENDING: u8 = 0;
+const VERDICT_YES: u8 = 1;
+const VERDICT_NO: u8 = 2;
+/// Rows awaiting a verdict before a batch is decided.
+const VERDICT_BATCH: usize = 1024;
+
 /// A lid's owner `(region, entry)` packed in a u64 (`NO_OWNER`: none).
 #[inline]
 pub fn pack_owner(region: u32, entry: u32) -> u64 {
@@ -435,9 +442,15 @@ pub struct UnitSink<'a> {
     requests: Vec<Request>,
     bufs: Vec<RowBuf>,
     /// Per (lid, cell) the coarser level's verdict (`MarkFilter`), once a unit.
-    verdicts: rustc_hash::FxHashMap<u64, bool>,
-    /// A scratch row for a verdict, per shape.
+    /// `VERDICT_*` per (lid, cell): the coarser level's filter, decided in
+    /// batches (a projection per block, not per row).
+    verdicts: rustc_hash::FxHashMap<u64, u8>,
+    /// The rows awaiting a verdict, per shape, and their (lid, cell)s.
     scratch: Vec<RowBuf>,
+    scratch_at: Vec<Vec<u64>>,
+    /// Some (lid, cell) of the unit was disallowed: its edges and requests
+    /// go at the unit's end.
+    disallowed: bool,
     /// `CELESTE_KERNEL_KEY_CHECK=1`: every emission's row, checked in batches.
     check: Vec<RowBuf>,
     drop_last: Option<((u64, u32), Option<u32>)>,
@@ -509,6 +522,8 @@ impl<'a> UnitSink<'a> {
             bufs: Vec::new(),
             verdicts: Default::default(),
             scratch: Vec::new(),
+            scratch_at: Vec::new(),
+            disallowed: false,
             check: Vec::new(),
             drop_last: None,
             xfer_ids: Default::default(),
@@ -568,6 +583,7 @@ impl<'a> UnitSink<'a> {
         self.requests.clear();
         self.bufs = Vec::new();
         self.verdicts.clear();
+        self.disallowed = false;
     }
 
     /// The level -1 filter at EMISSION: `Some(from)` where it drops every
@@ -738,22 +754,26 @@ impl<'a> UnitSink<'a> {
         let words = self.geo.words;
         let (slot, local) = self.geo.slot_local(cell);
         let lid = self.lid(shape, slot, key);
-        // The coarser level's filter (the objects ladder): once per target.
-        if let Some(f) = self.filters.marks {
+        // The coarser level's filter (the objects ladder): once per target,
+        // in batches - a target awaiting its verdict is taken as allowed, and
+        // its edges and requests go at the unit's end if it is not.
+        if self.filters.marks.is_some() {
             let at = (lid as u64) << 8 | local as u64;
-            let ok = match self.verdicts.get(&at) {
-                Some(&ok) => ok,
+            match self.verdicts.get(&at) {
+                Some(&VERDICT_NO) => return Ok(()),
+                Some(_) => {}
                 None => {
                     let i = Self::buf_of(&mut self.scratch, shape, &init);
-                    self.scratch[i].clear();
+                    if self.scratch_at.len() <= i {
+                        self.scratch_at.resize_with(i + 1, Vec::new);
+                    }
                     push(&mut self.scratch[i]);
-                    let ok = f.allowed(&self.scratch[i].to_rt2(), self.frame)?[0];
-                    self.verdicts.insert(at, ok);
-                    ok
+                    self.scratch_at[i].push(at);
+                    self.verdicts.insert(at, VERDICT_PENDING);
+                    if self.scratch[i].rows() >= VERDICT_BATCH {
+                        self.decide()?;
+                    }
                 }
-            };
-            if !ok {
-                return Ok(());
             }
         }
         let (w, b) = ((local / 64) as usize, 1u64 << (local % 64));
@@ -793,6 +813,24 @@ impl<'a> UnitSink<'a> {
         }
         if let (Some(x), true) = (xfer, self.record_edges) {
             self.edges.push(pack_edge(lid, local, (lane - self.lo) as u32, x));
+        }
+        Ok(())
+    }
+
+    /// The verdicts of the rows awaiting one (`MarkFilter::allowed` over
+    /// each shape's batch).
+    fn decide(&mut self) -> Result<()> {
+        let Some(f) = self.filters.marks else { return Ok(()) };
+        for (buf, ats) in self.scratch.iter_mut().zip(self.scratch_at.iter_mut()) {
+            if buf.rows() == 0 {
+                continue;
+            }
+            for (&at, ok) in ats.iter().zip(f.allowed(&buf.to_rt2(), self.frame)?) {
+                self.verdicts.insert(at, if ok { VERDICT_YES } else { VERDICT_NO });
+                self.disallowed |= !ok;
+            }
+            buf.clear();
+            ats.clear();
         }
         Ok(())
     }
@@ -844,6 +882,23 @@ impl<'a> UnitSink<'a> {
             crate::compiled::asm_kernel::key_check(b);
         }
         self.check.iter_mut().for_each(RowBuf::clear);
+        // The last verdicts; a disallowed target's edges and requests go.
+        self.decide()?;
+        if self.disallowed {
+            let no = |v: &rustc_hash::FxHashMap<u64, u8>, lid: u32, local: u32| v.get(&((lid as u64) << 8 | local as u64)) == Some(&VERDICT_NO);
+            let v = &self.verdicts;
+            self.edges.retain(|&e| {
+                let (lid, local, ..) = unpack_edge(e);
+                !no(v, lid, local)
+            });
+            self.requests.retain(|r| !no(v, r.lid, r.local));
+            // A pending lid stays pending only if an edge still names it.
+            let mut named = vec![false; self.lids.len()];
+            for &e in &self.edges {
+                named[unpack_edge(e).0 as usize] = true;
+            }
+            self.pending.retain(|&l| named[l as usize]);
+        }
         // One pass: per (lid, cell) its edges' count, per transfer its use.
         let cells = (self.geo.side * self.geo.side) as usize;
         let n = self.lids.len();
