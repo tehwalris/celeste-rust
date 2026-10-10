@@ -91,7 +91,8 @@ t1() {
     step frame-r42n frame r42n 60 4,2 r0sxhn CELESTE_LEVEL_MINUS_ONE=71,5
     for n in r10 r62h r42n; do grep -hE '^\[bench\] rep 0' "$C/frame-$n.err" | sed "s/^/    $n /" | cut -c1-200; done
     # Every emitted row's key recomputed from its fields (the boundary's).
-    step keycheck-r10 keycheck
+    step keycheck-r10 keycheck r10 55 1,0 r0sxh
+    step keycheck-r42n keycheck r42n 60 4,2 r0sxhn CELESTE_LEVEL_MINUS_ONE=71,5
     # One backward frame (W f45 of h56), as the arc gate fingerprints it.
     step backward-r10arc backward
     grep -h '^\[bench-backward\] rep 0' "$C/backward-r10arc.err" | sed 's/^/    /'
@@ -107,9 +108,12 @@ t1() {
     for s in arccheck-r10 arccheck-r42x; do grep -h '^agreement' "$C/$s.out" | sed "s/^/    /" | cut -c1-200; done
 }
 
+# keycheck NAME FRAME ROOM LEVEL ENV...: frame's rows' keys recomputed
+# (CELESTE_KERNEL_KEY_CHECK), and the same f/e lines.
 keycheck() {
-    CELESTE_KERNEL_KEY_CHECK=1 ./safe-run.sh -- "$B" bench-frame --level-dir "$F/r10" --frame 55 --room 1,0 --level r0sxh --edges --threads "$TH" > "$C/keycheck.frame" || return 1
-    diff "$G/r10.frame" "$C/keycheck.frame" >&2
+    local name=$1 f=$2 room=$3 level=$4; shift 4
+    env "$@" CELESTE_KERNEL_KEY_CHECK=1 CELESTE_L1_TABLE="$F/$name/l1-table.bin" ./safe-run.sh -- "$B" bench-frame --level-dir "$F/$name" --frame "$f" --room "$room" --level "$level" --edges --threads "$TH" > "$C/keycheck-$name.frame" || return 1
+    diff "$G/$name.frame" "$C/keycheck-$name.frame" >&2
 }
 
 backward() {
