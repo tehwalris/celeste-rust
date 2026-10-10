@@ -555,7 +555,7 @@ impl EdgeStore {
         for e in std::fs::read_dir(dir).into_iter().flatten().flatten() {
             let p = e.path();
             let Some(n) = p.file_name().and_then(|s| s.to_str()) else { continue };
-            let Some(f) = n.strip_prefix('f').and_then(|s| s.get(..3)).and_then(|s| s.parse::<u32>().ok()) else { continue };
+            let Some(f) = frame_of_name(n) else { continue };
             if !n.ends_with(".bin") || f == 0 || f > horizon {
                 continue;
             }
@@ -802,6 +802,18 @@ pub fn set_done_frame(dir: &Path, frame: u32) -> Result<()> {
     Ok(())
 }
 
+/// The frame an edge file's name is of: `f{frame}.bin`, `f{frame}.r{seq}.bin`,
+/// `f{frame}.w{worker}.blk` - the digits after the `f`, however many (the
+/// names pad to 3: `f1000.bin` is frame 1000).
+pub fn frame_of_name(name: &str) -> Option<u32> {
+    let digits = name.strip_prefix('f')?;
+    let end = digits.find(|c: char| !c.is_ascii_digit()).unwrap_or(digits.len());
+    if end == 0 || !digits[end..].starts_with('.') {
+        return None;
+    }
+    digits[..end].parse().ok()
+}
+
 /// Drop what a run past `last` (the last complete frame) left: every edge
 /// file of a later frame and temporary files. Transfers past the trusted
 /// length are overwritten by the next merge.
@@ -809,8 +821,7 @@ pub fn discard_after(dir: &Path, last: u32) -> Result<()> {
     for e in std::fs::read_dir(dir).into_iter().flatten().flatten() {
         let p = e.path();
         let n = p.file_name().and_then(|s| s.to_str()).unwrap_or("");
-        let frame: Option<u32> = n.strip_prefix('f').and_then(|s| s.get(..3)).and_then(|s| s.parse().ok());
-        if n.ends_with(".tmp") || frame.is_some_and(|f| f > last) {
+        if n.ends_with(".tmp") || frame_of_name(n).is_some_and(|f| f > last) {
             std::fs::remove_file(&p).with_context(|| p.display().to_string())?;
         }
     }
@@ -847,6 +858,31 @@ mod tests {
 
     /// A block decodes, lid by lid, to the edges encoded, in order: same
     /// cells (source deltas), next cells, lids without edges.
+    /// Edge file names past frame 999 (split frame: step 1000 is frame 500).
+    #[test]
+    fn edge_file_names_give_their_frame_at_any_width() {
+        for (frame, raised) in [(7, None), (999, Some(3)), (1000, None), (1234, Some(12))] {
+            let p = file_path(Path::new("e"), frame, raised);
+            let name = p.file_name().and_then(|s| s.to_str()).expect("a name");
+            assert_eq!(frame_of_name(name), Some(frame), "{name}");
+            let blk = blocks_path(&p, 5);
+            assert_eq!(frame_of_name(blk.file_name().and_then(|s| s.to_str()).expect("a name")), Some(frame));
+        }
+        for name in ["done.txt", "xfer.bin", "f.bin", "fx12.bin", "f12x.bin"] {
+            assert_eq!(frame_of_name(name), None, "{name}");
+        }
+        let dir = std::env::temp_dir().join(format!("celeste-edge-names-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("tmp");
+        for f in ["f999.bin", "f1000.bin", "f1000.w001.blk", "f0998.bin", "done.txt"] {
+            std::fs::write(dir.join(f), b"").expect("write");
+        }
+        discard_after(&dir, 999).expect("discard");
+        let mut left: Vec<String> = std::fs::read_dir(&dir).expect("ls").map(|e| e.expect("e").file_name().to_string_lossy().into_owned()).collect();
+        left.sort();
+        std::fs::remove_dir_all(&dir).expect("cleanup");
+        assert_eq!(left, ["done.txt", "f0998.bin", "f999.bin"]);
+    }
+
     #[test]
     fn blocks_round_trip_lid_by_lid() {
         let mut v = 0x9e37_79b9_7f4a_7c15u64;
