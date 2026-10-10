@@ -73,6 +73,7 @@ The two `#[ignore]`d tests (resume, level -1 balloon) are t3.
 | keycheck-r42n | the same, r42n f60 | the object level's rows | 4.4 s |
 | backward-r10arc | `bench-backward --horizon 56 --frame 45` | one arc backward step (W f45 of a synthetic-win h56 search; the gate's W line) | 0.4 s |
 | storage-r10 | `bench-storage` of r10's f56 capture | the storage alone; its f/e lines must equal frame-r10's | 0.4 s |
+| widen-r10, -r62h, -r42n | `widen-check --emitted 64` of r10 f55, r62h f50, r42n f60 | the widening table's two sides agree at `h`, `hf`, `hn`: every stored row and the rows the kernels emit from 64 of them are fixed points of the block side's widening (`Rt2::widen_to`), exactly | 1.6 s, 7.1 s, 3.3 s |
 | refcheck-r10 | `ref-check` 32 rows of r10 f55 | kernels against the reference engine, row by row | 2.5 s |
 | refcheck-r42x | same, room (4,2) objects exact f55 | the same in an object room | 4.9 s |
 | arccheck-r10 | `arc-check` 32 records of r10 f56, `--path-cap 4096` | the recorded transfers against the reference | 3.0 s |
@@ -95,6 +96,7 @@ are `ckhash --edges`'s for the frame, so they equal the real tree's
 | search42-objects | room (4,2) `r0sxhn,r0sxh` (the objects ladder) to f50 at a synthetic win (32,56): arc bounds 47/47, concrete optimum 47; its witness as the known route; every `[gate]` line pinned | 5.0 s |
 | forward60-platforms | room (6,0) `r0sxhfp` split frame to step 71: `ckhash --edges` = the r60s fixture's pin | 25.5 s (the platform kernels' walk ~20 s) |
 | frame-r60s | one platform frame (step 70 -> 71) and its exact metrics: 49,469 kernel instructions a slice | 25.0 s (the same walk again) |
+| widen-r60s | `widen-check` of r60s steps 70 and 71 (stored rows): the widening table's two sides at `hfp`, at a boundary and mid-frame | ~2 s |
 
 ### big: the reference frame
 

@@ -4,8 +4,9 @@
 #   ./check.sh t0          the unit tests (nextest, quick profile)
 #   ./check.sh t1 [--pin]  single frames from the fixtures (tools/fixtures.sh):
 #                          the forward's exact output and metrics, KEY_CHECK,
-#                          one backward frame, the storage replay, the
-#                          kernels and the transfers against the reference
+#                          the widening table's two sides, one backward
+#                          frame, the storage replay, the kernels and the
+#                          transfers against the reference
 #   ./check.sh t2 [--pin]  short end-to-end runs: the room (1,0) gates, an
 #                          objects-ladder search, a platform room's forward
 #                          and one frame of it with its exact metrics
@@ -104,6 +105,12 @@ t1() {
     # The recorded transfers against the reference engine, sampled records.
     step arccheck-r10 ./safe-run.sh -- "$B" arc-check --level-dir "$F/r10" --room 1,0 --from 56 --to 56 --samples 32 --level r0sxh --threads "$TH" --path-cap 4096
     step arccheck-r42x ./safe-run.sh -- "$B" arc-check --level-dir "$F/r42x" --room 4,2 --from 56 --to 56 --samples 32 --level r0sxh --threads "$TH" --path-cap 4096
+    # The widening table's two sides: every stored row, and the rows the
+    # kernels emit from 64 of them, kept as they are by the block side.
+    step widen-r10 widencheck r10 55 1,0 r0sxh
+    step widen-r62h widencheck r62h 50 6,2 r0sxhf $L1_62
+    step widen-r42n widencheck r42n 60 4,2 r0sxhn CELESTE_LEVEL_MINUS_ONE=71,5
+    grep -h '^\[widen-check\] step' "$C"/widen-r*.out | sed 's/^/    /'
     for s in refcheck-r10 refcheck-r42x; do grep -h '^\[ref-check\] [0-9]' "$C/$s.out" | sed "s/^/    /"; done
     for s in arccheck-r10 arccheck-r42x; do grep -h '^agreement' "$C/$s.out" | sed "s/^/    /" | cut -c1-200; done
 }
@@ -114,6 +121,13 @@ keycheck() {
     local name=$1 f=$2 room=$3 level=$4; shift 4
     env "$@" CELESTE_KERNEL_KEY_CHECK=1 CELESTE_L1_TABLE="$F/$name/l1-table.bin" ./safe-run.sh -- "$B" bench-frame --level-dir "$F/$name" --frame "$f" --room "$room" --level "$level" --edges --threads "$TH" > "$C/keycheck-$name.frame" || return 1
     diff "$G/$name.frame" "$C/keycheck-$name.frame" >&2
+}
+
+# widencheck NAME FRAME ROOM LEVEL ENV...: `rewrite widen-check` of a
+# fixture's frame (the stored rows, and 64 rows' emissions).
+widencheck() {
+    local name=$1 f=$2 room=$3 level=$4; shift 4
+    env "$@" CELESTE_L1_TABLE="$F/$name/l1-table.bin" ./safe-run.sh -- "$B" widen-check --level-dir "$F/$name" --frame "$f" --room "$room" --level "$level" --emitted 64
 }
 
 backward() {
@@ -151,6 +165,9 @@ t2() {
     # cost: ~20 s of tracing, hence here and not in t1).
     step fixtures-r60s tools/fixtures.sh ensure r60s
     step frame-r60s frame r60s 70 6,0 r0sxhfp CELESTE_SPLIT_FRAME=1
+    # The widening table's two sides at `p`, a boundary and a mid-frame step
+    # (stored rows only: the emissions would build the kernels again).
+    step widen-r60s widen60
     grep -hE '^\[bench\] (kernels|rep)' "$C/frame-r60s.err" | sed 's/^/    /' | cut -c1-200
 }
 
@@ -176,6 +193,12 @@ search42() {
 forward60() {
     CELESTE_SPLIT_FRAME=1 ./safe-run.sh -- "$B" forward --room 6,0 --level r0sxhfp --to 71 --checkpoint-dir "$C/t2/p60" > /dev/null || return 1
     "$B" ckhash --room 6,0 --to 71 --edges --checkpoint-dir "$C/t2/p60" 2> /dev/null | diff "$G/r60s.ckhash" - >&2
+}
+
+widen60() {
+    for f in 70 71; do
+        CELESTE_SPLIT_FRAME=1 ./safe-run.sh -- "$B" widen-check --level-dir "$F/r60s" --frame $f --room 6,0 --level r0sxhfp || return 1
+    done
 }
 
 echo "[$TIER] $(uptime | sed 's/.*load/load/')"

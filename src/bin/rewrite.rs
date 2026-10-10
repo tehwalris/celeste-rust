@@ -372,6 +372,28 @@ enum Command {
         #[arg(long)]
         by_age: Option<usize>,
     },
+    /// THE WIDENING TABLE'S TWO SIDES AGREE (`celeste_engine::widening`):
+    /// every row stored at step `frame` - widened in the kernels' graph - is
+    /// a fixed point of the block side's widening at `--level`
+    /// (`Rt2::widen_to`), compared exactly (canonical bytes), and so is every
+    /// row the kernels emit from `--emitted` of them (evenly spaced). A row
+    /// the block side changes is printed with the fields that moved; the run
+    /// exits non-zero. (Not mid split frame at a near level: there the
+    /// graph side keeps a floor's computed `collideable` in the player's
+    /// probe window, which a frame boundary's widening does not.)
+    WidenCheck {
+        #[arg(long)]
+        level_dir: String,
+        #[arg(long)]
+        frame: u32,
+        #[arg(long, value_parser = Level::parse)]
+        level: Level,
+        /// Start room "x,y" (`CELESTE_START_ROOM` when not given).
+        #[arg(long)]
+        room: Option<String>,
+        #[arg(long, default_value_t = 0)]
+        emitted: usize,
+    },
     /// THE KERNELS AGAINST THE REFERENCE ENGINE, row by row: `samples` stored
     /// rows first reached at step `frame` (in `--cell x,y` if given) each run
     /// one step through the kernels of `--level` and through `RefEngine`, both
@@ -1514,6 +1536,65 @@ fn main() -> Result<()> {
                 through.extend(states);
                 println!("f{frame:03}: {rows} rows -> {n} states ({:.2}x fewer); {} states through f{frame:03}", rows as f64 / n.max(1) as f64, through.len());
             }
+        }
+        Command::WidenCheck { level_dir, frame, level, room, emitted } => {
+            if let Some(r) = &room {
+                std::env::set_var("CELESTE_START_ROOM", r);
+            }
+            anyhow::ensure!(
+                !(level.floors_near && frame % celeste_rust::frame::steps_per_frame() != 0),
+                "step {frame} is mid split frame at a near level: the graph side keeps a floor's computed `collideable` there, the block side does not"
+            );
+            let dir = std::path::Path::new(&level_dir);
+            let ids = celeste_rust::compiled::ids();
+            // Every lane of `rt2` against its block-side widening, exactly:
+            // the lanes it moved (the first few printed, `shown` so far).
+            let check = |rt2: &Rt2, what: &str, shown: usize| -> usize {
+                let mut moved = 0;
+                let mut a = rt2.clone_block();
+                a.canonical();
+                let mut b = rt2.clone_block();
+                widen_rt2_to(&mut b, level);
+                b.canonical();
+                let (ea, eb) = (celeste_engine::exact::exact_rows(&a, ids), celeste_engine::exact::exact_rows(&b, ids));
+                for l in 0..rt2.width {
+                    if a.shape_hash == b.shape_hash && ea[l] == eb[l] {
+                        continue;
+                    }
+                    moved += 1;
+                    if shown + moved <= 8 {
+                        let (pa, pb) = (project_all(&a).swap_remove(l), project_all(&b).swap_remove(l));
+                        let diff: Vec<String> = pa.iter().filter(|(k, v)| pb.get(*k) != Some(v)).map(|(k, v)| format!("{k}: {v} -> {}", pb.get(k).map_or("-", |s| s.as_str()))).collect();
+                        println!("[widen-check] {what} row {l} of shape {:#x} MOVED: {}", a.shape_hash, diff.join(", "));
+                    }
+                }
+                moved
+            };
+            let (mut stored, mut emitted_rows, mut moved) = (0usize, 0usize, 0usize);
+            let files = frame_files(dir, frame)?;
+            for (_, f) in &files {
+                if let Some(rt2) = f.load_all()? {
+                    stored += rt2.width;
+                    moved += check(&rt2, "stored", moved);
+                }
+            }
+            if emitted > 0 {
+                set_level(level);
+                let kernels = celeste_rust::compiled::FrameEngine::new_for_start_room()?;
+                kernels.warm();
+                let all: Vec<(usize, u32)> = files.iter().enumerate().flat_map(|(fi, (_, f))| (0..f.width()).map(move |r| (fi, r))).collect();
+                let n = emitted.min(all.len());
+                for k in 0..n {
+                    let (fi, r) = all[k * all.len() / n];
+                    let rt2 = files[fi].1.load_rows(&[r..r + 1])?.ok_or_else(|| anyhow::anyhow!("no row"))?;
+                    for b in rerun(&kernels, rt2, frame)?.0 {
+                        emitted_rows += b.lanes();
+                        moved += check(b.rt2(), "emitted", moved);
+                    }
+                }
+            }
+            println!("[widen-check] step {frame} at {level}: {stored} stored rows, {emitted_rows} emitted from {emitted}; {moved} moved by the block side's widening");
+            anyhow::ensure!(moved == 0, "widen-check: {moved} rows the block side's widening changes (the table's two sides disagree)");
         }
         Command::RefCheck { level_dir, frame, level, samples, cell, show, room, threads, path_cap } => {
             if let Some(r) = &room {
