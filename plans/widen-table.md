@@ -127,11 +127,13 @@ deliberately minimal; it should become that record's level field.
 
 ## Verification
 
-- Byte-identical at every commit: `./check.sh t1` (the three fixture frames'
-  f/e lines and every exact metric, KEY_CHECK, backward, storage, ref-check,
-  arc-check), `t2` (the room (1,0) gates, the objects-ladder search, the
-  platform room's forward and frame metrics) and `big` (the reference frame
-  and its capture), with no re-pin; `t0` all pass.
+- Byte-identical, no re-pin: `./check.sh t0` and `t1` (the three fixture
+  frames' f/e lines and every exact metric, KEY_CHECK, backward, storage,
+  ref-check, arc-check) pass at every commit (`f172fed` checked with the
+  next); `t2` (the room (1,0) gates, the objects-ladder search, the platform
+  room's forward and frame metrics) at the table, widen-check,
+  level-as-value and last commits; `big` (the reference frame and its
+  capture) at the table and level-as-value commits.
 - The agreement test that replaces `rewrite follow` as the cross-check:
   `rewrite widen-check` (t1: r10 `r0sxh` f55, r62h `r0sxhf` f50, r42n
   `r0sxhn` f60, each with the rows the kernels emit from 64 stored rows;
@@ -142,6 +144,12 @@ deliberately minimal; it should become that record's level field.
   full interval) moves 495,271 of r42n's rows.
 - `dead_fields_are_unread` (below), `the_table_resolves`,
   `the_abstractions_doc_lists_the_table`.
+- Level -1 (its tracer runs the table too; the fixtures load cached
+  tables, so t1/t2 do not rebuild one): `transpile --level-minus-one-table
+  5` rebuilt with this branch gives the fixtures' recorded fingerprints,
+  room (4,2) `af00ed208170568a`, room (6,2) 100% `067cab08a33c645f`.
+- The `#[ignore]`d tests (t3: resume, the level -1 balloon table, the
+  isolated floors' pin): 3/3 pass.
 
 ## The timers: an exact canonicalization, checked
 
@@ -185,8 +193,11 @@ player's remainder declared dead instead it fails. No output moved.
    the interval's exact containment per lane), every frame's states and
    edges stay identical and the kernels SHRINK: dynamic instructions
    -1.83% (r10), -5.57% (r62h), -3.21% (r42n); static -2.2%, -3.4%, -4.7%.
-   Not applied (it moves every metrics pin); one commit and a metrics
-   re-pin if wanted (branch `widen-table-static-proof`).
+   Platforms (r60s step 70) -2.23%, the reference frame (r62h57) -5.42%.
+   Not applied here (it moves every metrics pin): branch
+   `widen-table-static-proof` is the one commit with the metrics re-pinned
+   (only the five `.metrics` files moved), t0/t1/t2/big green, both level
+   -1 tables' fingerprints unchanged. Merge it if wanted.
 5. **Trees without `level.txt`** (all fixtures, every tree built before
    this branch) are accepted silently. Alternative: refuse, and rebuild or
    stamp the fixtures.
