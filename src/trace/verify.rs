@@ -340,20 +340,18 @@ pub fn trace_frame<'a>(
         .collect();
     let derived = super::error::for_outcomes(&mut it.d, &roots);
     // A PIN DISCONNECTS its input: nothing the outcomes compute - values,
-    // guards, transfers, derived errors - may read a pinned raw cell; only
-    // the pin's own check does (`error::pins_hold`, in `global`).
+    // guards, transfers, derived errors - may read a pinned input; only the
+    // pin's own check does (`error::pins_hold`, in `global`).
     {
-        let pinned: rustc_hash::FxHashSet<u32> = iface.pins.iter().map(|(i, _)| *i as u32).collect();
+        let pinned: Vec<NodeId> = it.d.assumptions.iter().filter(|a| matches!(it.d.graph.get(**a).op, crate::transpile::graph::Op::Pin(_))).map(|a| it.d.graph.get(*a).args[0]).collect();
         if !pinned.is_empty() {
             let mut reads: Vec<NodeId> = derived.clone();
             for o in &outs {
                 reads.extend(o.fields.iter().map(|(_, n, _)| *n).chain([o.guard]).chain(o.arc.iter().copied()));
             }
             let reach = crate::transpile::bdd::reachable(&it.d.graph, &reads);
-            for (n, r) in reach.iter().enumerate() {
-                if let (true, crate::transpile::graph::Op::Cell(c)) = (*r, &it.d.graph.get(n as NodeId).op) {
-                    anyhow::ensure!(!pinned.contains(c), "pinned input {} is read past its pin", iface::show(&iface.slots[*c as usize]));
-                }
+            for x in pinned {
+                anyhow::ensure!(!reach[x as usize], "a pinned input (node {x}, {:?}) is read past its pin", it.d.graph.get(x).op);
             }
         }
     }
