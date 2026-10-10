@@ -68,11 +68,15 @@ pub fn sources_in(root: &std::path::Path) -> Result<String> {
     // `CELESTE_SPLIT_FRAME`: the split-frame prototype, one frame as two steps.
     let lua = if std::env::var_os("CELESTE_SPLIT_FRAME").is_some() { "lua/celeste-minimal-split.lua" } else { "lua/celeste-minimal.lua" };
     let mut game = crate::game_runner::apply_start_room(&read(lua)?)?;
+    anyhow::ensure!(!(nodiag() && onlydiag()), "CELESTE_NODIAG and CELESTE_ONLYDIAG exclude each other");
     if let Some(j) = crate::game_runner::loading_jank() {
         game = apply_loading_frame(&game, j, root)?;
     }
     if nodiag() {
         game = forbid_diagonal_dashes(&game)?;
+    }
+    if onlydiag() {
+        game = forbid_straight_dashes(&game)?;
     }
     if let Ok(seeds) = std::env::var("CELESTE_BALLOON_SEEDS") {
         game = fix_balloon_seeds(&game, &seeds, root)?;
@@ -211,6 +215,32 @@ fn forbid_diagonal_dashes(game: &str) -> Result<String> {
     Ok(game.replacen(ARM, &format!("{ARM}\t\t   \tlocal nodiag_violation = nil > 0\n"), 1))
 }
 
+/// `CELESTE_ONLYDIAG`: every dash diagonal, the inverse of `CELESTE_NODIAG`.
+/// A dash may only START with both a horizontal and a vertical direction
+/// held; a dash with no direction held (horizontal, facing direction) is not
+/// diagonal.
+pub fn onlydiag() -> bool {
+    std::env::var_os("CELESTE_ONLYDIAG").is_some()
+}
+
+/// Make the three non-diagonal arms of the player's dash start (horizontal
+/// only, vertical only, no direction) RAISE, as `forbid_diagonal_dashes`
+/// does the diagonal one: exact at every level and in the reference engine.
+fn forbid_straight_dashes(game: &str) -> Result<String> {
+    const ARMS: [&str; 3] = [
+        "\t\t  \telse\n\t\t   \tthis.spd.x=input*d_full\n",
+        "\t\t \telseif v_input~=0 then\n\t\t \t\tthis.spd.x=0\n",
+        "\t\t \telse\n\t\t \t\tthis.spd.x=(this.flip.x and -1 or 1)\n",
+    ];
+    let mut game = game.to_string();
+    for arm in ARMS {
+        anyhow::ensure!(game.matches(arm).count() == 1, "CELESTE_ONLYDIAG: a dash arm was not found exactly once: {arm:?}");
+        let head = &arm[..=arm.find('\n').expect("an arm is two lines")];
+        game = game.replacen(arm, &format!("{head}\t\t   \tlocal onlydiag_violation = nil > 0\n{}", &arm[head.len()..]), 1);
+    }
+    Ok(game)
+}
+
 /// Refuse a program that could tell an `ABSENT_AS_ZERO` field's missing
 /// value (nil) from the 0 every frame writes there
 /// (`widen::materialize_absent_fields`). Every `.field` must be an assignment
@@ -329,5 +359,42 @@ pub fn run_chunk<'a, D: Domain>(
     match f {
         Flow::Normal | Flow::Return(_) => Ok(s),
         Flow::Break => Err(anyhow!("break at chunk toplevel")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::trace::refengine::RefEngine;
+
+    /// The dash starts each category allows, through the reference engine
+    /// (the kernels trace the same patched source): room (1,0), the player
+    /// standing after 40 idle frames, then a dash with up+right, right, up
+    /// or no direction held. A forbidden start raises: no successor.
+    #[test]
+    fn nodiag_and_onlydiag_forbid_exactly_their_dashes() {
+        const DASH: u8 = 32;
+        const RIGHT: u8 = 2;
+        const UP: u8 = 4;
+        let starts = [DASH | RIGHT | UP, DASH | RIGHT, DASH | UP, DASH];
+        // The cart is read when an engine is built (nextest: own process).
+        let successors = |mode: Option<&str>| -> Vec<usize> {
+            for m in ["CELESTE_NODIAG", "CELESTE_ONLYDIAG"] {
+                std::env::remove_var(m);
+            }
+            if let Some(m) = mode {
+                std::env::set_var(m, "1");
+            }
+            let mut eng = RefEngine::new().expect("engine");
+            let mut row = eng.initial().expect("initial");
+            for _ in 0..40 {
+                row = eng.step_one(&row, 0).expect("idle frame").into_rt2();
+            }
+            starts.iter().map(|&b| eng.step(&row, b).expect("dash frame").len()).collect()
+        };
+        assert_eq!(successors(None), [1, 1, 1, 1], "any%: every dash start");
+        assert_eq!(successors(Some("CELESTE_NODIAG")), [0, 1, 1, 1], "nodiag: all but the diagonal");
+        assert_eq!(successors(Some("CELESTE_ONLYDIAG")), [1, 0, 0, 0], "onlydiag: the diagonal only");
+        std::env::set_var("CELESTE_NODIAG", "1");
+        assert!(RefEngine::new().is_err(), "both modes at once must be refused");
     }
 }
