@@ -1,0 +1,3 @@
+# Room (4,2), synthetic win at (32, 56): the objects-ladder search's concrete witness (f47),
+# the known route ./check.sh t2 checks against every pruning step (search::known).
+0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,2,34,0,0,0,0,0,0,0,0
