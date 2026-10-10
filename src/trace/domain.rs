@@ -385,6 +385,8 @@ pub struct Symbolic {
     pub floors_near: bool,
     /// Moving platforms unknown (`Level::platforms`).
     pub platforms_unknown: bool,
+    /// The player's speed the literal `[-S, S]` (`Level::speed`, prototype).
+    pub speed_wide: bool,
     /// How many `Op::UnknownBool` atoms this frame handed out.
     pub unknown_atoms: u32,
     /// `Domain::set_countdown_hint`.

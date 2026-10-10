@@ -260,6 +260,9 @@ pub fn level_widened_paths(st: &State<Symbolic>, opts: &crate::abstraction::Leve
     if opts.fruit {
         out.extend(super::widen::fly_fruit_paths(st).all().cloned());
     }
+    if opts.speed {
+        out.extend(super::widen::speed_paths(st));
+    }
     if opts.floors_near {
         out.extend(super::widen::floor_timer_paths(st));
         out.extend(super::widen::near_floor_paths(st).all().cloned());

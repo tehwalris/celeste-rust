@@ -84,8 +84,20 @@ pub(crate) fn lattice_kernel_refs(
                             let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                             let Some((key, f, bound)) = slots.get(i).and_then(|m| m.lock().unwrap().take()) else { break };
                             let r = (|| -> Result<(Option<Region>, Reference)> {
+                                let t = std::time::Instant::now();
                                 let lowered = super::emit::lower_frame(&bound, Some(room.clone()))
                                     .map_err(|e| anyhow::anyhow!("lattice frame {} ({:?}) lower: {:#}", i, key, name_cells(&f, e)))?;
+                                if std::env::var_os("CELESTE_BUILD_PROGRESS").is_some() {
+                                    eprintln!(
+                                        "[lower] frame {i} {key:?}: {} outcomes, forks {} {:?}, {} bodies, {} fused nodes, {:.2} s",
+                                        f.outs.len(),
+                                        f.forks,
+                                        f.fork_ways,
+                                        lowered.bodies,
+                                        lowered.spec.0.len(),
+                                        t.elapsed().as_secs_f64()
+                                    );
+                                }
                                 Ok((key, Reference { frame: f, bound, lowered, cart: cart.clone(), cache: cache.clone() }))
                             })();
                             out.push((i, r));
@@ -410,6 +422,7 @@ pub fn room_constant_lattice(
     it.d.fruit_unknown = opts.fruit;
     it.d.floors_near = opts.floors_near;
     it.d.platforms_unknown = opts.platforms;
+    it.d.speed_wide = opts.speed;
     if opts.platforms {
         it.d.worlds = Some(std::sync::Arc::new(crate::concrete::platform_worlds(PLATFORM_WORLD_FRAMES)?));
     }
@@ -728,6 +741,10 @@ fn boundary_ival(st: &super::state::State<super::domain::Symbolic>, opts: crate:
     // The fly fruit's `spd.y`/`rem.y`, likewise (`widen::fork_fruit_inputs`).
     if opts.fruit {
         ival.extend(super::widen::fly_fruit_paths(st).ranges.into_iter().map(|(p, _)| p));
+    }
+    // The player's speed at a speed-bucket level: a bucket per lane.
+    if opts.speed {
+        ival.extend(super::widen::speed_paths(st));
     }
     // Near level: floors and object phases (countdowns are the unknown
     // number instead, `widen::forget_countdown_inputs`).

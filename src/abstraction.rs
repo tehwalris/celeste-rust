@@ -27,11 +27,16 @@ pub struct Level {
     /// `p`: every moving platform's `x` and `last` the interval of its whole
     /// path, its `rem.x` the whole remainder (its phase forgotten).
     pub platforms: bool,
+    /// `v` (PROTOTYPE, branch `l1-native`, plans/level-minus-one-native.md):
+    /// the player's `spd.x`/`spd.y` stored as their whole-pixel bucket
+    /// `[k, k + 1)` (`widen::widen_speed`). Not yet projected by
+    /// `Rt2::widen_to`, so no filter or known-route check can read it.
+    pub speed: bool,
 }
 
 impl Level {
     /// Every object exact (`r0sx`).
-    pub const EXACT: Level = Level { held: false, fruit: false, floors_near: false, platforms: false };
+    pub const EXACT: Level = Level { held: false, fruit: false, floors_near: false, platforms: false, speed: false };
 
     /// A level from `r0sx[h][f][n][p]`: the fixed prefix, then the flags in
     /// that order (each absent = exact).
@@ -39,7 +44,7 @@ impl Level {
         let s = spec.trim();
         let mut rest = s
             .strip_prefix("r0sx")
-            .ok_or_else(|| format!("level {spec:?}: expected r0sx[h][f][n][p] (the remainder is the arcs', the speed exact)"))?;
+            .ok_or_else(|| format!("level {spec:?}: expected r0sx[h][f][n][p][v] (the remainder is the arcs', the speed exact)"))?;
         let mut flag = |c: char| -> bool {
             match rest.strip_prefix(c) {
                 Some(t) => {
@@ -49,9 +54,9 @@ impl Level {
                 None => false,
             }
         };
-        let level = Level { held: flag('h'), fruit: flag('f'), floors_near: flag('n'), platforms: flag('p') };
+        let level = Level { held: flag('h'), fruit: flag('f'), floors_near: flag('n'), platforms: flag('p'), speed: flag('v') };
         if !rest.is_empty() {
-            return Err(format!("level {spec:?}: unexpected {rest:?} (flags are h, f, n, p in that order)"));
+            return Err(format!("level {spec:?}: unexpected {rest:?} (flags are h, f, n, p, v in that order)"));
         }
         Ok(level)
     }
@@ -61,7 +66,7 @@ impl std::fmt::Display for Level {
     /// The spec `parse` reads.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "r0sx")?;
-        for (on, c) in [(self.held, 'h'), (self.fruit, 'f'), (self.floors_near, 'n'), (self.platforms, 'p')] {
+        for (on, c) in [(self.held, 'h'), (self.fruit, 'f'), (self.floors_near, 'n'), (self.platforms, 'p'), (self.speed, 'v')] {
             if on {
                 write!(f, "{c}")?;
             }

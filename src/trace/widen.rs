@@ -107,7 +107,44 @@ pub fn widen(st: &mut State<Symbolic>, d: &mut Symbolic) -> Result<SlotErrors> {
     widen_platforms(st, d, &mut errs)?;
     canon_balloon_offset(st, d, &mut errs)?;
     widen_held(st, d)?;
+    widen_speed(st, d)?;
     Ok(errs)
+}
+
+/// The player's `spd.x`/`spd.y`: at a speed-bucket level (`Level::speed`)
+/// each is stored as its whole-pixel BUCKET `[k, k + 1)`.
+pub fn speed_paths<D: Domain>(st: &State<D>) -> Vec<Path> {
+    objects_of_type(st, "player").iter().flat_map(|o| ["x", "y"].map(|f| field(o, &["spd", f]))).collect()
+}
+
+/// The speed's OUTPUT side at a speed-bucket level (PROTOTYPE, `l1-native`):
+/// the computed speed `v` is FORKED on its floor (`Partition::Floors`, 2
+/// ways: a bucket-wide input moves a lane by less than a bucket, so its
+/// output straddles at most one edge; a lane spanning more declines by the
+/// fork's own error), and each part stores `[flr, flr + 1)`. Contains `v`
+/// by construction: nothing is owed.
+fn widen_speed(st: &mut State<Symbolic>, d: &mut Symbolic) -> Result<()> {
+    if !d.speed_wide {
+        return Ok(());
+    }
+    for p in speed_paths(st) {
+        let Some(Value::Num(v)) = iface::get(st, &p) else { bail!("{}: not a number", iface::show(&p)) };
+        let part = if d.is_interval(&v) {
+            let (frag, valid) = d.fork_flr(&v, crate::trace::domain::MOVE_WAYS);
+            let at = st.decided(d);
+            d.evaluated_at(&frag, &at);
+            st.guard = d.and(&st.guard, &valid);
+            frag
+        } else {
+            v
+        };
+        let lo = d.fun1(super::domain::Fun1::Flr, &part)?;
+        let below_one = d.num(P8::from_raw(0xffff));
+        let hi = d.arith(super::domain::Arith::Add, &lo, &below_one)?;
+        let bucket = d.graph.fold(Op::Span, vec![lo, hi]);
+        iface::set(st, &p, Value::Num(bucket))?;
+    }
+    Ok(())
 }
 
 /// The player's remainder := [-1/2, 1/2); the edge's transfer

@@ -301,6 +301,10 @@ enum Command {
         to: u32,
         #[arg(long, default_value = "")]
         erase: String,
+        /// Name prefixes whose numbers count by their WHOLE part only (`flr`):
+        /// a 1 px bucket (the speed of a would-be coarse level, l1-native).
+        #[arg(long, default_value = "")]
+        floor: String,
     },
     /// DIAGNOSTIC: does a cell's visited set saturate? (A frame's rows are the
     /// states NEW at it.) From the cell indexes only: the `top` cells by
@@ -532,7 +536,7 @@ enum Command {
 /// `coarse-census`: one frame's states as hashes, the named value cells
 /// under an `erase` prefix left out (pointers count as structure); and the
 /// frame's row count.
-fn erased_states(dir: &std::path::Path, frame: u32, erase: &[String]) -> Result<(u64, rustc_hash::FxHashSet<u64>)> {
+fn erased_states(dir: &std::path::Path, frame: u32, erase: &[String], floor: &[String]) -> Result<(u64, rustc_hash::FxHashSet<u64>)> {
     use celeste_engine::runtime2::{av_code, mix64, Cell2, Col, AV};
     let ids = celeste_rust::compiled::ids();
     let name_hash = |s: &str| -> u64 { s.bytes().fold(0x9e37_79b9_7f4a_7c15u64, |h, b| mix64(h ^ b as u64)) };
@@ -545,23 +549,29 @@ fn erased_states(dir: &std::path::Path, frame: u32, erase: &[String]) -> Result<
             let Some(rt2) = ff.load_rows(&[lo..(lo + (1 << 20)).min(width)])? else { break };
             rows += rt2.width as u64;
             let names = cell_names(&rt2, ids);
-            let cells: Vec<(u64, usize)> = (0..rt2.cols.len())
+            let cells: Vec<(u64, usize, bool)> = (0..rt2.cols.len())
                 .filter(|&c| matches!(rt2.structure[c], Cell2::Val))
                 .map(|c| (c, names.get(&c).cloned().unwrap_or_else(|| format!("cell{c}"))))
                 .filter(|(_, nm)| !erase.iter().any(|p| nm.starts_with(p.as_str())))
-                .map(|(c, nm)| (name_hash(&nm), c))
+                .map(|(c, nm)| (name_hash(&nm), c, floor.iter().any(|p| nm.starts_with(p.as_str()))))
                 .collect();
+            let code_of = |v: AV, fl: bool| -> u64 {
+                match (v, fl) {
+                    (AV::Num(n), true) => code(AV::Num(n.flr())),
+                    _ => code(v),
+                }
+            };
             // The block's uniform cells once; the rest per row.
             let mut base = 0u64;
             let mut varying = Vec::new();
-            for &(h, c) in &cells {
+            for &(h, c, fl) in &cells {
                 match &rt2.cols[c] {
-                    Col::U(v) => base = base.wrapping_add(mix64(h ^ code(*v))),
-                    _ => varying.push((h, c)),
+                    Col::U(v) => base = base.wrapping_add(mix64(h ^ code_of(*v, fl))),
+                    _ => varying.push((h, c, fl)),
                 }
             }
             for r in 0..rt2.width {
-                states.insert(varying.iter().fold(base, |acc, &(h, c)| acc.wrapping_add(mix64(h ^ code(rt2.cols[c].at(r))))));
+                states.insert(varying.iter().fold(base, |acc, &(h, c, fl)| acc.wrapping_add(mix64(h ^ code_of(rt2.cols[c].at(r), fl)))));
             }
         }
     }
@@ -1279,11 +1289,12 @@ fn main() -> Result<()> {
             );
             anyhow::ensure!(missing_total == 0 && inside_bad == 0 && unpredicted == 0 && outside_bad == 0, "arc-check: disagreement");
         }
-        Command::CoarseCensus { level_dir, from, to, erase } => {
+        Command::CoarseCensus { level_dir, from, to, erase, floor } => {
             let erase = prefixes(&erase);
+            let floor = prefixes(&floor);
             let mut through: rustc_hash::FxHashSet<u64> = Default::default();
             for frame in from..=to {
-                let (rows, states) = erased_states(std::path::Path::new(&level_dir), frame, &erase)?;
+                let (rows, states) = erased_states(std::path::Path::new(&level_dir), frame, &erase, &floor)?;
                 let n = states.len();
                 through.extend(states);
                 println!("f{frame:03}: {rows} rows -> {n} states ({:.2}x fewer); {} states through f{frame:03}", rows as f64 / n.max(1) as f64, through.len());
