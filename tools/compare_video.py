@@ -6,19 +6,23 @@ counter and the margin when the new run exits.
 
     tools/compare_video.py LEVEL OLD.tas NEW.tas OUT_PREFIX [--title 2800M]
         [--category "NO DIAGONAL DASHES"] [--old-label "TASDATABASE (GHOST)"] [--new-label OURS]
-        [--slow 4] [--captures DIR] [--stills DIR]
-Gemskip categories: UCT_DASHES=1 in the environment (as tools/category_runner.py).
+        [--slow 4] [--captures DIR] [--stills DIR] [--tool uct|celia]
+Gemskip categories: UCT_DASHES=1 / CELIA_DASHES=1 in the environment (as tools/category_runner.py).
 
 Writes OUT_PREFIX.mp4 (real time, 30 fps) and OUT_PREFIX_slow.mp4 (the room
 entry at real time, then 1/SLOW speed). Both runs are played headlessly in
-UniversalClassicTas (tools/uct/validate.sh with UCT_CAPTURE, see
-tools/uct/capture.lua), so they get UCT's graphics and its balloon seeds from
-the files. Needs numpy, pillow and imageio-ffmpeg (a venv will do).
+UniversalClassicTas (--tool uct, the default: tools/uct/validate.sh with
+UCT_CAPTURE, see tools/uct/capture.lua) or in Celia (--tool celia:
+tools/celia/validate.sh with CELIA_CAPTURE, tools/celia/capture.lua), so they
+get that tool's graphics and its balloon seeds from the files. Celia loads
+the room as it does for an IL, with the LOADING JANK that UCT does not model:
+a run that only finishes in real play (moving platforms, 1800m nodiag) needs
+--tool celia. Needs numpy, pillow and imageio-ffmpeg (a venv will do).
 
 Checked, not assumed: both captures must start the room identically (the same
-number of spawn frames), and each run's frame count (UCT's timer on the frame
-before the room changes) must equal its file's input count - 1, the count the
-tasdatabase lists.
+number of spawn frames), and each run's frame count (the tool's timer on the
+frame before the room changes) must equal its file's input count - 1, the
+count the tasdatabase lists. A death during the capture is warned about.
 """
 import argparse, json, os, re, subprocess, sys
 import numpy as np
@@ -42,13 +46,13 @@ GHOST_ALPHA, SMOKE_ALPHA = 0.7, 0.35
 
 # ---- capture -------------------------------------------------------------
 
-def capture(level, tas, outdir):
+def capture(tool, level, tas, outdir):
     os.makedirs(outdir, exist_ok=True)
-    env = dict(os.environ, UCT_CAPTURE=outdir)
-    out = subprocess.run([f"{M}/tools/uct/validate.sh", str(level), tas], env=env, capture_output=True, text=True).stdout
+    env = dict(os.environ, **{f"{tool.upper()}_CAPTURE": outdir})
+    out = subprocess.run([f"{M}/tools/{tool}/validate.sh", str(level), tas], env=env, capture_output=True, text=True).stdout
     print(out.strip())
-    if "finished, clean save" not in out:
-        sys.exit(f"{tas}: did not finish in UniversalClassicTas")
+    if f"level {level} {tas}: finished, " not in out:
+        sys.exit(f"{tas}: did not finish in {tool}")
 
 
 def load(outdir, tas):
@@ -66,6 +70,9 @@ def load(outdir, tas):
         sp0 = next(i for i, m in enumerate(meta) if m["practice_time"] >= 1)
         spl = next(i for i in range(starts[-1], len(meta)) if meta[i]["practice_time"] >= 1)
         meta, raw = meta[spl - sp0:], raw[spl - sp0:]
+    deaths = sorted({m["deaths"] for m in meta[:-1]})
+    if len(deaths) > 1:
+        print(f"WARNING {tas}: {deaths[-1] - deaths[0]} death(s) during the capture", file=sys.stderr)
     meta, raw = meta[:-1], raw[:-1]          # the exit frame already shows the reloaded room
     idx = np.rint(raw[..., 0].astype(np.float32) * 15 / 255).astype(np.int64)
     alpha = raw[..., 3] > 127
@@ -73,7 +80,7 @@ def load(outdir, tas):
     n_inputs = len(re.findall(r"\d+", text[text.index("]") + 1:]))
     frames = meta[-1]["practice_time"]
     if frames != n_inputs - 1:
-        sys.exit(f"{tas}: exits after {frames} frames in UCT, the file has {n_inputs} inputs")
+        sys.exit(f"{tas}: exits after {frames} frames, the file has {n_inputs} inputs")
     spawn = next(i for i, m in enumerate(meta) if m["practice_time"] >= 1)
     return {"meta": meta, "screen": idx[:, 0], "player": (idx[:, 1], alpha[:, 1]), "smoke": (idx[:, 2], alpha[:, 2]), "objects": (idx[:, 3], alpha[:, 3]),
             "frames": frames, "spawn": spawn}
@@ -238,6 +245,7 @@ def main():
     ap.add_argument("--slow", type=int, default=4)
     ap.add_argument("--captures", help="capture directory (reused if present)")
     ap.add_argument("--stills", help="also write PNGs of a few frames here")
+    ap.add_argument("--tool", choices=("uct", "celia"), default="uct", help="the TAS tool that plays both runs")
     args = ap.parse_args()
     FONT = load_font()
     cap = args.captures or f"{args.out}_captures"
@@ -245,7 +253,7 @@ def main():
     for name, tas in (("old", args.old), ("new", args.new)):
         d = f"{cap}/{name}"
         if not os.path.exists(f"{d}/frames.jsonl"):
-            capture(args.level, tas, d)
+            capture(args.tool, args.level, tas, d)
         runs[name] = load(d, tas)
     old, new = runs["old"], runs["new"]
     if old["spawn"] != new["spawn"]:

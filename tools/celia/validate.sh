@@ -15,6 +15,8 @@
 #      fixed point instead of Lua doubles); CELIA_TRACE=1 (per-frame objects);
 #      CELIA_LOG=1 (all of LOVE's output); CELIA (clone, default
 #      ~/src/github.com/gonengazit/Celia), LOVE (default /var/tmp/love/squashfs-root/AppRun).
+# CELIA_CAPTURE=DIR (one LEVEL FILE pair): also write every played frame to
+# DIR (capture.lua; tools/compare_video.py --tool celia renders them).
 # Each run has its own LOVE save identity (no clash with a concurrent run).
 set -e
 CELIA=${CELIA:-$HOME/src/github.com/gonengazit/Celia}
@@ -28,6 +30,7 @@ rm -rf "$RUN/game/.git"
 sed -i "s/t.identity = \"Celia\"/t.identity = \"$ID\"/" "$RUN/game/conf.lua"
 grep -q "\"$ID\"" "$RUN/game/conf.lua" || { echo "validate.sh: could not set the save identity" >&2; exit 1; }
 cp "$(dirname "$0")/driver.lua" "$RUN/game/celia_driver.lua"
+cp "$(dirname "$0")/capture.lua" "$RUN/game/celia_capture.lua"
 cat >> "$RUN/game/main.lua" <<'HOOK'
 
 if os.getenv("CELIA_LEVEL") then
@@ -35,7 +38,12 @@ if os.getenv("CELIA_LEVEL") then
   love.errorhandler = function(msg) print("[celia] LUA ERROR: " .. tostring(msg) .. "\n" .. debug.traceback()); os.exit(3) end
   local drv = require("celia_driver")
   local orig_update = love.update
-  love.update = function(dt) orig_update(dt); drv.tas = tastool; drv.tick() end
+  local cap = os.getenv("CELIA_CAPTURE") and require("celia_capture")
+  if cap then cap.install(drv) end
+  love.update = function(dt)
+    if cap and tastool then cap.wrap(tastool) end
+    orig_update(dt); drv.tas = tastool; drv.tick()
+  end
 end
 HOOK
 fixp=""
