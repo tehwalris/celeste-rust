@@ -9,6 +9,7 @@
 use anyhow::{anyhow, Context, Result};
 
 fn main() -> Result<()> {
+    celeste_rust::knobs::startup()?;
     let mut args = std::env::args().skip(1);
     match args.next().as_deref() {
         Some("--level-minus-one") => {
@@ -19,7 +20,7 @@ fn main() -> Result<()> {
             let from: u32 = next("FROM")?.parse().context("--level-minus-one FROM")?;
             let to: u32 = next("TO")?.parse().context("--level-minus-one TO")?;
             let marks = args.next().map(std::path::PathBuf::from);
-            let threads = std::env::var("CELESTE_THREADS").ok().map(|s| s.parse().context("CELESTE_THREADS")).transpose()?.unwrap_or(8);
+            let threads = celeste_rust::knobs::number("CELESTE_THREADS").unwrap_or(8);
             let opts = celeste_rust::trace::level_minus_one::Opts { spd_px, level_dir, ceiling, from, to, marks, threads };
             // The tracer recurses through the cart's AST: a big stack.
             let report = std::thread::Builder::new()
@@ -35,10 +36,7 @@ fn main() -> Result<()> {
             // Build the table as the search does and print its fingerprint:
             // the A/B check for a change to the build.
             let spd_px: i32 = args.next().ok_or_else(|| anyhow!("--level-minus-one-table S"))?.parse().context("--level-minus-one-table S")?;
-            let threads = match std::env::var("CELESTE_THREADS") {
-                Ok(s) => s.parse().context("CELESTE_THREADS")?,
-                Err(_) => std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4),
-            };
+            let threads = celeste_rust::knobs::number("CELESTE_THREADS").unwrap_or_else(|| std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4));
             let t = std::time::Instant::now();
             let table = std::thread::Builder::new()
                 .stack_size(256 * 1024 * 1024)

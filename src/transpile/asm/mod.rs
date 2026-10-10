@@ -42,48 +42,13 @@ pub fn compile_and_load_reprs(
     let so: PathBuf = assemble(&compiled.asm, tag)?;
     let t_asm = t1.elapsed();
     let loaded = Loaded::open(&so, &sym)?;
-    if std::env::var_os("CELESTE_BUILD_TRACE").is_some() {
+    if crate::knobs::flag("CELESTE_BUILD_TRACE") {
         eprintln!(
             "[build] {tag}: {} roots, asm text {:.1} MB: compile {:.1}s, gcc+load {:.1}s",
             roots.len(),
             compiled.asm.len() as f64 / 1e6,
             t_compile.as_secs_f64(),
             t_asm.as_secs_f64()
-        );
-    }
-    // `CELESTE_ASM_STATS`: per kernel, the instruction count and the share of
-    // stack traffic (a big kernel's reloads miss the caches).
-    if std::env::var_os("CELESTE_ASM_STATS").is_some() {
-        let (mut insts, mut reloads, mut spills) = (0usize, 0usize, 0usize);
-        for line in compiled.asm.lines() {
-            let Some(body) = line.strip_prefix("    ") else { continue };
-            if body.starts_with('.') {
-                continue;
-            }
-            insts += 1;
-            if let Some(ops) = body.strip_prefix("vmovdqu64 ") {
-                if ops.contains("(%rsp), %zmm") {
-                    reloads += 1;
-                } else if ops.starts_with("%zmm") && ops.ends_with("(%rsp)") {
-                    spills += 1;
-                }
-            }
-        }
-        eprintln!(
-            "[asm stats] {sym}: {insts} instructions, {reloads} reloads ({:.0}%), {spills} spills ({:.0}%), {} spill slots, frame {:.1} MB, {} output roots ({:.1} MB per slice)",
-            100.0 * reloads as f64 / insts.max(1) as f64,
-            100.0 * spills as f64 / insts.max(1) as f64,
-            compiled.spill_slots,
-            compiled.frame_bytes as f64 / 1048576.0,
-            compiled.n_roots,
-            compiled.out_bytes as f64 / 1048576.0
-        );
-        let count = |k: RootKind| compiled.root_kinds.iter().filter(|r| **r == k).count();
-        eprintln!(
-            "[asm stats] {sym}: output slots by kind: {} num, {} interval, {} bool",
-            count(RootKind::Num),
-            count(RootKind::Ival),
-            count(RootKind::Bool)
         );
     }
     // The assembly text is only the assembler's input: drop it once loaded
@@ -99,7 +64,7 @@ pub fn compile_and_load_reprs(
 /// `CELESTE_KERNEL_METRICS=1`: its census and slice counts only.
 pub fn mix_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("CELESTE_KERNEL_MIX").is_some() || crate::compiled::mix::metrics_on())
+    *ON.get_or_init(|| crate::knobs::value("CELESTE_KERNEL_MIX").is_some() || crate::compiled::mix::metrics_on())
 }
 
 #[cfg(test)]

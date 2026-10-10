@@ -116,11 +116,7 @@ impl<'a, D: Domain> Interp<'a, D> {
             cart: None,
             cache: None,
             max_states: 256,
-            // `CELESTE_MAX_TRACE_NODES`: for measuring a refused trace.
-            max_nodes: std::env::var("CELESTE_MAX_TRACE_NODES")
-                .ok()
-                .map(|v| v.parse().unwrap_or_else(|_| panic!("CELESTE_MAX_TRACE_NODES={v:?} is not a number")))
-                .unwrap_or(2_000_000),
+            max_nodes: 2_000_000,
             trace_start_nodes: 0,
             prints: Vec::new(),
             for_iterations: 0,

@@ -87,10 +87,7 @@ impl Geometry {
 pub fn geometry() -> &'static Geometry {
     static G: std::sync::OnceLock<Geometry> = std::sync::OnceLock::new();
     G.get_or_init(|| {
-        let side: u32 = match std::env::var("CELESTE_STORAGE_REGION") {
-            Ok(v) => v.trim().parse().unwrap_or_else(|_| panic!("CELESTE_STORAGE_REGION={v:?}: 8 or 16")),
-            Err(_) => 8,
-        };
+        let side: u32 = crate::knobs::number("CELESTE_STORAGE_REGION").unwrap_or(8);
         let g = Geometry::new(side);
         if let Some(k) = crate::trace::kernel::region_grid() {
             assert!(

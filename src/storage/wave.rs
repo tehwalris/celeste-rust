@@ -113,17 +113,9 @@ pub struct Wave {
 /// `workers`: ~16 units a worker, between 1024 and 4096 lanes. A bigger unit
 /// fills more of each region's slices (room (3,0) 100% r0sxhfn at 8 px, f49:
 /// 1024 -> 4096 lanes, padding 22% -> 11%); a small frame keeps enough units
-/// to balance. `CELESTE_UNIT_LANES` fixes it (a multiple of 64).
+/// to balance.
 fn unit_lanes(lanes: usize, workers: usize) -> usize {
-    static FIXED: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
-    let fixed = *FIXED.get_or_init(|| {
-        std::env::var("CELESTE_UNIT_LANES").ok().map(|v| {
-            let n: usize = v.parse().unwrap_or_else(|_| panic!("CELESTE_UNIT_LANES={v:?} is not a number"));
-            assert!(n >= 64 && n % 64 == 0 && n <= super::unit::MAX_UNIT_LANES, "CELESTE_UNIT_LANES={n}: a multiple of 64, at most {}", super::unit::MAX_UNIT_LANES);
-            n
-        })
-    });
-    fixed.unwrap_or_else(|| (lanes / (workers.max(1) * 16)).clamp(1024, 4096) & !63)
+    (lanes / (workers.max(1) * 16)).clamp(1024, 4096) & !63
 }
 
 /// A unit: block, and its range of the block's live lanes (`order`).

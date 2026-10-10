@@ -1159,14 +1159,14 @@ pub(crate) fn key_check_block(blk: &Rt2, keys: &KeySpace) {
 /// `CELESTE_KERNEL_KEY_CHECK=1` (see `key_check`).
 pub(crate) fn key_check_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("CELESTE_KERNEL_KEY_CHECK").is_some())
+    *ON.get_or_init(|| crate::knobs::flag("CELESTE_KERNEL_KEY_CHECK"))
 }
 
 /// Whether kernels keep their fused graphs after assembly
 /// (`CELESTE_KERNEL_EXPLAIN`): a decline then names the premise it failed.
 fn kernel_graph_kept() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("CELESTE_KERNEL_EXPLAIN").is_some())
+    *ON.get_or_init(|| crate::knobs::flag("CELESTE_KERNEL_EXPLAIN"))
 }
 
 fn num_raw(av: AV) -> i32 {
@@ -1935,10 +1935,9 @@ impl Drop for BuildPurgeDelay {
 
 fn build_registry_for_level(level: crate::abstraction::Level) -> Option<Registry> {
     let _purge = BuildPurgeDelay::start();
-    let root = std::env::var("CELESTE_ROOT").unwrap_or_else(|_| ".".to_string());
     let built = std::thread::Builder::new()
         .stack_size(256 * 1024 * 1024)
-        .spawn(move || Registry::build_for_start_room(Path::new(&root), level))
+        .spawn(move || Registry::build_for_start_room(Path::new("."), level))
         .expect("spawn asm-kernel builder")
         .join()
         .expect("asm-kernel builder panicked");

@@ -61,12 +61,7 @@ pub(crate) fn lattice_kernel_refs(
     // Lower (the expensive half of a build), in parallel.
     let (cart, cache) = (lw.cart.clone(), lw.cache.clone());
     let room = &room;
-    // `CELESTE_BUILD_THREADS` caps concurrent frames: the largest take GBs.
-    let n_workers = std::env::var("CELESTE_BUILD_THREADS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or_else(|| std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4))
-        .min(frames.len().max(1));
+    let n_workers = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).min(frames.len().max(1));
     let next = std::sync::atomic::AtomicUsize::new(0);
     // Each frame is taken by exactly one worker (a `Frame` is not cloned).
     let slots: Vec<std::sync::Mutex<Option<(Option<Region>, super::verify::Frame, Bound)>>> =
@@ -129,7 +124,7 @@ pub struct RegionGrid {
 pub fn region_grid() -> Option<RegionGrid> {
     static GRID: std::sync::OnceLock<Option<RegionGrid>> = std::sync::OnceLock::new();
     *GRID.get_or_init(|| {
-        let g = match std::env::var("CELESTE_REGION").ok().as_deref() {
+        let g = match crate::knobs::value("CELESTE_REGION").as_deref() {
             Some("off") => None,
             Some(s) => {
                 let v: Vec<i32> = s.split(',').map(|t| t.trim().parse().expect("CELESTE_REGION=\"px,S\" or off")).collect();
@@ -220,7 +215,7 @@ fn successor_regions(
     // Probe only: `CELESTE_WALK_REGIONS="(ix,iy) .."` traces just those.
     static ONLY: std::sync::OnceLock<Option<Vec<(i16, i16)>>> = std::sync::OnceLock::new();
     let only = ONLY.get_or_init(|| {
-        std::env::var("CELESTE_WALK_REGIONS").ok().map(|v| {
+        crate::knobs::value("CELESTE_WALK_REGIONS").map(|v| {
             v.split_whitespace()
                 .map(|t| {
                     let t = t.trim_matches(|c| c == '(' || c == ')');
@@ -437,7 +432,7 @@ pub fn room_constant_lattice(
         Some(_) => no_player_ranges(&mut it, reset, fr, &start, opts)?,
         None => NoPlayer::default(),
     };
-    if std::env::var_os("CELESTE_LATTICE_TRACE").is_some() {
+    if crate::knobs::flag("CELESTE_BUILD_TRACE") {
         let show = |b: &Bounds| b.iter().map(|(p, (a, b))| format!("{} [{:.2}, {:.2}]", super::iface::show(p), *a as f64 / 65536.0, *b as f64 / 65536.0)).collect::<Vec<_>>();
         for (i, (_, b)) in no_player.shapes.iter().enumerate() {
             eprintln!("[walk] no-player shape {i} ranges: {:?}", show(b));
@@ -484,14 +479,13 @@ pub fn room_constant_lattice(
     let mut regions: std::collections::BTreeMap<String, std::collections::BTreeSet<Option<Region>>> = Default::default();
     regions.insert(sk.clone(), start_regions.iter().copied().collect());
     let room0 = shapes::room_of(&start, &it.d);
-    let lattice_trace = std::env::var_os("CELESTE_LATTICE_TRACE").is_some();
+    let lattice_trace = crate::knobs::flag("CELESTE_BUILD_TRACE");
 
     // THE ROUNDS: each traces its frontier in parallel against a lattice
     // snapshot; results apply in node order between rounds. Each frame is
     // bound in the worker arena it was traced in.
     let mut rep_constants: std::collections::BTreeMap<String, std::collections::HashMap<u32, super::iface::Conc>> = Default::default();
-    // `CELESTE_WALK_THREADS` caps workers: each holds an arena of GBs.
-    let n_workers = std::env::var("CELESTE_WALK_THREADS").ok().and_then(|v| v.parse().ok()).unwrap_or_else(|| std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4));
+    let n_workers = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
     let mut tracers: Vec<Tracer> = (0..n_workers).map(|_| Tracer { it: it.clone(), reset, fr }).collect();
     let mut frontier: Vec<WalkNode> = start_regions.into_iter().map(|r| (sk.clone(), r)).collect();
     // Shapes waiting for the deferred re-trace.

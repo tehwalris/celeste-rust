@@ -30,8 +30,8 @@ use super::StateId;
 fn capture_target() -> Option<&'static (PathBuf, Option<u32>)> {
     static T: std::sync::OnceLock<Option<(PathBuf, Option<u32>)>> = std::sync::OnceLock::new();
     T.get_or_init(|| {
-        let dir = std::env::var_os("CELESTE_EMIT_CAPTURE")?;
-        let frame = std::env::var("CELESTE_EMIT_CAPTURE_FRAME").ok().map(|v| v.parse().expect("CELESTE_EMIT_CAPTURE_FRAME: a frame"));
+        let dir = crate::knobs::value("CELESTE_EMIT_CAPTURE")?;
+        let frame = crate::knobs::number("CELESTE_EMIT_CAPTURE_FRAME");
         Some((PathBuf::from(dir), frame))
     })
     .as_ref()

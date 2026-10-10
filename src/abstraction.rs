@@ -16,7 +16,7 @@ pub use celeste_engine::widening::Level;
 pub fn synthetic_win_rect() -> Option<(i16, i16, i16, i16)> {
     static TARGET: std::sync::OnceLock<Option<(i16, i16, i16, i16)>> = std::sync::OnceLock::new();
     *TARGET.get_or_init(|| {
-        let raw = std::env::var("CELESTE_WIN_AT_XY").ok()?;
+        let raw = crate::knobs::value("CELESTE_WIN_AT_XY")?;
         let (x, y) = raw
             .split_once(',')
             .unwrap_or_else(|| panic!("CELESTE_WIN_AT_XY must be \"x,y\" or \"x0..x1,y0..y1\", got {:?}", raw));

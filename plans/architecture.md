@@ -568,7 +568,7 @@ Win conditions: the room exit (`game_runner::win_room()`, including the wrap
 from a row's last room to (0, y+1)); the summit's flag rect
 (`frame::win_rect`, `c195f8c`); the orb room's exit WITH the orb
 (`frame::orb_required`, `2dc116d`); a synthetic `CELESTE_WIN_AT_XY` /
-`CELESTE_WIN_RECT` / `--win-at` for experiments. Rooms past (5,2) start with
+`--win-at` for experiments. Rooms past (5,2) start with
 `max_djump = 2` (`26a0e54`).
 
 ### A level is a set of object flags

@@ -66,7 +66,7 @@ pub fn sources_in(root: &std::path::Path) -> Result<String> {
     let b3 = read("lua/builtin_level_3.lua")?;
     let b4 = read("lua/builtin_level_4.lua")?;
     // `CELESTE_SPLIT_FRAME`: the split-frame prototype, one frame as two steps.
-    let lua = if std::env::var_os("CELESTE_SPLIT_FRAME").is_some() { "lua/celeste-minimal-split.lua" } else { "lua/celeste-minimal.lua" };
+    let lua = if crate::knobs::flag("CELESTE_SPLIT_FRAME") { "lua/celeste-minimal-split.lua" } else { "lua/celeste-minimal.lua" };
     let mut game = crate::game_runner::apply_start_room(&read(lua)?)?;
     anyhow::ensure!(!(nodiag() && onlydiag()), "CELESTE_NODIAG and CELESTE_ONLYDIAG exclude each other");
     if let Some(j) = crate::game_runner::loading_jank() {
@@ -78,7 +78,7 @@ pub fn sources_in(root: &std::path::Path) -> Result<String> {
     if onlydiag() {
         game = forbid_straight_dashes(&game)?;
     }
-    if let Ok(seeds) = std::env::var("CELESTE_BALLOON_SEEDS") {
+    if let Some(seeds) = crate::knobs::value("CELESTE_BALLOON_SEEDS") {
         game = fix_balloon_seeds(&game, &seeds, root)?;
     }
     Ok(format!("{}\n{}\n{}\n", b3, b4, game))
@@ -202,7 +202,7 @@ mod loading_frame_tests {
 /// `CELESTE_NODIAG`: the No Diagonal Dashes category. A dash may not START
 /// with both a horizontal and a vertical direction held.
 pub fn nodiag() -> bool {
-    std::env::var_os("CELESTE_NODIAG").is_some()
+    crate::knobs::flag("CELESTE_NODIAG")
 }
 
 /// Make the diagonal arm of the player's dash start RAISE (`nil > 0`): a raise
@@ -220,7 +220,7 @@ fn forbid_diagonal_dashes(game: &str) -> Result<String> {
 /// held; a dash with no direction held (horizontal, facing direction) is not
 /// diagonal.
 pub fn onlydiag() -> bool {
-    std::env::var_os("CELESTE_ONLYDIAG").is_some()
+    crate::knobs::flag("CELESTE_ONLYDIAG")
 }
 
 /// Make the three non-diagonal arms of the player's dash start (horizontal

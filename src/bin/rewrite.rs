@@ -189,6 +189,10 @@ enum Command {
         /// count hash`) by their sources' (shape, key, cell) and horizons.
         #[arg(long)]
         dropped: bool,
+        /// With `--edges`: print frame F's edges (target, source, transfer)
+        /// on stderr, to diff two trees' edges at the frame whose line differs.
+        #[arg(long)]
+        dump_edges: Option<u32>,
     },
     /// ONE FORWARD FRAME of a tree, repeatably: the forward as it stood
     /// after `--frame` F (`ForwardState::at`: the tree's visited set,
@@ -687,6 +691,7 @@ fn rerun(engine: &dyn FrameStep, rt2: Rt2, layer: u32) -> Result<(Vec<Block>, bo
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
+    celeste_rust::knobs::startup()?;
 
     match cli.command {
         Command::Search { to, ceiling, level, checkpoint_dir, room, win_at, no_witness, save_marks, prefer } => {
@@ -915,6 +920,7 @@ fn main() -> Result<()> {
             cells: top_cells,
             edges,
             dropped,
+            dump_edges,
         } => {
             std::env::set_var("CELESTE_START_ROOM", &room);
             let dir = std::path::Path::new(&checkpoint_dir);
@@ -955,7 +961,6 @@ fn main() -> Result<()> {
             };
             if edges {
                 let eg = celeste_rust::storage::edges::EdgeStore::open(&dir.join("edges"), to)?;
-                let dump = std::env::var("CELESTE_EDGE_DUMP").ok();
                 // One frame's line (frames in parallel, printed in order).
                 let line = |frame: u32| -> Result<String> {
                     let (mut n, mut acc) = (0usize, 0u64);
@@ -965,7 +970,7 @@ fn main() -> Result<()> {
                         celeste_rust::search::arc_edges::encode_pair(&mut b, &pair);
                         let p = b.iter().fold(0u64, |h, &x| celeste_engine::runtime2::mix64(h ^ x as u64));
                         let (t, s) = (node(e.dst)?, node(e.src)?);
-                        if dump.as_deref() == Some(frame.to_string().as_str()) {
+                        if dump_edges == Some(frame) {
                             eprintln!("edge {t:016x} {s:016x} {pair:?}");
                         }
                         acc = acc.wrapping_add(celeste_engine::runtime2::mix64(t ^ s.rotate_left(21) ^ p.rotate_left(42)));

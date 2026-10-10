@@ -1127,7 +1127,7 @@ pub(super) fn rem_of(rt2: &celeste_engine::runtime2::Rt2) -> anyhow::Result<(u32
 /// concrete state's key maps its phase to that interval (`lookup_view`).
 /// Built under the global level: `_init` runs under it.
 pub(super) fn concrete_engines(n: usize) -> anyhow::Result<(Vec<crate::trace::refengine::RefEngine>, bool)> {
-    let seeds = std::env::var("CELESTE_CONCRETE_BALLOON_SEEDS").ok();
+    let seeds = crate::knobs::value("CELESTE_CONCRETE_BALLOON_SEEDS");
     if let Some(s) = &seeds {
         std::env::set_var("CELESTE_BALLOON_SEEDS", s);
     }

@@ -8,8 +8,8 @@ use anyhow::{anyhow, Result};
 /// the collision cache's room and the checkpoint fingerprint, which must agree.
 pub fn start_room() -> (i16, i16) {
     static ROOM: std::sync::OnceLock<(i16, i16)> = std::sync::OnceLock::new();
-    *ROOM.get_or_init(|| match std::env::var("CELESTE_START_ROOM") {
-        Ok(s) => {
+    *ROOM.get_or_init(|| match crate::knobs::value("CELESTE_START_ROOM") {
+        Some(s) => {
             let (x, y) = s
                 .split_once(',')
                 .unwrap_or_else(|| panic!("CELESTE_START_ROOM must be \"x,y\", got {:?}", s));
@@ -18,7 +18,7 @@ pub fn start_room() -> (i16, i16) {
                 y.trim().parse().expect("CELESTE_START_ROOM y must be an integer"),
             )
         }
-        Err(_) => (1, 0),
+        None => (1, 0),
     })
 }
 
@@ -42,13 +42,13 @@ pub fn level_index(x: i16, y: i16) -> i16 {
 /// `CELESTE_GEMSKIP`: the gemskip categories skip the orb - the orb room
 /// is won without it and every later room starts with ONE dash.
 pub fn gemskip() -> bool {
-    std::env::var_os("CELESTE_GEMSKIP").is_some()
+    crate::knobs::flag("CELESTE_GEMSKIP")
 }
 
 /// `CELESTE_HUNDRED`: the 100% category - a room is won only by exiting with
 /// its berry taken (`frame::got_fruit`).
 pub fn hundred() -> bool {
-    std::env::var_os("CELESTE_HUNDRED").is_some()
+    crate::knobs::flag("CELESTE_HUNDRED")
 }
 
 /// `CELESTE_LOADING_JANK=J`: start the room as REAL PLAY enters it - the
@@ -62,8 +62,8 @@ pub fn hundred() -> bool {
 pub fn loading_jank() -> Option<usize> {
     static J: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
     *J.get_or_init(|| {
-        let j = match std::env::var("CELESTE_LOADING_JANK") {
-            Ok(s) if s != "none" => {
+        let j = match crate::knobs::value("CELESTE_LOADING_JANK") {
+            Some(s) if s != "none" => {
                 let j: usize = s.trim().parse().unwrap_or_else(|_| panic!("CELESTE_LOADING_JANK must be an object index >= 1 or `none`, got {s:?}"));
                 assert!(j >= 1, "CELESTE_LOADING_JANK must be >= 1");
                 Some(j)

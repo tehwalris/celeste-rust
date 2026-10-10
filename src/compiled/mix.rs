@@ -60,14 +60,14 @@ pub(crate) const ROLE_ARC: u8 = 8;
 
 /// The directory, when on.
 pub(crate) fn dir() -> Option<PathBuf> {
-    std::env::var_os("CELESTE_KERNEL_MIX").map(PathBuf::from)
+    crate::knobs::value("CELESTE_KERNEL_MIX").map(PathBuf::from)
 }
 
 /// `CELESTE_KERNEL_METRICS=1`: the census and the slice counters without
 /// the files (`rewrite bench-frame --metrics`: `kernel_metrics`).
 pub fn metrics_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("CELESTE_KERNEL_METRICS").is_ok_and(|v| v == "1"))
+    *ON.get_or_init(|| crate::knobs::flag("CELESTE_KERNEL_METRICS"))
 }
 
 /// One kernel's census (`report`): its static counts, `key -> value`.

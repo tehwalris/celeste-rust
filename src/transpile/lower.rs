@@ -120,7 +120,7 @@ pub(crate) fn specialize_frame(
     decide: bool,
     room: Option<&crate::transpile::graph::Room>,
 ) -> (Graph, Vec<SpecializedBody>) {
-    let trace = std::env::var_os("CELESTE_BUILD_TRACE").is_some();
+    let trace = crate::knobs::flag("CELESTE_BUILD_TRACE");
     let t0 = std::time::Instant::now();
     // --- 1. the forks each outcome depends on: those in its cone (read off
     // the reachable set, so no limit on a frame's fork count) ---

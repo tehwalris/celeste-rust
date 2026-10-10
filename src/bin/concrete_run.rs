@@ -171,6 +171,7 @@ fn print_frame(st: &Rt2, frame_num: u32, input_byte: u8) {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
+    celeste_rust::knobs::startup()?;
     if cli.dump_start {
         dump_start(&RefEngine::new()?.initial()?);
         return Ok(());

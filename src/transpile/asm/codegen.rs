@@ -2089,32 +2089,12 @@ pub fn compile(
     let batch = 4;
     let t_lower = std::time::Instant::now();
     let order = schedule(g, &live, roots, batch);
-    // `CELESTE_ASM_STATS`: which graph op each vreg and instruction came from.
-    let stats = std::env::var_os("CELESTE_ASM_STATS").is_some();
-    let mut kinds: Vec<String> = Vec::new();
-    let mut kind_ix: HashMap<String, u16> = HashMap::new();
-    let mut vreg_kind: Vec<u16> = Vec::new();
-    let mut insts_by_kind: Vec<usize> = Vec::new();
     let mix = super::mix_on();
     let mut prov_node: Vec<NodeId> = Vec::new();
     for id in order {
-        let (v0, i0) = (lo.next_vreg, lo.insts.len());
         lo.lower_node(id)?;
         if mix {
             prov_node.resize(lo.insts.len(), id);
-        }
-        if stats {
-            let name = format!("{:?}", g.get(id).op).split('(').next().unwrap_or("").to_string();
-            let k = *kind_ix.entry(name.clone()).or_insert_with(|| {
-                kinds.push(name);
-                insts_by_kind.push(0);
-                (kinds.len() - 1) as u16
-            });
-            insts_by_kind[k as usize] += lo.insts.len() - i0;
-            vreg_kind.resize(lo.next_vreg as usize, u16::MAX);
-            for v in v0..lo.next_vreg {
-                vreg_kind[v as usize] = k;
-            }
         }
     }
     let t_lower = t_lower.elapsed();
@@ -2192,7 +2172,7 @@ pub fn compile(
         Vec::new()
     };
     let foldable = if mix { foldable(&lo.insts, lo.next_vreg) } else { Vec::new() };
-    if std::env::var_os("CELESTE_BUILD_TRACE").is_some() {
+    if crate::knobs::flag("CELESTE_BUILD_TRACE") {
         eprintln!("[build]   {sym}: {} insts, {} vregs: lower {:.1}s, reschedule {:.1}s", lo.insts.len(), lo.next_vreg, t_lower.as_secs_f64(), t.elapsed().as_secs_f64());
     }
 
@@ -2210,36 +2190,8 @@ pub fn compile(
 
     let t_alloc = std::time::Instant::now();
     let (home, spill_slots) = allocate(&lo.insts, lo.next_vreg, &remat);
-    if std::env::var_os("CELESTE_BUILD_TRACE").is_some() {
+    if crate::knobs::flag("CELESTE_BUILD_TRACE") {
         eprintln!("[build]   {sym}: allocate {:.1}s ({spill_slots} spill slots)", t_alloc.elapsed().as_secs_f64());
-    }
-    if stats {
-        // Per graph op: instructions, spilled values, reloads.
-        vreg_kind.resize(lo.next_vreg as usize, u16::MAX);
-        let (mut spilled, mut reloads) = (vec![0usize; kinds.len()], vec![0usize; kinds.len()]);
-        for v in 0..lo.next_vreg as usize {
-            if matches!(home[v], Loc::Spill(_)) && !remat[v] && vreg_kind[v] != u16::MAX {
-                spilled[vreg_kind[v] as usize] += 1;
-            }
-        }
-        let mut buf = Vec::new();
-        for inst in &lo.insts {
-            buf.clear();
-            inst_uses(inst, &mut buf);
-            for &v in &buf {
-                if matches!(home[v as usize], Loc::Spill(_)) && !remat[v as usize] && vreg_kind[v as usize] != u16::MAX {
-                    reloads[vreg_kind[v as usize] as usize] += 1;
-                }
-            }
-        }
-        let mut rows: Vec<usize> = (0..kinds.len()).collect();
-        rows.sort_by_key(|&k| std::cmp::Reverse(reloads[k]));
-        let line: Vec<String> = rows
-            .iter()
-            .take(14)
-            .map(|&k| format!("{} {}i/{}s/{}r", kinds[k], insts_by_kind[k], spilled[k], reloads[k]))
-            .collect();
-        eprintln!("[asm stats] {sym} by op (instructions/spilled values/reloads): {}", line.join(", "));
     }
 
     let has_calls = lo.insts.iter().any(|i| matches!(i, Inst::Call { .. }));

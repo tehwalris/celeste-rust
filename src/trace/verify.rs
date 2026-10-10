@@ -330,11 +330,11 @@ pub fn trace_frame<'a>(
     for (o, e) in outs.iter_mut().zip(super::error::for_outcomes(&mut it.d, &roots)) {
         o.error = it.d.graph.fold(crate::transpile::graph::Op::Or, vec![o.error, e]);
     }
-    if std::env::var_os("CELESTE_BUILD_TRACE").is_some() {
+    if crate::knobs::flag("CELESTE_BUILD_TRACE") {
         eprintln!("[build] trace_frame (widen {widen}): {} forks at the end, {} outcomes, {} pins", it.d.forks, outs.len(), pin.len());
     }
     // DIAGNOSTIC: forks by origin, and how many each outcome sees.
-    if std::env::var_os("CELESTE_BUILD_TRACE").is_some() {
+    if crate::knobs::flag("CELESTE_BUILD_TRACE") {
         let mut by: std::collections::BTreeMap<&str, usize> = Default::default();
         for (_, o) in &it.d.fork_origins {
             *by.entry(o.as_str()).or_default() += 1;
@@ -1030,7 +1030,7 @@ fn split_undecided_selects(d: &mut Symbolic, outs: Vec<FrameOut>, mut points: Op
         }
         n_rest += 1;
     }
-    if std::env::var_os("CELESTE_BUILD_TRACE").is_some() {
+    if crate::knobs::flag("CELESTE_BUILD_TRACE") {
         eprintln!("[build] split_undecided_selects: {n_in} outcomes, {n_splits} splits, {n_decided} decided by the points, {n_rest} absorbed by a case split, {} out", done.len());
     }
     // Each outcome whole again; only its pixels reach the kernel.
@@ -1181,13 +1181,13 @@ fn three_valued(d: &mut Symbolic, root: NodeId) -> NodeId {
                 }
                 None if boolean_op => {
                     let u = d.unknown_bool_atom();
-                    if std::env::var_os("CELESTE_BUILD_TRACE").is_some() {
+                    if crate::knobs::flag("CELESTE_BUILD_TRACE") {
                         eprintln!("[build] three_valued: {op:?} past {ARMS} arms, unknown {:?}", d.graph.get(u).op);
                     }
                     u
                 }
                 None => {
-                    if std::env::var_os("CELESTE_BUILD_TRACE").is_some() {
+                    if crate::knobs::flag("CELESTE_BUILD_TRACE") {
                         eprintln!("[build] three_valued: {op:?} past {ARMS} arms, the whole range");
                     }
                     d.graph.leaf(Op::Const(i32::MIN, i32::MAX))

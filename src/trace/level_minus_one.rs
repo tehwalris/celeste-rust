@@ -1019,16 +1019,14 @@ impl CostToGo {
 
 /// The start room's level -1 table at speed bound `spd_px`, built or cached.
 pub fn cost_to_go(root: &FsPath, spd_px: i32, threads: usize) -> Result<CostToGo> {
-    let cache = cache_file(root, spd_px)?;
-    if let Some((path, _)) = &cache {
-        match CostToGo::load(path) {
-            Ok(Some(t)) => {
-                eprintln!("[level -1] table read from {} ({} entries)", path.display(), t.d.len());
-                return Ok(t);
-            }
-            Ok(None) => {}
-            Err(e) => eprintln!("[level -1] the cached table {} is unreadable ({e:#}): building it", path.display()),
+    let (path, key) = cache_file(root, spd_px)?;
+    match CostToGo::load(&path) {
+        Ok(Some(t)) => {
+            eprintln!("[level -1] table read from {} ({} entries)", path.display(), t.d.len());
+            return Ok(t);
         }
+        Ok(None) => {}
+        Err(e) => eprintln!("[level -1] the cached table {} is unreadable ({e:#}): building it", path.display()),
     }
     let mut rep = String::new();
     let b = build(root, spd_px, threads, &mut rep)?;
@@ -1041,11 +1039,9 @@ pub fn cost_to_go(root: &FsPath, spd_px: i32, threads: usize) -> Result<CostToGo
         }
     }
     let t = CostToGo { d, start_d: b.start_d };
-    if let Some((path, key)) = &cache {
-        match t.save(path, key) {
-            Ok(()) => eprintln!("[level -1] table cached at {}", path.display()),
-            Err(e) => eprintln!("[level -1] could not cache the table at {} ({e:#})", path.display()),
-        }
+    match t.save(&path, &key) {
+        Ok(()) => eprintln!("[level -1] table cached at {}", path.display()),
+        Err(e) => eprintln!("[level -1] could not cache the table at {} ({e:#})", path.display()),
     }
     Ok(t)
 }
@@ -1053,7 +1049,7 @@ pub fn cost_to_go(root: &FsPath, spd_px: i32, threads: usize) -> Result<CostToGo
 /// The table cache's format; bump it when what a file holds changes.
 const CACHE_FORMAT: u32 = 1;
 
-/// The cache file under `CELESTE_L1_CACHE` (`off` disables) and its key: the
+/// The cache file under /var/tmp/celeste-l1-cache and its key: the
 /// binary, the cart, `spd_px` and every `CELESTE_*` variable not known to be
 /// irrelevant, so an unknown knob costs a rebuild, never a wrong table.
 ///
@@ -1062,16 +1058,12 @@ const CACHE_FORMAT: u32 = 1;
 /// a fixture sets it (tools/fixtures.sh: the table its tree was built
 /// under, recorded by fingerprint in the tree, which `bench-frame` checks),
 /// never a search.
-fn cache_file(root: &FsPath, spd_px: i32) -> Result<Option<(PathBuf, String)>> {
+fn cache_file(root: &FsPath, spd_px: i32) -> Result<(PathBuf, String)> {
     use std::hash::{Hash, Hasher};
-    if let Some(f) = std::env::var_os("CELESTE_L1_TABLE") {
-        return Ok(Some((PathBuf::from(f), format!("level -1 table pinned by CELESTE_L1_TABLE, format {CACHE_FORMAT}, S = {spd_px}\n"))));
+    if let Some(f) = crate::knobs::value("CELESTE_L1_TABLE") {
+        return Ok((PathBuf::from(f), format!("level -1 table pinned by CELESTE_L1_TABLE, format {CACHE_FORMAT}, S = {spd_px}\n")));
     }
-    let dir = match std::env::var("CELESTE_L1_CACHE") {
-        Ok(s) if s == "off" => return Ok(None),
-        Ok(s) => PathBuf::from(s),
-        Err(_) => PathBuf::from("/var/tmp/celeste-l1-cache"),
-    };
+    let dir = PathBuf::from("/var/tmp/celeste-l1-cache");
     let exe = std::env::current_exe()?;
     let exe_bytes = std::fs::read(&exe).map_err(|e| anyhow!("reading this binary {}: {e}", exe.display()))?;
     let lua = super::cart::sources_in(root)?;
@@ -1085,12 +1077,10 @@ fn cache_file(root: &FsPath, spd_px: i32) -> Result<Option<(PathBuf, String)>> {
     cart.sort();
     // Knobs the table cannot depend on: scheduling, the filter's horizon,
     // and the forward's diagnostics (they observe, they change nothing).
-    const IRRELEVANT: [&str; 9] = [
+    const IRRELEVANT: [&str; 7] = [
         "CELESTE_THREADS",
         "CELESTE_LEVEL_MINUS_ONE",
-        "CELESTE_L1_CACHE",
         "CELESTE_PHASES",
-        "CELESTE_UNIT_LANES",
         "CELESTE_KERNEL_METRICS",
         "CELESTE_KERNEL_KEY_CHECK",
         "CELESTE_EMIT_CAPTURE",
@@ -1112,7 +1102,7 @@ fn cache_file(root: &FsPath, spd_px: i32) -> Result<Option<(PathBuf, String)>> {
         exe_bytes.len(),
         cart.iter().map(|c| &c.0).collect::<Vec<_>>()
     );
-    Ok(Some((dir.join(format!("room{}_{}_s{spd_px}_{name}.bin", room.0, room.1)), key)))
+    Ok((dir.join(format!("room{}_{}_s{spd_px}_{name}.bin", room.0, room.1)), key))
 }
 
 impl CostToGo {
@@ -1971,7 +1961,7 @@ pub fn probe(root: &FsPath, opts: &Opts) -> Result<String> {
         say!(rep, "{:4} {line}", ty as i32 * 8)?;
     }
     // `CELESTE_L1_PATH="x,y"`: the table's fastest path from that cell.
-    if let Ok(s) = std::env::var("CELESTE_L1_PATH") {
+    if let Some(s) = crate::knobs::value("CELESTE_L1_PATH") {
         let (x, y) = s
             .split_once(',')
             .and_then(|(a, b)| Some((a.trim().parse::<i16>().ok()?, b.trim().parse::<i16>().ok()?)))

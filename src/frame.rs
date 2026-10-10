@@ -26,7 +26,7 @@ pub mod phases {
     static TICKS: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
     fn on() -> bool {
         static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        *ON.get_or_init(|| std::env::var("CELESTE_PHASES").is_ok_and(|v| v == "1"))
+        *ON.get_or_init(|| crate::knobs::flag("CELESTE_PHASES"))
     }
     #[inline]
     pub fn start() -> u64 {
@@ -233,8 +233,7 @@ pub fn win_rect() -> Option<(i16, i16, i16, i16)> {
         if crate::game_runner::level_index(rx, ry) != SUMMIT_LEVEL {
             return None;
         }
-        let root = std::env::var("CELESTE_ROOT").unwrap_or_else(|_| ".".to_string());
-        let cart = celeste_core::cart_data::CartData::load(std::path::Path::new(&root).join("cart"))
+        let cart = celeste_core::cart_data::CartData::load(std::path::Path::new("cart"))
             .expect("summit win: load the cart");
         let flags: Vec<(i16, i16)> = (0..16i16)
             .flat_map(|ty| (0..16i16).map(move |tx| (tx, ty)))
@@ -429,14 +428,14 @@ pub fn orb_required() -> bool {
 /// (`rerun-row`, `follow`, `arc-check`, ...) refuse a trimmed tree.
 pub fn trim_rows() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("CELESTE_TRIM_ROWS").is_ok_and(|v| v == "1"))
+    *ON.get_or_init(|| crate::knobs::flag("CELESTE_TRIM_ROWS"))
 }
 
 /// Search steps per game frame: 2 under the split frame
 /// (`CELESTE_SPLIT_FRAME`: part a up to and including the player's move,
 /// part b the rest; step `2k` is the end of frame `k`), else 1.
 pub fn steps_per_frame() -> u32 {
-    if std::env::var_os("CELESTE_SPLIT_FRAME").is_some() {
+    if crate::knobs::flag("CELESTE_SPLIT_FRAME") {
         2
     } else {
         1
@@ -448,10 +447,8 @@ pub fn steps_per_frame() -> u32 {
 pub fn threads() -> usize {
     static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *N.get_or_init(|| {
-        std::env::var("CELESTE_THREADS")
-            .ok()
-            .and_then(|s| s.parse::<usize>().ok())
-            .filter(|&n| n >= 1)
+        crate::knobs::number::<usize>("CELESTE_THREADS")
+            .inspect(|&n| assert!(n >= 1, "CELESTE_THREADS=0"))
             .unwrap_or_else(|| {
                 (std::thread::available_parallelism().map(|n| n.get()).unwrap_or(2) / 2).max(1)
             })
@@ -473,7 +470,7 @@ pub struct MinusOne {
 impl MinusOne {
     /// `CELESTE_LEVEL_MINUS_ONE="H,S"`, if set.
     pub fn from_env() -> Option<MinusOne> {
-        let s = std::env::var("CELESTE_LEVEL_MINUS_ONE").ok()?;
+        let s = crate::knobs::value("CELESTE_LEVEL_MINUS_ONE")?;
         let (h, sp) = s.split_once(',').expect("CELESTE_LEVEL_MINUS_ONE=\"H,S\"");
         let h: u32 = h.trim().parse().expect("CELESTE_LEVEL_MINUS_ONE horizon");
         let speed: i32 = sp.trim().parse().expect("CELESTE_LEVEL_MINUS_ONE speed bound (px per frame)");
@@ -494,12 +491,11 @@ fn minus_one_table(speed: i32) -> &'static crate::trace::level_minus_one::CostTo
     let (sp, table) = TABLE.get_or_init(|| {
         // The table measures the EXIT: unsound for a position win.
         assert!(win_rect().is_none(), "CELESTE_LEVEL_MINUS_ONE: the table measures the room exit; this room's win is a position");
-        let root = std::env::var("CELESTE_ROOT").unwrap_or_else(|_| ".".to_string());
         let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
         let t = std::time::Instant::now();
         let table = std::thread::Builder::new()
             .stack_size(256 * 1024 * 1024)
-            .spawn(move || crate::trace::level_minus_one::cost_to_go(std::path::Path::new(&root), speed, threads))
+            .spawn(move || crate::trace::level_minus_one::cost_to_go(std::path::Path::new("."), speed, threads))
             .expect("spawn the level -1 builder")
             .join()
             .expect("the level -1 builder panicked")
@@ -1421,10 +1417,7 @@ pub fn forward_run(
 /// second level at its first frame, 2026-10-07).
 fn ensure_disk_space(dir: &std::path::Path, last_free: &mut Option<u64>) -> Result<()> {
     use std::os::unix::ffi::OsStrExt;
-    let min_gb: u64 = match std::env::var("CELESTE_MIN_FREE_GB") {
-        Ok(v) => v.parse().context("CELESTE_MIN_FREE_GB")?,
-        Err(_) => 20,
-    };
+    let min_gb: u64 = crate::knobs::number("CELESTE_MIN_FREE_GB").unwrap_or(20);
     let path = std::ffi::CString::new(dir.as_os_str().as_bytes())?;
     // SAFETY: `path` is NUL-terminated; `st` is a valid out-parameter that
     // statvfs fills on success.

@@ -3,6 +3,7 @@ pub mod abstraction;
 pub mod compiled;
 pub mod frame;
 pub mod game_runner;
+pub mod knobs;
 pub mod concrete;
 pub mod metrics;
 pub mod search;
