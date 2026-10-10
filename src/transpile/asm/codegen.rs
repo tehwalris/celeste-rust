@@ -118,6 +118,7 @@ enum Key {
     Muldq(Vreg, Vreg),
     Sraq(Vreg, u8),
     Sllq(Vreg, u8),
+    ShrD(Vreg, u8, bool),
     BlendImm(u16, Vreg, Vreg),
     Cmp(u8, Vreg, SrcKey),
     Ternlog(Vreg, Vreg, Vreg, u8),
@@ -138,6 +139,9 @@ enum Inst {
     Sraq { dst: Vreg, a: Vreg, imm: u8 },
     /// Logical 64-bit left shift by an immediate (`vpsllq`).
     Sllq { dst: Vreg, a: Vreg, imm: u8 },
+    /// 32-bit right shift by an immediate: arithmetic (`vpsrad`) or logical
+    /// (`vpsrld`).
+    ShrD { dst: Vreg, a: Vreg, imm: u8, arith: bool },
     /// Per-lane `mask ? b : a` by a COMPILE-TIME mask (`vpblendmd`).
     BlendImm { dst: Vreg, mask: u16, a: Vreg, b: Vreg },
     /// Signed compare (`vpcmpd` predicate `imm`) to a vector mask.
@@ -288,6 +292,49 @@ impl<'a> Lower<'a> {
     fn sllq(&mut self, a: Vreg, imm: u8) -> Vreg {
         self.pure(Key::Sllq(a, imm), move |d| Inst::Sllq { dst: d, a, imm })
     }
+    fn shrd(&mut self, a: Vreg, imm: u8, arith: bool) -> Vreg {
+        self.pure(Key::ShrD(a, imm, arith), move |d| Inst::ShrD { dst: d, a, imm, arith })
+    }
+
+    /// PICO-8 `x / 2^s` (raw divisor `2^(16+s)`, `0 <= s <= 14`), inline:
+    /// `Pico8Num`'s division TRUNCATES toward zero and never saturates for
+    /// these divisors, so it is the arithmetic shift of `x` biased by
+    /// `2^s - 1` where `x` is negative (`(x + ((x >> 31) >>> (32 - s))) >> s`;
+    /// no overflow: the bias is added to negatives only).
+    /// `asm::tests::inline_div_rem_by_a_power_of_two_is_pico8s` checks it
+    /// bit-exact against `Pico8Num` over the whole i32 range.
+    fn div_pow2(&mut self, x: Vreg, s: u8) -> Vreg {
+        if s == 0 {
+            return x;
+        }
+        let sign = self.shrd(x, 31, true);
+        let bias = self.shrd(sign, 32 - s, false);
+        let biased = self.dbin(ROp::AddD, x, bias);
+        self.shrd(biased, s, true)
+    }
+
+    /// `s` if `id` is the literal `2^(16+s)` with `0 <= s <= 14` (a divisor
+    /// `div_pow2` takes).
+    fn pow2_divisor(&self, id: NodeId) -> Option<u8> {
+        match self.g.get(id).op {
+            Op::Const(lo, hi) if lo == hi && lo > 0 && (lo as u32).is_power_of_two() => {
+                let m = (lo as u32).trailing_zeros();
+                (16..=30).contains(&m).then(|| (m - 16) as u8)
+            }
+            _ => None,
+        }
+    }
+
+    /// The mask `2^m - 1` if `id` is the literal `2^m` (raw, `m <= 30`):
+    /// PICO-8's `%` is `rem_euclid` on the raw bits, which for a positive power
+    /// of two is the low bits, negatives included.
+    fn pow2_modulus_mask(&self, id: NodeId) -> Option<i32> {
+        match self.g.get(id).op {
+            Op::Const(lo, hi) if lo == hi && lo > 0 && (lo as u32).is_power_of_two() => Some(lo - 1),
+            _ => None,
+        }
+    }
+
     fn blend_imm(&mut self, mask: u16, a: Vreg, b: Vreg) -> Vreg {
         self.pure(Key::BlendImm(mask, a, b), move |d| Inst::BlendImm { dst: d, mask, a, b })
     }
@@ -808,6 +855,11 @@ impl<'a> Lower<'a> {
                 }
                 let iv = self.as_ival(a[0])?;
                 let ar = self.ival_regs(iv);
+                if let Some(sh) = self.pow2_divisor(a[1]) {
+                    let (lo, hi) = (self.div_pow2(ar[0], sh), self.div_pow2(ar[1], sh));
+                    self.vals[id as usize] = Some(Value::Ival([NumVal::Reg(lo), NumVal::Reg(hi)]));
+                    return Ok(());
+                }
                 let s = self.as_num(a[1])?;
                 let sreg = self.num_reg(s);
                 let mut ends = [ar[0]; 2];
@@ -1073,6 +1125,18 @@ impl<'a> Lower<'a> {
                 };
                 Value::Bool([ok, MaskVal::Const(true)])
             }
+            Op::Div if self.pow2_divisor(a[1]).is_some() => {
+                let sh = self.pow2_divisor(a[1]).expect("guarded");
+                let x = self.as_num(a[0])?;
+                let xr = self.num_reg(x);
+                Value::Num(NumVal::Reg(self.div_pow2(xr, sh)))
+            }
+            Op::Rem if self.dom(a[0]) != 2 && self.pow2_modulus_mask(a[1]).is_some() => {
+                let m = self.pow2_modulus_mask(a[1]).expect("guarded");
+                let x = self.as_num(a[0])?;
+                let xr = self.num_reg(x);
+                Value::Num(NumVal::Reg(self.dbin_c(ROp::AndD, xr, m)))
+            }
             Op::Div | Op::Rem | Op::Sin | Op::Mget => {
                 let (op, n_args) = match &node.op {
                     Op::Div => (CallOp::Div, 2),
@@ -1218,7 +1282,7 @@ fn inst_uses(inst: &Inst, out: &mut Vec<Vreg>) {
             out.push(*a);
             out.push(*b);
         }
-        Inst::Sraq { a, .. } | Inst::Sllq { a, .. } => out.push(*a),
+        Inst::Sraq { a, .. } | Inst::Sllq { a, .. } | Inst::ShrD { a, .. } => out.push(*a),
         Inst::Cmp { a, b, .. } => {
             out.push(*a);
             push_src(b, out);
@@ -1375,6 +1439,7 @@ fn inst_def(inst: &Inst) -> Option<Vreg> {
         | Inst::Muldq { dst, .. }
         | Inst::Sraq { dst, .. }
         | Inst::Sllq { dst, .. }
+        | Inst::ShrD { dst, .. }
         | Inst::BlendImm { dst, .. }
         | Inst::Cmp { dst, .. }
         | Inst::Ternlog { dst, .. }
@@ -1486,6 +1551,62 @@ fn allocate(insts: &[Inst], n_vregs: Vreg, remat: &[bool]) -> (Vec<Loc>, usize) 
     (home, n_slots as usize)
 }
 
+/// Per call (by instruction index), which registers to SAVE before it and
+/// RESTORE after it. Live across a call: a register holding a value defined
+/// before it and read after it (a vreg keeps one home for its whole interval,
+/// `allocate` never splits; a call's operands are marshalled before it, its
+/// result written after). A value live across two CONSECUTIVE calls and not
+/// read between them (nor as the second's operand) stays in the save area:
+/// not restored after the first, not saved again before the second. Its
+/// register holds nothing anyone reads in between (no other vreg has it
+/// while this one is live), and its save slot (one per register) is written
+/// by no other save meanwhile.
+fn call_saves(insts: &[Inst], n_vregs: Vreg, home: &[Loc]) -> HashMap<usize, (u32, u32)> {
+    let calls: Vec<u32> = (0..insts.len() as u32).filter(|&i| matches!(insts[i as usize], Inst::Call { .. })).collect();
+    let mut live = vec![0u32; calls.len()];
+    // Bit r of `carry[k]`: register r's value stays saved from call k to k+1.
+    let mut carry = vec![0u32; calls.len()];
+    let mut def = vec![u32::MAX; n_vregs as usize];
+    let mut uses: Vec<Vec<u32>> = vec![Vec::new(); n_vregs as usize];
+    let mut buf = Vec::new();
+    for (i, inst) in insts.iter().enumerate() {
+        if let Some(d) = inst_def(inst) {
+            def[d as usize] = def[d as usize].min(i as u32);
+        }
+        buf.clear();
+        inst_uses(inst, &mut buf);
+        for v in &buf {
+            uses[*v as usize].push(i as u32);
+        }
+    }
+    for v in 0..n_vregs as usize {
+        let Loc::Reg(r) = home[v] else { continue };
+        let Some(&last) = uses[v].last() else { continue };
+        if def[v] == u32::MAX {
+            continue;
+        }
+        // Calls strictly inside (def, last).
+        let from = calls.partition_point(|&c| c <= def[v]);
+        let to = calls.partition_point(|&c| c < last).max(from);
+        for k in from..to {
+            live[k] |= 1 << r;
+            // Read in (calls[k], calls[k + 1]]?
+            if k + 1 < to {
+                let at = uses[v].partition_point(|&u| u <= calls[k]);
+                if uses[v].get(at).is_none_or(|&u| u > calls[k + 1]) {
+                    carry[k] |= 1 << r;
+                }
+            }
+        }
+    }
+    (0..calls.len())
+        .map(|k| {
+            let carried_in = if k > 0 { carry[k - 1] } else { 0 };
+            (calls[k] as usize, (live[k] & !carried_in, live[k] & !carry[k]))
+        })
+        .collect()
+}
+
 // ---- emission ----
 
 struct Emitter<'a> {
@@ -1495,6 +1616,12 @@ struct Emitter<'a> {
     def_of: &'a [u32],
     /// rsp offset of the 32-zmm save area used around a call.
     save_off: u32,
+    /// Per instruction index of a call: the registers (bit r for zmm r) to
+    /// save before it and to restore after it (`call_saves`).
+    call_saves: &'a HashMap<usize, (u32, u32)>,
+    /// The last instruction reading `ZERO` (a `Neg`): a call before it
+    /// re-zeroes it.
+    last_neg: Option<usize>,
     /// rsp offset of the call-out argument/result buffers.
     argbuf_off: u32,
     pool: Pool,
@@ -1567,7 +1694,7 @@ impl<'a> Emitter<'a> {
         }
     }
 
-    fn emit_inst(&mut self, inst: &Inst) {
+    fn emit_inst(&mut self, k: usize, inst: &Inst) {
         match inst {
             Inst::Load { dst, off } => {
                 if self.skip_def(*dst) {
@@ -1642,6 +1769,12 @@ impl<'a> Emitter<'a> {
                 writeln!(self.out, "    vpsllq ${}, %zmm{}, %zmm{}", imm, ra, d).unwrap();
                 self.store_def(*dst, d);
             }
+            Inst::ShrD { dst, a, imm, arith } => {
+                let ra = self.use_reg(*a, OPA);
+                let d = self.def_reg(*dst);
+                writeln!(self.out, "    {} ${}, %zmm{}, %zmm{}", if *arith { "vpsrad" } else { "vpsrld" }, imm, ra, d).unwrap();
+                self.store_def(*dst, d);
+            }
             Inst::BlendImm { dst, mask, a, b } => {
                 let ra = self.use_reg(*a, OPA);
                 let rb = self.use_reg(*b, OPB);
@@ -1680,8 +1813,12 @@ impl<'a> Emitter<'a> {
                     writeln!(self.out, "    vmovdqu64 %zmm{}, {}(%rsp)", r, off).unwrap();
                 }
                 let resbuf = self.argbuf_off + 7 * 64;
-                // 2. save all 32 zmm (the call clobbers every vector reg).
-                for r in 0..32u32 {
+                // 2. save the registers live across the call and not still
+                // saved from the call before (it clobbers every vector
+                // register; the scratches hold nothing across an
+                // instruction, `ZERO` is re-zeroed below).
+                let (saves, restores) = self.call_saves[&k];
+                for r in (0..32u32).filter(|r| saves & (1 << r) != 0) {
                     writeln!(self.out, "    vmovdqu64 %zmm{}, {}(%rsp)", r, self.save_off + r * 64)
                         .unwrap();
                 }
@@ -1737,10 +1874,14 @@ impl<'a> Emitter<'a> {
                 if stack_arg {
                     writeln!(self.out, "    addq $16, %rsp").unwrap();
                 }
-                // 5. restore all 32 zmm.
-                for r in 0..32u32 {
+                // 5. restore those read before the next call; `ZERO` again
+                // where a `Neg` follows.
+                for r in (0..32u32).filter(|r| restores & (1 << r) != 0) {
                     writeln!(self.out, "    vmovdqu64 {}(%rsp), %zmm{}", self.save_off + r * 64, r)
                         .unwrap();
+                }
+                if self.last_neg.is_some_and(|n| n > k) {
+                    writeln!(self.out, "    vpxorq %zmm{Z}, %zmm{Z}, %zmm{Z}", Z = ZERO).unwrap();
                 }
                 // 6. read the result into dst.
                 let d = self.def_reg(*dst);
@@ -2032,12 +2173,16 @@ pub fn compile(
     let save_off = spill_bytes;
     let argbuf_off = spill_bytes + SAVE_BYTES;
 
+    let call_saves = call_saves(&lo.insts, lo.next_vreg, &home);
+    let last_neg = lo.insts.iter().rposition(|i| matches!(i, Inst::Neg { .. }));
     let mut em = Emitter {
         home: &home,
         insts: &lo.insts,
         remat: &remat,
         def_of: &def_of,
         save_off,
+        call_saves: &call_saves,
+        last_neg,
         argbuf_off,
         pool: Pool::default(),
         out: String::new(),
@@ -2050,7 +2195,7 @@ pub fn compile(
             // A comment line: assembles to nothing, and `drop_redundant_reloads` passes it.
             writeln!(em.out, "#@{k}").unwrap();
         }
-        em.emit_inst(inst);
+        em.emit_inst(k, inst);
     }
     std::mem::swap(&mut em.out, &mut body); // em.out empty again, body holds the code
     let body = drop_redundant_reloads(&body);
@@ -2290,6 +2435,7 @@ fn inst_kind(inst: &Inst) -> &'static str {
         Inst::Muldq { .. } => "muldq",
         Inst::Sraq { .. } => "sraq",
         Inst::Sllq { .. } => "sllq",
+        Inst::ShrD { .. } => "shrd",
         Inst::BlendImm { .. } => "blendimm",
         Inst::Cmp { .. } => "cmp",
         Inst::Ternlog { imm: 0xca, .. } => "sel",

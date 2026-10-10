@@ -49,3 +49,33 @@ BENCHMARK_DATA.md.
 - `codegen::foldable` (the mix diagnostic's estimate) is kept: it now
   measures what bit identities would STILL remove (near nothing), which is
   the check that the fold is complete.
+
+## 3. Call-outs: live registers only; `/2^s` and `%2^m` inline
+
+- **Liveness from the allocator's own intervals** (`codegen::call_saves`):
+  a register is saved around a call iff it holds a vreg defined before and
+  read after it. `allocate` never splits an interval, so a vreg's home is
+  its home for its whole life and nothing else is in that register
+  meanwhile: this is exact, not a heuristic. The scratches (zmm26-30) hold
+  nothing across an instruction; `ZERO` (zmm31) is re-zeroed after a call
+  when a `Neg` follows instead of saved.
+- **Beyond the brief: values carried across a RUN of calls.** The hot kernels
+  call `tile_flag_at` back to back (the player's `is_solid` probes); a value
+  live across consecutive calls and not read between them stays in its
+  save slot - not restored after the first, not saved again before the
+  next. Measured: call-out marshalling 910M -> 430M dynamic instructions on
+  the reference frame. Exact for the same reason (one vreg per register
+  while live; one save slot per register, written only by that register's
+  saves). Tested with a mutation: carrying unconditionally fails
+  `values_held_across_a_run_of_calls_survive_it`.
+- **`/ 2^s` inline only for `0 <= s <= 14`** (raw divisor `2^16 ..= 2^30`):
+  `Pico8Num`'s `/` truncates toward zero and saturates on overflow; for a
+  divisor >= 1 nothing overflows, and truncation is the biased arithmetic
+  shift. Smaller divisors (`/0.5`, which can saturate) stay call-outs.
+  `%` by any positive power of two `2^m` (raw, `m <= 30`) is the low-bit mask
+  (`rem_euclid`), negatives included. Interval `/` by a power of two:
+  per endpoint, as the call-out did. Checked bit-exact against `Pico8Num`
+  over the edges of the i32 range (MIN, MAX, 0, +-1, every +-2^k and its
+  neighbours) and random raws (`inline_div_rem_by_a_power_of_two_is_pico8s`).
+- The stack frame keeps its 32-register save area (unchanged layout; only
+  fewer moves).
