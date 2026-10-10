@@ -277,7 +277,7 @@ Where the code differs from the design above, and why:
 Verified (the commits say which): position-free keys (sets identical to
 fg-2300 by rekeying its trees); room (1,0) f0-f62 and (6,2) 100% f0-f57 kept
 counts, ckhash and pos graphs identical; the three pinned gates; KEY_CHECK;
-arc-check at r0sx and r0sxhn; 3 vs 32 threads and a resume identical
+arc-check at r0sx (r0sxhn pending, Follow-ups); KEY_CHECK at r0sxhn too; 3 vs 32 threads and a resume identical
 (states and edge content); `gates/raise.sh`; the ignored tests; end to end
 room (1,0) `--ceiling 99`, (6,2) 100% `r0sxhf,r0sxh --ceiling 94` and (4,2)
 `r0sxhn,r0sxh --ceiling 71`: the same optima, witnesses and `[gate]` counts.
@@ -290,3 +290,21 @@ themselves are ~3.5 B, as the runs were. Since: the owner by lid derived
 from the owner index when read (`EdgeStore::owners`, 0.4 s a graph-load
 pass in (1,0)), sources a row range of the previous layer's frame file
 where the unit's block was whole: (1,0) 50 GB, (6,2) 67 GB.
+
+## Follow-ups (not built)
+
+- **Edge file v6: compact lid tables.** The owner index is 16 B a lid
+  (region, entry, unit, lid as four u32s); 243M lids in room (1,0) h99
+  make it ~3.9 GB of the 50 GB. Delta-coded by owner (regions ascend,
+  entries within a region ascend, unit/lid small) it should be a few bytes
+  a lid. Branch `storage-unify` (plans/storage-unify.md, `rewrite
+  storage-census`) measured the alternative - unified per-region state
+  sets - and recommends against it, in favour of these compact lid tables.
+- **Edge block compression.** Blocks are ~3.5 B an edge (cell byte,
+  varint source deltas, transfer rank); a general-purpose or entropy coder
+  over a block is untried.
+- **The object-level arc-check** (r0sxhn, room (4,2)) on a v2 tree: started
+  (f38-60, 20 samples; and f44-47, 5 samples) but the reference engine on
+  widened object states ran for over 1.5 h without finishing; the r0sx
+  arc-checks (gate tree, 0 bad) and ref-checks pass. Rerun it with fewer
+  samples or a faster reference before relying on it.
