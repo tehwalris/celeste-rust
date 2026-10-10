@@ -1729,31 +1729,56 @@ mod tests {
                 })
             })
         };
-        let (mut icy, mut dry) = (0, 0);
-        for rx in 0..8i16 {
-            for ry in 0..4i16 {
-                it.cache = Some(std::sync::Arc::new(
-                    celeste_core::collision_cache::CollisionCache::new(&cd, rx, ry).expect("cache"),
-                ));
-                let mut o = st.clone();
-                for (k, v) in [("x", rx), ("y", ry)] {
-                    let n = it.d.num(crate::pico8_num::Pico8Num::from_i16(v));
-                    iface::set(&mut o, &[iface::key("room"), iface::key(k)], Value::Num(n))
-                        .expect("set room");
-                }
-                let mut any = false;
-                for (&(x, y, w, h), probe) in rects.iter().zip(&probes) {
-                    let s = run_one(&mut it, probe, o.clone()).expect("ice_at answers");
-                    let Some(Value::Bool(b)) = iface::get(&s, &[iface::key("ice_probe")]) else {
-                        panic!("ice_at did not return a boolean")
-                    };
-                    let want = scan(rx, ry, x, y, w, h);
-                    assert_eq!(it.d.decide(&b), Some(want), "room ({rx},{ry}) ice_at({x},{y},{w},{h})");
-                    any |= want;
-                }
-                if any { icy += 1 } else { dry += 1 }
-            }
+        // The rooms in parallel, each on its own COPY of the interpreter.
+        struct Worker<'a> {
+            it: Interp<'a, Symbolic>,
+            st: State<Symbolic>,
+            probes: &'a [ast::Ast],
         }
+        // SAFETY: the interpreter's raw pointers point into this test's
+        // ASTs, which outlive the scope and are only read.
+        unsafe impl Send for Worker<'_> {}
+        let rooms: Vec<(i16, i16)> = (0..8i16).flat_map(|rx| (0..4i16).map(move |ry| (rx, ry))).collect();
+        let next = std::sync::atomic::AtomicUsize::new(0);
+        let workers = std::thread::available_parallelism().map_or(4, |n| n.get()).min(16);
+        let icy_rooms: Vec<bool> = std::thread::scope(|sc| {
+            let hs: Vec<_> = (0..workers)
+                .map(|_| {
+                    let mut w = Worker { it: it.clone(), st: st.clone(), probes: &probes };
+                    let (rooms, rects, next, scan, cd) = (&rooms, &rects, &next, &scan, &cd);
+                    std::thread::Builder::new()
+                        .stack_size(64 << 20)
+                        .spawn_scoped(sc, move || {
+                            let w = &mut w;
+                            let mut out = Vec::new();
+                            while let Some(&(rx, ry)) = rooms.get(next.fetch_add(1, std::sync::atomic::Ordering::Relaxed)) {
+                                w.it.cache = Some(std::sync::Arc::new(celeste_core::collision_cache::CollisionCache::new(cd, rx, ry).expect("cache")));
+                                let mut o = w.st.clone();
+                                for (k, v) in [("x", rx), ("y", ry)] {
+                                    let n = w.it.d.num(crate::pico8_num::Pico8Num::from_i16(v));
+                                    iface::set(&mut o, &[iface::key("room"), iface::key(k)], Value::Num(n)).expect("set room");
+                                }
+                                let mut any = false;
+                                for (&(x, y, wd, h), probe) in rects.iter().zip(w.probes) {
+                                    let s = run_one(&mut w.it, probe, o.clone()).expect("ice_at answers");
+                                    let Some(Value::Bool(b)) = iface::get(&s, &[iface::key("ice_probe")]) else {
+                                        panic!("ice_at did not return a boolean")
+                                    };
+                                    let want = scan(rx, ry, x, y, wd, h);
+                                    assert_eq!(w.it.d.decide(&b), Some(want), "room ({rx},{ry}) ice_at({x},{y},{wd},{h})");
+                                    any |= want;
+                                }
+                                out.push(any);
+                            }
+                            out
+                        })
+                        .expect("spawn an ice worker")
+                })
+                .collect();
+            hs.into_iter().flat_map(|h| h.join().expect("an ice worker panicked")).collect()
+        });
+        let icy = icy_rooms.iter().filter(|&&b| b).count();
+        let dry = icy_rooms.len() - icy;
         eprintln!("[ice] {icy} rooms with ice, {dry} without");
         assert!(icy > 0 && dry > 0, "the map has rooms with and without ice");
     }
@@ -2004,45 +2029,86 @@ end
         let at: Vec<(crate::transpile::graph::Graph, Vec<NodeId>)> = (0u8..64)
             .map(|m| at_buttons(&it.d.graph, &f, &std::array::from_fn(|i| m & (1 << i) != 0)).expect("the six buttons"))
             .collect();
-        for (label, over) in &perts {
-            let label = label.as_str();
-            let cells = cells_with(&f.iface, over).expect("overrides name input cells");
-            for mask in 0u8..64 {
-                let mut bits = [false; 6];
-                for (i, b) in bits.iter_mut().enumerate() {
-                    *b = mask & (1 << i) != 0;
+        // Every (sweep point, buttons) in parallel: each worker runs the
+        // oracle on its own COPY of the interpreter (the oracle's frame adds
+        // nodes to its arena; the traced frame and `at` are read only).
+        enum Point {
+            Checked(usize, usize),
+            Declined(String),
+        }
+        struct Worker<'a> {
+            it: Interp<'a, Symbolic>,
+            frame: &'a ast::Ast,
+        }
+        // SAFETY: the interpreter's raw pointers point into this test's
+        // ASTs, which outlive the scope and are only read.
+        unsafe impl Send for Worker<'_> {}
+        let points: Vec<(usize, u8)> = (0..perts.len()).flat_map(|i| (0u8..64).map(move |m| (i, m))).collect();
+        let next = std::sync::atomic::AtomicUsize::new(0);
+        let workers = std::thread::available_parallelism().map_or(4, |n| n.get()).min(16);
+        let mut results: Vec<(usize, Point)> = std::thread::scope(|sc| {
+            let hs: Vec<_> = (0..workers)
+                .map(|_| {
+                    let mut w = Worker { it: it.clone(), frame: &frame };
+                    let (st, perts, f, at, points, next) = (&st, &perts, &f, &at, &points, &next);
+                    std::thread::Builder::new()
+                        .stack_size(64 << 20)
+                        .spawn_scoped(sc, move || {
+                            let w = &mut w;
+                            let mut out = Vec::new();
+                            while let Some(&(pi, mask)) = points.get(next.fetch_add(1, std::sync::atomic::Ordering::Relaxed)) {
+                                let (label, over) = (&perts[pi].0, &perts[pi].1);
+                                let cells = cells_with(&f.iface, over).expect("overrides name input cells");
+                                let mut bits = [false; 6];
+                                for (i, b) in bits.iter_mut().enumerate() {
+                                    *b = mask & (1 << i) != 0;
+                                }
+                                let mut o = st.clone();
+                                for (p, c) in over {
+                                    let v = match c {
+                                        Conc::Num(n) => Value::Num(w.it.d.num(*n)),
+                                        Conc::Bool(b) => Value::Bool(w.it.d.boolean(*b)),
+                                    };
+                                    iface::set(&mut o, p, v).expect("override a heap slot");
+                                }
+                                set_buttons(&mut w.it.d, &mut o, &bits).unwrap_or_else(|e| panic!("[verify] {label} {bits:?}: {e:#}"));
+                                let mut o = run_one(&mut w.it, w.frame, o).unwrap_or_else(|e| panic!("[verify] oracle {label} {bits:?} stopped at: {e:#}"));
+                                // The absent-as-zero fields, as every frame's outcomes write them.
+                                crate::trace::widen::materialize_absent_fields(&mut o, &mut w.it.d).expect("materialize the absent fields");
+                                let want = iface::read_concrete(&w.it.d, &o, &[]).unwrap_or_else(|e| panic!("[verify] oracle {label} {bits:?} not concrete: {e:#}"));
+                                let point = match check_at(&w.it, f, &at[mask as usize], &cells, &bits, &want) {
+                                    Ok((which, n)) => Point::Checked(which, n),
+                                    // A refusal, not a wrong answer: counted.
+                                    Err(e) if format!("{}", e).contains("declined") => Point::Declined(format!("[verify] {label} {bits:?} declined: {e:#}")),
+                                    // A MISMATCH is a WRONG ANSWER: it must fail the test.
+                                    Err(e) => panic!("[verify] MISMATCH {} {:#}", label, e),
+                                };
+                                out.push((pi * 64 + mask as usize, point));
+                            }
+                            out
+                        })
+                        .expect("spawn an oracle worker")
+                })
+                .collect();
+            hs.into_iter().flat_map(|h| h.join().expect("an oracle worker panicked")).collect()
+        });
+        results.sort_by_key(|r| r.0);
+        for (k, point) in results {
+            let label = perts[k / 64].0.as_str();
+            match point {
+                Point::Checked(which, n) => {
+                    checked += 1;
+                    compared += n;
+                    used.insert(which);
                 }
-                let mut o = st.clone();
-                for (p, c) in over {
-                    let v = match c {
-                        Conc::Num(n) => Value::Num(it.d.num(*n)),
-                        Conc::Bool(b) => Value::Bool(it.d.boolean(*b)),
-                    };
-                    iface::set(&mut o, p, v).expect("override a heap slot");
-                }
-                set_buttons(&mut it.d, &mut o, &bits).unwrap_or_else(|e| panic!("[verify] {label} {bits:?}: {e:#}"));
-                let mut o = run_one(&mut it, &frame, o).unwrap_or_else(|e| panic!("[verify] oracle {label} {bits:?} stopped at: {e:#}"));
-                // The absent-as-zero fields, as every frame's outcomes write them.
-                crate::trace::widen::materialize_absent_fields(&mut o, &mut it.d).expect("materialize the absent fields");
-                let want = iface::read_concrete(&it.d, &o, &[]).unwrap_or_else(|e| panic!("[verify] oracle {label} {bits:?} not concrete: {e:#}"));
-                match check_at(&it, &f, &at[mask as usize], &cells, &bits, &want) {
-                    Ok((which, n)) => {
-                        checked += 1;
-                        compared += n;
-                        used.insert(which);
+                Point::Declined(msg) => {
+                    declined += 1;
+                    let n = declined_at.entry(label.to_string()).or_default();
+                    // The first refusal per sweep label, named.
+                    if *n == 0 {
+                        eprintln!("{msg}");
                     }
-                    // A refusal, not a wrong answer: counted.
-                    Err(e) if format!("{}", e).contains("declined") => {
-                        declined += 1;
-                        let n = declined_at.entry(label.to_string()).or_default();
-                        // The first refusal per sweep label, named.
-                        if *n == 0 {
-                            eprintln!("[verify] {label} {bits:?} declined: {e:#}");
-                        }
-                        *n += 1;
-                    }
-                    // A MISMATCH is a WRONG ANSWER: it must fail the test.
-                    Err(e) => panic!("[verify] MISMATCH {} {:#}", label, e),
+                    *n += 1;
                 }
             }
         }

@@ -393,8 +393,11 @@ mod tests {
                 })
                 .collect()
         };
+        // The route's sampled states (concrete steps, cheap), then each
+        // checked on its own engine (the unpinned steps are the cost).
         let mut row = eng.initial().expect("initial state");
-        let (mut with, mut leaves_pinned, mut leaves_full) = (0, 0, 0);
+        let mut with = 0;
+        let mut sampled: Vec<(usize, Rt2)> = Vec::new();
         for (f, &byte) in inputs.iter().enumerate() {
             if f % stride == 0 {
                 let mut abs = row.clone_block();
@@ -402,21 +405,38 @@ mod tests {
                 if !objects_of_type(&from_block(&abs, 0, &eng.fn_info, &eng.base).expect("state").0, what).is_empty() {
                     with += 1;
                 }
-                let mut ran: Vec<(u8, u8)> = Vec::new();
-                for b in if all_inputs { 0..64u8 } else { byte..byte + 1 } {
-                    if ran.iter().any(|(r, m)| (r ^ b) & m == 0) {
-                        continue;
-                    }
-                    let (pinned, read) = eng.step_at_pinned(&abs, b, level, true).expect("pinned step");
-                    let (full, read_full) = eng.step_at_pinned(&abs, b, level, false).expect("full step");
-                    assert_eq!(projected(&pinned), projected(&full), "f{f} input {b}: the pins changed the projected successors");
-                    ran.push((b, read | read_full));
-                    leaves_pinned += pinned.len();
-                    leaves_full += full.len();
-                }
+                sampled.push((f, abs));
             }
             row = eng.step_one(&row, byte).expect("frame").into_rt2();
         }
+        let next = std::sync::atomic::AtomicUsize::new(0);
+        let workers = std::thread::available_parallelism().map_or(4, |n| n.get()).min(16).min(sampled.len()).max(1);
+        let (leaves_pinned, leaves_full) = std::thread::scope(|sc| {
+            let hs: Vec<_> = (0..workers)
+                .map(|_| {
+                    sc.spawn(|| {
+                        let mut eng = RefEngine::new().expect("ref engine");
+                        let (mut pinned_n, mut full_n) = (0, 0);
+                        while let Some((f, abs)) = sampled.get(next.fetch_add(1, std::sync::atomic::Ordering::Relaxed)) {
+                            let mut ran: Vec<(u8, u8)> = Vec::new();
+                            for b in if all_inputs { 0..64u8 } else { inputs[*f]..inputs[*f] + 1 } {
+                                if ran.iter().any(|(r, m)| (r ^ b) & m == 0) {
+                                    continue;
+                                }
+                                let (pinned, read) = eng.step_at_pinned(abs, b, level, true).expect("pinned step");
+                                let (full, read_full) = eng.step_at_pinned(abs, b, level, false).expect("full step");
+                                assert_eq!(projected(&pinned), projected(&full), "f{f} input {b}: the pins changed the projected successors");
+                                ran.push((b, read | read_full));
+                                pinned_n += pinned.len();
+                                full_n += full.len();
+                            }
+                        }
+                        (pinned_n, full_n)
+                    })
+                })
+                .collect();
+            hs.into_iter().map(|h| h.join().expect("a pin worker panicked")).fold((0, 0), |a, b| (a.0 + b.0, a.1 + b.1))
+        });
         eprintln!("{with} sampled states with a {what}; {leaves_pinned} leaves pinned, {leaves_full} without");
         (with, leaves_pinned, leaves_full)
     }
