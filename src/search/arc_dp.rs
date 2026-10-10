@@ -1491,7 +1491,7 @@ pub fn solve(
     known: Option<&super::known::Route>,
 ) -> anyhow::Result<Solved> {
     use crate::frame::{mark_row, save_marks, MarkRow, Visited};
-    crate::frame::check_tree_level(dir, level)?;
+    crate::settings::Settings::current().check(dir, level)?;
     crate::metrics::mem_phase("arc: start");
     let Loaded { graph, start, marks, wins, .. } = load(dir, horizon)?;
     let g = &graph;

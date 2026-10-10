@@ -7,6 +7,7 @@ pub mod knobs;
 pub mod concrete;
 pub mod metrics;
 pub mod search;
+pub mod settings;
 pub mod storage;
 pub mod trace;
 pub mod transpile;

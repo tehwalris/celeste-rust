@@ -521,11 +521,12 @@ else of an old frame, and the rows' values are most of a tree's frames
 GB). The diagnostics that load old rows refuse a trimmed tree, so it is off
 by default.
 The level is a value (2026-10-10): the engines carry it (`FrameEngine`,
-`RefEngine::at_level`, `FrameStep::level`), and a tree records it
-(`<level>/level.txt`, written when a forward starts it; `frame::
-check_tree_level` refuses another `--level` on resume, reuse, a raise, the
-arc phase and the diagnostics; a tree from before the record is taken as it
-is). One kernel set is resident; a call at another level drops it and builds
+`RefEngine::at_level`, `FrameStep::level`), and a tree records it in its
+settings record (`<level>/settings.txt`, `settings::Settings`, written when a
+forward starts it, with the room, category and region settings;
+`Settings::check` refuses another `--level` or any other setting on resume,
+reuse, a raise, the arc phase and the diagnostics; a tree without the record
+is refused). One kernel set is resident; a call at another level drops it and builds
 that level's. Fused graphs are dropped
 after assembly unless `CELESTE_KERNEL_EXPLAIN`.
 

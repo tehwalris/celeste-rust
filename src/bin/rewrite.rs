@@ -1174,7 +1174,7 @@ fn main() -> Result<()> {
         Command::BenchStorage { capture, tree, room, level, threads, phase, reps } => {
             std::env::set_var("CELESTE_START_ROOM", &room);
             let threads = threads.unwrap_or_else(celeste_rust::frame::threads);
-            celeste_rust::frame::check_tree_level(std::path::Path::new(&tree), level)?;
+            celeste_rust::settings::Settings::current().check(std::path::Path::new(&tree), level)?;
             celeste_rust::storage::bench::bench_storage(&celeste_rust::storage::bench::BenchArgs {
                 capture: std::path::Path::new(&capture),
                 tree: std::path::Path::new(&tree),
@@ -1273,7 +1273,7 @@ fn main() -> Result<()> {
                 std::env::set_var("CELESTE_THREADS", n.to_string());
             }
             let dir = std::path::Path::new(&level_dir);
-            celeste_rust::frame::check_tree_level(dir, level)?;
+            celeste_rust::settings::Settings::current().check(dir, level)?;
             let edges_dir = dir.join("edges");
             let ids = celeste_rust::compiled::ids();
             let graph = celeste_rust::storage::edges::EdgeStore::open(&edges_dir, to)?;
@@ -1554,7 +1554,7 @@ fn main() -> Result<()> {
                 "step {frame} is mid split frame at a near level: the graph side keeps a floor's computed `collideable` there, the block side does not"
             );
             let dir = std::path::Path::new(&level_dir);
-            celeste_rust::frame::check_tree_level(dir, level)?;
+            celeste_rust::settings::Settings::current().check(dir, level)?;
             let ids = celeste_rust::compiled::ids();
             // Every lane of `rt2` against its block-side widening, exactly:
             // the lanes it moved (the first few printed, `shown` so far).
@@ -1612,7 +1612,7 @@ fn main() -> Result<()> {
                 std::env::set_var("CELESTE_THREADS", n.to_string());
             }
             let dir = std::path::Path::new(&level_dir);
-            celeste_rust::frame::check_tree_level(dir, level)?;
+            celeste_rust::settings::Settings::current().check(dir, level)?;
             let kernels = celeste_rust::compiled::FrameEngine::new_for_start_room(level)?;
             kernels.warm();
             let only = cell.map(cell_at).transpose()?;
@@ -1711,7 +1711,7 @@ fn main() -> Result<()> {
             let erase = prefixes(&erase);
             let parts: Vec<u32> = row.split(':').map(|s| s.trim().parse()).collect::<Result<_, _>>()?;
             let [layer, seq, r] = parts[..] else { anyhow::bail!("--row L:S:R") };
-            celeste_rust::frame::check_tree_level(dir, level)?;
+            celeste_rust::settings::Settings::current().check(dir, level)?;
             let engine = celeste_rust::compiled::FrameEngine::new_for_start_room(level)?;
             let (_, f) = frame_files(dir, layer)?.into_iter().find(|(s, _)| *s == seq).ok_or_else(|| anyhow::anyhow!("no file l{layer} s{seq}"))?;
             anyhow::ensure!(r < f.width(), "row {r} past the file's {}", f.width());
@@ -2343,7 +2343,7 @@ fn main() -> Result<()> {
         Command::Follow { level_dir, level, inputs, show } => {
             let dir = std::path::Path::new(&level_dir);
             let lvl = level;
-            celeste_rust::frame::check_tree_level(dir, lvl)?;
+            celeste_rust::settings::Settings::current().check(dir, lvl)?;
             let bytes = celeste_rust::concrete::read_inputs(&inputs)?;
             // (key, cell) -> (layer, seq, row): where the tree first has it.
             let mut at: rustc_hash::FxHashMap<(u64, u64, u32), (u32, u32, u32)> = Default::default();

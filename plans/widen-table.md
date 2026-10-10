@@ -123,7 +123,9 @@ refused at `r0sx` and extended at `r0sxh`.
 
 Coordination: branch `footguns` is adding ONE tree settings record (split
 frame, regions, room, category flags, win rect, the level). `level.txt` is
-deliberately minimal; it should become that record's level field.
+deliberately minimal; it should become that record's level field. (Done
+on `footguns`: `level.txt` is gone, the level is a line of
+`<level dir>/settings.txt`, and a tree without the record is refused.)
 
 ## Verification
 

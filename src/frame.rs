@@ -919,17 +919,17 @@ impl ForwardState {
         }
         let filter = TreeFilter::of(minus_one);
         filter.write(dir)?;
-        std::fs::write(dir.join("level.txt"), format!("{level}\n"))?;
+        crate::settings::Settings::current().write(dir, level)?;
         let mut visited = crate::storage::visited::VisitedSet::new(*crate::storage::geometry());
         let meta = crate::storage::wave::seed(&mut visited, &mut initial, level)?;
         let won = checkpoint_frontier(dir, 0, &mut initial, true)?;
         crate::storage::meta::save(dir, 0, None, &meta)?;
-        crate::storage::edges::set_done_frame(&dir.join("edges"), 0)?;
         let observer = record.then(crate::search::pos_graph::PosObserver::default);
         // An (empty) graph from the start: every tree with frames has one.
         if let Some(o) = observer.as_ref() {
-            save_pos_graph(dir, &o.snapshot(), 0)?;
+            save_pos_graph(dir, &o.snapshot())?;
         }
+        crate::storage::edges::set_done(&dir.join("edges"), 0, 0)?;
         Ok(ForwardState {
             frontier: expandable(initial, 0, filter.ceiling())?,
             visited,
@@ -987,9 +987,10 @@ impl ForwardState {
     /// READ-ONLY: frames after `last` are ignored, not discarded (`resume`
     /// discards them first). What `extend` runs its next wave from, so
     /// `bench_wave` from here is frame `last + 1` of the real forward.
-    /// Refused at another `level` than the tree's (`check_tree_level`).
+    /// Refused under other settings or at another `level` than the tree's
+    /// (`settings::Settings::check`).
     pub fn at(dir: &std::path::Path, last: u32, record: bool, level: crate::abstraction::Level) -> Result<Self> {
-        check_tree_level(dir, level)?;
+        crate::settings::Settings::current().check(dir, level)?;
         let edges_dir = dir.join("edges");
         let filter = TreeFilter::read(dir)?;
         let (visited, win_frame) = restore_visited(dir, last)?;
@@ -1006,8 +1007,9 @@ impl ForwardState {
             let path = pos_graph_path(dir);
             let graph = crate::search::pos_graph::PosGraph::load(&path)
                 .with_context(|| format!("resuming {}: no pos graph at {}", dir.display(), path.display()))?;
-            // It must cover every trusted frame (no marker: the whole tree).
-            if let Some(covered) = pos_graph_frame(dir) {
+            // Saved before each frame's done marker, it covers every trusted
+            // frame; a tree from before kept a marker of its own.
+            if let Some(covered) = legacy_pos_graph_frame(dir) {
                 anyhow::ensure!(
                     covered >= last,
                     "resuming {}: the pos graph covers f0-f{covered}, but the trusted frames run to f{last}",
@@ -1121,7 +1123,7 @@ impl ForwardState {
             };
             let wave = crate::storage::wave::run_wave(engine, frontier, cx)?;
             let (mut next, st) = (wave.next, wave.stats);
-            // Before the frame is trusted (its checkpoint, then done.txt).
+            // Before the frame is trusted (every file, then done.txt).
             if filters.notes_drops() {
                 crate::search::checkpoint::save_value_to(&dropped_path(dir, frame), &wave.dropped)?;
             }
@@ -1129,7 +1131,13 @@ impl ForwardState {
             let won = checkpoint_frontier(dir, frame, &mut next, true)?;
             crate::storage::meta::save(dir, frame, None, &wave.meta)?;
             let t_ckpt = t.elapsed();
-            crate::storage::edges::set_done_frame(&edges_dir, frame)?;
+            let t = std::time::Instant::now();
+            if let Some(o) = self.observer.as_ref() {
+                save_pos_graph(dir, &o.snapshot())?;
+            }
+            let t_pos = t.elapsed();
+            // The frame's LAST write: every file above is trusted from here.
+            crate::storage::edges::set_done(&edges_dir, frame, self.xfers.pairs.len())?;
             // A resume loads frame `frame` as its frontier and never an
             // earlier one's rows: those may go.
             if trim_rows() && frame >= 2 {
@@ -1137,11 +1145,6 @@ impl ForwardState {
                     crate::search::checkpoint::trim(&p)?;
                 }
             }
-            let t = std::time::Instant::now();
-            if let Some(o) = self.observer.as_ref() {
-                save_pos_graph(dir, &o.snapshot(), frame)?;
-            }
-            let t_pos = t.elapsed();
             log_frame(frame, &st, t_ckpt, t_pos, t_frame.elapsed(), self.visited_len());
             ensure_disk_space(dir, &mut last_free)?;
             self.frames = frame;
@@ -1150,9 +1153,6 @@ impl ForwardState {
                 eprintln!("[fwd] first win at f{frame}");
             }
             self.frontier = expandable(next, frame, minus_one.map(|m| m.h))?;
-        }
-        if let Some(o) = self.observer.as_ref() {
-            save_pos_graph(dir, &o.snapshot(), self.frames)?;
         }
         Ok(())
     }
@@ -1279,8 +1279,10 @@ impl ForwardState {
             std::fs::remove_dir_all(dir.join("dropped"))?;
         }
         if let Some(o) = self.observer.as_ref() {
-            save_pos_graph(dir, &o.snapshot(), self.frames)?;
+            save_pos_graph(dir, &o.snapshot())?;
         }
+        // The raise's transfers trusted (its frames' edge files were written).
+        crate::storage::edges::set_done(&edges_dir, self.frames, self.xfers.pairs.len())?;
         std::fs::remove_file(raise_marker(dir))?;
         eprintln!(
             "[raise] {}: {redone} sources re-expanded, {added} states added over f1-f{last} in {:.1} s",
@@ -1312,7 +1314,9 @@ pub fn grow_tree(
     engine: impl FnOnce() -> Result<Box<dyn FrameStep>>,
     initial: impl FnOnce() -> Result<Vec<Block>>,
 ) -> Result<ForwardResult> {
-    check_tree_level(dir, level)?;
+    if dir.join("frames").join("f000").is_dir() {
+        crate::settings::Settings::current().check(dir, level)?;
+    }
     if let Some(w) = want {
         anyhow::ensure!(to <= w.h, "CELESTE_LEVEL_MINUS_ONE at step {} is below the horizon, step {to}", w.h);
     }
@@ -1380,20 +1384,24 @@ pub fn grow_tree(
     Ok(ForwardResult { win_frame: st.win_frame, frames: st.frames, pos_graph: st.pos_graph() })
 }
 
-/// Persist the position graph after `frame` (atomic renames), every frame so
-/// a crash stays resumable; extra edges from discarded frames recur anyway.
-pub fn save_pos_graph(dir: &std::path::Path, graph: &crate::search::pos_graph::PosGraph, frame: u32) -> Result<()> {
+/// Persist the position graph (an atomic rename), every frame BEFORE its
+/// done marker, so it covers every trusted frame; a frame discarded after a
+/// crash adds its edges again when it is rerun.
+fn save_pos_graph(dir: &std::path::Path, graph: &crate::search::pos_graph::PosGraph) -> Result<()> {
     let tmp = dir.join("posgraph.tmp");
     graph.save(&tmp)?;
     std::fs::rename(&tmp, pos_graph_path(dir))?;
-    let ftmp = dir.join("posgraph.frame.tmp");
-    std::fs::write(&ftmp, format!("{frame}\n"))?;
-    std::fs::rename(&ftmp, dir.join("posgraph.frame"))?;
+    // A tree from before kept the covered frame apart: now stale.
+    let old = dir.join("posgraph.frame");
+    if old.exists() {
+        std::fs::remove_file(&old)?;
+    }
     Ok(())
 }
 
-/// The last frame the saved position graph covers; `None`: the whole tree.
-pub fn pos_graph_frame(dir: &std::path::Path) -> Option<u32> {
+/// The covered frame a tree from before the one done marker recorded beside
+/// its pos graph (saved AFTER the marker then, so possibly behind it).
+fn legacy_pos_graph_frame(dir: &std::path::Path) -> Option<u32> {
     std::fs::read_to_string(dir.join("posgraph.frame")).ok().and_then(|s| s.trim().parse().ok())
 }
 
@@ -1765,25 +1773,6 @@ impl Visited {
     }
 }
 
-/// THE LEVEL a tree's rows were widened at, `<dir>/level.txt`: written when
-/// a forward starts the tree, checked wherever it is resumed, raised, reused
-/// or read at a level (`ForwardState::at`, `grow_tree`, `arc_dp::solve`, the
-/// diagnostics): another level's rows key differently, so its kernels, its
-/// arc phase or the concrete search's lookups would silently misread it. A
-/// tree from before the record (the pinned fixtures) has none and is taken
-/// as it is.
-pub fn check_tree_level(dir: &std::path::Path, level: crate::abstraction::Level) -> Result<()> {
-    match std::fs::read_to_string(dir.join("level.txt")) {
-        Ok(s) => {
-            let built = crate::abstraction::Level::parse(s.trim()).map_err(|e| anyhow::anyhow!("{}: {e}", dir.join("level.txt").display()))?;
-            anyhow::ensure!(built == level, "{}: a tree of level {built}, used at {level} (run it at {built}, or delete it)", dir.display());
-            Ok(())
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(anyhow::Error::new(e).context(dir.join("level.txt").display().to_string())),
-    }
-}
-
 /// The first win of a tree complete through `horizon`; `None` if it is not.
 pub fn tree_first_win_through(dir: &std::path::Path, horizon: u32) -> Result<Option<Option<u32>>> {
     let done = crate::storage::edges::done_frame(&dir.join("edges"));
@@ -1959,6 +1948,54 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A run killed after a frame's files but before its done marker
+    /// resumes to the uninterrupted tree: the frame is discarded and rerun,
+    /// the pos graph (saved before the marker) covers it, the transfers past
+    /// the trusted length are overwritten. The one marker holds the frame
+    /// and the transfer count; nothing else claims trust.
+    #[test]
+    fn a_frame_killed_before_its_done_marker_is_rerun() {
+        std::env::set_var("CELESTE_START_ROOM", "1,0");
+        let base = std::env::temp_dir().join(format!("celeste-done-marker-{}", std::process::id()));
+        let (a, b) = (base.join("uninterrupted"), base.join("killed"));
+        let _ = std::fs::remove_dir_all(&base);
+        // The kernels (they record transfers), past the spawn.
+        let level = crate::abstraction::Level::parse("r0sxh").expect("level");
+        let e = crate::compiled::FrameEngine::new_for_start_room(level).expect("kernels");
+        let start = RefEngine::new().expect("engine").initial().expect("init");
+        let init = || vec![Block::canonical(start.clone_block()).expect("block")];
+        let ends = 30;
+        ForwardState::start(init(), &a, true, None, level).expect("start").extend(&e, &a, ends, None).expect("extend");
+        let mut st = ForwardState::start(init(), &b, true, None, level).expect("start");
+        st.extend(&e, &b, ends - 1, None).expect("extend");
+        let marker = std::fs::read_to_string(b.join("edges/done.txt")).expect("done");
+        assert_eq!(marker, format!("{} xfers {}\n", ends - 1, st.xfers.pairs.len()));
+        st.extend(&e, &b, ends, None).expect("extend");
+        // Killed just before frame `ends`' marker.
+        std::fs::write(b.join("edges/done.txt"), &marker).expect("rewind the marker");
+        for d in [&a, &b] {
+            for stale in ["edges/xfer.len", "posgraph.frame"] {
+                assert!(!d.join(stale).exists(), "{stale}: a second marker");
+            }
+        }
+        let mut st = ForwardState::resume(&b, true, level).expect("resume").expect("a tree");
+        assert_eq!(st.frames, ends - 1, "the untrusted frame is discarded");
+        st.extend(&e, &b, ends, None).expect("rerun");
+        for f in 0..=ends {
+            let keys = |d: &std::path::Path| -> Vec<(u64, u64)> {
+                let mut k: Vec<_> = load_frame(d, f).expect("load").iter().flat_map(|b| b.keys().to_vec()).collect();
+                k.sort_unstable();
+                k
+            };
+            assert_eq!(keys(&a), keys(&b), "f{f}");
+        }
+        assert!(st.xfers.pairs.len() > 1, "transfers recorded");
+        for file in ["edges/done.txt", "edges/xfer.bin", "posgraph.bin", "settings.txt"] {
+            assert_eq!(std::fs::read(a.join(file)).expect("a"), std::fs::read(b.join(file)).expect("b"), "{file}");
+        }
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     /// Extending frame by frame and resuming reproduce a fresh run's key sets.
     #[test]
     #[ignore]
@@ -1989,11 +2026,11 @@ mod tests {
             let init = vec![Block::canonical(e.initial().expect("init")).expect("block")];
             let e = Mutex::new(e);
             let mut st = ForwardState::start(init, dir, true, None, crate::abstraction::Level::EXACT).expect("start");
-            assert_eq!(pos_graph_frame(dir), Some(0), "start must leave a graph beside f0");
+            assert!(pos_graph_path(dir).exists(), "start must leave a graph beside f0");
             for to in 1..=4 {
                 st.extend(&e, dir, to, None).expect("extend");
                 assert_eq!(st.frames, to);
-                assert_eq!(pos_graph_frame(dir), Some(to), "the pos graph must be saved with frame {to}");
+                assert_eq!(crate::storage::edges::done_frame(&dir.join("edges")), Some(to), "frame {to} trusted");
             }
             assert!(st.pos_graph().is_some());
         }

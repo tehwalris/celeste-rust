@@ -114,7 +114,8 @@ fn decode_lid(b: &[u8], mut f: impl FnMut(u32, u32, u32) -> bool) {
 
 /// The global transfer table: every distinct pair the tree's edges carry,
 /// a pair's id its position. `edges/xfer.bin` (`encode_pair` each), its
-/// trusted length in `edges/xfer.len` (pairs past it are a killed wave's).
+/// trusted length in the done marker (`done.txt`: pairs past it are a
+/// killed wave's; a tree from before records it in `edges/xfer.len`).
 #[derive(Default, Clone)]
 pub struct XferTable {
     pub pairs: Vec<Pair>,
@@ -125,16 +126,21 @@ fn xfer_path(dir: &Path) -> PathBuf {
     dir.join("xfer.bin")
 }
 
-fn xfer_len_path(dir: &Path) -> PathBuf {
-    dir.join("xfer.len")
-}
-
 impl XferTable {
-    /// The tree's table (`dir` = `<level>/edges`); empty without one.
+    /// The tree's table (`dir` = `<level>/edges`) as its done marker trusts
+    /// it; empty without one.
     pub fn load(dir: &Path) -> Result<Self> {
-        let n: usize = match std::fs::read_to_string(xfer_len_path(dir)) {
-            Ok(s) => s.trim().parse().with_context(|| xfer_len_path(dir).display().to_string())?,
-            Err(_) => 0,
+        let n = match read_done(dir)? {
+            Some(Done { xfers: Some(n), .. }) => n,
+            Some(Done { xfers: None, .. }) => {
+                // A tree from before the one marker.
+                let p = dir.join("xfer.len");
+                match std::fs::read_to_string(&p) {
+                    Ok(s) => s.trim().parse().with_context(|| p.display().to_string())?,
+                    Err(_) => 0,
+                }
+            }
+            None => 0,
         };
         let b = if n > 0 { std::fs::read(xfer_path(dir)).with_context(|| xfer_path(dir).display().to_string())? } else { Vec::new() };
         ensure!(b.len() >= n * PAIR_BYTES, "{}: {} pairs, {} trusted", xfer_path(dir).display(), b.len() / PAIR_BYTES, n);
@@ -144,7 +150,8 @@ impl XferTable {
     }
 
     /// The workers' tables into the global one: new pairs appended in value
-    /// order (content-canonical), and written (`dir`); per worker, its ids'
+    /// order (content-canonical), and written past the trusted length
+    /// (`dir`; the frame's done marker trusts them); per worker, its ids'
     /// global ones.
     pub fn merge(&mut self, dir: Option<&Path>, tables: &[Vec<Pair>]) -> Result<Vec<Vec<u32>>> {
         let mut new: Vec<Pair> = tables.iter().flatten().filter(|p| !self.index.contains_key(p)).copied().collect();
@@ -167,9 +174,6 @@ impl XferTable {
             }
             f.write_all(&buf)?;
             f.sync_data()?;
-            let tmp = dir.join("xfer.len.tmp");
-            std::fs::write(&tmp, format!("{}\n", self.pairs.len()))?;
-            std::fs::rename(&tmp, xfer_len_path(dir))?;
         }
         Ok(tables.iter().map(|t| t.iter().map(|p| self.index[p]).collect()).collect())
     }
@@ -788,17 +792,53 @@ impl UnitView<'_> {
     }
 }
 
-/// The last frame whose files are complete (`<dir>/done.txt`); `None`: no
-/// marker.
-pub fn done_frame(dir: &Path) -> Option<u32> {
-    std::fs::read_to_string(dir.join("done.txt")).ok().and_then(|s| s.trim().parse().ok())
+/// THE TREE'S ONE TRUST MARKER (`<level>/edges/done.txt`): the last frame
+/// whose files are all complete - its frame files, metadata, drop notes,
+/// edge files and the pos graph, all written before it - and the transfer
+/// table's trusted length. A frame past it is a killed run's (`resume`
+/// discards it).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Done {
+    pub frame: u32,
+    /// `None`: a tree from before (`xfer.len` holds it).
+    pub xfers: Option<usize>,
 }
 
-pub fn set_done_frame(dir: &Path, frame: u32) -> Result<()> {
+fn read_done(dir: &Path) -> Result<Option<Done>> {
+    let p = dir.join("done.txt");
+    let s = match std::fs::read_to_string(&p) {
+        Ok(s) => s,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e).with_context(|| p.display().to_string()),
+    };
+    let w: Vec<&str> = s.split_whitespace().collect();
+    let bad = || anyhow::anyhow!("{}: not a done marker: {s:?}", p.display());
+    let frame = w.first().and_then(|f| f.parse().ok()).ok_or_else(bad)?;
+    let xfers = match w[1..] {
+        [] => None,
+        ["xfers", n] => Some(n.parse().map_err(|_| bad())?),
+        _ => return Err(bad()),
+    };
+    Ok(Some(Done { frame, xfers }))
+}
+
+/// The last frame whose files are complete; `None`: no marker.
+pub fn done_frame(dir: &Path) -> Option<u32> {
+    read_done(dir).ok().flatten().map(|d| d.frame)
+}
+
+/// Trust frame `frame` and the first `xfers` transfers: the frame's LAST
+/// write.
+pub fn set_done(dir: &Path, frame: u32, xfers: usize) -> Result<()> {
     std::fs::create_dir_all(dir)?;
     let tmp = dir.join("done.tmp");
-    std::fs::write(&tmp, format!("{frame}\n"))?;
+    std::fs::write(&tmp, format!("{frame} xfers {xfers}\n"))?;
     std::fs::rename(&tmp, dir.join("done.txt"))?;
+    // The old marker (a resumed tree from before) would contradict this one.
+    let old = dir.join("xfer.len");
+    if old.exists() {
+        std::fs::remove_file(&old)?;
+    }
     Ok(())
 }
 
@@ -932,6 +972,8 @@ mod tests {
             pairs.push((a, a));
         }
         xt.merge(Some(&dir), &[pairs]).unwrap();
+        // The frame's last write trusts them.
+        set_done(&dir, 4, xt.pairs.len()).unwrap();
         let store = EdgeStore::open(&dir, 4).unwrap();
         assert_eq!(store.edges, 603);
         let mut got = Vec::new();
