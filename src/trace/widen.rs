@@ -10,7 +10,7 @@
 use anyhow::{bail, Result};
 
 use celeste_core::pico8_num::Pico8Num as P8;
-use celeste_engine::widening::{floor_player_window, Entry, Flag, Hook, Input, Level, Proof, Slot, Stored, Target, FLOOR_HITBOX, PLATFORM_PATH, PLAYER_HITBOX, REM, TABLE};
+use celeste_engine::widening::{floor_player_window, Entry, Flag, Hook, Input, Level, Slot, Stored, Target, FLOOR_HITBOX, PLATFORM_PATH, PLAYER_HITBOX, REM, TABLE};
 
 use super::domain::{Domain, Symbolic};
 use super::heap::Value;
@@ -177,41 +177,24 @@ fn widen_entry(st: &mut State<Symbolic>, d: &mut Symbolic, e: &Entry, errs: &mut
             };
             let mut owed = None;
             let new = match s.stored {
-                Stored::Range { lo, hi, proof } => {
-                    owed = range_holds(d, num()?, (lo, hi), proof)?;
+                Stored::Range { lo, hi } => {
+                    owed = contain(d, num()?, (lo as i64, hi as i64));
                     if let Some(h) = owed {
                         owe(errs, d, p, h);
                     }
                     Value::Num(ival(d, lo, hi))
                 }
-                Stored::Band { around, radius, proof } => {
+                // A constant centre (a shape's constant): a literal range.
+                Stored::Band { around, radius } => {
                     let sp = field(&p[..p.len() - 1].to_vec(), &[around]);
                     let Some(Value::Num(centre)) = iface::get(st, &sp) else { bail!("{}: not a number", iface::show(&sp)) };
-                    let v = num()?;
-                    match proof {
-                        // The band as the centre's own arithmetic, per lane.
-                        Proof::PerLane => {
-                            let amp = d.num(P8::from_raw(radius));
-                            let l = d.arith(super::domain::Arith::Sub, &centre, &amp)?;
-                            let h = d.arith(super::domain::Arith::Add, &centre, &amp)?;
-                            let a = d.compare(super::domain::Cmp::Ge, &v, &l)?;
-                            let b = d.compare(super::domain::Cmp::Le, &v, &h)?;
-                            let inside = d.and(&a, &b);
-                            owe(errs, d, p, inside);
-                            owed = Some(inside);
-                            Value::Num(d.graph.fold(Op::Span, vec![l, h]))
-                        }
-                        // A constant centre: the band is a literal range.
-                        Proof::Static | Proof::Literals => {
-                            let Some(c) = d.as_const(&centre) else { bail!("{}: not a constant", iface::show(&sp)) };
-                            let (lo, hi) = (c.to_bits() as i32 - radius, c.to_bits() as i32 + radius);
-                            owed = range_holds(d, v, (lo, hi), proof)?;
-                            if let Some(h) = owed {
-                                owe(errs, d, p, h);
-                            }
-                            Value::Num(ival(d, lo, hi))
-                        }
+                    let Some(c) = d.as_const(&centre) else { bail!("{}: not a constant", iface::show(&sp)) };
+                    let (lo, hi) = (c.to_bits() as i32 - radius, c.to_bits() as i32 + radius);
+                    owed = contain(d, num()?, (lo as i64, hi as i64));
+                    if let Some(h) = owed {
+                        owe(errs, d, p, h);
                     }
+                    Value::Num(ival(d, lo, hi))
                 }
                 Stored::Phase { lo, hi } => Value::Num(ival(d, lo, hi)),
                 Stored::AtLeast(k) => {
@@ -264,41 +247,6 @@ fn widen_entry(st: &mut State<Symbolic>, d: &mut Symbolic, e: &Entry, errs: &mut
         }
     }
     Ok(())
-}
-
-/// `v` inside `[lo, hi]` (raw) as `proof` shows it: `None` if proved, else
-/// the per-lane condition.
-fn range_holds(d: &mut Symbolic, v: NodeId, (lo, hi): (i32, i32), proof: Proof) -> Result<Option<NodeId>> {
-    Ok(match proof {
-        Proof::PerLane => {
-            let (klo, khi) = (d.num(P8::from_raw(lo)), d.num(P8::from_raw(hi)));
-            let a = d.compare(super::domain::Cmp::Ge, &v, &klo)?;
-            let b = d.compare(super::domain::Cmp::Le, &v, &khi)?;
-            Some(d.and(&a, &b))
-        }
-        Proof::Static => contain(d, v, (lo as i64, hi as i64)),
-        Proof::Literals => {
-            let mut arms = Vec::new();
-            if literal_arms(&d.graph, v, &mut arms) && arms.iter().all(|(a, b)| lo <= *a && *b <= hi) {
-                None
-            } else {
-                Some(bounds_inside(d, v, lo, hi))
-            }
-        }
-    })
-}
-
-/// Every value a lane can hold: a literal, or a select over such values.
-fn literal_arms(g: &crate::transpile::graph::Graph, n: NodeId, out: &mut Vec<(i32, i32)>) -> bool {
-    let node = g.get(n);
-    match node.op {
-        Op::Const(a, b) => {
-            out.push((a, b));
-            true
-        }
-        Op::Sel => literal_arms(g, node.args[1], out) && literal_arms(g, node.args[2], out),
-        _ => false,
-    }
 }
 
 /// `lo <= Lo(v) and Hi(v) <= hi`, per lane.

@@ -71,10 +71,10 @@ point-split run at every frame.
 |---|---|---|---|---|---|---|
 | held buttons | `h` | `player` | `p_jump` | the unknown boolean | both ways, every lane | over |
 |  |  |  | `p_dash` | the unknown boolean | both ways, every lane |  |
-| player remainder | every | `player` | `rem.x` | [-0.5, 0.49998]; owed: inside (per lane) | as stored | over |
-|  |  |  | `rem.y` | [-0.5, 0.49998]; owed: inside (per lane) | as stored |  |
+| player remainder | every | `player` | `rem.x` | [-0.5, 0.49998]; owed: inside | as stored | over |
+|  |  |  | `rem.y` | [-0.5, 0.49998]; owed: inside | as stored |  |
 | dash effect | every | `player` | `dash_effect_time` | max(v, 0) | as stored | exact |
-| strawberry bob | every | `fruit` | `y` | `start` +- 2.5; owed: inside (per lane) | as stored | over |
+| strawberry bob | every | `fruit` | `y` | `start` +- 2.5; owed: inside | as stored | over |
 |  |  |  | `off` | one period [0, 39] | as stored |  |
 | timers | every | globals | `frames` | 0 (dead) | as stored | exact |
 |  |  |  | `seconds` | 0 (dead) | as stored |  |
@@ -84,22 +84,22 @@ point-split run at every frame.
 |  |  |  | `flip.x` | false (dead) | as stored |  |
 | fly fruit | `f` | `fly_fruit` | `step` | the unknown number | the unknown number | over |
 |  |  |  | `y` | the unknown number | the unknown number |  |
-|  |  |  | `spd.y` | [-3.5, 0.5]; owed: inside (proved on literal arms, else per lane) | the literal; owed: inside |  |
-|  |  |  | `rem.y` | [-0.5, 0.49998]; owed: inside (proved on literal arms, else per lane) | the literal; owed: inside |  |
+|  |  |  | `spd.y` | [-3.5, 0.5]; owed: inside | the literal; owed: inside |  |
+|  |  |  | `rem.y` | [-0.5, 0.49998]; owed: inside | the literal; owed: inside |  |
 |  |  |  | `fly` | the unknown boolean | an undecided atom |  |
 | fall floor countdown | `n` | `fall_floor` | `delay` (may be absent) | the unknown number | the unknown number | over |
 | balloon countdown | `n` | `balloon` | `timer` | the unknown number | the unknown number | over |
-| spring phase | `n` | `spring` | `spr` | [0, 19]; owed: inside (proved statically, else per lane) | as stored | over |
+| spring phase | `n` | `spring` | `spr` | [0, 19]; owed: inside | as stored | over |
 |  |  |  | `delay` (may be absent) | the unknown number | the unknown number |  |
 |  |  |  | `hide_in` | the unknown number | the unknown number |  |
 |  |  |  | `hide_for` | the unknown number | the unknown number |  |
-| balloon phase | `n` | `balloon` | `spr` | [0, 22]; owed: inside (proved statically, else per lane) | as stored | over |
-|  |  |  | `y` | `start` +- 2; owed: inside (proved statically, else per lane) | as stored |  |
-| near fall floor | `n` | `fall_floor` | `state` | [0, 2]; owed: inside (proved statically, else per lane) | by the hook | over, hook `NearFloor` |
+| balloon phase | `n` | `balloon` | `spr` | [0, 22]; owed: inside | as stored | over |
+|  |  |  | `y` | `start` +- 2; owed: inside | as stored |  |
+| near fall floor | `n` | `fall_floor` | `state` | [0, 2]; owed: inside | by the hook | over, hook `NearFloor` |
 |  |  |  | `collideable` | the unknown boolean | by the hook |  |
-| platform path | `p` | `platform` | `x` | [-16, 128]; owed: inside (proved statically, else per lane) | by the hook | over, hook `PlatformInputs` |
+| platform path | `p` | `platform` | `x` | [-16, 128]; owed: inside | by the hook | over, hook `PlatformInputs` |
 |  |  |  | `last` | `x`'s; owed: equal to `x` | by the hook |  |
-| platform remainder | `p` | `platform` | `rem.x` | [-0.5, 0.49998]; owed: inside (proved statically, else per lane) | by the hook | over, hook `PlatformInputs` |
+| platform remainder | `p` | `platform` | `rem.x` | [-0.5, 0.49998]; owed: inside | by the hook | over, hook `PlatformInputs` |
 | balloon offset | every | `balloon` | `offset` (may be absent) | a full period as [0, 0.99998]; owed: the width | as stored | exact |
 | absent fall floor delay | every | `fall_floor` | `delay` (may be absent) | 0 where absent | as stored | exact |
 | absent spring delay | every | `spring` | `delay` (may be absent) | 0 where absent | as stored | exact |

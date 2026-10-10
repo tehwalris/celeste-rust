@@ -26,12 +26,11 @@ possible, every widening visible and justified, the level a value.
     another field), `Phase{lo, hi}` (one period of a periodic read),
     `AtLeast(k)`, `UnknownNum`, `UnknownBool`, `Num(k)`/`Bool(b)` (dead
     fields), `FullPeriod(p)`, `SameAs(field)`, `AbsentAsZero`.
-  - `Proof` (how the graph discharges a containment; on blocks every
-    containment is a per-lane assertion): `PerLane` (the domain's
-    comparisons), `Static` (`widen::within`, else per lane), `Literals`
-    (every select arm a literal inside, else per lane). Three because the
-    existing code used three constructions and outputs must stay
-    byte-identical; unifying them is a follow-up that moves kernels.
+  - A containment is proved from the graph where it can be
+    (`widen::within`), else checked per lane on the interval's ends; on
+    blocks every containment is a per-lane assertion. (Branch `widen-table`
+    kept the three constructions the old code used - per lane, static,
+    literal arms - to stay byte-identical; this branch unifies them.)
   - `Input`: `Stored`, `BothWays` (a 2-way fork every lane takes),
     `Atom` (an undecided atom), `Unknown` (the unknown number), `Literal`
     (read as the stored range, owed per lane on the raw input), `Hook`.
