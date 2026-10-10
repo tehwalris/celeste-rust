@@ -221,6 +221,19 @@ player's remainder declared dead instead it fails. No output moved.
    graph side keeps a floor's computed `collideable` in the probe window
    there, the block side does not; the same limitation as `MarkFilter`).
 
+## To-do (Philippe, 2026-10-10)
+
+- **No-player platform `spd.x` (`src/trace/widen.rs`, the platform input hook,
+  "NO PLAYER" branch).** In a no-player shape the hook reads a platform's
+  `spd.x` as its one moving speed v and owes per lane "the input is 0 or v"
+  (0 on the platform's creation frame: `init` never sets it, `update` sets
+  `dir*0.65` after the frame's `move`). The only input assumption outside the
+  Pin/Restrict family. Open questions: why the `0 or v` assertion is needed at
+  all (the move is argued unobservable without a player, `x` being widened to
+  the path at `p`), and whether it should become a table entry (exact,
+  depending on the `p` widening of `x`) plus a pin with a set check. Not
+  decided; do not change without Philippe.
+
 ## Lines
 
 Rust under `src/` and `crates/`: 46,262 before, 46,550 after (+288).
