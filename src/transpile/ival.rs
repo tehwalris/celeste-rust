@@ -77,7 +77,7 @@ pub fn fold_into(
     let need = super::bdd::reachable(g, roots);
     let cells = seed_cells(g);
     let vals = match room {
-        Some(r) => g.eval_lenient_in(&cells, r)?,
+        Some(r) => g.eval_fold_in(&cells, r)?,
         None => g.eval_lenient(&cells)?,
     };
     let mut map: Vec<NodeId> = vec![UNREACHABLE; g.len()];
@@ -243,6 +243,69 @@ mod tests {
         }
         // Open columns ARE decided false: the test is not vacuous.
         assert!(decided > 0 && decided < checked, "{decided} of {checked} decided");
+    }
+
+    /// `mget == k` over a RESTRICTED rectangle of tiles (as `spikes_at` reads
+    /// the map) folds to false exactly where no tile of the rectangle is `k`,
+    /// to true where every one is, and is otherwise left standing; at every
+    /// lane inside the rectangle the folded graph computes what the unfolded
+    /// one does. Every level room, rectangles up to 3x3 tiles, the spike tiles
+    /// and a tile of the room.
+    #[test]
+    fn a_tile_test_over_a_restricted_rectangle_folds_exactly_by_the_set_of_tiles() {
+        let cart = std::sync::Arc::new(celeste_core::cart_data::CartData::load("cart").expect("cart"));
+        let raw = |v: i16| Pico8Num::from_i16(v).as_raw_u32() as i32;
+        let (mut decided_false, mut kept) = (0usize, 0usize);
+        for ry in 0..4i16 {
+            for rx in 0..8i16 {
+                let cache = std::sync::Arc::new(celeste_core::collision_cache::CollisionCache::new(&cart, rx, ry).expect("cache"));
+                let room = Room { cart: cart.clone(), cache };
+                let tile = |i: i16, j: i16| cart.mget_whole(rx * 16 + i, ry * 16 + j) as i16;
+                for (i0, j0) in [(0i16, 0i16), (3, 1), (7, 12), (13, 13), (-1, 14), (14, -1)] {
+                    for (w, h) in [(1i16, 1i16), (2, 2), (3, 2), (3, 3)] {
+                        let mut g = Graph::new();
+                        let (ci, cj) = (g.leaf(Op::Cell(0)), g.leaf(Op::Cell(1)));
+                        let ri = g.fold(Op::Restrict(raw(i0), raw(i0 + w - 1)), vec![ci]);
+                        let rj = g.fold(Op::Restrict(raw(j0), raw(j0 + h - 1)), vec![cj]);
+                        let (ox, oy) = (g.leaf(Op::Const(raw(rx * 16), raw(rx * 16))), g.leaf(Op::Const(raw(ry * 16), raw(ry * 16))));
+                        let (x, y) = (g.fold(Op::Add, vec![ox, ri]), g.fold(Op::Add, vec![oy, rj]));
+                        let m = g.fold(Op::Mget, vec![x, y]);
+                        let mut roots = Vec::new();
+                        for k in [17i16, 27, 43, 59, tile(i0.max(0), j0.max(0))] {
+                            let kn = g.leaf(Op::Const(raw(k), raw(k)));
+                            roots.push((k, g.fold(Op::Eq, vec![m, kn])));
+                        }
+                        let rs: Vec<NodeId> = roots.iter().map(|r| r.1).collect();
+                        let (out, map, _) = fold(&g, &rs, Some(&room)).expect("folds");
+                        for &(k, r) in &roots {
+                            let lanes: Vec<bool> = (i0..i0 + w).flat_map(|i| (j0..j0 + h).map(move |j| (i, j))).map(|(i, j)| tile(i, j) == k).collect();
+                            match out.get(map[r as usize]).op {
+                                Op::ConstBool(false) => {
+                                    decided_false += 1;
+                                    assert!(lanes.iter().all(|t| !t), "room ({rx},{ry}) tile {k} at {i0},{j0} {w}x{h}: folded false, but a tile is {k}");
+                                }
+                                Op::ConstBool(true) => assert!(lanes.iter().all(|t| *t), "folded true, but a tile is not {k}"),
+                                _ => {
+                                    kept += 1;
+                                    assert!(lanes.iter().any(|t| *t) && !lanes.iter().all(|t| *t), "room ({rx},{ry}) tile {k} at {i0},{j0} {w}x{h}: decidable, left standing");
+                                }
+                            }
+                            // Lane by lane, folded and unfolded agree.
+                            for i in i0..i0 + w {
+                                for j in j0..j0 + h {
+                                    let cells = HashMap::from([(0u32, Val::exact_num(Pico8Num::from_i16(i))), (1u32, Val::exact_num(Pico8Num::from_i16(j)))]);
+                                    let before = g.eval_lenient_in(&cells, &room).expect("before")[r as usize];
+                                    let after = out.eval_lenient_in(&cells, &room).expect("after")[map[r as usize] as usize];
+                                    assert_eq!(before, after, "room ({rx},{ry}) tile {k} lane ({i},{j})");
+                                    assert_eq!(before, Val::Bool(Some(tile(i, j) == k)));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert!(decided_false > 0 && kept > 0, "{decided_false} decided false, {kept} kept: the test is not vacuous");
     }
 
     /// A node it cannot model must not be decided, and must not poison the

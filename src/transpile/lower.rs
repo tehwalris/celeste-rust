@@ -309,7 +309,7 @@ pub(crate) fn specialize_frame(
         if trace {
             let cells = crate::transpile::ival::seed_cells(&sp);
             let vals = match room {
-                Some(r) => sp.eval_lenient_in(&cells, r),
+                Some(r) => sp.eval_fold_in(&cells, r),
                 None => sp.eval_lenient(&cells),
             }
             .expect("lenient eval");

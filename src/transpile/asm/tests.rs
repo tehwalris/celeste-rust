@@ -765,3 +765,267 @@ fn asm_interval_overflow_declines() {
         }
     }
 }
+
+/// The tri-state layer with DECIDED planes: a maybe-unknown input, a bool
+/// input, a comparison (known everywhere), the two literals and an undecided
+/// constant, combined pairwise by `And`/`Or`/`Eq`/`Not` and as `Sel`
+/// conditions and arms. The codegen folds the decided planes by bit identities
+/// (`codegen::Lower::m_and` ...); every root must still equal the `zb_*`
+/// primitives on EVERY bit of both planes, not only on the known lanes.
+#[test]
+fn asm_bool_layer_with_decided_planes_is_bit_exact() {
+    use crate::transpile::asm::{compile_and_load_reprs, CellRepr};
+    let mut g = Graph::new();
+    let u = g.leaf(Op::Cell(0));
+    let b = g.leaf(Op::Cell(1));
+    let (x, y) = (g.leaf(Op::Cell(2)), g.leaf(Op::Cell(3)));
+    let c = g.add(Op::Lt, vec![x, y]);
+    let t = g.leaf(Op::ConstBool(true));
+    let f = g.leaf(Op::ConstBool(false));
+    let k = g.leaf(Op::UnknownBool(0));
+    let leaves = [u, b, c, t, f, k];
+    let mut roots = Vec::new();
+    for &p in &leaves {
+        roots.push(g.add(Op::Not, vec![p]));
+        roots.push(g.add(Op::Sel, vec![p, x, y]));
+        for &q in &leaves {
+            for op in [Op::And, Op::Or, Op::Eq] {
+                roots.push(g.add(op, vec![p, q]));
+            }
+            for &r in &leaves {
+                roots.push(g.add(Op::Sel, vec![p, q, r]));
+            }
+        }
+    }
+    let reprs = HashMap::from([(0u32, CellRepr::UBool), (1u32, CellRepr::Bool)]);
+    let (compiled, loaded) = compile_and_load_reprs(&g, &roots, "decided", &reprs).expect("compile+load");
+    let mut rng = Lcg(0xdec1_dedd);
+    for trial in 0..16 {
+        let (uv, uk, bv) = ((rng.next_u64() & 0xFFFF) as u16, (rng.next_u64() & 0xFFFF) as u16, (rng.next_u64() & 0xFFFF) as u16);
+        let (xs, ys): ([i32; 16], [i32; 16]) = (std::array::from_fn(|_| rng.i32() % 4), std::array::from_fn(|_| rng.i32() % 4));
+        let mut input = vec![0u8; compiled.input_bytes as usize];
+        for (ci, cell) in compiled.input_cells.iter().enumerate() {
+            let at = compiled.input_offsets[ci] as usize;
+            match cell {
+                0 => {
+                    input[at..at + 2].copy_from_slice(&uv.to_le_bytes());
+                    input[at + 2..at + 4].copy_from_slice(&uk.to_le_bytes());
+                }
+                1 => input[at..at + 2].copy_from_slice(&bv.to_le_bytes()),
+                _ => {
+                    let col = if *cell == 2 { &xs } else { &ys };
+                    for (l, v) in col.iter().enumerate() {
+                        input[at + l * 4..at + l * 4 + 4].copy_from_slice(&v.to_le_bytes());
+                    }
+                }
+            }
+        }
+        let out = run_asm_raw(&loaded, &input, compiled.out_bytes, std::ptr::null());
+        let zn = |a: &[i32; 16]| ZN::from_array(std::array::from_fn(|i| P8::from_raw(a[i])));
+        let (zx, zy) = (zn(&xs), zn(&ys));
+        // The oracle, per node: each leaf's planes as the codegen holds them.
+        let mut vals: HashMap<NodeId, ZB> = HashMap::new();
+        vals.insert(u, ZB { val: uv, known: uk });
+        vals.insert(b, ZB { val: bv, known: ALL });
+        vals.insert(c, zn_lt(zx, zy));
+        vals.insert(t, ZB { val: ALL, known: ALL });
+        vals.insert(f, ZB { val: 0, known: ALL });
+        vals.insert(k, ZB { val: 0, known: 0 });
+        for (ri, &r) in roots.iter().enumerate() {
+            let node = g.get(r);
+            let a = |i: usize| vals[&node.args[i]];
+            let o = compiled.root_offsets[ri] as usize;
+            let word = |at: usize| u16::from_le_bytes([out[at], out[at + 1]]);
+            if node.op == Op::Sel && !matches!(g.get(node.args[1]).op, Op::Cell(2) | Op::Cell(3)) {
+                let want = zsel_b(a(0), a(1), a(2));
+                assert_eq!((word(o), word(o + 2)), (want.val, want.known), "trial {trial}: root {ri} {:?}", node);
+                continue;
+            }
+            if node.op == Op::Sel {
+                assert_eq!(&out[o..o + 64], &zn_bytes(zsel_n(a(0), zx, zy)), "trial {trial}: root {ri} numeric select");
+                continue;
+            }
+            let want = match node.op {
+                Op::Not => zb_not(a(0)),
+                Op::And => zb_and(a(0), a(1)),
+                Op::Or => zb_or(a(0), a(1)),
+                _ => zb_eq(a(0), a(1)),
+            };
+            assert_eq!((word(o), word(o + 2)), (want.val, want.known), "trial {trial}: root {ri} {:?}", node);
+        }
+    }
+}
+
+/// `/ 2^s` and `% 2^m` by a literal are INLINE shifts and masks
+/// (`codegen::Lower::div_pow2`, `pow2_modulus_mask`), not call-outs, and are
+/// bit-exact against `Pico8Num`'s `/` (truncating, saturating) and `%`
+/// (`rem_euclid`) over the whole i32 range: the edges (MIN, MAX, 0, +-1,
+/// every +-2^k and its neighbours) and random raws, negatives included; for
+/// the interval `/`, both endpoints.
+#[test]
+fn inline_div_rem_by_a_power_of_two_is_pico8s() {
+    let mut g = Graph::new();
+    let x = g.leaf(Op::Cell(0));
+    let y = g.leaf(Op::Cell(1));
+    let iv = g.add(Op::Span, vec![x, y]);
+    let mut roots = Vec::new();
+    let mut want: Vec<(u8, i32)> = Vec::new(); // (0 div, 1 rem, 2 interval div), raw divisor
+    for s in 0..=14u32 {
+        let d = 1i32 << (16 + s);
+        let c = g.leaf(Op::Const(d, d));
+        roots.push(g.add(Op::Div, vec![x, c]));
+        want.push((0, d));
+        roots.push(g.add(Op::Div, vec![iv, c]));
+        want.push((2, d));
+    }
+    for m in 0..=30u32 {
+        let d = 1i32 << m;
+        let c = g.leaf(Op::Const(d, d));
+        roots.push(g.add(Op::Rem, vec![x, c]));
+        want.push((1, d));
+    }
+    let (compiled, loaded) = compile_and_load(&g, &roots, "pow2").expect("compile+load");
+    // (`compile_and_load` drops the text once loaded.)
+    let text = crate::transpile::asm::compile(&g, &roots, "pow2", &HashMap::new()).expect("compile").asm;
+    assert!(!text.contains("call"), "a power-of-two divisor is inline");
+    let mut edges: Vec<i32> = vec![i32::MIN, i32::MIN + 1, i32::MAX, i32::MAX - 1, 0, 1, -1];
+    for k in 0..31 {
+        for d in [-1i32, 0, 1] {
+            edges.push((1i32 << k).wrapping_add(d));
+            edges.push((-(1i64 << k) as i32).wrapping_add(d));
+        }
+    }
+    let mut rng = Lcg(0x0d1f_2e3d);
+    let mut batches: Vec<[i32; 16]> = edges.chunks(16).map(|c| std::array::from_fn(|i| c[i % c.len()])).collect();
+    batches.extend((0..64).map(|_| std::array::from_fn(|_| rng.i32())));
+    for xs in &batches {
+        // The interval's high end: the low end plus a random non-negative span.
+        let ys: [i32; 16] = std::array::from_fn(|i| xs[i].saturating_add((rng.i32() & 0x7fff_ffff) >> (rng.i32() & 31)));
+        let cols = HashMap::from([(0u32, *xs), (1u32, ys)]);
+        let input = pack_inputs(&compiled.input_cells, &cols);
+        let out = run_asm_raw(&loaded, &input, compiled.out_bytes, std::ptr::null());
+        for (ri, &(kind, d)) in want.iter().enumerate() {
+            let o = compiled.root_offsets[ri] as usize;
+            let lane = |half: usize, l: usize| i32::from_le_bytes(out[o + half * 64 + l * 4..o + half * 64 + l * 4 + 4].try_into().unwrap());
+            for l in 0..16 {
+                let (p, q) = (P8::from_raw(xs[l]), P8::from_raw(d));
+                match kind {
+                    0 => assert_eq!(lane(0, l), (p / q).as_raw_u32() as i32, "{:#x} / {:#x}", xs[l], d),
+                    1 => assert_eq!(lane(0, l), (p % q).as_raw_u32() as i32, "{:#x} % {:#x}", xs[l], d),
+                    _ => {
+                        assert_eq!(lane(0, l), (p / q).as_raw_u32() as i32, "[{:#x}, ..] / {:#x}", xs[l], d);
+                        assert_eq!(lane(1, l), (P8::from_raw(ys[l]) / q).as_raw_u32() as i32, "[.., {:#x}] / {:#x}", ys[l], d);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Only the registers live across a call-out are saved and restored: a
+/// value computed before a call and read after it survives it, the kernel
+/// saves fewer than all 32, and `ZERO` (read by a `Neg` after the call) is
+/// zero again.
+#[test]
+fn a_call_out_preserves_what_is_live_across_it() {
+    let mut g = Graph::new();
+    let x = g.leaf(Op::Cell(0));
+    let y = g.leaf(Op::Cell(1));
+    let three = g.leaf(Op::Const(3 << 16, 3 << 16));
+    let before = g.add(Op::Add, vec![x, y]); // live across the call
+    let q = g.add(Op::Div, vec![before, three]); // a call-out, after `before`
+    let n = g.add(Op::Neg, vec![q]); // reads ZERO after the call
+    let sum = g.add(Op::Add, vec![before, n]);
+    let roots = vec![sum, before];
+    let (compiled, loaded) = compile_and_load(&g, &roots, "livecall").expect("compile+load");
+    let text = crate::transpile::asm::compile(&g, &roots, "livecall", &HashMap::new()).expect("compile").asm;
+    // Stores to the stack: the call's two arguments and the saves.
+    let stores = text.lines().filter(|l| l.contains("vmovdqu64 %zmm") && l.contains("(%rsp)")).count();
+    assert!(text.contains("call") && (3..32).contains(&stores), "{stores} stack stores around the call");
+    let ctx = crate::transpile::asm::AsmCtx::new(std::ptr::null());
+    let mut rng = Lcg(0x11fe_ca11);
+    for _ in 0..16 {
+        let cols = random_small_columns(&compiled.input_cells, &mut rng);
+        let input = pack_inputs(&compiled.input_cells, &cols);
+        let out = run_asm_raw(&loaded, &input, compiled.out_bytes, &ctx as *const _ as *const std::os::raw::c_void);
+        for l in 0..16 {
+            let (px, py) = (P8::from_raw(cols[&0][l]), P8::from_raw(cols[&1][l]));
+            let want = [(px + py) + -((px + py) / P8::from_raw(3 << 16)), px + py];
+            for (ri, w) in want.iter().enumerate() {
+                let o = compiled.root_offsets[ri] as usize + l * 4;
+                assert_eq!(i32::from_le_bytes(out[o..o + 4].try_into().unwrap()), w.as_raw_u32() as i32, "root {ri} lane {l}");
+            }
+        }
+    }
+}
+
+/// Values live across a RUN of call-outs and read only after it stay in the
+/// save area between the calls (`codegen::call_saves`): the kernel restores
+/// fewer registers than it would around each call alone, and every value
+/// survives. Eight call-outs on independent operands, four values held
+/// across all of them.
+#[test]
+fn values_held_across_a_run_of_calls_survive_it() {
+    let mut g = Graph::new();
+    let cs: Vec<NodeId> = (0..8u32).map(|c| g.leaf(Op::Cell(c))).collect();
+    let three = g.leaf(Op::Const(3 << 16, 3 << 16));
+    let held: Vec<NodeId> = (0..4).map(|i| g.add(Op::Add, vec![cs[i], cs[i + 4]])).collect();
+    // Each call reads one held value, so all four are defined first.
+    let qs: Vec<NodeId> = (0..8).map(|i| {
+        let arg = g.add(Op::Sub, vec![held[i % 4], cs[i]]);
+        g.add(Op::Div, vec![arg, three])
+    }).collect();
+    let mut roots = held.clone();
+    roots.extend(qs.iter().copied());
+    let text = crate::transpile::asm::compile(&g, &roots, "callrun", &HashMap::new()).expect("compile").asm;
+    let calls = text.matches("call *%rax").count();
+    assert_eq!(calls, 8, "eight call-outs");
+    let (compiled, loaded) = compile_and_load(&g, &roots, "callrun").expect("compile+load");
+    let ctx = crate::transpile::asm::AsmCtx::new(std::ptr::null());
+    let mut rng = Lcg(0x5a7e_0a11);
+    for _ in 0..16 {
+        let cols = random_small_columns(&compiled.input_cells, &mut rng);
+        let input = pack_inputs(&compiled.input_cells, &cols);
+        let out = run_asm_raw(&loaded, &input, compiled.out_bytes, &ctx as *const _ as *const std::os::raw::c_void);
+        let vals = eval_nodes(&g, &cols, None);
+        for (ri, r) in roots.iter().enumerate() {
+            let V::N(z) = vals[*r as usize] else { panic!("numeric roots") };
+            let o = compiled.root_offsets[ri] as usize;
+            assert_eq!(&out[o..o + 64], &zn_bytes(z), "root {ri}");
+        }
+    }
+}
+
+/// Constants under register pressure: 48 select chains whose arms are
+/// broadcast constants (all-ones, zero and others) still live at the end,
+/// so the allocator spills some and REMATERIALIZES them at their uses
+/// (`Emitter::constant`). Bit-exact against the primitives.
+#[test]
+fn rematerialized_constants_under_pressure_are_bit_exact() {
+    let mut g = Graph::new();
+    let cells: Vec<u32> = (0..48u32).collect();
+    let cs: Vec<NodeId> = cells.iter().map(|c| g.leaf(Op::Cell(*c))).collect();
+    let ks: Vec<NodeId> = [-1i32, 0, 1, 0x10000, -0x8000, 7, 0x7fff_ffff, i32::MIN]
+        .iter()
+        .map(|&k| g.leaf(Op::Const(k, k)))
+        .collect();
+    let mut firsts = Vec::new();
+    for (i, &x) in cs.iter().enumerate() {
+        let y = cs[(i + 1) % cs.len()];
+        let lt = g.add(Op::Lt, vec![x, y]);
+        firsts.push(g.add(Op::Sel, vec![lt, ks[i % ks.len()], ks[(i + 3) % ks.len()]]));
+    }
+    // Their minimum, then every first select again beside more constants:
+    // all 48 are live until the minimum is known.
+    let min = firsts.iter().skip(1).fold(firsts[0], |m, &s| g.add(Op::Min, vec![m, s]));
+    let mut roots = vec![min];
+    for (i, &s) in firsts.iter().enumerate() {
+        let ge = g.add(Op::Ge, vec![cs[i], min]);
+        roots.push(g.add(Op::Sel, vec![ge, ks[(i + 5) % ks.len()], s]));
+    }
+    let text = crate::transpile::asm::compile(&g, &roots, "remat", &HashMap::new()).expect("compile").asm;
+    let consts = text.lines().filter(|l| l.contains("vpbroadcastd") || l.contains("vpternlogd $0xff") || l.trim_start().starts_with("vpxord")).count();
+    assert!(text.contains("(%rsp)") && consts > ks.len(), "the test needs spilled constants: {consts} materializations");
+    let mut rng = Lcg(0x4e3a_7a7e);
+    check(&g, &roots, "remat", &mut rng, random_columns, std::ptr::null(), None);
+}

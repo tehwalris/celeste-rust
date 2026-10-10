@@ -48,7 +48,7 @@ const FLR_MASK: i32 = 0xffff_0000u32 as i32;
 type Vreg = u32;
 
 /// A numeric (ZN) node value: a live register or a broadcast constant.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq)]
 enum NumVal {
     Reg(Vreg),
     ConstI32(i32),
@@ -56,7 +56,7 @@ enum NumVal {
 
 /// One plane of a tri-state boolean: a per-lane VECTOR mask (all-ones or
 /// zero), not a k-register, so booleans share the zmm allocator.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq)]
 enum MaskVal {
     Reg(Vreg),
     Const(bool),
@@ -118,6 +118,7 @@ enum Key {
     Muldq(Vreg, Vreg),
     Sraq(Vreg, u8),
     Sllq(Vreg, u8),
+    ShrD(Vreg, u8, bool),
     BlendImm(u16, Vreg, Vreg),
     Cmp(u8, Vreg, SrcKey),
     Ternlog(Vreg, Vreg, Vreg, u8),
@@ -138,6 +139,9 @@ enum Inst {
     Sraq { dst: Vreg, a: Vreg, imm: u8 },
     /// Logical 64-bit left shift by an immediate (`vpsllq`).
     Sllq { dst: Vreg, a: Vreg, imm: u8 },
+    /// 32-bit right shift by an immediate: arithmetic (`vpsrad`) or logical
+    /// (`vpsrld`).
+    ShrD { dst: Vreg, a: Vreg, imm: u8, arith: bool },
     /// Per-lane `mask ? b : a` by a COMPILE-TIME mask (`vpblendmd`).
     BlendImm { dst: Vreg, mask: u16, a: Vreg, b: Vreg },
     /// Signed compare (`vpcmpd` predicate `imm`) to a vector mask.
@@ -205,6 +209,13 @@ pub struct Compiled {
     pub spill_slots: usize,
     /// The stack frame in bytes, for the caller's stack check.
     pub frame_bytes: u32,
+    /// `CELESTE_KERNEL_MIX` only (else empty): per SSA instruction `k`, the
+    /// graph node it was lowered from (a root store: the root) and its kind;
+    /// the text then marks each instruction's lines with a `#@k` line.
+    pub prov: Vec<(NodeId, &'static str)>,
+    /// `CELESTE_KERNEL_MIX` only: per SSA instruction, whether plain bit
+    /// identities over the stream remove it (`foldable`).
+    pub foldable: Vec<bool>,
 }
 
 // ---- constant pool ----
@@ -281,6 +292,49 @@ impl<'a> Lower<'a> {
     fn sllq(&mut self, a: Vreg, imm: u8) -> Vreg {
         self.pure(Key::Sllq(a, imm), move |d| Inst::Sllq { dst: d, a, imm })
     }
+    fn shrd(&mut self, a: Vreg, imm: u8, arith: bool) -> Vreg {
+        self.pure(Key::ShrD(a, imm, arith), move |d| Inst::ShrD { dst: d, a, imm, arith })
+    }
+
+    /// PICO-8 `x / 2^s` (raw divisor `2^(16+s)`, `0 <= s <= 14`), inline:
+    /// `Pico8Num`'s division TRUNCATES toward zero and never saturates for
+    /// these divisors, so it is the arithmetic shift of `x` biased by
+    /// `2^s - 1` where `x` is negative (`(x + ((x >> 31) >>> (32 - s))) >> s`;
+    /// no overflow: the bias is added to negatives only).
+    /// `asm::tests::inline_div_rem_by_a_power_of_two_is_pico8s` checks it
+    /// bit-exact against `Pico8Num` over the whole i32 range.
+    fn div_pow2(&mut self, x: Vreg, s: u8) -> Vreg {
+        if s == 0 {
+            return x;
+        }
+        let sign = self.shrd(x, 31, true);
+        let bias = self.shrd(sign, 32 - s, false);
+        let biased = self.dbin(ROp::AddD, x, bias);
+        self.shrd(biased, s, true)
+    }
+
+    /// `s` if `id` is the literal `2^(16+s)` with `0 <= s <= 14` (a divisor
+    /// `div_pow2` takes).
+    fn pow2_divisor(&self, id: NodeId) -> Option<u8> {
+        match self.g.get(id).op {
+            Op::Const(lo, hi) if lo == hi && lo > 0 && (lo as u32).is_power_of_two() => {
+                let m = (lo as u32).trailing_zeros();
+                (16..=30).contains(&m).then(|| (m - 16) as u8)
+            }
+            _ => None,
+        }
+    }
+
+    /// The mask `2^m - 1` if `id` is the literal `2^m` (raw, `m <= 30`):
+    /// PICO-8's `%` is `rem_euclid` on the raw bits, which for a positive power
+    /// of two is the low bits, negatives included.
+    fn pow2_modulus_mask(&self, id: NodeId) -> Option<i32> {
+        match self.g.get(id).op {
+            Op::Const(lo, hi) if lo == hi && lo > 0 && (lo as u32).is_power_of_two() => Some(lo - 1),
+            _ => None,
+        }
+    }
+
     fn blend_imm(&mut self, mask: u16, a: Vreg, b: Vreg) -> Vreg {
         self.pure(Key::BlendImm(mask, a, b), move |d| Inst::BlendImm { dst: d, mask, a, b })
     }
@@ -350,6 +404,97 @@ impl<'a> Lower<'a> {
     /// Vector-mask select `c ? t : f` (one plane), via `vpternlogd 0xca`.
     fn vsel(&mut self, c: Vreg, t: Vreg, f: Vreg) -> Vreg {
         self.ternlog(c, t, f, 0xca)
+    }
+
+    // ---- mask planes with the bit identities folded ----
+    //
+    // A plane that is a compile-time constant (`MaskVal::Const`: all-ones or
+    // zero in every lane) or the same register on both sides is folded by an
+    // identity that holds BIT FOR BIT in every lane (`x & -1 = x`, `x | -1 =
+    // -1`, `x & 0 = 0`, `x & x = x`, `c ? t : t = t`, ...), so the folded
+    // kernel computes exactly what the unfolded one did; nothing is decided
+    // that was not already a constant.
+
+    /// `p & q`.
+    fn m_and(&mut self, p: MaskVal, q: MaskVal) -> MaskVal {
+        match (p, q) {
+            (MaskVal::Const(false), _) | (_, MaskVal::Const(false)) => MaskVal::Const(false),
+            (MaskVal::Const(true), x) | (x, MaskVal::Const(true)) => x,
+            (MaskVal::Reg(a), MaskVal::Reg(b)) if a == b => p,
+            (MaskVal::Reg(a), MaskVal::Reg(b)) => MaskVal::Reg(self.dbin(ROp::AndD, a, b)),
+        }
+    }
+
+    /// `p | q`.
+    fn m_or(&mut self, p: MaskVal, q: MaskVal) -> MaskVal {
+        match (p, q) {
+            (MaskVal::Const(true), _) | (_, MaskVal::Const(true)) => MaskVal::Const(true),
+            (MaskVal::Const(false), x) | (x, MaskVal::Const(false)) => x,
+            (MaskVal::Reg(a), MaskVal::Reg(b)) if a == b => p,
+            (MaskVal::Reg(a), MaskVal::Reg(b)) => MaskVal::Reg(self.dbin(ROp::OrD, a, b)),
+        }
+    }
+
+    /// `~p & q`.
+    fn m_andn(&mut self, p: MaskVal, q: MaskVal) -> MaskVal {
+        match (p, q) {
+            (MaskVal::Const(true), _) | (_, MaskVal::Const(false)) => MaskVal::Const(false),
+            (MaskVal::Const(false), x) => x,
+            (x, MaskVal::Const(true)) => self.m_not(x),
+            (MaskVal::Reg(a), MaskVal::Reg(b)) if a == b => MaskVal::Const(false),
+            (MaskVal::Reg(a), MaskVal::Reg(b)) => MaskVal::Reg(self.dbin(ROp::AndnD, a, b)),
+        }
+    }
+
+    /// `p ^ q`.
+    fn m_xor(&mut self, p: MaskVal, q: MaskVal) -> MaskVal {
+        match (p, q) {
+            (MaskVal::Const(a), MaskVal::Const(b)) => MaskVal::Const(a != b),
+            (MaskVal::Const(false), x) | (x, MaskVal::Const(false)) => x,
+            (MaskVal::Const(true), x) | (x, MaskVal::Const(true)) => self.m_not(x),
+            (MaskVal::Reg(a), MaskVal::Reg(b)) if a == b => MaskVal::Const(false),
+            (MaskVal::Reg(a), MaskVal::Reg(b)) => MaskVal::Reg(self.dbin(ROp::XorD, a, b)),
+        }
+    }
+
+    /// `~p`.
+    fn m_not(&mut self, p: MaskVal) -> MaskVal {
+        match p {
+            MaskVal::Const(b) => MaskVal::Const(!b),
+            MaskVal::Reg(a) => MaskVal::Reg(self.not_mask(a)),
+        }
+    }
+
+    /// `c ? t : f`, one plane.
+    fn m_sel(&mut self, c: MaskVal, t: MaskVal, f: MaskVal) -> MaskVal {
+        match (c, t, f) {
+            (MaskVal::Const(true), t, _) => t,
+            (MaskVal::Const(false), _, f) => f,
+            (_, t, f) if t == f => t,
+            (c, MaskVal::Const(true), MaskVal::Const(false)) => c,
+            (c, MaskVal::Const(false), MaskVal::Const(true)) => self.m_not(c),
+            (c, MaskVal::Const(true), f) => self.m_or(c, f),
+            (c, MaskVal::Const(false), f) => self.m_andn(c, f),
+            (c, t, MaskVal::Const(true)) => {
+                let nc = self.m_not(c);
+                self.m_or(nc, t)
+            }
+            (c, t, MaskVal::Const(false)) => self.m_and(c, t),
+            (MaskVal::Reg(c), MaskVal::Reg(t), MaskVal::Reg(f)) => MaskVal::Reg(self.vsel(c, t, f)),
+        }
+    }
+
+    /// `c ? t : f` on a numeric plane.
+    fn n_sel(&mut self, c: MaskVal, t: NumVal, f: NumVal) -> NumVal {
+        match c {
+            MaskVal::Const(true) => t,
+            MaskVal::Const(false) => f,
+            _ if t == f => t,
+            MaskVal::Reg(c) => {
+                let (tr, fr) = (self.num_reg(t), self.num_reg(f));
+                NumVal::Reg(self.vsel(c, tr, fr))
+            }
+        }
     }
 
     // ---- interval layer (ZI as two i32 planes) ----
@@ -710,6 +855,11 @@ impl<'a> Lower<'a> {
                 }
                 let iv = self.as_ival(a[0])?;
                 let ar = self.ival_regs(iv);
+                if let Some(sh) = self.pow2_divisor(a[1]) {
+                    let (lo, hi) = (self.div_pow2(ar[0], sh), self.div_pow2(ar[1], sh));
+                    self.vals[id as usize] = Some(Value::Ival([NumVal::Reg(lo), NumVal::Reg(hi)]));
+                    return Ok(());
+                }
                 let s = self.as_num(a[1])?;
                 let sreg = self.num_reg(s);
                 let mut ends = [ar[0]; 2];
@@ -810,13 +960,11 @@ impl<'a> Lower<'a> {
                     }
                     1 => {
                         let (p, q) = (self.as_bool(a[0])?, self.as_bool(a[1])?);
-                        let (pv, qv) = (self.mask_reg(p[0]), self.mask_reg(q[0]));
-                        // val = ~(pv ^ qv)
-                        let x = self.dbin(ROp::XorD, pv, qv);
-                        let val = self.not_mask(x);
-                        let (pk, qk) = (self.mask_reg(p[1]), self.mask_reg(q[1]));
-                        let known = self.dbin(ROp::AndD, pk, qk);
-                        Value::Bool([MaskVal::Reg(val), MaskVal::Reg(known)])
+                        // val = ~(pv ^ qv), known = pk & qk
+                        let x = self.m_xor(p[0], q[0]);
+                        let val = self.m_not(x);
+                        let known = self.m_and(p[1], q[1]);
+                        Value::Bool([val, known])
                     }
                     _ => {
                         let x = self.as_num(a[0])?;
@@ -829,32 +977,30 @@ impl<'a> Lower<'a> {
             }
             Op::Not => {
                 let b = self.as_bool(a[0])?;
-                let v = self.mask_reg(b[0]);
-                let nv = self.not_mask(v);
-                Value::Bool([MaskVal::Reg(nv), b[1]])
+                let nv = self.m_not(b[0]);
+                Value::Bool([nv, b[1]])
             }
             op @ (Op::And | Op::Or) => {
                 let (p, q) = (self.as_bool(a[0])?, self.as_bool(a[1])?);
-                let (pv, qv) = (self.mask_reg(p[0]), self.mask_reg(q[0]));
-                let (pk, qk) = (self.mask_reg(p[1]), self.mask_reg(q[1]));
+                let ([pv, pk], [qv, qk]) = (p, q);
+                // Kleene, per lane; the identities fold decided planes.
+                let kk = self.m_and(pk, qk);
                 if matches!(op, Op::And) {
                     // known = (pk & qk) | (~pv & pk) | (~qv & qk)
-                    let val = self.dbin(ROp::AndD, pv, qv);
-                    let kfa = self.dbin(ROp::AndnD, pv, pk);
-                    let kfb = self.dbin(ROp::AndnD, qv, qk);
-                    let kf = self.dbin(ROp::OrD, kfa, kfb);
-                    let kk = self.dbin(ROp::AndD, pk, qk);
-                    let known = self.dbin(ROp::OrD, kk, kf);
-                    Value::Bool([MaskVal::Reg(val), MaskVal::Reg(known)])
+                    let val = self.m_and(pv, qv);
+                    let kfa = self.m_andn(pv, pk);
+                    let kfb = self.m_andn(qv, qk);
+                    let kf = self.m_or(kfa, kfb);
+                    let known = self.m_or(kk, kf);
+                    Value::Bool([val, known])
                 } else {
                     // known = (pk & qk) | (pv & pk) | (qv & qk)
-                    let val = self.dbin(ROp::OrD, pv, qv);
-                    let kta = self.dbin(ROp::AndD, pv, pk);
-                    let ktb = self.dbin(ROp::AndD, qv, qk);
-                    let kt = self.dbin(ROp::OrD, kta, ktb);
-                    let kk = self.dbin(ROp::AndD, pk, qk);
-                    let known = self.dbin(ROp::OrD, kk, kt);
-                    Value::Bool([MaskVal::Reg(val), MaskVal::Reg(known)])
+                    let val = self.m_or(pv, qv);
+                    let kta = self.m_and(pv, pk);
+                    let ktb = self.m_and(qv, qk);
+                    let kt = self.m_or(kta, ktb);
+                    let known = self.m_or(kk, kt);
+                    Value::Bool([val, known])
                 }
             }
             Op::Known => {
@@ -898,31 +1044,24 @@ impl<'a> Lower<'a> {
                 }
             }
             Op::Sel => {
-                let c = self.as_bool(a[0])?;
-                let cv = self.mask_reg(c[0]);
+                let cv = self.as_bool(a[0])?[0];
                 // On the JOINED arm domain (a number beside an interval is [n, n]).
                 match self.dom(a[1]).max(self.dom(a[2])) {
                     1 => {
                         let (t, f) = (self.as_bool(a[1])?, self.as_bool(a[2])?);
-                        let (tv, fv) = (self.mask_reg(t[0]), self.mask_reg(f[0]));
-                        let (tk, fk) = (self.mask_reg(t[1]), self.mask_reg(f[1]));
-                        let val = self.vsel(cv, tv, fv);
-                        let known = self.vsel(cv, tk, fk);
-                        Value::Bool([MaskVal::Reg(val), MaskVal::Reg(known)])
+                        let val = self.m_sel(cv, t[0], f[0]);
+                        let known = self.m_sel(cv, t[1], f[1]);
+                        Value::Bool([val, known])
                     }
                     2 => {
                         let (t, f) = (self.as_ival(a[1])?, self.as_ival(a[2])?);
-                        let (tl, fl) = (self.num_reg(t[0]), self.num_reg(f[0]));
-                        let (th, fh) = (self.num_reg(t[1]), self.num_reg(f[1]));
-                        let lo = self.vsel(cv, tl, fl);
-                        let hi = self.vsel(cv, th, fh);
-                        Value::Ival([NumVal::Reg(lo), NumVal::Reg(hi)])
+                        let lo = self.n_sel(cv, t[0], f[0]);
+                        let hi = self.n_sel(cv, t[1], f[1]);
+                        Value::Ival([lo, hi])
                     }
                     _ => {
-                        let t = self.as_num(a[1])?;
-                        let f = self.as_num(a[2])?;
-                        let (tr, fr) = (self.num_reg(t), self.num_reg(f));
-                        Value::Num(NumVal::Reg(self.vsel(cv, tr, fr)))
+                        let (t, f) = (self.as_num(a[1])?, self.as_num(a[2])?);
+                        Value::Num(self.n_sel(cv, t, f))
                     }
                 }
             }
@@ -985,6 +1124,18 @@ impl<'a> Lower<'a> {
                     _ => MaskVal::Const(true),
                 };
                 Value::Bool([ok, MaskVal::Const(true)])
+            }
+            Op::Div if self.pow2_divisor(a[1]).is_some() => {
+                let sh = self.pow2_divisor(a[1]).expect("guarded");
+                let x = self.as_num(a[0])?;
+                let xr = self.num_reg(x);
+                Value::Num(NumVal::Reg(self.div_pow2(xr, sh)))
+            }
+            Op::Rem if self.dom(a[0]) != 2 && self.pow2_modulus_mask(a[1]).is_some() => {
+                let m = self.pow2_modulus_mask(a[1]).expect("guarded");
+                let x = self.as_num(a[0])?;
+                let xr = self.num_reg(x);
+                Value::Num(NumVal::Reg(self.dbin_c(ROp::AndD, xr, m)))
             }
             Op::Div | Op::Rem | Op::Sin | Op::Mget => {
                 let (op, n_args) = match &node.op {
@@ -1131,7 +1282,7 @@ fn inst_uses(inst: &Inst, out: &mut Vec<Vreg>) {
             out.push(*a);
             out.push(*b);
         }
-        Inst::Sraq { a, .. } | Inst::Sllq { a, .. } => out.push(*a),
+        Inst::Sraq { a, .. } | Inst::Sllq { a, .. } | Inst::ShrD { a, .. } => out.push(*a),
         Inst::Cmp { a, b, .. } => {
             out.push(*a);
             push_src(b, out);
@@ -1148,7 +1299,7 @@ fn inst_uses(inst: &Inst, out: &mut Vec<Vreg>) {
 }
 
 /// List-schedule the SSA stream: highest critical path first, to hide latency.
-fn reschedule(insts: Vec<Inst>, n_vregs: Vreg) -> Vec<Inst> {
+fn reschedule(insts: Vec<Inst>, n_vregs: Vreg) -> (Vec<Inst>, Vec<u32>) {
     let n = insts.len();
     let mut def_inst = vec![u32::MAX; n_vregs as usize];
     for (i, inst) in insts.iter().enumerate() {
@@ -1273,7 +1424,8 @@ fn reschedule(insts: Vec<Inst>, n_vregs: Vreg) -> Vec<Inst> {
     }
     assert_eq!(order.len(), n, "list scheduler dropped instructions");
     let mut slots: Vec<Option<Inst>> = insts.into_iter().map(Some).collect();
-    order.into_iter().map(|i| slots[i as usize].take().unwrap()).collect()
+    let out = order.iter().map(|&i| slots[i as usize].take().unwrap()).collect();
+    (out, order)
 }
 
 fn inst_def(inst: &Inst) -> Option<Vreg> {
@@ -1287,6 +1439,7 @@ fn inst_def(inst: &Inst) -> Option<Vreg> {
         | Inst::Muldq { dst, .. }
         | Inst::Sraq { dst, .. }
         | Inst::Sllq { dst, .. }
+        | Inst::ShrD { dst, .. }
         | Inst::BlendImm { dst, .. }
         | Inst::Cmp { dst, .. }
         | Inst::Ternlog { dst, .. }
@@ -1398,6 +1551,62 @@ fn allocate(insts: &[Inst], n_vregs: Vreg, remat: &[bool]) -> (Vec<Loc>, usize) 
     (home, n_slots as usize)
 }
 
+/// Per call (by instruction index), which registers to SAVE before it and
+/// RESTORE after it. Live across a call: a register holding a value defined
+/// before it and read after it (a vreg keeps one home for its whole interval,
+/// `allocate` never splits; a call's operands are marshalled before it, its
+/// result written after). A value live across two CONSECUTIVE calls and not
+/// read between them (nor as the second's operand) stays in the save area:
+/// not restored after the first, not saved again before the second. Its
+/// register holds nothing anyone reads in between (no other vreg has it
+/// while this one is live), and its save slot (one per register) is written
+/// by no other save meanwhile.
+fn call_saves(insts: &[Inst], n_vregs: Vreg, home: &[Loc]) -> HashMap<usize, (u32, u32)> {
+    let calls: Vec<u32> = (0..insts.len() as u32).filter(|&i| matches!(insts[i as usize], Inst::Call { .. })).collect();
+    let mut live = vec![0u32; calls.len()];
+    // Bit r of `carry[k]`: register r's value stays saved from call k to k+1.
+    let mut carry = vec![0u32; calls.len()];
+    let mut def = vec![u32::MAX; n_vregs as usize];
+    let mut uses: Vec<Vec<u32>> = vec![Vec::new(); n_vregs as usize];
+    let mut buf = Vec::new();
+    for (i, inst) in insts.iter().enumerate() {
+        if let Some(d) = inst_def(inst) {
+            def[d as usize] = def[d as usize].min(i as u32);
+        }
+        buf.clear();
+        inst_uses(inst, &mut buf);
+        for v in &buf {
+            uses[*v as usize].push(i as u32);
+        }
+    }
+    for v in 0..n_vregs as usize {
+        let Loc::Reg(r) = home[v] else { continue };
+        let Some(&last) = uses[v].last() else { continue };
+        if def[v] == u32::MAX {
+            continue;
+        }
+        // Calls strictly inside (def, last).
+        let from = calls.partition_point(|&c| c <= def[v]);
+        let to = calls.partition_point(|&c| c < last).max(from);
+        for k in from..to {
+            live[k] |= 1 << r;
+            // Read in (calls[k], calls[k + 1]]?
+            if k + 1 < to {
+                let at = uses[v].partition_point(|&u| u <= calls[k]);
+                if uses[v].get(at).is_none_or(|&u| u > calls[k + 1]) {
+                    carry[k] |= 1 << r;
+                }
+            }
+        }
+    }
+    (0..calls.len())
+        .map(|k| {
+            let carried_in = if k > 0 { carry[k - 1] } else { 0 };
+            (calls[k] as usize, (live[k] & !carried_in, live[k] & !carry[k]))
+        })
+        .collect()
+}
+
 // ---- emission ----
 
 struct Emitter<'a> {
@@ -1407,6 +1616,12 @@ struct Emitter<'a> {
     def_of: &'a [u32],
     /// rsp offset of the 32-zmm save area used around a call.
     save_off: u32,
+    /// Per instruction index of a call: the registers (bit r for zmm r) to
+    /// save before it and to restore after it (`call_saves`).
+    call_saves: &'a HashMap<usize, (u32, u32)>,
+    /// The last instruction reading `ZERO` (a `Neg`): a call before it
+    /// re-zeroes it.
+    last_neg: Option<usize>,
     /// rsp offset of the call-out argument/result buffers.
     argbuf_off: u32,
     pool: Pool,
@@ -1441,8 +1656,23 @@ impl<'a> Emitter<'a> {
             Inst::Load { off, .. } => {
                 writeln!(self.out, "    vmovdqu64 {}(%r13), %zmm{}", off, dst).unwrap();
             }
+            &Inst::BcastD { val, .. } => self.constant(val, dst),
             other => {
                 unreachable!("non-rematerializable def marked remat: {:?}", std::mem::discriminant(other))
+            }
+        }
+    }
+
+    /// The constant `val` in every lane of `dst`: zero by the zeroing idiom
+    /// (no memory, no dependency), anything else broadcast from the pool (a
+    /// load, like the reload it replaces; `vpternlogd $0xff` for all-ones
+    /// would take a logic port, the kernels' busiest, and depends on `dst`).
+    fn constant(&mut self, val: i32, dst: u8) {
+        match val {
+            0 => writeln!(self.out, "    vpxord %zmm{dst}, %zmm{dst}, %zmm{dst}").unwrap(),
+            _ => {
+                let l = self.pool.d(val);
+                writeln!(self.out, "    vpbroadcastd {l}(%rip), %zmm{dst}").unwrap();
             }
         }
     }
@@ -1479,7 +1709,7 @@ impl<'a> Emitter<'a> {
         }
     }
 
-    fn emit_inst(&mut self, inst: &Inst) {
+    fn emit_inst(&mut self, k: usize, inst: &Inst) {
         match inst {
             Inst::Load { dst, off } => {
                 if self.skip_def(*dst) {
@@ -1500,10 +1730,11 @@ impl<'a> Emitter<'a> {
                 self.store_def(*dst, d);
             }
             Inst::BcastD { dst, val } => {
-                let l = self.pool.d(*val);
+                if self.skip_def(*dst) {
+                    return;
+                }
                 let d = self.def_reg(*dst);
-                writeln!(self.out, "    vpbroadcastd {}(%rip), %zmm{}", l, d).unwrap();
-                self.store_def(*dst, d);
+                self.constant(*val, d);
             }
             Inst::RBin { dst, op, a, b } => {
                 let ra = self.use_reg(*a, OPA);
@@ -1554,6 +1785,12 @@ impl<'a> Emitter<'a> {
                 writeln!(self.out, "    vpsllq ${}, %zmm{}, %zmm{}", imm, ra, d).unwrap();
                 self.store_def(*dst, d);
             }
+            Inst::ShrD { dst, a, imm, arith } => {
+                let ra = self.use_reg(*a, OPA);
+                let d = self.def_reg(*dst);
+                writeln!(self.out, "    {} ${}, %zmm{}, %zmm{}", if *arith { "vpsrad" } else { "vpsrld" }, imm, ra, d).unwrap();
+                self.store_def(*dst, d);
+            }
             Inst::BlendImm { dst, mask, a, b } => {
                 let ra = self.use_reg(*a, OPA);
                 let rb = self.use_reg(*b, OPB);
@@ -1592,8 +1829,12 @@ impl<'a> Emitter<'a> {
                     writeln!(self.out, "    vmovdqu64 %zmm{}, {}(%rsp)", r, off).unwrap();
                 }
                 let resbuf = self.argbuf_off + 7 * 64;
-                // 2. save all 32 zmm (the call clobbers every vector reg).
-                for r in 0..32u32 {
+                // 2. save the registers live across the call and not still
+                // saved from the call before (it clobbers every vector
+                // register; the scratches hold nothing across an
+                // instruction, `ZERO` is re-zeroed below).
+                let (saves, restores) = self.call_saves[&k];
+                for r in (0..32u32).filter(|r| saves & (1 << r) != 0) {
                     writeln!(self.out, "    vmovdqu64 %zmm{}, {}(%rsp)", r, self.save_off + r * 64)
                         .unwrap();
                 }
@@ -1649,10 +1890,14 @@ impl<'a> Emitter<'a> {
                 if stack_arg {
                     writeln!(self.out, "    addq $16, %rsp").unwrap();
                 }
-                // 5. restore all 32 zmm.
-                for r in 0..32u32 {
+                // 5. restore those read before the next call; `ZERO` again
+                // where a `Neg` follows.
+                for r in (0..32u32).filter(|r| restores & (1 << r) != 0) {
                     writeln!(self.out, "    vmovdqu64 {}(%rsp), %zmm{}", self.save_off + r * 64, r)
                         .unwrap();
+                }
+                if self.last_neg.is_some_and(|n| n > k) {
+                    writeln!(self.out, "    vpxorq %zmm{Z}, %zmm{Z}, %zmm{Z}", Z = ZERO).unwrap();
                 }
                 // 6. read the result into dst.
                 let d = self.def_reg(*dst);
@@ -1686,10 +1931,12 @@ impl<'a> Emitter<'a> {
     }
 }
 
-/// Drop stack reloads into a register that already holds that slot. A
-/// register holds a slot from its reload/spill until written (last AT&T
-/// operand); a spill stales other holders; any other stack access, label,
-/// jump, call, ret or `vzeroupper` forgets everything.
+/// Drop stack reloads into a register that already holds that slot, and
+/// constant materializations (`Emitter::constant`) into a register that
+/// already holds that constant. A register holds a slot from its
+/// reload/spill, a constant from its materialization, until written (last
+/// AT&T operand); a spill stales other holders of its slot; any other stack
+/// access, label, jump, call, ret or `vzeroupper` forgets everything.
 fn drop_redundant_reloads(body: &str) -> String {
     let reg = |s: &str| -> Option<usize> {
         let s = s.strip_prefix("%zmm").or_else(|| s.strip_prefix("%ymm")).or_else(|| s.strip_prefix("%xmm"))?;
@@ -1717,6 +1964,13 @@ fn drop_redundant_reloads(body: &str) -> String {
             } else {
                 forget(&mut holds);
             }
+        } else if let Some(k) = constant_key(mn, ops, a).filter(|_| reg(b).is_some_and(|r| r < 32)) {
+            // A constant into a register: dropped if it holds it already.
+            let r = reg(b).expect("filtered");
+            if holds[r].as_deref() == Some(k.as_str()) {
+                continue;
+            }
+            holds[r] = Some(k);
         } else if mn == "vmovdqu64" && a.starts_with("%zmm") && slot(b).is_some() {
             // A spill: `vmovdqu64 %zmmR, OFF(%rsp)`.
             let s = slot(b).unwrap();
@@ -1740,6 +1994,21 @@ fn drop_redundant_reloads(body: &str) -> String {
         out.push('\n');
     }
     out
+}
+
+/// The constant a line materializes (`Emitter::constant`), as a key no
+/// stack slot (a bare offset) can equal: the pool label of a broadcast, or
+/// `$zero` for the zeroing idiom.
+fn constant_key(mn: &str, ops: &str, a: &str) -> Option<String> {
+    match mn {
+        "vpbroadcastd" if a.ends_with("(%rip)") => Some(a.to_string()),
+        "vpxord" => {
+            let mut it = ops.split(", ");
+            let first = it.next()?;
+            (it.clone().count() == 2 && it.all(|o| o == first)).then(|| "$zero".to_string())
+        }
+        _ => None,
+    }
 }
 
 /// Compile `roots` of `g` into AVX-512 assembly, with the buffer layouts.
@@ -1793,9 +2062,14 @@ pub fn compile(
     let mut kind_ix: HashMap<String, u16> = HashMap::new();
     let mut vreg_kind: Vec<u16> = Vec::new();
     let mut insts_by_kind: Vec<usize> = Vec::new();
+    let mix = super::mix_on();
+    let mut prov_node: Vec<NodeId> = Vec::new();
     for id in order {
         let (v0, i0) = (lo.next_vreg, lo.insts.len());
         lo.lower_node(id)?;
+        if mix {
+            prov_node.resize(lo.insts.len(), id);
+        }
         if stats {
             let name = format!("{:?}", g.get(id).op).split('(').next().unwrap_or("").to_string();
             let k = *kind_ix.entry(name.clone()).or_insert_with(|| {
@@ -1871,10 +2145,20 @@ pub fn compile(
             None => bail!("root {} was never lowered", r),
         };
         root_kinds.push(kind);
+        if mix {
+            prov_node.resize(lo.insts.len(), *r);
+        }
     }
 
     let t = std::time::Instant::now();
-    lo.insts = reschedule(std::mem::take(&mut lo.insts), lo.next_vreg);
+    let (insts, order) = reschedule(std::mem::take(&mut lo.insts), lo.next_vreg);
+    lo.insts = insts;
+    let prov: Vec<(NodeId, &'static str)> = if mix {
+        order.iter().zip(&lo.insts).map(|(&i, inst)| (prov_node[i as usize], inst_kind(inst))).collect()
+    } else {
+        Vec::new()
+    };
+    let foldable = if mix { foldable(&lo.insts, lo.next_vreg) } else { Vec::new() };
     if std::env::var_os("CELESTE_BUILD_TRACE").is_some() {
         eprintln!("[build]   {sym}: {} insts, {} vregs: lower {:.1}s, reschedule {:.1}s", lo.insts.len(), lo.next_vreg, t_lower.as_secs_f64(), t.elapsed().as_secs_f64());
     }
@@ -1885,8 +2169,9 @@ pub fn compile(
     for (i, inst) in lo.insts.iter().enumerate() {
         if let Some(d) = inst_def(inst) {
             def_of[d as usize] = i as u32;
-            // A load is rematerializable (reads `%r13`); nothing else is.
-            remat[d as usize] = matches!(inst, Inst::Load { .. });
+            // A load (reads `%r13`) and a constant are rematerializable;
+            // nothing else is.
+            remat[d as usize] = matches!(inst, Inst::Load { .. } | Inst::BcastD { .. });
         }
     }
 
@@ -1929,12 +2214,16 @@ pub fn compile(
     let save_off = spill_bytes;
     let argbuf_off = spill_bytes + SAVE_BYTES;
 
+    let call_saves = call_saves(&lo.insts, lo.next_vreg, &home);
+    let last_neg = lo.insts.iter().rposition(|i| matches!(i, Inst::Neg { .. }));
     let mut em = Emitter {
         home: &home,
         insts: &lo.insts,
         remat: &remat,
         def_of: &def_of,
         save_off,
+        call_saves: &call_saves,
+        last_neg,
         argbuf_off,
         pool: Pool::default(),
         out: String::new(),
@@ -1942,8 +2231,12 @@ pub fn compile(
     // Body first (fills the pool), then wrap with prologue/epilogue.
     let mut body = String::new();
     std::mem::swap(&mut em.out, &mut body);
-    for inst in &lo.insts {
-        em.emit_inst(inst);
+    for (k, inst) in lo.insts.iter().enumerate() {
+        if mix {
+            // A comment line: assembles to nothing, and `drop_redundant_reloads` passes it.
+            writeln!(em.out, "#@{k}").unwrap();
+        }
+        em.emit_inst(k, inst);
     }
     std::mem::swap(&mut em.out, &mut body); // em.out empty again, body holds the code
     let body = drop_redundant_reloads(&body);
@@ -1967,6 +2260,9 @@ pub fn compile(
     }
     writeln!(asm, "    vpxorq %zmm{Z}, %zmm{Z}, %zmm{Z}", Z = ZERO).unwrap();
     asm.push_str(&body);
+    if mix {
+        writeln!(asm, "#@end").unwrap();
+    }
     if frame > 0 {
         writeln!(asm, "    add ${}, %rsp", frame).unwrap();
     }
@@ -1996,5 +2292,197 @@ pub fn compile(
         sym: sym.to_string(),
         spill_slots,
         frame_bytes: frame,
+        prov,
+        foldable,
     })
+}
+
+/// A vreg's value as far as bit identities know it.
+#[derive(Clone, Copy, PartialEq)]
+enum Known {
+    Opaque,
+    /// The same i32 in every lane.
+    Const(i32),
+    /// Equal to another (opaque) vreg.
+    Alias(Vreg),
+}
+
+/// The instructions plain bit identities REMOVE (`CELESTE_KERNEL_MIX`'s
+/// estimate; nothing in the build uses it): constants folded through
+/// `x & -1 = x`, `x | -1 = -1`, `x | 0 = x`, `x & 0 = 0`, `c ? t : t = t`, a
+/// select or operation on constants, and so on; then every instruction no
+/// store needs (through the resolved operands) is removable. A constant a
+/// kept instruction still reads keeps its broadcast. Exact per lane: an
+/// identity holds for every input, so this drops no check.
+fn foldable(insts: &[Inst], n_vregs: Vreg) -> Vec<bool> {
+    let mut kn = vec![Known::Opaque; n_vregs as usize];
+    let res = |kn: &[Known], v: Vreg| -> Known {
+        match kn[v as usize] {
+            Known::Opaque => Known::Alias(v),
+            k => k,
+        }
+    };
+    let src = |kn: &[Known], s: &Src| -> Known {
+        match s {
+            Src::Reg(v) => res(kn, *v),
+            Src::BI32(c) => Known::Const(*c),
+        }
+    };
+    for inst in insts {
+        let (dst, k) = match inst {
+            Inst::BcastD { dst, val } => (*dst, Known::Const(*val)),
+            Inst::RBin { dst, op, a, b } => {
+                let (x, y) = (res(&kn, *a), src(&kn, b));
+                let k = match (op, x, y) {
+                    (_, Known::Const(p), Known::Const(q)) => Known::Const(match op {
+                        ROp::AddD => p.wrapping_add(q),
+                        ROp::SubD => p.wrapping_sub(q),
+                        ROp::MinSD => p.min(q),
+                        ROp::MaxSD => p.max(q),
+                        ROp::AndD => p & q,
+                        ROp::OrD => p | q,
+                        ROp::XorD => p ^ q,
+                        ROp::AndnD => !p & q,
+                    }),
+                    (ROp::AndD, z, Known::Const(-1)) | (ROp::AndD, Known::Const(-1), z) => z,
+                    (ROp::AndD, _, Known::Const(0)) | (ROp::AndD, Known::Const(0), _) => Known::Const(0),
+                    (ROp::OrD, _, Known::Const(-1)) | (ROp::OrD, Known::Const(-1), _) => Known::Const(-1),
+                    (ROp::OrD, z, Known::Const(0)) | (ROp::OrD, Known::Const(0), z) => z,
+                    (ROp::AndD | ROp::OrD | ROp::MinSD | ROp::MaxSD, p, q) if p == q => p,
+                    (ROp::XorD, z, Known::Const(0)) | (ROp::XorD, Known::Const(0), z) => z,
+                    (ROp::XorD | ROp::SubD, p, q) if p == q => Known::Const(0),
+                    (ROp::AndnD, Known::Const(-1), _) | (ROp::AndnD, _, Known::Const(0)) => Known::Const(0),
+                    (ROp::AndnD, Known::Const(0), z) => z,
+                    (ROp::AndnD, p, q) if p == q => Known::Const(0),
+                    (ROp::AddD | ROp::SubD, z, Known::Const(0)) => z,
+                    (ROp::AddD, Known::Const(0), z) => z,
+                    _ => Known::Opaque,
+                };
+                (*dst, k)
+            }
+            Inst::Cmp { dst, imm, a, b } => {
+                let k = match (res(&kn, *a), src(&kn, b)) {
+                    (Known::Const(p), Known::Const(q)) => {
+                        let t = match imm {
+                            0 => p == q,
+                            1 => p < q,
+                            2 => p <= q,
+                            4 => p != q,
+                            5 => p >= q,
+                            6 => p > q,
+                            _ => return vec![false; insts.len()],
+                        };
+                        Known::Const(if t { -1 } else { 0 })
+                    }
+                    (p, q) if p == q => match imm {
+                        0 | 2 | 5 => Known::Const(-1),
+                        _ => Known::Const(0),
+                    },
+                    _ => Known::Opaque,
+                };
+                (*dst, k)
+            }
+            Inst::Ternlog { dst, a, b, c, imm } => {
+                let (x, y, z) = (res(&kn, *a), res(&kn, *b), res(&kn, *c));
+                let k = match (x, y, z) {
+                    (Known::Const(p), Known::Const(q), Known::Const(r)) => {
+                        let mut out = 0i32;
+                        for bit in 0..32 {
+                            let i = ((p >> bit) & 1) << 2 | ((q >> bit) & 1) << 1 | ((r >> bit) & 1);
+                            out |= ((*imm as i32 >> i) & 1) << bit;
+                        }
+                        Known::Const(out)
+                    }
+                    _ if *imm == 0xca && y == z => y,
+                    (Known::Const(-1), _, _) if *imm == 0xca => y,
+                    (Known::Const(0), _, _) if *imm == 0xca => z,
+                    _ => Known::Opaque,
+                };
+                (*dst, k)
+            }
+            other => match inst_def(other) {
+                Some(d) => (d, Known::Opaque),
+                None => continue,
+            },
+        };
+        // An alias of itself is just opaque.
+        kn[dst as usize] = if k == Known::Alias(dst) { Known::Opaque } else { k };
+    }
+    // Liveness from the stores through resolved operands.
+    let mut def_at = vec![u32::MAX; n_vregs as usize];
+    for (i, inst) in insts.iter().enumerate() {
+        if let Some(d) = inst_def(inst) {
+            def_at[d as usize] = i as u32;
+        }
+    }
+    let mut const_def: HashMap<i32, u32> = HashMap::new();
+    for (i, inst) in insts.iter().enumerate() {
+        if let Inst::BcastD { val, .. } = inst {
+            const_def.entry(*val).or_insert(i as u32);
+        }
+    }
+    let mut needed = vec![false; insts.len()];
+    let mut stack: Vec<u32> = Vec::new();
+    let mut buf = Vec::new();
+    let need_vreg = |v: Vreg, stack: &mut Vec<u32>, needed: &mut Vec<bool>| {
+        let at = match res(&kn, v) {
+            Known::Alias(w) => def_at[w as usize],
+            // A constant operand needs its broadcast (or an embedded one).
+            Known::Const(c) => const_def.get(&c).copied().unwrap_or(u32::MAX),
+            Known::Opaque => def_at[v as usize],
+        };
+        if at != u32::MAX && !needed[at as usize] {
+            needed[at as usize] = true;
+            stack.push(at);
+        }
+    };
+    for (i, inst) in insts.iter().enumerate() {
+        if matches!(inst, Inst::Store { .. } | Inst::StoreMask { .. } | Inst::Call { .. }) {
+            needed[i] = true;
+            stack.push(i as u32);
+        }
+    }
+    while let Some(i) = stack.pop() {
+        buf.clear();
+        inst_uses(&insts[i as usize], &mut buf);
+        for &v in &buf {
+            need_vreg(v, &mut stack, &mut needed);
+        }
+    }
+    needed.iter().map(|n| !n).collect()
+}
+
+/// An instruction's kind for `Compiled::prov`: the variant, a binary op's
+/// operation, and whether its operand is the floor mask or the NOT constant.
+fn inst_kind(inst: &Inst) -> &'static str {
+    match inst {
+        Inst::Load { .. } => "load",
+        Inst::LoadMask { .. } => "loadmask",
+        Inst::BcastD { .. } => "bcast",
+        Inst::RBin { op, b, .. } => match (op, b) {
+            (ROp::AndD, Src::BI32(FLR_MASK)) => "flr",
+            (ROp::XorD, Src::BI32(-1)) => "not",
+            (ROp::AddD, _) => "add",
+            (ROp::SubD, _) => "sub",
+            (ROp::MinSD, _) => "min",
+            (ROp::MaxSD, _) => "max",
+            (ROp::AndD, _) => "and",
+            (ROp::OrD, _) => "or",
+            (ROp::XorD, _) => "xor",
+            (ROp::AndnD, _) => "andn",
+        },
+        Inst::Neg { .. } => "neg",
+        Inst::Abs { .. } => "abs",
+        Inst::Muldq { .. } => "muldq",
+        Inst::Sraq { .. } => "sraq",
+        Inst::Sllq { .. } => "sllq",
+        Inst::ShrD { .. } => "shrd",
+        Inst::BlendImm { .. } => "blendimm",
+        Inst::Cmp { .. } => "cmp",
+        Inst::Ternlog { imm: 0xca, .. } => "sel",
+        Inst::Ternlog { .. } => "ternlog",
+        Inst::Call { .. } => "call",
+        Inst::Store { .. } => "store",
+        Inst::StoreMask { .. } => "storemask",
+    }
 }

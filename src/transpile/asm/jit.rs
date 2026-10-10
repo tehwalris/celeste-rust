@@ -122,6 +122,11 @@ impl Loaded {
             func,
         })
     }
+
+    /// The loaded shared object (`CELESTE_KERNEL_MIX` keeps a copy).
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
 }
 
 impl Drop for Loaded {

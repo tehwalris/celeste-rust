@@ -87,9 +87,18 @@ pub fn compile_and_load_reprs(
         );
     }
     // The assembly text is only the assembler's input: drop it once loaded
-    // (it is GBs across a room's kernel sets).
-    compiled.asm = String::new();
+    // (it is GBs across a room's kernel sets). The mix diagnostic reads it.
+    if !mix_on() {
+        compiled.asm = String::new();
+    }
     Ok((compiled, loaded))
+}
+
+/// `CELESTE_KERNEL_MIX=DIR`: the instruction-mix diagnostic
+/// (`compiled::mix`) - provenance in the assembly, a report per kernel.
+pub fn mix_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("CELESTE_KERNEL_MIX").is_some())
 }
 
 #[cfg(test)]
