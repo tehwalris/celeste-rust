@@ -238,6 +238,13 @@ impl FieldDict {
         self.num_slot(word).map_or(NONE, |s| s.idx1 - 1)
     }
 
+    /// The numbers as `(word, placed bits)` while there are at most
+    /// `SMALL` of them (the emission matches them lane-parallel).
+    #[inline]
+    pub fn small_nums(&self) -> Option<&[(u64, u128)]> {
+        (self.nums <= SMALL).then(|| &self.small[..self.nums])
+    }
+
     /// A number's PLACED bits (`place` of its index; `None`: absent).
     #[inline]
     pub fn find_num_placed(&self, word: u64) -> Option<u128> {

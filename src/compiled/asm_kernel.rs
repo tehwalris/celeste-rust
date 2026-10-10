@@ -209,44 +209,32 @@ impl KeyField {
         std::array::from_fn(|i| u32::from_le_bytes([b[4 * i], b[4 * i + 1], b[4 * i + 2], b[4 * i + 3]]))
     }
 
-    /// Each lane of `take`: its index in `d` placed into `k`, or its bit in
-    /// `miss` where `d` lacks its code.
+    /// Each lane of `take`: its code's placed bits in `d` ORed into `k`, or
+    /// its bit in `miss` where `d` lacks the code. A field of at most a few
+    /// numbers is matched lane-parallel, code by code.
     #[inline]
     fn place16(&self, buf: &[u8], d: &FieldDict, take: u16, k: &mut [u128; 16], miss: &mut u16) {
+        use celeste_engine::runtime2::POS_WHOLE;
         let base = self.root;
-        let mut m = take;
-        macro_rules! each {
-            ($word:expr) => {
-                while m != 0 {
-                    let i = m.trailing_zeros() as usize;
-                    m &= m - 1;
-                    match d.find_num_placed($word(i)) {
-                        Some(p) => k[i] |= p,
-                        None => *miss |= 1 << i,
-                    }
-                }
-            };
-        }
-        match self.read {
+        let (lo, hi) = match self.read {
             KeyRead::Num => {
                 let w = Self::words(buf, base);
-                each!(|i: usize| Code::num(w[i], w[i]).word());
+                (w, w)
             }
-            KeyRead::Ival => {
-                let (lo, hi) = (Self::words(buf, base), Self::words(buf, base + 64));
-                each!(|i: usize| Code::num(lo[i], hi[i]).word());
-            }
+            KeyRead::Ival => (Self::words(buf, base), Self::words(buf, base + 64)),
             KeyRead::PosNum => {
-                let w = Self::words(buf, base);
-                each!(|i: usize| Code::pos(w[i], w[i]).word());
+                let w = Self::words(buf, base).map(|x| x & !POS_WHOLE);
+                (w, w)
             }
             KeyRead::PosIval => {
                 let (lo, hi) = (Self::words(buf, base), Self::words(buf, base + 64));
-                each!(|i: usize| Code::pos(lo[i], hi[i]).word());
+                let whole: [u32; 16] = std::array::from_fn(|i| lo[i] & POS_WHOLE);
+                (std::array::from_fn(|i| lo[i].wrapping_sub(whole[i])), std::array::from_fn(|i| hi[i].wrapping_sub(whole[i])))
             }
             KeyRead::Bool => {
                 let val = u16::from_le_bytes([buf[base], buf[base + 1]]);
                 let known = u16::from_le_bytes([buf[base + 2], buf[base + 3]]);
+                let mut m = take;
                 while m != 0 {
                     let i = m.trailing_zeros() as usize;
                     m &= m - 1;
@@ -256,6 +244,37 @@ impl KeyField {
                         None => *miss |= 1 << i,
                     }
                 }
+                return;
+            }
+        };
+        if let Some(small) = d.small_nums() {
+            let mut hit = 0u16;
+            for &(word, placed) in small {
+                let (a, b) = ((word >> 32) as u32, word as u32);
+                let mut eq = 0u16;
+                for i in 0..16 {
+                    eq |= (((lo[i] == a) & (hi[i] == b)) as u16) << i;
+                }
+                eq &= take;
+                hit |= eq;
+                if placed != 0 {
+                    while eq != 0 {
+                        let i = eq.trailing_zeros() as usize;
+                        eq &= eq - 1;
+                        k[i] |= placed;
+                    }
+                }
+            }
+            *miss |= take & !hit;
+            return;
+        }
+        let mut m = take;
+        while m != 0 {
+            let i = m.trailing_zeros() as usize;
+            m &= m - 1;
+            match d.find_num_placed(Code::num(lo[i], hi[i]).word()) {
+                Some(p) => k[i] |= p,
+                None => *miss |= 1 << i,
             }
         }
     }
