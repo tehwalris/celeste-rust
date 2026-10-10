@@ -186,18 +186,16 @@ pub fn trace_frame<'a>(
     it.d.fork_origins.clear();
     it.d.evaluated.clear();
     let iface = iface::symbolize(&mut it.d, &mut st, roots, pin, ival)?;
-    // THE KERNEL'S ADMISSIBLE INPUTS: the pins (`symbolize` made their
-    // slots read the constants; the raw cells feed only these checks), a
-    // lane outside is an error of the whole frame.
+    // The lattice's pins (`symbolize` made their slots read the constants;
+    // the raw cells feed only these checks).
     for (i, c) in &iface.pins {
         let cell = it.d.graph.leaf(crate::transpile::graph::Op::Cell(*i as u32));
         let c = match *c {
-            iface::Conc::Num(v) => crate::transpile::graph::Point::Num(v.as_raw_u32() as i32),
-            iface::Conc::Bool(b) => crate::transpile::graph::Point::Bool(b),
+            iface::Conc::Num(v) => crate::transpile::graph::Pinned::Num(v.as_raw_u32() as i32, v.as_raw_u32() as i32),
+            iface::Conc::Bool(b) => crate::transpile::graph::Pinned::Bool(b),
         };
         it.d.pin(cell, c);
     }
-    let mut admissible = super::error::pins_hold(&mut it.d);
     // The BOUNDED inputs (the region's square, speed and remainder; the
     // no-player phase's hulls): the body reads each through its restriction,
     // whose own error is the bound's check. Nothing seeds the raw cell, so
@@ -241,9 +239,13 @@ pub fn trace_frame<'a>(
     // The level's widened slots read as the table says (held trails forked
     // both ways, the fly fruit's replaced, near floors' `collideable`
     // derived, countdowns unknown, platform cells decided per world by the
-    // split pass), after the input shape, before any read. What they owe
-    // per lane is an error of the whole frame.
-    for ob in super::widen::read_inputs(&mut st, &mut it.d)? {
+    // split pass), after the input shape, before any read; an input read as
+    // a literal range is pinned to it.
+    let owed = super::widen::read_inputs(&mut st, &mut it.d)?;
+    // THE KERNEL'S ADMISSIBLE INPUTS: every pin holds, and what the inputs'
+    // hooks owe; a lane outside is an error of the whole frame.
+    let mut admissible = super::error::pins_hold(&mut it.d);
+    for ob in owed {
         admissible = it.d.graph.fold(crate::transpile::graph::Op::And, vec![admissible, ob]);
     }
     // The arc capture is per FRAME; drop a representative's old one.

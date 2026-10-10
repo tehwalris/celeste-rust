@@ -268,9 +268,10 @@ fn contain(d: &mut Symbolic, v: NodeId, (lo, hi): (i64, i64)) -> Option<<Symboli
 }
 
 /// The INPUT side: every entry of the tracer's level read as its slots'
-/// `Input` says, in table order, before the frame reads anything. Returned:
-/// the per-lane obligations on the raw inputs (a `Literal`'s containment,
-/// the platforms' hook's), which the caller makes errors of the whole frame.
+/// `Input` says, in table order, before the frame reads anything; a
+/// `Literal` is pinned to its range (`Op::Pin`). Returned: what the
+/// platforms' hook owes per lane beyond its pins (the no-player speed), which
+/// the caller makes an error of the whole frame.
 pub fn read_inputs(st: &mut State<Symbolic>, d: &mut Symbolic) -> Result<Vec<NodeId>> {
     let mut obligations = Vec::new();
     let mid = mid_frame(st);
@@ -294,7 +295,7 @@ pub fn read_inputs(st: &mut State<Symbolic>, d: &mut Symbolic) -> Result<Vec<Nod
             None => {
                 for paths in entry_paths(st, e) {
                     for (s, p) in e.slots.iter().zip(&paths) {
-                        obligations.extend(read_slot(st, d, e, s, p)?);
+                        read_slot(st, d, e, s, p)?;
                     }
                 }
             }
@@ -303,28 +304,35 @@ pub fn read_inputs(st: &mut State<Symbolic>, d: &mut Symbolic) -> Result<Vec<Nod
     Ok(obligations)
 }
 
-/// One slot's input (`Input`), and its obligation if it owes one.
-fn read_slot(st: &mut State<Symbolic>, d: &mut Symbolic, e: &Entry, s: &Slot, p: &Path) -> Result<Option<NodeId>> {
+/// An input `v` READ AS the literal `[lo, hi]` (`Input::Literal`, a
+/// platform's `rem.x`): pinned to it (`Op::Pin`, the input disconnected, its
+/// check `v` inside the literal), unless the graph proves it inside.
+fn pin_literal(d: &mut Symbolic, v: NodeId, lo: i32, hi: i32) {
+    if !within(d, v, (lo as i64, hi as i64), &mut Vec::new()) {
+        d.pin(v, crate::transpile::graph::Pinned::Num(lo, hi));
+    }
+}
+
+/// One slot's input (`Input`).
+fn read_slot(st: &mut State<Symbolic>, d: &mut Symbolic, e: &Entry, s: &Slot, p: &Path) -> Result<()> {
     let what = |kind: &str| anyhow::anyhow!("{}: not a {kind} (widening {:?})", iface::show(p), e.name);
     let new = match (s.input, iface::get(st, p)) {
-        (Input::Stored, _) => return Ok(None),
+        (Input::Stored, _) => return Ok(()),
         (Input::Hook, _) => bail!("{}: widening {:?} reads it in a hook it does not have", iface::show(p), e.name),
-        (_, None) if s.optional => return Ok(None),
+        (_, None) if s.optional => return Ok(()),
         (Input::BothWays, Some(Value::Bool(_))) => Value::Bool(d.both_values(s.field.last().expect("a field"))),
         (Input::Atom, Some(Value::Bool(_))) => Value::Bool(d.unknown_bool_atom()),
         (Input::BothWays | Input::Atom, _) => return Err(what("boolean")),
         (Input::Unknown, Some(Value::Num(_))) => Value::Num(d.unknown_num()),
         (Input::Literal, Some(Value::Num(v))) => {
             let Stored::Range { lo, hi, .. } = s.stored else { bail!("{}: a literal input reads a range", iface::show(p)) };
-            let owed = contain(d, v, (lo as i64, hi as i64));
+            pin_literal(d, v, lo, hi);
             let r = ival(d, lo, hi);
-            iface::set(st, p, Value::Num(r))?;
-            return Ok(owed);
+            return iface::set(st, p, Value::Num(r));
         }
         (Input::Unknown | Input::Literal, _) => return Err(what("number")),
     };
-    iface::set(st, p, new)?;
-    Ok(None)
+    iface::set(st, p, new)
 }
 
 /// An object's `(x, y)`: constants, floors and springs never move.
@@ -495,13 +503,14 @@ fn widen_near_floors(st: &mut State<Symbolic>, d: &mut Symbolic, e: &Entry, errs
 /// world's cell, so the split decides player-vs-platform comparisons per
 /// PLATFORM WORLD, keeping platforms mutually consistent; `last` read as `x`
 /// (checked at the output, `Stored::SameAs`); `rem.x` the literal whole
-/// remainder (as `Input::Literal`: a literal's floor rejoins as fragments;
-/// the price is a pixel of slack at this level); each unpinned `spd.x`
+/// remainder (pinned to it as `Input::Literal`: a literal's floor rejoins as
+/// fragments; the price is a pixel of slack at this level); each unpinned `spd.x`
 /// through its range over the worlds - with no player, as the literal of its
 /// one moving speed. Not table slots: all of it is per WORLD (which world
 /// platform an object is, and what its inputs may be there), which a slot
-/// cannot say. Returned: per-lane obligations (the no-player speed; `rem.x`
-/// inside its literal).
+/// cannot say. Returned: the per-lane obligation of each no-player speed
+/// (`0` or its one moving speed, read as the latter: a two-point set no
+/// single `Pin` states).
 pub fn platform_inputs(st: &mut State<Symbolic>, d: &mut Symbolic) -> Result<Vec<NodeId>> {
     let worlds = d.worlds.clone().ok_or_else(|| anyhow::anyhow!("the platforms are unknown but there is no world table"))?;
     let platforms = objects_of_type(st, "platform");
@@ -559,7 +568,7 @@ pub fn platform_inputs(st: &mut State<Symbolic>, d: &mut Symbolic) -> Result<Vec
         // `rem.x` is replaced by the literal whole remainder: sound for a
         // lane whose own lies inside, which is owed.
         let Some(Value::Num(rv)) = iface::get(st, &rem) else { bail!("{}: not a number", iface::show(&rem)) };
-        obligations.extend(contain(d, rv, (REM.0 as i64, REM.1 as i64)));
+        pin_literal(d, rv, REM.0, REM.1);
         let r = ival(d, REM.0, REM.1);
         iface::set(st, &rem, Value::Num(r))?;
         cells[j] = Some(xv);

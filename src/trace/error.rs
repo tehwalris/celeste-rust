@@ -54,12 +54,12 @@ use crate::transpile::graph::{NodeId, Op};
 use super::domain::{Domain, Symbolic};
 
 /// Every PIN of the frame holds (`Symbolic::pin`, in the order made): the
-/// conjunction of `x == c` on the raw inputs; `true` without pins. Its
+/// conjunction of `x` inside `c` on the raw inputs; `true` without pins. Its
 /// negation is an error of the whole frame, never a guard: a disagreeing lane
 /// is real and must decline loudly.
 pub fn pins_hold(d: &mut Symbolic) -> NodeId {
-    use crate::transpile::graph::Point;
-    let pins: Vec<(NodeId, Point)> = d
+    use crate::transpile::graph::Pinned;
+    let pins: Vec<(NodeId, Pinned)> = d
         .assumptions
         .iter()
         .filter_map(|a| match d.graph.get(*a).op {
@@ -70,12 +70,20 @@ pub fn pins_hold(d: &mut Symbolic) -> NodeId {
     let mut acc = d.graph.leaf(Op::ConstBool(true));
     for (x, c) in pins {
         let t = match c {
-            Point::Num(v) => {
+            Pinned::Num(v, w) if v == w => {
                 let k = d.graph.leaf(Op::Const(v, v));
                 d.graph.fold(Op::Eq, vec![x, k])
             }
-            Point::Bool(true) => x,
-            Point::Bool(false) => d.graph.fold(Op::Not, vec![x]),
+            // Inside a literal interval: both ends, on the raw input.
+            Pinned::Num(lo, hi) => {
+                let (klo, khi) = (d.graph.leaf(Op::Const(lo, lo)), d.graph.leaf(Op::Const(hi, hi)));
+                let (xlo, xhi) = (d.graph.fold(Op::Lo, vec![x]), d.graph.fold(Op::Hi, vec![x]));
+                let above = d.graph.fold(Op::Ge, vec![xlo, klo]);
+                let below = d.graph.fold(Op::Le, vec![xhi, khi]);
+                d.graph.fold(Op::And, vec![above, below])
+            }
+            Pinned::Bool(true) => x,
+            Pinned::Bool(false) => d.graph.fold(Op::Not, vec![x]),
         };
         acc = d.graph.fold(Op::And, vec![acc, t]);
     }

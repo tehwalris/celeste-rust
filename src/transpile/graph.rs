@@ -66,10 +66,11 @@ pub struct Room {
     pub cache: Arc<CollisionCache>,
 }
 
-/// A `Pin`'s value.
+/// What a `Pin` reads its input as: a number (a point, or a literal
+/// interval `[lo, hi]`, raw 16.16) or a boolean.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-pub enum Point {
-    Num(i32),
+pub enum Pinned {
+    Num(i32, i32),
     Bool(bool),
 }
 
@@ -112,13 +113,16 @@ pub enum Op {
     /// raw operand (`trace::error`), charged to every outcome of the frame,
     /// because a comparison the range decided no longer reads the node.
     Restrict(i32, i32),
-    /// `Pin(c)(x)`: the input `x` ASSUMED to hold exactly `c` (a number, raw
-    /// 16.16, or a boolean): the point twin of `Restrict`. The body was
-    /// specialized on `c`: every USE of the input reads the constant, never
-    /// this node, so the node exists for its own error, `x != c` on the raw
-    /// input, charged to every outcome of the frame (`trace::error::
-    /// assumptions_hold`). A shape's lattice constants enter a kernel this way.
-    Pin(Point),
+    /// `Pin(c)(x)`: the input `x` ASSUMED to lie in the constant `c` (a
+    /// number, a literal interval or a boolean; `Pinned`), the twin of
+    /// `Restrict` that DISCONNECTS its input: every USE of the input reads
+    /// the constant `c`, never this node or `x`, so the node has no data
+    /// output and exists for its check, `x` inside `c` on the raw input
+    /// (`trace::error::pins_hold`), an error of the whole frame. A shape's
+    /// lattice constants enter a kernel this way (points), and so do inputs
+    /// read as a literal range so that lanes merge across it (a fly fruit's
+    /// `spd.y`/`rem.y`, a platform's `rem.x`).
+    Pin(Pinned),
     /// THE UNKNOWN NUMBER. Not the full-range interval (interval arithmetic
     /// at the extremes raises): it stays unknown under every operation and a
     /// comparison with it is an `UnknownBool`. It never reaches a kernel: it

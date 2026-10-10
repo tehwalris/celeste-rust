@@ -416,8 +416,8 @@ pub struct Symbolic {
     may_memo: std::cell::RefCell<rustc_hash::FxHashMap<NodeId, (NodeId, NodeId)>>,
     /// The frame's INPUT ASSUMPTIONS, in the order made: `Op::Restrict`
     /// (`restrict`: a bounded input, the only source of a static range - no
-    /// cell is seeded with one) and `Op::Pin` (`pin`: an input the body was
-    /// specialized on). Each is charged to every outcome (`trace::error`).
+    /// cell is seeded with one) and `Op::Pin` (`pin`: an input the body reads
+    /// as a constant). Each is charged to every outcome (`trace::error`).
     /// Per frame.
     pub assumptions: Vec<NodeId>,
     /// `range_of`'s memo; a comparison the ranges decide folds.
@@ -588,11 +588,11 @@ impl Symbolic {
         r
     }
 
-    /// THE POINT ASSUMPTION: the input `x` holds exactly `c` (`Op::Pin`),
-    /// recorded so its check is charged to every outcome. It has no data
-    /// output: the caller makes every use of the input read the constant
-    /// instead, so `x` feeds this check alone.
-    pub fn pin(&mut self, x: NodeId, c: crate::transpile::graph::Point) {
+    /// THE PIN: the input `x` lies in the constant `c` (`Op::Pin`), recorded
+    /// so its check is charged to the frame. It has no data output: the
+    /// caller makes every use of the input read the constant instead, so `x`
+    /// feeds this check alone.
+    pub fn pin(&mut self, x: NodeId, c: crate::transpile::graph::Pinned) {
         let p = self.graph.add(Op::Pin(c), vec![x]);
         if !self.assumptions.contains(&p) {
             self.assumptions.push(p);
