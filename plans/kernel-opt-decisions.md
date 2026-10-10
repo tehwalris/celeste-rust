@@ -141,3 +141,19 @@ changed. If storage must be 8, kernels at 8 are safe and cost only startup.
   per input row) is where the reference frame's time is now.
 - Steps 3 and 4 were not perf-profiled (perf's mmap failed while another
   agent profiled); their cycles are the `[phases]` kernel phase.
+
+## Verification, every step (summary)
+
+Against `fg-2300` (`cc83334`) built the same way: `ckhash --edges` (and
+`--dropped` where level -1 runs) identical on room (1,0) r0sxh f0-f62,
+(6,2) 100% r0sxhf f0-f50, (2,1) r0sxhnp f0-f45, (6,0) r0sxhfp split to step
+75, (6,2) r0sxh f0-f40; `kernel lanes: missed 0` in all; the key check
+(`CELESTE_KERNEL_KEY_CHECK=1`, room (1,0) f44); `ref-check` (8 samples of
+30 rows, rooms (1,0) and (6,2), all agree, unchanged) and `arc-check` (exit
+0); the room (1,0) gates (posgraph, ckhash, arc gate h35, the known route
+with `--prefer`: no PRUNED); nextest `--cargo-profile quick --run-ignored
+all`. The final binary also on the reference frame itself (f56 -> f57 of
+`/var/tmp/canon-h62-f56`, which runs the 12 spike-reaching kernels):
+`ckhash --edges --dropped` through f57 and `posgraph.bin` identical.
+At region 8 the final kernels run 2.155G instructions on the frame (5,877 a
+slice) against 2.660G (7,264) at 16: -19%, as after step 1.
