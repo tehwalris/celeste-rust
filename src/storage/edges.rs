@@ -621,6 +621,12 @@ impl EdgeStore {
         }
     }
 
+    /// Frame `frame`'s files (`storage-census`): per file its index file's
+    /// bytes, its owner index's entries and its units.
+    pub fn file_sizes(&self, frame: u32) -> Vec<(u64, u64, usize)> {
+        self.frames.get(frame as usize).into_iter().flatten().map(|f| (f.map.len() as u64, f.head.n_owner_index, f.head.units.len())).collect()
+    }
+
     /// The last frame with edges.
     pub fn horizon(&self) -> u32 {
         self.frames.len() as u32 - 1
@@ -719,6 +725,18 @@ impl UnitView<'_> {
 
     pub fn n_lids(&self) -> usize {
         self.u.n_lids as usize
+    }
+
+    /// The unit's recorded layout (`storage-census`): its block's bytes, its
+    /// transfer ranks, and whether its sources are explicit ids (8 B each)
+    /// rather than a row range.
+    pub fn layout(&self) -> (u64, u32, bool) {
+        (self.u.block_len, self.u.n_xfers, self.u.src_seq == u32::MAX)
+    }
+
+    /// Lid `l`'s bytes in the block (`storage-census`).
+    pub fn lid_bytes(&self, l: u32) -> u32 {
+        self.file.u32_at(self.u.starts, l as usize + 1) - self.file.u32_at(self.u.starts, l as usize)
     }
 
     /// Lid `l`'s owner `(region, entry)` (`None`: a lid no edge names).
