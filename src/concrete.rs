@@ -67,8 +67,9 @@ pub const WORLD_FIELDS: usize = 6;
 /// on how many frames the platforms have updated (a freeze or restart only
 /// lowers that), and a no-input run visits every arrangement a search of up
 /// to `frames` frames can meet. The caller must refuse a longer search.
-pub fn platform_worlds(frames: usize) -> Result<Vec<Vec<[i32; WORLD_FIELDS]>>> {
-    let mut eng = RefEngine::new()?;
+/// `s`: the run's settings (its room).
+pub fn platform_worlds(frames: usize, s: &crate::settings::Settings) -> Result<Vec<Vec<[i32; WORLD_FIELDS]>>> {
+    let mut eng = RefEngine::new(s)?;
     let mut state = eng.initial()?;
     let mut seen: std::collections::BTreeSet<Vec<[i32; WORLD_FIELDS]>> = Default::default();
     let mut worlds = Vec::new();
@@ -106,8 +107,8 @@ mod tests {
             (r.shape_hash_of(), celeste_engine::exact::exact_rows(&c, crate::compiled::ids()), crate::search::pos_graph::block_cells(r).expect("cells"))
         };
         // The cart is read when an engine is built, under its settings.
-        let mut whole = RefEngine::new().expect("engine");
-        let mut split = RefEngine::with(&crate::settings::Settings { split_frame: true, ..Default::default() }).expect("split engine");
+        let mut whole = RefEngine::new(&Default::default()).expect("engine");
+        let mut split = RefEngine::new(&crate::settings::Settings { split_frame: true, ..Default::default() }).expect("split engine");
 
         let mut a = whole.initial().expect("init");
         let mut b = split.initial().expect("split init");

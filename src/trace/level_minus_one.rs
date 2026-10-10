@@ -1,6 +1,6 @@
 //! LEVEL -1 (plans/level-minus-one.md): a POSITION-ONLY cost-to-go table for
 //! the start room, from the traced frame graphs; the search uses it as a
-//! filter (`--level-minus-one H,S`), `transpile --level-minus-one`
+//! filter (`--level-minus-one H,S`), `transpile --probe`
 //! checks it (`probe`).
 //!
 //! A node is (heap shape, cell of the player or player spawn); every other
@@ -300,6 +300,8 @@ struct Table<'a> {
     lw: &'a LatticeWalk,
     room: Room,
     room0: (i16, i16),
+    /// `--hundred`: a successor that leaves the berry behind is no exit.
+    hundred: bool,
     spd_px: i32,
     shapes: Vec<Shape>,
     by_key: HashMap<String, usize>,
@@ -465,7 +467,7 @@ impl<'a> Table<'a> {
             if room != self.room0 {
                 // 100%: an exit that certainly leaves the berry behind wins
                 // nothing - the run ends there, no successor.
-                if crate::game_runner::hundred() && berry_left_behind(&o.st, d, self.room0) {
+                if self.hundred && berry_left_behind(&o.st, d, self.room0) {
                     continue;
                 }
                 outs.push(OutSpec { target: Target::Exit, fields: Vec::new() });
@@ -1018,8 +1020,8 @@ impl CostToGo {
 }
 
 /// The start room's level -1 table at speed bound `spd_px`, built or cached.
-pub fn cost_to_go(root: &FsPath, spd_px: i32, threads: usize) -> Result<CostToGo> {
-    let (path, key) = cache_file(root, spd_px)?;
+pub fn cost_to_go(root: &FsPath, spd_px: i32, threads: usize, s: &crate::settings::Settings) -> Result<CostToGo> {
+    let (path, key) = cache_file(root, spd_px, s)?;
     match CostToGo::load(&path) {
         Ok(Some(t)) => {
             eprintln!("[level -1] table read from {} ({} entries)", path.display(), t.d.len());
@@ -1029,7 +1031,7 @@ pub fn cost_to_go(root: &FsPath, spd_px: i32, threads: usize) -> Result<CostToGo
         Err(e) => eprintln!("[level -1] the cached table {} is unreadable ({e:#}): building it", path.display()),
     }
     let mut rep = String::new();
-    let b = build(root, spd_px, threads, &mut rep)?;
+    let b = build(root, spd_px, threads, &mut rep, s)?;
     let mut d = rustc_hash::FxHashMap::default();
     for (&h, &id) in &b.by_hash {
         for (i, &(sid, x, y)) in b.g1.nodes.iter().enumerate() {
@@ -1058,15 +1060,15 @@ const CACHE_FORMAT: u32 = 1;
 /// a fixture sets it (tools/fixtures.sh: the table its tree was built
 /// under, recorded by fingerprint in the tree, which `bench-frame` checks),
 /// never a search.
-fn cache_file(root: &FsPath, spd_px: i32) -> Result<(PathBuf, String)> {
+fn cache_file(root: &FsPath, spd_px: i32, s: &crate::settings::Settings) -> Result<(PathBuf, String)> {
     use std::hash::{Hash, Hasher};
-    if let Some(f) = &crate::settings::get().l1_table {
+    if let Some(f) = &s.l1_table {
         return Ok((f.clone(), format!("level -1 table pinned by --l1-table, format {CACHE_FORMAT}, S = {spd_px}\n")));
     }
     let dir = PathBuf::from("/var/tmp/celeste-l1-cache");
     let exe = std::env::current_exe()?;
     let exe_bytes = std::fs::read(&exe).map_err(|e| anyhow!("reading this binary {}: {e}", exe.display()))?;
-    let lua = super::cart::sources_in(root, crate::settings::get())?;
+    let lua = super::cart::sources_in(root, s)?;
     let mut cart: Vec<(String, Vec<u8>)> = Vec::new();
     for e in std::fs::read_dir(root.join("cart"))? {
         let e = e?;
@@ -1077,8 +1079,8 @@ fn cache_file(root: &FsPath, spd_px: i32) -> Result<(PathBuf, String)> {
     cart.sort();
     // What the cart is a function of (the settings a tree records, and the
     // walk's probe): not threads, the filter's horizon or diagnostics.
-    let env = crate::settings::get().cart_key();
-    let room = crate::game_runner::start_room();
+    let env = s.cart_key();
+    let room = s.room;
     // Two 64-bit SipHashes under different prefixes: a 128-bit name.
     let half = |salt: u8| {
         let mut h = std::collections::hash_map::DefaultHasher::new();
@@ -1587,16 +1589,18 @@ impl Graph1 {
 }
 
 /// The table: lattice walk, spawn chain, passes to inductive ranges, d.
-fn build(root: &FsPath, spd_px: i32, threads: usize, rep: &mut String) -> Result<Built> {
+fn build(root: &FsPath, spd_px: i32, threads: usize, rep: &mut String, s: &crate::settings::Settings) -> Result<Built> {
     let t_all = std::time::Instant::now();
-    let room0 = crate::game_runner::start_room();
-    let lw = super::kernel::room_constant_lattice(root, crate::abstraction::Level { held: true, ..crate::abstraction::Level::EXACT })?;
+    let room0 = s.room;
+    let walk = super::kernel::Walk { settings: s, only: None };
+    let lw = super::kernel::room_constant_lattice(root, crate::abstraction::Level { held: true, ..crate::abstraction::Level::EXACT }, &walk)?;
     say!(rep, "room {room0:?}: lattice walk {} shapes, {:.1} s", lw.lattice.len(), t_all.elapsed().as_secs_f64())?;
     let mut tr = lw.tracer.clone();
     let mut table = Table {
         lw: &lw,
         room: Room { cart: lw.cart.clone(), cache: lw.cache.clone() },
         room0,
+        hundred: s.hundred,
         spd_px,
         shapes: Vec::new(),
         by_key: HashMap::new(),
@@ -1926,10 +1930,10 @@ fn build(root: &FsPath, spd_px: i32, threads: usize, rep: &mut String) -> Result
     Ok(Built { by_hash, g1, sound, chain, start_d })
 }
 
-pub fn probe(root: &FsPath, opts: &Opts) -> Result<String> {
+pub fn probe(root: &FsPath, opts: &Opts, s: &crate::settings::Settings) -> Result<String> {
     let mut rep = String::new();
     let t_all = std::time::Instant::now();
-    let Built { by_hash, g1, sound, chain, .. } = build(root, opts.spd_px, opts.threads, &mut rep)?;
+    let Built { by_hash, g1, sound, chain, .. } = build(root, opts.spd_px, opts.threads, &mut rep, s)?;
 
     // Min sound d per 8 px tile (0-9, a-z, '+' above, '*' no path, '.' no node).
     say!(rep, "\nsound d per 8 px tile, the smallest over the table's shapes:")?;
@@ -1949,25 +1953,6 @@ pub fn probe(root: &FsPath, opts: &Opts) -> Result<String> {
             })
             .collect();
         say!(rep, "{:4} {line}", ty as i32 * 8)?;
-    }
-    // `--l1-path x,y`: the table's fastest path from that cell.
-    if let Some((x, y)) = crate::settings::get().diag.l1_path {
-        let show = |i: usize| format!("({}, {}) shape {} d {}", g1.nodes[i].1, g1.nodes[i].2, g1.nodes[i].0, sound[i]);
-        match g1.nodes.iter().enumerate().filter(|(_, n)| n.1 == x && n.2 == y).min_by_key(|(i, _)| sound[*i]).map(|(i, _)| i) {
-            None => say!(rep, "\npath from ({x}, {y}): not a table node")?,
-            Some(mut i) => {
-                let mut steps = vec![show(i)];
-                while sound[i] > 1 && sound[i] != u32::MAX && steps.len() < 64 {
-                    let Some(&next) = g1.edges[i].iter().find(|&&e| sound[e as usize] == sound[i] - 1) else {
-                        steps.push("(no successor of d - 1: a death seed)".to_string());
-                        break;
-                    };
-                    i = next as usize;
-                    steps.push(show(i));
-                }
-                say!(rep, "\npath from ({x}, {y}), the table's fastest:\n  {}{}", steps.join("\n  "), if g1.exits[i] { "\n  EXIT" } else { "" })?;
-            }
-        }
     }
 
     // The soundness check against the recorded transitions.
@@ -2194,10 +2179,10 @@ mod room_tests {
         if !std::path::Path::new("lua/celeste-minimal.lua").exists() {
             return;
         }
-        crate::settings::install(crate::settings::Settings { room: (7, 1), ..Default::default() });
+        let s = crate::settings::Settings { room: (7, 1), ..Default::default() };
         let t = std::thread::Builder::new()
             .stack_size(256 * 1024 * 1024)
-            .spawn(|| super::cost_to_go(std::path::Path::new("."), 5, 8))
+            .spawn(move || super::cost_to_go(std::path::Path::new("."), 5, 8, &s))
             .unwrap()
             .join()
             .unwrap()

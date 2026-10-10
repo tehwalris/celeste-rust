@@ -34,17 +34,26 @@ cleanup toward ~10k is in progress.
 ## Read these before doing anything substantial
 
 - `plans/architecture.md` - the current design: interfaces, the tracer and
-  kernel model, the waves frame and the door, the recorded edges and their
+  kernel model, the wave and the storage, the recorded edges and their
   transfers, the search (arcs, the concrete search), gates, open issues.
 - `plans/abstractions.md` - every level flag (`h f n p`; the remainder):
-  what it widens, why it is sound, what refutes it, its status.
+  what it widens, why it is sound, what refutes it, its status. Generated
+  from the widening table (`celeste_engine::widening::TABLE`, interpreted
+  by the tracer and by `Rt2::widen_to`; plans/widen-table.md).
+- `plans/storage-v2.md` (the visited set, state ids, the edge files) and
+  `plans/exact-keys.md` (a state's key is its packed field codes, not a
+  hash).
+- `plans/devloop.md` - the check ladder (`./check.sh`) and the fixtures.
+- `plans/footguns.md` - the settings (flags, recorded in each tree) and
+  the other footguns fixed, with the decisions behind them.
 - `plans/results.md` - every room's optimum, how it was proven, its witness;
   how to run an object room.
 - `plans/lessons.md` - abandoned approaches and the measurement that killed
   each. Check it before proposing something that sounds familiar.
 - `plans/level-minus-one.md` - the cost-to-go filter.
-- `src/frame.rs` (~2.7k lines: the block, the frame step, the forward) and
-  `src/search/` (door, edges, checkpoint, arcs, arc_dp: the search).
+- `src/frame.rs` (~2.3k lines: the block, the frame step, the forward),
+  `src/storage/` (the wave, its units, the visited set, the edge files) and
+  `src/search/` (checkpoint, edges, arcs, arc_dp, known: the search).
 - `BENCHMARK_DATA.md` - dated measurements, newest first; partly stale (see
   its first line).
 
@@ -99,8 +108,8 @@ latter.
 
 ## Branches
 
-`develop` is the main line; work happens on feature branches off it
-(current: `integrate`, and `arc-only` for the arc-only search).
+`develop` is the main line; work happens on feature branches off it and is
+merged back.
 `parallel-experiments` (overnight parallelism, deliberately not merged),
 `asm-interval-wrap` (a rejected first version of the interval-overflow fix;
 the accepted one is on `arc-sets`), `interpreter-abandoned-2026-01-11` (the
@@ -109,7 +118,7 @@ January CFG optimizer, reading material only).
 ## Running safely
 
 Use `./safe-run.sh` for EVERYTHING that builds or runs - `cargo build`,
-`cargo check`, nextest, `transpile`, benches, the search - including
+`cargo check`, nextest, the binaries, benches, the search - including
 commands issued by subagents. It runs the command in a systemd scope with
 `MemoryMax=60G` (`--memory 85G` etc. to raise it for one run) so a blowup
 kills the process, not the machine. Why everything: on 2026-08-24 a process
@@ -120,118 +129,65 @@ thing that fails.
 
 - Exit code 137 means OOM. Never raise the cap past what `free` leaves after
   /tmp, which is a tmpfs.
+- **One cargo at a time: `./one-cargo.sh cargo ...`** (an flock on the build
+  directory: a second build WAITS and says so, instead of blocking silently
+  or swapping the binary under a running measurement).
 - Checkpoints go on DISK (`/var/tmp/celeste-checkpoints`, the default
   `--checkpoint-dir`), never under /tmp. A long run's trees are 100-200 GB:
   check `df` first.
 - Reading memory: the `[fwd]` line's `rss start/wave/end` is the ANONYMOUS
-  resident set (`RssAnon`: door, frontier, queues); `file` is file-backed
-  pages (mapped edge records and checkpoints, reclaimable); `peak` is `VmHWM`,
-  both together. Reading `VmRSS` once mistook the mmaps for heap.
-- `safe-run.sh` sets `MIMALLOC_PURGE_DELAY=0` (freed pages return at once: the
-  door rebuilds every shard each frame and the delayed purge kept 2 GB of
-  copies resident). Override it in the environment to experiment.
+  resident set (`RssAnon`); `file` is file-backed pages (mapped edge files
+  and checkpoints, reclaimable); `peak` is `VmHWM`, both together. Reading
+  `VmRSS` once mistook the mmaps for heap.
+- `safe-run.sh` sets `MIMALLOC_PURGE_DELAY=0` (freed pages return at once).
+  Override it in the environment to experiment.
+- **Settings are flags**, never environment variables: a binary refuses any
+  `CELESTE_*` variable (naming the flag that replaced it). A tree records
+  the settings that change it (`<level dir>/settings.txt`) and refuses a run
+  under others; `--override-settings` proceeds only past a different
+  `--region`, loudly. A tree without the record: `rewrite adopt-settings`.
 - A search RESUMES from its checkpoint directory: rerun the same command
-  after a crash or kill; delete the directory for a fresh run. Nothing on disk
-  records a level's spec, so do not resume a tree under another `--level`.
+  after a crash or kill; delete the directory for a fresh run.
 
-## Iterating quickly - read this before running anything
+## Checking a change
 
-**Pick the cheapest thing that answers your question.** The mistake is
-always reaching for the most expensive profile out of habit.
+The check ladder is `./check.sh t0|t1|t2|big` (plans/devloop.md: what each
+tier runs and protects, the fixtures, the pins). No check runs longer than
+~2 minutes; background anything over ~30 s and wait with a Monitor
+until-loop, do not poll.
 
-| what you want | command | cost |
-|---|---|---|
-| "did my edit compile and does its unit test pass" | `cargo nextest run <filter>` (DEBUG) | ~1.3 s after an edit |
-| "does the whole suite still pass" / the pre-commit run | `./safe-run.sh -- cargo nextest run --cargo-profile quick` | ~47 s build + run |
-| anything you will quote a NUMBER from | `--release` | ~110 s build + run |
-| the `#[ignore]`d tests, deliberately | `--cargo-profile quick --run-ignored all` | minutes |
+| tier | what |
+|---|---|
+| `t0` | the unit tests (nextest, quick profile): the pre-commit run |
+| `t1` | single frames from the fixtures, exact: the forward, `--key-check`, the widening table, a backward frame, the storage, the kernels and transfers against the reference engine |
+| `t2` | end to end: the three pinned room (1,0) oracles and the known route, an objects-ladder search, a platform room. Every change to the loop, the kernels or the tracer must pass it |
+| `big` | the reference frame (6,2) 100% f56 -> f57 (and its storage replay), the one kernel and storage measurements use |
 
-- **Never use `--release` for unit tests.** The release profile is
-  `lto = "fat"` + `codegen-units = 1`: a one-line edit relinks the workspace,
-  ~100 s to run a test that executes in 6 ms.
-- **Do not run the full suite in plain debug**: the compute-bound tests
-  (`a_traced_frame_agrees_with_the_oracle`, `ice_at_answers_the_tile_scan_in_every_room`)
-  are slow without optimization.
-  Debug wins when a filter keeps them out; `--cargo-profile quick` otherwise.
-- **Tools get `--profile quick`, not `--release`** (`transpile` probes,
-  `rewrite` diagnostics, export-ui): 15 s to build against ~78 s. "Too slow
-  in debug" argues for optimization, not for the gate's profile.
-- **`--release` is for the gate and for benchmarks only.** Never make
-  `[profile.release]` cheaper to speed up the loop - it silently reprices
-  every recorded result. Add a profile instead.
 - **Run tests with NEXTEST, never bare `cargo test`.** Several tests mutate
-  process-global state (the precision, the kernel registry); under cargo
-  test's shared process the suite twice degraded to 70-85 MINUTES on one core.
-  nextest isolates each test in its own process.
-- **One cargo at a time: `./one-cargo.sh cargo ...`** takes an flock on the
-  build directory, so a second build WAITS and says so. Without it, a build
-  started while another runs prints `Blocking waiting for file lock` once,
-  into a log nobody tails, and then appears to take forever (2026-08-23: a
-  70 s build "taking 25 minutes", a false hung-test alarm, a bogus theory);
-  it can also swap the binary under a running A/B measurement.
-- **Background anything over ~30 s** (`run_in_background: true`) and wait
-  with a Monitor until-loop. Do not poll in a loop.
-- **`touch` the file you care about** to measure what an edit really costs:
-  `touch src/transpile/lower.rs && time cargo nextest run transpile`.
-
-**The ignored tests** (3, `#[ignore]` rather than an env check so nextest
-prints them as skipped): `forward_extended_frame_by_frame_matches_fresh`
-(resume), `room_71_table_builds_with_its_balloon` (level -1) and
-`pinning_isolated_floors_keeps_the_projected_successors` (the reference
-engine's floor pin for `arc-check`, ~200 s). They are
-NOT part of the pre-commit run. Run them, AND the three pinned oracles
-(below), when you touched the tracer, the lowering, the ASM codegen, the
-edge recording, resume, level -1 or the reference engine: the kernels are
-assembled at startup, so the oracles are what check what they COMPUTE.
-
-Do NOT read past the "N skipped" line and call the suite green when one of
-those reasons applies. That is the exact mistake behind `a8f4635`.
-
-## Gates
-
-Every change to the loop, the kernels or the tracer must reproduce the three
-pinned room (1,0) oracles:
-
-```bash
-./safe-run.sh -- ./target/release/rewrite forward --to 44 --room 1,0 --checkpoint-dir D   # prints the posgraph line
-./target/release/rewrite ckhash --to 44 --room 1,0 --checkpoint-dir D | diff - gates/ckhash_room10_f000-044.txt   # empty
-# the posgraph line must equal gates/posgraph_room10_f044.txt
-./safe-run.sh -- ./target/release/rewrite search --to 35 --win-at 9,101 --checkpoint-dir D2 \
-    --prefer gates/known_room10_win9-101.txt > log    # exits non-zero if the known route is pruned
-grep '^\[gate\]' log | diff - gates/arc_room10_win9-101_h35.txt          # empty
-```
-
-- **The known-route check** (`search::known`, plans/architecture.md
-  "Gates"): `search --prefer FILE` steps a known solution through the
-  reference engine and, when it exits by the horizon, asserts at every level
-  and step that no pruning drops it - level -1, the ladder's filter, the
-  arc graph's node, its `W` at the exact remainder, the reach marks - and
-  FAILS the search with the first step that does (`[known] PRUNED`). Run
-  real rooms with `--prefer` their community TAS or our witness (the
-  category runner does); `rewrite check-known --checkpoint-dir D --level
-  SPEC --horizon H --inputs FILE` checks finished trees alone. A pruned
-  known route is a soundness bug, never a result: it is how room (6,1)'s
-  wrong refutation of 93 (`5ccf712`) shows up, at the mid-frame step the
-  filter drops.
-
-- The arc gate (2026-10-05, replacing the ladder's marks gate) pins the
-  remainder-free marks at h35 (count and a fingerprint over (shape, key,
-  cell)), the winning sets W at every frame 0-35 (node count and a
-  fingerprint over each node's (shape, key, cell) and its region), the arc
-  optimum (33) and the concrete witness (its 33 inputs). Ids depend on the
-  scheduling; none of these do (identical at 3 and 32 threads, and over a
-  reused tree).
-- **Re-pin only on evidence that the SETS did not move** - posgraph
-  identical, every per-frame kept count, marked count, first win and the
-  optimum identical - and say so in the commit (done for `4e2d2e9` and
-  `18208c6`, both new globals that move every key).
-- After any change to the edge or transfer recording: `rewrite arc-check
-  --level-dir D/level00 --to N` (every record has a transfer; sampled
-  transfers probed with the reference engine inside and outside their
-  guards; exits non-zero on any disagreement).
-- Kernel keys against the boundary, per row: `CELESTE_KERNEL_KEY_CHECK=1` on a
-  forward. Kernels against the reference engine, row by row: `rewrite
-  ref-check`. `kernel lanes: missed 0` in every log.
+  process-global state (the kernel registry, the counters); under cargo
+  test's shared process the suite twice degraded to 70-85 MINUTES on one
+  core. For one test after an edit: `cargo nextest run <filter>` (debug).
+- **Never use `--release` for unit tests or tools.** The release profile
+  is `lto = "fat"` + `codegen-units = 1` (~100 s relink after any edit).
+  Tests and diagnostics get the `quick` profile; `--release` is for the
+  gate and for benchmarks. Never make `[profile.release]` cheaper to speed
+  up the loop - it silently reprices every recorded result.
+- **The `#[ignore]`d tests** (resume, the room (7,1) level -1 table, the
+  floor pin) and the full-tree `arc-check` are t3 (plans/devloop.md): run
+  them deliberately when you touched the tracer, the lowering, the ASM
+  codegen, the edge recording, resume, level -1 or the reference engine. Do
+  NOT read past the "N skipped" line and call the suite green when one of
+  those reasons applies (`a8f4635`).
+- **Re-pin only on evidence that the SETS did not move** - every per-frame
+  count, marked count, first win and optimum identical - and say so in the
+  commit (`./check.sh t1 --pin` etc.; plans/devloop.md "Re-pinning").
+- **The known-route check** (`search::known`): `search --prefer FILE` and
+  `rewrite check-known` step a known solution through the reference engine
+  and FAIL at the first pruning step that drops it. A pruned known route is
+  a soundness bug, never a result (room (6,1)'s wrong refutation of 93,
+  `5ccf712`). Run real rooms with `--prefer` their community TAS or our
+  witness.
+- `kernel lanes: missed 0` in every log.
 
 ## Verifying a result: REAL PLAY, not the IL load
 
@@ -242,8 +198,8 @@ jank"; plans/architecture.md "The room's start").
 - UniversalClassicTas loads a room alone and misses this. A 100% 2300m 63
   that UCT finished died in real play (2026-10-08).
 - Celia (gonengazit/Celia) models it.
-- Searches run with `CELESTE_LOADING_JANK=J`. The category runner sets it,
-  and searches the other feasible J's too.
+- Searches run with `--loading-jank J`. The category runner sets it, and
+  searches the other feasible J's too.
 
 ```bash
 tools/uct/check_uploads.py [--cat CAT] FILE.tas...   # IL, UCT, Celia, chain, BOOT chain -> VALID/INVALID
@@ -273,81 +229,34 @@ retraces the start room's shapes at startup, specializes each on the constant
 lattice for the level, and assembles it with gcc + dlopen. What runs is
 always what the tracer produces from the Lua in this checkout.
 
-## Useful entry points
+## The commands
+
+Every binary documents itself: `rewrite --help` (the search and every
+diagnostic), `rewrite <command> --help`, `transpile --help` (the level -1
+table), `concrete_run --help` (single-lane concrete execution). The
+settings flags (`--room`, the category, `--level-minus-one`, `--threads`,
+the diagnostics, ...) are shared by all three. The most common:
 
 ```bash
-# THE SEARCH (the horizon: --to H, or --ceiling H for a known solution, where
-# a refutation or no witness is an error). The tree goes to DIR/level00 and
-# is reused when it already reaches the horizon; the witness to
-# DIR/witness_frame_F.txt. --win-at x,y forces a cheap synthetic win.
+# THE SEARCH: --ceiling H for a known solution (a refutation or no witness is
+# an error), --to H otherwise; the witness goes to DIR/witness_frame_F.txt.
 ./safe-run.sh -- ./target/release/rewrite search --room 1,0 --ceiling 99 --checkpoint-dir DIR
-# Object rooms: the objects abstract at level 0 and the level -1 filter
-# (plans/results.md, "How to run a room").
-CELESTE_LEVEL_MINUS_ONE="C,5" ./safe-run.sh -- ./target/release/rewrite search \
-    --room X,Y --level r0sxhn --ceiling C --checkpoint-dir DIR [--save-marks UIDIR]
-# The objects ladder, where r0sxhn's bound is loose (room (7,0): 80 against 84):
-# the r0sxh forward filtered by r0sxhn's arc-marked nodes.
-CELESTE_LEVEL_MINUS_ONE="84,5" ./safe-run.sh -- ./target/release/rewrite search \
-    --room 7,0 --level r0sxhn,r0sxh --ceiling 84 --checkpoint-dir DIR
-# Other knobs: CELESTE_THREADS, CELESTE_REGION="px,S" | off. CELESTE_SPLIT_FRAME=1: two steps a frame
-# (smaller kernels; the tree, the marks and level -1 count steps, --to/--ceiling frames). CELESTE_TRIM_ROWS=1: old frames keep keys, cells and
-# wins only (a big room's tree ~30-40% smaller; diagnostics that load old rows refuse it).
-
-# One forward at one level, with the per-frame [fwd] line; then its fingerprint.
-./safe-run.sh -- ./target/release/rewrite forward --to 44 --room 1,0 [--level r0sxhn]
-./target/release/rewrite ckhash --to 44 --room 1,0
-
-# The transfers of a tree, checked against the reference engine.
-./safe-run.sh -- ./target/quick/rewrite arc-check --level-dir DIR/level00 --room 3,3 --to 80 --level r0sxhn
-
-# Level -1 as a probe (the table against a tree, too-late share per frame).
-CELESTE_START_ROOM=2,0 ./safe-run.sh -- ./target/quick/transpile --level-minus-one S LEVEL_DIR CEILING FROM TO [MARKS]
-
-# A known solution stepped against a level's tree (which state loses it).
-./target/release/rewrite follow --level-dir D --level SPEC --inputs tas/FILE.txt
-# A known solution against every pruning step of a finished search (same env as the search:
-# CELESTE_LEVEL_MINUS_ONE, CELESTE_SPLIT_FRAME, seeds); `search --prefer` runs it too.
-./safe-run.sh -- ./target/quick/rewrite check-known --checkpoint-dir DIR --level SPEC --horizon H --room X,Y --inputs tas/FILE.txt
-
-# Single-lane concrete execution; the same inputs on a REAL PICO-8, headless.
-./target/release/concrete_run -i 42,0,0,0,0,16,2,2,2,2 -f 10
-pico8_diff/replay.py --room 1,0 tas/room_1_0_exit_frame_99.txt
-pico8_diff/replay.py --room 7,0 --balloon-seeds 0 tas/room_7_0_exit_frame_84.txt
-# --lua ~/src/github.com/tehwalris/celeste_ocaml/celeste.lua --begin-game: the ORIGINAL cart
-
-# A reference for OUR game from a community TAS: replay it in the original
-# cart, take its per-frame positions, find inputs that follow them (~1 min).
-./target/quick/rewrite trajectory --trajectory positions.txt --room 0,0
-
-# Diagnostics (rewrite subcommands, quick profile): cell-growth --by-age,
-# col-census [--cell x,y --erase F --every N], coarse-census --erase F,
-# spurious [--chain-out], rerun-row, ref-check, diag-project [--fine-marks
-# --coarse-marks], bench-frame, trajectory.
-# The level -1 table alone, with its fingerprint (cached in /var/tmp/celeste-l1-cache):
-CELESTE_START_ROOM=X,Y ./target/quick/transpile --level-minus-one-table S
+# An object room, and the objects ladder (plans/results.md, "How to run a room").
+./safe-run.sh -- ./target/release/rewrite search --room 7,0 --level r0sxhn,r0sxh \
+    --level-minus-one 84,5 --ceiling 84 --checkpoint-dir DIR --prefer tas/FILE.txt
 ```
+
+On a real PICO-8, headless: `pico8_diff/replay.py --room X,Y FILE` (and
+`--help`; `--lua ~/src/github.com/tehwalris/celeste_ocaml/celeste.lua
+--begin-game` for the ORIGINAL cart).
 
 ### The UI (`ui/`)
 
-A phone-first web view of one finished search: the room as a heatmap per
-(level, pass, frame), set sizes, the timing waterfall, and the arc pass
-(`search --save-marks`). Static: `rewrite export-ui` turns a finished
-search's checkpoint dir + its log into `run.json` + per-level binaries; a Vite
-build plus `ui/serve.mjs` serve it under `/celeste/` on port 3011
-(UI-HOSTING.md; control model and data layout in `ui/README.md` and at the
-top of `src/search/ui_export.rs`).
-
-```bash
-./safe-run.sh -- ./target/release/rewrite search --room 1,0 --ceiling 99 --checkpoint-dir DIR \
-    --save-marks MARKS 2> /var/tmp/celeste-ui/room10.log  # the log is the timing source
-./safe-run.sh -- ./target/quick/rewrite export-ui --checkpoint-dir DIR --arc MARKS \
-    --log /var/tmp/celeste-ui/room10.log --out /var/tmp/celeste-ui/data/room10 --room 1,0   # from the repo root
-cd ui && npm install && npm run typecheck && npm run build
-systemd-run --user --scope -p MemoryMax=2G --quiet node serve.mjs &   # http://localhost:3011/celeste/
-```
-
-Never serve uncapped, never on another port, and nothing generated
-(`ui/dist`, `ui/node_modules`, the exported data) is committed.
+A phone-first web view of one finished search (`search --save-marks DIR`,
+then `rewrite export-ui --help`); building and serving it: `ui/README.md`
+and UI-HOSTING.md. It is served under `/celeste/` on port 3011 only, never
+uncapped (`systemd-run --user --scope -p MemoryMax=2G`), and nothing
+generated (`ui/dist`, `ui/node_modules`, the exported data) is committed.
 
 ## Installing packages
 

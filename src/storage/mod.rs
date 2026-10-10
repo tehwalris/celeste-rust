@@ -29,8 +29,8 @@ pub mod wave;
 
 use crate::search::pos_graph::{GRID, NO_CELL};
 
-/// The storage regions: `side` x `side` cells (`--storage-region`, 8
-/// or 16), aligned at 0 as the kernels' `RegionGrid::of` (`div_euclid`; the
+/// The storage regions: `side` x `side` cells (`GEOMETRY`: 8; the tests
+/// also check 16), aligned at 0 as the kernels' `RegionGrid::of` (`div_euclid`; the
 /// grid's origin -64 is a multiple of both), each nested in one kernel
 /// region. A region's SLOT is its place on the grid, row-major, `NO_CELL`
 /// the last (one cell).
@@ -46,8 +46,8 @@ pub struct Geometry {
 }
 
 impl Geometry {
-    pub fn new(side: u32) -> Geometry {
-        assert!(side == 8 || side == 16, "a storage region is 8 or 16 cells wide, not {side}");
+    pub const fn new(side: u32) -> Geometry {
+        assert!(side == 8 || side == 16, "a storage region is 8 or 16 cells wide");
         let per_row = GRID as u32 / side;
         Geometry { side, per_row, slots: per_row * per_row + 1, words: (side * side / 64) as usize }
     }
@@ -81,24 +81,10 @@ impl Geometry {
     }
 }
 
-/// The process's storage geometry: `--storage-region` (8 default, or
-/// 16). A storage region must nest in one kernel region: the kernels' px
-/// (`--region`) a multiple of the side - else refused.
-pub fn geometry() -> &'static Geometry {
-    static G: std::sync::OnceLock<Geometry> = std::sync::OnceLock::new();
-    G.get_or_init(|| {
-        let side: u32 = crate::settings::get().storage_region;
-        let g = Geometry::new(side);
-        if let Some(k) = crate::trace::kernel::region_grid() {
-            assert!(
-                k.px % side as i32 == 0,
-                "--storage-region {side}: a storage region must nest in one kernel region, and the kernels' regions are {} px (--region)",
-                k.px
-            );
-        }
-        g
-    })
-}
+/// THE storage geometry: 8-cell regions (storage v2 measured 8 against 16;
+/// plans/storage-v2.md). The kernels' regions (`--region`, a multiple of 8
+/// px) each hold whole storage regions.
+pub const GEOMETRY: Geometry = Geometry::new(8);
 
 /// A state's id: its region (shape index * slots + slot), its entry number
 /// in the region, its cell's index in the region - `region << 38 | entry <<

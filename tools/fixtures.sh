@@ -92,7 +92,7 @@ build() {
     if [[ $CMD == capture* ]]; then
         # One wave of the tree fixture, captured (--emit-capture).
         local f=${CMD#capture }
-        ./safe-run.sh -- "$B" bench-frame --level-dir "$ROOT/$DEP" --frame $((f - 1)) --edges --room "$ROOM" --level "$(level_of "$DEP")" $FLAGS --l1-table "$ROOT/$DEP/l1-table.bin" --emit-capture "$tmp" --emit-capture-frame "$f" > "$tmp/build.out" 2> "$tmp/build.log" \
+        ./safe-run.sh -- "$B" bench-frame --level-dir "$ROOT/$DEP" --frame $((f - 1)) --edges --room "$ROOM" --level "$(level_of "$DEP")" $FLAGS --l1-table "$ROOT/$DEP/l1-table.bin" --emit-capture "$tmp" > "$tmp/build.out" 2> "$tmp/build.log" \
             || { echo "[fixtures] $name: the capture FAILED (see $tmp/build.log)" >&2; exit 1; }
         # The captured wave is the tree fixture's frame check: the same lines.
         if [[ -z $pin && -f $PINS/$DEP.frame ]] && ! diff -q "$PINS/$DEP.frame" "$tmp/build.out" > /dev/null; then

@@ -2050,6 +2050,7 @@ pub fn compile(
     roots: &[NodeId],
     sym: &str,
     cell_reprs: &HashMap<u32, CellRepr>,
+    opts: super::AsmOptions,
 ) -> Result<Compiled> {
     let live = reachable(g, roots);
 
@@ -2089,7 +2090,7 @@ pub fn compile(
     let batch = 4;
     let t_lower = std::time::Instant::now();
     let order = schedule(g, &live, roots, batch);
-    let mix = super::mix_on();
+    let mix = opts.mix;
     let mut prov_node: Vec<NodeId> = Vec::new();
     for id in order {
         lo.lower_node(id)?;
@@ -2172,7 +2173,7 @@ pub fn compile(
         Vec::new()
     };
     let foldable = if mix { foldable(&lo.insts, lo.next_vreg) } else { Vec::new() };
-    if crate::settings::get().diag.build_trace {
+    if opts.trace {
         eprintln!("[build]   {sym}: {} insts, {} vregs: lower {:.1}s, reschedule {:.1}s", lo.insts.len(), lo.next_vreg, t_lower.as_secs_f64(), t.elapsed().as_secs_f64());
     }
 
@@ -2190,7 +2191,7 @@ pub fn compile(
 
     let t_alloc = std::time::Instant::now();
     let (home, spill_slots) = allocate(&lo.insts, lo.next_vreg, &remat);
-    if crate::settings::get().diag.build_trace {
+    if opts.trace {
         eprintln!("[build]   {sym}: allocate {:.1}s ({spill_slots} spill slots)", t_alloc.elapsed().as_secs_f64());
     }
 

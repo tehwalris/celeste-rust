@@ -15,6 +15,15 @@ use anyhow::Result;
 use std::collections::HashMap;
 use std::path::PathBuf;
 
+/// What an assembly is built with: `trace` (`--build-trace`: the build's
+/// progress lines) and `mix` (`--kernel-mix` or `bench-frame --metrics`:
+/// instruction provenance kept, the assembly text kept for the report).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct AsmOptions {
+    pub trace: bool,
+    pub mix: bool,
+}
+
 /// Compile `roots` of `g` to assembly, assemble it, and load it. Returns
 /// the layout metadata and the loaded function. All input cells numeric;
 /// use `compile_and_load_reprs` when a cell is bool.
@@ -23,7 +32,7 @@ pub fn compile_and_load(
     roots: &[crate::transpile::graph::NodeId],
     tag: &str,
 ) -> Result<(Compiled, Loaded)> {
-    compile_and_load_reprs(g, roots, tag, &HashMap::new())
+    compile_and_load_reprs(g, roots, tag, &HashMap::new(), AsmOptions::default())
 }
 
 /// `compile_and_load` with an explicit per-cell input repr (a cell absent
@@ -33,16 +42,17 @@ pub fn compile_and_load_reprs(
     roots: &[crate::transpile::graph::NodeId],
     tag: &str,
     cell_reprs: &HashMap<u32, CellRepr>,
+    opts: AsmOptions,
 ) -> Result<(Compiled, Loaded)> {
     let sym = format!("kernel_{tag}");
     let t0 = std::time::Instant::now();
-    let mut compiled = compile(g, roots, &sym, cell_reprs)?;
+    let mut compiled = compile(g, roots, &sym, cell_reprs, opts)?;
     let t_compile = t0.elapsed();
     let t1 = std::time::Instant::now();
     let so: PathBuf = assemble(&compiled.asm, tag)?;
     let t_asm = t1.elapsed();
     let loaded = Loaded::open(&so, &sym)?;
-    if crate::settings::get().diag.build_trace {
+    if opts.trace {
         eprintln!(
             "[build] {tag}: {} roots, asm text {:.1} MB: compile {:.1}s, gcc+load {:.1}s",
             roots.len(),
@@ -53,18 +63,10 @@ pub fn compile_and_load_reprs(
     }
     // The assembly text is only the assembler's input: drop it once loaded
     // (it is GBs across a room's kernel sets). The mix diagnostic reads it.
-    if !mix_on() {
+    if !opts.mix {
         compiled.asm = String::new();
     }
     Ok((compiled, loaded))
-}
-
-/// `--kernel-mix DIR`: the instruction-mix diagnostic
-/// (`compiled::mix`) - provenance in the assembly, a report per kernel;
-/// `bench-frame --metrics`: its census and slice counts only.
-pub fn mix_on() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| crate::settings::get().diag.kernel_mix.is_some() || crate::compiled::mix::metrics_on())
 }
 
 #[cfg(test)]

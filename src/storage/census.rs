@@ -250,13 +250,15 @@ pub struct CensusArgs<'a> {
     /// Frames whose unified edges are encoded exactly (each holds the frame's
     /// edges in memory, 24 B each).
     pub encode: &'a [u32],
+    /// Worker threads.
+    pub threads: usize,
 }
 
 pub fn census(a: &CensusArgs) -> Result<()> {
     let dir = a.dir;
-    let geo = *super::geometry();
+    let geo = super::GEOMETRY;
     let eg = EdgeStore::open(&dir.join("edges"), a.to)?;
-    let threads = crate::frame::threads();
+    let threads = a.threads;
     // (shape index, key) -> g; per region its entries' g; (R, g) -> own entry.
     let mut gkeys: FxHashMap<(u32, Key), u32> = FxHashMap::default();
     let mut ent_g: FxHashMap<u32, Vec<u32>> = FxHashMap::default();
@@ -296,7 +298,7 @@ pub fn census(a: &CensusArgs) -> Result<()> {
         if f == 0 || !eg.has_frame(f) {
             continue;
         }
-        let owners = eg.owners(f);
+        let owners = eg.owners(f, threads);
         let units = eg.units(f);
         let encode = a.encode.contains(&f);
         let cens: Vec<(UnitCensus, Vec<(u32, u32, u32, u8, u64, u32)>)> = super::wave::par_map(&units, threads, |&(fi, ui)| {

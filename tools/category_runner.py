@@ -61,12 +61,18 @@ def mode_flags(cat):
 
 
 # A job's old "env" (CELESTE_* variables, before the settings were flags).
-ENV_FLAGS = {"CELESTE_TRIM_ROWS": "--trim-rows", "CELESTE_SPLIT_FRAME": "--split-frame", "CELESTE_THREADS": "--threads", "CELESTE_REGION": "--region", "CELESTE_STORAGE_REGION": "--storage-region", "CELESTE_MIN_FREE_GB": "--min-free-gb"}
+ENV_FLAGS = {"CELESTE_TRIM_ROWS": "--trim-rows", "CELESTE_SPLIT_FRAME": "--split-frame", "CELESTE_THREADS": "--threads", "CELESTE_REGION": "--region"}
+# Knobs since fixed (no flag): accepted at their fixed value only.
+ENV_FIXED = {"CELESTE_STORAGE_REGION": "8", "CELESTE_MIN_FREE_GB": "20"}
 
 
 def job_flags(job):
     flags = list(job.get("flags", []))
     for k, v in job.get("env", {}).items():
+        if k in ENV_FIXED:
+            if v != ENV_FIXED[k]:
+                raise SystemExit(f"job {job}: {k}={v!r}: fixed at {ENV_FIXED[k]} now (no flag)")
+            continue
         if k not in ENV_FLAGS:
             raise SystemExit(f"job {job}: env {k} has no flag here: give it in \"flags\"")
         flag = ENV_FLAGS[k]

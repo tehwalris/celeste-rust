@@ -3,18 +3,10 @@
 
 use anyhow::{anyhow, Result};
 
-/// The room the search starts in (`--room`, default (1, 0)). The single
-/// source of truth for the `_init` substitution, the collision cache's room
-/// and the checkpoint fingerprint, which must agree.
-pub fn start_room() -> (i16, i16) {
-    crate::settings::get().room
-}
-
-/// The room that means "won": the one the cart's `next_room` loads after
-/// the start room, `(x + 1, y)`, or `(0, y + 1)` from a row's last room.
-/// Compare BOTH coordinates: the wrapped exit changes `room.y`.
-pub fn win_room() -> (i16, i16) {
-    let (x, y) = start_room();
+/// The room that means "won" from start room `(x, y)`: the one the cart's
+/// `next_room` loads after it, `(x + 1, y)`, or `(0, y + 1)` from a row's
+/// last room. Compare BOTH coordinates: the wrapped exit changes `room.y`.
+pub fn win_room((x, y): (i16, i16)) -> (i16, i16) {
     if x == 7 {
         (0, y + 1)
     } else {
@@ -26,19 +18,6 @@ pub fn win_room() -> (i16, i16) {
 pub fn level_index(x: i16, y: i16) -> i16 {
     x % 8 + y * 8
 }
-
-/// `--gemskip`: the gemskip categories skip the orb - the orb room
-/// is won without it and every later room starts with ONE dash.
-pub fn gemskip() -> bool {
-    crate::settings::get().gemskip
-}
-
-/// `--hundred`: the 100% category - a room is won only by exiting with
-/// its berry taken (`frame::got_fruit`).
-pub fn hundred() -> bool {
-    crate::settings::get().hundred
-}
-
 
 /// The level whose big chest holds the orb (`max_djump=2`): room (5,2).
 pub const ORB_LEVEL: i16 = 21;
@@ -67,10 +46,11 @@ pub fn apply_start_room(game_lua: &str, s: &crate::settings::Settings) -> Result
 mod tests {
     use super::apply_start_room;
 
-    // The default settings: room (1,0).
+    // Room (1,0) exits to (2,0); a row's last room wraps to the next row.
     #[test]
     fn win_room_of_the_default_room() {
-        assert_eq!(super::win_room(), (2, 0));
+        assert_eq!(super::win_room((1, 0)), (2, 0));
+        assert_eq!(super::win_room((7, 1)), (0, 2));
     }
 
     // In the default room the substitution is the identity.

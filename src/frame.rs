@@ -10,8 +10,8 @@ use celeste_engine::runtime2::{Col, Rt2};
 
 use crate::storage::StateId;
 
-/// Wave phase timers (`--phases`): TSC ticks summed over workers,
-/// printed by `print_phases`. Off, `phase_start` is one load and a branch.
+/// Wave phase timers (`--phases`, which the wave's sinks carry): TSC ticks
+/// summed over workers, printed by `print_phases`. Off, `start` is a branch.
 pub mod phases {
     use std::sync::atomic::{AtomicU64, Ordering};
     pub const NAMES: [&str; 8] = ["pack", "kernel", "emit", "unit end (sort, encode)", "translate", "layer (gather, edge file)", "slice.setup", "unit (all of engine.run)"];
@@ -24,13 +24,10 @@ pub mod phases {
     pub const SETUP: usize = 6;
     pub const UNIT: usize = 7;
     static TICKS: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
-    fn on() -> bool {
-        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        *ON.get_or_init(|| crate::settings::get().diag.phases)
-    }
+    /// A phase's start (`on`: `--phases`; off, 0 and every `add` a no-op).
     #[inline]
-    pub fn start() -> u64 {
-        if on() {
+    pub fn start(on: bool) -> u64 {
+        if on {
             unsafe { core::arch::x86_64::_rdtsc() }
         } else {
             0
@@ -46,8 +43,8 @@ pub mod phases {
         TICKS[p].fetch_add(t - t0, Ordering::Relaxed);
         t
     }
-    pub fn print_phases(wall: std::time::Duration, workers: usize) {
-        if !on() {
+    pub fn print_phases(on: bool, wall: std::time::Duration, workers: usize) {
+        if !on {
             return;
         }
         let v: Vec<u64> = TICKS.iter().map(|a| a.swap(0, Ordering::Relaxed)).collect();
@@ -120,13 +117,13 @@ impl Block {
     }
 
     /// Per lane: does it sit on the room's win target (`wins_of`)?
-    pub fn wins(&self) -> Result<Vec<bool>> {
-        wins_of(&self.rt2)
+    pub fn wins(&self, s: &crate::settings::Settings) -> Result<Vec<bool>> {
+        wins_of(&self.rt2, s)
     }
 
     /// Per lane: has it left the start room (`exits_of`, a superset of wins)?
-    pub fn exits(&self) -> Result<Vec<bool>> {
-        exits_of(&self.rt2)
+    pub fn exits(&self, s: &crate::settings::Settings) -> Result<Vec<bool>> {
+        exits_of(&self.rt2, s)
     }
 
     /// Keep only the lanes whose mask entry is true; `None` if none survive.
@@ -223,16 +220,30 @@ pub const SUMMIT_LEVEL: i16 = 30;
 
 /// The winning positions (x_lo, x_hi, y_lo, y_hi, inclusive): `--win-at` or
 /// the summit's flag; a lane wins where it MEETS it. None: the room exit.
-pub fn win_rect() -> Option<(i16, i16, i16, i16)> {
-    static RECT: std::sync::OnceLock<Option<(i16, i16, i16, i16)>> = std::sync::OnceLock::new();
-    *RECT.get_or_init(|| {
-        if let Some(rect) = crate::abstraction::synthetic_win_rect() {
-            return Some(rect);
-        }
-        let (rx, ry) = crate::game_runner::start_room();
-        if crate::game_runner::level_index(rx, ry) != SUMMIT_LEVEL {
-            return None;
-        }
+pub fn win_rect(s: &crate::settings::Settings) -> Option<(i16, i16, i16, i16)> {
+    if let Some((xl, xh, yl, yh)) = s.win_at {
+        // Said once per process, where a win is first judged.
+        static SAID: std::sync::Once = std::sync::Once::new();
+        SAID.call_once(|| {
+            println!(
+                "SYNTHETIC WIN: a lane counts as won at player x {xl}..={xh}, y {yl}..={yh}, NOT at the \
+                 room exit - this is a test configuration and is in the fingerprint"
+            )
+        });
+        return s.win_at;
+    }
+    summit_flag(s.room)
+}
+
+/// The summit's win rectangle around its flag, if `room` is the summit (read
+/// off the cart once per room: a cache keyed on the room).
+fn summit_flag((rx, ry): (i16, i16)) -> Option<(i16, i16, i16, i16)> {
+    type Cache = std::sync::Mutex<std::collections::HashMap<(i16, i16), Option<(i16, i16, i16, i16)>>>;
+    static RECTS: std::sync::OnceLock<Cache> = std::sync::OnceLock::new();
+    if crate::game_runner::level_index(rx, ry) != SUMMIT_LEVEL {
+        return None;
+    }
+    *RECTS.get_or_init(Default::default).lock().unwrap().entry((rx, ry)).or_insert_with(|| {
         let cart = celeste_core::cart_data::CartData::load(std::path::Path::new("cart"))
             .expect("summit win: load the cart");
         let flags: Vec<(i16, i16)> = (0..16i16)
@@ -248,10 +259,10 @@ pub fn win_rect() -> Option<(i16, i16, i16, i16)> {
 }
 
 /// Per lane: has it left the start room, or met the `win_rect`?
-pub fn exits_of(rt2: &Rt2) -> Result<Vec<bool>> {
+pub fn exits_of(rt2: &Rt2, s: &crate::settings::Settings) -> Result<Vec<bool>> {
     let ids = crate::compiled::ids();
     let lanes = rt2.width;
-    if let Some((txl, txh, tyl, tyh)) = win_rect() {
+    if let Some((txl, txh, tyl, tyh)) = win_rect(s) {
         let Some(obj) = crate::search::pos_graph::player_object(rt2) else {
             return Ok(vec![false; lanes]);
         };
@@ -270,7 +281,7 @@ pub fn exits_of(rt2: &Rt2) -> Result<Vec<bool>> {
         });
     }
     // Both coordinates: the exit from a row's last room wraps to the next row.
-    room_is(rt2, crate::game_runner::win_room())
+    room_is(rt2, s.win_room())
 }
 
 /// Per lane: is the `room` global (`room.x`, `room.y`) = `(wx, wy)`?
@@ -297,11 +308,11 @@ fn room_is(rt2: &Rt2, (wx, wy): (i16, i16)) -> Result<Vec<bool>> {
 
 /// Per lane: on the win target? The exit, plus the orb in the orb room,
 /// and in a 100% run the room's berry taken.
-pub fn wins_of(rt2: &Rt2) -> Result<Vec<bool>> {
-    let mut wins = reaches_win(rt2)?;
-    if crate::game_runner::hundred() {
+pub fn wins_of(rt2: &Rt2, s: &crate::settings::Settings) -> Result<Vec<bool>> {
+    let mut wins = reaches_win(rt2, s)?;
+    if s.hundred {
         // 100%: the exit counts only with this room's berry taken.
-        for (e, b) in wins.iter_mut().zip(got_fruit(rt2)?) {
+        for (e, b) in wins.iter_mut().zip(got_fruit(rt2, s.room)?) {
             *e &= b;
         }
     }
@@ -310,10 +321,10 @@ pub fn wins_of(rt2: &Rt2) -> Result<Vec<bool>> {
 
 /// Per lane: the win target met, the berry aside (`wins_of` without its
 /// 100% condition).
-fn reaches_win(rt2: &Rt2) -> Result<Vec<bool>> {
+fn reaches_win(rt2: &Rt2, s: &crate::settings::Settings) -> Result<Vec<bool>> {
     use celeste_engine::runtime2::AV;
-    let exits = exits_of(rt2)?;
-    if win_rect().is_some() || !orb_required() {
+    let exits = exits_of(rt2, s)?;
+    if win_rect(s).is_some() || !orb_required(s) {
         return Ok(exits);
     }
     let (ids, lanes) = (crate::compiled::ids(), rt2.width);
@@ -326,15 +337,14 @@ fn reaches_win(rt2: &Rt2) -> Result<Vec<bool>> {
     Ok(exits.iter().zip(&has_orb).map(|(e, o)| *e && *o).collect())
 }
 
-/// Per lane: has the start room's berry been taken (`got_fruit[1 +
+/// Per lane: has start room `(x, y)`'s berry been taken (`got_fruit[1 +
 /// level_index()]`, an array the cart pads with nils up to that index)? An
 /// unknown value (a coarse level) counts as taken: a win there is only an
 /// over-approximation, and the exact level decides.
-pub fn got_fruit(rt2: &Rt2) -> Result<Vec<bool>> {
+pub fn got_fruit(rt2: &Rt2, (x, y): (i16, i16)) -> Result<Vec<bool>> {
     use celeste_engine::runtime2::{Cell2, Col, AV};
     let lanes = rt2.width;
     let g = celeste_names::gen::global_id("got_fruit").expect("`got_fruit` is a global name");
-    let (x, y) = crate::game_runner::start_room();
     let i = crate::game_runner::level_index(x, y) as usize;
     let Some(arr) = rt2.global_target(g) else { return Ok(vec![false; lanes]) };
     let Cell2::Arr(items) = &rt2.structure[arr as usize] else { return Ok(vec![false; lanes]) };
@@ -372,14 +382,14 @@ pub fn orb_deadline_skip(rt2: &Rt2, frame: u32, horizon: u32) -> Vec<bool> {
 /// taken (`got_fruit` false, not unknown) and nothing left that holds or
 /// drops it - the fruit, the fly fruit (gone once it flew off), the key and
 /// its chest, a fake wall. Exact: every state the row stands for is lost.
-pub fn berry_lost(rt2: &Rt2) -> Result<Vec<bool>> {
+pub fn berry_lost(rt2: &Rt2, s: &crate::settings::Settings) -> Result<Vec<bool>> {
     let lanes = rt2.width;
     let ids = crate::compiled::ids();
     let sources = [ids.g_fruit, ids.g_fly_fruit, ids.g_key, ids.g_chest, ids.g_fake_wall];
-    if !crate::game_runner::hundred() || sources.iter().any(|&g| !rt2.objects_of_type(ids, g).is_empty()) {
+    if !s.hundred || sources.iter().any(|&g| !rt2.objects_of_type(ids, g).is_empty()) {
         return Ok(vec![false; lanes]);
     }
-    Ok(got_fruit(rt2)?.into_iter().map(|taken| !taken).collect())
+    Ok(got_fruit(rt2, s.room)?.into_iter().map(|taken| !taken).collect())
 }
 
 /// Per lane of a frame's rows: NOT expanded further. An exited row (no kernels
@@ -388,20 +398,20 @@ pub fn berry_lost(rt2: &Rt2) -> Result<Vec<bool>> {
 /// too late for the ceiling (`orb_deadline_skip`).
 /// Applied to every frame's layer (`expandable`). `ceiling`: the tree's level
 /// -1 horizon, the orb deadline's.
-pub fn not_expanded(b: &Block, frame: u32, ceiling: Option<u32>) -> Result<Vec<bool>> {
-    let mut skip = b.exits()?;
+pub fn not_expanded(b: &Block, frame: u32, ceiling: Option<u32>, s: &crate::settings::Settings) -> Result<Vec<bool>> {
+    let mut skip = b.exits(s)?;
     // Under a win rectangle (`--win-at`, the summit's flag) a row that LEFT
     // the room is no win, but it is not this room's search either (its
     // shape has no kernel: a coverage gap at room (0,3) f93).
-    if win_rect().is_some() {
-        for (w, here) in skip.iter_mut().zip(room_is(b.rt2(), crate::game_runner::start_room())?) {
+    if win_rect(s).is_some() {
+        for (w, here) in skip.iter_mut().zip(room_is(b.rt2(), s.room)?) {
             *w |= !here;
         }
     }
-    for (w, lost) in skip.iter_mut().zip(berry_lost(b.rt2())?) {
+    for (w, lost) in skip.iter_mut().zip(berry_lost(b.rt2(), s)?) {
         *w |= lost;
     }
-    if let (true, Some(h)) = (orb_required(), ceiling) {
+    if let (true, Some(h)) = (orb_required(s), ceiling) {
         for (w, late) in skip.iter_mut().zip(orb_deadline_skip(b.rt2(), frame, h)) {
             *w |= late;
         }
@@ -414,13 +424,13 @@ pub fn not_expanded(b: &Block, frame: u32, ceiling: Option<u32>) -> Result<Vec<b
 /// the forward's every frame (`extend`, frame 0 in `start`, a `raise`) and
 /// a resume (`ForwardState::at`) all take their frontier through it, so a
 /// resumed run expands exactly the rows an uninterrupted one does.
-fn expandable(layer: Vec<Block>, frame: u32, ceiling: Option<u32>) -> Result<Vec<Block>> {
+fn expandable(layer: Vec<Block>, frame: u32, ceiling: Option<u32>, s: &crate::settings::Settings) -> Result<Vec<Block>> {
     std::thread::scope(|scope| {
         let handles: Vec<_> = layer
             .into_iter()
             .map(|mut b| {
                 scope.spawn(move || -> Result<Block> {
-                    let skip = not_expanded(&b, frame, ceiling)?;
+                    let skip = not_expanded(&b, frame, ceiling, s)?;
                     b.set_skip(skip);
                     Ok(b)
                 })
@@ -432,37 +442,9 @@ fn expandable(layer: Vec<Block>, frame: u32, ceiling: Option<u32>) -> Result<Vec
 
 /// Is the start room the orb room (5,2)? A win there also needs the orb
 /// (`max_djump == 2`): later levels are played with the second dash.
-pub fn orb_required() -> bool {
-    let (x, y) = crate::game_runner::start_room();
-    crate::game_runner::level_index(x, y) == crate::game_runner::ORB_LEVEL && !crate::game_runner::gemskip()
-}
-
-/// `--trim-rows`: a frame's checkpoint files keep only keys, cells
-/// and wins once a later frame's runs are complete (`checkpoint::trim`) -
-/// what the search reads of them, and what a resume and `export-ui` read.
-/// The rows' values are most of a frame's files: room (2,3) gemskip h137,
-/// level 0's frames 3.03 -> 0.78 GB (room (5,1) nodiag's format-9 rows: 148
-/// B, of which the key is 16). The diagnostics that load old rows
-/// (`rerun-row`, `follow`, `arc-check`, ...) refuse a trimmed tree.
-pub fn trim_rows() -> bool {
-    crate::settings::get().trim_rows
-}
-
-/// Search steps per game frame: 2 under the split frame
-/// (`--split-frame`: part a up to and including the player's move,
-/// part b the rest; step `2k` is the end of frame `k`), else 1.
-pub fn steps_per_frame() -> u32 {
-    if crate::settings::get().split_frame {
-        2
-    } else {
-        1
-    }
-}
-
-/// Worker count: `--threads`, else one per physical core (AVX-512 units
-/// are shared by SMT siblings).
-pub fn threads() -> usize {
-    crate::settings::get().threads.unwrap_or_else(|| (std::thread::available_parallelism().map(|n| n.get()).unwrap_or(2) / 2).max(1))
+pub fn orb_required(s: &crate::settings::Settings) -> bool {
+    let (x, y) = s.room;
+    crate::game_runner::level_index(x, y) == crate::game_runner::ORB_LEVEL && !s.gemskip
 }
 
 /// THE LEVEL -1 FILTER at a horizon (`--level-minus-one H,S`, H in search
@@ -478,37 +460,40 @@ pub struct MinusOne {
 }
 
 impl MinusOne {
-    /// The run's `--level-minus-one H,S`, if given.
-    pub fn of_run() -> Option<MinusOne> {
-        crate::settings::get().level_minus_one.map(|(h, speed)| MinusOne { h, speed })
-    }
-
-    /// The start room's table at this speed bound (one per process).
-    pub fn table(&self) -> &'static crate::trace::level_minus_one::CostToGo {
-        minus_one_table(self.speed)
+    /// The start room's table at this speed bound, under settings `s`
+    /// (`minus_one_table`).
+    pub fn table(&self, s: &crate::settings::Settings) -> &'static crate::trace::level_minus_one::CostToGo {
+        minus_one_table(self.speed, s)
     }
 }
 
-/// The level -1 table at speed bound `speed`, built (or read from its cache)
-/// once, on a thread with the tracer's stack.
-fn minus_one_table(speed: i32) -> &'static crate::trace::level_minus_one::CostToGo {
-    static TABLE: std::sync::OnceLock<(i32, crate::trace::level_minus_one::CostToGo)> = std::sync::OnceLock::new();
-    let (sp, table) = TABLE.get_or_init(|| {
-        // The table measures the EXIT: unsound for a position win.
-        assert!(win_rect().is_none(), "--level-minus-one: the table measures the room exit; this room's win is a position");
-        let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
-        let t = std::time::Instant::now();
-        let table = std::thread::Builder::new()
-            .stack_size(256 * 1024 * 1024)
-            .spawn(move || crate::trace::level_minus_one::cost_to_go(std::path::Path::new("."), speed, threads))
-            .expect("spawn the level -1 builder")
-            .join()
-            .expect("the level -1 builder panicked")
-            .unwrap_or_else(|e| panic!("building the level -1 table: {e:#}"));
-        eprintln!("[level -1] table ready in {:.1} s (S = {speed}): the start state's d = {}", t.elapsed().as_secs_f64(), table.start_d);
-        (speed, table)
-    });
-    assert_eq!(*sp, speed, "one level -1 table per process: S = {sp}, then S = {speed}");
+/// The level -1 table at speed bound `speed` under settings `s`, built (or
+/// read from its cache file) once per process and KEY (what the table is a
+/// function of: `Settings::cart_key`, the pinned file, the speed), on a
+/// thread with the tracer's stack. Leaked: a process holds one or two.
+fn minus_one_table(speed: i32, s: &crate::settings::Settings) -> &'static crate::trace::level_minus_one::CostToGo {
+    type Key = (String, Option<std::path::PathBuf>, i32);
+    static TABLES: std::sync::Mutex<Vec<(Key, &'static crate::trace::level_minus_one::CostToGo)>> = std::sync::Mutex::new(Vec::new());
+    let key: Key = (s.cart_key(), s.l1_table.clone(), speed);
+    let mut tables = TABLES.lock().unwrap();
+    if let Some((_, t)) = tables.iter().find(|(k, _)| *k == key) {
+        return t;
+    }
+    // The table measures the EXIT: unsound for a position win.
+    assert!(win_rect(s).is_none(), "--level-minus-one: the table measures the room exit; this room's win is a position");
+    let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
+    let t = std::time::Instant::now();
+    let owned = s.clone();
+    let table = std::thread::Builder::new()
+        .stack_size(256 * 1024 * 1024)
+        .spawn(move || crate::trace::level_minus_one::cost_to_go(std::path::Path::new("."), speed, threads, &owned))
+        .expect("spawn the level -1 builder")
+        .join()
+        .expect("the level -1 builder panicked")
+        .unwrap_or_else(|e| panic!("building the level -1 table: {e:#}"));
+    eprintln!("[level -1] table ready in {:.1} s (S = {speed}): the start state's d = {}", t.elapsed().as_secs_f64(), table.start_d);
+    let table: &'static _ = Box::leak(Box::new(table));
+    tables.push((key, table));
     table
 }
 
@@ -550,11 +535,13 @@ pub(crate) fn cell_too_late(cell: u32, frame: u32, h: u32, px: i32) -> bool {
 pub struct MarkFilter<'a> {
     marked: &'a Visited,
     coarser: crate::abstraction::Level,
+    /// Search steps per frame (`Settings::steps_per_frame`).
+    spf: u32,
 }
 
 impl<'a> MarkFilter<'a> {
-    pub fn new(marked: &'a Visited, coarser: crate::abstraction::Level) -> Self {
-        MarkFilter { marked, coarser }
+    pub fn new(marked: &'a Visited, coarser: crate::abstraction::Level, spf: u32) -> Self {
+        MarkFilter { marked, coarser, spf }
     }
 
     /// Per lane of `rt2` (rows of frame `frame`): admitted? Under the split
@@ -566,7 +553,7 @@ impl<'a> MarkFilter<'a> {
     /// nodiag `r0sxhn,r0sxh` REFUTED 93, which the community TAS reaches.
     /// The next boundary filters its successors.
     pub fn allowed(&self, rt2: &Rt2, frame: u32) -> Result<Vec<bool>> {
-        if frame % steps_per_frame() != 0 {
+        if frame % self.spf != 0 {
             return Ok(vec![true; rt2.width]);
         }
         Ok(self.deadlines(rt2)?.into_iter().map(|d| d.is_some_and(|d| u32::from(d) >= frame)).collect())
@@ -635,6 +622,10 @@ pub trait FrameStep: Sync {
     /// The level its frames widen to (its rows' key view, the platform
     /// worlds' range).
     fn level(&self) -> crate::abstraction::Level;
+
+    /// The settings it runs under: the wave's (threads, the diagnostics,
+    /// the win and the category its rows are judged by).
+    fn settings(&self) -> std::sync::Arc<crate::settings::Settings>;
 }
 
 /// Where a wave's new states go.
@@ -720,10 +711,10 @@ pub enum TreeFilter {
 }
 
 impl TreeFilter {
-    fn of(m: Option<MinusOne>) -> TreeFilter {
+    fn of(m: Option<MinusOne>, s: &crate::settings::Settings) -> TreeFilter {
         match m {
             None => TreeFilter::Off,
-            Some(m) => TreeFilter::MinusOne { m, table: m.table().fingerprint() },
+            Some(m) => TreeFilter::MinusOne { m, table: m.table(s).fingerprint() },
         }
     }
 
@@ -780,22 +771,39 @@ impl TreeFilter {
         }
     }
 
+    /// The filter a forward extending the tree runs under, its table checked
+    /// against the one the tree recorded: a table built under other
+    /// settings (`--override-settings`) or by another binary would filter
+    /// the new frames otherwise than the tree's.
+    fn checked_minus_one(&self, dir: &std::path::Path, s: &crate::settings::Settings) -> Result<Option<MinusOne>> {
+        let m = self.minus_one(dir)?;
+        if let (TreeFilter::MinusOne { table, .. }, Some(m)) = (self, m) {
+            let got = m.table(s).fingerprint();
+            anyhow::ensure!(
+                got == *table,
+                "{}: the level -1 table is not the one the tree was built under (fingerprint {got:016x}, the tree's {table:016x}; a fixture pins its table: --l1-table)",
+                dir.display()
+            );
+        }
+        Ok(m)
+    }
+
     /// The level -1 filter the tree in `dir` was built under, its table
     /// checked against the recorded fingerprint: what a check of the tree
     /// (`search::known`) must apply, whatever the environment says. Refused
     /// without a record or for a legacy one (its table is unknown).
-    pub fn of_tree(dir: &std::path::Path) -> Result<Option<MinusOne>> {
+    pub fn of_tree(dir: &std::path::Path, s: &crate::settings::Settings) -> Result<Option<MinusOne>> {
         match TreeFilter::read(dir)? {
             None => anyhow::bail!("{}: no level -1 record (a tree from before records): its filter is unknown", dir.display()),
             Some(TreeFilter::Off) => Ok(None),
             Some(TreeFilter::Legacy(h)) => anyhow::bail!("{}: filtered by level -1 at step {h} before the table was recorded: its filter is unknown", dir.display()),
             Some(TreeFilter::MinusOne { m, table }) => {
                 anyhow::ensure!(
-                    m.table().fingerprint() == table,
+                    m.table(s).fingerprint() == table,
                     "{}: the level -1 table (S = {}) is not the one the tree was built under (fingerprint {:016x}, the tree's {table:016x})",
                     dir.display(),
                     m.speed,
-                    m.table().fingerprint()
+                    m.table(s).fingerprint()
                 );
                 Ok(Some(m))
             }
@@ -827,7 +835,7 @@ fn raise_marker(dir: &std::path::Path) -> std::path::PathBuf {
 
 /// The rows `ids` (sorted) of layer `layer`, as one block per file holding
 /// some, exactly those rows (a raise's sources).
-fn load_sources(dir: &std::path::Path, layer: u32, ids: &[StateId]) -> Result<Vec<Block>> {
+fn load_sources(dir: &std::path::Path, layer: u32, ids: &[StateId], room: (i16, i16)) -> Result<Vec<Block>> {
     let mut out = Vec::new();
     let mut found = 0usize;
     for (seq, file) in frame_files(dir, layer)? {
@@ -844,7 +852,7 @@ fn load_sources(dir: &std::path::Path, layer: u32, ids: &[StateId]) -> Result<Ve
                 _ => ranges.push(r..r + 1),
             }
         }
-        let rt2 = file.load_rows(&ranges)?.expect("rows of a non-empty range");
+        let rt2 = file.load_rows(&ranges, room)?.expect("rows of a non-empty range");
         out.push(Block::with_ids(rt2, rows.iter().map(|&r| file.id_at(r)).collect(), seq));
     }
     anyhow::ensure!(found == ids.len(), "{}: {} of {} sources found in layer {layer}", dir.display(), found, ids.len());
@@ -853,7 +861,7 @@ fn load_sources(dir: &std::path::Path, layer: u32, ids: &[StateId]) -> Result<Ve
 
 /// Every state's layer (a raise's refusal of a hit from a later layer).
 fn state_layers(dir: &std::path::Path, last: u32) -> Result<crate::storage::wave::StateLayers> {
-    let geo = crate::storage::geometry();
+    let geo = &crate::storage::GEOMETRY;
     let mut layers = crate::storage::wave::StateLayers::new((geo.side * geo.side) as usize);
     for f in 0..=last {
         for (_, file) in frame_files(dir, f)? {
@@ -895,8 +903,8 @@ pub struct ForwardResult {
 impl ForwardState {
     /// Frame 0: `initial` into an empty visited set (its ids) and
     /// checkpointed; the tree is filtered by `minus_one` and widened at
-    /// `level` (both recorded).
-    pub fn start(mut initial: Vec<Block>, dir: &std::path::Path, record: bool, minus_one: Option<MinusOne>, level: crate::abstraction::Level) -> Result<Self> {
+    /// `level` (both recorded, with the settings `s`).
+    pub fn start(mut initial: Vec<Block>, dir: &std::path::Path, record: bool, minus_one: Option<MinusOne>, level: crate::abstraction::Level, s: &crate::settings::Settings) -> Result<Self> {
         // A fresh tree keeps nothing a killed run left (stale edge files).
         for sub in ["frames", "edges", "dropped"] {
             let p = dir.join(sub);
@@ -904,12 +912,12 @@ impl ForwardState {
                 std::fs::remove_dir_all(&p).with_context(|| p.display().to_string())?;
             }
         }
-        let filter = TreeFilter::of(minus_one);
+        let filter = TreeFilter::of(minus_one, s);
         filter.write(dir)?;
-        crate::settings::get().write(dir, level)?;
-        let mut visited = crate::storage::visited::VisitedSet::new(*crate::storage::geometry());
+        s.write(dir, level)?;
+        let mut visited = crate::storage::visited::VisitedSet::new(crate::storage::GEOMETRY);
         let meta = crate::storage::wave::seed(&mut visited, &mut initial, level)?;
-        let won = checkpoint_frontier(dir, 0, &mut initial, true)?;
+        let won = checkpoint_frontier(dir, 0, &mut initial, true, s)?;
         crate::storage::meta::save(dir, 0, None, &meta)?;
         let observer = record.then(crate::search::pos_graph::PosObserver::default);
         // An (empty) graph from the start: every tree with frames has one.
@@ -918,7 +926,7 @@ impl ForwardState {
         }
         crate::storage::edges::set_done(&dir.join("edges"), 0, 0)?;
         Ok(ForwardState {
-            frontier: expandable(initial, 0, filter.ceiling())?,
+            frontier: expandable(initial, 0, filter.ceiling(), s)?,
             visited,
             xfers: Default::default(),
             observer,
@@ -930,8 +938,8 @@ impl ForwardState {
 
     /// The forward as its checkpoint tree left it (`None`: no tree); extending
     /// it matches extending the original. Refused at another `level` than
-    /// the tree's.
-    pub fn resume(dir: &std::path::Path, record: bool, level: crate::abstraction::Level) -> Result<Option<Self>> {
+    /// the tree's, or under other settings `s` than its.
+    pub fn resume(dir: &std::path::Path, record: bool, level: crate::abstraction::Level, s: &crate::settings::Settings) -> Result<Option<Self>> {
         anyhow::ensure!(
             !raise_marker(dir).exists(),
             "{}: a raise was interrupted ({}); its frames are half raised - delete the tree",
@@ -956,7 +964,7 @@ impl ForwardState {
             last = done;
         }
         crate::storage::edges::discard_after(&edges_dir, last)?;
-        let st = Self::at(dir, last, record, level)?;
+        let st = Self::at(dir, last, record, level, s)?;
         eprintln!(
             "[resume] {}: f{last} ({} lanes), visited {} states in {} entries, first win {:?}, level -1 {:?}, {:.1} s",
             dir.display(),
@@ -976,8 +984,8 @@ impl ForwardState {
     /// `bench_wave` from here is frame `last + 1` of the real forward.
     /// Refused under other settings or at another `level` than the tree's
     /// (`settings::Settings::check`).
-    pub fn at(dir: &std::path::Path, last: u32, record: bool, level: crate::abstraction::Level) -> Result<Self> {
-        crate::settings::get().check(dir, level)?;
+    pub fn at(dir: &std::path::Path, last: u32, record: bool, level: crate::abstraction::Level, s: &crate::settings::Settings) -> Result<Self> {
+        s.check(dir, level)?;
         let edges_dir = dir.join("edges");
         let filter = TreeFilter::read(dir)?;
         let (visited, win_frame) = restore_visited(dir, last)?;
@@ -987,9 +995,9 @@ impl ForwardState {
         // record by the run's ceiling, as it was built).
         let ceiling = match filter {
             Some(f) => f.ceiling(),
-            None => MinusOne::of_run().map(|m| m.h),
+            None => s.minus_one().map(|m| m.h),
         };
-        let frontier = expandable(load_frame(dir, last)?, last, ceiling)?;
+        let frontier = expandable(load_frame(dir, last, s.room)?, last, ceiling, s)?;
         let observer = if record {
             let path = pos_graph_path(dir);
             let graph = crate::search::pos_graph::PosGraph::load(&path)
@@ -1038,19 +1046,11 @@ impl ForwardState {
         dir: &std::path::Path,
         edges_dir: Option<&std::path::Path>,
     ) -> Result<(crate::storage::wave::Wave, crate::storage::visited::VisitedSet, crate::storage::edges::XferTable)> {
+        // The frame the tree would make: under the table it was built with.
         let minus_one = match self.filter {
-            Some(f) => f.minus_one(dir)?,
+            Some(f) => f.checked_minus_one(dir, &engine.settings())?,
             None => anyhow::bail!("{}: no level -1 record (a tree from before records)", dir.display()),
         };
-        // The frame the tree would make: under the table it was built with.
-        if let (Some(TreeFilter::MinusOne { table, .. }), Some(m)) = (self.filter, minus_one) {
-            anyhow::ensure!(
-                m.table().fingerprint() == table,
-                "{}: the level -1 table is not the one the tree was built under (fingerprint {:016x}, the tree's {table:016x}; a fixture pins its table: --l1-table)",
-                dir.display(),
-                m.table().fingerprint()
-            );
-        }
         let frontier: Vec<Block> = self
             .frontier
             .iter()
@@ -1087,8 +1087,9 @@ impl ForwardState {
         to: u32,
         marks: Option<&MarkFilter>,
     ) -> Result<()> {
+        let s = &engine.settings();
         let minus_one = match self.filter {
-            Some(f) => f.minus_one(dir)?,
+            Some(f) => f.checked_minus_one(dir, s)?,
             None => anyhow::bail!("{}: no level -1 record (a tree from before records): it cannot be extended (delete it)", dir.display()),
         };
         let filters = Filters { marks, minus_one };
@@ -1115,7 +1116,7 @@ impl ForwardState {
                 crate::search::checkpoint::save_value_to(&dropped_path(dir, frame), &wave.dropped)?;
             }
             let t = std::time::Instant::now();
-            let won = checkpoint_frontier(dir, frame, &mut next, true)?;
+            let won = checkpoint_frontier(dir, frame, &mut next, true, s)?;
             crate::storage::meta::save(dir, frame, None, &wave.meta)?;
             let t_ckpt = t.elapsed();
             let t = std::time::Instant::now();
@@ -1127,7 +1128,7 @@ impl ForwardState {
             crate::storage::edges::set_done(&edges_dir, frame, self.xfers.pairs.len())?;
             // A resume loads frame `frame` as its frontier and never an
             // earlier one's rows: those may go.
-            if trim_rows() && frame >= 2 {
+            if s.trim_rows && frame >= 2 {
                 for (_, p) in frame_paths(dir, frame - 1)? {
                     crate::search::checkpoint::trim(&p)?;
                 }
@@ -1139,7 +1140,7 @@ impl ForwardState {
                 self.win_frame = Some(frame);
                 eprintln!("[fwd] first win at f{frame}");
             }
-            self.frontier = expandable(next, frame, minus_one.map(|m| m.h))?;
+            self.frontier = expandable(next, frame, minus_one.map(|m| m.h), s)?;
         }
         Ok(())
     }
@@ -1167,8 +1168,9 @@ impl ForwardState {
         let h_new = to.map_or(u32::MAX, |m| m.h);
         anyhow::ensure!(h_new > from.h, "{}: a raise from step {} to {to:?} is not a raise", dir.display(), from.h);
         anyhow::ensure!(to.is_none_or(|m| m.speed == from.speed), "{}: the tree's level -1 table has S = {}, the raise asks for {to:?}", dir.display(), from.speed);
+        let s = &engine.settings();
         anyhow::ensure!(
-            !orb_required(),
+            !orb_required(s),
             "{}: in the orb room the rows not expanded past the chest's deadline depend on the horizon: a raise is not supported (delete the tree)",
             dir.display()
         );
@@ -1209,7 +1211,7 @@ impl ForwardState {
                 continue;
             }
             let t_frame = std::time::Instant::now();
-            let mut frontier = load_sources(dir, t - 1, &redo)?;
+            let mut frontier = load_sources(dir, t - 1, &redo, s.room)?;
             let n_new = new_prev.iter().map(Block::lanes).sum::<usize>();
             frontier.append(&mut new_prev);
             let first_seq = frame_paths(dir, t)?.iter().map(|(s, _)| s + 1).max().unwrap_or(0);
@@ -1227,7 +1229,7 @@ impl ForwardState {
             let wave = crate::storage::wave::run_wave(engine, frontier, cx)?;
             old_seqs = first_seq;
             let mut next = wave.next;
-            let won = checkpoint_frontier(dir, t, &mut next, false)?;
+            let won = checkpoint_frontier(dir, t, &mut next, false, s)?;
             crate::storage::meta::save(dir, t, Some(first_seq), &wave.meta)?;
             for b in &next {
                 for &id in b.ids() {
@@ -1255,11 +1257,11 @@ impl ForwardState {
             );
             redone += redo.len();
             added += kept;
-            new_prev = expandable(next, t, to.map(|m| m.h))?;
+            new_prev = expandable(next, t, to.map(|m| m.h), s)?;
         }
         // The last layer's new states join the frontier `extend` expands.
         self.frontier.append(&mut new_prev);
-        let filter = TreeFilter::of(to);
+        let filter = TreeFilter::of(to, s);
         filter.write(dir)?;
         self.filter = Some(filter);
         if to.is_none() && dir.join("dropped").exists() {
@@ -1291,7 +1293,9 @@ impl ForwardState {
 /// its filter, or started under `want`. A tree is never filtered lower than
 /// it was built: frames of one tree are filtered alike. `marks`: the coarser
 /// level's filter (the caller rebuilds such a tree for another horizon).
-/// `engine` is built only when frames are computed, at `level`, the tree's.
+/// `engine` is built only when frames are computed, at `level`, the tree's,
+/// under the run's settings `s` (the tree's, checked).
+#[allow(clippy::too_many_arguments)]
 pub fn grow_tree(
     dir: &std::path::Path,
     to: u32,
@@ -1300,9 +1304,10 @@ pub fn grow_tree(
     level: crate::abstraction::Level,
     engine: impl FnOnce() -> Result<Box<dyn FrameStep>>,
     initial: impl FnOnce() -> Result<Vec<Block>>,
+    s: &crate::settings::Settings,
 ) -> Result<ForwardResult> {
     if dir.join("frames").join("f000").is_dir() {
-        crate::settings::get().check(dir, level)?;
+        s.check(dir, level)?;
     }
     if let Some(w) = want {
         anyhow::ensure!(to <= w.h, "--level-minus-one at step {} is below the horizon, step {to}", w.h);
@@ -1343,7 +1348,7 @@ pub fn grow_tree(
                 } else {
                     if let Some(w) = want {
                         anyhow::ensure!(
-                            w.table().fingerprint() == table,
+                            w.table(s).fingerprint() == table,
                             "{}: the level -1 table changed since the tree was built, so its notes do not raise it exactly (delete it)",
                             dir.display()
                         );
@@ -1360,9 +1365,10 @@ pub fn grow_tree(
     }
     let engine = engine()?;
     anyhow::ensure!(engine.level() == level, "the forward's engine is at {}, the tree at {level}", engine.level());
-    let mut st = match ForwardState::resume(dir, true, level)? {
-        Some(s) => s,
-        None => ForwardState::start(initial()?, dir, true, want, level)?,
+    anyhow::ensure!(*engine.settings() == *s, "the forward's engine runs under other settings than the tree's");
+    let mut st = match ForwardState::resume(dir, true, level, s)? {
+        Some(st) => st,
+        None => ForwardState::start(initial()?, dir, true, want, level, s)?,
     };
     if let Some(target) = raise_to {
         st.raise(engine.as_ref(), dir, target)?;
@@ -1405,13 +1411,16 @@ pub fn forward_run(
     max_frames: u32,
     record: bool,
 ) -> Result<ForwardResult> {
-    let mut st = ForwardState::start(initial, dir, record, None, engine.level())?;
+    let mut st = ForwardState::start(initial, dir, record, None, engine.level(), &engine.settings())?;
     st.extend(engine, dir, max_frames, None)?;
     Ok(ForwardResult { win_frame: st.win_frame, frames: st.frames, pos_graph: st.pos_graph() })
 }
 
+/// The free disk the forward keeps, GB (`ensure_disk_space`).
+const MIN_FREE_GB: u64 = 20;
+
 /// Stop the forward before the checkpoint disk fills: below
-/// `--min-free-gb` (default 20) plus three times what the last frame
+/// `MIN_FREE_GB` plus three times what the last frame
 /// wrote, free on `dir`'s filesystem, an error -
 /// a full disk otherwise fails a worker mid-write (room (5,1) nodiag,
 /// 2026-10-06) and starves everything else on the machine. `last_free`: the
@@ -1421,7 +1430,7 @@ pub fn forward_run(
 /// second level at its first frame, 2026-10-07).
 fn ensure_disk_space(dir: &std::path::Path, last_free: &mut Option<u64>) -> Result<()> {
     use std::os::unix::ffi::OsStrExt;
-    let min_gb: u64 = crate::settings::get().min_free_gb;
+    let min_gb = MIN_FREE_GB;
     let path = std::ffi::CString::new(dir.as_os_str().as_bytes())?;
     // SAFETY: `path` is NUL-terminated; `st` is a valid out-parameter that
     // statvfs fills on success.
@@ -1434,7 +1443,7 @@ fn ensure_disk_space(dir: &std::path::Path, last_free: &mut Option<u64>) -> Resu
     let need = (min_gb << 30) + 3 * frame_bytes;
     anyhow::ensure!(
         free >= need,
-        "only {} GB free on {}'s filesystem, the last frame used {} GB (--min-free-gb {min_gb}, plus 3 frames): stopping the forward before the disk fills",
+        "only {} GB free on {}'s filesystem, the last frame used {} GB (the floor {min_gb} GB, plus 3 frames): stopping the forward before the disk fills",
         free >> 30,
         dir.display(),
         frame_bytes >> 30
@@ -1501,7 +1510,7 @@ fn log_frame(
 /// adds to the frame, beside its own.
 /// Returns whether a row wins (`wins_of`, the files' win rows): the
 /// forward's first win is read off the same rows a resume reads it from.
-fn checkpoint_frontier(dir: &std::path::Path, frame: u32, frontier: &mut [Block], fresh: bool) -> Result<bool> {
+fn checkpoint_frontier(dir: &std::path::Path, frame: u32, frontier: &mut [Block], fresh: bool, s: &crate::settings::Settings) -> Result<bool> {
     let fdir = dir.join("frames").join(format!("f{:03}", frame));
     // A re-run frame must not leave stale files behind.
     if fresh {
@@ -1522,7 +1531,7 @@ fn checkpoint_frontier(dir: &std::path::Path, frame: u32, frontier: &mut [Block]
                 scope.spawn(move || -> Result<bool> {
                     anyhow::ensure!(block.ids.len() == block.lanes(), "checkpoint f{frame}: a block without its ids");
                     let cells = block.positions()?;
-                    let wins = block.wins()?;
+                    let wins = block.wins(s)?;
                     let path = fdir.join(format!("s{:016x}_{:04}.bin", block.shard_shape(), block.seq));
                     anyhow::ensure!(fresh || !path.exists(), "checkpoint f{frame}: {} exists", path.display());
                     crate::search::checkpoint::save_block(&path, &block.rt2, &block.ids, &cells, &wins)?;
@@ -1565,11 +1574,11 @@ pub fn frame_files(dir: &std::path::Path, frame: u32) -> Result<Vec<(u32, crate:
     frame_paths(dir, frame)?.into_iter().map(|(seq, p)| Ok((seq, crate::search::checkpoint::FrameFile::open(&p)?))).collect()
 }
 
-/// Load every block of a checkpointed frame.
-pub fn load_frame(dir: &std::path::Path, frame: u32) -> Result<Vec<Block>> {
+/// Load every block of a checkpointed frame of a search from `room`.
+pub fn load_frame(dir: &std::path::Path, frame: u32, room: (i16, i16)) -> Result<Vec<Block>> {
     let mut out = Vec::new();
     for (seq, file) in frame_files(dir, frame)? {
-        if let Some(rt2) = file.load_all()? {
+        if let Some(rt2) = file.load_all(room)? {
             out.push(Block::layer_piece(rt2, file.ids(), seq));
         }
     }
@@ -1577,13 +1586,14 @@ pub fn load_frame(dir: &std::path::Path, frame: u32) -> Result<Vec<Block>> {
 }
 
 /// One stored row by its id: the row, its shape, its cell and its layer
-/// (found by a binary search in each frame's files: a diagnostic's lookup).
-pub fn load_row(dir: &std::path::Path, id: StateId) -> Result<(Rt2, u64, u32, u32)> {
+/// (found by a binary search in each frame's files: a diagnostic's lookup),
+/// in a search from `room`.
+pub fn load_row(dir: &std::path::Path, id: StateId, room: (i16, i16)) -> Result<(Rt2, u64, u32, u32)> {
     let mut frame = 0;
     while dir.join("frames").join(format!("f{frame:03}")).is_dir() {
         for (_, f) in frame_files(dir, frame)? {
             if let Some(row) = f.find_row(id) {
-                let rt2 = f.load_rows(&[row..row + 1])?.ok_or_else(|| anyhow::anyhow!("no row for id {}", crate::storage::show_id(id)))?;
+                let rt2 = f.load_rows(&[row..row + 1], room)?.ok_or_else(|| anyhow::anyhow!("no row for id {}", crate::storage::show_id(id)))?;
                 return Ok((rt2, f.shape_hash(), f.cell_at(row), frame));
             }
         }
@@ -1596,7 +1606,7 @@ pub fn load_row(dir: &std::path::Path, id: StateId) -> Result<(Rt2, u64, u32, u3
 /// shapes and entries, the frame files' ids for the cells), and its first
 /// win. A row whose key is not its entry's is a collision, fatal.
 pub fn restore_visited(dir: &std::path::Path, last: u32) -> Result<(crate::storage::visited::VisitedSet, Option<u32>)> {
-    let geo = *crate::storage::geometry();
+    let geo = crate::storage::GEOMETRY;
     let mut visited = crate::storage::visited::VisitedSet::new(geo);
     let metas = crate::storage::meta::load_tree(dir, last)?;
     visited.keys = crate::storage::meta::key_space(&metas)?;
@@ -1783,8 +1793,9 @@ mod tests {
     /// The mark filter admits a marked node's rows up to its deadline only.
     #[test]
     fn the_mark_filter_admits_up_to_the_deadline() {
+        let s = crate::settings::Settings::default();
         use crate::abstraction::Level;
-        let engine = RefEngine::new().expect("ref engine");
+        let engine = RefEngine::new(&s).expect("ref engine");
         let block = Block::canonical(engine.initial().expect("initial state")).expect("block");
         let coarse = Level::parse("r0sxh").expect("level");
         // The coarse key space holds the projection's codes.
@@ -1796,12 +1807,12 @@ mod tests {
         let (shape, keys, cells) = widened_keys(&block, coarse, &space).expect("keys");
         let mut marked = Visited::new(space.clone());
         marked.insert_until(shape, keys[0].expect("keyed"), cells[0], 5);
-        let f = MarkFilter::new(&marked, coarse);
+        let f = MarkFilter::new(&marked, coarse, 1);
         assert_eq!(f.allowed(block.rt2(), 5).expect("filter"), vec![true], "at the deadline");
         assert_eq!(f.allowed(block.rt2(), 6).expect("filter"), vec![false], "past it");
-        assert_eq!(MarkFilter::new(&Visited::new(Default::default()), coarse).allowed(block.rt2(), 0).expect("filter"), vec![false], "a key space without its codes");
+        assert_eq!(MarkFilter::new(&Visited::new(Default::default()), coarse, 1).allowed(block.rt2(), 0).expect("filter"), vec![false], "a key space without its codes");
         let empty = Visited::new(space);
-        assert_eq!(MarkFilter::new(&empty, coarse).allowed(block.rt2(), 0).expect("filter"), vec![false], "not marked");
+        assert_eq!(MarkFilter::new(&empty, coarse, 1).allowed(block.rt2(), 0).expect("filter"), vec![false], "not marked");
     }
 
 
@@ -1814,7 +1825,8 @@ mod tests {
     /// A fresh forward keeps none of a killed run's files.
     #[test]
     fn a_fresh_forward_clears_what_a_killed_run_left() {
-        let engine = RefEngine::new().expect("ref engine");
+        let s = crate::settings::Settings::default();
+        let engine = RefEngine::new(&s).expect("ref engine");
         let init = vec![Block::canonical(engine.initial().expect("initial state")).expect("block")];
         let dir = std::path::Path::new("/var/tmp/celeste-frame-fresh-start-test");
         let _ = std::fs::remove_dir_all(dir);
@@ -1823,7 +1835,7 @@ mod tests {
             std::fs::create_dir_all(f.parent().unwrap()).expect("mkdir");
             std::fs::write(f, b"stale").expect("write");
         }
-        ForwardState::start(init, dir, true, None, crate::abstraction::Level::EXACT).expect("start");
+        ForwardState::start(init, dir, true, None, crate::abstraction::Level::EXACT, &s).expect("start");
         for f in &stale {
             assert!(!f.exists(), "{} survived a fresh start", f.display());
         }
@@ -1836,11 +1848,12 @@ mod tests {
     /// load its rows.
     #[test]
     fn a_trimmed_frame_keeps_its_keys_cells_and_wins() {
-        let engine = std::sync::Mutex::new(RefEngine::new().expect("ref engine"));
+        let s = crate::settings::Settings::default();
+        let engine = std::sync::Mutex::new(RefEngine::new(&s).expect("ref engine"));
         let init = vec![Block::canonical(engine.lock().unwrap().initial().expect("initial state")).expect("block")];
         let dir = std::path::Path::new("/var/tmp/celeste-frame-trim-test");
         let _ = std::fs::remove_dir_all(dir);
-        let mut st = ForwardState::start(init, dir, true, None, crate::abstraction::Level::EXACT).expect("start");
+        let mut st = ForwardState::start(init, dir, true, None, crate::abstraction::Level::EXACT, &s).expect("start");
         st.extend(&engine, dir, 2, None).expect("two frames");
         type Seen = (u32, u64, Vec<(u32, (u64, u64))>, Vec<u64>, Vec<(u64, (u64, u64), u32)>);
         let seen = |f: &crate::search::checkpoint::FrameFile| -> Seen {
@@ -1851,7 +1864,7 @@ mod tests {
             assert!(crate::search::checkpoint::trim(&p).expect("trim") > 0, "the rows' values are gone");
             let f = crate::search::checkpoint::FrameFile::open(&p).expect("reopen");
             assert_eq!(seen(&f), before);
-            assert!(f.load_all().is_err(), "a trimmed frame's rows do not load");
+            assert!(f.load_all(s.room).is_err(), "a trimmed frame's rows do not load");
             assert_eq!(crate::search::checkpoint::trim(&p).expect("trim again"), 0);
         }
         let _ = std::fs::remove_dir_all(dir);
@@ -1864,11 +1877,11 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("celeste-tree-filter-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         assert_eq!(TreeFilter::read(&dir).expect("read"), None, "no record: unknown");
-        assert!(TreeFilter::of_tree(&dir).is_err(), "a check refuses an unknown filter");
+        assert!(TreeFilter::of_tree(&dir, &Default::default()).is_err(), "a check refuses an unknown filter");
         TreeFilter::Off.write(&dir).expect("write");
-        assert_eq!(TreeFilter::of_tree(&dir).expect("off"), None, "a check of an unfiltered tree applies no level -1");
+        assert_eq!(TreeFilter::of_tree(&dir, &Default::default()).expect("off"), None, "a check of an unfiltered tree applies no level -1");
         TreeFilter::Legacy(111).write(&dir).expect("write");
-        assert!(TreeFilter::of_tree(&dir).is_err(), "a legacy record's table is unknown");
+        assert!(TreeFilter::of_tree(&dir, &Default::default()).is_err(), "a legacy record's table is unknown");
         for f in [TreeFilter::Off, TreeFilter::MinusOne { m: MinusOne { h: 186, speed: 5 }, table: 0x0123_4567_89ab_cdef }, TreeFilter::Legacy(111)] {
             f.write(&dir).expect("write");
             assert_eq!(TreeFilter::read(&dir).expect("read"), Some(f));
@@ -1911,10 +1924,10 @@ mod tests {
     /// 0), a resume always: a resumed 100% run expanded fewer rows.
     #[test]
     fn a_resume_expands_what_the_uninterrupted_forward_expands() {
-        crate::settings::install(crate::settings::Settings { hundred: true, ..Default::default() });
+        let s = crate::settings::Settings { hundred: true, ..Default::default() };
         let dir = std::env::temp_dir().join(format!("celeste-resume-frontier-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        let e = RefEngine::new().expect("engine");
+        let e = RefEngine::new(&s).expect("engine");
         let init = vec![Block::canonical(e.initial().expect("init")).expect("block")];
         let e = Mutex::new(e);
         let frontier = |st: &ForwardState| -> Vec<(Vec<StateId>, Vec<bool>)> {
@@ -1922,11 +1935,11 @@ mod tests {
             v.sort();
             v
         };
-        let mut st = ForwardState::start(init, &dir, true, None, crate::abstraction::Level::EXACT).expect("start");
+        let mut st = ForwardState::start(init, &dir, true, None, crate::abstraction::Level::EXACT, &s).expect("start");
         assert!(st.frontier.iter().all(|b| b.skip().iter().all(|&s| s)), "frame 0: the berry is lost");
         for to in 0..=3 {
             st.extend(&e, &dir, to, None).expect("extend");
-            let resumed = ForwardState::at(&dir, st.frames, true, crate::abstraction::Level::EXACT).expect("at");
+            let resumed = ForwardState::at(&dir, st.frames, true, crate::abstraction::Level::EXACT, &s).expect("at");
             assert_eq!(frontier(&st), frontier(&resumed), "f{}: the resume's frontier is not the forward's", st.frames);
             assert_eq!(st.win_frame, resumed.win_frame, "f{}: the first win", st.frames);
         }
@@ -1941,18 +1954,18 @@ mod tests {
     /// and the transfer count; nothing else claims trust.
     #[test]
     fn a_frame_killed_before_its_done_marker_is_rerun() {
-        crate::settings::install(crate::settings::Settings::default());
+        let s = crate::settings::Settings::default();
         let base = std::env::temp_dir().join(format!("celeste-done-marker-{}", std::process::id()));
         let (a, b) = (base.join("uninterrupted"), base.join("killed"));
         let _ = std::fs::remove_dir_all(&base);
         // The kernels (they record transfers), past the spawn.
         let level = crate::abstraction::Level::parse("r0sxh").expect("level");
-        let e = crate::compiled::FrameEngine::new_for_start_room(level).expect("kernels");
-        let start = RefEngine::new().expect("engine").initial().expect("init");
+        let e = crate::compiled::FrameEngine::new(&s, level).expect("kernels");
+        let start = RefEngine::new(&s).expect("engine").initial().expect("init");
         let init = || vec![Block::canonical(start.clone_block()).expect("block")];
         let ends = 30;
-        ForwardState::start(init(), &a, true, None, level).expect("start").extend(&e, &a, ends, None).expect("extend");
-        let mut st = ForwardState::start(init(), &b, true, None, level).expect("start");
+        ForwardState::start(init(), &a, true, None, level, &s).expect("start").extend(&e, &a, ends, None).expect("extend");
+        let mut st = ForwardState::start(init(), &b, true, None, level, &s).expect("start");
         st.extend(&e, &b, ends - 1, None).expect("extend");
         let marker = std::fs::read_to_string(b.join("edges/done.txt")).expect("done");
         assert_eq!(marker, format!("{} xfers {}\n", ends - 1, st.xfers.pairs.len()));
@@ -1964,12 +1977,12 @@ mod tests {
                 assert!(!d.join(stale).exists(), "{stale}: a second marker");
             }
         }
-        let mut st = ForwardState::resume(&b, true, level).expect("resume").expect("a tree");
+        let mut st = ForwardState::resume(&b, true, level, &s).expect("resume").expect("a tree");
         assert_eq!(st.frames, ends - 1, "the untrusted frame is discarded");
         st.extend(&e, &b, ends, None).expect("rerun");
         for f in 0..=ends {
             let keys = |d: &std::path::Path| -> Vec<(u64, u64)> {
-                let mut k: Vec<_> = load_frame(d, f).expect("load").iter().flat_map(|b| b.keys().to_vec()).collect();
+                let mut k: Vec<_> = load_frame(d, f, s.room).expect("load").iter().flat_map(|b| b.keys().to_vec()).collect();
                 k.sort_unstable();
                 k
             };
@@ -1986,12 +1999,13 @@ mod tests {
     #[test]
     #[ignore]
     fn forward_extended_frame_by_frame_matches_fresh() {
+        let s = crate::settings::Settings::default();
         use rustc_hash::FxHashSet;
         let dir = std::path::Path::new("/var/tmp/celeste-frame-rebuild-resume-test");
         let _ = std::fs::remove_dir_all(dir);
         std::fs::create_dir_all(dir).expect("mkdir");
         let keyset = |frame: u32| -> FxHashSet<(u64, u64)> {
-            load_frame(dir, frame)
+            load_frame(dir, frame, s.room)
                 .expect("load")
                 .iter()
                 .flat_map(|b| b.keys().to_vec())
@@ -1999,7 +2013,7 @@ mod tests {
         };
 
         {
-            let e = RefEngine::new().expect("engine");
+            let e = RefEngine::new(&s).expect("engine");
             let init = vec![Block::canonical(e.initial().expect("init")).expect("block")];
             forward_run(&Mutex::new(e), init, dir, 4, true).expect("fresh");
         }
@@ -2008,10 +2022,10 @@ mod tests {
 
         // The same run extended one frame at a time.
         {
-            let e = RefEngine::new().expect("engine");
+            let e = RefEngine::new(&s).expect("engine");
             let init = vec![Block::canonical(e.initial().expect("init")).expect("block")];
             let e = Mutex::new(e);
-            let mut st = ForwardState::start(init, dir, true, None, crate::abstraction::Level::EXACT).expect("start");
+            let mut st = ForwardState::start(init, dir, true, None, crate::abstraction::Level::EXACT, &s).expect("start");
             assert!(pos_graph_path(dir).exists(), "start must leave a graph beside f0");
             for to in 1..=4 {
                 st.extend(&e, dir, to, None).expect("extend");
@@ -2029,20 +2043,20 @@ mod tests {
         let _ = std::fs::remove_dir_all(fresh_dir);
         std::fs::create_dir_all(fresh_dir).expect("mkdir");
         {
-            let e = RefEngine::new().expect("engine");
+            let e = RefEngine::new(&s).expect("engine");
             let init = vec![Block::canonical(e.initial().expect("init")).expect("block")];
             forward_run(&Mutex::new(e), init, fresh_dir, 6, true).expect("fresh 6");
         }
         {
-            let e = Mutex::new(RefEngine::new().expect("engine"));
-            let mut st = ForwardState::resume(dir, true, crate::abstraction::Level::EXACT).expect("resume").expect("a tree to resume");
+            let e = Mutex::new(RefEngine::new(&s).expect("engine"));
+            let mut st = ForwardState::resume(dir, true, crate::abstraction::Level::EXACT, &s).expect("resume").expect("a tree to resume");
             assert_eq!(st.frames, 4);
             let visited_before = st.visited_len();
             st.extend(&e, dir, 6, None).expect("extend resumed");
             assert!(st.visited_len() >= visited_before);
         }
         let keyset_in = |d: &std::path::Path, frame: u32| -> FxHashSet<(u64, u64)> {
-            load_frame(d, frame).expect("load").iter().flat_map(|b| b.keys().to_vec()).collect()
+            load_frame(d, frame, s.room).expect("load").iter().flat_map(|b| b.keys().to_vec()).collect()
         };
         assert_eq!(keyset_in(fresh_dir, 6), keyset_in(dir, 6), "resumed run diverged from fresh at frame 6");
         assert_eq!(keyset_in(fresh_dir, 5), keyset_in(dir, 5), "resumed run diverged from fresh at frame 5");
@@ -2056,11 +2070,11 @@ mod tests {
     #[test]
     fn room_02_spawn_frame_kernels_make_the_reference_successors() {
         use crate::abstraction::Level;
-        crate::settings::install(crate::settings::Settings { room: (0, 2), ..Default::default() });
-        let kernels = crate::compiled::FrameEngine::new_for_start_room(Level::EXACT).expect("kernels");
-        let reference = Mutex::new(RefEngine::new().expect("ref engine"));
+        let s = crate::settings::Settings { room: (0, 2), ..Default::default() };
+        let kernels = crate::compiled::FrameEngine::new(&s, Level::EXACT).expect("kernels");
+        let reference = Mutex::new(RefEngine::new(&s).expect("ref engine"));
         // 25 frames of no input: the spawn's last frame is the 26th.
-        let mut concrete = RefEngine::new().expect("ref engine");
+        let mut concrete = RefEngine::new(&s).expect("ref engine");
         let mut row = concrete.initial().expect("initial state");
         for _ in 0..25 {
             row = concrete.step_one(&row, 0).expect("frame").into_rt2();
@@ -2086,12 +2100,12 @@ mod tests {
     #[test]
     fn a_lane_outside_its_kernels_bounds_declines() {
         use crate::abstraction::Level;
-        crate::settings::install(crate::settings::Settings::default());
+        let s = crate::settings::Settings::default();
         let level = Level::parse("r0sxh").expect("level");
-        let grid = crate::trace::kernel::region_grid().expect("the default region grid");
-        let _kernels = crate::compiled::FrameEngine::new_for_start_room(level).expect("kernels");
+        let grid = s.region_grid().expect("the default region grid");
+        let registry = crate::compiled::asm_kernel::registry(level, &s);
         // The first frame with a player, a few frames in: standing, at rest.
-        let mut reference = RefEngine::new().expect("ref engine");
+        let mut reference = RefEngine::new(&s).expect("ref engine");
         let mut row = reference.initial().expect("initial state");
         let ids = crate::compiled::ids();
         let mut after = 0;
@@ -2121,12 +2135,12 @@ mod tests {
         let runs = |r: &Rt2| -> bool {
             let cells = crate::search::pos_graph::block_cells(r).expect("cells");
             assert!(grid.of_cell(cells[0]).is_some(), "the lane has a region");
-            let visited = crate::storage::visited::VisitedSet::new(*crate::storage::geometry());
+            let visited = crate::storage::visited::VisitedSet::new(crate::storage::GEOMETRY);
             let claims = crate::storage::unit::Claims::default();
             let prov = celeste_engine::exact::Provisional::default();
-            let mut sink = crate::storage::unit::UnitSink::new(&visited, &claims, &prov, Filters::default(), 1, level, 0, false, false, None, None);
+            let mut sink = crate::storage::unit::UnitSink::new(&visited, &claims, &prov, Filters::default(), 1, level, 0, false, false, None, None, &s);
             sink.begin(0, 0, 0, &[0], None, None, false);
-            crate::compiled::dispatch::run_chunk_kernel(level, r, &cells, &[0], &mut sink)
+            crate::compiled::dispatch::run_chunk_kernel(&registry, r, &cells, &[0], &mut sink)
         };
         let px = |n: i16| P8::from_i16(n);
         let half = P8::from_parts(0, 0x8000);
@@ -2147,10 +2161,10 @@ mod tests {
     #[test]
     fn a_lane_outside_its_platform_bounds_declines() {
         use crate::abstraction::Level;
-        crate::settings::install(crate::settings::Settings { room: (2, 1), ..Default::default() });
+        let s = crate::settings::Settings { room: (2, 1), ..Default::default() };
         let level = Level::parse("r0sxhnp").expect("level");
-        let _kernels = crate::compiled::FrameEngine::new_for_start_room(level).expect("kernels");
-        let mut reference = RefEngine::new().expect("ref engine");
+        let registry = crate::compiled::asm_kernel::registry(level, &s);
+        let mut reference = RefEngine::new(&s).expect("ref engine");
         let mut row = reference.initial().expect("initial state");
         let ids = crate::compiled::ids();
         let mut after = 0;
@@ -2183,12 +2197,12 @@ mod tests {
         };
         let runs = |r: &Rt2| -> bool {
             let cells = crate::search::pos_graph::block_cells(r).expect("cells");
-            let visited = crate::storage::visited::VisitedSet::new(*crate::storage::geometry());
+            let visited = crate::storage::visited::VisitedSet::new(crate::storage::GEOMETRY);
             let claims = crate::storage::unit::Claims::default();
             let prov = celeste_engine::exact::Provisional::default();
-            let mut sink = crate::storage::unit::UnitSink::new(&visited, &claims, &prov, Filters::default(), 1, level, 0, false, false, None, None);
+            let mut sink = crate::storage::unit::UnitSink::new(&visited, &claims, &prov, Filters::default(), 1, level, 0, false, false, None, None, &s);
             sink.begin(0, 0, 0, &[0], None, None, false);
-            crate::compiled::dispatch::run_chunk_kernel(level, r, &cells, &[0], &mut sink)
+            crate::compiled::dispatch::run_chunk_kernel(&registry, r, &cells, &[0], &mut sink)
         };
         let px = |n: i16| P8::from_i16(n);
         let (path_lo, path_hi) = (px(celeste_engine::widening::PLATFORM_PATH.0), px(celeste_engine::widening::PLATFORM_PATH.1));
@@ -2207,9 +2221,9 @@ mod tests {
     #[test]
     fn room_13_exit_frame_keys_the_concrete_exit() {
         use crate::abstraction::Level;
-        crate::settings::install(crate::settings::Settings { room: (1, 3), ..Default::default() });
+        let s = crate::settings::Settings { room: (1, 3), ..Default::default() };
         let level = Level::parse("r0sxh").expect("level");
-        let kernels = crate::compiled::FrameEngine::new_for_start_room(level).expect("kernels");
+        let kernels = crate::compiled::FrameEngine::new(&s, level).expect("kernels");
         let text = std::fs::read_to_string("tas/room_1_3_reference_frame_127.txt").expect("the reference solution");
         let inputs: Vec<u8> = text
             .lines()
@@ -2217,13 +2231,13 @@ mod tests {
             .flat_map(|l| l.split(',').filter(|t| !t.trim().is_empty()).map(|t| t.trim().parse::<u8>().expect("an input byte")).collect::<Vec<_>>())
             .collect();
         assert_eq!(inputs.len(), 127);
-        let mut reference = RefEngine::new().expect("ref engine");
+        let mut reference = RefEngine::new(&s).expect("ref engine");
         let mut st = reference.initial().expect("initial state");
         for &b in &inputs[..126] {
             st = reference.step_one(&st, b).expect("one concrete successor").into_rt2();
         }
         let exit = reference.step_one(&st, inputs[126]).expect("one concrete successor");
-        assert!(wins_of(exit.rt2()).expect("wins")[0], "the reference solution exits at frame 127");
+        assert!(wins_of(exit.rt2(), &s).expect("wins")[0], "the reference solution exits at frame 127");
         let mut parent = st;
         widen_rt2_to(&mut parent, level);
         let wave = crate::storage::wave::one_frame(&kernels, vec![Block::from_rt2(parent)], 127).expect("frame");
@@ -2245,8 +2259,8 @@ mod tests {
     /// The summit wins at the flag: the TAS31 reference wins at frame 55, not before.
     #[test]
     fn the_summit_reference_wins_at_the_flag() {
-        crate::settings::install(crate::settings::Settings { room: (6, 3), ..Default::default() });
-        assert_eq!(win_rect(), Some((55, 67, 41, 52)), "the flag at (61, 48)");
+        let s = crate::settings::Settings { room: (6, 3), ..Default::default() };
+        assert_eq!(win_rect(&s), Some((55, 67, 41, 52)), "the flag at (61, 48)");
         let text = std::fs::read_to_string("tas/room_6_3_reference_frame_55.txt").expect("the reference");
         let inputs: Vec<u8> = text
             .lines()
@@ -2254,11 +2268,11 @@ mod tests {
             .flat_map(|l| l.split(',').filter(|t| !t.trim().is_empty()).map(|t| t.trim().parse::<u8>().expect("an input byte")).collect::<Vec<_>>())
             .collect();
         assert_eq!(inputs.len(), 55);
-        let mut reference = RefEngine::new().expect("ref engine");
+        let mut reference = RefEngine::new(&s).expect("ref engine");
         let mut st = reference.initial().expect("initial state");
         for (i, &b) in inputs.iter().enumerate() {
             let next = reference.step_one(&st, b).expect("one concrete successor");
-            let won = wins_of(next.rt2()).expect("wins")[0];
+            let won = wins_of(next.rt2(), &s).expect("wins")[0];
             assert_eq!(won, i + 1 == 55, "frame {}: won {won}", i + 1);
             st = next.into_rt2();
         }
@@ -2270,19 +2284,19 @@ mod tests {
     #[test]
     fn split_frame_reaches_the_unsplit_frontier_at_a_near_level() {
         use crate::abstraction::Level;
-        crate::settings::install(crate::settings::Settings { room: (2, 1), split_frame: true, ..Default::default() });
+        let s = crate::settings::Settings { room: (2, 1), split_frame: true, ..Default::default() };
         let level = Level::parse("r0sxhn").expect("level");
         let dir = std::path::Path::new("/var/tmp/celeste-frame-split-near-test");
         let _ = std::fs::remove_dir_all(dir);
         std::fs::create_dir_all(dir).expect("checkpoint dir");
-        let engine = crate::compiled::FrameEngine::new_for_start_room(level).expect("engine");
-        let init = vec![Block::canonical(RefEngine::new().expect("ref").initial().expect("init")).expect("block")];
+        let engine = crate::compiled::FrameEngine::new(&s, level).expect("engine");
+        let init = vec![Block::canonical(RefEngine::new(&s).expect("ref").initial().expect("init")).expect("block")];
         // Unsplit, frame by frame: 1 state a frame through the spawn, then these.
         let unsplit: Vec<(u32, usize)> = (0..24).map(|f| (f, 1)).chain([(24, 27), (25, 308), (26, 1576), (27, 5559), (28, 15348)]).collect();
         let last = unsplit.last().unwrap().0;
         forward_run(&engine, init, dir, 2 * last, false).expect("split forward");
         for (f, want) in unsplit {
-            let got: usize = load_frame(dir, 2 * f).expect("load").iter().map(Block::lanes).sum();
+            let got: usize = load_frame(dir, 2 * f, s.room).expect("load").iter().map(Block::lanes).sum();
             assert_eq!(got, want, "frame {f} (step {}): the split frame reached {got} states, the unsplit {want}", 2 * f);
         }
         let _ = std::fs::remove_dir_all(dir);

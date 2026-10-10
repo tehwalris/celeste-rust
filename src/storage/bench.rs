@@ -1,5 +1,6 @@
 //! THE STORAGE MICROBENCHMARK: one real frame's emissions, captured in the
-//! forward (`--emit-capture DIR`, optionally `--emit-capture-frame F`),
+//! forward (`--emit-capture DIR`: every wave, `DIR/f{F}/`; `bench-frame`
+//! runs one),
 //! replayed through the REAL storage code (`UnitSink`, the translation, the
 //! layer's gather, the edge file) by `rewrite bench-storage`, against the
 //! tree's visited set at the frame before - without the kernels, so a tweak
@@ -25,12 +26,6 @@ use super::unit::{RowBuf, UnitSink};
 use super::visited::{Key, VisitedSet};
 use super::StateId;
 
-/// The capture directory and frame (`--emit-capture`,
-/// `--emit-capture-frame`: any frame when unset).
-fn capture_target() -> Option<&'static (PathBuf, Option<u32>)> {
-    crate::settings::get().diag.emit_capture.as_ref()
-}
-
 /// One wave worker's capture stream.
 pub struct CaptureWriter {
     dir: PathBuf,
@@ -39,17 +34,14 @@ pub struct CaptureWriter {
 }
 
 impl CaptureWriter {
-    /// The stream of `worker` at `frame`, if this frame is captured
+    /// The stream of `worker` at `frame`, if the run captures
     /// (`DIR/f{frame}/`).
-    pub fn open(frame: u32, worker: u32, level: crate::abstraction::Level) -> Option<Self> {
-        let (root, only) = capture_target()?;
-        if only.is_some_and(|f| f != frame) {
-            return None;
-        }
+    pub fn open(frame: u32, worker: u32, level: crate::abstraction::Level, s: &crate::settings::Settings) -> Option<Self> {
+        let root = s.diag.emit_capture.as_ref()?;
         let dir = root.join(format!("f{frame:03}"));
         std::fs::create_dir_all(&dir).expect("the capture dir");
         if worker == 0 {
-            std::fs::write(dir.join("env.txt"), format!("frame {frame}\nlevel {level}\nsettings {}\n", crate::settings::get().cart_key())).expect("the capture's env");
+            std::fs::write(dir.join("env.txt"), format!("frame {frame}\nlevel {level}\nsettings {}\n", s.cart_key())).expect("the capture's env");
         }
         let f = std::fs::File::create(dir.join(format!("w{worker:03}.bin"))).expect("a capture stream");
         Some(CaptureWriter { dir, worker, out: std::io::BufWriter::with_capacity(8 << 20, f) })
@@ -195,9 +187,9 @@ impl Capture {
 
 /// The replay's row of a state: 16 numbers (the key's words and the cell),
 /// in a synthetic block of the shape.
-fn bench_skeleton(shape: u64) -> celeste_engine::runtime2::Rt2 {
+fn bench_skeleton(shape: u64, room: (i16, i16)) -> celeste_engine::runtime2::Rt2 {
     use celeste_engine::runtime2::{Cell2, Col, Rt2};
-    let (cart, cache) = crate::compiled::room_context().expect("the room's cart");
+    let (cart, cache) = crate::compiled::room_context(room).expect("the room's cart");
     let mut b = Rt2::empty(0, 0, &[], cart, cache);
     b.structure = vec![Cell2::Val; 16];
     b.cols = (0..16).map(|_| Col::N(Vec::new())).collect();
@@ -222,7 +214,8 @@ pub struct BenchArgs<'a> {
     pub capture: &'a Path,
     pub tree: &'a Path,
     pub level: crate::abstraction::Level,
-    pub threads: usize,
+    /// The run's settings (the capture's: threads, the room).
+    pub settings: &'a crate::settings::Settings,
     pub phase: &'a str,
     pub reps: usize,
 }
@@ -265,11 +258,11 @@ pub fn bench_storage(a: &BenchArgs) -> Result<()> {
         let prov = celeste_engine::exact::Provisional::default();
         type Done = (Vec<super::unit::UnitOut>, Vec<crate::search::arc_edges::Pair>, u64, u64);
         let done: Vec<Done> = std::thread::scope(|scope| {
-            let hs: Vec<_> = (0..a.threads)
+            let hs: Vec<_> = (0..a.settings.threads())
                 .map(|w| {
                     let (cap, order, next, claims, prov, index) = (&cap, &order, &next, &claims, &prov, &index);
                     scope.spawn(move || -> Result<Done> {
-                        let mut sink = UnitSink::new(shared, claims, prov, crate::frame::Filters::default(), frame, a.level, w as u32, true, false, None, None);
+                        let mut sink = UnitSink::new(shared, claims, prov, crate::frame::Filters::default(), frame, a.level, w as u32, true, false, None, None, a.settings);
                         if do_edges {
                             sink.stream_blocks(&index)?;
                         }
@@ -279,7 +272,7 @@ pub fn bench_storage(a: &BenchArgs) -> Result<()> {
                             let Some(&ui) = order.get(i) else { break };
                             let u = &cap.units[ui];
                             sink.begin(u.unit, u.block, u.lo as usize, &u.sources, None, None, u.old);
-                            replay_unit(&mut sink, cap, u, &mut xmap[u.stream])?;
+                            replay_unit(&mut sink, cap, u, &mut xmap[u.stream], a.settings.room)?;
                             sink.end()?;
                         }
                         sink.finish()?;
@@ -300,14 +293,14 @@ pub fn bench_storage(a: &BenchArgs) -> Result<()> {
         // Units in the capture's order, as the wave numbers them.
         outs.sort_by_key(|o: &super::unit::UnitOut| o.sources.first().copied());
         let edges: u64 = outs.iter().map(|o| o.edges).sum();
-        let mut line = format!("[bench-storage] rep {rep}: units {:.3} s ({} threads; requests {requests} lids {lids} edges {edges})", t_units.as_secs_f64(), a.threads);
+        let mut line = format!("[bench-storage] rep {rep}: units {:.3} s ({} threads; requests {requests} lids {lids} edges {edges})", t_units.as_secs_f64(), a.settings.threads());
         if do_translate {
             let t = Instant::now();
-            let (news, _meta) = super::wave::translate(&mut visited, &mut outs, &prov, frame)?;
-            super::wave::resolve_lids(&visited, &outs, frame)?;
+            let (news, _meta) = super::wave::translate(&mut visited, &mut outs, &prov, frame, a.settings)?;
+            super::wave::resolve_lids(&visited, &outs, frame, a.settings.threads())?;
             let t_tr = t.elapsed();
             let t = Instant::now();
-            let layer = super::wave::gather_layer(&visited, &outs, &news, frame, 0)?;
+            let layer = super::wave::gather_layer(&visited, &outs, &news, frame, 0, a.settings)?;
             let t_layer = t.elapsed();
             line += &format!(" | translate {:.3} s, new {} | layer {:.3} s, {} pieces", t_tr.as_secs_f64(), news.len(), t_layer.as_secs_f64(), layer.len());
             // The new states' fingerprint, as `ckhash`'s `f` line.
@@ -316,11 +309,11 @@ pub fn bench_storage(a: &BenchArgs) -> Result<()> {
             if do_edges {
                 let t = Instant::now();
                 let remaps = xfers.merge(Some(&scratch), &tables)?;
-                let bytes = super::edges::write_file(&index, frame, &outs, remaps)? + outs.iter().map(|u| u.block_len).sum::<u64>();
+                let bytes = super::edges::write_file(&index, frame, &outs, remaps, a.settings.threads())? + outs.iter().map(|u| u.block_len).sum::<u64>();
                 let t_e = t.elapsed();
                 line += &format!(" | edge file {:.3} s, {:.2} B an edge", t_e.as_secs_f64(), bytes as f64 / edges.max(1) as f64);
                 // The edges' fingerprint, as `ckhash --edges`'s `e` line.
-                let (n, acc) = edge_fingerprint(&scratch, frame, &xfers, &visited)?;
+                let (n, acc) = edge_fingerprint(&scratch, frame, &xfers, &visited, a.settings.threads())?;
                 line += &format!(" | e{frame:03} {n} {acc:016x}");
             }
         }
@@ -349,7 +342,7 @@ pub fn layer_fingerprint(layer: &[crate::frame::Block], visited: &VisitedSet) ->
 /// source (looked up in `visited`, which holds both) and its transfer pair
 /// (`xfers`, the merged table in memory: the dir's file may hold only the
 /// frame's new pairs).
-pub fn edge_fingerprint(edges_dir: &Path, frame: u32, xfers: &super::edges::XferTable, visited: &VisitedSet) -> Result<(u64, u64)> {
+pub fn edge_fingerprint(edges_dir: &Path, frame: u32, xfers: &super::edges::XferTable, visited: &VisitedSet, threads: usize) -> Result<(u64, u64)> {
     let mix = celeste_engine::runtime2::mix64;
     let store = super::edges::EdgeStore::open(edges_dir, frame)?;
     let content = visited.keys.content_hash();
@@ -369,7 +362,7 @@ pub fn edge_fingerprint(edges_dir: &Path, frame: u32, xfers: &super::edges::Xfer
             b.iter().fold(0u64, |h, &x| mix(h ^ x as u64))
         })
         .collect();
-    let parts = store.par_scan(frame, crate::frame::threads(), || (0u64, 0u64), |(n, acc), e| {
+    let parts = store.par_scan(frame, threads, || (0u64, 0u64), |(n, acc), e| {
         *acc = acc.wrapping_add(mix(node(e.dst) ^ node(e.src).rotate_left(21) ^ pair_hash[e.xfer as usize].rotate_left(42)));
         *n += 1;
     });
@@ -378,7 +371,7 @@ pub fn edge_fingerprint(edges_dir: &Path, frame: u32, xfers: &super::edges::Xfer
 
 /// Replay one unit's records into the sink (`xmap`: the stream's transfer
 /// ids as the sink's, filled on first use).
-fn replay_unit(sink: &mut UnitSink, cap: &Capture, u: &CapUnit, xmap: &mut Vec<u32>) -> Result<()> {
+fn replay_unit(sink: &mut UnitSink, cap: &Capture, u: &CapUnit, xmap: &mut Vec<u32>, room: (i16, i16)) -> Result<()> {
     let b = &cap.maps[u.stream][u.records.clone()];
     let u32_at = |o: usize| u32::from_le_bytes(b[o..o + 4].try_into().unwrap());
     let u64_at = |o: usize| u64::from_le_bytes(b[o..o + 8].try_into().unwrap());
@@ -417,7 +410,7 @@ fn replay_unit(sink: &mut UnitSink, cap: &Capture, u: &CapUnit, xmap: &mut Vec<u
             }
             xmap[x as usize]
         });
-        sink.emit(shape, cell, key, u.lo as usize + lane as usize, xfer, || bench_skeleton(shape), |buf| push_bench_row(buf, key, cell))?;
+        sink.emit(shape, cell, key, u.lo as usize + lane as usize, xfer, || bench_skeleton(shape, room), |buf| push_bench_row(buf, key, cell))?;
     }
     Ok(())
 }

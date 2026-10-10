@@ -119,8 +119,8 @@ pub(crate) fn specialize_frame(
     forks: u8,
     decide: bool,
     room: Option<&crate::transpile::graph::Room>,
+    trace: bool,
 ) -> (Graph, Vec<SpecializedBody>) {
-    let trace = crate::settings::get().diag.build_trace;
     let t0 = std::time::Instant::now();
     // --- 1. the forks each outcome depends on: those in its cone (read off
     // the reachable set, so no limit on a frame's fork count) ---
@@ -456,14 +456,15 @@ pub(crate) fn specialize_frame(
 /// The fused bodies' constant-output analysis. Sets each outcome field's
 /// `konst_av` to the `AV` it holds in EVERY row: when every body of the
 /// outcome computes the same node for it and that node is a compile-time
-/// constant. Returns the fused graph and its bodies (`specialize_frame`).
-pub(crate) fn lower_outcomes(e: &Emit, outs: &mut [Outcome]) -> (Graph, Vec<SpecializedBody>) {
+/// constant. Returns the fused graph and its bodies (`specialize_frame`;
+/// `trace`: `--build-trace`).
+pub(crate) fn lower_outcomes(e: &Emit, outs: &mut [Outcome], trace: bool) -> (Graph, Vec<SpecializedBody>) {
     let outs_spec: Vec<(Vec<NodeId>, NodeId, NodeId, Vec<NodeId>)> = outs
         .iter()
         .map(|o| (o.of.fields.iter().map(|f| f.node).collect(), o.error, o.live, o.arc.clone()))
         .collect();
     let (sp, bodies) =
-        specialize_frame(&e.graph, &outs_spec, e.fork_depth as u8, e.decide, e.room.as_ref());
+        specialize_frame(&e.graph, &outs_spec, e.fork_depth as u8, e.decide, e.room.as_ref(), trace);
     for (oi, o) in outs.iter_mut().enumerate() {
         let mine: Vec<&Vec<NodeId>> = bodies.iter().filter(|b| b.0 == oi).map(|b| &b.2).collect();
         let Some(first) = mine.first() else {

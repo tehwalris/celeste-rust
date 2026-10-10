@@ -96,9 +96,12 @@ pub fn player_object(rt2: &Rt2) -> Option<u32> {
 }
 
 /// Per-lane cell of a block. `room.x`/`room.y` must be numbers; no player
-/// object, or a position that is not numeric, is `NO_CELL`.
+/// object, or a position that is not numeric, is `NO_CELL`. The start room
+/// is the block's own (its collision cache's room: every block of a search
+/// carries the start room's).
 pub fn block_cells(rt2: &Rt2) -> Result<Vec<u32>> {
     let ids = crate::compiled::ids();
+    let start = (rt2.cache.room_x, rt2.cache.room_y);
     let lanes = rt2.width;
     let axis = |obj: u32, f: u32| rt2.obj_field_cell(obj, f).and_then(|c| whole_i16_col(rt2, c));
     let room = rt2
@@ -115,23 +118,24 @@ pub fn block_cells(rt2: &Rt2) -> Result<Vec<u32>> {
     };
     (0..lanes)
         .map(|i| {
-            let (ox, oy) = room_offset(rx[i], ry[i])?;
+            let (ox, oy) = room_offset(start, rx[i], ry[i])?;
             cell_of(px[i] as i32 + ox, py[i] as i32 + oy)
         })
         .collect()
 }
 
-/// The labelling offset of a row in room `(rx, ry)`: the start room at 0,
-/// `game_runner::win_room` one ROOM_PX to the right (also across the wrap
-/// (7,y) -> (0,y+1)). No other room occurs: a death reloads the start room.
-pub fn room_offset(rx: i16, ry: i16) -> Result<(i32, i32)> {
-    let start = crate::game_runner::start_room();
+/// The labelling offset of a row in room `(rx, ry)` of a search from room
+/// `start`: the start room at 0, `game_runner::win_room` one ROOM_PX to the
+/// right (also across the wrap (7,y) -> (0,y+1)). No other room occurs: a
+/// death reloads the start room.
+pub fn room_offset(start: (i16, i16), rx: i16, ry: i16) -> Result<(i32, i32)> {
+    let win = crate::game_runner::win_room(start);
     if (rx, ry) == start {
         Ok((0, 0))
-    } else if (rx, ry) == crate::game_runner::win_room() {
+    } else if (rx, ry) == win {
         Ok((ROOM_PX, 0))
     } else {
-        Err(anyhow!("a row in room ({rx},{ry}): neither the start room {start:?} nor the one it exits to {:?}", crate::game_runner::win_room()))
+        Err(anyhow!("a row in room ({rx},{ry}): neither the start room {start:?} nor the one it exits to {win:?}"))
     }
 }
 

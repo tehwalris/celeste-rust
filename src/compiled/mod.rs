@@ -49,33 +49,41 @@ pub fn ids() -> &'static runtime2::BoundaryIds {
     IDS.get_or_init(boundary_ids)
 }
 
-/// The start room's cart and collision cache, loaded once. Every block
-/// carries these two `Arc`s (the kernels read tiles through them); anything
-/// that builds a block outside an engine attaches the same pair.
-pub fn room_context() -> Result<(Arc<CartData>, Arc<CollisionCache>)> {
-    static CTX: std::sync::OnceLock<(Arc<CartData>, Arc<CollisionCache>)> =
-        std::sync::OnceLock::new();
-    if let Some(c) = CTX.get() {
+/// Room `(room_x, room_y)`'s cart and collision cache, loaded once per room
+/// (a cache keyed on the room). Every block carries these two `Arc`s (the
+/// kernels read tiles through them); anything that builds a block outside
+/// an engine attaches the same pair.
+pub fn room_context((room_x, room_y): (i16, i16)) -> Result<(Arc<CartData>, Arc<CollisionCache>)> {
+    type Ctx = (Arc<CartData>, Arc<CollisionCache>);
+    static CTX: std::sync::Mutex<Vec<((i16, i16), Ctx)>> = std::sync::Mutex::new(Vec::new());
+    let mut all = CTX.lock().unwrap();
+    if let Some((_, c)) = all.iter().find(|(r, _)| *r == (room_x, room_y)) {
         return Ok(c.clone());
     }
-    let (room_x, room_y) = crate::game_runner::start_room();
     let cart = Arc::new(CartData::load("cart")?);
     let cache = Arc::new(CollisionCache::new(&cart, room_x, room_y)?);
-    let _ = CTX.set((cart, cache));
-    Ok(CTX.get().expect("just set").clone())
+    all.push(((room_x, room_y), (cart.clone(), cache.clone())));
+    Ok((cart, cache))
 }
 
-/// The kernels of one LEVEL (`asm_kernel::registry`).
+/// The kernels of one LEVEL under the run's settings
+/// (`asm_kernel::registry`, built on first use).
 pub struct FrameEngine {
     level: crate::abstraction::Level,
+    settings: Arc<crate::settings::Settings>,
+    registry: std::sync::OnceLock<Arc<asm_kernel::Registry>>,
 }
 
 impl FrameEngine {
-    /// The engine for the configured start room (its cart loads here), its
-    /// frames at `level`.
-    pub fn new_for_start_room(level: crate::abstraction::Level) -> Result<Self> {
-        room_context()?;
-        Ok(FrameEngine { level })
+    /// The engine for the start room of `settings` (its cart loads here),
+    /// its frames at `level`.
+    pub fn new(settings: &crate::settings::Settings, level: crate::abstraction::Level) -> Result<Self> {
+        room_context(settings.room)?;
+        Ok(FrameEngine { level, settings: Arc::new(settings.clone()), registry: std::sync::OnceLock::new() })
+    }
+
+    fn registry(&self) -> &asm_kernel::Registry {
+        self.registry.get_or_init(|| asm_kernel::registry(self.level, &self.settings))
     }
 
     /// One frame of one BUCKET (one shape's block of the frontier), emitted
@@ -89,7 +97,7 @@ impl FrameEngine {
         lanes: &[usize],
         sink: &mut crate::storage::unit::UnitSink,
     ) {
-        if !dispatch::run_chunk_kernel(self.level, bucket, cell_in, lanes, sink) {
+        if !dispatch::run_chunk_kernel(self.registry(), bucket, cell_in, lanes, sink) {
             // A COVERAGE GAP, not a degraded mode: there is no fallback.
             // The search resumes from the last completed frame's checkpoint.
             panic!(
@@ -119,10 +127,14 @@ impl crate::frame::FrameStep for FrameEngine {
 
     fn warm(&self) {
         // A level without kernels fails loudly in `run_bucket`, not here.
-        let _ = asm_kernel::registry(self.level);
+        let _ = self.registry();
     }
 
     fn level(&self) -> crate::abstraction::Level {
         self.level
+    }
+
+    fn settings(&self) -> Arc<crate::settings::Settings> {
+        self.settings.clone()
     }
 }

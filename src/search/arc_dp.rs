@@ -191,9 +191,9 @@ pub struct Loaded {
 }
 
 /// Run `f` over the nodes `0..n` in parallel chunks (`f(lo, hi)`), collecting
-/// its results in chunk order.
-fn par_chunks<T: Send>(n: usize, f: impl Fn(usize, usize) -> anyhow::Result<T> + Sync) -> anyhow::Result<Vec<T>> {
-    let threads = crate::frame::threads().max(1);
+/// its results in chunk order, on `threads` workers.
+fn par_chunks<T: Send>(n: usize, threads: usize, f: impl Fn(usize, usize) -> anyhow::Result<T> + Sync) -> anyhow::Result<Vec<T>> {
+    let threads = threads.max(1);
     let chunk = n.div_ceil(threads * 8).max(1);
     let next = std::sync::atomic::AtomicUsize::new(0);
     let mut parts: Vec<(usize, T)> = std::thread::scope(|sc| {
@@ -249,7 +249,7 @@ fn tree_frames(dir: &std::path::Path, horizon: u32) -> anyhow::Result<Vec<Vec<(u
 /// then a pass filling the two adjacencies in place - so no edge list is
 /// ever held beside the graph: 12 B an edge, the graph's own (room (2,3)
 /// gemskip h137, 373M edges: 28 B an edge and a 12.1 GB peak before).
-pub fn load(dir: &std::path::Path, horizon: u32) -> anyhow::Result<Loaded> {
+pub fn load(dir: &std::path::Path, horizon: u32, threads: usize) -> anyhow::Result<Loaded> {
     use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
     let t0 = std::time::Instant::now();
     let mut wins: Vec<(u64, u32)> = Vec::new();
@@ -278,7 +278,7 @@ pub fn load(dir: &std::path::Path, horizon: u32) -> anyhow::Result<Loaded> {
     for (f, &rows) in kept.iter().enumerate().skip(1) {
         anyhow::ensure!(rows == 0 || eg.has_frame(f as u32), "{}: no edges for f{f}, which kept {rows} rows", dir.display());
     }
-    let (mut bfs, _) = super::edges::bfs(&eg, horizon, wins.iter().copied());
+    let (mut bfs, _) = super::edges::bfs(&eg, horizon, wins.iter().copied(), threads);
     let t_bfs = t0.elapsed();
     // The BFS never marks layer 0: the start, deadline 0. The wins are
     // seeds, marked; so the marks are the nodes.
@@ -300,9 +300,9 @@ pub fn load(dir: &std::path::Path, horizon: u32) -> anyhow::Result<Loaded> {
     // its units are read, in parallel.
     let each_unit = |f: &(dyn Fn(&crate::storage::edges::UnitView) -> anyhow::Result<()> + Sync)| -> anyhow::Result<()> {
         for frame in 1..=horizon {
-            let owners = eg.owners(frame);
+            let owners = eg.owners(frame, threads);
             let units = eg.units(frame);
-            par_chunks(units.len(), |lo, hi| {
+            par_chunks(units.len(), threads, |lo, hi| {
                 for &(fi, ui) in &units[lo..hi] {
                     f(&eg.unit(frame, &owners, fi, ui))?;
                 }
@@ -383,7 +383,7 @@ pub fn load(dir: &std::path::Path, horizon: u32) -> anyhow::Result<Loaded> {
     }
     {
         let (out_ref, preds_ref, out_at_ref, pred_at_ref) = (out.as_mut_ptr() as usize, preds.as_mut_ptr() as usize, &out_at, &pred_at);
-        par_chunks(n, |lo, hi| {
+        par_chunks(n, threads, |lo, hi| {
             // SAFETY: the nodes `lo..hi` own the disjoint ranges
             // `out_at[lo]..out_at[hi]` and `pred_at[lo]..pred_at[hi]`.
             let o = unsafe { std::slice::from_raw_parts_mut((out_ref as *mut Out).add(out_at_ref[lo] as usize), (out_at_ref[hi] - out_at_ref[lo]) as usize) };
@@ -495,8 +495,8 @@ fn pull<'a>(g: &Graph, i: u32, next: impl Fn(u32) -> Option<&'a Region>, pieces:
 /// torus from its layer on; any other's is the union of its out-edges'
 /// preimages of `W_{t+1}`, while it is live (`Backward::step`, a frame at a
 /// time). Prints the step totals and the sets' fragmentation every 4th frame.
-pub fn backward(g: &Graph, horizon: u32) -> Winning {
-    let mut b = Backward::new(g, horizon);
+pub fn backward(g: &Graph, horizon: u32, threads: usize) -> Winning {
+    let mut b = Backward::new(g, horizon, threads);
     for t in (0..horizon).rev() {
         b.step(t);
     }
@@ -541,8 +541,9 @@ fn region_hash(r: &Region) -> u64 {
 }
 
 impl<'g> Backward<'g> {
-    /// `W_horizon`: the win nodes present by the horizon.
-    pub fn new(g: &'g Graph, horizon: u32) -> Self {
+    /// `W_horizon`: the win nodes present by the horizon (each step on
+    /// `threads` workers).
+    pub fn new(g: &'g Graph, horizon: u32, threads: usize) -> Self {
         let n = g.len();
         assert!(horizon < u16::MAX as u32, "a horizon past u16");
         let sets: Vec<Region> = vec![Region::full()];
@@ -564,7 +565,7 @@ impl<'g> Backward<'g> {
         Backward {
             g,
             horizon,
-            threads: crate::frame::threads(),
+            threads,
             sets,
             interned,
             spans: Vec::new(),
@@ -825,10 +826,10 @@ impl<'g> Backward<'g> {
 /// A set more fragmented than `REACH_SEGS` segments is replaced by `W_t`
 /// itself (a superset: the filter only loosens), which bounds the memory -
 /// W's sets are shared, a node's reached set is its own.
-pub fn reach(g: &Graph, w: &Winning, start: u32, point: (u32, u32), horizon: u32) -> Vec<u32> {
+pub fn reach(g: &Graph, w: &Winning, start: u32, point: (u32, u32), horizon: u32, threads: usize) -> Vec<u32> {
     use super::arcs::Piece;
     let n = g.len();
-    let threads = crate::frame::threads().max(1);
+    let threads = threads.max(1);
     let mut last = vec![u32::MAX; n];
     const REACH_SEGS: usize = 32;
     // The current frame's sets, by node (`None`: W_t of the node); `pos[i]`
@@ -1125,12 +1126,11 @@ pub(super) fn rem_of(rt2: &celeste_engine::runtime2::Rt2) -> anyhow::Result<(u32
 /// file's seeds), so a concrete run is one real run under them - the tree
 /// and W keep the phase an interval (sound for every seed), and a concrete
 /// state's key maps its phase to that interval (`lookup_view`). Built under
-/// the global level: `_init` runs under it.
-pub(super) fn concrete_engines(n: usize) -> anyhow::Result<(Vec<crate::trace::refengine::RefEngine>, bool)> {
-    let run = crate::settings::get();
+/// the run's settings `run`: `_init` runs under them.
+pub(super) fn concrete_engines(n: usize, run: &crate::settings::Settings) -> anyhow::Result<(Vec<crate::trace::refengine::RefEngine>, bool)> {
     let seeded = run.concrete_balloon_seeds.is_some();
     let s = crate::settings::Settings { balloon_seeds: run.concrete_balloon_seeds.clone().or_else(|| run.balloon_seeds.clone()), ..run.clone() };
-    let engines = (0..n).map(|_| crate::trace::refengine::RefEngine::with(&s)).collect::<anyhow::Result<Vec<_>>>()?;
+    let engines = (0..n).map(|_| crate::trace::refengine::RefEngine::new(&s)).collect::<anyhow::Result<Vec<_>>>()?;
     Ok((engines, seeded))
 }
 
@@ -1184,19 +1184,20 @@ pub fn concrete_search(
     w: &Winning,
     bound: u32,
     prefer: Option<&[u8]>,
+    s: &crate::settings::Settings,
 ) -> anyhow::Result<Option<Witness>> {
     use crate::frame::{wins_of, Block};
     use anyhow::Result;
     use crate::trace::refengine::RefEngine;
     use celeste_engine::runtime2::Rt2;
     // Their frames run exact (`RefEngine::frame`); `level` is the lookups'.
-    let workers = crate::frame::threads().max(1);
-    let (engines, seeded) = concrete_engines(workers)?;
+    let workers = s.threads().max(1);
+    let (engines, seeded) = concrete_engines(workers, s)?;
     let engines: Vec<std::sync::Mutex<RefEngine>> = engines.into_iter().map(std::sync::Mutex::new).collect();
     let initial = engines[0].lock().expect("an engine").initial()?;
     // W is indexed by search STEP; the concrete search steps whole frames
     // (`RefEngine::frame`), and frame k ends at step `spf * k`.
-    let spf = crate::frame::steps_per_frame();
+    let spf = s.steps_per_frame();
     anyhow::ensure!(horizon % spf == 0, "the horizon {horizon} is not a whole number of frames ({spf} steps each)");
     let frames = horizon / spf;
     let t0 = std::time::Instant::now();
@@ -1235,6 +1236,7 @@ pub fn concrete_search(
             prefer: Option<&'a [u8]>,
             seeded: bool,
             spf: u32,
+            settings: &'a crate::settings::Settings,
         }
         /// `Ok(None)`: out of budget.
         fn dfs(cx: &mut Dfs, st: &Rt2, k: u32) -> Result<Option<bool>> {
@@ -1254,7 +1256,7 @@ pub fn concrete_search(
                         return Ok(None);
                     }
                     let cell = b.positions()?[0];
-                    if wins_of(b.rt2())?.iter().any(|&x| x) {
+                    if wins_of(b.rt2(), cx.settings)?.iter().any(|&x| x) {
                         // A win before the lower bound means a lost path.
                         anyhow::ensure!(k + 1 == cx.frames, "a concrete win at f{} before the arc bound f{}: the backward lost a path", k + 1, cx.frames);
                         cx.path.push((byte, cell));
@@ -1286,7 +1288,7 @@ pub fn concrete_search(
         const DFS_BUDGET: u64 = 200_000;
         let t = std::time::Instant::now();
         let mut eng = engines[0].lock().expect("an engine");
-        let mut cx = Dfs { eng: &mut eng, node, keys, w, level, from: frames - bound, frames: bound, dead: FxHashSet::default(), path: Vec::new(), steps: 0, prefer, seeded, spf };
+        let mut cx = Dfs { eng: &mut eng, node, keys, w, level, from: frames - bound, frames: bound, dead: FxHashSet::default(), path: Vec::new(), steps: 0, prefer, seeded, spf, settings: s };
         let found = dfs(&mut cx, start.rt2(), 0)?;
         eprintln!(
             "[concrete] depth-first at the bound f{bound}: {} after {} steps, {:.1} s",
@@ -1345,7 +1347,7 @@ pub fn concrete_search(
                                         // Dedup on the EXACT state, never the level's
                                         // widened key (`exact_state`).
                                         let exact = exact_state(&b, cell);
-                                        let win = wins_of(b.rt2())?.iter().any(|&x| x);
+                                        let win = wins_of(b.rt2(), s)?.iter().any(|&x| x);
                                         if !win && chunk_seen.contains(&exact) {
                                             continue;
                                         }
@@ -1485,14 +1487,16 @@ pub fn solve(
     save: Option<&std::path::Path>,
     prefer: Option<&[u8]>,
     known: Option<&super::known::Route>,
+    s: &crate::settings::Settings,
 ) -> anyhow::Result<Solved> {
     use crate::frame::{mark_row, save_marks, MarkRow, Visited};
-    crate::settings::get().check(dir, level)?;
+    s.check(dir, level)?;
     crate::metrics::mem_phase("arc: start");
-    let Loaded { graph, start, marks, wins, .. } = load(dir, horizon)?;
+    let threads = s.threads();
+    let Loaded { graph, start, marks, wins, .. } = load(dir, horizon, threads)?;
     let g = &graph;
     let tb = std::time::Instant::now();
-    let w = backward(g, horizon);
+    let w = backward(g, horizon, threads);
     crate::metrics::mem_phase("arc: backward");
     let tb = tb.elapsed().as_secs_f64();
     // The start has no player yet: any point stands for its remainder.
@@ -1501,7 +1505,7 @@ pub fn solve(
     let arc_steps = found.as_ref().map(|f| f.frame);
     // In frames: a win at step s is during frame ceil(s / spf) (a lower
     // bound still: a frame's win is a win at its last step at the latest).
-    let arc = arc_steps.map(|s| s.div_ceil(crate::frame::steps_per_frame()));
+    let arc = arc_steps.map(|k| k.div_ceil(s.steps_per_frame()));
     eprintln!("[arc] backward {tb:.2} s; optimum {arc_steps:?} (steps)");
     // The nodes as (shape, key, cell), through the storage metadata (the
     // marks are the nodes, in order): the fingerprints, the marks file and
@@ -1558,7 +1562,7 @@ pub fn solve(
     let mut arc_marks = want_marks.then(|| Visited::new(resolver.space.clone()));
     if want_marks || save.is_some() {
         let tr = std::time::Instant::now();
-        let last = reach(g, &w, start, p0, horizon);
+        let last = reach(g, &w, start, p0, horizon, threads);
         eprintln!("[arc] reach {:.2} s", tr.elapsed().as_secs_f64());
         crate::metrics::mem_phase("arc: reach");
         let ids: Vec<(u64, u16)> = (0..g.len() as u32).filter(|&i| last[i as usize] != u32::MAX).map(|i| (g.id(i), last[i as usize] as u16)).collect();
@@ -1582,8 +1586,8 @@ pub fn solve(
     let node = NodeKeys::new(keys);
     let known = match known {
         Some(route) => {
-            let minus_one = crate::frame::TreeFilter::of_tree(dir)?;
-            let p = super::known::Pruning { level, horizon, node: &node, keys: &resolver.space, start, w: &w, reached: arc_marks.as_ref(), minus_one, files: &files };
+            let minus_one = crate::frame::TreeFilter::of_tree(dir, s)?;
+            let p = super::known::Pruning { settings: s, level, horizon, node: &node, keys: &resolver.space, start, w: &w, reached: arc_marks.as_ref(), minus_one, files: &files };
             super::known::check(route, &p)?
         }
         None => None,
@@ -1593,7 +1597,7 @@ pub fn solve(
     drop(graph);
     crate::metrics::mem_phase("arc: marks for the next level, graph dropped");
     let found = match (concrete, arc) {
-        (true, Some(f)) => concrete_search(level, horizon, &node, &resolver.space, &w, f, prefer)?,
+        (true, Some(f)) => concrete_search(level, horizon, &node, &resolver.space, &w, f, prefer, s)?,
         _ => None,
     };
     if let Some(wt) = &found {
@@ -1630,7 +1634,7 @@ mod tests {
         let g = corridor();
         let s = g.index(0).unwrap();
         // rem -0.1 + 0.6 crosses at once: a win at frame 1.
-        let w = backward(&g, 3);
+        let w = backward(&g, 3, 2);
         let f = optimum(&g, &w, s, (point(-6553), point(0)), 3).expect("a win");
         assert_eq!(f.frame, 1);
         // rem -0.5: -0.5 + 0.6 = 0.1 stays, 0.7 crosses at frame 2.
@@ -1638,7 +1642,7 @@ mod tests {
         assert_eq!(f.frame, 2);
         assert_eq!(f.path.len(), 3);
         // Horizon 1 refutes it from -0.5, not from -0.1.
-        let w1 = backward(&g, 1);
+        let w1 = backward(&g, 1, 2);
         assert!(optimum(&g, &w1, s, (point(-32768), point(0)), 1).is_none());
         assert!(optimum(&g, &w1, s, (point(-6553), point(0)), 1).is_some());
     }
@@ -1682,7 +1686,7 @@ mod tests {
             };
             let lay = layers.clone();
             let g = Graph::from_edges(edges, move |id| lay[id as usize], wins, deadline.as_ref());
-            let w = backward(&g, horizon);
+            let w = backward(&g, horizon, 2);
             // The definition.
             let mut want: Vec<Vec<Option<Region>>> = vec![vec![None; g.len()]; horizon as usize + 1];
             for i in 0..g.len() as u32 {
@@ -1754,9 +1758,9 @@ mod tests {
             let d = dist.clone();
             let g = Graph::from_edges(edges, move |id| d[id as usize], wins, None);
             let Some(start) = g.index(0) else { continue };
-            let w = backward(&g, horizon);
+            let w = backward(&g, horizon, 2);
             let p0 = (r(CIRCLE), r(CIRCLE));
-            let got = reach(&g, &w, start, p0, horizon);
+            let got = reach(&g, &w, start, p0, horizon, 2);
             let mut want = vec![u32::MAX; g.len()];
             let inside = |t: u32, i: u32, p: (u32, u32)| w.at(t, i).is_some_and(|reg| reg.contains(p.0, p.1));
             let mut cur: FxHashSet<(u32, (u32, u32))> = FxHashSet::default();
@@ -1830,8 +1834,8 @@ mod tests {
             let d = dist.clone();
             let g = Graph::from_edges(edges, move |id| d[id as usize], wins, None);
             let Some(start) = g.index(0) else { continue };
-            let w = backward(&g, horizon);
-            let ws: Vec<Winning> = (0..=horizon).map(|h| backward(&g, h)).collect();
+            let w = backward(&g, horizon, 2);
+            let ws: Vec<Winning> = (0..=horizon).map(|h| backward(&g, h, 2)).collect();
             for _ in 0..20 {
                 let p = (r(CIRCLE), point(0));
                 let got = optimum(&g, &w, start, p, horizon).map(|f| f.frame);

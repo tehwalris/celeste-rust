@@ -20,9 +20,10 @@ pub struct BfsStats {
 /// layer f - 1). So iteration i marks exactly the states that win by the
 /// horizon from frame i but not from i+1. Lookups in parallel, inserts
 /// sequential in frontier order: the marks are a function of the graph.
-pub fn bfs(store: &EdgeStore, horizon: u32, seeds: impl IntoIterator<Item = (StateId, u32)>) -> (Marks, BfsStats) {
+/// Lookups on `threads` workers.
+pub fn bfs(store: &EdgeStore, horizon: u32, seeds: impl IntoIterator<Item = (StateId, u32)>, threads: usize) -> (Marks, BfsStats) {
     let t = std::time::Instant::now();
-    let mut marks = Marks::new(crate::storage::geometry());
+    let mut marks = Marks::new(&crate::storage::GEOMETRY);
     let mut frontier: Vec<(StateId, u32)> = Vec::new();
     for (s, layer) in seeds {
         if layer <= horizon && marks.insert(s, horizon, layer) {
@@ -30,7 +31,7 @@ pub fn bfs(store: &EdgeStore, horizon: u32, seeds: impl IntoIterator<Item = (Sta
         }
     }
     let (mut edges_read, mut lookups) = (0u64, 0u64);
-    let workers = crate::frame::threads().max(1);
+    let workers = threads.max(1);
     for i in (1..horizon).rev() {
         let t_it = std::time::Instant::now();
         frontier.sort_unstable();
@@ -101,7 +102,7 @@ mod tests {
         let lids = targets.iter().map(|_| Lid { shape: 0, slot: 0, key: (0, 0) }).collect();
         let owners = targets.iter().map(|&t| std::sync::atomic::AtomicU64::new(pack_owner(crate::storage::id_region(t), crate::storage::id_entry(t)))).collect();
         let u = UnitOut { worker: 0, sources, source_rows: None, lids, owners, requests: Vec::new(), pending: Vec::new(), bufs: Vec::new(), block_at: None, block_len: block.len() as u64, block, xfers: vec![0], starts, edges: packed.len() as u64 };
-        write_file(&file_path(dir, frame, None), frame, &[u], vec![vec![0]]).unwrap();
+        write_file(&file_path(dir, frame, None), frame, &[u], vec![vec![0]], 1).unwrap();
     }
 
     /// A mark's deadline is the last frame it still reaches a win by the
@@ -124,7 +125,7 @@ mod tests {
         let p = crate::search::arc_edges::AxisXfer { lo: 0, hi: crate::search::arcs::CIRCLE, tag: 0, val: 0 };
         xt.merge(Some(&dir), &[vec![(p, p)]]).unwrap();
         let store = EdgeStore::open(&dir, 4).unwrap();
-        let (marks, _) = bfs(&store, 4, [(w, 3)]);
+        let (marks, _) = bfs(&store, 4, [(w, 3)], 2);
         let (ranks, got) = marks.into_ranked();
         let mut want = vec![(a, 1u16, 0u32), (b, 2, 1), (c, 3, 2), (w, 4, 3), (g, 3, 3)];
         want.sort_unstable();

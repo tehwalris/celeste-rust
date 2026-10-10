@@ -714,15 +714,15 @@ mod tests {
         if !std::path::Path::new("lua/celeste-minimal.lua").exists() {
             return;
         }
-        crate::settings::install(crate::settings::Settings { room: (4, 0), ..Default::default() });
-        let src = cart::sources(crate::settings::get()).expect("sources");
+        let s = crate::settings::Settings { room: (4, 0), ..Default::default() };
+        let src = cart::sources(&s).expect("sources");
         let top = full_moon::parse(&src).expect("parse");
         let init = full_moon::parse("_init()").expect("parse _init");
         let reset = full_moon::parse("__reset_button_states()").expect("parse reset");
         let frame = full_moon::parse(cart::FRAME_CODE).expect("parse frame");
         let mut it: Interp<Symbolic> = Interp::new(Symbolic::default());
         let cd = std::sync::Arc::new(celeste_core::cart_data::CartData::load("cart").expect("cart"));
-        let (rx, ry) = crate::game_runner::start_room();
+        let (rx, ry) = s.room;
         it.cache = Some(std::sync::Arc::new(celeste_core::collision_cache::CollisionCache::new(&cd, rx, ry).expect("cache")));
         it.cart = Some(cd);
         let st = cart::fresh_state::<Symbolic>(&mut it.d);

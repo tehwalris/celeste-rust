@@ -11,7 +11,11 @@ use clap::Parser;
 
 #[derive(Parser)]
 #[command(name = "concrete_run")]
-#[command(about = "Run game with specific input sequence")]
+#[command(
+    about = "Run game with specific input sequence",
+    long_about = "Single-lane concrete execution: the reference engine (the interpreter on the traced cart) runs an input sequence from the start room's entry and prints the player's state each frame. The same inputs on a real PICO-8: pico8_diff/replay.py. The settings (--room, the category, --loading-jank, --balloon-seeds, ...) are the shared flags.",
+    after_long_help = "Examples:\n  target/quick/concrete_run -i 42,0,0,0,0,16,2,2,2,2 -f 10\n  target/quick/concrete_run --room 6,2 --hundred --loading-jank 2 --dump-start -i 0"
+)]
 struct Cli {
     /// Comma-separated input bytes (e.g., "52,0,0,0,0,0")
     /// Each byte encodes buttons: bit0=left, bit1=right, bit2=up, bit3=down, bit4=jump, bit5=dash
@@ -174,9 +178,9 @@ fn print_frame(st: &Rt2, frame_num: u32, input_byte: u8) {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    celeste_rust::settings::startup(&cli.settings, |_| {})?;
+    let cfg = celeste_rust::settings::startup(&cli.settings, |_| {})?;
     if cli.dump_start {
-        dump_start(&RefEngine::new()?.initial()?);
+        dump_start(&RefEngine::new(&cfg)?.initial()?);
         return Ok(());
     }
 
@@ -194,7 +198,7 @@ fn main() -> Result<()> {
     println!();
 
     println!("Running game init...");
-    let mut eng = RefEngine::new()?;
+    let mut eng = RefEngine::new(&cfg)?;
     let mut state = eng.initial()?;
     println!("Init complete.\n");
 
@@ -214,4 +218,18 @@ fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    /// The command line is well-formed: no flag defined twice (a
+    /// subcommand's own against the shared settings), every one parseable
+    /// (`clap`'s debug assertions, which a release build skips).
+    #[test]
+    fn the_command_line_is_well_formed() {
+        use clap::CommandFactory;
+        let cmd = super::Cli::command();
+        assert_eq!(celeste_rust::settings::duplicate_flags(&cmd), Vec::<String>::new(), "flags defined twice");
+        cmd.debug_assert();
+    }
 }

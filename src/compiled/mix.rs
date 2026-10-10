@@ -58,28 +58,22 @@ pub(crate) const ROLE_ERROR: u8 = 2;
 pub(crate) const ROLE_LIVE: u8 = 4;
 pub(crate) const ROLE_ARC: u8 = 8;
 
-/// The directory, when on.
-pub(crate) fn dir() -> Option<PathBuf> {
-    crate::settings::get().diag.kernel_mix.clone()
-}
-
-/// `bench-frame --metrics`: the census and the slice counters without
-/// the files (`rewrite bench-frame --metrics`: `kernel_metrics`).
-pub fn metrics_on() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| crate::settings::get().diag.kernel_metrics)
-}
-
 /// One kernel's census (`report`): its static counts, `key -> value`.
 pub type Census = BTreeMap<String, u64>;
 
-/// Every kernel built while on: its symbol, its slice counter, its census.
-static KERNELS: Mutex<Vec<(String, Arc<AtomicU64>, Census)>> = Mutex::new(Vec::new());
+/// A kernel built with the census on (`--kernel-mix`, `bench-frame
+/// --metrics`): its symbol, slice counter, census and report directory.
+type Counted = (String, Arc<AtomicU64>, Census, Option<PathBuf>);
 
-/// A fresh slice counter for kernel `sym`, with its census.
-pub(crate) fn counter(sym: &str, census: Census) -> Arc<AtomicU64> {
+/// Every kernel built with the census on (a process-wide stats sink, like
+/// the dispatch's hit counters).
+static KERNELS: Mutex<Vec<Counted>> = Mutex::new(Vec::new());
+
+/// A fresh slice counter for kernel `sym`, with its census; `dir`: its
+/// `--kernel-mix` directory (`calls.tsv`).
+pub(crate) fn counter(sym: &str, census: Census, dir: Option<PathBuf>) -> Arc<AtomicU64> {
     let c = Arc::new(AtomicU64::new(0));
-    KERNELS.lock().unwrap().push((sym.to_string(), c.clone(), census));
+    KERNELS.lock().unwrap().push((sym.to_string(), c.clone(), census, dir));
     c
 }
 
@@ -87,14 +81,14 @@ pub(crate) fn counter(sym: &str, census: Census) -> Arc<AtomicU64> {
 /// (`insts` the static instruction count: a kernel is straight-line code, so
 /// slices x insts is its dynamic count, call-outs' callees aside), by symbol.
 pub fn kernel_metrics() -> Vec<(String, u64, Census)> {
-    let mut v: Vec<(String, u64, Census)> = KERNELS.lock().unwrap().iter().map(|(s, c, m)| (s.clone(), c.load(Ordering::Relaxed), m.clone())).collect();
+    let mut v: Vec<(String, u64, Census)> = KERNELS.lock().unwrap().iter().map(|(s, c, m, _)| (s.clone(), c.load(Ordering::Relaxed), m.clone())).collect();
     v.sort_by(|a, b| a.0.cmp(&b.0));
     v
 }
 
 /// Zero every kernel's slice counter (a bench's warm-up done).
 pub fn reset_slices() {
-    for (_, c, _) in KERNELS.lock().unwrap().iter() {
+    for (_, c, _, _) in KERNELS.lock().unwrap().iter() {
         c.store(0, Ordering::Relaxed);
     }
 }
@@ -115,15 +109,19 @@ pub(crate) fn op_kind(op: &Op) -> &'static str {
     }
 }
 
-/// `DIR/calls.tsv`: per kernel the slices it ran so far.
+/// `DIR/calls.tsv`, per `--kernel-mix` directory: per kernel built for it,
+/// the slices it ran so far.
 pub(crate) fn write_calls() {
-    let Some(dir) = dir() else { return };
-    let mut out = String::from("sym\tslices\n");
-    for (sym, c, _) in KERNELS.lock().unwrap().iter() {
+    let mut by_dir: BTreeMap<PathBuf, String> = BTreeMap::new();
+    for (sym, c, _, dir) in KERNELS.lock().unwrap().iter() {
+        let Some(dir) = dir else { continue };
+        let out = by_dir.entry(dir.clone()).or_insert_with(|| String::from("sym\tslices\n"));
         writeln!(out, "{sym}\t{}", c.load(Ordering::Relaxed)).unwrap();
     }
-    if let Err(e) = std::fs::write(dir.join("calls.tsv"), out) {
-        eprintln!("[mix] writing calls.tsv: {e}");
+    for (dir, out) in by_dir {
+        if let Err(e) = std::fs::write(dir.join("calls.tsv"), out) {
+            eprintln!("[mix] writing calls.tsv: {e}");
+        }
     }
 }
 
@@ -142,6 +140,10 @@ pub(crate) struct Input<'a> {
     /// Input cell -> its traced path.
     pub names: &'a HashMap<u32, String>,
     pub cart: &'a celeste_core::cart_data::CartData,
+    /// The start room (the spike-fold census's tiles).
+    pub room: (i16, i16),
+    /// `--kernel-mix DIR`: where the report goes (`None`: the census only).
+    pub dir: Option<&'a Path>,
 }
 
 /// A node's role class.
@@ -326,7 +328,7 @@ fn category(mn: &str, ops: &str, kind: &str, node_op: &Op, store_role: &str) -> 
 
 /// One kernel's census and, with `--kernel-mix DIR`, its report.
 pub(crate) fn report(inp: &Input) -> Result<Census> {
-    let dir = dir();
+    let dir = inp.dir;
     if let Some(dir) = &dir {
         std::fs::create_dir_all(dir)?;
     }
@@ -675,7 +677,7 @@ pub(crate) fn report(inp: &Input) -> Result<Census> {
         }
         let reach = match (xr, yr) {
             (Some((x0, x1)), Some((y0, y1))) => {
-                let (rx, ry) = crate::game_runner::start_room();
+                let (rx, ry) = inp.room;
                 let mut any = false;
                 for ty in ((y0 - 16).max(0) / 8)..=((y1 + 16).min(127) / 8) {
                     for tx in ((x0 - 16).max(0) / 8)..=((x1 + 16).min(127) / 8) {
