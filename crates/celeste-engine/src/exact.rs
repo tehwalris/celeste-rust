@@ -170,6 +170,9 @@ pub struct FieldDict {
     num_slots: Vec<NumSlot>,
     /// Numbers held.
     nums: usize,
+    /// While `nums <= SMALL`: the numbers' words and placed bits, searched
+    /// linearly (most fields hold a handful of codes).
+    small: [(u64, u128); SMALL],
     /// Every other code, by search.
     others: Vec<(Code, u32)>,
     /// `Bool(false)`, `Bool(true)`, `UBool`'s indices (`NONE`: absent) and
@@ -181,6 +184,9 @@ pub struct FieldDict {
     runs: Vec<(u8, u8)>,
     bits: u32,
 }
+
+/// Numbers a field searches linearly (`FieldDict::small`).
+const SMALL: usize = 4;
 
 /// A number's slot: its word, index + 1 (0: empty) and placed bits.
 #[derive(Clone, Copy, Default, Debug)]
@@ -235,6 +241,9 @@ impl FieldDict {
     /// A number's PLACED bits (`place` of its index; `None`: absent).
     #[inline]
     pub fn find_num_placed(&self, word: u64) -> Option<u128> {
+        if self.nums <= SMALL {
+            return self.small[..self.nums].iter().find(|s| s.0 == word).map(|s| s.1);
+        }
         self.num_slot(word).map(|s| s.placed)
     }
 
@@ -292,6 +301,9 @@ impl FieldDict {
                     let placed = self.place(idx);
                     Self::put(&mut self.num_slots, c.word(), idx, placed);
                 }
+                if n <= SMALL {
+                    self.small[n - 1] = (c.word(), self.place(idx));
+                }
             }
             K_BOOL => {
                 self.bools[c.a as usize] = idx;
@@ -325,6 +337,11 @@ impl FieldDict {
             let s = self.num_slots[i];
             if s.idx1 != 0 {
                 self.num_slots[i].placed = self.place(s.idx1 - 1);
+            }
+        }
+        if self.nums <= SMALL {
+            for j in 0..self.nums {
+                self.small[j].1 = self.num_slot(self.small[j].0).expect("a small number is in the table").placed;
             }
         }
         for t in 0..3 {
