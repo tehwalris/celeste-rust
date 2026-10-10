@@ -260,6 +260,13 @@ Where the code differs from the design above, and why:
   (`EdgeStore::preds_at`); the graph load streams the blocks unit by unit -
   per SOURCE unit, the pull order - and keeps only edges between marked
   nodes.
+- **Storage regions of 16** (`CELESTE_STORAGE_REGION=16`) are exact too
+  (room (6,2) 100% f0-f57: kept counts, ckhash and pos graph identical to 8)
+  and store 7% less (3.41 against 3.68 B an edge; 2.38M lids against 3.80M
+  at f57), but cost more: `bench-storage` f57, 16 threads, three
+  interleaved reps each, units 1.31-1.33 s against 1.17-1.21 s (the end's
+  counting sort runs over 256 cells a lid), translation 0.21-0.22 against
+  0.16 s (fewer, heavier regions). 8 stays the default.
 - **`bench-storage --phase units|translate|all`** (not dedup|edges): units
   (sinks, edges, blocks), then the translation and the layer, then the edge
   file. Its `f`/`e` lines are `ckhash`'s, comparable with the real tree.
