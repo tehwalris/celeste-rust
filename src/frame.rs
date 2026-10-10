@@ -281,16 +281,26 @@ fn room_is(rt2: &Rt2, (wx, wy): (i16, i16)) -> Result<Vec<bool>> {
     Ok(xs.iter().zip(&ys).map(|(a, b)| *a && *b).collect())
 }
 
-/// Per lane: on the win target? The exit, plus the orb in the orb room.
+/// Per lane: on the win target? The exit, plus the orb in the orb room,
+/// and in a 100% run the room's berry taken.
 pub fn wins_of(rt2: &Rt2) -> Result<Vec<bool>> {
-    use celeste_engine::runtime2::AV;
-    let mut exits = exits_of(rt2)?;
+    let mut wins = reaches_win(rt2)?;
     if crate::game_runner::hundred() {
         // 100%: the exit counts only with this room's berry taken.
-        for (e, b) in exits.iter_mut().zip(got_fruit(rt2)?) {
+        for (e, b) in wins.iter_mut().zip(got_fruit(rt2)?) {
             *e &= b;
         }
     }
+    Ok(wins)
+}
+
+/// Per lane: the win target met, the berry aside (`wins_of` without its
+/// 100% condition): the forward's "first win", whose frame turns on the
+/// not-expanded filter (`not_expanded`) - a 100% exit without the berry is
+/// no win, and is not expanded either.
+pub fn reaches_win(rt2: &Rt2) -> Result<Vec<bool>> {
+    use celeste_engine::runtime2::AV;
+    let exits = exits_of(rt2)?;
     if win_rect().is_some() || !orb_required() {
         return Ok(exits);
     }

@@ -325,12 +325,15 @@ pub struct UnitOut {
     pub pending: Vec<u32>,
     pub bufs: Vec<RowBuf>,
     /// The encoded edges (`edges::encode_block`): in the worker's blocks
-    /// file at `block_at` (the wave's), or here (`block`); its length, its
-    /// index, its edge count.
+    /// file at `block_at` (the wave's), or here (`block`); its length, per
+    /// lid its edges' start, its edge count.
     pub block_at: Option<u64>,
     pub block_len: u64,
     pub block: Vec<u8>,
-    pub index: Vec<(u32, u32)>,
+    /// The unit's transfers by use: an edge's transfer field is its rank
+    /// here, which holds the worker's id.
+    pub xfers: Vec<u32>,
+    pub starts: Vec<u32>,
     pub edges: u64,
 }
 
@@ -425,6 +428,8 @@ pub struct UnitSink<'a> {
     /// The end's counting sort: per lid its edges' start, and the sorted edges.
     sort_at: Vec<u32>,
     sorted: Vec<u64>,
+    /// The end's transfer ranks: per worker id its count, then its rank.
+    xfer_use: Vec<u32>,
     requests: Vec<Request>,
     bufs: Vec<RowBuf>,
     /// Per (lid, cell) the coarser level's verdict (`MarkFilter`), once a unit.
@@ -496,6 +501,7 @@ impl<'a> UnitSink<'a> {
             edges: Vec::new(),
             sort_at: Vec::new(),
             sorted: Vec::new(),
+            xfer_use: Vec::new(),
             requests: Vec::new(),
             bufs: Vec::new(),
             verdicts: Default::default(),
@@ -835,6 +841,30 @@ impl<'a> UnitSink<'a> {
             crate::compiled::asm_kernel::key_check(b);
         }
         self.check.iter_mut().for_each(RowBuf::clear);
+        // The unit's transfers by use (common ones code in a byte): each
+        // edge's transfer field becomes its rank.
+        if self.xfer_use.len() < self.xfer_tab.len() {
+            self.xfer_use.resize(self.xfer_tab.len(), 0);
+        }
+        let mut used: Vec<u32> = Vec::new();
+        for &e in &self.edges {
+            let x = unpack_edge(e).3 as usize;
+            if self.xfer_use[x] == 0 {
+                used.push(x as u32);
+            }
+            self.xfer_use[x] += 1;
+        }
+        used.sort_unstable_by_key(|&x| (std::cmp::Reverse(self.xfer_use[x as usize]), x));
+        for (r, &x) in used.iter().enumerate() {
+            self.xfer_use[x as usize] = r as u32;
+        }
+        let xmask = (1u64 << XFER_BITS) - 1;
+        for e in self.edges.iter_mut() {
+            *e = *e & !xmask | self.xfer_use[(*e & xmask) as usize] as u64;
+        }
+        for &x in &used {
+            self.xfer_use[x as usize] = 0;
+        }
         // By target: a counting sort on the lid (dense in the unit), then
         // each lid's few edges sorted (cell, source, transfer); duplicates go.
         let n = self.lids.len();
@@ -863,7 +893,7 @@ impl<'a> UnitSink<'a> {
             }
         }
         self.sorted.dedup();
-        let (mut block, index) = super::edges::encode_block(&self.sorted);
+        let (mut block, starts) = super::edges::encode_block(&self.sorted, self.lids.len());
         let block_len = block.len() as u64;
         let block_at = match &mut self.blocks {
             Some(w) => {
@@ -886,7 +916,8 @@ impl<'a> UnitSink<'a> {
             block_at,
             block_len,
             block,
-            index,
+            xfers: used,
+            starts,
             edges: self.sorted.len() as u64,
         });
         let t1 = crate::frame::phases::add(crate::frame::phases::END_UNIT, t);

@@ -97,10 +97,10 @@ mod tests {
             .map(|&(s, t)| pack_edge(lid_of(t), crate::storage::id_local(t), sources.iter().position(|&x| x == s).unwrap() as u32, 0))
             .collect();
         packed.sort_unstable();
-        let (block, index) = encode_block(&packed);
+        let (block, starts) = encode_block(&packed, targets.len());
         let lids = targets.iter().map(|_| Lid { shape: 0, slot: 0, key: (0, 0) }).collect();
         let owners = targets.iter().map(|&t| std::sync::atomic::AtomicU64::new(pack_owner(crate::storage::id_region(t), crate::storage::id_entry(t)))).collect();
-        let u = UnitOut { worker: 0, sources, lids, owners, requests: Vec::new(), pending: Vec::new(), bufs: Vec::new(), block_at: None, block_len: block.len() as u64, block, index, edges: packed.len() as u64 };
+        let u = UnitOut { worker: 0, sources, lids, owners, requests: Vec::new(), pending: Vec::new(), bufs: Vec::new(), block_at: None, block_len: block.len() as u64, block, xfers: vec![0], starts, edges: packed.len() as u64 };
         write_file(&file_path(dir, frame, None), frame, &[u], vec![vec![0]]).unwrap();
     }
 

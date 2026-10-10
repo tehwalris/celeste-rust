@@ -21,9 +21,6 @@ use super::unit::UnitOut;
 use super::{id_entry, id_local, id_region, state_id, StateId};
 use crate::search::arc_edges::{decode_pair, encode_pair, Pair, PAIR_BYTES};
 
-/// Edges per index entry of a block.
-const STRIDE: usize = 256;
-
 #[inline]
 fn put_varint(out: &mut Vec<u8>, mut v: u64) {
     while v >= 0x80 {
@@ -48,77 +45,67 @@ fn get_varint(b: &[u8], pos: &mut usize) -> u64 {
     }
 }
 
-/// A unit's edges (`unit::pack_edge`, sorted, distinct) as its block: per
-/// edge varints - a HEAD, `delta << 1 | 1` at a new target (the target code
-/// `lid << 8 | cell` as a delta, then the source in full) or `delta << 1`
-/// (the source's delta, same target) - then the transfer (the worker's id).
-/// An index entry `(target code, offset)` every `STRIDE` edges, where the
-/// deltas restart.
-pub fn encode_block(edges: &[u64]) -> (Vec<u8>, Vec<(u32, u32)>) {
+/// A unit's edges (`unit::pack_edge`, sorted, distinct; the transfer field
+/// the unit's rank of it, `unit::UnitOut::xfers`) as its block, LID BY LID:
+/// per lid its edges from `starts[lid]` (`n_lids + 1` offsets), each edge a
+/// HEAD then the transfer's rank (varints). A lid's first edge: its cell (a
+/// byte) and source; then `src_delta << 1` for the same cell, or
+/// `cell_delta << 1 | 1` and the source for its next cell. A probe for a
+/// target (lid, cell) decodes only its lid's edges. (Room (6,2) 100% f57:
+/// 4.5 B an edge at first, ~3 B with the unit's tables.)
+pub fn encode_block(edges: &[u64], n_lids: usize) -> (Vec<u8>, Vec<u32>) {
     let mut out = Vec::with_capacity(edges.len() * 3);
-    let mut index = Vec::with_capacity(edges.len() / STRIDE + 1);
-    let (mut prev_t, mut prev_s) = (0u32, 0u32);
-    for (k, &e) in edges.iter().enumerate() {
-        let (lid, local, src, x) = super::unit::unpack_edge(e);
-        let t = lid << 8 | local;
-        let fresh = k % STRIDE == 0;
-        if fresh {
-            assert!(out.len() < u32::MAX as usize, "a unit block past 4 GB");
-            index.push((t, out.len() as u32));
-            prev_t = t;
+    let mut starts = Vec::with_capacity(n_lids + 1);
+    let mut k = 0;
+    for lid in 0..n_lids as u32 {
+        assert!(out.len() < u32::MAX as usize, "a unit block past 4 GB");
+        starts.push(out.len() as u32);
+        let (mut prev_c, mut prev_s) = (u32::MAX, 0u32);
+        while k < edges.len() {
+            let (l, local, src, x) = super::unit::unpack_edge(edges[k]);
+            if l != lid {
+                debug_assert!(l > lid, "edges sorted by lid");
+                break;
+            }
+            if prev_c == u32::MAX {
+                out.push(local as u8);
+                put_varint(&mut out, src as u64);
+            } else if local == prev_c {
+                put_varint(&mut out, ((src - prev_s) as u64) << 1);
+            } else {
+                put_varint(&mut out, ((local - prev_c) as u64) << 1 | 1);
+                put_varint(&mut out, src as u64);
+            }
+            put_varint(&mut out, x as u64);
+            (prev_c, prev_s) = (local, src);
+            k += 1;
         }
-        if fresh || t != prev_t {
-            put_varint(&mut out, ((t - prev_t) as u64) << 1 | 1);
-            put_varint(&mut out, src as u64);
-        } else {
-            put_varint(&mut out, ((src - prev_s) as u64) << 1);
-        }
-        put_varint(&mut out, x as u64);
-        prev_t = t;
-        prev_s = src;
     }
-    (out, index)
+    assert_eq!(k, edges.len(), "an edge past the unit's lids");
+    starts.push(out.len() as u32);
+    (out, starts)
 }
 
-/// A block's index: `(target code, offset)` entries, in memory or mapped.
-pub trait BlockIndex {
-    fn len(&self) -> usize;
-    fn get(&self, k: usize) -> (u32, u32);
-}
-
-impl BlockIndex for [(u32, u32)] {
-    fn len(&self) -> usize {
-        <[(u32, u32)]>::len(self)
-    }
-    fn get(&self, k: usize) -> (u32, u32) {
-        self[k]
-    }
-}
-
-/// Decode a block from index entry `blk` on: `f(target code, source,
-/// transfer)` per edge until `f` returns false.
-fn decode_block<I: BlockIndex + ?Sized>(b: &[u8], index: &I, mut blk: usize, mut f: impl FnMut(u32, u32, u32) -> bool) {
-    if blk >= index.len() {
+/// Decode one lid's edges `b` (its slice of the block): `f(cell, source,
+/// transfer rank)` until `f` returns false.
+fn decode_lid(b: &[u8], mut f: impl FnMut(u32, u32, u32) -> bool) {
+    if b.is_empty() {
         return;
     }
-    let (mut prev_t, pos) = index.get(blk);
-    let mut pos = pos as usize;
-    let next = |k: usize| if k < index.len() { index.get(k).1 as usize } else { usize::MAX };
-    let mut next_at = next(blk + 1);
-    let mut prev_s = 0u32;
-    while pos < b.len() {
-        if pos >= next_at {
-            blk += 1;
-            prev_t = index.get(blk).0;
-            next_at = next(blk + 1);
+    let mut pos = 1usize;
+    let mut cell = b[0] as u32;
+    let mut src = get_varint(b, &mut pos) as u32;
+    loop {
+        let x = get_varint(b, &mut pos) as u32;
+        if !f(cell, src, x) || pos >= b.len() {
+            return;
         }
         let head = get_varint(b, &mut pos);
-        let (t, s) = if head & 1 == 1 { (prev_t + (head >> 1) as u32, get_varint(b, &mut pos) as u32) } else { (prev_t, prev_s + (head >> 1) as u32) };
-        let x = get_varint(b, &mut pos) as u32;
-        prev_t = t;
-        prev_s = s;
-        if !f(t, s, x) {
-            return;
+        if head & 1 == 0 {
+            src += (head >> 1) as u32;
+        } else {
+            cell += (head >> 1) as u32;
+            src = get_varint(b, &mut pos) as u32;
         }
     }
 }
@@ -237,15 +224,18 @@ struct UnitHead {
     block: u64,
     block_len: u64,
     edges: u64,
-    /// `(target code, offset)` pairs, u32 each.
-    index: u64,
-    n_index: u32,
+    /// Per lid its edges' first offset in the block, and one past the last
+    /// lid's: `n_lids + 1` u32s.
+    starts: u64,
     /// Per lid its owner `(region, entry)` (u32 each; `unit::NONE`: unused).
     lids: u64,
     n_lids: u32,
     /// `(region, entry, lid)` (u32 each) sorted: the owners named.
     owners: u64,
     n_owners: u32,
+    /// Per transfer rank (the edges' field) its global id, u32 each.
+    xfers: u64,
+    n_xfers: u32,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -254,8 +244,6 @@ struct FileHead {
     units: Vec<UnitHead>,
     /// `(region, unit)`: the units naming an entry of the region, sorted.
     region_units: Vec<(u32, u32)>,
-    /// Per worker, its transfer ids' global ones.
-    remaps: Vec<Vec<u32>>,
 }
 
 /// The edge file of frame `frame` (`raised`: a raise's, by its first seq).
@@ -269,7 +257,8 @@ pub fn file_path(dir: &Path, frame: u32, raised: Option<u32>) -> PathBuf {
 /// One unit's sections of an edge file, built apart (in parallel).
 struct UnitBytes {
     sources: Vec<u8>,
-    index: Vec<u8>,
+    xfers: Vec<u8>,
+    starts: Vec<u8>,
     lids: Vec<u8>,
     owners: Vec<u8>,
     n_owners: u32,
@@ -280,17 +269,21 @@ fn le32(v: &mut Vec<u8>, x: u32) {
     v.extend_from_slice(&x.to_le_bytes());
 }
 
-/// Unit `u`'s sections: its sources, index, lid owners by lid and sorted by
-/// owner, the regions it names.
-fn unit_bytes(u: &UnitOut, frame: u32) -> Result<UnitBytes> {
+/// Unit `u`'s sections: its sources, transfers (global ids, through its
+/// worker's `remap`), index, lid owners by lid and sorted by owner, the
+/// regions it names.
+fn unit_bytes(u: &UnitOut, remap: &[u32], frame: u32) -> Result<UnitBytes> {
     let mut sources = Vec::with_capacity(8 * u.sources.len());
     for s in &u.sources {
         sources.extend_from_slice(&s.to_le_bytes());
     }
-    let mut index = Vec::with_capacity(8 * u.index.len());
-    for &(t, o) in &u.index {
-        le32(&mut index, t);
-        le32(&mut index, o);
+    let mut xfers = Vec::with_capacity(4 * u.xfers.len());
+    for &x in &u.xfers {
+        le32(&mut xfers, remap[x as usize]);
+    }
+    let mut starts = Vec::with_capacity(4 * u.starts.len());
+    for &o in &u.starts {
+        le32(&mut starts, o);
     }
     let mut lids = Vec::with_capacity(8 * u.lids.len());
     let mut owned: Vec<(u32, u32, u32)> = Vec::new();
@@ -317,7 +310,7 @@ fn unit_bytes(u: &UnitOut, frame: u32) -> Result<UnitBytes> {
             regions.push(r);
         }
     }
-    Ok(UnitBytes { sources, index, lids, owners, n_owners: owned.len() as u32, regions })
+    Ok(UnitBytes { sources, xfers, starts, lids, owners, n_owners: owned.len() as u32, regions })
 }
 
 /// Write frame `frame`'s edge file from its units (owners resolved) and
@@ -326,7 +319,7 @@ fn unit_bytes(u: &UnitOut, frame: u32) -> Result<UnitBytes> {
 pub fn write_file(path: &Path, frame: u32, outs: &[UnitOut], remaps: Vec<Vec<u32>>) -> Result<u64> {
     use std::os::unix::fs::FileExt;
     let threads = crate::frame::threads();
-    let bytes: Vec<UnitBytes> = super::wave::par_map(outs, threads, |u| unit_bytes(u, frame)).into_iter().collect::<Result<_>>()?;
+    let bytes: Vec<UnitBytes> = super::wave::par_map(outs, threads, |u| unit_bytes(u, &remaps[u.worker as usize], frame)).into_iter().collect::<Result<_>>()?;
     // The data region's layout: per unit its sections, in unit order.
     let mut units = Vec::with_capacity(outs.len());
     let mut region_units: Vec<(u32, u32)> = Vec::new();
@@ -348,17 +341,18 @@ pub fn write_file(path: &Path, frame: u32, outs: &[UnitOut], remaps: Vec<Vec<u32
             },
             block_len: u.block_len,
             edges: u.edges,
-            index: place(b.index.len()),
-            n_index: u.index.len() as u32,
+            starts: place(b.starts.len()),
             lids: place(b.lids.len()),
             n_lids: u.lids.len() as u32,
             owners: place(b.owners.len()),
             n_owners: b.n_owners,
+            xfers: place(b.xfers.len()),
+            n_xfers: u.xfers.len() as u32,
         });
         region_units.extend(b.regions.iter().map(|&r| (r, ui as u32)));
     }
     region_units.sort_unstable();
-    let head = bincode::serialize(&FileHead { frame, units, region_units, remaps }).context("serializing an edge file header")?;
+    let head = bincode::serialize(&FileHead { frame, units, region_units }).context("serializing an edge file header")?;
     let base = 16 + head.len() as u64;
     std::fs::create_dir_all(path.parent().expect("an edges dir"))?;
     let tmp = path.with_extension("tmp");
@@ -377,9 +371,10 @@ pub fn write_file(path: &Path, frame: u32, outs: &[UnitOut], remaps: Vec<Vec<u32
         if h.inline {
             file.write_all_at(&u.block, base + h.block)?;
         }
-        file.write_all_at(&b.index, base + h.index)?;
+        file.write_all_at(&b.starts, base + h.starts)?;
         file.write_all_at(&b.lids, base + h.lids)?;
         file.write_all_at(&b.owners, base + h.owners)?;
+        file.write_all_at(&b.xfers, base + h.xfers)?;
         Ok(())
     })
     .into_iter()
@@ -442,13 +437,19 @@ impl EdgeFile {
         u64::from_le_bytes(self.map[o..o + 8].try_into().unwrap())
     }
 
-    fn block<'b>(&'b self, u: &'b UnitHead) -> (&'b [u8], MappedIndex<'b>) {
-        let b = if u.inline {
+    fn block<'b>(&'b self, u: &'b UnitHead) -> &'b [u8] {
+        if u.inline {
             &self.map[self.data + u.block as usize..self.data + (u.block + u.block_len) as usize]
         } else {
             &self.blocks[u.worker as usize].as_ref().expect("mapped at open")[u.block as usize..(u.block + u.block_len) as usize]
-        };
-        (b, MappedIndex { file: self, u })
+        }
+    }
+
+    /// Lid `lid`'s edges in unit `u`'s block.
+    #[inline]
+    fn lid_edges<'b>(&'b self, u: &'b UnitHead, block: &'b [u8], lid: u32) -> &'b [u8] {
+        let (a, b) = (self.u32_at(u.starts, lid as usize), self.u32_at(u.starts, lid as usize + 1));
+        &block[a as usize..b as usize]
     }
 
     /// Unit `u`'s lid naming `(region, entry)`.
@@ -472,21 +473,6 @@ impl EdgeFile {
         let lo = ru.partition_point(|e| e.0 < region);
         let hi = ru.partition_point(|e| e.0 <= region);
         &ru[lo..hi]
-    }
-}
-
-/// A unit's block index, read in place.
-struct MappedIndex<'a> {
-    file: &'a EdgeFile,
-    u: &'a UnitHead,
-}
-
-impl BlockIndex for MappedIndex<'_> {
-    fn len(&self) -> usize {
-        self.u.n_index as usize
-    }
-    fn get(&self, k: usize) -> (u32, u32) {
-        (self.file.u32_at(self.u.index, 2 * k), self.file.u32_at(self.u.index, 2 * k + 1))
     }
 }
 
@@ -560,25 +546,12 @@ impl EdgeStore {
             for &(_, ui) in file.units_of(region) {
                 let u = &file.head.units[ui as usize];
                 let Some(lid) = file.lid_of(u, region, entry) else { continue };
-                let code = lid << 8 | local;
-                let (b, index) = file.block(u);
-                // The last index entry starting below the code (or the next).
-                let (mut lo, mut hi) = (0usize, index.len());
-                while lo < hi {
-                    let mid = (lo + hi) / 2;
-                    if index.get(mid).0 < code {
-                        lo = mid + 1;
-                    } else {
-                        hi = mid;
+                let block = file.block(u);
+                decode_lid(file.lid_edges(u, block, lid), |c, s, x| {
+                    if c == local {
+                        out.push(InEdge { src: file.source(u, s), xfer: file.u32_at(u.xfers, x as usize) });
                     }
-                }
-                let k = lo;
-                let remap = &file.head.remaps[u.worker as usize];
-                decode_block(b, &index, k.saturating_sub(1), |t, s, x| {
-                    if t == code {
-                        out.push(InEdge { src: file.source(u, s), xfer: remap[x as usize] });
-                    }
-                    t <= code
+                    c <= local
                 });
             }
         }
@@ -588,14 +561,14 @@ impl EdgeStore {
     pub fn scan(&self, frame: u32, mut f: impl FnMut(Edge)) {
         for file in self.frames.get(frame as usize).into_iter().flatten() {
             for u in &file.head.units {
-                let remap = &file.head.remaps[u.worker as usize];
-                let (b, index) = file.block(u);
-                decode_block(b, &index, 0, |t, s, x| {
-                    let lid = (t >> 8) as usize;
-                    let (region, entry) = (file.u32_at(u.lids, 2 * lid), file.u32_at(u.lids, 2 * lid + 1));
-                    f(Edge { src: file.source(u, s), dst: state_id(region, entry, t & 0xff), xfer: remap[x as usize] });
-                    true
-                });
+                let block = file.block(u);
+                for lid in 0..u.n_lids {
+                    let (region, entry) = (file.u32_at(u.lids, 2 * lid as usize), file.u32_at(u.lids, 2 * lid as usize + 1));
+                    decode_lid(file.lid_edges(u, block, lid), |c, s, x| {
+                        f(Edge { src: file.source(u, s), dst: state_id(region, entry, c), xfer: file.u32_at(u.xfers, x as usize) });
+                        true
+                    });
+                }
             }
         }
     }
@@ -616,7 +589,7 @@ impl EdgeStore {
     pub fn unit(&self, (frame, file, unit): (u32, u32, u32)) -> UnitView<'_> {
         let file = &self.frames[frame as usize][file as usize];
         let u = &file.head.units[unit as usize];
-        UnitView { file, u, remap: &file.head.remaps[u.worker as usize] }
+        UnitView { file, u }
     }
 
     /// `scan` as a list.
@@ -631,7 +604,6 @@ impl EdgeStore {
 pub struct UnitView<'a> {
     file: &'a EdgeFile,
     u: &'a UnitHead,
-    remap: &'a [u32],
 }
 
 impl UnitView<'_> {
@@ -660,11 +632,13 @@ impl UnitView<'_> {
 
     /// Every edge, by target: `f(lid, cell, source, global transfer)`.
     pub fn edges(&self, mut f: impl FnMut(u32, u32, u32, u32)) {
-        let (b, index) = self.file.block(self.u);
-        decode_block(b, &index, 0, |t, s, x| {
-            f(t >> 8, t & 0xff, s, self.remap[x as usize]);
-            true
-        });
+        let block = self.file.block(self.u);
+        for lid in 0..self.u.n_lids {
+            decode_lid(self.file.lid_edges(self.u, block, lid), |c, s, x| {
+                f(lid, c, s, self.file.u32_at(self.u.xfers, x as usize));
+                true
+            });
+        }
     }
 }
 
@@ -705,7 +679,7 @@ mod tests {
     fn unit(worker: u32, sources: Vec<StateId>, lids: Vec<(u32, u32)>, mut edges: Vec<u64>) -> UnitOut {
         edges.sort_unstable();
         edges.dedup();
-        let (block, index) = encode_block(&edges);
+        let (block, starts) = encode_block(&edges, lids.len());
         UnitOut {
             block_at: None,
             block_len: block.len() as u64,
@@ -717,9 +691,39 @@ mod tests {
             pending: Vec::new(),
             bufs: Vec::new(),
             block,
-            index,
+            // The ranks are the worker's ids here.
+            xfers: (0..=edges.iter().map(|&e| super::super::unit::unpack_edge(e).3).max().unwrap_or(0)).collect(),
+            starts,
             edges: edges.len() as u64,
         }
+    }
+
+    /// A block decodes, lid by lid, to the edges encoded, in order: same
+    /// cells (source deltas), next cells, lids without edges.
+    #[test]
+    fn blocks_round_trip_lid_by_lid() {
+        let mut v = 0x9e37_79b9_7f4a_7c15u64;
+        let mut edges: Vec<u64> = (0..5000)
+            .map(|_| {
+                v = v.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                let lid = (v >> 40) as u32 % 700;
+                let local = (v >> 20) as u32 % 64;
+                pack_edge(lid, local, (v >> 8) as u32 % 4096, (v >> 4) as u32 % 300)
+            })
+            .collect();
+        edges.sort_unstable();
+        edges.dedup();
+        let (b, starts) = encode_block(&edges, 703);
+        assert_eq!(starts.len(), 704);
+        let want: Vec<(u32, u32, u32, u32)> = edges.iter().map(|&e| super::super::unit::unpack_edge(e)).collect();
+        let mut got = Vec::new();
+        for lid in 0..703u32 {
+            decode_lid(&b[starts[lid as usize] as usize..starts[lid as usize + 1] as usize], |c, s, x| {
+                got.push((lid, c, s, x));
+                true
+            });
+        }
+        assert_eq!(got, want);
     }
 
     /// A target's in-edges come back from every unit naming it, across

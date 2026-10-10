@@ -318,7 +318,7 @@ pub fn run_wave(engine: &dyn FrameStep, frontier: Vec<Block>, cx: WaveCtx) -> Re
     st.lanes_kept = new_states.len();
     let mut won = false;
     for b in &next {
-        won |= b.wins()?.iter().any(|&w| w);
+        won |= crate::frame::reaches_win(b.rt2())?.iter().any(|&w| w);
     }
     if let (Some(dir), Some(path)) = (edges_dir, &index_path) {
         let remaps = xfers.merge(Some(dir), &tables)?;
