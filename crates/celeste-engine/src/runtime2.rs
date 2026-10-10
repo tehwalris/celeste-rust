@@ -100,7 +100,6 @@ pub struct BoundaryIds {
     pub g_room: u32,
     /// `max_djump`: 2 once the orb is taken (`frame::wins_of`).
     pub g_max_djump: u32,
-    pub g_timers: Vec<u32>, // frames, seconds, minutes, deaths
     pub f_type: u32,
     pub f_rem: u32,
     pub f_spd: u32,
@@ -330,18 +329,6 @@ impl Rt2 {
             }
         }
         found
-    }
-
-    pub fn mark_walk(&self, ids: &BoundaryIds) -> (Vec<u32>, Vec<u32>) {
-        let mut rem_cells = Vec::new();
-        let mut det_cells = Vec::new();
-        for obj in self.player_objects(ids) {
-            rem_cells.extend(self.xy_cells_of(obj, ids.f_rem, ids));
-            if let Some(c) = self.obj_field_cell(obj, ids.f_dash_effect_time) {
-                det_cells.push(c);
-            }
-        }
-        (rem_cells, det_cells)
     }
 
     /// The `x`/`y` cells of the table at `obj`'s field `f` (rem, spd).

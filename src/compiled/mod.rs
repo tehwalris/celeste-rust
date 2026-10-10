@@ -23,7 +23,6 @@ pub(crate) fn boundary_ids() -> runtime2::BoundaryIds {
         g_player_spawn: g("player_spawn"),
         g_room: g("room"),
         g_max_djump: g("max_djump"),
-        g_timers: ["frames", "seconds", "minutes", "deaths"].iter().map(|n| g(n)).collect(),
         f_type: f("type"),
         f_rem: f("rem"),
         f_spd: f("spd"),

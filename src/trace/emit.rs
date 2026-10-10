@@ -46,9 +46,9 @@ pub struct FrameOutcome {
     pub outputs: Vec<(u32, NodeId, &'static str)>,
     pub live: NodeId,
     pub error: NodeId,
-    /// Cells `Rt2::boundary` widens to a UNIFORM value at level 0 (rem x/y ->
-    /// [-0.5, 0.5); timer globals -> 0), with that value. The key emitter
-    /// mirrors the boundary (`OutField::widen_uniform`).
+    /// Fields stored as the UNKNOWN NUMBER (uniform, but no graph constant
+    /// `konst_av` could find), with that value: off the key's per-lane fold
+    /// (`OutField::widen_uniform`).
     pub widen: Vec<(u32, celeste_engine::runtime2::AV)>,
     /// The transfer roots (`verify::FrameOut::arc`; empty but at level 0),
     /// after `live` in a body's roots, and whether the outcome has a player
@@ -182,16 +182,7 @@ pub fn bind(f: &crate::trace::verify::Frame, g: &Graph) -> Result<Bound> {
         }
     }
 
-    // Level-0 boundary WIDENINGS that make a cell UNIFORM (rem -> [-0.5, 0.5);
-    // timer globals -> 0). The kernel key must take these from the constant
-    // KPART, off the per-lane fold, exactly as `Rt2::boundary` does, or the
-    // keys disagree. Found with the boundary's OWN walk (`mark_walk`,
-    // `g_timers`) on each outcome's structure, so the two cannot drift.
     use celeste_engine::runtime2::AV;
-    let ids = crate::compiled::boundary_ids();
-    let half = celeste_core::pico8_num::Pico8Num::from_parts(0, 0x8000);
-    let rem_ival = AV::Ival(-half, half.next_smallest());
-    let zero = celeste_core::pico8_num::Pico8Num::from_i16(0);
     let mut at = 0usize;
     let mut outcomes = Vec::new();
     for (oi, o) in f.outs.iter().enumerate() {
@@ -204,20 +195,12 @@ pub fn bind(f: &crate::trace::verify::Frame, g: &Graph) -> Result<Bound> {
                 (o.cells[i], roots[at + i], *ty)
             })
             .collect();
-        let mut widen: Vec<(u32, AV)> = Vec::new();
-        let (rem_cells, _det_cells) = o.rt2.mark_walk(&ids);
-        for c in rem_cells {
-            widen.push((c, rem_ival));
-        }
-        for &tg in &ids.g_timers {
-            let cell = o.rt2.globals[tg as usize];
-            if (cell as usize) < o.rt2.structure.len() {
-                widen.push((cell, AV::Num(zero)));
-            }
-        }
         // The unknown numbers, uniform, off the per-lane key fold. (Unknown
         // BOOLEANS are not fields at all: `verify::out_fields` stores them
-        // uniform.)
+        // uniform. A widening that stores a constant - the remainder's
+        // interval, a dead timer's 0 - is a constant node in every body,
+        // which `lower::lower_outcomes` finds as the field's `konst_av`.)
+        let mut widen: Vec<(u32, AV)> = Vec::new();
         for (i, u) in unknown_fields[oi].iter().enumerate() {
             if *u {
                 widen.push((o.cells[i], AV::UNum));

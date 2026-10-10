@@ -40,10 +40,10 @@ pub(crate) struct OutField {
     pub(crate) ty: &'static str,
     /// The graph node this cell ends the frame holding.
     pub(crate) node: NodeId,
-    /// Set when `Rt2::boundary` widens this cell to a uniform value. The key
-    /// must then take the widened value from the constant key prefix, so the
-    /// field is excluded from the per-lane fold, or the folded key disagrees
-    /// with `b.row_keys`.
+    /// Set for a field stored as a uniform value no graph constant names (the
+    /// unknown number). The key must then take it from the constant key
+    /// prefix, so the field is excluded from the per-lane fold, or the folded
+    /// key disagrees with `b.row_keys`.
     pub(crate) widen_uniform: Option<celeste_engine::runtime2::AV>,
     /// The `AV` this cell holds in every row, when every body of the outcome
     /// writes the same compile-time constant (`lower::lower_outcomes`). Written
