@@ -127,20 +127,22 @@ Built: wrapped. Compared with N2's halo numbers on the same capture
 (`bench-storage`), reported in PROGRESS.md with both numbers.
 
 **The edge file** `edges/f{frame}.bin` (raised frames add
-`f{frame}.r{n}.bin`): a header; per unit its worker, its source ids
-(the frontier rows it ran, in lane order), its block (edges grouped by
-target (lid, cell): a varint head per edge, the source as a lane index,
-the transfer as the worker's id; an index entry every 256 edges), its lid
-table by lid (owner region, entry) and the same sorted by owner (the
-reverse translation); per target region the units naming it; per worker the
-transfer remap into the global table `edges/x{frame}.bin` (that frame's new
-pairs, sorted; a pair's global id is its position across the files).
+`f{frame}.r{n}.bin`): a header; per unit its worker, its sources (the
+frontier rows it ran, in lane order: a row range of the previous layer's
+frame file when the unit's block was whole, explicit ids otherwise), its
+block (edges lid by lid with per-lid starts: a cell byte, varint source
+deltas, the transfer's rank in the unit) and its ranks' global transfer
+ids; per file the OWNER INDEX `(region, entry, unit, lid)` sorted - every
+unit's translation table at once, the reverse walk; a unit's owners by
+lid are derived from it when read (`EdgeStore::owners`, per frame). The
+transfers: one table for the tree, `edges/xfer.bin` (each wave appends its
+new pairs sorted; a pair's global id is its position).
 
 **The backward.** `storage::edges::EdgeStore` answers:
-- `preds_at(target, frame)`: the units naming the target's region, in each
-  the lid of its (region, entry) (binary search of the owner-sorted table),
-  in its block the target's (lid, cell) (index, then decode): sources and
-  global transfers. This IS the reverse walk through the translation
+- `preds_at(target, frame)`: the owner index's entries of the target's
+  (region, entry) (a binary search), each a (unit, lid); in that unit's
+  block the lid's edges at the target's cell: sources and global
+  transfers. This IS the reverse walk through the translation
   tables; no inversion exists.
 - `scan(frame)`: every edge of the frame, block by block (arc-check, ckhash
   `--edges`, the edge census, and the streaming graph load below).
@@ -279,3 +281,12 @@ arc-check at r0sx and r0sxhn; 3 vs 32 threads and a resume identical
 (states and edge content); `gates/raise.sh`; the ignored tests; end to end
 room (1,0) `--ceiling 99`, (6,2) 100% `r0sxhf,r0sxh --ceiling 94` and (4,2)
 `r0sxhn,r0sxh --ceiling 71`: the same optima, witnesses and `[gate]` counts.
+
+**Where the trees are bigger** (room (1,0) h99: 52-53 GB against fg-2300's
+46; (6,2) 100% h94: 70-71 against 66): the lids' tables, 24 B a lid (owner
+by lid 8 B, the owner index 16 B; 243M lids, 5.8 GB, in (1,0)), and the
+units' explicit source ids (8 B a frontier row; 1.6 GB). The edges
+themselves are ~3.5 B, as the runs were. Since: the owner by lid derived
+from the owner index when read (`EdgeStore::owners`, 0.4 s a graph-load
+pass in (1,0)), sources a row range of the previous layer's frame file
+where the unit's block was whole: (1,0) 50 GB, (6,2) 67 GB.

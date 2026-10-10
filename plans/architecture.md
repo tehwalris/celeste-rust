@@ -325,10 +325,11 @@ kernel. An edge recorded at frame f leaves a state of layer f - 1.
   (a raise adds `f{frame}.r{seq}.bin`), and per worker its blocks file
   `f{frame}.w{n}.blk`. Per unit: its sources (ids), its BLOCK - its edges
   lid by lid (a cell byte, varint source deltas, the transfer's rank in the
-  unit; ~3.7 B an edge with the tables, room (6,2) 100% f57) with per lid
-  its start - its lids' owners by lid (the translation table), its transfer
-  ranks' global ids; and per file the OWNER INDEX, `(region, entry, unit,
-  lid)` sorted: the translation tables inverted, the REVERSE WALK. The transfers: ONE table for the tree,
+  unit) with per lid its start, its transfer ranks' global ids; its
+  sources a row range of the previous layer's frame file when its block
+  was whole. Per file the OWNER INDEX, `(region, entry, unit, lid)`
+  sorted: the translation tables, the REVERSE WALK (a unit's owners by lid
+  are derived from it when read). The transfers: ONE table for the tree,
   `edges/xfer.bin`, content-canonical (each wave appends its new pairs in
   value order).
 - **`EdgeStore`**: `preds_at(target, frame)` - the owner index's entries of

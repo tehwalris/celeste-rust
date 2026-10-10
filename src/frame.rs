@@ -74,6 +74,9 @@ pub struct Block {
     seq: u32,
     /// Lanes the frame step must not expand (a mask, so ids stay consecutive).
     skip: Vec<bool>,
+    /// Is it its layer's file `seq` row for row (a unit's sources are then
+    /// stored as a row range of it, `storage::edges`)?
+    whole: bool,
 }
 
 impl Block {
@@ -86,7 +89,7 @@ impl Block {
             rt2.row_keys.len(),
             rt2.width
         );
-        Block { rt2, ids: Vec::new(), seq: 0, skip: Vec::new() }
+        Block { rt2, ids: Vec::new(), seq: 0, skip: Vec::new(), whole: false }
     }
 
     /// A reference-engine block keyed as the level's kernels key it (held
@@ -96,7 +99,7 @@ impl Block {
         let (_, keys, _) = widened_keys_rt2(&rt2, level)?;
         rt2.row_keys_canonical(crate::compiled::ids());
         rt2.row_keys = keys;
-        Ok(Block { rt2, ids: Vec::new(), seq: 0, skip: Vec::new() })
+        Ok(Block { rt2, ids: Vec::new(), seq: 0, skip: Vec::new(), whole: false })
     }
 
     pub fn into_rt2(self) -> Rt2 {
@@ -138,6 +141,7 @@ impl Block {
             return None;
         }
         self.rt2.retain_lanes(&keep);
+        self.whole = false;
         if !self.ids.is_empty() {
             self.ids = keep.iter().map(|&i| self.ids[i as usize]).collect();
         }
@@ -164,6 +168,18 @@ impl Block {
         b.ids = ids;
         b.seq = seq;
         b
+    }
+
+    /// A layer's file `seq`, row for row (`whole`).
+    pub fn layer_piece(rt2: Rt2, ids: Vec<u64>, seq: u32) -> Self {
+        let mut b = Block::with_ids(rt2, ids, seq);
+        b.whole = true;
+        b
+    }
+
+    /// Is it its layer's file `seq` row for row?
+    pub fn is_whole(&self) -> bool {
+        self.whole
     }
 
     /// The rows' ids (empty if the block is not a layer's piece).
@@ -1459,7 +1475,7 @@ pub fn load_frame(dir: &std::path::Path, frame: u32) -> Result<Vec<Block>> {
     let mut out = Vec::new();
     for (seq, file) in frame_files(dir, frame)? {
         if let Some(rt2) = file.load_all()? {
-            out.push(Block::with_ids(rt2, file.ids(), seq));
+            out.push(Block::layer_piece(rt2, file.ids(), seq));
         }
     }
     Ok(out)
@@ -1902,7 +1918,7 @@ mod tests {
             let visited = crate::storage::visited::VisitedSet::new(*crate::storage::geometry());
             let claims = crate::storage::unit::Claims::default();
             let mut sink = crate::storage::unit::UnitSink::new(&visited, &claims, Filters::default(), 1, 0, false, false, None, None);
-            sink.begin(0, 0, 0, &[0], None, false);
+            sink.begin(0, 0, 0, &[0], None, None, false);
             crate::compiled::dispatch::run_chunk_kernel(r, &cells, &[0], &mut sink)
         };
         let px = |n: i16| P8::from_i16(n);
@@ -1964,7 +1980,7 @@ mod tests {
             let visited = crate::storage::visited::VisitedSet::new(*crate::storage::geometry());
             let claims = crate::storage::unit::Claims::default();
             let mut sink = crate::storage::unit::UnitSink::new(&visited, &claims, Filters::default(), 1, 0, false, false, None, None);
-            sink.begin(0, 0, 0, &[0], None, false);
+            sink.begin(0, 0, 0, &[0], None, None, false);
             crate::compiled::dispatch::run_chunk_kernel(r, &cells, &[0], &mut sink)
         };
         let px = |n: i16| P8::from_i16(n);

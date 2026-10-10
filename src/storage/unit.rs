@@ -320,8 +320,11 @@ pub struct Request {
 pub struct UnitOut {
     pub worker: u32,
     /// The frontier rows the unit ran, by lane from its first (edges name a
-    /// source by its index here).
+    /// source by its index here); and where they are rows `first..` of the
+    /// previous layer's file `seq`, `(seq, first)` (the edge file stores
+    /// that instead of the ids).
     pub sources: Vec<StateId>,
+    pub source_rows: Option<(u32, u32)>,
     pub lids: Vec<Lid>,
     /// Per lid its owner (`pack_owner`, `NO_OWNER`): set once, by the
     /// translation's worker of the lid's region where the visited set had
@@ -420,6 +423,7 @@ pub struct UnitSink<'a> {
     block: u32,
     lo: usize,
     sources: Vec<StateId>,
+    source_rows: Option<(u32, u32)>,
     /// Are the unit's sources the tree's (a raise; not the raise's own)?
     pub sources_old: bool,
     /// Lanes of the block being run that must not be expanded.
@@ -507,6 +511,7 @@ impl<'a> UnitSink<'a> {
             block: 0,
             lo: 0,
             sources: Vec::new(),
+            source_rows: None,
             sources_old: false,
             skip_in: None,
             lids: Vec::new(),
@@ -557,8 +562,10 @@ impl<'a> UnitSink<'a> {
     }
 
     /// Start unit `unit` of the wave: lanes `lo..lo + sources.len()` of
-    /// frontier block `block`.
-    pub fn begin(&mut self, unit: u32, block: u32, lo: usize, sources: &[StateId], skip: Option<&'a [bool]>, sources_old: bool) {
+    /// frontier block `block` (`rows`: rows `(seq, first)..` of the previous
+    /// layer's file `seq`, when the block is that file).
+    #[allow(clippy::too_many_arguments)]
+    pub fn begin(&mut self, unit: u32, block: u32, lo: usize, sources: &[StateId], rows: Option<(u32, u32)>, skip: Option<&'a [bool]>, sources_old: bool) {
         assert!(sources.len() <= MAX_UNIT_LANES, "a unit of {} lanes: at most {MAX_UNIT_LANES}", sources.len());
         if let Some(c) = &mut self.capture {
             c.unit(unit, block, lo, sources, sources_old);
@@ -567,6 +574,7 @@ impl<'a> UnitSink<'a> {
         self.lo = lo;
         self.sources.clear();
         self.sources.extend_from_slice(sources);
+        self.source_rows = rows;
         self.skip_in = skip;
         self.sources_old = sources_old;
         self.lids.clear();
@@ -963,6 +971,7 @@ impl<'a> UnitSink<'a> {
         self.outs.push(UnitOut {
             worker: self.worker,
             sources: std::mem::take(&mut self.sources),
+            source_rows: self.source_rows,
             lids: std::mem::replace(&mut self.lids, Vec::with_capacity(n)),
             owners: self.lid_owners.drain(..).map(|o| std::sync::atomic::AtomicU64::new(if o == PENDING { NO_OWNER } else { o })).collect(),
             requests: std::mem::replace(&mut self.requests, Vec::with_capacity(n_requests)),

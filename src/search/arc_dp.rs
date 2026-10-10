@@ -296,9 +296,22 @@ pub fn load(dir: &std::path::Path, horizon: u32) -> anyhow::Result<Loaded> {
     // no probe per node and frame): `f(src, dst, xfer)` per edge whose source
     // and target are both nodes. A unit with no node among its sources is
     // skipped whole; a lid's region ranks are looked up once a unit.
-    let units = eg.units();
-    let each_edge = |k: usize, f: &mut dyn FnMut(u32, u32, u32)| -> anyhow::Result<()> {
-        let u = eg.unit(units[k]);
+    // A frame at a time: its lids' owners (`EdgeStore::owners`) held while
+    // its units are read, in parallel.
+    let each_unit = |f: &(dyn Fn(&crate::storage::edges::UnitView) -> anyhow::Result<()> + Sync)| -> anyhow::Result<()> {
+        for frame in 1..=horizon {
+            let owners = eg.owners(frame);
+            let units = eg.units(frame);
+            par_chunks(units.len(), |lo, hi| {
+                for &(fi, ui) in &units[lo..hi] {
+                    f(&eg.unit(frame, &owners, fi, ui))?;
+                }
+                Ok(())
+            })?;
+        }
+        Ok(())
+    };
+    let each_edge = |u: &crate::storage::edges::UnitView, f: &mut dyn FnMut(u32, u32, u32)| -> anyhow::Result<()> {
         let src: Vec<Option<u32>> = (0..u.n_sources() as u32).map(|s| ranks.rank(u.source(s))).collect();
         if src.iter().all(Option::is_none) {
             return Ok(());
@@ -323,14 +336,11 @@ pub fn load(dir: &std::path::Path, horizon: u32) -> anyhow::Result<Loaded> {
     let t1 = std::time::Instant::now();
     let out_deg: Vec<AtomicU64> = (0..n).map(|_| AtomicU64::new(0)).collect();
     let in_deg: Vec<AtomicU64> = (0..n).map(|_| AtomicU64::new(0)).collect();
-    par_chunks(units.len(), |lo, hi| {
-        for k in lo..hi {
-            each_edge(k, &mut |s, d, _| {
-                out_deg[s as usize].fetch_add(1, Relaxed);
-                in_deg[d as usize].fetch_add(1, Relaxed);
-            })?;
-        }
-        Ok(())
+    each_unit(&|u| {
+        each_edge(u, &mut |s, d, _| {
+            out_deg[s as usize].fetch_add(1, Relaxed);
+            in_deg[d as usize].fetch_add(1, Relaxed);
+        })
     })?;
     let prefix = |deg: &mut dyn Iterator<Item = u64>| -> Vec<u64> {
         let mut at = Vec::with_capacity(n + 1);
@@ -354,22 +364,19 @@ pub fn load(dir: &std::path::Path, horizon: u32) -> anyhow::Result<Loaded> {
         let out_cursor: Vec<AtomicU64> = out_at[..n].iter().map(|&a| AtomicU64::new(a)).collect();
         let pred_cursor: Vec<AtomicU64> = pred_at[..n].iter().map(|&a| AtomicU64::new(a)).collect();
         let (preds_ptr, out_ptr) = (preds.as_mut_ptr() as usize, out.as_mut_ptr() as usize);
-        par_chunks(units.len(), |lo, hi| {
-            for k in lo..hi {
-                each_edge(k, &mut |s, d, xfer| {
-                    let slot = out_cursor[s as usize].fetch_add(1, Relaxed);
-                    let at = pred_cursor[d as usize].fetch_add(1, Relaxed);
-                    assert!(at < pred_at[d as usize + 1] && slot < out_at[s as usize + 1], "the edge fill pass disagrees with the count");
-                    // SAFETY: `slot` and `at` were each claimed once, by
-                    // their atomic cursors, from their node's range; both
-                    // are below `edges`.
-                    unsafe {
-                        (preds_ptr as *mut u32).add(at as usize).write(s);
-                        (out_ptr as *mut Out).add(slot as usize).write(Out { dst: d, xfer });
-                    }
-                })?;
-            }
-            Ok(())
+        each_unit(&|u| {
+            each_edge(u, &mut |s, d, xfer| {
+                let slot = out_cursor[s as usize].fetch_add(1, Relaxed);
+                let at = pred_cursor[d as usize].fetch_add(1, Relaxed);
+                assert!(at < pred_at[d as usize + 1] && slot < out_at[s as usize + 1], "the edge fill pass disagrees with the count");
+                // SAFETY: `slot` and `at` were each claimed once, by
+                // their atomic cursors, from their node's range; both
+                // are below `edges`.
+                unsafe {
+                    (preds_ptr as *mut u32).add(at as usize).write(s);
+                    (out_ptr as *mut Out).add(slot as usize).write(Out { dst: d, xfer });
+                }
+            })
         })?;
         anyhow::ensure!(out_cursor.iter().zip(&out_at[1..]).all(|(c, &e)| c.load(Relaxed) == e), "the edge fill pass disagrees with the count");
         anyhow::ensure!(pred_cursor.iter().zip(&pred_at[1..]).all(|(c, &e)| c.load(Relaxed) == e), "the edge fill pass disagrees with the count");

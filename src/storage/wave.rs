@@ -257,7 +257,9 @@ pub fn run_wave(engine: &dyn FrameStep, frontier: Vec<Block>, cx: WaveCtx) -> Re
                             &b.ids()[first..=last]
                         };
                         let old = raised.is_some_and(|r| b.seq() < r.old_seqs);
-                        sink.begin(u as u32, bi as u32, first, sources, (!b.skip().is_empty()).then_some(b.skip()), old);
+                        // A whole layer piece's rows are named by their range.
+                        let range = b.is_whole().then_some((b.seq(), first as u32));
+                        sink.begin(u as u32, bi as u32, first, sources, range, (!b.skip().is_empty()).then_some(b.skip()), old);
                         let t_unit = phases::start();
                         engine.run(b, &cells[bi], &order[bi][lo..hi], &mut sink)?;
                         phases::add(phases::UNIT, t_unit);
@@ -548,7 +550,7 @@ pub(crate) fn gather_layer(visited: &VisitedSet, outs: &[UnitOut], news: &[NewSt
         };
         let ids: Vec<StateId> = part.iter().map(|n| n.0).collect();
         crate::compiled::asm_kernel::key_check_block(&rt2);
-        let b = Block::with_ids(rt2, ids, seq);
+        let b = Block::layer_piece(rt2, ids, seq);
         if crate::compiled::asm_kernel::key_check_on() {
             let cells = b.positions()?;
             for (id, c) in b.ids().iter().zip(&cells) {
@@ -722,7 +724,7 @@ pub fn seed(visited: &mut VisitedSet, blocks: &mut [Block]) -> Result<FrameMeta>
         let sorted: Vec<StateId> = order.iter().map(|&l| ids[l as usize]).collect();
         let mut rt2 = b.rt2().clone_block();
         rt2.gather_lanes(&order);
-        *b = Block::with_ids(rt2, sorted, seq as u32);
+        *b = Block::layer_piece(rt2, sorted, seq as u32);
     }
     meta.entries.sort_unstable();
     Ok(meta)

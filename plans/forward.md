@@ -1,5 +1,10 @@
 # The forward frame: where it goes, and what is next (2026-10-09)
 
+> Since 2026-10-10 the door, the queues, the unit row cache, the raw edge
+> records and the inversion described below are gone: storage v2
+> (plans/storage-v2.md; the frame in plans/architecture.md "The forward
+> frame and the storage"). The measurements below are of the old frame.
+
 Measured on the harness in BENCHMARK_DATA.md ("The forward frame,
 2026-10-09 night"): room (6,2) 100%, f56 -> f57 (5.86M states in, 6.74M
 kept), 16 workers on a 7950X3D (16 cores, 32 threads), DDR5 at 3600 MT/s

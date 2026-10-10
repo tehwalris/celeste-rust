@@ -946,7 +946,7 @@ fn main() -> Result<()> {
             };
             for rep in 0..reps {
                 // With their ids, as the search runs them.
-                let input: Vec<Block> = frontier.iter().map(|b| Block::with_ids(b.rt2().clone_block(), b.ids().to_vec(), b.seq())).collect();
+                let input: Vec<Block> = frontier.iter().map(|b| Block::layer_piece(b.rt2().clone_block(), b.ids().to_vec(), b.seq())).collect();
                 let (mut visited, mut xfers) = match &tree {
                     Some((v, x)) => (v.clone(), x.clone()),
                     None => (celeste_rust::storage::visited::VisitedSet::new(*celeste_rust::storage::geometry()), Default::default()),

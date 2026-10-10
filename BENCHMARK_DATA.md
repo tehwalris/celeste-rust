@@ -28,13 +28,24 @@ projected a row at a time; batched since (below). Room (1,0): the BFS
 38-42 s (with the inversion) against 14 s, the graph load 14.8 against
 1.9 s.
 
-Then (5d.. below, one run each, load 14-18): the reverse walk through one
+Then (81ce0df, one run each, load 14-18): the reverse walk through one
 OWNER INDEX per frame file instead of each unit's owner table, and the
 coarser-marks filter decided in batches: room (1,0) 119.9 s, BFS 2.9 s
 (14 s before); room (6,2) 216.7 s (the level -1 table rebuilt again), BFS
 1.5 s, level 1 4.4 s (8.4 before, fg-2300 4.8); room (4,2) `r0sxhn,r0sxh
 --ceiling 71` 20.8 s (fg-2300 21.9 s). Same answers, witnesses and `[gate]`
 counts.
+
+Then (the next commit, one run each, load 12-17): a unit's sources a row
+range of the previous layer's frame file, its owners by lid derived from
+the owner index when read. Trees: room (1,0) 50 GB (53 before; fg-2300
+46), room (6,2) 67 GB (71; fg-2300 66). Room (1,0) 121.0 s, the graph load
+3.5-4.6 s (1.8-1.9 before; 0.4 s a pass builds the owners, the rest is
+noise at this load); peak 16.0 GB, all of the rise file-backed pages of
+the frame files the sources are read from (anon unchanged, 3.0 GB in the
+read). Room (6,2): 265 s with a test suite running alongside (not a
+timing); peak 10.3 GB, again file pages. Same answers, witnesses and
+`[gate]` counts.
 
 **The reference frame** (6,2) 100% f56 -> f57 (`bench-frame --edges`, no
 filter: 17.2M new states, 512M edges; three interleaved reps, load 6-16):

@@ -261,7 +261,7 @@ pub fn bench_storage(a: &BenchArgs) -> Result<()> {
                             let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                             let Some(&ui) = order.get(i) else { break };
                             let u = &cap.units[ui];
-                            sink.begin(u.unit, u.block, u.lo as usize, &u.sources, None, u.old);
+                            sink.begin(u.unit, u.block, u.lo as usize, &u.sources, None, None, u.old);
                             replay_unit(&mut sink, cap, u, &mut xmap[u.stream])?;
                             sink.end()?;
                         }
