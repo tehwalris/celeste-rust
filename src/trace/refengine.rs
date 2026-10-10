@@ -307,14 +307,14 @@ impl crate::frame::FrameStep for std::sync::Mutex<RefEngine> {
         block: &Block,
         cell_in: &[u32],
         lanes: &[usize],
-        sink: &mut crate::frame::ForwardSink,
+        sink: &mut crate::storage::unit::UnitSink,
     ) -> Result<()> {
         let mut engine = self.lock().expect("reference engine lock");
         for &lane in lanes {
             for b in engine.run_lane(block.rt2(), lane)? {
                 let cell_out = b.positions()?[0];
                 if sink.edges_on {
-                    sink.edges.insert((cell_in[lane], cell_out));
+                    sink.pos_edges.insert((cell_in[lane], cell_out));
                 }
                 sink.emit_row(b.rt2(), cell_out)?;
             }

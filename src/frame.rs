@@ -1,36 +1,29 @@
-//! The block, the frame-step interface (`FrameStep`, `ForwardSink`: queues,
-//! door, edge records with transfers) and the forward (`forward_frame`, one
-//! wave; `ForwardState`, extended frame by frame, checkpointed, resumable).
+//! The block, the frame-step interface (`FrameStep`, emitting into the
+//! storage's `UnitSink`) and the forward (`ForwardState`, extended frame by
+//! frame by `storage::wave::run_wave`, checkpointed, resumable, raisable).
 //! A block is OPAQUE to the loop except for its KEYS and POSITIONS.
 
 use anyhow::{Context, Result};
-use crate::search::door::Admit;
 use std::ops::Range;
-use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 
-use celeste_core::pico8_num::Pico8Num as P8;
-use celeste_engine::runtime2::{Col, Rt2, AV};
+use celeste_engine::runtime2::{Col, Rt2};
+
+use crate::storage::StateId;
 
 /// Wave phase timers (`CELESTE_PHASES=1`): TSC ticks summed over workers,
 /// printed by `print_phases`. Off, `phase_start` is one load and a branch.
 pub mod phases {
     use std::sync::atomic::{AtomicU64, Ordering};
-    pub const NAMES: [&str; 14] = ["pack", "kernel", "emit (net of flush)", "flush", "flush.sort", "flush.admit", "flush.edges", "flush.gather", "end_call", "flush.pre", "flush.post", "slice.setup", "finish", "unit (all of engine.run)"];
+    pub const NAMES: [&str; 8] = ["pack", "kernel", "emit", "unit end (sort, encode)", "translate", "layer (gather, edge file)", "slice.setup", "unit (all of engine.run)"];
     pub const PACK: usize = 0;
     pub const KERNEL: usize = 1;
     pub const EMIT: usize = 2;
-    pub const FLUSH: usize = 3;
-    pub const SORT: usize = 4;
-    pub const ADMIT: usize = 5;
-    pub const EDGES: usize = 6;
-    pub const GATHER: usize = 7;
-    pub const END_CALL: usize = 8;
-    pub const PRE: usize = 9;
-    pub const POST: usize = 10;
-    pub const SETUP: usize = 11;
-    pub const FINISH: usize = 12;
-    pub const UNIT: usize = 13;
-    static TICKS: [AtomicU64; 14] = [const { AtomicU64::new(0) }; 14];
+    pub const END_UNIT: usize = 3;
+    pub const TRANSLATE: usize = 4;
+    pub const LAYER: usize = 5;
+    pub const SETUP: usize = 6;
+    pub const UNIT: usize = 7;
+    static TICKS: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
     fn on() -> bool {
         static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         *ON.get_or_init(|| std::env::var("CELESTE_PHASES").is_ok_and(|v| v == "1"))
@@ -53,10 +46,6 @@ pub mod phases {
         TICKS[p].fetch_add(t - t0, Ordering::Relaxed);
         t
     }
-    /// Subtract nested ticks from phase `p` (the emit loop's flushes).
-    pub fn sub(p: usize, ticks: u64) {
-        TICKS[p].fetch_sub(ticks, Ordering::Relaxed);
-    }
     pub fn print_phases(wall: std::time::Duration, workers: usize) {
         if !on() {
             return;
@@ -78,32 +67,13 @@ pub mod phases {
 /// key column. Only the per-lane key and position are exposed.
 pub struct Block {
     rt2: Rt2,
-    /// The rows' stable ids `pack_id(layer, seq, row)` when the block is a
-    /// layer's piece; empty otherwise.
-    ids: Vec<u64>,
+    /// The rows' ids (`storage::StateId`) when the block is a layer's
+    /// piece; empty otherwise.
+    ids: Vec<StateId>,
     /// The piece's file seq within its layer (`s{shape}_{seq}.bin`).
     seq: u32,
     /// Lanes the frame step must not expand (a mask, so ids stay consecutive).
     skip: Vec<bool>,
-}
-
-/// A state's stable id (layer = first frame reached, piece seq, row): its
-/// place in the layer's canonical order (`canon`), fixed at the end of the
-/// wave that reached it (during the wave, its flush id).
-pub fn pack_id(layer: u32, seq: u32, row: u32) -> u64 {
-    ((layer as u64) << 48) | ((seq as u64) << 32) | row as u64
-}
-
-pub fn id_layer(id: u64) -> u32 {
-    (id >> 48) as u32
-}
-
-pub fn id_seq(id: u64) -> u32 {
-    ((id >> 32) & 0xffff) as u32
-}
-
-pub fn id_row(id: u64) -> u32 {
-    id as u32
 }
 
 impl Block {
@@ -463,934 +433,6 @@ pub fn threads() -> usize {
     })
 }
 
-/// A typed varying column of emitted rows: raw 16.16 words, (low, high)
-/// pairs, or a byte per bool (0 false, 1 true, 2 unknown).
-pub enum TCol {
-    Num(Vec<u32>),
-    Ival(Vec<(u32, u32)>),
-    Bool(Vec<u8>),
-}
-
-/// A queue of emitted rows of one (shape, cell): skeleton, a `TCol` per
-/// varying cell, key and cell per row, and predecessors for the edges.
-pub struct Slot {
-    pub shape: u64,
-    /// The queue's key while live (`ForwardSink::queue`).
-    pub outcome: u64,
-    pub cell: u32,
-    pub live: bool,
-    pub touched: bool,
-    skeleton: Rt2,
-    /// `(cell, column)` per varying cell, in the kernel's order.
-    pub cols: Vec<(usize, TCol)>,
-    pub keys: Vec<(u64, u64)>,
-    pub cells: Vec<u32>,
-    /// Predecessors in the emitting slice: its first input id, a bit per lane.
-    pub pred_base: Vec<u64>,
-    pub pred_mask: Vec<u64>,
-    /// The transfer of `pred_mask`'s lanes (others go to `extra`).
-    pub pred_xfer: Vec<u32>,
-    /// Later producers (other slices, other transfers) of a row pushed once
-    /// per call: `(row, slice base, transfer, lane mask)`.
-    pub extra: Vec<(u32, u64, u32, u64)>,
-    /// Per row, its latest `extra` entry (`u32::MAX`: none), merged into.
-    pub last_extra: Vec<u32>,
-    /// Bumped at every flush, so a stale row ref is recognised.
-    pub gen: u16,
-}
-
-impl Slot {
-    /// An empty slot over `skeleton`.
-    pub fn new(skeleton: Rt2) -> Self {
-        let cols = skeleton
-            .cols
-            .iter()
-            .enumerate()
-            .filter_map(|(cell, c)| match c {
-                Col::N(_) => Some((cell, TCol::Num(Vec::new()))),
-                Col::I(_) => Some((cell, TCol::Ival(Vec::new()))),
-                Col::V(_) => Some((cell, TCol::Bool(Vec::new()))),
-                Col::U(_) => None,
-            })
-            .collect::<Vec<_>>();
-        Slot {
-            shape: skeleton.shape_hash,
-            outcome: 0,
-            cell: 0,
-            live: false,
-            touched: false,
-            skeleton,
-            cols,
-            keys: Vec::new(),
-            cells: Vec::new(),
-            pred_base: Vec::new(),
-            pred_mask: Vec::new(),
-            pred_xfer: Vec::new(),
-            extra: Vec::new(),
-            last_extra: Vec::new(),
-            gen: 0,
-        }
-    }
-
-    pub fn rows(&self) -> usize {
-        self.keys.len()
-    }
-
-    /// Bytes allocated for this slot's rows (capacities, not lengths).
-    pub fn alloc_bytes(&self) -> usize {
-        self.cols
-            .iter()
-            .map(|(_, c)| match c {
-                TCol::Num(v) => v.capacity() * 4,
-                TCol::Ival(v) => v.capacity() * 8,
-                TCol::Bool(v) => v.capacity(),
-            })
-            .sum::<usize>()
-            + self.keys.capacity() * 16
-            + self.cells.capacity() * 4
-    }
-
-    /// Drop the rows, keeping the skeleton and the columns' capacity.
-    pub fn clear(&mut self) {
-        for (_, c) in &mut self.cols {
-            match c {
-                TCol::Num(v) => v.clear(),
-                TCol::Ival(v) => v.clear(),
-                TCol::Bool(v) => v.clear(),
-            }
-        }
-        self.keys.clear();
-        self.cells.clear();
-        self.pred_base.clear();
-        self.pred_mask.clear();
-        self.pred_xfer.clear();
-        self.extra.clear();
-        self.last_extra.clear();
-        self.gen = self.gen.wrapping_add(1);
-    }
-
-    /// An empty block of this slot's shape for the rows to land in.
-    pub fn empty_piece(&self) -> Rt2 {
-        let mut b = celeste_engine::slots::reshape(&self.skeleton, 0);
-        b.cols = self
-            .skeleton
-            .cols
-            .iter()
-            .map(|c| match c {
-                Col::N(_) => Col::N(Vec::new()),
-                Col::I(_) => Col::I(Vec::new()),
-                Col::V(_) => Col::V(Vec::new()),
-                u => u.clone(),
-            })
-            .collect();
-        b.shape_hash = self.shape;
-        b
-    }
-
-    /// Append `rows` to `piece` (same shape); cells it holds differently go
-    /// through `col_push`.
-    pub fn gather_into(&self, piece: &mut Rt2, rows: &[u32]) {
-        use celeste_engine::runtime2::col_push;
-        let w = piece.width;
-        let mut ti = 0;
-        for (cell, c) in self.skeleton.cols.iter().enumerate() {
-            if !matches!(piece.structure[cell], celeste_engine::runtime2::Cell2::Val) {
-                continue;
-            }
-            let typed = if ti < self.cols.len() && self.cols[ti].0 == cell {
-                ti += 1;
-                Some(&self.cols[ti - 1].1)
-            } else {
-                None
-            };
-            let dst = &mut piece.cols[cell];
-            match (typed, c) {
-                (None, Col::U(v)) => {
-                    if !matches!(dst, Col::U(d) if d == v) {
-                        for (n, _) in rows.iter().enumerate() {
-                            col_push(dst, w + n, *v);
-                        }
-                    }
-                }
-                (None, _) => unreachable!("a non-uniform skeleton column without a typed column"),
-                (Some(TCol::Num(v)), _) => match dst {
-                    Col::N(d) => d.extend(rows.iter().map(|&r| P8::from_raw(v[r as usize] as i32))),
-                    _ => {
-                        for (n, &r) in rows.iter().enumerate() {
-                            col_push(dst, w + n, AV::Num(P8::from_raw(v[r as usize] as i32)));
-                        }
-                    }
-                },
-                (Some(TCol::Ival(v)), _) => match dst {
-                    Col::I(d) => d.extend(rows.iter().map(|&r| {
-                        let (a, b) = v[r as usize];
-                        (P8::from_raw(a as i32), P8::from_raw(b as i32))
-                    })),
-                    _ => {
-                        for (n, &r) in rows.iter().enumerate() {
-                            let (a, b) = v[r as usize];
-                            col_push(dst, w + n, AV::Ival(P8::from_raw(a as i32), P8::from_raw(b as i32)));
-                        }
-                    }
-                },
-                (Some(TCol::Bool(v)), _) => {
-                    let av = |r: u32| match v[r as usize] {
-                        0 => AV::Bool(false),
-                        1 => AV::Bool(true),
-                        _ => AV::UBool,
-                    };
-                    match dst {
-                        Col::V(d) => d.extend(rows.iter().map(|&r| av(r))),
-                        _ => {
-                            for (n, &r) in rows.iter().enumerate() {
-                                col_push(dst, w + n, av(r));
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        piece.row_keys.extend(rows.iter().map(|&r| self.keys[r as usize]));
-        piece.width = w + rows.len();
-    }
-
-    /// The whole slot as a block (the checks read blocks).
-    pub fn to_rt2(&self) -> Rt2 {
-        let mut b = self.empty_piece();
-        let all: Vec<u32> = (0..self.rows() as u32).collect();
-        self.gather_into(&mut b, &all);
-        b
-    }
-
-    /// Does any of `rows` sit on the win target (`wins_of` on the columns)?
-    pub fn any_win(&self, rows: &[u32]) -> Result<bool> {
-        let ids = crate::compiled::ids();
-        let sk = &self.skeleton;
-        let num_at = |cell: u32| -> Result<NumView<'_>> {
-            match &sk.cols[cell as usize] {
-                Col::U(AV::Num(n)) => Ok(NumView::Uniform(*n)),
-                Col::N(_) => match self.cols.iter().find(|(c, _)| *c == cell as usize) {
-                    Some((_, TCol::Num(v))) => Ok(NumView::Rows(v)),
-                    _ => anyhow::bail!("any_win: cell {cell} is not a typed number column"),
-                },
-                other => anyhow::bail!("any_win: cell {cell} is not a number: {:?}", other),
-            }
-        };
-        if let Some((txl, txh, tyl, tyh)) = win_rect() {
-            let Some(obj) = crate::search::pos_graph::player_object(sk) else {
-                return Ok(false);
-            };
-            let (Some(cx), Some(cy)) = (sk.obj_field_cell(obj, ids.f_x), sk.obj_field_cell(obj, ids.f_y)) else {
-                return Ok(false);
-            };
-            // Meeting the target wins (over-approximate; the concrete search refutes).
-            let range_at = |cell: u32| -> Result<Box<dyn Fn(u32) -> (i16, i16) + '_>> {
-                Ok(match &sk.cols[cell as usize] {
-                    Col::U(AV::Num(n)) => {
-                        let w = n.whole_part_as_i16();
-                        Box::new(move |_| (w, w))
-                    }
-                    Col::U(AV::Ival(a, b)) => {
-                        let (lo, hi) = (a.whole_part_as_i16(), b.whole_part_as_i16());
-                        Box::new(move |_| (lo, hi))
-                    }
-                    Col::N(_) | Col::I(_) => match self.cols.iter().find(|(c, _)| *c == cell as usize) {
-                        Some((_, TCol::Num(v))) => Box::new(move |r| {
-                            let w = P8::from_raw(v[r as usize] as i32).whole_part_as_i16();
-                            (w, w)
-                        }),
-                        Some((_, TCol::Ival(v))) => Box::new(move |r| {
-                            let (a, b) = v[r as usize];
-                            (P8::from_raw(a as i32).whole_part_as_i16(), P8::from_raw(b as i32).whole_part_as_i16())
-                        }),
-                        _ => anyhow::bail!("any_win: cell {cell} is not a typed position column"),
-                    },
-                    other => anyhow::bail!("any_win: cell {cell} is not a position: {:?}", other),
-                })
-            };
-            let (xs, ys) = (range_at(cx)?, range_at(cy)?);
-            return Ok(rows.iter().any(|&r| {
-                let (xl, xh) = xs(r);
-                let (yl, yh) = ys(r);
-                xl <= txh && txl <= xh && yl <= tyh && tyl <= yh
-            }));
-        }
-        let (wx, wy) = crate::game_runner::win_room();
-        let (wx, wy) = (P8::from_i16(wx), P8::from_i16(wy));
-        let room = sk.global_target(ids.g_room).ok_or_else(|| anyhow::anyhow!("any_win: no `room` global"))?;
-        let x = sk.obj_field_cell(room, ids.f_x).ok_or_else(|| anyhow::anyhow!("any_win: room has no x"))?;
-        let y = sk.obj_field_cell(room, ids.f_y).ok_or_else(|| anyhow::anyhow!("any_win: room has no y"))?;
-        let (xs, ys) = (num_at(x)?, num_at(y)?);
-        if orb_required() {
-            let c = sk.globals[ids.g_max_djump as usize];
-            anyhow::ensure!(c != celeste_engine::runtime2::NONE, "any_win: no `max_djump` global");
-            let md = num_at(c)?;
-            let two = P8::from_i16(2);
-            return Ok(rows.iter().any(|&r| xs.at(r) == wx && ys.at(r) == wy && md.at(r) == two));
-        }
-        Ok(rows.iter().any(|&r| xs.at(r) == wx && ys.at(r) == wy))
-    }
-
-    /// Push one materialized row (the reference engine's path).
-    pub fn push_row(&mut self, row: &Rt2, key: (u64, u64), cell: u32) {
-        debug_assert_eq!(row.width, 1);
-        for (c, col) in self.cols.iter_mut() {
-            let v = row.cols[*c].at(0);
-            match (col, v) {
-                (TCol::Num(d), AV::Num(n)) => d.push(n.as_raw_u32()),
-                (TCol::Ival(d), AV::Ival(a, b)) => d.push((a.as_raw_u32(), b.as_raw_u32())),
-                (TCol::Ival(d), AV::Num(n)) => d.push((n.as_raw_u32(), n.as_raw_u32())),
-                (TCol::Bool(d), AV::Bool(x)) => d.push(x as u8),
-                (TCol::Bool(d), AV::UBool) => d.push(2),
-                (_, v) => panic!("emitted row's cell {c} holds {v:?}, not its column's kind"),
-            }
-        }
-        self.keys.push(key);
-        self.cells.push(cell);
-    }
-}
-
-/// Slots of the direct-mapped edge merge cache (`ForwardSink::direct_edge`).
-const DIRECT_SLOTS: usize = 1 << 12;
-
-/// Append one record to the target layer's buffer, written out when full.
-#[inline]
-fn append_record(
-    edge_bufs: &mut Vec<Vec<u128>>,
-    edge_records: &mut u64,
-    dir: &std::path::Path,
-    frame: u32,
-    worker: u32,
-    target: u64,
-    base: u64,
-    xfer: u32,
-    mask: u64,
-) -> Result<()> {
-    let layer = id_layer(target) as usize;
-    if edge_bufs.len() <= layer {
-        edge_bufs.resize_with(layer + 1, Vec::new);
-    }
-    let buf = &mut edge_bufs[layer];
-    crate::search::edges::push_records(buf, target, base, xfer, mask);
-    *edge_records += 1;
-    if buf.len() >= crate::search::edges::CHUNK_WORDS {
-        write_edges(dir, frame, layer, worker, buf)?;
-    }
-    Ok(())
-}
-
-/// Append `buf` to the worker's raw file for `layer` at `frame` as a chunk
-/// (`edges::write_chunk`), and clear it. Written in the order recorded:
-/// equal records are merged by the inversion (`encode_sorted`), and the
-/// sink's merges leave none to sort out here (room (6,2) 100% f57: 0 of
-/// 252M records were duplicates in a buffer; the sort was ~1/3 of
-/// `flush.edges`).
-fn write_edges(dir: &std::path::Path, frame: u32, layer: usize, worker: u32, buf: &mut Vec<u128>) -> Result<()> {
-    use std::io::Write;
-    thread_local! {
-        static BYTES: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
-    }
-    let path = crate::search::edges::raw_path(dir, frame, layer as u32, worker);
-    std::fs::create_dir_all(path.parent().expect("a raw dir"))?;
-    BYTES.with_borrow_mut(|bytes| -> Result<()> {
-        bytes.clear();
-        crate::search::edges::write_chunk(bytes, buf);
-        let mut f = std::fs::OpenOptions::new().create(true).append(true).open(&path)?;
-        f.write_all(bytes)?;
-        Ok(())
-    })?;
-    buf.clear();
-    Ok(())
-}
-
-/// A number column of a slot as `any_win` reads it.
-enum NumView<'a> {
-    Uniform(P8),
-    Rows(&'a [u32]),
-}
-
-impl NumView<'_> {
-    fn at(&self, row: u32) -> P8 {
-        match self {
-            NumView::Uniform(n) => *n,
-            NumView::Rows(v) => P8::from_raw(v[row as usize] as i32),
-        }
-    }
-}
-
-/// Rows per queue; small so a worker's pool stays cache-resident.
-pub const QUEUE_ROWS: usize = 256;
-/// Live queues per worker; beyond it one is evicted (only flush count changes).
-pub const POOL_QUEUES: usize = 256;
-
-/// One worker's sink for a frame: keyed rows into a QUEUE per (outcome,
-/// cell); a full or evicted queue is FLUSHED (filter, door, piece, edges).
-/// Entries of `ForwardSink::xfer_id_raw`'s cache.
-const XFER_CACHE: usize = 1 << 12;
-
-pub struct ForwardSink<'a> {
-    /// The pool: every queue ever created by this sink, live or spare.
-    pub slots: Vec<Slot>,
-    /// (outcome id, cell) -> live queue; the id is the emitter's own.
-    index: rustc_hash::FxHashMap<(u64, u32), u32>,
-    /// Flushed, empty queues per outcome id, keeping their columns.
-    spare: rustc_hash::FxHashMap<u64, Vec<u32>>,
-    /// The second-chance hand over `slots`.
-    clock: usize,
-    /// The run cache: rows arrive in runs of one (outcome, cell).
-    last: ((u64, u32), u32),
-    /// `minus_one_drop`'s last answer: emissions come in runs of one cell.
-    drop_last: Option<((u64, u32), Option<u32>)>,
-    door: Option<&'a crate::search::door::Door>,
-    filters: Filters<'a>,
-    /// Note the sources of the rows level -1 drops (`drops`): a level-0
-    /// tree's, so that a raise can re-expand them.
-    note_drops: bool,
-    /// Per source, the smallest horizon that admits one of its dropped
-    /// successors (`CostToGo::admitted_from`), shared by the wave's workers.
-    drops: Option<&'a DropNotes>,
-    /// The next piece's seq, shared by the wave's workers.
-    seqs: Option<&'a AtomicU32>,
-    /// A raise's wave (`Layer::Raised`): no state may come from a later
-    /// layer, and the tree's sources' edges it admitted are not recorded again.
-    raised: Option<Raised>,
-    /// Are the lanes of the kernel call being run the tree's (not added by
-    /// the raise)? A call runs one block, so one or the other.
-    pub sources_old: bool,
-    /// The ids of the block being run (slice bases for predecessor masks).
-    pub ids_in: Option<&'a [u64]>,
-    /// Lanes of the block being run that must not be expanded.
-    pub skip_in: Option<&'a [bool]>,
-    /// Where the edge records go (`edges::raw_path`); `None`: no recording.
-    edges_dir: Option<std::path::PathBuf>,
-    edge_bufs: Vec<Vec<u128>>,
-    pub edge_records: u64,
-    /// The within-call dedup cache (`RowCache`), written back by the flush.
-    pub seen: celeste_engine::kernel::RowCache,
-    /// Direct-mapped merge of edges to flushed states; evicted -> a record.
-    direct: Vec<(u64, u64, u32, u64)>,
-    /// This worker's interned transfers (records carry the index).
-    xfer_ids: rustc_hash::FxHashMap<crate::search::arc_edges::Pair, u32>,
-    /// `xfer_id_raw`'s cache (allocated on first use).
-    xfer_cache: Vec<(crate::compiled::asm_kernel::RawWords, u32)>,
-    xfer_tab: Vec<crate::search::arc_edges::Pair>,
-    /// Time spent encoding and writing edge records (this worker).
-    pub t_edges: std::time::Duration,
-
-    /// Next-frame pieces per shape: block, seq (from the wave's counter),
-    /// each row's cell; renumbered at the wave's end (`canon`).
-    pieces: rustc_hash::FxHashMap<u64, (Rt2, u32, Vec<u32>)>,
-    /// The new rows' layer and this worker's index (part of a new row's id).
-    frame: u32,
-    worker: u32,
-    pub won: bool,
-    pub kept: usize,
-    pub flushes: u64,
-    pub flushed_rows: u64,
-    sort_buf: Vec<((u64, u64), u32)>,
-    keys_buf: Vec<(u64, u64)>,
-    uniq_buf: Vec<u32>,
-    row_uniq: Vec<u32>,
-    new_buf: Vec<u32>,
-    ids_buf: Vec<u64>,
-    rows_buf: Vec<u32>,
-    /// Record `edges` at all (off for the backward, which has the graph).
-    pub edges_on: bool,
-    /// The distinct pos-graph edges this worker produced.
-    pub edges: rustc_hash::FxHashSet<(u32, u32)>,
-    /// Rows emitted after the step's within-call dedup (the raw fan-out).
-    pub emitted: u64,
-    /// TSC ticks spent in flushes (`phases`), nested in the emit loop.
-    pub flush_ticks: u64,
-}
-
-const NO_QUEUE: ((u64, u32), u32) = ((u64::MAX, u32::MAX), u32::MAX);
-
-impl<'a> ForwardSink<'a> {
-    fn empty(edges_on: bool) -> Self {
-        ForwardSink {
-            slots: Vec::new(),
-            index: Default::default(),
-            spare: Default::default(),
-            clock: 0,
-            last: NO_QUEUE,
-            drop_last: None,
-            door: None,
-            filters: Filters::default(),
-            note_drops: false,
-            drops: None,
-            seqs: None,
-            raised: None,
-            sources_old: false,
-            ids_in: None,
-            skip_in: None,
-            edges_dir: None,
-            edge_bufs: Vec::new(),
-            edge_records: 0,
-            seen: celeste_engine::kernel::RowCache::new(),
-            direct: Vec::new(),
-            xfer_ids: Default::default(),
-            xfer_cache: Vec::new(),
-            xfer_tab: Vec::new(),
-            t_edges: std::time::Duration::ZERO,
-            pieces: Default::default(),
-            frame: 0,
-            worker: 0,
-            won: false,
-            kept: 0,
-            flushes: 0,
-            flushed_rows: 0,
-            sort_buf: Vec::with_capacity(QUEUE_ROWS),
-            keys_buf: Vec::with_capacity(QUEUE_ROWS),
-            uniq_buf: Vec::with_capacity(QUEUE_ROWS),
-            row_uniq: Vec::with_capacity(QUEUE_ROWS),
-            new_buf: Vec::with_capacity(QUEUE_ROWS),
-            ids_buf: Vec::with_capacity(QUEUE_ROWS),
-            rows_buf: Vec::with_capacity(QUEUE_ROWS),
-            edges_on,
-            edges: Default::default(),
-            emitted: 0,
-            flush_ticks: 0,
-        }
-    }
-
-    /// Worker `worker`'s sink for `frame` (new ids in layer `frame`, its
-    /// pieces numbered from `seqs`).
-    pub fn forward(
-        door: &'a crate::search::door::Door,
-        filters: Filters<'a>,
-        edges_on: bool,
-        frame: u32,
-        worker: u32,
-        edges_dir: Option<&std::path::Path>,
-        seqs: &'a AtomicU32,
-        raised: Option<Raised>,
-        drops: Option<&'a DropNotes>,
-    ) -> Self {
-        let mut s = Self::empty(edges_on);
-        s.drops = drops;
-        s.door = Some(door);
-        s.filters = filters;
-        s.note_drops = filters.notes_drops() && edges_dir.is_some();
-        s.frame = frame;
-        s.worker = worker;
-        s.edges_dir = edges_dir.map(|p| p.to_path_buf());
-        s.seqs = Some(seqs);
-        s.raised = raised;
-        s
-    }
-
-    /// The level -1 filter at EMISSION: `Some(from)` where it drops every
-    /// row of (`shape`, `cell`) at this frame - exactly the queues `flush`
-    /// would drop whole - so the row is never keyed, queued or flushed.
-    /// Half the unit-unique rows of room (6,2) 100% f57 (56M of 113M).
-    #[inline]
-    pub fn minus_one_drop(&mut self, shape: u64, cell: u32) -> Option<u32> {
-        let m = self.filters.minus_one?;
-        if let Some((at, r)) = self.drop_last {
-            if at == (shape, cell) {
-                return r;
-            }
-        }
-        let from = m.table().admitted_from(shape, cell, self.frame);
-        let r = (from > m.h).then_some(from);
-        self.drop_last = Some(((shape, cell), r));
-        r
-    }
-
-    /// A re-emission of a row a filter dropped (its cache ref `r` carries
-    /// `admitted_from`; 0: a raise's known edge): one more source to note.
-    #[inline]
-    pub fn dropped_again(&mut self, base: u64, lane: usize, r: u64) {
-        if let (true, Some(d), true) = (self.note_drops, self.drops, r != 0) {
-            d.note(base, 1u64 << lane, r as u32);
-        }
-    }
-
-    /// The transfer pair `t` as this worker's id (interned on first use).
-    #[inline]
-    /// `xfer_id` of a raw transfer, through a small direct-mapped cache of
-    /// raw -> id: a frame has few distinct transfers (room (1,0) to f99:
-    /// 17k) against one lookup per emitted lane, and the decode plus the
-    /// hash-map intern was ~17% of a forward.
-    pub fn xfer_id_raw(&mut self, words: &crate::compiled::asm_kernel::RawWords, decode: impl FnOnce(&crate::compiled::asm_kernel::RawWords) -> crate::search::arc_edges::Pair) -> u32 {
-        let mut h = 0u64;
-        for pair in words.chunks_exact(2) {
-            h = (h ^ ((pair[0] as u64) << 32 | pair[1] as u64)).wrapping_mul(0x9e37_79b9_7f4a_7c15).rotate_left(29);
-        }
-        let slot = (h as usize) & (XFER_CACHE - 1);
-        if self.xfer_cache.is_empty() {
-            self.xfer_cache = vec![([0; crate::compiled::asm_kernel::RAW_WORDS], u32::MAX); XFER_CACHE];
-        }
-        let (w, id) = &self.xfer_cache[slot];
-        if *id != u32::MAX && w == words {
-            return *id;
-        }
-        let id = self.xfer_id(decode(words));
-        self.xfer_cache[slot] = (*words, id);
-        id
-    }
-
-    pub fn xfer_id(&mut self, t: crate::search::arc_edges::Pair) -> u32 {
-        if let Some(&id) = self.xfer_ids.get(&t) {
-            return id;
-        }
-        let id = u32::try_from(self.xfer_tab.len()).expect("transfer table past u32");
-        self.xfer_tab.push(t);
-        self.xfer_ids.insert(t, id);
-        id
-    }
-
-    /// One edge record: `mask`'s lanes at `base` -> state `target`, via `xfer`.
-    #[inline]
-    fn record(&mut self, target: u64, base: u64, xfer: u32, mask: u64) -> Result<()> {
-        let dir = self.edges_dir.as_deref().expect("recording without an edges dir");
-        append_record(&mut self.edge_bufs, &mut self.edge_records, dir, self.frame, self.worker, target, base, xfer, mask)
-    }
-
-    /// An edge to the flushed state `target`, merged in the direct-mapped cache.
-    #[inline]
-    pub fn direct_edge(&mut self, target: u64, base: u64, xfer: u32, lane: usize) {
-        if self.edges_dir.is_none() {
-            return;
-        }
-        if self.direct.is_empty() {
-            self.direct = vec![(u64::MAX, 0, 0, 0); DIRECT_SLOTS];
-        }
-        let i = (celeste_engine::runtime2::mix64(target ^ base.rotate_left(17) ^ (xfer as u64).rotate_left(41)) as usize) & (DIRECT_SLOTS - 1);
-        let e = self.direct[i];
-        if e.0 == target && e.1 == base && e.2 == xfer {
-            self.direct[i].3 |= 1u64 << lane;
-            return;
-        }
-        if e.0 != u64::MAX {
-            self.record(e.0, e.1, e.2, e.3).expect("recording an edge");
-        }
-        self.direct[i] = (target, base, xfer, 1u64 << lane);
-    }
-
-    /// The step's end of a kernel call: the merge cache drains.
-    pub fn end_call(&mut self) {
-        let t = phases::start();
-        self.end_call_inner();
-        phases::add(phases::END_CALL, t);
-    }
-
-    fn end_call_inner(&mut self) {
-        for i in 0..self.direct.len() {
-            let e = self.direct[i];
-            if e.0 != u64::MAX {
-                self.record(e.0, e.1, e.2, e.3).expect("recording an edge");
-                self.direct[i] = (u64::MAX, 0, 0, 0);
-            }
-        }
-    }
-
-    /// A handle on the row just pushed into `q`: row (8 bits), queue (24: the
-    /// pool grows past `POOL_QUEUES`), generation (16), below the flag bits.
-    #[inline]
-    pub fn row_ref(&self, q: usize) -> u64 {
-        const _: () = assert!(QUEUE_ROWS <= 256);
-        assert!(q < 1 << 24, "queue pool past 2^24 slots");
-        let s = &self.slots[q];
-        ((s.gen as u64) << 32) | ((q as u64) << 8) | (s.rows() as u64 - 1)
-    }
-
-    /// Add a predecessor to the row at `row_ref`; false if its queue was
-    /// flushed since (the caller pushes the row again).
-    #[inline]
-    pub fn mark_pred(&mut self, row_ref: u64, base: u64, xfer: u32, lane: usize) -> bool {
-        let (gen, q, r) = ((row_ref >> 32) as u16, ((row_ref >> 8) & 0xff_ffff) as usize, (row_ref & 0xff) as usize);
-        let s = &mut self.slots[q];
-        if !s.live || s.gen != gen || r >= s.pred_mask.len() {
-            return false;
-        }
-        if s.pred_base[r] == base && s.pred_xfer[r] == xfer {
-            s.pred_mask[r] |= 1u64 << lane;
-            return true;
-        }
-        let last = s.last_extra[r];
-        if last != u32::MAX && s.extra[last as usize].1 == base && s.extra[last as usize].2 == xfer {
-            s.extra[last as usize].3 |= 1u64 << lane;
-        } else {
-            s.last_extra[r] = s.extra.len() as u32;
-            s.extra.push((r as u32, base, xfer, 1u64 << lane));
-        }
-        true
-    }
-
-    /// The live queue for `(outcome, cell)`, created on first use.
-    pub fn queue(&mut self, outcome: u64, cell: u32, init: impl FnOnce() -> Rt2) -> usize {
-        if self.last.0 == (outcome, cell) {
-            return self.last.1 as usize;
-        }
-        let q = match self.index.get(&(outcome, cell)) {
-            Some(&q) => q,
-            None => {
-                if self.index.len() >= POOL_QUEUES {
-                    self.evict_one();
-                }
-                let q = match self.spare.get_mut(&outcome).and_then(Vec::pop) {
-                    Some(q) => q,
-                    None => {
-                        self.slots.push(Slot::new(init()));
-                        (self.slots.len() - 1) as u32
-                    }
-                };
-                let s = &mut self.slots[q as usize];
-                s.outcome = outcome;
-                s.cell = cell;
-                s.live = true;
-                s.touched = false;
-                self.index.insert((outcome, cell), q);
-                q
-            }
-        };
-        self.last = ((outcome, cell), q);
-        q as usize
-    }
-
-    /// Second chance: flush the first untouched live queue.
-    fn evict_one(&mut self) {
-        loop {
-            let i = self.clock % self.slots.len();
-            self.clock += 1;
-            let s = &mut self.slots[i];
-            if !s.live {
-                continue;
-            }
-            if s.touched {
-                s.touched = false;
-                continue;
-            }
-            self.flush(i).expect("flushing an evicted queue");
-            return;
-        }
-    }
-
-    /// After a push into queue `q`: flush it when full.
-    #[inline]
-    pub fn pushed(&mut self, q: usize) -> Result<()> {
-        let s = &mut self.slots[q];
-        s.touched = true;
-        if s.rows() >= QUEUE_ROWS {
-            self.flush(q)?;
-        }
-        Ok(())
-    }
-
-    /// Flush queue `q`: filter, sort and collapse duplicates, admit at the
-    /// door, gather into this worker's piece; the queue becomes a spare.
-    fn flush(&mut self, q: usize) -> Result<()> {
-        let t_flush = phases::start();
-        let r = self.flush_inner(q);
-        let t_end = phases::add(phases::FLUSH, t_flush);
-        self.flush_ticks += t_end.saturating_sub(t_flush);
-        r
-    }
-
-    fn flush_inner(&mut self, q: usize) -> Result<()> {
-        let door = self.door.expect("flush without a door");
-        let t_pre = phases::start();
-        let slot = &mut self.slots[q];
-        let n = slot.rows();
-        if n > 0 {
-            crate::compiled::asm_kernel::key_check(slot);
-            self.flushes += 1;
-            self.flushed_rows += n as u64;
-            // The coarser level's filter (`MarkFilter`).
-            let allow = match self.filters.marks {
-                Some(f) => Some(f.allowed(&slot.to_rt2(), self.frame)?),
-                None => None,
-            };
-            // The level -1 filter: the queue's cell provably cannot exit by
-            // H. `dropped`: the smallest horizon that would admit it.
-            let dropped = self.filters.minus_one.and_then(|m| {
-                let from = m.table().admitted_from(slot.shape, slot.cell, self.frame);
-                (from > m.h).then_some(from)
-            });
-            let allow = if dropped.is_some() { Some(vec![false; n]) } else { allow };
-            // A level-0 tree notes the dropped rows' sources (`raise`).
-            if let (Some(from), true) = (dropped, self.note_drops && slot.pred_base.len() == n) {
-                let rows = slot.pred_base.iter().zip(&slot.pred_mask).map(|(&b, &m)| (b, m));
-                let d = self.drops.expect("a sink noting drops has the wave's notes");
-                for (b, m) in rows.chain(slot.extra.iter().map(|&(_, b, _, m)| (b, m))) {
-                    d.note(b, m, from);
-                }
-            }
-            self.sort_buf.clear();
-            self.sort_buf.extend(
-                slot.keys
-                    .iter()
-                    .enumerate()
-                    .filter(|(r, _)| allow.as_ref().is_none_or(|a| a[*r]))
-                    .map(|(r, k)| (*k, r as u32)),
-            );
-            let t_ph = phases::add(phases::PRE, t_pre);
-            self.sort_buf.sort_unstable();
-            // Rows sharing a key are one state with several predecessor masks.
-            self.keys_buf.clear();
-            self.uniq_buf.clear();
-            for e in &self.sort_buf {
-                if self.keys_buf.last() != Some(&e.0) {
-                    self.keys_buf.push(e.0);
-                }
-                self.uniq_buf.push(self.keys_buf.len() as u32 - 1);
-            }
-            // Per ROW, its index among the distinct keys (`u32::MAX`: filtered).
-            self.row_uniq.clear();
-            self.row_uniq.resize(n, u32::MAX);
-            for (e, &u) in self.sort_buf.iter().zip(&self.uniq_buf) {
-                self.row_uniq[e.1 as usize] = u;
-            }
-            self.new_buf.clear();
-            self.ids_buf.clear();
-            // The k-th new key gets `first_new + k`, appended in that order.
-            let frame = self.frame;
-            let seqs = self.seqs.expect("a flush without piece numbers");
-            let (piece, seq, piece_cells) = self.pieces.entry(slot.shape).or_insert_with(|| {
-                let seq = seqs.fetch_add(1, Ordering::Relaxed);
-                assert!(seq <= u16::MAX as u32, "frame {frame}: piece seq {seq} past the 16 bits an id holds");
-                (slot.empty_piece(), seq, Vec::new())
-            });
-            let first_new = pack_id(frame, *seq, piece.width as u32);
-            let t_ph = phases::add(phases::SORT, t_ph);
-            door.admit(slot.shape, slot.cell, &self.keys_buf, first_new, &mut self.ids_buf, &mut self.new_buf);
-            let t_ph = phases::add(phases::ADMIT, t_ph);
-            // A RAISE runs old frames against the whole tree's door: a state
-            // of a later layer here means the larger horizon reaches it
-            // sooner, which would renumber the tree - refused, never absorbed.
-            if let Some(&id) = self.ids_buf.iter().find(|&&id| self.raised.is_some() && id_layer(id) > frame) {
-                anyhow::bail!(
-                    "frame {frame}: a state the tree first reached at frame {} is reached at frame {frame}: the raised tree would move it to an earlier layer (the level -1 table is not consistent along this edge), so it cannot be extended exactly - delete the tree",
-                    id_layer(id)
-                );
-            }
-            // A raise re-expands sources of the tree: where the tree's own
-            // filter admitted this queue, their edges into it are recorded.
-            let known: Option<u32> = self
-                .raised
-                .filter(|r| dropped.is_none() && r.old.table().admitted_from(slot.shape, slot.cell, frame) <= r.old.h)
-                .map(|r| r.old_seqs);
-            // Each row's predecessors and extras (none from id-less blocks).
-            if let Some(edges_dir) = self.edges_dir.as_deref().filter(|_| slot.pred_base.len() == n) {
-                let t_e = std::time::Instant::now();
-                let (row_uniq, ids_buf) = (&self.row_uniq, &self.ids_buf);
-                let (edge_bufs, edge_records, frame, worker) = (&mut self.edge_bufs, &mut self.edge_records, self.frame, self.worker);
-                let rows = slot.pred_base.iter().zip(&slot.pred_xfer).zip(&slot.pred_mask).enumerate().map(|(r, ((&b, &x), &m))| (r as u32, b, x, m));
-                for (r, b, x, m) in rows.chain(slot.extra.iter().copied()) {
-                    let u = row_uniq[r as usize];
-                    if u != u32::MAX && known.is_none_or(|old_seqs| id_seq(b) >= old_seqs) {
-                        append_record(edge_bufs, edge_records, edges_dir, frame, worker, ids_buf[u as usize], b, x, m)?;
-                    }
-                }
-                // Each row's fate into the dedup cache (later re-emissions).
-                for (r, key) in slot.keys.iter().enumerate() {
-                    let u = row_uniq[r];
-                    let v = if u == u32::MAX {
-                        celeste_engine::kernel::RowCache::DROP_FLAG | dropped.unwrap_or(u32::MAX) as u64
-                    } else if known.is_some() && self.sources_old {
-                        // Recorded already, nothing to note.
-                        celeste_engine::kernel::RowCache::DROP_FLAG
-                    } else {
-                        celeste_engine::kernel::RowCache::ID_FLAG | ids_buf[u as usize]
-                    };
-                    self.seen.set_ref(*key, slot.cells[r], v);
-                }
-                self.t_edges += t_e.elapsed();
-            }
-            let t_ph = phases::add(phases::EDGES, t_ph);
-            if !self.new_buf.is_empty() {
-                self.rows_buf.clear();
-                // The first row of a new key's group is the one kept.
-                self.rows_buf.extend(self.new_buf.iter().map(|&u| {
-                    let first = self.uniq_buf.partition_point(|&x| x < u);
-                    self.sort_buf[first].1
-                }));
-                self.kept += self.rows_buf.len();
-                self.won |= slot.any_win(&self.rows_buf)?;
-                slot.gather_into(piece, &self.rows_buf);
-                piece_cells.extend(std::iter::repeat_n(slot.cell, self.rows_buf.len()));
-                debug_assert_eq!(piece_cells.len(), piece.width);
-            }
-            let t_ph = phases::add(phases::GATHER, t_ph);
-            slot.clear();
-            phases::add(phases::POST, t_ph);
-        }
-        slot.live = false;
-        slot.touched = false;
-        self.index.remove(&(slot.outcome, slot.cell));
-        self.spare.entry(slot.outcome).or_default().push(q as u32);
-        if self.last.1 == q as u32 {
-            self.last = NO_QUEUE;
-        }
-        Ok(())
-    }
-
-    /// End of the worker's frame: flush everything, hand back the pieces
-    /// (in flush order: `canon::canonical_layer` orders the layer).
-    pub fn finish(&mut self) -> Result<Vec<crate::canon::Flushed>> {
-        for q in 0..self.slots.len() {
-            if self.slots[q].live {
-                self.flush(q)?;
-            }
-        }
-        if let Some(dir) = self.edges_dir.clone() {
-            for (layer, buf) in self.edge_bufs.iter_mut().enumerate() {
-                if !buf.is_empty() {
-                    write_edges(&dir, self.frame, layer, self.worker, buf)?;
-                }
-            }
-            if !self.xfer_tab.is_empty() {
-                let mut buf = Vec::with_capacity(self.xfer_tab.len() * crate::search::arc_edges::PAIR_BYTES);
-                for p in &self.xfer_tab {
-                    crate::search::arc_edges::encode_pair(&mut buf, p);
-                }
-                let path = crate::search::edges::raw_xfer_path(&dir, self.frame, self.worker);
-                std::fs::create_dir_all(path.parent().expect("a raw dir"))?;
-                std::fs::write(path, buf)?;
-            }
-        }
-        // Empty pieces hold no rows to renumber.
-        Ok(std::mem::take(&mut self.pieces)
-            .into_values()
-            .filter(|(p, _, _)| p.width > 0)
-            .map(|(rt2, seq, cells)| crate::canon::Flushed { rt2, seq, cells })
-            .collect())
-    }
-
-    /// Bytes allocated across the pool (capacities).
-    pub fn alloc_bytes(&self) -> usize {
-        self.slots.iter().map(Slot::alloc_bytes).sum()
-    }
-
-    /// Emit one single-row block at `cell` (the reference engine's path).
-    pub fn emit_row(&mut self, row: &Rt2, cell: u32) -> Result<()> {
-        debug_assert_eq!(row.width, 1);
-        debug_assert_eq!(row.row_keys.len(), 1, "an emitted row carries its key");
-        let q = self.queue(row.shape_hash, cell, || {
-            // Numbers and bools vary; the rest is fixed by the shape.
-            let mut b = celeste_engine::slots::reshape(row, 0);
-            b.cols = row
-                .cols
-                .iter()
-                .map(|c| match c.at(0) {
-                    AV::Num(_) => Col::N(Vec::new()),
-                    AV::Ival(..) => Col::I(Vec::new()),
-                    AV::Bool(_) | AV::UBool => Col::V(Vec::new()),
-                    v => Col::U(v),
-                })
-                .collect();
-            b.shape_hash = row.shape_hash;
-            b
-        });
-        self.slots[q].push_row(row, row.row_keys[0], cell);
-        self.emitted += 1;
-        self.pushed(q)
-    }
-}
-
-
 /// THE LEVEL -1 FILTER at a horizon (`CELESTE_LEVEL_MINUS_ONE="H,S"`, H in
 /// search steps): drop a queue when the table proves its cell cannot exit
 /// by `h` (sound: inductive ranges, clipped successors and deaths
@@ -1458,68 +500,6 @@ impl Filters<'_> {
     /// raise extends (a marks-filtered tree is rebuilt for another horizon).
     pub fn notes_drops(&self) -> bool {
         self.marks.is_none() && self.minus_one.is_some()
-    }
-}
-
-/// The sources of rows level -1 dropped, per source its smallest horizon that
-/// admits one of them: DENSE over the wave's input rows (an atomic min per
-/// row), not a map - the sources are always input rows, and per-worker hash
-/// maps of tens of millions of entries were 68% of a frame (room (6,2) 100%
-/// f57). Looked up by id through the input's runs of consecutive ids.
-pub struct DropNotes {
-    /// `(first id, rows, offset into mins)` per run, sorted by id.
-    runs: Vec<(u64, u32, u32)>,
-    mins: Vec<AtomicU32>,
-}
-
-impl DropNotes {
-    pub fn new(blocks: &[Block]) -> Self {
-        let mut runs = Vec::new();
-        let mut off = 0u32;
-        for b in blocks {
-            let ids = &b.ids;
-            let mut i = 0;
-            while i < ids.len() {
-                let mut j = i + 1;
-                while j < ids.len() && ids[j] == ids[j - 1] + 1 {
-                    j += 1;
-                }
-                runs.push((ids[i], (j - i) as u32, off));
-                off += (j - i) as u32;
-                i = j;
-            }
-        }
-        runs.sort_unstable();
-        let mins = (0..off).map(|_| AtomicU32::new(u32::MAX)).collect();
-        DropNotes { runs, mins }
-    }
-
-    /// Note `mask`'s lanes from `base` as sources of a row dropped until `from`.
-    pub fn note(&self, base: u64, mask: u64, from: u32) {
-        let k = self.runs.partition_point(|r| r.0 <= base);
-        let (start, len, off) = self.runs[k.checked_sub(1).expect("a dropped row's source is an input row")];
-        let mut m = mask;
-        while m != 0 {
-            let id = base + m.trailing_zeros() as u64;
-            m &= m - 1;
-            let at = id - start;
-            assert!(at < len as u64, "source {id:#x} outside its input run");
-            self.mins[(off as u64 + at) as usize].fetch_min(from, Ordering::Relaxed);
-        }
-    }
-
-    /// `(id, smallest horizon)` per noted source, by id.
-    pub fn into_sorted(self) -> Vec<(u64, u32)> {
-        let mut out = Vec::new();
-        for (start, len, off) in &self.runs {
-            for k in 0..*len {
-                let m = self.mins[(off + k) as usize].load(Ordering::Relaxed);
-                if m != u32::MAX {
-                    out.push((start + k as u64, m));
-                }
-            }
-        }
-        out
     }
 }
 
@@ -1611,50 +591,13 @@ pub fn widened_keys_rt2(
 pub trait FrameStep: Sync {
     /// One frame of `lanes` of `block` into `sink`; called concurrently on
     /// disjoint ranges (scratch in the sink or behind a lock).
-    fn run(&self, block: &Block, cell_in: &[u32], lanes: &[usize], sink: &mut ForwardSink) -> Result<()>;
+    fn run(&self, block: &Block, cell_in: &[u32], lanes: &[usize], sink: &mut crate::storage::unit::UnitSink) -> Result<()>;
 
     /// Build what the engine builds on first use (the kernels) before a
     /// wave's clock starts: built inside the wave, the first frame's workers
     /// all waited on the build's lock (room (6,2) 100% f57: 61 of 152
     /// worker-s, so a one-frame bench timed the build).
     fn warm(&self) {}
-}
-
-/// Lanes per unit (one kernel call) for a frame of `lanes` input rows on
-/// `workers`: ~16 units a worker, between 1024 and 4096 lanes. A bigger unit
-/// fills more of each region's slices and dedups more before the queues
-/// (room (3,0) 100% r0sxhfn at 8 px, f49: 1024 -> 4096 lanes, padding 22%
-/// -> 11%, wave 2.48 -> 2.03 s; room (6,2) 100% f57 4.80 -> 4.71 s); a small
-/// frame keeps enough units to balance. `CELESTE_UNIT_LANES` fixes it (a
-/// multiple of 64, the id groups).
-fn unit_lanes(lanes: usize, workers: usize) -> usize {
-    static FIXED: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
-    let fixed = *FIXED.get_or_init(|| {
-        std::env::var("CELESTE_UNIT_LANES").ok().map(|v| {
-            let n: usize = v.parse().unwrap_or_else(|_| panic!("CELESTE_UNIT_LANES={v:?} is not a number"));
-            assert!(n >= 64 && n % 64 == 0, "CELESTE_UNIT_LANES={n}: must be a positive multiple of 64");
-            n
-        })
-    });
-    fixed.unwrap_or_else(|| (lanes / (workers.max(1) * 16)).clamp(1024, 4096) & !63)
-}
-
-/// Stack per frame worker: kernel spill frames reach ~83 MB (virtual; each
-/// call checks it fits, `asm_kernel::set_thread_stack`).
-const WORKER_STACK: usize = 512 << 20;
-
-/// Cut `blocks` (by lane count) into `(block, lo, hi)` units.
-fn units_of(lanes: impl Iterator<Item = usize>, unit: usize) -> Vec<(usize, usize, usize)> {
-    let mut units = Vec::new();
-    for (bi, n) in lanes.enumerate() {
-        let mut lo = 0;
-        while lo < n {
-            let hi = (lo + unit).min(n);
-            units.push((bi, lo, hi));
-            lo = hi;
-        }
-    }
-    units
 }
 
 /// Where a wave's new states go.
@@ -1671,7 +614,7 @@ pub enum Layer {
 pub struct Raised {
     /// The new pieces' first seq (after the frame's own).
     pub first_seq: u32,
-    /// The filter the tree was built under: where it admitted a queue, the
+    /// The filter the tree was built under: where it admitted a cell, the
     /// tree's sources' edges into it are recorded already.
     pub old: MinusOne,
     /// The sources (layer `frame - 1`) below this seq are the tree's; from
@@ -1679,227 +622,35 @@ pub struct Raised {
     pub old_seqs: u32,
 }
 
-/// One wave's output.
-pub struct Wave {
-    /// The new states, as pieces with their ids.
-    pub next: Vec<Block>,
-    pub won: bool,
-    pub stats: FrameStats,
-    /// The level -1 drops' sources (`Filters::notes_drops`): `(id, the
-    /// smallest horizon admitting one of its dropped successors)`, by id.
-    pub dropped: Vec<(u64, u32)>,
-}
-
-/// One forward frame (the wave): units in CELL order pulled by workers into
-/// their own sinks; one barrier. The kept set does not depend on scheduling.
-#[allow(clippy::too_many_arguments)]
-pub fn forward_frame(
-    engine: &dyn FrameStep,
-    frontier: Vec<Block>,
-    door: &crate::search::door::Door,
-    pos: Option<&crate::search::pos_graph::PosObserver>,
-    filters: Filters,
-    frame: u32,
-    edges_dir: Option<&std::path::Path>,
-    layer: Layer,
-) -> Result<Wave> {
-    use std::time::Instant;
-    // A platforms-unknown level knows only `PLATFORM_WORLD_FRAMES` worlds.
-    let level = crate::abstraction::current_level();
-    // Under the split frame a game frame is two steps.
-    let game_frame = frame.div_ceil(steps_per_frame());
-    anyhow::ensure!(
-        !level.platforms || game_frame as usize <= crate::trace::kernel::PLATFORM_WORLD_FRAMES,
-        "frame {frame} at {level}: the platform worlds cover {} frames",
-        crate::trace::kernel::PLATFORM_WORLD_FRAMES
-    );
-    let t_warm = Instant::now();
-    engine.warm();
-    if let Some(m) = filters.minus_one {
-        let _ = m.table();
-    }
-    if t_warm.elapsed().as_secs_f64() > 0.5 {
-        // Not `[fwd] f...`: log readers (`export-ui`) parse those as frames.
-        eprintln!("[warm] f{frame}: engine and level -1 table built in {:.1} s, before the wave", t_warm.elapsed().as_secs_f64());
-    }
-    let mut st = FrameStats::default();
-    let workers = threads();
-    let t_frame = std::time::Instant::now();
-    st.blocks_in = frontier.len();
-    st.lanes_in = frontier.iter().map(Block::lanes).sum();
-    st.bytes_in = frontier.iter().map(Block::bytes).sum();
-    st.rss_start = crate::metrics::current_rss_gb();
-
-    let cells: Vec<Vec<u32>> = frontier.iter().map(Block::positions).collect::<Result<_>>()?;
-    // Per block its live lanes (a skipped lane is never expanded), in
-    // storage order, which is POSITION order: a layer is stored by region
-    // (the kernel key's), cell, key (`canon`). So a unit is a few regions
-    // and few cells, its slices fill, and its dedup cache sees the outputs
-    // of neighbouring inputs together. (Sorting here instead, a213214, was
-    // the identity on every canonical block and 0.1-0.2 s serial a frame
-    // on room (6,2) 100% f57; a tree written before `canon` runs its first
-    // frame after a resume in flush order: slower, the same states.)
-    let order: Vec<Vec<usize>> = frontier.iter().map(|b| (0..b.lanes()).filter(|&l| b.skip.is_empty() || !b.skip[l]).collect()).collect();
-    // Units in WAVE order: by first position.
-    let mut units = units_of(order.iter().map(Vec::len), unit_lanes(order.iter().map(Vec::len).sum(), workers));
-    units.sort_by_key(|&(bi, lo, _)| (cells[bi][order[bi][lo]], bi, lo));
-    let next_unit = AtomicUsize::new(0);
-    // Level -1's drops are noted against the input rows (`DropNotes`).
-    let notes = (filters.notes_drops() && edges_dir.is_some()).then(|| DropNotes::new(&frontier));
-    let (seqs, raised) = match layer {
-        Layer::New => (AtomicU32::new(0), None),
-        Layer::Raised(r) => (AtomicU32::new(r.first_seq), Some(r)),
-    };
-
-    let t = Instant::now();
-    struct Done {
-        pieces: Vec<crate::canon::Flushed>,
-        won: bool,
-        kept: usize,
-        flushes: u64,
-        flushed_rows: u64,
-        emitted: u64,
-        edges: rustc_hash::FxHashSet<(u32, u32)>,
-        queue_bytes: usize,
-        edge_records: u64,
-        t_edges: std::time::Duration,
-        busy: std::time::Duration,
-    }
-    let done: Vec<Done> = std::thread::scope(|scope| {
-        let handles: Vec<_> = (0..workers)
-            .map(|w| {
-                let (frontier, cells, order, units, next_unit, seqs, notes) = (&frontier, &cells, &order, &units, &next_unit, &seqs, notes.as_ref());
-                std::thread::Builder::new().stack_size(WORKER_STACK).spawn_scoped(scope, move || -> Result<Done> {
-                    crate::compiled::asm_kernel::set_thread_stack(WORKER_STACK);
-                    let t = Instant::now();
-                    let mut sink = ForwardSink::forward(door, filters, pos.is_some(), frame, w as u32, edges_dir, seqs, raised, notes);
-                    loop {
-                        let u = next_unit.fetch_add(1, Ordering::Relaxed);
-                        let Some(&(bi, lo, hi)) = units.get(u) else { break };
-                        let b = &frontier[bi];
-                        sink.ids_in = (!b.ids.is_empty()).then_some(b.ids.as_slice());
-                        sink.skip_in = (!b.skip.is_empty()).then_some(b.skip.as_slice());
-                        sink.sources_old = raised.is_some_and(|r| b.seq < r.old_seqs);
-                        // Dedup within the UNIT (the door catches the rest). Per
-                        // kernel call it caught little once the kernels were keyed
-                        // by region: a unit's cell order changes region every
-                        // ~12 rows (room (1,0) f0-f70: 1.37M calls, 2.6x the
-                        // rows after the cache). Its refs stay valid across
-                        // calls: queued rows carry a generation, flushed ones an id.
-                        sink.seen.clear();
-                        let t_unit = phases::start();
-                        engine.run(b, &cells[bi], &order[bi][lo..hi], &mut sink)?;
-                        phases::add(phases::UNIT, t_unit);
-                    }
-                    let t_fin = phases::start();
-                    let pieces = sink.finish()?;
-                    phases::add(phases::FINISH, t_fin);
-                    crate::compiled::dispatch::fold_hits();
-                    Ok(Done {
-                        pieces,
-                        won: sink.won,
-                        kept: sink.kept,
-                        flushes: sink.flushes,
-                        flushed_rows: sink.flushed_rows,
-                        emitted: sink.emitted,
-                        edges: std::mem::take(&mut sink.edges),
-                        queue_bytes: sink.alloc_bytes(),
-                        edge_records: sink.edge_records,
-                        t_edges: sink.t_edges,
-                        busy: t.elapsed(),
-                    })
-                }).expect("spawn wave worker")
-            })
-            .collect();
-        handles
-            .into_iter()
-            .map(|h| h.join().expect("wave worker panicked"))
-            .collect::<Result<Vec<_>>>()
-    })?;
-    st.t_wave = t.elapsed();
-    st.wave_idle = idle_fraction(st.t_wave, workers, done.iter().map(|d| d.busy).sum());
-    st.rss_wave = crate::metrics::current_rss_gb();
-    drop(frontier);
-
-    let mut won = false;
-    let mut pieces: Vec<crate::canon::Flushed> = Vec::new();
-    for d in done {
-        st.lanes_raw += d.emitted as usize;
-        st.lanes_kept += d.kept;
-        st.flushes += d.flushes;
-        st.flushed_rows += d.flushed_rows;
-        st.queue_bytes += d.queue_bytes;
-        st.edge_records += d.edge_records;
-        st.t_edges += d.t_edges;
-        won |= d.won;
-        if let Some(p) = pos {
-            p.record_pairs(d.edges.iter().copied());
-        }
-        pieces.extend(d.pieces);
-    }
-    // The next frontier: the layer in CANONICAL order (`canon`); the ids the
-    // wave handed out are renumbered in the door and, where the inversion
-    // decodes them, in the edge records.
-    let t = Instant::now();
-    let first_seq = match layer {
-        Layer::New => 0,
-        Layer::Raised(r) => r.first_seq,
-    };
-    let (next, renumber) = crate::canon::canonical_layer(pieces, frame, first_seq)?;
-    if let Some(dir) = edges_dir {
-        renumber.save(&crate::search::edges::renumber_path(dir, frame))?;
-    }
-    st.t_canon = t.elapsed();
-    let t = Instant::now();
-    door.end_frame(workers, Some(&renumber));
-    st.t_door = t.elapsed();
-    st.door_bytes = door.alloc_bytes();
-    st.rss_end = crate::metrics::current_rss_gb();
-    st.rss_file = crate::metrics::current_file_rss_gb();
-    st.blocks_out = next.len();
-    st.lanes_out = next.iter().map(Block::lanes).sum();
-    let dropped = notes.map_or_else(Vec::new, DropNotes::into_sorted);
-    phases::print_phases(t_frame.elapsed(), workers);
-    Ok(Wave { next, won, stats: st, dropped })
-}
-
-
-/// The share of `workers x wall` spent waiting at the barrier.
-fn idle_fraction(wall: std::time::Duration, workers: usize, busy: std::time::Duration) -> f64 {
-    if workers == 0 || wall.is_zero() {
-        return 0.0;
-    }
-    (1.0 - busy.as_secs_f64() / (workers as f64 * wall.as_secs_f64())).max(0.0)
-}
-
 /// One forward frame's timings and sizes, for the `[fwd]` log line.
 #[derive(Default, Clone, Copy)]
 pub struct FrameStats {
     pub blocks_in: usize,
     pub lanes_in: usize,
-    /// Rows emitted (after the within-call dedup), before filter and door.
+    /// Emissions past level -1: each a lookup and an edge.
     pub lanes_raw: usize,
-    /// Rows that passed the filter and were new at the door.
+    /// New states (requests the translation found new).
     pub lanes_kept: usize,
     pub blocks_out: usize,
     pub lanes_out: usize,
-    /// The wave's wall time and its barrier idle fraction.
+    /// The units' wall time and its barrier idle fraction.
     pub t_wave: std::time::Duration,
     pub wave_idle: f64,
-    /// The layer's renumbering into canonical order (`canon`), wall.
-    pub t_canon: std::time::Duration,
-    /// The door's end-of-frame merge, wall.
-    pub t_door: std::time::Duration,
-    pub flushes: u64,
-    pub flushed_rows: u64,
-    /// Edge records written, and the workers' summed time writing them.
+    /// The translation, wall.
+    pub t_translate: std::time::Duration,
+    /// The layer's gather and the edge file, wall.
+    pub t_layer: std::time::Duration,
+    pub units: usize,
+    /// The units' requests and lids (distinct target entries per unit).
+    pub requests: u64,
+    pub lids: u64,
+    /// Edges recorded, and the frame's edge file bytes.
     pub edge_records: u64,
-    pub t_edges: std::time::Duration,
+    pub edge_bytes: u64,
     /// The input frontier's row storage, bytes.
     pub bytes_in: usize,
-    /// Bytes allocated in the workers' queue pools, and in the door.
-    pub queue_bytes: usize,
-    pub door_bytes: usize,
+    /// Bytes allocated in the visited set.
+    pub visited_bytes: usize,
     /// Anonymous resident set at the frame's start, after the wave, at the end.
     pub rss_start: f64,
     pub rss_wave: f64,
@@ -2010,49 +761,53 @@ fn raise_marker(dir: &std::path::Path) -> std::path::PathBuf {
     dir.join("raising.txt")
 }
 
-/// The rows `ids` (sorted) of layer `layer`, as one block per file of the
-/// whole 64-row id groups holding them (a kernel slice reads its lanes' ids
-/// as the group's first plus the lane), every other row skipped.
-fn load_sources(dir: &std::path::Path, layer: u32, ids: &[u64]) -> Result<Vec<Block>> {
-    let files = frame_files(dir, layer)?;
+/// The rows `ids` (sorted) of layer `layer`, as one block per file holding
+/// some, exactly those rows (a raise's sources).
+fn load_sources(dir: &std::path::Path, layer: u32, ids: &[StateId]) -> Result<Vec<Block>> {
     let mut out = Vec::new();
-    let mut i = 0;
-    while i < ids.len() {
-        let seq = id_seq(ids[i]);
-        let j = i + ids[i..].partition_point(|&id| id_seq(id) == seq);
-        let (_, file) = files
-            .iter()
-            .find(|(s, _)| *s == seq)
-            .ok_or_else(|| anyhow::anyhow!("{}: no file of layer {layer} with seq {seq}", dir.display()))?;
-        let width = file.width();
+    let mut found = 0usize;
+    for (seq, file) in frame_files(dir, layer)? {
+        let mut rows: Vec<u32> = ids.iter().filter_map(|&id| file.find_row(id)).collect();
+        if rows.is_empty() {
+            continue;
+        }
+        rows.sort_unstable();
+        found += rows.len();
         let mut ranges: Vec<Range<u32>> = Vec::new();
-        for &id in &ids[i..j] {
-            let row = id_row(id);
-            anyhow::ensure!(id_layer(id) == layer && row < width, "{}: id {id:#x} is not a row of layer {layer}", dir.display());
-            let g = row / 64 * 64;
-            let group = g..(g + 64).min(width);
+        for &r in &rows {
             match ranges.last_mut() {
-                Some(r) if r.end >= group.start => r.end = r.end.max(group.end),
-                _ => ranges.push(group),
+                Some(x) if x.end == r => x.end = r + 1,
+                _ => ranges.push(r..r + 1),
             }
         }
         let rt2 = file.load_rows(&ranges)?.expect("rows of a non-empty range");
-        let row_ids: Vec<u64> = ranges.iter().flat_map(|r| r.clone()).map(|r| pack_id(layer, seq, r)).collect();
-        let wanted: rustc_hash::FxHashSet<u64> = ids[i..j].iter().copied().collect();
-        let skip = row_ids.iter().map(|id| !wanted.contains(id)).collect();
-        let mut b = Block::with_ids(rt2, row_ids, seq);
-        b.set_skip(skip);
-        out.push(b);
-        i = j;
+        out.push(Block::with_ids(rt2, rows.iter().map(|&r| file.id_at(r)).collect(), seq));
     }
+    anyhow::ensure!(found == ids.len(), "{}: {} of {} sources found in layer {layer}", dir.display(), found, ids.len());
     Ok(out)
+}
+
+/// Every state's layer (a raise's refusal of a hit from a later layer).
+fn state_layers(dir: &std::path::Path, last: u32) -> Result<crate::storage::wave::StateLayers> {
+    let geo = crate::storage::geometry();
+    let mut layers = crate::storage::wave::StateLayers::new((geo.side * geo.side) as usize);
+    for f in 0..=last {
+        for (_, file) in frame_files(dir, f)? {
+            for id in file.ids() {
+                layers.set(id, f);
+            }
+        }
+    }
+    Ok(layers)
 }
 
 /// The forward's in-memory state, EXTENDED frame by frame (each checkpointed).
 pub struct ForwardState {
     frontier: Vec<Block>,
-    /// The door: every (shape, cell, key) reached so far (`search::door`).
-    door: crate::search::door::Door,
+    /// Every state reached so far (`storage::visited`).
+    visited: crate::storage::visited::VisitedSet,
+    /// The tree's transfers (`storage::edges::XferTable`).
+    xfers: crate::storage::edges::XferTable,
     observer: Option<crate::search::pos_graph::PosObserver>,
     /// The last frame computed (and checkpointed).
     pub frames: u32,
@@ -2074,10 +829,10 @@ pub struct ForwardResult {
 }
 
 impl ForwardState {
-    /// Frame 0: seed the door from `initial` and checkpoint it; the tree is
-    /// filtered by `minus_one` (recorded).
+    /// Frame 0: `initial` into an empty visited set (its ids) and
+    /// checkpointed; the tree is filtered by `minus_one` (recorded).
     pub fn start(mut initial: Vec<Block>, dir: &std::path::Path, record: bool, minus_one: Option<MinusOne>) -> Result<Self> {
-        // A fresh tree keeps nothing a killed run left (stale edge runs).
+        // A fresh tree keeps nothing a killed run left (stale edge files).
         for sub in ["frames", "edges", "dropped"] {
             let p = dir.join(sub);
             if p.exists() {
@@ -2086,19 +841,11 @@ impl ForwardState {
         }
         let filter = TreeFilter::of(minus_one);
         filter.write(dir)?;
-        // The checkpoint assigns the ids (layer 0) the door takes.
+        let mut visited = crate::storage::visited::VisitedSet::new(*crate::storage::geometry());
+        let meta = crate::storage::wave::seed(&mut visited, &mut initial)?;
         checkpoint_frontier(dir, 0, &mut initial, true)?;
-        crate::search::edges::set_done_frame(&dir.join("edges"), 0)?;
-        let door = crate::search::door::Door::new();
-        for b in &initial {
-            let cells = b.positions()?;
-            let shape = b.shard_shape();
-            let (mut new, mut ids) = (Vec::new(), Vec::new());
-            for ((&cell, &key), &id) in cells.iter().zip(b.keys()).zip(b.ids()) {
-                door.admit(shape, cell, &[key], id, &mut ids, &mut new);
-            }
-        }
-        door.end_frame(1, None);
+        crate::storage::meta::save(dir, 0, None, &meta)?;
+        crate::storage::edges::set_done_frame(&dir.join("edges"), 0)?;
         let observer = record.then(crate::search::pos_graph::PosObserver::default);
         // An (empty) graph from the start: every tree with frames has one.
         if let Some(o) = observer.as_ref() {
@@ -2106,7 +853,8 @@ impl ForwardState {
         }
         Ok(ForwardState {
             frontier: initial,
-            door,
+            visited,
+            xfers: Default::default(),
             observer,
             frames: 0,
             win_frame: None,
@@ -2117,7 +865,6 @@ impl ForwardState {
     /// The forward as its checkpoint tree left it (`None`: no tree); extending
     /// it matches extending the original.
     pub fn resume(dir: &std::path::Path, record: bool) -> Result<Option<Self>> {
-        use crate::search::door::Admit;
         anyhow::ensure!(
             !raise_marker(dir).exists(),
             "{}: a raise was interrupted ({}); its frames are half raised - delete the tree",
@@ -2130,63 +877,21 @@ impl ForwardState {
         }
         let Some(mut last) = last else { return Ok(None) };
         let t = std::time::Instant::now();
-        // Trust only frames whose edge records are complete (at most one lost).
+        // Trust only frames whose files are complete (at most one lost).
         let edges_dir = dir.join("edges");
-        let done = crate::search::edges::done_frame(&edges_dir).unwrap_or(last);
+        let done = crate::storage::edges::done_frame(&edges_dir).unwrap_or(last);
         if done < last {
             for f in done + 1..=last {
                 std::fs::remove_dir_all(dir.join("frames").join(format!("f{:03}", f)))?;
                 let _ = std::fs::remove_file(dropped_path(dir, f));
             }
-            eprintln!("[resume] frames f{} to f{last} discarded: their edge records were not complete", done + 1);
+            eprintln!("[resume] frames f{} to f{last} discarded: their files were not complete", done + 1);
             last = done;
         }
-        crate::search::edges::discard_after(&edges_dir, last)?;
+        crate::storage::edges::discard_after(&edges_dir, last)?;
         let filter = TreeFilter::read(dir)?;
-        // Every layer's keys into the door, one file per unit of work.
-        let mut files: Vec<(u32, u32, std::path::PathBuf)> = Vec::new();
-        for f in 0..=last {
-            files.extend(frame_paths(dir, f)?.into_iter().map(|(seq, p)| (f, seq, p)));
-        }
-        let next = AtomicUsize::new(0);
-        let partial: Vec<(rustc_hash::FxHashMap<(u64, u32), Vec<crate::search::door::Entry>>, Option<u32>)> =
-            std::thread::scope(|scope| {
-                let handles: Vec<_> = (0..threads())
-                    .map(|_| {
-                        let (files, next) = (&files, &next);
-                        scope.spawn(move || -> Result<_> {
-                            let mut m: rustc_hash::FxHashMap<(u64, u32), Vec<crate::search::door::Entry>> = Default::default();
-                            let mut win: Option<u32> = None;
-                            loop {
-                                let i = next.fetch_add(1, Ordering::Relaxed);
-                                let Some((f, seq, path)) = files.get(i) else { break };
-                                let file = crate::search::checkpoint::FrameFile::open(path)?;
-                                let shape = file.shape_hash();
-                                for (row, (cell, key)) in file.cell_keys_rows() {
-                                    m.entry((shape, cell)).or_default().push((key, pack_id(*f, *seq, row)));
-                                }
-                                if !file.wins().is_empty() {
-                                    win = Some(win.map_or(*f, |w| w.min(*f)));
-                                }
-                            }
-                            Ok((m, win))
-                        })
-                    })
-                    .collect();
-                handles.into_iter().map(|h| h.join().expect("resume loader panicked")).collect::<Result<Vec<_>>>()
-            })?;
-        let mut shards: rustc_hash::FxHashMap<(u64, u32), Vec<crate::search::door::Entry>> = Default::default();
-        let mut win_frame: Option<u32> = None;
-        for (m, w) in partial {
-            for (k, mut v) in m {
-                shards.entry(k).or_default().append(&mut v);
-            }
-            win_frame = match (win_frame, w) {
-                (Some(a), Some(b)) => Some(a.min(b)),
-                (a, b) => a.or(b),
-            };
-        }
-        let door = crate::search::door::Door::from_shards(shards);
+        let (visited, win_frame) = restore_visited(dir, last)?;
+        let xfers = crate::storage::edges::XferTable::load(&edges_dir)?;
         // The frontier: the last layer minus the rows the forward does not
         // expand (`not_expanded`, as `extend` decides it; a tree without a
         // record by the environment's ceiling, as it was built).
@@ -2216,25 +921,26 @@ impl ForwardState {
             None
         };
         eprintln!(
-            "[resume] {}: f{last} ({} lanes), door {} entries from {} files, first win {:?}, level -1 {:?}, {:.1} s",
+            "[resume] {}: f{last} ({} lanes), visited {} states in {} entries, first win {:?}, level -1 {:?}, {:.1} s",
             dir.display(),
             frontier.iter().map(Block::lanes).sum::<usize>(),
-            door.len(),
-            files.len(),
+            visited.len(),
+            visited.entries(),
             win_frame,
             filter,
             t.elapsed().as_secs_f64()
         );
-        Ok(Some(ForwardState { frontier, door, observer, frames: last, win_frame, filter }))
+        Ok(Some(ForwardState { frontier, visited, xfers, observer, frames: last, win_frame, filter }))
     }
 
-    /// The door's size: every distinct state reached so far.
+    /// The visited set's size: every distinct state reached so far.
     pub fn visited_len(&self) -> usize {
-        self.door.len()
+        self.visited.len()
     }
 
-    pub fn door(&self) -> &crate::search::door::Door {
-        &self.door
+    /// The visited set (`bench-frame`, `bench-storage`).
+    pub fn visited(&self) -> &crate::storage::visited::VisitedSet {
+        &self.visited
     }
 
     /// Compute and checkpoint frames `frames+1 ..= to` under the tree's
@@ -2258,7 +964,17 @@ impl ForwardState {
             let t_frame = std::time::Instant::now();
             let frontier = std::mem::take(&mut self.frontier);
             let edges_dir = dir.join("edges");
-            let wave = forward_frame(engine, frontier, &self.door, self.observer.as_ref(), filters, frame, Some(&edges_dir), Layer::New)?;
+            let cx = crate::storage::wave::WaveCtx {
+                visited: &mut self.visited,
+                xfers: &mut self.xfers,
+                pos: self.observer.as_ref(),
+                filters,
+                frame,
+                edges_dir: Some(&edges_dir),
+                layer: Layer::New,
+                layers: None,
+            };
+            let wave = crate::storage::wave::run_wave(engine, frontier, cx)?;
             let (mut next, won, st) = (wave.next, wave.won, wave.stats);
             // Before the frame is trusted (its checkpoint, then done.txt).
             if filters.notes_drops() {
@@ -2266,11 +982,9 @@ impl ForwardState {
             }
             let t = std::time::Instant::now();
             checkpoint_frontier(dir, frame, &mut next, true)?;
+            crate::storage::meta::save(dir, frame, None, &wave.meta)?;
             let t_ckpt = t.elapsed();
-            // The wave wrote every raw record (`ForwardSink::finish`): the
-            // frame is complete. Its records stay raw until the backward
-            // inverts them (`edges::invert`).
-            crate::search::edges::set_done_frame(&edges_dir, frame)?;
+            crate::storage::edges::set_done_frame(&edges_dir, frame)?;
             // A resume loads frame `frame` as its frontier and never an
             // earlier one's rows: those may go.
             if trim_rows() && frame >= 2 {
@@ -2327,17 +1041,16 @@ impl ForwardState {
     /// Each frame noted the SOURCES of its drops with the smallest horizon
     /// admitting one (`dropped/`), so frame by frame this re-expands those
     /// sources and the states the raise added one frame earlier, under `to`,
-    /// against the whole tree's door: a new state joins the frame's layer
-    /// (new pieces, numbered after its own), an old one gets its edge; a
-    /// re-expanded source's edges into queues the old filter admitted are
-    /// recorded already and skipped (`Raised`). The new edges go to the
-    /// frame's RAISED runs (`edges::compact_raised`), so the frame's runs are
-    /// not rewritten. The result is the tree a fresh
-    /// forward under `to` makes - the same states per frame, the same edges,
-    /// the same notes - unless the larger horizon reaches a state SOONER
-    /// than the tree does (the table inconsistent along an edge), which would
-    /// renumber the tree: refused (`ForwardSink::flush`). Then `extend`
-    /// continues under `to`.
+    /// against the whole tree's visited set: a new state joins the frame's
+    /// layer (new pieces, numbered after its own; new entries numbered after
+    /// every entry), an old one gets its edge; a re-expanded source's edges
+    /// into cells the old filter admitted are recorded already and skipped
+    /// (`Raised`). The new edges go to the frame's RAISED edge file
+    /// (`f{frame}.r{seq}.bin`). The result is the tree a fresh forward under
+    /// `to` makes - the same states per frame, the same edges, the same
+    /// notes - unless the larger horizon reaches a state SOONER than the
+    /// tree does (the table inconsistent along an edge): refused
+    /// (`UnitSink::emit`). Then `extend` continues under `to`.
     pub fn raise(&mut self, engine: &dyn FrameStep, dir: &std::path::Path, to: Option<MinusOne>) -> Result<()> {
         let Some(TreeFilter::MinusOne { m: from, .. }) = self.filter else {
             anyhow::bail!("{}: only a tree built under level -1 can be raised (its record: {:?})", dir.display(), self.filter);
@@ -2353,11 +1066,7 @@ impl ForwardState {
         let t0 = std::time::Instant::now();
         let last = self.frames;
         let edges_dir = dir.join("edges");
-        // The raise writes each frame's new records as raw files of their
-        // own, compacted into its RAISED runs: the frames' own records are
-        // inverted into their runs first.
-        crate::search::edges::invert(&edges_dir, last)?;
-        let notes: Vec<Vec<(u64, u32)>> = (1..=last)
+        let notes: Vec<Vec<(StateId, u32)>> = (1..=last)
             .map(|t| {
                 let p = dropped_path(dir, t);
                 crate::search::checkpoint::load_value_from(&p).with_context(|| format!("{}: frame {t}'s level -1 drops were not noted: the tree cannot be raised (delete it)", p.display()))
@@ -2365,27 +1074,27 @@ impl ForwardState {
             .collect::<Result<_>>()?;
         // Before touching the tree: the rows to re-expand hold their values.
         for t in 1..=last {
-            let seqs: rustc_hash::FxHashSet<u32> = notes[t as usize - 1].iter().filter(|e| e.1 <= h_new).map(|e| id_seq(e.0)).collect();
-            for (seq, file) in frame_files(dir, t - 1)? {
+            let redo: Vec<StateId> = notes[t as usize - 1].iter().filter(|e| e.1 <= h_new).map(|e| e.0).collect();
+            for (_, file) in frame_files(dir, t - 1)? {
                 anyhow::ensure!(
-                    !seqs.contains(&seq) || !file.trimmed(),
+                    !file.trimmed() || redo.iter().all(|&id| file.find_row(id).is_none()),
                     "{}: frame {}'s rows were trimmed (CELESTE_TRIM_ROWS) and the raise must re-expand some: delete the tree",
                     dir.display(),
                     t - 1
                 );
             }
         }
+        let mut layers = state_layers(dir, last)?;
         std::fs::write(raise_marker(dir), format!("raising level -1 from step {} to {to:?}\n", from.h))?;
         eprintln!("[raise] {}: level -1 from step {} to {}, frames 1-{last}", dir.display(), from.h, to.map_or("off".to_string(), |m| format!("step {}", m.h)));
         let filters = Filters { marks: None, minus_one: to };
-        let mut compaction: Option<std::thread::JoinHandle<Result<crate::search::edges::CompactStats>>> = None;
         let mut new_prev: Vec<Block> = Vec::new();
         let (mut redone, mut added) = (0usize, 0usize);
         // The first seq the raise gave the previous layer (`u32::MAX`: none).
         let mut old_seqs = u32::MAX;
         for t in 1..=last {
             let notes_t = &notes[t as usize - 1];
-            let redo: Vec<u64> = notes_t.iter().filter(|e| e.1 <= h_new).map(|e| e.0).collect();
+            let redo: Vec<StateId> = notes_t.iter().filter(|e| e.1 <= h_new).map(|e| e.0).collect();
             if redo.is_empty() && new_prev.is_empty() {
                 old_seqs = u32::MAX;
                 continue;
@@ -2396,41 +1105,40 @@ impl ForwardState {
             frontier.append(&mut new_prev);
             let first_seq = frame_paths(dir, t)?.iter().map(|(s, _)| s + 1).max().unwrap_or(0);
             let layer = Layer::Raised(Raised { first_seq, old: from, old_seqs });
-            let wave = forward_frame(engine, frontier, &self.door, self.observer.as_ref(), filters, t, Some(&edges_dir), layer)?;
+            let cx = crate::storage::wave::WaveCtx {
+                visited: &mut self.visited,
+                xfers: &mut self.xfers,
+                pos: self.observer.as_ref(),
+                filters,
+                frame: t,
+                edges_dir: Some(&edges_dir),
+                layer,
+                layers: Some(&layers),
+            };
+            let wave = crate::storage::wave::run_wave(engine, frontier, cx)?;
             old_seqs = first_seq;
             let mut next = wave.next;
             checkpoint_frontier(dir, t, &mut next, false)?;
+            crate::storage::meta::save(dir, t, Some(first_seq), &wave.meta)?;
+            for b in &next {
+                for &id in b.ids() {
+                    layers.set(id, t);
+                }
+            }
             // The frame's notes: the sources not re-expanded keep theirs.
             if to.is_some() {
-                let mut kept: Vec<(u64, u32)> = notes_t.iter().copied().filter(|e| e.1 > h_new).collect();
+                let mut kept: Vec<(StateId, u32)> = notes_t.iter().copied().filter(|e| e.1 > h_new).collect();
                 kept.extend(wave.dropped);
                 kept.sort_unstable();
                 kept.dedup_by_key(|e| e.0);
                 crate::search::checkpoint::save_value_to(&dropped_path(dir, t), &kept)?;
-            }
-            // The frame's new edges into its raised runs (an earlier raise's
-            // reopened and merged), behind the next frame's wave.
-            if let Some(h) = compaction.take() {
-                h.join().expect("compaction thread panicked")?;
-            }
-            if wave.stats.edge_records > 0 {
-                let edges_dir = edges_dir.clone();
-                compaction = Some(std::thread::Builder::new().name(format!("raised-f{t}")).spawn(move || {
-                    crate::search::edges::reopen_raised(&edges_dir, t)?;
-                    crate::search::edges::compact_raised(&edges_dir, t)
-                })?);
-            } else {
-                let raw = crate::search::edges::raw_dir(&edges_dir, t);
-                if raw.exists() {
-                    std::fs::remove_dir_all(&raw)?;
-                }
             }
             if wave.won {
                 self.win_frame = Some(self.win_frame.map_or(t, |w| w.min(t)));
             }
             let kept = next.iter().map(Block::lanes).sum::<usize>();
             eprintln!(
-                "[raise] f{t:03} re-expanded {} sources + {n_new} new, raw {} kept {kept} new, {} edge records, {:.0} ms",
+                "[raise] f{t:03} re-expanded {} sources + {n_new} new, raw {} kept {kept} new, {} edges, {:.0} ms",
                 redo.len(),
                 wave.stats.lanes_raw,
                 wave.stats.edge_records,
@@ -2443,9 +1151,6 @@ impl ForwardState {
                 b.set_skip(skip);
             }
             new_prev = next;
-        }
-        if let Some(h) = compaction.take() {
-            h.join().expect("compaction thread panicked")?;
         }
         // The last layer's new states join the frontier `extend` expands.
         self.frontier.append(&mut new_prev);
@@ -2466,7 +1171,6 @@ impl ForwardState {
         );
         Ok(())
     }
-
     /// The position graph recorded so far (None when not recording).
     pub fn pos_graph(&self) -> Option<crate::search::pos_graph::PosGraph> {
         self.observer.as_ref().map(|o| o.snapshot())
@@ -2637,9 +1341,9 @@ fn log_frame(
     let ms = |d: std::time::Duration| d.as_secs_f64() * 1e3;
     eprintln!(
         "[fwd] f{frame:03} in {}/{} raw {} kept {} out {}/{} visited {} | \
-         wave {:.0} (idle {:.0}%) canon {:.0} door {:.0} ckpt {:.0} pos {:.0} total {:.0} ms | \
-         flushes {} ({:.0} rows avg) edges {} | \
-         in {:.2} queues {:.2} door {:.2} GB rss start {:.2} wave {:.2} end {:.2} peak {:.2} GB (anon; file {:.2})",
+         wave {:.0} (idle {:.0}%) translate {:.0} layer {:.0} ckpt {:.0} pos {:.0} total {:.0} ms | \
+         units {} requests {} lids {} edges {} ({:.2} B) | \
+         in {:.2} visited {:.2} GB rss start {:.2} wave {:.2} end {:.2} peak {:.2} GB (anon; file {:.2})",
         st.blocks_in,
         st.lanes_in,
         st.lanes_raw,
@@ -2649,17 +1353,18 @@ fn log_frame(
         visited,
         ms(st.t_wave),
         st.wave_idle * 100.0,
-        ms(st.t_canon),
-        ms(st.t_door),
+        ms(st.t_translate),
+        ms(st.t_layer),
         ms(t_ckpt),
         ms(t_pos),
         ms(t_total),
-        st.flushes,
-        st.flushed_rows as f64 / st.flushes.max(1) as f64,
+        st.units,
+        st.requests,
+        st.lids,
         st.edge_records,
+        st.edge_bytes as f64 / st.edge_records.max(1) as f64,
         st.bytes_in as f64 / 1e9,
-        st.queue_bytes as f64 / 1e9,
-        st.door_bytes as f64 / 1e9,
+        st.visited_bytes as f64 / 1e9,
         st.rss_start,
         st.rss_wave,
         st.rss_end,
@@ -2667,17 +1372,16 @@ fn log_frame(
         st.rss_file,
     );
     crate::metrics::record("fwd.wave", st.t_wave);
-    crate::metrics::record("fwd.canon", st.t_canon);
-    crate::metrics::record("fwd.door", st.t_door);
+    crate::metrics::record("fwd.translate", st.t_translate);
+    crate::metrics::record("fwd.layer", st.t_layer);
     crate::metrics::record("fwd.checkpoint", t_ckpt);
     crate::metrics::record("fwd.posgraph", t_pos);
     crate::metrics::record("fwd.frame", t_total);
 }
 
-/// Checkpoint a frontier: `frames/fNNN/s{shape}_{seq}.bin` per piece, in row
-/// order (position = id); the id-less initial frontier gets its ids here.
-/// `fresh`: a new frame (any old files go); else pieces a raise adds to the
-/// frame, beside its own.
+/// Checkpoint a frontier: `frames/fNNN/s{shape}_{seq}.bin` per piece, rows
+/// in id order. `fresh`: a new frame (any old files go); else pieces a raise
+/// adds to the frame, beside its own.
 fn checkpoint_frontier(dir: &std::path::Path, frame: u32, frontier: &mut [Block], fresh: bool) -> Result<()> {
     let fdir = dir.join("frames").join(format!("f{:03}", frame));
     // A re-run frame must not leave stale files behind.
@@ -2685,29 +1389,24 @@ fn checkpoint_frontier(dir: &std::path::Path, frame: u32, frontier: &mut [Block]
         let _ = std::fs::remove_dir_all(&fdir);
     }
     std::fs::create_dir_all(&fdir)?;
-    // Ids are (layer, seq, row): a frame's seqs must be distinct.
+    // A frame's seqs name its files: distinct.
     {
-        let mut seqs: Vec<u32> = frontier.iter().filter(|b| !b.ids.is_empty()).map(|b| b.seq).collect();
+        let mut seqs: Vec<u32> = frontier.iter().map(|b| b.seq).collect();
         seqs.sort_unstable();
         anyhow::ensure!(seqs.windows(2).all(|w| w[0] != w[1]), "checkpoint f{frame}: two pieces share a seq");
     }
     std::thread::scope(|scope| {
         let handles: Vec<_> = frontier
             .iter_mut()
-            .enumerate()
-            .map(|(i, block)| {
+            .map(|block| {
                 let fdir = &fdir;
                 scope.spawn(move || -> Result<()> {
-                    if block.ids.is_empty() {
-                        anyhow::ensure!(frame == 0, "checkpoint f{frame}: an id-less block past the initial frontier");
-                        block.seq = i as u32;
-                        block.ids = (0..block.lanes() as u32).map(|r| pack_id(frame, i as u32, r)).collect();
-                    }
+                    anyhow::ensure!(block.ids.len() == block.lanes(), "checkpoint f{frame}: a block without its ids");
                     let cells = block.positions()?;
                     let wins = block.wins()?;
                     let path = fdir.join(format!("s{:016x}_{:04}.bin", block.shard_shape(), block.seq));
                     anyhow::ensure!(fresh || !path.exists(), "checkpoint f{frame}: {} exists", path.display());
-                    crate::search::checkpoint::save_block(&path, &block.rt2, &cells, &wins)
+                    crate::search::checkpoint::save_block(&path, &block.rt2, &block.ids, &cells, &wins)
                 })
             })
             .collect();
@@ -2750,23 +1449,69 @@ pub fn load_frame(dir: &std::path::Path, frame: u32) -> Result<Vec<Block>> {
     let mut out = Vec::new();
     for (seq, file) in frame_files(dir, frame)? {
         if let Some(rt2) = file.load_all()? {
-            let ids: Vec<u64> = (0..rt2.width as u32).map(|r| pack_id(frame, seq, r)).collect();
-            out.push(Block::with_ids(rt2, ids, seq));
+            out.push(Block::with_ids(rt2, file.ids(), seq));
         }
     }
     Ok(out)
 }
 
-/// One stored row by its id (`pack_id`): the row, its shape and its cell.
-pub fn load_row(dir: &std::path::Path, id: u64) -> Result<(Rt2, u64, u32)> {
-    let (layer, seq, row) = (id_layer(id), id_seq(id), id_row(id));
-    let (_, f) = frame_files(dir, layer)?
-        .into_iter()
-        .find(|(s, _)| *s == seq)
-        .ok_or_else(|| anyhow::anyhow!("no file l{layer} s{seq} for id {id:#x}"))?;
-    anyhow::ensure!(row < f.width(), "id {id:#x}: row {row} past its file's {}", f.width());
-    let rt2 = f.load_rows(&[row..row + 1])?.ok_or_else(|| anyhow::anyhow!("no row for id {id:#x}"))?;
-    Ok((rt2, f.shape_hash(), f.row_cells()[row as usize]))
+/// One stored row by its id: the row, its shape, its cell and its layer
+/// (found by a binary search in each frame's files: a diagnostic's lookup).
+pub fn load_row(dir: &std::path::Path, id: StateId) -> Result<(Rt2, u64, u32, u32)> {
+    let mut frame = 0;
+    while dir.join("frames").join(format!("f{frame:03}")).is_dir() {
+        for (_, f) in frame_files(dir, frame)? {
+            if let Some(row) = f.find_row(id) {
+                let rt2 = f.load_rows(&[row..row + 1])?.ok_or_else(|| anyhow::anyhow!("no row for id {}", crate::storage::show_id(id)))?;
+                return Ok((rt2, f.shape_hash(), f.cell_at(row), frame));
+            }
+        }
+        frame += 1;
+    }
+    anyhow::bail!("{}: no frame holds state {}", dir.display(), crate::storage::show_id(id))
+}
+
+/// The visited set of a tree's frames `0..=last` (the storage metadata's
+/// shapes and entries, the frame files' ids for the cells), and its first
+/// win. A row whose key is not its entry's is a collision, fatal.
+pub fn restore_visited(dir: &std::path::Path, last: u32) -> Result<(crate::storage::visited::VisitedSet, Option<u32>)> {
+    let geo = *crate::storage::geometry();
+    let mut visited = crate::storage::visited::VisitedSet::new(geo);
+    let metas = crate::storage::meta::load_tree(dir, last)?;
+    let mut shapes: Vec<(u32, u64)> = metas.iter().flat_map(|m| m.shapes.iter().copied()).collect();
+    shapes.sort_unstable();
+    for (i, s) in shapes {
+        visited.restore_shape(i, s)?;
+    }
+    let mut entries: Vec<(u32, u32, crate::storage::visited::Key)> = metas.into_iter().flat_map(|m| m.entries).collect();
+    entries.sort_unstable();
+    let mut touched: Vec<u32> = Vec::new();
+    for (r, e, k) in entries {
+        anyhow::ensure!((r / geo.slots) < visited.shapes().len() as u32, "{}: entry of region {r}, whose shape is not numbered", dir.display());
+        visited.table_mut(r).push_numbered(geo.words, e, k)?;
+        if touched.last() != Some(&r) {
+            touched.push(r);
+        }
+    }
+    for r in touched {
+        visited.table_mut(r).reindex();
+    }
+    let mut win_frame = None;
+    for f in 0..=last {
+        for (_, file) in frame_files(dir, f)? {
+            for row in 0..file.width() {
+                let id = file.id_at(row);
+                let (r, e, l) = (crate::storage::id_region(id), crate::storage::id_entry(id), crate::storage::id_local(id));
+                let t = visited.table_mut(r);
+                anyhow::ensure!((e as usize) < t.len() && t.key(e) == file.key_at(row), "{}: f{f} row {row} (state {}) is not its entry's key", dir.display(), crate::storage::show_id(id));
+                anyhow::ensure!(t.set(geo.words, e, l), "{}: state {} stored twice", dir.display(), crate::storage::show_id(id));
+            }
+            if !file.wins().is_empty() {
+                win_frame = Some(win_frame.map_or(f, |w: u32| w.min(f)));
+            }
+        }
+    }
+    Ok((visited, win_frame))
 }
 
 /// One row of a marks file: `(shape, cell, key.0, key.1, dist)`.
@@ -2880,7 +1625,7 @@ impl Visited {
 
 /// The first win of a tree complete through `horizon`; `None` if it is not.
 pub fn tree_first_win_through(dir: &std::path::Path, horizon: u32) -> Result<Option<Option<u32>>> {
-    let done = crate::search::edges::done_frame(&dir.join("edges"));
+    let done = crate::storage::edges::done_frame(&dir.join("edges"));
     if done.is_none_or(|d| d < horizon) || !dir.join("frames").join(format!("f{horizon:03}")).is_dir() {
         return Ok(None);
     }
@@ -2916,46 +1661,10 @@ mod tests {
     }
 
 
-    /// A row ref names queues past index 255 without aliasing.
-    #[test]
-    fn row_refs_survive_more_than_256_queue_slots() {
-        let mut sink = ForwardSink::empty(false);
-        let engine = RefEngine::new().expect("ref engine");
-        let skeleton = Block::keyed(engine.initial().expect("initial state")).expect("block").into_rt2();
-        for q in 0..300 {
-            sink.slots.push(Slot::new(skeleton.clone_block()));
-            let s = &mut sink.slots[q];
-            s.live = true;
-            s.gen = (q * 7) as u16;
-            s.keys.push((q as u64, 1));
-            s.cells.push(0);
-            s.pred_base.push(1000 + q as u64 * 16);
-            s.pred_mask.push(1);
-            s.pred_xfer.push(7);
-            s.last_extra.push(u32::MAX);
-        }
-        let r = sink.row_ref(299);
-        assert!(r & celeste_engine::kernel::RowCache::ID_FLAG == 0);
-        assert!(sink.mark_pred(r, 1000 + 299 * 16, 7, 3));
-        assert_eq!(sink.slots[299].pred_mask[0], 0b1001);
-        assert_eq!(sink.slots[43].pred_mask[0], 1, "no other queue's row was touched");
-        // Another slice of the same call: an extra entry on the same row.
-        assert!(sink.mark_pred(r, 5000, 7, 2));
-        assert_eq!(sink.slots[299].extra, vec![(0, 5000, 7, 0b100u64)]);
-        // Lanes up to 63 (a 64-lane group).
-        assert!(sink.mark_pred(r, 1000 + 299 * 16, 7, 63));
-        assert_eq!(sink.slots[299].pred_mask[0], 0b1001 | (1 << 63));
-        // The same slice with another transfer: its own entry, not the mask.
-        assert!(sink.mark_pred(r, 1000 + 299 * 16, 8, 5));
-        assert!(sink.mark_pred(r, 1000 + 299 * 16, 8, 6));
-        assert_eq!(sink.slots[299].pred_mask[0], 0b1001 | (1 << 63));
-        assert_eq!(sink.slots[299].extra[1], (0, 1000 + 299 * 16, 8, 0b110_0000u64));
-        // A flushed queue's ref is stale.
-        sink.slots[299].clear();
-        assert!(!sink.mark_pred(r, 1000 + 299 * 16, 7, 0));
-    }
     use super::*;
     use crate::trace::refengine::RefEngine;
+    use celeste_core::pico8_num::Pico8Num as P8;
+    use celeste_engine::runtime2::AV;
     use std::sync::Mutex;
 
     /// A fresh forward keeps none of a killed run's files.
@@ -2965,7 +1674,7 @@ mod tests {
         let init = vec![Block::keyed(engine.initial().expect("initial state")).expect("block")];
         let dir = std::path::Path::new("/var/tmp/celeste-frame-fresh-start-test");
         let _ = std::fs::remove_dir_all(dir);
-        let stale = [dir.join("edges/l9/f009.bin"), dir.join("edges/raw/f009/w0.bin"), dir.join("frames/f009/b0_s0.bin")];
+        let stale = [dir.join("edges/f009.bin"), dir.join("edges/xfer.bin"), dir.join("frames/f009/b0_s0.bin")];
         for f in &stale {
             std::fs::create_dir_all(f.parent().unwrap()).expect("mkdir");
             std::fs::write(f, b"stale").expect("write");
@@ -2979,8 +1688,8 @@ mod tests {
     }
 
     /// A trimmed checkpoint keeps everything the search reads of an old
-    /// frame - width, shape, keys, cells, the cell index, the wins - and
-    /// refuses to load its rows.
+    /// frame - width, shape, keys, ids, cells, the wins - and refuses to
+    /// load its rows.
     #[test]
     fn a_trimmed_frame_keeps_its_keys_cells_and_wins() {
         let engine = std::sync::Mutex::new(RefEngine::new().expect("ref engine"));
@@ -2989,9 +1698,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
         let mut st = ForwardState::start(init, dir, true, None).expect("start");
         st.extend(&engine, dir, 2, None).expect("two frames");
-        type Seen = (u32, u64, Vec<(u32, (u64, u64))>, Vec<u32>, Vec<(u64, (u64, u64), u32)>);
+        type Seen = (u32, u64, Vec<(u32, (u64, u64))>, Vec<u64>, Vec<(u64, (u64, u64), u32)>);
         let seen = |f: &crate::search::checkpoint::FrameFile| -> Seen {
-            (f.width(), f.shape_hash(), f.cell_keys().collect(), f.row_cells(), f.wins())
+            (f.width(), f.shape_hash(), f.cell_keys().collect(), f.ids(), f.wins())
         };
         for (_, p) in frame_paths(dir, 1).expect("frame 1") {
             let before = seen(&crate::search::checkpoint::FrameFile::open(&p).expect("open"));
@@ -3094,9 +1803,9 @@ mod tests {
             let e = Mutex::new(RefEngine::new().expect("engine"));
             let mut st = ForwardState::resume(dir, true).expect("resume").expect("a tree to resume");
             assert_eq!(st.frames, 4);
-            let door_before = st.visited_len();
+            let visited_before = st.visited_len();
             st.extend(&e, dir, 6, None).expect("extend resumed");
-            assert!(st.visited_len() >= door_before);
+            assert!(st.visited_len() >= visited_before);
         }
         let keyset_in = |d: &std::path::Path, frame: u32| -> FxHashSet<(u64, u64)> {
             load_frame(d, frame).expect("load").iter().flat_map(|b| b.keys().to_vec()).collect()
@@ -3125,8 +1834,7 @@ mod tests {
         }
         widen_rt2_to(&mut row, Level::EXACT);
         let successors = |engine: &dyn FrameStep| -> std::collections::BTreeSet<((u64, u64), u32)> {
-            let door = crate::search::door::Door::new();
-            let next = forward_frame(engine, vec![Block::from_rt2(row.clone_block())], &door, None, Filters::default(), 26, None, Layer::New).expect("frame").next;
+            let next = crate::storage::wave::one_frame(engine, vec![Block::from_rt2(row.clone_block())], 26).expect("frame").next;
             next.iter().flat_map(|b| b.keys().iter().copied().zip(b.positions().expect("cells"))).collect()
         };
         let (k, r) = (successors(&kernels), successors(&reference));
@@ -3181,7 +1889,9 @@ mod tests {
         let runs = |r: &Rt2| -> bool {
             let cells = crate::search::pos_graph::block_cells(r).expect("cells");
             assert!(grid.of_cell(cells[0]).is_some(), "the lane has a region");
-            let mut sink = ForwardSink::empty(false);
+            let visited = crate::storage::visited::VisitedSet::new(*crate::storage::geometry());
+            let mut sink = crate::storage::unit::UnitSink::new(&visited, Filters::default(), 1, 0, false, false, None, None);
+            sink.begin(0, 0, &[0], None, false);
             crate::compiled::dispatch::run_chunk_kernel(r, &cells, &[0], &mut sink)
         };
         let px = |n: i16| P8::from_i16(n);
@@ -3240,7 +1950,9 @@ mod tests {
         };
         let runs = |r: &Rt2| -> bool {
             let cells = crate::search::pos_graph::block_cells(r).expect("cells");
-            let mut sink = ForwardSink::empty(false);
+            let visited = crate::storage::visited::VisitedSet::new(*crate::storage::geometry());
+            let mut sink = crate::storage::unit::UnitSink::new(&visited, Filters::default(), 1, 0, false, false, None, None);
+            sink.begin(0, 0, &[0], None, false);
             crate::compiled::dispatch::run_chunk_kernel(r, &cells, &[0], &mut sink)
         };
         let px = |n: i16| P8::from_i16(n);
@@ -3280,8 +1992,7 @@ mod tests {
         assert!(wins_of(exit.rt2()).expect("wins")[0], "the reference solution exits at frame 127");
         let mut parent = st;
         widen_rt2_to(&mut parent, level);
-        let door = crate::search::door::Door::new();
-        let next = forward_frame(&kernels, vec![Block::from_rt2(parent)], &door, None, Filters::default(), 127, None, Layer::New).expect("frame").next;
+        let next = crate::storage::wave::one_frame(&kernels, vec![Block::from_rt2(parent)], 127).expect("frame").next;
         let mut made: std::collections::BTreeSet<(u64, (u64, u64), u32)> = Default::default();
         for b in &next {
             let stored = b.keys().to_vec();

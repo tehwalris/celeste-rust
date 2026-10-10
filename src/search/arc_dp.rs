@@ -86,12 +86,11 @@ impl Graph {
     /// the first frame a node can be occupied, `win` the win nodes, `until`
     /// one past the last frame each can still win from (0: never;
     /// `u32::MAX`: no bound).
-    fn from_csr(ids: Vec<u64>, adj: Csr, xfers: Vec<(Transfer, Transfer)>, layer: impl Fn(u64) -> u32, win: Vec<bool>, until: Vec<u32>) -> Self {
+    fn from_csr(ids: Vec<u64>, adj: Csr, xfers: Vec<(Transfer, Transfer)>, layer: Vec<u32>, win: Vec<bool>, until: Vec<u32>) -> Self {
         let n = ids.len();
         assert!(n < u32::MAX as usize, "{n} nodes do not fit a u32 index");
         debug_assert!(ids.windows(2).all(|w| w[0] < w[1]), "ids sorted and unique");
-        assert!(adj.out_at.len() == n + 1 && adj.pred_at.len() == n + 1 && win.len() == n && until.len() == n);
-        let layer: Vec<u32> = ids.iter().map(|&id| layer(id)).collect();
+        assert!(adj.out_at.len() == n + 1 && adj.pred_at.len() == n + 1 && win.len() == n && until.len() == n && layer.len() == n);
         let mut by_deadline: Vec<Vec<u32>> = Vec::new();
         for i in 0..n {
             if !win[i] && until[i] != 0 && until[i] != u32::MAX {
@@ -123,6 +122,7 @@ impl Graph {
             None => vec![u32::MAX; n],
             Some(d) => ids.iter().map(|id| d.get(id).map_or(0, |&t| t as u32 + 1)).collect(),
         };
+        let layer = ids.iter().map(|&id| layer(id)).collect();
         Graph::from_csr(ids, Csr { out_at, out, pred_at, preds }, xfers, layer, win, until)
     }
     /// The transfer pair of edge `e`.
@@ -185,8 +185,8 @@ pub struct Loaded {
     /// the horizon with SOME remainder, with its deadline (the start always).
     /// They are the graph's nodes, in its order: node `i` is `marks[i]`.
     pub marks: Vec<(u64, u16)>,
-    /// The win rows of frames `1..=horizon`.
-    pub wins: Vec<u64>,
+    /// The win rows of frames `1..=horizon`, with their layers.
+    pub wins: Vec<(u64, u32)>,
     pub edges: usize,
 }
 
@@ -250,80 +250,59 @@ fn tree_frames(dir: &std::path::Path, horizon: u32) -> anyhow::Result<Vec<Vec<(u
 /// 12 B an edge, the graph's own (room (2,3) gemskip h137, 373M edges: 28 B
 /// an edge and a 12.1 GB peak before).
 pub fn load(dir: &std::path::Path, horizon: u32) -> anyhow::Result<Loaded> {
-    use crate::frame::{id_layer, pack_id};
     use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
     let t0 = std::time::Instant::now();
-    let mut wins: Vec<u64> = Vec::new();
+    let mut wins: Vec<(u64, u32)> = Vec::new();
     let mut start_id: Option<u64> = None;
     // Per frame, the rows it kept (its layer).
     let mut kept: Vec<u32> = Vec::with_capacity(horizon as usize + 1);
     for (f, files) in tree_frames(dir, horizon)?.into_iter().enumerate() {
         let f = f as u32;
         let mut rows = 0u32;
-        for (seq, file) in files {
-            rows += file.cell_counts().map(|(_, n)| n).sum::<u32>();
+        for (_, file) in files {
+            rows += file.width();
             if f == 0 {
-                anyhow::ensure!(start_id.is_none(), "{}: more than one start file", dir.display());
-                start_id = Some(pack_id(0, seq, 0));
+                anyhow::ensure!(start_id.is_none() && file.width() == 1, "{}: more than one start row", dir.display());
+                start_id = Some(file.id_at(0));
             } else {
-                wins.extend(file.win_rows().iter().map(|&(row, _)| pack_id(f, seq, row)));
+                wins.extend(file.win_rows().iter().map(|&(row, _)| (file.id_at(row), f)));
             }
         }
         kept.push(rows);
     }
     let start_id = start_id.ok_or_else(|| anyhow::anyhow!("{}: no frame-0 row", dir.display()))?;
-    let eg = super::edges::EdgeGraph::open(&dir.join("edges"), horizon)?;
-    crate::metrics::mem_phase("arc: runs opened");
-    // A frame that kept rows must have its own layer's run; one that kept
-    // none (the level -1 filter) may have none.
+    let eg = crate::storage::edges::EdgeStore::open(&dir.join("edges"), horizon)?;
+    crate::metrics::mem_phase("arc: edge files opened");
+    // A frame that kept rows must have its edges; one that kept none (the
+    // level -1 filter) may have none.
     for (f, &rows) in kept.iter().enumerate().skip(1) {
-        let f = f as u32;
-        anyhow::ensure!(rows == 0 || eg.has_run(f, f), "{}: no edge run for f{f}, which kept {rows} rows", dir.display());
+        anyhow::ensure!(rows == 0 || eg.has_frame(f as u32), "{}: no edges for f{f}, which kept {rows} rows", dir.display());
     }
     let (mut bfs, _) = super::edges::bfs(&eg, horizon, wins.iter().copied());
     let t_bfs = t0.elapsed();
     // The BFS never marks layer 0: the start, deadline 0. The wins are
     // seeds, marked; so the marks are the nodes.
-    bfs.insert_absent(start_id, 0);
-    let (ranks, marks) = bfs.into_ranked();
-    let n = marks.len();
+    bfs.insert(start_id, 0, 0);
+    let (ranks, members) = bfs.into_ranked();
+    let n = members.len();
     anyhow::ensure!(n < u32::MAX as usize, "{n} nodes do not fit a u32 index");
+    let marks: Vec<(u64, u16)> = members.iter().map(|&(id, d, _)| (id, d)).collect();
+    let layers: Vec<u32> = members.iter().map(|m| m.2).collect();
+    drop(members);
     crate::metrics::mem_phase("arc: bfs, node numbers");
-    // The frames' transfer tables into one: per frame, its ids' global ones.
-    let mut xfers: Vec<(Transfer, Transfer)> = Vec::new();
-    let mut global: FxHashMap<super::arc_edges::Pair, u32> = FxHashMap::default();
-    let remap: Vec<Vec<u32>> = (0..=horizon)
-        .map(|f| {
-            eg.pairs(f)
-                .iter()
-                .map(|p| {
-                    *global.entry(*p).or_insert_with(|| {
-                        xfers.push((p.0.transfer(), p.1.transfer()));
-                        xfers.len() as u32 - 1
-                    })
-                })
-                .collect()
-        })
-        .collect();
-    drop(global);
+    // The transfers: the tree's global table.
+    let xfers: Vec<(Transfer, Transfer)> = eg.pairs().iter().map(|p| (p.0.transfer(), p.1.transfer())).collect();
     // Node `dst`'s in-edges from nodes, frames layer..=horizon: `f(src, xfer)`
-    // in the runs' order.
-    let in_edges = |dst: u32, buf: &mut Vec<super::edges::Edge>, f: &mut dyn FnMut(u32, u32)| -> anyhow::Result<()> {
+    // in the files' order.
+    let in_edges = |dst: u32, buf: &mut Vec<crate::storage::edges::InEdge>, f: &mut dyn FnMut(u32, u32)| -> anyhow::Result<()> {
         let target = marks[dst as usize].0;
-        for frame in id_layer(target).max(1)..=horizon {
+        for frame in layers[dst as usize].max(1)..=horizon {
             buf.clear();
             eg.preds_at(target, frame, buf);
             for e in buf.iter() {
-                let xfer = *remap[frame as usize].get(e.xfer as usize).ok_or_else(|| {
-                    anyhow::anyhow!("{}: an edge at f{frame} into {target:#x} has transfer {} past its frame's table", dir.display(), e.xfer)
-                })?;
-                let mut m = e.mask;
-                while m != 0 {
-                    let lane = m.trailing_zeros() as u64;
-                    m &= m - 1;
-                    if let Some(src) = ranks.rank(e.base + lane) {
-                        f(src, xfer);
-                    }
+                anyhow::ensure!((e.xfer as usize) < xfers.len(), "{}: an edge at f{frame} into {} has transfer {} past the table", dir.display(), crate::storage::show_id(target), e.xfer);
+                if let Some(src) = ranks.rank(e.src) {
+                    f(src, e.xfer);
                 }
             }
         }
@@ -410,13 +389,13 @@ pub fn load(dir: &std::path::Path, horizon: u32) -> anyhow::Result<Loaded> {
     let t2 = std::time::Instant::now();
     let n_xfers = xfers.len();
     let mut win = vec![false; n];
-    for &w in &wins {
-        let i = marks.binary_search_by_key(&w, |m| m.0).map_err(|_| anyhow::anyhow!("a win row {w:#x} the BFS did not mark"))?;
+    for &(w, _) in &wins {
+        let i = marks.binary_search_by_key(&w, |m| m.0).map_err(|_| anyhow::anyhow!("a win state {} the BFS did not mark", crate::storage::show_id(w)))?;
         win[i] = true;
     }
     let until: Vec<u32> = marks.iter().map(|&(_, d)| d as u32 + 1).collect();
     let ids: Vec<u64> = marks.iter().map(|&(id, _)| id).collect();
-    let graph = Graph::from_csr(ids, Csr { out_at, out, pred_at, preds }, xfers, id_layer, win, until);
+    let graph = Graph::from_csr(ids, Csr { out_at, out, pred_at, preds }, xfers, layers, win, until);
     crate::metrics::mem_phase("arc: graph built");
     eprintln!(
         "[arc] h{horizon}: {} marked nodes, {} win rows, {edges} edges, {n_xfers} transfer pairs; bfs {:.1} s, edges {:.1} s (two passes), graph {:.1} s",
@@ -1393,7 +1372,7 @@ pub fn solve(
     prefer: Option<&[u8]>,
     known: Option<&super::known::Route>,
 ) -> anyhow::Result<Solved> {
-    use crate::frame::{id_layer, mark_row, save_marks, MarkRow, Visited};
+    use crate::frame::{mark_row, save_marks, MarkRow, Visited};
     use celeste_engine::runtime2::mix64;
     crate::metrics::mem_phase("arc: start");
     let Loaded { graph, start, marks, wins, .. } = load(dir, horizon)?;
@@ -1410,9 +1389,10 @@ pub fn solve(
     // bound still: a frame's win is a win at its last step at the latest).
     let arc = arc_steps.map(|s| s.div_ceil(crate::frame::steps_per_frame()));
     eprintln!("[arc] backward {tb:.2} s; optimum {arc_steps:?} (steps)");
-    // The nodes as (shape, key, cell), in ONE pass over the frame files (the
+    // The nodes as (shape, key, cell), through the storage metadata (the
     // marks are the nodes, in order): the fingerprints, the marks file and
     // the concrete search's keys.
+    let resolver = crate::storage::marks::Resolver::load(dir, horizon)?;
     let mut files = Vec::new();
     for (f, fs) in tree_frames(dir, horizon)?.into_iter().enumerate() {
         files.extend(fs.into_iter().map(|(seq, file)| (f as u32, seq, file)));
@@ -1422,7 +1402,8 @@ pub fn solve(
     let mut keys: Vec<(u64, (u64, u64), u32, u32)> = Vec::with_capacity(if keyed { g.len() } else { 0 });
     let mut rows: Vec<MarkRow> = Vec::new();
     let mut fp = 0u64;
-    super::edges::resolve_ids(&files, &marks, |shape, key, cell, d| {
+    for &(id, d) in &marks {
+        let (shape, key, cell) = resolver.resolve(id)?;
         node_key.push(mix64(shape ^ mix64(key.0 ^ mix64(key.1 ^ (cell as u64) << 1))));
         // `Visited::fingerprint`: the marks are distinct states (the door).
         fp = fp.wrapping_add(mix64(key.0 ^ mix64(key.1 ^ (cell as u64) << 1)));
@@ -1432,7 +1413,7 @@ pub fn solve(
         if save.is_some() {
             rows.push(mark_row(shape, key, cell, d, horizon));
         }
-    })?;
+    }
     println!("[gate] h{horizon} marks {} {fp:016x}", marks.len());
     drop(marks);
     if let Some(out) = save {
@@ -1470,18 +1451,19 @@ pub fn solve(
         crate::metrics::mem_phase("arc: reach");
         let ids: Vec<(u64, u16)> = (0..g.len() as u32).filter(|&i| last[i as usize] != u32::MAX).map(|i| (g.id(i), last[i as usize] as u16)).collect();
         drop(last);
-        super::edges::resolve_ids(&files, &ids, |shape, key, cell, d| {
+        for &(id, d) in &ids {
+            let (shape, key, cell) = resolver.resolve(id)?;
             if let Some(am) = &mut arc_marks {
                 am.insert_until(shape, key, cell, d);
             }
             if save.is_some() {
                 rows.push(mark_row(shape, key, cell, d, horizon));
             }
-        })?;
+        }
     }
     if let Some(out) = save {
         save_marks(&out.join("arc.marks.bin"), rows, horizon)?;
-        let first_win = wins.iter().map(|&id| id_layer(id)).min();
+        let first_win = wins.iter().map(|&(_, f)| f).min();
         let show = |v: Option<u32>| v.map_or("none".to_string(), |f| f.to_string());
         std::fs::write(out.join("arc.txt"), format!("horizon {horizon}\nlevel {level}\nlevel0_first_win {}\noptimal {}\n", show(first_win), show(arc)))?;
     }

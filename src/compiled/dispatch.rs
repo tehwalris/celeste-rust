@@ -14,7 +14,7 @@ pub(crate) fn run_chunk_kernel(
     chunk: &runtime2::Rt2,
     cell_in: &[u32],
     lanes: &[usize],
-    sink: &mut crate::frame::ForwardSink,
+    sink: &mut crate::storage::unit::UnitSink,
 ) -> bool {
     // A miss is counted here and is fatal in the caller.
     let n = lanes.len() as u64;

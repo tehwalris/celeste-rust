@@ -97,7 +97,7 @@ impl FrameEngine {
         bucket: &runtime2::Rt2,
         cell_in: &[u32],
         lanes: &[usize],
-        sink: &mut crate::frame::ForwardSink,
+        sink: &mut crate::storage::unit::UnitSink,
     ) {
         if !dispatch::run_chunk_kernel(bucket, cell_in, lanes, sink) {
             // A COVERAGE GAP, not a degraded mode: there is no fallback.
@@ -121,7 +121,7 @@ impl crate::frame::FrameStep for FrameEngine {
         block: &crate::frame::Block,
         cell_in: &[u32],
         lanes: &[usize],
-        sink: &mut crate::frame::ForwardSink,
+        sink: &mut crate::storage::unit::UnitSink,
     ) -> anyhow::Result<()> {
         self.run_bucket(block.rt2(), cell_in, lanes, sink);
         Ok(())

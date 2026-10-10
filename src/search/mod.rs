@@ -1,9 +1,8 @@
-//! The search around the frame step (`frame::forward_frame`):
+//! The search around the forward (`frame::ForwardState`, `storage`):
 //!
 //!   * `checkpoint` - frame checkpoint files: one per (frame, shape piece),
-//!                    raw fixed-width columns with a per-cell run index
-//!   * `door`       - the forward's dedup set of every reached state
-//!   * `edges`      - the recorded backward graph and the remainder-free BFS
+//!                    raw fixed-width columns, rows in id order
+//!   * `edges`      - the remainder-free BFS over the recorded graph
 //!   * `arc_edges`  - per recorded edge, the remainder transfer
 //!   * `arcs`       - sets of remainders as arcs of the circle
 //!   * `arc_dp`     - THE SEARCH: winning sets, optimum, concrete search
@@ -15,7 +14,6 @@ pub mod arc_dp;
 pub mod arc_edges;
 pub mod arcs;
 pub mod checkpoint;
-pub mod door;
 pub mod edges;
 pub mod inspect;
 pub mod known;

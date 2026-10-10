@@ -1,14 +1,12 @@
-//! Frame checkpoints: one file per (frame, shape piece), rows in the layer's
-//! canonical order (`canon`: by region, cell, key; a tree written before it
-//! has them in flush order), a row's position its id, with an index of
-//! per-cell runs, columns RAW
-//! and fixed-width, so "the rows in these cells" is a few range copies out
-//! of an mmap.
+//! Frame checkpoints: one file per (frame, shape piece), rows in ID order
+//! (`storage::StateId`: by shape, position, entry), each row's id and cell in
+//! columns of their own, columns RAW and fixed-width, so a row is found by
+//! its id with a binary search in an mmap.
 //!
 //! Layout: `magic | version u32 | header_len u64 | header (bincode) | data`.
 //! The header holds everything not per-row (structure, globals, strings,
-//! uniform columns, win rows), the cell index and each varying column's data
-//! offset; the data region is the varying columns and the key column, `width`
+//! uniform columns, win rows) and each varying column's data offset; the
+//! data region is the varying columns, the key, id and cell columns, `width`
 //! fixed-width entries each. A version mismatch is refused, not migrated.
 //!
 //! Writes go to a `tmp-` sibling renamed into place, so a crash never leaves
@@ -25,7 +23,7 @@ use celeste_engine::runtime2::{Cell2, Col, Rt2, AV};
 const MAGIC: &[u8; 4] = b"C8TB";
 /// Bump whenever the meaning or layout of ANY checkpoint content changes
 /// (older trees are refused; history in git).
-pub const FORMAT_VERSION: u32 = 11;
+pub const FORMAT_VERSION: u32 = 12;
 
 /// Where one column lives: uniform (in the header) or raw in the data
 /// region at a byte offset, `width` entries of the kind's fixed width.
@@ -51,6 +49,8 @@ const I_BYTES: usize = 8;
 const V_BYTES: usize = 9;
 const S_BYTES: usize = 1;
 const KEY_BYTES: usize = 16;
+const ID_BYTES: usize = 8;
+const CELL_BYTES: usize = 4;
 
 #[derive(Serialize, Deserialize)]
 struct Header {
@@ -61,11 +61,10 @@ struct Header {
     prints: Vec<String>,
     shape_hash: u64,
     cols: Vec<ColMeta>,
-    /// Data offset of the key column, 16 bytes per row.
+    /// Data offsets of the key (16 B a row), id (8 B) and cell (4 B) columns.
     keys: u64,
-    /// The runs of rows at one cell, `(cell, start, len)` sorted by
-    /// `(cell, start)`: one per cell (one per flush in an older tree).
-    index: Vec<(u32, u32, u32)>,
+    ids: u64,
+    cells: u64,
     /// The rows that are wins (`Block::wins`), ascending, with their cell.
     wins: Vec<(u32, u32)>,
     /// The rows' values are gone (`trim`): keys, cells and wins only, `cols`
@@ -126,12 +125,13 @@ fn decode_s(x: u8) -> Result<AV> {
     av_of(x >> 1, (x & 1) as u32, 0)
 }
 
-/// Save one piece in ITS OWN row order; `cells` per row, `wins` marks the
-/// win rows. Atomic.
-pub fn save_block(path: &Path, rt2: &Rt2, cells: &[u32], wins: &[bool]) -> Result<()> {
+/// Save one piece, its rows in id order; `ids` and `cells` per row, `wins`
+/// marks the win rows. Atomic.
+pub fn save_block(path: &Path, rt2: &Rt2, ids: &[u64], cells: &[u32], wins: &[bool]) -> Result<()> {
     let width = rt2.width;
     ensure!(rt2.row_keys.len() == width, "checkpointing a block without its key column");
-    ensure!(cells.len() == width && wins.len() == width, "save_block: column lengths");
+    ensure!(ids.len() == width && cells.len() == width && wins.len() == width, "save_block: column lengths");
+    ensure!(ids.windows(2).all(|w| w[0] < w[1]), "save_block: rows not in id order");
     for cell in &rt2.structure {
         if let Cell2::Clo(_, caps) = cell {
             ensure!(
@@ -167,16 +167,12 @@ pub fn save_block(path: &Path, rt2: &Rt2, cells: &[u32], wins: &[bool]) -> Resul
     }
     let keys_off = off;
     off += (width * KEY_BYTES) as u64;
+    let ids_off = off;
+    off += (width * ID_BYTES) as u64;
+    let cells_off = off;
+    off += (width * CELL_BYTES) as u64;
     let data_len = off as usize;
 
-    let mut index: Vec<(u32, u32, u32)> = Vec::new();
-    for (i, &c) in cells.iter().enumerate() {
-        match index.last_mut() {
-            Some(run) if run.0 == c => run.2 += 1,
-            _ => index.push((c, i as u32, 1)),
-        }
-    }
-    index.sort_unstable();
     let header = Header {
         width: width as u32,
         structure: rt2.structure.clone(),
@@ -186,7 +182,8 @@ pub fn save_block(path: &Path, rt2: &Rt2, cells: &[u32], wins: &[bool]) -> Resul
         shape_hash: rt2.shape_hash,
         cols,
         keys: keys_off,
-        index,
+        ids: ids_off,
+        cells: cells_off,
         wins: wins
             .iter()
             .enumerate()
@@ -237,6 +234,14 @@ pub fn save_block(path: &Path, rt2: &Rt2, cells: &[u32], wins: &[bool]) -> Resul
         data[base..base + 8].copy_from_slice(&a.to_le_bytes());
         data[base + 8..base + 16].copy_from_slice(&b.to_le_bytes());
     }
+    for (i, id) in ids.iter().enumerate() {
+        let base = ids_off as usize + i * ID_BYTES;
+        data[base..base + ID_BYTES].copy_from_slice(&id.to_le_bytes());
+    }
+    for (i, c) in cells.iter().enumerate() {
+        let base = cells_off as usize + i * CELL_BYTES;
+        data[base..base + CELL_BYTES].copy_from_slice(&c.to_le_bytes());
+    }
 
     write_file(path, &header_bytes, &data)
 }
@@ -264,8 +269,8 @@ fn write_file(path: &Path, header_bytes: &[u8], data: &[u8]) -> Result<()> {
 }
 
 /// TRIM a checkpoint file to what the search reads of a frame that is no
-/// longer the frontier: the keys, the cell index and the wins (the door on a
-/// resume, the backward's ids, the marks, the UI). The rows' values go; a
+/// longer the frontier: the keys, ids, cells and wins (the visited set on a
+/// resume, the backward's seeds, the marks, the UI). The rows' values go; a
 /// load of its rows is an error. Atomic. Returns the bytes saved.
 pub fn trim(path: &Path) -> Result<u64> {
     let f = FrameFile::open(path)?;
@@ -273,7 +278,8 @@ pub fn trim(path: &Path) -> Result<u64> {
         return Ok(0);
     }
     let width = f.header.width as usize;
-    let keys = &f.map[f.data + f.header.keys as usize..f.data + f.header.keys as usize + width * KEY_BYTES];
+    let col = |off: u64, bytes: usize| &f.map[f.data + off as usize..f.data + off as usize + width * bytes];
+    let kept = [col(f.header.keys, KEY_BYTES), col(f.header.ids, ID_BYTES), col(f.header.cells, CELL_BYTES)].concat();
     let header = Header {
         width: f.header.width,
         structure: f.header.structure.clone(),
@@ -283,14 +289,15 @@ pub fn trim(path: &Path) -> Result<u64> {
         shape_hash: f.header.shape_hash,
         cols: Vec::new(),
         keys: 0,
-        index: f.header.index.clone(),
+        ids: (width * KEY_BYTES) as u64,
+        cells: (width * (KEY_BYTES + ID_BYTES)) as u64,
         wins: f.header.wins.clone(),
         trimmed: true,
     };
     let header_bytes = bincode::serialize(&header).context("serializing checkpoint header")?;
     let before = f.map.len() as u64;
-    write_file(path, &header_bytes, keys)?;
-    Ok(before.saturating_sub((16 + header_bytes.len() + keys.len()) as u64))
+    write_file(path, &header_bytes, &kept)?;
+    Ok(before.saturating_sub((16 + header_bytes.len() + kept.len()) as u64))
 }
 
 /// One checkpoint file, mapped, its header decoded; loads gather row ranges
@@ -322,7 +329,7 @@ impl FrameFile {
             .with_context(|| format!("deserializing {} header", path.display()))?;
         let data = 16 + header_len;
         let width = header.width as usize;
-        let need = header.keys as usize + width * KEY_BYTES;
+        let need = (header.keys as usize + width * KEY_BYTES).max(header.ids as usize + width * ID_BYTES).max(header.cells as usize + width * CELL_BYTES);
         ensure!(map.len() >= data + need, "{}: truncated data region", path.display());
         Ok(FrameFile { map, header, data })
     }
@@ -340,34 +347,37 @@ impl FrameFile {
         self.header.trimmed
     }
 
-    /// `(cell, rows at that cell)` per distinct cell, ascending, off the index.
-    pub fn cell_counts(&self) -> impl Iterator<Item = (u32, u32)> + '_ {
-        // Runs are sorted by cell: sum each cell's.
-        let idx = &self.header.index;
-        idx.chunk_by(|a, b| a.0 == b.0).map(|runs| (runs[0].0, runs.iter().map(|r| r.2).sum()))
+    /// `(cell, rows at that cell)` per distinct cell, ascending.
+    pub fn cell_counts(&self) -> Vec<(u32, u32)> {
+        let mut cells = self.row_cells();
+        cells.sort_unstable();
+        let mut out: Vec<(u32, u32)> = Vec::new();
+        for c in cells {
+            match out.last_mut() {
+                Some((x, n)) if *x == c => *n += 1,
+                _ => out.push((c, 1)),
+            }
+        }
+        out
     }
 
-    /// Every row's `(cell, key)`, cell by cell (runs in file order).
+    /// Every row's `(cell, key)`, in row order.
     pub fn cell_keys(&self) -> impl Iterator<Item = (u32, (u64, u64))> + '_ {
-        self.header.index.iter().flat_map(move |&(cell, start, len)| (start..start + len).map(move |r| (cell, self.key(r))))
+        (0..self.header.width).map(move |r| (self.cell_at(r), self.key(r)))
     }
 
-    /// `cell_keys` with each row's position (its id within the file).
-    pub fn cell_keys_rows(&self) -> impl Iterator<Item = (u32, (u32, (u64, u64)))> + '_ {
-        self.header.index.iter().flat_map(move |&(cell, start, len)| (start..start + len).map(move |r| (r, (cell, self.key(r)))))
-    }
-
-    /// The cell index: runs `(cell, start, len)` sorted by `(cell, start)`.
-    pub fn runs(&self) -> &[(u32, u32, u32)] {
-        &self.header.index
-    }
-
-    /// The row ranges holding `cell`, ascending (empty if the file has none).
+    /// The rows at `cell` as ranges, ascending (empty if the file has none).
     pub fn rows_of_cell(&self, cell: u32) -> Vec<std::ops::Range<u32>> {
-        let idx = &self.header.index;
-        let lo = idx.partition_point(|e| e.0 < cell);
-        let hi = idx.partition_point(|e| e.0 <= cell);
-        idx[lo..hi].iter().map(|&(_, s, n)| s..s + n).collect()
+        let mut out: Vec<std::ops::Range<u32>> = Vec::new();
+        for r in 0..self.header.width {
+            if self.cell_at(r) == cell {
+                match out.last_mut() {
+                    Some(x) if x.end == r => x.end = r + 1,
+                    _ => out.push(r..r + 1),
+                }
+            }
+        }
+        out
     }
 
     /// The win rows as `(shape, key, cell)` - the backward's seeds.
@@ -380,13 +390,42 @@ impl FrameFile {
         &self.header.wins
     }
 
-    /// The cell of every row (the run index inverted).
+    /// The cell of every row.
     pub fn row_cells(&self) -> Vec<u32> {
-        let mut cells = vec![u32::MAX; self.header.width as usize];
-        for &(cell, start, len) in &self.header.index {
-            cells[start as usize..(start + len) as usize].fill(cell);
+        (0..self.header.width).map(|r| self.cell_at(r)).collect()
+    }
+
+    /// Row `row`'s cell.
+    #[inline]
+    pub fn cell_at(&self, row: u32) -> u32 {
+        let base = self.data + self.header.cells as usize + row as usize * CELL_BYTES;
+        u32::from_le_bytes(self.map[base..base + CELL_BYTES].try_into().unwrap())
+    }
+
+    /// Row `row`'s id (`storage::StateId`).
+    #[inline]
+    pub fn id_at(&self, row: u32) -> u64 {
+        let base = self.data + self.header.ids as usize + row as usize * ID_BYTES;
+        u64::from_le_bytes(self.map[base..base + ID_BYTES].try_into().unwrap())
+    }
+
+    /// Every row's id, in row (= id) order.
+    pub fn ids(&self) -> Vec<u64> {
+        (0..self.header.width).map(|r| self.id_at(r)).collect()
+    }
+
+    /// The row holding id `id` (rows are in id order).
+    pub fn find_row(&self, id: u64) -> Option<u32> {
+        let (mut lo, mut hi) = (0u32, self.header.width);
+        while lo < hi {
+            let mid = (lo + hi) / 2;
+            match self.id_at(mid).cmp(&id) {
+                std::cmp::Ordering::Less => lo = mid + 1,
+                std::cmp::Ordering::Greater => hi = mid,
+                std::cmp::Ordering::Equal => return Some(mid),
+            }
         }
-        cells
+        None
     }
 
     pub fn key_at(&self, row: u32) -> (u64, u64) {

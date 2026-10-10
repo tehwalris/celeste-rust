@@ -231,7 +231,7 @@ fn parse_fwd(line: &str) -> Result<FwdLine> {
         // Older logs say `emit` / `own` for `wave` / `door`.
         emit_ms: num(after(&t, "wave", 0).or_else(|_| after(&t, "emit", 0))?)?,
         emit_idle: num(after(&t, "(idle", 0)?)?,
-        own_ms: num(after(&t, "door", 0).or_else(|_| after(&t, "own", 0))?)?,
+        own_ms: num(after(&t, "translate", 0).or_else(|_| after(&t, "door", 0)).or_else(|_| after(&t, "own", 0))?)?,
         own_idle: after(&t, "(idle", 1).ok().map(num).transpose()?.unwrap_or(0),
         ckpt_ms: num(after(&t, "ckpt", 0)?)?,
         pos_ms: num(after(&t, "pos", 0)?)?,
@@ -498,24 +498,21 @@ fn frame_counts(dir: &Path, f: u32, marks: Option<&MarkTable>, nsets: usize) -> 
         }
         let Some(t) = marks else { continue };
         let shape = file.shape_hash();
-        // A cell's runs are adjacent: look the cell up once, and skip an
-        // unmarked cell's runs without reading their keys.
-        let mut last: Option<(u32, bool)> = None;
-        for &(cell, start, len) in file.runs() {
-            let marked = match last {
-                Some((c, m)) if c == cell => m,
-                _ => {
-                    let m = t.cells.contains(&(shape, cell));
-                    last = Some((cell, m));
-                    m
-                }
-            };
-            if !marked {
+        // Rows in id order: a cell's rows come in short runs; look a cell up
+        // once a run, and skip an unmarked cell's rows without their keys.
+        let cells = file.row_cells();
+        let mut start = 0usize;
+        while start < cells.len() {
+            let cell = cells[start];
+            let end = start + cells[start..].iter().take_while(|&&c| c == cell).count();
+            let (lo, hi) = (start as u32, end as u32);
+            start = end;
+            if !t.cells.contains(&(shape, cell)) {
                 continue;
             }
             let shard = &t.shards[mark_shard(shape, cell)];
             per_set.fill(0);
-            for r in start..start + len {
+            for r in lo..hi {
                 if let Some(&m) = shard.get(&(shape, cell, file.key_at(r))) {
                     let mut bits = m;
                     while bits != 0 {

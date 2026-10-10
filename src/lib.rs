@@ -1,12 +1,12 @@
 
 pub mod abstraction;
-pub mod canon;
 pub mod compiled;
 pub mod frame;
 pub mod game_runner;
 pub mod concrete;
 pub mod metrics;
 pub mod search;
+pub mod storage;
 pub mod trace;
 pub mod transpile;
 

@@ -13,7 +13,6 @@ use std::path::Path;
 use anyhow::{Context, Result};
 
 use celeste_core::pico8_num::Pico8Num as P8;
-use celeste_engine::kernel::RowCache;
 use celeste_engine::runtime2::{self, Col, Rt2, AV};
 use celeste_engine::slots::reshape;
 
@@ -356,15 +355,15 @@ struct AsmKernel {
 }
 
 impl AsmKernel {
-    /// Run `lanes` of one block in 16-lane slices, pushing each body's
-    /// `live & !error` lanes into the sink's (shape, cell) queue with their
-    /// edges. Any `live & error` (declined) fails the call: a coverage gap.
+    /// Run `lanes` of one block in 16-lane slices, emitting each body's
+    /// `live & !error` lanes into the sink with their edges. Any `live &
+    /// error` (declined) fails the call: a coverage gap.
     fn run(
         &self,
         chunk: &Rt2,
         cell_in: &[u32],
         lanes: &[usize],
-        sink: &mut crate::frame::ForwardSink,
+        sink: &mut crate::storage::unit::UnitSink,
     ) -> bool {
         debug_assert_eq!(cell_in.len(), chunk.width, "one input cell per input row");
         stats([1, 0, 0, 0, 0, 0, 0]);
@@ -375,7 +374,6 @@ impl AsmKernel {
                 return false;
             }
         }
-        sink.end_call();
         true
     }
 
@@ -386,7 +384,7 @@ impl AsmKernel {
         cell_in: &[u32],
         lanes: &[usize],
         only: u16,
-        sink: &mut crate::frame::ForwardSink,
+        sink: &mut crate::storage::unit::UnitSink,
     ) -> bool {
         let t_setup = crate::frame::phases::start();
         let n = lanes.len();
@@ -404,12 +402,7 @@ impl AsmKernel {
         // Utilization tallies, folded into `CALL_STATS[3..]` at the end.
         let (mut n_bodies, mut n_bodies_taken, mut n_lanes, mut n_unique) = (0u64, 0u64, 0u64, 0u64);
         {
-            // Per lane its predecessor GROUP's first id (ids are consecutive
-            // in a block; a slice may span groups): a predecessor record is
-            // that id plus the lane's bit in its group.
-            let bases: Option<[u64; 16]> = sink.ids_in.map(|ids| std::array::from_fn(|i| if i < n { ids[lanes[i] & !63] } else { 0 }));
-            let base = |i: usize| bases.map(|b| b[i]);
-            let glane = |i: usize| lanes[i] & 63;
+            let record = sink.records_edges();
             let skip: u16 = match sink.skip_in {
                 Some(sk) => (0..n).filter(|&i| sk[lanes[i]]).fold(0u16, |m, i| m | (1 << i)),
                 None => 0,
@@ -434,7 +427,6 @@ impl AsmKernel {
                 );
             }
             let t_emit = crate::frame::phases::add(crate::frame::phases::KERNEL, t_ph);
-            let flush_before = sink.flush_ticks;
             let valid = (((1u32 << n) - 1) as u16) & only;
             for (bi, (body, cols)) in self.bodies.iter().zip(body_cols).enumerate() {
                 // Tri-state masks, each read where it MAY hold.
@@ -505,9 +497,9 @@ impl AsmKernel {
                 n_bodies_taken += 1;
                 n_lanes += take.count_ones() as u64;
                 let template = &self.acc_templates[body.outcome];
+                let shape = template.union.shape_hash;
                 // Level -1 first: a dropped cell's row needs no key, transfer
-                // or queue, only its pos-graph edge and its sources' notes
-                // (what `flush` records for a dropped queue).
+                // or lookup, only its pos-graph edge and its source's note.
                 let mut couts = [0u32; 16];
                 let mut m = take;
                 while m != 0 {
@@ -515,16 +507,14 @@ impl AsmKernel {
                     m &= m - 1;
                     let cout = cell_out(body, outbuf, i);
                     couts[i] = cout;
-                    if let Some(from) = sink.minus_one_drop(template.union.shape_hash, cout) {
+                    if let Some(from) = sink.minus_one_drop(shape, cout) {
                         take &= !(1 << i);
                         let cin = cell_in[lanes[i]];
                         if sink.edges_on && last_edge != (cin, cout) {
                             last_edge = (cin, cout);
-                            sink.edges.insert((cin, cout));
+                            sink.pos_edges.insert((cin, cout));
                         }
-                        if let Some(b) = base(i) {
-                            sink.dropped_again(b, glane(i), from as u64);
-                        }
+                        sink.dropped(lanes[i], from);
                     }
                 }
                 if take == 0 {
@@ -540,63 +530,27 @@ impl AsmKernel {
                         runtime2::mix64(part.0.wrapping_add(h1)),
                         runtime2::mix64(part.1.wrapping_add(h2)),
                     );
-                    let cin = cell_in[lanes[i]];
+                    let (cin, cout) = (cell_in[lanes[i]], couts[i]);
                     // THE TRANSFER: per producer, on the edge, never in the row.
-                    let xfer = match base(i) {
-                        Some(_) => {
-                            let words = body.arc.words(outbuf, i);
-                            sink.xfer_id_raw(&words, |w| ArcSlots::decode(&body.arc.raw(w, chunk, lanes[i], body.outcome), chunk, lanes[i], body.outcome))
-                        }
-                        None => 0,
-                    };
+                    let xfer = record.then(|| {
+                        let words = body.arc.words(outbuf, i);
+                        sink.xfer_id_raw(&words, |w| ArcSlots::decode(&body.arc.raw(w, chunk, lanes[i], body.outcome), chunk, lanes[i], body.outcome))
+                    });
                     // EMISSION-TIME PROVENANCE: the pos-graph and backward
                     // edges from lane `i` are recorded right here.
-                    if let Some((first_cin, r)) = sink.seen.insert_ref(key, couts[i], cin, 0) {
-                        // A re-emission: one more predecessor (on the queued
-                        // row's mask, or direct if flushed).
-                        if sink.edges_on && first_cin != cin {
-                            sink.edges.insert((cin, couts[i]));
-                        }
-                        match base(i) {
-                            Some(b) if r & RowCache::ID_FLAG != 0 => {
-                                sink.direct_edge(r & !RowCache::ID_FLAG, b, xfer, glane(i));
-                                continue;
-                            }
-                            Some(b) if r & RowCache::DROP_FLAG != 0 => {
-                                sink.dropped_again(b, glane(i), r & !RowCache::DROP_FLAG);
-                                continue;
-                            }
-                            // A stale ref: push again; the flush merges by key.
-                            Some(b) if !sink.mark_pred(r, b, xfer, glane(i)) => {}
-                            Some(_) => continue,
-                            None => continue,
-                        }
-                    }
-                    sink.emitted += 1;
-                    n_unique += 1;
-                    let cout = couts[i];
                     if sink.edges_on && last_edge != (cin, cout) {
                         last_edge = (cin, cout);
-                        sink.edges.insert((cin, cout));
+                        sink.pos_edges.insert((cin, cout));
                     }
-                    let q = sink.queue(template.shape_hash, cout, || (*template.union).clone_block());
-                    // `minus_one_drop` judged the row by the union's shape:
-                    // the queue's must be that one (flush filters by it).
-                    assert_eq!(sink.slots[q].shape, template.union.shape_hash, "a queue's shape is its template union's");
-                    cols.push_row(&mut sink.slots[q], outbuf, i, key, cout);
-                    if let Some(b) = base(i) {
-                        sink.slots[q].pred_base.push(b);
-                        sink.slots[q].pred_mask.push(1u64 << (glane(i)));
-                        sink.slots[q].pred_xfer.push(xfer);
-                        sink.slots[q].last_extra.push(u32::MAX);
-                        sink.seen.set_ref(key, cout, sink.row_ref(q));
+                    n_unique += 1;
+                    let r = sink.emit(shape, cout, key, lanes[i], xfer, || (*template.union).clone_block(), |buf| cols.push_row(buf, outbuf, i, key, cout));
+                    if let Err(e) = r {
+                        panic!("frame step: {e:#}");
                     }
-                    sink.pushed(q).expect("flushing a full queue");
                 }
             }
             if t_emit != 0 {
                 crate::frame::phases::add(crate::frame::phases::EMIT, t_emit);
-                crate::frame::phases::sub(crate::frame::phases::EMIT, sink.flush_ticks - flush_before);
             }
         }
         sc.put_back();
@@ -887,8 +841,8 @@ struct BodyCols {
 }
 
 impl BodyCols {
-    fn of(body: &AsmBody, proto: &crate::frame::Slot, own: &Rt2) -> Result<Self> {
-        use crate::frame::TCol;
+    fn of(body: &AsmBody, proto: &crate::storage::unit::RowBuf, own: &Rt2) -> Result<Self> {
+        use crate::storage::unit::TCol;
         let (mut num, mut ival, mut num_as_ival, mut bool_) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
         let mut written = vec![false; proto.cols.len()];
         for f in &body.fields {
@@ -928,8 +882,8 @@ impl BodyCols {
 
     /// Append lane `i` of the output buffer to `slot` as one row.
     #[inline]
-    fn push_row(&self, slot: &mut crate::frame::Slot, buf: &[u8], i: usize, key: (u64, u64), cell: u32) {
-        use crate::frame::TCol;
+    fn push_row(&self, slot: &mut crate::storage::unit::RowBuf, buf: &[u8], i: usize, key: (u64, u64), cell: u32) {
+        use crate::storage::unit::TCol;
         let word = |base: usize| u32::from_le_bytes(buf[base..base + 4].try_into().unwrap());
         for &(ci, root) in &self.num {
             if let TCol::Num(v) = &mut slot.cols[ci].1 {
@@ -1024,7 +978,7 @@ impl<'c> InputView<'c> {
 /// (`Rt2::boundary_canonicalize`) over a copy of an emitted block must
 /// change nothing (structure, shape hash, every row's key): the gate that
 /// the append's keys are exact.
-pub(crate) fn key_check(slot: &crate::frame::Slot) {
+pub(crate) fn key_check(slot: &crate::storage::unit::RowBuf) {
     if !key_check_on() {
         return;
     }
@@ -1085,7 +1039,7 @@ pub(crate) fn key_check_block(blk: &Rt2) {
 }
 
 /// `CELESTE_KERNEL_KEY_CHECK=1` (see `key_check`).
-fn key_check_on() -> bool {
+pub(crate) fn key_check_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("CELESTE_KERNEL_KEY_CHECK").is_some())
 }
@@ -1149,7 +1103,7 @@ impl Registry {
         chunk: &Rt2,
         cell_in: &[u32],
         lanes: &[usize],
-        sink: &mut crate::frame::ForwardSink,
+        sink: &mut crate::storage::unit::UnitSink,
     ) -> bool {
         if self.grid.is_none() {
             return self.run_key(chunk, None, cell_in, lanes, sink);
@@ -1182,7 +1136,6 @@ impl Registry {
                 }
             }
         }
-        sink.end_call();
         true
     }
 
@@ -1192,7 +1145,7 @@ impl Registry {
         key: Option<Region>,
         cell_in: &[u32],
         lanes: &[usize],
-        sink: &mut crate::frame::ForwardSink,
+        sink: &mut crate::storage::unit::UnitSink,
     ) -> bool {
         match self.kernels.get(&(chunk.shape_hash, key)) {
             Some(k) => k.run(chunk, cell_in, lanes, sink),
@@ -1388,7 +1341,7 @@ fn apply_union(kernel: &mut AsmKernel, unions: &HashMap<u64, std::sync::Arc<Rt2>
     let mut body_cols = Vec::with_capacity(kernel.bodies.len());
     for b in &kernel.bodies {
         let t = &kernel.acc_templates[b.outcome];
-        let proto = crate::frame::Slot::new((*t.union).clone_block());
+        let proto = crate::storage::unit::RowBuf::new((*t.union).clone_block());
         body_cols.push(BodyCols::of(b, &proto, &t.own)?);
     }
     kernel.body_cols = body_cols;
@@ -1854,7 +1807,7 @@ pub(crate) fn run_chunk(
     chunk: &Rt2,
     cell_in: &[u32],
     lanes: &[usize],
-    sink: &mut crate::frame::ForwardSink,
+    sink: &mut crate::storage::unit::UnitSink,
 ) -> bool {
     match registry() {
         Some(reg) => reg.run_chunk(chunk, cell_in, lanes, sink),

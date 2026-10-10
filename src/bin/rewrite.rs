@@ -7,7 +7,8 @@
 use anyhow::{Context, Result};
 use celeste_engine::runtime2::Rt2;
 use celeste_rust::trace::refengine::RefEngine;
-use celeste_rust::frame::{forward_frame, frame_files, frame_paths, id_layer, Filters, Layer, MinusOne, id_row, id_seq, load_row, pack_id, widen_rt2_to, widened_keys, wins_of, Block, FrameStep, Visited};
+use celeste_rust::frame::{frame_files, frame_paths, load_row, widen_rt2_to, widened_keys, wins_of, Block, FrameStep, MinusOne, Visited};
+use celeste_rust::storage::{show_id, StateId};
 use celeste_rust::abstraction::{set_level, Level};
 use celeste_rust::search::inspect::{brief, cell_names, parse_xy, player_summary, project_all, project_onto, project_row, projection_key, Proj};
 use clap::{Parser, Subcommand};
@@ -189,9 +190,10 @@ enum Command {
         #[arg(long)]
         dropped: bool,
     },
-    /// Microbenchmark of ONE forward frame: run `forward_frame` on a
-    /// checkpointed frame `reps` times (empty door, no filter), printing the
-    /// per-rep phase times.
+    /// Microbenchmark of ONE forward frame: run the wave
+    /// (`storage::wave::run_wave`) on a checkpointed frame `reps` times (an
+    /// empty visited set, or with `--edges` the tree's at the frame; no
+    /// filter), printing the per-rep phase times.
     BenchFrame {
         #[arg(long, default_value = DEFAULT_CHECKPOINT_DIR)]
         checkpoint_dir: String,
@@ -207,8 +209,9 @@ enum Command {
         /// The level to run at.
         #[arg(long, value_parser = Level::parse, default_value = "r0sx")]
         level: Level,
-        /// Record the frame's edges (into `<level dir>/bench-edges`, compacted
-        /// and deleted per rep, both timed) - the search's forward path.
+        /// Record the frame's edges (into `<level dir>/bench-edges`, deleted
+        /// per rep) against the tree's visited set at the frame - the
+        /// search's forward path.
         #[arg(long, default_value_t = false)]
         edges: bool,
     },
@@ -344,22 +347,6 @@ enum Command {
         /// with `--real`.
         #[arg(long)]
         chain_out: Option<String>,
-    },
-    /// BENCH: invert frames `frame..=to`'s raw edge records, from a copy
-    /// (hardlinks into `scratch`, which is replaced): the wall and CPU time
-    /// of `edges::invert` and its phases, and the runs it writes
-    /// (`scratch/l*/f*.bin`, to compare byte for byte). A tree's frames keep
-    /// their raw records until the backward inverts them.
-    CompactBench {
-        #[arg(long)]
-        edges_dir: String,
-        #[arg(long)]
-        frame: u32,
-        /// The last frame (default: `frame`).
-        #[arg(long)]
-        to: Option<u32>,
-        #[arg(long)]
-        scratch: String,
     },
     /// DIAGNOSTIC: the shape of a frame's recorded edges. Groups the edges
     /// recorded at `frame` by (source, target) and reports how many
@@ -555,24 +542,19 @@ fn where_(c: u32) -> String {
     celeste_rust::search::pos_graph::cell_xy(c).map(|(x, y)| format!("({x}, {y})")).unwrap_or_else(|| "no player".to_string())
 }
 
-/// The predecessors of row `id` recorded at its layer, unpacked from the
-/// records' lane masks.
-fn preds_of(edges: &celeste_rust::search::edges::EdgeGraph, id: u64) -> Vec<u64> {
+/// The predecessors of state `id`, first reached at `layer`, recorded at
+/// that frame.
+fn preds_of(edges: &celeste_rust::storage::edges::EdgeStore, id: StateId, layer: u32) -> Vec<StateId> {
     let mut buf = Vec::new();
-    edges.preds_at(id, id_layer(id), &mut buf);
-    buf.iter().flat_map(|e| (0..64u64).filter(move |i| e.mask >> i & 1 == 1).map(move |i| e.base + i)).collect()
+    edges.preds_at(id, layer, &mut buf);
+    buf.iter().map(|e| e.src).collect()
 }
 
-/// Every row of `rt2` through ONE forward frame of `engine` (an empty door, no
-/// filter), its edges recorded into a scratch directory that is removed:
-/// the successors and whether one wins.
-fn rerun(engine: &dyn FrameStep, rt2: Rt2, id: u64, scratch: &str) -> Result<(Vec<Block>, bool)> {
-    let block = Block::with_ids(rt2, vec![id], id_seq(id));
-    let tmp = std::env::temp_dir().join(format!("{scratch}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&tmp);
-    let door = celeste_rust::search::door::Door::new();
-    let wave = forward_frame(engine, vec![block], &door, None, Filters::default(), id_layer(id) + 1, Some(&tmp), Layer::New)?;
-    let _ = std::fs::remove_dir_all(&tmp);
+/// Every row of `rt2` (of layer `layer`) through ONE forward frame of
+/// `engine` (an empty visited set, no filter): the successors and whether
+/// one wins.
+fn rerun(engine: &dyn FrameStep, rt2: Rt2, layer: u32) -> Result<(Vec<Block>, bool)> {
+    let wave = celeste_rust::storage::wave::one_frame(engine, vec![Block::from_rt2(rt2)], layer + 1)?;
     Ok((wave.next, wave.won))
 }
 
@@ -836,29 +818,22 @@ fn main() -> Result<()> {
             // cell) of target and source, and the transfer - ids and table
             // positions depend on scheduling (and on a raise), these do not.
             // A state by what it is, not by its id.
-            let mut files: rustc_hash::FxHashMap<(u32, u32), (celeste_rust::search::checkpoint::FrameFile, Vec<u32>)> = Default::default();
-            let mut node = |id: u64| -> Result<u64> {
-                let (layer, seq, row) = (id_layer(id), id_seq(id), id_row(id));
-                if !files.contains_key(&(layer, seq)) {
-                    let (_, f) = frame_files(dir, layer)?.into_iter().find(|(s, _)| *s == seq).ok_or_else(|| anyhow::anyhow!("no file l{layer} s{seq}"))?;
-                    let cells = f.row_cells();
-                    files.insert((layer, seq), (f, cells));
-                }
-                let (f, cells) = &files[&(layer, seq)];
-                let k = f.key_at(row);
+            let resolver = (edges || dropped).then(|| celeste_rust::storage::marks::Resolver::load(dir, to)).transpose()?;
+            let node = |id: StateId| -> Result<u64> {
+                let (shape, k, cell) = resolver.as_ref().expect("loaded for edges and drops").resolve(id)?;
                 let mix = celeste_engine::runtime2::mix64;
-                Ok(mix(k.0 ^ mix(k.1 ^ mix(f.shape_hash() ^ cells[row as usize] as u64))))
+                Ok(mix(k.0 ^ mix(k.1 ^ mix(shape ^ cell as u64))))
             };
             if edges {
-                let eg = celeste_rust::search::edges::EdgeGraph::open(&dir.join("edges"), to)?;
+                let eg = celeste_rust::storage::edges::EdgeStore::open(&dir.join("edges"), to)?;
                 for frame in 1..=to {
                     let (mut n, mut acc) = (0usize, 0u64);
-                    for e in eg.records_at(frame) {
-                        let pair = eg.pair(frame, e.xfer).ok_or_else(|| anyhow::anyhow!("f{frame}: an edge without its transfer"))?;
+                    for e in eg.edges_at(frame) {
+                        let pair = eg.pair(e.xfer).ok_or_else(|| anyhow::anyhow!("f{frame}: an edge without its transfer"))?;
                         let mut b = Vec::new();
                         celeste_rust::search::arc_edges::encode_pair(&mut b, &pair);
                         let p = b.iter().fold(0u64, |h, &x| celeste_engine::runtime2::mix64(h ^ x as u64));
-                        let (t, s) = (node(e.target)?, node(e.base)?);
+                        let (t, s) = (node(e.dst)?, node(e.src)?);
                         if std::env::var("CELESTE_EDGE_DUMP").is_ok_and(|v| v == frame.to_string()) {
                             eprintln!("edge {t:016x} {s:016x} {pair:?}");
                         }
@@ -904,7 +879,7 @@ fn main() -> Result<()> {
             edges,
         } => {
             use celeste_rust::frame::{load_frame, threads};
-            use celeste_rust::search::door::Door;
+            use celeste_rust::storage::wave::{one_frame, run_wave, WaveCtx};
             std::env::set_var("CELESTE_START_ROOM", &room);
             set_level(level);
             let engine = celeste_rust::compiled::FrameEngine::new_for_start_room()?;
@@ -926,63 +901,49 @@ fn main() -> Result<()> {
                 let b = Block::from_rt2(frontier[0].rt2().clone_block());
                 let n = b.lanes();
                 let mask: Vec<bool> = (0..n).map(|i| i < 64).collect();
-                let small = vec![b.keep(&mask).expect("a non-empty block")];
-                forward_frame(&engine, small, &Door::new(), None, Filters::default(), frame + 1, None, Layer::New)?;
+                one_frame(&engine, vec![b.keep(&mask).expect("a non-empty block")], frame + 1)?;
             }
             let edges_dir = dir.join("bench-edges");
-            // With edges, the tree's own door, so a re-emitted old state
-            // resolves to its real layer, as in the search.
-            let tree_door = if edges {
+            // With edges, the tree's own visited set at the frame (frames
+            // 0..=frame), so an old state is old, as in the search.
+            let tree = if edges {
                 let t = std::time::Instant::now();
-                let state = celeste_rust::frame::ForwardState::resume(&dir, false)?.expect("a checkpoint tree");
-                eprintln!("[bench] tree door loaded in {:.1} s", t.elapsed().as_secs_f64());
-                Some(state)
+                let (visited, _) = celeste_rust::frame::restore_visited(&dir, frame)?;
+                let xfers = celeste_rust::storage::edges::XferTable::load(&dir.join("edges"))?;
+                eprintln!("[bench] the tree's visited set at f{frame} ({} states) in {:.1} s", visited.len(), t.elapsed().as_secs_f64());
+                Some((visited, xfers))
             } else {
                 None
             };
             for rep in 0..reps {
                 // With their ids, as the search runs them.
-                let input: Vec<Block> = frontier
-                    .iter()
-                    .map(|b| Block::with_ids(b.rt2().clone_block(), b.ids().to_vec(), b.seq()))
-                    .collect();
-                let fresh = Door::new();
-                let door: &Door = tree_door.as_ref().map_or(&fresh, |s| s.door());
+                let input: Vec<Block> = frontier.iter().map(|b| Block::with_ids(b.rt2().clone_block(), b.ids().to_vec(), b.seq())).collect();
+                let (mut visited, mut xfers) = match &tree {
+                    Some((v, x)) => (v.clone(), x.clone()),
+                    None => (celeste_rust::storage::visited::VisitedSet::new(*celeste_rust::storage::geometry()), Default::default()),
+                };
                 let _ = std::fs::remove_dir_all(&edges_dir);
                 let t = std::time::Instant::now();
-                let wave = forward_frame(&engine, input, door, None, Filters::default(), frame + 1, edges.then_some(edges_dir.as_path()), Layer::New)?;
+                let cx = WaveCtx { visited: &mut visited, xfers: &mut xfers, pos: None, filters: Default::default(), frame: frame + 1, edges_dir: edges.then_some(edges_dir.as_path()), layer: celeste_rust::frame::Layer::New, layers: None };
+                let wave = run_wave(&engine, input, cx)?;
                 let (next, st) = (wave.next, wave.stats);
                 let t_fwd = t.elapsed();
-                let (t_compact, records) = if edges {
-                    let t = std::time::Instant::now();
-                    let c = celeste_rust::search::edges::compact_frame(&edges_dir, frame + 1)?;
-                    println!(
-                        "[bench]   compaction: {} records -> {} edges, {:.1} MB runs ({:.2} B/edge), {} layers",
-                        c.records,
-                        c.edges,
-                        c.bytes as f64 / 1e6,
-                        c.bytes as f64 / c.edges.max(1) as f64,
-                        c.layers
-                    );
-                    (t.elapsed(), c.records)
-                } else {
-                    (std::time::Duration::ZERO, 0)
-                };
                 let ms = |d: std::time::Duration| d.as_secs_f64() * 1e3;
                 println!(
-                    "[bench] rep {rep}: raw {} kept {} | wave {:.0} ms (idle {:.0}%) door {:.0} total {:.0} ms | flushes {} ({:.0} rows avg) | {} out blocks | edges {} written {:.0} compact {:.0} ms",
+                    "[bench] rep {rep}: raw {} kept {} | wave {:.0} ms (idle {:.0}%) translate {:.0} layer {:.0} total {:.0} ms | units {} requests {} lids {} | {} out blocks | edges {} ({:.2} B)",
                     st.lanes_raw,
                     st.lanes_kept,
                     ms(st.t_wave),
                     st.wave_idle * 100.0,
-                    ms(st.t_door),
+                    ms(st.t_translate),
+                    ms(st.t_layer),
                     ms(t_fwd),
-                    st.flushes,
-                    st.flushed_rows as f64 / st.flushes.max(1) as f64,
+                    st.units,
+                    st.requests,
+                    st.lids,
                     next.len(),
-                    records,
-                    ms(st.t_edges),
-                    ms(t_compact),
+                    st.edge_records,
+                    st.edge_bytes as f64 / st.edge_records.max(1) as f64,
                 );
             }
             let _ = std::fs::remove_dir_all(&edges_dir);
@@ -1078,10 +1039,10 @@ fn main() -> Result<()> {
             let edges_dir = dir.join("edges");
             let ids = celeste_rust::compiled::ids();
             let mut eng = RefEngine::new()?;
-            let graph = celeste_rust::search::edges::EdgeGraph::open(&edges_dir, to)?;
+            let graph = celeste_rust::storage::edges::EdgeStore::open(&edges_dir, to)?;
             let rem_cells = |rt2: &Rt2| rt2.player_xy_cells(ids, ids.f_rem);
             // One stored row, by id, as a one-lane block.
-            let row_of = |id: u64| -> Result<Block> { Ok(Block::from_rt2(load_row(dir, id)?.0)) };
+            let row_of = |id: StateId| -> Result<Block> { Ok(Block::from_rt2(load_row(dir, id)?.0)) };
             // Every successor of `row` at remainder `rem` over all 64 inputs:
             // its projection onto the level and its player's remainder.
             type Succ = ((u64, (u64, u64), u32), Option<(u32, u32)>);
@@ -1148,20 +1109,19 @@ fn main() -> Result<()> {
             let t0 = std::time::Instant::now();
             /// A record with its transfer decoded.
             struct Rec {
-                target: u64,
-                base: u64,
-                mask: u64,
+                target: StateId,
+                src: StateId,
                 x: celeste_rust::search::arcs::Transfer,
                 y: celeste_rust::search::arcs::Transfer,
             }
             for frame in from..=to {
-                let all = graph.records_at(frame);
-                let missing = all.iter().filter(|e| graph.pair(frame, e.xfer).is_none()).count() as u64;
+                let all = graph.edges_at(frame);
+                let missing = all.iter().filter(|e| graph.pair(e.xfer).is_none()).count() as u64;
                 missing_total += missing;
                 let recs: Vec<Rec> = all
                     .iter()
-                    .filter_map(|e| graph.pair(frame, e.xfer).map(|p| (e, p)))
-                    .map(|(e, p)| Ok(Rec { target: e.target, base: e.base, mask: e.mask, x: corrupt(p.0.transfer())?, y: p.1.transfer() }))
+                    .filter_map(|e| graph.pair(e.xfer).map(|p| (e, p)))
+                    .map(|(e, p)| Ok(Rec { target: e.dst, src: e.src, x: corrupt(p.0.transfer())?, y: p.1.transfer() }))
                     .collect::<Result<_>>()?;
                 records_total += recs.len() as u64;
                 for r in &recs {
@@ -1174,14 +1134,14 @@ fn main() -> Result<()> {
                 let stride = (recs.len() / samples.max(1)).max(1);
                 for r in recs.iter().step_by(stride).take(samples) {
                     sampled += 1;
-                    let src = r.base + r.mask.trailing_zeros() as u64;
+                    let src = r.src;
                     let src_row = row_of(src)?;
                     let tgt_row = row_of(r.target)?;
                     let (tshape, tkeys, tcells) = widened_keys(&tgt_row, level)?;
                     let target = (tshape, tkeys[0], tcells[0]);
                     let (gx, gy) = (r.x.guard, r.y.guard);
                     // Every record of this (pred, target), and its guards as rectangles.
-                    let pair: Vec<&Rec> = recs.iter().filter(|q| q.target == r.target && src >= q.base && src < q.base + 64 && q.mask >> (src - q.base) & 1 == 1).collect();
+                    let pair: Vec<&Rec> = recs.iter().filter(|q| q.target == r.target && q.src == src).collect();
                     let mut union = Rects::empty();
                     for q in &pair {
                         union.add(Rect { x: q.x.guard_set(), y: q.y.guard_set() });
@@ -1220,14 +1180,14 @@ fn main() -> Result<()> {
                         let stray: Vec<(u32, u32)> = succs.iter().filter(|(id, _)| *id == target).filter_map(|(_, q)| *q).filter(|q| !predicted(q)).collect();
                         if !stray.is_empty() {
                             unpredicted += 1;
-                            eprintln!("[arc-check] f{frame} pred {src:#x} -> {:#x}: inside {p:?} the reference reaches the target at {stray:?}, which no record of the pair taking the point predicts", r.target);
+                            eprintln!("[arc-check] f{frame} pred {} -> {}: inside {p:?} the reference reaches the target at {stray:?}, which no record of the pair taking the point predicts", show_id(src), show_id(r.target));
                         }
                         if !ok {
                             inside_bad += 1;
                             let reached: Vec<&Option<(u32, u32)>> = succs.iter().filter(|(id, _)| *id == target).map(|(_, q)| q).collect();
                             eprintln!(
-                                "[arc-check] f{frame} pred {src:#x} -> {:#x}: inside {p:?} the transfer x {:?} y {:?} predicts {want:?}; the reference reaches the target with remainders {reached:?}",
-                                r.target, r.x, r.y
+                                "[arc-check] f{frame} pred {} -> {}: inside {p:?} the transfer x {:?} y {:?} predicts {want:?}; the reference reaches the target with remainders {reached:?}",
+                                show_id(src), show_id(r.target), r.x, r.y
                             );
                         }
                     }
@@ -1242,7 +1202,7 @@ fn main() -> Result<()> {
                             outside += 1;
                             if successors(&src_row, p)?.iter().any(|(id, _)| *id == target) {
                                 outside_bad += 1;
-                                eprintln!("[arc-check] f{frame} pred {src:#x} -> {:#x}: OUTSIDE every guard of the pair at {p:?}, the reference reaches the target", r.target);
+                                eprintln!("[arc-check] f{frame} pred {} -> {}: OUTSIDE every guard of the pair at {p:?}, the reference reaches the target", show_id(src), show_id(r.target));
                             }
                         }
                     }
@@ -1294,9 +1254,9 @@ fn main() -> Result<()> {
                 let (fi, r) = all[k * all.len() / n];
                 let (seq, f) = &files[fi];
                 let rt2 = f.load_rows(&[r..r + 1])?.ok_or_else(|| anyhow::anyhow!("no row"))?;
-                let at = where_(f.row_cells()[r as usize]);
+                let at = where_(f.cell_at(r));
                 // The kernels' successors.
-                let (next, _) = rerun(&kernels, rt2.clone_block(), pack_id(frame, *seq, r), "ref-check")?;
+                let (next, _) = rerun(&kernels, rt2.clone_block(), frame)?;
                 let mut kset: std::collections::BTreeSet<Proj> = Default::default();
                 for b in next {
                     kset.extend(project_onto(&mut b.into_rt2(), level));
@@ -1336,14 +1296,15 @@ fn main() -> Result<()> {
             let [layer, seq, r] = parts[..] else { anyhow::bail!("--row L:S:R") };
             set_level(level);
             let engine = celeste_rust::compiled::FrameEngine::new_for_start_room()?;
-            let id = pack_id(layer, seq, r);
-            let (rt2, _, cell) = load_row(dir, id)?;
+            let (_, f) = frame_files(dir, layer)?.into_iter().find(|(s, _)| *s == seq).ok_or_else(|| anyhow::anyhow!("no file l{layer} s{seq}"))?;
+            anyhow::ensure!(r < f.width(), "row {r} past the file's {}", f.width());
+            let rt2 = f.load_rows(&[r..r + 1])?.ok_or_else(|| anyhow::anyhow!("no row"))?;
             let me = project_row(&rt2, &cell_names(&rt2, ids), 0, &erase);
-            println!("[rerun] l{layer} s{seq} r{r} at {}:", where_(cell));
+            println!("[rerun] l{layer} s{seq} r{r} (state {}) at {}:", show_id(f.id_at(r)), where_(f.cell_at(r)));
             for (n, v) in &me {
                 println!("    {n} = {v}");
             }
-            let (next, won) = rerun(&engine, rt2, id, "rerun-row")?;
+            let (next, won) = rerun(&engine, rt2, layer)?;
             let mut n = 0;
             for b in &next {
                 let cells = celeste_rust::search::pos_graph::block_cells(b.rt2())?;
@@ -1406,10 +1367,10 @@ fn main() -> Result<()> {
             };
             // The samples: the coarse tree's new states at `step` in the cells.
             let (mut total, mut sp_vals, mut co_vals) = (0u64, Dist::new(), Dist::new());
-            let mut chosen: Vec<u64> = Vec::new();
+            let mut chosen: Vec<StateId> = Vec::new();
             for &want in &wants {
                 let here_real = real_of(want, Some(&mut real_vals))?;
-                for (seq, f) in frame_files(coarse, step)? {
+                for (_, f) in frame_files(coarse, step)? {
                     for range in f.rows_of_cell(want) {
                         let lo = range.start;
                         let Some(rt2) = f.load_rows(&[range])? else { continue };
@@ -1419,7 +1380,7 @@ fn main() -> Result<()> {
                             let is_real = real.is_some() && here_real.get(&projection_key(&p)).is_some_and(|&s| s <= step);
                             tally(if is_real { &mut co_vals } else { &mut sp_vals }, &p);
                             if !is_real {
-                                chosen.push(pack_id(step, seq, lo + r as u32));
+                                chosen.push(f.id_at(lo + r as u32));
                             }
                         }
                     }
@@ -1449,33 +1410,33 @@ fn main() -> Result<()> {
                 }
             }
             // Walk the samples back.
-            let edges = celeste_rust::search::edges::EdgeGraph::open(&coarse.join("edges"), step)?;
+            let edges = celeste_rust::storage::edges::EdgeStore::open(&coarse.join("edges"), step)?;
             let n = samples.min(chosen.len());
             for k in 0..n {
-                let mut id = chosen[k * chosen.len() / n];
-                let (rt2, shape, c) = load_row(coarse, id)?;
+                let (mut id, mut layer) = (chosen[k * chosen.len() / n], step);
+                let (rt2, shape, c, _) = load_row(coarse, id)?;
                 let mut cur = project(&rt2, 0);
-                println!("\n[spurious] sample {k}: l{} s{} r{} shape {shape:016x} {}", id_layer(id), id_seq(id), id_row(id), where_(c));
+                println!("\n[spurious] sample {k}: f{layer} {} shape {shape:016x} {}", show_id(id), where_(c));
                 if real.is_none() {
                     for (name, v) in &cur {
                         println!("    {name} = {v}");
                     }
                 }
                 // (frame, cell, key) along the chain, for `--chain-out`.
-                let mut chain: Vec<(u32, u32, (u64, u64))> = vec![(id_layer(id), c, rt2.clone_block().row_keys_canonical(celeste_rust::compiled::ids())[0])];
+                let mut chain: Vec<(u32, u32, (u64, u64))> = vec![(layer, c, rt2.clone_block().row_keys_canonical(celeste_rust::compiled::ids())[0])];
                 let mut found = false;
                 for _ in 0..depth {
-                    if id_layer(id) == 0 {
+                    if layer == 0 {
                         break;
                     }
-                    let preds = preds_of(&edges, id);
+                    let preds = preds_of(&edges, id, layer);
                     // Prefer a REAL predecessor: then this step is the first
                     // spurious one.
-                    let mut pick: Option<(u64, Rt2, Proj, u32, bool)> = None;
+                    let mut pick: Option<(StateId, Rt2, Proj, u32, bool)> = None;
                     for &p in &preds {
-                        let (rt, _, pc) = load_row(coarse, p)?;
+                        let (rt, _, pc, _) = load_row(coarse, p)?;
                         let pp = project(&rt, 0);
-                        let is_real = real.is_some() && real_of(pc, None)?.get(&projection_key(&pp)).is_some_and(|&s| s <= id_layer(p));
+                        let is_real = real.is_some() && real_of(pc, None)?.get(&projection_key(&pp)).is_some_and(|&s| s < layer);
                         if is_real || pick.is_none() {
                             pick = Some((p, rt, pp, pc, is_real));
                         }
@@ -1484,7 +1445,7 @@ fn main() -> Result<()> {
                         }
                     }
                     let Some((p, rt, pp, pc, is_real)) = pick else {
-                        println!("  <- no recorded predecessor at f{:03}", id_layer(id));
+                        println!("  <- no recorded predecessor at f{layer:03}");
                         break;
                     };
                     let changed: Vec<String> = cur
@@ -1493,16 +1454,17 @@ fn main() -> Result<()> {
                         .map(|(nm, v)| format!("{nm}: {} -> {v}", pp.get(nm).map(|s| s.as_str()).unwrap_or("absent")))
                         .collect();
                     if is_real {
-                        println!("  FIRST SPURIOUS STEP l{} s{} r{} -> l{}: {} ({} preds): {}", id_layer(p), id_seq(p), id_row(p), id_layer(id), where_(pc), preds.len(), changed.join(", "));
+                        println!("  FIRST SPURIOUS STEP f{} {} -> f{layer}: {} ({} preds): {}", layer - 1, show_id(p), where_(pc), preds.len(), changed.join(", "));
                         // The whole real predecessor, unprojected: the floors too.
                         let full = project_row(&rt, &cell_names(&rt, ids), 0, &[]);
                         println!("    predecessor (full): {}", full.iter().filter(|(n, _)| !n.contains("hitbox") && !n.contains(".type.") && !n.ends_with(".solids") && !n.contains(".flip.y") && !n.ends_with(".spr") || n.starts_with("spring") || n.starts_with("balloon")).map(|(n, v)| format!("{n}={v}")).collect::<Vec<_>>().join(" "));
                         found = true;
                         break;
                     }
-                    println!("  <- f{:03} {} [{}:{}:{}] ({} preds){}: {}", id_layer(p), where_(pc), id_layer(p), id_seq(p), id_row(p), preds.len(), if real.is_some() { " still spurious" } else { "" }, changed.join(", "));
-                    chain.push((id_layer(p), pc, rt.clone_block().row_keys_canonical(celeste_rust::compiled::ids())[0]));
+                    println!("  <- f{:03} {} [{}] ({} preds){}: {}", layer - 1, where_(pc), show_id(p), preds.len(), if real.is_some() { " still spurious" } else { "" }, changed.join(", "));
+                    chain.push((layer - 1, pc, rt.clone_block().row_keys_canonical(celeste_rust::compiled::ids())[0]));
                     id = p;
+                    layer -= 1;
                     cur = pp;
                 }
                 if real.is_some() && !found {
@@ -1523,48 +1485,11 @@ fn main() -> Result<()> {
                 }
             }
         }
-        Command::CompactBench { edges_dir, frame, to, scratch } => {
-            use celeste_rust::search::edges::{invert, raw_dir, set_done_frame};
-            let dst = std::path::Path::new(&scratch);
-            if dst.exists() {
-                std::fs::remove_dir_all(dst)?;
-            }
-            let last = to.unwrap_or(frame);
-            let mut n = 0;
-            for f in frame..=last {
-                let (src, to) = (raw_dir(std::path::Path::new(&edges_dir), f), raw_dir(dst, f));
-                std::fs::create_dir_all(&to)?;
-                for e in std::fs::read_dir(&src).map_err(|e| anyhow::anyhow!("{}: {e}", src.display()))? {
-                    let p = e?.path();
-                    std::fs::hard_link(&p, to.join(p.file_name().expect("a file")))?;
-                    n += 1;
-                }
-            }
-            set_done_frame(dst, last)?;
-            let cpu = || {
-                // SAFETY: getrusage fills the struct it is given.
-                let mut u: libc::rusage = unsafe { std::mem::zeroed() };
-                unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut u) };
-                u.ru_utime.tv_sec as f64 + u.ru_utime.tv_usec as f64 * 1e-6 + u.ru_stime.tv_sec as f64 + u.ru_stime.tv_usec as f64 * 1e-6
-            };
-            let (t0, c0) = (std::time::Instant::now(), cpu());
-            let st = invert(dst, last)?;
-            println!(
-                "[compact-bench] f{frame:03}-f{last:03}: {n} raw files, {} layers, {} records -> {} edges, {:.1} MB runs; wall {:.2} s, cpu {:.1} s",
-                st.layers,
-                st.records,
-                st.edges,
-                st.bytes as f64 / 1e6,
-                t0.elapsed().as_secs_f64(),
-                cpu() - c0
-            );
-        }
         Command::EdgeCensus { level_dir, frame, horizon } => {
-            use celeste_rust::search::edges::EdgeGraph;
-            let g = EdgeGraph::open(std::path::Path::new(&level_dir), horizon)?;
-            let pairs = g.pairs(frame);
-            let mut recs = g.records_at(frame);
-            recs.sort_unstable_by_key(|e| (e.base, e.target, e.xfer));
+            let g = celeste_rust::storage::edges::EdgeStore::open(&std::path::Path::new(&level_dir).join("edges"), horizon)?;
+            let pairs = g.pairs();
+            let mut recs = g.edges_at(frame);
+            recs.sort_unstable();
             let n_edges = recs.len();
             let mut hist = std::collections::BTreeMap::<usize, u64>::new();
             let (mut n_pairs, mut product, mut x_const, mut y_const, mut dup) = (0u64, 0u64, 0u64, 0u64, 0u64);
@@ -1574,7 +1499,7 @@ fn main() -> Result<()> {
             let mut i = 0;
             while i < recs.len() {
                 let mut j = i;
-                while j < recs.len() && (recs[j].base, recs[j].target) == (recs[i].base, recs[i].target) {
+                while j < recs.len() && (recs[j].src, recs[j].dst) == (recs[i].src, recs[i].dst) {
                     j += 1;
                 }
                 let mut ids: Vec<u32> = recs[i..j].iter().map(|e| e.xfer).collect();
@@ -1607,7 +1532,7 @@ fn main() -> Result<()> {
             println!("frame {frame}: {n_edges} edges, {n_pairs} (source, target) pairs, {:.2} transfers a pair, {dup} duplicate edges", n_edges as f64 / n_pairs as f64);
             println!("transfers per pair: {hist:?}");
             println!("pairs whose transfers are exactly x-pieces x y-pieces: {product} ({:.1}%); x part constant {x_const} ({:.1}%), y part constant {y_const} ({:.1}%)", 100.0 * product as f64 / n_pairs as f64, 100.0 * x_const as f64 / n_pairs as f64, 100.0 * y_const as f64 / n_pairs as f64);
-            println!("distinct transfer sets {}, x sets {}, y sets {} (frame table: {} pairs)", sets.len(), xsets.len(), ysets.len(), pairs.len());
+            println!("distinct transfer sets {}, x sets {}, y sets {} (the tree's table: {} pairs)", sets.len(), xsets.len(), ysets.len(), pairs.len());
         }
         Command::BoundsAudit { level_dir, room } => {
             use celeste_engine::runtime2::{Col, AV, FLY_FRUIT_REM_Y, FLY_FRUIT_SPD_Y, PLATFORM_PATH, PLATFORM_REM};
@@ -2029,14 +1954,14 @@ fn main() -> Result<()> {
                 let Some(loc) = found.filter(|_| !won) else {
                     println!("[follow] f{f} input {byte}: {} ({} concrete leaves)", if won { "WIN" } else { "NOT IN THE TREE" }, next.len());
                     let (layer, seq, r) = parent.ok_or_else(|| anyhow::anyhow!("the first step is already missing"))?;
-                    let id = pack_id(layer, seq, r);
-                    let (rt2, ..) = load_row(dir, id)?;
-                    println!("    parent row (layer {layer} s{seq} r{r}): {}", brief(&project_onto(&mut rt2.clone_block(), lvl)[0]));
+                    let (_, file) = frame_files(dir, layer)?.into_iter().find(|(s, _)| *s == seq).ok_or_else(|| anyhow::anyhow!("no file l{layer} s{seq}"))?;
+                    let rt2 = file.load_rows(&[r..r + 1])?.ok_or_else(|| anyhow::anyhow!("no row"))?;
+                    println!("    parent row (layer {layer} s{seq} r{r}, state {}): {}", show_id(file.id_at(r)), brief(&project_onto(&mut rt2.clone_block(), lvl)[0]));
                     for s in &states {
                         println!("    concrete parent: {}", brief(&project_all(s)[0]));
                     }
                     let kernels = celeste_rust::compiled::FrameEngine::new_for_start_room()?;
-                    let (out, _) = rerun(&kernels, rt2, id, "follow")?;
+                    let (out, _) = rerun(&kernels, rt2, layer)?;
                     let mut kset: std::collections::BTreeSet<Proj> = Default::default();
                     let mut kwins = 0;
                     for b in out {
