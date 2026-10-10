@@ -1580,14 +1580,6 @@ pub fn load_marks(path: &std::path::Path) -> Result<(Vec<MarkRow>, u32, celeste_
     Ok((rows, horizon, celeste_engine::exact::KeySpace::from_additions(adds).with_context(|| format!("{}: its key space", path.display()))?))
 }
 
-/// The order-independent hash of a state `(shape, key, cell)` in the
-/// fingerprints (ckhash, the arc gate's marks).
-#[inline]
-pub fn state_hash(shape: u64, key: (u64, u64), cell: u32) -> u64 {
-    use celeste_engine::runtime2::mix64;
-    mix64(shape ^ mix64(key.0 ^ mix64(key.1 ^ (cell as u64) << 1)))
-}
-
 /// An in-memory set of states `(shape, cell, key)` (a level's MARKED states
 /// or a diagnostic's), saved as a marks file; its keys are in the key space
 /// of the tree it names.
@@ -1608,24 +1600,27 @@ impl Visited {
     pub fn keys(&self) -> &celeste_engine::exact::KeySpace {
         &self.keys
     }
-    /// `(entries, order-independent hash of the (shape, key, cell) set)`.
+    /// `(entries, order-independent CONTENT hash of the (shape, key, cell)
+    /// set)` (`exact::ContentHash`).
     pub fn fingerprint(&self) -> (usize, u64) {
+        let h = self.keys.content_hash();
         let mut acc = 0u64;
         for ((shape, cell), keys) in &self.shards {
             for &k in keys.keys() {
-                acc = acc.wrapping_add(state_hash(*shape, k, *cell));
+                acc = acc.wrapping_add(h.state(*shape, k, *cell));
             }
         }
         (self.len(), acc)
     }
-    /// An order-independent hash of every `(shape, cell, key, deadline)`:
-    /// equal values filter alike (`MarkFilter`).
+    /// An order-independent content hash of every `(shape, cell, key,
+    /// deadline)`: equal values filter alike (`MarkFilter`).
     pub fn filter_fingerprint(&self) -> u64 {
         use celeste_engine::runtime2::mix64;
+        let h = self.keys.content_hash();
         let mut acc = 0u64;
         for ((shape, cell), keys) in &self.shards {
-            for (&(k0, k1), &d) in keys {
-                acc = acc.wrapping_add(mix64(k0 ^ mix64(k1 ^ mix64(*shape ^ ((*cell as u64) << 16 | d as u64)))));
+            for (&k, &d) in keys {
+                acc = acc.wrapping_add(mix64(h.state(*shape, k, *cell) ^ (d as u64) << 3));
             }
         }
         acc
@@ -1804,17 +1799,24 @@ mod tests {
     #[test]
     fn marks_files_keep_their_deadlines() {
         let path = std::env::temp_dir().join(format!("celeste-marks-roundtrip-{}.bin", std::process::id()));
-        let mut v = Visited::new(Default::default());
-        v.insert_until(1, (2, 3), 4, 7);
-        v.insert_until(1, (5, 6), 4, 12);
-        v.insert(9, (2, 3), 8);
+        // A key space with shapes 1 and 9, two codes in one field each.
+        let mut space = celeste_engine::exact::KeySpace::new();
+        let mut adds = Default::default();
+        for shape in [1, 9] {
+            space.add_shape(&celeste_engine::exact::ShapeRecord { hash: shape, sig: vec![1, u32::MAX], pos: None }, &mut adds);
+            space.add_codes(shape, 0, &[celeste_engine::exact::Code::num(0, 0), celeste_engine::exact::Code::num(1, 1)], &mut adds);
+        }
+        let mut v = Visited::new(space);
+        v.insert_until(1, (0, 0), 4, 7);
+        v.insert_until(1, (0, 1), 4, 12);
+        v.insert(9, (0, 0), 8);
         v.save(&path, 12).expect("save");
         let w = Visited::load(&path).expect("load");
         std::fs::remove_file(&path).expect("rm");
         assert_eq!(w.fingerprint(), v.fingerprint());
-        assert_eq!(w.deadline(1, (2, 3), 4), Some(7));
-        assert_eq!(w.deadline(1, (5, 6), 4), Some(12));
-        assert_eq!(w.deadline(9, (2, 3), 8), Some(12), "no deadline: the horizon");
+        assert_eq!(w.deadline(1, (0, 0), 4), Some(7));
+        assert_eq!(w.deadline(1, (0, 1), 4), Some(12));
+        assert_eq!(w.deadline(9, (0, 0), 8), Some(12), "no deadline: the horizon");
     }
 
     /// Extending frame by frame and resuming reproduce a fresh run's key sets.

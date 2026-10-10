@@ -471,6 +471,44 @@ impl ShapeKeys {
     }
 }
 
+/// FINGERPRINTS over exact CONTENT: a key's decoded codes, hashed - so
+/// two trees whose dictionaries grew in different orders (a raise appends
+/// its codes after later frames') fingerprint the same states alike. Per
+/// shape the fields without bits hashed once, and per field with bits a
+/// hash per index.
+pub struct ContentHash {
+    shapes: FxHashMap<u64, (u64, Vec<(Vec<(u8, u8)>, Vec<u64>)>)>,
+}
+
+impl ContentHash {
+    #[inline]
+    fn code_hash(cell: u32, c: Code) -> u64 {
+        mix64(mix64((cell as u64) << 8 | c.kind as u64) ^ ((c.a as u64) << 32 | c.b as u64))
+    }
+
+    /// The content hash of `shape`'s key `k` (a key the space holds).
+    pub fn key(&self, shape: u64, k: Key) -> u64 {
+        let (fixed, fields) = self.shapes.get(&shape).unwrap_or_else(|| panic!("exact keys: fingerprinting a key of the unknown shape {shape:#x}"));
+        let k = of_key(k);
+        let mut acc = *fixed;
+        for (runs, hashes) in fields {
+            let (mut idx, mut at) = (0u128, 0u32);
+            for &(pos, len) in runs {
+                idx |= (k >> pos & ((1u128 << len) - 1)) << at;
+                at += len as u32;
+            }
+            acc = acc.wrapping_add(*hashes.get(idx as usize).unwrap_or_else(|| panic!("exact keys: a key of shape {shape:#x} indexes past its dictionary")));
+        }
+        mix64(shape ^ acc)
+    }
+
+    /// The content hash of a state `(shape, key, cell)`.
+    #[inline]
+    pub fn state(&self, shape: u64, k: Key, cell: u32) -> u64 {
+        mix64(self.key(shape, k) ^ (cell as u64) << 1)
+    }
+}
+
 /// A row's key against a key space: packed, or (a code is missing) its
 /// exact content.
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
@@ -652,6 +690,30 @@ impl KeySpace {
         }
         self.bump();
         Ok(())
+    }
+
+    /// The content hasher of the space as it is.
+    pub fn content_hash(&self) -> ContentHash {
+        let shapes = self
+            .shapes
+            .iter()
+            .map(|(&h, s)| {
+                let mut fixed = 0u64;
+                let mut fields = Vec::new();
+                for (c, f) in s.fields.iter().enumerate() {
+                    let Some(f) = f else { continue };
+                    let hashes: Vec<u64> = f.codes.iter().map(|&code| ContentHash::code_hash(c as u32, code)).collect();
+                    if f.runs.is_empty() {
+                        // No bits: index 0 (a field never stored holds no code).
+                        fixed = fixed.wrapping_add(hashes.first().copied().unwrap_or(0));
+                    } else {
+                        fields.push((f.runs.clone(), hashes));
+                    }
+                }
+                (h, (fixed, fields))
+            })
+            .collect();
+        ContentHash { shapes }
     }
 
     /// Everything as additions (a marks file carries its tree's key space).

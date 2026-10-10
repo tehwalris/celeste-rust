@@ -838,6 +838,9 @@ fn main() -> Result<()> {
         } => {
             std::env::set_var("CELESTE_START_ROOM", &room);
             let dir = std::path::Path::new(&checkpoint_dir);
+            // Fingerprints over CONTENT (`exact::ContentHash`): a raised tree's
+            // dictionaries grew in another order than a fresh one's.
+            let content = celeste_rust::storage::meta::tree_keys(dir, to)?.content_hash();
             let mut by_cell: rustc_hash::FxHashMap<u32, usize> = Default::default();
             let mut died = false;
             for frame in 0..=to {
@@ -851,7 +854,7 @@ fn main() -> Result<()> {
                 for block in celeste_rust::frame::load_frame(dir, frame)? {
                     let cells = block.positions()?;
                     for (k, &c) in block.keys().iter().zip(&cells) {
-                        acc = acc.wrapping_add(celeste_rust::frame::state_hash(block.shard_shape(), *k, c));
+                        acc = acc.wrapping_add(content.state(block.shard_shape(), *k, c));
                         n += 1;
                         if frame == to && top_cells.is_some() {
                             *by_cell.entry(c).or_default() += 1;
@@ -868,8 +871,7 @@ fn main() -> Result<()> {
             let resolver = (edges || dropped).then(|| celeste_rust::storage::marks::Resolver::load(dir, to)).transpose()?;
             let node = |id: StateId| -> Result<u64> {
                 let (shape, k, cell) = resolver.as_ref().expect("loaded for edges and drops").resolve(id)?;
-                let mix = celeste_engine::runtime2::mix64;
-                Ok(mix(k.0 ^ mix(k.1 ^ mix(shape ^ cell as u64))))
+                Ok(content.state(shape, k, cell))
             };
             if edges {
                 let eg = celeste_rust::storage::edges::EdgeStore::open(&dir.join("edges"), to)?;

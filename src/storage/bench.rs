@@ -318,9 +318,10 @@ pub fn bench_storage(a: &BenchArgs) -> Result<()> {
             line += &format!(" | translate {:.3} s, new {} | layer {:.3} s, {} pieces", t_tr.as_secs_f64(), news.len(), t_layer.as_secs_f64(), layer.len());
             // The new states' fingerprint, as `ckhash`'s `f` line.
             let mut acc = 0u64;
+            let content = visited.keys.content_hash();
             for b in &layer {
                 for (k, id) in b.keys().iter().zip(b.ids()) {
-                    acc = acc.wrapping_add(crate::frame::state_hash(b.shard_shape(), *k, super::id_cell(&visited.geo, *id)));
+                    acc = acc.wrapping_add(content.state(b.shard_shape(), *k, super::id_cell(&visited.geo, *id)));
                 }
             }
             line += &format!(" | f{frame:03} {} {acc:016x}", news.len());
@@ -336,8 +337,7 @@ pub fn bench_storage(a: &BenchArgs) -> Result<()> {
                     let r = super::id_region(id);
                     let shape = visited.shape_hash(r / visited.geo.slots);
                     let k = visited.table(r).expect("a region of the set").key(super::id_entry(id));
-                    let mix = celeste_engine::runtime2::mix64;
-                    mix(k.0 ^ mix(k.1 ^ mix(shape ^ super::id_cell(&visited.geo, id) as u64)))
+                    content.state(shape, k, super::id_cell(&visited.geo, id))
                 };
                 let (mut n, mut acc) = (0u64, 0u64);
                 store.scan(frame, |e| {

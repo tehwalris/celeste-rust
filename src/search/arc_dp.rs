@@ -1419,6 +1419,9 @@ pub fn solve(
     // marks are the nodes, in order): the fingerprints, the marks file and
     // the concrete search's keys.
     let resolver = crate::storage::marks::Resolver::load(dir, horizon)?;
+    // Fingerprints over CONTENT (`exact::ContentHash`): independent of the
+    // order the tree's dictionaries grew in (a raise).
+    let content = resolver.space.content_hash();
     let mut files = Vec::new();
     for (f, fs) in tree_frames(dir, horizon)?.into_iter().enumerate() {
         files.extend(fs.into_iter().map(|(seq, file)| (f as u32, seq, file)));
@@ -1431,7 +1434,7 @@ pub fn solve(
     for &(id, d) in &marks {
         let (shape, key, cell) = resolver.resolve(id)?;
         // `Visited::fingerprint`: the marks are distinct states.
-        let h = crate::frame::state_hash(shape, key, cell);
+        let h = content.state(shape, key, cell);
         node_key.push(h);
         fp = fp.wrapping_add(h);
         if keyed {
