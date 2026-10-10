@@ -180,7 +180,7 @@ pub fn run_wave(engine: &dyn FrameStep, frontier: Vec<Block>, cx: WaveCtx) -> Re
     use std::time::Instant;
     let WaveCtx { visited, xfers, pos, filters, frame, edges_dir, layer, layers } = cx;
     // A platforms-unknown level knows only `PLATFORM_WORLD_FRAMES` worlds.
-    let level = crate::abstraction::current_level();
+    let level = engine.level();
     let game_frame = frame.div_ceil(crate::frame::steps_per_frame());
     ensure!(
         !level.platforms || game_frame as usize <= crate::trace::kernel::PLATFORM_WORLD_FRAMES,
@@ -242,7 +242,7 @@ pub fn run_wave(engine: &dyn FrameStep, frontier: Vec<Block>, cx: WaveCtx) -> Re
                     crate::compiled::asm_kernel::set_thread_stack(WORKER_STACK);
                     let t = Instant::now();
                     let raise = raised.map(|r| RaiseCtx { raised: r, layers: layers.expect("checked") });
-                    let mut sink = UnitSink::new(shared, claims, prov, filters, frame, w as u32, record, pos.is_some(), notes, raise);
+                    let mut sink = UnitSink::new(shared, claims, prov, filters, frame, level, w as u32, record, pos.is_some(), notes, raise);
                     if let Some(p) = index_path {
                         sink.stream_blocks(p)?;
                     }
@@ -743,15 +743,16 @@ fn gather(srcs: &[&Rt2], rows: &[u64]) -> Rt2 {
 }
 
 /// Frame 0: the initial states into an empty visited set, each block
-/// reordered by id and given its ids (seq: its place); the metadata.
-pub fn seed(visited: &mut VisitedSet, blocks: &mut [Block]) -> Result<FrameMeta> {
+/// reordered by id and given its ids (seq: its place); the metadata. Keyed
+/// at `level` (its held buttons widened, as a reference row).
+pub fn seed(visited: &mut VisitedSet, blocks: &mut [Block], level: crate::abstraction::Level) -> Result<FrameMeta> {
     let geo = visited.geo;
     let mut meta = FrameMeta::new();
     // The key space: every initial code, per field sorted; then the keys.
     // A row is keyed as the forward keys a reference row (`UnitSink::row_key`:
     // the level's held buttons widened) and stored as it is.
     let ids = crate::compiled::ids();
-    let level = crate::abstraction::Level { held: crate::abstraction::current_level().held, ..crate::abstraction::Level::EXACT };
+    let level = crate::abstraction::Level { held: level.held, ..crate::abstraction::Level::EXACT };
     let mut canon: Vec<Rt2> = Vec::with_capacity(blocks.len());
     let mut views: Vec<Rt2> = Vec::with_capacity(blocks.len());
     for b in blocks.iter() {

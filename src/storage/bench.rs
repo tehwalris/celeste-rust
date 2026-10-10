@@ -47,7 +47,7 @@ pub struct CaptureWriter {
 impl CaptureWriter {
     /// The stream of `worker` at `frame`, if this frame is captured
     /// (`DIR/f{frame}/`).
-    pub fn open(frame: u32, worker: u32) -> Option<Self> {
+    pub fn open(frame: u32, worker: u32, level: crate::abstraction::Level) -> Option<Self> {
         let (root, only) = capture_target()?;
         if only.is_some_and(|f| f != frame) {
             return None;
@@ -56,7 +56,7 @@ impl CaptureWriter {
         std::fs::create_dir_all(&dir).expect("the capture dir");
         if worker == 0 {
             let vars: Vec<String> = std::env::vars().filter(|(k, _)| k.starts_with("CELESTE_")).map(|(k, v)| format!("{k}={v}")).collect();
-            std::fs::write(dir.join("env.txt"), format!("frame {frame}\nlevel {}\n{}\n", crate::abstraction::current_level(), vars.join("\n"))).expect("the capture's env");
+            std::fs::write(dir.join("env.txt"), format!("frame {frame}\nlevel {level}\n{}\n", vars.join("\n"))).expect("the capture's env");
         }
         let f = std::fs::File::create(dir.join(format!("w{worker:03}.bin"))).expect("a capture stream");
         Some(CaptureWriter { dir, worker, out: std::io::BufWriter::with_capacity(8 << 20, f) })
@@ -228,6 +228,7 @@ fn push_bench_row(buf: &mut RowBuf, key: Key, cell: u32) {
 pub struct BenchArgs<'a> {
     pub capture: &'a Path,
     pub tree: &'a Path,
+    pub level: crate::abstraction::Level,
     pub threads: usize,
     pub phase: &'a str,
     pub reps: usize,
@@ -275,7 +276,7 @@ pub fn bench_storage(a: &BenchArgs) -> Result<()> {
                 .map(|w| {
                     let (cap, order, next, claims, prov, index) = (&cap, &order, &next, &claims, &prov, &index);
                     scope.spawn(move || -> Result<Done> {
-                        let mut sink = UnitSink::new(shared, claims, prov, crate::frame::Filters::default(), frame, w as u32, true, false, None, None);
+                        let mut sink = UnitSink::new(shared, claims, prov, crate::frame::Filters::default(), frame, a.level, w as u32, true, false, None, None);
                         if do_edges {
                             sink.stream_blocks(&index)?;
                         }

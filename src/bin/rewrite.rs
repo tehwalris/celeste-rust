@@ -9,7 +9,7 @@ use celeste_engine::runtime2::Rt2;
 use celeste_rust::trace::refengine::RefEngine;
 use celeste_rust::frame::{frame_files, frame_paths, load_row, widen_rt2_to, widened_keys, wins_of, Block, FrameStep, MinusOne, Visited};
 use celeste_rust::storage::{show_id, StateId};
-use celeste_rust::abstraction::{set_level, Level};
+use celeste_rust::abstraction::Level;
 use celeste_rust::search::inspect::{brief, cell_names, parse_xy, player_summary, project_all, project_onto, project_row, Proj};
 use clap::{Parser, Subcommand};
 
@@ -711,7 +711,6 @@ fn main() -> Result<()> {
             let mut prev: Option<(Visited, Level)> = None;
             for (li, &lvl) in levels.iter().enumerate() {
                 let last = li + 1 == levels.len();
-                set_level(lvl);
                 let dir = base.join(format!("level{li:02}"));
                 // THE FORWARD. Level 0's tree is reused, extended, or RAISED
                 // to this run's level -1 horizon (`grow_tree`). A finer
@@ -738,7 +737,8 @@ fn main() -> Result<()> {
                     steps,
                     want,
                     filter.as_ref(),
-                    || Ok(Box::new(celeste_rust::compiled::FrameEngine::new_for_start_room()?)),
+                    lvl,
+                    || Ok(Box::new(celeste_rust::compiled::FrameEngine::new_for_start_room(lvl)?)),
                     || Ok(vec![Block::canonical(RefEngine::new()?.initial()?)?]),
                 )?
                 .win_frame;
@@ -801,7 +801,6 @@ fn main() -> Result<()> {
             let mut prev: Option<(Visited, Level)> = None;
             for (li, &lvl) in levels.iter().enumerate() {
                 let last = li + 1 == levels.len();
-                set_level(lvl);
                 let dir = std::path::Path::new(&checkpoint_dir).join(format!("level{li:02}"));
                 anyhow::ensure!(
                     celeste_rust::frame::tree_first_win_through(&dir, steps)?.is_some(),
@@ -828,12 +827,11 @@ fn main() -> Result<()> {
             reference,
         } => {
             std::env::set_var("CELESTE_START_ROOM", &room);
-            set_level(level);
             let t = std::time::Instant::now();
             let engine: Box<dyn FrameStep> = if reference {
-                Box::new(std::sync::Mutex::new(celeste_rust::trace::refengine::RefEngine::new()?))
+                Box::new(std::sync::Mutex::new(celeste_rust::trace::refengine::RefEngine::new()?.at_level(level)))
             } else {
-                Box::new(celeste_rust::compiled::FrameEngine::new_for_start_room()?)
+                Box::new(celeste_rust::compiled::FrameEngine::new_for_start_room(level)?)
             };
             eprintln!("[fwd] engine up in {:.2} s ({level}{})", t.elapsed().as_secs_f64(), if reference { ", REFERENCE engine" } else { "" });
             let dir = std::path::Path::new(&checkpoint_dir);
@@ -844,6 +842,7 @@ fn main() -> Result<()> {
                 to,
                 MinusOne::from_env(),
                 None,
+                level,
                 || Ok(engine),
                 || Ok(vec![Block::canonical(RefEngine::new()?.initial()?)?]),
             )?;
@@ -1038,18 +1037,17 @@ fn main() -> Result<()> {
             if metrics.is_some() {
                 std::env::set_var("CELESTE_KERNEL_METRICS", "1");
             }
-            set_level(level);
             let dir = std::path::PathBuf::from(&level_dir);
             let frame = match frame {
                 Some(f) => f,
                 None => celeste_rust::storage::edges::done_frame(&dir.join("edges")).ok_or_else(|| anyhow::anyhow!("{level_dir}: no finished frame"))?,
             };
-            let engine = celeste_rust::compiled::FrameEngine::new_for_start_room()?;
+            let engine = celeste_rust::compiled::FrameEngine::new_for_start_room(level)?;
             let t = std::time::Instant::now();
             engine.warm();
             let t_kernels = t.elapsed().as_secs_f64();
             let t = std::time::Instant::now();
-            let st = celeste_rust::frame::ForwardState::at(&dir, frame, true)?;
+            let st = celeste_rust::frame::ForwardState::at(&dir, frame, true, level)?;
             eprintln!(
                 "[bench] kernels built in {t_kernels:.2} s; f{frame} loaded in {:.2} s: {} lanes, visited {} states; {} threads",
                 t.elapsed().as_secs_f64(),
@@ -1166,11 +1164,12 @@ fn main() -> Result<()> {
         }
         Command::BenchStorage { capture, tree, room, level, threads, phase, reps } => {
             std::env::set_var("CELESTE_START_ROOM", &room);
-            set_level(level);
             let threads = threads.unwrap_or_else(celeste_rust::frame::threads);
+            celeste_rust::frame::check_tree_level(std::path::Path::new(&tree), level)?;
             celeste_rust::storage::bench::bench_storage(&celeste_rust::storage::bench::BenchArgs {
                 capture: std::path::Path::new(&capture),
                 tree: std::path::Path::new(&tree),
+                level,
                 threads,
                 phase: &phase,
                 reps,
@@ -1264,8 +1263,8 @@ fn main() -> Result<()> {
             if let Some(n) = threads {
                 std::env::set_var("CELESTE_THREADS", n.to_string());
             }
-            set_level(level);
             let dir = std::path::Path::new(&level_dir);
+            celeste_rust::frame::check_tree_level(dir, level)?;
             let edges_dir = dir.join("edges");
             let ids = celeste_rust::compiled::ids();
             let graph = celeste_rust::storage::edges::EdgeStore::open(&edges_dir, to)?;
@@ -1546,6 +1545,7 @@ fn main() -> Result<()> {
                 "step {frame} is mid split frame at a near level: the graph side keeps a floor's computed `collideable` there, the block side does not"
             );
             let dir = std::path::Path::new(&level_dir);
+            celeste_rust::frame::check_tree_level(dir, level)?;
             let ids = celeste_rust::compiled::ids();
             // Every lane of `rt2` against its block-side widening, exactly:
             // the lanes it moved (the first few printed, `shown` so far).
@@ -1579,8 +1579,7 @@ fn main() -> Result<()> {
                 }
             }
             if emitted > 0 {
-                set_level(level);
-                let kernels = celeste_rust::compiled::FrameEngine::new_for_start_room()?;
+                let kernels = celeste_rust::compiled::FrameEngine::new_for_start_room(level)?;
                 kernels.warm();
                 let all: Vec<(usize, u32)> = files.iter().enumerate().flat_map(|(fi, (_, f))| (0..f.width()).map(move |r| (fi, r))).collect();
                 let n = emitted.min(all.len());
@@ -1604,8 +1603,8 @@ fn main() -> Result<()> {
                 std::env::set_var("CELESTE_THREADS", n.to_string());
             }
             let dir = std::path::Path::new(&level_dir);
-            set_level(level);
-            let kernels = celeste_rust::compiled::FrameEngine::new_for_start_room()?;
+            celeste_rust::frame::check_tree_level(dir, level)?;
+            let kernels = celeste_rust::compiled::FrameEngine::new_for_start_room(level)?;
             kernels.warm();
             let only = cell.map(cell_at).transpose()?;
             // Every candidate row (seq, row), then `samples` evenly spaced.
@@ -1666,7 +1665,7 @@ fn main() -> Result<()> {
                 let hs: Vec<_> = (0..workers)
                     .map(|_| {
                         sc.spawn(|| -> Result<Vec<(usize, Row)>> {
-                            let mut reference = RefEngine::new()?;
+                            let mut reference = RefEngine::new()?.at_level(level);
                             if let Some(cap) = path_cap {
                                 reference.set_path_cap(cap);
                             }
@@ -1703,8 +1702,8 @@ fn main() -> Result<()> {
             let erase = prefixes(&erase);
             let parts: Vec<u32> = row.split(':').map(|s| s.trim().parse()).collect::<Result<_, _>>()?;
             let [layer, seq, r] = parts[..] else { anyhow::bail!("--row L:S:R") };
-            set_level(level);
-            let engine = celeste_rust::compiled::FrameEngine::new_for_start_room()?;
+            celeste_rust::frame::check_tree_level(dir, level)?;
+            let engine = celeste_rust::compiled::FrameEngine::new_for_start_room(level)?;
             let (_, f) = frame_files(dir, layer)?.into_iter().find(|(s, _)| *s == seq).ok_or_else(|| anyhow::anyhow!("no file l{layer} s{seq}"))?;
             anyhow::ensure!(r < f.width(), "row {r} past the file's {}", f.width());
             let rt2 = f.load_rows(&[r..r + 1])?.ok_or_else(|| anyhow::anyhow!("no row"))?;
@@ -2335,7 +2334,7 @@ fn main() -> Result<()> {
         Command::Follow { level_dir, level, inputs, show } => {
             let dir = std::path::Path::new(&level_dir);
             let lvl = level;
-            set_level(lvl);
+            celeste_rust::frame::check_tree_level(dir, lvl)?;
             let bytes = celeste_rust::concrete::read_inputs(&inputs)?;
             // (key, cell) -> (layer, seq, row): where the tree first has it.
             let mut at: rustc_hash::FxHashMap<(u64, u64, u32), (u32, u32, u32)> = Default::default();
@@ -2386,7 +2385,7 @@ fn main() -> Result<()> {
                     for s in &states {
                         println!("    concrete parent: {}", brief(&project_all(s)[0]));
                     }
-                    let kernels = celeste_rust::compiled::FrameEngine::new_for_start_room()?;
+                    let kernels = celeste_rust::compiled::FrameEngine::new_for_start_room(lvl)?;
                     let (out, _) = rerun(&kernels, rt2, layer)?;
                     let mut kset: std::collections::BTreeSet<Proj> = Default::default();
                     let mut kwins = 0;

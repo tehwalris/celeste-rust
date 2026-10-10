@@ -65,13 +65,17 @@ pub fn room_context() -> Result<(Arc<CartData>, Arc<CollisionCache>)> {
     Ok(CTX.get().expect("just set").clone())
 }
 
-pub struct FrameEngine;
+/// The kernels of one LEVEL (`asm_kernel::registry`).
+pub struct FrameEngine {
+    level: crate::abstraction::Level,
+}
 
 impl FrameEngine {
-    /// The engine for the configured start room (its cart loads here).
-    pub fn new_for_start_room() -> Result<Self> {
+    /// The engine for the configured start room (its cart loads here), its
+    /// frames at `level`.
+    pub fn new_for_start_room(level: crate::abstraction::Level) -> Result<Self> {
         room_context()?;
-        Ok(FrameEngine)
+        Ok(FrameEngine { level })
     }
 
     /// One frame of one BUCKET (one shape's block of the frontier), emitted
@@ -85,7 +89,7 @@ impl FrameEngine {
         lanes: &[usize],
         sink: &mut crate::storage::unit::UnitSink,
     ) {
-        if !dispatch::run_chunk_kernel(bucket, cell_in, lanes, sink) {
+        if !dispatch::run_chunk_kernel(self.level, bucket, cell_in, lanes, sink) {
             // A COVERAGE GAP, not a degraded mode: there is no fallback.
             // The search resumes from the last completed frame's checkpoint.
             panic!(
@@ -115,6 +119,10 @@ impl crate::frame::FrameStep for FrameEngine {
 
     fn warm(&self) {
         // A level without kernels fails loudly in `run_bucket`, not here.
-        let _ = asm_kernel::registry();
+        let _ = asm_kernel::registry(self.level);
+    }
+
+    fn level(&self) -> crate::abstraction::Level {
+        self.level
     }
 }

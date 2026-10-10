@@ -419,6 +419,8 @@ pub struct UnitSink<'a> {
     geo: Geometry,
     filters: Filters<'a>,
     frame: u32,
+    /// The level the wave runs at (a reference row's key view).
+    level: crate::abstraction::Level,
     pub worker: u32,
     note_drops: bool,
     drops: Option<&'a super::wave::DropNotes>,
@@ -499,6 +501,7 @@ impl<'a> UnitSink<'a> {
         prov: &'a Provisional,
         filters: Filters<'a>,
         frame: u32,
+        level: crate::abstraction::Level,
         worker: u32,
         record_edges: bool,
         edges_on: bool,
@@ -512,6 +515,7 @@ impl<'a> UnitSink<'a> {
             geo: visited.geo,
             filters,
             frame,
+            level,
             worker,
             note_drops: filters.notes_drops() && record_edges && drops.is_some(),
             drops,
@@ -552,7 +556,7 @@ impl<'a> UnitSink<'a> {
             claimed_elsewhere: 0,
             pending: Vec::new(),
             end_ticks: 0,
-            capture: super::bench::CaptureWriter::open(frame, worker),
+            capture: super::bench::CaptureWriter::open(frame, worker, level),
             noted: Default::default(),
             blocks: None,
         }
@@ -881,7 +885,7 @@ impl<'a> UnitSink<'a> {
     /// widened, as its kernels key it, in the tree's dictionaries -
     /// provisional where a code is new.
     pub fn row_key(&mut self, row: &Rt2) -> Key {
-        let level = crate::abstraction::Level { held: crate::abstraction::current_level().held, ..crate::abstraction::Level::EXACT };
+        let level = crate::abstraction::Level { held: self.level.held, ..crate::abstraction::Level::EXACT };
         let mut w = row.clone_block();
         crate::frame::widen_rt2_to(&mut w, level);
         w.canonical();

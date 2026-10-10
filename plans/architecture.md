@@ -520,9 +520,13 @@ else of an old frame, and the rows' values are most of a tree's frames
 (room (2,3) gemskip h137, level 0: 3.03 -> 0.78 GB; the tree 7.0 -> 4.8
 GB). The diagnostics that load old rows refuse a trimmed tree, so it is off
 by default.
-Nothing on disk records the level: reusing a tree under another `--level` is
-on you. One kernel set is resident, the process-global level's; a call at
-another level drops it and builds that level's. Fused graphs are dropped
+The level is a value (2026-10-10): the engines carry it (`FrameEngine`,
+`RefEngine::at_level`, `FrameStep::level`), and a tree records it
+(`<level>/level.txt`, written when a forward starts it; `frame::
+check_tree_level` refuses another `--level` on resume, reuse, a raise, the
+arc phase and the diagnostics; a tree from before the record is taken as it
+is). One kernel set is resident; a call at another level drops it and builds
+that level's. Fused graphs are dropped
 after assembly unless `CELESTE_KERNEL_EXPLAIN`.
 
 **The concrete search runs at the LAST level only** (2026-10-08). A coarser

@@ -1193,13 +1193,11 @@ pub fn concrete_search(
     use anyhow::Result;
     use crate::trace::refengine::RefEngine;
     use celeste_engine::runtime2::Rt2;
-    // Build the engines BEFORE setting the level: `_init` runs under the
-    // global level. Their frames run exact whatever is set.
+    // Their frames run exact (`RefEngine::frame`); `level` is the lookups'.
     let workers = crate::frame::threads().max(1);
     let (engines, seeded) = concrete_engines(workers)?;
     let engines: Vec<std::sync::Mutex<RefEngine>> = engines.into_iter().map(std::sync::Mutex::new).collect();
     let initial = engines[0].lock().expect("an engine").initial()?;
-    crate::abstraction::set_level(level);
     // W is indexed by search STEP; the concrete search steps whole frames
     // (`RefEngine::frame`), and frame k ends at step `spf * k`.
     let spf = crate::frame::steps_per_frame();
@@ -1493,6 +1491,7 @@ pub fn solve(
     known: Option<&super::known::Route>,
 ) -> anyhow::Result<Solved> {
     use crate::frame::{mark_row, save_marks, MarkRow, Visited};
+    crate::frame::check_tree_level(dir, level)?;
     crate::metrics::mem_phase("arc: start");
     let Loaded { graph, start, marks, wins, .. } = load(dir, horizon)?;
     let g = &graph;

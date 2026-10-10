@@ -11,6 +11,7 @@ pub(crate) fn miss_report() -> String {
 }
 
 pub(crate) fn run_chunk_kernel(
+    level: crate::abstraction::Level,
     chunk: &runtime2::Rt2,
     cell_in: &[u32],
     lanes: &[usize],
@@ -18,7 +19,7 @@ pub(crate) fn run_chunk_kernel(
 ) -> bool {
     // A miss is counted here and is fatal in the caller.
     let n = lanes.len() as u64;
-    let hit = super::asm_kernel::run_chunk(chunk, cell_in, lanes, sink);
+    let hit = super::asm_kernel::run_chunk(level, chunk, cell_in, lanes, sink);
     if hit {
         HITS.with(|c| c.set(c.get() + n));
         return true;

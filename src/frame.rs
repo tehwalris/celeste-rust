@@ -630,6 +630,10 @@ pub trait FrameStep: Sync {
     /// all waited on the build's lock (room (6,2) 100% f57: 61 of 152
     /// worker-s, so a one-frame bench timed the build).
     fn warm(&self) {}
+
+    /// The level its frames widen to (its rows' key view, the platform
+    /// worlds' range).
+    fn level(&self) -> crate::abstraction::Level;
 }
 
 /// Where a wave's new states go.
@@ -867,8 +871,9 @@ pub struct ForwardResult {
 
 impl ForwardState {
     /// Frame 0: `initial` into an empty visited set (its ids) and
-    /// checkpointed; the tree is filtered by `minus_one` (recorded).
-    pub fn start(mut initial: Vec<Block>, dir: &std::path::Path, record: bool, minus_one: Option<MinusOne>) -> Result<Self> {
+    /// checkpointed; the tree is filtered by `minus_one` and widened at
+    /// `level` (both recorded).
+    pub fn start(mut initial: Vec<Block>, dir: &std::path::Path, record: bool, minus_one: Option<MinusOne>, level: crate::abstraction::Level) -> Result<Self> {
         // A fresh tree keeps nothing a killed run left (stale edge files).
         for sub in ["frames", "edges", "dropped"] {
             let p = dir.join(sub);
@@ -878,8 +883,9 @@ impl ForwardState {
         }
         let filter = TreeFilter::of(minus_one);
         filter.write(dir)?;
+        std::fs::write(dir.join("level.txt"), format!("{level}\n"))?;
         let mut visited = crate::storage::visited::VisitedSet::new(*crate::storage::geometry());
-        let meta = crate::storage::wave::seed(&mut visited, &mut initial)?;
+        let meta = crate::storage::wave::seed(&mut visited, &mut initial, level)?;
         checkpoint_frontier(dir, 0, &mut initial, true)?;
         crate::storage::meta::save(dir, 0, None, &meta)?;
         crate::storage::edges::set_done_frame(&dir.join("edges"), 0)?;
@@ -900,8 +906,9 @@ impl ForwardState {
     }
 
     /// The forward as its checkpoint tree left it (`None`: no tree); extending
-    /// it matches extending the original.
-    pub fn resume(dir: &std::path::Path, record: bool) -> Result<Option<Self>> {
+    /// it matches extending the original. Refused at another `level` than
+    /// the tree's.
+    pub fn resume(dir: &std::path::Path, record: bool, level: crate::abstraction::Level) -> Result<Option<Self>> {
         anyhow::ensure!(
             !raise_marker(dir).exists(),
             "{}: a raise was interrupted ({}); its frames are half raised - delete the tree",
@@ -926,7 +933,7 @@ impl ForwardState {
             last = done;
         }
         crate::storage::edges::discard_after(&edges_dir, last)?;
-        let st = Self::at(dir, last, record)?;
+        let st = Self::at(dir, last, record, level)?;
         eprintln!(
             "[resume] {}: f{last} ({} lanes), visited {} states in {} entries, first win {:?}, level -1 {:?}, {:.1} s",
             dir.display(),
@@ -944,7 +951,9 @@ impl ForwardState {
     /// READ-ONLY: frames after `last` are ignored, not discarded (`resume`
     /// discards them first). What `extend` runs its next wave from, so
     /// `bench_wave` from here is frame `last + 1` of the real forward.
-    pub fn at(dir: &std::path::Path, last: u32, record: bool) -> Result<Self> {
+    /// Refused at another `level` than the tree's (`check_tree_level`).
+    pub fn at(dir: &std::path::Path, last: u32, record: bool, level: crate::abstraction::Level) -> Result<Self> {
+        check_tree_level(dir, level)?;
         let edges_dir = dir.join("edges");
         let filter = TreeFilter::read(dir)?;
         let (visited, win_frame) = restore_visited(dir, last)?;
@@ -1288,15 +1297,17 @@ impl ForwardState {
 /// its filter, or started under `want`. A tree is never filtered lower than
 /// it was built: frames of one tree are filtered alike. `marks`: the coarser
 /// level's filter (the caller rebuilds such a tree for another horizon).
-/// `engine` is built only when frames are computed.
+/// `engine` is built only when frames are computed, at `level`, the tree's.
 pub fn grow_tree(
     dir: &std::path::Path,
     to: u32,
     want: Option<MinusOne>,
     marks: Option<&MarkFilter>,
+    level: crate::abstraction::Level,
     engine: impl FnOnce() -> Result<Box<dyn FrameStep>>,
     initial: impl FnOnce() -> Result<Vec<Block>>,
 ) -> Result<ForwardResult> {
+    check_tree_level(dir, level)?;
     if let Some(w) = want {
         anyhow::ensure!(to <= w.h, "CELESTE_LEVEL_MINUS_ONE at step {} is below the horizon, step {to}", w.h);
     }
@@ -1352,9 +1363,10 @@ pub fn grow_tree(
         return Ok(ForwardResult { win_frame: first_win, frames: to, pos_graph });
     }
     let engine = engine()?;
-    let mut st = match ForwardState::resume(dir, true)? {
+    anyhow::ensure!(engine.level() == level, "the forward's engine is at {}, the tree at {level}", engine.level());
+    let mut st = match ForwardState::resume(dir, true, level)? {
         Some(s) => s,
-        None => ForwardState::start(initial()?, dir, true, want)?,
+        None => ForwardState::start(initial()?, dir, true, want, level)?,
     };
     if let Some(target) = raise_to {
         st.raise(engine.as_ref(), dir, target)?;
@@ -1393,7 +1405,7 @@ pub fn forward_run(
     max_frames: u32,
     record: bool,
 ) -> Result<ForwardResult> {
-    let mut st = ForwardState::start(initial, dir, record, None)?;
+    let mut st = ForwardState::start(initial, dir, record, None, engine.level())?;
     st.extend(engine, dir, max_frames, None)?;
     Ok(ForwardResult { win_frame: st.win_frame, frames: st.frames, pos_graph: st.pos_graph() })
 }
@@ -1747,6 +1759,25 @@ impl Visited {
     }
 }
 
+/// THE LEVEL a tree's rows were widened at, `<dir>/level.txt`: written when
+/// a forward starts the tree, checked wherever it is resumed, raised, reused
+/// or read at a level (`ForwardState::at`, `grow_tree`, `arc_dp::solve`, the
+/// diagnostics): another level's rows key differently, so its kernels, its
+/// arc phase or the concrete search's lookups would silently misread it. A
+/// tree from before the record (the pinned fixtures) has none and is taken
+/// as it is.
+pub fn check_tree_level(dir: &std::path::Path, level: crate::abstraction::Level) -> Result<()> {
+    match std::fs::read_to_string(dir.join("level.txt")) {
+        Ok(s) => {
+            let built = crate::abstraction::Level::parse(s.trim()).map_err(|e| anyhow::anyhow!("{}: {e}", dir.join("level.txt").display()))?;
+            anyhow::ensure!(built == level, "{}: a tree of level {built}, used at {level} (run it at {built}, or delete it)", dir.display());
+            Ok(())
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(anyhow::Error::new(e).context(dir.join("level.txt").display().to_string())),
+    }
+}
+
 /// The first win of a tree complete through `horizon`; `None` if it is not.
 pub fn tree_first_win_through(dir: &std::path::Path, horizon: u32) -> Result<Option<Option<u32>>> {
     let done = crate::storage::edges::done_frame(&dir.join("edges"));
@@ -1810,7 +1841,7 @@ mod tests {
             std::fs::create_dir_all(f.parent().unwrap()).expect("mkdir");
             std::fs::write(f, b"stale").expect("write");
         }
-        ForwardState::start(init, dir, true, None).expect("start");
+        ForwardState::start(init, dir, true, None, crate::abstraction::Level::EXACT).expect("start");
         for f in &stale {
             assert!(!f.exists(), "{} survived a fresh start", f.display());
         }
@@ -1827,7 +1858,7 @@ mod tests {
         let init = vec![Block::canonical(engine.lock().unwrap().initial().expect("initial state")).expect("block")];
         let dir = std::path::Path::new("/var/tmp/celeste-frame-trim-test");
         let _ = std::fs::remove_dir_all(dir);
-        let mut st = ForwardState::start(init, dir, true, None).expect("start");
+        let mut st = ForwardState::start(init, dir, true, None, crate::abstraction::Level::EXACT).expect("start");
         st.extend(&engine, dir, 2, None).expect("two frames");
         type Seen = (u32, u64, Vec<(u32, (u64, u64))>, Vec<u64>, Vec<(u64, (u64, u64), u32)>);
         let seen = |f: &crate::search::checkpoint::FrameFile| -> Seen {
@@ -1915,7 +1946,7 @@ mod tests {
             let e = RefEngine::new().expect("engine");
             let init = vec![Block::canonical(e.initial().expect("init")).expect("block")];
             let e = Mutex::new(e);
-            let mut st = ForwardState::start(init, dir, true, None).expect("start");
+            let mut st = ForwardState::start(init, dir, true, None, crate::abstraction::Level::EXACT).expect("start");
             assert_eq!(pos_graph_frame(dir), Some(0), "start must leave a graph beside f0");
             for to in 1..=4 {
                 st.extend(&e, dir, to, None).expect("extend");
@@ -1939,7 +1970,7 @@ mod tests {
         }
         {
             let e = Mutex::new(RefEngine::new().expect("engine"));
-            let mut st = ForwardState::resume(dir, true).expect("resume").expect("a tree to resume");
+            let mut st = ForwardState::resume(dir, true, crate::abstraction::Level::EXACT).expect("resume").expect("a tree to resume");
             assert_eq!(st.frames, 4);
             let visited_before = st.visited_len();
             st.extend(&e, dir, 6, None).expect("extend resumed");
@@ -1959,10 +1990,9 @@ mod tests {
     /// successors. Guards `Graph::tile_flag_over` reading every row a span covers.
     #[test]
     fn room_02_spawn_frame_kernels_make_the_reference_successors() {
-        use crate::abstraction::{set_level, Level};
+        use crate::abstraction::Level;
         std::env::set_var("CELESTE_START_ROOM", "0,2");
-        set_level(Level::parse("r0sx").expect("level"));
-        let kernels = crate::compiled::FrameEngine::new_for_start_room().expect("kernels");
+        let kernels = crate::compiled::FrameEngine::new_for_start_room(Level::EXACT).expect("kernels");
         let reference = Mutex::new(RefEngine::new().expect("ref engine"));
         // 25 frames of no input: the spawn's last frame is the 26th.
         let mut concrete = RefEngine::new().expect("ref engine");
@@ -1990,12 +2020,11 @@ mod tests {
     /// was computed silently wrong.
     #[test]
     fn a_lane_outside_its_kernels_bounds_declines() {
-        use crate::abstraction::{set_level, Level};
+        use crate::abstraction::Level;
         std::env::set_var("CELESTE_START_ROOM", "1,0");
         let level = Level::parse("r0sxh").expect("level");
-        set_level(level);
         let grid = crate::trace::kernel::region_grid().expect("the default region grid");
-        let _kernels = crate::compiled::FrameEngine::new_for_start_room().expect("kernels");
+        let _kernels = crate::compiled::FrameEngine::new_for_start_room(level).expect("kernels");
         // The first frame with a player, a few frames in: standing, at rest.
         let mut reference = RefEngine::new().expect("ref engine");
         let mut row = reference.initial().expect("initial state");
@@ -2030,9 +2059,9 @@ mod tests {
             let visited = crate::storage::visited::VisitedSet::new(*crate::storage::geometry());
             let claims = crate::storage::unit::Claims::default();
             let prov = celeste_engine::exact::Provisional::default();
-            let mut sink = crate::storage::unit::UnitSink::new(&visited, &claims, &prov, Filters::default(), 1, 0, false, false, None, None);
+            let mut sink = crate::storage::unit::UnitSink::new(&visited, &claims, &prov, Filters::default(), 1, level, 0, false, false, None, None);
             sink.begin(0, 0, 0, &[0], None, None, false);
-            crate::compiled::dispatch::run_chunk_kernel(r, &cells, &[0], &mut sink)
+            crate::compiled::dispatch::run_chunk_kernel(level, r, &cells, &[0], &mut sink)
         };
         let px = |n: i16| P8::from_i16(n);
         let half = P8::from_parts(0, 0x8000);
@@ -2052,11 +2081,10 @@ mod tests {
     /// such a lane was computed silently wrong.
     #[test]
     fn a_lane_outside_its_platform_bounds_declines() {
-        use crate::abstraction::{set_level, Level};
+        use crate::abstraction::Level;
         std::env::set_var("CELESTE_START_ROOM", "2,1");
         let level = Level::parse("r0sxhnp").expect("level");
-        set_level(level);
-        let _kernels = crate::compiled::FrameEngine::new_for_start_room().expect("kernels");
+        let _kernels = crate::compiled::FrameEngine::new_for_start_room(level).expect("kernels");
         let mut reference = RefEngine::new().expect("ref engine");
         let mut row = reference.initial().expect("initial state");
         let ids = crate::compiled::ids();
@@ -2093,9 +2121,9 @@ mod tests {
             let visited = crate::storage::visited::VisitedSet::new(*crate::storage::geometry());
             let claims = crate::storage::unit::Claims::default();
             let prov = celeste_engine::exact::Provisional::default();
-            let mut sink = crate::storage::unit::UnitSink::new(&visited, &claims, &prov, Filters::default(), 1, 0, false, false, None, None);
+            let mut sink = crate::storage::unit::UnitSink::new(&visited, &claims, &prov, Filters::default(), 1, level, 0, false, false, None, None);
             sink.begin(0, 0, 0, &[0], None, None, false);
-            crate::compiled::dispatch::run_chunk_kernel(r, &cells, &[0], &mut sink)
+            crate::compiled::dispatch::run_chunk_kernel(level, r, &cells, &[0], &mut sink)
         };
         let px = |n: i16| P8::from_i16(n);
         let (path_lo, path_hi) = (px(celeste_engine::widening::PLATFORM_PATH.0), px(celeste_engine::widening::PLATFORM_PATH.1));
@@ -2113,11 +2141,10 @@ mod tests {
     /// state, KEY included. Guards a number and its point interval keying alike.
     #[test]
     fn room_13_exit_frame_keys_the_concrete_exit() {
-        use crate::abstraction::{set_level, Level};
+        use crate::abstraction::Level;
         std::env::set_var("CELESTE_START_ROOM", "1,3");
         let level = Level::parse("r0sxh").expect("level");
-        set_level(level);
-        let kernels = crate::compiled::FrameEngine::new_for_start_room().expect("kernels");
+        let kernels = crate::compiled::FrameEngine::new_for_start_room(level).expect("kernels");
         let text = std::fs::read_to_string("tas/room_1_3_reference_frame_127.txt").expect("the reference solution");
         let inputs: Vec<u8> = text
             .lines()
@@ -2177,14 +2204,14 @@ mod tests {
     /// removal and the mid-frame cut not widening floors the player reads.
     #[test]
     fn split_frame_reaches_the_unsplit_frontier_at_a_near_level() {
-        use crate::abstraction::{set_level, Level};
+        use crate::abstraction::Level;
         std::env::set_var("CELESTE_START_ROOM", "2,1");
         std::env::set_var("CELESTE_SPLIT_FRAME", "1");
-        set_level(Level::parse("r0sxhn").expect("level"));
+        let level = Level::parse("r0sxhn").expect("level");
         let dir = std::path::Path::new("/var/tmp/celeste-frame-split-near-test");
         let _ = std::fs::remove_dir_all(dir);
         std::fs::create_dir_all(dir).expect("checkpoint dir");
-        let engine = crate::compiled::FrameEngine::new_for_start_room().expect("engine");
+        let engine = crate::compiled::FrameEngine::new_for_start_room(level).expect("engine");
         let init = vec![Block::canonical(RefEngine::new().expect("ref").initial().expect("init")).expect("block")];
         // Unsplit, frame by frame: 1 state a frame through the spawn, then these.
         let unsplit: Vec<(u32, usize)> = (0..24).map(|f| (f, 1)).chain([(24, 27), (25, 308), (26, 1576), (27, 5559), (28, 15348)]).collect();

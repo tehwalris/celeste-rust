@@ -12,7 +12,7 @@ use celeste_engine::runtime2::Rt2;
 use full_moon::ast;
 
 use crate::frame::Block;
-use crate::abstraction::{current_level, Level};
+use crate::abstraction::Level;
 use crate::trace::interp::Interp;
 use crate::trace::refbridge::{fn_info_of, from_block, set_buttons, to_block, FnInfo};
 use crate::trace::refdomain::RefDomain;
@@ -35,6 +35,9 @@ pub struct RefEngine {
     fn_info: FnInfo,
     /// The most fork paths one frame may take (`refdriver::TooManyPaths`).
     path_cap: usize,
+    /// The level `run_lane` (the engine as a `FrameStep`) forks a row's
+    /// unknowns at: `Level::EXACT` unless `at_level`.
+    level: Level,
 }
 
 // The raw pointers inside (`Interp`'s AST references) point into the
@@ -62,7 +65,13 @@ impl RefEngine {
         crate::trace::cart::inject_tile_flag_at(&mut st0);
         let base = run_one(&mut it, init, st0)?;
         let fn_info = fn_info_of(&base)?;
-        Ok(RefEngine { it, body, body_concrete, base, fn_info, path_cap: 1_000_000 })
+        Ok(RefEngine { it, body, body_concrete, base, fn_info, path_cap: 1_000_000, level: Level::EXACT })
+    }
+
+    /// The engine with `run_lane` at `level`.
+    pub fn at_level(mut self, level: Level) -> Self {
+        self.level = level;
+        self
     }
 
     /// At most `cap` fork paths a frame, else `refdriver::TooManyPaths`
@@ -186,11 +195,12 @@ impl RefEngine {
         Ok(out.remove(0))
     }
 
-    /// One frame of lane `lane` at the current level: every fork leaf (the
-    /// buttons, and each unknown boolean of the row, are forked per path).
+    /// One frame of lane `lane` at the engine's level (`at_level`): every
+    /// fork leaf (the buttons, and each unknown boolean of the row, are
+    /// forked per path).
     pub fn run_lane(&mut self, block: &Rt2, lane: usize) -> Result<Vec<Block>> {
         let (st, unknown) = from_block(block, lane, &self.fn_info, &self.base)?;
-        let leaves = run_frame_all(&mut self.it, self.body, &st, &unknown, current_level(), self.path_cap)?;
+        let leaves = run_frame_all(&mut self.it, self.body, &st, &unknown, self.level, self.path_cap)?;
         leaves.iter().map(|l| Block::canonical(to_block(l)?)).collect()
     }
 }
@@ -333,6 +343,10 @@ impl crate::frame::FrameStep for std::sync::Mutex<RefEngine> {
             }
         }
         Ok(())
+    }
+
+    fn level(&self) -> Level {
+        self.lock().expect("reference engine lock").level
     }
 }
 

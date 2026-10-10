@@ -1874,12 +1874,11 @@ pub(crate) fn take_call_stats() -> [u64; 7] {
     std::array::from_fn(|i| CALL_STATS[i].swap(0, std::sync::atomic::Ordering::Relaxed))
 }
 
-/// The process-global level's kernel set, built on first use. ONE set is
-/// resident (GBs): another level replaces it; callers hold theirs by `Arc`.
-pub(crate) fn registry() -> Option<std::sync::Arc<Registry>> {
+/// `level`'s kernel set, built on first use. ONE set is resident (GBs):
+/// another level replaces it; callers hold theirs by `Arc`.
+pub(crate) fn registry(level: crate::abstraction::Level) -> Option<std::sync::Arc<Registry>> {
     type Resident = Option<(crate::abstraction::Level, Option<std::sync::Arc<Registry>>)>;
     static SET: std::sync::Mutex<Resident> = std::sync::Mutex::new(None);
-    let level = crate::abstraction::current_level();
     let mut set = SET.lock().unwrap();
     match &*set {
         Some((l, r)) if *l == level => r.clone(),
@@ -1952,14 +1951,16 @@ fn build_registry_for_level(level: crate::abstraction::Level) -> Option<Registry
     }
 }
 
-/// Run one chunk through the kernels; `false` (miss or decline) is fatal.
+/// Run one chunk through `level`'s kernels; `false` (miss or decline) is
+/// fatal.
 pub(crate) fn run_chunk(
+    level: crate::abstraction::Level,
     chunk: &Rt2,
     cell_in: &[u32],
     lanes: &[usize],
     sink: &mut crate::storage::unit::UnitSink,
 ) -> bool {
-    match registry() {
+    match registry(level) {
         Some(reg) => reg.run_chunk(chunk, cell_in, lanes, sink),
         None => false,
     }
