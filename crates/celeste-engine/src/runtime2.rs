@@ -660,12 +660,13 @@ impl Rt2 {
 
     /// The boundary's widenings: `widen_to` with every level flag off.
     fn boundary_widen(&mut self, ids: &BoundaryIds) {
-        self.widen_to(ids, false, false, false, false);
+        self.widen_to(ids, crate::widening::Level::EXACT);
     }
 
     /// A level's widenings, as its kernels bake them (`trace::widen`), so a
     /// finer row can be looked up as the level's node. Each asserts it only grows.
-    pub fn widen_to(&mut self, ids: &BoundaryIds, held: bool, fruit: bool, floors_near: bool, platforms: bool) {
+    pub fn widen_to(&mut self, ids: &BoundaryIds, level: crate::widening::Level) {
+        let crate::widening::Level { held, fruit, floors_near, platforms } = level;
         let (rem_cells, det_cells) = self.mark_walk(ids);
 
         // 1. The player's rem: the full [-0.5, 0.5) interval.

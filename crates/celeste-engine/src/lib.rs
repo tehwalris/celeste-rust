@@ -14,6 +14,7 @@ pub mod exact;
 pub mod kernel;
 pub mod runtime2;
 pub mod slots;
+pub mod widening;
 
 pub use runtime2::{Cell2, Col, Rt2, AV, NONE};
 

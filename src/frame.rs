@@ -596,7 +596,7 @@ pub fn widened_keys(
 
 /// `rt2` projected IN PLACE onto `level`, as its kernels would store it.
 pub fn widen_rt2_to(rt2: &mut Rt2, level: crate::abstraction::Level) {
-    rt2.widen_to(crate::compiled::ids(), level.held, level.fruit, level.floors_near, level.platforms);
+    rt2.widen_to(crate::compiled::ids(), level);
 }
 
 /// `(shape, keys, cells)` of the widened rows (the widened block's shape),
