@@ -374,7 +374,8 @@ def run(job, outdir, binary):
     if opt < ref and not job.get("witness"):
         try:
             paths = os.path.join(jd, "paths")
-            env = dict(os.environ, TAS_CATEGORY=cat, REPLAY_ARGS=" ".join(replay_args(cat)))
+            # The paths start the room as the search and the replays do (its loading frame).
+            env = dict(os.environ, TAS_CATEGORY=cat, REPLAY_ARGS=" ".join(replay_args(cat) + jank_args(jank)))
             subprocess.run([sys.executable, f"{M}/tools/align_tas.py", room, name, str(prologue), os.path.join(jd, "witness.txt"), seeds or "-", paths], env=env, cwd=M, capture_output=True, timeout=1800, check=True)
             # The UI's download must be the upload file: its seeds as UCT wrote them.
             if res.get("upload"):

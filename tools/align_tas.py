@@ -7,7 +7,8 @@
 # starts as the cart reports them, the tasdatabase name / prologue / seeds, then `f x y` per frame from 0 to the exit).
 import json,os,re,subprocess,sys
 D='/home/philippe/src/github.com/CelesteClassic/tasdatabase'
-M='/home/philippe/src/github.com/tehwalris/celeste-rust'
+# The checkout this file is in: its replay.py (a branch's --jank, say), not the main tree's.
+M=os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CAT=os.environ.get('TAS_CATEGORY','nodiag')
 room,name,off,ours_file,seeds=sys.argv[1:6]
 outdir=sys.argv[6] if len(sys.argv)>6 else None
