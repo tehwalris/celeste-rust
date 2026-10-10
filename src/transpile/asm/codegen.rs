@@ -8,7 +8,7 @@ use std::fmt::Write;
 
 use anyhow::{bail, Result};
 
-use crate::transpile::graph::{Graph, NodeId, Op};
+use crate::transpile::graph::{self, Graph, NodeId, Op};
 
 // Registers: zmm26..=31 are reserved scratches (zmm27 unused), 26 homes.
 const ZERO: u8 = 31; // constant 0, for Neg
@@ -574,6 +574,23 @@ impl<'a> Lower<'a> {
         let min = self.num_reg(NumVal::ConstI32(i32::MIN));
         self.cmp(4, a[0], Src::Reg(min)) // lo != MIN  (NE)
     }
+    /// `Op::NoWrap` of an interval `*` / `/` by a positive literal: the
+    /// operation is monotone, so it fits iff `lo >= fits.0` and `hi <=
+    /// fits.1` (`graph::Scaled::fits`, `kernel::zi_scale_wraps` /
+    /// `zi_div_wraps`). A side the literal cannot overflow is no compare.
+    fn zi_scaled_no_wrap(&mut self, a: [Vreg; 2], fits: (i32, i32)) -> MaskVal {
+        let lo = if fits.0 == i32::MIN {
+            MaskVal::Const(true)
+        } else {
+            MaskVal::Reg(self.cmp(5, a[0], Src::BI32(fits.0))) // lo >= min  (NLT)
+        };
+        let hi = if fits.1 == i32::MAX {
+            MaskVal::Const(true)
+        } else {
+            MaskVal::Reg(self.cmp(2, a[1], Src::BI32(fits.1))) // hi <= max  (LE)
+        };
+        self.m_and(lo, hi)
+    }
     /// `zi_abs`: the three-case blend (non-negative / non-positive / straddle).
     fn zi_abs(&mut self, a: [Vreg; 2]) -> [Vreg; 2] {
         let zero = self.num_reg(NumVal::ConstI32(0));
@@ -816,7 +833,8 @@ impl<'a> Lower<'a> {
             }
             Op::Mul => {
                 // Interval * positive constant: scale each endpoint. An
-                // overflow wraps UNCHECKED (no `NoWrap`; architecture.md, open).
+                // overflow wraps; it is the op's own error (`Op::NoWrap`,
+                // `zi_scaled_no_wrap`), so the lane declines where it is read.
                 if self.dom(a[0]) == 2 || self.dom(a[1]) == 2 {
                     let (ivn, scn) = if self.dom(a[0]) == 2 { (a[0], a[1]) } else { (a[1], a[0]) };
                     if self.dom(scn) == 2 {
@@ -844,7 +862,10 @@ impl<'a> Lower<'a> {
                 }
             }
             // Interval / positive constant: divide each endpoint (before the
-            // scalar `Op::Div` arm, which reads `as_num`).
+            // scalar `Op::Div` arm, which reads `as_num`). The scalar `/`
+            // saturates where the interval one has no answer: the op's own
+            // error, as `Mul`. A power-of-two divisor (`div_pow2`) is at
+            // least 1, so it never does: its `NoWrap` folds to true.
             Op::Div if self.dom(a[0]) == 2 => {
                 if self.pos_const_scalar(a[1]).is_none() {
                     bail!(
@@ -1119,6 +1140,18 @@ impl<'a> Lower<'a> {
                         let ip = self.as_ival(xn.args[0])?;
                         let pr = self.ival_regs(ip);
                         MaskVal::Reg(self.zi_neg_no_wrap(pr))
+                    }
+                    (Op::Mul | Op::Div, 2) => {
+                        let Some(sc) = graph::scaled(self.g, x) else {
+                            bail!("node {}: NoWrap of an interval {:?} by a non-positive / non-constant scalar is not modelled", id, xn.op);
+                        };
+                        let operand = xn.args[sc.operand];
+                        if self.dom(operand) != 2 {
+                            bail!("node {}: NoWrap of {:?}: the interval is not the operand `scaled` names", id, xn.op);
+                        }
+                        let ip = self.as_ival(operand)?;
+                        let pr = self.ival_regs(ip);
+                        self.zi_scaled_no_wrap(pr, sc.fits())
                     }
                     // Exact, or rewritten into another op (as `Graph::fold`).
                     _ => MaskVal::Const(true),

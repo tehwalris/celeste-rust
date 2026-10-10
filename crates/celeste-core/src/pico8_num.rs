@@ -380,6 +380,43 @@ impl Pico8NumInterval {
         let div = |a: i32| -> i64 { ((a as i64) << 16).wrapping_div(rhs.0 as i64) };
         Self::try_from_i64_endpoints(div(self.low.0), div(self.high.0))
     }
+
+    /// The endpoints `e` that `checked_scale_positive(rhs)` maps inside the
+    /// 16.16 range, as `[lo, hi]`: the scale is monotone, so an interval
+    /// scales without a wrap iff `lo <= low` and `high <= hi`. The kernels'
+    /// check (`Op::NoWrap`) is those two compares. Bisected on the checked
+    /// operation itself, so it agrees with it by construction.
+    pub fn scale_positive_fits(rhs: Pico8Num) -> (Pico8Num, Pico8Num) {
+        Self::fitting(|e| Self::from_number(e).checked_scale_positive(rhs).is_some())
+    }
+
+    /// `scale_positive_fits` for `checked_div_positive`.
+    pub fn div_positive_fits(rhs: Pico8Num) -> (Pico8Num, Pico8Num) {
+        Self::fitting(|e| Self::from_number(e).checked_div_positive(rhs).is_some())
+    }
+
+    /// The `[lo, hi]` where a monotone map of an endpoint fits: `fits(0)`
+    /// holds, and moving away from 0 only grows the image's magnitude.
+    fn fitting(fits: impl Fn(Pico8Num) -> bool) -> (Pico8Num, Pico8Num) {
+        assert!(fits(Pico8Num(0)), "zero maps to zero");
+        // The last `e` from 0 toward `end` that fits (`fits` is a prefix).
+        let edge = |end: i32| -> i32 {
+            let (mut good, mut bad) = (0i64, end as i64);
+            if fits(Pico8Num(end)) {
+                return end;
+            }
+            while (bad - good).abs() > 1 {
+                let mid = good + (bad - good) / 2;
+                if fits(Pico8Num(mid as i32)) {
+                    good = mid;
+                } else {
+                    bad = mid;
+                }
+            }
+            good as i32
+        };
+        (Pico8Num(edge(i32::MIN)), Pico8Num(edge(i32::MAX)))
+    }
 }
 
 impl fmt::Debug for Pico8NumInterval {
@@ -551,6 +588,38 @@ mod tests {
         assert!("".parse::<Pico8Num>().is_err());
         assert!("1.2.3".parse::<Pico8Num>().is_err());
         assert!("nope".parse::<Pico8Num>().is_err());
+    }
+
+    /// The fitting endpoints of a scale / divide by a positive constant are
+    /// exactly where the checked operation stops returning `None`: the edge
+    /// fits, one past it does not, on both sides; a factor at most 1 (a
+    /// divisor at least 1) fits everywhere.
+    #[test]
+    fn the_fitting_endpoints_are_where_the_checked_scale_and_divide_stop_fitting() {
+        use super::Pico8NumInterval as IV;
+        let raw = |v: i32| Pico8Num(v);
+        let fits = |div: bool, e: i32, k: Pico8Num| {
+            let x = IV::from_number(raw(e));
+            if div { x.checked_div_positive(k).is_some() } else { x.checked_scale_positive(k).is_some() }
+        };
+        for k in [1, 2, 3, 0x7fff, 0x8000, 0xffff, 0x1_0000, 0x1_0001, 0x1_8000, 0x2_0000, 0x3_0000, 0x40_0000, i32::MAX] {
+            for div in [false, true] {
+                let (lo, hi) = if div { IV::div_positive_fits(raw(k)) } else { IV::scale_positive_fits(raw(k)) };
+                let (lo, hi) = (lo.0, hi.0);
+                assert!(fits(div, lo, raw(k)) && fits(div, hi, raw(k)), "k {k:#x} div {div}: the edges fit");
+                if lo > i32::MIN {
+                    assert!(!fits(div, lo - 1, raw(k)), "k {k:#x} div {div}: below {lo:#x} wraps");
+                }
+                if hi < i32::MAX {
+                    assert!(!fits(div, hi + 1, raw(k)), "k {k:#x} div {div}: above {hi:#x} wraps");
+                }
+                let everywhere = if div { k >= 0x1_0000 } else { k <= 0x1_0000 };
+                assert_eq!((lo, hi) == (i32::MIN, i32::MAX), everywhere, "k {k:#x} div {div}");
+            }
+        }
+        // Scale by 2: [-16384, 16383.99998]. Divide by 0.5 the same.
+        assert_eq!(IV::scale_positive_fits(raw(0x2_0000)), (raw(i32::MIN / 2), raw(i32::MAX / 2)));
+        assert_eq!(IV::div_positive_fits(raw(0x8000)), (raw(i32::MIN / 2), raw(i32::MAX / 2)));
     }
 
     /// Division and the +/-32768 edges, against a real PICO-8 0.2.7a6.

@@ -238,6 +238,48 @@ pub fn zi_neg_wraps(a: ZI) -> u16 {
     }
 }
 
+/// The lanes where interval `a` times the POSITIVE `k` (`zi_scale`) leaves
+/// the 16.16 range: the assembled kernel's error for it (`Op::NoWrap`).
+/// Per lane `Pico8NumInterval::checked_scale_positive`, so the codegen's
+/// two compares are checked against the operation they replace.
+#[inline(always)]
+pub fn zi_scale_wraps(a: ZI, k: ZN) -> u16 {
+    zi_scaled_wraps(a, k, |e, k| e.checked_scale_positive(k).is_none())
+}
+/// `zi_scale_wraps` for `a / k` (`Pico8NumInterval::checked_div_positive`):
+/// the scalar `/` SATURATES where the interval one has no answer.
+#[inline(always)]
+pub fn zi_div_wraps(a: ZI, k: ZN) -> u16 {
+    zi_scaled_wraps(a, k, |e, k| e.checked_div_positive(k).is_none())
+}
+/// Each endpoint on its own: the map is monotone, so the interval wraps iff
+/// an endpoint's image does (and a lane whose endpoints are out of order is
+/// never asserted on).
+fn zi_scaled_wraps(a: ZI, k: ZN, wraps: impl Fn(IV, P8) -> bool) -> u16 {
+    let (lo, hi, k) = (a.lo.to_array(), a.hi.to_array(), k.to_array());
+    (0..W).fold(0u16, |m, i| {
+        let w = wraps(IV::from_number(lo[i]), k[i]) || wraps(IV::from_number(hi[i]), k[i]);
+        m | (w as u16) << i
+    })
+}
+/// Interval times a POSITIVE `k`, endpoint by endpoint (monotone). Panics on
+/// a wrap, as `zi_add`; the assembled kernel declines such a lane instead.
+#[inline(always)]
+pub fn zi_scale(a: ZI, k: ZN) -> ZI {
+    if zi_scale_wraps(a, k) != 0 {
+        panic!("interval scale wraps: lanes {:#06x}", zi_scale_wraps(a, k));
+    }
+    ZI { lo: zn_mul(a.lo, k), hi: zn_mul(a.hi, k) }
+}
+/// Interval over a POSITIVE `k`, as `zi_scale`.
+#[inline(always)]
+pub fn zi_div(a: ZI, k: ZN) -> ZI {
+    if zi_div_wraps(a, k) != 0 {
+        panic!("interval divide wraps: lanes {:#06x}", zi_div_wraps(a, k));
+    }
+    ZI { lo: zn_div(a.lo, k), hi: zn_div(a.hi, k) }
+}
+
 #[inline(always)]
 pub fn zi_add(a: ZI, b: ZI) -> ZI {
     if zi_add_wraps(a, b) != 0 {
@@ -612,6 +654,54 @@ mod tests {
             assert_eq!(zn_flr(a), ref1(a, |x| x.flr()), "flr {}", seed);
             assert_eq!(zn_div(a, b), ref2(a, b, |x, y| x / y), "div {}", seed);
             assert_eq!(zn_rem(a, b), ref2(a, b, |x, y| x % y), "rem {}", seed);
+        }
+    }
+
+    /// Interval `*` and `/` by a positive constant: a lane wraps exactly
+    /// where `Pico8NumInterval`'s checked operation has no answer, one ulp
+    /// either side of the edge; elsewhere the endpoints are `zn_mul` /
+    /// `zn_div`'s and the interval operation's.
+    #[test]
+    fn interval_scale_and_divide_wrap_exactly_where_the_checked_operation_fails() {
+        let raw = |v: i32| P8::from_raw(v);
+        // Times 2 / over 0.5: the image is 2e, fitting iff e in [MIN/2, MAX/2].
+        let (two, half) = (zn_splat(raw(0x2_0000)), zn_splat(raw(0x8000)));
+        let (lo_edge, hi_edge) = (i32::MIN / 2, i32::MAX / 2);
+        // Lane i: [lo, hi] with one end on, or one ulp past, an edge.
+        let cases: [(i32, i32, bool); 6] = [
+            (lo_edge, hi_edge, false),
+            (lo_edge - 1, 0, true),
+            (0, hi_edge + 1, true),
+            (lo_edge, lo_edge, false),
+            (i32::MIN, i32::MAX, true),
+            (-0x10_0000, 0x10_0000, false),
+        ];
+        let lanes = |k: usize| std::array::from_fn(|i| raw(if k == 0 { cases[i % 6].0 } else { cases[i % 6].1 }));
+        let a = ZI { lo: ZN::from_array(lanes(0)), hi: ZN::from_array(lanes(1)) };
+        let want = (0..W).fold(0u16, |m, i| m | (cases[i % 6].2 as u16) << i);
+        assert_eq!(zi_scale_wraps(a, two), want, "times 2");
+        assert_eq!(zi_div_wraps(a, half), want, "over 0.5");
+        // Never at a factor of at most 1 / a divisor of at least 1.
+        for k in [1, 0x8000, 0x1_0000] {
+            assert_eq!(zi_scale_wraps(a, zn_splat(raw(k))), 0, "times {k:#x}");
+        }
+        for k in [0x1_0000, 0x1_0001, 0x40_0000] {
+            assert_eq!(zi_div_wraps(a, zn_splat(raw(k))), 0, "over {k:#x}");
+        }
+        // Where nothing wraps: the checked operation, per lane.
+        for seed in 0..32 {
+            let a = ival(seed);
+            for k in [0x8000, 0x1_0000, 0x1_8000, 0x3_0000, 0x8_0000] {
+                let kz = zn_splat(raw(k));
+                for (div, got) in [(false, zi_scale(a, kz)), (true, zi_div(a, kz))] {
+                    for i in 0..W {
+                        let x = IV::new(a.lo.lane(i), a.hi.lane(i));
+                        let r = if div { x.checked_div_positive(raw(k)) } else { x.checked_scale_positive(raw(k)) };
+                        let r = r.expect("small values fit");
+                        assert_eq!((got.lo.lane(i), got.hi.lane(i)), (r.low, r.high), "seed {seed} k {k:#x} div {div}");
+                    }
+                }
+            }
         }
     }
 

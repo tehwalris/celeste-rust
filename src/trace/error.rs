@@ -15,6 +15,7 @@
 //! | a fork's fragment (`Split`, `SplitInt`) of a set | not covered: `not SplitOk(ways)` | a lane spanning more parts than are enumerated has none to go to |
 //! | `Sel(c, t, f)`, `c` lane-undecidable | `not Known(c)` | the kernel picks an arm by `c`'s value bit |
 //! | `Add`, `Sub`, `Neg` of an interval, not bounded inside the 16.16 range by the static ranges | `not NoWrap(op)` | the kernel computes each endpoint in wrapping i32: an overflow wraps it apart from the other |
+//! | `Mul`, `Div` of an interval by a positive literal that can carry an endpoint out of range (or a scalar no literal yet), the operand's static range not inside `Scaled::fits` | `not NoWrap(op)` | as `Add`: `*` wraps, `/` saturates, where `Pico8NumInterval`'s checked operation has no answer |
 //! | `Restrict(lo, hi)(x)` | `Lo(x) < lo or Hi(x) > hi`, on the raw `x` | the body was specialized on the range: the static ranges folded comparisons with it |
 //!
 //! A RESTRICTION's own error is charged to EVERY outcome of the frame, not
@@ -171,6 +172,14 @@ fn own_error(d: &mut Symbolic, n: NodeId) -> Option<NodeId> {
             let fits = d.graph.fold(Op::NoWrap, vec![n]);
             d.graph.fold(Op::Not, vec![fits])
         }
+        // The same for a scale or divide, bounded by the OPERAND's range: the
+        // product's range is unknown past 16.16 anyway, and a saturated
+        // quotient's always lies inside it. `NoWrap` folds to true where the
+        // literal cannot overflow (a factor at most 1, a divisor at least 1).
+        Op::Mul | Op::Div if d.is_interval(&n) && !scaled_bounded(d, n) => {
+            let fits = d.graph.fold(Op::NoWrap, vec![n]);
+            d.graph.fold(Op::Not, vec![fits])
+        }
         // The assumption, checked on the raw operand: `Lo`/`Hi` of a number
         // are the number.
         Op::Restrict(lo, hi) => {
@@ -204,6 +213,17 @@ fn within_one_integer(d: &Symbolic, n: NodeId) -> bool {
 /// the 16.16 range? In i64, so a bound past it is seen rather than wrapped.
 fn bounded(d: &mut Symbolic, n: NodeId) -> bool {
     d.range_of(n).is_some_and(|pieces| pieces.iter().all(|&(lo, hi)| lo >= i32::MIN as i64 && hi <= i32::MAX as i64))
+}
+
+/// Do the static ranges put every value of a scale / divide's interval
+/// operand where its image fits (`Scaled::fits`)? False while the scalar is
+/// no positive literal: its `NoWrap` stays for a specialization to decide
+/// (the kernel models no other interval `*` or `/`).
+fn scaled_bounded(d: &mut Symbolic, n: NodeId) -> bool {
+    let Some(s) = crate::transpile::graph::scaled(&d.graph, n) else { return false };
+    let (lo, hi) = s.fits();
+    let operand = d.graph.get(n).args[s.operand];
+    d.range_of(operand).is_some_and(|pieces| pieces.iter().all(|&(a, b)| a >= lo as i64 && b <= hi as i64))
 }
 
 /// `not Known(b)`: the lane holds `b` undecided.
@@ -354,6 +374,47 @@ mod tests {
         let s = d.graph.fold(Op::Add, vec![y, z]);
         let e = of(&mut d, &[s]);
         assert_eq!(d.graph.get(e).op, Op::ConstBool(false));
+    }
+
+    #[test]
+    fn interval_scale_and_divide_own_their_no_wrap_where_the_literal_can_overflow() {
+        let mut d = Symbolic::default();
+        let x = cell(&mut d, 0, true);
+        let k = |d: &mut Symbolic, raw: i32| d.graph.leaf(Op::Const(raw, raw));
+        for (op, raw, owns) in [
+            (Op::Mul, 0x2_0000, true),
+            (Op::Mul, 0x1_0000, false),
+            (Op::Mul, 0x4000, false),
+            (Op::Div, 0x4000, true),
+            (Op::Div, 0x8_0000, false),
+        ] {
+            let c = k(&mut d, raw);
+            let r = d.graph.fold(op.clone(), vec![x, c]);
+            let e = of(&mut d, &[r]);
+            if owns {
+                let fits = d.graph.fold(Op::NoWrap, vec![r]);
+                assert_eq!(e, d.graph.fold(Op::Not, vec![fits]), "{op:?} {raw:#x}");
+            } else {
+                assert_eq!(d.graph.get(e).op, Op::ConstBool(false), "{op:?} {raw:#x}");
+            }
+        }
+        let two = k(&mut d, 0x2_0000);
+        // Exact: PICO-8's own wrap (before any restriction, which every
+        // outcome owes).
+        let y = cell(&mut d, 1, false);
+        let m = d.graph.fold(Op::Mul, vec![y, two]);
+        let e = of(&mut d, &[m]);
+        assert_eq!(d.graph.get(e).op, Op::ConstBool(false));
+        // The operand's static range inside `fits`: nothing beyond the
+        // restriction's own check. One ulp past it: the product owes it.
+        let inside = d.restrict(x, i32::MIN / 2, i32::MAX / 2);
+        let m = d.graph.fold(Op::Mul, vec![inside, two]);
+        assert_eq!(of(&mut d, &[m]), of(&mut d, &[inside]));
+        let past = d.restrict(x, i32::MIN / 2, i32::MAX / 2 + 1);
+        let m = d.graph.fold(Op::Mul, vec![past, two]);
+        let fits = d.graph.fold(Op::NoWrap, vec![m]);
+        let e = of(&mut d, &[m]);
+        assert!(crate::transpile::bdd::reachable(&d.graph, &[e])[fits as usize], "the product's NoWrap is owed");
     }
 
     #[test]

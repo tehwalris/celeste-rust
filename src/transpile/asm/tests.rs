@@ -7,7 +7,7 @@ const ONE_FIXED2: i32 = 0x0002_0000; // +2.0 in 16.16
 
 use celeste_engine::kernel::{
     zb_and, zb_eq, zb_not, zb_or, zi_abs, zi_add, zi_add_wraps, zi_cmp, zi_eq, zi_flr, zi_fork_flr, zi_max, zi_min,
-    zi_neg, zi_neg_wraps, zi_span_ok, zi_sub, zi_sub_wraps, zn_abs, zn_add, zn_eq, zn_flr, zn_ge, zn_gt, zn_le, zn_lt, zn_max,
+    zi_div, zi_div_wraps, zi_neg, zi_neg_wraps, zi_scale, zi_scale_wraps, zi_span_ok, zi_sub, zi_sub_wraps, zn_abs, zn_add, zn_eq, zn_flr, zn_ge, zn_gt, zn_le, zn_lt, zn_max,
     zn_min, zn_mul, zn_neg, zn_sub, zsel_b, zsel_i, zsel_n,
     zn_div, zn_mget, zn_rem, zn_sin, zn_tile_flag_at, Cmp, ZB, ZI,
     ZN, ALL,
@@ -113,6 +113,11 @@ fn eval_nodes(
             Op::Sub => V::N(zn_sub(n(0), n(1))),
             Op::Min => V::N(zn_min(n(0), n(1))),
             Op::Max => V::N(zn_max(n(0), n(1))),
+            // Interval by a positive literal, endpoint by endpoint (`zi_scale`
+            // panics where `NoWrap` is false).
+            Op::Mul if wide(0) => V::I(zi_scale(iv(0), n(1))),
+            Op::Mul if wide(1) => V::I(zi_scale(iv(1), n(0))),
+            Op::Div if wide(0) => V::I(zi_div(iv(0), n(1))),
             Op::Mul => V::N(zn_mul(n(0), n(1))),
             Op::Div => V::N(zn_div(n(0), n(1))),
             Op::Rem => V::N(zn_rem(n(0), n(1))),
@@ -196,6 +201,9 @@ fn eval_nodes(
                     (Op::Add, V::I(_)) => zi_add_wraps(ivx(0), ivx(1)),
                     (Op::Sub, V::I(_)) => zi_sub_wraps(ivx(0), ivx(1)),
                     (Op::Neg, V::I(_)) => zi_neg_wraps(ivx(0)),
+                    (Op::Mul, V::I(_)) if matches!(vals[x.args[0] as usize], V::I(_)) => zi_scale_wraps(ivx(0), ivx(1).lo),
+                    (Op::Mul, V::I(_)) => zi_scale_wraps(ivx(1), ivx(0).lo),
+                    (Op::Div, V::I(_)) => zi_div_wraps(ivx(0), ivx(1).lo),
                     _ => 0,
                 };
                 V::B(ZB { val: !wraps, known: ALL })
@@ -763,6 +771,113 @@ fn asm_interval_overflow_declines() {
             let want = (e.lo.to_array()[0].as_raw_u32() as i32, e.hi.to_array()[0].as_raw_u32() as i32);
             assert_eq!((lo[l], hi[l]), want, "{name} lane {l} {:?}: assembled vs primitive", lanes[l]);
         }
+    }
+}
+
+/// Interval `*` and `/` by a positive literal whose endpoints leave the
+/// 16.16 range are an ERROR in that lane, as `+`/`-`/negation
+/// (`asm_interval_overflow_declines`): `NoWrap` is false exactly where
+/// `zi_scale_wraps` / `zi_div_wraps` (`Pico8NumInterval`'s checked
+/// operations) fire, one ulp either side of each literal's edges, and every
+/// other lane is bit-exact with `zi_scale` / `zi_div`. A literal that cannot
+/// carry an endpoint out (a factor at most 1, a divisor at least 1: the
+/// inline `div_pow2`) has a constant-true `NoWrap`, so no compare.
+#[test]
+fn asm_interval_scale_and_divide_overflow_declines() {
+    use crate::transpile::asm::{compile_and_load_reprs, CellRepr};
+    use crate::transpile::graph::scaled;
+    let mut g = Graph::new();
+    let civ = g.leaf(Op::Cell(0)); // ival
+    // (op, raw literal, the literal first, can wrap)
+    let forms: [(Op, i32, bool, bool); 10] = [
+        (Op::Mul, 0x2_0000, false, true),
+        (Op::Mul, 0x3_0000, true, true),
+        (Op::Mul, 0x1_8000, false, true),
+        (Op::Mul, 0x1_0001, false, true),
+        (Op::Mul, 0x8000, false, false),
+        (Op::Div, 0x8000, false, true),
+        (Op::Div, 0x4000, false, true),
+        (Op::Div, 0xffff, false, true),
+        (Op::Div, 0x3_0000, false, false),
+        (Op::Div, 0x2_0000, false, false), // inline `div_pow2`
+    ];
+    let mut ops = Vec::new();
+    for (op, k, first, _) in &forms {
+        let c = g.leaf(Op::Const(*k, *k));
+        ops.push(g.add(op.clone(), if *first { vec![c, civ] } else { vec![civ, c] }));
+    }
+    let oks: Vec<NodeId> = ops.iter().map(|&x| g.add(Op::NoWrap, vec![x])).collect();
+    let roots: Vec<NodeId> = ops.iter().chain(&oks).copied().collect();
+    let mut reprs = HashMap::new();
+    reprs.insert(0u32, CellRepr::Ival);
+    let (compiled, loaded) = compile_and_load_reprs(&g, &roots, "ivalscale", &reprs).expect("compile+load");
+    let ctx = crate::transpile::asm::AsmCtx::new(std::ptr::null());
+    let text = crate::transpile::asm::compile(&g, &roots, "ivalscale", &reprs).expect("compile").asm;
+    let compares = text.lines().filter(|l| l.trim_start().starts_with("vpcmpd")).count();
+    // One per distinct bound a literal can cross (`*2` and `/0.5` share
+    // theirs, `*1.00002` and `/0.99998` their low one), none for the rest.
+    let mut bounds = std::collections::BTreeSet::new();
+    for (f, &x) in ops.iter().enumerate() {
+        let (lo, hi) = scaled(&g, x).expect("scaled").fits();
+        assert_eq!(lo != i32::MIN && hi != i32::MAX, forms[f].3, "{:?}: both ends or neither", forms[f]);
+        if lo != i32::MIN {
+            bounds.insert((0, lo));
+        }
+        if hi != i32::MAX {
+            bounds.insert((1, hi));
+        }
+    }
+    assert_eq!(compares, bounds.len(), "one compare per bound:\n{text}");
+    let mut fired = vec![0u32; forms.len()];
+    let mut held = vec![0u32; forms.len()];
+    // Lanes around every literal's edges, then the extremes and small values.
+    let mut lanes: Vec<(i32, i32)> = vec![(i32::MIN, i32::MAX), (0, 0), (-0x10_0000, 0x10_0000), (i32::MIN, 0), (0, i32::MAX)];
+    for &x in &ops {
+        let (lo, hi) = scaled(&g, x).expect("scaled").fits();
+        for d in [-1i64, 0, 1] {
+            let (l, h) = ((lo as i64 + d).clamp(i32::MIN as i64, 0) as i32, (hi as i64 + d).clamp(0, i32::MAX as i64) as i32);
+            lanes.extend([(l, 0), (0, h), (l, h), (l, l.saturating_add(3)), (h.saturating_sub(3), h)]);
+        }
+    }
+    for batch in lanes.chunks(16) {
+        let lane = |i: usize| batch[i % batch.len()];
+        let mut input = vec![0u8; compiled.input_bytes as usize];
+        for l in 0..16 {
+            input[l * 4..l * 4 + 4].copy_from_slice(&lane(l).0.to_le_bytes());
+            input[64 + l * 4..64 + l * 4 + 4].copy_from_slice(&lane(l).1.to_le_bytes());
+        }
+        let out = run_asm_raw(&loaded, &input, compiled.out_bytes, &ctx as *const _ as *const std::os::raw::c_void);
+        let word = |o: usize| u16::from_le_bytes([out[o], out[o + 1]]);
+        let plane = |ri: usize, off: usize| -> [i32; 16] {
+            let o = compiled.root_offsets[ri] as usize + off;
+            std::array::from_fn(|l| i32::from_le_bytes(out[o + l * 4..o + l * 4 + 4].try_into().unwrap()))
+        };
+        let ziv = ZI {
+            lo: ZN::from_array(std::array::from_fn(|i| P8::from_raw(lane(i).0))),
+            hi: ZN::from_array(std::array::from_fn(|i| P8::from_raw(lane(i).1))),
+        };
+        for (f, (op, k, _, can)) in forms.iter().enumerate() {
+            let kz = ZN::from_array([P8::from_raw(*k); 16]);
+            let div = matches!(op, Op::Div);
+            let wraps = if div { zi_div_wraps(ziv, kz) } else { zi_scale_wraps(ziv, kz) };
+            assert!(*can || wraps == 0, "{op:?} {k:#x} never wraps");
+            fired[f] += wraps.count_ones();
+            held[f] += (!wraps).count_ones();
+            let o = compiled.root_offsets[forms.len() + f] as usize;
+            assert_eq!(word(o + 2), 0xffff, "{op:?} {k:#x}: the premise is decided on every lane");
+            assert_eq!(word(o), !wraps, "{op:?} {k:#x}: NoWrap false exactly where the checked operation fails");
+            let (lo, hi) = (plane(f, 0), plane(f, 64));
+            for l in (0..16).filter(|l| wraps >> l & 1 == 0) {
+                let pick = |z: ZN| ZN::from_array([z.lane(l); 16]);
+                let a = ZI { lo: pick(ziv.lo), hi: pick(ziv.hi) };
+                let e = if div { zi_div(a, kz) } else { zi_scale(a, kz) };
+                let want = (e.lo.lane(0).as_raw_u32() as i32, e.hi.lane(0).as_raw_u32() as i32);
+                assert_eq!((lo[l], hi[l]), want, "{op:?} {k:#x} lane {l} {:?}: assembled vs primitive", lane(l));
+            }
+        }
+    }
+    for (f, (op, k, _, can)) in forms.iter().enumerate() {
+        assert!(held[f] > 0 && (fired[f] > 0) == *can, "{op:?} {k:#x}: fired {} held {}", fired[f], held[f]);
     }
 }
 

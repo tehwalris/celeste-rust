@@ -162,6 +162,7 @@ OR(error(args))`, materialized once, after fusion:
 | a fork fragment | `not SplitOk(ways)` / `not SplitOkTab`: the lane spans more parts than enumerated |
 | an unrolled loop | its condition still holds after the bound (`State::ended`) |
 | interval `Add`/`Sub`/`Neg` | `not NoWrap(op)`: an endpoint overflowed 16.16 on this lane (`b47b118`; skipped where the static ranges bound the result) |
+| interval `Mul`/`Div` by a positive literal | `not NoWrap(op)`: an endpoint left 16.16 (`*` wraps, `/` saturates) where `Pico8NumInterval`'s checked operation has none (branch `mul-nowrap`; two compares against `graph::Scaled::fits`; none for a factor at most 1 or a divisor at least 1, so never for `div_pow2`; skipped where the operand's static range fits) |
 | a widening | containment of the slot it writes (`widen::SlotErrors`), only where stored |
 | `Restrict(lo, hi)(x)` (a bounded input) | `Lo(x) < lo or Hi(x) > hi` on the raw input, charged to EVERY outcome |
 | the frame | inputs outside the kernel's pins |
@@ -295,9 +296,16 @@ that spans everything (floor `delay`, balloon `timer`, at `n` the spring's
 `delay`/`hide_in`/`hide_for`) is stored and read as the unknown number
 (`AV::UNum`, `widen::forget_countdown_inputs`), never as the interval [MIN,
 MAX]. (`72fdea7` on branch `asm-interval-wrap` was a rejected first version.)
-STILL UNCHECKED: interval `Mul`/`Div` by a positive constant (its known
-source, the rem rungs' scale, is gone) can still wrap - an open item. Which
-results ran before the fix: plans/results.md.
+Interval `Mul`/`Div` by a positive literal got the same own error on
+2026-10-10 (branch `mul-nowrap`): the operation is monotone, so the check is
+the operand's endpoints against the range whose image fits (bisected on
+`checked_scale_positive` / `checked_div_positive`). The cart's factors
+above 1 multiply bounded values (`sin(..)*2`) and its divisors are at least
+1, so no kernel of rooms (1,0), (6,2) 100% or (4,2) emits one (their trees
+and dynamic instruction counts are unchanged). The static range of
+a product is now computed unwrapped (`pieces_of`: past 16.16 it is unknown,
+not PICO-8's wrapped endpoints). Which results ran before the fix:
+plans/results.md.
 
 ## The forward frame and the storage (storage v2, 2026-10-10)
 
@@ -760,14 +768,10 @@ REACHED` at frame 24, the frame the player spawns with `rem` set to 0.
 2. **The transfer capture costs the forward** ~25-45% CPU (room (1,0)
    f0-f44, `d7c373a`); the kernels compute five roots per axis per body
    where the transfer depends only on the fork configuration and `ox`.
-3. **Overflow in interval `Mul`/`Div` by a constant** is unchecked (it can
-   wrap silently, as Add/Sub did before `b47b118`): give it a `NoWrap`-style
-   own error - or refuse it: its one known source was the rem rungs' bucket
-   snap, gone.
-4. **A batch-invariance test** (`a_lanes_key_does_not_depend_on_its_
+3. **A batch-invariance test** (`a_lanes_key_does_not_depend_on_its_
    neighbours` went with the old sweep) and a widening-soundness check
    (`diag-project` checks one projection; `ref-check` the kernels).
-5. **The UI** (`ui/`, TypeScript) still carries the ladder's concepts
+4. **The UI** (`ui/`, TypeScript) still carries the ladder's concepts
    (several horizons, kernel re-run backward iterations, the band colours);
    the exporter writes one horizon and leaves those fields empty.
 
