@@ -165,18 +165,29 @@ fn bits_for(n: usize) -> u32 {
 pub struct FieldDict {
     /// Index -> code.
     codes: Vec<Code>,
-    /// Numbers: an open-addressing table of `(word, index + 1)`, 0 empty.
-    num_slots: Vec<(u64, u32)>,
+    /// Numbers: an open-addressing table, each slot holding its index's
+    /// PLACED bits (`place`, kept current as runs are added).
+    num_slots: Vec<NumSlot>,
     /// Numbers held.
     nums: usize,
     /// Every other code, by search.
     others: Vec<(Code, u32)>,
-    /// `Bool(false)`, `Bool(true)`, `UBool`'s indices (`NONE`: absent).
+    /// `Bool(false)`, `Bool(true)`, `UBool`'s indices (`NONE`: absent) and
+    /// placed bits.
     bools: [u32; 3],
+    bool_placed: [u128; 3],
     /// The field's bit runs `(first bit, bits)`, low index bits first;
     /// adjacent runs merged.
     runs: Vec<(u8, u8)>,
     bits: u32,
+}
+
+/// A number's slot: its word, index + 1 (0: empty) and placed bits.
+#[derive(Clone, Copy, Default, Debug)]
+struct NumSlot {
+    word: u64,
+    idx1: u32,
+    placed: u128,
 }
 
 impl FieldDict {
@@ -196,30 +207,41 @@ impl FieldDict {
         self.codes[idx as usize]
     }
 
-    /// A number's index (`NONE`: absent).
     #[inline]
-    pub fn find_num(&self, word: u64) -> u32 {
+    fn num_slot(&self, word: u64) -> Option<&NumSlot> {
         if self.num_slots.is_empty() {
-            return NONE;
+            return None;
         }
         let m = self.num_slots.len() - 1;
         let mut i = (word.wrapping_mul(0x9e37_79b9_7f4a_7c15) >> 32) as usize & m;
         loop {
-            let (w, e) = self.num_slots[i];
-            if e == 0 {
-                return NONE;
+            let s = &self.num_slots[i];
+            if s.idx1 == 0 {
+                return None;
             }
-            if w == word {
-                return e - 1;
+            if s.word == word {
+                return Some(s);
             }
             i = (i + 1) & m;
         }
     }
 
-    /// A boolean's index: `0` false, `1` true, `2` unknown (`NONE`: absent).
+    /// A number's index (`NONE`: absent).
     #[inline]
-    pub fn find_bool(&self, tri: usize) -> u32 {
-        self.bools[tri]
+    pub fn find_num(&self, word: u64) -> u32 {
+        self.num_slot(word).map_or(NONE, |s| s.idx1 - 1)
+    }
+
+    /// A number's PLACED bits (`place` of its index; `None`: absent).
+    #[inline]
+    pub fn find_num_placed(&self, word: u64) -> Option<u128> {
+        self.num_slot(word).map(|s| s.placed)
+    }
+
+    /// A boolean's placed bits: `0` false, `1` true, `2` unknown (`None`: absent).
+    #[inline]
+    pub fn find_bool_placed(&self, tri: usize) -> Option<u128> {
+        (self.bools[tri] != NONE).then_some(self.bool_placed[tri])
     }
 
     /// Any code's index (`NONE`: absent).
@@ -259,37 +281,57 @@ impl FieldDict {
                 let n = self.nums;
                 if n * 2 > self.num_slots.len() {
                     let cap = (n * 2).next_power_of_two().max(4);
-                    self.num_slots = vec![(0, 0); cap];
+                    self.num_slots = vec![NumSlot::default(); cap];
                     for (i, c) in self.codes.iter().enumerate() {
                         if c.kind == K_NUM {
-                            Self::put(&mut self.num_slots, c.word(), i as u32);
+                            let placed = self.place(i as u32);
+                            Self::put(&mut self.num_slots, c.word(), i as u32, placed);
                         }
                     }
                 } else {
-                    Self::put(&mut self.num_slots, c.word(), idx);
+                    let placed = self.place(idx);
+                    Self::put(&mut self.num_slots, c.word(), idx, placed);
                 }
             }
-            K_BOOL => self.bools[c.a as usize] = idx,
-            K_UBOOL => self.bools[2] = idx,
+            K_BOOL => {
+                self.bools[c.a as usize] = idx;
+                self.bool_placed[c.a as usize] = self.place(idx);
+            }
+            K_UBOOL => {
+                self.bools[2] = idx;
+                self.bool_placed[2] = self.place(idx);
+            }
             _ => self.others.push((c, idx)),
         }
     }
 
-    fn put(slots: &mut [(u64, u32)], word: u64, idx: u32) {
+    fn put(slots: &mut [NumSlot], word: u64, idx: u32, placed: u128) {
         let m = slots.len() - 1;
         let mut i = (word.wrapping_mul(0x9e37_79b9_7f4a_7c15) >> 32) as usize & m;
-        while slots[i].1 != 0 {
+        while slots[i].idx1 != 0 {
             i = (i + 1) & m;
         }
-        slots[i] = (word, idx + 1);
+        slots[i] = NumSlot { word, idx1: idx + 1, placed };
     }
 
+    /// A new run: every code's placed bits recomputed.
     fn add_run(&mut self, pos: u8, len: u8) {
         match self.runs.last_mut() {
             Some(last) if last.0 + last.1 == pos => last.1 += len,
             _ => self.runs.push((pos, len)),
         }
         self.bits += len as u32;
+        for i in 0..self.num_slots.len() {
+            let s = self.num_slots[i];
+            if s.idx1 != 0 {
+                self.num_slots[i].placed = self.place(s.idx1 - 1);
+            }
+        }
+        for t in 0..3 {
+            if self.bools[t] != NONE {
+                self.bool_placed[t] = self.place(self.bools[t]);
+            }
+        }
     }
 }
 
@@ -901,6 +943,39 @@ mod tests {
         assert_eq!(Code::of_pos(AV::Num(x)), Code::num(0x8000, 0x8000));
         assert_eq!(Code::of_pos(AV::Ival(x, P8::from_raw(0x0005_0000))), Code::num(0x8000, 0x0002_0000));
         assert_ne!(Code::of(AV::Bool(false)), Code::of(AV::UBool));
+    }
+
+    /// A number and its point interval are one code; a wider interval is
+    /// neither end.
+    #[test]
+    fn a_point_interval_codes_as_its_number() {
+        use celeste_core::pico8_num::Pico8Num as P8;
+        for raw in [0i32, 1, -1, 64 << 16, -(5 << 15), i32::MAX, i32::MIN] {
+            let x = P8::from_raw(raw);
+            assert_eq!(Code::of(AV::Ival(x, x)), Code::of(AV::Num(x)), "raw {raw:#x}");
+        }
+        let (a, b) = (P8::from_raw(0), P8::from_raw(1));
+        assert_ne!(Code::of(AV::Ival(a, b)), Code::of(AV::Num(a)));
+        assert_ne!(Code::of(AV::Ival(a, b)), Code::of(AV::Num(b)));
+        assert_ne!(Code::of(AV::Ival(a, b)), Code::of(AV::Ival(b, b)));
+    }
+
+    /// A position coordinate codes without its low end's whole pixels: every
+    /// integer alike, an interval by its offsets from its low pixel, and a
+    /// fraction is still the key's (the cell holds only `flr`).
+    #[test]
+    fn a_position_codes_without_its_whole_pixels() {
+        use celeste_core::pico8_num::Pico8Num as P8;
+        let px = |raw: i32| P8::from_raw(raw);
+        for whole in [-64i32, -1, 0, 5, 300] {
+            assert_eq!(Code::of_pos(AV::Num(px(whole << 16))), Code::of_pos(AV::Num(px(0))), "x = {whole}");
+            assert_eq!(Code::of_pos(AV::Num(px((whole << 16) + 0x4000))), Code::of_pos(AV::Num(px(0x4000))), "x = {whole}.25");
+            let iv = AV::Ival(px((whole << 16) + 0x8000), px(((whole + 2) << 16) + 0x4000));
+            assert_eq!(Code::of_pos(iv), Code::of_pos(AV::Ival(px(0x8000), px((2 << 16) + 0x4000))), "[{whole}.5, {}.25]", whole + 2);
+            assert_eq!(Code::of_pos(AV::Ival(px(whole << 16), px(whole << 16))), Code::of_pos(AV::Num(px(0))));
+        }
+        assert_ne!(Code::of_pos(AV::Num(px(0x4000))), Code::of_pos(AV::Num(px(0))), "a fraction is the key's");
+        assert_ne!(Code::of_pos(AV::Ival(px(0), px(1 << 16))), Code::of_pos(AV::Ival(px(0), px(2 << 16))), "an interval's width is the key's");
     }
 
     /// Past 127 bits is fatal, never truncated.

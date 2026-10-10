@@ -163,19 +163,6 @@ enum Command {
         coarse_marks: Option<String>,
     },
 
-    /// TEMPORARY (exact keys): over every stored row of a tree, the develop
-    /// HASH key (recomputed) against the exact key: one-to-one per (shape,
-    /// cell) and per (shape, region); prints develop's ckhash lines.
-    ExactBijection {
-        #[arg(long)]
-        checkpoint_dir: String,
-        #[arg(long)]
-        to: u32,
-        #[arg(long, default_value = "1,0")]
-        room: String,
-        #[arg(long, value_parser = Level::parse)]
-        level: Level,
-    },
     /// Fingerprint a forward checkpoint tree: per frame, the lane count and an
     /// order-independent hash of its (row key, cell) set, independent of the
     /// storage format.
@@ -840,48 +827,6 @@ fn main() -> Result<()> {
                 println!("MISS {m}");
             }
             println!("of {total} fine rows' projections: {missed} not reached by the coarse tree (a forward loss), {unmarked} reached but unmarked (a backward loss)");
-        }
-        Command::ExactBijection { checkpoint_dir, to, room, level } => {
-            std::env::set_var("CELESTE_START_ROOM", &room);
-            set_level(level);
-            let dir = std::path::Path::new(&checkpoint_dir);
-            let ids = celeste_rust::compiled::ids();
-            let geo = *celeste_rust::storage::geometry();
-            let held = Level { held: level.held, ..Level::EXACT };
-            // (shape, cell, old) -> new and back; (shape, slot, old) -> new and back.
-            let mut fwd: rustc_hash::FxHashMap<(u64, u32, (u64, u64)), (u64, u64)> = Default::default();
-            let mut back: rustc_hash::FxHashMap<(u64, u32, (u64, u64)), (u64, u64)> = Default::default();
-            let mut efwd: rustc_hash::FxHashMap<(u64, u32, (u64, u64)), (u64, u64)> = Default::default();
-            let mut eback: rustc_hash::FxHashMap<(u64, u32, (u64, u64)), (u64, u64)> = Default::default();
-            let (mut rows, mut bad) = (0u64, 0u64);
-            for frame in 0..=to {
-                let (mut n, mut acc) = (0usize, 0u64);
-                for block in celeste_rust::frame::load_frame(dir, frame)? {
-                    let cells = block.positions()?;
-                    let mut view = block.rt2().clone_block();
-                    widen_rt2_to(&mut view, held);
-                    let old = view.legacy_hash_keys(ids);
-                    let shape = block.shard_shape();
-                    for (i, (&k, &c)) in block.keys().iter().zip(&cells).enumerate() {
-                        let o = old[i];
-                        acc = acc.wrapping_add(celeste_engine::runtime2::mix64(o.0 ^ celeste_engine::runtime2::mix64(o.1 ^ (c as u64) << 1)));
-                        n += 1;
-                        rows += 1;
-                        let slot = geo.slot_local(c).0;
-                        for (map, a, b) in [(&mut fwd, (shape, c, o), k), (&mut back, (shape, c, k), o), (&mut efwd, (shape, slot, o), k), (&mut eback, (shape, slot, k), o)] {
-                            if *map.entry(a).or_insert(b) != b {
-                                bad += 1;
-                                if bad <= 5 {
-                                    eprintln!("NOT ONE-TO-ONE: f{frame} shape {shape:#x} cell {c} old {o:x?} new {k:x?}");
-                                }
-                            }
-                        }
-                    }
-                }
-                println!("f{frame:03} {n} {acc:016x}");
-            }
-            println!("bijection: {rows} rows, {} states, {} entries (old) / {} (new), {bad} violations", fwd.len(), efwd.len(), eback.len());
-            anyhow::ensure!(bad == 0 && fwd.len() == back.len() && efwd.len() == eback.len(), "not a bijection");
         }
         Command::Ckhash {
             checkpoint_dir,

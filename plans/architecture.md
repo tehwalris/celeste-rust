@@ -267,17 +267,24 @@ spikes, and the test stays per lane. The tracer (`verify::Points`) and level
 `ival::a_tile_test_over_a_restricted_rectangle_folds_exactly_by_the_set_of_tiles`
 checks fold against per-lane evaluation in every room.
 
-**Keys.** The row key is folded per EMITTED row in the append step
-(`AsmBody::key_words`: `Σ cell_mix` over the key fields read off the packed
-output buffer), checked per row against `Rt2::boundary_canonicalize` by
-`CELESTE_KERNEL_KEY_CHECK=1`. A number and its point interval key alike
-(`592c72f`). FIELD_NAMES' order feeds the shape hash and every key: a
-reordering is a different search. The key holds NO POSITION (2026-10-10,
-`29d8364`): the position object's (player, else `player_spawn`) `x`/`y`
-contribute only their part past the low end's whole pixel
-(`runtime2::pos_code`), which the cell holds; the room is in the key, so a
-state is still `(shape, key, cell)`, and states sharing everything but the
-position share a key - the storage's entries (below).
+**Keys.** A state's key is EXACT (2026-10-10, plans/exact-keys.md): per
+(shape, value cell) a dictionary of the codes the tree has stored (a
+number and its point interval are one code, `592c72f`), each field's index
+in append-only bit runs of a 127-bit key that never moves as the
+dictionaries grow. The append step looks each emitted row's key fields up
+in the dictionaries (read-only during a wave); a code they lack makes the
+state new and its key PROVISIONAL (its content interned), made final by
+the translation, which appends the frame's new codes sorted - so keys stay
+canonical. Checked per row against `Rt2::boundary_canonicalize` keyed in
+the same dictionaries by `CELESTE_KERNEL_KEY_CHECK=1`. FIELD_NAMES' order
+feeds the shape hash (a shape's name; its signature is stored and compared)
+and the cell numbering: a reordering is a different search. The key holds
+NO POSITION (`29d8364`): the position object's (player, else
+`player_spawn`) `x`/`y` contribute only their part past the low end's whole
+pixel (`exact::Code::pos`), which the cell holds; the room is in the key, so
+a state is still `(shape, key, cell)`, and states sharing everything but the
+position share a key - the storage's entries (below). The concrete search
+compares whole states (`exact::exact_rows`), never keys.
 
 **Where it still diverges / is open.** The re-trace per level (above). The
 platform tension: storing a platform's `x` as its whole path is what lets

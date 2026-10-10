@@ -213,7 +213,6 @@ impl KeyField {
     /// `miss` where `d` lacks its code.
     #[inline]
     fn place16(&self, buf: &[u8], d: &FieldDict, take: u16, k: &mut [u128; 16], miss: &mut u16) {
-        use celeste_engine::exact::NONE;
         let base = self.root;
         let mut m = take;
         macro_rules! each {
@@ -221,11 +220,9 @@ impl KeyField {
                 while m != 0 {
                     let i = m.trailing_zeros() as usize;
                     m &= m - 1;
-                    let idx = d.find_num($word(i));
-                    if idx == NONE {
-                        *miss |= 1 << i;
-                    } else {
-                        k[i] |= d.place(idx);
+                    match d.find_num_placed($word(i)) {
+                        Some(p) => k[i] |= p,
+                        None => *miss |= 1 << i,
                     }
                 }
             };
@@ -254,11 +251,9 @@ impl KeyField {
                     let i = m.trailing_zeros() as usize;
                     m &= m - 1;
                     let tri = if known >> i & 1 == 1 { (val >> i & 1) as usize } else { 2 };
-                    let idx = d.find_bool(tri);
-                    if idx == NONE {
-                        *miss |= 1 << i;
-                    } else {
-                        k[i] |= d.place(idx);
+                    match d.find_bool_placed(tri) {
+                        Some(p) => k[i] |= p,
+                        None => *miss |= 1 << i,
                     }
                 }
             }
