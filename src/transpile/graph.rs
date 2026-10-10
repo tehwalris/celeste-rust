@@ -582,6 +582,15 @@ impl Graph {
         self.eval_inner(cells, true, false, Some(room))
     }
 
+    /// `eval_lenient_in` that also reads `mget` over INTERVAL coordinates as
+    /// the SET of tiles the rectangle holds (`tiles_over`), so `Eq(k, mget)`
+    /// decides where no tile there is `k`. The interval fold's evaluator
+    /// (`transpile::ival`); the tracer's (`verify::Points`) and level -1's
+    /// keep `eval_lenient_in`, so neither the trace nor the table moves.
+    pub fn eval_fold_in(&self, cells: &HashMap<u32, Val>, room: &Room) -> Result<Vec<Val>> {
+        self.eval_full(cells, true, false, Some(room), true)
+    }
+
     /// Forks resolved via `Frag`; an unmodelled node (`Mget`, roomless
     /// `TileFlagAt`) is TOP.
     pub fn eval_narrow_top_in(&self, cells: &HashMap<u32, Val>, room: &Room) -> Result<Vec<Val>> {
@@ -600,7 +609,21 @@ impl Graph {
         strict_err: bool,
         room: Option<&Room>,
     ) -> Result<Vec<Val>> {
+        self.eval_full(cells, frag_lenient, strict_err, room, false)
+    }
+
+    fn eval_full(
+        &self,
+        cells: &HashMap<u32, Val>,
+        frag_lenient: bool,
+        strict_err: bool,
+        room: Option<&Room>,
+        mget_sets: bool,
+    ) -> Result<Vec<Val>> {
         let lenient = frag_lenient;
+        // Per `Mget` node read as a set (`mget_sets`): the tiles its
+        // coordinates' rectangle holds.
+        let mut tiles: HashMap<NodeId, TileSet> = HashMap::new();
         let full = Val::Num(Pico8NumInterval::new(
             Pico8Num::from_raw(i32::MIN),
             Pico8Num::from_raw(i32::MAX),
@@ -801,6 +824,14 @@ impl Graph {
                     };
                     Val::Num(Pico8NumInterval::new(pick(x.low, y.low), pick(x.high, y.high)))
                 }
+                // A tile against a literal, decided by the SET of tiles.
+                Op::Eq if node.args.iter().any(|m| tiles.contains_key(m)) => {
+                    let m = if tiles.contains_key(&node.args[0]) { 0 } else { 1 };
+                    match a!(1 - m).as_exact() {
+                        Some(k) => Val::Bool(tiles[&node.args[m]].eq(k)),
+                        None => Self::compare(&node.op, a!(0), a!(1))?,
+                    }
+                }
                 Op::Lt | Op::Le | Op::Gt | Op::Ge | Op::Eq => {
                     Self::compare(&node.op, a!(0), a!(1))?
                 }
@@ -848,11 +879,17 @@ impl Graph {
                 Op::TileFlagAt if room.is_some() => {
                     Self::tile_flag_over(room.unwrap(), a!(0), a!(1), a!(2), a!(3), a!(4))?
                 }
-                // `mget` on EXACT coordinates only, as in the kernels.
+                // `mget` on EXACT coordinates, as in the kernels; over an
+                // interval, the tiles the rectangle holds (`mget_sets`).
                 Op::Mget if room.is_some() => {
                     let (x, y) = (a!(0).as_num("Mget")?, a!(1).as_num("Mget")?);
                     if x.low != x.high || y.low != y.high {
-                        bail!("node {}: mget over an interval coordinate", i);
+                        if !mget_sets {
+                            bail!("node {}: mget over an interval coordinate", i);
+                        }
+                        let set = TileSet::over(room.unwrap(), x, y);
+                        tiles.insert(i as NodeId, set);
+                        return Ok(set.hull());
                     }
                     let t = room.unwrap().cart.mget(x.low, y.low)?;
                     let t = Pico8Num::from_i16(t as i16);
@@ -1036,6 +1073,55 @@ impl Graph {
             (Val::Bool(a), Val::Bool(b)) => Val::Bool(if a == b { a } else { None }),
             _ => bail!("cannot join a number with a boolean"),
         })
+    }
+}
+
+/// The tiles `mget` can return over a rectangle of coordinates: one bit per
+/// tile number (`mget` returns a byte).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct TileSet([u64; 4]);
+
+impl TileSet {
+    /// Every tile `mget(x, y)` returns for `x` in `xs`, `y` in `ys`. A lane's
+    /// coordinate is an integer inside its hull (`mget` of a fraction raises,
+    /// in the kernels too), so it is one of `flr(lo) ..= flr(hi)`; outside the
+    /// map `mget` is 0, so the rectangle is clipped to the map plus one row of
+    /// "outside" on each side.
+    fn over(room: &Room, xs: Pico8NumInterval, ys: Pico8NumInterval) -> TileSet {
+        let span = |iv: Pico8NumInterval, size: i32| {
+            let (lo, hi) = (iv.low.flr().whole_part_as_i16() as i32, iv.high.flr().whole_part_as_i16() as i32);
+            (lo.clamp(-1, size), hi.clamp(-1, size))
+        };
+        let ((x0, x1), (y0, y1)) = (span(xs, 128), span(ys, 64));
+        let mut set = TileSet([0; 4]);
+        for x in x0..=x1 {
+            for y in y0..=y1 {
+                let t = room.cart.mget_whole(x as i16, y as i16) as usize;
+                set.0[t / 64] |= 1 << (t % 64);
+            }
+        }
+        set
+    }
+
+    fn contains(&self, t: usize) -> bool {
+        t < 256 && self.0[t / 64] & (1 << (t % 64)) != 0
+    }
+
+    /// The hull of the tiles, as a number interval.
+    fn hull(&self) -> Val {
+        let mut it = (0..256).filter(|t| self.contains(*t));
+        let lo = it.next().expect("a rectangle holds a tile") as i16;
+        let hi = it.last().map_or(lo, |t| t as i16);
+        Val::Num(Pico8NumInterval::new(Pico8Num::from_i16(lo), Pico8Num::from_i16(hi)))
+    }
+
+    /// `mget == k` over the set: false if no tile is `k`, true if every one is.
+    fn eq(&self, k: Pico8Num) -> Option<bool> {
+        let t = k.as_i16().filter(|t| (0..256).contains(t)).map(|t| t as usize);
+        match t {
+            Some(t) if self.contains(t) => (self.0.iter().map(|w| w.count_ones()).sum::<u32>() == 1).then_some(true),
+            _ => Some(false),
+        }
     }
 }
 

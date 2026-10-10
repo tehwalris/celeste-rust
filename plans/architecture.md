@@ -232,6 +232,36 @@ something it is not. `rewrite bounds-audit --room` audits all of these.
 The no-player phase's `spd.x` (the literal, owing `0 or v`) is a pin, not a
 range.
 
+**The map folds by range** (`spikes_at`, 2026-10-10, branch `kernel-opt`).
+`tile_flag_at` is an intrinsic whose interval reading (`Graph::tile_flag_over`)
+the lowering's fold has always used; `spikes_at` stays Lua, a 2x2 unrolled
+tile scan whose four tests are `Eq(k, Mget(x, y))` for the spike tiles k =
+17, 27, 43, 59. The fold's evaluator (`Graph::eval_fold_in`, used by
+`transpile::ival` only) reads `Mget` over interval coordinates as the SET of
+tiles the rectangle `flr(lo) ..= flr(hi)` holds (`TileSet`; outside the map,
+0), its value the set's hull, and `Eq(k, Mget)` against a literal as
+membership: false where no tile there is k, true where every one is. In a
+region whose reachable rectangles hold no spike tile the death test folds
+to false and its whole cone (the `%8`/`/8` call-outs, the four guards, the
+`mget`s) goes. Why it is EXACT, not a widening: (1) the map is constant, so
+the set is a fact about the cart; (2) the coordinates' hull covers every
+lane's coordinate: the evaluator's arithmetic is checked interval arithmetic
+over the same graph the kernel runs (a wrap is TOP, an undecided `Sel` the
+join of its arms), and every node is evaluated on every lane whatever the
+path, so the hull holds off-path lanes too; (3) the player's position, speed
+and remainder enter only through `Restrict`, which narrows the hull, and a
+lane outside a restriction is in error by the restriction's OWN error,
+checked on the raw cell and charged to every outcome, so it emits nothing
+whatever the folded node says; (4) a lane's `mget` coordinate is an
+integer (the kernels' `zn_mget` raises on a fraction), and every integer in
+the hull is in the rectangle. So on every lane that emits, the folded
+constant is what the per-lane evaluation computes. Where the evaluator
+cannot bound a coordinate (TOP), the rectangle is the whole map, which holds
+spikes, and the test stays per lane. The tracer (`verify::Points`) and level
+-1 keep the old reading (no set), so neither the trace nor the table moves.
+`ival::a_tile_test_over_a_restricted_rectangle_folds_exactly_by_the_set_of_tiles`
+checks fold against per-lane evaluation in every room.
+
 **Keys.** The row key is folded per EMITTED row in the append step
 (`AsmBody::key_words`: `Σ cell_mix` over the key fields read off the packed
 output buffer), checked per row against `Rt2::boundary` by
