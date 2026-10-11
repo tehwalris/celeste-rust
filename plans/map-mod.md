@@ -166,3 +166,25 @@ pred_at 8, layers 4, until 4, win 1) + 12 B an edge (`Out` dst+xfer 8,
 `preds` 4); the backward +2.6 GB, fingerprints' phase peak 40.7 GB. h155's
 BFS marked 371M nodes (the `[bfs]` lines); at h140's 18 edges a node that
 is ~6.7B edges: ~18 GB of nodes + ~80 GB of edges before the backward.
+
+### The mid synthetic win SOLVED by the objects ladder: 142 (2026-10-11)
+
+`search --level r0sxhne,r0sxhe,r0sxe --to 168 --win-at 56..72,104..112
+--level-minus-one 168,5 --cart MOD --concrete-balloon-seeds 0 --prefer
+beam-mid-168.txt` (develop e7e9f78: the minimal push backward, format 14):
+
+| level | forward | arc bound | known route (the beam's f168) |
+|---|---|---|---|
+| r0sxhne | 3.20B states, 2527 s (OOM at 60G at f158; resumed under 95G, peak 71 GB at f159's 199M), 426 GB | 141 (backward 1828 s, anon peak 24.6 GB) | survives every step |
+| r0sxhe | 362k states, 9 s | 142 | survives |
+| r0sxe | 641k states, 9 s | 142 | survives |
+
+The concrete search's depth-first try at the bound f142: a win after 165
+steps (0.1 s). OPTIMAL 142 (`lad168/witness_frame_142.txt`). The 141 of
+`r0sxhne` was the `n` widening (objects' phases and countdowns): dropping
+`n` gives 142; `h` changes nothing. Replay: the minimal cart on a real
+PICO-8 reaches (61, 105) on f142; the mod's own Lua diverges at f114 - two
+jump presses that fire nowhere in the minimal cart (f113, f139) fire from
+the original's jump buffer. With them removed (`mid142-canon.txt`, as
+category_runner's `canon_jumps`) both carts agree on every frame and reach
+(61, 105) on f142.
