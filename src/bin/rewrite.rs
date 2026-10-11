@@ -277,6 +277,16 @@ enum Command {
     /// A finished tree's edges counted against the target layouts of
     /// plans/storage-unify.md (built lids, unified per-region sets, hybrids):
     /// per frame a line, then totals and the persistent structures' reuse.
+    /// TEMPORARY: the tree's edges as target-region bundle blocks in candidate
+    /// orders, bytes raw and with zstd -1 (`storage::orders`).
+    BundleOrders {
+        #[arg(long)]
+        level_dir: String,
+        #[arg(long)]
+        from: u32,
+        #[arg(long)]
+        to: u32,
+    },
     StorageCensus {
         /// The level's tree (the dir holding `frames/` and `edges/`; a search's
         /// `<checkpoint-dir>/levelNN`).
@@ -1267,6 +1277,9 @@ fn main() -> Result<()> {
                 }
                 first = Some(line);
             }
+        }
+        Command::BundleOrders { level_dir, from, to } => {
+            celeste_rust::storage::orders::orders(std::path::Path::new(&level_dir), from, to, cfg.threads())?;
         }
         Command::StorageCensus { level_dir, to, encode } => {
             let encode: Vec<u32> = encode.split(',').filter(|s| !s.is_empty()).map(|s| s.parse()).collect::<Result<_, _>>()?;

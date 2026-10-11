@@ -20,12 +20,14 @@
 //! `runtime2::pos_code`); its id is `(region, entry, cell in region)`.
 
 pub mod bench;
+pub mod bundle;
 pub mod census;
 pub mod convert;
 pub mod decode;
 pub mod edges;
 pub mod marks;
 pub mod meta;
+pub mod orders;
 pub mod unit;
 pub mod visited;
 pub mod wave;
@@ -138,6 +140,41 @@ pub fn id_cell(geo: &Geometry, id: StateId) -> u32 {
 /// An id as text (`r{region}.e{entry}.c{local}`).
 pub fn show_id(id: StateId) -> String {
     format!("r{}.e{}.c{}", id_region(id), id_entry(id), id_local(id))
+}
+
+/// A STATE by what it is: its region (shape index and slot), its exact key
+/// and its cell's index in the region - what the edge files name
+/// (`bundle`) and the backward keys its winning sets by. Sorts by region,
+/// key, cell: region-major, as the edge files are read.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub struct Sk {
+    pub region: u32,
+    pub key: visited::Key,
+    pub local: u8,
+}
+
+impl Sk {
+    /// The state of shape index `shape` with `key` at `cell`.
+    #[inline]
+    pub fn at(geo: &Geometry, shape: u32, key: visited::Key, cell: u32) -> Sk {
+        let (slot, local) = geo.slot_local(cell);
+        Sk { region: region_of(geo, shape, slot), key, local: local as u8 }
+    }
+
+    #[inline]
+    pub fn shape(&self, geo: &Geometry) -> u32 {
+        self.region / geo.slots
+    }
+
+    #[inline]
+    pub fn cell(&self, geo: &Geometry) -> u32 {
+        geo.cell(self.region % geo.slots, self.local as u32)
+    }
+
+    /// As text (`r{region}.{key}.c{local}`).
+    pub fn show(&self) -> String {
+        format!("r{}.{:x}:{:x}.c{}", self.region, self.key.0, self.key.1, self.local)
+    }
 }
 
 #[cfg(test)]

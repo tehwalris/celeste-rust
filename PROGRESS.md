@@ -1,18 +1,55 @@
-# storage-v2 progress log
+# edges-target progress log
 
-Branch `storage-v2` (from `fg-2300` cc83334), worktree /var/tmp/sv2-wt,
-target dir /var/tmp/sv2-target; baseline build of cc83334 in /var/tmp/sv2-base
-(target /var/tmp/sv2-base-target). Plan: plans/storage-v2.md.
+Branch `edges-target` (from `develop` e7e9f78), worktree /var/tmp/tgt-wt,
+target dir /var/tmp/tgt-target, fixtures /var/tmp/tgt-fixtures. Baseline:
+detached worktree /var/tmp/tgt-base at e7e9f78, target /var/tmp/tgt-base-target
+(quick + release), fixtures /var/tmp/tgt-base-fixtures (hard links of the
+shared format-14/edges-5 fixtures). Logs in /var/tmp/tgt-logs.
+(The storage-v2 log that was here is in git history and plans/storage-v2.md.)
 
-- 2026-10-10 (~11:00, clock approximate) Phase 0: read CLAUDE.md, architecture, abstractions, lessons, the research (DESIGNS A-N3); mapped consumers; wrote plans/storage-v2.md. Phase order: 1a position-free keys (old pipeline), 1b storage v2 in one step (ids couple everything), 2 backward streaming + speed, 3 cleanup + measurement.
-- 2026-10-10 (~12:40, clock approximate) Phase 1a DONE (29d8364): position-free row keys. Kept counts identical to fg-2300 on (1,0) f0-62 and (6,2) 100% f0-57; pos graphs identical; fg-2300 trees rekeyed == new trees' ckhash every frame (sets identical); arc gate counts/optimum 33/witness identical; KEY_CHECK clean; suite 172/172. Gates re-pinned (fingerprints only).
-- 2026-10-10 (~12:40, clock approximate) Phase 1b started: src/storage/{mod,visited,meta,unit,edges,wave}.rs drafted (not yet wired).
-- 2026-10-10 (~13:40, clock approximate) Phase 1b first working state (3d8f3c0): storage v2 wired end to end; door/canon/queues/raw records/inversion deleted. Room (1,0) f0-62 kept + ckhash identical to 1a; pinned ckhash/posgraph gates OK; arc gate IDENTICAL (marks, W, optimum 33, witness, known route); quick suite green. Perf not yet tuned: f62 translate 0.75 s + layer 1.8 s (4x duplicate requests), peak RSS 8.2 GB vs 2.9 GB. Next: KEY_CHECK, arc-check, resume/raise/determinism, (6,2) f57, then speed.
-- 2026-10-10 (~14:30, clock approximate) Verified on storage v2: KEY_CHECK (1,0) f0-40; arc-check gate tree f1-35 0 bad; 3 vs 32 threads identical states+edges (1,0) f0-50; resume identical; gates/raise.sh 1,0 55 56 58 OK. Added bench-storage + CELESTE_EMIT_CAPTURE (89f... see git log). Running (6,2) 100% f0-57 + capture of f57.
-- 2026-10-10 (~15:30, clock approximate) (6,2) 100% f0-57 on storage v2: kept, posgraph, ckhash identical to 1a; f57 edges 257,724,013 (= research count). bench-storage replays the f57 capture and reproduces the real ckhash f057 and e057 lines. Room (1,0) --ceiling 99: same optimum 99 + witness + gate counts; 157.8 s vs 205.9 s (fg-2300), user 1527 vs 2694 s, peak 13.8 vs 22.6 GB, disk 57 vs 46 GB. Added claims (dedupe requests across units) + streamed blocks (578fe38). Next: (6,2) full search, edge compression, BFS speed, docs.
-- 2026-10-10 (~16:40, clock approximate) (6,2) 100% full search (r0sxhf,r0sxh, --ceiling 94, --prefer): OPTIMAL 93 same witness, gate counts + kept counts identical both levels; 212 s vs 312 s (fg-2300), user 2884 vs 4206 s, peak 8.9 vs 27.2 GB, disk 70 vs 66 GB. Found+fixed: 100% first-win trigger (reaches_win). Blocks now per-lid with per-unit transfer ranks: 3.68 B/edge. RowCache deleted (bd... see git log). Next: object room (4,2) ladder, arc-check/ref-check at object level, docs, quiet-machine A/B.
-- 2026-10-10 (~17:20, clock approximate) (4,2) r0sxhn,r0sxh --ceiling 71 vs fg-2300: OPTIMAL 71 same witness, gate+kept counts identical (20.3 vs 21.9 s). Storage region S=16 exact too ((6,2) f0-57 kept/ckhash/posgraph identical); bench f57 interleaved x3 at 16 threads: S=8 units 1.17-1.21 s translate 0.16 s edges 3.68 B; S=16 units 1.31-1.33 s translate 0.21-0.22 s edges 3.41 B -> keep 8. Halo bound: 3.80M lids vs 1.68M (unit,key) -> halo saves <=~3% of units (kept wrapped).
-- 2026-10-10 (~17:40, clock approximate) Split-frame gate vs base: counts+witness same; TRIM_ROWS gate identical; KEY_CHECK (4,2) r0sxhn f0-55 clean. Starting quiet-ish A/B measurements.
-- 2026-10-10 (~14:40 real clock) Interleaved A/B vs fg-2300 done (BENCHMARK_DATA): (1,0) h99 128-131 s vs 187-196 s, peak 13.5 vs 21.5 GB, tree 52 vs 46 GB; (6,2) 100% h94 184 s vs 301-326 s, peak 8.9 vs 28 GB, tree 70 vs 66 GB. Then 81ce0df: owner index per frame file (BFS (1,0) 14 -> 2.9 s), batched ladder verdicts (level 1 8.4 -> 4.4 s). All gates/optima/witnesses identical. Running battery3 (determinism, resume, raise, KEY_CHECK, arc-check) + ignored tests on 81ce0df.
-- 2026-10-10 (~14:05 real clock) Disk: sources as a row range of the previous layer's file, owners by lid derived from the owner index at read (parallel scatter, 0.4 s/pass in (1,0)). Trees (1,0) 53 -> 50 GB, (6,2) 71 -> 67 GB (fg-2300 46/66). Quick suite 166/166; arc gate identical; bench-storage f057/e057 reproduced; 3 vs 32 threads + resume identical; ckhash gate OK; raise.sh OK; KEY_CHECK clean; arc-check gate tree 0 bad; (1,0) h99 and (6,2) h94 gate counts/optima/witnesses identical. Object arc-check (4,2) r0sxhn f38-60 still running (>90 min, single-threaded reference engine).
-- 2026-10-10 (~15:20 real clock) Wrap-up: ignored tests 3/3 on fa2b2dc's code; object-level arc-check (4,2) r0sxhn PENDING - stopped after >1.5 h (f38-60 x20) and >40 min (f44-47 x5) without finishing (the reference engine on widened object states; profile all interp). Follow-ups recorded in plans/storage-v2.md (edge file v6 compact lid tables, block compression, the object arc-check).
+## The plan (2026-10-11)
+
+Target end state (the coordinator's brief): edges ID-free, as bundles
+(source key, transfer, offset, target key) -> target-cell mask, stored per
+TARGET region and frame (segments), zstd; the forward routes every emission
+to its target region (dedup and edge insert there: one probe and an OR);
+the backward reads in-edges from target-region blocks, W keyed by state;
+lids, owner index, claims, translation, unit blocks, the v5 format deleted.
+
+Steps:
+1. The block codec (`storage::bundle`): bundles, offsets, per-block key
+   dictionaries, the at-rest order, zstd; round-trip tests.
+2. The edge files and their reader (`storage::edges`, version 6): per
+   frame one file of (target region, segment) blocks and the
+   source-region -> target-region index; scan, in-edges by region,
+   out-edges through the index.
+3. The forward: units emit records into per-target-region chunks
+   (`storage::route`), the region phase dedups and inserts bundles
+   (`storage::region`), the frame end finalizes keys, numbers new entries
+   canonically and DECODES the new layer from (shape, key, cell)
+   (plans/rows-from-keys.md's follow-up). Slices bound the records' memory.
+4. The backward on states (`storage::Sk`: region, key, cell), reading
+   (region, frame) blocks; reach through the index; the concrete search and
+   the known route by Sk.
+5. Consumers (ckhash, arc-check, bench-storage, bench-frame, census), tests,
+   fixtures, gates; deletions; measurements; docs.
+6. State ids (frame files, meta entries, drop notes, raise): a proposal to
+   the coordinator with numbers before any rewrite.
+
+## Log
+- 2026-10-11 ~15:00 Baseline (e7e9f78, base fixtures): t1 all ok (69 s, load 22), t2 all ok (104 s).
+- 2026-10-11 ~15:20 Step 1: `storage::bundle` (codec, order generic, zstd -1), round-trip tests pass.
+  Re-validated the order on REAL trees (temporary `rewrite bundle-orders`: the v5 edges
+  re-stored per (target region, frame) block; B an edge with zstd -1, raw in brackets):
+
+  | tree | edges | edges/bundle | [M o x s t] | [s x o t] relative | [s x o t] | [t s x o] |
+  |---|---|---|---|---|---|---|
+  | r10 f50-56 | 88.4M | 5.59 | 0.099 (0.46) | 0.105 (0.50) | 0.171 | 0.162 |
+  | r42n f55-61 | 57.2M | 5.78 | 0.129 (0.49) | 0.127 (0.57) | 0.241 | 0.189 |
+  | r60s f65-71 | 9.1M | 7.90 | 0.249 (0.61) | 0.236 (0.57) | 0.316 | 0.271 |
+  | r62h57 f52-57 | 1048M | 7.56 | 0.081 (0.35) | 0.075 (0.40) | 0.149 | 0.263 |
+
+  Chosen: [M o x s t], absolute masks - within 0.92-1.06x of the relative masks,
+  and a block decodes alone (relative masks need the previous layer's per-key
+  masks in up to four source regions at every read). Decode ~1-3 ns an edge on
+  one thread (load 20-45).
