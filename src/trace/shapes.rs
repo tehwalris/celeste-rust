@@ -270,12 +270,11 @@ pub fn player_path(st: &State<Symbolic>) -> Option<Path> {
         })
 }
 
-/// The slots the widenings of `r0sx` make INTERVAL inputs
-/// (`widen::interval_input` of the entries no flag but `e` turns off: the
-/// player's `rem.x` and `rem.y`, a live fruit's `y`/`off`; level -1's walk,
-/// which never has `e`), so a kernel expecting
+/// The slots every row of `level` has as INTERVAL inputs
+/// (`widen::interval_input` of `level.boundary()`'s entries: the player's
+/// `rem.x` and `rem.y`, a live fruit's `y`/`off` unless `e`), so a kernel expecting
 /// `num` binds. Found by `type`, not by index: which object is the player
 /// changes within a room.
-pub fn ival_paths(st: &State<Symbolic>) -> Vec<Path> {
-    super::widen::slots_where(st, crate::abstraction::Level::EXACT, super::widen::interval_input)
+pub fn ival_paths(st: &State<Symbolic>, level: crate::abstraction::Level) -> Vec<Path> {
+    super::widen::slots_where(st, level.boundary(), super::widen::interval_input)
 }

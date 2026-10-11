@@ -396,7 +396,7 @@ impl<'a> Table<'a> {
             bounds.insert(p.clone(), self.shapes[id].ranges[&p]);
             ival.push(p);
         }
-        for p in super::shapes::ival_paths(&st).into_iter().chain(self.lw.ival_extra.get(&key).into_iter().flatten().cloned()) {
+        for p in super::shapes::ival_paths(&st, self.lw.opts).into_iter().chain(self.lw.ival_extra.get(&key).into_iter().flatten().cloned()) {
             if !pins.contains_key(&p) && !ival.contains(&p) {
                 ival.push(p);
             }
@@ -1588,12 +1588,24 @@ impl Graph1 {
     }
 }
 
+/// The level the table's lattice walk runs at: held buttons unknown, and
+/// the strawberries EXACT (`e`) where the start room has more than one -
+/// their bob's band around `start` cannot be built there (plans/map-mod.md);
+/// every room of the original map has at most one, so its tables are the
+/// same as before.
+fn walk_level(root: &FsPath, s: &crate::settings::Settings) -> Result<crate::abstraction::Level> {
+    let cart = s.cart_data_in(root)?;
+    let (rx, ry) = s.room;
+    let fruits = (0..16i16).flat_map(|tx| (0..16i16).map(move |ty| (tx, ty))).filter(|&(tx, ty)| cart.mget_whole(rx * 16 + tx, ry * 16 + ty) == 26).count();
+    Ok(crate::abstraction::Level { held: true, exact_fruit: fruits > 1, ..crate::abstraction::Level::EXACT })
+}
+
 /// The table: lattice walk, spawn chain, passes to inductive ranges, d.
 fn build(root: &FsPath, spd_px: i32, threads: usize, rep: &mut String, s: &crate::settings::Settings) -> Result<Built> {
     let t_all = std::time::Instant::now();
     let room0 = s.room;
     let walk = super::kernel::Walk { settings: s, only: None };
-    let lw = super::kernel::room_constant_lattice(root, crate::abstraction::Level { held: true, ..crate::abstraction::Level::EXACT }, &walk)?;
+    let lw = super::kernel::room_constant_lattice(root, walk_level(root, s)?, &walk)?;
     say!(rep, "room {room0:?}: lattice walk {} shapes, {:.1} s", lw.lattice.len(), t_all.elapsed().as_secs_f64())?;
     let mut tr = lw.tracer.clone();
     let mut table = Table {
