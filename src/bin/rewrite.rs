@@ -138,6 +138,28 @@ enum Command {
         #[arg(long)]
         horizon: u32,
     },
+    /// A BEAM SEARCH for ANY route out of the start room (search::beam):
+    /// exact concrete states (the reference engine, every input), the
+    /// `width` best a frame by level -1's d (give `--level-minus-one H,S`),
+    /// a dash, height, speed. Its route is REAL but NOT PROVEN OPTIMAL, and
+    /// no route proves nothing. Writes the inputs to `--out`.
+    Beam {
+        /// States kept a frame.
+        #[arg(long, default_value_t = 10000)]
+        width: usize,
+        /// At most this many kept states at one player cell (0: no cap).
+        #[arg(long, default_value_t = 0)]
+        per_cell: usize,
+        /// Give up after this many frames.
+        #[arg(long, default_value_t = 400)]
+        max_frames: u32,
+        /// The level the level -1 table's shapes are keyed at (the forward's).
+        #[arg(long, value_parser = Level::parse, default_value = "r0sxhn")]
+        level: Level,
+        /// The route's inputs, comma-separated, one line.
+        #[arg(long)]
+        out: Option<String>,
+    },
     /// ONE forward pass at ONE level, exactly as the search runs it, with the
     /// per-frame timing line. The profiling entry point for the forward.
     Forward {
@@ -882,6 +904,20 @@ fn main() -> Result<()> {
                     return Ok(());
                 }
                 prev = Some((s.arc_marks.expect("asked for"), lvl));
+            }
+        }
+        Command::Beam { width, per_cell, max_frames, level, out } => {
+            let args = celeste_rust::search::beam::BeamArgs { width, per_cell, max_frames, level };
+            println!("[beam] NOT A PROOF: a route found here is real but NOT proven optimal; none found proves nothing");
+            match celeste_rust::search::beam::beam(&args, &cfg)? {
+                Some(r) => {
+                    let line = r.inputs.iter().map(|b| b.to_string()).collect::<Vec<_>>().join(",");
+                    println!("beam route: exits on frame {} (NOT proven optimal); inputs {line}", r.inputs.len());
+                    if let Some(p) = out {
+                        std::fs::write(&p, format!("{line}\n"))?;
+                    }
+                }
+                None => println!("beam: no route within {max_frames} frames (proves nothing)"),
             }
         }
         Command::CheckKnown { checkpoint_dir, level, inputs, horizon } => {

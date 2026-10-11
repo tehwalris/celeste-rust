@@ -1142,14 +1142,14 @@ pub(super) fn concrete_engines(n: usize, run: &crate::settings::Settings) -> any
 /// order, which the search's exact dedup would drop: skipping it changes
 /// nothing but the step count.
 #[derive(Default)]
-struct Covered(Vec<(u8, u8)>);
+pub(super) struct Covered(Vec<(u8, u8)>);
 
 impl Covered {
-    fn covers(&self, byte: u8) -> bool {
+    pub(super) fn covers(&self, byte: u8) -> bool {
         self.0.iter().any(|&(b, read)| (b ^ byte) & read == 0)
     }
 
-    fn push(&mut self, byte: u8, read: u8) {
+    pub(super) fn push(&mut self, byte: u8, read: u8) {
         self.0.push((byte, read));
     }
 }
