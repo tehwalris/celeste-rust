@@ -10,7 +10,16 @@
 //! and, for the placement, v4: (source key, target shape + key, transfer,
 //! offset) -> mask over SOURCE cells, in the SOURCE region (no partition in a
 //! forward: its units are source runs; here the batches are built by the same
-//! partition, reported apart).
+//! partition, reported apart), and v5 (source key, offset, transfer, target
+//! key) in the target region.
+//!
+//! Then `sweep:16`: EVERY order of (s, t, x, o), and each after the mask
+//! (`M`: bundles grouped by identical mask), on each placement's last run;
+//! the best three target-side orders also with masks RELATIVE to the
+//! source entry's frontier mask (shifted by the offset and clipped to the
+//! region; `ref_mask`); every block decoded back. `push:T`: the backward's
+//! reads from each placement's best blocks - every edge, and the in-edges
+//! of a sample of changed targets.
 //! each in two encodings per unit block: E1 the trie with raw key values (a
 //! level byte - the first field that changed - its delta, the later fields
 //! raw), E2 the same with each key field a rank into the block's sorted key
@@ -121,50 +130,60 @@ struct Scratch { tab: Vec<H>, et: Vec<KE>, gen: u32, tup: Vec<([u64; 4], u64)>, 
 /// The fields of a variant's order: (target, source, transfer << 32 | off).
 #[inline] fn fields(v: usize, t: u64, s: u64, xo: u64) -> [u64; 4] {
     let (x, off) = (xo >> 32, xo & 0xffff_ffff);
-    match v { 1 => [t, x, s, off], 2 => [t, s, x, off], 3 => [s, x, t, off], _ => [s, t, x, off] }
+    match v { 1 => [t, x, s, off], 2 => [t, s, x, off], 3 => [s, x, t, off], 4 => [s, t, x, off], _ => [s, off, x, t] }
 }
 /// Which fields are the target and the source key.
-fn key_fields(v: usize) -> (usize, usize) { match v { 1 => (0, 2), 2 => (0, 1), 3 => (2, 0), _ => (1, 0) } }
+fn key_fields(v: usize) -> (usize, usize) { match v { 1 => (0, 2), 2 => (0, 1), 3 => (2, 0), 4 => (1, 0), _ => (3, 0) } }
 /// The transfer's field.
-fn x_field(v: usize) -> usize { match v { 2 | 4 => 2, _ => 1 } }
+fn x_field(v: usize) -> usize { match v { 2 | 4 | 5 => 2, _ => 1 } }
+/// The offset's field.
+fn off_field(v: usize) -> usize { if v == 5 { 1 } else { 3 } }
 
-/// One trie record: the level (first changed field), its delta, the later
-/// fields raw (the offset as its byte); then the mask.
+/// Level-byte flags of a relative-mask block: the mask is the reference;
+/// the mask is an explicit u64 (no reference).
+const EQ: u8 = 0x80;
+const RAW: u8 = 0x40;
+
+/// One trie record: the level (first changed field) with `flags`, its delta,
+/// the later fields raw (the offset as its byte). The mask follows (the caller's).
 #[inline]
-fn put_rec(o: &mut Vec<u8>, prev: &mut Option<[u64; 4]>, f: &[u64; 4], mask: u64) {
+fn put_rec(o: &mut Vec<u8>, prev: &mut Option<[u64; 4]>, f: &[u64; 4], offi: usize, flags: u8) {
     let l = match prev { None => 0, Some(p) => (0..4).find(|&i| f[i] != p[i]).unwrap() };
-    o.push(l as u8);
+    o.push(l as u8 | flags);
     for i in l..4 {
-        if i == 3 { put_off(o, f[3] as u32); }
+        if i == offi { put_off(o, f[i] as u32); }
         else if i == l && prev.is_some() { varint(o, f[i] - prev.unwrap()[i]); }
         else { varint(o, f[i]); }
     }
-    o.extend_from_slice(&mask.to_le_bytes());
     *prev = Some(*f);
 }
 
-fn get_rec(b: &[u8], i: &mut usize, prev: &mut [u64; 4], first: bool) -> u64 {
-    let l = b[*i] as usize; *i += 1;
+/// A record's fields into `prev`; its flags.
+fn get_rec(b: &[u8], i: &mut usize, prev: &mut [u64; 4], first: bool, offi: usize) -> u8 {
+    let lb = b[*i]; *i += 1;
+    let l = (lb & 3) as usize;
     for k in l..4 {
-        if k == 3 { prev[3] = get_off(b, i) as u64; }
+        if k == offi { prev[k] = get_off(b, i) as u64; }
         else if k == l && !first { prev[k] += get_varint(b, i); }
         else { prev[k] = get_varint(b, i); }
     }
-    let m = u64::from_le_bytes(b[*i..*i + 8].try_into().unwrap()); *i += 8;
-    m
+    lb & 0xc0
 }
 
+#[inline] fn get_u64(b: &[u8], i: &mut usize) -> u64 { let m = u64::from_le_bytes(b[*i..*i + 8].try_into().unwrap()); *i += 8; m }
+
 /// The table's entries as a sorted trie in order `v`: E1 into `enc1`, E2
-/// into `enc2`; the nanoseconds of (collect + sort + E1, E2).
+/// into `enc2` (u64 masks); the nanoseconds of (collect + sort + E1, E2).
 fn encode(s: &mut Scratch, cap: usize, v: usize) -> (u64, u64, u64) {
     let t0 = Instant::now();
+    let offi = off_field(v);
     s.tup.clear();
     for e in &s.et[..cap] { if e.gen == s.gen { s.tup.push((fields(v, e.t, e.s, e.xo), e.mask)); } }
     s.tup.sort_unstable_by_key(|x| x.0);
     s.enc1.clear();
     varint(&mut s.enc1, s.tup.len() as u64);
     let mut prev = None;
-    for (f, m) in &s.tup { put_rec(&mut s.enc1, &mut prev, f, *m); }
+    for (f, m) in &s.tup { put_rec(&mut s.enc1, &mut prev, f, offi, 0); s.enc1.extend_from_slice(&m.to_le_bytes()); }
     let t1 = t0.elapsed().as_nanos() as u64;
     let t0 = Instant::now();
     let (ti, si) = key_fields(v);
@@ -178,26 +197,183 @@ fn encode(s: &mut Scratch, cap: usize, v: usize) -> (u64, u64, u64) {
         let mut g = *f;
         g[ti] = s.td.binary_search(&f[ti]).unwrap() as u64;
         g[si] = s.sd.binary_search(&f[si]).unwrap() as u64;
-        put_rec(&mut s.enc2, &mut prev, &g, *m);
+        put_rec(&mut s.enc2, &mut prev, &g, offi, 0);
+        s.enc2.extend_from_slice(&m.to_le_bytes());
     }
     (t1, t0.elapsed().as_nanos() as u64, s.tup.len() as u64)
+}
+
+/// The frontier: per (source region, key) the entry's cells in the frame's
+/// sources (the layer before).
+type Front = FxHashMap<(u32, u64), u64>;
+
+/// A bundle's REFERENCE mask: its source entry's frontier cells - in the
+/// target region (`!source_side`), shifted by the offset into this region's
+/// cells and clipped to them (the source cells may lie in up to four source
+/// regions: one lookup each); in the source region, the entry's own.
+/// `None` where an offset code names no shift (`NO_CELL`).
+fn ref_mask(front: &Front, source_side: bool, home_slot: u32, s: u64, off: u32) -> Option<u64> {
+    let (sh, key) = ((s >> SK) as u32, s & ((1 << SK) - 1));
+    if source_side { return front.get(&(sh * SLOTS + home_slot, key)).copied(); }
+    if off >= 1 << 22 || home_slot == SLOTS - 1 { return None; }
+    let (dx, dy) = ((off >> 11) as i32 - 1024, (off & 2047) as i32 - 1024);
+    let (tx0, ty0) = ((home_slot % 64) as i32 * 8, (home_slot / 64) as i32 * 8);
+    let (sx0, sy0) = (tx0 - dx, ty0 - dy);
+    let mut r = 0u64;
+    for sry in sy0.div_euclid(8)..=(sy0 + 7).div_euclid(8) {
+        for srx in sx0.div_euclid(8)..=(sx0 + 7).div_euclid(8) {
+            if !(0..64).contains(&srx) || !(0..64).contains(&sry) { continue; }
+            let Some(&m) = front.get(&(sh * SLOTS + (sry * 64 + srx) as u32, key)) else { continue };
+            let shc = sx0 - srx * 8;
+            for ly in 0..8 {
+                let gy = sy0 + ly;
+                if gy.div_euclid(8) != sry { continue; }
+                let row = (m >> ((gy - sry * 8) * 8)) & 0xff;
+                let tb = if shc >= 0 { row >> shc } else { (row << -shc) & 0xff };
+                r |= tb << (ly * 8);
+            }
+        }
+    }
+    Some(r)
+}
+
+/// `m` over `r`'s set bits, as `ceil(popcount(r) / 8)` bytes.
+fn put_rel(o: &mut Vec<u8>, r: u64, m: u64) {
+    let k = r.count_ones() as usize;
+    let (mut bits, mut j, mut rr) = (0u64, 0, r);
+    while rr != 0 { let c = rr.trailing_zeros(); rr &= rr - 1; if m >> c & 1 == 1 { bits |= 1 << j; } j += 1; }
+    o.extend_from_slice(&bits.to_le_bytes()[..k.div_ceil(8)]);
+}
+fn get_rel(b: &[u8], i: &mut usize, r: u64) -> u64 {
+    let k = r.count_ones() as usize;
+    let n = k.div_ceil(8);
+    let mut w = [0u8; 8]; w[..n].copy_from_slice(&b[*i..*i + n]); *i += n;
+    let bits = u64::from_le_bytes(w);
+    let (mut m, mut j, mut rr) = (0u64, 0, r);
+    while rr != 0 { let c = rr.trailing_zeros(); rr &= rr - 1; if bits >> j & 1 == 1 { m |= 1 << c; } j += 1; }
+    m
 }
 
 /// Decode a block of order `v` (`e2`: with its dictionaries) to
 /// `f(target key, source key, transfer, offset, mask)`.
 fn decode(b: &[u8], v: usize, e2: bool, mut f: impl FnMut(u64, u64, u64, u32, u64)) {
     let mut i = 0;
-    let (ti, si) = key_fields(v);
+    let (ti, si, xi, offi) = { let (a, c) = key_fields(v); (a, c, x_field(v), off_field(v)) };
     let mut dicts: [Vec<u64>; 2] = [Vec::new(), Vec::new()];
     if e2 { for d in dicts.iter_mut() { let n = get_varint(b, &mut i); let mut p = 0u64; for _ in 0..n { p += get_varint(b, &mut i); d.push(p); } } }
     let n = get_varint(b, &mut i);
     let mut prev = [0u64; 4];
     for k in 0..n {
-        let m = get_rec(b, &mut i, &mut prev, k == 0);
+        get_rec(b, &mut i, &mut prev, k == 0, offi);
         let (mut t, mut s) = (prev[ti], prev[si]);
         if e2 { t = dicts[0][t as usize]; s = dicts[1][s as usize]; }
-        let x = prev[x_field(v)];
-        f(t, s, x, prev[3] as u32, m);
+        let m = get_u64(b, &mut i);
+        f(t, s, prev[xi], prev[offi] as u32, m);
+    }
+    assert_eq!(i, b.len(), "a block did not decode to its end");
+}
+
+/// A field of a block's sort ORDER: source key, target key, transfer,
+/// offset, mask.
+#[derive(Clone, Copy, PartialEq, Debug)] enum F { S, T, X, O, M }
+/// A bundle: target key, source key, transfer, offset, mask.
+type Tup = [u64; 5];
+fn fidx(f: F) -> usize { match f { F::T => 0, F::S => 1, F::X => 2, F::O => 3, F::M => 4 } }
+fn order_name(o: &[F]) -> String { o.iter().map(|f| match f { F::S => "s", F::T => "t", F::X => "x", F::O => "o", F::M => "M" }).collect::<Vec<_>>().join(" ") }
+
+/// Every order: the 24 permutations of (s, t, x, o) with the mask last, and
+/// each after the mask (bundles grouped by identical mask first).
+fn all_orders() -> Vec<Vec<F>> {
+    let base = [F::S, F::T, F::X, F::O];
+    let mut perms = Vec::new();
+    for a in 0..4 { for b in 0..4 { for c in 0..4 { for d in 0..4 {
+        let i = [a, b, c, d];
+        if (0..4).all(|k| (0..4).filter(|&j| i[j] == k).count() == 1) { perms.push(i.iter().map(|&k| base[k]).collect::<Vec<F>>()); }
+    } } } }
+    let mut out = perms.clone();
+    out.extend(perms.into_iter().map(|p| { let mut v = vec![F::M]; v.extend(p); v }));
+    out
+}
+
+/// A block of `tups` in `order` (the state study's form: sorted, the keys as
+/// ranks into the block's sorted dictionaries, a trie record per bundle - a
+/// level byte, the first changed field's delta, the later fields raw, the
+/// offset a byte, the mask a u64 - the mask last unless the order has it).
+/// `rel` (the mask last): masks RELATIVE to their reference (`ref_mask`):
+/// `EQ` where equal, the bits over its cells, `RAW` + u64 without one.
+/// Returns the block and (equal, relative, raw, violations).
+fn encode_order(tups: &[Tup], order: &[F], rel: Option<(&Front, bool, u32)>) -> (Vec<u8>, [u64; 4]) {
+    let mut td: Vec<u64> = tups.iter().map(|x| x[0]).collect(); td.sort_unstable(); td.dedup();
+    let mut sd: Vec<u64> = tups.iter().map(|x| x[1]).collect(); sd.sort_unstable(); sd.dedup();
+    let mut r: Vec<(Vec<u64>, usize)> = tups.iter().enumerate().map(|(k, x)| {
+        let ranked = [td.binary_search(&x[0]).unwrap() as u64, sd.binary_search(&x[1]).unwrap() as u64, x[2], x[3], x[4]];
+        (order.iter().map(|&f| ranked[fidx(f)]).collect(), k)
+    }).collect();
+    r.sort_unstable();
+    let mut o = Vec::with_capacity(tups.len() * 12);
+    for d in [&td, &sd] { varint(&mut o, d.len() as u64); let mut p = 0u64; for &k in d.iter() { varint(&mut o, k - p); p = k; } }
+    varint(&mut o, r.len() as u64);
+    let has_m = order.contains(&F::M);
+    let mut st = [0u64; 4];
+    let mut prev: Option<&Vec<u64>> = None;
+    for (vals, k) in &r {
+        let l = match prev { None => 0, Some(p) => (0..vals.len()).find(|&i| vals[i] != p[i]).unwrap() };
+        let m = tups[*k][4];
+        // The mask's form, decided before the level byte that flags it.
+        let (flags, payload) = match (has_m, rel) {
+            (true, _) | (false, None) => (0u8, None),
+            (false, Some((front, side, slot))) => match ref_mask(front, side, slot, tups[*k][1], tups[*k][3] as u32) {
+                Some(rm) if m & !rm == 0 => if m == rm { st[0] += 1; (EQ, Some(None)) } else { st[1] += 1; (0, Some(Some(rm))) },
+                rm => { st[2] += 1; if rm.is_some() { st[3] += 1; } (RAW, None) }
+            },
+        };
+        o.push(l as u8 | flags);
+        for i in l..vals.len() {
+            match order[i] {
+                F::O => put_off(&mut o, vals[i] as u32),
+                F::M => o.extend_from_slice(&vals[i].to_le_bytes()),
+                _ => if i == l && prev.is_some() { varint(&mut o, vals[i] - prev.unwrap()[i]) } else { varint(&mut o, vals[i]) },
+            }
+        }
+        if !has_m {
+            match payload { Some(None) => {}, Some(Some(rm)) => put_rel(&mut o, rm, m), None => o.extend_from_slice(&m.to_le_bytes()) }
+        }
+        prev = Some(vals);
+    }
+    (o, st)
+}
+
+/// `encode_order` inverted: `f` per bundle (raw keys).
+fn decode_order(b: &[u8], order: &[F], rel: Option<(&Front, bool, u32)>, mut f: impl FnMut(&Tup)) {
+    let mut i = 0;
+    let mut dicts: [Vec<u64>; 2] = [Vec::new(), Vec::new()];
+    for d in dicts.iter_mut() { let n = get_varint(b, &mut i); let mut p = 0u64; for _ in 0..n { p += get_varint(b, &mut i); d.push(p); } }
+    let n = get_varint(b, &mut i);
+    let has_m = order.contains(&F::M);
+    let mut vals = [0u64; 5];
+    for k in 0..n {
+        let lb = b[i]; i += 1;
+        let l = (lb & 7) as usize;
+        for j in l..order.len() {
+            vals[j] = match order[j] {
+                F::O => get_off(b, &mut i) as u64,
+                F::M => get_u64(b, &mut i),
+                _ => if j == l && k > 0 { vals[j] + get_varint(b, &mut i) } else { get_varint(b, &mut i) },
+            };
+        }
+        let mut t: Tup = [0; 5];
+        for (j, &fl) in order.iter().enumerate() { t[fidx(fl)] = vals[j]; }
+        t[0] = dicts[0][t[0] as usize]; t[1] = dicts[1][t[1] as usize];
+        if !has_m {
+            t[4] = match rel {
+                None => get_u64(b, &mut i),
+                Some((front, side, slot)) => if lb & RAW != 0 { get_u64(b, &mut i) } else {
+                    let rm = ref_mask(front, side, slot, t[1], t[3] as u32).expect("a relative mask without a reference");
+                    if lb & EQ != 0 { rm } else { get_rel(b, &mut i, rm) }
+                },
+            };
+        }
+        f(&t);
     }
     assert_eq!(i, b.len(), "a block did not decode to its end");
 }
@@ -340,17 +516,18 @@ pub fn idfree(mut d: Data, args: &[String]) {
     let mut out: Vec<IE> = vec![IE::default(); ems.len()];
     let arena = |n: usize| Arena { buf: vec![0u8; n], at: AtomicUsize::new(0) };
     let mut plans: FxHashMap<(bool, usize), Plan> = FxHashMap::default();
-    // The last run of each order: its blocks (for the check and the access) and units.
-    let mut kept: FxHashMap<usize, Kept> = FxHashMap::default();
-    let mut last_split = 0usize;
+    let front: Front = d.regions.iter().flat_map(|r| { let rid = d_region_id(r); r.keys.iter().zip(&r.front).filter(|(_, &m)| m != 0).map(move |(&k, &m)| ((rid, k), m)) }).collect();
+    // Per placement (source side?), its last run's bundles.
+    let mut placed: FxHashMap<bool, Placed> = FxHashMap::default();
+    let mut checked: Vec<usize> = Vec::new();
     for run in args {
         let w: Vec<&str> = run.split(':').collect();
         let threads: usize = w[1].parse().unwrap();
-        if w[0] == "access" { access(&d, &plans[&(false, last_split)], &kept, threads); continue; }
-        let v: usize = match w[0] { "dedup" => 0, "v1" => 1, "v2" => 2, "v3" => 3, "v4" => 4, m => panic!("mode {m}") };
+        if w[0] == "sweep" { for pl in placed.values_mut() { sweep(pl, &front); } continue; }
+        if w[0] == "push" { push(&d, &placed, &front, threads); continue; }
+        let v: usize = match w[0] { "dedup" => 0, "v1" => 1, "v2" => 2, "v3" => 3, "v4" => 4, "v5" => 5, m => panic!("mode {m}") };
         let split: usize = w[2].parse().unwrap();
         let by_source = v == 4;
-        if !by_source { last_split = split; }
         if !plans.contains_key(&(by_source, split)) {
             let tp = Instant::now();
             let mut cnt = vec![0usize; d.regions.len()];
@@ -375,7 +552,7 @@ pub fn idfree(mut d: Data, args: &[String]) {
         }
         let p = &plans[&(by_source, split)];
         let nu = p.unit_region.len();
-        let (a1, a2) = if v > 0 { (arena(d.n_edges as usize * 6), arena(d.n_edges as usize * 3)) } else { (arena(0), arena(0)) };
+        let (a1, a2) = if v > 0 { (arena(d.n_edges as usize * 4), arena(d.n_edges as usize * 5 / 2)) } else { (arena(0), arena(0)) };
         for a in [&a1, &a2] { let ptr = a.buf.as_ptr() as *mut u8; for o in (0..a.buf.len()).step_by(4096) { unsafe { ptr.add(o).write(1) }; } }
         let mut scr: Vec<Scratch> = (0..threads).map(|_| Scratch { tab: Vec::with_capacity(1 << 22), et: vec![KE::default(); 1 << 18], gen: 0, tup: Vec::with_capacity(1 << 20), enc1: Vec::with_capacity(1 << 24), enc2: Vec::with_capacity(1 << 24), td: Vec::new(), sd: Vec::new() }).collect();
         crate::perf_on(true);
@@ -411,9 +588,13 @@ pub fn idfree(mut d: Data, args: &[String]) {
             if v > 0 { format!("; {nb} bundles, in memory 40 B an entry: {:.2} B an edge dense, {:.2} at the tables' final sizes; blocks E1 {:.3} E2 {:.3} B an edge", 40.0 * nb as f64 / e, tcap as f64 / e, b1 as f64 / e, b2 as f64 / e) } else { String::new() },
             load.split_whitespace().next().unwrap_or("?"));
         if v > 0 {
-            if !kept.contains_key(&v) { check(&d, p, v, &a1, &a2, &outs, &key_index, &dense); }
+            if !checked.contains(&v) { check(&d, p, v, &a1, &a2, &outs, &key_index, &dense); checked.push(v); }
+            // The placement's bundles, for the sweep and the push (untimed).
+            let tups: Vec<Vec<Tup>> = outs.iter().map(|o| { let mut t = Vec::new(); decode(&a2.buf[o.b2.0..o.b2.0 + o.b2.1], v, true, |tk, sk, x, off, m| t.push([tk, sk, x, off as u64, m])); t }).collect();
+            let slots = p.unit_region.iter().map(|&r| d.regions[r as usize].slot).collect();
+            let shapes = p.unit_region.iter().map(|&r| d.regions[r as usize].shape).collect();
             let _ = starts;
-            kept.insert(v, Kept { a1, a2, outs, unit_region: p.unit_region.clone() });
+            placed.insert(by_source, Placed { source_side: by_source, slots, shapes, tups, edges: d.n_edges, best: None });
         }
     }
 }
@@ -462,69 +643,128 @@ fn check(d: &Data, p: &Plan, v: usize, a1: &Arena, a2: &Arena, outs: &[UOut], ke
         t[1], t[0], ok(t[0], t[1]), t[3], t[2], ok(t[2], t[3]), a1.at.load(Ordering::Relaxed) as f64 / e, t[4] as f64 / e, a2.at.load(Ordering::Relaxed) as f64 / e, t[5] as f64 / e, tv.elapsed().as_secs_f64());
 }
 
-/// A run's blocks kept for the access pass.
-struct Kept { a1: Arena, a2: Arena, outs: Vec<UOut>, unit_region: Vec<u32> }
+/// A placement's bundles after its last run (decoded from its blocks,
+/// untimed), per unit with its home region's slot and shape.
+struct Placed { source_side: bool, slots: Vec<u32>, shapes: Vec<u32>, tups: Vec<Vec<Tup>>, edges: u64, best: Option<(Vec<F>, bool, Vec<Vec<u8>>)> }
 
-/// The backward's read, a batched region pass: every block of each kept
-/// order decoded per in-edge to (source key + cell, transfer) (v4: per
-/// out-edge to (target key + cell, transfer)); then, for the target-side
-/// orders, the same with W KEYED BY STATE - a probe of the unit's in-core
-/// table (target key -> its W slots) per bundle whose target key changed.
-fn access(d: &Data, p: &Plan, kept: &FxHashMap<usize, Kept>, threads: usize) {
-    // Per target unit its in-core table of target keys (untimed): its entries.
-    let tv = kept.keys().copied().filter(|&v| v < 4).min();
-    let tabs: Vec<(Vec<H>, usize)> = match tv { None => Vec::new(), Some(tv) => (0..p.unit_region.len()).map(|u| {
-        let rest = &p.rest[u];
-        let mut i = 0; let n = get_varint(rest, &mut i) as usize;
-        let mut keys: Vec<u64> = Vec::with_capacity(n);
-        let mut k = 0u64; for _ in 0..n { k += get_varint(rest, &mut i); i += 8; keys.push(k); }
-        let kp = &kept[&tv];
-        let (o, l) = kp.outs[u].b1;
-        decode(&kp.a1.buf[o..o + l], tv, false, |t, _, _, _, _| keys.push(t));
-        keys.sort_unstable(); keys.dedup();
-        let cap = (keys.len() * 2).next_power_of_two().max(16);
-        let mut tab = vec![H { key: EMPTY, m: 0, nm: 0, lid: 0 }; cap];
-        for (j, &k) in keys.iter().enumerate() { let q = crate::edgebundle::hslot(&tab, cap - 1, k); tab[q] = H { key: k, m: 0, nm: 0, lid: j as u32 }; }
-        (tab, cap - 1)
-    }).collect() };
-    let mut vs: Vec<usize> = kept.keys().copied().collect(); vs.sort();
-    for v in vs {
-        let kp = &kept[&v];
-        for (enc, a) in [("E1", &kp.a1), ("E2", &kp.a2)] {
-            for probe in if v == 4 { vec![false] } else { vec![false, true] } {
-                let next = AtomicUsize::new(0);
-                let t = Instant::now();
-                let res: Vec<(u64, u64, u64)> = std::thread::scope(|sc| {
-                    let hs: Vec<_> = (0..threads).map(|_| { let (next, tabs) = (&next, &tabs); sc.spawn(move || {
-                        let (mut n, mut acc, mut probes) = (0u64, 0u64, 0u64);
-                        loop {
-                            let u = next.fetch_add(1, Ordering::Relaxed); if u >= kp.outs.len() { break; }
-                            let reg = &d.regions[kp.unit_region[u] as usize];
-                            let (o, l) = if enc == "E1" { kp.outs[u].b1 } else { kp.outs[u].b2 };
-                            let (mut last_t, mut slot) = (u64::MAX, 0u32);
-                            decode(&a.buf[o..o + l], v, enc == "E2", |tk, s, x, off, m| {
-                                if probe && tk != last_t { let q = crate::edgebundle::hslot(&tabs[u].0, tabs[u].1, tk); slot = tabs[u].0[q].lid; last_t = tk; probes += 1; }
-                                let mut mm = m;
-                                while mm != 0 {
-                                    let bit = mm.trailing_zeros(); mm &= mm - 1;
-                                    let (other, oc) = if v == 4 { (tk, fwd(cell_of(reg.slot, bit), off)) } else { (s, back(cell_of(reg.slot, bit), off)) };
-                                    acc = acc.wrapping_add(other ^ (oc as u64) << 7 ^ x ^ (slot as u64) << 40 ^ bit as u64);
-                                    n += 1;
-                                }
-                            });
-                        }
-                        (n, acc, probes)
-                    }) }).collect();
-                    hs.into_iter().map(|h| h.join().unwrap()).collect()
-                });
-                let wall = t.elapsed().as_secs_f64();
-                let n: u64 = res.iter().map(|r| r.0).sum();
-                let probes: u64 = res.iter().map(|r| r.2).sum();
-                std::hint::black_box(res.iter().fold(0u64, |a, r| a ^ r.1));
-                println!("    ACCESS v{v} {enc} {threads:>2} threads{}: {n} {} in {wall:.3} s ({:.2} ns an edge)",
-                    if probe { format!(" + W keyed by state ({probes} target-key probes)") } else { String::new() },
-                    if v == 4 { "out-edges to (target key + cell, transfer)" } else { "in-edges to (source key + cell, transfer)" }, wall * 1e9 / n.max(1) as f64);
+fn tup_hash(t: &Tup) -> u64 { t.iter().fold(0x51ed_270b_27a4_c7b1u64, |a, &x| crate::bits::mix64(a ^ x).wrapping_add(x)) }
+
+/// Every order (and the relative masks in the best three of the target side)
+/// on a placement's bundles: B an edge raw and with zstd -1 per unit block,
+/// each block decoded back to its bundles (an order-free hash); the best
+/// encoding's blocks kept.
+fn sweep(pl: &mut Placed, front: &Front) {
+    let ts = Instant::now();
+    let e = pl.edges as f64;
+    let want: Vec<u64> = pl.tups.iter().map(|v| v.iter().fold(0u64, |a, t| a.wrapping_add(tup_hash(t)))).collect();
+    let run = |order: &[F], rel: bool, keep: bool| -> (u64, u64, [u64; 4], Vec<Vec<u8>>) {
+        let next = AtomicUsize::new(0);
+        let res: Vec<(u64, u64, [u64; 4], Vec<(usize, Vec<u8>)>)> = std::thread::scope(|sc| {
+            let hs: Vec<_> = (0..16).map(|_| { let (next, want, pl) = (&next, &want, &*pl); sc.spawn(move || {
+                let (mut raw, mut z, mut st, mut kept) = (0u64, 0u64, [0u64; 4], Vec::new());
+                loop {
+                    let u = next.fetch_add(1, Ordering::Relaxed); if u >= pl.tups.len() { break; }
+                    let rl = rel.then_some((front, pl.source_side, pl.slots[u]));
+                    let (b, s4) = encode_order(&pl.tups[u], order, rl);
+                    for k in 0..4 { st[k] += s4[k]; }
+                    raw += b.len() as u64; z += zstd::bulk::compress(&b, 1).unwrap().len() as u64;
+                    let mut h = 0u64;
+                    decode_order(&b, order, rl, |t| h = h.wrapping_add(tup_hash(t)));
+                    assert_eq!(h, want[u], "order {}: unit {u} decodes to other bundles", order_name(order));
+                    if keep { kept.push((u, b)); }
+                }
+                (raw, z, st, kept)
+            }) }).collect();
+            hs.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+        let (mut raw, mut z, mut st) = (0u64, 0u64, [0u64; 4]);
+        let mut blocks: Vec<Vec<u8>> = vec![Vec::new(); pl.tups.len()];
+        for (r, zz, s4, kept) in res { raw += r; z += zz; for k in 0..4 { st[k] += s4[k]; } for (u, b) in kept { blocks[u] = b; } }
+        (raw, z, st, blocks)
+    };
+    let side = if pl.source_side { "source" } else { "target" };
+    let mut rows: Vec<(f64, f64, String, Vec<F>)> = Vec::new();
+    for o in all_orders() { let (raw, z, _, _) = run(&o, false, false); rows.push((z as f64 / e, raw as f64 / e, order_name(&o), o)); }
+    rows.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+    println!("    SWEEP {side} region ({} orders, every block decoded back: OK; {:.0} s): B an edge raw / zstd -1, best first:", rows.len(), ts.elapsed().as_secs_f64());
+    for ch in rows.chunks(4) { println!("      {}", ch.iter().map(|r| format!("[{}] {:.3} / {:.3}", r.2, r.1, r.0)).collect::<Vec<_>>().join("   ")); }
+    // The relative masks in the best three orders with the mask last.
+    let mut best = (rows[0].0, rows[0].3.clone(), false);
+    for r in rows.iter().filter(|r| !r.3.contains(&F::M)).take(3) {
+        let (raw, z, st, _) = run(&r.3, true, false);
+        let n: u64 = st[..3].iter().sum();
+        println!("    REL {side} [{}]: {:.3} / {:.3} B an edge (u64 masks {:.3} / {:.3}); masks equal to the reference {:.1}%, relative {:.1}%, raw (no shift) {:.1}%, outside it {}",
+            r.2, raw as f64 / e, z as f64 / e, r.1, r.0, 100.0 * st[0] as f64 / n as f64, 100.0 * st[1] as f64 / n as f64, 100.0 * st[2] as f64 / n as f64, st[3]);
+        if (z as f64 / e) < best.0 { best = (z as f64 / e, r.3.clone(), true); }
+    }
+    let (_, _, _, blocks) = run(&best.1, best.2, true);
+    println!("    BEST {side} region: [{}]{} {:.3} B an edge with zstd -1", order_name(&best.1), if best.2 { " relative masks" } else { "" }, best.0);
+    pl.best = Some((best.1, best.2, blocks));
+}
+
+/// The backward's reads: (1) every in-edge (target side; the source side's
+/// every out-edge) decoded from the best blocks, a region pass; (2) the PUSH
+/// backward's read - the in-edges of a sample of CHANGED targets: the target
+/// side decodes only the units holding one and filters each bundle's mask;
+/// the source side reads every block and filters each bundle by its target.
+fn push(d: &Data, placed: &FxHashMap<bool, Placed>, front: &Front, threads: usize) {
+    let pass = |pl: &Placed, f: &(dyn Fn(usize, &Tup, &mut u64) + Sync), units: &(dyn Fn(usize) -> bool + Sync)| -> (f64, u64) {
+        let (order, rel, blocks) = pl.best.as_ref().expect("a sweep before the push");
+        let next = AtomicUsize::new(0);
+        let t = Instant::now();
+        let n: u64 = std::thread::scope(|sc| {
+            let hs: Vec<_> = (0..threads).map(|_| { let next = &next; sc.spawn(move || {
+                let mut n = 0u64;
+                loop {
+                    let u = next.fetch_add(1, Ordering::Relaxed); if u >= blocks.len() { break; }
+                    if !units(u) { continue; }
+                    decode_order(&blocks[u], order, rel.then_some((front, pl.source_side, pl.slots[u])), |tp| f(u, tp, &mut n));
+                }
+                n
+            }) }).collect();
+            hs.into_iter().map(|h| h.join().unwrap()).sum()
+        });
+        (t.elapsed().as_secs_f64(), n)
+    };
+    // (1) every edge, the other side's cell and key per edge.
+    for (&side, pl) in placed.iter() {
+        let (w, n) = pass(pl, &|u, tp, n| {
+            let mut m = tp[4];
+            while m != 0 { let bit = m.trailing_zeros(); m &= m - 1; let c = cell_of(pl.slots[u], bit); let oc = if side { fwd(c, tp[3] as u32) } else { back(c, tp[3] as u32) }; *n += 1 + (oc as u64 & 0); }
+        }, &|_| true);
+        let (o, rel, _) = pl.best.as_ref().unwrap();
+        println!("    READ {} region [{}]{}, {threads} threads: every {} decoded ({n}) in {w:.3} s ({:.2} ns an edge)", if side { "source" } else { "target" }, order_name(o), if *rel { " relative masks" } else { "" }, if side { "out-edge" } else { "in-edge" }, w * 1e9 / n.max(1) as f64);
+    }
+    let (Some(tp), Some(sp)) = (placed.get(&false), placed.get(&true)) else { return };
+    for every in [30u64, 1000] {
+        // The changed targets (untimed): 1 in `every` of the targets with in-edges.
+        let mut rng = 0x9E37_79B9_7F4A_7C15u64;
+        let mut per_unit: Vec<FxHashMap<u64, u64>> = vec![FxHashMap::default(); tp.tups.len()];
+        let mut global: FxHashMap<(u64, u32), ()> = FxHashMap::default();
+        let mut keys: rustc_hash::FxHashSet<u64> = Default::default();
+        for (u, v) in tp.tups.iter().enumerate() {
+            let mut targets: Vec<(u64, u32)> = Vec::new();
+            for t in v { let mut m = t[4]; while m != 0 { let b = m.trailing_zeros(); m &= m - 1; targets.push((t[0], b)); } }
+            targets.sort_unstable(); targets.dedup();
+            for (k, b) in targets {
+                rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                if (rng >> 33) % every != 0 { continue; }
+                *per_unit[u].entry(k).or_default() |= 1 << b;
+                let gk = (tp.shapes[u] as u64) << 56 | k;
+                global.insert((gk, cell_of(tp.slots[u], b)), ());
+                keys.insert(gk);
             }
         }
+        let n_changed = global.len();
+        let (wt, nt) = pass(tp, &|u, t, n| { if let Some(&cm) = per_unit[u].get(&t[0]) { *n += (cm & t[4]).count_ones() as u64; } }, &|u| !per_unit[u].is_empty());
+        let units_read = per_unit.iter().filter(|m| !m.is_empty()).count();
+        let (ws, ns) = pass(sp, &|u, t, n| {
+            if !keys.contains(&t[0]) { return; }
+            let mut m = t[4];
+            while m != 0 { let b = m.trailing_zeros(); m &= m - 1; if global.contains_key(&(t[0], fwd(cell_of(sp.slots[u], b), t[3] as u32))) { *n += 1; } }
+        }, &|_| true);
+        println!("    PUSH {threads} threads, {n_changed} changed targets (1 in {every}): target side {nt} in-edges from {units_read} of {} units in {wt:.4} s; source side {ns} in-edges, every unit read, in {ws:.4} s{}",
+            tp.tups.len(), if nt == ns { "" } else { " (COUNTS DIFFER)" });
     }
+    let _ = d;
 }

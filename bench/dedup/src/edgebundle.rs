@@ -104,7 +104,8 @@ pub(crate) fn fwd(a: u32, off: u32) -> u32 {
 pub(crate) struct Edge { pub(crate) tkey: u64, pub(crate) se: u32, pub(crate) x: u32, pub(crate) treg: u16, pub(crate) sreg: u16, pub(crate) tpos: u8, pub(crate) spos: u8 }
 
 /// Per dense region: its shape index and slot; its frame-start entries.
-pub(crate) struct Region { pub(crate) shape: u32, pub(crate) slot: u32, pub(crate) keys: Vec<u64>, pub(crate) masks: Vec<u64> }
+/// `front`: per entry its cells in the last frame's layer (the frontier: this frame's sources).
+pub(crate) struct Region { pub(crate) shape: u32, pub(crate) slot: u32, pub(crate) keys: Vec<u64>, pub(crate) masks: Vec<u64>, pub(crate) front: Vec<u64> }
 
 pub(crate) struct Data { pub(crate) regions: Vec<Region>, pub(crate) edges: Vec<Vec<Edge>>, pub(crate) n_edges: u64, pub(crate) fp: u64, shape_hash: Vec<u64>, prov_hash: Vec<u64> }
 
@@ -137,6 +138,7 @@ fn load(cap: &str, tree: &str, last: u32) -> Data {
     let mut shape_idx: FxHashMap<u64, u32> = FxHashMap::default();
     let mut ent_keys: FxHashMap<u32, Vec<u64>> = FxHashMap::default();
     let mut ent_masks: FxHashMap<u32, Vec<u64>> = FxHashMap::default();
+    let mut front_masks: FxHashMap<u32, Vec<u64>> = FxHashMap::default();
     let mut ents_all: Vec<(u32, u32, u64)> = Vec::new();
     let mut n_states = 0u64;
     for f in 0..=last {
@@ -156,6 +158,7 @@ fn load(cap: &str, tree: &str, last: u32) -> Data {
                 if v.len() <= e as usize { v.resize(e as usize + 1, 0); }
                 assert!(v[e as usize] >> l & 1 == 0, "a state twice");
                 v[e as usize] |= 1 << l;
+                if f == last { let w = front_masks.entry(r).or_default(); if w.len() <= e as usize { w.resize(e as usize + 1, 0); } w[e as usize] |= 1 << l; }
                 n_states += 1;
             }
         }
@@ -171,8 +174,9 @@ fn load(cap: &str, tree: &str, last: u32) -> Data {
     for r in rids {
         let keys = ent_keys.remove(&r).unwrap();
         let mut masks = ent_masks.remove(&r).unwrap_or_default(); masks.resize(keys.len(), 0);
+        let mut front = front_masks.remove(&r).unwrap_or_default(); front.resize(keys.len(), 0);
         dense.insert(r, regions.len() as u16);
-        regions.push(Region { shape: r / SLOTS, slot: r % SLOTS, keys, masks });
+        regions.push(Region { shape: r / SLOTS, slot: r % SLOTS, keys, masks, front });
     }
     // Transfers by content; MISS contents by bytes.
     let t1 = Instant::now();
@@ -239,7 +243,7 @@ fn load(cap: &str, tree: &str, last: u32) -> Data {
         hs.into_iter().map(|h| h.join().unwrap()).collect()
     });
     let g = shared.into_inner().unwrap();
-    for &(rid, d) in &g.3 { assert_eq!(d as usize, regions.len()); regions.push(Region { shape: rid / SLOTS, slot: rid % SLOTS, keys: Vec::new(), masks: Vec::new() }); }
+    for &(rid, d) in &g.3 { assert_eq!(d as usize, regions.len()); regions.push(Region { shape: rid / SLOTS, slot: rid % SLOTS, keys: Vec::new(), masks: Vec::new(), front: Vec::new() }); }
     assert!(regions.len() < 1 << 16);
     let mut n_edges = 0u64;
     let mut edges = Vec::with_capacity(parts.len());

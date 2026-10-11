@@ -1092,3 +1092,81 @@ any other (0.044 s a frame at 16 threads, one W probe per entry). The
 target-side layouts lose 3x at rest and need a partition of every edge
 (0.58 s a frame here). IDs remain useful INSIDE the backward's in-RAM graph
 (dense arrays), where they can be assigned at load time and never stored.
+
+### O3. Placement and order, systematically (`idfree ... sweep:16 push:T`; 2026-10-11, load 1-10)
+
+**Target-side masks are source masks moved.** In v1-v3 (and the T of O) the
+mask bit is the TARGET cell `c`, and the edge's source is (source key,
+`c - offset`): a target-side bundle is a source entry's bundle shifted by the
+offset and clipped to the target region. The information is the same. Why
+O2 measured 3x more for it (0.43 against 0.139 B an edge, 100k-edge units):
+(1) one source mask appears as several different u64 values on the target
+side, one per offset and per target region it straddles, so equal masks
+stop being equal bytes; (2) sorting target-first scatters one source entry's
+bundles (which share a mask) across the block, and the 100k units - a
+target region cut into parts by a hash of the TARGET key - scatter them
+across blocks; (3) each such part carries a dictionary of every source key
+reaching its region (9.07M entries in all, against 2.15M target keys on the
+source side). None of it is fundamental: (1) is undone by coding the mask
+RELATIVE to the source entry's own frontier mask, shifted and clipped
+(`ref_mask`: one lookup per source region the shifted region overlaps, at
+most four), (2)-(3) by source-major orders and whole-region blocks.
+
+**The sweep.** Every order of (s, t, x, o) - 24 - and each after the mask
+(`M`: bundles grouped by identical mask, the mask a level of the trie), for
+both placements; the best three orders with the mask last again with
+RELATIVE masks (`EQ` flag where the mask is the reference, its bits over
+the reference's cells otherwise, `RAW` u64 where an offset names no shift);
+every block decoded back to its bundles. E2 coding (key dictionaries per
+block), zstd -1 per block. Relative masks: target side 81.6% equal to the
+reference, 16.1% relative, 2.4% raw (into or out of `NO_CELL`), none outside
+it; source side 77.2% / 22.8% / 0.
+
+B an edge with zstd -1 (raw in brackets); per WHOLE REGION block (278 target
+/ 253 source regions with edges), and per 100k-edge part:
+
+| order | target region, region blocks | source region, region blocks | target, 100k parts | source, 100k parts |
+|---|---|---|---|---|
+| **best** | **[s x o t] relative 0.070 (0.413)** | **[M o x s t] 0.063 (0.347)** | [t s x o] relative 0.284 (0.727) | [M x o s t] 0.102 (0.372) |
+| M o x s t | 0.079 (0.365) | 0.063 (0.347) | 0.481 (0.850) | 0.102 (0.372) |
+| M x o s t | 0.088 | 0.068 | | 0.102 |
+| M s x o t | 0.090 | 0.068 | | 0.102 |
+| x o s t, relative masks | | 0.066 (0.396) | | |
+| s t x o, relative | 0.094 (0.634) | 0.082 (0.595) | 0.287 | 0.113 |
+| s t x o (u64 masks) | 0.122 (1.694) | 0.114 (1.611) | 0.428 | 0.139 |
+| t s x o (u64) | | | 0.427 (1.788) | 0.126 |
+| worst of 48 | 0.66 | 0.27 | 0.66 | 0.27 |
+
+(Full lists, all 48 orders per placement and granularity:
+`/var/tmp/eb-out/idf-sweep0.txt` and `idf-sweep.txt`, not committed.)
+
+- **Per region, target-side comes within 1.11x of source-side** (0.070
+  against 0.063 B an edge) - placement can be chosen by what the forward
+  and the backward want. Both are ~50x below production's 3.15 and 2x below
+  O2's best.
+- Source-major orders win in both placements (bundles of one source entry
+  together: their masks are equal, or equal after the shift); mask-first is
+  best where masks repeat byte for byte (source side); relative masks are
+  best where they repeat only up to a shift (target side).
+- The hash parts cost 1.6x (source) and 4x (target): at rest, blocks should
+  be whole regions (or parts cut so that a source entry's bundles stay
+  together), whatever the units of work were.
+
+**The costs that differ** (16 threads unless said; f57):
+
+| | source region | target region |
+|---|---|---|
+| bytes at rest (per region, zstd -1) | 0.063 | 0.070 (1.11x) |
+| forward: shipping the edges | none (the units are source runs) | partition of all 257.7M edges, 24 B each: 0.57-0.58 s (2.2 ns an edge; 8.0 at 1 thread) - the dedup's own shipping if the forward is region-batched (J2), extra if it is today's source units |
+| forward: insert + encode | 0.33 s (100k parts; whole regions unsplit 1.5 s on the critical path) | dedup + insert + encode 0.53 s (100k parts; 1.8 s unsplit) |
+| backward: every edge decoded (region pass) | 0.038 s (0.15 ns an edge) | 0.146 s (relative masks: up to four frontier-mask lookups a bundle; u64 masks 0.051 s) |
+| push backward: in-edges of changed targets (random samples of 1 in 30 / 1 in 1000 of the 10.9M targets) | every block read, filtered by target: 0.130 / 0.094 s | only the blocks of regions holding a changed target: 0.166 / 0.145 s (the random samples touch 269 / 236 of 278 regions) |
+
+The push numbers are the worst case for the target side: random changed sets
+touch almost every region. A backward's changed set is spatially clustered
+(it spreads from the wins), and the target side reads only the regions it
+touches, the source side always all of them; neither layout's push was
+measured on a real changed set.
+
+Run cost: the whole-region sweep took 3:20 (two placements x 48 orders x
+2 decodes of 15M-edge blocks) - over the 2-minute budget; the 100k sweep 1:03.
