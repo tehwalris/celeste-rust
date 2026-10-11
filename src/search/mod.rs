@@ -6,12 +6,14 @@
 //!   * `arcs`       - sets of remainders as arcs of the circle
 //!   * `arc_dp`     - THE SEARCH: winning sets, optimum, concrete search
 //!   * `known`      - a known solution checked against every pruning step
+//!   * `beam`       - `rewrite beam`: ANY route by a beam search (not a proof)
 //!   * `pos_graph`  - player-position cells and the position graph
 //!   * `inspect`    - rows read by named fields, for the diagnostics
 //!   * `ui_export`  - `rewrite export-ui`: a finished run -> the web UI's data
 pub mod arc_dp;
 pub mod arc_edges;
 pub mod arcs;
+pub mod beam;
 pub mod checkpoint;
 pub mod inspect;
 pub mod known;
