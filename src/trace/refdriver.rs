@@ -75,7 +75,7 @@ pub fn run_frame_all<'a>(
         }
         // A path that RAISES (`Interp::poison`) ends in no state, and only then.
         it.raised.clear();
-        let ended = it.exec_block(body.nodes(), st)?;
+        let ended = it.exec_block(body.nodes(), st).map_err(|e| e.context(format!("fork path {}", paths + 1)))?;
         match ended.len() {
             0 => anyhow::ensure!(!it.raised.is_empty(), "a frame path ended in no state without a raise"),
             1 => {

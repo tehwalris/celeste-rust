@@ -106,7 +106,7 @@ impl RefEngine {
         self.it.button_reads = Some((buttons, 0));
         let leaves = run_frame_all(&mut self.it, self.body_concrete, &st, &[], Level::EXACT, self.path_cap);
         let (_, mask) = self.it.button_reads.take().expect("set above");
-        let out = leaves?.iter().map(|l| Block::canonical(to_block(l, self.settings.room)?)).collect::<Result<_>>()?;
+        let out = leaves.map_err(|e| e.context(ran_from(&st, Some(byte))))?.iter().map(|l| Block::canonical(to_block(l, self.settings.room)?)).collect::<Result<_>>()?;
         Ok((out, mask))
     }
 
@@ -174,7 +174,7 @@ impl RefEngine {
         self.it.button_reads = Some((buttons, 0));
         let leaves = run_frame_all(&mut self.it, self.body_concrete, &st, &unknown, level, self.path_cap);
         let (_, mask) = self.it.button_reads.take().expect("set above");
-        let leaves = leaves?;
+        let leaves = leaves.map_err(|e| e.context(ran_from(&st, Some(byte))))?;
         if pinned_floors {
             // What the floors' pin assumes: no player went far this frame.
             let before = players(&st)?;
@@ -203,7 +203,7 @@ impl RefEngine {
     /// forked per path).
     pub fn run_lane(&mut self, block: &Rt2, lane: usize) -> Result<Vec<Block>> {
         let (st, unknown) = from_block(block, lane, &self.fn_info, &self.base)?;
-        let leaves = run_frame_all(&mut self.it, self.body, &st, &unknown, self.level, self.path_cap)?;
+        let leaves = run_frame_all(&mut self.it, self.body, &st, &unknown, self.level, self.path_cap).map_err(|e| e.context(ran_from(&st, None)))?;
         leaves.iter().map(|l| Block::canonical(to_block(l, self.settings.room)?)).collect()
     }
 }
@@ -254,6 +254,24 @@ const PLAYER_FAR: P8 = P8::from_i16(20);
 /// ... and with no object but floors (and the fly fruit) closer than this
 /// (a spring on it reads its `collideable` and breaks with it).
 const OTHERS_FAR: P8 = P8::from_i16(16);
+
+/// What a reference frame ran from, for its error: the input (`None`: the
+/// buttons forked) and where every player and player spawn was.
+fn ran_from(st: &State<RefDomain>, byte: Option<u8>) -> String {
+    let at: Vec<String> = ["player", "player_spawn"]
+        .iter()
+        .flat_map(|ty| objects_of_type(st, ty))
+        .map(|o| {
+            let n = |f: &str| match iface::get(st, &field(&o, &[f])) {
+                Some(Value::Num(v)) => crate::trace::refdomain::show(&v),
+                other => format!("{other:?}"),
+            };
+            format!("{} at ({}, {})", iface::show(&o), n("x"), n("y"))
+        })
+        .collect();
+    let input = byte.map_or("every input".to_string(), |b| format!("input {b:#04x}"));
+    format!("the reference frame under {input} from a state with {}", if at.is_empty() { "no player".to_string() } else { at.join(", ") })
+}
 
 /// The positions of every player and player spawn, concrete.
 fn players(st: &State<RefDomain>) -> Result<Vec<(P8, P8)>> {

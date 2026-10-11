@@ -225,11 +225,13 @@ impl Rem for Pico8Num {
     /// PICO-8's `%` is exactly `i32::rem_euclid` on the raw bits, with
     /// `a % 0 == 0`: total, and never negative. NOT Lua's rule (Lua's
     /// result takes the divisor's sign: `7 % -3` is -2 in Lua, 1 here).
+    /// `-32768 % -0x0.0001` is the exact remainder 0 (unmeasured on the
+    /// console; `rem_euclid` would panic on its quotient's overflow).
     fn rem(self, rhs: Self) -> Self::Output {
         if rhs.0 == 0 {
             return Self(0);
         }
-        Self(self.0.rem_euclid(rhs.0))
+        Self(self.0.wrapping_rem_euclid(rhs.0))
     }
 }
 
@@ -328,6 +330,45 @@ impl Pico8NumInterval {
     pub fn checked_neg(self) -> Option<Self> {
         Self::try_from_i64_endpoints(-(self.high.0 as i64), -(self.low.0 as i64))
     }
+
+    /// `*` of any two intervals (points included), `None` where a product
+    /// leaves the 16.16 range (the console WRAPS it). The product is
+    /// bilinear and the 16.16 shift monotone, so the corners bound the set;
+    /// a point's product is `Pico8Num`'s `*` wherever that does not wrap.
+    pub fn checked_mul(self, rhs: Self) -> Option<Self> {
+        let p = |a: Pico8Num, b: Pico8Num| ((a.0 as i64) * (b.0 as i64)) >> 16;
+        let c = [p(self.low, rhs.low), p(self.low, rhs.high), p(self.high, rhs.low), p(self.high, rhs.high)];
+        Self::try_from_i64_endpoints(*c.iter().min().expect("four"), *c.iter().max().expect("four"))
+    }
+
+    /// `/` of any two intervals, `None` where the divisor may be 0 or a
+    /// quotient leaves the 16.16 range (the console SATURATES both). Off
+    /// zero the quotient is monotone in each operand, and truncation toward
+    /// zero is monotone, so the corners bound the set; a point's quotient is
+    /// `Pico8Num`'s `/` wherever that does not saturate.
+    pub fn checked_div(self, rhs: Self) -> Option<Self> {
+        if rhs.low.0 <= 0 && 0 <= rhs.high.0 {
+            return None;
+        }
+        let q = |a: Pico8Num, b: Pico8Num| ((a.0 as i64) << 16) / (b.0 as i64);
+        let c = [q(self.low, rhs.low), q(self.low, rhs.high), q(self.high, rhs.low), q(self.high, rhs.high)];
+        Self::try_from_i64_endpoints(*c.iter().min().expect("four"), *c.iter().max().expect("four"))
+    }
+
+    /// `abs`, `None` where the set holds `i32::MIN` (the console SATURATES
+    /// `abs(-32768)` to `0x7fff.ffff`).
+    pub fn checked_abs(self) -> Option<Self> {
+        let zero = Pico8Num(0);
+        if self.low.0 == i32::MIN {
+            None
+        } else if self.low >= zero {
+            Some(self)
+        } else if self.high <= zero {
+            Some(Self::new(-self.high, -self.low))
+        } else {
+            Some(Self::new(zero, (-self.low).max(self.high)))
+        }
+    }
 }
 
 impl Add for Pico8NumInterval {
@@ -353,32 +394,17 @@ impl Sub for Pico8NumInterval {
 }
 
 impl Pico8NumInterval {
-    /// Scale by a POSITIVE scalar (monotone, so endpoint images bound the
-    /// set), with the same loud wrap detection as `Add`/`Sub`.
-    pub fn scale_positive(&self, rhs: Pico8Num) -> Self {
-        self.checked_scale_positive(rhs)
-            .unwrap_or_else(|| panic!("interval scale wrapped by {:?}", rhs))
-    }
-
-    /// `scale_positive` that reports a wrap instead of panicking on it.
+    /// `checked_mul` by a POSITIVE scalar: the kernels' interval `*`, whose
+    /// lane error (`Op::NoWrap`) is defined for a positive literal only.
     pub fn checked_scale_positive(&self, rhs: Pico8Num) -> Option<Self> {
         assert!(rhs.0 > 0, "scale_positive needs a positive scalar");
-        let mul = |a: i32| -> i64 { ((a as i64) * (rhs.0 as i64)) >> 16 };
-        Self::try_from_i64_endpoints(mul(self.low.0), mul(self.high.0))
+        self.checked_mul(Self::from_number(rhs))
     }
 
-    /// Divide by a POSITIVE scalar (monotone), loud on wrap. Mirrors the
-    /// concrete `Div` (i64 shifted dividend, truncating division).
-    pub fn div_positive(&self, rhs: Pico8Num) -> Self {
-        self.checked_div_positive(rhs)
-            .unwrap_or_else(|| panic!("interval divide wrapped by {:?}", rhs))
-    }
-
-    /// `div_positive` that reports a wrap instead of panicking on it.
+    /// `checked_div` by a POSITIVE scalar, as `checked_scale_positive`.
     pub fn checked_div_positive(&self, rhs: Pico8Num) -> Option<Self> {
         assert!(rhs.0 > 0, "div_positive needs a positive scalar");
-        let div = |a: i32| -> i64 { ((a as i64) << 16).wrapping_div(rhs.0 as i64) };
-        Self::try_from_i64_endpoints(div(self.low.0), div(self.high.0))
+        self.checked_div(Self::from_number(rhs))
     }
 
     /// The endpoints `e` that `checked_scale_positive(rhs)` maps inside the
@@ -709,6 +735,147 @@ mod tests {
                 "sin({}/40) disagrees with the console",
                 i
             );
+        }
+    }
+
+    /// Raw values at and around every edge the 16.16 operations have: the
+    /// range's ends, 0 and +/-1, the 16.16 one, and the products' and
+    /// quotients' overflow thresholds (`0xb504f3` is ~sqrt(2^47)).
+    const EDGES: [i32; 26] = [
+        i32::MIN, i32::MIN + 1, i32::MIN + 2, -0x4000_0000, -0xb5_04f4, -0xb5_04f3,
+        -0x1_0001, -0x1_0000, -0xffff, -0x8000, -2, -1, 0, 1, 2, 0x8000, 0xffff,
+        0x1_0000, 0x1_0001, 0xb5_04f3, 0xb5_04f4, 0x4000_0000, 0x7fff_0000,
+        i32::MAX - 2, i32::MAX - 1, i32::MAX,
+    ];
+
+    /// The exact result of `op` on two raw 16.16 values (`None`: division
+    /// by zero), as the operation's definition gives it before the console
+    /// wraps or saturates: `*` floors the 32-bit-shifted product, `/`
+    /// truncates the quotient.
+    fn exact(op: char, a: i32, b: i32) -> Option<i128> {
+        let (a, b) = (a as i128, b as i128);
+        match op {
+            '+' => Some(a + b),
+            '-' => Some(a - b),
+            '*' => Some((a * b) >> 16),
+            '/' => (b != 0).then(|| (a << 16) / b),
+            _ => unreachable!(),
+        }
+    }
+
+    fn fits(v: i128) -> bool {
+        (i32::MIN as i128..=i32::MAX as i128).contains(&v)
+    }
+
+    /// At every pair of edge values, the checked interval operations on
+    /// POINTS are `Pico8Num`'s: the console's result wherever the exact one
+    /// fits, `None` exactly where it does not - where the console's differs
+    /// from the exact result (it wrapped or saturated).
+    #[test]
+    fn checked_operations_on_points_are_the_consoles_where_they_fit_and_none_where_it_wraps() {
+        use super::Pico8NumInterval as IV;
+        let pt = |v: i32| IV::from_number(Pico8Num(v));
+        for &a in &EDGES {
+            for &b in &EDGES {
+                for op in ['+', '-', '*', '/'] {
+                    let (x, y) = (Pico8Num(a), Pico8Num(b));
+                    let console = match op {
+                        '+' => x + y,
+                        '-' => x - y,
+                        '*' => x * y,
+                        _ => x / y,
+                    };
+                    let checked = match op {
+                        '+' => pt(a).checked_add(pt(b)),
+                        '-' => pt(a).checked_sub(pt(b)),
+                        '*' => pt(a).checked_mul(pt(b)),
+                        _ => pt(a).checked_div(pt(b)),
+                    };
+                    match exact(op, a, b) {
+                        Some(e) if fits(e) => {
+                            assert_eq!(console.0 as i128, e, "{a:#x} {op} {b:#x}: the console's is the exact result");
+                            assert_eq!(checked, Some(pt(console.0)), "{a:#x} {op} {b:#x}");
+                        }
+                        e => {
+                            assert!(e.is_none_or(|e| console.0 as i128 != e), "{a:#x} {op} {b:#x}: an overflow the console does not show");
+                            assert_eq!(checked, None, "{a:#x} {op} {b:#x}: the console gives {:#x}, not the exact result", console.0);
+                        }
+                    }
+                }
+            }
+            // Negation wraps and `abs` saturates at MIN only.
+            let x = Pico8Num(a);
+            assert_eq!(pt(a).checked_neg(), (a != i32::MIN).then(|| pt((-x).0)), "-{a:#x}");
+            assert_eq!(pt(a).checked_abs(), (a != i32::MIN).then(|| pt(x.abs().0)), "abs({a:#x})");
+            if a == i32::MIN {
+                assert_eq!(((-x).0, x.abs().0), (i32::MIN, i32::MAX), "the console wraps -MIN and saturates abs(MIN)");
+            }
+        }
+    }
+
+    /// Small intervals at every edge, against every pair of their points:
+    /// a checked operation is `None` exactly when some pair's exact result
+    /// does not fit (or divides by zero), and otherwise the hull of the
+    /// pairs' results - every concrete value inside, both ends attained.
+    #[test]
+    fn checked_operations_on_intervals_hold_every_points_result_or_refuse() {
+        use super::Pico8NumInterval as IV;
+        let mut ivs = Vec::new();
+        for &e in &EDGES {
+            for w in 0..3 {
+                ivs.push((e, e.saturating_add(w)));
+                ivs.push((e.saturating_sub(w), e));
+            }
+        }
+        let iv = |(lo, hi): (i32, i32)| IV::new(Pico8Num(lo), Pico8Num(hi));
+        for &a in &ivs {
+            for &b in &ivs {
+                for op in ['+', '-', '*', '/'] {
+                    let results: Vec<Option<i128>> = (a.0..=a.1)
+                        .flat_map(|x| (b.0..=b.1).map(move |y| exact(op, x, y)))
+                        .collect();
+                    let got = match op {
+                        '+' => iv(a).checked_add(iv(b)),
+                        '-' => iv(a).checked_sub(iv(b)),
+                        '*' => iv(a).checked_mul(iv(b)),
+                        _ => iv(a).checked_div(iv(b)),
+                    };
+                    if results.iter().all(|r| r.is_some_and(fits)) {
+                        let r: Vec<i128> = results.into_iter().flatten().collect();
+                        let hull = (*r.iter().min().unwrap() as i32, *r.iter().max().unwrap() as i32);
+                        assert_eq!(got, Some(iv(hull)), "{a:x?} {op} {b:x?}");
+                    } else {
+                        assert_eq!(got, None, "{a:x?} {op} {b:x?}: some pair overflows");
+                    }
+                }
+            }
+            let has_min = a.0 == i32::MIN;
+            let negs: Vec<i32> = (a.0..=a.1).map(|x| -(x as i64) as i32).collect();
+            let neg = (!has_min).then(|| iv((*negs.iter().min().unwrap(), *negs.iter().max().unwrap())));
+            assert_eq!(iv(a).checked_neg(), neg, "-{a:x?}");
+            let abss: Vec<i32> = (a.0..=a.1).map(|x| (x as i64).abs() as i32).collect();
+            let abs = (!has_min).then(|| iv((*abss.iter().min().unwrap(), *abss.iter().max().unwrap())));
+            assert_eq!(iv(a).checked_abs(), abs, "abs({a:x?})");
+        }
+        // A straddling `abs` and a product across zero, by hand.
+        assert_eq!(iv((-3, 2)).checked_abs(), Some(iv((0, 3))));
+        assert_eq!(iv((-0x2_0000, 0x1_0000)).checked_mul(iv((-0x3_0000, 0x1_0000))), Some(iv((-0x3_0000, 0x6_0000))));
+    }
+
+    /// `%` never panics at the range's edges, and stays in `[0, |b|)`
+    /// (`MIN % -0x0.0001`: the exact 0, where `rem_euclid` panics).
+    #[test]
+    fn modulo_is_total_at_the_range_edges() {
+        for &a in &EDGES {
+            for &b in &EDGES {
+                let r = (Pico8Num(a) % Pico8Num(b)).0 as i64;
+                if b == 0 {
+                    assert_eq!(r, 0, "{a:#x} % 0");
+                } else {
+                    assert!((0..(b as i64).abs()).contains(&r), "{a:#x} % {b:#x} gave {r:#x}");
+                    assert_eq!(r, (a as i64).rem_euclid(b as i64), "{a:#x} % {b:#x}");
+                }
+            }
         }
     }
 }

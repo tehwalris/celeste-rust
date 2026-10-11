@@ -847,7 +847,7 @@ impl<'a, D: Domain> Interp<'a, D> {
                     out.push(match unop {
                         ast::UnOp::Minus(_) => {
                             let Value::Num(n) = v else { bail!("unary minus on a non-number") };
-                            let r = self.d.fun1(Fun1::Neg, &n)?;
+                            let r = self.d.fun1(Fun1::Neg, &n).map_err(|err| anyhow!("in `{}`: {:#}", source_text(e), err))?;
                             (st, Value::Num(r))
                         }
                         ast::UnOp::Hash(_) => {
@@ -875,11 +875,7 @@ impl<'a, D: Domain> Interp<'a, D> {
             }
             ast::Expression::BinaryOperator { lhs, binop, rhs } => {
                 // Carry the SOURCE TEXT into the error.
-                self.eval_binop(lhs, binop, rhs, st).map_err(|err| {
-                    let t = e.to_string();
-                    let t = t.trim();
-                    anyhow!("in `{}`: {:#}", &t[..t.len().min(60)], err)
-                })
+                self.eval_binop(lhs, binop, rhs, st).map_err(|err| anyhow!("in `{}`: {:#}", source_text(e), err))
             }
             ast::Expression::Var(v) => match v {
                 ast::Var::Name(t) => {
@@ -1810,6 +1806,11 @@ fn unroll_bound(limit_src: &str) -> Option<u32> {
     }
 }
 
+/// An expression's source text for an error, its first 60 characters.
+fn source_text(e: &ast::Expression) -> String {
+    let t = e.to_string();
+    t.trim().chars().take(60).collect()
+}
 
 fn ident(t: &full_moon::tokenizer::TokenReference) -> Result<String> {
     match t.token_type() {

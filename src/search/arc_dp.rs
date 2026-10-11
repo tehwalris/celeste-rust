@@ -1519,7 +1519,7 @@ pub fn concrete_search(
                 if ran.covers(byte) {
                     continue;
                 }
-                let (succ, read) = cx.eng.frame_reads(st, byte)?;
+                let (succ, read) = cx.eng.frame_reads(st, byte).map_err(|e| e.context(format!("the frame after {k} frames of the depth-first try, with input {byte}")))?;
                 ran.push(byte, read);
                 for b in succ {
                     cx.steps += 1;
