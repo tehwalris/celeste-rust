@@ -121,6 +121,14 @@ impl Pico8Num {
         Some(if negative { -raw } else { raw })
     }
 
+    /// The console's reading of a literal, which WRAPS a whole part past the
+    /// range (`32768` reads as -32768, `65535` as -1; `FromStr` refuses
+    /// those): for the tests that pin the console (`lua/probe`'s overflow
+    /// corpora).
+    pub fn wrapping_from_str(s: &str) -> Option<Self> {
+        Self::parse_decimal(s.trim()).map(|raw| Self(raw as i32))
+    }
+
     /// `i64` raw 16.16 as a number, `None` where it leaves the range.
     fn fit(raw: i64) -> Option<Self> {
         i32::try_from(raw).ok().map(Self)
@@ -594,11 +602,14 @@ mod tests {
             );
         }
         // The console WRAPS an integer part past the range (`32768` reads
-        // as -32768, `65535` as -1): an error here, as any overflow.
-        for text in ["32768", "65535", "-32768.00002", "40000.5"] {
+        // as -32768, `65535` as -1): an error here, as any overflow, and the
+        // console's reading spelled out.
+        for (text, console) in [("32768", 0x8000_0000_u32), ("65535", 0xffff_0000), ("-32768.00002", 0x7fff_ffff), ("40000.5", 0x9c40_8000)] {
             let e = text.parse::<Pico8Num>().expect_err(text).to_string();
             assert!(e.contains("leaves the 16.16 range"), "{text}: {e}");
+            assert_eq!(Pico8Num::wrapping_from_str(text).map(|n| n.to_bits()), Some(console), "{text}");
         }
+        assert_eq!(Pico8Num::wrapping_from_str("0.1"), "0.1".parse().ok(), "in range, the same");
         assert!("".parse::<Pico8Num>().is_err());
         assert!("1.2.3".parse::<Pico8Num>().is_err());
         assert!("nope".parse::<Pico8Num>().is_err());

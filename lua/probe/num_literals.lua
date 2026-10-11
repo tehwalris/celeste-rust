@@ -19,14 +19,12 @@ __hex(0.99999)
 __hex(0.00002)
 __hex(0.00001)
 __hex(0.000005)
--- Whole-part extremes. 32768 is already out of range as written, so this
--- pins that both sides fold the out-of-range literal the same way.
+-- Whole-part extremes. 32768 is out of range as written (PICO-8 wraps it,
+-- the interpreter RAISES): num_literals_overflow.lua.
 __hex(255)
 __hex(256)
 __hex(32767)
-__hex(32768)
 __hex(-1)
 __hex(-0.5)
 __hex(-0.1)
 __hex(-32767)
-__hex(-32768)

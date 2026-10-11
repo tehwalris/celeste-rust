@@ -334,6 +334,21 @@ and dynamic instruction counts are unchanged). The static range of
 a product is now computed unwrapped (`pieces_of`: past 16.16 it is unknown,
 not PICO-8's wrapped endpoints). Which results ran before the fix:
 plans/results.md.
+**THE RULE: match PICO-8 exactly, or raise** (Philippe, 2026-10-11). For
+overflow, division by zero and every case like them, the interpreter, the
+kernels and the reference engine either compute exactly what PICO-8
+computes or RAISE (the kernels: decline the lane, a fatal coverage gap).
+Raising is always acceptable as long as real runs never hit it; computing
+something else is never acceptable. So a wrap or a saturation is an error,
+and so is `x / 0` (PICO-8 saturates it): no division in the traced cart
+(`lua/celeste-minimal.lua`, the builtins) or the original
+(`celeste_ocaml/celeste.lua`) has a divisor that can be 0 - every one is a
+nonzero literal (8, 30, 40; the original's draw code 1.5, 3, 4, 5, 32, 60,
+64), and `%` by 0 is PICO-8's exact 0. The console's own values where the
+interpreter raises stay pinned by the `lua/probe` `*_overflow` corpora
+(`trace::probe::OVERFLOW`: every case raises; `Pico8Num`'s explicit
+`wrapping_*`/`saturating_*` reproduce their golden PICO-8 output).
+
 **Every overflow is an error** (Philippe's decision, 2026-10-11, branch
 `overflow-errors`): the game never leaves the 16.16 range, so nothing
 wraps or saturates silently, for points as for intervals. `Pico8Num` has
