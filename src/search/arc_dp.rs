@@ -383,7 +383,7 @@ impl<'a> Backward<'a> {
             run_bytes: 0,
             opens: FxHashMap::default(),
             round_emits: ROUND_EMITS,
-            chunk: 1024,
+            chunk: 256,
             read: ReadStats::default(),
             n_changed: 0,
             n_emits: 0,
