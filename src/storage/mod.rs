@@ -21,6 +21,7 @@
 
 pub mod bench;
 pub mod census;
+pub mod convert;
 pub mod decode;
 pub mod edges;
 pub mod marks;

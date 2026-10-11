@@ -656,6 +656,17 @@ enum Command {
         #[arg(long, default_value_t = 5)]
         show: usize,
     },
+    /// Convert format-13 trees to format 14 in place (plans/rows-from-keys.md):
+    /// every tree under `--dir` (a level's tree, a search's checkpoint dir, or
+    /// a dir of them). Each frame file's v14 replacement is decoded back and
+    /// compared with its v13 rows exactly before any file of the tree is
+    /// replaced; a tree that fails stays at format 13. The other `C8TB` files
+    /// (metadata, pos-graph, notes, marks) get the new version. `--room` gives
+    /// the blocks their cart context only. Refuses any other format.
+    ConvertTree {
+        #[arg(long)]
+        dir: String,
+    },
     /// Record the settings of a tree built before trees recorded them
     /// (`settings::Settings`), so it can be resumed or reused: give the
     /// flags and `--level` it WAS built with - nothing can check them, which
@@ -2494,6 +2505,21 @@ fn main() -> Result<()> {
                 states = next.into_iter().map(Block::into_rt2).collect();
             }
             println!("[follow] every frame is in the tree");
+        }
+        Command::ConvertTree { dir } => {
+            let t = std::time::Instant::now();
+            let r = celeste_rust::storage::convert::convert(std::path::Path::new(&dir), cfg.room, cfg.threads())?;
+            println!(
+                "[convert-tree] {dir}: {} trees, {} frame files ({} rows) and {} other files to format {}; frame files {} -> {} B; {:.1} s",
+                r.trees,
+                r.frame_files,
+                r.rows,
+                r.value_files,
+                celeste_rust::search::checkpoint::FORMAT_VERSION,
+                r.bytes_before,
+                r.bytes_after,
+                t.elapsed().as_secs_f64()
+            );
         }
         Command::AdoptSettings { level_dir, level } => {
             let dir = std::path::Path::new(&level_dir);
