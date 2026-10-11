@@ -78,7 +78,7 @@ pub fn fold_into(
     let cells = seed_cells(g);
     let vals = match room {
         Some(r) => g.eval_fold_in(&cells, r)?,
-        None => g.eval_lenient(&cells)?,
+        None => g.eval_fold(&cells)?,
     };
     let mut map: Vec<NodeId> = vec![UNREACHABLE; g.len()];
     let mut st = Stats {

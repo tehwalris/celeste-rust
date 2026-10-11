@@ -217,6 +217,9 @@ pub const MAX_WAYS: usize = 255;
 /// One fork-grid step (the integers) in raw 16.16 units.
 const GRID_STEP: i32 = 1 << 16;
 
+/// `Graph::eval_full`'s `defined`.
+const DEFINED: bool = true;
+
 impl Graph {
     pub fn new() -> Self {
         Self::default()
@@ -390,21 +393,37 @@ impl Graph {
                 let v = (lo as i64).max(base).clamp(i32::MIN as i64, i32::MAX as i64) as i32;
                 return self.leaf(Op::Const(v, v));
             }
-            // No-wrap of anything but an interval `+`/`-`/negation or `*`/`/`
-            // holds (as in `eval`); so does that of a `*`/`/` whose literal
-            // cannot carry an endpoint out of range. One whose scalar is no
-            // literal YET stays: a specialization may make it one.
-            Op::NoWrap
-                if match self.nodes[args[0] as usize].op {
-                    Op::Add | Op::Sub | Op::Neg => false,
-                    Op::Mul | Op::Div => scaled(self, args[0]).is_some_and(|s| s.fits() == (i32::MIN, i32::MAX)),
-                    _ => true,
-                } =>
-            {
-                return self.leaf(Op::ConstBool(true));
-            }
-            // Arithmetic on literal POINTS folds (PICO-8 arithmetic), so a
-            // select on it folds instead of being split both ways.
+            // No-wrap of anything but `+ - * /`, negation and `abs` holds (as
+            // in `eval`). Of one with a single operand that is no literal
+            // point (`one_operand`) it is decided where that operand's range
+            // is: every value fits (`x + 0`, `x * 0.5`, `x / 2`), none does
+            // (`x / 0`), or the operand is a literal. One with no literal
+            // operand YET stays: a specialization may make it one.
+            Op::NoWrap => match self.nodes[args[0] as usize].op {
+                Op::Add | Op::Sub | Op::Neg | Op::Abs | Op::Mul | Op::Div => {
+                    if let Some(o) = one_operand(self, args[0]) {
+                        let operand = self.nodes[args[0] as usize].args[o.operand];
+                        let decided = match (o.fits, &self.nodes[operand as usize].op) {
+                            (None, _) => Some(false),
+                            (Some((i32::MIN, i32::MAX)), _) => Some(true),
+                            (Some((lo, hi)), Op::Const(a, b)) => Some(lo <= *a && *b <= hi),
+                            _ => None,
+                        };
+                        if let Some(b) = decided {
+                            return self.leaf(Op::ConstBool(b));
+                        }
+                    }
+                }
+                _ => return self.leaf(Op::ConstBool(true)),
+            },
+            // Arithmetic on literal POINTS folds, so a select on it folds
+            // instead of being split both ways. EXACTLY: a result past the
+            // 16.16 range (where PICO-8 wraps or saturates) is an error, and
+            // `fold` has no error to return, so it panics with the operands.
+            // The traced Lua's constant arithmetic is the domain's
+            // (`Symbolic::arith`, an error with the source text); this is
+            // what a specialization or a substitution folds, and the program
+            // overflows nowhere (`checked`).
             Op::Add | Op::Sub | Op::Mul | Op::Div | Op::Min | Op::Max => {
                 let point = |g: &Graph, i: usize| match g.nodes[args[i] as usize].op {
                     Op::Const(lo, hi) if lo == hi => Some(Pico8Num::from_raw(lo)),
@@ -412,18 +431,15 @@ impl Graph {
                 };
                 if let (Some(x), Some(y)) = (point(self, 0), point(self, 1)) {
                     let r = match op {
-                        Op::Add => Some(x + y),
-                        Op::Sub => Some(x - y),
-                        Op::Mul => Some(x * y),
-                        Op::Div if y.as_raw_u32() != 0 => Some(x / y),
-                        Op::Div => None,
-                        Op::Min => Some(if y < x { y } else { x }),
-                        _ => Some(if y > x { y } else { x }),
+                        Op::Add => checked("+", x.checked_add(y), x, y),
+                        Op::Sub => checked("-", x.checked_sub(y), x, y),
+                        Op::Mul => checked("*", x.checked_mul(y), x, y),
+                        Op::Div => checked("/", x.checked_div(y), x, y),
+                        Op::Min => x.min(y),
+                        _ => x.max(y),
                     };
-                    if let Some(r) = r {
-                        let raw = r.as_raw_u32() as i32;
-                        return self.leaf(Op::Const(raw, raw));
-                    }
+                    let raw = r.as_raw_u32() as i32;
+                    return self.leaf(Op::Const(raw, raw));
                 }
             }
             Op::Neg | Op::Abs | Op::Flr => {
@@ -431,8 +447,8 @@ impl Graph {
                     if lo == hi {
                         let x = Pico8Num::from_raw(lo);
                         let r = match op {
-                            Op::Neg => -x,
-                            Op::Abs => x.abs(),
+                            Op::Neg => checked("unary -", x.checked_neg(), x, x),
+                            Op::Abs => checked("abs", x.checked_abs(), x, x),
                             _ => x.flr(),
                         };
                         let raw = r.as_raw_u32() as i32;
@@ -612,22 +628,29 @@ impl Graph {
 
     /// `eval_lenient_in` that also reads `mget` over INTERVAL coordinates as
     /// the SET of tiles the rectangle holds (`tiles_over`), so `Eq(k, mget)`
-    /// decides where no tile there is `k`. The interval fold's evaluator
-    /// (`transpile::ival`); the tracer's (`verify::Points`) and level -1's
-    /// keep `eval_lenient_in`, so neither the trace nor the table moves.
+    /// decides where no tile there is `k`, and evaluates `DEFINED` (below).
+    /// The interval fold's evaluator (`transpile::ival`); the tracer's
+    /// (`verify::Points`) keeps `eval_lenient_in`, so the trace does not
+    /// move.
     pub fn eval_fold_in(&self, cells: &HashMap<u32, Val>, room: &Room) -> Result<Vec<Val>> {
-        self.eval_full(cells, true, false, Some(room), true)
+        self.eval_full(cells, true, false, Some(room), true, DEFINED)
+    }
+
+    /// `eval_fold_in` without a room (no `mget`, `TileFlagAt` TOP).
+    pub fn eval_fold(&self, cells: &HashMap<u32, Val>) -> Result<Vec<Val>> {
+        self.eval_full(cells, true, false, None, false, DEFINED)
     }
 
     /// Forks resolved via `Frag`; an unmodelled node (`Mget`, roomless
-    /// `TileFlagAt`) is TOP.
+    /// `TileFlagAt`) is TOP. `DEFINED`: level -1 takes the kernels'
+    /// premises as holding.
     pub fn eval_narrow_top_in(&self, cells: &HashMap<u32, Val>, room: &Room) -> Result<Vec<Val>> {
-        self.eval_inner(cells, false, false, Some(room))
+        self.eval_full(cells, false, false, Some(room), false, DEFINED)
     }
 
     /// `eval_narrow_top_in` without a room, for bare arithmetic sub-DAGs.
     pub fn eval_narrow_top(&self, cells: &HashMap<u32, Val>) -> Result<Vec<Val>> {
-        self.eval_inner(cells, false, false, None)
+        self.eval_full(cells, false, false, None, false, DEFINED)
     }
 
     fn eval_inner(
@@ -637,9 +660,19 @@ impl Graph {
         strict_err: bool,
         room: Option<&Room>,
     ) -> Result<Vec<Val>> {
-        self.eval_full(cells, frag_lenient, strict_err, room, false)
+        self.eval_full(cells, frag_lenient, strict_err, room, false, !DEFINED)
     }
 
+    /// `defined` (`DEFINED`): an operation's value need cover only the lanes
+    /// where it is DEFINED - `abs` of a hull holding MIN is `[0, MAX]`, the
+    /// MIN lane being in error (`abs`'s own `NoWrap`). Sound where that
+    /// error is charged to whatever reads the value: once the outcomes'
+    /// errors are derived and are roots of the graph evaluated (the
+    /// lowering's fold: every node it decides is in an outcome's cone, and
+    /// so is the source's error), or where the premises are taken as holding
+    /// (level -1). NOT in the tracer, which decides comparisons BEFORE the
+    /// errors are derived: a decided one would no longer reach the `abs`, so
+    /// nothing would charge its error.
     fn eval_full(
         &self,
         cells: &HashMap<u32, Val>,
@@ -647,6 +680,7 @@ impl Graph {
         strict_err: bool,
         room: Option<&Room>,
         mget_sets: bool,
+        defined: bool,
     ) -> Result<Vec<Val>> {
         let lenient = frag_lenient;
         // Per `Mget` node read as a set (`mget_sets`): the tiles its
@@ -744,23 +778,20 @@ impl Graph {
                         bail!("node {}: SplitOk of an interval that may not fit", i)
                     }
                 }
-                // No-wrap in i64. On a hull: no wrap is no wrap on any lane; a
-                // wrap is unknown per lane.
+                // The operation's checked form (points and intervals alike).
+                // On a hull: no wrap is no wrap on any lane (the operations
+                // are monotone in each operand, or bilinear); a wrap is
+                // unknown per lane.
                 Op::NoWrap => {
                     let x = &self.nodes[node.args[0] as usize];
+                    let arg = |k: usize| out[x.args[k] as usize].as_num("NoWrap");
                     let fits = match x.op {
-                        Op::Add | Op::Sub => {
-                            let (p, q) = (out[x.args[0] as usize].as_num("NoWrap")?, out[x.args[1] as usize].as_num("NoWrap")?);
-                            if matches!(x.op, Op::Add) { p.checked_add(q) } else { p.checked_sub(q) }.is_some()
-                        }
-                        Op::Neg => out[x.args[0] as usize].as_num("NoWrap")?.checked_neg().is_some(),
-                        Op::Mul | Op::Div => match scaled(self, node.args[0]) {
-                            Some(Scaled { operand, k, div }) => {
-                                let iv = out[x.args[operand] as usize].as_num("NoWrap")?;
-                                if div { iv.checked_div_positive(k) } else { iv.checked_scale_positive(k) }.is_some()
-                            }
-                            None => true,
-                        },
+                        Op::Add => arg(0)?.checked_add(arg(1)?).is_some(),
+                        Op::Sub => arg(0)?.checked_sub(arg(1)?).is_some(),
+                        Op::Mul => arg(0)?.checked_mul(arg(1)?).is_some(),
+                        Op::Div => arg(0)?.checked_div(arg(1)?).is_some(),
+                        Op::Neg => arg(0)?.checked_neg().is_some(),
+                        Op::Abs => arg(0)?.checked_abs().is_some(),
                         _ => true,
                     };
                     Val::Bool(if fits || !lenient { Some(fits) } else { None })
@@ -825,18 +856,15 @@ impl Graph {
                         .ok_or_else(|| anyhow!("node {}: Neg wrapped", i))?,
                 ),
                 Op::Mul | Op::Div | Op::Rem => Self::arith(&node.op, a!(0), a!(1))?,
+                // `defined`: a lane holding MIN is in error (`abs`'s own), so
+                // the value is the hull over the others, in [0, MAX].
                 Op::Abs => {
-                    let x = a!(0).as_num("Abs")?;
-                    let zero = Pico8Num::from_i16(0);
-                    if x.low >= zero {
-                        Val::Num(x)
-                    } else if x.high <= zero {
-                        Val::Num(Pico8NumInterval::new(-x.high, -x.low))
-                    } else {
-                        // Straddles zero: the result is [0, max(|lo|,|hi|)].
-                        let m = if -x.low > x.high { -x.low } else { x.high };
-                        Val::Num(Pico8NumInterval::new(zero, m))
+                    let mut x = a!(0).as_num("Abs")?;
+                    let min = Pico8Num::from_raw(i32::MIN);
+                    if defined && x.low == min && x.high > min {
+                        x.low = Pico8Num::from_raw(i32::MIN + 1);
                     }
+                    Val::Num(x.checked_abs().ok_or_else(|| anyhow!("node {}: Abs saturated", i))?)
                 }
                 // flr is monotone, so endpoints suffice.
                 Op::Flr => {
@@ -1026,14 +1054,15 @@ impl Graph {
     }
 
     fn arith(op: &Op, x: Val, y: Val) -> Result<Val> {
-        // Exact op exact is always exact.
+        // Exact op exact is exact, or an error where it leaves the range.
         if let (Some(p), Some(q)) = (x.as_exact(), y.as_exact()) {
-            return Ok(Val::exact_num(match op {
-                Op::Mul => p * q,
-                Op::Div => p / q,
-                Op::Rem => p % q,
+            let r = match op {
+                Op::Mul => p.checked_mul(q),
+                Op::Div => p.checked_div(q),
+                Op::Rem => Some(p % q),
                 _ => unreachable!(),
-            }));
+            };
+            return Ok(Val::exact_num(r.ok_or_else(|| anyhow!("{:?} of {:?} and {:?} wrapped", op, p, q))?));
         }
         let xi = x.as_num("arith")?;
         let scalar = match y.as_exact() {
@@ -1045,13 +1074,10 @@ impl Graph {
             bail!("{:?} by a non-positive scalar is not modelled", op);
         }
         // Checked, as for `Add`: at TOP a scale wraps.
+        let k = Pico8NumInterval::from_number(scalar);
         Ok(Val::Num(match op {
-            Op::Mul => xi
-                .checked_scale_positive(scalar)
-                .ok_or_else(|| anyhow!("Mul over an interval wrapped"))?,
-            Op::Div => xi
-                .checked_div_positive(scalar)
-                .ok_or_else(|| anyhow!("Div over an interval wrapped"))?,
+            Op::Mul => xi.checked_mul(k).ok_or_else(|| anyhow!("Mul over an interval wrapped"))?,
+            Op::Div => xi.checked_div(k).ok_or_else(|| anyhow!("Div over an interval wrapped"))?,
             Op::Rem => bail!("Rem over an interval is not modelled"),
             _ => unreachable!(),
         }))
@@ -1538,57 +1564,128 @@ mod tests {
         assert!(err.contains("not modelled"), "unexpected error: {}", err);
     }
 
-    /// `NoWrap` of an interval `*` / `/` by a positive literal: a literal that
-    /// cannot carry an endpoint out of range folds it to true (a factor at
-    /// most 1, a divisor at least 1: every power-of-two division); one that
-    /// can keeps it, and `eval` answers it with the checked operation.
+    /// `NoWrap` of an operation with one operand not a literal point
+    /// (`one_operand`), every form, literals of both signs: `fits` is
+    /// exactly where the checked operation has an answer (its ends fit, one
+    /// past them does not), `fold` decides it where every operand fits or
+    /// none does, and `eval` answers it on an interval with the checked
+    /// operation (a fit decided, one past it unknown per lane).
     #[test]
-    fn interval_scale_and_divide_keep_their_no_wrap_only_where_it_can_fail() {
-        // `x op k` (or `k * x`) and its `NoWrap`, alone in a graph, so
-        // `eval` meets no other operation's wrap.
-        let build = |op: Op, raw: i32, first: bool| {
-            let mut g = Graph::new();
-            let x = g.leaf(Op::Cell(0));
-            let c = g.leaf(Op::Const(raw, raw));
-            let m = if first { g.add(op, vec![c, x]) } else { g.fold(op, vec![x, c]) };
-            let fits = g.fold(Op::NoWrap, vec![m]);
-            (g, m, fits)
-        };
-        for (op, raw, first, can) in [
-            (Op::Mul, 0x1_0000, false, false),
-            (Op::Mul, 0x8000, false, false),
-            (Op::Mul, 0x1_0001, false, true),
-            (Op::Mul, 0x2_0000, false, true),
-            // The literal first: `fold` puts it second, `add` keeps it.
-            (Op::Mul, 0x2_0000, true, true),
-            (Op::Div, 0x8_0000, false, false),
-            (Op::Div, 0x1_0000, false, false),
-            (Op::Div, 0xffff, false, true),
-        ] {
-            let (g, m, fits) = build(op.clone(), raw, first);
-            let s = scaled(&g, m).expect("scaled");
-            assert_eq!(s, Scaled { operand: first as usize, k: Pico8Num::from_raw(raw), div: op == Op::Div });
-            assert_eq!(g.get(fits).op == Op::ConstBool(true), !can, "{op:?} {raw:#x}");
-            // (`eval`'s `arith` reads the literal second, where `fold` puts it.)
-            if !can || first {
-                continue;
-            }
-            // At its edges, against the checked operation: a fit is decided;
-            // a wrap `eval` refuses in the operation itself (as `Add`'s),
-            // the lenient one leaves to the lanes.
-            let (lo, hi) = s.fits();
-            for (a, b, want) in [(lo, hi, true), (lo - 1, 0, false), (0, hi + 1, false), (0, 0, true)] {
-                let cells = HashMap::from([(0u32, Val::Num(Pico8NumInterval::new(Pico8Num::from_raw(a), Pico8Num::from_raw(b))))]);
-                let lenient = g.eval_lenient(&cells).expect("lenient")[fits as usize];
-                if want {
-                    assert_eq!(g.eval(&cells).expect("fits")[fits as usize], Val::Bool(Some(true)), "{s:?} [{a:#x}, {b:#x}]");
-                    assert_eq!(lenient, Val::Bool(Some(true)), "{s:?} [{a:#x}, {b:#x}]");
-                } else {
-                    assert!(g.eval(&cells).unwrap_err().to_string().contains("wrapped"), "{s:?} [{a:#x}, {b:#x}]");
-                    assert_eq!(lenient, Val::Bool(None), "{s:?} [{a:#x}, {b:#x}]");
+    fn one_operand_no_wrap_fits_exactly_where_the_checked_operation_does() {
+        let p = Pico8Num::from_raw;
+        let ks = [0, 1, -1, 0x8000, -0x8000, 0xffff, 0x1_0000, -0x1_0000, 0x1_0001, -0x1_0001, 0x2_0000, -0x2_0000, 0x7fff_0000, i32::MAX, i32::MIN];
+        // (op, the literal first)
+        let forms = [(Op::Add, false), (Op::Add, true), (Op::Sub, false), (Op::Sub, true), (Op::Mul, false), (Op::Mul, true), (Op::Div, false)];
+        let mut checked_forms = 0;
+        for (op, first) in forms {
+            for k in ks {
+                let mut g = Graph::new();
+                let x = g.leaf(Op::Cell(0));
+                let c = g.leaf(Op::Const(k, k));
+                let m = g.add(op.clone(), if first { vec![c, x] } else { vec![x, c] });
+                let o = one_operand(&g, m).expect("one operand");
+                assert_eq!(o.operand, first as usize, "{op:?} {k:#x}");
+                let exact = |v: i32| {
+                    let (a, b) = if first { (p(k), p(v)) } else { (p(v), p(k)) };
+                    match op {
+                        Op::Add => a.checked_add(b),
+                        Op::Sub => a.checked_sub(b),
+                        Op::Mul => a.checked_mul(b),
+                        _ => a.checked_div(b),
+                    }
+                    .is_some()
+                };
+                let nw = g.fold(Op::NoWrap, vec![m]);
+                let Some((lo, hi)) = o.fits else {
+                    assert!(op == Op::Div && k == 0, "{op:?} {k:#x}: only `x / 0` fits nowhere");
+                    assert!([i32::MIN, -1, 0, 1, i32::MAX].iter().all(|v| !exact(*v)));
+                    assert_eq!(g.get(nw).op, Op::ConstBool(false));
+                    continue;
+                };
+                assert!(exact(lo) && exact(hi), "{op:?} {k:#x}: the ends fit");
+                assert!(lo == i32::MIN || !exact(lo - 1), "{op:?} {k:#x}: below {lo:#x}");
+                assert!(hi == i32::MAX || !exact(hi + 1), "{op:?} {k:#x}: above {hi:#x}");
+                let everywhere = (lo, hi) == (i32::MIN, i32::MAX);
+                assert_eq!(g.get(nw).op == Op::ConstBool(true), everywhere, "{op:?} {k:#x}: decided iff every value fits");
+                let at = |a: i32, b: i32| {
+                    let cells = HashMap::from([(0u32, Val::Num(Pico8NumInterval::new(p(a), p(b))))]);
+                    g.eval_lenient(&cells).expect("lenient")[nw as usize]
+                };
+                assert_eq!(at(lo, hi), Val::Bool(Some(true)), "{op:?} {k:#x}: the whole fitting range");
+                if lo > i32::MIN {
+                    assert_eq!(at(lo - 1, hi), Val::Bool(None), "{op:?} {k:#x}: one past the low end");
                 }
+                if hi < i32::MAX {
+                    assert_eq!(at(lo, hi + 1), Val::Bool(None), "{op:?} {k:#x}: one past the high end");
+                    // A point past it: the operation itself is the error.
+                    let cells = HashMap::from([(0u32, Val::exact_num(p(hi + 1)))]);
+                    assert!(g.eval(&cells).unwrap_err().to_string().contains("wrapped"), "{op:?} {k:#x}");
+                }
+                checked_forms += !everywhere as usize;
             }
         }
+        assert!(checked_forms > 40, "{checked_forms} forms that can overflow");
+        // Negation and `abs`: everything but MIN.
+        for op in [Op::Neg, Op::Abs] {
+            let mut g = Graph::new();
+            let x = g.leaf(Op::Cell(0));
+            let m = g.add(op.clone(), vec![x]);
+            assert_eq!(one_operand(&g, m), Some(OneOperand { operand: 0, fits: Some((i32::MIN + 1, i32::MAX)) }));
+        }
+        // `k / x` is no `OneOperand`, nor is an operation of two cells.
+        let mut g = Graph::new();
+        let (x, y, c) = (g.leaf(Op::Cell(0)), g.leaf(Op::Cell(1)), g.leaf(Op::Const(0x1_0000, 0x1_0000)));
+        for (op, args) in [(Op::Div, vec![c, x]), (Op::Add, vec![x, y]), (Op::Mul, vec![x, y])] {
+            let m = g.add(op, args);
+            assert_eq!(one_operand(&g, m), None);
+            let nw = g.fold(Op::NoWrap, vec![m]);
+            assert_eq!(g.get(nw).op, Op::NoWrap, "stays for the lanes");
+        }
+    }
+
+    /// Literal POINT arithmetic folds exactly; a result past the 16.16
+    /// range (which PICO-8 wraps or saturates) is an error, never a wrapped
+    /// constant: `fold` panics with the operation and its operands.
+    #[test]
+    fn a_literal_fold_folds_exactly() {
+        let mut g = Graph::new();
+        let k = |g: &mut Graph, v: i32| g.leaf(Op::Const(v, v));
+        let (a, b) = (k(&mut g, 3 << 16), k(&mut g, -(5 << 16)));
+        for (op, want) in [(Op::Add, -2 << 16), (Op::Sub, 8 << 16), (Op::Mul, -15 << 16), (Op::Div, -0x9999)] {
+            let r = g.fold(op.clone(), vec![a, b]);
+            assert_eq!(g.get(r).op, Op::Const(want, want), "{op:?}");
+        }
+        // One step inside the edges is exact.
+        let (max, one) = (k(&mut g, i32::MAX - 1), k(&mut g, 1));
+        let r = g.fold(Op::Add, vec![max, one]);
+        assert_eq!(g.get(r).op, Op::Const(i32::MAX, i32::MAX));
+        let min = k(&mut g, i32::MIN + 1);
+        let r = g.fold(Op::Neg, vec![min]);
+        assert_eq!(g.get(r).op, Op::Const(i32::MAX, i32::MAX));
+    }
+
+    #[test]
+    #[should_panic(expected = "constant fold overflow: + of the literals 32767.99998")]
+    fn a_literal_fold_that_overflows_is_an_error() {
+        let mut g = Graph::new();
+        let (max, eps) = (g.leaf(Op::Const(i32::MAX, i32::MAX)), g.leaf(Op::Const(1, 1)));
+        g.fold(Op::Add, vec![max, eps]);
+    }
+
+    #[test]
+    #[should_panic(expected = "constant fold overflow: / of the literals 1 and 0 leaves the 16.16 range")]
+    fn a_literal_division_by_zero_is_an_error() {
+        let mut g = Graph::new();
+        let (one, zero) = (g.leaf(Op::Const(1 << 16, 1 << 16)), g.leaf(Op::Const(0, 0)));
+        g.fold(Op::Div, vec![one, zero]);
+    }
+
+    #[test]
+    #[should_panic(expected = "constant fold overflow: abs of the literals -32768 and -32768")]
+    fn a_literal_abs_of_min_is_an_error() {
+        let mut g = Graph::new();
+        let min = g.leaf(Op::Const(i32::MIN, i32::MIN));
+        g.fold(Op::Abs, vec![min]);
     }
 
     /// A product's range is computed unwrapped: one past the 16.16 range is
@@ -1648,49 +1745,69 @@ mod tests {
     }
 }
 
-/// A `*` or `/` the kernel computes endpoint by endpoint: an interval
-/// `operand` (an argument index) times, or over, the POSITIVE literal `k`.
-/// Only these have an interval form (`Graph::eval`'s `arith`, the codegen);
-/// `Op::NoWrap` of one is `Pico8NumInterval`'s checked operation.
+/// `Graph::fold`'s literal arithmetic: the exact result, or a panic naming
+/// the operation (`fold` cannot return an error; see there).
+fn checked(op: &str, r: Option<Pico8Num>, x: Pico8Num, y: Pico8Num) -> Pico8Num {
+    r.unwrap_or_else(|| {
+        let dec = |n: Pico8Num| n.as_raw_u32() as i32 as f64 / 65536.0;
+        panic!(
+            "constant fold overflow: {op} of the literals {} and {} leaves the 16.16 range \
+             (PICO-8 would wrap or saturate; overflow is an error)",
+            dec(x),
+            dec(y)
+        )
+    })
+}
+
+/// A numeric operation whose operands are literal POINTS but one, `operand`
+/// (an argument index): `x + k`, `k + x`, `x - k`, `k - x`, `-x`, `abs(x)`,
+/// `x * k`, `k * x`, `x / k`. Its exact result fits the 16.16 range iff the
+/// operand lies in `fits` (raw, inclusive; `None`: nowhere, `x / 0`): each
+/// map is monotone in `x`, or (`abs`) grows with `|x|`, so the set that fits
+/// is an interval, and an interval operand fits iff both its ends do. So
+/// `Op::NoWrap` of one is at most two compares (the codegen's), none where
+/// `fits` is the whole range (`Graph::fold` decides those). Not `k / x`:
+/// the divisors that fit are no interval (none is near 0).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Scaled {
+pub struct OneOperand {
     pub operand: usize,
-    pub k: Pico8Num,
-    pub div: bool,
+    pub fits: Option<(i32, i32)>,
 }
 
-impl Scaled {
-    /// The operand's endpoints whose image fits the 16.16 range, `[lo, hi]`
-    /// raw: the operation is monotone, so an interval fits iff `lo <= low`
-    /// and `high <= hi`. The whole range for a factor at most 1 or a divisor
-    /// at least 1 (`div_pow2`'s).
-    pub fn fits(self) -> (i32, i32) {
-        let (lo, hi) = if self.div {
-            Pico8NumInterval::div_positive_fits(self.k)
-        } else {
-            Pico8NumInterval::scale_positive_fits(self.k)
-        };
-        (lo.as_raw_u32() as i32, hi.as_raw_u32() as i32)
-    }
-}
-
-/// `x` as a `Scaled`, if it is one: `x * k`, `k * x` or `x / k`, `k` a
-/// positive point literal (the second operand where both are).
-pub fn scaled(g: &Graph, x: NodeId) -> Option<Scaled> {
+/// `x` as a `OneOperand`, if it is one (the first operand where both are
+/// literal points).
+pub fn one_operand(g: &Graph, x: NodeId) -> Option<OneOperand> {
     let node = g.get(x);
-    let positive = |a: NodeId| match g.get(a).op {
-        Op::Const(lo, hi) if lo == hi && lo > 0 => Some(Pico8Num::from_raw(lo)),
+    let point = |k: usize| match g.get(node.args[k]).op {
+        Op::Const(lo, hi) if lo == hi => Some(lo as i64),
         _ => None,
     };
-    match node.op {
-        Op::Mul => match (positive(node.args[0]), positive(node.args[1])) {
-            (_, Some(k)) => Some(Scaled { operand: 0, k, div: false }),
-            (Some(k), None) => Some(Scaled { operand: 1, k, div: false }),
-            _ => None,
+    let (min, max) = (i32::MIN as i64, i32::MAX as i64);
+    // The operand's values `[lo, hi]` inside the range: never empty below.
+    let clip = |lo: i64, hi: i64| Some((lo.max(min) as i32, hi.min(max) as i32));
+    let p8 = |k: i64| Pico8Num::from_raw(k as i32);
+    let raw = |(lo, hi): (Pico8Num, Pico8Num)| (lo.as_raw_u32() as i32, hi.as_raw_u32() as i32);
+    let (operand, fits) = match node.op {
+        Op::Neg | Op::Abs => (0, Some((i32::MIN + 1, i32::MAX))),
+        Op::Add => match (point(0), point(1)) {
+            (_, Some(k)) => (0, clip(min - k, max - k)),
+            (Some(k), None) => (1, clip(min - k, max - k)),
+            _ => return None,
         },
-        Op::Div => positive(node.args[1]).map(|k| Scaled { operand: 0, k, div: true }),
-        _ => None,
-    }
+        Op::Sub => match (point(0), point(1)) {
+            (_, Some(k)) => (0, clip(min + k, max + k)),
+            (Some(k), None) => (1, clip(k - max, k - min)),
+            _ => return None,
+        },
+        Op::Mul => match (point(0), point(1)) {
+            (_, Some(k)) => (0, Some(raw(Pico8Num::mul_fits(p8(k))))),
+            (Some(k), None) => (1, Some(raw(Pico8Num::mul_fits(p8(k))))),
+            _ => return None,
+        },
+        Op::Div => (0, Pico8Num::div_fits(p8(point(1)?)).map(raw)),
+        _ => return None,
+    };
+    Some(OneOperand { operand, fits })
 }
 
 /// A static range as sorted, disjoint pieces (raw 16.16, inclusive).
@@ -1799,11 +1916,11 @@ pub fn pieces_of(
                 return None;
             }
             let a = rec(memo, k_of)?;
-            // A product in i64, unwrapped: one that leaves the 16.16 range
-            // makes the range unknown (`normalize_pieces`), where PICO-8's
-            // wrapped endpoints would bound nothing. The quotient saturates,
-            // which is monotone.
-            let f = |x: i64| -> i64 { if is_div { raw(p8(x) / k) } else { (x * raw(k)) >> 16 } };
+            // In i64, unwrapped and unsaturated: a product or quotient that
+            // leaves the 16.16 range makes the range unknown
+            // (`normalize_pieces`), where PICO-8's wrapped or saturated
+            // endpoints would bound nothing (and a lane there is in error).
+            let f = |x: i64| -> i64 { if is_div { (x << 16) / raw(k) } else { (x * raw(k)) >> 16 } };
             let mut out = Vec::new();
             for a in a {
                 let (x, y) = (f(a.0), f(a.1));

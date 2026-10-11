@@ -273,6 +273,19 @@ const ESCAPE_ATOMS: usize = 6;
 
 // ---------------------------------------------------------------- concrete
 
+/// A number for an error message, as its decimal value.
+fn show(n: P8) -> String {
+    format!("{}", n.as_raw_u32() as i32 as f64 / 65536.0)
+}
+
+/// THE overflow error of the concrete domain (and so of the tracer's
+/// constant folding, `Symbolic::arith`): the operation that left the 16.16
+/// range. The game never overflows, so one is a modelling surprise, never a
+/// wrapped value (the reference engine's is `refdomain`'s).
+fn overflow(what: String) -> anyhow::Error {
+    anyhow::anyhow!("arithmetic overflow: {what} leaves the 16.16 range (PICO-8 would wrap or saturate; overflow is an error)")
+}
+
 #[derive(Default)]
 pub struct Concrete;
 
@@ -286,19 +299,23 @@ impl Domain for Concrete {
     fn boolean(&mut self, b: bool) -> bool {
         b
     }
+    /// The exact result; one past the 16.16 range (where PICO-8 wraps or
+    /// saturates) is an error, as everywhere (`overflow`).
     fn arith(&mut self, op: Arith, a: &P8, b: &P8) -> Result<P8> {
-        Ok(match op {
-            Arith::Add => *a + *b,
-            Arith::Sub => *a - *b,
-            Arith::Mul => *a * *b,
-            Arith::Div => *a / *b,
-            Arith::Rem => *a % *b,
-        })
+        let (r, sym) = match op {
+            Arith::Add => (a.checked_add(*b), "+"),
+            Arith::Sub => (a.checked_sub(*b), "-"),
+            Arith::Mul => (a.checked_mul(*b), "*"),
+            Arith::Div => (a.checked_div(*b), "/"),
+            // Never overflows: in `[0, |b|)`, or 0 for `b == 0`.
+            Arith::Rem => (Some(*a % *b), "%"),
+        };
+        r.ok_or_else(|| overflow(format!("{} {sym} {}", show(*a), show(*b))))
     }
     fn fun1(&mut self, f: Fun1, a: &P8) -> Result<P8> {
         Ok(match f {
-            Fun1::Neg => -*a,
-            Fun1::Abs => a.abs(),
+            Fun1::Neg => a.checked_neg().ok_or_else(|| overflow(format!("-{}", show(*a))))?,
+            Fun1::Abs => a.checked_abs().ok_or_else(|| overflow(format!("abs({})", show(*a))))?,
             Fun1::Flr => a.flr(),
             Fun1::Sin => a.pico8_sin(),
         })
@@ -573,6 +590,14 @@ impl Symbolic {
         crate::transpile::graph::pieces_of(&self.graph, &mut self.range_memo, n)
     }
 
+    /// Do the static ranges put every value of `n`'s EXACT result inside
+    /// the 16.16 range? Computed in i64, unwrapped and unsaturated
+    /// (`graph::pieces_of`), so a result past it is unknown, not wrapped:
+    /// false. Where true, `n` cannot overflow (`trace::error`).
+    pub fn bounded(&mut self, n: NodeId) -> bool {
+        self.range_of(n).is_some_and(|pieces| pieces.iter().all(|&(lo, hi)| lo >= i32::MIN as i64 && hi <= i32::MAX as i64))
+    }
+
     /// Does anything give this frame a static range (a restriction)?
     /// Without, no comparison is decided by one.
     fn has_ranges(&self) -> bool {
@@ -736,10 +761,12 @@ impl Symbolic {
         crate::trace::verify::cone(&self.graph, ns).into_iter().any(|n| matches!(self.graph.get(n).op, Op::UnknownNum | Op::UnknownBool(_)))
     }
 
-    /// `a - r` where `a` is `r + c`: `c` EXACTLY (true in wrapping 16.16),
-    /// also under a select's arms (a platform's `x - last`). Here, not in
-    /// `Graph::fold`: over ranges `(r + c) - r` evaluates wider, and `fold`
-    /// must agree with the evaluator. `None` where nothing cancels.
+    /// `a - r` where `a` is `r + c`: `c` EXACTLY, also under a select's
+    /// arms (a platform's `x - last`). Here, not in `Graph::fold`: over
+    /// ranges `(r + c) - r` evaluates wider, and `fold` must agree with the
+    /// evaluator. Only where the static ranges bound the sum: `r + c` that
+    /// overflows is an error, which the cancelled form would no longer read.
+    /// `None` where nothing cancels.
     fn cancel_sub(&mut self, a: NodeId, r: NodeId) -> Result<Option<NodeId>> {
         if a == r {
             return Ok(Some(self.konst(P8::from_raw(0))));
@@ -747,8 +774,8 @@ impl Symbolic {
         let op = self.graph.get(a).op.clone();
         let args = self.graph.get(a).args.clone();
         match op {
-            Op::Add if args[0] == r => Ok(Some(args[1])),
-            Op::Add if args[1] == r => Ok(Some(args[0])),
+            Op::Add if args[0] == r && self.bounded(a) => Ok(Some(args[1])),
+            Op::Add if args[1] == r && self.bounded(a) => Ok(Some(args[0])),
             Op::Sel => {
                 let (c, t, f) = (args[0], args[1], args[2]);
                 let (tc, fc) = (self.cancel_sub(t, r)?, self.cancel_sub(f, r)?);

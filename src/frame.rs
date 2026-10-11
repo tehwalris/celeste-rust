@@ -2207,11 +2207,12 @@ mod tests {
         };
         let px = |n: i16| P8::from_i16(n);
         let half = P8::from_parts(0, 0x8000);
+        let past = px(grid.speed as i16).checked_add(half).expect("small");
         assert!(runs(&row), "the lane as played runs");
         assert!(runs(&with(ids.f_spd, ids.f_x, px(grid.speed as i16))), "speed at the bound runs");
-        assert!(runs(&with(ids.f_rem, ids.f_x, half - P8::from_raw(1))), "the remainder at its upper bound runs");
-        assert!(!runs(&with(ids.f_spd, ids.f_x, px(grid.speed as i16) + half)), "speed.x past the bound declines");
-        assert!(!runs(&with(ids.f_spd, ids.f_y, -(px(grid.speed as i16) + half))), "speed.y past the bound declines");
+        assert!(runs(&with(ids.f_rem, ids.f_x, P8::from_raw(0x7fff))), "the remainder at its upper bound runs");
+        assert!(!runs(&with(ids.f_spd, ids.f_x, past)), "speed.x past the bound declines");
+        assert!(!runs(&with(ids.f_spd, ids.f_y, past.wrapping_neg())), "speed.y past the bound declines");
         assert!(!runs(&with(ids.f_rem, ids.f_x, half)), "a remainder of 0.5 declines");
     }
 
@@ -2273,10 +2274,11 @@ mod tests {
         let Col::U(AV::Num(speed)) = row.cols[spd] else { panic!("the platform's spd.x is not a number") };
         assert!(runs(&row), "the lane as played runs");
         assert!(runs(&with(x, path_lo, path_hi)), "x over the whole path runs");
-        assert!(!runs(&with(x, path_lo, path_hi + P8::from_raw(1))), "x past the path declines");
-        assert!(!runs(&with(x, path_lo - px(1), path_hi)), "x before the path declines");
-        assert!(!runs(&with(rem, -half, half)), "a remainder reaching 0.5 declines");
-        assert!(!runs(&with(spd, speed + px(1), speed + px(1))), "spd.x past its worlds' range declines");
+        let add = |a: P8, b: P8| a.checked_add(b).expect("small");
+        assert!(!runs(&with(x, path_lo, add(path_hi, P8::from_raw(1)))), "x past the path declines");
+        assert!(!runs(&with(x, add(path_lo, px(-1)), path_hi)), "x before the path declines");
+        assert!(!runs(&with(rem, half.wrapping_neg(), half)), "a remainder reaching 0.5 declines");
+        assert!(!runs(&with(spd, add(speed, px(1)), add(speed, px(1)))), "spd.x past its worlds' range declines");
     }
 
     /// Room (1,3)'s 127-frame EXIT FRAME: the kernels make the concrete exit's

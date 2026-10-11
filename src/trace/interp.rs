@@ -785,7 +785,9 @@ impl<'a, D: Domain> Interp<'a, D> {
                 }
             }
             running = next;
-            i = i + one;
+            // Past 32767 the console's counter WRAPS (and the loop never
+            // ends): an error, as every overflow.
+            i = i.checked_add(one).ok_or_else(|| anyhow!("`for {name}={from:?},{to:?}`: the counter overflows past {i:?} (PICO-8 would wrap it)"))?;
         }
         done.extend(running.into_iter().map(|(s, _)| (s, Flow::Normal)));
         Ok(done)
@@ -2113,6 +2115,56 @@ mod tests {
         let e = super::super::error::of(&mut it.d, &[r]);
         assert_eq!(it.d.graph.get(e).op, Op::ConstBool(false), "no lane errs");
         assert_eq!(it.d.forks, 0, "no per-lane fork");
+    }
+
+    /// THE TRACER'S CONSTANT FOLDING never wraps: Lua arithmetic on
+    /// constants whose result leaves the 16.16 range (where PICO-8 wraps or
+    /// saturates) is an error at trace time naming the operation, its
+    /// operands and the source - in the tracer (`Symbolic` folds constants
+    /// through `Concrete`) as in the concrete interpreter. One step inside
+    /// the range is the exact value.
+    #[test]
+    fn an_overflowing_constant_fold_is_an_error_with_its_source() {
+        fn refused<D: Domain>(d: D, src: &str) -> Result<()> {
+            let ast = parse(src);
+            let mut it = Interp::new(d);
+            let mut st = fresh::<D>(&mut it.d);
+            let g = st.globals;
+            st.heap.tables.get_mut(&g).unwrap().hash.insert("abs".into(), Value::Builtin("abs"));
+            it.exec_block(ast.nodes(), st).map(|_| ())
+        }
+        for (src, what) in [
+            ("x = 32767 + 1", "32767 + 1"),
+            ("x = -32767 - 2", "-32767 - 2"),
+            ("x = 200 * 200", "200 * 200"),
+            ("x = 20000 / 0.5", "20000 / 0.5"),
+            ("x = 1 / 0", "1 / 0"),
+            ("local m = -32767 - 1\n x = -m", "-(-32768)"),
+            ("local m = -32767 - 1\n x = abs(m)", "abs(-32768)"),
+        ] {
+            for err in [refused(Symbolic::default(), src).err(), refused(Concrete, src).err()] {
+                let e = format!("{:#}", err.unwrap_or_else(|| panic!("{src}: refused")));
+                assert!(e.contains("arithmetic overflow") && e.contains("leaves the 16.16 range"), "{src}: {e}");
+                let shown = what.replace("-(-32768)", "--32768");
+                assert!(e.contains(&shown), "{src}: names {shown}: {e}");
+            }
+        }
+        // A counter past the range, a literal past it.
+        for (src, what) in [("for i = 32760, 32767 do end", "the counter overflows"), ("x = 32768", "leaves the 16.16 range")] {
+            let e = format!("{:#}", refused(Concrete, src).expect_err(src));
+            assert!(e.contains(what), "{src}: {e}");
+        }
+        // One step inside: exact.
+        let ast = parse("x = 32766.99998 + 1\n y = -32767 - 1\n z = 181 * 181");
+        let mut it = Interp::new(Symbolic::default());
+        let st = fresh::<Symbolic>(&mut it.d);
+        let out = it.exec_block(ast.nodes(), st).expect("in range");
+        let s = &out[0].0;
+        let num = |k: &str| match s.heap.tables[&s.globals].hash[k].clone() {
+            Value::Num(n) => it.d.as_const(&n).expect("a constant"),
+            other => panic!("{k}: {other:?}"),
+        };
+        assert_eq!((num("x"), num("y"), num("z")), (P8::from_raw(i32::MAX - 1), P8::from_raw(i32::MIN), P8::from_i16(32761)));
     }
 
     /// A literal spanning too many integers is refused while tracing.

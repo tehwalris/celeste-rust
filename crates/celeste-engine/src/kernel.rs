@@ -2,12 +2,16 @@
 //! are checked against (`transpile::asm::tests`), the call-outs the
 //! assembled kernels make (collisions, map reads).
 //!
-//! Types are static; lanes are rows (W = 16 x i32 = one zmm). Each op must
-//! agree bit-exactly with `Pico8Num`'s scalar operator (the tests check it).
+//! Types are static; lanes are rows (W = 16 x i32 = one zmm). Each op
+//! agrees bit-exactly with the console's operation (`Pico8Num`'s
+//! `wrapping_*` / `saturating_*`; the tests check it). Where that is not the
+//! EXACT result (it wrapped or saturated), the lane is in error: an
+//! overflow is never a value. The `*_wraps` masks are those lanes, the
+//! reference for the assembled kernels' `Op::NoWrap` (`trace::error`).
 
 use celeste_core::cart_data::CartData;
 use celeste_core::collision_cache::CollisionCache;
-use celeste_core::pico8_num::{Pico8Num as P8, Pico8NumInterval as IV};
+use celeste_core::pico8_num::Pico8Num as P8;
 
 // The whole lane layer is AVX-512.
 use std::arch::x86_64::*;
@@ -94,7 +98,10 @@ pub fn zn_splat(v: P8) -> ZN {
 // ---- 16-lane PICO-8 arithmetic ----
 //
 // A `Pico8Num` is its raw `i32` in 16.16 fixed point, so add, sub, min
-// and max are the plain integer ops: the scale cancels.
+// and max are the plain integer ops: the scale cancels. `+ - *` and negation
+// wrap as the console's do, `abs` of MIN does not saturate as the console's
+// does, and `/` saturates as it does: in each case on exactly the lanes the
+// op's `*_wraps` mask declines.
 
 #[inline(always)]
 pub fn zn_add(a: ZN, b: ZN) -> ZN {
@@ -116,9 +123,46 @@ pub fn zn_max(a: ZN, b: ZN) -> ZN {
 pub fn zn_neg(a: ZN) -> ZN {
     ZN(unsafe { _mm512_sub_epi32(_mm512_setzero_si512(), a.0) })
 }
+/// `vpabsd`: `abs(MIN)` is MIN, where the console saturates to MAX - a lane
+/// `zn_abs_wraps` puts in error either way.
 #[inline(always)]
 pub fn zn_abs(a: ZN) -> ZN {
     ZN(unsafe { _mm512_abs_epi32(a.0) })
+}
+
+/// The lanes where `a + b` leaves the 16.16 range (`Pico8Num::checked_add`
+/// fails): a scalar `+`'s error in the assembled kernel (`Op::NoWrap`).
+#[inline(always)]
+pub fn zn_add_wraps(a: ZN, b: ZN) -> u16 {
+    add_overflows(a.0, b.0, zn_add(a, b).0)
+}
+/// `zn_add_wraps` for `a - b`.
+#[inline(always)]
+pub fn zn_sub_wraps(a: ZN, b: ZN) -> u16 {
+    sub_overflows(a.0, b.0, zn_sub(a, b).0)
+}
+/// `zn_add_wraps` for `-a`: `a == MIN`, which the console wraps to itself.
+#[inline(always)]
+pub fn zn_neg_wraps(a: ZN) -> u16 {
+    unsafe { _mm512_cmpeq_epi32_mask(a.0, _mm512_set1_epi32(i32::MIN)) }
+}
+/// `zn_add_wraps` for `abs(a)`: `a == MIN`, which the console saturates.
+#[inline(always)]
+pub fn zn_abs_wraps(a: ZN) -> u16 {
+    zn_neg_wraps(a)
+}
+/// `zn_add_wraps` for `a * b` (`Pico8Num::checked_mul`, per lane).
+pub fn zn_mul_wraps(a: ZN, b: ZN) -> u16 {
+    lanes_where(a, b, |x, y| x.checked_mul(y).is_none())
+}
+/// `zn_add_wraps` for `a / b` (`Pico8Num::checked_div`, per lane): where
+/// the console saturates the quotient, a zero divisor included.
+pub fn zn_div_wraps(a: ZN, b: ZN) -> u16 {
+    lanes_where(a, b, |x, y| x.checked_div(y).is_none())
+}
+/// The mask of the lanes where `f` holds.
+fn lanes_where(a: ZN, b: ZN, f: impl Fn(P8, P8) -> bool) -> u16 {
+    (0..W).fold(0u16, |m, i| m | (f(a.lane(i), b.lane(i)) as u16) << i)
 }
 
 /// `flr`: `P8::flr` is `((x >> 16) as i16 as i32) << 16`, and the `as i16`
@@ -148,11 +192,12 @@ pub fn zn_mul(a: ZN, b: ZN) -> ZN {
 
 /// Divide and remainder go out to scalar (x86 has no integer vector
 /// divide). A vector version through `f64` plus a rounding correction is
-/// possible; the sites are rare enough that it has not been worth it.
+/// possible; the sites are rare enough that it has not been worth it. `/`
+/// saturates as the console's does, on the lanes `zn_div_wraps` declines.
 #[inline(always)]
 pub fn zn_div(a: ZN, b: ZN) -> ZN {
     let (x, y) = (a.to_array(), b.to_array());
-    ZN::from_array(std::array::from_fn(|i| x[i] / y[i]))
+    ZN::from_array(std::array::from_fn(|i| x[i].saturating_div(y[i])))
 }
 #[inline(always)]
 pub fn zn_rem(a: ZN, b: ZN) -> ZN {
@@ -172,9 +217,9 @@ pub fn zn_sin(a: ZN) -> ZN {
 // between endpoints, never a per-lane branch.
 //
 // An endpoint must never wrap silently (a widened interval is exactly what
-// can run away). `Pico8NumInterval`'s `Add`/`Sub` panic when a result leaves
-// `i32`, so each arm computes the signed-overflow predicate and hands the
-// whole column to the scalar implementation if any lane trips it.
+// can run away). Each arm computes the signed-overflow predicate and panics
+// if any lane trips it (`Pico8NumInterval`'s checked operation has no
+// answer); the assembled kernel declines such a lane instead (`Op::NoWrap`).
 
 /// Signed 32-bit add-overflow, per lane: the sign of both operands
 /// differs from the sign of the result. `((a^r) & (b^r)) < 0`.
@@ -194,20 +239,12 @@ fn sub_overflows(a: __m512i, b: __m512i, r: __m512i) -> u16 {
     }
 }
 
-/// The scalar interval implementation, per lane: reached only when a vector
-/// arm detects a wrap, for its panic.
+/// The panic of an interval arm whose `wraps` lanes are not empty.
 #[inline(always)]
-fn zi_scalar(a: ZI, b: ZI, f: impl Fn(IV, IV) -> IV) -> ZI {
-    let (alo, ahi) = (a.lo.to_array(), a.hi.to_array());
-    let (blo, bhi) = (b.lo.to_array(), b.hi.to_array());
-    let mut lo = [P8::from_i16(0); W];
-    let mut hi = [P8::from_i16(0); W];
-    for i in 0..W {
-        let r = f(IV::new(alo[i], ahi[i]), IV::new(blo[i], bhi[i]));
-        lo[i] = r.low;
-        hi[i] = r.high;
+fn no_wrap(op: &str, wraps: u16) {
+    if wraps != 0 {
+        panic!("interval {op} wraps: lanes {wraps:#06x}");
     }
-    ZI { lo: ZN::from_array(lo), hi: ZN::from_array(hi) }
 }
 
 /// The lanes where an interval `+` overflows an endpoint: the assembled
@@ -240,60 +277,47 @@ pub fn zi_neg_wraps(a: ZI) -> u16 {
 
 /// The lanes where interval `a` times the POSITIVE `k` (`zi_scale`) leaves
 /// the 16.16 range: the assembled kernel's error for it (`Op::NoWrap`).
-/// Per lane `Pico8NumInterval::checked_scale_positive`, so the codegen's
-/// two compares are checked against the operation they replace.
+/// Per lane `Pico8Num::checked_mul` of each endpoint (the product is
+/// monotone in it, so the interval wraps iff an endpoint's image does), so
+/// the codegen's compares are checked against the operation they replace.
 #[inline(always)]
 pub fn zi_scale_wraps(a: ZI, k: ZN) -> u16 {
-    zi_scaled_wraps(a, k, |e, k| e.checked_scale_positive(k).is_none())
+    lanes_where(a.lo, k, |e, k| e.checked_mul(k).is_none()) | lanes_where(a.hi, k, |e, k| e.checked_mul(k).is_none())
 }
-/// `zi_scale_wraps` for `a / k` (`Pico8NumInterval::checked_div_positive`):
-/// the scalar `/` SATURATES where the interval one has no answer.
+/// `zi_scale_wraps` for `a / k` (`Pico8Num::checked_div`): the scalar `/`
+/// SATURATES where the interval one has no answer.
 #[inline(always)]
 pub fn zi_div_wraps(a: ZI, k: ZN) -> u16 {
-    zi_scaled_wraps(a, k, |e, k| e.checked_div_positive(k).is_none())
+    zn_div_wraps(a.lo, k) | zn_div_wraps(a.hi, k)
 }
-/// Each endpoint on its own: the map is monotone, so the interval wraps iff
-/// an endpoint's image does (and a lane whose endpoints are out of order is
-/// never asserted on).
-fn zi_scaled_wraps(a: ZI, k: ZN, wraps: impl Fn(IV, P8) -> bool) -> u16 {
-    let (lo, hi, k) = (a.lo.to_array(), a.hi.to_array(), k.to_array());
-    (0..W).fold(0u16, |m, i| {
-        let w = wraps(IV::from_number(lo[i]), k[i]) || wraps(IV::from_number(hi[i]), k[i]);
-        m | (w as u16) << i
-    })
+/// `zi_add_wraps` for `abs`: the low end at MIN (`vpabsd` keeps it MIN).
+#[inline(always)]
+pub fn zi_abs_wraps(a: ZI) -> u16 {
+    zn_abs_wraps(a.lo)
 }
 /// Interval times a POSITIVE `k`, endpoint by endpoint (monotone). Panics on
 /// a wrap, as `zi_add`; the assembled kernel declines such a lane instead.
 #[inline(always)]
 pub fn zi_scale(a: ZI, k: ZN) -> ZI {
-    if zi_scale_wraps(a, k) != 0 {
-        panic!("interval scale wraps: lanes {:#06x}", zi_scale_wraps(a, k));
-    }
+    no_wrap("scale", zi_scale_wraps(a, k));
     ZI { lo: zn_mul(a.lo, k), hi: zn_mul(a.hi, k) }
 }
 /// Interval over a POSITIVE `k`, as `zi_scale`.
 #[inline(always)]
 pub fn zi_div(a: ZI, k: ZN) -> ZI {
-    if zi_div_wraps(a, k) != 0 {
-        panic!("interval divide wraps: lanes {:#06x}", zi_div_wraps(a, k));
-    }
+    no_wrap("divide", zi_div_wraps(a, k));
     ZI { lo: zn_div(a.lo, k), hi: zn_div(a.hi, k) }
 }
 
 #[inline(always)]
 pub fn zi_add(a: ZI, b: ZI) -> ZI {
-    if zi_add_wraps(a, b) != 0 {
-        // The scalar `+` panics on the wrap: never silently.
-        return zi_scalar(a, b, |x, y| x + y);
-    }
+    no_wrap("add", zi_add_wraps(a, b));
     unsafe { ZI { lo: ZN(_mm512_add_epi32(a.lo.0, b.lo.0)), hi: ZN(_mm512_add_epi32(a.hi.0, b.hi.0)) } }
 }
 #[inline(always)]
 pub fn zi_sub(a: ZI, b: ZI) -> ZI {
     // `[a.low - b.high, a.high - b.low]`: the endpoints cross.
-    if zi_sub_wraps(a, b) != 0 {
-        return zi_scalar(a, b, |x, y| x - y);
-    }
+    no_wrap("sub", zi_sub_wraps(a, b));
     unsafe { ZI { lo: ZN(_mm512_sub_epi32(a.lo.0, b.hi.0)), hi: ZN(_mm512_sub_epi32(a.hi.0, b.lo.0)) } }
 }
 #[inline(always)]
@@ -307,17 +331,15 @@ pub fn zi_max(a: ZI, b: ZI) -> ZI {
 
 #[inline(always)]
 pub fn zi_neg(a: ZI) -> ZI {
-    // `-MIN` wraps to `MIN`: panic, as `zi_add` / `zi_sub` do. The
-    // assembled kernel declines such a lane instead (`Op::NoWrap`).
-    if zi_neg_wraps(a) != 0 {
-        return zi_scalar(a, a, |x, _| x.checked_neg().unwrap_or_else(|| panic!("interval negation wraps: -[{:?}, {:?}]", x.low, x.high)));
-    }
+    // `-MIN` wraps to `MIN`: panic, as `zi_add` / `zi_sub` do.
+    no_wrap("negation", zi_neg_wraps(a));
     ZI { lo: zn_neg(a.hi), hi: zn_neg(a.lo) }
 }
 
 /// `abs` of an interval, branch-free: unchanged if non-negative, reflected
 /// if non-positive, else `[0, max(|lo|, |hi|)]`. The cases partition the
-/// lanes, so each is a mask and the result is blends.
+/// lanes, so each is a mask and the result is blends. A low end at MIN
+/// stays MIN (`zn_abs`): the lanes `zi_abs_wraps` declines.
 #[inline(always)]
 pub fn zi_abs(a: ZI) -> ZI {
     unsafe {
@@ -344,7 +366,9 @@ pub fn zi_flr(a: ZI) -> ZN {
 }
 
 /// The premise `zi_fork_flr` is taken under: the lane's interval spans at
-/// most `ways` floors, so the fork's fragments cover it.
+/// most `ways` floors, so the fork's fragments cover it. False where the
+/// grid arithmetic wraps (a low end in the top `ways - 1` floors), so the
+/// fragments' own wrap is never read.
 #[inline(always)]
 pub fn zi_span_ok(a: ZI, ways: u8) -> ZB {
     let (fl, fh) = (zn_flr(a.lo), zn_flr(a.hi));
@@ -575,6 +599,7 @@ pub fn zn_tile_flag_at_lanes(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use celeste_core::pico8_num::Pico8NumInterval as IV;
 
     /// A deterministic spread of raw 16.16 patterns: zero, both signs, the
     /// fractional boundaries `flr` cares about, and the extremes.
@@ -640,27 +665,88 @@ mod tests {
         m
     }
 
+    /// Every arm is the console's operation, bit for bit, on the wide spread
+    /// (the extremes included: there `+ - *` wrap and `/` saturates as the
+    /// console's do).
     #[test]
-    fn vector_arithmetic_matches_the_scalar_operators() {
+    fn vector_arithmetic_matches_the_consoles_operations() {
         for seed in 0..96 {
-            let (a, b) = (small(seed), small(seed + 31));
-            assert_eq!(zn_add(a, b), ref2(a, b, |x, y| x + y), "add {}", seed);
-            assert_eq!(zn_sub(a, b), ref2(a, b, |x, y| x - y), "sub {}", seed);
-            assert_eq!(zn_mul(a, b), ref2(a, b, |x, y| x * y), "mul {}", seed);
-            // The total ops get the wide spread, including i32::MIN.
             let (a, b) = (column(seed), column(seed + 31));
+            assert_eq!(zn_add(a, b), ref2(a, b, |x, y| x.wrapping_add(y)), "add {}", seed);
+            assert_eq!(zn_sub(a, b), ref2(a, b, |x, y| x.wrapping_sub(y)), "sub {}", seed);
+            assert_eq!(zn_mul(a, b), ref2(a, b, |x, y| x.wrapping_mul(y)), "mul {}", seed);
+            assert_eq!(zn_neg(a), ref1(a, |x| x.wrapping_neg()), "neg {}", seed);
             assert_eq!(zn_min(a, b), ref2(a, b, |x, y| x.min(y)), "min {}", seed);
             assert_eq!(zn_max(a, b), ref2(a, b, |x, y| x.max(y)), "max {}", seed);
             assert_eq!(zn_flr(a), ref1(a, |x| x.flr()), "flr {}", seed);
-            assert_eq!(zn_div(a, b), ref2(a, b, |x, y| x / y), "div {}", seed);
+            assert_eq!(zn_div(a, b), ref2(a, b, |x, y| x.saturating_div(y)), "div {}", seed);
             assert_eq!(zn_rem(a, b), ref2(a, b, |x, y| x % y), "rem {}", seed);
         }
+    }
+
+    /// Raw values at and around every edge of the scalar operations: the
+    /// range's ends, 0 and +-1, and the products' and quotients' thresholds
+    /// (`0xb504f3` is ~sqrt(2^47)).
+    const EDGES: [i32; 22] = [
+        i32::MIN, i32::MIN + 1, -0x4000_0000, -0xb5_04f4, -0xb5_04f3, -0x1_0001, -0x1_0000, -0xffff,
+        -0x8000, -1, 0, 1, 0x8000, 0xffff, 0x1_0000, 0x1_0001, 0xb5_04f3, 0xb5_04f4, 0x4000_0000,
+        0x3fff_ffff, i32::MAX - 1, i32::MAX,
+    ];
+
+    /// A SCALAR operation that overflows is the lane's error: its `*_wraps`
+    /// mask is set exactly where `Pico8Num`'s checked operation has no
+    /// answer (the console wrapped or saturated), and on every other lane
+    /// the arm IS the exact result - up to one step inside each edge.
+    #[test]
+    fn a_scalar_operation_wraps_exactly_where_the_checked_operation_fails() {
+        let raw = |v: i32| P8::from_raw(v);
+        let pairs: Vec<(i32, i32)> = EDGES.iter().flat_map(|&a| EDGES.iter().map(move |&b| (a, b))).collect();
+        let (mut fired, mut held) = ([0u32; 6], [0u32; 6]);
+        for chunk in pairs.chunks(W) {
+            let lane = |i: usize| chunk[i % chunk.len()];
+            let a = ZN::from_array(std::array::from_fn(|i| raw(lane(i).0)));
+            let b = ZN::from_array(std::array::from_fn(|i| raw(lane(i).1)));
+            type Exact = fn(P8, P8) -> Option<P8>;
+            let ops: [(&str, ZN, u16, Exact); 6] = [
+                ("add", zn_add(a, b), zn_add_wraps(a, b), |x, y| x.checked_add(y)),
+                ("sub", zn_sub(a, b), zn_sub_wraps(a, b), |x, y| x.checked_sub(y)),
+                ("mul", zn_mul(a, b), zn_mul_wraps(a, b), |x, y| x.checked_mul(y)),
+                ("div", zn_div(a, b), zn_div_wraps(a, b), |x, y| x.checked_div(y)),
+                ("neg", zn_neg(a), zn_neg_wraps(a), |x, _| x.checked_neg()),
+                ("abs", zn_abs(a), zn_abs_wraps(a), |x, _| x.checked_abs()),
+            ];
+            for (k, (name, got, wraps, exact)) in ops.into_iter().enumerate() {
+                for i in 0..W.min(chunk.len()) {
+                    let (x, y) = (a.lane(i), b.lane(i));
+                    match exact(x, y) {
+                        Some(r) => {
+                            assert_eq!(wraps >> i & 1, 0, "{name} {x:?} {y:?}: fits, so no error");
+                            assert_eq!(got.lane(i), r, "{name} {x:?} {y:?}: the exact result");
+                            held[k] += 1;
+                        }
+                        None => {
+                            assert_eq!(wraps >> i & 1, 1, "{name} {x:?} {y:?}: overflows, so the lane's error");
+                            fired[k] += 1;
+                        }
+                    }
+                }
+            }
+        }
+        assert!(fired.iter().chain(&held).all(|n| *n > 0), "every operation both fits and overflows somewhere: fired {fired:?} held {held:?}");
+        // One step inside each end of `+`: exact; one step past: an error.
+        let (max, one) = (zn_splat(raw(i32::MAX - 1)), zn_splat(raw(1)));
+        assert_eq!((zn_add_wraps(max, one), zn_add(max, one)), (0, zn_splat(raw(i32::MAX))));
+        assert_eq!(zn_add_wraps(zn_add(max, one), one), ALL);
+        let min = zn_splat(raw(i32::MIN + 1));
+        assert_eq!((zn_sub_wraps(min, one), zn_sub(min, one)), (0, zn_splat(raw(i32::MIN))));
+        assert_eq!(zn_sub_wraps(zn_sub(min, one), one), ALL);
     }
 
     /// Interval `*` and `/` by a positive constant: a lane wraps exactly
     /// where `Pico8NumInterval`'s checked operation has no answer, one ulp
     /// either side of the edge; elsewhere the endpoints are `zn_mul` /
-    /// `zn_div`'s and the interval operation's.
+    /// `zn_div`'s and the interval operation's. `abs` wraps exactly where
+    /// the low end is MIN.
     #[test]
     fn interval_scale_and_divide_wrap_exactly_where_the_checked_operation_fails() {
         let raw = |v: i32| P8::from_raw(v);
@@ -688,6 +774,10 @@ mod tests {
         for k in [0x1_0000, 0x1_0001, 0x40_0000] {
             assert_eq!(zi_div_wraps(a, zn_splat(raw(k))), 0, "over {k:#x}");
         }
+        let m = |v: i32| zn_splat(raw(v));
+        let abs = ZI { lo: ZN::from_array(std::array::from_fn(|i| raw([i32::MIN, i32::MIN + 1, i32::MIN, -5][i % 4]))), hi: ZN::from_array(std::array::from_fn(|i| raw([i32::MIN, 0, 7, -5][i % 4]))) };
+        assert_eq!(zi_abs_wraps(abs), 0x5555, "abs: a low end at MIN");
+        assert_eq!(zi_abs_wraps(ZI { lo: m(i32::MIN + 1), hi: m(i32::MAX) }), 0, "abs: MIN + eps fits");
         // Where nothing wraps: the checked operation, per lane.
         for seed in 0..32 {
             let a = ival(seed);
@@ -696,7 +786,7 @@ mod tests {
                 for (div, got) in [(false, zi_scale(a, kz)), (true, zi_div(a, kz))] {
                     for i in 0..W {
                         let x = IV::new(a.lo.lane(i), a.hi.lane(i));
-                        let r = if div { x.checked_div_positive(raw(k)) } else { x.checked_scale_positive(raw(k)) };
+                        let r = if div { x.checked_div(IV::from_number(raw(k))) } else { x.checked_mul(IV::from_number(raw(k))) };
                         let r = r.expect("small values fit");
                         assert_eq!((got.lo.lane(i), got.hi.lane(i)), (r.low, r.high), "seed {seed} k {k:#x} div {div}");
                     }
@@ -711,15 +801,16 @@ mod tests {
     fn the_multiply_weave_puts_every_lane_back_where_it_came_from() {
         let a = ZN::from_array(std::array::from_fn(|i| P8::from_i16(i as i16 + 1)));
         let b = ZN::from_array(std::array::from_fn(|i| P8::from_i16(100 - i as i16)));
-        assert_eq!(zn_mul(a, b), ref2(a, b, |x, y| x * y));
+        let mul = |x: P8, y: P8| x.checked_mul(y).expect("small");
+        assert_eq!(zn_mul(a, b), ref2(a, b, mul));
         // Negatives in alternating lanes: the odd-lane shift must be
         // arithmetic.
         let c = ZN::from_array(std::array::from_fn(|i| {
             P8::from_i16(if i % 2 == 0 { -(i as i16) - 1 } else { i as i16 + 1 })
         }));
-        assert_eq!(zn_mul(c, b), ref2(c, b, |x, y| x * y));
-        assert_eq!(zn_mul(b, c), ref2(b, c, |x, y| x * y));
-        assert_eq!(zn_mul(c, c), ref2(c, c, |x, y| x * y));
+        assert_eq!(zn_mul(c, b), ref2(c, b, mul));
+        assert_eq!(zn_mul(b, c), ref2(b, c, mul));
+        assert_eq!(zn_mul(c, c), ref2(c, c, mul));
     }
 
     #[test]
@@ -770,8 +861,8 @@ mod tests {
                 }
                 ZI { lo: ZN::from_array(lo), hi: ZN::from_array(hi) }
             };
-            assert_eq!(zi_add(a, b), sc(&|x, y| x + y), "zi_add {}", seed);
-            assert_eq!(zi_sub(a, b), sc(&|x, y| x - y), "zi_sub {}", seed);
+            assert_eq!(zi_add(a, b), sc(&|x, y| x.checked_add(y).expect("small")), "zi_add {}", seed);
+            assert_eq!(zi_sub(a, b), sc(&|x, y| x.checked_sub(y).expect("small")), "zi_sub {}", seed);
             assert_eq!(
                 zi_min(a, b),
                 sc(&|x, y| IV::new(x.low.min(y.low), x.high.min(y.high))),
@@ -792,9 +883,9 @@ mod tests {
                 let r = if l >= zero {
                     IV::new(l, h)
                 } else if h <= zero {
-                    IV::new(h.abs(), l.abs())
+                    IV::new(h.saturating_abs(), l.saturating_abs())
                 } else {
-                    IV::new(zero, l.abs().max(h.abs()))
+                    IV::new(zero, l.saturating_abs().max(h.saturating_abs()))
                 };
                 lo[i] = r.low;
                 hi[i] = r.high;

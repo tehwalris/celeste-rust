@@ -411,12 +411,12 @@ mod tests {
 
         // Just inside the edges: the console's value, a point a point.
         let x = P8::from_raw(i32::MAX - 1);
-        assert_eq!(d.arith(Arith::Add, &raw(i32::MAX - 1), &raw(1)).unwrap(), Iv::from_number(x + P8::from_raw(1)));
+        assert_eq!(d.arith(Arith::Add, &raw(i32::MAX - 1), &raw(1)).unwrap(), Iv::from_number(x.wrapping_add(P8::from_raw(1))));
         assert_eq!(d.arith(Arith::Sub, &raw(i32::MIN + 1), &raw(1)).unwrap(), min);
         assert_eq!(d.fun1(Fun1::Neg, &max).unwrap(), raw(-i32::MAX));
         assert_eq!(d.fun1(Fun1::Abs, &raw(i32::MIN + 1)).unwrap(), max);
         let (a, b) = (P8::from_i16(181), P8::from_i16(181));
-        assert_eq!(d.arith(Arith::Mul, &Iv::from_number(a), &Iv::from_number(b)).unwrap(), Iv::from_number(a * b));
+        assert_eq!(d.arith(Arith::Mul, &Iv::from_number(a), &Iv::from_number(b)).unwrap(), Iv::from_number(a.wrapping_mul(b)));
         assert_eq!(d.arith(Arith::Div, &min, &one).unwrap(), min, "MIN / 1 fits");
         // An interval by a positive scalar, and by zero (which panicked).
         assert_eq!(d.arith(Arith::Mul, &two, &Iv::new(P8::from_i16(-3), P8::from_i16(4))).unwrap(), Iv::new(P8::from_i16(-6), P8::from_i16(8)));

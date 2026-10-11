@@ -547,8 +547,9 @@ impl<'a> Lower<'a> {
         // Endpoints cross: [a.lo - b.hi, a.hi - b.lo].
         [self.dbin(ROp::SubD, a[0], b[1]), self.dbin(ROp::SubD, a[1], b[0])]
     }
-    /// `Op::NoWrap` of interval `+`/`-` with result `r`: overflow iff
-    /// `(x^r)&(y^r)` (add) / `(x^y)&(x^r)` (sub) is negative (`kernel::zi_*_wraps`).
+    /// `Op::NoWrap` of interval `+`/`-` with result `r`, neither operand a
+    /// literal point: overflow iff `(x^r)&(y^r)` (add) / `(x^y)&(x^r)` (sub)
+    /// is negative (`kernel::zi_*_wraps`).
     fn zi_arith_no_wrap(&mut self, sub: bool, a: [Vreg; 2], b: [Vreg; 2], r: [Vreg; 2]) -> Vreg {
         let (bl, bh, imm) = if sub { (b[1], b[0], 0x18) } else { (b[0], b[1], 0x42) };
         let ol = self.ternlog(a[0], bl, r[0], imm);
@@ -556,6 +557,12 @@ impl<'a> Lower<'a> {
         let any = self.dbin(ROp::OrD, ol, oh);
         let zero = self.num_reg(NumVal::ConstI32(0));
         self.cmp(5, any, Src::Reg(zero)) // any >= 0  (NLT)
+    }
+    /// The same for a POINT `+`/`-` (`kernel::zn_*_wraps`): one plane.
+    fn zn_arith_no_wrap(&mut self, sub: bool, a: Vreg, b: Vreg, r: Vreg) -> Vreg {
+        let o = self.ternlog(a, b, r, if sub { 0x18 } else { 0x42 });
+        let zero = self.num_reg(NumVal::ConstI32(0));
+        self.cmp(5, o, Src::Reg(zero)) // o >= 0  (NLT)
     }
     fn zi_min(&mut self, a: [Vreg; 2], b: [Vreg; 2]) -> [Vreg; 2] {
         [self.dbin(ROp::MinSD, a[0], b[0]), self.dbin(ROp::MinSD, a[1], b[1])]
@@ -569,16 +576,12 @@ impl<'a> Lower<'a> {
         let hi = self.neg(a[0]);
         [lo, hi]
     }
-    /// `Op::NoWrap` of a negation: `lo != MIN` (`kernel::zi_neg_wraps`).
-    fn zi_neg_no_wrap(&mut self, a: [Vreg; 2]) -> Vreg {
-        let min = self.num_reg(NumVal::ConstI32(i32::MIN));
-        self.cmp(4, a[0], Src::Reg(min)) // lo != MIN  (NE)
-    }
-    /// `Op::NoWrap` of an interval `*` / `/` by a positive literal: the
-    /// operation is monotone, so it fits iff `lo >= fits.0` and `hi <=
-    /// fits.1` (`graph::Scaled::fits`, `kernel::zi_scale_wraps` /
-    /// `zi_div_wraps`). A side the literal cannot overflow is no compare.
-    fn zi_scaled_no_wrap(&mut self, a: [Vreg; 2], fits: (i32, i32)) -> MaskVal {
+    /// `Op::NoWrap` of an operation with ONE operand not a literal point
+    /// (`graph::one_operand`), whose low and high ends are `a` (a point's
+    /// twice): it fits iff `lo >= fits.0` and `hi <= fits.1` (the
+    /// `kernel::*_wraps` masks). A side every value fits is no compare (a
+    /// negation's high end, `x + k`'s low end for `k >= 0`, ...).
+    fn one_operand_no_wrap(&mut self, a: [Vreg; 2], fits: (i32, i32)) -> MaskVal {
         let lo = if fits.0 == i32::MIN {
             MaskVal::Const(true)
         } else {
@@ -614,7 +617,12 @@ impl<'a> Lower<'a> {
         let fh = self.flr(a[1]);
         self.mask_eq(fl, fh)
     }
-    /// `zi_span_ok(a, ways)`: does it span at most `ways` floors?
+    /// `zi_span_ok(a, ways)`: does it span at most `ways` floors? The grid
+    /// arithmetic here and in `zi_fork_flr` wraps only for a lane whose low
+    /// end lies in the top `ways - 1` floors, where `fl + (ways - 1) * step`
+    /// wraps to the bottom and this is false: the fork's own error
+    /// (`trace::error`, charged where a fork's operand is an interval, as
+    /// every fork's is), so no such lane emits.
     fn zi_span_ok(&mut self, a: [Vreg; 2], ways: u8) -> Vreg {
         let step = 1i32 << 16;
         let fl = self.flr(a[0]);
@@ -1123,38 +1131,42 @@ impl<'a> Lower<'a> {
                 let ok = self.zi_span_ok(ar, *ways);
                 Value::Bool([MaskVal::Reg(ok), MaskVal::Const(true)])
             }
-            // The own error of an interval `+`, `-` or negation; an EXACT one
-            // wraps as PICO-8 does, so it holds.
+            // The own error of `+ - * /`, negation and `abs`, on points and
+            // intervals (`trace::error`): did the exact result leave the
+            // 16.16 range on this lane? Anything else fits (as
+            // `Graph::fold`).
             Op::NoWrap => {
                 let x = a[0];
                 let xn = self.g.get(x);
-                let ok = match (&xn.op, self.dom(x)) {
-                    (op @ (Op::Add | Op::Sub), 2) => {
+                let ok = match (graph::one_operand(self.g, x), &xn.op) {
+                    (_, op) if !matches!(op, Op::Add | Op::Sub | Op::Neg | Op::Abs | Op::Mul | Op::Div) => MaskVal::Const(true),
+                    // Nothing fits (`x / 0`): `Graph::fold` decides it, and
+                    // this is the same constant.
+                    (Some(graph::OneOperand { fits: None, .. }), _) => MaskVal::Const(false),
+                    (Some(graph::OneOperand { operand, fits: Some(fits) }), _) => {
+                        let ends = self.as_ival(xn.args[operand])?;
+                        let ends = self.ival_regs(ends);
+                        self.one_operand_no_wrap(ends, fits)
+                    }
+                    (None, op @ (Op::Add | Op::Sub)) => {
                         let (p, q) = (xn.args[0], xn.args[1]);
                         let sub = matches!(op, Op::Sub);
-                        let (ip, iq, ir) = (self.as_ival(p)?, self.as_ival(q)?, self.as_ival(x)?);
-                        let (pr, qr, rr) = (self.ival_regs(ip), self.ival_regs(iq), self.ival_regs(ir));
-                        MaskVal::Reg(self.zi_arith_no_wrap(sub, pr, qr, rr))
-                    }
-                    (Op::Neg, 2) => {
-                        let ip = self.as_ival(xn.args[0])?;
-                        let pr = self.ival_regs(ip);
-                        MaskVal::Reg(self.zi_neg_no_wrap(pr))
-                    }
-                    (Op::Mul | Op::Div, 2) => {
-                        let Some(sc) = graph::scaled(self.g, x) else {
-                            bail!("node {}: NoWrap of an interval {:?} by a non-positive / non-constant scalar is not modelled", id, xn.op);
-                        };
-                        let operand = xn.args[sc.operand];
-                        if self.dom(operand) != 2 {
-                            bail!("node {}: NoWrap of {:?}: the interval is not the operand `scaled` names", id, xn.op);
+                        if self.dom(x) == 2 {
+                            let (ip, iq, ir) = (self.as_ival(p)?, self.as_ival(q)?, self.as_ival(x)?);
+                            let (pr, qr, rr) = (self.ival_regs(ip), self.ival_regs(iq), self.ival_regs(ir));
+                            MaskVal::Reg(self.zi_arith_no_wrap(sub, pr, qr, rr))
+                        } else {
+                            let (np, nq, nr) = (self.as_num(p)?, self.as_num(q)?, self.as_num(x)?);
+                            let (pr, qr, rr) = (self.num_reg(np), self.num_reg(nq), self.num_reg(nr));
+                            MaskVal::Reg(self.zn_arith_no_wrap(sub, pr, qr, rr))
                         }
-                        let ip = self.as_ival(operand)?;
-                        let pr = self.ival_regs(ip);
-                        self.zi_scaled_no_wrap(pr, sc.fits())
                     }
-                    // Exact, or rewritten into another op (as `Graph::fold`).
-                    _ => MaskVal::Const(true),
+                    (None, op) => bail!(
+                        "node {}: NoWrap of {:?} with no literal operand (`{}`) is not modelled: no kernel computes whether it overflows",
+                        id,
+                        op,
+                        self.describe(x, 2)
+                    ),
                 };
                 Value::Bool([ok, MaskVal::Const(true)])
             }

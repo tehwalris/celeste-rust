@@ -163,8 +163,7 @@ OR(error(args))`, materialized once, after fusion:
 | `Sel(c, t, f)` | `not Known(c)` |
 | a fork fragment | `not SplitOk(ways)` / `not SplitOkTab`: the lane spans more parts than enumerated |
 | an unrolled loop | its condition still holds after the bound (`State::ended`) |
-| interval `Add`/`Sub`/`Neg` | `not NoWrap(op)`: an endpoint overflowed 16.16 on this lane (`b47b118`; skipped where the static ranges bound the result) |
-| interval `Mul`/`Div` by a positive literal | `not NoWrap(op)`: an endpoint left 16.16 (`*` wraps, `/` saturates) where `Pico8NumInterval`'s checked operation has none (branch `mul-nowrap`; two compares against `graph::Scaled::fits`; none for a factor at most 1 or a divisor at least 1, so never for `div_pow2`; skipped where the operand's static range fits) |
+| `Add`/`Sub`/`Neg`/`Abs`/`Mul`/`Div`, of POINTS and of intervals | `not NoWrap(op)`: the exact result (an endpoint) left 16.16 on this lane, where the console wraps `+ - *` and negation and saturates `/` and `abs` (intervals: `b47b118`, `mul-nowrap`; points and `abs`: 2026-10-11, branch `overflow-errors`). Skipped where the static ranges bound the exact result (`Symbolic::bounded`, unwrapped and unsaturated). With one operand not a literal point (`graph::one_operand`: `x + k`, `k - x`, `x * k`, `x / k`, `-x`, `abs(x)`) the check is at most two compares of that operand (of an interval's two ends), none where every value fits (`x / 2`, `x * 0.5`: `Graph::fold` decides it) and constant false where none does (`x / 0`); two non-literals' `+`/`-` is the sign test (`vpternlogd` + compare); two non-literals' `*`, and `/` by one, have no check (the codegen refuses them; the cart has none) |
 | a widening | containment of the slot it writes (`widen::SlotErrors`), only where stored |
 | `Restrict(lo, hi)(x)` (a bounded input) | `Lo(x) < lo or Hi(x) > hi` on the raw input, charged to EVERY outcome |
 | `Pin(c)(x)` (a pinned input) | `x` outside `c` on the raw input, an error of the whole frame (`error::pins_hold`) |
@@ -314,7 +313,7 @@ platform tension: storing a platform's `x` as its whole path is what lets
 frames merge, and the overlap predicates only fold at ~4.5 px granularity -
 exactly where no cross-frame merge survives; storing zones would cost ~Z
 tuples (one phase drives all ten platforms), the ~18 px middle unmeasured.
-**Interval overflow.** Until 2026-10-03 the assembled interval `+`, `-` and
+**Overflow.** Until 2026-10-03 the assembled interval `+`, `-` and
 negation WRAPPED an overflowing endpoint silently (plain `vpaddd`/`vpsubd`;
 the Rust primitives panicked, and the per-op tests bounded their inputs).
 Fixed on `arc-sets` by `549ecf5` (overflow -> the whole range; with the
@@ -328,13 +327,44 @@ MAX]. (`72fdea7` on branch `asm-interval-wrap` was a rejected first version.)
 Interval `Mul`/`Div` by a positive literal got the same own error on
 2026-10-10 (branch `mul-nowrap`): the operation is monotone, so the check is
 the operand's endpoints against the range whose image fits (bisected on
-`checked_scale_positive` / `checked_div_positive`). The cart's factors
+`checked_mul` / `checked_div`: `Pico8Num::mul_fits`). The cart's factors
 above 1 multiply bounded values (`sin(..)*2`) and its divisors are at least
 1, so no kernel of rooms (1,0), (6,2) 100% or (4,2) emits one (their trees
 and dynamic instruction counts are unchanged). The static range of
 a product is now computed unwrapped (`pieces_of`: past 16.16 it is unknown,
 not PICO-8's wrapped endpoints). Which results ran before the fix:
 plans/results.md.
+**Every overflow is an error** (Philippe's decision, 2026-10-11, branch
+`overflow-errors`): the game never leaves the 16.16 range, so nothing
+wraps or saturates silently, for points as for intervals. `Pico8Num` has
+no `+ - * /` operators: `checked_*` (the exact result or `None`) and the
+console's `wrapping_*`/`saturating_*`, spelled out, for the kernels' lanes
+and the tests. (1) THE KERNELS: a scalar `+ - * /`, negation or `abs` owes
+`NoWrap` as an interval one does (the table above; `kernel::zn_*_wraps`
+the reference masks), so an overflowing lane declines - a fatal coverage
+gap. (2) THE TRACER'S CONSTANT FOLDING: the cart's arithmetic on constants
+goes through `Concrete` (checked: an error naming the operation, its
+operands and the source text, at trace time); `Graph::fold` of literal
+points panics with the operands (it has no error to return; what the cart
+folds never reaches it); the evaluator (`Graph::eval`, the lowering's
+fold, level -1, `Points`) is checked throughout (an overflow is an error,
+TOP where lenient), and a literal past the range (`32768`), a `for`
+counter past it, are errors. (3) ELSEWHERE: the fall floors' collide
+window and the fruit's band (checked), the reference's distance tests
+(`i64`), and the fork grid's arithmetic in `zi_span_ok`/`zi_fork_flr`,
+which wraps only for a lane in its operand's top `ways - 1` floors, where
+`SplitOk(ways)` is false - the fork's own error, charged wherever a fork's
+operand is an interval. The transfer roots are error roots too (the
+remainder before the widening stores no field). The dead timers'
+`minutes + 1` is checked at the stored constant
+(`widen::tests::dead_fields_are_unread`). Cost, measured (t1 metrics,
+2026-10-11): kernel dynamic instructions +1.9% (room (1,0) f55), +3.0%
+((6,2) 100% f50), +2.6% ((4,2) `n` f60); outputs identical, no lane
+declines. The checks the ranges do not fold: `spd +- dash_accel` in
+`appr` (the dash's acceleration is no restricted input: 1.6-2.7%), and
+`dash_effect_time - 1`, `grace - 1`, `dash_time - 1` (0.2-1.2%; the first
+is stored `max(v, 0)`, the others decrement under `> 0`, which no range
+analysis reads); interval `+ k` as compares saved 0.4% in (4,2).
 
 ## The forward frame and the storage (storage v2, 2026-10-10)
 

@@ -182,7 +182,7 @@ impl RefEngine {
             for leaf in &leaves {
                 for (x, y) in players(leaf)? {
                     ensure!(
-                        before.iter().any(|&(bx, by)| (x - bx).abs() <= PLAYER_STEP && (y - by).abs() <= PLAYER_STEP),
+                        before.iter().any(|&(bx, by)| apart_by(x, bx) <= raw(PLAYER_STEP) && apart_by(y, by) <= raw(PLAYER_STEP)),
                         "pinned floors: a player at ({x:?}, {y:?}) is more than {PLAYER_STEP:?} from every player of the input {before:?}"
                     );
                 }
@@ -262,6 +262,16 @@ const PLAYER_FAR: P8 = P8::from_i16(20);
 /// (a spring on it reads its `collideable` and breaks with it).
 const OTHERS_FAR: P8 = P8::from_i16(16);
 
+/// `|a - b|` in raw 16.16, exact (`i64`: two coordinates far apart never
+/// wrap into near ones).
+fn apart_by(a: P8, b: P8) -> i64 {
+    (raw(a) - raw(b)).abs()
+}
+
+fn raw(v: P8) -> i64 {
+    v.as_raw_u32() as i32 as i64
+}
+
 /// What a reference frame ran from, for its error: the input (`None`: the
 /// buttons forked) and where every player and player spawn was.
 fn ran_from(st: &State<RefDomain>, byte: Option<u8>) -> String {
@@ -331,7 +341,7 @@ fn pin_isolated_floors(st: &mut State<RefDomain>) -> Result<bool> {
             others.push(position(st, &o)?);
         }
     }
-    let apart = |a: (P8, P8), b: (P8, P8), d: P8| (a.0 - b.0).abs() >= d || (a.1 - b.1).abs() >= d;
+    let apart = |a: (P8, P8), b: (P8, P8), d: P8| apart_by(a.0, b.0) >= raw(d) || apart_by(a.1, b.1) >= raw(d);
     let mut any = false;
     for f in &floors {
         let ps = field(f, &["state"]);

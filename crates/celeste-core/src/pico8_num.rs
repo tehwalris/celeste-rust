@@ -2,14 +2,20 @@
 // against a real PICO-8 0.2.7a6 (`lua/probe/num_*`, the tests below): literal
 // parsing, `+ - * / %`, the range edges (negation wraps, `abs` and `/`
 // saturate) and `sin` (a table dumped from the console).
+//
+// OVERFLOW IS AN ERROR (Philippe's decision, 2026-10-11): the game never
+// leaves the 16.16 range, so where the console would wrap (`+ - *`, unary
+// minus, a literal's integer part) or saturate (`/`, `abs`) the exact result
+// does not exist. So there are no `+ - * /` OPERATORS here, nothing that
+// wraps where an expression does not say so: `checked_*` give the exact
+// result or `None`, and the console's own `wrapping_*` / `saturating_*` are
+// spelled out for the kernels (which compute them and decline the lane where
+// the checked operation fails, `Op::NoWrap`) and the tests that pin them.
+// `%` never overflows and keeps its operator.
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
-use std::{
-    fmt,
-    ops::{Add, Div, Mul, Neg, Rem, Sub},
-    str::FromStr,
-};
+use std::{fmt, ops::Rem, str::FromStr};
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct Pico8Num(i32);
@@ -82,12 +88,13 @@ impl Pico8Num {
         self.0 as u32
     }
 
-    /// Parse a decimal literal the way the console does: multiply by 65536,
-    /// TRUNCATE toward zero, and let an out-of-range integer part WRAP
-    /// (`65535` is -1). In `i128` on the digits, not floating point (f32
-    /// has too few bits, and Rust's float-to-int casts saturate), so it is
-    /// exact for any input length.
-    fn parse_decimal(s: &str) -> Option<Self> {
+    /// A decimal literal's EXACT raw value, as the console reads it:
+    /// multiplied by 65536 and TRUNCATED toward zero (the console then lets
+    /// an out-of-range integer part WRAP: `65535` is -1, which `FromStr`
+    /// refuses). In `i128` on the digits, not floating point (f32 has too
+    /// few bits, and Rust's float-to-int casts saturate), so it is exact for
+    /// any input length; `None` for a malformed literal or one past `i128`.
+    fn parse_decimal(s: &str) -> Option<i128> {
         let (negative, digits) = match s.strip_prefix('-') {
             Some(rest) => (true, rest),
             None => (false, s),
@@ -110,33 +117,152 @@ impl Pico8Num {
             let denominator = 10i128.checked_pow(u32::try_from(frac_text.len()).ok()?)?;
             frac_raw = scaled.checked_mul(65536)? / denominator;
         }
-        let raw = (int_part << 16).wrapping_add(frac_raw) as i32;
-        Some(Self(if negative { raw.wrapping_neg() } else { raw }))
+        let raw = int_part.checked_mul(1 << 16)?.checked_add(frac_raw)?;
+        Some(if negative { -raw } else { raw })
     }
 
-    pub const fn const_mul(&self, rhs: &Self) -> Self {
+    /// `i64` raw 16.16 as a number, `None` where it leaves the range.
+    fn fit(raw: i64) -> Option<Self> {
+        i32::try_from(raw).ok().map(Self)
+    }
+
+    /// `+`, the exact sum: `None` where the console WRAPS it.
+    pub const fn checked_add(self, rhs: Self) -> Option<Self> {
+        match self.0.checked_add(rhs.0) {
+            Some(v) => Some(Self(v)),
+            None => None,
+        }
+    }
+
+    /// `-`, the exact difference: `None` where the console WRAPS it.
+    pub const fn checked_sub(self, rhs: Self) -> Option<Self> {
+        match self.0.checked_sub(rhs.0) {
+            Some(v) => Some(Self(v)),
+            None => None,
+        }
+    }
+
+    /// `*`, the 32-bit-shifted product floored (`>> 16`): `None` where the
+    /// console WRAPS it.
+    pub fn checked_mul(self, rhs: Self) -> Option<Self> {
+        Self::fit((self.0 as i64 * rhs.0 as i64) >> 16)
+    }
+
+    /// `/`, the quotient truncated toward zero: `None` where the console
+    /// SATURATES it, a zero divisor included.
+    pub fn checked_div(self, rhs: Self) -> Option<Self> {
+        if rhs.0 == 0 {
+            return None;
+        }
+        Self::fit(((self.0 as i64) << 16) / rhs.0 as i64)
+    }
+
+    /// Unary minus: `None` for `-32768`, which the console WRAPS to itself.
+    pub const fn checked_neg(self) -> Option<Self> {
+        match self.0.checked_neg() {
+            Some(v) => Some(Self(v)),
+            None => None,
+        }
+    }
+
+    /// `abs`: `None` for `-32768`, which the console SATURATES.
+    pub const fn checked_abs(self) -> Option<Self> {
+        match self.0.checked_abs() {
+            Some(v) => Some(Self(v)),
+            None => None,
+        }
+    }
+
+    /// The console's `+`, which WRAPS. For the kernels' lanes (whose
+    /// `NoWrap` declines where `checked_add` fails) and the tests.
+    pub const fn wrapping_add(self, rhs: Self) -> Self {
+        Self(self.0.wrapping_add(rhs.0))
+    }
+
+    /// The console's `-`, which WRAPS (as `wrapping_add`).
+    pub const fn wrapping_sub(self, rhs: Self) -> Self {
+        Self(self.0.wrapping_sub(rhs.0))
+    }
+
+    /// The console's `*`, which WRAPS (as `wrapping_add`).
+    pub const fn wrapping_mul(self, rhs: Self) -> Self {
         let high = (self.0 as i64).wrapping_mul(rhs.0 as i64);
         let low = high >> 16;
         Self(low as i32)
     }
 
-    /// Negation WRAPS: the console gives `-(-32768) == -32768`.
-    pub const fn const_neg(self) -> Self {
+    /// The console's unary minus, which WRAPS: `-(-32768) == -32768`.
+    pub const fn wrapping_neg(self) -> Self {
         Self(self.0.wrapping_neg())
     }
 
-    /// `abs` SATURATES, unlike negation: the console gives
+    /// The console's `abs`, which SATURATES, unlike negation:
     /// `abs(-32768) == 0x7fff.ffff` while `-(-32768) == -32768`.
-    pub const fn abs(self) -> Self {
+    pub const fn saturating_abs(self) -> Self {
         Self(self.0.saturating_abs())
+    }
+
+    /// The console's `/`: truncate toward zero, and SATURATE to
+    /// +/-0x7fff.ffff if the exact quotient does not fit - including
+    /// division by zero (`1/0 = 0x7fff.ffff`, `-1/0 = 0x8000.0001`, `0/0 =
+    /// 0x7fff.ffff`). The clamp is for overflow only: `min/1 = 0x8000.0000`
+    /// fits and is returned as is. The kernels' scalar `/` (as
+    /// `wrapping_add`).
+    pub fn saturating_div(self, rhs: Self) -> Self {
+        const LIMIT: i32 = 0x7fff_ffff;
+        if rhs.0 == 0 {
+            // 0/0 saturates POSITIVE on the console, so `>= 0` not `> 0`.
+            return Self(if self.0 >= 0 { LIMIT } else { -LIMIT });
+        }
+        let quotient = ((self.0 as i64) << 16) / (rhs.0 as i64);
+        Self(match i32::try_from(quotient) {
+            Ok(exact) => exact,
+            Err(_) if quotient > 0 => LIMIT,
+            Err(_) => -LIMIT,
+        })
+    }
+
+    /// The `x` whose `x * k` fits the 16.16 range (`checked_mul`), as `[lo,
+    /// hi]`: every `x` for `|k| <= 1`. An interval multiplies without a wrap
+    /// iff both its ends lie inside (the product is monotone in `x`). The
+    /// kernels' check for it (`Op::NoWrap`) is those compares.
+    pub fn mul_fits(k: Self) -> (Self, Self) {
+        Self::fitting(|x| x.checked_mul(k).is_some())
+    }
+
+    /// `mul_fits` for `x / k` (`checked_div`); `None` for `k == 0`, where
+    /// no `x` does (the console saturates).
+    pub fn div_fits(k: Self) -> Option<(Self, Self)> {
+        (k.0 != 0).then(|| Self::fitting(|x| x.checked_div(k).is_some()))
+    }
+
+    /// The `[lo, hi]` where a map of `x` fits: `fits(0)` holds, and moving
+    /// away from 0 only grows the image's magnitude, so the set is an
+    /// interval about 0. Bisected on the checked operation itself, so it
+    /// agrees with it by construction.
+    fn fitting(fits: impl Fn(Self) -> bool) -> (Self, Self) {
+        assert!(fits(Self(0)), "zero maps to zero");
+        // The last `x` from 0 toward `end` that fits (`fits` is a prefix).
+        let edge = |end: i32| -> i32 {
+            let (mut good, mut bad) = (0i64, end as i64);
+            if fits(Self(end)) {
+                return end;
+            }
+            while (bad - good).abs() > 1 {
+                let mid = good + (bad - good) / 2;
+                if fits(Self(mid as i32)) {
+                    good = mid;
+                } else {
+                    bad = mid;
+                }
+            }
+            good as i32
+        };
+        (Self(edge(i32::MIN)), Self(edge(i32::MAX)))
     }
 
     pub const fn flr(self) -> Self {
         Self::from_i16((self.0 >> 16) as i16)
-    }
-
-    pub const fn next_smallest(self) -> Self {
-        Self(self.0 - 1)
     }
 
     /// PICO-8 `sin`: the argument is in TURNS and the result is INVERTED
@@ -165,59 +291,6 @@ impl fmt::Debug for Pico8Num {
     }
 }
 
-impl Add for Pico8Num {
-    type Output = Self;
-
-    fn add(self, rhs: Self) -> Self::Output {
-        Self(self.0.wrapping_add(rhs.0))
-    }
-}
-
-impl Sub for Pico8Num {
-    type Output = Self;
-
-    fn sub(self, rhs: Self) -> Self::Output {
-        Self(self.0.wrapping_sub(rhs.0))
-    }
-}
-
-impl Mul for Pico8Num {
-    type Output = Self;
-
-    fn mul(self, rhs: Self) -> Self::Output {
-        self.const_mul(&rhs)
-    }
-}
-
-impl Div for Pico8Num {
-    type Output = Self;
-
-    /// Truncate toward zero, and SATURATE to +/-0x7fff.ffff if the exact
-    /// quotient does not fit - including division by zero (`1/0 =
-    /// 0x7fff.ffff`, `-1/0 = 0x8000.0001`, `0/0 = 0x7fff.ffff`). The clamp is
-    /// for overflow only: `min/1 = 0x8000.0000` fits and is returned as is.
-    /// A panic here would be unsound (the search would lose states the
-    /// console reaches).
-    fn div(self, rhs: Self) -> Self::Output {
-        const LIMIT: i64 = 0x7fff_ffff;
-        if rhs.0 == 0 {
-            // 0/0 saturates POSITIVE on the console, so `>= 0` not `> 0`.
-            return Self(if self.0 >= 0 { LIMIT as i32 } else { -(LIMIT as i32) });
-        }
-        let quotient = ((self.0 as i64) << 16) / (rhs.0 as i64);
-        Self(match i32::try_from(quotient) {
-            Ok(exact) => exact,
-            Err(_) => {
-                if quotient > 0 {
-                    LIMIT as i32
-                } else {
-                    -(LIMIT as i32)
-                }
-            }
-        })
-    }
-}
-
 
 impl Rem for Pico8Num {
     type Output = Self;
@@ -235,20 +308,17 @@ impl Rem for Pico8Num {
     }
 }
 
-impl Neg for Pico8Num {
-    type Output = Self;
-
-    fn neg(self) -> Self::Output {
-        self.const_neg()
-    }
-}
-
 impl FromStr for Pico8Num {
     type Err = anyhow::Error;
 
+    /// A literal's exact value; one whose integer part leaves the 16.16
+    /// range (which the console WRAPS: `32768` is -32768) is an error.
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        Self::parse_decimal(s.trim())
-            .ok_or_else(|| anyhow::anyhow!("{:?} is not a PICO-8 number literal", s))
+        let raw = Self::parse_decimal(s.trim()).ok_or_else(|| anyhow::anyhow!("{:?} is not a PICO-8 number literal", s))?;
+        i64::try_from(raw)
+            .ok()
+            .and_then(Self::fit)
+            .ok_or_else(|| anyhow::anyhow!("the literal {s:?} leaves the 16.16 range (PICO-8 would wrap it; overflow is an error)"))
     }
 }
 
@@ -287,22 +357,11 @@ impl Pico8NumInterval {
 }
 
 impl Pico8NumInterval {
-    /// Endpoint arithmetic is only sound when no value in the interval
-    /// wraps: if one endpoint wraps, the true result is two disjoint
-    /// segments. The i64 extremes bound every value, so checking them is a
-    /// complete wrap detector. Panics on a wrap: it is a modeling surprise
-    /// to investigate, not a case to paper over.
-    fn from_i64_endpoints(low: i64, high: i64) -> Self {
-        Self::try_from_i64_endpoints(low, high).unwrap_or_else(|| {
-            panic!(
-                "interval arithmetic wrapped: endpoints [{}, {}] leave the 16.16 range",
-                low, high
-            )
-        })
-    }
-
-    /// The same, `None` on a wrap, for callers with a sound answer for it
-    /// (`transpile::graph`'s evaluator: inputs at top, result `full()`).
+    /// The interval of two `i64` raw endpoints, `None` where one leaves the
+    /// 16.16 range. Endpoint arithmetic is sound only when no value in the
+    /// interval wraps (one wrapped endpoint makes the true result two
+    /// disjoint segments); the `i64` extremes bound every value, so checking
+    /// them is a complete wrap detector.
     fn try_from_i64_endpoints(low: i64, high: i64) -> Option<Self> {
         if low >= i32::MIN as i64 && high <= i32::MAX as i64 {
             Some(Self::new(Pico8Num(low as i32), Pico8Num(high as i32)))
@@ -311,7 +370,7 @@ impl Pico8NumInterval {
         }
     }
 
-    /// `+` and `-` that report a wrap instead of panicking on it.
+    /// `+` and `-`, `None` where an endpoint WRAPS.
     pub fn checked_add(self, rhs: Self) -> Option<Self> {
         Self::try_from_i64_endpoints(
             self.low.0 as i64 + rhs.low.0 as i64,
@@ -359,89 +418,15 @@ impl Pico8NumInterval {
     /// `abs(-32768)` to `0x7fff.ffff`).
     pub fn checked_abs(self) -> Option<Self> {
         let zero = Pico8Num(0);
-        if self.low.0 == i32::MIN {
-            None
-        } else if self.low >= zero {
+        // `low` is not MIN past here, nor is `high <= 0` (`low <= high`).
+        let low = self.low.checked_abs()?;
+        if self.low >= zero {
             Some(self)
         } else if self.high <= zero {
-            Some(Self::new(-self.high, -self.low))
+            Some(Self::new(self.high.checked_abs()?, low))
         } else {
-            Some(Self::new(zero, (-self.low).max(self.high)))
+            Some(Self::new(zero, low.max(self.high)))
         }
-    }
-}
-
-impl Add for Pico8NumInterval {
-    type Output = Self;
-
-    fn add(self, rhs: Self) -> Self::Output {
-        Self::from_i64_endpoints(
-            self.low.0 as i64 + rhs.low.0 as i64,
-            self.high.0 as i64 + rhs.high.0 as i64,
-        )
-    }
-}
-
-impl Sub for Pico8NumInterval {
-    type Output = Self;
-
-    fn sub(self, rhs: Self) -> Self::Output {
-        Self::from_i64_endpoints(
-            self.low.0 as i64 - rhs.high.0 as i64,
-            self.high.0 as i64 - rhs.low.0 as i64,
-        )
-    }
-}
-
-impl Pico8NumInterval {
-    /// `checked_mul` by a POSITIVE scalar: the kernels' interval `*`, whose
-    /// lane error (`Op::NoWrap`) is defined for a positive literal only.
-    pub fn checked_scale_positive(&self, rhs: Pico8Num) -> Option<Self> {
-        assert!(rhs.0 > 0, "scale_positive needs a positive scalar");
-        self.checked_mul(Self::from_number(rhs))
-    }
-
-    /// `checked_div` by a POSITIVE scalar, as `checked_scale_positive`.
-    pub fn checked_div_positive(&self, rhs: Pico8Num) -> Option<Self> {
-        assert!(rhs.0 > 0, "div_positive needs a positive scalar");
-        self.checked_div(Self::from_number(rhs))
-    }
-
-    /// The endpoints `e` that `checked_scale_positive(rhs)` maps inside the
-    /// 16.16 range, as `[lo, hi]`: the scale is monotone, so an interval
-    /// scales without a wrap iff `lo <= low` and `high <= hi`. The kernels'
-    /// check (`Op::NoWrap`) is those two compares. Bisected on the checked
-    /// operation itself, so it agrees with it by construction.
-    pub fn scale_positive_fits(rhs: Pico8Num) -> (Pico8Num, Pico8Num) {
-        Self::fitting(|e| Self::from_number(e).checked_scale_positive(rhs).is_some())
-    }
-
-    /// `scale_positive_fits` for `checked_div_positive`.
-    pub fn div_positive_fits(rhs: Pico8Num) -> (Pico8Num, Pico8Num) {
-        Self::fitting(|e| Self::from_number(e).checked_div_positive(rhs).is_some())
-    }
-
-    /// The `[lo, hi]` where a monotone map of an endpoint fits: `fits(0)`
-    /// holds, and moving away from 0 only grows the image's magnitude.
-    fn fitting(fits: impl Fn(Pico8Num) -> bool) -> (Pico8Num, Pico8Num) {
-        assert!(fits(Pico8Num(0)), "zero maps to zero");
-        // The last `e` from 0 toward `end` that fits (`fits` is a prefix).
-        let edge = |end: i32| -> i32 {
-            let (mut good, mut bad) = (0i64, end as i64);
-            if fits(Pico8Num(end)) {
-                return end;
-            }
-            while (bad - good).abs() > 1 {
-                let mid = good + (bad - good) / 2;
-                if fits(Pico8Num(mid as i32)) {
-                    good = mid;
-                } else {
-                    bad = mid;
-                }
-            }
-            good as i32
-        };
-        (Pico8Num(edge(i32::MIN)), Pico8Num(edge(i32::MAX)))
     }
 }
 
@@ -473,7 +458,7 @@ mod tests {
         assert_eq!(n(-16) % eight, n(0));
         let half = Pico8Num::from_parts(2, 0x8000); // 2.5
         assert_eq!(half % eight, half);
-        let neg_half = half.const_neg(); // -2.5
+        let neg_half = half.wrapping_neg(); // -2.5
         assert_eq!(neg_half % eight, Pico8Num::from_parts(5, 0x8000)); // 5.5
         // Zero, negative and fractional divisors, measured on a real
         // PICO-8 0.2.7a6:
@@ -497,54 +482,50 @@ mod tests {
         }
     }
 
+    /// `a + b`, `a - b`, `a * b`, `a / b`, `abs(a)` that fit.
+    fn add(a: Pico8Num, b: Pico8Num) -> Pico8Num {
+        a.checked_add(b).expect("fits")
+    }
+    fn sub(a: Pico8Num, b: Pico8Num) -> Pico8Num {
+        a.checked_sub(b).expect("fits")
+    }
+    fn mul(a: Pico8Num, b: Pico8Num) -> Pico8Num {
+        a.checked_mul(b).expect("fits")
+    }
+    fn div(a: Pico8Num, b: Pico8Num) -> Pico8Num {
+        a.checked_div(b).expect("fits")
+    }
+    fn abs(a: Pico8Num) -> Pico8Num {
+        a.checked_abs().expect("fits")
+    }
+
     #[test]
     fn test_mul() {
-        assert_eq!(
-            (Pico8Num::from_i16(25) * Pico8Num::from_i16(4)).as_i16(),
-            Some(100)
-        );
-        assert_eq!(
-            (Pico8Num::from_i16(-25) * Pico8Num::from_i16(4)).as_i16(),
-            Some(-100)
-        );
+        assert_eq!(mul(int(25), int(4)).as_i16(), Some(100));
+        assert_eq!(mul(int(-25), int(4)).as_i16(), Some(-100));
     }
 
     #[test]
     fn test_div() {
-        assert_eq!(
-            (Pico8Num::from_i16(100) / Pico8Num::from_i16(4)).as_i16(),
-            Some(25)
-        );
-        assert_eq!(
-            (Pico8Num::from_i16(-100) / Pico8Num::from_i16(4)).as_i16(),
-            Some(-25)
-        );
-        assert_eq!(
-            (Pico8Num::from_i16(-100) / Pico8Num::from_i16(7)).as_i16(),
-            None
-        );
+        assert_eq!(div(int(100), int(4)).as_i16(), Some(25));
+        assert_eq!(div(int(-100), int(4)).as_i16(), Some(-25));
+        assert_eq!(div(int(-100), int(7)).as_i16(), None);
     }
 
     #[test]
     fn test_flr() {
-        assert_eq!((int(4) + P0_15).flr(), int(4));
+        assert_eq!(add(int(4), P0_15).flr(), int(4));
         assert_eq!(int(4).flr(), int(4));
-        assert_eq!((int(-2) - P0_15).flr(), int(-3));
+        assert_eq!(sub(int(-2), P0_15).flr(), int(-3));
         assert_eq!(int(-2).flr(), int(-2));
     }
 
     #[test]
     fn test_abs() {
-        assert_eq!(int(4).abs(), int(4));
-        assert_eq!(int(-4).abs(), int(4));
-        assert_eq!(
-            (int(4) + P0_15).abs(),
-            int(4) + P0_15
-        );
-        assert_eq!(
-            (int(-4) - P0_15).abs(),
-            int(4) + P0_15
-        );
+        assert_eq!(abs(int(4)), int(4));
+        assert_eq!(abs(int(-4)), int(4));
+        assert_eq!(abs(add(int(4), P0_15)), add(int(4), P0_15));
+        assert_eq!(abs(sub(int(-4), P0_15)), add(int(4), P0_15));
     }
 
     /// Pins the invariance the "strawberry bob" widening relies on: for every
@@ -554,8 +535,8 @@ mod tests {
     fn test_pico8_sin_period_40_bit_exact() {
         let forty = Pico8Num::from_i16(40);
         for off in 0..=i16::MAX {
-            let full = Pico8Num::from_i16(off) / forty;
-            let reduced = Pico8Num::from_i16(off % 40) / forty;
+            let full = div(Pico8Num::from_i16(off), forty);
+            let reduced = div(Pico8Num::from_i16(off % 40), forty);
             assert_eq!(
                 full.pico8_sin(),
                 reduced.pico8_sin(),
@@ -584,8 +565,9 @@ mod tests {
     }
 
     /// Literal parsing, against a real PICO-8 0.2.7a6. `0.0000076` (under
-    /// half an ulp) and `0.0000153` show truncation, not rounding; `65535`
-    /// and `32768` show the integer part wraps, not saturates.
+    /// half an ulp) and `0.0000153` show truncation, not rounding; the
+    /// console's `65535` and `32768` show the integer part wraps, not
+    /// saturates, which is refused here.
     #[test]
     fn literals_parse_the_way_the_console_parses_them() {
         for (text, expected) in [
@@ -596,8 +578,8 @@ mod tests {
             ("1000.00002", 0x03e8_0001),
             ("0.0000076", 0x0000_0000),
             ("0.0000153", 0x0000_0001),
-            ("32768", 0x8000_0000),
-            ("65535", 0xffff_0000),
+            ("32767", 0x7fff_0000),
+            ("-32768", 0x8000_0000),
             ("0.05", 0x0000_0ccc),
             ("1.5", 0x0001_8000),
         ] {
@@ -611,65 +593,72 @@ mod tests {
                 expected
             );
         }
+        // The console WRAPS an integer part past the range (`32768` reads
+        // as -32768, `65535` as -1): an error here, as any overflow.
+        for text in ["32768", "65535", "-32768.00002", "40000.5"] {
+            let e = text.parse::<Pico8Num>().expect_err(text).to_string();
+            assert!(e.contains("leaves the 16.16 range"), "{text}: {e}");
+        }
         assert!("".parse::<Pico8Num>().is_err());
         assert!("1.2.3".parse::<Pico8Num>().is_err());
         assert!("nope".parse::<Pico8Num>().is_err());
     }
 
-    /// The fitting endpoints of a scale / divide by a positive constant are
-    /// exactly where the checked operation stops returning `None`: the edge
-    /// fits, one past it does not, on both sides; a factor at most 1 (a
-    /// divisor at least 1) fits everywhere.
+    /// The fitting endpoints of a multiply / divide by a constant `k` of
+    /// either sign are exactly where the checked operation stops returning
+    /// `None`: the edges fit, one past them does not; a factor of magnitude
+    /// at most 1 (a divisor at least 1, or below -1) fits everywhere, and
+    /// nothing divides by 0.
     #[test]
-    fn the_fitting_endpoints_are_where_the_checked_scale_and_divide_stop_fitting() {
-        use super::Pico8NumInterval as IV;
+    fn the_fitting_endpoints_are_where_the_checked_multiply_and_divide_stop_fitting() {
         let raw = |v: i32| Pico8Num(v);
-        let fits = |div: bool, e: i32, k: Pico8Num| {
-            let x = IV::from_number(raw(e));
-            if div { x.checked_div_positive(k).is_some() } else { x.checked_scale_positive(k).is_some() }
-        };
-        for k in [1, 2, 3, 0x7fff, 0x8000, 0xffff, 0x1_0000, 0x1_0001, 0x1_8000, 0x2_0000, 0x3_0000, 0x40_0000, i32::MAX] {
+        let fits = |div: bool, x: i32, k: i32| if div { raw(x).checked_div(raw(k)).is_some() } else { raw(x).checked_mul(raw(k)).is_some() };
+        let ks = [1, 2, 3, 0x7fff, 0x8000, 0xffff, 0x1_0000, 0x1_0001, 0x1_8000, 0x2_0000, 0x3_0000, 0x40_0000, i32::MAX];
+        for k in ks.into_iter().flat_map(|k| [k, -k]).chain([i32::MIN]) {
             for div in [false, true] {
-                let (lo, hi) = if div { IV::div_positive_fits(raw(k)) } else { IV::scale_positive_fits(raw(k)) };
+                let (lo, hi) = if div { Pico8Num::div_fits(raw(k)).expect("k != 0") } else { Pico8Num::mul_fits(raw(k)) };
                 let (lo, hi) = (lo.0, hi.0);
-                assert!(fits(div, lo, raw(k)) && fits(div, hi, raw(k)), "k {k:#x} div {div}: the edges fit");
+                assert!(fits(div, lo, k) && fits(div, hi, k) && fits(div, 0, k), "k {k:#x} div {div}: the edges fit");
                 if lo > i32::MIN {
-                    assert!(!fits(div, lo - 1, raw(k)), "k {k:#x} div {div}: below {lo:#x} wraps");
+                    assert!(!fits(div, lo - 1, k), "k {k:#x} div {div}: below {lo:#x} wraps");
                 }
                 if hi < i32::MAX {
-                    assert!(!fits(div, hi + 1, raw(k)), "k {k:#x} div {div}: above {hi:#x} wraps");
+                    assert!(!fits(div, hi + 1, k), "k {k:#x} div {div}: above {hi:#x} wraps");
                 }
-                let everywhere = if div { k >= 0x1_0000 } else { k <= 0x1_0000 };
+                let everywhere = if div { k >= 0x1_0000 || k <= -0x1_0001 } else { (-0xffff..=0x1_0000).contains(&k) };
                 assert_eq!((lo, hi) == (i32::MIN, i32::MAX), everywhere, "k {k:#x} div {div}");
             }
         }
-        // Scale by 2: [-16384, 16383.99998]. Divide by 0.5 the same.
-        assert_eq!(IV::scale_positive_fits(raw(0x2_0000)), (raw(i32::MIN / 2), raw(i32::MAX / 2)));
-        assert_eq!(IV::div_positive_fits(raw(0x8000)), (raw(i32::MIN / 2), raw(i32::MAX / 2)));
+        assert_eq!(Pico8Num::div_fits(raw(0)), None, "x / 0 never fits");
+        assert_eq!(Pico8Num::mul_fits(raw(0)), (raw(i32::MIN), raw(i32::MAX)));
+        // Times 2: [-16384, 16383.99998]. Over 0.5 the same; times -1 all but MIN.
+        assert_eq!(Pico8Num::mul_fits(raw(0x2_0000)), (raw(i32::MIN / 2), raw(i32::MAX / 2)));
+        assert_eq!(Pico8Num::div_fits(raw(0x8000)), Some((raw(i32::MIN / 2), raw(i32::MAX / 2))));
+        assert_eq!(Pico8Num::mul_fits(raw(-0x1_0000)), (raw(i32::MIN + 1), raw(i32::MAX)));
     }
 
-    /// Division and the +/-32768 edges, against a real PICO-8 0.2.7a6.
-    /// `min/1` vs `min/-1` rules out a blanket clamp; `-min` vs `abs(min)`
-    /// shows negation wraps while `abs` saturates.
+    /// The console's division and the +/-32768 edges, against a real PICO-8
+    /// 0.2.7a6. `min/1` vs `min/-1` rules out a blanket clamp; `-min` vs
+    /// `abs(min)` shows negation wraps while `abs` saturates.
     #[test]
     fn division_and_the_range_edges_match_the_console() {
         let raw = |bits: u32| Pico8Num(bits as i32);
         let min = int(-32768);
         for (label, got, expected) in [
-            ("1/0", int(1) / int(0), 0x7fff_ffff_u32),
-            ("-1/0", int(-1) / int(0), 0x8000_0001),
-            ("0/0", int(0) / int(0), 0x7fff_ffff),
-            ("32767/0.5", int(32767) / raw(0x0000_8000), 0x7fff_ffff),
-            ("-32767/0.5", int(-32767) / raw(0x0000_8000), 0x8000_0001),
-            ("min/1", min / int(1), 0x8000_0000),
-            ("min/-1", min / int(-1), 0x7fff_ffff),
-            ("min*-1", min * int(-1), 0x8000_0000),
-            ("-min", -min, 0x8000_0000),
-            ("abs(min)", min.abs(), 0x7fff_ffff),
-            ("-7/2", int(-7) / int(2), 0xfffc_8000),
-            ("7/-2", int(7) / int(-2), 0xfffc_8000),
-            ("1/3", int(1) / int(3), 0x0000_5555),
-            ("-1/3", int(-1) / int(3), 0xffff_aaab),
+            ("1/0", int(1).saturating_div(int(0)), 0x7fff_ffff_u32),
+            ("-1/0", int(-1).saturating_div(int(0)), 0x8000_0001),
+            ("0/0", int(0).saturating_div(int(0)), 0x7fff_ffff),
+            ("32767/0.5", int(32767).saturating_div(raw(0x0000_8000)), 0x7fff_ffff),
+            ("-32767/0.5", int(-32767).saturating_div(raw(0x0000_8000)), 0x8000_0001),
+            ("min/1", min.saturating_div(int(1)), 0x8000_0000),
+            ("min/-1", min.saturating_div(int(-1)), 0x7fff_ffff),
+            ("min*-1", min.wrapping_mul(int(-1)), 0x8000_0000),
+            ("-min", min.wrapping_neg(), 0x8000_0000),
+            ("abs(min)", min.saturating_abs(), 0x7fff_ffff),
+            ("-7/2", int(-7).saturating_div(int(2)), 0xfffc_8000),
+            ("7/-2", int(7).saturating_div(int(-2)), 0xfffc_8000),
+            ("1/3", int(1).saturating_div(int(3)), 0x0000_5555),
+            ("-1/3", int(-1).saturating_div(int(3)), 0xffff_aaab),
         ] {
             assert_eq!(
                 got.to_bits(),
@@ -728,7 +717,7 @@ mod tests {
         ];
         for (index, expected) in want.iter().enumerate() {
             let i = i16::try_from(index + 1).expect("small");
-            let turns = int(i) / int(40);
+            let turns = div(int(i), int(40));
             assert_eq!(
                 turns.pico8_sin().as_raw_u32() as i32,
                 *expected,
@@ -767,10 +756,10 @@ mod tests {
         (i32::MIN as i128..=i32::MAX as i128).contains(&v)
     }
 
-    /// At every pair of edge values, the checked interval operations on
-    /// POINTS are `Pico8Num`'s: the console's result wherever the exact one
-    /// fits, `None` exactly where it does not - where the console's differs
-    /// from the exact result (it wrapped or saturated).
+    /// At every pair of edge values, the checked operations on POINTS (and
+    /// the interval ones on point intervals) are the console's result
+    /// wherever the exact one fits, `None` exactly where it does not - where
+    /// the console's differs from the exact result (it wrapped or saturated).
     #[test]
     fn checked_operations_on_points_are_the_consoles_where_they_fit_and_none_where_it_wraps() {
         use super::Pico8NumInterval as IV;
@@ -779,18 +768,13 @@ mod tests {
             for &b in &EDGES {
                 for op in ['+', '-', '*', '/'] {
                     let (x, y) = (Pico8Num(a), Pico8Num(b));
-                    let console = match op {
-                        '+' => x + y,
-                        '-' => x - y,
-                        '*' => x * y,
-                        _ => x / y,
+                    let (console, point, checked) = match op {
+                        '+' => (x.wrapping_add(y), x.checked_add(y), pt(a).checked_add(pt(b))),
+                        '-' => (x.wrapping_sub(y), x.checked_sub(y), pt(a).checked_sub(pt(b))),
+                        '*' => (x.wrapping_mul(y), x.checked_mul(y), pt(a).checked_mul(pt(b))),
+                        _ => (x.saturating_div(y), x.checked_div(y), pt(a).checked_div(pt(b))),
                     };
-                    let checked = match op {
-                        '+' => pt(a).checked_add(pt(b)),
-                        '-' => pt(a).checked_sub(pt(b)),
-                        '*' => pt(a).checked_mul(pt(b)),
-                        _ => pt(a).checked_div(pt(b)),
-                    };
+                    assert_eq!(point.map(IV::from_number), checked, "{a:#x} {op} {b:#x}: the point and the interval operation agree");
                     match exact(op, a, b) {
                         Some(e) if fits(e) => {
                             assert_eq!(console.0 as i128, e, "{a:#x} {op} {b:#x}: the console's is the exact result");
@@ -805,10 +789,12 @@ mod tests {
             }
             // Negation wraps and `abs` saturates at MIN only.
             let x = Pico8Num(a);
-            assert_eq!(pt(a).checked_neg(), (a != i32::MIN).then(|| pt((-x).0)), "-{a:#x}");
-            assert_eq!(pt(a).checked_abs(), (a != i32::MIN).then(|| pt(x.abs().0)), "abs({a:#x})");
+            assert_eq!(x.checked_neg(), (a != i32::MIN).then(|| x.wrapping_neg()), "-{a:#x}");
+            assert_eq!(x.checked_abs(), (a != i32::MIN).then(|| x.saturating_abs()), "abs({a:#x})");
+            assert_eq!(pt(a).checked_neg(), x.checked_neg().map(IV::from_number), "-{a:#x}");
+            assert_eq!(pt(a).checked_abs(), x.checked_abs().map(IV::from_number), "abs({a:#x})");
             if a == i32::MIN {
-                assert_eq!(((-x).0, x.abs().0), (i32::MIN, i32::MAX), "the console wraps -MIN and saturates abs(MIN)");
+                assert_eq!((x.wrapping_neg().0, x.saturating_abs().0), (i32::MIN, i32::MAX), "the console wraps -MIN and saturates abs(MIN)");
             }
         }
     }
