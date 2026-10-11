@@ -277,3 +277,29 @@ cells) 1.9-2.0 and 0.43-0.54 with zstd - a source entry's cells move
 together, so its bundles repeat one mask. This supports the recommendation
 above: source units, masks over source cells (sorted by target for the
 reverse walk).
+
+## Revised recommendation: ID-free, source-side (DESIGNS O2)
+
+Judged on the end state's merits, not on the distance from today's code:
+edges named by KEYS (shape + exact position-free key; content-canonical
+transfers), no entry numbers, lids or owner index, stored per SOURCE region
+as a sorted trie (source key, target shape + key, transfer, offset) -> u64
+mask over source cells, zstd -1 per block. On the f57 capture it is the
+smallest layout measured - 1.63 B an edge raw, 0.139 with zstd, against the
+ID-based S 1.84 / 0.147, the T-order lid blocks above (1.31 / 0.23 with their
+tables on real trees), production's 3.15 - and the cheapest to produce
+(the forward's units are source runs: no partition; ~4.6 ns an edge to
+insert, 3.4-7 to encode). A key costs a sorted trie only at its first-changed
+level, so it is no bigger than an id; the machinery ids require (lids'
+owners, the owner index at 0.18-0.70 B an edge, `resolve_lids`, explicit
+sources, per-unit ranks, the edge `Resolver`) disappears. Target-side
+storage (masks over target cells, best order (target, source, transfer,
+offset): 1.79 / 0.43) loses 3x at rest and needs every edge partitioned to
+its target region (0.58 s a frame at 16 threads, 4x the dedup).
+
+What it needs instead: W keyed by state (one probe of a region's in-core
+table per entry, ~4 ns; the backward's in-RAM graph may still number nodes
+densely at load time, never stored), and a reverse pass for the BFS
+(region-batched over out-edges, 0.044 s a frame at 16 threads, or a
+target-side copy for the backward only). The "edge file v6" above is the
+incremental path to it, not the end state.
