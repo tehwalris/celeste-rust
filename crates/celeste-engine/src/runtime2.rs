@@ -143,6 +143,30 @@ pub struct Rt2 {
     pub row_keys: Vec<(u64, u64)>,
 }
 
+impl Rt2 {
+    /// DIAGNOSTIC (`--phases`' `[mem]` line): the block's heap bytes by
+    /// capacity (columns, structure, globals, strings, prints, keys).
+    pub fn heap_bytes(&self) -> usize {
+        use std::mem::size_of;
+        let cols: usize = self
+            .cols
+            .iter()
+            .map(|c| match c {
+                Col::U(_) => 0,
+                Col::V(v) => v.capacity() * size_of::<AV>(),
+                Col::N(v) => v.capacity() * size_of::<P8>(),
+                Col::I(v) => v.capacity() * size_of::<(P8, P8)>(),
+            })
+            .sum();
+        cols + self.cols.capacity() * size_of::<Col>()
+            + self.structure.capacity() * size_of::<Cell2>()
+            + self.globals.capacity() * 4
+            + self.strings.iter().map(|x| x.capacity() + size_of::<String>()).sum::<usize>()
+            + self.prints.iter().map(|x| x.capacity() + size_of::<String>()).sum::<usize>()
+            + self.row_keys.capacity() * 16
+    }
+}
+
 pub const NONE: u32 = u32::MAX;
 
 pub fn col_push(col: &mut Col, width: usize, v: AV) {

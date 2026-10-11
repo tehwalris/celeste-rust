@@ -882,6 +882,22 @@ impl Default for Provisional {
 }
 
 impl Provisional {
+    /// DIAGNOSTIC (`[mem]`): the interned contents' bytes, `(entries, bytes)`
+    /// (each content is held twice: the map's key and the list).
+    pub fn alloc_bytes(&self) -> (usize, usize) {
+        use std::mem::size_of;
+        let (mut n, mut b) = (0usize, 0usize);
+        for s in &self.shards {
+            let g = s.lock().expect("a provisional shard");
+            let (map, list) = &*g;
+            n += list.len();
+            let heap = |m: &MissKey| m.missing.capacity() * size_of::<(u32, Code)>();
+            b += map.capacity() * 8 / 7 * (size_of::<(MissKey, u32)>() + 1) + map.keys().map(heap).sum::<usize>();
+            b += list.capacity() * size_of::<MissKey>() + list.iter().map(heap).sum::<usize>();
+        }
+        (n, b)
+    }
+
     /// A shape the key space lacks, which misses are made of.
     pub fn note_shape(&self, r: &ShapeRecord) {
         let mut g = self.shapes.lock().expect("the provisional shapes");

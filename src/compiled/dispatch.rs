@@ -86,6 +86,7 @@ pub fn print_kernel_hits() {
 /// The `kernel lanes:` (`missed 0` is what every log must say), `kernel
 /// calls:` and `kernel utilization:` lines.
 pub fn print_stats(s: &KernelStats) {
+    super::asm_kernel::print_key_diag();
     if s.traced > 0 || s.missed > 0 {
         eprintln!("kernel lanes: traced {} missed {}", s.traced, s.missed);
     }

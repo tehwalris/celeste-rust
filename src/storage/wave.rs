@@ -194,6 +194,9 @@ pub fn run_wave(engine: &dyn FrameStep, frontier: Vec<Block>, cx: WaveCtx) -> Re
     st.lanes_in = frontier.iter().map(Block::lanes).sum();
     st.bytes_in = frontier.iter().map(Block::bytes).sum();
     st.rss_start = crate::metrics::current_rss_gb();
+    if s.diag.phases {
+        crate::metrics::mem_phase(&format!("f{frame} wave start"));
+    }
     let record = edges_dir.is_some();
     ensure!(!record || frontier.iter().all(|b| b.ids().len() == b.lanes()), "frame {frame}: recording edges needs every input row's id");
     let cells: Vec<Vec<u32>> = frontier.iter().map(Block::positions).collect::<Result<_>>()?;
@@ -221,6 +224,17 @@ pub fn run_wave(engine: &dyn FrameStep, frontier: Vec<Block>, cx: WaveCtx) -> Re
         requests: u64,
         lids: u64,
         busy: std::time::Duration,
+    }
+    impl DoneLike for Done {
+        fn outs(&self) -> &[UnitOut] {
+            &self.outs
+        }
+        fn xfer_bytes(&self) -> usize {
+            self.xfer_tab.capacity() * std::mem::size_of::<crate::search::arc_edges::Pair>()
+        }
+        fn pos_bytes(&self) -> usize {
+            self.pos_edges.capacity() * 8 / 7 * 9
+        }
     }
     let shared: &VisitedSet = visited;
     let claims = super::unit::Claims::default();
@@ -277,6 +291,11 @@ pub fn run_wave(engine: &dyn FrameStep, frontier: Vec<Block>, cx: WaveCtx) -> Re
     st.t_wave = t.elapsed();
     st.wave_idle = idle_fraction(st.t_wave, workers, done.iter().map(|d| d.busy).sum());
     st.rss_wave = crate::metrics::current_rss_gb();
+    if s.diag.phases {
+        crate::metrics::mem_phase(&format!("f{frame} wave end"));
+        let dn: Vec<&Done> = done.iter().collect();
+        mem_report_wave(frame, &frontier, &cells, &order, notes.as_ref(), &claims, &prov, &dn, visited);
+    }
     drop(frontier);
     let mut outs: Vec<UnitOut> = Vec::new();
     let mut tables: Vec<Vec<crate::search::arc_edges::Pair>> = vec![Vec::new(); workers];
@@ -303,6 +322,19 @@ pub fn run_wave(engine: &dyn FrameStep, frontier: Vec<Block>, cx: WaveCtx) -> Re
     resolve_lids(visited, &outs, frame, workers)?;
     phases::add(phases::TRANSLATE, tr);
     st.t_translate = t.elapsed();
+    if s.diag.phases {
+        crate::metrics::mem_phase(&format!("f{frame} translated"));
+        let gb = |b: usize| b as f64 / 1e9;
+        eprintln!(
+            "[mem] f{frame} translation: new states {} GB ({} B a state), entries {} GB, visited {} GB ({} states, {} entries)",
+            gb(new_states.capacity() * std::mem::size_of::<NewState>()),
+            std::mem::size_of::<NewState>(),
+            gb(meta.entries.capacity() * std::mem::size_of::<(u32, u32, Key)>()),
+            gb(visited.alloc_bytes()),
+            visited.len(),
+            visited.entries()
+        );
+    }
 
     // THE LAYER, and the frame's edges.
     let t = Instant::now();
@@ -320,6 +352,12 @@ pub fn run_wave(engine: &dyn FrameStep, frontier: Vec<Block>, cx: WaveCtx) -> Re
     drop(outs);
     phases::add(phases::LAYER, tl);
     st.t_layer = t.elapsed();
+    if s.diag.phases {
+        crate::metrics::mem_phase(&format!("f{frame} layer"));
+        let b: usize = next.iter().map(Block::heap_bytes).sum();
+        let rows: usize = next.iter().map(Block::lanes).sum();
+        eprintln!("[mem] f{frame} layer: next {:.3} GB ({:.1} B a row, {rows} rows)", b as f64 / 1e9, b as f64 / rows.max(1) as f64);
+    }
     st.visited_bytes = visited.alloc_bytes();
     st.rss_end = crate::metrics::current_rss_gb();
     st.rss_file = crate::metrics::current_file_rss_gb();
@@ -328,6 +366,54 @@ pub fn run_wave(engine: &dyn FrameStep, frontier: Vec<Block>, cx: WaveCtx) -> Re
     let dropped = notes.map_or_else(Vec::new, DropNotes::into_sorted);
     phases::print_phases(s.diag.phases, t_frame.elapsed(), workers);
     Ok(Wave { next, stats: st, dropped, meta })
+}
+
+/// DIAGNOSTIC (`--phases`): the wave's structures by allocated bytes at its
+/// end, per row, claim, lid, request and edge, against the anonymous RSS.
+#[allow(clippy::too_many_arguments)]
+fn mem_report_wave<D: DoneLike>(frame: u32, frontier: &[Block], cells: &[Vec<u32>], order: &[Vec<usize>], notes: Option<&DropNotes>, claims: &super::unit::Claims, prov: &Provisional, done: &[&D], visited: &VisitedSet) {
+    let gb = |b: usize| b as f64 / 1e9;
+    let per = |b: usize, n: usize| b as f64 / n.max(1) as f64;
+    let rows: usize = frontier.iter().map(Block::lanes).sum();
+    let f_b: usize = frontier.iter().map(Block::heap_bytes).sum();
+    let c_b: usize = cells.iter().map(|c| c.capacity() * 4).sum();
+    let o_b: usize = order.iter().map(|o| o.capacity() * 8).sum();
+    let n_b = notes.map_or(0, |n| n.mins.capacity() * 4 + n.ids.capacity() * 8 + n.starts.capacity() * 8);
+    let (n_claims, cl_b) = claims.alloc_bytes();
+    let (n_prov, pr_b) = prov.alloc_bytes();
+    let mut parts = [0usize; 8];
+    let (mut lids, mut reqs, mut edges, mut units, mut x_b, mut p_b) = (0usize, 0usize, 0u64, 0usize, 0usize, 0usize);
+    for d in done {
+        for u in d.outs() {
+            for (a, b) in parts.iter_mut().zip(u.alloc_bytes()) {
+                *a += b;
+            }
+            lids += u.lids.len();
+            reqs += u.requests.len();
+            edges += u.edges;
+            units += 1;
+        }
+        x_b += d.xfer_bytes();
+        p_b += d.pos_bytes();
+    }
+    let v_b = visited.alloc_bytes();
+    let outs: usize = parts.iter().sum();
+    let sum = f_b + c_b + o_b + n_b + cl_b + pr_b + outs + x_b + p_b + v_b;
+    eprintln!(
+        "[mem] f{frame} wave end: frontier {:.3} GB ({:.1} B/row, {rows} rows) cells {:.3} order {:.3} drop notes {:.3} | claims {:.3} GB ({n_claims}, {:.1} B each) provisional {:.3} GB ({n_prov}, {:.1} B each) | units {units}: sources {:.3} lids {:.3} ({lids}, {:.1} B/lid) owners {:.3} requests {:.3} ({reqs}, {:.1} B/req) rows {:.3} ({:.1} B/request) skeletons {:.3} blocks {:.3} starts+xfers {:.3} | edges {edges} ({:.2} B/edge in units) | worker xfer tables {:.3} pos sets {:.3} | visited {:.3} | SUM {:.3} GB",
+        gb(f_b), per(f_b, rows), gb(c_b), gb(o_b), gb(n_b),
+        gb(cl_b), per(cl_b, n_claims), gb(pr_b), per(pr_b, n_prov),
+        gb(parts[0]), gb(parts[1]), per(parts[1], lids), gb(parts[2]), gb(parts[3]), per(parts[3], reqs), gb(parts[4]), per(parts[4], reqs), gb(parts[5]), gb(parts[6]), gb(parts[7]),
+        per(outs, edges as usize),
+        gb(x_b), gb(p_b), gb(v_b), gb(sum)
+    );
+}
+
+/// The wave workers' results as `mem_report_wave` reads them.
+trait DoneLike {
+    fn outs(&self) -> &[UnitOut];
+    fn xfer_bytes(&self) -> usize;
+    fn pos_bytes(&self) -> usize;
 }
 
 /// A new state: its id and its row (unit, buffer, row).

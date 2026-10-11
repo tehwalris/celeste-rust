@@ -378,6 +378,73 @@ impl AccTemplate {
     }
 }
 
+/// DIAGNOSTIC (`--phases`): per slice, the emitting bodies' key fields and
+/// transfer roots against the DISTINCT ones among them - what a per-slice
+/// memo (or in-kernel packing) would compute once. Folded into `KEY_DIAG`.
+#[derive(Default)]
+struct SliceDiag {
+    /// (root, cell, lanes) per distinct key field; (transfer roots, lanes).
+    fields: Vec<(usize, u32, u16)>,
+    arcs: Vec<(ArcSlots, u16)>,
+    /// [field evals, field-lanes, field-lanes of big dictionaries, bool
+    /// field-lanes, distinct fields, distinct field-lanes, transfer lanes,
+    /// distinct (transfer roots, lane), distinct transfer root sets]
+    n: [u64; 9],
+}
+
+impl SliceDiag {
+    fn body(&mut self, body: &AsmBody, sk: Option<&ShapeKeys>, take: u16) {
+        let lanes = take.count_ones() as u64;
+        for f in &body.key_fields {
+            self.n[0] += 1;
+            self.n[1] += lanes;
+            match f.read {
+                KeyRead::Bool => self.n[3] += lanes,
+                _ => {
+                    if sk.and_then(|sk| sk.field(f.cell as usize)).is_some_and(|d| d.small_nums().is_none()) {
+                        self.n[2] += lanes;
+                    }
+                }
+            }
+            match self.fields.iter_mut().find(|e| e.0 == f.root && e.1 == f.cell) {
+                Some(e) => e.2 |= take,
+                None => self.fields.push((f.root, f.cell, take)),
+            }
+        }
+        self.n[6] += lanes;
+        match self.arcs.iter_mut().find(|e| e.0.roots == body.arc.roots && e.0.fin == body.arc.fin) {
+            Some(e) => e.1 |= take,
+            None => self.arcs.push((body.arc, take)),
+        }
+    }
+
+    fn fold(mut self) {
+        self.n[4] += self.fields.len() as u64;
+        self.n[5] += self.fields.iter().map(|e| e.2.count_ones() as u64).sum::<u64>();
+        self.n[7] += self.arcs.iter().map(|e| e.1.count_ones() as u64).sum::<u64>();
+        self.n[8] += self.arcs.len() as u64;
+        for (a, b) in KEY_DIAG.iter().zip(self.n) {
+            a.fetch_add(b, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+}
+
+static KEY_DIAG: [std::sync::atomic::AtomicU64; 9] = [const { std::sync::atomic::AtomicU64::new(0) }; 9];
+
+/// `--phases`: the slices' sharing (`SliceDiag`) since the last call, one line.
+pub(crate) fn print_key_diag() {
+    let n: Vec<u64> = KEY_DIAG.iter().map(|a| a.swap(0, std::sync::atomic::Ordering::Relaxed)).collect();
+    if n[0] == 0 {
+        return;
+    }
+    let r = |a: u64, b: u64| a as f64 / b.max(1) as f64;
+    eprintln!(
+        "[keydiag] key fields: {} (body, field) evals, {} field-lanes ({:.1}% big dictionaries, {:.1}% bools), {:.2} fields a transfer lane; distinct (root, cell) a slice: {} ({:.1}x fewer evals), {} field-lanes ({:.2}x fewer) | transfers: {} lanes, {} distinct (roots, lane) ({:.2}x fewer), {} distinct root sets | xfer cache misses {} ({:.2}% of lanes)",
+        n[0], n[1], 100.0 * r(n[2], n[1]), 100.0 * r(n[3], n[1]), r(n[1], n[6]), n[4], r(n[0], n[4]), n[5], r(n[1], n[5]), n[6], n[7], r(n[6], n[7]), n[8],
+        crate::storage::unit::take_xfer_misses(), 100.0 * r(crate::storage::unit::peek_xfer_misses_last(), n[6])
+    );
+}
+
 /// Rust's default spawned-thread stack, assumed without `set_thread_stack`.
 const DEFAULT_THREAD_STACK: usize = 2 << 20;
 /// Room a kernel call leaves for its callers' frames and its call-outs.
@@ -468,6 +535,8 @@ impl AsmKernel {
         let generation = keys.generation();
         let body_cols = &self.body_cols;
 
+        // `--phases`: what the slice's bodies share (`SliceDiag`).
+        let mut diag = sink.phases.then(SliceDiag::default);
         // Utilization tallies, folded into `CALL_STATS[3..]` at the end.
         let (mut n_bodies, mut n_bodies_taken, mut n_lanes, mut n_unique) = (0u64, 0u64, 0u64, 0u64);
         {
@@ -596,6 +665,9 @@ impl AsmKernel {
                 if sk.is_none() {
                     sink.note_shape(&template.record);
                 }
+                if let Some(d) = diag.as_mut() {
+                    d.body(body, sk, take);
+                }
                 if parts[body.outcome].0 != generation {
                     parts[body.outcome] = (generation, PartKey::of(template, sk));
                 }
@@ -633,6 +705,9 @@ impl AsmKernel {
             }
         }
         sc.put_back();
+        if let Some(d) = diag {
+            d.fold();
+        }
         stats([0, only.count_ones().min(n as u32) as u64, 16, n_bodies, n_bodies_taken, n_lanes, n_unique]);
         true
     }

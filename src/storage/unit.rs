@@ -75,6 +75,11 @@ impl RowBuf {
             + self.cells.capacity() * 4
     }
 
+    /// DIAGNOSTIC (`[mem]`): the skeleton's heap bytes (a copy per buffer).
+    pub fn skeleton_bytes(&self) -> usize {
+        self.skeleton.heap_bytes() + self.cols.capacity() * std::mem::size_of::<(usize, TCol)>()
+    }
+
     /// Drop the rows, keeping the skeleton and the columns' capacity.
     pub fn clear(&mut self) {
         for (_, c) in &mut self.cols {
@@ -349,6 +354,25 @@ pub struct UnitOut {
     pub edges: u64,
 }
 
+impl UnitOut {
+    /// DIAGNOSTIC (`[mem]`): bytes by part: sources, lids, owners, requests,
+    /// row buffers (rows), row buffers (skeletons), block, starts + xfers +
+    /// pending.
+    pub fn alloc_bytes(&self) -> [usize; 8] {
+        use std::mem::size_of;
+        [
+            self.sources.capacity() * 8,
+            self.lids.capacity() * size_of::<Lid>(),
+            self.owners.capacity() * 8,
+            self.requests.capacity() * size_of::<Request>(),
+            self.bufs.iter().map(RowBuf::alloc_bytes).sum(),
+            self.bufs.iter().map(RowBuf::skeleton_bytes).sum::<usize>() + self.bufs.capacity() * size_of::<RowBuf>(),
+            self.block.capacity(),
+            self.starts.capacity() * 4 + self.xfers.capacity() * 4 + self.pending.capacity() * 4,
+        ]
+    }
+}
+
 /// The states requested in a wave, across its units: the first unit to
 /// request one copies its row and hands it to the translation; another
 /// unit's lid of it finds it after the translation (`wave::resolve_lids`).
@@ -367,6 +391,17 @@ impl Default for Claims {
 const CLAIM_SHARDS: usize = 1 << 12;
 
 impl Claims {
+    /// DIAGNOSTIC (`[mem]`): `(claims, bytes)` over the shards' tables.
+    pub fn alloc_bytes(&self) -> (usize, usize) {
+        let (mut n, mut b) = (0, 0);
+        for s in &self.shards {
+            let g = s.lock().expect("a claims shard");
+            n += g.len();
+            b += g.capacity() * 8 / 7 * (std::mem::size_of::<(u64, u32, Key, u32)>() + 1);
+        }
+        (n, b)
+    }
+
     /// Is this the first request of `(shape, slot, key, cell)` this wave?
     #[inline]
     pub fn claim(&self, shape: u64, slot: u32, key: Key, local: u32) -> bool {
@@ -397,6 +432,22 @@ pub fn unpack_edge(e: u64) -> (u32, u32, u32, u32) {
         (e >> XFER_BITS) as u32 & ((1 << SRC_BITS) - 1),
         e as u32 & ((1 << XFER_BITS) - 1),
     )
+}
+
+/// DIAGNOSTIC (`--phases`): `xfer_id_raw`'s cache misses.
+static XFER_MISSES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static XFER_MISSES_LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The cache misses since the last take.
+pub fn take_xfer_misses() -> u64 {
+    let n = XFER_MISSES.swap(0, std::sync::atomic::Ordering::Relaxed);
+    XFER_MISSES_LAST.store(n, std::sync::atomic::Ordering::Relaxed);
+    n
+}
+
+/// The last `take_xfer_misses`.
+pub fn peek_xfer_misses_last() -> u64 {
+    XFER_MISSES_LAST.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// Entries of `UnitSink::xfer_id_raw`'s cache.
@@ -689,6 +740,9 @@ impl<'a> UnitSink<'a> {
         let (w, id) = &self.xfer_cache[slot];
         if *id != u32::MAX && w == words {
             return *id;
+        }
+        if self.phases {
+            XFER_MISSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
         let id = self.xfer_id(decode(words));
         self.xfer_cache[slot] = (*words, id);

@@ -199,6 +199,11 @@ impl Block {
     }
 
     /// The block's row storage in bytes: its varying columns and keys.
+    /// DIAGNOSTIC (`[mem]`): heap bytes by capacity (rows, ids, skip).
+    pub fn heap_bytes(&self) -> usize {
+        self.rt2.heap_bytes() + self.ids.capacity() * 8 + self.skip.capacity()
+    }
+
     pub fn bytes(&self) -> usize {
         let w = self.rt2.width;
         self.rt2
