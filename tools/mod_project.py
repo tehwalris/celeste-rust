@@ -27,7 +27,7 @@ import re
 import statistics
 import sys
 
-FWD = re.compile(r"^\[fwd\] f(\d+) in \d+/(\d+) raw (\d+) kept (\d+) .*?total (\d+) ms .*?edges (\d+) \(([\d.]+) B\).*?rss start ([\d.]+) wave ([\d.]+)")
+FWD = re.compile(r"^\[fwd\] f(\d+) in \d+/(\d+) raw (\d+) kept (\d+) .*?total (\d+) ms .*?edges (\d+)(?: bundles \d+)? \(([\d.]+) B\).*?rss start ([\d.]+) wave ([\d.]+)")
 ARC = re.compile(r"^\[arc\] f(\d+): .*?-> (\d+) in-edges .*?read (\d+) pull (\d+) merge (\d+) ms")
 
 
@@ -176,7 +176,7 @@ def main():
     p.add_argument("--growth", type=float, help="U's rate a frame past the last measured frame (default: the last 10 frames')")
     p.add_argument("--decay", type=float, default=0.0, help="the rate's excess shrinks by this share a frame")
     p.add_argument("--ns-emission", type=float, help="override the fitted wall ns an emission (a faster forward)")
-    p.add_argument("--b-state", type=float, default=10.0, help="disk bytes a state (format 14 frame files ~9-10)")
+    p.add_argument("--b-state", type=float, default=12.0, help="disk bytes a state (frame files ~9 + drop notes ~1.3 + the rest; format 14 with the target-region edges: 12)")
     p.add_argument("--b-edge-alt", type=float, help="another storage's bytes an edge (the target-region bundles: 0.08-0.25)")
     p.add_argument("--marked-share", type=float, default=0.15, help="the share of edges the backward reads (h140: 0.16)")
     a = ap.parse_args()

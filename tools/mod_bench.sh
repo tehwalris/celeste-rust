@@ -22,22 +22,20 @@ ROOT=${MOD_FIXTURES:-/var/tmp/mod-fixtures}
 CART=${MOD_CART:-/var/tmp/mod/taslevel.p8}
 B=${BIN:-${CARGO_TARGET_DIR:-./target}/release/rewrite}
 TH=${THREADS:-16}
-MID="--room 0,0 --win-at 56..72,104..112 --cart $CART"
 
 # NAME -> SRC (a level dir) | F | LEVEL | FLAGS (the tree's settings)
+FROM_MID="--room 0,0 --balloon-seeds 0 --start-inputs /var/tmp/mod-ck/mid142-canon.txt --cart $CART"
 spec() {
     case $1 in
-        # r0sxhe (objects exact, held unknown) to the mid win, level -1 142:
-        # early-busy and its peak frame (5.4M and 8.0M new states).
-        he100) SRC=/var/tmp/mod-ck/dir-r0sxhe; F=100; LEVEL=r0sxhe; FLAGS="$MID --level-minus-one 142,5" ;;
-        he120) SRC=/var/tmp/mod-ck/dir-r0sxhe; F=120; LEVEL=r0sxhe; FLAGS="$MID --level-minus-one 142,5" ;;
-        # r0sxhne to the mid win, level -1 155: a peak-sized frame (f150 ->
-        # f151: ~75M rows in) of the tree the arc-memory work uses.
-        hne150) SRC=/var/tmp/mod-ck/mid155/level00; F=150; LEVEL=r0sxhne; FLAGS="$MID --level-minus-one 155,5" ;;
+        # The second half: r0sxhe from the proven mid state (f142) to the
+        # real exit, level -1 85, new storage (develop a4c3dfc): a busy frame
+        # (f45: 39M rows in) and the peak (f68: 171M rows in, 5.2G emissions).
+        fm45) SRC=/var/tmp/mod-ck/fm/level00; F=45; LEVEL=r0sxhe; FLAGS="$FROM_MID --level-minus-one 85,5" ;;
+        fm68) SRC=/var/tmp/mod-ck/fm/level00; F=68; LEVEL=r0sxhe; FLAGS="$FROM_MID --level-minus-one 85,5" ;;
         *) echo "mod_bench: no fixture $1 (list)" >&2; exit 2 ;;
     esac
 }
-ALL="he100 he120 hne150"
+ALL="fm45 fm68"
 
 make_one() {
     spec "$1"
