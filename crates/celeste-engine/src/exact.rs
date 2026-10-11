@@ -270,6 +270,27 @@ impl FieldDict {
         }
     }
 
+    /// The key bits the field holds (0: one code, the same in every key).
+    #[inline]
+    pub fn bits(&self) -> u32 {
+        self.bits
+    }
+
+    /// The index key `k` holds in this field (`place` inverted).
+    #[inline]
+    pub fn index_in(&self, k: Key) -> u32 {
+        if let [(pos, len)] = self.runs[..] {
+            return ((of_key(k) >> pos) as u64 & ((1u64 << len) - 1)) as u32;
+        }
+        let k = of_key(k);
+        let (mut idx, mut at) = (0u128, 0u32);
+        for &(pos, len) in &self.runs {
+            idx |= (k >> pos & ((1u128 << len) - 1)) << at;
+            at += len as u32;
+        }
+        idx as u32
+    }
+
     /// Index `idx` placed in the key's bits.
     #[inline]
     pub fn place(&self, idx: u32) -> u128 {
@@ -480,16 +501,10 @@ impl ShapeKeys {
 
     /// The fields' codes of a key (the inverse of the packing).
     pub fn decode(&self, k: Key) -> Vec<(u32, Code)> {
-        let k = of_key(k);
         let mut out = Vec::new();
         for (c, f) in self.fields.iter().enumerate() {
             let Some(f) = f else { continue };
-            let (mut idx, mut at) = (0u128, 0u32);
-            for &(pos, len) in &f.runs {
-                idx |= (k >> pos & ((1u128 << len) - 1)) << at;
-                at += len as u32;
-            }
-            out.push((c as u32, f.codes.get(idx as usize).copied().unwrap_or(Code { kind: u8::MAX, a: 0, b: 0 })));
+            out.push((c as u32, f.codes.get(f.index_in(k) as usize).copied().unwrap_or(Code { kind: u8::MAX, a: 0, b: 0 })));
         }
         out
     }

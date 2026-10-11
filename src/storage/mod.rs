@@ -13,6 +13,7 @@
 //!                 an id to its (shape, key, cell)
 //!   * `meta`    - per frame, the shapes and entries it created
 //!   * `bench`   - `--emit-capture` and `rewrite bench-storage`
+//!   * `decode`  - rows from (shape skeleton, key, cell): `rewrite decode-check`
 //!   * `census`  - `rewrite storage-census` (plans/storage-unify.md)
 //!
 //! A state is `(shape, key, cell)` (the key holds no position:
@@ -20,6 +21,7 @@
 
 pub mod bench;
 pub mod census;
+pub mod decode;
 pub mod edges;
 pub mod marks;
 pub mod meta;

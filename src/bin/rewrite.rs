@@ -410,6 +410,22 @@ enum Command {
     /// exits non-zero. (Not mid split frame at a near level: there the
     /// graph side keeps a floor's computed `collideable` in the player's
     /// probe window, which a frame boundary's widening does not.)
+    /// ROWS FROM KEYS (plans/rows-from-keys.md): every stored row of frames
+    /// `--from..=--to` decoded from its id alone (the region's shape and the
+    /// entry's key from the metadata, the cell from the id) and its shape's
+    /// skeleton, compared with the stored row exactly. Prints the rows, the
+    /// files that differ (first difference each) and the decode ns per row;
+    /// exits non-zero on a difference at a frame past 0 (frame 0 keeps its
+    /// rows as the reference made them: `--from 1`).
+    DecodeCheck {
+        /// The level's tree (a search's `<checkpoint-dir>/levelNN`).
+        #[arg(long)]
+        level_dir: String,
+        #[arg(long, default_value_t = 0)]
+        from: u32,
+        #[arg(long)]
+        to: u32,
+    },
     WidenCheck {
         /// The level's tree (the dir holding `frames/` and `edges/`; a search's
         /// `<checkpoint-dir>/levelNN`).
@@ -1597,6 +1613,23 @@ fn main() -> Result<()> {
                 through.extend(states);
                 println!("f{frame:03}: {rows} rows -> {n} states ({:.2}x fewer); {} states through f{frame:03}", rows as f64 / n.max(1) as f64, through.len());
             }
+        }
+        Command::DecodeCheck { level_dir, from, to } => {
+            let r = celeste_rust::storage::decode::check_tree(std::path::Path::new(&level_dir), from, to, cfg.room)?;
+            for (f, name, what) in r.bad.iter().take(20) {
+                println!("[decode-check] f{f:03} {name}: {what}");
+            }
+            println!(
+                "[decode-check] f{from:03}-f{to:03}: {} rows in {} files of {} shapes; {} rows in {} files differ; decode {:.1} ns a row, load {:.1} ns a row",
+                r.rows,
+                r.files,
+                r.shapes,
+                r.bad_rows,
+                r.bad.len(),
+                r.t_decode.as_nanos() as f64 / r.rows.max(1) as f64,
+                r.t_load.as_nanos() as f64 / r.rows.max(1) as f64
+            );
+            anyhow::ensure!(r.bad.iter().all(|b| b.0 == 0), "decoded rows differ from the stored ones");
         }
         Command::WidenCheck { level_dir, frame, level, emitted } => {
             anyhow::ensure!(
