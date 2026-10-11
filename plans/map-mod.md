@@ -146,3 +146,23 @@ A beam search over exact states (`rewrite beam`, branch `mod-beam`, WIP,
 paused for the optimum): width 20000, no deaths, by d: it survives the
 spawn pocket (alive through f218, 20k states) and reaches d 20 at (105, 115)
 on f188, without an exit by f218.
+
+### The synthetic mid win (2026-10-11)
+
+`--win-at 56..72,104..112` (the open floor right of the spring), level -1
+seeded with the rectangle's nodes (commit "Level -1 with a win rectangle":
+the table's start d 62). Refuted at h95 (14 s), h105 (30 s), h115 (86 s),
+h125 (299 s), h140 (607 s): the mid win needs more than 140 frames. The beam
+(branch `mod-beam`, width 20000) reaches the rectangle on f168; that route
+replays identically in the reference engine and on a real PICO-8 (the mod's
+own Lua, `--balloon-seeds 0`). So the mid optimum is in 141..168.
+
+h155 runs out of memory in the ARC phase (the forward finished: 1.047B
+states, 39.4B edges, tree 191 GB at format 13, 127 GB at 14). Measured at
+h140, `arc_dp::load`: 114.7M marked nodes (29% of the forward's 390M
+states), 2.08B edges kept (16% of 12.8B); `graph built` 31.2 GB anon =
+~49 B a node (marks 16, ids 8 - a copy of the marks' ids, out_at 8,
+pred_at 8, layers 4, until 4, win 1) + 12 B an edge (`Out` dst+xfer 8,
+`preds` 4); the backward +2.6 GB, fingerprints' phase peak 40.7 GB. h155's
+BFS marked 371M nodes (the `[bfs]` lines); at h140's 18 edges a node that
+is ~6.7B edges: ~18 GB of nodes + ~80 GB of edges before the backward.
