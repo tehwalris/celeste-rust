@@ -1233,15 +1233,18 @@ fn main() -> Result<()> {
             let resolver = celeste_rust::storage::marks::Resolver::load(dir, horizon)?;
             let content = resolver.space.content_hash();
             eprintln!("[bench-backward] h{horizon}'s edge files opened in {:.2} s: {} win rows, {} edges; {} threads", t.elapsed().as_secs_f64(), seeds.wins.len(), seeds.store.edges, cfg.threads());
-            let t = std::time::Instant::now();
-            let mut b = celeste_rust::search::arc_dp::Backward::new(&seeds.store, &seeds.pairs, &seeds.wins, horizon, cfg.threads());
-            for f in (frame + 1..horizon).rev() {
-                b.step(f);
-            }
-            eprintln!("[bench-backward] W from f{horizon} down to f{} in {:.2} s", frame + 1, t.elapsed().as_secs_f64());
             let mut first: Option<String> = None;
             for rep in 0..reps {
-                let mut c = b.clone();
+                // Each rep pushes W down to F+1 afresh (untimed but the
+                // first), then times the step to W_F.
+                let t = std::time::Instant::now();
+                let mut c = celeste_rust::search::arc_dp::Backward::new(&seeds.store, &seeds.pairs, &seeds.wins, horizon, cfg.threads());
+                for f in (frame + 1..horizon).rev() {
+                    c.step(f);
+                }
+                if rep == 0 {
+                    eprintln!("[bench-backward] W from f{horizon} down to f{} in {:.2} s", frame + 1, t.elapsed().as_secs_f64());
+                }
                 let before = c.walls();
                 let t = std::time::Instant::now();
                 c.step(frame);

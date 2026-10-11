@@ -43,9 +43,70 @@ const BLOCK: usize = 16;
 pub struct Winning {
     n: usize,
     blocks: Vec<(StateId, u64)>,
-    data: Vec<u8>,
+    data: Bytes,
     sets: Sets,
     spans: usize,
+}
+
+/// Bytes appended in order, then read back: in memory, or in a scratch file
+/// mapped once written (`Spill::file`: page cache, which the kernel can
+/// reclaim, not anonymous memory; the file is unlinked once mapped).
+enum Spill {
+    Mem(Vec<u8>),
+    File { out: std::io::BufWriter<std::fs::File>, path: std::path::PathBuf, len: u64 },
+}
+
+impl Spill {
+    fn file(path: std::path::PathBuf) -> anyhow::Result<Self> {
+        let f = std::fs::File::create(&path).map_err(|e| anyhow::anyhow!("{}: {e}", path.display()))?;
+        Ok(Spill::File { out: std::io::BufWriter::with_capacity(1 << 20, f), path, len: 0 })
+    }
+    fn len(&self) -> u64 {
+        match self {
+            Spill::Mem(v) => v.len() as u64,
+            Spill::File { len, .. } => *len,
+        }
+    }
+    fn put(&mut self, b: &[u8]) {
+        match self {
+            Spill::Mem(v) => v.extend_from_slice(b),
+            Spill::File { out, path, len } => {
+                use std::io::Write;
+                out.write_all(b).unwrap_or_else(|e| panic!("FATAL: writing the arc phase's scratch file {}: {e}", path.display()));
+                *len += b.len() as u64;
+            }
+        }
+    }
+    fn done(self) -> anyhow::Result<Bytes> {
+        match self {
+            Spill::Mem(v) => Ok(Bytes::Mem(v)),
+            Spill::File { out, path, .. } => {
+                out.into_inner().map_err(|e| anyhow::anyhow!("{}: {e}", path.display()))?.sync_data()?;
+                let f = std::fs::File::open(&path)?;
+                // SAFETY: the file is this process's own, complete, and
+                // unlinked right after: nothing else writes it.
+                let m = unsafe { memmap2::Mmap::map(&f)? };
+                std::fs::remove_file(&path)?;
+                Ok(Bytes::Map(m))
+            }
+        }
+    }
+}
+
+/// `Spill::done`'s bytes.
+enum Bytes {
+    Mem(Vec<u8>),
+    Map(memmap2::Mmap),
+}
+
+impl std::ops::Deref for Bytes {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        match self {
+            Bytes::Mem(v) => v,
+            Bytes::Map(m) => m,
+        }
+    }
 }
 
 /// W's distinct sets: the backward's arena, numbered by use (`order[k]`:
@@ -196,36 +257,42 @@ impl Winning {
 
 /// The spans one backward step closed - each node whose set changed or
 /// ended below the step's frame, its span from `lo` (the step's frame + 1)
-/// to its last frame - by id, as varints: the id's delta, `hi - lo`, the set.
-#[derive(Clone, Default)]
+/// to its last frame - by id, as varints (the id's delta, `hi - lo`, the
+/// set) at `at..at + len` of the backward's spilled runs.
+#[derive(Clone, Copy)]
 struct Run {
     lo: u16,
     n: usize,
-    bytes: Vec<u8>,
+    at: u64,
+    len: u64,
 }
 
 impl Run {
-    fn new(lo: u16, closed: impl IntoIterator<Item = (StateId, u16, u32)>) -> Self {
-        let mut r = Run { lo, n: 0, bytes: Vec::new() };
-        let mut last = 0;
+    /// Encode `closed` (by id) into `out`.
+    fn new(lo: u16, closed: impl IntoIterator<Item = (StateId, u16, u32)>, out: &mut Spill) -> Self {
+        let mut bytes = Vec::new();
+        let (mut last, mut n) = (0, 0);
         for (id, hi, set) in closed {
             debug_assert!(id >= last && hi >= lo);
-            put_varint(&mut r.bytes, id - last);
-            put_varint(&mut r.bytes, (hi - lo) as u64);
-            put_varint(&mut r.bytes, set as u64);
+            put_varint(&mut bytes, id - last);
+            put_varint(&mut bytes, (hi - lo) as u64);
+            put_varint(&mut bytes, set as u64);
             last = id;
-            r.n += 1;
+            n += 1;
         }
-        r.bytes.shrink_to_fit();
-        r
+        let at = out.len();
+        out.put(&bytes);
+        Run { lo, n, at, len: bytes.len() as u64 }
     }
-    /// `(id, hi, set)` in id order.
-    fn iter(&self) -> impl Iterator<Item = (StateId, u16, u32)> + '_ {
+    /// `(id, hi, set)` in id order, from the spilled runs `all`.
+    fn iter<'b>(&self, all: &'b [u8]) -> impl Iterator<Item = (StateId, u16, u32)> + 'b {
+        let b = &all[self.at as usize..(self.at + self.len) as usize];
+        let lo = self.lo;
         let (mut pos, mut id) = (0usize, 0u64);
         (0..self.n).map(move |_| {
-            id += get_varint(&self.bytes, &mut pos);
-            let hi = self.lo + get_varint(&self.bytes, &mut pos) as u16;
-            (id, hi, get_varint(&self.bytes, &mut pos) as u32)
+            id += get_varint(b, &mut pos);
+            let hi = lo + get_varint(b, &mut pos) as u16;
+            (id, hi, get_varint(b, &mut pos) as u32)
         })
     }
 }
@@ -327,9 +394,13 @@ fn id_ranges(mut sample: Vec<StateId>, total: usize, parts: usize) -> Vec<StateI
 }
 
 /// BACKWARD: `W_t` for `t = horizon` down to 0 (`Backward::step`, a frame at
-/// a time), from the win states `wins` (id, layer).
-pub fn backward(store: &EdgeStore, pairs: &[(Transfer, Transfer)], wins: &[(StateId, u32)], horizon: u32, threads: usize) -> Winning {
+/// a time), from the win states `wins` (id, layer); with `spill`, the
+/// closed spans and W's nodes go to scratch files there (`Spill`).
+pub fn backward(store: &EdgeStore, pairs: &[(Transfer, Transfer)], wins: &[(StateId, u32)], horizon: u32, threads: usize, spill: Option<&std::path::Path>) -> anyhow::Result<Winning> {
     let mut b = Backward::new(store, pairs, wins, horizon, threads);
+    if let Some(dir) = spill {
+        b = b.spill_to(dir)?;
+    }
     for t in (0..horizon).rev() {
         b.step(t);
     }
@@ -338,8 +409,7 @@ pub fn backward(store: &EdgeStore, pairs: &[(Transfer, Transfer)], wins: &[(Stat
 
 /// The backward between two frames: `W_{t+1}` (the frame done last), which
 /// of its sets changed there, and the spans closed so far. `rewrite
-/// bench-backward` times one `step` from a clone.
-#[derive(Clone)]
+/// bench-backward` times one `step`.
 pub struct Backward<'a> {
     store: &'a EdgeStore,
     pairs: &'a [(Transfer, Transfer)],
@@ -353,10 +423,11 @@ pub struct Backward<'a> {
     cur: Vec<Cur>,
     /// Their indices whose set changed there (or appeared).
     changed: Vec<u32>,
-    /// Per step, the spans it closed.
+    /// Per step, the spans it closed, in `run_bytes`; with `spill`, that
+    /// and W's nodes are scratch files there.
     runs: Vec<Run>,
-    /// The bytes the runs hold.
-    run_bytes: u64,
+    run_bytes: Spill,
+    spill: Option<std::path::PathBuf>,
     /// Per target region, the steps that read its in-edges.
     opens: FxHashMap<u32, u32>,
     /// A round's in-edges (`ROUND_EMITS`) and a read's targets (tests
@@ -400,7 +471,8 @@ impl<'a> Backward<'a> {
             cur,
             changed,
             runs: Vec::new(),
-            run_bytes: 0,
+            run_bytes: Spill::Mem(Vec::new()),
+            spill: None,
             opens: FxHashMap::default(),
             round_emits: ROUND_EMITS,
             chunk: 1024,
@@ -414,6 +486,14 @@ impl<'a> Backward<'a> {
             d_merge: std::time::Duration::ZERO,
             fragments: Vec::new(),
         }
+    }
+
+    /// The closed spans and W's nodes in scratch files in `dir` (created).
+    pub fn spill_to(mut self, dir: &std::path::Path) -> anyhow::Result<Self> {
+        std::fs::create_dir_all(dir)?;
+        self.run_bytes = Spill::file(dir.join("runs.bin"))?;
+        self.spill = Some(dir.to_path_buf());
+        Ok(self)
     }
 
     /// Read in rounds of `emits` in-edges, `chunk` targets at a time.
@@ -748,8 +828,7 @@ impl<'a> Backward<'a> {
             closed.extend(o.closed);
         }
         drop(local);
-        let run = Run::new(close_at, closed);
-        self.run_bytes += run.bytes.len() as u64;
+        let run = Run::new(close_at, closed, &mut self.run_bytes);
         self.runs.push(run);
         self.cur = new_cur;
         self.changed = changed;
@@ -767,7 +846,7 @@ impl<'a> Backward<'a> {
             ms(d_merge),
             crate::metrics::current_rss_gb(),
             (self.cur.capacity() * std::mem::size_of::<Cur>() + self.changed.capacity() * 4) as f64 / 1e9,
-            self.run_bytes as f64 / 1e9,
+            self.run_bytes.len() as f64 / 1e9,
             self.sets.len(),
             (self.sets.bytes() + self.interned.capacity() * 16) as f64 / 1e9,
         );
@@ -780,16 +859,18 @@ impl<'a> Backward<'a> {
     /// The winning sets, once every frame down to 0 is done: the runs merged
     /// node by node (a heap over the runs) into `Winning`'s varints, the
     /// sets renumbered by use.
-    pub fn finish(mut self) -> Winning {
+    pub fn finish(mut self) -> anyhow::Result<Winning> {
         use std::cmp::Reverse;
         assert_eq!(self.runs.len(), self.horizon as usize, "finish before frame 0");
         let last = std::mem::take(&mut self.cur);
         let mut runs = std::mem::take(&mut self.runs);
-        runs.push(Run::new(0, last.into_iter().map(|c| (c.id, c.hi, c.set))));
+        let mut run_bytes = std::mem::replace(&mut self.run_bytes, Spill::Mem(Vec::new()));
+        runs.push(Run::new(0, last.into_iter().map(|c| (c.id, c.hi, c.set)), &mut run_bytes));
+        let all = run_bytes.done()?;
         // The sets by use, the most used first (smaller varints).
         let mut uses = vec![0u64; self.sets.len()];
         for r in &runs {
-            for (_, _, s) in r.iter() {
+            for (_, _, s) in r.iter(&all) {
                 uses[s as usize] += 1;
             }
         }
@@ -806,31 +887,38 @@ impl<'a> Backward<'a> {
         crate::metrics::mem_phase("arc: backward swept");
         // The runs merged by (id, frame).
         let spans: usize = runs.iter().map(|r| r.n).sum();
-        let mut iters: Vec<_> = runs.iter().map(|r| r.iter()).collect();
+        let mut iters: Vec<_> = runs.iter().map(|r| r.iter(&all)).collect();
         let mut heap: std::collections::BinaryHeap<Reverse<(StateId, u16, u16, u32, usize)>> = std::collections::BinaryHeap::new();
         for (k, it) in iters.iter_mut().enumerate() {
             if let Some((id, hi, s)) = it.next() {
                 heap.push(Reverse((id, runs[k].lo, hi, s, k)));
             }
         }
-        let mut w = Winning { n: 0, blocks: Vec::new(), data: Vec::new(), sets, spans };
+        let mut data = match &self.spill {
+            Some(dir) => Spill::file(dir.join("w.bin"))?,
+            None => Spill::Mem(Vec::new()),
+        };
+        let (mut n, mut blocks) = (0usize, Vec::new());
         let mut node: Vec<(u16, u16, u32)> = Vec::new();
+        let mut bytes: Vec<u8> = Vec::new();
         let (mut cur_id, mut prev_id) = (None::<StateId>, 0u64);
-        let flush = |w: &mut Winning, id: StateId, node: &mut Vec<(u16, u16, u32)>, prev_id: &mut u64| {
-            if w.n % BLOCK == 0 {
-                w.blocks.push((id, w.data.len() as u64));
+        let mut flush = |id: StateId, node: &mut Vec<(u16, u16, u32)>, prev_id: &mut u64| {
+            if n % BLOCK == 0 {
+                blocks.push((id, data.len()));
                 *prev_id = id;
             }
-            put_varint(&mut w.data, id - *prev_id);
-            put_varint(&mut w.data, node[0].0 as u64);
-            put_varint(&mut w.data, node.len() as u64);
+            bytes.clear();
+            put_varint(&mut bytes, id - *prev_id);
+            put_varint(&mut bytes, node[0].0 as u64);
+            put_varint(&mut bytes, node.len() as u64);
             for (k, &(lo, hi, s)) in node.iter().enumerate() {
                 debug_assert!(k == 0 || node[k - 1].1 + 1 == lo, "a node's spans are contiguous");
-                put_varint(&mut w.data, (hi - lo) as u64);
-                put_varint(&mut w.data, renumber[s as usize] as u64);
+                put_varint(&mut bytes, (hi - lo) as u64);
+                put_varint(&mut bytes, renumber[s as usize] as u64);
             }
+            data.put(&bytes);
             *prev_id = id;
-            w.n += 1;
+            n += 1;
             node.clear();
         };
         while let Some(Reverse((id, lo, hi, s, k))) = heap.pop() {
@@ -839,17 +927,24 @@ impl<'a> Backward<'a> {
             }
             if cur_id != Some(id) {
                 if let Some(c) = cur_id {
-                    flush(&mut w, c, &mut node, &mut prev_id);
+                    flush(c, &mut node, &mut prev_id);
                 }
                 cur_id = Some(id);
             }
             node.push((lo, hi, s));
         }
         if let Some(c) = cur_id {
-            flush(&mut w, c, &mut node, &mut prev_id);
+            flush(c, &mut node, &mut prev_id);
         }
+        drop(flush);
         drop(iters);
         drop(runs);
+        drop(all);
+        let w = Winning { n, blocks, data: data.done()?, sets, spans };
+        if let Some(dir) = &self.spill {
+            // Both files are mapped and unlinked.
+            let _ = std::fs::remove_dir(dir);
+        }
         let opens: Vec<u32> = self.opens.values().copied().collect();
         let (o_mean, o_max) = (opens.iter().map(|&o| o as f64).sum::<f64>() / opens.len().max(1) as f64, opens.iter().copied().max().unwrap_or(0));
         eprintln!(
@@ -879,7 +974,7 @@ impl<'a> Backward<'a> {
         for f in &self.fragments {
             eprintln!("{f}");
         }
-        w
+        Ok(w)
     }
 }
 
@@ -1657,9 +1752,14 @@ pub fn solve(
     let seeds = Seeds::load(dir, horizon)?;
     crate::metrics::mem_phase("arc: edge files opened");
     let tb = std::time::Instant::now();
-    // The backward's reads are scattered: no read-ahead.
+    // The backward's reads are scattered: no read-ahead. Its closed spans
+    // and W's nodes go to scratch files beside the tree (mapped, unlinked).
     seeds.store.advise(memmap2::Advice::Random)?;
-    let w = backward(&seeds.store, &seeds.pairs, &seeds.wins, horizon, threads);
+    let scratch = dir.join("arc-scratch");
+    if scratch.exists() {
+        std::fs::remove_dir_all(&scratch)?;
+    }
+    let w = backward(&seeds.store, &seeds.pairs, &seeds.wins, horizon, threads, Some(&scratch))?;
     crate::metrics::mem_phase("arc: backward");
     let tb = tb.elapsed().as_secs_f64();
     let start = w.index(seeds.start);
@@ -1933,7 +2033,7 @@ mod tests {
         let tree = TestTree::new("corridor", vec![0, 1], &[(0, 0, both(&p[0]), still), (0, 1, both(&p[1]), still)], vec![1]);
         let opt = |h: u32, rem: i32| {
             let (store, pairs, wins) = tree.open(h);
-            let w = backward(&store, &pairs, &wins, h, 2);
+            let w = backward(&store, &pairs, &wins, h, 2, None).expect("backward");
             optimum(&w, w.index(sid(0)), (point(rem), point(0)), h)
         };
         // rem -0.1 + 0.6 crosses at once: a win at frame 1.
@@ -1969,8 +2069,10 @@ mod tests {
             for t in (0..horizon).rev() {
                 b.step(t);
             }
-            let w = b.finish();
-            assert_eq!(w.len(), backward(&store, &pairs, &seeds, horizon, 2).len(), "rounds or not, the same support");
+            let w = b.finish().expect("backward");
+            let spilled = tree.dir.join("spill");
+            assert_eq!(w.len(), backward(&store, &pairs, &seeds, horizon, 2, Some(&spilled)).expect("backward").len(), "rounds or not, spilled or not, the same support");
+            assert!(!spilled.exists(), "the scratch files are gone once mapped");
             for i in 0..n {
                 let node = w.index(sid(i));
                 assert_eq!(node.is_some(), (0..=horizon).any(|t| want[t as usize][i as usize].is_some()), "node {i}: in the support iff it has a set");
@@ -2004,7 +2106,7 @@ mod tests {
             let horizon = 7;
             let tree = TestTree::new("reach", layers, &edges, wins.clone());
             let (store, pairs, seeds) = tree.open(horizon);
-            let w = backward(&store, &pairs, &seeds, horizon, 2);
+            let w = backward(&store, &pairs, &seeds, horizon, 2, None).expect("backward");
             let mut g = ReachEdges::new(&store, &w, tree.win_ids(), 2);
             let start = w.index(sid(0));
             let p0 = (r(CIRCLE), r(CIRCLE));
@@ -2061,7 +2163,7 @@ mod tests {
             let ws: Vec<Winning> = (0..=horizon)
                 .map(|h| {
                     let (store, pairs, seeds) = tree.open(h);
-                    backward(&store, &pairs, &seeds, h, 2)
+                    backward(&store, &pairs, &seeds, h, 2, None).expect("backward")
                 })
                 .collect();
             let w = &ws[horizon as usize];

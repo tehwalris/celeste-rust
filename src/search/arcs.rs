@@ -500,9 +500,9 @@ impl RegionArena {
         let (a, b) = (self.at[i as usize], self.at[i as usize + 1]);
         RegionRef { slabs: &self.slabs[a.0 as usize..b.0 as usize], xs: &self.xs[a.1 as usize..b.1 as usize] }
     }
-    /// The bytes held.
+    /// The bytes its sets take (the lists' used lengths).
     pub fn bytes(&self) -> usize {
-        self.slabs.capacity() * std::mem::size_of::<Slab>() + self.xs.capacity() * std::mem::size_of::<Seg>() + self.at.capacity() * 8
+        self.slabs.len() * std::mem::size_of::<Slab>() + self.xs.len() * std::mem::size_of::<Seg>() + self.at.len() * 8
     }
 }
 
