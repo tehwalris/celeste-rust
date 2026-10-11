@@ -231,7 +231,9 @@ fn parse_fwd(line: &str) -> Result<FwdLine> {
         // Older logs say `emit` / `own` for `wave` / `door`.
         emit_ms: num(after(&t, "wave", 0).or_else(|_| after(&t, "emit", 0))?)?,
         emit_idle: num(after(&t, "(idle", 0)?)?,
-        own_ms: num(after(&t, "translate", 0).or_else(|_| after(&t, "door", 0)).or_else(|_| after(&t, "own", 0))?)?,
+        // Since the routed forward (its region phase runs inside the wave),
+        // the storage's own wall time is the frame's end, `layer`.
+        own_ms: num(after(&t, "translate", 0).or_else(|_| after(&t, "door", 0)).or_else(|_| after(&t, "own", 0)).or_else(|_| after(&t, "layer", 0))?)?,
         own_idle: after(&t, "(idle", 1).ok().map(num).transpose()?.unwrap_or(0),
         ckpt_ms: num(after(&t, "ckpt", 0)?)?,
         pos_ms: num(after(&t, "pos", 0)?)?,

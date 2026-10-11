@@ -298,7 +298,7 @@ pub fn bench_storage(a: &BenchArgs) -> Result<()> {
         let (n, acc) = layer_fingerprint(&wave.next, &visited);
         let (ne, ae) = edge_fingerprint(&scratch, frame, &xfers, &visited, a.settings.threads())?;
         println!(
-            "[bench-storage] rep {rep}: units {:.0} ms (idle {:.0}%) regions {:.0} end {:.0} total {:.0} ms ({} threads; {} slices, {} routes, {} bundles, {:.3} B an edge) | f{frame:03} {n} {acc:016x} | e{frame:03} {ne} {ae:016x}",
+            "[bench-storage] rep {rep}: units {:.0} ms (idle {:.0}%, regions {:.0} worker-ms) end {:.0} total {:.0} ms ({} threads; {} slices, {} routes, {} bundles, {:.3} B an edge) | f{frame:03} {n} {acc:016x} | e{frame:03} {ne} {ae:016x}",
             ms(w.t_wave),
             w.wave_idle * 100.0,
             ms(w.t_regions),

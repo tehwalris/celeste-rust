@@ -142,8 +142,29 @@ impl RegionTable {
             self.masks.truncate(s * words);
             self.masks.extend(masks);
         }
-        if moved || rekeyed {
+        if rekeyed {
+            // A provisional key's slot was its own: every slot again (rare:
+            // a frame's new codes).
             self.reindex();
+        } else if moved {
+            // Each new entry keeps its key's slot: the slots found under the
+            // old numbers first, then given the new ones.
+            let m = self.index.len() - 1;
+            // (Entry `s + n` is now the one numbered `order[n]` before.)
+            let slots: Vec<usize> = order
+                .iter()
+                .enumerate()
+                .map(|(n, &old)| {
+                    let mut i = slot_hash(self.keys[s + n]) as usize & m;
+                    while self.index[i] != old + 1 {
+                        i = (i + 1) & m;
+                    }
+                    i
+                })
+                .collect();
+            for (n, i) in slots.into_iter().enumerate() {
+                self.index[i] = start + n as u32 + 1;
+            }
         }
         Ok(order)
     }

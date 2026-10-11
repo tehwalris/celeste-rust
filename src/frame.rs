@@ -649,7 +649,8 @@ pub struct FrameStats {
     /// The units' wall time (every slice's) and its barrier idle fraction.
     pub t_wave: std::time::Duration,
     pub wave_idle: f64,
-    /// The region phase, wall (every slice's).
+    /// The region phase: its jobs' time summed over the workers (they run
+    /// inside the wave, overlapping the units).
     pub t_regions: std::time::Duration,
     /// The frame's end (keys, numbering, the layer decoded, the edge file), wall.
     pub t_layer: std::time::Duration,
@@ -1471,7 +1472,7 @@ fn log_frame(
     let ms = |d: std::time::Duration| d.as_secs_f64() * 1e3;
     eprintln!(
         "[fwd] f{frame:03} in {}/{} raw {} kept {} out {}/{} visited {} | \
-         wave {:.0} (idle {:.0}%) regions {:.0} layer {:.0} ckpt {:.0} pos {:.0} total {:.0} ms | \
+         wave {:.0} (idle {:.0}%, regions {:.0} worker-ms) layer {:.0} ckpt {:.0} pos {:.0} total {:.0} ms | \
          units {} slices {} routes {} edges {} bundles {} ({:.3} B) | \
          in {:.2} visited {:.2} GB rss start {:.2} wave {:.2} end {:.2} peak {:.2} GB (anon; file {:.2}) | \
          keys {} bits, {} codes (+{})",

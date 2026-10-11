@@ -80,3 +80,10 @@ Steps:
   unit, in order; transfers merged per slice from each worker's pairs met in it (`upto`).
   Region worker-s at f57 ~4-5.5 (31-39 at 8dcaa56); wave idle 1-3%. Reference frame A/B
   (interleaved, load 26-38, spiky): develop min 3.13 s median ~5.7; this min 3.0 median ~4.2.
+- 2026-10-11 ~17:45 Determinism (room (1,0) r0sxh f0-50): 3 vs 32 threads ckhash --edges identical, frame files byte-identical, xfer.bin identical; resume f35->f50 identical; gates/raise.sh 1,0 55 56 58 OK. t1/t2/big ok (metrics re-pinned: storage keys only).
+- 2026-10-11 16:58 Frame end: `RegionTable::finish_frame` renumbers only the new entries' index
+  slots (a full reindex only when provisional keys were rekeyed) - the room (1,0) A/B showed the
+  frame end at 11.5 s against develop's layer 7.2 s. The `[fwd]` line's `regions` is now the region
+  jobs' summed worker time (it was never set), `rss wave` sampled again; the UI export reads
+  `layer` as the storage's own time. Room (1,0) f44: posgraph, ckhash, frame and edge files
+  byte-identical. t0 193/193.

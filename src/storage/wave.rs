@@ -282,16 +282,16 @@ pub fn run_wave(engine: &dyn FrameStep, frontier: Vec<Block>, cx: WaveCtx) -> Re
     // slice's last unit GATHERS the slices that are complete, in order:
     // their transfers' global ids, new routes, their chunks as jobs. Region
     // work overlaps the next slices' kernels; no barrier but the frame's end.
-    let spent: Vec<std::time::Duration> = std::thread::scope(|scope| {
+    let spent: Vec<(std::time::Duration, std::time::Duration)> = std::thread::scope(|scope| {
         let handles: Vec<_> = sinks
             .iter_mut()
             .zip(scratch.iter_mut())
             .map(|(sink, sc)| {
                 let (frontier, cells, order, units, sources, pipe, slice_of, slices, routes) = (&frontier, &cells, &order, &units, &sources, &pipe, &slice_of, &slices, &routes);
                 let visited: &VisitedSet = visited;
-                std::thread::Builder::new().stack_size(WORKER_STACK).spawn_scoped(scope, move || -> Result<std::time::Duration> {
+                std::thread::Builder::new().stack_size(WORKER_STACK).spawn_scoped(scope, move || -> Result<(std::time::Duration, std::time::Duration)> {
                     crate::compiled::asm_kernel::set_thread_stack(WORKER_STACK);
-                    let mut busy = std::time::Duration::ZERO;
+                    let (mut busy, mut in_regions) = (std::time::Duration::ZERO, std::time::Duration::ZERO);
                     let mut idle_spins = 0u32;
                     loop {
                         if let Some(job) = pipe.pop_job() {
@@ -304,6 +304,7 @@ pub fn run_wave(engine: &dyn FrameStep, frontier: Vec<Block>, cx: WaveCtx) -> Re
                             r?;
                             phases::add(phases::REGIONS, tp);
                             busy += t.elapsed();
+                            in_regions += t.elapsed();
                             idle_spins = 0;
                             continue;
                         }
@@ -343,7 +344,7 @@ pub fn run_wave(engine: &dyn FrameStep, frontier: Vec<Block>, cx: WaveCtx) -> Re
                         pipe.wait(&mut idle_spins);
                     }
                     crate::compiled::dispatch::fold_hits();
-                    Ok(busy)
+                    Ok((busy, in_regions))
                 })
                 .expect("spawn wave worker")
             })
@@ -351,9 +352,11 @@ pub fn run_wave(engine: &dyn FrameStep, frontier: Vec<Block>, cx: WaveCtx) -> Re
         handles.into_iter().map(|h| h.join().expect("wave worker panicked")).collect::<Result<Vec<_>>>()
     })?;
     let t_units = t_pipeline.elapsed();
-    let busy: std::time::Duration = spent.iter().sum();
+    let busy: std::time::Duration = spent.iter().map(|w| w.0).sum();
+    st.t_regions = spent.iter().map(|w| w.1).sum();
     st.t_wave = t_units;
     st.wave_idle = idle_fraction(t_units, workers, busy);
+    st.rss_wave = crate::metrics::current_rss_gb();
     st.slices = slices.len();
     for sink in &mut sinks {
         sink.finish()?;
