@@ -246,3 +246,30 @@ exact speed (the `s` of `r0sx`), not a widening.
   target-region bundles, 0.08-0.25 B an edge, move that to ~215). The
   projection's big uncertainty is U past f152 (extrapolated at +9.3%/frame;
   a 3%/frame decay of that rate halves h220).
+
+### Stitching the exit route from the mid point (2026-10-11)
+
+`search --start-inputs PREFIX` (a search from the state a route prefix
+reaches) and `search --all-wins FILE` (every concrete win inside W).
+
+- Validated on this room: the beam's mid route split at f100 - from that
+  state the optimum to the mid rect is 42, so 100 + 42 = 142, the proven
+  optimum from the load; the beam's own suffix survives every pruning step.
+- The f142 mid states (`--all-wins`, r0sxhe h142, 1.8 s of concrete BFS):
+  8,013 (4,840 without the held buttons), all at y 105, x 61/62/64, every
+  strawberry taken, spring and balloon identical; 22 classes by (speed,
+  djump, freeze, dash_time, grace): 1,506 with the dash in hand (spd 1.85,2
+  or -2,-2), 6,507 starting a dash that frame in one of 9 directions. f143-150
+  (h150): W too loose for the BFS (x1.5 a layer, 454k states and 32 GB at
+  layer 132): stopped.
+- From the canonical f142 state (`mid142-canon.txt`, dash in hand), r0sxhe,
+  `--balloon-seeds 0`, level -1:
+  - to the real exit: REFUTED at h80 (first remainder-free win f68; forward
+    19 min, 107M states at its peak frame, 148 GB, 41 GB): the stitched
+    route is >= 142 + 81 = 223 (the room's bound: >= 191);
+  - to the right shaft's foot (`--win-at 100..121,64..96`, after the
+    balloon): REFUTED at h30, 40, 50, 60, 70 (h70: forward 16 min, 45M a
+    frame at f49, first remainder-free win f26).
+- The beam (`rewrite beam`, branch mod-beam merged here) from the same
+  state toward the exit by level -1's d stalls at d 22-25 in the bottom
+  pocket (y 110-128) for 30 frames.
