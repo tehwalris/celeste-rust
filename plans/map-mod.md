@@ -92,10 +92,17 @@ identical; three rooms changed: (0,0) the challenge room (spawn (32,24), 3
 strawberries, a spring, a balloon, spikes; exit at the top), (1,0) an orb
 (big chest) room, (2,0) a flag room. Only room (0,0) matters.
 
-BLOCKER (open): the kernels' lattice walk fails on room (0,0) at every
-level: `objects[0].start: not a constant`. The "strawberry bob" widening
-(`Flag::Always`, crates/celeste-engine/src/widening.rs) stores a fruit's `y`
-as a band around its `start`, which must be a constant of the shape. With
-THREE strawberries, taking one shifts the others' indices, so different
-fruit subsets share a shape with different `start`s. The original map has
-one strawberry a room, so nothing met this before.
+The kernels needed the strawberries exact (level flag `e`, commit
+df1795f: the bob's band around `start` cannot be built when taking one of
+three strawberries moves the others in `objects`).
+
+Measured at `r0sxhne`, no level -1, NOT `--balloon-seeds` in the forward
+(a seeded balloon's offset is a point that advances only while `spr == 22`,
+and `n` makes `spr` a range: the offset forked into 62 values a frame;
+unseeded it is the canonical full period). `--concrete-balloon-seeds 0`
+for the concrete phase instead. The player exists from frame 46 (the
+upload cut: 45). New states a frame: f60 19k, f90 4.4M, f126 12.9M, f152
+104.5M (+9% a frame); 270 GB of tree at f152 (quick build, ~3-25 s a
+frame). First abstract win f152; `search --to 152` on that tree: the arcs
+REFUTE 152 (15 s). In f140's largest shape (28.8M rows, the fruit all
+taken) `spd.x` has 14845 distinct values.
