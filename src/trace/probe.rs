@@ -1,24 +1,42 @@
-//! Differential corpora against REAL PICO-8, for questions another model
-//! could get wrong the same way (`#` on a table with a hole depends on how
-//! the table was BUILT, not on what it holds).
+//! Differential corpora against REAL PICO-8: the numerics the concrete
+//! search relies on (16.16 `+ - * / %`, `flr`, `abs`, `min`/`max`, `sin`,
+//! literals), the sequence builtins (`add`, `del`, `count`, `foreach`) and
+//! questions another model could get wrong the same way (`#` on a table with
+//! a hole depends on how the table was BUILT, not on what it holds).
 //!
-//! Each `lua/probe/*.lua` runs unchanged in the tracer and in PICO-8; its
-//! real stdout is checked in beside it (`./regen-pico8-golden.sh` needs a
-//! PICO-8 install, the tests do not). The corpus prints only through
-//! `printh`, one value per call: the tracer has no `tostr` or `..`.
+//! Each `lua/probe/*.lua` runs unchanged in the tracer (after the game's
+//! Lua builtins, `lua/builtin_level_3.lua` and `_4`, as the cart does) and
+//! in PICO-8; its real stdout is checked in beside it
+//! (`./regen-pico8-golden.sh` needs a PICO-8 install, the tests do not).
+//! A corpus prints one value per call: `printh` for strings, booleans and
+//! integers (the tracer has no `tostr` or `..`), and `__hex(x)` for any
+//! number, its exact 16.16 bits as `tostr(x, true)` prints them
+//! (`0x0000.5555`): native here, `printh(tostr(x, true))` in the cart the
+//! regen script builds. Printing the raw bits runs the value through no
+//! arithmetic; decomposing it with `flr`, `*` and `-` inside the corpus
+//! would put the operations under test into the print.
+//!
+//! A corpus uses only what the tracer has (`cart::NATIVE`, the Lua
+//! builtins; no `sqrt`, `cos`, `sgn`, `mid`, `..`), runs concretely (it must
+//! end in exactly one state), and keeps one divergence per
+//! file, so a known-bad line cannot hide the good ones after it.
 
 use anyhow::{bail, Result};
 
 use super::cart::{fresh_state, run_chunk};
 use super::domain::Symbolic;
+use super::heap::Value;
 use super::interp::Interp;
 
-/// Run one corpus file in the tracer and return what it printed.
+/// Run one corpus file in the tracer, after the game's Lua builtins, and
+/// return what it printed.
 pub fn run_probe(name: &str) -> Result<Vec<String>> {
-    let src = std::fs::read_to_string(format!("lua/probe/{}.lua", name))?;
+    let read = |p: &str| std::fs::read_to_string(p).map_err(|e| anyhow::anyhow!("{p}: {e}"));
+    let src = format!("{}\n{}\n{}", read("lua/builtin_level_3.lua")?, read("lua/builtin_level_4.lua")?, read(&format!("lua/probe/{name}.lua"))?);
     let ast = full_moon::parse(&src).map_err(|e| anyhow::anyhow!("parse: {}", e))?;
     let mut it: Interp<Symbolic> = Interp::new(Symbolic::default());
-    let st = fresh_state::<Symbolic>(&mut it.d);
+    let mut st = fresh_state::<Symbolic>(&mut it.d);
+    st.heap.tables.get_mut(&st.globals).expect("the globals table").hash.insert("__hex".to_string(), Value::Builtin("__hex"));
     run_chunk(&mut it, &ast, st)?;
     Ok(std::mem::take(&mut it.prints))
 }
@@ -37,8 +55,9 @@ pub fn compare(name: &str) -> Result<usize> {
     let mut label = "<start>".to_string();
     for (i, w) in want.iter().enumerate() {
         // A label is any line that is not a value; the corpus only prints
-        // numbers, booleans, `[nil]` and its own case names.
-        if w.contains('-') || (!w.starts_with('[') && w.parse::<f64>().is_err() && w != "true" && w != "false") {
+        // numbers (decimal or `__hex`'s), booleans, `[nil]` and its own case
+        // names.
+        if !w.starts_with('[') && !w.starts_with("0x") && w.parse::<f64>().is_err() && w != "true" && w != "false" {
             label = w.clone();
         }
         match got.get(i) {
@@ -67,7 +86,25 @@ pub fn compare(name: &str) -> Result<usize> {
 }
 
 /// Corpora the tracer must reproduce EXACTLY.
-pub const MATCHING: &[&str] = &["tables"];
+pub const MATCHING: &[&str] = &[
+    "fmt_basics",
+    "num_abs",
+    "num_abs_min",
+    "num_arith",
+    "num_div",
+    "num_div_saturate",
+    "num_flr",
+    "num_literals",
+    "num_literals_precision",
+    "num_minmax",
+    "num_mod",
+    "num_mod_signs",
+    "num_sin",
+    "num_sin_fruit40",
+    "seq_add_del_count",
+    "seq_foreach",
+    "tables",
+];
 
 /// Corpora the tracer must REFUSE: each is a `#` that depends on the table's
 /// rehash history, not its keys (`heap::Table::len`). Their golden files
@@ -114,12 +151,14 @@ mod tests {
 
     #[test]
     fn corpora_match_pico8() {
+        let mut bad = Vec::new();
         for name in MATCHING {
             match compare(name) {
                 Ok(n) => eprintln!("[probe] {}: {} lines agree with real PICO-8", name, n),
-                Err(e) => panic!("{:#}", e),
+                Err(e) => bad.push(format!("{:#}", e)),
             }
         }
+        assert!(bad.is_empty(), "{}", bad.join("\n"));
     }
 
     /// The other half of "exactly match PICO-8 or raise": these must RAISE.

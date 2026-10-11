@@ -194,23 +194,12 @@ impl Settings {
     /// The tree in `dir` was built under these settings, at `level`: else an
     /// error that names every difference.
     pub fn check(&self, dir: &Path, level: crate::abstraction::Level) -> Result<()> {
-        self.check_at(dir, &level.to_string())
-    }
-
-    /// The same, whatever the tree's level (a diagnostic that reads the tree
-    /// without a level).
-    pub fn check_any_level(&self, dir: &Path) -> Result<()> {
-        let rec = std::fs::read_to_string(path(dir)).unwrap_or_default();
-        let level = rec.lines().find_map(|l| l.strip_prefix("level ")).unwrap_or("").to_string();
-        self.check_at(dir, &level)
-    }
-
-    fn check_at(&self, dir: &Path, level: &str) -> Result<()> {
+        let level = level.to_string();
         let p = path(dir);
         let recorded = match std::fs::read_to_string(&p) {
             Ok(s) => s,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => anyhow::bail!(
-                "{}: the tree records no settings (built before {}): its room, category, split frame, regions and level are unknown - delete it, or record the ones it was built under (`rewrite adopt-settings` with its flags)",
+                "{}: the tree records no settings (built before {}): its room, category, split frame, regions and level are unknown - delete it",
                 dir.display(),
                 p.display()
             ),
@@ -220,7 +209,7 @@ impl Settings {
         let head = rec.next().unwrap_or("");
         anyhow::ensure!(head == format!("tree settings {VERSION}"), "{}: {head:?} is not a settings record of format {VERSION}", p.display());
         let rec: std::collections::BTreeMap<&str, &str> = rec.filter_map(|l| l.split_once(' ')).collect();
-        let mine = self.recorded(level);
+        let mine = self.recorded(&level);
         let mut diffs: Vec<(&str, String)> = mine
             .iter()
             .filter(|(k, v)| rec.get(k) != Some(&v.as_str()))
@@ -344,8 +333,7 @@ pub struct SettingsArgs {
     /// Use a tree recorded under other settings that do not change what it
     /// holds (only `--region`), under this run's; every difference is logged.
     /// Any other difference (room, win, split frame, category, loading jank,
-    /// balloons, level) is still refused. A tree without a record: `rewrite
-    /// adopt-settings`.
+    /// balloons, level) is still refused. A tree without a record is refused.
     #[arg(long, global = true)]
     pub override_settings: bool,
     /// DIAGNOSTIC: every emitted row's key recomputed by the boundary, and
@@ -582,31 +570,32 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("celeste-settings-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("mkdir");
+        let lvl = |l: &str| crate::abstraction::Level::parse(l).expect("a level");
         let sample = Settings { room: (6, 2), hundred: true, loading_jank: Some(2), ..Settings::default() };
-        let e = sample.check_at(&dir, "r0sxhf").expect_err("no record");
+        let e = sample.check(&dir, lvl("r0sxhf")).expect_err("no record");
         assert!(e.to_string().contains("records no settings"), "{e}");
         std::fs::write(path(&dir), sample.text("r0sxhf")).expect("write");
-        sample.check_at(&dir, "r0sxhf").expect("the same settings");
+        sample.check(&dir, lvl("r0sxhf")).expect("the same settings");
         let harmless = Settings { threads: Some(3), level_minus_one: Some((94, 5)), diag: Diagnostics { key_check: true, ..Default::default() }, ..sample.clone() };
-        harmless.check_at(&dir, "r0sxhf").expect("threads, level -1 and diagnostics are not a tree's settings");
+        harmless.check(&dir, lvl("r0sxhf")).expect("threads, level -1 and diagnostics are not a tree's settings");
         let other = Settings { hundred: false, split_frame: true, win_at: Some((8, 8, 64, 64)), ..sample.clone() };
-        let e = other.check_at(&dir, "r0sxh").expect_err("other settings").to_string();
+        let e = other.check(&dir, lvl("r0sxh")).expect_err("other settings").to_string();
         for k in ["hundred: the tree's 1, this run's 0", "split_frame: the tree's 0, this run's 1", "win_at: the tree's none, this run's 8..8,64..64", "level: the tree's r0sxhf, this run's r0sxh"] {
             assert!(e.contains(k), "{k} not in {e}");
         }
         assert!(!e.contains("room:"), "{e}");
         // `--override-settings`: only the region grid, and only with the flag.
         let grid = Settings { region: None, ..sample.clone() };
-        let e = grid.check_at(&dir, "r0sxhf").expect_err("another grid, no override").to_string();
+        let e = grid.check(&dir, lvl("r0sxhf")).expect_err("another grid, no override").to_string();
         assert!(e.contains("region: the tree's 16,6, this run's none") && e.contains("--override-settings proceeds"), "{e}");
-        Settings { override_settings: true, ..grid.clone() }.check_at(&dir, "r0sxhf").expect("the grid overridden");
-        let e = Settings { override_settings: true, hundred: false, ..grid }.check_at(&dir, "r0sxhf").expect_err("a category is not overridable").to_string();
+        Settings { override_settings: true, ..grid.clone() }.check(&dir, lvl("r0sxhf")).expect("the grid overridden");
+        let e = Settings { override_settings: true, hundred: false, ..grid }.check(&dir, lvl("r0sxhf")).expect_err("a category is not overridable").to_string();
         assert!(e.contains("hundred: the tree's 1, this run's 0") && e.contains("region:"), "{e}");
         // A record from before the storage side was fixed: `storage_region 8`
         // is accepted, another side is not.
         for (side, ok) in [("8", true), ("16", false)] {
             std::fs::write(path(&dir), format!("{}storage_region {side}\n", sample.text("r0sxhf"))).expect("write");
-            assert_eq!(sample.check_at(&dir, "r0sxhf").is_ok(), ok, "storage_region {side}");
+            assert_eq!(sample.check(&dir, lvl("r0sxhf")).is_ok(), ok, "storage_region {side}");
         }
         let _ = std::fs::remove_dir_all(&dir);
     }

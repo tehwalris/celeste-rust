@@ -88,7 +88,7 @@ def build_cart(inputs, frames, out, lua_path=None, begin_game=False, room=None, 
         # a frame in Lua doubles, PICO-8 0x0.028f, so a balloon whose y meets
         # an integer can be touched here and missed there (seed 0 puts y at
         # exactly `start` at offset 0.5 in UCT). Check uploads in UCT too
-        # (tools/uct/validate.sh; category_runner.nudged_seeds).
+        # (tools/uct/validate.sh; tools/celeste/love.py nudged_seeds).
         pat = "this.offset=rnd(1)"
         assert lua.count(pat) == 1, f"expected exactly one {pat!r} in the Lua"
         lua = lua.replace(pat, "this.offset=__balloon_seed()")

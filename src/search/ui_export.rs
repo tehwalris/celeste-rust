@@ -1,23 +1,24 @@
-//! `rewrite export-ui`: a finished search's checkpoint trees + run log ->
-//! the compact static data the web UI (`ui/`) renders.
+//! `rewrite export-ui`: a finished search's record (`result.json`), its
+//! checkpoint trees and marks -> the compact static data the web UI (`ui/`)
+//! renders.
 //!
 //! Per (level, frame): states and wins per player-position cell; per marked
 //! set (`search --save-marks`: W's support, arc-marked nodes): the
 //! marked states per cell by distance to the win. All of it comes from the
 //! checkpoint HEADERS (cell index, win list), the marks files, and the key
-//! column at marked cells: no row is decoded, no engine built.
+//! column at marked cells: no row is decoded, no engine built. The forward's
+//! per-frame stats are each tree's own record (`frame::FORWARD_STATS`).
 //!
-//! The input is a `rewrite search` checkpoint directory (`levelNN/` per
-//! `--level`) or one `rewrite forward` tree, with its log: one horizon whose
-//! levels are the forward levels, plus with `--arc` a last level carrying the
-//! arc backward over the last forward tree (`forward_of`). Some JSON fields
-//! (`bwd`, `reruns`, several horizons) are kept only because the UI reads them.
+//! The run is one horizon whose levels are the search's, plus with `--arc` a
+//! last level carrying the arc backward over the last forward tree
+//! (`forward_of`). Some JSON fields (`bwd`, `reruns`, several horizons) are
+//! kept only because the UI reads them.
 //!
 //! Output layout (`--out DIR`):
 //!
 //! * `run.json` - the run: room, the cell box every binary indexes into,
-//!   the room's tiles, and per level the log's per-frame forward stats and
-//!   the names of the level's binary files.
+//!   the room's tiles, per level the per-frame forward stats and the names of
+//!   the level's binary files, the concrete paths and the download.
 //! * `l00.frames.bin` - level 0's frames; `hHHH_lLL.frames.bin` for every
 //!   finer level. Format: `"CUF1" | u32 nframes | nframes x (u32 cells_off,
 //!   u32 ncells, u32 wins_off, u32 nwins) | data`, where a cells record at
@@ -44,7 +45,8 @@ use std::path::Path;
 
 use crate::search::pos_graph::cell_xy;
 
-/// One forward frame's line of the run log.
+/// One forward frame's stats (a row of the tree's `forward.tsv`, under the
+/// UI's names).
 #[derive(Serialize, Clone, Debug)]
 pub struct FwdLine {
     pub f: u32,
@@ -138,113 +140,30 @@ pub struct Run {
     /// Another concrete run to compare it with (`--reference FILE`: e.g. the
     /// community TAS replayed in the original cart).
     pub reference: Option<Witness>,
+    /// The file the UI offers for download (`--download FILE`), verbatim.
+    pub download: Option<Download>,
+}
+
+/// A file offered for download: its name and its bytes (text).
+#[derive(Serialize, Debug)]
+pub struct Download {
+    pub file: String,
+    pub text: String,
 }
 
 /// A concrete witness: its inputs and the player's (x, y) per frame (frame 0
 /// the start; `None` without a player), in the cells' pixel coordinates, and
 /// the frames a dash starts at with its direction (`R`, `U`, ...; only when
-/// the file lists them). With `db` / `prologue` / `seeds` lines, also the run
-/// as a tasdatabase file (`tas`).
+/// the file lists them).
 #[derive(Serialize, Debug)]
 pub struct Witness {
     pub label: String,
     pub inputs: Vec<u8>,
     pub path: Vec<Option<(i32, i32)>>,
     pub dashes: Vec<(u32, String)>,
-    pub tas: Option<TasFile>,
 }
 
-/// A run as the community's TAS tool (UniversalClassicTas) clean-saves it,
-/// the file the tasdatabase upload takes: `[` each seed then `,` `]`, each
-/// input byte then `,`, no newline, starting at the room's first
-/// controllable frame - the spawn PROLOGUE (the frames before the player
-/// exists; the earliest offset the community TAS exits at) is not in it.
-/// Named `TAS<level>.tas` (2900m: level 29). `frames` is the database's
-/// count: inputs after the prologue - 1.
-#[derive(Serialize, Debug, PartialEq)]
-pub struct TasFile {
-    /// `TAS29.tas`: the database's file name for the level.
-    pub file: String,
-    pub text: String,
-    pub frames: u32,
-    pub prologue: u32,
-}
-
-impl TasFile {
-    fn new(name: &str, prologue: usize, seeds: &[String], inputs: &[u8]) -> Result<Self> {
-        anyhow::ensure!(prologue < inputs.len(), "prologue {prologue}: only {} inputs", inputs.len());
-        // The prologue is dropped, so it must not press anything.
-        anyhow::ensure!(inputs[..prologue].iter().all(|&b| b == 0), "the prologue's {prologue} inputs are not all 0: {:?}", &inputs[..prologue]);
-        let level: u32 = name.strip_suffix('m').and_then(|m| m.parse::<u32>().ok()).filter(|m| m % 100 == 0).map(|m| m / 100).with_context(|| format!("{name}: not a level name like 2900m"))?;
-        let each = |v: Vec<String>| v.iter().map(|x| format!("{x},")).collect::<String>();
-        let text = format!(
-            "[{}]{}",
-            each(seeds.to_vec()),
-            each(inputs[prologue..].iter().map(|b| b.to_string()).collect())
-        );
-        Ok(TasFile { file: format!("TAS{level}.tas"), text, frames: (inputs.len() - prologue - 1) as u32, prologue: prologue as u32 })
-    }
-}
-
-fn num<T: std::str::FromStr>(tok: &str) -> Result<T>
-where
-    T::Err: std::fmt::Display,
-{
-    let t = tok.trim_matches(|c: char| !(c.is_ascii_digit() || c == '.' || c == '-'));
-    t.parse::<T>().map_err(|e| anyhow::anyhow!("parsing {tok:?}: {e}"))
-}
-
-/// The token after the `nth` occurrence (0-based) of `key`.
-fn after<'a>(toks: &[&'a str], key: &str, nth: usize) -> Result<&'a str> {
-    let mut seen = 0;
-    for (i, t) in toks.iter().enumerate() {
-        if *t == key {
-            if seen == nth {
-                return toks.get(i + 1).copied().ok_or_else(|| anyhow::anyhow!("nothing after {key}"));
-            }
-            seen += 1;
-        }
-    }
-    bail!("no token {key:?} (#{nth}) in line")
-}
-
-/// A frame's `[fwd] fNNN in ...` line, not another `[fwd] f...` line (the
-/// binaries of 2026-10-09 38ea337..6c3c1bd wrote `[fwd] f1: engine and
-/// level -1 table built ...`, now `[warm]`).
-fn is_frame_line(line: &str) -> bool {
-    line.strip_prefix("[fwd] f").and_then(|r| r.split_once(' ')).is_some_and(|(f, rest)| f.bytes().all(|b| b.is_ascii_digit()) && rest.starts_with("in "))
-}
-
-fn parse_fwd(line: &str) -> Result<FwdLine> {
-    let t: Vec<&str> = line.split_whitespace().collect();
-    let (ib, il) = after(&t, "in", 0)?.split_once('/').context("in b/l")?;
-    let (ob, ol) = after(&t, "out", 0)?.split_once('/').context("out b/l")?;
-    Ok(FwdLine {
-        f: num(t[1])?,
-        in_blocks: num(ib)?,
-        in_lanes: num(il)?,
-        raw: num(after(&t, "raw", 0)?)?,
-        kept: num(after(&t, "kept", 0)?)?,
-        out_blocks: num(ob)?,
-        out_lanes: num(ol)?,
-        visited: num(after(&t, "visited", 0)?)?,
-        // Older logs say `emit` / `own` for `wave` / `door`.
-        emit_ms: num(after(&t, "wave", 0).or_else(|_| after(&t, "emit", 0))?)?,
-        emit_idle: num(after(&t, "(idle", 0)?)?,
-        own_ms: num(after(&t, "translate", 0).or_else(|_| after(&t, "door", 0)).or_else(|_| after(&t, "own", 0))?)?,
-        own_idle: after(&t, "(idle", 1).ok().map(num).transpose()?.unwrap_or(0),
-        ckpt_ms: num(after(&t, "ckpt", 0)?)?,
-        pos_ms: num(after(&t, "pos", 0)?)?,
-        total_ms: num(after(&t, "total", 0)?)?,
-        // `rss X GB` (older) or `rss start A wave B end C ...`: the end value.
-        rss_gb: match after(&t, "rss", 0)? {
-            "start" => num(after(&t, "end", 0)?)?,
-            v => num(v)?,
-        },
-    })
-}
-
-/// A level with only what the log says.
+/// A level of the run.
 fn level_run(level: usize, precision: String, fwd: Vec<FwdLine>, first_win: Option<u32>) -> LevelRun {
     LevelRun {
         level,
@@ -268,44 +187,52 @@ fn level_run(level: usize, precision: String, fwd: Vec<FwdLine>, first_win: Opti
     }
 }
 
-/// The run log: `[fwd]` lines split into levels by the `[search] level i
-/// (SPEC): forward to fH ...; first win W` line closing each (none in a
-/// `rewrite forward` log: one level), the horizon, and the wall time and
-/// optimum of the `OPTIMAL win frame: F (S s)` line.
-pub fn parse_log(text: &str) -> Result<(Vec<LevelRun>, u32, Option<f64>, Option<u32>)> {
-    let mut levels: Vec<LevelRun> = Vec::new();
-    let mut fwd: Vec<FwdLine> = Vec::new();
-    let mut first_win: Option<u32> = None;
-    let (mut horizon, mut wall, mut optimal) = (None, None, None);
-    for (ln, line) in text.lines().enumerate() {
-        let ctx = || format!("log line {}: {line}", ln + 1);
-        if line.starts_with("[fwd] first win at f") {
-            first_win = Some(num(line.rsplit(' ').next().unwrap_or("")).with_context(ctx)?);
-        } else if is_frame_line(line) {
-            fwd.push(parse_fwd(line).with_context(ctx)?);
-        } else if let Some(rest) = line.strip_prefix("[search] level ") {
-            let t: Vec<&str> = rest.split_whitespace().collect();
-            let level: usize = num(t[0]).with_context(ctx)?;
-            anyhow::ensure!(level == levels.len(), "{}: level {level} after {} levels", ctx(), levels.len());
-            let spec = t[1].trim_start_matches('(').trim_end_matches("):").to_string();
-            horizon = Some(num(after(&t, "to", 0)?).with_context(ctx)?);
-            let win = line.rsplit("first win ").next().unwrap_or("");
-            let win = win.strip_prefix("Some(").map(|w| num(w)).transpose().with_context(ctx)?;
-            levels.push(level_run(level, spec, std::mem::take(&mut fwd), win));
-            first_win = None;
-        } else if let Some(rest) = line.strip_prefix("OPTIMAL win frame: ") {
-            let t: Vec<&str> = rest.split_whitespace().collect();
-            optimal = Some(num(t[0]).with_context(ctx)?);
-            wall = t.get(1).map(|w| num(w)).transpose().with_context(ctx)?;
-        }
+/// A tree's forward record (`frame::FORWARD_STATS`), a frame's last row
+/// winning, by frame; empty for a tree from before the record.
+fn read_forward_stats(dir: &Path) -> Result<Vec<FwdLine>> {
+    let path = dir.join(crate::frame::FORWARD_STATS);
+    let text = match std::fs::read_to_string(&path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
+    };
+    let mut lines = text.lines();
+    let header: Vec<&str> = lines.next().unwrap_or("").split('\t').collect();
+    let col = |name: &str| header.iter().position(|h| *h == name).with_context(|| format!("{}: no column {name:?}", path.display()));
+    let c: Vec<usize> = ["frame", "blocks_in", "lanes_in", "lanes_raw", "lanes_kept", "blocks_out", "lanes_out", "visited", "wave_ms", "wave_idle_pct", "translate_ms", "ckpt_ms", "pos_ms", "total_ms", "rss_end_gb"]
+        .iter()
+        .map(|n| col(n))
+        .collect::<Result<_>>()?;
+    let mut by_frame: std::collections::BTreeMap<u32, FwdLine> = Default::default();
+    for (ln, line) in lines.enumerate() {
+        let t: Vec<&str> = line.split('\t').collect();
+        anyhow::ensure!(t.len() == header.len(), "{} line {}: {} fields, the header {}", path.display(), ln + 2, t.len(), header.len());
+        let n = |k: usize| -> Result<u64> { t[c[k]].parse().with_context(|| format!("{} line {}: {:?}", path.display(), ln + 2, t[c[k]])) };
+        let x = |k: usize| -> Result<f64> { t[c[k]].parse().with_context(|| format!("{} line {}: {:?}", path.display(), ln + 2, t[c[k]])) };
+        let f = n(0)? as u32;
+        by_frame.insert(
+            f,
+            FwdLine {
+                f,
+                in_blocks: n(1)?,
+                in_lanes: n(2)?,
+                raw: n(3)?,
+                kept: n(4)?,
+                out_blocks: n(5)?,
+                out_lanes: n(6)?,
+                visited: n(7)?,
+                emit_ms: n(8)?,
+                emit_idle: n(9)? as u32,
+                own_ms: n(10)?,
+                own_idle: 0,
+                ckpt_ms: n(11)?,
+                pos_ms: n(12)?,
+                total_ms: n(13)?,
+                rss_gb: x(14)?,
+            },
+        );
     }
-    if levels.is_empty() {
-        anyhow::ensure!(!fwd.is_empty(), "the log has neither `[search] level` nor `[fwd]` lines");
-        horizon = fwd.last().map(|l| l.f);
-        levels.push(level_run(0, "forward".to_string(), std::mem::take(&mut fwd), first_win));
-    }
-    anyhow::ensure!(fwd.is_empty(), "the log ends with {} `[fwd]` lines after its last level", fwd.len());
-    Ok((levels, horizon.expect("set with every level"), wall, optimal))
+    Ok(by_frame.into_values().collect())
 }
 
 /// Sparse per-cell counts of one frame: `(cell, count)` ascending by cell.
@@ -314,40 +241,6 @@ type Sparse = Vec<(u32, u32)>;
 struct LevelData {
     /// Per frame: the states per cell, the wins per cell.
     frames: Vec<(Sparse, Sparse)>,
-}
-
-/// `f(i)` for every `i < n` in parallel, results by index; the first error
-/// stops the pulling.
-fn par_map<T: Send>(n: usize, f: impl Fn(usize) -> Result<T> + Sync) -> Result<Vec<T>> {
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    let next = AtomicUsize::new(0);
-    let workers = std::thread::available_parallelism().map(|p| p.get()).unwrap_or(8).min(n.max(1));
-    let parts = std::thread::scope(|s| {
-        let handles: Vec<_> = (0..workers)
-            .map(|_| {
-                s.spawn(|| -> Result<Vec<(usize, T)>> {
-                    let mut mine = Vec::new();
-                    loop {
-                        let i = next.fetch_add(1, Ordering::Relaxed);
-                        if i >= n {
-                            return Ok(mine);
-                        }
-                        match f(i) {
-                            Ok(v) => mine.push((i, v)),
-                            Err(e) => {
-                                next.store(n, Ordering::Relaxed);
-                                return Err(e);
-                            }
-                        }
-                    }
-                })
-            })
-            .collect();
-        handles.into_iter().map(|h| h.join().expect("export worker panicked")).collect::<Result<Vec<_>>>()
-    })?;
-    let mut all: Vec<(usize, T)> = parts.into_iter().flatten().collect();
-    all.sort_unstable_by_key(|p| p.0);
-    Ok(all.into_iter().map(|p| p.1).collect())
 }
 
 /// A marks file, mapped: `Visited::save`'s `(shape, cell, k0, k1, dist)`
@@ -419,7 +312,7 @@ fn mark_table(sets: &[MarksMap]) -> Result<(MarkTable, Vec<Vec<(u32, u32, u32)>>
     // Every set's rows in parallel into per-shard lists and (dist, cell) counts.
     let chunks: Vec<(usize, usize)> =
         sets.iter().enumerate().flat_map(|(k, m)| (0..m.rows.div_ceil(MARKS_CHUNK)).map(move |c| (k, c))).collect();
-    let read = par_map(chunks.len(), |i| {
+    let read = crate::par::Pool::per_core().map(chunks.len(), |i| {
         let (k, c) = chunks[i];
         let m = &sets[k];
         let mut shards: Vec<Vec<MarkId>> = vec![Vec::new(); MARK_SHARDS];
@@ -446,7 +339,7 @@ fn mark_table(sets: &[MarksMap]) -> Result<(MarkTable, Vec<Vec<(u32, u32, u32)>>
     }
     // Per shard: one entry per state with its sets' bits OR-ed, and the
     // shard's (shape, cell)s.
-    let built = par_map(MARK_SHARDS, |s| {
+    let built = crate::par::Pool::per_core().map(MARK_SHARDS, |s| {
         let lists = std::mem::take(&mut *per_shard[s].lock().unwrap());
         let mut map: FxHashMap<MarkId, u64> = FxHashMap::default();
         map.reserve(lists.iter().map(|l| l.1.len()).sum());
@@ -569,7 +462,7 @@ fn read_tree(dir: &Path, marks: Option<&MarkTable>, nsets: usize) -> Result<(Lev
         _ => None,
     };
     let marks = marks.zip(tree.as_ref());
-    let mut counts = par_map(n, |i| frame_counts(dir, (n - 1 - i) as u32, marks, nsets))?;
+    let mut counts = crate::par::Pool::per_core().map(n, |i| frame_counts(dir, (n - 1 - i) as u32, marks, nsets))?;
     counts.reverse();
     let mut frames: Vec<(Sparse, Sparse)> = Vec::with_capacity(n);
     let mut layers: Vec<Vec<Sparse>> = vec![Vec::with_capacity(n); nsets];
@@ -709,19 +602,11 @@ fn room_tiles(room: (i16, i16)) -> Result<Tiles> {
     Ok(Tiles { w, h, ids, solid })
 }
 
-/// `key value` lines (`arc.txt`).
-fn read_keyed(path: &Path) -> Result<FxHashMap<String, String>> {
-    let text = std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
-    Ok(text.lines().filter_map(|l| l.split_once(' ')).map(|(k, v)| (k.to_string(), v.trim().to_string())).collect())
-}
-
 /// `witness.txt` (`search --save-marks`): `inputs a,b,..`, then
 /// `f x y` per frame from 0 (`f - -` without a player). A file for
 /// `--witness` / `--reference` (`tools/align_tas.py`) may also carry, before
-/// the frames and in any order, `label TEXT`, `dashes F:DIR ...`, and for the
-/// tasdatabase file (`TasFile`) all three of `db NAME CATEGORY` (`db 2900m
-/// nodiag`), `prologue N` (the spawn frames to strip) and `seeds [a,b,..]`
-/// (`seeds []` without); the frames may end early (at the exit).
+/// the frames and in any order, `label TEXT` and `dashes F:DIR ...`; the
+/// frames may end early (at the exit).
 fn read_witness(path: &Path) -> Result<Witness> {
     let text = std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
     let name = path.display();
@@ -729,9 +614,10 @@ fn read_witness(path: &Path) -> Result<Witness> {
     let mut head: FxHashMap<&str, &str> = FxHashMap::default();
     while let Some(l) = lines.next_if(|l| !l.starts_with(|c: char| c.is_ascii_digit())) {
         let (k, v) = l.split_once(' ').unwrap_or((l, ""));
-        anyhow::ensure!(["label", "inputs", "dashes", "db", "prologue", "seeds"].contains(&k), "{name}: unknown line {l:?}");
+        anyhow::ensure!(["label", "inputs", "dashes"].contains(&k), "{name}: unknown line {l:?}");
         anyhow::ensure!(head.insert(k, v.trim()).is_none(), "{name}: two `{k}` lines");
     }
+    let num = |t: &str| -> Result<i32> { t.parse().with_context(|| format!("{name}: {t:?} is not a number")) };
     let inputs: Vec<u8> = head
         .get("inputs")
         .with_context(|| format!("{name}: no `inputs` line"))?
@@ -744,26 +630,9 @@ fn read_witness(path: &Path) -> Result<Witness> {
         .split_whitespace()
         .map(|d| {
             let (f, dir) = d.split_once(':').with_context(|| format!("{name}: dash {d:?} is not F:DIR"))?;
-            Ok((num(f)?, dir.to_string()))
+            Ok((f.parse().with_context(|| format!("{name}: dash {d:?} is not F:DIR"))?, dir.to_string()))
         })
         .collect::<Result<_>>()?;
-    let mut tas = match (head.get("db"), head.get("prologue"), head.get("seeds")) {
-        (None, None, None) => None,
-        (Some(db), Some(prologue), Some(seeds)) => {
-            let (db_name, _category) = db.split_once(' ').with_context(|| format!("{name}: `db {db}` is not `db NAME CATEGORY`"))?;
-            let inner = seeds.strip_prefix('[').and_then(|s| s.strip_suffix(']')).with_context(|| format!("{name}: `seeds {seeds}` is not `seeds [a,b,..]`"))?;
-            // Balloon seeds are the tool's numbers as written (`0.02485`).
-            let seeds: Vec<String> = inner
-                .split(',')
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .map(|s| s.parse::<f64>().map(|_| s.to_string()).with_context(|| format!("{name}: a seed {s:?}")))
-                .collect::<Result<_>>()?;
-            let prologue: usize = prologue.parse().with_context(|| format!("{name}: `prologue {prologue}`"))?;
-            Some(TasFile::new(db_name, prologue, &seeds, &inputs).with_context(|| format!("{name}: the tasdatabase file"))?)
-        }
-        _ => bail!("{name}: `db`, `prologue` and `seeds` go together"),
-    };
     let mut path_xy = Vec::new();
     for (i, l) in lines.enumerate() {
         let t: Vec<&str> = l.split_whitespace().collect();
@@ -771,47 +640,27 @@ fn read_witness(path: &Path) -> Result<Witness> {
         path_xy.push(if t[1] == "-" { None } else { Some((num(t[1])?, num(t[2])?)) });
     }
     anyhow::ensure!((1..=inputs.len() + 1).contains(&path_xy.len()), "{name}: {} inputs, {} positions", inputs.len(), path_xy.len());
-    // The database's count is to the EXIT: a file may carry inputs past it
-    // (100% TAS23: 71 inputs, exits after 68), and the path ends there.
-    if let Some(t) = tas.as_mut() {
-        let exit = path_xy.len() as u32 - 1;
-        if exit > t.prologue {
-            t.frames = t.frames.min(exit - t.prologue - 1);
-        }
-    }
     let label = head.get("label").map_or_else(|| format!("concrete witness inside the winning sets, a win at f{}", inputs.len()), |l| l.to_string());
-    Ok(Witness { label, inputs, path: path_xy, dashes, tas })
+    Ok(Witness { label, inputs, path: path_xy, dashes })
 }
 
-/// `--arc DIR` (`search --save-marks DIR`): the last forward level gets the
-/// winning sets' support, and a level after it the ARC backward over the same
-/// tree; the optimum is the arc search's. Returns the witness if present.
-fn attach_arc(hr: &mut HorizonRun, optimal: &mut Option<u32>, dir: &Path) -> Result<Option<Witness>> {
-    let kv = read_keyed(&dir.join("arc.txt"))?;
-    let get = |k: &str| kv.get(k).with_context(|| format!("arc.txt: no `{k}`"));
-    let frame = |k: &str| -> Result<Option<u32>> {
-        let v = get(k)?;
-        if v == "none" {
-            Ok(None)
-        } else {
-            Ok(Some(num(v)?))
-        }
-    };
-    let h: u32 = num(get("horizon")?)?;
-    anyhow::ensure!(hr.h == h, "--arc: the arc search ran to h{h}, the log's forward to f{}", hr.h);
+/// `--arc DIR` (`search --save-marks DIR`, which holds the LAST level's
+/// sets): the last forward level gets the winning sets' support, and a level
+/// after it the ARC backward over the same tree; the optimum is the arc
+/// search's (`last`: the record's last level). Returns the witness if present.
+fn attach_arc(hr: &mut HorizonRun, optimal: &mut Option<u32>, dir: &Path, last: &super::result::LevelResult) -> Result<Option<Witness>> {
     let rows = |name: &str| -> Result<u64> { Ok(MarksMap::open(&dir.join(name))?.rows as u64) };
-    let found = frame("optimal")?;
+    let found = last.arc_bound;
     hr.partial = false;
-    let last = hr.levels.len() - 1;
-    let lr = &mut hr.levels[last];
-    lr.precision = format!("{}, rem free", get("level")?);
-    lr.first_win = frame("level0_first_win")?;
+    let li = hr.levels.len() - 1;
+    let lr = &mut hr.levels[li];
+    lr.precision = format!("{}, rem free", last.spec);
     lr.refuted = lr.first_win.is_none();
     lr.marked = Some(rows("level0.marks.bin")?);
-    let mut arc = level_run(last + 1, format!("arc: {}, rem exact", get("level")?), Vec::new(), found);
+    let mut arc = level_run(li + 1, format!("arc: {}, rem exact", last.spec), Vec::new(), found);
     arc.marked = found.map(|_| rows("arc.marks.bin")).transpose()?;
     arc.refuted = found.is_none();
-    arc.forward_of = Some(last);
+    arc.forward_of = Some(li);
     hr.levels.push(arc);
     hr.refuted_at = hr.levels.iter().position(|l| l.refuted);
     *optimal = if hr.refuted_at.is_none() { found } else { None };
@@ -820,43 +669,33 @@ fn attach_arc(hr: &mut HorizonRun, optimal: &mut Option<u32>, dir: &Path) -> Res
 }
 
 /// The concrete runs drawn over the room: `witness` (replacing the arc
-/// directory's) and `reference`, files in `read_witness`'s format.
+/// directory's) and `reference`, files in `read_witness`'s format; and the
+/// file the UI offers for download.
 pub struct Paths<'a> {
     pub witness: Option<&'a Path>,
     pub reference: Option<&'a Path>,
+    pub download: Option<&'a Path>,
 }
 
-/// `export-ui --paths-only`: replace the concrete paths (`witness`,
-/// `reference`) in an existing export's `run.json` and nothing else - for
-/// path files that changed after the run's trees were deleted.
-pub fn update_paths(out: &Path, paths: Paths) -> Result<()> {
-    anyhow::ensure!(paths.witness.is_some() || paths.reference.is_some(), "--paths-only needs --witness or --reference");
-    let p = out.join("run.json");
-    let text = std::fs::read_to_string(&p).with_context(|| format!("reading {}", p.display()))?;
-    let mut run: serde_json::Value = serde_json::from_str(&text).with_context(|| format!("parsing {}", p.display()))?;
-    let obj = run.as_object_mut().with_context(|| format!("{}: not an object", p.display()))?;
-    for (key, file) in [("witness", paths.witness), ("reference", paths.reference)] {
-        if let Some(file) = file {
-            obj.insert(key.to_string(), serde_json::to_value(read_witness(file)?)?);
-            eprintln!("[export-ui] {}: `{key}` from {}", p.display(), file.display());
-        }
+/// The export. `checkpoint_dir` is a search's (`result.json`, `levelNN/`);
+/// `room` the start room (the run's settings: the record's must agree);
+/// `arc` its `search --save-marks` directory.
+pub fn export(checkpoint_dir: &Path, out: &Path, room: (i16, i16), arc: Option<&Path>, paths: Paths) -> Result<()> {
+    let res = super::result::SearchResult::read(checkpoint_dir)?;
+    anyhow::ensure!(res.room == room, "{}: the search ran in room {:?}, this run's --room is {room:?}", checkpoint_dir.display(), res.room);
+    let last = res.levels.last().with_context(|| format!("{}: the search recorded no level ({:?})", checkpoint_dir.display(), res.verdict))?;
+    // `h` counts search steps (the trees' frames).
+    let h = res.horizon * res.steps_per_frame;
+    let tree_dir = |level: usize| checkpoint_dir.join(&res.levels[level].dir);
+    let mut levels = Vec::new();
+    for (i, l) in res.levels.iter().enumerate() {
+        levels.push(level_run(i, l.spec.clone(), read_forward_stats(&tree_dir(i))?, l.first_win));
     }
-    std::fs::write(&p, serde_json::to_string(&run)?).with_context(|| format!("writing {}", p.display()))
-}
-
-/// The export. `checkpoint_dir` is a search's (`levelNN/` under it) or one
-/// forward's tree; `room` the start room it ran from; `arc` its `search
-/// --save-marks` directory.
-pub fn export(checkpoint_dir: &Path, log_path: &Path, out: &Path, room: (i16, i16), arc: Option<&Path>, paths: Paths) -> Result<()> {
-    let text = std::fs::read_to_string(log_path).with_context(|| format!("reading {}", log_path.display()))?;
-    let (levels, h, wall_s, mut optimal) = parse_log(&text)?;
-    let search = checkpoint_dir.join("level00").exists();
-    anyhow::ensure!(search || levels.len() == 1, "{}: one forward's tree, but the log has {} levels", checkpoint_dir.display(), levels.len());
-    let tree_dir = |level: usize| if search { checkpoint_dir.join(format!("level{level:02}")) } else { checkpoint_dir.to_path_buf() };
     let nforward = levels.len();
+    let (wall_s, mut optimal) = (Some(res.wall_s), res.optimal);
     let mut hr = HorizonRun { h, levels, refuted_at: None, partial: true };
     let witness = match arc {
-        Some(dir) => attach_arc(&mut hr, &mut optimal, dir)?,
+        Some(dir) => attach_arc(&mut hr, &mut optimal, dir, last)?,
         None => None,
     };
     let witness = match paths.witness {
@@ -864,7 +703,14 @@ pub fn export(checkpoint_dir: &Path, log_path: &Path, out: &Path, room: (i16, i1
         None => witness,
     };
     let reference = paths.reference.map(read_witness).transpose()?;
-    eprintln!("[export-ui] log: {} levels to f{h}, optimal {optimal:?}", hr.levels.len());
+    let download = match paths.download {
+        Some(p) => Some(Download {
+            file: p.file_name().with_context(|| format!("{}: not a file", p.display()))?.to_string_lossy().into_owned(),
+            text: std::fs::read_to_string(p).with_context(|| format!("reading {}", p.display()))?,
+        }),
+        None => None,
+    };
+    eprintln!("[export-ui] {}: {} levels to f{h}, optimal {optimal:?}", checkpoint_dir.display(), hr.levels.len());
     std::fs::create_dir_all(out)?;
 
     // One pass per forward level's tree, reading its frames and its marked
@@ -986,6 +832,7 @@ pub fn export(checkpoint_dir: &Path, log_path: &Path, out: &Path, room: (i16, i1
         horizons: vec![hr],
         witness,
         reference,
+        download,
     };
     let mut f = std::io::BufWriter::new(std::fs::File::create(out.join("run.json"))?);
     serde_json::to_writer(&mut f, &run)?;
@@ -1033,19 +880,26 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
-    /// Only `[fwd] fNNN in ...` lines are frames: the warm line some
-    /// binaries wrote as `[fwd] f1: ...` is skipped, not an error.
+    /// The forward's record as the forward writes it: a rerun frame's last
+    /// row wins, the frames in order.
     #[test]
-    fn a_log_reads_only_frame_lines_as_frames() {
-        let log = "[search] room 1,0, levels r0sx, horizon 3\n\
-[fwd] f1: engine and level -1 table built in 3.8 s, before the wave\n\
-[fwd] f001 in 1/1 raw 3 kept 2 out 1/2 visited 3 | wave 1 (idle 0%) door 0 edges 0 ckpt 0 pos 0 total 1 ms | flushes 1 (3 rows avg) edges 0 | in 0.00 queues 0.00 door 0.00 GB rss start 0.10 wave 0.10 end 0.10 peak 0.10 GB (anon; file 0.00)\n\
-[fwd] first win at f1\n\
-[search] level 0 (r0sx): forward to f3 in 0.1 s; first win Some(1)\n";
-        let (levels, ..) = parse_log(log).unwrap();
-        assert_eq!(levels.len(), 1);
-        assert_eq!(levels[0].fwd.len(), 1, "one frame line; the warm line skipped");
-        assert_eq!(levels[0].fwd[0].kept, 2);
+    fn a_trees_forward_record_reads_back() {
+        let dir = std::env::temp_dir().join(format!("celeste-ui-fwd-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        assert!(read_forward_stats(&dir).unwrap().is_empty(), "a tree from before the record");
+        let ms = std::time::Duration::from_millis;
+        let row = |f: u32, kept: usize| {
+            let st = crate::frame::FrameStats { lanes_kept: kept, wave_idle: 0.94, t_wave: ms(7), rss_end: 1.28, ..Default::default() };
+            crate::frame::forward_stats_row(f, &st, ms(1), ms(2), ms(11), 4)
+        };
+        for (f, kept) in [(1, 10), (2, 20), (2, 21), (3, 30)] {
+            crate::frame::append_forward_stats(&dir, &row(f, kept)).unwrap();
+        }
+        let got = read_forward_stats(&dir).unwrap();
+        assert_eq!(got.iter().map(|l| (l.f, l.kept)).collect::<Vec<_>>(), vec![(1, 10), (2, 21), (3, 30)]);
+        assert_eq!((got[0].emit_ms, got[0].emit_idle, got[0].ckpt_ms, got[0].total_ms, got[0].visited, got[0].rss_gb), (7, 94, 1, 11, 4, 1.28));
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     /// The search's `witness.txt` and a labelled path file with dashes that
@@ -1065,37 +919,7 @@ mod tests {
         let r = read("label TAS29 (community)\ninputs 0,34,0\ndashes 2:R\n0 - -\n1 8 96\n2 13 96\n").unwrap();
         assert_eq!((r.label.as_str(), r.path.len(), r.dashes), ("TAS29 (community)", 3, vec![(2, "R".to_string())]));
         assert!(read("inputs 0,34\n0 - -\n2 8 96\n").is_err(), "frames are consecutive from 0");
-        // The tasdatabase file: the prologue stripped, the seeds in front, no newline.
-        let t = read("label ours\ninputs 0,0,16,0,2\ndb 2900m nodiag\nprologue 2\nseeds [0,0,0]\n0 - -\n").unwrap().tas.unwrap();
-        assert_eq!(t, TasFile { file: "TAS29.tas".into(), text: "[0,0,0,]16,0,2,".into(), frames: 2, prologue: 2 });
-        let t = read("inputs 0,17,0\nprologue 1\nseeds [0,0.02485]\ndb 600m nodiag\n0 - -\n").unwrap().tas.unwrap();
-        assert_eq!((t.text.as_str(), t.frames), ("[0,0.02485,]17,0,", 1));
-        assert!(read("inputs 0,17,0\nprologue 2\nseeds []\ndb 600m nodiag\n0 - -\n").is_err(), "a prologue that presses a button");
-        assert!(read("inputs 0,17,0\nprologue 1\n0 - -\n").is_err(), "db, prologue and seeds go together");
+        assert!(read("inputs 0,34\nprologue 1\n0 - -\n").is_err(), "an unknown line");
         std::fs::remove_dir_all(&dir).unwrap();
-    }
-
-    #[test]
-    fn the_search_log_splits_into_its_levels() {
-        let fwd = |f: u32| format!("[fwd] f{f:03} in 1/1 raw 1 kept 1 out 1/1 visited 4 | wave 7 (idle 94%) door 3 ckpt 0 pos 0 total 11 ms | flushes 1 (1 rows avg) | in 0.00 queues 0.00 door 0.00 GB rss start 1.26 wave 1.27 end 1.28 peak 8.25 GB");
-        let log = [
-            "[search] room 7,0, levels r0sxhn,r0sxh, horizon 2".to_string(),
-            fwd(1),
-            fwd(2),
-            "[fwd] first win at f2".to_string(),
-            "[search] level 0 (r0sxhn): forward to f2 in 2.7 s; first win Some(2)".to_string(),
-            fwd(1),
-            "[search] level 1 (r0sxh): forward to f2 in 0.1 s; first win None".to_string(),
-            "OPTIMAL win frame: 2 (3.5 s); witness /x/witness_frame_2.txt".to_string(),
-        ]
-        .join("\n");
-        let (levels, h, wall, optimal) = parse_log(&log).unwrap();
-        assert_eq!((levels.len(), h, wall, optimal), (2, 2, Some(3.5), Some(2)));
-        assert_eq!((levels[0].precision.as_str(), levels[0].fwd.len(), levels[0].first_win), ("r0sxhn", 2, Some(2)));
-        assert_eq!((levels[1].precision.as_str(), levels[1].fwd.len(), levels[1].first_win), ("r0sxh", 1, None));
-        assert_eq!(levels[0].fwd[1].rss_gb, 1.28);
-        // A `rewrite forward` log: one level to its last frame.
-        let (levels, h, _, _) = parse_log(&[fwd(1), fwd(2), fwd(3)].join("\n")).unwrap();
-        assert_eq!((levels.len(), h, levels[0].fwd.len()), (1, 3, 3));
     }
 }

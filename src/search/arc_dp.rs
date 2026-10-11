@@ -1745,7 +1745,8 @@ pub fn gate_w_hash(node: u64, r: RegionRef) -> u64 {
 /// fingerprints (over (shape, key, cell), independent of scheduling): W's
 /// support, W at every frame, the optimum. With `save`, writes the UI's arc
 /// pass: `level0.marks.bin` (W's support, each node to its last frame),
-/// `arc.marks.bin` (the nodes `reach` reaches), `arc.txt` and the witness.
+/// `arc.marks.bin` (the nodes `reach` reaches) and the witness (the bound
+/// and the first win are the search's `result.json`).
 /// With `known`, checks a known solution against every pruning step before
 /// the concrete search (`search::known`): an error if one drops it.
 #[allow(clippy::too_many_arguments)]
@@ -1871,9 +1872,6 @@ pub fn solve(
     }
     if let Some(out) = save {
         save_marks(&out.join("arc.marks.bin"), rows, horizon, &resolver.space)?;
-        let first_win = seeds.wins.iter().map(|&(_, f)| f).min();
-        let show = |v: Option<u32>| v.map_or("none".to_string(), |f| f.to_string());
-        std::fs::write(out.join("arc.txt"), format!("horizon {horizon}\nlevel {level}\nlevel0_first_win {}\noptimal {}\n", show(first_win), show(arc)))?;
     }
     // The concrete search reads W and the node keys, not the edge files.
     drop(seeds);

@@ -183,7 +183,8 @@ The tools:
   - `--modes` diffs the room-entry state of the IL load and of the jank
     model against the chain's, field by field.
   - `--check-start` does the same for the search's own start state.
-  - `--feasible` lists every J a play of the previous room can give.
+  - `--feasible REWRITE` lists every J a play of the previous room can
+    give (`rewrite starts`).
   - `--vary` compares the entry state after every category's boot chain.
 - `tools/celia/validate.sh` runs Celia headless.
 - `tools/uct/check_uploads.py` runs IL, UCT, Celia, the chain and the boot
@@ -233,7 +234,7 @@ plus the room title or the spawn's smoke if the exit came soon enough.
 The search therefore takes the room's start as a set of J classes.
 `category_runner` runs the main search at the boot chain's J (its witness is
 valid after the database's previous rooms) and one search-only job per other
-feasible start (`chain.start_classes`). The history-widened optimum is the
+feasible start (`rewrite starts`). The history-widened optimum is the
 least of them.
 
 Re-verification (2026-10-08). IL / UCT / Celia / boot chain, all at the

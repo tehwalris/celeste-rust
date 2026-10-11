@@ -1641,6 +1641,16 @@ impl<'a, D: Domain> Interp<'a, D> {
                 self.prints.push(text);
                 (st, Value::Nil)
             }
+            // A number's exact 16.16 bits, as PICO-8's `tostr(x, true)`
+            // prints them (`0x0000.5555`): the probe corpora's exact print
+            // (`trace::probe` registers it; the game has no such global).
+            "__hex" => {
+                let Some(Value::Num(n)) = args.first() else { bail!("__hex of a non-number: {:?}", args.first()) };
+                let Some(v) = self.d.as_const(n) else { bail!("__hex of a symbolic number") };
+                let raw = v.to_bits();
+                self.prints.push(format!("0x{:04x}.{:04x}", raw >> 16, raw & 0xffff));
+                (st, Value::Nil)
+            }
             // A merge hint: the tracer merges at every join anyway.
             "_hint_normalize" => (st, Value::Nil),
             // A SHAPE change.

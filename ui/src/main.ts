@@ -16,9 +16,10 @@
 // runs.json: any% first, then e.g. No Diagonal Dashes) and lists each group
 // in GAME order (level
 // index) with the altitude the game shows on entering the room; the
-// default run is still runs.json's first entry. A run whose witness carries
-// a tasdatabase file (`tas`) gets a "Download .tas" button and its frame
-// count in the database's convention (its own row on a phone).
+// default run is still runs.json's first entry. A run that carries a file
+// to download (the tasdatabase upload, `download`) gets a "Download" button
+// and the file's frame count in the database's convention (its own row on a
+// phone).
 import "./style.css";
 import { categoryOf, chapters, fmtDuration, loadRun, loadRuns, pickLabel, runsInGameOrder, type Chapter, type Run, type RunInfo } from "./data";
 import { el, clear, button, download, select, type Select } from "./ui";
@@ -105,7 +106,7 @@ async function main() {
   let runPicker: Select<string> | null = null;
   const runBox = el("div", { class: "run-switch" });
   const nav = el("nav", { class: "tabs", "aria-label": "views" });
-  // The run's TAS in the tasdatabase's format, when the export carries it.
+  // The run's upload file, when the export carries it.
   const tasBox = el("div", { class: "tas-dl" });
   const header = el("header", { class: "top" }, [brand, runBox, tasBox, nav]);
   const main = el("main");
@@ -186,7 +187,7 @@ async function main() {
         main.append(
           errorCard(
             `Could not load ${label}`,
-            `${(e as Error).message}\n\nRegenerate it with:\n  rewrite export-ui --log <run log> --out <data dir>/${runId} --room ${runId.replace(/^room(\d)(\d)$/, "$1,$2")}`,
+            `${(e as Error).message}\n\nRegenerate it with:\n  rewrite export-ui --checkpoint-dir <search dir> --arc <marks dir> --out <data dir>/${runId} --room ${runId.replace(/^room(\d)(\d)$/, "$1,$2")}`,
             () => {
               current = null;
               void apply(runId, t, params);
@@ -211,12 +212,15 @@ async function main() {
       if (run.reference) sub.append(el("span", { text: `${run.reference.label.split(/[\s:(]/)[0]}: ${run.reference.path.length - 1} frames` }));
       sub.append(el("span", { text: `${run.horizons.length} horizon${run.horizons.length === 1 ? "" : "s"} tested` }));
       if (wall) sub.append(el("span", { text: `${wall} search` }));
-      const tas = run.witness?.tas;
-      if (tas) {
-        const dl = button("Download .tas", () => download(tas.file, new Blob([tas.text], { type: "application/octet-stream" })), "small", `Download ${tas.file} (tasdatabase format)`);
-        // Frames in the database's convention: inputs after the spawn - 1.
-        const ref = run.reference?.tas ? ` vs ${run.reference.label.split(/[\s:(]/)[0]} ${run.reference.tas.frames}f` : "";
-        tasBox.replaceChildren(dl, el("span", { class: "tas-frames", text: `${tas.frames}f${ref}` }));
+      const up = run.download;
+      if (up) {
+        const dl = button(`Download ${up.file}`, () => download(up.file, new Blob([up.text], { type: "application/octet-stream" })), "small", `Download ${up.file} (the verified upload)`);
+        // The database's count: the file's inputs (from the player's first
+        // frame, `[seeds]` first) - 1.
+        const inputs = up.text.slice(up.text.indexOf("]") + 1).split(",").filter((v) => v.trim() !== "").length;
+        tasBox.replaceChildren(dl, el("span", { class: "tas-frames", text: `${inputs - 1}f` }));
+      } else {
+        tasBox.replaceChildren();
       }
     }
     const v = build(t);

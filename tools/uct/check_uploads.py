@@ -18,43 +18,27 @@ The level is the file name's (TAS<level>.tas), the category its directory's
    count (100%: with the berry), and Celia agrees. The chain from the previous
    room is informative: that room itself starts there by an IL load, so its
    own database file can fail ("PREVIOUS ROOM FAILED").
---nudge, where UCT did not finish: category_runner.nudged_seeds, each checked
-in PICO-8 (the IL exit must not move) and UCT.
+--nudge, where UCT did not finish: the balloon seed nudges
+(celeste.love.nudged_seeds), each checked in PICO-8 (the IL exit must not
+move) and UCT.
 """
-import argparse, json, os, re, subprocess, sys
+import argparse
+import os
+import sys
 from concurrent.futures import ThreadPoolExecutor
 
 M = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, os.path.join(M, "tools"))
 sys.path.insert(0, os.path.join(M, "pico8_diff"))
-import category_runner as cr  # noqa: E402
 import chain  # noqa: E402
-
-
-def tool(script, env_key, pat, level, path, gemskip):
-    """UCT or Celia: (status, the number its line reports)."""
-    env = dict(os.environ)
-    if gemskip:
-        env[env_key] = "1"
-    out = subprocess.run([f"{M}/safe-run.sh", "--memory", "8G", "--", f"{M}/tools/{script}", str(level), path], capture_output=True, text=True, env=env, timeout=1800).stdout
-    m = re.search(pat, out)
-    return (m.group(1) if m else "no result"), (int(m.group(2)) if m else None)
-
-
-def uct(level, path, gemskip):
-    st, n = tool("uct/validate.sh", "UCT_DASHES", r"(finished, clean save|DID NOT FINISH[^,]*), (\d+) inputs", level, path, gemskip)
-    return st, (n - 1 if n else None)
-
-
-def celia(level, path, gemskip):
-    return tool("celia/validate.sh", "CELIA_DASHES", r"(finished|DID NOT FINISH[^,]*), (\d+)f", level, path, gemskip)
+from celeste import REWRITE, categories, love, rooms, tasdb  # noqa: E402
 
 
 def cat_of(path, cat):
     d = os.path.dirname(os.path.abspath(path))
     # `<cat>/TAS<n>.tas`, or `<cat>/upload/TAS<n>.tas` (tas/tasdatabase).
     c = cat or os.path.basename(os.path.dirname(d) if os.path.basename(d) == "upload" else d)
-    if c not in chain.FALLBACK:
+    if c not in categories.FALLBACK:
         raise SystemExit(f"{path}: category {c!r} unknown (--cat)")
     return c
 
@@ -64,25 +48,25 @@ def chain_result(lines, nsegs):
     return (int(last["count"]), last["berry"] == "true") if last else None, s.strip(": ")
 
 
-def check(path, nudge, cat):
+def check(path, nudge, cat, binary=REWRITE):
     cat = cat_of(path, cat)
-    level = int(re.search(r"TAS(\d+)\.tas$", path).group(1))
-    room = chain.room_of(level)
-    gemskip = cat.startswith("gemskip")
-    hundred = cat in ("100", "gemskip100")
-    seeds, inputs = chain.parse_tas(open(path).read())
+    level = tasdb.level_of_file(path)
+    room = rooms.room_of(level)
+    hundred = categories.hundred(cat)
+    seeds, inputs = tasdb.parse(open(path).read())
     ours = len(inputs) - 1
-    db = [e for e in json.load(open(f"{chain.DB}/database.json"))["classic"][cat] if e.get("file") == f"TAS{level}.tas"]
+    db = [e for e in tasdb.entries(cat) if e.get("file") == tasdb.file_of_level(level)]
     dbn = db[0].get("frames") if db else None
     il, il_s = chain_result(chain.single(cat, level, seeds, inputs), 1)
-    st, n = uct(level, path, gemskip)
-    cst, cn = celia(level, path, gemskip)
+    _, st, n = love.uct(level, path, cat)
+    n = n - 1 if n else None
+    _, cst, cn = love.celia(level, path, cat)
     ch, ch_s = chain_result(chain.chain(cat, level, seeds, inputs, max(level - 1, 1)), 2 if level > 1 else 1)
     # A database file that dies on PICO-8, or never exits there (it was made
     # in a tool computing in doubles: gemskipany 2600m dies), breaks the boot
     # chain: it restarts at the level after it, by an IL load, and says so (as
     # chain.entry_jank does). Where we have a valid file of our own for such a
-    # room (chain.OVERRIDES: gemskip100 2800m), the chain plays it instead.
+    # room (tasdb.OVERRIDES: gemskip100 2800m), the chain plays it instead.
     first = 1
     while True:
         nsegs = level - first + 1
@@ -107,15 +91,15 @@ def check(path, nudge, cat):
            f"chain {ch_s}", f"boot {bt_s}", "VALID" if valid else "INVALID" + (" (boot chain broken by a database file)" if first > 1 else "")]
     if nudge and not st.startswith("finished"):
         found = None
-        for sd in cr.nudged_seeds(f"{room[0]},{room[1]}", ",".join(str(v) for v in seeds) or "0"):
-            if chain_result(chain.single(cat, level, [float(v) for v in sd.split(",")], inputs), 1)[0] != il:
+        for sd in love.nudged_seeds(seeds, rooms.seed_slots(room, binary)):
+            if chain_result(chain.single(cat, level, sd, inputs), 1)[0] != il:
                 continue
             tmp = f"/tmp/check_uploads-{os.getpid()}-{level}.tas"
-            open(tmp, "w").write(f"[{sd},]" + ",".join(map(str, inputs)))
-            st2, n2 = uct(level, tmp, gemskip)
+            open(tmp, "w").write(tasdb.text(sd, inputs))
+            finished, _, n2 = love.uct(level, tmp, cat)
             os.remove(tmp)
-            if st2.startswith("finished"):
-                found = f"nudge [{sd},] finishes ({n2})"
+            if finished:
+                found = f"nudge [{','.join(sd)}] finishes ({n2 - 1})"
                 break
         row.append(found or "no nudge works")
     return "\t".join(row)
@@ -127,9 +111,10 @@ def main():
     ap.add_argument("--nudge", action="store_true")
     ap.add_argument("--cat", help="the category (default: the file's directory name)")
     ap.add_argument("--jobs", type=int, default=4)
+    ap.add_argument("--bin", default=REWRITE, help="the rewrite binary (--nudge: the room's seed slots)")
     a = ap.parse_args()
     with ThreadPoolExecutor(a.jobs) as ex:
-        for line in ex.map(lambda p: check(p, a.nudge, a.cat), a.files):
+        for line in ex.map(lambda p: check(p, a.nudge, a.cat, a.bin), a.files):
             print(line, flush=True)
 
 

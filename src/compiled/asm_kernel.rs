@@ -1298,41 +1298,16 @@ impl Registry {
             .context("retracing the start room for ASM kernels")?;
         let trace_s = t_trace.elapsed().as_secs_f64();
         let t_asm = std::time::Instant::now();
-        let n_workers = std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(4)
-            .min(refs.len().max(1));
-        let next = std::sync::atomic::AtomicUsize::new(0);
-        let refs_ref = &refs;
-        let mut built: Vec<(usize, Result<(u64, Option<Region>, AsmKernel)>)> = std::thread::scope(|scope| {
-            let handles: Vec<_> = (0..n_workers)
-                .map(|_| {
-                    let next = &next;
-                    std::thread::Builder::new()
-                        .stack_size(128 * 1024 * 1024)
-                        .spawn_scoped(scope, move || {
-                            let mut out = Vec::new();
-                            loop {
-                                let si =
-                                    next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                if si >= refs_ref.len() {
-                                    break;
-                                }
-                                let (key, r) = &refs_ref[si];
-                                out.push((si, build_one_shape(r, si, &format!("_{si}"), build).map(|(shape, kernel)| (shape, *key, kernel))));
-                            }
-                            out
-                        })
-                        .expect("spawn asm shape builder")
-                })
-                .collect();
-            handles.into_iter().flat_map(|h| h.join().unwrap()).collect()
-        });
-        built.sort_by_key(|(si, _)| *si);
+        // The shapes in parallel; a shape's build recurses deeply.
+        let pool = crate::par::Pool::per_core().stack(128 * 1024 * 1024);
+        let n_workers = pool.workers(refs.len());
+        let built = pool.map(refs.len(), |si| {
+            let (key, r) = &refs[si];
+            build_one_shape(r, si, &format!("_{si}"), build).map(|(shape, kernel)| (shape, *key, kernel))
+        })?;
         let mut kernels = HashMap::new();
         let mut first: HashMap<(u64, Option<Region>), usize> = HashMap::new();
-        for (si, res) in built {
-            let (shape, key, kernel) = res?;
+        for (si, (shape, key, kernel)) in built.into_iter().enumerate() {
             if kernels.insert((shape, key), kernel).is_some() {
                 let slots = |i: usize| refs[i].1.frame.iface.slots.iter().map(crate::trace::iface::show).filter(|p| p.starts_with("__")).collect::<Vec<_>>();
                 anyhow::bail!(
