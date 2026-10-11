@@ -75,7 +75,9 @@ enum Command {
     /// win refutes the horizon); then, at the LAST level only, the concrete
     /// search inside the winning sets (a try at the bound, then breadth-first).
     /// The first concrete win is the optimum, its inputs written to
-    /// `<checkpoint-dir>/witness_frame_F.txt`.
+    /// `<checkpoint-dir>/witness_frame_F.txt`. The outcome, per level and
+    /// the verdict, goes to `<checkpoint-dir>/result.json`
+    /// (`search::result`) before the exit code says it.
     Search {
         /// The horizon: every frame up to it is searched.
         #[arg(long)]
@@ -99,7 +101,7 @@ enum Command {
         /// --arc DIR`): the winning sets' support, each node to its last
         /// frame (`level0.marks.bin`), and the ARC-MARKED nodes (`arc.marks.bin`),
         /// both as `(shape, cell, key, dist)` rows with `dist` the horizon
-        /// minus the last frame the node still wins from; `arc.txt`;
+        /// minus the last frame the node still wins from;
         /// `witness.txt` (inputs and player position per frame).
         #[arg(long)]
         save_marks: Option<String>,
@@ -565,16 +567,13 @@ enum Command {
         #[arg(long, default_value_t = 4)]
         every: u32,
     },
-    /// Export a finished run for the web UI (`ui/`) from the checkpoint
-    /// HEADERS, the marks files and the log. See `search::ui_export`.
+    /// Export a finished search for the web UI (`ui/`) from its record
+    /// (`result.json`), the trees' checkpoint HEADERS and forward records
+    /// (`forward.tsv`) and the marks files. See `search::ui_export`.
     ExportUi {
-        /// A `rewrite search` checkpoint dir (`level00/`, ...) or one
-        /// `rewrite forward` tree.
+        /// A `rewrite search` checkpoint dir (`result.json`, `level00/`, ...).
         #[arg(long, default_value = DEFAULT_CHECKPOINT_DIR)]
         checkpoint_dir: String,
-        /// The run's log (its `[fwd]` and `[search] level` lines).
-        #[arg(long, required_unless_present = "paths_only")]
-        log: Option<String>,
         /// Output directory (the UI serves it as `data/`).
         #[arg(long, default_value = "/var/tmp/celeste-ui/data")]
         out: String,
@@ -583,20 +582,18 @@ enum Command {
         #[arg(long)]
         arc: Option<String>,
         /// A concrete run to draw instead of the arc directory's witness:
-        /// `[label TEXT]`, `inputs a,b,..`, `[dashes F:DIR ..]`, `[db NAME
-        /// CATEGORY` + `prologue N` + `seeds [..]]` (the UI's tasdatabase
-        /// download), then `f x y` per frame from 0 (`tools/align_tas.py ...
-        /// OUTDIR` writes one).
+        /// `[label TEXT]`, `inputs a,b,..`, `[dashes F:DIR ..]`, then `f x y`
+        /// per frame from 0 (`tools/align_tas.py ... OUTDIR` writes one).
         #[arg(long)]
         witness: Option<String>,
         /// Another concrete run to draw next to it (same format): e.g. the
         /// community TAS replayed in the original cart.
         #[arg(long)]
         reference: Option<String>,
-        /// Only replace `--witness` / `--reference` in the existing
-        /// `--out/run.json` (no trees, no log read).
+        /// The file the UI's "Download" button offers, embedded byte for
+        /// byte (the tasdatabase upload the category runner verified).
         #[arg(long)]
-        paths_only: bool,
+        download: Option<String>,
     },
     /// A concrete input sequence that follows a given TRAJECTORY of player
     /// positions (one "x,y" per line from frame 1; `-` accepts any), found
@@ -782,6 +779,7 @@ fn main() -> Result<()> {
 
     match cli.command {
         Command::Search { to, ceiling, level, checkpoint_dir, no_witness, save_marks, prefer } => {
+            use celeste_rust::search::result::{LevelResult, SearchResult, Verdict};
             let prefer: Option<Vec<u8>> = prefer.as_deref().map(celeste_rust::concrete::read_inputs).transpose()?;
             use celeste_rust::search::arc_dp::solve;
             let horizon = match (ceiling, to) {
@@ -796,6 +794,44 @@ fn main() -> Result<()> {
             eprintln!("[search] room {room}, levels {level}, horizon {horizon}");
             let t0 = std::time::Instant::now();
             let base = std::path::Path::new(&checkpoint_dir);
+            // The record of THIS run: none until it decides.
+            std::fs::create_dir_all(base)?;
+            match std::fs::remove_file(celeste_rust::search::result::path(base)) {
+                Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e.into()),
+                _ => {}
+            }
+            let mut res = SearchResult {
+                format: celeste_rust::search::result::FORMAT,
+                room: cfg.room,
+                level: level.clone(),
+                horizon,
+                ceiling: ceiling.is_some(),
+                steps_per_frame: cfg.steps_per_frame(),
+                levels: Vec::new(),
+                verdict: Verdict::BoundOnly,
+                optimal: None,
+                witness: None,
+                witness_file: None,
+                wall_s: 0.0,
+                peak_gb: 0.0,
+                error: None,
+            };
+            let record = |res: &mut SearchResult, verdict: Verdict| -> Result<()> {
+                res.verdict = verdict;
+                res.wall_s = t0.elapsed().as_secs_f64();
+                res.peak_gb = celeste_rust::metrics::peak_rss_gb();
+                res.write(base)
+            };
+            // The level -1 table first: a room whose table cannot be built
+            // is a recorded refusal (rerun without the filter), not a panic
+            // somewhere in the forward.
+            if let Some(m) = cfg.minus_one() {
+                if let Err(e) = m.try_table(&cfg) {
+                    res.error = Some(format!("{e:#}"));
+                    record(&mut res, Verdict::LevelMinusOneRefused)?;
+                    return Err(e.context("--level-minus-one: building the level -1 table"));
+                }
+            }
             // The previous level's arc-marked nodes: the next forward's filter.
             let mut prev: Option<(Visited, Level)> = None;
             for (li, &lvl) in levels.iter().enumerate() {
@@ -832,8 +868,9 @@ fn main() -> Result<()> {
                     &cfg,
                 )?
                 .win_frame;
-                // `f` counts search steps (`ui_export::parse_log` reads this line).
-                eprintln!("[search] level {li} ({lvl}): forward to f{steps} in {:.1} s; first win {first_win:?}", t.elapsed().as_secs_f64());
+                let forward_s = t.elapsed().as_secs_f64();
+                // `f` counts search steps.
+                eprintln!("[search] level {li} ({lvl}): forward to f{steps} in {forward_s:.1} s; first win {first_win:?}");
                 celeste_rust::metrics::mem_phase("forward");
                 // THE ARC PHASE, and the concrete search at the LAST level only:
                 // a coarser level's bound is loose wherever its objects are
@@ -845,7 +882,9 @@ fn main() -> Result<()> {
                 let known = prefer.as_deref().map(|inputs| celeste_rust::search::known::Route { inputs, filter: filter.as_ref() });
                 let s = solve(&dir, lvl, steps, concrete, !last, save_marks.as_deref().map(std::path::Path::new), prefer.as_deref(), known.as_ref(), &cfg)?;
                 let wall = t0.elapsed().as_secs_f64();
+                res.levels.push(LevelResult { spec: lvl.to_string(), dir: format!("level{li:02}"), forward_s, first_win, arc_bound: s.arc });
                 let Some(bound) = s.arc else {
+                    record(&mut res, Verdict::Refuted)?;
                     anyhow::ensure!(ceiling.is_none(), "ceiling {horizon} REFUTED by the arc search at level {li} ({lvl}): a known solution the model cannot reproduce");
                     println!("REFUTED: no win by f{horizon} (level {li}, {lvl}; {wall:.1} s)");
                     return Ok(());
@@ -864,13 +903,18 @@ fn main() -> Result<()> {
                             w.inputs_text()
                         ),
                     )?;
+                    res.optimal = Some(f as u32);
+                    res.witness = Some(w.inputs.clone());
+                    res.witness_file = Some(path.file_name().expect("a file").to_string_lossy().into_owned());
+                    record(&mut res, Verdict::Optimal)?;
                     println!("OPTIMAL win frame: {f} ({wall:.1} s); witness {}", path.display());
                     return Ok(());
                 }
                 if no_witness && last {
-                    return Ok(());
+                    return record(&mut res, Verdict::BoundOnly);
                 }
                 if last {
+                    record(&mut res, Verdict::NoConcreteWin)?;
                     anyhow::ensure!(ceiling.is_none(), "ceiling {horizon}: no concrete witness by it - a known solution the model cannot reproduce");
                     println!("no concrete win by f{horizon} (arc bound f{bound}; {wall:.1} s)");
                     return Ok(());
@@ -2118,32 +2162,18 @@ fn main() -> Result<()> {
                 }
             }
         }
-        Command::ExportUi {
-            checkpoint_dir,
-            log,
-            out,
-            arc,
-            witness,
-            reference,
-            paths_only,
-        } => {
-            let paths = celeste_rust::search::ui_export::Paths {
-                witness: witness.as_deref().map(std::path::Path::new),
-                reference: reference.as_deref().map(std::path::Path::new),
-            };
-            if paths_only {
-                celeste_rust::search::ui_export::update_paths(std::path::Path::new(&out), paths)?;
-            } else {
-                let (rx, ry) = cfg.room;
-                celeste_rust::search::ui_export::export(
-                    std::path::Path::new(&checkpoint_dir),
-                    std::path::Path::new(log.as_deref().expect("clap: --log is required without --paths-only")),
-                    std::path::Path::new(&out),
-                    (rx, ry),
-                    arc.as_deref().map(std::path::Path::new),
-                    paths,
-                )?;
-            }
+        Command::ExportUi { checkpoint_dir, out, arc, witness, reference, download } => {
+            celeste_rust::search::ui_export::export(
+                std::path::Path::new(&checkpoint_dir),
+                std::path::Path::new(&out),
+                cfg.room,
+                arc.as_deref().map(std::path::Path::new),
+                celeste_rust::search::ui_export::Paths {
+                    witness: witness.as_deref().map(std::path::Path::new),
+                    reference: reference.as_deref().map(std::path::Path::new),
+                    download: download.as_deref().map(std::path::Path::new),
+                },
+            )?;
         }
         Command::Trajectory {
             trajectory,

@@ -244,7 +244,8 @@ the diagnostics, ...) are shared by all three. The most common:
 
 ```bash
 # THE SEARCH: --ceiling H for a known solution (a refutation or no witness is
-# an error), --to H otherwise; the witness goes to DIR/witness_frame_F.txt.
+# an error), --to H otherwise; the witness goes to DIR/witness_frame_F.txt,
+# the outcome (levels, bounds, verdict, witness) to DIR/result.json.
 ./safe-run.sh -- ./target/release/rewrite search --room 1,0 --ceiling 99 --checkpoint-dir DIR
 # An object room, and the objects ladder (plans/results.md, "How to run a room").
 ./safe-run.sh -- ./target/release/rewrite search --room 7,0 --level r0sxhn,r0sxh \

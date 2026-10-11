@@ -4,7 +4,7 @@
 # env TAS_CATEGORY: the tasdatabase category (default nodiag); REPLAY_ARGS: extra replay.py flags (e.g. --one-dash)
 # With OUTDIR, also writes OUTDIR/ours.txt and OUTDIR/reference.txt: the two paths for
 # `rewrite export-ui --witness ours.txt --reference reference.txt` (label, inputs, dash
-# starts as the cart reports them, the tasdatabase name / prologue / seeds, then `f x y` per frame from 0 to the exit).
+# starts as the cart reports them, then `f x y` per frame from 0 to the exit).
 import json,os,re,subprocess,sys
 D='/home/philippe/src/github.com/CelesteClassic/tasdatabase'
 # The checkout this file is in: its replay.py (a branch's --jank, say), not the main tree's.
@@ -51,9 +51,7 @@ def dashes(D,end): return [f"{f}:{d}" for f,d in sorted(D.items()) if f<=end]
 def write(path,label,seq,R,D):
     end=ex(R)
     with open(path,'w') as o:
-        # db / prologue / seeds: the UI's "Download .tas" (the database's format, the community file's seeds)
-        o.write(f"label {label}\ninputs {','.join(map(str,seq))}\ndashes {' '.join(dashes(D,end))}\n"
-                f"db {name} {CAT}\nprologue {off}\nseeds {s[:s.index(']')+1].strip()}\n0 - -\n")
+        o.write(f"label {label}\ninputs {','.join(map(str,seq))}\ndashes {' '.join(dashes(D,end))}\n0 - -\n")
         for f in range(1,end+1):
             r=R.get(f)
             o.write(f"{f} {r[1]:.0f} {r[2]:.0f}\n" if r and r[0]==room and r[1] is not None else f"{f} - -\n")

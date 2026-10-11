@@ -271,11 +271,14 @@ def run(job, outdir, binary):
         if job.get("reuse") and os.path.isdir(job["reuse"]):
             os.makedirs(tree)
             shutil.move(job["reuse"], os.path.join(tree, "level00"))
-        cmd = [f"{M}/safe-run.sh", "--memory", job.get("mem", "60G"), "--", binary, "search", "--room", room, "--to" if "to" in job else "--ceiling", str(horizon), "--level", job["levels"], "--prefer", prefer, "--save-marks", os.path.join(jd, "marks"), "--checkpoint-dir", os.path.join(jd, "tree")] + flags
+        cmd = [f"{M}/safe-run.sh", "--memory", job.get("mem", "60G"), "--", binary, "search", "--room", room, "--to" if "to" in job else "--ceiling", str(horizon), "--level", job["levels"], "--prefer", prefer, "--save-marks", os.path.join(jd, "marks"), "--checkpoint-dir", tree] + flags
         t = time.time()
         with open(log, "w") as f:
             rc = subprocess.run(cmd, stdout=f, stderr=subprocess.STDOUT, cwd=M, timeout=job.get("timeout", 4 * 3600)).returncode
-        return rc, open(log, errors="replace").read(), time.time() - t
+        # The search's record (rewrite.rs `search::result`): none when it
+        # stopped on an error before deciding.
+        rec = os.path.join(tree, "result.json")
+        return rc, (json.load(open(rec)) if os.path.exists(rec) else None), time.time() - t
     horizon = job.get("to", ref)
     keep = job.get("keep_tree")
 
@@ -295,31 +298,27 @@ def run(job, outdir, binary):
         opt = None
     try:
         if opt is None:
-            rc, log, secs = search(job.get("l1", True))
-            if rc != 0 and job.get("l1", True) and rc != 137 and re.search(r"building the level -1 table|level_minus_one", log):
+            rc, rec, secs = search(job.get("l1", True))
+            if rc != 0 and job.get("l1", True) and rec and rec["verdict"] == "level_minus_one_refused":
                 res["l1"] = "refused"
-                rc, log, secs = search(False)
+                rc, rec, secs = search(False)
     except subprocess.TimeoutExpired:
         drop_tree()
         return {**res, "status": "search timed out"}
     if opt is None:
         res["search_s"] = round(secs)
-        peak = re.findall(r"peak ([\d.]+) GB", log)
-        res["peak_gb"] = peak[-1] if peak else None
-        bounds = re.findall(r"ARC BOUND: no win before f(\d+)", log)
-        res["arc_bounds"] = [int(b) for b in bounds]
-        m = re.search(r"OPTIMAL win frame: (\d+)", log)
+        res["peak_gb"] = round(rec["peak_gb"], 2) if rec else None
+        res["arc_bounds"] = [l["arc_bound"] for l in rec["levels"] if l["arc_bound"] is not None] if rec else []
         # Under `--to H` a refutation is a result: no win by H at all.
-        refuted = re.search(r"^(REFUTED: no win by f\d+|no concrete win by f\d+)", log, re.M)
-        if rc == 0 and refuted and "to" in job:
+        if rc == 0 and rec and rec["verdict"] in ("refuted", "no_concrete_win") and "to" in job:
             drop_tree()
-            return {**res, "status": f"refuted at {horizon}", "detail": refuted.group(1)}
-        if rc != 0 or not m:
+            return {**res, "status": f"refuted at {horizon}", "detail": rec["verdict"]}
+        if rc != 0 or not rec or rec["verdict"] != "optimal":
             drop_tree()
+            log = open(os.path.join(jd, "search.log"), errors="replace").read()
             tail = [l for l in log.splitlines() if l.strip()][-3:]
-            return {**res, "status": f"search failed (exit {rc})", "tail": tail}
-        opt = int(m.group(1))
-        ours = [int(x) for x in re.search(r"concrete optimum \d+ inputs (\S+)", log).group(1).split(",")]
+            return {**res, "status": f"search failed (exit {rc}{', ' + rec['verdict'] if rec else ''})", "tail": tail}
+        opt, ours = rec["optimal"], rec["witness"]
     res["ours"] = opt
     if job.get("search_only"):
         drop_tree()
@@ -414,20 +413,12 @@ def run(job, outdir, binary):
             # The paths start the room as the search and the replays do (its loading frame).
             env = dict(os.environ, TAS_CATEGORY=cat, REPLAY_ARGS=" ".join(replay_args(cat) + jank_args(jank)))
             subprocess.run([sys.executable, f"{M}/tools/align_tas.py", room, name, str(prologue), os.path.join(jd, "witness.txt"), seeds or "-", paths], env=env, cwd=M, capture_output=True, timeout=1800, check=True)
-            # The UI's download must be the upload file: its seeds as UCT wrote them.
-            if res.get("upload"):
-                up_seeds, _ = parse_tas(open(res["upload"]).read())
-                p = f"{paths}/ours.txt"
-                text = open(p).read()
-                open(p, "w").write(re.sub(r"(?m)^seeds .*$", f"seeds [{up_seeds}]", text, count=1))
             rid = f"room{room.replace(',', '')}{cat}"
-            ex = subprocess.run([f"{M}/safe-run.sh", "--", binary, "export-ui", "--checkpoint-dir", os.path.join(jd, "tree"), "--log", os.path.join(jd, "search.log"), "--out", f"{UI}/{rid}", "--room", room, "--arc", os.path.join(jd, "marks"), "--witness", f"{paths}/ours.txt", "--reference", f"{paths}/reference.txt"], cwd=M, capture_output=True, text=True, timeout=3600)
+            # The UI's download IS the upload file.
+            dl = ["--download", res["upload"]] if res.get("upload") else []
+            ex = subprocess.run([f"{M}/safe-run.sh", "--", binary, "export-ui", "--checkpoint-dir", os.path.join(jd, "tree"), "--out", f"{UI}/{rid}", "--room", room, "--arc", os.path.join(jd, "marks"), "--witness", f"{paths}/ours.txt", "--reference", f"{paths}/reference.txt"] + dl, cwd=M, capture_output=True, text=True, timeout=3600)
             if ex.returncode != 0:
                 raise RuntimeError("export-ui: " + ex.stderr.strip().splitlines()[-1] if ex.stderr.strip() else "export-ui failed")
-            # The UI's download must equal the upload file.
-            if res.get("upload"):
-                t = json.load(open(f"{UI}/{rid}/run.json"))["witness"]["tas"]["text"]
-                res["ui_download_equals_upload"] = t == open(res["upload"]).read()
             runs = json.load(open(f"{UI}/runs.json"))
             runs["runs"] = [r for r in runs["runs"] if r["id"] != rid]
             tasn = entry["file"].replace(".tas", "")

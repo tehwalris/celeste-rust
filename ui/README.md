@@ -177,40 +177,33 @@ other categories in runs.json order, each in game order. The switch shows
 names (`exit at frame 85` -> `85 f`).
 
 Each run's subdirectory (`id`) is produced by `rewrite export-ui`
-(`src/search/ui_export.rs`) from a `rewrite search` checkpoint dir (or one
-`rewrite forward` tree) and its log. It reads only the checkpoint headers
-(per-cell counts = the cell index, win cells = the win list), the marks
-files, and - to split the marks by layer - each frame file's `(cell, key)`
-rows. A run is one horizon: one level per `--level` of the search, and with
-`--arc DIR` (what `search --save-marks DIR` wrote) the last level gets the
-remainder-free backward's marks and one more level is the remainder-exact
-ARC backward over the same tree (`forward_of` in `run.json`: no forward
-pass of its own; a node is marked when its winning set W_t is non-empty at
-some frame t, drawn at its first-reach layer). With a concrete witness,
-`witness.txt` (the inputs and the player's position per frame) is drawn
-over the room as a path (below). `--witness FILE` replaces it and
-`--reference FILE` adds a second one to compare with, in the same format
-plus an optional `label` line and `dashes F:DIR ...`: `tools/align_tas.py
-ROOM 2900m PROLOGUE OUR_TAS SEEDS OUTDIR` writes both (`ours.txt`,
-`reference.txt`) from a community TAS and ours replayed in the ORIGINAL
-cart, so the two are directly comparable.
+(`src/search/ui_export.rs`) from a `rewrite search` checkpoint dir: the
+search's record (`result.json`: the levels, their first wins and arc bounds,
+the optimum, the wall time) and each level's tree. It reads only the
+checkpoint headers (per-cell counts = the cell index, win cells = the win
+list), the tree's forward record (`forward.tsv`: the per-frame sizes and
+timings), the marks files, and - to split the marks by layer - each frame
+file's `(cell, key)` rows. A run is one horizon: one level per `--level` of
+the search, and with `--arc DIR` (what `search --save-marks DIR` wrote) the
+last level gets the remainder-free backward's marks and one more level is
+the remainder-exact ARC backward over the same tree (`forward_of` in
+`run.json`: no forward pass of its own; a node is marked when its winning
+set W_t is non-empty at some frame t, drawn at its first-reach layer). With
+a concrete witness, `witness.txt` (the inputs and the player's position per
+frame) is drawn over the room as a path (below). `--witness FILE` replaces
+it and `--reference FILE` adds a second one to compare with, in the same
+format plus an optional `label` line and `dashes F:DIR ...`:
+`tools/align_tas.py ROOM 2900m PROLOGUE OUR_TAS SEEDS OUTDIR` writes both
+(`ours.txt`, `reference.txt`) from a community TAS and ours replayed in the
+ORIGINAL cart, so the two are directly comparable.
 
-A path file may also name the run in the CelesteClassic tasdatabase:
-`db 2900m nodiag`, `prologue 29` (the spawn frames before the player
-exists - the earliest offset the community TAS exits at, never inferred
-from leading zeros; the export refuses a prologue that presses anything)
-and `seeds [0,0,0]` (the community file's seed list, `seeds []` without;
-`align_tas.py` writes all three). The witness's `tas` in `run.json` is
-then the file itself, and the header has a **Download .tas** button
-saving `2900m_nodiag.tas` byte for byte (`[seeds]` + the inputs after the
-prologue, comma-separated, no trailing newline), next to the frame count
-in the database's convention (inputs after the prologue - 1: `76f vs
-TAS29 81f`). When only the path files changed (the trees may be long
-gone), `export-ui --paths-only --out DIR --witness F --reference F`
-replaces those two entries of `DIR/run.json` and nothing else; that is how
-the three nodiag runs got theirs (2026-10-06, from the files in
-`/var/tmp/celeste-ui/nodiag-paths/`; the downloads are identical to the
-PICO-8-verified `tas/tasdatabase/nodiag/*.tas`).
+`--download FILE` embeds a file byte for byte (`download` in `run.json`):
+the header gets a **Download TAS29.tas** button saving it, next to its frame
+count in the database's convention (its inputs - 1). The category runner
+passes the tasdatabase upload it verified in real play, so the download IS
+the upload (until 2026-10-11 the export re-derived the file from the path
+file's `db` / `prologue` / `seeds` lines, and two recorded runs offered a
+file other than the one submitted).
 
 A path (Room and Passes grains; the `witness` / `paths` chip, `w=0` in
 the hash hides them) is the player's 8x8 box at the frame shown - ours
@@ -241,10 +234,9 @@ tiles):
 ```bash
 ./safe-run.sh -- ./target/quick/rewrite search --level-minus-one 172,5 \
     --checkpoint-dir /var/tmp/arc33-172 --to 172 --room 3,3 --level r0sxhn \
-    --save-marks /var/tmp/arc33-172-ui 2> /var/tmp/celeste-ui/room33arc172.log
+    --save-marks /var/tmp/arc33-172-ui
 ./safe-run.sh -- ./target/quick/rewrite export-ui --checkpoint-dir /var/tmp/arc33-172 \
-    --arc /var/tmp/arc33-172-ui --log /var/tmp/celeste-ui/room33arc172.log \
-    --out /var/tmp/celeste-ui/data/room33arc172 --room 3,3
+    --arc /var/tmp/arc33-172-ui --out /var/tmp/celeste-ui/data/room33arc172 --room 3,3
 # then list it in /var/tmp/celeste-ui/data/runs.json (above)
 ```
 

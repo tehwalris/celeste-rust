@@ -114,6 +114,16 @@ export interface Run {
   /** Another concrete run to compare with (`export-ui --reference`: a
    *  community TAS replayed in the original cart). Absent in older exports. */
   reference?: Witness | null;
+  /** The file the "Download" button offers (`export-ui --download`: the
+   *  tasdatabase upload the category runner verified), byte for byte.
+   *  Absent in older exports. */
+  download?: Download | null;
+}
+
+/** A file to download: its name (`TAS29.tas`) and its exact content. */
+export interface Download {
+  file: string;
+  text: string;
 }
 
 /** A concrete witness: its inputs and the player's (x, y) per frame, frame
@@ -125,19 +135,6 @@ export interface Witness {
   inputs: number[];
   path: ([number, number] | null)[];
   dashes?: [number, string][];
-  /** The run as a CelesteClassic tasdatabase file (`db` / `prologue` /
-   *  `seeds` in the path file; absent otherwise and in older exports). */
-  tas?: TasFile | null;
-}
-
-/** A tasdatabase file: `file` its name (`TAS29.tas`), `text` its
- *  exact content (`[seeds]` + the inputs after the spawn prologue, no
- *  newline), `frames` the database's count (those inputs - 1). */
-export interface TasFile {
-  file: string;
-  text: string;
-  frames: number;
-  prologue: number;
 }
 
 /** A state with no player position (see ui_export::NO_POSITION). */
