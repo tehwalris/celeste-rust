@@ -130,3 +130,19 @@ The exit: the room's only opening is the top row's spikes (tile 27, cols
 9-11). `spikes_at` kills on tile 27 when the hitbox top `y % 8 <= 2` and
 `spd.y <= 0`, so the player must cross hitbox-top 2..0 in one frame (4+ px
 up: a dash), the frame before leaving.
+
+How loose level -1 is here: its start distance is 89 frames, the proven
+lower bound 191 (h190 refuted), so it is at least 102 frames short. The room
+is a LOOP (Philippe): the spawn pocket is walled by spikes, the route goes
+down the left, across the bottom (spring, balloon) and back up the right to
+the spiked top exit - and every spike crossing needs a frame that jumps the
+spike's danger band (a dash's speed, a dash in hand). A position-only
+distance knows neither the dashes nor the bands (it widens `djump`; the
+probe's "VIOLATION"s are its premise checks on those widened outcomes), so
+it measures the loop's length, not its cost. It still cuts 83-100% of the
+late frames' states (h152 probe), which is what made h170/h190 fit.
+
+A beam search over exact states (`rewrite beam`, branch `mod-beam`, WIP,
+paused for the optimum): width 20000, no deaths, by d: it survives the
+spawn pocket (alive through f218, 20k states) and reaches d 20 at (105, 115)
+on f188, without an exit by f218.
