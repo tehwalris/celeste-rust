@@ -106,3 +106,27 @@ upload cut: 45). New states a frame: f60 19k, f90 4.4M, f126 12.9M, f152
 frame). First abstract win f152; `search --to 152` on that tree: the arcs
 REFUTE 152 (15 s). In f140's largest shape (28.8M rows, the fruit all
 taken) `spd.x` has 14845 distinct values.
+
+### Searches with level -1 (2026-10-11)
+
+Level -1 builds with `e` for this room (68800 entries, start d 89: it
+widens `djump`, so it is weak early). Checked against the unfiltered f152
+tree before deleting it: `transpile --probe` under the h152 remainder-free
+marks, frames 120-152: 0 marked rows too late.
+
+| H | flags | forward | peak new states/frame | disk (trimmed) | peak RSS | result |
+|---|---|---|---|---|---|---|
+| 152 | none (unfiltered) | to f152 | 104.5M (f152) | 270 GB | 25 GB | REFUTED (arcs) |
+| 170 | `--level-minus-one 170,5 --trim-rows` | 347 s | 14.0M (f133) | 63 GB | 14 GB | REFUTED |
+| 190 | `--level-minus-one 190,5 --trim-rows` | 1147 s | 108.8M (f154) | 317 GB | 64 GB | REFUTED (1251 s) |
+
+So the optimum is at least 191 (the arcs' refutation at r0sxhne: sound). At
+h190 the winning sets W reach back to f080 (1 node; f152 at h152), the
+player exists from f046. A raise needs untrimmed rows (`--trim-rows` trees
+are refused), so each H is a fresh run. The cost grows about 9% a frame per
+frame of horizon in the middle frames: H=200 is ~2.4x H=190's disk.
+
+The exit: the room's only opening is the top row's spikes (tile 27, cols
+9-11). `spikes_at` kills on tile 27 when the hitbox top `y % 8 <= 2` and
+`spd.y <= 0`, so the player must cross hitbox-top 2..0 in one frame (4+ px
+up: a dash), the frame before leaving.
