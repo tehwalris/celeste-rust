@@ -114,10 +114,10 @@ impl Winning {
         let k = s.partition_point(|s| (s.hi as u32) < t);
         s.get(k).filter(|s| s.lo as u32 <= t).map(|s| &self.sets[s.set as usize])
     }
-    /// Every span `(node, lo, hi, set)`: `W_t(node) = set` for `t` in
+    /// Node `i`'s spans `(lo, hi, set)`: `W_t(i) = set` for `t` in
     /// `lo..=hi`, empty at the frames no span covers.
-    pub fn spans(&self) -> impl Iterator<Item = (u32, u32, u32, &Region)> + '_ {
-        (0..self.ids.len() as u32).flat_map(move |i| self.of(i).iter().map(move |s| (i, s.lo as u32, s.hi as u32, &self.sets[s.set as usize])))
+    pub fn spans_of(&self, i: u32) -> impl Iterator<Item = (u32, u32, &Region)> + '_ {
+        self.of(i).iter().map(move |s| (s.lo as u32, s.hi as u32, &self.sets[s.set as usize]))
     }
     /// The bytes held: ids, span offsets, spans, and the sets' arena.
     pub fn bytes(&self) -> u64 {
@@ -327,7 +327,9 @@ impl<'a> Backward<'a> {
         self.n_emits += n_emits as u64;
         self.max_emits = self.max_emits.max(n_emits);
         self.n_changed += changed.len() as u64;
-        self.d_read += t0.elapsed();
+        let n_read = changed.len();
+        let d_read = t0.elapsed();
+        self.d_read += d_read;
         // PULL, by source id ranges cut at the emissions' quantiles: each
         // source's set at t + 1 united with its pulls; the untouched carried,
         // those of layer t + 1 closed.
@@ -414,7 +416,8 @@ impl<'a> Backward<'a> {
             o
         });
         drop(parts);
-        self.d_pull += t0.elapsed();
+        let d_pull = t0.elapsed();
+        self.d_pull += d_pull;
         // MERGE, in range order: the new sets interned, the ranges joined.
         let t0 = std::time::Instant::now();
         let mut cur = Vec::with_capacity(outs.iter().map(|o| o.cur.len()).sum());
@@ -455,7 +458,19 @@ impl<'a> Backward<'a> {
         self.cur = cur;
         self.changed = changed;
         self.max_cur = self.max_cur.max(self.cur.len());
-        self.d_merge += t0.elapsed();
+        let d_merge = t0.elapsed();
+        self.d_merge += d_merge;
+        let ms = |d: std::time::Duration| d.as_secs_f64() * 1e3;
+        eprintln!(
+            "[arc] f{t:03}: {n_read} changed at f{} -> {n_emits} in-edges; {} nodes with a set, {} changed | read {:.0} pull {:.0} merge {:.0} ms | anon {:.2} GB",
+            t + 1,
+            self.cur.len(),
+            self.changed.len(),
+            ms(d_read),
+            ms(d_pull),
+            ms(d_merge),
+            crate::metrics::current_rss_gb()
+        );
         if (self.horizon - 1 - t) % 4 == 0 {
             let wins = &self.wins;
             let (k, med, p90, max) = fragmentation(self.cur.iter().filter(|c| wins.binary_search(&c.id).is_err()).map(|c| &self.sets[c.set as usize]));
@@ -844,27 +859,52 @@ impl Witness {
     }
 }
 
-/// The graph's nodes by `(shape, key, cell)`, for the concrete search:
-/// sorted, 32 B a node (a hash map took ~80).
-pub struct NodeKeys(Vec<(u64, (u64, u64), u32, u32)>);
+/// W's nodes by `(shape, key, cell)`, for the concrete search and the known
+/// route: a state's id is its region (shape and cell), its entry (the
+/// region's number for its key) and its cell, so only the ENTRIES are
+/// listed - `((region, key), entry)` per distinct entry of the support,
+/// sorted, 24 B - and the node is the id's index in `W`.
+pub struct NodeKeys<'w> {
+    w: &'w Winning,
+    geo: crate::storage::Geometry,
+    /// Shape hash -> shape index, sorted.
+    shapes: Vec<(u64, u32)>,
+    entries: Vec<((u32, (u64, u64)), u32)>,
+}
 
-impl NodeKeys {
-    /// From `(shape, key, cell, node)` in any order; a key twice keeps its
-    /// lowest node.
-    fn new(mut v: Vec<(u64, (u64, u64), u32, u32)>) -> Self {
-        v.sort_unstable();
-        v.dedup_by_key(|e| (e.0, e.1, e.2));
-        NodeKeys(v)
+impl<'w> NodeKeys<'w> {
+    /// Over `w`'s support, its entries' keys from the tree's metadata.
+    pub fn new(w: &'w Winning, resolver: &crate::storage::marks::Resolver) -> anyhow::Result<Self> {
+        let geo = crate::storage::GEOMETRY;
+        let (mut shapes, mut entries) = (Vec::new(), Vec::new());
+        let mut last = None;
+        for &id in &w.ids {
+            let (region, entry) = (id_region(id), id_entry(id));
+            if last == Some((region, entry)) {
+                continue;
+            }
+            last = Some((region, entry));
+            let (shape, key, _) = resolver.resolve(id)?;
+            shapes.push((shape, region / geo.slots));
+            entries.push(((region, key), entry));
+        }
+        shapes.sort_unstable();
+        shapes.dedup();
+        anyhow::ensure!(shapes.windows(2).all(|p| p[0].0 != p[1].0), "a shape with two indices");
+        entries.sort_unstable();
+        Ok(NodeKeys { w, geo, shapes, entries })
     }
     pub(super) fn get(&self, shape: u64, key: Option<(u64, u64)>, cell: u32) -> Option<u32> {
-        let k = (shape, key?, cell);
-        self.0.binary_search_by(|e| (e.0, e.1, e.2).cmp(&k)).ok().map(|j| self.0[j].3)
+        let key = key?;
+        let k = self.shapes.binary_search_by_key(&shape, |s| s.0).ok()?;
+        let (slot, local) = self.geo.slot_local(cell);
+        let region = crate::storage::region_of(&self.geo, self.shapes[k].1, slot);
+        let e = self.entries.binary_search_by(|e| e.0.cmp(&(region, key))).ok()?;
+        self.w.index(state_id(region, self.entries[e].1, local))
     }
-    pub fn len(&self) -> usize {
-        self.0.len()
-    }
-    pub fn is_empty(&self) -> bool {
-        self.0.is_empty()
+    /// The support's distinct entries.
+    pub fn entries(&self) -> usize {
+        self.entries.len()
     }
 }
 
@@ -985,7 +1025,7 @@ fn input_order(prefer: Option<&[u8]>, k: u32) -> impl Iterator<Item = u8> {
 pub fn concrete_search(
     level: crate::abstraction::Level,
     horizon: u32,
-    node: &NodeKeys,
+    node: &NodeKeys<'_>,
     keys: &celeste_engine::exact::KeySpace,
     w: &Winning,
     bound: u32,
@@ -1007,7 +1047,7 @@ pub fn concrete_search(
     anyhow::ensure!(horizon % spf == 0, "the horizon {horizon} is not a whole number of frames ({spf} steps each)");
     let frames = horizon / spf;
     let t0 = std::time::Instant::now();
-    eprintln!("[concrete] {} nodes keyed; {workers} workers; the arc bound f{bound}", node.len());
+    eprintln!("[concrete] {} nodes keyed by {} entries; {workers} workers; the arc bound f{bound}", w.len(), node.entries());
     crate::metrics::mem_phase("concrete: engines up");
     /// A successor that stays inside W (or wins), in (parent, input, leaf)
     /// order within its worker's chunk.
@@ -1029,7 +1069,7 @@ pub fn concrete_search(
     {
         struct Dfs<'a> {
             eng: &'a mut RefEngine,
-            node: &'a NodeKeys,
+            node: &'a NodeKeys<'a>,
             keys: &'a celeste_engine::exact::KeySpace,
             w: &'a Winning,
             level: crate::abstraction::Level,
@@ -1323,19 +1363,21 @@ pub fn solve(
     for (f, fs) in tree_frames(dir, horizon)?.into_iter().enumerate() {
         files.extend(fs.into_iter().map(|(seq, file)| (f as u32, seq, file)));
     }
-    let keyed = (concrete && arc.is_some()) || known.is_some();
-    let mut node_key: Vec<u64> = Vec::with_capacity(w.len());
-    let mut keys: Vec<(u64, (u64, u64), u32, u32)> = Vec::with_capacity(if keyed { w.len() } else { 0 });
     let mut rows: Vec<MarkRow> = Vec::new();
     let mut fp = 0u64;
+    // Per frame, the nodes with a set and the sum of their (node, set) hashes.
+    let mut per_frame = vec![(0usize, 0u64); horizon as usize + 1];
     for i in 0..w.len() as u32 {
         let (shape, key, cell) = resolver.resolve(w.id(i))?;
         // `Visited::fingerprint`: the nodes are distinct states.
         let h = content.state(shape, key, cell);
-        node_key.push(h);
         fp = fp.wrapping_add(h);
-        if keyed {
-            keys.push((shape, key, cell, i));
+        for (lo, hi, r) in w.spans_of(i) {
+            let g = gate_w_hash(h, r);
+            for f in &mut per_frame[lo as usize..=hi as usize] {
+                f.0 += 1;
+                f.1 = f.1.wrapping_add(g);
+            }
         }
         if save.is_some() {
             rows.push(mark_row(shape, key, cell, w.last(i) as u16, horizon));
@@ -1346,19 +1388,9 @@ pub fn solve(
         std::fs::create_dir_all(out)?;
         save_marks(&out.join("level0.marks.bin"), std::mem::take(&mut rows), horizon, &resolver.space)?;
     }
-    // Per frame, the nodes with a set and the sum of their (node, set) hashes.
-    let mut per_frame = vec![(0usize, 0u64); horizon as usize + 1];
-    for (i, lo, hi, r) in w.spans() {
-        let h = gate_w_hash(node_key[i as usize], r);
-        for f in &mut per_frame[lo as usize..=hi as usize] {
-            f.0 += 1;
-            f.1 = f.1.wrapping_add(h);
-        }
-    }
     for (t, (n, acc)) in per_frame.into_iter().enumerate() {
         println!("[gate] h{horizon} W f{t:03} {n} {acc:016x}");
     }
-    drop(node_key);
     println!("[gate] h{horizon} arc optimum {}", arc_steps.map_or("none".to_string(), |f| f.to_string()));
     crate::metrics::mem_phase("arc: fingerprints");
     // Per node the LAST frame it is reached inside W from the start (`reach`;
@@ -1392,19 +1424,20 @@ pub fn solve(
     }
     // The concrete search reads W and the node keys, not the edge files.
     drop(seeds);
-    let node = NodeKeys::new(keys);
-    let known = match known {
-        Some(route) => {
+    let keyed = (concrete && arc.is_some()) || known.is_some();
+    let node = if keyed { Some(NodeKeys::new(&w, &resolver)?) } else { None };
+    let known = match (known, &node) {
+        (Some(route), Some(node)) => {
             let minus_one = crate::frame::TreeFilter::of_tree(dir, s)?;
-            let p = super::known::Pruning { settings: s, level, horizon, node: &node, keys: &resolver.space, start, w: &w, reached: arc_marks.as_ref(), minus_one, files: &files, tree: &resolver };
+            let p = super::known::Pruning { settings: s, level, horizon, node, keys: &resolver.space, start, w: &w, reached: arc_marks.as_ref(), minus_one, files: &files, tree: &resolver };
             super::known::check(route, &p)?
         }
-        None => None,
+        _ => None,
     };
     drop(files);
     crate::metrics::mem_phase("arc: marks for the next level, edge files closed");
-    let found = match (concrete, arc) {
-        (true, Some(f)) => concrete_search(level, horizon, &node, &resolver.space, &w, f, prefer, s)?,
+    let found = match (concrete, arc, &node) {
+        (true, Some(f), Some(node)) => concrete_search(level, horizon, node, &resolver.space, &w, f, prefer, s)?,
         _ => None,
     };
     if let Some(wt) = &found {

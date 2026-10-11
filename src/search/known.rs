@@ -45,7 +45,7 @@ pub struct Pruning<'a> {
     pub level: crate::abstraction::Level,
     /// In search steps.
     pub horizon: u32,
-    pub node: &'a NodeKeys,
+    pub node: &'a NodeKeys<'a>,
     /// The tree's key space (concrete states keyed as its rows).
     pub keys: &'a celeste_engine::exact::KeySpace,
     /// The start's node (`None`: no winning set at any frame): the tree
