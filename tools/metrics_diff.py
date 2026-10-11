@@ -5,8 +5,6 @@ the percent change, the per-kernel `k.<sym>.*` lines summarized (how many
 kernels appeared, disappeared or changed; the largest changes listed).
 Exits 1 on any difference: a change in these numbers is always noticed and
 re-pinned deliberately (`./check.sh t1 --pin`, and say why in the commit).
-The `approx.*` keys (the edge file's bytes: the scheduling moves them by a
-few bytes) differ only beyond APPROX (0.5%).
 
     tools/metrics_diff.py PINNED NEW
 """
@@ -24,17 +22,6 @@ def load(path):
             k, v = line.rsplit(" ", 1)
             vals[k] = int(v)
     return head, vals
-
-
-APPROX = 0.005
-
-
-def differs(k, va, vb):
-    if va == vb:
-        return False
-    if k.startswith("approx.") and va is not None and vb is not None:
-        return abs(vb - va) > APPROX * max(abs(va), 1)
-    return True
 
 
 def pct(a, b):
@@ -55,7 +42,7 @@ def main():
     rows = []
     for k in top:
         va, vb = a.get(k), b.get(k)
-        if differs(k, va, vb):
+        if va != vb:
             rows.append((k, va, vb))
     for k, va, vb in rows:
         sa = "-" if va is None else str(va)

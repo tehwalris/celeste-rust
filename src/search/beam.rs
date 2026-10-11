@@ -219,19 +219,22 @@ pub fn beam(args: &BeamArgs, s: &crate::settings::Settings) -> Result<Option<Rou
 
 #[cfg(test)]
 mod tests {
-    /// Room (1,0), the original map: a narrow beam (the reference engine,
-    /// every input) finds an exit, and the route replays to it.
+    /// Room (1,0), the original map, the arc gate's synthetic win (9,101)
+    /// (optimum 33): a narrow beam (the reference engine, every input),
+    /// ranked by level -1's d, finds a route, and it replays to the win on
+    /// its last frame.
     #[test]
-    fn a_beam_finds_an_exit_of_room_10() {
-        let s = crate::settings::Settings { threads: Some(4), ..Default::default() };
-        let args = super::BeamArgs { width: 64, per_cell: 2, max_frames: 140, level: crate::abstraction::Level::EXACT };
-        let r = super::beam(&args, &s).expect("beam").expect("a route out of room (1,0)");
+    fn a_beam_finds_a_route_to_room_10s_gate_win() {
+        let s = crate::settings::Settings { threads: Some(4), win_at: Some((9, 9, 101, 101)), level_minus_one: Some((60, 5)), ..Default::default() };
+        let args = super::BeamArgs { width: 64, per_cell: 2, max_frames: 60, level: crate::abstraction::Level::EXACT };
+        let r = super::beam(&args, &s).expect("beam").expect("a route to (9,101)");
+        assert!(r.inputs.len() >= 33, "no route beats the optimum 33: {}", r.inputs.len());
         let mut eng = crate::trace::refengine::RefEngine::new(&s).expect("engine");
         let mut row = crate::frame::Block::canonical(eng.initial().expect("initial")).expect("canonical").into_rt2();
         for (i, &b) in r.inputs.iter().enumerate() {
             let next = eng.step_one(&row, b).expect("one successor");
             let won = crate::frame::wins_of(next.rt2(), &s).expect("wins")[0];
-            assert_eq!(won, i + 1 == r.inputs.len(), "the room is left on the route's last frame, not frame {}", i + 1);
+            assert_eq!(won, i + 1 == r.inputs.len(), "the route wins on its last frame, not frame {}", i + 1);
             row = next.into_rt2();
         }
     }

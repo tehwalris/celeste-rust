@@ -37,7 +37,6 @@ pub(crate) fn boundary_ids() -> runtime2::BoundaryIds {
         f_state: f("state"),
         g_big_chest: g("big_chest"),
         g_platform: g("platform"),
-        f_last: f("last"),
         g_balloon: g("balloon"),
         f_offset: f("offset"),
         f_start: f("start"),

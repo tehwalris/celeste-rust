@@ -496,6 +496,10 @@ impl<'a> Table<'a> {
         }
 
         // The cone: literal forks (buttons) whole, the kernels' premises true.
+        // `NoWrap` among them: a lane whose arithmetic overflows is in error
+        // in the kernels and the reference (FATAL there), so it has no
+        // successor to bound, and the cone's own arithmetic is checked
+        // (`Graph::eval`: an overflow is TOP), never a wrapped value.
         let arena = &d.graph;
         let mut rs: Vec<NodeId> = Vec::new();
         for r in &roots_old {

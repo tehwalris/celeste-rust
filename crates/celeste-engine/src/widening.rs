@@ -289,12 +289,14 @@ pub const PLAYER_HITBOX: [i16; 4] = [1, 3, 6, 5];
 pub const FLOOR_HITBOX: [i16; 4] = [0, 0, 8, 8];
 
 /// The cart's `floor.collide(player, 0, 0)` solved for the player: OPEN
-/// windows `(lo, hi)` for `x` and `y`.
-pub fn floor_player_window(floor: (P8, P8)) -> [(P8, P8); 2] {
+/// windows `(lo, hi)` for `x` and `y`; `None` where one leaves the 16.16
+/// range (a floor's position is its map tile's, so never: an error, not a
+/// wrapped window).
+pub fn floor_player_window(floor: (P8, P8)) -> Option<[(P8, P8); 2]> {
     let [px, py, pw, ph] = PLAYER_HITBOX;
     let [fx, fy, fw, fh] = FLOOR_HITBOX;
-    let at = |base: P8, d: i16| base + P8::from_i16(d);
-    [(at(floor.0, fx - px - pw), at(floor.0, fx + fw - px)), (at(floor.1, fy - py - ph), at(floor.1, fy + fh - py))]
+    let at = |base: P8, d: i16| base.checked_add(P8::from_i16(d));
+    Some([(at(floor.0, fx - px - pw)?, at(floor.0, fx + fw - px)?), (at(floor.1, fy - py - ph)?, at(floor.1, fy + fh - py)?)])
 }
 
 /// Does a player in ranges `x`, `y` CERTAINLY overlap? A straddling range
@@ -386,7 +388,8 @@ pub static TABLE: &[Entry] = &[
               each other and the key's sprite (below), never in anything a state's successors or the \
               search's tests depend on, so every value of them behaves alike. Checked: traced as free \
               input cells along room (4,0)'s 100% route, no other stored field, guard, error or raise \
-              reads them (`trace::widen::tests::dead_fields_are_unread`).",
+              reads them, but for an error's overflow check of their own arithmetic (`minutes + 1`), \
+              which holds at the stored 0 (`trace::widen::tests::dead_fields_are_unread`).",
     },
     Entry {
         name: "key sprite",
@@ -789,7 +792,10 @@ impl Rt2 {
                 let r = P8::from_raw(radius);
                 let band: Vec<(P8, P8)> = (0..self.width)
                     .map(|lane| match self.cols[centre as usize].at(lane) {
-                        AV::Num(s) => (s - r, s + r),
+                        AV::Num(s) => match (s.checked_sub(r), s.checked_add(r)) {
+                            (Some(lo), Some(hi)) => (lo, hi),
+                            _ => panic!("widening {name:?}: lane {lane}'s band {s:?} +- {r:?} leaves the 16.16 range"),
+                        },
                         other => panic!("widening {name:?}: the band's centre is {other:?}"),
                     })
                     .collect();
@@ -836,7 +842,7 @@ impl Rt2 {
                 if (0..self.width).all(|lane| matches!(self.cols[c as usize].at(lane), AV::Num(_))) {
                     return;
                 }
-                let full = |v: AV| matches!(v, AV::Ival(lo, hi) if hi.as_raw_u32() as i32 - lo.as_raw_u32() as i32 >= p);
+                let full = |v: AV| matches!(v, AV::Ival(lo, hi) if hi.as_raw_u32() as i32 as i64 - lo.as_raw_u32() as i32 as i64 >= p as i64);
                 self.check_lanes(name, c, "not a full period", full);
                 Col::U(AV::Ival(P8::from_raw(0), P8::from_raw(p)))
             }
@@ -872,7 +878,8 @@ impl Rt2 {
                 let col = self.obj_field_cell(obj, f).map(|c| &self.cols[c as usize]);
                 col.and_then(|c| c.uniform_num(self.width)).unwrap_or_else(|| panic!("near floor widening: a fall floor's position is {col:?}, not one number"))
             };
-            let window = floor_player_window((at(ids.f_x), at(ids.f_y)));
+            let (fx, fy) = (at(ids.f_x), at(ids.f_y));
+            let window = floor_player_window((fx, fy)).unwrap_or_else(|| panic!("near floor widening: a fall floor at ({fx:?}, {fy:?}): its window leaves the 16.16 range"));
             let overlap: Vec<bool> = (0..self.width)
                 .map(|lane| {
                     players.iter().any(|&(cx, cy)| {
@@ -944,7 +951,8 @@ mod tests {
     #[test]
     fn the_overlap_window_is_the_carts_collide() {
         let (fx, fy) = (48i16, 112i16);
-        let window = floor_player_window((P8::from_i16(fx), P8::from_i16(fy)));
+        let window = floor_player_window((P8::from_i16(fx), P8::from_i16(fy))).expect("in range");
+        assert_eq!(floor_player_window((P8::from_raw(i32::MAX), P8::from_i16(fy))), None, "a window past the range is no window");
         let [px_, py_, pw, ph] = PLAYER_HITBOX;
         let [fx_, fy_, fw, fh] = FLOOR_HITBOX;
         for x in fx - 20..fx + 20 {

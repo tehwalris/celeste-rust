@@ -50,7 +50,7 @@ while [ $# -ge 2 ]; do
   if [ -n "$UCT_LOG" ]; then echo "$log"; fi
   died=$(echo "$log" | grep -o 'DIED at [^;]*' | head -1 || true)
   err=$(echo "$log" | grep -o 'LUA ERROR: .*' | head -1 || true)
-  # No comma inside the status: tools/category_runner.py parses "STATUS, N inputs".
+  # No comma inside the status: tools/celeste/love.py parses "STATUS, N inputs".
   died=${died//,/ }; err=${err//,/ }
   if [ -n "$err" ]; then st="DID NOT FINISH (${err})"
   elif [ -n "$died" ]; then st="DID NOT FINISH (${died/DIED/died})"

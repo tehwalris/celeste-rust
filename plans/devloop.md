@@ -23,7 +23,7 @@ environment (naming the flag that replaced it). Only `CELESTE_FIXTURES`,
 read by the shell tools, remains. A tree records the settings that change
 it (`<level>/settings.txt`) and refuses a run under other ones
 (`--override-settings` proceeds past a different `--region` only; a tree
-without a record: `rewrite adopt-settings`). Nothing reads a global: the
+without a record is refused). Nothing reads a global: the
 binaries pass the settings (plans/footguns.md, "Follow-ups").
 
 ## The ladder
@@ -117,9 +117,9 @@ Room (6,2) 100% (`--hundred --loading-jank 2
 instructions over 366,186 slices (7,264 a slice: plans/kernel-opt-decisions.md
 measured 2.660G and 7,264). frame-r62h57 8.2-11.1 s (kernels 4.1 s, the f56
 tree 0.6 s, the wave 2.2 s, 37M-state visited set copied per rep);
-storage-r62h57 3.0-5.8 s (`bench-storage` of the 12 GB capture: units
-1.23 s, translation 0.16 s, layer 0.11 s, edge file 0.11 s at 16 threads,
-format 12).
+storage-r62h57 3.0-5.8 s (`bench-storage` of the 12 GB capture: units and
+region jobs 2.1 s, frame end 0.25 s at 16 threads, edge file v6;
+2026-10-11).
 
 ### t3: deliberate, by hand
 
@@ -157,14 +157,14 @@ tree recorded.
 
 | fixture | what | frames | build (load 5-20) | size |
 |---|---|---|---|---|
-| r10 | room (1,0) 200m `r0sxh` | f0-f56; frame 55 -> 56 | 8-14 s | 773 MB |
-| r62h | room (6,2) 100% `r0sxhf`, level -1 (94,5) | f0-f51; frame 50 -> 51 | 62-76 s (the table ~60 s of it) | 2.7 GB |
-| r42n | room (4,2) 2100m `r0sxhn`, level -1 (71,5) | f0-f61; frame 60 -> 61 | 18-28 s | 450 MB |
-| r42x | room (4,2) `r0sxh` (objects exact), level -1 | f0-f56 | 9-16 s | 140 MB |
-| r10arc | room (1,0) `search --level r0sxh --to 56 --win-at 40,64` | the level-0 tree to h56 | 9-15 s | 773 MB |
+| r10 | room (1,0) 200m `r0sxh` | f0-f56; frame 55 -> 56 | 8-14 s | 61 MB |
+| r62h | room (6,2) 100% `r0sxhf`, level -1 (94,5) | f0-f51; frame 50 -> 51 | 62-76 s (the table ~60 s of it) | 280 MB |
+| r42n | room (4,2) 2100m `r0sxhn`, level -1 (71,5) | f0-f61; frame 60 -> 61 | 18-28 s | 43 MB |
+| r42x | room (4,2) `r0sxh` (objects exact), level -1 | f0-f56 | 9-16 s | 17 MB |
+| r10arc | room (1,0) `search --level r0sxh --to 56 --win-at 40,64` | the level-0 tree to h56 | 9-15 s | 61 MB |
 | cap-r10 | r10's f56 emissions (`--emit-capture`) | f56 | 2-3 s | 518 MB |
-| r60s | room (6,0) 700m `r0sxhfp`, split frame | steps 0-71; 70 -> 71 | 26-33 s | 186 MB |
-| r62h57 (big) | room (6,2) 100%, as r62h | f0-f57; the reference frame 56 -> 57 | 143-151 s | 8.1 GB |
+| r60s | room (6,0) 700m `r0sxhfp`, split frame | steps 0-71; 70 -> 71 | 26-33 s | 25 MB |
+| r62h57 (big) | room (6,2) 100%, as r62h | f0-f57; the reference frame 56 -> 57 | 143-151 s | 0.9 GB |
 | cap-r62h57 (big) | its f57 capture | f57 | 12-14 s | 12 GB |
 
 All of `all`: 2:37 at load 5-15 (most of it r62h's table); `big` 2:38. Using a fixture
@@ -178,16 +178,17 @@ visited states), 0.62 s (r62h57 f56, 37M).
   (`ForwardState::at`: visited set, transfers, level -1 filter, pos graph;
   later frames ignored), the wave of F+1 run `--reps` times from copies.
   stdout: `f{F+1}` and `e{F+1}` lines (`ckhash --edges`'s); stderr per rep:
-  the wave, translation and layer + edge file walls, the workers' phases
-  (`[phases]`: pack, kernel, emit, unit end, translate, layer), `kernel
-  lanes: traced N missed 0` (a miss is an error).
+  the wave (with the region jobs' worker time inside it) and the frame
+  end's walls, the workers' phases (`[phases]`: pack, kernel, emit, unit
+  end, regions, frame end), `kernel lanes: traced N missed 0` (a miss is
+  an error).
 - `rewrite bench-backward --level-dir D --horizon H --frame F [--reps N]
   [--win-at X,Y] [--threads T]`: the edge files opened (timed), W pushed
   down to F+1, then the step to W_F `--reps` times from a copy: read, pull
   and merge walls, and the gate's `[gate] hH W fF count hash` line. (Each
   step of the push prints its `[arc] fNNN` line.)
-- `rewrite bench-storage --capture DIR/fF --tree D` (unchanged): the units,
-  translation, layer and edge file of a captured frame, without kernels.
+- `rewrite bench-storage --capture DIR/fF --tree D`: the units, region
+  jobs, frame end and edge file of a captured frame, without kernels.
   Small capture: cap-r10 (518 MB); big: cap-r62h57 (12 GB).
 - `rewrite ref-check` and `rewrite arc-check`: now `--threads` (a reference
   engine per worker), `--path-cap N` (a sample whose reference step forks
@@ -226,16 +227,14 @@ exits non-zero; `./check.sh t1 --pin` re-pins. Keys:
 - `calls.*`: kernel calls, rows, slice-lanes, (body, slice) evaluations and
   those that took a lane, lane emissions and those after the dedup cache,
   lanes missed;
-- `frame.*`: lanes in, emissions, states kept, units, requests, lids, edges;
-- `approx.frame.edge_bytes`, `approx.frame.edge_millibytes_per_edge`: NOT
-  exact (a unit's block is encoded during the wave with its worker's local
-  transfer ids, whose varint lengths depend on which units it ran first:
-  28 bytes in 41.8 MB between two runs); compared within 0.5%.
+- `frame.*`: lanes in, emissions, states kept, units, slices, routes,
+  edges, bundles, the edge file's bytes and millibytes an edge (exact: a
+  segment is a function of its (route, slice)'s units, the transfer ids
+  global and canonical).
 
-Exact at a fixed thread count (the units, so the slices and calls, follow
-the workers); `check.sh` uses 16. Checked: identical run to run, and at 8
-against 16 threads for room (1,0) f44 (whose units are the 1024-lane
-minimum either way). The census costs the build ~0.6 s for room (6,0)'s
+The same at every thread count since the edges target (2026-10-11: a
+unit is a 256th of the frame, not of the workers): `check.sh t1` at 8 and
+at 16 threads gives the same metrics, f/e lines and edge files. The census costs the build ~0.6 s for room (6,0)'s
 918 kernels (2.1 against 1.5 s of assembly).
 
 ## Costs measured

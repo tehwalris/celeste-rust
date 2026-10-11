@@ -1,6 +1,7 @@
 //! The RESOLVER of a state id to its `(shape, key, cell)` from the storage
-//! metadata (no frame file read): the arc phase's fingerprints, marks files
-//! and node keys.
+//! metadata (no frame file read): loading a layer's frame file (its rows
+//! decoded from the keys), the known-route check, the UI export and the
+//! diagnostics that name states by id.
 
 use anyhow::{Context, Result};
 use rustc_hash::FxHashMap;
@@ -71,6 +72,24 @@ impl Resolver {
         shapes.sort_unstable();
         anyhow::ensure!(shapes.iter().enumerate().all(|(i, s)| s.0 as usize == i), "{}: the shapes are not numbered 0..{}", dir.display(), shapes.len());
         Ok((shapes.into_iter().map(|s| s.1).collect(), entries, space))
+    }
+
+    /// The tree's shapes by index.
+    pub fn shapes(&self) -> &[u64] {
+        &self.shapes
+    }
+
+    /// `id` as a state (`Sk`: region, key, cell).
+    pub fn sk(&self, id: StateId) -> Result<super::Sk> {
+        Ok(super::Sk { region: id_region(id), key: self.resolve(id)?.1, local: super::id_local(id) as u8 })
+    }
+
+    /// A state's id (its region's entry holding its key; a search of the
+    /// region's entries: diagnostics).
+    pub fn id_of(&self, s: super::Sk) -> Result<StateId> {
+        let Keys::Dense(keys) = &self.keys else { anyhow::bail!("id_of needs every entry's key (Resolver::load)") };
+        let e = keys.get(&s.region).and_then(|v| v.iter().position(|&k| k == s.key)).with_context(|| format!("state {}: no entry", s.show()))?;
+        Ok(super::state_id(s.region, e as u32, s.local as u32))
     }
 
     /// `id`'s `(shape, key, cell)`.

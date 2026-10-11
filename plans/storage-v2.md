@@ -1,9 +1,15 @@
 # Storage v2: posmask regions, region ids, source-side edges (2026-10-10)
 
+> The EDGE side of this plan (source-side unit blocks, lids, the owner
+> index, claims, the translation) was replaced on 2026-10-11 by
+> plans/edges-target.md (ID-free bundles in their target regions, the
+> routed forward). The visited set, the ids of the layers' frame files and
+> the metadata are as below.
+
 The plan for replacing the door, the queues, the unit row cache, the raw
-edge records and the inversion with ONE storage system; the running log is
+edge records and the inversion with ONE storage system; the running log was
 `PROGRESS.md` at the worktree root (branch `storage-v2`, from `fg-2300`
-cc83334). Research: branch `emit-capture`, `bench/dedup/DESIGNS.md` A-N3.
+cc83334; deleted 2026-10-11, in the history). Research: branch `emit-capture`, `bench/dedup/DESIGNS.md` A-N3.
 
 ## What it replaces, consumer by consumer
 

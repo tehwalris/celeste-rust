@@ -1,5 +1,67 @@
 > STALE in parts: dated sections, newest first, each measured on the code of its date (before 2026-08-31: the deleted pre-rebuild search; plans/ links may name merged or deleted docs, see plans/architecture.md "Where the old plans went") - re-measure before relying on a number.
 
+# Edges target, 2026-10-11 (16 threads, branch `edges-target`)
+
+ID-free edge bundles stored in their target regions, the routed forward
+(plans/edges-target.md), against develop e7e9f78 (`/var/tmp/tgt-base`). A
+shared machine at load 9-45 (other agents' runs) throughout: whole-search
+walls moved 1.5-2x within one run as the load did; the per-frame A/B
+(interleaved) is the comparison to trust. Every pair below has the same
+optimum, witness and `[gate]` lines, and the known route survives.
+
+**The reference frame** (6,2) 100% f56 -> f57 (`bench-frame --edges`,
+level -1 94,5, quick profile; 3 interleaved rounds of 2 reps, load 36-39;
+the f/e lines identical):
+
+| | frame total | wave | storage outside the wave | worker-s | edge file |
+|---|---|---|---|---|---|
+| develop | 4.32-5.64 s (median 4.56) | 3.53-4.80 s | translate 0.20-0.40, layer + edge file 0.20-0.37 | 66-87 (unit end 5.6-8.7) | 3.15 B an edge |
+| edges target | 4.24-4.99 s (median 4.50) | 3.27-4.39 s | frame end 0.26-0.39 | 62-77 (unit end 1.6-2.4, region jobs 5.0-7.7) | 0.113 B (29 MB) |
+
+At 8dcaa56 (the first routed version) the coordinator measured 12.0-14.7 s
+against develop's 8.4-9.7 s, the region phase 31-39 worker-s: a routed
+bundle table probed per record (DRAM-bound), per-bundle key hashing and a
+block sort, a transfer merge re-hashing each worker's whole table every
+slice, and barriers between slices. Now: unit-local bundles, dense target
+ranks and grouping instead of sorting, each worker's new pairs merged
+once, one pipeline a frame. `bench-storage` (the capture, no kernels):
+units 2.1 s, frame end 0.25 s.
+
+**End to end** (`rewrite search`, release, the tree built from nothing;
+round a: develop first, load 9-23 (the edges target's frame end not yet
+fixed, 11.5 s of frame end in (1,0)); round b: edges target first, load
+17-45):
+
+| case | run | wall a / b | user CPU a / b | peak a / b | tree | of it edges | backward, level 0 |
+|---|---|---|---|---|---|---|---|
+| room (1,0) `--ceiling 99` | develop | 118.9 / 97.1 s | 1274 / 1233 s | 3.55 / 3.78 GB | 28 GB | 26 GB | 2.83 / 1.74 s |
+| | edges target | 135.7 / 112.7 s | 1562 / 1363 s | 3.43 / 3.37 GB | 2.4 GB | 517 MB | 2.81 / 2.05 s |
+| room (6,2) 100% `r0sxhf,r0sxh --ceiling 94` | develop | 304 / 357 s | 2990 / 3064 s | 8.15 / 8.18 GB | 45 GB | 39 GB | 3.74 / 6.12 s |
+| | edges target | 241 / 389 s | 2956 / 3209 s | 7.64 / 7.83 GB | 7.6 GB | 1.6 GB | 1.65 / 2.28 s |
+| room (4,2) `r0sxhn,r0sxh --ceiling 71` | develop | 11.0 / 12.8 s | 86 / 93 s | 0.91 / 0.92 GB | 546 MB | 465 MB | 0.77 / 0.79 s |
+| | edges target | 9.9 / 12.6 s | 80 / 93 s | 0.90 / 0.91 GB | 103 MB | 23 MB | 1.22 / 1.11 s |
+
+Room (1,0) frame by frame (round b): in the stretches where the load held
+still the edges target took 400-480 ms a million lanes against develop's
+430-470; its slow stretch (f45-f72, ~700) was the load's (the same frames
+ran at ~450 in round a). The backward reads more on small trees: a step
+decodes a (target region, frame)'s whole blocks, so (4,2) parsed 66.7M
+bundles for 19.9M in-edges (develop read 0.17 GB of lids and owner
+entries), read 0.47 against 0.29 s; on (6,2) 100% it is 2.3-2.7x faster.
+Skipping a block without changed targets (1452 of 5827 in (4,2)) saved
+nothing measurable and was not kept.
+
+**Trees** (fixtures, `du`): r10 464 -> 61 MB, r42n 232 -> 43 MB, r42x 71
+-> 17 MB, r60s 59 -> 25 MB, r62h 1.5 GB -> 280 MB, r62h57 5.1 GB -> 901
+MB. What r62h57 holds now: frames 403 MB (the id pieces 351, metadata 52),
+edges 136 MB, level -1 drop notes 398 MB.
+
+**Page faults** (`MIMALLOC_PURGE_DELAY`, safe-run's 0 against mimalloc's
+10 ms; not changed): the reference frame 6.7M -> 2.2M faults over 3 reps,
+the frame ~8% faster, peak 4.22 -> 4.42-4.66 GB; the (4,2) backward 402k
+-> 35k faults, CPU 8.3 -> 6.7 s. In the code: a unit's bucket vectors kept
+for the next unit took the frame's 6.8M to 4.3M.
+
 # Storage v2, 2026-10-10 (release, 16 threads, branch `storage-v2`)
 
 Posmask regions, region ids, source-side edge files; no door, no inversion

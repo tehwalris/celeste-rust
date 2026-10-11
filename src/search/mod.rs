@@ -8,6 +8,7 @@
 //!   * `known`      - a known solution checked against every pruning step
 //!   * `beam`       - `rewrite beam`: ANY route by a beam search (not a proof)
 //!   * `pos_graph`  - player-position cells and the position graph
+//!   * `result`     - `result.json`: what a search decided, as a record
 //!   * `inspect`    - rows read by named fields, for the diagnostics
 //!   * `ui_export`  - `rewrite export-ui`: a finished run -> the web UI's data
 pub mod arc_dp;
@@ -18,4 +19,5 @@ pub mod checkpoint;
 pub mod inspect;
 pub mod known;
 pub mod pos_graph;
+pub mod result;
 pub mod ui_export;

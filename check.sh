@@ -19,8 +19,8 @@
 # (gates/fixtures/) instead of comparing: only on evidence, and say why in
 # the commit. Timings are reported, never pinned. Builds the quick binary
 # first. Env: CARGO_TARGET_DIR, CELESTE_FIXTURES, CHECK_DIR (t2's scratch,
-# default /var/tmp/celeste-check), THREADS (default 16: the metrics' units
-# and slices depend on it).
+# default /var/tmp/celeste-check), THREADS (default 16; the metrics are the
+# same at every thread count).
 set -uo pipefail
 cd "$(dirname "$0")"
 TIER=${1:-}

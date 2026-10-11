@@ -1,23 +1,22 @@
-//! ONE UNIT of a wave (plans/storage-v2.md "The forward wave"): a run of
-//! frontier rows through the kernels, every emission against the visited
-//! set. The sink (`UnitSink`, one per worker, reset per unit) names each
-//! distinct target entry by a LID - (target shape, region slot, key) - and
-//! looks it up in the visited set ONCE (read-only during the wave), keeping
-//! the owner's entry number and cell mask: an emission into a cell the owner
-//! holds is an old state (an edge only); any other is a REQUEST, its row
-//! copied (the only copy), unless the unit requested that cell already. The
-//! edges `(lid, cell, source, transfer)` are sorted and encoded into the
-//! unit's block at its end (`edges::encode_block`); the translation
-//! (`wave`) gives the lids their owners.
+//! ONE UNIT of a wave (plans/edges-target.md "The forward"): a run of
+//! frontier rows through the kernels. The sink (`UnitSink`, one per worker,
+//! reset per unit) ORs each emission into its BUNDLE of its target's route
+//! (`route::UnitBundles`: source key, transfer, offset, target key ->
+//! target cells) - nothing is looked up and no row is copied here: the
+//! target region's worker dedups the states and merges the edges
+//! (`route::run_route`), and the new layer is decoded from the keys
+//! (`wave`). At the unit's end its bundles are the chunks of their routes.
 
 use anyhow::Result;
 use celeste_core::pico8_num::Pico8Num as P8;
 use celeste_engine::runtime2::{Col, Rt2, AV};
+use rustc_hash::{FxHashMap, FxHashSet};
 
+use super::decode::Skeletons;
+use super::route::{Chunk, Routes, Sources, UnitBundles, NO_XFER};
 use super::visited::{Key, VisitedSet};
-use celeste_engine::exact::{is_provisional, slot_hash, KeySpace, Provisional, RowKey};
-use super::{Geometry, StateId};
 use crate::frame::{Filters, Raised};
+use celeste_engine::exact::{is_provisional, KeySpace, Provisional, RowKey};
 
 /// A typed varying column of buffered rows: raw 16.16 words, (low, high)
 /// pairs, or a byte per bool (0 false, 1 true, 2 unknown).
@@ -29,7 +28,8 @@ pub enum TCol {
 
 /// Rows of one shape, columnar: the shape's skeleton (the union of its
 /// outcome templates' varying cells), a `TCol` per varying cell, key and
-/// cell per row. A unit buffers its requested rows here.
+/// cell per row. A unit buffers rows here only to look at them: the
+/// coarser level's verdicts, the key check, the decode guard.
 pub struct RowBuf {
     pub shape: u64,
     skeleton: Rt2,
@@ -60,19 +60,9 @@ impl RowBuf {
         self.keys.len()
     }
 
-
-    /// Bytes allocated for the rows (capacities).
-    pub fn alloc_bytes(&self) -> usize {
-        self.cols
-            .iter()
-            .map(|(_, c)| match c {
-                TCol::Num(v) => v.capacity() * 4,
-                TCol::Ival(v) => v.capacity() * 8,
-                TCol::Bool(v) => v.capacity(),
-            })
-            .sum::<usize>()
-            + self.keys.capacity() * 16
-            + self.cells.capacity() * 4
+    /// The buffer's skeleton (its shape's).
+    pub fn skeleton(&self) -> &Rt2 {
+        &self.skeleton
     }
 
     /// Drop the rows, keeping the skeleton and the columns' capacity.
@@ -88,8 +78,8 @@ impl RowBuf {
         self.cells.clear();
     }
 
-    /// An empty block of this shape for the rows to land in.
-    fn empty_piece(&self) -> Rt2 {
+    /// The whole buffer as a block.
+    pub fn to_rt2(&self) -> Rt2 {
         let mut b = celeste_engine::slots::reshape(&self.skeleton, 0);
         b.cols = self
             .skeleton
@@ -103,161 +93,28 @@ impl RowBuf {
             })
             .collect();
         b.shape_hash = self.shape;
-        b
-    }
-
-    /// Append `rows` to `piece` (same shape); cells it holds differently go
-    /// through `col_push`.
-    fn gather_into(&self, piece: &mut Rt2, rows: &[u32]) {
-        use celeste_engine::runtime2::col_push;
-        let w = piece.width;
-        let mut ti = 0;
-        for (cell, c) in self.skeleton.cols.iter().enumerate() {
-            if !matches!(piece.structure[cell], celeste_engine::runtime2::Cell2::Val) {
-                continue;
-            }
-            let typed = if ti < self.cols.len() && self.cols[ti].0 == cell {
-                ti += 1;
-                Some(&self.cols[ti - 1].1)
-            } else {
-                None
-            };
-            let dst = &mut piece.cols[cell];
-            match (typed, c) {
-                (None, Col::U(v)) => {
-                    if !matches!(dst, Col::U(d) if d == v) {
-                        for (n, _) in rows.iter().enumerate() {
-                            col_push(dst, w + n, *v);
-                        }
-                    }
-                }
-                (None, _) => unreachable!("a non-uniform skeleton column without a typed column"),
-                (Some(TCol::Num(v)), _) => match dst {
-                    Col::N(d) => d.extend(rows.iter().map(|&r| P8::from_raw(v[r as usize] as i32))),
-                    _ => {
-                        for (n, &r) in rows.iter().enumerate() {
-                            col_push(dst, w + n, AV::Num(P8::from_raw(v[r as usize] as i32)));
-                        }
-                    }
-                },
-                (Some(TCol::Ival(v)), _) => match dst {
-                    Col::I(d) => d.extend(rows.iter().map(|&r| {
-                        let (a, b) = v[r as usize];
-                        (P8::from_raw(a as i32), P8::from_raw(b as i32))
-                    })),
-                    _ => {
-                        for (n, &r) in rows.iter().enumerate() {
-                            let (a, b) = v[r as usize];
-                            col_push(dst, w + n, AV::Ival(P8::from_raw(a as i32), P8::from_raw(b as i32)));
-                        }
-                    }
-                },
-                (Some(TCol::Bool(v)), _) => {
-                    let av = |r: u32| match v[r as usize] {
-                        0 => AV::Bool(false),
-                        1 => AV::Bool(true),
-                        _ => AV::UBool,
-                    };
-                    match dst {
-                        Col::V(d) => d.extend(rows.iter().map(|&r| av(r))),
-                        _ => {
-                            for (n, &r) in rows.iter().enumerate() {
-                                col_push(dst, w + n, av(r));
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        piece.row_keys.extend(rows.iter().map(|&r| self.keys[r as usize]));
-        piece.width = w + rows.len();
-    }
-
-    /// The whole buffer as a block.
-    pub fn to_rt2(&self) -> Rt2 {
-        self.rows_rt2(&(0..self.rows() as u32).collect::<Vec<_>>())
-    }
-
-    /// `rows` as a block.
-    pub fn rows_rt2(&self, rows: &[u32]) -> Rt2 {
-        let mut b = self.empty_piece();
-        self.gather_into(&mut b, rows);
-        b
-    }
-
-    /// Do `self` and `other` lay rows out alike: the same skeleton values
-    /// and the same typed cells (a shape's buffers from one engine do)?
-    pub fn same_layout(&self, other: &RowBuf) -> bool {
-        self.skeleton.cols == other.skeleton.cols && self.cols.len() == other.cols.len() && self.cols.iter().zip(&other.cols).all(|(a, b)| a.0 == b.0)
-    }
-
-    /// The rows `rows` (`(buffer, row)` into `bufs`, one shape, one layout:
-    /// `same_layout`) as one block, every column canonical
-    /// (`collapse_uniform`): a function of the rows' values.
-    pub fn gather_rows(bufs: &[&RowBuf], rows: &[(u32, u32)]) -> Rt2 {
-        use celeste_engine::runtime2::collapse_uniform;
-        let t = bufs[0];
-        debug_assert!(bufs.iter().all(|b| b.same_layout(t)));
-        let mut piece = t.empty_piece();
-        for (k, (cell, tcol)) in t.cols.iter().enumerate() {
-            let col = match tcol {
-                TCol::Num(_) => Col::N(
-                    rows.iter()
-                        .map(|&(b, r)| match &bufs[b as usize].cols[k].1 {
-                            TCol::Num(v) => P8::from_raw(v[r as usize] as i32),
-                            _ => unreachable!("one layout"),
-                        })
-                        .collect(),
-                ),
-                TCol::Ival(_) => Col::I(
-                    rows.iter()
-                        .map(|&(b, r)| match &bufs[b as usize].cols[k].1 {
-                            TCol::Ival(v) => {
-                                let (a, c) = v[r as usize];
-                                (P8::from_raw(a as i32), P8::from_raw(c as i32))
-                            }
-                            _ => unreachable!("one layout"),
-                        })
-                        .collect(),
-                ),
-                TCol::Bool(_) => Col::V(
-                    rows.iter()
-                        .map(|&(b, r)| match &bufs[b as usize].cols[k].1 {
-                            TCol::Bool(v) => match v[r as usize] {
-                                0 => AV::Bool(false),
-                                1 => AV::Bool(true),
-                                _ => AV::UBool,
-                            },
-                            _ => unreachable!("one layout"),
+        for (cell, col) in &self.cols {
+            b.cols[*cell] = match col {
+                TCol::Num(v) => Col::N(v.iter().map(|&x| P8::from_raw(x as i32)).collect()),
+                TCol::Ival(v) => Col::I(v.iter().map(|&(a, c)| (P8::from_raw(a as i32), P8::from_raw(c as i32))).collect()),
+                TCol::Bool(v) => Col::V(
+                    v.iter()
+                        .map(|&x| match x {
+                            0 => AV::Bool(false),
+                            1 => AV::Bool(true),
+                            _ => AV::UBool,
                         })
                         .collect(),
                 ),
             };
-            piece.cols[*cell] = collapse_uniform(col);
         }
-        piece.row_keys = rows.iter().map(|&(b, r)| bufs[b as usize].keys[r as usize]).collect();
-        piece.width = rows.len();
-        piece
+        b.row_keys = self.keys.clone();
+        b.width = self.rows();
+        b
     }
 
-    /// Do rows `a` and `b` hold the same values (key and cell included)?
-    pub fn same_row(&self, a: u32, other: &RowBuf, b: u32) -> bool {
-        let (a, b) = (a as usize, b as usize);
-        self.keys[a] == other.keys[b]
-            && self.cells[a] == other.cells[b]
-            && self.cols.len() == other.cols.len()
-            && self.cols.iter().zip(&other.cols).all(|((ca, x), (cb, y))| {
-                ca == cb
-                    && match (x, y) {
-                        (TCol::Num(x), TCol::Num(y)) => x[a] == y[b],
-                        (TCol::Ival(x), TCol::Ival(y)) => x[a] == y[b],
-                        (TCol::Bool(x), TCol::Bool(y)) => x[a] == y[b],
-                        _ => false,
-                    }
-            })
-    }
-
-    /// Push one materialized row (the reference engine's path).
+    /// Push one materialized row (the reference engine's path): each typed
+    /// cell's value, of its column's kind.
     pub fn push_row(&mut self, row: &Rt2, key: Key, cell: u32) {
         debug_assert_eq!(row.width, 1);
         for (c, col) in self.cols.iter_mut() {
@@ -276,19 +133,6 @@ impl RowBuf {
     }
 }
 
-/// A unit's name for one target entry. Its OWNER (`UnitOut::owners`) is
-/// found in the visited set when the lid is made, or given by the
-/// translation.
-#[derive(Clone, Copy, Debug)]
-pub struct Lid {
-    pub shape: u64,
-    pub slot: u32,
-    pub key: Key,
-}
-
-/// No owner (yet).
-pub const NONE: u32 = u32::MAX;
-
 /// A target's verdict under the coarser level's filter (`UnitSink::decide`).
 const VERDICT_PENDING: u8 = 0;
 const VERDICT_YES: u8 = 1;
@@ -296,127 +140,26 @@ const VERDICT_NO: u8 = 2;
 /// Rows awaiting a verdict before a batch is decided.
 const VERDICT_BATCH: usize = 1024;
 
-/// A lid's owner `(region, entry)` packed in a u64 (`NO_OWNER`: none).
-#[inline]
-pub fn pack_owner(region: u32, entry: u32) -> u64 {
-    (region as u64) << 32 | entry as u64
-}
-
-pub const NO_OWNER: u64 = u64::MAX;
-
-/// A unit's lid owner while the unit runs: no owner, and another unit
-/// claimed one of its states (`Claims`).
-const PENDING: u64 = u64::MAX - 1;
-
-/// A cell of a lid the unit asked the translation to add: its row is row
-/// `row` of the unit's buffer `buf`.
-#[derive(Clone, Copy, Debug)]
-pub struct Request {
-    pub lid: u32,
-    pub local: u32,
-    pub buf: u32,
-    pub row: u32,
-}
-
-/// A finished unit: its sources, lids, requests, rows and edge block.
-pub struct UnitOut {
-    pub worker: u32,
-    /// The frontier rows the unit ran, by lane from its first (edges name a
-    /// source by its index here); and where they are rows `first..` of the
-    /// previous layer's file `seq`, `(seq, first)` (the edge file stores
-    /// that instead of the ids).
-    pub sources: Vec<StateId>,
-    pub source_rows: Option<(u32, u32)>,
-    pub lids: Vec<Lid>,
-    /// Per lid its owner (`pack_owner`, `NO_OWNER`): set once, by the
-    /// translation's worker of the lid's region where the visited set had
-    /// none.
-    pub owners: Vec<std::sync::atomic::AtomicU64>,
-    pub requests: Vec<Request>,
-    /// Lids without an owner whose state another unit claimed (`Claims`).
-    pub pending: Vec<u32>,
-    pub bufs: Vec<RowBuf>,
-    /// The encoded edges (`edges::encode_block`): in the worker's blocks
-    /// file at `block_at` (the wave's), or here (`block`); its length, per
-    /// lid its edges' start, its edge count.
-    pub block_at: Option<u64>,
-    pub block_len: u64,
-    pub block: Vec<u8>,
-    /// The unit's transfers by use: an edge's transfer field is its rank
-    /// here, which holds the worker's id.
-    pub xfers: Vec<u32>,
-    pub starts: Vec<u32>,
-    pub edges: u64,
-}
-
-/// The states requested in a wave, across its units: the first unit to
-/// request one copies its row and hands it to the translation; another
-/// unit's lid of it finds it after the translation (`wave::resolve_lids`).
-/// Under `--key-check` every request goes through, so the
-/// translation compares their rows.
-pub struct Claims {
-    shards: Vec<std::sync::Mutex<rustc_hash::FxHashSet<(u64, u32, Key, u32)>>>,
-}
-
-impl Default for Claims {
-    fn default() -> Self {
-        Claims { shards: (0..CLAIM_SHARDS).map(|_| Default::default()).collect() }
-    }
-}
-
-const CLAIM_SHARDS: usize = 1 << 12;
-
-impl Claims {
-    /// Is this the first request of `(shape, slot, key, cell)` this wave?
-    #[inline]
-    pub fn claim(&self, shape: u64, slot: u32, key: Key, local: u32) -> bool {
-        let h = slot_hash(key) ^ celeste_engine::runtime2::mix64(shape ^ (slot as u64) << 8 ^ (local as u64) << 40);
-        self.shards[(h >> 52) as usize & (CLAIM_SHARDS - 1)].lock().expect("a claims shard").insert((shape, slot, key, local))
-    }
-}
-
-/// Bits of a packed edge (`lid | cell | source | transfer`, a u64 that sorts
-/// by target): see `pack_edge`.
-const LID_BITS: u32 = 20;
-const LOCAL_BITS: u32 = 8;
-const SRC_BITS: u32 = 13;
-const XFER_BITS: u32 = 23;
-/// Lanes a unit may span (its sources' indices fit `SRC_BITS`).
-pub const MAX_UNIT_LANES: usize = 1 << SRC_BITS;
-
-#[inline]
-pub fn pack_edge(lid: u32, local: u32, src: u32, xfer: u32) -> u64 {
-    (lid as u64) << (LOCAL_BITS + SRC_BITS + XFER_BITS) | (local as u64) << (SRC_BITS + XFER_BITS) | (src as u64) << XFER_BITS | xfer as u64
-}
-
-#[inline]
-pub fn unpack_edge(e: u64) -> (u32, u32, u32, u32) {
-    (
-        (e >> (LOCAL_BITS + SRC_BITS + XFER_BITS)) as u32,
-        (e >> (SRC_BITS + XFER_BITS)) as u32 & ((1 << LOCAL_BITS) - 1),
-        (e >> XFER_BITS) as u32 & ((1 << SRC_BITS) - 1),
-        e as u32 & ((1 << XFER_BITS) - 1),
-    )
-}
-
 /// Entries of `UnitSink::xfer_id_raw`'s cache.
 const XFER_CACHE: usize = 1 << 12;
 
-/// What a raise's units need beyond a wave's: the layer of every state, to
-/// refuse a hit from a later layer (`StateLayers`).
-pub struct RaiseCtx<'a> {
+/// What a raise's units need beyond a wave's: which sources are the tree's.
+#[derive(Clone, Copy)]
+pub struct RaiseCtx {
     pub raised: Raised,
-    pub layers: &'a super::wave::StateLayers,
 }
+
+/// A (route, key, cell) target as the coarser level's verdicts name it.
+type Target = (u32, Key, u8);
 
 /// One worker's sink for a frame's units (module doc).
 pub struct UnitSink<'a> {
-    visited: &'a VisitedSet,
-    claims: &'a Claims,
+    keys: &'a KeySpace,
+    routes: &'a Routes,
+    skeletons: &'a Skeletons,
     /// The wave's provisional keys (states holding a code the key space
     /// lacks: new by construction).
     prov: &'a Provisional,
-    geo: Geometry,
     filters: Filters<'a>,
     frame: u32,
     /// The level the wave runs at (a reference row's key view).
@@ -424,46 +167,42 @@ pub struct UnitSink<'a> {
     pub worker: u32,
     note_drops: bool,
     drops: Option<&'a super::wave::DropNotes>,
-    raise: Option<RaiseCtx<'a>>,
+    raise: Option<RaiseCtx>,
     record_edges: bool,
-    /// The unit's: its block's index in the frontier, first lane, sources.
+    /// The unit's: its index, its block's index in the frontier, first
+    /// lane, and the block's first row's index in the wave's frontier.
+    unit: u32,
     block: u32,
     lo: usize,
-    sources: Vec<StateId>,
-    source_rows: Option<(u32, u32)>,
+    src_base: u32,
     /// Are the unit's sources the tree's (a raise; not the raise's own)?
     pub sources_old: bool,
     /// Lanes of the block being run that must not be expanded.
     pub skip_in: Option<&'a [bool]>,
-    lids: Vec<Lid>,
-    /// Per lid its owner where the visited set has it (`pack_owner`).
-    lid_owners: Vec<u64>,
-    /// Per lid, `2 * words`: the owner's mask at the wave's start, then the
-    /// cells this unit requested.
-    lid_masks: Vec<u64>,
-    lid_index: Vec<u32>,
-    edges: Vec<u64>,
-    /// The end's counting sort: per lid its edges' start, and the sorted edges.
-    sort_at: Vec<u32>,
-    sorted: Vec<u64>,
-    /// The end's transfer ranks: per worker id its count, then its rank;
-    /// the last unit's distinct transfers (a capacity).
-    xfer_use: Vec<u32>,
-    last_used: usize,
-    requests: Vec<Request>,
-    bufs: Vec<RowBuf>,
-    /// Per (lid, cell) the coarser level's verdict (`MarkFilter`), once a unit.
-    /// `VERDICT_*` per (lid, cell): the coarser level's filter, decided in
-    /// batches (a projection per block, not per row).
-    verdicts: rustc_hash::FxHashMap<u64, u8>,
-    /// The rows awaiting a verdict, per shape, and their (lid, cell)s.
+    /// This worker's routes, and the last one asked.
+    route_ids: FxHashMap<(u64, u32), u32>,
+    last_route: (u64, u32, u32),
+    /// The wave's frontier as sources (`None`: no edges recorded).
+    sources: Option<&'a Sources>,
+    /// The unit's bundles by route, and its (route, source region) pairs.
+    bundles: UnitBundles,
+    src_regions: Vec<(u32, u32)>,
+    /// The unit's distinct sources (shape, key), and per lane from its
+    /// first its index there.
+    unit_sources: Vec<(u32, Key)>,
+    src_local: Vec<u32>,
+    src_idx: rustc_hash2::FxHashMap<(u32, Key), u32>,
+    /// Per target the coarser level's verdict (`MarkFilter`), once a unit,
+    /// decided in batches (a projection per block, not per row).
+    verdicts: rustc_hash2::FxHashMap<Target, u8>,
+    /// The rows awaiting a verdict, per shape, and their targets.
     scratch: Vec<RowBuf>,
-    scratch_at: Vec<Vec<u64>>,
-    /// Some (lid, cell) of the unit was disallowed: its edges and requests
-    /// go at the unit's end.
+    scratch_at: Vec<Vec<Target>>,
+    /// Some target of the unit was disallowed: its records go at the
+    /// unit's end.
     disallowed: bool,
-    /// `--key-check`: every emission's row, checked in batches; claims off
-    /// (every unit's copy of a new state reaches the translation).
+    /// `--key-check`: every emission's row, checked in batches (its key,
+    /// and that its key and cell decode to it).
     key_check: bool,
     check: Vec<RowBuf>,
     /// `--phases`: the wave's phase timers (`frame::phases`).
@@ -472,56 +211,60 @@ pub struct UnitSink<'a> {
     /// the same table), resolved once.
     l1: Option<&'static crate::trace::level_minus_one::CostToGo>,
     drop_last: Option<((u64, u32), Option<u32>)>,
-    xfer_ids: rustc_hash::FxHashMap<crate::search::arc_edges::Pair, u32>,
+    xfer_ids: FxHashMap<crate::search::arc_edges::Pair, u32>,
     xfer_cache: Vec<(crate::compiled::asm_kernel::RawWords, u32)>,
-    pub xfer_tab: Vec<crate::search::arc_edges::Pair>,
-    pub outs: Vec<UnitOut>,
+    /// The worker's transfer table (the wave's gather reads it), and its
+    /// length.
+    xfer_tab: &'a std::sync::RwLock<Vec<crate::search::arc_edges::Pair>>,
+    xfer_len: u32,
+    /// The units' chunks.
+    pub outbox: Vec<Chunk>,
     /// Record `edges` (the pos graph) at all.
     pub edges_on: bool,
     /// The distinct pos-graph edges this worker produced.
-    pub pos_edges: rustc_hash::FxHashSet<(u32, u32)>,
-    /// Emissions past level -1 (each one a lookup and an edge).
+    pub pos_edges: FxHashSet<(u32, u32)>,
+    /// Emissions past level -1 (each one a record).
     pub emitted: u64,
-    pub n_requests: u64,
-    pub n_lids: u64,
-    /// Requests another unit had claimed (`Claims`).
-    pub claimed_elsewhere: u64,
-    /// The unit's lids without an owner whose state another unit claimed:
-    /// resolved after the translation (`wave::resolve_lids`).
-    pending: Vec<u32>,
-    /// TSC ticks of the units' ends (sort and encode), `phases`.
-    pub end_ticks: u64,
     /// `--emit-capture`: this worker's stream (`bench`).
     capture: Option<super::bench::CaptureWriter>,
-    /// The shapes this worker noted (`note_shape`).
-    noted: rustc_hash::FxHashSet<u64>,
-    /// The worker's blocks file (`edges::blocks_path`): units' blocks go
-    /// there as they end; `None`: kept in memory.
-    blocks: Option<super::edges::BlockWriter>,
+    /// The shapes this worker noted (`note_shape`), registered
+    /// (`Skeletons`) and checked this frame (`guard`).
+    noted: FxHashSet<u64>,
+    registered: FxHashSet<u64>,
+    guarded: FxHashSet<u64>,
+    /// Inside `emit_row` (the reference engine's rows: no guard, no key
+    /// check), or the emissions come without rows (`bench::Replay`).
+    reference: bool,
+    rowless: bool,
+    /// The last emission's shape, once registered and guarded (0: none).
+    last_shape: u64,
 }
 
 impl<'a> UnitSink<'a> {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         visited: &'a VisitedSet,
-        claims: &'a Claims,
+        routes: &'a Routes,
+        skeletons: &'a Skeletons,
         prov: &'a Provisional,
         filters: Filters<'a>,
         frame: u32,
         level: crate::abstraction::Level,
         worker: u32,
-        record_edges: bool,
+        xfer_tab: &'a std::sync::RwLock<Vec<crate::search::arc_edges::Pair>>,
+        sources: Option<&'a Sources>,
         edges_on: bool,
         drops: Option<&'a super::wave::DropNotes>,
-        raise: Option<RaiseCtx<'a>>,
+        raise: Option<RaiseCtx>,
         s: &crate::settings::Settings,
     ) -> Self {
+        let record_edges = sources.is_some();
         let l1 = filters.minus_one.or(raise.as_ref().map(|r| r.raised.old)).map(|m| m.table(s));
         UnitSink {
-            visited,
-            claims,
+            keys: &visited.keys,
+            routes,
+            skeletons,
             prov,
-            geo: visited.geo,
             filters,
             frame,
             level,
@@ -530,23 +273,20 @@ impl<'a> UnitSink<'a> {
             drops,
             raise,
             record_edges,
+            unit: 0,
             block: 0,
             lo: 0,
-            sources: Vec::new(),
-            source_rows: None,
+            src_base: 0,
             sources_old: false,
             skip_in: None,
-            lids: Vec::new(),
-            lid_owners: Vec::new(),
-            lid_masks: Vec::new(),
-            lid_index: Vec::new(),
-            edges: Vec::new(),
-            sort_at: Vec::new(),
-            sorted: Vec::new(),
-            xfer_use: Vec::new(),
-            last_used: 0,
-            requests: Vec::new(),
-            bufs: Vec::new(),
+            route_ids: FxHashMap::default(),
+            last_route: (0, u32::MAX, u32::MAX),
+            sources,
+            bundles: UnitBundles::default(),
+            src_regions: Vec::new(),
+            unit_sources: Vec::new(),
+            src_local: Vec::new(),
+            src_idx: Default::default(),
             verdicts: Default::default(),
             scratch: Vec::new(),
             scratch_at: Vec::new(),
@@ -558,33 +298,26 @@ impl<'a> UnitSink<'a> {
             drop_last: None,
             xfer_ids: Default::default(),
             xfer_cache: Vec::new(),
-            xfer_tab: Vec::new(),
-            outs: Vec::new(),
+            xfer_tab,
+            xfer_len: 0,
+            outbox: Vec::new(),
             edges_on,
             pos_edges: Default::default(),
             emitted: 0,
-            n_requests: 0,
-            n_lids: 0,
-            claimed_elsewhere: 0,
-            pending: Vec::new(),
-            end_ticks: 0,
             capture: super::bench::CaptureWriter::open(frame, worker, level, s),
             noted: Default::default(),
-            blocks: None,
+            registered: Default::default(),
+            guarded: Default::default(),
+            reference: false,
+            rowless: false,
+            last_shape: 0,
         }
-    }
-
-    /// Stream the units' blocks into `blocks` (the frame's index path's
-    /// worker file) instead of keeping them.
-    pub fn stream_blocks(&mut self, index: &std::path::Path) -> Result<()> {
-        self.blocks = Some(super::edges::BlockWriter::create(&super::edges::blocks_path(index, self.worker))?);
-        Ok(())
     }
 
     /// The tree's key space (read-only during the wave).
     #[inline]
     pub fn keys(&self) -> &'a KeySpace {
-        &self.visited.keys
+        self.keys
     }
 
     /// The wave's provisional keys.
@@ -604,43 +337,54 @@ impl<'a> UnitSink<'a> {
         }
     }
 
-    /// Are edges recorded (an edges dir, ids on the frontier)?
+    /// Are edges recorded (an edges dir, the frontier's sources)?
     #[inline]
     pub fn records_edges(&self) -> bool {
         self.record_edges
     }
 
-    /// Start unit `unit` of the wave: lanes `lo..lo + sources.len()` of
-    /// frontier block `block` (`rows`: rows `(seq, first)..` of the previous
-    /// layer's file `seq`, when the block is that file).
+    /// Start unit `unit` of the wave: lanes `lo..lo + n` of frontier block
+    /// `block`, whose row 0 is row `src_base` of the wave's frontier
+    /// (`route::Sources`; `ids`: the lanes' ids, for the capture).
     #[allow(clippy::too_many_arguments)]
-    pub fn begin(&mut self, unit: u32, block: u32, lo: usize, sources: &[StateId], rows: Option<(u32, u32)>, skip: Option<&'a [bool]>, sources_old: bool) {
-        assert!(sources.len() <= MAX_UNIT_LANES, "a unit of {} lanes: at most {MAX_UNIT_LANES}", sources.len());
+    pub fn begin(&mut self, unit: u32, block: u32, lo: usize, src_base: u32, ids: &[super::StateId], skip: Option<&'a [bool]>, sources_old: bool) {
         if let Some(c) = &mut self.capture {
-            c.unit(unit, block, lo, sources, sources_old);
+            c.unit(unit, block, lo, ids, sources_old);
         }
+        self.unit = unit;
         self.block = block;
         self.lo = lo;
-        self.sources.clear();
-        self.sources.extend_from_slice(sources);
-        self.source_rows = rows;
+        self.src_base = src_base;
         self.skip_in = skip;
         self.sources_old = sources_old;
-        self.lids.clear();
-        self.lid_owners.clear();
-        self.lid_masks.clear();
-        let cap = (sources.len() * 16).next_power_of_two().max(1024);
-        if self.lid_index.len() != cap {
-            self.lid_index = vec![0; cap];
-        } else {
-            self.lid_index.fill(0);
-        }
-        self.edges.clear();
-        self.pending.clear();
-        self.requests.clear();
-        self.bufs = Vec::new();
+        self.bundles.clear();
+        self.src_regions.clear();
         self.verdicts.clear();
         self.disallowed = false;
+        // The unit's sources: its lanes' (shape, key)s, distinct.
+        self.unit_sources.clear();
+        self.src_local.clear();
+        self.src_idx.clear();
+        if let Some(sources) = self.sources {
+            let rows = &sources.rows[src_base as usize + lo..src_base as usize + lo + ids.len()];
+            let mut last: Option<((u32, Key), u32)> = None;
+            for r in rows {
+                let s = (r.shape, r.key);
+                let k = match last {
+                    Some((l, k)) if l == s => k,
+                    _ => {
+                        let n = self.unit_sources.len() as u32;
+                        let k = *self.src_idx.entry(s).or_insert(n);
+                        if k == n {
+                            self.unit_sources.push(s);
+                        }
+                        last = Some((s, k));
+                        k
+                    }
+                };
+                self.src_local.push(k);
+            }
+        }
     }
 
     /// The level -1 filter at EMISSION: `Some(from)` where it drops every
@@ -700,65 +444,35 @@ impl<'a> UnitSink<'a> {
         if let Some(&id) = self.xfer_ids.get(&t) {
             return id;
         }
-        let id = u32::try_from(self.xfer_tab.len()).expect("transfer table past u32");
-        assert!(id < 1 << XFER_BITS, "worker {}: {id} transfers in one frame, past the {XFER_BITS} bits an edge holds", self.worker);
-        self.xfer_tab.push(t);
+        let id = self.xfer_len;
+        assert!(id < NO_XFER, "worker {}: {id} transfers in one frame", self.worker);
+        self.xfer_tab.write().expect("a transfer table").push(t);
+        self.xfer_len += 1;
         self.xfer_ids.insert(t, id);
         id
     }
 
-    /// The lid of `(shape, slot, key)`, made (and looked up in the visited
-    /// set) on first use.
-    #[inline]
-    fn lid(&mut self, shape: u64, slot: u32, key: Key) -> u32 {
-        let words = self.geo.words;
-        let m = self.lid_index.len() - 1;
-        let h = slot_hash(key) ^ celeste_engine::runtime2::mix64(shape ^ (slot as u64) << 7);
-        let mut i = (h as usize) & m;
-        loop {
-            let l = self.lid_index[i];
-            if l == 0 {
-                break;
-            }
-            let x = &self.lids[l as usize - 1];
-            if x.key == key && x.shape == shape && x.slot == slot {
-                return l - 1;
-            }
-            i = (i + 1) & m;
-        }
-        let l = self.lids.len() as u32;
-        assert!(l < 1 << LID_BITS, "a unit with {l} distinct target entries, past the {LID_BITS} bits an edge holds");
-        // A provisional key is a new state: no lookup.
-        let (region, entry) = if is_provisional(key) { (NONE, NONE) } else { self.visited.find(shape, slot, key).unwrap_or((NONE, NONE)) };
-        self.lids.push(Lid { shape, slot, key });
-        self.lid_owners.push(if entry == NONE { NO_OWNER } else { pack_owner(region, entry) });
-        match entry {
-            NONE => self.lid_masks.extend(std::iter::repeat_n(0, 2 * words)),
-            e => {
-                let t = self.visited.table(region).expect("a found entry's table");
-                self.lid_masks.extend_from_slice(t.mask(words, e));
-                self.lid_masks.extend(std::iter::repeat_n(0, words));
-            }
-        }
-        self.lid_index[i] = l + 1;
-        if (self.lids.len() + 1) * 2 > self.lid_index.len() {
-            self.grow();
-        }
-        l
+    /// The transfers this worker has met (its table's length).
+    pub fn xfers_met(&self) -> usize {
+        self.xfer_len as usize
     }
 
-    fn grow(&mut self) {
-        let cap = self.lid_index.len() * 2;
-        self.lid_index = vec![0; cap];
-        let m = cap - 1;
-        for (l, x) in self.lids.iter().enumerate() {
-            let h = slot_hash(x.key) ^ celeste_engine::runtime2::mix64(x.shape ^ (x.slot as u64) << 7);
-            let mut i = (h as usize) & m;
-            while self.lid_index[i] != 0 {
-                i = (i + 1) & m;
-            }
-            self.lid_index[i] = l as u32 + 1;
+    /// The route of `(shape, slot)`.
+    #[inline]
+    fn route(&mut self, shape: u64, slot: u32) -> u32 {
+        if (self.last_route.0, self.last_route.1) == (shape, slot) {
+            return self.last_route.2;
         }
+        let r = match self.route_ids.get(&(shape, slot)) {
+            Some(&r) => r,
+            None => {
+                let r = self.routes.id(shape, slot);
+                self.route_ids.insert((shape, slot), r);
+                r
+            }
+        };
+        self.last_route = (shape, slot, r);
+        r
     }
 
     /// The buffer of `shape` in `bufs` (made over `init()`'s skeleton).
@@ -775,8 +489,9 @@ impl<'a> UnitSink<'a> {
 
     /// ONE EMISSION: the state `(shape, key, cell)` reached from lane `lane`
     /// with transfer `xfer` (`None`: the reference engine's path, no edge).
-    /// `push` appends its row to a buffer when the row is needed (a
-    /// request, a verdict, the key check); `init` is the shape's skeleton.
+    /// `init` is the shape's skeleton (the new layer's rows are decoded
+    /// with it: `Skeletons`); `push` appends the row to a buffer, when the
+    /// row is looked at (a verdict, the key check, the decode guard).
     #[inline]
     #[allow(clippy::too_many_arguments)]
     pub fn emit(
@@ -801,22 +516,38 @@ impl<'a> UnitSink<'a> {
         if let Some(c) = &mut self.capture {
             c.emit(shape, cell, key, (lane - self.lo) as u32, xfer, is_provisional(key).then(|| self.prov.content(key)));
         }
-        if self.key_check {
+        // A shape's first emission (this worker, this wave): its skeleton
+        // registered, and THE DECODE GUARD - its row is what its key and
+        // cell decode to (the new layer is decoded). Looked at only when the
+        // shape is not the last emission's.
+        if shape != self.last_shape {
+            if !self.registered.contains(&shape) {
+                self.skeletons.register(&init())?;
+                self.registered.insert(shape);
+            }
+            self.last_shape = if self.guarded.contains(&shape) { shape } else { 0 };
+        }
+        if self.last_shape != shape && !self.reference && !self.rowless && !is_provisional(key) {
+            let mut b = RowBuf::new(init());
+            push(&mut b);
+            self.skeletons.check_decodes(self.keys, &b.to_rt2(), &[cell])?;
+            self.guarded.insert(shape);
+            self.last_shape = shape;
+        }
+        if self.key_check && !self.reference && !self.rowless {
             let i = Self::buf_of(&mut self.check, shape, &init);
             push(&mut self.check[i]);
             if self.check[i].rows() >= 256 {
-                crate::compiled::asm_kernel::key_check(&self.check[i], &self.visited.keys, self.prov, self.level);
-                self.check[i].clear();
+                self.check_rows(i)?;
             }
         }
-        let words = self.geo.words;
-        let (slot, local) = self.geo.slot_local(cell);
-        let lid = self.lid(shape, slot, key);
+        let (slot, local) = super::GEOMETRY.slot_local(cell);
+        let route = self.route(shape, slot);
         // The coarser level's filter (the objects ladder): once per target,
         // in batches - a target awaiting its verdict is taken as allowed, and
-        // its edges and requests go at the unit's end if it is not.
+        // its records go at the unit's end if it is not.
         if self.filters.marks.is_some() {
-            let at = (lid as u64) << 8 | local as u64;
+            let at: Target = (route, key, local as u8);
             match self.verdicts.get(&at) {
                 Some(&VERDICT_NO) => return Ok(()),
                 Some(_) => {}
@@ -834,44 +565,35 @@ impl<'a> UnitSink<'a> {
                 }
             }
         }
-        let (w, b) = ((local / 64) as usize, 1u64 << (local % 64));
-        let base = lid as usize * 2 * words;
-        if self.lid_masks[base + w] & b != 0 {
-            // An old state; a raise refuses one from a later layer.
-            if let Some(r) = &self.raise {
-                let o = self.lid_owners[lid as usize];
-                let layer = r.layers.layer(super::state_id((o >> 32) as u32, o as u32, local));
-                anyhow::ensure!(
-                    layer <= self.frame,
-                    "frame {}: a state the tree first reached at frame {layer} is reached at frame {}: the raised tree would move it to an earlier layer (the level -1 table is not consistent along this edge), so it cannot be extended exactly - delete the tree",
-                    self.frame,
-                    self.frame
-                );
-            }
-        } else if self.lid_masks[base + words + w] & b == 0 {
-            self.lid_masks[base + words + w] |= b;
-            // Another unit may hold the state's row already: only the
-            // first copies it (`Claims`).
-            if !self.key_check && !self.claims.claim(shape, slot, key, local) {
-                self.claimed_elsewhere += 1;
-                if self.lid_owners[lid as usize] == NO_OWNER {
-                    // Marked pending once: its owner slot says so.
-                    self.lid_owners[lid as usize] = PENDING;
-                    self.pending.push(lid);
+        let bit = 1u64 << local;
+        match (xfer, self.sources) {
+            (Some(x), Some(sources)) => {
+                let s = &sources.rows[self.src_base as usize + lane];
+                if self.src_regions.last() != Some(&(route, s.region)) {
+                    self.src_regions.push((route, s.region));
                 }
-                if let (Some(x), true) = (xfer, self.record_edges) {
-                    self.edges.push(pack_edge(lid, local, (lane - self.lo) as u32, x));
-                }
-                return Ok(());
+                let sl = self.src_local[lane - self.lo];
+                self.bundles.insert(route, key, sl, x, super::bundle::offset(s.cell, cell), bit);
             }
-            let i = Self::buf_of(&mut self.bufs, shape, &init);
-            push(&mut self.bufs[i]);
-            debug_assert_eq!(self.bufs[i].cells.last(), Some(&cell));
-            self.requests.push(Request { lid, local, buf: i as u32, row: self.bufs[i].rows() as u32 - 1 });
+            _ => self.bundles.insert(route, key, 0, NO_XFER, 0, bit),
         }
-        if let (Some(x), true) = (xfer, self.record_edges) {
-            self.edges.push(pack_edge(lid, local, (lane - self.lo) as u32, x));
+        Ok(())
+    }
+
+    /// `--key-check` of the rows in `check[i]`: each one's key is the
+    /// boundary's, and its key and cell decode to it.
+    fn check_rows(&mut self, i: usize) -> Result<()> {
+        let b = &self.check[i];
+        crate::compiled::asm_kernel::key_check(b, self.keys, self.prov, self.level);
+        let rows = b.to_rt2();
+        let keep: Vec<u32> = (0..rows.width as u32).filter(|&r| !is_provisional(rows.row_keys[r as usize])).collect();
+        if !keep.is_empty() {
+            let mut r = rows.clone_block();
+            r.retain_lanes(&keep);
+            let cells: Vec<u32> = keep.iter().map(|&k| b.cells[k as usize]).collect();
+            self.skeletons.check_decodes(self.keys, &r, &cells)?;
         }
+        self.check[i].clear();
         Ok(())
     }
 
@@ -905,10 +627,10 @@ impl<'a> UnitSink<'a> {
         let mut w = row.clone_block();
         crate::frame::widen_rt2_to(&mut w, level);
         w.canonical();
-        if self.visited.keys.shape(w.shape_hash).is_none() {
+        if self.keys.shape(w.shape_hash).is_none() {
             self.note_shape(&celeste_engine::exact::ShapeRecord::of(&w, crate::compiled::ids()));
         }
-        let key = match self.visited.keys.row_keys(&w, crate::compiled::ids()).swap_remove(0) {
+        let key = match self.keys.row_keys(&w, crate::compiled::ids()).swap_remove(0) {
             RowKey::Hit(k) => k,
             RowKey::Miss(m) => self.prov.intern(m),
         };
@@ -916,7 +638,10 @@ impl<'a> UnitSink<'a> {
     }
 
     /// The reference engine's emission: one materialized row (stored
-    /// widened: `row_key`), no edge.
+    /// widened: `row_key`), no edge. Its shape's skeleton is the row's
+    /// structure with every value cell left to the decode (`decode::Repr::
+    /// Other`): a reference row's columns follow its values, not a kernel's
+    /// template.
     pub fn emit_row(&mut self, row: &Rt2, cell: u32) -> Result<()> {
         debug_assert_eq!(row.width, 1);
         if self.minus_one_drop(row.shape_hash, cell).is_some() {
@@ -924,8 +649,12 @@ impl<'a> UnitSink<'a> {
         }
         let (w, key) = self.row_key(row);
         anyhow::ensure!(w.shape_hash == row.shape_hash, "a reference row's widening changed its shape ({:016x} -> {:016x})", row.shape_hash, w.shape_hash);
+        if !self.registered.contains(&w.shape_hash) {
+            self.skeletons.register(&super::decode::reference_skeleton(&w))?;
+            self.registered.insert(w.shape_hash);
+        }
+        // Its buffers (verdicts, the key check) hold the row as it is.
         let init = || {
-            // Numbers and bools vary; the rest is fixed by the shape.
             let mut b = celeste_engine::slots::reshape(&w, 0);
             b.cols = w
                 .cols
@@ -940,140 +669,64 @@ impl<'a> UnitSink<'a> {
             b.shape_hash = w.shape_hash;
             b
         };
-        self.emit(w.shape_hash, cell, key, self.lo, None, init, |b| b.push_row(&w, key, cell))
+        self.reference = true;
+        let r = self.emit(w.shape_hash, cell, key, self.lo, None, init, |b| b.push_row(&w, key, cell));
+        self.reference = false;
+        r
     }
 
-    /// The worker's units are over: its blocks file complete, its capture
-    /// stream and transfer table written (`--emit-capture`).
+    /// The emissions come without rows (`bench::Replay`, a capture): no
+    /// decode guard, no key check.
+    pub fn replaying(&mut self) {
+        self.rowless = true;
+    }
+
+    /// The worker's units are over: its capture stream and transfer table
+    /// written (`--emit-capture`); the shapes it checked are checked again
+    /// next frame.
     pub fn finish(&mut self) -> Result<()> {
-        if let Some(b) = self.blocks.take() {
-            b.finish()?;
-        }
+        self.guarded.clear();
+        self.last_shape = 0;
         match self.capture.take() {
-            Some(c) => c.finish(&self.xfer_tab),
+            Some(c) => c.finish(&self.xfer_tab.read().expect("a transfer table")),
             None => Ok(()),
         }
     }
 
-    /// The unit is over: its edges sorted, deduplicated and encoded; its
-    /// lids, requests and rows kept for the translation.
+    /// The unit is over: its rows checked, its last verdicts decided (a
+    /// disallowed target's records go), its buckets the chunks of their
+    /// routes.
     pub fn end(&mut self) -> Result<()> {
         let t = crate::frame::phases::start(self.phases);
-        for b in &self.check {
-            crate::compiled::asm_kernel::key_check(b, &self.visited.keys, self.prov, self.level);
+        for i in 0..self.check.len() {
+            if self.check[i].rows() > 0 {
+                self.check_rows(i)?;
+            }
         }
-        self.check.iter_mut().for_each(RowBuf::clear);
-        // The last verdicts; a disallowed target's edges and requests go.
         self.decide()?;
-        if self.disallowed {
-            let no = |v: &rustc_hash::FxHashMap<u64, u8>, lid: u32, local: u32| v.get(&((lid as u64) << 8 | local as u64)) == Some(&VERDICT_NO);
-            let v = &self.verdicts;
-            self.edges.retain(|&e| {
-                let (lid, local, ..) = unpack_edge(e);
-                !no(v, lid, local)
-            });
-            self.requests.retain(|r| !no(v, r.lid, r.local));
-            // A pending lid stays pending only if an edge still names it.
-            let mut named = vec![false; self.lids.len()];
-            for &e in &self.edges {
-                named[unpack_edge(e).0 as usize] = true;
+        let v = &self.verdicts;
+        let drop = |route: u32, key: Key, c: u32| v.get(&(route, key, c as u8)) == Some(&VERDICT_NO);
+        let buckets = self.bundles.drain(if self.disallowed { Some(&drop) } else { None });
+        self.src_regions.sort_unstable();
+        self.src_regions.dedup();
+        let sources: std::sync::Arc<[(u32, Key)]> = self.unit_sources.as_slice().into();
+        let mut buckets = buckets;
+        buckets.sort_unstable_by_key(|b| b.0);
+        let mut srcs = self.src_regions.iter().peekable();
+        for (route, targets, bundles) in buckets {
+            let mut src_regions = Vec::new();
+            while let Some(&&(r, region)) = srcs.peek() {
+                if r > route {
+                    break;
+                }
+                if r == route {
+                    src_regions.push(region);
+                }
+                srcs.next();
             }
-            self.pending.retain(|&l| named[l as usize]);
+            self.outbox.push(Chunk { route, unit: self.unit, worker: self.worker, targets, sources: sources.clone(), bundles, src_regions });
         }
-        // One pass: per (lid, cell) its edges' count, per transfer its use.
-        let cells = (self.geo.side * self.geo.side) as usize;
-        let n = self.lids.len();
-        if self.xfer_use.len() < self.xfer_tab.len() {
-            self.xfer_use.resize(self.xfer_tab.len(), 0);
-        }
-        self.sort_at.clear();
-        self.sort_at.resize(n * cells + 1, 0);
-        let mut used: Vec<u32> = Vec::with_capacity(self.last_used);
-        for &e in &self.edges {
-            let (lid, local, _, x) = unpack_edge(e);
-            self.sort_at[lid as usize * cells + local as usize + 1] += 1;
-            if self.xfer_use[x as usize] == 0 {
-                used.push(x);
-            }
-            self.xfer_use[x as usize] += 1;
-        }
-        // The unit's transfers by use (common ones code in a byte): each
-        // edge's transfer field becomes its rank.
-        used.sort_unstable_by_key(|&x| (std::cmp::Reverse(self.xfer_use[x as usize]), x));
-        for (r, &x) in used.iter().enumerate() {
-            self.xfer_use[x as usize] = r as u32;
-        }
-        for k in 0..n * cells {
-            self.sort_at[k + 1] += self.sort_at[k];
-        }
-        // By target (a counting sort on (lid, cell)), the rank in place of
-        // the transfer; each target's few edges sorted (source, transfer),
-        // duplicates dropped.
-        self.sorted.clear();
-        self.sorted.resize(self.edges.len(), 0);
-        {
-            let xmask = (1u64 << XFER_BITS) - 1;
-            let mut cur = self.sort_at.clone();
-            for &e in &self.edges {
-                let (lid, local, _, x) = unpack_edge(e);
-                let k = lid as usize * cells + local as usize;
-                self.sorted[cur[k] as usize] = e & !xmask | self.xfer_use[x as usize] as u64;
-                cur[k] += 1;
-            }
-        }
-        for &x in &used {
-            self.xfer_use[x as usize] = 0;
-        }
-        self.last_used = used.len();
-        for k in 0..n * cells {
-            let (a, b) = (self.sort_at[k] as usize, self.sort_at[k + 1] as usize);
-            if b - a > 1 {
-                self.sorted[a..b].sort_unstable();
-            }
-        }
-        self.sorted.dedup();
-        let (block, starts) = super::edges::encode_block(&self.sorted, n);
-        let block_len = block.len() as u64;
-        let (block_at, block) = match &mut self.blocks {
-            Some(w) => (Some(w.append(&block)?), Vec::new()),
-            None => (None, block),
-        };
-        let n_requests = self.requests.len();
-        self.n_requests += n_requests as u64;
-        self.n_lids += self.lids.len() as u64;
-        self.outs.push(UnitOut {
-            worker: self.worker,
-            sources: std::mem::take(&mut self.sources),
-            source_rows: self.source_rows,
-            lids: std::mem::replace(&mut self.lids, Vec::with_capacity(n)),
-            owners: self.lid_owners.drain(..).map(|o| std::sync::atomic::AtomicU64::new(if o == PENDING { NO_OWNER } else { o })).collect(),
-            requests: std::mem::replace(&mut self.requests, Vec::with_capacity(n_requests)),
-            pending: std::mem::take(&mut self.pending),
-            bufs: std::mem::take(&mut self.bufs),
-            block_at,
-            block_len,
-            block,
-            xfers: used,
-            starts,
-            edges: self.sorted.len() as u64,
-        });
-        let t1 = crate::frame::phases::add(crate::frame::phases::END_UNIT, t);
-        self.end_ticks += t1.saturating_sub(t);
+        crate::frame::phases::add(crate::frame::phases::END_UNIT, t);
         Ok(())
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn packed_edges_sort_by_target_and_round_trip() {
-        let a = pack_edge(3, 63, 8191, (1 << XFER_BITS) - 1);
-        assert_eq!(unpack_edge(a), (3, 63, 8191, (1 << XFER_BITS) - 1));
-        let b = pack_edge(4, 0, 0, 0);
-        assert!(a < b, "a later lid sorts after");
-        assert!(pack_edge(3, 62, 8191, 9) < pack_edge(3, 63, 0, 0), "then the cell");
-        assert_eq!(unpack_edge(pack_edge((1 << LID_BITS) - 1, 255, 5, 7)), ((1 << LID_BITS) - 1, 255, 5, 7));
     }
 }

@@ -38,7 +38,7 @@ pub fn fresh_interp<'a>(cart: Arc<CartData>, cache: Arc<CollisionCache>) -> Inte
 /// `level` is passed in, not read from the process-global level: a concrete
 /// step (`RefEngine::step`) is exact whatever the search has set.
 ///
-/// `unknown` names the input's unknown-boolean fields (`refbridge::from_block`):
+/// `unknown` names the input's unknown-boolean fields (`block::from_block`):
 /// each is a cursor choice made before the frame runs, as the kernels fork them.
 ///
 /// More than `cap` paths is an error, `TooManyPaths` (every path's output is
@@ -75,7 +75,7 @@ pub fn run_frame_all<'a>(
         }
         // A path that RAISES (`Interp::poison`) ends in no state, and only then.
         it.raised.clear();
-        let ended = it.exec_block(body.nodes(), st)?;
+        let ended = it.exec_block(body.nodes(), st).map_err(|e| e.context(format!("fork path {}", paths + 1)))?;
         match ended.len() {
             0 => anyhow::ensure!(!it.raised.is_empty(), "a frame path ended in no state without a raise"),
             1 => {

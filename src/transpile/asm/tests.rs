@@ -6,11 +6,10 @@ use std::collections::HashMap;
 const ONE_FIXED2: i32 = 0x0002_0000; // +2.0 in 16.16
 
 use celeste_engine::kernel::{
-    zb_and, zb_eq, zb_not, zb_or, zi_abs, zi_add, zi_add_wraps, zi_cmp, zi_eq, zi_flr, zi_fork_flr, zi_max, zi_min,
-    zi_div, zi_div_wraps, zi_neg, zi_neg_wraps, zi_scale, zi_scale_wraps, zi_span_ok, zi_sub, zi_sub_wraps, zn_abs, zn_add, zn_eq, zn_flr, zn_ge, zn_gt, zn_le, zn_lt, zn_max,
-    zn_min, zn_mul, zn_neg, zn_sub, zsel_b, zsel_i, zsel_n,
-    zn_div, zn_mget, zn_rem, zn_sin, zn_tile_flag_at, Cmp, ZB, ZI,
-    ZN, ALL,
+    zb_and, zb_eq, zb_not, zb_or, zi_abs, zi_abs_wraps, zi_add, zi_add_wraps, zi_cmp, zi_eq, zi_flr, zi_fork_flr, zi_max, zi_min,
+    zi_div, zi_div_wraps, zi_neg, zi_neg_wraps, zi_scale, zi_scale_wraps, zi_span_ok, zi_sub, zi_sub_wraps, zn_abs, zn_abs_wraps, zn_add,
+    zn_add_wraps, zn_div_wraps, zn_eq, zn_flr, zn_ge, zn_gt, zn_le, zn_lt, zn_max, zn_min, zn_mul, zn_mul_wraps, zn_neg, zn_neg_wraps,
+    zn_sub, zn_sub_wraps, zsel_b, zsel_i, zsel_n, zn_div, zn_mget, zn_rem, zn_sin, zn_tile_flag_at, Cmp, ZB, ZI, ZN, ALL,
 };
 
 use crate::pico8_num::Pico8Num as P8;
@@ -197,13 +196,21 @@ fn eval_nodes(
                     V::N(z) => ZI { lo: z, hi: z },
                     _ => panic!("node {id}: NoWrap of a boolean"),
                 };
+                let nx = |k: usize| ivx(k).lo;
                 let wraps = match (&x.op, vals[node.args[0] as usize]) {
                     (Op::Add, V::I(_)) => zi_add_wraps(ivx(0), ivx(1)),
                     (Op::Sub, V::I(_)) => zi_sub_wraps(ivx(0), ivx(1)),
                     (Op::Neg, V::I(_)) => zi_neg_wraps(ivx(0)),
+                    (Op::Abs, V::I(_)) => zi_abs_wraps(ivx(0)),
                     (Op::Mul, V::I(_)) if matches!(vals[x.args[0] as usize], V::I(_)) => zi_scale_wraps(ivx(0), ivx(1).lo),
                     (Op::Mul, V::I(_)) => zi_scale_wraps(ivx(1), ivx(0).lo),
                     (Op::Div, V::I(_)) => zi_div_wraps(ivx(0), ivx(1).lo),
+                    (Op::Add, V::N(_)) => zn_add_wraps(nx(0), nx(1)),
+                    (Op::Sub, V::N(_)) => zn_sub_wraps(nx(0), nx(1)),
+                    (Op::Mul, V::N(_)) => zn_mul_wraps(nx(0), nx(1)),
+                    (Op::Div, V::N(_)) => zn_div_wraps(nx(0), nx(1)),
+                    (Op::Neg, V::N(_)) => zn_neg_wraps(nx(0)),
+                    (Op::Abs, V::N(_)) => zn_abs_wraps(nx(0)),
                     _ => 0,
                 };
                 V::B(ZB { val: !wraps, known: ALL })
@@ -785,7 +792,7 @@ fn asm_interval_overflow_declines() {
 #[test]
 fn asm_interval_scale_and_divide_overflow_declines() {
     use crate::transpile::asm::{compile_and_load_reprs, CellRepr};
-    use crate::transpile::graph::scaled;
+    let fits = |g: &Graph, x: NodeId| crate::transpile::graph::one_operand(g, x).expect("one operand").fits.expect("fits somewhere");
     let mut g = Graph::new();
     let civ = g.leaf(Op::Cell(0)); // ival
     // (op, raw literal, the literal first, can wrap)
@@ -818,7 +825,7 @@ fn asm_interval_scale_and_divide_overflow_declines() {
     // theirs, `*1.00002` and `/0.99998` their low one), none for the rest.
     let mut bounds = std::collections::BTreeSet::new();
     for (f, &x) in ops.iter().enumerate() {
-        let (lo, hi) = scaled(&g, x).expect("scaled").fits();
+        let (lo, hi) = fits(&g, x);
         assert_eq!(lo != i32::MIN && hi != i32::MAX, forms[f].3, "{:?}: both ends or neither", forms[f]);
         if lo != i32::MIN {
             bounds.insert((0, lo));
@@ -833,7 +840,7 @@ fn asm_interval_scale_and_divide_overflow_declines() {
     // Lanes around every literal's edges, then the extremes and small values.
     let mut lanes: Vec<(i32, i32)> = vec![(i32::MIN, i32::MAX), (0, 0), (-0x10_0000, 0x10_0000), (i32::MIN, 0), (0, i32::MAX)];
     for &x in &ops {
-        let (lo, hi) = scaled(&g, x).expect("scaled").fits();
+        let (lo, hi) = fits(&g, x);
         for d in [-1i64, 0, 1] {
             let (l, h) = ((lo as i64 + d).clamp(i32::MIN as i64, 0) as i32, (hi as i64 + d).clamp(0, i32::MAX as i64) as i32);
             lanes.extend([(l, 0), (0, h), (l, h), (l, l.saturating_add(3)), (h.saturating_sub(3), h)]);
@@ -878,6 +885,115 @@ fn asm_interval_scale_and_divide_overflow_declines() {
     }
     for (f, (op, k, _, can)) in forms.iter().enumerate() {
         assert!(held[f] > 0 && (fired[f] > 0) == *can, "{op:?} {k:#x}: fired {} held {}", fired[f], held[f]);
+    }
+}
+
+/// SCALAR (point) arithmetic that leaves the 16.16 range is an ERROR in
+/// that lane, as an interval's is (`asm_interval_overflow_declines`):
+/// `NoWrap` of `+ - * /`, negation and `abs` is false exactly where the
+/// primitives' masks (`zn_*_wraps`: `Pico8Num`'s checked operation has no
+/// answer) fire, one step either side of every edge, and every other lane
+/// is bit-exact with the primitive - the exact result. With a literal
+/// operand the check is at most two compares of the other one
+/// (`graph::one_operand`), none where every value fits; two cells' `+`/`-`
+/// is the sign test of the interval form on one plane.
+#[test]
+fn asm_scalar_overflow_declines() {
+    use crate::transpile::graph::one_operand;
+    let mut g = Graph::new();
+    let (x, y) = (g.leaf(Op::Cell(0)), g.leaf(Op::Cell(1)));
+    // (op, the literal: None for two cells / unary, the literal first)
+    let mut forms: Vec<(Op, Option<i32>, bool)> = vec![(Op::Add, None, false), (Op::Sub, None, false), (Op::Neg, None, false), (Op::Abs, None, false)];
+    for k in [0, 1, -1, 0x1_0000, -0x1_0000, 0x7fff_0000, i32::MAX, i32::MIN] {
+        forms.extend([(Op::Add, Some(k), false), (Op::Sub, Some(k), false), (Op::Sub, Some(k), true)]);
+    }
+    for k in [0x2_0000, -0x2_0000, 0x8000, -0x1_0000, 0x7fff_0000] {
+        forms.extend([(Op::Mul, Some(k), false), (Op::Mul, Some(k), true)]);
+    }
+    for k in [0x8000, -0x8000, 0x3_0000, -0x1_0000, 0x2_0000, 0] {
+        forms.push((Op::Div, Some(k), false));
+    }
+    let mut ops = Vec::new();
+    for (op, k, first) in &forms {
+        let args = match k {
+            None if matches!(op, Op::Neg | Op::Abs) => vec![x],
+            None => vec![x, y],
+            Some(k) => {
+                let c = g.leaf(Op::Const(*k, *k));
+                if *first { vec![c, x] } else { vec![x, c] }
+            }
+        };
+        ops.push(g.add(op.clone(), args));
+    }
+    let oks: Vec<NodeId> = ops.iter().map(|&o| g.add(Op::NoWrap, vec![o])).collect();
+    let roots: Vec<NodeId> = ops.iter().chain(&oks).copied().collect();
+    let (compiled, loaded) = compile_and_load(&g, &roots, "scalarovf").expect("compile+load");
+    // One compare per distinct bound a literal form puts on `x`, and one
+    // sign test per two-cell `+`/`-`; nothing else compares.
+    let text = crate::transpile::asm::compile(&g, &roots, "scalarovf", &HashMap::new(), Default::default()).expect("compile").asm;
+    let compares = text.lines().filter(|l| l.trim_start().starts_with("vpcmpd")).count();
+    let mut bounds = std::collections::BTreeSet::new();
+    for &o in &ops {
+        if let Some(f) = one_operand(&g, o).and_then(|o| o.fits) {
+            if f.0 != i32::MIN {
+                bounds.insert((0, f.0));
+            }
+            if f.1 != i32::MAX {
+                bounds.insert((1, f.1));
+            }
+        }
+    }
+    assert_eq!(compares, bounds.len() + 2, "{text}");
+    let ctx = crate::transpile::asm::AsmCtx::new(std::ptr::null());
+    // `x` at and one step either side of every bound, the extremes and small
+    // values; `y` cycling through the extremes and small values.
+    let mut xs: Vec<i32> = vec![i32::MIN, i32::MIN + 1, -1, 0, 1, 0x1_0000, i32::MAX - 1, i32::MAX];
+    for &(_, b) in &bounds {
+        xs.extend([b.saturating_sub(1), b, b.saturating_add(1)]);
+    }
+    let ys = [i32::MAX, i32::MIN, 1, -1, 0, 0x7fff_0000, -0x7fff_0000, 0x1_0000, i32::MAX - 1, i32::MIN + 1, 3, -0x4000_0000, 0x4000_0000];
+    let (mut fired, mut held) = (vec![0u32; forms.len()], vec![0u32; forms.len()]);
+    for (batch, chunk) in xs.chunks(16).enumerate() {
+        let col = |f: &dyn Fn(usize) -> i32| -> [i32; 16] { std::array::from_fn(f) };
+        let xc = col(&|l| chunk[l % chunk.len()]);
+        let yc = col(&|l| ys[(l + batch * 5) % ys.len()]);
+        let cols = HashMap::from([(0u32, xc), (1u32, yc)]);
+        let input = pack_inputs(&compiled.input_cells, &cols);
+        let out = run_asm_raw(&loaded, &input, compiled.out_bytes, &ctx as *const _ as *const std::os::raw::c_void);
+        let zn = |c: [i32; 16]| ZN::from_array(std::array::from_fn(|i| P8::from_raw(c[i])));
+        let (a, b) = (zn(xc), zn(yc));
+        for (f, (op, k, first)) in forms.iter().enumerate() {
+            let kz = k.map(|k| ZN::from_array([P8::from_raw(k); 16]));
+            let (p, q) = match (kz, first) {
+                (None, _) => (a, b),
+                (Some(kz), false) => (a, kz),
+                (Some(kz), true) => (kz, a),
+            };
+            let (want, wraps) = match op {
+                Op::Add => (zn_add(p, q), zn_add_wraps(p, q)),
+                Op::Sub => (zn_sub(p, q), zn_sub_wraps(p, q)),
+                Op::Mul => (zn_mul(p, q), zn_mul_wraps(p, q)),
+                Op::Div => (zn_div(p, q), zn_div_wraps(p, q)),
+                Op::Neg => (zn_neg(p), zn_neg_wraps(p)),
+                _ => (zn_abs(p), zn_abs_wraps(p)),
+            };
+            fired[f] += wraps.count_ones();
+            held[f] += (!wraps).count_ones();
+            let o = compiled.root_offsets[forms.len() + f] as usize;
+            let word = |o: usize| u16::from_le_bytes([out[o], out[o + 1]]);
+            assert_eq!(word(o + 2), 0xffff, "{op:?} {k:x?}: decided on every lane");
+            assert_eq!(word(o), !wraps, "{op:?} {k:x?} first {first}: NoWrap false exactly where the primitive's mask fires");
+            let v = compiled.root_offsets[f] as usize;
+            for l in (0..16).filter(|l| wraps >> l & 1 == 0) {
+                let got = i32::from_le_bytes(out[v + l * 4..v + l * 4 + 4].try_into().unwrap());
+                assert_eq!(got, want.lane(l).as_raw_u32() as i32, "{op:?} {k:x?} first {first} lane {l}: x {:#x} y {:#x}", xc[l], yc[l]);
+            }
+        }
+    }
+    for (f, form) in forms.iter().enumerate() {
+        let everywhere = one_operand(&g, ops[f]).is_some_and(|o| o.fits == Some((i32::MIN, i32::MAX)));
+        assert!(held[f] > 0 || form.0 == Op::Div && form.1 == Some(0), "{form:?}: some lane fits");
+        assert_eq!(fired[f] == 0, everywhere, "{form:?}: fired {} held {}", fired[f], held[f]);
     }
 }
 
@@ -1025,11 +1141,11 @@ fn inline_div_rem_by_a_power_of_two_is_pico8s() {
             for l in 0..16 {
                 let (p, q) = (P8::from_raw(xs[l]), P8::from_raw(d));
                 match kind {
-                    0 => assert_eq!(lane(0, l), (p / q).as_raw_u32() as i32, "{:#x} / {:#x}", xs[l], d),
+                    0 => assert_eq!(lane(0, l), p.saturating_div(q).as_raw_u32() as i32, "{:#x} / {:#x}", xs[l], d),
                     1 => assert_eq!(lane(0, l), (p % q).as_raw_u32() as i32, "{:#x} % {:#x}", xs[l], d),
                     _ => {
-                        assert_eq!(lane(0, l), (p / q).as_raw_u32() as i32, "[{:#x}, ..] / {:#x}", xs[l], d);
-                        assert_eq!(lane(1, l), (P8::from_raw(ys[l]) / q).as_raw_u32() as i32, "[.., {:#x}] / {:#x}", ys[l], d);
+                        assert_eq!(lane(0, l), p.saturating_div(q).as_raw_u32() as i32, "[{:#x}, ..] / {:#x}", xs[l], d);
+                        assert_eq!(lane(1, l), P8::from_raw(ys[l]).saturating_div(q).as_raw_u32() as i32, "[.., {:#x}] / {:#x}", ys[l], d);
                     }
                 }
             }
@@ -1065,7 +1181,9 @@ fn a_call_out_preserves_what_is_live_across_it() {
         let out = run_asm_raw(&loaded, &input, compiled.out_bytes, &ctx as *const _ as *const std::os::raw::c_void);
         for l in 0..16 {
             let (px, py) = (P8::from_raw(cols[&0][l]), P8::from_raw(cols[&1][l]));
-            let want = [(px + py) + -((px + py) / P8::from_raw(3 << 16)), px + py];
+            let sum = px.checked_add(py).expect("small");
+            let third = sum.checked_div(P8::from_raw(3 << 16)).expect("small");
+            let want = [sum.checked_sub(third).expect("small"), sum];
             for (ri, w) in want.iter().enumerate() {
                 let o = compiled.root_offsets[ri] as usize + l * 4;
                 assert_eq!(i32::from_le_bytes(out[o..o + 4].try_into().unwrap()), w.as_raw_u32() as i32, "root {ri} lane {l}");

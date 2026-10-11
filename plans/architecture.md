@@ -36,9 +36,10 @@ kernels come from the **tracer** via one hand-off.
    position), already widened for the level. Branching, widening and keying happen inside. Two impls: the
    compiled `compiled::FrameEngine` and the reference `trace::refengine`
    (`RefEngine`: the tracer's interpreter over `RefDomain`, one lane and one
-   fork path at a time; `trace::refbridge` turns a block's lane into its
-   state and each leaf back into a one-row block, boxes and all, so its rows
-   key like the kernels'). The loop never touches an interpreter state.
+   fork path at a time; `trace::block` turns a block's lane into its
+   state and each leaf back into a one-row block, boxes and all, by the one
+   converter the tracer's output shapes come from, so its rows key like the
+   kernels'). The loop never touches an interpreter state.
 2. **The block** (`Rt2` in `celeste-engine`, `frame::Block` = an `Rt2` with its
    key column and its rows' ids, `storage::StateId`). Columnar; key and cell
    are exposed, the fields are opaque columns. Serialized whole
@@ -61,12 +62,13 @@ crates/celeste-engine    Rt2 block model, boundary/keys, lane primitives        
 .  (celeste-rust)        everything else                                         deps: all
   src/frame.rs           Block, FrameStep, ForwardState (start, resume,
                          extend, raise), MarkFilter, the frame files
-  src/storage/           THE STORAGE (plans/storage-v2.md): visited (posmask
-                         region tables), unit (UnitSink: the kernels'
-                         emissions), wave (units, translation, the layer),
-                         edges (edge files, transfers, EdgeStore), marks
-                         (the Resolver), meta, bench (the capture and
-                         `bench-storage`)
+  src/storage/           THE STORAGE (plans/storage-v2.md, plans/edges-target.md):
+                         visited (posmask region tables), unit (UnitSink: the
+                         kernels' emissions into bundles), route (the region
+                         phase), wave (the frame's pipeline and end), bundle
+                         and edges (the edge files, transfers, EdgeStore),
+                         marks (the Resolver), meta, decode, bench (the
+                         capture and `bench-storage`)
   src/search/            checkpoint, arc_edges (the transfer decode), arcs
                          (remainder sets, their arena), arc_dp (THE SEARCH:
                          the backward push, optimum, reach, concrete search),
@@ -74,7 +76,8 @@ crates/celeste-engine    Rt2 block model, boundary/keys, lane primitives        
   src/trace/             the AST tracer (Lua -> transpile::graph::Graph), the
                          constant-lattice walk (kernel.rs), widen.rs, verify.rs
                          (split pass), error.rs, level_minus_one.rs, the
-                         reference engine (refengine, refdriver, refbridge)
+                         reference engine (refengine, refdriver, refbridge),
+                         block.rs (state <-> block, every domain)
   src/transpile/         graph IR, lowering (lower::specialize_frame), ASM
                          assembler (transpile::asm)
   src/compiled/          FrameEngine, the kernel registry and append step
@@ -161,8 +164,7 @@ OR(error(args))`, materialized once, after fusion:
 | `Sel(c, t, f)` | `not Known(c)` |
 | a fork fragment | `not SplitOk(ways)` / `not SplitOkTab`: the lane spans more parts than enumerated |
 | an unrolled loop | its condition still holds after the bound (`State::ended`) |
-| interval `Add`/`Sub`/`Neg` | `not NoWrap(op)`: an endpoint overflowed 16.16 on this lane (`b47b118`; skipped where the static ranges bound the result) |
-| interval `Mul`/`Div` by a positive literal | `not NoWrap(op)`: an endpoint left 16.16 (`*` wraps, `/` saturates) where `Pico8NumInterval`'s checked operation has none (branch `mul-nowrap`; two compares against `graph::Scaled::fits`; none for a factor at most 1 or a divisor at least 1, so never for `div_pow2`; skipped where the operand's static range fits) |
+| `Add`/`Sub`/`Neg`/`Abs`/`Mul`/`Div`, of POINTS and of intervals | `not NoWrap(op)`: the exact result (an endpoint) left 16.16 on this lane, where the console wraps `+ - *` and negation and saturates `/` and `abs` (intervals: `b47b118`, `mul-nowrap`; points and `abs`: 2026-10-11, branch `overflow-errors`). Skipped where the static ranges bound the exact result (`Symbolic::bounded`, unwrapped and unsaturated). With one operand not a literal point (`graph::one_operand`: `x + k`, `k - x`, `x * k`, `x / k`, `-x`, `abs(x)`) the check is at most two compares of that operand (of an interval's two ends), none where every value fits (`x / 2`, `x * 0.5`: `Graph::fold` decides it) and constant false where none does (`x / 0`); two non-literals' `+`/`-` is the sign test (`vpternlogd` + compare); two non-literals' `*`, and `/` by one, have no check (the codegen refuses them; the cart has none) |
 | a widening | containment of the slot it writes (`widen::SlotErrors`), only where stored |
 | `Restrict(lo, hi)(x)` (a bounded input) | `Lo(x) < lo or Hi(x) > hi` on the raw input, charged to EVERY outcome |
 | `Pin(c)(x)` (a pinned input) | `x` outside `c` on the raw input, an error of the whole frame (`error::pins_hold`) |
@@ -219,7 +221,8 @@ bounds were both seeded (`d.ranges`, and the lowering's `fold_with(..,
 ranges)`) and guarded, and the lowering's fold, seeded with the very range,
 folded the guard to true: a lane with speed or remainder outside was
 computed silently wrong (x/y were held by the dispatch alone). The trees
-audited (`rewrite bounds-audit`) never held such a row. The codegen emits
+audited (`rewrite bounds-audit`, retired 2026-10-11 now that every kernel
+checks per lane) never held such a row. The codegen emits
 `Restrict` as the identity; the error is two compares a bound.
 The platforms (`p`, 2026-10-09) were the last seeded ranges: a platform's
 `x` (the path) and, with a player, its `spd.x` (its range over the worlds)
@@ -254,8 +257,8 @@ metrics included). Charging a pin per outcome as a restriction cost up to
 +0.3% dynamic instructions, so the two kinds keep their charging. The one
 assumption left outside the family: the no-player phase's `spd.x`, read as
 its one moving speed `v` and owed `0 or v` per lane (a two-point set; a pin
-to the hull would admit speeds in between). `rewrite bounds-audit --room`
-audits these.
+to the hull would admit speeds in between). A lane outside is the
+kernel's own error (a fatal coverage gap).
 
 **The map folds by range** (`spikes_at`, 2026-10-10, branch `kernel-opt`).
 `tile_flag_at` is an intrinsic whose interval reading (`Graph::tile_flag_over`)
@@ -293,8 +296,8 @@ number and its point interval are one code, `592c72f`), each field's index
 in append-only bit runs of a 127-bit key that never moves as the
 dictionaries grow. The append step looks each emitted row's key fields up
 in the dictionaries (read-only during a wave); a code they lack makes the
-state new and its key PROVISIONAL (its content interned), made final by
-the translation, which appends the frame's new codes sorted - so keys stay
+state new and its key PROVISIONAL (its content interned), made final at
+the frame's end, which appends the frame's new codes sorted - so keys stay
 canonical. Checked per row against `Rt2::boundary_canonicalize` keyed in
 the same dictionaries by `--key-check`. FIELD_NAMES' order
 feeds the shape hash (a shape's name; its signature is stored and compared)
@@ -311,7 +314,7 @@ platform tension: storing a platform's `x` as its whole path is what lets
 frames merge, and the overlap predicates only fold at ~4.5 px granularity -
 exactly where no cross-frame merge survives; storing zones would cost ~Z
 tuples (one phase drives all ten platforms), the ~18 px middle unmeasured.
-**Interval overflow.** Until 2026-10-03 the assembled interval `+`, `-` and
+**Overflow.** Until 2026-10-03 the assembled interval `+`, `-` and
 negation WRAPPED an overflowing endpoint silently (plain `vpaddd`/`vpsubd`;
 the Rust primitives panicked, and the per-op tests bounded their inputs).
 Fixed on `arc-sets` by `549ecf5` (overflow -> the whole range; with the
@@ -325,18 +328,66 @@ MAX]. (`72fdea7` on branch `asm-interval-wrap` was a rejected first version.)
 Interval `Mul`/`Div` by a positive literal got the same own error on
 2026-10-10 (branch `mul-nowrap`): the operation is monotone, so the check is
 the operand's endpoints against the range whose image fits (bisected on
-`checked_scale_positive` / `checked_div_positive`). The cart's factors
+`checked_mul` / `checked_div`: `Pico8Num::mul_fits`). The cart's factors
 above 1 multiply bounded values (`sin(..)*2`) and its divisors are at least
 1, so no kernel of rooms (1,0), (6,2) 100% or (4,2) emits one (their trees
 and dynamic instruction counts are unchanged). The static range of
 a product is now computed unwrapped (`pieces_of`: past 16.16 it is unknown,
 not PICO-8's wrapped endpoints). Which results ran before the fix:
 plans/results.md.
+**THE RULE: match PICO-8 exactly, or raise** (Philippe, 2026-10-11). For
+overflow, division by zero and every case like them, the interpreter, the
+kernels and the reference engine either compute exactly what PICO-8
+computes or RAISE (the kernels: decline the lane, a fatal coverage gap).
+Raising is always acceptable as long as real runs never hit it; computing
+something else is never acceptable. So a wrap or a saturation is an error,
+and so is `x / 0` (PICO-8 saturates it): no division in the traced cart
+(`lua/celeste-minimal.lua`, the builtins) or the original
+(`celeste_ocaml/celeste.lua`) has a divisor that can be 0 - every one is a
+nonzero literal (8, 30, 40; the original's draw code 1.5, 3, 4, 5, 32, 60,
+64), and `%` by 0 is PICO-8's exact 0. The console's own values where the
+interpreter raises stay pinned by the `lua/probe` `*_overflow` corpora
+(`trace::probe::OVERFLOW`: every case raises; `Pico8Num`'s explicit
+`wrapping_*`/`saturating_*` reproduce their golden PICO-8 output).
 
-## The forward frame and the storage (storage v2, 2026-10-10)
+**Every overflow is an error** (Philippe's decision, 2026-10-11, branch
+`overflow-errors`): the game never leaves the 16.16 range, so nothing
+wraps or saturates silently, for points as for intervals. `Pico8Num` has
+no `+ - * /` operators: `checked_*` (the exact result or `None`) and the
+console's `wrapping_*`/`saturating_*`, spelled out, for the kernels' lanes
+and the tests. (1) THE KERNELS: a scalar `+ - * /`, negation or `abs` owes
+`NoWrap` as an interval one does (the table above; `kernel::zn_*_wraps`
+the reference masks), so an overflowing lane declines - a fatal coverage
+gap. (2) THE TRACER'S CONSTANT FOLDING: the cart's arithmetic on constants
+goes through `Concrete` (checked: an error naming the operation, its
+operands and the source text, at trace time); `Graph::fold` of literal
+points panics with the operands (it has no error to return; what the cart
+folds never reaches it); the evaluator (`Graph::eval`, the lowering's
+fold, level -1, `Points`) is checked throughout (an overflow is an error,
+TOP where lenient), and a literal past the range (`32768`), a `for`
+counter past it, are errors. (3) ELSEWHERE: the fall floors' collide
+window and the fruit's band (checked), the reference's distance tests
+(`i64`), and the fork grid's arithmetic in `zi_span_ok`/`zi_fork_flr`,
+which wraps only for a lane in its operand's top `ways - 1` floors, where
+`SplitOk(ways)` is false - the fork's own error, charged wherever a fork's
+operand is an interval. The transfer roots are error roots too (the
+remainder before the widening stores no field). The dead timers'
+`minutes + 1` is checked at the stored constant
+(`widen::tests::dead_fields_are_unread`). Cost, measured (t1 metrics,
+2026-10-11): kernel dynamic instructions +1.9% (room (1,0) f55), +3.0%
+((6,2) 100% f50), +2.6% ((4,2) `n` f60); outputs identical, no lane
+declines. The checks the ranges do not fold: `spd +- dash_accel` in
+`appr` (the dash's acceleration is no restricted input: 1.6-2.7%), and
+`dash_effect_time - 1`, `grace - 1`, `dash_time - 1` (0.2-1.2%; the first
+is stored `max(v, 0)`, the others decrement under `> 0`, which no range
+analysis reads); interval `+ k` as compares saved 0.4% in (4,2).
 
-One storage system (plans/storage-v2.md; it replaced the door, the queues,
-the unit row cache, the raw edge records and the inversion):
+## The forward frame and the storage (edges target, 2026-10-11)
+
+One storage system (plans/storage-v2.md built the visited set and the ids;
+plans/edges-target.md the ID-free edges and the routed forward; they
+replaced the door, the queues, the unit row cache, the raw edge records,
+the inversion, then the lids, the owner index and the translation):
 
 - **The visited set** (`storage::visited`): per (shape, storage REGION) a
   table of ENTRIES - a position-free key and a mask over the region's cells.
@@ -345,73 +396,77 @@ the unit row cache, the raw edge records and the inversion):
   (the kernels' px a multiple of it, else refused); `NO_CELL` is one more
   region per shape. Room (6,2) 100% f57: 43.8M states in 2.19M entries,
   0.10 GB (the door: 1.08 GB).
-- **Ids** (`storage::StateId`): (region, entry, cell in region), region =
-  shape index x slots + slot, so ids sort by shape and position. Entry
-  numbers are assigned by the translation in KEY order among a frame's new
-  entries: canonical when assigned, whatever the threads or the units. A
-  layer is stored in id order (checkpoint v12: id and cell columns); the
-  frame's metadata (`storage::meta`, `frames/fNNN/meta.bin`) lists the shapes
-  and entries (with keys) it created - with the files' ids, the visited set.
-- **The wave** (`storage::wave::run_wave`): the frontier cut into UNITS of
-  contiguous rows (1024-4096 lanes), pulled by `threads()` workers. Per
-  emission the unit's sink (`storage::unit::UnitSink`) drops level -1's
-  rows (noting their sources), keys the row, decodes its transfer, and
-  probes its TARGET TABLE keyed by (shape, region slot, key): a LID per
-  distinct target entry, looked up in the visited set once (read-only
-  during the wave) with the owner's mask. A cell the owner holds is an old
-  state: an edge only. Else a REQUEST: the first unit to request the state
-  this wave copies its row (`Claims`); the others only name it. The unit's
-  edges `(lid, cell, source, transfer)` are sorted by target and encoded at
-  its end and streamed into the worker's blocks file.
-- **The translation** (`wave::translate`): the requests grouped by target
-  region, one worker a region: sorted by (key, cell), each new key an entry
-  (key order), each new cell a NEW state; every lid gets its owner (others'
-  lids of claimed states are found after it, `resolve_lids`). The only
-  writer of the visited set.
-- **The layer** (`gather_layer`): the new states in id order gathered from
-  the units' row buffers into pieces (`PIECE_ROWS`), checkpointed with their
-  ids, cells, keys and wins; the frame's edge file (below); the metadata;
-  the drop notes; the pos graph; then `done.txt`.
+- **States** are `(shape, key, cell)`; the edges and the backward name them
+  so (`storage::Sk`: region, key, cell in region). The layers' frame files
+  still carry IDS (`storage::StateId`: region, entry, cell in region; region
+  = shape index x slots + slot, so ids sort by shape and position). Entry
+  numbers are assigned at the frame's end in KEY order among a frame's new
+  entries: canonical, whatever the threads or the units. A layer is stored
+  in id order (checkpoint v14: the id column, rows decoded from the keys);
+  the frame's metadata (`storage::meta`, `frames/fNNN/meta.bin`) lists the
+  shapes and entries (with keys) it created.
+- **The wave** (`storage::wave::run_wave`), one pipeline a frame: the
+  frontier cut into UNITS of contiguous rows (a 256th of the frame,
+  1024-4096 lanes) and the units into SLICES (~1M lanes). Per emission the
+  unit's sink (`storage::unit::UnitSink`) drops level -1's rows (noting
+  their sources), keys the row and ORs it into its BUNDLE (source key,
+  transfer, offset, target key -> target cells) in a unit-local table,
+  keyed by the target's ROUTE (shape, region slot). Nothing is looked up in
+  the visited set and no row is copied. At its end the unit's bundles are
+  per route a CHUNK. When a slice's units are done its transfers get their
+  global ids and its chunks become REGION JOBS (one per (route, slice)),
+  which the workers take before the next slice's units: the region phase
+  overlaps the kernels.
+- **The region phase** (`storage::route::run_route`): per chunk target ONE
+  probe of the region's table and an OR - the cells the entry lacked are
+  the new states - and the job's bundles encoded into one zstd SEGMENT of
+  the frame's edge file. A region's table is written only by its route's
+  jobs, one at a time.
+- **The frame's end**: provisional keys made final, new shapes numbered,
+  each route's new entries renumbered in key order (`RegionTable::
+  finish_frame`), the edge file written, and the new LAYER DECODED from
+  its states' keys and cells (`decode::Skeletons`: no row was copied);
+  checkpointed with ids, cells, keys and wins; the metadata; the drop
+  notes; the pos graph; then `done.txt`. The DECODE GUARD: a shape's first
+  emitted row (each worker, each wave) must be what its key and cell decode
+  to, and every emission's skeleton the shape's (FATAL otherwise);
+  `--key-check` compares every row.
 
-The result is a function of the frame, not of scheduling: identical at 3
-and 32 threads (states and edge content, room (1,0) f0-f50), over a resume,
-and under `gates/raise.sh`. `rewrite bench-storage` replays one captured
-frame (`--emit-capture`) through this code without the kernels, and
-reproduces the real tree's `ckhash` lines of that frame.
+The result is a function of the frame, not of scheduling or the thread
+count: room (1,0) f0-f60 at 3 and 32 threads and over a resume, the frame
+files, edge files and `xfer.bin` are byte-identical (multi-slice frames:
+r0sx f50-f56), and `gates/raise.sh` passes. `rewrite bench-storage`
+replays one captured frame (`--emit-capture`) through this code without the
+kernels, and reproduces the real tree's `ckhash` lines of that frame.
 
-## The recorded graph (storage v2, 2026-10-10)
+## The recorded graph (edges target, 2026-10-11)
 
 The forward records every edge once, with what the frame did to the
 remainder (its transfer); the backward reads the edge files and re-runs no
 kernel. An edge recorded at frame f leaves a state of layer f - 1.
 
-- **The edge file** (`storage::edges`): per frame `edges/f{frame}.bin`
-  (a raise adds `f{frame}.r{seq}.bin`), and per worker its blocks file
-  `f{frame}.w{n}.blk`. Per unit: its sources (ids), its BLOCK - its edges
-  lid by lid (a cell byte, varint source deltas, the transfer's rank in the
-  unit) with per lid its start, its transfer ranks' global ids; its
-  sources a row range of the previous layer's frame file when its block
-  was whole. Per file the OWNER INDEX, `(region, entry, unit, lid)`
-  sorted: the translation tables, the REVERSE WALK (a unit's owners by lid
-  are derived from it when read). The transfers: ONE table for the tree,
-  `edges/xfer.bin`, content-canonical (each wave appends its new pairs in
-  value order).
-- **`EdgeStore`**: `preds_at(target, frame)` - the owner index's entries of
-  the target's (region, entry) (a binary search), each a (unit, lid) whose
-  edges are decoded alone, into the target's cell: nothing is inverted.
-  `preds_sorted(frame, targets)` - the same for a sorted batch: region by
-  region (a file's regions found once, `EdgeFile::regions`), entries by
-  galloping through the region's range, a lid decoded once for all its
-  targets' cells; it counts what it read (`ReadStats`). `scan(frame)` and
-  `units`/`unit`: every edge, unit by unit.
+- **The edge file** (`storage::edges`, v6; plans/edges-target.md): per
+  frame `edges/f{frame}.bin` (a raise adds `f{frame}.r{seq}.bin`): a header
+  - the segments by TARGET region (one a slice that reached it), and per
+  target region the source regions its edges leave - and the zstd blocks.
+  A block holds BUNDLES: `(source shape and key, transfer, offset, target
+  key) -> mask` over the target region's 64 cells, its target keys and
+  sources as sorted dictionaries, the records a trie in the order mask,
+  offset, transfer, source, target. Nothing names a state by a number.
+  The transfers: ONE table for the tree, `edges/xfer.bin`,
+  content-canonical (each slice appends its new pairs in value order).
+  Room (6,2) 100% f57: 257.7M edges in 50.9M bundles, 29 MB (0.113 B an
+  edge; storage v2's unit blocks 3.15 B).
+- **`EdgeStore`**: per (frame, region) its segments (`segments`), every
+  block (`all_segments`, `par_blocks`), the target regions a source region
+  reaches (`targets_of`), and for the diagnostics a state's in-edges
+  (`preds_at`) and a frame's edges sorted (`edges_at`).
 - **The backward reads the edge files, it loads no graph** (2026-10-11,
   plans/arc-memory.md): per step the in-edges of the nodes whose winning set
-  changed (`preds_sorted`, the files advised `MADV_RANDOM`: the reads are
-  scattered); `reach` alone loads out-edges, those between W's nodes
-  (`arc_dp::OutGraph`, unit by unit, two passes). Before: a remainder-free
-  BFS marked the states that could win at all, and a CSR of the edges
-  between them (12 B an edge) was loaded - the mod room at h155 died at
-  ~104 GB in that load.
+  changed, read per (target region, frame): the region's blocks decoded and
+  their records matched against the changed targets' keys and cells; `reach`
+  loads out-edges as states are reached (`arc_dp::ReachEdges`, through the
+  header's source-region index).
 - **Checks.** `rewrite arc-check` (every edge has a transfer; sampled
   transfers probed with the reference engine at the tree's level inside and
   outside their guards); `ckhash --edges` (each frame's edges by content).
@@ -449,21 +504,21 @@ the list (coarsest first; one level is the usual case):
    recorded at frame f leaves layer f - 1 and enters a layer <= f), so
    `W_t(p) = W_{t+1}(p) ∪ U pull_e(W_{t+1}(m))` over the edges `p -> m`
    whose target CHANGED at t + 1: frame by frame from the wins, the changed
-   nodes' in-edges at frames <= t + 1 are read from the edge files by
-   target, in bounded ROUNDS (64M in-edges at most), and pulled into their
-   sources in parallel id ranges. No graph is held and nothing marks nodes
+   nodes' in-edges at frames <= t + 1 are read from their target regions'
+   blocks, in bounded ROUNDS (~20M in-edges, 0.8 GB, at most), and pulled into their
+   sources in parallel state ranges. No graph is held and nothing marks nodes
    first: a node no winning set reaches is never touched, and W's SUPPORT
    (the nodes with a set at some frame) replaces the remainder-free marks
-   in the gate. W is kept as varints - per node its id delta, layer and
+   in the gate. W is kept as varints - per node its state's delta, layer and
    spans, per span its length and set, ~4 B a node and ~3 a span - in a
    scratch file beside the tree, mapped back (`<level>/arc-scratch`,
    unlinked once mapped), over a flat arena of the distinct sets
    (`RegionArena`, bounds in 16 bits). `arc_dp::optimum` reads
    the optimum off the start's sets. That optimum is exact in the remainder
    and over-approximates the level's other widenings (and `rnd`): a LOWER
-   BOUND, and no win REFUTES H. The storage metadata
-   (`storage::marks::Resolver`) gives the gate's fingerprints, the marks
-   files and the concrete search's node keys (by ENTRY, 24 B each). The mod
+   BOUND, and no win REFUTES H. A node IS its state (`Sk`: region, key,
+   cell, as the edge files name it), so the gate's fingerprints, the marks
+   files and the concrete search's node keys need no metadata. The mod
    room at h155 (230M nodes, 430M spans, 6.0G in-edges read): the arc phase
    in ~15 GB anonymous under a 30 GB cap, where the remainder-free BFS and
    its 12 B-an-edge graph were OOM-killed at ~104 GB.
@@ -514,7 +569,7 @@ the frame are rewritten (the untouched sources keep theirs). The result is
 the tree a fresh forward under H' makes: the same (key, cell) set per frame,
 the same edges, the same pos graph, the same notes - unless H' reaches a
 state SOONER than the tree did, which would move it to an earlier layer: a
-hit on a state of a later layer is refused (`UnitSink::emit`, through every
+hit on a state of a later layer is refused (`route::run_route`, through every
 state's layer, `wave::StateLayers`, built for the raise; possible only where
 the table's d is not consistent along a real edge; it has not fired). Checked by `gates/raise.sh` (a tree raised H1 -> H2 -> ...
 against a fresh tree per horizon: `ckhash --edges`, the pos graph, the
@@ -542,8 +597,11 @@ format 14): a row is a function of its shape's skeleton, its exact key and
 its cell, and an id names both, so a frame file is the shape's skeleton,
 the win rows and the id column (8 B a row), and a row is DECODED when read
 (`storage::decode`, against the metadata's key space and entries:
-`decode::TreeKeys`). The forward checks every piece it writes decodes to
-its rows exactly (`decode::check_piece`, FATAL otherwise). This replaced
+`decode::TreeKeys`). Since the edges target the forward copies no row at
+all: the new layer is decoded from its states' keys and cells, and the
+DECODE GUARD checks a shape's first emitted row each worker and wave
+against its decode (`decode::Skeletons`, FATAL otherwise); `--key-check`
+checks every row. This replaced
 `--trim-rows` (2026-10-07: old frames trimmed to keys, ids, cells and wins,
 and the diagnostics refused them): every frame's rows are readable now, and
 the frames take ~8 B a state instead of 50-80.
@@ -735,8 +793,10 @@ arc gate's optimum becomes 32.
 J is HISTORY: it depends on how the previous room was played (plans/results.md
 "Real play"). The sound treatment is the set of feasible J's, grouped by the
 start state each gives:
-- `pico8_diff/chain.py` `feasible_janks` / `start_classes` compute the
-  classes, using `concrete_run --dump-start` to compare start states;
+- `rewrite starts` (`src/starts.rs`) computes the feasible J's and the
+  classes, comparing the reference engine's start states exactly (until
+  2026-10-11 `pico8_diff/chain.py`, one `concrete_run --dump-start` text
+  per J; identical classes for levels 2-31);
 - `tools/category_runner.py` `expand` runs one search per class;
 - the boot chain's class carries the witness and the upload.
 

@@ -26,6 +26,7 @@ pub mod refdriver;
 pub mod refengine;
 pub mod refbridge;
 pub mod bind;
+pub mod block;
 pub mod cart;
 pub mod domain;
 pub mod emit;

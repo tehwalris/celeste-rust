@@ -187,7 +187,8 @@ fn column(repr: Repr, codes: &[Code]) -> Result<Col> {
 
 /// Where a decoded block differs from the stored one (`None`: identical,
 /// representation included).
-pub fn block_diff(stored: &Rt2, decoded: &Rt2) -> Option<String> {
+#[cfg(test)]
+pub(crate) fn block_diff(stored: &Rt2, decoded: &Rt2) -> Option<String> {
     if stored.shape_hash != decoded.shape_hash || stored.width != decoded.width {
         return Some(format!("shape {:016x}/{:016x}, width {}/{}", stored.shape_hash, decoded.shape_hash, stored.width, decoded.width));
     }
@@ -216,6 +217,7 @@ pub fn block_diff(stored: &Rt2, decoded: &Rt2) -> Option<String> {
     None
 }
 
+#[cfg(test)]
 fn kind(c: &Col) -> &'static str {
     match c {
         Col::U(_) => "U",
@@ -223,6 +225,75 @@ fn kind(c: &Col) -> &'static str {
         Col::I(_) => "I",
         Col::V(_) => "V",
     }
+}
+
+/// THE SHAPES' SKELETONS a wave decodes its new layer with (the layer is
+/// not gathered from copied rows: its rows ARE their keys and cells): per
+/// shape the first registered - a kernel registry's union template
+/// (`asm_kernel::unify`: one per shape), or a reference row's structure
+/// (`reference_skeleton`). Another skeleton under one shape is FATAL.
+#[derive(Default)]
+pub struct Skeletons(std::sync::RwLock<rustc_hash::FxHashMap<u64, std::sync::Arc<Rt2>>>);
+
+impl Skeletons {
+    /// Register `skel` for its shape (width 0; checked against the shape's).
+    pub fn register(&self, skel: &Rt2) -> Result<()> {
+        let same = |a: &Rt2| a.structure == skel.structure && a.cols == skel.cols && a.globals == skel.globals && a.strings == skel.strings && a.prints == skel.prints;
+        if let Some(a) = self.0.read().expect("skeletons").get(&skel.shape_hash) {
+            ensure!(same(a), "ROWS FROM KEYS: two skeletons of shape {:016x} (another structure, non-value cell or column kind): its rows would decode as the first's", skel.shape_hash);
+            return Ok(());
+        }
+        let mut s = celeste_engine::slots::reshape(skel, 0);
+        s.cols = skel.cols.clone();
+        s.shape_hash = skel.shape_hash;
+        s.row_keys.clear();
+        self.0.write().expect("skeletons").entry(skel.shape_hash).or_insert_with(|| std::sync::Arc::new(s));
+        Ok(())
+    }
+
+    /// The skeleton of `shape`.
+    pub fn get(&self, shape: u64) -> Result<std::sync::Arc<Rt2>> {
+        self.0.read().expect("skeletons").get(&shape).cloned().ok_or_else(|| anyhow!("ROWS FROM KEYS: no skeleton of shape {shape:016x} (it was never emitted)"))
+    }
+
+    /// THE GUARD: `rows` (their keys, `cells`) decode with their shape's
+    /// skeleton to exactly themselves, row by row, representation included
+    /// (`Col::at`: a number column's `Num`, an interval column's `Ival`).
+    pub fn check_decodes(&self, keys: &KeySpace, rows: &Rt2, cells: &[u32]) -> Result<()> {
+        let skel = self.get(rows.shape_hash)?;
+        let keyed: Vec<(Key, u32)> = rows.row_keys.iter().copied().zip(cells.iter().copied()).collect();
+        let d = decode_rows(keys, &skel, &keyed)?;
+        let lossy = |what: String| anyhow!("ROWS FROM KEYS: an emitted row of shape {:016x} is not what its key and cell decode to ({what}): the new layer would hold another state", rows.shape_hash);
+        if d.structure != rows.structure || d.globals != rows.globals || d.strings != rows.strings || d.prints != rows.prints {
+            return Err(lossy("structure, globals, strings or prints".into()));
+        }
+        for (c, (a, b)) in rows.cols.iter().zip(&d.cols).enumerate() {
+            for r in 0..rows.width {
+                let (x, y) = (a.at(r), b.at(r));
+                if x != y {
+                    let how = if Code::of(x) == Code::of(y) { "same code, other representation" } else { "other value" };
+                    return Err(lossy(format!("cell {c} row {r}: emitted {x:?}, decoded {y:?} ({how})")));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// The layer of new states `rows` (one shape, by id), decoded.
+    pub fn decode(&self, keys: &KeySpace, shape: u64, rows: &[(Key, u32)]) -> Result<Rt2> {
+        let skel = self.get(shape)?;
+        decode_rows(keys, &skel, rows)
+    }
+}
+
+/// A reference row's skeleton: its structure, globals, strings and
+/// non-value cells, every value cell left to the decode (`Repr::Other`:
+/// the column follows its values).
+pub fn reference_skeleton(row: &Rt2) -> Rt2 {
+    let mut b = celeste_engine::slots::reshape(row, 0);
+    b.cols = row.structure.iter().zip(&row.cols).map(|(cell, c)| if matches!(cell, Cell2::Val) { Col::V(Vec::new()) } else { Col::U(c.at(0)) }).collect();
+    b.shape_hash = row.shape_hash;
+    b
 }
 
 /// What decoding a stored id needs: the tree's key space and the key of

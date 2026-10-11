@@ -105,50 +105,77 @@ fn fix_balloon_seeds(game: &str, seeds: &str, root: &std::path::Path, s: &crate:
     anyhow::ensure!(game.matches(PAT).count() == 1, "--balloon-seeds: the balloon's `{PAT}` was not found exactly once");
     let seeds: Vec<f64> = seeds.split(',').map(str::trim).filter(|v| !v.is_empty()).map(|v| v.parse::<f64>().with_context(|| format!("--balloon-seeds: {v:?}"))).collect::<Result<_>>()?;
     let cart = s.cart_data_in(root)?;
-    // The tool's seed list runs over balloons (tile 22) AND chests (tile 20)
-    // in creation order; only the balloons' phases are fixed here (a chest's
-    // shake decides only where its berry appears).
-    let mut seeded = Vec::new();
-    for tx in 0..16i16 {
-        for ty in 0..16i16 {
-            let tile = cart.mget_whole(rx * 16 + tx, ry * 16 + ty);
-            if tile == 22 || tile == 20 {
-                seeded.push((tile, tx * 8, ty * 8));
-            }
-        }
-    }
+    // The tool's seed list runs over balloons AND chests in creation order
+    // (`RoomObject::seeded`); only the balloons' phases are fixed here (a
+    // chest's shake decides only where its berry appears).
+    let seeded: Vec<RoomObject> = room_objects(&cart, (rx, ry)).into_iter().filter(|o| o.seeded).collect();
     // More seeds than objects: the tool (UniversalClassicTas `set_seeds`)
     // applies one per balloon/chest present and ignores the rest.
     let mut expr = "0".to_string();
-    for (i, &(tile, x, y)) in seeded.iter().enumerate().rev() {
-        if tile == 22 {
-            let v = seeds.get(i).copied().unwrap_or(0.0);
+    for (i, o) in seeded.iter().enumerate().rev() {
+        if o.tile == BALLOON {
+            let (x, y, v) = (o.tx * 8, o.ty * 8, seeds.get(i).copied().unwrap_or(0.0));
             expr = format!("((this.x=={x} and this.y=={y}) and {v} or {expr})");
         }
     }
     Ok(game.replacen(PAT, &format!("this.offset={expr}"), 1))
 }
 
-/// The tiles `load_room` makes an object of, in the ORIGINAL cart, and
-/// whether the minimal cart makes it too: platforms (11, 12) and the types
-/// with a `tile`. The minimal cart has no `message` (86, room (3,1)) nor
-/// `flag` (118, the summit); `room_title` is the original's last object.
-const OBJECT_TILES: &[(u8, bool)] = &[
-    (1, true),
-    (8, true),
-    (11, true),
-    (12, true),
-    (18, true),
-    (20, true),
-    (22, true),
-    (23, true),
-    (26, true),
-    (28, true),
-    (64, true),
-    (96, true),
-    (86, false),
-    (118, false),
+/// The tiles `load_room` makes an object of, in the ORIGINAL cart, with the
+/// object's type and whether the minimal cart makes it too: platforms (11,
+/// 12) and the types with a `tile`. The minimal cart has no `message` (86,
+/// room (3,1)) nor `flag` (118, the summit); `room_title` is the original's
+/// last object.
+const OBJECT_TILES: &[(u8, &str, bool)] = &[
+    (1, "player_spawn", true),
+    (8, "key", true),
+    (11, "platform", true),
+    (12, "platform", true),
+    (18, "spring", true),
+    (20, "chest", true),
+    (22, "balloon", true),
+    (23, "fall_floor", true),
+    (26, "fruit", true),
+    (28, "fly_fruit", true),
+    (64, "fake_wall", true),
+    (96, "big_chest", true),
+    (86, "message", false),
+    (118, "flag", false),
 ];
+
+const BALLOON: u8 = 22;
+const CHEST: u8 = 20;
+
+/// One object `load_room` makes in a room, in the ORIGINAL cart: its tile,
+/// tile position in the room, type, whether the minimal cart makes it, and
+/// whether a seed of the TAS tools' `[seeds]` list is its (balloons and
+/// chests, in creation order: UniversalClassicTas `set_seeds`).
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct RoomObject {
+    pub tile: u8,
+    pub tx: i16,
+    pub ty: i16,
+    pub kind: &'static str,
+    pub minimal: bool,
+    pub seeded: bool,
+}
+
+/// Room `(rx, ry)`'s objects in creation order (`load_room`'s tile loop: x
+/// outer, y inner), the original cart's (`room_title`, made last, left
+/// out). The one scan of the map for objects: the loading frame's J, the
+/// seeds, the tools (`rewrite room`, `rewrite starts`).
+pub fn room_objects(cart: &celeste_core::cart_data::CartData, (rx, ry): (i16, i16)) -> Vec<RoomObject> {
+    let mut out = Vec::new();
+    for tx in 0..16i16 {
+        for ty in 0..16i16 {
+            let tile = cart.mget_whole(rx * 16 + tx, ry * 16 + ty);
+            if let Some(&(_, kind, minimal)) = OBJECT_TILES.iter().find(|(t, _, _)| *t == tile) {
+                out.push(RoomObject { tile, tx, ty, kind, minimal, seeded: tile == BALLOON || tile == CHEST });
+            }
+        }
+    }
+    out
+}
 
 /// The start room's LOADING FRAME as a real transition runs it
 /// (`--loading-jank J`): the leaving
@@ -173,21 +200,8 @@ fn apply_loading_frame(game: &str, j: usize, root: &std::path::Path, s: &crate::
 /// The minimal cart's index of room `(rx, ry)`'s first object updated by the
 /// loading frame, the original's J-th: one past the minimal cart's objects
 /// the original creates before it.
-fn minimal_index(cart: &celeste_core::cart_data::CartData, (rx, ry): (i16, i16), j: usize) -> usize {
-    let mut original = 0;
-    let mut before = 0;
-    for tx in 0..16i16 {
-        for ty in 0..16i16 {
-            let tile = cart.mget_whole(rx * 16 + tx, ry * 16 + ty);
-            if let Some(&(_, minimal)) = OBJECT_TILES.iter().find(|(t, _)| *t == tile) {
-                original += 1;
-                if original < j && minimal {
-                    before += 1;
-                }
-            }
-        }
-    }
-    before + 1
+fn minimal_index(cart: &celeste_core::cart_data::CartData, room: (i16, i16), j: usize) -> usize {
+    1 + room_objects(cart, room).iter().take(j.saturating_sub(1)).filter(|o| o.minimal).count()
 }
 
 #[cfg(test)]

@@ -1,23 +1,31 @@
-//! THE FRAME (plans/storage-v2.md "The forward wave"): the frontier's
-//! UNITS through the kernels against the visited set (read-only), the
-//! TRANSLATION of their requests into it (one worker per region; new entries
-//! numbered in key order, so ids are canonical when assigned), the new
-//! LAYER gathered from the units' rows in id order, the frame's edge file.
-//! The result is a function of the frame, not of the scheduling.
+//! THE FRAME (plans/edges-target.md "The forward"): the frontier's UNITS
+//! through the kernels, each emission ORed into its bundle of its target's
+//! ROUTE (`route`); the REGION PHASE there (a job a route and slice: the
+//! dedup against the region's table, the slice's segment of the edge
+//! file). One PIPELINE a frame: the units are cut into SLICES, a slice's
+//! chunks become region jobs once its units are done (and its transfers
+//! have global ids), and the jobs run while the next slice's units do -
+//! the records in flight stay bounded. Then the frame's END: provisional
+//! keys made final, the new entries numbered in key order (canonical), the
+//! new LAYER decoded from its states' keys and cells (no row is copied),
+//! the frame's edge file. The result is a function of the frame, not of
+//! the scheduling.
 
 use anyhow::{ensure, Result};
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 
-use celeste_core::pico8_num::Pico8Num as P8;
-use celeste_engine::runtime2::{collapse_uniform, Cell2, Col, Rt2, AV};
+use celeste_engine::runtime2::Rt2;
+use rustc_hash::FxHashMap;
 
+use super::decode::Skeletons;
 use super::edges::XferTable;
 use super::meta::FrameMeta;
-use super::unit::{RaiseCtx, UnitOut, UnitSink};
-use super::visited::{Key, RegionTable, VisitedSet};
-use celeste_engine::exact::{is_provisional, Code, MissKey, Provisional};
+use super::route::{Chunk, RegionCtx, RouteState, Routes, Sources};
+use super::unit::{RaiseCtx, UnitSink};
+use super::visited::{Key, VisitedSet};
 use super::{id_region, region_of, state_id, StateId};
 use crate::frame::{phases, Block, Filters, FrameStats, FrameStep, Layer};
+use celeste_engine::exact::{is_provisional, Code, MissKey, Provisional};
 
 /// Rows per piece of a layer: a shape's rows are cut into pieces of at most
 /// this many (the checkpoint writes one file per piece, in parallel).
@@ -108,35 +116,57 @@ pub struct Wave {
     pub meta: FrameMeta,
 }
 
-/// Lanes per unit (one kernel call) for a frame of `lanes` input rows on
-/// `workers`: ~16 units a worker, between 1024 and 4096 lanes. A bigger unit
-/// fills more of each region's slices (room (3,0) 100% r0sxhfn at 8 px, f49:
-/// 1024 -> 4096 lanes, padding 22% -> 11%); a small frame keeps enough units
-/// to balance.
-fn unit_lanes(lanes: usize, workers: usize) -> usize {
-    (lanes / (workers.max(1) * 16)).clamp(1024, 4096) & !63
+/// Lanes per unit (one kernel call) for a frame of `lanes` input rows: a
+/// 256th of the frame (16 units a worker at 16 threads), between 1024 and
+/// 4096 lanes. A bigger unit fills more of each region's slices (room (3,0)
+/// 100% r0sxhfn at 8 px, f49: 1024 -> 4096 lanes, padding 22% -> 11%); a
+/// small frame keeps enough units to balance. A function of the frame
+/// alone, not of the threads: the units cut the bundles and the slices
+/// number the transfers, so the edge files are the same at every thread
+/// count.
+fn unit_lanes(lanes: usize) -> usize {
+    (lanes / 256).clamp(1024, 4096) & !63
 }
 
 /// A unit: block, and its range of the block's live lanes (`order`).
 type UnitSpec = (usize, usize, usize);
 
-/// Cut each block's live lanes into units of `unit` lanes, whose span of
-/// block lanes stays within `MAX_UNIT_LANES` (sources are named by their
-/// lane from the unit's first).
+/// Cut each block's live lanes into units of `unit` lanes.
 fn units_of(order: &[Vec<usize>], unit: usize) -> Vec<UnitSpec> {
     let mut units = Vec::new();
     for (bi, o) in order.iter().enumerate() {
         let mut lo = 0;
         while lo < o.len() {
-            let mut hi = (lo + unit).min(o.len());
-            while o[hi - 1] - o[lo] >= super::unit::MAX_UNIT_LANES {
-                hi -= 1;
-            }
+            let hi = (lo + unit).min(o.len());
             units.push((bi, lo, hi));
             lo = hi;
         }
     }
     units
+}
+
+/// Input lanes per SLICE: a slice's units run, then its records go through
+/// the region phase, before the next slice's units run - so a frame holds
+/// one slice's records (~24 B an edge, ~45 edges a lane in room (6,2) 100%:
+/// ~1.1 GB a slice), not the whole frame's. Slices are runs of units, so a
+/// function of the frontier, as everything they cut is.
+const SLICE_LANES: usize = 1 << 20;
+
+/// The units cut into slices of about `SLICE_LANES` lanes.
+fn slices_of(units: &[UnitSpec]) -> Vec<std::ops::Range<usize>> {
+    let mut out = Vec::new();
+    let (mut a, mut lanes) = (0usize, 0usize);
+    for (k, u) in units.iter().enumerate() {
+        lanes += u.2 - u.1;
+        if lanes >= SLICE_LANES {
+            out.push(a..k + 1);
+            (a, lanes) = (k + 1, 0);
+        }
+    }
+    if a < units.len() {
+        out.push(a..units.len());
+    }
+    out
 }
 
 /// Stack per frame worker: kernel spill frames reach ~83 MB (virtual; each
@@ -164,12 +194,28 @@ pub struct WaveCtx<'a> {
     pub layer: Layer,
     /// A raise's per-state layers.
     pub layers: Option<&'a StateLayers>,
+    /// The shapes' skeletons the new layer is decoded with (the forward's,
+    /// kept across frames).
+    pub skeletons: &'a Skeletons,
+}
+
+/// The frontier's rows as sources, by their index over its blocks (the
+/// records' `src`): shape and cell from the id, key from the key column.
+fn sources_of(frontier: &[Block]) -> Sources {
+    let geo = super::GEOMETRY;
+    let mut rows = Vec::with_capacity(frontier.iter().map(Block::lanes).sum());
+    let mut starts = Vec::with_capacity(frontier.len());
+    for b in frontier {
+        starts.push(rows.len() as u32);
+        rows.extend(b.ids().iter().zip(b.keys()).map(|(&id, &key)| super::route::Src { shape: id_region(id) / geo.slots, cell: super::id_cell(&geo, id), region: id_region(id), key }));
+    }
+    Sources { rows, starts }
 }
 
 /// ONE FORWARD FRAME (module doc).
 pub fn run_wave(engine: &dyn FrameStep, frontier: Vec<Block>, cx: WaveCtx) -> Result<Wave> {
     use std::time::Instant;
-    let WaveCtx { visited, xfers, pos, filters, frame, edges_dir, layer, layers } = cx;
+    let WaveCtx { visited, xfers, pos, filters, frame, edges_dir, layer, layers, skeletons } = cx;
     // A platforms-unknown level knows only `PLATFORM_WORLD_FRAMES` worlds.
     let (level, s) = (engine.level(), &engine.settings());
     let game_frame = frame.div_ceil(s.steps_per_frame());
@@ -200,124 +246,228 @@ pub fn run_wave(engine: &dyn FrameStep, frontier: Vec<Block>, cx: WaveCtx) -> Re
     // Per block its live lanes (a skipped lane is never expanded), in id
     // order: by shape, then position.
     let order: Vec<Vec<usize>> = frontier.iter().map(|b| (0..b.lanes()).filter(|&l| b.skip().is_empty() || !b.skip()[l]).collect()).collect();
-    let units = units_of(&order, unit_lanes(order.iter().map(Vec::len).sum(), workers));
-    let next_unit = AtomicUsize::new(0);
+    let units = units_of(&order, unit_lanes(order.iter().map(Vec::len).sum()));
+    let slices = slices_of(&units);
     let notes = (filters.notes_drops() && record).then(|| DropNotes::new(&frontier));
     let raised = match layer {
         Layer::New => None,
         Layer::Raised(r) => Some(r),
     };
     ensure!(raised.is_none() || layers.is_some(), "frame {frame}: a raise needs the tree's layers");
-    // The frame's edge file (a raise's beside the frame's own).
-    let index_path = edges_dir.map(|d| super::edges::file_path(d, frame, raised.map(|r| r.first_seq)));
-
-    // THE UNITS.
-    let t = Instant::now();
-    struct Done {
-        outs: Vec<UnitOut>,
-        xfer_tab: Vec<crate::search::arc_edges::Pair>,
-        pos_edges: rustc_hash::FxHashSet<(u32, u32)>,
-        emitted: u64,
-        requests: u64,
-        lids: u64,
-        busy: std::time::Duration,
-    }
-    let shared: &VisitedSet = visited;
-    let claims = super::unit::Claims::default();
+    let sources = record.then(|| sources_of(&frontier));
+    let routes = Routes::default();
     let prov = Provisional::default();
-    let done: Vec<Done> = std::thread::scope(|scope| {
-        let handles: Vec<_> = (0..workers)
-            .map(|w| {
-                let (frontier, cells, order, units, next_unit, notes, claims, prov, index_path) = (&frontier, &cells, &order, &units, &next_unit, notes.as_ref(), &claims, &prov, &index_path);
-                std::thread::Builder::new().stack_size(WORKER_STACK).spawn_scoped(scope, move || -> Result<Done> {
+    // The routes' regions' tables are taken out of the visited set until the
+    // frame's end; the workers' transfer tables are shared with the gather.
+    let tables: Vec<Option<Box<super::visited::RegionTable>>> = std::mem::take(visited.tables_mut_vec());
+    let xtabs: Vec<std::sync::RwLock<Vec<crate::search::arc_edges::Pair>>> = (0..workers).map(|_| Default::default()).collect();
+    let mut sinks: Vec<UnitSink> = (0..workers)
+        .map(|w| UnitSink::new(visited, &routes, skeletons, &prov, filters, frame, level, w as u32, &xtabs[w], sources.as_ref(), pos.is_some(), notes.as_ref(), raised.map(|r| RaiseCtx { raised: r }), s))
+        .collect();
+    let mut scratch: Vec<super::route::Scratch> = (0..workers).map(|_| super::route::Scratch::default()).collect();
+    let mut slice_of = vec![0u32; units.len()];
+    for (k, r) in slices.iter().enumerate() {
+        slice_of[r.clone()].fill(k as u32);
+    }
+    let pipe = Pipe {
+        xtabs: &xtabs,
+        next_unit: AtomicUsize::new(0),
+        left: slices.iter().map(|r| AtomicUsize::new(r.len())).collect(),
+        upto: slices.iter().map(|_| (0..workers).map(|_| AtomicUsize::new(0)).collect()).collect(),
+        chunks: slices.iter().map(|_| Default::default()).collect(),
+        gathered: AtomicUsize::new(0),
+        gather: std::sync::Mutex::new(Gather { tables, xfers, merged: vec![0; workers], remaps: vec![Vec::new(); workers], routes: 0 }),
+        states: Default::default(),
+        jobs: Default::default(),
+        jobs_left: AtomicUsize::new(0),
+    };
+    let t_pipeline = Instant::now();
+    // THE PIPELINE (one scope for the frame): a worker takes a region job
+    // first (the oldest slice's, heaviest first), else the next unit - at
+    // most one slice past the last gathered - and the worker that ends a
+    // slice's last unit GATHERS the slices that are complete, in order:
+    // their transfers' global ids, new routes, their chunks as jobs. Region
+    // work overlaps the next slices' kernels; no barrier but the frame's end.
+    let spent: Vec<(std::time::Duration, std::time::Duration)> = std::thread::scope(|scope| {
+        let handles: Vec<_> = sinks
+            .iter_mut()
+            .zip(scratch.iter_mut())
+            .map(|(sink, sc)| {
+                let (frontier, cells, order, units, sources, pipe, slice_of, slices, routes) = (&frontier, &cells, &order, &units, &sources, &pipe, &slice_of, &slices, &routes);
+                let visited: &VisitedSet = visited;
+                std::thread::Builder::new().stack_size(WORKER_STACK).spawn_scoped(scope, move || -> Result<(std::time::Duration, std::time::Duration)> {
                     crate::compiled::asm_kernel::set_thread_stack(WORKER_STACK);
-                    let t = Instant::now();
-                    let raise = raised.map(|r| RaiseCtx { raised: r, layers: layers.expect("checked") });
-                    let mut sink = UnitSink::new(shared, claims, prov, filters, frame, level, w as u32, record, pos.is_some(), notes, raise, s);
-                    if let Some(p) = index_path {
-                        sink.stream_blocks(p)?;
-                    }
+                    let (mut busy, mut in_regions) = (std::time::Duration::ZERO, std::time::Duration::ZERO);
+                    let mut idle_spins = 0u32;
                     loop {
-                        let u = next_unit.fetch_add(1, Ordering::Relaxed);
-                        let Some(&(bi, lo, hi)) = units.get(u) else { break };
-                        let b = &frontier[bi];
-                        let (first, last) = (order[bi][lo], order[bi][hi - 1]);
-                        let zeros;
-                        let sources: &[StateId] = if b.ids().is_empty() {
-                            zeros = vec![0; last - first + 1];
-                            &zeros
-                        } else {
-                            &b.ids()[first..=last]
-                        };
-                        let old = raised.is_some_and(|r| b.seq() < r.old_seqs);
-                        // A whole layer piece's rows are named by their range.
-                        let range = b.is_whole().then_some((b.seq(), first as u32));
-                        sink.begin(u as u32, bi as u32, first, sources, range, (!b.skip().is_empty()).then_some(b.skip()), old);
-                        let t_unit = phases::start(s.diag.phases);
-                        engine.run(b, &cells[bi], &order[bi][lo..hi], &mut sink)?;
-                        phases::add(phases::UNIT, t_unit);
-                        sink.end()?;
+                        if let Some(job) = pipe.pop_job() {
+                            let t = Instant::now();
+                            let tp = phases::start(s.diag.phases);
+                            let rcx = RegionCtx { frame, sources: sources.as_ref(), remaps: &job.remaps, layers: raised.and(layers) };
+                            let cs: Vec<&Chunk> = job.chunks.iter().collect();
+                            let r = super::route::run_route(&mut job.state.lock().expect("a route"), job.slice, &cs, &rcx, sc);
+                            pipe.jobs_left.fetch_sub(1, Ordering::AcqRel);
+                            r?;
+                            phases::add(phases::REGIONS, tp);
+                            busy += t.elapsed();
+                            in_regions += t.elapsed();
+                            idle_spins = 0;
+                            continue;
+                        }
+                        let u = pipe.next_unit.load(Ordering::Acquire);
+                        if u < units.len() {
+                            if slice_of[u] as usize > pipe.gathered.load(Ordering::Acquire) + 1 || pipe.next_unit.compare_exchange(u, u + 1, Ordering::AcqRel, Ordering::Acquire).is_err() {
+                                pipe.wait(&mut idle_spins);
+                                continue;
+                            }
+                            let t = Instant::now();
+                            let (bi, lo, hi) = units[u];
+                            let b = &frontier[bi];
+                            let (first, last) = (order[bi][lo], order[bi][hi - 1]);
+                            let ids: &[StateId] = if b.ids().is_empty() { &[] } else { &b.ids()[first..=last] };
+                            let old = raised.is_some_and(|r| b.seq() < r.old_seqs);
+                            let base = sources.as_ref().map_or(0, |x| x.starts[bi]);
+                            sink.begin(u as u32, bi as u32, first, base, ids, (!b.skip().is_empty()).then_some(b.skip()), old);
+                            let t_unit = phases::start(s.diag.phases);
+                            engine.run(b, &cells[bi], &order[bi][lo..hi], sink)?;
+                            phases::add(phases::UNIT, t_unit);
+                            sink.end()?;
+                            let k = slice_of[u] as usize;
+                            pipe.upto[k][sink.worker as usize].fetch_max(sink.xfers_met(), Ordering::AcqRel);
+                            pipe.chunks[k].lock().expect("a slice's chunks").append(&mut sink.outbox);
+                            busy += t.elapsed();
+                            idle_spins = 0;
+                            if pipe.left[k].fetch_sub(1, Ordering::AcqRel) == 1 {
+                                let t = Instant::now();
+                                pipe.gather_ready(slices.len(), routes, visited)?;
+                                busy += t.elapsed();
+                            }
+                            continue;
+                        }
+                        if pipe.gathered.load(Ordering::Acquire) == slices.len() && pipe.jobs_left.load(Ordering::Acquire) == 0 {
+                            break;
+                        }
+                        pipe.wait(&mut idle_spins);
                     }
                     crate::compiled::dispatch::fold_hits();
-                    sink.finish()?;
-                    Ok(Done {
-                        outs: std::mem::take(&mut sink.outs),
-                        xfer_tab: std::mem::take(&mut sink.xfer_tab),
-                        pos_edges: std::mem::take(&mut sink.pos_edges),
-                        emitted: sink.emitted,
-                        requests: sink.n_requests,
-                        lids: sink.n_lids,
-                        busy: t.elapsed(),
-                    })
-                }).expect("spawn wave worker")
+                    Ok((busy, in_regions))
+                })
+                .expect("spawn wave worker")
             })
             .collect();
         handles.into_iter().map(|h| h.join().expect("wave worker panicked")).collect::<Result<Vec<_>>>()
     })?;
-    st.t_wave = t.elapsed();
-    st.wave_idle = idle_fraction(st.t_wave, workers, done.iter().map(|d| d.busy).sum());
+    let t_units = t_pipeline.elapsed();
+    let busy: std::time::Duration = spent.iter().map(|w| w.0).sum();
+    st.t_regions = spent.iter().map(|w| w.1).sum();
+    st.t_wave = t_units;
+    st.wave_idle = idle_fraction(t_units, workers, busy);
     st.rss_wave = crate::metrics::current_rss_gb();
-    drop(frontier);
-    let mut outs: Vec<UnitOut> = Vec::new();
-    let mut tables: Vec<Vec<crate::search::arc_edges::Pair>> = vec![Vec::new(); workers];
-    for (w, d) in done.into_iter().enumerate() {
-        st.lanes_raw += d.emitted as usize;
-        st.requests += d.requests;
-        st.lids += d.lids;
+    st.slices = slices.len();
+    for sink in &mut sinks {
+        sink.finish()?;
+        st.lanes_raw += sink.emitted as usize;
         if let Some(p) = pos {
-            p.record_pairs(d.pos_edges.iter().copied());
+            p.record_pairs(sink.pos_edges.iter().copied());
         }
-        outs.extend(d.outs);
-        tables[w] = d.xfer_tab;
     }
-    st.units = outs.len();
-    st.edge_records = outs.iter().map(|u| u.edges).sum();
+    st.units = units.len();
+    drop(sinks);
+    drop(frontier);
+    let Pipe { gather, states, .. } = pipe;
+    let Gather { mut tables, xfers, .. } = gather.into_inner().expect("the gather");
+    let mut states: Vec<RouteState> = states
+        .into_inner()
+        .expect("the routes")
+        .into_iter()
+        .map(|a| std::sync::Arc::try_unwrap(a).map_err(|_| anyhow::anyhow!("a route still shared")).and_then(|m| m.into_inner().map_err(|_| anyhow::anyhow!("a route lock poisoned"))))
+        .collect::<Result<_>>()?;
 
-    // THE TRANSLATION.
-    let t = Instant::now();
-    let tr = phases::start(s.diag.phases);
-    drop(claims);
-    let (new_states, meta) = translate(visited, &mut outs, &prov, frame, s)?;
-    drop(prov);
-    (st.key_bits, st.key_codes, st.new_codes) = (visited.keys.max_bits(), visited.keys.codes(), meta.keys.codes.len());
-    resolve_lids(visited, &outs, frame, workers)?;
-    phases::add(phases::TRANSLATE, tr);
-    st.t_translate = t.elapsed();
 
-    // THE LAYER, and the frame's edges.
+    // THE FRAME'S END.
     let t = Instant::now();
     let tl = phases::start(s.diag.phases);
+    let mut meta = FrameMeta::new();
+    let finals = finalize_keys(visited, &states, &prov, &mut meta);
+    drop(prov);
+    (st.key_bits, st.key_codes, st.new_codes) = (visited.keys.max_bits(), visited.keys.codes(), meta.keys.codes.len());
+    // New shapes numbered (in hash order); every route gets its region.
+    let mut new_shapes: Vec<u64> = states.iter().filter(|r| r.new_states > 0).map(|r| r.shape).filter(|&h| visited.shape_index(h).is_none()).collect();
+    new_shapes.sort_unstable();
+    new_shapes.dedup();
+    for h in new_shapes {
+        let i = visited.add_shape(h);
+        meta.shapes.push((i, h));
+    }
+    // (`add_shape` sized the visited set's emptied table list for them.)
+    tables.resize_with(visited.tables_mut_vec().len().max(tables.len()), || None);
+    let regions: Vec<Option<u32>> = states.iter().map(|r| visited.region(r.shape, r.slot)).collect();
+    let sealed: Vec<Result<Option<super::route::Sealed>>> = {
+        let next = AtomicUsize::new(0);
+        let cells: Vec<std::sync::Mutex<&mut RouteState>> = states.iter_mut().map(std::sync::Mutex::new).collect();
+        std::thread::scope(|scope| {
+            let hs: Vec<_> = scratch
+                .iter_mut()
+                .map(|sc| {
+                    let (next, cells, regions, finals) = (&next, &cells, &regions, &finals);
+                    scope.spawn(move || {
+                        let mut out = Vec::new();
+                        loop {
+                            let k = next.fetch_add(1, Ordering::Relaxed);
+                            let Some(c) = cells.get(k) else { return out };
+                            let mut st = c.lock().expect("a route");
+                            let r = match regions[k] {
+                                Some(region) => super::route::seal(&mut st, region, finals, sc).map(Some),
+                                // A route of a new shape whose records the
+                                // coarser level all dropped.
+                                None if st.new_states == 0 => Ok(None),
+                                None => Err(anyhow::anyhow!("frame {frame}: a route of an unnumbered shape with new states")),
+                            };
+                            out.push((k, r));
+                        }
+                    })
+                })
+                .collect();
+            let mut all: Vec<(usize, Result<Option<super::route::Sealed>>)> = hs.into_iter().flat_map(|h| h.join().expect("a seal worker panicked")).collect();
+            all.sort_by_key(|x| x.0);
+            all.into_iter().map(|x| x.1).collect()
+        })
+    };
+    let mut news: Vec<StateId> = Vec::new();
+    for x in sealed {
+        if let Some(sl) = x? {
+            meta.entries.extend(sl.entries);
+            news.extend(sl.states);
+        }
+    }
+    meta.entries.sort_unstable();
+    news.sort_unstable();
+    // The tables back into the visited set; the routes' segments into the file.
+    let mut segs = Vec::new();
+    let mut src_index: Vec<(u32, Vec<u32>)> = Vec::new();
+    for (r, region) in states.into_iter().zip(&regions) {
+        let Some(region) = *region else { continue };
+        st.edge_bundles += r.segs.iter().map(|g| g.1.bundles as u64).sum::<u64>();
+        st.edge_records += r.segs.iter().map(|g| g.1.edges).sum::<u64>();
+        st.routes += 1;
+        if !r.sources.is_empty() {
+            src_index.push((region, r.sources.into_iter().collect()));
+        }
+        segs.extend(r.segs.into_iter().map(|g| g.1));
+        tables[region as usize] = Some(r.table);
+    }
+    *visited.tables_mut_vec() = tables;
+    st.lanes_kept = news.len();
+    if let Some(dir) = edges_dir {
+        xfers.flush(dir)?;
+        let path = super::edges::file_path(dir, frame, raised.map(|r| r.first_seq));
+        st.edge_bytes = super::edges::write_file(&path, frame, segs, src_index)?;
+    }
     let first_seq = match layer {
         Layer::New => 0,
         Layer::Raised(r) => r.first_seq,
     };
-    let next = gather_layer(visited, &outs, &new_states, frame, first_seq, level, s)?;
-    st.lanes_kept = new_states.len();
-    if let (Some(dir), Some(path)) = (edges_dir, &index_path) {
-        let remaps = xfers.merge(Some(dir), &tables)?;
-        st.edge_bytes = super::edges::write_file(path, frame, &outs, remaps, workers)? + outs.iter().filter(|u| u.block_at.is_some()).map(|u| u.block_len).sum::<u64>();
-    }
-    drop(outs);
+    let next = decode_layer(visited, skeletons, &news, frame, first_seq, engine.level(), s)?;
     phases::add(phases::LAYER, tl);
     st.t_layer = t.elapsed();
     st.visited_bytes = visited.alloc_bytes();
@@ -330,20 +480,137 @@ pub fn run_wave(engine: &dyn FrameStep, frontier: Vec<Block>, cx: WaveCtx) -> Re
     Ok(Wave { next, stats: st, dropped, meta })
 }
 
-/// A new state: its id and its row (unit, buffer, row).
-pub(crate) type NewState = (StateId, u32, u32, u32);
+/// A region job: one route's chunks of one slice (in unit order), and the
+/// slice's transfer remaps.
+struct Job {
+    state: std::sync::Arc<std::sync::Mutex<RouteState>>,
+    slice: u32,
+    chunks: Vec<Chunk>,
+    remaps: std::sync::Arc<Vec<Vec<u32>>>,
+}
 
-/// The frame's PROVISIONAL keys made final (plans/exact-keys.md): the
-/// requested states' codes the key space lacks, per (shape, field) SORTED
-/// and appended (new shapes first, by hash), then every provisional key in
-/// the units - lids and row buffers - replaced by its packed key. The
-/// dictionaries then are a function of the frame's new states.
-fn finalize_keys(visited: &mut VisitedSet, outs: &mut [UnitOut], prov: &Provisional, meta: &mut FrameMeta, threads: usize) {
-    let mut keys: Vec<Key> = outs.iter().flat_map(|u| u.requests.iter().map(|r| u.lids[r.lid as usize].key)).filter(|&k| is_provisional(k)).collect();
+/// What the gather owns: the regions' tables not yet given to a route,
+/// the global transfer table, per worker its merged length and its ids'
+/// global ones, the routes made so far.
+struct Gather<'a> {
+    tables: Vec<Option<Box<super::visited::RegionTable>>>,
+    xfers: &'a mut XferTable,
+    merged: Vec<usize>,
+    remaps: Vec<Vec<u32>>,
+    routes: usize,
+}
+
+/// The wave's pipeline (`run_wave`): units by index, per slice its units
+/// left and its chunks, the slices gathered, the routes, the jobs (by
+/// slice, heaviest first within one).
+struct Pipe<'a> {
+    xtabs: &'a [std::sync::RwLock<Vec<crate::search::arc_edges::Pair>>],
+    next_unit: AtomicUsize,
+    left: Vec<AtomicUsize>,
+    /// Per slice, per worker its transfer table's length after its units of
+    /// the slice (the pairs it met there are below).
+    upto: Vec<Vec<AtomicUsize>>,
+    chunks: Vec<std::sync::Mutex<Vec<Chunk>>>,
+    gathered: AtomicUsize,
+    gather: std::sync::Mutex<Gather<'a>>,
+    states: std::sync::RwLock<Vec<std::sync::Arc<std::sync::Mutex<RouteState>>>>,
+    jobs: std::sync::Mutex<std::collections::VecDeque<Job>>,
+    jobs_left: AtomicUsize,
+}
+
+impl Pipe<'_> {
+    fn pop_job(&self) -> Option<Job> {
+        self.jobs.lock().expect("the jobs").pop_front()
+    }
+
+    /// Nothing to take now: spin a little, then sleep a little.
+    fn wait(&self, spins: &mut u32) {
+        *spins += 1;
+        if *spins < 64 {
+            std::hint::spin_loop();
+        } else if *spins < 256 {
+            std::thread::yield_now();
+        } else {
+            std::thread::sleep(std::time::Duration::from_micros(50));
+        }
+    }
+
+    /// GATHER every complete slice past the gathered ones, in order (one
+    /// thread at a time): its transfers' global ids - each worker's pairs
+    /// first met in it, its table's new pairs up to its length after its
+    /// units of the slice (`upto`): the slice's pairs not merged before, a
+    /// function of the slice - the new routes with their regions' tables,
+    /// its chunks by route as jobs.
+    fn gather_ready(&self, n_slices: usize, routes: &Routes, visited: &VisitedSet) -> Result<()> {
+        let mut g = self.gather.lock().expect("the gather");
+        loop {
+            let k = self.gathered.load(Ordering::Acquire);
+            if k >= n_slices || self.left[k].load(Ordering::Acquire) != 0 {
+                return Ok(());
+            }
+            let mut chunks = std::mem::take(&mut *self.chunks[k].lock().expect("a slice's chunks"));
+            let g = &mut *g;
+            let upto: Vec<usize> = self.upto[k].iter().zip(&g.merged).map(|(u, &m)| u.load(Ordering::Acquire).max(m)).collect();
+            let tabs: Vec<std::sync::RwLockReadGuard<Vec<crate::search::arc_edges::Pair>>> = (0..g.merged.len()).map(|w| self.xtab(w)).collect();
+            let tails: Vec<&[crate::search::arc_edges::Pair]> = tabs.iter().enumerate().map(|(w, t)| &t[g.merged[w]..upto[w]]).collect();
+            for (w, ids) in g.xfers.merge(&tails).into_iter().enumerate() {
+                g.remaps[w].extend(ids);
+                g.merged[w] = upto[w];
+            }
+            drop(tails);
+            drop(tabs);
+            let remaps = std::sync::Arc::new(g.remaps.clone());
+            {
+                let mut states = self.states.write().expect("the routes");
+                for (shape, slot) in routes.list().into_iter().skip(g.routes) {
+                    let region = visited.region(shape, slot);
+                    let table = region.and_then(|r| g.tables.get_mut(r as usize).and_then(Option::take));
+                    states.push(std::sync::Arc::new(std::sync::Mutex::new(RouteState::new(shape, slot, region, table))));
+                }
+                g.routes = states.len();
+            }
+            // One job a route: its chunks in unit order; heaviest first.
+            chunks.sort_unstable_by_key(|c| std::cmp::Reverse((c.route, c.unit)));
+            let mut jobs: Vec<(usize, u32, Vec<Chunk>)> = Vec::new();
+            while let Some(c) = chunks.pop() {
+                match jobs.last_mut() {
+                    Some(j) if j.1 == c.route => {
+                        j.0 += c.bundles.len();
+                        j.2.push(c);
+                    }
+                    _ => jobs.push((c.bundles.len(), c.route, vec![c])),
+                }
+            }
+            jobs.sort_by_key(|j| (std::cmp::Reverse(j.0), j.1));
+            let states = self.states.read().expect("the routes");
+            let mut q = self.jobs.lock().expect("the jobs");
+            self.jobs_left.fetch_add(jobs.len(), Ordering::AcqRel);
+            for (_, r, chunks) in jobs {
+                q.push_back(Job { state: states[r as usize].clone(), slice: k as u32, chunks, remaps: remaps.clone() });
+            }
+            drop(q);
+            drop(states);
+            self.gathered.store(k + 1, Ordering::Release);
+        }
+    }
+
+    /// Worker `w`'s transfer table.
+    fn xtab(&self, w: usize) -> std::sync::RwLockReadGuard<'_, Vec<crate::search::arc_edges::Pair>> {
+        self.xtabs[w].read().expect("a transfer table")
+    }
+}
+
+/// The frame's PROVISIONAL keys made final (plans/exact-keys.md): the new
+/// states' codes the key space lacks, per (shape, field) SORTED and
+/// appended (new shapes first, by hash); returns each provisional key's
+/// packed key. The dictionaries then are a function of the frame's new
+/// states.
+fn finalize_keys(visited: &mut VisitedSet, states: &[RouteState], prov: &Provisional, meta: &mut FrameMeta) -> FxHashMap<Key, Key> {
+    let mut keys: Vec<Key> = states.iter().flat_map(|r| r.table.keys_from(r.start).iter().copied().filter(|&k| is_provisional(k))).collect();
     keys.sort_unstable();
     keys.dedup();
     if keys.is_empty() {
-        return;
+        return FxHashMap::default();
     }
     let contents: Vec<MissKey> = keys.iter().map(|&k| prov.content(k)).collect();
     let mut new_shapes: Vec<u64> = contents.iter().map(|m| m.shape).filter(|&s| visited.keys.shape(s).is_none()).collect();
@@ -362,210 +629,22 @@ fn finalize_keys(visited: &mut VisitedSet, outs: &mut [UnitOut], prov: &Provisio
     for ((shape, cell), set) in codes {
         visited.keys.add_codes(shape, cell, &set.into_iter().collect::<Vec<_>>(), &mut meta.keys);
     }
-    let map: rustc_hash::FxHashMap<Key, Key> = keys.iter().zip(&contents).map(|(&k, m)| (k, visited.keys.complete(m))).collect();
-    let fin = |k: &mut Key| {
-        if is_provisional(*k) {
-            if let Some(f) = map.get(k) {
-                *k = *f;
-            }
-        }
-    };
-    let per = outs.len().div_ceil(threads.max(1)).max(1);
-    std::thread::scope(|sc| {
-        for part in outs.chunks_mut(per) {
-            let fin = &fin;
-            sc.spawn(move || {
-                for u in part {
-                    u.lids.iter_mut().for_each(|l| fin(&mut l.key));
-                    for b in &mut u.bufs {
-                        b.keys.iter_mut().for_each(fin);
-                    }
-                }
-            });
-        }
-    });
+    keys.iter().zip(&contents).map(|(&k, m)| (k, visited.keys.complete(m))).collect()
 }
 
-/// THE TRANSLATION: the units' requests into the visited set, their
-/// provisional keys made final first (`finalize_keys`). New shapes
-/// numbered first (in hash order), then each target region on one worker:
-/// its requests sorted by (key, cell, unit, request), each distinct key
-/// found or appended as an entry (in key order: canonical numbers), each
-/// distinct (entry, cell) a NEW state, its row the first request's; every
-/// request's lid gets its owner. Returns the new states by id, and the
-/// frame's metadata. `s`: the threads, `--key-check`.
-pub(crate) fn translate(visited: &mut VisitedSet, outs: &mut [UnitOut], prov: &Provisional, frame: u32, s: &crate::settings::Settings) -> Result<(Vec<NewState>, FrameMeta)> {
-    let mut meta = FrameMeta::new();
-    let threads = s.threads();
-    finalize_keys(visited, outs, prov, &mut meta, threads);
-    let mut new_shapes: Vec<u64> = outs.iter().flat_map(|u| u.requests.iter().map(|r| u.lids[r.lid as usize].shape)).filter(|s| visited.shape_index(*s).is_none()).collect();
-    new_shapes.sort_unstable();
-    new_shapes.dedup();
-    for s in new_shapes {
-        let i = visited.add_shape(s);
-        meta.shapes.push((i, s));
-    }
-    let geo = visited.geo;
-    // Per unit its requests as `region << 32 | request`, sorted (in
-    // parallel); per region the units' ranges are gathered by its job.
-    ensure!(outs.len() < 1 << 32, "frame {frame}: {} units", outs.len());
-    let unit_reqs: Vec<Vec<u64>> = {
-        let v: &VisitedSet = visited;
-        par_map(outs, threads, |u| {
-            let mut x: Vec<u64> = u
-                .requests
-                .iter()
-                .enumerate()
-                .map(|(k, r)| {
-                    let l = &u.lids[r.lid as usize];
-                    (region_of(&geo, v.shape_index(l.shape).expect("numbered above"), l.slot) as u64) << 32 | k as u64
-                })
-                .collect();
-            x.sort_unstable();
-            x
-        })
-    };
-    // Per region its request count, heaviest first; the tables taken out to
-    // be filled one region a worker.
-    let mut counts: rustc_hash::FxHashMap<u32, usize> = Default::default();
-    for x in &unit_reqs {
-        let mut i = 0;
-        while i < x.len() {
-            let r = (x[i] >> 32) as u32;
-            let j = i + x[i..].partition_point(|&y| (y >> 32) as u32 == r);
-            *counts.entry(r).or_default() += j - i;
-            i = j;
-        }
-    }
-    let mut ranges: Vec<(u32, usize)> = counts.into_iter().collect();
-    ranges.sort_by_key(|&(r, n)| (std::cmp::Reverse(n), r));
-    let tables = visited.tables_mut();
-    for &(r, _) in &ranges {
-        tables[r as usize].get_or_insert_with(Default::default);
-    }
-    // `&mut` to each table in `ranges`' order (disjoint regions).
-    let mut by_region: Vec<Option<&mut RegionTable>> = tables.iter_mut().map(|t| t.as_deref_mut()).collect();
-    let jobs: Vec<(u32, &mut RegionTable)> = ranges.iter().map(|&(r, _)| (r, by_region[r as usize].take().expect("a table per region"))).collect();
-    let jobs = std::sync::Mutex::new(jobs.into_iter().rev().collect::<Vec<_>>());
-    let check = s.diag.key_check;
-    let words = geo.words;
-    /// Per region job: the region, its new states (by id), its new entries.
-    type Part = Vec<(u32, Vec<NewState>, Vec<(u32, u32, Key)>)>;
-    let outs_ref: &[UnitOut] = outs;
-    let parts: Vec<Part> = std::thread::scope(|scope| {
-        let hs: Vec<_> = (0..threads)
-            .map(|_| {
-                let (jobs, unit_reqs) = (&jobs, &unit_reqs);
-                scope.spawn(move || -> Result<Part> {
-                    let mut done: Part = Vec::new();
-                    let mut items: Vec<(Key, u32, u32, u32)> = Vec::new();
-                    loop {
-                        let Some((region, table)) = jobs.lock().expect("translation jobs").pop() else { break };
-                        let (mut news, mut entries) = (Vec::new(), Vec::new());
-                        items.clear();
-                        for (ui, x) in unit_reqs.iter().enumerate() {
-                            let lo = x.partition_point(|&y| ((y >> 32) as u32) < region);
-                            let hi = lo + x[lo..].partition_point(|&y| (y >> 32) as u32 == region);
-                            let u = &outs_ref[ui];
-                            items.extend(x[lo..hi].iter().map(|&y| {
-                                let k = y as u32;
-                                let r = &u.requests[k as usize];
-                                (u.lids[r.lid as usize].key, r.local, ui as u32, k)
-                            }));
-                        }
-                        items.sort_unstable();
-                        let mut a = 0;
-                        while a < items.len() {
-                            let key = items[a].0;
-                            let b = a + items[a..].partition_point(|x| x.0 == key);
-                            let e = match table.find(key) {
-                                Some(e) => e,
-                                None => {
-                                    let e = table.push_key(words, key);
-                                    entries.push((region, e, key));
-                                    e
-                                }
-                            };
-                            let mut c = a;
-                            while c < b {
-                                let local = items[c].1;
-                                let d = c + items[c..b].partition_point(|x| x.1 == local);
-                                ensure!(table.set(words, e, local), "frame {frame}: a requested state {} was held already", super::show_id(state_id(region, e, local)));
-                                let (u0, k0) = (items[c].2, items[c].3);
-                                let r0 = &outs_ref[u0 as usize].requests[k0 as usize];
-                                news.push((state_id(region, e, local), u0, r0.buf, r0.row));
-                                for &(_, _, ui, k) in &items[c..d] {
-                                    let r = &outs_ref[ui as usize].requests[k as usize];
-                                    // A lid is of one region: only this job sets it.
-                                    let o = &outs_ref[ui as usize].owners[r.lid as usize];
-                                    let was = o.swap(super::unit::pack_owner(region, e), Ordering::Relaxed);
-                                    ensure!(was == super::unit::NO_OWNER || was == super::unit::pack_owner(region, e), "frame {frame}: a lid with two owners");
-                                    if check {
-                                        let (x, y) = (&outs_ref[u0 as usize].bufs[r0.buf as usize], &outs_ref[ui as usize].bufs[r.buf as usize]);
-                                        ensure!(x.same_row(r0.row, y, r.row), "frame {frame}: two rows of state {} differ: a key collision", super::show_id(state_id(region, e, local)));
-                                    }
-                                }
-                                c = d;
-                            }
-                            a = b;
-                        }
-                        news.sort_unstable();
-                        done.push((region, news, entries));
-                    }
-                    Ok(done)
-                })
-            })
-            .collect();
-        hs.into_iter().map(|h| h.join().expect("translation worker panicked")).collect::<Result<Vec<_>>>()
-    })?;
-    // The regions in index order: the new states by id, the entries by
-    // (region, entry).
-    let mut parts: Vec<(u32, Vec<NewState>, Vec<(u32, u32, Key)>)> = parts.into_iter().flatten().collect();
-    parts.sort_unstable_by_key(|p| p.0);
-    let mut news: Vec<NewState> = Vec::with_capacity(parts.iter().map(|p| p.1.len()).sum());
-    for (_, n, entries) in parts {
-        news.extend(n);
-        meta.entries.extend(entries);
-    }
-    Ok((news, meta))
-}
-
-/// The lids whose state another unit claimed (`unit::Claims`): their
-/// owners, found in the visited set the translation filled. Each must be
-/// there: its state was requested.
-pub(crate) fn resolve_lids(visited: &VisitedSet, outs: &[UnitOut], frame: u32, threads: usize) -> Result<()> {
-    let r: Vec<Result<()>> = par_map(outs, threads, |u| {
-        for &l in &u.pending {
-            let o = &u.owners[l as usize];
-            if o.load(Ordering::Relaxed) != super::unit::NO_OWNER {
-                continue;
-            }
-            let lid = &u.lids[l as usize];
-            let (region, entry) = visited.find(lid.shape, lid.slot, lid.key).ok_or_else(|| anyhow::anyhow!("frame {frame}: a requested entry is not in the visited set after the translation"))?;
-            o.store(super::unit::pack_owner(region, entry), Ordering::Relaxed);
-        }
-        Ok(())
-    });
-    r.into_iter().collect()
-}
-
-/// The new LAYER: per shape its new states in id order, gathered from the
-/// units' row buffers, cut into pieces (`PIECE_ROWS`) numbered from
-/// `first_seq`, each row with its id. `s`: the threads, `--key-check`.
-pub(crate) fn gather_layer(visited: &VisitedSet, outs: &[UnitOut], news: &[NewState], frame: u32, first_seq: u32, level: crate::abstraction::Level, s: &crate::settings::Settings) -> Result<Vec<Block>> {
+/// The new LAYER: per shape its new states `news` (by id) DECODED from
+/// their keys and cells with the shape's skeleton (`Skeletons`), cut into
+/// pieces (`PIECE_ROWS`) numbered from `first_seq`, each row with its id.
+/// `s`: the threads, `--key-check`.
+pub(crate) fn decode_layer(visited: &VisitedSet, skeletons: &Skeletons, news: &[StateId], frame: u32, first_seq: u32, level: crate::abstraction::Level, s: &crate::settings::Settings) -> Result<Vec<Block>> {
     let geo = visited.geo;
     // Per shape (ids sort by shape first) its range of `news`.
-    let mut shapes: Vec<(usize, usize)> = Vec::new();
-    let mut i = 0;
-    while i < news.len() {
-        let s = id_region(news[i].0) / geo.slots;
-        let j = i + news[i..].partition_point(|n| id_region(n.0) / geo.slots == s);
-        shapes.push((i, j));
-        i = j;
-    }
     let mut jobs: Vec<(usize, usize, u32)> = Vec::new();
     let mut seq = first_seq;
-    for &(i, j) in &shapes {
+    let mut i = 0;
+    while i < news.len() {
+        let sh = id_region(news[i]) / geo.slots;
+        let j = i + news[i..].partition_point(|&n| id_region(n) / geo.slots == sh);
         let mut lo = i;
         while lo < j {
             let hi = (lo + PIECE_ROWS).min(j);
@@ -574,38 +653,27 @@ pub(crate) fn gather_layer(visited: &VisitedSet, outs: &[UnitOut], news: &[NewSt
             seq += 1;
             lo = hi;
         }
+        i = j;
     }
     par_map(&jobs, s.threads(), |&(lo, hi, seq)| -> Result<Block> {
         let part = &news[lo..hi];
-        // The row buffers the piece reads: in one layout (one engine), read
-        // in place; else (a shape's skeleton differing between buffers) as
-        // blocks through the general gather.
-        let mut bufs: Vec<(u32, u32)> = part.iter().map(|n| (n.1, n.2)).collect();
-        bufs.sort_unstable();
-        bufs.dedup();
-        let refs: Vec<&super::unit::RowBuf> = bufs.iter().map(|&(u, b)| &outs[u as usize].bufs[b as usize]).collect();
-        let at = |n: &NewState| bufs.binary_search(&(n.1, n.2)).expect("a gathered buffer") as u32;
-        let rt2 = if refs.iter().all(|b| b.same_layout(refs[0])) {
-            let rows: Vec<(u32, u32)> = part.iter().map(|n| (at(n), n.3)).collect();
-            super::unit::RowBuf::gather_rows(&refs, &rows)
-        } else {
-            let srcs: Vec<Rt2> = refs.iter().map(|b| b.to_rt2()).collect();
-            let src_refs: Vec<&Rt2> = srcs.iter().collect();
-            let rows: Vec<u64> = part.iter().map(|n| (at(n) as u64) << 32 | n.3 as u64).collect();
-            gather(&src_refs, &rows)
-        };
-        let ids: Vec<StateId> = part.iter().map(|n| n.0).collect();
+        let shape = visited.shape_hash(id_region(part[0]) / geo.slots);
+        let rows: Vec<(Key, u32)> = part
+            .iter()
+            .map(|&id| {
+                let t = visited.table(id_region(id)).expect("a new state's region");
+                (t.key(super::id_entry(id)), super::id_cell(&geo, id))
+            })
+            .collect();
+        let rt2: Rt2 = skeletons.decode(&visited.keys, shape, &rows)?;
         if s.diag.key_check {
             crate::compiled::asm_kernel::key_check_block(&rt2, &visited.keys, level);
-        }
-        let b = Block::layer_piece(rt2, ids, seq);
-        if s.diag.key_check {
-            let cells = b.positions()?;
-            for (id, c) in b.ids().iter().zip(&cells) {
-                ensure!(super::id_cell(&geo, *id) == *c, "frame {frame}: state {} stored at cell {c}", super::show_id(*id));
+            let b = Block::from_rt2(rt2.clone_block());
+            for (&id, c) in part.iter().zip(b.positions()?) {
+                ensure!(super::id_cell(&geo, id) == c, "frame {frame}: state {} decoded at cell {c}", super::show_id(id));
             }
         }
-        Ok(b)
+        Ok(Block::with_ids(rt2, part.to_vec(), seq))
     })
     .into_iter()
     .collect()
@@ -633,101 +701,6 @@ pub fn par_map<T: Sync, R: Send>(items: &[T], threads: usize, f: impl Fn(&T) -> 
     });
     out.sort_unstable_by_key(|e| e.0);
     out.into_iter().map(|e| e.1).collect()
-}
-
-/// One source's column as the gather reads it: its rows, or one value.
-enum Src<'a, T> {
-    Rows(&'a [T]),
-    Same(T),
-}
-
-impl<T: Copy> Src<'_, T> {
-    #[inline]
-    fn at(&self, i: usize) -> T {
-        match self {
-            Src::Rows(v) => v[i],
-            Src::Same(x) => *x,
-        }
-    }
-}
-
-/// The block of the rows `rows` (`(source << 32 | row)` into `srcs`, one
-/// shape): a column the sources hold alike stays uniform; otherwise numbers
-/// as `N`, intervals as `I`, anything else as `V`, then agreeing columns
-/// become uniform - a function of the rows' values, not of the sources.
-fn gather(srcs: &[&Rt2], rows: &[u64]) -> Rt2 {
-    let t = srcs[0];
-    let split = |s: u64| ((s >> 32) as usize, (s as u32) as usize);
-    let cols = (0..t.cols.len())
-        .map(|c| {
-            if !matches!(t.structure[c], Cell2::Val) {
-                return t.cols[c].clone();
-            }
-            if let Col::U(v) = t.cols[c] {
-                if srcs.iter().all(|s| matches!(s.cols[c], Col::U(w) if w == v)) {
-                    return Col::U(v);
-                }
-            }
-            let nums: Option<Vec<Src<P8>>> = srcs
-                .iter()
-                .map(|s| match &s.cols[c] {
-                    Col::N(v) => Some(Src::Rows(v.as_slice())),
-                    Col::U(AV::Num(x)) => Some(Src::Same(*x)),
-                    _ => None,
-                })
-                .collect();
-            let ivals: Option<Vec<Src<(P8, P8)>>> = srcs
-                .iter()
-                .map(|s| match &s.cols[c] {
-                    Col::I(v) => Some(Src::Rows(v.as_slice())),
-                    Col::U(AV::Ival(a, b)) => Some(Src::Same((*a, *b))),
-                    _ => None,
-                })
-                .collect();
-            let col = if let Some(src) = nums {
-                Col::N(rows.iter().map(|&s| {
-                    let (p, i) = split(s);
-                    src[p].at(i)
-                }).collect())
-            } else if let Some(src) = ivals {
-                Col::I(rows.iter().map(|&s| {
-                    let (p, i) = split(s);
-                    src[p].at(i)
-                }).collect())
-            } else {
-                let vs: Vec<AV> = rows
-                    .iter()
-                    .map(|&s| {
-                        let (p, i) = split(s);
-                        srcs[p].cols[c].at(i)
-                    })
-                    .collect();
-                if vs.iter().all(|v| matches!(v, AV::Num(_))) {
-                    Col::N(vs.iter().map(|v| if let AV::Num(x) = v { *x } else { unreachable!() }).collect())
-                } else if vs.iter().all(|v| matches!(v, AV::Ival(..))) {
-                    Col::I(vs.iter().map(|v| if let AV::Ival(a, b) = v { (*a, *b) } else { unreachable!() }).collect())
-                } else {
-                    Col::V(vs)
-                }
-            };
-            collapse_uniform(col)
-        })
-        .collect();
-    Rt2 {
-        width: rows.len(),
-        structure: t.structure.clone(),
-        cols,
-        globals: t.globals.clone(),
-        strings: t.strings.clone(),
-        cart: t.cart.clone(),
-        cache: t.cache.clone(),
-        prints: t.prints.clone(),
-        shape_hash: t.shape_hash,
-        row_keys: rows.iter().map(|&s| {
-            let (p, i) = split(s);
-            srcs[p].row_keys[i]
-        }).collect(),
-    }
 }
 
 /// Frame 0: the initial states into an empty visited set, each block
@@ -802,7 +775,7 @@ pub fn seed(visited: &mut VisitedSet, blocks: &mut [Block], level: crate::abstra
         let mut rt2 = views[seq].clone_block();
         rt2.row_keys = keys[seq].clone();
         rt2.gather_lanes(&order);
-        *b = Block::layer_piece(rt2, sorted, seq as u32);
+        *b = Block::with_ids(rt2, sorted, seq as u32);
     }
     meta.entries.sort_unstable();
     Ok(meta)
@@ -813,6 +786,7 @@ pub fn seed(visited: &mut VisitedSet, blocks: &mut [Block], level: crate::abstra
 pub fn one_frame(engine: &dyn FrameStep, frontier: Vec<Block>, frame: u32) -> Result<Wave> {
     let mut visited = VisitedSet::new(super::GEOMETRY);
     let mut xfers = XferTable::default();
-    let cx = WaveCtx { visited: &mut visited, xfers: &mut xfers, pos: None, filters: Filters::default(), frame, edges_dir: None, layer: Layer::New, layers: None };
+    let skeletons = Skeletons::default();
+    let cx = WaveCtx { visited: &mut visited, xfers: &mut xfers, pos: None, filters: Filters::default(), frame, edges_dir: None, layer: Layer::New, layers: None, skeletons: &skeletons };
     run_wave(engine, frontier, cx)
 }

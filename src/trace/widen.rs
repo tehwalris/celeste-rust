@@ -7,7 +7,7 @@
 //! widen what the table does not name. The two hooks (`Hook::NearFloor`,
 //! `Hook::PlatformInputs`) are implemented below.
 
-use anyhow::{bail, Result};
+use anyhow::{anyhow, bail, Result};
 
 use celeste_core::pico8_num::Pico8Num as P8;
 use celeste_engine::widening::{floor_player_window, Entry, Flag, Hook, Input, Level, Slot, Stored, Target, FLOOR_HITBOX, PLATFORM_PATH, PLAYER_HITBOX, REM, TABLE};
@@ -189,7 +189,10 @@ fn widen_entry(st: &mut State<Symbolic>, d: &mut Symbolic, e: &Entry, errs: &mut
                     let sp = field(&p[..p.len() - 1].to_vec(), &[around]);
                     let Some(Value::Num(centre)) = iface::get(st, &sp) else { bail!("{}: not a number", iface::show(&sp)) };
                     let Some(c) = d.as_const(&centre) else { bail!("{}: not a constant", iface::show(&sp)) };
-                    let (lo, hi) = (c.to_bits() as i32 - radius, c.to_bits() as i32 + radius);
+                    let (lo, hi) = (c.to_bits() as i32 as i64 - radius as i64, c.to_bits() as i32 as i64 + radius as i64);
+                    let (Ok(lo), Ok(hi)) = (i32::try_from(lo), i32::try_from(hi)) else {
+                        bail!("{}: the band {c:?} +- {radius:#x} leaves the 16.16 range", iface::show(p))
+                    };
                     owed = contain(d, num()?, (lo as i64, hi as i64));
                     if let Some(h) = owed {
                         owe(errs, d, p, h);
@@ -432,7 +435,7 @@ fn widen_near_floors(st: &mut State<Symbolic>, d: &mut Symbolic, e: &Entry, errs
         let [ps, pc] = &paths[..] else { bail!("the near floors' entry has two slots") };
         hitbox(st, d, &obj, FLOOR_HITBOX)?;
         let at = position(st, d, &obj)?;
-        let [(xlo, xhi), (ylo, yhi)] = floor_player_window(at);
+        let [(xlo, xhi), (ylo, yhi)] = floor_player_window(at).ok_or_else(|| anyhow!("{}: a fall floor at {at:?}: its window leaves the 16.16 range", iface::show(&obj)))?;
         // `lo < v < hi` for every value a lane may hold (straddling is no
         // overlap, the safe side), as `widening::player_overlaps_floor`.
         let inside = |d: &mut Symbolic, v: NodeId, lo: P8, hi: P8| -> Result<NodeId> {
@@ -452,8 +455,9 @@ fn widen_near_floors(st: &mut State<Symbolic>, d: &mut Symbolic, e: &Entry, errs
             overlap = d.or(&overlap, &both);
             if mid {
                 let [(dxlo, dxhi), (dylo, dyhi)] = PLAYER_PROBE;
-                let x = inside(d, px, xlo + P8::from_i16(dxlo), xhi + P8::from_i16(dxhi))?;
-                let y = inside(d, py, ylo + P8::from_i16(dylo), yhi + P8::from_i16(dyhi))?;
+                let shift = |v: P8, by: i16| v.checked_add(P8::from_i16(by)).ok_or_else(|| anyhow!("{}: the probe window {v:?} + {by} leaves the 16.16 range", iface::show(&obj)));
+                let x = inside(d, px, shift(xlo, dxlo)?, shift(xhi, dxhi)?)?;
+                let y = inside(d, py, shift(ylo, dylo)?, shift(yhi, dyhi)?)?;
                 let both = d.and(&x, &y);
                 probe = d.or(&probe, &both);
             }
@@ -700,15 +704,36 @@ mod tests {
     use crate::trace::cart;
     use crate::trace::interp::Interp;
     use crate::trace::verify::{run_one, trace_frame};
+    use crate::transpile::graph::Val;
+    use std::collections::HashMap;
+
+    /// The constant the table stores in `p` of `st`, if it stores one.
+    fn canonical(st: &State<Symbolic>, p: &Path) -> Option<Val> {
+        for e in Level::EXACT.entries() {
+            for paths in entry_paths(st, e) {
+                for (s, q) in e.slots.iter().zip(paths) {
+                    match s.stored {
+                        Stored::Num(k) if &q == p => return Some(Val::exact_num(P8::from_raw(k))),
+                        Stored::Bool(b) if &q == p => return Some(Val::Bool(Some(b))),
+                        _ => {}
+                    }
+                }
+            }
+        }
+        None
+    }
 
     /// THE DEAD FIELDS are unread: the slots the table stores as a constant
     /// (`Stored::Num`/`Bool`: the timers, the key's sprite) are traced as
     /// free input cells, every other slot concrete, and no stored field
     /// outside them, no guard, error or raise reads one of those cells - so
     /// every value of them makes the same successors, and the constant the
-    /// table stores loses nothing (an EXACT canonicalization). Every frame
-    /// of room (4,0)'s 100% route (the player runs and dashes, takes the
-    /// key and opens the chest with it).
+    /// table stores loses nothing (an EXACT canonicalization). The one read
+    /// is an error's OVERFLOW check of their own arithmetic (`minutes + 1`:
+    /// a free cell may be MAX): it holds at the stored constants, which are
+    /// all the search ever holds there. Every frame of room (4,0)'s 100%
+    /// route (the player runs and dashes, takes the key and opens the chest
+    /// with it).
     #[test]
     fn dead_fields_are_unread() {
         if !std::path::Path::new("lua/celeste-minimal.lua").exists() {
@@ -734,6 +759,7 @@ mod tests {
         // the chest with it.
         let route = crate::concrete::read_inputs("tas/room_4_0_hundred_frame_152.txt").expect("the route");
         let (mut traced, mut with_key, mut with_player, mut has_key) = (0, 0, 0, false);
+        let mut overflow_checks = 0;
         for &byte in &route {
             let roots = slots_where(&st, Level::EXACT, dead);
             with_key += roots.iter().any(|p| p.last() == Some(&iface::key("spr"))) as usize;
@@ -758,10 +784,33 @@ mod tests {
                 }
             }
             let (g, map, _) = crate::transpile::bdd::simplify_local(&it.d.graph, &roots_in, crate::transpile::bdd::LOCAL_CAP, crate::transpile::bdd::LOCAL_EXPAND);
+            // Every input cell is a dead slot's; at its stored constant.
+            let stored: HashMap<u32, Val> = f
+                .iface
+                .slots
+                .iter()
+                .enumerate()
+                .map(|(i, p)| (i as u32, canonical(&st, p).unwrap_or_else(|| panic!("{} is no dead slot", iface::show(p)))))
+                .collect();
+            let at_stored = g.eval_lenient(&stored).expect("eval");
             for (r, w) in roots_in.iter().zip(&what) {
-                let cone = crate::transpile::bdd::reachable(&g, &[map[*r as usize]]);
-                let reads = (0..g.len()).any(|m| cone[m] && matches!(g.get(m as NodeId).op, Op::Cell(_)));
-                assert!(!reads, "{w} reads a dead field");
+                // Down to the cells, but not through an overflow check, which
+                // must hold at the stored constants instead.
+                let mut seen = vec![false; g.len()];
+                let mut stack = vec![map[*r as usize]];
+                while let Some(n) = stack.pop() {
+                    if std::mem::replace(&mut seen[n as usize], true) {
+                        continue;
+                    }
+                    match g.get(n).op {
+                        Op::Cell(_) => panic!("{w} reads a dead field"),
+                        Op::NoWrap => {
+                            assert_eq!(at_stored[n as usize], Val::Bool(Some(true)), "{w}: an overflow check fails at the stored constants");
+                            overflow_checks += 1;
+                        }
+                        _ => stack.extend(g.get(n).args.iter().copied()),
+                    }
+                }
             }
             traced += 1;
             for b in 0..6 {
@@ -775,5 +824,6 @@ mod tests {
             has_key |= matches!(iface::get(&st, &[iface::key("has_key")]), Some(Value::Bool(b)) if it.d.decide(&b) == Some(true));
         }
         assert!(has_key && with_key > 60 && with_player > 60, "{traced} frames traced: {with_key} with the key, {with_player} with the player, the key taken: {has_key}");
+        assert!(overflow_checks > 0, "the timers' own arithmetic is checked");
     }
 }

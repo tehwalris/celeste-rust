@@ -2,7 +2,8 @@
 //! region) a table of ENTRIES - a non-position key and a mask over the
 //! region's cells - numbered densely in the region (a state's id is its
 //! entry and cell, `storage::StateId`). Read-only while a wave's units run;
-//! written only by the translation, one worker per region (`wave`).
+//! a region's table is written only by its route's region jobs, one at a
+//! time (`route::run_route`), and renumbered at the frame's end.
 
 use rustc_hash::FxHashMap;
 
@@ -112,6 +113,74 @@ impl RegionTable {
         self.index[i] = e + 1;
     }
 
+    /// The keys of entries `start..`.
+    pub fn keys_from(&self, start: u32) -> &[Key] {
+        &self.keys[start as usize..]
+    }
+
+    /// The frame's END for this region (`route::seal`): the entries from
+    /// `start` on (the frame's new ones, appended as they came) re-keyed by
+    /// `rekey` (a provisional key to its final one; `None`: none, an error)
+    /// and renumbered in KEY order - canonical, as the frame's new states
+    /// determine it - the index rebuilt. Returns the old numbers in the new
+    /// order.
+    pub fn finish_frame(&mut self, words: usize, start: u32, rekey: impl Fn(Key) -> Option<Key>) -> anyhow::Result<Vec<u32>> {
+        let s = start as usize;
+        let mut rekeyed = false;
+        for k in &mut self.keys[s..] {
+            let f = rekey(*k).ok_or_else(|| anyhow::anyhow!("a provisional key without its final key"))?;
+            rekeyed |= f != *k;
+            *k = f;
+        }
+        let mut order: Vec<u32> = (start..self.keys.len() as u32).collect();
+        order.sort_unstable_by_key(|&e| self.keys[e as usize]);
+        let moved = order.iter().enumerate().any(|(i, &e)| e as usize != s + i);
+        if moved {
+            let keys: Vec<Key> = order.iter().map(|&e| self.keys[e as usize]).collect();
+            let masks: Vec<u64> = order.iter().flat_map(|&e| self.masks[e as usize * words..(e as usize + 1) * words].iter().copied()).collect();
+            self.keys.truncate(s);
+            self.keys.extend(keys);
+            self.masks.truncate(s * words);
+            self.masks.extend(masks);
+        }
+        if rekeyed {
+            // A provisional key's slot was its own: every slot again (rare:
+            // a frame's new codes).
+            self.reindex();
+        } else if moved {
+            // Each new entry keeps its key's slot: the slots found under the
+            // old numbers first, then given the new ones.
+            let m = self.index.len() - 1;
+            // (Entry `s + n` is now the one numbered `order[n]` before.)
+            let slots: Vec<usize> = order
+                .iter()
+                .enumerate()
+                .map(|(n, &old)| {
+                    let mut i = slot_hash(self.keys[s + n]) as usize & m;
+                    while self.index[i] != old + 1 {
+                        i = (i + 1) & m;
+                    }
+                    i
+                })
+                .collect();
+            for (n, i) in slots.into_iter().enumerate() {
+                self.index[i] = start + n as u32 + 1;
+            }
+        }
+        Ok(order)
+    }
+
+    /// OR the cells `mask` into entry `e` (8 x 8 regions: one mask word);
+    /// the cells it held before.
+    #[inline]
+    pub fn or_cells(&mut self, e: u32, mask: u64) -> u64 {
+        debug_assert_eq!(super::GEOMETRY.words, 1);
+        let w = &mut self.masks[e as usize];
+        let had = *w;
+        *w |= mask;
+        had
+    }
+
     /// Set cell `local` of entry `e`; true if it was not set.
     #[inline]
     pub fn set(&mut self, words: usize, e: u32, local: u32) -> bool {
@@ -201,8 +270,9 @@ impl VisitedSet {
         self.regions[region as usize].get_or_insert_with(Default::default)
     }
 
-    /// Every region's table, by index (the translation takes them apart).
-    pub fn tables_mut(&mut self) -> &mut [Option<Box<RegionTable>>] {
+    /// Every region's table, by index (a wave takes them out for its
+    /// frame: `wave::run_wave`).
+    pub fn tables_mut_vec(&mut self) -> &mut Vec<Option<Box<RegionTable>>> {
         &mut self.regions
     }
 
