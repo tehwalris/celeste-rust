@@ -213,7 +213,10 @@ pub struct UnitSink<'a> {
     drop_last: Option<((u64, u32), Option<u32>)>,
     xfer_ids: FxHashMap<crate::search::arc_edges::Pair, u32>,
     xfer_cache: Vec<(crate::compiled::asm_kernel::RawWords, u32)>,
-    pub xfer_tab: Vec<crate::search::arc_edges::Pair>,
+    /// The worker's transfer table (the wave's gather reads it), and its
+    /// length.
+    xfer_tab: &'a std::sync::RwLock<Vec<crate::search::arc_edges::Pair>>,
+    xfer_len: u32,
     /// The units' chunks.
     pub outbox: Vec<Chunk>,
     /// Record `edges` (the pos graph) at all.
@@ -248,6 +251,7 @@ impl<'a> UnitSink<'a> {
         frame: u32,
         level: crate::abstraction::Level,
         worker: u32,
+        xfer_tab: &'a std::sync::RwLock<Vec<crate::search::arc_edges::Pair>>,
         sources: Option<&'a Sources>,
         edges_on: bool,
         drops: Option<&'a super::wave::DropNotes>,
@@ -294,7 +298,8 @@ impl<'a> UnitSink<'a> {
             drop_last: None,
             xfer_ids: Default::default(),
             xfer_cache: Vec::new(),
-            xfer_tab: Vec::new(),
+            xfer_tab,
+            xfer_len: 0,
             outbox: Vec::new(),
             edges_on,
             pos_edges: Default::default(),
@@ -439,11 +444,17 @@ impl<'a> UnitSink<'a> {
         if let Some(&id) = self.xfer_ids.get(&t) {
             return id;
         }
-        let id = u32::try_from(self.xfer_tab.len()).expect("transfer table past u32");
+        let id = self.xfer_len;
         assert!(id < NO_XFER, "worker {}: {id} transfers in one frame", self.worker);
-        self.xfer_tab.push(t);
+        self.xfer_tab.write().expect("a transfer table").push(t);
+        self.xfer_len += 1;
         self.xfer_ids.insert(t, id);
         id
+    }
+
+    /// The transfers this worker has met (its table's length).
+    pub fn xfers_met(&self) -> usize {
+        self.xfer_len as usize
     }
 
     /// The route of `(shape, slot)`.
@@ -677,7 +688,7 @@ impl<'a> UnitSink<'a> {
         self.guarded.clear();
         self.last_shape = 0;
         match self.capture.take() {
-            Some(c) => c.finish(&self.xfer_tab),
+            Some(c) => c.finish(&self.xfer_tab.read().expect("a transfer table")),
             None => Ok(()),
         }
     }

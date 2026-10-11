@@ -251,59 +251,69 @@ pub fn run_wave(engine: &dyn FrameStep, frontier: Vec<Block>, cx: WaveCtx) -> Re
     let sources = record.then(|| sources_of(&frontier));
     let routes = Routes::default();
     let prov = Provisional::default();
-    // The routes through the frame, by id: their regions' tables taken out
-    // of the visited set until the frame's end.
-    let mut states: Vec<std::sync::Mutex<RouteState>> = Vec::new();
-    let mut tables: Vec<Option<Box<super::visited::RegionTable>>> = std::mem::take(visited.tables_mut_vec());
+    // The routes' regions' tables are taken out of the visited set until the
+    // frame's end; the workers' transfer tables are shared with the gather.
+    let tables: Vec<Option<Box<super::visited::RegionTable>>> = std::mem::take(visited.tables_mut_vec());
+    let xtabs: Vec<std::sync::RwLock<Vec<crate::search::arc_edges::Pair>>> = (0..workers).map(|_| Default::default()).collect();
     let mut sinks: Vec<UnitSink> = (0..workers)
-        .map(|w| UnitSink::new(visited, &routes, skeletons, &prov, filters, frame, level, w as u32, sources.as_ref(), pos.is_some(), notes.as_ref(), raised.map(|r| RaiseCtx { raised: r }), s))
+        .map(|w| UnitSink::new(visited, &routes, skeletons, &prov, filters, frame, level, w as u32, &xtabs[w], sources.as_ref(), pos.is_some(), notes.as_ref(), raised.map(|r| RaiseCtx { raised: r }), s))
         .collect();
     let mut scratch: Vec<super::route::Scratch> = (0..workers).map(|_| super::route::Scratch::default()).collect();
-    // Per worker: its transfer table's length merged so far, and its ids'
-    // global ones.
-    let mut merged: Vec<usize> = vec![0; workers];
-    let mut remaps: Vec<Vec<u32>> = vec![Vec::new(); workers];
-    // The previous slice's chunks and its region jobs `(route, chunks a..b,
-    // bundles)`, heaviest first.
-    type Jobs = Vec<(u32, usize, usize, usize)>;
-    let mut pending: (Vec<Chunk>, Jobs) = (Vec::new(), Vec::new());
-    let (mut t_tail, mut busy) = (std::time::Duration::ZERO, std::time::Duration::ZERO);
+    let mut slice_of = vec![0u32; units.len()];
+    for (k, r) in slices.iter().enumerate() {
+        slice_of[r.clone()].fill(k as u32);
+    }
+    let pipe = Pipe {
+        xtabs: &xtabs,
+        next_unit: AtomicUsize::new(0),
+        left: slices.iter().map(|r| AtomicUsize::new(r.len())).collect(),
+        upto: slices.iter().map(|_| (0..workers).map(|_| AtomicUsize::new(0)).collect()).collect(),
+        chunks: slices.iter().map(|_| Default::default()).collect(),
+        gathered: AtomicUsize::new(0),
+        gather: std::sync::Mutex::new(Gather { tables, xfers, merged: vec![0; workers], remaps: vec![Vec::new(); workers], routes: 0 }),
+        states: Default::default(),
+        jobs: Default::default(),
+        jobs_left: AtomicUsize::new(0),
+    };
     let t_pipeline = Instant::now();
-    // THE PIPELINE: step k runs slice k's units and slice k - 1's region
-    // jobs together (a worker takes a job first, heaviest first, then
-    // units), so a heavy route's job overlaps the next slice's kernels;
-    // between steps, slice k's GATHER (its transfers, routes and jobs).
-    for step in 0..=slices.len() {
-        let slice = slices.get(step).cloned().unwrap_or(units.len()..units.len());
-        let t = Instant::now();
-        let next_unit = AtomicUsize::new(slice.start);
-        let next_job = AtomicUsize::new(0);
-        let rcx = RegionCtx { frame, sources: sources.as_ref(), remaps: &remaps, layers: raised.and(layers) };
-        let (chunks, jobs, states_ref, rcx_ref) = (&pending.0, &pending.1, &states, &rcx);
-        let spent: Vec<std::time::Duration> = std::thread::scope(|scope| {
-            let handles: Vec<_> = sinks
-                .iter_mut()
-                .zip(scratch.iter_mut())
-                .map(|(sink, sc)| {
-                    let (frontier, cells, order, units, next_unit, next_job, sources) = (&frontier, &cells, &order, &units, &next_unit, &next_job, &sources);
-                    let end = slice.end;
-                    std::thread::Builder::new().stack_size(WORKER_STACK).spawn_scoped(scope, move || -> Result<std::time::Duration> {
-                        crate::compiled::asm_kernel::set_thread_stack(WORKER_STACK);
-                        let t = Instant::now();
-                        loop {
-                            // A region job first (the previous slice's).
-                            if let Some(&(r, a, b, _)) = jobs.get(next_job.fetch_add(1, Ordering::Relaxed)) {
-                                let cs: Vec<&Chunk> = chunks[a..b].iter().collect();
-                                let mut route = states_ref[r as usize].lock().expect("a route");
-                                let t = phases::start(s.diag.phases);
-                                super::route::run_route(&mut route, &cs, rcx_ref, sc)?;
-                                phases::add(phases::REGIONS, t);
+    // THE PIPELINE (one scope for the frame): a worker takes a region job
+    // first (the oldest slice's, heaviest first), else the next unit - at
+    // most one slice past the last gathered - and the worker that ends a
+    // slice's last unit GATHERS the slices that are complete, in order:
+    // their transfers' global ids, new routes, their chunks as jobs. Region
+    // work overlaps the next slices' kernels; no barrier but the frame's end.
+    let spent: Vec<std::time::Duration> = std::thread::scope(|scope| {
+        let handles: Vec<_> = sinks
+            .iter_mut()
+            .zip(scratch.iter_mut())
+            .map(|(sink, sc)| {
+                let (frontier, cells, order, units, sources, pipe, slice_of, slices, routes) = (&frontier, &cells, &order, &units, &sources, &pipe, &slice_of, &slices, &routes);
+                let visited: &VisitedSet = visited;
+                std::thread::Builder::new().stack_size(WORKER_STACK).spawn_scoped(scope, move || -> Result<std::time::Duration> {
+                    crate::compiled::asm_kernel::set_thread_stack(WORKER_STACK);
+                    let mut busy = std::time::Duration::ZERO;
+                    let mut idle_spins = 0u32;
+                    loop {
+                        if let Some(job) = pipe.pop_job() {
+                            let t = Instant::now();
+                            let tp = phases::start(s.diag.phases);
+                            let rcx = RegionCtx { frame, sources: sources.as_ref(), remaps: &job.remaps, layers: raised.and(layers) };
+                            let cs: Vec<&Chunk> = job.chunks[job.a..job.b].iter().collect();
+                            let r = super::route::run_route(&mut job.state.lock().expect("a route"), &cs, &rcx, sc);
+                            pipe.jobs_left.fetch_sub(1, Ordering::AcqRel);
+                            r?;
+                            phases::add(phases::REGIONS, tp);
+                            busy += t.elapsed();
+                            idle_spins = 0;
+                            continue;
+                        }
+                        let u = pipe.next_unit.load(Ordering::Acquire);
+                        if u < units.len() {
+                            if slice_of[u] as usize > pipe.gathered.load(Ordering::Acquire) + 1 || pipe.next_unit.compare_exchange(u, u + 1, Ordering::AcqRel, Ordering::Acquire).is_err() {
+                                pipe.wait(&mut idle_spins);
                                 continue;
                             }
-                            let u = next_unit.fetch_add(1, Ordering::Relaxed);
-                            if u >= end {
-                                break;
-                            }
+                            let t = Instant::now();
                             let (bi, lo, hi) = units[u];
                             let b = &frontier[bi];
                             let (first, last) = (order[bi][lo], order[bi][hi - 1]);
@@ -315,69 +325,55 @@ pub fn run_wave(engine: &dyn FrameStep, frontier: Vec<Block>, cx: WaveCtx) -> Re
                             engine.run(b, &cells[bi], &order[bi][lo..hi], sink)?;
                             phases::add(phases::UNIT, t_unit);
                             sink.end()?;
+                            let k = slice_of[u] as usize;
+                            pipe.upto[k][sink.worker as usize].fetch_max(sink.xfers_met(), Ordering::AcqRel);
+                            pipe.chunks[k].lock().expect("a slice's chunks").append(&mut sink.outbox);
+                            busy += t.elapsed();
+                            idle_spins = 0;
+                            if pipe.left[k].fetch_sub(1, Ordering::AcqRel) == 1 {
+                                let t = Instant::now();
+                                pipe.gather_ready(slices.len(), routes, visited)?;
+                                busy += t.elapsed();
+                            }
+                            continue;
                         }
-                        crate::compiled::dispatch::fold_hits();
-                        Ok(t.elapsed())
-                    })
-                    .expect("spawn wave worker")
+                        if pipe.gathered.load(Ordering::Acquire) == slices.len() && pipe.jobs_left.load(Ordering::Acquire) == 0 {
+                            break;
+                        }
+                        pipe.wait(&mut idle_spins);
+                    }
+                    crate::compiled::dispatch::fold_hits();
+                    Ok(busy)
                 })
-                .collect();
-            handles.into_iter().map(|h| h.join().expect("wave worker panicked")).collect::<Result<Vec<_>>>()
-        })?;
-        busy += spent.iter().sum::<std::time::Duration>();
-        if step == slices.len() {
-            t_tail = t.elapsed();
-        }
-        drop(std::mem::take(&mut pending));
-        st.rss_wave = st.rss_wave.max(crate::metrics::current_rss_gb());
-        if step == slices.len() {
-            break;
-        }
-        // THE GATHER of slice `step`: its transfers get their global ids
-        // (each worker's NEW pairs only), new routes join with their
-        // regions' tables, its chunks become jobs by route.
-        let tails: Vec<&[crate::search::arc_edges::Pair]> = sinks.iter().zip(&merged).map(|(k, &m)| &k.xfer_tab[m..]).collect();
-        for (w, ids) in xfers.merge(&tails).into_iter().enumerate() {
-            remaps[w].extend(ids);
-            merged[w] = remaps[w].len();
-        }
-        for (shape, slot) in routes.list().into_iter().skip(states.len()) {
-            let region = visited.region(shape, slot);
-            let table = region.and_then(|r| tables.get_mut(r as usize).and_then(Option::take));
-            states.push(std::sync::Mutex::new(RouteState::new(shape, slot, region, table)));
-        }
-        let mut chunks: Vec<Chunk> = sinks.iter_mut().flat_map(|k| k.outbox.drain(..)).collect();
-        chunks.sort_unstable_by_key(|c| (c.route, c.unit));
-        let mut jobs: Jobs = Vec::new();
-        let mut a = 0;
-        while a < chunks.len() {
-            let r = chunks[a].route;
-            let b = a + chunks[a..].partition_point(|c| c.route == r);
-            jobs.push((r, a, b, chunks[a..b].iter().map(|c| c.bundles.len()).sum()));
-            a = b;
-        }
-        jobs.sort_by_key(|j| (std::cmp::Reverse(j.3), j.0));
-        pending = (chunks, jobs);
-    }
+                .expect("spawn wave worker")
+            })
+            .collect();
+        handles.into_iter().map(|h| h.join().expect("wave worker panicked")).collect::<Result<Vec<_>>>()
+    })?;
     let t_units = t_pipeline.elapsed();
+    let busy: std::time::Duration = spent.iter().sum();
     st.t_wave = t_units;
     st.wave_idle = idle_fraction(t_units, workers, busy);
-    st.t_regions = t_tail;
     st.slices = slices.len();
-    let mut tabs: Vec<Vec<crate::search::arc_edges::Pair>> = Vec::with_capacity(workers);
     for sink in &mut sinks {
         sink.finish()?;
         st.lanes_raw += sink.emitted as usize;
         if let Some(p) = pos {
             p.record_pairs(sink.pos_edges.iter().copied());
         }
-        tabs.push(std::mem::take(&mut sink.xfer_tab));
     }
     st.units = units.len();
     drop(sinks);
-    drop(tabs);
     drop(frontier);
-    let mut states: Vec<RouteState> = states.into_iter().map(|m| m.into_inner().expect("a route")).collect();
+    let Pipe { gather, states, .. } = pipe;
+    let Gather { mut tables, xfers, .. } = gather.into_inner().expect("the gather");
+    let mut states: Vec<RouteState> = states
+        .into_inner()
+        .expect("the routes")
+        .into_iter()
+        .map(|a| std::sync::Arc::try_unwrap(a).map_err(|_| anyhow::anyhow!("a route still shared")).and_then(|m| m.into_inner().map_err(|_| anyhow::anyhow!("a route lock poisoned"))))
+        .collect::<Result<_>>()?;
+
 
     // THE FRAME'S END.
     let t = Instant::now();
@@ -473,6 +469,125 @@ pub fn run_wave(engine: &dyn FrameStep, frontier: Vec<Block>, cx: WaveCtx) -> Re
     let dropped = notes.map_or_else(Vec::new, DropNotes::into_sorted);
     phases::print_phases(s.diag.phases, t_frame.elapsed(), workers);
     Ok(Wave { next, stats: st, dropped, meta })
+}
+
+/// A region job: one route's chunks of one slice, and the slice's
+/// transfer remaps.
+struct Job {
+    state: std::sync::Arc<std::sync::Mutex<RouteState>>,
+    chunks: std::sync::Arc<Vec<Chunk>>,
+    a: usize,
+    b: usize,
+    remaps: std::sync::Arc<Vec<Vec<u32>>>,
+}
+
+/// What the gather owns: the regions' tables not yet given to a route,
+/// the global transfer table, per worker its merged length and its ids'
+/// global ones, the routes made so far.
+struct Gather<'a> {
+    tables: Vec<Option<Box<super::visited::RegionTable>>>,
+    xfers: &'a mut XferTable,
+    merged: Vec<usize>,
+    remaps: Vec<Vec<u32>>,
+    routes: usize,
+}
+
+/// The wave's pipeline (`run_wave`): units by index, per slice its units
+/// left and its chunks, the slices gathered, the routes, the jobs (by
+/// slice, heaviest first within one).
+struct Pipe<'a> {
+    xtabs: &'a [std::sync::RwLock<Vec<crate::search::arc_edges::Pair>>],
+    next_unit: AtomicUsize,
+    left: Vec<AtomicUsize>,
+    /// Per slice, per worker its transfer table's length after its units of
+    /// the slice (the pairs it met there are below).
+    upto: Vec<Vec<AtomicUsize>>,
+    chunks: Vec<std::sync::Mutex<Vec<Chunk>>>,
+    gathered: AtomicUsize,
+    gather: std::sync::Mutex<Gather<'a>>,
+    states: std::sync::RwLock<Vec<std::sync::Arc<std::sync::Mutex<RouteState>>>>,
+    jobs: std::sync::Mutex<std::collections::VecDeque<Job>>,
+    jobs_left: AtomicUsize,
+}
+
+impl Pipe<'_> {
+    fn pop_job(&self) -> Option<Job> {
+        self.jobs.lock().expect("the jobs").pop_front()
+    }
+
+    /// Nothing to take now: spin a little, then sleep a little.
+    fn wait(&self, spins: &mut u32) {
+        *spins += 1;
+        if *spins < 64 {
+            std::hint::spin_loop();
+        } else if *spins < 256 {
+            std::thread::yield_now();
+        } else {
+            std::thread::sleep(std::time::Duration::from_micros(50));
+        }
+    }
+
+    /// GATHER every complete slice past the gathered ones, in order (one
+    /// thread at a time): its transfers' global ids - each worker's pairs
+    /// first met in it, its table's new pairs up to its length after its
+    /// units of the slice (`upto`): the slice's pairs not merged before, a
+    /// function of the slice - the new routes with their regions' tables,
+    /// its chunks by route as jobs.
+    fn gather_ready(&self, n_slices: usize, routes: &Routes, visited: &VisitedSet) -> Result<()> {
+        let mut g = self.gather.lock().expect("the gather");
+        loop {
+            let k = self.gathered.load(Ordering::Acquire);
+            if k >= n_slices || self.left[k].load(Ordering::Acquire) != 0 {
+                return Ok(());
+            }
+            let mut chunks = std::mem::take(&mut *self.chunks[k].lock().expect("a slice's chunks"));
+            let g = &mut *g;
+            let upto: Vec<usize> = self.upto[k].iter().zip(&g.merged).map(|(u, &m)| u.load(Ordering::Acquire).max(m)).collect();
+            let tabs: Vec<std::sync::RwLockReadGuard<Vec<crate::search::arc_edges::Pair>>> = (0..g.merged.len()).map(|w| self.xtab(w)).collect();
+            let tails: Vec<&[crate::search::arc_edges::Pair]> = tabs.iter().enumerate().map(|(w, t)| &t[g.merged[w]..upto[w]]).collect();
+            for (w, ids) in g.xfers.merge(&tails).into_iter().enumerate() {
+                g.remaps[w].extend(ids);
+                g.merged[w] = upto[w];
+            }
+            drop(tails);
+            drop(tabs);
+            let remaps = std::sync::Arc::new(g.remaps.clone());
+            {
+                let mut states = self.states.write().expect("the routes");
+                for (shape, slot) in routes.list().into_iter().skip(g.routes) {
+                    let region = visited.region(shape, slot);
+                    let table = region.and_then(|r| g.tables.get_mut(r as usize).and_then(Option::take));
+                    states.push(std::sync::Arc::new(std::sync::Mutex::new(RouteState::new(shape, slot, region, table))));
+                }
+                g.routes = states.len();
+            }
+            chunks.sort_unstable_by_key(|c| (c.route, c.unit));
+            let chunks = std::sync::Arc::new(chunks);
+            let mut jobs: Vec<(u32, usize, usize, usize)> = Vec::new();
+            let mut a = 0;
+            while a < chunks.len() {
+                let r = chunks[a].route;
+                let b = a + chunks[a..].partition_point(|c| c.route == r);
+                jobs.push((r, a, b, chunks[a..b].iter().map(|c| c.bundles.len()).sum()));
+                a = b;
+            }
+            jobs.sort_by_key(|j| (std::cmp::Reverse(j.3), j.0));
+            let states = self.states.read().expect("the routes");
+            let mut q = self.jobs.lock().expect("the jobs");
+            self.jobs_left.fetch_add(jobs.len(), Ordering::AcqRel);
+            for (r, a, b, _) in jobs {
+                q.push_back(Job { state: states[r as usize].clone(), chunks: chunks.clone(), a, b, remaps: remaps.clone() });
+            }
+            drop(q);
+            drop(states);
+            self.gathered.store(k + 1, Ordering::Release);
+        }
+    }
+
+    /// Worker `w`'s transfer table.
+    fn xtab(&self, w: usize) -> std::sync::RwLockReadGuard<'_, Vec<crate::search::arc_edges::Pair>> {
+        self.xtabs[w].read().expect("a transfer table")
+    }
 }
 
 /// The frame's PROVISIONAL keys made final (plans/exact-keys.md): the new

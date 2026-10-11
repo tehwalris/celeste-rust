@@ -71,3 +71,12 @@ Steps:
   run with the units of slice k+1 (pipeline). Reference frame r62h57 f56->f57, 16 threads,
   interleaved, load 27-34: develop total 7.8-8.1 s (one 10.5), this 3.8-5.7 s (one 10.9
   outlier, a load spike in its units); f/e lines identical. t0 193/193; gates OK.
+- 2026-10-11 ~17:25 Region phase and pipeline (05d99f1 + this): chunks carry their unit's distinct
+  targets (deduped once a chunk) and sources; bundles are 24-B index records; the encoder ranks
+  by dense arrays and GROUPS records by (mask, offset, transfer) (21k-135k groups for 1-2.6M
+  bundles at f57) instead of sorting the block - byte-identical output; maps keyed by packed
+  keys use rustc-hash 2 (1.x: long probe chains). A CONTINUOUS pipeline: one scope a frame,
+  region jobs before units, a slice gathered (transfers, routes, jobs) by whoever ends its last
+  unit, in order; transfers merged per slice from each worker's pairs met in it (`upto`).
+  Region worker-s at f57 ~4-5.5 (31-39 at 8dcaa56); wave idle 1-3%. Reference frame A/B
+  (interleaved, load 26-38, spiky): develop min 3.13 s median ~5.7; this min 3.0 median ~4.2.

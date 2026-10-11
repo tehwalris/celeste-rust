@@ -2159,7 +2159,8 @@ mod tests {
             let visited = crate::storage::visited::VisitedSet::new(crate::storage::GEOMETRY);
             let (routes, skeletons) = (crate::storage::route::Routes::default(), crate::storage::decode::Skeletons::default());
             let prov = celeste_engine::exact::Provisional::default();
-            let mut sink = crate::storage::unit::UnitSink::new(&visited, &routes, &skeletons, &prov, Filters::default(), 1, level, 0, None, false, None, None, &s);
+            let xtab = Default::default();
+            let mut sink = crate::storage::unit::UnitSink::new(&visited, &routes, &skeletons, &prov, Filters::default(), 1, level, 0, &xtab, None, false, None, None, &s);
             sink.begin(0, 0, 0, 0, &[0], None, false);
             crate::compiled::dispatch::run_chunk_kernel(&registry, r, &cells, &[0], &mut sink)
         };
@@ -2221,7 +2222,8 @@ mod tests {
             let visited = crate::storage::visited::VisitedSet::new(crate::storage::GEOMETRY);
             let (routes, skeletons) = (crate::storage::route::Routes::default(), crate::storage::decode::Skeletons::default());
             let prov = celeste_engine::exact::Provisional::default();
-            let mut sink = crate::storage::unit::UnitSink::new(&visited, &routes, &skeletons, &prov, Filters::default(), 1, level, 0, None, false, None, None, &s);
+            let xtab = Default::default();
+            let mut sink = crate::storage::unit::UnitSink::new(&visited, &routes, &skeletons, &prov, Filters::default(), 1, level, 0, &xtab, None, false, None, None, &s);
             sink.begin(0, 0, 0, 0, &[0], None, false);
             crate::compiled::dispatch::run_chunk_kernel(&registry, r, &cells, &[0], &mut sink)
         };
