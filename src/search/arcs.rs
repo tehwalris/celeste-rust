@@ -278,6 +278,17 @@ impl Region {
     pub fn n_segs(&self) -> usize {
         self.xs.len()
     }
+    /// The bytes the set holds (its two lists and itself).
+    pub fn bytes(&self) -> usize {
+        std::mem::size_of::<Region>() + self.slabs.capacity() * std::mem::size_of::<Slab>() + self.xs.capacity() * std::mem::size_of::<Seg>()
+    }
+    /// The set as pieces (a slab's y times each of its x segments),
+    /// appended to `out`.
+    pub fn pieces(&self, out: &mut Vec<Piece>) {
+        for (y, xs) in self.slabs() {
+            out.extend(xs.iter().map(|&x| Piece { y, x }));
+        }
+    }
     fn slab_at(&self, y: u32) -> Option<&[Seg]> {
         let i = self.slabs.partition_point(|s| s.hi <= y);
         let s = self.slabs.get(i).filter(|s| s.lo <= y)?;

@@ -2,8 +2,8 @@
 //! `rewrite search --prefer` when the file wins by the horizon).
 //!
 //! The search prunes by several things - level -1, the objects ladder's
-//! filter (the coarser level's REACHED nodes), the remainder-free BFS
-//! marks, the winning sets `W_t` the concrete search looks states up in -
+//! filter (the coarser level's REACHED nodes), the winning sets `W_t` the
+//! concrete search looks states up in -
 //! and each of them over a tree the kernels and the visited set built. If any is
 //! wrong it silently removes real winners: a wrong "optimal" or a tie, never
 //! a fake improvement (witnesses are replayed). A known route that wins by
@@ -18,8 +18,8 @@
 //! * at a frame boundary (`s` a multiple of `steps_per_frame`, where a
 //!   concrete state keys exactly as the tree's rows; mid-frame rows carry the
 //!   split frame's cut widening, which `Rt2::widen_to` does not): its
-//!   projection is a node of the arc graph (in the tree AND marked by the
-//!   remainder-free BFS), whose `W_s` holds its exact remainder - the concrete
+//!   projection is a node of `W`'s support (in the tree AND with a winning
+//!   set at some frame), whose `W_s` holds its exact remainder - the concrete
 //!   search's own admission test - and, at a level that filters the next one,
 //!   the node is REACHED (`arc_dp::reach`) with a deadline >= s. The start
 //!   is the tree's frame-0 row (stored unwidened), its W the arc optimum's.
@@ -48,9 +48,10 @@ pub struct Pruning<'a> {
     pub node: &'a NodeKeys,
     /// The tree's key space (concrete states keyed as its rows).
     pub keys: &'a celeste_engine::exact::KeySpace,
-    /// The start's node: the tree holds the start as the engine made it,
-    /// unwidened, so it is not looked up by its projection.
-    pub start: u32,
+    /// The start's node (`None`: no winning set at any frame): the tree
+    /// holds the start as the engine made it, unwidened, so it is not looked
+    /// up by its projection.
+    pub start: Option<u32>,
     pub w: &'a Winning,
     /// This level's reached nodes (the next level's filter), if it has one.
     pub reached: Option<&'a Visited>,
@@ -197,7 +198,7 @@ fn at_frame(s: u32, spf: u32) -> String {
 
 /// A failed check: the report's line, and whether the FORWARD lost the
 /// state (level -1, the ladder's filter, not in the tree) rather than the
-/// arc phase (not marked, outside W, not reached).
+/// arc phase (no winning set, outside W, not reached).
 struct Miss {
     forward: bool,
     what: String,
@@ -242,10 +243,10 @@ fn verdict(b: &Block, s: u32, seeded: bool, l1: Option<(u32, &crate::trace::leve
     if s % p.settings.steps_per_frame() != 0 {
         return Ok(None);
     }
-    let Some(i) = (if s == 0 { Some(p.start) } else { p.node.get(shape, key, cell) }) else {
+    let Some(i) = (if s == 0 { p.start } else { p.node.get(shape, key, cell) }) else {
         return Ok(match key.and_then(|key| in_tree(p.files, p.tree, s, shape, key, cell)) {
             Some((layer, seq, row)) => backward(format!(
-                "NOT MARKED: in the tree (layer {layer} s{seq} r{row}) but the remainder-free BFS finds no recorded path from it to a win by step {} - a successor on the route was lost ({node})",
+                "NOT IN W's SUPPORT: in the tree (layer {layer} s{seq} r{row}) but its winning set is empty at every step by {} - a successor on the route was lost ({node})",
                 p.horizon
             )),
             None => forward(format!("NOT IN THE TREE by step {s}: the forward lost it since the step before (the kernels, the visited set, or a filter on a mid-frame step; `rewrite follow` shows its parent's kernel successors) ({node})")),

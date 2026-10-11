@@ -2,7 +2,7 @@
 //! the compact static data the web UI (`ui/`) renders.
 //!
 //! Per (level, frame): states and wins per player-position cell; per marked
-//! set (`search --save-marks`: remainder-free marks, arc-marked nodes): the
+//! set (`search --save-marks`: W's support, arc-marked nodes): the
 //! marked states per cell by distance to the win. All of it comes from the
 //! checkpoint HEADERS (cell index, win list), the marks files, and the key
 //! column at marked cells: no row is decoded, no engine built.
@@ -784,7 +784,7 @@ fn read_witness(path: &Path) -> Result<Witness> {
 }
 
 /// `--arc DIR` (`search --save-marks DIR`): the last forward level gets the
-/// remainder-free marks, and a level after it the ARC backward over the same
+/// winning sets' support, and a level after it the ARC backward over the same
 /// tree; the optimum is the arc search's. Returns the witness if present.
 fn attach_arc(hr: &mut HorizonRun, optimal: &mut Option<u32>, dir: &Path) -> Result<Option<Witness>> {
     let kv = read_keyed(&dir.join("arc.txt"))?;

@@ -426,6 +426,9 @@ struct EdgeFile {
     /// The previous layer's files by seq, where units name their sources
     /// as rows of them.
     prev: rustc_hash::FxHashMap<u32, crate::search::checkpoint::FrameFile>,
+    /// The owner index's REGIONS: each one's first entry, in order
+    /// (`regions`, built on first use: a search per region, not a scan).
+    regions: std::sync::OnceLock<Vec<(u32, u32)>>,
 }
 
 impl EdgeFile {
@@ -470,7 +473,66 @@ impl EdgeFile {
                 ensure!(u.src_row0 as u64 + u.n_sources as u64 <= f.width() as u64, "{}: a unit's sources past its file's rows", path.display());
             }
         }
-        Ok(EdgeFile { map, head, data: 16 + n, blocks, prev })
+        ensure!(head.n_owner_index < u32::MAX as u64, "{}: {} owner index entries do not fit a u32", path.display(), head.n_owner_index);
+        Ok(EdgeFile { map, head, data: 16 + n, blocks, prev, regions: std::sync::OnceLock::new() })
+    }
+
+    /// The owner index's regions, `(region, first entry)` in order: from the
+    /// first entry, a binary search for the next region's, region by region.
+    fn regions(&self) -> &[(u32, u32)] {
+        self.regions.get_or_init(|| {
+            let n = self.head.n_owner_index as usize;
+            let mut out = Vec::new();
+            let mut at = 0usize;
+            while at < n {
+                let r = self.owner_at(at).0;
+                out.push((r, at as u32));
+                let (mut lo, mut hi) = (at + 1, n);
+                while lo < hi {
+                    let mid = (lo + hi) / 2;
+                    if self.owner_at(mid).0 <= r {
+                        lo = mid + 1;
+                    } else {
+                        hi = mid;
+                    }
+                }
+                at = lo;
+            }
+            out
+        })
+    }
+
+    /// The first owner index entry in `lo..hi` (one region's) whose entry
+    /// is >= `entry` (`hi`: none): a galloping search from `lo`, the
+    /// previous target's place (targets come in order).
+    fn gallop_entry(&self, lo: usize, hi: usize, entry: u32, stats: &mut ReadStats) -> usize {
+        let at = |k: usize, stats: &mut ReadStats| {
+            stats.owner_probes += 1;
+            self.u32_at(self.head.owner_index, 4 * k + 1)
+        };
+        if lo >= hi || at(lo, stats) >= entry {
+            return lo;
+        }
+        // `a`: an entry below `entry`; the answer is past it.
+        let (mut a, mut step) = (lo, 1usize);
+        let mut b = loop {
+            let b = a + step;
+            if b >= hi || at(b, stats) >= entry {
+                break b.min(hi);
+            }
+            a = b;
+            step *= 2;
+        };
+        a += 1;
+        while a < b {
+            let mid = (a + b) / 2;
+            if at(mid, stats) < entry {
+                a = mid + 1;
+            } else {
+                b = mid;
+            }
+        }
+        a
     }
 
     #[inline]
@@ -531,6 +593,32 @@ impl EdgeFile {
 pub struct InEdge {
     pub src: StateId,
     pub xfer: u32,
+}
+
+/// What `EdgeStore::preds_sorted` read: owner index entries looked at (16
+/// B each: the searches' probes and the entries walked), lid bytes decoded,
+/// in-edges found, and the (target region, frame) pairs it opened.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ReadStats {
+    pub owner_probes: u64,
+    pub lid_bytes: u64,
+    pub edges: u64,
+    pub region_opens: u64,
+}
+
+impl ReadStats {
+    pub fn add(&mut self, o: &ReadStats) {
+        self.owner_probes += o.owner_probes;
+        self.lid_bytes += o.lid_bytes;
+        self.edges += o.edges;
+        self.region_opens += o.region_opens;
+    }
+
+    /// The bytes of the edge store read (logically: the owner index entries
+    /// and the lids' edges; pages touched are at least these).
+    pub fn bytes(&self) -> u64 {
+        16 * self.owner_probes + self.lid_bytes
+    }
 }
 
 /// One edge of a frame: source, target, global transfer id.
@@ -608,6 +696,66 @@ impl EdgeStore {
                     }
                     c <= local
                 });
+            }
+        }
+    }
+
+    /// The in-edges recorded at frame `frame` of every state in `targets`
+    /// (sorted, distinct): `f(k, edge)` for `targets[k]`. Region by region:
+    /// a target region absent from a file costs a search of the file's
+    /// regions (`EdgeFile::regions`), a present one's entries are found by
+    /// galloping through its range in target order, and a lid is decoded
+    /// once for all its targets' cells. `stats` counts what was read.
+    pub fn preds_sorted(&self, frame: u32, targets: &[StateId], stats: &mut ReadStats, mut f: impl FnMut(usize, InEdge)) {
+        debug_assert!(targets.windows(2).all(|w| w[0] < w[1]), "targets sorted and distinct");
+        for file in self.frames.get(frame as usize).into_iter().flatten() {
+            let regions = file.regions();
+            let n = file.head.n_owner_index as usize;
+            let (mut k, mut d) = (0usize, 0usize);
+            while k < targets.len() {
+                let region = id_region(targets[k]);
+                let k_end = k + targets[k..].partition_point(|&t| id_region(t) == region);
+                d += regions[d..].partition_point(|r| r.0 < region);
+                if regions.get(d).is_some_and(|r| r.0 == region) {
+                    stats.region_opens += 1;
+                    let hi = regions.get(d + 1).map_or(n, |r| r.1 as usize);
+                    let mut pos = regions[d].1 as usize;
+                    let mut j = k;
+                    while j < k_end {
+                        let entry = id_entry(targets[j]);
+                        let j_end = j + targets[j..k_end].partition_point(|&t| id_entry(t) == entry);
+                        pos = file.gallop_entry(pos, hi, entry, stats);
+                        while pos < hi {
+                            let (_, e, ui, lid) = file.owner_at(pos);
+                            if e != entry {
+                                break;
+                            }
+                            stats.owner_probes += 1;
+                            pos += 1;
+                            let u = &file.head.units[ui as usize];
+                            let bytes = file.lid_edges(u, file.block(u), lid);
+                            stats.lid_bytes += bytes.len() as u64;
+                            // The lid's edges come by cell, as the group's
+                            // targets do.
+                            let mut q = j;
+                            decode_lid(bytes, |c, s, x| {
+                                while q < j_end && id_local(targets[q]) < c {
+                                    q += 1;
+                                }
+                                if q == j_end {
+                                    return false;
+                                }
+                                if id_local(targets[q]) == c {
+                                    stats.edges += 1;
+                                    f(q, InEdge { src: file.source(u, s), xfer: file.u32_at(u.xfers, x as usize) });
+                                }
+                                true
+                            });
+                        }
+                        j = j_end;
+                    }
+                }
+                k = k_end;
             }
         }
     }
@@ -868,6 +1016,60 @@ pub fn discard_after(dir: &Path, last: u32) -> Result<()> {
     Ok(())
 }
 
+/// A tree's edge files from edges `(source, target, global transfer)` per
+/// frame (each frame one unit of worker 0) and its transfer table `pairs`:
+/// the backward's tests write their graphs with it.
+#[cfg(test)]
+pub(crate) fn write_test_edges(dir: &Path, frames: &[(u32, Vec<(StateId, StateId, u32)>)], pairs: &[Pair]) -> Result<()> {
+    use super::unit::{pack_edge, pack_owner, Lid};
+    let mut xt = XferTable::default();
+    xt.merge(Some(dir), &[pairs.to_vec()])?;
+    ensure!(xt.pairs.len() == pairs.len(), "the test's transfer pairs are not distinct");
+    let identity: Vec<u32> = (0..pairs.len() as u32).collect();
+    let mut last = 0;
+    for (frame, edges) in frames {
+        let mut sources: Vec<StateId> = edges.iter().map(|e| e.0).collect();
+        sources.sort_unstable();
+        sources.dedup();
+        let mut owners: Vec<(u32, u32)> = edges.iter().map(|e| (id_region(e.1), id_entry(e.1))).collect();
+        owners.sort_unstable();
+        owners.dedup();
+        let mut xfers: Vec<u32> = edges.iter().map(|e| e.2).collect();
+        xfers.sort_unstable();
+        xfers.dedup();
+        let at = |v: &[u32], x: u32| v.binary_search(&x).expect("listed") as u32;
+        let mut packed: Vec<u64> = edges
+            .iter()
+            .map(|&(s, t, x)| {
+                let lid = owners.binary_search(&(id_region(t), id_entry(t))).expect("listed") as u32;
+                pack_edge(lid, id_local(t), sources.binary_search(&s).expect("listed") as u32, at(&xfers, x))
+            })
+            .collect();
+        packed.sort_unstable();
+        packed.dedup();
+        let (block, starts) = encode_block(&packed, owners.len());
+        let u = UnitOut {
+            worker: 0,
+            sources,
+            source_rows: None,
+            lids: owners.iter().map(|_| Lid { shape: 0, slot: 0, key: (0, 0) }).collect(),
+            owners: owners.iter().map(|&(r, e)| std::sync::atomic::AtomicU64::new(pack_owner(r, e))).collect(),
+            requests: Vec::new(),
+            pending: Vec::new(),
+            bufs: Vec::new(),
+            block_at: None,
+            block_len: block.len() as u64,
+            block,
+            xfers,
+            starts,
+            edges: packed.len() as u64,
+        };
+        write_file(&file_path(dir, *frame, None), *frame, &[u], vec![identity.clone()], 1)?;
+        last = last.max(*frame);
+    }
+    set_done(dir, last, pairs.len())
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::unit::{pack_edge, Lid, UnitOut};
@@ -986,6 +1188,23 @@ mod tests {
         assert!(got.is_empty(), "another cell of the entry");
         store.preds_at(state_id(r2, 3, 63), 4, &mut got);
         assert_eq!(got, vec![InEdge { src: state_id(2, 0, 1), xfer: 20 }]);
+        // The batched read: every target at once, as one by one.
+        let mut targets = vec![state_id(r1, 7, 3), state_id(r1, 7, 4), state_id(r2, 2, 0), state_id(r2, 3, 63), state_id(r2, 3, 0), state_id(7, 0, 0)];
+        targets.sort_unstable();
+        let mut want: Vec<(usize, InEdge)> = Vec::new();
+        for (k, &t) in targets.iter().enumerate() {
+            let mut v = Vec::new();
+            store.preds_at(t, 4, &mut v);
+            want.extend(v.into_iter().map(|e| (k, e)));
+        }
+        let mut stats = ReadStats::default();
+        let mut batch = Vec::new();
+        store.preds_sorted(4, &targets, &mut stats, |k, e| batch.push((k, e)));
+        batch.sort_unstable();
+        want.sort_unstable();
+        assert_eq!(batch, want);
+        assert_eq!(stats.edges, 603, "every edge has one of the targets");
+        assert_eq!(stats.region_opens, 2, "region 7 has no lids");
         let all = store.edges_at(4, 2);
         assert_eq!(all.len(), 603);
         assert!(all.contains(&Edge { src: state_id(1, 4, 0), dst: state_id(r2, 2, 0), xfer: 11 }));

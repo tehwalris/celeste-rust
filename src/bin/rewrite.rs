@@ -96,8 +96,8 @@ enum Command {
         #[arg(long)]
         no_witness: bool,
         /// Write the web UI's arc pass into this directory (`export-ui
-        /// --arc DIR`): the remainder-free backward's marks
-        /// (`level0.marks.bin`) and the ARC-MARKED nodes (`arc.marks.bin`),
+        /// --arc DIR`): the winning sets' support, each node to its last
+        /// frame (`level0.marks.bin`), and the ARC-MARKED nodes (`arc.marks.bin`),
         /// both as `(shape, cell, key, dist)` rows with `dist` the horizon
         /// minus the last frame the node still wins from; `arc.txt`;
         /// `witness.txt` (inputs and player position per frame).
@@ -252,14 +252,13 @@ enum Command {
         #[arg(long)]
         metrics: Option<String>,
     },
-    /// ONE BACKWARD FRAME of the arc phase, repeatably: the rotation graph of
-    /// a finished level-0 tree to `--horizon` (`arc_dp::load`: the
-    /// remainder-free BFS, the edges, the graph; timed), the winning sets
-    /// down to `W_{F+1}` (`arc_dp::Backward`), then `W_F` from them `--reps`
-    /// times from a copy. Prints (stdout) `W_F`'s fingerprint as the arc
-    /// gate's line (`[gate] hH W fF count hash`, over each node's (shape,
-    /// key, cell) and its set), the same every rep; per rep the candidates,
-    /// pull and merge walls.
+    /// ONE BACKWARD FRAME of the arc phase, repeatably: a finished level-0
+    /// tree's edge files to `--horizon` opened (`arc_dp::Seeds`; timed), the
+    /// winning sets pushed down to `W_{F+1}` (`arc_dp::Backward`), then `W_F`
+    /// from them `--reps` times from a copy. Prints (stdout) `W_F`'s
+    /// fingerprint as the arc gate's line (`[gate] hH W fF count hash`, over
+    /// each node's (shape, key, cell) and its set), the same every rep; per
+    /// rep the read, pull and merge walls.
     BenchBackward {
         /// The level-0 tree (`frames/`, `edges/` under it).
         #[arg(long)]
@@ -593,8 +592,8 @@ enum Command {
         /// Output directory (the UI serves it as `data/`).
         #[arg(long, default_value = "/var/tmp/celeste-ui/data")]
         out: String,
-        /// The search's `--save-marks` directory: the remainder-free and the
-        /// arc backward's marks over the last level's tree (and the witness).
+        /// The search's `--save-marks` directory: the winning sets' support
+        /// and the arc-marked nodes over the last level's tree (and the witness).
         #[arg(long)]
         arc: Option<String>,
         /// A concrete run to draw instead of the arc directory's witness:
@@ -1230,13 +1229,12 @@ fn main() -> Result<()> {
             anyhow::ensure!(frame < horizon, "--frame {frame}: below the horizon {horizon}");
             let dir = std::path::Path::new(&level_dir);
             let t = std::time::Instant::now();
-            let loaded = celeste_rust::search::arc_dp::load(dir, horizon, cfg.threads())?;
-            let g = &loaded.graph;
+            let seeds = celeste_rust::search::arc_dp::Seeds::load(dir, horizon)?;
             let resolver = celeste_rust::storage::marks::Resolver::load(dir, horizon)?;
             let content = resolver.space.content_hash();
-            eprintln!("[bench-backward] graph of h{horizon} loaded in {:.2} s: {} nodes, {} edges; {} threads", t.elapsed().as_secs_f64(), g.len(), loaded.edges, cfg.threads());
+            eprintln!("[bench-backward] h{horizon}'s edge files opened in {:.2} s: {} win rows, {} edges; {} threads", t.elapsed().as_secs_f64(), seeds.wins.len(), seeds.store.edges, cfg.threads());
             let t = std::time::Instant::now();
-            let mut b = celeste_rust::search::arc_dp::Backward::new(g, horizon, cfg.threads());
+            let mut b = celeste_rust::search::arc_dp::Backward::new(&seeds.store, &seeds.pairs, &seeds.wins, horizon, cfg.threads());
             for f in (frame + 1..horizon).rev() {
                 b.step(f);
             }
@@ -1252,13 +1250,13 @@ fn main() -> Result<()> {
                 // The gate's W line: per node with a set, its (shape, key,
                 // cell) and its set's rectangles, summed.
                 let (mut n, mut acc) = (0usize, 0u64);
-                for (i, r) in c.current() {
-                    let (shape, key, cell) = resolver.resolve(g.id(i))?;
+                for (id, r) in c.current() {
+                    let (shape, key, cell) = resolver.resolve(id)?;
                     n += 1;
                     acc = acc.wrapping_add(celeste_rust::search::arc_dp::gate_w_hash(content.state(shape, key, cell), r));
                 }
                 let ms = |k: usize| (after[k] - before[k]).as_secs_f64() * 1e3;
-                eprintln!("[bench-backward] rep {rep}: W f{frame} in {:.1} ms (candidates {:.1}, pull {:.1}, merge {:.1} ms)", wall.as_secs_f64() * 1e3, ms(0), ms(1), ms(2));
+                eprintln!("[bench-backward] rep {rep}: W f{frame} in {:.1} ms (read {:.1}, pull {:.1}, merge {:.1} ms)", wall.as_secs_f64() * 1e3, ms(0), ms(1), ms(2));
                 let line = format!("[gate] h{horizon} W f{frame:03} {n} {acc:016x}");
                 match &first {
                     None => println!("{line}"),
