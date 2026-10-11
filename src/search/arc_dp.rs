@@ -39,7 +39,8 @@ const BLOCK: usize = 16;
 /// delta), its layer, its spans' count, and per span its length and its set
 /// (the arena's sets numbered by use, the most used first); per block of
 /// `BLOCK` nodes its first id and byte offset. ~4 B a node and ~3 a span
-/// (a span as fields took 8, its node's id and offset 12 more).
+/// (a span as fields took 8, its node's id and offset 12 more), in a scratch
+/// file mapped back when the backward has a directory for it (`Spill`).
 pub struct Winning {
     n: usize,
     blocks: Vec<(StateId, u64)>,
