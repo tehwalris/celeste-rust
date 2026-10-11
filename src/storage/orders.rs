@@ -1,8 +1,8 @@
-//! `rewrite bundle-orders` (temporary, before the target-region edge
-//! files): a finished tree's recorded edges re-stored as target-region
-//! bundle blocks (`storage::bundle`), one per (target region, frame), in
-//! candidate orders, counting bytes raw and with zstd -1. Re-validates on
-//! real trees what bench/dedup DESIGNS O3 measured on one frame.
+//! `rewrite bundle-orders`: a finished tree's bundles re-encoded, one block
+//! per (target region, frame) (its segments' bundles merged), in candidate
+//! orders and with relative masks, counting bytes raw and with zstd -1 -
+//! the stored order (`bundle::ORDER`) checked against the alternatives on
+//! real trees (plans/edges-target.md "The order").
 
 use anyhow::Result;
 use rustc_hash::FxHashMap;
@@ -10,9 +10,7 @@ use rustc_hash::FxHashMap;
 use super::bundle::{self, Bundle, F};
 use super::edges::EdgeStore;
 use super::visited::Key;
-use super::{id_cell, id_local, id_region, Geometry, GEOMETRY};
-
-type BKey = (u32, u32, Key, u32, u32, Key);
+use super::{id_local, id_region, Geometry, GEOMETRY};
 
 /// Level-byte flags of a relative-mask record: the mask is the reference;
 /// the mask is an explicit u64.
@@ -165,33 +163,15 @@ pub fn orders(dir: &std::path::Path, from: u32, to: u32, threads: usize) -> Resu
                 *front.entry((id_region(id), k)).or_default() |= 1u64 << id_local(id);
             }
         }
-        let maps = store.par_scan(f, threads, FxHashMap::<BKey, u64>::default, |m, e| {
-            let (_, tk, tc) = resolver.resolve(e.dst).expect("a target");
-            let (_, sk, _) = resolver.resolve(e.src).expect("a source");
-            let sc = id_cell(&geo, e.src);
-            let s_shape = id_region(e.src) / geo.slots;
-            *m.entry((id_region(e.dst), s_shape, sk, e.xfer, bundle::offset(sc, tc), tk)).or_default() |= 1u64 << id_local(e.dst);
-        });
-        let mut v: Vec<(BKey, u64)> = maps.into_iter().flatten().collect();
-        v.sort_unstable_by_key(|x| x.0);
-        let mut merged: Vec<(BKey, u64)> = Vec::with_capacity(v.len());
-        for (k, m) in v {
-            match merged.last_mut() {
-                Some(l) if l.0 == k => l.1 |= m,
-                _ => merged.push((k, m)),
-            }
-        }
-        let mut groups: Vec<(usize, usize)> = Vec::new();
-        let mut a = 0;
-        while a < merged.len() {
-            let b = a + merged[a..].partition_point(|x| x.0 .0 == merged[a].0 .0);
-            groups.push((a, b));
-            a = b;
-        }
-        let parts: Vec<Tot> = super::wave::par_map(&groups, threads, |&(a, b)| {
-            let region = merged[a].0 .0;
+        let regions = store.regions(f);
+        let parts: Vec<Result<Tot>> = super::wave::par_map(&regions, threads, |&region| -> Result<Tot> {
             let slot = region % geo.slots;
-            let mut bundles: Vec<Bundle> = merged[a..b].iter().map(|&((_, sh, sk, x, o, tk), mask)| Bundle { s_shape: sh, s_key: sk, x, o, t_key: tk, mask }).collect();
+            let mut by: FxHashMap<(u32, Key, u32, u32, Key), u64> = FxHashMap::default();
+            let mut dec = super::edges::Decoder::default();
+            for seg in store.segments(f, region) {
+                dec.bundles(&seg, |b| *by.entry((b.s_shape, b.s_key, b.x, b.o, b.t_key)).or_default() |= b.mask)?;
+            }
+            let mut bundles: Vec<Bundle> = by.into_iter().map(|((s_shape, s_key, x, o, t_key), mask)| Bundle { s_shape, s_key, x, o, t_key, mask }).collect();
             let mut t = Tot { blocks: 1, bundles: bundles.len() as u64, edges: bundles.iter().map(|b| b.mask.count_ones() as u64).sum(), ..Default::default() };
             let mut z = zstd::bulk::Compressor::new(1).expect("zstd");
             let mut raw = Vec::new();
@@ -211,11 +191,11 @@ pub fn orders(dir: &std::path::Path, from: u32, to: u32, threads: usize) -> Resu
             t.raw[4] = rawr.len() as u64;
             t.z[4] = z.compress(&rawr).expect("zstd").len() as u64;
             t.rel = st;
-            t
+            Ok(t)
         });
         let mut tot = Tot::default();
-        for p in &parts {
-            add(&mut tot, p);
+        for p in parts {
+            add(&mut tot, &p?);
         }
         print(&format!("f{f:03}"), &tot, t0.elapsed().as_secs_f64());
         add(&mut all, &tot);

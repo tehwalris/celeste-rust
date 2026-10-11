@@ -1,10 +1,10 @@
 //! THE STORAGE MICROBENCHMARK: one real frame's emissions, captured in the
 //! forward (`--emit-capture DIR`: every wave, `DIR/f{F}/`; `bench-frame`
-//! runs one),
-//! replayed through the REAL storage code (`UnitSink`, the translation, the
-//! layer's gather, the edge file) by `rewrite bench-storage`, against the
-//! tree's visited set at the frame before - without the kernels, so a tweak
-//! to the storage is timed alone.
+//! runs one), replayed through the REAL wave (`wave::run_wave`: the units'
+//! sinks and routes, the region phase, the frame's end, the edge file) by
+//! `rewrite bench-storage`, from the tree's frame before - the kernels
+//! replaced by the capture (`Replay`), so a tweak to the storage is timed
+//! alone.
 //!
 //! A capture: per wave worker `w{n}.bin`, tagged little-endian records in
 //! unit order - UNIT (`1`, unit index u32, block u32, first lane u64, source
@@ -15,14 +15,14 @@
 //! provisional key, re-interned by the replay) and SHAPE (`5`, length u32,
 //! a bincode `exact::ShapeRecord`: a shape the key space lacks) - and its transfer
 //! table `x{n}.bin` (`encode_pair` each, the EMIT ids index it); `env.txt`.
-//! Rows are not captured: the replay copies a row of 16 numbers (the key
-//! and cell spread over them), about a real row's size.
+//! Rows are not captured: the new layer is decoded from the keys, each
+//! shape with its first frontier piece's skeleton.
 
 use anyhow::{ensure, Context, Result};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use super::unit::{RowBuf, UnitSink};
+use super::unit::UnitSink;
 use super::visited::{Key, VisitedSet};
 use super::StateId;
 
@@ -118,8 +118,6 @@ struct CapUnit {
     unit: u32,
     block: u32,
     lo: u64,
-    old: bool,
-    sources: Vec<StateId>,
     /// The worker stream and the byte range of its records.
     stream: usize,
     records: std::ops::Range<usize>,
@@ -159,8 +157,6 @@ impl Capture {
                 let (unit, block) = (u32_at(pos + 1), u32_at(pos + 5));
                 let lo = u64::from_le_bytes(b[pos + 9..pos + 17].try_into().unwrap());
                 let n = u32_at(pos + 17) as usize;
-                let old = b[pos + 21] != 0;
-                let sources: Vec<StateId> = (0..n).map(|k| u64::from_le_bytes(b[pos + 22 + 8 * k..pos + 30 + 8 * k].try_into().unwrap())).collect();
                 pos += 22 + 8 * n;
                 let start = pos;
                 let mut emits = 0u64;
@@ -175,7 +171,7 @@ impl Capture {
                         t => anyhow::bail!("{}: record tag {t} at byte {pos}", p.display()),
                     }
                 }
-                units.push(CapUnit { unit, block, lo, old, sources, stream: maps.len(), records: start..pos, emits });
+                units.push(CapUnit { unit, block, lo, stream: maps.len(), records: start..pos, emits });
             }
             maps.push(map);
         }
@@ -185,28 +181,72 @@ impl Capture {
     }
 }
 
-/// The replay's row of a state: 16 numbers (the key's words and the cell),
-/// in a synthetic block of the shape.
-fn bench_skeleton(shape: u64, room: (i16, i16)) -> celeste_engine::runtime2::Rt2 {
-    use celeste_engine::runtime2::{Cell2, Col, Rt2};
-    let (cart, cache) = crate::compiled::room_context(room).expect("the room's cart");
-    let mut b = Rt2::empty(0, 0, &[], cart, cache);
-    b.structure = vec![Cell2::Val; 16];
-    b.cols = (0..16).map(|_| Col::N(Vec::new())).collect();
-    b.shape_hash = shape;
-    b
+/// The capture as a `FrameStep`: a unit's "kernels" replay the captured
+/// unit with the same block and first lane (the replay runs at the
+/// capture's thread count, so the wave cuts the same units).
+struct Replay<'a> {
+    cap: &'a Capture,
+    /// Captured units by (frontier block, first lane).
+    by_start: rustc_hash::FxHashMap<(u32, u64), usize>,
+    /// The frontier's blocks by (shape, seq): their index in it.
+    blocks: rustc_hash::FxHashMap<(u64, u32), u32>,
+    /// Per shape, the skeleton its emissions carry (its first frontier
+    /// piece's: the replay has no kernel templates).
+    skeletons: rustc_hash::FxHashMap<u64, celeste_engine::runtime2::Rt2>,
+    level: crate::abstraction::Level,
+    settings: std::sync::Arc<crate::settings::Settings>,
 }
 
-fn push_bench_row(buf: &mut RowBuf, key: Key, cell: u32) {
-    use super::unit::TCol;
-    let words = [key.0 as u32, (key.0 >> 32) as u32, key.1 as u32, (key.1 >> 32) as u32, cell];
-    for (i, (_, col)) in buf.cols.iter_mut().enumerate() {
-        if let TCol::Num(v) = col {
-            v.push(words[i % words.len()].rotate_left(i as u32));
+impl crate::frame::FrameStep for Replay<'_> {
+    fn run(&self, block: &crate::frame::Block, _cell_in: &[u32], lanes: &[usize], sink: &mut UnitSink) -> Result<()> {
+        let bi = *self.blocks.get(&(block.shard_shape(), block.seq())).context("a frontier block the capture does not know")?;
+        let first = *lanes.first().context("an empty unit")? as u64;
+        let &ui = self.by_start.get(&(bi, first)).with_context(|| format!("no captured unit starts at lane {first} of block {bi}: replay at the capture's thread count"))?;
+        let u = &self.cap.units[ui];
+        sink.replaying();
+        let b = &self.cap.maps[u.stream][u.records.clone()];
+        let u32_at = |o: usize| u32::from_le_bytes(b[o..o + 4].try_into().unwrap());
+        let u64_at = |o: usize| u64::from_le_bytes(b[o..o + 8].try_into().unwrap());
+        let mut pos = 0usize;
+        // The next emission's provisional key, re-interned (a MISS record).
+        let mut miss: Option<Key> = None;
+        while pos < b.len() {
+            match b[pos] {
+                3 => {
+                    sink.dropped(u.lo as usize + u32_at(pos + 1) as usize, u32_at(pos + 5));
+                    pos += 9;
+                    continue;
+                }
+                4 | 5 => {
+                    let n = u32_at(pos + 1) as usize;
+                    let bytes = &b[pos + 5..pos + 5 + n];
+                    if b[pos] == 4 {
+                        miss = Some(sink.provisional().intern(bincode::deserialize(bytes)?));
+                    } else {
+                        sink.note_shape(&bincode::deserialize(bytes)?);
+                    }
+                    pos += 5 + n;
+                    continue;
+                }
+                _ => {}
+            }
+            let (shape, key, cell, lane, x) = (u64_at(pos + 1), (u64_at(pos + 9), u64_at(pos + 17)), u32_at(pos + 25), u32_at(pos + 29), u32_at(pos + 33));
+            let key = miss.take().unwrap_or(key);
+            pos += 37;
+            let xfer = (x != u32::MAX).then(|| sink.xfer_id(self.cap.xfers[u.stream][x as usize]));
+            let skel = self.skeletons.get(&shape).with_context(|| format!("the captured shape {shape:016x} is not in the frontier: the replay has no skeleton for it"))?;
+            sink.emit(shape, cell, key, u.lo as usize + lane as usize, xfer, || skel.clone_block(), |_| {})?;
         }
+        Ok(())
     }
-    buf.keys.push(key);
-    buf.cells.push(cell);
+
+    fn level(&self) -> crate::abstraction::Level {
+        self.level
+    }
+
+    fn settings(&self) -> std::sync::Arc<crate::settings::Settings> {
+        self.settings.clone()
+    }
 }
 
 /// What `rewrite bench-storage` runs.
@@ -216,14 +256,13 @@ pub struct BenchArgs<'a> {
     pub level: crate::abstraction::Level,
     /// The run's settings (the capture's: threads, the room).
     pub settings: &'a crate::settings::Settings,
-    pub phase: &'a str,
     pub reps: usize,
 }
 
-/// Replay a capture `reps` times (module doc), printing per rep the phases'
-/// wall times and the validation: emissions, requests, lids, new states and
-/// edges, and fingerprints of the new states and of the edge set computed as
-/// `rewrite ckhash` computes them (its `f{frame}` and `e{frame}` lines).
+/// Replay a capture `reps` times (module doc), printing per rep the wave's
+/// phases (the units - the sinks over the captured emissions - the region
+/// phase, the frame's end) and its fingerprints as `rewrite ckhash`
+/// computes them (its `f{frame}` and `e{frame}` lines).
 pub fn bench_storage(a: &BenchArgs) -> Result<()> {
     use std::time::Instant;
     let t = Instant::now();
@@ -232,92 +271,34 @@ pub fn bench_storage(a: &BenchArgs) -> Result<()> {
     let emits: u64 = cap.units.iter().map(|u| u.emits).sum();
     eprintln!("[bench-storage] capture of f{frame}: {} units, {} streams, {emits} emissions, mapped in {:.1} s", cap.units.len(), cap.maps.len(), t.elapsed().as_secs_f64());
     let t = Instant::now();
-    let (base, _) = crate::frame::restore_visited(a.tree, frame - 1)?;
-    let base_xfers = super::edges::XferTable::load(&a.tree.join("edges"))?;
-    eprintln!("[bench-storage] the tree's visited set at f{} ({} states, {} entries) in {:.1} s", frame - 1, base.len(), base.entries(), t.elapsed().as_secs_f64());
-    let (do_translate, do_edges) = match a.phase {
-        "units" => (false, false),
-        "translate" => (true, false),
-        "all" => (true, true),
-        p => anyhow::bail!("--phase {p}: units, translate or all"),
-    };
+    let st = crate::frame::ForwardState::at(a.tree, frame - 1, true, a.level, a.settings)?;
+    eprintln!("[bench-storage] the tree at f{} ({} states, {} lanes in) in {:.1} s", frame - 1, st.visited_len(), st.frontier_lanes(), t.elapsed().as_secs_f64());
+    let (blocks, skeletons) = st.frontier_index();
+    let by_start = cap.units.iter().enumerate().map(|(i, u)| ((u.block, u.lo), i)).collect();
+    let engine = Replay { cap: &cap, by_start, blocks, skeletons, level: a.level, settings: std::sync::Arc::new(a.settings.clone()) };
     let scratch = std::env::temp_dir().join(format!("celeste-bench-storage-{}", std::process::id()));
+    let ms = |d: std::time::Duration| d.as_secs_f64() * 1e3;
     for rep in 0..a.reps {
-        let mut visited = base.clone();
-        let mut xfers = base_xfers.clone();
         let _ = std::fs::remove_dir_all(&scratch);
-        let index = super::edges::file_path(&scratch, frame, None);
-        // THE UNITS: each replayed on a worker's sink, heaviest first; with
-        // the edge file, their blocks streamed to the workers' files.
-        let t0 = Instant::now();
-        let mut order: Vec<usize> = (0..cap.units.len()).collect();
-        order.sort_by_key(|&i| std::cmp::Reverse(cap.units[i].emits));
-        let next = std::sync::atomic::AtomicUsize::new(0);
-        let shared: &VisitedSet = &visited;
-        let claims = super::unit::Claims::default();
-        let prov = celeste_engine::exact::Provisional::default();
-        type Done = (Vec<super::unit::UnitOut>, Vec<crate::search::arc_edges::Pair>, u64, u64);
-        let done: Vec<Done> = std::thread::scope(|scope| {
-            let hs: Vec<_> = (0..a.settings.threads())
-                .map(|w| {
-                    let (cap, order, next, claims, prov, index) = (&cap, &order, &next, &claims, &prov, &index);
-                    scope.spawn(move || -> Result<Done> {
-                        let mut sink = UnitSink::new(shared, claims, prov, crate::frame::Filters::default(), frame, a.level, w as u32, true, false, None, None, a.settings);
-                        if do_edges {
-                            sink.stream_blocks(&index)?;
-                        }
-                        let mut xmap: Vec<Vec<u32>> = vec![Vec::new(); cap.maps.len()];
-                        loop {
-                            let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            let Some(&ui) = order.get(i) else { break };
-                            let u = &cap.units[ui];
-                            sink.begin(u.unit, u.block, u.lo as usize, &u.sources, None, None, u.old);
-                            replay_unit(&mut sink, cap, u, &mut xmap[u.stream], a.settings.room)?;
-                            sink.end()?;
-                        }
-                        sink.finish()?;
-                        Ok((std::mem::take(&mut sink.outs), std::mem::take(&mut sink.xfer_tab), sink.n_requests, sink.n_lids))
-                    })
-                })
-                .collect();
-            hs.into_iter().map(|h| h.join().expect("a bench worker panicked")).collect::<Result<Vec<_>>>()
-        })?;
-        let t_units = t0.elapsed();
-        let (mut outs, mut tables, mut requests, mut lids) = (Vec::new(), Vec::new(), 0u64, 0u64);
-        for (o, x, r, l) in done {
-            outs.extend(o);
-            tables.push(x);
-            requests += r;
-            lids += l;
-        }
-        // Units in the capture's order, as the wave numbers them.
-        outs.sort_by_key(|o: &super::unit::UnitOut| o.sources.first().copied());
-        let edges: u64 = outs.iter().map(|o| o.edges).sum();
-        let mut line = format!("[bench-storage] rep {rep}: units {:.3} s ({} threads; requests {requests} lids {lids} edges {edges})", t_units.as_secs_f64(), a.settings.threads());
-        if do_translate {
-            let t = Instant::now();
-            let (news, _meta) = super::wave::translate(&mut visited, &mut outs, &prov, frame, a.settings)?;
-            super::wave::resolve_lids(&visited, &outs, frame, a.settings.threads())?;
-            let t_tr = t.elapsed();
-            let t = Instant::now();
-            let layer = super::wave::gather_layer(&visited, &outs, &news, frame, 0, a.settings)?;
-            let t_layer = t.elapsed();
-            line += &format!(" | translate {:.3} s, new {} | layer {:.3} s, {} pieces", t_tr.as_secs_f64(), news.len(), t_layer.as_secs_f64(), layer.len());
-            // The new states' fingerprint, as `ckhash`'s `f` line.
-            let (_, acc) = layer_fingerprint(&layer, &visited);
-            line += &format!(" | f{frame:03} {} {acc:016x}", news.len());
-            if do_edges {
-                let t = Instant::now();
-                let remaps = xfers.merge(Some(&scratch), &tables)?;
-                let bytes = super::edges::write_file(&index, frame, &outs, remaps, a.settings.threads())? + outs.iter().map(|u| u.block_len).sum::<u64>();
-                let t_e = t.elapsed();
-                line += &format!(" | edge file {:.3} s, {:.2} B an edge", t_e.as_secs_f64(), bytes as f64 / edges.max(1) as f64);
-                // The edges' fingerprint, as `ckhash --edges`'s `e` line.
-                let (n, acc) = edge_fingerprint(&scratch, frame, &xfers, &visited, a.settings.threads())?;
-                line += &format!(" | e{frame:03} {n} {acc:016x}");
-            }
-        }
-        println!("{line}");
+        let t = Instant::now();
+        let (wave, visited, xfers) = st.bench_wave(&engine, a.tree, Some(&scratch))?;
+        let all = t.elapsed();
+        let w = &wave.stats;
+        let (n, acc) = layer_fingerprint(&wave.next, &visited);
+        let (ne, ae) = edge_fingerprint(&scratch, frame, &xfers, &visited, a.settings.threads())?;
+        println!(
+            "[bench-storage] rep {rep}: units {:.0} ms (idle {:.0}%) regions {:.0} end {:.0} total {:.0} ms ({} threads; {} slices, {} routes, {} bundles, {:.3} B an edge) | f{frame:03} {n} {acc:016x} | e{frame:03} {ne} {ae:016x}",
+            ms(w.t_wave),
+            w.wave_idle * 100.0,
+            ms(w.t_regions),
+            ms(w.t_layer),
+            ms(all),
+            a.settings.threads(),
+            w.slices,
+            w.routes,
+            w.edge_bundles,
+            w.edge_bytes as f64 / w.edge_records.max(1) as f64,
+        );
     }
     let _ = std::fs::remove_dir_all(&scratch);
     Ok(())
@@ -338,79 +319,68 @@ pub fn layer_fingerprint(layer: &[crate::frame::Block], visited: &VisitedSet) ->
 }
 
 /// `rewrite ckhash --edges`'s `e{frame}` line over the frame's edge file in
-/// `edges_dir`: each edge by the (shape, key, cell) of its target and
-/// source (looked up in `visited`, which holds both) and its transfer pair
-/// (`xfers`, the merged table in memory: the dir's file may hold only the
-/// frame's new pairs).
+/// `edges_dir` (`EdgeHashes::frame`; `xfers`: the merged table in memory,
+/// the dir's file may hold only the frame's new pairs).
 pub fn edge_fingerprint(edges_dir: &Path, frame: u32, xfers: &super::edges::XferTable, visited: &VisitedSet, threads: usize) -> Result<(u64, u64)> {
-    let mix = celeste_engine::runtime2::mix64;
     let store = super::edges::EdgeStore::open(edges_dir, frame)?;
-    let content = visited.keys.content_hash();
-    let node = |id: StateId| -> u64 {
-        let r = super::id_region(id);
-        let shape = visited.shape_hash(r / visited.geo.slots);
-        let k = visited.table(r).expect("a region of the set").key(super::id_entry(id));
-        content.state(shape, k, super::id_cell(&visited.geo, id))
-    };
-    // A pair's hash once, not per edge.
-    let pair_hash: Vec<u64> = xfers
-        .pairs
-        .iter()
-        .map(|pair| {
-            let mut b = Vec::new();
-            crate::search::arc_edges::encode_pair(&mut b, pair);
-            b.iter().fold(0u64, |h, &x| mix(h ^ x as u64))
-        })
-        .collect();
-    let parts = store.par_scan(frame, threads, || (0u64, 0u64), |(n, acc), e| {
-        *acc = acc.wrapping_add(mix(node(e.dst) ^ node(e.src).rotate_left(21) ^ pair_hash[e.xfer as usize].rotate_left(42)));
-        *n += 1;
-    });
-    Ok(parts.into_iter().fold((0, 0), |(n, acc), (m, a)| (n + m, acc.wrapping_add(a))))
+    EdgeHashes::new(&xfers.pairs).frame(&store, frame, &visited.keys.content_hash(), visited.shapes(), threads)
 }
 
-/// Replay one unit's records into the sink (`xmap`: the stream's transfer
-/// ids as the sink's, filled on first use).
-fn replay_unit(sink: &mut UnitSink, cap: &Capture, u: &CapUnit, xmap: &mut Vec<u32>, room: (i16, i16)) -> Result<()> {
-    let b = &cap.maps[u.stream][u.records.clone()];
-    let u32_at = |o: usize| u32::from_le_bytes(b[o..o + 4].try_into().unwrap());
-    let u64_at = |o: usize| u64::from_le_bytes(b[o..o + 8].try_into().unwrap());
-    let mut pos = 0usize;
-    // The next emission's provisional key, re-interned (a MISS record).
-    let mut miss: Option<Key> = None;
-    while pos < b.len() {
-        match b[pos] {
-            3 => {
-                sink.dropped(u.lo as usize + u32_at(pos + 1) as usize, u32_at(pos + 5));
-                pos += 9;
-                continue;
-            }
-            4 | 5 => {
-                let n = u32_at(pos + 1) as usize;
-                let bytes = &b[pos + 5..pos + 5 + n];
-                if b[pos] == 4 {
-                    miss = Some(sink.provisional().intern(bincode::deserialize(bytes)?));
-                } else {
-                    sink.note_shape(&bincode::deserialize(bytes)?);
-                }
-                pos += 5 + n;
-                continue;
-            }
-            _ => {}
+/// `ckhash --edges`'s per-edge term: `mix64(node(dst) ^ node(src) <<< 21 ^
+/// pair <<< 42)`, a node `ContentHash::state` of its (shape, key, cell)
+/// (`mix64(key hash ^ cell << 1)`), a pair the hash of its bytes - summed
+/// over a frame's edges, with their count. Each pair hashed once, each key
+/// once a block (its dictionaries').
+pub struct EdgeHashes {
+    pairs: Vec<u64>,
+}
+
+impl EdgeHashes {
+    pub fn new(pairs: &[crate::search::arc_edges::Pair]) -> Self {
+        let mix = celeste_engine::runtime2::mix64;
+        EdgeHashes {
+            pairs: pairs
+                .iter()
+                .map(|pair| {
+                    let mut b = Vec::new();
+                    crate::search::arc_edges::encode_pair(&mut b, pair);
+                    b.iter().fold(0u64, |h, &x| mix(h ^ x as u64))
+                })
+                .collect(),
         }
-        let (shape, key, cell, lane, x) = (u64_at(pos + 1), (u64_at(pos + 9), u64_at(pos + 17)), u32_at(pos + 25), u32_at(pos + 29), u32_at(pos + 33));
-        let key = miss.take().unwrap_or(key);
-        pos += 37;
-        let xfer = (x != u32::MAX).then(|| {
-            if xmap.len() <= x as usize {
-                xmap.resize(x as usize + 1, u32::MAX);
-            }
-            if xmap[x as usize] == u32::MAX {
-                xmap[x as usize] = sink.xfer_id(cap.xfers[u.stream][x as usize]);
-            }
-            xmap[x as usize]
-        });
-        sink.emit(shape, cell, key, u.lo as usize + lane as usize, xfer, || bench_skeleton(shape, room), |buf| push_bench_row(buf, key, cell))?;
     }
-    Ok(())
+
+    /// Frame `frame`'s edges of `store`: `(count, sum of terms)` (`shapes`:
+    /// the tree's by index).
+    pub fn frame(&self, store: &super::edges::EdgeStore, frame: u32, content: &celeste_engine::exact::ContentHash, shapes: &[u64], threads: usize) -> Result<(u64, u64)> {
+        let mix = celeste_engine::runtime2::mix64;
+        let geo = super::GEOMETRY;
+        let parts = store.par_blocks(frame, threads, || (0u64, 0u64), |(n, acc), region, blk| {
+            let slot = region % geo.slots;
+            let t_shape = *shapes.get((region / geo.slots) as usize).context("a target region of no shape")?;
+            let th: Vec<u64> = blk.t_keys.iter().map(|&k| content.key(t_shape, k)).collect();
+            let sh: Vec<u64> = blk.sources.iter().map(|&(s, k)| shapes.get(s as usize).map(|&h| content.key(h, k))).collect::<Option<_>>().context("a source of no shape")?;
+            let mut bad = false;
+            blk.records(|r| {
+                let Some(&p) = self.pairs.get(r.x as usize) else {
+                    bad = true;
+                    return;
+                };
+                let mut m = r.mask;
+                while m != 0 {
+                    let c = m.trailing_zeros();
+                    m &= m - 1;
+                    let tc = geo.cell(slot, c);
+                    let sc = super::bundle::source_cell(tc, r.o);
+                    let t = mix(th[r.t as usize] ^ (tc as u64) << 1);
+                    let s = mix(sh[r.s as usize] ^ (sc as u64) << 1);
+                    *acc = acc.wrapping_add(mix(t ^ s.rotate_left(21) ^ p.rotate_left(42)));
+                    *n += 1;
+                }
+            })?;
+            ensure!(!bad, "f{frame}: an edge without its transfer");
+            Ok(())
+        })?;
+        Ok(parts.into_iter().fold((0, 0), |(n, acc), (m, a)| (n + m, acc.wrapping_add(a))))
+    }
 }

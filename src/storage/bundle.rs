@@ -128,7 +128,7 @@ pub(crate) fn get_varint(b: &[u8], pos: &mut usize) -> u64 {
 }
 
 #[inline]
-fn put_varint128(out: &mut Vec<u8>, mut v: u128) {
+pub(crate) fn put_varint128(out: &mut Vec<u8>, mut v: u128) {
     while v >= 0x80 {
         out.push((v as u8) | 0x80);
         v >>= 7;
@@ -137,7 +137,7 @@ fn put_varint128(out: &mut Vec<u8>, mut v: u128) {
 }
 
 #[inline]
-fn get_varint128(b: &[u8], pos: &mut usize) -> u128 {
+pub(crate) fn get_varint128(b: &[u8], pos: &mut usize) -> u128 {
     let mut v = 0u128;
     let mut shift = 0;
     loop {

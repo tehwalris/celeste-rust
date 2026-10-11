@@ -1,121 +1,29 @@
-//! THE RECORDED GRAPH, source-side (plans/storage-v2.md "The edge file").
+//! THE RECORDED GRAPH, target-side and ID-free (plans/edges-target.md).
 //!
-//! Every edge of frame `f` leaves a state of layer `f - 1` (a frontier row)
-//! and is recorded by the unit that ran it, in the unit's BLOCK: its edges
-//! `(target lid, target cell, source, transfer)` sorted by target and
-//! encoded (`encode_block`), the lids the unit's own names for target
-//! entries. The file's OWNER INDEX, `(region, entry, unit, lid)` sorted,
-//! is every unit's translation table at once - the reverse walk; a unit's
-//! owners by lid are derived from it at read time (`EdgeStore::owners`).
-//! A unit's sources are a row range of the previous layer's frame file
-//! when they are one (a whole block), explicit ids otherwise. Per frame ONE
-//! file `edges/f{frame}.bin` (a raise adds `f{frame}.r{seq}.bin`); the
-//! transfers are global ids into `edges/xfer.bin`, content-canonical (each
-//! wave appends its new pairs sorted). Nothing is ever inverted:
-//! `EdgeStore::preds_at` finds a target's in-edges through the owner index.
+//! Every edge of frame `f` leaves a state of layer `f - 1` and is stored in
+//! its TARGET's region: per (target region, frame) its bundles
+//! (`storage::bundle`: source key, transfer, offset, target key -> target
+//! cells) in one or more SEGMENTS - a wave's slices; a raise adds a file -
+//! each a zstd block. Per frame ONE file `edges/f{frame}.bin` (a raise adds
+//! `f{frame}.r{seq}.bin`): a header - the segments, by region, and per
+//! target region the SOURCE regions its edges leave (the out-edge lookup) -
+//! and the blocks. Transfers are global ids into `edges/xfer.bin`,
+//! content-canonical (each wave appends its new pairs sorted). Nothing
+//! names a state by a number: a state is its region, key and cell (`Sk`).
 
 use anyhow::{ensure, Context, Result};
 use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
-use super::unit::UnitOut;
-use super::{id_entry, id_local, id_region, state_id, StateId};
+use super::bundle::{self, Bundle};
+use super::{Geometry, Sk, GEOMETRY};
 use crate::search::arc_edges::{decode_pair, encode_pair, Pair, PAIR_BYTES};
-
-#[inline]
-pub(crate) fn put_varint(out: &mut Vec<u8>, mut v: u64) {
-    while v >= 0x80 {
-        out.push((v as u8) | 0x80);
-        v >>= 7;
-    }
-    out.push(v as u8);
-}
-
-#[inline]
-pub(crate) fn get_varint(b: &[u8], pos: &mut usize) -> u64 {
-    let mut v = 0u64;
-    let mut shift = 0;
-    loop {
-        let x = b[*pos];
-        *pos += 1;
-        v |= ((x & 0x7f) as u64) << shift;
-        if x & 0x80 == 0 {
-            return v;
-        }
-        shift += 7;
-    }
-}
-
-/// A unit's edges (`unit::pack_edge`, sorted, distinct; the transfer field
-/// the unit's rank of it, `unit::UnitOut::xfers`) as its block, LID BY LID:
-/// per lid its edges from `starts[lid]` (`n_lids + 1` offsets), each edge a
-/// HEAD then the transfer's rank (varints). A lid's first edge: its cell (a
-/// byte) and source; then `src_delta << 1` for the same cell, or
-/// `cell_delta << 1 | 1` and the source for its next cell. A probe for a
-/// target (lid, cell) decodes only its lid's edges. (Room (6,2) 100% f57:
-/// 4.5 B an edge at first, ~3 B with the unit's tables.)
-pub fn encode_block(edges: &[u64], n_lids: usize) -> (Vec<u8>, Vec<u32>) {
-    let mut out = Vec::with_capacity(edges.len() * 3);
-    let mut starts = Vec::with_capacity(n_lids + 1);
-    let mut k = 0;
-    for lid in 0..n_lids as u32 {
-        assert!(out.len() < u32::MAX as usize, "a unit block past 4 GB");
-        starts.push(out.len() as u32);
-        let (mut prev_c, mut prev_s) = (u32::MAX, 0u32);
-        while k < edges.len() {
-            let (l, local, src, x) = super::unit::unpack_edge(edges[k]);
-            if l != lid {
-                debug_assert!(l > lid, "edges sorted by lid");
-                break;
-            }
-            if prev_c == u32::MAX {
-                out.push(local as u8);
-                put_varint(&mut out, src as u64);
-            } else if local == prev_c {
-                put_varint(&mut out, ((src - prev_s) as u64) << 1);
-            } else {
-                put_varint(&mut out, ((local - prev_c) as u64) << 1 | 1);
-                put_varint(&mut out, src as u64);
-            }
-            put_varint(&mut out, x as u64);
-            (prev_c, prev_s) = (local, src);
-            k += 1;
-        }
-    }
-    assert_eq!(k, edges.len(), "an edge past the unit's lids");
-    starts.push(out.len() as u32);
-    (out, starts)
-}
-
-/// Decode one lid's edges `b` (its slice of the block): `f(cell, source,
-/// transfer rank)` until `f` returns false.
-fn decode_lid(b: &[u8], mut f: impl FnMut(u32, u32, u32) -> bool) {
-    if b.is_empty() {
-        return;
-    }
-    let mut pos = 1usize;
-    let mut cell = b[0] as u32;
-    let mut src = get_varint(b, &mut pos) as u32;
-    loop {
-        let x = get_varint(b, &mut pos) as u32;
-        if !f(cell, src, x) || pos >= b.len() {
-            return;
-        }
-        let head = get_varint(b, &mut pos);
-        if head & 1 == 0 {
-            src += (head >> 1) as u32;
-        } else {
-            cell += (head >> 1) as u32;
-            src = get_varint(b, &mut pos) as u32;
-        }
-    }
-}
 
 /// The global transfer table: every distinct pair the tree's edges carry,
 /// a pair's id its position. `edges/xfer.bin` (`encode_pair` each), its
 /// trusted length in the done marker (`done.txt`: pairs past it are a
-/// killed wave's; a tree from before records it in `edges/xfer.len`).
+/// killed wave's).
 #[derive(Default, Clone)]
 pub struct XferTable {
     pub pairs: Vec<Pair>,
@@ -139,15 +47,7 @@ impl XferTable {
     /// index: the mod room at h155 has 4.0M pairs).
     pub fn load_pairs(dir: &Path) -> Result<Vec<Pair>> {
         let n = match read_done(dir)? {
-            Some(Done { xfers: Some(n), .. }) => n,
-            Some(Done { xfers: None, .. }) => {
-                // A tree from before the one marker.
-                let p = dir.join("xfer.len");
-                match std::fs::read_to_string(&p) {
-                    Ok(s) => s.trim().parse().with_context(|| p.display().to_string())?,
-                    Err(_) => 0,
-                }
-            }
+            Some(d) => d.xfers,
             None => 0,
         };
         let b = if n > 0 { std::fs::read(xfer_path(dir)).with_context(|| xfer_path(dir).display().to_string())? } else { Vec::new() };
@@ -185,79 +85,56 @@ impl XferTable {
     }
 }
 
-const MAGIC: &[u8; 4] = b"CSE1";
-const VERSION: u32 = 5;
+const MAGIC: &[u8; 4] = b"CSE2";
+/// 6: target-region bundle blocks (5: source-side unit blocks with lids
+/// and an owner index; trees before are rebuilt, not converted).
+const VERSION: u32 = 6;
 
-/// The blocks file a wave's worker streams its units' blocks into, beside
-/// the frame's index file `index` (`f{frame}.bin` -> `f{frame}.w{worker}.blk`).
-pub fn blocks_path(index: &Path, worker: u32) -> PathBuf {
-    let name = index.file_name().and_then(|s| s.to_str()).expect("an edge file name");
-    index.with_file_name(format!("{}.w{worker:03}.blk", name.strip_suffix(".bin").expect("an edge index is a .bin")))
-}
-
-/// A worker's blocks file, appended unit by unit during the wave.
-pub struct BlockWriter {
-    out: std::io::BufWriter<std::fs::File>,
+/// One segment's place in an edge file.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug)]
+struct SegHead {
+    region: u32,
+    /// Offset of its zstd block in the file's data region, its length and
+    /// its raw length.
     at: u64,
-}
-
-impl BlockWriter {
-    pub fn create(path: &Path) -> Result<Self> {
-        std::fs::create_dir_all(path.parent().expect("an edges dir"))?;
-        Ok(BlockWriter { out: std::io::BufWriter::with_capacity(1 << 20, std::fs::File::create(path).with_context(|| path.display().to_string())?), at: 0 })
-    }
-
-    /// Append a block; its offset.
-    pub fn append(&mut self, b: &[u8]) -> Result<u64> {
-        use std::io::Write;
-        self.out.write_all(b)?;
-        let at = self.at;
-        self.at += b.len() as u64;
-        Ok(at)
-    }
-
-    pub fn finish(mut self) -> Result<()> {
-        use std::io::Write;
-        self.out.flush()?;
-        Ok(())
-    }
-}
-
-/// One unit's place in an edge file (offsets into its data region).
-#[derive(Serialize, Deserialize, Clone, Debug)]
-struct UnitHead {
-    worker: u32,
-    /// `n_sources` source ids, u64 each - or with `src_seq` (not `u32::MAX`)
-    /// rows `src_row0..` of the previous layer's file `src_seq` (its id
-    /// column names them).
-    sources: u64,
-    n_sources: u32,
-    src_seq: u32,
-    src_row0: u32,
-    /// The block: in the worker's blocks file (`blocks_path`), or with
-    /// `inline`, in this file's data region.
-    inline: bool,
-    block: u64,
-    block_len: u64,
+    len: u32,
+    raw: u32,
+    bundles: u32,
     edges: u64,
-    /// Per lid its edges' first offset in the block, and one past the last
-    /// lid's: `n_lids + 1` u32s.
-    starts: u64,
-    /// Per lid its owner `(region, entry)` (u32 each; `unit::NONE`: unused).
-    n_lids: u32,
-    /// Per transfer rank (the edges' field) its global id, u32 each.
-    xfers: u64,
-    n_xfers: u32,
 }
 
 #[derive(Serialize, Deserialize)]
 struct FileHead {
     frame: u32,
-    units: Vec<UnitHead>,
-    /// The OWNER INDEX: `(region, entry, unit, lid)` (u32 each) per lid with
-    /// an owner, sorted - the translation tables inverted, the reverse walk.
-    owner_index: u64,
-    n_owner_index: u64,
+    /// By region (a region's segments in the order written).
+    segs: Vec<SegHead>,
+    /// Per target region (sorted) the source regions (sorted) its edges leave.
+    sources: Vec<(u32, Vec<u32>)>,
+}
+
+/// One target region's encoded segment, as a wave hands it to the file.
+pub struct Segment {
+    pub region: u32,
+    /// The zstd block and its raw length.
+    pub bytes: Vec<u8>,
+    pub raw: u32,
+    pub bundles: u32,
+    pub edges: u64,
+}
+
+impl Segment {
+    /// `bundles` (distinct; sorted in place) as a segment of `region`.
+    pub fn encode(region: u32, bundles: &mut [Bundle], raw: &mut Vec<u8>, z: &mut zstd::bulk::Compressor<'static>) -> Result<Segment> {
+        bundle::encode(bundles, &bundle::ORDER, raw);
+        ensure!(raw.len() < u32::MAX as usize, "an edge segment of {} bytes", raw.len());
+        Ok(Segment {
+            region,
+            bytes: bundle::compress(raw, z)?,
+            raw: raw.len() as u32,
+            bundles: bundles.len() as u32,
+            edges: bundles.iter().map(|b| b.mask.count_ones() as u64).sum(),
+        })
+    }
 }
 
 /// The edge file of frame `frame` (`raised`: a raise's, by its first seq).
@@ -268,175 +145,49 @@ pub fn file_path(dir: &Path, frame: u32, raised: Option<u32>) -> PathBuf {
     }
 }
 
-/// One unit's sections of an edge file, built apart (in parallel).
-struct UnitBytes {
-    sources: Vec<u8>,
-    xfers: Vec<u8>,
-    starts: Vec<u8>,
-    /// `(region, entry, lid)` per lid with an owner, sorted.
-    owned: Vec<(u32, u32, u32)>,
-}
-
-fn le32(v: &mut Vec<u8>, x: u32) {
-    v.extend_from_slice(&x.to_le_bytes());
-}
-
-/// Unit `u`'s sections: its sources, transfers (global ids, through its
-/// worker's `remap`), per-lid starts, and the owners it names (sorted, for
-/// the owner index).
-fn unit_bytes(u: &UnitOut, remap: &[u32], frame: u32) -> Result<UnitBytes> {
-    let mut sources = Vec::new();
-    if u.source_rows.is_none() {
-        sources.reserve(8 * u.sources.len());
-        for s in &u.sources {
-            sources.extend_from_slice(&s.to_le_bytes());
-        }
+/// Write frame `frame`'s edge file from its segments (any order) and its
+/// source-region index (`sources`: per target region the source regions,
+/// any order). Atomic (renamed into place). Returns its bytes.
+pub fn write_file(path: &Path, frame: u32, mut segs: Vec<Segment>, mut sources: Vec<(u32, Vec<u32>)>) -> Result<u64> {
+    use std::io::Write;
+    segs.sort_by_key(|s| s.region);
+    sources.sort_unstable_by_key(|s| s.0);
+    for s in &mut sources {
+        s.1.sort_unstable();
+        s.1.dedup();
     }
-    let mut xfers = Vec::with_capacity(4 * u.xfers.len());
-    for &x in &u.xfers {
-        le32(&mut xfers, remap[x as usize]);
-    }
-    let mut starts = Vec::with_capacity(4 * u.starts.len());
-    for &o in &u.starts {
-        le32(&mut starts, o);
-    }
-    let mut owned: Vec<(u32, u32, u32)> = Vec::new();
-    for (l, o) in u.owners.iter().enumerate() {
-        match o.load(std::sync::atomic::Ordering::Relaxed) {
-            super::unit::NO_OWNER => {}
-            o => owned.push(((o >> 32) as u32, o as u32, l as u32)),
-        }
-    }
-    owned.sort_unstable();
-    ensure!(owned.windows(2).all(|w| (w[0].0, w[0].1) != (w[1].0, w[1].1)), "frame {frame}: a unit names one entry by two lids");
-    Ok(UnitBytes { sources, xfers, starts, owned })
-}
-
-/// Write frame `frame`'s edge file from its units (owners resolved) and
-/// the workers' transfer remaps: the sections built per unit and written at
-/// their offsets, in parallel. Atomic (renamed into place). Returns its bytes.
-pub fn write_file(path: &Path, frame: u32, outs: &[UnitOut], remaps: Vec<Vec<u32>>, threads: usize) -> Result<u64> {
-    use std::os::unix::fs::FileExt;
-    let bytes: Vec<UnitBytes> = super::wave::par_map(outs, threads, |u| unit_bytes(u, &remaps[u.worker as usize], frame)).into_iter().collect::<Result<_>>()?;
-    // The data region's layout: per unit its sections, in unit order.
-    let mut units = Vec::with_capacity(outs.len());
+    let mut heads = Vec::with_capacity(segs.len());
     let mut at = 0u64;
-    let mut place = |n: usize| -> u64 {
-        let o = at;
-        at += n as u64;
-        o
-    };
-    for (u, b) in outs.iter().zip(&bytes) {
-        units.push(UnitHead {
-            worker: u.worker,
-            sources: place(b.sources.len()),
-            n_sources: u.sources.len() as u32,
-            src_seq: u.source_rows.map_or(u32::MAX, |r| r.0),
-            src_row0: u.source_rows.map_or(0, |r| r.1),
-            inline: u.block_at.is_none(),
-            block: match u.block_at {
-                Some(at) => at,
-                None => place(u.block.len()),
-            },
-            block_len: u.block_len,
-            edges: u.edges,
-            starts: place(b.starts.len()),
-            n_lids: u.lids.len() as u32,
-            xfers: place(b.xfers.len()),
-            n_xfers: u.xfers.len() as u32,
-        });
+    for s in &segs {
+        heads.push(SegHead { region: s.region, at, len: s.bytes.len() as u32, raw: s.raw, bundles: s.bundles, edges: s.edges });
+        at += s.bytes.len() as u64;
     }
-    // The owner index: the units' sorted owners merged, a region range a
-    // thread (the ranges cut at the units' region quantiles).
-    let index = owner_index(&bytes, threads);
-    let n_owner_index = (index.len() / 16) as u64;
-    let owner_index_at = place(index.len());
-    let head = bincode::serialize(&FileHead { frame, units, owner_index: owner_index_at, n_owner_index }).context("serializing an edge file header")?;
-    let base = 16 + head.len() as u64;
+    let head = bincode::serialize(&FileHead { frame, segs: heads, sources }).context("serializing an edge file header")?;
     std::fs::create_dir_all(path.parent().expect("an edges dir"))?;
     let tmp = path.with_extension("tmp");
-    let file = std::fs::File::create(&tmp)?;
-    let mut prefix = Vec::with_capacity(16 + head.len());
-    prefix.extend_from_slice(MAGIC);
-    prefix.extend_from_slice(&VERSION.to_le_bytes());
-    prefix.extend_from_slice(&(head.len() as u64).to_le_bytes());
-    prefix.extend_from_slice(&head);
-    file.write_all_at(&prefix, 0)?;
-    file.write_all_at(&index, base + owner_index_at)?;
-    let head: FileHead = bincode::deserialize(&head).context("the header just written")?;
-    let order: Vec<usize> = (0..outs.len()).collect();
-    super::wave::par_map(&order, threads, |&k| -> Result<()> {
-        let (h, b, u) = (&head.units[k], &bytes[k], &outs[k]);
-        file.write_all_at(&b.sources, base + h.sources)?;
-        if h.inline {
-            file.write_all_at(&u.block, base + h.block)?;
+    {
+        let mut out = std::io::BufWriter::with_capacity(1 << 20, std::fs::File::create(&tmp).with_context(|| tmp.display().to_string())?);
+        out.write_all(MAGIC)?;
+        out.write_all(&VERSION.to_le_bytes())?;
+        out.write_all(&(head.len() as u64).to_le_bytes())?;
+        out.write_all(&head)?;
+        for s in &segs {
+            out.write_all(&s.bytes)?;
         }
-        file.write_all_at(&b.starts, base + h.starts)?;
-        file.write_all_at(&b.xfers, base + h.xfers)?;
-        Ok(())
-    })
-    .into_iter()
-    .collect::<Result<()>>()?;
-    drop(file);
-    std::fs::rename(&tmp, path)?;
-    Ok(base + at)
-}
-
-/// The owner index's bytes: every unit's `(region, entry, lid)` with the
-/// unit, sorted by `(region, entry, unit)`, 16 B each. Built in parallel:
-/// the region space cut into ranges, each gathered from every unit's sorted
-/// owners and sorted.
-fn owner_index(bytes: &[UnitBytes], threads: usize) -> Vec<u8> {
-    let total: usize = bytes.iter().map(|b| b.owned.len()).sum();
-    if total == 0 {
-        return Vec::new();
+        out.flush()?;
     }
-    // Cuts: regions at evenly spaced positions of a sample.
-    let mut sample: Vec<u32> = bytes.iter().flat_map(|b| b.owned.iter().step_by(64).map(|o| o.0)).collect();
-    sample.sort_unstable();
-    let parts = (threads * 4).max(1);
-    let mut cuts: Vec<u32> = (1..parts).map(|k| sample[k * sample.len() / parts]).collect();
-    cuts.dedup();
-    let mut bounds = vec![0u32];
-    bounds.extend(cuts);
-    bounds.push(u32::MAX);
-    bounds.dedup();
-    let ranges: Vec<(u32, u32)> = bounds.windows(2).map(|w| (w[0], w[1])).collect();
-    let pieces: Vec<Vec<u8>> = super::wave::par_map(&ranges, threads, |&(lo, hi)| {
-        let mut v: Vec<(u32, u32, u32, u32)> = Vec::new();
-        for (ui, b) in bytes.iter().enumerate() {
-            let a = b.owned.partition_point(|o| o.0 < lo);
-            let z = b.owned.partition_point(|o| o.0 < hi);
-            v.extend(b.owned[a..z].iter().map(|&(r, e, l)| (r, e, ui as u32, l)));
-        }
-        v.sort_unstable();
-        let mut out = Vec::with_capacity(16 * v.len());
-        for (r, e, u, l) in v {
-            le32(&mut out, r);
-            le32(&mut out, e);
-            le32(&mut out, u);
-            le32(&mut out, l);
-        }
-        out
-    });
-    pieces.concat()
+    std::fs::rename(&tmp, path)?;
+    Ok(16 + head.len() as u64 + at)
 }
 
-/// One edge file, mapped, with its workers' blocks files.
+/// One edge file, mapped.
 struct EdgeFile {
     map: memmap2::Mmap,
     head: FileHead,
     data: usize,
-    /// Per worker its blocks file, where a unit's block is there.
-    blocks: Vec<Option<memmap2::Mmap>>,
-    /// The previous layer's files by seq, where units name their sources
-    /// as rows of them.
-    prev: rustc_hash::FxHashMap<u32, crate::search::checkpoint::FrameFile>,
-    /// The owner index's REGIONS: each one's first entry, in order
-    /// (`regions`, built on first use: a search per region, not a scan).
-    regions: std::sync::OnceLock<Vec<(u32, u32)>>,
-    /// Per unit its first and last source, by first (`unit_sources`).
-    unit_sources: std::sync::OnceLock<Vec<(StateId, StateId, u32)>>,
+    /// Per source region the target regions its edges reach (`head.sources`
+    /// inverted on first use).
+    targets: std::sync::OnceLock<FxHashMap<u32, Vec<u32>>>,
 }
 
 impl EdgeFile {
@@ -445,221 +196,102 @@ impl EdgeFile {
         // SAFETY: edge files are written once (renamed into place) and
         // never modified afterwards.
         let map = unsafe { memmap2::Mmap::map(&file)? };
-        ensure!(map.len() >= 16 && &map[0..4] == MAGIC, "{}: not an edge file", path.display());
+        ensure!(map.len() >= 16 && &map[0..4] == MAGIC, "{}: not an edge file of this format (a tree from before target-region edges: rebuild it)", path.display());
         let v = u32::from_le_bytes(map[4..8].try_into().unwrap());
         ensure!(v == VERSION, "{}: edge file version {v}, expected {VERSION}", path.display());
         let n = u64::from_le_bytes(map[8..16].try_into().unwrap()) as usize;
         ensure!(map.len() >= 16 + n, "{}: truncated header", path.display());
         let head: FileHead = bincode::deserialize(&map[16..16 + n]).with_context(|| path.display().to_string())?;
         ensure!(head.frame == frame, "{}: the edges of frame {}, not {frame}", path.display(), head.frame);
-        let mut blocks: Vec<Option<memmap2::Mmap>> = Vec::new();
-        for u in head.units.iter().filter(|u| !u.inline) {
-            let w = u.worker as usize;
-            if blocks.len() <= w {
-                blocks.resize_with(w + 1, || None);
-            }
-            if blocks[w].is_none() {
-                let p = blocks_path(path, u.worker);
-                let f = std::fs::File::open(&p).with_context(|| p.display().to_string())?;
-                // SAFETY: a blocks file is complete once its frame's index
-                // is in place, and never modified afterwards.
-                blocks[w] = Some(unsafe { memmap2::Mmap::map(&f)? });
-            }
-            let len = blocks[w].as_ref().expect("mapped").len() as u64;
-            ensure!(u.block + u.block_len <= len, "{}: a unit's block past its blocks file", path.display());
+        ensure!(head.segs.windows(2).all(|w| w[0].region <= w[1].region), "{}: segments not by region", path.display());
+        let data = 16 + n;
+        for s in &head.segs {
+            ensure!(data as u64 + s.at + s.len as u64 <= map.len() as u64, "{}: a segment past the file", path.display());
         }
-        // The previous layer's files, where a unit's sources are its rows:
-        // `<level>/frames/f{frame - 1}` beside `<level>/edges`.
-        let mut prev = rustc_hash::FxHashMap::default();
-        if head.units.iter().any(|u| u.src_seq != u32::MAX) {
-            let level = path.parent().and_then(|d| d.parent()).with_context(|| format!("{}: no level dir", path.display()))?;
-            for (seq, file) in crate::frame::frame_files(level, frame - 1)? {
-                prev.insert(seq, file);
-            }
-            for u in head.units.iter().filter(|u| u.src_seq != u32::MAX) {
-                let f = prev.get(&u.src_seq).with_context(|| format!("{}: a unit's sources in file seq {} of frame {}, which is missing", path.display(), u.src_seq, frame - 1))?;
-                ensure!(u.src_row0 as u64 + u.n_sources as u64 <= f.width() as u64, "{}: a unit's sources past its file's rows", path.display());
-            }
-        }
-        ensure!(head.n_owner_index < u32::MAX as u64, "{}: {} owner index entries do not fit a u32", path.display(), head.n_owner_index);
-        Ok(EdgeFile { map, head, data: 16 + n, blocks, prev, regions: std::sync::OnceLock::new(), unit_sources: std::sync::OnceLock::new() })
+        Ok(EdgeFile { map, head, data, targets: std::sync::OnceLock::new() })
     }
 
-    /// The owner index's regions, `(region, first entry)` in order: from the
-    /// first entry, a binary search for the next region's, region by region.
-    fn regions(&self) -> &[(u32, u32)] {
-        self.regions.get_or_init(|| {
-            let n = self.head.n_owner_index as usize;
-            let mut out = Vec::new();
-            let mut at = 0usize;
-            while at < n {
-                let r = self.owner_at(at).0;
-                out.push((r, at as u32));
-                let (mut lo, mut hi) = (at + 1, n);
-                while lo < hi {
-                    let mid = (lo + hi) / 2;
-                    if self.owner_at(mid).0 <= r {
-                        lo = mid + 1;
-                    } else {
-                        hi = mid;
-                    }
+    /// The segments of `region`.
+    fn segs_of(&self, region: u32) -> &[SegHead] {
+        let s = &self.head.segs;
+        let lo = s.partition_point(|x| x.region < region);
+        let hi = lo + s[lo..].partition_point(|x| x.region == region);
+        &s[lo..hi]
+    }
+
+    fn seg<'a>(&'a self, h: &'a SegHead) -> SegRef<'a> {
+        let a = self.data + h.at as usize;
+        SegRef { region: h.region, bytes: &self.map[a..a + h.len as usize], raw: h.raw as usize, bundles: h.bundles, edges: h.edges }
+    }
+
+    fn targets(&self) -> &FxHashMap<u32, Vec<u32>> {
+        self.targets.get_or_init(|| {
+            let mut m: FxHashMap<u32, Vec<u32>> = FxHashMap::default();
+            for (t, srcs) in &self.head.sources {
+                for &s in srcs {
+                    m.entry(s).or_default().push(*t);
                 }
-                at = lo;
             }
-            out
+            m
         })
-    }
-
-    /// The units' source ranges `(first, last, unit)`, by first, built on
-    /// first use. A unit's sources are a run of its frontier in id order and
-    /// units do not overlap: both checked here (FATAL otherwise - an out-edge
-    /// lookup would miss edges).
-    fn unit_sources(&self) -> &[(StateId, StateId, u32)] {
-        self.unit_sources.get_or_init(|| {
-            let mut v: Vec<(StateId, StateId, u32)> = Vec::new();
-            for (ui, u) in self.head.units.iter().enumerate() {
-                if u.n_sources == 0 {
-                    continue;
-                }
-                let mut prev = None;
-                for k in 0..u.n_sources {
-                    let s = self.source(u, k);
-                    assert!(prev.is_none_or(|p| p < s), "frame {}: unit {ui}'s sources are not in id order", self.head.frame);
-                    prev = Some(s);
-                }
-                v.push((self.source(u, 0), self.source(u, u.n_sources - 1), ui as u32));
-            }
-            v.sort_unstable();
-            assert!(v.windows(2).all(|w| w[0].1 < w[1].0), "frame {}: two units' sources overlap", self.head.frame);
-            v
-        })
-    }
-
-    /// The first owner index entry in `lo..hi` (one region's) whose entry
-    /// is >= `entry` (`hi`: none): a galloping search from `lo`, the
-    /// previous target's place (targets come in order).
-    fn gallop_entry(&self, lo: usize, hi: usize, entry: u32, stats: &mut ReadStats) -> usize {
-        let at = |k: usize, stats: &mut ReadStats| {
-            stats.owner_probes += 1;
-            self.u32_at(self.head.owner_index, 4 * k + 1)
-        };
-        if lo >= hi || at(lo, stats) >= entry {
-            return lo;
-        }
-        // `a`: an entry below `entry`; the answer is past it.
-        let (mut a, mut step) = (lo, 1usize);
-        let mut b = loop {
-            let b = a + step;
-            if b >= hi || at(b, stats) >= entry {
-                break b.min(hi);
-            }
-            a = b;
-            step *= 2;
-        };
-        a += 1;
-        while a < b {
-            let mid = (a + b) / 2;
-            if at(mid, stats) < entry {
-                a = mid + 1;
-            } else {
-                b = mid;
-            }
-        }
-        a
-    }
-
-    #[inline]
-    fn u32_at(&self, off: u64, k: usize) -> u32 {
-        let o = self.data + off as usize + 4 * k;
-        u32::from_le_bytes(self.map[o..o + 4].try_into().unwrap())
-    }
-
-    #[inline]
-    fn source(&self, u: &UnitHead, s: u32) -> StateId {
-        if u.src_seq != u32::MAX {
-            return self.prev[&u.src_seq].id_at(u.src_row0 + s);
-        }
-        let o = self.data + u.sources as usize + 8 * s as usize;
-        u64::from_le_bytes(self.map[o..o + 8].try_into().unwrap())
-    }
-
-    fn block<'b>(&'b self, u: &'b UnitHead) -> &'b [u8] {
-        if u.inline {
-            &self.map[self.data + u.block as usize..self.data + (u.block + u.block_len) as usize]
-        } else {
-            &self.blocks[u.worker as usize].as_ref().expect("mapped at open")[u.block as usize..(u.block + u.block_len) as usize]
-        }
-    }
-
-    /// Lid `lid`'s edges in unit `u`'s block.
-    #[inline]
-    fn lid_edges<'b>(&'b self, u: &'b UnitHead, block: &'b [u8], lid: u32) -> &'b [u8] {
-        let (a, b) = (self.u32_at(u.starts, lid as usize), self.u32_at(u.starts, lid as usize + 1));
-        &block[a as usize..b as usize]
-    }
-
-    /// The owner index's entry `k`: `(region, entry, unit, lid)`.
-    #[inline]
-    fn owner_at(&self, k: usize) -> (u32, u32, u32, u32) {
-        let o = self.head.owner_index;
-        (self.u32_at(o, 4 * k), self.u32_at(o, 4 * k + 1), self.u32_at(o, 4 * k + 2), self.u32_at(o, 4 * k + 3))
-    }
-
-    /// The owner index's entries naming `(region, entry)`: their first.
-    fn owners_of(&self, region: u32, entry: u32) -> usize {
-        let (mut lo, mut hi) = (0usize, self.head.n_owner_index as usize);
-        while lo < hi {
-            let mid = (lo + hi) / 2;
-            let (r, e, ..) = self.owner_at(mid);
-            if (r, e) < (region, entry) {
-                lo = mid + 1;
-            } else {
-                hi = mid;
-            }
-        }
-        lo
     }
 }
 
-/// One in-edge: the source and the global transfer id.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub struct InEdge {
-    pub src: StateId,
-    pub xfer: u32,
-}
-
-/// What `EdgeStore::preds_sorted` read: owner index entries looked at (16
-/// B each: the searches' probes and the entries walked), lid bytes decoded,
-/// in-edges found, and the (target region, frame) pairs it opened.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct ReadStats {
-    pub owner_probes: u64,
-    pub lid_bytes: u64,
+/// One stored segment: its target region, zstd block and raw length.
+#[derive(Clone, Copy)]
+pub struct SegRef<'a> {
+    pub region: u32,
+    pub bytes: &'a [u8],
+    pub raw: usize,
+    pub bundles: u32,
     pub edges: u64,
-    pub region_opens: u64,
 }
 
-impl ReadStats {
-    pub fn add(&mut self, o: &ReadStats) {
-        self.owner_probes += o.owner_probes;
-        self.lid_bytes += o.lid_bytes;
-        self.edges += o.edges;
-        self.region_opens += o.region_opens;
-    }
-
-    /// The bytes of the edge store read (logically: the owner index entries
-    /// and the lids' edges; pages touched are at least these).
-    pub fn bytes(&self) -> u64 {
-        16 * self.owner_probes + self.lid_bytes
-    }
-}
-
-/// One edge of a frame: source, target, global transfer id.
+/// One edge: source, target, global transfer id.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Edge {
-    pub src: StateId,
-    pub dst: StateId,
+    pub src: Sk,
+    pub dst: Sk,
     pub xfer: u32,
+}
+
+/// The edges of bundle `b` of target region `region`: `f(source, target)`
+/// per target cell.
+#[inline]
+pub fn expand(geo: &Geometry, region: u32, b: &Bundle, mut f: impl FnMut(Sk, Sk)) {
+    let slot = region % geo.slots;
+    let mut m = b.mask;
+    while m != 0 {
+        let c = m.trailing_zeros();
+        m &= m - 1;
+        let s_cell = bundle::source_cell(geo.cell(slot, c), b.o);
+        f(Sk::at(geo, b.s_shape, b.s_key, s_cell), Sk { region, key: b.t_key, local: c as u8 });
+    }
+}
+
+/// A worker's decoder: a zstd context and the raw block's buffer.
+pub struct Decoder {
+    z: zstd::bulk::Decompressor<'static>,
+    raw: Vec<u8>,
+}
+
+impl Default for Decoder {
+    fn default() -> Self {
+        Decoder { z: zstd::bulk::Decompressor::new().expect("a zstd decompressor"), raw: Vec::new() }
+    }
+}
+
+impl Decoder {
+    /// Segment `s`'s raw block, opened (its dictionaries read).
+    pub fn open<'a>(&'a mut self, s: &SegRef) -> Result<bundle::Block<'a>> {
+        bundle::decompress(s.bytes, s.raw, &mut self.z, &mut self.raw)?;
+        bundle::Block::open(&self.raw, &bundle::ORDER)
+    }
+
+    /// Every bundle of segment `s`.
+    pub fn bundles(&mut self, s: &SegRef, f: impl FnMut(Bundle)) -> Result<()> {
+        self.open(s)?.bundles(f)
+    }
 }
 
 /// A level's recorded graph up to a horizon, mapped: per frame its edge
@@ -676,6 +308,7 @@ impl EdgeStore {
     pub fn open(dir: &Path, horizon: u32) -> Result<Self> {
         let mut frames: Vec<Vec<EdgeFile>> = (0..=horizon).map(|_| Vec::new()).collect();
         let (mut edges, mut bytes) = (0u64, 0u64);
+        let mut paths: Vec<(u32, PathBuf)> = Vec::new();
         for e in std::fs::read_dir(dir).into_iter().flatten().flatten() {
             let p = e.path();
             let Some(n) = p.file_name().and_then(|s| s.to_str()) else { continue };
@@ -683,26 +316,18 @@ impl EdgeStore {
             if !n.ends_with(".bin") || f == 0 || f > horizon {
                 continue;
             }
+            paths.push((f, p));
+        }
+        // A frame's own file first, then its raises' (by seq).
+        paths.sort();
+        for (f, p) in paths {
             let file = EdgeFile::open(&p, f)?;
-            edges += file.head.units.iter().map(|u| u.edges).sum::<u64>();
-            bytes += file.map.len() as u64 + file.blocks.iter().flatten().map(|m| m.len() as u64).sum::<u64>();
+            edges += file.head.segs.iter().map(|s| s.edges).sum::<u64>();
+            bytes += file.map.len() as u64;
             frames[f as usize].push(file);
         }
         let xfers = XferTable::load_pairs(dir)?;
         Ok(EdgeStore { frames, xfers, edges, bytes })
-    }
-
-    /// Advise the kernel how the mapped files will be read: `Random` (no
-    /// read-ahead) for the backward's scattered in-edge reads, `Normal` for
-    /// the scans.
-    pub fn advise(&self, advice: memmap2::Advice) -> Result<()> {
-        for f in self.frames.iter().flatten() {
-            f.map.advise(advice)?;
-            for b in f.blocks.iter().flatten() {
-                b.advise(advice)?;
-            }
-        }
-        Ok(())
     }
 
     /// The transfer of global id `xfer`.
@@ -720,193 +345,57 @@ impl EdgeStore {
         self.frames.get(frame as usize).is_some_and(|v| !v.is_empty())
     }
 
-    /// The in-edges of `target` recorded at frame `frame` (sources of layer
-    /// `frame - 1`), appended to `out`: through the units naming the
-    /// target's region, each one's lid of its entry, the block's edges into
-    /// (lid, cell).
-    pub fn preds_at(&self, target: StateId, frame: u32, out: &mut Vec<InEdge>) {
-        let (region, entry, local) = (id_region(target), id_entry(target), id_local(target));
-        for file in self.frames.get(frame as usize).into_iter().flatten() {
-            let mut k = file.owners_of(region, entry);
-            while k < file.head.n_owner_index as usize {
-                let (r, e, ui, lid) = file.owner_at(k);
-                if (r, e) != (region, entry) {
-                    break;
-                }
-                k += 1;
-                let u = &file.head.units[ui as usize];
-                let block = file.block(u);
-                decode_lid(file.lid_edges(u, block, lid), |c, s, x| {
-                    if c == local {
-                        out.push(InEdge { src: file.source(u, s), xfer: file.u32_at(u.xfers, x as usize) });
-                    }
-                    c <= local
-                });
-            }
-        }
+    /// The last frame of the store.
+    pub fn horizon(&self) -> u32 {
+        self.frames.len() as u32 - 1
     }
 
-    /// The in-edges recorded at frame `frame` of every state in `targets`
-    /// (sorted, distinct): `f(k, edge)` for `targets[k]`. Region by region:
-    /// a target region absent from a file costs a search of the file's
-    /// regions (`EdgeFile::regions`), a present one's entries are found by
-    /// galloping through its range in target order, and a lid is decoded
-    /// once for all its targets' cells. `stats` counts what was read.
-    pub fn preds_sorted(&self, frame: u32, targets: &[StateId], stats: &mut ReadStats, mut f: impl FnMut(usize, InEdge)) {
-        debug_assert!(targets.windows(2).all(|w| w[0] < w[1]), "targets sorted and distinct");
-        for file in self.frames.get(frame as usize).into_iter().flatten() {
-            let regions = file.regions();
-            let n = file.head.n_owner_index as usize;
-            let (mut k, mut d) = (0usize, 0usize);
-            while k < targets.len() {
-                let region = id_region(targets[k]);
-                let k_end = k + targets[k..].partition_point(|&t| id_region(t) == region);
-                d += regions[d..].partition_point(|r| r.0 < region);
-                if regions.get(d).is_some_and(|r| r.0 == region) {
-                    stats.region_opens += 1;
-                    let hi = regions.get(d + 1).map_or(n, |r| r.1 as usize);
-                    let mut pos = regions[d].1 as usize;
-                    let mut j = k;
-                    while j < k_end {
-                        let entry = id_entry(targets[j]);
-                        let j_end = j + targets[j..k_end].partition_point(|&t| id_entry(t) == entry);
-                        pos = file.gallop_entry(pos, hi, entry, stats);
-                        while pos < hi {
-                            let (_, e, ui, lid) = file.owner_at(pos);
-                            if e != entry {
-                                break;
-                            }
-                            stats.owner_probes += 1;
-                            pos += 1;
-                            let u = &file.head.units[ui as usize];
-                            let bytes = file.lid_edges(u, file.block(u), lid);
-                            stats.lid_bytes += bytes.len() as u64;
-                            // The lid's edges come by cell, as the group's
-                            // targets do.
-                            let mut q = j;
-                            decode_lid(bytes, |c, s, x| {
-                                while q < j_end && id_local(targets[q]) < c {
-                                    q += 1;
-                                }
-                                if q == j_end {
-                                    return false;
-                                }
-                                if id_local(targets[q]) == c {
-                                    stats.edges += 1;
-                                    f(q, InEdge { src: file.source(u, s), xfer: file.u32_at(u.xfers, x as usize) });
-                                }
-                                true
-                            });
-                        }
-                        j = j_end;
-                    }
-                }
-                k = k_end;
-            }
-        }
+    /// The target regions with edges at frame `frame`, sorted, distinct.
+    pub fn regions(&self, frame: u32) -> Vec<u32> {
+        let mut v: Vec<u32> = self.frames.get(frame as usize).into_iter().flatten().flat_map(|f| f.head.segs.iter().map(|s| s.region)).collect();
+        v.dedup();
+        v.sort_unstable();
+        v.dedup();
+        v
     }
 
-    /// The out-edges recorded at frame `frame` of the states `sources`
-    /// (sorted, distinct; sources of frame `frame` have layer `frame - 1`):
-    /// `(k, target, transfer)` for `sources[k]`. A source's unit is found by
-    /// the file's unit ranges (`EdgeFile::unit_sources`); the units holding
-    /// one are decoded whole, on `threads` workers, their lids' owners taken
-    /// from one pass over the owner index keeping those units' entries.
-    pub fn out_edges(&self, frame: u32, sources: &[StateId], threads: usize) -> Vec<(usize, StateId, u32)> {
-        debug_assert!(sources.windows(2).all(|w| w[0] < w[1]), "sources sorted and distinct");
-        let mut out = Vec::new();
-        for file in self.frames.get(frame as usize).into_iter().flatten() {
-            let index = file.unit_sources();
-            // Per unit, its sources asked for: (lane, k), by lane.
-            let mut want: FxHashMap<u32, Vec<(u32, usize)>> = FxHashMap::default();
-            for (k, &s) in sources.iter().enumerate() {
-                let Some(&(_, last, ui)) = index[..index.partition_point(|x| x.0 <= s)].last() else { continue };
-                if s > last {
-                    continue;
-                }
-                let u = &file.head.units[ui as usize];
-                let (mut lo, mut hi) = (0u32, u.n_sources);
-                while lo < hi {
-                    let mid = (lo + hi) / 2;
-                    if file.source(u, mid) < s {
-                        lo = mid + 1;
-                    } else {
-                        hi = mid;
-                    }
-                }
-                if lo < u.n_sources && file.source(u, lo) == s {
-                    want.entry(ui).or_default().push((lo, k));
-                }
-            }
-            if want.is_empty() {
-                continue;
-            }
-            // Those units' lids' owners: (lid, region, entry), by lid.
-            let mut owners: FxHashMap<u32, Vec<(u32, u32, u32)>> = FxHashMap::default();
-            for k in 0..file.head.n_owner_index as usize {
-                let (r, e, ui, lid) = file.owner_at(k);
-                if want.contains_key(&ui) {
-                    owners.entry(ui).or_default().push((lid, r, e));
-                }
-            }
-            let mut units: Vec<u32> = want.keys().copied().collect();
-            units.sort_unstable();
-            let parts: Vec<Vec<(usize, StateId, u32)>> = super::wave::par_map(&units, threads, |&ui| {
-                let mut reqs = want[&ui].clone();
-                reqs.sort_unstable();
-                let mut own = owners.get(&ui).cloned().unwrap_or_default();
-                own.sort_unstable();
-                let u = &file.head.units[ui as usize];
-                let block = file.block(u);
-                let mut res = Vec::new();
-                for &(lid, region, entry) in &own {
-                    decode_lid(file.lid_edges(u, block, lid), |c, s, x| {
-                        if let Ok(r) = reqs.binary_search_by_key(&s, |q| q.0) {
-                            res.push((reqs[r].1, state_id(region, entry, c), file.u32_at(u.xfers, x as usize)));
-                        }
-                        true
-                    });
-                }
-                res
-            });
-            out.extend(parts.into_iter().flatten());
-        }
-        out
+    /// The segments of target region `region` at frame `frame`.
+    pub fn segments(&self, frame: u32, region: u32) -> Vec<SegRef<'_>> {
+        self.frames.get(frame as usize).into_iter().flatten().flat_map(|f| f.segs_of(region).iter().map(move |h| f.seg(h))).collect()
     }
 
-    /// Every edge recorded at frame `frame`, unit by unit (`threads`: the
-    /// owner index's scatter).
-    pub fn scan(&self, frame: u32, threads: usize, mut f: impl FnMut(Edge)) {
-        let owners = self.owners(frame, threads);
-        for (fi, unit) in self.units(frame) {
-            let u = self.unit(frame, &owners, fi, unit);
-            u.edges(|lid, c, s, x| {
-                let (region, entry) = u.lid_owner(lid).expect("an edge names an owned lid");
-                f(Edge { src: u.source(s), dst: state_id(region, entry, c), xfer: x });
-            });
-        }
+    /// Every segment of frame `frame`, by region.
+    pub fn all_segments(&self, frame: u32) -> Vec<SegRef<'_>> {
+        let mut v: Vec<SegRef> = self.frames.get(frame as usize).into_iter().flatten().flat_map(|f| f.head.segs.iter().map(move |h| f.seg(h))).collect();
+        v.sort_by_key(|s| s.region);
+        v
     }
 
-    /// `scan` on `threads` workers: each folds the edges of the units it
-    /// takes into its own accumulator (`init()`); the accumulators, in no
-    /// particular order (fold them with something commutative).
-    pub fn par_scan<A: Send>(&self, frame: u32, threads: usize, init: impl Fn() -> A + Sync, f: impl Fn(&mut A, Edge) + Sync) -> Vec<A> {
-        let owners = self.owners(frame, threads);
-        let units = self.units(frame);
+    /// The target regions holding edges that leave source region `source`
+    /// at frame `frame` (the out-edge lookup), sorted, distinct.
+    pub fn targets_of(&self, frame: u32, source: u32) -> Vec<u32> {
+        let mut v: Vec<u32> = self.frames.get(frame as usize).into_iter().flatten().flat_map(|f| f.targets().get(&source).into_iter().flatten().copied()).collect();
+        v.sort_unstable();
+        v.dedup();
+        v
+    }
+
+    /// Every edge of frame `frame` on `threads` workers: each folds the
+    /// edges of the segments it takes into its own accumulator (`init()`);
+    /// the accumulators, in no particular order (fold them commutatively).
+    pub fn par_scan<A: Send>(&self, frame: u32, threads: usize, init: impl Fn() -> A + Sync, f: impl Fn(&mut A, Edge) + Sync) -> Result<Vec<A>> {
+        let segs = self.all_segments(frame);
+        let geo = GEOMETRY;
         let next = std::sync::atomic::AtomicUsize::new(0);
         std::thread::scope(|sc| {
             let hs: Vec<_> = (0..threads.max(1))
                 .map(|_| {
-                    sc.spawn(|| {
-                        let mut acc = init();
+                    sc.spawn(|| -> Result<A> {
+                        let (mut acc, mut dec) = (init(), Decoder::default());
                         loop {
                             let k = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            let Some(&(fi, unit)) = units.get(k) else { return acc };
-                            let u = self.unit(frame, &owners, fi, unit);
-                            u.edges(|lid, c, s, x| {
-                                let (region, entry) = u.lid_owner(lid).expect("an edge names an owned lid");
-                                f(&mut acc, Edge { src: u.source(s), dst: state_id(region, entry, c), xfer: x });
-                            });
+                            let Some(s) = segs.get(k) else { return Ok(acc) };
+                            dec.bundles(s, |b| expand(&geo, s.region, &b, |src, dst| f(&mut acc, Edge { src, dst, xfer: b.x })))?;
                         }
                     })
                 })
@@ -915,142 +404,52 @@ impl EdgeStore {
         })
     }
 
-    /// Frame `frame`'s files (`storage-census`): per file its index file's
-    /// bytes, its owner index's entries and its units.
-    pub fn file_sizes(&self, frame: u32) -> Vec<(u64, u64, usize)> {
-        self.frames.get(frame as usize).into_iter().flatten().map(|f| (f.map.len() as u64, f.head.n_owner_index, f.head.units.len())).collect()
-    }
-
-    /// The last frame with edges.
-    pub fn horizon(&self) -> u32 {
-        self.frames.len() as u32 - 1
-    }
-
-    /// Frame `frame`'s units: `(file, unit)`.
-    pub fn units(&self, frame: u32) -> Vec<(u32, u32)> {
-        let mut v = Vec::new();
-        for (fi, file) in self.frames.get(frame as usize).into_iter().flatten().enumerate() {
-            v.extend((0..file.head.units.len() as u32).map(|u| (fi as u32, u)));
-        }
-        v
-    }
-
-    /// Frame `frame`'s lids' owners, by unit and lid, from the files' owner
-    /// indexes (`pack_owner`, `NO_OWNER`): held while the frame is read unit
-    /// by unit, then dropped (8 B a lid; on disk only the index). Scattered
-    /// on `threads` workers.
-    pub fn owners(&self, frame: u32, threads: usize) -> FrameOwners {
-        let mut files = Vec::new();
-        for file in self.frames.get(frame as usize).into_iter().flatten() {
-            let mut starts = Vec::with_capacity(file.head.units.len() + 1);
-            let mut n = 0usize;
-            for u in &file.head.units {
-                starts.push(n);
-                n += u.n_lids as usize;
-            }
-            starts.push(n);
-            // The owner index scattered by (unit, lid), in parallel: it is
-            // sorted by owner, so the writes land anywhere.
-            use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
-            let owners: Vec<AtomicU64> = (0..n).map(|_| AtomicU64::new(super::unit::NO_OWNER)).collect();
-            let m = file.head.n_owner_index as usize;
-            let chunk = m.div_ceil(threads.max(1)).max(1 << 16);
-            std::thread::scope(|sc| {
-                for lo in (0..m).step_by(chunk) {
-                    let (owners, starts) = (&owners, &starts);
-                    sc.spawn(move || {
-                        for k in lo..(lo + chunk).min(m) {
-                            let (r, e, ui, lid) = file.owner_at(k);
-                            owners[starts[ui as usize] + lid as usize].store(super::unit::pack_owner(r, e), Relaxed);
+    /// Every segment of frame `frame` opened, on `threads` workers: each
+    /// folds the blocks it takes (`f(acc, target region, block)`) into its
+    /// own accumulator; the accumulators, in no particular order.
+    pub fn par_blocks<A: Send>(&self, frame: u32, threads: usize, init: impl Fn() -> A + Sync, f: impl Fn(&mut A, u32, &bundle::Block) -> Result<()> + Sync) -> Result<Vec<A>> {
+        let segs = self.all_segments(frame);
+        let next = std::sync::atomic::AtomicUsize::new(0);
+        std::thread::scope(|sc| {
+            let hs: Vec<_> = (0..threads.max(1))
+                .map(|_| {
+                    sc.spawn(|| -> Result<A> {
+                        let (mut acc, mut dec) = (init(), Decoder::default());
+                        loop {
+                            let k = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            let Some(s) = segs.get(k) else { return Ok(acc) };
+                            let blk = dec.open(s)?;
+                            f(&mut acc, s.region, &blk)?;
                         }
-                    });
+                    })
+                })
+                .collect();
+            hs.into_iter().map(|h| h.join().expect("an edge scan worker panicked")).collect()
+        })
+    }
+
+    /// Every edge of frame `frame`, as a list, sorted.
+    pub fn edges_at(&self, frame: u32, threads: usize) -> Result<Vec<Edge>> {
+        let mut v: Vec<Edge> = self.par_scan(frame, threads, Vec::new, |v, e| v.push(e))?.into_iter().flatten().collect();
+        v.sort_unstable();
+        Ok(v)
+    }
+
+    /// The in-edges recorded at frame `frame` of `target` (sources of layer
+    /// `frame - 1`): its region's segments decoded.
+    pub fn preds_at(&self, target: Sk, frame: u32) -> Result<Vec<(Sk, u32)>> {
+        let geo = GEOMETRY;
+        let mut out = Vec::new();
+        let mut dec = Decoder::default();
+        for s in self.segments(frame, target.region) {
+            dec.bundles(&s, |b| {
+                if b.t_key == target.key && b.mask >> target.local & 1 == 1 {
+                    let s_cell = bundle::source_cell(geo.cell(target.region % geo.slots, target.local as u32), b.o);
+                    out.push((Sk::at(&geo, b.s_shape, b.s_key, s_cell), b.x));
                 }
-            });
-            files.push((starts, owners.into_iter().map(AtomicU64::into_inner).collect()));
+            })?;
         }
-        FrameOwners { files }
-    }
-
-    /// Unit `unit` of file `file` of frame `frame` (`units`), read in place
-    /// with the frame's `owners`.
-    pub fn unit<'a>(&'a self, frame: u32, owners: &'a FrameOwners, file: u32, unit: u32) -> UnitView<'a> {
-        let (starts, own) = &owners.files[file as usize];
-        let f = &self.frames[frame as usize][file as usize];
-        let u = &f.head.units[unit as usize];
-        let prev = (u.src_seq != u32::MAX).then(|| &f.prev[&u.src_seq]);
-        UnitView { file: f, u, owners: &own[starts[unit as usize]..starts[unit as usize + 1]], prev }
-    }
-
-    /// `scan` as a list.
-    pub fn edges_at(&self, frame: u32, threads: usize) -> Vec<Edge> {
-        let mut v = Vec::new();
-        self.scan(frame, threads, |e| v.push(e));
-        v
-    }
-}
-
-/// A frame's lids' owners (`EdgeStore::owners`): per file, per unit its
-/// first index, and the owners.
-pub struct FrameOwners {
-    files: Vec<(Vec<usize>, Vec<u64>)>,
-}
-
-/// One recorded unit: its sources, its lids' owners, its edges.
-pub struct UnitView<'a> {
-    file: &'a EdgeFile,
-    u: &'a UnitHead,
-    owners: &'a [u64],
-    /// The previous layer's file holding the sources, when a row range.
-    prev: Option<&'a crate::search::checkpoint::FrameFile>,
-}
-
-impl UnitView<'_> {
-    pub fn n_sources(&self) -> usize {
-        self.u.n_sources as usize
-    }
-
-    /// Source `s` (by its lane from the unit's first).
-    pub fn source(&self, s: u32) -> StateId {
-        match self.prev {
-            Some(p) => p.id_at(self.u.src_row0 + s),
-            None => self.file.source(self.u, s),
-        }
-    }
-
-    pub fn n_lids(&self) -> usize {
-        self.u.n_lids as usize
-    }
-
-    /// The unit's recorded layout (`storage-census`): its block's bytes, its
-    /// transfer ranks, and whether its sources are explicit ids (8 B each)
-    /// rather than a row range.
-    pub fn layout(&self) -> (u64, u32, bool) {
-        (self.u.block_len, self.u.n_xfers, self.u.src_seq == u32::MAX)
-    }
-
-    /// Lid `l`'s bytes in the block (`storage-census`).
-    pub fn lid_bytes(&self, l: u32) -> u32 {
-        self.file.u32_at(self.u.starts, l as usize + 1) - self.file.u32_at(self.u.starts, l as usize)
-    }
-
-    /// Lid `l`'s owner `(region, entry)` (`None`: a lid no edge names).
-    pub fn lid_owner(&self, l: u32) -> Option<(u32, u32)> {
-        match self.owners[l as usize] {
-            super::unit::NO_OWNER => None,
-            o => Some(((o >> 32) as u32, o as u32)),
-        }
-    }
-
-    /// Every edge, by target: `f(lid, cell, source (its index, `source`),
-    /// global transfer)`.
-    pub fn edges(&self, mut f: impl FnMut(u32, u32, u32, u32)) {
-        let block = self.file.block(self.u);
-        for lid in 0..self.u.n_lids {
-            decode_lid(self.file.lid_edges(self.u, block, lid), |c, s, x| {
-                f(lid, c, s, self.file.u32_at(self.u.xfers, x as usize));
-                true
-            });
-        }
+        Ok(out)
     }
 }
 
@@ -1062,8 +461,7 @@ impl UnitView<'_> {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Done {
     pub frame: u32,
-    /// `None`: a tree from before (`xfer.len` holds it).
-    pub xfers: Option<usize>,
+    pub xfers: usize,
 }
 
 fn read_done(dir: &Path) -> Result<Option<Done>> {
@@ -1075,13 +473,10 @@ fn read_done(dir: &Path) -> Result<Option<Done>> {
     };
     let w: Vec<&str> = s.split_whitespace().collect();
     let bad = || anyhow::anyhow!("{}: not a done marker: {s:?}", p.display());
-    let frame = w.first().and_then(|f| f.parse().ok()).ok_or_else(bad)?;
-    let xfers = match w[1..] {
-        [] => None,
-        ["xfers", n] => Some(n.parse().map_err(|_| bad())?),
-        _ => return Err(bad()),
-    };
-    Ok(Some(Done { frame, xfers }))
+    match w[..] {
+        [frame, "xfers", n] => Ok(Some(Done { frame: frame.parse().map_err(|_| bad())?, xfers: n.parse().map_err(|_| bad())? })),
+        _ => Err(bad()),
+    }
 }
 
 /// The last frame whose files are complete; `None`: no marker.
@@ -1096,17 +491,12 @@ pub fn set_done(dir: &Path, frame: u32, xfers: usize) -> Result<()> {
     let tmp = dir.join("done.tmp");
     std::fs::write(&tmp, format!("{frame} xfers {xfers}\n"))?;
     std::fs::rename(&tmp, dir.join("done.txt"))?;
-    // The old marker (a resumed tree from before) would contradict this one.
-    let old = dir.join("xfer.len");
-    if old.exists() {
-        std::fs::remove_file(&old)?;
-    }
     Ok(())
 }
 
-/// The frame an edge file's name is of: `f{frame}.bin`, `f{frame}.r{seq}.bin`,
-/// `f{frame}.w{worker}.blk` - the digits after the `f`, however many (the
-/// names pad to 3: `f1000.bin` is frame 1000).
+/// The frame an edge file's name is of: `f{frame}.bin`, `f{frame}.r{seq}.bin`
+/// - the digits after the `f`, however many (the names pad to 3:
+/// `f1000.bin` is frame 1000).
 pub fn frame_of_name(name: &str) -> Option<u32> {
     let digits = name.strip_prefix('f')?;
     let end = digits.find(|c: char| !c.is_ascii_digit()).unwrap_or(digits.len());
@@ -1130,55 +520,39 @@ pub fn discard_after(dir: &Path, last: u32) -> Result<()> {
     Ok(())
 }
 
+/// Edges `(source, target, transfer)` as bundles by target region: the
+/// segments of one frame and its source index.
+pub fn segments_of(edges: &[(Sk, Sk, u32)]) -> Result<(Vec<Segment>, Vec<(u32, Vec<u32>)>)> {
+    let geo = GEOMETRY;
+    let mut by: std::collections::BTreeMap<u32, FxHashMap<(u32, super::visited::Key, u32, u32, super::visited::Key), u64>> = Default::default();
+    let mut sources: std::collections::BTreeMap<u32, Vec<u32>> = Default::default();
+    for &(s, t, x) in edges {
+        let o = bundle::offset(s.cell(&geo), t.cell(&geo));
+        *by.entry(t.region).or_default().entry((s.shape(&geo), s.key, x, o, t.key)).or_default() |= 1u64 << t.local;
+        sources.entry(t.region).or_default().push(s.region);
+    }
+    let mut z = zstd::bulk::Compressor::new(1)?;
+    let mut raw = Vec::new();
+    let mut segs = Vec::new();
+    for (region, m) in by {
+        let mut bundles: Vec<Bundle> = m.into_iter().map(|((s_shape, s_key, x, o, t_key), mask)| Bundle { s_shape, s_key, x, o, t_key, mask }).collect();
+        segs.push(Segment::encode(region, &mut bundles, &mut raw, &mut z)?);
+    }
+    Ok((segs, sources.into_iter().collect()))
+}
+
 /// A tree's edge files from edges `(source, target, global transfer)` per
-/// frame (each frame one unit of worker 0) and its transfer table `pairs`:
-/// the backward's tests write their graphs with it.
+/// frame and its transfer table `pairs`: the backward's tests write their
+/// graphs with it.
 #[cfg(test)]
-pub(crate) fn write_test_edges(dir: &Path, frames: &[(u32, Vec<(StateId, StateId, u32)>)], pairs: &[Pair]) -> Result<()> {
-    use super::unit::{pack_edge, pack_owner, Lid};
+pub(crate) fn write_test_edges(dir: &Path, frames: &[(u32, Vec<(Sk, Sk, u32)>)], pairs: &[Pair]) -> Result<()> {
     let mut xt = XferTable::default();
     xt.merge(Some(dir), &[pairs.to_vec()])?;
     ensure!(xt.pairs.len() == pairs.len(), "the test's transfer pairs are not distinct");
-    let identity: Vec<u32> = (0..pairs.len() as u32).collect();
     let mut last = 0;
     for (frame, edges) in frames {
-        let mut sources: Vec<StateId> = edges.iter().map(|e| e.0).collect();
-        sources.sort_unstable();
-        sources.dedup();
-        let mut owners: Vec<(u32, u32)> = edges.iter().map(|e| (id_region(e.1), id_entry(e.1))).collect();
-        owners.sort_unstable();
-        owners.dedup();
-        let mut xfers: Vec<u32> = edges.iter().map(|e| e.2).collect();
-        xfers.sort_unstable();
-        xfers.dedup();
-        let at = |v: &[u32], x: u32| v.binary_search(&x).expect("listed") as u32;
-        let mut packed: Vec<u64> = edges
-            .iter()
-            .map(|&(s, t, x)| {
-                let lid = owners.binary_search(&(id_region(t), id_entry(t))).expect("listed") as u32;
-                pack_edge(lid, id_local(t), sources.binary_search(&s).expect("listed") as u32, at(&xfers, x))
-            })
-            .collect();
-        packed.sort_unstable();
-        packed.dedup();
-        let (block, starts) = encode_block(&packed, owners.len());
-        let u = UnitOut {
-            worker: 0,
-            sources,
-            source_rows: None,
-            lids: owners.iter().map(|_| Lid { shape: 0, slot: 0, key: (0, 0) }).collect(),
-            owners: owners.iter().map(|&(r, e)| std::sync::atomic::AtomicU64::new(pack_owner(r, e))).collect(),
-            requests: Vec::new(),
-            pending: Vec::new(),
-            bufs: Vec::new(),
-            block_at: None,
-            block_len: block.len() as u64,
-            block,
-            xfers,
-            starts,
-            edges: packed.len() as u64,
-        };
-        write_file(&file_path(dir, *frame, None), *frame, &[u], vec![identity.clone()], 1)?;
+        let (segs, sources) = segments_of(edges)?;
+        write_file(&file_path(dir, *frame, None), *frame, segs, sources)?;
         last = last.max(*frame);
     }
     set_done(dir, last, pairs.len())
@@ -1186,34 +560,8 @@ pub(crate) fn write_test_edges(dir: &Path, frames: &[(u32, Vec<(StateId, StateId
 
 #[cfg(test)]
 mod tests {
-    use super::super::unit::{pack_edge, Lid, UnitOut};
     use super::*;
 
-    fn unit(worker: u32, sources: Vec<StateId>, lids: Vec<(u32, u32)>, mut edges: Vec<u64>) -> UnitOut {
-        edges.sort_unstable();
-        edges.dedup();
-        let (block, starts) = encode_block(&edges, lids.len());
-        UnitOut {
-            source_rows: None,
-            block_at: None,
-            block_len: block.len() as u64,
-            worker,
-            sources,
-            lids: lids.iter().map(|_| Lid { shape: 0, slot: 0, key: (0, 0) }).collect(),
-            owners: lids.iter().map(|&(r, e)| std::sync::atomic::AtomicU64::new(super::super::unit::pack_owner(r, e))).collect(),
-            requests: Vec::new(),
-            pending: Vec::new(),
-            bufs: Vec::new(),
-            block,
-            // The ranks are the worker's ids here.
-            xfers: (0..=edges.iter().map(|&e| super::super::unit::unpack_edge(e).3).max().unwrap_or(0)).collect(),
-            starts,
-            edges: edges.len() as u64,
-        }
-    }
-
-    /// A block decodes, lid by lid, to the edges encoded, in order: same
-    /// cells (source deltas), next cells, lids without edges.
     /// Edge file names past frame 999 (split frame: step 1000 is frame 500).
     #[test]
     fn edge_file_names_give_their_frame_at_any_width() {
@@ -1221,15 +569,13 @@ mod tests {
             let p = file_path(Path::new("e"), frame, raised);
             let name = p.file_name().and_then(|s| s.to_str()).expect("a name");
             assert_eq!(frame_of_name(name), Some(frame), "{name}");
-            let blk = blocks_path(&p, 5);
-            assert_eq!(frame_of_name(blk.file_name().and_then(|s| s.to_str()).expect("a name")), Some(frame));
         }
         for name in ["done.txt", "xfer.bin", "f.bin", "fx12.bin", "f12x.bin"] {
             assert_eq!(frame_of_name(name), None, "{name}");
         }
         let dir = std::env::temp_dir().join(format!("celeste-edge-names-{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("tmp");
-        for f in ["f999.bin", "f1000.bin", "f1000.w001.blk", "f0998.bin", "done.txt"] {
+        for f in ["f999.bin", "f1000.bin", "f1000.r0001.bin", "f0998.bin", "done.txt"] {
             std::fs::write(dir.join(f), b"").expect("write");
         }
         discard_after(&dir, 999).expect("discard");
@@ -1239,90 +585,55 @@ mod tests {
         assert_eq!(left, ["done.txt", "f0998.bin", "f999.bin"]);
     }
 
+    /// A frame's edges come back from its file: every edge by a scan, a
+    /// target's in-edges by `preds_at`, the out-edge index by source region;
+    /// a raise's file beside the frame's adds its edges.
     #[test]
-    fn blocks_round_trip_lid_by_lid() {
-        let mut v = 0x9e37_79b9_7f4a_7c15u64;
-        let mut edges: Vec<u64> = (0..5000)
-            .map(|_| {
-                v = v.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-                let lid = (v >> 40) as u32 % 700;
-                let local = (v >> 20) as u32 % 64;
-                pack_edge(lid, local, (v >> 8) as u32 % 4096, (v >> 4) as u32 % 300)
-            })
-            .collect();
-        edges.sort_unstable();
-        edges.dedup();
-        let (b, starts) = encode_block(&edges, 703);
-        assert_eq!(starts.len(), 704);
-        let want: Vec<(u32, u32, u32, u32)> = edges.iter().map(|&e| super::super::unit::unpack_edge(e)).collect();
-        let mut got = Vec::new();
-        for lid in 0..703u32 {
-            decode_lid(&b[starts[lid as usize] as usize..starts[lid as usize + 1] as usize], |c, s, x| {
-                got.push((lid, c, s, x));
-                true
-            });
-        }
-        assert_eq!(got, want);
-    }
-
-    /// A target's in-edges come back from every unit naming it, across
-    /// index blocks; a scan yields every edge; transfers go through the
-    /// workers' remaps.
-    #[test]
-    fn preds_and_scans_find_every_edge() {
+    fn a_frames_edges_come_back() {
         let dir = std::env::temp_dir().join(format!("celeste-storage-edges-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        let (r1, r2) = (5u32, 9u32);
-        // Unit 0 (worker 0): 600 edges into (r1, entry 7, cell 3) and one
-        // into (r2, 2, 0); unit 1 (worker 1): (r1, 7, 3) again, lid 1.
-        let mut e0: Vec<u64> = (0..600).map(|s| pack_edge(0, 3, s % 300, (s / 300) as u32)).collect();
-        e0.push(pack_edge(1, 0, 4, 1));
-        let u0 = unit(0, (0..300).map(|s| state_id(1, s, 0)).collect(), vec![(r1, 7), (r2, 2)], e0);
-        let u1 = unit(1, vec![state_id(2, 0, 1), state_id(2, 1, 1)], vec![(r2, 3), (r1, 7)], vec![pack_edge(1, 3, 1, 0), pack_edge(0, 63, 0, 0)]);
-        let path = file_path(&dir, 4, None);
-        write_file(&path, 4, &[u0, u1], vec![vec![10, 11], vec![20]], 2).unwrap();
-        let mut xt = XferTable::default();
-        let mut pairs = Vec::new();
-        for i in 0..21u32 {
-            let a = crate::search::arc_edges::AxisXfer { lo: 0, hi: 1 << 16, tag: 0, val: i as i32 };
-            pairs.push((a, a));
-        }
-        xt.merge(Some(&dir), &[pairs]).unwrap();
-        // The frame's last write trusts them.
-        set_done(&dir, 4, xt.pairs.len()).unwrap();
+        let geo = GEOMETRY;
+        let cell = |x: i32, y: i32| crate::search::pos_graph::cell_of(x, y).unwrap();
+        let st = |shape: u32, k: u64, c: u32| Sk::at(&geo, shape, (0, k), c);
+        let a = st(0, 5, cell(3, 4));
+        let b = st(0, 5, cell(4, 4));
+        let t1 = st(1, 9, cell(5, 4));
+        let t2 = st(1, 9, cell(6, 4));
+        let far = st(1, 2, cell(100, 40));
+        let none = st(0, 7, crate::search::pos_graph::NO_CELL);
+        let mut edges = vec![(a, t1, 3), (b, t2, 3), (a, t2, 4), (a, far, 3), (none, t1, 0), (t1, none, 1)];
+        let pairs: Vec<Pair> = (0..5)
+            .map(|i| {
+                let ax = crate::search::arc_edges::AxisXfer { lo: 0, hi: 1 << 16, tag: 0, val: i };
+                (ax, ax)
+            })
+            .collect();
+        write_test_edges(&dir, &[(4, edges.clone())], &pairs).unwrap();
+        // A raise's file: one more edge into t1's region.
+        let extra = (st(0, 6, cell(2, 4)), t1, 2);
+        let (segs, src) = segments_of(&[extra]).unwrap();
+        write_file(&file_path(&dir, 4, Some(1)), 4, segs, src).unwrap();
+        edges.push(extra);
         let store = EdgeStore::open(&dir, 4).unwrap();
-        assert_eq!(store.edges, 603);
-        let mut got = Vec::new();
-        store.preds_at(state_id(r1, 7, 3), 4, &mut got);
-        assert_eq!(got.len(), 601);
-        assert!(got.contains(&InEdge { src: state_id(2, 1, 1), xfer: 20 }), "unit 1's edge, worker 1's remap");
-        assert!(got.contains(&InEdge { src: state_id(1, 299, 0), xfer: 11 }));
-        got.clear();
-        store.preds_at(state_id(r1, 7, 4), 4, &mut got);
-        assert!(got.is_empty(), "another cell of the entry");
-        store.preds_at(state_id(r2, 3, 63), 4, &mut got);
-        assert_eq!(got, vec![InEdge { src: state_id(2, 0, 1), xfer: 20 }]);
-        // The batched read: every target at once, as one by one.
-        let mut targets = vec![state_id(r1, 7, 3), state_id(r1, 7, 4), state_id(r2, 2, 0), state_id(r2, 3, 63), state_id(r2, 3, 0), state_id(7, 0, 0)];
-        targets.sort_unstable();
-        let mut want: Vec<(usize, InEdge)> = Vec::new();
-        for (k, &t) in targets.iter().enumerate() {
-            let mut v = Vec::new();
-            store.preds_at(t, 4, &mut v);
-            want.extend(v.into_iter().map(|e| (k, e)));
-        }
-        let mut stats = ReadStats::default();
-        let mut batch = Vec::new();
-        store.preds_sorted(4, &targets, &mut stats, |k, e| batch.push((k, e)));
-        batch.sort_unstable();
+        assert_eq!(store.edges, edges.len() as u64);
+        let mut got = store.edges_at(4, 2).unwrap();
+        got.sort_unstable();
+        let mut want: Vec<Edge> = edges.iter().map(|&(src, dst, xfer)| Edge { src, dst, xfer }).collect();
         want.sort_unstable();
-        assert_eq!(batch, want);
-        assert_eq!(stats.edges, 603, "every edge has one of the targets");
-        assert_eq!(stats.region_opens, 2, "region 7 has no lids");
-        let all = store.edges_at(4, 2);
-        assert_eq!(all.len(), 603);
-        assert!(all.contains(&Edge { src: state_id(1, 4, 0), dst: state_id(r2, 2, 0), xfer: 11 }));
-        assert_eq!(XferTable::load(&dir).unwrap().pairs.len(), 21);
+        assert_eq!(got, want);
+        let mut p = store.preds_at(t1, 4).unwrap();
+        p.sort_unstable();
+        let mut pw = vec![(a, 3), (none, 0), (extra.0, 2)];
+        pw.sort_unstable();
+        assert_eq!(p, pw);
+        assert_eq!(store.targets_of(4, a.region), {
+            let mut v = vec![t1.region, far.region];
+            v.sort_unstable();
+            v.dedup();
+            v
+        });
+        assert_eq!(store.targets_of(4, t1.region), vec![none.region]);
+        assert_eq!(store.regions(4).len(), 3);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

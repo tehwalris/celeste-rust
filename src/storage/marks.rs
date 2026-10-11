@@ -73,6 +73,24 @@ impl Resolver {
         Ok((shapes.into_iter().map(|s| s.1).collect(), entries, space))
     }
 
+    /// The tree's shapes by index.
+    pub fn shapes(&self) -> &[u64] {
+        &self.shapes
+    }
+
+    /// `id` as a state (`Sk`: region, key, cell).
+    pub fn sk(&self, id: StateId) -> Result<super::Sk> {
+        Ok(super::Sk { region: id_region(id), key: self.resolve(id)?.1, local: super::id_local(id) as u8 })
+    }
+
+    /// A state's id (its region's entry holding its key; a search of the
+    /// region's entries: diagnostics).
+    pub fn id_of(&self, s: super::Sk) -> Result<StateId> {
+        let Keys::Dense(keys) = &self.keys else { anyhow::bail!("id_of needs every entry's key (Resolver::load)") };
+        let e = keys.get(&s.region).and_then(|v| v.iter().position(|&k| k == s.key)).with_context(|| format!("state {}: no entry", s.show()))?;
+        Ok(super::state_id(s.region, e as u32, s.local as u32))
+    }
+
     /// `id`'s `(shape, key, cell)`.
     pub fn resolve(&self, id: StateId) -> Result<(u64, Key, u32)> {
         let (r, e) = (id_region(id), id_entry(id));

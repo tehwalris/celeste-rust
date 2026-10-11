@@ -287,18 +287,6 @@ enum Command {
         #[arg(long)]
         to: u32,
     },
-    StorageCensus {
-        /// The level's tree (the dir holding `frames/` and `edges/`; a search's
-        /// `<checkpoint-dir>/levelNN`).
-        #[arg(long)]
-        level_dir: String,
-        /// The last frame counted.
-        #[arg(long)]
-        to: u32,
-        /// Frames whose unified-layout edges are encoded exactly (comma list).
-        #[arg(long, default_value = "")]
-        encode: String,
-    },
     /// BENCH: replay one captured frame through the REAL storage code
     /// (`storage::bench`): a forward or `bench-frame` run with
     /// `--emit-capture DIR` writes each wave's `DIR/f{F}/`; this replays
@@ -319,9 +307,6 @@ enum Command {
         /// The level the capture was run at (its `env.txt`).
         #[arg(long, value_parser = Level::parse, default_value = "r0sx")]
         level: Level,
-        /// `units`, `translate` (and the layer) or `all` (and the edge file).
-        #[arg(long, default_value = "all")]
-        phase: String,
         /// Replay the capture this many times.
         #[arg(long, default_value_t = 3)]
         reps: usize,
@@ -665,18 +650,6 @@ enum Command {
         #[arg(long, default_value_t = 5)]
         show: usize,
     },
-    /// Convert format-13 trees to format 14 in place (plans/rows-from-keys.md):
-    /// every tree under `--dir` (a level's tree, a search's checkpoint dir, or
-    /// a dir of them). Each frame file's v14 replacement is decoded back and
-    /// compared with its v13 rows exactly before any file of the tree is
-    /// replaced; a tree that fails stays at format 13. The other `C8TB` files
-    /// (metadata, pos-graph, notes, marks) get the new version. Each tree's
-    /// rows decode in the room its `settings.txt` records (`--room` for one
-    /// without). Refuses any other format.
-    ConvertTree {
-        #[arg(long)]
-        dir: String,
-    },
     /// Record the settings of a tree built before trees recorded them
     /// (`settings::Settings`), so it can be resumed or reused: give the
     /// flags and `--level` it WAS built with - nothing can check them, which
@@ -775,11 +748,9 @@ fn where_(c: u32) -> String {
 }
 
 /// The predecessors of state `id`, first reached at `layer`, recorded at
-/// that frame.
-fn preds_of(edges: &celeste_rust::storage::edges::EdgeStore, id: StateId, layer: u32) -> Vec<StateId> {
-    let mut buf = Vec::new();
-    edges.preds_at(id, layer, &mut buf);
-    buf.iter().map(|e| e.src).collect()
+/// that frame (`tree`: its ids and keys).
+fn preds_of(edges: &celeste_rust::storage::edges::EdgeStore, tree: &celeste_rust::storage::marks::Resolver, id: StateId, layer: u32) -> Result<Vec<StateId>> {
+    edges.preds_at(tree.sk(id)?, layer)?.into_iter().map(|(s, _)| tree.id_of(s)).collect()
 }
 
 /// Every row of `rt2` (of layer `layer`) through ONE forward frame of
@@ -1069,11 +1040,10 @@ fn main() -> Result<()> {
                 died = n == 0;
             }
             // The recorded edges per frame, by what they join: (shape, key,
-            // cell) of target and source, and the transfer - ids and table
-            // positions depend on scheduling (and on a raise), these do not.
-            // A state by what it is, not by its id.
-            // Each entry's key hashed once (`ContentHash::state` per state is
-            // `mix64(key hash ^ cell << 1)`).
+            // cell) of target and source, and the transfer - table positions
+            // depend on a raise, these do not. A state by what it is
+            // (`ContentHash::state`: `mix64(key hash ^ cell << 1)`); a drop
+            // note's by its id, each entry's key hashed once.
             let entries = resolver.per_entry(|shape, k| content.key(shape, k));
             let node = |id: StateId| -> Result<u64> {
                 let (kh, cell) = entries.get(id)?;
@@ -1081,57 +1051,20 @@ fn main() -> Result<()> {
             };
             if edges {
                 let eg = celeste_rust::storage::edges::EdgeStore::open(&dir.join("edges"), to)?;
-                // Each transfer's hash once (the table is small; an edge names
-                // one by index).
-                let pairs: Vec<u64> = eg
-                    .pairs()
-                    .iter()
-                    .map(|pair| {
-                        let mut b = Vec::new();
-                        celeste_rust::search::arc_edges::encode_pair(&mut b, pair);
-                        b.iter().fold(0u64, |h, &x| celeste_engine::runtime2::mix64(h ^ x as u64))
-                    })
-                    .collect();
-                // STREAMED: one frame at a time, its units on every thread, each
-                // folding into its own (count, sum, first error): the sum is
-                // commutative. (Materializing frames' edges, frames in
-                // parallel, held 38 GB on room (6,2) f57; 2026-10-11.)
-                type Acc = (usize, u64, Option<anyhow::Error>);
+                // STREAMED: one frame at a time, its blocks on every thread
+                // (each key hashed once a block, each pair once).
+                let hashes = celeste_rust::storage::bench::EdgeHashes::new(eg.pairs());
+                let shapes = resolver.shapes();
                 for frame in 1..=to {
-                    let parts = eg.par_scan(
-                        frame,
-                        cfg.threads(),
-                        || -> Acc { (0, 0, None) },
-                        |acc, e| {
-                            if acc.2.is_some() {
-                                return;
-                            }
-                            let r = (|| -> Result<u64> {
-                                let p = *pairs.get(e.xfer as usize).ok_or_else(|| anyhow::anyhow!("f{frame}: an edge without its transfer"))?;
-                                let (t, s) = (node(e.dst)?, node(e.src)?);
-                                if dump_edges == Some(frame) {
-                                    eprintln!("edge {t:016x} {s:016x} {:?}", eg.pair(e.xfer));
-                                }
-                                Ok(celeste_engine::runtime2::mix64(t ^ s.rotate_left(21) ^ p.rotate_left(42)))
-                            })();
-                            match r {
-                                Ok(h) => {
-                                    acc.0 += 1;
-                                    acc.1 = acc.1.wrapping_add(h);
-                                }
-                                Err(err) => acc.2 = Some(err),
-                            }
-                        },
-                    );
-                    let (mut n, mut acc) = (0usize, 0u64);
-                    for (pn, ph, err) in parts {
-                        if let Some(err) = err {
-                            return Err(err);
-                        }
-                        n += pn;
-                        acc = acc.wrapping_add(ph);
-                    }
+                    let (n, acc) = hashes.frame(&eg, frame, &content, shapes, cfg.threads())?;
                     println!("e{frame:03} {n} {acc:016x}");
+                    if dump_edges == Some(frame) {
+                        let geo = celeste_rust::storage::GEOMETRY;
+                        let node = |s: celeste_rust::storage::Sk| content.state(shapes[s.shape(&geo) as usize], s.key, s.cell(&geo));
+                        for e in eg.edges_at(frame, cfg.threads())? {
+                            eprintln!("edge {:016x} {:016x} {:?}", node(e.dst), node(e.src), eg.pair(e.xfer));
+                        }
+                    }
                 }
             }
             if dropped {
@@ -1190,19 +1123,20 @@ fn main() -> Result<()> {
                 let t_all = t.elapsed();
                 let w = &wave.stats;
                 eprintln!(
-                    "[bench] rep {rep}: wave {:.0} ms (idle {:.0}%) translate {:.0} layer + edge file {:.0} total {:.0} ms | in {} emitted {} kept {} | units {} requests {} lids {} | edges {} ({:.2} B)",
+                    "[bench] rep {rep}: wave {:.0} ms (idle {:.0}%) regions {:.0} end {:.0} total {:.0} ms | in {} emitted {} kept {} | units {} slices {} routes {} | edges {} bundles {} ({:.3} B)",
                     ms(w.t_wave),
                     w.wave_idle * 100.0,
-                    ms(w.t_translate),
+                    ms(w.t_regions),
                     ms(w.t_layer),
                     ms(t_all),
                     w.lanes_in,
                     w.lanes_raw,
                     w.lanes_kept,
                     w.units,
-                    w.requests,
-                    w.lids,
+                    w.slices,
+                    w.routes,
                     w.edge_records,
+                    w.edge_bundles,
                     w.edge_bytes as f64 / w.edge_records.max(1) as f64,
                 );
                 let (n, acc) = celeste_rust::storage::bench::layer_fingerprint(&wave.next, &visited);
@@ -1240,8 +1174,7 @@ fn main() -> Result<()> {
             let dir = std::path::Path::new(&level_dir);
             let t = std::time::Instant::now();
             let seeds = celeste_rust::search::arc_dp::Seeds::load(dir, horizon)?;
-            let resolver = celeste_rust::storage::marks::Resolver::load(dir, horizon)?;
-            let content = resolver.space.content_hash();
+            let content = seeds.space.content_hash();
             eprintln!("[bench-backward] h{horizon}'s edge files opened in {:.2} s: {} win rows, {} edges; {} threads", t.elapsed().as_secs_f64(), seeds.wins.len(), seeds.store.edges, cfg.threads());
             let mut first: Option<String> = None;
             for rep in 0..reps {
@@ -1250,21 +1183,21 @@ fn main() -> Result<()> {
                 let t = std::time::Instant::now();
                 let mut c = celeste_rust::search::arc_dp::Backward::new(&seeds.store, &seeds.pairs, &seeds.wins, horizon, cfg.threads());
                 for f in (frame + 1..horizon).rev() {
-                    c.step(f);
+                    c.step(f)?;
                 }
                 if rep == 0 {
                     eprintln!("[bench-backward] W from f{horizon} down to f{} in {:.2} s", frame + 1, t.elapsed().as_secs_f64());
                 }
                 let before = c.walls();
                 let t = std::time::Instant::now();
-                c.step(frame);
+                c.step(frame)?;
                 let wall = t.elapsed();
                 let after = c.walls();
                 // The gate's W line: per node with a set, its (shape, key,
                 // cell) and its set's rectangles, summed.
                 let (mut n, mut acc) = (0usize, 0u64);
                 for (id, r) in c.current() {
-                    let (shape, key, cell) = resolver.resolve(id)?;
+                    let (shape, key, cell) = seeds.state(id);
                     n += 1;
                     acc = acc.wrapping_add(celeste_rust::search::arc_dp::gate_w_hash(content.state(shape, key, cell), r));
                 }
@@ -1281,18 +1214,13 @@ fn main() -> Result<()> {
         Command::BundleOrders { level_dir, from, to } => {
             celeste_rust::storage::orders::orders(std::path::Path::new(&level_dir), from, to, cfg.threads())?;
         }
-        Command::StorageCensus { level_dir, to, encode } => {
-            let encode: Vec<u32> = encode.split(',').filter(|s| !s.is_empty()).map(|s| s.parse()).collect::<Result<_, _>>()?;
-            celeste_rust::storage::census::census(&celeste_rust::storage::census::CensusArgs { dir: std::path::Path::new(&level_dir), to, encode: &encode, threads: cfg.threads() })?;
-        }
-        Command::BenchStorage { capture, tree, level, phase, reps } => {
+        Command::BenchStorage { capture, tree, level, reps } => {
             cfg.check(std::path::Path::new(&tree), level)?;
             celeste_rust::storage::bench::bench_storage(&celeste_rust::storage::bench::BenchArgs {
                 capture: std::path::Path::new(&capture),
                 tree: std::path::Path::new(&tree),
                 level,
                 settings: &cfg,
-                phase: &phase,
                 reps,
             })?;
         }
@@ -1385,7 +1313,7 @@ fn main() -> Result<()> {
             let rem_cells = |rt2: &Rt2| rt2.player_xy_cells(ids, ids.f_rem);
             // One stored row, by id, as a one-lane block.
             let tree = celeste_rust::storage::marks::Resolver::load(dir, to)?;
-            let row_of = |id: StateId| -> Result<Block> { Ok(Block::from_rt2(load_row(dir, id, cfg.room, &tree)?.0)) };
+            let row_of = |s: celeste_rust::storage::Sk| -> Result<Block> { Ok(Block::from_rt2(load_row(dir, tree.id_of(s)?, cfg.room, &tree)?.0)) };
             // Every successor of `row` at remainder `rem` over all 64 inputs:
             // its projection onto the level and its player's remainder; and
             // the reference steps it took.
@@ -1450,8 +1378,8 @@ fn main() -> Result<()> {
             };
             /// A record with its transfer decoded.
             struct Rec {
-                target: StateId,
-                src: StateId,
+                target: celeste_rust::storage::Sk,
+                src: celeste_rust::storage::Sk,
                 x: celeste_rust::search::arcs::Transfer,
                 y: celeste_rust::search::arcs::Transfer,
             }
@@ -1476,7 +1404,7 @@ fn main() -> Result<()> {
                 let src_row = row_of(src)?;
                 let tgt_row = row_of(r.target)?;
                 let (tshape, tkeys, tcells) = widened_keys(&tgt_row, level, &space)?;
-                anyhow::ensure!(tkeys[0].is_some(), "arc-check: the target {} does not key in its own tree", show_id(r.target));
+                anyhow::ensure!(tkeys[0].is_some(), "arc-check: the target {} does not key in its own tree", r.target.show());
                 let target = (tshape, tkeys[0], tcells[0]);
                 let (gx, gy) = (r.x.guard, r.y.guard);
                 // Every record of this (pred, target), and its guards as rectangles.
@@ -1520,14 +1448,14 @@ fn main() -> Result<()> {
                     let stray: Vec<(u32, u32)> = succs.iter().filter(|(id, _)| *id == target).filter_map(|(_, q)| *q).filter(|q| !predicted(q)).collect();
                     if !stray.is_empty() {
                         o.unpredicted += 1;
-                        o.msgs.push(format!("[arc-check] f{frame} pred {} -> {}: inside {p:?} the reference reaches the target at {stray:?}, which no record of the pair taking the point predicts", show_id(src), show_id(r.target)));
+                        o.msgs.push(format!("[arc-check] f{frame} pred {} -> {}: inside {p:?} the reference reaches the target at {stray:?}, which no record of the pair taking the point predicts", src.show(), r.target.show()));
                     }
                     if !ok {
                         o.inside_bad += 1;
                         let reached: Vec<&Option<(u32, u32)>> = succs.iter().filter(|(id, _)| *id == target).map(|(_, q)| q).collect();
                         o.msgs.push(format!(
                             "[arc-check] f{frame} pred {} -> {}: inside {p:?} the transfer x {:?} y {:?} predicts {want:?}; the reference reaches the target with remainders {reached:?}",
-                            show_id(src), show_id(r.target), r.x, r.y
+                            src.show(), r.target.show(), r.x, r.y
                         ));
                     }
                 }
@@ -1544,7 +1472,7 @@ fn main() -> Result<()> {
                         o.steps += steps;
                         if succs.iter().any(|(id, _)| *id == target) {
                             o.outside_bad += 1;
-                            o.msgs.push(format!("[arc-check] f{frame} pred {} -> {}: OUTSIDE every guard of the pair at {p:?}, the reference reaches the target", show_id(src), show_id(r.target)));
+                            o.msgs.push(format!("[arc-check] f{frame} pred {} -> {}: OUTSIDE every guard of the pair at {p:?}, the reference reaches the target", src.show(), r.target.show()));
                         }
                     }
                 }
@@ -1556,7 +1484,7 @@ fn main() -> Result<()> {
             let t0 = std::time::Instant::now();
             let workers = cfg.threads();
             for frame in from..=to {
-                let all = graph.edges_at(frame, cfg.threads());
+                let all = graph.edges_at(frame, cfg.threads())?;
                 let missing = all.iter().filter(|e| graph.pair(e.xfer).is_none()).count() as u64;
                 missing_total += missing;
                 let recs: Vec<Rec> = all
@@ -1592,7 +1520,7 @@ fn main() -> Result<()> {
                                     match check(&mut eng, frame, r, &recs) {
                                         Ok(o) => out.push((k, o)),
                                         Err(e) if e.downcast_ref::<celeste_rust::trace::refdriver::TooManyPaths>().is_some() => {
-                                            let msg = format!("[arc-check] f{frame} pred {} -> {}: SKIPPED ({e})", show_id(r.src), show_id(r.target));
+                                            let msg = format!("[arc-check] f{frame} pred {} -> {}: SKIPPED ({e})", r.src.show(), r.target.show());
                                             out.push((k, Sampled { skipped: 1, msgs: vec![msg], ..Default::default() }));
                                         }
                                         Err(e) => return Err(e),
@@ -1948,7 +1876,7 @@ fn main() -> Result<()> {
                     if layer == 0 {
                         break;
                     }
-                    let preds = preds_of(&edges, id, layer);
+                    let preds = preds_of(&edges, &coarse_tree, id, layer)?;
                     // Prefer a REAL predecessor: then this step is the first
                     // spurious one.
                     let mut pick: Option<(StateId, Rt2, Proj, u32, bool)> = None;
@@ -2007,7 +1935,7 @@ fn main() -> Result<()> {
         Command::EdgeCensus { level_dir, frame, horizon } => {
             let g = celeste_rust::storage::edges::EdgeStore::open(&std::path::Path::new(&level_dir).join("edges"), horizon)?;
             let pairs = g.pairs();
-            let mut recs = g.edges_at(frame, cfg.threads());
+            let mut recs = g.edges_at(frame, cfg.threads())?;
             recs.sort_unstable();
             let n_edges = recs.len();
             let mut hist = std::collections::BTreeMap::<usize, u64>::new();
@@ -2521,21 +2449,6 @@ fn main() -> Result<()> {
             }
             println!("[follow] every frame is in the tree");
         }
-        Command::ConvertTree { dir } => {
-            let t = std::time::Instant::now();
-            let r = celeste_rust::storage::convert::convert(std::path::Path::new(&dir), cfg.room, cfg.threads())?;
-            println!(
-                "[convert-tree] {dir}: {} trees, {} frame files ({} rows) and {} other files to format {}; frame files {} -> {} B; {:.1} s",
-                r.trees,
-                r.frame_files,
-                r.rows,
-                r.value_files,
-                celeste_rust::search::checkpoint::FORMAT_VERSION,
-                r.bytes_before,
-                r.bytes_after,
-                t.elapsed().as_secs_f64()
-            );
-        }
         Command::AdoptSettings { level_dir, level } => {
             let dir = std::path::Path::new(&level_dir);
             anyhow::ensure!(dir.join("frames").join("f000").is_dir(), "{level_dir}: not a tree");
@@ -2631,14 +2544,14 @@ fn frame_metrics(room: &str, level: Level, frame: u32, w: &celeste_rust::frame::
     put("frame.emissions", w.lanes_raw as u64);
     put("frame.kept", w.lanes_kept as u64);
     put("frame.units", w.units as u64);
-    put("frame.requests", w.requests);
-    put("frame.lids", w.lids);
+    put("frame.slices", w.slices as u64);
+    put("frame.routes", w.routes);
     put("frame.edges", w.edge_records);
-    // NOT exact: a unit's block is encoded during the wave with its
-    // worker's local transfer ids, whose varint lengths depend on which
-    // units the worker ran first (`tools/metrics_diff.py` allows 0.5%).
-    put("approx.frame.edge_bytes", w.edge_bytes);
-    put("approx.frame.edge_millibytes_per_edge", (w.edge_bytes * 1000).checked_div(w.edge_records).unwrap_or(0));
+    put("frame.bundles", w.edge_bundles);
+    // Exact: a segment is a function of its route's records (global
+    // transfer ids, sorted bundles, zstd -1).
+    put("frame.edge_bytes", w.edge_bytes);
+    put("frame.edge_millibytes_per_edge", (w.edge_bytes * 1000).checked_div(w.edge_records).unwrap_or(0));
     put("calls.calls", ks.calls);
     put("calls.rows", ks.rows);
     put("calls.slice_lanes", ks.slice_lanes);

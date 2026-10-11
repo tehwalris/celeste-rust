@@ -24,26 +24,80 @@
 //! concrete search runs inside `W` (`concrete_search`).
 
 use super::arcs::{Region, RegionArena, RegionRef, Transfer};
-use crate::storage::edges::{get_varint, put_varint, EdgeStore, ReadStats};
-use crate::storage::{id_entry, id_region, state_id, StateId};
+use crate::storage::bundle::{get_varint, get_varint128, put_varint, put_varint128};
+use crate::storage::edges::EdgeStore;
+use crate::storage::{Sk, GEOMETRY};
 use rustc_hash::{FxHashMap, FxHashSet};
+
+/// Past every state (a sorted stream's end).
+const SK_MAX: Sk = Sk { region: u32::MAX, key: (u64::MAX, u64::MAX), local: u8::MAX };
+
+#[inline]
+fn wide(k: (u64, u64)) -> u128 {
+    (k.0 as u128) << 64 | k.1 as u128
+}
+
+/// State `s` after `prev` in a sorted stream (`prev <= s`): its region's
+/// delta, its key (a delta within the region, raw past it), its cell.
+#[inline]
+fn put_sk(out: &mut Vec<u8>, prev: Sk, s: Sk) {
+    debug_assert!(prev <= s);
+    let dr = s.region - prev.region;
+    put_varint(out, dr as u64);
+    put_varint128(out, if dr == 0 { wide(s.key) - wide(prev.key) } else { wide(s.key) });
+    out.push(s.local);
+}
+
+#[inline]
+fn get_sk(b: &[u8], pos: &mut usize, prev: Sk) -> Sk {
+    let dr = get_varint(b, pos) as u32;
+    let k = get_varint128(b, pos);
+    let k = if dr == 0 { wide(prev.key) + k } else { k };
+    let local = b[*pos];
+    *pos += 1;
+    Sk { region: prev.region + dr, key: ((k >> 64) as u64, k as u64), local }
+}
+
+/// What a backward's reads decoded: segments (zstd blocks) and their
+/// bytes (stored, raw), bundles parsed, in-edges found, (region, frame)
+/// pairs opened.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ReadStats {
+    pub segments: u64,
+    pub stored: u64,
+    pub raw: u64,
+    pub bundles: u64,
+    pub edges: u64,
+    pub region_opens: u64,
+}
+
+impl ReadStats {
+    pub fn add(&mut self, o: &ReadStats) {
+        self.segments += o.segments;
+        self.stored += o.stored;
+        self.raw += o.raw;
+        self.bundles += o.bundles;
+        self.edges += o.edges;
+        self.region_opens += o.region_opens;
+    }
+}
 
 /// Nodes a block of `Winning` holds: a node is found by decoding at most
 /// this many.
 const BLOCK: usize = 16;
 
 /// The winning sets, `t` in `0..=horizon`, of the nodes that have one (W's
-/// SUPPORT, sorted by id). A node's set is non-empty from its layer to its
-/// last frame and only grows as `t` falls, so it is a few SPANS - a set and
-/// the frames it holds over - and is stored as varints: per node its id (a
-/// delta), its layer, its spans' count, and per span its length and its set
-/// (the arena's sets numbered by use, the most used first); per block of
-/// `BLOCK` nodes its first id and byte offset. ~4 B a node and ~3 a span
-/// (a span as fields took 8, its node's id and offset 12 more), in a scratch
-/// file mapped back when the backward has a directory for it (`Spill`).
+/// SUPPORT, sorted by state: `Sk`). A node's set is non-empty from its
+/// layer to its last frame and only grows as `t` falls, so it is a few SPANS
+/// - a set and the frames it holds over - and is stored as varints: per
+/// node its state (a delta, `put_sk`), its layer, its spans' count, and per
+/// span its length and its set (the arena's sets numbered by use, the most
+/// used first); per block of `BLOCK` nodes its first state and byte offset,
+/// in a scratch file mapped back when the backward has a directory for it
+/// (`Spill`).
 pub struct Winning {
     n: usize,
-    blocks: Vec<(StateId, u64)>,
+    blocks: Vec<(Sk, u64)>,
     data: Bytes,
     sets: Sets,
     spans: usize,
@@ -130,10 +184,10 @@ impl Sets {
     }
 }
 
-/// One node of `Winning`: its id, its layer and its spans.
+/// One node of `Winning`: its state, its layer and its spans.
 #[derive(Clone, Copy)]
 pub struct Node<'a> {
-    pub id: StateId,
+    pub id: Sk,
     pub layer: u32,
     count: u32,
     bytes: &'a [u8],
@@ -179,7 +233,7 @@ pub struct Nodes<'a> {
     k: usize,
     end: usize,
     pos: usize,
-    id: StateId,
+    id: Sk,
 }
 
 impl<'a> Iterator for Nodes<'a> {
@@ -198,9 +252,9 @@ impl<'a> Iterator for Nodes<'a> {
 }
 
 impl Winning {
-    /// The node at `pos` (whose previous node's id is `id`); both past it.
-    fn decode_at(&self, pos: &mut usize, id: &mut StateId) -> Node<'_> {
-        *id += get_varint(&self.data, pos);
+    /// The node at `pos` (whose previous node's state is `id`); both past it.
+    fn decode_at(&self, pos: &mut usize, id: &mut Sk) -> Node<'_> {
+        *id = get_sk(&self.data, pos, *id);
         let layer = get_varint(&self.data, pos) as u32;
         let count = get_varint(&self.data, pos) as u32;
         let start = *pos;
@@ -226,7 +280,7 @@ impl Winning {
     /// first node).
     fn nodes_from(&self, lo: usize, hi: usize) -> Nodes<'_> {
         assert!(lo % BLOCK == 0, "nodes from a block's first");
-        Nodes { w: self, k: lo, end: hi.min(self.n), pos: 0, id: 0 }
+        Nodes { w: self, k: lo, end: hi.min(self.n), pos: 0, id: Sk::default() }
     }
     pub fn len(&self) -> usize {
         self.n
@@ -235,7 +289,7 @@ impl Winning {
         self.n == 0
     }
     /// The node of state `id` (`None`: no set at any frame).
-    pub fn index(&self, id: StateId) -> Option<u32> {
+    pub fn index(&self, id: Sk) -> Option<u32> {
         let b = self.blocks.partition_point(|x| x.0 <= id).checked_sub(1)?;
         let (mut at, mut pos) = (self.blocks[b].0, self.blocks[b].1 as usize);
         for k in 0..BLOCK.min(self.n - b * BLOCK) {
@@ -246,7 +300,7 @@ impl Winning {
         }
         None
     }
-    pub fn id(&self, i: u32) -> StateId {
+    pub fn id(&self, i: u32) -> Sk {
         self.node(i).id
     }
     /// `W_t(i)` (`None` = empty).
@@ -261,8 +315,8 @@ impl Winning {
 
 /// The spans one backward step closed - each node whose set changed or
 /// ended below the step's frame, its span from `lo` (the step's frame + 1)
-/// to its last frame - by id, as varints (the id's delta, `hi - lo`, the
-/// set) at `at..at + len` of the backward's spilled runs.
+/// to its last frame - by state, as varints (the state's delta, `hi - lo`,
+/// the set) at `at..at + len` of the backward's spilled runs.
 #[derive(Clone, Copy)]
 struct Run {
     lo: u16,
@@ -272,13 +326,13 @@ struct Run {
 }
 
 impl Run {
-    /// Encode `closed` (by id) into `out`.
-    fn new(lo: u16, closed: impl IntoIterator<Item = (StateId, u16, u32)>, out: &mut Spill) -> Self {
+    /// Encode `closed` (by state) into `out`.
+    fn new(lo: u16, closed: impl IntoIterator<Item = (Sk, u16, u32)>, out: &mut Spill) -> Self {
         let mut bytes = Vec::new();
-        let (mut last, mut n) = (0, 0);
+        let (mut last, mut n) = (Sk::default(), 0);
         for (id, hi, set) in closed {
             debug_assert!(id >= last && hi >= lo);
-            put_varint(&mut bytes, id - last);
+            put_sk(&mut bytes, last, id);
             put_varint(&mut bytes, (hi - lo) as u64);
             put_varint(&mut bytes, set as u64);
             last = id;
@@ -288,13 +342,13 @@ impl Run {
         out.put(&bytes);
         Run { lo, n, at, len: bytes.len() as u64 }
     }
-    /// `(id, hi, set)` in id order, from the spilled runs `all`.
-    fn iter<'b>(&self, all: &'b [u8]) -> impl Iterator<Item = (StateId, u16, u32)> + 'b {
+    /// `(state, hi, set)` in state order, from the spilled runs `all`.
+    fn iter<'b>(&self, all: &'b [u8]) -> impl Iterator<Item = (Sk, u16, u32)> + 'b {
         let b = &all[self.at as usize..(self.at + self.len) as usize];
         let lo = self.lo;
-        let (mut pos, mut id) = (0usize, 0u64);
+        let (mut pos, mut id) = (0usize, Sk::default());
         (0..self.n).map(move |_| {
-            id += get_varint(b, &mut pos);
+            id = get_sk(b, &mut pos, id);
             let hi = lo + get_varint(b, &mut pos) as u16;
             (id, hi, get_varint(b, &mut pos) as u32)
         })
@@ -305,7 +359,7 @@ impl Run {
 /// current span, its layer (with `WIN`: a win node).
 #[derive(Clone, Copy, Debug)]
 struct Cur {
-    id: StateId,
+    id: Sk,
     set: u32,
     hi: u16,
     layer: u16,
@@ -324,7 +378,7 @@ impl Cur {
 /// source's layer, the target's set, the edge's transfer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 struct Emit {
-    p: StateId,
+    p: Sk,
     set: u32,
     xfer: u32,
     layer: u16,
@@ -335,7 +389,7 @@ struct Emit {
 /// layer.
 #[derive(Clone, Copy, Debug)]
 struct Acc {
-    p: StateId,
+    p: Sk,
     set: u32,
     layer: u16,
 }
@@ -384,15 +438,15 @@ fn par_chunks<T: Send>(n: usize, chunk: usize, threads: usize, f: impl Fn(usize,
     parts.into_iter().map(|p| p.1).collect()
 }
 
-/// Id ranges `[bounds[k], bounds[k + 1])` cutting `total` ids into about
-/// `parts` pieces of equal weight, from a `sample` of them (one range when
-/// they are few).
-fn id_ranges(mut sample: Vec<StateId>, total: usize, parts: usize) -> Vec<StateId> {
+/// State ranges `[bounds[k], bounds[k + 1])` cutting `total` states into
+/// about `parts` pieces of equal weight, from a `sample` of them (one range
+/// when they are few).
+fn id_ranges(mut sample: Vec<Sk>, total: usize, parts: usize) -> Vec<Sk> {
     sample.sort_unstable();
     let n = if total < 1 << 16 || sample.is_empty() { 1 } else { parts };
-    let mut bounds: Vec<StateId> = vec![0];
+    let mut bounds: Vec<Sk> = vec![Sk::default()];
     bounds.extend((1..n).map(|k| sample[k * sample.len() / n]));
-    bounds.push(StateId::MAX);
+    bounds.push(SK_MAX);
     bounds.dedup();
     bounds
 }
@@ -400,13 +454,13 @@ fn id_ranges(mut sample: Vec<StateId>, total: usize, parts: usize) -> Vec<StateI
 /// BACKWARD: `W_t` for `t = horizon` down to 0 (`Backward::step`, a frame at
 /// a time), from the win states `wins` (id, layer); with `spill`, the
 /// closed spans and W's nodes go to scratch files there (`Spill`).
-pub fn backward(store: &EdgeStore, pairs: &[(Transfer, Transfer)], wins: &[(StateId, u32)], horizon: u32, threads: usize, spill: Option<&std::path::Path>) -> anyhow::Result<Winning> {
+pub fn backward(store: &EdgeStore, pairs: &[(Transfer, Transfer)], wins: &[(Sk, u32)], horizon: u32, threads: usize, spill: Option<&std::path::Path>) -> anyhow::Result<Winning> {
     let mut b = Backward::new(store, pairs, wins, horizon, threads);
     if let Some(dir) = spill {
         b = b.spill_to(dir)?;
     }
     for t in (0..horizon).rev() {
-        b.step(t);
+        b.step(t)?;
     }
     b.finish()
 }
@@ -434,10 +488,9 @@ pub struct Backward<'a> {
     spill: Option<std::path::PathBuf>,
     /// Per target region, the steps that read its in-edges.
     opens: FxHashMap<u32, u32>,
-    /// A round's in-edges (`ROUND_EMITS`) and a read's targets (tests
-    /// shrink both to exercise the rounds).
+    /// A round's in-edges (`ROUND_EMITS`; tests shrink it to exercise the
+    /// rounds).
     round_emits: usize,
-    chunk: usize,
     read: ReadStats,
     n_changed: u64,
     n_emits: u64,
@@ -453,7 +506,7 @@ pub struct Backward<'a> {
 impl<'a> Backward<'a> {
     /// `W_horizon`: the win nodes present by the horizon (each step on
     /// `threads` workers).
-    pub fn new(store: &'a EdgeStore, pairs: &'a [(Transfer, Transfer)], wins: &[(StateId, u32)], horizon: u32, threads: usize) -> Self {
+    pub fn new(store: &'a EdgeStore, pairs: &'a [(Transfer, Transfer)], wins: &[(Sk, u32)], horizon: u32, threads: usize) -> Self {
         assert!(horizon < WIN as u32, "a horizon past {WIN}");
         let mut sets = RegionArena::default();
         let full = Region::full();
@@ -479,7 +532,6 @@ impl<'a> Backward<'a> {
             spill: None,
             opens: FxHashMap::default(),
             round_emits: ROUND_EMITS,
-            chunk: 1024,
             read: ReadStats::default(),
             n_changed: 0,
             n_emits: 0,
@@ -500,15 +552,15 @@ impl<'a> Backward<'a> {
         Ok(self)
     }
 
-    /// Read in rounds of `emits` in-edges, `chunk` targets at a time.
+    /// Read in rounds of `emits` in-edges.
     #[cfg(test)]
-    fn with_rounds(mut self, emits: usize, chunk: usize) -> Self {
-        (self.round_emits, self.chunk) = (emits, chunk);
+    fn with_rounds(mut self, emits: usize) -> Self {
+        self.round_emits = emits;
         self
     }
 
     /// The frame done last's nodes with a set, and each one's set.
-    pub fn current(&self) -> impl Iterator<Item = (StateId, RegionRef<'_>)> + '_ {
+    pub fn current(&self) -> impl Iterator<Item = (Sk, RegionRef<'_>)> + '_ {
         self.cur.iter().map(|c| (c.id, self.sets.get(c.set)))
     }
 
@@ -517,73 +569,121 @@ impl<'a> Backward<'a> {
         [self.d_read, self.d_pull, self.d_merge]
     }
 
-    /// The work of a step's reads: the changed nodes (in id order) cut into
-    /// chunks of `chunk` targets, each chunk read frame by frame from the
-    /// least layer among its targets (at least 1) to `t + 1` - one ITEM a
-    /// (chunk, frame), numbered chunk-major: per chunk its first item and
-    /// first frame.
-    fn read_items(&self, t: u32) -> Vec<(usize, u32)> {
-        let mut items = Vec::with_capacity(self.changed.len().div_ceil(self.chunk) + 1);
-        let mut at = 0usize;
-        for chunk in self.changed.chunks(self.chunk) {
-            let first = chunk.iter().map(|&c| self.cur[c as usize].layer() as u32).min().unwrap_or(0).max(1);
-            items.push((at, first));
+    /// The work of a step's reads: the changed nodes (in state order, so
+    /// region by region) grouped by REGION - a region's in-edges are its
+    /// segments at a frame, decoded whole - each group read frame by frame
+    /// from the least layer among its nodes (at least 1) to `t + 1`: one
+    /// ITEM a (region, frame), numbered group-major. Per group its first
+    /// item, its first frame and its range of `changed`; then the total.
+    fn read_items(&self, t: u32) -> Vec<(usize, u32, usize, usize)> {
+        let mut items = Vec::new();
+        let (mut at, mut a) = (0usize, 0usize);
+        while a < self.changed.len() {
+            let region = self.cur[self.changed[a] as usize].id.region;
+            let b = a + self.changed[a..].partition_point(|&c| self.cur[c as usize].id.region == region);
+            let first = self.changed[a..b].iter().map(|&c| self.cur[c as usize].layer() as u32).min().unwrap_or(0).max(1);
+            items.push((at, first, a, b));
             at += (t + 2).saturating_sub(first) as usize;
+            a = b;
         }
-        items.push((at, 0));
+        items.push((at, 0, a, a));
         items
     }
 
     /// One ROUND of a step's reads: from item `start` on (`read_items`), on
     /// `threads` workers, until the round holds `round_emits` in-edges -
-    /// the in-edges recorded at an item's frame into its chunk's targets of
-    /// layer <= the frame (frames <= t + 1 at step t: their sources have
-    /// layers <= t).
-    /// Per worker its in-edges sorted and distinct; and where the round
-    /// stopped. A round stops between items, so one heavy target bounds it
-    /// by its in-edges at one frame.
-    fn read_round(&self, items: &[(usize, u32)], start: usize) -> (Vec<(Vec<Emit>, ReadStats)>, usize) {
+    /// the in-edges recorded at an item's frame into its region's changed
+    /// targets of layer <= the frame (frames <= t + 1 at step t: their
+    /// sources have layers <= t). Per worker its in-edges sorted and
+    /// distinct; and where the round stopped. A round stops between items,
+    /// so one heavy region bounds it by its in-edges at one frame.
+    fn read_round(&self, items: &[(usize, u32, usize, usize)], start: usize) -> anyhow::Result<(Vec<(Vec<Emit>, ReadStats)>, usize)> {
         use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
-        let (cur, changed, store, chunk_len, budget) = (&self.cur, &self.changed, self.store, self.chunk, self.round_emits);
+        let (cur, changed, store, budget) = (&self.cur, &self.changed, self.store, self.round_emits);
+        let geo = GEOMETRY;
         let total = items.last().map_or(0, |x| x.0);
         let (next, held) = (AtomicUsize::new(start), AtomicUsize::new(0));
-        let parts: Vec<(Vec<Emit>, ReadStats)> = std::thread::scope(|sc| {
+        let parts: Vec<anyhow::Result<(Vec<Emit>, ReadStats)>> = std::thread::scope(|sc| {
             let hs: Vec<_> = (0..self.threads)
                 .map(|_| {
-                    sc.spawn(|| {
+                    sc.spawn(|| -> anyhow::Result<(Vec<Emit>, ReadStats)> {
                         let (mut emits, mut stats) = (Vec::new(), ReadStats::default());
-                        let (mut targets, mut sets): (Vec<StateId>, Vec<u32>) = (Vec::new(), Vec::new());
+                        let mut dec = crate::storage::edges::Decoder::default();
+                        // The group's targets of layer <= the frame, by
+                        // (key, cell): their sets; per block target rank,
+                        // its changed cells and its first target.
+                        let mut targets: Vec<((u64, u64), u8, u32)> = Vec::new();
+                        let mut ranks: Vec<(u64, u32)> = Vec::new();
                         while held.load(Relaxed) < budget {
                             let k = next.fetch_add(1, Relaxed);
                             if k >= total {
                                 break;
                             }
-                            let c = items.partition_point(|x| x.0 <= k) - 1;
-                            let f = items[c].1 + (k - items[c].0) as u32;
-                            let chunk = &changed[c * chunk_len..((c + 1) * chunk_len).min(changed.len())];
-                            let before = emits.len();
+                            let g = items.partition_point(|x| x.0 <= k) - 1;
+                            let (first_item, first_frame, a, b) = items[g];
+                            let f = first_frame + (k - first_item) as u32;
+                            let region = cur[changed[a] as usize].id.region;
                             targets.clear();
-                            sets.clear();
-                            for &n in chunk {
+                            for &n in &changed[a..b] {
                                 let n = &cur[n as usize];
                                 if n.layer() as u32 <= f {
-                                    targets.push(n.id);
-                                    sets.push(n.set);
+                                    targets.push((n.id.key, n.id.local, n.set));
                                 }
                             }
-                            store.preds_sorted(f, &targets, &mut stats, |k, e| emits.push(Emit { p: e.src, set: sets[k], xfer: e.xfer, layer: (f - 1) as u16 }));
+                            if targets.is_empty() {
+                                continue;
+                            }
+                            let before = emits.len();
+                            let slot = region % geo.slots;
+                            stats.region_opens += 1;
+                            for seg in store.segments(f, region) {
+                                stats.segments += 1;
+                                stats.stored += seg.bytes.len() as u64;
+                                stats.raw += seg.raw as u64;
+                                stats.bundles += seg.bundles as u64;
+                                let blk = dec.open(&seg)?;
+                                // The block's targets against the group's (both sorted).
+                                ranks.clear();
+                                let mut j = 0usize;
+                                for &tk in &blk.t_keys {
+                                    while j < targets.len() && targets[j].0 < tk {
+                                        j += 1;
+                                    }
+                                    let mut m = 0u64;
+                                    let mut e = j;
+                                    while e < targets.len() && targets[e].0 == tk {
+                                        m |= 1u64 << targets[e].1;
+                                        e += 1;
+                                    }
+                                    ranks.push((m, j as u32));
+                                }
+                                let sources = &blk.sources;
+                                blk.records(|r| {
+                                    let (m, at) = ranks[r.t as usize];
+                                    let mut hit = m & r.mask;
+                                    while hit != 0 {
+                                        let c = hit.trailing_zeros();
+                                        hit &= hit - 1;
+                                        let set = targets[at as usize..].iter().find(|x| x.1 as u32 == c).expect("a changed cell").2;
+                                        let (s_shape, s_key) = sources[r.s as usize];
+                                        let s_cell = crate::storage::bundle::source_cell(geo.cell(slot, c), r.o);
+                                        emits.push(Emit { p: Sk::at(&geo, s_shape, s_key, s_cell), set, xfer: r.x, layer: (f - 1) as u16 });
+                                    }
+                                })?;
+                            }
+                            stats.edges += (emits.len() - before) as u64;
                             held.fetch_add(emits.len() - before, Relaxed);
                         }
                         emits.sort_unstable();
                         emits.dedup();
                         emits.shrink_to_fit();
-                        (emits, stats)
+                        Ok((emits, stats))
                     })
                 })
                 .collect();
             hs.into_iter().map(|h| h.join().expect("a backward reader panicked")).collect()
         });
-        (parts, next.into_inner().min(total))
+        Ok((parts.into_iter().collect::<anyhow::Result<Vec<_>>>()?, next.into_inner().min(total)))
     }
 
     /// A set code's set (`local`: the step's own sets).
@@ -621,8 +721,8 @@ impl<'a> Backward<'a> {
             let (mut pieces, mut scratch) = (Vec::new(), Vec::new());
             let (mut i, mut j, mut ci) = (0usize, 0usize, 0usize);
             while i < a.len() || j < es.len() {
-                let ia = a.get(i).map_or(StateId::MAX, |x| x.p);
-                let ie = es.get(j).map_or(StateId::MAX, |e| e.p);
+                let ia = a.get(i).map_or(SK_MAX, |x| x.p);
+                let ie = es.get(j).map_or(SK_MAX, |e| e.p);
                 if ia < ie {
                     out.push(a[i]);
                     i += 1;
@@ -630,16 +730,16 @@ impl<'a> Backward<'a> {
                 }
                 let j_end = j + es[j..].partition_point(|e| e.p == ie);
                 let layer = es[j].layer;
-                assert!(es[j..j_end].iter().all(|e| e.layer == layer), "state {} has in-edges recorded at two frames", crate::storage::show_id(ie));
+                assert!(es[j..j_end].iter().all(|e| e.layer == layer), "state {} has in-edges recorded at two frames", ie.show());
                 // The base: the set so far, else the set at t + 1.
                 let base: Option<u32> = if ia == ie {
                     i += 1;
-                    assert_eq!(a[i - 1].layer, layer, "state {}: its layer from the edges disagrees", crate::storage::show_id(ie));
+                    assert_eq!(a[i - 1].layer, layer, "state {}: its layer from the edges disagrees", ie.show());
                     Some(a[i - 1].set)
                 } else {
                     ci += c[ci..].partition_point(|x| x.id < ie);
                     c.get(ci).filter(|x| x.id == ie).map(|x| {
-                        assert_eq!(x.layer(), layer, "state {}: its layer from the edges disagrees", crate::storage::show_id(ie));
+                        assert_eq!(x.layer(), layer, "state {}: its layer from the edges disagrees", ie.show());
                         x.set
                     })
                 };
@@ -712,11 +812,11 @@ impl<'a> Backward<'a> {
     /// source by source into their sets at `t + 1` (`fold_round`); then the
     /// sets that grew replace their spans and the nodes of layer `t + 1`
     /// close theirs.
-    pub fn step(&mut self, t: u32) {
+    pub fn step(&mut self, t: u32) -> anyhow::Result<()> {
         assert!(t < self.horizon, "a step below the horizon");
         let mut last_region = u32::MAX;
         for &c in &self.changed {
-            let r = id_region(self.cur[c as usize].id);
+            let r = self.cur[c as usize].id.region;
             if r != last_region {
                 *self.opens.entry(r).or_default() += 1;
                 last_region = r;
@@ -731,7 +831,7 @@ impl<'a> Backward<'a> {
         let (mut d_read, mut d_pull) = (std::time::Duration::ZERO, std::time::Duration::ZERO);
         while start < total {
             let t0 = std::time::Instant::now();
-            let (parts, end) = self.read_round(&items, start);
+            let (parts, end) = self.read_round(&items, start)?;
             start = end;
             let round: usize = parts.iter().map(|p| p.0.len()).sum();
             for p in &parts {
@@ -758,7 +858,7 @@ impl<'a> Backward<'a> {
         struct RangeOut {
             cur: Vec<Cur>,
             changed: Vec<u32>,
-            closed: Vec<(StateId, u16, u32)>,
+            closed: Vec<(Sk, u16, u32)>,
         }
         let (cur, acc_ref, local_ref) = (&self.cur, &acc, &local);
         let outs: Vec<RangeOut> = par_chunks(bounds.len() - 1, 1, self.threads, |k, _| {
@@ -768,8 +868,8 @@ impl<'a> Backward<'a> {
             let mut o = RangeOut { cur: Vec::with_capacity(c.len() + a.len() / 8), changed: Vec::new(), closed: Vec::new() };
             let (mut i, mut j) = (0usize, 0usize);
             while i < c.len() || j < a.len() {
-                let ic = c.get(i).map_or(StateId::MAX, |x| x.id);
-                let ia = a.get(j).map_or(StateId::MAX, |x| x.p);
+                let ic = c.get(i).map_or(SK_MAX, |x| x.id);
+                let ia = a.get(j).map_or(SK_MAX, |x| x.p);
                 if ic < ia {
                     let x = c[i];
                     if x.layer() == close_at {
@@ -869,6 +969,7 @@ impl<'a> Backward<'a> {
             let (k, med, p90, max) = fragmentation(self.cur.iter().filter(|c| c.layer & WIN == 0).map(|c| self.sets.get(c.set)));
             self.fragments.push(format!("[arc] W frame {t:3}: {k} non-win nodes can win; rectangles per node med {med} p90 {p90} max {max}"));
         }
+        Ok(())
     }
 
     /// The winning sets, once every frame down to 0 is done: the runs merged
@@ -903,7 +1004,7 @@ impl<'a> Backward<'a> {
         // The runs merged by (id, frame).
         let spans: usize = runs.iter().map(|r| r.n).sum();
         let mut iters: Vec<_> = runs.iter().map(|r| r.iter(&all)).collect();
-        let mut heap: std::collections::BinaryHeap<Reverse<(StateId, u16, u16, u32, usize)>> = std::collections::BinaryHeap::new();
+        let mut heap: std::collections::BinaryHeap<Reverse<(Sk, u16, u16, u32, usize)>> = std::collections::BinaryHeap::new();
         for (k, it) in iters.iter_mut().enumerate() {
             if let Some((id, hi, s)) = it.next() {
                 heap.push(Reverse((id, runs[k].lo, hi, s, k)));
@@ -916,14 +1017,14 @@ impl<'a> Backward<'a> {
         let (mut n, mut blocks) = (0usize, Vec::new());
         let mut node: Vec<(u16, u16, u32)> = Vec::new();
         let mut bytes: Vec<u8> = Vec::new();
-        let (mut cur_id, mut prev_id) = (None::<StateId>, 0u64);
-        let mut flush = |id: StateId, node: &mut Vec<(u16, u16, u32)>, prev_id: &mut u64| {
+        let (mut cur_id, mut prev_id) = (None::<Sk>, Sk::default());
+        let mut flush = |id: Sk, node: &mut Vec<(u16, u16, u32)>, prev_id: &mut Sk| {
             if n % BLOCK == 0 {
                 blocks.push((id, data.len()));
                 *prev_id = id;
             }
             bytes.clear();
-            put_varint(&mut bytes, id - *prev_id);
+            put_sk(&mut bytes, *prev_id, id);
             put_varint(&mut bytes, node[0].0 as u64);
             put_varint(&mut bytes, node.len() as u64);
             for (k, &(lo, hi, s)) in node.iter().enumerate() {
@@ -963,16 +1064,17 @@ impl<'a> Backward<'a> {
         let opens: Vec<u32> = self.opens.values().copied().collect();
         let (o_mean, o_max) = (opens.iter().map(|&o| o as f64).sum::<f64>() / opens.len().max(1) as f64, opens.iter().copied().max().unwrap_or(0));
         eprintln!(
-            "[arc] backward: {} sets changed, {} in-edges read ({} emissions in {} rounds, at most {} a round), {:.2} GB of the edge store's {:.2} GB read ({} owner entries, {:.2} GB of lids); {} target regions read on {o_mean:.1} steps each (at most {o_max}), {} (region, frame) opens; at most {} nodes a frame; read {:.2} s, pull {:.2} s, merge {:.2} s; {} nodes, {} spans, {} distinct sets: W {:.2} GB (nodes and spans {:.2}, sets {:.2})",
+            "[arc] backward: {} sets changed, {} in-edges read ({} emissions in {} rounds, at most {} a round), {} segments decoded: {:.2} GB stored ({:.3} GB the store), {:.2} GB raw, {} bundles; {} target regions read on {o_mean:.1} steps each (at most {o_max}), {} (region, frame) opens; at most {} nodes a frame; read {:.2} s, pull {:.2} s, merge {:.2} s; {} nodes, {} spans, {} distinct sets: W {:.2} GB (nodes and spans {:.2}, sets {:.2})",
             self.n_changed,
             self.read.edges,
             self.n_emits,
             self.rounds,
             self.max_round,
-            self.read.bytes() as f64 / 1e9,
+            self.read.segments,
+            self.read.stored as f64 / 1e9,
             self.store.bytes as f64 / 1e9,
-            self.read.owner_probes,
-            self.read.lid_bytes as f64 / 1e9,
+            self.read.raw as f64 / 1e9,
+            self.read.bundles,
             opens.len(),
             self.read.region_opens,
             self.max_cur,
@@ -996,26 +1098,70 @@ impl<'a> Backward<'a> {
 /// The out-edges `reach` follows - between W's nodes, from a non-win
 /// source to a target with a set at or past the edge's frame (the others
 /// carry nothing) - loaded as `reach` first reaches their source, a frame's
-/// sources at a time (`EdgeStore::out_edges`): what is held is the reached
-/// nodes' edges, 8 B each, not the graph between W's nodes.
+/// sources at a time (`out_edges`): what is held is the reached nodes'
+/// edges, 8 B each, not the graph between W's nodes.
 pub struct ReachEdges<'a> {
     store: &'a EdgeStore,
     w: &'a Winning,
     /// The win states, sorted: never expanded, so never left.
-    wins: Vec<StateId>,
+    wins: Vec<Sk>,
     threads: usize,
     loaded: FxHashMap<u32, Box<[(u32, u32)]>>,
     edges: usize,
 }
 
+/// The out-edges recorded at frame `frame` of the states `sources` (their
+/// layer is `frame - 1`): `(k, target, transfer)` for `sources[k]`. A
+/// source's edges are stored in their TARGETS' regions: the frame's index
+/// names the target regions each source region reaches; those regions'
+/// segments are decoded (on `threads` workers) and their bundles from the
+/// sources' keys kept where a source cell is one asked for.
+pub fn out_edges(store: &EdgeStore, frame: u32, sources: &[Sk], threads: usize) -> anyhow::Result<Vec<(usize, Sk, u32)>> {
+    let geo = GEOMETRY;
+    let mut wanted: FxHashMap<(u32, (u64, u64)), Vec<(u32, usize)>> = FxHashMap::default();
+    let mut regions: Vec<u32> = Vec::new();
+    for (k, s) in sources.iter().enumerate() {
+        wanted.entry((s.shape(&geo), s.key)).or_default().push((s.cell(&geo), k));
+        regions.push(s.region);
+    }
+    regions.sort_unstable();
+    regions.dedup();
+    let mut targets: Vec<u32> = regions.iter().flat_map(|&r| store.targets_of(frame, r)).collect();
+    targets.sort_unstable();
+    targets.dedup();
+    let parts = crate::storage::wave::par_map(&targets, threads, |&region| -> anyhow::Result<Vec<(usize, Sk, u32)>> {
+        let mut dec = crate::storage::edges::Decoder::default();
+        let mut out = Vec::new();
+        for seg in store.segments(frame, region) {
+            dec.bundles(&seg, |b| {
+                let Some(cands) = wanted.get(&(b.s_shape, b.s_key)) else { return };
+                crate::storage::edges::expand(&geo, region, &b, |src, dst| {
+                    let c = src.cell(&geo);
+                    for &(wc, k) in cands {
+                        if wc == c {
+                            out.push((k, dst, b.x));
+                        }
+                    }
+                });
+            })?;
+        }
+        Ok(out)
+    });
+    let mut out = Vec::new();
+    for p in parts {
+        out.extend(p?);
+    }
+    Ok(out)
+}
+
 impl<'a> ReachEdges<'a> {
-    pub fn new(store: &'a EdgeStore, w: &'a Winning, wins: Vec<StateId>, threads: usize) -> Self {
+    pub fn new(store: &'a EdgeStore, w: &'a Winning, wins: Vec<Sk>, threads: usize) -> Self {
         ReachEdges { store, w, wins, threads, loaded: FxHashMap::default(), edges: 0 }
     }
     /// Load the out-edges of those of `nodes` not loaded yet, frame by frame
     /// (a node's are recorded at its layer + 1).
-    fn load(&mut self, nodes: impl Iterator<Item = u32>) {
-        let mut todo: Vec<(u32, StateId, u32)> = nodes.filter(|i| !self.loaded.contains_key(i)).map(|i| {
+    fn load(&mut self, nodes: impl Iterator<Item = u32>) -> anyhow::Result<()> {
+        let mut todo: Vec<(u32, Sk, u32)> = nodes.filter(|i| !self.loaded.contains_key(i)).map(|i| {
             let n = self.w.node(i);
             (n.layer + 1, n.id, i)
         }).collect();
@@ -1025,9 +1171,9 @@ impl<'a> ReachEdges<'a> {
         while a < todo.len() {
             let f = todo[a].0;
             let b = a + todo[a..].partition_point(|x| x.0 == f);
-            let ids: Vec<StateId> = todo[a..b].iter().map(|x| x.1).collect();
+            let ids: Vec<Sk> = todo[a..b].iter().map(|x| x.1).collect();
             let mut lists: Vec<Vec<(u32, u32)>> = vec![Vec::new(); ids.len()];
-            for (k, dst, x) in self.store.out_edges(f, &ids, self.threads) {
+            for (k, dst, x) in out_edges(self.store, f, &ids, self.threads)? {
                 if self.wins.binary_search(&ids[k]).is_ok() {
                     continue;
                 }
@@ -1037,11 +1183,13 @@ impl<'a> ReachEdges<'a> {
             }
             for (&(_, _, i), mut l) in todo[a..b].iter().zip(lists) {
                 l.sort_unstable();
+                l.dedup();
                 self.edges += l.len();
                 self.loaded.insert(i, l.into_boxed_slice());
             }
             a = b;
         }
+        Ok(())
     }
     fn of(&self, i: u32) -> &[(u32, u32)] {
         &self.loaded[&i]
@@ -1071,7 +1219,7 @@ impl<'a> ReachEdges<'a> {
 /// itself (a superset: the filter only loosens), which bounds the memory -
 /// W's sets are shared, a node's reached set is its own.
 #[allow(clippy::too_many_arguments)]
-pub fn reach(w: &Winning, g: &mut ReachEdges, pairs: &[(Transfer, Transfer)], start: Option<u32>, point: (u32, u32), horizon: u32, threads: usize) -> Vec<u32> {
+pub fn reach(w: &Winning, g: &mut ReachEdges, pairs: &[(Transfer, Transfer)], start: Option<u32>, point: (u32, u32), horizon: u32, threads: usize) -> anyhow::Result<Vec<u32>> {
     use super::arcs::Piece;
     let n = w.len();
     let threads = threads.max(1);
@@ -1100,7 +1248,7 @@ pub fn reach(w: &Winning, g: &mut ReachEdges, pairs: &[(Transfer, Transfer)], st
         // Each reached node's set pushed along its out-edges (loaded as the
         // node is first reached) into the targets with a set at t + 1,
         // tagged by target.
-        g.load(cur.iter().map(|c| c.0));
+        g.load(cur.iter().map(|c| c.0))?;
         let (cur_ref, g) = (&cur, &*g);
         let mut pushed: Vec<(u32, Piece)> = par_chunks(cur.len(), 64, threads, |lo, hi| {
             let (mut out, mut tmp) = (Vec::new(), Vec::new());
@@ -1166,7 +1314,7 @@ pub fn reach(w: &Winning, g: &mut ReachEdges, pairs: &[(Transfer, Transfer)], st
     }
     let marked = last.iter().filter(|&&l| l != u32::MAX).count();
     eprintln!("[arc] reach: {marked} of {n} nodes reached inside W from the start (at most {active_max} a frame; {in_w} sets widened to W)");
-    last
+    Ok(last)
 }
 
 /// The OPTIMUM from `start` at remainder `point`, read off ONE backward:
@@ -1198,21 +1346,27 @@ fn tree_frames(dir: &std::path::Path, horizon: u32) -> anyhow::Result<Vec<Vec<(u
 }
 
 /// What the backward starts from in the tree in `dir` up to `horizon`: the
-/// start's id (frame 0's one row), the win rows of frames `1..=horizon`
-/// with their layers, and the edge store - every frame that kept rows has
-/// its edges (one that kept none, under level -1, may have none).
+/// start (frame 0's one row), the win rows of frames `1..=horizon` with
+/// their layers, as states (their keys through the tree's metadata), the
+/// edge store - every frame that kept rows has its edges (one that kept
+/// none, under level -1, may have none) - and the tree's shapes and key
+/// space.
 pub struct Seeds {
-    pub start: StateId,
-    pub wins: Vec<(StateId, u32)>,
+    pub start: Sk,
+    pub wins: Vec<(Sk, u32)>,
     pub store: EdgeStore,
     /// The transfer table, decoded.
     pub pairs: Vec<(Transfer, Transfer)>,
+    /// The tree's shapes by index, and its key space.
+    pub shapes: Vec<u64>,
+    pub space: celeste_engine::exact::KeySpace,
 }
 
 impl Seeds {
     pub fn load(dir: &std::path::Path, horizon: u32) -> anyhow::Result<Self> {
-        let mut wins: Vec<(StateId, u32)> = Vec::new();
-        let mut start: Option<StateId> = None;
+        use crate::storage::{id_entry, id_local, id_region};
+        let mut wins: Vec<(crate::storage::StateId, u32)> = Vec::new();
+        let mut start: Option<crate::storage::StateId> = None;
         let mut kept: Vec<u32> = Vec::with_capacity(horizon as usize + 1);
         for (f, files) in tree_frames(dir, horizon)?.into_iter().enumerate() {
             let f = f as u32;
@@ -1234,15 +1388,29 @@ impl Seeds {
             anyhow::ensure!(rows == 0 || store.has_frame(f as u32), "{}: no edges for f{f}, which kept {rows} rows", dir.display());
         }
         let pairs = store.pairs().iter().map(|p| (p.0.transfer(), p.1.transfer())).collect();
-        Ok(Seeds { start, wins, store, pairs })
+        // The start's and the wins' keys, from the metadata.
+        let mut wanted: Vec<(u32, u32)> = wins.iter().map(|w| w.0).chain([start]).map(|id| (id_region(id), id_entry(id))).collect();
+        wanted.sort_unstable();
+        wanted.dedup();
+        let resolver = crate::storage::marks::Resolver::load_for(dir, horizon, &wanted)?;
+        let sk = |id: crate::storage::StateId| -> anyhow::Result<Sk> { Ok(Sk { region: id_region(id), key: resolver.resolve(id)?.1, local: id_local(id) as u8 }) };
+        let start = sk(start)?;
+        let wins = wins.into_iter().map(|(id, f)| Ok((sk(id)?, f))).collect::<anyhow::Result<Vec<_>>>()?;
+        Ok(Seeds { start, wins, store, pairs, shapes: resolver.shapes().to_vec(), space: resolver.space })
     }
 
     /// The win states, sorted.
-    pub fn win_ids(&self) -> Vec<StateId> {
-        let mut v: Vec<StateId> = self.wins.iter().map(|w| w.0).collect();
+    pub fn win_ids(&self) -> Vec<Sk> {
+        let mut v: Vec<Sk> = self.wins.iter().map(|w| w.0).collect();
         v.sort_unstable();
         v.dedup();
         v
+    }
+
+    /// A state's `(shape, key, cell)`.
+    pub fn state(&self, s: Sk) -> (u64, (u64, u64), u32) {
+        let geo = GEOMETRY;
+        (self.shapes[s.shape(&geo) as usize], s.key, s.cell(&geo))
     }
 }
 
@@ -1285,51 +1453,28 @@ impl Witness {
 }
 
 /// W's nodes by `(shape, key, cell)`, for the concrete search and the known
-/// route: a state's id is its region (shape and cell), its entry (the
-/// region's number for its key) and its cell, so only the ENTRIES are
-/// listed - `((region, key), entry)` per distinct entry of the support,
-/// sorted, 24 B - and the node is the id's index in `W`.
+/// route: a node IS its state - its region (the shape's index and the
+/// cell's slot), its key and its cell - so only the tree's shapes are
+/// listed.
 pub struct NodeKeys<'w> {
     w: &'w Winning,
     geo: crate::storage::Geometry,
     /// Shape hash -> shape index, sorted.
     shapes: Vec<(u64, u32)>,
-    entries: Vec<((u32, (u64, u64)), u32)>,
 }
 
 impl<'w> NodeKeys<'w> {
-    /// Over `w`'s support, its entries' keys from the tree's metadata.
-    pub fn new(w: &'w Winning, resolver: &crate::storage::marks::Resolver) -> anyhow::Result<Self> {
-        let geo = crate::storage::GEOMETRY;
-        let (mut shapes, mut entries) = (Vec::new(), Vec::new());
-        let mut last = None;
-        for id in w.nodes().map(|x| x.id) {
-            let (region, entry) = (id_region(id), id_entry(id));
-            if last == Some((region, entry)) {
-                continue;
-            }
-            last = Some((region, entry));
-            let (shape, key, _) = resolver.resolve(id)?;
-            shapes.push((shape, region / geo.slots));
-            entries.push(((region, key), entry));
-        }
-        shapes.sort_unstable();
-        shapes.dedup();
-        anyhow::ensure!(shapes.windows(2).all(|p| p[0].0 != p[1].0), "a shape with two indices");
-        entries.sort_unstable();
-        Ok(NodeKeys { w, geo, shapes, entries })
+    /// Over `w`, the tree's shapes by index.
+    pub fn new(w: &'w Winning, shapes: &[u64]) -> anyhow::Result<Self> {
+        let mut by: Vec<(u64, u32)> = shapes.iter().enumerate().map(|(i, &h)| (h, i as u32)).collect();
+        by.sort_unstable();
+        anyhow::ensure!(by.windows(2).all(|p| p[0].0 != p[1].0), "a shape with two indices");
+        Ok(NodeKeys { w, geo: GEOMETRY, shapes: by })
     }
     pub(super) fn get(&self, shape: u64, key: Option<(u64, u64)>, cell: u32) -> Option<u32> {
         let key = key?;
         let k = self.shapes.binary_search_by_key(&shape, |s| s.0).ok()?;
-        let (slot, local) = self.geo.slot_local(cell);
-        let region = crate::storage::region_of(&self.geo, self.shapes[k].1, slot);
-        let e = self.entries.binary_search_by(|e| e.0.cmp(&(region, key))).ok()?;
-        self.w.index(state_id(region, self.entries[e].1, local))
-    }
-    /// The support's distinct entries.
-    pub fn entries(&self) -> usize {
-        self.entries.len()
+        self.w.index(Sk::at(&self.geo, self.shapes[k].1, key, cell))
     }
 }
 
@@ -1472,7 +1617,7 @@ pub fn concrete_search(
     anyhow::ensure!(horizon % spf == 0, "the horizon {horizon} is not a whole number of frames ({spf} steps each)");
     let frames = horizon / spf;
     let t0 = std::time::Instant::now();
-    eprintln!("[concrete] {} nodes keyed by {} entries; {workers} workers; the arc bound f{bound}", w.len(), node.entries());
+    eprintln!("[concrete] {} nodes; {workers} workers; the arc bound f{bound}", w.len());
     crate::metrics::mem_phase("concrete: engines up");
     /// A successor that stays inside W (or wins), in (parent, input, leaf)
     /// order within its worker's chunk.
@@ -1767,9 +1912,8 @@ pub fn solve(
     let seeds = Seeds::load(dir, horizon)?;
     crate::metrics::mem_phase("arc: edge files opened");
     let tb = std::time::Instant::now();
-    // The backward's reads are scattered: no read-ahead. Its closed spans
-    // and W's nodes go to scratch files beside the tree (mapped, unlinked).
-    seeds.store.advise(memmap2::Advice::Random)?;
+    // The closed spans and W's nodes go to scratch files beside the tree
+    // (mapped, unlinked).
     let scratch = dir.join("arc-scratch");
     if scratch.exists() {
         std::fs::remove_dir_all(&scratch)?;
@@ -1785,20 +1929,10 @@ pub fn solve(
     // bound still: a frame's win is a win at its last step at the latest).
     let arc = arc_steps.map(|k| k.div_ceil(s.steps_per_frame()));
     eprintln!("[arc] backward {tb:.2} s; optimum {arc_steps:?} (steps)");
-    // The nodes as (shape, key, cell), through the storage metadata: the
-    // fingerprints, the marks files and the concrete search's keys.
-    let mut wanted: Vec<(u32, u32)> = Vec::new();
-    for x in w.nodes() {
-        let e = (id_region(x.id), id_entry(x.id));
-        if wanted.last() != Some(&e) {
-            wanted.push(e);
-        }
-    }
-    let resolver = crate::storage::marks::Resolver::load_for(dir, horizon, &wanted)?;
-    drop(wanted);
     // Fingerprints over CONTENT (`exact::ContentHash`): independent of the
-    // order the tree's dictionaries grew in (a raise).
-    let content = resolver.space.content_hash();
+    // order the tree's dictionaries grew in (a raise). A node is its state:
+    // (shape, key, cell) without a lookup.
+    let content = seeds.space.content_hash();
     let mut files = Vec::new();
     for (f, fs) in tree_frames(dir, horizon)?.into_iter().enumerate() {
         files.extend(fs.into_iter().map(|(seq, file)| (f as u32, seq, file)));
@@ -1812,7 +1946,7 @@ pub fn solve(
     let parts: Vec<anyhow::Result<Part>> = par_chunks(blocks, 4096, threads, |lo, hi| {
         let (mut fp, mut delta, mut rows) = (0u64, vec![(0i64, 0u64); horizon as usize + 2], Vec::new());
         for x in w.nodes_from(lo * BLOCK, hi * BLOCK) {
-            let (shape, key, cell) = resolver.resolve(x.id)?;
+            let (shape, key, cell) = seeds.state(x.id);
             // `Visited::fingerprint`: the nodes are distinct states.
             let h = content.state(shape, key, cell);
             fp = fp.wrapping_add(h);
@@ -1839,7 +1973,7 @@ pub fn solve(
     println!("[gate] h{horizon} support {} {fp:016x}", w.len());
     if let Some(out) = save {
         std::fs::create_dir_all(out)?;
-        save_marks(&out.join("level0.marks.bin"), std::mem::take(&mut rows), horizon, &resolver.space)?;
+        save_marks(&out.join("level0.marks.bin"), std::mem::take(&mut rows), horizon, &seeds.space)?;
     }
     let (mut n, mut acc) = (0i64, 0u64);
     for (t, d) in delta[..=horizon as usize].iter().enumerate() {
@@ -1850,16 +1984,16 @@ pub fn solve(
     crate::metrics::mem_phase("arc: fingerprints");
     // Per node the LAST frame it is reached inside W from the start (`reach`;
     // at most its W deadline): the next level's filter, and the UI's arc marks.
-    let mut arc_marks = want_marks.then(|| Visited::new(resolver.space.clone()));
+    let mut arc_marks = want_marks.then(|| Visited::new(seeds.space.clone()));
     if want_marks || save.is_some() {
         let tr = std::time::Instant::now();
         let mut g = ReachEdges::new(&seeds.store, &w, seeds.win_ids(), threads);
-        let last = reach(&w, &mut g, &seeds.pairs, start, p0, horizon, threads);
+        let last = reach(&w, &mut g, &seeds.pairs, start, p0, horizon, threads)?;
         eprintln!("[arc] reach {:.2} s ({} reached nodes' {} out-edges loaded)", tr.elapsed().as_secs_f64(), g.sizes().0, g.sizes().1);
         drop(g);
         crate::metrics::mem_phase("arc: reach");
         for i in (0..w.len() as u32).filter(|&i| last[i as usize] != u32::MAX) {
-            let (shape, key, cell) = resolver.resolve(w.id(i))?;
+            let (shape, key, cell) = seeds.state(w.id(i));
             let d = last[i as usize] as u16;
             if let Some(am) = &mut arc_marks {
                 am.insert_until(shape, key, cell, d);
@@ -1870,19 +2004,20 @@ pub fn solve(
         }
     }
     if let Some(out) = save {
-        save_marks(&out.join("arc.marks.bin"), rows, horizon, &resolver.space)?;
+        save_marks(&out.join("arc.marks.bin"), rows, horizon, &seeds.space)?;
         let first_win = seeds.wins.iter().map(|&(_, f)| f).min();
         let show = |v: Option<u32>| v.map_or("none".to_string(), |f| f.to_string());
         std::fs::write(out.join("arc.txt"), format!("horizon {horizon}\nlevel {level}\nlevel0_first_win {}\noptimal {}\n", show(first_win), show(arc)))?;
     }
     // The concrete search reads W and the node keys, not the edge files.
-    drop(seeds);
+    let Seeds { shapes, space, store, .. } = seeds;
+    drop(store);
     let keyed = (concrete && arc.is_some()) || known.is_some();
-    let node = if keyed { Some(NodeKeys::new(&w, &resolver)?) } else { None };
+    let node = if keyed { Some(NodeKeys::new(&w, &shapes)?) } else { None };
     let known = match (known, &node) {
         (Some(route), Some(node)) => {
             let minus_one = crate::frame::TreeFilter::of_tree(dir, s)?;
-            let p = super::known::Pruning { settings: s, level, horizon, node, keys: &resolver.space, start, w: &w, reached: arc_marks.as_ref(), minus_one, files: &files, dir };
+            let p = super::known::Pruning { settings: s, level, horizon, node, keys: &space, start, w: &w, reached: arc_marks.as_ref(), minus_one, files: &files, dir };
             super::known::check(route, &p)?
         }
         _ => None,
@@ -1890,7 +2025,7 @@ pub fn solve(
     drop(files);
     crate::metrics::mem_phase("arc: marks for the next level, edge files closed");
     let found = match (concrete, arc, &node) {
-        (true, Some(f), Some(node)) => concrete_search(level, horizon, node, &resolver.space, &w, f, prefer, s)?,
+        (true, Some(f), Some(node)) => concrete_search(level, horizon, node, &space, &w, f, prefer, s)?,
         _ => None,
     };
     if let Some(wt) = &found {
@@ -1916,9 +2051,9 @@ mod tests {
         }
     }
 
-    /// Node `k`'s state id (increasing in `k`, across regions and entries).
-    fn sid(k: u32) -> StateId {
-        state_id(1 + (k >> 6), (k >> 3) & 7, k & 7)
+    /// Node `k`'s state (increasing in `k`, across regions and keys).
+    fn sid(k: u32) -> Sk {
+        Sk { region: 1 + (k >> 6), key: (0, ((k >> 3) & 7) as u64), local: (k & 7) as u8 }
     }
 
     fn axis(t: Transfer) -> AxisXfer {
@@ -1947,7 +2082,7 @@ mod tests {
             let mut pairs: Vec<crate::search::arc_edges::Pair> = edges.iter().map(|e| (axis(e.2), axis(e.3))).collect();
             pairs.sort_unstable();
             pairs.dedup();
-            let mut frames: std::collections::BTreeMap<u32, Vec<(StateId, StateId, u32)>> = Default::default();
+            let mut frames: std::collections::BTreeMap<u32, Vec<(Sk, Sk, u32)>> = Default::default();
             for &(a, b, x, y) in edges {
                 if wins.contains(&a) {
                     continue;
@@ -1956,21 +2091,21 @@ mod tests {
                 let k = pairs.binary_search(&(axis(x), axis(y))).expect("listed") as u32;
                 frames.entry(layers[a as usize] + 1).or_default().push((sid(a), sid(b), k));
             }
-            let frames: Vec<(u32, Vec<(StateId, StateId, u32)>)> = frames.into_iter().collect();
+            let frames: Vec<(u32, Vec<(Sk, Sk, u32)>)> = frames.into_iter().collect();
             crate::storage::edges::write_test_edges(&dir, &frames, &pairs).expect("the test tree");
             TestTree { dir, layers, wins }
         }
 
         /// The store up to `horizon`, its transfers, and its win seeds.
-        fn open(&self, horizon: u32) -> (EdgeStore, Vec<(Transfer, Transfer)>, Vec<(StateId, u32)>) {
+        fn open(&self, horizon: u32) -> (EdgeStore, Vec<(Transfer, Transfer)>, Vec<(Sk, u32)>) {
             let store = EdgeStore::open(&self.dir, horizon).expect("open");
             let pairs = store.pairs().iter().map(|p| (p.0.transfer(), p.1.transfer())).collect();
             let wins = self.wins.iter().map(|&k| (sid(k), self.layers[k as usize])).collect();
             (store, pairs, wins)
         }
 
-        fn win_ids(&self) -> Vec<StateId> {
-            let mut v: Vec<StateId> = self.wins.iter().map(|&k| sid(k)).collect();
+        fn win_ids(&self) -> Vec<Sk> {
+            let mut v: Vec<Sk> = self.wins.iter().map(|&k| sid(k)).collect();
             v.sort_unstable();
             v
         }
@@ -2093,9 +2228,9 @@ mod tests {
             let (store, pairs, seeds) = tree.open(horizon);
             // Rounds of a few in-edges, a target at a time: the step's
             // sets folded round by round.
-            let mut b = Backward::new(&store, &pairs, &seeds, horizon, 2).with_rounds(1 + r(4) as usize, 1);
+            let mut b = Backward::new(&store, &pairs, &seeds, horizon, 2).with_rounds(1 + r(4) as usize);
             for t in (0..horizon).rev() {
-                b.step(t);
+                b.step(t).expect("a step");
             }
             let w = b.finish().expect("backward");
             let spilled = tree.dir.join("spill");
@@ -2138,7 +2273,7 @@ mod tests {
             let mut g = ReachEdges::new(&store, &w, tree.win_ids(), 2);
             let start = w.index(sid(0));
             let p0 = (r(CIRCLE), r(CIRCLE));
-            let got = reach(&w, &mut g, &pairs, start, p0, horizon, 2);
+            let got = reach(&w, &mut g, &pairs, start, p0, horizon, 2).expect("reach");
             let mut want = vec![u32::MAX; w.len()];
             let inside = |t: u32, i: u32, p: (u32, u32)| w.index(sid(i)).and_then(|k| w.at(t, k)).is_some_and(|reg| reg.contains(p.0, p.1));
             let mut cur: FxHashSet<(u32, (u32, u32))> = FxHashSet::default();

@@ -15,12 +15,12 @@ use crate::storage::StateId;
 /// summed over workers, printed by `print_phases`. Off, `start` is a branch.
 pub mod phases {
     use std::sync::atomic::{AtomicU64, Ordering};
-    pub const NAMES: [&str; 8] = ["pack", "kernel", "emit", "unit end (sort, encode)", "translate", "layer (gather, edge file)", "slice.setup", "unit (all of engine.run)"];
+    pub const NAMES: [&str; 8] = ["pack", "kernel", "emit", "unit end (chunks)", "regions (dedup, bundles, segments)", "frame end (keys, layer decode, edge file)", "slice.setup", "unit (all of engine.run)"];
     pub const PACK: usize = 0;
     pub const KERNEL: usize = 1;
     pub const EMIT: usize = 2;
     pub const END_UNIT: usize = 3;
-    pub const TRANSLATE: usize = 4;
+    pub const REGIONS: usize = 4;
     pub const LAYER: usize = 5;
     pub const SETUP: usize = 6;
     pub const UNIT: usize = 7;
@@ -72,9 +72,6 @@ pub struct Block {
     seq: u32,
     /// Lanes the frame step must not expand (a mask, so ids stay consecutive).
     skip: Vec<bool>,
-    /// Is it its layer's file `seq` row for row (a unit's sources are then
-    /// stored as a row range of it, `storage::edges`)?
-    whole: bool,
 }
 
 impl Block {
@@ -87,7 +84,7 @@ impl Block {
             rt2.row_keys.len(),
             rt2.width
         );
-        Block { rt2, ids: Vec::new(), seq: 0, skip: Vec::new(), whole: false }
+        Block { rt2, ids: Vec::new(), seq: 0, skip: Vec::new() }
     }
 
     /// A reference-engine block, CANONICAL (ids, shape hash), without keys:
@@ -95,7 +92,7 @@ impl Block {
     /// compares them whole (`exact::exact_rows`).
     pub fn canonical(mut rt2: Rt2) -> Result<Self> {
         rt2.canonical();
-        Ok(Block { rt2, ids: Vec::new(), seq: 0, skip: Vec::new(), whole: false })
+        Ok(Block { rt2, ids: Vec::new(), seq: 0, skip: Vec::new() })
     }
 
     pub fn into_rt2(self) -> Rt2 {
@@ -138,7 +135,6 @@ impl Block {
             return None;
         }
         self.rt2.retain_lanes(&keep);
-        self.whole = false;
         if !self.ids.is_empty() {
             self.ids = keep.iter().map(|&i| self.ids[i as usize]).collect();
         }
@@ -165,18 +161,6 @@ impl Block {
         b.ids = ids;
         b.seq = seq;
         b
-    }
-
-    /// A layer's file `seq`, row for row (`whole`).
-    pub fn layer_piece(rt2: Rt2, ids: Vec<u64>, seq: u32) -> Self {
-        let mut b = Block::with_ids(rt2, ids, seq);
-        b.whole = true;
-        b
-    }
-
-    /// Is it its layer's file `seq` row for row?
-    pub fn is_whole(&self) -> bool {
-        self.whole
     }
 
     /// The rows' ids (empty if the block is not a layer's piece).
@@ -656,25 +640,26 @@ pub struct Raised {
 pub struct FrameStats {
     pub blocks_in: usize,
     pub lanes_in: usize,
-    /// Emissions past level -1: each a lookup and an edge.
+    /// Emissions past level -1: each a record (a lookup and an edge).
     pub lanes_raw: usize,
-    /// New states (requests the translation found new).
+    /// New states.
     pub lanes_kept: usize,
     pub blocks_out: usize,
     pub lanes_out: usize,
-    /// The units' wall time and its barrier idle fraction.
+    /// The units' wall time (every slice's) and its barrier idle fraction.
     pub t_wave: std::time::Duration,
     pub wave_idle: f64,
-    /// The translation, wall.
-    pub t_translate: std::time::Duration,
-    /// The layer's gather and the edge file, wall.
+    /// The region phase, wall (every slice's).
+    pub t_regions: std::time::Duration,
+    /// The frame's end (keys, numbering, the layer decoded, the edge file), wall.
     pub t_layer: std::time::Duration,
     pub units: usize,
-    /// The units' requests and lids (distinct target entries per unit).
-    pub requests: u64,
-    pub lids: u64,
-    /// Edges recorded, and the frame's edge file bytes.
+    /// The slices, and the routes (target regions) with new states or edges.
+    pub slices: usize,
+    pub routes: u64,
+    /// Edges recorded, their bundles, and the frame's edge file bytes.
     pub edge_records: u64,
+    pub edge_bundles: u64,
     pub edge_bytes: u64,
     /// The input frontier's row storage, bytes.
     pub bytes_in: usize,
@@ -881,6 +866,8 @@ pub struct ForwardState {
     visited: crate::storage::visited::VisitedSet,
     /// The tree's transfers (`storage::edges::XferTable`).
     xfers: crate::storage::edges::XferTable,
+    /// The shapes' skeletons the new layers are decoded with.
+    skeletons: crate::storage::decode::Skeletons,
     observer: Option<crate::search::pos_graph::PosObserver>,
     /// The last frame computed (and checkpointed).
     pub frames: u32,
@@ -918,7 +905,7 @@ impl ForwardState {
         s.write(dir, level)?;
         let mut visited = crate::storage::visited::VisitedSet::new(crate::storage::GEOMETRY);
         let meta = crate::storage::wave::seed(&mut visited, &mut initial, level)?;
-        let won = checkpoint_frontier(dir, 0, &mut initial, true, &visited.keys, s)?;
+        let won = checkpoint_frontier(dir, 0, &mut initial, true, Some(&visited.keys), s)?;
         crate::storage::meta::save(dir, 0, None, &meta)?;
         let observer = record.then(crate::search::pos_graph::PosObserver::default);
         // An (empty) graph from the start: every tree with frames has one.
@@ -930,6 +917,7 @@ impl ForwardState {
             frontier: expandable(initial, 0, filter.ceiling(), s)?,
             visited,
             xfers: Default::default(),
+            skeletons: Default::default(),
             observer,
             frames: 0,
             win_frame: won.then_some(0),
@@ -1016,7 +1004,7 @@ impl ForwardState {
         } else {
             None
         };
-        Ok(ForwardState { frontier, visited, xfers, observer, frames: last, win_frame, filter })
+        Ok(ForwardState { frontier, visited, xfers, skeletons: Default::default(), observer, frames: last, win_frame, filter })
     }
 
     /// The visited set's size: every distinct state reached so far.
@@ -1032,6 +1020,35 @@ impl ForwardState {
     /// The input frontier's rows (`bench-frame`).
     pub fn frontier_lanes(&self) -> usize {
         self.frontier.iter().map(Block::lanes).sum()
+    }
+
+    /// The frontier's blocks by (shape, seq) - their index in it - and per
+    /// shape a skeleton, its first block's (`bench-storage`'s replay, which
+    /// has no kernel templates).
+    #[allow(clippy::type_complexity)]
+    pub fn frontier_index(&self) -> (rustc_hash::FxHashMap<(u64, u32), u32>, rustc_hash::FxHashMap<u64, Rt2>) {
+        let mut blocks = rustc_hash::FxHashMap::default();
+        let mut skeletons = rustc_hash::FxHashMap::default();
+        for (i, b) in self.frontier.iter().enumerate() {
+            blocks.insert((b.shard_shape(), b.seq()), i as u32);
+            skeletons.entry(b.shard_shape()).or_insert_with(|| {
+                let mut s = celeste_engine::slots::reshape(b.rt2(), 0);
+                s.cols = b
+                    .rt2()
+                    .cols
+                    .iter()
+                    .map(|c| match c {
+                        Col::N(_) => Col::N(Vec::new()),
+                        Col::I(_) => Col::I(Vec::new()),
+                        Col::V(_) => Col::V(Vec::new()),
+                        u => u.clone(),
+                    })
+                    .collect();
+                s.shape_hash = b.shard_shape();
+                s
+            });
+        }
+        (blocks, skeletons)
     }
 
     /// ONE WAVE of `extend` - frame `frames + 1`, under the tree's level -1
@@ -1056,7 +1073,7 @@ impl ForwardState {
             .frontier
             .iter()
             .map(|b| {
-                let mut c = Block::layer_piece(b.rt2().clone_block(), b.ids().to_vec(), b.seq());
+                let mut c = Block::with_ids(b.rt2().clone_block(), b.ids().to_vec(), b.seq());
                 if !b.skip().is_empty() {
                     c.set_skip(b.skip().to_vec());
                 }
@@ -1073,6 +1090,7 @@ impl ForwardState {
             edges_dir,
             layer: Layer::New,
             layers: None,
+            skeletons: &self.skeletons,
         };
         let wave = crate::storage::wave::run_wave(engine, frontier, cx)?;
         Ok((wave, visited, xfers))
@@ -1109,6 +1127,7 @@ impl ForwardState {
                 edges_dir: Some(&edges_dir),
                 layer: Layer::New,
                 layers: None,
+                skeletons: &self.skeletons,
             };
             let wave = crate::storage::wave::run_wave(engine, frontier, cx)?;
             let (mut next, st) = (wave.next, wave.stats);
@@ -1117,7 +1136,7 @@ impl ForwardState {
                 crate::search::checkpoint::save_value_to(&dropped_path(dir, frame), &wave.dropped)?;
             }
             let t = std::time::Instant::now();
-            let won = checkpoint_frontier(dir, frame, &mut next, true, &self.visited.keys, s)?;
+            let won = checkpoint_frontier(dir, frame, &mut next, true, None, s)?;
             crate::storage::meta::save(dir, frame, None, &wave.meta)?;
             let t_ckpt = t.elapsed();
             let t = std::time::Instant::now();
@@ -1207,11 +1226,12 @@ impl ForwardState {
                 edges_dir: Some(&edges_dir),
                 layer,
                 layers: Some(&layers),
+                skeletons: &self.skeletons,
             };
             let wave = crate::storage::wave::run_wave(engine, frontier, cx)?;
             old_seqs = first_seq;
             let mut next = wave.next;
-            let won = checkpoint_frontier(dir, t, &mut next, false, &self.visited.keys, s)?;
+            let won = checkpoint_frontier(dir, t, &mut next, false, None, s)?;
             crate::storage::meta::save(dir, t, Some(first_seq), &wave.meta)?;
             for b in &next {
                 for &id in b.ids() {
@@ -1445,8 +1465,8 @@ fn log_frame(
     let ms = |d: std::time::Duration| d.as_secs_f64() * 1e3;
     eprintln!(
         "[fwd] f{frame:03} in {}/{} raw {} kept {} out {}/{} visited {} | \
-         wave {:.0} (idle {:.0}%) translate {:.0} layer {:.0} ckpt {:.0} pos {:.0} total {:.0} ms | \
-         units {} requests {} lids {} edges {} ({:.2} B) | \
+         wave {:.0} (idle {:.0}%) regions {:.0} layer {:.0} ckpt {:.0} pos {:.0} total {:.0} ms | \
+         units {} slices {} routes {} edges {} bundles {} ({:.3} B) | \
          in {:.2} visited {:.2} GB rss start {:.2} wave {:.2} end {:.2} peak {:.2} GB (anon; file {:.2}) | \
          keys {} bits, {} codes (+{})",
         st.blocks_in,
@@ -1458,15 +1478,16 @@ fn log_frame(
         visited,
         ms(st.t_wave),
         st.wave_idle * 100.0,
-        ms(st.t_translate),
+        ms(st.t_regions),
         ms(st.t_layer),
         ms(t_ckpt),
         ms(t_pos),
         ms(t_total),
         st.units,
-        st.requests,
-        st.lids,
+        st.slices,
+        st.routes,
         st.edge_records,
+        st.edge_bundles,
         st.edge_bytes as f64 / st.edge_records.max(1) as f64,
         st.bytes_in as f64 / 1e9,
         st.visited_bytes as f64 / 1e9,
@@ -1480,7 +1501,7 @@ fn log_frame(
         st.new_codes,
     );
     crate::metrics::record("fwd.wave", st.t_wave);
-    crate::metrics::record("fwd.translate", st.t_translate);
+    crate::metrics::record("fwd.regions", st.t_regions);
     crate::metrics::record("fwd.layer", st.t_layer);
     crate::metrics::record("fwd.checkpoint", t_ckpt);
     crate::metrics::record("fwd.posgraph", t_pos);
@@ -1492,10 +1513,11 @@ fn log_frame(
 /// adds to the frame, beside its own.
 /// Returns whether a row wins (`wins_of`, the files' win rows): the
 /// forward's first win is read off the same rows a resume reads it from.
-/// A file holds the piece's ids, not its rows: each piece is checked to
-/// decode from its keys and cells exactly first (`decode::check_piece`,
-/// against `keys`, the tree's key space).
-fn checkpoint_frontier(dir: &std::path::Path, frame: u32, frontier: &mut [Block], fresh: bool, keys: &celeste_engine::exact::KeySpace, s: &crate::settings::Settings) -> Result<bool> {
+/// A file holds the piece's ids, not its rows: a wave's pieces ARE their
+/// keys and cells decoded (`wave::decode_layer`); the start's (`seed`, the
+/// engine's own rows) are checked to decode from them exactly first
+/// (`decode::check_piece`, against `seed_keys`, the tree's key space).
+fn checkpoint_frontier(dir: &std::path::Path, frame: u32, frontier: &mut [Block], fresh: bool, seed_keys: Option<&celeste_engine::exact::KeySpace>, s: &crate::settings::Settings) -> Result<bool> {
     let fdir = dir.join("frames").join(format!("f{:03}", frame));
     // A re-run frame must not leave stale files behind.
     if fresh {
@@ -1517,7 +1539,9 @@ fn checkpoint_frontier(dir: &std::path::Path, frame: u32, frontier: &mut [Block]
                     anyhow::ensure!(block.ids.len() == block.lanes(), "checkpoint f{frame}: a block without its ids");
                     let cells = block.positions()?;
                     let wins = block.wins(s)?;
-                    crate::storage::decode::check_piece(keys, &block.rt2, &cells).with_context(|| format!("checkpoint f{frame}"))?;
+                    if let Some(keys) = seed_keys {
+                        crate::storage::decode::check_piece(keys, &block.rt2, &cells).with_context(|| format!("checkpoint f{frame}"))?;
+                    }
                     let path = fdir.join(format!("s{:016x}_{:04}.bin", block.shard_shape(), block.seq));
                     anyhow::ensure!(fresh || !path.exists(), "checkpoint f{frame}: {} exists", path.display());
                     crate::search::checkpoint::save_block(&path, &block.rt2, &block.ids, &cells, &wins)?;
@@ -1566,7 +1590,7 @@ pub fn load_frame(dir: &std::path::Path, frame: u32, room: (i16, i16), tree: &dy
     let mut out = Vec::new();
     for (seq, file) in frame_files(dir, frame)? {
         if let Some(rt2) = file.load_all(room, tree)? {
-            out.push(Block::layer_piece(rt2, file.ids(), seq));
+            out.push(Block::with_ids(rt2, file.ids(), seq));
         }
     }
     Ok(out)
@@ -2130,10 +2154,10 @@ mod tests {
             let cells = crate::search::pos_graph::block_cells(r).expect("cells");
             assert!(grid.of_cell(cells[0]).is_some(), "the lane has a region");
             let visited = crate::storage::visited::VisitedSet::new(crate::storage::GEOMETRY);
-            let claims = crate::storage::unit::Claims::default();
+            let (routes, skeletons) = (crate::storage::route::Routes::default(), crate::storage::decode::Skeletons::default());
             let prov = celeste_engine::exact::Provisional::default();
-            let mut sink = crate::storage::unit::UnitSink::new(&visited, &claims, &prov, Filters::default(), 1, level, 0, false, false, None, None, &s);
-            sink.begin(0, 0, 0, &[0], None, None, false);
+            let mut sink = crate::storage::unit::UnitSink::new(&visited, &routes, &skeletons, &prov, Filters::default(), 1, level, 0, false, false, None, None, &s);
+            sink.begin(0, 0, 0, 0, &[0], None, false);
             crate::compiled::dispatch::run_chunk_kernel(&registry, r, &cells, &[0], &mut sink)
         };
         let px = |n: i16| P8::from_i16(n);
@@ -2192,10 +2216,10 @@ mod tests {
         let runs = |r: &Rt2| -> bool {
             let cells = crate::search::pos_graph::block_cells(r).expect("cells");
             let visited = crate::storage::visited::VisitedSet::new(crate::storage::GEOMETRY);
-            let claims = crate::storage::unit::Claims::default();
+            let (routes, skeletons) = (crate::storage::route::Routes::default(), crate::storage::decode::Skeletons::default());
             let prov = celeste_engine::exact::Provisional::default();
-            let mut sink = crate::storage::unit::UnitSink::new(&visited, &claims, &prov, Filters::default(), 1, level, 0, false, false, None, None, &s);
-            sink.begin(0, 0, 0, &[0], None, None, false);
+            let mut sink = crate::storage::unit::UnitSink::new(&visited, &routes, &skeletons, &prov, Filters::default(), 1, level, 0, false, false, None, None, &s);
+            sink.begin(0, 0, 0, 0, &[0], None, false);
             crate::compiled::dispatch::run_chunk_kernel(&registry, r, &cells, &[0], &mut sink)
         };
         let px = |n: i16| P8::from_i16(n);
