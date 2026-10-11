@@ -13,9 +13,8 @@
 
 use anyhow::{anyhow, bail, Result};
 
-use celeste_engine::runtime2::{Cell2, Col, Rt2, AV, NONE};
+use celeste_engine::runtime2::{Cell2, Rt2};
 use celeste_engine::slots;
-use celeste_names::gen;
 
 use super::iface::{show, Path, Step};
 
@@ -46,187 +45,6 @@ fn kind(c: &Cell2) -> &'static str {
         Cell2::Bi(_) => "builtin",
     }
 }
-
-/// Build the ENGINE's structure for a traced state: the same boxed layout
-/// `trace::refbridge::to_block` builds, over the symbolic heap. Needed
-/// because an outcome that allocates ends in a shape the input block lacks.
-///
-/// The ids are the engine's canonical numbering by construction;
-/// `the_structure_a_traced_state_becomes_is_already_canonical` checks that
-/// `Rt2::canonicalize_ids` is the identity on it.
-///
-/// Structure only: `cols` carries pointers (the resolver follows them) and
-/// `AV::Nil` everywhere else.
-pub fn structure_of(
-    st: &super::state::State<super::domain::Symbolic>,
-    cart: std::sync::Arc<celeste_core::cart_data::CartData>,
-    cache: std::sync::Arc<celeste_core::collision_cache::CollisionCache>,
-) -> Result<Rt2> {
-    use super::heap::Value;
-
-    let mut rt2 = Rt2::empty(1, gen::GLOBAL_NAMES.len(), gen::STRINGS, cart, cache);
-    rt2.structure = Vec::new();
-    rt2.cols = Vec::new();
-
-    // What each cell still owes: a `Val` its pointer, a placeholder table
-    // cell its body.
-    type V = Value<super::domain::Symbolic>;
-    enum Todo {
-        Val(V),
-        Table(u32),
-        Done,
-    }
-    let mut todo: Vec<Todo> = Vec::new();
-    let mut table_cell: std::collections::HashMap<u32, u32> = Default::default();
-
-    // Cells are created in DISCOVERY order and never reordered, so walking
-    // the array from 0 upwards IS the breadth-first walk. The order is
-    // load-bearing: a pointee is appended past the cursor, never created
-    // inside the slot that points at it.
-    let mut globals = vec![NONE; gen::GLOBAL_NAMES.len()];
-    let groot = &st.heap.tables[&st.globals];
-    for (gi, name) in gen::GLOBAL_NAMES.iter().enumerate() {
-        if let Some(v) = groot.hash.get(*name) {
-            rt2.structure.push(Cell2::Val);
-            rt2.cols.push(Col::U(AV::Nil));
-            todo.push(Todo::Val(v.clone()));
-            globals[gi] = (rt2.structure.len() - 1) as u32;
-        }
-    }
-    rt2.globals = globals;
-
-    let mut c = 0usize;
-    while c < rt2.structure.len() {
-        match std::mem::replace(&mut todo[c], Todo::Done) {
-            Todo::Val(Value::Table(t)) => {
-                let target = match table_cell.get(&t) {
-                    Some(x) => *x,
-                    None => {
-                        rt2.structure.push(Cell2::Unk);
-                        rt2.cols.push(Col::U(AV::Nil));
-                        todo.push(Todo::Table(t));
-                        let x = (rt2.structure.len() - 1) as u32;
-                        table_cell.insert(t, x);
-                        x
-                    }
-                };
-                rt2.cols[c] = Col::U(AV::Ptr(target));
-            }
-            Todo::Val(Value::Func(f)) => {
-                // The engine names a closure by index into `FN_NAMES`
-                // (`Interp::fn_id_of`). An unnamed one is refused: the
-                // cart's anonymous functions never outlive their frame.
-                let cl = st.heap.closures[&f].clone();
-                let id = cl
-                    .fn_id
-                    .ok_or_else(|| anyhow!("closure {} has no name for FN_NAMES", f))?;
-                // The captures are columns on the closure cell, hashed into
-                // the row key.
-                let mut caps: Vec<Col> = Vec::new();
-                for name in &cl.captures {
-                    let v = st
-                        .heap
-                        .lookup(cl.env, name)
-                        .ok_or_else(|| anyhow!("capture {:?} is not in scope", name))?;
-                    caps.push(Col::U(match v {
-                        Value::Table(t) => {
-                            // Every capture in this cart is the owning
-                            // object, already visited; inventing a cell
-                            // here would break the canonical order.
-                            AV::Ptr(*table_cell.get(t).ok_or_else(|| {
-                                anyhow!("capture {:?} points at an unvisited table", name)
-                            })?)
-                        }
-                        other => bail!("capture {:?} holds {:?}", name, other),
-                    }));
-                }
-                rt2.structure.push(Cell2::Clo(id, caps.into_boxed_slice()));
-                rt2.cols.push(Col::U(AV::Nil));
-                todo.push(Todo::Done);
-                rt2.cols[c] = Col::U(AV::Ptr((rt2.structure.len() - 1) as u32));
-            }
-            Todo::Val(Value::Builtin(name)) => {
-                // IN PLACE, not behind a pointer: a block puts the builtin's
-                // `BUILTIN_NAMES` index AT the slot.
-                let i = crate::builtins::BUILTIN_NAMES
-                    .iter()
-                    .position(|n| *n == name)
-                    .ok_or_else(|| anyhow!("unknown builtin {:?}", name))?;
-                rt2.structure[c] = Cell2::Bi(i as u32);
-            }
-            Todo::Val(_) => {}
-            Todo::Table(t) => {
-                let tab = &st.heap.tables[&t];
-                // A table is an object OR an array to the engine, never both.
-                if !tab.hash.is_empty() && !tab.arr.is_empty() {
-                    bail!("table {} has both a hash and an array part", t);
-                }
-                // Integer keys past the end of the array (`got_fruit[1 +
-                // level_index()]` on an empty table) are a sparse `ints`
-                // map in the tracer's heap. Flatten them into a dense array
-                // padded with nils, as `refbridge::to_block` does, or the
-                // shape hash differs.
-                let arr: Vec<V> = if tab.ints.is_empty() {
-                    tab.arr.clone()
-                } else {
-                    if !tab.hash.is_empty() {
-                        bail!(
-                            "table {} has integer keys AND named fields - the engine's \
-                             Cell2 is an object or an array, never both",
-                            t
-                        );
-                    }
-                    // 1-based: a non-positive key has no place, refused.
-                    let Some(&top) = tab.ints.keys().next_back() else {
-                        unreachable!("checked non-empty")
-                    };
-                    if *tab.ints.keys().next().unwrap() < 1 {
-                        bail!(
-                            "table {} has a non-positive integer key - it has no place \
-                             in a dense array part",
-                            t
-                        );
-                    }
-                    let mut arr = tab.arr.clone();
-                    arr.resize(top as usize, Value::Nil);
-                    for (k, v) in tab.ints.iter() {
-                        arr[*k as usize - 1] = v.clone();
-                    }
-                    arr
-                };
-                let slot = |rt2: &mut Rt2, todo: &mut Vec<Todo>, v: &V| -> u32 {
-                    rt2.structure.push(Cell2::Val);
-                    rt2.cols.push(Col::U(AV::Nil));
-                    todo.push(Todo::Val(v.clone()));
-                    (rt2.structure.len() - 1) as u32
-                };
-                // An EMPTY table has no kind yet: `Cell2::Unk`, not an
-                // object with no fields (a different cell to the shape hash).
-                let body = if tab.hash.is_empty() && arr.is_empty() {
-                    Cell2::Unk
-                } else if arr.is_empty() {
-                    // Fields the boundary does not name are dropped, as
-                    // `refbridge::to_block` drops them.
-                    let mut fields: Vec<(u32, u32)> = Vec::new();
-                    for (k, v) in tab.hash.iter() {
-                        let Some(f) = gen::field_id(k) else { continue };
-                        fields.push((f, slot(&mut rt2, &mut todo, v)));
-                    }
-                    Cell2::Obj(fields)
-                } else {
-                    let items: Vec<u32> =
-                        arr.iter().map(|v| slot(&mut rt2, &mut todo, v)).collect();
-                    Cell2::Arr(items)
-                };
-                rt2.structure[c] = body;
-            }
-            Todo::Done => {}
-        }
-        c += 1;
-    }
-    Ok(rt2)
-}
-
 
 /// How the first root that reaches `target` does so, as a chain of ops:
 /// so an error names a path instead of a node id.
@@ -344,7 +162,7 @@ pub fn renumber_cells(
 /// cell for each `Op::Cell(i)`.
 ///
 /// Inputs only: an outcome that allocates names cells the input block does
-/// not have, so outputs bind against their own shape (`structure_of`).
+/// not have, so outputs bind against their own shape (`block::skeleton`).
 pub fn bind_inputs(rt2: &Rt2, iface: &super::iface::Iface) -> Result<Vec<u32>> {
     resolve_all(rt2, &iface.slots)
 }
@@ -382,6 +200,8 @@ pub fn resolve_all(rt2: &Rt2, paths: &[Path]) -> Result<Vec<u32>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use celeste_engine::runtime2::{Col, AV, NONE};
+    use celeste_names::gen;
     use crate::trace::iface::key;
 
     /// Rebuild a shape witness (a real boundary shape with its canonical
@@ -492,60 +312,6 @@ mod tests {
         }
     }
 
-    /// `structure_of` emits the engine's numbering directly: canonicalizing
-    /// what it produces must be the IDENTITY. Never compared at runtime, so
-    /// a divergence would silently misread every later cell.
-    #[test]
-    fn the_structure_a_traced_state_becomes_is_already_canonical() {
-        use crate::trace::{cart, domain::Symbolic, interp::Interp, verify::run_one};
-
-        let src = cart::sources(&crate::settings::Settings::default()).expect("sources");
-        let top = full_moon::parse(&src).expect("parse");
-        let init = full_moon::parse("_init()").expect("parse _init");
-        let frame = full_moon::parse(cart::FRAME_CODE).expect("parse frame");
-        let mut it: Interp<Symbolic> = Interp::new(Symbolic::default());
-        let cd = std::sync::Arc::new(
-            celeste_core::cart_data::CartData::load("cart").expect("cart"),
-        );
-        let (rx, ry) = crate::settings::Settings::default().room;
-        let cache = std::sync::Arc::new(
-            celeste_core::collision_cache::CollisionCache::new(&cd, rx, ry).expect("cache"),
-        );
-        it.cache = Some(cache.clone());
-        it.cart = Some(cd.clone());
-        let st = cart::fresh_state::<Symbolic>(&mut it.d);
-        let mut st = run_one(&mut it, &top, st).expect("toplevel");
-        cart::inject_tile_flag_at(&mut st);
-        let mut st = run_one(&mut it, &init, st).expect("_init");
-        for _ in 0..12 {
-            st = run_one(&mut it, &frame, st).expect("warm-up");
-        }
-
-        let rt2 = structure_of(&st, cd.clone(), cache.clone()).expect("structure");
-        // Built twice: `Rt2` is deliberately not `Clone`.
-        let mut canon = structure_of(&st, cd, cache).expect("structure");
-        canon.canonicalize_ids();
-        assert_eq!(
-            rt2.globals, canon.globals,
-            "the globals point at different cells after canonicalizing"
-        );
-        assert_eq!(
-            rt2.structure.len(),
-            canon.structure.len(),
-            "canonicalizing dropped {} cells as unreachable",
-            rt2.structure.len() as i64 - canon.structure.len() as i64
-        );
-        let first = (0..rt2.structure.len())
-            .find(|i| format!("{:?}", rt2.structure[*i]) != format!("{:?}", canon.structure[*i]));
-        assert!(
-            first.is_none(),
-            "cell {} differs: {:?} vs canonical {:?}",
-            first.unwrap(),
-            rt2.structure[first.unwrap()],
-            canon.structure[first.unwrap()]
-        );
-    }
-
     /// Every scalar the boundary can name lands on a DISTINCT `Val` cell of
     /// the structure the tracer builds (a merge would be silent corruption).
     #[test]
@@ -574,7 +340,7 @@ mod tests {
             st = run_one(&mut it, &frame, st).expect("warm-up");
         }
 
-        let rt2 = structure_of(&st, cd, cache).expect("structure");
+        let rt2 = crate::trace::block::skeleton(&st, cd, cache).expect("structure");
         let mut seen: std::collections::HashMap<u32, Path> = Default::default();
         let (mut ok, mut unnameable) = (0usize, 0usize);
         for p in crate::trace::iface::scalars(&st, &[]).expect("scalars") {

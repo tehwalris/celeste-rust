@@ -430,7 +430,9 @@ enum Command {
     /// one step through the kernels of `--level` and through `RefEngine`, both
     /// sides projected onto the level and compared by named fields. A
     /// reference successor the kernels miss is a SOUNDNESS gap; a kernel
-    /// successor the reference never makes is a PRECISION gap.
+    /// successor the reference never makes is a PRECISION gap. Every row,
+    /// kernel successor and reference leaf must also convert alike on the
+    /// tracer's side and the reference's (`block::check_agreement`).
     RefCheck {
         /// The level's tree (the dir holding `frames/` and `edges/`; a search's
         /// `<checkpoint-dir>/levelNN`).
@@ -1715,15 +1717,26 @@ fn main() -> Result<()> {
             let n = samples.min(all.len());
             let picked: Vec<(usize, u32)> = (0..n).map(|k| all[k * all.len() / n]).collect();
             // One row: (its report, reference-only successors, kernel-only,
-            // skipped over the path cap).
-            let one = |reference: &mut RefEngine, (fi, r): (usize, u32)| -> Result<(String, usize, usize, usize)> {
+            // skipped over the path cap, lanes converted alike).
+            let one = |reference: &mut RefEngine, (fi, r): (usize, u32)| -> Result<(String, usize, usize, usize, usize)> {
                 let (seq, f) = &files[fi];
                 let rt2 = f.load_rows(&[r..r + 1], cfg.room, &tree)?.ok_or_else(|| anyhow::anyhow!("no row"))?;
                 let at = where_(f.cell_at(r));
+                // The row, its kernel successors and its reference leaves
+                // convert alike on the tracer's side and the reference's
+                // (`block::check_agreement`).
+                let mut alike = 0;
+                let mut agree = |reference: &RefEngine, b: &Rt2| -> Result<()> {
+                    reference.check_agreement(b).map_err(|e| e.context(format!("row s{seq} r{r} at {at}: the one converter")))?;
+                    alike += b.width;
+                    Ok(())
+                };
+                agree(reference, &rt2)?;
                 // The kernels' successors.
                 let (next, _) = rerun(&kernels, rt2.clone_block(), frame)?;
                 let mut kset: std::collections::BTreeSet<Proj> = Default::default();
                 for b in next {
+                    agree(reference, b.rt2())?;
                     kset.extend(project_onto(&mut b.into_rt2(), level));
                 }
                 // The reference engine's, from the row projected onto the level.
@@ -1732,11 +1745,12 @@ fn main() -> Result<()> {
                 let mut rset: std::collections::BTreeSet<Proj> = Default::default();
                 let leaves = match reference.run_lane(&input, 0) {
                     Err(e) if e.downcast_ref::<celeste_rust::trace::refdriver::TooManyPaths>().is_some() => {
-                        return Ok((format!("[ref-check] row s{seq} r{r} at {at}: SKIPPED ({e})\n"), 0, 0, 1));
+                        return Ok((format!("[ref-check] row s{seq} r{r} at {at}: SKIPPED ({e})\n"), 0, 0, 1, alike));
                     }
                     other => other?,
                 };
                 for leaf in leaves {
+                    agree(reference, leaf.rt2())?;
                     rset.extend(project_onto(&mut leaf.into_rt2(), level));
                 }
                 let missing: Vec<&Proj> = rset.difference(&kset).collect();
@@ -1749,13 +1763,13 @@ fn main() -> Result<()> {
                 for p in extra.iter().take(show) {
                     out += &format!("    only in the KERNELS (precision gap): {}\n", brief(p));
                 }
-                Ok((out, missing.len(), extra.len(), 0))
+                Ok((out, missing.len(), extra.len(), 0, alike))
             };
             // The rows in parallel (the kernels' engine shared, a reference
             // engine per worker), reported in row order.
             let next = std::sync::atomic::AtomicUsize::new(0);
             let workers = cfg.threads().min(n);
-            type Row = (String, usize, usize, usize);
+            type Row = (String, usize, usize, usize, usize);
             let mut done: Vec<(usize, Row)> = std::thread::scope(|sc| {
                 let hs: Vec<_> = (0..workers)
                     .map(|_| {
@@ -1779,15 +1793,17 @@ fn main() -> Result<()> {
             .flatten()
             .collect();
             done.sort_by_key(|d| d.0);
-            let (mut sound_gaps, mut precision_gaps, mut rows_bad, mut skipped) = (0usize, 0usize, 0usize, 0usize);
-            for (_, (text, missing, extra, skip)) in done {
+            let (mut sound_gaps, mut precision_gaps, mut rows_bad, mut skipped, mut alike) = (0usize, 0usize, 0usize, 0usize, 0usize);
+            for (_, (text, missing, extra, skip, lanes)) in done {
                 print!("{text}");
                 sound_gaps += missing;
                 precision_gaps += extra;
                 rows_bad += (missing + extra > 0) as usize;
                 skipped += skip;
+                alike += lanes;
             }
             println!("[ref-check] {n} rows ({skipped} SKIPPED over the path cap): {rows_bad} differ; {sound_gaps} successors only in the reference, {precision_gaps} only in the kernels");
+            println!("[ref-check] the one converter: {alike} lanes (the rows, their kernel successors and reference leaves) convert alike on both sides");
             celeste_rust::compiled::dispatch::print_kernel_hits();
             anyhow::ensure!(sound_gaps == 0, "ref-check: {sound_gaps} reference successors the kernels miss (a SOUNDNESS gap)");
         }

@@ -411,8 +411,8 @@ impl Rt2 {
 
     /// Renumber every cell into CANONICAL order (BFS discovery from the
     /// globals, children in stored order) and compact, so isomorphic heaps
-    /// are identical and row keys block-independent. Public so producers
-    /// that claim canonical ids (`trace::bind::structure_of`) are checked.
+    /// are identical and row keys block-independent. Public: the heap's
+    /// converter (`trace::block::to_rt2`) ends in it.
     pub fn canonicalize_ids(&mut self) {
         // Fields sorted by name, or creation order changes the shape.
         for cell in self.structure.iter_mut() {

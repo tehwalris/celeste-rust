@@ -233,7 +233,7 @@ pub fn trace_frame<'a>(
         (Some(a), Some(b)) => (a, b),
         _ => bail!("tracing a frame needs the cart and the room's collision cache"),
     };
-    let in_rt2 = super::bind::structure_of(&st, cart.clone(), cache.clone())?;
+    let in_rt2 = super::block::skeleton(&st, cart.clone(), cache.clone())?;
     let in_cells = super::bind::bind_inputs(&in_rt2, &iface)?;
     let mut st = st;
     // The level's widened slots read as the table says (held trails forked
@@ -303,7 +303,7 @@ pub fn trace_frame<'a>(
             .fold(it.d.graph.fold(crate::transpile::graph::Op::Or, vec![global, s.ended]), |e, (_, w)| it.d.graph.fold(crate::transpile::graph::Op::Or, vec![e, *w]));
         // This outcome's engine numbering; fields and dead cells share one
         // cell space.
-        let rt2 = super::bind::structure_of(&s, cart.clone(), cache.clone())?;
+        let rt2 = super::block::skeleton(&s, cart.clone(), cache.clone())?;
         let paths: Vec<Path> =
             fields.iter().map(|(p, _, _)| p.clone()).chain(ubool.iter().cloned()).collect();
         let all = super::bind::resolve_all(&rt2, &paths)?;

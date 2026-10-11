@@ -36,9 +36,10 @@ kernels come from the **tracer** via one hand-off.
    position), already widened for the level. Branching, widening and keying happen inside. Two impls: the
    compiled `compiled::FrameEngine` and the reference `trace::refengine`
    (`RefEngine`: the tracer's interpreter over `RefDomain`, one lane and one
-   fork path at a time; `trace::refbridge` turns a block's lane into its
-   state and each leaf back into a one-row block, boxes and all, so its rows
-   key like the kernels'). The loop never touches an interpreter state.
+   fork path at a time; `trace::block` turns a block's lane into its
+   state and each leaf back into a one-row block, boxes and all, by the one
+   converter the tracer's output shapes come from, so its rows key like the
+   kernels'). The loop never touches an interpreter state.
 2. **The block** (`Rt2` in `celeste-engine`, `frame::Block` = an `Rt2` with its
    key column and its rows' ids, `storage::StateId`). Columnar; key and cell
    are exposed, the fields are opaque columns. Serialized whole
@@ -74,7 +75,8 @@ crates/celeste-engine    Rt2 block model, boundary/keys, lane primitives        
   src/trace/             the AST tracer (Lua -> transpile::graph::Graph), the
                          constant-lattice walk (kernel.rs), widen.rs, verify.rs
                          (split pass), error.rs, level_minus_one.rs, the
-                         reference engine (refengine, refdriver, refbridge)
+                         reference engine (refengine, refdriver, refbridge),
+                         block.rs (state <-> block, every domain)
   src/transpile/         graph IR, lowering (lower::specialize_frame), ASM
                          assembler (transpile::asm)
   src/compiled/          FrameEngine, the kernel registry and append step

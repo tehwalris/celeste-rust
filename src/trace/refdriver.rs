@@ -38,7 +38,7 @@ pub fn fresh_interp<'a>(cart: Arc<CartData>, cache: Arc<CollisionCache>) -> Inte
 /// `level` is passed in, not read from the process-global level: a concrete
 /// step (`RefEngine::step`) is exact whatever the search has set.
 ///
-/// `unknown` names the input's unknown-boolean fields (`refbridge::from_block`):
+/// `unknown` names the input's unknown-boolean fields (`block::from_block`):
 /// each is a cursor choice made before the frame runs, as the kernels fork them.
 ///
 /// More than `cap` paths is an error, `TooManyPaths` (every path's output is

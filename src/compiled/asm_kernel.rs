@@ -1774,16 +1774,8 @@ fn cell_out(body: &AsmBody, buf: &[u8], i: usize, start: (i16, i16)) -> u32 {
 /// The accumulator recipe for one outcome, with `shape_hash` and its key's
 /// uniform fields.
 fn acc_template(r: &crate::trace::kernel::Reference, oi: usize) -> Result<AccTemplate> {
+    // Canonical: `block::skeleton` ends in `Rt2::canonicalize_ids`.
     let skeleton = reshape(&r.frame.outs[oi].rt2, 0);
-    // The structure must be canonical already (checked, not trusted).
-    {
-        let mut probe = skeleton.clone_block();
-        probe.canonicalize_ids();
-        anyhow::ensure!(
-            probe.structure == skeleton.structure,
-            "outcome {oi}: the traced output structure is not canonical"
-        );
-    }
     let shape_hash = skeleton.shape_hash_of();
     let mut inits: Vec<(usize, ColInit)> = Vec::new();
     for f in &r.lowered.outs[oi].fields {
