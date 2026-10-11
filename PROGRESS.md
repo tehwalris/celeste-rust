@@ -104,3 +104,9 @@ Steps:
   * MIMALLOC_PURGE_DELAY=10 instead of safe-run's 0 (not changed; for the coordinator): f57 page
     faults 6.7M -> 2.2M per 3 reps, frame ~8% faster, peak +5-10% (4.22 -> 4.42-4.66 GB);
     r42 backward CPU -19% (8.3 -> 6.7 s), faults 402k -> 35k.
+- 2026-10-11 18:10 Gates and docs. big ok (f57 4.18 s at load 36); t0 + ignored 196/196. The
+  backward's round is sized in bytes (20M 40-B emissions, 0.8 GB, as develop's 32M 24-B ones).
+  BENCHMARK_DATA.md 2026-10-11, plans/edges-target.md (numbers, the backward's memory per node,
+  the state-id proposal), lessons.md (what was measured and dropped), CLAUDE.md and
+  storage-v2.md pointers. Full-search A/B, two rounds (develop first, then this first): every
+  [gate] file identical, known routes survive; walls within the load's noise (9-45).

@@ -106,6 +106,28 @@ shared machine): the inversion 54 s, the BFS and the graph load another
 their translation tables, no inversion): 212 s, peak 8.9 GB, the same
 answer. The research behind it: branch `emit-capture`, bench/dedup/DESIGNS.md.
 
+**Source-side edge blocks with lids, the owner index and the translation**
+(storage v2, 2026-10-10 .. 2026-10-11; replaced by plans/edges-target.md).
+Units named targets by LIDS (a visited-set lookup each), the first unit to
+request a new state copied its row (claims), the translation numbered
+entries and resolved every lid, and the backward walked back through a
+per-frame owner index (16 B a lid): 3.15 B an edge at room (6,2) 100% f57,
+room (1,0) h99's tree 28 GB of which edges 26 GB. Bundles in their target
+regions: 0.113 B an edge, 2.4 GB. On the way, measured and dropped: a
+ROUTE-level bundle table merging the units' bundles of one key (17% fewer
+bundles, 0.101 against 0.113 B an edge at f57) - probed per record, it was
+DRAM-bound and the region phase took 31-39 worker-s a frame against 5;
+`rustc-hash` 1.x's FxHash on packed keys in hashbrown (long probe chains:
+`rustc_hash2` for those maps); a barrier between slices (idle cores; one
+pipeline instead); merging the transfer tables by re-hashing every
+worker's whole table each slice (quadratic; each worker's new pairs
+since); a reindex of every touched region table each frame (11.5 s of
+frame end in room (1,0); the new slots only); in the backward, skipping a
+block with no changed target (a quarter of room (4,2)'s blocks, no
+measurable time); relative masks (`[s x o t]` with masks relative to the
+source key's cells: 1.5-7% smaller on three trees, 6% larger on room
+(1,0), a source lookup at every read).
+
 **Other frame shapes rejected on paper** (plans of 2026-09-13): lockstep per
 input cell (150-lane kernel calls per worker, the dedup window collapses, raw
 rows 2x), streaming owners (hides <= 10% of a frame), two-pass emit-keys-then-

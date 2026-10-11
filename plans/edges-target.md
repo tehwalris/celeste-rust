@@ -124,20 +124,46 @@ give byte-identical frame files, edge files and `xfer.bin`; `gates/raise.sh
   dictionary ranked against the group's changed targets (both sorted), and
   every record's mask ANDed with its target's changed cells; a hit is an
   in-edge (source = the record's source key at target cell - offset).
-- **Reach** (the next level's filter) and the concrete search's successors
-  load out-edges as states are reached: a frame's sources by region, the
-  file header's index names the target regions those regions' edges reach,
-  their segments are decoded and the bundles of the sources' keys kept
-  (`out_edges`).
+- **Reach** (the next level's filter) loads out-edges as states are
+  reached: a frame's sources by region, the file header's index names the
+  target regions those regions' edges reach, their segments are decoded
+  and the bundles of the sources' keys kept (`out_edges`). The concrete
+  search reads W and the node keys only (it runs the reference engine).
 - **The region-batched worklist** (plans/edge-bundles.md's proposal: drive
   the step by region so a block is decoded once for all of its changed
   targets) is what the reader does already: items are (region, frame), so
   each block a step needs is decoded once for every changed target in it.
   What remains is the decode AMPLIFICATION across steps (below).
 
-## Numbers
+- **Memory per node.** `Sk` is 24 B (a 127-bit exact key, the region, the
+  cell), so the step's records are twice develop's: a node with a set
+  (`Cur`) and a source's set so far (`Acc`) 32 B against 16, an in-edge read
+  (`Emit`) 40 B against 24 (a round is now ~20M in-edges, 0.8 GB, as it
+  was). The rooms measured never reach 0.5 GB in the backward; at the mod
+  room's h155 (230M nodes, ~15 GB anonymous on develop) expect ~+4 GB. The
+  remedy if it binds: W-local region tables (per region its nodes' keys
+  once, a node an index into them), the visited set's own trick.
 
-(See BENCHMARK_DATA.md 2026-10-11 for the runs.)
+## Numbers (BENCHMARK_DATA.md 2026-10-11 has the runs)
+
+- **The reference frame** (6,2) 100% f56 -> f57, interleaved with develop
+  at load 36-39: 4.24-4.99 s (median 4.50) against 4.32-5.64 (4.56). The
+  region jobs are 5.0-7.7 worker-s inside the wave (31-39 at 8dcaa56, when
+  the frame took 12.0-14.7 s against develop's 8.4-9.7); the frame's end
+  0.26-0.39 s. Edges 29 MB, 0.113 B an edge (develop 3.15 B).
+- **Searches** (same answers, witnesses, `[gate]` lines; the known routes
+  survive): room (1,0) h99 tree 28 GB -> 2.4 GB (edges 26 GB -> 517 MB),
+  (6,2) 100% 45 -> 7.6 GB (39 GB -> 1.6 GB), (4,2) 546 -> 103 MB; peaks
+  equal or lower (3.4 against 3.6-3.8 GB, 7.6-7.8 against 8.2 GB); walls
+  within the load's noise of develop's (both directions, two rounds).
+- **The backward**: (6,2) 100% 2.3-2.7x faster (1.65-2.28 s against
+  3.74-6.12); (1,0) 2.05-2.81 against 1.74-2.83 s; (4,2) 1.11-1.22 against
+  0.77-0.79 s. The small trees pay the AMPLIFICATION: a step decodes a
+  (target region, frame)'s whole blocks for its changed targets - (4,2)
+  parsed 66.7M bundles for 19.9M in-edges, (1,0) 237M for 47M. Skipping
+  blocks without a changed target (25% of (4,2)'s) saved nothing
+  measurable. A target-major order would read less and store more; not
+  tried.
 
 ## What still carries state ids (and the proposal)
 
@@ -146,7 +172,7 @@ layers' frame files (an id column, 8 B a state), the per-frame metadata
 (the entries created, with keys: the Resolver), the level -1 drop notes
 (sorted (id, horizon), 9.1 B a dropped source), a raise's per-state layers,
 and the diagnostics that name states (`follow`, `spurious`, the UI export).
-On r62h57 (942 MB): frames 403 MB (the id pieces 351, the metadata 52),
+On r62h57 (0.9 GB): frames 403 MB (the id pieces 351, the metadata 52),
 edges 136 MB, drop notes 398 MB. The proposal for Philippe (not built):
 store a layer as per (shape, region) its new entries' keys and cell masks
 (the visited set's own form, ~0.5 B a state raw, ~0.06 with zstd) and the

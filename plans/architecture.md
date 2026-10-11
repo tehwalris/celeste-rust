@@ -457,20 +457,20 @@ the list (coarsest first; one level is the usual case):
    `W_t(p) = W_{t+1}(p) ∪ U pull_e(W_{t+1}(m))` over the edges `p -> m`
    whose target CHANGED at t + 1: frame by frame from the wins, the changed
    nodes' in-edges at frames <= t + 1 are read from their target regions'
-   blocks, in bounded ROUNDS (32M in-edges at most), and pulled into their
+   blocks, in bounded ROUNDS (~20M in-edges, 0.8 GB, at most), and pulled into their
    sources in parallel state ranges. No graph is held and nothing marks nodes
    first: a node no winning set reaches is never touched, and W's SUPPORT
    (the nodes with a set at some frame) replaces the remainder-free marks
-   in the gate. W is kept as varints - per node its id delta, layer and
+   in the gate. W is kept as varints - per node its state's delta, layer and
    spans, per span its length and set, ~4 B a node and ~3 a span - in a
    scratch file beside the tree, mapped back (`<level>/arc-scratch`,
    unlinked once mapped), over a flat arena of the distinct sets
    (`RegionArena`, bounds in 16 bits). `arc_dp::optimum` reads
    the optimum off the start's sets. That optimum is exact in the remainder
    and over-approximates the level's other widenings (and `rnd`): a LOWER
-   BOUND, and no win REFUTES H. The storage metadata
-   (`storage::marks::Resolver`) gives the gate's fingerprints, the marks
-   files and the concrete search's node keys (by ENTRY, 24 B each). The mod
+   BOUND, and no win REFUTES H. A node IS its state (`Sk`: region, key,
+   cell, as the edge files name it), so the gate's fingerprints, the marks
+   files and the concrete search's node keys need no metadata. The mod
    room at h155 (230M nodes, 430M spans, 6.0G in-edges read): the arc phase
    in ~15 GB anonymous under a 30 GB cap, where the remainder-free BFS and
    its 12 B-an-edge graph were OOM-killed at ~104 GB.
@@ -521,7 +521,7 @@ the frame are rewritten (the untouched sources keep theirs). The result is
 the tree a fresh forward under H' makes: the same (key, cell) set per frame,
 the same edges, the same pos graph, the same notes - unless H' reaches a
 state SOONER than the tree did, which would move it to an earlier layer: a
-hit on a state of a later layer is refused (`UnitSink::emit`, through every
+hit on a state of a later layer is refused (`route::run_route`, through every
 state's layer, `wave::StateLayers`, built for the raise; possible only where
 the table's d is not consistent along a real edge; it has not fired). Checked by `gates/raise.sh` (a tree raised H1 -> H2 -> ...
 against a fresh tree per horizon: `ckhash --edges`, the pos graph, the
@@ -549,8 +549,11 @@ format 14): a row is a function of its shape's skeleton, its exact key and
 its cell, and an id names both, so a frame file is the shape's skeleton,
 the win rows and the id column (8 B a row), and a row is DECODED when read
 (`storage::decode`, against the metadata's key space and entries:
-`decode::TreeKeys`). The forward checks every piece it writes decodes to
-its rows exactly (`decode::check_piece`, FATAL otherwise). This replaced
+`decode::TreeKeys`). Since the edges target the forward copies no row at
+all: the new layer is decoded from its states' keys and cells, and the
+DECODE GUARD checks a shape's first emitted row each worker and wave
+against its decode (`decode::Skeletons`, FATAL otherwise); `--key-check`
+checks every row. This replaced
 `--trim-rows` (2026-10-07: old frames trimmed to keys, ids, cells and wins,
 and the diagnostics refused them): every frame's rows are readable now, and
 the frames take ~8 B a state instead of 50-80.

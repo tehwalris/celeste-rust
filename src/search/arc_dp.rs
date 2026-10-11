@@ -403,9 +403,10 @@ const LOCAL: u32 = 1 << 31;
 const MADE: u32 = 1 << 30;
 
 /// The in-edges a step reads at once: a step whose changed nodes have more
-/// reads them in ROUNDS, each folded into the step's sets so far (24 B an
-/// in-edge: 0.8 GB a round).
-const ROUND_EMITS: usize = 1 << 25;
+/// reads them in ROUNDS, each folded into the step's sets so far (an
+/// `Emit` is 40 B: 0.8 GB a round, as with 24-B id emissions of 32M).
+const ROUND_EMITS: usize = 20 << 20;
+const _: () = assert!(std::mem::size_of::<Emit>() == 40, "ROUND_EMITS is sized for 40-B emissions");
 
 fn region_hash(r: RegionRef) -> u64 {
     use std::hash::{Hash, Hasher};
