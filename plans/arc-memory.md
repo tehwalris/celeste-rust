@@ -10,9 +10,11 @@ that peaked at 21 GB.
 
 **Result.** The backward is ONE PUSH over the recorded in-edges, read from
 the edge files: no graph is loaded and no remainder-free marks are made.
-The mod room's arc phase at h155 now peaks at TODO GB anonymous (backward
-TODO s, TODO wall) under a 30 GB cap; every `[gate]` W line, the optimum,
-the witness and the arc marks are identical on every case measured.
+The mod room's arc phase at h155 now peaks at 6.5 GB anonymous (inside its
+heaviest backward step; 2.8-3.9 GB between phases), the backward taking
+277 s, under a 30 GB cap - 31% of the forward's 21 GB peak, against the
+old phase's >104 GB. Every `[gate]` W line, the optimum, the witness and
+the arc marks are identical on every case measured.
 
 ## Where it went (before: develop 432a844)
 
@@ -125,7 +127,7 @@ Quick profile, 16 threads, a shared machine (load 7-27). "anon" is
 | r10arc (room (1,0) `r0sxh` h56, win 40,64; 337k marks, 4.1M edges) | bfs 0.1 + load 0.2 + backward 0.12 s; arc anon peak 0.25 GB | backward 0.2 s; anon peak 0.06 GB; 153k support nodes |
 | r62w (room (6,2) any% `r0sxhf` h56, win `22..30,44..52`; 11 GB tree; 2.16M marks, 46.7M edges) | bfs 0.8 + load 0.9 + backward 1.2 s; anon: graph 0.72, backward 0.77, fingerprints 0.90 GB; `--save-marks` reach 0.94 | backward 0.8-1.1 s (read 0.32, pull 0.34, merge 0.13); anon peak 0.16 GB; `--save-marks` reach 0.34 GB; 1.71M support nodes |
 | mod room h140 | bfs 95 + load 40 + backward 91 s; 31.2 GB graph, 40.7 peak; reach 33.6; 62.5 GB with the files | not rerun (the tree is built at h155 now) |
-| mod room h155 | OOM-killed at ~104 GB in the load | TODO |
+| mod room h155 | OOM-killed at ~104 GB in the load | backward 277 s (read 116, pull 105, merge 29); anon peak 6.5 GB (the sweep), 3.5 GB (end of backward), 3.5 (fingerprints), 3.9 (node keys), 3.7 (concrete engines up); 230M support nodes |
 
 The mod room at h155, version by version (cold page cache, 30 GB cap):
 
@@ -137,7 +139,7 @@ The mod room at h155, version by version (cold page cache, 30 GB cap):
 | + the set arena, 256-target chunks | 343 s | 12.1 / - / 9.4 | 5.6 GB | 41 GB |
 | + rounds by (chunk, frame), sets numbered without a copy | 280 s | 9.7 / 11.0 / 9.6 | 7.9 GB (capacities) | 41 GB |
 | + runs and nodes spilled to files, W's entries alone resolved | 286 s | 8.1 / 4.9 / 5.0 | 5.8 GB (2.4 of it the spilled nodes) | 41 GB |
-| + one frame copy fewer, 32M rounds, 16-bit bounds, mimalloc collects | TODO | TODO | TODO | TODO |
+| + one frame copy fewer, 32M rounds, 16-bit bounds, mimalloc collects | 277 s | 6.5 / 3.5 / 3.5 | 4.3 GB (2.4 spilled, sets 1.8) | 40 GB (8.0M faults) |
 
 Its backward: 430M spans (sets changed), 230M support nodes, 28.3M
 distinct sets, 6.0G in-edges read (5.0G after dedup), at most 96.5M nodes
@@ -179,19 +181,53 @@ Fewer opens, more reading. A region opened before its successors' values
 are final is opened again, and a reopen re-reads its pending nodes'
 in-edges over all their frames. In the sweep every value it reads is final
 at its frame (W_t depends on W_{t+1} only), so a node is read once per
-change of its set - 1.87 times a node on the mod room - and no schedule
-reads a node less than once. The worklist also holds every node's value
+change of its set - 1.87 times a node on the mod room; reading it once
+would need its whole value final first, which the time dependence (and
+the graph's cycles) rule out for a schedule over whole values. The worklist also holds every node's value
 mutable at once (the sweep only the present frame's) and its opens are
 sequential. What would cut the reads is the layout: a target region's
 in-edges are spread over the lids of every unit whose sources reach it, so
 a target-indexed edge store ("target-region bundles") would make a
 region's in-edges one contiguous read per frame.
 
+## Toward ID-free, target-region edge storage
+
+Edge storage may become ID-free: a region's IN-edges as (source state,
+target state, transition) tuples of whole exact keys in the TARGET
+region's compressed trie, with target-cell masks (another agent is
+measuring it). The backward above already needs nothing else:
+
+- its one storage query is "the in-edges, at frame f, of these targets"
+  (`EdgeStore::preds_sorted`), asked with the changed targets sorted
+  region-major - a lookup of those targets in the target region's store;
+- nothing is numbered: a node is a state, carried as its storage identity
+  (today a `StateId`, (region, entry, cell); with ID-free storage (region,
+  key, cell)), and every set operation is a merge of state-sorted streams
+  (the frame's sets, a round's in-edges by source) - no per-edge lookup,
+  no global node ids, no CSR. W per state could equally be a per-region
+  table keyed through the region's in-core table; the merges need only an
+  order, the concrete search a lookup (per concrete state: rare).
+
+Which schedule then: the sweep reads each node's in-edges once per change
+of its set (1.87 times a node on the mod room), every value it reads final
+at its frame; the region worklist opened regions 3.5x less often but read
+5-12% more (above). That ranking holds while reading a region costs per target
+looked up, as with the owner index today. If opening a target region costs
+its whole bundle (decompressing its trie), opens dominate and the
+region-batched schedule should be measured again on that layout; the
+sweep's items would then be (target region, frame) rather than (1024
+targets, frame).
+
 ## Follow-ups
 
 - The sweep's peak is the largest frame twice (96.5M nodes, 16 B each)
   with a round and the step's sets so far; the arena of distinct sets
   (28.3M) is what stays.
-- The concrete search was measured on the mod room only through its key
-  table (TODO).
+- The concrete search itself is not this change's: on the mod room at
+  h155 its depth-first try at the bound f141 was exhaustive in 51k steps
+  (32.6 s, 3.7 GB anonymous with W and the 20.8M node-key entries), then
+  its breadth-first search grew ~1.3x a layer inside W (26k states at layer
+  122, 5.4 GB) and was stopped: W at `r0sxhne` admits too many concrete
+  states there - the objects ladder's case (plans/architecture.md, "The
+  objects ladder").
 - A target-indexed edge layout (above).
