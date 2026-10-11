@@ -24,7 +24,7 @@ use super::{id_entry, id_local, id_region, state_id, StateId};
 use crate::search::arc_edges::{decode_pair, encode_pair, Pair, PAIR_BYTES};
 
 #[inline]
-fn put_varint(out: &mut Vec<u8>, mut v: u64) {
+pub(crate) fn put_varint(out: &mut Vec<u8>, mut v: u64) {
     while v >= 0x80 {
         out.push((v as u8) | 0x80);
         v >>= 7;
@@ -33,7 +33,7 @@ fn put_varint(out: &mut Vec<u8>, mut v: u64) {
 }
 
 #[inline]
-fn get_varint(b: &[u8], pos: &mut usize) -> u64 {
+pub(crate) fn get_varint(b: &[u8], pos: &mut usize) -> u64 {
     let mut v = 0u64;
     let mut shift = 0;
     loop {

@@ -24,120 +24,210 @@
 //! concrete search runs inside `W` (`concrete_search`).
 
 use super::arcs::{Region, Transfer};
-use crate::storage::edges::{EdgeStore, ReadStats};
+use crate::storage::edges::{get_varint, put_varint, EdgeStore, ReadStats};
 use crate::storage::{id_entry, id_local, id_region, state_id, StateId};
 use rustc_hash::{FxHashMap, FxHashSet};
 
-/// A node's winning set over the frames `lo..=hi`.
-#[derive(Clone, Copy, Debug)]
-struct Span {
-    lo: u16,
-    hi: u16,
-    set: u32,
-}
+/// Nodes a block of `Winning` holds: a node is found by decoding at most
+/// this many.
+const BLOCK: usize = 16;
 
 /// The winning sets, `t` in `0..=horizon`, of the nodes that have one (W's
-/// SUPPORT, sorted by id): per node its SPANS - a set and the frames it
-/// holds over, 8 B - into an arena of the distinct sets. A node's set is
-/// non-empty from its layer to its last frame and grows as `t` falls, so a
-/// node is one span per change.
+/// SUPPORT, sorted by id). A node's set is non-empty from its layer to its
+/// last frame and only grows as `t` falls, so it is a few SPANS - a set and
+/// the frames it holds over - and is stored as varints: per node its id (a
+/// delta), its layer, its spans' count, and per span its length and its set
+/// (the arena's sets numbered by use, the most used first); per block of
+/// `BLOCK` nodes its first id and byte offset. ~4 B a node and ~3 a span
+/// (a span as fields took 8, its node's id and offset 12 more).
 pub struct Winning {
-    ids: Vec<StateId>,
-    /// Node `i`'s spans: `spans[at[i]..at[i + 1]]`, by frame.
-    at: Vec<u32>,
-    spans: Vec<Span>,
+    n: usize,
+    blocks: Vec<(StateId, u64)>,
+    data: Vec<u8>,
     sets: Vec<Region>,
+    spans: usize,
+}
+
+/// One node of `Winning`: its id, its layer and its spans.
+#[derive(Clone, Copy)]
+pub struct Node<'a> {
+    pub id: StateId,
+    pub layer: u32,
+    count: u32,
+    bytes: &'a [u8],
+    sets: &'a [Region],
+}
+
+impl<'a> Node<'a> {
+    /// The spans `(lo, hi, set index)`, in frame order.
+    fn raw(self) -> impl Iterator<Item = (u32, u32, u32)> + 'a {
+        let mut pos = 0usize;
+        let mut lo = self.layer;
+        (0..self.count).map(move |_| {
+            let hi = lo + get_varint(self.bytes, &mut pos) as u32;
+            let set = get_varint(self.bytes, &mut pos) as u32;
+            let s = (lo, hi, set);
+            lo = hi + 1;
+            s
+        })
+    }
+    /// The spans `(lo, hi, set)`: `W_t = set` for `t` in `lo..=hi`, empty
+    /// at the frames no span covers.
+    pub fn spans(self) -> impl Iterator<Item = (u32, u32, &'a Region)> + 'a {
+        let sets = self.sets;
+        self.raw().map(move |(lo, hi, s)| (lo, hi, &sets[s as usize]))
+    }
+    /// The last frame the node has a set (its deadline).
+    pub fn last(self) -> u32 {
+        self.raw().last().expect("a node has a span").1
+    }
+    /// `W_t` (`None` = empty).
+    pub fn at(self, t: u32) -> Option<&'a Region> {
+        if t < self.layer {
+            return None;
+        }
+        let sets = self.sets;
+        self.raw().find(|s| t <= s.1).map(|s| &sets[s.2 as usize])
+    }
+}
+
+/// `Winning::nodes`: every node, decoded in order.
+pub struct Nodes<'a> {
+    w: &'a Winning,
+    k: usize,
+    pos: usize,
+    id: StateId,
+}
+
+impl<'a> Iterator for Nodes<'a> {
+    type Item = Node<'a>;
+    fn next(&mut self) -> Option<Node<'a>> {
+        if self.k >= self.w.n {
+            return None;
+        }
+        if self.k % BLOCK == 0 {
+            (self.id, self.pos) = (self.w.blocks[self.k / BLOCK].0, self.w.blocks[self.k / BLOCK].1 as usize);
+        }
+        let n = self.w.decode_at(&mut self.pos, &mut self.id);
+        self.k += 1;
+        Some(n)
+    }
 }
 
 impl Winning {
-    /// From the runs of closed spans the backward made (each sorted by id,
-    /// a node at most once a run, the runs by falling frame): merged by
-    /// (id, frame) into the nodes' lists.
-    fn from_runs(runs: Vec<Vec<(StateId, Span)>>, sets: Vec<Region>) -> Self {
-        use std::cmp::Reverse;
-        let total: usize = runs.iter().map(Vec::len).sum();
-        assert!(total < u32::MAX as usize, "{total} spans do not fit a u32 index");
-        let mut heap: std::collections::BinaryHeap<Reverse<(StateId, u16, usize)>> = std::collections::BinaryHeap::new();
-        let mut pos = vec![0usize; runs.len()];
-        for (k, r) in runs.iter().enumerate() {
-            if let Some(&(id, s)) = r.first() {
-                heap.push(Reverse((id, s.lo, k)));
-            }
+    /// The node at `pos` (whose previous node's id is `id`); both past it.
+    fn decode_at(&self, pos: &mut usize, id: &mut StateId) -> Node<'_> {
+        *id += get_varint(&self.data, pos);
+        let layer = get_varint(&self.data, pos) as u32;
+        let count = get_varint(&self.data, pos) as u32;
+        let start = *pos;
+        for _ in 0..2 * count {
+            get_varint(&self.data, pos);
         }
-        let (mut ids, mut at, mut spans): (Vec<StateId>, Vec<u32>, Vec<Span>) = (Vec::new(), Vec::new(), Vec::with_capacity(total));
-        while let Some(Reverse((id, _, k))) = heap.pop() {
-            let s = runs[k][pos[k]].1;
-            pos[k] += 1;
-            if let Some(&(nid, ns)) = runs[k].get(pos[k]) {
-                heap.push(Reverse((nid, ns.lo, k)));
-            }
-            if ids.last() != Some(&id) {
-                ids.push(id);
-                at.push(spans.len() as u32);
-            } else {
-                debug_assert_eq!(spans.last().map(|p: &Span| p.hi as u32 + 1), Some(s.lo as u32), "a node's spans are contiguous");
-            }
-            spans.push(s);
+        Node { id: *id, layer, count, bytes: &self.data[start..*pos], sets: &self.sets }
+    }
+    /// Node `i`.
+    pub fn node(&self, i: u32) -> Node<'_> {
+        let (b, k) = (i as usize / BLOCK, i as usize % BLOCK);
+        let (mut id, mut pos) = (self.blocks[b].0, self.blocks[b].1 as usize);
+        for _ in 0..k {
+            self.decode_at(&mut pos, &mut id);
         }
-        at.push(spans.len() as u32);
-        ids.shrink_to_fit();
-        at.shrink_to_fit();
-        Winning { ids, at, spans, sets }
+        self.decode_at(&mut pos, &mut id)
+    }
+    /// Every node, in id order.
+    pub fn nodes(&self) -> Nodes<'_> {
+        Nodes { w: self, k: 0, pos: 0, id: 0 }
     }
     pub fn len(&self) -> usize {
-        self.ids.len()
+        self.n
     }
     pub fn is_empty(&self) -> bool {
-        self.ids.is_empty()
+        self.n == 0
     }
     /// The node of state `id` (`None`: no set at any frame).
     pub fn index(&self, id: StateId) -> Option<u32> {
-        self.ids.binary_search(&id).ok().map(|i| i as u32)
+        let b = self.blocks.partition_point(|x| x.0 <= id).checked_sub(1)?;
+        let (mut at, mut pos) = (self.blocks[b].0, self.blocks[b].1 as usize);
+        for k in 0..BLOCK.min(self.n - b * BLOCK) {
+            let n = self.decode_at(&mut pos, &mut at);
+            if n.id >= id {
+                return (n.id == id).then_some((b * BLOCK + k) as u32);
+            }
+        }
+        None
     }
     pub fn id(&self, i: u32) -> StateId {
-        self.ids[i as usize]
-    }
-    fn of(&self, i: u32) -> &[Span] {
-        &self.spans[self.at[i as usize] as usize..self.at[i as usize + 1] as usize]
-    }
-    /// The first frame node `i` has a set: its layer.
-    pub fn layer(&self, i: u32) -> u32 {
-        self.of(i)[0].lo as u32
-    }
-    /// The last frame node `i` has a set (its deadline).
-    pub fn last(&self, i: u32) -> u32 {
-        self.of(i).last().expect("a node has a span").hi as u32
+        self.node(i).id
     }
     /// `W_t(i)` (`None` = empty).
     pub fn at(&self, t: u32, i: u32) -> Option<&Region> {
-        let s = self.of(i);
-        let k = s.partition_point(|s| (s.hi as u32) < t);
-        s.get(k).filter(|s| s.lo as u32 <= t).map(|s| &self.sets[s.set as usize])
+        self.node(i).at(t)
     }
-    /// Node `i`'s spans `(lo, hi, set)`: `W_t(i) = set` for `t` in
-    /// `lo..=hi`, empty at the frames no span covers.
-    pub fn spans_of(&self, i: u32) -> impl Iterator<Item = (u32, u32, &Region)> + '_ {
-        self.of(i).iter().map(move |s| (s.lo as u32, s.hi as u32, &self.sets[s.set as usize]))
-    }
-    /// The bytes held: ids, span offsets, spans, and the sets' arena.
+    /// The bytes held: the encoding, the block index and the sets' arena.
     pub fn bytes(&self) -> u64 {
         let sets: usize = self.sets.iter().map(|r| r.bytes()).sum();
-        (8 * self.ids.len() + 4 * self.at.len() + 8 * self.spans.len() + sets) as u64
+        (self.data.len() + 16 * self.blocks.len() + sets) as u64
     }
     /// Spans and distinct sets.
     pub fn sizes(&self) -> (usize, usize) {
-        (self.spans.len(), self.sets.len())
+        (self.spans, self.sets.len())
+    }
+}
+
+/// The spans one backward step closed - each node whose set changed or
+/// ended below the step's frame, its span from `lo` (the step's frame + 1)
+/// to its last frame - by id, as varints: the id's delta, `hi - lo`, the set.
+#[derive(Clone, Default)]
+struct Run {
+    lo: u16,
+    n: usize,
+    bytes: Vec<u8>,
+}
+
+impl Run {
+    fn new(lo: u16, closed: impl IntoIterator<Item = (StateId, u16, u32)>) -> Self {
+        let mut r = Run { lo, n: 0, bytes: Vec::new() };
+        let mut last = 0;
+        for (id, hi, set) in closed {
+            debug_assert!(id >= last && hi >= lo);
+            put_varint(&mut r.bytes, id - last);
+            put_varint(&mut r.bytes, (hi - lo) as u64);
+            put_varint(&mut r.bytes, set as u64);
+            last = id;
+            r.n += 1;
+        }
+        r.bytes.shrink_to_fit();
+        r
+    }
+    /// `(id, hi, set)` in id order.
+    fn iter(&self) -> impl Iterator<Item = (StateId, u16, u32)> + '_ {
+        let (mut pos, mut id) = (0usize, 0u64);
+        (0..self.n).map(move |_| {
+            id += get_varint(&self.bytes, &mut pos);
+            let hi = self.lo + get_varint(&self.bytes, &mut pos) as u16;
+            (id, hi, get_varint(&self.bytes, &mut pos) as u32)
+        })
     }
 }
 
 /// A node with a set at the frame done last: the set, the last frame of its
-/// current span, its layer.
+/// current span, its layer (with `WIN`: a win node).
 #[derive(Clone, Copy, Debug)]
 struct Cur {
     id: StateId,
     set: u32,
     hi: u16,
     layer: u16,
+}
+
+/// `Cur::layer`'s flag of a win node.
+const WIN: u16 = 1 << 15;
+
+impl Cur {
+    fn layer(&self) -> u16 {
+        self.layer & !WIN
+    }
 }
 
 /// An in-edge of a changed node, read at a step: its source and the
@@ -150,9 +240,26 @@ struct Emit {
     layer: u16,
 }
 
-/// A set code during a step's merge: an arena index, or (with this bit) the
-/// index of a set its range made, interned after.
-const NEW_SET: u32 = 1 << 31;
+/// A source's set so far at a step (its set at the next frame united with
+/// the pulls read so far): a set code (`LOCAL`: the step's own) and its
+/// layer.
+#[derive(Clone, Copy, Debug)]
+struct Acc {
+    p: StateId,
+    set: u32,
+    layer: u16,
+}
+
+/// Set codes during a step: below `MADE`, the arena's; with `LOCAL`, the
+/// step's own sets (made this step, not in the arena); with `MADE`, the
+/// sets a range of the current pass made, numbered after it.
+const LOCAL: u32 = 1 << 31;
+const MADE: u32 = 1 << 30;
+
+/// The in-edges a step reads at once: a step whose changed nodes have more
+/// reads them in ROUNDS, each folded into the step's sets so far (24 B an
+/// in-edge: 1.5 GB a round).
+const ROUND_EMITS: usize = 1 << 26;
 
 fn region_hash(r: &Region) -> u64 {
     use std::hash::{Hash, Hasher};
@@ -187,6 +294,19 @@ fn par_chunks<T: Send>(n: usize, chunk: usize, threads: usize, f: impl Fn(usize,
     parts.into_iter().map(|p| p.1).collect()
 }
 
+/// Id ranges `[bounds[k], bounds[k + 1])` cutting `total` ids into about
+/// `parts` pieces of equal weight, from a `sample` of them (one range when
+/// they are few).
+fn id_ranges(mut sample: Vec<StateId>, total: usize, parts: usize) -> Vec<StateId> {
+    sample.sort_unstable();
+    let n = if total < 1 << 16 || sample.is_empty() { 1 } else { parts };
+    let mut bounds: Vec<StateId> = vec![0];
+    bounds.extend((1..n).map(|k| sample[k * sample.len() / n]));
+    bounds.push(StateId::MAX);
+    bounds.dedup();
+    bounds
+}
+
 /// BACKWARD: `W_t` for `t = horizon` down to 0 (`Backward::step`, a frame at
 /// a time), from the win states `wins` (id, layer).
 pub fn backward(store: &EdgeStore, pairs: &[(Transfer, Transfer)], wins: &[(StateId, u32)], horizon: u32, threads: usize) -> Winning {
@@ -204,8 +324,6 @@ pub fn backward(store: &EdgeStore, pairs: &[(Transfer, Transfer)], wins: &[(Stat
 pub struct Backward<'a> {
     store: &'a EdgeStore,
     pairs: &'a [(Transfer, Transfer)],
-    /// The win states, sorted (the fragmentation lines count the others).
-    wins: Vec<StateId>,
     horizon: u32,
     threads: usize,
     /// The ARENA of sets, equal sets once (found by hash; a collision with a
@@ -216,14 +334,19 @@ pub struct Backward<'a> {
     cur: Vec<Cur>,
     /// Their indices whose set changed there (or appeared).
     changed: Vec<u32>,
-    /// Per step, the spans it closed (sorted by id).
-    runs: Vec<Vec<(StateId, Span)>>,
+    /// Per step, the spans it closed.
+    runs: Vec<Run>,
     /// Per target region, the steps that read its in-edges.
     opens: FxHashMap<u32, u32>,
+    /// A round's in-edges (`ROUND_EMITS`) and a read's targets (tests
+    /// shrink both to exercise the rounds).
+    round_emits: usize,
+    chunk: usize,
     read: ReadStats,
     n_changed: u64,
     n_emits: u64,
-    max_emits: usize,
+    max_round: usize,
+    rounds: u64,
     max_cur: usize,
     d_read: std::time::Duration,
     d_pull: std::time::Duration,
@@ -235,19 +358,17 @@ impl<'a> Backward<'a> {
     /// `W_horizon`: the win nodes present by the horizon (each step on
     /// `threads` workers).
     pub fn new(store: &'a EdgeStore, pairs: &'a [(Transfer, Transfer)], wins: &[(StateId, u32)], horizon: u32, threads: usize) -> Self {
-        assert!(horizon < u16::MAX as u32, "a horizon past u16");
+        assert!(horizon < WIN as u32, "a horizon past {WIN}");
         let sets: Vec<Region> = vec![Region::full()];
         let mut interned: FxHashMap<u64, u32> = FxHashMap::default();
         interned.insert(region_hash(&sets[0]), 0);
-        let mut cur: Vec<Cur> = wins.iter().filter(|w| w.1 <= horizon).map(|&(id, layer)| Cur { id, set: 0, hi: horizon as u16, layer: layer as u16 }).collect();
+        let mut cur: Vec<Cur> = wins.iter().filter(|w| w.1 <= horizon).map(|&(id, layer)| Cur { id, set: 0, hi: horizon as u16, layer: layer as u16 | WIN }).collect();
         cur.sort_unstable_by_key(|c| c.id);
         cur.dedup_by_key(|c| c.id);
         let changed: Vec<u32> = (0..cur.len() as u32).collect();
-        let wins = cur.iter().map(|c| c.id).collect();
         Backward {
             store,
             pairs,
-            wins,
             horizon,
             threads: threads.max(1),
             sets,
@@ -257,15 +378,25 @@ impl<'a> Backward<'a> {
             changed,
             runs: Vec::new(),
             opens: FxHashMap::default(),
+            round_emits: ROUND_EMITS,
+            chunk: 1024,
             read: ReadStats::default(),
             n_changed: 0,
             n_emits: 0,
-            max_emits: 0,
+            max_round: 0,
+            rounds: 0,
             d_read: std::time::Duration::ZERO,
             d_pull: std::time::Duration::ZERO,
             d_merge: std::time::Duration::ZERO,
             fragments: Vec::new(),
         }
+    }
+
+    /// Read in rounds of `emits` in-edges, `chunk` targets at a time.
+    #[cfg(test)]
+    fn with_rounds(mut self, emits: usize, chunk: usize) -> Self {
+        (self.round_emits, self.chunk) = (emits, chunk);
+        self
     }
 
     /// The frame done last's nodes with a set, and each one's set.
@@ -278,16 +409,181 @@ impl<'a> Backward<'a> {
         [self.d_read, self.d_pull, self.d_merge]
     }
 
+    /// One ROUND of a step's reads: the in-edges of the changed nodes from
+    /// `changed[start..]` (in id order, a chunk at a time on `threads`
+    /// workers, until the round holds `ROUND_EMITS`), recorded at frames up
+    /// to `t + 1` (their sources have layers <= `t`). Per worker its
+    /// in-edges sorted and distinct; and where the round stopped.
+    fn read_round(&self, t: u32, start: usize) -> (Vec<(Vec<Emit>, ReadStats)>, usize) {
+        use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+        let (cur, changed, store, chunk_len, budget) = (&self.cur, &self.changed, self.store, self.chunk, self.round_emits);
+        let (next, held) = (AtomicUsize::new(start), AtomicUsize::new(0));
+        let parts: Vec<(Vec<Emit>, ReadStats)> = std::thread::scope(|sc| {
+            let hs: Vec<_> = (0..self.threads)
+                .map(|_| {
+                    sc.spawn(|| {
+                        let (mut emits, mut stats) = (Vec::new(), ReadStats::default());
+                        let (mut targets, mut sets): (Vec<StateId>, Vec<u32>) = (Vec::new(), Vec::new());
+                        while held.load(Relaxed) < budget {
+                            let lo = next.fetch_add(chunk_len, Relaxed);
+                            if lo >= changed.len() {
+                                break;
+                            }
+                            let chunk = &changed[lo..(lo + chunk_len).min(changed.len())];
+                            let before = emits.len();
+                            let min_layer = chunk.iter().map(|&c| cur[c as usize].layer() as u32).min().unwrap_or(0);
+                            for f in min_layer.max(1)..=t + 1 {
+                                targets.clear();
+                                sets.clear();
+                                for &c in chunk {
+                                    let n = &cur[c as usize];
+                                    if n.layer() as u32 <= f {
+                                        targets.push(n.id);
+                                        sets.push(n.set);
+                                    }
+                                }
+                                store.preds_sorted(f, &targets, &mut stats, |k, e| emits.push(Emit { p: e.src, set: sets[k], xfer: e.xfer, layer: (f - 1) as u16 }));
+                            }
+                            held.fetch_add(emits.len() - before, Relaxed);
+                        }
+                        emits.sort_unstable();
+                        emits.dedup();
+                        emits.shrink_to_fit();
+                        (emits, stats)
+                    })
+                })
+                .collect();
+            hs.into_iter().map(|h| h.join().expect("a backward reader panicked")).collect()
+        });
+        (parts, next.into_inner().min(changed.len()))
+    }
+
+    /// A set code's set (`local`: the step's own sets).
+    fn set_of<'s>(&'s self, code: u32, local: &'s [Region]) -> &'s Region {
+        if code & LOCAL != 0 {
+            &local[(code & !LOCAL) as usize]
+        } else {
+            &self.sets[code as usize]
+        }
+    }
+
+    /// The arena's code of `r`, if it holds it.
+    fn arena_code(&self, r: &Region, h: u64) -> Option<u32> {
+        self.interned.get(&h).copied().filter(|&s| self.sets[s as usize] == *r)
+    }
+
+    /// Fold one round's in-edges into the step's sets so far (`acc`, by
+    /// id): per source in parallel id ranges, its set so far (or at `t + 1`)
+    /// united with the round's pulls. New sets go into `local`.
+    fn fold_round(&self, acc: Vec<Acc>, parts: &[(Vec<Emit>, ReadStats)], local: &mut Vec<Region>, local_interned: &mut FxHashMap<u64, u32>) -> Vec<Acc> {
+        let n_emits: usize = parts.iter().map(|p| p.0.len()).sum();
+        let bounds = id_ranges(parts.iter().flat_map(|p| p.0.iter().step_by(64).map(|e| e.p)).collect(), n_emits, self.threads * 4);
+        let (cur, pairs, local_ro) = (&self.cur, self.pairs, &*local);
+        let outs: Vec<(Vec<Acc>, Vec<Region>)> = par_chunks(bounds.len() - 1, 1, self.threads, |k, _| {
+            let (lo, hi) = (bounds[k], bounds[k + 1]);
+            let a = &acc[acc.partition_point(|x| x.p < lo)..acc.partition_point(|x| x.p < hi)];
+            let c = &cur[cur.partition_point(|x| x.id < lo)..cur.partition_point(|x| x.id < hi)];
+            let mut es: Vec<Emit> = Vec::new();
+            for p in parts {
+                es.extend_from_slice(&p.0[p.0.partition_point(|e| e.p < lo)..p.0.partition_point(|e| e.p < hi)]);
+            }
+            es.sort_unstable();
+            es.dedup();
+            let (mut out, mut made) = (Vec::with_capacity(a.len() + es.len() / 4), Vec::new());
+            let (mut pieces, mut scratch) = (Vec::new(), Vec::new());
+            let (mut i, mut j, mut ci) = (0usize, 0usize, 0usize);
+            while i < a.len() || j < es.len() {
+                let ia = a.get(i).map_or(StateId::MAX, |x| x.p);
+                let ie = es.get(j).map_or(StateId::MAX, |e| e.p);
+                if ia < ie {
+                    out.push(a[i]);
+                    i += 1;
+                    continue;
+                }
+                let j_end = j + es[j..].partition_point(|e| e.p == ie);
+                let layer = es[j].layer;
+                assert!(es[j..j_end].iter().all(|e| e.layer == layer), "state {} has in-edges recorded at two frames", crate::storage::show_id(ie));
+                // The base: the set so far, else the set at t + 1.
+                let base: Option<u32> = if ia == ie {
+                    i += 1;
+                    assert_eq!(a[i - 1].layer, layer, "state {}: its layer from the edges disagrees", crate::storage::show_id(ie));
+                    Some(a[i - 1].set)
+                } else {
+                    ci += c[ci..].partition_point(|x| x.id < ie);
+                    c.get(ci).filter(|x| x.id == ie).map(|x| {
+                        assert_eq!(x.layer(), layer, "state {}: its layer from the edges disagrees", crate::storage::show_id(ie));
+                        x.set
+                    })
+                };
+                pieces.clear();
+                if let Some(b) = base {
+                    self.set_of(b, local_ro).pieces(&mut pieces);
+                }
+                for e in &es[j..j_end] {
+                    let (x, y) = pairs[e.xfer as usize];
+                    self.sets[e.set as usize].pull(x, y, &mut pieces);
+                }
+                j = j_end;
+                if pieces.is_empty() {
+                    continue;
+                }
+                let r = Region::from_pieces(&mut pieces, &mut scratch);
+                let set = match base {
+                    Some(b) if *self.set_of(b, local_ro) == r => b,
+                    _ => {
+                        let h = region_hash(&r);
+                        match self.arena_code(&r, h).or_else(|| local_interned.get(&h).copied().filter(|&s| local_ro[s as usize] == r).map(|s| s | LOCAL)) {
+                            Some(s) => s,
+                            None => {
+                                made.push(r);
+                                MADE | (made.len() as u32 - 1)
+                            }
+                        }
+                    }
+                };
+                out.push(Acc { p: ie, set, layer });
+            }
+            (out, made)
+        });
+        // The ranges' new sets become the step's own, once each.
+        let mut acc = Vec::with_capacity(outs.iter().map(|o| o.0.len()).sum());
+        for (out, made) in outs {
+            let codes: Vec<u32> = made
+                .into_iter()
+                .map(|r| {
+                    let h = region_hash(&r);
+                    match local_interned.get(&h) {
+                        Some(&s) if local[s as usize] == r => s | LOCAL,
+                        found => {
+                            let s = local.len() as u32;
+                            assert!(s < MADE, "more distinct sets in a step than set codes");
+                            if found.is_none() {
+                                local_interned.insert(h, s);
+                            }
+                            local.push(r);
+                            s | LOCAL
+                        }
+                    }
+                })
+                .collect();
+            acc.extend(out.into_iter().map(|mut x| {
+                if x.set & MADE != 0 && x.set & LOCAL == 0 {
+                    x.set = codes[(x.set & !MADE) as usize];
+                }
+                x
+            }));
+        }
+        acc
+    }
+
     /// `W_t` from `W_{t+1}` (the frame done last; `t` counts down from
     /// `horizon - 1`): the in-edges of the nodes whose set changed at `t + 1`,
-    /// recorded at frames up to `t + 1` (their sources have layers <= `t`),
-    /// read target by target in id order on `threads` workers; then, source
-    /// by source in parallel id ranges, its set at `t + 1` united with the
-    /// pulls; the nodes of layer `t + 1` close their spans.
+    /// read target by target in id order (`read_round`, in rounds), folded
+    /// source by source into their sets at `t + 1` (`fold_round`); then the
+    /// sets that grew replace their spans and the nodes of layer `t + 1`
+    /// close theirs.
     pub fn step(&mut self, t: u32) {
         assert!(t < self.horizon, "a step below the horizon");
-        let (store, pairs, threads) = (self.store, self.pairs, self.threads);
-        let t0 = std::time::Instant::now();
         let mut last_region = u32::MAX;
         for &c in &self.changed {
             let r = id_region(self.cur[c as usize].id);
@@ -296,173 +592,126 @@ impl<'a> Backward<'a> {
                 last_region = r;
             }
         }
-        // READ: per chunk of changed nodes (in id order), frame by frame,
-        // the in-edges of those of them with layer <= the frame.
-        let (cur, changed) = (&self.cur, &self.changed);
-        let parts: Vec<(Vec<Emit>, ReadStats)> = par_chunks(changed.len(), 1024, threads, |lo, hi| {
-            let chunk = &changed[lo..hi];
-            let (mut emits, mut stats) = (Vec::new(), ReadStats::default());
-            let (mut targets, mut sets): (Vec<StateId>, Vec<u32>) = (Vec::with_capacity(chunk.len()), Vec::with_capacity(chunk.len()));
-            let min_layer = chunk.iter().map(|&c| cur[c as usize].layer as u32).min().unwrap_or(0);
-            for f in min_layer.max(1)..=t + 1 {
-                targets.clear();
-                sets.clear();
-                for &c in chunk {
-                    let n = &cur[c as usize];
-                    if n.layer as u32 <= f {
-                        targets.push(n.id);
-                        sets.push(n.set);
-                    }
-                }
-                store.preds_sorted(f, &targets, &mut stats, |k, e| emits.push(Emit { p: e.src, set: sets[k], xfer: e.xfer, layer: (f - 1) as u16 }));
+        let n_read = self.changed.len();
+        self.n_changed += n_read as u64;
+        let (mut acc, mut local, mut local_interned) = (Vec::new(), Vec::new(), FxHashMap::default());
+        let (mut start, mut n_emits, mut rounds) = (0usize, 0usize, 0u32);
+        let (mut d_read, mut d_pull) = (std::time::Duration::ZERO, std::time::Duration::ZERO);
+        while start < self.changed.len() {
+            let t0 = std::time::Instant::now();
+            let (parts, end) = self.read_round(t, start);
+            start = end;
+            let round: usize = parts.iter().map(|p| p.0.len()).sum();
+            for p in &parts {
+                self.read.add(&p.1);
             }
-            emits.sort_unstable();
-            emits.dedup();
-            (emits, stats)
-        });
-        let n_emits: usize = parts.iter().map(|p| p.0.len()).sum();
-        for p in &parts {
-            self.read.add(&p.1);
+            n_emits += round;
+            rounds += 1;
+            self.max_round = self.max_round.max(round);
+            d_read += t0.elapsed();
+            let t0 = std::time::Instant::now();
+            acc = self.fold_round(acc, &parts, &mut local, &mut local_interned);
+            d_pull += t0.elapsed();
         }
         self.n_emits += n_emits as u64;
-        self.max_emits = self.max_emits.max(n_emits);
-        self.n_changed += changed.len() as u64;
-        let n_read = changed.len();
-        let d_read = t0.elapsed();
+        self.rounds += rounds as u64;
         self.d_read += d_read;
-        // PULL, by source id ranges cut at the emissions' quantiles: each
-        // source's set at t + 1 united with its pulls; the untouched carried,
-        // those of layer t + 1 closed.
+        self.d_pull += d_pull;
+        // MERGE: per id range in parallel, the step's sets against those at
+        // t + 1 - a node whose set grew closes its span and opens one, a
+        // node of layer t + 1 closes its span, the others carry on.
         let t0 = std::time::Instant::now();
-        let mut sample: Vec<StateId> = parts.iter().flat_map(|p| p.0.iter().step_by(64).map(|e| e.p)).collect();
-        sample.sort_unstable();
-        let n_ranges = if n_emits < 1 << 16 { 1 } else { threads * 4 };
-        let mut bounds: Vec<StateId> = vec![0];
-        bounds.extend((1..n_ranges).map(|k| sample[k * sample.len() / n_ranges]));
-        bounds.push(StateId::MAX);
-        bounds.dedup();
+        let close_at = t as u16 + 1;
+        let bounds = id_ranges(acc.iter().step_by(64).map(|x| x.p).chain(self.cur.iter().step_by(64).map(|x| x.id)).collect(), acc.len() + self.cur.len(), self.threads * 4);
         struct RangeOut {
             cur: Vec<Cur>,
             changed: Vec<u32>,
-            closed: Vec<(StateId, Span)>,
-            news: Vec<Region>,
+            closed: Vec<(StateId, u16, u32)>,
         }
-        let (sets, interned) = (&self.sets, &self.interned);
-        let close_at = t as u16 + 1;
-        let outs: Vec<RangeOut> = par_chunks(bounds.len() - 1, 1, threads, |k, _| {
+        let (cur, acc_ref, local_ref) = (&self.cur, &acc, &local);
+        let outs: Vec<RangeOut> = par_chunks(bounds.len() - 1, 1, self.threads, |k, _| {
             let (lo, hi) = (bounds[k], bounds[k + 1]);
-            let cur = &cur[cur.partition_point(|c| c.id < lo)..cur.partition_point(|c| c.id < hi)];
-            let mut es: Vec<Emit> = Vec::new();
-            for p in &parts {
-                es.extend_from_slice(&p.0[p.0.partition_point(|e| e.p < lo)..p.0.partition_point(|e| e.p < hi)]);
-            }
-            es.sort_unstable();
-            es.dedup();
-            let mut o = RangeOut { cur: Vec::with_capacity(cur.len()), changed: Vec::new(), closed: Vec::new(), news: Vec::new() };
-            let (mut pieces, mut scratch) = (Vec::new(), Vec::new());
-            let (mut a, mut k) = (0usize, 0usize);
-            while a < cur.len() || k < es.len() {
-                let ia = cur.get(a).map_or(StateId::MAX, |c| c.id);
-                let ik = es.get(k).map_or(StateId::MAX, |e| e.p);
-                if ia < ik {
-                    let c = cur[a];
-                    if c.layer == close_at {
-                        o.closed.push((c.id, Span { lo: close_at, hi: c.hi, set: c.set }));
+            let c = &cur[cur.partition_point(|x| x.id < lo)..cur.partition_point(|x| x.id < hi)];
+            let a = &acc_ref[acc_ref.partition_point(|x| x.p < lo)..acc_ref.partition_point(|x| x.p < hi)];
+            let mut o = RangeOut { cur: Vec::with_capacity(c.len() + a.len() / 8), changed: Vec::new(), closed: Vec::new() };
+            let (mut i, mut j) = (0usize, 0usize);
+            while i < c.len() || j < a.len() {
+                let ic = c.get(i).map_or(StateId::MAX, |x| x.id);
+                let ia = a.get(j).map_or(StateId::MAX, |x| x.p);
+                if ic < ia {
+                    let x = c[i];
+                    if x.layer() == close_at {
+                        o.closed.push((x.id, x.hi, x.set));
                     } else {
-                        o.cur.push(c);
+                        o.cur.push(x);
                     }
-                    a += 1;
+                    i += 1;
                     continue;
                 }
-                let k_end = k + es[k..].partition_point(|e| e.p == ik);
-                let layer = es[k].layer;
-                assert!(es[k..k_end].iter().all(|e| e.layer == layer), "state {} has in-edges recorded at two frames", crate::storage::show_id(ik));
-                let base = (ia == ik).then(|| cur[a]);
-                if let Some(b) = base {
-                    assert_eq!(b.layer, layer, "state {}: its layer from the edges disagrees", crate::storage::show_id(ik));
-                    a += 1;
-                }
-                pieces.clear();
-                if let Some(b) = base {
-                    sets[b.set as usize].pieces(&mut pieces);
-                }
-                for e in &es[k..k_end] {
-                    let (x, y) = pairs[e.xfer as usize];
-                    sets[e.set as usize].pull(x, y, &mut pieces);
-                }
-                k = k_end;
-                if pieces.is_empty() {
-                    continue;
-                }
-                let r = Region::from_pieces(&mut pieces, &mut scratch);
-                if let Some(b) = base {
-                    if sets[b.set as usize] == r {
-                        o.cur.push(b);
+                let n = a[j];
+                j += 1;
+                let mut win = 0;
+                if ic == ia {
+                    let x = c[i];
+                    i += 1;
+                    if n.set == x.set || *self.set_of(n.set, local_ref) == self.sets[x.set as usize] {
+                        o.cur.push(x);
                         continue;
                     }
-                    o.closed.push((b.id, Span { lo: close_at, hi: b.hi, set: b.set }));
+                    o.closed.push((x.id, x.hi, x.set));
+                    win = x.layer & WIN;
                 }
-                let h = region_hash(&r);
-                let set = match interned.get(&h) {
-                    Some(&s) if sets[s as usize] == r => s,
-                    _ => {
-                        o.news.push(r);
-                        NEW_SET | (o.news.len() as u32 - 1)
-                    }
-                };
                 o.changed.push(o.cur.len() as u32);
-                o.cur.push(Cur { id: ik, set, hi: t as u16, layer });
+                o.cur.push(Cur { id: n.p, set: n.set, hi: t as u16, layer: n.layer | win });
             }
             o
         });
-        drop(parts);
-        let d_pull = t0.elapsed();
-        self.d_pull += d_pull;
-        // MERGE, in range order: the new sets interned, the ranges joined.
-        let t0 = std::time::Instant::now();
-        let mut cur = Vec::with_capacity(outs.iter().map(|o| o.cur.len()).sum());
+        drop(acc);
+        // In range order: the step's sets that a node keeps go into the
+        // arena (once each), the ranges are joined.
+        let mut to_arena: Vec<u32> = vec![u32::MAX; local.len()];
+        let mut new_cur = Vec::with_capacity(outs.iter().map(|o| o.cur.len()).sum());
         let mut changed = Vec::new();
-        let mut closed = Vec::with_capacity(outs.iter().map(|o| o.closed.len()).sum());
+        let n_closed: usize = outs.iter().map(|o| o.closed.len()).sum();
+        let mut closed = Vec::with_capacity(n_closed);
         for o in outs {
-            let ids: Vec<u32> = o
-                .news
-                .into_iter()
-                .map(|r| {
-                    let h = region_hash(&r);
-                    match self.interned.get(&h) {
-                        Some(&s) if self.sets[s as usize] == r => s,
-                        found => {
-                            let s = self.sets.len() as u32;
-                            assert!(s < NEW_SET, "more distinct sets than set codes");
-                            let fresh = found.is_none();
-                            self.sets.push(r);
-                            if fresh {
-                                self.interned.insert(h, s);
-                            }
-                            s
-                        }
-                    }
-                })
-                .collect();
-            let base = cur.len() as u32;
+            let base = new_cur.len() as u32;
             changed.extend(o.changed.iter().map(|&k| base + k));
-            cur.extend(o.cur.into_iter().map(|mut c| {
-                if c.set & NEW_SET != 0 {
-                    c.set = ids[(c.set & !NEW_SET) as usize];
+            for mut x in o.cur {
+                if x.set & LOCAL != 0 {
+                    let l = (x.set & !LOCAL) as usize;
+                    if to_arena[l] == u32::MAX {
+                        let r = std::mem::take(&mut local[l]);
+                        let h = region_hash(&r);
+                        to_arena[l] = match self.interned.get(&h) {
+                            Some(&s) if self.sets[s as usize] == r => s,
+                            found => {
+                                let s = self.sets.len() as u32;
+                                assert!(s < MADE, "more distinct sets than set codes");
+                                if found.is_none() {
+                                    self.interned.insert(h, s);
+                                }
+                                self.sets.push(r);
+                                s
+                            }
+                        };
+                    }
+                    x.set = to_arena[l];
                 }
-                c
-            }));
+                new_cur.push(x);
+            }
             closed.extend(o.closed);
         }
-        self.runs.push(closed);
-        self.cur = cur;
+        drop(local);
+        self.runs.push(Run::new(close_at, closed));
+        self.cur = new_cur;
         self.changed = changed;
         self.max_cur = self.max_cur.max(self.cur.len());
         let d_merge = t0.elapsed();
         self.d_merge += d_merge;
         let ms = |d: std::time::Duration| d.as_secs_f64() * 1e3;
         eprintln!(
-            "[arc] f{t:03}: {n_read} changed at f{} -> {n_emits} in-edges; {} nodes with a set, {} changed | read {:.0} pull {:.0} merge {:.0} ms | anon {:.2} GB",
+            "[arc] f{t:03}: {n_read} changed at f{} -> {n_emits} in-edges ({rounds} rounds); {} nodes with a set, {} changed | read {:.0} pull {:.0} merge {:.0} ms | anon {:.2} GB",
             t + 1,
             self.cur.len(),
             self.changed.len(),
@@ -472,28 +721,95 @@ impl<'a> Backward<'a> {
             crate::metrics::current_rss_gb()
         );
         if (self.horizon - 1 - t) % 4 == 0 {
-            let wins = &self.wins;
-            let (k, med, p90, max) = fragmentation(self.cur.iter().filter(|c| wins.binary_search(&c.id).is_err()).map(|c| &self.sets[c.set as usize]));
+            let (k, med, p90, max) = fragmentation(self.cur.iter().filter(|c| c.layer & WIN == 0).map(|c| &self.sets[c.set as usize]));
             self.fragments.push(format!("[arc] W frame {t:3}: {k} non-win nodes can win; rectangles per node med {med} p90 {p90} max {max}"));
         }
     }
 
-    /// The winning sets, once every frame down to 0 is done.
+    /// The winning sets, once every frame down to 0 is done: the runs merged
+    /// node by node (a heap over the runs) into `Winning`'s varints, the
+    /// sets renumbered by use.
     pub fn finish(mut self) -> Winning {
-        let last: Vec<(StateId, Span)> = std::mem::take(&mut self.cur).into_iter().map(|c| (c.id, Span { lo: 0, hi: c.hi, set: c.set })).collect();
+        use std::cmp::Reverse;
         assert_eq!(self.runs.len(), self.horizon as usize, "finish before frame 0");
+        let last = std::mem::take(&mut self.cur);
         let mut runs = std::mem::take(&mut self.runs);
-        runs.push(last);
+        runs.push(Run::new(0, last.into_iter().map(|c| (c.id, c.hi, c.set))));
+        // The sets by use, the most used first (smaller varints).
+        let mut uses = vec![0u64; self.sets.len()];
+        for r in &runs {
+            for (_, _, s) in r.iter() {
+                uses[s as usize] += 1;
+            }
+        }
+        let mut order: Vec<u32> = (0..self.sets.len() as u32).filter(|&s| uses[s as usize] > 0).collect();
+        order.sort_by_key(|&s| (Reverse(uses[s as usize]), s));
+        let mut renumber = vec![u32::MAX; self.sets.len()];
+        for (k, &s) in order.iter().enumerate() {
+            renumber[s as usize] = k as u32;
+        }
+        let mut old = std::mem::take(&mut self.sets);
+        let sets: Vec<Region> = order.iter().map(|&s| std::mem::take(&mut old[s as usize])).collect();
+        drop(old);
+        // The runs merged by (id, frame).
+        let spans: usize = runs.iter().map(|r| r.n).sum();
+        let mut iters: Vec<_> = runs.iter().map(|r| r.iter()).collect();
+        let mut heap: std::collections::BinaryHeap<Reverse<(StateId, u16, u16, u32, usize)>> = std::collections::BinaryHeap::new();
+        for (k, it) in iters.iter_mut().enumerate() {
+            if let Some((id, hi, s)) = it.next() {
+                heap.push(Reverse((id, runs[k].lo, hi, s, k)));
+            }
+        }
+        let mut w = Winning { n: 0, blocks: Vec::new(), data: Vec::new(), sets, spans };
+        let mut node: Vec<(u16, u16, u32)> = Vec::new();
+        let (mut cur_id, mut prev_id) = (None::<StateId>, 0u64);
+        let flush = |w: &mut Winning, id: StateId, node: &mut Vec<(u16, u16, u32)>, prev_id: &mut u64| {
+            if w.n % BLOCK == 0 {
+                w.blocks.push((id, w.data.len() as u64));
+                *prev_id = id;
+            }
+            put_varint(&mut w.data, id - *prev_id);
+            put_varint(&mut w.data, node[0].0 as u64);
+            put_varint(&mut w.data, node.len() as u64);
+            for (k, &(lo, hi, s)) in node.iter().enumerate() {
+                debug_assert!(k == 0 || node[k - 1].1 + 1 == lo, "a node's spans are contiguous");
+                put_varint(&mut w.data, (hi - lo) as u64);
+                put_varint(&mut w.data, renumber[s as usize] as u64);
+            }
+            *prev_id = id;
+            w.n += 1;
+            node.clear();
+        };
+        while let Some(Reverse((id, lo, hi, s, k))) = heap.pop() {
+            if let Some((nid, nhi, ns)) = iters[k].next() {
+                heap.push(Reverse((nid, runs[k].lo, nhi, ns, k)));
+            }
+            if cur_id != Some(id) {
+                if let Some(c) = cur_id {
+                    flush(&mut w, c, &mut node, &mut prev_id);
+                }
+                cur_id = Some(id);
+            }
+            node.push((lo, hi, s));
+        }
+        if let Some(c) = cur_id {
+            flush(&mut w, c, &mut node, &mut prev_id);
+        }
+        drop(iters);
+        drop(runs);
+        w.data.shrink_to_fit();
+        w.blocks.shrink_to_fit();
         let opens: Vec<u32> = self.opens.values().copied().collect();
         let (o_mean, o_max) = (opens.iter().map(|&o| o as f64).sum::<f64>() / opens.len().max(1) as f64, opens.iter().copied().max().unwrap_or(0));
-        let w = Winning::from_runs(runs, std::mem::take(&mut self.sets));
         eprintln!(
-            "[arc] backward: {} sets changed, {} in-edges read ({} emissions, at most {} a frame), {:.2} GB of the edge store read ({} owner entries, {:.2} GB of lids); {} target regions read on {o_mean:.1} steps each (at most {o_max}), {} (region, frame) opens; at most {} nodes a frame; read {:.2} s, pull {:.2} s, merge {:.2} s; {} nodes, {} spans, {} distinct sets, {:.2} GB",
+            "[arc] backward: {} sets changed, {} in-edges read ({} emissions in {} rounds, at most {} a round), {:.2} GB of the edge store's {:.2} GB read ({} owner entries, {:.2} GB of lids); {} target regions read on {o_mean:.1} steps each (at most {o_max}), {} (region, frame) opens; at most {} nodes a frame; read {:.2} s, pull {:.2} s, merge {:.2} s; {} nodes, {} spans, {} distinct sets, {:.2} GB",
             self.n_changed,
             self.read.edges,
             self.n_emits,
-            self.max_emits,
+            self.rounds,
+            self.max_round,
             self.read.bytes() as f64 / 1e9,
+            self.store.bytes as f64 / 1e9,
             self.read.owner_probes,
             self.read.lid_bytes as f64 / 1e9,
             opens.len(),
@@ -503,7 +819,7 @@ impl<'a> Backward<'a> {
             self.d_pull.as_secs_f64(),
             self.d_merge.as_secs_f64(),
             w.len(),
-            w.spans.len(),
+            w.spans,
             w.sets.len(),
             w.bytes() as f64 / 1e9,
         );
@@ -531,9 +847,11 @@ impl OutGraph {
         use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
         let n = w.len();
         let xfers = store.pairs().len();
+        // W's nodes' ids and last frames, flat (12 B a node, while loading).
+        let (ids, last): (Vec<StateId>, Vec<u32>) = w.nodes().map(|x| (x.id, x.last())).unzip();
         // The edges of one unit: `f(src, dst, xfer)` per kept one.
         let each_edge = |frame: u32, u: &crate::storage::edges::UnitView, f: &mut dyn FnMut(u32, u32, u32)| -> anyhow::Result<()> {
-            let src: Vec<Option<u32>> = (0..u.n_sources() as u32).map(|s| u.source(s)).map(|id| w.index(id).filter(|_| wins.binary_search(&id).is_err())).collect();
+            let src: Vec<Option<u32>> = (0..u.n_sources() as u32).map(|s| u.source(s)).map(|id| ids.binary_search(&id).ok().map(|k| k as u32).filter(|_| wins.binary_search(&id).is_err())).collect();
             if src.iter().all(Option::is_none) {
                 return Ok(());
             }
@@ -541,8 +859,8 @@ impl OutGraph {
             let owners: Vec<(usize, usize)> = (0..u.n_lids() as u32)
                 .map(|l| match u.lid_owner(l) {
                     Some((r, e)) => {
-                        let a = w.ids.partition_point(|&id| id < state_id(r, e, 0));
-                        (a, a + w.ids[a..].partition_point(|&id| id_region(id) == r && id_entry(id) == e))
+                        let a = ids.partition_point(|&id| id < state_id(r, e, 0));
+                        (a, a + ids[a..].partition_point(|&id| id_region(id) == r && id_entry(id) == e))
                     }
                     None => (0, 0),
                 })
@@ -558,9 +876,9 @@ impl OutGraph {
                     bad = Some(x);
                     return;
                 }
-                if let Ok(k) = w.ids[a..b].binary_search_by_key(&local, |&id| id_local(id)) {
+                if let Ok(k) = ids[a..b].binary_search_by_key(&local, |&id| id_local(id)) {
                     let m = (a + k) as u32;
-                    if w.last(m) >= frame {
+                    if last[m as usize] >= frame {
                         f(p, m, x);
                     }
                 }
@@ -878,7 +1196,7 @@ impl<'w> NodeKeys<'w> {
         let geo = crate::storage::GEOMETRY;
         let (mut shapes, mut entries) = (Vec::new(), Vec::new());
         let mut last = None;
-        for &id in &w.ids {
+        for id in w.nodes().map(|x| x.id) {
             let (region, entry) = (id_region(id), id_entry(id));
             if last == Some((region, entry)) {
                 continue;
@@ -1367,22 +1685,22 @@ pub fn solve(
     }
     let mut rows: Vec<MarkRow> = Vec::new();
     let mut fp = 0u64;
-    // Per frame, the nodes with a set and the sum of their (node, set) hashes.
-    let mut per_frame = vec![(0usize, 0u64); horizon as usize + 1];
-    for i in 0..w.len() as u32 {
-        let (shape, key, cell) = resolver.resolve(w.id(i))?;
+    // Per frame, the nodes with a set and the sum of their (node, set)
+    // hashes: each span added at its first frame and taken off past its
+    // last (`delta`), then summed frame by frame.
+    let mut delta = vec![(0i64, 0u64); horizon as usize + 2];
+    for x in w.nodes() {
+        let (shape, key, cell) = resolver.resolve(x.id)?;
         // `Visited::fingerprint`: the nodes are distinct states.
         let h = content.state(shape, key, cell);
         fp = fp.wrapping_add(h);
-        for (lo, hi, r) in w.spans_of(i) {
+        for (lo, hi, r) in x.spans() {
             let g = gate_w_hash(h, r);
-            for f in &mut per_frame[lo as usize..=hi as usize] {
-                f.0 += 1;
-                f.1 = f.1.wrapping_add(g);
-            }
+            delta[lo as usize] = (delta[lo as usize].0 + 1, delta[lo as usize].1.wrapping_add(g));
+            delta[hi as usize + 1] = (delta[hi as usize + 1].0 - 1, delta[hi as usize + 1].1.wrapping_sub(g));
         }
         if save.is_some() {
-            rows.push(mark_row(shape, key, cell, w.last(i) as u16, horizon));
+            rows.push(mark_row(shape, key, cell, x.last() as u16, horizon));
         }
     }
     println!("[gate] h{horizon} support {} {fp:016x}", w.len());
@@ -1390,7 +1708,9 @@ pub fn solve(
         std::fs::create_dir_all(out)?;
         save_marks(&out.join("level0.marks.bin"), std::mem::take(&mut rows), horizon, &resolver.space)?;
     }
-    for (t, (n, acc)) in per_frame.into_iter().enumerate() {
+    let (mut n, mut acc) = (0i64, 0u64);
+    for (t, d) in delta[..=horizon as usize].iter().enumerate() {
+        (n, acc) = (n + d.0, acc.wrapping_add(d.1));
         println!("[gate] h{horizon} W f{t:03} {n} {acc:016x}");
     }
     println!("[gate] h{horizon} arc optimum {}", arc_steps.map_or("none".to_string(), |f| f.to_string()));
@@ -1641,7 +1961,14 @@ mod tests {
             let want = definition(&layers, &edges, &wins, horizon);
             let tree = TestTree::new("def", layers.clone(), &edges, wins.clone());
             let (store, pairs, seeds) = tree.open(horizon);
-            let w = backward(&store, &pairs, &seeds, horizon, 2);
+            // Rounds of a few in-edges, a target at a time: the step's
+            // sets folded round by round.
+            let mut b = Backward::new(&store, &pairs, &seeds, horizon, 2).with_rounds(1 + r(4) as usize, 1);
+            for t in (0..horizon).rev() {
+                b.step(t);
+            }
+            let w = b.finish();
+            assert_eq!(w.len(), backward(&store, &pairs, &seeds, horizon, 2).len(), "rounds or not, the same support");
             for i in 0..n {
                 let node = w.index(sid(i));
                 assert_eq!(node.is_some(), (0..=horizon).any(|t| want[t as usize][i as usize].is_some()), "node {i}: in the support iff it has a set");
