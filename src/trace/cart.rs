@@ -77,7 +77,7 @@ pub fn sources_in(root: &std::path::Path, s: &crate::settings::Settings) -> Resu
         None => eprintln!("[start] IL load: no loading frame (no --loading-jank) - not real play where the room's objects move on it"),
     });
     if let Some(j) = s.loading_jank {
-        game = apply_loading_frame(&game, j, root, s.room)?;
+        game = apply_loading_frame(&game, j, root, s)?;
     }
     if s.nodiag {
         game = forbid_diagonal_dashes(&game)?;
@@ -86,7 +86,7 @@ pub fn sources_in(root: &std::path::Path, s: &crate::settings::Settings) -> Resu
         game = forbid_straight_dashes(&game)?;
     }
     if let Some(seeds) = &s.balloon_seeds {
-        game = fix_balloon_seeds(&game, seeds, root, s.room)?;
+        game = fix_balloon_seeds(&game, seeds, root, s)?;
     }
     Ok(format!("{}\n{}\n{}\n", b3, b4, game))
 }
@@ -99,11 +99,12 @@ pub fn sources_in(root: &std::path::Path, s: &crate::settings::Settings) -> Resu
 /// No new global (the name table is frozen): each balloon's seed is inlined,
 /// chosen by its position; creation order is `load_room`'s tile loop
 /// (x outer, y inner).
-fn fix_balloon_seeds(game: &str, seeds: &str, root: &std::path::Path, (rx, ry): (i16, i16)) -> Result<String> {
+fn fix_balloon_seeds(game: &str, seeds: &str, root: &std::path::Path, s: &crate::settings::Settings) -> Result<String> {
+    let (rx, ry) = s.room;
     const PAT: &str = "this.offset=rnd(1)";
     anyhow::ensure!(game.matches(PAT).count() == 1, "--balloon-seeds: the balloon's `{PAT}` was not found exactly once");
-    let seeds: Vec<f64> = seeds.split(',').map(str::trim).filter(|s| !s.is_empty()).map(|s| s.parse::<f64>().with_context(|| format!("--balloon-seeds: {s:?}"))).collect::<Result<_>>()?;
-    let cart = celeste_core::cart_data::CartData::load(root.join("cart"))?;
+    let seeds: Vec<f64> = seeds.split(',').map(str::trim).filter(|v| !v.is_empty()).map(|v| v.parse::<f64>().with_context(|| format!("--balloon-seeds: {v:?}"))).collect::<Result<_>>()?;
+    let cart = s.cart_data_in(root)?;
     // The tool's seed list runs over balloons (tile 22) AND chests (tile 20)
     // in creation order; only the balloons' phases are fixed here (a chest's
     // shake decides only where its berry appears).
@@ -157,8 +158,9 @@ const OBJECT_TILES: &[(u8, bool)] = &[
 /// objects (pico8_diff/chain.py reports it); it is translated to the minimal
 /// cart's list, which lacks `message` and `flag`. Measured against a real
 /// PICO-8 chain field by field (`pico8_diff/chain.py --modes`).
-fn apply_loading_frame(game: &str, j: usize, root: &std::path::Path, (rx, ry): (i16, i16)) -> Result<String> {
-    let cart = celeste_core::cart_data::CartData::load(root.join("cart"))?;
+fn apply_loading_frame(game: &str, j: usize, root: &std::path::Path, s: &crate::settings::Settings) -> Result<String> {
+    let (rx, ry) = s.room;
+    let cart = s.cart_data_in(root)?;
     let first = minimal_index(&cart, (rx, ry), j);
     let call = format!("load_room({}, {})", rx, ry);
     anyhow::ensure!(game.matches(&call).count() == 1, "--loading-jank: the start room's `{call}` was not found exactly once");

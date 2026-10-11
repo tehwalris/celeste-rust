@@ -49,20 +49,23 @@ pub fn ids() -> &'static runtime2::BoundaryIds {
     IDS.get_or_init(boundary_ids)
 }
 
-/// Room `(room_x, room_y)`'s cart and collision cache, loaded once per room
-/// (a cache keyed on the room). Every block carries these two `Arc`s (the
-/// kernels read tiles through them); anything that builds a block outside
-/// an engine attaches the same pair.
-pub fn room_context((room_x, room_y): (i16, i16)) -> Result<(Arc<CartData>, Arc<CollisionCache>)> {
+/// The start room's cart (`--cart`'s map, else cart/) and collision cache
+/// under settings `s`, loaded once per (room, cart) (a cache keyed on both).
+/// Every block carries these two `Arc`s (the kernels read tiles through
+/// them); anything that builds a block outside an engine attaches the same
+/// pair.
+pub fn room_context(s: &crate::settings::Settings) -> Result<(Arc<CartData>, Arc<CollisionCache>)> {
     type Ctx = (Arc<CartData>, Arc<CollisionCache>);
-    static CTX: std::sync::Mutex<Vec<((i16, i16), Ctx)>> = std::sync::Mutex::new(Vec::new());
+    type Key = ((i16, i16), Option<String>);
+    static CTX: std::sync::Mutex<Vec<(Key, Ctx)>> = std::sync::Mutex::new(Vec::new());
+    let key: Key = (s.room, s.cart.as_ref().map(|c| c.sha256.clone()));
     let mut all = CTX.lock().unwrap();
-    if let Some((_, c)) = all.iter().find(|(r, _)| *r == (room_x, room_y)) {
+    if let Some((_, c)) = all.iter().find(|(k, _)| *k == key) {
         return Ok(c.clone());
     }
-    let cart = Arc::new(CartData::load("cart")?);
-    let cache = Arc::new(CollisionCache::new(&cart, room_x, room_y)?);
-    all.push(((room_x, room_y), (cart.clone(), cache.clone())));
+    let cart = Arc::new(s.cart_data()?);
+    let cache = Arc::new(CollisionCache::new(&cart, s.room.0, s.room.1)?);
+    all.push((key, (cart.clone(), cache.clone())));
     Ok((cart, cache))
 }
 
@@ -78,7 +81,7 @@ impl FrameEngine {
     /// The engine for the start room of `settings` (its cart loads here),
     /// its frames at `level`.
     pub fn new(settings: &crate::settings::Settings, level: crate::abstraction::Level) -> Result<Self> {
-        room_context(settings.room)?;
+        room_context(settings)?;
         Ok(FrameEngine { level, settings: Arc::new(settings.clone()), registry: std::sync::OnceLock::new() })
     }
 

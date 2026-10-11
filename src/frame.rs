@@ -232,20 +232,22 @@ pub fn win_rect(s: &crate::settings::Settings) -> Option<(i16, i16, i16, i16)> {
         });
         return s.win_at;
     }
-    summit_flag(s.room)
+    summit_flag(s)
 }
 
-/// The summit's win rectangle around its flag, if `room` is the summit (read
-/// off the cart once per room: a cache keyed on the room).
-fn summit_flag((rx, ry): (i16, i16)) -> Option<(i16, i16, i16, i16)> {
-    type Cache = std::sync::Mutex<std::collections::HashMap<(i16, i16), Option<(i16, i16, i16, i16)>>>;
+/// The summit's win rectangle around its flag, if the start room is the
+/// summit (read off the run's cart once per room and cart: a cache keyed on
+/// both).
+fn summit_flag(s: &crate::settings::Settings) -> Option<(i16, i16, i16, i16)> {
+    type Key = ((i16, i16), Option<String>);
+    type Cache = std::sync::Mutex<std::collections::HashMap<Key, Option<(i16, i16, i16, i16)>>>;
     static RECTS: std::sync::OnceLock<Cache> = std::sync::OnceLock::new();
+    let (rx, ry) = s.room;
     if crate::game_runner::level_index(rx, ry) != SUMMIT_LEVEL {
         return None;
     }
-    *RECTS.get_or_init(Default::default).lock().unwrap().entry((rx, ry)).or_insert_with(|| {
-        let cart = celeste_core::cart_data::CartData::load(std::path::Path::new("cart"))
-            .expect("summit win: load the cart");
+    *RECTS.get_or_init(Default::default).lock().unwrap().entry((s.room, s.cart.as_ref().map(|c| c.sha256.clone()))).or_insert_with(|| {
+        let cart = s.cart_data().expect("summit win: load the cart");
         let flags: Vec<(i16, i16)> = (0..16i16)
             .flat_map(|ty| (0..16i16).map(move |tx| (tx, ty)))
             .filter(|&(tx, ty)| cart.mget_whole(rx * 16 + tx, ry * 16 + ty) == 118)
@@ -835,7 +837,7 @@ fn raise_marker(dir: &std::path::Path) -> std::path::PathBuf {
 
 /// The rows `ids` (sorted) of layer `layer`, as one block per file holding
 /// some, exactly those rows (a raise's sources).
-fn load_sources(dir: &std::path::Path, layer: u32, ids: &[StateId], room: (i16, i16)) -> Result<Vec<Block>> {
+fn load_sources(dir: &std::path::Path, layer: u32, ids: &[StateId], s: &crate::settings::Settings) -> Result<Vec<Block>> {
     let mut out = Vec::new();
     let mut found = 0usize;
     for (seq, file) in frame_files(dir, layer)? {
@@ -852,7 +854,7 @@ fn load_sources(dir: &std::path::Path, layer: u32, ids: &[StateId], room: (i16, 
                 _ => ranges.push(r..r + 1),
             }
         }
-        let rt2 = file.load_rows(&ranges, room)?.expect("rows of a non-empty range");
+        let rt2 = file.load_rows(&ranges, s)?.expect("rows of a non-empty range");
         out.push(Block::with_ids(rt2, rows.iter().map(|&r| file.id_at(r)).collect(), seq));
     }
     anyhow::ensure!(found == ids.len(), "{}: {} of {} sources found in layer {layer}", dir.display(), found, ids.len());
@@ -997,7 +999,7 @@ impl ForwardState {
             Some(f) => f.ceiling(),
             None => s.minus_one().map(|m| m.h),
         };
-        let frontier = expandable(load_frame(dir, last, s.room)?, last, ceiling, s)?;
+        let frontier = expandable(load_frame(dir, last, s)?, last, ceiling, s)?;
         let observer = if record {
             let path = pos_graph_path(dir);
             let graph = crate::search::pos_graph::PosGraph::load(&path)
@@ -1211,7 +1213,7 @@ impl ForwardState {
                 continue;
             }
             let t_frame = std::time::Instant::now();
-            let mut frontier = load_sources(dir, t - 1, &redo, s.room)?;
+            let mut frontier = load_sources(dir, t - 1, &redo, s)?;
             let n_new = new_prev.iter().map(Block::lanes).sum::<usize>();
             frontier.append(&mut new_prev);
             let first_seq = frame_paths(dir, t)?.iter().map(|(s, _)| s + 1).max().unwrap_or(0);
@@ -1574,11 +1576,11 @@ pub fn frame_files(dir: &std::path::Path, frame: u32) -> Result<Vec<(u32, crate:
     frame_paths(dir, frame)?.into_iter().map(|(seq, p)| Ok((seq, crate::search::checkpoint::FrameFile::open(&p)?))).collect()
 }
 
-/// Load every block of a checkpointed frame of a search from `room`.
-pub fn load_frame(dir: &std::path::Path, frame: u32, room: (i16, i16)) -> Result<Vec<Block>> {
+/// Load every block of a checkpointed frame of a search under `s`.
+pub fn load_frame(dir: &std::path::Path, frame: u32, s: &crate::settings::Settings) -> Result<Vec<Block>> {
     let mut out = Vec::new();
     for (seq, file) in frame_files(dir, frame)? {
-        if let Some(rt2) = file.load_all(room)? {
+        if let Some(rt2) = file.load_all(s)? {
             out.push(Block::layer_piece(rt2, file.ids(), seq));
         }
     }
@@ -1587,13 +1589,13 @@ pub fn load_frame(dir: &std::path::Path, frame: u32, room: (i16, i16)) -> Result
 
 /// One stored row by its id: the row, its shape, its cell and its layer
 /// (found by a binary search in each frame's files: a diagnostic's lookup),
-/// in a search from `room`.
-pub fn load_row(dir: &std::path::Path, id: StateId, room: (i16, i16)) -> Result<(Rt2, u64, u32, u32)> {
+/// in a search under `s`.
+pub fn load_row(dir: &std::path::Path, id: StateId, s: &crate::settings::Settings) -> Result<(Rt2, u64, u32, u32)> {
     let mut frame = 0;
     while dir.join("frames").join(format!("f{frame:03}")).is_dir() {
         for (_, f) in frame_files(dir, frame)? {
             if let Some(row) = f.find_row(id) {
-                let rt2 = f.load_rows(&[row..row + 1], room)?.ok_or_else(|| anyhow::anyhow!("no row for id {}", crate::storage::show_id(id)))?;
+                let rt2 = f.load_rows(&[row..row + 1], s)?.ok_or_else(|| anyhow::anyhow!("no row for id {}", crate::storage::show_id(id)))?;
                 return Ok((rt2, f.shape_hash(), f.cell_at(row), frame));
             }
         }
@@ -1864,7 +1866,7 @@ mod tests {
             assert!(crate::search::checkpoint::trim(&p).expect("trim") > 0, "the rows' values are gone");
             let f = crate::search::checkpoint::FrameFile::open(&p).expect("reopen");
             assert_eq!(seen(&f), before);
-            assert!(f.load_all(s.room).is_err(), "a trimmed frame's rows do not load");
+            assert!(f.load_all(&s).is_err(), "a trimmed frame's rows do not load");
             assert_eq!(crate::search::checkpoint::trim(&p).expect("trim again"), 0);
         }
         let _ = std::fs::remove_dir_all(dir);
@@ -1982,7 +1984,7 @@ mod tests {
         st.extend(&e, &b, ends, None).expect("rerun");
         for f in 0..=ends {
             let keys = |d: &std::path::Path| -> Vec<(u64, u64)> {
-                let mut k: Vec<_> = load_frame(d, f, s.room).expect("load").iter().flat_map(|b| b.keys().to_vec()).collect();
+                let mut k: Vec<_> = load_frame(d, f, &s).expect("load").iter().flat_map(|b| b.keys().to_vec()).collect();
                 k.sort_unstable();
                 k
             };
@@ -2005,7 +2007,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
         std::fs::create_dir_all(dir).expect("mkdir");
         let keyset = |frame: u32| -> FxHashSet<(u64, u64)> {
-            load_frame(dir, frame, s.room)
+            load_frame(dir, frame, &s)
                 .expect("load")
                 .iter()
                 .flat_map(|b| b.keys().to_vec())
@@ -2056,7 +2058,7 @@ mod tests {
             assert!(st.visited_len() >= visited_before);
         }
         let keyset_in = |d: &std::path::Path, frame: u32| -> FxHashSet<(u64, u64)> {
-            load_frame(d, frame, s.room).expect("load").iter().flat_map(|b| b.keys().to_vec()).collect()
+            load_frame(d, frame, &s).expect("load").iter().flat_map(|b| b.keys().to_vec()).collect()
         };
         assert_eq!(keyset_in(fresh_dir, 6), keyset_in(dir, 6), "resumed run diverged from fresh at frame 6");
         assert_eq!(keyset_in(fresh_dir, 5), keyset_in(dir, 5), "resumed run diverged from fresh at frame 5");
@@ -2296,7 +2298,7 @@ mod tests {
         let last = unsplit.last().unwrap().0;
         forward_run(&engine, init, dir, 2 * last, false).expect("split forward");
         for (f, want) in unsplit {
-            let got: usize = load_frame(dir, 2 * f, s.room).expect("load").iter().map(Block::lanes).sum();
+            let got: usize = load_frame(dir, 2 * f, &s).expect("load").iter().map(Block::lanes).sum();
             assert_eq!(got, want, "frame {f} (step {}): the split frame reached {got} states, the unsplit {want}", 2 * f);
         }
         let _ = std::fs::remove_dir_all(dir);

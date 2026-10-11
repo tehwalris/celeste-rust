@@ -6,7 +6,6 @@
 use anyhow::{ensure, Result};
 use std::sync::Arc;
 
-use celeste_core::cart_data::CartData;
 use celeste_core::collision_cache::CollisionCache;
 use celeste_engine::runtime2::Rt2;
 use full_moon::ast;
@@ -58,7 +57,7 @@ impl RefEngine {
         let body = leak("__reset_button_states()\n_update()\n_draw()")?;
         let body_concrete = leak("_update()\n_draw()")?;
 
-        let cart = Arc::new(CartData::load("cart")?);
+        let cart = Arc::new(s.cart_data()?);
         let (rx, ry) = s.room;
         let cache = Arc::new(CollisionCache::new(&cart, rx, ry)?);
 
@@ -85,7 +84,7 @@ impl RefEngine {
 
     /// The room's start (post-`_init`) as a one-row block, without keys.
     pub fn initial(&self) -> Result<Rt2> {
-        to_block(&self.base, self.settings.room)
+        to_block(&self.base, &self.settings)
     }
 
     /// One CONCRETE frame of row 0 of `row` under input `byte`: every leaf,
@@ -106,7 +105,7 @@ impl RefEngine {
         self.it.button_reads = Some((buttons, 0));
         let leaves = run_frame_all(&mut self.it, self.body_concrete, &st, &[], Level::EXACT, self.path_cap);
         let (_, mask) = self.it.button_reads.take().expect("set above");
-        let out = leaves?.iter().map(|l| Block::canonical(to_block(l, self.settings.room)?)).collect::<Result<_>>()?;
+        let out = leaves?.iter().map(|l| Block::canonical(to_block(l, &self.settings)?)).collect::<Result<_>>()?;
         Ok((out, mask))
     }
 
@@ -187,7 +186,7 @@ impl RefEngine {
                 }
             }
         }
-        let out = leaves.iter().map(|l| Block::canonical(to_block(l, self.settings.room)?)).collect::<Result<_>>()?;
+        let out = leaves.iter().map(|l| Block::canonical(to_block(l, &self.settings)?)).collect::<Result<_>>()?;
         Ok((out, mask))
     }
 
@@ -204,7 +203,7 @@ impl RefEngine {
     pub fn run_lane(&mut self, block: &Rt2, lane: usize) -> Result<Vec<Block>> {
         let (st, unknown) = from_block(block, lane, &self.fn_info, &self.base)?;
         let leaves = run_frame_all(&mut self.it, self.body, &st, &unknown, self.level, self.path_cap)?;
-        leaves.iter().map(|l| Block::canonical(to_block(l, self.settings.room)?)).collect()
+        leaves.iter().map(|l| Block::canonical(to_block(l, &self.settings)?)).collect()
     }
 }
 
