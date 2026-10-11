@@ -1,11 +1,7 @@
 -- PICO-8's `sin` takes TURNS, not radians, and is INVERTED relative to a
--- normal sine: sin(0.25) = -1.
---
--- Ours (`Pico8Num::pico8_sin`) reduces the argument mod one turn in fixed
--- point and then runs `-sinf(2*pi*turns)` in f32, truncating the result
--- toward zero. That is a MODEL of the console, not a reproduction of it: the
--- console's own sine is a table lookup, so agreement anywhere except the
--- quarter turns has to be measured. This case measures it.
+-- normal sine: sin(0.25) = -1. The console's sine is a table lookup
+-- (cart/pico8_sin_table.bin, from cart/pico8_sin_table.p8): agreement
+-- anywhere but the quarter turns has to be measured.
 
 __hex(sin(0))
 __hex(sin(0.25))

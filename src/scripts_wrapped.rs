@@ -10,7 +10,7 @@ fn scripts(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
         let p = e.expect("entry").path();
         let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
         if p.is_dir() {
-            if !name.starts_with('.') && !["target", "ui", "node_modules", "baseline"].contains(&name) {
+            if !name.starts_with('.') && !["target", "ui", "node_modules"].contains(&name) {
                 scripts(&p, out);
             }
         } else if name.ends_with(".sh") || name.ends_with(".py") {
@@ -34,14 +34,12 @@ fn runs_ours(line: &str, python: bool) -> bool {
         let first = call[j + 2..].split([',', ']']).next().unwrap_or("").trim();
         return ["binary", "concrete", "bin", "rewrite"].contains(&first) || first.contains("target/") || first.contains("cargo");
     }
-    // Shell: the binary variables of check.sh, fixtures.sh and raise.sh, the
-    // lua_run of pico8_diff, a path into target/, cargo - not where assigned
-    // or tested for (`-x`).
+    // Shell: the binary variables of check.sh, fixtures.sh and raise.sh, a
+    // path into target/, cargo - not where assigned or tested for (`-x`).
     let code = t.split(" #").next().unwrap_or(t);
     let invokes = |pat: &str| code.match_indices(pat).any(|(i, _)| !code[..i].ends_with("-x ") && !code[..i].ends_with('='));
     invokes("\"$B\"")
         || invokes("$B ")
-        || invokes("\"$lua_run\"")
         || invokes("\"$BIN\"")
         || ["cargo build", "cargo nextest", "cargo test", "cargo run", "cargo check"].iter().any(|c| code.contains(c))
         || code.split_whitespace().next().is_some_and(|w| w.contains("target/") && !w.contains('='))
@@ -71,12 +69,11 @@ fn every_script_runs_our_binaries_under_safe_run() {
 fn the_scan_sees_an_unwrapped_run() {
     assert!(runs_ours("    \"$B\" ckhash --room 1,0 --to 44", false));
     assert!(runs_ours("        $B ckhash --room \"$ROOM\"", false));
-    assert!(runs_ours("    if ! cargo build --release --bin lua_run >&2; then", false));
-    assert!(runs_ours("    \"$lua_run\" \"$case_file\" >\"$ours\"", false));
+    assert!(runs_ours("    if ! cargo build --profile quick --bins >&2; then", false));
     assert!(runs_ours("            ex = subprocess.run([binary, \"export-ui\"], cwd=M)", true));
     assert!(runs_ours("./target/quick/rewrite ckhash --to 44", false));
     assert!(!runs_ours("B=$T/quick/rewrite", false));
-    assert!(!runs_ours("lua_run=\"$repo_root/target/release/lua_run\"", false));
-    assert!(!runs_ours("if [ ! -x \"$lua_run\" ]; then", false));
+    assert!(!runs_ours("B=\"$repo_root/target/quick/rewrite\"", false));
+    assert!(!runs_ours("if [ ! -x \"$B\" ]; then", false));
     assert!(!runs_ours("    out = subprocess.run(cmd, capture_output=True)", true));
 }

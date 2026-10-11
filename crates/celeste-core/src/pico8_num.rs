@@ -1,5 +1,5 @@
 // PICO-8's 16.16 fixed-point numbers. Every operation here was verified
-// against a real PICO-8 0.2.7a6 (`pico8_diff/`, the tests below): literal
+// against a real PICO-8 0.2.7a6 (`lua/probe/num_*`, the tests below): literal
 // parsing, `+ - * / %`, the range edges (negation wraps, `abs` and `/`
 // saturate) and `sin` (a table dumped from the console).
 
@@ -16,7 +16,7 @@ pub struct Pico8Num(i32);
 
 /// The console's `sin`, tabulated: little-endian `i32` in 16.16, one entry
 /// per distinguishable input of the first half-turn (`pico8_sin`;
-/// `pico8_diff/gen/README.md` for the dump).
+/// `cart/pico8_sin_table.p8` dumps it).
 static SIN_TABLE: [i32; 16384] = {
     let bytes = *include_bytes!("../../../cart/pico8_sin_table.bin");
     let mut table = [0i32; 16384];

@@ -1,4 +1,4 @@
--- The case this whole harness was built for.
+-- `foreach` when the callback changes the table.
 --
 -- Three candidate models of `foreach` have been in this repo or considered
 -- for it:
@@ -11,7 +11,7 @@
 --   (A)  ALL          `for item in all(t) do f(item) end`, where `all` keeps
 --                     an index plus the last item it returned and only
 --                     advances when that slot still holds it. This is what
---                     lua/builtin_level_3.lua implements today.
+--                     lua/builtin_level_3.lua implements.
 --
 -- The six scenarios below are chosen so that (I) and (S) each fail a
 -- DIFFERENT pair, which is why no smaller set pins the semantics down:
@@ -29,89 +29,72 @@
 -- they are here because they are the degenerate shapes where an
 -- index-plus-last-item scheme is easiest to get wrong.
 --
--- Tables are built with `add` rather than `{"a","b"}` because our frontend
--- only compiles table constructors with named fields. `t` is a global
--- because the closures below would otherwise need an upvalue.
+-- Each scenario prints its name, then every element the callback is handed,
+-- then the table's length (no `..`: the tracer has none). `t` is a global.
 
-visited = ""
-
-function visit(x)
-  visited = visited .. x
-end
+visit = printh
 
 -- 1. The callback deletes the element it was just handed. Under an index
 --    walk everything after it shifts down one and "c" is never visited.
+printh("delete_current")
 t = {}
 add(t, "a") add(t, "b") add(t, "c") add(t, "d")
-visited = ""
 foreach(t, function(x)
   visit(x)
   if x == "b" then del(t, x) end
 end)
-__print("delete_current")
-__print(visited)
-__print(#t)
+printh(#t)
 
 -- 2. The callback deletes an element that has not been reached yet. A
 --    snapshot still visits it; PICO-8 does not.
+printh("delete_later")
 t = {}
 add(t, "a") add(t, "b") add(t, "c")
-visited = ""
 foreach(t, function(x)
   visit(x)
   if x == "a" then del(t, "b") end
 end)
-__print("delete_later")
-__print(visited)
-__print(#t)
+printh(#t)
 
 -- 3. The callback appends. A snapshot never sees the new element; PICO-8
 --    visits it.
+printh("append")
 t = {}
 add(t, "a")
-visited = ""
 foreach(t, function(x)
   visit(x)
   if x == "a" then add(t, "z") end
 end)
-__print("append")
-__print(visited)
-__print(#t)
+printh(#t)
 
 -- 4. The callback deletes an element BEFORE the current one, so the current
 --    index now points one past where it should. An index walk drops the
 --    tail element.
+printh("delete_earlier")
 t = {}
 add(t, "a") add(t, "b") add(t, "c")
-visited = ""
 foreach(t, function(x)
   visit(x)
   if x == "b" then del(t, "a") end
 end)
-__print("delete_earlier")
-__print(visited)
-__print(#t)
+printh(#t)
 
 -- 5. Sole element deletes itself: the table goes empty while the iterator
 --    is mid-flight.
+printh("single_self_delete")
 t = {}
 add(t, "a")
-visited = ""
 foreach(t, function(x)
   visit(x)
   del(t, x)
 end)
-__print("single_self_delete")
-__print(visited)
-__print(#t)
+printh(#t)
 
 -- 6. Empty table: the callback must not run at all, and in particular must
 --    not be handed nil.
+printh("empty")
 t = {}
-visited = ""
 foreach(t, function(x)
   visit("SHOULD_NOT_RUN")
 end)
-__print("empty")
-__print(visited)
-__print(#t)
+printh(#t)

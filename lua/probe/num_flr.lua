@@ -1,9 +1,6 @@
 -- `flr` rounds toward NEGATIVE INFINITY, not toward zero: flr(-0.5) is -1.
---
--- Ours is an arithmetic right shift by 16, which is floor by construction.
--- The negative lines are what tells floor apart from truncation, and the
--- `-0.00002` line is the one-ulp case where the two differ on a value the
--- game's subpixel arithmetic actually produces.
+-- The negative lines tell floor from truncation; `-0.00002` is the one-ulp
+-- case where they differ on a value the game's subpixel arithmetic produces.
 
 __hex(flr(0))
 __hex(flr(1))
@@ -18,8 +15,8 @@ __hex(flr(-0.99999))
 __hex(flr(-1.5))
 __hex(flr(-2))
 
--- The bottom of the range, built by arithmetic: the literal `-32768` does
--- not survive our parser (see num_literals.lua) and this case is about flr.
+-- The bottom of the range, built by arithmetic (the literal:
+-- num_literals.lua).
 mn = -32767 - 1
 __hex(flr(32767))
 __hex(flr(mn))

@@ -1,10 +1,6 @@
--- How a decimal literal in the source becomes 16.16 bits.
---
--- Ours goes through `Pico8Num::from_f32` (src/pico8_num.rs), reached from
--- the frontend's `text.parse()?` on the number token. PICO-8 does its own
--- decimal-to-fixed conversion. Both appear to TRUNCATE rather than round
--- (0.1 -> 0x0000.1999, not 0x0000.199a), but "appear to" is exactly the kind
--- of claim this harness exists to replace.
+-- How a decimal literal in the source becomes 16.16 bits: PICO-8 TRUNCATES
+-- rather than rounds (0.1 -> 0x0000.1999, not 0x0000.199a), measured here
+-- rather than assumed.
 
 __hex(0)
 __hex(1)
