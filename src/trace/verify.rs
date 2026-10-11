@@ -233,7 +233,7 @@ pub fn trace_frame<'a>(
         (Some(a), Some(b)) => (a, b),
         _ => bail!("tracing a frame needs the cart and the room's collision cache"),
     };
-    let in_rt2 = super::bind::structure_of(&st, cart.clone(), cache.clone())?;
+    let in_rt2 = super::block::skeleton(&st, cart.clone(), cache.clone())?;
     let in_cells = super::bind::bind_inputs(&in_rt2, &iface)?;
     let mut st = st;
     // The level's widened slots read as the table says (held trails forked
@@ -303,7 +303,7 @@ pub fn trace_frame<'a>(
             .fold(it.d.graph.fold(crate::transpile::graph::Op::Or, vec![global, s.ended]), |e, (_, w)| it.d.graph.fold(crate::transpile::graph::Op::Or, vec![e, *w]));
         // This outcome's engine numbering; fields and dead cells share one
         // cell space.
-        let rt2 = super::bind::structure_of(&s, cart.clone(), cache.clone())?;
+        let rt2 = super::block::skeleton(&s, cart.clone(), cache.clone())?;
         let paths: Vec<Path> =
             fields.iter().map(|(p, _, _)| p.clone()).chain(ubool.iter().cloned()).collect();
         let all = super::bind::resolve_all(&rt2, &paths)?;
@@ -333,10 +333,13 @@ pub fn trace_frame<'a>(
         // Three-valued, like the guards (unknown reads as error).
         three_valued_evaluated(&mut it.d, &outs);
     }
-    // ERROR, DERIVED once the graph is final (`trace::error`).
+    // ERROR, DERIVED once the graph is final (`trace::error`), of everything
+    // an outcome computes: its stored fields, guard and transfer roots (the
+    // remainder before the widening stores no field, and an overflow there
+    // would be a wrong transfer).
     let roots: Vec<Vec<NodeId>> = outs
         .iter()
-        .map(|o| o.fields.iter().map(|(_, n, _)| *n).chain([o.guard, o.error]).collect())
+        .map(|o| o.fields.iter().map(|(_, n, _)| *n).chain([o.guard, o.error]).chain(o.arc.iter().copied()).collect())
         .collect();
     let derived = super::error::for_outcomes(&mut it.d, &roots);
     // A PIN DISCONNECTS its input: nothing the outcomes compute - values,
@@ -1683,7 +1686,7 @@ mod tests {
         for (i, c) in &f.iface.pins {
             let mut cells = f.iface.init.clone();
             cells[*i] = match c {
-                Conc::Num(v) => Conc::Num(*v + crate::pico8_num::Pico8Num::from_parts(1, 0)),
+                Conc::Num(v) => Conc::Num(v.checked_add(crate::pico8_num::Pico8Num::from_parts(1, 0)).expect("a small constant")),
                 Conc::Bool(b) => Conc::Bool(!*b),
             };
             assert!(
@@ -1917,6 +1920,8 @@ end
             Conc::Bool(_) => panic!("{} is a boolean", iface::show(p)),
         };
         let n = crate::pico8_num::Pico8Num::from_i16;
+        // `at + d`, a pixel offset from the state's position.
+        let off = |at: crate::pico8_num::Pico8Num, d: i16| Conc::Num(at.checked_add(n(d)).expect("on screen"));
         // Position x speed: hits walls, floors and the pit (non-trivial shapes).
         let mut perts: Vec<(String, Vec<(Path, Conc)>)> = Vec::new();
         for dx in [-8i16, -1, 0, 1, 8] {
@@ -1926,8 +1931,8 @@ end
                     if dx == 0 { &[None, Some(-2), Some(2), Some(8)] } else { &[None, Some(-2), Some(2)] };
                 for sy in sys.iter().copied() {
                     let mut over = vec![
-                        (px("x"), Conc::Num(at(&px("x")) + n(dx))),
-                        (px("y"), Conc::Num(at(&px("y")) + n(dy))),
+                        (px("x"), off(at(&px("x")), dx)),
+                        (px("y"), off(at(&px("y")), dy)),
                     ];
                     if let Some(v) = sy {
                         over.push((sub("spd", "y"), Conc::Num(n(v))));
@@ -1957,9 +1962,9 @@ end
             ("dash effect", vec![(px("dash_effect_time"), Conc::Num(n(5)))]),
             ("frames", vec![(g("frames"), Conc::Num(n(29)))]),
             // Out of the TOP of the room: `next_room()`, the largest shape.
-            ("top edge", vec![(px("y"), Conc::Num(at(&px("y")) - n(120)))]),
-            ("right edge", vec![(px("x"), Conc::Num(at(&px("x")) + n(124)))]),
-            ("left edge", vec![(px("x"), Conc::Num(at(&px("x")) - n(16)))]),
+            ("top edge", vec![(px("y"), off(at(&px("y")), -120))]),
+            ("right edge", vec![(px("x"), off(at(&px("x")), 124))]),
+            ("left edge", vec![(px("x"), off(at(&px("x")), -16))]),
         ] {
             perts.push((name.to_string(), over));
         }

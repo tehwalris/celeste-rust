@@ -239,7 +239,7 @@ pub struct Closure {
     /// The names this closure CAPTURES: the free variables of its body that
     /// resolve to a local of the defining scope. Names, not values, so the
     /// state stays the single source of what a capture holds. The block
-    /// carries captures as key columns; `refbridge::to_block` must agree.
+    /// carries captures as key columns (`block::to_rt2`).
     pub captures: Vec<String>,
 }
 

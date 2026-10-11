@@ -23,7 +23,7 @@ environment (naming the flag that replaced it). Only `CELESTE_FIXTURES`,
 read by the shell tools, remains. A tree records the settings that change
 it (`<level>/settings.txt`) and refuses a run under other ones
 (`--override-settings` proceeds past a different `--region` only; a tree
-without a record: `rewrite adopt-settings`). Nothing reads a global: the
+without a record is refused). Nothing reads a global: the
 binaries pass the settings (plans/footguns.md, "Follow-ups").
 
 ## The ladder

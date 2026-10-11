@@ -151,7 +151,7 @@ thing that fails.
   `CELESTE_*` variable (naming the flag that replaced it). A tree records
   the settings that change it (`<level dir>/settings.txt`) and refuses a run
   under others; `--override-settings` proceeds only past a different
-  `--region`, loudly. A tree without the record: `rewrite adopt-settings`.
+  `--region`, loudly. A tree without the record is refused (delete it).
 - A search RESUMES from its checkpoint directory: rerun the same command
   after a crash or kill; delete the directory for a fresh run.
 
@@ -213,7 +213,7 @@ tools/celia/validate.sh LEVEL FILE.tas               # Celia headless (CELIA_DAS
 pico8_diff/chain.py CAT LEVEL FILE --boot            # real PICO-8 from 100m with the database's files
 pico8_diff/chain.py CAT LEVEL FILE --modes           # IL / jank / chain entry states diffed field by field
 pico8_diff/chain.py CAT LEVEL x --check-start target/quick/concrete_run   # the search's start vs the boot chain
-pico8_diff/chain.py CAT LEVEL x --feasible target/quick/concrete_run      # every J a previous-room play gives
+target/quick/rewrite starts --room X,Y [category] --balloon-seeds 0   # every J a previous-room play gives, its classes
 ```
 
 The boot chain is the verdict; a passing UCT run is not. Some database files
@@ -245,7 +245,8 @@ the diagnostics, ...) are shared by all three. The most common:
 
 ```bash
 # THE SEARCH: --ceiling H for a known solution (a refutation or no witness is
-# an error), --to H otherwise; the witness goes to DIR/witness_frame_F.txt.
+# an error), --to H otherwise; the witness goes to DIR/witness_frame_F.txt,
+# the outcome (levels, bounds, verdict, witness) to DIR/result.json.
 ./safe-run.sh -- ./target/release/rewrite search --room 1,0 --ceiling 99 --checkpoint-dir DIR
 # An object room, and the objects ladder (plans/results.md, "How to run a room").
 ./safe-run.sh -- ./target/release/rewrite search --room 7,0 --level r0sxhn,r0sxh \

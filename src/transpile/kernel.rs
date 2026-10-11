@@ -48,7 +48,7 @@ pub(crate) struct OutField {
     /// The `AV` this cell holds in every row, when every body of the outcome
     /// writes the same compile-time constant (`lower::lower_outcomes`). Written
     /// once as `Col::U` and skipped by the dedup fold. The boundary must key by
-    /// THIS value: `structure_of`'s rt2 leaves some constant cells `Nil`.
+    /// THIS value: the traced skeleton (`block::skeleton`) leaves every scalar `Nil`.
     pub(crate) konst_av: Option<celeste_engine::runtime2::AV>,
 }
 

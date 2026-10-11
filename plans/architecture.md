@@ -36,9 +36,10 @@ kernels come from the **tracer** via one hand-off.
    position), already widened for the level. Branching, widening and keying happen inside. Two impls: the
    compiled `compiled::FrameEngine` and the reference `trace::refengine`
    (`RefEngine`: the tracer's interpreter over `RefDomain`, one lane and one
-   fork path at a time; `trace::refbridge` turns a block's lane into its
-   state and each leaf back into a one-row block, boxes and all, so its rows
-   key like the kernels'). The loop never touches an interpreter state.
+   fork path at a time; `trace::block` turns a block's lane into its
+   state and each leaf back into a one-row block, boxes and all, by the one
+   converter the tracer's output shapes come from, so its rows key like the
+   kernels'). The loop never touches an interpreter state.
 2. **The block** (`Rt2` in `celeste-engine`, `frame::Block` = an `Rt2` with its
    key column and its rows' ids, `storage::StateId`). Columnar; key and cell
    are exposed, the fields are opaque columns. Serialized whole
@@ -75,7 +76,8 @@ crates/celeste-engine    Rt2 block model, boundary/keys, lane primitives        
   src/trace/             the AST tracer (Lua -> transpile::graph::Graph), the
                          constant-lattice walk (kernel.rs), widen.rs, verify.rs
                          (split pass), error.rs, level_minus_one.rs, the
-                         reference engine (refengine, refdriver, refbridge)
+                         reference engine (refengine, refdriver, refbridge),
+                         block.rs (state <-> block, every domain)
   src/transpile/         graph IR, lowering (lower::specialize_frame), ASM
                          assembler (transpile::asm)
   src/compiled/          FrameEngine, the kernel registry and append step
@@ -162,8 +164,7 @@ OR(error(args))`, materialized once, after fusion:
 | `Sel(c, t, f)` | `not Known(c)` |
 | a fork fragment | `not SplitOk(ways)` / `not SplitOkTab`: the lane spans more parts than enumerated |
 | an unrolled loop | its condition still holds after the bound (`State::ended`) |
-| interval `Add`/`Sub`/`Neg` | `not NoWrap(op)`: an endpoint overflowed 16.16 on this lane (`b47b118`; skipped where the static ranges bound the result) |
-| interval `Mul`/`Div` by a positive literal | `not NoWrap(op)`: an endpoint left 16.16 (`*` wraps, `/` saturates) where `Pico8NumInterval`'s checked operation has none (branch `mul-nowrap`; two compares against `graph::Scaled::fits`; none for a factor at most 1 or a divisor at least 1, so never for `div_pow2`; skipped where the operand's static range fits) |
+| `Add`/`Sub`/`Neg`/`Abs`/`Mul`/`Div`, of POINTS and of intervals | `not NoWrap(op)`: the exact result (an endpoint) left 16.16 on this lane, where the console wraps `+ - *` and negation and saturates `/` and `abs` (intervals: `b47b118`, `mul-nowrap`; points and `abs`: 2026-10-11, branch `overflow-errors`). Skipped where the static ranges bound the exact result (`Symbolic::bounded`, unwrapped and unsaturated). With one operand not a literal point (`graph::one_operand`: `x + k`, `k - x`, `x * k`, `x / k`, `-x`, `abs(x)`) the check is at most two compares of that operand (of an interval's two ends), none where every value fits (`x / 2`, `x * 0.5`: `Graph::fold` decides it) and constant false where none does (`x / 0`); two non-literals' `+`/`-` is the sign test (`vpternlogd` + compare); two non-literals' `*`, and `/` by one, have no check (the codegen refuses them; the cart has none) |
 | a widening | containment of the slot it writes (`widen::SlotErrors`), only where stored |
 | `Restrict(lo, hi)(x)` (a bounded input) | `Lo(x) < lo or Hi(x) > hi` on the raw input, charged to EVERY outcome |
 | `Pin(c)(x)` (a pinned input) | `x` outside `c` on the raw input, an error of the whole frame (`error::pins_hold`) |
@@ -220,7 +221,8 @@ bounds were both seeded (`d.ranges`, and the lowering's `fold_with(..,
 ranges)`) and guarded, and the lowering's fold, seeded with the very range,
 folded the guard to true: a lane with speed or remainder outside was
 computed silently wrong (x/y were held by the dispatch alone). The trees
-audited (`rewrite bounds-audit`) never held such a row. The codegen emits
+audited (`rewrite bounds-audit`, retired 2026-10-11 now that every kernel
+checks per lane) never held such a row. The codegen emits
 `Restrict` as the identity; the error is two compares a bound.
 The platforms (`p`, 2026-10-09) were the last seeded ranges: a platform's
 `x` (the path) and, with a player, its `spd.x` (its range over the worlds)
@@ -255,8 +257,8 @@ metrics included). Charging a pin per outcome as a restriction cost up to
 +0.3% dynamic instructions, so the two kinds keep their charging. The one
 assumption left outside the family: the no-player phase's `spd.x`, read as
 its one moving speed `v` and owed `0 or v` per lane (a two-point set; a pin
-to the hull would admit speeds in between). `rewrite bounds-audit --room`
-audits these.
+to the hull would admit speeds in between). A lane outside is the
+kernel's own error (a fatal coverage gap).
 
 **The map folds by range** (`spikes_at`, 2026-10-10, branch `kernel-opt`).
 `tile_flag_at` is an intrinsic whose interval reading (`Graph::tile_flag_over`)
@@ -312,7 +314,7 @@ platform tension: storing a platform's `x` as its whole path is what lets
 frames merge, and the overlap predicates only fold at ~4.5 px granularity -
 exactly where no cross-frame merge survives; storing zones would cost ~Z
 tuples (one phase drives all ten platforms), the ~18 px middle unmeasured.
-**Interval overflow.** Until 2026-10-03 the assembled interval `+`, `-` and
+**Overflow.** Until 2026-10-03 the assembled interval `+`, `-` and
 negation WRAPPED an overflowing endpoint silently (plain `vpaddd`/`vpsubd`;
 the Rust primitives panicked, and the per-op tests bounded their inputs).
 Fixed on `arc-sets` by `549ecf5` (overflow -> the whole range; with the
@@ -326,13 +328,59 @@ MAX]. (`72fdea7` on branch `asm-interval-wrap` was a rejected first version.)
 Interval `Mul`/`Div` by a positive literal got the same own error on
 2026-10-10 (branch `mul-nowrap`): the operation is monotone, so the check is
 the operand's endpoints against the range whose image fits (bisected on
-`checked_scale_positive` / `checked_div_positive`). The cart's factors
+`checked_mul` / `checked_div`: `Pico8Num::mul_fits`). The cart's factors
 above 1 multiply bounded values (`sin(..)*2`) and its divisors are at least
 1, so no kernel of rooms (1,0), (6,2) 100% or (4,2) emits one (their trees
 and dynamic instruction counts are unchanged). The static range of
 a product is now computed unwrapped (`pieces_of`: past 16.16 it is unknown,
 not PICO-8's wrapped endpoints). Which results ran before the fix:
 plans/results.md.
+**THE RULE: match PICO-8 exactly, or raise** (Philippe, 2026-10-11). For
+overflow, division by zero and every case like them, the interpreter, the
+kernels and the reference engine either compute exactly what PICO-8
+computes or RAISE (the kernels: decline the lane, a fatal coverage gap).
+Raising is always acceptable as long as real runs never hit it; computing
+something else is never acceptable. So a wrap or a saturation is an error,
+and so is `x / 0` (PICO-8 saturates it): no division in the traced cart
+(`lua/celeste-minimal.lua`, the builtins) or the original
+(`celeste_ocaml/celeste.lua`) has a divisor that can be 0 - every one is a
+nonzero literal (8, 30, 40; the original's draw code 1.5, 3, 4, 5, 32, 60,
+64), and `%` by 0 is PICO-8's exact 0. The console's own values where the
+interpreter raises stay pinned by the `lua/probe` `*_overflow` corpora
+(`trace::probe::OVERFLOW`: every case raises; `Pico8Num`'s explicit
+`wrapping_*`/`saturating_*` reproduce their golden PICO-8 output).
+
+**Every overflow is an error** (Philippe's decision, 2026-10-11, branch
+`overflow-errors`): the game never leaves the 16.16 range, so nothing
+wraps or saturates silently, for points as for intervals. `Pico8Num` has
+no `+ - * /` operators: `checked_*` (the exact result or `None`) and the
+console's `wrapping_*`/`saturating_*`, spelled out, for the kernels' lanes
+and the tests. (1) THE KERNELS: a scalar `+ - * /`, negation or `abs` owes
+`NoWrap` as an interval one does (the table above; `kernel::zn_*_wraps`
+the reference masks), so an overflowing lane declines - a fatal coverage
+gap. (2) THE TRACER'S CONSTANT FOLDING: the cart's arithmetic on constants
+goes through `Concrete` (checked: an error naming the operation, its
+operands and the source text, at trace time); `Graph::fold` of literal
+points panics with the operands (it has no error to return; what the cart
+folds never reaches it); the evaluator (`Graph::eval`, the lowering's
+fold, level -1, `Points`) is checked throughout (an overflow is an error,
+TOP where lenient), and a literal past the range (`32768`), a `for`
+counter past it, are errors. (3) ELSEWHERE: the fall floors' collide
+window and the fruit's band (checked), the reference's distance tests
+(`i64`), and the fork grid's arithmetic in `zi_span_ok`/`zi_fork_flr`,
+which wraps only for a lane in its operand's top `ways - 1` floors, where
+`SplitOk(ways)` is false - the fork's own error, charged wherever a fork's
+operand is an interval. The transfer roots are error roots too (the
+remainder before the widening stores no field). The dead timers'
+`minutes + 1` is checked at the stored constant
+(`widen::tests::dead_fields_are_unread`). Cost, measured (t1 metrics,
+2026-10-11): kernel dynamic instructions +1.9% (room (1,0) f55), +3.0%
+((6,2) 100% f50), +2.6% ((4,2) `n` f60); outputs identical, no lane
+declines. The checks the ranges do not fold: `spd +- dash_accel` in
+`appr` (the dash's acceleration is no restricted input: 1.6-2.7%), and
+`dash_effect_time - 1`, `grace - 1`, `dash_time - 1` (0.2-1.2%; the first
+is stored `max(v, 0)`, the others decrement under `> 0`, which no range
+analysis reads); interval `+ k` as compares saved 0.4% in (4,2).
 
 ## The forward frame and the storage (edges target, 2026-10-11)
 
@@ -745,8 +793,10 @@ arc gate's optimum becomes 32.
 J is HISTORY: it depends on how the previous room was played (plans/results.md
 "Real play"). The sound treatment is the set of feasible J's, grouped by the
 start state each gives:
-- `pico8_diff/chain.py` `feasible_janks` / `start_classes` compute the
-  classes, using `concrete_run --dump-start` to compare start states;
+- `rewrite starts` (`src/starts.rs`) computes the feasible J's and the
+  classes, comparing the reference engine's start states exactly (until
+  2026-10-11 `pico8_diff/chain.py`, one `concrete_run --dump-start` text
+  per J; identical classes for levels 2-31);
 - `tools/category_runner.py` `expand` runs one search per class;
 - the boot chain's class carries the witness and the upload.
 

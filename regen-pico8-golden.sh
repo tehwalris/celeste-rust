@@ -15,7 +15,9 @@ tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
 for lua in lua/probe/*.lua; do
     name="$(basename "$lua" .lua)"
+    # `__hex`: the exact print the tracer has natively (src/trace/probe.rs).
     { printf 'pico-8 cartridge // http://www.pico-8.com\nversion 42\n__lua__\n';
+      printf 'function __hex(x) printh(tostr(x, true)) end\n';
       cat "$lua"; } > "$tmp/$name.p8"
     # PICO-8 wants to be run from the cart's directory, and prints a
     # RUNNING: banner that is not part of the program's output.

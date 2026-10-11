@@ -1,0 +1,15 @@
+-- `abs` away from the range boundary (`abs(-32768)`: num_abs_min.lua).
+
+__hex(abs(0))
+__hex(abs(1))
+__hex(abs(-1))
+__hex(abs(0.5))
+__hex(abs(-0.5))
+__hex(abs(0.00002))
+__hex(abs(-0.00002))
+__hex(abs(255.5))
+__hex(abs(-255.5))
+__hex(abs(32767))
+__hex(abs(-32767))
+__hex(abs(1 / 3))
+__hex(abs(-1 / 3))

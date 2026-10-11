@@ -7,8 +7,8 @@
 //!
 //! This crate does not know about the interpreter: it depends only on
 //! `celeste-core` (numbers, cart, collision cache) and `celeste-names`
-//! (`FIELD_NAMES`). Translating reference states into blocks is
-//! `trace::refbridge` in `celeste-rust`.
+//! (`FIELD_NAMES`). Translating interpreter states into blocks is
+//! `trace::block` in `celeste-rust`.
 
 pub mod exact;
 pub mod kernel;

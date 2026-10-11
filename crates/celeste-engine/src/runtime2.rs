@@ -117,9 +117,8 @@ pub struct BoundaryIds {
     pub f_state: u32,
     /// The orb room's big chest (`frame::orb_deadline_skip`).
     pub g_big_chest: u32,
-    /// The moving platforms (diagnostics: `bounds-audit`, a frame test).
+    /// The moving platforms (a frame test).
     pub g_platform: u32,
-    pub f_last: u32,
     /// The balloon's phase and bob (`arc_dp::lookup_view`, a seeded state).
     pub g_balloon: u32,
     pub f_offset: u32,
@@ -411,8 +410,8 @@ impl Rt2 {
 
     /// Renumber every cell into CANONICAL order (BFS discovery from the
     /// globals, children in stored order) and compact, so isomorphic heaps
-    /// are identical and row keys block-independent. Public so producers
-    /// that claim canonical ids (`trace::bind::structure_of`) are checked.
+    /// are identical and row keys block-independent. Public: the heap's
+    /// converter (`trace::block::to_rt2`) ends in it.
     pub fn canonicalize_ids(&mut self) {
         // Fields sorted by name, or creation order changes the shape.
         for cell in self.structure.iter_mut() {

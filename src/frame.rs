@@ -448,6 +448,12 @@ impl MinusOne {
     /// The start room's table at this speed bound, under settings `s`
     /// (`minus_one_table`).
     pub fn table(&self, s: &crate::settings::Settings) -> &'static crate::trace::level_minus_one::CostToGo {
+        minus_one_table(self.speed, s).unwrap_or_else(|e| panic!("building the level -1 table: {e:#}"))
+    }
+
+    /// The same, an error where the table cannot be built (the search
+    /// records the refusal before anything else needs the table).
+    pub fn try_table(&self, s: &crate::settings::Settings) -> Result<&'static crate::trace::level_minus_one::CostToGo> {
         minus_one_table(self.speed, s)
     }
 }
@@ -456,16 +462,16 @@ impl MinusOne {
 /// read from its cache file) once per process and KEY (what the table is a
 /// function of: `Settings::cart_key`, the pinned file, the speed), on a
 /// thread with the tracer's stack. Leaked: a process holds one or two.
-fn minus_one_table(speed: i32, s: &crate::settings::Settings) -> &'static crate::trace::level_minus_one::CostToGo {
+fn minus_one_table(speed: i32, s: &crate::settings::Settings) -> Result<&'static crate::trace::level_minus_one::CostToGo> {
     type Key = (String, Option<std::path::PathBuf>, i32);
     static TABLES: std::sync::Mutex<Vec<(Key, &'static crate::trace::level_minus_one::CostToGo)>> = std::sync::Mutex::new(Vec::new());
     let key: Key = (s.cart_key(), s.l1_table.clone(), speed);
     let mut tables = TABLES.lock().unwrap();
     if let Some((_, t)) = tables.iter().find(|(k, _)| *k == key) {
-        return t;
+        return Ok(t);
     }
     // The table measures the EXIT: unsound for a position win.
-    assert!(win_rect(s).is_none(), "--level-minus-one: the table measures the room exit; this room's win is a position");
+    anyhow::ensure!(win_rect(s).is_none(), "--level-minus-one: the table measures the room exit; this room's win is a position");
     let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
     let t = std::time::Instant::now();
     let owned = s.clone();
@@ -474,12 +480,11 @@ fn minus_one_table(speed: i32, s: &crate::settings::Settings) -> &'static crate:
         .spawn(move || crate::trace::level_minus_one::cost_to_go(std::path::Path::new("."), speed, threads, &owned))
         .expect("spawn the level -1 builder")
         .join()
-        .expect("the level -1 builder panicked")
-        .unwrap_or_else(|e| panic!("building the level -1 table: {e:#}"));
+        .map_err(|p| anyhow::anyhow!("the level -1 builder panicked: {}", p.downcast_ref::<String>().map(String::as_str).or_else(|| p.downcast_ref::<&str>().copied()).unwrap_or("?")))??;
     eprintln!("[level -1] table ready in {:.1} s (S = {speed}): the start state's d = {}", t.elapsed().as_secs_f64(), table.start_d);
     let table: &'static _ = Box::leak(Box::new(table));
     tables.push((key, table));
-    table
+    Ok(table)
 }
 
 /// What a forward's flush filters by.
@@ -1153,7 +1158,7 @@ impl ForwardState {
             let t_pos = t.elapsed();
             // The frame's LAST write: every file above is trusted from here.
             crate::storage::edges::set_done(&edges_dir, frame, self.xfers.pairs.len())?;
-            log_frame(frame, &st, t_ckpt, t_pos, t_frame.elapsed(), self.visited_len());
+            log_frame(dir, frame, &st, t_ckpt, t_pos, t_frame.elapsed(), self.visited_len())?;
             ensure_disk_space(dir, &mut last_free)?;
             self.frames = frame;
             if won && self.win_frame.is_none() {
@@ -1460,15 +1465,17 @@ fn ensure_disk_space(dir: &std::path::Path, last_free: &mut Option<u64>) -> Resu
     Ok(())
 }
 
-/// The per-frame `[fwd]` line (ms) and the `fwd.*` metrics totals.
+/// The per-frame `[fwd]` line (ms), its record in the tree
+/// (`FORWARD_STATS`) and the `fwd.*` metrics totals.
 fn log_frame(
+    dir: &std::path::Path,
     frame: u32,
     st: &FrameStats,
     t_ckpt: std::time::Duration,
     t_pos: std::time::Duration,
     t_total: std::time::Duration,
     visited: usize,
-) {
+) -> Result<()> {
     let ms = |d: std::time::Duration| d.as_secs_f64() * 1e3;
     eprintln!(
         "[fwd] f{frame:03} in {}/{} raw {} kept {} out {}/{} visited {} | \
@@ -1513,6 +1520,68 @@ fn log_frame(
     crate::metrics::record("fwd.checkpoint", t_ckpt);
     crate::metrics::record("fwd.posgraph", t_pos);
     crate::metrics::record("fwd.frame", t_total);
+    append_forward_stats(dir, &forward_stats_row(frame, st, t_ckpt, t_pos, t_total, visited))
+}
+
+/// One frame's row of the tree's forward record (`FORWARD_STATS`): (column,
+/// value), times in ms, memory in GB.
+pub(crate) fn forward_stats_row(
+    frame: u32,
+    st: &FrameStats,
+    t_ckpt: std::time::Duration,
+    t_pos: std::time::Duration,
+    t_total: std::time::Duration,
+    visited: usize,
+) -> Vec<(&'static str, String)> {
+    let ms = |d: std::time::Duration| d.as_secs_f64() * 1e3;
+    vec![
+        ("frame", frame.to_string()),
+        ("blocks_in", st.blocks_in.to_string()),
+        ("lanes_in", st.lanes_in.to_string()),
+        ("lanes_raw", st.lanes_raw.to_string()),
+        ("lanes_kept", st.lanes_kept.to_string()),
+        ("blocks_out", st.blocks_out.to_string()),
+        ("lanes_out", st.lanes_out.to_string()),
+        ("visited", visited.to_string()),
+        ("wave_ms", format!("{:.0}", ms(st.t_wave))),
+        ("wave_idle_pct", format!("{:.0}", st.wave_idle * 100.0)),
+        ("regions_worker_ms", format!("{:.0}", ms(st.t_regions))),
+        ("layer_ms", format!("{:.0}", ms(st.t_layer))),
+        ("ckpt_ms", format!("{:.0}", ms(t_ckpt))),
+        ("pos_ms", format!("{:.0}", ms(t_pos))),
+        ("total_ms", format!("{:.0}", ms(t_total))),
+        ("edges", st.edge_records.to_string()),
+        ("rss_start_gb", format!("{:.2}", st.rss_start)),
+        ("rss_wave_gb", format!("{:.2}", st.rss_wave)),
+        ("rss_end_gb", format!("{:.2}", st.rss_end)),
+        ("rss_file_gb", format!("{:.2}", st.rss_file)),
+        ("peak_gb", format!("{:.2}", crate::metrics::peak_rss_gb())),
+    ]
+}
+
+/// A tree's per-frame forward record (`<dir>/forward.tsv`): a header row
+/// naming the columns, then one row per frame the forward ran, appended as
+/// it runs (a resumed or extended tree appends; a frame rerun after a crash
+/// appears again, and its LAST row is the frame's). `export-ui` reads it.
+pub const FORWARD_STATS: &str = "forward.tsv";
+
+pub(crate) fn append_forward_stats(dir: &std::path::Path, row: &[(&str, String)]) -> Result<()> {
+    use std::io::Write;
+    let path = dir.join(FORWARD_STATS);
+    let header: Vec<&str> = row.iter().map(|(k, _)| *k).collect();
+    let fresh = !path.exists();
+    if !fresh {
+        // A record written with other columns is not appended to silently.
+        let mut have = String::new();
+        std::io::BufRead::read_line(&mut std::io::BufReader::new(std::fs::File::open(&path)?), &mut have)?;
+        anyhow::ensure!(have.trim_end() == header.join("\t"), "{}: its columns ({have:?}) are not this binary's: move it aside", path.display());
+    }
+    let mut f = std::fs::OpenOptions::new().create(true).append(true).open(&path)?;
+    if fresh {
+        writeln!(f, "{}", header.join("\t"))?;
+    }
+    writeln!(f, "{}", row.iter().map(|(_, v)| v.as_str()).collect::<Vec<_>>().join("\t"))?;
+    Ok(())
 }
 
 /// Checkpoint a frontier: `frames/fNNN/s{shape}_{seq}.bin` per piece, rows
@@ -2170,11 +2239,12 @@ mod tests {
         };
         let px = |n: i16| P8::from_i16(n);
         let half = P8::from_parts(0, 0x8000);
+        let past = px(grid.speed as i16).checked_add(half).expect("small");
         assert!(runs(&row), "the lane as played runs");
         assert!(runs(&with(ids.f_spd, ids.f_x, px(grid.speed as i16))), "speed at the bound runs");
-        assert!(runs(&with(ids.f_rem, ids.f_x, half - P8::from_raw(1))), "the remainder at its upper bound runs");
-        assert!(!runs(&with(ids.f_spd, ids.f_x, px(grid.speed as i16) + half)), "speed.x past the bound declines");
-        assert!(!runs(&with(ids.f_spd, ids.f_y, -(px(grid.speed as i16) + half))), "speed.y past the bound declines");
+        assert!(runs(&with(ids.f_rem, ids.f_x, P8::from_raw(0x7fff))), "the remainder at its upper bound runs");
+        assert!(!runs(&with(ids.f_spd, ids.f_x, past)), "speed.x past the bound declines");
+        assert!(!runs(&with(ids.f_spd, ids.f_y, past.wrapping_neg())), "speed.y past the bound declines");
         assert!(!runs(&with(ids.f_rem, ids.f_x, half)), "a remainder of 0.5 declines");
     }
 
@@ -2237,10 +2307,11 @@ mod tests {
         let Col::U(AV::Num(speed)) = row.cols[spd] else { panic!("the platform's spd.x is not a number") };
         assert!(runs(&row), "the lane as played runs");
         assert!(runs(&with(x, path_lo, path_hi)), "x over the whole path runs");
-        assert!(!runs(&with(x, path_lo, path_hi + P8::from_raw(1))), "x past the path declines");
-        assert!(!runs(&with(x, path_lo - px(1), path_hi)), "x before the path declines");
-        assert!(!runs(&with(rem, -half, half)), "a remainder reaching 0.5 declines");
-        assert!(!runs(&with(spd, speed + px(1), speed + px(1))), "spd.x past its worlds' range declines");
+        let add = |a: P8, b: P8| a.checked_add(b).expect("small");
+        assert!(!runs(&with(x, path_lo, add(path_hi, P8::from_raw(1)))), "x past the path declines");
+        assert!(!runs(&with(x, add(path_lo, px(-1)), path_hi)), "x before the path declines");
+        assert!(!runs(&with(rem, half.wrapping_neg(), half)), "a remainder reaching 0.5 declines");
+        assert!(!runs(&with(spd, add(speed, px(1)), add(speed, px(1)))), "spd.x past its worlds' range declines");
     }
 
     /// Room (1,3)'s 127-frame EXIT FRAME: the kernels make the concrete exit's

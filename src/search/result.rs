@@ -1,0 +1,128 @@
+//! `<checkpoint-dir>/result.json`: what `rewrite search` decided, as a
+//! record, so nothing parses its log (the category runner, `export-ui`).
+//! Written at every outcome, before the exit code says it; a run's start
+//! removes the previous run's.
+
+use anyhow::{Context, Result};
+use serde::{Deserialize, Serialize};
+use std::path::{Path, PathBuf};
+
+/// The record's format; a reader refuses another.
+pub const FORMAT: u32 = 1;
+
+/// The file in a search's checkpoint dir.
+pub fn path(checkpoint_dir: &Path) -> PathBuf {
+    checkpoint_dir.join("result.json")
+}
+
+/// How the search ended.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum Verdict {
+    /// A concrete win at the optimum (`optimal`, `witness`).
+    Optimal,
+    /// No win by the horizon at some level's arc phase: the optimum is past
+    /// it. Under `--ceiling` an error (the exit code is non-zero).
+    Refuted,
+    /// The arc bound holds, but the exhaustive concrete search found no win
+    /// by the horizon. Under `--ceiling` an error.
+    NoConcreteWin,
+    /// `--no-witness`: the last level's arc bound only.
+    BoundOnly,
+    /// The level -1 table could not be built (`error`): rerun without
+    /// `--level-minus-one`. The exit code is non-zero.
+    LevelMinusOneRefused,
+}
+
+/// One level of `--level`, in order.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct LevelResult {
+    /// Its spec (`r0sxhn`).
+    pub spec: String,
+    /// Its tree, under the checkpoint dir (`level00`).
+    pub dir: String,
+    /// The forward's wall time in this run (0 for a reused tree), seconds.
+    pub forward_s: f64,
+    /// The tree's first win, in search steps.
+    pub first_win: Option<u32>,
+    /// The arc phase's bound, in frames (`None`: the horizon refuted).
+    pub arc_bound: Option<u32>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct SearchResult {
+    pub format: u32,
+    pub room: (i16, i16),
+    /// `--level`, as given (`r0sxhn,r0sxh`).
+    pub level: String,
+    /// The horizon in frames, and whether it was a `--ceiling`.
+    pub horizon: u32,
+    pub ceiling: bool,
+    /// Search steps per frame (2 under `--split-frame`): the trees, the
+    /// first wins and the marks count steps.
+    pub steps_per_frame: u32,
+    /// The levels the search reached, in order.
+    pub levels: Vec<LevelResult>,
+    pub verdict: Verdict,
+    /// The concrete optimum, frames.
+    pub optimal: Option<u32>,
+    /// Its inputs (`witness_file` holds them too).
+    pub witness: Option<Vec<u8>>,
+    pub witness_file: Option<String>,
+    /// The search's wall time and peak resident set (`VmHWM`, GB).
+    pub wall_s: f64,
+    pub peak_gb: f64,
+    /// Why the search stopped short (the level -1 refusal's error).
+    pub error: Option<String>,
+}
+
+impl SearchResult {
+    /// Atomic: a reader never sees a partial record.
+    pub fn write(&self, checkpoint_dir: &Path) -> Result<()> {
+        let p = path(checkpoint_dir);
+        let tmp = p.with_extension("json.tmp");
+        std::fs::write(&tmp, serde_json::to_string(self)? + "\n").with_context(|| format!("writing {}", tmp.display()))?;
+        std::fs::rename(&tmp, &p).with_context(|| format!("writing {}", p.display()))
+    }
+
+    pub fn read(checkpoint_dir: &Path) -> Result<Self> {
+        let p = path(checkpoint_dir);
+        let text = std::fs::read_to_string(&p).with_context(|| format!("reading {} (a `rewrite search` checkpoint dir records its result there)", p.display()))?;
+        let r: SearchResult = serde_json::from_str(&text).with_context(|| format!("parsing {}", p.display()))?;
+        anyhow::ensure!(r.format == FORMAT, "{}: format {}, this binary reads {FORMAT}", p.display(), r.format);
+        Ok(r)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The record round-trips through its file; the verdicts are snake case
+    /// (the runner reads them by name).
+    #[test]
+    fn a_result_round_trips() {
+        let dir = std::env::temp_dir().join(format!("celeste-result-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let r = SearchResult {
+            format: FORMAT,
+            room: (4, 2),
+            level: "r0sxhn,r0sxh".into(),
+            horizon: 50,
+            ceiling: false,
+            steps_per_frame: 1,
+            levels: vec![LevelResult { spec: "r0sxhn".into(), dir: "level00".into(), forward_s: 1.5, first_win: Some(47), arc_bound: Some(47) }],
+            verdict: Verdict::LevelMinusOneRefused,
+            optimal: None,
+            witness: None,
+            witness_file: None,
+            wall_s: 2.0,
+            peak_gb: 0.5,
+            error: Some("x".into()),
+        };
+        r.write(&dir).unwrap();
+        assert_eq!(SearchResult::read(&dir).unwrap(), r);
+        assert!(std::fs::read_to_string(path(&dir)).unwrap().contains("\"level_minus_one_refused\""));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+}

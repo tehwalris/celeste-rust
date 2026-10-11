@@ -14,7 +14,8 @@ use full_moon::ast;
 use crate::frame::Block;
 use crate::abstraction::Level;
 use crate::trace::interp::Interp;
-use crate::trace::refbridge::{fn_info_of, from_block, set_buttons, to_block, FnInfo};
+use crate::trace::block::{fn_info_of, FnInfo};
+use crate::trace::refbridge::{from_block, set_buttons, to_block};
 use crate::trace::refdomain::RefDomain;
 use crate::trace::refdriver::{fresh_interp, run_frame_all};
 use crate::pico8_num::{Pico8Num as P8, Pico8NumInterval as Iv};
@@ -98,7 +99,7 @@ impl RefEngine {
     /// `step`, and the mask of the buttons it READ (`Interp::button_reads`,
     /// over every fork path). The successors are a function of the row and
     /// of the buttons read alone - the output writes every button `UBool`
-    /// (`refbridge`) - so an input that agrees with `byte` on the mask has
+    /// (`block::to_rt2`) - so an input that agrees with `byte` on the mask has
     /// the same successors.
     fn step_reads(&mut self, row: &Rt2, byte: u8) -> Result<(Vec<Block>, u8)> {
         let (mut st, _) = from_block(row, 0, &self.fn_info, &self.base)?;
@@ -106,7 +107,7 @@ impl RefEngine {
         self.it.button_reads = Some((buttons, 0));
         let leaves = run_frame_all(&mut self.it, self.body_concrete, &st, &[], Level::EXACT, self.path_cap);
         let (_, mask) = self.it.button_reads.take().expect("set above");
-        let out = leaves?.iter().map(|l| Block::canonical(to_block(l, self.settings.room)?)).collect::<Result<_>>()?;
+        let out = leaves.map_err(|e| e.context(ran_from(&st, Some(byte))))?.iter().map(|l| Block::canonical(to_block(l, self.settings.room)?)).collect::<Result<_>>()?;
         Ok((out, mask))
     }
 
@@ -174,14 +175,14 @@ impl RefEngine {
         self.it.button_reads = Some((buttons, 0));
         let leaves = run_frame_all(&mut self.it, self.body_concrete, &st, &unknown, level, self.path_cap);
         let (_, mask) = self.it.button_reads.take().expect("set above");
-        let leaves = leaves?;
+        let leaves = leaves.map_err(|e| e.context(ran_from(&st, Some(byte))))?;
         if pinned_floors {
             // What the floors' pin assumes: no player went far this frame.
             let before = players(&st)?;
             for leaf in &leaves {
                 for (x, y) in players(leaf)? {
                     ensure!(
-                        before.iter().any(|&(bx, by)| (x - bx).abs() <= PLAYER_STEP && (y - by).abs() <= PLAYER_STEP),
+                        before.iter().any(|&(bx, by)| apart_by(x, bx) <= raw(PLAYER_STEP) && apart_by(y, by) <= raw(PLAYER_STEP)),
                         "pinned floors: a player at ({x:?}, {y:?}) is more than {PLAYER_STEP:?} from every player of the input {before:?}"
                     );
                 }
@@ -198,12 +199,18 @@ impl RefEngine {
         Ok(out.remove(0))
     }
 
+    /// The one converter agrees across the two sides on every lane of `row`
+    /// (`block::check_agreement`, from this engine's base state).
+    pub fn check_agreement(&self, row: &Rt2) -> Result<()> {
+        crate::trace::block::check_agreement(row, &self.fn_info, &self.base, self.settings.room)
+    }
+
     /// One frame of lane `lane` at the engine's level (`at_level`): every
     /// fork leaf (the buttons, and each unknown boolean of the row, are
     /// forked per path).
     pub fn run_lane(&mut self, block: &Rt2, lane: usize) -> Result<Vec<Block>> {
         let (st, unknown) = from_block(block, lane, &self.fn_info, &self.base)?;
-        let leaves = run_frame_all(&mut self.it, self.body, &st, &unknown, self.level, self.path_cap)?;
+        let leaves = run_frame_all(&mut self.it, self.body, &st, &unknown, self.level, self.path_cap).map_err(|e| e.context(ran_from(&st, None)))?;
         leaves.iter().map(|l| Block::canonical(to_block(l, self.settings.room)?)).collect()
     }
 }
@@ -254,6 +261,34 @@ const PLAYER_FAR: P8 = P8::from_i16(20);
 /// ... and with no object but floors (and the fly fruit) closer than this
 /// (a spring on it reads its `collideable` and breaks with it).
 const OTHERS_FAR: P8 = P8::from_i16(16);
+
+/// `|a - b|` in raw 16.16, exact (`i64`: two coordinates far apart never
+/// wrap into near ones).
+fn apart_by(a: P8, b: P8) -> i64 {
+    (raw(a) - raw(b)).abs()
+}
+
+fn raw(v: P8) -> i64 {
+    v.as_raw_u32() as i32 as i64
+}
+
+/// What a reference frame ran from, for its error: the input (`None`: the
+/// buttons forked) and where every player and player spawn was.
+fn ran_from(st: &State<RefDomain>, byte: Option<u8>) -> String {
+    let at: Vec<String> = ["player", "player_spawn"]
+        .iter()
+        .flat_map(|ty| objects_of_type(st, ty))
+        .map(|o| {
+            let n = |f: &str| match iface::get(st, &field(&o, &[f])) {
+                Some(Value::Num(v)) => crate::trace::refdomain::show(&v),
+                other => format!("{other:?}"),
+            };
+            format!("{} at ({}, {})", iface::show(&o), n("x"), n("y"))
+        })
+        .collect();
+    let input = byte.map_or("every input".to_string(), |b| format!("input {b:#04x}"));
+    format!("the reference frame under {input} from a state with {}", if at.is_empty() { "no player".to_string() } else { at.join(", ") })
+}
 
 /// The positions of every player and player spawn, concrete.
 fn players(st: &State<RefDomain>) -> Result<Vec<(P8, P8)>> {
@@ -306,7 +341,7 @@ fn pin_isolated_floors(st: &mut State<RefDomain>) -> Result<bool> {
             others.push(position(st, &o)?);
         }
     }
-    let apart = |a: (P8, P8), b: (P8, P8), d: P8| (a.0 - b.0).abs() >= d || (a.1 - b.1).abs() >= d;
+    let apart = |a: (P8, P8), b: (P8, P8), d: P8| apart_by(a.0, b.0) >= raw(d) || apart_by(a.1, b.1) >= raw(d);
     let mut any = false;
     for f in &floors {
         let ps = field(f, &["state"]);
@@ -360,6 +395,63 @@ impl crate::frame::FrameStep for std::sync::Mutex<RefEngine> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// THE ONE CONVERTER AGREES ACROSS THE SIDES over real states: every
+    /// state along room (1,0)'s and room (4,2)'s exits (reference rows), and
+    /// the kernels' successors of every fifth (widened rows: intervals, the
+    /// buttons' and the held trails' unknowns). Each lane, read into the
+    /// tracer's domain and the reference's, converts back to one block with
+    /// one key (`RefEngine::check_agreement`).
+    #[test]
+    fn the_tracer_and_the_reference_convert_every_state_alike() {
+        let level = Level::parse("r0sxh").expect("level");
+        for (room, tas) in [((1, 0), "tas/room_1_0_exit_frame_99.txt"), ((4, 2), "tas/room_4_2_exit_frame_71.txt")] {
+            let s = crate::settings::Settings { room, ..Default::default() };
+            let mut eng = RefEngine::new(&s).expect("ref engine");
+            let kernels = crate::compiled::FrameEngine::new(&s, level).expect("kernels");
+            let mut row = eng.initial().expect("initial state");
+            let (mut states, mut lanes) = (0, 0);
+            for (f, &byte) in crate::concrete::read_inputs(tas).expect("the exit's inputs").iter().enumerate() {
+                eng.check_agreement(&row).unwrap_or_else(|e| panic!("room {room:?} frame {f}: {e:#}"));
+                states += 1;
+                if f % 5 == 2 {
+                    let mut parent = row.clone_block();
+                    crate::frame::widen_rt2_to(&mut parent, level);
+                    let next = crate::storage::wave::one_frame(&kernels, vec![Block::from_rt2(parent)], f as u32 + 1).expect("kernel frame").next;
+                    for b in &next {
+                        eng.check_agreement(b.rt2()).unwrap_or_else(|e| panic!("room {room:?} kernel successors of frame {f}: {e:#}"));
+                        lanes += b.rt2().width;
+                    }
+                }
+                row = eng.step_one(&row, byte).expect("frame").into_rt2();
+            }
+            assert!(states >= 71 && lanes > 100, "room {room:?}: {states} states, {lanes} kernel lanes");
+        }
+    }
+
+    /// A BUILTIN HELD IN SEVERAL SLOTS is a `Bi` cell at each, on both
+    /// sides. The two converters disagreed here: the reference's made the
+    /// first slot in traversal order the builtin's cell and pointed the
+    /// others at it, the tracer's wrote it in place at every slot, so such a
+    /// state keyed differently as a kernel row and as a reference row.
+    #[test]
+    fn a_builtin_in_several_slots_converts_alike_on_both_sides() {
+        use celeste_engine::runtime2::{Cell2, Col, AV};
+        let eng = RefEngine::new(&Default::default()).expect("ref engine");
+        let mut st = eng.base.clone();
+        let g = st.globals;
+        // `abs` also in the global `flr` and in `room.x`.
+        let globals = &mut st.heap.tables.get_mut(&g).expect("globals").hash;
+        globals.insert("flr".to_string(), Value::Builtin("abs"));
+        let Some(Value::Table(room)) = globals.get("room").cloned() else { panic!("no room table") };
+        st.heap.tables.get_mut(&room).expect("room").hash.insert("x".to_string(), Value::Builtin("abs"));
+        let row = to_block(&st, eng.settings.room).expect("block");
+        let abs = crate::builtins::BUILTIN_NAMES.iter().position(|n| *n == "abs").expect("abs") as u32;
+        assert_eq!(row.structure.iter().filter(|c| **c == Cell2::Bi(abs)).count(), 3, "a Bi cell at each of the three slots");
+        let points_at_builtin = |c: &Col| matches!(c, Col::U(AV::Ptr(p)) if matches!(row.structure[*p as usize], Cell2::Bi(_)));
+        assert!(!row.cols.iter().any(points_at_builtin), "no slot points at a builtin's cell");
+        eng.check_agreement(&row).expect("both sides convert it alike");
+    }
 
     /// The concrete search runs one input per class of `frame_reads`
     /// (`arc_dp::Covered`): every input that agrees with a run input on the
