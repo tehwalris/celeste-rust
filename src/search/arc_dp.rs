@@ -803,6 +803,7 @@ impl<'a> Backward<'a> {
         // (No shrink: a Vec's unused capacity is never touched, so never
         // resident; shrinking would copy the arena.)
         let sets = Sets { arena: std::mem::take(&mut self.sets), order };
+        crate::metrics::mem_phase("arc: backward swept");
         // The runs merged by (id, frame).
         let spans: usize = runs.iter().map(|r| r.n).sum();
         let mut iters: Vec<_> = runs.iter().map(|r| r.iter()).collect();
@@ -852,7 +853,7 @@ impl<'a> Backward<'a> {
         let opens: Vec<u32> = self.opens.values().copied().collect();
         let (o_mean, o_max) = (opens.iter().map(|&o| o as f64).sum::<f64>() / opens.len().max(1) as f64, opens.iter().copied().max().unwrap_or(0));
         eprintln!(
-            "[arc] backward: {} sets changed, {} in-edges read ({} emissions in {} rounds, at most {} a round), {:.2} GB of the edge store's {:.2} GB read ({} owner entries, {:.2} GB of lids); {} target regions read on {o_mean:.1} steps each (at most {o_max}), {} (region, frame) opens; at most {} nodes a frame; read {:.2} s, pull {:.2} s, merge {:.2} s; {} nodes, {} spans, {} distinct sets, {:.2} GB",
+            "[arc] backward: {} sets changed, {} in-edges read ({} emissions in {} rounds, at most {} a round), {:.2} GB of the edge store's {:.2} GB read ({} owner entries, {:.2} GB of lids); {} target regions read on {o_mean:.1} steps each (at most {o_max}), {} (region, frame) opens; at most {} nodes a frame; read {:.2} s, pull {:.2} s, merge {:.2} s; {} nodes, {} spans, {} distinct sets: W {:.2} GB (nodes and spans {:.2}, sets {:.2})",
             self.n_changed,
             self.read.edges,
             self.n_emits,
@@ -872,6 +873,8 @@ impl<'a> Backward<'a> {
             w.spans,
             w.sets.len(),
             w.bytes() as f64 / 1e9,
+            (w.data.len() + 16 * w.blocks.len()) as f64 / 1e9,
+            w.sets.bytes() as f64 / 1e9,
         );
         for f in &self.fragments {
             eprintln!("{f}");
