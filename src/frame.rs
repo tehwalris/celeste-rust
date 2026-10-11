@@ -471,8 +471,9 @@ fn minus_one_table(speed: i32, s: &crate::settings::Settings) -> Result<&'static
     if let Some((_, t)) = tables.iter().find(|(k, _)| *k == key) {
         return Ok(t);
     }
-    // The table measures the EXIT: unsound for a position win.
-    anyhow::ensure!(win_rect(s).is_none(), "--level-minus-one: the table measures the room exit; this room's win is a position");
+    // A win rectangle (`win_rect`: `--win-at`, the summit's flag) seeds the
+    // table's backward (`level_minus_one::sound_d`); the cache key has it
+    // (`Settings::cart_key`: the room and `win_at`).
     let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
     let t = std::time::Instant::now();
     let owned = s.clone();
