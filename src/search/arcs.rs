@@ -504,11 +504,6 @@ impl RegionArena {
     pub fn bytes(&self) -> usize {
         self.slabs.capacity() * std::mem::size_of::<Slab>() + self.xs.capacity() * std::mem::size_of::<Seg>() + self.at.capacity() * 8
     }
-    pub fn shrink_to_fit(&mut self) {
-        self.slabs.shrink_to_fit();
-        self.xs.shrink_to_fit();
-        self.at.shrink_to_fit();
-    }
 }
 
 #[cfg(test)]

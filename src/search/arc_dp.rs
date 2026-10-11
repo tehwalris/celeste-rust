@@ -44,8 +44,28 @@ pub struct Winning {
     n: usize,
     blocks: Vec<(StateId, u64)>,
     data: Vec<u8>,
-    sets: RegionArena,
+    sets: Sets,
     spans: usize,
+}
+
+/// W's distinct sets: the backward's arena, numbered by use (`order[k]`:
+/// the arena's index of set `k`, the most used first - smaller varints)
+/// without copying the arena.
+struct Sets {
+    arena: RegionArena,
+    order: Vec<u32>,
+}
+
+impl Sets {
+    fn get(&self, k: u32) -> RegionRef<'_> {
+        self.arena.get(self.order[k as usize])
+    }
+    fn len(&self) -> usize {
+        self.order.len()
+    }
+    fn bytes(&self) -> usize {
+        self.arena.bytes() + 4 * self.order.capacity()
+    }
 }
 
 /// One node of `Winning`: its id, its layer and its spans.
@@ -55,7 +75,7 @@ pub struct Node<'a> {
     pub layer: u32,
     count: u32,
     bytes: &'a [u8],
-    sets: &'a RegionArena,
+    sets: &'a Sets,
 }
 
 impl<'a> Node<'a> {
@@ -383,7 +403,7 @@ impl<'a> Backward<'a> {
             run_bytes: 0,
             opens: FxHashMap::default(),
             round_emits: ROUND_EMITS,
-            chunk: 256,
+            chunk: 1024,
             read: ReadStats::default(),
             n_changed: 0,
             n_emits: 0,
@@ -413,14 +433,35 @@ impl<'a> Backward<'a> {
         [self.d_read, self.d_pull, self.d_merge]
     }
 
-    /// One ROUND of a step's reads: the in-edges of the changed nodes from
-    /// `changed[start..]` (in id order, a chunk at a time on `threads`
-    /// workers, until the round holds `ROUND_EMITS`), recorded at frames up
-    /// to `t + 1` (their sources have layers <= `t`). Per worker its
-    /// in-edges sorted and distinct; and where the round stopped.
-    fn read_round(&self, t: u32, start: usize) -> (Vec<(Vec<Emit>, ReadStats)>, usize) {
+    /// The work of a step's reads: the changed nodes (in id order) cut into
+    /// chunks of `chunk` targets, each chunk read frame by frame from the
+    /// least layer among its targets (at least 1) to `t + 1` - one ITEM a
+    /// (chunk, frame), numbered chunk-major: per chunk its first item and
+    /// first frame.
+    fn read_items(&self, t: u32) -> Vec<(usize, u32)> {
+        let mut items = Vec::with_capacity(self.changed.len().div_ceil(self.chunk) + 1);
+        let mut at = 0usize;
+        for chunk in self.changed.chunks(self.chunk) {
+            let first = chunk.iter().map(|&c| self.cur[c as usize].layer() as u32).min().unwrap_or(0).max(1);
+            items.push((at, first));
+            at += (t + 2).saturating_sub(first) as usize;
+        }
+        items.push((at, 0));
+        items
+    }
+
+    /// One ROUND of a step's reads: from item `start` on (`read_items`), on
+    /// `threads` workers, until the round holds `round_emits` in-edges -
+    /// the in-edges recorded at an item's frame into its chunk's targets of
+    /// layer <= the frame (frames <= t + 1 at step t: their sources have
+    /// layers <= t).
+    /// Per worker its in-edges sorted and distinct; and where the round
+    /// stopped. A round stops between items, so one heavy target bounds it
+    /// by its in-edges at one frame.
+    fn read_round(&self, items: &[(usize, u32)], start: usize) -> (Vec<(Vec<Emit>, ReadStats)>, usize) {
         use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
         let (cur, changed, store, chunk_len, budget) = (&self.cur, &self.changed, self.store, self.chunk, self.round_emits);
+        let total = items.last().map_or(0, |x| x.0);
         let (next, held) = (AtomicUsize::new(start), AtomicUsize::new(0));
         let parts: Vec<(Vec<Emit>, ReadStats)> = std::thread::scope(|sc| {
             let hs: Vec<_> = (0..self.threads)
@@ -429,25 +470,24 @@ impl<'a> Backward<'a> {
                         let (mut emits, mut stats) = (Vec::new(), ReadStats::default());
                         let (mut targets, mut sets): (Vec<StateId>, Vec<u32>) = (Vec::new(), Vec::new());
                         while held.load(Relaxed) < budget {
-                            let lo = next.fetch_add(chunk_len, Relaxed);
-                            if lo >= changed.len() {
+                            let k = next.fetch_add(1, Relaxed);
+                            if k >= total {
                                 break;
                             }
-                            let chunk = &changed[lo..(lo + chunk_len).min(changed.len())];
+                            let c = items.partition_point(|x| x.0 <= k) - 1;
+                            let f = items[c].1 + (k - items[c].0) as u32;
+                            let chunk = &changed[c * chunk_len..((c + 1) * chunk_len).min(changed.len())];
                             let before = emits.len();
-                            let min_layer = chunk.iter().map(|&c| cur[c as usize].layer() as u32).min().unwrap_or(0);
-                            for f in min_layer.max(1)..=t + 1 {
-                                targets.clear();
-                                sets.clear();
-                                for &c in chunk {
-                                    let n = &cur[c as usize];
-                                    if n.layer() as u32 <= f {
-                                        targets.push(n.id);
-                                        sets.push(n.set);
-                                    }
+                            targets.clear();
+                            sets.clear();
+                            for &n in chunk {
+                                let n = &cur[n as usize];
+                                if n.layer() as u32 <= f {
+                                    targets.push(n.id);
+                                    sets.push(n.set);
                                 }
-                                store.preds_sorted(f, &targets, &mut stats, |k, e| emits.push(Emit { p: e.src, set: sets[k], xfer: e.xfer, layer: (f - 1) as u16 }));
                             }
+                            store.preds_sorted(f, &targets, &mut stats, |k, e| emits.push(Emit { p: e.src, set: sets[k], xfer: e.xfer, layer: (f - 1) as u16 }));
                             held.fetch_add(emits.len() - before, Relaxed);
                         }
                         emits.sort_unstable();
@@ -459,7 +499,7 @@ impl<'a> Backward<'a> {
                 .collect();
             hs.into_iter().map(|h| h.join().expect("a backward reader panicked")).collect()
         });
-        (parts, next.into_inner().min(changed.len()))
+        (parts, next.into_inner().min(total))
     }
 
     /// A set code's set (`local`: the step's own sets).
@@ -599,11 +639,13 @@ impl<'a> Backward<'a> {
         let n_read = self.changed.len();
         self.n_changed += n_read as u64;
         let (mut acc, mut local, mut local_interned) = (Vec::new(), Vec::new(), FxHashMap::default());
+        let items = self.read_items(t);
+        let total = items.last().map_or(0, |x| x.0);
         let (mut start, mut n_emits, mut rounds) = (0usize, 0usize, 0u32);
         let (mut d_read, mut d_pull) = (std::time::Duration::ZERO, std::time::Duration::ZERO);
-        while start < self.changed.len() {
+        while start < total {
             let t0 = std::time::Instant::now();
-            let (parts, end) = self.read_round(t, start);
+            let (parts, end) = self.read_round(&items, start);
             start = end;
             let round: usize = parts.iter().map(|p| p.0.len()).sum();
             for p in &parts {
@@ -757,13 +799,10 @@ impl<'a> Backward<'a> {
         for (k, &s) in order.iter().enumerate() {
             renumber[s as usize] = k as u32;
         }
-        let old = std::mem::take(&mut self.sets);
-        let mut sets = RegionArena::default();
-        for &s in &order {
-            sets.push(old.get(s));
-        }
-        sets.shrink_to_fit();
-        drop(old);
+        drop(uses);
+        // (No shrink: a Vec's unused capacity is never touched, so never
+        // resident; shrinking would copy the arena.)
+        let sets = Sets { arena: std::mem::take(&mut self.sets), order };
         // The runs merged by (id, frame).
         let spans: usize = runs.iter().map(|r| r.n).sum();
         let mut iters: Vec<_> = runs.iter().map(|r| r.iter()).collect();
@@ -810,8 +849,6 @@ impl<'a> Backward<'a> {
         }
         drop(iters);
         drop(runs);
-        w.data.shrink_to_fit();
-        w.blocks.shrink_to_fit();
         let opens: Vec<u32> = self.opens.values().copied().collect();
         let (o_mean, o_max) = (opens.iter().map(|&o| o as f64).sum::<f64>() / opens.len().max(1) as f64, opens.iter().copied().max().unwrap_or(0));
         eprintln!(
