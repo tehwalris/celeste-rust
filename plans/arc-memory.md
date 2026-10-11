@@ -1,12 +1,11 @@
 # The arc phase's memory (2026-10-11, branch `arc-memory`)
 
 Philippe: the arc phase (everything after the forward in `rewrite search`)
-"should not be necessary to use much at all". On the map mod's challenge
-room (room (0,0), `r0sxhne`, synthetic win `56..72,104..112`, level -1
-(155,5), `--cart taslevel.p8`; the tree `mid155`: 1.05B states, 39.4B
-edges, 127 GB on disk) it took 62.5 GB at h140 (33 GB anonymous in `reach`
-alone) and was OOM-killed at ~104 GB anonymous at h155, against a forward
-that peaked at 21 GB.
+"should not be necessary to use much at all". On the map mod's room (branch
+`map-mod`; `r0sxhne`, a synthetic win, level -1 at 155; the tree: 1.05B
+states, 39.4B edges, 127 GB on disk) it took 62.5 GB at h140 (33 GB
+anonymous in `reach` alone) and was OOM-killed at ~104 GB anonymous at
+h155, against a forward that peaked at 21 GB.
 
 **Result.** The backward is ONE PUSH over the recorded in-edges, read from
 the edge files: no graph is loaded and no remainder-free marks are made.
@@ -26,7 +25,7 @@ recomputing the predecessors of changed nodes and the nodes whose deadline
 starts; (4) fingerprints, `reach` over the same graph, `NodeKeys`, the
 concrete search.
 
-The mod room at h140 (`/var/tmp/celeste-ui/mid140.log`; 114.7M marked
+The mod room at h140 (its search log; 114.7M marked
 nodes, 29% of 390M states; 2.08G kept edges, 16% of 12.8G; 103.7M spans,
 6.2M distinct sets):
 
