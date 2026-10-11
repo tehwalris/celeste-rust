@@ -455,8 +455,10 @@ the list (coarsest first; one level is the usual case):
    first: a node no winning set reaches is never touched, and W's SUPPORT
    (the nodes with a set at some frame) replaces the remainder-free marks
    in the gate. W is kept as varints - per node its id delta, layer and
-   spans, per span its length and set, ~4 B a node and ~3 a span - over a
-   flat arena of the distinct sets (`RegionArena`). `arc_dp::optimum` reads
+   spans, per span its length and set, ~4 B a node and ~3 a span - in a
+   scratch file beside the tree, mapped back (`<level>/arc-scratch`,
+   unlinked once mapped), over a flat arena of the distinct sets
+   (`RegionArena`, bounds in 16 bits). `arc_dp::optimum` reads
    the optimum off the start's sets. That optimum is exact in the remainder
    and over-approximates the level's other widenings (and `rnd`): a LOWER
    BOUND, and no win REFUTES H. The storage metadata

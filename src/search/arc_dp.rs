@@ -249,10 +249,6 @@ impl Winning {
     pub fn bytes(&self) -> u64 {
         (self.data.len() + 16 * self.blocks.len() + self.sets.bytes()) as u64
     }
-    /// Spans and distinct sets.
-    pub fn sizes(&self) -> (usize, usize) {
-        (self.spans, self.sets.len())
-    }
 }
 
 /// The spans one backward step closed - each node whose set changed or
