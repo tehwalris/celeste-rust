@@ -15,11 +15,13 @@
 //!   * `bench`   - `--emit-capture` and `rewrite bench-storage`
 //!   * `decode`  - rows from (shape skeleton, key, cell): `rewrite decode-check`
 //!   * `census`  - `rewrite storage-census` (plans/storage-unify.md)
+//!   * `bundles` - `rewrite bundle-census` (plans/edge-bundles.md)
 //!
 //! A state is `(shape, key, cell)` (the key holds no position:
 //! `runtime2::pos_code`); its id is `(region, entry, cell in region)`.
 
 pub mod bench;
+pub mod bundles;
 pub mod census;
 pub mod convert;
 pub mod decode;

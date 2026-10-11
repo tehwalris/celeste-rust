@@ -24,7 +24,7 @@ use super::{id_entry, id_local, id_region, state_id, StateId};
 use crate::search::arc_edges::{decode_pair, encode_pair, Pair, PAIR_BYTES};
 
 #[inline]
-fn put_varint(out: &mut Vec<u8>, mut v: u64) {
+pub(super) fn put_varint(out: &mut Vec<u8>, mut v: u64) {
     while v >= 0x80 {
         out.push((v as u8) | 0x80);
         v >>= 7;

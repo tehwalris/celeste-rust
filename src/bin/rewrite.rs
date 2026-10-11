@@ -290,6 +290,39 @@ enum Command {
         #[arg(long, default_value = "")]
         encode: String,
     },
+    /// DIAGNOSTIC: a tree's recorded edges counted as EDGE BUNDLES
+    /// (plans/edge-bundles.md, `storage::bundles`): per unit, one source
+    /// entry's edges to one target at one transfer and one cell offset, with
+    /// a mask of its source cells - by target entry (A) and by target key
+    /// (B); the variants (the transfer out of the key, (source entry,
+    /// offset) as the key, whole entries moving together); the A bundles
+    /// encoded per unit block (varint, fixed width, zstd -1) against the
+    /// built blocks; the reverse walk's index; states and edges in bytes.
+    BundleCensus {
+        /// The level's tree (the dir holding `frames/` and `edges/`; a search's
+        /// `<checkpoint-dir>/levelNN`).
+        #[arg(long)]
+        level_dir: String,
+        /// The first frame whose edges are counted.
+        #[arg(long, default_value_t = 1)]
+        from: u32,
+        /// The last frame whose edges are counted.
+        #[arg(long)]
+        to: u32,
+        /// Only the edges between the remainder-free BFS's marks at this
+        /// horizon (the win rows of the tree's frames as seeds, as
+        /// `arc_dp::load`): the in-RAM graph's edges.
+        #[arg(long)]
+        marked: Option<u32>,
+        /// Time each unit's end both ways (the built counting sort and block
+        /// against bundles), this many reps (0: not timed).
+        #[arg(long, default_value_t = 0)]
+        time_reps: u32,
+        /// With `--marked`: run the backward on the loaded graph and count
+        /// how many distinct winning sets an entry's cells hold per frame.
+        #[arg(long)]
+        w_share: bool,
+    },
     /// BENCH: replay one captured frame through the REAL storage code
     /// (`storage::bench`): a forward or `bench-frame` run with
     /// `--emit-capture DIR` writes each wave's `DIR/f{F}/`; this replays
@@ -1269,6 +1302,17 @@ fn main() -> Result<()> {
         Command::StorageCensus { level_dir, to, encode } => {
             let encode: Vec<u32> = encode.split(',').filter(|s| !s.is_empty()).map(|s| s.parse()).collect::<Result<_, _>>()?;
             celeste_rust::storage::census::census(&celeste_rust::storage::census::CensusArgs { dir: std::path::Path::new(&level_dir), to, encode: &encode, threads: cfg.threads() })?;
+        }
+        Command::BundleCensus { level_dir, from, to, marked, time_reps, w_share } => {
+            celeste_rust::storage::bundles::bundle_census(&celeste_rust::storage::bundles::BundleArgs {
+                dir: std::path::Path::new(&level_dir),
+                from,
+                to,
+                threads: cfg.threads(),
+                marked,
+                time_reps,
+                w_share,
+            })?;
         }
         Command::BenchStorage { capture, tree, level, phase, reps } => {
             cfg.check(std::path::Path::new(&tree), level)?;

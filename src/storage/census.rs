@@ -79,7 +79,7 @@ impl Totals {
     }
 }
 
-fn varint_len(mut v: u64) -> u64 {
+pub(super) fn varint_len(mut v: u64) -> u64 {
     let mut n = 1;
     while v >= 0x80 {
         v >>= 7;
@@ -91,7 +91,7 @@ fn varint_len(mut v: u64) -> u64 {
 /// A sorted index `(Q, e, owner, rank)` delta-coded: a new region its delta
 /// and the entry, a new entry in the region its delta, then the owner (a
 /// unit or a source region) and its rank there, varints.
-fn index_bytes(v: &[(u32, u32, u32, u32)]) -> u64 {
+pub(super) fn index_bytes(v: &[(u32, u32, u32, u32)]) -> u64 {
     let (mut n, mut pq, mut pe) = (0u64, u32::MAX, 0u32);
     let mut last = (u32::MAX, u32::MAX);
     for &(q, e, o, r) in v {

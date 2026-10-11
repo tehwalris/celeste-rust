@@ -380,7 +380,7 @@ impl Claims {
 const LID_BITS: u32 = 20;
 const LOCAL_BITS: u32 = 8;
 const SRC_BITS: u32 = 13;
-const XFER_BITS: u32 = 23;
+pub(super) const XFER_BITS: u32 = 23;
 /// Lanes a unit may span (its sources' indices fit `SRC_BITS`).
 pub const MAX_UNIT_LANES: usize = 1 << SRC_BITS;
 
