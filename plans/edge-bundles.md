@@ -303,3 +303,22 @@ densely at load time, never stored), and a reverse pass for the BFS
 (region-batched over out-edges, 0.044 s a frame at 16 threads, or a
 target-side copy for the backward only). The "edge file v6" above is the
 incremental path to it, not the end state.
+
+## Placement is free in bytes (DESIGNS O3)
+
+The systematic sweep (every order of source key, target key, transfer and
+offset, and mask-first, in both placements) at whole-region blocks: source
+region [M o x s t] 0.063 B an edge with zstd -1, target region [s x o t]
+with masks relative to the source entry's frontier mask (shifted, clipped)
+0.070 - within 1.11x. O2's 3x gap was the order (target-first scatters a
+source entry's equal masks), u64 masks that repeat only up to a shift, and
+blocks cut by a hash of the target key. So the placement follows the
+algorithms, not the bytes: the source side costs the forward nothing to
+ship (its units are source runs) and decodes 4x faster (0.038 against 0.146
+s a frame at 16 threads: no cross-region mask lookups); the target side
+needs every edge shipped to its target region (0.57 s a frame at 16 threads
+for 24-B records - the dedup's own shipping if the forward becomes
+region-batched) and serves the push backward's in-edges of changed targets
+region-locally. Which one is the better end state depends on the backward:
+a push backward streaming from disk wants the target side; a backward that
+loads the graph into RAM (as `arc_dp::load` does) is served by either.
