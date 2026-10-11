@@ -805,7 +805,7 @@ impl<'a> UnitSink<'a> {
             let i = Self::buf_of(&mut self.check, shape, &init);
             push(&mut self.check[i]);
             if self.check[i].rows() >= 256 {
-                crate::compiled::asm_kernel::key_check(&self.check[i], &self.visited.keys, self.prov);
+                crate::compiled::asm_kernel::key_check(&self.check[i], &self.visited.keys, self.prov, self.level);
                 self.check[i].clear();
             }
         }
@@ -901,7 +901,7 @@ impl<'a> UnitSink<'a> {
     /// key decodes to (plans/rows-from-keys.md), not whichever concrete row
     /// of the class came first.
     pub fn row_key(&mut self, row: &Rt2) -> (Rt2, Key) {
-        let level = crate::abstraction::Level { held: self.level.held, ..crate::abstraction::Level::EXACT };
+        let level = crate::abstraction::Level { held: self.level.held, ..self.level.boundary() };
         let mut w = row.clone_block();
         crate::frame::widen_rt2_to(&mut w, level);
         w.canonical();
@@ -960,7 +960,7 @@ impl<'a> UnitSink<'a> {
     pub fn end(&mut self) -> Result<()> {
         let t = crate::frame::phases::start(self.phases);
         for b in &self.check {
-            crate::compiled::asm_kernel::key_check(b, &self.visited.keys, self.prov);
+            crate::compiled::asm_kernel::key_check(b, &self.visited.keys, self.prov, self.level);
         }
         self.check.iter_mut().for_each(RowBuf::clear);
         // The last verdicts; a disallowed target's edges and requests go.

@@ -40,19 +40,34 @@ pub struct Level {
     /// `p`: every moving platform's `x` and `last` the interval of its whole
     /// path, its `rem.x` the whole remainder (its phase forgotten).
     pub platforms: bool,
+    /// `e`: the strawberries EXACT - the "strawberry bob" widening, on at
+    /// every other level, OFF (`Flag::UnlessExactFruit`). A widening
+    /// removed, so nothing new to refute. Needed where a room has several
+    /// strawberries: taking one moves the others in `objects`, so one shape
+    /// holds rows whose fruit `start`s differ, and the bob's band around
+    /// `start` (a constant of the shape) cannot be built (a map mod's room,
+    /// plans/map-mod.md). (Not `b`: that letter was the old floors-unknown
+    /// flag, refused so that a stale spec does not change meaning.)
+    pub exact_fruit: bool,
 }
 
 impl Level {
     /// Every object exact (`r0sx`).
-    pub const EXACT: Level = Level { held: false, fruit: false, floors_near: false, platforms: false };
+    pub const EXACT: Level = Level { held: false, fruit: false, floors_near: false, platforms: false, exact_fruit: false };
 
-    /// A level from `r0sx[h][f][n][p]`: the fixed prefix, then the flags in
-    /// that order (each absent = exact).
+    /// The widenings every row of this level has at the BOUNDARY whatever
+    /// its kernels: the entries of no level flag but `e` (`Rt2::boundary_canonicalize`).
+    pub fn boundary(self) -> Level {
+        Level { exact_fruit: self.exact_fruit, ..Level::EXACT }
+    }
+
+    /// A level from `r0sx[h][f][n][p][e]`: the fixed prefix, then the flags
+    /// in that order (each absent = its default).
     pub fn parse(spec: &str) -> Result<Level, String> {
         let s = spec.trim();
         let mut rest = s
             .strip_prefix("r0sx")
-            .ok_or_else(|| format!("level {spec:?}: expected r0sx[h][f][n][p] (the remainder is the arcs', the speed exact)"))?;
+            .ok_or_else(|| format!("level {spec:?}: expected r0sx[h][f][n][p][e] (the remainder is the arcs', the speed exact)"))?;
         let mut flag = |c: char| -> bool {
             match rest.strip_prefix(c) {
                 Some(t) => {
@@ -62,9 +77,9 @@ impl Level {
                 None => false,
             }
         };
-        let level = Level { held: flag('h'), fruit: flag('f'), floors_near: flag('n'), platforms: flag('p') };
+        let level = Level { held: flag('h'), fruit: flag('f'), floors_near: flag('n'), platforms: flag('p'), exact_fruit: flag('e') };
         if !rest.is_empty() {
-            return Err(format!("level {spec:?}: unexpected {rest:?} (flags are h, f, n, p in that order)"));
+            return Err(format!("level {spec:?}: unexpected {rest:?} (flags are h, f, n, p, e in that order)"));
         }
         Ok(level)
     }
@@ -77,6 +92,7 @@ impl Level {
             Flag::Fruit => self.fruit,
             Flag::Near => self.floors_near,
             Flag::Platforms => self.platforms,
+            Flag::UnlessExactFruit => !self.exact_fruit,
         }
     }
 
@@ -90,7 +106,7 @@ impl std::fmt::Display for Level {
     /// The spec `parse` reads.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "r0sx")?;
-        for (on, c) in [(self.held, 'h'), (self.fruit, 'f'), (self.floors_near, 'n'), (self.platforms, 'p')] {
+        for (on, c) in [(self.held, 'h'), (self.fruit, 'f'), (self.floors_near, 'n'), (self.platforms, 'p'), (self.exact_fruit, 'e')] {
             if on {
                 write!(f, "{c}")?;
             }
@@ -112,6 +128,8 @@ pub enum Flag {
     Near,
     /// `p`.
     Platforms,
+    /// Every level but those with `e` (the strawberries exact).
+    UnlessExactFruit,
 }
 
 /// Where an entry's slots live.
@@ -337,7 +355,7 @@ pub static TABLE: &[Entry] = &[
     },
     Entry {
         name: "strawberry bob",
-        flag: Flag::Always,
+        flag: Flag::UnlessExactFruit,
         target: Target::Objects("fruit"),
         slots: &[
             slot(&["y"], Stored::Band { around: "start", radius: FRUIT_BOB_RAW }, Input::Stored),
@@ -587,6 +605,7 @@ pub fn render_markdown() -> String {
             Flag::Fruit => "`f`",
             Flag::Near => "`n`",
             Flag::Platforms => "`p`",
+            Flag::UnlessExactFruit => "all but `e`",
         };
         let target = match e.target {
             Target::Objects(t) => format!("`{t}`"),
@@ -898,7 +917,7 @@ mod tests {
     #[test]
     fn levels_parse_and_print() {
         assert_eq!(Level::parse("r0sx").unwrap(), Level::EXACT);
-        for spec in ["r0sx", "r0sxh", "r0sxhf", "r0sxhn", "r0sxhnp", "r0sxn", "r0sxf"] {
+        for spec in ["r0sx", "r0sxh", "r0sxhf", "r0sxhn", "r0sxhnp", "r0sxn", "r0sxf", "r0sxhne", "r0sxe"] {
             assert_eq!(Level::parse(spec).unwrap().to_string(), spec);
         }
         let hn = Level::parse("r0sxhn").unwrap();
@@ -910,6 +929,14 @@ mod tests {
         assert!(Level::parse("y2r0sx").is_err());
         assert!(Level::parse("r0sxhb").is_err(), "floors unknown `b` is gone");
         assert!(Level::parse("r0sxph").is_err(), "flags in order");
+        // `e`: the strawberry bob's entry off, nothing else.
+        let e = Level::parse("r0sxhne").unwrap();
+        assert!(e.exact_fruit && e.held && e.floors_near);
+        let on = |l: Level| l.entries().map(|x| x.name).collect::<Vec<_>>();
+        assert!(on(hn).contains(&"strawberry bob") && !on(e).contains(&"strawberry bob"));
+        assert_eq!(on(e).len() + 1, on(hn).len());
+        assert_eq!(e.boundary(), Level::parse("r0sxe").unwrap());
+        assert_eq!(hn.boundary(), Level::EXACT);
     }
 
     /// `floor_player_window` is the cart's `floor.collide(player, 0, 0)` at

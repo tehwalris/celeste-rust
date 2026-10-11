@@ -300,7 +300,7 @@ pub fn bench_storage(a: &BenchArgs) -> Result<()> {
             super::wave::resolve_lids(&visited, &outs, frame, a.settings.threads())?;
             let t_tr = t.elapsed();
             let t = Instant::now();
-            let layer = super::wave::gather_layer(&visited, &outs, &news, frame, 0, a.settings)?;
+            let layer = super::wave::gather_layer(&visited, &outs, &news, frame, 0, a.level, a.settings)?;
             let t_layer = t.elapsed();
             line += &format!(" | translate {:.3} s, new {} | layer {:.3} s, {} pieces", t_tr.as_secs_f64(), news.len(), t_layer.as_secs_f64(), layer.len());
             // The new states' fingerprint, as `ckhash`'s `f` line.

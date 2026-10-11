@@ -538,11 +538,12 @@ impl Rt2 {
     }
 
 
-    /// The BOUNDARY: level-0 widenings, canonical renumbering (the GC) and
-    /// the shape hash, lanes kept.
-    pub fn boundary_canonicalize(&mut self, ids: &BoundaryIds) {
+    /// The BOUNDARY of a row of `level`: the widenings of every row of it
+    /// (`Level::boundary`), canonical renumbering (the GC) and the shape
+    /// hash, lanes kept.
+    pub fn boundary_canonicalize(&mut self, ids: &BoundaryIds, level: crate::widening::Level) {
         self.boundary_prepare();
-        self.boundary_widen(ids);
+        self.widen_to(ids, level.boundary());
         self.boundary_finish();
     }
 
@@ -569,11 +570,6 @@ impl Rt2 {
             }),
             "boundary: a closure capture is not at block width"
         );
-    }
-
-    /// The boundary's widenings: `widen_to` with every level flag off.
-    fn boundary_widen(&mut self, ids: &BoundaryIds) {
-        self.widen_to(ids, crate::widening::Level::EXACT);
     }
 
     /// Shared boundary tail: canonical ids and the shape hash. Row keys are

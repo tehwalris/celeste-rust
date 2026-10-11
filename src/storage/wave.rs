@@ -311,7 +311,7 @@ pub fn run_wave(engine: &dyn FrameStep, frontier: Vec<Block>, cx: WaveCtx) -> Re
         Layer::New => 0,
         Layer::Raised(r) => r.first_seq,
     };
-    let next = gather_layer(visited, &outs, &new_states, frame, first_seq, s)?;
+    let next = gather_layer(visited, &outs, &new_states, frame, first_seq, level, s)?;
     st.lanes_kept = new_states.len();
     if let (Some(dir), Some(path)) = (edges_dir, &index_path) {
         let remaps = xfers.merge(Some(dir), &tables)?;
@@ -552,7 +552,7 @@ pub(crate) fn resolve_lids(visited: &VisitedSet, outs: &[UnitOut], frame: u32, t
 /// The new LAYER: per shape its new states in id order, gathered from the
 /// units' row buffers, cut into pieces (`PIECE_ROWS`) numbered from
 /// `first_seq`, each row with its id. `s`: the threads, `--key-check`.
-pub(crate) fn gather_layer(visited: &VisitedSet, outs: &[UnitOut], news: &[NewState], frame: u32, first_seq: u32, s: &crate::settings::Settings) -> Result<Vec<Block>> {
+pub(crate) fn gather_layer(visited: &VisitedSet, outs: &[UnitOut], news: &[NewState], frame: u32, first_seq: u32, level: crate::abstraction::Level, s: &crate::settings::Settings) -> Result<Vec<Block>> {
     let geo = visited.geo;
     // Per shape (ids sort by shape first) its range of `news`.
     let mut shapes: Vec<(usize, usize)> = Vec::new();
@@ -596,7 +596,7 @@ pub(crate) fn gather_layer(visited: &VisitedSet, outs: &[UnitOut], news: &[NewSt
         };
         let ids: Vec<StateId> = part.iter().map(|n| n.0).collect();
         if s.diag.key_check {
-            crate::compiled::asm_kernel::key_check_block(&rt2, &visited.keys);
+            crate::compiled::asm_kernel::key_check_block(&rt2, &visited.keys, level);
         }
         let b = Block::layer_piece(rt2, ids, seq);
         if s.diag.key_check {
@@ -740,7 +740,7 @@ pub fn seed(visited: &mut VisitedSet, blocks: &mut [Block], level: crate::abstra
     // A row is keyed as the forward keys a reference row (`UnitSink::row_key`:
     // the level's held buttons widened) and stored as it is.
     let ids = crate::compiled::ids();
-    let level = crate::abstraction::Level { held: level.held, ..crate::abstraction::Level::EXACT };
+    let level = crate::abstraction::Level { held: level.held, ..level.boundary() };
     let mut canon: Vec<Rt2> = Vec::with_capacity(blocks.len());
     let mut views: Vec<Rt2> = Vec::with_capacity(blocks.len());
     for b in blocks.iter() {
