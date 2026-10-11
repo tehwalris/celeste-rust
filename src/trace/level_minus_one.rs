@@ -911,17 +911,19 @@ struct Built {
 }
 
 /// A LOWER BOUND on the frames from each node to an exit: a backward
-/// shortest path seeded at exits (1) and deaths (1 + `chain_frames` + d of
-/// the chain's end, iterated to a fixpoint). A CLIPPED successor is not a
+/// shortest path seeded at exits (1), at the WIN RECTANGLE's nodes (0: a
+/// synthetic win or the summit's flag, `frame::win_rect`; the forward wins
+/// a row whose player is inside it) and at deaths (1 + `chain_frames` + d
+/// of the chain's end, iterated to a fixpoint). A CLIPPED successor is not a
 /// seed (no real player is outside `WINDOW`), which `too_late` checks per row.
-fn sound_d(g: &Graph1, rev: &[Vec<u32>], chain_frames: u32, end_node: u32) -> Vec<u32> {
+fn sound_d(g: &Graph1, rev: &[Vec<u32>], chain_frames: u32, end_node: u32, win: Option<(i16, i16, i16, i16)>) -> Vec<u32> {
     use std::cmp::Reverse;
     let n = g.nodes.len();
     let run = |death: Option<u32>| -> Vec<u32> {
         let mut dist = vec![u32::MAX; n];
         let mut heap = std::collections::BinaryHeap::new();
         for i in 0..n {
-            let mut s = if g.exits[i] { 1 } else { u32::MAX };
+            let mut s = if in_win(win, g.nodes[i]) { 0 } else if g.exits[i] { 1 } else { u32::MAX };
             if let (true, Some(w)) = (g.deaths[i], death) {
                 s = s.min(w.saturating_add(1));
             }
@@ -953,6 +955,12 @@ fn sound_d(g: &Graph1, rev: &[Vec<u32>], chain_frames: u32, end_node: u32) -> Ve
         }
         death = w;
     }
+}
+
+/// Is the node's player cell inside the win rectangle `(x0, x1, y0, y1)`
+/// (inclusive, as `frame::exits_of` tests a position)?
+fn in_win(win: Option<(i16, i16, i16, i16)>, (_, x, y): (usize, i16, i16)) -> bool {
+    win.is_some_and(|(x0, x1, y0, y1)| (x0..=x1).contains(&x) && (y0..=y1).contains(&y))
 }
 
 /// THE LEVEL -1 FILTER's table (`frame::level_minus_one`): per (block shape
@@ -1898,10 +1906,20 @@ fn build(root: &FsPath, spd_px: i32, threads: usize, rep: &mut String, s: &crate
             rev[e as usize].push(s as u32);
         }
     }
+    // A win rectangle: its nodes are wins (d 0). On the spawn's own path it
+    // is refused (the chain would have to stop there).
+    let win = crate::frame::win_rect(s);
+    if let Some(w) = win {
+        ensure!(!chain.iter().any(|&(id, (x, y))| in_win(Some(w), (id, x, y))), "level -1: the win rectangle {w:?} lies on the spawn's path {:?}", chain.iter().map(|c| c.1).collect::<Vec<_>>());
+        say!(rep, "win rectangle {w:?}: {} nodes inside it are wins (d 0)", g1.nodes.iter().filter(|&&nd| in_win(win, nd)).count())?;
+    }
     let mut dist = vec![u32::MAX; n];
     let mut q: VecDeque<u32> = VecDeque::new();
     for i in 0..n {
-        if g1.exits[i] {
+        if in_win(win, g1.nodes[i]) {
+            dist[i] = 0;
+            q.push_front(i as u32);
+        } else if g1.exits[i] {
             dist[i] = 1;
             q.push_back(i as u32);
         }
@@ -1924,7 +1942,7 @@ fn build(root: &FsPath, spd_px: i32, threads: usize, rep: &mut String, s: &crate
         dist[end_node as usize].saturating_add(chain.len() as u32 - 1),
         dist.iter().filter(|d| **d != u32::MAX).max().copied().unwrap_or(0)
     )?;
-    let sound = sound_d(&g1, &rev, chain.len() as u32 - 1, end_node);
+    let sound = sound_d(&g1, &rev, chain.len() as u32 - 1, end_node, win);
     let start_d = sound[end_node as usize].saturating_add(chain.len() as u32 - 1);
     say!(
         rep,
