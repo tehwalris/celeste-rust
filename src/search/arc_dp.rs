@@ -23,7 +23,7 @@
 //! (`reach`, over the out-edges between `W`'s nodes, `OutGraph`), and the
 //! concrete search runs inside `W` (`concrete_search`).
 
-use super::arcs::{Region, Transfer};
+use super::arcs::{Region, RegionArena, RegionRef, Transfer};
 use crate::storage::edges::{get_varint, put_varint, EdgeStore, ReadStats};
 use crate::storage::{id_entry, id_local, id_region, state_id, StateId};
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -44,7 +44,7 @@ pub struct Winning {
     n: usize,
     blocks: Vec<(StateId, u64)>,
     data: Vec<u8>,
-    sets: Vec<Region>,
+    sets: RegionArena,
     spans: usize,
 }
 
@@ -55,7 +55,7 @@ pub struct Node<'a> {
     pub layer: u32,
     count: u32,
     bytes: &'a [u8],
-    sets: &'a [Region],
+    sets: &'a RegionArena,
 }
 
 impl<'a> Node<'a> {
@@ -73,21 +73,21 @@ impl<'a> Node<'a> {
     }
     /// The spans `(lo, hi, set)`: `W_t = set` for `t` in `lo..=hi`, empty
     /// at the frames no span covers.
-    pub fn spans(self) -> impl Iterator<Item = (u32, u32, &'a Region)> + 'a {
+    pub fn spans(self) -> impl Iterator<Item = (u32, u32, RegionRef<'a>)> + 'a {
         let sets = self.sets;
-        self.raw().map(move |(lo, hi, s)| (lo, hi, &sets[s as usize]))
+        self.raw().map(move |(lo, hi, s)| (lo, hi, sets.get(s)))
     }
     /// The last frame the node has a set (its deadline).
     pub fn last(self) -> u32 {
         self.raw().last().expect("a node has a span").1
     }
     /// `W_t` (`None` = empty).
-    pub fn at(self, t: u32) -> Option<&'a Region> {
+    pub fn at(self, t: u32) -> Option<RegionRef<'a>> {
         if t < self.layer {
             return None;
         }
         let sets = self.sets;
-        self.raw().find(|s| t <= s.1).map(|s| &sets[s.2 as usize])
+        self.raw().find(|s| t <= s.1).map(|s| sets.get(s.2))
     }
 }
 
@@ -161,13 +161,12 @@ impl Winning {
         self.node(i).id
     }
     /// `W_t(i)` (`None` = empty).
-    pub fn at(&self, t: u32, i: u32) -> Option<&Region> {
+    pub fn at(&self, t: u32, i: u32) -> Option<RegionRef<'_>> {
         self.node(i).at(t)
     }
     /// The bytes held: the encoding, the block index and the sets' arena.
     pub fn bytes(&self) -> u64 {
-        let sets: usize = self.sets.iter().map(|r| r.bytes()).sum();
-        (self.data.len() + 16 * self.blocks.len() + sets) as u64
+        (self.data.len() + 16 * self.blocks.len() + self.sets.bytes()) as u64
     }
     /// Spans and distinct sets.
     pub fn sizes(&self) -> (usize, usize) {
@@ -261,7 +260,7 @@ const MADE: u32 = 1 << 30;
 /// in-edge: 1.5 GB a round).
 const ROUND_EMITS: usize = 1 << 26;
 
-fn region_hash(r: &Region) -> u64 {
+fn region_hash(r: RegionRef) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut hs = rustc_hash::FxHasher::default();
     r.hash(&mut hs);
@@ -328,7 +327,7 @@ pub struct Backward<'a> {
     threads: usize,
     /// The ARENA of sets, equal sets once (found by hash; a collision with a
     /// different set is stored apart). Index 0: the whole torus.
-    sets: Vec<Region>,
+    sets: RegionArena,
     interned: FxHashMap<u64, u32>,
     /// The nodes with a set at the frame done last, by id.
     cur: Vec<Cur>,
@@ -336,6 +335,8 @@ pub struct Backward<'a> {
     changed: Vec<u32>,
     /// Per step, the spans it closed.
     runs: Vec<Run>,
+    /// The bytes the runs hold.
+    run_bytes: u64,
     /// Per target region, the steps that read its in-edges.
     opens: FxHashMap<u32, u32>,
     /// A round's in-edges (`ROUND_EMITS`) and a read's targets (tests
@@ -359,9 +360,11 @@ impl<'a> Backward<'a> {
     /// `threads` workers).
     pub fn new(store: &'a EdgeStore, pairs: &'a [(Transfer, Transfer)], wins: &[(StateId, u32)], horizon: u32, threads: usize) -> Self {
         assert!(horizon < WIN as u32, "a horizon past {WIN}");
-        let sets: Vec<Region> = vec![Region::full()];
+        let mut sets = RegionArena::default();
+        let full = Region::full();
+        sets.push(full.as_ref());
         let mut interned: FxHashMap<u64, u32> = FxHashMap::default();
-        interned.insert(region_hash(&sets[0]), 0);
+        interned.insert(region_hash(full.as_ref()), 0);
         let mut cur: Vec<Cur> = wins.iter().filter(|w| w.1 <= horizon).map(|&(id, layer)| Cur { id, set: 0, hi: horizon as u16, layer: layer as u16 | WIN }).collect();
         cur.sort_unstable_by_key(|c| c.id);
         cur.dedup_by_key(|c| c.id);
@@ -377,6 +380,7 @@ impl<'a> Backward<'a> {
             cur,
             changed,
             runs: Vec::new(),
+            run_bytes: 0,
             opens: FxHashMap::default(),
             round_emits: ROUND_EMITS,
             chunk: 1024,
@@ -400,8 +404,8 @@ impl<'a> Backward<'a> {
     }
 
     /// The frame done last's nodes with a set, and each one's set.
-    pub fn current(&self) -> impl Iterator<Item = (StateId, &Region)> + '_ {
-        self.cur.iter().map(|c| (c.id, &self.sets[c.set as usize]))
+    pub fn current(&self) -> impl Iterator<Item = (StateId, RegionRef<'_>)> + '_ {
+        self.cur.iter().map(|c| (c.id, self.sets.get(c.set)))
     }
 
     /// The read, pull and merge walls so far.
@@ -459,17 +463,17 @@ impl<'a> Backward<'a> {
     }
 
     /// A set code's set (`local`: the step's own sets).
-    fn set_of<'s>(&'s self, code: u32, local: &'s [Region]) -> &'s Region {
+    fn set_of<'s>(&'s self, code: u32, local: &'s [Region]) -> RegionRef<'s> {
         if code & LOCAL != 0 {
-            &local[(code & !LOCAL) as usize]
+            local[(code & !LOCAL) as usize].as_ref()
         } else {
-            &self.sets[code as usize]
+            self.sets.get(code)
         }
     }
 
     /// The arena's code of `r`, if it holds it.
     fn arena_code(&self, r: &Region, h: u64) -> Option<u32> {
-        self.interned.get(&h).copied().filter(|&s| self.sets[s as usize] == *r)
+        self.interned.get(&h).copied().filter(|&s| self.sets.get(s) == *r)
     }
 
     /// Fold one round's in-edges into the step's sets so far (`acc`, by
@@ -521,7 +525,7 @@ impl<'a> Backward<'a> {
                 }
                 for e in &es[j..j_end] {
                     let (x, y) = pairs[e.xfer as usize];
-                    self.sets[e.set as usize].pull(x, y, &mut pieces);
+                    self.sets.get(e.set).pull(x, y, &mut pieces);
                 }
                 j = j_end;
                 if pieces.is_empty() {
@@ -529,9 +533,9 @@ impl<'a> Backward<'a> {
                 }
                 let r = Region::from_pieces(&mut pieces, &mut scratch);
                 let set = match base {
-                    Some(b) if *self.set_of(b, local_ro) == r => b,
+                    Some(b) if self.set_of(b, local_ro) == r => b,
                     _ => {
-                        let h = region_hash(&r);
+                        let h = region_hash(r.as_ref());
                         match self.arena_code(&r, h).or_else(|| local_interned.get(&h).copied().filter(|&s| local_ro[s as usize] == r).map(|s| s | LOCAL)) {
                             Some(s) => s,
                             None => {
@@ -551,7 +555,7 @@ impl<'a> Backward<'a> {
             let codes: Vec<u32> = made
                 .into_iter()
                 .map(|r| {
-                    let h = region_hash(&r);
+                    let h = region_hash(r.as_ref());
                     match local_interned.get(&h) {
                         Some(&s) if local[s as usize] == r => s | LOCAL,
                         found => {
@@ -654,7 +658,7 @@ impl<'a> Backward<'a> {
                 if ic == ia {
                     let x = c[i];
                     i += 1;
-                    if n.set == x.set || *self.set_of(n.set, local_ref) == self.sets[x.set as usize] {
+                    if n.set == x.set || self.set_of(n.set, local_ref) == self.sets.get(x.set) {
                         o.cur.push(x);
                         continue;
                     }
@@ -682,16 +686,15 @@ impl<'a> Backward<'a> {
                     let l = (x.set & !LOCAL) as usize;
                     if to_arena[l] == u32::MAX {
                         let r = std::mem::take(&mut local[l]);
-                        let h = region_hash(&r);
+                        let h = region_hash(r.as_ref());
                         to_arena[l] = match self.interned.get(&h) {
-                            Some(&s) if self.sets[s as usize] == r => s,
+                            Some(&s) if self.sets.get(s) == r => s,
                             found => {
-                                let s = self.sets.len() as u32;
+                                let s = self.sets.push(r.as_ref());
                                 assert!(s < MADE, "more distinct sets than set codes");
                                 if found.is_none() {
                                     self.interned.insert(h, s);
                                 }
-                                self.sets.push(r);
                                 s
                             }
                         };
@@ -703,7 +706,9 @@ impl<'a> Backward<'a> {
             closed.extend(o.closed);
         }
         drop(local);
-        self.runs.push(Run::new(close_at, closed));
+        let run = Run::new(close_at, closed);
+        self.run_bytes += run.bytes.len() as u64;
+        self.runs.push(run);
         self.cur = new_cur;
         self.changed = changed;
         self.max_cur = self.max_cur.max(self.cur.len());
@@ -711,17 +716,21 @@ impl<'a> Backward<'a> {
         self.d_merge += d_merge;
         let ms = |d: std::time::Duration| d.as_secs_f64() * 1e3;
         eprintln!(
-            "[arc] f{t:03}: {n_read} changed at f{} -> {n_emits} in-edges ({rounds} rounds); {} nodes with a set, {} changed | read {:.0} pull {:.0} merge {:.0} ms | anon {:.2} GB",
+            "[arc] f{t:03}: {n_read} changed at f{} -> {n_emits} in-edges ({rounds} rounds); {} nodes with a set, {} changed | read {:.0} pull {:.0} merge {:.0} ms | anon {:.2} GB: frame {:.2}, runs {:.2}, {} sets {:.2}",
             t + 1,
             self.cur.len(),
             self.changed.len(),
             ms(d_read),
             ms(d_pull),
             ms(d_merge),
-            crate::metrics::current_rss_gb()
+            crate::metrics::current_rss_gb(),
+            (self.cur.capacity() * std::mem::size_of::<Cur>() + self.changed.capacity() * 4) as f64 / 1e9,
+            self.run_bytes as f64 / 1e9,
+            self.sets.len(),
+            (self.sets.bytes() + self.interned.capacity() * 16) as f64 / 1e9,
         );
         if (self.horizon - 1 - t) % 4 == 0 {
-            let (k, med, p90, max) = fragmentation(self.cur.iter().filter(|c| c.layer & WIN == 0).map(|c| &self.sets[c.set as usize]));
+            let (k, med, p90, max) = fragmentation(self.cur.iter().filter(|c| c.layer & WIN == 0).map(|c| self.sets.get(c.set)));
             self.fragments.push(format!("[arc] W frame {t:3}: {k} non-win nodes can win; rectangles per node med {med} p90 {p90} max {max}"));
         }
     }
@@ -748,8 +757,12 @@ impl<'a> Backward<'a> {
         for (k, &s) in order.iter().enumerate() {
             renumber[s as usize] = k as u32;
         }
-        let mut old = std::mem::take(&mut self.sets);
-        let sets: Vec<Region> = order.iter().map(|&s| std::mem::take(&mut old[s as usize])).collect();
+        let old = std::mem::take(&mut self.sets);
+        let mut sets = RegionArena::default();
+        for &s in &order {
+            sets.push(old.get(s));
+        }
+        sets.shrink_to_fit();
         drop(old);
         // The runs merged by (id, frame).
         let spans: usize = runs.iter().map(|r| r.n).sum();
@@ -1001,7 +1014,10 @@ pub fn reach(w: &Winning, g: &OutGraph, pairs: &[(Transfer, Transfer)], start: O
         let mut pushed: Vec<(u32, Piece)> = par_chunks(cur.len(), 64, threads, |lo, hi| {
             let (mut out, mut tmp) = (Vec::new(), Vec::new());
             for (p, r) in &cur_ref[lo..hi] {
-                let r = r.as_ref().unwrap_or_else(|| w.at(t, *p).expect("a node reached in W has a set"));
+                let r: RegionRef = match r {
+                    Some(r) => r.as_ref(),
+                    None => w.at(t, *p).expect("a node reached in W has a set"),
+                };
                 for &(m, x) in g.of(*p) {
                     if w.at(t + 1, m).is_some() {
                         let (x, y) = pairs[x as usize];
@@ -1141,7 +1157,7 @@ impl Seeds {
 
 /// Fragmentation of winning sets (x segments per node, over all slabs) as
 /// (nodes, median, p90, max).
-pub fn fragmentation<'a>(sets: impl Iterator<Item = &'a Region>) -> (usize, usize, usize, usize) {
+pub fn fragmentation<'a>(sets: impl Iterator<Item = RegionRef<'a>>) -> (usize, usize, usize, usize) {
     let mut v: Vec<usize> = sets.map(|r| r.n_segs()).collect();
     if v.is_empty() {
         return (0, 0, 0, 0);
@@ -1621,7 +1637,7 @@ pub struct Solved {
 /// One node's term of the gate's `W f{t}` line: the node's content hash
 /// (`exact::ContentHash::state`) folded with its set's rectangles
 /// (`rewrite bench-backward` prints the same line for one frame).
-pub fn gate_w_hash(node: u64, r: &Region) -> u64 {
+pub fn gate_w_hash(node: u64, r: RegionRef) -> u64 {
     use celeste_engine::runtime2::mix64;
     let mut h = node;
     for (y, xs) in r.slabs() {
@@ -1974,7 +1990,7 @@ mod tests {
                 assert_eq!(node.is_some(), (0..=horizon).any(|t| want[t as usize][i as usize].is_some()), "node {i}: in the support iff it has a set");
                 for t in 0..=horizon {
                     let got = node.and_then(|k| w.at(t, k));
-                    assert_eq!(got, want[t as usize][i as usize].as_ref(), "t {t} node {i}");
+                    assert_eq!(got, want[t as usize][i as usize].as_ref().map(Region::as_ref), "t {t} node {i}");
                     sets += got.is_some() as usize;
                 }
             }
