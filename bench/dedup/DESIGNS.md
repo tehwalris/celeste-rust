@@ -968,3 +968,127 @@ its targets per block (as it does per unit today).
 
 Code: `src/edgebundle.rs` (`dedup-bench CAP edgebundle TREE
 mode:threads:split ... access:threads`).
+
+### O2. ID-free: edges named by KEYS (`edgebundle CAP TREE idfree`; `src/edgekeys.rs`)
+
+Philippe's question: why do edges carry IDs at all (lids, entry numbers, the
+owner index)? An edge is (source state, target state, transfer), a state its
+shape + exact position-free key + cell. Stored like states: a table per
+region keyed by (keys, transfer, offset) -> u64 cell mask (one probe, one OR),
+at rest a sorted trie per unit block. Variants (the first three in the
+TARGET region, masks over target cells, inserted in the dedup pass; v4 for
+the placement):
+
+- v1 (target key, transfer, source key, offset)
+- v2 (target key, source key, transfer, offset)
+- v3 (source key, transfer, target key, offset)
+- v4 (source key, target shape + key, transfer, offset), in the SOURCE
+  region, masks over SOURCE cells
+
+Keys are the exact packed keys with their shape (`shape << 50 | key`;
+provisional keys by their MISS content); transfers content-canonical global
+ids. Encodings per unit block (the state study's: sorted, delta, varint): E1
+the trie with raw key values - a level byte (the first field that changed),
+that field's delta, the later fields raw, the offset byte, the u64 mask; E2
+the same with each key field a rank into the block's sorted key dictionaries
+(delta-coded; block-local, not IDs). In memory a table entry is 40 B (two
+keys, transfer | offset, mask, generation) against the ID-based 32.
+
+**Timed now** (unlike O's T and S runs): the PARTITION - the emissions in
+capture (kernel) order, 24 B each as the kernel has them (target key, the
+source key from its input row, transfer and both cells), counted, prefixed
+and scattered to their target unit as 24-B records - then per unit the dedup,
+the edge insert and the block encode (E1 and E2 both, in the same timing).
+Every variant decodes back (E1 and E2) to the capture's 257,724,013 edges,
+fingerprint 2226cf815188958e; the dedup's 6,735,699 new states every run.
+Load 9-13 for the numbers below (an earlier series at load 25-31 was 10-35%
+slower, same ranking).
+
+| f57, split 100k | 1 thread | 16 threads |
+|---|---|---|
+| partition (257.7M x 24 B to 2,758 target units) | 2.06-2.20 s (8.0-8.5 ns an edge) | 0.571-0.585 s (2.2-2.3 ns) |
+| dedup alone, after it | 0.61 s (2.4 ns) | 0.145 s |
+| dedup + edge insert + encode, v2 | 5.23 s (insert ~6, encode E1 6.8 + E2 4.8 ns) | 0.52-0.54 s |
+| v4 insert + encode (no dedup; source units) | 3.89 s (insert 4.6, encode E1 7.0 + E2 3.4 ns) | 0.33 s |
+| frame: partition + dedup / + v2 edges | 2.67 / 7.43 s | 0.72 / 1.11 s |
+
+The partition is the expensive part of the target side: ~18 GB of DRAM
+traffic (24-B records read twice, written once) in 0.58 s, 4x the dedup it
+feeds. A forward whose units are SOURCE runs (production's) needs none for
+v4: its emissions already arrive grouped by source.
+
+**At rest** (B an edge, per unit block):
+
+| | E1 raw | E1 zstd -1 | E2 raw | E2 zstd -1 |
+|---|---|---|---|---|
+| v1 (t, x, s, off) | 2.360 | 0.587 | 1.858 | 0.577 |
+| **v2 (t, s, x, off)** | 1.787 | 0.444 | 1.788 | **0.427** |
+| v3 (s, x, t, off), target region | 2.184 | 0.504 | 1.874 | 0.452 |
+| **v4 (s, t, x, off), source region** | 1.695 | 0.182 | **1.629** | **0.139** |
+| ID-based T (lid home, source key dictionary; O) | 1.996 | 0.544 | | |
+| ID-based S (source entry home; O) | 1.844 | 0.147 | | |
+
+- In the target region, v2 is the best order: target key first, then the
+  source key (deltas between a target's sources are small); the transfer
+  before the source (v1) breaks those runs. Source-first in the target region
+  (v3) is in between.
+- **Keys cost nothing against IDs**: v2 ID-free (1.79 / 0.43) is SMALLER than
+  the ID-based T it corresponds to (2.00 / 0.54), and v4 (1.63 / 0.139)
+  smaller than the ID-based S (1.84 / 0.147). A sorted trie pays for a key
+  only at its first-changed level: once per target entry (v2), once per
+  source entry (v4).
+- **Placement dominates**: masks over SOURCE cells compress 3x better (0.14
+  against 0.43) - a source entry's cells move together, so its bundles repeat
+  one mask; a target's in-bundles come from many sources.
+- In memory 40 B an entry: 5.4-5.6 B an edge dense (the ID-based 4.3-4.5);
+  the tables are per unit, transient.
+
+**The backward's read**, every block decoded to (source key + cell,
+transfer) per in-edge (v4: (target key + cell, transfer) per out-edge), a
+batched region pass: v2 0.051 s at 16 threads (0.20 ns an edge), 0.69 s at 1
+(2.7 ns); v4 0.044 / 0.60 s. **W keyed by state**: in target-key order (v1,
+v2) a target entry's in-bundles are consecutive, so one probe of the
+region's in-core table (target key -> the entry's W slots, as the dedup
+probes, ~4 ns in regionbatch) serves all of them: 879,831 probes for 257.7M
+in-edges, +0.005 s at 16 threads, +0.08 s at 1. In v3 order the target
+changes per bundle: 13.4M probes, +0.01-0.2 s.
+
+**What IDs buy, plainly:**
+- *Fixed-width references*: an entry number is dense and small (a lid ~1-2 B
+  in a block, an id a fixed u64). Measured here it buys no size: the sorted
+  trie of keys is smaller than the ID-based blocks.
+- *Array-indexed W*: `arc_dp` numbers the marked nodes densely (`MarkRanks`)
+  and holds W, the CSR (12 B an edge) and the deadlines in arrays indexed by
+  that number: O(1) without hashing. ID-free, W is keyed by state: a probe of
+  the region's in-core table per target ENTRY (batched by region; 0.0034
+  probes an in-edge in v2 order), ~4 ns each - negligible against the decode.
+- *What they cost* (the census on real trees, plans/edge-bundles.md; storage
+  v2): per unit a lid table (key + owner + two masks a lid), `Claims`, pending
+  lids and `resolve_lids` after the translation; the owner index (16 B a lid:
+  0.18-0.70 B an edge on disk, more than a whole zstd'd v4 block), per-lid
+  starts, per-unit transfer ranks, explicit source ids where a unit's sources
+  are not a whole piece, `EdgeStore::owners` (an 8-B-a-lid scatter per frame
+  read), the `Resolver` from ids back to keys for every fingerprint, marks
+  file and node key, and canonical entry numbering at the translation (ids
+  must not depend on the schedule). Tables alone are 0.25 B an edge at f57.
+
+**What an ID-free design needs instead:** the dedup still (a state is still
+inserted once - by today's read-only lookups from the source units plus the
+translation of new states, or a target-side region pass); W per (region,
+key) with a slot per cell, probed through the region's in-core table; and a
+reverse direction for the BFS (marks flow from targets to sources): from v4
+blocks, either a region-batched pass over the out-edges per BFS iteration
+(0.044 s a frame's 257.7M at 16 threads) or a target-side copy kept for the
+backward only.
+
+**On the merits** (the best end state, not the nearest to today's code): the
+ID-free, SOURCE-side key trie (v4) is the smallest layout measured (1.63 raw,
+0.139 B an edge with zstd -1, against production's 3.15), its forward
+insert is the cheapest (no partition: the units are source runs; ~4.6 ns an
+edge to insert, ~3.4-7 to encode), its block is self-describing (keys and
+content-canonical transfers: no owner index, no lid resolution, no id
+translation, no resolver for edges), and its backward read costs the same as
+any other (0.044 s a frame at 16 threads, one W probe per entry). The
+target-side layouts lose 3x at rest and need a partition of every edge
+(0.58 s a frame here). IDs remain useful INSIDE the backward's in-RAM graph
+(dense arrays), where they can be assigned at load time and never stored.

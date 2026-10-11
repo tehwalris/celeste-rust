@@ -31,7 +31,8 @@
 //! `access:T` (T's backward access, after a `t` run), e.g.
 //! `edgebundle CAP TREE dedup:1:0 t:1:0 s:1:0 dedup:16:1000000 ...`.
 //! The (untimed) decode check runs after the first run of each mode (every
-//! run with env `EB_CHECK_ALL`).
+//! run with env `EB_CHECK_ALL`). `edgebundle CAP TREE idfree ...`: the
+//! ID-free variants (`edgekeys`).
 
 use rustc_hash::FxHashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -39,23 +40,23 @@ use std::sync::Mutex;
 use std::time::Instant;
 
 /// Regions per shape: 8x8 regions over the 512-cell grid, `NO_CELL`'s last.
-const SLOTS: u32 = 64 * 64 + 1;
+pub(crate) const SLOTS: u32 = 64 * 64 + 1;
 const NO_CELL: u32 = 512 * 512;
 /// A provisional (new, MISS-content-interned) key: below `1 << 56` with this bit.
 const PROV: u64 = 1 << 55;
-const EMPTY: u64 = u64::MAX;
+pub(crate) const EMPTY: u64 = u64::MAX;
 
 #[inline] fn varint(o: &mut Vec<u8>, mut v: u64) { while v >= 0x80 { o.push(v as u8 | 0x80); v >>= 7; } o.push(v as u8); }
 #[inline] fn get_varint(b: &[u8], i: &mut usize) -> u64 { let mut v = 0u64; let mut s = 0; loop { let x = b[*i]; *i += 1; v |= ((x & 0x7f) as u64) << s; if x < 0x80 { return v; } s += 7; } }
 fn mix(t: &[u64]) -> u64 { t.iter().fold(0x1234_5678u64, |a, &x| crate::bits::mix64(a ^ x).wrapping_add(x)) }
-fn hpart(k: u64, parts: u32) -> u32 { (crate::bits::mix64(k) >> 32) as u32 % parts }
+pub(crate) fn hpart(k: u64, parts: u32) -> u32 { (crate::bits::mix64(k) >> 32) as u32 % parts }
 
-fn slot_local(cell: u32) -> (u32, u32) {
+pub(crate) fn slot_local(cell: u32) -> (u32, u32) {
     if cell == NO_CELL { return (SLOTS - 1, 0); }
     let (gx, gy) = (cell % 512, cell / 512);
     ((gy / 8) * 64 + gx / 8, (gy % 8) * 8 + gx % 8)
 }
-fn cell_of(slot: u32, local: u32) -> u32 {
+pub(crate) fn cell_of(slot: u32, local: u32) -> u32 {
     if slot == SLOTS - 1 { return NO_CELL; }
     let (rx, ry) = (slot % 64, slot / 64);
     (ry * 8 + local / 8) * 512 + rx * 8 + local % 8
@@ -68,7 +69,7 @@ fn cell_of(slot: u32, local: u32) -> u32 {
 const TO_NONE: u32 = 1 << 22;
 const FROM_NONE: u32 = 1 << 23;
 const NONE_NONE: u32 = 1 << 24;
-fn offset(a: u32, b: u32, t_side: bool) -> u32 {
+pub(crate) fn offset(a: u32, b: u32, t_side: bool) -> u32 {
     match (a == NO_CELL, b == NO_CELL) {
         (false, false) => { let dx = (b % 512) as i32 - (a % 512) as i32; let dy = (b / 512) as i32 - (a / 512) as i32; ((dx + 1024) as u32) << 11 | (dy + 1024) as u32 }
         (false, true) => if t_side { TO_NONE | a } else { TO_NONE },
@@ -77,21 +78,21 @@ fn offset(a: u32, b: u32, t_side: bool) -> u32 {
     }
 }
 /// T: the source cell of an edge into `b` at offset code `off`.
-fn back(b: u32, off: u32) -> u32 {
+pub(crate) fn back(b: u32, off: u32) -> u32 {
     if off < TO_NONE { let (dx, dy) = ((off >> 11) as i32 - 1024, (off & 2047) as i32 - 1024); ((b / 512) as i32 - dy) as u32 * 512 + ((b % 512) as i32 - dx) as u32 }
     else if off & !(TO_NONE - 1) == TO_NONE { off & (TO_NONE - 1) } else { NO_CELL }
 }
 /// S: the target cell of an edge out of `a` at offset code `off`.
-fn fwd(a: u32, off: u32) -> u32 {
+pub(crate) fn fwd(a: u32, off: u32) -> u32 {
     if off < TO_NONE { let (dx, dy) = ((off >> 11) as i32 - 1024, (off & 2047) as i32 - 1024); ((a / 512) as i32 + dy) as u32 * 512 + ((a % 512) as i32 + dx) as u32 }
     else if off & !(TO_NONE - 1) == FROM_NONE { off & (TO_NONE - 1) } else { NO_CELL }
 }
 /// An offset in a block: `(dx + 8) << 4 | (dy + 8)` for |d| <= 7 (never 0), else 0 and its varint.
-#[inline] fn put_off(o: &mut Vec<u8>, off: u32) {
+#[inline] pub(crate) fn put_off(o: &mut Vec<u8>, off: u32) {
     if off < TO_NONE { let (dx, dy) = ((off >> 11) as i32 - 1024, (off & 2047) as i32 - 1024); if dx.abs() <= 7 && dy.abs() <= 7 { o.push(((dx + 8) << 4 | (dy + 8)) as u8); return; } }
     o.push(0); varint(o, off as u64);
 }
-#[inline] fn get_off(b: &[u8], i: &mut usize) -> u32 {
+#[inline] pub(crate) fn get_off(b: &[u8], i: &mut usize) -> u32 {
     let x = b[*i]; *i += 1;
     if x != 0 { let (dx, dy) = ((x >> 4) as i32 - 8, (x & 15) as i32 - 8); ((dx + 1024) as u32) << 11 | (dy + 1024) as u32 } else { get_varint(b, i) as u32 }
 }
@@ -100,17 +101,17 @@ fn fwd(a: u32, off: u32) -> u32 {
 /// region gives the shape), source entry, transfer (content-canonical),
 /// dense target and source regions, target and source cells in their regions.
 #[derive(Clone, Copy)] #[repr(C)]
-struct Edge { tkey: u64, se: u32, x: u32, treg: u16, sreg: u16, tpos: u8, spos: u8 }
+pub(crate) struct Edge { pub(crate) tkey: u64, pub(crate) se: u32, pub(crate) x: u32, pub(crate) treg: u16, pub(crate) sreg: u16, pub(crate) tpos: u8, pub(crate) spos: u8 }
 
 /// Per dense region: its shape index and slot; its frame-start entries.
-struct Region { shape: u32, slot: u32, keys: Vec<u64>, masks: Vec<u64> }
+pub(crate) struct Region { pub(crate) shape: u32, pub(crate) slot: u32, pub(crate) keys: Vec<u64>, pub(crate) masks: Vec<u64> }
 
-struct Data { regions: Vec<Region>, edges: Vec<Vec<Edge>>, n_edges: u64, fp: u64, shape_hash: Vec<u64>, prov_hash: Vec<u64> }
+pub(crate) struct Data { pub(crate) regions: Vec<Region>, pub(crate) edges: Vec<Vec<Edge>>, pub(crate) n_edges: u64, pub(crate) fp: u64, shape_hash: Vec<u64>, prov_hash: Vec<u64> }
 
 impl Data {
     /// An edge's fingerprint term over CANONICAL values (the shape's hash, a
     /// provisional key's content hash: the setup numbers both by arrival).
-    fn term(&self, src: u64, shape: u64, cell: u32, key: u64, x: u64) -> u64 {
+    pub(crate) fn term(&self, src: u64, shape: u64, cell: u32, key: u64, x: u64) -> u64 {
         let k = if key & PROV != 0 { 1 << 63 | self.prov_hash[(key & !PROV) as usize] >> 1 } else { key };
         mix(&[src, self.shape_hash[shape as usize], cell as u64, k, x])
     }
@@ -319,7 +320,7 @@ fn units_s(d: &Data, split: usize) -> Vec<Unit<Edge>> {
 
 /// A visited-set entry in the unit's table: key, old and new masks, its
 /// local number (insertion order: stable across a regrow).
-#[derive(Clone, Copy)] struct H { key: u64, m: u64, nm: u64, lid: u32 }
+#[derive(Clone, Copy)] pub(crate) struct H { pub(crate) key: u64, pub(crate) m: u64, pub(crate) nm: u64, pub(crate) lid: u32 }
 /// An edge-table entry: `a` the other side's (shape << 56 | key), `b` home << 32
 /// | transfer, `c` the offset code; the mask; the generation that owns it.
 #[derive(Clone, Copy)] #[repr(C)] struct BE { a: u64, b: u64, mask: u64, c: u32, gen: u32 }
@@ -328,7 +329,7 @@ struct Scratch { tab: Vec<H>, lids: Vec<u32>, et: Vec<BE>, gen: u32, coll: Vec<(
 
 #[derive(Default, Clone)] struct Out { new: u64, bundles: u64, table: u64, thread: usize, off: usize, len: usize, t_ins: u64, t_enc: u64 }
 
-#[inline(always)] fn hslot(tab: &[H], mask: usize, k: u64) -> usize { let mut i = (crate::bits::mix64(k) >> 20) as usize & mask; loop { let x = tab[i].key; if x == k || x == EMPTY { return i; } i = (i + 1) & mask; } }
+#[inline(always)] pub(crate) fn hslot(tab: &[H], mask: usize, k: u64) -> usize { let mut i = (crate::bits::mix64(k) >> 20) as usize & mask; loop { let x = tab[i].key; if x == k || x == EMPTY { return i; } i = (i + 1) & mask; } }
 #[inline(always)] fn ehash(a: u64, b: u64, c: u32) -> u64 { crate::bits::mix64(a ^ b.rotate_left(23) ^ (c as u64).rotate_left(47)) }
 
 /// One probe and one OR (module doc); grows the table (rare) by re-inserting
@@ -620,7 +621,7 @@ fn check(mode: &str, d: &Data, us: &[(u16, u32)], tus: &[Unit<TEdge>], outs: &[O
         raw as f64 / e, dict_bytes as f64 / e, z as f64 / e, alt as f64 / e, z_alt as f64 / e, 100.0 * uni_groups as f64 / groups.max(1) as f64, fact as f64 / e, z_fact as f64 / e, tv.elapsed().as_secs_f64());
 }
 
-fn d_region_id(r: &Region) -> u32 { r.shape * SLOTS + r.slot }
+pub(crate) fn d_region_id(r: &Region) -> u32 { r.shape * SLOTS + r.slot }
 
 /// T's backward access, from the blocks at rest: (1) every in-edge, block by
 /// block (decode, expand the masks: source cell = target cell - offset);
@@ -683,6 +684,7 @@ fn access(d: &Data, us: &[Unit<TEdge>], outs: &[Out], scr: &[Scratch], threads: 
 pub fn edgebundle(args: &[String]) {
     let (cap, tree) = (&args[0], &args[1]);
     let d = load(cap, tree, 56);
+    if args.get(2).is_some_and(|a| a == "idfree") { return crate::edgekeys::idfree(d, &args[3..]); }
     let mut tb: Option<(usize, Vec<Unit<TEdge>>)> = None;
     let mut sb: Option<(usize, Vec<Unit<Edge>>)> = None;
     let mut last_t: Option<(Vec<Out>, Vec<Scratch>)> = None;

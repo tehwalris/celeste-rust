@@ -19,6 +19,7 @@ mod regionedge;
 mod ghost;
 mod ghost2;
 mod edgebundle;
+mod edgekeys;
 
 const REC: usize = 48;
 const PAYLOAD: usize = 64;
