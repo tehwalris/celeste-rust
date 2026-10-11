@@ -178,9 +178,10 @@ pub struct Report {
 
 /// Convert every format-13 tree under `dir` (a level's tree, a search's
 /// checkpoint dir, or any dir holding them) to format 14 in place, each
-/// checked as above; `room` gives the blocks their cart context only (the
-/// values are the tree's). Refuses a dir holding any other format, and
-/// a tree with a leftover conversion file, before touching anything.
+/// checked as above, against the room its `settings.txt` records (`room`
+/// for a tree without one: a wrong room fails the check). Refuses a dir
+/// holding any other format, and a leftover conversion file, before
+/// touching anything.
 pub fn convert(dir: &Path, room: (i16, i16), threads: usize) -> Result<Report> {
     let mut files = Vec::new();
     walk(dir, &mut files)?;
@@ -210,6 +211,7 @@ pub fn convert(dir: &Path, room: (i16, i16), threads: usize) -> Result<Report> {
     let in_tree = |p: &Path| frames.keys().filter(|t| p.starts_with(t)).max_by_key(|t| t.as_os_str().len()).cloned();
     for (tree, (last, paths)) in &frames {
         let mine: Vec<&PathBuf> = values.iter().filter(|p| in_tree(p).as_ref() == Some(tree)).collect();
+        let room = tree_room(tree)?.unwrap_or(room);
         convert_tree(tree, *last, paths, &mine, room, threads, &mut r).with_context(|| format!("{}: left at format {FROM}", tree.display()))?;
         r.trees += 1;
     }
@@ -218,6 +220,15 @@ pub fn convert(dir: &Path, room: (i16, i16), threads: usize) -> Result<Report> {
         r.value_files += 1;
     }
     Ok(r)
+}
+
+/// The room a tree records (`settings.txt`): its rows decode against it
+/// (the position's whole pixels are the cell's less the room offset).
+fn tree_room(tree: &Path) -> Result<Option<(i16, i16)>> {
+    let Ok(text) = std::fs::read_to_string(crate::settings::path(tree)) else { return Ok(None) };
+    let Some(v) = text.lines().find_map(|l| l.strip_prefix("room ")) else { return Ok(None) };
+    let (x, y) = v.split_once(',').ok_or_else(|| anyhow!("{}: room {v}", tree.display()))?;
+    Ok(Some((x.trim().parse()?, y.trim().parse()?)))
 }
 
 fn convert_tree(tree: &Path, last: u32, paths: &[PathBuf], values: &[&PathBuf], room: (i16, i16), threads: usize, r: &mut Report) -> Result<()> {

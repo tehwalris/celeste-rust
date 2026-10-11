@@ -661,8 +661,9 @@ enum Command {
     /// a dir of them). Each frame file's v14 replacement is decoded back and
     /// compared with its v13 rows exactly before any file of the tree is
     /// replaced; a tree that fails stays at format 13. The other `C8TB` files
-    /// (metadata, pos-graph, notes, marks) get the new version. `--room` gives
-    /// the blocks their cart context only. Refuses any other format.
+    /// (metadata, pos-graph, notes, marks) get the new version. Each tree's
+    /// rows decode in the room its `settings.txt` records (`--room` for one
+    /// without). Refuses any other format.
     ConvertTree {
         #[arg(long)]
         dir: String,
