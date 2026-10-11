@@ -1051,53 +1051,66 @@ fn main() -> Result<()> {
             // cell) of target and source, and the transfer - ids and table
             // positions depend on scheduling (and on a raise), these do not.
             // A state by what it is, not by its id.
+            // Each entry's key hashed once (`ContentHash::state` per state is
+            // `mix64(key hash ^ cell << 1)`).
+            let entries = resolver.per_entry(|shape, k| content.key(shape, k));
             let node = |id: StateId| -> Result<u64> {
-                let (shape, k, cell) = resolver.resolve(id)?;
-                Ok(content.state(shape, k, cell))
+                let (kh, cell) = entries.get(id)?;
+                Ok(celeste_engine::runtime2::mix64(kh ^ (cell as u64) << 1))
             };
             if edges {
                 let eg = celeste_rust::storage::edges::EdgeStore::open(&dir.join("edges"), to)?;
-                // One frame's line (frames in parallel, printed in order).
-                let line = |frame: u32| -> Result<String> {
-                    let (mut n, mut acc) = (0usize, 0u64);
-                    for e in eg.edges_at(frame, cfg.threads()) {
-                        let pair = eg.pair(e.xfer).ok_or_else(|| anyhow::anyhow!("f{frame}: an edge without its transfer"))?;
+                // Each transfer's hash once (the table is small; an edge names
+                // one by index).
+                let pairs: Vec<u64> = eg
+                    .pairs()
+                    .iter()
+                    .map(|pair| {
                         let mut b = Vec::new();
-                        celeste_rust::search::arc_edges::encode_pair(&mut b, &pair);
-                        let p = b.iter().fold(0u64, |h, &x| celeste_engine::runtime2::mix64(h ^ x as u64));
-                        let (t, s) = (node(e.dst)?, node(e.src)?);
-                        if dump_edges == Some(frame) {
-                            eprintln!("edge {t:016x} {s:016x} {pair:?}");
-                        }
-                        acc = acc.wrapping_add(celeste_engine::runtime2::mix64(t ^ s.rotate_left(21) ^ p.rotate_left(42)));
-                        n += 1;
-                    }
-                    Ok(format!("e{frame:03} {n} {acc:016x}"))
-                };
-                let next = std::sync::atomic::AtomicU32::new(1);
-                let mut lines: Vec<(u32, String)> = std::thread::scope(|sc| {
-                    let hs: Vec<_> = (0..cfg.threads().min(to as usize).max(1))
-                        .map(|_| {
-                            sc.spawn(|| -> Result<Vec<(u32, String)>> {
-                                let mut out = Vec::new();
-                                loop {
-                                    let f = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                    if f > to {
-                                        return Ok(out);
-                                    }
-                                    out.push((f, line(f)?));
+                        celeste_rust::search::arc_edges::encode_pair(&mut b, pair);
+                        b.iter().fold(0u64, |h, &x| celeste_engine::runtime2::mix64(h ^ x as u64))
+                    })
+                    .collect();
+                // STREAMED: one frame at a time, its units on every thread, each
+                // folding into its own (count, sum, first error): the sum is
+                // commutative. (Materializing frames' edges, frames in
+                // parallel, held 38 GB on room (6,2) f57; 2026-10-11.)
+                type Acc = (usize, u64, Option<anyhow::Error>);
+                for frame in 1..=to {
+                    let parts = eg.par_scan(
+                        frame,
+                        cfg.threads(),
+                        || -> Acc { (0, 0, None) },
+                        |acc, e| {
+                            if acc.2.is_some() {
+                                return;
+                            }
+                            let r = (|| -> Result<u64> {
+                                let p = *pairs.get(e.xfer as usize).ok_or_else(|| anyhow::anyhow!("f{frame}: an edge without its transfer"))?;
+                                let (t, s) = (node(e.dst)?, node(e.src)?);
+                                if dump_edges == Some(frame) {
+                                    eprintln!("edge {t:016x} {s:016x} {:?}", eg.pair(e.xfer));
                                 }
-                            })
-                        })
-                        .collect();
-                    hs.into_iter().map(|h| h.join().expect("a ckhash worker panicked")).collect::<Result<Vec<_>>>()
-                })?
-                .into_iter()
-                .flatten()
-                .collect();
-                lines.sort_by_key(|l| l.0);
-                for (_, l) in lines {
-                    println!("{l}");
+                                Ok(celeste_engine::runtime2::mix64(t ^ s.rotate_left(21) ^ p.rotate_left(42)))
+                            })();
+                            match r {
+                                Ok(h) => {
+                                    acc.0 += 1;
+                                    acc.1 = acc.1.wrapping_add(h);
+                                }
+                                Err(err) => acc.2 = Some(err),
+                            }
+                        },
+                    );
+                    let (mut n, mut acc) = (0usize, 0u64);
+                    for (pn, ph, err) in parts {
+                        if let Some(err) = err {
+                            return Err(err);
+                        }
+                        n += pn;
+                        acc = acc.wrapping_add(ph);
+                    }
+                    println!("e{frame:03} {n} {acc:016x}");
                 }
             }
             if dropped {

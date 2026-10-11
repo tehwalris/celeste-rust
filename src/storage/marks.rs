@@ -175,3 +175,38 @@ impl Resolver {
         Ok((shape, key, super::id_cell(&self.geo, id)))
     }
 }
+
+impl Resolver {
+    /// `f(shape, key)` of every entry, looked up by id like `resolve`: a
+    /// per-entry value computed once, not per state or edge (`ckhash`'s
+    /// content hashes).
+    pub fn per_entry(&self, f: impl Fn(u64, Key) -> u64) -> PerEntry {
+        let vals = self
+            .keys
+            .iter()
+            .map(|(&r, keys)| {
+                let shape = self.shapes.get((r / self.geo.slots) as usize).copied();
+                (r, keys.iter().map(|&k| shape.map_or(0, |s| f(s, k))).collect())
+            })
+            .collect();
+        PerEntry { geo: self.geo, vals, shapes: self.shapes.len() }
+    }
+}
+
+/// `Resolver::per_entry`'s values.
+pub struct PerEntry {
+    geo: Geometry,
+    vals: FxHashMap<u32, Vec<u64>>,
+    shapes: usize,
+}
+
+impl PerEntry {
+    /// `id`'s entry's value and `id`'s cell.
+    #[inline]
+    pub fn get(&self, id: StateId) -> Result<(u64, u32)> {
+        let r = id_region(id);
+        anyhow::ensure!(((r / self.geo.slots) as usize) < self.shapes, "state {}: no shape", super::show_id(id));
+        let v = *self.vals.get(&r).and_then(|v| v.get(id_entry(id) as usize)).with_context(|| format!("state {}: no entry", super::show_id(id)))?;
+        Ok((v, super::id_cell(&self.geo, id)))
+    }
+}
