@@ -66,8 +66,8 @@ export interface HorizonRun {
   h: number;
   levels: LevelRun[];
   refuted_at: number | null;
-  /** A forward on its own (`export-ui --forward-only`): level 0's frames
-   *  up to `h`, no backward, no verdict. Absent in older exports. */
+  /** Exported without the arc pass (`export-ui` without `--arc`): the
+   *  forward levels' frames up to `h`, no verdict. Absent in older exports. */
   partial?: boolean;
 }
 

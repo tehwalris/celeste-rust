@@ -6,8 +6,9 @@ and verify every result end to end.
 
 JOBS.json: a list of {"cat": "nodiag", "room": "0,0", "name": "100m",
 "offset": 27, "levels": "r0sxhn,r0sxh", "l1": true, "mem": "60G"} (optional:
-"flags": more flags for the search, e.g. ["--trim-rows"] (a job's old "env"
-of CELESTE_* variables is translated: the binaries refuse the environment); "tag"; "timeout"; "reuse": a level-0 tree directory, moved in when it exists and moved back
+"flags": more flags for the search, e.g. ["--split-frame"] (a job's old "env"
+of CELESTE_* variables is refused, as the binaries refuse them); "tag";
+"timeout"; "reuse": a level-0 tree directory, moved in when it exists and moved back
 there when the job ends - so jobs can count horizons up on one kept tree;
 "to": a horizon H instead of the reference - `--to H`, level -1 at H, and a
 refutation is a result (the optimum is above H); "keep_tree": leave the tree
@@ -60,29 +61,12 @@ def mode_flags(cat):
     return flags
 
 
-# A job's old "env" (CELESTE_* variables, before the settings were flags).
-ENV_FLAGS = {"CELESTE_TRIM_ROWS": "--trim-rows", "CELESTE_SPLIT_FRAME": "--split-frame", "CELESTE_THREADS": "--threads", "CELESTE_REGION": "--region"}
-# Knobs since fixed (no flag): accepted at their fixed value only.
-ENV_FIXED = {"CELESTE_STORAGE_REGION": "8", "CELESTE_MIN_FREE_GB": "20"}
-
-
 def job_flags(job):
-    flags = list(job.get("flags", []))
-    for k, v in job.get("env", {}).items():
-        if k in ENV_FIXED:
-            if v != ENV_FIXED[k]:
-                raise SystemExit(f"job {job}: {k}={v!r}: fixed at {ENV_FIXED[k]} now (no flag)")
-            continue
-        if k not in ENV_FLAGS:
-            raise SystemExit(f"job {job}: env {k} has no flag here: give it in \"flags\"")
-        flag = ENV_FLAGS[k]
-        if flag in ("--trim-rows", "--split-frame"):
-            if v != "1":
-                raise SystemExit(f"job {job}: {k}={v!r}: a flag is 1")
-            flags.append(flag)
-        else:
-            flags += [flag, v]
-    return flags
+    """The job's own search flags. A job's "env" (CELESTE_* variables, before
+    2026-10-10) is refused, as the binaries refuse the environment."""
+    if "env" in job:
+        raise SystemExit(f"job {job}: \"env\" is gone (the binaries refuse CELESTE_* variables): give its settings in \"flags\"")
+    return list(job.get("flags", []))
 
 
 def replay_args(cat):

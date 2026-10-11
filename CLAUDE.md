@@ -150,7 +150,7 @@ thing that fails.
   `CELESTE_*` variable (naming the flag that replaced it). A tree records
   the settings that change it (`<level dir>/settings.txt`) and refuses a run
   under others; `--override-settings` proceeds only past a different
-  `--region`, loudly. A tree without the record: `rewrite adopt-settings`.
+  `--region`, loudly. A tree without the record is refused (delete it).
 - A search RESUMES from its checkpoint directory: rerun the same command
   after a crash or kill; delete the directory for a fresh run.
 

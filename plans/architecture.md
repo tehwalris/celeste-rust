@@ -219,7 +219,8 @@ bounds were both seeded (`d.ranges`, and the lowering's `fold_with(..,
 ranges)`) and guarded, and the lowering's fold, seeded with the very range,
 folded the guard to true: a lane with speed or remainder outside was
 computed silently wrong (x/y were held by the dispatch alone). The trees
-audited (`rewrite bounds-audit`) never held such a row. The codegen emits
+audited (`rewrite bounds-audit`, retired 2026-10-11 now that every kernel
+checks per lane) never held such a row. The codegen emits
 `Restrict` as the identity; the error is two compares a bound.
 The platforms (`p`, 2026-10-09) were the last seeded ranges: a platform's
 `x` (the path) and, with a player, its `spd.x` (its range over the worlds)
@@ -254,8 +255,8 @@ metrics included). Charging a pin per outcome as a restriction cost up to
 +0.3% dynamic instructions, so the two kinds keep their charging. The one
 assumption left outside the family: the no-player phase's `spd.x`, read as
 its one moving speed `v` and owed `0 or v` per lane (a two-point set; a pin
-to the hull would admit speeds in between). `rewrite bounds-audit --room`
-audits these.
+to the hull would admit speeds in between). A lane outside is the
+kernel's own error (a fatal coverage gap).
 
 **The map folds by range** (`spikes_at`, 2026-10-10, branch `kernel-opt`).
 `tile_flag_at` is an intrinsic whose interval reading (`Graph::tile_flag_over`)
