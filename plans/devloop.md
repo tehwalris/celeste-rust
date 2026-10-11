@@ -276,7 +276,7 @@ walk 20-26 s). The level -1 table without a cached file: (4,2) 12 s, (6,2)
 | the reference frame `/var/tmp/canon-h62-f56` (hand-made) | the r62h57 fixture, `./check.sh big` | reproducible, pinned |
 | a synthetic-win search in an object room | t2 `search42-objects` | new |
 | the platform rooms (verified by hand: (6,0) split to step 75) | t2 forward + frame + metrics | new, pinned |
-| `ckhash --edges`: frames one at a time | in parallel (room (1,0) to f56: >15 s -> 4 s) | every fixture build and gate uses it |
+| `ckhash --edges`: frames one at a time | in parallel (room (1,0) to f56: >15 s -> 4 s); since 2026-10-11 streamed (frames in order, each frame's units on every thread, each entry's key hashed once) | every fixture build and gate uses it. The parallel frames each materialized their edges: r62h57 peaked at 38 GB (70 GB unwrapped in the 11:38 OOM); streamed 4.9 GB, 6 s |
 
 ## What remains over budget, and gaps
 

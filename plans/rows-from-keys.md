@@ -150,7 +150,17 @@ rows pays ~2-3x the CPU, from a file 6-9x smaller.
   other old variables, saying why.
 - **The reference sink stores widened rows** (gap 2).
 - **Format 13 -> 14**: old trees are refused (as every format change);
-  fixtures rebuild (`tools/fixtures.sh ensure` does it).
+  fixtures rebuild (`tools/fixtures.sh ensure` does it). A format-13 tree
+  converts in place: `rewrite convert-tree --dir D` (every tree under D,
+  each in the room its settings record). Each v14 file is decoded back
+  and compared with the v13 rows exactly, its stored keys and cells with
+  its ids', before any file of the tree is replaced; a failure leaves the
+  tree at 13. 2026-10-11: every format-13 tree on the machine but another
+  agent's (42 trees: three private fixture copies, four t2 scratch dirs, a
+  r62h copy; 244M rows), `ckhash --edges` (`--dropped`) identical before
+  (v13 binary) and after, resumes (`bench-frame`) equal to their pins or
+  their own next frame; a fixture copy's seven trees (73.7M rows) in 4-7 s
+  at 0.6 GB peak.
 - `rewrite decode-check` (the format-13 comparison) is gone with the stored
   rows it compared against; its result is the table above, and the guard
   plus `frame::tests::a_resumed_frontier_is_the_forwards_own` (every frame
