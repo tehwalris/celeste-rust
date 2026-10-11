@@ -807,6 +807,12 @@ REACHED` at frame 24, the frame the player spawns with `rem` set to 0.
 4. **The UI** (`ui/`, TypeScript) still carries the ladder's concepts
    (several horizons, kernel re-run backward iterations, the band colours);
    the exporter writes one horizon and leaves those fields empty.
+5. **The optimal-path set as the search's output** (Philippe, 2026-10-11;
+   plans/optimal-set.md): R (the nodes reached inside W, with their exact
+   remainder points) at H* is 8-133 KB raw where the trees are 13-345M
+   states; a later concrete selection search inside it picks the path by a
+   preference. Measured by `rewrite optimal-set`; the writer, reader and
+   selection search are not built.
 
 ## Where the old plans went (2026-10-04)
 

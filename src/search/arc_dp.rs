@@ -192,7 +192,7 @@ pub struct Loaded {
 
 /// Run `f` over the nodes `0..n` in parallel chunks (`f(lo, hi)`), collecting
 /// its results in chunk order, on `threads` workers.
-fn par_chunks<T: Send>(n: usize, threads: usize, f: impl Fn(usize, usize) -> anyhow::Result<T> + Sync) -> anyhow::Result<Vec<T>> {
+pub(super) fn par_chunks<T: Send>(n: usize, threads: usize, f: impl Fn(usize, usize) -> anyhow::Result<T> + Sync) -> anyhow::Result<Vec<T>> {
     let threads = threads.max(1);
     let chunk = n.div_ceil(threads * 8).max(1);
     let next = std::sync::atomic::AtomicUsize::new(0);
@@ -993,7 +993,7 @@ pub fn optimum(g: &Graph, w: &Winning, start: u32, point: (u32, u32), horizon: u
 }
 
 /// An action on one point of the circle.
-fn apply(a: Action, p: u32) -> u32 {
+pub(super) fn apply(a: Action, p: u32) -> u32 {
     match a {
         Action::Rotate(v) => (p as i64 + v as i64).rem_euclid(super::arcs::CIRCLE as i64) as u32,
         Action::Const(c) => c,
@@ -1045,7 +1045,7 @@ pub struct NodeKeys(Vec<(u64, (u64, u64), u32, u32)>);
 impl NodeKeys {
     /// From `(shape, key, cell, node)` in any order; a key twice keeps its
     /// lowest node.
-    fn new(mut v: Vec<(u64, (u64, u64), u32, u32)>) -> Self {
+    pub(super) fn new(mut v: Vec<(u64, (u64, u64), u32, u32)>) -> Self {
         v.sort_unstable();
         v.dedup_by_key(|e| (e.0, e.1, e.2));
         NodeKeys(v)
@@ -1142,14 +1142,14 @@ pub(super) fn concrete_engines(n: usize, run: &crate::settings::Settings) -> any
 /// order, which the search's exact dedup would drop: skipping it changes
 /// nothing but the step count.
 #[derive(Default)]
-struct Covered(Vec<(u8, u8)>);
+pub(super) struct Covered(Vec<(u8, u8)>);
 
 impl Covered {
-    fn covers(&self, byte: u8) -> bool {
+    pub(super) fn covers(&self, byte: u8) -> bool {
         self.0.iter().any(|&(b, read)| (b ^ byte) & read == 0)
     }
 
-    fn push(&mut self, byte: u8, read: u8) {
+    pub(super) fn push(&mut self, byte: u8, read: u8) {
         self.0.push((byte, read));
     }
 }

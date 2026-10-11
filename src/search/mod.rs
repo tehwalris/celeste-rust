@@ -7,6 +7,7 @@
 //!   * `arcs`       - sets of remainders as arcs of the circle
 //!   * `arc_dp`     - THE SEARCH: winning sets, optimum, concrete search
 //!   * `known`      - a known solution checked against every pruning step
+//!   * `optimal_set` - `rewrite optimal-set`: the optimal-path set, measured
 //!   * `pos_graph`  - player-position cells and the position graph
 //!   * `inspect`    - rows read by named fields, for the diagnostics
 //!   * `ui_export`  - `rewrite export-ui`: a finished run -> the web UI's data
@@ -17,5 +18,6 @@ pub mod checkpoint;
 pub mod edges;
 pub mod inspect;
 pub mod known;
+pub mod optimal_set;
 pub mod pos_graph;
 pub mod ui_export;

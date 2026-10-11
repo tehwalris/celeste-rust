@@ -114,6 +114,46 @@ enum Command {
         #[arg(long)]
         prefer: Option<String>,
     },
+    /// THE OPTIMAL-PATH SET of a finished search's tree, measured
+    /// (`search::optimal_set`, plans/optimal-set.md): at the optimum H* read
+    /// off the tree's horizon (and up to `--slack` frames more), the nodes
+    /// reached from the start inside the winning sets, with their exact
+    /// remainders (points), per frame and in total, the edges between them,
+    /// against the tree, the remainder-free marks and W's support, and the
+    /// bytes of the set's encodings. `--concrete`: the concrete states a
+    /// breadth-first search inside the set visits, to the horizon.
+    OptimalSet {
+        /// The level's tree (`<checkpoint-dir>/level{i:02}` of a search).
+        #[arg(long)]
+        level_dir: String,
+        /// The tree's level (one level).
+        #[arg(long, default_value = "r0sx")]
+        level: String,
+        /// The tree's horizon in frames (it must reach it).
+        #[arg(long)]
+        horizon: u32,
+        /// Also measure H* + 1 ..= H* + slack (at most the horizon).
+        #[arg(long, default_value_t = 0)]
+        slack: u32,
+        /// Run the concrete breadth-first search inside the exact set (every
+        /// layer to the horizon) and count its states.
+        #[arg(long)]
+        concrete: bool,
+        /// The same inside the time-collapsed set (per node its first and
+        /// last frame and the union of its remainders).
+        #[arg(long)]
+        collapsed: bool,
+        /// A concrete search stops past this many states in a layer.
+        #[arg(long, default_value_t = 2_000_000)]
+        budget: usize,
+        /// Write the exact set (regions form, raw) per horizon N to FILE with
+        /// the extension `.hN`.
+        #[arg(long)]
+        write: Option<String>,
+        /// Print the per-frame profile (a markdown table).
+        #[arg(long)]
+        profile: bool,
+    },
     /// A KNOWN solution against the pruning of finished search trees
     /// (`search::known`): stepped through the reference engine, at every
     /// step it must pass level -1 (the filter the tree recorded) and the
@@ -932,6 +972,19 @@ fn main() -> Result<()> {
                 prev = Some((s.arc_marks.expect("asked for"), lvl));
             }
             println!("[check-known] every level passes ({:.1} s)", t0.elapsed().as_secs_f64());
+        }
+        Command::OptimalSet { level_dir, level, horizon, slack, concrete, collapsed, budget, write, profile } => {
+            let level = Level::parse(&level).map_err(|e| anyhow::anyhow!(e))?;
+            let o = celeste_rust::search::optimal_set::Opts {
+                horizon: horizon * cfg.steps_per_frame(),
+                slack,
+                concrete,
+                collapsed,
+                budget,
+                write: write.as_deref().map(std::path::Path::new),
+                profile,
+            };
+            celeste_rust::search::optimal_set::run(std::path::Path::new(&level_dir), level, &o, &cfg)?;
         }
         Command::Forward {
             to,
