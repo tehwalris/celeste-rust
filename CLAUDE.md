@@ -127,8 +127,13 @@ whole Claude session and a background agent's uncommitted hour of work with
 it. The judgment call about which command is "cheap enough" is exactly the
 thing that fails.
 
-- Exit code 137 means OOM. Never raise the cap past what `free` leaves after
-  /tmp, which is a tmpfs.
+- Exit code 137 means OOM. `safe-run.sh` REFUSES a `--memory` above
+  MemAvailable less 10 GB (MemAvailable counts /tmp, a tmpfs) and lowers
+  its default to fit, printing the limit: caps that together exceed the
+  machine took it down on 2026-10-11 (a 100G search beside an UNWRAPPED
+  70 GB `ckhash` in tools/fixtures.sh).
+- Scripts too: every binary and cargo a script runs goes through
+  `safe-run.sh` (`scripts_wrapped`, a t0 test, fails on a line that does not).
 - **One cargo at a time: `./one-cargo.sh cargo ...`** (an flock on the build
   directory: a second build WAITS and says so, instead of blocking silently
   or swapping the binary under a running measurement).

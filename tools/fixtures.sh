@@ -77,7 +77,7 @@ sources() {
 fingerprint() {
     local dir=$1/$TREE extra=""
     [[ $FLAGS == *level-minus-one* ]] && extra=--dropped
-    "$B" ckhash --room "$ROOM" --to "$LAST" --edges $extra --checkpoint-dir "$dir" 2>/dev/null
+    ./safe-run.sh -- "$B" ckhash --room "$ROOM" --to "$LAST" --edges $extra --checkpoint-dir "$dir" 2>/dev/null
 }
 
 build() {

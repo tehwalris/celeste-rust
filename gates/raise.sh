@@ -38,7 +38,7 @@ for H in "$@"; do
             /usr/bin/time -f "%e s %M KB" ./safe-run.sh --memory 25G -- $B forward --room "$ROOM" --to "$H" --level-minus-one "$H,5" ${LEVEL:+--level ${LEVEL%%,*}} $EXTRA --checkpoint-dir "$T" > "$LOG.out" 2> "$LOG" || { echo "$KIND h$H FAILED (see $LOG)"; FAIL=1; continue; }
             L0=$T
         fi
-        $B ckhash --room "$ROOM" --to "$H" --edges --checkpoint-dir "$L0" > "$DIR/$KIND-$H.ck" 2>/dev/null || { echo "$KIND h$H ckhash FAILED"; FAIL=1; }
+        ./safe-run.sh -- $B ckhash --room "$ROOM" --to "$H" --edges --checkpoint-dir "$L0" > "$DIR/$KIND-$H.ck" 2>/dev/null || { echo "$KIND h$H ckhash FAILED"; FAIL=1; }
         echo "$KIND h$H: $(tail -1 "$LOG") $(grep -c '^\[raise\] f' "$LOG") frames raised"
     done
     diff -q "$DIR/raised-$H.ck" "$DIR/fresh-$H.ck" > /dev/null && echo "h$H ckhash+edges OK" || { echo "h$H ckhash+edges DIFF"; FAIL=1; }

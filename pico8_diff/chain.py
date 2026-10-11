@@ -201,7 +201,7 @@ def check_start(cat, level, binary):
     rx, ry = room_of(level)
     flags = ["--room", f"{rx},{ry}", "--loading-jank", str(j) if j else "none", "--balloon-seeds", "0"] + (["--gemskip"] if cat.startswith("gemskip") else [])
     root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    ours = subprocess.run([binary, "-i", "0", "--dump-start"] + flags, capture_output=True, text=True, cwd=root, check=True).stdout.splitlines()
+    ours = subprocess.run([os.path.join(root, "safe-run.sh"), "--", binary, "-i", "0", "--dump-start"] + flags, capture_output=True, text=True, cwd=root, check=True).stdout.splitlines()
     skip = ("room_title", "message", "flag")
     pico = [fields(l) for l in ref if l.startswith("obj ") and l.split()[2] not in skip]
     mine = [fields(l) for l in ours if l.startswith("obj ")]
@@ -276,7 +276,7 @@ def start_classes(level, binary, cat="any"):
     for j in feasible_janks(level):
         flags = ["--room", f"{rx},{ry}", "--loading-jank", str(j), "--balloon-seeds", "0"] + (["--gemskip"] if cat.startswith("gemskip") else [])
         root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        dump = subprocess.run([binary, "-i", "0", "--dump-start"] + flags, capture_output=True, text=True, cwd=root, check=True).stdout
+        dump = subprocess.run([os.path.join(root, "safe-run.sh"), "--", binary, "-i", "0", "--dump-start"] + flags, capture_output=True, text=True, cwd=root, check=True).stdout
         classes.setdefault(dump, []).append(j)
     return list(classes.values())
 

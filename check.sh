@@ -175,7 +175,7 @@ t2() {
 gate10_forward() {
     ./safe-run.sh -- "$B" forward --to 44 --room 1,0 --checkpoint-dir "$C/t2/g10" > "$C/t2/g10.out" || return 1
     grep '^posgraph' "$C/t2/g10.out" | diff gates/posgraph_room10_f044.txt - >&2 || return 1
-    "$B" ckhash --to 44 --room 1,0 --checkpoint-dir "$C/t2/g10" | diff gates/ckhash_room10_f000-044.txt - >&2
+    ./safe-run.sh -- "$B" ckhash --to 44 --room 1,0 --checkpoint-dir "$C/t2/g10" | diff gates/ckhash_room10_f000-044.txt - >&2
 }
 gate10_arc() {
     ./safe-run.sh -- "$B" search --to 35 --win-at 9,101 --checkpoint-dir "$C/t2/arc10" --prefer gates/known_room10_win9-101.txt > "$C/t2/arc10.out" || return 1
@@ -192,7 +192,7 @@ search42() {
 # fingerprint is the r60s fixture's pin.
 forward60() {
     ./safe-run.sh -- "$B" forward --room 6,0 --level r0sxhfp --to 71 --split-frame --checkpoint-dir "$C/t2/p60" > /dev/null || return 1
-    "$B" ckhash --room 6,0 --to 71 --edges --checkpoint-dir "$C/t2/p60" 2> /dev/null | diff "$G/r60s.ckhash" - >&2
+    ./safe-run.sh -- "$B" ckhash --room 6,0 --to 71 --edges --checkpoint-dir "$C/t2/p60" 2> /dev/null | diff "$G/r60s.ckhash" - >&2
 }
 
 widen60() {

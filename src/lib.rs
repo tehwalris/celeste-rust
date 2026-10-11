@@ -11,6 +11,9 @@ pub mod storage;
 pub mod trace;
 pub mod transpile;
 
+#[cfg(test)]
+mod scripts_wrapped;
+
 // The leaf types live in `celeste-core` (so the engine crates can use them);
 // re-exported here so `celeste_rust::pico8_num` etc. resolve.
 pub use celeste_core::{cart_data, collision_cache, pico8_num};

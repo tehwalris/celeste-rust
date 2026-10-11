@@ -42,7 +42,7 @@ fi
 
 if [ ! -x "$lua_run" ]; then
     echo "pico8_diff: building lua_run (missing at $lua_run)" >&2
-    if ! cargo build --release --bin lua_run >&2; then
+    if ! "$repo_root/safe-run.sh" -- "$repo_root/one-cargo.sh" cargo build --release --bin lua_run >&2; then
         echo "pico8_diff: cargo build --release --bin lua_run failed" >&2
         exit 2
     fi
@@ -102,7 +102,7 @@ for case_file in "${cases[@]}"; do
     cart="$work/$name.p8"
 
     ours_status=0
-    "$lua_run" "$case_file" >"$ours" 2>"$errs" || ours_status=$?
+    "$repo_root/safe-run.sh" -- "$lua_run" "$case_file" >"$ours" 2>"$errs" || ours_status=$?
 
     "$here/wrap.sh" "$case_file" "$cart"
     # A cart that never returns would hang the suite; 60 s is ~1000x the time
