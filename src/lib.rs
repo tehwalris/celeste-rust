@@ -5,6 +5,7 @@ pub mod frame;
 pub mod game_runner;
 pub mod concrete;
 pub mod metrics;
+pub mod par;
 pub mod search;
 pub mod settings;
 pub mod storage;

@@ -316,40 +316,6 @@ struct LevelData {
     frames: Vec<(Sparse, Sparse)>,
 }
 
-/// `f(i)` for every `i < n` in parallel, results by index; the first error
-/// stops the pulling.
-fn par_map<T: Send>(n: usize, f: impl Fn(usize) -> Result<T> + Sync) -> Result<Vec<T>> {
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    let next = AtomicUsize::new(0);
-    let workers = std::thread::available_parallelism().map(|p| p.get()).unwrap_or(8).min(n.max(1));
-    let parts = std::thread::scope(|s| {
-        let handles: Vec<_> = (0..workers)
-            .map(|_| {
-                s.spawn(|| -> Result<Vec<(usize, T)>> {
-                    let mut mine = Vec::new();
-                    loop {
-                        let i = next.fetch_add(1, Ordering::Relaxed);
-                        if i >= n {
-                            return Ok(mine);
-                        }
-                        match f(i) {
-                            Ok(v) => mine.push((i, v)),
-                            Err(e) => {
-                                next.store(n, Ordering::Relaxed);
-                                return Err(e);
-                            }
-                        }
-                    }
-                })
-            })
-            .collect();
-        handles.into_iter().map(|h| h.join().expect("export worker panicked")).collect::<Result<Vec<_>>>()
-    })?;
-    let mut all: Vec<(usize, T)> = parts.into_iter().flatten().collect();
-    all.sort_unstable_by_key(|p| p.0);
-    Ok(all.into_iter().map(|p| p.1).collect())
-}
-
 /// A marks file, mapped: `Visited::save`'s `(shape, cell, k0, k1, dist)`
 /// rows (32 bytes each) then the horizon (4 bytes), read in place (up to
 /// ~100M rows).
@@ -419,7 +385,7 @@ fn mark_table(sets: &[MarksMap]) -> Result<(MarkTable, Vec<Vec<(u32, u32, u32)>>
     // Every set's rows in parallel into per-shard lists and (dist, cell) counts.
     let chunks: Vec<(usize, usize)> =
         sets.iter().enumerate().flat_map(|(k, m)| (0..m.rows.div_ceil(MARKS_CHUNK)).map(move |c| (k, c))).collect();
-    let read = par_map(chunks.len(), |i| {
+    let read = crate::par::Pool::per_core().map(chunks.len(), |i| {
         let (k, c) = chunks[i];
         let m = &sets[k];
         let mut shards: Vec<Vec<MarkId>> = vec![Vec::new(); MARK_SHARDS];
@@ -446,7 +412,7 @@ fn mark_table(sets: &[MarksMap]) -> Result<(MarkTable, Vec<Vec<(u32, u32, u32)>>
     }
     // Per shard: one entry per state with its sets' bits OR-ed, and the
     // shard's (shape, cell)s.
-    let built = par_map(MARK_SHARDS, |s| {
+    let built = crate::par::Pool::per_core().map(MARK_SHARDS, |s| {
         let lists = std::mem::take(&mut *per_shard[s].lock().unwrap());
         let mut map: FxHashMap<MarkId, u64> = FxHashMap::default();
         map.reserve(lists.iter().map(|l| l.1.len()).sum());
@@ -569,7 +535,7 @@ fn read_tree(dir: &Path, marks: Option<&MarkTable>, nsets: usize) -> Result<(Lev
         _ => None,
     };
     let marks = marks.zip(tree.as_ref());
-    let mut counts = par_map(n, |i| frame_counts(dir, (n - 1 - i) as u32, marks, nsets))?;
+    let mut counts = crate::par::Pool::per_core().map(n, |i| frame_counts(dir, (n - 1 - i) as u32, marks, nsets))?;
     counts.reverse();
     let mut frames: Vec<(Sparse, Sparse)> = Vec::with_capacity(n);
     let mut layers: Vec<Vec<Sparse>> = vec![Vec::with_capacity(n); nsets];

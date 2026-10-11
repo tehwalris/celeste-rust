@@ -1726,34 +1726,19 @@ fn main() -> Result<()> {
             };
             // The rows in parallel (the kernels' engine shared, a reference
             // engine per worker), reported in row order.
-            let next = std::sync::atomic::AtomicUsize::new(0);
-            let workers = cfg.threads().min(n);
-            type Row = (String, usize, usize, usize);
-            let mut done: Vec<(usize, Row)> = std::thread::scope(|sc| {
-                let hs: Vec<_> = (0..workers)
-                    .map(|_| {
-                        sc.spawn(|| -> Result<Vec<(usize, Row)>> {
-                            let mut reference = RefEngine::new(&cfg)?.at_level(level);
-                            if let Some(cap) = path_cap {
-                                reference.set_path_cap(cap);
-                            }
-                            let mut out = Vec::new();
-                            loop {
-                                let k = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                let Some(&row) = picked.get(k) else { return Ok(out) };
-                                out.push((k, one(&mut reference, row)?));
-                            }
-                        })
-                    })
-                    .collect();
-                hs.into_iter().map(|h| h.join().expect("a ref-check worker panicked")).collect::<Result<Vec<_>>>()
-            })?
-            .into_iter()
-            .flatten()
-            .collect();
-            done.sort_by_key(|d| d.0);
+            let done = celeste_rust::par::Pool::new(cfg.threads()).map_with(
+                n,
+                || {
+                    let mut reference = RefEngine::new(&cfg)?.at_level(level);
+                    if let Some(cap) = path_cap {
+                        reference.set_path_cap(cap);
+                    }
+                    Ok(reference)
+                },
+                |reference, k| one(reference, picked[k]),
+            )?;
             let (mut sound_gaps, mut precision_gaps, mut rows_bad, mut skipped) = (0usize, 0usize, 0usize, 0usize);
-            for (_, (text, missing, extra, skip)) in done {
+            for (text, missing, extra, skip) in done {
                 print!("{text}");
                 sound_gaps += missing;
                 precision_gaps += extra;
