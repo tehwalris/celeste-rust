@@ -273,11 +273,6 @@ enum Command {
         /// Compute W_F this many times, each from a copy.
         #[arg(long, default_value_t = 1)]
         reps: usize,
-        /// EXPERIMENT: also the whole backward both ways - the time-stepped
-        /// sweep and the region worklist (`search::arc_worklist`) - with
-        /// their reads, opens and walls, and every frame's W line compared.
-        #[arg(long)]
-        worklist: bool,
     },
     /// A finished tree's edges counted against the target layouts of
     /// plans/storage-unify.md (built lids, unified per-region sets, hybrids):
@@ -1230,62 +1225,13 @@ fn main() -> Result<()> {
             let ks = take_kernel_stats();
             anyhow::ensure!(ks.missed == 0, "KERNEL COVERAGE GAP: {} lanes missed", ks.missed);
         }
-        Command::BenchBackward { level_dir, horizon, frame, reps, worklist } => {
+        Command::BenchBackward { level_dir, horizon, frame, reps } => {
             anyhow::ensure!(frame < horizon, "--frame {frame}: below the horizon {horizon}");
             let dir = std::path::Path::new(&level_dir);
             let t = std::time::Instant::now();
             let seeds = celeste_rust::search::arc_dp::Seeds::load(dir, horizon)?;
             let resolver = celeste_rust::storage::marks::Resolver::load(dir, horizon)?;
             let content = resolver.space.content_hash();
-            if worklist {
-                use celeste_rust::search::arc_dp::gate_w_hash;
-                // Every frame's (count, hash), from (id, spans) per node.
-                let lines = |nodes: &mut dyn Iterator<Item = (u64, Vec<(u32, u32, &celeste_rust::search::arcs::Region)>)>| -> anyhow::Result<Vec<(i64, u64)>> {
-                    let mut d = vec![(0i64, 0u64); horizon as usize + 2];
-                    for (id, spans) in nodes {
-                        let (shape, key, cell) = resolver.resolve(id)?;
-                        let h = content.state(shape, key, cell);
-                        for (lo, hi, r) in spans {
-                            let g = gate_w_hash(h, r);
-                            d[lo as usize] = (d[lo as usize].0 + 1, d[lo as usize].1.wrapping_add(g));
-                            d[hi as usize + 1] = (d[hi as usize + 1].0 - 1, d[hi as usize + 1].1.wrapping_sub(g));
-                        }
-                    }
-                    let mut acc = (0i64, 0u64);
-                    Ok(d[..=horizon as usize].iter().map(|x| {
-                        acc = (acc.0 + x.0, acc.1.wrapping_add(x.1));
-                        acc
-                    }).collect())
-                };
-                seeds.store.advise(memmap2::Advice::Random)?;
-                let t = std::time::Instant::now();
-                let w = celeste_rust::search::arc_dp::backward(&seeds.store, &seeds.pairs, &seeds.wins, horizon, cfg.threads());
-                eprintln!("[bench-backward] the sweep: {:.2} s, {} nodes, anon {:.2} GB", t.elapsed().as_secs_f64(), w.len(), celeste_rust::metrics::current_rss_gb());
-                let a = lines(&mut w.nodes().map(|x| (x.id, x.spans().collect())))?;
-                drop(w);
-                let t = std::time::Instant::now();
-                let (vals, sets, st) = celeste_rust::search::arc_worklist::backward(&seeds.store, &seeds.pairs, &seeds.wins, horizon);
-                let opens: Vec<u32> = st.opens.values().copied().collect();
-                eprintln!(
-                    "[bench-backward] the region worklist: {:.2} s (one thread), {} nodes, anon {:.2} GB; {} target regions opened {:.1} times each (at most {}), {} passes, {} updates, {} changes; {} in-edges read, {:.2} GB of the edge store ({} (region, frame) opens)",
-                    t.elapsed().as_secs_f64(),
-                    vals.len(),
-                    celeste_rust::metrics::current_rss_gb(),
-                    opens.len(),
-                    opens.iter().map(|&o| o as f64).sum::<f64>() / opens.len().max(1) as f64,
-                    opens.iter().max().copied().unwrap_or(0),
-                    st.passes,
-                    st.updates,
-                    st.changes,
-                    st.read.edges,
-                    st.read.bytes() as f64 / 1e9,
-                    st.read.region_opens
-                );
-                let b = lines(&mut vals.iter().map(|(id, sp)| (*id, sp.iter().map(|&(lo, hi, s)| (lo as u32, hi as u32, &sets[s as usize])).collect())))?;
-                anyhow::ensure!(a == b, "the worklist's W differs from the sweep's");
-                println!("[bench-backward] the same W at every frame: {} frames", a.len());
-                return Ok(());
-            }
             eprintln!("[bench-backward] h{horizon}'s edge files opened in {:.2} s: {} win rows, {} edges; {} threads", t.elapsed().as_secs_f64(), seeds.wins.len(), seeds.store.edges, cfg.threads());
             let t = std::time::Instant::now();
             let mut b = celeste_rust::search::arc_dp::Backward::new(&seeds.store, &seeds.pairs, &seeds.wins, horizon, cfg.threads());
