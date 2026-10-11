@@ -229,6 +229,9 @@ fn verdict(b: &Block, s: u32, seeded: bool, l1: Option<(u32, &crate::trace::leve
                 return Ok(forward(format!("LEVEL -1 drops it: d {:?} from step {s} exceeds its horizon {h} ({node})", table.d_of(shape, cell))));
             }
         }
+        if p.settings.pruned_cell(cell) {
+            return Ok(forward(format!("THE HEURISTIC --prune-rect drops it at step {s} ({node})")));
+        }
         if let Some(f) = route.filter {
             let mut row = lookup_view(b.rt2(), seeded)?;
             crate::frame::widen_rt2_to(&mut row, p.level);

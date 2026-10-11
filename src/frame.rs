@@ -649,6 +649,8 @@ pub struct FrameStats {
     pub lanes_in: usize,
     /// Emissions past level -1: each a record (a lookup and an edge).
     pub lanes_raw: usize,
+    /// Rows `--prune-rect` dropped (HEURISTIC).
+    pub lanes_pruned: usize,
     /// New states.
     pub lanes_kept: usize,
     pub blocks_out: usize,
@@ -1484,7 +1486,7 @@ fn log_frame(
          wave {:.0} (idle {:.0}%, regions {:.0} worker-ms) layer {:.0} ckpt {:.0} pos {:.0} total {:.0} ms | \
          units {} slices {} routes {} edges {} bundles {} ({:.3} B) | \
          in {:.2} visited {:.2} GB rss start {:.2} wave {:.2} end {:.2} peak {:.2} GB (anon; file {:.2}) | \
-         keys {} bits, {} codes (+{})",
+         keys {} bits, {} codes (+{}){}",
         st.blocks_in,
         st.lanes_in,
         st.lanes_raw,
@@ -1515,6 +1517,7 @@ fn log_frame(
         st.key_bits,
         st.key_codes,
         st.new_codes,
+        if st.lanes_pruned > 0 { format!(" | pruned {} (HEURISTIC --prune-rect)", st.lanes_pruned) } else { String::new() }
     );
     crate::metrics::record("fwd.wave", st.t_wave);
     crate::metrics::record("fwd.regions", st.t_regions);

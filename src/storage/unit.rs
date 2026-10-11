@@ -210,6 +210,8 @@ pub struct UnitSink<'a> {
     /// The level -1 table of `filters.minus_one` (or a raise's old filter:
     /// the same table), resolved once.
     l1: Option<&'static crate::trace::level_minus_one::CostToGo>,
+    /// `--prune-rect` (HEURISTIC): its rows are dropped at emission.
+    prune: Vec<(i16, i16, i16, i16)>,
     drop_last: Option<((u64, u32), Option<u32>)>,
     xfer_ids: FxHashMap<crate::search::arc_edges::Pair, u32>,
     xfer_cache: Vec<(crate::compiled::asm_kernel::RawWords, u32)>,
@@ -225,6 +227,8 @@ pub struct UnitSink<'a> {
     pub pos_edges: FxHashSet<(u32, u32)>,
     /// Emissions past level -1 (each one a record).
     pub emitted: u64,
+    /// Rows `--prune-rect` dropped (HEURISTIC; the `[fwd]` line's `pruned`).
+    pub pruned: u64,
     /// `--emit-capture`: this worker's stream (`bench`).
     capture: Option<super::bench::CaptureWriter>,
     /// The shapes this worker noted (`note_shape`), registered
@@ -295,6 +299,7 @@ impl<'a> UnitSink<'a> {
             check: Vec::new(),
             phases: s.diag.phases,
             l1,
+            prune: s.prune_rects.clone(),
             drop_last: None,
             xfer_ids: Default::default(),
             xfer_cache: Vec::new(),
@@ -304,6 +309,7 @@ impl<'a> UnitSink<'a> {
             edges_on,
             pos_edges: Default::default(),
             emitted: 0,
+            pruned: 0,
             capture: super::bench::CaptureWriter::open(frame, worker, level, s),
             noted: Default::default(),
             registered: Default::default(),
@@ -402,6 +408,15 @@ impl<'a> UnitSink<'a> {
         let r = (from > m.h).then_some(from);
         self.drop_last = Some(((shape, cell), r));
         r
+    }
+
+    /// Is the row's player cell in a `--prune-rect` (HEURISTIC: dropped, no
+    /// note - a raise never readmits it)?
+    #[inline]
+    pub fn pruned(&mut self, cell: u32) -> bool {
+        let p = !self.prune.is_empty() && crate::settings::in_rects(&self.prune, cell);
+        self.pruned += u64::from(p);
+        p
     }
 
     /// A row level -1 dropped, from `lane`: its source is noted (`from`:
@@ -644,7 +659,7 @@ impl<'a> UnitSink<'a> {
     /// template.
     pub fn emit_row(&mut self, row: &Rt2, cell: u32) -> Result<()> {
         debug_assert_eq!(row.width, 1);
-        if self.minus_one_drop(row.shape_hash, cell).is_some() {
+        if self.minus_one_drop(row.shape_hash, cell).is_some() || self.pruned(cell) {
             return Ok(());
         }
         let (w, key) = self.row_key(row);

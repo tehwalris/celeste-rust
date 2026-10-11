@@ -584,6 +584,9 @@ impl AsmKernel {
                             sink.pos_edges.insert((cin, cout));
                         }
                         sink.dropped(lanes[i], from);
+                    } else if sink.pruned(cout) {
+                        // `--prune-rect` (HEURISTIC): dropped, no note.
+                        take &= !(1 << i);
                     }
                 }
                 if take == 0 {

@@ -367,6 +367,7 @@ pub fn run_wave(engine: &dyn FrameStep, frontier: Vec<Block>, cx: WaveCtx) -> Re
     for sink in &mut sinks {
         sink.finish()?;
         st.lanes_raw += sink.emitted as usize;
+        st.lanes_pruned += sink.pruned as usize;
         if let Some(p) = pos {
             p.record_pairs(sink.pos_edges.iter().copied());
         }

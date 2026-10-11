@@ -63,6 +63,10 @@ pub struct Settings {
     /// load (`--start-inputs`; the reference engine, exact): frame 0 is
     /// that state, the horizon counts from it.
     pub start_inputs: Option<Vec<u8>>,
+    /// HEURISTIC prune (`--prune-rect`): a row whose player cell lies in one
+    /// of these `(x0, x1, y0, y1)` (inclusive) is dropped at emission. NOT
+    /// sound: a search under it proves nothing (`is_heuristic`).
+    pub prune_rects: Vec<(i16, i16, i16, i16)>,
     // NOT recorded.
     /// The level -1 filter `(H, S)`, H in search steps (`--level-minus-one`;
     /// the tree records it as `TreeFilter`).
@@ -138,6 +142,7 @@ impl Default for Settings {
             balloon_seeds: None,
             cart: None,
             start_inputs: None,
+            prune_rects: Vec::new(),
             level_minus_one: None,
             concrete_balloon_seeds: None,
             threads: None,
@@ -164,6 +169,16 @@ impl Settings {
         } else {
             1
         }
+    }
+
+    /// Is a heuristic in force that makes a refutation no proof (`--prune-rect`)?
+    pub fn is_heuristic(&self) -> bool {
+        !self.prune_rects.is_empty()
+    }
+
+    /// Is a player cell inside a `--prune-rect`?
+    pub fn pruned_cell(&self, cell: u32) -> bool {
+        in_rects(&self.prune_rects, cell)
     }
 
     /// The room that means "won" (`game_runner::win_room` of `--room`).
@@ -206,6 +221,7 @@ impl Settings {
         let opt = |v: Option<String>| v.unwrap_or_else(|| "none".to_string());
         let cart = self.cart.as_ref().map(|c| ("cart", format!("sha256:{}", c.sha256)));
         let start = self.start_inputs.as_ref().map(|v| ("start_inputs", v.iter().map(|b| b.to_string()).collect::<Vec<_>>().join(",")));
+        let prune = (!self.prune_rects.is_empty()).then(|| ("prune_rects", self.prune_rects.iter().map(|(x0, x1, y0, y1)| format!("{x0}..{x1},{y0}..{y1}")).collect::<Vec<_>>().join(";")));
         vec![
             ("room", format!("{},{}", self.room.0, self.room.1)),
             ("win_at", opt(self.win_at.map(|(x0, x1, y0, y1)| format!("{x0}..{x1},{y0}..{y1}")))),
@@ -222,6 +238,7 @@ impl Settings {
         .into_iter()
         .chain(cart)
         .chain(start)
+        .chain(prune)
         .collect()
     }
 
@@ -230,7 +247,7 @@ impl Settings {
     pub fn cart_key(&self) -> String {
         // Not the start: the table is built from the room's load (its spawn
         // chain, the lattice walk), whatever state a search starts from.
-        let s: Vec<String> = self.recorded("").into_iter().filter(|(k, _)| *k != "level" && *k != "start_inputs").map(|(k, v)| format!("{k}={v}")).collect();
+        let s: Vec<String> = self.recorded("").into_iter().filter(|(k, _)| *k != "level" && *k != "start_inputs" && *k != "prune_rects").map(|(k, v)| format!("{k}={v}")).collect();
         s.join(" ")
     }
 
@@ -299,6 +316,12 @@ impl Settings {
         eprintln!("[settings] OVERRIDE (--override-settings) {}: the tree's record stays, this run proceeds under its own:\n  {}", dir.display(), show(&soft));
         Ok(())
     }
+}
+
+/// Is a player cell inside one of `rects` (`(x0, x1, y0, y1)`, inclusive)?
+pub fn in_rects(rects: &[(i16, i16, i16, i16)], cell: u32) -> bool {
+    let Some((x, y)) = crate::search::pos_graph::cell_xy(cell) else { return false };
+    rects.iter().any(|&(x0, x1, y0, y1)| (x0 as i32..=x1 as i32).contains(&x) && (y0 as i32..=y1 as i32).contains(&y))
 }
 
 /// The recorded settings `--override-settings` may override: those that do
@@ -388,6 +411,12 @@ pub struct SettingsArgs {
     /// tree records them.
     #[arg(long, global = true)]
     pub start_inputs: Option<String>,
+    /// HEURISTIC, NOT A PROOF: drop every row whose player cell lies in
+    /// "x0..x1,y0..y1" (inclusive; repeatable), at emission. A first path
+    /// search's cut of areas a route should not need; its refutations prove
+    /// nothing (they say so). The tree records it.
+    #[arg(long, global = true, value_parser = parse_win_at, allow_hyphen_values = true)]
+    pub prune_rect: Vec<(i16, i16, i16, i16)>,
     /// The balloons' phases of the concrete phase only (a tasdatabase file's
     /// seeds): the witness is one real run under them.
     #[arg(long, global = true)]
@@ -478,6 +507,7 @@ impl SettingsArgs {
             balloon_seeds: self.balloon_seeds.clone(),
             cart,
             start_inputs,
+            prune_rects: self.prune_rect.clone(),
             level_minus_one,
             concrete_balloon_seeds: self.concrete_balloon_seeds.clone(),
             threads: self.threads,
@@ -593,6 +623,7 @@ pub fn startup(args: &SettingsArgs, adjust: impl FnOnce(&mut Settings)) -> Resul
     note("--gemskip", s.gemskip, String::new());
     note("--loading-jank ", s.loading_jank.is_some(), format!("{}", s.loading_jank.unwrap_or_default()));
     note("--balloon-seeds ", s.balloon_seeds.is_some(), s.balloon_seeds.clone().unwrap_or_default());
+    note("--prune-rect (HEURISTIC, NOT A PROOF) ", !s.prune_rects.is_empty(), format!("{:?}", s.prune_rects));
     note("--start-inputs ", s.start_inputs.is_some(), format!("({} inputs)", s.start_inputs.as_ref().map_or(0, Vec::len)));
     note("--cart ", s.cart.is_some(), s.cart.as_ref().map_or(String::new(), |c| format!("{} (sha256 {})", c.path.display(), c.sha256)));
     note("--concrete-balloon-seeds ", s.concrete_balloon_seeds.is_some(), s.concrete_balloon_seeds.clone().unwrap_or_default());
@@ -640,6 +671,15 @@ mod tests {
             assert!(parse(bad).is_err(), "{bad:?}");
         }
         assert_eq!(parse(&["--region", "off"]).expect("off").region, None);
+        // `--prune-rect`: repeatable, recorded, a HEURISTIC; a cell inside
+        // either rect (inclusive) is pruned, one outside is not.
+        let p = parse(&["--prune-rect", "-16..63,-16..39", "--prune-rect", "100..110,0..5"]).expect("--prune-rect");
+        assert_eq!(p.prune_rects, vec![(-16, 63, -16, 39), (100, 110, 0, 5)]);
+        assert!(p.is_heuristic() && !Settings::default().is_heuristic());
+        assert!(p.text("r0sx").contains("prune_rects -16..63,-16..39;100..110,0..5"));
+        assert_eq!(p.cart_key(), Settings::default().cart_key(), "the level -1 table does not depend on it");
+        let cell = |x: i32, y: i32| crate::search::pos_graph::cell_of(x, y).expect("a cell");
+        assert!(p.pruned_cell(cell(63, 39)) && p.pruned_cell(cell(105, 3)) && !p.pruned_cell(cell(64, 39)) && !p.pruned_cell(cell(63, 40)));
         // `--cart`: the file's SHA-256; a file that is not a .p8 is refused.
         let root = concat!(env!("CARGO_MANIFEST_DIR"));
         let c = parse(&["--cart", &format!("{root}/test-fixtures/celeste-original-data.p8")]).expect("--cart").cart.expect("a cart");

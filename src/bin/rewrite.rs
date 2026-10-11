@@ -825,7 +825,10 @@ fn main() -> Result<()> {
                 wall_s: 0.0,
                 peak_gb: 0.0,
                 error: None,
+                heuristic: cfg.is_heuristic().then(|| format!("--prune-rect {:?}: rows dropped by position, NOT a proof", cfg.prune_rects)),
             };
+            // A heuristic run says so on every verdict line.
+            let caveat = if cfg.is_heuristic() { " (HEURISTIC PRUNE ACTIVE, not a proof)" } else { "" };
             let record = |res: &mut SearchResult, verdict: Verdict| -> Result<()> {
                 res.verdict = verdict;
                 res.wall_s = t0.elapsed().as_secs_f64();
@@ -896,10 +899,10 @@ fn main() -> Result<()> {
                 let Some(bound) = s.arc else {
                     record(&mut res, Verdict::Refuted)?;
                     anyhow::ensure!(ceiling.is_none(), "ceiling {horizon} REFUTED by the arc search at level {li} ({lvl}): a known solution the model cannot reproduce");
-                    println!("REFUTED: no win by f{horizon} (level {li}, {lvl}; {wall:.1} s)");
+                    println!("REFUTED: no win by f{horizon}{caveat} (level {li}, {lvl}; {wall:.1} s)");
                     return Ok(());
                 };
-                println!("ARC BOUND: no win before f{bound} (level {li}, {lvl}: remainder-exact, the level's objects over-approximated)");
+                println!("ARC BOUND: no win before f{bound}{caveat} (level {li}, {lvl}: remainder-exact, the level's objects over-approximated)");
                 if let Some(w) = &s.concrete {
                     let f = w.inputs.len();
                     let path = base.join(format!("witness_frame_{f}.txt"));
@@ -923,10 +926,10 @@ fn main() -> Result<()> {
                         let full: Vec<String> = prefix.iter().chain(&w.inputs).map(|b| b.to_string()).collect();
                         let fpath = base.join(format!("route_frame_{}.txt", prefix.len() + f));
                         std::fs::write(&fpath, format!("# --start-inputs ({} frames) + the witness ({f} frames): optimal FROM the start state only\n{}\n", prefix.len(), full.join(",")))?;
-                        println!("OPTIMAL from the start state: {f} frames ({wall:.1} s); witness {}; the route from the room's load: {} frames, {}", path.display(), prefix.len() + f, fpath.display());
+                        println!("OPTIMAL from the start state{caveat}: {f} frames ({wall:.1} s); witness {}; the route from the room's load: {} frames, {}", path.display(), prefix.len() + f, fpath.display());
                         return Ok(());
                     }
-                    println!("OPTIMAL win frame: {f} ({wall:.1} s); witness {}", path.display());
+                    println!("OPTIMAL win frame: {f}{caveat} ({wall:.1} s); witness {}", path.display());
                     return Ok(());
                 }
                 if no_witness && last {
@@ -935,7 +938,7 @@ fn main() -> Result<()> {
                 if last {
                     record(&mut res, Verdict::NoConcreteWin)?;
                     anyhow::ensure!(ceiling.is_none(), "ceiling {horizon}: no concrete witness by it - a known solution the model cannot reproduce");
-                    println!("no concrete win by f{horizon} (arc bound f{bound}; {wall:.1} s)");
+                    println!("no concrete win by f{horizon}{caveat} (arc bound f{bound}; {wall:.1} s)");
                     return Ok(());
                 }
                 prev = Some((s.arc_marks.expect("asked for"), lvl));

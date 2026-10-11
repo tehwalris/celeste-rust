@@ -74,6 +74,10 @@ pub struct SearchResult {
     pub peak_gb: f64,
     /// Why the search stopped short (the level -1 refusal's error).
     pub error: Option<String>,
+    /// A HEURISTIC was in force (`--prune-rect`): no verdict is a proof
+    /// (a refutation, the optimum, the bound hold for the pruned game only).
+    #[serde(default)]
+    pub heuristic: Option<String>,
 }
 
 impl SearchResult {
@@ -119,6 +123,7 @@ mod tests {
             wall_s: 2.0,
             peak_gb: 0.5,
             error: Some("x".into()),
+            heuristic: None,
         };
         r.write(&dir).unwrap();
         assert_eq!(SearchResult::read(&dir).unwrap(), r);
