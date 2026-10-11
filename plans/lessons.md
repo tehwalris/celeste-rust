@@ -118,6 +118,30 @@ re-run): built, exact, removed the same day - it saved ~15 s of a 524 s run
 and did not fit the per-cell structure. Then the kernel re-run backward
 itself gave way to the recorded graph: room (0,0) 2:32 h -> 23:50.
 
+**The remainder-free BFS and the loaded rotation graph** (2026-10-04 ..
+2026-10-11, replaced by the backward push, plans/arc-memory.md). The arc
+phase marked every state that could win with SOME remainder (a BFS back
+from the wins over the in-edges), loaded the edges between the marks as a
+CSR both ways (12 B an edge) and pulled W over it, recomputing the
+predecessors of changed nodes. The marks were a loose superset of W's
+support (the mod room at h140: 114.7M marks, 29% of the states, 2.08G
+edges: 31 GB of graph, 40.7 GB at its peak, reach 33 GB; at h155
+OOM-killed at ~104 GB). W only grows as t falls, so pushing the changed
+sets through the in-edges read from the edge files gives the same W with
+no graph and no marks: h155 in ~15 GB.
+
+**The backward as a region worklist** (2026-10-11, `26d976d`, removed in
+`2e75fd9`). Each node's value its whole time-indexed set, a monotone
+fixpoint scheduled by target region (open a region, apply all its pending
+updates over all frames, push the changed sources). The same W, regions
+opened 2.9 times instead of 10.2 (room (6,2) synthetic win) - but it read
+MORE (41.2M in-edges against 39.3M, 3.85M value changes against 2.92M;
+largest queue first: 44.2M and 4.08M), and it holds every node's value
+mutable. A region opened before its successors' values are final is
+opened again and re-reads its nodes' in-edges over all their frames; in
+the time-stepped sweep every value read is final at its frame, so a node
+is read once per change of its set.
+
 **Checkpoint layouts.** One file per cell-uniform block: ~17k files a frame,
 an inode blow-up on tmpfs. zstd bincode layers: the H=89 backward spent 35 s
 per iteration decoding ~100M rows to keep a few hundred. Now one

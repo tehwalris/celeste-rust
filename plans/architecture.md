@@ -65,12 +65,12 @@ crates/celeste-engine    Rt2 block model, boundary/keys, lane primitives        
                          region tables), unit (UnitSink: the kernels'
                          emissions), wave (units, translation, the layer),
                          edges (edge files, transfers, EdgeStore), marks
-                         (BFS marks, Resolver), meta, bench (the capture and
+                         (the Resolver), meta, bench (the capture and
                          `bench-storage`)
-  src/search/            checkpoint, edges (the BFS), arc_edges (the transfer
-                         decode), arcs (remainder sets), arc_dp (THE SEARCH:
-                         load, backward, optimum, concrete search), known,
-                         pos_graph, ui_export
+  src/search/            checkpoint, arc_edges (the transfer decode), arcs
+                         (remainder sets, their arena), arc_dp (THE SEARCH:
+                         the backward push, optimum, reach, concrete search),
+                         known, pos_graph, ui_export
   src/trace/             the AST tracer (Lua -> transpile::graph::Graph), the
                          constant-lattice walk (kernel.rs), widen.rs, verify.rs
                          (split pass), error.rs, level_minus_one.rs, the
@@ -398,18 +398,20 @@ kernel. An edge recorded at frame f leaves a state of layer f - 1.
   value order).
 - **`EdgeStore`**: `preds_at(target, frame)` - the owner index's entries of
   the target's (region, entry) (a binary search), each a (unit, lid) whose
-  edges are decoded alone, into the target's cell: nothing is inverted. `scan(frame)` and `units`/`unit`: every edge, unit by unit.
-- **The BFS** (`search::edges::bfs`): seeds the win rows of every layer <= H
-  with their layers. For i = H-1 down to 1, each newly marked state's
-  in-edges at frames layer..=i+1 (`preds_at`, in parallel; inserts in
-  frontier order); a predecessor's layer is its edge's frame - 1. Iteration i
-  marks exactly the states that win by H from frame i but not i+1 - with
-  SOME remainder: i is the state's DEADLINE. The marks are masks per entry
-  (`storage::marks::Marks`), ranked by prefix popcounts.
-- **The graph load** (`arc_dp::load`): the edges between marked nodes read
-  UNIT BY UNIT (sources ranked once a unit, a lid's region once), two
-  passes (degrees, then the adjacencies in place). Room (6,2) 100% h94:
-  BFS 2.2 s and load 1.0 s against 56.4 s (with the inversion) and 38.6 s.
+  edges are decoded alone, into the target's cell: nothing is inverted.
+  `preds_sorted(frame, targets)` - the same for a sorted batch: region by
+  region (a file's regions found once, `EdgeFile::regions`), entries by
+  galloping through the region's range, a lid decoded once for all its
+  targets' cells; it counts what it read (`ReadStats`). `scan(frame)` and
+  `units`/`unit`: every edge, unit by unit.
+- **The backward reads the edge files, it loads no graph** (2026-10-11,
+  plans/arc-memory.md): per step the in-edges of the nodes whose winning set
+  changed (`preds_sorted`, the files advised `MADV_RANDOM`: the reads are
+  scattered); `reach` alone loads out-edges, those between W's nodes
+  (`arc_dp::OutGraph`, unit by unit, two passes). Before: a remainder-free
+  BFS marked the states that could win at all, and a CSR of the edges
+  between them (12 B an edge) was loaded - the mod room at h155 died at
+  ~104 GB in that load.
 - **Checks.** `rewrite arc-check` (every edge has a transfer; sampled
   transfers probed with the reference engine at the tree's level inside and
   outside their guards); `ckhash --edges` (each frame's edges by content).
@@ -441,26 +443,28 @@ the list (coarsest first; one level is the usual case):
    `r0sxh` forward took 16.7 s instead of 681 s, with the same answer. A set
    past 32 segments is replaced by W_t (a superset: the filter only
    loosens). The UI's `arc.marks.bin` are the same reached nodes.
-3. **The arc phase** (`arc_dp::solve`): the remainder-free BFS marks the
-   nodes that can win by H at all, with their deadlines; only the edges
-   between them are loaded (unit by unit, `arc_dp::load`), each with its
-   global transfer id; `arc_dp::backward` computes the
-   winning sets `W_t`; `arc_dp::optimum` reads the optimum off them. That
-   optimum is exact in the remainder and over-approximates the level's other
-   widenings (and `rnd`): a LOWER BOUND, and no win REFUTES H.
-   MEMORY (2026-10-07, `[mem]` lines at every phase boundary): a node is the
-   rank of its mark in the BFS's own masks (`storage::marks::MarkRanks`);
-   the edges are read twice, counting then filling the two adjacencies
-   in place (12 B an edge, nothing held beside them); W is kept as SPANS
-   (node, frames, set: 12 B per unchanged run) into an arena of the distinct
-   sets instead of a table per frame of `Arc`s; the storage metadata
+3. **The arc phase** (`arc_dp::solve`; plans/arc-memory.md): ONE BACKWARD
+   PUSH over the recorded in-edges (`arc_dp::backward`). `W_t(n)` only grows
+   as `t` falls (more time never hurts, and the layers never bind: an edge
+   recorded at frame f leaves layer f - 1 and enters a layer <= f), so
+   `W_t(p) = W_{t+1}(p) ∪ U pull_e(W_{t+1}(m))` over the edges `p -> m`
+   whose target CHANGED at t + 1: frame by frame from the wins, the changed
+   nodes' in-edges at frames <= t + 1 are read from the edge files by
+   target, in bounded ROUNDS (64M in-edges at most), and pulled into their
+   sources in parallel id ranges. No graph is held and nothing marks nodes
+   first: a node no winning set reaches is never touched, and W's SUPPORT
+   (the nodes with a set at some frame) replaces the remainder-free marks
+   in the gate. W is kept as varints - per node its id delta, layer and
+   spans, per span its length and set, ~4 B a node and ~3 a span - over a
+   flat arena of the distinct sets (`RegionArena`). `arc_dp::optimum` reads
+   the optimum off the start's sets. That optimum is exact in the remainder
+   and over-approximates the level's other widenings (and `rnd`): a LOWER
+   BOUND, and no win REFUTES H. The storage metadata
    (`storage::marks::Resolver`) gives the gate's fingerprints, the marks
-   files and the concrete search's sorted node keys. Room (2,3) gemskip h137, level
-   0 (18.6M nodes, 373M edges, 18.5M spans over 2.9M distinct sets): arc
-   phase peak 14.2 -> 8.1 GB anonymous, 20.2 -> 9.3 GB with the mapped runs;
-   W 4.4 -> 0.9 GB; the graph's build 12.1 -> 5.4 GB. Level 1 (22.9M nodes,
-   58.5M spans over 0.65M sets): peak 17.6 -> 7.2 GB, 2.6 GB left for the
-   concrete search (17.0 before).
+   files and the concrete search's node keys (by ENTRY, 24 B each). The mod
+   room at h155 (230M nodes, 430M spans, 6.0G in-edges read): the arc phase
+   in ~15 GB anonymous under a 30 GB cap, where the remainder-free BFS and
+   its 12 B-an-edge graph were OOM-killed at ~104 GB.
 4. **The concrete search** (`arc_dp::concrete_search`) over concrete states
    (the reference engine's concrete step, every input, every `rnd` leaf) from
    the room's start, admitting a successor only if its projection onto the
@@ -745,9 +749,9 @@ three pinned room (1,0) oracles (commands and comparison in CLAUDE.md):
 `gates/ckhash_room10_f000-044.txt` (frontier sets f0-f44),
 `gates/posgraph_room10_f044.txt` (pos-graph edges), and
 `gates/arc_room10_win9-101_h35.txt` (the search at a synthetic win at h35:
-the remainder-free marks, W's fingerprint at every frame, the arc optimum 33
-and the concrete witness; it replaced the ladder's marks gate on
-2026-10-05). Plus the quick suite, `kernel lanes: missed 0`, and for the
+W's support, W's fingerprint at every frame, the arc optimum 33 and the
+concrete witness; it replaced the ladder's marks gate on 2026-10-05; its
+first line was the remainder-free marks until 2026-10-11, plans/arc-memory.md). Plus the quick suite, `kernel lanes: missed 0`, and for the
 recording `arc-check`. A kernels-against-interpreter check: `rewrite
 ref-check` (row by row; the kernels over-approximate where the reference
 splits an interval, so ckhash equality with the reference engine is no
@@ -756,8 +760,7 @@ test). After a change to the forward's filters, the notes or the edge files:
 
 **A known solution against the pruning** (`search::known`, 2026-10-08).
 Every pruning step of the search - level -1, the objects ladder's filter,
-the remainder-free BFS, the winning sets the concrete search looks states up
-in, and under them the kernels' successors, the visited set and the split frame's
+the winning sets the concrete search looks states up in, and under them the kernels' successors, the visited set and the split frame's
 mid-frame steps - removes real winners silently if it is wrong: the result
 is a wrong optimum or a false tie, never a fake improvement (witnesses are
 replayed), so nothing else notices. Room (6,1) nodiag `r0sxhn,r0sxh` REFUTED

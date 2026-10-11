@@ -20,12 +20,12 @@
 //!
 //! Then the optimum is read off the start's sets (`optimum`), the start's
 //! remainder pushed forward inside `W` for the next level's filter
-//! (`reach`, over the out-edges between `W`'s nodes, `OutGraph`), and the
+//! (`reach`, over the reached nodes' out-edges, `ReachEdges`), and the
 //! concrete search runs inside `W` (`concrete_search`).
 
 use super::arcs::{Region, RegionArena, RegionRef, Transfer};
 use crate::storage::edges::{get_varint, put_varint, EdgeStore, ReadStats};
-use crate::storage::{id_entry, id_local, id_region, state_id, StateId};
+use crate::storage::{id_entry, id_region, state_id, StateId};
 use rustc_hash::{FxHashMap, FxHashSet};
 
 /// Nodes a block of `Winning` holds: a node is found by decoding at most
@@ -843,123 +843,62 @@ impl<'a> Backward<'a> {
     }
 }
 
-/// The out-edges between `W`'s nodes that can carry a remainder (`reach`):
-/// an edge `p -> m` recorded at frame `f` (so `p` has layer `f - 1`) from a
-/// non-win `p` to an `m` with a set at `f` or later - the others are on no
-/// winning path. By node, each one's `(target, transfer)`s sorted.
-pub struct OutGraph {
-    at: Vec<u64>,
-    out: Vec<(u32, u32)>,
+/// The out-edges `reach` follows - between W's nodes, from a non-win
+/// source to a target with a set at or past the edge's frame (the others
+/// carry nothing) - loaded as `reach` first reaches their source, a frame's
+/// sources at a time (`EdgeStore::out_edges`): what is held is the reached
+/// nodes' edges, 8 B each, not the graph between W's nodes.
+pub struct ReachEdges<'a> {
+    store: &'a EdgeStore,
+    w: &'a Winning,
+    /// The win states, sorted: never expanded, so never left.
+    wins: Vec<StateId>,
+    threads: usize,
+    loaded: FxHashMap<u32, Box<[(u32, u32)]>>,
+    edges: usize,
 }
 
-impl OutGraph {
-    /// Read from the edge files unit by unit as recorded, TWICE - counting
-    /// each node's out-degree, then filling in place - so no edge list is
-    /// held beside the graph: 8 B an edge.
-    pub fn load(store: &EdgeStore, w: &Winning, wins: &[StateId], horizon: u32, threads: usize) -> anyhow::Result<Self> {
-        use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
-        let n = w.len();
-        let xfers = store.pairs().len();
-        // W's nodes' ids and last frames, flat (12 B a node, while loading).
-        let (ids, last): (Vec<StateId>, Vec<u32>) = w.nodes().map(|x| (x.id, x.last())).unzip();
-        // The edges of one unit: `f(src, dst, xfer)` per kept one.
-        let each_edge = |frame: u32, u: &crate::storage::edges::UnitView, f: &mut dyn FnMut(u32, u32, u32)| -> anyhow::Result<()> {
-            let src: Vec<Option<u32>> = (0..u.n_sources() as u32).map(|s| u.source(s)).map(|id| ids.binary_search(&id).ok().map(|k| k as u32).filter(|_| wins.binary_search(&id).is_err())).collect();
-            if src.iter().all(Option::is_none) {
-                return Ok(());
+impl<'a> ReachEdges<'a> {
+    pub fn new(store: &'a EdgeStore, w: &'a Winning, wins: Vec<StateId>, threads: usize) -> Self {
+        ReachEdges { store, w, wins, threads, loaded: FxHashMap::default(), edges: 0 }
+    }
+    /// Load the out-edges of those of `nodes` not loaded yet, frame by frame
+    /// (a node's are recorded at its layer + 1).
+    fn load(&mut self, nodes: impl Iterator<Item = u32>) {
+        let mut todo: Vec<(u32, StateId, u32)> = nodes.filter(|i| !self.loaded.contains_key(i)).map(|i| {
+            let n = self.w.node(i);
+            (n.layer + 1, n.id, i)
+        }).collect();
+        todo.sort_unstable();
+        todo.dedup();
+        let mut a = 0;
+        while a < todo.len() {
+            let f = todo[a].0;
+            let b = a + todo[a..].partition_point(|x| x.0 == f);
+            let ids: Vec<StateId> = todo[a..b].iter().map(|x| x.1).collect();
+            let mut lists: Vec<Vec<(u32, u32)>> = vec![Vec::new(); ids.len()];
+            for (k, dst, x) in self.store.out_edges(f, &ids, self.threads) {
+                if self.wins.binary_search(&ids[k]).is_ok() {
+                    continue;
+                }
+                if let Some(m) = self.w.index(dst).filter(|&m| self.w.node(m).last() >= f) {
+                    lists[k].push((m, x));
+                }
             }
-            // Per lid its entry's nodes: a range of W's ids.
-            let owners: Vec<(usize, usize)> = (0..u.n_lids() as u32)
-                .map(|l| match u.lid_owner(l) {
-                    Some((r, e)) => {
-                        let a = ids.partition_point(|&id| id < state_id(r, e, 0));
-                        (a, a + ids[a..].partition_point(|&id| id_region(id) == r && id_entry(id) == e))
-                    }
-                    None => (0, 0),
-                })
-                .collect();
-            let mut bad = None;
-            u.edges(|lid, local, s, x| {
-                let Some(p) = src[s as usize] else { return };
-                let (a, b) = owners[lid as usize];
-                if a == b {
-                    return;
-                }
-                if x as usize >= xfers {
-                    bad = Some(x);
-                    return;
-                }
-                if let Ok(k) = ids[a..b].binary_search_by_key(&local, |&id| id_local(id)) {
-                    let m = (a + k) as u32;
-                    if last[m as usize] >= frame {
-                        f(p, m, x);
-                    }
-                }
-            });
-            anyhow::ensure!(bad.is_none(), "an edge with transfer {bad:?} past the table");
-            Ok(())
-        };
-        let each_unit = |f: &(dyn Fn(u32, &crate::storage::edges::UnitView) -> anyhow::Result<()> + Sync)| -> anyhow::Result<()> {
-            for frame in 1..=horizon {
-                let owners = store.owners(frame, threads);
-                let units = store.units(frame);
-                par_chunks(units.len(), 16, threads, |lo, hi| -> anyhow::Result<()> {
-                    for &(fi, ui) in &units[lo..hi] {
-                        f(frame, &store.unit(frame, &owners, fi, ui))?;
-                    }
-                    Ok(())
-                })
-                .into_iter()
-                .collect::<anyhow::Result<()>>()?;
+            for (&(_, _, i), mut l) in todo[a..b].iter().zip(lists) {
+                l.sort_unstable();
+                self.edges += l.len();
+                self.loaded.insert(i, l.into_boxed_slice());
             }
-            Ok(())
-        };
-        let deg: Vec<AtomicU64> = (0..n).map(|_| AtomicU64::new(0)).collect();
-        each_unit(&|frame, u| {
-            each_edge(frame, u, &mut |p, _, _| {
-                deg[p as usize].fetch_add(1, Relaxed);
-            })
-        })?;
-        let mut at = Vec::with_capacity(n + 1);
-        at.push(0u64);
-        for d in &deg {
-            at.push(at.last().expect("one") + d.load(Relaxed));
+            a = b;
         }
-        let edges = at[n] as usize;
-        let mut out: Vec<(u32, u32)> = vec![(0, 0); edges];
-        for (d, &a) in deg.iter().zip(&at) {
-            d.store(a, Relaxed);
-        }
-        let out_ptr = out.as_mut_ptr() as usize;
-        each_unit(&|frame, u| {
-            each_edge(frame, u, &mut |p, m, x| {
-                let slot = deg[p as usize].fetch_add(1, Relaxed);
-                assert!(slot < at[p as usize + 1], "the edge fill pass disagrees with the count");
-                // SAFETY: each slot is claimed once, by its node's atomic
-                // cursor, inside the node's range, below `edges`.
-                unsafe { (out_ptr as *mut (u32, u32)).add(slot as usize).write((m, x)) };
-            })
-        })?;
-        anyhow::ensure!(deg.iter().zip(&at[1..]).all(|(c, &e)| c.load(Relaxed) == e), "the edge fill pass disagrees with the count");
-        drop(deg);
-        let at_ref = &at;
-        let out_ref = out.as_mut_ptr() as usize;
-        par_chunks(n, 4096, threads, |lo, hi| {
-            // SAFETY: the nodes `lo..hi` own the disjoint range
-            // `at[lo]..at[hi]`.
-            let o = unsafe { std::slice::from_raw_parts_mut((out_ref as *mut (u32, u32)).add(at_ref[lo] as usize), (at_ref[hi] - at_ref[lo]) as usize) };
-            let base = at_ref[lo];
-            for i in lo..hi {
-                o[(at_ref[i] - base) as usize..(at_ref[i + 1] - base) as usize].sort_unstable();
-            }
-        });
-        Ok(OutGraph { at, out })
     }
     fn of(&self, i: u32) -> &[(u32, u32)] {
-        &self.out[self.at[i as usize] as usize..self.at[i as usize + 1] as usize]
+        &self.loaded[&i]
     }
-    pub fn edges(&self) -> usize {
-        self.out.len()
+    /// The nodes and edges loaded.
+    pub fn sizes(&self) -> (usize, usize) {
+        (self.loaded.len(), self.edges)
     }
 }
 
@@ -982,7 +921,7 @@ impl OutGraph {
 /// itself (a superset: the filter only loosens), which bounds the memory -
 /// W's sets are shared, a node's reached set is its own.
 #[allow(clippy::too_many_arguments)]
-pub fn reach(w: &Winning, g: &OutGraph, pairs: &[(Transfer, Transfer)], start: Option<u32>, point: (u32, u32), horizon: u32, threads: usize) -> Vec<u32> {
+pub fn reach(w: &Winning, g: &mut ReachEdges, pairs: &[(Transfer, Transfer)], start: Option<u32>, point: (u32, u32), horizon: u32, threads: usize) -> Vec<u32> {
     use super::arcs::Piece;
     let n = w.len();
     let threads = threads.max(1);
@@ -1008,9 +947,11 @@ pub fn reach(w: &Winning, g: &OutGraph, pairs: &[(Transfer, Transfer)], start: O
             let segs: usize = cur.iter().filter_map(|c| c.1.as_ref()).map(|r| r.n_segs()).sum();
             eprintln!("[arc] reach f{t:03}: {} nodes ({own} own sets, {segs} segments; the rest W's)", cur.len());
         }
-        // Each reached node's set pushed along its out-edges into the
-        // targets with a set at t + 1, tagged by target.
-        let cur_ref = &cur;
+        // Each reached node's set pushed along its out-edges (loaded as the
+        // node is first reached) into the targets with a set at t + 1,
+        // tagged by target.
+        g.load(cur.iter().map(|c| c.0));
+        let (cur_ref, g) = (&cur, &*g);
         let mut pushed: Vec<(u32, Piece)> = par_chunks(cur.len(), 64, threads, |lo, hi| {
             let (mut out, mut tmp) = (Vec::new(), Vec::new());
             for (p, r) in &cur_ref[lo..hi] {
@@ -1736,12 +1677,9 @@ pub fn solve(
     let mut arc_marks = want_marks.then(|| Visited::new(resolver.space.clone()));
     if want_marks || save.is_some() {
         let tr = std::time::Instant::now();
-        seeds.store.advise(memmap2::Advice::Normal)?;
-        let g = OutGraph::load(&seeds.store, &w, &seeds.win_ids(), horizon, threads)?;
-        let tl = tr.elapsed().as_secs_f64();
-        crate::metrics::mem_phase("arc: W's out-edges");
-        let last = reach(&w, &g, &seeds.pairs, start, p0, horizon, threads);
-        eprintln!("[arc] reach {:.2} s ({} out-edges between W's nodes read in {tl:.2} s)", tr.elapsed().as_secs_f64(), g.edges());
+        let mut g = ReachEdges::new(&seeds.store, &w, seeds.win_ids(), threads);
+        let last = reach(&w, &mut g, &seeds.pairs, start, p0, horizon, threads);
+        eprintln!("[arc] reach {:.2} s ({} reached nodes' {} out-edges loaded)", tr.elapsed().as_secs_f64(), g.sizes().0, g.sizes().1);
         drop(g);
         crate::metrics::mem_phase("arc: reach");
         for i in (0..w.len() as u32).filter(|&i| last[i as usize] != u32::MAX) {
@@ -2019,10 +1957,10 @@ mod tests {
             let tree = TestTree::new("reach", layers, &edges, wins.clone());
             let (store, pairs, seeds) = tree.open(horizon);
             let w = backward(&store, &pairs, &seeds, horizon, 2);
-            let g = OutGraph::load(&store, &w, &tree.win_ids(), horizon, 2).expect("the out-edges");
+            let mut g = ReachEdges::new(&store, &w, tree.win_ids(), 2);
             let start = w.index(sid(0));
             let p0 = (r(CIRCLE), r(CIRCLE));
-            let got = reach(&w, &g, &pairs, start, p0, horizon, 2);
+            let got = reach(&w, &mut g, &pairs, start, p0, horizon, 2);
             let mut want = vec![u32::MAX; w.len()];
             let inside = |t: u32, i: u32, p: (u32, u32)| w.index(sid(i)).and_then(|k| w.at(t, k)).is_some_and(|reg| reg.contains(p.0, p.1));
             let mut cur: FxHashSet<(u32, (u32, u32))> = FxHashSet::default();

@@ -130,6 +130,14 @@ impl XferTable {
     /// The tree's table (`dir` = `<level>/edges`) as its done marker trusts
     /// it; empty without one.
     pub fn load(dir: &Path) -> Result<Self> {
+        let pairs = Self::load_pairs(dir)?;
+        let index = pairs.iter().enumerate().map(|(i, p)| (*p, i as u32)).collect();
+        Ok(XferTable { pairs, index })
+    }
+
+    /// The table's pairs alone, as `load` reads them (the readers need no
+    /// index: the mod room at h155 has 4.0M pairs).
+    pub fn load_pairs(dir: &Path) -> Result<Vec<Pair>> {
         let n = match read_done(dir)? {
             Some(Done { xfers: Some(n), .. }) => n,
             Some(Done { xfers: None, .. }) => {
@@ -144,9 +152,7 @@ impl XferTable {
         };
         let b = if n > 0 { std::fs::read(xfer_path(dir)).with_context(|| xfer_path(dir).display().to_string())? } else { Vec::new() };
         ensure!(b.len() >= n * PAIR_BYTES, "{}: {} pairs, {} trusted", xfer_path(dir).display(), b.len() / PAIR_BYTES, n);
-        let pairs: Vec<Pair> = b[..n * PAIR_BYTES].chunks_exact(PAIR_BYTES).map(decode_pair).collect();
-        let index = pairs.iter().enumerate().map(|(i, p)| (*p, i as u32)).collect();
-        Ok(XferTable { pairs, index })
+        Ok(b[..n * PAIR_BYTES].chunks_exact(PAIR_BYTES).map(decode_pair).collect())
     }
 
     /// The workers' tables into the global one: new pairs appended in value
@@ -429,6 +435,8 @@ struct EdgeFile {
     /// The owner index's REGIONS: each one's first entry, in order
     /// (`regions`, built on first use: a search per region, not a scan).
     regions: std::sync::OnceLock<Vec<(u32, u32)>>,
+    /// Per unit its first and last source, by first (`unit_sources`).
+    unit_sources: std::sync::OnceLock<Vec<(StateId, StateId, u32)>>,
 }
 
 impl EdgeFile {
@@ -474,7 +482,7 @@ impl EdgeFile {
             }
         }
         ensure!(head.n_owner_index < u32::MAX as u64, "{}: {} owner index entries do not fit a u32", path.display(), head.n_owner_index);
-        Ok(EdgeFile { map, head, data: 16 + n, blocks, prev, regions: std::sync::OnceLock::new() })
+        Ok(EdgeFile { map, head, data: 16 + n, blocks, prev, regions: std::sync::OnceLock::new(), unit_sources: std::sync::OnceLock::new() })
     }
 
     /// The owner index's regions, `(region, first entry)` in order: from the
@@ -499,6 +507,31 @@ impl EdgeFile {
                 at = lo;
             }
             out
+        })
+    }
+
+    /// The units' source ranges `(first, last, unit)`, by first, built on
+    /// first use. A unit's sources are a run of its frontier in id order and
+    /// units do not overlap: both checked here (FATAL otherwise - an out-edge
+    /// lookup would miss edges).
+    fn unit_sources(&self) -> &[(StateId, StateId, u32)] {
+        self.unit_sources.get_or_init(|| {
+            let mut v: Vec<(StateId, StateId, u32)> = Vec::new();
+            for (ui, u) in self.head.units.iter().enumerate() {
+                if u.n_sources == 0 {
+                    continue;
+                }
+                let mut prev = None;
+                for k in 0..u.n_sources {
+                    let s = self.source(u, k);
+                    assert!(prev.is_none_or(|p| p < s), "frame {}: unit {ui}'s sources are not in id order", self.head.frame);
+                    prev = Some(s);
+                }
+                v.push((self.source(u, 0), self.source(u, u.n_sources - 1), ui as u32));
+            }
+            v.sort_unstable();
+            assert!(v.windows(2).all(|w| w[0].1 < w[1].0), "frame {}: two units' sources overlap", self.head.frame);
+            v
         })
     }
 
@@ -655,7 +688,7 @@ impl EdgeStore {
             bytes += file.map.len() as u64 + file.blocks.iter().flatten().map(|m| m.len() as u64).sum::<u64>();
             frames[f as usize].push(file);
         }
-        let xfers = XferTable::load(dir)?.pairs;
+        let xfers = XferTable::load_pairs(dir)?;
         Ok(EdgeStore { frames, xfers, edges, bytes })
     }
 
@@ -771,6 +804,74 @@ impl EdgeStore {
                 k = k_end;
             }
         }
+    }
+
+    /// The out-edges recorded at frame `frame` of the states `sources`
+    /// (sorted, distinct; sources of frame `frame` have layer `frame - 1`):
+    /// `(k, target, transfer)` for `sources[k]`. A source's unit is found by
+    /// the file's unit ranges (`EdgeFile::unit_sources`); the units holding
+    /// one are decoded whole, on `threads` workers, their lids' owners taken
+    /// from one pass over the owner index keeping those units' entries.
+    pub fn out_edges(&self, frame: u32, sources: &[StateId], threads: usize) -> Vec<(usize, StateId, u32)> {
+        debug_assert!(sources.windows(2).all(|w| w[0] < w[1]), "sources sorted and distinct");
+        let mut out = Vec::new();
+        for file in self.frames.get(frame as usize).into_iter().flatten() {
+            let index = file.unit_sources();
+            // Per unit, its sources asked for: (lane, k), by lane.
+            let mut want: FxHashMap<u32, Vec<(u32, usize)>> = FxHashMap::default();
+            for (k, &s) in sources.iter().enumerate() {
+                let Some(&(_, last, ui)) = index[..index.partition_point(|x| x.0 <= s)].last() else { continue };
+                if s > last {
+                    continue;
+                }
+                let u = &file.head.units[ui as usize];
+                let (mut lo, mut hi) = (0u32, u.n_sources);
+                while lo < hi {
+                    let mid = (lo + hi) / 2;
+                    if file.source(u, mid) < s {
+                        lo = mid + 1;
+                    } else {
+                        hi = mid;
+                    }
+                }
+                if lo < u.n_sources && file.source(u, lo) == s {
+                    want.entry(ui).or_default().push((lo, k));
+                }
+            }
+            if want.is_empty() {
+                continue;
+            }
+            // Those units' lids' owners: (lid, region, entry), by lid.
+            let mut owners: FxHashMap<u32, Vec<(u32, u32, u32)>> = FxHashMap::default();
+            for k in 0..file.head.n_owner_index as usize {
+                let (r, e, ui, lid) = file.owner_at(k);
+                if want.contains_key(&ui) {
+                    owners.entry(ui).or_default().push((lid, r, e));
+                }
+            }
+            let mut units: Vec<u32> = want.keys().copied().collect();
+            units.sort_unstable();
+            let parts: Vec<Vec<(usize, StateId, u32)>> = super::wave::par_map(&units, threads, |&ui| {
+                let mut reqs = want[&ui].clone();
+                reqs.sort_unstable();
+                let mut own = owners.get(&ui).cloned().unwrap_or_default();
+                own.sort_unstable();
+                let u = &file.head.units[ui as usize];
+                let block = file.block(u);
+                let mut res = Vec::new();
+                for &(lid, region, entry) in &own {
+                    decode_lid(file.lid_edges(u, block, lid), |c, s, x| {
+                        if let Ok(r) = reqs.binary_search_by_key(&s, |q| q.0) {
+                            res.push((reqs[r].1, state_id(region, entry, c), file.u32_at(u.xfers, x as usize)));
+                        }
+                        true
+                    });
+                }
+                res
+            });
+            out.extend(parts.into_iter().flatten());
+        }
+        out
     }
 
     /// Every edge recorded at frame `frame`, unit by unit (`threads`: the

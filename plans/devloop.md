@@ -182,11 +182,10 @@ visited states), 0.62 s (r62h57 f56, 37M).
   (`[phases]`: pack, kernel, emit, unit end, translate, layer), `kernel
   lanes: traced N missed 0` (a miss is an error).
 - `rewrite bench-backward --level-dir D --horizon H --frame F [--reps N]
-  [--win-at X,Y] [--threads T]`: the rotation graph loaded (timed), W down
-  to F+1, then the step to W_F `--reps` times from a copy: candidates, pull
-  and merge walls, and the gate's `[gate] hH W fF count hash` line. (The
-  remainder-free BFS is part of the load; its per-frame times are its
-  `[bfs]` lines.)
+  [--win-at X,Y] [--threads T]`: the edge files opened (timed), W pushed
+  down to F+1, then the step to W_F `--reps` times from a copy: read, pull
+  and merge walls, and the gate's `[gate] hH W fF count hash` line. (Each
+  step of the push prints its `[arc] fNNN` line.)
 - `rewrite bench-storage --capture DIR/fF --tree D` (unchanged): the units,
   translation, layer and edge file of a captured frame, without kernels.
   Small capture: cap-r10 (518 MB); big: cap-r62h57 (12 GB).
