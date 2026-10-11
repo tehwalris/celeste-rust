@@ -188,3 +188,61 @@ jump presses that fire nowhere in the minimal cart (f113, f139) fire from
 the original's jump buffer. With them removed (`mid142-canon.txt`, as
 category_runner's `canon_jumps`) both carts agree on every frame and reach
 (61, 105) on f142.
+
+### The coarse rung is not a bug: `h` merges, `n` does not (2026-10-11)
+
+The ladder's finer rungs looked 10,000x smaller (r0sxhe 362k, r0sxe 641k
+states against r0sxhne's 3.2B) only because they are FILTERED by the coarse
+rung's arc-marked nodes. Run directly (no ladder), mid target, level -1:
+
+| level | h | total states | per frame f80 / f100 / f120 | peak memory | wall |
+|---|---|---|---|---|---|
+| r0sxhne (mid140) | 140 | 0.39B | 2.33M / 5.55M / 9.35M | | |
+| r0sxhe | 142 | 0.35B | 2.33M / 5.41M / 7.95M | 5.6 GB | 183 s |
+| r0sxe | 142 | 1.35B | 8.37M / 20.5M / 30.5M | 20 GB | |
+
+r0sxhne and r0sxhe are IDENTICAL up to f80, and r0sxhe is smaller after:
+`n` (the balloon's and the spring's phases widened) merges nothing in this
+room and loosens the bound (141 against 142). `h` (held buttons unknown)
+is the 3.8x. RECOMMENDED: run this room at `r0sxhe` alone - the bound of
+the exact objects at the coarse rung's cost; no ladder.
+
+What grows is the player: f140's dominant shape (27.6M of 33M rows, every
+fruit gone) has 14,846 distinct `spd.x` (110 x, 116 y, 102 `spd.y`); one
+cell, (58,102), holds 9,432 rows with 1,911 `spd.x`. They are the exact
+16.16 sums of the accelerations (0.6, 0.4, 0.15, 1.5, 1.0606) along
+different input histories, and the spring's `spd.x * 0.2`: inherent to the
+exact speed (the `s` of `r0sx`), not a widening.
+
+### Benchmark and projection (2026-10-11)
+
+- `tools/mod_bench.sh make|run|list`: single-frame fixtures cut (hard links)
+  from finished trees under /var/tmp/mod-fixtures, the level -1 table pinned
+  beside each, the first run's f/e lines pinned. he100 (r0sxhe f100: 154M
+  emissions, 2.2 s), he120 (r0sxhe peak f120: 256M, 3.7 s), hne150 (r0sxhne
+  mid155 f150: 1.46G emissions, 12.3 s). 16 threads.
+- `tools/mod_project.py fit LOG...` / `project`: forward wall = a x
+  emissions (a 11-21 ns at 16 threads, load-dependent; lad168 13.6), the
+  wave's memory 2 GB + 292 B a row in + 68 B a new state, edges 3.0 B
+  (format 14 + edges v5), the backward 92 ns an in-edge (14.6% of the
+  edges read). States per frame N_H(f) = U(f) A(H - f): U the unfiltered
+  forward (measured to f152, +9.3%/frame then), A the share level -1
+  admits at slack s (from the exit runs h170/h190).
+- Calibration: the mid target at h168 projected from mid140+mid155: 2.69B
+  states, 0.5 h, 370 GB (actual lad168: 3.20B, 0.7 h, 426 GB); the exit at
+  h190 from h170: 2.05B (actual 2.13B).
+- The exit (r0sxhne counts; r0sxhe the same or smaller):
+
+| H | states | peak frame | forward | disk now / at 0.15 B an edge | wave memory | backward |
+|---|---|---|---|---|---|---|
+| 195 | 3.1B | 131M | 0.6 h | 432 / 51 GB | 49 GB | 0.5 h |
+| 200 | 4.8B | 205M | 0.9 h | 656 / 78 GB | 76 GB | 0.8 h |
+| 205 | 7.3B | 319M | 1.4 h | 1005 / 119 GB | 117 GB | 1.1 h |
+| 210 | 11.3B | 497M | 2.1 h | 1548 / 184 GB | 181 GB | 1.8 h |
+| 220 | 27B | 1.2B | 5 h | 3.7 / 0.44 TB | 437 GB | 4.2 h |
+
+  The wall is not the limit: the FRONTIER's memory (~290 B a row in) is,
+  past H ~ 203 on this machine, and disk past ~200 on edges v5 (the
+  target-region bundles, 0.08-0.25 B an edge, move that to ~215). The
+  projection's big uncertainty is U past f152 (extrapolated at +9.3%/frame;
+  a 3%/frame decay of that rate halves h220).
