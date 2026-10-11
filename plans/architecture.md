@@ -524,21 +524,23 @@ f1-f97: 6.3M sources re-expanded, 6.1M states added; the door's reload
 6 s) and 4.8 GB peak, against 265 s and 6.0 GB for a fresh 98 - and its
 tree is identical (`ckhash --edges`, pos graph). The notes
 cost the forward nothing measurable (fresh 98: 265 s, the build before
-them 272 s) and 82 MB on a 29 GB tree. Refused, loudly: a trimmed tree
-(`--trim-rows`: the sources' values are gone), the orb room (its
+them 272 s) and 82 MB on a 29 GB tree. Refused, loudly: the orb room (its
 not-expanded rows depend on the horizon), another S or a changed table, a
 tree without a record (only used where complete), and a tree whose raise was
 interrupted (`raising.txt`: half raised, delete it). A FINER level's tree
 (the objects ladder) is filtered by the coarser marks for one horizon; it is
 kept only for the same marks (with deadlines), horizon and level -1
 (`filtered_for.txt`), else built again - it is the cheap one.
-`--trim-rows` (2026-10-07) trims every frame's checkpoint files to
-keys, ids, cells and wins once a later frame is complete
-(`checkpoint::trim`): the search, a resume and `export-ui` read nothing
-else of an old frame, and the rows' values are most of a tree's frames
-(room (2,3) gemskip h137, level 0: 3.03 -> 0.78 GB; the tree 7.0 -> 4.8
-GB). The diagnostics that load old rows refuse a trimmed tree, so it is off
-by default.
+Frame files hold IDS, not rows (2026-10-11, plans/rows-from-keys.md;
+format 14): a row is a function of its shape's skeleton, its exact key and
+its cell, and an id names both, so a frame file is the shape's skeleton,
+the win rows and the id column (8 B a row), and a row is DECODED when read
+(`storage::decode`, against the metadata's key space and entries:
+`decode::TreeKeys`). The forward checks every piece it writes decodes to
+its rows exactly (`decode::check_piece`, FATAL otherwise). This replaced
+`--trim-rows` (2026-10-07: old frames trimmed to keys, ids, cells and wins,
+and the diagnostics refused them): every frame's rows are readable now, and
+the frames take ~8 B a state instead of 50-80.
 The level is a value (2026-10-10): the engines carry it (`FrameEngine`,
 `RefEngine::at_level`, `FrameStep::level`), and a tree records it in its
 settings record (`<level>/settings.txt`, `settings::Settings`, written when a

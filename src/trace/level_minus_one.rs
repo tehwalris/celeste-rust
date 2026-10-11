@@ -2014,6 +2014,8 @@ pub fn probe(root: &FsPath, opts: &Opts, s: &crate::settings::Settings) -> Resul
         }
         None => None,
     };
+    // The rows' keys (a marked state's), from the tree's metadata.
+    let tree = crate::storage::marks::Resolver::load(&opts.level_dir, opts.to)?;
     say!(rep, "\nframe | states | too late (f + d > {}) | no exit path | band {},8 cut | death (kept) | left the room | other shape | not in the table | marked | MARKED TOO LATE", opts.ceiling, opts.ceiling)?;
     let mut samples: BTreeSet<String> = BTreeSet::new();
     for f in opts.from..=opts.to {
@@ -2069,7 +2071,7 @@ pub fn probe(root: &FsPath, opts: &Opts, s: &crate::settings::Settings) -> Resul
             // A marked state wins by the horizon: called too late is a finding.
             if let Some(m) = &marks {
                 let shape = ff.shape_hash();
-                for (cell, key) in ff.cell_keys() {
+                for (cell, key) in (0..ff.width()).map(|r| tree.resolve(ff.id_at(r)).map(|x| (x.2, x.1))).collect::<Result<Vec<_>>>()? {
                     if m.contains(shape, key, cell) {
                         marked += 1;
                         if late_cells.contains(&cell) {

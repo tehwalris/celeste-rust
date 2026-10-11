@@ -63,7 +63,7 @@ since branch `settings-explicit`, below).
 | `--balloon-seeds S` | CELESTE_BALLOON_SEEDS | yes |
 | `--concrete-balloon-seeds S` | CELESTE_CONCRETE_BALLOON_SEEDS | no (the concrete phase) |
 | `--level-minus-one H,S` | CELESTE_LEVEL_MINUS_ONE | its own record (`TreeFilter`: a raise changes it) |
-| `--trim-rows` | CELESTE_TRIM_ROWS | no (the files say which rows are trimmed) |
+| `--trim-rows` (gone 2026-10-11: frame files hold ids only, plans/rows-from-keys.md) | CELESTE_TRIM_ROWS | no (the files say which rows are trimmed) |
 | `--threads N` | CELESTE_THREADS (and per-command `--threads`) | no |
 | ~~`--min-free-gb N`~~ (cut: 20 GB, `frame::MIN_FREE_GB`) | CELESTE_MIN_FREE_GB | no |
 | `--l1-table FILE` | CELESTE_L1_TABLE | no (the tree records the table's fingerprint) |

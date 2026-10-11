@@ -893,10 +893,14 @@ impl<'a> UnitSink<'a> {
         Ok(())
     }
 
-    /// A reference row's key (a CANONICAL row): the level's held buttons
-    /// widened, as its kernels key it, in the tree's dictionaries -
-    /// provisional where a code is new.
-    pub fn row_key(&mut self, row: &Rt2) -> Key {
+    /// A reference row (a CANONICAL row) as the tree holds it, and its key:
+    /// the level's held buttons widened, as its kernels key it (with every
+    /// level's widenings: `Rt2::widen_to`), in the tree's dictionaries -
+    /// provisional where a code is new. The row is the WIDENED one: a
+    /// tree's state is `(shape, key, cell)`, and its stored row is what the
+    /// key decodes to (plans/rows-from-keys.md), not whichever concrete row
+    /// of the class came first.
+    pub fn row_key(&mut self, row: &Rt2) -> (Rt2, Key) {
         let level = crate::abstraction::Level { held: self.level.held, ..crate::abstraction::Level::EXACT };
         let mut w = row.clone_block();
         crate::frame::widen_rt2_to(&mut w, level);
@@ -904,22 +908,26 @@ impl<'a> UnitSink<'a> {
         if self.visited.keys.shape(w.shape_hash).is_none() {
             self.note_shape(&celeste_engine::exact::ShapeRecord::of(&w, crate::compiled::ids()));
         }
-        match self.visited.keys.row_keys(&w, crate::compiled::ids()).swap_remove(0) {
+        let key = match self.visited.keys.row_keys(&w, crate::compiled::ids()).swap_remove(0) {
             RowKey::Hit(k) => k,
             RowKey::Miss(m) => self.prov.intern(m),
-        }
+        };
+        (w, key)
     }
 
-    /// The reference engine's emission: one materialized row, no edge.
+    /// The reference engine's emission: one materialized row (stored
+    /// widened: `row_key`), no edge.
     pub fn emit_row(&mut self, row: &Rt2, cell: u32) -> Result<()> {
         debug_assert_eq!(row.width, 1);
         if self.minus_one_drop(row.shape_hash, cell).is_some() {
             return Ok(());
         }
+        let (w, key) = self.row_key(row);
+        anyhow::ensure!(w.shape_hash == row.shape_hash, "a reference row's widening changed its shape ({:016x} -> {:016x})", row.shape_hash, w.shape_hash);
         let init = || {
             // Numbers and bools vary; the rest is fixed by the shape.
-            let mut b = celeste_engine::slots::reshape(row, 0);
-            b.cols = row
+            let mut b = celeste_engine::slots::reshape(&w, 0);
+            b.cols = w
                 .cols
                 .iter()
                 .map(|c| match c.at(0) {
@@ -929,11 +937,10 @@ impl<'a> UnitSink<'a> {
                     v => Col::U(v),
                 })
                 .collect();
-            b.shape_hash = row.shape_hash;
+            b.shape_hash = w.shape_hash;
             b
         };
-        let key = self.row_key(row);
-        self.emit(row.shape_hash, cell, key, self.lo, None, init, |b| b.push_row(row, key, cell))
+        self.emit(w.shape_hash, cell, key, self.lo, None, init, |b| b.push_row(&w, key, cell))
     }
 
     /// The worker's units are over: its blocks file complete, its capture

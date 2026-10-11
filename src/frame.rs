@@ -8,6 +8,7 @@ use std::ops::Range;
 
 use celeste_engine::runtime2::{Col, Rt2};
 
+use crate::storage::decode::TreeKeys;
 use crate::storage::StateId;
 
 /// Wave phase timers (`--phases`, which the wave's sinks carry): TSC ticks
@@ -835,7 +836,7 @@ fn raise_marker(dir: &std::path::Path) -> std::path::PathBuf {
 
 /// The rows `ids` (sorted) of layer `layer`, as one block per file holding
 /// some, exactly those rows (a raise's sources).
-fn load_sources(dir: &std::path::Path, layer: u32, ids: &[StateId], room: (i16, i16)) -> Result<Vec<Block>> {
+fn load_sources(dir: &std::path::Path, layer: u32, ids: &[StateId], room: (i16, i16), tree: &dyn TreeKeys) -> Result<Vec<Block>> {
     let mut out = Vec::new();
     let mut found = 0usize;
     for (seq, file) in frame_files(dir, layer)? {
@@ -852,7 +853,7 @@ fn load_sources(dir: &std::path::Path, layer: u32, ids: &[StateId], room: (i16, 
                 _ => ranges.push(r..r + 1),
             }
         }
-        let rt2 = file.load_rows(&ranges, room)?.expect("rows of a non-empty range");
+        let rt2 = file.load_rows(&ranges, room, tree)?.expect("rows of a non-empty range");
         out.push(Block::with_ids(rt2, rows.iter().map(|&r| file.id_at(r)).collect(), seq));
     }
     anyhow::ensure!(found == ids.len(), "{}: {} of {} sources found in layer {layer}", dir.display(), found, ids.len());
@@ -917,7 +918,7 @@ impl ForwardState {
         s.write(dir, level)?;
         let mut visited = crate::storage::visited::VisitedSet::new(crate::storage::GEOMETRY);
         let meta = crate::storage::wave::seed(&mut visited, &mut initial, level)?;
-        let won = checkpoint_frontier(dir, 0, &mut initial, true, s)?;
+        let won = checkpoint_frontier(dir, 0, &mut initial, true, &visited.keys, s)?;
         crate::storage::meta::save(dir, 0, None, &meta)?;
         let observer = record.then(crate::search::pos_graph::PosObserver::default);
         // An (empty) graph from the start: every tree with frames has one.
@@ -997,7 +998,7 @@ impl ForwardState {
             Some(f) => f.ceiling(),
             None => s.minus_one().map(|m| m.h),
         };
-        let frontier = expandable(load_frame(dir, last, s.room)?, last, ceiling, s)?;
+        let frontier = expandable(load_frame(dir, last, s.room, &visited)?, last, ceiling, s)?;
         let observer = if record {
             let path = pos_graph_path(dir);
             let graph = crate::search::pos_graph::PosGraph::load(&path)
@@ -1116,7 +1117,7 @@ impl ForwardState {
                 crate::search::checkpoint::save_value_to(&dropped_path(dir, frame), &wave.dropped)?;
             }
             let t = std::time::Instant::now();
-            let won = checkpoint_frontier(dir, frame, &mut next, true, s)?;
+            let won = checkpoint_frontier(dir, frame, &mut next, true, &self.visited.keys, s)?;
             crate::storage::meta::save(dir, frame, None, &wave.meta)?;
             let t_ckpt = t.elapsed();
             let t = std::time::Instant::now();
@@ -1126,13 +1127,6 @@ impl ForwardState {
             let t_pos = t.elapsed();
             // The frame's LAST write: every file above is trusted from here.
             crate::storage::edges::set_done(&edges_dir, frame, self.xfers.pairs.len())?;
-            // A resume loads frame `frame` as its frontier and never an
-            // earlier one's rows: those may go.
-            if s.trim_rows && frame >= 2 {
-                for (_, p) in frame_paths(dir, frame - 1)? {
-                    crate::search::checkpoint::trim(&p)?;
-                }
-            }
             log_frame(frame, &st, t_ckpt, t_pos, t_frame.elapsed(), self.visited_len());
             ensure_disk_space(dir, &mut last_free)?;
             self.frames = frame;
@@ -1183,18 +1177,6 @@ impl ForwardState {
                 crate::search::checkpoint::load_value_from(&p).with_context(|| format!("{}: frame {t}'s level -1 drops were not noted: the tree cannot be raised (delete it)", p.display()))
             })
             .collect::<Result<_>>()?;
-        // Before touching the tree: the rows to re-expand hold their values.
-        for t in 1..=last {
-            let redo: Vec<StateId> = notes[t as usize - 1].iter().filter(|e| e.1 <= h_new).map(|e| e.0).collect();
-            for (_, file) in frame_files(dir, t - 1)? {
-                anyhow::ensure!(
-                    !file.trimmed() || redo.iter().all(|&id| file.find_row(id).is_none()),
-                    "{}: frame {}'s rows were trimmed (--trim-rows) and the raise must re-expand some: delete the tree",
-                    dir.display(),
-                    t - 1
-                );
-            }
-        }
         let mut layers = state_layers(dir, last)?;
         std::fs::write(raise_marker(dir), format!("raising level -1 from step {} to {to:?}\n", from.h))?;
         eprintln!("[raise] {}: level -1 from step {} to {}, frames 1-{last}", dir.display(), from.h, to.map_or("off".to_string(), |m| format!("step {}", m.h)));
@@ -1211,7 +1193,7 @@ impl ForwardState {
                 continue;
             }
             let t_frame = std::time::Instant::now();
-            let mut frontier = load_sources(dir, t - 1, &redo, s.room)?;
+            let mut frontier = load_sources(dir, t - 1, &redo, s.room, &self.visited)?;
             let n_new = new_prev.iter().map(Block::lanes).sum::<usize>();
             frontier.append(&mut new_prev);
             let first_seq = frame_paths(dir, t)?.iter().map(|(s, _)| s + 1).max().unwrap_or(0);
@@ -1229,7 +1211,7 @@ impl ForwardState {
             let wave = crate::storage::wave::run_wave(engine, frontier, cx)?;
             old_seqs = first_seq;
             let mut next = wave.next;
-            let won = checkpoint_frontier(dir, t, &mut next, false, s)?;
+            let won = checkpoint_frontier(dir, t, &mut next, false, &self.visited.keys, s)?;
             crate::storage::meta::save(dir, t, Some(first_seq), &wave.meta)?;
             for b in &next {
                 for &id in b.ids() {
@@ -1510,7 +1492,10 @@ fn log_frame(
 /// adds to the frame, beside its own.
 /// Returns whether a row wins (`wins_of`, the files' win rows): the
 /// forward's first win is read off the same rows a resume reads it from.
-fn checkpoint_frontier(dir: &std::path::Path, frame: u32, frontier: &mut [Block], fresh: bool, s: &crate::settings::Settings) -> Result<bool> {
+/// A file holds the piece's ids, not its rows: each piece is checked to
+/// decode from its keys and cells exactly first (`decode::check_piece`,
+/// against `keys`, the tree's key space).
+fn checkpoint_frontier(dir: &std::path::Path, frame: u32, frontier: &mut [Block], fresh: bool, keys: &celeste_engine::exact::KeySpace, s: &crate::settings::Settings) -> Result<bool> {
     let fdir = dir.join("frames").join(format!("f{:03}", frame));
     // A re-run frame must not leave stale files behind.
     if fresh {
@@ -1532,6 +1517,7 @@ fn checkpoint_frontier(dir: &std::path::Path, frame: u32, frontier: &mut [Block]
                     anyhow::ensure!(block.ids.len() == block.lanes(), "checkpoint f{frame}: a block without its ids");
                     let cells = block.positions()?;
                     let wins = block.wins(s)?;
+                    crate::storage::decode::check_piece(keys, &block.rt2, &cells).with_context(|| format!("checkpoint f{frame}"))?;
                     let path = fdir.join(format!("s{:016x}_{:04}.bin", block.shard_shape(), block.seq));
                     anyhow::ensure!(fresh || !path.exists(), "checkpoint f{frame}: {} exists", path.display());
                     crate::search::checkpoint::save_block(&path, &block.rt2, &block.ids, &cells, &wins)?;
@@ -1574,11 +1560,12 @@ pub fn frame_files(dir: &std::path::Path, frame: u32) -> Result<Vec<(u32, crate:
     frame_paths(dir, frame)?.into_iter().map(|(seq, p)| Ok((seq, crate::search::checkpoint::FrameFile::open(&p)?))).collect()
 }
 
-/// Load every block of a checkpointed frame of a search from `room`.
-pub fn load_frame(dir: &std::path::Path, frame: u32, room: (i16, i16)) -> Result<Vec<Block>> {
+/// Load every block of a checkpointed frame of a search from `room`, its
+/// rows decoded against `tree` (the tree's key space and entries).
+pub fn load_frame(dir: &std::path::Path, frame: u32, room: (i16, i16), tree: &dyn TreeKeys) -> Result<Vec<Block>> {
     let mut out = Vec::new();
     for (seq, file) in frame_files(dir, frame)? {
-        if let Some(rt2) = file.load_all(room)? {
+        if let Some(rt2) = file.load_all(room, tree)? {
             out.push(Block::layer_piece(rt2, file.ids(), seq));
         }
     }
@@ -1587,13 +1574,13 @@ pub fn load_frame(dir: &std::path::Path, frame: u32, room: (i16, i16)) -> Result
 
 /// One stored row by its id: the row, its shape, its cell and its layer
 /// (found by a binary search in each frame's files: a diagnostic's lookup),
-/// in a search from `room`.
-pub fn load_row(dir: &std::path::Path, id: StateId, room: (i16, i16)) -> Result<(Rt2, u64, u32, u32)> {
+/// in a search from `room`, decoded against `tree`.
+pub fn load_row(dir: &std::path::Path, id: StateId, room: (i16, i16), tree: &dyn TreeKeys) -> Result<(Rt2, u64, u32, u32)> {
     let mut frame = 0;
     while dir.join("frames").join(format!("f{frame:03}")).is_dir() {
         for (_, f) in frame_files(dir, frame)? {
             if let Some(row) = f.find_row(id) {
-                let rt2 = f.load_rows(&[row..row + 1], room)?.ok_or_else(|| anyhow::anyhow!("no row for id {}", crate::storage::show_id(id)))?;
+                let rt2 = f.load_rows(&[row..row + 1], room, tree)?.ok_or_else(|| anyhow::anyhow!("no row for id {}", crate::storage::show_id(id)))?;
                 return Ok((rt2, f.shape_hash(), f.cell_at(row), frame));
             }
         }
@@ -1604,7 +1591,7 @@ pub fn load_row(dir: &std::path::Path, id: StateId, room: (i16, i16)) -> Result<
 
 /// The visited set of a tree's frames `0..=last` (the storage metadata's
 /// shapes and entries, the frame files' ids for the cells), and its first
-/// win. A row whose key is not its entry's is a collision, fatal.
+/// win.
 pub fn restore_visited(dir: &std::path::Path, last: u32) -> Result<(crate::storage::visited::VisitedSet, Option<u32>)> {
     let geo = crate::storage::GEOMETRY;
     let mut visited = crate::storage::visited::VisitedSet::new(geo);
@@ -1635,10 +1622,10 @@ pub fn restore_visited(dir: &std::path::Path, last: u32) -> Result<(crate::stora
                 let id = file.id_at(row);
                 let (r, e, l) = (crate::storage::id_region(id), crate::storage::id_entry(id), crate::storage::id_local(id));
                 let t = visited.table_mut(r);
-                anyhow::ensure!((e as usize) < t.len() && t.key(e) == file.key_at(row), "{}: f{f} row {row} (state {}) is not its entry's key", dir.display(), crate::storage::show_id(id));
+                anyhow::ensure!((e as usize) < t.len(), "{}: f{f} row {row} (state {}) has no entry", dir.display(), crate::storage::show_id(id));
                 anyhow::ensure!(t.set(geo.words, e, l), "{}: state {} stored twice", dir.display(), crate::storage::show_id(id));
             }
-            if !file.wins().is_empty() {
+            if !file.win_rows().is_empty() {
                 win_frame = Some(win_frame.map_or(f, |w: u32| w.min(f)));
             }
         }
@@ -1780,7 +1767,7 @@ pub fn tree_first_win_through(dir: &std::path::Path, horizon: u32) -> Result<Opt
         for e in std::fs::read_dir(dir.join("frames").join(format!("f{f:03}")))? {
             let p = e?.path();
             let name = p.file_name().and_then(|s| s.to_str()).unwrap_or("");
-            if name.starts_with('s') && name.ends_with(".bin") && !crate::search::checkpoint::FrameFile::open(&p)?.wins().is_empty() {
+            if name.starts_with('s') && name.ends_with(".bin") && !crate::search::checkpoint::FrameFile::open(&p)?.win_rows().is_empty() {
                 return Ok(Some(Some(f)));
             }
         }
@@ -1843,31 +1830,38 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
-    /// A trimmed checkpoint keeps everything the search reads of an old
-    /// frame - width, shape, keys, ids, cells, the wins - and refuses to
-    /// load its rows.
+    /// ROWS FROM KEYS: a frame file holds the ids, not the rows. The
+    /// frontier a resume DECODES from them (the metadata's keys, the ids'
+    /// cells, the shape's skeleton) is the forward's own, row for row -
+    /// values and column kinds - at every frame to f36, and a frame's file is ~8
+    /// B a row. (On format-13 trees, before the rows went: every stored row
+    /// of seven fixtures decoded exactly, 73.9M rows; plans/rows-from-keys.md.)
     #[test]
-    fn a_trimmed_frame_keeps_its_keys_cells_and_wins() {
+    fn a_resumed_frontier_is_the_forwards_own() {
         let s = crate::settings::Settings::default();
-        let engine = std::sync::Mutex::new(RefEngine::new(&s).expect("ref engine"));
-        let init = vec![Block::canonical(engine.lock().unwrap().initial().expect("initial state")).expect("block")];
-        let dir = std::path::Path::new("/var/tmp/celeste-frame-trim-test");
-        let _ = std::fs::remove_dir_all(dir);
-        let mut st = ForwardState::start(init, dir, true, None, crate::abstraction::Level::EXACT, &s).expect("start");
-        st.extend(&engine, dir, 2, None).expect("two frames");
-        type Seen = (u32, u64, Vec<(u32, (u64, u64))>, Vec<u64>, Vec<(u64, (u64, u64), u32)>);
-        let seen = |f: &crate::search::checkpoint::FrameFile| -> Seen {
-            (f.width(), f.shape_hash(), f.cell_keys().collect(), f.ids(), f.wins())
-        };
-        for (_, p) in frame_paths(dir, 1).expect("frame 1") {
-            let before = seen(&crate::search::checkpoint::FrameFile::open(&p).expect("open"));
-            assert!(crate::search::checkpoint::trim(&p).expect("trim") > 0, "the rows' values are gone");
-            let f = crate::search::checkpoint::FrameFile::open(&p).expect("reopen");
-            assert_eq!(seen(&f), before);
-            assert!(f.load_all(s.room).is_err(), "a trimmed frame's rows do not load");
-            assert_eq!(crate::search::checkpoint::trim(&p).expect("trim again"), 0);
+        let dir = std::env::temp_dir().join(format!("celeste-rows-from-keys-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let level = crate::abstraction::Level::parse("r0sxh").expect("level");
+        let e = crate::compiled::FrameEngine::new(&s, level).expect("kernels");
+        let init = vec![Block::canonical(RefEngine::new(&s).expect("engine").initial().expect("init")).expect("block")];
+        let mut st = ForwardState::start(init, &dir, true, None, level, &s).expect("start");
+        let (mut rows, mut bytes) = (0usize, 0u64);
+        for f in 1..=36 {
+            st.extend(&e, &dir, f, None).expect("extend");
+            let back = ForwardState::at(&dir, f, false, level, &s).expect("at");
+            assert_eq!(st.frontier.len(), back.frontier.len(), "f{f}: pieces");
+            for (a, b) in st.frontier.iter().zip(&back.frontier) {
+                assert_eq!((a.ids(), a.seq(), a.skip()), (b.ids(), b.seq(), b.skip()), "f{f}: ids");
+                assert_eq!(crate::storage::decode::block_diff(a.rt2(), b.rt2()), None, "f{f}: a decoded row differs");
+                rows += a.lanes();
+            }
+            for (_, p) in frame_paths(&dir, f).expect("paths") {
+                bytes += std::fs::metadata(&p).expect("stat").len();
+            }
         }
-        let _ = std::fs::remove_dir_all(dir);
+        assert!(rows > 50_000, "{rows} rows: past the spawn");
+        assert!(bytes < rows as u64 * 9 + 36 * 4096, "{bytes} B for {rows} rows: the files hold ids only");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A tree's level -1 record round-trips, reads the campaign's bare
@@ -1982,7 +1976,7 @@ mod tests {
         st.extend(&e, &b, ends, None).expect("rerun");
         for f in 0..=ends {
             let keys = |d: &std::path::Path| -> Vec<(u64, u64)> {
-                let mut k: Vec<_> = load_frame(d, f, s.room).expect("load").iter().flat_map(|b| b.keys().to_vec()).collect();
+                let mut k: Vec<_> = load_frame(d, f, s.room, &crate::storage::marks::Resolver::load(d, f).expect("metadata")).expect("load").iter().flat_map(|b| b.keys().to_vec()).collect();
                 k.sort_unstable();
                 k
             };
@@ -2005,7 +1999,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
         std::fs::create_dir_all(dir).expect("mkdir");
         let keyset = |frame: u32| -> FxHashSet<(u64, u64)> {
-            load_frame(dir, frame, s.room)
+            load_frame(dir, frame, s.room, &crate::storage::marks::Resolver::load(dir, frame).expect("metadata"))
                 .expect("load")
                 .iter()
                 .flat_map(|b| b.keys().to_vec())
@@ -2056,7 +2050,7 @@ mod tests {
             assert!(st.visited_len() >= visited_before);
         }
         let keyset_in = |d: &std::path::Path, frame: u32| -> FxHashSet<(u64, u64)> {
-            load_frame(d, frame, s.room).expect("load").iter().flat_map(|b| b.keys().to_vec()).collect()
+            load_frame(d, frame, s.room, &crate::storage::marks::Resolver::load(d, frame).expect("metadata")).expect("load").iter().flat_map(|b| b.keys().to_vec()).collect()
         };
         assert_eq!(keyset_in(fresh_dir, 6), keyset_in(dir, 6), "resumed run diverged from fresh at frame 6");
         assert_eq!(keyset_in(fresh_dir, 5), keyset_in(dir, 5), "resumed run diverged from fresh at frame 5");
@@ -2296,7 +2290,7 @@ mod tests {
         let last = unsplit.last().unwrap().0;
         forward_run(&engine, init, dir, 2 * last, false).expect("split forward");
         for (f, want) in unsplit {
-            let got: usize = load_frame(dir, 2 * f, s.room).expect("load").iter().map(Block::lanes).sum();
+            let got: usize = load_frame(dir, 2 * f, s.room, &crate::storage::marks::Resolver::load(dir, 2 * f).expect("metadata")).expect("load").iter().map(Block::lanes).sum();
             assert_eq!(got, want, "frame {f} (step {}): the split frame reached {got} states, the unsplit {want}", 2 * f);
         }
         let _ = std::fs::remove_dir_all(dir);

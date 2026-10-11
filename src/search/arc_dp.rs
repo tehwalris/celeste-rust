@@ -1587,7 +1587,7 @@ pub fn solve(
     let known = match known {
         Some(route) => {
             let minus_one = crate::frame::TreeFilter::of_tree(dir, s)?;
-            let p = super::known::Pruning { settings: s, level, horizon, node: &node, keys: &resolver.space, start, w: &w, reached: arc_marks.as_ref(), minus_one, files: &files };
+            let p = super::known::Pruning { settings: s, level, horizon, node: &node, keys: &resolver.space, start, w: &w, reached: arc_marks.as_ref(), minus_one, files: &files, tree: &resolver };
             super::known::check(route, &p)?
         }
         None => None,

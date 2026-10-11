@@ -483,7 +483,8 @@ struct FrameCounts {
     marked: Vec<FxHashMap<u32, u32>>,
 }
 
-fn frame_counts(dir: &Path, f: u32, marks: Option<&MarkTable>, nsets: usize) -> Result<FrameCounts> {
+fn frame_counts(dir: &Path, f: u32, marks: Option<(&MarkTable, &crate::storage::marks::Resolver)>, nsets: usize) -> Result<FrameCounts> {
+    use crate::storage::decode::TreeKeys;
     let mut out = FrameCounts { cells: FxHashMap::default(), wins: FxHashMap::default(), marked: vec![FxHashMap::default(); nsets] };
     let files = match crate::frame::frame_files(dir, f) {
         Ok(v) => v,
@@ -498,7 +499,7 @@ fn frame_counts(dir: &Path, f: u32, marks: Option<&MarkTable>, nsets: usize) -> 
         for &(_, cell) in file.win_rows() {
             *out.wins.entry(cell).or_default() += 1;
         }
-        let Some(t) = marks else { continue };
+        let Some((t, tree)) = marks else { continue };
         let shape = file.shape_hash();
         // Rows in id order: a cell's rows come in short runs; look a cell up
         // once a run, and skip an unmarked cell's rows without their keys.
@@ -515,7 +516,7 @@ fn frame_counts(dir: &Path, f: u32, marks: Option<&MarkTable>, nsets: usize) -> 
             let shard = &t.shards[mark_shard(shape, cell)];
             per_set.fill(0);
             for r in lo..hi {
-                if let Some(&m) = shard.get(&(shape, cell, file.key_at(r))) {
+                if let Some(&m) = shard.get(&(shape, cell, tree.key(file.id_at(r), shape)?)) {
                     let mut bits = m;
                     while bits != 0 {
                         per_set[bits.trailing_zeros() as usize] += 1;
@@ -562,6 +563,12 @@ fn read_tree(dir: &Path, marks: Option<&MarkTable>, nsets: usize) -> Result<(Lev
     };
     // The largest (latest) frames first, so the tail is small ones.
     let n = nframes as usize;
+    // A marked state's key: its id's entry in the storage metadata.
+    let tree = match marks {
+        Some(_) if n > 0 => Some(crate::storage::marks::Resolver::load(dir, n as u32 - 1)?),
+        _ => None,
+    };
+    let marks = marks.zip(tree.as_ref());
     let mut counts = par_map(n, |i| frame_counts(dir, (n - 1 - i) as u32, marks, nsets))?;
     counts.reverse();
     let mut frames: Vec<(Sparse, Sparse)> = Vec::with_capacity(n);

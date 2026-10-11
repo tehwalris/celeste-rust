@@ -18,7 +18,7 @@
 //!
 //! The level -1 filter is recorded apart (`frame::TreeFilter`,
 //! `level_minus_one.txt`): a raise changes it, and a tree serves every
-//! horizon up to it. Threads, trimming and the diagnostics never change a
+//! horizon up to it. Threads and the diagnostics never change a
 //! tree. The level the tree's rows are widened at (the engine's `Level`) is
 //! a line of the record: a tree used at another level is refused like any
 //! other difference.
@@ -62,8 +62,6 @@ pub struct Settings {
     pub level_minus_one: Option<(u32, i32)>,
     /// The balloons' phases of the concrete phase only.
     pub concrete_balloon_seeds: Option<String>,
-    /// Old frames keep keys, cells and wins only (`--trim-rows`).
-    pub trim_rows: bool,
     /// Worker threads (`None`: one per physical core).
     pub threads: Option<usize>,
     /// The level -1 table pinned by its file (the fixtures).
@@ -109,7 +107,6 @@ impl Default for Settings {
             balloon_seeds: None,
             level_minus_one: None,
             concrete_balloon_seeds: None,
-            trim_rows: false,
             threads: None,
             l1_table: None,
             override_settings: false,
@@ -337,10 +334,6 @@ pub struct SettingsArgs {
     /// The level -1 filter "H,S": H in search steps, S the table's speed bound.
     #[arg(long, global = true, value_parser = |s: &str| pair::<u32>(s, "--level-minus-one"))]
     pub level_minus_one: Option<(u32, u32)>,
-    /// Old frames keep keys, cells and wins only (a big room's tree ~30-40%
-    /// smaller; diagnostics that load old rows refuse it).
-    #[arg(long, global = true)]
-    pub trim_rows: bool,
     /// Worker threads (default: one per physical core).
     #[arg(long, global = true)]
     pub threads: Option<usize>,
@@ -422,7 +415,6 @@ impl SettingsArgs {
             balloon_seeds: self.balloon_seeds.clone(),
             level_minus_one,
             concrete_balloon_seeds: self.concrete_balloon_seeds.clone(),
-            trim_rows: self.trim_rows,
             threads: self.threads,
             l1_table: self.l1_table.clone(),
             override_settings: self.override_settings,
@@ -488,7 +480,7 @@ pub fn refuse_env() -> Result<()> {
         ("CELESTE_BALLOON_SEEDS", "--balloon-seeds"),
         ("CELESTE_CONCRETE_BALLOON_SEEDS", "--concrete-balloon-seeds"),
         ("CELESTE_LEVEL_MINUS_ONE", "--level-minus-one H,S"),
-        ("CELESTE_TRIM_ROWS", "--trim-rows"),
+        ("CELESTE_TRIM_ROWS", "nothing: frame files hold ids, never rows (plans/rows-from-keys.md)"),
         ("CELESTE_THREADS", "--threads"),
         ("CELESTE_L1_TABLE", "--l1-table"),
         ("CELESTE_KERNEL_KEY_CHECK", "--key-check"),
@@ -538,7 +530,6 @@ pub fn startup(args: &SettingsArgs, adjust: impl FnOnce(&mut Settings)) -> Resul
     note("--balloon-seeds ", s.balloon_seeds.is_some(), s.balloon_seeds.clone().unwrap_or_default());
     note("--concrete-balloon-seeds ", s.concrete_balloon_seeds.is_some(), s.concrete_balloon_seeds.clone().unwrap_or_default());
     note("--level-minus-one ", s.level_minus_one.is_some(), s.level_minus_one.map_or(String::new(), |(h, v)| format!("{h},{v}")));
-    note("--trim-rows", s.trim_rows, String::new());
     note("--threads ", s.threads.is_some(), format!("{}", s.threads.unwrap_or_default()));
     note("--override-settings", s.override_settings, String::new());
     note("--l1-table ", s.l1_table.is_some(), format!("{}", s.l1_table.as_deref().unwrap_or(Path::new("")).display()));
@@ -596,8 +587,8 @@ mod tests {
         assert!(e.to_string().contains("records no settings"), "{e}");
         std::fs::write(path(&dir), sample.text("r0sxhf")).expect("write");
         sample.check_at(&dir, "r0sxhf").expect("the same settings");
-        let harmless = Settings { threads: Some(3), trim_rows: true, level_minus_one: Some((94, 5)), diag: Diagnostics { key_check: true, ..Default::default() }, ..sample.clone() };
-        harmless.check_at(&dir, "r0sxhf").expect("threads, trimming, level -1 and diagnostics are not a tree's settings");
+        let harmless = Settings { threads: Some(3), level_minus_one: Some((94, 5)), diag: Diagnostics { key_check: true, ..Default::default() }, ..sample.clone() };
+        harmless.check_at(&dir, "r0sxhf").expect("threads, level -1 and diagnostics are not a tree's settings");
         let other = Settings { hundred: false, split_frame: true, win_at: Some((8, 8, 64, 64)), ..sample.clone() };
         let e = other.check_at(&dir, "r0sxh").expect_err("other settings").to_string();
         for k in ["hundred: the tree's 1, this run's 0", "split_frame: the tree's 0, this run's 1", "win_at: the tree's none, this run's 8..8,64..64", "level: the tree's r0sxhf, this run's r0sxh"] {

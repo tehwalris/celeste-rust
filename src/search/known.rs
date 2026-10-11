@@ -56,8 +56,10 @@ pub struct Pruning<'a> {
     pub reached: Option<&'a Visited>,
     /// The level -1 filter the tree was built under (`TreeFilter::of_tree`).
     pub minus_one: Option<crate::frame::MinusOne>,
-    /// The tree's frame files `(layer, seq, file)`, for the report.
+    /// The tree's frame files `(layer, seq, file)`, for the report, and
+    /// its metadata (their rows' keys).
     pub files: &'a [(u32, u32, super::checkpoint::FrameFile)],
+    pub tree: &'a crate::storage::marks::Resolver,
 }
 
 /// The route's concrete states per search step, each with its parent's
@@ -241,7 +243,7 @@ fn verdict(b: &Block, s: u32, seeded: bool, l1: Option<(u32, &crate::trace::leve
         return Ok(None);
     }
     let Some(i) = (if s == 0 { Some(p.start) } else { p.node.get(shape, key, cell) }) else {
-        return Ok(match key.and_then(|key| in_tree(p.files, s, shape, key, cell)) {
+        return Ok(match key.and_then(|key| in_tree(p.files, p.tree, s, shape, key, cell)) {
             Some((layer, seq, row)) => backward(format!(
                 "NOT MARKED: in the tree (layer {layer} s{seq} r{row}) but the remainder-free BFS finds no recorded path from it to a win by step {} - a successor on the route was lost ({node})",
                 p.horizon
@@ -266,9 +268,9 @@ fn verdict(b: &Block, s: u32, seeded: bool, l1: Option<(u32, &crate::trace::leve
 }
 
 /// Where the tree holds a row `(shape, key, cell)` at a layer <= `s`.
-fn in_tree(files: &[(u32, u32, super::checkpoint::FrameFile)], s: u32, shape: u64, key: (u64, u64), cell: u32) -> Option<(u32, u32, u32)> {
+fn in_tree(files: &[(u32, u32, super::checkpoint::FrameFile)], tree: &crate::storage::marks::Resolver, s: u32, shape: u64, key: (u64, u64), cell: u32) -> Option<(u32, u32, u32)> {
     files
         .iter()
         .filter(|(layer, _, f)| *layer <= s && f.shape_hash() == shape)
-        .find_map(|(layer, seq, f)| f.rows_of_cell(cell).into_iter().flatten().find(|&r| f.key_at(r) == key).map(|r| (*layer, *seq, r)))
+        .find_map(|(layer, seq, f)| f.rows_of_cell(cell).into_iter().flatten().find(|&r| tree.resolve(f.id_at(r)).is_ok_and(|x| x.1 == key)).map(|r| (*layer, *seq, r)))
 }
