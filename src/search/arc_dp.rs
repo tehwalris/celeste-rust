@@ -1672,7 +1672,15 @@ pub fn solve(
     eprintln!("[arc] backward {tb:.2} s; optimum {arc_steps:?} (steps)");
     // The nodes as (shape, key, cell), through the storage metadata: the
     // fingerprints, the marks files and the concrete search's keys.
-    let resolver = crate::storage::marks::Resolver::load(dir, horizon)?;
+    let mut wanted: Vec<(u32, u32)> = Vec::new();
+    for x in w.nodes() {
+        let e = (id_region(x.id), id_entry(x.id));
+        if wanted.last() != Some(&e) {
+            wanted.push(e);
+        }
+    }
+    let resolver = crate::storage::marks::Resolver::load_for(dir, horizon, &wanted)?;
+    drop(wanted);
     // Fingerprints over CONTENT (`exact::ContentHash`): independent of the
     // order the tree's dictionaries grew in (a raise).
     let content = resolver.space.content_hash();
@@ -1746,7 +1754,7 @@ pub fn solve(
     let known = match (known, &node) {
         (Some(route), Some(node)) => {
             let minus_one = crate::frame::TreeFilter::of_tree(dir, s)?;
-            let p = super::known::Pruning { settings: s, level, horizon, node, keys: &resolver.space, start, w: &w, reached: arc_marks.as_ref(), minus_one, files: &files, tree: &resolver };
+            let p = super::known::Pruning { settings: s, level, horizon, node, keys: &resolver.space, start, w: &w, reached: arc_marks.as_ref(), minus_one, files: &files, dir };
             super::known::check(route, &p)?
         }
         _ => None,

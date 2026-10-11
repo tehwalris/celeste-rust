@@ -57,10 +57,11 @@ pub struct Pruning<'a> {
     pub reached: Option<&'a Visited>,
     /// The level -1 filter the tree was built under (`TreeFilter::of_tree`).
     pub minus_one: Option<crate::frame::MinusOne>,
-    /// The tree's frame files `(layer, seq, file)`, for the report, and
-    /// its metadata (their rows' keys).
+    /// The tree's frame files `(layer, seq, file)` and its directory, for
+    /// the report (its rows' keys from every entry's metadata, loaded only
+    /// on a miss).
     pub files: &'a [(u32, u32, super::checkpoint::FrameFile)],
-    pub tree: &'a crate::storage::marks::Resolver,
+    pub dir: &'a std::path::Path,
 }
 
 /// The route's concrete states per search step, each with its parent's
@@ -244,7 +245,8 @@ fn verdict(b: &Block, s: u32, seeded: bool, l1: Option<(u32, &crate::trace::leve
         return Ok(None);
     }
     let Some(i) = (if s == 0 { p.start } else { p.node.get(shape, key, cell) }) else {
-        return Ok(match key.and_then(|key| in_tree(p.files, p.tree, s, shape, key, cell)) {
+        let tree = crate::storage::marks::Resolver::load(p.dir, s)?;
+        return Ok(match key.and_then(|key| in_tree(p.files, &tree, s, shape, key, cell)) {
             Some((layer, seq, row)) => backward(format!(
                 "NOT IN W's SUPPORT: in the tree (layer {layer} s{seq} r{row}) but its winning set is empty at every step by {} - a successor on the route was lost ({node})",
                 p.horizon
