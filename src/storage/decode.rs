@@ -187,7 +187,8 @@ fn column(repr: Repr, codes: &[Code]) -> Result<Col> {
 
 /// Where a decoded block differs from the stored one (`None`: identical,
 /// representation included).
-pub fn block_diff(stored: &Rt2, decoded: &Rt2) -> Option<String> {
+#[cfg(test)]
+pub(crate) fn block_diff(stored: &Rt2, decoded: &Rt2) -> Option<String> {
     if stored.shape_hash != decoded.shape_hash || stored.width != decoded.width {
         return Some(format!("shape {:016x}/{:016x}, width {}/{}", stored.shape_hash, decoded.shape_hash, stored.width, decoded.width));
     }
@@ -216,6 +217,7 @@ pub fn block_diff(stored: &Rt2, decoded: &Rt2) -> Option<String> {
     None
 }
 
+#[cfg(test)]
 fn kind(c: &Col) -> &'static str {
     match c {
         Col::U(_) => "U",

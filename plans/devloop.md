@@ -226,16 +226,14 @@ exits non-zero; `./check.sh t1 --pin` re-pins. Keys:
 - `calls.*`: kernel calls, rows, slice-lanes, (body, slice) evaluations and
   those that took a lane, lane emissions and those after the dedup cache,
   lanes missed;
-- `frame.*`: lanes in, emissions, states kept, units, requests, lids, edges;
-- `approx.frame.edge_bytes`, `approx.frame.edge_millibytes_per_edge`: NOT
-  exact (a unit's block is encoded during the wave with its worker's local
-  transfer ids, whose varint lengths depend on which units it ran first:
-  28 bytes in 41.8 MB between two runs); compared within 0.5%.
+- `frame.*`: lanes in, emissions, states kept, units, slices, routes,
+  edges, bundles, the edge file's bytes and millibytes an edge (exact: a
+  segment is a function of its (route, slice)'s units, the transfer ids
+  global and canonical).
 
-Exact at a fixed thread count (the units, so the slices and calls, follow
-the workers); `check.sh` uses 16. Checked: identical run to run, and at 8
-against 16 threads for room (1,0) f44 (whose units are the 1024-lane
-minimum either way). The census costs the build ~0.6 s for room (6,0)'s
+The same at every thread count since the edges target (2026-10-11: a
+unit is a 256th of the frame, not of the workers): `check.sh t1` at 8 and
+at 16 threads gives the same metrics, f/e lines and edge files. The census costs the build ~0.6 s for room (6,0)'s
 918 kernels (2.1 against 1.5 s of assembly).
 
 ## Costs measured

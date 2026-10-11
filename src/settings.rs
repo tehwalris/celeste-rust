@@ -349,8 +349,8 @@ pub struct SettingsArgs {
     #[arg(long, global = true)]
     pub override_settings: bool,
     /// DIAGNOSTIC: every emitted row's key recomputed by the boundary, and
-    /// every unit's copy of a new state compared (claims off: every copy
-    /// reaches the translation).
+    /// the row decoded back from its key and cell (the new layer is
+    /// decoded so) and compared.
     #[arg(long, global = true)]
     pub key_check: bool,
     /// DIAGNOSTIC: kernels keep their graphs, so a decline names its premise.

@@ -61,12 +61,13 @@ crates/celeste-engine    Rt2 block model, boundary/keys, lane primitives        
 .  (celeste-rust)        everything else                                         deps: all
   src/frame.rs           Block, FrameStep, ForwardState (start, resume,
                          extend, raise), MarkFilter, the frame files
-  src/storage/           THE STORAGE (plans/storage-v2.md): visited (posmask
-                         region tables), unit (UnitSink: the kernels'
-                         emissions), wave (units, translation, the layer),
-                         edges (edge files, transfers, EdgeStore), marks
-                         (the Resolver), meta, bench (the capture and
-                         `bench-storage`)
+  src/storage/           THE STORAGE (plans/storage-v2.md, plans/edges-target.md):
+                         visited (posmask region tables), unit (UnitSink: the
+                         kernels' emissions into bundles), route (the region
+                         phase), wave (the frame's pipeline and end), bundle
+                         and edges (the edge files, transfers, EdgeStore),
+                         marks (the Resolver), meta, decode, bench (the
+                         capture and `bench-storage`)
   src/search/            checkpoint, arc_edges (the transfer decode), arcs
                          (remainder sets, their arena), arc_dp (THE SEARCH:
                          the backward push, optimum, reach, concrete search),
@@ -293,8 +294,8 @@ number and its point interval are one code, `592c72f`), each field's index
 in append-only bit runs of a 127-bit key that never moves as the
 dictionaries grow. The append step looks each emitted row's key fields up
 in the dictionaries (read-only during a wave); a code they lack makes the
-state new and its key PROVISIONAL (its content interned), made final by
-the translation, which appends the frame's new codes sorted - so keys stay
+state new and its key PROVISIONAL (its content interned), made final at
+the frame's end, which appends the frame's new codes sorted - so keys stay
 canonical. Checked per row against `Rt2::boundary_canonicalize` keyed in
 the same dictionaries by `--key-check`. FIELD_NAMES' order
 feeds the shape hash (a shape's name; its signature is stored and compared)
@@ -333,10 +334,12 @@ a product is now computed unwrapped (`pieces_of`: past 16.16 it is unknown,
 not PICO-8's wrapped endpoints). Which results ran before the fix:
 plans/results.md.
 
-## The forward frame and the storage (storage v2, 2026-10-10)
+## The forward frame and the storage (edges target, 2026-10-11)
 
-One storage system (plans/storage-v2.md; it replaced the door, the queues,
-the unit row cache, the raw edge records and the inversion):
+One storage system (plans/storage-v2.md built the visited set and the ids;
+plans/edges-target.md the ID-free edges and the routed forward; they
+replaced the door, the queues, the unit row cache, the raw edge records,
+the inversion, then the lids, the owner index and the translation):
 
 - **The visited set** (`storage::visited`): per (shape, storage REGION) a
   table of ENTRIES - a position-free key and a mask over the region's cells.
@@ -345,73 +348,77 @@ the unit row cache, the raw edge records and the inversion):
   (the kernels' px a multiple of it, else refused); `NO_CELL` is one more
   region per shape. Room (6,2) 100% f57: 43.8M states in 2.19M entries,
   0.10 GB (the door: 1.08 GB).
-- **Ids** (`storage::StateId`): (region, entry, cell in region), region =
-  shape index x slots + slot, so ids sort by shape and position. Entry
-  numbers are assigned by the translation in KEY order among a frame's new
-  entries: canonical when assigned, whatever the threads or the units. A
-  layer is stored in id order (checkpoint v12: id and cell columns); the
-  frame's metadata (`storage::meta`, `frames/fNNN/meta.bin`) lists the shapes
-  and entries (with keys) it created - with the files' ids, the visited set.
-- **The wave** (`storage::wave::run_wave`): the frontier cut into UNITS of
-  contiguous rows (1024-4096 lanes), pulled by `threads()` workers. Per
-  emission the unit's sink (`storage::unit::UnitSink`) drops level -1's
-  rows (noting their sources), keys the row, decodes its transfer, and
-  probes its TARGET TABLE keyed by (shape, region slot, key): a LID per
-  distinct target entry, looked up in the visited set once (read-only
-  during the wave) with the owner's mask. A cell the owner holds is an old
-  state: an edge only. Else a REQUEST: the first unit to request the state
-  this wave copies its row (`Claims`); the others only name it. The unit's
-  edges `(lid, cell, source, transfer)` are sorted by target and encoded at
-  its end and streamed into the worker's blocks file.
-- **The translation** (`wave::translate`): the requests grouped by target
-  region, one worker a region: sorted by (key, cell), each new key an entry
-  (key order), each new cell a NEW state; every lid gets its owner (others'
-  lids of claimed states are found after it, `resolve_lids`). The only
-  writer of the visited set.
-- **The layer** (`gather_layer`): the new states in id order gathered from
-  the units' row buffers into pieces (`PIECE_ROWS`), checkpointed with their
-  ids, cells, keys and wins; the frame's edge file (below); the metadata;
-  the drop notes; the pos graph; then `done.txt`.
+- **States** are `(shape, key, cell)`; the edges and the backward name them
+  so (`storage::Sk`: region, key, cell in region). The layers' frame files
+  still carry IDS (`storage::StateId`: region, entry, cell in region; region
+  = shape index x slots + slot, so ids sort by shape and position). Entry
+  numbers are assigned at the frame's end in KEY order among a frame's new
+  entries: canonical, whatever the threads or the units. A layer is stored
+  in id order (checkpoint v14: the id column, rows decoded from the keys);
+  the frame's metadata (`storage::meta`, `frames/fNNN/meta.bin`) lists the
+  shapes and entries (with keys) it created.
+- **The wave** (`storage::wave::run_wave`), one pipeline a frame: the
+  frontier cut into UNITS of contiguous rows (a 256th of the frame,
+  1024-4096 lanes) and the units into SLICES (~1M lanes). Per emission the
+  unit's sink (`storage::unit::UnitSink`) drops level -1's rows (noting
+  their sources), keys the row and ORs it into its BUNDLE (source key,
+  transfer, offset, target key -> target cells) in a unit-local table,
+  keyed by the target's ROUTE (shape, region slot). Nothing is looked up in
+  the visited set and no row is copied. At its end the unit's bundles are
+  per route a CHUNK. When a slice's units are done its transfers get their
+  global ids and its chunks become REGION JOBS (one per (route, slice)),
+  which the workers take before the next slice's units: the region phase
+  overlaps the kernels.
+- **The region phase** (`storage::route::run_route`): per chunk target ONE
+  probe of the region's table and an OR - the cells the entry lacked are
+  the new states - and the job's bundles encoded into one zstd SEGMENT of
+  the frame's edge file. A region's table is written only by its route's
+  jobs, one at a time.
+- **The frame's end**: provisional keys made final, new shapes numbered,
+  each route's new entries renumbered in key order (`RegionTable::
+  finish_frame`), the edge file written, and the new LAYER DECODED from
+  its states' keys and cells (`decode::Skeletons`: no row was copied);
+  checkpointed with ids, cells, keys and wins; the metadata; the drop
+  notes; the pos graph; then `done.txt`. The DECODE GUARD: a shape's first
+  emitted row (each worker, each wave) must be what its key and cell decode
+  to, and every emission's skeleton the shape's (FATAL otherwise);
+  `--key-check` compares every row.
 
-The result is a function of the frame, not of scheduling: identical at 3
-and 32 threads (states and edge content, room (1,0) f0-f50), over a resume,
-and under `gates/raise.sh`. `rewrite bench-storage` replays one captured
-frame (`--emit-capture`) through this code without the kernels, and
-reproduces the real tree's `ckhash` lines of that frame.
+The result is a function of the frame, not of scheduling or the thread
+count: room (1,0) f0-f60 at 3 and 32 threads and over a resume, the frame
+files, edge files and `xfer.bin` are byte-identical (multi-slice frames:
+r0sx f50-f56), and `gates/raise.sh` passes. `rewrite bench-storage`
+replays one captured frame (`--emit-capture`) through this code without the
+kernels, and reproduces the real tree's `ckhash` lines of that frame.
 
-## The recorded graph (storage v2, 2026-10-10)
+## The recorded graph (edges target, 2026-10-11)
 
 The forward records every edge once, with what the frame did to the
 remainder (its transfer); the backward reads the edge files and re-runs no
 kernel. An edge recorded at frame f leaves a state of layer f - 1.
 
-- **The edge file** (`storage::edges`): per frame `edges/f{frame}.bin`
-  (a raise adds `f{frame}.r{seq}.bin`), and per worker its blocks file
-  `f{frame}.w{n}.blk`. Per unit: its sources (ids), its BLOCK - its edges
-  lid by lid (a cell byte, varint source deltas, the transfer's rank in the
-  unit) with per lid its start, its transfer ranks' global ids; its
-  sources a row range of the previous layer's frame file when its block
-  was whole. Per file the OWNER INDEX, `(region, entry, unit, lid)`
-  sorted: the translation tables, the REVERSE WALK (a unit's owners by lid
-  are derived from it when read). The transfers: ONE table for the tree,
-  `edges/xfer.bin`, content-canonical (each wave appends its new pairs in
-  value order).
-- **`EdgeStore`**: `preds_at(target, frame)` - the owner index's entries of
-  the target's (region, entry) (a binary search), each a (unit, lid) whose
-  edges are decoded alone, into the target's cell: nothing is inverted.
-  `preds_sorted(frame, targets)` - the same for a sorted batch: region by
-  region (a file's regions found once, `EdgeFile::regions`), entries by
-  galloping through the region's range, a lid decoded once for all its
-  targets' cells; it counts what it read (`ReadStats`). `scan(frame)` and
-  `units`/`unit`: every edge, unit by unit.
+- **The edge file** (`storage::edges`, v6; plans/edges-target.md): per
+  frame `edges/f{frame}.bin` (a raise adds `f{frame}.r{seq}.bin`): a header
+  - the segments by TARGET region (one a slice that reached it), and per
+  target region the source regions its edges leave - and the zstd blocks.
+  A block holds BUNDLES: `(source shape and key, transfer, offset, target
+  key) -> mask` over the target region's 64 cells, its target keys and
+  sources as sorted dictionaries, the records a trie in the order mask,
+  offset, transfer, source, target. Nothing names a state by a number.
+  The transfers: ONE table for the tree, `edges/xfer.bin`,
+  content-canonical (each slice appends its new pairs in value order).
+  Room (6,2) 100% f57: 257.7M edges in 50.9M bundles, 29 MB (0.113 B an
+  edge; storage v2's unit blocks 3.15 B).
+- **`EdgeStore`**: per (frame, region) its segments (`segments`), every
+  block (`all_segments`, `par_blocks`), the target regions a source region
+  reaches (`targets_of`), and for the diagnostics a state's in-edges
+  (`preds_at`) and a frame's edges sorted (`edges_at`).
 - **The backward reads the edge files, it loads no graph** (2026-10-11,
   plans/arc-memory.md): per step the in-edges of the nodes whose winning set
-  changed (`preds_sorted`, the files advised `MADV_RANDOM`: the reads are
-  scattered); `reach` alone loads out-edges, those between W's nodes
-  (`arc_dp::OutGraph`, unit by unit, two passes). Before: a remainder-free
-  BFS marked the states that could win at all, and a CSR of the edges
-  between them (12 B an edge) was loaded - the mod room at h155 died at
-  ~104 GB in that load.
+  changed, read per (target region, frame): the region's blocks decoded and
+  their records matched against the changed targets' keys and cells; `reach`
+  loads out-edges as states are reached (`arc_dp::ReachEdges`, through the
+  header's source-region index).
 - **Checks.** `rewrite arc-check` (every edge has a transfer; sampled
   transfers probed with the reference engine at the tree's level inside and
   outside their guards); `ckhash --edges` (each frame's edges by content).
@@ -449,9 +456,9 @@ the list (coarsest first; one level is the usual case):
    recorded at frame f leaves layer f - 1 and enters a layer <= f), so
    `W_t(p) = W_{t+1}(p) ∪ U pull_e(W_{t+1}(m))` over the edges `p -> m`
    whose target CHANGED at t + 1: frame by frame from the wins, the changed
-   nodes' in-edges at frames <= t + 1 are read from the edge files by
-   target, in bounded ROUNDS (64M in-edges at most), and pulled into their
-   sources in parallel id ranges. No graph is held and nothing marks nodes
+   nodes' in-edges at frames <= t + 1 are read from their target regions'
+   blocks, in bounded ROUNDS (32M in-edges at most), and pulled into their
+   sources in parallel state ranges. No graph is held and nothing marks nodes
    first: a node no winning set reaches is never touched, and W's SUPPORT
    (the nodes with a set at some frame) replaces the remainder-free marks
    in the gate. W is kept as varints - per node its id delta, layer and

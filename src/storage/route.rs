@@ -7,14 +7,18 @@
 //! an OR, in cache), keyed also by the target's ROUTE - its (shape, region
 //! slot): a storage region. An emission without an edge (the reference
 //! engine's) is a bundle of its target alone (`NO_XFER`). At the unit's end
-//! its bundles are the CHUNKS of their routes. The region phase then takes
-//! the routes, heaviest first, one worker a route: per bundle ONE probe of
-//! the region's table (the dedup: the cells the entry lacks are new states,
-//! set at once) and ONE probe and an OR in the route's bundle table (the
-//! edges: units' bundles of one key merge); the route's bundles are encoded
-//! into a SEGMENT of the frame's edge file. No lookup happens in the units,
-//! no state is named by a number, no row is copied: the new layer is
-//! decoded from (shape, key, cell) at the frame's end (`wave`).
+//! its bundles are the CHUNKS of their routes: per route the unit's
+//! distinct targets, its sources, the bundles naming both by index. The
+//! region phase (`run_route`) takes one route's chunks of one slice as a
+//! JOB: per chunk target ONE probe of the region's table (the dedup: the
+//! cells the entry lacks are new states, set at once); per bundle its
+//! target named by the table's entry; the job's bundles encoded into a
+//! SEGMENT of the frame's edge file. Bundles of one key from two units
+//! stay two (their cells differ): merging them across units saved ~17% of
+//! the bundles and cost a route-level table that was DRAM-bound. No lookup
+//! happens in the units, no state is named by a number, no row is copied:
+//! the new layer is decoded from (shape, key, cell) at the frame's end
+//! (`wave`).
 
 use anyhow::{ensure, Result};
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -121,7 +125,9 @@ pub struct RouteState {
     /// Bundles into provisional targets: encoded at the frame's end, their
     /// keys final.
     pub prov: Vec<Bundle>,
-    pub segs: Vec<Segment>,
+    /// Its segments with their slices: jobs of a route may run out of
+    /// slice order; the file has them in it (`seal`).
+    pub segs: Vec<(u32, Segment)>,
     /// The source regions its edges leave.
     pub sources: FxHashSet<u32>,
     /// Records taken (emissions) and new states found.
@@ -165,6 +171,8 @@ pub struct UnitBundles {
     last: Option<(u32, u32)>,
     /// `drain`'s target index.
     t_idx: rustc_hash2::FxHashMap<Key, u32>,
+    /// Emptied buckets, kept for the next units (their pages stay mapped).
+    spare: Vec<Vec<(Key, Ub)>>,
 }
 
 #[inline]
@@ -181,7 +189,10 @@ impl UnitBundles {
         if self.n > 0 {
             self.index.fill(0);
         }
-        self.buckets.clear();
+        for (_, mut v) in self.buckets.drain(..) {
+            v.clear();
+            self.spare.push(v);
+        }
         self.bucket_of.clear();
         (self.last_route, self.last, self.n) = (None, None, 0);
     }
@@ -204,7 +215,8 @@ impl UnitBundles {
                 let k = match self.bucket_of.get(&route) {
                     Some(&k) => k,
                     None => {
-                        self.buckets.push((route, Vec::new()));
+                        let v = self.spare.pop().unwrap_or_default();
+                        self.buckets.push((route, v));
                         let k = self.buckets.len() as u32 - 1;
                         self.bucket_of.insert(route, k);
                         k
@@ -262,14 +274,13 @@ impl UnitBundles {
     #[allow(clippy::type_complexity)]
     pub fn drain(&mut self, drop: Option<&dyn Fn(u32, Key, u32) -> bool>) -> Vec<(u32, Vec<(Key, u64)>, Vec<Ub>)> {
         let buckets = std::mem::take(&mut self.buckets);
-        self.clear();
         let mut out = Vec::with_capacity(buckets.len());
-        for (route, v) in buckets {
+        for &(route, ref v) in &buckets {
             self.t_idx.clear();
             let mut targets: Vec<(Key, u64)> = Vec::new();
             let mut bundles: Vec<Ub> = Vec::with_capacity(v.len());
             let mut last: Option<(Key, u32)> = None;
-            for (t_key, mut u) in v {
+            for &(t_key, mut u) in v {
                 let mut m = u.mask;
                 if let Some(drop) = drop {
                     let mut c = m;
@@ -305,6 +316,8 @@ impl UnitBundles {
                 out.push((route, targets, bundles));
             }
         }
+        self.buckets = buckets;
+        self.clear();
         out
     }
 }
@@ -344,7 +357,7 @@ impl Default for Scratch {
 /// and the route's source index as names; then the slice's segment encoded
 /// - its bundles as the units made them (a key's bundles of two units hold
 /// other cells; they stay two).
-pub fn run_route(st: &mut RouteState, chunks: &[&Chunk], cx: &RegionCtx, sc: &mut Scratch) -> Result<()> {
+pub fn run_route(st: &mut RouteState, slice: u32, chunks: &[&Chunk], cx: &RegionCtx, sc: &mut Scratch) -> Result<()> {
     let n: usize = chunks.iter().map(|c| c.bundles.len()).sum();
     st.recs += n as u64;
     let record = cx.sources.is_some();
@@ -424,7 +437,7 @@ pub fn run_route(st: &mut RouteState, chunks: &[&Chunk], cx: &RegionCtx, sc: &mu
         let table = &st.table;
         sc.enc.encode(&sc.tbs, table.len(), |e| table.key(e), &sc.s_list, &mut sc.raw);
         let region = st.region.unwrap_or(u32::MAX);
-        st.segs.push(Segment::of_raw(region, &sc.raw, sc.tbs.len() as u32, sc.tbs.iter().map(|t| t.mask.count_ones() as u64).sum(), &mut sc.z)?);
+        st.segs.push((slice, Segment::of_raw(region, &sc.raw, sc.tbs.len() as u32, sc.tbs.iter().map(|t| t.mask.count_ones() as u64).sum(), &mut sc.z)?));
     }
     Ok(())
 }
@@ -443,8 +456,9 @@ pub struct Sealed {
 pub fn seal(st: &mut RouteState, region: u32, finals: &FxHashMap<Key, Key>, sc: &mut Scratch) -> Result<Sealed> {
     let words = st.table_words();
     st.region = Some(region);
+    st.segs.sort_unstable_by_key(|s| s.0);
     for seg in &mut st.segs {
-        seg.region = region;
+        seg.1.region = region;
     }
     let order = st.table.finish_frame(words, st.start, |k| if is_provisional(k) { finals.get(&k).copied() } else { Some(k) })?;
     // `fresh` follows the entries' new numbers.
@@ -466,7 +480,7 @@ pub fn seal(st: &mut RouteState, region: u32, finals: &FxHashMap<Key, Key>, sc: 
         for b in &mut v {
             b.t_key = *finals.get(&b.t_key).ok_or_else(|| anyhow::anyhow!("a provisional target key without its final key"))?;
         }
-        st.segs.push(Segment::encode(region, &mut v, &mut sc.raw, &mut sc.z)?);
+        st.segs.push((u32::MAX, Segment::encode(region, &mut v, &mut sc.raw, &mut sc.z)?));
     }
     Ok(Sealed { entries, states })
 }

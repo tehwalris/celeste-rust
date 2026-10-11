@@ -1,23 +1,26 @@
-//! STORAGE (plans/storage-v2.md): the forward's visited set, its state ids,
-//! and the recorded edges, in one system.
+//! STORAGE (plans/storage-v2.md, plans/edges-target.md): the forward's
+//! visited set, the states of its layers, and the recorded edges.
 //!
 //!   * `visited` - per (shape, region) a table of ENTRIES: a state's
-//!                 non-position key and a mask over the region's cells
-//!   * `unit`    - one unit of the wave: the kernels' emissions against the
-//!                 visited set (read-only), its edges and its requests
-//!   * `wave`    - the frame: the units, the TRANSLATION (requests into the
-//!                 visited set, canonical entry numbers), the new layer
-//!   * `edges`   - the edge files (source-side unit blocks with their
-//!                 translation tables), the global transfer table, the reader
-//!   * `marks`   - the backward's marks over state ids, and the resolver of
-//!                 an id to its (shape, key, cell)
+//!                 position-free key and a mask over the region's cells
+//!   * `unit`    - one unit of the wave: the kernels' emissions into its
+//!                 bundles, by target route
+//!   * `route`   - the region phase: a route's dedup against its region's
+//!                 table and its edge segments
+//!   * `wave`    - the frame: units and region jobs in one pipeline, the
+//!                 frame's end (canonical entry numbers, the new layer)
+//!   * `bundle`  - the edges' format: bundles in zstd blocks
+//!   * `edges`   - the edge files (per target region and frame), the global
+//!                 transfer table, the reader (`EdgeStore`)
+//!   * `marks`   - the resolver of a state id to its (shape, key, cell)
 //!   * `meta`    - per frame, the shapes and entries it created
+//!   * `decode`  - rows from (shape skeleton, key, cell)
 //!   * `bench`   - `--emit-capture` and `rewrite bench-storage`
-//!   * `decode`  - rows from (shape skeleton, key, cell): `rewrite decode-check`
-//!   * `census`  - `rewrite storage-census` (plans/storage-unify.md)
 //!
 //! A state is `(shape, key, cell)` (the key holds no position:
-//! `runtime2::pos_code`); its id is `(region, entry, cell in region)`.
+//! `runtime2::pos_code`): an edge names it so (`Sk`, ID-free); the layers'
+//! frame files and the drop notes still by its id `(region, entry, cell in
+//! region)`.
 
 pub mod bench;
 pub mod bundle;
@@ -25,7 +28,6 @@ pub mod decode;
 pub mod edges;
 pub mod marks;
 pub mod meta;
-pub mod orders;
 pub mod route;
 pub mod unit;
 pub mod visited;

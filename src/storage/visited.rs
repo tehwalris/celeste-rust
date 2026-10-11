@@ -2,7 +2,8 @@
 //! region) a table of ENTRIES - a non-position key and a mask over the
 //! region's cells - numbered densely in the region (a state's id is its
 //! entry and cell, `storage::StateId`). Read-only while a wave's units run;
-//! written only by the translation, one worker per region (`wave`).
+//! a region's table is written only by its route's region jobs, one at a
+//! time (`route::run_route`), and renumbered at the frame's end.
 
 use rustc_hash::FxHashMap;
 

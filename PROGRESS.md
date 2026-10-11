@@ -87,3 +87,20 @@ Steps:
   jobs' summed worker time (it was never set), `rss wave` sampled again; the UI export reads
   `layer` as the storage's own time. Room (1,0) f44: posgraph, ckhash, frame and edge files
   byte-identical. t0 193/193.
+- 2026-10-11 17:50 Determinism to the byte, measured costs:
+  * Units are a 256th of the frame (1024-4096 lanes), no longer of the workers: units cut the
+    bundles and slices number the transfers, so the edge files and `xfer.bin` were the same only
+    at one thread count. A route's segments are filed in slice order (its jobs could run out of
+    order). Room (1,0) r0sxh f0-60 and r0sx f0-56 (2 slices a frame from f50): 3 vs 32 threads and
+    a resume give byte-identical frame files, edge files and xfer.bin; raise.sh 1,0 55 56 58 OK.
+    t1 at 8 and 16 threads: identical metrics (the header no longer names the threads).
+  * A region job owns its route's chunks (no shared slice vector); a unit's bucket vectors are
+    kept for the next unit (f57: 6.8M -> 4.3M page faults over 3 reps; chunk recycling saved
+    0.5M more and was dropped: no measurable time). The backward's fold merges the workers'
+    sorted runs (stable sort): r42 h71 43.6G -> 41.0G instructions.
+  * Measured and NOT kept: skipping a block without changed targets (1452 of 5827 r42 blocks,
+    7% fewer bundles parsed, read time unchanged); `rewrite bundle-orders` deleted (its census is
+    in plans/edges-target.md).
+  * MIMALLOC_PURGE_DELAY=10 instead of safe-run's 0 (not changed; for the coordinator): f57 page
+    faults 6.7M -> 2.2M per 3 reps, frame ~8% faster, peak +5-10% (4.22 -> 4.42-4.66 GB);
+    r42 backward CPU -19% (8.3 -> 6.7 s), faults 402k -> 35k.

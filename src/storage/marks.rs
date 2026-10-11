@@ -1,6 +1,7 @@
 //! The RESOLVER of a state id to its `(shape, key, cell)` from the storage
-//! metadata (no frame file read): the arc phase's fingerprints, marks files
-//! and node keys.
+//! metadata (no frame file read): loading a layer's frame file (its rows
+//! decoded from the keys), the known-route check, the UI export and the
+//! diagnostics that name states by id.
 
 use anyhow::{Context, Result};
 use rustc_hash::FxHashMap;

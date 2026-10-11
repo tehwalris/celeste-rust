@@ -224,12 +224,13 @@ enum Command {
     /// Prints (stdout, the same every rep, else an error) `ckhash --edges`'s
     /// lines for F+1 - `f{F+1}` of the new states and, with `--edges`,
     /// `e{F+1}` of the edges - so a tree extended past F checks it; per rep
-    /// (stderr) the wave, translation and layer + edge file walls and the
-    /// workers' phases (`--phases`: pack, kernel, emit, unit end);
+    /// (stderr) the wave (the region phase's worker time inside it) and the
+    /// frame's end walls and the workers' phases (`--phases`: pack, kernel,
+    /// emit, unit end, regions, frame end);
     /// `kernel lanes: ... missed 0`. With `--metrics FILE`, the EXACT
     /// metrics of the first rep (kernel census and dynamic instructions,
     /// lanes, emissions, states, edges: `tools/metrics_diff.py` compares
-    /// them with a pinned file); exact at a fixed `--threads`.
+    /// them with a pinned file); the same at every `--threads`.
     BenchFrame {
         /// The tree (`frames/` under it).
         #[arg(long)]
@@ -274,28 +275,14 @@ enum Command {
         #[arg(long, default_value_t = 1)]
         reps: usize,
     },
-    /// A finished tree's edges counted against the target layouts of
-    /// plans/storage-unify.md (built lids, unified per-region sets, hybrids):
-    /// per frame a line, then totals and the persistent structures' reuse.
-    /// TEMPORARY: the tree's edges as target-region bundle blocks in candidate
-    /// orders, bytes raw and with zstd -1 (`storage::orders`).
-    BundleOrders {
-        #[arg(long)]
-        level_dir: String,
-        #[arg(long)]
-        from: u32,
-        #[arg(long)]
-        to: u32,
-    },
     /// BENCH: replay one captured frame through the REAL storage code
     /// (`storage::bench`): a forward or `bench-frame` run with
     /// `--emit-capture DIR` writes each wave's `DIR/f{F}/`; this replays
-    /// its units against `--tree`'s visited set at frame F-1 - the sinks,
-    /// then (`--phase translate|all`) the translation and the layer, then
-    /// (`all`) the edge file - printing per rep each phase's wall time and the
-    /// validation: requests, lids, edges, new states, and the `ckhash` lines
-    /// of the new states (`f`) and of the edges (`e`), to compare with the
-    /// real tree's (`ckhash --edges`). Run it with the capture's settings
+    /// its units against `--tree`'s visited set at frame F-1 through the
+    /// whole wave - the sinks, the region phase, the frame's end, the edge
+    /// file - printing per rep the wall times and the `ckhash` lines of the
+    /// new states (`f`) and of the edges (`e`), to compare with the real
+    /// tree's (`ckhash --edges`). Run it with the capture's settings
     /// (`DIR/f{F}/env.txt`: the level and the settings line).
     BenchStorage {
         /// A captured frame's directory (`DIR/f{F}`).
@@ -1123,7 +1110,7 @@ fn main() -> Result<()> {
                 let t_all = t.elapsed();
                 let w = &wave.stats;
                 eprintln!(
-                    "[bench] rep {rep}: wave {:.0} ms (idle {:.0}%) regions {:.0} end {:.0} total {:.0} ms | in {} emitted {} kept {} | units {} slices {} routes {} | edges {} bundles {} ({:.3} B)",
+                    "[bench] rep {rep}: wave {:.0} ms (idle {:.0}%, regions {:.0} worker-ms) end {:.0} total {:.0} ms | in {} emitted {} kept {} | units {} slices {} routes {} | edges {} bundles {} ({:.3} B)",
                     ms(w.t_wave),
                     w.wave_idle * 100.0,
                     ms(w.t_regions),
@@ -1158,7 +1145,7 @@ fn main() -> Result<()> {
                         let slices: u64 = kernels.iter().map(|k| k.1).sum();
                         let insts: u64 = kernels.iter().map(|(_, n, c)| n * c.get("insts").copied().unwrap_or(0)).sum();
                         eprintln!("[bench] kernels: {insts} dynamic instructions over {slices} slices ({} a slice; call-outs' callees aside)", insts.checked_div(slices).unwrap_or(0));
-                        let text = frame_metrics(&room_text(&cfg), level, frame, w, &ks, cfg.threads());
+                        let text = frame_metrics(&room_text(&cfg), level, frame, w, &ks);
                         std::fs::write(path, text).with_context(|| path.clone())?;
                     }
                     celeste_rust::compiled::mix::reset_slices();
@@ -1210,9 +1197,6 @@ fn main() -> Result<()> {
                 }
                 first = Some(line);
             }
-        }
-        Command::BundleOrders { level_dir, from, to } => {
-            celeste_rust::storage::orders::orders(std::path::Path::new(&level_dir), from, to, cfg.threads())?;
         }
         Command::BenchStorage { capture, tree, level, reps } => {
             cfg.check(std::path::Path::new(&tree), level)?;
@@ -2527,15 +2511,14 @@ fn main() -> Result<()> {
 }
 
 /// `bench-frame --metrics`: one frame's EXACT metrics, `key value` lines
-/// (deterministic at a fixed thread count; no timings). Kernels: every
+/// (the same at every thread count; no timings). Kernels: every
 /// built kernel's census summed (`all.*`: the traced and fused graphs'
 /// nodes by kind, guard roots, static instructions by category, spill
 /// slots), the frame's dynamic instructions (slices x static count, by
 /// category: `dyn.*`), and per kernel that ran its own line set
 /// (`k.<sym>.*`); the frame: lanes, emissions, states kept, units,
-/// requests, lids, edges; their bytes (`approx.*`: scheduling moves them
-/// by a few bytes).
-fn frame_metrics(room: &str, level: Level, frame: u32, w: &celeste_rust::frame::FrameStats, ks: &celeste_rust::compiled::dispatch::KernelStats, threads: usize) -> String {
+/// slices, routes, edges, bundles, the edge file's bytes.
+fn frame_metrics(room: &str, level: Level, frame: u32, w: &celeste_rust::frame::FrameStats, ks: &celeste_rust::compiled::dispatch::KernelStats) -> String {
     use std::collections::BTreeMap;
     use std::fmt::Write as _;
     let mut m: BTreeMap<String, u64> = BTreeMap::new();
@@ -2588,7 +2571,7 @@ fn frame_metrics(room: &str, level: Level, frame: u32, w: &celeste_rust::frame::
         put(&format!("k.{sym}.slices"), *slices);
         put(&format!("k.{sym}.dyn_insts"), slices * insts);
     }
-    let mut out = format!("# rewrite bench-frame --metrics: room {room}, {level}, f{frame} -> f{}, {} threads\n", frame + 1, threads);
+    let mut out = format!("# rewrite bench-frame --metrics: room {room}, {level}, f{frame} -> f{}\n", frame + 1);
     for (k, v) in &m {
         writeln!(out, "{k} {v}").unwrap();
     }

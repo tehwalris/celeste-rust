@@ -12,11 +12,13 @@
 //! one of layer <= `f`, so `W_t(p)` reads `W_{t+1}(m)` only where `m` has
 //! one. Hence `W_t(p) = W_{t+1}(p) ∪ U pull_e(W_{t+1}(m))` over the edges
 //! `p -> m` whose target CHANGED at `t + 1`: frame by frame, the changed
-//! nodes' in-edges are read from the edge files by target (`EdgeStore::
-//! preds_sorted`) and their sets pulled into the sources. No graph is held
-//! and nothing marks nodes first: a node no winning set reaches is never
-//! touched. Exact because "intersect with the guard, then act" distributes
-//! over unions.
+//! nodes' in-edges are read from their TARGET regions' blocks in the edge
+//! files (`Backward::read_round`; edges are stored there) and their sets
+//! pulled into the sources. No graph is held and nothing marks nodes first:
+//! a node no winning set reaches is never touched. Nodes are states by
+//! what they are (`Sk`: region, key, cell), as the edge files name them.
+//! Exact because "intersect with the guard, then act" distributes over
+//! unions.
 //!
 //! Then the optimum is read off the start's sets (`optimum`), the start's
 //! remainder pushed forward inside `W` for the next level's filter
@@ -640,7 +642,6 @@ impl<'a> Backward<'a> {
                                 stats.segments += 1;
                                 stats.stored += seg.bytes.len() as u64;
                                 stats.raw += seg.raw as u64;
-                                stats.bundles += seg.bundles as u64;
                                 let blk = dec.open(&seg)?;
                                 // The block's targets against the group's (both sorted).
                                 ranks.clear();
@@ -657,6 +658,7 @@ impl<'a> Backward<'a> {
                                     }
                                     ranks.push((m, j as u32));
                                 }
+                                stats.bundles += seg.bundles as u64;
                                 let sources = &blk.sources;
                                 blk.records(|r| {
                                     let (m, at) = ranks[r.t as usize];
@@ -715,7 +717,8 @@ impl<'a> Backward<'a> {
             for p in parts {
                 es.extend_from_slice(&p.0[p.0.partition_point(|e| e.p < lo)..p.0.partition_point(|e| e.p < hi)]);
             }
-            es.sort_unstable();
+            // Sorted runs, one a worker: merged (the stable sort finds runs).
+            es.sort();
             es.dedup();
             let (mut out, mut made) = (Vec::with_capacity(a.len() + es.len() / 4), Vec::new());
             let (mut pieces, mut scratch) = (Vec::new(), Vec::new());

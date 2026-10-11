@@ -1,12 +1,15 @@
 //! THE FRAME (plans/edges-target.md "The forward"): the frontier's UNITS
-//! through the kernels, each emission a record shipped to its target's
-//! ROUTE (`route`); the REGION PHASE there (one worker a route: the dedup
-//! against the region's table and the edges into its bundle table and
-//! segments); in SLICES of the frontier, so the records in flight stay
-//! bounded. Then the frame's END: provisional keys made final, the new
-//! entries numbered in key order (canonical), the new LAYER decoded from
-//! its states' keys and cells (no row is copied), the frame's edge file.
-//! The result is a function of the frame, not of the scheduling.
+//! through the kernels, each emission ORed into its bundle of its target's
+//! ROUTE (`route`); the REGION PHASE there (a job a route and slice: the
+//! dedup against the region's table, the slice's segment of the edge
+//! file). One PIPELINE a frame: the units are cut into SLICES, a slice's
+//! chunks become region jobs once its units are done (and its transfers
+//! have global ids), and the jobs run while the next slice's units do -
+//! the records in flight stay bounded. Then the frame's END: provisional
+//! keys made final, the new entries numbered in key order (canonical), the
+//! new LAYER decoded from its states' keys and cells (no row is copied),
+//! the frame's edge file. The result is a function of the frame, not of
+//! the scheduling.
 
 use anyhow::{ensure, Result};
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
@@ -113,13 +116,16 @@ pub struct Wave {
     pub meta: FrameMeta,
 }
 
-/// Lanes per unit (one kernel call) for a frame of `lanes` input rows on
-/// `workers`: ~16 units a worker, between 1024 and 4096 lanes. A bigger unit
-/// fills more of each region's slices (room (3,0) 100% r0sxhfn at 8 px, f49:
-/// 1024 -> 4096 lanes, padding 22% -> 11%); a small frame keeps enough units
-/// to balance.
-fn unit_lanes(lanes: usize, workers: usize) -> usize {
-    (lanes / (workers.max(1) * 16)).clamp(1024, 4096) & !63
+/// Lanes per unit (one kernel call) for a frame of `lanes` input rows: a
+/// 256th of the frame (16 units a worker at 16 threads), between 1024 and
+/// 4096 lanes. A bigger unit fills more of each region's slices (room (3,0)
+/// 100% r0sxhfn at 8 px, f49: 1024 -> 4096 lanes, padding 22% -> 11%); a
+/// small frame keeps enough units to balance. A function of the frame
+/// alone, not of the threads: the units cut the bundles and the slices
+/// number the transfers, so the edge files are the same at every thread
+/// count.
+fn unit_lanes(lanes: usize) -> usize {
+    (lanes / 256).clamp(1024, 4096) & !63
 }
 
 /// A unit: block, and its range of the block's live lanes (`order`).
@@ -240,7 +246,7 @@ pub fn run_wave(engine: &dyn FrameStep, frontier: Vec<Block>, cx: WaveCtx) -> Re
     // Per block its live lanes (a skipped lane is never expanded), in id
     // order: by shape, then position.
     let order: Vec<Vec<usize>> = frontier.iter().map(|b| (0..b.lanes()).filter(|&l| b.skip().is_empty() || !b.skip()[l]).collect()).collect();
-    let units = units_of(&order, unit_lanes(order.iter().map(Vec::len).sum(), workers));
+    let units = units_of(&order, unit_lanes(order.iter().map(Vec::len).sum()));
     let slices = slices_of(&units);
     let notes = (filters.notes_drops() && record).then(|| DropNotes::new(&frontier));
     let raised = match layer {
@@ -298,8 +304,8 @@ pub fn run_wave(engine: &dyn FrameStep, frontier: Vec<Block>, cx: WaveCtx) -> Re
                             let t = Instant::now();
                             let tp = phases::start(s.diag.phases);
                             let rcx = RegionCtx { frame, sources: sources.as_ref(), remaps: &job.remaps, layers: raised.and(layers) };
-                            let cs: Vec<&Chunk> = job.chunks[job.a..job.b].iter().collect();
-                            let r = super::route::run_route(&mut job.state.lock().expect("a route"), &cs, &rcx, sc);
+                            let cs: Vec<&Chunk> = job.chunks.iter().collect();
+                            let r = super::route::run_route(&mut job.state.lock().expect("a route"), job.slice, &cs, &rcx, sc);
                             pipe.jobs_left.fetch_sub(1, Ordering::AcqRel);
                             r?;
                             phases::add(phases::REGIONS, tp);
@@ -441,13 +447,13 @@ pub fn run_wave(engine: &dyn FrameStep, frontier: Vec<Block>, cx: WaveCtx) -> Re
     let mut src_index: Vec<(u32, Vec<u32>)> = Vec::new();
     for (r, region) in states.into_iter().zip(&regions) {
         let Some(region) = *region else { continue };
-        st.edge_bundles += r.segs.iter().map(|g| g.bundles as u64).sum::<u64>();
-        st.edge_records += r.segs.iter().map(|g| g.edges).sum::<u64>();
+        st.edge_bundles += r.segs.iter().map(|g| g.1.bundles as u64).sum::<u64>();
+        st.edge_records += r.segs.iter().map(|g| g.1.edges).sum::<u64>();
         st.routes += 1;
         if !r.sources.is_empty() {
             src_index.push((region, r.sources.into_iter().collect()));
         }
-        segs.extend(r.segs);
+        segs.extend(r.segs.into_iter().map(|g| g.1));
         tables[region as usize] = Some(r.table);
     }
     *visited.tables_mut_vec() = tables;
@@ -474,13 +480,12 @@ pub fn run_wave(engine: &dyn FrameStep, frontier: Vec<Block>, cx: WaveCtx) -> Re
     Ok(Wave { next, stats: st, dropped, meta })
 }
 
-/// A region job: one route's chunks of one slice, and the slice's
-/// transfer remaps.
+/// A region job: one route's chunks of one slice (in unit order), and the
+/// slice's transfer remaps.
 struct Job {
     state: std::sync::Arc<std::sync::Mutex<RouteState>>,
-    chunks: std::sync::Arc<Vec<Chunk>>,
-    a: usize,
-    b: usize,
+    slice: u32,
+    chunks: Vec<Chunk>,
     remaps: std::sync::Arc<Vec<Vec<u32>>>,
 }
 
@@ -564,22 +569,24 @@ impl Pipe<'_> {
                 }
                 g.routes = states.len();
             }
-            chunks.sort_unstable_by_key(|c| (c.route, c.unit));
-            let chunks = std::sync::Arc::new(chunks);
-            let mut jobs: Vec<(u32, usize, usize, usize)> = Vec::new();
-            let mut a = 0;
-            while a < chunks.len() {
-                let r = chunks[a].route;
-                let b = a + chunks[a..].partition_point(|c| c.route == r);
-                jobs.push((r, a, b, chunks[a..b].iter().map(|c| c.bundles.len()).sum()));
-                a = b;
+            // One job a route: its chunks in unit order; heaviest first.
+            chunks.sort_unstable_by_key(|c| std::cmp::Reverse((c.route, c.unit)));
+            let mut jobs: Vec<(usize, u32, Vec<Chunk>)> = Vec::new();
+            while let Some(c) = chunks.pop() {
+                match jobs.last_mut() {
+                    Some(j) if j.1 == c.route => {
+                        j.0 += c.bundles.len();
+                        j.2.push(c);
+                    }
+                    _ => jobs.push((c.bundles.len(), c.route, vec![c])),
+                }
             }
-            jobs.sort_by_key(|j| (std::cmp::Reverse(j.3), j.0));
+            jobs.sort_by_key(|j| (std::cmp::Reverse(j.0), j.1));
             let states = self.states.read().expect("the routes");
             let mut q = self.jobs.lock().expect("the jobs");
             self.jobs_left.fetch_add(jobs.len(), Ordering::AcqRel);
-            for (r, a, b, _) in jobs {
-                q.push_back(Job { state: states[r as usize].clone(), chunks: chunks.clone(), a, b, remaps: remaps.clone() });
+            for (_, r, chunks) in jobs {
+                q.push_back(Job { state: states[r as usize].clone(), slice: k as u32, chunks, remaps: remaps.clone() });
             }
             drop(q);
             drop(states);
