@@ -18,6 +18,7 @@ mod edgecensus;
 mod regionedge;
 mod ghost;
 mod ghost2;
+mod edgebundle;
 
 const REC: usize = 48;
 const PAYLOAD: usize = 64;
@@ -59,6 +60,7 @@ fn main() {
     if variant == "structure" { return structure::structure(dir); }
     if variant == "sharing" { return structure::sharing(dir); }
     if variant == "posregion" { return posregion::posregion(dir); }
+    if variant == "edgebundle" { return edgebundle::edgebundle(&args[1..].iter().filter(|a| a.as_str() != "edgebundle").cloned().collect::<Vec<_>>()); }
     let t0 = Instant::now();
     // Inputs, mapped.
     let mut files: Vec<_> = std::fs::read_dir(dir).unwrap().flatten().map(|e| e.path()).filter(|p| p.file_name().unwrap().to_str().unwrap().starts_with('w')).collect();

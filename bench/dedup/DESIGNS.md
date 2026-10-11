@@ -836,3 +836,135 @@ dedup ~0.025 s + translation 0.06 = ~0.085 s; with edges ~0.23 + 0.06 =
 threaded: the pair table probe, the transfer dictionary, the bit writes), not
 bandwidth. Next for speed: SIMD bit packing per 16-lane call, the pair set
 folded into the target entry for own targets.
+
+## O. Edges stored the way states are (`edgebundle`; 2026-10-11, load 18-28)
+
+Philippe's layout: edges in per-region TABLES keyed like the visited set's
+entries - (home entry, the other side's position-free key, transfer, offset
+dx/dy) -> a u64 cell mask. Inserting an edge is one probe and one OR, exactly
+like a state: a duplicate is free and nothing is sorted until the unit's
+block is encoded. Two variants, both built and validated:
+
+- **S**, in the SOURCE region: home = the source entry, other = the target's
+  (shape, key), mask over SOURCE cells. Its own pass over the emissions
+  grouped by source region (the forward's units are source runs).
+- **T**, in the TARGET region: home = the target entry (the dedup's probe
+  found it: the table entry carries a stable local number), other = the
+  source's (shape, key), mask over TARGET cells - already inverted for a
+  backward following in-edges. Inserted in the dedup pass itself (J2's units:
+  target regions, heavy ones split by a hash of the key).
+
+Table entries 32 B (other u64, home << 32 | transfer, offset code u32, mask,
+generation), open addressing cleared by generation per unit, sized to a
+quarter of the unit's batch and grown when 70% full. A unit's END encodes
+its table: a counting sort by home (homes are dense: the unit's entry ranks,
+the region's source entries), a dictionary of the other sides (sorted,
+delta-coded), each home's bundles sorted (other rank, transfer, offset), per
+bundle home delta (0 = same) | other rank (delta within the home) | global
+transfer id | offset byte (`(dx+8)<<4|(dy+8)`, 0 + varint beyond +-7 or for
+`NO_CELL`, whose code carries the other side's cell where the mask cannot) |
+u64 mask. T's END also re-encodes the visited entries (J2).
+
+**Data (a change from K-N).** `/var/tmp/emitcap2` needs the field dump of
+its tree (`Fields`: the position-free packed keys), which went with
+`/var/tmp/emitcap`; so this uses the same frame captured on storage v2 with
+EXACT position-free keys: `/var/tmp/ia-fixtures/cap-r62h57/f057` (room (6,2)
+100% f56 -> f57, `--emit-capture`) and its format-14 tree
+`/var/tmp/ia-fixtures/r62h57` for the frame-start visited set (frame files'
+id columns, `meta.bin` entries and shapes: 36,873,579 states in 1,837,641
+entries). Sources are the units' ids (region, entry, cell); targets (shape,
+cell, exact key), the 261 provisional keys of new states interned by their
+MISS content; 92,406 transfers interned by content over the workers' tables
+(as K1). So the fingerprint differs from fca41b0f1a28b51d: it is over
+(source id, target shape hash, cell, key, transfer), provisional keys by
+their content's hash: **2226cf815188958e**, reproducible across runs.
+
+**Validation**, every configuration's first run: each unit block decoded
+back to edges (S: source cell = mask bit, target cell = + offset, target by
+key; T: target by home rank, source cell = - offset, source entry by key in
+its region) - 257,724,013 edges, fingerprint EQUAL to the capture's; the
+dedup's new states 6,735,699 in every run (= the tree's f57).
+
+Harness as J2/N2: grouping and units untimed (26-31 s at 100k-edge parts),
+heaviest unit first by an atomic index, per-thread scratch prefaulted, no
+pinning (other agents' searches held 14-18 cores: load 18-28, so walls are
+noisy; repeated runs moved by up to 2x, first reps highest). Records are
+24 B (S) and 32 B (T: the target key and cell plus T's payload - the
+source's key and the offset, as the kernel has them at the emission) against
+J2's 8 B.
+
+**Insert and frame wall** (split 100k edges a unit; 16 threads: the best 2 of
+3 interleaved reps; "insert" and "encode" summed over units, ns an edge):
+
+| | 1 thread | ns an edge (insert + encode) | 16 threads |
+|---|---|---|---|
+| dedup alone (T's units, no edges) | 1.04 s | 3.7 + 0.3 | 0.230-0.235 s |
+| dedup + T (one pass) | 4.47 s | 8.9 + 8.4 | 0.658-0.690 |
+| S pass alone | 3.93 | 8.7 + 6.5 | 0.427-0.433 |
+| dedup + S (two passes) | 4.97 | | 0.66 |
+| (split 1M) dedup / T / S | | | 0.385-0.576 / 1.53 / 0.74 (heavy units: idle 14-20%) |
+
+So an edge costs ~5 ns to insert (T: 8.9 - 3.7) and ~7-8 ns to encode,
+single-threaded; at 16 threads both variants make the frame ~2.9x the dedup
+alone (+0.43 s here, loaded). Against the earlier formats' ratios to the
+dedup (N2 2.6x, N3 2.2x, relt 3.5x): the same band, not below it. The
+insert is as cheap as hoped (a probe into an L2-sized 32-B table, no sort);
+the END is now half of the edge cost: a counting sort, a u64 sort for the
+dictionary, a binary search per bundle and the varints - ~57 ns a bundle.
+The J2 dedup ran 0.057 s on a quiet machine with 8-B records; this one
+0.23 s loaded with 32-B records.
+
+**Size.** Bundles: S 34,719,650 (7.42 edges each, edge-weighted median 16,
+19.7% single-cell; = the census's B, 34.78M), T 36,024,770 (7.15, 16, 22.1%).
+In memory: 32 B a table entry = 4.3-4.5 B an edge dense; 12-14 B an edge at
+the tables' final sizes (transient: one table a worker, reused per unit). At
+rest, B an edge (per unit block; zstd -1 per block):
+
+| | S, 100k units | S, 1M | T, 100k | T, 1M |
+|---|---|---|---|---|
+| block: global transfer ids, u64 masks | 1.844 (dict 0.027) | 1.834 | 1.996 (dict 0.102) | 1.936 (dict 0.040) |
+| + zstd -1 | **0.147** | **0.136** | 0.544 | 0.426 |
+| transfer ranks per block, masks relative to the home entry's cells | 1.022 | 1.028 | 1.687 | 1.469 |
+| + zstd -1 | 0.153 | 0.142 | 0.730 | 0.511 |
+| transfer FACTORED per (home, offset), where unique (S 90.2% of 2.1M groups, T 61.2% of 3.0M) | **0.612** | **0.608** | 1.438 | 1.223 |
+| + zstd -1 | 0.167 | 0.150 | 0.751 | 0.537 |
+
+- S compresses 3-4x better than T: a source entry's cells mostly move
+  together (the census: 71% of edges), so ITS bundles repeat one mask; a
+  target entry's in-bundles come from many sources with unrelated masks.
+- Factoring the transfer (and the offset) per (home, offset) is the best RAW
+  form: S 0.61 B an edge, 3x below the plain block - 90% of S's groups have
+  one transfer. Under zstd it buys nothing (0.15 against 0.14).
+- Relative masks shrink the raw block by 0.4-0.8 B an edge but compress
+  worse than the u64s (the absolute cell bits repeat; the relative ones do not).
+
+**T's backward access**, from the raw blocks at rest (split 100k), each
+touched block decoded once:
+
+| | 16 threads | 1 thread |
+|---|---|---|
+| every in-edge (257.7M), block by block, masks expanded | 0.046-0.067 s (0.18-0.26 ns an in-edge) | 0.55-0.94 s (2.1-3.6 ns) |
+| 1 in 30 of the 10.9M targets with in-edges (364,670; ~23 in-edges each; 2,740 of 2,758 blocks) | 34-38 ms (94-105 ns a target) | 0.27-0.45 s (0.75-1.24 us) |
+| 1 in 1,000 (11,001; 2,631 blocks) | 31-33 ms (2.8-3.0 us a target) | 0.20-0.27 s |
+
+A sparse sample still touches nearly every block, so a lookup pass costs
+about one decode of the frame (~0.05 s at 16 threads); the BFS should batch
+its targets per block (as it does per unit today).
+
+**Conclusions.**
+- The state-like edge table works and validates exactly: one probe and one
+  OR an edge, ~5 ns single-threaded, duplicates free.
+- The cost moved to the unit's END (encoding the block): halving it (a hash
+  dictionary instead of the sort, SIMD varints, or keeping the table's
+  order and writing fixed-width records) is the next lever; the frame is
+  ~2.9x the dedup alone either way, as with the earlier formats.
+- At rest, S (source-side, masks over source cells) is the layout: 1.83 B
+  raw, 0.61 factored, 0.14-0.15 with zstd -1 - against production's 3.15.
+  T's inversion costs 3-4x under zstd; the backward can read S blocks and
+  invert per batch instead (or keep T in memory only).
+- These agree with the census on real trees (plans/edge-bundles.md on
+  `edge-bundles`): there the recommended blocks are SOURCE units sorted by
+  target lid with masks over source cells (0.13-0.16 with zstd).
+
+Code: `src/edgebundle.rs` (`dedup-bench CAP edgebundle TREE
+mode:threads:split ... access:threads`).
