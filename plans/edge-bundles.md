@@ -261,3 +261,19 @@ version 6, every fixture re-pinned on identical `ckhash --edges`; (2)
 `arc_dp::load` keeps bundles (2-2.8x less RAM for the graph), the backward
 expanding them per source entry; (3) a mask-parallel BFS over target
 entries; (4) zstd per block with a per-iteration block cache in the BFS.
+
+## Prototype: the state-like edge table (bench/dedup on `edge-bundle-bench`, DESIGNS O)
+
+Edges inserted like states - per region a table (home entry, the other
+side's position-free key, transfer, offset) -> u64 mask, one probe and one
+OR - on the f57 capture (cap-r62h57, exact keys; every variant decodes back
+to the capture's 257,724,013 edges): ~5 ns an edge to insert and ~7-8 ns to
+encode the unit's block single-threaded; at 16 threads (load 18-28) dedup +
+target-side edges 0.66-0.69 s against the dedup alone 0.23 s, the
+source-side pass 0.43 s. At rest SOURCE-side blocks with masks over source
+cells win: 1.84 B an edge, 0.61 with the transfer factored per (source
+entry, offset), 0.14-0.15 with zstd -1; target-side (masks over target
+cells) 1.9-2.0 and 0.43-0.54 with zstd - a source entry's cells move
+together, so its bundles repeat one mask. This supports the recommendation
+above: source units, masks over source cells (sorted by target for the
+reverse walk).
