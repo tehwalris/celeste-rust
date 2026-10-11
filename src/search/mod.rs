@@ -11,6 +11,7 @@
 //!   * `ui_export`  - `rewrite export-ui`: a finished run -> the web UI's data
 pub mod arc_dp;
 pub mod arc_edges;
+pub mod arc_worklist;
 pub mod arcs;
 pub mod checkpoint;
 pub mod inspect;
