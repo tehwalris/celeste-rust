@@ -839,6 +839,11 @@ impl<'a> Backward<'a> {
         self.cur = new_cur;
         self.changed = changed;
         self.max_cur = self.max_cur.max(self.cur.len());
+        // The step's workers are gone: their heaps' freed pages go back now
+        // (mimalloc reclaims an exited thread's segments lazily otherwise -
+        // ~3 GB held on the mod room).
+        // SAFETY: mimalloc's documented API, callable from any thread.
+        unsafe { libmimalloc_sys::mi_collect(true) };
         let d_merge = t0.elapsed();
         self.d_merge += d_merge;
         let ms = |d: std::time::Duration| d.as_secs_f64() * 1e3;

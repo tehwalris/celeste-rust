@@ -223,22 +223,40 @@ pub struct Piece {
     pub x: Seg,
 }
 
-/// A slab of a `Region`: `[lo, hi)` of y, its x set `xs[start..end]` (the
-/// start is the previous slab's end).
+/// A segment as a `Region` stores it: `[lo, last]`, `last` its last point
+/// (so the whole circle, `[0, CIRCLE)`, fits 16 bits a bound).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct Stored {
+    lo: u16,
+    last: u16,
+}
+
+impl Stored {
+    fn of(s: Seg) -> Self {
+        debug_assert!(s.lo < s.hi && s.hi <= CIRCLE, "a segment of the circle: {s:?}");
+        Stored { lo: s.lo as u16, last: (s.hi - 1) as u16 }
+    }
+    fn seg(self) -> Seg {
+        Seg { lo: self.lo as u32, hi: self.last as u32 + 1 }
+    }
+}
+
+/// A slab of a `Region`: its y segment, its x set `xs[start..end]` (the
+/// start is the previous slab's end). 6 B.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 struct Slab {
-    lo: u32,
-    hi: u32,
-    end: u32,
+    y: Stored,
+    end: u16,
 }
 
 /// A set of the torus in CANONICAL form: sorted disjoint y slabs, each with
 /// a non-empty x set, touching slabs never with the same x set. Equal sets
-/// are equal values; a union of many contributions is one sweep.
+/// are equal values; a union of many contributions is one sweep. Bounds
+/// are stored in 16 bits (`Stored`), a region holds < 65536 segments.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub struct Region {
     slabs: Vec<Slab>,
-    xs: Vec<Seg>,
+    xs: Vec<Stored>,
 }
 
 /// `s` rotated by `d` (already in `0..CIRCLE`): one or two segments.
@@ -261,7 +279,8 @@ fn clip(s: Seg, g: Seg) -> Option<Seg> {
 
 impl Region {
     pub fn full() -> Self {
-        Region { slabs: vec![Slab { lo: 0, hi: CIRCLE, end: 1 }], xs: vec![Seg { lo: 0, hi: CIRCLE }] }
+        let all = Stored::of(Seg { lo: 0, hi: CIRCLE });
+        Region { slabs: vec![Slab { y: all, end: 1 }], xs: vec![all] }
     }
     /// The set as a borrowed view (what every query takes).
     pub fn as_ref(&self) -> RegionRef<'_> {
@@ -273,7 +292,7 @@ impl Region {
     pub fn n_segs(&self) -> usize {
         self.xs.len()
     }
-    pub fn slabs(&self) -> impl Iterator<Item = (Seg, &[Seg])> + '_ {
+    pub fn slabs(&self) -> impl Iterator<Item = (Seg, impl Iterator<Item = Seg> + '_)> + '_ {
         self.as_ref().slabs()
     }
     pub fn contains(&self, x: u32, y: u32) -> bool {
@@ -327,13 +346,14 @@ impl Region {
             let start = out.slabs.last().map_or(0, |s| s.end) as usize;
             let prev_start = if out.slabs.len() >= 2 { out.slabs[out.slabs.len() - 2].end as usize } else { 0 };
             if let Some(last) = out.slabs.last_mut() {
-                if last.hi == lo && out.xs[prev_start..start] == merged[..] {
-                    last.hi = hi;
+                if last.y.last as u32 + 1 == lo && out.xs[prev_start..start].iter().map(|s| s.seg()).eq(merged.iter().copied()) {
+                    last.y = Stored::of(Seg { lo: last.y.lo as u32, hi });
                     continue;
                 }
             }
-            out.xs.extend_from_slice(&merged);
-            out.slabs.push(Slab { lo, hi, end: out.xs.len() as u32 });
+            out.xs.extend(merged.iter().map(|&s| Stored::of(s)));
+            assert!(out.xs.len() < 1 << 16, "a region past 65535 segments");
+            out.slabs.push(Slab { y: Stored::of(Seg { lo, hi }), end: out.xs.len() as u16 });
         }
         out
     }
@@ -343,7 +363,7 @@ impl Region {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct RegionRef<'a> {
     slabs: &'a [Slab],
-    xs: &'a [Seg],
+    xs: &'a [Stored],
 }
 
 impl<'a> RegionRef<'a> {
@@ -354,32 +374,38 @@ impl<'a> RegionRef<'a> {
         self.xs.len()
     }
     /// Slabs (a y segment and its x set), in y order.
-    pub fn slabs(self) -> impl Iterator<Item = (Seg, &'a [Seg])> + 'a {
+    pub fn slabs(self) -> impl Iterator<Item = (Seg, impl Iterator<Item = Seg> + 'a)> + 'a {
+        self.stored().map(|(y, xs)| (y, xs.iter().map(|s| s.seg())))
+    }
+    /// The slabs as stored.
+    fn stored(self) -> impl Iterator<Item = (Seg, &'a [Stored])> + 'a {
         let mut start = 0;
         self.slabs.iter().map(move |s| {
             let xs = &self.xs[start as usize..s.end as usize];
             start = s.end;
-            (Seg { lo: s.lo, hi: s.hi }, xs)
+            (s.y.seg(), xs)
         })
     }
     /// The set as pieces (a slab's y times each of its x segments),
     /// appended to `out`.
     pub fn pieces(self, out: &mut Vec<Piece>) {
         for (y, xs) in self.slabs() {
-            out.extend(xs.iter().map(|&x| Piece { y, x }));
+            out.extend(xs.map(|x| Piece { y, x }));
         }
     }
-    fn slab_at(self, y: u32) -> Option<&'a [Seg]> {
-        let i = self.slabs.partition_point(|s| s.hi <= y);
-        let s = self.slabs.get(i).filter(|s| s.lo <= y)?;
+    fn slab_at(self, y: u32) -> Option<&'a [Stored]> {
+        let i = self.slabs.partition_point(|s| (s.y.last as u32) < y);
+        let s = self.slabs.get(i).filter(|s| s.y.lo as u32 <= y)?;
         let start = if i == 0 { 0 } else { self.slabs[i - 1].end };
         Some(&self.xs[start as usize..s.end as usize])
     }
+    /// Is point `p` in the stored x set `xs`?
+    fn holds(xs: &[Stored], p: u32) -> bool {
+        let i = xs.partition_point(|s| (s.last as u32) < p);
+        xs.get(i).is_some_and(|s| s.lo as u32 <= p)
+    }
     pub fn contains(self, x: u32, y: u32) -> bool {
-        self.slab_at(y).is_some_and(|xs| {
-            let i = xs.partition_point(|s| s.hi <= x);
-            xs.get(i).is_some_and(|s| s.lo <= x)
-        })
+        self.slab_at(y).is_some_and(|xs| Self::holds(xs, x))
     }
     /// The IMAGE of `self` under one edge, as pieces appended to `out`: the
     /// points of `self` inside the edge's guards, moved by its actions.
@@ -395,7 +421,7 @@ impl<'a> RegionRef<'a> {
         let mut ximg: Vec<Seg> = Vec::new();
         for (ys, xs) in self.slabs() {
             ximg.clear();
-            for &s in xs {
+            for s in xs {
                 image(x, s, &mut |r| ximg.push(r));
             }
             if ximg.is_empty() {
@@ -408,7 +434,7 @@ impl<'a> RegionRef<'a> {
     pub fn clip_into(self, p: Piece, out: &mut Vec<Piece>) {
         for (ys, xs) in self.slabs() {
             let Some(y) = clip(ys, p.y) else { continue };
-            for &s in xs {
+            for s in xs {
                 if let Some(x) = clip(s, p.x) {
                     out.push(Piece { y, x });
                 }
@@ -419,11 +445,11 @@ impl<'a> RegionRef<'a> {
     /// pieces appended to `out`: the remainders the edge takes into `self`.
     pub fn pull(self, x: Transfer, y: Transfer, out: &mut Vec<Piece>) {
         let neg = |v: i32| (-(v as i64)).rem_euclid(CIRCLE as i64) as u32;
-        let emit_x = |ys: Seg, xs: &[Seg], out: &mut Vec<Piece>| match x.action {
+        let emit_x = |ys: Seg, xs: &[Stored], out: &mut Vec<Piece>| match x.action {
             Action::Rotate(v) => {
                 let d = neg(v);
-                for &s in xs {
-                    rot_seg(s, d, |r| {
+                for s in xs {
+                    rot_seg(s.seg(), d, |r| {
                         if let Some(c) = clip(r, x.guard) {
                             out.push(Piece { y: ys, x: c });
                         }
@@ -431,8 +457,7 @@ impl<'a> RegionRef<'a> {
                 }
             }
             Action::Const(c) => {
-                let i = xs.partition_point(|s| s.hi <= c);
-                if xs.get(i).is_some_and(|s| s.lo <= c) {
+                if Self::holds(xs, c) {
                     out.push(Piece { y: ys, x: x.guard });
                 }
             }
@@ -440,7 +465,7 @@ impl<'a> RegionRef<'a> {
         match y.action {
             Action::Rotate(v) => {
                 let d = neg(v);
-                for (ys, xs) in self.slabs() {
+                for (ys, xs) in self.stored() {
                     rot_seg(ys, d, |r| {
                         if let Some(c) = clip(r, y.guard) {
                             emit_x(c, xs, out);
@@ -463,13 +488,13 @@ impl PartialEq<Region> for RegionRef<'_> {
     }
 }
 
-/// Many sets in two flat lists (a slab 12 B, a segment 8, 8 B a set
+/// Many sets in two flat lists (a slab 6 B, a segment 4, 8 B a set
 /// besides): the backward's arena of distinct winning sets, without a
 /// `Region`'s two allocations each.
 #[derive(Clone)]
 pub struct RegionArena {
     slabs: Vec<Slab>,
-    xs: Vec<Seg>,
+    xs: Vec<Stored>,
     /// Set `i`: `slabs[at[i].0..at[i + 1].0]`, `xs[at[i].1..at[i + 1].1]`.
     at: Vec<(u32, u32)>,
 }
@@ -502,7 +527,7 @@ impl RegionArena {
     }
     /// The bytes its sets take (the lists' used lengths).
     pub fn bytes(&self) -> usize {
-        self.slabs.len() * std::mem::size_of::<Slab>() + self.xs.len() * std::mem::size_of::<Seg>() + self.at.len() * 8
+        self.slabs.len() * std::mem::size_of::<Slab>() + self.xs.len() * std::mem::size_of::<Stored>() + self.at.len() * 8
     }
 }
 
