@@ -736,8 +736,10 @@ arc gate's optimum becomes 32.
 J is HISTORY: it depends on how the previous room was played (plans/results.md
 "Real play"). The sound treatment is the set of feasible J's, grouped by the
 start state each gives:
-- `pico8_diff/chain.py` `feasible_janks` / `start_classes` compute the
-  classes, using `concrete_run --dump-start` to compare start states;
+- `rewrite starts` (`src/starts.rs`) computes the feasible J's and the
+  classes, comparing the reference engine's start states exactly (until
+  2026-10-11 `pico8_diff/chain.py`, one `concrete_run --dump-start` text
+  per J; identical classes for levels 2-31);
 - `tools/category_runner.py` `expand` runs one search per class;
 - the boot chain's class carries the witness and the upload.
 

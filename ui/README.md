@@ -193,7 +193,7 @@ a concrete witness, `witness.txt` (the inputs and the player's position per
 frame) is drawn over the room as a path (below). `--witness FILE` replaces
 it and `--reference FILE` adds a second one to compare with, in the same
 format plus an optional `label` line and `dashes F:DIR ...`:
-`tools/align_tas.py ROOM 2900m PROLOGUE OUR_TAS SEEDS OUTDIR` writes both
+`tools/align_tas.py ROOM 2900m PROLOGUE OUR_TAS OUTDIR --cat CAT` writes both
 (`ours.txt`, `reference.txt`) from a community TAS and ours replayed in the
 ORIGINAL cart, so the two are directly comparable.
 

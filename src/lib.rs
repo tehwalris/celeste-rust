@@ -8,6 +8,7 @@ pub mod metrics;
 pub mod par;
 pub mod search;
 pub mod settings;
+pub mod starts;
 pub mod storage;
 pub mod trace;
 pub mod transpile;

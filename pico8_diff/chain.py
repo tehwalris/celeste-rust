@@ -17,78 +17,27 @@ the frame its player is created, as UniversalClassicTas and Celia do):
     here J is the one the chain measured;
  3. chain (the ground truth): the previous room (`--from L`: from level L;
     `--boot`: from 100m, the game's start) played with the database's files
-    (the category's, else a fallback category's: FALLBACK; our own file
-    where the database's never exits on PICO-8: OVERRIDES), then FILE.
+    (the category's, else a fallback category's; our own file where the
+    database's never exits on PICO-8: `celeste.tasdb.chain_file`), then FILE.
 The default runs the chain from the previous level only. Prints each
 segment's exit (frame, the room's count, the leaving player's index J, the
 berry), and with --modes each mode's count and the room-entry state of
 modes 1 and 2 diffed against the chain's, field by field.
 """
 import argparse
-import json
 import os
-import re
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import replay  # noqa: E402
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "tools"))
+from celeste import categories, rooms, tasdb  # noqa: E402
+from celeste.pico8 import ORIG  # noqa: E402
 
-DB = os.path.expanduser("~/src/github.com/CelesteClassic/tasdatabase")
-ORIG = os.path.expanduser("~/src/github.com/tehwalris/celeste_ocaml/celeste.lua")
-# The files a category's full run plays where the category has none: the
-# 100% categories play any% where a room has no berry; the gemskip ones play
-# their parent category before the orb room (level 22).
-FALLBACK = {
-    "any": ["any"],
-    "100": ["100", "any"],
-    "nodiag": ["nodiag", "any"],
-    "gemskipany": ["gemskipany", "any"],
-    "gemskipnodiag": ["gemskipnodiag", "nodiag", "any"],
-    "gemskip100": ["gemskip100", "gemskipany", "100", "any"],
-    "mindashes": ["mindashes", "any"],
-    "minjumps": ["minjumps", "any"],
-    "key": ["key", "any"],
-}
 # Globals that only draw, sound or count time (pico8_diff/replay.py
 # DUMP_GLOBALS): no object's update reads them.
 COSMETIC = {"frames", "seconds", "minutes", "music_timer", "sfx_timer", "new_bg", "flash_bg", "deaths", "shake"}
-
-
-def room_of(level):
-    return ((level - 1) % 8, (level - 1) // 8)
-
-
-def parse_tas(text):
-    """A tasdatabase file: `[s1,s2,]i1,i2,...` (seeds optional)."""
-    seeds = []
-    if "[" in text:
-        seeds = [float(v) for v in text[text.index("[") + 1:text.index("]")].split(",") if v.strip()]
-        text = text[text.index("]") + 1:]
-    return seeds, [int(x) for x in re.findall(r"\d+", text)]
-
-
-# Rooms whose database file is not PICO-8 valid (made in a tool computing in
-# doubles, it never exits on a real PICO-8), played in a category's chain with
-# OUR file instead, so the chain runs on unbroken (it used to restart after
-# such a room by an IL load): (category, level) -> a file, relative to the
-# repo. Only files verified like any submission (check_uploads: VALID).
-OVERRIDES = {
-    # The database's 164 finishes in Celia only; ours exits on PICO-8.
-    ("gemskip100", 28): "tas/tasdatabase/gemskip100/upload/TAS28.tas",
-}
-
-
-def db_file(cat, level):
-    """The file a full run of `cat` plays in `level` (the database's, the
-    category's, else FALLBACK's; an OVERRIDES entry first), and its category."""
-    if (cat, level) in OVERRIDES:
-        return cat, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), OVERRIDES[(cat, level)])
-    db = json.load(open(f"{DB}/database.json"))["classic"]
-    for c in FALLBACK[cat]:
-        for e in db.get(c, []):
-            if e.get("file") == f"TAS{level}.tas" and os.path.exists(f"{DB}/classic/{c}/{e['file']}"):
-                return c, f"{DB}/classic/{c}/{e['file']}"
-    raise SystemExit(f"chain.py: no database file for level {level} in {FALLBACK[cat]}")
+room_of = rooms.room_of
 
 
 def parse(lines):
@@ -125,8 +74,8 @@ def chain(cat, level, seeds, inputs, first, trace_objects=False, dump=True):
     inputs) in `level`; the PICO-8 output lines."""
     segs = []
     for l in range(first, level):
-        _, path = db_file(cat, l)
-        sd, ins = parse_tas(open(path).read())
+        _, path = tasdb.chain_file(cat, l)
+        sd, ins = tasdb.parse(open(path).read())
         segs.append((room_of(l), sd, ins))
     segs.append((room_of(level), seeds, inputs))
     frames = sum(len(s[2]) + 80 for s in segs)
@@ -134,12 +83,12 @@ def chain(cat, level, seeds, inputs, first, trace_objects=False, dump=True):
     # begin_game AFTER its objects' updates, then the frame draws (the room
     # title's first tick) - a loading frame that updates no object.
     return replay.run(inputs, frames, lua_path=ORIG, begin_game=True, room=room_of(first) if first > 1 else None,
-                      one_dash=cat.startswith("gemskip"), segments=segs, dump=dump, trace_objects=trace_objects, load_draw=first == 1)
+                      one_dash=categories.one_dash(cat), segments=segs, dump=dump, trace_objects=trace_objects, load_draw=first == 1)
 
 
 def single(cat, level, seeds, inputs, jank=None, trace_objects=False):
     """The room alone (mode 1), or with its loading frame from object J (mode 2)."""
-    return replay.run(inputs, len(inputs) + 80, lua_path=ORIG, begin_game=True, room=room_of(level), one_dash=cat.startswith("gemskip"),
+    return replay.run(inputs, len(inputs) + 80, lua_path=ORIG, begin_game=True, room=room_of(level), one_dash=categories.one_dash(cat),
                       segments=[(room_of(level), seeds, inputs)], jank=jank, dump=True, trace_objects=trace_objects)
 
 
@@ -199,7 +148,7 @@ def check_start(cat, level, binary):
     j = entry_jank(cat, level)
     _, _, ref = parse(chain(cat, level, [], [0], 1))
     rx, ry = room_of(level)
-    flags = ["--room", f"{rx},{ry}", "--loading-jank", str(j) if j else "none", "--balloon-seeds", "0"] + (["--gemskip"] if cat.startswith("gemskip") else [])
+    flags = ["--room", f"{rx},{ry}", "--loading-jank", str(j) if j else "none", "--balloon-seeds", "0"] + (["--gemskip"] if categories.one_dash(cat) else [])
     root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     ours = subprocess.run([os.path.join(root, "safe-run.sh"), "--", binary, "-i", "0", "--dump-start"] + flags, capture_output=True, text=True, cwd=root, check=True).stdout.splitlines()
     skip = ("room_title", "message", "flag")
@@ -216,69 +165,6 @@ def check_start(cat, level, binary):
             else:
                 only.add(f"{hm.split()[2]}.{k} ({'PICO-8' if k in fp else 'search'} only)")
     return j, diffs, sorted(only)
-
-
-# Object tiles whose object a play can destroy before the exit (a berry
-# taken, a fly fruit taken or flown off, a key taken, a chest opened, a fake
-# wall broken); the spawn is always replaced by the player.
-DESTROYABLE = {26, 28, 8, 20, 64}
-# The player's speed bound, px a frame (the search's region asserts it).
-MAX_SPEED = 6
-
-
-def room_objects(room):
-    """The object tiles of a room in load_room's creation order (the original cart's)."""
-    m = replay.hexbytes(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "cart", "map-data.txt"), 8192)
-    return [t for t in (m[(room[1] * 16 + ty) * 128 + room[0] * 16 + tx] for tx in range(16) for ty in range(16)) if t in replay.OBJECT_TILES]
-
-
-def celia_jank(level):
-    """The J Celia's IL load uses (cctas.lua `load_level`, offset 0): the
-    previous room's object count at its load, the title left out - as if the
-    player left it with nothing destroyed and the title gone. It differs from
-    the boot chain's where the previous room's play destroys objects (any%
-    levels 5, 8, 13, 18; most 100% levels after a berry): both are checked."""
-    return None if level == 1 else len(room_objects(room_of(level - 1)))
-
-
-def feasible_janks(level):
-    """Every J a play of the previous room can enter `level` with - a
-    SOUND over-approximation of the history the room-entry state depends on.
-    J = 1 + the objects before the player when it leaves: the previous
-    room's objects but the spawn, less any subset of the destroyable ones,
-    plus the room title if it is still up (it is drawn away on the 36th frame
-    after the load) and the spawn's smoke (15 frames, 6 of them before the
-    player exists) if they can be: only when the exit can come that soon,
-    bounded by the spawn's own frames and the climb at MAX_SPEED."""
-    prev = room_of(level - 1)
-    m = replay.hexbytes(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "cart", "map-data.txt"), 8192)
-    tiles = [(m[(prev[1] * 16 + ty) * 128 + prev[0] * 16 + tx], ty) for tx in range(16) for ty in range(16)]
-    objs = [t for t, _ in tiles if t in replay.OBJECT_TILES]
-    spawn_y = next(ty * 8 for t, ty in tiles if t == 1)
-    k, d = len(objs), sum(t in DESTROYABLE for t in objs)
-    # The frame the player is created on, after an IL load (no input reaches the spawn).
-    lines = single("any", level - 1, [], [0])
-    start = min(int(l.split()[0][1:]) for l in lines if l.startswith("f") and " player " in l)
-    climb = -(-(spawn_y + 5) // MAX_SPEED)
-    # start - 1: in real play the previous room's own loading frame may have
-    # updated its spawn too (a frame ahead).
-    title = [0, 1] if (start - 1) + climb - 1 <= 36 else [0]
-    smoke = [0, 1] if climb <= 10 else [0]
-    return sorted({1 + (k - 1 - x) + t + sm for x in range(d + 1) for t in title for sm in smoke})
-
-
-def start_classes(level, binary, cat="any"):
-    """The feasible J's grouped by the search's start state they give
-    (`concrete_run --dump-start`): one class per distinct room entry."""
-    import subprocess
-    rx, ry = room_of(level)
-    classes = {}
-    for j in feasible_janks(level):
-        flags = ["--room", f"{rx},{ry}", "--loading-jank", str(j), "--balloon-seeds", "0"] + (["--gemskip"] if cat.startswith("gemskip") else [])
-        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        dump = subprocess.run([os.path.join(root, "safe-run.sh"), "--", binary, "-i", "0", "--dump-start"] + flags, capture_output=True, text=True, cwd=root, check=True).stdout
-        classes.setdefault(dump, []).append(j)
-    return list(classes.values())
 
 
 def vary(level, cats):
@@ -305,7 +191,7 @@ def vary(level, cats):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("cat", choices=sorted(FALLBACK))
+    ap.add_argument("cat", choices=sorted(categories.FALLBACK))
     ap.add_argument("level", type=int)
     ap.add_argument("file", help="the room's TAS (tasdatabase format)")
     g = ap.add_mutually_exclusive_group()
@@ -314,7 +200,7 @@ def main():
     ap.add_argument("--modes", action="store_true", help="also the IL and jank modes, their entry states diffed against the chain's")
     ap.add_argument("--trace-objects", action="store_true", help="print the last room's frame lines with every object")
     ap.add_argument("--check-start", metavar="CONCRETE_RUN", help="(FILE ignored) the search's start state (this concrete_run binary's --dump-start) against the boot chain's room entry, field by field")
-    ap.add_argument("--feasible", metavar="CONCRETE_RUN", help="(FILE ignored) every J a play of the previous room can enter with, grouped by the start state they give")
+    ap.add_argument("--feasible", metavar="REWRITE", help="(FILE ignored) every J a play of the previous room can enter with, grouped by the start state they give (this rewrite binary's `starts`)")
     ap.add_argument("--entry-jank", action="store_true", help="(FILE ignored) print the J the category's boot chain enters the level with")
     ap.add_argument("--vary", action="store_true", help="(FILE ignored) the room's entry state after every category's boot chain, and the fields that differ")
     a = ap.parse_args()
@@ -327,20 +213,21 @@ def main():
             print("    (not compared, one cart only: " + ", ".join(only) + ")")
         sys.exit(1 if diffs else 0)
     if a.feasible:
-        print(f"level {a.level}: feasible J {feasible_janks(a.level)}, start classes {start_classes(a.level, a.feasible, a.cat)}")
+        st = rooms.starts(room_of(a.level), categories.search_flags(a.cat) + ["--balloon-seeds", "0"], a.feasible)
+        print(f"level {a.level}: feasible J {st['feasible']}, start classes {st['classes']}, Celia's J {st['celia']}")
         return
     if a.entry_jank:
         print(entry_jank(a.cat, a.level))
         return
     if a.vary:
-        runs, differ = vary(a.level, [c for c in FALLBACK if c != "gemskip100"])
+        runs, differ = vary(a.level, [c for c in categories.FALLBACK if c != "gemskip100"])
         for c, (st, _) in runs.items():
             print(f"{c}: {st}")
         for field, cs in sorted(differ.items()):
             kind = "cosmetic" if field.startswith("globals ") and field.split()[1] in COSMETIC else "STATE"
             print(f"varies ({kind}): {field}  [{', '.join(sorted(cs))} differ from {next(c for c, (_, d) in runs.items() if d)}]")
         return
-    seeds, inputs = parse_tas(open(a.file).read())
+    seeds, inputs = tasdb.parse(open(a.file).read())
     first = 1 if a.boot else (a.first or a.level - 1)
     lines = chain(a.cat, a.level, seeds, inputs, first, a.trace_objects)
     exits, bad, ref = parse(lines)

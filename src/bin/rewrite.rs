@@ -595,6 +595,18 @@ enum Command {
         #[arg(long)]
         download: Option<String>,
     },
+    /// The room (`--room`) as the tools need it, as JSON on stdout: its
+    /// level and its objects in creation order (the original cart's: tile,
+    /// tile position, type, whether the minimal cart has it, whether a TAS
+    /// file's `[seeds]` list runs over it - in this order).
+    Room,
+    /// The start states real play can enter the room (`--room`) with
+    /// (`starts`), as JSON on stdout: every loading-frame J a play of the
+    /// previous room can give, the J's grouped by the exact start state they
+    /// make (one search per class), and the J of Celia's IL load. Give the
+    /// search's settings (the category; `--balloon-seeds` for a room with
+    /// balloons); not `--loading-jank`.
+    Starts,
     /// A concrete input sequence that follows a given TRAJECTORY of player
     /// positions (one "x,y" per line from frame 1; `-` accepts any), found
     /// breadth-first over the reference engine's concrete step, deduplicated
@@ -2174,6 +2186,15 @@ fn main() -> Result<()> {
                     download: download.as_deref().map(std::path::Path::new),
                 },
             )?;
+        }
+        Command::Room => {
+            let cart = celeste_core::cart_data::CartData::load("cart")?;
+            let objects = celeste_rust::trace::cart::room_objects(&cart, cfg.room);
+            let level = celeste_rust::game_runner::level_index(cfg.room.0, cfg.room.1) + 1;
+            println!("{}", serde_json::json!({ "room": cfg.room, "level": level, "objects": objects }));
+        }
+        Command::Starts => {
+            println!("{}", serde_json::to_string(&celeste_rust::starts::starts(&cfg)?)?);
         }
         Command::Trajectory {
             trajectory,
