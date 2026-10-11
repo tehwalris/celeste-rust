@@ -177,6 +177,7 @@ impl<'a> Node<'a> {
 pub struct Nodes<'a> {
     w: &'a Winning,
     k: usize,
+    end: usize,
     pos: usize,
     id: StateId,
 }
@@ -184,7 +185,7 @@ pub struct Nodes<'a> {
 impl<'a> Iterator for Nodes<'a> {
     type Item = Node<'a>;
     fn next(&mut self) -> Option<Node<'a>> {
-        if self.k >= self.w.n {
+        if self.k >= self.end {
             return None;
         }
         if self.k % BLOCK == 0 {
@@ -219,7 +220,13 @@ impl Winning {
     }
     /// Every node, in id order.
     pub fn nodes(&self) -> Nodes<'_> {
-        Nodes { w: self, k: 0, pos: 0, id: 0 }
+        self.nodes_from(0, self.n)
+    }
+    /// Nodes `lo..hi` in id order (`lo` a multiple of `BLOCK`: a block's
+    /// first node).
+    fn nodes_from(&self, lo: usize, hi: usize) -> Nodes<'_> {
+        assert!(lo % BLOCK == 0, "nodes from a block's first");
+        Nodes { w: self, k: lo, end: hi.min(self.n), pos: 0, id: 0 }
     }
     pub fn len(&self) -> usize {
         self.n
@@ -1796,25 +1803,38 @@ pub fn solve(
     for (f, fs) in tree_frames(dir, horizon)?.into_iter().enumerate() {
         files.extend(fs.into_iter().map(|(seq, file)| (f as u32, seq, file)));
     }
-    let mut rows: Vec<MarkRow> = Vec::new();
-    let mut fp = 0u64;
     // Per frame, the nodes with a set and the sum of their (node, set)
     // hashes: each span added at its first frame and taken off past its
-    // last (`delta`), then summed frame by frame.
-    let mut delta = vec![(0i64, 0u64); horizon as usize + 2];
-    for x in w.nodes() {
-        let (shape, key, cell) = resolver.resolve(x.id)?;
-        // `Visited::fingerprint`: the nodes are distinct states.
-        let h = content.state(shape, key, cell);
-        fp = fp.wrapping_add(h);
-        for (lo, hi, r) in x.spans() {
-            let g = gate_w_hash(h, r);
-            delta[lo as usize] = (delta[lo as usize].0 + 1, delta[lo as usize].1.wrapping_add(g));
-            delta[hi as usize + 1] = (delta[hi as usize + 1].0 - 1, delta[hi as usize + 1].1.wrapping_sub(g));
+    // last (`delta`), then summed frame by frame; W's nodes in parallel
+    // block ranges, the sums commutative.
+    type Part = (u64, Vec<(i64, u64)>, Vec<MarkRow>);
+    let blocks = w.len().div_ceil(BLOCK);
+    let parts: Vec<anyhow::Result<Part>> = par_chunks(blocks, 4096, threads, |lo, hi| {
+        let (mut fp, mut delta, mut rows) = (0u64, vec![(0i64, 0u64); horizon as usize + 2], Vec::new());
+        for x in w.nodes_from(lo * BLOCK, hi * BLOCK) {
+            let (shape, key, cell) = resolver.resolve(x.id)?;
+            // `Visited::fingerprint`: the nodes are distinct states.
+            let h = content.state(shape, key, cell);
+            fp = fp.wrapping_add(h);
+            for (lo, hi, r) in x.spans() {
+                let g = gate_w_hash(h, r);
+                delta[lo as usize] = (delta[lo as usize].0 + 1, delta[lo as usize].1.wrapping_add(g));
+                delta[hi as usize + 1] = (delta[hi as usize + 1].0 - 1, delta[hi as usize + 1].1.wrapping_sub(g));
+            }
+            if save.is_some() {
+                rows.push(mark_row(shape, key, cell, x.last() as u16, horizon));
+            }
         }
-        if save.is_some() {
-            rows.push(mark_row(shape, key, cell, x.last() as u16, horizon));
+        Ok((fp, delta, rows))
+    });
+    let (mut fp, mut delta, mut rows) = (0u64, vec![(0i64, 0u64); horizon as usize + 2], Vec::<MarkRow>::new());
+    for part in parts {
+        let (f, d, r) = part?;
+        fp = fp.wrapping_add(f);
+        for (a, b) in delta.iter_mut().zip(d) {
+            *a = (a.0 + b.0, a.1.wrapping_add(b.1));
         }
+        rows.extend(r);
     }
     println!("[gate] h{horizon} support {} {fp:016x}", w.len());
     if let Some(out) = save {
