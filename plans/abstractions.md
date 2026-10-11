@@ -1,7 +1,9 @@
 # The level flags: what each widens, why it is sound, what refutes it
 
 A level is `celeste_engine::widening::Level { held, fruit, floors_near,
-platforms }`, written `r0sx[h][f][n][p]` (`Level::parse`): `r0sxhn` = held
+platforms, exact_fruit }`, written `r0sx[h][f][n][p][e]` (`Level::parse`):
+`e` REMOVES a widening (the strawberry bob: strawberries exact, for a room
+with several of them, plans/map-mod.md); `r0sxhn` = held
 buttons unknown, fall floors (and every object's phase) widened except where
 the player overlaps. The `r0sx` prefix says what every level shares: the
 remainder widened at the boundary and tracked exactly by the arcs, the speed
@@ -11,8 +13,8 @@ nodes; plans/architecture.md "The search"). The rem rungs were deleted on
 2026-10-05.
 
 **Every widening is one entry of ONE table** (`celeste_engine::widening::
-TABLE`, plans/widen-table.md): per entry its flag (every level, or `h`, `f`,
-`n`, `p`), its objects, per slot what it STORES, how the frame READS it,
+TABLE`, plans/widen-table.md): per entry its flag (every level, every level
+but `e`'s, or `h`, `f`, `n`, `p`), its objects, per slot what it STORES, how the frame READS it,
 whether it is EXACT or an OVER-APPROXIMATION, and why. A level is the set of
 entries its flags turn on. The tracer interprets the table in the graph
 (`trace::widen::widen`, `read_inputs`), the block side over columns
@@ -74,7 +76,7 @@ point-split run at every frame.
 | player remainder | every | `player` | `rem.x` | [-0.5, 0.49998]; owed: inside | as stored | over |
 |  |  |  | `rem.y` | [-0.5, 0.49998]; owed: inside | as stored |  |
 | dash effect | every | `player` | `dash_effect_time` | max(v, 0) | as stored | exact |
-| strawberry bob | every | `fruit` | `y` | `start` +- 2.5; owed: inside | as stored | over |
+| strawberry bob | all but `e` | `fruit` | `y` | `start` +- 2.5; owed: inside | as stored | over |
 |  |  |  | `off` | one period [0, 39] | as stored |  |
 | timers | every | globals | `frames` | 0 (dead) | as stored | exact |
 |  |  |  | `seconds` | 0 (dead) | as stored |  |

@@ -1089,11 +1089,11 @@ impl<'c> InputView<'c> {
 /// change nothing (structure, shape hash), and every row's key must be what
 /// the key space makes of the boundary's row - packed, or for a provisional
 /// key the same exact content: the gate that the append's keys are exact.
-pub(crate) fn key_check(slot: &crate::storage::unit::RowBuf, keys: &KeySpace, prov: &Provisional) {
+pub(crate) fn key_check(slot: &crate::storage::unit::RowBuf, keys: &KeySpace, prov: &Provisional, level: crate::abstraction::Level) {
     use celeste_engine::exact::{is_provisional, RowKey};
     let acc = slot.to_rt2();
     let mut b = acc.clone_block();
-    b.boundary_canonicalize(super::ids());
+    b.boundary_canonicalize(super::ids(), level);
     let want = keys.row_keys(&b, super::ids());
     let bad: Vec<usize> = (0..acc.width)
         .filter(|&i| match &want[i] {
@@ -1134,9 +1134,9 @@ pub(crate) fn key_check(slot: &crate::storage::unit::RowBuf, keys: &KeySpace, pr
 /// piece, `storage::wave::gather_layer`, keys final): the boundary over a
 /// copy must keep its shape and structure, and the key space key its rows
 /// as stored - its gather moved rows, not values.
-pub(crate) fn key_check_block(blk: &Rt2, keys: &KeySpace) {
+pub(crate) fn key_check_block(blk: &Rt2, keys: &KeySpace, level: crate::abstraction::Level) {
     let mut b = blk.clone_block();
-    b.boundary_canonicalize(super::ids());
+    b.boundary_canonicalize(super::ids(), level);
     let got: Vec<Option<(u64, u64)>> = keys.lookup_keys(&b, super::ids());
     let same = got.iter().zip(&blk.row_keys).all(|(g, w)| *g == Some(*w));
     assert!(
