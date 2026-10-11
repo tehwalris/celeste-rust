@@ -344,8 +344,8 @@ const MADE: u32 = 1 << 30;
 
 /// The in-edges a step reads at once: a step whose changed nodes have more
 /// reads them in ROUNDS, each folded into the step's sets so far (24 B an
-/// in-edge: 1.5 GB a round).
-const ROUND_EMITS: usize = 1 << 26;
+/// in-edge: 0.8 GB a round).
+const ROUND_EMITS: usize = 1 << 25;
 
 fn region_hash(r: RegionRef) -> u64 {
     use std::hash::{Hash, Hasher};
