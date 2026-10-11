@@ -229,10 +229,11 @@ impl FrameFile {
         None
     }
 
-    /// The shape's skeleton: an empty block of a search from `room`.
-    fn skeleton(&self, room: (i16, i16)) -> Result<Rt2> {
+    /// The shape's skeleton: an empty block of a search under `s` (its
+    /// start room's cart and collision cache).
+    fn skeleton(&self, s: &crate::settings::Settings) -> Result<Rt2> {
         let h = &self.header;
-        let (cart, cache) = crate::compiled::room_context(room)?;
+        let (cart, cache) = crate::compiled::room_context(s)?;
         let mut rt2 = Rt2::empty(0, h.globals.len(), &[], cart, cache);
         rt2.structure = h.structure.clone();
         rt2.globals = h.globals.clone();
@@ -252,7 +253,7 @@ impl FrameFile {
     /// Decode `ranges` (ascending, disjoint) into a block of a search from
     /// `room` (its cart and collision cache), their keys from `tree` (the
     /// tree's key space and entries). `None` if they are all empty.
-    pub fn load_rows(&self, ranges: &[std::ops::Range<u32>], room: (i16, i16), tree: &dyn TreeKeys) -> Result<Option<Rt2>> {
+    pub fn load_rows(&self, ranges: &[std::ops::Range<u32>], s: &crate::settings::Settings, tree: &dyn TreeKeys) -> Result<Option<Rt2>> {
         let total: usize = ranges.iter().map(|r| r.len()).sum();
         if total == 0 {
             return Ok(None);
@@ -265,12 +266,12 @@ impl FrameFile {
                 Ok((tree.key(id, self.header.shape_hash)?, self.cell_at(r)))
             })
             .collect::<Result<Vec<_>>>()?;
-        crate::storage::decode::decode_rows(tree.space(), &self.skeleton(room)?, &rows).map(Some)
+        crate::storage::decode::decode_rows(tree.space(), &self.skeleton(s)?, &rows).map(Some)
     }
 
     /// The whole file as one block.
-    pub fn load_all(&self, room: (i16, i16), tree: &dyn TreeKeys) -> Result<Option<Rt2>> {
-        self.load_rows(&[0..self.header.width], room, tree)
+    pub fn load_all(&self, s: &crate::settings::Settings, tree: &dyn TreeKeys) -> Result<Option<Rt2>> {
+        self.load_rows(&[0..self.header.width], s, tree)
     }
 }
 

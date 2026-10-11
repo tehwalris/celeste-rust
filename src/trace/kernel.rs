@@ -367,7 +367,7 @@ pub fn room_constant_lattice(
     let fr = leak(full_moon::parse(cart::FRAME_CODE).map_err(|e| anyhow!("frame: {:?}", e))?);
 
     let mut it: Interp<'static, Symbolic> = Interp::new(Symbolic::default());
-    let cart_data = std::sync::Arc::new(celeste_core::cart_data::CartData::load(root.join("cart"))?);
+    let cart_data = std::sync::Arc::new(s.cart_data_in(root)?);
     let (rx, ry) = s.room;
     let cache = std::sync::Arc::new(celeste_core::collision_cache::CollisionCache::new(&cart_data, rx, ry)?);
     it.cache = Some(cache.clone());

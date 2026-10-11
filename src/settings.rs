@@ -56,6 +56,9 @@ pub struct Settings {
     pub loading_jank: Option<usize>,
     /// The balloons' fixed phases (`--balloon-seeds`).
     pub balloon_seeds: Option<String>,
+    /// The map and sprite flags of this PICO-8 cartridge instead of cart/
+    /// (`--cart`, a map mod; recorded by its content hash).
+    pub cart: Option<CartFile>,
     // NOT recorded.
     /// The level -1 filter `(H, S)`, H in search steps (`--level-minus-one`;
     /// the tree records it as `TreeFilter`).
@@ -70,6 +73,30 @@ pub struct Settings {
     /// these, loudly (`--override-settings`).
     pub override_settings: bool,
     pub diag: Diagnostics,
+}
+
+/// `--cart FILE.p8`: the cartridge whose `__map__`, `__gfx__` (map rows
+/// 32-63) and `__gff__` the run reads instead of cart/*.txt
+/// (`CartData::from_p8`), and its content hash (SHA-256, as `sha256sum`
+/// prints it), which the tree records. Only the map and the flags are read:
+/// the traced Lua stays lua/celeste-minimal.lua (plans/map-mod.md: a mod's
+/// own Lua is diffed with `tools/p8.py luadiff`, never run by the search).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CartFile {
+    pub path: PathBuf,
+    pub sha256: String,
+}
+
+impl CartFile {
+    /// The file and its hash; it must parse as a cart.
+    pub fn open(path: &Path) -> Result<Self> {
+        use sha2::Digest;
+        let bytes = std::fs::read(path).with_context(|| format!("--cart {}", path.display()))?;
+        let text = std::str::from_utf8(&bytes).with_context(|| format!("--cart {}: not a text cartridge (.p8; a .p8.png is not read)", path.display()))?;
+        celeste_core::cart_data::CartData::from_p8(text).with_context(|| format!("--cart {}", path.display()))?;
+        let sha256 = sha2::Sha256::digest(&bytes).iter().map(|b| format!("{b:02x}")).collect();
+        Ok(CartFile { path: path.to_path_buf(), sha256 })
+    }
 }
 
 /// Self-checks, logs and dumps: none changes a result.
@@ -105,6 +132,7 @@ impl Default for Settings {
             gemskip: false,
             loading_jank: None,
             balloon_seeds: None,
+            cart: None,
             level_minus_one: None,
             concrete_balloon_seeds: None,
             threads: None,
@@ -148,10 +176,30 @@ impl Settings {
         self.level_minus_one.map(|(h, speed)| crate::frame::MinusOne { h, speed })
     }
 
+    /// The run's map and sprite flags: `--cart`'s cartridge (refused if
+    /// the file changed since the run started), else `root`/cart/*.txt.
+    pub fn cart_data_in(&self, root: &Path) -> Result<celeste_core::cart_data::CartData> {
+        match &self.cart {
+            None => celeste_core::cart_data::CartData::load(root.join("cart")),
+            Some(c) => {
+                let now = CartFile::open(&c.path)?;
+                anyhow::ensure!(now.sha256 == c.sha256, "--cart {}: the file changed during the run (sha256 {} at the start, {} now)", c.path.display(), c.sha256, now.sha256);
+                celeste_core::cart_data::CartData::load_p8(&c.path)
+            }
+        }
+    }
+
+    /// `cart_data_in` from the working directory (the repo root).
+    pub fn cart_data(&self) -> Result<celeste_core::cart_data::CartData> {
+        self.cart_data_in(Path::new("."))
+    }
+
     /// The record's lines, `(key, value)`, in a fixed order: what changes a
-    /// tree. `level`: the tree's level spec.
+    /// tree. `level`: the tree's level spec. `cart` only under `--cart`: a
+    /// record without it is the original map (every tree before the flag).
     fn recorded(&self, level: &str) -> Vec<(&'static str, String)> {
         let opt = |v: Option<String>| v.unwrap_or_else(|| "none".to_string());
+        let cart = self.cart.as_ref().map(|c| ("cart", format!("sha256:{}", c.sha256)));
         vec![
             ("room", format!("{},{}", self.room.0, self.room.1)),
             ("win_at", opt(self.win_at.map(|(x0, x1, y0, y1)| format!("{x0}..{x1},{y0}..{y1}")))),
@@ -165,6 +213,9 @@ impl Settings {
             ("balloon_seeds", opt(self.balloon_seeds.clone())),
             ("level", level.to_string()),
         ]
+        .into_iter()
+        .chain(cart)
+        .collect()
     }
 
     /// What the cart (so the kernels and the level -1 table) is a function
@@ -327,6 +378,12 @@ pub struct SettingsArgs {
     /// The start room's balloons' phases fixed, "s1,s2,..".
     #[arg(long, global = true)]
     pub balloon_seeds: Option<String>,
+    /// A map mod: the map and sprite flags of this PICO-8 text cartridge
+    /// (.p8: `__map__`, `__gfx__` rows 64-127, `__gff__`) instead of
+    /// cart/*.txt. The tree records its SHA-256. The Lua stays the minimal
+    /// cart's (plans/map-mod.md).
+    #[arg(long, global = true)]
+    pub cart: Option<PathBuf>,
     /// The balloons' phases of the concrete phase only (a tasdatabase file's
     /// seeds): the witness is one real run under them.
     #[arg(long, global = true)]
@@ -402,6 +459,7 @@ impl SettingsArgs {
             None => None,
         };
         anyhow::ensure!(self.threads != Some(0), "--threads 0");
+        let cart = self.cart.as_deref().map(CartFile::open).transpose()?;
         Ok(Settings {
             room: self.room,
             win_at: self.win_at,
@@ -413,6 +471,7 @@ impl SettingsArgs {
             gemskip: self.gemskip,
             loading_jank,
             balloon_seeds: self.balloon_seeds.clone(),
+            cart,
             level_minus_one,
             concrete_balloon_seeds: self.concrete_balloon_seeds.clone(),
             threads: self.threads,
@@ -528,6 +587,7 @@ pub fn startup(args: &SettingsArgs, adjust: impl FnOnce(&mut Settings)) -> Resul
     note("--gemskip", s.gemskip, String::new());
     note("--loading-jank ", s.loading_jank.is_some(), format!("{}", s.loading_jank.unwrap_or_default()));
     note("--balloon-seeds ", s.balloon_seeds.is_some(), s.balloon_seeds.clone().unwrap_or_default());
+    note("--cart ", s.cart.is_some(), s.cart.as_ref().map_or(String::new(), |c| format!("{} (sha256 {})", c.path.display(), c.sha256)));
     note("--concrete-balloon-seeds ", s.concrete_balloon_seeds.is_some(), s.concrete_balloon_seeds.clone().unwrap_or_default());
     note("--level-minus-one ", s.level_minus_one.is_some(), s.level_minus_one.map_or(String::new(), |(h, v)| format!("{h},{v}")));
     note("--threads ", s.threads.is_some(), format!("{}", s.threads.unwrap_or_default()));
@@ -573,6 +633,11 @@ mod tests {
             assert!(parse(bad).is_err(), "{bad:?}");
         }
         assert_eq!(parse(&["--region", "off"]).expect("off").region, None);
+        // `--cart`: the file's SHA-256; a file that is not a .p8 is refused.
+        let root = concat!(env!("CARGO_MANIFEST_DIR"));
+        let c = parse(&["--cart", &format!("{root}/test-fixtures/celeste-original-data.p8")]).expect("--cart").cart.expect("a cart");
+        assert_eq!(c.sha256.len(), 64);
+        assert!(parse(&["--cart", &format!("{root}/cart/map-data.txt")]).is_err(), "not a .p8");
     }
 
     /// The record round-trips; every differing setting is named; a tree
@@ -602,6 +667,17 @@ mod tests {
         Settings { override_settings: true, ..grid.clone() }.check_at(&dir, "r0sxhf").expect("the grid overridden");
         let e = Settings { override_settings: true, hundred: false, ..grid }.check_at(&dir, "r0sxhf").expect_err("a category is not overridable").to_string();
         assert!(e.contains("hundred: the tree's 1, this run's 0") && e.contains("region:"), "{e}");
+        // `--cart`: a tree of the original map (no `cart` line) is refused
+        // under a cart, and a cart's tree under another cart or none.
+        let cart = |h: &str| Settings { cart: Some(CartFile { path: "mod.p8".into(), sha256: h.repeat(64) }), ..sample.clone() };
+        let e = cart("a").check_at(&dir, "r0sxhf").expect_err("a mod against the original's tree").to_string();
+        assert!(e.contains("cart: the tree's (missing), this run's sha256:aaaa"), "{e}");
+        std::fs::write(path(&dir), cart("a").text("r0sxhf")).expect("write");
+        cart("a").check_at(&dir, "r0sxhf").expect("the same cart");
+        assert!(cart("b").check_at(&dir, "r0sxhf").expect_err("another cart").to_string().contains("cart: the tree's sha256:aaaa"));
+        assert!(sample.check_at(&dir, "r0sxhf").expect_err("no cart").to_string().contains("cart: in the tree's record, not a setting"));
+        assert_ne!(cart("a").cart_key(), sample.cart_key(), "the level -1 table's key");
+        std::fs::write(path(&dir), sample.text("r0sxhf")).expect("write");
         // A record from before the storage side was fixed: `storage_region 8`
         // is accepted, another side is not.
         for (side, ok) in [("8", true), ("16", false)] {

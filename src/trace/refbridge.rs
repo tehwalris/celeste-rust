@@ -325,9 +325,9 @@ impl ToBlock<'_> {
 
 /// A reference state as a one-lane block in canonical cell order (no row
 /// keys: `frame::Block::canonical` makes them canonical; a tree keys them).
-/// `room`: the search's start room (the block's cart and collision cache).
-pub fn to_block(st: &State<RefDomain>, room: (i16, i16)) -> Result<Rt2> {
-    let (cart, cache) = crate::compiled::room_context(room)?;
+/// `s`: the search's settings (its start room's cart and collision cache).
+pub fn to_block(st: &State<RefDomain>, s: &crate::settings::Settings) -> Result<Rt2> {
+    let (cart, cache) = crate::compiled::room_context(s)?;
     let rt2 = Rt2::empty(1, gen::GLOBAL_NAMES.len(), gen::STRINGS, cart, cache);
     let mut cx = ToBlock { st, rt2, memo_t: HashMap::new(), memo_c: HashMap::new(), memo_b: HashMap::new() };
     for (name, v) in &st.heap.tables[&st.globals].hash {

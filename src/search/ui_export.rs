@@ -685,8 +685,9 @@ fn write_marks_bin(path: &Path, marks: &[(u32, u32, u32)], b: &Box2) -> Result<(
     std::fs::write(path, &w.buf).with_context(|| format!("writing {}", path.display()))
 }
 
-fn room_tiles(room: (i16, i16)) -> Result<Tiles> {
-    let cart = celeste_core::cart_data::CartData::load("cart").context("loading cart/ (run from the repo root)")?;
+fn room_tiles(s: &crate::settings::Settings) -> Result<Tiles> {
+    let room = s.room;
+    let cart = s.cart_data().context("loading the cart (cart/: run from the repo root)")?;
     let grid = cart.map_grid();
     // The start room and the one to its right (where the exit lands).
     let (w, h) = (32u32, 16u32);
@@ -845,9 +846,10 @@ pub fn update_paths(out: &Path, paths: Paths) -> Result<()> {
 }
 
 /// The export. `checkpoint_dir` is a search's (`levelNN/` under it) or one
-/// forward's tree; `room` the start room it ran from; `arc` its `search
-/// --save-marks` directory.
-pub fn export(checkpoint_dir: &Path, log_path: &Path, out: &Path, room: (i16, i16), arc: Option<&Path>, paths: Paths) -> Result<()> {
+/// forward's tree; `s` the settings it ran under (its start room, its
+/// cart); `arc` its `search --save-marks` directory.
+pub fn export(checkpoint_dir: &Path, log_path: &Path, out: &Path, s: &crate::settings::Settings, arc: Option<&Path>, paths: Paths) -> Result<()> {
+    let room = s.room;
     let text = std::fs::read_to_string(log_path).with_context(|| format!("reading {}", log_path.display()))?;
     let (levels, h, wall_s, mut optimal) = parse_log(&text)?;
     let search = checkpoint_dir.join("level00").exists();
@@ -979,7 +981,7 @@ pub fn export(checkpoint_dir: &Path, log_path: &Path, out: &Path, room: (i16, i1
         format: 1,
         room,
         cell_box,
-        tiles: room_tiles(room)?,
+        tiles: room_tiles(s)?,
         wall_s,
         prebuild_s: None,
         optimal,

@@ -80,7 +80,7 @@ struct File13 {
     wins: Vec<(u32, u32)>,
 }
 
-fn load13(path: &Path, room: (i16, i16)) -> Result<File13> {
+fn load13(path: &Path, s: &crate::settings::Settings) -> Result<File13> {
     let bytes = std::fs::read(path)?;
     ensure!(bytes.len() >= 16 && &bytes[0..4] == MAGIC, "bad magic");
     let version = u32::from_le_bytes(bytes[4..8].try_into().unwrap());
@@ -97,7 +97,7 @@ fn load13(path: &Path, room: (i16, i16)) -> Result<File13> {
         data.get(b..b + n).ok_or_else(|| anyhow!("truncated data region"))
     };
     let u32_at = |off: u64, row: usize, n: usize, k: usize| -> Result<u32> { Ok(u32::from_le_bytes(at(off, row, n)?[k..k + 4].try_into().unwrap())) };
-    let (cart, cache) = crate::compiled::room_context(room)?;
+    let (cart, cache) = crate::compiled::room_context(s)?;
     let mut rt2 = Rt2::empty(w, h.globals.len(), &[], cart, cache);
     rt2.structure = h.structure;
     rt2.globals = h.globals;
@@ -178,11 +178,12 @@ pub struct Report {
 
 /// Convert every format-13 tree under `dir` (a level's tree, a search's
 /// checkpoint dir, or any dir holding them) to format 14 in place, each
-/// checked as above, against the room its `settings.txt` records (`room`
-/// for a tree without one: a wrong room fails the check). Refuses a dir
-/// holding any other format, and a leftover conversion file, before
-/// touching anything.
-pub fn convert(dir: &Path, room: (i16, i16), threads: usize) -> Result<Report> {
+/// checked as above, against the room its `settings.txt` records (`s.room`
+/// for a tree without one: a wrong room fails the check) and the run's cart
+/// (`--cart`: a tree recording a cart must be converted under that cart).
+/// Refuses a dir holding any other format, and a leftover conversion file,
+/// before touching anything.
+pub fn convert(dir: &Path, s: &crate::settings::Settings, threads: usize) -> Result<Report> {
     let mut files = Vec::new();
     walk(dir, &mut files)?;
     files.sort();
@@ -211,8 +212,9 @@ pub fn convert(dir: &Path, room: (i16, i16), threads: usize) -> Result<Report> {
     let in_tree = |p: &Path| frames.keys().filter(|t| p.starts_with(t)).max_by_key(|t| t.as_os_str().len()).cloned();
     for (tree, (last, paths)) in &frames {
         let mine: Vec<&PathBuf> = values.iter().filter(|p| in_tree(p).as_ref() == Some(tree)).collect();
-        let room = tree_room(tree)?.unwrap_or(room);
-        convert_tree(tree, *last, paths, &mine, room, threads, &mut r).with_context(|| format!("{}: left at format {FROM}", tree.display()))?;
+        tree_cart_matches(tree, s)?;
+        let ts = crate::settings::Settings { room: tree_room(tree)?.unwrap_or(s.room), ..s.clone() };
+        convert_tree(tree, *last, paths, &mine, &ts, threads, &mut r).with_context(|| format!("{}: left at format {FROM}", tree.display()))?;
         r.trees += 1;
     }
     for p in values.iter().filter(|p| in_tree(p).is_none()) {
@@ -231,7 +233,17 @@ fn tree_room(tree: &Path) -> Result<Option<(i16, i16)>> {
     Ok(Some((x.trim().parse()?, y.trim().parse()?)))
 }
 
-fn convert_tree(tree: &Path, last: u32, paths: &[PathBuf], values: &[&PathBuf], room: (i16, i16), threads: usize, r: &mut Report) -> Result<()> {
+/// A tree that records a cart (`cart sha256:..`) converts only under that
+/// cart (`--cart`), one without only without.
+fn tree_cart_matches(tree: &Path, s: &crate::settings::Settings) -> Result<()> {
+    let text = std::fs::read_to_string(crate::settings::path(tree)).unwrap_or_default();
+    let recorded = text.lines().find_map(|l| l.strip_prefix("cart ")).map(str::to_string);
+    let mine = s.cart.as_ref().map(|c| format!("sha256:{}", c.sha256));
+    ensure!(recorded == mine, "{}: the tree's cart {} but this run's {} (give the tree's `--cart FILE.p8`)", tree.display(), recorded.as_deref().unwrap_or("is the original"), mine.as_deref().unwrap_or("is the original"));
+    Ok(())
+}
+
+fn convert_tree(tree: &Path, last: u32, paths: &[PathBuf], values: &[&PathBuf], s: &crate::settings::Settings, threads: usize, r: &mut Report) -> Result<()> {
     // Its metadata first (the decode reads it at the new version); put back
     // on any failure.
     for p in values {
@@ -259,7 +271,7 @@ fn convert_tree(tree: &Path, last: u32, paths: &[PathBuf], values: &[&PathBuf], 
                         loop {
                             let i = next.fetch_add(1, Ordering::Relaxed);
                             let Some(p) = paths.get(i) else { return Ok(acc) };
-                            let (n, b, a) = convert_file(p, &resolver, room).with_context(|| p.display().to_string())?;
+                            let (n, b, a) = convert_file(p, &resolver, s).with_context(|| p.display().to_string())?;
                             acc = (acc.0 + n, acc.1 + b, acc.2 + a);
                         }
                     })
@@ -288,8 +300,8 @@ fn cv_path(p: &Path) -> PathBuf {
 
 /// One frame file to its checked v14 replacement beside it (`cv-`):
 /// `(rows, bytes before, bytes after)`.
-fn convert_file(p: &Path, resolver: &Resolver, room: (i16, i16)) -> Result<(usize, u64, u64)> {
-    let old = load13(p, room)?;
+fn convert_file(p: &Path, resolver: &Resolver, s: &crate::settings::Settings) -> Result<(usize, u64, u64)> {
+    let old = load13(p, s)?;
     let w = old.ids.len();
     for (r, &id) in old.ids.iter().enumerate() {
         let (shape, key, cell) = resolver.resolve(id)?;
@@ -308,7 +320,7 @@ fn convert_file(p: &Path, resolver: &Resolver, room: (i16, i16)) -> Result<(usiz
     crate::search::checkpoint::save_block(&cv, &old.rt2, &old.ids, &old.cells, &wins)?;
     let new = FrameFile::open(&cv)?;
     ensure!(new.ids() == old.ids && new.win_rows() == old.wins.as_slice(), "the new file's ids or win rows differ");
-    let back = new.load_all(room, resolver)?.ok_or_else(|| anyhow!("no rows decoded"))?;
+    let back = new.load_all(s, resolver)?.ok_or_else(|| anyhow!("no rows decoded"))?;
     if let Some(d) = block_diff(&old.rt2, &back) {
         bail!("a decoded row differs from the stored one: {d}");
     }

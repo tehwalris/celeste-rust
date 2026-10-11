@@ -13,6 +13,11 @@
 -- CELIA_JANK_OFFSET (Celia's loading-jank offset, default 0: key A);
 -- CELIA_TRACE=1: one "[trace]" line per frame of the playback (the player
 -- and every object with a phase), to compare with pico8_diff/replay.py.
+-- CELIA_FULLGAME=1: Celia's full-game playback instead (cctas Shift+N: the
+-- boot, then each level's TAS<n>.tas as the level is reached): "[celia]
+-- EXIT level <n> frames <c> time <m:s.f>" per level (c: Celia's own count,
+-- the tasdatabase's), then "[celia] FULLGAME ..." (or DIED / STOPPED).
+-- CELIA_FULLGAME_LEVELS=N: done after N levels.
 local D = {t = 0, phase = "start", n = tonumber(os.getenv("CELIA_LEVEL"))}
 
 local function name_of(o)
@@ -37,10 +42,50 @@ local function trace()
   print(line)
 end
 
+local function clock(cart)
+  if type(cart.minutes) == "number" and type(cart.seconds) == "number" and type(cart.frames) == "number" then
+    return string.format("%02d:%02d.%03d", cart.minutes, cart.seconds, math.floor(cart.frames / 30 * 1000))
+  end
+  return "?"
+end
+
+local function fullgame()
+  local tas, cart = D.tas, pico8.cart
+  if D.phase == "start" then
+    if os.getenv("CELIA_DASHES") then tas.max_djump_overload = tonumber(os.getenv("CELIA_DASHES")) end
+    tas:begin_full_game_playback()
+    D.phase, D.level, D.deaths, D.done, D.fc = "full", tas:get_file_level_index(), pico8.cart.deaths, 0, 0
+    D.want = tonumber(os.getenv("CELIA_FULLGAME_LEVELS") or "")
+    print("[celia] full game from level " .. D.level .. " (" .. #tas.keystates .. " inputs in its file)")
+    return
+  end
+  local lvl = tas:get_file_level_index()
+  if cart.deaths ~= D.deaths then
+    print("[celia] DIED in level " .. lvl .. " at frame " .. tas:frame_count())
+    love.event.quit(); D.phase = "done"; return
+  end
+  if lvl ~= D.level then
+    D.done = D.done + 1
+    -- cctas:step resets the level's count on the change: the last one seen.
+    print("[celia] EXIT level " .. D.level .. " frames " .. D.fc .. " time " .. clock(cart))
+    D.level = lvl
+    if D.want and D.done >= D.want then
+      print("[celia] FULLGAME " .. D.done .. " levels, time " .. clock(cart))
+      love.event.quit(); D.phase = "done"; return
+    end
+  end
+  D.fc = tas:frame_count()
+  if not tas.full_game_playback or tas:frame_count() > #tas.keystates + 60 then
+    print("[celia] STOPPED in level " .. lvl .. " after " .. D.done .. " exits (no exit within 60 frames after its file's " .. #tas.keystates .. " inputs), time " .. clock(cart))
+    love.event.quit(); D.phase = "done"
+  end
+end
+
 function D.tick()
   D.t = D.t + 1
   local tas = D.tas
   if D.t < 5 or tas == nil then return end
+  if os.getenv("CELIA_FULLGAME") then return fullgame() end
   if D.phase == "start" then
     if os.getenv("CELIA_DASHES") then tas.max_djump_overload = tonumber(os.getenv("CELIA_DASHES")) end
     for _ = 1, D.n - 1 do tas:next_level() end

@@ -48,10 +48,20 @@ DUMP_GLOBALS = ["max_djump", "deaths", "freeze", "shake", "has_dashed", "has_key
 OBJECT_TILES = {1: True, 8: True, 11: True, 12: True, 18: True, 20: True, 22: True, 23: True, 26: True, 28: True, 64: True, 96: True, 86: False, 118: False}
 
 
-def minimal_jank(room, j):
+def cart_data(cart=None):
+    """(map, flags): the .p8's at path `cart` (a map mod: p8cart.py, the
+    search's `--cart`), else the original's (cart/*.txt)."""
+    if cart:
+        import p8cart
+        c = p8cart.Cart(cart)
+        return c.map, c.flags
+    return hexbytes(os.path.join(ROOT, "cart", "map-data.txt"), 8192), hexbytes(os.path.join(ROOT, "cart", "flag-data.txt"), 256)
+
+
+def minimal_jank(room, j, cart=None):
     """The minimal cart's index of the original cart's J-th object (the
     loading frame's first, `--jank`): one past the minimal objects before it."""
-    m = hexbytes(os.path.join(ROOT, "cart", "map-data.txt"), 8192)
+    m = cart_data(cart)[0]
     tiles = [m[(room[1] * 16 + ty) * 128 + room[0] * 16 + tx] for tx in range(16) for ty in range(16)]
     objs = [OBJECT_TILES[t] for t in tiles if t in OBJECT_TILES]
     return 1 + sum(objs[:j - 1])
@@ -61,7 +71,7 @@ def lua_list(xs):
     return "{" + ",".join(str(v) for v in xs) + "}"
 
 
-def build_cart(inputs, frames, out, lua_path=None, begin_game=False, room=None, balloon_seeds=None, one_dash=False, segments=None, jank=None, dump=False, trace_objects=False, load_draw=False):
+def build_cart(inputs, frames, out, lua_path=None, begin_game=False, room=None, balloon_seeds=None, one_dash=False, segments=None, jank=None, dump=False, trace_objects=False, load_draw=False, cart=None, max_djump=None):
     """`segments` (the CHAIN mode, pico8_diff/chain.py): [(room, seeds,
     inputs), ...] played in order from the first room's load THROUGH THE
     REAL ROOM TRANSITIONS, each segment's inputs from the frame its player is
@@ -73,7 +83,11 @@ def build_cart(inputs, frames, out, lua_path=None, begin_game=False, room=None, 
     (after its loading frame), as `@P8@ dump` lines. `trace_objects`: every
     object (index, type, position, remainder, phase fields) on the frame
     lines. `load_draw`: the start load's frame draws (no object updated): the
-    game's boot, where begin_game runs inside the title screen's `_update`."""
+    game's boot, where begin_game runs inside the title screen's `_update`.
+    `cart`: a .p8 whose map and flags replace cart/*.txt (a map mod; its Lua
+    is `lua_path`'s, e.g. `p8cart.py extract`'s game.lua). `max_djump`: the
+    start room's dashes instead of the original's orb rule (a mod's orb room
+    may be elsewhere)."""
     lua = open(lua_path or os.path.join(ROOT, "lua", "celeste-minimal.lua")).read()
     if segments is not None:
         balloon_seeds = []
@@ -105,8 +119,13 @@ def build_cart(inputs, frames, out, lua_path=None, begin_game=False, room=None, 
     # facing, the driver prints it on the frame's line and clears it. A global
     # write only: nothing the game reads.
     pat = "local v_input=(btn(k_up) and -1 or (btn(k_down) and 1 or 0))"
-    assert lua.count(pat) == 1, f"expected exactly one {pat!r} (the dash branch) in the Lua"
-    lua = lua.replace(pat, pat + " __dash_start={input,v_input,this.flip.x}")
+    if cart and lua.count(pat) != 1:
+        # A mod's Lua may spell it otherwise (`btn(2)`): the dash notes are
+        # information only.
+        print(f"[replay] the mod's Lua has no {pat!r}: no dash notes", file=sys.stderr)
+    else:
+        assert lua.count(pat) == 1, f"expected exactly one {pat!r} (the dash branch) in the Lua"
+        lua = lua.replace(pat, pat + " __dash_start={input,v_input,this.flip.x}")
     if room is not None:
         # The minimal cart's _init loads room (1,0); the search patches the
         # same call (celeste-interp game_runner) to start elsewhere. The
@@ -118,9 +137,10 @@ def build_cart(inputs, frames, out, lua_path=None, begin_game=False, room=None, 
         # the second dash: max_djump=2 (celeste-interp game_runner, the same).
         # --one-dash: the gemskip categories skip the orb, one dash throughout.
         orb = "max_djump=2 " if room[0] % 8 + room[1] * 8 > 21 and not one_dash else ""
+        if max_djump is not None:
+            orb = f"max_djump={max_djump} "
         lua = lua.replace(pat, f"{orb}load_room({room[0]}, {room[1]})")
-    map_data = hexbytes(os.path.join(ROOT, "cart", "map-data.txt"), 8192)
-    flags = hexbytes(os.path.join(ROOT, "cart", "flag-data.txt"), 256)
+    map_data, flags = cart_data(cart)
     prelude = [
         "__begin_game = " + ("true" if begin_game else "false"),
         # The interpreter's hooks: the interval splitter (identity on a
@@ -221,7 +241,7 @@ def build_cart(inputs, frames, out, lua_path=None, begin_game=False, room=None, 
         "if __begin_game then begin_game() end",
     ]
     if jank is not None and lua_path is None:
-        jank = minimal_jank(room or (1, 0), jank)
+        jank = minimal_jank(room or (1, 0), jank, cart)
     if jank is not None:
         # The jank model: the loading frame of a real transition. The rest
         # of `_update`'s `foreach` runs over the new room from the leaving
@@ -382,6 +402,8 @@ def main():
     ap.add_argument("--jank", type=int, help="the start room's loading frame from object J on (the jank model: a real transition's, Celia's IL load)")
     ap.add_argument("--dump", action="store_true", help="dump the start state (globals, every object's fields) before frame 1")
     ap.add_argument("--trace-objects", action="store_true", help="every object's position, remainder and phase on each frame line")
+    ap.add_argument("--cart", help="a map mod's .p8: its map and sprite flags instead of cart/*.txt (the Lua stays --lua's)")
+    ap.add_argument("--max-djump", type=int, help="the start room's dashes (default: the original's orb rule, 2 past level 22; a mod may move its orb)")
     args = ap.parse_args()
     if args.inputs:
         inputs = [int(x) for x in args.inputs.split(",")]
@@ -393,7 +415,7 @@ def main():
     seeds = [float(v) for v in args.balloon_seeds.split(",") if v] if args.balloon_seeds is not None else None
     try:
         lines = run(inputs, args.frames or len(inputs), args.keep, lua_path=args.lua, begin_game=args.begin_game, room=room, balloon_seeds=seeds,
-                     one_dash=args.one_dash, jank=args.jank, dump=args.dump, trace_objects=args.trace_objects)
+                     one_dash=args.one_dash, jank=args.jank, dump=args.dump, trace_objects=args.trace_objects, cart=args.cart, max_djump=args.max_djump)
     except NoCartOutput as e:
         sys.exit(f"[replay] {e}")
     for l in lines:

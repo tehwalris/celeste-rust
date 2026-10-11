@@ -187,9 +187,9 @@ impl Capture {
 
 /// The replay's row of a state: 16 numbers (the key's words and the cell),
 /// in a synthetic block of the shape.
-fn bench_skeleton(shape: u64, room: (i16, i16)) -> celeste_engine::runtime2::Rt2 {
+fn bench_skeleton(shape: u64, s: &crate::settings::Settings) -> celeste_engine::runtime2::Rt2 {
     use celeste_engine::runtime2::{Cell2, Col, Rt2};
-    let (cart, cache) = crate::compiled::room_context(room).expect("the room's cart");
+    let (cart, cache) = crate::compiled::room_context(s).expect("the room's cart");
     let mut b = Rt2::empty(0, 0, &[], cart, cache);
     b.structure = vec![Cell2::Val; 16];
     b.cols = (0..16).map(|_| Col::N(Vec::new())).collect();
@@ -272,7 +272,7 @@ pub fn bench_storage(a: &BenchArgs) -> Result<()> {
                             let Some(&ui) = order.get(i) else { break };
                             let u = &cap.units[ui];
                             sink.begin(u.unit, u.block, u.lo as usize, &u.sources, None, None, u.old);
-                            replay_unit(&mut sink, cap, u, &mut xmap[u.stream], a.settings.room)?;
+                            replay_unit(&mut sink, cap, u, &mut xmap[u.stream], a.settings)?;
                             sink.end()?;
                         }
                         sink.finish()?;
@@ -371,7 +371,7 @@ pub fn edge_fingerprint(edges_dir: &Path, frame: u32, xfers: &super::edges::Xfer
 
 /// Replay one unit's records into the sink (`xmap`: the stream's transfer
 /// ids as the sink's, filled on first use).
-fn replay_unit(sink: &mut UnitSink, cap: &Capture, u: &CapUnit, xmap: &mut Vec<u32>, room: (i16, i16)) -> Result<()> {
+fn replay_unit(sink: &mut UnitSink, cap: &Capture, u: &CapUnit, xmap: &mut Vec<u32>, s: &crate::settings::Settings) -> Result<()> {
     let b = &cap.maps[u.stream][u.records.clone()];
     let u32_at = |o: usize| u32::from_le_bytes(b[o..o + 4].try_into().unwrap());
     let u64_at = |o: usize| u64::from_le_bytes(b[o..o + 8].try_into().unwrap());
@@ -410,7 +410,7 @@ fn replay_unit(sink: &mut UnitSink, cap: &Capture, u: &CapUnit, xmap: &mut Vec<u
             }
             xmap[x as usize]
         });
-        sink.emit(shape, cell, key, u.lo as usize + lane as usize, xfer, || bench_skeleton(shape, room), |buf| push_bench_row(buf, key, cell))?;
+        sink.emit(shape, cell, key, u.lo as usize + lane as usize, xfer, || bench_skeleton(shape, s), |buf| push_bench_row(buf, key, cell))?;
     }
     Ok(())
 }
