@@ -148,7 +148,7 @@ In this order (each step its own commit, t0/t1 each, t2 at the end):
 9. **J2's rest**: sweep the disk for format-13 trees, then `convert-tree`
    and storage/convert.rs go; `edge-census` as the edge owner decides;
    `spurious --chain-out` with `trajectory --spec/--tree`.
-10. **J10** (the UI) once Philippe has answered the questions below.
+10. **J10** (the UI): PARKED. Philippe (2026-10-11): "I don't really want to change much for now." Keep the UI as is; only keep it working (exports from the current search records).
 
 ### J10: questions for Philippe
 
