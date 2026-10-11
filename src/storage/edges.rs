@@ -659,6 +659,19 @@ impl EdgeStore {
         Ok(EdgeStore { frames, xfers, edges, bytes })
     }
 
+    /// Advise the kernel how the mapped files will be read: `Random` (no
+    /// read-ahead) for the backward's scattered in-edge reads, `Normal` for
+    /// the scans.
+    pub fn advise(&self, advice: memmap2::Advice) -> Result<()> {
+        for f in self.frames.iter().flatten() {
+            f.map.advise(advice)?;
+            for b in f.blocks.iter().flatten() {
+                b.advise(advice)?;
+            }
+        }
+        Ok(())
+    }
+
     /// The transfer of global id `xfer`.
     pub fn pair(&self, xfer: u32) -> Option<Pair> {
         self.xfers.get(xfer as usize).copied()

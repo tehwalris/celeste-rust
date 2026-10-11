@@ -1342,6 +1342,8 @@ pub fn solve(
     let seeds = Seeds::load(dir, horizon)?;
     crate::metrics::mem_phase("arc: edge files opened");
     let tb = std::time::Instant::now();
+    // The backward's reads are scattered: no read-ahead.
+    seeds.store.advise(memmap2::Advice::Random)?;
     let w = backward(&seeds.store, &seeds.pairs, &seeds.wins, horizon, threads);
     crate::metrics::mem_phase("arc: backward");
     let tb = tb.elapsed().as_secs_f64();
@@ -1398,6 +1400,7 @@ pub fn solve(
     let mut arc_marks = want_marks.then(|| Visited::new(resolver.space.clone()));
     if want_marks || save.is_some() {
         let tr = std::time::Instant::now();
+        seeds.store.advise(memmap2::Advice::Normal)?;
         let g = OutGraph::load(&seeds.store, &w, &seeds.win_ids(), horizon, threads)?;
         let tl = tr.elapsed().as_secs_f64();
         crate::metrics::mem_phase("arc: W's out-edges");
