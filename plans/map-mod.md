@@ -273,3 +273,32 @@ reaches) and `search --all-wins FILE` (every concrete win inside W).
 - The beam (`rewrite beam`, branch mod-beam merged here) from the same
   state toward the exit by level -1's d stalls at d 22-25 in the bottom
   pocket (y 110-128) for 30 frames.
+
+### On the new storage: the second half and the waypoints (2026-10-11, develop a4c3dfc merged)
+
+New storage numbers (fm85, fmp95): 11.1 ns an emission (16 threads), edges
+0.06 B (were 3.0), frames ~9 B a state now dominate the disk; the forward's
+anonymous memory is still ~215-295 B a frontier row (the decoded rows):
+RAM, not disk or time, is the limit.
+
+| run (r0sxhe, level -1, balloon seed 0) | target | H | states | forward | peak RSS | disk | verdict |
+|---|---|---|---|---|---|---|---|
+| fm | exit, from mid f142 | 85 | 3.68B | 1112 s | 40.6 GB | 43 GB | REFUTED |
+| fmp, `--prune-rect=-8..63,-16..39` | exit, from mid f142 | 95 | ~8B | 2830 s (+335 s arc) | 78 GB (f77: 351M rows in) | 101 GB | REFUTED (heuristic) |
+| wp | shaft x78-95 y8-23, from mid | 64 | | 121 s | | | REFUTED |
+| wpa | right of the strip, from mid (13 mid states) | 40 | | 12-64 s | | | all REFUTED |
+| far | x 88-95 under the strip, from mid | 30 | | 57 s | | | OPTIMAL +11 (route 153) |
+| cross160 | strip's far side x96-103 y105-120, from load | 160 | | 335 s | 12 GB | | OPTIMAL 157 (252 states f157-160, all djump 0) |
+| bal185 | the balloon x112-121 y96-112, from load | 185 | | 1905 s | 64 GB | 66 GB | REFUTED (remainder-free first win f107) |
+
+- The prune (above the topmost berry, x <= 63, y <= 39) cut 17M of ~8B rows
+  (0.2%): the states do not go back there. Not worth its caveat here.
+- The strip: row 14 (y 112-119) cols 10-11 are up-spikes between the
+  ceiling (row 13, y <= 111) and the floor (row 15): a player crosses at
+  y 109-110 (or moving up) only - a dash along the ceiling. From the mid
+  states it ends at (88,109) on f153 (`mod00-furthest`, replayed on PICO-8
+  with the mod's Lua); the earliest crossing from the load is f157, with
+  the dash spent, falling at ~1.5 px a frame: every such state dies in the
+  pit within 10 frames (`--start-inputs` from it: refuted to +75, the
+  forward empty by +10). The balloon (x >= 113 to touch, the only dash
+  refill and the only way up into the right area) is not reached by f185.
