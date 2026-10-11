@@ -240,9 +240,9 @@ pub(crate) fn write_dicts(t: &[Key], s: &[(u32, Key)], out: &mut Vec<u8>) {
     }
 }
 
-/// Encode `bundles` (distinct, any order; sorted in place) as a raw block
-/// in `order` into `out` (cleared).
-pub fn encode(bundles: &mut [Bundle], order: &[F; 5], out: &mut Vec<u8>) {
+/// Encode `bundles` (distinct, any order) as a raw block in `order` into
+/// `out` (cleared).
+pub fn encode(bundles: &[Bundle], order: &[F; 5], out: &mut Vec<u8>) {
     out.clear();
     let mut t: Vec<Key> = bundles.iter().map(|b| b.t_key).collect();
     t.sort_unstable();
@@ -251,25 +251,22 @@ pub fn encode(bundles: &mut [Bundle], order: &[F; 5], out: &mut Vec<u8>) {
     s.sort_unstable();
     s.dedup();
     write_dicts(&t, &s, out);
-    // The records sorted by the order's fields.
-    let mut recs: Vec<([u64; 5], Ranked)> = bundles
+    // The records sorted by the order's fields (ranks through hash maps:
+    // a dictionary's order is its keys').
+    let t_rank: rustc_hash::FxHashMap<Key, u32> = t.iter().enumerate().map(|(i, &k)| (k, i as u32)).collect();
+    let s_rank: rustc_hash::FxHashMap<(u32, Key), u32> = s.iter().enumerate().map(|(i, &k)| (k, i as u32)).collect();
+    let mut recs: Vec<[u64; 5]> = bundles
         .iter()
         .map(|b| {
-            let r = Ranked {
-                s: s.binary_search(&(b.s_shape, b.s_key)).expect("listed") as u32,
-                t: t.binary_search(&b.t_key).expect("listed") as u32,
-                x: b.x,
-                o: b.o,
-                mask: b.mask,
-            };
-            (order.map(|f| r.field(f)), r)
+            let r = Ranked { s: s_rank[&(b.s_shape, b.s_key)], t: t_rank[&b.t_key], x: b.x, o: b.o, mask: b.mask };
+            order.map(|f| r.field(f))
         })
         .collect();
-    recs.sort_unstable_by_key(|r| r.0);
-    debug_assert!(recs.windows(2).all(|w| w[0].0 != w[1].0), "bundles distinct");
+    recs.sort_unstable();
+    debug_assert!(recs.windows(2).all(|w| w[0] != w[1]), "bundles distinct");
     put_varint(out, recs.len() as u64);
     let mut prev: Option<[u64; 5]> = None;
-    for (vals, _) in &recs {
+    for vals in &recs {
         let l = match prev {
             None => 0,
             Some(p) => (0..5).find(|&i| vals[i] != p[i]).expect("distinct records"),
@@ -286,6 +283,113 @@ pub fn encode(bundles: &mut [Bundle], order: &[F; 5], out: &mut Vec<u8>) {
             }
         }
         prev = Some(*vals);
+    }
+}
+
+/// A bundle as the region phase holds it: its target named by an id (the
+/// region table's entry, whose key the encoder looks up), its source by key.
+#[derive(Clone, Copy, Debug)]
+pub struct Tb {
+    pub t: u32,
+    pub x: u32,
+    pub o: u32,
+    pub s_shape: u32,
+    pub s_key: Key,
+    pub mask: u64,
+}
+
+/// The block encoder of the region phase (`ORDER`, the format `encode`
+/// writes), its scratch reused block to block: targets ranked through a
+/// dense array over their ids, sources through a hash map, the records
+/// sorted as three words.
+#[derive(Default)]
+pub struct Encoder {
+    t_rank: Vec<u32>,
+    tids: Vec<u32>,
+    s_idx: rustc_hash::FxHashMap<(u32, Key), u32>,
+    s_list: Vec<(u32, Key)>,
+    s_perm: Vec<u32>,
+    item_s: Vec<u32>,
+    recs: Vec<[u64; 3]>,
+}
+
+const _: () = assert!(matches!(ORDER, [F::M, F::O, F::X, F::S, F::T]), "Encoder packs ORDER's fields");
+
+impl Encoder {
+    /// `items` (distinct) as a raw block in `ORDER` into `out` (cleared):
+    /// target ids below `n_ids`, their keys `t_key(id)`.
+    pub fn encode(&mut self, items: &[Tb], n_ids: usize, t_key: impl Fn(u32) -> Key, out: &mut Vec<u8>) {
+        out.clear();
+        if self.t_rank.len() < n_ids {
+            self.t_rank.resize(n_ids, u32::MAX);
+        }
+        // The targets: distinct ids, sorted by key.
+        self.tids.clear();
+        for it in items {
+            if self.t_rank[it.t as usize] == u32::MAX {
+                self.t_rank[it.t as usize] = 0;
+                self.tids.push(it.t);
+            }
+        }
+        let mut tk: Vec<(Key, u32)> = self.tids.iter().map(|&t| (t_key(t), t)).collect();
+        tk.sort_unstable();
+        for (r, &(_, t)) in tk.iter().enumerate() {
+            self.t_rank[t as usize] = r as u32;
+        }
+        // The sources: distinct, numbered as met, then by key.
+        self.s_idx.clear();
+        self.s_list.clear();
+        self.item_s.clear();
+        for it in items {
+            let n = self.s_list.len() as u32;
+            let k = *self.s_idx.entry((it.s_shape, it.s_key)).or_insert(n);
+            if k == n {
+                self.s_list.push((it.s_shape, it.s_key));
+            }
+            self.item_s.push(k);
+        }
+        let mut order: Vec<u32> = (0..self.s_list.len() as u32).collect();
+        order.sort_unstable_by_key(|&i| self.s_list[i as usize]);
+        self.s_perm.clear();
+        self.s_perm.resize(order.len(), 0);
+        for (r, &i) in order.iter().enumerate() {
+            self.s_perm[i as usize] = r as u32;
+        }
+        let t: Vec<Key> = tk.iter().map(|x| x.0).collect();
+        let s: Vec<(u32, Key)> = order.iter().map(|&i| self.s_list[i as usize]).collect();
+        write_dicts(&t, &s, out);
+        // The records: [mask, o << 32 | x, s << 32 | t], sorted.
+        self.recs.clear();
+        for (it, &si) in items.iter().zip(&self.item_s) {
+            self.recs.push([it.mask, (it.o as u64) << 32 | it.x as u64, (self.s_perm[si as usize] as u64) << 32 | self.t_rank[it.t as usize] as u64]);
+        }
+        for &t in &self.tids {
+            self.t_rank[t as usize] = u32::MAX;
+        }
+        self.recs.sort_unstable();
+        debug_assert!(self.recs.windows(2).all(|w| w[0] != w[1]), "bundles distinct");
+        put_varint(out, self.recs.len() as u64);
+        let split = |r: &[u64; 3]| [r[0], r[1] >> 32, r[1] & 0xffff_ffff, r[2] >> 32, r[2] & 0xffff_ffff];
+        let mut prev: Option<[u64; 5]> = None;
+        for r in &self.recs {
+            let vals = split(r);
+            let l = match prev {
+                None => 0,
+                Some(p) => (0..5).find(|&i| vals[i] != p[i]).expect("distinct records"),
+            };
+            out.push(l as u8);
+            for i in l..5 {
+                match ORDER[i] {
+                    F::O => put_off(out, vals[i] as u32),
+                    F::M => out.extend_from_slice(&vals[i].to_le_bytes()),
+                    _ => match prev {
+                        Some(p) if i == l => put_varint(out, vals[i] - p[i]),
+                        _ => put_varint(out, vals[i]),
+                    },
+                }
+            }
+            prev = Some(vals);
+        }
     }
 }
 
@@ -444,7 +548,7 @@ mod tests {
         let mut d = zstd::bulk::Decompressor::new().unwrap();
         for order in orders {
             let mut raw = Vec::new();
-            encode(&mut bundles.clone(), &order, &mut raw);
+            encode(&bundles, &order, &mut raw);
             let stored = compress(&raw, &mut z).unwrap();
             let mut back = Vec::new();
             decompress(&stored, raw.len(), &mut d, &mut back).unwrap();
@@ -454,8 +558,20 @@ mod tests {
             got.sort_unstable();
             assert_eq!(got, bundles, "{order:?}");
         }
+        // The region phase's encoder writes what `encode` does.
+        let mut ids: Vec<Key> = bundles.iter().map(|b| b.t_key).collect();
+        ids.sort_unstable();
+        ids.dedup();
+        let items: Vec<Tb> = bundles.iter().map(|b| Tb { t: ids.binary_search(&b.t_key).unwrap() as u32 * 3 + 1, x: b.x, o: b.o, s_shape: b.s_shape, s_key: b.s_key, mask: b.mask }).collect();
+        let (mut a, mut b2) = (Vec::new(), Vec::new());
+        encode(&bundles, &ORDER, &mut a);
+        let mut enc = Encoder::default();
+        for _ in 0..2 {
+            enc.encode(&items, ids.len() * 3 + 1, |t| ids[(t as usize - 1) / 3], &mut b2);
+            assert_eq!(a, b2, "Encoder and encode agree");
+        }
         let mut raw = Vec::new();
-        encode(&mut [], &ORDER, &mut raw);
+        encode(&[], &ORDER, &mut raw);
         let b = Block::open(&raw, &ORDER).unwrap();
         assert!(b.is_empty());
         b.records(|_| panic!("no records")).unwrap();

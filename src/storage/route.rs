@@ -1,18 +1,20 @@
 //! THE ROUTING of a wave's emissions to their TARGET regions, and the
 //! REGION PHASE there (plans/edges-target.md "The forward").
 //!
-//! A unit (a run of frontier rows through the kernels) turns each emission
-//! into a RECORD - the target's key and cell, the source (its index in the
-//! wave's frontier), the transfer - appended to the unit's bucket of the
-//! target's ROUTE (its (shape, region slot): a storage region). At the
-//! unit's end each bucket is a CHUNK for its route. The region phase then
-//! takes the routes, heaviest first, one worker a route: per record ONE
-//! probe of the region's table (the dedup: a cell the entry lacks is a new
-//! state, set at once) and ONE probe and an OR in the route's bundle table
-//! (the edge, `bundle::Bundle`); the route's bundles are encoded into a
-//! SEGMENT of the frame's edge file. No lookup happens in the units, no
-//! state is named by a number, no row is copied: the new layer is decoded
-//! from (shape, key, cell) at the frame's end (`wave`).
+//! A unit (a run of frontier rows through the kernels) ORs each emission
+//! into its BUNDLE (`bundle::Bundle`: source key, transfer, offset, target
+//! key -> target cells) in a unit-local table (`UnitBundles`: one probe and
+//! an OR, in cache), keyed also by the target's ROUTE - its (shape, region
+//! slot): a storage region. An emission without an edge (the reference
+//! engine's) is a bundle of its target alone (`NO_XFER`). At the unit's end
+//! its bundles are the CHUNKS of their routes. The region phase then takes
+//! the routes, heaviest first, one worker a route: per bundle ONE probe of
+//! the region's table (the dedup: the cells the entry lacks are new states,
+//! set at once) and ONE probe and an OR in the route's bundle table (the
+//! edges: units' bundles of one key merge); the route's bundles are encoded
+//! into a SEGMENT of the frame's edge file. No lookup happens in the units,
+//! no state is named by a number, no row is copied: the new layer is
+//! decoded from (shape, key, cell) at the frame's end (`wave`).
 
 use anyhow::{ensure, Result};
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -21,22 +23,10 @@ use std::sync::RwLock;
 use super::bundle::{self, Bundle};
 use super::edges::Segment;
 use super::visited::{Key, RegionTable};
-use super::{Geometry, Sk};
-use celeste_engine::exact::{is_provisional, slot_hash};
+use celeste_engine::exact::is_provisional;
 
-/// One emission's record (24 B): the target's key, its source's index in
-/// the wave's frontier (`Sources`), and `transfer << 8 | target cell in its
-/// region` - the transfer the worker's local id (`NO_XFER`: no edge, the
-/// reference engine's emissions).
-#[derive(Clone, Copy, Debug)]
-pub struct Rec {
-    pub key: Key,
-    pub src: u32,
-    pub xl: u32,
-}
-
-/// `Rec::xl`'s transfer of an emission without an edge.
-pub const NO_XFER: u32 = (1 << 24) - 1;
+/// A unit bundle's transfer when it holds no edge (its target alone).
+pub const NO_XFER: u32 = u32::MAX;
 
 /// The wave's routes: a target's (shape, region slot) -> a dense id, made
 /// by the units as they emit (read-mostly: a worker caches its own).
@@ -69,18 +59,29 @@ impl Routes {
     }
 }
 
-/// A unit's records of one route.
+/// A unit's bundles of one route (their transfers the worker's local ids),
+/// and the source regions their edges leave.
 pub struct Chunk {
     pub route: u32,
     pub unit: u32,
     pub worker: u32,
-    pub recs: Vec<Rec>,
+    pub bundles: Vec<Bundle>,
+    pub sources: Vec<u32>,
 }
 
-/// The wave's frontier rows as states, by their index over its blocks
-/// (`Rec::src`).
+/// A frontier row as an edge names its source: its shape's index, its
+/// cell, its region, its key.
+#[derive(Clone, Copy, Debug)]
+pub struct Src {
+    pub shape: u32,
+    pub cell: u32,
+    pub region: u32,
+    pub key: Key,
+}
+
+/// The wave's frontier rows, by their index over its blocks.
 pub struct Sources {
-    pub rows: Vec<Sk>,
+    pub rows: Vec<Src>,
     /// Per frontier block, its first row's index.
     pub starts: Vec<u32>,
 }
@@ -119,7 +120,6 @@ impl RouteState {
 
 /// What the region phase reads besides its route.
 pub struct RegionCtx<'a> {
-    pub geo: Geometry,
     pub frame: u32,
     /// The frontier as states (`None`: no edges recorded).
     pub sources: Option<&'a Sources>,
@@ -130,119 +130,207 @@ pub struct RegionCtx<'a> {
     pub layers: Option<&'a super::wave::StateLayers>,
 }
 
-/// A worker's scratch for the region phase: the bundle table, the
-/// encoder's buffers.
+/// A bundle's slot (its fields compared exactly): odd multipliers per
+/// word, one final mix.
+#[inline]
+fn bundle_hash(s_shape: u32, s_key: Key, x: u32, o: u32, t_key: Key) -> u64 {
+    let h = t_key.1.wrapping_mul(0x9e37_79b9_7f4a_7c15)
+        ^ t_key.0.wrapping_mul(0xc2b2_ae3d_27d4_eb4f)
+        ^ s_key.1.wrapping_mul(0x1656_67b1_9e37_79f9).rotate_left(23)
+        ^ s_key.0.wrapping_mul(0x85eb_ca77_c2b2_ae63).rotate_left(41)
+        ^ ((x as u64) << 32 | o as u64).wrapping_mul(0x27d4_eb2f_1656_67c5)
+        ^ (s_shape as u64).wrapping_mul(0xff51_afd7_ed55_8ccd);
+    celeste_engine::runtime2::mix64(h)
+}
+
+/// A unit's bundles, by route: one probe and an OR an emission (the last
+/// bundle remembered: a body's lanes mostly share it). Each route's bundles
+/// in a bucket of their own, handed over whole at the unit's end.
+#[derive(Default)]
+pub struct UnitBundles {
+    buckets: Vec<(u32, Vec<Bundle>)>,
+    bucket_of: FxHashMap<u32, u32>,
+    last_route: Option<(u32, u32)>,
+    /// `bucket << 32 | position + 1`; 0 empty.
+    index: Vec<u64>,
+    n: usize,
+    last: Option<(u32, u32)>,
+}
+
+#[inline]
+fn unit_hash(route: u32, b: &Bundle) -> u64 {
+    bundle_hash(b.s_shape ^ route.rotate_left(16), b.s_key, b.x, b.o, b.t_key)
+}
+
+impl UnitBundles {
+    pub fn clear(&mut self) {
+        if self.n > 0 {
+            self.index.fill(0);
+        }
+        self.buckets.clear();
+        self.bucket_of.clear();
+        (self.last_route, self.last, self.n) = (None, None, 0);
+    }
+
+    /// OR `bit` into the bundle `(route; s_shape, s_key, x, o, t_key)`.
+    #[inline]
+    #[allow(clippy::too_many_arguments)]
+    pub fn insert(&mut self, route: u32, s_shape: u32, s_key: Key, x: u32, o: u32, t_key: Key, bit: u64) {
+        let probe = Bundle { s_shape, s_key, x, o, t_key, mask: 0 };
+        let same = |b: &Bundle| b.t_key == t_key && b.s_key == s_key && b.x == x && b.o == o && b.s_shape == s_shape;
+        if let Some((k, p)) = self.last {
+            let (r, v) = &mut self.buckets[k as usize];
+            if *r == route && same(&v[p as usize]) {
+                v[p as usize].mask |= bit;
+                return;
+            }
+        }
+        let k = match self.last_route {
+            Some((r, k)) if r == route => k,
+            _ => {
+                let k = match self.bucket_of.get(&route) {
+                    Some(&k) => k,
+                    None => {
+                        self.buckets.push((route, Vec::new()));
+                        let k = self.buckets.len() as u32 - 1;
+                        self.bucket_of.insert(route, k);
+                        k
+                    }
+                };
+                self.last_route = Some((route, k));
+                k
+            }
+        };
+        if self.index.is_empty() {
+            self.index = vec![0; 1 << 12];
+        }
+        let m = self.index.len() - 1;
+        let mut i = unit_hash(route, &probe) as usize & m;
+        loop {
+            let e = self.index[i];
+            if e == 0 {
+                break;
+            }
+            let (bk, p) = ((e >> 32) as u32, (e as u32) - 1);
+            if bk == k && same(&self.buckets[k as usize].1[p as usize]) {
+                self.buckets[k as usize].1[p as usize].mask |= bit;
+                self.last = Some((k, p));
+                return;
+            }
+            i = (i + 1) & m;
+        }
+        let v = &mut self.buckets[k as usize].1;
+        v.push(Bundle { mask: bit, ..probe });
+        let p = v.len() as u32 - 1;
+        self.index[i] = (k as u64) << 32 | (p as u64 + 1);
+        self.last = Some((k, p));
+        self.n += 1;
+        if self.n * 2 > self.index.len() {
+            self.reindex(self.index.len() * 2);
+        }
+    }
+
+    fn reindex(&mut self, cap: usize) {
+        self.index = vec![0; cap];
+        let m = cap - 1;
+        for (k, (route, v)) in self.buckets.iter().enumerate() {
+            for (p, b) in v.iter().enumerate() {
+                let mut i = unit_hash(*route, b) as usize & m;
+                while self.index[i] != 0 {
+                    i = (i + 1) & m;
+                }
+                self.index[i] = (k as u64) << 32 | (p as u64 + 1);
+            }
+        }
+    }
+
+    /// Clear the cells `drop(route, key, cell)` says (the coarser level's
+    /// disallowed targets); a bundle left without cells goes.
+    pub fn retain_cells(&mut self, drop: impl Fn(u32, Key, u32) -> bool) {
+        for (route, v) in &mut self.buckets {
+            for b in v.iter_mut() {
+                let mut m = b.mask;
+                while m != 0 {
+                    let c = m.trailing_zeros();
+                    m &= m - 1;
+                    if drop(*route, b.t_key, c) {
+                        b.mask &= !(1u64 << c);
+                    }
+                }
+            }
+            v.retain(|b| b.mask != 0);
+        }
+        self.n = self.buckets.iter().map(|b| b.1.len()).sum();
+        self.reindex(self.index.len().max(1 << 12));
+        self.last = None;
+    }
+
+    /// The bundles by route; the table cleared.
+    pub fn drain(&mut self) -> Vec<(u32, Vec<Bundle>)> {
+        let out = std::mem::take(&mut self.buckets);
+        self.clear();
+        out.into_iter().filter(|b| !b.1.is_empty()).collect()
+    }
+}
+
+/// A worker's scratch for the region phase: the route's edges as the
+/// encoder takes them, the encoder, the raw block, zstd.
 pub struct Scratch {
-    ents: Vec<Bundle>,
-    index: Vec<u32>,
+    tbs: Vec<bundle::Tb>,
+    enc: bundle::Encoder,
     raw: Vec<u8>,
     z: zstd::bulk::Compressor<'static>,
 }
 
 impl Default for Scratch {
     fn default() -> Self {
-        Scratch { ents: Vec::new(), index: vec![0; 1 << 10], raw: Vec::new(), z: zstd::bulk::Compressor::new(1).expect("a zstd compressor") }
+        Scratch { tbs: Vec::new(), enc: bundle::Encoder::default(), raw: Vec::new(), z: zstd::bulk::Compressor::new(1).expect("a zstd compressor") }
     }
 }
 
-#[inline]
-fn bundle_hash(s_shape: u32, s_key: Key, x: u32, o: u32, t_key: Key) -> u64 {
-    use celeste_engine::runtime2::mix64;
-    mix64(slot_hash(t_key) ^ slot_hash(s_key).rotate_left(17) ^ ((s_shape as u64) << 40 | (x as u64) << 8) ^ (o as u64).rotate_left(31))
-}
-
-impl Scratch {
-    fn clear(&mut self, records: usize) {
-        self.ents.clear();
-        let cap = (records / 2).next_power_of_two().clamp(1 << 10, 1 << 26);
-        if self.index.len() != cap {
-            self.index = vec![0; cap];
-        } else {
-            self.index.fill(0);
-        }
-    }
-
-    /// OR `bit` into the bundle `(s_shape, s_key, x, o, t_key)`; its entry.
-    #[inline]
-    fn insert(&mut self, s_shape: u32, s_key: Key, x: u32, o: u32, t_key: Key, bit: u64) -> usize {
-        let m = self.index.len() - 1;
-        let mut i = bundle_hash(s_shape, s_key, x, o, t_key) as usize & m;
-        loop {
-            let e = self.index[i];
-            if e == 0 {
-                break;
-            }
-            let b = &mut self.ents[e as usize - 1];
-            if b.t_key == t_key && b.s_key == s_key && b.x == x && b.o == o && b.s_shape == s_shape {
-                b.mask |= bit;
-                return e as usize - 1;
-            }
-            i = (i + 1) & m;
-        }
-        self.ents.push(Bundle { s_shape, s_key, x, o, t_key, mask: bit });
-        self.index[i] = self.ents.len() as u32;
-        if self.ents.len() * 2 > self.index.len() {
-            self.grow();
-        }
-        self.ents.len() - 1
-    }
-
-    fn grow(&mut self) {
-        let cap = self.index.len() * 2;
-        self.index = vec![0; cap];
-        let m = cap - 1;
-        for (k, b) in self.ents.iter().enumerate() {
-            let mut i = bundle_hash(b.s_shape, b.s_key, b.x, b.o, b.t_key) as usize & m;
-            while self.index[i] != 0 {
-                i = (i + 1) & m;
-            }
-            self.index[i] = k as u32 + 1;
-        }
-    }
-}
-
-/// THE REGION PHASE of one route over one slice's `chunks` (module doc).
+/// THE REGION PHASE of one route over one slice's `chunks` (module doc):
+/// per unit bundle the dedup (one probe of the region's table) and its
+/// edges kept with the target's entry as its name; then the slice's
+/// segment encoded - its bundles as the units made them (a key's bundles
+/// of two units hold other cells; they stay two).
 pub fn run_route(st: &mut RouteState, chunks: &[&Chunk], cx: &RegionCtx, sc: &mut Scratch) -> Result<()> {
-    let geo = cx.geo;
-    let words = geo.words;
-    let n: usize = chunks.iter().map(|c| c.recs.len()).sum();
+    let n: usize = chunks.iter().map(|c| c.bundles.len()).sum();
     st.recs += n as u64;
     let record = cx.sources.is_some();
-    if record {
-        sc.clear(n);
-    }
-    // The last target's entry and the last bundle: consecutive records
-    // mostly share both (a source's lanes, a body's slice).
+    sc.tbs.clear();
+    // The last target's entry: consecutive bundles often share it.
     let (mut last_key, mut last_e) = (None::<Key>, 0u32);
-    let mut last_src_region = u32::MAX;
-    let mut last_bundle: Option<((u32, Key, u32, u32, Key), usize)> = None;
     for c in chunks {
-        let remap = cx.remaps.get(c.worker as usize);
-        for r in &c.recs {
-            let local = r.xl & 0xff;
-            // THE DEDUP: the target's entry (made for a new key), its cell.
+        let remap: &[u32] = cx.remaps.get(c.worker as usize).map_or(&[], |m| m.as_slice());
+        st.sources.extend(c.sources.iter().copied());
+        for b in &c.bundles {
+            // THE DEDUP: the target's entry (made for a new key); the cells
+            // it lacked are new states.
             let e = match last_key {
-                Some(k) if k == r.key => last_e,
+                Some(k) if k == b.t_key => last_e,
                 _ => {
-                    let e = match st.table.find(r.key) {
+                    let e = match st.table.find(b.t_key) {
                         Some(e) => e,
                         None => {
                             st.fresh.push(0);
-                            st.table.push_key(words, r.key)
+                            st.table.push_key(super::GEOMETRY.words, b.t_key)
                         }
                     };
-                    (last_key, last_e) = (Some(r.key), e);
+                    (last_key, last_e) = (Some(b.t_key), e);
                     e
                 }
             };
-            let bit = 1u64 << local;
-            if st.table.set(words, e, local) {
-                st.fresh[e as usize] |= bit;
-                st.new_states += 1;
-            } else if let (Some(layers), Some(region)) = (cx.layers, st.region) {
-                if st.fresh[e as usize] & bit == 0 {
-                    // A state of the tree: a raise refuses one of a later layer.
-                    let layer = layers.layer(super::state_id(region, e, local));
+            let had = st.table.or_cells(e, b.mask);
+            let new = b.mask & !had;
+            st.fresh[e as usize] |= new;
+            st.new_states += new.count_ones() as u64;
+            if let (Some(layers), Some(region)) = (cx.layers, st.region) {
+                // States of the tree: a raise refuses one of a later layer.
+                let mut old = b.mask & had & !st.fresh[e as usize];
+                while old != 0 {
+                    let c = old.trailing_zeros();
+                    old &= old - 1;
+                    let layer = layers.layer(super::state_id(region, e, c));
                     ensure!(
                         layer <= cx.frame,
                         "frame {}: a state the tree first reached at frame {layer} is reached at frame {}: the raised tree would move it to an earlier layer (the level -1 table is not consistent along this edge), so it cannot be extended exactly - delete the tree",
@@ -251,37 +339,23 @@ pub fn run_route(st: &mut RouteState, chunks: &[&Chunk], cx: &RegionCtx, sc: &mu
                     );
                 }
             }
-            // THE EDGE.
-            let x = r.xl >> 8;
-            if let (Some(sources), true) = (cx.sources, x != NO_XFER) {
-                let s = sources.rows[r.src as usize];
-                let x = remap.and_then(|m| m.get(x as usize)).copied().ok_or_else(|| anyhow::anyhow!("frame {}: a record's transfer {x} of worker {} has no global id", cx.frame, c.worker))?;
-                let o = bundle::offset(s.cell(&geo), geo.cell(st.slot, local));
-                let sh = s.shape(&geo);
-                match last_bundle {
-                    Some((k, e)) if k == (sh, s.key, x, o, r.key) => sc.ents[e].mask |= bit,
-                    _ => last_bundle = Some(((sh, s.key, x, o, r.key), sc.insert(sh, s.key, x, o, r.key, bit))),
-                }
-                if s.region != last_src_region {
-                    last_src_region = s.region;
-                    st.sources.insert(s.region);
+            // THE EDGES (a provisional target's wait for its key: the frame's end).
+            if record && b.x != NO_XFER {
+                let x = *remap.get(b.x as usize).ok_or_else(|| anyhow::anyhow!("frame {}: a bundle's transfer {} of worker {} has no global id", cx.frame, b.x, c.worker))?;
+                if is_provisional(b.t_key) {
+                    st.prov.push(Bundle { x, ..*b });
+                } else {
+                    sc.tbs.push(bundle::Tb { t: e, x, o: b.o, s_shape: b.s_shape, s_key: b.s_key, mask: b.mask });
                 }
             }
         }
     }
-    if !record || sc.ents.is_empty() {
-        return Ok(());
-    }
-    // Bundles into provisional targets wait for their keys (the frame's end).
-    let ents = std::mem::take(&mut sc.ents);
-    let (prov, mut done): (Vec<Bundle>, Vec<Bundle>) = ents.into_iter().partition(|b| is_provisional(b.t_key));
-    st.prov.extend(prov);
-    if !done.is_empty() {
+    if !sc.tbs.is_empty() {
+        let table = &st.table;
+        sc.enc.encode(&sc.tbs, table.len(), |e| table.key(e), &mut sc.raw);
         let region = st.region.unwrap_or(u32::MAX);
-        st.segs.push(Segment::encode(region, &mut done, &mut sc.raw, &mut sc.z)?);
+        st.segs.push(Segment::of_raw(region, &sc.raw, sc.tbs.len() as u32, sc.tbs.iter().map(|t| t.mask.count_ones() as u64).sum(), &mut sc.z)?);
     }
-    done.clear();
-    sc.ents = done;
     Ok(())
 }
 
@@ -322,16 +396,7 @@ pub fn seal(st: &mut RouteState, region: u32, finals: &FxHashMap<Key, Key>, sc: 
         for b in &mut v {
             b.t_key = *finals.get(&b.t_key).ok_or_else(|| anyhow::anyhow!("a provisional target key without its final key"))?;
         }
-        // A bundle of two slices: its masks united.
-        v.sort_unstable_by_key(|b| (b.s_shape, b.s_key, b.x, b.o, b.t_key));
-        let mut merged: Vec<Bundle> = Vec::with_capacity(v.len());
-        for b in v {
-            match merged.last_mut() {
-                Some(l) if (l.s_shape, l.s_key, l.x, l.o, l.t_key) == (b.s_shape, b.s_key, b.x, b.o, b.t_key) => l.mask |= b.mask,
-                _ => merged.push(b),
-            }
-        }
-        st.segs.push(Segment::encode(region, &mut merged, &mut sc.raw, &mut sc.z)?);
+        st.segs.push(Segment::encode(region, &mut v, &mut sc.raw, &mut sc.z)?);
     }
     Ok(Sealed { entries, states })
 }

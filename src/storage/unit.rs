@@ -1,11 +1,11 @@
 //! ONE UNIT of a wave (plans/edges-target.md "The forward"): a run of
 //! frontier rows through the kernels. The sink (`UnitSink`, one per worker,
-//! reset per unit) turns each emission into a RECORD of its target's route
-//! (`route::Rec`: the target's key and cell, the source, the transfer) -
-//! nothing is looked up and no row is copied here: the target region's
-//! worker dedups it and records its edge (`route::run_route`), and the new
-//! layer is decoded from the keys (`wave`). At the unit's end its records
-//! are the chunks of their routes.
+//! reset per unit) ORs each emission into its BUNDLE of its target's route
+//! (`route::UnitBundles`: source key, transfer, offset, target key ->
+//! target cells) - nothing is looked up and no row is copied here: the
+//! target region's worker dedups the states and merges the edges
+//! (`route::run_route`), and the new layer is decoded from the keys
+//! (`wave`). At the unit's end its bundles are the chunks of their routes.
 
 use anyhow::Result;
 use celeste_core::pico8_num::Pico8Num as P8;
@@ -13,9 +13,8 @@ use celeste_engine::runtime2::{Col, Rt2, AV};
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use super::decode::Skeletons;
-use super::route::{Chunk, Rec, Routes, NO_XFER};
+use super::route::{Chunk, Routes, Sources, UnitBundles, NO_XFER};
 use super::visited::{Key, VisitedSet};
-use super::Geometry;
 use crate::frame::{Filters, Raised};
 use celeste_engine::exact::{is_provisional, KeySpace, Provisional, RowKey};
 
@@ -161,7 +160,6 @@ pub struct UnitSink<'a> {
     /// The wave's provisional keys (states holding a code the key space
     /// lacks: new by construction).
     prov: &'a Provisional,
-    geo: Geometry,
     filters: Filters<'a>,
     frame: u32,
     /// The level the wave runs at (a reference row's key view).
@@ -184,10 +182,11 @@ pub struct UnitSink<'a> {
     /// This worker's routes, and the last one asked.
     route_ids: FxHashMap<(u64, u32), u32>,
     last_route: (u64, u32, u32),
-    /// The unit's records by route (`bucket_of`: route -> bucket).
-    buckets: Vec<(u32, Vec<Rec>)>,
-    bucket_of: FxHashMap<u32, u32>,
-    last_bucket: (u32, u32),
+    /// The wave's frontier as sources (`None`: no edges recorded).
+    sources: Option<&'a Sources>,
+    /// The unit's bundles by route, and its (route, source region) pairs.
+    bundles: UnitBundles,
+    src_regions: Vec<(u32, u32)>,
     /// Per target the coarser level's verdict (`MarkFilter`), once a unit,
     /// decided in batches (a projection per block, not per row).
     verdicts: FxHashMap<Target, u8>,
@@ -229,6 +228,8 @@ pub struct UnitSink<'a> {
     /// check), or the emissions come without rows (`bench::Replay`).
     reference: bool,
     rowless: bool,
+    /// The last emission's shape, once registered and guarded (0: none).
+    last_shape: u64,
 }
 
 impl<'a> UnitSink<'a> {
@@ -242,19 +243,19 @@ impl<'a> UnitSink<'a> {
         frame: u32,
         level: crate::abstraction::Level,
         worker: u32,
-        record_edges: bool,
+        sources: Option<&'a Sources>,
         edges_on: bool,
         drops: Option<&'a super::wave::DropNotes>,
         raise: Option<RaiseCtx>,
         s: &crate::settings::Settings,
     ) -> Self {
+        let record_edges = sources.is_some();
         let l1 = filters.minus_one.or(raise.as_ref().map(|r| r.raised.old)).map(|m| m.table(s));
         UnitSink {
             keys: &visited.keys,
             routes,
             skeletons,
             prov,
-            geo: visited.geo,
             filters,
             frame,
             level,
@@ -271,9 +272,9 @@ impl<'a> UnitSink<'a> {
             skip_in: None,
             route_ids: FxHashMap::default(),
             last_route: (0, u32::MAX, u32::MAX),
-            buckets: Vec::new(),
-            bucket_of: FxHashMap::default(),
-            last_bucket: (u32::MAX, 0),
+            sources,
+            bundles: UnitBundles::default(),
+            src_regions: Vec::new(),
             verdicts: Default::default(),
             scratch: Vec::new(),
             scratch_at: Vec::new(),
@@ -296,6 +297,7 @@ impl<'a> UnitSink<'a> {
             guarded: Default::default(),
             reference: false,
             rowless: false,
+            last_shape: 0,
         }
     }
 
@@ -322,7 +324,7 @@ impl<'a> UnitSink<'a> {
         }
     }
 
-    /// Are edges recorded (an edges dir, ids on the frontier)?
+    /// Are edges recorded (an edges dir, the frontier's sources)?
     #[inline]
     pub fn records_edges(&self) -> bool {
         self.record_edges
@@ -342,9 +344,8 @@ impl<'a> UnitSink<'a> {
         self.src_base = src_base;
         self.skip_in = skip;
         self.sources_old = sources_old;
-        self.buckets.clear();
-        self.bucket_of.clear();
-        self.last_bucket = (u32::MAX, 0);
+        self.bundles.clear();
+        self.src_regions.clear();
         self.verdicts.clear();
         self.disallowed = false;
     }
@@ -407,7 +408,7 @@ impl<'a> UnitSink<'a> {
             return id;
         }
         let id = u32::try_from(self.xfer_tab.len()).expect("transfer table past u32");
-        assert!(id < NO_XFER, "worker {}: {id} transfers in one frame, past the 24 bits a record holds", self.worker);
+        assert!(id < NO_XFER, "worker {}: {id} transfers in one frame", self.worker);
         self.xfer_tab.push(t);
         self.xfer_ids.insert(t, id);
         id
@@ -429,24 +430,6 @@ impl<'a> UnitSink<'a> {
         };
         self.last_route = (shape, slot, r);
         r
-    }
-
-    /// The unit's bucket of `route`.
-    #[inline]
-    fn bucket(&mut self, route: u32) -> &mut Vec<Rec> {
-        if self.last_bucket.0 != route {
-            let b = match self.bucket_of.get(&route) {
-                Some(&b) => b,
-                None => {
-                    self.buckets.push((route, Vec::new()));
-                    let b = self.buckets.len() as u32 - 1;
-                    self.bucket_of.insert(route, b);
-                    b
-                }
-            };
-            self.last_bucket = (route, b);
-        }
-        &mut self.buckets[self.last_bucket.1 as usize].1
     }
 
     /// The buffer of `shape` in `bufs` (made over `init()`'s skeleton).
@@ -490,17 +473,23 @@ impl<'a> UnitSink<'a> {
         if let Some(c) = &mut self.capture {
             c.emit(shape, cell, key, (lane - self.lo) as u32, xfer, is_provisional(key).then(|| self.prov.content(key)));
         }
-        if !self.registered.contains(&shape) {
-            self.skeletons.register(&init())?;
-            self.registered.insert(shape);
+        // A shape's first emission (this worker, this wave): its skeleton
+        // registered, and THE DECODE GUARD - its row is what its key and
+        // cell decode to (the new layer is decoded). Looked at only when the
+        // shape is not the last emission's.
+        if shape != self.last_shape {
+            if !self.registered.contains(&shape) {
+                self.skeletons.register(&init())?;
+                self.registered.insert(shape);
+            }
+            self.last_shape = if self.guarded.contains(&shape) { shape } else { 0 };
         }
-        if !self.reference && !self.rowless && !is_provisional(key) && !self.guarded.contains(&shape) {
-            // THE DECODE GUARD, once a shape a worker and frame: the row is
-            // what its key and cell decode to (the new layer is decoded).
+        if self.last_shape != shape && !self.reference && !self.rowless && !is_provisional(key) {
             let mut b = RowBuf::new(init());
             push(&mut b);
             self.skeletons.check_decodes(self.keys, &b.to_rt2(), &[cell])?;
             self.guarded.insert(shape);
+            self.last_shape = shape;
         }
         if self.key_check && !self.reference && !self.rowless {
             let i = Self::buf_of(&mut self.check, shape, &init);
@@ -509,7 +498,7 @@ impl<'a> UnitSink<'a> {
                 self.check_rows(i)?;
             }
         }
-        let (slot, local) = self.geo.slot_local(cell);
+        let (slot, local) = super::GEOMETRY.slot_local(cell);
         let route = self.route(shape, slot);
         // The coarser level's filter (the objects ladder): once per target,
         // in batches - a target awaiting its verdict is taken as allowed, and
@@ -533,12 +522,17 @@ impl<'a> UnitSink<'a> {
                 }
             }
         }
-        let x = match (xfer, self.record_edges) {
-            (Some(x), true) => x,
-            _ => NO_XFER,
-        };
-        let src = self.src_base + lane as u32;
-        self.bucket(route).push(Rec { key, src, xl: x << 8 | local });
+        let bit = 1u64 << local;
+        match (xfer, self.sources) {
+            (Some(x), Some(sources)) => {
+                let s = &sources.rows[self.src_base as usize + lane];
+                if self.src_regions.last() != Some(&(route, s.region)) {
+                    self.src_regions.push((route, s.region));
+                }
+                self.bundles.insert(route, s.shape, s.key, x, super::bundle::offset(s.cell, cell), key, bit);
+            }
+            _ => self.bundles.insert(route, 0, (0, 0), NO_XFER, 0, key, bit),
+        }
         Ok(())
     }
 
@@ -648,6 +642,7 @@ impl<'a> UnitSink<'a> {
     /// next frame.
     pub fn finish(&mut self) -> Result<()> {
         self.guarded.clear();
+        self.last_shape = 0;
         match self.capture.take() {
             Some(c) => c.finish(&self.xfer_tab),
             None => Ok(()),
@@ -667,14 +662,23 @@ impl<'a> UnitSink<'a> {
         self.decide()?;
         if self.disallowed {
             let v = &self.verdicts;
-            for (route, recs) in &mut self.buckets {
-                recs.retain(|r| v.get(&(*route, r.key, (r.xl & 0xff) as u8)) != Some(&VERDICT_NO));
-            }
+            self.bundles.retain_cells(|route, key, c| v.get(&(route, key, c as u8)) == Some(&VERDICT_NO));
         }
-        for (route, recs) in self.buckets.drain(..) {
-            if !recs.is_empty() {
-                self.outbox.push(Chunk { route, unit: self.unit, worker: self.worker, recs });
+        self.src_regions.sort_unstable();
+        self.src_regions.dedup();
+        let mut srcs = self.src_regions.iter().peekable();
+        for (route, bundles) in self.bundles.drain() {
+            let mut sources = Vec::new();
+            while let Some(&&(r, region)) = srcs.peek() {
+                if r > route {
+                    break;
+                }
+                if r == route {
+                    sources.push(region);
+                }
+                srcs.next();
             }
+            self.outbox.push(Chunk { route, unit: self.unit, worker: self.worker, bundles, sources });
         }
         crate::frame::phases::add(crate::frame::phases::END_UNIT, t);
         Ok(())

@@ -53,3 +53,21 @@ Steps:
   and a block decodes alone (relative masks need the previous layer's per-key
   masks in up to four source regions at every read). Decode ~1-3 ns an edge on
   one thread (load 20-45).
+- 2026-10-11 ~16:00 Step 2-4 in one switch (8dcaa56): target-region bundle segments (edge file v6),
+  the routed forward (records -> region phase -> segments; layer decoded from keys), the
+  backward on states (Sk) over region blocks, reach through the source-region index.
+  Room (1,0) f0-44: posgraph, ckhash, ckhash --edges, frame files and xfer.bin identical to
+  develop; tree 280 -> 34 MB (edges 253 -> 6.4 MB, 0.055 B an edge). Arc gate identical
+  (W, optimum 33, witness, known route). Suite + ignored 196/196. Every fixture rebuilt
+  (/var/tmp/tgt-fixtures) reproduces its pinned ckhash --edges/--dropped: r10 773 -> 61 MB,
+  r42n 450 -> 43, r42x 140 -> 17, r60s 186 -> 25, r62h 2.7 GB -> 280 MB.
+- 2026-10-11 ~16:50 The region phase made fast enough (the coordinator's fwd-perf findings):
+  units BUNDLE their emissions in a unit-local table (route, s, x, o, t) -> mask and hand
+  each route its bucket; the region phase dedups per unit bundle (one region-table probe +
+  OR) and names targets by their table entry; a dedicated encoder (dense target ranks,
+  packed 24-B sort keys) writes the block; no route-level bundle table (it was DRAM-bound
+  and merged ~17% of bundles: 0.101 -> 0.113 B an edge at f57); the transfer merge takes
+  each worker's NEW pairs only and writes xfer.bin once a frame; region jobs of slice k
+  run with the units of slice k+1 (pipeline). Reference frame r62h57 f56->f57, 16 threads,
+  interleaved, load 27-34: develop total 7.8-8.1 s (one 10.5), this 3.8-5.7 s (one 10.9
+  outlier, a load spike in its units); f/e lines identical. t0 193/193; gates OK.

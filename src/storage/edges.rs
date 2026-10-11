@@ -28,6 +28,8 @@ use crate::search::arc_edges::{decode_pair, encode_pair, Pair, PAIR_BYTES};
 pub struct XferTable {
     pub pairs: Vec<Pair>,
     index: FxHashMap<Pair, u32>,
+    /// Pairs written to `xfer.bin` (`flush`).
+    flushed: usize,
 }
 
 fn xfer_path(dir: &Path) -> PathBuf {
@@ -40,7 +42,7 @@ impl XferTable {
     pub fn load(dir: &Path) -> Result<Self> {
         let pairs = Self::load_pairs(dir)?;
         let index = pairs.iter().enumerate().map(|(i, p)| (*p, i as u32)).collect();
-        Ok(XferTable { pairs, index })
+        Ok(XferTable { flushed: pairs.len(), pairs, index })
     }
 
     /// The table's pairs alone, as `load` reads them (the readers need no
@@ -55,21 +57,27 @@ impl XferTable {
         Ok(b[..n * PAIR_BYTES].chunks_exact(PAIR_BYTES).map(decode_pair).collect())
     }
 
-    /// The workers' tables into the global one: new pairs appended in value
-    /// order (content-canonical), and written past the trusted length
-    /// (`dir`; the frame's done marker trusts them); per worker, its ids'
-    /// global ones.
-    pub fn merge(&mut self, dir: Option<&Path>, tables: &[Vec<Pair>]) -> Result<Vec<Vec<u32>>> {
-        let mut new: Vec<Pair> = tables.iter().flatten().filter(|p| !self.index.contains_key(p)).copied().collect();
+    /// The workers' NEW pairs (`tails`: what each worker's table gained
+    /// since its last merge) into the table: the ones it lacks appended in
+    /// value order (content-canonical: a function of the pairs, whatever
+    /// the workers); per tail its pairs' global ids.
+    pub fn merge(&mut self, tails: &[&[Pair]]) -> Vec<Vec<u32>> {
+        let mut new: Vec<Pair> = tails.iter().flat_map(|t| t.iter()).filter(|p| !self.index.contains_key(p)).copied().collect();
         new.sort_unstable();
         new.dedup();
-        let first = self.pairs.len();
         for p in new {
             self.index.insert(p, self.pairs.len() as u32);
             self.pairs.push(p);
         }
-        if let (Some(dir), true) = (dir, self.pairs.len() > first) {
-            use std::io::{Seek, Write};
+        tails.iter().map(|t| t.iter().map(|p| self.index[p]).collect()).collect()
+    }
+
+    /// Write the pairs merged since the last flush past the trusted length
+    /// (the frame's done marker trusts them).
+    pub fn flush(&mut self, dir: &Path) -> Result<()> {
+        use std::io::{Seek, Write};
+        let first = self.flushed;
+        if self.pairs.len() > first {
             std::fs::create_dir_all(dir)?;
             let mut f = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(xfer_path(dir))?;
             f.set_len((first * PAIR_BYTES) as u64)?;
@@ -81,7 +89,8 @@ impl XferTable {
             f.write_all(&buf)?;
             f.sync_data()?;
         }
-        Ok(tables.iter().map(|t| t.iter().map(|p| self.index[p]).collect()).collect())
+        self.flushed = self.pairs.len();
+        Ok(())
     }
 }
 
@@ -123,7 +132,14 @@ pub struct Segment {
 }
 
 impl Segment {
-    /// `bundles` (distinct; sorted in place) as a segment of `region`.
+    /// A raw block of `bundles` bundles and `edges` edges as a segment of
+    /// `region`.
+    pub fn of_raw(region: u32, raw: &[u8], bundles: u32, edges: u64, z: &mut zstd::bulk::Compressor<'static>) -> Result<Segment> {
+        ensure!(raw.len() < u32::MAX as usize, "an edge segment of {} bytes", raw.len());
+        Ok(Segment { region, bytes: bundle::compress(raw, z)?, raw: raw.len() as u32, bundles, edges })
+    }
+
+    /// `bundles` (distinct) as a segment of `region`.
     pub fn encode(region: u32, bundles: &mut [Bundle], raw: &mut Vec<u8>, z: &mut zstd::bulk::Compressor<'static>) -> Result<Segment> {
         bundle::encode(bundles, &bundle::ORDER, raw);
         ensure!(raw.len() < u32::MAX as usize, "an edge segment of {} bytes", raw.len());
@@ -547,7 +563,8 @@ pub fn segments_of(edges: &[(Sk, Sk, u32)]) -> Result<(Vec<Segment>, Vec<(u32, V
 #[cfg(test)]
 pub(crate) fn write_test_edges(dir: &Path, frames: &[(u32, Vec<(Sk, Sk, u32)>)], pairs: &[Pair]) -> Result<()> {
     let mut xt = XferTable::default();
-    xt.merge(Some(dir), &[pairs.to_vec()])?;
+    xt.merge(&[pairs]);
+    xt.flush(dir)?;
     ensure!(xt.pairs.len() == pairs.len(), "the test's transfer pairs are not distinct");
     let mut last = 0;
     for (frame, edges) in frames {

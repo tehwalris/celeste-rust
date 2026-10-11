@@ -20,7 +20,7 @@ use super::meta::FrameMeta;
 use super::route::{Chunk, RegionCtx, RouteState, Routes, Sources};
 use super::unit::{RaiseCtx, UnitSink};
 use super::visited::{Key, VisitedSet};
-use super::{id_region, region_of, state_id, Sk, StateId};
+use super::{id_region, region_of, state_id, StateId};
 use crate::frame::{phases, Block, Filters, FrameStats, FrameStep, Layer};
 use celeste_engine::exact::{is_provisional, Code, MissKey, Provisional};
 
@@ -193,17 +193,16 @@ pub struct WaveCtx<'a> {
     pub skeletons: &'a Skeletons,
 }
 
-/// The frontier's rows as states, by their index over its blocks (the
-/// records' sources): region from the id, key from the key column.
+/// The frontier's rows as sources, by their index over its blocks (the
+/// records' `src`): shape and cell from the id, key from the key column.
 fn sources_of(frontier: &[Block]) -> Sources {
     let geo = super::GEOMETRY;
     let mut rows = Vec::with_capacity(frontier.iter().map(Block::lanes).sum());
     let mut starts = Vec::with_capacity(frontier.len());
     for b in frontier {
         starts.push(rows.len() as u32);
-        rows.extend(b.ids().iter().zip(b.keys()).map(|(&id, &key)| Sk { region: id_region(id), key, local: super::id_local(id) as u8 }));
+        rows.extend(b.ids().iter().zip(b.keys()).map(|(&id, &key)| super::route::Src { shape: id_region(id) / geo.slots, cell: super::id_cell(&geo, id), region: id_region(id), key }));
     }
-    debug_assert!(rows.iter().all(|s| s.region / geo.slots < u32::MAX));
     Sources { rows, starts }
 }
 
@@ -250,7 +249,6 @@ pub fn run_wave(engine: &dyn FrameStep, frontier: Vec<Block>, cx: WaveCtx) -> Re
     };
     ensure!(raised.is_none() || layers.is_some(), "frame {frame}: a raise needs the tree's layers");
     let sources = record.then(|| sources_of(&frontier));
-    let geo = visited.geo;
     let routes = Routes::default();
     let prov = Provisional::default();
     // The routes through the frame, by id: their regions' tables taken out
@@ -258,24 +256,50 @@ pub fn run_wave(engine: &dyn FrameStep, frontier: Vec<Block>, cx: WaveCtx) -> Re
     let mut states: Vec<std::sync::Mutex<RouteState>> = Vec::new();
     let mut tables: Vec<Option<Box<super::visited::RegionTable>>> = std::mem::take(visited.tables_mut_vec());
     let mut sinks: Vec<UnitSink> = (0..workers)
-        .map(|w| UnitSink::new(visited, &routes, skeletons, &prov, filters, frame, level, w as u32, record, pos.is_some(), notes.as_ref(), raised.map(|r| RaiseCtx { raised: r }), s))
+        .map(|w| UnitSink::new(visited, &routes, skeletons, &prov, filters, frame, level, w as u32, sources.as_ref(), pos.is_some(), notes.as_ref(), raised.map(|r| RaiseCtx { raised: r }), s))
         .collect();
-    let (mut t_units, mut t_regions, mut busy) = (std::time::Duration::ZERO, std::time::Duration::ZERO, std::time::Duration::ZERO);
     let mut scratch: Vec<super::route::Scratch> = (0..workers).map(|_| super::route::Scratch::default()).collect();
-    for slice in &slices {
-        // THE UNITS of the slice: each worker's sink takes units in order.
+    // Per worker: its transfer table's length merged so far, and its ids'
+    // global ones.
+    let mut merged: Vec<usize> = vec![0; workers];
+    let mut remaps: Vec<Vec<u32>> = vec![Vec::new(); workers];
+    // The previous slice's chunks and its region jobs `(route, chunks a..b,
+    // bundles)`, heaviest first.
+    type Jobs = Vec<(u32, usize, usize, usize)>;
+    let mut pending: (Vec<Chunk>, Jobs) = (Vec::new(), Vec::new());
+    let (mut t_tail, mut busy) = (std::time::Duration::ZERO, std::time::Duration::ZERO);
+    let t_pipeline = Instant::now();
+    // THE PIPELINE: step k runs slice k's units and slice k - 1's region
+    // jobs together (a worker takes a job first, heaviest first, then
+    // units), so a heavy route's job overlaps the next slice's kernels;
+    // between steps, slice k's GATHER (its transfers, routes and jobs).
+    for step in 0..=slices.len() {
+        let slice = slices.get(step).cloned().unwrap_or(units.len()..units.len());
         let t = Instant::now();
         let next_unit = AtomicUsize::new(slice.start);
+        let next_job = AtomicUsize::new(0);
+        let rcx = RegionCtx { frame, sources: sources.as_ref(), remaps: &remaps, layers: raised.and(layers) };
+        let (chunks, jobs, states_ref, rcx_ref) = (&pending.0, &pending.1, &states, &rcx);
         let spent: Vec<std::time::Duration> = std::thread::scope(|scope| {
             let handles: Vec<_> = sinks
                 .iter_mut()
-                .map(|sink| {
-                    let (frontier, cells, order, units, next_unit, sources) = (&frontier, &cells, &order, &units, &next_unit, &sources);
+                .zip(scratch.iter_mut())
+                .map(|(sink, sc)| {
+                    let (frontier, cells, order, units, next_unit, next_job, sources) = (&frontier, &cells, &order, &units, &next_unit, &next_job, &sources);
                     let end = slice.end;
                     std::thread::Builder::new().stack_size(WORKER_STACK).spawn_scoped(scope, move || -> Result<std::time::Duration> {
                         crate::compiled::asm_kernel::set_thread_stack(WORKER_STACK);
                         let t = Instant::now();
                         loop {
+                            // A region job first (the previous slice's).
+                            if let Some(&(r, a, b, _)) = jobs.get(next_job.fetch_add(1, Ordering::Relaxed)) {
+                                let cs: Vec<&Chunk> = chunks[a..b].iter().collect();
+                                let mut route = states_ref[r as usize].lock().expect("a route");
+                                let t = phases::start(s.diag.phases);
+                                super::route::run_route(&mut route, &cs, rcx_ref, sc)?;
+                                phases::add(phases::REGIONS, t);
+                                continue;
+                            }
                             let u = next_unit.fetch_add(1, Ordering::Relaxed);
                             if u >= end {
                                 break;
@@ -300,60 +324,45 @@ pub fn run_wave(engine: &dyn FrameStep, frontier: Vec<Block>, cx: WaveCtx) -> Re
                 .collect();
             handles.into_iter().map(|h| h.join().expect("wave worker panicked")).collect::<Result<Vec<_>>>()
         })?;
-        t_units += t.elapsed();
         busy += spent.iter().sum::<std::time::Duration>();
-        // The slice's transfers get their global ids (the workers' tables
-        // so far: ids already merged keep theirs).
-        let t = Instant::now();
-        let tabs: Vec<Vec<crate::search::arc_edges::Pair>> = sinks.iter().map(|k| k.xfer_tab.clone()).collect();
-        let remaps = xfers.merge(edges_dir, &tabs)?;
-        // New routes join, with their regions' tables.
+        if step == slices.len() {
+            t_tail = t.elapsed();
+        }
+        drop(std::mem::take(&mut pending));
+        st.rss_wave = st.rss_wave.max(crate::metrics::current_rss_gb());
+        if step == slices.len() {
+            break;
+        }
+        // THE GATHER of slice `step`: its transfers get their global ids
+        // (each worker's NEW pairs only), new routes join with their
+        // regions' tables, its chunks become jobs by route.
+        let tails: Vec<&[crate::search::arc_edges::Pair]> = sinks.iter().zip(&merged).map(|(k, &m)| &k.xfer_tab[m..]).collect();
+        for (w, ids) in xfers.merge(&tails).into_iter().enumerate() {
+            remaps[w].extend(ids);
+            merged[w] = remaps[w].len();
+        }
         for (shape, slot) in routes.list().into_iter().skip(states.len()) {
             let region = visited.region(shape, slot);
             let table = region.and_then(|r| tables.get_mut(r as usize).and_then(Option::take));
             states.push(std::sync::Mutex::new(RouteState::new(shape, slot, region, table)));
         }
-        // THE REGION PHASE: the slice's chunks by route, heaviest first.
         let mut chunks: Vec<Chunk> = sinks.iter_mut().flat_map(|k| k.outbox.drain(..)).collect();
         chunks.sort_unstable_by_key(|c| (c.route, c.unit));
-        let mut jobs: Vec<(u32, usize, usize, usize)> = Vec::new();
+        let mut jobs: Jobs = Vec::new();
         let mut a = 0;
         while a < chunks.len() {
             let r = chunks[a].route;
             let b = a + chunks[a..].partition_point(|c| c.route == r);
-            jobs.push((r, a, b, chunks[a..b].iter().map(|c| c.recs.len()).sum()));
+            jobs.push((r, a, b, chunks[a..b].iter().map(|c| c.bundles.len()).sum()));
             a = b;
         }
         jobs.sort_by_key(|j| (std::cmp::Reverse(j.3), j.0));
-        let rcx = RegionCtx { geo, frame, sources: sources.as_ref(), remaps: &remaps, layers: raised.and(layers) };
-        let next_job = AtomicUsize::new(0);
-        let (chunks_ref, jobs_ref, states_ref, rcx_ref, phased) = (&chunks, &jobs, &states, &rcx, s.diag.phases);
-        std::thread::scope(|scope| {
-            let hs: Vec<_> = scratch
-                .iter_mut()
-                .map(|sc| {
-                    let next_job = &next_job;
-                    scope.spawn(move || -> Result<()> {
-                        loop {
-                            let k = next_job.fetch_add(1, Ordering::Relaxed);
-                            let Some(&(r, a, b, _)) = jobs_ref.get(k) else { return Ok(()) };
-                            let cs: Vec<&Chunk> = chunks_ref[a..b].iter().collect();
-                            let mut route = states_ref[r as usize].lock().expect("a route");
-                            let t = phases::start(phased);
-                            super::route::run_route(&mut route, &cs, rcx_ref, sc)?;
-                            phases::add(phases::REGIONS, t);
-                        }
-                    })
-                })
-                .collect();
-            hs.into_iter().map(|h| h.join().expect("a region worker panicked")).collect::<Result<Vec<()>>>()
-        })?;
-        drop(chunks);
-        t_regions += t.elapsed();
-        st.rss_wave = st.rss_wave.max(crate::metrics::current_rss_gb());
+        pending = (chunks, jobs);
     }
+    let t_units = t_pipeline.elapsed();
     st.t_wave = t_units;
     st.wave_idle = idle_fraction(t_units, workers, busy);
+    st.t_regions = t_tail;
     st.slices = slices.len();
     let mut tabs: Vec<Vec<crate::search::arc_edges::Pair>> = Vec::with_capacity(workers);
     for sink in &mut sinks {
@@ -445,6 +454,7 @@ pub fn run_wave(engine: &dyn FrameStep, frontier: Vec<Block>, cx: WaveCtx) -> Re
     *visited.tables_mut_vec() = tables;
     st.lanes_kept = news.len();
     if let Some(dir) = edges_dir {
+        xfers.flush(dir)?;
         let path = super::edges::file_path(dir, frame, raised.map(|r| r.first_seq));
         st.edge_bytes = super::edges::write_file(&path, frame, segs, src_index)?;
     }
@@ -454,7 +464,6 @@ pub fn run_wave(engine: &dyn FrameStep, frontier: Vec<Block>, cx: WaveCtx) -> Re
     };
     let next = decode_layer(visited, skeletons, &news, frame, first_seq, s)?;
     phases::add(phases::LAYER, tl);
-    st.t_regions = t_regions;
     st.t_layer = t.elapsed();
     st.visited_bytes = visited.alloc_bytes();
     st.rss_end = crate::metrics::current_rss_gb();

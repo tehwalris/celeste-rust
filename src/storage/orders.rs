@@ -176,7 +176,7 @@ pub fn orders(dir: &std::path::Path, from: u32, to: u32, threads: usize) -> Resu
             let mut z = zstd::bulk::Compressor::new(1).expect("zstd");
             let mut raw = Vec::new();
             for (k, (_, order)) in ORDERS.iter().enumerate() {
-                bundle::encode(&mut bundles, order, &mut raw);
+                bundle::encode(&bundles, order, &mut raw);
                 t.raw[k] = raw.len() as u64;
                 t.z[k] = z.compress(&raw).expect("zstd").len() as u64;
                 if k == 0 {

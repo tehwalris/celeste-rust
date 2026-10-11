@@ -148,6 +148,17 @@ impl RegionTable {
         Ok(order)
     }
 
+    /// OR the cells `mask` into entry `e` (8 x 8 regions: one mask word);
+    /// the cells it held before.
+    #[inline]
+    pub fn or_cells(&mut self, e: u32, mask: u64) -> u64 {
+        debug_assert_eq!(super::GEOMETRY.words, 1);
+        let w = &mut self.masks[e as usize];
+        let had = *w;
+        *w |= mask;
+        had
+    }
+
     /// Set cell `local` of entry `e`; true if it was not set.
     #[inline]
     pub fn set(&mut self, words: usize, e: u32, local: u32) -> bool {
