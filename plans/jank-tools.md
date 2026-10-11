@@ -42,6 +42,139 @@ rm-1, rm-4, bw-2, fw-13), it is extended here, not repeated.
     category table, the tasdatabase format, room/level names, the map's
     object tiles and the cart patches, with no shared module.
 
+## Status (2026-10-11, branch `tools-cleanup`)
+
+Phase 1 is done: the items independent of the edge-storage refactor
+(`edges-target`) and of the map mod (`map-mod`, which edits
+pico8_diff/replay.py and src/trace/cart.rs). Every commit passed
+`./check.sh t0` and `t1`; the last also `t2`.
+
+| item | done | commit |
+|---|---|---|
+| J1 | the 16 numerics/sequence cases are lua/probe corpora (all agree with PICO-8 0.2.7, 234 lines; `__hex` native in the probe runner); run.sh, wrap.sh, known_fail.txt, cases/, README, trace_frame37.json (26 MB), baseline/isocheck (1.1 MB), PROGRESS.md deleted; the sin table's generator moved to cart/pico8_sin_table.p8 | `The PICO-8 numerics cases as probe corpora` |
+| J2 | `bounds-audit` (+ `check_any_level`, `ids.f_last`) and `adopt-settings` retired (the sweep found one tree without a record, /var/tmp/fg-r62h-new, a scratch tree) | `Retire bounds-audit and adopt-settings` |
+| J7 | the runner's `env` shim refused; `ancestry`/`--forward-only` names; docs | same |
+| J8 | `par::Pool` for ref-check, ui_export and the kernel build | `One scoped worker pool` |
+| J5 | `result.json` (verdict, levels, bounds, witness, wall, peak); the level -1 refusal a verdict; the forward's per-frame stats in each tree (`forward.tsv`); export-ui reads them (no `--log`, no `arc.txt`, no `--paths-only`); the runner reads the record | `The search writes result.json` |
+| J4 | `export-ui --download FILE`: the UI's download IS the upload; `TasFile` and the path files' tasdatabase lines gone | same |
+| J6 | tools/celeste/ (categories, tasdb, rooms, pico8, love); the runner, check_uploads, align_tas and chain.py its clients | `One Python package for the game model` |
+| J15 | `rewrite starts`: the feasible J's and their classes in Rust (equal to chain.py's for levels 2-31) | same |
+| seeds | `rewrite room` (`trace::cart::room_objects`, the one object scan): the runner's seed slots | same |
+
+Not done in phase 1, and why:
+- **J14 (the cart patches) and moving replay.py/chain.py to tools/**: they
+  rewrite pico8_diff/replay.py's `build_cart` and trace/cart.rs, which the
+  map-mod branch is editing (`--cart`, `--max-djump`, `cart_data`). Phase
+  1b, below.
+- **J8's fingerprint module, arc-check's pool, J2's `convert-tree`,
+  `edge-census`, `spurious --chain-out` (+ `trajectory --spec/--tree`),
+  J7's `fixtures.sh formats()`** (it greps `storage/edges.rs`): they touch
+  the edge storage. Phase 2.
+
+Merging `edges-target` over this branch: expect small conflicts in
+src/frame.rs (`log_frame` appends `forward.tsv`; `minus_one_table` returns a
+`Result`), src/search/arc_dp.rs (no `arc.txt`) and src/bin/rewrite.rs (the
+`Search` arm writes `result.json`; `bounds-audit`, `adopt-settings` gone).
+Merging `map-mod`: rewrite.rs (the retired arms' `cfg.room` lines: take the
+deletion), ui_export.rs (`export` takes the room and `Paths`; map-mod
+passes `&cfg` for the mod's tiles), trace/cart.rs (`room_objects` beside
+`OBJECT_TILES`; map-mod's `s.cart_data_in(root)` goes into the callers).
+
+### Phase 1b: after map-mod merges
+
+1. `rewrite cart --lua minimal|original --room X,Y [--gemskip]
+   [--loading-jank J] [--seeds hook|inline] [--cart FILE.p8] [--max-djump
+   N]` prints the patched Lua; `trace::cart` owns the start-room and orb
+   patch for both carts (`load_room(1, 0)` and begin_game's
+   `load_room(0,0)`), the loading frame (one text: Rust skips `move` at a
+   zero speed, the replay does not; `move(0, 0)` can only zero a `rem`
+   inside a solid, and every `rem` is 0 at a load - check it) and the
+   seeds. Two seed modes, both Rust's: INLINE by position (the search: no
+   new global) and a HOOK (`this.offset=__balloon_seed()` and the chest's
+   last shake, the replay's driver supplying the queue, per room in a
+   chain). The concrete search's chests stay `rnd`, as a stated option.
+2. replay.py keeps only its driver (the dash notes, the dump, the
+   segments, the frame lines) and asks `rewrite cart`; `minimal_jank` and
+   `OBJECT_TILES` go (the J translation is `room_objects`).
+3. replay.py and chain.py move to tools/ (`celeste.pico8` owns the cart
+   build; the CLIs thin); pico8_diff/ is gone.
+4. Verify: `chain.py --check-start` for rooms (3,1), (6,2), (2,1)
+   unchanged; every tas/*.txt witness and every upload replays to the same
+   exit frame (PICO-8, a few minutes).
+
+### Phase 2: after edges-target merges
+
+In this order (each step its own commit, t0/t1 each, t2 at the end):
+
+1. **J11 `storage::Tree::open(dir)`**: the recorded `Settings` and level,
+   the `TreeFilter`, the last frame, the `Resolver`, the `EdgeStore` on
+   demand, `rows(frame, sel)` with ONE row selector (`--frame F [--cell
+   x,y] [--samples N] | --id ID`), `engines()` built under the tree's own
+   settings. Every read-only command takes `--tree DIR` and REFUSES the
+   settings flags (check.sh, fixtures.sh and raise.sh drop `--room
+   --level ...` from those lines; `ckhash --room` goes).
+2. **One binary, grouped** (the structure below): `rewrite tree
+   hash|census|rows|project`, `rewrite check known|kernels|transfers`,
+   `rewrite bench frame|backward|storage`, `rewrite l1 table|probe|check`,
+   `rewrite run`, `rewrite cart`, `rewrite room`, `rewrite starts`;
+   src/bin/rewrite.rs split into src/bin/rewrite/{main, search, tree,
+   check, bench, l1, run}.rs.
+3. **J3**: `transpile` and `concrete_run` folded in (`rewrite l1 ...` through
+   one `frame::minus_one_table`, its cache key, pin and win-rect check;
+   `rewrite run --inputs F|LIST [--frames N] [--object T] [--dump-start]`
+   over `RefEngine::frame`, whole frames; `trajectory`, `follow`, `l1
+   check` on `frame` too, so `step`/`step_one` have no tool callers);
+   `chain.py --check-start` asks `rewrite run --dump-start`; the dump's
+   TYPES once (replay.py's list goes with phase 1b).
+4. **J13**: `check kernels` (ref-check + rerun-row + widen-check: one
+   sampler, three comparisons); `follow`'s kernel diff becomes
+   `check known`'s explanation of a "not in the tree" failure.
+5. **J9**: `tree census --frames A..B [--cell] [--erase] --by
+   frame|cell|column|age` (cell-growth, col-census, coarse-census, ckhash
+   --cells), on the Tree's row iterator.
+6. **J12**: `search::run(&SearchSpec) -> SearchResult` in the library
+   (the record `result.json` already is); `check known` is `run` with
+   `forward: ReuseOnly, concrete: false`; `filtered_for.txt` written by the
+   storage, not the binary.
+7. **J5's rest**: the arc pass's artifacts under the checkpoint dir in
+   their own format (`search --ui-data`: W's support, the reached nodes;
+   not `Visited`'s bincode read by byte offset); `export-ui --dir D --out O
+   [--witness --reference --download]` (no `--arc`, no `--room`);
+   gates/raise.sh compares two `result.json`s with the walls dropped.
+8. **J8's rest**: `storage::fingerprint` (state, edge, pair, note and the
+   line formatters) for ckhash, bench-frame, bench-storage and
+   bench-backward; arc-check on `par::Pool`; `rewrite formats` for
+   fixtures.sh.
+9. **J2's rest**: sweep the disk for format-13 trees, then `convert-tree`
+   and storage/convert.rs go; `edge-census` as the edge owner decides;
+   `spurious --chain-out` with `trajectory --spec/--tree`.
+10. **J10** (the UI) once Philippe has answered the questions below.
+
+### J10: questions for Philippe
+
+1. Which views stay? Today: the room heatmap with the ladder's horizon x
+   level grid and passes (space.ts, 1.7k lines), sizes, the timing
+   waterfall, rem. A search is now a LIST of levels (each a forward and an
+   arc phase) and one concrete result: is a level list what you want to
+   browse?
+2. Per level, what matters: states per frame and cell, the arc bound,
+   W's support and the reached nodes by frame, the forward's timings and
+   memory (forward.tsv)? Anything about the concrete search (its DFS/BFS
+   steps)?
+3. Several runs of one room (the categories, a room's other start
+   classes, a retried horizon): side by side in one view, or separate runs
+   in the switch as now?
+4. The witness against the community path, the input strip and the dash
+   markers: keep as they are?
+5. The arc artifacts cost disk (the mod room's W support: 230M nodes,
+   ~7 GB): written only on request (`--ui-data`), or always for the
+   runner's improvements?
+6. Old exports (format 1, the ladder's horizons and `bwd`): keep them
+   rendering, or re-export what is worth keeping and drop the code?
+7. The video export (export.ts): keep?
+8. Should run.json's schema be generated from the Rust types (`ts-rs`, a
+   build dependency) or checked by a test against data.ts?
+
 ## Ranking
 
 Score = lines x confidence / effort (effort in rough half-days).
