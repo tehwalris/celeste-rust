@@ -47,8 +47,6 @@ all.traced.kind.num 52942
 all.traced.kind.restrict 1818
 all.traced.kind.sel 59416
 all.traced.nodes 345357
-approx.frame.edge_bytes 272272778
-approx.frame.edge_millibytes_per_edge 3091
 calls.bodies 27197851
 calls.bodies_taken 12232367
 calls.calls 545
@@ -77,12 +75,15 @@ dyn.cat.d.store-field 73064186
 dyn.cat.d.store-live 7823514
 dyn.insts 916183228
 dyn.slices 139243
+frame.bundles 15117046
+frame.edge_bytes 8203868
+frame.edge_millibytes_per_edge 93
 frame.edges 88076797
 frame.emissions 88076797
 frame.kept 2597457
 frame.lanes_in 2226618
-frame.lids 935182
-frame.requests 2597457
+frame.routes 177
+frame.slices 3
 frame.units 545
 k.kernel_k71e1d8019968708a_212.dyn_insts 702240
 k.kernel_k71e1d8019968708a_212.fused_nodes 2448

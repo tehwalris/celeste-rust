@@ -292,7 +292,7 @@ pub fn bench_storage(a: &BenchArgs) -> Result<()> {
     for rep in 0..a.reps {
         let _ = std::fs::remove_dir_all(&scratch);
         let t = Instant::now();
-        let (wave, visited, xfers) = st.bench_wave(&engine, a.tree, Some(&scratch))?;
+        let (wave, visited, xfers) = st.bench_wave(&engine, a.tree, Some(&scratch), true)?;
         let all = t.elapsed();
         let w = &wave.stats;
         let (n, acc) = layer_fingerprint(&wave.next, &visited);
