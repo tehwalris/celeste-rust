@@ -1118,7 +1118,7 @@ pub struct ReachEdges<'a> {
 /// sources' keys kept where a source cell is one asked for.
 pub fn out_edges(store: &EdgeStore, frame: u32, sources: &[Sk], threads: usize) -> anyhow::Result<Vec<(usize, Sk, u32)>> {
     let geo = GEOMETRY;
-    let mut wanted: FxHashMap<(u32, (u64, u64)), Vec<(u32, usize)>> = FxHashMap::default();
+    let mut wanted: rustc_hash2::FxHashMap<(u32, (u64, u64)), Vec<(u32, usize)>> = Default::default();
     let mut regions: Vec<u32> = Vec::new();
     for (k, s) in sources.iter().enumerate() {
         wanted.entry((s.shape(&geo), s.key)).or_default().push((s.cell(&geo), k));

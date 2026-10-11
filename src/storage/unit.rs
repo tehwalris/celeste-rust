@@ -187,9 +187,14 @@ pub struct UnitSink<'a> {
     /// The unit's bundles by route, and its (route, source region) pairs.
     bundles: UnitBundles,
     src_regions: Vec<(u32, u32)>,
+    /// The unit's distinct sources (shape, key), and per lane from its
+    /// first its index there.
+    unit_sources: Vec<(u32, Key)>,
+    src_local: Vec<u32>,
+    src_idx: rustc_hash2::FxHashMap<(u32, Key), u32>,
     /// Per target the coarser level's verdict (`MarkFilter`), once a unit,
     /// decided in batches (a projection per block, not per row).
-    verdicts: FxHashMap<Target, u8>,
+    verdicts: rustc_hash2::FxHashMap<Target, u8>,
     /// The rows awaiting a verdict, per shape, and their targets.
     scratch: Vec<RowBuf>,
     scratch_at: Vec<Vec<Target>>,
@@ -275,6 +280,9 @@ impl<'a> UnitSink<'a> {
             sources,
             bundles: UnitBundles::default(),
             src_regions: Vec::new(),
+            unit_sources: Vec::new(),
+            src_local: Vec::new(),
+            src_idx: Default::default(),
             verdicts: Default::default(),
             scratch: Vec::new(),
             scratch_at: Vec::new(),
@@ -348,6 +356,30 @@ impl<'a> UnitSink<'a> {
         self.src_regions.clear();
         self.verdicts.clear();
         self.disallowed = false;
+        // The unit's sources: its lanes' (shape, key)s, distinct.
+        self.unit_sources.clear();
+        self.src_local.clear();
+        self.src_idx.clear();
+        if let Some(sources) = self.sources {
+            let rows = &sources.rows[src_base as usize + lo..src_base as usize + lo + ids.len()];
+            let mut last: Option<((u32, Key), u32)> = None;
+            for r in rows {
+                let s = (r.shape, r.key);
+                let k = match last {
+                    Some((l, k)) if l == s => k,
+                    _ => {
+                        let n = self.unit_sources.len() as u32;
+                        let k = *self.src_idx.entry(s).or_insert(n);
+                        if k == n {
+                            self.unit_sources.push(s);
+                        }
+                        last = Some((s, k));
+                        k
+                    }
+                };
+                self.src_local.push(k);
+            }
+        }
     }
 
     /// The level -1 filter at EMISSION: `Some(from)` where it drops every
@@ -529,9 +561,10 @@ impl<'a> UnitSink<'a> {
                 if self.src_regions.last() != Some(&(route, s.region)) {
                     self.src_regions.push((route, s.region));
                 }
-                self.bundles.insert(route, s.shape, s.key, x, super::bundle::offset(s.cell, cell), key, bit);
+                let sl = self.src_local[lane - self.lo];
+                self.bundles.insert(route, key, sl, x, super::bundle::offset(s.cell, cell), bit);
             }
-            _ => self.bundles.insert(route, 0, (0, 0), NO_XFER, 0, key, bit),
+            _ => self.bundles.insert(route, key, 0, NO_XFER, 0, bit),
         }
         Ok(())
     }
@@ -660,25 +693,27 @@ impl<'a> UnitSink<'a> {
             }
         }
         self.decide()?;
-        if self.disallowed {
-            let v = &self.verdicts;
-            self.bundles.retain_cells(|route, key, c| v.get(&(route, key, c as u8)) == Some(&VERDICT_NO));
-        }
+        let v = &self.verdicts;
+        let drop = |route: u32, key: Key, c: u32| v.get(&(route, key, c as u8)) == Some(&VERDICT_NO);
+        let buckets = self.bundles.drain(if self.disallowed { Some(&drop) } else { None });
         self.src_regions.sort_unstable();
         self.src_regions.dedup();
+        let sources: std::sync::Arc<[(u32, Key)]> = self.unit_sources.as_slice().into();
+        let mut buckets = buckets;
+        buckets.sort_unstable_by_key(|b| b.0);
         let mut srcs = self.src_regions.iter().peekable();
-        for (route, bundles) in self.bundles.drain() {
-            let mut sources = Vec::new();
+        for (route, targets, bundles) in buckets {
+            let mut src_regions = Vec::new();
             while let Some(&&(r, region)) = srcs.peek() {
                 if r > route {
                     break;
                 }
                 if r == route {
-                    sources.push(region);
+                    src_regions.push(region);
                 }
                 srcs.next();
             }
-            self.outbox.push(Chunk { route, unit: self.unit, worker: self.worker, bundles, sources });
+            self.outbox.push(Chunk { route, unit: self.unit, worker: self.worker, targets, sources: sources.clone(), bundles, src_regions });
         }
         crate::frame::phases::add(crate::frame::phases::END_UNIT, t);
         Ok(())

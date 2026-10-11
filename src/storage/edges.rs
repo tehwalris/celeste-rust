@@ -540,7 +540,7 @@ pub fn discard_after(dir: &Path, last: u32) -> Result<()> {
 /// segments of one frame and its source index.
 pub fn segments_of(edges: &[(Sk, Sk, u32)]) -> Result<(Vec<Segment>, Vec<(u32, Vec<u32>)>)> {
     let geo = GEOMETRY;
-    let mut by: std::collections::BTreeMap<u32, FxHashMap<(u32, super::visited::Key, u32, u32, super::visited::Key), u64>> = Default::default();
+    let mut by: std::collections::BTreeMap<u32, rustc_hash2::FxHashMap<(u32, super::visited::Key, u32, u32, super::visited::Key), u64>> = Default::default();
     let mut sources: std::collections::BTreeMap<u32, Vec<u32>> = Default::default();
     for &(s, t, x) in edges {
         let o = bundle::offset(s.cell(&geo), t.cell(&geo));

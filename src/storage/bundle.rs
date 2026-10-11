@@ -253,8 +253,8 @@ pub fn encode(bundles: &[Bundle], order: &[F; 5], out: &mut Vec<u8>) {
     write_dicts(&t, &s, out);
     // The records sorted by the order's fields (ranks through hash maps:
     // a dictionary's order is its keys').
-    let t_rank: rustc_hash::FxHashMap<Key, u32> = t.iter().enumerate().map(|(i, &k)| (k, i as u32)).collect();
-    let s_rank: rustc_hash::FxHashMap<(u32, Key), u32> = s.iter().enumerate().map(|(i, &k)| (k, i as u32)).collect();
+    let t_rank: rustc_hash2::FxHashMap<Key, u32> = t.iter().enumerate().map(|(i, &k)| (k, i as u32)).collect();
+    let s_rank: rustc_hash2::FxHashMap<(u32, Key), u32> = s.iter().enumerate().map(|(i, &k)| (k, i as u32)).collect();
     let mut recs: Vec<[u64; 5]> = bundles
         .iter()
         .map(|b| {
@@ -287,38 +287,42 @@ pub fn encode(bundles: &[Bundle], order: &[F; 5], out: &mut Vec<u8>) {
 }
 
 /// A bundle as the region phase holds it: its target named by an id (the
-/// region table's entry, whose key the encoder looks up), its source by key.
+/// region table's entry, whose key the encoder looks up), its source by
+/// its index in the route's source list.
 #[derive(Clone, Copy, Debug)]
 pub struct Tb {
     pub t: u32,
+    pub s: u32,
     pub x: u32,
     pub o: u32,
-    pub s_shape: u32,
-    pub s_key: Key,
     pub mask: u64,
 }
 
 /// The block encoder of the region phase (`ORDER`, the format `encode`
-/// writes), its scratch reused block to block: targets ranked through a
-/// dense array over their ids, sources through a hash map, the records
-/// sorted as three words.
+/// writes), its scratch reused block to block: targets and sources ranked
+/// through dense arrays over their ids; the records GROUPED by (mask,
+/// offset, transfer) - a block has few (room (6,2) f57: 21k-135k for 1-2.6M
+/// bundles) - the groups sorted, each group's (source, target) pairs
+/// sorted apart: no sort of the whole block.
 #[derive(Default)]
 pub struct Encoder {
     t_rank: Vec<u32>,
     tids: Vec<u32>,
-    s_idx: rustc_hash::FxHashMap<(u32, Key), u32>,
-    s_list: Vec<(u32, Key)>,
     s_perm: Vec<u32>,
-    item_s: Vec<u32>,
-    recs: Vec<[u64; 3]>,
+    gid: rustc_hash2::FxHashMap<(u64, u64), u32>,
+    groups: Vec<(u64, u64, u32)>,
+    item_g: Vec<u32>,
+    at: Vec<u32>,
+    st: Vec<u64>,
 }
 
-const _: () = assert!(matches!(ORDER, [F::M, F::O, F::X, F::S, F::T]), "Encoder packs ORDER's fields");
+const _: () = assert!(matches!(ORDER, [F::M, F::O, F::X, F::S, F::T]), "Encoder groups ORDER's fields");
 
 impl Encoder {
     /// `items` (distinct) as a raw block in `ORDER` into `out` (cleared):
-    /// target ids below `n_ids`, their keys `t_key(id)`.
-    pub fn encode(&mut self, items: &[Tb], n_ids: usize, t_key: impl Fn(u32) -> Key, out: &mut Vec<u8>) {
+    /// target ids below `n_ids`, their keys `t_key(id)`; source indices into
+    /// `sources` (distinct; each one some item's).
+    pub fn encode(&mut self, items: &[Tb], n_ids: usize, t_key: impl Fn(u32) -> Key, sources: &[(u32, Key)], out: &mut Vec<u8>) {
         out.clear();
         if self.t_rank.len() < n_ids {
             self.t_rank.resize(n_ids, u32::MAX);
@@ -336,59 +340,87 @@ impl Encoder {
         for (r, &(_, t)) in tk.iter().enumerate() {
             self.t_rank[t as usize] = r as u32;
         }
-        // The sources: distinct, numbered as met, then by key.
-        self.s_idx.clear();
-        self.s_list.clear();
-        self.item_s.clear();
-        for it in items {
-            let n = self.s_list.len() as u32;
-            let k = *self.s_idx.entry((it.s_shape, it.s_key)).or_insert(n);
-            if k == n {
-                self.s_list.push((it.s_shape, it.s_key));
-            }
-            self.item_s.push(k);
-        }
-        let mut order: Vec<u32> = (0..self.s_list.len() as u32).collect();
-        order.sort_unstable_by_key(|&i| self.s_list[i as usize]);
+        // The sources, by key.
+        let mut order: Vec<u32> = (0..sources.len() as u32).collect();
+        order.sort_unstable_by_key(|&i| sources[i as usize]);
         self.s_perm.clear();
         self.s_perm.resize(order.len(), 0);
         for (r, &i) in order.iter().enumerate() {
             self.s_perm[i as usize] = r as u32;
         }
         let t: Vec<Key> = tk.iter().map(|x| x.0).collect();
-        let s: Vec<(u32, Key)> = order.iter().map(|&i| self.s_list[i as usize]).collect();
+        let s: Vec<(u32, Key)> = order.iter().map(|&i| sources[i as usize]).collect();
         write_dicts(&t, &s, out);
-        // The records: [mask, o << 32 | x, s << 32 | t], sorted.
-        self.recs.clear();
-        for (it, &si) in items.iter().zip(&self.item_s) {
-            self.recs.push([it.mask, (it.o as u64) << 32 | it.x as u64, (self.s_perm[si as usize] as u64) << 32 | self.t_rank[it.t as usize] as u64]);
+        // The groups: (mask, o << 32 | x), numbered as met.
+        self.gid.clear();
+        self.groups.clear();
+        self.item_g.clear();
+        let mut last: Option<((u64, u64), u32)> = None;
+        for it in items {
+            let k = (it.mask, (it.o as u64) << 32 | it.x as u64);
+            let g = match last {
+                Some((l, g)) if l == k => g,
+                _ => {
+                    let n = self.groups.len() as u32;
+                    let g = *self.gid.entry(k).or_insert(n);
+                    if g == n {
+                        self.groups.push((k.0, k.1, 0));
+                    }
+                    last = Some((k, g));
+                    g
+                }
+            };
+            self.groups[g as usize].2 += 1;
+            self.item_g.push(g);
+        }
+        // The groups in order, each one's place; its (s << 32 | t)s there.
+        let mut by: Vec<u32> = (0..self.groups.len() as u32).collect();
+        by.sort_unstable_by_key(|&g| (self.groups[g as usize].0, self.groups[g as usize].1));
+        self.at.clear();
+        self.at.resize(self.groups.len(), 0);
+        let mut n = 0u32;
+        for &g in &by {
+            self.at[g as usize] = n;
+            n += self.groups[g as usize].2;
+        }
+        self.st.clear();
+        self.st.resize(items.len(), 0);
+        for (it, &g) in items.iter().zip(&self.item_g) {
+            let p = &mut self.at[g as usize];
+            self.st[*p as usize] = (self.s_perm[it.s as usize] as u64) << 32 | self.t_rank[it.t as usize] as u64;
+            *p += 1;
         }
         for &t in &self.tids {
             self.t_rank[t as usize] = u32::MAX;
         }
-        self.recs.sort_unstable();
-        debug_assert!(self.recs.windows(2).all(|w| w[0] != w[1]), "bundles distinct");
-        put_varint(out, self.recs.len() as u64);
-        let split = |r: &[u64; 3]| [r[0], r[1] >> 32, r[1] & 0xffff_ffff, r[2] >> 32, r[2] & 0xffff_ffff];
+        put_varint(out, items.len() as u64);
         let mut prev: Option<[u64; 5]> = None;
-        for r in &self.recs {
-            let vals = split(r);
-            let l = match prev {
-                None => 0,
-                Some(p) => (0..5).find(|&i| vals[i] != p[i]).expect("distinct records"),
-            };
-            out.push(l as u8);
-            for i in l..5 {
-                match ORDER[i] {
-                    F::O => put_off(out, vals[i] as u32),
-                    F::M => out.extend_from_slice(&vals[i].to_le_bytes()),
-                    _ => match prev {
-                        Some(p) if i == l => put_varint(out, vals[i] - p[i]),
-                        _ => put_varint(out, vals[i]),
-                    },
+        let mut a = 0usize;
+        for &g in &by {
+            let (mask, ox, len) = self.groups[g as usize];
+            let run = &mut self.st[a..a + len as usize];
+            run.sort_unstable();
+            debug_assert!(run.windows(2).all(|w| w[0] != w[1]), "bundles distinct");
+            for &st in run.iter() {
+                let vals = [mask, ox >> 32, ox & 0xffff_ffff, st >> 32, st & 0xffff_ffff];
+                let l = match prev {
+                    None => 0,
+                    Some(p) => (0..5).find(|&i| vals[i] != p[i]).expect("distinct records"),
+                };
+                out.push(l as u8);
+                for i in l..5 {
+                    match ORDER[i] {
+                        F::O => put_off(out, vals[i] as u32),
+                        F::M => out.extend_from_slice(&vals[i].to_le_bytes()),
+                        _ => match prev {
+                            Some(p) if i == l => put_varint(out, vals[i] - p[i]),
+                            _ => put_varint(out, vals[i]),
+                        },
+                    }
                 }
+                prev = Some(vals);
             }
-            prev = Some(vals);
+            a += len as usize;
         }
     }
 }
@@ -562,12 +594,19 @@ mod tests {
         let mut ids: Vec<Key> = bundles.iter().map(|b| b.t_key).collect();
         ids.sort_unstable();
         ids.dedup();
-        let items: Vec<Tb> = bundles.iter().map(|b| Tb { t: ids.binary_search(&b.t_key).unwrap() as u32 * 3 + 1, x: b.x, o: b.o, s_shape: b.s_shape, s_key: b.s_key, mask: b.mask }).collect();
+        let mut srcs: Vec<(u32, Key)> = bundles.iter().map(|b| (b.s_shape, b.s_key)).collect();
+        srcs.sort_unstable();
+        srcs.dedup();
+        srcs.reverse();
+        let items: Vec<Tb> = bundles
+            .iter()
+            .map(|b| Tb { t: ids.binary_search(&b.t_key).unwrap() as u32 * 3 + 1, s: srcs.iter().position(|&x| x == (b.s_shape, b.s_key)).unwrap() as u32, x: b.x, o: b.o, mask: b.mask })
+            .collect();
         let (mut a, mut b2) = (Vec::new(), Vec::new());
         encode(&bundles, &ORDER, &mut a);
         let mut enc = Encoder::default();
         for _ in 0..2 {
-            enc.encode(&items, ids.len() * 3 + 1, |t| ids[(t as usize - 1) / 3], &mut b2);
+            enc.encode(&items, ids.len() * 3 + 1, |t| ids[(t as usize - 1) / 3], &srcs, &mut b2);
             assert_eq!(a, b2, "Encoder and encode agree");
         }
         let mut raw = Vec::new();

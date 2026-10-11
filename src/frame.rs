@@ -859,6 +859,24 @@ fn state_layers(dir: &std::path::Path, last: u32) -> Result<crate::storage::wave
     Ok(layers)
 }
 
+/// A block's skeleton: its structure and uniform columns, its typed columns
+/// empty (`bench-storage`'s replay decodes with it).
+pub fn skeleton_of(rt2: &Rt2) -> Rt2 {
+    let mut s = celeste_engine::slots::reshape(rt2, 0);
+    s.cols = rt2
+        .cols
+        .iter()
+        .map(|c| match c {
+            Col::N(_) => Col::N(Vec::new()),
+            Col::I(_) => Col::I(Vec::new()),
+            Col::V(_) => Col::V(Vec::new()),
+            u => u.clone(),
+        })
+        .collect();
+    s.shape_hash = rt2.shape_hash;
+    s
+}
+
 /// The forward's in-memory state, EXTENDED frame by frame (each checkpointed).
 pub struct ForwardState {
     frontier: Vec<Block>,
@@ -1031,22 +1049,7 @@ impl ForwardState {
         let mut skeletons = rustc_hash::FxHashMap::default();
         for (i, b) in self.frontier.iter().enumerate() {
             blocks.insert((b.shard_shape(), b.seq()), i as u32);
-            skeletons.entry(b.shard_shape()).or_insert_with(|| {
-                let mut s = celeste_engine::slots::reshape(b.rt2(), 0);
-                s.cols = b
-                    .rt2()
-                    .cols
-                    .iter()
-                    .map(|c| match c {
-                        Col::N(_) => Col::N(Vec::new()),
-                        Col::I(_) => Col::I(Vec::new()),
-                        Col::V(_) => Col::V(Vec::new()),
-                        u => u.clone(),
-                    })
-                    .collect();
-                s.shape_hash = b.shard_shape();
-                s
-            });
+            skeletons.entry(b.shard_shape()).or_insert_with(|| skeleton_of(b.rt2()));
         }
         (blocks, skeletons)
     }

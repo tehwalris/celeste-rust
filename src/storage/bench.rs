@@ -273,7 +273,18 @@ pub fn bench_storage(a: &BenchArgs) -> Result<()> {
     let t = Instant::now();
     let st = crate::frame::ForwardState::at(a.tree, frame - 1, true, a.level, a.settings)?;
     eprintln!("[bench-storage] the tree at f{} ({} states, {} lanes in) in {:.1} s", frame - 1, st.visited_len(), st.frontier_lanes(), t.elapsed().as_secs_f64());
-    let (blocks, skeletons) = st.frontier_index();
+    let (blocks, mut skeletons) = st.frontier_index();
+    // Shapes the capture emits beyond the frontier's: a stored row's skeleton.
+    for f in (0..frame).rev() {
+        for (_, file) in crate::frame::frame_files(a.tree, f)? {
+            if skeletons.contains_key(&file.shape_hash()) || file.width() == 0 {
+                continue;
+            }
+            if let Some(row) = file.load_rows(&[0..1], a.settings.room, st.visited())? {
+                skeletons.insert(file.shape_hash(), crate::frame::skeleton_of(&row));
+            }
+        }
+    }
     let by_start = cap.units.iter().enumerate().map(|(i, u)| ((u.block, u.lo), i)).collect();
     let engine = Replay { cap: &cap, by_start, blocks, skeletons, level: a.level, settings: std::sync::Arc::new(a.settings.clone()) };
     let scratch = std::env::temp_dir().join(format!("celeste-bench-storage-{}", std::process::id()));

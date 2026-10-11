@@ -5,7 +5,6 @@
 //! real trees (plans/edges-target.md "The order").
 
 use anyhow::Result;
-use rustc_hash::FxHashMap;
 
 use super::bundle::{self, Bundle, F};
 use super::edges::EdgeStore;
@@ -20,7 +19,7 @@ const RAW: u8 = 0x40;
 /// A bundle's REFERENCE mask: its source key's cells in the frame's sources
 /// (`front`: layer `f - 1`, per (region, key)), shifted by the offset into
 /// the target region `slot` and clipped to it (up to four source regions).
-fn ref_mask(geo: &Geometry, front: &FxHashMap<(u32, Key), u64>, slot: u32, b: &Bundle) -> Option<u64> {
+fn ref_mask(geo: &Geometry, front: &rustc_hash2::FxHashMap<(u32, Key), u64>, slot: u32, b: &Bundle) -> Option<u64> {
     if b.o >= bundle::TO_NONE || slot == geo.no_cell_slot() {
         return None;
     }
@@ -155,7 +154,7 @@ pub fn orders(dir: &std::path::Path, from: u32, to: u32, threads: usize) -> Resu
     for f in from.max(1)..=to {
         let t0 = std::time::Instant::now();
         // Layer f - 1: per (region, key) its cells (the relative masks' reference).
-        let mut front: FxHashMap<(u32, Key), u64> = FxHashMap::default();
+        let mut front: rustc_hash2::FxHashMap<(u32, Key), u64> = Default::default();
         for (_, file) in crate::frame::frame_files(dir, f - 1)? {
             for r in 0..file.width() {
                 let id = file.id_at(r);
@@ -166,7 +165,7 @@ pub fn orders(dir: &std::path::Path, from: u32, to: u32, threads: usize) -> Resu
         let regions = store.regions(f);
         let parts: Vec<Result<Tot>> = super::wave::par_map(&regions, threads, |&region| -> Result<Tot> {
             let slot = region % geo.slots;
-            let mut by: FxHashMap<(u32, Key, u32, u32, Key), u64> = FxHashMap::default();
+            let mut by: rustc_hash2::FxHashMap<(u32, Key, u32, u32, Key), u64> = Default::default();
             let mut dec = super::edges::Decoder::default();
             for seg in store.segments(f, region) {
                 dec.bundles(&seg, |b| *by.entry((b.s_shape, b.s_key, b.x, b.o, b.t_key)).or_default() |= b.mask)?;
