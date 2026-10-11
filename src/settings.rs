@@ -59,6 +59,10 @@ pub struct Settings {
     /// The map and sprite flags of this PICO-8 cartridge instead of cart/
     /// (`--cart`, a map mod; recorded by its content hash).
     pub cart: Option<CartFile>,
+    /// The search starts from the state these inputs reach from the room's
+    /// load (`--start-inputs`; the reference engine, exact): frame 0 is
+    /// that state, the horizon counts from it.
+    pub start_inputs: Option<Vec<u8>>,
     // NOT recorded.
     /// The level -1 filter `(H, S)`, H in search steps (`--level-minus-one`;
     /// the tree records it as `TreeFilter`).
@@ -133,6 +137,7 @@ impl Default for Settings {
             loading_jank: None,
             balloon_seeds: None,
             cart: None,
+            start_inputs: None,
             level_minus_one: None,
             concrete_balloon_seeds: None,
             threads: None,
@@ -200,6 +205,7 @@ impl Settings {
     fn recorded(&self, level: &str) -> Vec<(&'static str, String)> {
         let opt = |v: Option<String>| v.unwrap_or_else(|| "none".to_string());
         let cart = self.cart.as_ref().map(|c| ("cart", format!("sha256:{}", c.sha256)));
+        let start = self.start_inputs.as_ref().map(|v| ("start_inputs", v.iter().map(|b| b.to_string()).collect::<Vec<_>>().join(",")));
         vec![
             ("room", format!("{},{}", self.room.0, self.room.1)),
             ("win_at", opt(self.win_at.map(|(x0, x1, y0, y1)| format!("{x0}..{x1},{y0}..{y1}")))),
@@ -215,13 +221,16 @@ impl Settings {
         ]
         .into_iter()
         .chain(cart)
+        .chain(start)
         .collect()
     }
 
     /// What the cart (so the kernels and the level -1 table) is a function
     /// of, besides the sources: the cache key of a level -1 table.
     pub fn cart_key(&self) -> String {
-        let s: Vec<String> = self.recorded("").into_iter().filter(|(k, _)| *k != "level").map(|(k, v)| format!("{k}={v}")).collect();
+        // Not the start: the table is built from the room's load (its spawn
+        // chain, the lattice walk), whatever state a search starts from.
+        let s: Vec<String> = self.recorded("").into_iter().filter(|(k, _)| *k != "level" && *k != "start_inputs").map(|(k, v)| format!("{k}={v}")).collect();
         s.join(" ")
     }
 
@@ -384,6 +393,12 @@ pub struct SettingsArgs {
     /// cart's (plans/map-mod.md).
     #[arg(long, global = true)]
     pub cart: Option<PathBuf>,
+    /// Start from the state these inputs reach from the room's load (a
+    /// file or a comma list, as `--prefer`; frame 0 is that state, the
+    /// horizon and the witness count from it): a route's second half. The
+    /// tree records them.
+    #[arg(long, global = true)]
+    pub start_inputs: Option<String>,
     /// The balloons' phases of the concrete phase only (a tasdatabase file's
     /// seeds): the witness is one real run under them.
     #[arg(long, global = true)]
@@ -460,6 +475,8 @@ impl SettingsArgs {
         };
         anyhow::ensure!(self.threads != Some(0), "--threads 0");
         let cart = self.cart.as_deref().map(CartFile::open).transpose()?;
+        let start_inputs = self.start_inputs.as_deref().map(crate::concrete::read_inputs).transpose()?;
+        anyhow::ensure!(start_inputs.as_ref().is_none_or(|v| v.iter().all(|&b| b < 64)), "--start-inputs: an input byte past 63");
         Ok(Settings {
             room: self.room,
             win_at: self.win_at,
@@ -472,6 +489,7 @@ impl SettingsArgs {
             loading_jank,
             balloon_seeds: self.balloon_seeds.clone(),
             cart,
+            start_inputs,
             level_minus_one,
             concrete_balloon_seeds: self.concrete_balloon_seeds.clone(),
             threads: self.threads,
@@ -587,6 +605,7 @@ pub fn startup(args: &SettingsArgs, adjust: impl FnOnce(&mut Settings)) -> Resul
     note("--gemskip", s.gemskip, String::new());
     note("--loading-jank ", s.loading_jank.is_some(), format!("{}", s.loading_jank.unwrap_or_default()));
     note("--balloon-seeds ", s.balloon_seeds.is_some(), s.balloon_seeds.clone().unwrap_or_default());
+    note("--start-inputs ", s.start_inputs.is_some(), format!("({} inputs)", s.start_inputs.as_ref().map_or(0, Vec::len)));
     note("--cart ", s.cart.is_some(), s.cart.as_ref().map_or(String::new(), |c| format!("{} (sha256 {})", c.path.display(), c.sha256)));
     note("--concrete-balloon-seeds ", s.concrete_balloon_seeds.is_some(), s.concrete_balloon_seeds.clone().unwrap_or_default());
     note("--level-minus-one ", s.level_minus_one.is_some(), s.level_minus_one.map_or(String::new(), |(h, v)| format!("{h},{v}")));

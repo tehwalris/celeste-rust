@@ -1455,6 +1455,7 @@ pub fn concrete_search(
     w: &Winning,
     bound: u32,
     prefer: Option<&[u8]>,
+    all_wins: Option<&std::path::Path>,
     s: &crate::settings::Settings,
 ) -> anyhow::Result<Option<Witness>> {
     use crate::frame::{wins_of, Block};
@@ -1487,11 +1488,15 @@ pub fn concrete_search(
     }
     let start = Block::canonical(initial)?;
     let start_cell = start.positions()?[0];
+    // `all_wins`: EVERY concrete win inside W by the horizon (the frame,
+    // the inputs, the state by name), not the first: the breadth-first
+    // search runs to the horizon, its wins kept (never expanded).
+    let mut all: Vec<(u32, Vec<u8>, String)> = Vec::new();
     // THE FAST PATH: a budgeted depth-first search for a win AT the bound,
     // inside `W_{H - bound + k}`, on one engine. Sound: a win here is at the
     // lower bound, hence optimal; an exhausted or abandoned DFS proves nothing
     // and the breadth-first search runs.
-    {
+    if all_wins.is_none() {
         struct Dfs<'a> {
             eng: &'a mut RefEngine,
             node: &'a NodeKeys<'a>,
@@ -1636,8 +1641,8 @@ pub fn concrete_search(
                                         // order) ends the search. Every successor of the last
                                         // layer can win - kept whole, room (4,3) 100% reached
                                         // 100 GB there.
-                                        got.push(Succ { parent: p as u32, byte, cell, win, exact, row: (!win).then(|| b.into_rt2()) });
-                                        if win {
+                                        got.push(Succ { parent: p as u32, byte, cell, win, exact, row: (!win || all_wins.is_some()).then(|| b.into_rt2()) });
+                                        if win && all_wins.is_none() {
                                             break 'chunk;
                                         }
                                     }
@@ -1662,7 +1667,16 @@ pub fn concrete_search(
         let mut seen: FxHashSet<celeste_engine::exact::ExactRow> = FxHashSet::default();
         let (mut next, mut links): (Vec<Rt2>, Vec<(u32, u8, u32)>) = (Vec::new(), Vec::new());
         let mut won: Option<(u32, u8, u32)> = None;
+        let mut won_rows: Vec<(u32, u8, Rt2)> = Vec::new();
+        let mut won_seen: FxHashSet<celeste_engine::exact::ExactRow> = FxHashSet::default();
         for s in succs {
+            if s.win && all_wins.is_some() {
+                won.get_or_insert((s.parent, s.byte, s.cell));
+                if won_seen.insert(s.exact) {
+                    won_rows.push((s.parent, s.byte, s.row.expect("a collected win keeps its state")));
+                }
+                continue;
+            }
             if s.win {
                 won = Some((s.parent, s.byte, s.cell));
                 break;
@@ -1681,6 +1695,39 @@ pub fn concrete_search(
             t.elapsed().as_secs_f64(),
             crate::metrics::current_rss_gb()
         );
+        // The path of `(parent, byte)` at layer k+1, back through the layers.
+        let path_of = |parent: u32, byte: u8| -> Vec<u8> {
+            let mut inputs = vec![byte];
+            let mut p = parent;
+            for layer in back.iter().rev() {
+                let (pp, b, _) = layer[p as usize];
+                inputs.push(b);
+                p = pp;
+            }
+            inputs.reverse();
+            inputs
+        };
+        for (parent, byte, row) in &won_rows {
+            let named = crate::search::inspect::project_all(row).swap_remove(0);
+            let text: Vec<String> = named.iter().map(|(k, v)| format!("{k}={v}")).collect();
+            all.push((k + 1, path_of(*parent, *byte), text.join(" ")));
+        }
+        if all_wins.is_some() {
+            if !won_rows.is_empty() {
+                eprintln!("[concrete] layer {:3}: {} distinct winning states (collected)", k + 1, won_rows.len());
+            }
+            if k + 1 == frames || next.is_empty() {
+                let p = all_wins.expect("collecting");
+                let text: String = all.iter().map(|(f, inputs, named)| format!("f{f} inputs {} | {named}\n", inputs.iter().map(|b| b.to_string()).collect::<Vec<_>>().join(","))).collect();
+                std::fs::write(p, text)?;
+                eprintln!("[concrete] {} winning states by f{} written to {}", all.len(), k + 1, p.display());
+                let first = all.first().map(|(_, inputs, _)| inputs.clone());
+                return Ok(first.map(|inputs| Witness { cells: Vec::new(), inputs }));
+            }
+            back.push(links);
+            cur = next;
+            continue;
+        }
         if let Some((parent, byte, cell)) = won {
             anyhow::ensure!(k + 1 >= bound, "a concrete win at f{} before the arc bound f{bound}: the backward lost a path", k + 1);
             // The path, back through the layers.
@@ -1758,6 +1805,7 @@ pub fn solve(
     save: Option<&std::path::Path>,
     prefer: Option<&[u8]>,
     known: Option<&super::known::Route>,
+    all_wins: Option<&std::path::Path>,
     s: &crate::settings::Settings,
 ) -> anyhow::Result<Solved> {
     use crate::frame::{mark_row, save_marks, MarkRow, Visited};
@@ -1778,8 +1826,13 @@ pub fn solve(
     crate::metrics::mem_phase("arc: backward");
     let tb = tb.elapsed().as_secs_f64();
     let start = w.index(seeds.start);
-    // The start has no player yet: any point stands for its remainder.
-    let p0 = (super::arcs::point(0), super::arcs::point(0));
+    // The start has no player yet: any point stands for its remainder -
+    // unless the search starts mid-room (`--start-inputs`): then the start
+    // state's EXACT remainder (the tree's row holds it widened).
+    let p0 = match &s.start_inputs {
+        None => (super::arcs::point(0), super::arcs::point(0)),
+        Some(_) => rem_of(&crate::trace::refengine::RefEngine::new(s)?.initial()?)?,
+    };
     let arc_steps = optimum(&w, start, p0, horizon);
     // In frames: a win at step s is during frame ceil(s / spf) (a lower
     // bound still: a frame's win is a win at its last step at the latest).
@@ -1890,7 +1943,7 @@ pub fn solve(
     drop(files);
     crate::metrics::mem_phase("arc: marks for the next level, edge files closed");
     let found = match (concrete, arc, &node) {
-        (true, Some(f), Some(node)) => concrete_search(level, horizon, node, &resolver.space, &w, f, prefer, s)?,
+        (true, Some(f), Some(node)) => concrete_search(level, horizon, node, &resolver.space, &w, f, prefer, all_wins, s)?,
         _ => None,
     };
     if let Some(wt) = &found {
@@ -2204,5 +2257,53 @@ mod tests {
             }
         }
         assert!(checked > 50, "only {checked} winning starts exercised");
+    }
+}
+
+#[cfg(test)]
+mod start_inputs_tests {
+    /// A route split in two: the search from the state its first part
+    /// reaches (`--start-inputs`) finds the rest at the same length. Room
+    /// (1,0) at the arc gate's synthetic win (9,101), optimum 33 from the
+    /// load (gates/arc_room10_win9-101_h35.txt): from the state after its
+    /// first 25 inputs the optimum is 8, and prefix + suffix replays to the
+    /// win on frame 33 from the load.
+    #[test]
+    fn a_route_split_at_a_frame_keeps_its_length_from_the_middle() {
+        use crate::frame::Block;
+        use crate::trace::refengine::RefEngine;
+        let gate: Vec<u8> = [0u8; 23].into_iter().chain([1, 17, 0, 0, 2, 32, 0, 0, 0, 0]).collect();
+        let prefix = gate[..25].to_vec();
+        let s = crate::settings::Settings { win_at: Some((9, 9, 101, 101)), start_inputs: Some(prefix.clone()), threads: Some(4), ..Default::default() };
+        let dir = std::env::temp_dir().join(format!("celeste-start-inputs-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let level = crate::abstraction::Level::EXACT;
+        crate::frame::grow_tree(
+            &dir,
+            12,
+            None,
+            None,
+            level,
+            || Ok(Box::new(crate::compiled::FrameEngine::new(&s, level)?)),
+            || Ok(vec![Block::canonical(RefEngine::new(&s)?.initial()?)?]),
+            &s,
+        )
+        .expect("forward");
+        let solved = super::solve(&dir, level, 12, true, false, None, None, None, None, &s).expect("solve");
+        assert_eq!(solved.arc, Some(8), "the arc optimum from the middle");
+        let suffix = solved.concrete.expect("a concrete witness").inputs;
+        assert_eq!(suffix.len(), 8);
+        // The stitched route from the room's load wins on frame 33 exactly.
+        let full_s = crate::settings::Settings { start_inputs: None, ..s.clone() };
+        let mut eng = RefEngine::new(&full_s).expect("engine");
+        let mut row = Block::canonical(eng.initial().expect("initial")).expect("canonical").into_rt2();
+        let route: Vec<u8> = prefix.iter().chain(&suffix).copied().collect();
+        for (i, &b) in route.iter().enumerate() {
+            let next = eng.step_one(&row, b).expect("one successor");
+            let won = crate::frame::wins_of(next.rt2(), &full_s).expect("wins")[0];
+            assert_eq!(won, i + 1 == route.len(), "the stitched route wins on its last frame (33), not on frame {}", i + 1);
+            row = next.into_rt2();
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

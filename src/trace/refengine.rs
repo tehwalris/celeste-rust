@@ -39,6 +39,9 @@ pub struct RefEngine {
     level: Level,
     /// The settings it was made under (its room, category, split frame).
     settings: std::sync::Arc<crate::settings::Settings>,
+    /// `--start-inputs`: the state they reach from the room's load, the
+    /// search's start (`initial`) instead of the load's.
+    start: Option<Rt2>,
 }
 
 // The raw pointers inside (`Interp`'s AST references) point into the
@@ -67,7 +70,25 @@ impl RefEngine {
         crate::trace::cart::inject_tile_flag_at(&mut st0);
         let base = run_one(&mut it, init, st0)?;
         let fn_info = fn_info_of(&base)?;
-        Ok(RefEngine { it, body, body_concrete, base, fn_info, path_cap: 1_000_000, level: Level::EXACT, settings: std::sync::Arc::new(s.clone()) })
+        let mut e = RefEngine { it, body, body_concrete, base, fn_info, path_cap: 1_000_000, level: Level::EXACT, settings: std::sync::Arc::new(s.clone()), start: None };
+        if let Some(inputs) = &s.start_inputs {
+            e.start = Some(e.replay(inputs)?);
+        }
+        Ok(e)
+    }
+
+    /// The state `inputs` reach from the room's load: one concrete leaf a
+    /// frame (a fork - an unseeded `rnd` - is refused), still in the room.
+    fn replay(&mut self, inputs: &[u8]) -> Result<Rt2> {
+        let mut row = Block::canonical(to_block(&self.base, &self.settings)?)?.into_rt2();
+        for (f, &b) in inputs.iter().enumerate() {
+            let mut out = self.frame(&row, b)?;
+            ensure!(out.len() == 1, "--start-inputs: frame {} forks into {} states (an unseeded `rnd`? give --balloon-seeds)", f + 1, out.len());
+            let next = out.remove(0);
+            ensure!(!crate::frame::wins_of(next.rt2(), &self.settings)?.iter().any(|&w| w), "--start-inputs: the inputs win (leave the room) on frame {}", f + 1);
+            row = next.into_rt2();
+        }
+        Ok(row)
     }
 
     /// The engine with `run_lane` at `level`.
@@ -84,6 +105,9 @@ impl RefEngine {
 
     /// The room's start (post-`_init`) as a one-row block, without keys.
     pub fn initial(&self) -> Result<Rt2> {
+        if let Some(r) = &self.start {
+            return Ok(r.clone_block());
+        }
         to_block(&self.base, &self.settings)
     }
 

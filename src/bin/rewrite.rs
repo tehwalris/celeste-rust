@@ -113,6 +113,12 @@ enum Command {
         /// the search fails if one drops it.
         #[arg(long)]
         prefer: Option<String>,
+        /// Collect EVERY concrete win inside the last level's W by the
+        /// horizon into FILE (`f<frame> inputs a,b,.. | field=value ..` a
+        /// line), not only the first: the waypoints a `--start-inputs`
+        /// search continues from. The breadth-first search runs to the horizon.
+        #[arg(long)]
+        all_wins: Option<String>,
     },
     /// A KNOWN solution against the pruning of finished search trees
     /// (`search::known`): stepped through the reference engine, at every
@@ -808,7 +814,7 @@ fn main() -> Result<()> {
     })?;
 
     match cli.command {
-        Command::Search { to, ceiling, level, checkpoint_dir, no_witness, save_marks, prefer } => {
+        Command::Search { to, ceiling, level, checkpoint_dir, no_witness, save_marks, prefer, all_wins } => {
             let prefer: Option<Vec<u8>> = prefer.as_deref().map(celeste_rust::concrete::read_inputs).transpose()?;
             use celeste_rust::search::arc_dp::solve;
             let horizon = match (ceiling, to) {
@@ -870,7 +876,7 @@ fn main() -> Result<()> {
                 let concrete = last && !no_witness;
                 // Every level saves its marks (the next overwrites).
                 let known = prefer.as_deref().map(|inputs| celeste_rust::search::known::Route { inputs, filter: filter.as_ref() });
-                let s = solve(&dir, lvl, steps, concrete, !last, save_marks.as_deref().map(std::path::Path::new), prefer.as_deref(), known.as_ref(), &cfg)?;
+                let s = solve(&dir, lvl, steps, concrete, !last, save_marks.as_deref().map(std::path::Path::new), prefer.as_deref(), known.as_ref(), all_wins.as_deref().map(std::path::Path::new), &cfg)?;
                 let wall = t0.elapsed().as_secs_f64();
                 let Some(bound) = s.arc else {
                     anyhow::ensure!(ceiling.is_none(), "ceiling {horizon} REFUTED by the arc search at level {li} ({lvl}): a known solution the model cannot reproduce");
@@ -891,6 +897,15 @@ fn main() -> Result<()> {
                             w.inputs_text()
                         ),
                     )?;
+                    if let Some(prefix) = &cfg.start_inputs {
+                        // A second half: the frames count from the start state;
+                        // the route from the room's load is the prefix + this.
+                        let full: Vec<String> = prefix.iter().chain(&w.inputs).map(|b| b.to_string()).collect();
+                        let fpath = base.join(format!("route_frame_{}.txt", prefix.len() + f));
+                        std::fs::write(&fpath, format!("# --start-inputs ({} frames) + the witness ({f} frames): optimal FROM the start state only\n{}\n", prefix.len(), full.join(",")))?;
+                        println!("OPTIMAL from the start state: {f} frames ({wall:.1} s); witness {}; the route from the room's load: {} frames, {}", path.display(), prefix.len() + f, fpath.display());
+                        return Ok(());
+                    }
                     println!("OPTIMAL win frame: {f} ({wall:.1} s); witness {}", path.display());
                     return Ok(());
                 }
@@ -922,7 +937,7 @@ fn main() -> Result<()> {
                 );
                 let filter = prev.as_ref().map(|(m, l)| celeste_rust::frame::MarkFilter::new(m, *l, cfg.steps_per_frame()));
                 let route = celeste_rust::search::known::Route { inputs: &inputs, filter: filter.as_ref() };
-                let s = solve(&dir, lvl, steps, false, !last, None, None, Some(&route), &cfg)?;
+                let s = solve(&dir, lvl, steps, false, !last, None, None, Some(&route), None, &cfg)?;
                 let f = s.known.ok_or_else(|| anyhow::anyhow!("the known route does not exit by f{horizon}: nothing to check"))?;
                 println!("[check-known] level {li} ({lvl}): the known route (exit f{f}) survives (arc bound {:?})", s.arc);
                 if last {

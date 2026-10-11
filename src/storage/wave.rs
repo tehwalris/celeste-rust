@@ -738,7 +738,10 @@ pub fn seed(visited: &mut VisitedSet, blocks: &mut [Block], level: crate::abstra
     let mut meta = FrameMeta::new();
     // The key space: every initial code, per field sorted; then the keys.
     // A row is keyed as the forward keys a reference row (`UnitSink::row_key`:
-    // the level's held buttons widened) and stored as it is.
+    // the level's held buttons widened) and stored as its key decodes: the
+    // WIDENED row (plans/rows-from-keys.md; the room's load has nothing the
+    // boundary widens, a mid-room start (`--start-inputs`) its player's
+    // remainder).
     let ids = crate::compiled::ids();
     let level = crate::abstraction::Level { held: level.held, ..level.boundary() };
     let mut canon: Vec<Rt2> = Vec::with_capacity(blocks.len());
@@ -796,7 +799,7 @@ pub fn seed(visited: &mut VisitedSet, blocks: &mut [Block], level: crate::abstra
         order.sort_unstable_by_key(|&l| ids[l as usize]);
         let sorted: Vec<StateId> = order.iter().map(|&l| ids[l as usize]).collect();
         ensure!(canon[seq].shape_hash == b.shard_shape(), "an initial block is not canonical");
-        let mut rt2 = canon[seq].clone_block();
+        let mut rt2 = views[seq].clone_block();
         rt2.row_keys = keys[seq].clone();
         rt2.gather_lanes(&order);
         *b = Block::layer_piece(rt2, sorted, seq as u32);
