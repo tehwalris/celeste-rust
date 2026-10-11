@@ -669,6 +669,8 @@ impl<'a> Backward<'a> {
             }
             (out, made)
         });
+        // The old sets so far are in the ranges' outputs now.
+        drop(acc);
         // The ranges' new sets become the step's own, once each.
         let mut acc = Vec::with_capacity(outs.iter().map(|o| o.0.len()).sum());
         for (out, made) in outs {
@@ -793,6 +795,10 @@ impl<'a> Backward<'a> {
             o
         });
         drop(acc);
+        // The frame done last is in the ranges' outputs now: dropped before
+        // they are joined (two copies of a frame at most, not three).
+        self.cur = Vec::new();
+        self.changed = Vec::new();
         // In range order: the step's sets that a node keeps go into the
         // arena (once each), the ranges are joined.
         let mut to_arena: Vec<u32> = vec![u32::MAX; local.len()];
