@@ -2529,11 +2529,30 @@ fn reach_command(checkpoint_dir: &str, level_index: usize, to: u32, save: Option
     let mut extent: Vec<(u32, i32, i32, i32, i32, u64, u64)> = Vec::new();
     let point = celeste_rust::search::arc_dp::start_point(cfg)?;
     let t0 = std::time::Instant::now();
-    // Per frame, the reached sets' shapes (`rem_stats.tsv`).
-    let mut rem_stats = String::from("frame\taxis\tof\tbucket\tstates\texact_states\n");
+    // Written frame by frame (a run stopped part way keeps them): the
+    // frames' sums (`reach.tsv`) and the reached sets' shapes
+    // (`rem_stats.tsv`).
+    const TSV_HEAD: &str = "frame\tstates\tnew\tentered\tentered_edges\treached_edges\tpushes\tpushes_nonempty\tpoints\tcells\tforward_layer\tcoarsened\tinexact\tmax_k\tx_min\tx_max\ty_min\ty_max\treached_with_dropped_successors\tdrop_noted_cells\n";
+    let save_dir = save.map(std::path::Path::new);
+    if let Some(d) = save_dir {
+        std::fs::create_dir_all(d)?;
+    }
+    let mut tsv_file = save_dir.map(|d| std::fs::File::create(d.join("reach.tsv")).map(std::io::LineWriter::new)).transpose()?;
+    let mut rem_file = save_dir.map(|d| std::fs::File::create(d.join("rem_stats.tsv")).map(std::io::LineWriter::new)).transpose()?;
+    if let Some(f) = &mut tsv_file {
+        f.write_all(TSV_HEAD.as_bytes())?;
+    }
+    if let Some(f) = &mut rem_file {
+        f.write_all(b"frame\taxis\tof\tbucket\tstates\texact_states\n")?;
+    }
+    let mut tsv = String::from(TSV_HEAD);
     let pool = celeste_rust::par::Pool::new(cfg.threads());
-    let r = celeste_rust::search::reach::reach(&dir, steps, point, cfg.threads(), |t, cur, inexact| {
-        rem_stats += &rem_shapes(t, cur, inexact, &pool)?;
+    let r = celeste_rust::search::reach::reach(&dir, steps, point, cfg.threads(), |fr, pushes, cur, inexact| {
+        let t = fr.frame;
+        let shapes = rem_shapes(t, cur, inexact, &pool)?;
+        if let Some(f) = &mut rem_file {
+            f.write_all(shapes.as_bytes())?;
+        }
         let (mut x0, mut x1, mut y0, mut y1) = (i32::MAX, i32::MIN, i32::MAX, i32::MIN);
         let mut per_cell: rustc_hash::FxHashMap<u32, u64> = Default::default();
         for (s, _) in cur {
@@ -2564,6 +2583,15 @@ fn reach_command(checkpoint_dir: &str, level_index: usize, to: u32, save: Option
             noted = cur.iter().filter(|(s, _)| by.get(&(s.region, s.key)).is_some_and(|m| m >> s.local & 1 == 1)).count() as u64;
         }
         extent.push((t, x0, x1, y0, y1, noted, notes_n));
+        let p = pushes.unwrap_or_default();
+        let line = format!(
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+            t, fr.states, fr.new, fr.entered, fr.entered_edges, fr.reached_edges, p.edges, p.nonempty, fr.points, fr.cells, fr.forward_layer, fr.coarsened, fr.inexact, fr.max_k, x0, x1, y0, y1, noted, notes_n
+        );
+        if let Some(f) = &mut tsv_file {
+            f.write_all(line.as_bytes())?;
+        }
+        tsv += &line;
         if let Some(((rx0, rx1), (ry0, ry1))) = rect {
             let inside: Vec<_> = cur
                 .iter()
@@ -2587,14 +2615,7 @@ fn reach_command(checkpoint_dir: &str, level_index: usize, to: u32, save: Option
         Ok(())
     })?;
     println!("[reach] {} to f{to}, {:.1} s", dir.display(), t0.elapsed().as_secs_f64());
-    let mut tsv = String::from("frame\tstates\tnew\tentered\tentered_edges\treached_edges\tpushes\tpushes_nonempty\tpoints\tcells\tforward_layer\tcoarsened\tinexact\tmax_k\tx_min\tx_max\ty_min\ty_max\treached_with_dropped_successors\tdrop_noted_cells\n");
-    for (f, e) in r.frames.iter().zip(&extent) {
-        let p = r.pushes.get(f.frame as usize).copied().unwrap_or_default();
-        let line = format!("{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}", f.frame, f.states, f.new, f.entered, f.entered_edges, f.reached_edges, p.edges, p.nonempty, f.points, f.cells, f.forward_layer, f.coarsened, f.inexact, f.max_k, e.1, e.2, e.3, e.4, e.5, e.6);
-        println!("{line}");
-        tsv += &line;
-        tsv.push('\n');
-    }
+    print!("{tsv}");
     // Against the forward: its visited states and its emissions (records)
     // over the same frames.
     let fwd = std::fs::read_to_string(dir.join("forward.tsv")).unwrap_or_default();
@@ -2644,8 +2665,6 @@ fn reach_command(checkpoint_dir: &str, level_index: usize, to: u32, save: Option
     if let Some(d) = save {
         let d = std::path::Path::new(d);
         std::fs::create_dir_all(d)?;
-        std::fs::write(d.join("reach.tsv"), &tsv)?;
-        std::fs::write(d.join("rem_stats.tsv"), &rem_stats)?;
         std::fs::write(d.join("summary.txt"), &summary)?;
         let rows: Vec<celeste_rust::frame::MarkRow> = r
             .last

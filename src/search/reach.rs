@@ -158,10 +158,13 @@ pub fn points(r: &Region) -> u64 {
 }
 
 /// EXACT REACH over the tree in `dir` up to `horizon` (search steps) from
-/// its start at `point` (`arc_dp::rem_of`'s encoding). `visit(t, states,
-/// inexact)` sees every frame's reached states and sets, and the inexact
-/// ones with their coarsest grid (the caller's facts).
-pub fn reach(dir: &std::path::Path, horizon: u32, point: (u32, u32), threads: usize, mut visit: impl FnMut(u32, &[(Sk, Region)], &FxHashMap<Sk, u8>) -> Result<()>) -> Result<Reach> {
+/// its start at `point` (`arc_dp::rem_of`'s encoding). `visit(sums,
+/// pushes, states, inexact)` sees every frame's sums once they are whole
+/// (its pushes to the next frame, none at the last), its reached states
+/// and sets, and the inexact ones with their coarsest grid (the caller's
+/// facts, written as they come).
+#[allow(clippy::type_complexity)]
+pub fn reach(dir: &std::path::Path, horizon: u32, point: (u32, u32), threads: usize, mut visit: impl FnMut(&FrameReach, Option<Pushes>, &[(Sk, Region)], &FxHashMap<Sk, u8>) -> Result<()>) -> Result<Reach> {
     let geo = GEOMETRY;
     let seeds = super::arc_dp::Seeds::load(dir, horizon)?;
     let tree = crate::storage::layer::Tree::open(dir, horizon)?;
@@ -200,8 +203,8 @@ pub fn reach(dir: &std::path::Path, horizon: u32, point: (u32, u32), threads: us
         }
         let max_k = inexact.values().copied().max().unwrap_or(0);
         frames.push(FrameReach { new, coarsened, inexact: inexact.len() as u64, max_k, ..sum(t, &cur) });
-        visit(t, &cur, &inexact)?;
         if t == horizon || cur.is_empty() {
+            visit(&frames[frames.len() - 1], None, &cur, &inexact)?;
             break;
         }
         let tt = std::time::Instant::now();
@@ -419,6 +422,7 @@ pub fn reach(dir: &std::path::Path, horizon: u32, point: (u32, u32), threads: us
             t_read,
             tt.elapsed().as_secs_f64()
         );
+        visit(&frames[frames.len() - 1], pushes.last().copied(), &cur, &inexact)?;
         cur = nx;
         inexact = next_inexact;
     }
@@ -473,7 +477,7 @@ mod tests {
         let tree = crate::storage::layer::Tree::open(&dir, 35).expect("tree");
         let mut per_frame: Vec<Vec<crate::storage::Sk>> = Vec::new();
         let mut sets: Vec<Vec<(crate::storage::Sk, super::Region)>> = Vec::new();
-        let r = super::reach(&dir, 35, p0, 4, |_, cur, inexact| {
+        let r = super::reach(&dir, 35, p0, 4, |_, _, cur, inexact| {
             assert!(inexact.is_empty(), "room (1,0) to h35 needs no coarsening");
             per_frame.push(cur.iter().map(|c| c.0).collect());
             sets.push(cur.to_vec());
