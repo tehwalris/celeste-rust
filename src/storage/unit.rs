@@ -262,6 +262,9 @@ pub struct UnitSink<'a> {
     l1: Option<&'static crate::trace::level_minus_one::CostToGo>,
     drop_last: Option<((u64, u32), Option<u32>)>,
     xfer_ids: FxHashMap<crate::search::arc_edges::Pair, u32>,
+    /// Per local transfer id, the edges this worker recorded with it (the
+    /// frame's new transfers are numbered by their count: `wave`).
+    xfer_counts: Vec<u64>,
     xfer_cache: Vec<(crate::compiled::asm_kernel::RawWords, u32)>,
     /// The worker's transfer table (the wave's gather reads it), and its
     /// length.
@@ -345,6 +348,7 @@ impl<'a> UnitSink<'a> {
             l1,
             drop_last: None,
             xfer_ids: Default::default(),
+            xfer_counts: Vec::new(),
             xfer_cache: Vec::new(),
             xfer_tab,
             xfer_len: 0,
@@ -376,6 +380,7 @@ impl<'a> UnitSink<'a> {
                 + 8 * self.lanes.capacity()
                 + 32 * self.src_idx.capacity()
                 + 40 * self.xfer_ids.capacity()
+                + 8 * self.xfer_counts.capacity()
                 + std::mem::size_of::<(crate::compiled::asm_kernel::RawWords, u32)>() * self.xfer_cache.capacity()
                 + self.outbox.iter().map(|c| c.alloc_bytes()).sum::<usize>(),
         ]
@@ -579,7 +584,13 @@ impl<'a> UnitSink<'a> {
         self.xfer_tab.write().expect("a transfer table").push(t);
         self.xfer_len += 1;
         self.xfer_ids.insert(t, id);
+        self.xfer_counts.push(0);
         id
+    }
+
+    /// Per local transfer id, the edges this worker recorded with it.
+    pub fn xfer_counts(&self) -> &[u64] {
+        &self.xfer_counts
     }
 
     /// The transfers this worker has met (its table's length).
@@ -749,6 +760,7 @@ impl<'a> UnitSink<'a> {
             if self.src_regions.last() != Some(&(route, t.s_region[i])) {
                 self.src_regions.push((route, t.s_region[i]));
             }
+            self.xfer_counts[xfers[i] as usize] += 1;
             let b = (route, e.keys[i], t.src[i], xfers[i], t.offset[i]);
             match &mut pending {
                 Some(p) if (p.0, p.1, p.2, p.3, p.4) == b => p.5 |= 1u64 << t.local[i],

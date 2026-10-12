@@ -105,13 +105,16 @@ pub struct RouteState {
     /// visited set lacks, per key (an indexed `set::RegionTable`; frozen at
     /// the frame's end, `seal`). The visited set is read only.
     pub next: RegionTable,
-    /// Bundles into provisional targets, per job (slice) a segment
-    /// encoded with their provisional keys: encoded again at the frame's
-    /// end with their final keys. Held as zstd blocks, not bundles: the
-    /// mod room's f53 (+95) held 103M of them, 5.8 GB as structs.
+    /// The bundles that WAIT for the frame's end: into a provisional
+    /// target (a code new this frame: no final key yet) or with a transfer
+    /// new this frame (no canonical id yet: `edges::XferTable::canonical`),
+    /// per job (slice) a segment encoded with the provisional keys and ids,
+    /// encoded again at the frame's end with the final ones (`seal`). Held
+    /// as zstd blocks, not bundles: the mod room's f53 (+95) held 103M into
+    /// provisional targets, 5.8 GB as structs.
     pub prov: Vec<(u32, Segment)>,
-    /// Its segments with their kind (0: a job's, 1: a job's provisional
-    /// bundles made final) and slice: jobs of a route may run out of slice
+    /// Its segments with their kind (0: a job's, 1: a job's bundles that
+    /// waited, made final) and slice: jobs of a route may run out of slice
     /// order; the file has them in this one (`seal`).
     pub segs: Vec<((u8, u32), Segment)>,
     /// The source regions its edges leave.
@@ -134,6 +137,9 @@ pub struct RegionCtx<'a> {
     pub record: bool,
     /// Per worker, its local transfer ids' global ones.
     pub remaps: &'a [Vec<u32>],
+    /// The global ids from here on are this frame's new transfers', in the
+    /// order the slices met them: provisional until the frame's end.
+    pub new_xfers: u32,
     /// A raise's per-state layers: a hit on a state of a later layer than
     /// the frame is refused.
     pub layers: Option<&'a super::wave::StateLayers>,
@@ -487,7 +493,8 @@ pub fn run_route(st: &mut RouteState, visited: Option<&RegionTable>, slice: u32,
         if !record {
             continue;
         }
-        // THE EDGES (a provisional target's wait for its key: the frame's end).
+        // THE EDGES (a provisional target's wait for its key, a new
+        // transfer's for its id: the frame's end).
         sc.s_of.clear();
         sc.s_of.resize(c.sources.len(), u32::MAX);
         for b in &c.bundles {
@@ -496,7 +503,7 @@ pub fn run_route(st: &mut RouteState, visited: Option<&RegionTable>, slice: u32,
             }
             let x = *remap.get(b.x as usize).ok_or_else(|| anyhow::anyhow!("frame {}: a bundle's transfer {} of worker {} has no global id", cx.frame, b.x, c.worker))?;
             let e = sc.e_of[b.t as usize];
-            if e == PROV {
+            if e == PROV || x >= cx.new_xfers {
                 let (s_shape, s_key) = c.sources[b.s as usize];
                 sc.prov.push(Bundle { s_shape, s_key, x, o: b.o, t_key: c.targets[b.t as usize].0, mask: b.mask });
                 continue;
@@ -538,37 +545,62 @@ pub struct Sealed {
     pub table: RegionTable,
 }
 
+/// The frame's new transfers' canonical ids (`edges::XferTable::
+/// canonical`): an id from `first` on is `first + perm[id - first]`.
+pub struct Renumber<'a> {
+    pub first: u32,
+    pub perm: &'a [u32],
+}
+
+impl Renumber<'_> {
+    #[inline]
+    fn id(&self, x: u32) -> u32 {
+        if x < self.first {
+            x
+        } else {
+            self.first + self.perm[(x - self.first) as usize]
+        }
+    }
+}
+
 /// THE FRAME'S END of a route (its shape numbered: `region`): provisional
 /// keys made final (`finals`), its new states FROZEN (sorted by key:
-/// canonical), the bundles into provisional targets encoded.
-pub fn seal(st: &mut RouteState, region: u32, finals: &FxHashMap<Key, Key>, sc: &mut Scratch) -> Result<Sealed> {
+/// canonical), the bundles that waited encoded with their final keys and
+/// transfer ids (`renumber`: `None` where the frame's new transfers are in
+/// order already).
+pub fn seal(st: &mut RouteState, region: u32, finals: &FxHashMap<Key, Key>, renumber: Option<&Renumber>, sc: &mut Scratch) -> Result<Sealed> {
     st.region = Some(region);
     for seg in &mut st.segs {
         seg.1.region = region;
     }
     st.next.rekey(|k| if is_provisional(k) { finals.get(&k).copied().ok_or_else(|| anyhow::anyhow!("a provisional key without its final key")) } else { Ok(k) })?;
     st.next.freeze();
-    // Each job's bundles into provisional targets, decoded and encoded
-    // again with the final keys (a segment a job, as it was made).
+    // Each job's bundles that waited, decoded and encoded again with the
+    // final keys and ids (a segment a job, as it was made).
     let mut dz = zstd::bulk::Decompressor::new()?;
     let mut raw: Vec<u8> = Vec::new();
     for (slice, seg) in std::mem::take(&mut st.prov) {
         bundle::decompress(&seg.bytes, seg.raw as usize, &mut dz, &mut raw)?;
         let mut v: Vec<Bundle> = Vec::with_capacity(seg.bundles as usize);
         let mut missing = false;
-        bundle::Block::open(&raw, &bundle::ORDER)?.bundles(|mut b| match finals.get(&b.t_key) {
-            Some(&k) => {
-                b.t_key = k;
-                v.push(b);
+        bundle::Block::open(&raw, &bundle::ORDER)?.bundles(|mut b| {
+            if is_provisional(b.t_key) {
+                match finals.get(&b.t_key) {
+                    Some(&k) => b.t_key = k,
+                    None => missing = true,
+                }
             }
-            None => missing = true,
+            if let Some(rn) = renumber {
+                b.x = rn.id(b.x);
+            }
+            v.push(b);
         })?;
         ensure!(!missing, "a provisional target key without its final key");
-        ensure!(v.len() == seg.bundles as usize, "a provisional segment of {} bundles decoded to {}", seg.bundles, v.len());
+        ensure!(v.len() == seg.bundles as usize, "a waiting segment of {} bundles decoded to {}", seg.bundles, v.len());
         st.segs.push(((1, slice), Segment::encode(region, &mut v, &mut sc.raw, &mut sc.z)?));
     }
-    // The file's order: the jobs' segments by slice, then the provisional
-    // ones by slice (one job a (route, slice): the keys are distinct).
+    // The file's order: the jobs' segments by slice, then the ones that
+    // waited by slice (one job a (route, slice): the keys are distinct).
     st.segs.sort_unstable_by_key(|s| s.0);
     Ok(Sealed { region, table: std::mem::take(&mut st.next) })
 }
