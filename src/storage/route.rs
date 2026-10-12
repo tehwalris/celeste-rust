@@ -329,6 +329,13 @@ impl UnitBundles {
 pub struct Scratch {
     /// The job's bundles into provisional targets.
     prov: Vec<Bundle>,
+    /// The job's targets: their names in the job (dense, as met) by their
+    /// place (a visited entry, or past the visited entries a next-layer
+    /// entry), and their keys - so the encoder's arrays are the job's size,
+    /// not its region's (a region of 24M entries made each job's ranks
+    /// 96 MB: 2 GB over 16 workers on the mod room).
+    t_loc: rustc_hash2::FxHashMap<u32, u32>,
+    t_keys: Vec<Key>,
     e_of: Vec<u32>,
     s_of: Vec<u32>,
     s_idx: rustc_hash2::FxHashMap<(u32, Key), u32>,
@@ -362,12 +369,16 @@ impl Scratch {
             self.s_idx = Default::default();
             self.s_list = Vec::new();
         }
+        if self.t_loc.capacity() > SCRATCH_KEEP {
+            self.t_loc = Default::default();
+            self.t_keys = Vec::new();
+        }
     }
 
     /// Bytes its buffers hold (`--phases`' `[wavemem]`): the job's
     /// bundles, the encoder's, the raw block, the rest.
     pub fn alloc_bytes(&self) -> [usize; 4] {
-        [std::mem::size_of::<bundle::Tb>() * self.tbs.capacity() + std::mem::size_of::<Bundle>() * self.prov.capacity(), self.enc.alloc_bytes(), self.raw.capacity(), 4 * (self.e_of.capacity() + self.s_of.capacity()) + 32 * self.s_idx.capacity() + 24 * self.s_list.capacity()]
+        [std::mem::size_of::<bundle::Tb>() * self.tbs.capacity() + std::mem::size_of::<Bundle>() * self.prov.capacity(), self.enc.alloc_bytes(), self.raw.capacity(), 4 * (self.e_of.capacity() + self.s_of.capacity()) + 32 * self.s_idx.capacity() + 24 * self.s_list.capacity() + 9 * self.t_loc.capacity() + 16 * self.t_keys.capacity()]
     }
 }
 
@@ -389,6 +400,8 @@ impl Default for Scratch {
     fn default() -> Self {
         Scratch {
             prov: Vec::new(),
+            t_loc: Default::default(),
+            t_keys: Vec::new(),
             e_of: Vec::new(),
             s_of: Vec::new(),
             s_idx: Default::default(),
@@ -414,8 +427,10 @@ pub fn run_route(st: &mut RouteState, visited: Option<&RegionTable>, slice: u32,
     sc.tbs.clear();
     sc.s_idx.clear();
     sc.s_list.clear();
-    // Targets are named by their visited entry, or past the visited
-    // table's entries by their next-layer entry.
+    sc.t_loc.clear();
+    sc.t_keys.clear();
+    // Targets are placed by their visited entry, or past the visited
+    // table's entries by their next-layer entry, and named in the job.
     let nv = visited.map_or(0, |t| t.len()) as u32;
     for c in chunks {
         let remap: &[u32] = cx.remaps.get(c.worker as usize).map_or(&[], |m| m.as_slice());
@@ -452,11 +467,21 @@ pub fn run_route(st: &mut RouteState, visited: Option<&RegionTable>, slice: u32,
                 }
             }
             // A provisional target's bundles wait for its key (the frame's end).
-            sc.e_of.push(match (is_provisional(key), v, next) {
+            let place = match (is_provisional(key), v, next) {
                 (true, _, _) => PROV,
                 (false, Some(e), _) => e,
                 (false, None, Some(e)) => nv + e,
                 (false, None, None) => unreachable!("a target the visited set lacks has new cells"),
+            };
+            sc.e_of.push(if place == PROV {
+                PROV
+            } else {
+                let n = sc.t_keys.len() as u32;
+                let l = *sc.t_loc.entry(place).or_insert(n);
+                if l == n {
+                    sc.t_keys.push(key);
+                }
+                l
             });
         }
         if !record {
@@ -493,9 +518,8 @@ pub fn run_route(st: &mut RouteState, visited: Option<&RegionTable>, slice: u32,
         }
     }
     if !sc.tbs.is_empty() {
-        let next = &st.next;
-        let key = |e: u32| if e < nv { visited.expect("a visited target").key(e) } else { next.key(e - nv) };
-        sc.enc.encode(&sc.tbs, nv as usize + next.len(), key, &sc.s_list, &mut sc.raw);
+        let keys = &sc.t_keys;
+        sc.enc.encode(&sc.tbs, keys.len(), |l| keys[l as usize], &sc.s_list, &mut sc.raw);
         let region = st.region.unwrap_or(u32::MAX);
         st.segs.push(((0, slice), Segment::of_raw(region, &sc.raw, sc.tbs.len() as u32, sc.tbs.iter().map(|t| t.mask.count_ones() as u64).sum(), &mut sc.z)?));
     }
