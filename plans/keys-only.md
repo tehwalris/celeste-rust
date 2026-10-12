@@ -59,13 +59,23 @@ alternatives were measured (below, "New cells: three ways").
    notes); level -1's drops are noted per lane in the unit and leave it as
    notes per (entry, horizon).
 5. The REGION PHASE dedups each chunk target against its region's table;
-   the cells an entry lacked are new. At the frame's end each route lists
-   its new states by key (`route::seal`) - the NEXT LAYER, assembled by
-   region. Its states are checked to be exactly the region phase's
-   insertions (count), then DECODED once more, in chunks of 4096 on every
-   thread, for their WINS (`frame::wins_of`) and, under `--key-check`,
-   for every row's key against the boundary's and its position against
-   its cell.
+   the cells an entry lacked are new, kept as (entry, cells) EVENTS. A
+   job's bundles into PROVISIONAL targets (a code new this frame: no final
+   key yet) are encoded into a zstd segment with their provisional keys
+   and encoded again with the final ones at the frame's end (held as
+   56 B structs they were 5.8 GB at the mod room's fmp f53). At the
+   frame's end each route merges its events and lists its new states by
+   key (`route::seal`) - the NEXT LAYER, assembled by region. Its states
+   are checked to be exactly the region phase's insertions (count), then
+   DECODED once more, in chunks of 4096 on every thread, for their WINS
+   (`frame::wins_of`) and, under `--key-check`, for every row's key
+   against the boundary's and its position against its cell.
+6. The wave's buffers are bounded and measured (`--phases`: `[wavemem]`
+   per frame, the structures by bytes; `[mem]` per phase, the sampled
+   peak): a unit keeps at most 512k bundles' room in its emptied buckets,
+   a region worker 1M bundles' between jobs, the segments are held at
+   their compressed size, the exited workers' freed pages are collected
+   (`mi_collect`) after the pipeline and the frame's end.
 
 **Disk: the frame files** (`frames/f{F}.bin`; a raise's additions
 `frames/f{F}.r{seq}.bin`, `checkpoint::FORMAT_VERSION` 15): a header - the
@@ -112,7 +122,11 @@ piece files (`checkpoint::FrameFile`, `save_block`), `storage::meta`
 (the per-frame entry metadata), `storage::marks::Resolver`,
 `decode::TreeKeys`, `wave::decode_layer`, `DropNotes` by id, `Sources`,
 `Block`'s ids, seq and skip mask, the kernels' skip mask, the visited
-tables' renumbering and `push_numbered`.
+tables' renumbering and `push_numbered`, the routes' per-entry new-cell
+array. 2249 lines deleted, 2752 added (src, crates, ui): the frame file
+and tree reader (`storage::layer`, 990 lines with its tests), the first
+decoder kept as the test reference (~110), the `[wavemem]` accounting
+(~90).
 
 ## Verification
 
@@ -215,6 +229,12 @@ visited set, so its max RSS holds it twice):
 |---|---|---|
 | the reference frame (6,2) 100% f56 -> f57, 2 x 3 reps | wave 2084-2157 ms, end 233-244 ms, frame 2590-2670 ms; max RSS 4.21-4.24 GB; f56 loaded in 1.3-1.5 s | wave 2147-2168 ms, end 55-59 ms, frame 2327-2353 ms; max RSS 2.26-2.30 GB; loaded in 0.20 s |
 | the mod room's peak frame fm f68 -> f69 (171.9M rows in, 4.17G emissions, 156M new), 2 rounds | wave 31.4 / 33.1 s, end 6.2 s; f68 loaded in 61 s, frame with the bench's frontier copy 54.6-72.3 s; max RSS 59.6-60.5 GB | wave 31.5 / 31.5 s, end 1.17 s; loaded in 7.2 s, frame 33.5 s; max RSS 16.3 GB |
+
+Whole searches (BENCHMARK_DATA.md 2026-10-12 has the table): room (1,0)
+`--ceiling 99` forward 84.4 -> 78.1 s, max RSS 3.7 -> 2.1 GB, tree 2.50 ->
+0.57 GB; room (6,2) 100% `r0sxhf,r0sxh --ceiling 94` level 0's forward 132
+-> 122 s, max RSS 8.3 -> 4.0 GB, tree 8.08 -> 1.85 GB; the backward the
+same; the same optima, witnesses and `[gate]` lines.
 
 The reference frame's wave is 2-3% slower (the units decode their rows,
 0.4 of 37 worker-s, and their (region, key) order changed the kernels'

@@ -1,5 +1,53 @@
 > STALE in parts: dated sections, newest first, each measured on the code of its date (before 2026-08-31: the deleted pre-rebuild search; plans/ links may name merged or deleted docs, see plans/architecture.md "Where the old plans went") - re-measure before relying on a number.
 
+# Keys only, 2026-10-12 (16 threads, branch `keys-only`)
+
+A state is its key in memory and on disk: the frontier and the frame files
+are per-region (key, cell mask) entries, rows decoded per unit right
+before the kernels, no state ids (plans/keys-only.md). Against develop
+a4c3dfc (`/var/tmp/keys-base`; the mod room: map-mod f32df10 against
+keys-only + map-mod, a local merge). Release; a shared machine at load
+5-17 for the interleaved A/B; the develop mod runs date from 2026-10-11
+(load 30-65): their walls are indicative, memory and sizes are not
+load-dependent. Every pair has identical f/e lines or `[gate]` lines,
+optima and witnesses.
+
+**The reference frame** (6,2) 100% f56 -> f57 (`bench-frame --edges`, 2
+interleaved rounds of 3 reps; the bench copies the visited set):
+
+| | wave | frame end | frame | max RSS | f56 loaded |
+|---|---|---|---|---|---|
+| develop | 2084-2157 ms | 233-244 ms | 2590-2670 ms | 4.21-4.24 GB | 1.3-1.5 s |
+| keys only | 2147-2168 ms | 55-59 ms | 2327-2353 ms | 2.26-2.30 GB | 0.20 s |
+
+**End to end** (`rewrite search`, the tree from nothing; round 3 with the
+final binary, rounds 1-2 with tighter buffer bounds; walls without a level
+-1 table build):
+
+| case | run | forward (level 0) | backward | wall | max RSS | tree |
+|---|---|---|---|---|---|---|
+| room (1,0) `--ceiling 99` | develop | 84.3-84.5 s | 2.03-2.06 s | 87.0-87.2 s | 3.66-3.70 GB | 2.50 GB |
+| | keys only | 78.1 s (82.1-82.8 tight bounds) | 2.00-2.02 s | 80.5 s (84.5-85.2) | 2.14 GB (1.75) | 0.57 GB |
+| room (6,2) 100% `r0sxhf,r0sxh --ceiling 94` | develop | 132.0-132.2 s | 1.19-1.21 s | 139.3-139.5 s | 8.29-8.39 GB | 8.08 GB |
+| | keys only | 122.3 s (126.7-126.8) | 1.19-1.21 s | 129.5 s* (133.9) | 3.95 GB (3.30-3.46) | 1.85 GB |
+
+\* 164.6 s with the level -1 table rebuilt (35.1 s): the table cache is
+keyed on the binary.
+
+**The mod room** (map-mod.md's second half, r0sxhe from the mid state):
+
+| case | develop | keys only |
+|---|---|---|
+| fm: level -1 85, 3.68B states, 116G emissions | forward 1112 s, peak 40.55 GB, tree 43 GB, backward 55.0 s | forward 923 s, peak 15.15 GB (the first version), tree 6.4 GB (frames 307 MB), backward 55.0 s |
+| fmp: level -1 95, `--prune-rect`, 7.98B states, 248G emissions | forward 2830 s, backward 335 s, search 3248 s; peak 79.05 GB (f77: rss start 46.4 / wave 77.3 / peak 78.1); tree 101 GB (frames 78, drop notes 8.6, edges 15) | forward 2454 s, backward 341 s, search 2798 s; peak 20.91 GB (f77: 13.9 / 18.1 / 20.6); tree 16 GB (frames 0.67, drop notes 0.19, edges 15); the arc phase's anon peak 13.1 GB (develop 21.1) |
+| fm f68 -> f69 (`bench-frame`; 171.9M rows in, 4.17G emissions) | wave 31.4-33.1 s, end 6.2 s, f68 loaded in 61 s, max RSS 59.6-60.5 GB | wave 30.7-31.5 s, end 1.17 s, loaded in 7.1 s, max RSS 16.3-16.9 GB |
+
+Decode: 49 ns a row in a unit (the mod frame; `not_expanded` included), 2%
+of the units' worker time. The visited set at fmp's f77: 17.3 GB
+allocated for 6.33B states (2.73 B a state); the frame's other buffers 6.7
+GB at its peak. The mod room's exit, projected (plans/keys-only.md): RAM
+fits to H ~222-225 on this machine (develop: ~203); time binds first.
+
 # Edges target, 2026-10-11 (16 threads, branch `edges-target`)
 
 ID-free edge bundles stored in their target regions, the routed forward
