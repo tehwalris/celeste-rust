@@ -442,17 +442,30 @@ pub fn run_wave(engine: &dyn FrameStep, parts: &[Part], cx: WaveCtx) -> Result<W
         let gb = |b: usize| b as f64 / 1e9;
         let routes = pipe.states.read().expect("the routes");
         let tables: usize = routes.iter().map(|r| r.lock().expect("a route").table.alloc_bytes()).sum();
-        let route_rest: usize = routes.iter().map(|r| r.lock().expect("a route").alloc_bytes()).sum();
+        let rest = routes.iter().fold([0usize; 3], |a, r| {
+            let b = r.lock().expect("a route").alloc_bytes();
+            [a[0] + b[0], a[1] + b[1], a[2] + b[2]]
+        });
         drop(routes);
+        let sc = scratch.iter().fold([0usize; 4], |a, k| {
+            let b = k.alloc_bytes();
+            [a[0] + b[0], a[1] + b[1], a[2] + b[2], a[3] + b[3]]
+        });
         eprintln!(
-            "[wavemem] f{frame}: frontier {:.3} GB ({} entries), route tables {:.3}, routes' new-cell slots, provisional bundles and segments {:.3}, chunks in flight at most {:.3}, sinks {:.3}, region scratch {:.3} GB; anon {:.2} GB",
+            "[wavemem] f{frame}: frontier {:.3} GB ({} entries), route tables {:.3}, routes' new-cell slots {:.3}, provisional bundles {:.3}, segments {:.3}, chunks in flight at most {:.3}, sinks {:.3}, region scratch {:.3} (bundles {:.3}, encoder {:.3}, raw {:.3}, rest {:.3}) GB; anon {:.2} GB",
             gb(st.frontier_bytes),
             st.entries_in,
             gb(tables),
-            gb(route_rest),
+            gb(rest[0]),
+            gb(rest[1]),
+            gb(rest[2]),
             gb(pipe.inflight_max.load(Ordering::Acquire)),
             gb(sinks.iter().map(|k| k.alloc_bytes()).sum()),
-            gb(scratch.iter().map(|k| k.alloc_bytes()).sum()),
+            gb(sc.iter().sum()),
+            gb(sc[0]),
+            gb(sc[1]),
+            gb(sc[2]),
+            gb(sc[3]),
             crate::metrics::current_rss_gb()
         );
     }

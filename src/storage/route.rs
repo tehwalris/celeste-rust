@@ -328,9 +328,10 @@ pub struct Scratch {
 }
 
 impl Scratch {
-    /// Bytes its buffers hold (`--phases`' `[wavemem]`).
-    pub fn alloc_bytes(&self) -> usize {
-        4 * (self.e_of.capacity() + self.s_of.capacity()) + 32 * self.s_idx.capacity() + 24 * self.s_list.capacity() + std::mem::size_of::<bundle::Tb>() * self.tbs.capacity() + self.enc.alloc_bytes() + self.raw.capacity()
+    /// Bytes its buffers hold (`--phases`' `[wavemem]`): the job's
+    /// bundles, the encoder's, the raw block, the rest.
+    pub fn alloc_bytes(&self) -> [usize; 4] {
+        [std::mem::size_of::<bundle::Tb>() * self.tbs.capacity(), self.enc.alloc_bytes(), self.raw.capacity(), 4 * (self.e_of.capacity() + self.s_of.capacity()) + 32 * self.s_idx.capacity() + 24 * self.s_list.capacity()]
     }
 }
 
@@ -343,8 +344,8 @@ impl Chunk {
 
 impl RouteState {
     /// Bytes its new-cell slots, provisional bundles and segments hold.
-    pub fn alloc_bytes(&self) -> usize {
-        8 * self.fresh.capacity() + std::mem::size_of::<Bundle>() * self.prov.capacity() + self.segs.iter().map(|s| s.1.bytes.capacity()).sum::<usize>()
+    pub fn alloc_bytes(&self) -> [usize; 3] {
+        [8 * self.fresh.capacity(), std::mem::size_of::<Bundle>() * self.prov.capacity(), self.segs.iter().map(|s| s.1.bytes.capacity()).sum::<usize>()]
     }
 }
 
