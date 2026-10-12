@@ -248,9 +248,13 @@ fn run_unit(engine: &dyn FrameStep, u: u32, spec: &UnitSpec, part: Part, shapes:
     sc.live.clear();
     sc.live.extend((0..block.lanes()).filter(|&l| !skip[l]));
     phases::add(phases::DECODE, t_dec);
-    let t_unit = phases::start(s.diag.phases);
-    engine.run(&block, &sc.cells, &sc.live, sink)?;
-    phases::add(phases::UNIT, t_unit);
+    // A unit of exits only (the frame after a win) runs no kernel: their
+    // shapes have none.
+    if !sc.live.is_empty() {
+        let t_unit = phases::start(s.diag.phases);
+        engine.run(&block, &sc.cells, &sc.live, sink)?;
+        phases::add(phases::UNIT, t_unit);
+    }
     sink.end()
 }
 
@@ -314,6 +318,7 @@ pub fn run_wave(engine: &dyn FrameStep, parts: &[Part], cx: WaveCtx) -> Result<W
         states: Default::default(),
         jobs: Default::default(),
         jobs_left: AtomicUsize::new(0),
+        failed: std::sync::atomic::AtomicBool::new(false),
     };
     let shapes: Vec<u64> = visited.shapes().to_vec();
     let t_pipeline = Instant::now();
@@ -332,10 +337,25 @@ pub fn run_wave(engine: &dyn FrameStep, parts: &[Part], cx: WaveCtx) -> Result<W
                 let visited: &VisitedSet = visited;
                 std::thread::Builder::new().stack_size(WORKER_STACK).spawn_scoped(scope, move || -> Result<(std::time::Duration, std::time::Duration)> {
                     crate::compiled::asm_kernel::set_thread_stack(WORKER_STACK);
+                    // Any way out of this worker but the end of the frame -
+                    // an error returned, a panic - stops the others.
+                    struct Stop<'p>(&'p std::sync::atomic::AtomicBool, bool);
+                    impl Drop for Stop<'_> {
+                        fn drop(&mut self) {
+                            if !self.1 {
+                                self.0.store(true, Ordering::Release);
+                            }
+                        }
+                    }
+                    let mut stop = Stop(&pipe.failed, false);
                     let (mut busy, mut in_regions) = (std::time::Duration::ZERO, std::time::Duration::ZERO);
                     let mut idle_spins = 0u32;
                     let mut us = UnitScratch::default();
                     loop {
+                        if pipe.failed.load(Ordering::Acquire) {
+                            stop.1 = true;
+                            return Err(anyhow!("frame {frame}: another wave worker failed"));
+                        }
                         if let Some(job) = pipe.pop_job() {
                             let t = Instant::now();
                             let tp = phases::start(s.diag.phases);
@@ -377,12 +397,26 @@ pub fn run_wave(engine: &dyn FrameStep, parts: &[Part], cx: WaveCtx) -> Result<W
                         pipe.wait(&mut idle_spins);
                     }
                     crate::compiled::dispatch::fold_hits();
+                    stop.1 = true;
                     Ok((busy, in_regions))
                 })
                 .expect("spawn wave worker")
             })
             .collect();
-        handles.into_iter().map(|h| h.join().expect("wave worker panicked")).collect::<Result<Vec<_>>>()
+        // The first failure's error (a worker that only stopped for it says so).
+        let mut out = Vec::new();
+        let mut first: Option<anyhow::Error> = None;
+        for h in handles {
+            match h.join().expect("wave worker panicked") {
+                Ok(x) => out.push(x),
+                Err(e) if first.is_none() || first.as_ref().is_some_and(|f| f.to_string().contains("another wave worker failed")) => first = Some(e),
+                Err(_) => {}
+            }
+        }
+        match first {
+            Some(e) => Err(e),
+            None => Ok(out),
+        }
     })?;
     let t_units = t_pipeline.elapsed();
     let busy: std::time::Duration = spent.iter().map(|w| w.0).sum();
@@ -391,7 +425,7 @@ pub fn run_wave(engine: &dyn FrameStep, parts: &[Part], cx: WaveCtx) -> Result<W
     st.wave_idle = idle_fraction(t_units, workers, busy);
     st.rss_wave = crate::metrics::current_rss_gb();
     st.slices = slices.len();
-    let mut notes: Vec<(u32, Key, u32, u32)> = Vec::new();
+    let mut notes: Vec<Note> = Vec::new();
     for sink in &mut sinks {
         sink.finish()?;
         st.lanes_raw += sink.emitted as usize;
@@ -433,13 +467,11 @@ pub fn run_wave(engine: &dyn FrameStep, parts: &[Part], cx: WaveCtx) -> Result<W
     st.fresh_slots = states.iter().map(|r| r.fresh.len() as u64).sum();
     st.fresh_events = states.iter().map(|r| r.fresh_events).sum();
     let inserted: u64 = states.iter().map(|r| r.new_states).sum();
-    // Per route (in parallel): sealed - its new states listed by key - and
-    // those states DECODED for their wins (and `--key-check`).
-    type Sealed = (super::route::Sealed, Vec<(u32, u64)>);
+    // Per route (in parallel): sealed - its new states listed by key.
+    type Sealed = super::route::Sealed;
     let sealed: Vec<Result<Option<Sealed>>> = {
         let next = AtomicUsize::new(0);
         let cells: Vec<std::sync::Mutex<&mut RouteState>> = states.iter_mut().map(std::sync::Mutex::new).collect();
-        let visited: &VisitedSet = visited;
         std::thread::scope(|scope| {
             let hs: Vec<_> = scratch
                 .iter_mut()
@@ -452,10 +484,7 @@ pub fn run_wave(engine: &dyn FrameStep, parts: &[Part], cx: WaveCtx) -> Result<W
                             let Some(c) = cells.get(k) else { return out };
                             let mut st = c.lock().expect("a route");
                             let r = match regions[k] {
-                                Some(region) => super::route::seal(&mut st, region, finals, sc).and_then(|x| {
-                                    let wins = new_wins(visited, skeletons, &x, frame, s)?;
-                                    Ok(Some((x, wins)))
-                                }),
+                                Some(region) => super::route::seal(&mut st, region, finals, sc).map(Some),
                                 // A route of a new shape whose records the
                                 // coarser level all dropped.
                                 None if st.new_states == 0 => Ok(None),
@@ -475,20 +504,16 @@ pub fn run_wave(engine: &dyn FrameStep, parts: &[Part], cx: WaveCtx) -> Result<W
     let mut new: Vec<Sealed> = Vec::new();
     for x in sealed {
         if let Some(sl) = x? {
-            if !sl.0.keys.is_empty() {
+            if !sl.keys.is_empty() {
                 new.push(sl);
             }
         }
     }
-    new.sort_unstable_by_key(|x| x.0.region);
+    new.sort_unstable_by_key(|x| x.region);
     let mut next = Layer::default();
-    let mut wins: Vec<(u32, u64)> = Vec::new();
-    for (sl, w) in &new {
-        let base = next.entries() as u32;
+    for sl in new {
         next.push_region(sl.region, &sl.keys, &sl.masks)?;
-        wins.extend(w.iter().map(|&(e, m)| (base + e, m)));
     }
-    drop(new);
     let mut shapes_in: Vec<u32> = next.regions().map(|(r, _)| r / GEOMETRY.slots).collect();
     shapes_in.dedup();
     for si in shapes_in {
@@ -496,6 +521,7 @@ pub fn run_wave(engine: &dyn FrameStep, parts: &[Part], cx: WaveCtx) -> Result<W
         next.skeletons.insert(h, skeletons.get(h)?);
     }
     ensure!(next.states() == inserted, "frame {frame}: the region phase inserted {inserted} new states, the next layer lists {}", next.states());
+    let wins = layer_wins(visited, &next, frame, s)?;
     // The tables back into the visited set; the routes' segments into the file.
     let mut segs = Vec::new();
     let mut src_index: Vec<(u32, Vec<u32>)> = Vec::new();
@@ -525,36 +551,55 @@ pub fn run_wave(engine: &dyn FrameStep, parts: &[Part], cx: WaveCtx) -> Result<W
     st.entries_out = next.entries();
     st.lanes_out = next.states() as usize;
     phases::print_phases(s.diag.phases, t_frame.elapsed(), workers);
-    Ok(Wave { next, wins, stats: st, dropped: super::layer::notes_of(notes), shapes: shapes_numbered, keys: adds })
+    Ok(Wave { next, wins, stats: st, dropped: super::layer::notes_of(notes)?, shapes: shapes_numbered, keys: adds })
 }
 
-/// Rows decoded at a time at the frame's end (a route's new states).
-const WIN_CHUNK: usize = 1 << 12;
+/// States decoded at a time at the frame's end (a chunk of a region's).
+const WIN_CHUNK: u32 = 1 << 12;
 
-/// A route's NEW states decoded (their shape's registered skeleton), for
-/// their WINS (`frame::wins_of`): per entry of `x` (index) its win cells.
-/// With `--key-check`, each decoded row's key is the boundary's and its
+/// The new layer's states DECODED (their shapes' skeletons, the layer's),
+/// for their WINS (`frame::wins_of`): per entry of `next` (ascending) its
+/// win cells. Chunks of a region's entries on every thread. With
+/// `--key-check`, each decoded row's key is the boundary's and its
 /// position its cell.
-fn new_wins(visited: &VisitedSet, skeletons: &Skeletons, x: &super::route::Sealed, frame: u32, s: &crate::settings::Settings) -> Result<Vec<(u32, u64)>> {
+fn layer_wins(visited: &VisitedSet, next: &Layer, frame: u32, s: &crate::settings::Settings) -> Result<Vec<(u32, u64)>> {
     let geo = GEOMETRY;
-    let shape = visited.shape_hash(x.region / geo.slots);
-    let skel = skeletons.get(shape)?;
-    let slot = x.region % geo.slots;
-    let mut wins: Vec<(u32, u64)> = Vec::new();
-    let mut rows: Vec<(Key, u32)> = Vec::with_capacity(WIN_CHUNK + 64);
-    let mut at: Vec<(u32, u32)> = Vec::with_capacity(WIN_CHUNK + 64);
-    let mut flush = |rows: &mut Vec<(Key, u32)>, at: &mut Vec<(u32, u32)>| -> Result<()> {
-        if rows.is_empty() {
-            return Ok(());
+    let mut chunks: Vec<(u32, std::ops::Range<usize>)> = Vec::new();
+    for (region, rg) in next.regions() {
+        let (mut a, mut n) = (rg.start, 0u32);
+        for e in rg.clone() {
+            n += next.masks()[e].count_ones();
+            if n >= WIN_CHUNK {
+                chunks.push((region, a..e + 1));
+                (a, n) = (e + 1, 0);
+            }
         }
-        let rt2 = super::decode::decode_rows(&visited.keys, &skel, rows)?;
+        if a < rg.end {
+            chunks.push((region, a..rg.end));
+        }
+    }
+    let parts = par_map(&chunks, s.threads(), |(region, rg)| -> Result<Vec<(u32, u64)>> {
+        let shape = visited.shape_hash(region / geo.slots);
+        let skel = next.skeletons.get(&shape).ok_or_else(|| anyhow!("no skeleton of shape {shape:016x}"))?;
+        let slot = region % geo.slots;
+        let mut rows: Vec<(Key, u32)> = Vec::with_capacity(WIN_CHUNK as usize + 64);
+        let mut at: Vec<(u32, u32)> = Vec::with_capacity(WIN_CHUNK as usize + 64);
+        for e in rg.clone() {
+            let (key, mask) = next.entry(e);
+            for local in bits(mask) {
+                rows.push((key, geo.cell(slot, local)));
+                at.push((e as u32, local));
+            }
+        }
+        let rt2 = super::decode::decode_rows(&visited.keys, skel, &rows)?;
         if s.diag.key_check {
             crate::compiled::asm_kernel::key_check_block(&rt2, &visited.keys);
             for (c, r) in crate::search::pos_graph::block_cells(&rt2)?.into_iter().zip(rows.iter()) {
-                ensure!(c == r.1, "frame {frame}: a state of r{} decoded at cell {c}, not its own {}", x.region, r.1);
+                ensure!(c == r.1, "frame {frame}: a state of r{region} decoded at cell {c}, not its own {}", r.1);
             }
         }
-        for (w, &(e, local)) in crate::frame::wins_of(&rt2, s)?.into_iter().zip(at.iter()) {
+        let mut wins: Vec<(u32, u64)> = Vec::new();
+        for (w, &(e, local)) in crate::frame::wins_of(&rt2, s)?.into_iter().zip(&at) {
             if w {
                 match wins.last_mut() {
                     Some(l) if l.0 == e => l.1 |= 1u64 << local,
@@ -562,21 +607,13 @@ fn new_wins(visited: &VisitedSet, skeletons: &Skeletons, x: &super::route::Seale
                 }
             }
         }
-        rows.clear();
-        at.clear();
-        Ok(())
-    };
-    for (e, (&key, &mask)) in x.keys.iter().zip(&x.masks).enumerate() {
-        for local in bits(mask) {
-            rows.push((key, geo.cell(slot, local)));
-            at.push((e as u32, local));
-        }
-        if rows.len() >= WIN_CHUNK {
-            flush(&mut rows, &mut at)?;
-        }
+        Ok(wins)
+    });
+    let mut out = Vec::new();
+    for p in parts {
+        out.extend(p?);
     }
-    flush(&mut rows, &mut at)?;
-    Ok(wins)
+    Ok(out)
 }
 
 /// A region job: one route's chunks of one slice (in unit order), and the
@@ -615,6 +652,9 @@ struct Pipe<'a> {
     states: std::sync::RwLock<Vec<std::sync::Arc<std::sync::Mutex<RouteState>>>>,
     jobs: std::sync::Mutex<std::collections::VecDeque<Job>>,
     jobs_left: AtomicUsize,
+    /// A worker failed (an error or a panic): the others stop, so the
+    /// frame's error comes back instead of a wait that never ends.
+    failed: std::sync::atomic::AtomicBool,
 }
 
 impl Pipe<'_> {

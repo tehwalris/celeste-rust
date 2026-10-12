@@ -740,18 +740,21 @@ pub fn read_notes(path: &Path) -> Result<Vec<Note>> {
     Ok(out)
 }
 
-/// Per-source notes `(region, key, cell, horizon)` (any order; a source at
-/// most once) as notes, sorted.
-pub fn notes_of(mut per_cell: Vec<(u32, Key, u32, u32)>) -> Vec<Note> {
-    per_cell.sort_unstable_by_key(|&(r, k, local, h)| (r, k, h, local));
-    let mut out: Vec<Note> = Vec::new();
-    for (r, k, local, h) in per_cell {
+/// Notes (any order; each source cell at most once) sorted, the notes of
+/// one (region, key, horizon) merged.
+pub fn notes_of(mut notes: Vec<Note>) -> Result<Vec<Note>> {
+    notes.sort_unstable_by_key(|n| (n.0, n.1, n.2));
+    let mut out: Vec<Note> = Vec::with_capacity(notes.len());
+    for n in notes {
         match out.last_mut() {
-            Some(n) if (n.0, n.1, n.2) == (r, k, h) => n.3 |= 1u64 << local,
-            _ => out.push((r, k, h, 1u64 << local)),
+            Some(m) if (m.0, m.1, m.2) == (n.0, n.1, n.2) => {
+                ensure!(m.3 & n.3 == 0, "a source of region {} noted twice", n.0);
+                m.3 |= n.3;
+            }
+            _ => out.push(n),
         }
     }
-    out
+    Ok(out)
 }
 
 /// A TREE's frame files through a frame: its codebooks (the shapes by
@@ -968,8 +971,9 @@ mod tests {
         assert_eq!(u.mask_of(3, (0, 5)), 0b1111);
         assert!(u.contains(Sk { region: 5, key: (0, 0), local: 0 }));
         assert!(a.clone().union(layer_of(&[(3, (0, 5), 0b0001)])).is_err());
-        let notes = notes_of(vec![(3, (0, 5), 1, 90), (3, (0, 5), 0, 90), (3, (0, 5), 3, 95), (70, (0, 1), 0, 91)]);
+        let notes = notes_of(vec![(3, (0, 5), 90, 0b10), (70, (0, 1), 91, 1), (3, (0, 5), 90, 0b01), (3, (0, 5), 95, 0b1000)]).unwrap();
         assert_eq!(notes, vec![(3, (0, 5), 90, 0b11), (3, (0, 5), 95, 0b1000), (70, (0, 1), 91, 1)]);
+        assert!(notes_of(vec![(3, (0, 5), 90, 0b10), (3, (0, 5), 90, 0b11)]).is_err(), "a cell noted twice");
         let np = notes_path(&dir, 7);
         write_notes(&np, &notes).unwrap();
         assert_eq!(read_notes(&np).unwrap(), notes);

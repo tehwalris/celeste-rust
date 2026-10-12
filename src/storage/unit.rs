@@ -182,10 +182,10 @@ pub struct UnitSink<'a> {
     unit_sources: Vec<(u32, Key)>,
     src_idx: rustc_hash2::FxHashMap<(u32, Key), u32>,
     /// Per lane the smallest horizon admitting a successor level -1 dropped
-    /// (`u32::MAX`: none), and the worker's notes so far: `(region, key,
-    /// cell in region, horizon)` per noted source.
+    /// (`u32::MAX`: none), and the worker's notes so far (per noted source
+    /// entry and horizon, its cells).
     drop_min: Vec<u32>,
-    pub notes: Vec<(u32, Key, u32, u32)>,
+    pub notes: Vec<super::layer::Note>,
     /// This worker's routes, and the last one asked.
     route_ids: FxHashMap<(u64, u32), u32>,
     last_route: (u64, u32, u32),
@@ -703,16 +703,27 @@ impl<'a> UnitSink<'a> {
             }
         }
         self.decide()?;
-        // The unit's noted sources.
-        let slots = super::GEOMETRY.slots;
-        for (lane, &h) in self.drop_min.iter().enumerate() {
-            if h != u32::MAX {
-                let (entry, cell) = self.lanes[lane];
-                let (region, key) = self.srcs[entry as usize];
-                let (slot, local) = super::GEOMETRY.slot_local(cell);
-                debug_assert_eq!(slot, region % slots);
-                self.notes.push((region, key, local, h));
+        // The unit's noted sources, per entry and horizon (an entry's lanes
+        // are consecutive).
+        let mut at = 0usize;
+        while at < self.lanes.len() {
+            let entry = self.lanes[at].0;
+            let end = at + self.lanes[at..].iter().take_while(|l| l.0 == entry).count();
+            let (region, key) = self.srcs[entry as usize];
+            let first = self.notes.len();
+            for lane in at..end {
+                let h = self.drop_min[lane];
+                if h == u32::MAX {
+                    continue;
+                }
+                let (slot, local) = super::GEOMETRY.slot_local(self.lanes[lane].1);
+                debug_assert_eq!(slot, region % super::GEOMETRY.slots);
+                match self.notes[first..].iter_mut().find(|n| n.2 == h) {
+                    Some(n) => n.3 |= 1u64 << local,
+                    None => self.notes.push((region, key, h, 1u64 << local)),
+                }
             }
+            at = end;
         }
         let v = &self.verdicts;
         let drop = |route: u32, key: Key, c: u32| v.get(&(route, key, c as u8)) == Some(&VERDICT_NO);

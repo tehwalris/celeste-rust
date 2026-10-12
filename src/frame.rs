@@ -1131,16 +1131,19 @@ impl ForwardState {
             };
             let wave = crate::storage::wave::run_wave(engine, &parts, cx)?;
             // The frame's notes: the sources not re-expanded keep theirs.
-            let kept: Option<Vec<layer::Note>> = to.map(|_| {
-                let mut per_cell: Vec<(u32, (u64, u64), u32, u32)> = Vec::new();
-                for &(r, k, h, m) in notes_t.iter().filter(|n| n.2 > h_new).chain(&wave.dropped) {
-                    per_cell.extend(layer::bits(m).map(|c| (r, k, c, h)));
+            let kept: Option<Vec<layer::Note>> = match to {
+                None => None,
+                Some(_) => {
+                    let mut per_cell: Vec<(u32, (u64, u64), u32, u32)> = Vec::new();
+                    for &(r, k, h, m) in notes_t.iter().filter(|n| n.2 > h_new).chain(&wave.dropped) {
+                        per_cell.extend(layer::bits(m).map(|c| (r, k, c, h)));
+                    }
+                    // A source noted twice keeps its smallest horizon.
+                    per_cell.sort_unstable();
+                    per_cell.dedup_by_key(|x| (x.0, x.1, x.2));
+                    Some(layer::notes_of(per_cell.into_iter().map(|(r, k, c, h)| (r, k, h, 1u64 << c)).collect())?)
                 }
-                // A source noted twice keeps its smallest horizon.
-                per_cell.sort_unstable();
-                per_cell.dedup_by_key(|x| (x.0, x.1, x.2));
-                layer::notes_of(per_cell)
-            });
+            };
             // The raise's new states with their layer, its frame file.
             let won = checkpoint(dir, t, Some(seq), &wave, None, s)?;
             if let Some(k) = &kept {
