@@ -8,7 +8,7 @@
 
 use anyhow::{Context, Result};
 
-use celeste_engine::runtime2::{Col, Rt2};
+use celeste_engine::runtime2::Rt2;
 
 use crate::storage::layer::Layer;
 
@@ -118,11 +118,6 @@ impl Block {
     /// Per lane: has it left the start room (`exits_of`, a superset of wins)?
     pub fn exits(&self, s: &crate::settings::Settings) -> Result<Vec<bool>> {
         exits_of(&self.rt2, s)
-    }
-
-    /// The block's shape.
-    pub fn shard_shape(&self) -> u64 {
-        self.rt2.shape_hash
     }
 
     /// Number of lanes in this block.
@@ -738,24 +733,6 @@ fn state_layers(dir: &std::path::Path, last: u32, visited: &crate::storage::visi
         layers.set_layer(visited, &l, f)?;
     }
     Ok(layers)
-}
-
-/// A block's skeleton: its structure and uniform columns, its typed columns
-/// empty (`bench-storage`'s replay decodes with it).
-pub fn skeleton_of(rt2: &Rt2) -> Rt2 {
-    let mut s = celeste_engine::slots::reshape(rt2, 0);
-    s.cols = rt2
-        .cols
-        .iter()
-        .map(|c| match c {
-            Col::N(_) => Col::N(Vec::new()),
-            Col::I(_) => Col::I(Vec::new()),
-            Col::V(_) => Col::V(Vec::new()),
-            u => u.clone(),
-        })
-        .collect();
-    s.shape_hash = rt2.shape_hash;
-    s
 }
 
 /// The forward's in-memory state, EXTENDED frame by frame (each checkpointed).
@@ -1699,7 +1676,7 @@ mod tests {
     use super::*;
     use crate::trace::refengine::RefEngine;
     use celeste_core::pico8_num::Pico8Num as P8;
-    use celeste_engine::runtime2::AV;
+    use celeste_engine::runtime2::{Col, AV};
     use std::sync::Mutex;
 
     /// A fresh forward keeps none of a killed run's files.
