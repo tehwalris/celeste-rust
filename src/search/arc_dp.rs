@@ -1403,6 +1403,17 @@ impl Seeds {
     }
 }
 
+/// The start state's remainder as a point of the torus: the room's load has
+/// no player yet, so any point stands for it - unless the search starts
+/// mid-room (`--start-inputs`): then the start state's EXACT remainder (the
+/// tree's row holds it widened).
+pub fn start_point(s: &crate::settings::Settings) -> anyhow::Result<(u32, u32)> {
+    match &s.start_inputs {
+        None => Ok((super::arcs::point(0), super::arcs::point(0))),
+        Some(_) => rem_of(&crate::trace::refengine::RefEngine::new(s)?.initial()?),
+    }
+}
+
 /// Fragmentation of winning sets (x segments per node, over all slabs) as
 /// (nodes, median, p90, max).
 pub fn fragmentation<'a>(sets: impl Iterator<Item = RegionRef<'a>>) -> (usize, usize, usize, usize) {
@@ -1513,7 +1524,7 @@ pub(super) fn lookup_view(row: &celeste_engine::runtime2::Rt2, seeded: bool) -> 
 
 /// A concrete state's remainder as a point of the torus (no player: the
 /// point (0, 0)).
-pub(super) fn rem_of(rt2: &celeste_engine::runtime2::Rt2) -> anyhow::Result<(u32, u32)> {
+pub fn rem_of(rt2: &celeste_engine::runtime2::Rt2) -> anyhow::Result<(u32, u32)> {
     use celeste_engine::runtime2::AV;
     let ids = crate::compiled::ids();
     let Some((cx, cy)) = rt2.player_xy_cells(ids, ids.f_rem) else { return Ok((super::arcs::point(0), super::arcs::point(0))) };
@@ -1960,13 +1971,7 @@ pub fn solve(
     crate::metrics::mem_phase("arc: backward");
     let tb = tb.elapsed().as_secs_f64();
     let start = w.index(seeds.start);
-    // The start has no player yet: any point stands for its remainder -
-    // unless the search starts mid-room (`--start-inputs`): then the start
-    // state's EXACT remainder (the tree's row holds it widened).
-    let p0 = match &s.start_inputs {
-        None => (super::arcs::point(0), super::arcs::point(0)),
-        Some(_) => rem_of(&crate::trace::refengine::RefEngine::new(s)?.initial()?)?,
-    };
+    let p0 = start_point(s)?;
     let arc_steps = optimum(&w, start, p0, horizon);
     // In frames: a win at step s is during frame ceil(s / spf) (a lower
     // bound still: a frame's win is a win at its last step at the latest).

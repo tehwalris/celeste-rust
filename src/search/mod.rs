@@ -19,5 +19,6 @@ pub mod checkpoint;
 pub mod inspect;
 pub mod known;
 pub mod pos_graph;
+pub mod reach;
 pub mod result;
 pub mod ui_export;

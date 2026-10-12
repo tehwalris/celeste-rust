@@ -366,6 +366,15 @@ is not measured. The projection's big uncertainty is S(H) past f152
   entry of ~17 states).
 - **The backward's sweep** (fmp95: 12.5 GB anonymous) now matches the
   forward's peak.
+- **Make transfer ids canonical (content order).** A transfer's id is its
+  place in `edges/xfer.bin`, which is DISCOVERY order: the slices, the
+  units and the jobs decide it. The states, the edges' endpoints and every
+  gate are canonical, but the edge files' bytes are not: fixtures cut by
+  1M- and 256k-lane slices give one frame check other edge bytes (-0.04 to
+  -1.5%), and `tools/fixtures.sh` has to treat the slice size as a format.
+  Numbering a frame's new transfers by their content (sorted at the
+  frame's end, the segments re-encoded or written after) would make the
+  tree a function of the search alone.
 - **The drop notes** (32 B a note, held to the frame's end): per unit
   sorted and delta-coded they would take a few bytes.
 - **Decode in the kernel prologue** (the ABI unchanged for now).

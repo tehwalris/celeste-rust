@@ -132,6 +132,37 @@ enum Command {
     /// the arc phase rerun over `<checkpoint-dir>/level{i:02}` as `search`
     /// runs it, without the concrete search. Exits non-zero on the first
     /// check that drops it, with the step, the node and the state.
+    /// EXACT-REMAINDER REACH over a finished tree's edges (search::reach):
+    /// from the start at its exact remainder, every frame's reached states
+    /// pushed along their out-edges through the transfers - the arc phase's
+    /// reach with W = everything. Prints per frame the reached states,
+    /// their remainder points and cells against the forward's layer, the
+    /// x/y extent, and (a level -1 tree) how many reached states had a
+    /// successor dropped. Exact in the remainder, bounded by the tree: what
+    /// the forward did not keep (level -1, a filter) is not reached.
+    Reach {
+        /// The search's checkpoint dir (its `level{i:02}` trees).
+        #[arg(long)]
+        checkpoint_dir: String,
+        /// Which level's tree.
+        #[arg(long, default_value_t = 0)]
+        level_index: usize,
+        /// The horizon in frames (the tree must reach it).
+        #[arg(long)]
+        to: u32,
+        /// Write `reach.marks.bin` (each reached state, dist = horizon - the
+        /// last frame it is reached at: `export-ui --reach DIR`) and
+        /// `reach.tsv` (the per-frame table) into DIR.
+        #[arg(long)]
+        save_marks: Option<String>,
+        /// Also write every frame's reached cells (`frame x y states`) to FILE.
+        #[arg(long)]
+        cells: Option<String>,
+        /// Decode and print the reached states whose player is in
+        /// "x0..x1,y0..y1" (their named fields), at most 20 a frame.
+        #[arg(long)]
+        decode_rect: Option<String>,
+    },
     CheckKnown {
         /// The search's checkpoint dir (its `level{i:02}` trees).
         #[arg(long)]
@@ -607,6 +638,13 @@ enum Command {
         /// byte (the tasdatabase upload the category runner verified).
         #[arg(long)]
         download: Option<String>,
+        /// `rewrite reach --save-marks DIR` of the last level's tree: its
+        /// exactly reached states as a level of their own.
+        #[arg(long)]
+        reach: Option<String>,
+        /// That level's label.
+        #[arg(long)]
+        reach_label: Option<String>,
     },
     /// The room (`--room`) as the tools need it, as JSON on stdout: its
     /// level and its objects in creation order (the original cart's: tile,
@@ -949,6 +987,9 @@ fn main() -> Result<()> {
                 }
                 None => println!("beam: no route within {max_frames} frames (proves nothing)"),
             }
+        }
+        Command::Reach { checkpoint_dir, level_index, to, save_marks, cells, decode_rect } => {
+            reach_command(&checkpoint_dir, level_index, to, save_marks.as_deref(), cells.as_deref(), decode_rect.as_deref(), &cfg)?;
         }
         Command::CheckKnown { checkpoint_dir, level, inputs, horizon } => {
             use celeste_rust::search::arc_dp::solve;
@@ -2143,7 +2184,7 @@ fn main() -> Result<()> {
                 }
             }
         }
-        Command::ExportUi { checkpoint_dir, out, arc, witness, reference, download } => {
+        Command::ExportUi { checkpoint_dir, out, arc, witness, reference, download, reach, reach_label } => {
             celeste_rust::search::ui_export::export(
                 std::path::Path::new(&checkpoint_dir),
                 std::path::Path::new(&out),
@@ -2153,6 +2194,8 @@ fn main() -> Result<()> {
                     witness: witness.as_deref().map(std::path::Path::new),
                     reference: reference.as_deref().map(std::path::Path::new),
                     download: download.as_deref().map(std::path::Path::new),
+                    reach: reach.as_deref().map(std::path::Path::new),
+                    reach_label: reach_label.as_deref(),
                 },
             )?;
         }
@@ -2511,4 +2554,111 @@ mod tests {
         assert_eq!(celeste_rust::settings::duplicate_flags(&cmd), Vec::<String>::new(), "flags defined twice");
         cmd.debug_assert();
     }
+}
+
+/// `rewrite reach` (search::reach): the run, its table and its outputs.
+fn reach_command(checkpoint_dir: &str, level_index: usize, to: u32, save: Option<&str>, cells_out: Option<&str>, decode_rect: Option<&str>, cfg: &celeste_rust::settings::Settings) -> Result<()> {
+    use celeste_rust::search::pos_graph::cell_xy;
+    use std::io::Write;
+    let dir = std::path::Path::new(checkpoint_dir).join(format!("level{level_index:02}"));
+    let steps = to * cfg.steps_per_frame();
+    let tree = Tree::open(&dir, steps)?;
+    let level = tree_level(&dir)?;
+    cfg.check(&dir, level)?;
+    let geo = celeste_rust::storage::GEOMETRY;
+    let rect = decode_rect
+        .map(|r| {
+            let (x, y) = r.split_once(',').ok_or_else(|| anyhow::anyhow!("--decode-rect x0..x1,y0..y1"))?;
+            let range = |t: &str| -> Result<(i32, i32)> {
+                let (a, b) = t.split_once("..").ok_or_else(|| anyhow::anyhow!("--decode-rect x0..x1,y0..y1"))?;
+                Ok((a.trim().parse()?, b.trim().parse()?))
+            };
+            Ok::<_, anyhow::Error>((range(x)?, range(y)?))
+        })
+        .transpose()?;
+    let mut cells_file = cells_out.map(|p| std::fs::File::create(p).map(std::io::BufWriter::new)).transpose()?;
+    // Per frame: the reached states' extent, and those a level -1 drop
+    // touched (their successors at the next frame partly dropped).
+    let has_notes = dir.join("dropped").is_dir();
+    let mut extent: Vec<(u32, i32, i32, i32, i32, u64, u64)> = Vec::new();
+    let point = celeste_rust::search::arc_dp::start_point(cfg)?;
+    let t0 = std::time::Instant::now();
+    let r = celeste_rust::search::reach::reach(&dir, steps, point, cfg.threads(), |t, cur| {
+        let (mut x0, mut x1, mut y0, mut y1) = (i32::MAX, i32::MIN, i32::MAX, i32::MIN);
+        let mut per_cell: rustc_hash::FxHashMap<u32, u64> = Default::default();
+        for (s, _) in cur {
+            let c = s.cell(&geo);
+            *per_cell.entry(c).or_default() += 1;
+            if let Some((x, y)) = cell_xy(c) {
+                (x0, x1, y0, y1) = (x0.min(x), x1.max(x), y0.min(y), y1.max(y));
+            }
+        }
+        if let Some(f) = &mut cells_file {
+            let mut v: Vec<(u32, u64)> = per_cell.into_iter().collect();
+            v.sort_unstable();
+            for (c, n) in v {
+                if let Some((x, y)) = cell_xy(c) {
+                    writeln!(f, "{t} {x} {y} {n}")?;
+                }
+            }
+        }
+        let (mut noted, mut notes_n) = (0u64, 0u64);
+        let notes_path = celeste_rust::storage::layer::notes_path(&dir, t + 1);
+        if has_notes && notes_path.exists() {
+            let notes = celeste_rust::storage::layer::read_notes(&notes_path)?;
+            notes_n = notes.iter().map(|n| n.3.count_ones() as u64).sum();
+            let mut by: rustc_hash::FxHashMap<(u32, (u64, u64)), u64> = Default::default();
+            for n in &notes {
+                *by.entry((n.0, n.1)).or_default() |= n.3;
+            }
+            noted = cur.iter().filter(|(s, _)| by.get(&(s.region, s.key)).is_some_and(|m| m >> s.local & 1 == 1)).count() as u64;
+        }
+        extent.push((t, x0, x1, y0, y1, noted, notes_n));
+        if let Some(((rx0, rx1), (ry0, ry1))) = rect {
+            let inside: Vec<_> = cur
+                .iter()
+                .filter(|(s, _)| cell_xy(s.cell(&geo)).is_some_and(|(x, y)| (rx0..=rx1).contains(&x) && (ry0..=ry1).contains(&y)))
+                .take(20)
+                .collect();
+            for (s, reg) in inside {
+                let layer = (0..=t).find(|&f| tree.mask_at(f, s.region, s.key).is_ok_and(|m| m >> s.local & 1 == 1));
+                let Some(layer) = layer else { continue };
+                let row = tree.row(layer, *s, cfg)?;
+                let named = project_all(&row).swap_remove(0);
+                let keep = ["player.x", "player.y", "spd.x", "spd.y", "rem.x", "rem.y", "dash_effect_time"];
+                let mut text: Vec<String> = named.iter().filter(|(k, _)| keep.contains(&k.as_str()) || k.ends_with(".djump") || k.ends_with(".dash_time") || k.ends_with(".grace")).map(|(k, v)| format!("{k}={v}")).collect();
+                text.push(format!("exact-rem-points={}", celeste_rust::search::reach::points(reg)));
+                println!("[reach] f{t:03} in the rect: {}", text.join(" "));
+            }
+        }
+        Ok(())
+    })?;
+    println!("[reach] {} to f{to}, {:.1} s", dir.display(), t0.elapsed().as_secs_f64());
+    let mut tsv = String::from("frame\tstates\tpoints\tcells\tforward_layer\tx_min\tx_max\ty_min\ty_max\treached_with_dropped_successors\tdrop_noted_cells\n");
+    for (f, e) in r.frames.iter().zip(&extent) {
+        let line = format!("{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}", f.frame, f.states, f.points, f.cells, f.forward_layer, e.1, e.2, e.3, e.4, e.5, e.6);
+        println!("{line}");
+        tsv += &line;
+        tsv.push('\n');
+    }
+    if let Some(d) = save {
+        let d = std::path::Path::new(d);
+        std::fs::create_dir_all(d)?;
+        std::fs::write(d.join("reach.tsv"), &tsv)?;
+        let rows: Vec<celeste_rust::frame::MarkRow> = r
+            .last
+            .iter()
+            .map(|(s, &l)| celeste_rust::frame::mark_row(tree.shapes[s.shape(&geo) as usize], s.key, s.cell(&geo), l.min(u16::MAX as u32) as u16, steps))
+            .collect();
+        celeste_rust::frame::save_marks(&d.join("reach.marks.bin"), rows, steps, &tree.space)?;
+        println!("[reach] {} reached states saved to {}", r.last.len(), d.join("reach.marks.bin").display());
+    }
+    Ok(())
+}
+
+/// The level a tree was widened at (its settings record).
+fn tree_level(dir: &std::path::Path) -> Result<Level> {
+    let rec = std::fs::read_to_string(celeste_rust::settings::path(dir)).with_context(|| format!("{}: no settings record", dir.display()))?;
+    let spec = rec.lines().find_map(|l| l.strip_prefix("level ")).ok_or_else(|| anyhow::anyhow!("{}: the record names no level", dir.display()))?;
+    Level::parse(spec).map_err(|e| anyhow::anyhow!(e))
 }

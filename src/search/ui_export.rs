@@ -649,6 +649,11 @@ pub struct Paths<'a> {
     pub witness: Option<&'a Path>,
     pub reference: Option<&'a Path>,
     pub download: Option<&'a Path>,
+    /// `rewrite reach --save-marks DIR` over the last level's tree: its
+    /// exactly reached states shown as a level after the last forward one,
+    /// labelled `reach_label`.
+    pub reach: Option<&'a Path>,
+    pub reach_label: Option<&'a str>,
 }
 
 /// The export. `checkpoint_dir` is a search's (`result.json`, `levelNN/`);
@@ -678,6 +683,19 @@ pub fn export(checkpoint_dir: &Path, out: &Path, s: &crate::settings::Settings, 
         None => witness,
     };
     let reference = paths.reference.map(read_witness).transpose()?;
+    // The exact reach (`rewrite reach`): a level over the last forward tree.
+    let reach_level = match paths.reach {
+        Some(dir) => {
+            let li = hr.levels.len();
+            let label = paths.reach_label.map_or_else(|| format!("exact reach: {}, rem exact, from the start", last.spec), str::to_string);
+            let mut lr = level_run(li, label, Vec::new(), None);
+            lr.marked = Some(MarksMap::open(&dir.join("reach.marks.bin"))?.rows as u64);
+            lr.forward_of = Some(nforward - 1);
+            hr.levels.push(lr);
+            Some((li, dir))
+        }
+        None => None,
+    };
     let download = match paths.download {
         Some(p) => Some(Download {
             file: p.file_name().with_context(|| format!("{}: not a file", p.display()))?.to_string_lossy().into_owned(),
@@ -712,6 +730,10 @@ pub fn export(checkpoint_dir: &Path, out: &Path, s: &crate::settings::Settings, 
                     maps.push(MarksMap::open(&a.join(name))?);
                 }
             }
+        }
+        if let Some((l, d)) = reach_level.filter(|_| level == nforward - 1) {
+            set_levels.push(l);
+            maps.push(MarksMap::open(&d.join("reach.marks.bin"))?);
         }
         let (table, by_cell_dist) = if maps.is_empty() {
             (None, Vec::new())
