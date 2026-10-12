@@ -510,7 +510,7 @@ pub fn run_wave(engine: &dyn FrameStep, parts: &[Part], cx: WaveCtx) -> Result<W
         }
     }
     new.sort_unstable_by_key(|x| x.region);
-    let mut next = Layer::default();
+    let mut next = Layer::with_capacity(new.iter().map(|x| x.keys.len()).sum());
     for sl in new {
         next.push_region(sl.region, &sl.keys, &sl.masks)?;
     }

@@ -1213,14 +1213,14 @@ pub fn grow_tree(
     initial: impl FnOnce() -> Result<Vec<Block>>,
     s: &crate::settings::Settings,
 ) -> Result<ForwardResult> {
-    if dir.join("frames").join("f000").is_dir() {
+    if crate::storage::layer::frame_exists(dir, 0) {
         s.check(dir, level)?;
     }
     if let Some(w) = want {
         anyhow::ensure!(to <= w.h, "--level-minus-one at step {} is below the horizon, step {to}", w.h);
     }
     let complete = tree_first_win_through(dir, to)?;
-    let raise_to: Option<Option<MinusOne>> = if !dir.join("frames").join("f000").is_dir() {
+    let raise_to: Option<Option<MinusOne>> = if !crate::storage::layer::frame_exists(dir, 0) {
         None
     } else {
         match TreeFilter::read(dir)? {

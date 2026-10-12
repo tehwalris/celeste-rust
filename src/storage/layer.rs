@@ -46,6 +46,11 @@ pub struct Layer {
 const _: () = assert!(GEOMETRY.words == 1, "a layer holds a u64 mask an entry: 8 x 8 storage regions");
 
 impl Layer {
+    /// An empty layer with room for `entries` entries.
+    pub fn with_capacity(entries: usize) -> Layer {
+        Layer { keys: Vec::with_capacity(entries), masks: Vec::with_capacity(entries), ..Default::default() }
+    }
+
     /// Append region `region`'s entries (after every region held; keys
     /// ascending, masks non-empty: checked).
     pub fn push_region(&mut self, region: u32, keys: &[Key], masks: &[u64]) -> Result<()> {
@@ -145,22 +150,6 @@ impl Layer {
     pub fn region_at(&self, i: usize) -> (u32, std::ops::Range<usize>) {
         let (r, a) = self.regions[i];
         (r, a as usize..self.regions.get(i + 1).map_or(self.keys.len(), |x| x.1 as usize))
-    }
-
-    /// THE STORAGE FINGERPRINT of the layer's states (count, and the sum of
-    /// a hash of each state's region, packed key and cell): what the frame
-    /// file must hold (`check_frame_file`). Not a content hash: a packed key
-    /// is the tree's, so two trees compare by `content_fingerprint`.
-    pub fn fingerprint(&self) -> (u64, u64) {
-        let (mut n, mut acc) = (0u64, 0u64);
-        for (region, key, mask) in self.iter() {
-            let h = mix64(key.0 ^ mix64(key.1 ^ (region as u64) << 8));
-            for local in bits(mask) {
-                acc = acc.wrapping_add(mix64(h ^ local as u64));
-                n += 1;
-            }
-        }
-        (n, acc)
     }
 
     /// `rewrite ckhash`'s `f` line over the layer: its states' count and the
@@ -642,15 +631,28 @@ impl FrameFile {
 }
 
 /// THE COMPLETE STORAGE CHECK of a frame file just written: read back from
-/// disk, its states are exactly `layer`'s (count and `Layer::fingerprint`,
-/// over every state of the frame) and its wins `wins`. FATAL otherwise:
-/// the frame would resume as another set than the forward expands.
+/// disk, region by region (in parallel, no copy of the whole frame), its
+/// states are exactly `layer`'s - its regions, every entry's key and cells
+/// - and its wins `wins`. FATAL otherwise: the frame would resume as
+/// another set than the forward expands.
 pub fn check_frame_file(path: &Path, layer: &Layer, wins: &[(u32, u64)], threads: usize) -> Result<()> {
     let f = FrameFile::open(path)?;
-    let (back, back_wins) = f.layer(None, threads)?;
-    let (want, got) = (layer.fingerprint(), back.fingerprint());
-    ensure!(want == got, "{}: STORED STATES DIFFER from the forward's: {} states {:016x} in memory, {} {:016x} read back", path.display(), want.0, want.1, got.0, got.1);
-    ensure!(back_wins == wins, "{}: STORED WINS DIFFER from the forward's ({} entries, {} read back)", path.display(), wins.len(), back_wins.len());
+    let regions: Vec<(u32, std::ops::Range<usize>)> = layer.regions().collect();
+    let differ = |what: String| anyhow!("{}: STORED STATES DIFFER from the forward's ({what})", path.display());
+    ensure!(f.header.regions.len() == regions.len(), differ(format!("{} regions in memory, {} read back", regions.len(), f.header.regions.len())));
+    let parts: Vec<Result<()>> = super::wave::par_map(&(0..regions.len()).collect::<Vec<_>>(), threads, |&i| {
+        let (region, rg) = &regions[i];
+        ensure!(f.header.regions[i].region == *region, differ(format!("region {} read back as {}", region, f.header.regions[i].region)));
+        let e = f.region(i)?;
+        ensure!(e.keys[..] == layer.keys[rg.clone()] && e.masks[..] == layer.masks[rg.clone()], differ(format!("region {region}'s entries")));
+        let lo = wins.partition_point(|w| (w.0 as usize) < rg.start);
+        let hi = wins.partition_point(|w| (w.0 as usize) < rg.end);
+        let want: Vec<(u32, u64)> = wins[lo..hi].iter().map(|&(x, m)| (x - rg.start as u32, m)).collect();
+        ensure!(e.wins == want, differ(format!("region {region}'s wins")));
+        Ok(())
+    });
+    parts.into_iter().collect::<Result<Vec<()>>>()?;
+    ensure!(f.header.states() == layer.states(), differ(format!("{} states in memory, {} in the header", layer.states(), f.header.states())));
     Ok(())
 }
 
