@@ -141,12 +141,18 @@ Not part of any tier: run them when their reason applies.
 `/var/tmp/celeste-fixtures` (`CELESTE_FIXTURES`), never committed; each
 built by a pinned command and checked against its pinned fingerprint
 (`gates/fixtures/NAME.ckhash`: `ckhash --edges`, and `--dropped` under level
--1, through its last frame). A manifest records the spec, the file formats
-and the sources. `ensure` rebuilds a fixture whose spec or file formats
-changed (loudly: `STALE fixture ... REBUILDING`); one built from other
-sources is reported, not rebuilt: a fixture is an INPUT pinned by its
-fingerprint, and a change to the forward shows in the frame checks and in
-t2's full-room gates. When a deliberate change moves a fixture's own
+-1, through its last frame). A manifest records the spec, the file formats,
+the slice size and the sources. `ensure` rebuilds a fixture whose spec,
+file formats or slice size changed (loudly: `STALE fixture ...
+REBUILDING`); one built from other sources is reported, not rebuilt: a
+fixture is an INPUT pinned by its fingerprint, and a change to the
+forward shows in the frame checks and in t2's full-room gates. The
+fingerprint is canonical but the tree's transfer ids (`xfer.bin`) are in
+discovery order, which the slices set: a fixture cut by another slice
+size gives a frame check other edge bytes (2026-10-12, 1M -> 256k: -0.04
+to -1.3%). Another change to the discovery order (the units, the jobs)
+does the same: rebuild the fixtures (`tools/fixtures.sh build all`)
+before re-pinning edge bytes. When a deliberate change moves a fixture's own
 frames, `tools/fixtures.sh pin NAME` rebuilds it and re-pins.
 
 Level -1 fixtures keep their table (`NAME/l1-table.bin`, `--l1-table`):
