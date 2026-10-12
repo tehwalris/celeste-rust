@@ -170,6 +170,12 @@ fn ub_hash(k: u32, t_key: Key, b: &Ub) -> u64 {
 }
 
 impl UnitBundles {
+    /// Bytes its tables hold (`--phases`' `[wavemem]`).
+    pub fn alloc_bytes(&self) -> usize {
+        let b = 16 + std::mem::size_of::<Ub>();
+        self.buckets.iter().map(|x| x.1.capacity() * b).sum::<usize>() + self.spare.iter().map(|v| v.capacity() * b).sum::<usize>() + 8 * self.index.capacity() + 24 * self.t_idx.capacity()
+    }
+
     pub fn clear(&mut self) {
         if self.n > 0 {
             self.index.fill(0);
@@ -319,6 +325,27 @@ pub struct Scratch {
     enc: bundle::Encoder,
     raw: Vec<u8>,
     z: zstd::bulk::Compressor<'static>,
+}
+
+impl Scratch {
+    /// Bytes its buffers hold (`--phases`' `[wavemem]`).
+    pub fn alloc_bytes(&self) -> usize {
+        4 * (self.e_of.capacity() + self.s_of.capacity()) + 32 * self.s_idx.capacity() + 24 * self.s_list.capacity() + std::mem::size_of::<bundle::Tb>() * self.tbs.capacity() + self.enc.alloc_bytes() + self.raw.capacity()
+    }
+}
+
+impl Chunk {
+    /// Bytes it holds (its unit's shared sources not counted).
+    pub fn alloc_bytes(&self) -> usize {
+        24 * self.targets.capacity() + std::mem::size_of::<Ub>() * self.bundles.capacity() + 4 * self.src_regions.capacity()
+    }
+}
+
+impl RouteState {
+    /// Bytes its new-cell slots, provisional bundles and segments hold.
+    pub fn alloc_bytes(&self) -> usize {
+        8 * self.fresh.capacity() + std::mem::size_of::<Bundle>() * self.prov.capacity() + self.segs.iter().map(|s| s.1.bytes.capacity()).sum::<usize>()
+    }
 }
 
 impl Default for Scratch {

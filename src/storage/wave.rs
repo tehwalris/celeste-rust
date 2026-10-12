@@ -319,6 +319,8 @@ pub fn run_wave(engine: &dyn FrameStep, parts: &[Part], cx: WaveCtx) -> Result<W
         jobs: Default::default(),
         jobs_left: AtomicUsize::new(0),
         failed: std::sync::atomic::AtomicBool::new(false),
+        inflight: AtomicUsize::new(0),
+        inflight_max: AtomicUsize::new(0),
     };
     let shapes: Vec<u64> = visited.shapes().to_vec();
     let t_pipeline = Instant::now();
@@ -362,6 +364,11 @@ pub fn run_wave(engine: &dyn FrameStep, parts: &[Part], cx: WaveCtx) -> Result<W
                             let rcx = RegionCtx { frame, record, remaps: &job.remaps, layers: raised.and(layers) };
                             let cs: Vec<&Chunk> = job.chunks.iter().collect();
                             let r = super::route::run_route(&mut job.state.lock().expect("a route"), job.slice, &cs, &rcx, sc);
+                            if s.diag.phases {
+                                pipe.inflight.fetch_sub(job.chunks.iter().map(Chunk::alloc_bytes).sum(), Ordering::AcqRel);
+                            }
+                            drop(cs);
+                            drop(job);
                             pipe.jobs_left.fetch_sub(1, Ordering::AcqRel);
                             r?;
                             phases::add(phases::REGIONS, tp);
@@ -381,6 +388,11 @@ pub fn run_wave(engine: &dyn FrameStep, parts: &[Part], cx: WaveCtx) -> Result<W
                             run_unit(engine, u as u32, spec, parts[spec.part as usize], shapes, sink, &mut us, frame - 1, ceiling, s)?;
                             let k = slice_of[u] as usize;
                             pipe.upto[k][sink.worker as usize].fetch_max(sink.xfers_met(), Ordering::AcqRel);
+                            if s.diag.phases {
+                                let b: usize = sink.outbox.iter().map(Chunk::alloc_bytes).sum();
+                                let now = pipe.inflight.fetch_add(b, Ordering::AcqRel) + b;
+                                pipe.inflight_max.fetch_max(now, Ordering::AcqRel);
+                            }
                             pipe.chunks[k].lock().expect("a slice's chunks").append(&mut sink.outbox);
                             busy += t.elapsed();
                             idle_spins = 0;
@@ -419,12 +431,31 @@ pub fn run_wave(engine: &dyn FrameStep, parts: &[Part], cx: WaveCtx) -> Result<W
         }
     })?;
     let t_units = t_pipeline.elapsed();
+    collect_freed();
     let busy: std::time::Duration = spent.iter().map(|w| w.0).sum();
     st.t_regions = spent.iter().map(|w| w.1).sum();
     st.t_wave = t_units;
     st.wave_idle = idle_fraction(t_units, workers, busy);
     st.rss_wave = crate::metrics::current_rss_gb();
     st.slices = slices.len();
+    if s.diag.phases {
+        let gb = |b: usize| b as f64 / 1e9;
+        let routes = pipe.states.read().expect("the routes");
+        let tables: usize = routes.iter().map(|r| r.lock().expect("a route").table.alloc_bytes()).sum();
+        let route_rest: usize = routes.iter().map(|r| r.lock().expect("a route").alloc_bytes()).sum();
+        drop(routes);
+        eprintln!(
+            "[wavemem] f{frame}: frontier {:.3} GB ({} entries), route tables {:.3}, routes' new-cell slots, provisional bundles and segments {:.3}, chunks in flight at most {:.3}, sinks {:.3}, region scratch {:.3} GB; anon {:.2} GB",
+            gb(st.frontier_bytes),
+            st.entries_in,
+            gb(tables),
+            gb(route_rest),
+            gb(pipe.inflight_max.load(Ordering::Acquire)),
+            gb(sinks.iter().map(|k| k.alloc_bytes()).sum()),
+            gb(scratch.iter().map(|k| k.alloc_bytes()).sum()),
+            crate::metrics::current_rss_gb()
+        );
+    }
     let mut notes: Vec<Note> = Vec::new();
     for sink in &mut sinks {
         sink.finish()?;
@@ -544,6 +575,7 @@ pub fn run_wave(engine: &dyn FrameStep, parts: &[Part], cx: WaveCtx) -> Result<W
         st.edge_bytes = super::edges::write_file(&path, frame, segs, src_index)?;
     }
     phases::add(phases::LAYER, tl);
+    collect_freed();
     st.t_layer = t.elapsed();
     st.visited_bytes = visited.alloc_bytes();
     st.rss_end = crate::metrics::current_rss_gb();
@@ -552,6 +584,14 @@ pub fn run_wave(engine: &dyn FrameStep, parts: &[Part], cx: WaveCtx) -> Result<W
     st.lanes_out = next.states() as usize;
     phases::print_phases(s.diag.phases, t_frame.elapsed(), workers);
     Ok(Wave { next, wins, stats: st, dropped: super::layer::notes_of(notes)?, shapes: shapes_numbered, keys: adds })
+}
+
+/// The freed pages of the frame's (exited) worker threads back to the OS
+/// now: mimalloc reclaims an exited thread's segments lazily otherwise (the
+/// arc phase's ~3 GB on the mod room, plans/arc-memory.md).
+fn collect_freed() {
+    // SAFETY: mimalloc's documented API, callable from any thread.
+    unsafe { libmimalloc_sys::mi_collect(true) };
 }
 
 /// States decoded at a time at the frame's end (a chunk of a region's).
@@ -655,6 +695,10 @@ struct Pipe<'a> {
     /// A worker failed (an error or a panic): the others stop, so the
     /// frame's error comes back instead of a wait that never ends.
     failed: std::sync::atomic::AtomicBool,
+    /// The chunks' bytes in flight (handed over, their job not done) and
+    /// their most (`--phases`' `[wavemem]`).
+    inflight: AtomicUsize,
+    inflight_max: AtomicUsize,
 }
 
 impl Pipe<'_> {
