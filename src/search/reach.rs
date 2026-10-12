@@ -84,15 +84,19 @@ fn snap(s: Seg, k: u32) -> Seg {
 
 /// The union of `v` (deduplicated, left as the union's input), and its
 /// coarsening: 0 exact, else the `k` its pieces were snapped to (outward,
-/// to the grid of `2^k` points per axis) to fit `MAX_SEGS` segments.
-fn union(v: &mut Vec<Piece>, scratch: &mut Vec<Seg>) -> (Region, u8) {
+/// to the grid of `2^k` points per axis) to fit `MAX_SEGS` segments - the
+/// smallest from `k0` (a target already coarsened to `k0` within the frame
+/// starts there: no ladder of failed sweeps on every union).
+fn union(v: &mut Vec<Piece>, scratch: &mut Vec<Seg>, k0: u8) -> (Region, u8) {
     v.sort_unstable_by_key(|p| (p.y, p.x));
     v.dedup();
-    if let Some(r) = Region::try_from_pieces(v, scratch, MAX_SEGS) {
-        return (r, 0);
+    if k0 == 0 {
+        if let Some(r) = Region::try_from_pieces(v, scratch, MAX_SEGS) {
+            return (r, 0);
+        }
     }
     let mut w = Vec::with_capacity(v.len());
-    for k in 1..=16 {
+    for k in (k0 as u32).max(1)..=16 {
         w.clear();
         w.extend(v.iter().map(|p| Piece { y: snap(p.y, k), x: snap(p.x, k) }));
         w.sort_unstable_by_key(|p| (p.y, p.x));
@@ -230,6 +234,7 @@ pub fn reach(dir: &std::path::Path, horizon: u32, point: (u32, u32), threads: us
                 for &(_, d) in &targets[c * TARGET_CHUNK..((c + 1) * TARGET_CHUNK).min(targets.len())] {
                     v.clear();
                     let (mut lim, mut snapped, mut from) = (256usize, 0u8, 0u8);
+                    let grid = |p: Piece, k: u8| Piece { y: snap(p.y, k as u32), x: snap(p.x, k as u32) };
                     for &(i, x) in &inc[start[d as usize] as usize..start[d as usize + 1] as usize] {
                         let (s, r) = &cur_ref[i as usize];
                         let (tx, ty) = pairs[x as usize];
@@ -239,16 +244,20 @@ pub fn reach(dir: &std::path::Path, horizon: u32, point: (u32, u32), threads: us
                             continue;
                         }
                         from = from.max(inexact_ref.get(s).copied().unwrap_or(0));
-                        v.extend_from_slice(tmp);
+                        if snapped == 0 {
+                            v.extend_from_slice(tmp);
+                        } else {
+                            v.extend(tmp.iter().map(|&p| grid(p, snapped)));
+                        }
                         if v.len() > lim {
-                            let (u, k) = union(v, scratch);
+                            let (u, k) = union(v, scratch, snapped);
                             snapped = snapped.max(k);
                             v.clear();
                             u.pieces(v);
                             lim = (2 * v.len()).max(256);
                         }
                     }
-                    let (u, k) = union(v, scratch);
+                    let (u, k) = union(v, scratch, snapped);
                     snapped = snapped.max(k);
                     if !u.is_empty() {
                         res.push((names_ref[d as usize], u, snapped, from));
@@ -300,12 +309,12 @@ mod tests {
         // 3 * MAX_SEGS points, 3 a row 5 apart in x, the rows 3 apart (never
         // adjacent).
         let cloud: Vec<Piece> = (0..3 * super::MAX_SEGS as u32).map(|i| pt(1000 + 5 * (i % 3), 3 * (i / 3))).collect();
-        let (r, k) = super::union(&mut cloud.clone(), &mut Vec::new());
+        let (r, k) = super::union(&mut cloud.clone(), &mut Vec::new(), 0);
         assert!(k > 0 && r.n_segs() <= super::MAX_SEGS, "k {k}, {} segments", r.n_segs());
         assert!(cloud.iter().all(|p| r.contains(p.x.lo, p.y.lo)), "the coarsened set holds every point");
-        let (r1, k1) = super::union(&mut cloud.iter().copied().map(|p| super::Piece { y: super::snap(p.y, k as u32 - 1), x: super::snap(p.x, k as u32 - 1) }).collect(), &mut Vec::new());
+        let (r1, k1) = super::union(&mut cloud.iter().copied().map(|p| super::Piece { y: super::snap(p.y, k as u32 - 1), x: super::snap(p.x, k as u32 - 1) }).collect(), &mut Vec::new(), 0);
         assert!(k1 > 0 || r1.n_segs() > super::MAX_SEGS, "a finer grid would have fit: k {k} is not the smallest");
-        let (small, k0) = super::union(&mut cloud[..100].to_vec(), &mut Vec::new());
+        let (small, k0) = super::union(&mut cloud[..100].to_vec(), &mut Vec::new(), 0);
         assert_eq!((k0, super::points(&small)), (0, 100));
     }
 
