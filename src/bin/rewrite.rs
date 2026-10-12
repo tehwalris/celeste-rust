@@ -2583,7 +2583,11 @@ fn reach_command(checkpoint_dir: &str, level_index: usize, to: u32, save: Option
     let mut extent: Vec<(u32, i32, i32, i32, i32, u64, u64)> = Vec::new();
     let point = celeste_rust::search::arc_dp::start_point(cfg)?;
     let t0 = std::time::Instant::now();
+    // Per frame, the reached sets' shapes (`rem_stats.tsv`).
+    let mut rem_stats = String::from("frame\taxis\tof\tbucket\tstates\texact_states\n");
+    let pool = celeste_rust::par::Pool::new(cfg.threads());
     let r = celeste_rust::search::reach::reach(&dir, steps, point, cfg.threads(), |t, cur, inexact| {
+        rem_stats += &rem_shapes(t, cur, inexact, &pool)?;
         let (mut x0, mut x1, mut y0, mut y1) = (i32::MAX, i32::MIN, i32::MAX, i32::MIN);
         let mut per_cell: rustc_hash::FxHashMap<u32, u64> = Default::default();
         for (s, _) in cur {
@@ -2637,17 +2641,60 @@ fn reach_command(checkpoint_dir: &str, level_index: usize, to: u32, save: Option
         Ok(())
     })?;
     println!("[reach] {} to f{to}, {:.1} s", dir.display(), t0.elapsed().as_secs_f64());
-    let mut tsv = String::from("frame\tstates\tnew\tpoints\tcells\tforward_layer\tcoarsened\tinexact\tmax_k\tx_min\tx_max\ty_min\ty_max\treached_with_dropped_successors\tdrop_noted_cells\n");
+    let mut tsv = String::from("frame\tstates\tnew\tentered\tentered_edges\tpushes\tpushes_nonempty\tpoints\tcells\tforward_layer\tcoarsened\tinexact\tmax_k\tx_min\tx_max\ty_min\ty_max\treached_with_dropped_successors\tdrop_noted_cells\n");
     for (f, e) in r.frames.iter().zip(&extent) {
-        let line = format!("{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}", f.frame, f.states, f.new, f.points, f.cells, f.forward_layer, f.coarsened, f.inexact, f.max_k, e.1, e.2, e.3, e.4, e.5, e.6);
+        let p = r.pushes.get(f.frame as usize).copied().unwrap_or_default();
+        let line = format!("{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}", f.frame, f.states, f.new, f.entered, f.entered_edges, p.edges, p.nonempty, f.points, f.cells, f.forward_layer, f.coarsened, f.inexact, f.max_k, e.1, e.2, e.3, e.4, e.5, e.6);
         println!("{line}");
         tsv += &line;
         tsv.push('\n');
     }
+    // Against the forward: its visited states and its emissions (records)
+    // over the same frames.
+    let fwd = std::fs::read_to_string(dir.join("forward.tsv")).unwrap_or_default();
+    let mut lines = fwd.lines();
+    let head: Vec<&str> = lines.next().unwrap_or("").split('\t').collect();
+    let col = |name: &str| head.iter().position(|h| *h == name);
+    let (mut visited, mut emitted) = (0u64, 0u64);
+    if let (Some(vf), Some(ve), Some(vv)) = (col("frame"), col("edges"), col("visited")) {
+        for l in lines {
+            let c: Vec<&str> = l.split('\t').collect();
+            let f: u32 = c[vf].parse()?;
+            if f <= steps {
+                emitted += c[ve].parse::<u64>()?;
+                visited = visited.max(c[vv].parse()?);
+            }
+        }
+    }
+    let live = r.last.len() as u64;
+    let entered: u64 = r.frames.iter().map(|f| f.entered).sum();
+    let entered_edges: u64 = r.frames.iter().map(|f| f.entered_edges).sum();
+    let e = &r.entries;
+    let range = |a: usize, b: usize| e.iter().skip(a).take(b.saturating_sub(a)).sum::<u64>();
+    let mut summary = String::new();
+    summary += &format!("[reach] states ever reached: {live} (the forward visited {visited}: {:.2}%)\n", 100.0 * live as f64 / visited.max(1) as f64);
+    summary += &format!(
+        "[reach] first arrival: entries per state 1: {}, 2: {}, 3-5: {}, 6+: {} ({entered} entries); their edge records {entered_edges} against the forward's emissions {emitted} ({:.2}%)\n",
+        range(1, 2),
+        range(2, 3),
+        range(3, 6),
+        range(6, usize::MAX),
+        100.0 * entered_edges as f64 / emitted.max(1) as f64
+    );
+    summary += &format!(
+        "[reach] edges of the states ever reached: {} records ({:.2}% of the forward's), {} distinct, {} of those ever pushed non-empty\n",
+        r.edges_raw,
+        100.0 * r.edges_raw as f64 / emitted.max(1) as f64,
+        r.edges,
+        r.edges_pushed
+    );
+    print!("{summary}");
     if let Some(d) = save {
         let d = std::path::Path::new(d);
         std::fs::create_dir_all(d)?;
         std::fs::write(d.join("reach.tsv"), &tsv)?;
+        std::fs::write(d.join("rem_stats.tsv"), &rem_stats)?;
+        std::fs::write(d.join("summary.txt"), &summary)?;
         let rows: Vec<celeste_rust::frame::MarkRow> = r
             .last
             .iter()
@@ -2657,6 +2704,118 @@ fn reach_command(checkpoint_dir: &str, level_index: usize, to: u32, save: Option
         println!("[reach] {} reached states saved to {}", r.last.len(), d.join("reach.marks.bin").display());
     }
     Ok(())
+}
+
+/// One frame's reached sets by shape, as `rem_stats.tsv` rows: per axis
+/// (`x`, `y`: the set's projection) the number of segments and the measure
+/// (points of the 2^16 circle), and the measure of the whole set (`xy`, of
+/// 2^32), each bucketed; every state and the exact ones apart.
+fn rem_shapes(t: u32, cur: &[(celeste_rust::storage::Sk, celeste_rust::search::arcs::Region)], inexact: &rustc_hash::FxHashMap<celeste_rust::storage::Sk, u8>, pool: &celeste_rust::par::Pool) -> Result<String> {
+    use celeste_rust::search::arcs::Seg;
+    const SEGS: [&str; 5] = ["1", "2-4", "5-64", "65-1024", "1025+"];
+    const MEASURE: [&str; 6] = ["point", "<=1/256", "<=1/16", "<=1/2", "<full", "full"];
+    let segs_bucket = |n: usize| match n {
+        0 | 1 => 0,
+        2..=4 => 1,
+        5..=64 => 2,
+        65..=1024 => 3,
+        _ => 4,
+    };
+    let measure_bucket = |p: u64, full: u64| match p {
+        _ if p >= full => 5,
+        0 | 1 => 0,
+        _ if p <= full >> 8 => 1,
+        _ if p <= full >> 4 => 2,
+        _ if p <= full >> 1 => 3,
+        _ => 4,
+    };
+    // [axis x, y][segs | measure][bucket][all, exact], and xy's measure.
+    type Counts = ([[[[u64; 2]; 6]; 2]; 2], [[u64; 2]; 6]);
+    const CHUNK: usize = 4096;
+    let parts = pool.map_with(
+        cur.len().div_ceil(CHUNK),
+        || Ok(Vec::<Seg>::new()),
+        |xs, c| {
+            let mut n: Counts = Default::default();
+            for (s, r) in &cur[c * CHUNK..((c + 1) * CHUNK).min(cur.len())] {
+                let k = !inexact.contains_key(s) as usize;
+                // A projection's (segments, points): merged where they touch.
+                let proj = |v: &mut Vec<Seg>| -> (usize, u64) {
+                    v.sort_unstable_by_key(|s| s.lo);
+                    let (mut n, mut p, mut hi) = (0usize, 0u64, None::<u32>);
+                    for s in v.iter() {
+                        match hi {
+                            Some(h) if s.lo <= h => {
+                                if s.hi > h {
+                                    p += (s.hi - h) as u64;
+                                    hi = Some(s.hi);
+                                }
+                            }
+                            _ => {
+                                n += 1;
+                                p += (s.hi - s.lo) as u64;
+                                hi = Some(s.hi);
+                            }
+                        }
+                    }
+                    (n, p)
+                };
+                xs.clear();
+                let mut ys: Vec<Seg> = Vec::new();
+                for (y, x) in r.slabs() {
+                    ys.push(y);
+                    xs.extend(x);
+                }
+                for (a, v) in [(0, &mut *xs), (1, &mut ys)] {
+                    let (segs, p) = proj(v);
+                    n.0[a][0][segs_bucket(segs)][0] += 1;
+                    n.0[a][1][measure_bucket(p, 1 << 16)][0] += 1;
+                    n.0[a][0][segs_bucket(segs)][1] += k as u64;
+                    n.0[a][1][measure_bucket(p, 1 << 16)][1] += k as u64;
+                }
+                let b = measure_bucket(celeste_rust::search::reach::points(r), 1 << 32);
+                n.1[b][0] += 1;
+                n.1[b][1] += k as u64;
+            }
+            Ok(n)
+        },
+    )?;
+    let mut n: Counts = Default::default();
+    for p in parts {
+        for a in 0..2 {
+            for m in 0..2 {
+                for b in 0..6 {
+                    for k in 0..2 {
+                        n.0[a][m][b][k] += p.0[a][m][b][k];
+                    }
+                }
+            }
+        }
+        for b in 0..6 {
+            for k in 0..2 {
+                n.1[b][k] += p.1[b][k];
+            }
+        }
+    }
+    let mut out = String::new();
+    for (a, axis) in ["x", "y"].iter().enumerate() {
+        for (b, name) in SEGS.iter().enumerate() {
+            if n.0[a][0][b][0] > 0 {
+                out += &format!("{t}\t{axis}\tsegments\t{name}\t{}\t{}\n", n.0[a][0][b][0], n.0[a][0][b][1]);
+            }
+        }
+        for (b, name) in MEASURE.iter().enumerate() {
+            if n.0[a][1][b][0] > 0 {
+                out += &format!("{t}\t{axis}\tmeasure\t{name}\t{}\t{}\n", n.0[a][1][b][0], n.0[a][1][b][1]);
+            }
+        }
+    }
+    for (b, name) in MEASURE.iter().enumerate() {
+        if n.1[b][0] > 0 {
+            out += &format!("{t}\txy\tmeasure\t{name}\t{}\t{}\n", n.1[b][0], n.1[b][1]);
+        }
+    }
+    Ok(out)
 }
 
 /// The level a tree was widened at (its settings record).

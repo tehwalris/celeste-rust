@@ -43,9 +43,11 @@ const BATCH: usize = 1 << 20;
 /// first).
 const TARGET_CHUNK: usize = 16;
 
-/// The most x segments a reached set keeps exactly (below a `Region`'s
-/// 65535: a set this fragmented costs every push through it).
-const MAX_SEGS: usize = 1 << 14;
+/// The most x segments a reached set keeps exactly (far below a `Region`'s
+/// 65535: the sets are clouds of the remainders many paths leave, ~10 B a
+/// segment, and bal200's frames hold millions of states - 16384 took 53 GB
+/// by f164).
+const MAX_SEGS: usize = 1 << 10;
 
 /// One frame's exact reach, summed.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -67,6 +69,20 @@ pub struct FrameReach {
     pub coarsened: u64,
     pub inexact: u64,
     pub max_k: u8,
+    /// FIRST ARRIVAL in (state, remainder): the states whose union of sets
+    /// so far (`R_0..R_t`) grew here - what an exact-remainder forward that
+    /// keeps each (state, remainder) at its first frame would expand at `t`
+    /// - and their out-edge records (its emissions; 0 at the horizon).
+    pub entered: u64,
+    pub entered_edges: u64,
+}
+
+/// A frame's edge pushes: every edge of a reached state, and those whose
+/// image is not empty.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Pushes {
+    pub edges: u64,
+    pub nonempty: u64,
 }
 
 /// What `reach` found: per frame its sums; per state the LAST frame it is
@@ -74,7 +90,25 @@ pub struct FrameReach {
 pub struct Reach {
     pub frames: Vec<FrameReach>,
     pub last: FxHashMap<Sk, u32>,
+    /// Per frame `t` (to `t + 1`), the pushes.
+    pub pushes: Vec<Pushes>,
+    /// The out-edges of the states ever reached (not wins): as recorded
+    /// (the forward's records), distinct (target, transfer), and of those
+    /// the ones whose image was ever non-empty.
+    pub edges_raw: u64,
+    pub edges: u64,
+    pub edges_pushed: u64,
+    /// `entries[n]`: the states ever reached that entered (first arrival)
+    /// at `n` frames.
+    pub entries: Vec<u64>,
 }
+
+/// An edge's transfer id's bit marking an edge whose image was non-empty
+/// at some frame.
+const PUSHED: u32 = 1 << 31;
+
+/// Reached states per parallel task of the first-arrival unions.
+const GROW_CHUNK: usize = 1024;
 
 /// `s` widened outward to the grid of `2^k` points.
 fn snap(s: Seg, k: u32) -> Seg {
@@ -130,7 +164,12 @@ pub fn reach(dir: &std::path::Path, horizon: u32, point: (u32, u32), threads: us
     // far, `(target, transfer)` by number (8 B an edge).
     let mut index: FxHashMap<Sk, u32> = FxHashMap::default();
     let mut names: Vec<Sk> = Vec::new();
-    let mut out: FxHashMap<Sk, Box<[(u32, u32)]>> = FxHashMap::default();
+    let mut out: FxHashMap<Sk, (u32, Box<[(u32, u32)]>)> = FxHashMap::default();
+    // First arrival: per state ever reached, the union of its sets so far
+    // and the frames it entered at.
+    let mut acc: FxHashMap<Sk, (Region, u32)> = FxHashMap::default();
+    let mut pushes: Vec<Pushes> = Vec::new();
+    let mut acc_segs = 0u64;
     // The tree's layers as loaded (frame `f`: the states first reached at `f`).
     let mut layers: Vec<crate::storage::layer::Layer> = Vec::new();
     let mut frames = Vec::new();
@@ -184,16 +223,63 @@ pub fn reach(dir: &std::path::Path, horizon: u32, point: (u32, u32), threads: us
                     lists[k].push((d, x));
                 }
                 for (s, mut l) in batch.iter().zip(lists) {
+                    let raw = l.len() as u32;
+                    anyhow::ensure!(l.iter().all(|e| e.1 < PUSHED), "a transfer id past 2^31");
                     l.sort_unstable();
                     l.dedup();
-                    out.insert(*s, l.into_boxed_slice());
+                    out.insert(*s, (raw, l.into_boxed_slice()));
                 }
             }
         }
         let t_read = tt.elapsed().as_secs_f64();
+        // First arrival: a state enters where `R_t` adds to its union so far.
+        let acc_ref = &acc;
+        let grown = pool.map_with(
+            cur.len().div_ceil(GROW_CHUNK),
+            || Ok((Vec::new(), Vec::new())),
+            |(v, scratch): &mut (Vec<Piece>, Vec<Seg>), c| {
+                let mut res: Vec<(u32, Region)> = Vec::new();
+                for i in c * GROW_CHUNK..((c + 1) * GROW_CHUNK).min(cur.len()) {
+                    let (s, r) = &cur[i];
+                    match acc_ref.get(s) {
+                        None => res.push((i as u32, r.clone())),
+                        Some((a, _)) => {
+                            v.clear();
+                            a.pieces(v);
+                            r.pieces(v);
+                            let (u, _) = union(v, scratch, 0);
+                            if u != *a {
+                                res.push((i as u32, u));
+                            }
+                        }
+                    }
+                }
+                Ok(res)
+            },
+        )?;
+        let (mut entered, mut entered_edges) = (0u64, 0u64);
+        for (i, u) in grown.into_iter().flatten() {
+            let s = cur[i as usize].0;
+            let e = acc.entry(s).or_insert_with(|| (Region::default(), 0));
+            acc_segs = acc_segs + u.n_segs() as u64 - e.0.n_segs() as u64;
+            e.0 = u;
+            e.1 += 1;
+            entered += 1;
+            entered_edges += out.get(&s).map_or(0, |o| o.0 as u64);
+        }
+        if let Some(f) = frames.last_mut() {
+            (f.entered, f.entered_edges) = (entered, entered_edges);
+        }
         // The frame's edges grouped by target (a counting sort): `inc[start[d]
         // ..start[d + 1]]` the (source in `cur`, transfer) pairs into `d`.
-        let edges_of: Vec<&[(u32, u32)]> = cur.iter().map(|(s, _)| out.get(s).map_or(&[][..], |e| &e[..])).collect();
+        let edges_of: Vec<&[(u32, u32)]> = cur.iter().map(|(s, _)| out.get(s).map_or(&[][..], |e| &e.1[..])).collect();
+        // Each (source, edge)'s place in the frame's pushed bits.
+        let mut off: Vec<u64> = Vec::with_capacity(cur.len() + 1);
+        off.push(0);
+        for es in &edges_of {
+            off.push(off[off.len() - 1] + es.len() as u64);
+        }
+        let pushed: Vec<std::sync::atomic::AtomicU64> = (0..off[cur.len()].div_ceil(64)).map(|_| Default::default()).collect();
         let mut start = vec![0u32; names.len() + 1];
         for es in &edges_of {
             for &(d, _) in es.iter() {
@@ -206,14 +292,13 @@ pub fn reach(dir: &std::path::Path, horizon: u32, point: (u32, u32), threads: us
         let mut fill = start.clone();
         let mut inc = vec![(0u32, 0u32); start[names.len()] as usize];
         for (i, es) in edges_of.iter().enumerate() {
-            for &(d, x) in es.iter() {
+            for (j, &(d, _)) in es.iter().enumerate() {
                 let p = &mut fill[d as usize];
-                inc[*p as usize] = (i as u32, x);
+                inc[*p as usize] = (i as u32, j as u32);
                 *p += 1;
             }
         }
         drop(fill);
-        drop(edges_of);
         // The targets, the costliest first (the segments pushed into each):
         // a few fragmented sets dominate a frame, and a worker that takes
         // one late would hold the frame up.
@@ -225,7 +310,7 @@ pub fn reach(dir: &std::path::Path, horizon: u32, point: (u32, u32), threads: us
         // Per target: every push into it, united (a union whenever the
         // pieces pass twice the last union's: a set of many pieces is not
         // re-united on every push), coarsened where it must be.
-        let (cur_ref, inexact_ref, names_ref) = (&cur, &inexact, &names);
+        let (cur_ref, inexact_ref, names_ref, edges_ref, off_ref, pushed_ref) = (&cur, &inexact, &names, &edges_of, &off, &pushed);
         let parts = pool.map_with(
             targets.len().div_ceil(TARGET_CHUNK),
             || Ok((Vec::new(), Vec::new(), Vec::new())),
@@ -235,14 +320,17 @@ pub fn reach(dir: &std::path::Path, horizon: u32, point: (u32, u32), threads: us
                     v.clear();
                     let (mut lim, mut snapped, mut from) = (256usize, 0u8, 0u8);
                     let grid = |p: Piece, k: u8| Piece { y: snap(p.y, k as u32), x: snap(p.x, k as u32) };
-                    for &(i, x) in &inc[start[d as usize] as usize..start[d as usize + 1] as usize] {
+                    for &(i, j) in &inc[start[d as usize] as usize..start[d as usize + 1] as usize] {
                         let (s, r) = &cur_ref[i as usize];
+                        let x = edges_ref[i as usize][j as usize].1 & !PUSHED;
                         let (tx, ty) = pairs[x as usize];
                         tmp.clear();
                         r.push(tx, ty, tmp);
                         if tmp.is_empty() {
                             continue;
                         }
+                        let g = off_ref[i as usize] + j as u64;
+                        pushed_ref[(g / 64) as usize].fetch_or(1 << (g % 64), std::sync::atomic::Ordering::Relaxed);
                         from = from.max(inexact_ref.get(s).copied().unwrap_or(0));
                         if snapped == 0 {
                             v.extend_from_slice(tmp);
@@ -267,6 +355,25 @@ pub fn reach(dir: &std::path::Path, horizon: u32, point: (u32, u32), threads: us
             },
         )?;
         drop(inc);
+        drop(edges_of);
+        // The non-empty pushes, marked on their edges.
+        let bit = |g: u64| pushed[(g / 64) as usize].load(std::sync::atomic::Ordering::Relaxed) >> (g % 64) & 1 == 1;
+        let mut nonempty = 0u64;
+        for (i, (s, _)) in cur.iter().enumerate() {
+            let (a, b) = (off[i], off[i + 1]);
+            if !(a..b).any(bit) {
+                continue;
+            }
+            let es = &mut out.get_mut(s).expect("a pushed state's edges").1;
+            for (j, e) in es.iter_mut().enumerate() {
+                if bit(a + j as u64) {
+                    e.1 |= PUSHED;
+                    nonempty += 1;
+                }
+            }
+        }
+        pushes.push(Pushes { edges: off[cur.len()], nonempty });
+        drop(pushed);
         let mut nx: Vec<(Sk, Region)> = Vec::new();
         let mut next_inexact: FxHashMap<Sk, u8> = FxHashMap::default();
         coarsened = 0;
@@ -279,7 +386,7 @@ pub fn reach(dir: &std::path::Path, horizon: u32, point: (u32, u32), threads: us
         }
         nx.sort_unstable_by_key(|e| e.0);
         eprintln!(
-            "[reach] f{:03} -> f{:03}: {} states -> {} ({} coarsened, {} inexact; {} states' edges held, {} names; read {:.1} s, total {:.1} s)",
+            "[reach] f{:03} -> f{:03}: {} states -> {} ({} coarsened, {} inexact; {} states' edges held, {} names; segments {} -> {}, first arrival {} entered, {} held, {} segments; rss {:.1} GB; read {:.1} s, total {:.1} s)",
             t,
             t + 1,
             cur.len(),
@@ -288,13 +395,29 @@ pub fn reach(dir: &std::path::Path, horizon: u32, point: (u32, u32), threads: us
             next_inexact.len(),
             out.len(),
             names.len(),
+            cur.iter().map(|c| c.1.n_segs() as u64).sum::<u64>(),
+            nx.iter().map(|c| c.1.n_segs() as u64).sum::<u64>(),
+            entered,
+            acc.len(),
+            acc_segs,
+            crate::metrics::current_rss_gb(),
             t_read,
             tt.elapsed().as_secs_f64()
         );
         cur = nx;
         inexact = next_inexact;
     }
-    Ok(Reach { frames, last })
+    let edges_raw = out.values().map(|o| o.0 as u64).sum();
+    let edges = out.values().map(|o| o.1.len() as u64).sum();
+    let edges_pushed = out.values().map(|o| o.1.iter().filter(|e| e.1 & PUSHED != 0).count() as u64).sum();
+    let mut entries = Vec::new();
+    for (_, n) in acc.values() {
+        if entries.len() <= *n as usize {
+            entries.resize(*n as usize + 1, 0);
+        }
+        entries[*n as usize] += 1;
+    }
+    Ok(Reach { frames, last, pushes, edges_raw, edges, edges_pushed, entries })
 }
 
 #[cfg(test)]
@@ -373,6 +496,16 @@ mod tests {
         let tree_states: u64 = r.frames.iter().map(|f| f.forward_layer).sum();
         assert!((r.last.len() as u64) < tree_states, "{} states reached exactly of the tree's {tree_states}", r.last.len());
         assert_eq!(r.frames.iter().map(|f| f.new).sum::<u64>(), r.last.len() as u64, "every reached state is new at one frame");
+        // First arrival: every state reached before the horizon enters at
+        // least once, at most at every frame it is reached.
+        assert_eq!(r.entries.first().copied().unwrap_or(0), 0);
+        assert_eq!(r.entries.iter().sum::<u64>(), r.frames[..35].iter().map(|f| f.new).sum::<u64>());
+        let entered: u64 = r.frames.iter().map(|f| f.entered).sum();
+        assert_eq!(entered, r.entries.iter().enumerate().map(|(n, &c)| n as u64 * c).sum::<u64>());
+        assert!(entered <= r.frames[..35].iter().map(|f| f.states).sum::<u64>());
+        // Edges: the distinct ones of the recorded, the pushed of those.
+        assert!(r.edges_pushed > 0 && r.edges_pushed <= r.edges && r.edges <= r.edges_raw);
+        assert!(r.pushes.iter().map(|p| p.nonempty).sum::<u64>() >= r.edges_pushed);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
