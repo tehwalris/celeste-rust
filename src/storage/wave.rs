@@ -565,6 +565,9 @@ pub fn run_wave(engine: &dyn FrameStep, parts: &[Part], cx: WaveCtx) -> Result<W
             all.into_iter().map(|x| x.1).collect()
         })
     };
+    if s.diag.phases {
+        crate::metrics::mem_phase(&format!("f{frame} the routes sealed (keys final, the next layer frozen)"));
+    }
     // THE NEXT LAYER: the routes' new states, frozen, by region.
     let mut new: Vec<Sealed> = Vec::new();
     for x in sealed {
@@ -587,8 +590,14 @@ pub fn run_wave(engine: &dyn FrameStep, parts: &[Part], cx: WaveCtx) -> Result<W
     }
     ensure!(next.states() == inserted, "frame {frame}: the region phase inserted {inserted} new states, the next layer lists {}", next.states());
     let wins = layer_wins(visited, &next, frame, level, s)?;
+    if s.diag.phases {
+        crate::metrics::mem_phase(&format!("f{frame} the next layer's wins decoded"));
+    }
     // The new states into the visited set (they are new: none held).
     let held = visited.merge(&next.set, s.threads())?;
+    if s.diag.phases {
+        crate::metrics::mem_phase(&format!("f{frame} the next layer merged into the visited set"));
+    }
     ensure!(held == 0, "frame {frame}: {held} of the next layer's states the visited set held already");
     // The routes' segments into the file.
     let mut segs = Vec::new();
