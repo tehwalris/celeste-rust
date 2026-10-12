@@ -39,6 +39,8 @@ pub struct FrameReach {
     /// The forward's layer at this frame (states first reached here, rows
     /// kept), for scale.
     pub forward_layer: u64,
+    /// States whose set was coarsened to a bounding box (`MAX_PIECES`).
+    pub coarsened: u64,
 }
 
 /// What `reach` found: per frame its sums; per state the LAST frame it is
@@ -46,6 +48,26 @@ pub struct FrameReach {
 pub struct Reach {
     pub frames: Vec<FrameReach>,
     pub last: FxHashMap<Sk, u32>,
+}
+
+/// Distinct pieces past which a state's set is COARSENED to its bounding
+/// box before the union (a `Region` holds at most 65535 x segments): a
+/// superset, so the reach stays sound as an upper bound but is no longer
+/// exact at that state (counted per frame: `FrameReach::coarsened`).
+const MAX_PIECES: usize = 32768;
+
+/// The union of `v` (deduplicated; coarsened past `MAX_PIECES`), and
+/// whether it was coarsened.
+fn union(v: &mut Vec<Piece>, scratch: &mut Vec<Seg>) -> (Region, bool) {
+    v.sort_unstable_by_key(|p| (p.y, p.x));
+    v.dedup();
+    if v.len() <= MAX_PIECES {
+        return (Region::from_pieces(v, scratch), false);
+    }
+    let (ylo, yhi) = (v.iter().map(|p| p.y.lo).min().unwrap_or(0), v.iter().map(|p| p.y.hi).max().unwrap_or(0));
+    let (xlo, xhi) = (v.iter().map(|p| p.x.lo).min().unwrap_or(0), v.iter().map(|p| p.x.hi).max().unwrap_or(0));
+    let mut bbox = [Piece { y: Seg { lo: ylo, hi: yhi }, x: Seg { lo: xlo, hi: xhi } }];
+    (Region::from_pieces(&mut bbox, scratch), true)
 }
 
 /// The number of points of a set.
@@ -68,22 +90,24 @@ pub fn reach(dir: &std::path::Path, horizon: u32, point: (u32, u32), threads: us
     // The tree's layers as loaded (frame `f`: the states first reached at `f`).
     let mut layers: Vec<crate::storage::layer::Layer> = Vec::new();
     let mut frames = Vec::new();
+    let mut coarsened = 0u64;
     let sum = |t: u32, cur: &[(Sk, Region)]| -> FrameReach {
         let mut cells: Vec<u32> = cur.iter().map(|(s, _)| s.cell(&geo)).collect();
         cells.sort_unstable();
         cells.dedup();
-        FrameReach { frame: t, states: cur.len() as u64, points: cur.iter().map(|(_, r)| points(r)).sum(), cells: cells.len() as u64, forward_layer: tree.states(t) }
+        FrameReach { frame: t, states: cur.len() as u64, points: cur.iter().map(|(_, r)| points(r)).sum(), cells: cells.len() as u64, forward_layer: tree.states(t), coarsened: 0 }
     };
     for t in 0..=horizon {
         for (s, _) in &cur {
             last.insert(*s, t);
         }
-        frames.push(sum(t, &cur));
+        frames.push(FrameReach { coarsened, ..sum(t, &cur) });
         visit(t, &cur)?;
         if t == horizon || cur.is_empty() {
             break;
         }
         let tt = std::time::Instant::now();
+        let mut coarse: rustc_hash::FxHashSet<Sk> = Default::default();
         // A state's out-edges are recorded once, at the frame after its
         // LAYER (the forward expands a state when it first reaches it; a
         // later visit has the same successors): each reached state is
@@ -116,9 +140,12 @@ pub fn reach(dir: &std::path::Path, horizon: u32, point: (u32, u32), threads: us
                 }
                 // Keep each target's pieces compact: a union once they pile up.
                 let mut scratch = Vec::new();
-                for v in next.values_mut() {
+                for (dst, v) in next.iter_mut() {
                     if v.len() > 64 {
-                        let r = Region::from_pieces(v, &mut scratch);
+                        let (r, c) = union(v, &mut scratch);
+                        if c {
+                            coarse.insert(*dst);
+                        }
                         v.clear();
                         r.pieces(v);
                     }
@@ -129,12 +156,16 @@ pub fn reach(dir: &std::path::Path, horizon: u32, point: (u32, u32), threads: us
         let mut nx: Vec<(Sk, Region)> = next
             .into_iter()
             .filter_map(|(s, mut v)| {
-                let r = Region::from_pieces(&mut v, &mut scratch);
+                let (r, c) = union(&mut v, &mut scratch);
+                if c {
+                    coarse.insert(s);
+                }
                 (!r.is_empty()).then_some((s, r))
             })
             .collect();
+        coarsened = coarse.len() as u64;
         nx.sort_unstable_by_key(|e| e.0);
-        eprintln!("[reach] f{:03} -> f{:03}: {} states -> {} ({:.1} s)", t, t + 1, cur.len(), nx.len(), tt.elapsed().as_secs_f64());
+        eprintln!("[reach] f{:03} -> f{:03}: {} states -> {} ({} coarsened; {:.1} s)", t, t + 1, cur.len(), nx.len(), coarsened, tt.elapsed().as_secs_f64());
         cur = nx;
     }
     Ok(Reach { frames, last })

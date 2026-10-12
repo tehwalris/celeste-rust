@@ -2580,9 +2580,9 @@ fn reach_command(checkpoint_dir: &str, level_index: usize, to: u32, save: Option
         Ok(())
     })?;
     println!("[reach] {} to f{to}, {:.1} s", dir.display(), t0.elapsed().as_secs_f64());
-    let mut tsv = String::from("frame\tstates\tpoints\tcells\tforward_layer\tx_min\tx_max\ty_min\ty_max\treached_with_dropped_successors\tdrop_noted_cells\n");
+    let mut tsv = String::from("frame\tstates\tpoints\tcells\tforward_layer\tcoarsened\tx_min\tx_max\ty_min\ty_max\treached_with_dropped_successors\tdrop_noted_cells\n");
     for (f, e) in r.frames.iter().zip(&extent) {
-        let line = format!("{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}", f.frame, f.states, f.points, f.cells, f.forward_layer, e.1, e.2, e.3, e.4, e.5, e.6);
+        let line = format!("{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}", f.frame, f.states, f.points, f.cells, f.forward_layer, f.coarsened, e.1, e.2, e.3, e.4, e.5, e.6);
         println!("{line}");
         tsv += &line;
         tsv.push('\n');
