@@ -149,10 +149,14 @@ fn units_of(parts: &[Part], unit: usize) -> Vec<UnitSpec> {
 
 /// Input lanes per SLICE: a slice's units run, then its records go through
 /// the region phase, before the next slice's units run - so a frame holds
-/// one slice's records (~24 B an edge, ~45 edges a lane in room (6,2) 100%:
-/// ~1.1 GB a slice), not the whole frame's. Slices are runs of units, so a
-/// function of the frontier, as everything they cut is.
-const SLICE_LANES: usize = 1 << 20;
+/// about one slice's records, not the whole frame's. Slices are runs of
+/// units, so a function of the frontier, as everything they cut is. 256k
+/// (2026-10-12; 1M before): the chunks in flight and the region jobs'
+/// buffers a quarter (the mod room's f77: -1.4 GB of the wave's peak; the
+/// reference frame -0.27 GB), the region phase's worker time -30% (smaller
+/// jobs), the wave the same; edge files -4% (the mod room) to +3.5% (the
+/// reference frame).
+const SLICE_LANES: usize = 1 << 18;
 
 /// The units cut into slices of about `SLICE_LANES` lanes.
 fn slices_of(units: &[UnitSpec]) -> Vec<std::ops::Range<usize>> {

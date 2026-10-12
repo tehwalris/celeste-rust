@@ -76,14 +76,14 @@ dyn.cat.d.store-live 7837122
 dyn.insts 944862772
 dyn.slices 139484
 frame.bundles 15099614
-frame.edge_bytes 8146894
-frame.edge_millibytes_per_edge 92
+frame.edge_bytes 8576384
+frame.edge_millibytes_per_edge 97
 frame.edges 88076797
 frame.emissions 88076797
 frame.kept 2597457
 frame.lanes_in 2226618
 frame.routes 177
-frame.slices 3
+frame.slices 9
 frame.units 544
 k.kernel_k71e1d8019968708a_212.dyn_insts 721908
 k.kernel_k71e1d8019968708a_212.fused_nodes 2529
