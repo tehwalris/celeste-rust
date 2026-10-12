@@ -127,7 +127,7 @@ fn units_of(parts: &[Part], unit: usize) -> Vec<UnitSpec> {
         let mut e = 0usize;
         for (region, t) in p.layer.set.tables() {
             let shape = region / slots;
-            for &m in t.masks() {
+            for m in t.masks() {
                 let n = m.count_ones();
                 cur = match cur {
                     Some((sh, a, l)) if sh == shape && (l as usize) < unit => Some((sh, a, l + n)),
@@ -657,7 +657,7 @@ fn layer_wins(visited: &VisitedSet, next: &Layer, frame: u32, level: crate::abst
     let mut chunks: Vec<(usize, std::ops::Range<u32>)> = Vec::new();
     for (ti, (_, t)) in tables.iter().enumerate() {
         let (mut a, mut n) = (0u32, 0u32);
-        for (e, &m) in t.masks().iter().enumerate() {
+        for (e, m) in t.masks().enumerate() {
             n += m.count_ones();
             if n >= WIN_CHUNK {
                 chunks.push((ti, a..e as u32 + 1));

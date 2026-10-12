@@ -387,7 +387,8 @@ pub fn write_frame(path: &Path, meta: &FrameMeta, layer: &Layer, wins: &[(u32, u
         let w: Vec<(u32, u64)> = wins[win_at[i].clone()].iter().map(|&(e, m)| (e - starts[i] as u32, m)).collect();
         let keys: Vec<Key> = t.iter().map(|x| x.0).collect();
         let mut raw = Vec::new();
-        encode_region(&keys, t.masks(), &w, &mut raw);
+        let masks: Vec<u64> = t.masks().collect();
+        encode_region(&keys, &masks, &w, &mut raw);
         Ok((zstd::bulk::compress(&raw, 1)?, raw.len() as u32))
     });
     let mut index = Vec::with_capacity(tables.len());

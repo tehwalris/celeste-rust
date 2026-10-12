@@ -18,8 +18,8 @@
 //!     bits the table's size leaves, a tag of the key's hash, so a probe
 //!     reads a key only on a tag match - at a load between 0.5 and 0.85
 //!     (non-power-of-two capacity), ~5.6 B an entry;
-//!   * the entries' arrays grow by an eighth, a merge by what it adds and a
-//!     sixteenth: little slack.
+//!   * the entries' arrays are chunks of 32768 entries: a table grows
+//!     without a copy, and holds part of one chunk unused at most.
 
 use anyhow::{anyhow, ensure, Result};
 
@@ -50,8 +50,8 @@ fn bytes_of(w: u128) -> usize {
 const MAX_LOAD: f64 = 0.85;
 const GROW_LOAD: f64 = 0.5;
 
-/// Room an array grows by when full (an eighth of its length, at least 64):
-/// a table growing by one entry at a time (the next layer in a wave).
+/// Room a table's last chunk grows by when full (an eighth of it, at least
+/// 64 entries; at most the chunk).
 #[inline]
 fn grown(len: usize, need: usize) -> usize {
     need.max(len + (len / 8).max(64))
@@ -92,14 +92,25 @@ impl Index {
     }
 }
 
-/// ONE REGION'S ENTRIES (module doc).
+/// Entries a chunk of a table's arrays holds (`RegionTable`): a table grows
+/// by chunks, never copied.
+const CH_BITS: u32 = 15;
+const CH: usize = 1 << CH_BITS;
+
+/// ONE REGION'S ENTRIES (module doc). The keys and masks live in CHUNKS of
+/// `CH` entries (the last one growing up to `CH`): a table that grows a few
+/// percent a frame - the visited set's - is never copied, and holds at
+/// most part of one chunk unused (a whole-array growth copied the visited
+/// set every frame, both copies alive: 3.4 GB at the mod room's f77).
 #[derive(Clone)]
 pub struct RegionTable {
     /// Bytes a key takes.
     kw: usize,
-    /// The keys, `kw` bytes each, then 16 zero bytes (a key is read as 16).
-    keys: Vec<u8>,
-    masks: Vec<u64>,
+    /// Per chunk its keys, `kw` bytes each, then 16 zero bytes (a key is
+    /// read as 16).
+    keys: Vec<Vec<u8>>,
+    masks: Vec<Vec<u64>>,
+    len: usize,
     /// `None`: frozen (sorted by key).
     index: Option<Index>,
 }
@@ -113,20 +124,20 @@ impl Default for RegionTable {
 impl RegionTable {
     /// An empty indexed table.
     pub fn new() -> Self {
-        RegionTable { kw: 1, keys: vec![0; 16], masks: Vec::new(), index: Some(Index::default()) }
+        RegionTable { kw: 1, keys: Vec::new(), masks: Vec::new(), len: 0, index: Some(Index::default()) }
     }
 
     /// An empty frozen table.
     pub fn frozen() -> Self {
-        RegionTable { kw: 1, keys: vec![0; 16], masks: Vec::new(), index: None }
+        RegionTable { kw: 1, keys: Vec::new(), masks: Vec::new(), len: 0, index: None }
     }
 
     pub fn len(&self) -> usize {
-        self.masks.len()
+        self.len
     }
 
     pub fn is_empty(&self) -> bool {
-        self.masks.is_empty()
+        self.len == 0
     }
 
     pub fn is_frozen(&self) -> bool {
@@ -141,8 +152,9 @@ impl RegionTable {
 
     #[inline]
     fn wkey(&self, e: usize) -> u128 {
-        let o = e * self.kw;
-        let w = u128::from_le_bytes(self.keys[o..o + 16].try_into().expect("16 bytes"));
+        let c = &self.keys[e >> CH_BITS];
+        let o = (e & (CH - 1)) * self.kw;
+        let w = u128::from_le_bytes(c[o..o + 16].try_into().expect("16 bytes"));
         if self.kw == 16 {
             w
         } else {
@@ -153,21 +165,22 @@ impl RegionTable {
     /// Entry `e`'s cells.
     #[inline]
     pub fn mask(&self, e: u32) -> u64 {
-        self.masks[e as usize]
+        self.masks[e as usize >> CH_BITS][e as usize & (CH - 1)]
     }
 
-    pub fn masks(&self) -> &[u64] {
-        &self.masks
+    /// Every entry's cells, in order.
+    pub fn masks(&self) -> impl Iterator<Item = u64> + '_ {
+        self.masks.iter().flatten().copied()
     }
 
     /// Every entry `(key, cells)`, in order (a frozen table's: by key).
     pub fn iter(&self) -> impl Iterator<Item = (Key, u64)> + '_ {
-        (0..self.len()).map(move |e| (narrow(self.wkey(e)), self.masks[e]))
+        (0..self.len).map(move |e| (narrow(self.wkey(e)), self.mask(e as u32)))
     }
 
     /// States held.
     pub fn states(&self) -> u64 {
-        self.masks.iter().map(|m| m.count_ones() as u64).sum()
+        self.masks().map(|m| m.count_ones() as u64).sum()
     }
 
     /// The entry holding `k`.
@@ -197,7 +210,7 @@ impl RegionTable {
                 }
             }
             None => {
-                let (mut lo, mut hi) = (0usize, self.len());
+                let (mut lo, mut hi) = (0usize, self.len);
                 while lo < hi {
                     let mid = (lo + hi) / 2;
                     match self.wkey(mid).cmp(&w) {
@@ -213,31 +226,21 @@ impl RegionTable {
 
     /// The cells of `k` held (0: none).
     pub fn mask_of(&self, k: Key) -> u64 {
-        self.find(k).map_or(0, |e| self.masks[e as usize])
+        self.find(k).map_or(0, |e| self.mask(e))
     }
 
     /// OR `mask` into entry `e`; the cells it held before.
     #[inline]
     pub fn or_cells(&mut self, e: u32, mask: u64) -> u64 {
-        let m = &mut self.masks[e as usize];
+        let m = &mut self.masks[e as usize >> CH_BITS][e as usize & (CH - 1)];
         let had = *m;
         *m |= mask;
         had
     }
 
-    /// Room for `n` more entries (a merge: exactly).
+    /// Room in the index for `n` more entries (a merge: at once).
     fn reserve(&mut self, n: usize) {
-        let need = self.len() + n;
-        if self.masks.capacity() < need {
-            // A sixteenth past the need: a table that grows a few percent a
-            // frame is copied every few frames, not every frame.
-            let c = need.max(self.len() + self.len() / 16);
-            self.masks.reserve_exact(c - self.masks.len());
-        }
-        let bytes = self.masks.capacity() * self.kw + 16;
-        if self.keys.capacity() < bytes {
-            self.keys.reserve_exact(bytes - self.keys.len());
-        }
+        let need = self.len + n;
         if let Some(ix) = &self.index {
             if need as f64 > MAX_LOAD * ix.slots.len() as f64 {
                 self.reindex(need);
@@ -245,16 +248,50 @@ impl RegionTable {
         }
     }
 
+    /// The keys, chunk by chunk, in `kw` bytes each.
+    fn chunk_keys(ws: impl Iterator<Item = u128>, kw: usize) -> Vec<Vec<u8>> {
+        let mut out: Vec<Vec<u8>> = Vec::new();
+        let mut cur: Vec<u8> = Vec::new();
+        let mut n = 0usize;
+        for w in ws {
+            if n == CH {
+                cur.extend_from_slice(&[0; 16]);
+                out.push(std::mem::take(&mut cur));
+                n = 0;
+            }
+            if cur.is_empty() {
+                cur.reserve_exact(CH * kw + 16);
+            }
+            cur.extend_from_slice(&w.to_le_bytes()[..kw]);
+            n += 1;
+        }
+        if n > 0 {
+            cur.extend_from_slice(&[0; 16]);
+            cur.shrink_to_fit();
+            out.push(cur);
+        }
+        out
+    }
+
+    /// The masks in chunks.
+    fn chunk_masks(ms: impl Iterator<Item = u64>) -> Vec<Vec<u64>> {
+        let mut out: Vec<Vec<u64>> = Vec::new();
+        for m in ms {
+            if out.last().is_none_or(|c| c.len() == CH) {
+                out.push(Vec::with_capacity(CH));
+            }
+            out.last_mut().expect("pushed").push(m);
+        }
+        if let Some(c) = out.last_mut() {
+            c.shrink_to_fit();
+        }
+        out
+    }
+
     /// The keys repacked in `kw` bytes each.
     fn repack(&mut self, kw: usize) {
         debug_assert!(kw >= self.kw && kw <= 16);
-        let n = self.len();
-        let mut keys = Vec::with_capacity(self.masks.capacity() * kw + 16);
-        for e in 0..n {
-            keys.extend_from_slice(&self.wkey(e).to_le_bytes()[..kw]);
-        }
-        keys.extend_from_slice(&[0; 16]);
-        self.keys = keys;
+        self.keys = Self::chunk_keys((0..self.len).map(|e| self.wkey(e)), kw);
         self.kw = kw;
     }
 
@@ -262,7 +299,7 @@ impl RegionTable {
     fn reindex(&mut self, n: usize) {
         let cap = ((n.max(4) as f64 / GROW_LOAD).ceil() as usize).max(8);
         let mut ix = Index::with_cap(cap);
-        for e in 0..self.len() {
+        for e in 0..self.len {
             Self::place(&mut ix, slot_hash(narrow(self.wkey(e))), e as u32);
         }
         self.index = Some(ix);
@@ -282,7 +319,7 @@ impl RegionTable {
     /// its number.
     pub fn push(&mut self, k: Key, mask: u64) -> u32 {
         let w = wide(k);
-        let e = self.len();
+        let e = self.len;
         assert!(e < u32::MAX as usize, "a region table of 2^32 entries");
         if self.index.is_none() {
             assert!(e == 0 || self.wkey(e - 1) < w, "a frozen table's keys out of order");
@@ -291,15 +328,22 @@ impl RegionTable {
         if kw > self.kw {
             self.repack(kw);
         }
-        if self.masks.len() == self.masks.capacity() {
-            let c = grown(self.masks.len(), e + 1);
-            self.masks.reserve_exact(c - self.masks.len());
-            self.keys.reserve_exact(c * self.kw + 16 - self.keys.len());
+        let i = e & (CH - 1);
+        if i == 0 {
+            self.keys.push(Vec::with_capacity(64 * self.kw + 16));
+            self.masks.push(Vec::with_capacity(64));
         }
-        self.keys.truncate(e * self.kw);
-        self.keys.extend_from_slice(&w.to_le_bytes()[..self.kw]);
-        self.keys.extend_from_slice(&[0; 16]);
-        self.masks.push(mask);
+        let (c, m) = (self.keys.last_mut().expect("a chunk"), self.masks.last_mut().expect("a chunk"));
+        if m.len() == m.capacity() {
+            let n = grown(m.len(), m.len() + 1).min(CH);
+            m.reserve_exact(n - m.len());
+            c.reserve_exact(n * self.kw + 16 - c.len());
+        }
+        c.truncate(i * self.kw);
+        c.extend_from_slice(&w.to_le_bytes()[..self.kw]);
+        c.extend_from_slice(&[0; 16]);
+        m.push(mask);
+        self.len += 1;
         if let Some(ix) = &mut self.index {
             if (e + 1) as f64 > MAX_LOAD * ix.slots.len() as f64 {
                 self.reindex(e + 1);
@@ -322,7 +366,7 @@ impl RegionTable {
     }
 
     /// Every entry `(k, cells)` of the frozen `other` ORed into this indexed
-    /// table (made where absent), room reserved first: a merge.
+    /// table (made where absent), the index sized first: a merge.
     pub fn merge(&mut self, other: &RegionTable) {
         debug_assert!(!self.is_frozen());
         let add = other.iter().filter(|(k, _)| self.find(*k).is_none()).count();
@@ -339,40 +383,29 @@ impl RegionTable {
     /// Every key `k` made `f(k)` (an indexed table: the index rebuilt if
     /// any key changed): the frame's provisional keys made final.
     pub fn rekey(&mut self, f: impl Fn(Key) -> Result<Key>) -> Result<()> {
-        let n = self.len();
-        let keys: Vec<Key> = (0..n).map(|e| f(self.key(e as u32))).collect::<Result<_>>()?;
-        if keys.iter().enumerate().all(|(e, &k)| k == self.key(e as u32)) {
+        let keys: Vec<u128> = (0..self.len).map(|e| f(narrow(self.wkey(e))).map(wide)).collect::<Result<_>>()?;
+        if keys.iter().enumerate().all(|(e, &k)| k == self.wkey(e)) {
             return Ok(());
         }
-        let kw = keys.iter().map(|&k| bytes_of(wide(k))).max().unwrap_or(1);
-        let mut bytes = Vec::with_capacity(n * kw + 16);
-        for &k in &keys {
-            bytes.extend_from_slice(&wide(k).to_le_bytes()[..kw]);
-        }
-        bytes.extend_from_slice(&[0; 16]);
-        (self.keys, self.kw) = (bytes, kw);
+        let kw = keys.iter().map(|&w| bytes_of(w)).max().unwrap_or(1);
+        self.keys = Self::chunk_keys(keys.into_iter(), kw);
+        self.kw = kw;
         if self.index.is_some() {
-            self.reindex(n);
+            self.reindex(self.len);
         }
         Ok(())
     }
 
     /// FROZEN: the entries sorted by key, the keys in the bytes their
-    /// largest needs, the index dropped, the arrays at their size.
+    /// largest needs, the index dropped, the chunks at their size.
     pub fn freeze(&mut self) {
-        let n = self.len();
-        let mut v: Vec<(u128, u64)> = (0..n).map(|e| (self.wkey(e), self.masks[e])).collect();
+        let mut v: Vec<(u128, u64)> = (0..self.len).map(|e| (self.wkey(e), self.mask(e as u32))).collect();
         v.sort_unstable_by_key(|x| x.0);
         debug_assert!(v.windows(2).all(|w| w[0].0 != w[1].0), "a key twice in a table");
         let kw = v.last().map_or(1, |x| bytes_of(x.0));
-        let mut keys = Vec::with_capacity(n * kw + 16);
-        for x in &v {
-            keys.extend_from_slice(&x.0.to_le_bytes()[..kw]);
-        }
-        keys.extend_from_slice(&[0; 16]);
-        self.keys = keys;
+        self.keys = Self::chunk_keys(v.iter().map(|x| x.0), kw);
+        self.masks = Self::chunk_masks(v.iter().map(|x| x.1));
         self.kw = kw;
-        self.masks = v.into_iter().map(|x| x.1).collect();
         self.index = None;
     }
 
@@ -382,12 +415,7 @@ impl RegionTable {
         ensure!(keys.len() == masks.len(), "a region with {} keys and {} masks", keys.len(), masks.len());
         ensure!(keys.windows(2).all(|w| w[0] < w[1]), "a region's keys not ascending");
         let kw = keys.last().map_or(1, |&k| bytes_of(wide(k)));
-        let mut b = Vec::with_capacity(keys.len() * kw + 16);
-        for &k in keys {
-            b.extend_from_slice(&wide(k).to_le_bytes()[..kw]);
-        }
-        b.extend_from_slice(&[0; 16]);
-        Ok(RegionTable { kw, keys: b, masks: masks.to_vec(), index: None })
+        Ok(RegionTable { kw, keys: Self::chunk_keys(keys.iter().map(|&k| wide(k)), kw), masks: Self::chunk_masks(masks.iter().copied()), len: keys.len(), index: None })
     }
 
     /// The disjoint union of two frozen tables (a frame and its raise: a
@@ -400,25 +428,25 @@ impl RegionTable {
             let b = (j < other.len()).then(|| other.wkey(j));
             match (a, b) {
                 (Some(x), Some(y)) if x == y => {
-                    ensure!(self.masks[i] & other.masks[j] == 0, "a state held by a frame and its raise");
+                    ensure!(self.mask(i as u32) & other.mask(j as u32) == 0, "a state held by a frame and its raise");
                     keys.push(narrow(x));
-                    masks.push(self.masks[i] | other.masks[j]);
+                    masks.push(self.mask(i as u32) | other.mask(j as u32));
                     i += 1;
                     j += 1;
                 }
                 (Some(x), Some(y)) if x < y => {
                     keys.push(narrow(x));
-                    masks.push(self.masks[i]);
+                    masks.push(self.mask(i as u32));
                     i += 1;
                 }
                 (Some(x), None) => {
                     keys.push(narrow(x));
-                    masks.push(self.masks[i]);
+                    masks.push(self.mask(i as u32));
                     i += 1;
                 }
                 (_, Some(y)) => {
                     keys.push(narrow(y));
-                    masks.push(other.masks[j]);
+                    masks.push(other.mask(j as u32));
                     j += 1;
                 }
                 (None, None) => unreachable!(),
@@ -428,7 +456,7 @@ impl RegionTable {
     }
 
     pub fn alloc_bytes(&self) -> usize {
-        self.keys.capacity() + self.masks.capacity() * 8 + self.index.as_ref().map_or(0, |ix| ix.slots.capacity() * 4)
+        self.keys.iter().map(|c| c.capacity()).sum::<usize>() + self.masks.iter().map(|c| c.capacity() * 8).sum::<usize>() + (self.keys.capacity() + self.masks.capacity()) * 24 + self.index.as_ref().map_or(0, |ix| ix.slots.capacity() * 4)
     }
 }
 
@@ -626,13 +654,33 @@ mod tests {
         g.merge(&f);
         assert_eq!(g.len(), f.len());
         assert_eq!(g.states(), f.states());
+        // Across chunks: 100k entries (three chunks and part of a fourth),
+        // a repack at entry 70000, found, frozen, merged.
+        let mut big = RegionTable::new();
+        for i in 0..100_000u64 {
+            let k = if i < 70_000 { (0, i * 7919 % 1_000_003) } else { (1, i) };
+            assert_eq!(big.insert_or(k, 1 << (i % 64)).1, 0);
+        }
+        assert_eq!((big.len(), big.kw), (100_000, 9));
+        for i in (0..100_000u64).step_by(13) {
+            let k = if i < 70_000 { (0, i * 7919 % 1_000_003) } else { (1, i) };
+            assert_eq!(big.mask_of(k), 1 << (i % 64));
+        }
+        let mut fb = big.clone();
+        fb.freeze();
+        assert!(fb.iter().map(|x| wide(x.0)).collect::<Vec<_>>().windows(2).all(|w| w[0] < w[1]));
+        assert_eq!(fb.states(), 100_000);
+        let mut gb = RegionTable::new();
+        gb.merge(&fb);
+        assert_eq!((gb.len(), gb.states()), (100_000, 100_000));
+        assert_eq!(gb.mask_of((1, 99_999)), 1 << (99_999 % 64));
         // Narrow keys stay narrow.
         let mut n = RegionTable::new();
         for k in 0..1000u64 {
             n.push((0, k * 3), 1);
         }
         assert_eq!(n.kw, 2);
-        assert!(n.keys.capacity() < 1000 * 3, "{} B of keys for 1000 two-byte keys", n.keys.capacity());
+        assert!(n.keys.iter().map(|c| c.capacity()).sum::<usize>() < 1000 * 3, "more than 3 B of keys a two-byte key");
         let slots = n.index.as_ref().expect("indexed").slots.len();
         assert!((1000..=2000).contains(&slots), "{slots} index slots for 1000 entries");
     }
