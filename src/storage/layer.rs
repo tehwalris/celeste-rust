@@ -477,6 +477,17 @@ impl FrameFile {
         Ok(e)
     }
 
+    /// Unmap the resident pages of region `i`'s block (the page cache keeps
+    /// them; a later read faults them back in): a reader streaming a tree
+    /// does not hold the blocks it has read.
+    pub fn release_region(&self, i: usize) -> Result<()> {
+        let r = &self.header.regions[i];
+        // SAFETY: a read-only shared mapping of a file never modified (see
+        // `open`): a page dropped reads back the same.
+        unsafe { self.map.unchecked_advise_range(memmap2::UncheckedAdvice::DontNeed, self.data + r.offset as usize, r.len as usize)? };
+        Ok(())
+    }
+
     /// The file's states as a layer, its skeletons in a search from `room`
     /// (`None`: none - a reader of keys and cells only). Regions decoded on
     /// `threads` threads.

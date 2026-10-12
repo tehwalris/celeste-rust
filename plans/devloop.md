@@ -105,6 +105,7 @@ are `ckhash --edges`'s for the frame, so they equal the real tree's
 | gate10-forward | `forward --to 44`, posgraph and ckhash against gates/ (CLAUDE.md's oracles 1-2) | 2.8 s |
 | gate10-arc | `search --to 35 --win-at 9,101 --prefer` (oracle 3 and the known route) | 1.8 s |
 | search42-objects | room (4,2) `r0sxhn,r0sxh` (the objects ladder) to f50 at a synthetic win (32,56): arc bounds 47/47, concrete optimum 47; its witness as the known route; every `[gate]` line pinned | 5.0 s |
+| export-ui | `rewrite export-ui` of gate10-arc's and search42's searches with their marks (`--save-marks`): every binary file and run.json without its timings, pinned by digest (`gates/fixtures/export-ui.sha256`; pinned 2026-10-12 from the in-memory export, which the streamed one reproduces byte for byte, as it does the mod room's balloon run) | 0.2 s |
 | forward60-platforms | room (6,0) `r0sxhfp` split frame to step 71: `ckhash --edges` = the r60s fixture's pin | 25.5 s (the platform kernels' walk ~20 s) |
 | frame-r60s | one platform frame (step 70 -> 71) and its exact metrics: 49,469 kernel instructions a slice | 25.0 s (the same walk again) |
 | widen-r60s | `widen-check` of r60s steps 70 and 71 (stored rows): the widening table's two sides at `hfp`, at a boundary and mid-frame | ~2 s |
