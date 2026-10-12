@@ -208,8 +208,21 @@ frames; the bundles into provisional targets alone were 5.8 GB at fmp's f53.
 40.55 -> 15.15 GB (the first version, above), forward 1112 -> 923 s,
 backward 55.0 -> 55.0 s, tree 43 -> 6.4 GB (frames 307 MB: 0.08 B a state).
 
-**Its peak frame alone** (fm f68 -> f69, `bench-frame`, 171.9M rows in,
-4.17G emissions, 156M new; two rounds): see the A/B table below.
+**Interleaved A/B** (2026-10-12, load 5-17; `bench-frame` copies the
+visited set, so its max RSS holds it twice):
+
+| case | develop | keys only |
+|---|---|---|
+| the reference frame (6,2) 100% f56 -> f57, 2 x 3 reps | wave 2084-2157 ms, end 233-244 ms, frame 2590-2670 ms; max RSS 4.21-4.24 GB; f56 loaded in 1.3-1.5 s | wave 2147-2168 ms, end 55-59 ms, frame 2327-2353 ms; max RSS 2.26-2.30 GB; loaded in 0.20 s |
+| the mod room's peak frame fm f68 -> f69 (171.9M rows in, 4.17G emissions, 156M new), 2 rounds | wave 31.4 / 33.1 s, end 6.2 s; f68 loaded in 61 s, frame with the bench's frontier copy 54.6-72.3 s; max RSS 59.6-60.5 GB | wave 31.5 / 31.5 s, end 1.17 s; loaded in 7.2 s, frame 33.5 s; max RSS 16.3 GB |
+
+The reference frame's wave is 2-3% slower (the units decode their rows,
+0.4 of 37 worker-s, and their (region, key) order changed the kernels'
+slices by +0.2%), its frame 10% faster (the end: no layer decode, no row
+copies). At first the bounds on the units' spare buckets and the region
+scratch were tight (128k, 256k): the wave was 8% slower, the units
+regrowing their buckets job after job; 512k and 1M cost the mod frame
+~0.8 GB of peak against the tight ones and keep the wave within 3%.
 
 **Decode**: 49 ns a row in a unit (release, the mod frame; the field codes
 per run of one entry, ~14 states an entry at f40; `not_expanded`
