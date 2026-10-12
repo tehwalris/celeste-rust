@@ -311,18 +311,21 @@ impl<'a> UnitSink<'a> {
     }
 
     /// Bytes this worker's buffers hold (`--phases`' `[wavemem]`): its
-    /// bundles, the unit's sources and lanes, its notes, pos-graph pairs,
-    /// transfers and chunks not yet handed over.
-    pub fn alloc_bytes(&self) -> usize {
-        self.bundles.alloc_bytes()
-            + 24 * (self.srcs.capacity() + self.unit_sources.capacity())
-            + 4 * (self.src_local.capacity() + self.drop_min.capacity())
-            + 8 * self.lanes.capacity()
-            + 32 * (self.src_idx.capacity() + self.notes.capacity())
-            + 9 * self.pos_edges.capacity()
-            + 40 * self.xfer_ids.capacity()
-            + std::mem::size_of::<(crate::compiled::asm_kernel::RawWords, u32)>() * self.xfer_cache.capacity()
-            + self.outbox.iter().map(|c| c.alloc_bytes()).sum::<usize>()
+    /// bundles, its drop notes, its pos-graph pairs, the rest (the unit's
+    /// sources and lanes, transfers, chunks not yet handed over).
+    pub fn alloc_bytes(&self) -> [usize; 4] {
+        [
+            self.bundles.alloc_bytes(),
+            std::mem::size_of::<super::layer::Note>() * self.notes.capacity(),
+            9 * self.pos_edges.capacity(),
+            24 * (self.srcs.capacity() + self.unit_sources.capacity())
+                + 4 * (self.src_local.capacity() + self.drop_min.capacity())
+                + 8 * self.lanes.capacity()
+                + 32 * self.src_idx.capacity()
+                + 40 * self.xfer_ids.capacity()
+                + std::mem::size_of::<(crate::compiled::asm_kernel::RawWords, u32)>() * self.xfer_cache.capacity()
+                + self.outbox.iter().map(|c| c.alloc_bytes()).sum::<usize>(),
+        ]
     }
 
     /// The tree's key space (read-only during the wave).
