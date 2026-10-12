@@ -435,3 +435,53 @@ For an exact-remainder forward (the coordinator's question; `summary.txt`,
   against the forward's 13.3B: 0.7-1.7%.
 - Edges: the states ever reached have 295M distinct out-edges (the forward
   emitted 550B lanes); 191M (65%) ever pushed a non-empty set.
+
+### One dash cannot reach the balloon: the geometric limit (2026-10-13)
+
+The balloon is touched when the player's x >= 113 (x is clamped at
+121) and its y is in (by - 9, by + 6), where by is in [110, 114]: the
+region x 113-121, y 102-119 over all phases. bal200's rect (y 104-117)
+was 2 rows too narrow at each end, but that changes nothing: no reached
+state has x >= 113 above y 124. The closest exact approaches are
+(110,119) at f186 and (112,121) at f187.
+
+The limit, in the exact reach: no state is ever at x >= 97 with y <= 110
+(the ceiling height), at any frame f158-f200. Level -1 dropped nothing
+before f174. Why:
+- The strip (row 14 cols 10-11, up-spikes, ceiling at y <= 111, floor
+  block row 15 cols 10-11) is crossed only at y 109-110, or while moving
+  up. Without the dash, the hover under the ceiling lasts 2-3 frames
+  (rem.y reset to 0 by the bump, then gravity). That is ~6 px against
+  the strip's 22, so the crossing spends the dash, and the dash must start
+  at y 109/110.
+- y 109/110 under the ceiling at x >= 66 is reached only by a grace jump
+  that bumps the ceiling. The only ground on the left is the spring's
+  base (row 13 col 6: the spring compressed, or not touched). The ceiling
+  block's left face (col 9 row 13, x 72) stops x at 65 until y >= 109.
+  Falling 96 -> 109 takes the whole grace window, even with a dash's
+  downward speed. So the bump is at x <= 69 and the dash starts at x <= 72.
+- A horizontal dash moves 6,4/5,3,3,3 px at constant y. It ends at x <= 91,
+  and the player leaves the strip at about (96,111) with spd.x <= 1.55,
+  falling, djump 0 (cross160's witness: f157).
+- From there, x 113 comes at y >= 124. The down-spike at row 14 col 13
+  (kill: hitbox overlapping it, (y+3)%8 <= 2, yspd <= 0: y 109-111 over
+  x 98-110) kills any exit that is later or higher.
+
+Checked independently on that crossing, frame by frame f145-f164 (the
+jump, the bump, the dash, the death at (111,126)): real PICO-8 running
+the mod's own Lua (`replay.py --lua --begin-game`) and Celia fixp with
+the mod cart (CELIA_TRACE; Celia loads level 1 with max_djump 1) both
+match our engine exactly.
+
+The bal200 TREE (the forward, remainder widened) holds right-side
+states with the balloon popped and djump 1: 2.25M at f160, popped as
+early as f135 (`rewrite scan-rect`). That is the widened remainder (a
+player hovering forever; remainder-free first win f107); the exact
+reach removes them.
+
+With max_djump 2 (real PICO-8, `replay.py --max-djump 2`), the f157
+crossing plus R,R,R and a dash up-right reaches the shaft floor at
+(103,96) on f179. Celia's dash override (its +/- keys,
+max_djump_overload) survives level loads and a TAS file does not record
+it. Whether the room is meant for 2 dashes is a question for Philippe.
+`--max-djump N` (recorded in the tree) runs such a game.
