@@ -156,9 +156,13 @@ enum Command {
         #[arg(long)]
         cells: Option<String>,
         /// Decode and print the reached states whose player is in
-        /// "x0..x1,y0..y1" (their named fields), at most 20 a frame.
+        /// "x0..x1,y0..y1" (their named fields), at most `--decode-max` a
+        /// frame.
         #[arg(long)]
         decode_rect: Option<String>,
+        /// At most this many states a frame decoded in `--decode-rect`.
+        #[arg(long, default_value_t = 20)]
+        decode_max: usize,
     },
     CheckKnown {
         /// The search's checkpoint dir (its `level{i:02}` trees).
@@ -937,8 +941,8 @@ fn main() -> Result<()> {
                 prev = Some((s.arc_marks.expect("asked for"), lvl));
             }
         }
-        Command::Reach { checkpoint_dir, level_index, to, save_marks, cells, decode_rect } => {
-            reach_command(&checkpoint_dir, level_index, to, save_marks.as_deref(), cells.as_deref(), decode_rect.as_deref(), &cfg)?;
+        Command::Reach { checkpoint_dir, level_index, to, save_marks, cells, decode_rect, decode_max } => {
+            reach_command(&checkpoint_dir, level_index, to, save_marks.as_deref(), cells.as_deref(), decode_rect.as_deref(), decode_max, &cfg)?;
         }
         Command::CheckKnown { checkpoint_dir, level, inputs, horizon } => {
             use celeste_rust::search::arc_dp::solve;
@@ -2506,7 +2510,8 @@ mod tests {
 }
 
 /// `rewrite reach` (search::reach): the run, its table and its outputs.
-fn reach_command(checkpoint_dir: &str, level_index: usize, to: u32, save: Option<&str>, cells_out: Option<&str>, decode_rect: Option<&str>, cfg: &celeste_rust::settings::Settings) -> Result<()> {
+#[allow(clippy::too_many_arguments)]
+fn reach_command(checkpoint_dir: &str, level_index: usize, to: u32, save: Option<&str>, cells_out: Option<&str>, decode_rect: Option<&str>, decode_max: usize, cfg: &celeste_rust::settings::Settings) -> Result<()> {
     use celeste_rust::search::pos_graph::cell_xy;
     use std::io::Write;
     let dir = std::path::Path::new(checkpoint_dir).join(format!("level{level_index:02}"));
@@ -2591,7 +2596,7 @@ fn reach_command(checkpoint_dir: &str, level_index: usize, to: u32, save: Option
             let inside: Vec<_> = cur
                 .iter()
                 .filter(|(s, _)| cell_xy(s.cell(&geo)).is_some_and(|(x, y)| (rx0..=rx1).contains(&x) && (ry0..=ry1).contains(&y)))
-                .take(20)
+                .take(decode_max)
                 .collect();
             for (s, reg) in inside {
                 let layer = (0..=t).find(|&f| tree.mask_at(f, s.region, s.key).is_ok_and(|m| m >> s.local & 1 == 1));
@@ -2599,7 +2604,7 @@ fn reach_command(checkpoint_dir: &str, level_index: usize, to: u32, save: Option
                 let row = tree.row(layer, *s, cfg.room)?;
                 let named = project_all(&row).swap_remove(0);
                 let keep = ["player.x", "player.y", "spd.x", "spd.y", "rem.x", "rem.y", "dash_effect_time"];
-                let mut text: Vec<String> = named.iter().filter(|(k, _)| keep.contains(&k.as_str()) || k.ends_with(".djump") || k.ends_with(".dash_time") || k.ends_with(".grace")).map(|(k, v)| format!("{k}={v}")).collect();
+                let mut text: Vec<String> = named.iter().filter(|(k, _)| keep.contains(&k.as_str()) || k.ends_with(".djump") || k.ends_with(".dash_time") || k.ends_with(".grace") || (k.starts_with("balloon") && (k.ends_with(".spr") || k.ends_with(".timer")))).map(|(k, v)| format!("{k}={v}")).collect();
                 text.push(format!("rem-points={}", celeste_rust::search::reach::points(reg)));
                 if let Some(k) = inexact.get(s) {
                     text.push(format!("INEXACT(2^{k} grid)"));
