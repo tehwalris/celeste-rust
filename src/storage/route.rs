@@ -103,8 +103,15 @@ pub struct RouteState {
     pub table: Box<RegionTable>,
     /// Entries at the frame's start.
     pub start: u32,
-    /// Per entry, its cells new this frame.
-    pub fresh: Vec<u64>,
+    /// THE NEW CELLS, as the dedup found them: `(entry, cells it lacked)`
+    /// per chunk target that found any - merged and keyed at the frame's
+    /// end (`seal`). 12-16 B an event, against 8 B for every entry of the
+    /// region in a per-entry array (the mod room's f69: 14.8M events
+    /// against 68M entries).
+    pub fresh: Vec<(u32, u64)>,
+    /// A raise's cells new this frame per entry: a hit on a cell the tree
+    /// held needs its layer, one the raise just made has none.
+    fresh_raise: Option<FxHashMap<u32, u64>>,
     /// Bundles into provisional targets: encoded at the frame's end, their
     /// keys final.
     pub prov: Vec<Bundle>,
@@ -124,7 +131,7 @@ impl RouteState {
     pub fn new(shape: u64, slot: u32, region: Option<u32>, table: Option<Box<RegionTable>>) -> Self {
         let table = table.unwrap_or_default();
         let start = table.len() as u32;
-        RouteState { shape, slot, region, fresh: vec![0; table.len()], table, start, prov: Vec::new(), segs: Vec::new(), sources: FxHashSet::default(), recs: 0, new_states: 0, fresh_events: 0 }
+        RouteState { shape, slot, region, fresh: Vec::new(), fresh_raise: None, table, start, prov: Vec::new(), segs: Vec::new(), sources: FxHashSet::default(), recs: 0, new_states: 0, fresh_events: 0 }
     }
 }
 
@@ -327,7 +334,27 @@ pub struct Scratch {
     z: zstd::bulk::Compressor<'static>,
 }
 
+/// Bundles a worker's region scratch keeps room for between jobs: a
+/// heavy route's job is millions of bundles (the mod room's f69: 3.1M),
+/// and every worker kept its largest job's buffers - 2.4 GB at 16
+/// threads.
+const SCRATCH_KEEP: usize = 1 << 18;
+
 impl Scratch {
+    /// Its buffers back to `SCRATCH_KEEP` bundles' room after a job that
+    /// grew them past it.
+    fn bound(&mut self) {
+        if self.tbs.capacity() > SCRATCH_KEEP {
+            self.tbs = Vec::with_capacity(SCRATCH_KEEP);
+            self.raw = Vec::new();
+            self.enc.bound(SCRATCH_KEEP);
+        }
+        if self.s_idx.capacity() > SCRATCH_KEEP {
+            self.s_idx = Default::default();
+            self.s_list = Vec::new();
+        }
+    }
+
     /// Bytes its buffers hold (`--phases`' `[wavemem]`): the job's
     /// bundles, the encoder's, the raw block, the rest.
     pub fn alloc_bytes(&self) -> [usize; 4] {
@@ -345,7 +372,7 @@ impl Chunk {
 impl RouteState {
     /// Bytes its new-cell slots, provisional bundles and segments hold.
     pub fn alloc_bytes(&self) -> [usize; 3] {
-        [8 * self.fresh.capacity(), std::mem::size_of::<Bundle>() * self.prov.capacity(), self.segs.iter().map(|s| s.1.bytes.capacity()).sum::<usize>()]
+        [12 * self.fresh.capacity() + 24 * self.fresh_raise.as_ref().map_or(0, |m| m.capacity()), std::mem::size_of::<Bundle>() * self.prov.capacity(), self.segs.iter().map(|s| s.1.bytes.capacity()).sum::<usize>()]
     }
 }
 
@@ -386,19 +413,23 @@ pub fn run_route(st: &mut RouteState, slice: u32, chunks: &[&Chunk], cx: &Region
         for &(key, mask) in &c.targets {
             let e = match st.table.find(key) {
                 Some(e) => e,
-                None => {
-                    st.fresh.push(0);
-                    st.table.push_key(super::GEOMETRY.words, key)
-                }
+                None => st.table.push_key(super::GEOMETRY.words, key),
             };
             let had = st.table.or_cells(e, mask);
             let new = mask & !had;
-            st.fresh[e as usize] |= new;
-            st.new_states += new.count_ones() as u64;
-            st.fresh_events += (new != 0) as u64;
+            if new != 0 {
+                st.fresh.push((e, new));
+                st.new_states += new.count_ones() as u64;
+                st.fresh_events += 1;
+            }
             if let (Some(layers), Some(region)) = (cx.layers, st.region) {
                 // States of the tree: a raise refuses one of a later layer.
-                let mut old = mask & had & !st.fresh[e as usize];
+                let made = st.fresh_raise.get_or_insert_with(Default::default);
+                let before = made.get(&e).copied().unwrap_or(0);
+                if new != 0 {
+                    made.insert(e, before | new);
+                }
+                let mut old = mask & had & !before;
                 while old != 0 {
                     let cell = old.trailing_zeros();
                     old &= old - 1;
@@ -453,6 +484,7 @@ pub fn run_route(st: &mut RouteState, slice: u32, chunks: &[&Chunk], cx: &Region
         let region = st.region.unwrap_or(u32::MAX);
         st.segs.push((slice, Segment::of_raw(region, &sc.raw, sc.tbs.len() as u32, sc.tbs.iter().map(|t| t.mask.count_ones() as u64).sum(), &mut sc.z)?));
     }
+    sc.bound();
     Ok(())
 }
 
@@ -474,7 +506,19 @@ pub fn seal(st: &mut RouteState, region: u32, finals: &FxHashMap<Key, Key>, sc: 
         seg.1.region = region;
     }
     st.table.finish_frame(st.start, |k| if is_provisional(k) { finals.get(&k).copied() } else { Some(k) })?;
-    let mut new: Vec<(Key, u64)> = st.fresh.iter().enumerate().filter(|x| *x.1 != 0).map(|(e, &m)| (st.table.key(e as u32), m)).collect();
+    // The new cells per entry (an entry's events merged), by key.
+    let mut events = std::mem::take(&mut st.fresh);
+    events.sort_unstable_by_key(|x| x.0);
+    let mut new: Vec<(Key, u64)> = Vec::with_capacity(events.len());
+    let mut last = u32::MAX;
+    for (e, m) in events {
+        if e == last {
+            new.last_mut().expect("pushed").1 |= m;
+        } else {
+            new.push((st.table.key(e), m));
+            last = e;
+        }
+    }
     new.sort_unstable_by_key(|x| x.0);
     if !st.prov.is_empty() {
         let mut v: Vec<Bundle> = std::mem::take(&mut st.prov);
@@ -483,6 +527,6 @@ pub fn seal(st: &mut RouteState, region: u32, finals: &FxHashMap<Key, Key>, sc: 
         }
         st.segs.push((u32::MAX, Segment::encode(region, &mut v, &mut sc.raw, &mut sc.z)?));
     }
-    st.fresh = Vec::new();
+    st.fresh_raise = None;
     Ok(Sealed { region, keys: new.iter().map(|x| x.0).collect(), masks: new.iter().map(|x| x.1).collect() })
 }

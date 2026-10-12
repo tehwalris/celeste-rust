@@ -317,6 +317,15 @@ pub struct Encoder {
 }
 
 impl Encoder {
+    /// Its buffers back to their default size if any holds room for more
+    /// than `keep` items (`route::Scratch::bound`).
+    pub fn bound(&mut self, keep: usize) {
+        let big = [self.t_rank.capacity(), self.tids.capacity(), self.s_perm.capacity(), self.item_g.capacity(), self.at.capacity(), self.st.capacity(), self.groups.capacity(), self.gid.capacity()].into_iter().any(|c| c > keep);
+        if big {
+            *self = Encoder::default();
+        }
+    }
+
     /// Bytes its buffers hold (`--phases`' `[wavemem]`).
     pub fn alloc_bytes(&self) -> usize {
         4 * (self.t_rank.capacity() + self.tids.capacity() + self.s_perm.capacity() + self.item_g.capacity() + self.at.capacity()) + 8 * self.st.capacity() + 20 * self.groups.capacity() + 24 * self.gid.capacity()
@@ -524,9 +533,13 @@ impl<'a> Block<'a> {
     }
 }
 
-/// zstd -1 of a raw block.
+/// zstd -1 of a raw block, at its size (the compressor's buffer is the
+/// raw block's bound: a frame's segments, held to its end, took 5x their
+/// bytes - 1.1 GB at the mod room's f69).
 pub fn compress(raw: &[u8], z: &mut zstd::bulk::Compressor<'static>) -> Result<Vec<u8>> {
-    Ok(z.compress(raw)?)
+    let mut v = z.compress(raw)?;
+    v.shrink_to_fit();
+    Ok(v)
 }
 
 /// A stored block's raw bytes (`raw_len` from its header) into `out`.
