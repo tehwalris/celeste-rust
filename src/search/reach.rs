@@ -39,8 +39,9 @@ use crate::storage::{Sk, GEOMETRY};
 /// Sources per batch of out-edges read.
 const BATCH: usize = 1 << 20;
 
-/// Targets per parallel task of a frame's pushes and unions.
-const TARGET_CHUNK: usize = 256;
+/// Targets per parallel task of a frame's pushes and unions (taken costliest
+/// first).
+const TARGET_CHUNK: usize = 16;
 
 /// The most x segments a reached set keeps exactly (below a `Region`'s
 /// 65535: a set this fragmented costs every push through it).
@@ -209,7 +210,14 @@ pub fn reach(dir: &std::path::Path, horizon: u32, point: (u32, u32), threads: us
         }
         drop(fill);
         drop(edges_of);
-        let targets: Vec<u32> = (0..names.len() as u32).filter(|&d| start[d as usize + 1] > start[d as usize]).collect();
+        // The targets, the costliest first (the segments pushed into each):
+        // a few fragmented sets dominate a frame, and a worker that takes
+        // one late would hold the frame up.
+        let mut targets: Vec<(u64, u32)> = (0..names.len() as u32)
+            .filter(|&d| start[d as usize + 1] > start[d as usize])
+            .map(|d| (inc[start[d as usize] as usize..start[d as usize + 1] as usize].iter().map(|&(i, _)| cur[i as usize].1.n_segs() as u64).sum(), d))
+            .collect();
+        targets.sort_unstable_by(|a, b| b.cmp(a));
         // Per target: every push into it, united (a union whenever the
         // pieces pass twice the last union's: a set of many pieces is not
         // re-united on every push), coarsened where it must be.
@@ -219,7 +227,7 @@ pub fn reach(dir: &std::path::Path, horizon: u32, point: (u32, u32), threads: us
             || Ok((Vec::new(), Vec::new(), Vec::new())),
             |(v, tmp, scratch): &mut (Vec<Piece>, Vec<Piece>, Vec<Seg>), c| {
                 let mut res: Vec<(Sk, Region, u8, u8)> = Vec::new();
-                for &d in &targets[c * TARGET_CHUNK..((c + 1) * TARGET_CHUNK).min(targets.len())] {
+                for &(_, d) in &targets[c * TARGET_CHUNK..((c + 1) * TARGET_CHUNK).min(targets.len())] {
                     v.clear();
                     let (mut lim, mut snapped, mut from) = (256usize, 0u8, 0u8);
                     for &(i, x) in &inc[start[d as usize] as usize..start[d as usize + 1] as usize] {
