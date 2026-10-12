@@ -423,10 +423,11 @@ only such too-late states.
 
 For an exact-remainder forward (the coordinator's question; `summary.txt`,
 `rem_stats.tsv`, `reach.tsv` in bal200-reach):
-- The sets are small clouds: per axis 5-64 segments for half the states
-  (1 segment for 15-30%), spanning <= 1/256 of the circle (1/256 px) for
-  85% of the exact states at every frame; the wide ones (up to the full
-  circle, 25-45% late) are almost all inexact.
+- The sets are small clouds: per axis 5-64 segments for 27-60% of the
+  states, 1 segment for 15-47%; a single point or a span <= 1/256 of the
+  circle (1/256 px) for 99%+ of the EXACT states at f100, f143, f165, f185
+  and f200. The wide ones (> 1/256: 33-60% of all states by f185-200) are
+  the coarsened (<= 0.4% of the exact ones).
 - First arrival in (state, remainder) - a state expanded again whenever
   its union of sets grows: entries per state 1: 9.74M, 2: 5.42M, 3-5:
   2.00M, 6+: 3.73M; 89M expansions (a lower bound: unions capped at 32
