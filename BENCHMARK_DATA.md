@@ -1,5 +1,49 @@
 > STALE in parts: dated sections, newest first, each measured on the code of its date (before 2026-08-31: the deleted pre-rebuild search; plans/ links may name merged or deleted docs, see plans/architecture.md "Where the old plans went") - re-measure before relying on a number.
 
+# Batched emission, canonical transfer ids, purge 100 ms, 2026-10-12 (16 threads, branch `emit-batch`)
+
+A kernel slice's cells, level -1, keys, transfers and sink targets
+computed column-wise over a per-kernel plan of distinct reads; a frame's
+new transfers numbered canonically at its end; safe-run's
+`MIMALLOC_PURGE_DELAY` 0 -> 100 ms (plans/emit-batch.md). Against develop
+8e1ca54 (`/var/tmp/emit-bin/base`; the mod fixture: map-mod 9d6320c
+against a local merge). Release; interleaved, 3 rounds of 3 reps (the
+reference frame) and 2 rounds of 1 rep (the mod fixture), load 16-24
+(another agent's 16-thread run beside it). Instructions a rep: the run's
+`instructions:u` less a `--reps 0` run's, over the reps (a rep: the frame
+and the bench's fingerprints). Every run's f/e lines are the pins.
+
+| case | develop (purge 0) | emit-batch, purge 100 (purge 0) |
+|---|---|---|
+| the reference frame (6,2) 100% f56 -> f57: instructions a rep | 521.2 G | 203.8 G |
+| wave | 2179-2996 ms | 1025-1033 ms, outliers 1127, 1602 (1109-1135, outliers 1229-1715) |
+| frame | 2362-3192 ms | 1174-1188 ms (1287-1315) |
+| page faults / kernel cycles, 3 reps, whole process | 3.0M / 45-46 G | 0.94M / 20-21 G (3.0M / 45-49 G) |
+| anonymous RSS start / wave / end | 0.55 / 1.64-1.69 / 1.15-1.21 GB | 1.52-1.57 / 1.96-1.98 / 1.42-1.45 GB (0.59 / 1.72-1.73 / 1.23) |
+| the mod fixture fmp f52 -> f53 (89.3M rows in, 3.26G emissions): instructions a rep | 7511 G | 3978 G |
+| wave | 35.8 / 35.7 s | 19.5 / 18.7 s (20.7 / 22.0) |
+| frame | 38.0 / 38.0 s | 21.2 / 21.1 s (22.8 / 24.2) |
+| page faults / kernel cycles, whole process | 11.8-12.0M / 167-170 G | 1.43M / 42 G (11.9-12.0M / 164-165 G) |
+| anonymous RSS start / wave / end | 3.63 / 5.68-5.71 / 4.96-4.99 GB | 3.73-3.74 / 6.21 / 5.32-5.35 GB (3.59-3.60 / 5.69-5.71 / 4.96-5.00) |
+
+The wave's breakdown before and after (perf, the reference frame,
+plans/emit-batch.md sections 1 and 6): 34.5 -> 15.0 worker-s a rep;
+transfers 7.4 -> 0.7, keys 6.3 -> 2.6, level -1 and cells 4.8 -> 0.8,
+the sink with the pos graph 6.1 -> 3.9; now the region phase (2.6) and
+the sink's bundle table (1.8) lead.
+
+**Canonical transfer ids** (room (6,2) 100% r0sxhf forward f0-f51,
+release): frame end +6-13 ms at f45-f51 (frames of 150-450 ms); edge store
+46.73 -> 44.97 MB; `xfer.bin` identical at 64k and 256k slices. The
+fixtures' frame checks: `frame.edge_bytes` -1.2% (r62h57) to -4.0% (r60s).
+
+**MIMALLOC_PURGE_DELAY** 0 / 10 / 100 / 1000 ms (2 rounds, load 12-16):
+faults 3.0M / 1.4M / 0.93M / 0.93M (the reference frame, 3 reps) and
+12.0M / 4.6M / 1.33M / 1.2M (the mod fixture); kernel cycles 46 / 26 / 20
+and 156 / 72 / 39 G; wave 1107-1165 / 1042-1103 / 1007-1023 ms and
+16.6-17.3 / 16.1-16.2 / 15.6 s; anonymous RSS at the wave's end 1.70 /
+1.85 / 1.94 GB and 5.70 / 6.00 / 6.25 GB.
+
 # One state set, 2026-10-12 (16 threads, branch `keys-only`)
 
 The visited set, the frontier and the next layer as one type

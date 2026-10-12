@@ -147,7 +147,7 @@ const POS_RECENT: usize = 1 << 10;
 
 /// The lanes of a slice mask, lowest first.
 #[inline]
-fn lanes_of(mut m: u16) -> impl Iterator<Item = usize> {
+pub(crate) fn lanes_of(mut m: u16) -> impl Iterator<Item = usize> {
     std::iter::from_fn(move || {
         (m != 0).then(|| {
             let i = m.trailing_zeros() as usize;

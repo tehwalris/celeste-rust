@@ -29,6 +29,7 @@ use celeste_engine::exact::{Code, FieldDict, MissKey, ShapeKeys};
 use celeste_engine::runtime2::{Rt2, POS_WHOLE};
 
 use super::{AsmKernel, RootKind};
+use crate::storage::unit::lanes_of;
 use crate::search::arc_edges::{decode_axis, RawAxis};
 
 /// One per-row field of a key: its cell (the shape's dictionary), output
@@ -126,18 +127,6 @@ fn bool_masks(buf: &[u8], o: usize) -> (u16, u16) {
 fn bool_same(v: u16, k: u16, r: usize, of: u16) -> u16 {
     let splat = |m: u16| if m >> r & 1 == 1 { 0xffff } else { 0 };
     of & !((v ^ splat(v)) | (k ^ splat(k)))
-}
-
-/// The lanes of a mask, lowest first.
-#[inline]
-fn lanes_of(mut m: u16) -> impl Iterator<Item = usize> {
-    std::iter::from_fn(move || {
-        (m != 0).then(|| {
-            let i = m.trailing_zeros() as usize;
-            m &= m - 1;
-            i
-        })
-    })
 }
 
 impl KeyField {
