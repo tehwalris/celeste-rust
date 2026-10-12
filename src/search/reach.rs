@@ -37,8 +37,10 @@ const BATCH: usize = 1 << 20;
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct FrameReach {
     pub frame: u32,
-    /// States with a non-empty set, and their sets' points.
+    /// States with a non-empty set, those of them reached here for the
+    /// first time, and their sets' points.
     pub states: u64,
+    pub new: u64,
     pub points: u64,
     /// Distinct player cells among them (`None`: no player).
     pub cells: u64,
@@ -107,13 +109,14 @@ pub fn reach(dir: &std::path::Path, horizon: u32, point: (u32, u32), threads: us
         let mut cells: Vec<u32> = cur.iter().map(|(s, _)| s.cell(&geo)).collect();
         cells.sort_unstable();
         cells.dedup();
-        FrameReach { frame: t, states: cur.len() as u64, points: cur.iter().map(|(_, r)| points(r)).sum(), cells: cells.len() as u64, forward_layer: tree.states(t), coarsened: 0, inexact: 0 }
+        FrameReach { frame: t, states: cur.len() as u64, new: 0, points: cur.iter().map(|(_, r)| points(r)).sum(), cells: cells.len() as u64, forward_layer: tree.states(t), coarsened: 0, inexact: 0 }
     };
     for t in 0..=horizon {
+        let mut new = 0;
         for (s, _) in &cur {
-            last.insert(*s, t);
+            new += last.insert(*s, t).is_none() as u64;
         }
-        frames.push(FrameReach { coarsened, inexact: inexact.len() as u64, ..sum(t, &cur) });
+        frames.push(FrameReach { coarsened, inexact: inexact.len() as u64, new, ..sum(t, &cur) });
         visit(t, &cur, &inexact)?;
         if t == horizon || cur.is_empty() {
             break;
@@ -263,6 +266,7 @@ mod tests {
         // Exact reach is a subset of the tree's states, and here a strict one.
         let tree_states: u64 = r.frames.iter().map(|f| f.forward_layer).sum();
         assert!((r.last.len() as u64) < tree_states, "{} states reached exactly of the tree's {tree_states}", r.last.len());
+        assert_eq!(r.frames.iter().map(|f| f.new).sum::<u64>(), r.last.len() as u64, "every reached state is new at one frame");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
