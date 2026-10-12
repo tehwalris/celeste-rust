@@ -131,9 +131,12 @@ enum Command {
     /// pushed along their out-edges through the transfers - the arc phase's
     /// reach with W = everything. Prints per frame the reached states,
     /// their remainder points and cells against the forward's layer, the
-    /// x/y extent, and (a level -1 tree) how many reached states had a
-    /// successor dropped. Exact in the remainder, bounded by the tree: what
-    /// the forward did not keep (level -1, a filter) is not reached.
+    /// x/y extent, the FIRST ARRIVAL in (state, remainder) (the states an
+    /// exact-remainder forward would expand), the edge pushes, and (a level
+    /// -1 tree) the forward's states with a dropped successor; then the
+    /// totals against the forward (`summary.txt`). Exact in the remainder
+    /// up to the coarsened sets (counted), bounded by the tree: what the
+    /// forward did not keep (level -1, a filter) is not reached.
     Reach {
         /// The search's checkpoint dir (its `level{i:02}` trees).
         #[arg(long)]
@@ -2523,16 +2526,13 @@ fn reach_command(checkpoint_dir: &str, level_index: usize, to: u32, save: Option
         })
         .transpose()?;
     let mut cells_file = cells_out.map(|p| std::fs::File::create(p).map(std::io::BufWriter::new)).transpose()?;
-    // Per frame: the reached states' extent, and those a level -1 drop
-    // touched (their successors at the next frame partly dropped).
     let has_notes = dir.join("dropped").is_dir();
-    let mut extent: Vec<(u32, i32, i32, i32, i32, u64, u64)> = Vec::new();
     let point = celeste_rust::search::arc_dp::start_point(cfg)?;
     let t0 = std::time::Instant::now();
     // Written frame by frame (a run stopped part way keeps them): the
     // frames' sums (`reach.tsv`) and the reached sets' shapes
     // (`rem_stats.tsv`).
-    const TSV_HEAD: &str = "frame\tstates\tnew\tentered\tentered_edges\treached_edges\tpushes\tpushes_nonempty\tpoints\tcells\tforward_layer\tcoarsened\tinexact\tmax_k\tx_min\tx_max\ty_min\ty_max\treached_with_dropped_successors\tdrop_noted_cells\n";
+    const TSV_HEAD: &str = "frame\tstates\tnew\tentered\tentered_edges\treached_edges\tpushes\tpushes_nonempty\tpoints\tcells\tforward_layer\tcoarsened\tinexact\tmax_k\tx_min\tx_max\ty_min\ty_max\tl1_noted_sources\n";
     let save_dir = save.map(std::path::Path::new);
     if let Some(d) = save_dir {
         std::fs::create_dir_all(d)?;
@@ -2571,22 +2571,17 @@ fn reach_command(checkpoint_dir: &str, level_index: usize, to: u32, save: Option
                 }
             }
         }
-        let (mut noted, mut notes_n) = (0u64, 0u64);
+        // The forward's states of layer `t` a level -1 drop touched (some
+        // successor at `t + 1` dropped as too late): a reached state from
+        // an earlier layer has its notes at its own layer, so they are not
+        // matched against the reach. A dropped successor of a state reached
+        // at `t` is no earlier than `t + 1`: too late for the tree's win.
         let notes_path = celeste_rust::storage::layer::notes_path(&dir, t + 1);
-        if has_notes && notes_path.exists() {
-            let notes = celeste_rust::storage::layer::read_notes(&notes_path)?;
-            notes_n = notes.iter().map(|n| n.3.count_ones() as u64).sum();
-            let mut by: rustc_hash::FxHashMap<(u32, (u64, u64)), u64> = Default::default();
-            for n in &notes {
-                *by.entry((n.0, n.1)).or_default() |= n.3;
-            }
-            noted = cur.iter().filter(|(s, _)| by.get(&(s.region, s.key)).is_some_and(|m| m >> s.local & 1 == 1)).count() as u64;
-        }
-        extent.push((t, x0, x1, y0, y1, noted, notes_n));
+        let noted = if has_notes && notes_path.exists() { celeste_rust::storage::layer::read_notes(&notes_path)?.iter().map(|n| n.3.count_ones() as u64).sum() } else { 0 };
         let p = pushes.unwrap_or_default();
         let line = format!(
-            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
-            t, fr.states, fr.new, fr.entered, fr.entered_edges, fr.reached_edges, p.edges, p.nonempty, fr.points, fr.cells, fr.forward_layer, fr.coarsened, fr.inexact, fr.max_k, x0, x1, y0, y1, noted, notes_n
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+            t, fr.states, fr.new, fr.entered, fr.entered_edges, fr.reached_edges, p.edges, p.nonempty, fr.points, fr.cells, fr.forward_layer, fr.coarsened, fr.inexact, fr.max_k, x0, x1, y0, y1, noted
         );
         if let Some(f) = &mut tsv_file {
             f.write_all(line.as_bytes())?;
@@ -2622,7 +2617,7 @@ fn reach_command(checkpoint_dir: &str, level_index: usize, to: u32, save: Option
     let mut lines = fwd.lines();
     let head: Vec<&str> = lines.next().unwrap_or("").split('\t').collect();
     let col = |name: &str| head.iter().position(|h| *h == name);
-    let (mut visited, mut emitted) = (0u64, 0u64);
+    let (mut visited, mut expanded, mut emitted) = (0u64, 0u64, 0u64);
     if let (Some(vf), Some(ve), Some(vv)) = (col("frame"), col("edges"), col("visited")) {
         for l in lines {
             let c: Vec<&str> = l.split('\t').collect();
@@ -2630,6 +2625,9 @@ fn reach_command(checkpoint_dir: &str, level_index: usize, to: u32, save: Option
             if f <= steps {
                 emitted += c[ve].parse::<u64>()?;
                 visited = visited.max(c[vv].parse()?);
+            }
+            if f < steps {
+                expanded = expanded.max(c[vv].parse()?);
             }
         }
     }
@@ -2643,22 +2641,21 @@ fn reach_command(checkpoint_dir: &str, level_index: usize, to: u32, save: Option
     let mut summary = String::new();
     summary += &format!("[reach] states ever reached: {live} (the forward visited {visited}: {:.2}%)\n", 100.0 * live as f64 / visited.max(1) as f64);
     summary += &format!(
-        "[reach] first arrival (a lower bound: unions coarsened past 32 segments): entries per state 1: {}, 2: {}, 3-5: {}, 6+: {} ({entered} entries); their edge records {entered_edges} against the forward's emissions {emitted} ({:.2}%)\n",
+        "[reach] first arrival (a lower bound: unions coarsened past 32 segments): entries per state 1: {}, 2: {}, 3-5: {}, 6+: {}; {entered} expansions against the forward's {expanded} ({:.2}%), {entered_edges} distinct out-edges pushed (the forward emitted {emitted} lanes)\n",
         range(1, 2),
         range(2, 3),
         range(3, 6),
         range(6, usize::MAX),
-        100.0 * entered_edges as f64 / emitted.max(1) as f64
+        100.0 * entered as f64 / expanded.max(1) as f64
     );
     summary += &format!(
-        "[reach] the upper bound, a state entering at every frame it is reached: {reached} entries, {reached_edges} edge records ({:.2}% of the forward's emissions)\n",
-        100.0 * reached_edges as f64 / emitted.max(1) as f64
+        "[reach] the upper bound, a state entering at every frame it is reached: {reached} expansions ({:.2}%), {reached_edges} distinct out-edges pushed\n",
+        100.0 * reached as f64 / expanded.max(1) as f64
     );
     summary += &format!(
-        "[reach] edges of the states ever reached: {} records ({:.2}% of the forward's), {} distinct, {} of those ever pushed non-empty\n",
-        r.edges_raw,
-        100.0 * r.edges_raw as f64 / emitted.max(1) as f64,
+        "[reach] edges of the states ever reached: {} distinct (target, transfer) of {} recorded, {} of those ever pushed non-empty\n",
         r.edges,
+        r.edges_raw,
         r.edges_pushed
     );
     print!("{summary}");
