@@ -28,14 +28,20 @@ FROM_MID="--room 0,0 --balloon-seeds 0 --start-inputs /var/tmp/mod-ck/mid142-can
 spec() {
     case $1 in
         # The second half: r0sxhe from the proven mid state (f142) to the
-        # real exit, level -1 85, new storage (develop a4c3dfc): a busy frame
-        # (f45: 39M rows in) and the peak (f68: 171M rows in, 5.2G emissions).
-        fm45) SRC=/var/tmp/mod-ck/fm/level00; F=45; LEVEL=r0sxhe; FLAGS="$FROM_MID --level-minus-one 85,5" ;;
-        fm68) SRC=/var/tmp/mod-ck/fm/level00; F=68; LEVEL=r0sxhe; FLAGS="$FROM_MID --level-minus-one 85,5" ;;
+        # real exit, level -1 85, keys only (format 15, develop 2ef9213): a
+        # busy frame (f45: 39M rows in) and the peak (f68: 171M rows in,
+        # 5.2G emissions).
+        fm45) SRC=/var/tmp/mod-ck/fm15/level00; F=45; LEVEL=r0sxhe; FLAGS="$FROM_MID --level-minus-one 85,5" ;;
+        fm68) SRC=/var/tmp/mod-ck/fm15/level00; F=68; LEVEL=r0sxhe; FLAGS="$FROM_MID --level-minus-one 85,5" ;;
+        # The +95 run (HEURISTIC --prune-rect, level -1 95): its frame with
+        # the most provisional keys (f52 -> f53) and its peak (f76 -> f77:
+        # 348M rows in, 11.2G emissions, a 17 GB visited set).
+        fmp52) SRC=/var/tmp/mod-ck/fmp15/level00; F=52; LEVEL=r0sxhe; FLAGS="$FROM_MID --prune-rect=-8..63,-16..39 --level-minus-one 95,5" ;;
+        fmp76) SRC=/var/tmp/mod-ck/fmp15/level00; F=76; LEVEL=r0sxhe; FLAGS="$FROM_MID --prune-rect=-8..63,-16..39 --level-minus-one 95,5" ;;
         *) echo "mod_bench: no fixture $1 (list)" >&2; exit 2 ;;
     esac
 }
-ALL="fm45 fm68"
+ALL="fm45 fm68 fmp52 fmp76"
 
 make_one() {
     spec "$1"
@@ -49,6 +55,8 @@ make_one() {
     # by the bench's scratch anyway; keep F's and earlier).
     find "$dir.tmp/frames" "$dir.tmp/edges" "$dir.tmp/dropped" -mindepth 1 -maxdepth 1 2>/dev/null \
         | while read -r p; do n=$(basename "$p" | grep -o '^f[0-9]*' | tr -d f || true); [[ -n $n ]] && ((10#$n > F)) && rm -rf "$p"; true; done
+    # The room's level -1 table (S = 5: every horizon's), pinned once.
+    [[ -f ${MOD_L1:-/var/tmp/mod-ck/l1-table.bin} ]] && cp "${MOD_L1:-/var/tmp/mod-ck/l1-table.bin}" "$dir.tmp/l1-table.bin"
     echo "src $SRC" > "$dir.tmp/fixture.txt"
     echo "frame $F level $LEVEL flags $FLAGS" >> "$dir.tmp/fixture.txt"
     mv "$dir.tmp" "$dir"
