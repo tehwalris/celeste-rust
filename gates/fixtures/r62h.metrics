@@ -76,8 +76,8 @@ dyn.cat.d.store-live 7837122
 dyn.insts 944862772
 dyn.slices 139484
 frame.bundles 15099614
-frame.edge_bytes 8463618
-frame.edge_millibytes_per_edge 96
+frame.edge_bytes 8189455
+frame.edge_millibytes_per_edge 92
 frame.edges 88076797
 frame.emissions 88076797
 frame.kept 2597457

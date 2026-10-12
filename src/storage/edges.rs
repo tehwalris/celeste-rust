@@ -8,8 +8,13 @@
 //! `f{frame}.r{seq}.bin`): a header - the segments, by region, and per
 //! target region the SOURCE regions its edges leave (the out-edge lookup) -
 //! and the blocks. Transfers are global ids into `edges/xfer.bin`,
-//! content-canonical (each wave appends its new pairs sorted). Nothing
-//! names a state by a number: a state is its region, key and cell (`Sk`).
+//! CANONICAL: a frame's new pairs are numbered at its end by their edges
+//! in the frame and their content (`XferTable::canonical`; a bundle
+//! holding one waits for it, as one into
+//! a provisional target does: `route::seal`), so the table and every id in
+//! the edge files are a function of the search, not of the order the
+//! wave's slices met them. Nothing names a state by a number: a state is its region, key
+//! and cell (`Sk`).
 
 use anyhow::{ensure, Context, Result};
 use rustc_hash::FxHashMap;
@@ -58,9 +63,9 @@ impl XferTable {
     }
 
     /// The workers' NEW pairs (`tails`: what each worker's table gained
-    /// since its last merge) into the table: the ones it lacks appended in
-    /// value order (content-canonical: a function of the pairs, whatever
-    /// the workers); per tail its pairs' global ids.
+    /// since its last merge) into the table: the ones it lacks appended (in
+    /// value order); per tail its pairs' global ids. A wave merges per
+    /// slice, so these ids are PROVISIONAL until its end (`canonical`).
     pub fn merge(&mut self, tails: &[&[Pair]]) -> Vec<Vec<u32>> {
         let mut new: Vec<Pair> = tails.iter().flat_map(|t| t.iter()).filter(|p| !self.index.contains_key(p)).copied().collect();
         new.sort_unstable();
@@ -70,6 +75,35 @@ impl XferTable {
             self.pairs.push(p);
         }
         tails.iter().map(|t| t.iter().map(|p| self.index[p]).collect()).collect()
+    }
+
+    /// The pairs from `first` on (a wave's: merged slice by slice, in the
+    /// slices' order) put in CANONICAL order - by the edges the frame
+    /// recorded with each (`counts[id - first]`), most first, then by
+    /// content: a function of the frame alone, and the frequent transfers
+    /// get the short ids (their varints; content order alone made the
+    /// reference frame's edge file 3% larger). Returns each one's new id
+    /// less `first`, by its old id less `first` (`None`: already in order).
+    /// The ids below `first` stay.
+    pub fn canonical(&mut self, first: usize, counts: &[u64]) -> Option<Vec<u32>> {
+        let new = &self.pairs[first..];
+        assert_eq!(counts.len(), new.len(), "a count per new transfer");
+        let mut order: Vec<u32> = (0..new.len() as u32).collect();
+        order.sort_unstable_by(|&a, &b| counts[b as usize].cmp(&counts[a as usize]).then_with(|| new[a as usize].cmp(&new[b as usize])));
+        if order.iter().enumerate().all(|(i, &o)| i as u32 == o) {
+            return None;
+        }
+        let mut perm = vec![0u32; new.len()];
+        for (to, &from) in order.iter().enumerate() {
+            perm[from as usize] = to as u32;
+        }
+        let sorted: Vec<Pair> = order.iter().map(|&i| new[i as usize]).collect();
+        self.pairs.truncate(first);
+        for p in sorted {
+            self.index.insert(p, self.pairs.len() as u32);
+            self.pairs.push(p);
+        }
+        Some(perm)
     }
 
     /// Write the pairs merged since the last flush past the trusted length
@@ -579,6 +613,34 @@ pub(crate) fn write_test_edges(dir: &Path, frames: &[(u32, Vec<(Sk, Sk, u32)>)],
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A wave's new transfers, merged slice by slice, get their CANONICAL
+    /// ids - by their edges' count, then content: the permutation, the
+    /// table and its index agree, the older ids stay, and a table in order
+    /// is left alone.
+    #[test]
+    fn a_waves_new_transfers_are_numbered_by_count_and_content() {
+        let pair = |v: i32| {
+            let ax = crate::search::arc_edges::AxisXfer { lo: 0, hi: 1 << 16, tag: 0, val: v };
+            (ax, ax)
+        };
+        let mut t = XferTable::default();
+        t.merge(&[&[pair(5), pair(1)]]);
+        assert_eq!(t.canonical(0, &[2, 2]), None, "one merge is in order");
+        let first = t.pairs.len();
+        // Two slices: the second meets smaller pairs (and one already held).
+        let ids_a = t.merge(&[&[pair(9), pair(7)], &[pair(8)]]);
+        let ids_b = t.merge(&[&[pair(3), pair(5)]]);
+        // Met as 7, 8, 9, 3; 9 the most edges, 7 and 3 tied.
+        let perm = t.canonical(first, &[1, 0, 5, 1]).expect("out of order");
+        assert_eq!(t.pairs, [1, 5, 9, 3, 7, 8].map(pair));
+        let id = |x: u32| if (x as usize) < first { x } else { first as u32 + perm[x as usize - first] };
+        for (p, x) in [pair(9), pair(7), pair(8), pair(3), pair(5)].iter().zip(ids_a.concat().into_iter().chain(ids_b.concat())) {
+            assert_eq!(t.pairs[id(x) as usize], *p);
+            assert_eq!(t.index[p], id(x));
+        }
+        assert_eq!(t.canonical(first, &[5, 1, 1, 0]), None, "in order already");
+    }
 
     /// Edge file names past frame 999 (split frame: step 1000 is frame 500).
     #[test]

@@ -366,7 +366,8 @@ is not measured. The projection's big uncertainty is S(H) past f152
   entry of ~17 states).
 - **The backward's sweep** (fmp95: 12.5 GB anonymous) now matches the
   forward's peak.
-- **Make transfer ids canonical (content order).** A transfer's id is its
+- **Make transfer ids canonical** - DONE (branch `emit-batch`,
+  plans/emit-batch.md section 3: by the frame's edges, then content). A transfer's id is its
   place in `edges/xfer.bin`, which is DISCOVERY order: the slices, the
   units and the jobs decide it. The states, the edges' endpoints and every
   gate are canonical, but the edge files' bytes are not: fixtures cut by

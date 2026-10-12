@@ -147,8 +147,9 @@ thing that fails.
   resident set (`RssAnon`); `file` is file-backed pages (mapped edge files
   and checkpoints, reclaimable); `peak` is `VmHWM`, both together. Reading
   `VmRSS` once mistook the mmaps for heap.
-- `safe-run.sh` sets `MIMALLOC_PURGE_DELAY=0` (freed pages return at once).
-  Override it in the environment to experiment.
+- `safe-run.sh` sets `MIMALLOC_PURGE_DELAY=100` (freed pages return after
+  100 ms: a wave's units reuse each other's; why, and the numbers, in the
+  script). Override it in the environment to experiment.
 - **Settings are flags**, never environment variables: a binary refuses any
   `CELESTE_*` variable (naming the flag that replaced it). A tree records
   the settings that change it (`<level dir>/settings.txt`) and refuses a run

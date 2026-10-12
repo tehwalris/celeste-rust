@@ -240,6 +240,29 @@ pub(crate) fn write_dicts(t: &[Key], s: &[(u32, Key)], out: &mut Vec<u8>) {
     }
 }
 
+/// One record of a block in `order` (`vals`, the fields in that order),
+/// after `prev`: its level byte (the first field that changed), that
+/// field's delta, the later fields raw (an offset short-coded, a mask its
+/// 8 bytes).
+#[inline]
+fn put_record(out: &mut Vec<u8>, order: &[F; 5], prev: Option<&[u64; 5]>, vals: &[u64; 5]) {
+    let l = match prev {
+        None => 0,
+        Some(p) => (0..5).find(|&i| vals[i] != p[i]).expect("distinct records"),
+    };
+    out.push(l as u8);
+    for i in l..5 {
+        match order[i] {
+            F::O => put_off(out, vals[i] as u32),
+            F::M => out.extend_from_slice(&vals[i].to_le_bytes()),
+            _ => match prev {
+                Some(p) if i == l => put_varint(out, vals[i] - p[i]),
+                _ => put_varint(out, vals[i]),
+            },
+        }
+    }
+}
+
 /// Encode `bundles` (distinct, any order) as a raw block in `order` into
 /// `out` (cleared).
 pub fn encode(bundles: &[Bundle], order: &[F; 5], out: &mut Vec<u8>) {
@@ -265,24 +288,8 @@ pub fn encode(bundles: &[Bundle], order: &[F; 5], out: &mut Vec<u8>) {
     recs.sort_unstable();
     debug_assert!(recs.windows(2).all(|w| w[0] != w[1]), "bundles distinct");
     put_varint(out, recs.len() as u64);
-    let mut prev: Option<[u64; 5]> = None;
-    for vals in &recs {
-        let l = match prev {
-            None => 0,
-            Some(p) => (0..5).find(|&i| vals[i] != p[i]).expect("distinct records"),
-        };
-        out.push(l as u8);
-        for i in l..5 {
-            match order[i] {
-                F::O => put_off(out, vals[i] as u32),
-                F::M => out.extend_from_slice(&vals[i].to_le_bytes()),
-                _ => match prev {
-                    Some(p) if i == l => put_varint(out, vals[i] - p[i]),
-                    _ => put_varint(out, vals[i]),
-                },
-            }
-        }
-        prev = Some(*vals);
+    for (k, vals) in recs.iter().enumerate() {
+        put_record(out, order, k.checked_sub(1).map(|j| &recs[j]), vals);
     }
 }
 
@@ -419,21 +426,7 @@ impl Encoder {
             debug_assert!(run.windows(2).all(|w| w[0] != w[1]), "bundles distinct");
             for &st in run.iter() {
                 let vals = [mask, ox >> 32, ox & 0xffff_ffff, st >> 32, st & 0xffff_ffff];
-                let l = match prev {
-                    None => 0,
-                    Some(p) => (0..5).find(|&i| vals[i] != p[i]).expect("distinct records"),
-                };
-                out.push(l as u8);
-                for i in l..5 {
-                    match ORDER[i] {
-                        F::O => put_off(out, vals[i] as u32),
-                        F::M => out.extend_from_slice(&vals[i].to_le_bytes()),
-                        _ => match prev {
-                            Some(p) if i == l => put_varint(out, vals[i] - p[i]),
-                            _ => put_varint(out, vals[i]),
-                        },
-                    }
-                }
+                put_record(out, &ORDER, prev.as_ref(), &vals);
                 prev = Some(vals);
             }
             a += len as usize;
@@ -635,4 +628,5 @@ mod tests {
         assert!(b.is_empty());
         b.records(|_| panic!("no records")).unwrap();
     }
+
 }
