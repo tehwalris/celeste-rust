@@ -29,127 +29,60 @@ use celeste_engine::runtime2::{mix64, Cell2, Col, Rt2};
 
 use super::bundle::{get_varint, get_varint128, put_varint, put_varint128};
 use super::decode::Repr;
+use super::set::{RegionSet, RegionTable};
 use super::{Sk, GEOMETRY};
 
-/// A set of states: per region (ascending) its entries - key (ascending)
-/// and cell mask - and the skeletons its shapes' rows decode with.
+/// A LAYER: a frozen set of states (`set::RegionSet`: per region
+/// (ascending) its entries, key (ascending) and cells) and the skeletons its
+/// shapes' rows decode with.
 #[derive(Default, Clone)]
 pub struct Layer {
-    /// `(region, its first entry)` per region held, ascending.
-    regions: Vec<(u32, u32)>,
-    keys: Vec<Key>,
-    masks: Vec<u64>,
+    pub set: RegionSet,
     /// Per shape (hash) its skeleton (`SkelRecord::rt2`).
     pub skeletons: FxHashMap<u64, Arc<Rt2>>,
 }
 
-const _: () = assert!(GEOMETRY.words == 1, "a layer holds a u64 mask an entry: 8 x 8 storage regions");
-
 impl Layer {
-    /// An empty layer with room for `entries` entries.
-    pub fn with_capacity(entries: usize) -> Layer {
-        Layer { keys: Vec::with_capacity(entries), masks: Vec::with_capacity(entries), ..Default::default() }
-    }
-
     /// Append region `region`'s entries (after every region held; keys
     /// ascending, masks non-empty: checked).
     pub fn push_region(&mut self, region: u32, keys: &[Key], masks: &[u64]) -> Result<()> {
-        ensure!(keys.len() == masks.len(), "a layer region with {} keys and {} masks", keys.len(), masks.len());
-        if keys.is_empty() {
-            return Ok(());
-        }
-        ensure!(self.regions.last().is_none_or(|&(r, _)| r < region), "layer regions out of order ({region} after {:?})", self.regions.last());
-        ensure!(keys.windows(2).all(|w| w[0] < w[1]), "region {region}: keys not ascending");
         ensure!(masks.iter().all(|&m| m != 0), "region {region}: an entry without cells");
         ensure!(region % GEOMETRY.slots != GEOMETRY.no_cell_slot() || masks.iter().all(|&m| m == 1), "region {region} (no player): a cell past 0");
-        self.regions.push((region, self.keys.len() as u32));
-        self.keys.extend_from_slice(keys);
-        self.masks.extend_from_slice(masks);
-        Ok(())
+        self.set.push(region, RegionTable::from_sorted(keys, masks)?)
     }
 
     /// Entries held.
     pub fn entries(&self) -> usize {
-        self.keys.len()
+        self.set.entries()
     }
 
     /// States held.
     pub fn states(&self) -> u64 {
-        self.masks.iter().map(|m| m.count_ones() as u64).sum()
+        self.set.states()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.keys.is_empty()
-    }
-
-    /// The regions held, each `(region, entries' range)`.
-    pub fn regions(&self) -> impl Iterator<Item = (u32, std::ops::Range<usize>)> + '_ {
-        self.regions.iter().enumerate().map(|(i, &(r, a))| {
-            let b = self.regions.get(i + 1).map_or(self.keys.len(), |x| x.1 as usize);
-            (r, a as usize..b)
-        })
-    }
-
-    /// Entry `e`'s key and mask.
-    #[inline]
-    pub fn entry(&self, e: usize) -> (Key, u64) {
-        (self.keys[e], self.masks[e])
-    }
-
-    pub fn keys(&self) -> &[Key] {
-        &self.keys
-    }
-
-    pub fn masks(&self) -> &[u64] {
-        &self.masks
+        self.set.is_empty()
     }
 
     /// Every entry `(region, key, mask)`, in order.
     pub fn iter(&self) -> impl Iterator<Item = (u32, Key, u64)> + '_ {
-        self.regions().flat_map(move |(r, rg)| rg.map(move |e| (r, self.keys[e], self.masks[e])))
+        self.set.iter()
     }
 
     /// Every state, in order (region, key, cell).
     pub fn states_iter(&self) -> impl Iterator<Item = Sk> + '_ {
-        self.iter().flat_map(|(region, key, mask)| bits(mask).map(move |local| Sk { region, key, local: local as u8 }))
-    }
-
-    /// The entries of `region` (empty if not held).
-    pub fn region(&self, region: u32) -> (&[Key], &[u64]) {
-        match self.regions.binary_search_by_key(&region, |x| x.0) {
-            Ok(i) => {
-                let (a, b) = (self.regions[i].1 as usize, self.regions.get(i + 1).map_or(self.keys.len(), |x| x.1 as usize));
-                (&self.keys[a..b], &self.masks[a..b])
-            }
-            Err(_) => (&[], &[]),
-        }
+        self.set.states_iter()
     }
 
     /// The cells of `(region, key)` held (0: none).
     pub fn mask_of(&self, region: u32, key: Key) -> u64 {
-        let (keys, masks) = self.region(region);
-        keys.binary_search(&key).map_or(0, |i| masks[i])
+        self.set.mask_of(region, key)
     }
 
     /// Does the layer hold state `s`?
     pub fn contains(&self, s: Sk) -> bool {
-        self.mask_of(s.region, s.key) >> s.local & 1 == 1
-    }
-
-    /// The region of entry `e`.
-    pub fn region_of_entry(&self, e: usize) -> u32 {
-        self.region_at(self.region_index(e)).0
-    }
-
-    /// The index (among the regions held) of entry `e`'s region.
-    pub fn region_index(&self, e: usize) -> usize {
-        self.regions.partition_point(|x| x.1 as usize <= e) - 1
-    }
-
-    /// The `i`-th region held and its entries' range.
-    pub fn region_at(&self, i: usize) -> (u32, std::ops::Range<usize>) {
-        let (r, a) = self.regions[i];
-        (r, a as usize..self.regions.get(i + 1).map_or(self.keys.len(), |x| x.1 as usize))
+        self.set.contains(s)
     }
 
     /// `rewrite ckhash`'s `f` line over the layer: its states' count and the
@@ -187,64 +120,12 @@ impl Layer {
                 }
             }
         }
-        let mut out = Layer { skeletons, ..Default::default() };
-        let (mut a, mut b) = (self.regions().peekable(), other.regions().peekable());
-        let (mut keys, mut masks): (Vec<Key>, Vec<u64>) = (Vec::new(), Vec::new());
-        loop {
-            let (ra, rb) = (a.peek().map(|x| x.0), b.peek().map(|x| x.0));
-            let region = match (ra, rb) {
-                (None, None) => break,
-                (Some(x), None) => x,
-                (None, Some(y)) => y,
-                (Some(x), Some(y)) => x.min(y),
-            };
-            keys.clear();
-            masks.clear();
-            let ea = if ra == Some(region) { a.next().map(|x| x.1) } else { None }.unwrap_or(0..0);
-            let eb = if rb == Some(region) { b.next().map(|x| x.1) } else { None }.unwrap_or(0..0);
-            let (mut i, mut j) = (ea.start, eb.start);
-            while i < ea.end || j < eb.end {
-                let ka = (i < ea.end).then(|| self.keys[i]);
-                let kb = (j < eb.end).then(|| other.keys[j]);
-                match (ka, kb) {
-                    (Some(x), Some(y)) if x == y => {
-                        ensure!(self.masks[i] & other.masks[j] == 0, "region {region}: a state held by a frame and its raise");
-                        keys.push(x);
-                        masks.push(self.masks[i] | other.masks[j]);
-                        i += 1;
-                        j += 1;
-                    }
-                    (Some(x), Some(y)) if x < y => {
-                        keys.push(x);
-                        masks.push(self.masks[i]);
-                        i += 1;
-                    }
-                    (Some(_), Some(y)) => {
-                        keys.push(y);
-                        masks.push(other.masks[j]);
-                        j += 1;
-                    }
-                    (Some(x), None) => {
-                        keys.push(x);
-                        masks.push(self.masks[i]);
-                        i += 1;
-                    }
-                    (None, Some(y)) => {
-                        keys.push(y);
-                        masks.push(other.masks[j]);
-                        j += 1;
-                    }
-                    (None, None) => unreachable!(),
-                }
-            }
-            out.push_region(region, &keys, &masks)?;
-        }
-        Ok(out)
+        Ok(Layer { set: self.set.union(&other.set)?, skeletons })
     }
 
     /// Bytes allocated.
     pub fn alloc_bytes(&self) -> usize {
-        self.regions.capacity() * 8 + self.keys.capacity() * 16 + self.masks.capacity() * 8
+        self.set.alloc_bytes()
     }
 }
 
@@ -486,37 +367,40 @@ fn decode_region(raw: &[u8]) -> Result<RegionEntries> {
 pub fn write_frame(path: &Path, meta: &FrameMeta, layer: &Layer, wins: &[(u32, u64)], threads: usize) -> Result<u64> {
     use std::io::Write;
     ensure!(wins.windows(2).all(|w| w[0].0 < w[1].0), "write_frame: wins not by entry");
-    let regions: Vec<(u32, std::ops::Range<usize>)> = layer.regions().collect();
-    // Per region its wins (entry indices made region-relative).
-    let mut win_at = Vec::with_capacity(regions.len());
+    let tables = layer.set.tables();
+    let starts = layer.set.entry_starts();
+    // Per region its wins (entry numbers made region-relative).
+    let mut win_at = Vec::with_capacity(tables.len());
     let mut wi = 0usize;
-    for (_, rg) in &regions {
-        let a = wi;
-        while wi < wins.len() && (wins[wi].0 as usize) < rg.end {
-            ensure!(wins[wi].0 as usize >= rg.start && wins[wi].1 & !layer.masks[wins[wi].0 as usize] == 0, "write_frame: a win outside its entry");
+    for (i, (_, t)) in tables.iter().enumerate() {
+        let (a, end) = (wi, starts[i] + t.len());
+        while wi < wins.len() && (wins[wi].0 as usize) < end {
+            let e = wins[wi].0 as usize;
+            ensure!(e >= starts[i] && wins[wi].1 & !t.mask((e - starts[i]) as u32) == 0, "write_frame: a win outside its entry");
             wi += 1;
         }
         win_at.push(a..wi);
     }
     ensure!(wi == wins.len(), "write_frame: a win past the layer");
-    let blocks: Vec<Result<(Vec<u8>, u32)>> = super::wave::par_map(&(0..regions.len()).collect::<Vec<_>>(), threads, |&i| {
-        let (_, rg) = &regions[i];
-        let w: Vec<(u32, u64)> = wins[win_at[i].clone()].iter().map(|&(e, m)| (e - rg.start as u32, m)).collect();
+    let blocks: Vec<Result<(Vec<u8>, u32)>> = super::wave::par_map(&(0..tables.len()).collect::<Vec<_>>(), threads, |&i| {
+        let t = &tables[i].1;
+        let w: Vec<(u32, u64)> = wins[win_at[i].clone()].iter().map(|&(e, m)| (e - starts[i] as u32, m)).collect();
+        let keys: Vec<Key> = t.iter().map(|x| x.0).collect();
         let mut raw = Vec::new();
-        encode_region(&layer.keys[rg.clone()], &layer.masks[rg.clone()], &w, &mut raw);
+        encode_region(&keys, t.masks(), &w, &mut raw);
         Ok((zstd::bulk::compress(&raw, 1)?, raw.len() as u32))
     });
-    let mut index = Vec::with_capacity(regions.len());
+    let mut index = Vec::with_capacity(tables.len());
     let mut offset = 0u64;
     let mut data = Vec::new();
     for (i, b) in blocks.into_iter().enumerate() {
         let (z, raw) = b?;
-        let (region, rg) = &regions[i];
+        let (region, t) = &tables[i];
         let w = &wins[win_at[i].clone()];
         index.push(RegionIndex {
             region: *region,
-            entries: rg.len() as u32,
-            states: layer.masks[rg.clone()].iter().map(|m| m.count_ones()).sum(),
+            entries: t.len() as u32,
+            states: t.states() as u32,
             wins: w.iter().map(|x| x.1.count_ones()).sum(),
             offset,
             len: z.len() as u32,
@@ -606,6 +490,7 @@ impl FrameFile {
             layer.push_region(self.header.regions[i].region, &p.keys, &p.masks).with_context(|| self.path.display().to_string())?;
             wins.extend(p.wins.into_iter().map(|(e, m)| (base + e, m)));
         }
+        ensure!(layer.set.tables().len() == n, "{}: an empty region", self.path.display());
         if let Some(room) = room {
             for s in &self.header.skeletons {
                 layer.skeletons.insert(s.shape_hash, Arc::new(s.rt2_in(room)?));
@@ -637,17 +522,19 @@ impl FrameFile {
 /// another set than the forward expands.
 pub fn check_frame_file(path: &Path, layer: &Layer, wins: &[(u32, u64)], threads: usize) -> Result<()> {
     let f = FrameFile::open(path)?;
-    let regions: Vec<(u32, std::ops::Range<usize>)> = layer.regions().collect();
+    let tables = layer.set.tables();
+    let starts = layer.set.entry_starts();
     let differ = |what: String| anyhow!("{}: STORED STATES DIFFER from the forward's ({what})", path.display());
-    ensure!(f.header.regions.len() == regions.len(), differ(format!("{} regions in memory, {} read back", regions.len(), f.header.regions.len())));
-    let parts: Vec<Result<()>> = super::wave::par_map(&(0..regions.len()).collect::<Vec<_>>(), threads, |&i| {
-        let (region, rg) = &regions[i];
+    ensure!(f.header.regions.len() == tables.len(), differ(format!("{} regions in memory, {} read back", tables.len(), f.header.regions.len())));
+    let parts: Vec<Result<()>> = super::wave::par_map(&(0..tables.len()).collect::<Vec<_>>(), threads, |&i| {
+        let (region, t) = &tables[i];
         ensure!(f.header.regions[i].region == *region, differ(format!("region {} read back as {}", region, f.header.regions[i].region)));
         let e = f.region(i)?;
-        ensure!(e.keys[..] == layer.keys[rg.clone()] && e.masks[..] == layer.masks[rg.clone()], differ(format!("region {region}'s entries")));
-        let lo = wins.partition_point(|w| (w.0 as usize) < rg.start);
-        let hi = wins.partition_point(|w| (w.0 as usize) < rg.end);
-        let want: Vec<(u32, u64)> = wins[lo..hi].iter().map(|&(x, m)| (x - rg.start as u32, m)).collect();
+        ensure!(e.keys.len() == t.len() && t.iter().zip(e.keys.iter().zip(&e.masks)).all(|((k, m), (k2, m2))| k == *k2 && m == *m2), differ(format!("region {region}'s entries")));
+        let (a, end) = (starts[i], starts[i] + t.len());
+        let lo = wins.partition_point(|w| (w.0 as usize) < a);
+        let hi = wins.partition_point(|w| (w.0 as usize) < end);
+        let want: Vec<(u32, u64)> = wins[lo..hi].iter().map(|&(x, m)| (x - a as u32, m)).collect();
         ensure!(e.wins == want, differ(format!("region {region}'s wins")));
         Ok(())
     });
@@ -813,10 +700,12 @@ impl Tree {
         let mut wins = Vec::new();
         for file in files {
             let (l, w) = file.layer(room, threads)?;
+            let starts = l.set.entry_starts();
             for &(e, m) in &w {
-                let (key, _) = l.entry(e as usize);
-                let region = l.region_of_entry(e as usize);
-                wins.extend(bits(m).map(|local| Sk { region, key, local: local as u8 }));
+                let (ti, local) = l.set.locate(&starts, e as usize)?;
+                let (region, t) = &l.set.tables()[ti];
+                let key = t.key(local);
+                wins.extend(bits(m).map(|c| Sk { region: *region, key, local: c as u8 }));
             }
             out = out.union(l)?;
         }
@@ -966,7 +855,7 @@ mod tests {
         assert_eq!(f.header.states(), a.states());
         assert_eq!(f.header.wins(), 2);
         let (back, w) = f.layer(None, 1).unwrap();
-        assert_eq!((back.keys(), back.masks(), w), (a.keys(), a.masks(), wins.clone()));
+        assert_eq!((back.iter().collect::<Vec<_>>(), w), (a.iter().collect::<Vec<_>>(), wins.clone()));
         let b = layer_of(&[(3, (0, 5), 0b0100), (5, (0, 0), 1)]);
         let u = a.clone().union(b).unwrap();
         assert_eq!(u.states(), a.states() + 2);

@@ -8,13 +8,16 @@
 //!   * `route`   - the region phase: a route's dedup against its region's
 //!                 table and its edge segments
 //!   * `wave`    - the frame: units and region jobs in one pipeline, the
-//!                 frame's end (canonical entry numbers, the new layer)
+//!                 frame's end (keys made final, the next layer frozen and
+//!                 merged into the visited set)
 //!   * `bundle`  - the edges' format: bundles in zstd blocks
 //!   * `edges`   - the edge files (per target region and frame), the global
 //!                 transfer table, the reader (`EdgeStore`)
-//!   * `layer`   - a set of states as per-region sorted (key, cell mask)
-//!                 entries: the frontier, the next layer, the frame files,
-//!                 the drop notes, the tree reader
+//!   * `set`     - THE ONE STATE SET: per region (key -> cell mask), indexed
+//!                 (the visited set, the next layer while a wave builds it)
+//!                 or frozen (the frontier, a frame read back)
+//!   * `layer`   - a frozen set with its skeletons (the frontier, the next
+//!                 layer), the frame files, the drop notes, the tree reader
 //!   * `decode`  - rows from (shape skeleton, key, cell)
 //!   * `bench`   - `--emit-capture` and `rewrite bench-storage`
 //!
@@ -28,6 +31,7 @@ pub mod decode;
 pub mod edges;
 pub mod layer;
 pub mod route;
+pub mod set;
 pub mod unit;
 pub mod visited;
 pub mod wave;

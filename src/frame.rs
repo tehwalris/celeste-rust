@@ -1459,7 +1459,6 @@ pub(crate) fn append_forward_stats(dir: &std::path::Path, row: &[(&str, String)]
 /// layer - the frontier a resume expands (skeletons in a search from
 /// `room`, if given). Each frame's regions in parallel.
 pub fn restore_visited(dir: &std::path::Path, last: u32, room: Option<(i16, i16)>, threads: usize) -> Result<(crate::storage::visited::VisitedSet, Option<u32>, Layer)> {
-    use std::sync::Mutex;
     let geo = crate::storage::GEOMETRY;
     let tree = crate::storage::layer::Tree::open(dir, last)?;
     let mut visited = crate::storage::visited::VisitedSet::new(geo);
@@ -1470,41 +1469,8 @@ pub fn restore_visited(dir: &std::path::Path, last: u32, room: Option<(i16, i16)
     let mut frontier = Layer::default();
     for f in 0..=last {
         let (layer, _) = tree.layer(f, if f == last { room } else { None }, threads)?;
-        let n_regions = layer.regions().count();
-        {
-            let tables = visited.tables_mut_vec();
-            let mut slots: Vec<(u32, std::ops::Range<usize>, Mutex<Option<&mut Option<Box<crate::storage::visited::RegionTable>>>>)> = Vec::with_capacity(n_regions);
-            let mut it = tables.iter_mut().enumerate();
-            for (region, rg) in layer.regions() {
-                let t = it.by_ref().find(|(i, _)| *i == region as usize).map(|x| x.1).ok_or_else(|| anyhow::anyhow!("{}: f{f}: region {region} of no shape", dir.display()))?;
-                slots.push((region, rg, Mutex::new(Some(t))));
-            }
-            let next = std::sync::atomic::AtomicUsize::new(0);
-            std::thread::scope(|scope| -> Result<()> {
-                let hs: Vec<_> = (0..threads.clamp(1, n_regions.max(1)))
-                    .map(|_| {
-                        let (slots, next, layer) = (&slots, &next, &layer);
-                        scope.spawn(move || -> Result<()> {
-                            loop {
-                                let k = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                let Some((region, rg, cell)) = slots.get(k) else { return Ok(()) };
-                                let t = cell.lock().expect("a region").take().expect("taken once").get_or_insert_with(Default::default);
-                                for e in rg.clone() {
-                                    let (key, mask) = layer.entry(e);
-                                    let x = match t.find(key) {
-                                        Some(x) => x,
-                                        None => t.push_key(geo.words, key),
-                                    };
-                                    anyhow::ensure!(t.or_cells(x, mask) & mask == 0, "{}: f{f}: a state of region {region} stored twice", dir.display());
-                                }
-                            }
-                        })
-                    })
-                    .collect();
-                hs.into_iter().map(|h| h.join().expect("a restore worker panicked")).collect::<Result<Vec<()>>>()?;
-                Ok(())
-            })?;
-        }
+        let held = visited.merge(&layer.set, threads)?;
+        anyhow::ensure!(held == 0, "{}: f{f}: {held} states stored twice", dir.display());
         if f == last {
             frontier = layer;
         }
