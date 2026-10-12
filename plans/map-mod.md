@@ -302,3 +302,33 @@ RAM, not disk or time, is the limit.
   pit within 10 frames (`--start-inputs` from it: refuted to +75, the
   forward empty by +10). The balloon (x >= 113 to touch, the only dash
   refill and the only way up into the right area) is not reached by f185.
+
+### Keys-only (develop 2ef9213, merged b8edfbe) and the room's geometry (2026-10-12)
+
+Keys-only memory: +105 from mid, f67 (365M rows in, 400M new) at 16 GB
+(~44 B a row in, against ~250 before). The +105 run was stopped at f67:
+the frames grew 9-10%/frame (f60 211M -> f67 400M) and project to ~2.5B a
+frame at its peak (~f87, ~20 min a frame, ~110 GB): over the RAM and ~10 h.
+
+Where the route has to go (tiles from the map; 17/27/43/59 are the
+up/down/left/right-facing spikes, non-solid):
+- The exit (row 0, cols 9-11, down-spikes) is reached only from the
+  exit chamber (cols 10-11, rows 1-3), which opens only right, along the
+  row-3 corridor (y 24-31, x 80-127; down-spikes above at row 2 cols 12-15,
+  up-spikes below at row 4 cols 9-15).
+- The corridor is reached only from below, through row 4's up-spikes
+  (safe moving up) and row 5's one gap, col 12 (x 96-103, y 40-47), from
+  the RIGHT SHAFT (rows 6-12, cols 11-15: x 88-127, y 48-103; its left side
+  col 10 left-facing spikes over the solid col 9).
+- The shaft is reached only from the PIT (rows 14-15, cols 12-15, no floor:
+  falling out is death) through col 15 at row 13 (x 120-127, y 104-111).
+  The pit holds the balloon (x 120, y 112; touched at player x >= 113,
+  y 104-117) - the only dash refill on the right.
+- The pit is reached from the mid area only through the STRIP (row 14,
+  cols 10-11: up-spikes, ceiling above at y <= 111, floor below): player y
+  109-110 or moving up - a dash along the ceiling.
+So: strip (dash) -> pit -> balloon -> up into the shaft -> up 56+ px to the
+gap -> corridor -> left -> up through the exit spikes. Measured: the
+earliest strip crossing from the load is f157, its dash spent, ~1.4-1.55
+px/frame right and falling: it reaches x ~107 at y ~126 (dead), short of
+the balloon's x 113.
