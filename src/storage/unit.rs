@@ -760,22 +760,30 @@ impl<'a> UnitSink<'a> {
             if self.src_regions.last() != Some(&(route, t.s_region[i])) {
                 self.src_regions.push((route, t.s_region[i]));
             }
-            self.xfer_counts[xfers[i] as usize] += 1;
             let b = (route, e.keys[i], t.src[i], xfers[i], t.offset[i]);
             match &mut pending {
                 Some(p) if (p.0, p.1, p.2, p.3, p.4) == b => p.5 |= 1u64 << t.local[i],
                 _ => {
                     if let Some((r, k, s, x, o, m)) = pending {
-                        self.bundles.insert(r, k, s, x, o, m);
+                        self.bundle(r, k, s, x, o, m);
                     }
                     pending = Some((b.0, b.1, b.2, b.3, b.4, 1u64 << t.local[i]));
                 }
             }
         }
         if let Some((r, k, s, x, o, m)) = pending {
-            self.bundles.insert(r, k, s, x, o, m);
+            self.bundle(r, k, s, x, o, m);
         }
         Ok(())
+    }
+
+    /// The edges `m` (target cells) of bundle `(route, t_key; source s,
+    /// transfer x, offset o)` into the unit's bundles, counted for their
+    /// transfer.
+    #[inline]
+    fn bundle(&mut self, route: u32, t_key: Key, s: u32, x: u32, o: u32, m: u64) {
+        self.xfer_counts[x as usize] += m.count_ones() as u64;
+        self.bundles.insert(route, t_key, s, x, o, m);
     }
 
     /// `--key-check` of the rows in `check[i]`: each one's key is the
