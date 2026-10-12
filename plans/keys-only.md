@@ -195,6 +195,13 @@ decoder kept as the test reference (~110), the `[wavemem]` accounting
   run (fmp, `--prune-rect`): every `[gate]` line (W at every frame, the
   support, the optimum) and every frame's in/raw/kept counts identical to
   develop's runs; the fm f68 -> f69 frame's f/e lines identical.
+- The one set (c2325d2..fc6130b): t0 215/215, t1, t2 and big ok; every
+  fixture's f/e lines the pins (the metrics re-pinned for the slices and
+  edge bytes only: fc6130b); `gates/raise.sh` OK; room (1,0) r0sx to f56
+  at 3 and 32 threads and resumed, and room (4,2) r0sxhn level -1 71,5 to
+  f61 likewise: frame files, edge files, drop notes and pos graph
+  byte-identical, ckhash the r42n pin; the mod room's fmp95: every
+  `[gate]` line and every frame's counts identical; the A/B pairs below.
 - `export-ui` of a search (the gate's, `--save-marks`): the frames' and the
   marks' binaries byte-identical to develop's; run.json the same but its
   timings and the renamed `in_entries`/`out_entries`.
@@ -224,18 +231,64 @@ baselines. The develop mod runs (fm85, fmp95) ran on 2026-10-11 under
 other agents' load (30-65); ours on 2026-10-12 beside our own checks: walls
 are indicative, memory and sizes are not load-dependent.
 
+**The one state set** (c2325d2..ef93c48 against 2ef9213, the first
+keys-only build; interleaved, 2 rounds, at load 21-33 - another agent's
+14-thread mod search beside it - so walls are good to ~5%). Bytes as
+allocated (`bench-frame`'s load line, the `[fwd]` line's `visited`):
+
+| | visited set: B a state (an entry) | frontier: B a state (an entry) | max RSS |
+|---|---|---|---|
+| the reference frame (6,2) 100% f56: 36.9M visited (1.84M entries), 5.86M rows in (576k) | 2.2 -> 1.05 (21) | 2.36 -> 1.37 (13.9) | 2.32-2.33 -> 1.88-1.91 GB (`bench-frame`: two visited copies) |
+| the mod room's fmp f76: 5.98B visited (345M entries), 348M rows in (19.4M) | 2.74 -> 1.34 (23.2) | 1.88 -> 0.95 (17) | 37.4 -> 20.9-21.0 GB (the same) |
+| room (1,0) `--ceiling 99`, f99 (213M visited) | 2.2 -> 0.94 | | 2.15 -> 1.65-1.68 GB |
+| room (6,2) 100% `r0sxhf,r0sxh --ceiling 94`, f94 (315M visited) | 2.0 -> 0.92 | | 3.86-3.88 -> 2.94-3.04 GB |
+| the mod room's +95 run (fmp95), f077 / f090 | 17.3 -> 8.34 GB / 22.4 -> 11.0 GB (1.32 / 1.24 B a state) | | 20.91 -> 13.66 GB |
+
+At the same speed or faster: the reference frame's wave 3727-3977 ->
+3439-3898 ms, its frame 3991-4217 -> 3694-4162 ms (the region phase's
+worker time 6.1-7.8 -> 4.6-5.4 s); the mod room's fmp f76 -> f77
+(`bench-frame`) wave 154.8 / 165.6 -> 134.8 / 142.1 s, frame 187.7 /
+207.2 -> 143.3 / 150.1 s (the region phase 648 / 784 -> 244 / 316
+worker-s: the encoder's arrays were its region's size); room (1,0)'s
+forward 133.7 / 139.5 -> 137.0 / 136.5 s, its backward 2.9 / 3.2 -> 3.2 /
+3.2 s; room (6,2)'s level-0 forward 211.8 / 207.5 -> 211.6 / 213.7 s,
+backward 1.9 / 1.8 -> 1.9 / 1.7 s. Trees: room (1,0) 570 -> 593 MB, room
+(6,2) 1.85 -> 1.84 GB, fmp 16 GB both (the 256k slices: more, smaller
+segments; edges +4% on room (1,0), -4% on the mod room).
+
+The 256k slices cost the BACKWARD at first: 2.3x the segments (fmp95:
+150k -> 348k decoded), and its read walked each segment's targets
+against the region's whole group of changed targets, one by one - 26% of
+the mod room's backward CPU (perf). Galloping through the group
+(ef93c48, `arc_dp::seek`), `bench-backward` W f86 of h95 on both
+slicings' fmp trees (fc6130b against ef93c48, 2 interleaved rounds, load
+22-25): the read of f87-f91 96.2 -> 58.4-59.4 s on the 256k-slice tree
+and 73.5-74.5 -> 60.6-63.2 s on the 1M one; f86's read 23.6-24.2 ->
+12.4-12.7 s (256k) and 15.8-16.4 -> 12.7-13.2 s (1M); the push down to
+f87 145.7 -> 108.3 s (256k), 122-126 -> 111-115 s (1M); W f086
+identical in all eight. So the slices cost the backward nothing now, and
+its read is faster than before them.
+
+Every pair: the same f/e lines, `[gate]` lines, optima and witnesses;
+the known routes survive (`--prefer`); fmp95's per-frame counts
+identical.
+
 **The mod room, the +95 run** (fmp: r0sxhe from the mid state, level -1
 95, `--prune-rect`; 7.98B states, 248G emissions):
 
-| frame | rows in | develop rss start / wave / peak (GB) | keys only rss start / wave / peak (GB) | frame (s), develop / keys only |
-|---|---|---|---|---|
-| f050 | 65M | 8.7 / 19.6 / 20.2 | 2.6 / 4.5 / 5.5 | 27.0 / 27.8 |
-| f060 | 178M | 22.3 / 45.0 / 47.2 | 5.6 / 8.6 / 10.5 | 63.5 / 58.9 |
-| f070 | 242M | 33.0 / 56.4 / 56.6 | 9.9 / 12.8 / 14.6 | 75.4 / 62.1 |
-| f075 | 329M | 43.4 / 73.6 / 75.1 | 12.5 / 16.5 / 19.1 | 114.0 / 84.1 |
-| f077 | 348M | 46.4 / 77.3 / 78.1 | 13.9 / 18.1 / 20.6 | 118.9 / 87.3 |
-| f080 | 315M | 44.8 / 68.5 / 79.1 | 15.3 / 18.2 / 20.6 | 76.5 / 60.5 |
-| f090 | 118M | 29.2 / 38.6 / 79.1 | 18.0 / 19.1 / 20.9 | 24.6 / 19.2 |
+| frame | rows in | develop rss start / wave / peak (GB) | keys only | the one set | frame (s), develop / keys only |
+|---|---|---|---|---|---|
+| f050 | 65M | 8.7 / 19.6 / 20.2 | 2.6 / 4.5 / 5.5 | 1.9 / 3.9 / 4.9 | 27.0 / 27.8 |
+| f060 | 178M | 22.3 / 45.0 / 47.2 | 5.6 / 8.6 / 10.5 | 3.9 / 6.7 / 6.9 | 63.5 / 58.9 |
+| f070 | 242M | 33.0 / 56.4 / 56.6 | 9.9 / 12.8 / 14.6 | 6.8 / 9.3 / 9.7 | 75.4 / 62.1 |
+| f075 | 329M | 43.4 / 73.6 / 75.1 | 12.5 / 16.5 / 19.1 | 8.7 / 11.6 / 12.1 | 114.0 / 84.1 |
+| f077 | 348M | 46.4 / 77.3 / 78.1 | 13.9 / 18.1 / 20.6 | 9.5 / 12.4 / 12.6 | 118.9 / 87.3 |
+| f080 | 315M | 44.8 / 68.5 / 79.1 | 15.3 / 18.2 / 20.6 | 10.4 / 12.6 / 13.0 | 76.5 / 60.5 |
+| f090 | 118M | 29.2 / 38.6 / 79.1 | 18.0 / 19.1 / 20.9 | 12.1 / 13.4 / 13.7 | 24.6 / 19.2 |
+
+(The peak is the process's so far: the one set's f050 is the level -1
+table's build. The one set's frames ran at load ~31 beside another
+agent's search: their walls are not comparable, see below.)
 
 Whole run: peak 79.05 -> 20.91 GB; forward 2830 -> 2454 s, backward 335 ->
 341 s, search 3248 -> 2798 s; the arc phase's anonymous peak 21.1 -> 13.1
@@ -284,32 +337,35 @@ decode of 156M new states, the seal, the edge file) 1.2 s against develop's
 
 **What the mod room's exit can reach now** (plans/map-mod.md's projection,
 r0sxhne counts: states S(H) of a search to the exit at H and its peak
-frame P(H); its RAM column was develop's ~290 B a row in). Keys only, from
-fmp: the visited set ~2.2 B a state resident (2.7 allocated; at the peak
-frame ~80% of S(H) is visited), the frame's rest ~3.5 GB of
-slice-bounded buffers plus ~9 B a row in:
+frame P(H); its RAM column was develop's ~290 B a row in). From fmp95: the
+first keys-only build held the visited set at ~2.2 B a state resident
+(2.7 allocated) and the frame's rest at ~3.5 GB plus ~9 B a row in; the
+one set holds it at 1.24-1.32 B a state (allocated = resident) and the
+rest at ~2.6 GB plus ~4 B a row in. The peak is the larger of the peak
+frame's (~80% of S(H) visited) and the last frames' (all of it):
 
-| H | S(H) | P(H) | develop: wave memory | keys only: peak (est.) | disk (~2 B a state) | forward / backward |
-|---|---|---|---|---|---|---|
-| 205 | 7.3B | 319M | 117 GB | ~19 GB | ~15 GB | 1.4 / 1.1 h |
-| 210 | 11.3B | 497M | 181 GB | ~28 GB | ~23 GB | 2.1 / 1.8 h |
-| 220 | 27B | 1.2B | 437 GB | ~62 GB | ~54 GB | 5 / 4.2 h |
-| ~225 | ~42B | ~1.9B | - | ~95 GB | ~85 GB | ~8 / ~7 h |
+| H | S(H) | P(H) | develop: wave memory | keys only: peak (est.) | the one set: peak (est.) | disk (~2 B a state) | forward / backward |
+|---|---|---|---|---|---|---|---|
+| 205 | 7.3B | 319M | 117 GB | ~19 GB | ~12 GB | ~15 GB | 1.4 / 1.1 h |
+| 210 | 11.3B | 497M | 181 GB | ~28 GB | ~17 GB | ~23 GB | 2.1 / 1.8 h |
+| 220 | 27B | 1.2B | 437 GB | ~62 GB | ~38 GB | ~54 GB | 5 / 4.2 h |
+| ~225 | ~42B | ~1.9B | - | ~95 GB | ~58 GB | ~85 GB | ~8 / ~7 h |
 
-So RAM no longer stops the forward near H 203: it fits to H ~222-225 on
-this machine (110 GB less headroom), and past H ~210 the WALL is the
-limit (hours a run). What binds next is the visited set itself (2.2-2.7 B a
-state: key 16 B, mask 8 B and index ~8 B an entry). The projection's big
-uncertainty is S(H) past f152 (map-mod.md: extrapolated at +9%/frame).
+So RAM no longer stops the forward near H 203: the first keys-only build
+fit to H ~222-225 on this machine (110 GB less headroom), the one set to
+H ~230 (S ~80B at +9% a frame), and past H ~210 the WALL is the limit
+(hours a run). The backward's sweep (fmp95: 12.5 GB anonymous, the
+forward's peak 13.7) is now as large as the forward; how it scales with H
+is not measured. The projection's big uncertainty is S(H) past f152
+(map-mod.md: extrapolated at +9%/frame).
 
 ## Follow-ups (not built)
 
-- **The visited set** is now what RAM buys: a u64 key where a shape's key
-  fits in 64 bits (8 B an entry less; the mod room's keys reach 66 bits
-  at f66, so a per-shape choice), and less index slack.
-- **Smaller slices** (`SLICE_LANES` 1M -> 256k): the chunks in flight and
-  the region jobs' buffers scale with a slice (~2 GB of the mod room's
-  frame peak), at the cost of more, smaller segments in the edge files.
+- **The visited set** is still most of the forward's peak (1.24-1.32 B a
+  state at the mod room: a 9 B key, the 8 B mask and ~5.6 B of index an
+  entry of ~17 states).
+- **The backward's sweep** (fmp95: 12.5 GB anonymous) now matches the
+  forward's peak.
 - **The drop notes** (32 B a note, held to the frame's end): per unit
   sorted and delta-coded they would take a few bytes.
 - **Decode in the kernel prologue** (the ABI unchanged for now).
