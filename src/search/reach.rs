@@ -18,7 +18,8 @@
 //! it is reached (in batches of `BATCH` sources from its layer's target
 //! blocks, `arc_dp::out_edges`), and kept as `(target, transfer)` numbers
 //! (8 B an edge): decoding them again every frame made a frame cost grow
-//! with the reach (bal200: 219 s at f143). The pushes are merged per target.
+//! with the reach (219 s a frame on a 13B-state tree). The pushes are merged
+//! per target.
 //!
 //! A target's set past `MAX_SEGS` x segments (a cloud of the remainders
 //! many paths leave) is COARSENED: its pieces snapped outward to the
@@ -45,15 +46,16 @@ const TARGET_CHUNK: usize = 16;
 
 /// The most x segments a reached set keeps exactly (far below a `Region`'s
 /// 65535: the sets are clouds of the remainders many paths leave, ~10 B a
-/// segment, and bal200's frames hold millions of states - 16384 took 53 GB
-/// by f164).
+/// segment, and a big tree's frames hold millions of states - 16384 took
+/// 53 GB by f164 of a 13B-state tree).
 const MAX_SEGS: usize = 1 << 10;
 
 /// The most segments a state's first-arrival union keeps (coarsened past
 /// it like a reached set): held for every state ever reached, it is most
-/// of the memory (1024 segments: 15 GB by bal200's f140). Coarser, it
-/// grows less often: the entries counted are a LOWER bound (every one is
-/// a real growth), the frames a state is reached at the upper.
+/// of the memory (1024 segments: 15 GB by f140 of a 13B-state tree).
+/// Coarser, it grows less often: the entries counted are a LOWER bound
+/// (every one is a real growth), the frames a state is reached at the
+/// upper.
 const ACC_SEGS: usize = 32;
 
 /// One frame's exact reach, summed.
