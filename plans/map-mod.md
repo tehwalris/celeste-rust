@@ -367,3 +367,18 @@ Checked exactly: the 252 crossings of f157-160 (20 distinct states by
 position, speed, remainder, djump) - `--start-inputs` each, `--win-at
 113..127,100..120` (the balloon), +20: all 20 REFUTED (7-16 s each; what
 survives to +20 is the respawn after the death).
+
+The minimal cart's mechanics against the original (the mod's Lua is the
+original's; `p8cart.luadiff` of lua/celeste-minimal.lua against it):
+every refill is there - the spring (`hit.djump=max_djump`), the balloon,
+the strawberry and the fly fruit, the orb (max_djump 2) - in the same
+order within the frame; the player's update differs only by the dropped
+jump buffer (a press is replayed at its firing frame: reachability is the
+same), the smoke/sound/shake/hair/sprite code (no object reads it), and
+the tracer's rewrites of `obj.move` (`flr(r + 0.5)` as `__split_by_flr`
+of `r + 0.5`, the same numbers); `_update` skips `move(0, 0)` (a no-op).
+The strawberries refill the dash but all three are on the left (x 16 and
+40); the room's other refill sources (the spring at (48,96)) are left of
+the strip too. Wall jumps: the only wall near the strip is the left pit's
+left side (col 5, x 40-47): a kick of 2 px/frame right, 25+ px short of the
+strip. So nothing the minimal cart lacks changes the strip argument.
