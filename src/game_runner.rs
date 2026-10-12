@@ -38,7 +38,11 @@ pub fn apply_start_room(game_lua: &str, s: &crate::settings::Settings) -> Result
     let (x, y) = s.room;
     // The orb sets `max_djump=2` for the rest of the game; a later room
     // must start as a play-through reaches it, with the orb taken.
-    let orb = if level_index(x, y) > ORB_LEVEL && !s.gemskip { "max_djump=2 " } else { "" };
+    let orb = match s.max_djump {
+        Some(d) => format!("max_djump={d} "),
+        None if level_index(x, y) > ORB_LEVEL && !s.gemskip => "max_djump=2 ".to_string(),
+        None => String::new(),
+    };
     Ok(game_lua.replacen(PAT, &format!("{}load_room({}, {})", orb, x, y), 1))
 }
 
@@ -58,6 +62,14 @@ mod tests {
     fn apply_start_room_is_identity_for_default_room() {
         let src = "function _init()\n\tload_room(1, 0)\nend\n";
         assert_eq!(apply_start_room(src, &Default::default()).unwrap(), src);
+    }
+
+    /// `--max-djump` overrides the game's dashes in any room.
+    #[test]
+    fn max_djump_overrides_the_start_rooms_dashes() {
+        let src = "function _init()\n\tload_room(1, 0)\nend\n";
+        let s = crate::settings::Settings { room: (0, 0), max_djump: Some(2), ..Default::default() };
+        assert!(apply_start_room(src, &s).unwrap().contains("max_djump=2 load_room(0, 0)"));
     }
 
     /// A room past the orb's starts with the second dash; the orb's room and

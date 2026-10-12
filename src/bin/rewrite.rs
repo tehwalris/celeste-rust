@@ -132,6 +132,24 @@ enum Command {
     /// the arc phase rerun over `<checkpoint-dir>/level{i:02}` as `search`
     /// runs it, without the concrete search. Exits non-zero on the first
     /// check that drops it, with the step, the node and the state.
+    /// Every tree state whose player cell lies in a rectangle, frames FROM
+    /// to TO, decoded: per frame the count of each value of the fields
+    /// named by `--field` substrings (e.g. `djump`, `balloon`): what the
+    /// forward ever held there (a superset of the game's states).
+    ScanRect {
+        #[arg(long)]
+        level_dir: String,
+        #[arg(long)]
+        from: u32,
+        #[arg(long)]
+        to: u32,
+        /// "x0..x1,y0..y1", inclusive.
+        #[arg(long, allow_hyphen_values = true)]
+        rect: String,
+        /// Field-name substrings to tally (every field whose name holds one).
+        #[arg(long, num_args = 1.., required = true)]
+        field: Vec<String>,
+    },
     /// EXACT-REMAINDER REACH over a finished tree's edges (search::reach):
     /// from the start at its exact remainder, every frame's reached states
     /// pushed along their out-edges through the transfers - the arc phase's
@@ -989,6 +1007,35 @@ fn main() -> Result<()> {
                     }
                 }
                 None => println!("beam: no route within {max_frames} frames (proves nothing)"),
+            }
+        }
+        Command::ScanRect { level_dir, from, to, rect, field } => {
+            use celeste_rust::search::pos_graph::cell_xy;
+            let (x, y) = rect.split_once(',').ok_or_else(|| anyhow::anyhow!("--rect x0..x1,y0..y1"))?;
+            let range = |t: &str| -> Result<(i32, i32)> {
+                let (a, b) = t.split_once("..").ok_or_else(|| anyhow::anyhow!("--rect x0..x1,y0..y1"))?;
+                Ok((a.trim().parse()?, b.trim().parse()?))
+            };
+            let ((x0, x1), (y0, y1)) = (range(x)?, range(y)?);
+            let dir = std::path::Path::new(&level_dir);
+            let tree = tree_of(dir)?;
+            let geo = celeste_rust::storage::GEOMETRY;
+            let inside = |s: celeste_rust::storage::Sk| cell_xy(s.cell(&geo)).is_some_and(|(cx, cy)| (x0..=x1).contains(&cx) && (y0..=y1).contains(&cy));
+            for f in from..=to.min(tree.last) {
+                let mut tally: std::collections::BTreeMap<String, u64> = Default::default();
+                let mut n = 0u64;
+                for (_, rt2) in tree.rows(f, &cfg, 1 << 16, &inside, cfg.threads())? {
+                    for p in celeste_rust::search::inspect::project_all(&rt2) {
+                        n += 1;
+                        let mut key: Vec<String> = p.iter().filter(|(k, _)| field.iter().any(|w| k.contains(w.as_str()))).map(|(k, v)| format!("{k}={v}")).collect();
+                        key.sort();
+                        *tally.entry(key.join(" ")).or_default() += 1;
+                    }
+                }
+                println!("f{f:03}: {n} states in the rect");
+                for (k, c) in &tally {
+                    println!("  {c:>10}  {k}");
+                }
             }
         }
         Command::Reach { checkpoint_dir, level_index, to, save_marks, cells, decode_rect } => {

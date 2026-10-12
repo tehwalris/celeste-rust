@@ -67,6 +67,10 @@ pub struct Settings {
     /// of these `(x0, x1, y0, y1)` (inclusive) is dropped at emission. NOT
     /// sound: a search under it proves nothing (`is_heuristic`).
     pub prune_rects: Vec<(i16, i16, i16, i16)>,
+    /// The start room's dashes (`--max-djump`; `None`: the game's own, 2
+    /// past the orb's level unless gemskip). A map mod played with a TAS
+    /// tool's dash override (Celia's +/-) is another game.
+    pub max_djump: Option<u8>,
     // NOT recorded.
     /// The level -1 filter `(H, S)`, H in search steps (`--level-minus-one`;
     /// the tree records it as `TreeFilter`).
@@ -143,6 +147,7 @@ impl Default for Settings {
             cart: None,
             start_inputs: None,
             prune_rects: Vec::new(),
+            max_djump: None,
             level_minus_one: None,
             concrete_balloon_seeds: None,
             threads: None,
@@ -222,6 +227,7 @@ impl Settings {
         let cart = self.cart.as_ref().map(|c| ("cart", format!("sha256:{}", c.sha256)));
         let start = self.start_inputs.as_ref().map(|v| ("start_inputs", v.iter().map(|b| b.to_string()).collect::<Vec<_>>().join(",")));
         let prune = (!self.prune_rects.is_empty()).then(|| ("prune_rects", self.prune_rects.iter().map(|(x0, x1, y0, y1)| format!("{x0}..{x1},{y0}..{y1}")).collect::<Vec<_>>().join(";")));
+        let dashes = self.max_djump.map(|d| ("max_djump", d.to_string()));
         vec![
             ("room", format!("{},{}", self.room.0, self.room.1)),
             ("win_at", opt(self.win_at.map(|(x0, x1, y0, y1)| format!("{x0}..{x1},{y0}..{y1}")))),
@@ -239,6 +245,7 @@ impl Settings {
         .chain(cart)
         .chain(start)
         .chain(prune)
+        .chain(dashes)
         .collect()
     }
 
@@ -417,6 +424,11 @@ pub struct SettingsArgs {
     /// nothing (they say so). The tree records it.
     #[arg(long, global = true, value_parser = parse_win_at, allow_hyphen_values = true)]
     pub prune_rect: Vec<(i16, i16, i16, i16)>,
+    /// The start room's dashes (max_djump), overriding the game's (1 before
+    /// the orb's level): a TAS tool's dash override (Celia's +/-) is another
+    /// game. The tree records it.
+    #[arg(long, global = true)]
+    pub max_djump: Option<u8>,
     /// The balloons' phases of the concrete phase only (a tasdatabase file's
     /// seeds): the witness is one real run under them.
     #[arg(long, global = true)]
@@ -508,6 +520,7 @@ impl SettingsArgs {
             cart,
             start_inputs,
             prune_rects: self.prune_rect.clone(),
+            max_djump: self.max_djump,
             level_minus_one,
             concrete_balloon_seeds: self.concrete_balloon_seeds.clone(),
             threads: self.threads,
@@ -624,6 +637,7 @@ pub fn startup(args: &SettingsArgs, adjust: impl FnOnce(&mut Settings)) -> Resul
     note("--loading-jank ", s.loading_jank.is_some(), format!("{}", s.loading_jank.unwrap_or_default()));
     note("--balloon-seeds ", s.balloon_seeds.is_some(), s.balloon_seeds.clone().unwrap_or_default());
     note("--prune-rect (HEURISTIC, NOT A PROOF) ", !s.prune_rects.is_empty(), format!("{:?}", s.prune_rects));
+    note("--max-djump ", s.max_djump.is_some(), s.max_djump.map_or(String::new(), |d| d.to_string()));
     note("--start-inputs ", s.start_inputs.is_some(), format!("({} inputs)", s.start_inputs.as_ref().map_or(0, Vec::len)));
     note("--cart ", s.cart.is_some(), s.cart.as_ref().map_or(String::new(), |c| format!("{} (sha256 {})", c.path.display(), c.sha256)));
     note("--concrete-balloon-seeds ", s.concrete_balloon_seeds.is_some(), s.concrete_balloon_seeds.clone().unwrap_or_default());
