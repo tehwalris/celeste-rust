@@ -112,12 +112,15 @@ pub struct RouteState {
     /// A raise's cells new this frame per entry: a hit on a cell the tree
     /// held needs its layer, one the raise just made has none.
     fresh_raise: Option<FxHashMap<u32, u64>>,
-    /// Bundles into provisional targets: encoded at the frame's end, their
-    /// keys final.
-    pub prov: Vec<Bundle>,
-    /// Its segments with their slices: jobs of a route may run out of
-    /// slice order; the file has them in it (`seal`).
-    pub segs: Vec<(u32, Segment)>,
+    /// Bundles into provisional targets, per job (slice) a segment
+    /// encoded with their provisional keys: encoded again at the frame's
+    /// end with their final keys. Held as zstd blocks, not bundles: the
+    /// mod room's f53 (+95) held 103M of them, 5.8 GB as structs.
+    pub prov: Vec<(u32, Segment)>,
+    /// Its segments with their kind (0: a job's, 1: a job's provisional
+    /// bundles made final) and slice: jobs of a route may run out of slice
+    /// order; the file has them in this one (`seal`).
+    pub segs: Vec<((u8, u32), Segment)>,
     /// The source regions its edges leave.
     pub sources: FxHashSet<u32>,
     /// Records taken (emissions) and new states found; the dedup's
@@ -324,6 +327,8 @@ impl UnitBundles {
 /// sources' indices, the route's source list, its edges as the encoder
 /// takes them, the encoder, the raw block, zstd.
 pub struct Scratch {
+    /// The job's bundles into provisional targets.
+    prov: Vec<Bundle>,
     e_of: Vec<u32>,
     s_of: Vec<u32>,
     s_idx: rustc_hash2::FxHashMap<(u32, Key), u32>,
@@ -344,6 +349,9 @@ impl Scratch {
     /// Its buffers back to `SCRATCH_KEEP` bundles' room after a job that
     /// grew them past it.
     fn bound(&mut self) {
+        if self.prov.capacity() > SCRATCH_KEEP {
+            self.prov = Vec::new();
+        }
         if self.tbs.capacity() > SCRATCH_KEEP {
             self.tbs = Vec::with_capacity(SCRATCH_KEEP);
             self.raw = Vec::new();
@@ -358,7 +366,7 @@ impl Scratch {
     /// Bytes its buffers hold (`--phases`' `[wavemem]`): the job's
     /// bundles, the encoder's, the raw block, the rest.
     pub fn alloc_bytes(&self) -> [usize; 4] {
-        [std::mem::size_of::<bundle::Tb>() * self.tbs.capacity(), self.enc.alloc_bytes(), self.raw.capacity(), 4 * (self.e_of.capacity() + self.s_of.capacity()) + 32 * self.s_idx.capacity() + 24 * self.s_list.capacity()]
+        [std::mem::size_of::<bundle::Tb>() * self.tbs.capacity() + std::mem::size_of::<Bundle>() * self.prov.capacity(), self.enc.alloc_bytes(), self.raw.capacity(), 4 * (self.e_of.capacity() + self.s_of.capacity()) + 32 * self.s_idx.capacity() + 24 * self.s_list.capacity()]
     }
 }
 
@@ -372,13 +380,14 @@ impl Chunk {
 impl RouteState {
     /// Bytes its new-cell slots, provisional bundles and segments hold.
     pub fn alloc_bytes(&self) -> [usize; 3] {
-        [12 * self.fresh.capacity() + 24 * self.fresh_raise.as_ref().map_or(0, |m| m.capacity()), std::mem::size_of::<Bundle>() * self.prov.capacity(), self.segs.iter().map(|s| s.1.bytes.capacity()).sum::<usize>()]
+        [12 * self.fresh.capacity() + 24 * self.fresh_raise.as_ref().map_or(0, |m| m.capacity()), self.prov.iter().map(|s| s.1.bytes.capacity()).sum::<usize>(), self.segs.iter().map(|s| s.1.bytes.capacity()).sum::<usize>()]
     }
 }
 
 impl Default for Scratch {
     fn default() -> Self {
         Scratch {
+            prov: Vec::new(),
             e_of: Vec::new(),
             s_of: Vec::new(),
             s_idx: Default::default(),
@@ -459,7 +468,7 @@ pub fn run_route(st: &mut RouteState, slice: u32, chunks: &[&Chunk], cx: &Region
             let e = sc.e_of[b.t as usize];
             if e == PROV {
                 let (s_shape, s_key) = c.sources[b.s as usize];
-                st.prov.push(Bundle { s_shape, s_key, x, o: b.o, t_key: c.targets[b.t as usize].0, mask: b.mask });
+                sc.prov.push(Bundle { s_shape, s_key, x, o: b.o, t_key: c.targets[b.t as usize].0, mask: b.mask });
                 continue;
             }
             let s = match sc.s_of[b.s as usize] {
@@ -482,7 +491,11 @@ pub fn run_route(st: &mut RouteState, slice: u32, chunks: &[&Chunk], cx: &Region
         let table = &st.table;
         sc.enc.encode(&sc.tbs, table.len(), |e| table.key(e), &sc.s_list, &mut sc.raw);
         let region = st.region.unwrap_or(u32::MAX);
-        st.segs.push((slice, Segment::of_raw(region, &sc.raw, sc.tbs.len() as u32, sc.tbs.iter().map(|t| t.mask.count_ones() as u64).sum(), &mut sc.z)?));
+        st.segs.push(((0, slice), Segment::of_raw(region, &sc.raw, sc.tbs.len() as u32, sc.tbs.iter().map(|t| t.mask.count_ones() as u64).sum(), &mut sc.z)?));
+    }
+    if !sc.prov.is_empty() {
+        st.prov.push((slice, Segment::encode(u32::MAX, &mut sc.prov, &mut sc.raw, &mut sc.z)?));
+        sc.prov.clear();
     }
     sc.bound();
     Ok(())
@@ -501,7 +514,6 @@ pub struct Sealed {
 /// layer's order), the bundles into provisional targets encoded.
 pub fn seal(st: &mut RouteState, region: u32, finals: &FxHashMap<Key, Key>, sc: &mut Scratch) -> Result<Sealed> {
     st.region = Some(region);
-    st.segs.sort_unstable_by_key(|s| s.0);
     for seg in &mut st.segs {
         seg.1.region = region;
     }
@@ -520,13 +532,28 @@ pub fn seal(st: &mut RouteState, region: u32, finals: &FxHashMap<Key, Key>, sc: 
         }
     }
     new.sort_unstable_by_key(|x| x.0);
-    if !st.prov.is_empty() {
-        let mut v: Vec<Bundle> = std::mem::take(&mut st.prov);
-        for b in &mut v {
-            b.t_key = *finals.get(&b.t_key).ok_or_else(|| anyhow::anyhow!("a provisional target key without its final key"))?;
-        }
-        st.segs.push((u32::MAX, Segment::encode(region, &mut v, &mut sc.raw, &mut sc.z)?));
+    // Each job's bundles into provisional targets, decoded and encoded
+    // again with the final keys (a segment a job, as it was made).
+    let mut dz = zstd::bulk::Decompressor::new()?;
+    let mut raw: Vec<u8> = Vec::new();
+    for (slice, seg) in std::mem::take(&mut st.prov) {
+        bundle::decompress(&seg.bytes, seg.raw as usize, &mut dz, &mut raw)?;
+        let mut v: Vec<Bundle> = Vec::with_capacity(seg.bundles as usize);
+        let mut missing = false;
+        bundle::Block::open(&raw, &bundle::ORDER)?.bundles(|mut b| match finals.get(&b.t_key) {
+            Some(&k) => {
+                b.t_key = k;
+                v.push(b);
+            }
+            None => missing = true,
+        })?;
+        ensure!(!missing, "a provisional target key without its final key");
+        ensure!(v.len() == seg.bundles as usize, "a provisional segment of {} bundles decoded to {}", seg.bundles, v.len());
+        st.segs.push(((1, slice), Segment::encode(region, &mut v, &mut sc.raw, &mut sc.z)?));
     }
+    // The file's order: the jobs' segments by slice, then the provisional
+    // ones by slice (one job a (route, slice): the keys are distinct).
+    st.segs.sort_unstable_by_key(|s| s.0);
     st.fresh_raise = None;
     Ok(Sealed { region, keys: new.iter().map(|x| x.0).collect(), masks: new.iter().map(|x| x.1).collect() })
 }
