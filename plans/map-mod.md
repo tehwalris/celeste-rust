@@ -425,7 +425,7 @@ For an exact-remainder forward (the coordinator's question; `summary.txt`,
 `rem_stats.tsv`, `reach.tsv` in bal200-reach):
 - The sets are small clouds: per axis 5-64 segments for 27-60% of the
   states, 1 segment for 15-47%; a single point or a span <= 1/256 of the
-  circle (1/256 px) for 99%+ of the EXACT states at f100, f143, f165, f185
+  circle (1/256 px) for 98.7%+ of the EXACT states at f100, f143, f165, f185
   and f200. The wide ones (> 1/256: 33-60% of all states by f185-200) are
   the coarsened (<= 0.4% of the exact ones).
 - First arrival in (state, remainder) - a state expanded again whenever
