@@ -143,18 +143,24 @@ Not part of any tier: run them when their reason applies.
 built by a pinned command and checked against its pinned fingerprint
 (`gates/fixtures/NAME.ckhash`: `ckhash --edges`, and `--dropped` under level
 -1, through its last frame). A manifest records the spec, the file formats,
-the slice size and the sources. `ensure` rebuilds a fixture whose spec,
-file formats or slice size changed (loudly: `STALE fixture ...
+the transfer table's order and the sources. `ensure` rebuilds a fixture
+whose spec, file formats or table order changed (loudly: `STALE fixture ...
 REBUILDING`); one built from other sources is reported, not rebuilt: a
 fixture is an INPUT pinned by its fingerprint, and a change to the
-forward shows in the frame checks and in t2's full-room gates. The
-fingerprint is canonical but the tree's transfer ids (`xfer.bin`) are in
-discovery order, which the slices set: a fixture cut by another slice
-size gives a frame check other edge bytes (2026-10-12, 1M -> 256k: -0.04
-to -1.3%). Another change to the discovery order (the units, the jobs)
-does the same: rebuild the fixtures (`tools/fixtures.sh build all`)
-before re-pinning edge bytes. When a deliberate change moves a fixture's own
-frames, `tools/fixtures.sh pin NAME` rebuilds it and re-pins.
+forward shows in the frame checks and in t2's full-room gates. A frame
+check encodes the fixture's transfers by their ids, so its edge bytes
+follow the fixture's `xfer.bin`; since branch `emit-batch` (2026-10-12)
+the ids are CANONICAL (a frame's new transfers numbered by their edges
+in the frame, then content: `edges::XferTable::canonical`), so the table
+is a function of the search, not of the slices or units that met the
+transfers first (before, a fixture cut by another slice size gave a frame
+check other edge bytes, -0.04 to -1.3%). When a deliberate change moves a
+fixture's own frames, `tools/fixtures.sh pin NAME` rebuilds it and re-pins.
+
+`bench-frame` (`ForwardState::at`) loads the tree's WHOLE transfer table,
+so a frame check meets no new transfer: the frame's end's canonical
+numbering is checked by full forwards (t2's, the fixtures' builds), not
+by the single-frame checks.
 
 Level -1 fixtures keep their table (`NAME/l1-table.bin`, `--l1-table`):
 the table cache is keyed on the binary's bytes, so every rebuild of the
@@ -306,7 +312,9 @@ walk 20-26 s). The level -1 table without a cached file: (4,2) 12 s, (6,2)
   fixtures pin their tables; the searches still pay. Keying it on the
   sources instead (a build-time hash) would be sound only if the build is
   deterministic in them; not changed.
-- **Edge bytes are not exact** (the per-worker transfer ids, above).
+- **A frame check meets no new transfer** (`ForwardState::at` loads the
+  whole table, above): recording each frame's table length would let it
+  start from the frame's own.
 - **The fixtures follow the format**: a format change (exact keys: 12 ->
   13) rebuilds every fixture (`ensure` does it) and moves every hash pin
   (`pin all`, `pin big`, then `t1/t2/big --pin`, ~8 min); the counts are the

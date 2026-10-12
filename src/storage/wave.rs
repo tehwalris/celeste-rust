@@ -309,6 +309,8 @@ pub fn run_wave(engine: &dyn FrameStep, parts: &[Part], cx: WaveCtx) -> Result<W
     // The visited set is read only until the frame's end; the workers'
     // transfer tables are shared with the gather.
     let xtabs: Vec<std::sync::RwLock<Vec<crate::search::arc_edges::Pair>>> = (0..workers).map(|_| Default::default()).collect();
+    // The frame's new transfers are numbered from here (canonically at its end).
+    let xfers_before = xfers.pairs.len();
     let mut sinks: Vec<UnitSink> = (0..workers)
         .map(|w| UnitSink::new(visited, &routes, skeletons, &prov, filters, frame, level, w as u32, &xtabs[w], record, pos.is_some(), raised.map(|r| RaiseCtx { raised: r }), s))
         .collect();
@@ -374,7 +376,7 @@ pub fn run_wave(engine: &dyn FrameStep, parts: &[Part], cx: WaveCtx) -> Result<W
                         if let Some(job) = pipe.pop_job() {
                             let t = Instant::now();
                             let tp = phases::start(s.diag.phases);
-                            let rcx = RegionCtx { frame, record, remaps: &job.remaps, layers: raised.and(layers) };
+                            let rcx = RegionCtx { frame, record, remaps: &job.remaps, new_xfers: xfers_before as u32, layers: raised.and(layers) };
                             let cs: Vec<&Chunk> = job.chunks.iter().collect();
                             let mut route = job.state.lock().expect("a route");
                             let vt = route.region.and_then(|r| visited.table(r));
@@ -498,19 +500,28 @@ pub fn run_wave(engine: &dyn FrameStep, parts: &[Part], cx: WaveCtx) -> Result<W
         );
     }
     let mut notes: Vec<Note> = Vec::new();
+    let Pipe { gather, states, .. } = pipe;
+    let Gather { xfers, remaps, .. } = gather.into_inner().expect("the gather");
+    // Per new transfer, the edges the frame recorded with it.
+    let mut xfer_counts = vec![0u64; xfers.pairs.len() - xfers_before];
+    for (sink, remap) in sinks.iter().zip(&remaps) {
+        for (&n, &g) in sink.xfer_counts().iter().zip(remap) {
+            if g as usize >= xfers_before {
+                xfer_counts[g as usize - xfers_before] += n;
+            }
+        }
+    }
     for sink in &mut sinks {
         sink.finish()?;
         st.lanes_raw += sink.emitted as usize;
         st.lanes_pruned += sink.pruned as usize;
         if let Some(p) = pos {
-            p.record_pairs(sink.pos_edges.iter().copied());
+            p.record_pairs(sink.pos_pairs());
         }
         notes.append(&mut sink.notes);
     }
     st.units = units.len();
     drop(sinks);
-    let Pipe { gather, states, .. } = pipe;
-    let Gather { xfers, .. } = gather.into_inner().expect("the gather");
     let mut states: Vec<RouteState> = states
         .into_inner()
         .expect("the routes")
@@ -536,6 +547,11 @@ pub fn run_wave(engine: &dyn FrameStep, parts: &[Part], cx: WaveCtx) -> Result<W
     }
     let regions: Vec<Option<u32>> = states.iter().map(|r| visited.region(r.shape, r.slot)).collect();
     let inserted: u64 = states.iter().map(|r| r.new_states).sum();
+    // The frame's new transfers in canonical order (by their edges, then
+    // content), whatever the slices that met them first (their bundles
+    // waited for their ids).
+    let perm = xfers.canonical(xfers_before, &xfer_counts);
+    let renumber = perm.as_deref().map(|perm| super::route::Renumber { first: xfers_before as u32, perm });
     // Per route (in parallel): sealed - its new states listed by key.
     type Sealed = super::route::Sealed;
     let sealed: Vec<Result<Option<Sealed>>> = {
@@ -545,7 +561,7 @@ pub fn run_wave(engine: &dyn FrameStep, parts: &[Part], cx: WaveCtx) -> Result<W
             let hs: Vec<_> = scratch
                 .iter_mut()
                 .map(|sc| {
-                    let (next, cells, regions, finals) = (&next, &cells, &regions, &finals);
+                    let (next, cells, regions, finals, renumber) = (&next, &cells, &regions, &finals, renumber.as_ref());
                     scope.spawn(move || {
                         let mut out = Vec::new();
                         loop {
@@ -553,7 +569,7 @@ pub fn run_wave(engine: &dyn FrameStep, parts: &[Part], cx: WaveCtx) -> Result<W
                             let Some(c) = cells.get(k) else { return out };
                             let mut st = c.lock().expect("a route");
                             let r = match regions[k] {
-                                Some(region) => super::route::seal(&mut st, region, finals, sc).map(Some),
+                                Some(region) => super::route::seal(&mut st, region, finals, renumber, sc).map(Some),
                                 // A route of a new shape whose records the
                                 // coarser level all dropped.
                                 None if st.new_states == 0 => Ok(None),

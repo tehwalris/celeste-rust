@@ -5,7 +5,6 @@
 //! `Rt2::boundary_finish` (`--key-check`), its pos-graph edge
 //! and its transfer.
 
-use crate::search::arc_edges::{decode_axis, RawAxis};
 use std::collections::HashMap;
 use std::os::raw::c_void;
 use std::path::Path;
@@ -13,12 +12,16 @@ use std::path::Path;
 use anyhow::{Context, Result};
 
 use celeste_core::pico8_num::Pico8Num as P8;
-use celeste_engine::exact::{Code, FieldDict, KeySpace, MissKey, Provisional, ShapeKeys, ShapeRecord};
+use celeste_engine::exact::{Code, KeySpace, Provisional, ShapeRecord};
 use celeste_engine::runtime2::{Col, Rt2, AV};
 use celeste_engine::slots::reshape;
 
 use crate::transpile::asm::{AsmCtx, CellRepr, CollisionEnv, Compiled, Loaded, RootKind};
 use crate::transpile::graph::Room;
+
+mod emit;
+use emit::{ArcSlots, KeyField, PartKey, PosSrc};
+pub(crate) use emit::{RawWords, RAW_WORDS};
 
 /// One output field of a body: its output cell, slot and kind.
 struct AsmField {
@@ -42,12 +45,6 @@ struct AsmBody {
     error_root: usize,
     error_off: usize,
     live_off: usize,
-    /// The per-row fields of the key; the rest are the template's `uniform`.
-    key_fields: Vec<KeyField>,
-    /// Sources of player x/y and room x/y, for the row's cell (`pos_sources`).
-    pos: Option<[PosSrc; 4]>,
-    /// The transfer roots (`search::arc_edges`).
-    arc: ArcSlots,
     /// Earlier bodies of the same outcome one fork away, with the root
     /// slots whose equality makes a lane's emission theirs (`DupRef`).
     dup_refs: Vec<DupRef>,
@@ -56,16 +53,61 @@ struct AsmBody {
 /// An earlier body `body` and the (its slot, my slot, kind) pairs that
 /// differ in slot: every root the emission reads (stored fields, key
 /// fields, position sources, transfer roots). Equal on a lane in all of
-/// them, the two bodies emit the identical row, edge and transfer.
+/// them, the two bodies emit the identical row, edge and transfer. The
+/// pairs are indices into the kernel's `DupPairs` (refs share them ~4x).
 struct DupRef {
     body: usize,
-    pairs: Vec<(usize, usize, RootKind)>,
+    pairs: Vec<u32>,
 }
 
-impl DupRef {
-    /// The lanes of `cand` on which every pair is equal.
+/// A kernel's distinct dup-ref slot pairs `(a, b, kind)`, each one's
+/// equality mask computed at most once a slice (`DupMemo`).
+#[derive(Default)]
+struct DupPairs {
+    pairs: Vec<(usize, usize, RootKind)>,
+    index: HashMap<(usize, usize, RootKind), u32>,
+}
+
+impl DupPairs {
+    fn id(&mut self, p: (usize, usize, RootKind)) -> u32 {
+        let n = self.pairs.len() as u32;
+        *self.index.entry(p).or_insert_with(|| {
+            self.pairs.push(p);
+            n
+        })
+    }
+}
+
+/// A slice's dup-pair equality masks (per thread and kernel): `mask[p]`
+/// holds when `stamp[p]` is the slice's.
+#[derive(Default)]
+struct DupMemo {
+    slice: u32,
+    stamp: Vec<u32>,
+    mask: Vec<u16>,
+}
+
+impl DupMemo {
+    /// The next slice (`pairs` many pairs).
+    fn next(&mut self, pairs: usize) {
+        if self.stamp.len() < pairs {
+            self.stamp.resize(pairs, 0);
+            self.mask.resize(pairs, 0);
+        }
+        self.slice = self.slice.wrapping_add(1);
+        if self.slice == 0 {
+            self.stamp.fill(0);
+            self.slice = 1;
+        }
+    }
+
+    /// The lanes where pair `p` of `pairs` is equal.
     #[inline]
-    fn eq_mask(&self, buf: &[u8], cand: u16) -> u16 {
+    fn eq(&mut self, pairs: &DupPairs, p: u32, buf: &[u8]) -> u16 {
+        let p = p as usize;
+        if self.stamp[p] == self.slice {
+            return self.mask[p];
+        }
         let block = |o: usize| -> [u32; 16] {
             let b: &[u8; 64] = buf[o..o + 64].try_into().unwrap();
             std::array::from_fn(|i| u32::from_le_bytes([b[4 * i], b[4 * i + 1], b[4 * i + 2], b[4 * i + 3]]))
@@ -78,263 +120,35 @@ impl DupRef {
             }
             m
         };
+        let (a, b, kind) = pairs.pairs[p];
+        let m = match kind {
+            RootKind::Num => eq16(a, b),
+            RootKind::Ival => eq16(a, b) & eq16(a + 64, b + 64),
+            RootKind::Bool => {
+                let w = |o: usize| (u16::from_le_bytes([buf[o], buf[o + 1]]), u16::from_le_bytes([buf[o + 2], buf[o + 3]]));
+                let ((va, ka), (vb, kb)) = (w(a), w(b));
+                !((va ^ vb) | (ka ^ kb))
+            }
+        };
+        self.stamp[p] = self.slice;
+        self.mask[p] = m;
+        m
+    }
+}
+
+impl DupRef {
+    /// The lanes of `cand` on which every pair is equal.
+    #[inline]
+    fn eq_mask(&self, pairs: &DupPairs, memo: &mut DupMemo, buf: &[u8], cand: u16) -> u16 {
         let mut m = cand;
-        for &(a, b, kind) in &self.pairs {
-            m &= match kind {
-                RootKind::Num => eq16(a, b),
-                RootKind::Ival => eq16(a, b) & eq16(a + 64, b + 64),
-                RootKind::Bool => {
-                    let w = |o: usize| (u16::from_le_bytes([buf[o], buf[o + 1]]), u16::from_le_bytes([buf[o + 2], buf[o + 3]]));
-                    let ((va, ka), (vb, kb)) = (w(a), w(b));
-                    !((va ^ vb) | (ka ^ kb))
-                }
-            };
+        for &p in &self.pairs {
+            m &= memo.eq(pairs, p, buf);
             if m == 0 {
                 break;
             }
         }
         m
     }
-}
-
-/// A body's transfer roots (`FrameOut::arc`): per axis took, pre, frag, ox,
-/// fin as (offset, kind); `fin` whether the outcome ends with a player.
-/// `ArcSlots::words`: two words per transfer root, then the outcome's
-/// `fin` flag - the words alone do not decode: without a fin root its words
-/// are 0 and the axis has no `fin`, with one they are `fin = Some((0, 0))`.
-/// Keyed on the words alone, `UnitSink::xfer_id_raw`'s cache gave a lane
-/// whichever body's transfer was interned first (a scheduling-dependent edge,
-/// room (1,0) f61, 2026-10-09).
-pub(crate) const RAW_WORDS: usize = 4 * crate::trace::verify::ARC_AXIS_ROOTS + 1;
-pub(crate) type RawWords = [u32; RAW_WORDS];
-
-#[derive(Clone, Copy)]
-struct ArcSlots {
-    roots: [(usize, RootKind); 2 * crate::trace::verify::ARC_AXIS_ROOTS],
-    fin: bool,
-}
-
-impl ArcSlots {
-    /// Lane `i`'s transfer as plain words off the output slots: per root
-    /// its (low, high) 16.16 words, a boolean root's (value, known) bits,
-    /// the fin roots 0 where the outcome has none, and the `fin` flag last.
-    /// (Grouping a slice's lanes by their words, word-major, cost more than
-    /// it saved at ~7 live lanes a body: room (6,2) f57 emit 104 -> 181 s.)
-    #[inline]
-    fn words(&self, buf: &[u8], i: usize) -> RawWords {
-        let w = |o: usize| u32::from_le_bytes(buf[o..o + 4].try_into().unwrap());
-        let mut out = [0u32; RAW_WORDS];
-        for (k, &(off, kind)) in self.roots.iter().enumerate() {
-            if !self.fin && k % crate::trace::verify::ARC_AXIS_ROOTS == 4 {
-                continue;
-            }
-            let (lo, hi) = match kind {
-                RootKind::Num => (w(off + i * 4), w(off + i * 4)),
-                RootKind::Ival => (w(off + i * 4), w(off + 64 + i * 4)),
-                RootKind::Bool => {
-                    let v = u16::from_le_bytes([buf[off], buf[off + 1]]);
-                    let known = u16::from_le_bytes([buf[off + 2], buf[off + 3]]);
-                    ((v >> i & 1) as u32, (known >> i & 1) as u32)
-                }
-            };
-            out[2 * k] = lo;
-            out[2 * k + 1] = hi;
-        }
-        out[RAW_WORDS - 1] = self.fin as u32;
-        out
-    }
-
-    /// The raw transfer of `words`. An undecided `took` is FATAL: the
-    /// record would be an unchecked claim about the remainder.
-    fn raw(&self, words: &RawWords, chunk: &Rt2, lane: usize, outcome: usize) -> (RawAxis, RawAxis) {
-        let axis = |a: usize| -> RawAxis {
-            let base = a * crate::trace::verify::ARC_AXIS_ROOTS;
-            let pair = |k: usize| (words[2 * (base + k)] as i32, words[2 * (base + k) + 1] as i32);
-            assert!(
-                self.roots[base].1 == RootKind::Bool && words[2 * base + 1] == 1,
-                "arc edges: shape {:#x} outcome {outcome} lane {lane}: axis {a}'s `took` is not a decided boolean",
-                chunk.shape_hash
-            );
-            RawAxis { took: words[2 * base] == 1, pre: pair(1), frag: pair(2), ox: pair(3), fin: self.fin.then(|| pair(4)) }
-        };
-        (axis(0), axis(1))
-    }
-
-    /// The record's pair of a raw transfer (`raw`).
-    fn decode(raw: &(RawAxis, RawAxis), chunk: &Rt2, lane: usize, outcome: usize) -> crate::search::arc_edges::Pair {
-        let axis = |a: usize, r: &RawAxis| {
-            decode_axis(r).unwrap_or_else(|e| panic!("arc edges: shape {:#x} outcome {outcome} lane {lane}: axis {a}: {e} (raw {r:?})", chunk.shape_hash))
-        };
-        (axis(0, &raw.0), axis(1, &raw.1))
-    }
-}
-
-/// One per-row field of a body's key: its cell (the shape's dictionary)
-/// and output slot.
-struct KeyField {
-    cell: u32,
-    root: usize,
-    read: KeyRead,
-}
-
-/// How a key field's slot becomes its code (a position coordinate's:
-/// `exact::Code::pos`).
-#[derive(Clone, Copy)]
-enum KeyRead {
-    Num,
-    Ival,
-    Bool,
-    PosNum,
-    PosIval,
-}
-
-impl KeyField {
-    /// `pos`: the cell is a position coordinate (`Rt2::position_cells`),
-    /// which keys without its whole pixels.
-    fn new(cell: u32, root: usize, kind: RootKind, pos: bool) -> Result<KeyField> {
-        let read = match (kind, pos) {
-            (RootKind::Num, false) => KeyRead::Num,
-            (RootKind::Ival, false) => KeyRead::Ival,
-            (RootKind::Bool, false) => KeyRead::Bool,
-            (RootKind::Num, true) => KeyRead::PosNum,
-            (RootKind::Ival, true) => KeyRead::PosIval,
-            (RootKind::Bool, true) => anyhow::bail!("position cell {cell} is a boolean output: its row would have no cell"),
-        };
-        Ok(KeyField { cell, root, read })
-    }
-
-    #[inline]
-    fn words(buf: &[u8], o: usize) -> [u32; 16] {
-        let b: &[u8; 64] = buf[o..o + 64].try_into().unwrap();
-        std::array::from_fn(|i| u32::from_le_bytes([b[4 * i], b[4 * i + 1], b[4 * i + 2], b[4 * i + 3]]))
-    }
-
-    /// Each lane of `take`: its code's placed bits in `d` ORed into `k`, or
-    /// its bit in `miss` where `d` lacks the code. A field of at most a few
-    /// numbers is matched lane-parallel, code by code.
-    #[inline]
-    fn place16(&self, buf: &[u8], d: &FieldDict, take: u16, k: &mut [u128; 16], miss: &mut u16) {
-        use celeste_engine::runtime2::POS_WHOLE;
-        let base = self.root;
-        let (lo, hi) = match self.read {
-            KeyRead::Num => {
-                let w = Self::words(buf, base);
-                (w, w)
-            }
-            KeyRead::Ival => (Self::words(buf, base), Self::words(buf, base + 64)),
-            KeyRead::PosNum => {
-                let w = Self::words(buf, base).map(|x| x & !POS_WHOLE);
-                (w, w)
-            }
-            KeyRead::PosIval => {
-                let (lo, hi) = (Self::words(buf, base), Self::words(buf, base + 64));
-                let whole: [u32; 16] = std::array::from_fn(|i| lo[i] & POS_WHOLE);
-                (std::array::from_fn(|i| lo[i].wrapping_sub(whole[i])), std::array::from_fn(|i| hi[i].wrapping_sub(whole[i])))
-            }
-            KeyRead::Bool => {
-                let val = u16::from_le_bytes([buf[base], buf[base + 1]]);
-                let known = u16::from_le_bytes([buf[base + 2], buf[base + 3]]);
-                let mut m = take;
-                while m != 0 {
-                    let i = m.trailing_zeros() as usize;
-                    m &= m - 1;
-                    let tri = if known >> i & 1 == 1 { (val >> i & 1) as usize } else { 2 };
-                    match d.find_bool_placed(tri) {
-                        Some(p) => k[i] |= p,
-                        None => *miss |= 1 << i,
-                    }
-                }
-                return;
-            }
-        };
-        if let Some(small) = d.small_nums() {
-            let mut hit = 0u16;
-            for &(word, placed) in small {
-                let (a, b) = ((word >> 32) as u32, word as u32);
-                let mut eq = 0u16;
-                for i in 0..16 {
-                    eq |= (((lo[i] == a) & (hi[i] == b)) as u16) << i;
-                }
-                eq &= take;
-                hit |= eq;
-                if placed != 0 {
-                    while eq != 0 {
-                        let i = eq.trailing_zeros() as usize;
-                        eq &= eq - 1;
-                        k[i] |= placed;
-                    }
-                }
-            }
-            *miss |= take & !hit;
-            return;
-        }
-        let mut m = take;
-        while m != 0 {
-            let i = m.trailing_zeros() as usize;
-            m &= m - 1;
-            match d.find_num_placed(Code::num(lo[i], hi[i]).word()) {
-                Some(p) => k[i] |= p,
-                None => *miss |= 1 << i,
-            }
-        }
-    }
-
-    /// Lane `i`'s code.
-    fn code(&self, buf: &[u8], i: usize) -> Code {
-        let w = |o: usize| u32::from_le_bytes(buf[o + 4 * i..o + 4 * i + 4].try_into().unwrap());
-        let base = self.root;
-        match self.read {
-            KeyRead::Num => Code::num(w(base), w(base)),
-            KeyRead::Ival => Code::num(w(base), w(base + 64)),
-            KeyRead::Bool => {
-                let val = u16::from_le_bytes([buf[base], buf[base + 1]]);
-                let known = u16::from_le_bytes([buf[base + 2], buf[base + 3]]);
-                Code::boolean((known >> i & 1 == 1).then_some(val >> i & 1 == 1))
-            }
-            KeyRead::PosNum => Code::pos(w(base), w(base)),
-            KeyRead::PosIval => Code::pos(w(base), w(base + 64)),
-        }
-    }
-}
-
-impl AsmBody {
-    /// Every lane of `take`'s packed key over the body's per-row fields,
-    /// OR'd onto the outcome's uniform part, and the lanes where a code is
-    /// not in its dictionary (all of them for a shape the key space lacks).
-    /// Lane by lane per field (a body that fires averages ~7 live lanes).
-    #[inline]
-    fn keys16(&self, buf: &[u8], sk: Option<&ShapeKeys>, part: u128, take: u16) -> ([u128; 16], u16) {
-        let mut k = [part; 16];
-        let Some(sk) = sk else { return (k, take) };
-        let mut miss = 0u16;
-        for f in &self.key_fields {
-            let d = sk.field(f.cell as usize).unwrap_or_else(|| panic!("key field cell {} is not a value cell of shape {:#x}", f.cell, sk.record.hash));
-            f.place16(buf, d, take, &mut k, &mut miss);
-        }
-        (k, miss)
-    }
-
-    /// Lane `i`'s exact content where a code is missing: its fields that
-    /// hit packed (`partial`), the outcome's and the body's missing codes.
-    fn miss_key(&self, buf: &[u8], i: usize, sk: Option<&ShapeKeys>, shape: u64, partial: u128, part_missing: &[(u32, Code)]) -> MissKey {
-        use celeste_engine::exact::NONE;
-        let mut missing: Vec<(u32, Code)> = part_missing.to_vec();
-        for f in &self.key_fields {
-            let c = f.code(buf, i);
-            if sk.is_none_or(|sk| sk.field(f.cell as usize).is_none_or(|d| d.find(c) == NONE)) {
-                missing.push((f.cell, c));
-            }
-        }
-        missing.sort_unstable_by_key(|m| m.0);
-        MissKey { shape, partial: ((partial >> 64) as u64, partial as u64), missing }
-    }
-}
-
-/// One whole-pixel coordinate of an emitted row: an output root or a constant.
-#[derive(Clone, Copy)]
-enum PosSrc {
-    Root(usize),
-    Konst(i16),
 }
 
 /// An accumulator column: a uniform constant or an empty typed vector.
@@ -402,6 +216,10 @@ struct AsmKernel {
     loaded: Loaded,
     compiled: Compiled,
     bodies: Vec<AsmBody>,
+    /// The bodies' dup-ref slot pairs.
+    dup_pairs: DupPairs,
+    /// What the bodies read at emission (`emit`).
+    plan: emit::Plan,
     acc_templates: Vec<AccTemplate>,
     forks: u8,
     /// Per body: where its roots go in the shape's union columns (`unify`).
@@ -422,214 +240,131 @@ impl AsmKernel {
     /// Run `lanes` of one block in 16-lane slices, emitting each body's
     /// `live & !error` lanes into the sink with their edges. Any `live &
     /// error` (declined) fails the call: a coverage gap.
-    fn run(
-        &self,
-        chunk: &Rt2,
-        cell_in: &[u32],
-        lanes: &[usize],
-        sink: &mut crate::storage::unit::UnitSink,
-    ) -> bool {
-        debug_assert_eq!(cell_in.len(), chunk.width, "one input cell per input row");
+    fn run(&self, chunk: &Rt2, lanes: &[usize], sink: &mut crate::storage::unit::UnitSink) -> bool {
         stats([1, 0, 0, 0, 0, 0, 0]);
         // Slices of 16 lanes (`lanes`: the unit's expanded ones).
         for part in lanes.chunks(16) {
-            if !self.run_slice(chunk, cell_in, part, ((1u32 << part.len()) - 1) as u16, sink) {
+            if !self.run_slice(chunk, part, ((1u32 << part.len()) - 1) as u16, sink) {
                 return false;
             }
         }
         true
     }
 
-    /// Run ONE slice of up to 16 lanes (of any id groups), keeping lanes in `only`.
-    fn run_slice(
-        &self,
-        chunk: &Rt2,
-        cell_in: &[u32],
-        lanes: &[usize],
-        only: u16,
-        sink: &mut crate::storage::unit::UnitSink,
-    ) -> bool {
+    /// Run ONE slice of up to 16 lanes (of any id groups), keeping lanes in
+    /// `only`: the kernel, each body's lanes (`live & !error`, less those
+    /// an earlier body emits identically), then their EMISSION (`emit`).
+    fn run_slice(&self, chunk: &Rt2, lanes: &[usize], only: u16, sink: &mut crate::storage::unit::UnitSink) -> bool {
         let t_setup = crate::frame::phases::start(sink.phases);
         let n = lanes.len();
         debug_assert!((1..=16).contains(&n));
         if let Some(c) = &self.mix_slices {
             c.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
-        // Skip the set insert for a repeated (input cell, output cell) pair.
-        let mut last_edge = (u32::MAX, u32::MAX);
         let views = self.input_views(chunk);
         let env = CollisionEnv { cart: &chunk.cart, cache: &chunk.cache };
         let ctx = AsmCtx::new(&env as *const CollisionEnv as *const c_void);
         // Per-thread reused buffers: a fresh allocation faults every page.
         let mut sc = Scratch::take(self);
-        let Scratch { inbuf, outbuf, took, parts, .. } = &mut sc;
-        let keys = sink.keys();
-        let generation = keys.generation();
-        let body_cols = &self.body_cols;
+        let Scratch { inbuf, outbuf, took, takes, parts, dups, .. } = &mut sc;
+        dups.next(self.dup_pairs.pairs.len());
 
         // Utilization tallies, folded into `CALL_STATS[3..]` at the end.
-        let (mut n_bodies, mut n_bodies_taken, mut n_lanes, mut n_unique) = (0u64, 0u64, 0u64, 0u64);
-        {
-            let record = sink.records_edges();
-            let t_ph = crate::frame::phases::add(crate::frame::phases::SETUP, t_setup);
-            self.pack_input(&views, lanes, inbuf);
-            let t_ph = crate::frame::phases::add(crate::frame::phases::PACK, t_ph);
-            // The spill frame is on THIS thread's stack: refuse rather than overrun.
-            let (frame, stack) = (self.compiled.frame_bytes as usize, thread_stack());
-            assert!(
-                frame + KERNEL_STACK_MARGIN <= stack,
-                "kernel {}: its {:.1} MB stack frame does not fit this thread's {:.1} MB stack (a kernel thread needs `set_thread_stack` and a larger `stack_size`)",
-                self.compiled.sym,
-                frame as f64 / 1048576.0,
-                stack as f64 / 1048576.0
+        let (mut n_bodies, mut n_bodies_taken, mut n_lanes) = (0u64, 0u64, 0u64);
+        let t_ph = crate::frame::phases::add(crate::frame::phases::SETUP, t_setup);
+        self.pack_input(&views, lanes, inbuf);
+        let t_ph = crate::frame::phases::add(crate::frame::phases::PACK, t_ph);
+        // The spill frame is on THIS thread's stack: refuse rather than overrun.
+        let (frame, stack) = (self.compiled.frame_bytes as usize, thread_stack());
+        assert!(
+            frame + KERNEL_STACK_MARGIN <= stack,
+            "kernel {}: its {:.1} MB stack frame does not fit this thread's {:.1} MB stack (a kernel thread needs `set_thread_stack` and a larger `stack_size`)",
+            self.compiled.sym,
+            frame as f64 / 1048576.0,
+            stack as f64 / 1048576.0
+        );
+        unsafe {
+            (self.loaded.func)(
+                inbuf.as_ptr(),
+                outbuf.as_mut_ptr(),
+                &ctx as *const AsmCtx as *const c_void,
             );
-            unsafe {
-                (self.loaded.func)(
-                    inbuf.as_ptr(),
-                    outbuf.as_mut_ptr(),
-                    &ctx as *const AsmCtx as *const c_void,
-                );
-            }
-            let t_emit = crate::frame::phases::add(crate::frame::phases::KERNEL, t_ph);
-            let valid = (((1u32 << n) - 1) as u16) & only;
-            for (bi, (body, cols)) in self.bodies.iter().zip(body_cols).enumerate() {
-                // Tri-state masks, each read where it MAY hold.
-                let error = read_zb_may(outbuf, body.error_off);
-                let live = read_zb_may(outbuf, body.live_off);
-                // A row the forward does not expand (an exit, a lost berry)
-                // never reaches a slice (the unit passes its expanded lanes
-                // only): its error would be no decline. Room (6,2) 100% at
-                // f84: an exited row (room (7,2), a restart pending) shared
-                // a slice with a live respawn and its error was fatal.
-                if live & error & valid != 0 {
-                    // Declined (fatal in the caller): report the lanes.
-                    let declined = live & error & valid;
-                    let ids = crate::compiled::ids();
-                    let mut rows = String::new();
-                    let mut m = declined;
-                    while m != 0 {
-                        let i = m.trailing_zeros() as usize;
-                        m &= m - 1;
-                        let lane = lanes[i];
-                        let mut desc = format!("lane {lane}:");
-                        for obj in chunk.player_objects(ids) {
-                            for (name, f) in [("rem", ids.f_rem), ("spd", ids.f_spd)] {
-                                if let Some(pc) = chunk.obj_field_cell(obj, f) {
-                                    if let Col::U(AV::Ptr(sub)) = chunk.cols[pc as usize] {
-                                        for (axis, g) in [("x", ids.f_x), ("y", ids.f_y)] {
-                                            if let Some(c) = chunk.obj_field_cell(sub, g) {
-                                                desc.push_str(&format!(" {name}.{axis}={:?}", chunk.cols[c as usize].at(lane)));
-                                            }
+        }
+        let t_emit = crate::frame::phases::add(crate::frame::phases::KERNEL, t_ph);
+        let valid = (((1u32 << n) - 1) as u16) & only;
+        for (bi, body) in self.bodies.iter().enumerate() {
+            // Tri-state masks, each read where it MAY hold.
+            let error = read_zb_may(outbuf, body.error_off);
+            let live = read_zb_may(outbuf, body.live_off);
+            // A row the forward does not expand (an exit, a lost berry)
+            // never reaches a slice (the unit passes its expanded lanes
+            // only): its error would be no decline. Room (6,2) 100% at
+            // f84: an exited row (room (7,2), a restart pending) shared
+            // a slice with a live respawn and its error was fatal.
+            if live & error & valid != 0 {
+                // Declined (fatal in the caller): report the lanes.
+                let declined = live & error & valid;
+                let ids = crate::compiled::ids();
+                let mut rows = String::new();
+                let mut m = declined;
+                while m != 0 {
+                    let i = m.trailing_zeros() as usize;
+                    m &= m - 1;
+                    let lane = lanes[i];
+                    let mut desc = format!("lane {lane}:");
+                    for obj in chunk.player_objects(ids) {
+                        for (name, f) in [("rem", ids.f_rem), ("spd", ids.f_spd)] {
+                            if let Some(pc) = chunk.obj_field_cell(obj, f) {
+                                if let Col::U(AV::Ptr(sub)) = chunk.cols[pc as usize] {
+                                    for (axis, g) in [("x", ids.f_x), ("y", ids.f_y)] {
+                                        if let Some(c) = chunk.obj_field_cell(sub, g) {
+                                            desc.push_str(&format!(" {name}.{axis}={:?}", chunk.cols[c as usize].at(lane)));
                                         }
                                     }
                                 }
                             }
                         }
-                        rows.push_str(&desc);
-                        rows.push('\n');
                     }
-                    eprintln!(
-                        "[kernel] shape {:#x} body of outcome {} declined lanes {:#06x} (live {:#06x} error {:#06x}):\n{rows}",
-                        chunk.shape_hash, body.outcome, declined, live, error
-                    );
-                    match self.flat_roots.get(body.error_root) {
-                        Some(&error_node) => self.explain_error(chunk, lanes[declined.trailing_zeros() as usize], error_node),
-                        None => eprintln!("[kernel] rerun with --kernel-explain for the error the lane holds"),
-                    }
-                    sc.put_back();
-                    return false;
+                    rows.push_str(&desc);
+                    rows.push('\n');
                 }
-                let mut take = live & !error & valid;
-                // A lane whose emission equals an earlier body's (same
-                // outcome, every stored root and transfer root equal) is
-                // that body's emission again: skip it (`DupRef`).
-                took[bi] = take;
-                if take != 0 {
-                    for r in &body.dup_refs {
-                        let cand = take & took[r.body];
-                        if cand != 0 {
-                            take &= !(cand & r.eq_mask(outbuf, cand));
-                            if take == 0 {
-                                break;
-                            }
+                eprintln!(
+                    "[kernel] shape {:#x} body of outcome {} declined lanes {:#06x} (live {:#06x} error {:#06x}):\n{rows}",
+                    chunk.shape_hash, body.outcome, declined, live, error
+                );
+                match self.flat_roots.get(body.error_root) {
+                    Some(&error_node) => self.explain_error(chunk, lanes[declined.trailing_zeros() as usize], error_node),
+                    None => eprintln!("[kernel] rerun with --kernel-explain for the error the lane holds"),
+                }
+                sc.put_back();
+                return false;
+            }
+            let mut take = live & !error & valid;
+            // A lane whose emission equals an earlier body's (same
+            // outcome, every stored root and transfer root equal) is
+            // that body's emission again: skip it (`DupRef`).
+            took[bi] = take;
+            if take != 0 {
+                for r in &body.dup_refs {
+                    let cand = take & took[r.body];
+                    if cand != 0 {
+                        take &= !(cand & r.eq_mask(&self.dup_pairs, dups, outbuf, cand));
+                        if take == 0 {
+                            break;
                         }
                     }
                 }
-                n_bodies += 1;
-                if take == 0 {
-                    continue;
-                }
+            }
+            takes[bi] = take;
+            n_bodies += 1;
+            if take != 0 {
                 n_bodies_taken += 1;
                 n_lanes += take.count_ones() as u64;
-                let template = &self.acc_templates[body.outcome];
-                let shape = template.union.shape_hash;
-                // Level -1 first: a dropped cell's row needs no key, transfer
-                // or lookup, only its pos-graph edge and its source's note.
-                let mut couts = [0u32; 16];
-                let mut m = take;
-                while m != 0 {
-                    let i = m.trailing_zeros() as usize;
-                    m &= m - 1;
-                    let cout = cell_out(body, outbuf, i, (self.room.cache.room_x, self.room.cache.room_y));
-                    couts[i] = cout;
-                    if let Some(from) = sink.minus_one_drop(shape, cout) {
-                        take &= !(1 << i);
-                        let cin = cell_in[lanes[i]];
-                        if sink.edges_on && last_edge != (cin, cout) {
-                            last_edge = (cin, cout);
-                            sink.pos_edges.insert((cin, cout));
-                        }
-                        sink.dropped(lanes[i], from);
-                    } else if sink.pruned(cout) {
-                        // `--prune-rect` (HEURISTIC): dropped, no note.
-                        take &= !(1 << i);
-                    }
-                }
-                if take == 0 {
-                    continue;
-                }
-                // THE KEY: the outcome's uniform fields (once per key space
-                // generation), the body's per-row fields per lane; a code the
-                // key space lacks makes the state new: a provisional key.
-                let sk = keys.shape(shape);
-                if sk.is_none() {
-                    sink.note_shape(&template.record);
-                }
-                if parts[body.outcome].0 != generation {
-                    parts[body.outcome] = (generation, PartKey::of(template, sk));
-                }
-                let part = &parts[body.outcome].1;
-                let (packed, miss) = body.keys16(outbuf, sk, part.key, take);
-                while take != 0 {
-                    let i = take.trailing_zeros() as usize;
-                    take &= take - 1;
-                    let key = if miss >> i & 1 == 0 && part.missing.is_empty() {
-                        ((packed[i] >> 64) as u64, packed[i] as u64)
-                    } else {
-                        sink.provisional().intern(body.miss_key(outbuf, i, sk, shape, packed[i], &part.missing))
-                    };
-                    let (cin, cout) = (cell_in[lanes[i]], couts[i]);
-                    // THE TRANSFER: per producer, on the edge, never in the row.
-                    let xfer = record.then(|| {
-                        let words = body.arc.words(outbuf, i);
-                        sink.xfer_id_raw(&words, |w| ArcSlots::decode(&body.arc.raw(w, chunk, lanes[i], body.outcome), chunk, lanes[i], body.outcome))
-                    });
-                    // EMISSION-TIME PROVENANCE: the pos-graph and backward
-                    // edges from lane `i` are recorded right here.
-                    if sink.edges_on && last_edge != (cin, cout) {
-                        last_edge = (cin, cout);
-                        sink.pos_edges.insert((cin, cout));
-                    }
-                    n_unique += 1;
-                    let r = sink.emit(shape, cout, key, lanes[i], xfer, || (*template.union).clone_block(), |buf| cols.push_row(buf, outbuf, i, key, cout));
-                    if let Err(e) = r {
-                        panic!("frame step: {e:#}");
-                    }
-                }
             }
-            if t_emit != 0 {
-                crate::frame::phases::add(crate::frame::phases::EMIT, t_emit);
-            }
+        }
+        let n_unique = self.emit(emit::Slice { chunk, lanes, buf: outbuf, takes, parts }, sink);
+        if t_emit != 0 {
+            crate::frame::phases::add(crate::frame::phases::EMIT, t_emit);
         }
         sc.put_back();
         stats([0, only.count_ones().min(n as u32) as u64, 16, n_bodies, n_bodies_taken, n_lanes, n_unique]);
@@ -874,38 +609,14 @@ struct Scratch {
     kernel: usize,
     inbuf: Vec<u8>,
     outbuf: Vec<u8>,
-    /// Per body, the lanes it took this slice before `dup_refs` masking.
+    /// Per body, the lanes it took this slice before `dup_refs` masking,
+    /// and after.
     took: Vec<u16>,
+    takes: Vec<u16>,
+    dups: DupMemo,
     /// Per outcome, its uniform fields keyed in the key space of generation
     /// `.0` (`PartKey`).
     parts: Vec<(u64, PartKey)>,
-}
-
-/// An outcome's uniform fields in a key space: the packed codes that hit,
-/// the `(cell, code)` of those that miss.
-#[derive(Default)]
-struct PartKey {
-    key: u128,
-    missing: Vec<(u32, Code)>,
-}
-
-impl PartKey {
-    /// `t`'s uniform fields in `sk` (`None`: a shape the key space lacks),
-    /// the template's signature checked against the key space's.
-    fn of(t: &AccTemplate, sk: Option<&ShapeKeys>) -> PartKey {
-        use celeste_engine::exact::NONE;
-        let Some(sk) = sk else { return PartKey { key: 0, missing: t.uniform.clone() } };
-        assert!(sk.record == t.record, "exact keys: two shapes under the hash {:#x} (a shape-hash collision)", t.shape_hash);
-        let mut p = PartKey::default();
-        for &(c, code) in &t.uniform {
-            let d = sk.field(c as usize).unwrap_or_else(|| panic!("uniform cell {c} is not a value cell of shape {:#x}", t.shape_hash));
-            match d.find(code) {
-                NONE => p.missing.push((c, code)),
-                i => p.key |= d.place(i),
-            }
-        }
-        p
-    }
 }
 
 thread_local! {
@@ -925,6 +636,8 @@ impl Scratch {
                     inbuf: vec![0u8; k.compiled.input_bytes as usize],
                     outbuf: vec![0u8; k.compiled.out_bytes as usize],
                     took: vec![0u16; k.bodies.len()],
+                    takes: vec![0u16; k.bodies.len()],
+                    dups: DupMemo::default(),
                     parts: (0..k.acc_templates.len()).map(|_| (0, PartKey::default())).collect(),
                 },
             }
@@ -1214,11 +927,11 @@ impl Registry {
         sink: &mut crate::storage::unit::UnitSink,
     ) -> bool {
         if self.grid.is_none() {
-            return self.run_key(chunk, None, cell_in, lanes, sink);
+            return self.run_key(chunk, None, lanes, sink);
         }
         // Regions only for shapes with a PLAYER (not `player_spawn`).
         let Some(grid) = self.grid.filter(|_| !chunk.player_objects(crate::compiled::ids()).is_empty()) else {
-            return self.run_key(chunk, None, cell_in, lanes, sink);
+            return self.run_key(chunk, None, lanes, sink);
         };
         // The unit's live lanes bucketed by region, each bucket cut into
         // slices of 16 (a slice may span id groups: `run_slice` keys each
@@ -1234,12 +947,12 @@ impl Registry {
         for run in by_region.chunk_by(|a, b| a.0 == b.0) {
             let key = run[0].0;
             let Some(k) = self.kernels.get(&(chunk.shape_hash, key)) else {
-                return self.run_key(chunk, key, cell_in, &[run[0].1], sink);
+                return self.run_key(chunk, key, &[run[0].1], sink);
             };
             for part in run.chunks(16) {
                 idx.clear();
                 idx.extend(part.iter().map(|&(_, l)| l));
-                if !k.run_slice(chunk, cell_in, &idx, ((1u32 << idx.len()) - 1) as u16, sink) {
+                if !k.run_slice(chunk, &idx, ((1u32 << idx.len()) - 1) as u16, sink) {
                     return false;
                 }
             }
@@ -1247,16 +960,9 @@ impl Registry {
         true
     }
 
-    fn run_key(
-        &self,
-        chunk: &Rt2,
-        key: Option<Region>,
-        cell_in: &[u32],
-        lanes: &[usize],
-        sink: &mut crate::storage::unit::UnitSink,
-    ) -> bool {
+    fn run_key(&self, chunk: &Rt2, key: Option<Region>, lanes: &[usize], sink: &mut crate::storage::unit::UnitSink) -> bool {
         match self.kernels.get(&(chunk.shape_hash, key)) {
-            Some(k) => k.run(chunk, cell_in, lanes, sink),
+            Some(k) => k.run(chunk, lanes, sink),
             None => {
                 // A coverage gap, printed once per (shape, key).
                 static SEEN: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<(u64, Option<Region>)>>> =
@@ -1499,6 +1205,8 @@ fn build_one_shape(r: &crate::trace::kernel::Reference, si: usize, tag: &str, bu
     // Each body's roots onto their slots, through `slot_of`.
     let mut off = 0usize;
     let mut asm_bodies = Vec::with_capacity(bodies.len());
+    // What each body reads at emission (`emit::Plan`).
+    let mut reads = Vec::with_capacity(bodies.len());
     for b in &bodies {
         let narc = r.bound.outcomes[b.outcome].arc.len();
         let nfields = b.roots.len() - 2 - narc; // roots = [fields.., error, live, arc..]
@@ -1543,18 +1251,17 @@ fn build_one_shape(r: &crate::trace::kernel::Reference, si: usize, tag: &str, bu
             error_root: slot_of[off + nfields],
             error_off: compiled.root_offsets[slot_of[off + nfields]] as usize,
             live_off: compiled.root_offsets[slot_of[off + nfields + 1]] as usize,
-            key_fields,
-            pos: None,
-            arc,
             dup_refs: Vec::new(),
         });
+        reads.push(emit::BodyReads { outcome: b.outcome, shape: acc_templates[b.outcome].shape_hash, key_fields, arc, pos: None });
         off += b.roots.len();
     }
 
-    for b in asm_bodies.iter_mut() {
-        b.pos = pos_sources(&acc_templates[b.outcome].build(), &b.fields)?;
+    for (b, rd) in asm_bodies.iter().zip(reads.iter_mut()) {
+        rd.pos = pos_sources(&acc_templates[b.outcome].build(), &b.fields)?;
     }
-    dup_refs(&mut asm_bodies);
+    let dup_pairs = dup_refs(&mut asm_bodies, &reads);
+    let plan = emit::Plan::of(&reads);
 
     let input_names: Vec<String> = compiled
         .input_cells
@@ -1612,6 +1319,8 @@ fn build_one_shape(r: &crate::trace::kernel::Reference, si: usize, tag: &str, bu
             loaded,
             compiled,
             bodies: asm_bodies,
+            dup_pairs,
+            plan,
             acc_templates,
             forks: r.bound.forks,
             body_cols: Vec::new(),
@@ -1629,13 +1338,15 @@ fn build_one_shape(r: &crate::trace::kernel::Reference, si: usize, tag: &str, bu
 /// configuration differs from its own in exactly one fork. Every root slot
 /// is compared (fields, so whatever the union stores; key fields and
 /// position sources are fields); a pair of kinds that differ is no ref.
-fn dup_refs(bodies: &mut [AsmBody]) {
+fn dup_refs(bodies: &mut [AsmBody], reads: &[emit::BodyReads]) -> DupPairs {
+    let mut ids = DupPairs::default();
     let n = bodies.len();
     for j in 0..n {
         let mut refs = Vec::new();
         for i in 0..j {
             let (a, b) = (&bodies[i], &bodies[j]);
-            if a.outcome != b.outcome || a.splits.len() != b.splits.len() || a.arc.fin != b.arc.fin {
+            let (aa, ab) = (&reads[i].arc, &reads[j].arc);
+            if a.outcome != b.outcome || a.splits.len() != b.splits.len() || aa.fin != ab.fin {
                 continue;
             }
             if a.splits.iter().zip(&b.splits).filter(|(x, y)| x != y).count() != 1 {
@@ -1656,11 +1367,11 @@ fn dup_refs(bodies: &mut [AsmBody]) {
                     pairs.push((fa.off, fb.off, fa.kind));
                 }
             }
-            for k in 0..a.arc.roots.len() {
-                if !a.arc.fin && k % crate::trace::verify::ARC_AXIS_ROOTS == 4 {
+            for k in 0..aa.roots.len() {
+                if !aa.fin && k % crate::trace::verify::ARC_AXIS_ROOTS == 4 {
                     continue;
                 }
-                let ((oa, ka), (ob, kb)) = (a.arc.roots[k], b.arc.roots[k]);
+                let ((oa, ka), (ob, kb)) = (aa.roots[k], ab.roots[k]);
                 if ka != kb {
                     ok = false;
                     break;
@@ -1672,11 +1383,12 @@ fn dup_refs(bodies: &mut [AsmBody]) {
             if ok {
                 pairs.sort_unstable_by_key(|p| (p.0, p.1));
                 pairs.dedup_by_key(|p| (p.0, p.1));
-                refs.push(DupRef { body: i, pairs });
+                refs.push(DupRef { body: i, pairs: pairs.into_iter().map(|p| ids.id(p)).collect() });
             }
         }
         bodies[j].dup_refs = refs;
     }
+    ids
 }
 
 /// Where a body's rows get player and room `x`/`y`; `None` (`NO_CELL`)
@@ -1720,29 +1432,6 @@ fn pos_sources(template: &Rt2, fields: &[AsmField]) -> Result<Option<[PosSrc; 4]
         return Ok(None);
     };
     Ok(Some([px, py, rx, ry]))
-}
-
-/// The position cell of lane `i` of a body's output (`start`: the kernel's
-/// room).
-#[inline]
-fn cell_out(body: &AsmBody, buf: &[u8], i: usize, start: (i16, i16)) -> u32 {
-    use crate::search::pos_graph::{cell_of, room_offset, NO_CELL};
-    let Some(srcs) = &body.pos else {
-        return NO_CELL;
-    };
-    let read = |s: PosSrc| -> i16 {
-        match s {
-            PosSrc::Root(base) => {
-                let o = base + i * 4;
-                (i32::from_le_bytes(buf[o..o + 4].try_into().unwrap()) >> 16) as i16
-            }
-            PosSrc::Konst(v) => v,
-        }
-    };
-    let (px, py, rx, ry) = (read(srcs[0]), read(srcs[1]), read(srcs[2]), read(srcs[3]));
-    // The same labelling as `pos_graph::block_cells` (`room_offset`).
-    let (ox, oy) = room_offset(start, rx, ry).unwrap_or_else(|e| panic!("emitted row: {e:#}"));
-    cell_of(px as i32 + ox, py as i32 + oy).unwrap_or_else(|e| panic!("emitted row: {e}"))
 }
 
 /// The accumulator recipe for one outcome, with `shape_hash` and its key's
