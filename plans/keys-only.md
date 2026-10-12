@@ -13,29 +13,53 @@ The running log was `PROGRESS.md` at the worktree root (not committed).
 
 ## The design
 
-**A LAYER** (`storage::layer::Layer`) is a set of states: per storage region
-(ascending) its ENTRIES - a key (ascending in the region) and the mask of
-its cells (8 x 8 regions: a u64) - and the skeletons its shapes' rows
-decode with. 24 B an entry; on the mod room an entry holds 14 states at f40
-(fm85), so ~1.7 B a state against ~92 B a decoded row.
+**ONE STATE SET, used three times** (`storage::set`, 2026-10-12; Philippe:
+"the same structure for the visited set, the frontier and the next layer:
+separate copies of the same thing, nothing that pushes ids around"). A
+`RegionSet` is per storage region (ascending) a `RegionTable` of ENTRIES -
+an exact key and the mask of its cells (8 x 8 regions: a u64):
 
-- The forward's FRONTIER is a layer (the last frame's new states); the
-  NEXT layer is built by the wave. Nothing else holds the frame's states.
-- The VISITED SET (`storage::visited`) is unchanged in form - per (shape,
-  region) a table of entries (key -> cell mask) - and becomes a pure dedup
-  structure: nothing outside it names an entry, so its entries are never
-  renumbered (storage v2 renumbered each frame's new entries in key order
-  to make ids canonical).
+- the VISITED SET (`storage::visited`): INDEXED (a hash index on the keys),
+  with the shapes it numbered and the key space; READ ONLY during a wave;
+- the NEXT LAYER, while a wave builds it: per route an INDEXED table of the
+  cells this frame reached that the visited set lacks (insert or OR);
+- the FRONTIER, a frame's layer read from its file, the next layer once
+  its wave ends: FROZEN (sorted by key, the index dropped) - iterated in
+  (region, key) order, membership by binary search (`storage::layer::Layer`
+  is a frozen set and its shapes' skeletons).
 
-**Philippe's design input** (a medium-weak opinion: a second copy of the
-region tables for the frontier, rather than "new this frame" inside the
-visited tables). Adopted for the frontier, for a reason beyond his: the
-region jobs APPEND to the visited tables during the wave, so a frontier
-that named table entries would be read concurrently with writes. The
-frontier is its own sorted (key, mask) list - walked sequentially, cut into
-units directly, freed when the frame ends - and its order, (region, key),
-is canonical with no entry numbering at all. For the NEXT layer the
-alternatives were measured (below, "New cells: three ways").
+The operations: insert/OR (`insert_or`), membership (`find`, `mask_of`),
+iteration in order, `freeze`, `merge` (a frozen set ORed into an indexed
+one), `rekey` (a wave's provisional keys made final), `union` (a frame and
+its raise), drop. Nothing names an entry outside its table, so entries are
+never renumbered (storage v2 renumbered each frame's new entries in key
+order to make ids canonical).
+
+Lean, so every use gains alike:
+
+- a KEY takes the bytes its table's largest key needs (1-16; the mod room's
+  67-bit keys 9 B, room (6,2)'s 42-bit ones 6 B, a table holding a wave's
+  provisional keys 16); a wider key repacks the table;
+- the INDEX is `u32` slots - the entry and, in the bits the capacity
+  leaves, a tag of the key's hash, so a probe reads a key only on a tag
+  match - at a load of 0.5-0.85 over a non-power-of-two capacity (~5.6 B an
+  entry; the u32 index at 0.25-0.5 was ~11);
+- the keys and masks live in CHUNKS of 32768 entries: a table grows without
+  a copy and holds part of one chunk unused at most (whole-array growth
+  copied the visited set at every frame's end, both copies alive: +3.4 GB
+  at the mod room's f77).
+
+Per entry: key + 8 + ~5.6 B indexed, key + 8 frozen. The visited set at the
+mod room's f76 (17.3 states an entry): 23.2 B an entry, 1.34 B a state
+(2.74 before); its frontier 17 B an entry, 0.95 B a state (1.88).
+
+**Philippe's earlier design input** (a second copy of the region tables for
+the frontier, rather than "new this frame" inside the visited tables) is
+this design's first use: the frontier is its own frozen set - walked
+sequentially, cut into units directly, freed when the frame ends - and its
+order, (region, key), is canonical with no entry numbering. Keeping the
+visited set read only during the wave also makes the region jobs' reads of
+it safe without taking its tables out.
 
 **The wave** (`storage::wave::run_wave`):
 
@@ -58,24 +82,30 @@ alternatives were measured (below, "New cells: three ways").
    frontier's per-row cell and order vectors and the 12 B a row drop
    notes); level -1's drops are noted per lane in the unit and leave it as
    notes per (entry, horizon).
-5. The REGION PHASE dedups each chunk target against its region's table;
-   the cells an entry lacked are new, kept as (entry, cells) EVENTS. A
+5. The REGION PHASE looks each chunk target up in its region's visited
+   table (read only) and ORs the cells it lacks into the route's NEXT-layer
+   table (indexed; a second probe only where a target has new cells); the
+   cells the next table lacked too are new states. A
    job's bundles into PROVISIONAL targets (a code new this frame: no final
    key yet) are encoded into a zstd segment with their provisional keys
    and encoded again with the final ones at the frame's end (held as
    56 B structs they were 5.8 GB at the mod room's fmp f53). At the
-   frame's end each route merges its events and lists its new states by
-   key (`route::seal`) - the NEXT LAYER, assembled by region. Its states
-   are checked to be exactly the region phase's insertions (count), then
-   DECODED once more, in chunks of 4096 on every thread, for their WINS
-   (`frame::wins_of`) and, under `--key-check`, for every row's key
-   against the boundary's and its position against its cell.
+   frame's end each route's next table gets its final keys and is FROZEN
+   (`route::seal`) - the NEXT LAYER, assembled by region. Its states are
+   checked to be exactly the region phase's insertions (count), DECODED
+   once more, in chunks of 4096 on every thread, for their WINS
+   (`frame::wins_of`) and, under `--key-check`, for every row's key against
+   the boundary's and its position against its cell, then MERGED into the
+   visited set (region by region in parallel; none may be held already).
 6. The wave's buffers are bounded and measured (`--phases`: `[wavemem]`
    per frame, the structures by bytes; `[mem]` per phase, the sampled
    peak): a unit keeps at most 512k bundles' room in its emptied buckets,
-   a region worker 1M bundles' between jobs, the segments are held at
-   their compressed size, the exited workers' freed pages are collected
-   (`mi_collect`) after the pipeline and the frame's end.
+   a region worker 1M bundles' between jobs, a job names its targets in the
+   job (the encoder's arrays the job's size: they were the region's, 2 GB
+   at the mod room's f77), the segments are held at their compressed size,
+   slices are 256k lanes (1M: the chunks in flight and region jobs 4x),
+   the exited workers' freed pages are collected (`mi_collect`) after the
+   pipeline and the frame's end.
 
 **Disk: the frame files** (`frames/f{F}.bin`; a raise's additions
 `frames/f{F}.r{seq}.bin`, `checkpoint::FORMAT_VERSION` 15): a header - the
@@ -109,8 +139,9 @@ comparing `SkelRecord`s).
 sorted, zstd. A raise reads them as the layer of sources to re-expand.
 
 **Resume** rebuilds the visited set from the frame files (each frame's
-regions in parallel; a state stored twice is an error); the frontier is
-the last frame's layer, its skeletons from its file. **Raise**: the noted
+layer merged in, its regions in parallel; a state stored twice is an
+error); the frontier is the last frame's layer, its skeletons from its
+file. **Raise**: the noted
 sources the new horizon admits are a layer (their skeletons the frame's),
 expanded beside the states the raise added one frame earlier; a state's
 layer (the refusal of a hit from a later layer) is kept per table place
@@ -123,7 +154,8 @@ piece files (`checkpoint::FrameFile`, `save_block`), `storage::meta`
 `decode::TreeKeys`, `wave::decode_layer`, `DropNotes` by id, `Sources`,
 `Block`'s ids, seq and skip mask, the kernels' skip mask, the visited
 tables' renumbering and `push_numbered`, the routes' per-entry new-cell
-array. 2249 lines deleted, 2752 added (src, crates, ui): the frame file
+array, the new-cell events, the visited tables' take-out for a frame, the
+raise's own map of its new cells. 2249 lines deleted, 2752 added (src, crates, ui): the frame file
 and tree reader (`storage::layer`, 990 lines with its tests), the first
 decoder kept as the test reference (~110), the `[wavemem]` accounting
 (~90).
@@ -167,23 +199,23 @@ decoder kept as the test reference (~110), the `[wavemem]` accounting
   marks' binaries byte-identical to develop's; run.json the same but its
   timings and the renamed `in_entries`/`out_entries`.
 
-## New cells: three ways (Philippe's input, measured)
+## New cells: three ways (measured), then one structure
 
-The region phase must say which cells are new this frame. Three ways were
-weighed on the mod room's fm85 frames (`[fwd]` lines: the regions the frame
-reached held every entry of the visited set's touched tables):
+The region phase must say which cells are new this frame. On the mod
+room's fm85 frames:
 
-| frame | entries of the reached regions | events (a chunk target with new cells) | new entries | per-entry array (8 B an entry, zeroed each frame) | events (16 B) | a second (key -> cells) set during the wave (~32-40 B a new entry) |
+| frame | entries of the reached regions | events (a chunk target with new cells) | new entries | per-entry array (8 B an entry, zeroed each frame) | events (16 B) | a second (key -> cells) set |
 |---|---|---|---|---|---|---|
 | f40 | 14.5M | 3.4M | 1.8M | 116 MB | 55 MB | 58-72 MB |
 | f69 | 67.9M | 14.8M | 7.3M | 543 MB (0.98 GB with growth slack) | 237 MB | 234-292 MB |
 
-Built: the EVENTS - an append per chunk target that found new cells, merged
-per entry and sorted by key at the frame's end. The smallest with the set,
-sequential during the wave (no second probe), and its merge is one sort of
-a few million pairs per route. The set would cost a second hash probe per
-target in the region phase for the same bytes. The per-entry array (storage
-v2's) was the first version here and is gone.
+The events were built first (the smallest with the set, no second probe).
+Philippe chose the set: one structure, three copies, nothing pushing
+entry numbers around - and with the lean table the set is ~29 B a new
+entry indexed during the wave (16 B keys while it can hold provisional
+ones), 17 B frozen. Its second probe costs nothing measurable (the region
+phase's worker time went DOWN, 4.2 -> 2.9 s on the reference frame, with
+the job-local target names and smaller slices).
 
 ## Measurements
 
