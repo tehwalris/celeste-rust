@@ -323,6 +323,9 @@ pub fn run_wave(engine: &dyn FrameStep, parts: &[Part], cx: WaveCtx) -> Result<W
         inflight_max: AtomicUsize::new(0),
     };
     let shapes: Vec<u64> = visited.shapes().to_vec();
+    if s.diag.phases {
+        crate::metrics::mem_phase(&format!("f{frame} start"));
+    }
     let t_pipeline = Instant::now();
     // THE PIPELINE (one scope for the frame): a worker takes a region job
     // first (the oldest slice's, heaviest first), else the next unit - at
@@ -432,6 +435,10 @@ pub fn run_wave(engine: &dyn FrameStep, parts: &[Part], cx: WaveCtx) -> Result<W
     })?;
     let t_units = t_pipeline.elapsed();
     collect_freed();
+    if s.diag.phases {
+        // The wave's anonymous peak (sampled) apart from the frame end's.
+        crate::metrics::mem_phase(&format!("f{frame} units and region jobs"));
+    }
     let busy: std::time::Duration = spent.iter().map(|w| w.0).sum();
     st.t_regions = spent.iter().map(|w| w.1).sum();
     st.t_wave = t_units;
@@ -588,6 +595,9 @@ pub fn run_wave(engine: &dyn FrameStep, parts: &[Part], cx: WaveCtx) -> Result<W
     }
     phases::add(phases::LAYER, tl);
     collect_freed();
+    if s.diag.phases {
+        crate::metrics::mem_phase(&format!("f{frame} the frame's end"));
+    }
     st.t_layer = t.elapsed();
     st.visited_bytes = visited.alloc_bytes();
     st.rss_end = crate::metrics::current_rss_gb();
