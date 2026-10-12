@@ -454,6 +454,25 @@ fn id_ranges(mut sample: Vec<Sk>, total: usize, parts: usize) -> Vec<Sk> {
     bounds
 }
 
+/// The first index at or past `j` whose key is not below `k`, in `v` sorted
+/// by key with every key before `j` below `k`: GALLOPING from `j`. A read
+/// walks each of a region's segments' sorted targets against the group's;
+/// stepping one by one cost every segment the whole group (26% of the mod
+/// room's backward; 256k-lane slices cut its frames into 2.3x the segments).
+fn seek<A, B>(v: &[((u64, u64), A, B)], j: usize, k: (u64, u64)) -> usize {
+    let mut lo = j;
+    let mut step = 1;
+    while lo < v.len() && v[lo].0 < k {
+        let hi = (lo + step).min(v.len());
+        if hi == v.len() || v[hi].0 >= k {
+            return lo + 1 + v[lo + 1..hi].partition_point(|x| x.0 < k);
+        }
+        lo = hi;
+        step *= 2;
+    }
+    lo
+}
+
 /// BACKWARD: `W_t` for `t = horizon` down to 0 (`Backward::step`, a frame at
 /// a time), from the win states `wins` (id, layer); with `spill`, the
 /// closed spans and W's nodes go to scratch files there (`Spill`).
@@ -648,9 +667,7 @@ impl<'a> Backward<'a> {
                                 ranks.clear();
                                 let mut j = 0usize;
                                 for &tk in &blk.t_keys {
-                                    while j < targets.len() && targets[j].0 < tk {
-                                        j += 1;
-                                    }
+                                    j = seek(&targets, j, tk);
                                     let mut m = 0u64;
                                     let mut e = j;
                                     while e < targets.len() && targets[e].0 == tk {
@@ -2007,6 +2024,30 @@ mod tests {
     use super::*;
     use crate::search::arc_edges::AxisXfer;
     use crate::search::arcs::{pieces, point, Action, Seg, Set, CIRCLE};
+
+    /// `seek` is the linear walk: from every start and for every key, over
+    /// groups with repeated keys, gaps and runs.
+    #[test]
+    fn seek_finds_what_the_linear_walk_finds() {
+        let mut x = 0x9e37_79b9_7f4a_7c15u64;
+        let mut rnd = |n: u64| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x % n
+        };
+        for len in [0usize, 1, 2, 3, 7, 64, 1000] {
+            let mut v: Vec<((u64, u64), u8, u32)> = (0..len).map(|_| ((rnd(3), rnd(200)), 0, 0)).collect();
+            v.sort_unstable();
+            for _ in 0..200 {
+                let k = (rnd(4), rnd(220));
+                let below = v.partition_point(|t| t.0 < k);
+                for j in 0..=below {
+                    assert_eq!(seek(&v, j, k), below, "len {len} from {j} to {k:?}");
+                }
+            }
+        }
+    }
 
     /// An action on one point of the circle.
     fn apply(a: Action, p: u32) -> u32 {
