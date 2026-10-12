@@ -302,3 +302,83 @@ RAM, not disk or time, is the limit.
   pit within 10 frames (`--start-inputs` from it: refuted to +75, the
   forward empty by +10). The balloon (x >= 113 to touch, the only dash
   refill and the only way up into the right area) is not reached by f185.
+
+### Keys-only (develop 2ef9213, merged b8edfbe) and the room's geometry (2026-10-12)
+
+Keys-only memory: +105 from mid, f67 (365M rows in, 400M new) at 16 GB
+(~44 B a row in, against ~250 before). The +105 run was stopped at f67:
+the frames grew 9-10%/frame (f60 211M -> f67 400M) and project to ~2.5B a
+frame at its peak (~f87, ~20 min a frame, ~110 GB): over the RAM and ~10 h.
+
+Where the route has to go (tiles from the map; 17/27/43/59 are the
+up/down/left/right-facing spikes, non-solid):
+- The exit (row 0, cols 9-11, down-spikes) is reached only from the
+  exit chamber (cols 10-11, rows 1-3), which opens only right, along the
+  row-3 corridor (y 24-31, x 80-127; down-spikes above at row 2 cols 12-15,
+  up-spikes below at row 4 cols 9-15).
+- The corridor is reached only from below, through row 4's up-spikes
+  (safe moving up) and row 5's one gap, col 12 (x 96-103, y 40-47), from
+  the RIGHT SHAFT (rows 6-12, cols 11-15: x 88-127, y 48-103; its left side
+  col 10 left-facing spikes over the solid col 9).
+- The shaft is reached only from the PIT (rows 14-15, cols 12-15, no floor:
+  falling out is death) through col 15 at row 13 (x 120-127, y 104-111).
+  The pit holds the balloon (x 120, y 112; touched at player x >= 113,
+  y 104-117) - the only dash refill on the right.
+- The pit is reached from the mid area only through the STRIP (row 14,
+  cols 10-11: up-spikes, ceiling above at y <= 111, floor below): player y
+  109-110 or moving up - a dash along the ceiling.
+So: strip (dash) -> pit -> balloon -> up into the shaft -> up 56+ px to the
+gap -> corridor -> left -> up through the exit spikes. Measured: the
+earliest strip crossing from the load is f157, its dash spent, ~1.4-1.55
+px/frame right and falling: it reaches x ~107 at y ~126 (dead), short of
+the balloon's x 113.
+
+### bal200 stopped; is the balloon reachable at all? (2026-10-12)
+
+bal200 (the balloon from the load, keys-only, r0sxhe, level -1 200):
+stopped at f181 - 731M new states a frame (+6.8%/frame), 800 s a frame,
+10.85B visited, the scope at 71 GB of its 80 GB cap: it would have hit the
+cap around f186-190 (frames to f200 another ~8 h), and up to f185 is
+already refuted. Wait for the unified RegionSet (visited 2.74 -> 1.34 B a
+state, the frontier 1.88 -> 0.95).
+
+The physics says the balloon may be unreachable at ANY horizon, which would
+make the right side - and the exit - unreachable with max_djump 1:
+- The strip (x 74-94 of player.x) is safe only at player.y 109-110 with
+  yspd >= 0 (up-spikes: (y+7)%8 >= 6 kills; the ceiling stops y < 109) or
+  while moving up. Air speed without a dash is <= 1 px/frame (`maxrun`);
+  a dash gives 5, 3.5, 2, 2 px over its 4 frames (12.5 px, y held), then
+  2 px decaying 0.15/frame whatever the input, and 3 frames of gravity
+  before y reaches 111: ~18-21 px in all - just the strip's width. So
+  every crossing spends the dash and leaves the strip at x ~95-98 with
+  spd.x <= 1.7 (measured: 1.25-1.55) and y 109-111.
+- No refill on the way (no ground, wall or refill object at the strip's
+  far end; the spring and the strawberries are on the left).
+- From there the balloon needs x >= 113 while y <= 117: 15+ px in ~5
+  frames of falling - x reaches ~104-105 by then (the 252 crossings at
+  f157-160 measured: all die in the pit within 10 frames).
+So either the intended route uses a mechanic we do not model (it would
+show as a replay mismatch - none so far), or the room needs something the
+argument above misses. Checking it exactly is cheap: the crossing states
+are few (252 by f160); `--start-inputs` from each, `--win-at` the balloon,
++20, settles their whole future.
+
+Checked exactly: the 252 crossings of f157-160 (20 distinct states by
+position, speed, remainder, djump) - `--start-inputs` each, `--win-at
+113..127,100..120` (the balloon), +20: all 20 REFUTED (7-16 s each; what
+survives to +20 is the respawn after the death).
+
+The minimal cart's mechanics against the original (the mod's Lua is the
+original's; `p8cart.luadiff` of lua/celeste-minimal.lua against it):
+every refill is there - the spring (`hit.djump=max_djump`), the balloon,
+the strawberry and the fly fruit, the orb (max_djump 2) - in the same
+order within the frame; the player's update differs only by the dropped
+jump buffer (a press is replayed at its firing frame: reachability is the
+same), the smoke/sound/shake/hair/sprite code (no object reads it), and
+the tracer's rewrites of `obj.move` (`flr(r + 0.5)` as `__split_by_flr`
+of `r + 0.5`, the same numbers); `_update` skips `move(0, 0)` (a no-op).
+The strawberries refill the dash but all three are on the left (x 16 and
+40); the room's other refill sources (the spring at (48,96)) are left of
+the strip too. Wall jumps: the only wall near the strip is the left pit's
+left side (col 5, x 40-47): a kick of 2 px/frame right, 25+ px short of the
+strip. So nothing the minimal cart lacks changes the strip argument.
