@@ -382,3 +382,55 @@ The strawberries refill the dash but all three are on the left (x 16 and
 the strip too. Wall jumps: the only wall near the strip is the left pit's
 left side (col 5, x 40-47): a kick of 2 px/frame right, 25+ px short of the
 strip. So nothing the minimal cart lacks changes the strip argument.
+
+### Exact reach over bal200 (2026-10-12, `rewrite reach`, branch exact-reach)
+
+`rewrite reach --checkpoint-dir /var/tmp/mod-ck/bal200 --to 200` (the
+search's settings; out: /var/tmp/mod-ck/bal200-reach, cells per frame in
+bal200-reach-cells.txt, log logs/reach200h.*): from the load at its exact
+remainder, every reached state's remainder set pushed along its recorded
+edges through their transfers, frame by frame, W = everything. 75 min, 30
+threads, RssAnon peak 79 GB (the scope's cap raised to 90G at f178; the
+held out-edges, the loaded layers and the frames' sets). A set past 1024
+segments (a cloud of the remainders many paths leave) is snapped outward
+to the finest 2^k grid that fits: that state and everything it reaches
+are INEXACT (supersets), 43% of the states at f143, 87% at f200 - every
+count below is an upper bound on the exact one. UI: `mod00-reach-h200`,
+level 2, "exact reach among states that level -1 kept for the balloon by
+h200".
+
+Level -1: the forward dropped successors only from f174 on (sources noted
+per frame, `l1_noted_sources`: 4.3M at f174, 162M at f182, 0.1M by f198).
+A dropped successor of a state reached at t comes at t+1 or later and was
+dropped because level -1 (sound) bounds it out of the balloon by h200: for
+the balloon the reach is complete; for "where can the player be" it lacks
+only such too-late states.
+
+- Right-most reached x per frame: 32 to f45 (the spawn), 65 by f100 and
+  still at f140, 82 at f150, 95 at f156, 104 at f160, 114 at f165, 116 from
+  f189.
+- The strip: first crossed at f156 (x 95, y 111); at f157 x 96-97, y 111.
+  Every decoded state past it (865, x >= 96 and y >= 100, at most 20 a
+  frame) has djump 0; the exact ones at f157: spd.x 1.25-1.55, spd.y +0.42
+  to +0.84 (falling), dash_effect_time 1-3 - the dash spent on the strip,
+  as the physics argument says.
+- The balloon (x >= 113, y 104-117): never reached. x >= 113 only at y
+  124-127 (falling out of the pit, f165 on). Closest: (110,119) at f186,
+  3.6 px short (x +3, y -2); 5 px at f163.
+- Against the forward: reached at f100 76k states (its layer 5.4M), f143
+  506k (30.8M), f180 5.1M (719M); ever reached 21.0M of the 13.3B visited
+  (0.16%).
+
+For an exact-remainder forward (the coordinator's question; `summary.txt`,
+`rem_stats.tsv`, `reach.tsv` in bal200-reach):
+- The sets are small clouds: per axis 5-64 segments for half the states
+  (1 segment for 15-30%), spanning <= 1/256 of the circle (1/256 px) for
+  85% of the exact states at every frame; the wide ones (up to the full
+  circle, 25-45% late) are almost all inexact.
+- First arrival in (state, remainder) - a state expanded again whenever
+  its union of sets grows: entries per state 1: 9.74M, 2: 5.42M, 3-5:
+  2.00M, 6+: 3.73M; 89M expansions (a lower bound: unions capped at 32
+  segments) to 223M (a state entering at every frame it is reached),
+  against the forward's 13.3B: 0.7-1.7%.
+- Edges: the states ever reached have 295M distinct out-edges (the forward
+  emitted 550B lanes); 191M (65%) ever pushed a non-empty set.
