@@ -332,3 +332,33 @@ gap -> corridor -> left -> up through the exit spikes. Measured: the
 earliest strip crossing from the load is f157, its dash spent, ~1.4-1.55
 px/frame right and falling: it reaches x ~107 at y ~126 (dead), short of
 the balloon's x 113.
+
+### bal200 stopped; is the balloon reachable at all? (2026-10-12)
+
+bal200 (the balloon from the load, keys-only, r0sxhe, level -1 200):
+stopped at f181 - 731M new states a frame (+6.8%/frame), 800 s a frame,
+10.85B visited, the scope at 71 GB of its 80 GB cap: it would have hit the
+cap around f186-190 (frames to f200 another ~8 h), and up to f185 is
+already refuted. Wait for the unified RegionSet (visited 2.74 -> 1.34 B a
+state, the frontier 1.88 -> 0.95).
+
+The physics says the balloon may be unreachable at ANY horizon, which would
+make the right side - and the exit - unreachable with max_djump 1:
+- The strip (x 74-94 of player.x) is safe only at player.y 109-110 with
+  yspd >= 0 (up-spikes: (y+7)%8 >= 6 kills; the ceiling stops y < 109) or
+  while moving up. Air speed without a dash is <= 1 px/frame (`maxrun`);
+  a dash gives 5, 3.5, 2, 2 px over its 4 frames (12.5 px, y held), then
+  2 px decaying 0.15/frame whatever the input, and 3 frames of gravity
+  before y reaches 111: ~18-21 px in all - just the strip's width. So
+  every crossing spends the dash and leaves the strip at x ~95-98 with
+  spd.x <= 1.7 (measured: 1.25-1.55) and y 109-111.
+- No refill on the way (no ground, wall or refill object at the strip's
+  far end; the spring and the strawberries are on the left).
+- From there the balloon needs x >= 113 while y <= 117: 15+ px in ~5
+  frames of falling - x reaches ~104-105 by then (the 252 crossings at
+  f157-160 measured: all die in the pit within 10 frames).
+So either the intended route uses a mechanic we do not model (it would
+show as a replay mismatch - none so far), or the room needs something the
+argument above misses. Checking it exactly is cheap: the crossing states
+are few (252 by f160); `--start-inputs` from each, `--win-at` the balloon,
++20, settles their whole future.
