@@ -492,6 +492,8 @@ pub fn backward(store: &EdgeStore, pairs: &[(Transfer, Transfer)], wins: &[(Sk, 
 /// bench-backward` times one `step`.
 pub struct Backward<'a> {
     store: &'a EdgeStore,
+    /// Per target region the first frame with edges into it.
+    first: FxHashMap<u32, u32>,
     pairs: &'a [(Transfer, Transfer)],
     horizon: u32,
     threads: usize,
@@ -541,6 +543,7 @@ impl<'a> Backward<'a> {
         let changed: Vec<u32> = (0..cur.len() as u32).collect();
         Backward {
             store,
+            first: store.first_frames(),
             pairs,
             horizon,
             threads: threads.max(1),
@@ -594,16 +597,20 @@ impl<'a> Backward<'a> {
     /// The work of a step's reads: the changed nodes (in state order, so
     /// region by region) grouped by REGION - a region's in-edges are its
     /// segments at a frame, decoded whole - each group read frame by frame
-    /// from the least layer among its nodes (at least 1) to `t + 1`: one
-    /// ITEM a (region, frame), numbered group-major. Per group its first
-    /// item, its first frame and its range of `changed`; then the total.
+    /// from the region's first frame with in-edges to `t + 1`: one ITEM a
+    /// (region, frame), numbered group-major. Per group its first item, its
+    /// first frame and its range of `changed`; then the total. Not from the
+    /// group's least LAYER: the hull forward records an edge at its source's
+    /// layer + 1 whatever its push then, so its target may be first reached
+    /// LATER than the edge's frame (when the source's hull grew into the
+    /// edge's guard).
     fn read_items(&self, t: u32) -> Vec<(usize, u32, usize, usize)> {
         let mut items = Vec::new();
         let (mut at, mut a) = (0usize, 0usize);
         while a < self.changed.len() {
             let region = self.cur[self.changed[a] as usize].id.region;
             let b = a + self.changed[a..].partition_point(|&c| self.cur[c as usize].id.region == region);
-            let first = self.changed[a..b].iter().map(|&c| self.cur[c as usize].layer() as u32).min().unwrap_or(0).max(1);
+            let first = self.first.get(&region).copied().unwrap_or(t + 1).max(1);
             items.push((at, first, a, b));
             at += (t + 2).saturating_sub(first) as usize;
             a = b;
@@ -615,10 +622,10 @@ impl<'a> Backward<'a> {
     /// One ROUND of a step's reads: from item `start` on (`read_items`), on
     /// `threads` workers, until the round holds `round_emits` in-edges -
     /// the in-edges recorded at an item's frame into its region's changed
-    /// targets of layer <= the frame (frames <= t + 1 at step t: their
-    /// sources have layers <= t). Per worker its in-edges sorted and
-    /// distinct; and where the round stopped. A round stops between items,
-    /// so one heavy region bounds it by its in-edges at one frame.
+    /// targets (frames <= t + 1 at step t: their sources have layers <= t).
+    /// Per worker its in-edges sorted and distinct; and where the round
+    /// stopped. A round stops between items, so one heavy region bounds it
+    /// by its in-edges at one frame.
     fn read_round(&self, items: &[(usize, u32, usize, usize)], start: usize) -> anyhow::Result<(Vec<(Vec<Emit>, ReadStats)>, usize)> {
         use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
         let (cur, changed, store, budget) = (&self.cur, &self.changed, self.store, self.round_emits);
@@ -631,9 +638,9 @@ impl<'a> Backward<'a> {
                     sc.spawn(|| -> anyhow::Result<(Vec<Emit>, ReadStats)> {
                         let (mut emits, mut stats) = (Vec::new(), ReadStats::default());
                         let mut dec = crate::storage::edges::Decoder::default();
-                        // The group's targets of layer <= the frame, by
-                        // (key, cell): their sets; per block target rank,
-                        // its changed cells and its first target.
+                        // The group's targets, by (key, cell): their sets;
+                        // per block target rank, its changed cells and its
+                        // first target.
                         let mut targets: Vec<((u64, u64), u8, u32)> = Vec::new();
                         let mut ranks: Vec<(u64, u32)> = Vec::new();
                         while held.load(Relaxed) < budget {
@@ -648,12 +655,7 @@ impl<'a> Backward<'a> {
                             targets.clear();
                             for &n in &changed[a..b] {
                                 let n = &cur[n as usize];
-                                if n.layer() as u32 <= f {
-                                    targets.push((n.id.key, n.id.local, n.set));
-                                }
-                            }
-                            if targets.is_empty() {
-                                continue;
+                                targets.push((n.id.key, n.id.local, n.set));
                             }
                             let before = emits.len();
                             let slot = region % geo.slots;

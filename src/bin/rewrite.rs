@@ -245,10 +245,11 @@ enum Command {
         /// fresh one).
         #[arg(long)]
         edges: bool,
-        /// Also fingerprint each frame's level -1 drop notes (`d{frame}
-        /// count hash`) by their sources' (shape, key, cell) and horizons.
+        /// Also fingerprint each frame's FRONTIER (`h{frame} count hash`,
+        /// its hull file): every state whose remainder hull grew there, by
+        /// its (shape, key, cell), layer and hull.
         #[arg(long)]
-        dropped: bool,
+        hulls: bool,
         /// With `--edges`: print frame F's edges (target, source, transfer)
         /// on stderr, to diff two trees' edges at the frame whose line differs.
         #[arg(long)]
@@ -1058,7 +1059,7 @@ fn main() -> Result<()> {
             to,
             cells: top_cells,
             edges,
-            dropped,
+            hulls,
             dump_edges,
         } => {
             let dir = std::path::Path::new(&checkpoint_dir);
@@ -1101,25 +1102,17 @@ fn main() -> Result<()> {
                     }
                 }
             }
-            // The level -1 drop notes per frame: each noted source by what it
-            // is and its horizon.
-            if dropped {
-                for frame in 1..=to {
+            // The frontier per frame: each state whose hull grew, with its
+            // layer and hull.
+            if hulls {
+                for frame in 0..=to {
                     // A forward whose frontier died has no frames past it.
                     if !celeste_rust::storage::layer::frame_exists(dir, frame) {
                         break;
                     }
-                    let notes = celeste_rust::storage::layer::read_notes(&celeste_rust::storage::layer::notes_path(dir, frame))?;
-                    let (mut n, mut acc) = (0u64, 0u64);
-                    for &(region, key, h, mask) in &notes {
-                        let shape = tree.shape_of(region)?;
-                        for local in celeste_rust::storage::layer::bits(mask) {
-                            let node = content.state(shape, key, geo.cell(region % geo.slots, local));
-                            acc = acc.wrapping_add(celeste_engine::runtime2::mix64(node ^ (h as u64).rotate_left(32)));
-                            n += 1;
-                        }
-                    }
-                    println!("d{frame:03} {n} {acc:016x}");
+                    let grown = celeste_rust::storage::hulls::read(&celeste_rust::storage::hulls::path(dir, frame))?;
+                    let (n, acc) = celeste_rust::storage::hulls::fingerprint(&grown, &tree.space, &tree.shapes)?;
+                    println!("h{frame:03} {n} {acc:016x}");
                 }
             }
             if let Some(top) = top_cells {
@@ -1147,12 +1140,13 @@ fn main() -> Result<()> {
             let t = std::time::Instant::now();
             let st = celeste_rust::frame::ForwardState::at(&dir, frame, true, level, &cfg)?;
             eprintln!(
-                "[bench] kernels built in {t_kernels:.2} s; f{frame} loaded in {:.2} s: {} lanes in {} entries ({:.3} GB, {:.2} B a state), visited {} states in {} entries ({:.3} GB, {:.2} B a state); {} threads; rss {:.2} GB",
+                "[bench] kernels built in {t_kernels:.2} s; f{frame} loaded in {:.2} s: {} lanes in {} entries ({:.3} GB, {:.2} B a state) and {} old states, visited {} states in {} entries ({:.3} GB, {:.2} B a state); {} threads; rss {:.2} GB",
                 t.elapsed().as_secs_f64(),
-                st.frontier().states(),
-                st.frontier().entries(),
-                st.frontier().alloc_bytes() as f64 / 1e9,
-                st.frontier().alloc_bytes() as f64 / st.frontier().states().max(1) as f64,
+                st.frontier().new.states(),
+                st.frontier().new.entries(),
+                st.frontier().new.alloc_bytes() as f64 / 1e9,
+                st.frontier().new.alloc_bytes() as f64 / st.frontier().new.states().max(1) as f64,
+                st.frontier().old.len(),
                 st.visited_len(),
                 st.visited().entries(),
                 st.visited().alloc_bytes() as f64 / 1e9,
@@ -1170,15 +1164,20 @@ fn main() -> Result<()> {
                 let t_all = t.elapsed();
                 let w = &wave.stats;
                 eprintln!(
-                    "[bench] rep {rep}: wave {:.0} ms (idle {:.0}%, regions {:.0} worker-ms) end {:.0} total {:.0} ms | in {} emitted {} kept {} | units {} slices {} routes {} | edges {} bundles {} ({:.3} B) | rss start {:.2} wave {:.2} end {:.2} peak {:.2} GB",
+                    "[bench] rep {rep}: wave {:.0} ms (idle {:.0}%, regions {:.0} worker-ms) re-push {:.0} end {:.0} total {:.0} ms | in {} old {} emitted {} re-pushed {} pushes {} kept {} grown {} | units {} slices {} routes {} | edges {} bundles {} ({:.3} B) | rss start {:.2} wave {:.2} end {:.2} peak {:.2} GB",
                     ms(w.t_wave),
                     w.wave_idle * 100.0,
                     ms(w.t_regions),
+                    ms(w.t_repush),
                     ms(w.t_layer),
                     ms(t_all),
                     w.lanes_in,
+                    w.old_in,
                     w.lanes_raw,
+                    w.repush_edges,
+                    w.pushes,
                     w.lanes_kept,
+                    w.grown,
                     w.units,
                     w.slices,
                     w.routes,
@@ -1192,6 +1191,8 @@ fn main() -> Result<()> {
                 );
                 let (n, acc) = wave.next.content_fingerprint(&visited.keys, visited.shapes())?;
                 let mut out = format!("f{:03} {n} {acc:016x}\n", frame + 1);
+                let (nh, ah) = celeste_rust::storage::hulls::fingerprint(&wave.frontier_states(frame + 1), &visited.keys, visited.shapes())?;
+                out += &format!("h{:03} {nh} {ah:016x}\n", frame + 1);
                 if edges {
                     let (n, acc) = celeste_rust::storage::bench::edge_fingerprint(&scratch, frame + 1, &xfers, &visited, cfg.threads())?;
                     out += &format!("e{:03} {n} {acc:016x}\n", frame + 1);

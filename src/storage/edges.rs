@@ -380,6 +380,17 @@ impl EdgeStore {
         Ok(EdgeStore { frames, xfers, edges, bytes })
     }
 
+    /// Frame `frame`'s edge file (the next past the store's horizon, just
+    /// written and trusted) mapped in: the forward's store grows with it.
+    pub fn add_frame(&mut self, dir: &Path, frame: u32) -> Result<()> {
+        ensure!(frame as usize == self.frames.len(), "edge store: frame {frame} after {}", self.frames.len() - 1);
+        let file = EdgeFile::open(&file_path(dir, frame, None), frame)?;
+        self.edges += file.head.segs.iter().map(|s| s.edges).sum::<u64>();
+        self.bytes += file.map.len() as u64;
+        self.frames.push(vec![file]);
+        Ok(())
+    }
+
     /// The transfer of global id `xfer`.
     pub fn pair(&self, xfer: u32) -> Option<Pair> {
         self.xfers.get(xfer as usize).copied()
@@ -398,6 +409,19 @@ impl EdgeStore {
     /// The last frame of the store.
     pub fn horizon(&self) -> u32 {
         self.frames.len() as u32 - 1
+    }
+
+    /// Per target region the first frame with edges into it.
+    pub fn first_frames(&self) -> FxHashMap<u32, u32> {
+        let mut m: FxHashMap<u32, u32> = FxHashMap::default();
+        for (f, files) in self.frames.iter().enumerate().rev() {
+            for file in files {
+                for h in &file.head.segs {
+                    m.insert(h.region, f as u32);
+                }
+            }
+        }
+        m
     }
 
     /// The target regions with edges at frame `frame`, sorted, distinct.

@@ -17,18 +17,21 @@
 //!                 (the visited set, the next layer while a wave builds it)
 //!                 or frozen (the frontier, a frame read back)
 //!   * `layer`   - a frozen set with its skeletons (the frontier, the next
-//!                 layer), the frame files, the drop notes, the tree reader
+//!                 layer), the frame files, the tree reader
+//!   * `hulls`   - the hull files: each frame's frontier with its states'
+//!                 layers and remainder hulls
 //!   * `decode`  - rows from (shape skeleton, key, cell)
 //!   * `bench`   - `--emit-capture` and `rewrite bench-storage`
 //!
 //! A state is `(shape, key, cell)` (the key holds no position:
 //! `runtime2::pos_code`) and is named so everywhere (`Sk`): the edges, the
-//! frame files, the drop notes, the backward. No state has a number.
+//! frame files, the hull files, the backward. No state has a number.
 
 pub mod bench;
 pub mod bundle;
 pub mod decode;
 pub mod edges;
+pub mod hulls;
 pub mod layer;
 pub mod route;
 pub mod set;

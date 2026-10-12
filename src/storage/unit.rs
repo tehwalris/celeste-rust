@@ -3,9 +3,11 @@
 //! reset per unit) ORs each emission into its BUNDLE of its target's route
 //! (`route::UnitBundles`: source key, transfer, offset, target key ->
 //! target cells) - nothing is looked up and no row is copied here: the
-//! target region's worker dedups the states and merges the edges
+//! target region's worker merges the pushes and records the edges
 //! (`route::run_route`), and the new layer is decoded from the keys
-//! (`wave`). At the unit's end its bundles are the chunks of their routes.
+//! (`wave`). At the unit's end its bundles are the chunks of their routes,
+//! each with its PUSHES: per target cell the hulls of the unit's sources
+//! pushed along the bundles' transfers (`search::hull`).
 
 use anyhow::Result;
 use celeste_core::pico8_num::Pico8Num as P8;
@@ -15,7 +17,9 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use super::decode::Skeletons;
 use super::route::{Chunk, Routes, UnitBundles, NO_XFER};
 use super::visited::{Key, VisitedSet};
-use crate::frame::{Filters, Raised};
+use crate::frame::Filters;
+use crate::search::arcs::Transfer;
+use crate::search::hull::{Hull, HullAcc};
 use celeste_engine::exact::{is_provisional, KeySpace, Provisional, RowKey};
 
 /// A typed varying column of buffered rows: raw 16.16 words, (low, high)
@@ -160,9 +164,7 @@ pub(crate) fn lanes_of(mut m: u16) -> impl Iterator<Item = usize> {
 /// A slice's TARGETS in one cell column of one output shape
 /// (`UnitSink::targets`, once per column, not per body): per lane its cell,
 /// route and bit in the route's region, its source (the unit's source
-/// index and region) and the offset between the two cells; `skip`, the
-/// lanes a raise does not emit (the tree's own filter admitted them: their
-/// states and edges are the tree's).
+/// index and region) and the offset between the two cells.
 #[derive(Clone, Copy)]
 pub struct Targets {
     pub cells: [u32; 16],
@@ -171,19 +173,19 @@ pub struct Targets {
     offset: [u32; 16],
     src: [u32; 16],
     s_region: [u32; 16],
-    skip: u16,
 }
 
 impl Default for Targets {
     fn default() -> Self {
-        Targets { cells: [0; 16], route: [0; 16], local: [0; 16], offset: [0; 16], src: [0; 16], s_region: [0; 16], skip: 0 }
+        Targets { cells: [0; 16], route: [0; 16], local: [0; 16], offset: [0; 16], src: [0; 16], s_region: [0; 16] }
     }
 }
 
 /// ONE BODY's emissions of a kernel slice (`compiled::asm_kernel`'s
 /// emission, column-wise): the lanes `take`, lane `i` the state `(shape,
 /// keys[i], targets.cells[i])` reached from unit lane `lanes[i]` with
-/// transfer `xfers[i]` (`None`: edges are not recorded).
+/// transfer `xfers[i]` (`None`: the engine knows none - the reference's
+/// rows - and the target is pushed the whole circle).
 pub struct BodyEmits<'e> {
     pub shape: u64,
     pub take: u16,
@@ -191,12 +193,6 @@ pub struct BodyEmits<'e> {
     pub targets: &'e Targets,
     pub xfers: Option<&'e [u32; 16]>,
     pub lanes: &'e [usize],
-}
-
-/// What a raise's units need beyond a wave's: which sources are the tree's.
-#[derive(Clone, Copy)]
-pub struct RaiseCtx {
-    pub raised: Raised,
 }
 
 /// A (route, key, cell) target as the coarser level's verdicts name it.
@@ -215,29 +211,23 @@ pub struct UnitSink<'a> {
     /// The level the wave runs at (a reference row's key view).
     level: crate::abstraction::Level,
     pub worker: u32,
-    /// Are level -1's drops noted (the sources of the rows it drops)?
-    note_drops: bool,
-    raise: Option<RaiseCtx>,
-    record_edges: bool,
     /// The unit's index in the wave.
     pub unit: u32,
-    /// Are the unit's sources the tree's (a raise; not the raise's own)?
-    pub sources_old: bool,
     /// The unit's sources: its entries `(region, key)`, each one's index
     /// among the unit's distinct `(shape, key)`s (`unit_sources`, the
-    /// chunks' source list), and per lane its entry and cell.
+    /// chunks' source list), and per lane its entry, cell and hull.
     srcs: Vec<(u32, Key)>,
     src_local: Vec<u32>,
     lanes: Vec<(u32, u32)>,
+    hulls: Vec<Hull>,
     unit_sources: Vec<(u32, Key)>,
     src_idx: rustc_hash2::FxHashMap<(u32, Key), u32>,
-    /// Per lane the smallest horizon admitting a successor level -1 dropped
-    /// (`u32::MAX`: none), and the worker's notes so far (per noted source
-    /// entry and horizon, its cells).
-    drop_min: Vec<u32>,
-    pub notes: Vec<super::layer::Note>,
-    /// This worker's routes, and the last one asked.
+    /// The unit's lanes' hulls by (unit source, cell), sorted: a bundle's
+    /// source cell is its target cell less its offset.
+    src_hulls: Vec<(u32, u32, Hull)>,
+    /// This worker's routes (and their slots), and the last one asked.
     route_ids: FxHashMap<(u64, u32), u32>,
+    route_slot: FxHashMap<u32, u32>,
     last_route: (u64, u32, u32),
     /// The unit's bundles by route, and its (route, source region) pairs.
     bundles: UnitBundles,
@@ -257,11 +247,12 @@ pub struct UnitSink<'a> {
     check: Vec<RowBuf>,
     /// `--phases`: the wave's phase timers (`frame::phases`).
     pub phases: bool,
-    /// The level -1 table of `filters.minus_one` (or a raise's old filter:
-    /// the same table), resolved once.
+    /// The level -1 table of `filters.minus_one`, resolved once.
     l1: Option<&'static crate::trace::level_minus_one::CostToGo>,
-    drop_last: Option<((u64, u32), Option<u32>)>,
+    drop_last: Option<((u64, u32), bool)>,
     xfer_ids: FxHashMap<crate::search::arc_edges::Pair, u32>,
+    /// Per local transfer id its decoded transfers (the pushes').
+    xfer_pairs: Vec<(Transfer, Transfer)>,
     /// Per local transfer id, the edges this worker recorded with it (the
     /// frame's new transfers are numbered by their count: `wave`).
     xfer_counts: Vec<u64>,
@@ -307,12 +298,10 @@ impl<'a> UnitSink<'a> {
         level: crate::abstraction::Level,
         worker: u32,
         xfer_tab: &'a std::sync::RwLock<Vec<crate::search::arc_edges::Pair>>,
-        record_edges: bool,
         edges_on: bool,
-        raise: Option<RaiseCtx>,
         s: &crate::settings::Settings,
     ) -> Self {
-        let l1 = filters.minus_one.or(raise.as_ref().map(|r| r.raised.old)).map(|m| m.table(s));
+        let l1 = filters.minus_one.map(|m| m.table(s));
         UnitSink {
             keys: &visited.keys,
             routes,
@@ -322,19 +311,16 @@ impl<'a> UnitSink<'a> {
             frame,
             level,
             worker,
-            note_drops: filters.notes_drops() && record_edges,
-            raise,
-            record_edges,
             unit: 0,
-            sources_old: false,
             srcs: Vec::new(),
             src_local: Vec::new(),
             lanes: Vec::new(),
+            hulls: Vec::new(),
             unit_sources: Vec::new(),
             src_idx: Default::default(),
-            drop_min: Vec::new(),
-            notes: Vec::new(),
+            src_hulls: Vec::new(),
             route_ids: FxHashMap::default(),
+            route_slot: FxHashMap::default(),
             last_route: (0, u32::MAX, u32::MAX),
             bundles: UnitBundles::default(),
             src_regions: Vec::new(),
@@ -348,6 +334,7 @@ impl<'a> UnitSink<'a> {
             l1,
             drop_last: None,
             xfer_ids: Default::default(),
+            xfer_pairs: Vec::new(),
             xfer_counts: Vec::new(),
             xfer_cache: Vec::new(),
             xfer_tab,
@@ -368,15 +355,15 @@ impl<'a> UnitSink<'a> {
     }
 
     /// Bytes this worker's buffers hold (`--phases`' `[wavemem]`): its
-    /// bundles, its drop notes, its pos-graph pairs, the rest (the unit's
+    /// bundles, its lanes' hulls, its pos-graph pairs, the rest (the unit's
     /// sources and lanes, transfers, chunks not yet handed over).
     pub fn alloc_bytes(&self) -> [usize; 4] {
         [
             self.bundles.alloc_bytes(),
-            std::mem::size_of::<super::layer::Note>() * self.notes.capacity(),
+            std::mem::size_of::<Hull>() * self.hulls.capacity() + std::mem::size_of::<(u32, u32, Hull)>() * self.src_hulls.capacity(),
             9 * self.pos_edges.capacity() + 8 * self.pos_recent.capacity(),
             24 * (self.srcs.capacity() + self.unit_sources.capacity())
-                + 4 * (self.src_local.capacity() + self.drop_min.capacity())
+                + 4 * self.src_local.capacity()
                 + 8 * self.lanes.capacity()
                 + 32 * self.src_idx.capacity()
                 + 40 * self.xfer_ids.capacity()
@@ -409,17 +396,10 @@ impl<'a> UnitSink<'a> {
         }
     }
 
-    /// Are edges recorded (an edges dir)?
-    #[inline]
-    pub fn records_edges(&self) -> bool {
-        self.record_edges
-    }
-
-    /// Start unit `unit` of the wave (`old`: its sources are the tree's, a
-    /// raise); its sources and lanes follow (`push_source`, `push_lane`).
-    pub fn begin(&mut self, unit: u32, old: bool) {
+    /// Start unit `unit` of the wave; its sources and lanes follow
+    /// (`push_source`, `push_lane`).
+    pub fn begin(&mut self, unit: u32) {
         self.unit = unit;
-        self.sources_old = old;
         self.bundles.clear();
         self.src_regions.clear();
         self.verdicts.clear();
@@ -427,9 +407,9 @@ impl<'a> UnitSink<'a> {
         self.srcs.clear();
         self.src_local.clear();
         self.lanes.clear();
+        self.hulls.clear();
         self.unit_sources.clear();
         self.src_idx.clear();
-        self.drop_min.clear();
     }
 
     /// The unit's next source entry `(region, key)`; its index.
@@ -446,17 +426,22 @@ impl<'a> UnitSink<'a> {
         self.srcs.len() as u32 - 1
     }
 
-    /// The unit's next lane: a state of source entry `entry` at `cell`.
+    /// The unit's next lane: a state of source entry `entry` at `cell`,
+    /// with its hull.
     #[inline]
-    pub fn push_lane(&mut self, entry: u32, cell: u32) {
+    pub fn push_lane(&mut self, entry: u32, cell: u32, hull: Hull) {
         self.lanes.push((entry, cell));
+        self.hulls.push(hull);
     }
 
-    /// The unit's sources and lanes are in: the capture's unit record.
+    /// The unit's sources and lanes are in: their hulls by (source, cell),
+    /// the capture's unit record.
     pub fn sources_done(&mut self) {
-        self.drop_min.resize(self.lanes.len(), u32::MAX);
+        self.src_hulls.clear();
+        self.src_hulls.extend(self.lanes.iter().zip(&self.hulls).map(|(&(entry, cell), &h)| (self.src_local[entry as usize], cell, h)));
+        self.src_hulls.sort_unstable_by_key(|x| (x.0, x.1));
         if let Some(c) = &mut self.capture {
-            c.unit(self.unit, self.lanes.len() as u32, self.sources_old);
+            c.unit(self.unit, self.lanes.len() as u32);
         }
     }
 
@@ -466,57 +451,33 @@ impl<'a> UnitSink<'a> {
         self.filters.minus_one.is_some()
     }
 
-    /// The level -1 filter at EMISSION: `Some(from)` where it drops every
-    /// row of (`shape`, `cell`) at this frame, so the row is never keyed or
+    /// The level -1 filter at EMISSION: does it drop every row of
+    /// (`shape`, `cell`) at this frame? Then the row is never keyed or
     /// looked up. Half the emissions of room (6,2) 100% f57.
     #[inline]
-    fn minus_one_drop(&mut self, shape: u64, cell: u32) -> Option<u32> {
-        let m = self.filters.minus_one?;
+    fn minus_one_drop(&mut self, shape: u64, cell: u32) -> bool {
+        let Some(m) = self.filters.minus_one else { return false };
         if let Some((at, r)) = self.drop_last {
             if at == (shape, cell) {
                 return r;
             }
         }
-        let from = self.l1.expect("the level -1 table").admitted_from(shape, cell, self.frame);
-        let r = (from > m.h).then_some(from);
+        let r = self.l1.expect("the level -1 table").admitted_from(shape, cell, self.frame) > m.h;
         self.drop_last = Some(((shape, cell), r));
         r
     }
 
     /// `minus_one_drop` of the lanes `need` of a slice, rows of `shape` at
-    /// `cells`: the lanes it drops, each one's `from`.
+    /// `cells`: the lanes it drops.
     #[inline]
-    pub fn minus_one_drops(&mut self, shape: u64, cells: &[u32; 16], need: u16, from: &mut [u32; 16]) -> u16 {
+    pub fn minus_one_drops(&mut self, shape: u64, cells: &[u32; 16], need: u16) -> u16 {
         let mut dropped = 0u16;
         for i in lanes_of(need) {
-            if let Some(f) = self.minus_one_drop(shape, cells[i]) {
+            if self.minus_one_drop(shape, cells[i]) {
                 dropped |= 1 << i;
-                from[i] = f;
             }
         }
         dropped
-    }
-
-    /// The rows level -1 dropped at emission: the lanes `dropped` of a
-    /// slice (`lanes`: their unit lanes), each one's source noted (`from`,
-    /// `dropped`).
-    pub fn dropped_lanes(&mut self, dropped: u16, from: &[u32; 16], lanes: &[usize]) {
-        for i in lanes_of(dropped) {
-            self.dropped(lanes[i], from[i]);
-        }
-    }
-
-    /// A row level -1 dropped, from `lane`: its source is noted (`from`:
-    /// the smallest horizon admitting it), in a level-0 tree a raise extends.
-    #[inline]
-    pub fn dropped(&mut self, lane: usize, from: u32) {
-        if let Some(c) = &mut self.capture {
-            c.dropped(lane as u32, from);
-        }
-        if self.note_drops {
-            let m = &mut self.drop_min[lane];
-            *m = (*m).min(from);
-        }
     }
 
     /// The pos-graph edges (when edges are on) from the unit lanes `lanes`
@@ -584,6 +545,7 @@ impl<'a> UnitSink<'a> {
         self.xfer_tab.write().expect("a transfer table").push(t);
         self.xfer_len += 1;
         self.xfer_ids.insert(t, id);
+        self.xfer_pairs.push((t.0.transfer(), t.1.transfer()));
         self.xfer_counts.push(0);
         id
     }
@@ -609,6 +571,7 @@ impl<'a> UnitSink<'a> {
             None => {
                 let r = self.routes.id(shape, slot);
                 self.route_ids.insert((shape, slot), r);
+                self.route_slot.insert(r, slot);
                 r
             }
         };
@@ -632,31 +595,15 @@ impl<'a> UnitSink<'a> {
     /// lanes), rows of `shape` at `cells` (`Targets`).
     pub fn targets(&mut self, shape: u64, cells: &[u32; 16], need: u16, lanes: &[usize], t: &mut Targets) {
         t.cells = *cells;
-        t.skip = 0;
-        // A raise re-expands sources of the tree: where the tree's own
-        // filter admitted this cell, the edges are recorded already and the
-        // state is in the tree.
-        if let Some(r) = &self.raise {
-            if self.sources_old {
-                let l1 = self.l1.expect("the level -1 table");
-                for i in lanes_of(need) {
-                    if l1.admitted_from(shape, cells[i], self.frame) <= r.raised.old.h {
-                        t.skip |= 1 << i;
-                    }
-                }
-            }
-        }
-        for i in lanes_of(need & !t.skip) {
+        for i in lanes_of(need) {
             let cell = cells[i];
             let (slot, local) = super::GEOMETRY.slot_local(cell);
             t.route[i] = self.route(shape, slot);
             t.local[i] = local as u8;
-            if self.record_edges {
-                let (entry, s_cell) = self.lanes[lanes[i]];
-                t.src[i] = self.src_local[entry as usize];
-                t.s_region[i] = self.srcs[entry as usize].0;
-                t.offset[i] = super::bundle::offset(s_cell, cell);
-            }
+            let (entry, s_cell) = self.lanes[lanes[i]];
+            t.src[i] = self.src_local[entry as usize];
+            t.s_region[i] = self.srcs[entry as usize].0;
+            t.offset[i] = super::bundle::offset(s_cell, cell);
         }
     }
 
@@ -682,7 +629,7 @@ impl<'a> UnitSink<'a> {
     /// when a row is looked at (a verdict, the key check, the decode guard).
     pub fn emit_body(&mut self, e: &BodyEmits, init: impl Fn() -> Rt2, mut push: impl FnMut(&mut RowBuf, usize)) -> Result<()> {
         let (shape, t) = (e.shape, e.targets);
-        let mut take = e.take & !t.skip;
+        let mut take = e.take;
         if take == 0 {
             return Ok(());
         }
@@ -747,8 +694,9 @@ impl<'a> UnitSink<'a> {
             }
         }
         // THE BUNDLES: lanes into one bundle (one source entry's cells
-        // reaching one target key alike) ORed together first.
-        let Some(xfers) = e.xfers.filter(|_| self.record_edges) else {
+        // reaching one target key alike) ORed together first. Without a
+        // transfer (the reference's rows) a bundle is its target alone.
+        let Some(xfers) = e.xfers else {
             for i in lanes_of(take) {
                 self.bundles.insert(t.route[i], e.keys[i], 0, NO_XFER, 0, 1u64 << t.local[i]);
             }
@@ -853,7 +801,7 @@ impl<'a> UnitSink<'a> {
         if self.edges_on {
             self.pos_edge(lane, cell);
         }
-        if self.minus_one_drop(row.shape_hash, cell).is_some() {
+        if self.minus_one_drop(row.shape_hash, cell) {
             return Ok(());
         }
         let (w, key) = self.row_key(row);
@@ -902,9 +850,46 @@ impl<'a> UnitSink<'a> {
         }
     }
 
+    /// The PUSHES of a route's bundles (`bundles` naming `targets` by
+    /// index, the route at `slot`): per target cell, the hulls of the
+    /// bundles' source cells pushed along their transfers (`Hull::push`;
+    /// a bundle without a transfer pushes the whole circle), merged -
+    /// `(target, cell, hull so far)`, the cells nothing reached left out.
+    fn pushes(&self, slot: u32, targets: &[(Key, u64)], bundles: &[super::route::Ub]) -> Vec<(u32, u8, HullAcc)> {
+        let geo = super::GEOMETRY;
+        let mut acc: rustc_hash2::FxHashMap<(u32, u8), HullAcc> = Default::default();
+        for b in bundles {
+            let mut m = b.mask;
+            while m != 0 {
+                let c = m.trailing_zeros();
+                m &= m - 1;
+                let mut one = HullAcc::EMPTY;
+                if b.x == NO_XFER {
+                    one.add_hull(&Hull::full());
+                } else {
+                    let s_cell = super::bundle::source_cell(geo.cell(slot, c), b.o);
+                    let at = self.src_hulls.partition_point(|x| (x.0, x.1) < (b.s, s_cell));
+                    let h = match self.src_hulls.get(at) {
+                        Some(x) if (x.0, x.1) == (b.s, s_cell) => x.2,
+                        _ => panic!("unit {}: a bundle's source cell {s_cell} of source {} is no lane of the unit", self.unit, b.s),
+                    };
+                    let (tx, ty) = self.xfer_pairs[b.x as usize];
+                    if !h.push(tx, ty, &mut one) {
+                        continue;
+                    }
+                }
+                acc.entry((b.t, c as u8)).or_default().merge(&one);
+            }
+        }
+        debug_assert!(acc.keys().all(|k| (k.0 as usize) < targets.len()));
+        let mut out: Vec<(u32, u8, HullAcc)> = acc.into_iter().map(|((t, c), a)| (t, c, a)).collect();
+        out.sort_unstable_by_key(|x| (x.0, x.1));
+        out
+    }
+
     /// The unit is over: its rows checked, its last verdicts decided (a
     /// disallowed target's records go), its buckets the chunks of their
-    /// routes.
+    /// routes, each with its pushes.
     pub fn end(&mut self) -> Result<()> {
         let t = crate::frame::phases::start(self.phases);
         for i in 0..self.check.len() {
@@ -913,28 +898,6 @@ impl<'a> UnitSink<'a> {
             }
         }
         self.decide()?;
-        // The unit's noted sources, per entry and horizon (an entry's lanes
-        // are consecutive).
-        let mut at = 0usize;
-        while at < self.lanes.len() {
-            let entry = self.lanes[at].0;
-            let end = at + self.lanes[at..].iter().take_while(|l| l.0 == entry).count();
-            let (region, key) = self.srcs[entry as usize];
-            let first = self.notes.len();
-            for lane in at..end {
-                let h = self.drop_min[lane];
-                if h == u32::MAX {
-                    continue;
-                }
-                let (slot, local) = super::GEOMETRY.slot_local(self.lanes[lane].1);
-                debug_assert_eq!(slot, region % super::GEOMETRY.slots);
-                match self.notes[first..].iter_mut().find(|n| n.2 == h) {
-                    Some(n) => n.3 |= 1u64 << local,
-                    None => self.notes.push((region, key, h, 1u64 << local)),
-                }
-            }
-            at = end;
-        }
         let v = &self.verdicts;
         let drop = |route: u32, key: Key, c: u32| v.get(&(route, key, c as u8)) == Some(&VERDICT_NO);
         let buckets = self.bundles.drain(if self.disallowed { Some(&drop) } else { None });
@@ -955,7 +918,9 @@ impl<'a> UnitSink<'a> {
                 }
                 srcs.next();
             }
-            self.outbox.push(Chunk { route, unit: self.unit, worker: self.worker, targets, sources: sources.clone(), bundles, src_regions });
+            let slot = *self.route_slot.get(&route).expect("a route this worker made");
+            let pushes = self.pushes(slot, &targets, &bundles);
+            self.outbox.push(Chunk { route, unit: self.unit, worker: self.worker, targets, pushes, sources: sources.clone(), bundles, src_regions });
         }
         crate::frame::phases::add(crate::frame::phases::END_UNIT, t);
         Ok(())

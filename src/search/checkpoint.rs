@@ -17,8 +17,11 @@ const MAGIC: &[u8; 4] = b"C8TB";
 /// (plans/rows-from-keys.md). 15: NO IDS - a frame file is its new states'
 /// keys and cell masks per region with the frame's codebook additions and
 /// skeletons, the drop notes masks per (region, key, horizon)
-/// (plans/keys-only.md).
-pub const FORMAT_VERSION: u32 = 15;
+/// (plans/keys-only.md). 16: THE HULL FORWARD - a frame's states are
+/// those its remainder hulls first reach, its hull file the frontier with
+/// every state's layer and hull; no drop notes (plans/architecture.md "The
+/// forward frame").
+pub const FORMAT_VERSION: u32 = 16;
 
 /// Save any serializable value (the marks, the pos-graph) under the same
 /// header, uncompressed bincode.

@@ -4,6 +4,7 @@
 //!                    raw fixed-width columns, rows in id order
 //!   * `arc_edges`  - per recorded edge, the remainder transfer
 //!   * `arcs`       - sets of remainders as arcs of the circle
+//!   * `hull`       - a state's remainder hull (the forward's): one arc per axis
 //!   * `arc_dp`     - THE SEARCH: winning sets, optimum, concrete search
 //!   * `known`      - a known solution checked against every pruning step
 //!   * `pos_graph`  - player-position cells and the position graph
@@ -14,6 +15,7 @@ pub mod arc_dp;
 pub mod arc_edges;
 pub mod arcs;
 pub mod checkpoint;
+pub mod hull;
 pub mod inspect;
 pub mod known;
 pub mod pos_graph;

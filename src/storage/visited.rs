@@ -1,23 +1,35 @@
 //! THE VISITED SET: every state the forward has reached - a `set::RegionSet`
 //! (per (shape, region) a table of entries: a position-free key and a mask
 //! over the region's cells), INDEXED, with the shapes it numbered and the key
-//! space its keys are in. A pure dedup structure, and READ-ONLY during a
-//! wave: the wave's new states go to the next layer (another `RegionSet`),
-//! which the frame's end merges in (`merge`).
+//! space its keys are in, and per state its LAYER and remainder HULL
+//! (`StateInfo`). READ-ONLY during a wave: the wave's new states go to the
+//! next layer (another `RegionSet`), which the frame's end merges in
+//! (`merge`), and the hulls that grew are set then (`set_info`).
 
 use anyhow::Result;
 use rustc_hash::FxHashMap;
 
 use super::set::{RegionSet, RegionTable};
 use super::{region_of, Geometry};
+use crate::search::hull::Hull;
 
 /// A state's EXACT packed key within its shape (`celeste_engine::exact`).
 pub use celeste_engine::exact::Key;
 use celeste_engine::exact::KeySpace;
 
+/// A state's LAYER (the frame the forward first reached it, whose wave
+/// expanded it) and its remainder HULL so far.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StateInfo {
+    pub hull: Hull,
+    pub layer: u16,
+}
+
 /// The visited set: the shapes (index -> hash, in the order the tree
-/// numbered them), the states (`RegionSet`, by `storage::region_of`), and
-/// the key space their keys are in (read-only during a wave).
+/// numbered them), the states (`RegionSet`, by `storage::region_of`), the
+/// key space their keys are in (read-only during a wave), and per state its
+/// layer and hull (per region, by `entry << 6 | cell`: entries keep their
+/// places).
 #[derive(Clone)]
 pub struct VisitedSet {
     pub geo: Geometry,
@@ -25,11 +37,12 @@ pub struct VisitedSet {
     shapes: Vec<u64>,
     shape_idx: FxHashMap<u64, u32>,
     set: RegionSet,
+    info: FxHashMap<u32, FxHashMap<u32, StateInfo>>,
 }
 
 impl VisitedSet {
     pub fn new(geo: Geometry) -> Self {
-        VisitedSet { geo, keys: KeySpace::new(), shapes: Vec::new(), shape_idx: FxHashMap::default(), set: RegionSet::default() }
+        VisitedSet { geo, keys: KeySpace::new(), shapes: Vec::new(), shape_idx: FxHashMap::default(), set: RegionSet::default(), info: FxHashMap::default() }
     }
 
     pub fn shape_index(&self, shape: u64) -> Option<u32> {
@@ -111,6 +124,36 @@ impl VisitedSet {
         Ok(held.into_iter().sum())
     }
 
+    /// The layer and hull of the state at cell `local` of entry `e` of
+    /// region `region`'s table.
+    #[inline]
+    pub fn info(&self, region: u32, e: u32, local: u32) -> Option<StateInfo> {
+        self.info.get(&region)?.get(&(e << 6 | local)).copied()
+    }
+
+    /// The layer and hull of state `(region, key, local)`, if held.
+    pub fn state(&self, region: u32, key: Key, local: u32) -> Option<StateInfo> {
+        let e = self.table(region)?.find(key)?;
+        self.info(region, e, local)
+    }
+
+    /// SET the layer and hull of states `(key, local)` of region `region`
+    /// (held by the set: checked).
+    pub fn set_info(&mut self, region: u32, states: impl Iterator<Item = (Key, u32, StateInfo)>) -> Result<()> {
+        let t = self.set.table(region).ok_or_else(|| anyhow::anyhow!("region {region}: no table for its states' hulls"))?;
+        let m = self.info.entry(region).or_default();
+        for (key, local, i) in states {
+            let e = t.find(key).filter(|&e| t.mask(e) >> local & 1 == 1).ok_or_else(|| anyhow::anyhow!("region {region}: a hull for a state the set lacks"))?;
+            m.insert(e << 6 | local, i);
+        }
+        Ok(())
+    }
+
+    /// The states with a layer and hull.
+    pub fn infos(&self) -> usize {
+        self.info.values().map(|m| m.len()).sum()
+    }
+
     /// States held.
     pub fn len(&self) -> usize {
         self.set.states() as usize
@@ -125,7 +168,8 @@ impl VisitedSet {
         self.set.entries()
     }
 
+    /// Bytes allocated: the set's, and the hulls' (their maps' slots).
     pub fn alloc_bytes(&self) -> usize {
-        self.set.alloc_bytes()
+        self.set.alloc_bytes() + self.info.values().map(|m| m.capacity() * (std::mem::size_of::<(u32, StateInfo)>() + 1)).sum::<usize>()
     }
 }

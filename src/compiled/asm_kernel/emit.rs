@@ -496,7 +496,6 @@ struct Cols {
     cells: Vec<[u32; 16]>,
     col_need: Vec<u16>,
     drop_mask: Vec<u16>,
-    drop_from: Vec<[u32; 16]>,
     targets: Vec<crate::storage::unit::Targets>,
 }
 
@@ -528,7 +527,6 @@ impl Cols {
         sized(&mut self.cells, plan.pos.len());
         zeroed(&mut self.col_need, plan.columns.len());
         zeroed(&mut self.drop_mask, plan.columns.len());
-        sized(&mut self.drop_from, plan.columns.len());
         if self.targets.len() < plan.columns.len() {
             self.targets.resize(plan.columns.len(), Default::default());
         }
@@ -580,16 +578,14 @@ impl AsmKernel {
             }
         }
         // LEVEL -1 first, per column: a dropped cell's row needs no key,
-        // transfer or lookup, only its source's note (and its pos-graph
-        // edge, above).
+        // transfer or lookup (only its pos-graph edge, above).
         if sink.drops_at_emission() {
             for bi in bodies() {
                 c.col_need[plan.bodies[bi].column as usize] |= takes[bi];
             }
             for (k, &(shape, pos)) in plan.columns.iter().enumerate() {
                 if c.col_need[k] != 0 {
-                    c.drop_mask[k] = sink.minus_one_drops(plan.shapes[shape as usize], &c.cells[pos as usize], c.col_need[k], &mut c.drop_from[k]);
-                    sink.dropped_lanes(c.col_need[k] & c.drop_mask[k], &c.drop_from[k], lanes);
+                    c.drop_mask[k] = sink.minus_one_drops(plan.shapes[shape as usize], &c.cells[pos as usize], c.col_need[k]);
                     c.col_need[k] = 0;
                 }
             }
@@ -643,19 +639,18 @@ impl AsmKernel {
             };
             c.read_high[r] = c.read_placed[r].high();
         }
-        // THE TRANSFERS, per root set: lanes of one transfer one lookup.
-        if sink.records_edges() {
-            for (k, (set, outcome)) in plan.arcs.iter().enumerate() {
-                let mut left = c.arc_need[k];
-                while left != 0 {
-                    let r = left.trailing_zeros() as usize;
-                    let same = set.same_as(buf, r, left);
-                    left &= !same;
-                    let words = set.words(buf, r);
-                    let id = sink.xfer_id_raw(&words, |w| ArcSlots::decode(&set.raw(w, chunk, lanes[r], *outcome), chunk, lanes[r], *outcome));
-                    for i in lanes_of(same) {
-                        c.arc_ids[k][i] = id;
-                    }
+        // THE TRANSFERS, per root set: lanes of one transfer one lookup
+        // (every push needs its edge's).
+        for (k, (set, outcome)) in plan.arcs.iter().enumerate() {
+            let mut left = c.arc_need[k];
+            while left != 0 {
+                let r = left.trailing_zeros() as usize;
+                let same = set.same_as(buf, r, left);
+                left &= !same;
+                let words = set.words(buf, r);
+                let id = sink.xfer_id_raw(&words, |w| ArcSlots::decode(&set.raw(w, chunk, lanes[r], *outcome), chunk, lanes[r], *outcome));
+                for i in lanes_of(same) {
+                    c.arc_ids[k][i] = id;
                 }
             }
         }
@@ -697,7 +692,7 @@ impl AsmKernel {
             }
             emitted += take.count_ones() as u64;
             let targets = &c.targets[b.column as usize];
-            let e = crate::storage::unit::BodyEmits { shape, take, keys: &out_keys, targets, xfers: sink.records_edges().then_some(&c.arc_ids[b.arc as usize]), lanes };
+            let e = crate::storage::unit::BodyEmits { shape, take, keys: &out_keys, targets, xfers: Some(&c.arc_ids[b.arc as usize]), lanes };
             let cols = &self.body_cols[bi];
             if let Err(e) = sink.emit_body(&e, || (*template.union).clone_block(), |row, i| cols.push_row(row, buf, i, out_keys[i], targets.cells[i])) {
                 panic!("frame step: {e:#}");

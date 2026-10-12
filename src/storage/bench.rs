@@ -7,13 +7,14 @@
 //! alone.
 //!
 //! A capture: per wave worker `w{n}.bin`, tagged little-endian records in
-//! unit order - UNIT (`1`, unit index u32, lanes u32, sources old u8), EMIT
-//! (`2`, shape u64, key u64 u64, cell u32, lane u32 (in the unit), transfer
-//! u32 (`u32::MAX`: none)), DROP (`3`, lane u32, from u32), MISS (`4`, length
-//! u32, a bincode `exact::MissKey`: the content of the next EMIT's
-//! provisional key, re-interned by the replay) and SHAPE (`5`, length u32,
-//! a bincode `exact::ShapeRecord`: a shape the key space lacks) - and its transfer
-//! table `x{n}.bin` (`encode_pair` each, the EMIT ids index it); `env.txt`.
+//! unit order - UNIT (`1`, unit index u32, lanes u32), EMIT (`2`, shape
+//! u64, key u64 u64, cell u32, lane u32 (in the unit), transfer u32
+//! (`u32::MAX`: none)), MISS (`4`, length u32, a bincode `exact::MissKey`:
+//! the content of the next EMIT's provisional key, re-interned by the
+//! replay) and SHAPE (`5`, length u32, a bincode `exact::ShapeRecord`: a
+//! shape the key space lacks) - and its transfer table `x{n}.bin`
+//! (`encode_pair` each, the EMIT ids index it); `env.txt`. The lanes'
+//! hulls are the frontier's (the replay's wave runs from the tree).
 //! Rows are not captured: the new states' wins are decoded from their keys,
 //! each shape with the tree's latest skeleton of it.
 
@@ -45,12 +46,11 @@ impl CaptureWriter {
         Some(CaptureWriter { dir, worker, out: std::io::BufWriter::with_capacity(8 << 20, f) })
     }
 
-    pub fn unit(&mut self, unit: u32, lanes: u32, old: bool) {
-        let mut b = [0u8; 10];
+    pub fn unit(&mut self, unit: u32, lanes: u32) {
+        let mut b = [0u8; 9];
         b[0] = 1;
         b[1..5].copy_from_slice(&unit.to_le_bytes());
         b[5..9].copy_from_slice(&lanes.to_le_bytes());
-        b[9] = old as u8;
         self.out.write_all(&b).expect("a capture write");
     }
 
@@ -82,15 +82,6 @@ impl CaptureWriter {
         b[25..29].copy_from_slice(&cell.to_le_bytes());
         b[29..33].copy_from_slice(&lane.to_le_bytes());
         b[33..37].copy_from_slice(&xfer.unwrap_or(u32::MAX).to_le_bytes());
-        self.out.write_all(&b).expect("a capture write");
-    }
-
-    #[inline]
-    pub fn dropped(&mut self, lane: u32, from: u32) {
-        let mut b = [0u8; 9];
-        b[0] = 3;
-        b[1..5].copy_from_slice(&lane.to_le_bytes());
-        b[5..9].copy_from_slice(&from.to_le_bytes());
         self.out.write_all(&b).expect("a capture write");
     }
 
@@ -147,7 +138,7 @@ impl Capture {
             while pos < b.len() {
                 ensure!(b[pos] == 1, "{}: a unit record expected at byte {pos}", p.display());
                 let (unit, lanes) = (u32_at(pos + 1), u32_at(pos + 5));
-                pos += 10;
+                pos += 9;
                 let start = pos;
                 let mut emits = 0u64;
                 while pos < b.len() && b[pos] != 1 {
@@ -156,7 +147,6 @@ impl Capture {
                             pos += 37;
                             emits += 1;
                         }
-                        3 => pos += 9,
                         4 | 5 => pos += 5 + u32_at(pos + 1) as usize,
                         t => anyhow::bail!("{}: record tag {t} at byte {pos}", p.display()),
                     }
@@ -197,11 +187,6 @@ impl crate::frame::FrameStep for Replay<'_> {
         let mut miss: Option<Key> = None;
         while pos < b.len() {
             match b[pos] {
-                3 => {
-                    sink.dropped(u32_at(pos + 1) as usize, u32_at(pos + 5));
-                    pos += 9;
-                    continue;
-                }
                 4 | 5 => {
                     let n = u32_at(pos + 1) as usize;
                     let bytes = &b[pos + 5..pos + 5 + n];
