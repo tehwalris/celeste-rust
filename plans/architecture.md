@@ -409,7 +409,7 @@ plans/keys-only.md the rest: no state ids, no rows held):
   f77 before).
 - **The wave** (`storage::wave::run_wave`), one pipeline a frame: the
   frontier cut into UNITS of whole entries of one shape (a 256th of the
-  frame, 1024-4096 states plus at most 63) and the units into SLICES (~1M
+  frame, 1024-4096 states plus at most 63) and the units into SLICES (~256k
   states). A unit is DECODED right before the kernels (`decode::decode_rows`,
   a field's code once per entry); `frame::not_expanded` is decided on it -
   for the forward's own frontier, a resume's and a raise's alike - and only
@@ -423,16 +423,18 @@ plans/keys-only.md the rest: no state ids, no rows held):
   transfers get their global ids and its chunks become REGION JOBS (one
   per (route, slice)), which the workers take before the next slice's
   units: the region phase overlaps the kernels.
-- **The region phase** (`storage::route::run_route`): per chunk target ONE
-  probe of the region's table and an OR - the cells the entry lacked are
-  the new states, kept as (entry, cells) events - and the job's bundles
-  encoded into one zstd SEGMENT of the frame's edge file. A region's table
-  is written only by its route's jobs, one at a time.
+- **The region phase** (`storage::route::run_route`): per chunk target one
+  probe of its region's visited table (read only) and, where it has cells
+  the visited set lacks, an OR into the route's next-layer table - the
+  cells that table lacked too are the new states - and the job's bundles
+  encoded into one zstd SEGMENT of the frame's edge file. A route's next
+  table is written only by its jobs, one at a time.
 - **The frame's end**: provisional keys made final, new shapes numbered,
-  each route's new states listed by key (`route::seal`): the NEXT LAYER,
-  its count checked against the region phase's insertions; its states
-  DECODED once more in chunks on every thread for their wins (and, under
-  `--key-check`, each row's key and cell); the edge file written. The
+  each route's next table FROZEN (`route::seal`): the NEXT LAYER, its count
+  checked against the region phase's insertions; its states DECODED once
+  more in chunks on every thread for their wins (and, under `--key-check`,
+  each row's key and cell); merged into the visited set; the edge file
+  written. The
   forward then writes the FRAME FILE (`frames/f{F}.bin`: per region a zstd
   block of the new entries' keys, masks and win masks; a header with the
   shapes numbered, the key space's additions and the shapes' skeletons),
@@ -444,8 +446,8 @@ plans/keys-only.md the rest: no state ids, no rows held):
   every emission's skeleton the shape's (FATAL otherwise); `--key-check`
   compares every row.
 - **Resume** rebuilds the visited set from the frame files (each frame's
-  regions in parallel; a state stored twice is an error); the frontier is
-  the last frame's layer. Readers (`layer::Tree`) give a frame's layer, a
+  layer merged in, regions in parallel; a state stored twice is an error);
+  the frontier is the last frame's layer. Readers (`layer::Tree`) give a frame's layer, a
   state's layer, rows decoded on demand.
 
 The result is a function of the frame, not of scheduling or the thread

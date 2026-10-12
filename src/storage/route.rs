@@ -390,7 +390,7 @@ impl Chunk {
 }
 
 impl RouteState {
-    /// Bytes its new-cell slots, provisional bundles and segments hold.
+    /// Bytes its next-layer table, provisional bundles and segments hold.
     pub fn alloc_bytes(&self) -> [usize; 3] {
         [self.next.alloc_bytes(), self.prov.iter().map(|s| s.1.bytes.capacity()).sum::<usize>(), self.segs.iter().map(|s| s.1.bytes.capacity()).sum::<usize>()]
     }
