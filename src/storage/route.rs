@@ -166,9 +166,15 @@ pub struct UnitBundles {
     last: Option<(u32, u32)>,
     /// `drain`'s target index.
     t_idx: rustc_hash2::FxHashMap<Key, u32>,
-    /// Emptied buckets, kept for the next units (their pages stay mapped).
+    /// Emptied buckets, kept for the next units (their pages stay mapped),
+    /// at most `SPARE_KEEP` bundles' room in all: kept without a bound,
+    /// every bucket grew to the largest route's (56 MB a worker on the mod
+    /// room's f53).
     spare: Vec<Vec<(Key, Ub)>>,
 }
+
+/// The bundles' room `UnitBundles` keeps in its emptied buckets.
+const SPARE_KEEP: usize = 1 << 17;
 
 #[inline]
 fn ub_hash(k: u32, t_key: Key, b: &Ub) -> u64 {
@@ -190,9 +196,13 @@ impl UnitBundles {
         if self.n > 0 {
             self.index.fill(0);
         }
+        let mut room: usize = self.spare.iter().map(Vec::capacity).sum();
         for (_, mut v) in self.buckets.drain(..) {
-            v.clear();
-            self.spare.push(v);
+            if room + v.capacity() <= SPARE_KEEP {
+                room += v.capacity();
+                v.clear();
+                self.spare.push(v);
+            }
         }
         self.bucket_of.clear();
         (self.last_route, self.last, self.n) = (None, None, 0);
