@@ -156,7 +156,7 @@ enum Inst {
 }
 
 /// The type of a root value: how to read its output slot.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum RootKind {
     Num,
     Bool,

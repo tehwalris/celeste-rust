@@ -142,6 +142,56 @@ const VERDICT_BATCH: usize = 1024;
 
 /// Entries of `UnitSink::xfer_id_raw`'s cache.
 const XFER_CACHE: usize = 1 << 12;
+/// Entries of `UnitSink::pos_edge`'s cache (a power of two).
+const POS_RECENT: usize = 1 << 10;
+
+/// The lanes of a slice mask, lowest first.
+#[inline]
+fn lanes_of(mut m: u16) -> impl Iterator<Item = usize> {
+    std::iter::from_fn(move || {
+        (m != 0).then(|| {
+            let i = m.trailing_zeros() as usize;
+            m &= m - 1;
+            i
+        })
+    })
+}
+
+/// A slice's TARGETS in one cell column of one output shape
+/// (`UnitSink::targets`, once per column, not per body): per lane its cell,
+/// route and bit in the route's region, its source (the unit's source
+/// index and region) and the offset between the two cells; `skip`, the
+/// lanes a raise does not emit (the tree's own filter admitted them: their
+/// states and edges are the tree's).
+#[derive(Clone, Copy)]
+pub struct Targets {
+    pub cells: [u32; 16],
+    route: [u32; 16],
+    local: [u8; 16],
+    offset: [u32; 16],
+    src: [u32; 16],
+    s_region: [u32; 16],
+    skip: u16,
+}
+
+impl Default for Targets {
+    fn default() -> Self {
+        Targets { cells: [0; 16], route: [0; 16], local: [0; 16], offset: [0; 16], src: [0; 16], s_region: [0; 16], skip: 0 }
+    }
+}
+
+/// ONE BODY's emissions of a kernel slice (`compiled::asm_kernel`'s
+/// emission, column-wise): the lanes `take`, lane `i` the state `(shape,
+/// keys[i], targets.cells[i])` reached from unit lane `lanes[i]` with
+/// transfer `xfers[i]` (`None`: edges are not recorded).
+pub struct BodyEmits<'e> {
+    pub shape: u64,
+    pub take: u16,
+    pub keys: &'e [Key; 16],
+    pub targets: &'e Targets,
+    pub xfers: Option<&'e [u32; 16]>,
+    pub lanes: &'e [usize],
+}
 
 /// What a raise's units need beyond a wave's: which sources are the tree's.
 #[derive(Clone, Copy)]
@@ -221,8 +271,10 @@ pub struct UnitSink<'a> {
     pub outbox: Vec<Chunk>,
     /// Record `edges` (the pos graph) at all.
     pub edges_on: bool,
-    /// The distinct pos-graph edges this worker produced.
-    pub pos_edges: FxHashSet<(u32, u32)>,
+    /// The distinct pos-graph edges this worker produced, and the ones met
+    /// recently (direct-mapped: a slice's lanes repeat their edges).
+    pos_edges: FxHashSet<(u32, u32)>,
+    pos_recent: Vec<(u32, u32)>,
     /// Emissions past level -1 (each one a record).
     pub emitted: u64,
     /// `--emit-capture`: this worker's stream (`bench`).
@@ -299,6 +351,7 @@ impl<'a> UnitSink<'a> {
             outbox: Vec::new(),
             edges_on,
             pos_edges: Default::default(),
+            pos_recent: Vec::new(),
             emitted: 0,
             capture: super::bench::CaptureWriter::open(frame, worker, level, s),
             noted: Default::default(),
@@ -317,7 +370,7 @@ impl<'a> UnitSink<'a> {
         [
             self.bundles.alloc_bytes(),
             std::mem::size_of::<super::layer::Note>() * self.notes.capacity(),
-            9 * self.pos_edges.capacity(),
+            9 * self.pos_edges.capacity() + 8 * self.pos_recent.capacity(),
             24 * (self.srcs.capacity() + self.unit_sources.capacity())
                 + 4 * (self.src_local.capacity() + self.drop_min.capacity())
                 + 8 * self.lanes.capacity()
@@ -402,11 +455,17 @@ impl<'a> UnitSink<'a> {
         }
     }
 
+    /// Does level -1 drop rows at emission (`minus_one_drops`)?
+    #[inline]
+    pub fn drops_at_emission(&self) -> bool {
+        self.filters.minus_one.is_some()
+    }
+
     /// The level -1 filter at EMISSION: `Some(from)` where it drops every
     /// row of (`shape`, `cell`) at this frame, so the row is never keyed or
     /// looked up. Half the emissions of room (6,2) 100% f57.
     #[inline]
-    pub fn minus_one_drop(&mut self, shape: u64, cell: u32) -> Option<u32> {
+    fn minus_one_drop(&mut self, shape: u64, cell: u32) -> Option<u32> {
         let m = self.filters.minus_one?;
         if let Some((at, r)) = self.drop_last {
             if at == (shape, cell) {
@@ -417,6 +476,29 @@ impl<'a> UnitSink<'a> {
         let r = (from > m.h).then_some(from);
         self.drop_last = Some(((shape, cell), r));
         r
+    }
+
+    /// `minus_one_drop` of the lanes `need` of a slice, rows of `shape` at
+    /// `cells`: the lanes it drops, each one's `from`.
+    #[inline]
+    pub fn minus_one_drops(&mut self, shape: u64, cells: &[u32; 16], need: u16, from: &mut [u32; 16]) -> u16 {
+        let mut dropped = 0u16;
+        for i in lanes_of(need) {
+            if let Some(f) = self.minus_one_drop(shape, cells[i]) {
+                dropped |= 1 << i;
+                from[i] = f;
+            }
+        }
+        dropped
+    }
+
+    /// The rows level -1 dropped at emission: the lanes `dropped` of a
+    /// slice (`lanes`: their unit lanes), each one's source noted (`from`,
+    /// `dropped`).
+    pub fn dropped_lanes(&mut self, dropped: u16, from: &[u32; 16], lanes: &[usize]) {
+        for i in lanes_of(dropped) {
+            self.dropped(lanes[i], from[i]);
+        }
     }
 
     /// A row level -1 dropped, from `lane`: its source is noted (`from`:
@@ -430,6 +512,38 @@ impl<'a> UnitSink<'a> {
             let m = &mut self.drop_min[lane];
             *m = (*m).min(from);
         }
+    }
+
+    /// The pos-graph edges (when edges are on) from the unit lanes `lanes`
+    /// of a slice's lanes `need` into their `cells`: every lane a body
+    /// takes, emitted or dropped, records its edge (the pos graph is a set:
+    /// once per cell column of a slice, not per body).
+    #[inline]
+    pub fn pos_edges(&mut self, cells: &[u32; 16], need: u16, lanes: &[usize]) {
+        if self.edges_on {
+            for i in lanes_of(need) {
+                self.pos_edge(lanes[i], cells[i]);
+            }
+        }
+    }
+
+    /// The pos-graph edge from unit lane `lane`'s cell into `cell`.
+    #[inline]
+    fn pos_edge(&mut self, lane: usize, cell: u32) {
+        let e = (self.lanes[lane].1, cell);
+        if self.pos_recent.is_empty() {
+            self.pos_recent = vec![(u32::MAX, u32::MAX); POS_RECENT];
+        }
+        let slot = ((e.0 as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15) ^ (e.1 as u64).wrapping_mul(0xc2b2_ae3d_27d4_eb4f)) >> (64 - POS_RECENT.trailing_zeros());
+        if self.pos_recent[slot as usize] != e {
+            self.pos_recent[slot as usize] = e;
+            self.pos_edges.insert(e);
+        }
+    }
+
+    /// The distinct pos-graph edges this worker produced.
+    pub fn pos_pairs(&self) -> impl Iterator<Item = (u32, u32)> + '_ {
+        self.pos_edges.iter().copied()
     }
 
     /// `xfer_id` of a raw transfer, through a small direct-mapped cache of
@@ -503,34 +617,70 @@ impl<'a> UnitSink<'a> {
         }
     }
 
-    /// ONE EMISSION: the state `(shape, key, cell)` reached from lane `lane`
-    /// with transfer `xfer` (`None`: the reference engine's path, no edge).
-    /// `init` is the shape's skeleton (the new layer's rows are decoded
-    /// with it: `Skeletons`); `push` appends the row to a buffer, when the
-    /// row is looked at (a verdict, the key check, the decode guard).
-    #[inline]
-    #[allow(clippy::too_many_arguments)]
-    pub fn emit(
-        &mut self,
-        shape: u64,
-        cell: u32,
-        key: Key,
-        lane: usize,
-        xfer: Option<u32>,
-        init: impl Fn() -> Rt2,
-        mut push: impl FnMut(&mut RowBuf),
-    ) -> Result<()> {
+    /// The TARGETS of the lanes `need` of a slice (`lanes`: their unit
+    /// lanes), rows of `shape` at `cells` (`Targets`).
+    pub fn targets(&mut self, shape: u64, cells: &[u32; 16], need: u16, lanes: &[usize], t: &mut Targets) {
+        t.cells = *cells;
+        t.skip = 0;
         // A raise re-expands sources of the tree: where the tree's own
         // filter admitted this cell, the edges are recorded already and the
         // state is in the tree.
         if let Some(r) = &self.raise {
-            if self.sources_old && self.l1.expect("the level -1 table").admitted_from(shape, cell, self.frame) <= r.raised.old.h {
-                return Ok(());
+            if self.sources_old {
+                let l1 = self.l1.expect("the level -1 table");
+                for i in lanes_of(need) {
+                    if l1.admitted_from(shape, cells[i], self.frame) <= r.raised.old.h {
+                        t.skip |= 1 << i;
+                    }
+                }
             }
         }
-        self.emitted += 1;
+        for i in lanes_of(need & !t.skip) {
+            let cell = cells[i];
+            let (slot, local) = super::GEOMETRY.slot_local(cell);
+            t.route[i] = self.route(shape, slot);
+            t.local[i] = local as u8;
+            if self.record_edges {
+                let (entry, s_cell) = self.lanes[lanes[i]];
+                t.src[i] = self.src_local[entry as usize];
+                t.s_region[i] = self.srcs[entry as usize].0;
+                t.offset[i] = super::bundle::offset(s_cell, cell);
+            }
+        }
+    }
+
+    /// ONE EMISSION: the state `(shape, key, cell)` reached from lane `lane`
+    /// with transfer `xfer` (`None`: the reference engine's path, no edge):
+    /// `emit_body` of one lane. `init` is the shape's skeleton (the new
+    /// layer's rows are decoded with it: `Skeletons`); `push` appends the
+    /// row to a buffer, when the row is looked at (a verdict, the key check,
+    /// the decode guard).
+    #[allow(clippy::too_many_arguments)]
+    pub fn emit(&mut self, shape: u64, cell: u32, key: Key, lane: usize, xfer: Option<u32>, init: impl Fn() -> Rt2, mut push: impl FnMut(&mut RowBuf)) -> Result<()> {
+        let mut targets = Targets::default();
+        self.targets(shape, &[cell; 16], 1, &[lane], &mut targets);
+        let xfers = xfer.map(|x| [x; 16]);
+        let e = BodyEmits { shape, take: 1, keys: &[key; 16], targets: &targets, xfers: xfers.as_ref(), lanes: &[lane] };
+        self.emit_body(&e, init, |b, _| push(b))
+    }
+
+    /// A BODY'S EMISSIONS (`BodyEmits`): per lane its state into its
+    /// route's bundle (source key, transfer, offset, target key -> cells).
+    /// `init` is the shape's skeleton (the new layer's rows are decoded with
+    /// it: `Skeletons`); `push(buf, i)` appends lane `i`'s row to a buffer,
+    /// when a row is looked at (a verdict, the key check, the decode guard).
+    pub fn emit_body(&mut self, e: &BodyEmits, init: impl Fn() -> Rt2, mut push: impl FnMut(&mut RowBuf, usize)) -> Result<()> {
+        let (shape, t) = (e.shape, e.targets);
+        let mut take = e.take & !t.skip;
+        if take == 0 {
+            return Ok(());
+        }
+        self.emitted += take.count_ones() as u64;
         if let Some(c) = &mut self.capture {
-            c.emit(shape, cell, key, lane as u32, xfer, is_provisional(key).then(|| self.prov.content(key)));
+            for i in lanes_of(take) {
+                let key = e.keys[i];
+                c.emit(shape, t.cells[i], key, e.lanes[i] as u32, e.xfers.map(|x| x[i]), is_provisional(key).then(|| self.prov.content(key)));
+            }
         }
         // A shape's first emission (this worker, this wave): its skeleton
         // registered, and THE DECODE GUARD - its row is what its key and
@@ -543,56 +693,75 @@ impl<'a> UnitSink<'a> {
             }
             self.last_shape = if self.guarded.contains(&shape) { shape } else { 0 };
         }
-        if self.last_shape != shape && !self.reference && !self.rowless && !is_provisional(key) {
-            let mut b = RowBuf::new(init());
-            push(&mut b);
-            self.skeletons.check_decodes(self.keys, &b.to_rt2(), &[cell])?;
-            self.guarded.insert(shape);
-            self.last_shape = shape;
-        }
-        if self.key_check && !self.reference && !self.rowless {
-            let i = Self::buf_of(&mut self.check, shape, &init);
-            push(&mut self.check[i]);
-            if self.check[i].rows() >= 256 {
-                self.check_rows(i)?;
+        if self.last_shape != shape && !self.reference && !self.rowless {
+            if let Some(i) = lanes_of(take).find(|&i| !is_provisional(e.keys[i])) {
+                let mut b = RowBuf::new(init());
+                push(&mut b, i);
+                self.skeletons.check_decodes(self.keys, &b.to_rt2(), &[t.cells[i]])?;
+                self.guarded.insert(shape);
+                self.last_shape = shape;
             }
         }
-        let (slot, local) = super::GEOMETRY.slot_local(cell);
-        let route = self.route(shape, slot);
+        if self.key_check && !self.reference && !self.rowless {
+            let b = Self::buf_of(&mut self.check, shape, &init);
+            for i in lanes_of(take) {
+                push(&mut self.check[b], i);
+                if self.check[b].rows() >= 256 {
+                    self.check_rows(b)?;
+                }
+            }
+        }
         // The coarser level's filter (the objects ladder): once per target,
         // in batches - a target awaiting its verdict is taken as allowed, and
         // its records go at the unit's end if it is not.
         if self.filters.marks.is_some() {
-            let at: Target = (route, key, local as u8);
-            match self.verdicts.get(&at) {
-                Some(&VERDICT_NO) => return Ok(()),
-                Some(_) => {}
-                None => {
-                    let i = Self::buf_of(&mut self.scratch, shape, &init);
-                    if self.scratch_at.len() <= i {
-                        self.scratch_at.resize_with(i + 1, Vec::new);
-                    }
-                    push(&mut self.scratch[i]);
-                    self.scratch_at[i].push(at);
-                    self.verdicts.insert(at, VERDICT_PENDING);
-                    if self.scratch[i].rows() >= VERDICT_BATCH {
-                        self.decide()?;
+            for i in lanes_of(take) {
+                let at: Target = (t.route[i], e.keys[i], t.local[i]);
+                match self.verdicts.get(&at) {
+                    Some(&VERDICT_NO) => take &= !(1 << i),
+                    Some(_) => {}
+                    None => {
+                        let b = Self::buf_of(&mut self.scratch, shape, &init);
+                        if self.scratch_at.len() <= b {
+                            self.scratch_at.resize_with(b + 1, Vec::new);
+                        }
+                        push(&mut self.scratch[b], i);
+                        self.scratch_at[b].push(at);
+                        self.verdicts.insert(at, VERDICT_PENDING);
+                        if self.scratch[b].rows() >= VERDICT_BATCH {
+                            self.decide()?;
+                        }
                     }
                 }
             }
         }
-        let bit = 1u64 << local;
-        match xfer {
-            Some(x) if self.record_edges => {
-                let (entry, s_cell) = self.lanes[lane];
-                let s_region = self.srcs[entry as usize].0;
-                if self.src_regions.last() != Some(&(route, s_region)) {
-                    self.src_regions.push((route, s_region));
-                }
-                let sl = self.src_local[entry as usize];
-                self.bundles.insert(route, key, sl, x, super::bundle::offset(s_cell, cell), bit);
+        // THE BUNDLES: lanes into one bundle (one source entry's cells
+        // reaching one target key alike) ORed together first.
+        let Some(xfers) = e.xfers.filter(|_| self.record_edges) else {
+            for i in lanes_of(take) {
+                self.bundles.insert(t.route[i], e.keys[i], 0, NO_XFER, 0, 1u64 << t.local[i]);
             }
-            _ => self.bundles.insert(route, key, 0, NO_XFER, 0, bit),
+            return Ok(());
+        };
+        let mut pending: Option<(u32, Key, u32, u32, u32, u64)> = None;
+        for i in lanes_of(take) {
+            let route = t.route[i];
+            if self.src_regions.last() != Some(&(route, t.s_region[i])) {
+                self.src_regions.push((route, t.s_region[i]));
+            }
+            let b = (route, e.keys[i], t.src[i], xfers[i], t.offset[i]);
+            match &mut pending {
+                Some(p) if (p.0, p.1, p.2, p.3, p.4) == b => p.5 |= 1u64 << t.local[i],
+                _ => {
+                    if let Some((r, k, s, x, o, m)) = pending {
+                        self.bundles.insert(r, k, s, x, o, m);
+                    }
+                    pending = Some((b.0, b.1, b.2, b.3, b.4, 1u64 << t.local[i]));
+                }
+            }
+        }
+        if let Some((r, k, s, x, o, m)) = pending {
+            self.bundles.insert(r, k, s, x, o, m);
         }
         Ok(())
     }
@@ -654,13 +823,16 @@ impl<'a> UnitSink<'a> {
         (w, key)
     }
 
-    /// The reference engine's emission: one materialized row (stored
-    /// widened: `row_key`), no edge. Its shape's skeleton is the row's
-    /// structure with every value cell left to the decode (`decode::Repr::
-    /// Other`): a reference row's columns follow its values, not a kernel's
-    /// template.
-    pub fn emit_row(&mut self, row: &Rt2, cell: u32) -> Result<()> {
+    /// The reference engine's emission: one materialized row from unit lane
+    /// `lane` (stored widened: `row_key`), its pos-graph edge, no transfer.
+    /// Its shape's skeleton is the row's structure with every value cell
+    /// left to the decode (`decode::Repr::Other`): a reference row's
+    /// columns follow its values, not a kernel's template.
+    pub fn emit_row(&mut self, row: &Rt2, lane: usize, cell: u32) -> Result<()> {
         debug_assert_eq!(row.width, 1);
+        if self.edges_on {
+            self.pos_edge(lane, cell);
+        }
         if self.minus_one_drop(row.shape_hash, cell).is_some() {
             return Ok(());
         }

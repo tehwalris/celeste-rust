@@ -502,7 +502,7 @@ pub fn run_wave(engine: &dyn FrameStep, parts: &[Part], cx: WaveCtx) -> Result<W
         sink.finish()?;
         st.lanes_raw += sink.emitted as usize;
         if let Some(p) = pos {
-            p.record_pairs(sink.pos_edges.iter().copied());
+            p.record_pairs(sink.pos_pairs());
         }
         notes.append(&mut sink.notes);
     }
