@@ -138,9 +138,113 @@ tables' renumbering and `push_numbered`.
 - The decoder against the first version (kept as a test reference): every
   state of a room (1,0) r0sxh forward to f40, in chunks that cut entries
   anywhere, decodes to the same block.
-- The unit tests (212), the ignored ones and a full arc-check: see the
-  commits.
+- Determinism with level -1 and objects: room (4,2) r0sxhn, level -1
+  71,5, to f61 at 3 and 32 threads and resumed at f50: frame files, edge
+  files, drop notes and pos graph byte-identical.
+- The unit tests (213), the ignored ones (3: resume, the room (7,1) level
+  -1 table, the floor pin), the full arc-check of the gate tree (f1-f35,
+  5.0M records: 0 without a transfer, 0 disagreements).
+- The mod room (map-mod's cart, a merge branch `keys-only-mod`, local):
+  the second half from the mid state (fm, r0sxhe, level -1 85) and the +95
+  run (fmp, `--prune-rect`): every `[gate]` line (W at every frame, the
+  support, the optimum) and every frame's in/raw/kept counts identical to
+  develop's runs; the fm f68 -> f69 frame's f/e lines identical.
+- `export-ui` of a search (the gate's, `--save-marks`): the frames' and the
+  marks' binaries byte-identical to develop's; run.json the same but its
+  timings and the renamed `in_entries`/`out_entries`.
+
+## New cells: three ways (Philippe's input, measured)
+
+The region phase must say which cells are new this frame. Three ways were
+weighed on the mod room's fm85 frames (`[fwd]` lines: the regions the frame
+reached held every entry of the visited set's touched tables):
+
+| frame | entries of the reached regions | events (a chunk target with new cells) | new entries | per-entry array (8 B an entry, zeroed each frame) | events (16 B) | a second (key -> cells) set during the wave (~32-40 B a new entry) |
+|---|---|---|---|---|---|---|
+| f40 | 14.5M | 3.4M | 1.8M | 116 MB | 55 MB | 58-72 MB |
+| f69 | 67.9M | 14.8M | 7.3M | 543 MB (0.98 GB with growth slack) | 237 MB | 234-292 MB |
+
+Built: the EVENTS - an append per chunk target that found new cells, merged
+per entry and sorted by key at the frame's end. The smallest with the set,
+sequential during the wave (no second probe), and its merge is one sort of
+a few million pairs per route. The set would cost a second hash probe per
+target in the region phase for the same bytes. The per-entry array (storage
+v2's) was the first version here and is gone.
 
 ## Measurements
 
-(filled in below as measured)
+Release builds, 16 threads; develop a4c3dfc and map-mod f32df10 the
+baselines. The develop mod runs (fm85, fmp95) ran on 2026-10-11 under
+other agents' load (30-65); ours on 2026-10-12 beside our own checks: walls
+are indicative, memory and sizes are not load-dependent.
+
+**The mod room, the +95 run** (fmp: r0sxhe from the mid state, level -1
+95, `--prune-rect`; 7.98B states, 248G emissions):
+
+| frame | rows in | develop rss start / wave / peak (GB) | keys only rss start / wave / peak (GB) | frame (s), develop / keys only |
+|---|---|---|---|---|
+| f050 | 65M | 8.7 / 19.6 / 20.2 | 2.6 / 4.5 / 5.5 | 27.0 / 27.8 |
+| f060 | 178M | 22.3 / 45.0 / 47.2 | 5.6 / 8.6 / 10.5 | 63.5 / 58.9 |
+| f070 | 242M | 33.0 / 56.4 / 56.6 | 9.9 / 12.8 / 14.6 | 75.4 / 62.1 |
+| f075 | 329M | 43.4 / 73.6 / 75.1 | 12.5 / 16.5 / 19.1 | 114.0 / 84.1 |
+| f077 | 348M | 46.4 / 77.3 / 78.1 | 13.9 / 18.1 / 20.6 | 118.9 / 87.3 |
+| f080 | 315M | 44.8 / 68.5 / 79.1 | 15.3 / 18.2 / 20.6 | 76.5 / 60.5 |
+| f090 | 118M | 29.2 / 38.6 / 79.1 | 18.0 / 19.1 / 20.9 | 24.6 / 19.2 |
+
+Whole run: peak 79.05 -> 20.91 GB; forward 2830 -> 2454 s, backward 335 ->
+341 s, search 3248 -> 2798 s; the arc phase's anonymous peak 21.1 -> 13.1
+GB (the sweep; the fingerprints' 21.1 GB went with the Resolver); tree 101
+-> 16 GB (frames 78 GB -> 669 MB, drop notes 8.6 GB -> 191 MB, edges 15 GB
+both). At f077 the visited set is 17.3 GB allocated (2.73 B a state; rss
+start 13.9 GB) and the rest of the frame's peak 6.7 GB ([wavemem] at f075:
+the route tables 10.2 GB - the visited set's, out for the frame - new-cell
+events 0.69, segments 0.60, chunks in flight 1.03, the sinks 1.05, the
+region scratch 1.02, the frontier 0.45). Before the wave's transients were
+found ([wavemem], 7bfc5fe..bbaa74c), the first keys-only version peaked at
+15.15 GB on fm85 (develop 40.55) with ~7 GB of transients at its 171M-row
+frames; the bundles into provisional targets alone were 5.8 GB at fmp's f53.
+
+**The mod room, the second half** (fm: level -1 85; 3.68B states): peak
+40.55 -> 15.15 GB (the first version, above), forward 1112 -> 923 s,
+backward 55.0 -> 55.0 s, tree 43 -> 6.4 GB (frames 307 MB: 0.08 B a state).
+
+**Its peak frame alone** (fm f68 -> f69, `bench-frame`, 171.9M rows in,
+4.17G emissions, 156M new; two rounds): see the A/B table below.
+
+**Decode**: 49 ns a row in a unit (release, the mod frame; the field codes
+per run of one entry, ~14 states an entry at f40; `not_expanded`
+included) - 2% of the units' worker time; the frame's end (the wins'
+decode of 156M new states, the seal, the edge file) 1.2 s against develop's
+6.1-6.3 s for its layer decode and the rest.
+
+**What the mod room's exit can reach now** (plans/map-mod.md's projection,
+r0sxhne counts: states S(H) of a search to the exit at H and its peak
+frame P(H); its RAM column was develop's ~290 B a row in). Keys only, from
+fmp: the visited set ~2.2 B a state resident (2.7 allocated; at the peak
+frame ~80% of S(H) is visited), the frame's rest ~3.5 GB of
+slice-bounded buffers plus ~9 B a row in:
+
+| H | S(H) | P(H) | develop: wave memory | keys only: peak (est.) | disk (~2 B a state) | forward / backward |
+|---|---|---|---|---|---|---|
+| 205 | 7.3B | 319M | 117 GB | ~19 GB | ~15 GB | 1.4 / 1.1 h |
+| 210 | 11.3B | 497M | 181 GB | ~28 GB | ~23 GB | 2.1 / 1.8 h |
+| 220 | 27B | 1.2B | 437 GB | ~62 GB | ~54 GB | 5 / 4.2 h |
+| ~225 | ~42B | ~1.9B | - | ~95 GB | ~85 GB | ~8 / ~7 h |
+
+So RAM no longer stops the forward near H 203: it fits to H ~222-225 on
+this machine (110 GB less headroom), and past H ~210 the WALL is the
+limit (hours a run). What binds next is the visited set itself (2.2-2.7 B a
+state: key 16 B, mask 8 B and index ~8 B an entry). The projection's big
+uncertainty is S(H) past f152 (map-mod.md: extrapolated at +9%/frame).
+
+## Follow-ups (not built)
+
+- **The visited set** is now what RAM buys: a u64 key where a shape's key
+  fits in 64 bits (8 B an entry less; the mod room's keys reach 66 bits
+  at f66, so a per-shape choice), and less index slack.
+- **Smaller slices** (`SLICE_LANES` 1M -> 256k): the chunks in flight and
+  the region jobs' buffers scale with a slice (~2 GB of the mod room's
+  frame peak), at the cost of more, smaller segments in the edge files.
+- **The drop notes** (32 B a note, held to the frame's end): per unit
+  sorted and delta-coded they would take a few bytes.
+- **Decode in the kernel prologue** (the ABI unchanged for now).

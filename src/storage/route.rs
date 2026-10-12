@@ -169,12 +169,13 @@ pub struct UnitBundles {
     /// Emptied buckets, kept for the next units (their pages stay mapped),
     /// at most `SPARE_KEEP` bundles' room in all: kept without a bound,
     /// every bucket grew to the largest route's (56 MB a worker on the mod
-    /// room's f53).
+    /// room's f53); bound to 128k, the units regrew theirs (the reference
+    /// frame's emit +4%).
     spare: Vec<Vec<(Key, Ub)>>,
 }
 
-/// The bundles' room `UnitBundles` keeps in its emptied buckets.
-const SPARE_KEEP: usize = 1 << 17;
+/// The bundles' room `UnitBundles` keeps in its emptied buckets (20 MB).
+const SPARE_KEEP: usize = 1 << 19;
 
 #[inline]
 fn ub_hash(k: u32, t_key: Key, b: &Ub) -> u64 {
@@ -352,8 +353,9 @@ pub struct Scratch {
 /// Bundles a worker's region scratch keeps room for between jobs: a
 /// heavy route's job is millions of bundles (the mod room's f69: 3.1M),
 /// and every worker kept its largest job's buffers - 2.4 GB at 16
-/// threads.
-const SCRATCH_KEEP: usize = 1 << 18;
+/// threads. At 256k the big jobs' buffers were made again job after job
+/// (the reference frame's region phase +20%); at 1M not (~25 MB a worker).
+const SCRATCH_KEEP: usize = 1 << 20;
 
 impl Scratch {
     /// Its buffers back to `SCRATCH_KEEP` bundles' room after a job that
