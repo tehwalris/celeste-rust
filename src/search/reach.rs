@@ -33,6 +33,9 @@ use crate::storage::{Sk, GEOMETRY};
 /// Sources per batch of out-edges read.
 const BATCH: usize = 1 << 20;
 
+/// Targets per parallel task of the frame's unions.
+const UNION_CHUNK: usize = 4096;
+
 /// One frame's exact reach, summed.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct FrameReach {
@@ -158,8 +161,10 @@ pub fn reach(dir: &std::path::Path, horizon: u32, point: (u32, u32), threads: us
                 }
             }
         }
-        // The pushes into each target, by target.
-        let mut next: FxHashMap<u32, Vec<Piece>> = FxHashMap::default();
+        // The pushes into each target, by target, with the size past which
+        // they are united (twice the last union's: a set of many pieces is
+        // not re-united on every push).
+        let mut next: FxHashMap<u32, (Vec<Piece>, usize)> = FxHashMap::default();
         let mut tmp = Vec::new();
         let mut scratch = Vec::new();
         for (s, r) in &cur {
@@ -175,31 +180,40 @@ pub fn reach(dir: &std::path::Path, horizon: u32, point: (u32, u32), threads: us
                 if bad {
                     tainted.insert(d);
                 }
-                let v = next.entry(d).or_default();
+                let (v, lim) = next.entry(d).or_insert_with(|| (Vec::new(), 256));
                 v.extend_from_slice(&tmp);
-                // Keep a target's pieces compact: a union once they pile up.
-                if v.len() > 256 {
+                if v.len() > *lim {
                     let (u, c) = union(v, &mut scratch);
                     if c {
                         coarse.insert(names[d as usize]);
                     }
                     v.clear();
                     u.pieces(v);
+                    *lim = (2 * v.len()).max(256);
                 }
             }
         }
-        let next: FxHashMap<Sk, Vec<Piece>> = next.into_iter().map(|(d, v)| (names[d as usize], v)).collect();
-        let mut scratch = Vec::new();
-        let mut nx: Vec<(Sk, Region)> = next
-            .into_iter()
-            .filter_map(|(s, mut v)| {
-                let (r, c) = union(&mut v, &mut scratch);
-                if c {
-                    coarse.insert(s);
-                }
-                (!r.is_empty()).then_some((s, r))
-            })
-            .collect();
+        // Every target's union, in parallel over chunks of targets.
+        let next: Vec<(Sk, Vec<Piece>)> = next.into_iter().map(|(d, (v, _))| (names[d as usize], v)).collect();
+        let chunks: Vec<std::sync::Mutex<Vec<(Sk, Vec<Piece>)>>> = next.chunks(UNION_CHUNK).map(|c| std::sync::Mutex::new(c.to_vec())).collect();
+        drop(next);
+        let united = crate::par::Pool::new(threads).map_with(
+            chunks.len(),
+            || Ok(Vec::new()),
+            |scratch, i| {
+                let chunk = std::mem::take(&mut *chunks[i].lock().map_err(|_| anyhow::anyhow!("a poisoned chunk"))?);
+                Ok(chunk.into_iter().map(|(s, mut v)| (s, union(&mut v, scratch))).collect::<Vec<_>>())
+            },
+        )?;
+        let mut nx: Vec<(Sk, Region)> = Vec::new();
+        for (s, (r, c)) in united.into_iter().flatten() {
+            if c {
+                coarse.insert(s);
+            }
+            if !r.is_empty() {
+                nx.push((s, r));
+            }
+        }
         coarsened = coarse.len() as u64;
         inexact = coarse;
         inexact.extend(tainted.into_iter().map(|d| names[d as usize]));
