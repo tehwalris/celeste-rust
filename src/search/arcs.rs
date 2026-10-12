@@ -13,6 +13,9 @@
 /// Points on the circle: 1 px in raw 16.16 units.
 pub const CIRCLE: u32 = 1 << 16;
 
+/// The most x segments a `Region` holds (its slabs' 16-bit end index).
+pub const MAX_SEGS: usize = (1 << 16) - 1;
+
 /// A remainder (raw, [-32768, 32767]) as a point of the circle.
 pub fn point(rem: i32) -> u32 {
     debug_assert!((-32768..32768).contains(&rem), "a remainder out of range: {rem}");
@@ -313,9 +316,16 @@ impl Region {
     /// The union of `pieces`, canonical (one sweep over y). `pieces` is
     /// left in an unspecified order.
     pub fn from_pieces(pieces: &mut [Piece], scratch: &mut Vec<Seg>) -> Region {
+        Self::try_from_pieces(pieces, scratch, MAX_SEGS).expect("a region past 65535 segments")
+    }
+
+    /// `from_pieces`, `None` where the union holds more than `max` x
+    /// segments (at most `MAX_SEGS`, what a region's 16-bit index holds).
+    pub fn try_from_pieces(pieces: &mut [Piece], scratch: &mut Vec<Seg>, max: usize) -> Option<Region> {
+        let max = max.min(MAX_SEGS);
         let mut out = Region::default();
         if pieces.is_empty() {
-            return out;
+            return Some(out);
         }
         pieces.sort_unstable_by_key(|p| p.y.lo);
         let mut bounds: Vec<u32> = pieces.iter().flat_map(|p| [p.y.lo, p.y.hi]).collect();
@@ -352,10 +362,12 @@ impl Region {
                 }
             }
             out.xs.extend(merged.iter().map(|&s| Stored::of(s)));
-            assert!(out.xs.len() < 1 << 16, "a region past 65535 segments");
+            if out.xs.len() > max {
+                return None;
+            }
             out.slabs.push(Slab { y: Stored::of(Seg { lo, hi }), end: out.xs.len() as u16 });
         }
-        out
+        Some(out)
     }
 }
 
