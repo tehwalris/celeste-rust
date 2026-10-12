@@ -2529,7 +2529,7 @@ fn reach_command(checkpoint_dir: &str, level_index: usize, to: u32, save: Option
     let mut extent: Vec<(u32, i32, i32, i32, i32, u64, u64)> = Vec::new();
     let point = celeste_rust::search::arc_dp::start_point(cfg)?;
     let t0 = std::time::Instant::now();
-    let r = celeste_rust::search::reach::reach(&dir, steps, point, cfg.threads(), |t, cur| {
+    let r = celeste_rust::search::reach::reach(&dir, steps, point, cfg.threads(), |t, cur, inexact| {
         let (mut x0, mut x1, mut y0, mut y1) = (i32::MAX, i32::MIN, i32::MAX, i32::MIN);
         let mut per_cell: rustc_hash::FxHashMap<u32, u64> = Default::default();
         for (s, _) in cur {
@@ -2573,16 +2573,19 @@ fn reach_command(checkpoint_dir: &str, level_index: usize, to: u32, save: Option
                 let named = project_all(&row).swap_remove(0);
                 let keep = ["player.x", "player.y", "spd.x", "spd.y", "rem.x", "rem.y", "dash_effect_time"];
                 let mut text: Vec<String> = named.iter().filter(|(k, _)| keep.contains(&k.as_str()) || k.ends_with(".djump") || k.ends_with(".dash_time") || k.ends_with(".grace")).map(|(k, v)| format!("{k}={v}")).collect();
-                text.push(format!("exact-rem-points={}", celeste_rust::search::reach::points(reg)));
+                text.push(format!("rem-points={}", celeste_rust::search::reach::points(reg)));
+                if inexact.contains(s) {
+                    text.push("INEXACT".into());
+                }
                 println!("[reach] f{t:03} in the rect: {}", text.join(" "));
             }
         }
         Ok(())
     })?;
     println!("[reach] {} to f{to}, {:.1} s", dir.display(), t0.elapsed().as_secs_f64());
-    let mut tsv = String::from("frame\tstates\tpoints\tcells\tforward_layer\tcoarsened\tx_min\tx_max\ty_min\ty_max\treached_with_dropped_successors\tdrop_noted_cells\n");
+    let mut tsv = String::from("frame\tstates\tpoints\tcells\tforward_layer\tcoarsened\tinexact\tx_min\tx_max\ty_min\ty_max\treached_with_dropped_successors\tdrop_noted_cells\n");
     for (f, e) in r.frames.iter().zip(&extent) {
-        let line = format!("{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}", f.frame, f.states, f.points, f.cells, f.forward_layer, f.coarsened, e.1, e.2, e.3, e.4, e.5, e.6);
+        let line = format!("{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}", f.frame, f.states, f.points, f.cells, f.forward_layer, f.coarsened, f.inexact, e.1, e.2, e.3, e.4, e.5, e.6);
         println!("{line}");
         tsv += &line;
         tsv.push('\n');

@@ -313,9 +313,15 @@ impl Region {
     /// The union of `pieces`, canonical (one sweep over y). `pieces` is
     /// left in an unspecified order.
     pub fn from_pieces(pieces: &mut [Piece], scratch: &mut Vec<Seg>) -> Region {
+        Self::try_from_pieces(pieces, scratch).expect("a region past 65535 segments")
+    }
+
+    /// `from_pieces`, `None` where the union holds more x segments than a
+    /// region's 16-bit index can (65535).
+    pub fn try_from_pieces(pieces: &mut [Piece], scratch: &mut Vec<Seg>) -> Option<Region> {
         let mut out = Region::default();
         if pieces.is_empty() {
-            return out;
+            return Some(out);
         }
         pieces.sort_unstable_by_key(|p| p.y.lo);
         let mut bounds: Vec<u32> = pieces.iter().flat_map(|p| [p.y.lo, p.y.hi]).collect();
@@ -352,10 +358,12 @@ impl Region {
                 }
             }
             out.xs.extend(merged.iter().map(|&s| Stored::of(s)));
-            assert!(out.xs.len() < 1 << 16, "a region past 65535 segments");
+            if out.xs.len() >= 1 << 16 {
+                return None;
+            }
             out.slabs.push(Slab { y: Stored::of(Seg { lo, hi }), end: out.xs.len() as u16 });
         }
-        out
+        Some(out)
     }
 }
 
