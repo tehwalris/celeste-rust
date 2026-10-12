@@ -20,21 +20,31 @@
 //! (8 B an edge): decoding them again every frame made a frame cost grow
 //! with the reach (bal200: 219 s at f143). The pushes are merged per target.
 //!
-//! A target's set past `Region`'s 65535 segments is replaced by its
-//! bounding box and counted as COARSENED: from then on that state's set,
-//! and what it reaches, over-approximate (still sound for "unreachable").
+//! A target's set past `MAX_SEGS` x segments (a cloud of the remainders
+//! many paths leave) is COARSENED: its pieces snapped outward to the
+//! coarsest-needed grid of `2^k` points per axis (`k` the smallest that
+//! fits). From then on that state's set, and what it reaches, OVER-
+//! approximate - still sound for "unreachable", an upper bound on the
+//! rest - and are counted as inexact with the largest `k` behind them.
+//!
+//! A frame's pushes and unions run in parallel over its targets (the
+//! frame's edges grouped by target with a counting sort).
 
 use anyhow::Result;
-use rustc_hash::{FxHashMap, FxHashSet};
+use rustc_hash::FxHashMap;
 
-use super::arcs::{Piece, Region, Seg, Transfer};
+use super::arcs::{Piece, Region, Seg, Transfer, CIRCLE};
 use crate::storage::{Sk, GEOMETRY};
 
 /// Sources per batch of out-edges read.
 const BATCH: usize = 1 << 20;
 
-/// Targets per parallel task of the frame's unions.
-const UNION_CHUNK: usize = 4096;
+/// Targets per parallel task of a frame's pushes and unions.
+const TARGET_CHUNK: usize = 256;
+
+/// The most x segments a reached set keeps exactly (below a `Region`'s
+/// 65535: a set this fragmented costs every push through it).
+const MAX_SEGS: usize = 1 << 14;
 
 /// One frame's exact reach, summed.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -50,11 +60,12 @@ pub struct FrameReach {
     /// The forward's layer at this frame (states first reached here, rows
     /// kept), for scale.
     pub forward_layer: u64,
-    /// States whose set was coarsened to a bounding box arriving here, and
-    /// the states whose set over-approximates (coarsened here or reached
-    /// from an inexact state).
+    /// States whose set was coarsened arriving here; the states whose set
+    /// over-approximates (coarsened here or reached from an inexact
+    /// state), and the coarsest grid behind them (`2^k` points, 0 exact).
     pub coarsened: u64,
     pub inexact: u64,
+    pub max_k: u8,
 }
 
 /// What `reach` found: per frame its sums; per state the LAST frame it is
@@ -64,20 +75,32 @@ pub struct Reach {
     pub last: FxHashMap<Sk, u32>,
 }
 
-/// The union of `v` (deduplicated), and whether it was COARSENED: a union
-/// past a `Region`'s 65535 x segments is replaced by its bounding box - a
-/// superset, so the reach stays sound as an upper bound but is no longer
-/// exact at that state (counted per frame: `FrameReach::coarsened`).
-fn union(v: &mut Vec<Piece>, scratch: &mut Vec<Seg>) -> (Region, bool) {
+/// `s` widened outward to the grid of `2^k` points.
+fn snap(s: Seg, k: u32) -> Seg {
+    let m = (1u32 << k) - 1;
+    Seg { lo: s.lo & !m, hi: ((s.hi + m) & !m).min(CIRCLE) }
+}
+
+/// The union of `v` (deduplicated, left as the union's input), and its
+/// coarsening: 0 exact, else the `k` its pieces were snapped to (outward,
+/// to the grid of `2^k` points per axis) to fit `MAX_SEGS` segments.
+fn union(v: &mut Vec<Piece>, scratch: &mut Vec<Seg>) -> (Region, u8) {
     v.sort_unstable_by_key(|p| (p.y, p.x));
     v.dedup();
-    if let Some(r) = Region::try_from_pieces(v, scratch) {
-        return (r, false);
+    if let Some(r) = Region::try_from_pieces(v, scratch, MAX_SEGS) {
+        return (r, 0);
     }
-    let (ylo, yhi) = (v.iter().map(|p| p.y.lo).min().unwrap_or(0), v.iter().map(|p| p.y.hi).max().unwrap_or(0));
-    let (xlo, xhi) = (v.iter().map(|p| p.x.lo).min().unwrap_or(0), v.iter().map(|p| p.x.hi).max().unwrap_or(0));
-    let mut bbox = [Piece { y: Seg { lo: ylo, hi: yhi }, x: Seg { lo: xlo, hi: xhi } }];
-    (Region::from_pieces(&mut bbox, scratch), true)
+    let mut w = Vec::with_capacity(v.len());
+    for k in 1..=16 {
+        w.clear();
+        w.extend(v.iter().map(|p| Piece { y: snap(p.y, k), x: snap(p.x, k) }));
+        w.sort_unstable_by_key(|p| (p.y, p.x));
+        w.dedup();
+        if let Some(r) = Region::try_from_pieces(&mut w, scratch, MAX_SEGS) {
+            return (r, k as u8);
+        }
+    }
+    unreachable!("at k 16 every piece is the whole torus")
 }
 
 /// The number of points of a set.
@@ -86,9 +109,10 @@ pub fn points(r: &Region) -> u64 {
 }
 
 /// EXACT REACH over the tree in `dir` up to `horizon` (search steps) from
-/// its start at `point` (`arc_dp::rem_of`'s encoding). `visit(t, states)`
-/// sees every frame's reached states and sets (the caller's facts).
-pub fn reach(dir: &std::path::Path, horizon: u32, point: (u32, u32), threads: usize, mut visit: impl FnMut(u32, &[(Sk, Region)], &FxHashSet<Sk>) -> Result<()>) -> Result<Reach> {
+/// its start at `point` (`arc_dp::rem_of`'s encoding). `visit(t, states,
+/// inexact)` sees every frame's reached states and sets, and the inexact
+/// ones with their coarsest grid (the caller's facts).
+pub fn reach(dir: &std::path::Path, horizon: u32, point: (u32, u32), threads: usize, mut visit: impl FnMut(u32, &[(Sk, Region)], &FxHashMap<Sk, u8>) -> Result<()>) -> Result<Reach> {
     let geo = GEOMETRY;
     let seeds = super::arc_dp::Seeds::load(dir, horizon)?;
     let tree = crate::storage::layer::Tree::open(dir, horizon)?;
@@ -106,27 +130,27 @@ pub fn reach(dir: &std::path::Path, horizon: u32, point: (u32, u32), threads: us
     let mut layers: Vec<crate::storage::layer::Layer> = Vec::new();
     let mut frames = Vec::new();
     let mut coarsened = 0u64;
-    // The reached states whose set over-approximates.
-    let mut inexact: FxHashSet<Sk> = FxHashSet::default();
+    // The reached states whose set over-approximates, with their `k`.
+    let mut inexact: FxHashMap<Sk, u8> = FxHashMap::default();
+    let pool = crate::par::Pool::new(threads);
     let sum = |t: u32, cur: &[(Sk, Region)]| -> FrameReach {
         let mut cells: Vec<u32> = cur.iter().map(|(s, _)| s.cell(&geo)).collect();
         cells.sort_unstable();
         cells.dedup();
-        FrameReach { frame: t, states: cur.len() as u64, new: 0, points: cur.iter().map(|(_, r)| points(r)).sum(), cells: cells.len() as u64, forward_layer: tree.states(t), coarsened: 0, inexact: 0 }
+        FrameReach { frame: t, states: cur.len() as u64, points: cur.iter().map(|(_, r)| points(r)).sum(), cells: cells.len() as u64, forward_layer: tree.states(t), ..Default::default() }
     };
     for t in 0..=horizon {
         let mut new = 0;
         for (s, _) in &cur {
             new += last.insert(*s, t).is_none() as u64;
         }
-        frames.push(FrameReach { coarsened, inexact: inexact.len() as u64, new, ..sum(t, &cur) });
+        let max_k = inexact.values().copied().max().unwrap_or(0);
+        frames.push(FrameReach { new, coarsened, inexact: inexact.len() as u64, max_k, ..sum(t, &cur) });
         visit(t, &cur, &inexact)?;
         if t == horizon || cur.is_empty() {
             break;
         }
         let tt = std::time::Instant::now();
-        let mut coarse: FxHashSet<Sk> = Default::default();
-        let mut tainted: FxHashSet<u32> = Default::default();
         // A state's out-edges are recorded once, at the frame after its
         // LAYER (the forward expands a state when it first reaches it; a
         // later visit has the same successors). They are read the first
@@ -161,71 +185,122 @@ pub fn reach(dir: &std::path::Path, horizon: u32, point: (u32, u32), threads: us
                 }
             }
         }
-        // The pushes into each target, by target, with the size past which
-        // they are united (twice the last union's: a set of many pieces is
-        // not re-united on every push).
-        let mut next: FxHashMap<u32, (Vec<Piece>, usize)> = FxHashMap::default();
-        let mut tmp = Vec::new();
-        let mut scratch = Vec::new();
-        for (s, r) in &cur {
-            let Some(es) = out.get(s) else { continue };
-            let bad = inexact.contains(s);
-            for &(d, x) in es.iter() {
-                let (tx, ty) = pairs[x as usize];
-                tmp.clear();
-                r.push(tx, ty, &mut tmp);
-                if tmp.is_empty() {
-                    continue;
-                }
-                if bad {
-                    tainted.insert(d);
-                }
-                let (v, lim) = next.entry(d).or_insert_with(|| (Vec::new(), 256));
-                v.extend_from_slice(&tmp);
-                if v.len() > *lim {
-                    let (u, c) = union(v, &mut scratch);
-                    if c {
-                        coarse.insert(names[d as usize]);
-                    }
-                    v.clear();
-                    u.pieces(v);
-                    *lim = (2 * v.len()).max(256);
-                }
+        let t_read = tt.elapsed().as_secs_f64();
+        // The frame's edges grouped by target (a counting sort): `inc[start[d]
+        // ..start[d + 1]]` the (source in `cur`, transfer) pairs into `d`.
+        let edges_of: Vec<&[(u32, u32)]> = cur.iter().map(|(s, _)| out.get(s).map_or(&[][..], |e| &e[..])).collect();
+        let mut start = vec![0u32; names.len() + 1];
+        for es in &edges_of {
+            for &(d, _) in es.iter() {
+                start[d as usize + 1] += 1;
             }
         }
-        // Every target's union, in parallel over chunks of targets.
-        let next: Vec<(Sk, Vec<Piece>)> = next.into_iter().map(|(d, (v, _))| (names[d as usize], v)).collect();
-        let chunks: Vec<std::sync::Mutex<Vec<(Sk, Vec<Piece>)>>> = next.chunks(UNION_CHUNK).map(|c| std::sync::Mutex::new(c.to_vec())).collect();
-        drop(next);
-        let united = crate::par::Pool::new(threads).map_with(
-            chunks.len(),
-            || Ok(Vec::new()),
-            |scratch, i| {
-                let chunk = std::mem::take(&mut *chunks[i].lock().map_err(|_| anyhow::anyhow!("a poisoned chunk"))?);
-                Ok(chunk.into_iter().map(|(s, mut v)| (s, union(&mut v, scratch))).collect::<Vec<_>>())
+        for i in 1..start.len() {
+            start[i] += start[i - 1];
+        }
+        let mut fill = start.clone();
+        let mut inc = vec![(0u32, 0u32); start[names.len()] as usize];
+        for (i, es) in edges_of.iter().enumerate() {
+            for &(d, x) in es.iter() {
+                let p = &mut fill[d as usize];
+                inc[*p as usize] = (i as u32, x);
+                *p += 1;
+            }
+        }
+        drop(fill);
+        drop(edges_of);
+        let targets: Vec<u32> = (0..names.len() as u32).filter(|&d| start[d as usize + 1] > start[d as usize]).collect();
+        // Per target: every push into it, united (a union whenever the
+        // pieces pass twice the last union's: a set of many pieces is not
+        // re-united on every push), coarsened where it must be.
+        let (cur_ref, inexact_ref, names_ref) = (&cur, &inexact, &names);
+        let parts = pool.map_with(
+            targets.len().div_ceil(TARGET_CHUNK),
+            || Ok((Vec::new(), Vec::new(), Vec::new())),
+            |(v, tmp, scratch): &mut (Vec<Piece>, Vec<Piece>, Vec<Seg>), c| {
+                let mut res: Vec<(Sk, Region, u8, u8)> = Vec::new();
+                for &d in &targets[c * TARGET_CHUNK..((c + 1) * TARGET_CHUNK).min(targets.len())] {
+                    v.clear();
+                    let (mut lim, mut snapped, mut from) = (256usize, 0u8, 0u8);
+                    for &(i, x) in &inc[start[d as usize] as usize..start[d as usize + 1] as usize] {
+                        let (s, r) = &cur_ref[i as usize];
+                        let (tx, ty) = pairs[x as usize];
+                        tmp.clear();
+                        r.push(tx, ty, tmp);
+                        if tmp.is_empty() {
+                            continue;
+                        }
+                        from = from.max(inexact_ref.get(s).copied().unwrap_or(0));
+                        v.extend_from_slice(tmp);
+                        if v.len() > lim {
+                            let (u, k) = union(v, scratch);
+                            snapped = snapped.max(k);
+                            v.clear();
+                            u.pieces(v);
+                            lim = (2 * v.len()).max(256);
+                        }
+                    }
+                    let (u, k) = union(v, scratch);
+                    snapped = snapped.max(k);
+                    if !u.is_empty() {
+                        res.push((names_ref[d as usize], u, snapped, from));
+                    }
+                }
+                Ok(res)
             },
         )?;
+        drop(inc);
         let mut nx: Vec<(Sk, Region)> = Vec::new();
-        for (s, (r, c)) in united.into_iter().flatten() {
-            if c {
-                coarse.insert(s);
+        let mut next_inexact: FxHashMap<Sk, u8> = FxHashMap::default();
+        coarsened = 0;
+        for (s, r, snapped, from) in parts.into_iter().flatten() {
+            coarsened += (snapped > 0) as u64;
+            if snapped.max(from) > 0 {
+                next_inexact.insert(s, snapped.max(from));
             }
-            if !r.is_empty() {
-                nx.push((s, r));
-            }
+            nx.push((s, r));
         }
-        coarsened = coarse.len() as u64;
-        inexact = coarse;
-        inexact.extend(tainted.into_iter().map(|d| names[d as usize]));
         nx.sort_unstable_by_key(|e| e.0);
-        eprintln!("[reach] f{:03} -> f{:03}: {} states -> {} ({} coarsened, {} inexact; {} states' edges held, {} names; {:.1} s)", t, t + 1, cur.len(), nx.len(), coarsened, inexact.len(), out.len(), names.len(), tt.elapsed().as_secs_f64());
+        eprintln!(
+            "[reach] f{:03} -> f{:03}: {} states -> {} ({} coarsened, {} inexact; {} states' edges held, {} names; read {:.1} s, total {:.1} s)",
+            t,
+            t + 1,
+            cur.len(),
+            nx.len(),
+            coarsened,
+            next_inexact.len(),
+            out.len(),
+            names.len(),
+            t_read,
+            tt.elapsed().as_secs_f64()
+        );
         cur = nx;
+        inexact = next_inexact;
     }
     Ok(Reach { frames, last })
 }
 
 #[cfg(test)]
 mod tests {
+    /// A cloud of isolated points past `MAX_SEGS` segments is coarsened to
+    /// a superset that fits, on the finest grid that does; a small one is
+    /// united exactly.
+    #[test]
+    fn a_union_past_its_segments_snaps_to_a_superset() {
+        use super::super::arcs::{Piece, Seg};
+        let pt = |x: u32, y: u32| Piece { y: Seg { lo: y, hi: y + 1 }, x: Seg { lo: x, hi: x + 1 } };
+        // 3 * MAX_SEGS points, 3 a row 5 apart in x, the rows 3 apart (never
+        // adjacent).
+        let cloud: Vec<Piece> = (0..3 * super::MAX_SEGS as u32).map(|i| pt(1000 + 5 * (i % 3), 3 * (i / 3))).collect();
+        let (r, k) = super::union(&mut cloud.clone(), &mut Vec::new());
+        assert!(k > 0 && r.n_segs() <= super::MAX_SEGS, "k {k}, {} segments", r.n_segs());
+        assert!(cloud.iter().all(|p| r.contains(p.x.lo, p.y.lo)), "the coarsened set holds every point");
+        let (r1, k1) = super::union(&mut cloud.iter().copied().map(|p| super::Piece { y: super::snap(p.y, k as u32 - 1), x: super::snap(p.x, k as u32 - 1) }).collect(), &mut Vec::new());
+        assert!(k1 > 0 || r1.n_segs() > super::MAX_SEGS, "a finer grid would have fit: k {k} is not the smallest");
+        let (small, k0) = super::union(&mut cloud[..100].to_vec(), &mut Vec::new());
+        assert_eq!((k0, super::points(&small)), (0, 100));
+    }
+
     /// Room (1,0) to its synthetic gate win (9,101), a forward of 35 frames:
     /// the exact reach holds the start, is a subset of every frame's tree
     /// states, and holds the known route's state at every frame (the gate's
