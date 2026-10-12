@@ -40,10 +40,12 @@ cleanup toward ~10k is in progress.
   what it widens, why it is sound, what refutes it, its status. Generated
   from the widening table (`celeste_engine::widening::TABLE`, interpreted
   by the tracer and by `Rt2::widen_to`; plans/widen-table.md).
-- `plans/storage-v2.md` (the visited set, state ids),
-  `plans/edges-target.md` (the edge files: ID-free bundles in their target
-  regions; the routed forward) and `plans/exact-keys.md` (a state's key is
-  its packed field codes, not a hash).
+- `plans/keys-only.md` (a state is its key: the frontier, the frame files
+  and the drop notes are per-region (key, cell mask) entries; rows are
+  decoded per unit right before the kernels), `plans/storage-v2.md` (the
+  visited set), `plans/edges-target.md` (the edge files: ID-free bundles in
+  their target regions; the routed forward) and `plans/exact-keys.md` (a
+  state's key is its packed field codes, not a hash).
 - `plans/devloop.md` - the check ladder (`./check.sh`) and the fixtures.
 - `plans/footguns.md` - the settings (flags, recorded in each tree) and
   the other footguns fixed, with the decisions behind them.

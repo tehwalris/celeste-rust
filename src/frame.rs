@@ -577,10 +577,8 @@ pub struct FrameStats {
     pub frontier_bytes: usize,
     /// Bytes allocated in the visited set.
     pub visited_bytes: usize,
-    /// The region phase's new-cell tracking: the per-entry slots it kept
-    /// (every entry of the regions the frame reached) and its events (a
-    /// chunk target that found new cells).
-    pub fresh_slots: u64,
+    /// The region phase's new-cell events (a chunk target that found new
+    /// cells: `route::RouteState::fresh`).
     pub fresh_events: u64,
     /// Anonymous resident set at the frame's start, after the wave, at the end.
     pub rss_start: f64,
@@ -1375,7 +1373,7 @@ fn log_frame(
          wave {:.0} (idle {:.0}%, regions {:.0} worker-ms) layer {:.0} ckpt {:.0} pos {:.0} total {:.0} ms | \
          units {} slices {} routes {} edges {} bundles {} ({:.3} B) | \
          in {:.2} visited {:.2} GB rss start {:.2} wave {:.2} end {:.2} peak {:.2} GB (anon; file {:.2}) | \
-         keys {} bits, {} codes (+{}) | fresh slots {} events {}",
+         keys {} bits, {} codes (+{}) | new-cell events {}",
         st.entries_in,
         st.lanes_in,
         st.lanes_raw,
@@ -1406,7 +1404,6 @@ fn log_frame(
         st.key_bits,
         st.key_codes,
         st.new_codes,
-        st.fresh_slots,
         st.fresh_events,
     );
     crate::metrics::record("fwd.wave", st.t_wave);

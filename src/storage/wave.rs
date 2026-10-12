@@ -508,7 +508,6 @@ pub fn run_wave(engine: &dyn FrameStep, parts: &[Part], cx: WaveCtx) -> Result<W
     // (`add_shape` sized the visited set's emptied table list for them.)
     tables.resize_with(visited.tables_mut_vec().len().max(tables.len()), || None);
     let regions: Vec<Option<u32>> = states.iter().map(|r| visited.region(r.shape, r.slot)).collect();
-    st.fresh_slots = states.iter().map(|r| r.fresh.len() as u64).sum();
     st.fresh_events = states.iter().map(|r| r.fresh_events).sum();
     let inserted: u64 = states.iter().map(|r| r.new_states).sum();
     // Per route (in parallel): sealed - its new states listed by key.

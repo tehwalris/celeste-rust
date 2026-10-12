@@ -1,5 +1,9 @@
 # Rows from keys: frame files hold ids, rows are decoded (2026-10-11)
 
+> Format 15 (2026-10-12, plans/keys-only.md) went the rest of the way: the
+> frame files hold the new states' keys and cell masks per region, no ids,
+> and the forward holds no rows (its frontier is keys, decoded per unit).
+
 Branch `rows-from-keys` (from `develop` f35583a). Philippe: "Our in-memory
 state storage already contains the full states, no? So there's no real
 point storing those uncompressed. Investigate."

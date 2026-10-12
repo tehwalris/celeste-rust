@@ -40,17 +40,19 @@ kernels come from the **tracer** via one hand-off.
    state and each leaf back into a one-row block, boxes and all, by the one
    converter the tracer's output shapes come from, so its rows key like the
    kernels'). The loop never touches an interpreter state.
-2. **The block** (`Rt2` in `celeste-engine`, `frame::Block` = an `Rt2` with its
-   key column and its rows' ids, `storage::StateId`). Columnar; key and cell
-   are exposed, the fields are opaque columns. Serialized whole
-   (`search::checkpoint`).
+2. **The block** (`Rt2` in `celeste-engine`, `frame::Block` = an `Rt2`, with
+   its key column where it was decoded from keys). Columnar; key and cell
+   are exposed, the fields are opaque columns. A TRANSIENT: the forward
+   holds states as keys (`storage::layer::Layer`), and a block exists only
+   inside a wave's unit (decoded right before the kernels) and in readers.
 3. **The kernel set** (`compiled::asm_kernel::Registry`). The tracer's whole
    output for one level: one assembled AVX-512 kernel per (shape, region),
    built at startup with gcc + dlopen. There is no checked-in kernel artifact.
 
-To the outer loop a state is OPAQUE: it touches a row's key (the visited
-set, checkpoint, marks) and its cell (regions, the pos graph, level -1). The
-frame step is the only thing that opens a state.
+To the outer loop a state is OPAQUE: it is `(shape, key, cell)` (the
+visited set, the layers and frame files, the edges, the marks) - its cell
+for regions, the pos graph and level -1. The frame step is the only thing
+that opens a state; a unit decodes rows for it from keys.
 
 ## Code layout
 
@@ -67,7 +69,8 @@ crates/celeste-engine    Rt2 block model, boundary/keys, lane primitives        
                          kernels' emissions into bundles), route (the region
                          phase), wave (the frame's pipeline and end), bundle
                          and edges (the edge files, transfers, EdgeStore),
-                         marks (the Resolver), meta, decode, bench (the
+                         layer (the frontier, frame files, drop notes and
+                         the tree reader: states as keys), decode, bench (the
                          capture and `bench-storage`)
   src/search/            checkpoint, arc_edges (the transfer decode), arcs
                          (remainder sets, their arena), arc_dp (THE SEARCH:
@@ -382,62 +385,76 @@ declines. The checks the ranges do not fold: `spd +- dash_accel` in
 is stored `max(v, 0)`, the others decrement under `> 0`, which no range
 analysis reads); interval `+ k` as compares saved 0.4% in (4,2).
 
-## The forward frame and the storage (edges target, 2026-10-11)
+## The forward frame and the storage (keys only, 2026-10-12)
 
-One storage system (plans/storage-v2.md built the visited set and the ids;
-plans/edges-target.md the ID-free edges and the routed forward; they
-replaced the door, the queues, the unit row cache, the raw edge records,
-the inversion, then the lids, the owner index and the translation):
+One storage system (plans/storage-v2.md built the visited set;
+plans/edges-target.md the ID-free edges and the routed forward;
+plans/keys-only.md the rest: no state ids, no rows held):
 
+- **A state is `(shape, key, cell)`** and is named so everywhere
+  (`storage::Sk`: region, key, cell in region; region = shape index x
+  slots + slot). No state has a number: not in memory, not on disk.
 - **The visited set** (`storage::visited`): per (shape, storage REGION) a
-  table of ENTRIES - a position-free key and a mask over the region's cells.
-  A storage region is 8 cells square (`storage::GEOMETRY`; 16 was the
-  other measured choice), aligned as the kernels' regions (`div_euclid`) and nested in one
-  (the kernels' px a multiple of it, else refused); `NO_CELL` is one more
-  region per shape. Room (6,2) 100% f57: 43.8M states in 2.19M entries,
-  0.10 GB (the door: 1.08 GB).
-- **States** are `(shape, key, cell)`; the edges and the backward name them
-  so (`storage::Sk`: region, key, cell in region). The layers' frame files
-  still carry IDS (`storage::StateId`: region, entry, cell in region; region
-  = shape index x slots + slot, so ids sort by shape and position). Entry
-  numbers are assigned at the frame's end in KEY order among a frame's new
-  entries: canonical, whatever the threads or the units. A layer is stored
-  in id order (checkpoint v14: the id column, rows decoded from the keys);
-  the frame's metadata (`storage::meta`, `frames/fNNN/meta.bin`) lists the
-  shapes and entries (with keys) it created.
+  table of ENTRIES - a position-free key and a mask over the region's
+  cells. A storage region is 8 cells square (`storage::GEOMETRY`; 16 was
+  the other measured choice), aligned as the kernels' regions
+  (`div_euclid`) and nested in one (the kernels' px a multiple of it, else
+  refused); `NO_CELL` is one more region per shape. A pure dedup
+  structure: nothing outside names an entry, so entries keep their places.
+- **A LAYER** (`storage::layer::Layer`): per region (ascending) its
+  entries - key (ascending) and cell mask, 24 B an entry - and the
+  skeletons its shapes' rows decode with. The forward's FRONTIER is a layer
+  (the last frame's new states) and the wave builds the NEXT one: no row
+  layer exists in memory (the mod room's +95 run held 32 + 31 GB of them at
+  f77 before).
 - **The wave** (`storage::wave::run_wave`), one pipeline a frame: the
-  frontier cut into UNITS of contiguous rows (a 256th of the frame,
-  1024-4096 lanes) and the units into SLICES (~1M lanes). Per emission the
-  unit's sink (`storage::unit::UnitSink`) drops level -1's rows (noting
-  their sources), keys the row and ORs it into its BUNDLE (source key,
-  transfer, offset, target key -> target cells) in a unit-local table,
-  keyed by the target's ROUTE (shape, region slot). Nothing is looked up in
-  the visited set and no row is copied. At its end the unit's bundles are
-  per route a CHUNK. When a slice's units are done its transfers get their
-  global ids and its chunks become REGION JOBS (one per (route, slice)),
-  which the workers take before the next slice's units: the region phase
-  overlaps the kernels.
+  frontier cut into UNITS of whole entries of one shape (a 256th of the
+  frame, 1024-4096 states plus at most 63) and the units into SLICES (~1M
+  states). A unit is DECODED right before the kernels (`decode::decode_rows`,
+  a field's code once per entry); `frame::not_expanded` is decided on it -
+  for the forward's own frontier, a resume's and a raise's alike - and only
+  its expanded lanes run. Per emission the unit's sink
+  (`storage::unit::UnitSink`) drops level -1's rows (noting their sources
+  per entry and horizon), keys the row and ORs it into its BUNDLE (source
+  key, transfer, offset, target key -> target cells) in a unit-local
+  table, keyed by the target's ROUTE (shape, region slot). Nothing is looked
+  up in the visited set and no row is copied. At its end the unit's
+  bundles are per route a CHUNK. When a slice's units are done its
+  transfers get their global ids and its chunks become REGION JOBS (one
+  per (route, slice)), which the workers take before the next slice's
+  units: the region phase overlaps the kernels.
 - **The region phase** (`storage::route::run_route`): per chunk target ONE
   probe of the region's table and an OR - the cells the entry lacked are
-  the new states - and the job's bundles encoded into one zstd SEGMENT of
-  the frame's edge file. A region's table is written only by its route's
-  jobs, one at a time.
+  the new states, kept as (entry, cells) events - and the job's bundles
+  encoded into one zstd SEGMENT of the frame's edge file. A region's table
+  is written only by its route's jobs, one at a time.
 - **The frame's end**: provisional keys made final, new shapes numbered,
-  each route's new entries renumbered in key order (`RegionTable::
-  finish_frame`), the edge file written, and the new LAYER DECODED from
-  its states' keys and cells (`decode::Skeletons`: no row was copied);
-  checkpointed with ids, cells, keys and wins; the metadata; the drop
-  notes; the pos graph; then `done.txt`. The DECODE GUARD: a shape's first
-  emitted row (each worker, each wave) must be what its key and cell decode
-  to, and every emission's skeleton the shape's (FATAL otherwise);
-  `--key-check` compares every row.
+  each route's new states listed by key (`route::seal`): the NEXT LAYER,
+  its count checked against the region phase's insertions; its states
+  DECODED once more in chunks on every thread for their wins (and, under
+  `--key-check`, each row's key and cell); the edge file written. The
+  forward then writes the FRAME FILE (`frames/f{F}.bin`: per region a zstd
+  block of the new entries' keys, masks and win masks; a header with the
+  shapes numbered, the key space's additions and the shapes' skeletons),
+  READS IT BACK and compares it with the layer, region by region and entry
+  by entry (`layer::check_frame_file`, FATAL on a difference); the drop
+  notes (`dropped/f{F}.bin`: (region, key, horizon) -> cells); the pos
+  graph; then `done.txt`. The DECODE GUARD: a shape's first emitted row
+  (each worker, each wave) must be what its key and cell decode to, and
+  every emission's skeleton the shape's (FATAL otherwise); `--key-check`
+  compares every row.
+- **Resume** rebuilds the visited set from the frame files (each frame's
+  regions in parallel; a state stored twice is an error); the frontier is
+  the last frame's layer. Readers (`layer::Tree`) give a frame's layer, a
+  state's layer, rows decoded on demand.
 
 The result is a function of the frame, not of scheduling or the thread
-count: room (1,0) f0-f60 at 3 and 32 threads and over a resume, the frame
-files, edge files and `xfer.bin` are byte-identical (multi-slice frames:
-r0sx f50-f56), and `gates/raise.sh` passes. `rewrite bench-storage`
-replays one captured frame (`--emit-capture`) through this code without the
-kernels, and reproduces the real tree's `ckhash` lines of that frame.
+count: room (1,0) r0sx f0-f56 at 3 and 32 threads and over a resume at
+f45, the frame files, edge files, `xfer.bin` and the pos graph are
+byte-identical (two slices a frame from f50), and `gates/raise.sh`
+passes. `rewrite bench-storage` replays one captured frame
+(`--emit-capture`) through this code without the kernels, and reproduces
+the real tree's `ckhash` lines of that frame.
 
 ## The recorded graph (edges target, 2026-10-11)
 
@@ -552,18 +569,19 @@ or a bare number - `gemskip-campaign`'s record, which noted nothing); a
 forward extends a tree under ITS filter, never the environment's, so one
 tree is filtered alike at every frame (`--to H` under a tree filtered at
 H2 >= H just uses it, as before). A level-0 forward under level -1 NOTES the
-SOURCES of every dropped row: `dropped/f{t}.bin`, per source id (a row of
-layer t-1) the smallest horizon that admits one of its dropped successors
-(`CostToGo::admitted_from` = f + d, per frontier row: `wave::DropNotes`). A
+SOURCES of every dropped row: `dropped/f{t}.bin`, per source (a state of
+layer t-1, by region and key, its cells a mask) the smallest horizon that
+admits one of its dropped successors (`CostToGo::admitted_from` = f + d,
+noted per lane in the unit). A
 search past the tree's H then RAISES it to the run's H' before extending:
 frame by frame from 1, the sources whose note is <= H' and the states the
 raise added one frame earlier run one wave under H', against the WHOLE
-tree's visited set. A new state joins the frame's layer (new pieces numbered
-after its own, `Layer::Raised`; new entries numbered after every entry,
-`meta.r{seq}.bin`), an old one gets its edge; a re-expanded source's edges
-into cells the OLD filter admitted exist already and are not recorded again
-(a unit runs one block, so its sources are all the tree's or all the
-raise's). The new edges go into the frame's RAISED edge file
+tree's visited set. A new state joins the frame (the raise's frame file
+`frames/f{t}.r{seq}.bin`, `frame::Raised`), an old one gets its edge; a
+re-expanded source's edges into cells the OLD filter admitted exist
+already and are not recorded again (the noted sources and the raise's own
+are two parts of the frontier, and a unit runs one). The new edges go into
+the frame's RAISED edge file
 `f{frame}.r{seq}.bin` beside its own; `EdgeStore` reads both. The notes of
 the frame are rewritten (the untouched sources keep theirs). The result is
 the tree a fresh forward under H' makes: the same (key, cell) set per frame,
@@ -592,19 +610,19 @@ interrupted (`raising.txt`: half raised, delete it). A FINER level's tree
 (the objects ladder) is filtered by the coarser marks for one horizon; it is
 kept only for the same marks (with deadlines), horizon and level -1
 (`filtered_for.txt`), else built again - it is the cheap one.
-Frame files hold IDS, not rows (2026-10-11, plans/rows-from-keys.md;
-format 14): a row is a function of its shape's skeleton, its exact key and
-its cell, and an id names both, so a frame file is the shape's skeleton,
-the win rows and the id column (8 B a row), and a row is DECODED when read
-(`storage::decode`, against the metadata's key space and entries:
-`decode::TreeKeys`). Since the edges target the forward copies no row at
-all: the new layer is decoded from its states' keys and cells, and the
-DECODE GUARD checks a shape's first emitted row each worker and wave
-against its decode (`decode::Skeletons`, FATAL otherwise); `--key-check`
-checks every row. This replaced
-`--trim-rows` (2026-10-07: old frames trimmed to keys, ids, cells and wins,
-and the diagnostics refused them): every frame's rows are readable now, and
-the frames take ~8 B a state instead of 50-80.
+Frame files hold KEYS only (2026-10-12, plans/keys-only.md; format 15,
+after format 14's ids and skeletons, plans/rows-from-keys.md): a row is a
+function of its shape's skeleton, its exact key and its cell, so a frame
+file is per region its new entries' keys and cell masks (and win masks)
+with the shapes' skeletons, and a row is DECODED when needed
+(`storage::decode`). The forward copies no row and holds no row layer: a
+unit decodes its rows from the frontier's keys, the frame's end decodes
+the new states once for their wins. The DECODE GUARD checks a shape's
+first emitted row each worker and wave against its decode
+(`decode::Skeletons`, FATAL otherwise); `--key-check` checks every row; every
+frame file is read back and compared with the forward's states. Frames
+take ~0.08 B a state on the mod room (fm85: 307 MB for 3.68B states;
+format 14 ~9 B).
 The level is a value (2026-10-10): the engines carry it (`FrameEngine`,
 `RefEngine::at_level`, `FrameStep::level`), and a tree records it in its
 settings record (`<level>/settings.txt`, `settings::Settings`, written when a
