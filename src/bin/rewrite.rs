@@ -2587,10 +2587,10 @@ fn reach_command(checkpoint_dir: &str, level_index: usize, to: u32, save: Option
         Ok(())
     })?;
     println!("[reach] {} to f{to}, {:.1} s", dir.display(), t0.elapsed().as_secs_f64());
-    let mut tsv = String::from("frame\tstates\tnew\tentered\tentered_edges\tpushes\tpushes_nonempty\tpoints\tcells\tforward_layer\tcoarsened\tinexact\tmax_k\tx_min\tx_max\ty_min\ty_max\treached_with_dropped_successors\tdrop_noted_cells\n");
+    let mut tsv = String::from("frame\tstates\tnew\tentered\tentered_edges\treached_edges\tpushes\tpushes_nonempty\tpoints\tcells\tforward_layer\tcoarsened\tinexact\tmax_k\tx_min\tx_max\ty_min\ty_max\treached_with_dropped_successors\tdrop_noted_cells\n");
     for (f, e) in r.frames.iter().zip(&extent) {
         let p = r.pushes.get(f.frame as usize).copied().unwrap_or_default();
-        let line = format!("{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}", f.frame, f.states, f.new, f.entered, f.entered_edges, p.edges, p.nonempty, f.points, f.cells, f.forward_layer, f.coarsened, f.inexact, f.max_k, e.1, e.2, e.3, e.4, e.5, e.6);
+        let line = format!("{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}", f.frame, f.states, f.new, f.entered, f.entered_edges, f.reached_edges, p.edges, p.nonempty, f.points, f.cells, f.forward_layer, f.coarsened, f.inexact, f.max_k, e.1, e.2, e.3, e.4, e.5, e.6);
         println!("{line}");
         tsv += &line;
         tsv.push('\n');
@@ -2615,17 +2615,23 @@ fn reach_command(checkpoint_dir: &str, level_index: usize, to: u32, save: Option
     let live = r.last.len() as u64;
     let entered: u64 = r.frames.iter().map(|f| f.entered).sum();
     let entered_edges: u64 = r.frames.iter().map(|f| f.entered_edges).sum();
+    let reached: u64 = r.frames.iter().filter(|f| f.frame < steps).map(|f| f.states).sum();
+    let reached_edges: u64 = r.frames.iter().map(|f| f.reached_edges).sum();
     let e = &r.entries;
     let range = |a: usize, b: usize| e.iter().skip(a).take(b.saturating_sub(a)).sum::<u64>();
     let mut summary = String::new();
     summary += &format!("[reach] states ever reached: {live} (the forward visited {visited}: {:.2}%)\n", 100.0 * live as f64 / visited.max(1) as f64);
     summary += &format!(
-        "[reach] first arrival: entries per state 1: {}, 2: {}, 3-5: {}, 6+: {} ({entered} entries); their edge records {entered_edges} against the forward's emissions {emitted} ({:.2}%)\n",
+        "[reach] first arrival (a lower bound: unions coarsened past 32 segments): entries per state 1: {}, 2: {}, 3-5: {}, 6+: {} ({entered} entries); their edge records {entered_edges} against the forward's emissions {emitted} ({:.2}%)\n",
         range(1, 2),
         range(2, 3),
         range(3, 6),
         range(6, usize::MAX),
         100.0 * entered_edges as f64 / emitted.max(1) as f64
+    );
+    summary += &format!(
+        "[reach] the upper bound, a state entering at every frame it is reached: {reached} entries, {reached_edges} edge records ({:.2}% of the forward's emissions)\n",
+        100.0 * reached_edges as f64 / emitted.max(1) as f64
     );
     summary += &format!(
         "[reach] edges of the states ever reached: {} records ({:.2}% of the forward's), {} distinct, {} of those ever pushed non-empty\n",

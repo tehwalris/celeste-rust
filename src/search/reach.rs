@@ -49,6 +49,13 @@ const TARGET_CHUNK: usize = 16;
 /// by f164).
 const MAX_SEGS: usize = 1 << 10;
 
+/// The most segments a state's first-arrival union keeps (coarsened past
+/// it like a reached set): held for every state ever reached, it is most
+/// of the memory (1024 segments: 15 GB by bal200's f140). Coarser, it
+/// grows less often: the entries counted are a LOWER bound (every one is
+/// a real growth), the frames a state is reached at the upper.
+const ACC_SEGS: usize = 32;
+
 /// One frame's exact reach, summed.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct FrameReach {
@@ -75,6 +82,9 @@ pub struct FrameReach {
     /// - and their out-edge records (its emissions; 0 at the horizon).
     pub entered: u64,
     pub entered_edges: u64,
+    /// The out-edge records of every reached state (the upper bound on the
+    /// entries': a state entering at every frame it is reached).
+    pub reached_edges: u64,
 }
 
 /// A frame's edge pushes: every edge of a reached state, and those whose
@@ -118,14 +128,14 @@ fn snap(s: Seg, k: u32) -> Seg {
 
 /// The union of `v` (deduplicated, left as the union's input), and its
 /// coarsening: 0 exact, else the `k` its pieces were snapped to (outward,
-/// to the grid of `2^k` points per axis) to fit `MAX_SEGS` segments - the
+/// to the grid of `2^k` points per axis) to fit `max` segments - the
 /// smallest from `k0` (a target already coarsened to `k0` within the frame
 /// starts there: no ladder of failed sweeps on every union).
-fn union(v: &mut Vec<Piece>, scratch: &mut Vec<Seg>, k0: u8) -> (Region, u8) {
+fn union(v: &mut Vec<Piece>, scratch: &mut Vec<Seg>, k0: u8, max: usize) -> (Region, u8) {
     v.sort_unstable_by_key(|p| (p.y, p.x));
     v.dedup();
     if k0 == 0 {
-        if let Some(r) = Region::try_from_pieces(v, scratch, MAX_SEGS) {
+        if let Some(r) = Region::try_from_pieces(v, scratch, max) {
             return (r, 0);
         }
     }
@@ -135,7 +145,7 @@ fn union(v: &mut Vec<Piece>, scratch: &mut Vec<Seg>, k0: u8) -> (Region, u8) {
         w.extend(v.iter().map(|p| Piece { y: snap(p.y, k), x: snap(p.x, k) }));
         w.sort_unstable_by_key(|p| (p.y, p.x));
         w.dedup();
-        if let Some(r) = Region::try_from_pieces(&mut w, scratch, MAX_SEGS) {
+        if let Some(r) = Region::try_from_pieces(&mut w, scratch, max) {
             return (r, k as u8);
         }
     }
@@ -242,12 +252,16 @@ pub fn reach(dir: &std::path::Path, horizon: u32, point: (u32, u32), threads: us
                 for i in c * GROW_CHUNK..((c + 1) * GROW_CHUNK).min(cur.len()) {
                     let (s, r) = &cur[i];
                     match acc_ref.get(s) {
-                        None => res.push((i as u32, r.clone())),
+                        None => {
+                            v.clear();
+                            r.pieces(v);
+                            res.push((i as u32, union(v, scratch, 0, ACC_SEGS).0));
+                        }
                         Some((a, _)) => {
                             v.clear();
                             a.pieces(v);
                             r.pieces(v);
-                            let (u, _) = union(v, scratch, 0);
+                            let (u, _) = union(v, scratch, 0, ACC_SEGS);
                             if u != *a {
                                 res.push((i as u32, u));
                             }
@@ -267,8 +281,9 @@ pub fn reach(dir: &std::path::Path, horizon: u32, point: (u32, u32), threads: us
             entered += 1;
             entered_edges += out.get(&s).map_or(0, |o| o.0 as u64);
         }
+        let reached_edges = cur.iter().map(|(s, _)| out.get(s).map_or(0, |o| o.0 as u64)).sum();
         if let Some(f) = frames.last_mut() {
-            (f.entered, f.entered_edges) = (entered, entered_edges);
+            (f.entered, f.entered_edges, f.reached_edges) = (entered, entered_edges, reached_edges);
         }
         // The frame's edges grouped by target (a counting sort): `inc[start[d]
         // ..start[d + 1]]` the (source in `cur`, transfer) pairs into `d`.
@@ -338,14 +353,14 @@ pub fn reach(dir: &std::path::Path, horizon: u32, point: (u32, u32), threads: us
                             v.extend(tmp.iter().map(|&p| grid(p, snapped)));
                         }
                         if v.len() > lim {
-                            let (u, k) = union(v, scratch, snapped);
+                            let (u, k) = union(v, scratch, snapped, MAX_SEGS);
                             snapped = snapped.max(k);
                             v.clear();
                             u.pieces(v);
                             lim = (2 * v.len()).max(256);
                         }
                     }
-                    let (u, k) = union(v, scratch, snapped);
+                    let (u, k) = union(v, scratch, snapped, MAX_SEGS);
                     snapped = snapped.max(k);
                     if !u.is_empty() {
                         res.push((names_ref[d as usize], u, snapped, from));
@@ -432,12 +447,12 @@ mod tests {
         // 3 * MAX_SEGS points, 3 a row 5 apart in x, the rows 3 apart (never
         // adjacent).
         let cloud: Vec<Piece> = (0..3 * super::MAX_SEGS as u32).map(|i| pt(1000 + 5 * (i % 3), 3 * (i / 3))).collect();
-        let (r, k) = super::union(&mut cloud.clone(), &mut Vec::new(), 0);
+        let (r, k) = super::union(&mut cloud.clone(), &mut Vec::new(), 0, super::MAX_SEGS);
         assert!(k > 0 && r.n_segs() <= super::MAX_SEGS, "k {k}, {} segments", r.n_segs());
         assert!(cloud.iter().all(|p| r.contains(p.x.lo, p.y.lo)), "the coarsened set holds every point");
-        let (r1, k1) = super::union(&mut cloud.iter().copied().map(|p| super::Piece { y: super::snap(p.y, k as u32 - 1), x: super::snap(p.x, k as u32 - 1) }).collect(), &mut Vec::new(), 0);
+        let (r1, k1) = super::union(&mut cloud.iter().copied().map(|p| super::Piece { y: super::snap(p.y, k as u32 - 1), x: super::snap(p.x, k as u32 - 1) }).collect(), &mut Vec::new(), 0, super::MAX_SEGS);
         assert!(k1 > 0 || r1.n_segs() > super::MAX_SEGS, "a finer grid would have fit: k {k} is not the smallest");
-        let (small, k0) = super::union(&mut cloud[..100].to_vec(), &mut Vec::new(), 0);
+        let (small, k0) = super::union(&mut cloud[..100].to_vec(), &mut Vec::new(), 0, super::MAX_SEGS);
         assert_eq!((k0, super::points(&small)), (0, 100));
     }
 
@@ -503,6 +518,7 @@ mod tests {
         let entered: u64 = r.frames.iter().map(|f| f.entered).sum();
         assert_eq!(entered, r.entries.iter().enumerate().map(|(n, &c)| n as u64 * c).sum::<u64>());
         assert!(entered <= r.frames[..35].iter().map(|f| f.states).sum::<u64>());
+        assert!(r.frames.iter().map(|f| f.entered_edges).sum::<u64>() <= r.frames.iter().map(|f| f.reached_edges).sum::<u64>());
         // Edges: the distinct ones of the recorded, the pushed of those.
         assert!(r.edges_pushed > 0 && r.edges_pushed <= r.edges && r.edges <= r.edges_raw);
         assert!(r.pushes.iter().map(|p| p.nonempty).sum::<u64>() >= r.edges_pushed);
