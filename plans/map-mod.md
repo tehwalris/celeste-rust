@@ -362,3 +362,8 @@ show as a replay mismatch - none so far), or the room needs something the
 argument above misses. Checking it exactly is cheap: the crossing states
 are few (252 by f160); `--start-inputs` from each, `--win-at` the balloon,
 +20, settles their whole future.
+
+Checked exactly: the 252 crossings of f157-160 (20 distinct states by
+position, speed, remainder, djump) - `--start-inputs` each, `--win-at
+113..127,100..120` (the balloon), +20: all 20 REFUTED (7-16 s each; what
+survives to +20 is the respawn after the death).
