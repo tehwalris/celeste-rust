@@ -2134,7 +2134,7 @@ fn main() -> Result<()> {
             celeste_rust::search::ui_export::export(
                 std::path::Path::new(&checkpoint_dir),
                 std::path::Path::new(&out),
-                cfg.room,
+                &cfg,
                 arc.as_deref().map(std::path::Path::new),
                 celeste_rust::search::ui_export::Paths {
                     witness: witness.as_deref().map(std::path::Path::new),

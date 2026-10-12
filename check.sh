@@ -8,8 +8,9 @@
 #                          frame, the storage replay, the kernels and the
 #                          transfers against the reference
 #   ./check.sh t2 [--pin]  short end-to-end runs: the room (1,0) gates, an
-#                          objects-ladder search, a platform room's forward
-#                          and one frame of it with its exact metrics
+#                          objects-ladder search, the UI export of both
+#                          searches, a platform room's forward and one frame
+#                          of it with its exact metrics
 #   ./check.sh big [--pin] the reference frame (6,2) 100% f56 -> f57 and its
 #                          12 GB capture replayed (fixtures: minutes, once)
 #   ./check.sh all         t0, t1, t2
@@ -160,6 +161,7 @@ t2() {
     step gate10-forward gate10_forward
     step gate10-arc gate10_arc
     step search42-objects search42
+    step export-ui export_ui
     step forward60-platforms forward60
     # The platform kernels' frame and exact metrics (their build is the
     # cost: ~20 s of tracing, hence here and not in t1).
@@ -178,16 +180,38 @@ gate10_forward() {
     ./safe-run.sh -- "$B" ckhash --to 44 --room 1,0 --checkpoint-dir "$C/t2/g10" | diff gates/ckhash_room10_f000-044.txt - >&2
 }
 gate10_arc() {
-    ./safe-run.sh -- "$B" search --to 35 --win-at 9,101 --checkpoint-dir "$C/t2/arc10" --prefer gates/known_room10_win9-101.txt > "$C/t2/arc10.out" || return 1
+    ./safe-run.sh -- "$B" search --to 35 --win-at 9,101 --checkpoint-dir "$C/t2/arc10" --prefer gates/known_room10_win9-101.txt --save-marks "$C/t2/arc10-marks" > "$C/t2/arc10.out" || return 1
     grep '^\[gate\]' "$C/t2/arc10.out" | diff gates/arc_room10_win9-101_h35.txt - >&2
 }
 # The objects ladder (r0sxhn filtering r0sxh) at a synthetic win, its
 # witness as the known route: every level's [gate] lines pinned.
 search42() {
-    ./safe-run.sh -- "$B" search --room 4,2 --level r0sxhn,r0sxh --to 50 --win-at 32,56 --checkpoint-dir "$C/t2/s42" --prefer "$G/known_room42_win32-56.txt" > "$C/t2/s42.out" || return 1
+    ./safe-run.sh -- "$B" search --room 4,2 --level r0sxhn,r0sxh --to 50 --win-at 32,56 --checkpoint-dir "$C/t2/s42" --prefer "$G/known_room42_win32-56.txt" --save-marks "$C/t2/s42-marks" > "$C/t2/s42.out" || return 1
     grep '^\[gate\]' "$C/t2/s42.out" > "$C/t2/s42.gate"
     same "$C/t2/s42.gate" "$G/search42.gate"
 }
+# The UI export (`rewrite export-ui`) of the two searches above with their
+# marks: every binary file, and run.json without its timings (the search's
+# wall, the forward's per-frame walls and memory), pinned by digest.
+export_ui() {
+    for s in arc10:1,0 s42:4,2; do
+        local d=${s%%:*} room=${s##*:}
+        ./safe-run.sh -- "$B" export-ui --room "$room" --checkpoint-dir "$C/t2/$d" --arc "$C/t2/$d-marks" --out "$C/t2/ui-$d" > /dev/null || return 1
+        (cd "$C/t2" && sha256sum ui-$d/*.bin)
+        python3 -c '
+import json, sys
+r = json.load(open(sys.argv[1]))
+del r["wall_s"]
+for h in r["horizons"]:
+    for l in h["levels"]:
+        for f in l["fwd"]:
+            for k in ["emit_ms", "emit_idle", "own_ms", "own_idle", "ckpt_ms", "pos_ms", "total_ms", "rss_gb"]:
+                del f[k]
+print(json.dumps(r, sort_keys=True))' "$C/t2/ui-$d/run.json" | sha256sum | sed "s|-\$|ui-$d/run.json (no timings)|"
+    done > "$C/t2/export-ui.sha256"
+    same "$C/t2/export-ui.sha256" "$G/export-ui.sha256"
+}
+
 # A platform room (platforms unknown, split frame) to step 71: the tree's
 # fingerprint is the r60s fixture's pin.
 forward60() {
