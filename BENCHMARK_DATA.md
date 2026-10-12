@@ -1,5 +1,26 @@
 > STALE in parts: dated sections, newest first, each measured on the code of its date (before 2026-08-31: the deleted pre-rebuild search; plans/ links may name merged or deleted docs, see plans/architecture.md "Where the old plans went") - re-measure before relying on a number.
 
+# The UI export streamed, 2026-10-12 (branch `ui-export-stream`)
+
+`rewrite export-ui` of the mod room's balloon run (`/var/tmp/mod-ck/bal200`:
+82 GB tree, 201 frames, 13.3B states in 315 storage regions; level0 marks
+13.8 GB, 431M rows), release, the map-mod build (a local merge for the
+cart). Before: develop's export (every marked state in a hash table, all
+frames read in parallel, each frame's layer decoded whole), the
+coordinator's run under a 95 GB cap (a 60 GB cap OOM-killed it). After:
+region by region, the marks file mapped and merged, what is read unmapped
+(`search::ui_export`). Load ~22. Every output file byte-identical.
+
+| | wall | user + sys | heap (RssAnon) peak | VmHWM |
+|---|---|---|---|---|
+| before | 102.5 s | - | ~81 GB (VmHWM less 14.7 GB of mapped files) | 96.1 GB |
+| after, 2 runs | 6.9 / 6.9 s | 107.6 / 106.9 s | 1.43 / 1.47 GB | 7.27 / 7.14 GB |
+
+VmHWM above the heap is the marks rows of the 16 regions in flight (mapped,
+clean); a 4 GB cap runs it unchanged (7.2 s, identical). Read frame by
+frame instead, every frame's merge touched rows all over the marks file:
+13.5 GB of it stayed mapped (12.7 s, quick profile).
+
 # One state set, 2026-10-12 (16 threads, branch `keys-only`)
 
 The visited set, the frontier and the next layer as one type
