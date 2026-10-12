@@ -1,5 +1,25 @@
 > STALE in parts: dated sections, newest first, each measured on the code of its date (before 2026-08-31: the deleted pre-rebuild search; plans/ links may name merged or deleted docs, see plans/architecture.md "Where the old plans went") - re-measure before relying on a number.
 
+# One state set, 2026-10-12 (16 threads, branch `keys-only`)
+
+The visited set, the frontier and the next layer as one type
+(`storage::set`: keys in the bytes they need, a tagged u32 index at load
+0.5-0.85, chunks of 32768 entries), job-local target names in the region
+phase, 256k-lane slices and the backward's galloping read
+(c2325d2..ef93c48, plans/keys-only.md "The one state set"), against
+2ef9213 (the first keys-only build, then develop). Release; interleaved, 2 rounds, at load 21-33 (another agent's 14-thread
+mod search beside it, 50 GB): walls good to ~5%. Every pair has identical
+f/e lines, `[gate]` lines, optima and witnesses.
+
+| case | 2ef9213 | one set |
+|---|---|---|
+| the reference frame (6,2) 100% f56 -> f57, 2 x 3 reps | wave 3727-3977 ms, frame 3991-4217 ms, region phase 6.1-7.8 worker-s; max RSS 2.32-2.33 GB; visited 2.2 B a state, frontier 2.36 | wave 3439-3898 ms, frame 3694-4162 ms, region phase 4.6-5.4 worker-s; max RSS 1.88-1.91 GB; visited 1.05 B a state, frontier 1.37 |
+| the mod room's fmp f76 -> f77 (`bench-frame`; 348M rows in, 11.2G emissions), 2 rounds | wave 154.8 / 165.6 s, frame 187.7 / 207.2 s, region phase 648 / 784 worker-s, end 8.5 / 9.5 s; max RSS 37.4 GB; visited 2.74 B a state, frontier 1.88 | wave 134.8 / 142.1 s, frame 143.3 / 150.1 s, region phase 244 / 316 worker-s, end 6.2 / 6.0 s; max RSS 20.9-21.0 GB; visited 1.34 B a state, frontier 0.95 |
+| room (1,0) `--ceiling 99` | forward 133.7 / 139.5 s, backward 2.9 / 3.2 s, max RSS 2.15 GB, tree 570 MB, f99 visited 2.2 B a state | forward 137.0 / 136.5 s, backward 3.2 / 3.2 s, max RSS 1.65-1.68 GB, tree 593 MB, 0.94 B a state |
+| room (6,2) 100% `r0sxhf,r0sxh --ceiling 94` | level 0's forward 211.8 / 207.5 s, backward 1.9 / 1.8 s, max RSS 3.86-3.88 GB, tree 1.85 GB, f94 visited 2.0 B a state | 211.6 / 213.7 s, 1.9 / 1.7 s, 2.94-3.04 GB, 1.84 GB, 0.92 B a state |
+| the mod room's +95 run (fmp95, whole) | peak 20.91 GB; f077 rss start / wave / peak 13.9 / 18.1 / 20.6 GB, visited 17.3 GB (2.73 B a state) | peak 13.66 GB; f077 9.5 / 12.4 / 12.6 GB, visited 8.34 GB (1.32 B a state); walls at load ~31, not comparable |
+| the mod room's backward, `bench-backward` W f86 of h95 on both slicings' trees (fc6130b against ef93c48; 2 interleaved rounds, load 22-25) | fc6130b, the 256k-slice tree: f87-f91 read 96.2 s, f86 read 23.6-24.2 s, push to f87 145.7 s; the 1M-slice tree: 73.5-74.5 s, 15.8-16.4 s, 122-126 s | with the galloping read (ef93c48): 256k 58.4-59.4 s, 12.4-12.7 s, 108.3 s; 1M 60.6-63.2 s, 12.7-13.2 s, 111-115 s; W f086 identical |
+
 # Keys only, 2026-10-12 (16 threads, branch `keys-only`)
 
 A state is its key in memory and on disk: the frontier and the frame files

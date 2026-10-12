@@ -524,7 +524,9 @@ the list (coarsest first; one level is the usual case):
    `W_t(p) = W_{t+1}(p) ∪ U pull_e(W_{t+1}(m))` over the edges `p -> m`
    whose target CHANGED at t + 1: frame by frame from the wins, the changed
    nodes' in-edges at frames <= t + 1 are read from their target regions'
-   blocks, in bounded ROUNDS (~20M in-edges, 0.8 GB, at most), and pulled into their
+   blocks (each block's sorted targets met by galloping through the
+   region's sorted changed ones: a block costs its own size, not the
+   group's), in bounded ROUNDS (~20M in-edges, 0.8 GB, at most), and pulled into their
    sources in parallel state ranges. No graph is held and nothing marks nodes
    first: a node no winning set reaches is never touched, and W's SUPPORT
    (the nodes with a set at some frame) replaces the remainder-free marks

@@ -65,9 +65,13 @@ ALL="r10 r62h r42n r42x r60s r10arc cap-r10"
 BIG="r62h57 cap-r62h57"
 
 # What the fixture's frames are a function of, besides its spec: the file
-# formats (a mismatch is STALE) and the sources (reported only).
+# formats and the slice size (a mismatch is STALE), and the sources
+# (reported only). The slices order the transfers' discovery, so a tree's
+# `xfer.bin` (its ids) and with it a frame check's edge bytes follow them:
+# a fixture cut by another slice size passes its fingerprint and fails the
+# metrics.
 formats() {
-    echo "checkpoint $(grep -o 'FORMAT_VERSION: u32 = [0-9]*' src/search/checkpoint.rs | grep -o '[0-9]*$') edges $(grep -o '^const VERSION: u32 = [0-9]*' src/storage/edges.rs | grep -o '[0-9]*$') settings $(grep -o '^pub const VERSION: u32 = [0-9]*' src/settings.rs | grep -o '[0-9]*$')"
+    echo "checkpoint $(grep -o 'FORMAT_VERSION: u32 = [0-9]*' src/search/checkpoint.rs | grep -o '[0-9]*$') edges $(grep -o '^const VERSION: u32 = [0-9]*' src/storage/edges.rs | grep -o '[0-9]*$') settings $(grep -o '^pub const VERSION: u32 = [0-9]*' src/settings.rs | grep -o '[0-9]*$') slices $(grep -o '^const SLICE_LANES: usize = [^;]*' src/storage/wave.rs | cut -d= -f2 | tr -d ' ')"
 }
 sources() {
     { git ls-files -s src crates lua cart Cargo.lock; git diff HEAD -- src crates lua cart Cargo.lock; } | sha1sum | cut -c1-16
