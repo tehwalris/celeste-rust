@@ -7,24 +7,22 @@
 //! alone.
 //!
 //! A capture: per wave worker `w{n}.bin`, tagged little-endian records in
-//! unit order - UNIT (`1`, unit index u32, block u32, first lane u64, source
-//! count u32, sources old u8, the source ids u64 each), EMIT (`2`, shape u64,
-//! key u64 u64, cell u32, lane u32 (from the unit's first), transfer u32
-//! (`u32::MAX`: none)), DROP (`3`, lane u32, from u32), MISS (`4`, length
+//! unit order - UNIT (`1`, unit index u32, lanes u32, sources old u8), EMIT
+//! (`2`, shape u64, key u64 u64, cell u32, lane u32 (in the unit), transfer
+//! u32 (`u32::MAX`: none)), DROP (`3`, lane u32, from u32), MISS (`4`, length
 //! u32, a bincode `exact::MissKey`: the content of the next EMIT's
 //! provisional key, re-interned by the replay) and SHAPE (`5`, length u32,
 //! a bincode `exact::ShapeRecord`: a shape the key space lacks) - and its transfer
 //! table `x{n}.bin` (`encode_pair` each, the EMIT ids index it); `env.txt`.
-//! Rows are not captured: the new layer is decoded from the keys, each
-//! shape with its first frontier piece's skeleton.
+//! Rows are not captured: the new states' wins are decoded from their keys,
+//! each shape with the tree's latest skeleton of it.
 
 use anyhow::{ensure, Context, Result};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use super::unit::UnitSink;
-use super::visited::{Key, VisitedSet};
-use super::StateId;
+use super::visited::Key;
 
 /// One wave worker's capture stream.
 pub struct CaptureWriter {
@@ -47,17 +45,12 @@ impl CaptureWriter {
         Some(CaptureWriter { dir, worker, out: std::io::BufWriter::with_capacity(8 << 20, f) })
     }
 
-    pub fn unit(&mut self, unit: u32, block: u32, lo: usize, sources: &[StateId], old: bool) {
-        let mut b = Vec::with_capacity(22 + 8 * sources.len());
-        b.push(1u8);
-        b.extend_from_slice(&unit.to_le_bytes());
-        b.extend_from_slice(&block.to_le_bytes());
-        b.extend_from_slice(&(lo as u64).to_le_bytes());
-        b.extend_from_slice(&(sources.len() as u32).to_le_bytes());
-        b.push(old as u8);
-        for s in sources {
-            b.extend_from_slice(&s.to_le_bytes());
-        }
+    pub fn unit(&mut self, unit: u32, lanes: u32, old: bool) {
+        let mut b = [0u8; 10];
+        b[0] = 1;
+        b[1..5].copy_from_slice(&unit.to_le_bytes());
+        b[5..9].copy_from_slice(&lanes.to_le_bytes());
+        b[9] = old as u8;
         self.out.write_all(&b).expect("a capture write");
     }
 
@@ -116,8 +109,7 @@ impl CaptureWriter {
 /// One captured unit, located in its stream.
 struct CapUnit {
     unit: u32,
-    block: u32,
-    lo: u64,
+    lanes: u32,
     /// The worker stream and the byte range of its records.
     stream: usize,
     records: std::ops::Range<usize>,
@@ -154,10 +146,8 @@ impl Capture {
             let mut pos = 0usize;
             while pos < b.len() {
                 ensure!(b[pos] == 1, "{}: a unit record expected at byte {pos}", p.display());
-                let (unit, block) = (u32_at(pos + 1), u32_at(pos + 5));
-                let lo = u64::from_le_bytes(b[pos + 9..pos + 17].try_into().unwrap());
-                let n = u32_at(pos + 17) as usize;
-                pos += 22 + 8 * n;
+                let (unit, lanes) = (u32_at(pos + 1), u32_at(pos + 5));
+                pos += 10;
                 let start = pos;
                 let mut emits = 0u64;
                 while pos < b.len() && b[pos] != 1 {
@@ -171,38 +161,33 @@ impl Capture {
                         t => anyhow::bail!("{}: record tag {t} at byte {pos}", p.display()),
                     }
                 }
-                units.push(CapUnit { unit, block, lo, stream: maps.len(), records: start..pos, emits });
+                units.push(CapUnit { unit, lanes, stream: maps.len(), records: start..pos, emits });
             }
             maps.push(map);
         }
         ensure!(!units.is_empty(), "{}: no capture streams", dir.display());
         units.sort_by_key(|u| u.unit);
+        ensure!(units.iter().enumerate().all(|(i, u)| u.unit == i as u32), "{}: the captured units are not 0..{}", dir.display(), units.len());
         Ok(Capture { maps, xfers, units, frame })
     }
 }
 
 /// The capture as a `FrameStep`: a unit's "kernels" replay the captured
-/// unit with the same block and first lane (the replay runs at the
-/// capture's thread count, so the wave cuts the same units).
+/// unit of the same index (the units are a function of the frontier, so
+/// the replay's are the capture's).
 struct Replay<'a> {
     cap: &'a Capture,
-    /// Captured units by (frontier block, first lane).
-    by_start: rustc_hash::FxHashMap<(u32, u64), usize>,
-    /// The frontier's blocks by (shape, seq): their index in it.
-    blocks: rustc_hash::FxHashMap<(u64, u32), u32>,
-    /// Per shape, the skeleton its emissions carry (its first frontier
-    /// piece's: the replay has no kernel templates).
+    /// Per shape, the skeleton its emissions carry (the tree's latest: the
+    /// replay has no kernel templates).
     skeletons: rustc_hash::FxHashMap<u64, celeste_engine::runtime2::Rt2>,
     level: crate::abstraction::Level,
     settings: std::sync::Arc<crate::settings::Settings>,
 }
 
 impl crate::frame::FrameStep for Replay<'_> {
-    fn run(&self, block: &crate::frame::Block, _cell_in: &[u32], lanes: &[usize], sink: &mut UnitSink) -> Result<()> {
-        let bi = *self.blocks.get(&(block.shard_shape(), block.seq())).context("a frontier block the capture does not know")?;
-        let first = *lanes.first().context("an empty unit")? as u64;
-        let &ui = self.by_start.get(&(bi, first)).with_context(|| format!("no captured unit starts at lane {first} of block {bi}: replay at the capture's thread count"))?;
-        let u = &self.cap.units[ui];
+    fn run(&self, block: &crate::frame::Block, _cell_in: &[u32], _lanes: &[usize], sink: &mut UnitSink) -> Result<()> {
+        let u = self.cap.units.get(sink.unit as usize).context("a unit the capture does not have")?;
+        ensure!(u.lanes as usize == block.lanes(), "unit {}: {} lanes, the capture's has {}", u.unit, block.lanes(), u.lanes);
         sink.replaying();
         let b = &self.cap.maps[u.stream][u.records.clone()];
         let u32_at = |o: usize| u32::from_le_bytes(b[o..o + 4].try_into().unwrap());
@@ -213,7 +198,7 @@ impl crate::frame::FrameStep for Replay<'_> {
         while pos < b.len() {
             match b[pos] {
                 3 => {
-                    sink.dropped(u.lo as usize + u32_at(pos + 1) as usize, u32_at(pos + 5));
+                    sink.dropped(u32_at(pos + 1) as usize, u32_at(pos + 5));
                     pos += 9;
                     continue;
                 }
@@ -234,8 +219,8 @@ impl crate::frame::FrameStep for Replay<'_> {
             let key = miss.take().unwrap_or(key);
             pos += 37;
             let xfer = (x != u32::MAX).then(|| sink.xfer_id(self.cap.xfers[u.stream][x as usize]));
-            let skel = self.skeletons.get(&shape).with_context(|| format!("the captured shape {shape:016x} is not in the frontier: the replay has no skeleton for it"))?;
-            sink.emit(shape, cell, key, u.lo as usize + lane as usize, xfer, || skel.clone_block(), |_| {})?;
+            let skel = self.skeletons.get(&shape).with_context(|| format!("the captured shape {shape:016x} is in no frame of the tree: the replay has no skeleton for it"))?;
+            sink.emit(shape, cell, key, lane as usize, xfer, || skel.clone_block(), |_| {})?;
         }
         Ok(())
     }
@@ -272,21 +257,20 @@ pub fn bench_storage(a: &BenchArgs) -> Result<()> {
     eprintln!("[bench-storage] capture of f{frame}: {} units, {} streams, {emits} emissions, mapped in {:.1} s", cap.units.len(), cap.maps.len(), t.elapsed().as_secs_f64());
     let t = Instant::now();
     let st = crate::frame::ForwardState::at(a.tree, frame - 1, true, a.level, a.settings)?;
-    eprintln!("[bench-storage] the tree at f{} ({} states, {} lanes in) in {:.1} s", frame - 1, st.visited_len(), st.frontier_lanes(), t.elapsed().as_secs_f64());
-    let (blocks, mut skeletons) = st.frontier_index();
-    // Shapes the capture emits beyond the frontier's: a stored row's skeleton.
+    eprintln!("[bench-storage] the tree at f{} ({} states, {} states in) in {:.1} s", frame - 1, st.visited_len(), st.frontier().states(), t.elapsed().as_secs_f64());
+    // Every shape's skeleton: the latest frame's that holds it.
+    let tree = super::layer::Tree::open(a.tree, frame - 1)?;
+    let mut skeletons: rustc_hash::FxHashMap<u64, celeste_engine::runtime2::Rt2> = Default::default();
     for f in (0..frame).rev() {
-        for (_, file) in crate::frame::frame_files(a.tree, f)? {
-            if skeletons.contains_key(&file.shape_hash()) || file.width() == 0 {
-                continue;
-            }
-            if let Some(row) = file.load_rows(&[0..1], a.settings, st.visited())? {
-                skeletons.insert(file.shape_hash(), crate::frame::skeleton_of(&row));
+        for file in &tree.frames[f as usize] {
+            for r in &file.header.skeletons {
+                if !skeletons.contains_key(&r.shape_hash) {
+                    skeletons.insert(r.shape_hash, r.rt2_in(a.settings)?);
+                }
             }
         }
     }
-    let by_start = cap.units.iter().enumerate().map(|(i, u)| ((u.block, u.lo), i)).collect();
-    let engine = Replay { cap: &cap, by_start, blocks, skeletons, level: a.level, settings: std::sync::Arc::new(a.settings.clone()) };
+    let engine = Replay { cap: &cap, skeletons, level: a.level, settings: std::sync::Arc::new(a.settings.clone()) };
     let scratch = std::env::temp_dir().join(format!("celeste-bench-storage-{}", std::process::id()));
     let ms = |d: std::time::Duration| d.as_secs_f64() * 1e3;
     for rep in 0..a.reps {
@@ -295,7 +279,7 @@ pub fn bench_storage(a: &BenchArgs) -> Result<()> {
         let (wave, visited, xfers) = st.bench_wave(&engine, a.tree, Some(&scratch), true)?;
         let all = t.elapsed();
         let w = &wave.stats;
-        let (n, acc) = layer_fingerprint(&wave.next, &visited);
+        let (n, acc) = wave.next.content_fingerprint(&visited.keys, visited.shapes())?;
         let (ne, ae) = edge_fingerprint(&scratch, frame, &xfers, &visited, a.settings.threads())?;
         println!(
             "[bench-storage] rep {rep}: units {:.0} ms (idle {:.0}%, regions {:.0} worker-ms) end {:.0} total {:.0} ms ({} threads; {} slices, {} routes, {} bundles, {:.3} B an edge) | f{frame:03} {n} {acc:016x} | e{frame:03} {ne} {ae:016x}",
@@ -315,24 +299,10 @@ pub fn bench_storage(a: &BenchArgs) -> Result<()> {
     Ok(())
 }
 
-/// `rewrite ckhash`'s `f{frame}` line over a new layer: its states'
-/// count and the order-independent sum of their (key, cell) hashes.
-pub fn layer_fingerprint(layer: &[crate::frame::Block], visited: &VisitedSet) -> (u64, u64) {
-    let content = visited.keys.content_hash();
-    let (mut n, mut acc) = (0u64, 0u64);
-    for b in layer {
-        for (k, id) in b.keys().iter().zip(b.ids()) {
-            acc = acc.wrapping_add(content.state(b.shard_shape(), *k, super::id_cell(&visited.geo, *id)));
-            n += 1;
-        }
-    }
-    (n, acc)
-}
-
 /// `rewrite ckhash --edges`'s `e{frame}` line over the frame's edge file in
 /// `edges_dir` (`EdgeHashes::frame`; `xfers`: the merged table in memory,
 /// the dir's file may hold only the frame's new pairs).
-pub fn edge_fingerprint(edges_dir: &Path, frame: u32, xfers: &super::edges::XferTable, visited: &VisitedSet, threads: usize) -> Result<(u64, u64)> {
+pub fn edge_fingerprint(edges_dir: &Path, frame: u32, xfers: &super::edges::XferTable, visited: &super::visited::VisitedSet, threads: usize) -> Result<(u64, u64)> {
     let store = super::edges::EdgeStore::open(edges_dir, frame)?;
     EdgeHashes::new(&xfers.pairs).frame(&store, frame, &visited.keys.content_hash(), visited.shapes(), threads)
 }

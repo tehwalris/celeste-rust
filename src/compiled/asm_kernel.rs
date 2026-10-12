@@ -431,9 +431,8 @@ impl AsmKernel {
     ) -> bool {
         debug_assert_eq!(cell_in.len(), chunk.width, "one input cell per input row");
         stats([1, 0, 0, 0, 0, 0, 0]);
-        // Slices of 16 live lanes (of any id groups: `run_slice`).
-        let live: Vec<usize> = lanes.iter().copied().filter(|&l| !sink.skip_in.is_some_and(|sk| sk[l])).collect();
-        for part in live.chunks(16) {
+        // Slices of 16 lanes (`lanes`: the unit's expanded ones).
+        for part in lanes.chunks(16) {
             if !self.run_slice(chunk, cell_in, part, ((1u32 << part.len()) - 1) as u16, sink) {
                 return false;
             }
@@ -472,10 +471,6 @@ impl AsmKernel {
         let (mut n_bodies, mut n_bodies_taken, mut n_lanes, mut n_unique) = (0u64, 0u64, 0u64, 0u64);
         {
             let record = sink.records_edges();
-            let skip: u16 = match sink.skip_in {
-                Some(sk) => (0..n).filter(|&i| sk[lanes[i]]).fold(0u16, |m, i| m | (1 << i)),
-                None => 0,
-            };
             let t_ph = crate::frame::phases::add(crate::frame::phases::SETUP, t_setup);
             self.pack_input(&views, lanes, inbuf);
             let t_ph = crate::frame::phases::add(crate::frame::phases::PACK, t_ph);
@@ -501,13 +496,14 @@ impl AsmKernel {
                 // Tri-state masks, each read where it MAY hold.
                 let error = read_zb_may(outbuf, body.error_off);
                 let live = read_zb_may(outbuf, body.live_off);
-                // A SKIPPED lane (an exit, a lost berry: never expanded) has no
-                // successors to lose, so its error is no decline. Room (6,2)
-                // 100% at f84: an exited row (room (7,2), a restart pending)
-                // shared a slice with a live respawn and its error was fatal.
-                if live & error & valid & !skip != 0 {
+                // A row the forward does not expand (an exit, a lost berry)
+                // never reaches a slice (the unit passes its expanded lanes
+                // only): its error would be no decline. Room (6,2) 100% at
+                // f84: an exited row (room (7,2), a restart pending) shared
+                // a slice with a live respawn and its error was fatal.
+                if live & error & valid != 0 {
                     // Declined (fatal in the caller): report the lanes.
-                    let declined = live & error & valid & !skip;
+                    let declined = live & error & valid;
                     let ids = crate::compiled::ids();
                     let mut rows = String::new();
                     let mut m = declined;
@@ -543,7 +539,7 @@ impl AsmKernel {
                     sc.put_back();
                     return false;
                 }
-                let mut take = live & !error & valid & !skip;
+                let mut take = live & !error & valid;
                 // A lane whose emission equals an earlier body's (same
                 // outcome, every stored root and transfer root equal) is
                 // that body's emission again: skip it (`DupRef`).
@@ -1232,7 +1228,7 @@ impl Registry {
         // left room (6,2) 100% f57 36% padding and room (3,0) at 8 px 53%.
         stats([1, 0, 0, 0, 0, 0, 0]);
         let mut by_region: Vec<(Option<Region>, usize)> =
-            lanes.iter().copied().filter(|&l| !sink.skip_in.is_some_and(|sk| sk[l])).map(|l| (grid.of_cell(cell_in[l]), l)).collect();
+            lanes.iter().map(|&l| (grid.of_cell(cell_in[l]), l)).collect();
         by_region.sort_unstable();
         let mut idx: Vec<usize> = Vec::with_capacity(16);
         for run in by_region.chunk_by(|a, b| a.0 == b.0) {

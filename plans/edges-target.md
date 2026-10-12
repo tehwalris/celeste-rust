@@ -167,6 +167,8 @@ give byte-identical frame files, edge files and `xfer.bin`; `gates/raise.sh
 
 ## What still carries state ids (and the proposal)
 
+> Built on 2026-10-12: plans/keys-only.md. Nothing carries a state id now.
+
 `storage::StateId` = (region, entry, cell in region) remains in: the
 layers' frame files (an id column, 8 B a state), the per-frame metadata
 (the entries created, with keys: the Resolver), the level -1 drop notes

@@ -17,8 +17,8 @@
 //! stay two (their cells differ): merging them across units saved ~17% of
 //! the bundles and cost a route-level table that was DRAM-bound. No lookup
 //! happens in the units, no state is named by a number, no row is copied:
-//! the new layer is decoded from (shape, key, cell) at the frame's end
-//! (`wave`).
+//! the new layer is the routes' new (key, cells) at the frame's end
+//! (`seal`, `wave`).
 
 use anyhow::{ensure, Result};
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -92,23 +92,6 @@ pub struct Ub {
     pub mask: u64,
 }
 
-/// A frontier row as an edge names its source: its shape's index, its
-/// cell, its region, its key.
-#[derive(Clone, Copy, Debug)]
-pub struct Src {
-    pub shape: u32,
-    pub cell: u32,
-    pub region: u32,
-    pub key: Key,
-}
-
-/// The wave's frontier rows, by their index over its blocks.
-pub struct Sources {
-    pub rows: Vec<Src>,
-    /// Per frontier block, its first row's index.
-    pub starts: Vec<u32>,
-}
-
 /// A route through a frame: its region's table (taken out of the visited
 /// set for the frame; a new one for a new shape's region), what is new in
 /// it this frame, and its encoded segments.
@@ -120,34 +103,46 @@ pub struct RouteState {
     pub table: Box<RegionTable>,
     /// Entries at the frame's start.
     pub start: u32,
-    /// Per entry, its cells new this frame.
-    pub fresh: Vec<u64>,
-    /// Bundles into provisional targets: encoded at the frame's end, their
-    /// keys final.
-    pub prov: Vec<Bundle>,
-    /// Its segments with their slices: jobs of a route may run out of
-    /// slice order; the file has them in it (`seal`).
-    pub segs: Vec<(u32, Segment)>,
+    /// THE NEW CELLS, as the dedup found them: `(entry, cells it lacked)`
+    /// per chunk target that found any - merged and keyed at the frame's
+    /// end (`seal`). 12-16 B an event, against 8 B for every entry of the
+    /// region in a per-entry array (the mod room's f69: 14.8M events
+    /// against 68M entries).
+    pub fresh: Vec<(u32, u64)>,
+    /// A raise's cells new this frame per entry: a hit on a cell the tree
+    /// held needs its layer, one the raise just made has none.
+    fresh_raise: Option<FxHashMap<u32, u64>>,
+    /// Bundles into provisional targets, per job (slice) a segment
+    /// encoded with their provisional keys: encoded again at the frame's
+    /// end with their final keys. Held as zstd blocks, not bundles: the
+    /// mod room's f53 (+95) held 103M of them, 5.8 GB as structs.
+    pub prov: Vec<(u32, Segment)>,
+    /// Its segments with their kind (0: a job's, 1: a job's provisional
+    /// bundles made final) and slice: jobs of a route may run out of slice
+    /// order; the file has them in this one (`seal`).
+    pub segs: Vec<((u8, u32), Segment)>,
     /// The source regions its edges leave.
     pub sources: FxHashSet<u32>,
-    /// Records taken (emissions) and new states found.
+    /// Records taken (emissions) and new states found; the dedup's
+    /// events that found new cells (an entry's new cells, per chunk target).
     pub recs: u64,
     pub new_states: u64,
+    pub fresh_events: u64,
 }
 
 impl RouteState {
     pub fn new(shape: u64, slot: u32, region: Option<u32>, table: Option<Box<RegionTable>>) -> Self {
         let table = table.unwrap_or_default();
         let start = table.len() as u32;
-        RouteState { shape, slot, region, fresh: vec![0; table.len()], table, start, prov: Vec::new(), segs: Vec::new(), sources: FxHashSet::default(), recs: 0, new_states: 0 }
+        RouteState { shape, slot, region, fresh: Vec::new(), fresh_raise: None, table, start, prov: Vec::new(), segs: Vec::new(), sources: FxHashSet::default(), recs: 0, new_states: 0, fresh_events: 0 }
     }
 }
 
 /// What the region phase reads besides its route.
 pub struct RegionCtx<'a> {
     pub frame: u32,
-    /// The frontier as states (`None`: no edges recorded).
-    pub sources: Option<&'a Sources>,
+    /// Are edges recorded?
+    pub record: bool,
     /// Per worker, its local transfer ids' global ones.
     pub remaps: &'a [Vec<u32>],
     /// A raise's per-state layers: a hit on a state of a later layer than
@@ -171,9 +166,16 @@ pub struct UnitBundles {
     last: Option<(u32, u32)>,
     /// `drain`'s target index.
     t_idx: rustc_hash2::FxHashMap<Key, u32>,
-    /// Emptied buckets, kept for the next units (their pages stay mapped).
+    /// Emptied buckets, kept for the next units (their pages stay mapped),
+    /// at most `SPARE_KEEP` bundles' room in all: kept without a bound,
+    /// every bucket grew to the largest route's (56 MB a worker on the mod
+    /// room's f53); bound to 128k, the units regrew theirs (the reference
+    /// frame's emit +4%).
     spare: Vec<Vec<(Key, Ub)>>,
 }
+
+/// The bundles' room `UnitBundles` keeps in its emptied buckets (20 MB).
+const SPARE_KEEP: usize = 1 << 19;
 
 #[inline]
 fn ub_hash(k: u32, t_key: Key, b: &Ub) -> u64 {
@@ -185,13 +187,23 @@ fn ub_hash(k: u32, t_key: Key, b: &Ub) -> u64 {
 }
 
 impl UnitBundles {
+    /// Bytes its tables hold (`--phases`' `[wavemem]`).
+    pub fn alloc_bytes(&self) -> usize {
+        let b = 16 + std::mem::size_of::<Ub>();
+        self.buckets.iter().map(|x| x.1.capacity() * b).sum::<usize>() + self.spare.iter().map(|v| v.capacity() * b).sum::<usize>() + 8 * self.index.capacity() + 24 * self.t_idx.capacity()
+    }
+
     pub fn clear(&mut self) {
         if self.n > 0 {
             self.index.fill(0);
         }
+        let mut room: usize = self.spare.iter().map(Vec::capacity).sum();
         for (_, mut v) in self.buckets.drain(..) {
-            v.clear();
-            self.spare.push(v);
+            if room + v.capacity() <= SPARE_KEEP {
+                room += v.capacity();
+                v.clear();
+                self.spare.push(v);
+            }
         }
         self.bucket_of.clear();
         (self.last_route, self.last, self.n) = (None, None, 0);
@@ -326,6 +338,8 @@ impl UnitBundles {
 /// sources' indices, the route's source list, its edges as the encoder
 /// takes them, the encoder, the raw block, zstd.
 pub struct Scratch {
+    /// The job's bundles into provisional targets.
+    prov: Vec<Bundle>,
     e_of: Vec<u32>,
     s_of: Vec<u32>,
     s_idx: rustc_hash2::FxHashMap<(u32, Key), u32>,
@@ -336,9 +350,56 @@ pub struct Scratch {
     z: zstd::bulk::Compressor<'static>,
 }
 
+/// Bundles a worker's region scratch keeps room for between jobs: a
+/// heavy route's job is millions of bundles (the mod room's f69: 3.1M),
+/// and every worker kept its largest job's buffers - 2.4 GB at 16
+/// threads. At 256k the big jobs' buffers were made again job after job
+/// (the reference frame's region phase +20%); at 1M not (~25 MB a worker).
+const SCRATCH_KEEP: usize = 1 << 20;
+
+impl Scratch {
+    /// Its buffers back to `SCRATCH_KEEP` bundles' room after a job that
+    /// grew them past it.
+    fn bound(&mut self) {
+        if self.prov.capacity() > SCRATCH_KEEP {
+            self.prov = Vec::new();
+        }
+        if self.tbs.capacity() > SCRATCH_KEEP {
+            self.tbs = Vec::with_capacity(SCRATCH_KEEP);
+            self.raw = Vec::new();
+            self.enc.bound(SCRATCH_KEEP);
+        }
+        if self.s_idx.capacity() > SCRATCH_KEEP {
+            self.s_idx = Default::default();
+            self.s_list = Vec::new();
+        }
+    }
+
+    /// Bytes its buffers hold (`--phases`' `[wavemem]`): the job's
+    /// bundles, the encoder's, the raw block, the rest.
+    pub fn alloc_bytes(&self) -> [usize; 4] {
+        [std::mem::size_of::<bundle::Tb>() * self.tbs.capacity() + std::mem::size_of::<Bundle>() * self.prov.capacity(), self.enc.alloc_bytes(), self.raw.capacity(), 4 * (self.e_of.capacity() + self.s_of.capacity()) + 32 * self.s_idx.capacity() + 24 * self.s_list.capacity()]
+    }
+}
+
+impl Chunk {
+    /// Bytes it holds (its unit's shared sources not counted).
+    pub fn alloc_bytes(&self) -> usize {
+        24 * self.targets.capacity() + std::mem::size_of::<Ub>() * self.bundles.capacity() + 4 * self.src_regions.capacity()
+    }
+}
+
+impl RouteState {
+    /// Bytes its new-cell slots, provisional bundles and segments hold.
+    pub fn alloc_bytes(&self) -> [usize; 3] {
+        [12 * self.fresh.capacity() + 24 * self.fresh_raise.as_ref().map_or(0, |m| m.capacity()), self.prov.iter().map(|s| s.1.bytes.capacity()).sum::<usize>(), self.segs.iter().map(|s| s.1.bytes.capacity()).sum::<usize>()]
+    }
+}
+
 impl Default for Scratch {
     fn default() -> Self {
         Scratch {
+            prov: Vec::new(),
             e_of: Vec::new(),
             s_of: Vec::new(),
             s_idx: Default::default(),
@@ -360,7 +421,7 @@ impl Default for Scratch {
 pub fn run_route(st: &mut RouteState, slice: u32, chunks: &[&Chunk], cx: &RegionCtx, sc: &mut Scratch) -> Result<()> {
     let n: usize = chunks.iter().map(|c| c.bundles.len()).sum();
     st.recs += n as u64;
-    let record = cx.sources.is_some();
+    let record = cx.record;
     sc.tbs.clear();
     sc.s_idx.clear();
     sc.s_list.clear();
@@ -373,22 +434,27 @@ pub fn run_route(st: &mut RouteState, slice: u32, chunks: &[&Chunk], cx: &Region
         for &(key, mask) in &c.targets {
             let e = match st.table.find(key) {
                 Some(e) => e,
-                None => {
-                    st.fresh.push(0);
-                    st.table.push_key(super::GEOMETRY.words, key)
-                }
+                None => st.table.push_key(super::GEOMETRY.words, key),
             };
             let had = st.table.or_cells(e, mask);
             let new = mask & !had;
-            st.fresh[e as usize] |= new;
-            st.new_states += new.count_ones() as u64;
+            if new != 0 {
+                st.fresh.push((e, new));
+                st.new_states += new.count_ones() as u64;
+                st.fresh_events += 1;
+            }
             if let (Some(layers), Some(region)) = (cx.layers, st.region) {
                 // States of the tree: a raise refuses one of a later layer.
-                let mut old = mask & had & !st.fresh[e as usize];
+                let made = st.fresh_raise.get_or_insert_with(Default::default);
+                let before = made.get(&e).copied().unwrap_or(0);
+                if new != 0 {
+                    made.insert(e, before | new);
+                }
+                let mut old = mask & had & !before;
                 while old != 0 {
                     let cell = old.trailing_zeros();
                     old &= old - 1;
-                    let layer = layers.layer(super::state_id(region, e, cell));
+                    let layer = layers.layer(region, e, cell);
                     ensure!(
                         layer <= cx.frame,
                         "frame {}: a state the tree first reached at frame {layer} is reached at frame {}: the raised tree would move it to an earlier layer (the level -1 table is not consistent along this edge), so it cannot be extended exactly - delete the tree",
@@ -414,7 +480,7 @@ pub fn run_route(st: &mut RouteState, slice: u32, chunks: &[&Chunk], cx: &Region
             let e = sc.e_of[b.t as usize];
             if e == PROV {
                 let (s_shape, s_key) = c.sources[b.s as usize];
-                st.prov.push(Bundle { s_shape, s_key, x, o: b.o, t_key: c.targets[b.t as usize].0, mask: b.mask });
+                sc.prov.push(Bundle { s_shape, s_key, x, o: b.o, t_key: c.targets[b.t as usize].0, mask: b.mask });
                 continue;
             }
             let s = match sc.s_of[b.s as usize] {
@@ -437,56 +503,69 @@ pub fn run_route(st: &mut RouteState, slice: u32, chunks: &[&Chunk], cx: &Region
         let table = &st.table;
         sc.enc.encode(&sc.tbs, table.len(), |e| table.key(e), &sc.s_list, &mut sc.raw);
         let region = st.region.unwrap_or(u32::MAX);
-        st.segs.push((slice, Segment::of_raw(region, &sc.raw, sc.tbs.len() as u32, sc.tbs.iter().map(|t| t.mask.count_ones() as u64).sum(), &mut sc.z)?));
+        st.segs.push(((0, slice), Segment::of_raw(region, &sc.raw, sc.tbs.len() as u32, sc.tbs.iter().map(|t| t.mask.count_ones() as u64).sum(), &mut sc.z)?));
     }
+    if !sc.prov.is_empty() {
+        st.prov.push((slice, Segment::encode(u32::MAX, &mut sc.prov, &mut sc.raw, &mut sc.z)?));
+        sc.prov.clear();
+    }
+    sc.bound();
     Ok(())
 }
 
-/// What a route's frame end gives the wave: its region's new entries
-/// `(region, entry, key)` and its new states by id.
+/// What a route's frame end gives the wave: its region and its NEW states
+/// - the entries with cells new this frame, by key, and those cells.
 pub struct Sealed {
-    pub entries: Vec<(u32, u32, Key)>,
-    pub states: Vec<super::StateId>,
+    pub region: u32,
+    pub keys: Vec<Key>,
+    pub masks: Vec<u64>,
 }
 
 /// THE FRAME'S END of a route (its shape numbered: `region`): provisional
-/// keys made final (`finals`), the frame's new entries numbered in key
-/// order (canonical: a function of the frame's new states), its new states
-/// listed by id, the bundles into provisional targets encoded.
+/// keys made final (`finals`), its new states listed by key (canonical: a
+/// layer's order), the bundles into provisional targets encoded.
 pub fn seal(st: &mut RouteState, region: u32, finals: &FxHashMap<Key, Key>, sc: &mut Scratch) -> Result<Sealed> {
-    let words = st.table_words();
     st.region = Some(region);
-    st.segs.sort_unstable_by_key(|s| s.0);
     for seg in &mut st.segs {
         seg.1.region = region;
     }
-    let order = st.table.finish_frame(words, st.start, |k| if is_provisional(k) { finals.get(&k).copied() } else { Some(k) })?;
-    // `fresh` follows the entries' new numbers.
-    let tail: Vec<u64> = order.iter().map(|&e| st.fresh[e as usize]).collect();
-    st.fresh.truncate(st.start as usize);
-    st.fresh.extend(tail);
-    let entries = (st.start..st.table.len() as u32).map(|e| (region, e, st.table.key(e))).collect();
-    let mut states = Vec::new();
-    for (e, &m) in st.fresh.iter().enumerate() {
-        let mut m = m;
-        while m != 0 {
-            let c = m.trailing_zeros();
-            m &= m - 1;
-            states.push(super::state_id(region, e as u32, c));
+    st.table.finish_frame(st.start, |k| if is_provisional(k) { finals.get(&k).copied() } else { Some(k) })?;
+    // The new cells per entry (an entry's events merged), by key.
+    let mut events = std::mem::take(&mut st.fresh);
+    events.sort_unstable_by_key(|x| x.0);
+    let mut new: Vec<(Key, u64)> = Vec::with_capacity(events.len());
+    let mut last = u32::MAX;
+    for (e, m) in events {
+        if e == last {
+            new.last_mut().expect("pushed").1 |= m;
+        } else {
+            new.push((st.table.key(e), m));
+            last = e;
         }
     }
-    if !st.prov.is_empty() {
-        let mut v: Vec<Bundle> = std::mem::take(&mut st.prov);
-        for b in &mut v {
-            b.t_key = *finals.get(&b.t_key).ok_or_else(|| anyhow::anyhow!("a provisional target key without its final key"))?;
-        }
-        st.segs.push((u32::MAX, Segment::encode(region, &mut v, &mut sc.raw, &mut sc.z)?));
+    new.sort_unstable_by_key(|x| x.0);
+    // Each job's bundles into provisional targets, decoded and encoded
+    // again with the final keys (a segment a job, as it was made).
+    let mut dz = zstd::bulk::Decompressor::new()?;
+    let mut raw: Vec<u8> = Vec::new();
+    for (slice, seg) in std::mem::take(&mut st.prov) {
+        bundle::decompress(&seg.bytes, seg.raw as usize, &mut dz, &mut raw)?;
+        let mut v: Vec<Bundle> = Vec::with_capacity(seg.bundles as usize);
+        let mut missing = false;
+        bundle::Block::open(&raw, &bundle::ORDER)?.bundles(|mut b| match finals.get(&b.t_key) {
+            Some(&k) => {
+                b.t_key = k;
+                v.push(b);
+            }
+            None => missing = true,
+        })?;
+        ensure!(!missing, "a provisional target key without its final key");
+        ensure!(v.len() == seg.bundles as usize, "a provisional segment of {} bundles decoded to {}", seg.bundles, v.len());
+        st.segs.push(((1, slice), Segment::encode(region, &mut v, &mut sc.raw, &mut sc.z)?));
     }
-    Ok(Sealed { entries, states })
-}
-
-impl RouteState {
-    fn table_words(&self) -> usize {
-        super::GEOMETRY.words
-    }
+    // The file's order: the jobs' segments by slice, then the provisional
+    // ones by slice (one job a (route, slice): the keys are distinct).
+    st.segs.sort_unstable_by_key(|s| s.0);
+    st.fresh_raise = None;
+    Ok(Sealed { region, keys: new.iter().map(|x| x.0).collect(), masks: new.iter().map(|x| x.1).collect() })
 }

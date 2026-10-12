@@ -1,9 +1,9 @@
 //! THE VISITED SET: every state the forward has reached, per (shape,
 //! region) a table of ENTRIES - a non-position key and a mask over the
-//! region's cells - numbered densely in the region (a state's id is its
-//! entry and cell, `storage::StateId`). Read-only while a wave's units run;
-//! a region's table is written only by its route's region jobs, one at a
-//! time (`route::run_route`), and renumbered at the frame's end.
+//! region's cells. A pure dedup structure: an entry's place in its table is
+//! the table's business (nothing outside names it; a layer names its states
+//! by key). Read-only while a wave's units run; a region's table is written
+//! only by its route's region jobs, one at a time (`route::run_route`).
 
 use rustc_hash::FxHashMap;
 
@@ -13,8 +13,8 @@ use super::{region_of, Geometry};
 pub use celeste_engine::exact::Key;
 use celeste_engine::exact::{slot_hash, KeySpace};
 
-/// One region's entries: key and mask by entry number, an open-addressing
-/// index on the key (entry + 1, 0 empty).
+/// One region's entries: key and mask by place, an open-addressing index on
+/// the key (place + 1, 0 empty).
 #[derive(Default, Clone)]
 pub struct RegionTable {
     keys: Vec<Key>,
@@ -72,8 +72,7 @@ impl RegionTable {
     /// Append the entry `k` (absent: checked); its number.
     pub fn push_key(&mut self, words: usize, k: Key) -> u32 {
         debug_assert!(self.find(k).is_none());
-        let e = self.keys.len() as u32;
-        assert!(e < 1 << super::ENTRY_BITS, "a region with {e} entries, past the {} bits an id holds", super::ENTRY_BITS);
+        let e = u32::try_from(self.keys.len()).expect("a region with 2^32 entries");
         self.keys.push(k);
         self.masks.extend(std::iter::repeat_n(0, words));
         if (self.keys.len() + 1) * 2 > self.index.len() {
@@ -84,18 +83,9 @@ impl RegionTable {
         e
     }
 
-    /// Append entry `e` with key `k` (a resume, entries in number order):
-    /// `e` must be the next number. The index is rebuilt by `reindex`.
-    pub fn push_numbered(&mut self, words: usize, e: u32, k: Key) -> anyhow::Result<()> {
-        anyhow::ensure!(e as usize == self.keys.len(), "entry {e} restored after {} entries", self.keys.len());
-        self.keys.push(k);
-        self.masks.extend(std::iter::repeat_n(0, words));
-        Ok(())
-    }
-
-    /// Rebuild the index over every entry (after `push_numbered`s); a key
-    /// held by two entries is an error.
-    pub fn reindex(&mut self) {
+    /// Rebuild the index over every entry (after a re-key); a key held by
+    /// two entries is an error.
+    fn reindex(&mut self) {
         let cap = ((self.keys.len() + 1) * 2).next_power_of_two().max(16);
         self.index = vec![0; cap];
         for e in 0..self.keys.len() as u32 {
@@ -119,55 +109,20 @@ impl RegionTable {
     }
 
     /// The frame's END for this region (`route::seal`): the entries from
-    /// `start` on (the frame's new ones, appended as they came) re-keyed by
-    /// `rekey` (a provisional key to its final one; `None`: none, an error)
-    /// and renumbered in KEY order - canonical, as the frame's new states
-    /// determine it - the index rebuilt. Returns the old numbers in the new
-    /// order.
-    pub fn finish_frame(&mut self, words: usize, start: u32, rekey: impl Fn(Key) -> Option<Key>) -> anyhow::Result<Vec<u32>> {
-        let s = start as usize;
+    /// `start` on (the frame's new ones) re-keyed by `rekey` (a provisional
+    /// key to its final one; `None`: none, an error), the index rebuilt when
+    /// a key changed (rare: a frame's new codes). Entries keep their places.
+    pub fn finish_frame(&mut self, start: u32, rekey: impl Fn(Key) -> Option<Key>) -> anyhow::Result<()> {
         let mut rekeyed = false;
-        for k in &mut self.keys[s..] {
+        for k in &mut self.keys[start as usize..] {
             let f = rekey(*k).ok_or_else(|| anyhow::anyhow!("a provisional key without its final key"))?;
             rekeyed |= f != *k;
             *k = f;
         }
-        let mut order: Vec<u32> = (start..self.keys.len() as u32).collect();
-        order.sort_unstable_by_key(|&e| self.keys[e as usize]);
-        let moved = order.iter().enumerate().any(|(i, &e)| e as usize != s + i);
-        if moved {
-            let keys: Vec<Key> = order.iter().map(|&e| self.keys[e as usize]).collect();
-            let masks: Vec<u64> = order.iter().flat_map(|&e| self.masks[e as usize * words..(e as usize + 1) * words].iter().copied()).collect();
-            self.keys.truncate(s);
-            self.keys.extend(keys);
-            self.masks.truncate(s * words);
-            self.masks.extend(masks);
-        }
         if rekeyed {
-            // A provisional key's slot was its own: every slot again (rare:
-            // a frame's new codes).
             self.reindex();
-        } else if moved {
-            // Each new entry keeps its key's slot: the slots found under the
-            // old numbers first, then given the new ones.
-            let m = self.index.len() - 1;
-            // (Entry `s + n` is now the one numbered `order[n]` before.)
-            let slots: Vec<usize> = order
-                .iter()
-                .enumerate()
-                .map(|(n, &old)| {
-                    let mut i = slot_hash(self.keys[s + n]) as usize & m;
-                    while self.index[i] != old + 1 {
-                        i = (i + 1) & m;
-                    }
-                    i
-                })
-                .collect();
-            for (n, i) in slots.into_iter().enumerate() {
-                self.index[i] = start + n as u32 + 1;
-            }
         }
-        Ok(order)
+        Ok(())
     }
 
     /// OR the cells `mask` into entry `e` (8 x 8 regions: one mask word);
@@ -202,8 +157,8 @@ impl RegionTable {
 }
 
 /// The visited set: the shapes (index -> hash, in the order the tree
-/// numbered them), a table per region (`StateId`'s region index), and the
-/// key space its keys are in (read-only during a wave).
+/// numbered them), a table per region (`storage::region_of`), and the key
+/// space its keys are in (read-only during a wave).
 #[derive(Clone)]
 pub struct VisitedSet {
     pub geo: Geometry,

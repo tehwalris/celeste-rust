@@ -456,7 +456,7 @@ export function timelineView(run: Run, chs: Chapter[]): View {
         detail.append(
           head(`h${c.h} · level ${c.level} · forward frame ${f}`, fmtMs(ms)),
           kv([
-            ["lanes in", `${fmtInt(l.in_lanes)} (${l.in_blocks} blocks)`],
+            ["lanes in", `${fmtInt(l.in_lanes)} (${fmtInt(l.in_entries)} entries)`],
             ["raw", fmtInt(l.raw)],
             ["kept", fmtInt(l.kept)],
             ["visited", fmtInt(l.visited)],

@@ -1,4 +1,4 @@
-//! STORAGE (plans/storage-v2.md, plans/edges-target.md): the forward's
+//! STORAGE (plans/storage-v2.md, plans/edges-target.md, plans/keys-only.md): the forward's
 //! visited set, the states of its layers, and the recorded edges.
 //!
 //!   * `visited` - per (shape, region) a table of ENTRIES: a state's
@@ -12,22 +12,21 @@
 //!   * `bundle`  - the edges' format: bundles in zstd blocks
 //!   * `edges`   - the edge files (per target region and frame), the global
 //!                 transfer table, the reader (`EdgeStore`)
-//!   * `marks`   - the resolver of a state id to its (shape, key, cell)
-//!   * `meta`    - per frame, the shapes and entries it created
+//!   * `layer`   - a set of states as per-region sorted (key, cell mask)
+//!                 entries: the frontier, the next layer, the frame files,
+//!                 the drop notes, the tree reader
 //!   * `decode`  - rows from (shape skeleton, key, cell)
 //!   * `bench`   - `--emit-capture` and `rewrite bench-storage`
 //!
 //! A state is `(shape, key, cell)` (the key holds no position:
-//! `runtime2::pos_code`): an edge names it so (`Sk`, ID-free); the layers'
-//! frame files and the drop notes still by its id `(region, entry, cell in
-//! region)`.
+//! `runtime2::pos_code`) and is named so everywhere (`Sk`): the edges, the
+//! frame files, the drop notes, the backward. No state has a number.
 
 pub mod bench;
 pub mod bundle;
 pub mod decode;
 pub mod edges;
-pub mod marks;
-pub mod meta;
+pub mod layer;
 pub mod route;
 pub mod unit;
 pub mod visited;
@@ -92,55 +91,12 @@ impl Geometry {
 /// px) each hold whole storage regions.
 pub const GEOMETRY: Geometry = Geometry::new(8);
 
-/// A state's id: its region (shape index * slots + slot), its entry number
-/// in the region, its cell's index in the region - `region << 38 | entry <<
-/// 8 | local`. Ids sort by shape, then position (regions row-major), then
-/// entry: a layer is stored in id order.
-pub type StateId = u64;
-
-/// Bits of an id's region (4096 shapes at 16 px regions, 16k at 8 px).
-pub const REGION_BITS: u32 = 26;
-/// Bits of an id's entry number (a region's entries).
-pub const ENTRY_BITS: u32 = 30;
-
-#[inline]
-pub fn state_id(region: u32, entry: u32, local: u32) -> StateId {
-    debug_assert!(region < 1 << REGION_BITS && entry < 1 << ENTRY_BITS && local < 256);
-    (region as u64) << (ENTRY_BITS + 8) | (entry as u64) << 8 | local as u64
-}
-
-#[inline]
-pub fn id_region(id: StateId) -> u32 {
-    (id >> (ENTRY_BITS + 8)) as u32
-}
-
-#[inline]
-pub fn id_entry(id: StateId) -> u32 {
-    (id >> 8) as u32 & ((1 << ENTRY_BITS) - 1)
-}
-
-#[inline]
-pub fn id_local(id: StateId) -> u32 {
-    (id & 0xff) as u32
-}
-
 /// A region's index from its shape's index and its slot.
 #[inline]
 pub fn region_of(geo: &Geometry, shape_idx: u32, slot: u32) -> u32 {
     let r = shape_idx as u64 * geo.slots as u64 + slot as u64;
-    assert!(r < 1 << REGION_BITS, "region {r} past the {REGION_BITS} bits an id holds ({shape_idx} shapes)");
+    assert!(r <= u32::MAX as u64, "region {r} past u32 ({shape_idx} shapes)");
     r as u32
-}
-
-/// An id's cell.
-#[inline]
-pub fn id_cell(geo: &Geometry, id: StateId) -> u32 {
-    geo.cell(id_region(id) % geo.slots, id_local(id))
-}
-
-/// An id as text (`r{region}.e{entry}.c{local}`).
-pub fn show_id(id: StateId) -> String {
-    format!("r{}.e{}.c{}", id_region(id), id_entry(id), id_local(id))
 }
 
 /// A STATE by what it is: its region (shape index and slot), its exact key
@@ -203,7 +159,5 @@ mod tests {
             assert_eq!(g.slot_local(NO_CELL), (g.no_cell_slot(), 0));
             assert_eq!(g.cell(g.no_cell_slot(), 0), NO_CELL);
         }
-        let id = state_id(77, 123_456, 63);
-        assert_eq!((id_region(id), id_entry(id), id_local(id)), (77, 123_456, 63));
     }
 }

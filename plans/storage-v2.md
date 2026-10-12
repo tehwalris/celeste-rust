@@ -3,8 +3,10 @@
 > The EDGE side of this plan (source-side unit blocks, lids, the owner
 > index, claims, the translation) was replaced on 2026-10-11 by
 > plans/edges-target.md (ID-free bundles in their target regions, the
-> routed forward). The visited set, the ids of the layers' frame files and
-> the metadata are as below.
+> routed forward). The ids, the layers' frame files and the metadata went
+> on 2026-10-12 (plans/keys-only.md: a state is its key; the frontier and
+> the frame files are per-region (key, cell mask) entries). The visited
+> set is as below, its entries no longer renumbered.
 
 The plan for replacing the door, the queues, the unit row cache, the raw
 edge records and the inversion with ONE storage system; the running log was

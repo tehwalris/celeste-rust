@@ -155,21 +155,21 @@ binary rebuilt the table (room (4,2) 12 s, (6,2) 37-61 s) before the first
 frame. `bench-frame` refuses a table whose fingerprint is not the one the
 tree recorded.
 
-| fixture | what | frames | build (load 5-20) | size |
+| fixture | what | frames | build (load 5-20) | size (format 15; 14) |
 |---|---|---|---|---|
-| r10 | room (1,0) 200m `r0sxh` | f0-f56; frame 55 -> 56 | 8-14 s | 61 MB |
-| r62h | room (6,2) 100% `r0sxhf`, level -1 (94,5) | f0-f51; frame 50 -> 51 | 62-76 s (the table ~60 s of it) | 280 MB |
-| r42n | room (4,2) 2100m `r0sxhn`, level -1 (71,5) | f0-f61; frame 60 -> 61 | 18-28 s | 43 MB |
-| r42x | room (4,2) `r0sxh` (objects exact), level -1 | f0-f56 | 9-16 s | 17 MB |
-| r10arc | room (1,0) `search --level r0sxh --to 56 --win-at 40,64` | the level-0 tree to h56 | 9-15 s | 61 MB |
-| cap-r10 | r10's f56 emissions (`--emit-capture`) | f56 | 2-3 s | 518 MB |
-| r60s | room (6,0) 700m `r0sxhfp`, split frame | steps 0-71; 70 -> 71 | 26-33 s | 25 MB |
-| r62h57 (big) | room (6,2) 100%, as r62h | f0-f57; the reference frame 56 -> 57 | 143-151 s | 0.9 GB |
+| r10 | room (1,0) 200m `r0sxh` | f0-f56; frame 55 -> 56 | 3-14 s | 22 MB (61) |
+| r62h | room (6,2) 100% `r0sxhf`, level -1 (94,5) | f0-f51; frame 50 -> 51 | 48-76 s (the table ~40-60 s of it) | 56 MB (280) |
+| r42n | room (4,2) 2100m `r0sxhn`, level -1 (71,5) | f0-f61; frame 60 -> 61 | 16-28 s | 15 MB (43) |
+| r42x | room (4,2) `r0sxh` (objects exact), level -1 | f0-f56 | 9-16 s | 7 MB (17) |
+| r10arc | room (1,0) `search --level r0sxh --to 56 --win-at 40,64` | the level-0 tree to h56 | 4-15 s | 22 MB (61) |
+| cap-r10 | r10's f56 emissions (`--emit-capture`) | f56 | 1-3 s | 515 MB |
+| r60s | room (6,0) 700m `r0sxhfp`, split frame | steps 0-71; 70 -> 71 | 26-33 s | 8 MB (25) |
+| r62h57 (big) | room (6,2) 100%, as r62h | f0-f57; the reference frame 56 -> 57 | 60-151 s | 181 MB (0.9 GB) |
 | cap-r62h57 (big) | its f57 capture | f57 | 12-14 s | 12 GB |
 
 All of `all`: 2:37 at load 5-15 (most of it r62h's table); `big` 2:38. Using a fixture
 is fast: frame F loads in 0.02-0.06 s (r10, r42n), 0.25 s (r62h f50, 12.6M
-visited states), 0.62 s (r62h57 f56, 37M).
+visited states), 0.20 s (r62h57 f56, 37M; 0.62 s at format 14).
 
 ## The single-frame commands
 

@@ -2048,18 +2048,27 @@ pub fn probe(root: &FsPath, opts: &Opts, s: &crate::settings::Settings) -> Resul
         }
         None => None,
     };
-    // The rows' keys (a marked state's), from the tree's metadata.
-    let tree = crate::storage::marks::Resolver::load(&opts.level_dir, opts.to)?;
+    // The tree's states, by frame.
+    let tree = crate::storage::layer::Tree::open(&opts.level_dir, opts.to)?;
+    let geo = crate::storage::GEOMETRY;
     say!(rep, "\nframe | states | too late (f + d > {}) | no exit path | band {},8 cut | death (kept) | left the room | other shape | not in the table | marked | MARKED TOO LATE", opts.ceiling, opts.ceiling)?;
     let mut samples: BTreeSet<String> = BTreeSet::new();
     for f in opts.from..=opts.to {
         let (mut states, mut late, mut nopath, mut band, mut dead, mut left, mut other, mut missing) = (0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64);
         let (mut marked, mut marked_late) = (0u64, 0u64);
-        for (_, ff) in crate::frame::frame_files(&opts.level_dir, f)? {
-            let id = by_hash.get(&ff.shape_hash()).copied();
+        // Per (shape, cell) its states' keys.
+        let mut by_cell: std::collections::BTreeMap<(u64, u32), Vec<(u64, u64)>> = Default::default();
+        let (layer, _) = tree.layer(f, None, 1)?;
+        for s in layer.states_iter() {
+            by_cell.entry((tree.shape_of(s.region)?, s.cell(&geo))).or_default().push(s.key);
+        }
+        let mut shapes: Vec<u64> = by_cell.keys().map(|k| k.0).collect();
+        shapes.dedup();
+        for shape in shapes {
+            let id = by_hash.get(&shape).copied();
             let mut late_cells: rustc_hash::FxHashSet<u32> = Default::default();
-            for (cell, rows) in ff.cell_counts() {
-                let rows = rows as u64;
+            for (&(_, cell), keys) in by_cell.range((shape, 0)..=(shape, u32::MAX)) {
+                let rows = keys.len() as u64;
                 states += rows;
                 // What the time band (`frame::cell_too_late`, 8 px) drops.
                 if crate::frame::cell_too_late(cell, f, opts.ceiling, 8) {
@@ -2077,7 +2086,7 @@ pub fn probe(root: &FsPath, opts: &Opts, s: &crate::settings::Settings) -> Resul
                 let Some(id) = id else {
                     other += rows;
                     if samples.len() < 24 {
-                        samples.insert(format!("f{f:03}: {rows} rows of shape {:#x} (not a table shape) at ({x}, {y})", ff.shape_hash()));
+                        samples.insert(format!("f{f:03}: {rows} rows of shape {shape:#x} (not a table shape) at ({x}, {y})"));
                     }
                     continue;
                 };
@@ -2104,15 +2113,16 @@ pub fn probe(root: &FsPath, opts: &Opts, s: &crate::settings::Settings) -> Resul
             }
             // A marked state wins by the horizon: called too late is a finding.
             if let Some(m) = &marks {
-                let shape = ff.shape_hash();
-                for (cell, key) in (0..ff.width()).map(|r| tree.resolve(ff.id_at(r)).map(|x| (x.2, x.1))).collect::<Result<Vec<_>>>()? {
-                    if m.contains(shape, key, cell) {
-                        marked += 1;
-                        if late_cells.contains(&cell) {
-                            marked_late += 1;
-                            if samples.len() < 24 {
-                                let (x, y) = xy_of(cell);
-                                samples.insert(format!("f{f:03}: a MARKED state of shape {shape:#x} at ({x}, {y}) is too late"));
+                for (&(_, cell), keys) in by_cell.range((shape, 0)..=(shape, u32::MAX)) {
+                    for &key in keys {
+                        if m.contains(shape, key, cell) {
+                            marked += 1;
+                            if late_cells.contains(&cell) {
+                                marked_late += 1;
+                                if samples.len() < 24 {
+                                    let (x, y) = xy_of(cell);
+                                    samples.insert(format!("f{f:03}: a MARKED state of shape {shape:#x} at ({x}, {y}) is too late"));
+                                }
                             }
                         }
                     }

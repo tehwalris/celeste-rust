@@ -57,10 +57,8 @@ pub struct Pruning<'a> {
     pub reached: Option<&'a Visited>,
     /// The level -1 filter the tree was built under (`TreeFilter::of_tree`).
     pub minus_one: Option<crate::frame::MinusOne>,
-    /// The tree's frame files `(layer, seq, file)` and its directory, for
-    /// the report (its rows' keys from every entry's metadata, loaded only
-    /// on a miss).
-    pub files: &'a [(u32, u32, super::checkpoint::FrameFile)],
+    /// The tree's directory, for the report (its frame files read on a
+    /// miss).
     pub dir: &'a std::path::Path,
 }
 
@@ -248,10 +246,15 @@ fn verdict(b: &Block, s: u32, seeded: bool, l1: Option<(u32, &crate::trace::leve
         return Ok(None);
     }
     let Some(i) = (if s == 0 { p.start } else { p.node.get(shape, key, cell) }) else {
-        let tree = crate::storage::marks::Resolver::load(p.dir, s)?;
-        return Ok(match key.and_then(|key| in_tree(p.files, &tree, s, shape, key, cell)) {
-            Some((layer, seq, row)) => backward(format!(
-                "NOT IN W's SUPPORT: in the tree (layer {layer} s{seq} r{row}) but its winning set is empty at every step by {} - a successor on the route was lost ({node})",
+        let tree = crate::storage::layer::Tree::open(p.dir, s)?;
+        let layer = match key.and_then(|key| tree.sk(shape, key, cell)) {
+            Some(sk) => tree.layer_of(sk, s)?.map(|l| (l, sk)),
+            None => None,
+        };
+        return Ok(match layer {
+            Some((layer, sk)) => backward(format!(
+                "NOT IN W's SUPPORT: in the tree (layer {layer}, state {}) but its winning set is empty at every step by {} - a successor on the route was lost ({node})",
+                sk.show(),
                 p.horizon
             )),
             None => forward(format!("NOT IN THE TREE by step {s}: the forward lost it since the step before (the kernels, the visited set, or a filter on a mid-frame step; `rewrite follow` shows its parent's kernel successors) ({node})")),
@@ -271,12 +274,4 @@ fn verdict(b: &Block, s: u32, seeded: bool, l1: Option<(u32, &crate::trace::leve
         }
     }
     Ok(None)
-}
-
-/// Where the tree holds a row `(shape, key, cell)` at a layer <= `s`.
-fn in_tree(files: &[(u32, u32, super::checkpoint::FrameFile)], tree: &crate::storage::marks::Resolver, s: u32, shape: u64, key: (u64, u64), cell: u32) -> Option<(u32, u32, u32)> {
-    files
-        .iter()
-        .filter(|(layer, _, f)| *layer <= s && f.shape_hash() == shape)
-        .find_map(|(layer, seq, f)| f.rows_of_cell(cell).into_iter().flatten().find(|&r| tree.resolve(f.id_at(r)).is_ok_and(|x| x.1 == key)).map(|r| (*layer, *seq, r)))
 }

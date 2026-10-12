@@ -1331,24 +1331,6 @@ pub fn optimum(w: &Winning, start: Option<u32>, point: (u32, u32), horizon: u32)
     (0..=horizon).rev().find(|&t| w.at(t, s).is_some_and(|r| r.contains(point.0, point.1))).map(|t| horizon - t)
 }
 
-/// Frames `0..=horizon` of the tree in `dir`, each its files `(seq, file)`.
-/// A forward whose frontier died (a finer level of the objects ladder,
-/// filtered down to nothing) has no frames past the empty one: they are
-/// empty too. Any other missing frame is an error.
-fn tree_frames(dir: &std::path::Path, horizon: u32) -> anyhow::Result<Vec<Vec<(u32, crate::search::checkpoint::FrameFile)>>> {
-    let mut out: Vec<Vec<(u32, crate::search::checkpoint::FrameFile)>> = Vec::with_capacity(horizon as usize + 1);
-    for f in 0..=horizon {
-        if !dir.join("frames").join(format!("f{f:03}")).is_dir() {
-            let died = out.last().is_some_and(|last| last.iter().all(|(_, file)| file.width() == 0));
-            anyhow::ensure!(died, "{}: no frame f{f}, and the frontier before it was not empty", dir.display());
-            out.push(Vec::new());
-            continue;
-        }
-        out.push(crate::frame::frame_files(dir, f)?);
-    }
-    Ok(out)
-}
-
 /// What the backward starts from in the tree in `dir` up to `horizon`: the
 /// start (frame 0's one row), the win rows of frames `1..=horizon` with
 /// their layers, as states (their keys through the tree's metadata), the
@@ -1368,39 +1350,25 @@ pub struct Seeds {
 
 impl Seeds {
     pub fn load(dir: &std::path::Path, horizon: u32) -> anyhow::Result<Self> {
-        use crate::storage::{id_entry, id_local, id_region};
-        let mut wins: Vec<(crate::storage::StateId, u32)> = Vec::new();
-        let mut start: Option<crate::storage::StateId> = None;
-        let mut kept: Vec<u32> = Vec::with_capacity(horizon as usize + 1);
-        for (f, files) in tree_frames(dir, horizon)?.into_iter().enumerate() {
-            let f = f as u32;
-            let mut rows = 0u32;
-            for (_, file) in files {
-                rows += file.width();
-                if f == 0 {
-                    anyhow::ensure!(start.is_none() && file.width() == 1, "{}: more than one start row", dir.display());
-                    start = Some(file.id_at(0));
-                } else {
-                    wins.extend(file.win_rows().iter().map(|&(row, _)| (file.id_at(row), f)));
+        let tree = crate::storage::layer::Tree::open(dir, horizon)?;
+        let (first, _) = tree.layer(0, None, 1)?;
+        let mut start = first.states_iter();
+        let (Some(start), None) = (start.next(), start.next()) else { anyhow::bail!("{}: frame 0 is not one state", dir.display()) };
+        let mut wins: Vec<(Sk, u32)> = Vec::new();
+        for f in 1..=horizon {
+            for file in &tree.frames[f as usize] {
+                if file.header.wins() > 0 {
+                    wins.extend(file.wins()?.into_iter().map(|w| (w, f)));
                 }
             }
-            kept.push(rows);
         }
-        let start = start.ok_or_else(|| anyhow::anyhow!("{}: no frame-0 row", dir.display()))?;
         let store = EdgeStore::open(&dir.join("edges"), horizon)?;
-        for (f, &rows) in kept.iter().enumerate().skip(1) {
-            anyhow::ensure!(rows == 0 || store.has_frame(f as u32), "{}: no edges for f{f}, which kept {rows} rows", dir.display());
+        for f in 1..=horizon {
+            let rows = tree.states(f);
+            anyhow::ensure!(rows == 0 || store.has_frame(f), "{}: no edges for f{f}, which kept {rows} states", dir.display());
         }
         let pairs = store.pairs().iter().map(|p| (p.0.transfer(), p.1.transfer())).collect();
-        // The start's and the wins' keys, from the metadata.
-        let mut wanted: Vec<(u32, u32)> = wins.iter().map(|w| w.0).chain([start]).map(|id| (id_region(id), id_entry(id))).collect();
-        wanted.sort_unstable();
-        wanted.dedup();
-        let resolver = crate::storage::marks::Resolver::load_for(dir, horizon, &wanted)?;
-        let sk = |id: crate::storage::StateId| -> anyhow::Result<Sk> { Ok(Sk { region: id_region(id), key: resolver.resolve(id)?.1, local: id_local(id) as u8 }) };
-        let start = sk(start)?;
-        let wins = wins.into_iter().map(|(id, f)| Ok((sk(id)?, f))).collect::<anyhow::Result<Vec<_>>>()?;
-        Ok(Seeds { start, wins, store, pairs, shapes: resolver.shapes().to_vec(), space: resolver.space })
+        Ok(Seeds { start, wins, store, pairs, shapes: tree.shapes, space: tree.space })
     }
 
     /// The win states, sorted.
@@ -1991,10 +1959,6 @@ pub fn solve(
     // order the tree's dictionaries grew in (a raise). A node is its state:
     // (shape, key, cell) without a lookup.
     let content = seeds.space.content_hash();
-    let mut files = Vec::new();
-    for (f, fs) in tree_frames(dir, horizon)?.into_iter().enumerate() {
-        files.extend(fs.into_iter().map(|(seq, file)| (f as u32, seq, file)));
-    }
     // Per frame, the nodes with a set and the sum of their (node, set)
     // hashes: each span added at its first frame and taken off past its
     // last (`delta`), then summed frame by frame; W's nodes in parallel
@@ -2072,12 +2036,11 @@ pub fn solve(
     let known = match (known, &node) {
         (Some(route), Some(node)) => {
             let minus_one = crate::frame::TreeFilter::of_tree(dir, s)?;
-            let p = super::known::Pruning { settings: s, level, horizon, node, keys: &space, start, w: &w, reached: arc_marks.as_ref(), minus_one, files: &files, dir };
+            let p = super::known::Pruning { settings: s, level, horizon, node, keys: &space, start, w: &w, reached: arc_marks.as_ref(), minus_one, dir };
             super::known::check(route, &p)?
         }
         _ => None,
     };
-    drop(files);
     crate::metrics::mem_phase("arc: marks for the next level, edge files closed");
     let found = match (concrete, arc, &node) {
         (true, Some(f), Some(node)) => concrete_search(level, horizon, node, &space, &w, f, prefer, all_wins, s)?,

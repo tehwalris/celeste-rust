@@ -7,11 +7,11 @@
 
 export interface FwdLine {
   f: number;
-  in_blocks: number;
+  in_entries: number;
   in_lanes: number;
   raw: number;
   kept: number;
-  out_blocks: number;
+  out_entries: number;
   out_lanes: number;
   visited: number;
   emit_ms: number;
