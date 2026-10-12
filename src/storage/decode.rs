@@ -1,7 +1,9 @@
-//! ROWS FROM KEYS (plans/rows-from-keys.md): a stored state's row is a
-//! function of its shape's SKELETON (structure with closure captures,
-//! globals, strings, the non-value cells), its exact key and its cell, so
-//! frame files store ids only (`search::checkpoint`) and rows are decoded:
+//! ROWS FROM KEYS (plans/rows-from-keys.md, plans/keys-only.md): a state's
+//! row is a function of its shape's SKELETON (structure with closure
+//! captures, globals, strings, the non-value cells), its exact key and its
+//! cell, so the storage holds keys and cells only (`layer`) and rows are
+//! decoded - a wave's units right before the kernels, a frame's new states
+//! at its end (their wins), a reader's on demand:
 //!
 //!   * every value cell is a key field (`exact::ShapeKeys::value_cells`):
 //!     its code is the dictionary's at the index the key holds;
@@ -10,14 +12,15 @@
 //!     room offset (`pos_graph::room_offset` of the row's own `room.x/y`,
 //!     themselves key fields);
 //!   * a column's representation: the code merges `Num(n)` and `Ival(n, n)`
-//!     (producers disagree), so the piece keeps per value cell whether its
-//!     column holds numbers, intervals or anything (`Repr`); the rest -
-//!     uniform or per row - follows from the values (`wave::gather`'s rule).
+//!     (producers disagree), so the skeleton keeps per value cell whether
+//!     its column holds numbers, intervals or anything (`Repr`); the rest -
+//!     uniform or per row - follows from the values.
 //!
-//! The forward checks every piece it checkpoints decodes to its rows
-//! exactly, representation included (`check_piece`): a row its key does
-//! not determine is FATAL, never stored lossy. Measured on format-13 trees
-//! before the rows went (every row of seven fixtures, 73.9M rows, 0 differ).
+//! The guards: a shape's first emission per worker and wave decodes from
+//! its key and cell to exactly the emitted row (`Skeletons::check_decodes`;
+//! `--key-check`: every emission), the start's rows likewise
+//! (`check_piece`). A row its key does not determine is FATAL, never
+//! stored lossy.
 
 use anyhow::{anyhow, ensure, Context, Result};
 use celeste_core::pico8_num::Pico8Num as P8;
@@ -26,7 +29,6 @@ use celeste_engine::exact::{Code, Key, KeySpace};
 use celeste_engine::runtime2::{collapse_uniform, Cell2, Col, Rt2, AV};
 
 use crate::search::pos_graph::{cell_xy, room_offset, NO_CELL};
-use crate::storage::StateId;
 
 /// The rows `(key, cell)` of `skel`'s shape, as a block: `skel` gives the
 /// structure, globals, strings and non-value cells (its values are not
@@ -185,75 +187,32 @@ fn column(repr: Repr, codes: &[Code]) -> Result<Col> {
     })
 }
 
-/// Where a decoded block differs from the stored one (`None`: identical,
-/// representation included).
-#[cfg(test)]
-pub(crate) fn block_diff(stored: &Rt2, decoded: &Rt2) -> Option<String> {
-    if stored.shape_hash != decoded.shape_hash || stored.width != decoded.width {
-        return Some(format!("shape {:016x}/{:016x}, width {}/{}", stored.shape_hash, decoded.shape_hash, stored.width, decoded.width));
-    }
-    if stored.structure != decoded.structure {
-        return Some("structure (closure captures?)".into());
-    }
-    if stored.globals != decoded.globals || stored.strings != decoded.strings || stored.prints != decoded.prints {
-        return Some("globals, strings or prints".into());
-    }
-    if stored.row_keys != decoded.row_keys {
-        return Some("row keys".into());
-    }
-    for (c, (a, b)) in stored.cols.iter().zip(&decoded.cols).enumerate() {
-        if a == b {
-            continue;
-        }
-        for r in 0..stored.width {
-            let (x, y) = (a.at(r), b.at(r));
-            if x != y {
-                let how = if Code::of(x) == Code::of(y) { "same code, other representation" } else { "other value" };
-                return Some(format!("cell {c} row {r}: stored {x:?}, decoded {y:?} ({how})"));
-            }
-        }
-        return Some(format!("cell {c}: the same values, another column kind ({} / {})", kind(a), kind(b)));
-    }
-    None
-}
-
-#[cfg(test)]
-fn kind(c: &Col) -> &'static str {
-    match c {
-        Col::U(_) => "U",
-        Col::N(_) => "N",
-        Col::I(_) => "I",
-        Col::V(_) => "V",
-    }
-}
-
-/// THE SHAPES' SKELETONS a wave decodes its new layer with (the layer is
-/// not gathered from copied rows: its rows ARE their keys and cells): per
-/// shape the first registered - a kernel registry's union template
-/// (`asm_kernel::unify`: one per shape), or a reference row's structure
-/// (`reference_skeleton`). Another skeleton under one shape is FATAL.
+/// THE SHAPES' SKELETONS a wave decodes its layers with (a layer's rows
+/// ARE their keys and cells): per shape the first registered - a kernel
+/// registry's union template (`asm_kernel::unify`: one per shape), or a
+/// reference row's structure (`reference_skeleton`) - kept as its
+/// `layer::SkelRecord` (what decodes) and that record's block. Another
+/// skeleton under one shape - another record: one that would decode
+/// otherwise - is FATAL.
 #[derive(Default)]
-pub struct Skeletons(std::sync::RwLock<rustc_hash::FxHashMap<u64, std::sync::Arc<Rt2>>>);
+pub struct Skeletons(std::sync::RwLock<rustc_hash::FxHashMap<u64, (super::layer::SkelRecord, std::sync::Arc<Rt2>)>>);
 
 impl Skeletons {
-    /// Register `skel` for its shape (width 0; checked against the shape's).
+    /// Register `skel` for its shape (checked against the shape's).
     pub fn register(&self, skel: &Rt2) -> Result<()> {
-        let same = |a: &Rt2| a.structure == skel.structure && a.cols == skel.cols && a.globals == skel.globals && a.strings == skel.strings && a.prints == skel.prints;
+        let rec = super::layer::SkelRecord::of(skel)?;
         if let Some(a) = self.0.read().expect("skeletons").get(&skel.shape_hash) {
-            ensure!(same(a), "ROWS FROM KEYS: two skeletons of shape {:016x} (another structure, non-value cell or column kind): its rows would decode as the first's", skel.shape_hash);
+            ensure!(a.0 == rec, "ROWS FROM KEYS: two skeletons of shape {:016x} (another structure, non-value cell or column kind): its rows would decode as the first's", skel.shape_hash);
             return Ok(());
         }
-        let mut s = celeste_engine::slots::reshape(skel, 0);
-        s.cols = skel.cols.clone();
-        s.shape_hash = skel.shape_hash;
-        s.row_keys.clear();
-        self.0.write().expect("skeletons").entry(skel.shape_hash).or_insert_with(|| std::sync::Arc::new(s));
+        let rt2 = std::sync::Arc::new(rec.rt2(skel.cart.clone(), skel.cache.clone()));
+        self.0.write().expect("skeletons").entry(skel.shape_hash).or_insert((rec, rt2));
         Ok(())
     }
 
     /// The skeleton of `shape`.
     pub fn get(&self, shape: u64) -> Result<std::sync::Arc<Rt2>> {
-        self.0.read().expect("skeletons").get(&shape).cloned().ok_or_else(|| anyhow!("ROWS FROM KEYS: no skeleton of shape {shape:016x} (it was never emitted)"))
+        self.0.read().expect("skeletons").get(&shape).map(|x| x.1.clone()).ok_or_else(|| anyhow!("ROWS FROM KEYS: no skeleton of shape {shape:016x} (it was never emitted)"))
     }
 
     /// THE GUARD: `rows` (their keys, `cells`) decode with their shape's
@@ -278,12 +237,6 @@ impl Skeletons {
         }
         Ok(())
     }
-
-    /// The layer of new states `rows` (one shape, by id), decoded.
-    pub fn decode(&self, keys: &KeySpace, shape: u64, rows: &[(Key, u32)]) -> Result<Rt2> {
-        let skel = self.get(shape)?;
-        decode_rows(keys, &skel, rows)
-    }
 }
 
 /// A reference row's skeleton: its structure, globals, strings and
@@ -296,44 +249,8 @@ pub fn reference_skeleton(row: &Rt2) -> Rt2 {
     b
 }
 
-/// What decoding a stored id needs: the tree's key space and the key of
-/// an id's entry (`storage::meta`: a resume's visited set, or a reader's
-/// `marks::Resolver`).
-pub trait TreeKeys {
-    fn space(&self) -> &KeySpace;
-    /// The key of `id`'s entry; `shape` is the file's (checked).
-    fn key(&self, id: StateId, shape: u64) -> Result<Key>;
-}
-
-impl TreeKeys for crate::storage::marks::Resolver {
-    fn space(&self) -> &KeySpace {
-        &self.space
-    }
-
-    fn key(&self, id: StateId, shape: u64) -> Result<Key> {
-        let (s, k, _) = self.resolve(id)?;
-        ensure!(s == shape, "state {}: of shape {s:016x}, its file's is {shape:016x}", crate::storage::show_id(id));
-        Ok(k)
-    }
-}
-
-impl TreeKeys for crate::storage::visited::VisitedSet {
-    fn space(&self) -> &KeySpace {
-        &self.keys
-    }
-
-    fn key(&self, id: StateId, shape: u64) -> Result<Key> {
-        let r = crate::storage::id_region(id);
-        let s = r / self.geo.slots;
-        ensure!(self.shapes().get(s as usize) == Some(&shape), "state {}: not of its file's shape {shape:016x}", crate::storage::show_id(id));
-        let t = self.table(r).ok_or_else(|| anyhow!("state {}: no region table", crate::storage::show_id(id)))?;
-        let e = crate::storage::id_entry(id);
-        ensure!((e as usize) < t.len(), "state {}: no entry", crate::storage::show_id(id));
-        Ok(t.key(e))
-    }
-}
-
-/// THE GUARD before a piece is stored as ids: its rows decode, from their
+/// THE GUARD on the start's rows (`wave::seed`: stored as their keys and
+/// cells, as the engine made them): they decode, from their
 /// keys and `cells`, to exactly themselves - every row's every value as the
 /// column holds it (`Col::at`: a number column's `Num`, an interval
 /// column's `Ival`), and every per-row column not one value throughout (a

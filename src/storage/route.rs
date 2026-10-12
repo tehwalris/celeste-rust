@@ -17,8 +17,8 @@
 //! stay two (their cells differ): merging them across units saved ~17% of
 //! the bundles and cost a route-level table that was DRAM-bound. No lookup
 //! happens in the units, no state is named by a number, no row is copied:
-//! the new layer is decoded from (shape, key, cell) at the frame's end
-//! (`wave`).
+//! the new layer is the routes' new (key, cells) at the frame's end
+//! (`seal`, `wave`).
 
 use anyhow::{ensure, Result};
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -92,23 +92,6 @@ pub struct Ub {
     pub mask: u64,
 }
 
-/// A frontier row as an edge names its source: its shape's index, its
-/// cell, its region, its key.
-#[derive(Clone, Copy, Debug)]
-pub struct Src {
-    pub shape: u32,
-    pub cell: u32,
-    pub region: u32,
-    pub key: Key,
-}
-
-/// The wave's frontier rows, by their index over its blocks.
-pub struct Sources {
-    pub rows: Vec<Src>,
-    /// Per frontier block, its first row's index.
-    pub starts: Vec<u32>,
-}
-
 /// A route through a frame: its region's table (taken out of the visited
 /// set for the frame; a new one for a new shape's region), what is new in
 /// it this frame, and its encoded segments.
@@ -130,24 +113,26 @@ pub struct RouteState {
     pub segs: Vec<(u32, Segment)>,
     /// The source regions its edges leave.
     pub sources: FxHashSet<u32>,
-    /// Records taken (emissions) and new states found.
+    /// Records taken (emissions) and new states found; the dedup's
+    /// events that found new cells (an entry's new cells, per chunk target).
     pub recs: u64,
     pub new_states: u64,
+    pub fresh_events: u64,
 }
 
 impl RouteState {
     pub fn new(shape: u64, slot: u32, region: Option<u32>, table: Option<Box<RegionTable>>) -> Self {
         let table = table.unwrap_or_default();
         let start = table.len() as u32;
-        RouteState { shape, slot, region, fresh: vec![0; table.len()], table, start, prov: Vec::new(), segs: Vec::new(), sources: FxHashSet::default(), recs: 0, new_states: 0 }
+        RouteState { shape, slot, region, fresh: vec![0; table.len()], table, start, prov: Vec::new(), segs: Vec::new(), sources: FxHashSet::default(), recs: 0, new_states: 0, fresh_events: 0 }
     }
 }
 
 /// What the region phase reads besides its route.
 pub struct RegionCtx<'a> {
     pub frame: u32,
-    /// The frontier as states (`None`: no edges recorded).
-    pub sources: Option<&'a Sources>,
+    /// Are edges recorded?
+    pub record: bool,
     /// Per worker, its local transfer ids' global ones.
     pub remaps: &'a [Vec<u32>],
     /// A raise's per-state layers: a hit on a state of a later layer than
@@ -360,7 +345,7 @@ impl Default for Scratch {
 pub fn run_route(st: &mut RouteState, slice: u32, chunks: &[&Chunk], cx: &RegionCtx, sc: &mut Scratch) -> Result<()> {
     let n: usize = chunks.iter().map(|c| c.bundles.len()).sum();
     st.recs += n as u64;
-    let record = cx.sources.is_some();
+    let record = cx.record;
     sc.tbs.clear();
     sc.s_idx.clear();
     sc.s_list.clear();
@@ -382,13 +367,14 @@ pub fn run_route(st: &mut RouteState, slice: u32, chunks: &[&Chunk], cx: &Region
             let new = mask & !had;
             st.fresh[e as usize] |= new;
             st.new_states += new.count_ones() as u64;
+            st.fresh_events += (new != 0) as u64;
             if let (Some(layers), Some(region)) = (cx.layers, st.region) {
                 // States of the tree: a raise refuses one of a later layer.
                 let mut old = mask & had & !st.fresh[e as usize];
                 while old != 0 {
                     let cell = old.trailing_zeros();
                     old &= old - 1;
-                    let layer = layers.layer(super::state_id(region, e, cell));
+                    let layer = layers.layer(region, e, cell);
                     ensure!(
                         layer <= cx.frame,
                         "frame {}: a state the tree first reached at frame {layer} is reached at frame {}: the raised tree would move it to an earlier layer (the level -1 table is not consistent along this edge), so it cannot be extended exactly - delete the tree",
@@ -442,39 +428,26 @@ pub fn run_route(st: &mut RouteState, slice: u32, chunks: &[&Chunk], cx: &Region
     Ok(())
 }
 
-/// What a route's frame end gives the wave: its region's new entries
-/// `(region, entry, key)` and its new states by id.
+/// What a route's frame end gives the wave: its region and its NEW states
+/// - the entries with cells new this frame, by key, and those cells.
 pub struct Sealed {
-    pub entries: Vec<(u32, u32, Key)>,
-    pub states: Vec<super::StateId>,
+    pub region: u32,
+    pub keys: Vec<Key>,
+    pub masks: Vec<u64>,
 }
 
 /// THE FRAME'S END of a route (its shape numbered: `region`): provisional
-/// keys made final (`finals`), the frame's new entries numbered in key
-/// order (canonical: a function of the frame's new states), its new states
-/// listed by id, the bundles into provisional targets encoded.
+/// keys made final (`finals`), its new states listed by key (canonical: a
+/// layer's order), the bundles into provisional targets encoded.
 pub fn seal(st: &mut RouteState, region: u32, finals: &FxHashMap<Key, Key>, sc: &mut Scratch) -> Result<Sealed> {
-    let words = st.table_words();
     st.region = Some(region);
     st.segs.sort_unstable_by_key(|s| s.0);
     for seg in &mut st.segs {
         seg.1.region = region;
     }
-    let order = st.table.finish_frame(words, st.start, |k| if is_provisional(k) { finals.get(&k).copied() } else { Some(k) })?;
-    // `fresh` follows the entries' new numbers.
-    let tail: Vec<u64> = order.iter().map(|&e| st.fresh[e as usize]).collect();
-    st.fresh.truncate(st.start as usize);
-    st.fresh.extend(tail);
-    let entries = (st.start..st.table.len() as u32).map(|e| (region, e, st.table.key(e))).collect();
-    let mut states = Vec::new();
-    for (e, &m) in st.fresh.iter().enumerate() {
-        let mut m = m;
-        while m != 0 {
-            let c = m.trailing_zeros();
-            m &= m - 1;
-            states.push(super::state_id(region, e as u32, c));
-        }
-    }
+    st.table.finish_frame(st.start, |k| if is_provisional(k) { finals.get(&k).copied() } else { Some(k) })?;
+    let mut new: Vec<(Key, u64)> = st.fresh.iter().enumerate().filter(|x| *x.1 != 0).map(|(e, &m)| (st.table.key(e as u32), m)).collect();
+    new.sort_unstable_by_key(|x| x.0);
     if !st.prov.is_empty() {
         let mut v: Vec<Bundle> = std::mem::take(&mut st.prov);
         for b in &mut v {
@@ -482,11 +455,6 @@ pub fn seal(st: &mut RouteState, region: u32, finals: &FxHashMap<Key, Key>, sc: 
         }
         st.segs.push((u32::MAX, Segment::encode(region, &mut v, &mut sc.raw, &mut sc.z)?));
     }
-    Ok(Sealed { entries, states })
-}
-
-impl RouteState {
-    fn table_words(&self) -> usize {
-        super::GEOMETRY.words
-    }
+    st.fresh = Vec::new();
+    Ok(Sealed { region, keys: new.iter().map(|x| x.0).collect(), masks: new.iter().map(|x| x.1).collect() })
 }

@@ -13,7 +13,7 @@ use celeste_engine::runtime2::{Col, Rt2, AV};
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use super::decode::Skeletons;
-use super::route::{Chunk, Routes, Sources, UnitBundles, NO_XFER};
+use super::route::{Chunk, Routes, UnitBundles, NO_XFER};
 use super::visited::{Key, VisitedSet};
 use crate::frame::{Filters, Raised};
 use celeste_engine::exact::{is_provisional, KeySpace, Provisional, RowKey};
@@ -165,33 +165,33 @@ pub struct UnitSink<'a> {
     /// The level the wave runs at (a reference row's key view).
     level: crate::abstraction::Level,
     pub worker: u32,
+    /// Are level -1's drops noted (the sources of the rows it drops)?
     note_drops: bool,
-    drops: Option<&'a super::wave::DropNotes>,
     raise: Option<RaiseCtx>,
     record_edges: bool,
-    /// The unit's: its index, its block's index in the frontier, first
-    /// lane, and the block's first row's index in the wave's frontier.
-    unit: u32,
-    block: u32,
-    lo: usize,
-    src_base: u32,
+    /// The unit's index in the wave.
+    pub unit: u32,
     /// Are the unit's sources the tree's (a raise; not the raise's own)?
     pub sources_old: bool,
-    /// Lanes of the block being run that must not be expanded.
-    pub skip_in: Option<&'a [bool]>,
+    /// The unit's sources: its entries `(region, key)`, each one's index
+    /// among the unit's distinct `(shape, key)`s (`unit_sources`, the
+    /// chunks' source list), and per lane its entry and cell.
+    srcs: Vec<(u32, Key)>,
+    src_local: Vec<u32>,
+    lanes: Vec<(u32, u32)>,
+    unit_sources: Vec<(u32, Key)>,
+    src_idx: rustc_hash2::FxHashMap<(u32, Key), u32>,
+    /// Per lane the smallest horizon admitting a successor level -1 dropped
+    /// (`u32::MAX`: none), and the worker's notes so far: `(region, key,
+    /// cell in region, horizon)` per noted source.
+    drop_min: Vec<u32>,
+    pub notes: Vec<(u32, Key, u32, u32)>,
     /// This worker's routes, and the last one asked.
     route_ids: FxHashMap<(u64, u32), u32>,
     last_route: (u64, u32, u32),
-    /// The wave's frontier as sources (`None`: no edges recorded).
-    sources: Option<&'a Sources>,
     /// The unit's bundles by route, and its (route, source region) pairs.
     bundles: UnitBundles,
     src_regions: Vec<(u32, u32)>,
-    /// The unit's distinct sources (shape, key), and per lane from its
-    /// first its index there.
-    unit_sources: Vec<(u32, Key)>,
-    src_local: Vec<u32>,
-    src_idx: rustc_hash2::FxHashMap<(u32, Key), u32>,
     /// Per target the coarser level's verdict (`MarkFilter`), once a unit,
     /// decided in batches (a projection per block, not per row).
     verdicts: rustc_hash2::FxHashMap<Target, u8>,
@@ -252,13 +252,11 @@ impl<'a> UnitSink<'a> {
         level: crate::abstraction::Level,
         worker: u32,
         xfer_tab: &'a std::sync::RwLock<Vec<crate::search::arc_edges::Pair>>,
-        sources: Option<&'a Sources>,
+        record_edges: bool,
         edges_on: bool,
-        drops: Option<&'a super::wave::DropNotes>,
         raise: Option<RaiseCtx>,
         s: &crate::settings::Settings,
     ) -> Self {
-        let record_edges = sources.is_some();
         let l1 = filters.minus_one.or(raise.as_ref().map(|r| r.raised.old)).map(|m| m.table(s));
         UnitSink {
             keys: &visited.keys,
@@ -269,24 +267,22 @@ impl<'a> UnitSink<'a> {
             frame,
             level,
             worker,
-            note_drops: filters.notes_drops() && record_edges && drops.is_some(),
-            drops,
+            note_drops: filters.notes_drops() && record_edges,
             raise,
             record_edges,
             unit: 0,
-            block: 0,
-            lo: 0,
-            src_base: 0,
             sources_old: false,
-            skip_in: None,
+            srcs: Vec::new(),
+            src_local: Vec::new(),
+            lanes: Vec::new(),
+            unit_sources: Vec::new(),
+            src_idx: Default::default(),
+            drop_min: Vec::new(),
+            notes: Vec::new(),
             route_ids: FxHashMap::default(),
             last_route: (0, u32::MAX, u32::MAX),
-            sources,
             bundles: UnitBundles::default(),
             src_regions: Vec::new(),
-            unit_sources: Vec::new(),
-            src_local: Vec::new(),
-            src_idx: Default::default(),
             verdicts: Default::default(),
             scratch: Vec::new(),
             scratch_at: Vec::new(),
@@ -337,53 +333,54 @@ impl<'a> UnitSink<'a> {
         }
     }
 
-    /// Are edges recorded (an edges dir, the frontier's sources)?
+    /// Are edges recorded (an edges dir)?
     #[inline]
     pub fn records_edges(&self) -> bool {
         self.record_edges
     }
 
-    /// Start unit `unit` of the wave: lanes `lo..lo + n` of frontier block
-    /// `block`, whose row 0 is row `src_base` of the wave's frontier
-    /// (`route::Sources`; `ids`: the lanes' ids, for the capture).
-    #[allow(clippy::too_many_arguments)]
-    pub fn begin(&mut self, unit: u32, block: u32, lo: usize, src_base: u32, ids: &[super::StateId], skip: Option<&'a [bool]>, sources_old: bool) {
-        if let Some(c) = &mut self.capture {
-            c.unit(unit, block, lo, ids, sources_old);
-        }
+    /// Start unit `unit` of the wave (`old`: its sources are the tree's, a
+    /// raise); its sources and lanes follow (`push_source`, `push_lane`).
+    pub fn begin(&mut self, unit: u32, old: bool) {
         self.unit = unit;
-        self.block = block;
-        self.lo = lo;
-        self.src_base = src_base;
-        self.skip_in = skip;
-        self.sources_old = sources_old;
+        self.sources_old = old;
         self.bundles.clear();
         self.src_regions.clear();
         self.verdicts.clear();
         self.disallowed = false;
-        // The unit's sources: its lanes' (shape, key)s, distinct.
-        self.unit_sources.clear();
+        self.srcs.clear();
         self.src_local.clear();
+        self.lanes.clear();
+        self.unit_sources.clear();
         self.src_idx.clear();
-        if let Some(sources) = self.sources {
-            let rows = &sources.rows[src_base as usize + lo..src_base as usize + lo + ids.len()];
-            let mut last: Option<((u32, Key), u32)> = None;
-            for r in rows {
-                let s = (r.shape, r.key);
-                let k = match last {
-                    Some((l, k)) if l == s => k,
-                    _ => {
-                        let n = self.unit_sources.len() as u32;
-                        let k = *self.src_idx.entry(s).or_insert(n);
-                        if k == n {
-                            self.unit_sources.push(s);
-                        }
-                        last = Some((s, k));
-                        k
-                    }
-                };
-                self.src_local.push(k);
-            }
+        self.drop_min.clear();
+    }
+
+    /// The unit's next source entry `(region, key)`; its index.
+    #[inline]
+    pub fn push_source(&mut self, region: u32, key: Key) -> u32 {
+        let s = (region / super::GEOMETRY.slots, key);
+        let n = self.unit_sources.len() as u32;
+        let k = *self.src_idx.entry(s).or_insert(n);
+        if k == n {
+            self.unit_sources.push(s);
+        }
+        self.srcs.push((region, key));
+        self.src_local.push(k);
+        self.srcs.len() as u32 - 1
+    }
+
+    /// The unit's next lane: a state of source entry `entry` at `cell`.
+    #[inline]
+    pub fn push_lane(&mut self, entry: u32, cell: u32) {
+        self.lanes.push((entry, cell));
+    }
+
+    /// The unit's sources and lanes are in: the capture's unit record.
+    pub fn sources_done(&mut self) {
+        self.drop_min.resize(self.lanes.len(), u32::MAX);
+        if let Some(c) = &mut self.capture {
+            c.unit(self.unit, self.lanes.len() as u32, self.sources_old);
         }
     }
 
@@ -409,10 +406,11 @@ impl<'a> UnitSink<'a> {
     #[inline]
     pub fn dropped(&mut self, lane: usize, from: u32) {
         if let Some(c) = &mut self.capture {
-            c.dropped((lane - self.lo) as u32, from);
+            c.dropped(lane as u32, from);
         }
-        if let (true, Some(d)) = (self.note_drops, self.drops) {
-            d.note(self.block, lane, from);
+        if self.note_drops {
+            let m = &mut self.drop_min[lane];
+            *m = (*m).min(from);
         }
     }
 
@@ -514,7 +512,7 @@ impl<'a> UnitSink<'a> {
         }
         self.emitted += 1;
         if let Some(c) = &mut self.capture {
-            c.emit(shape, cell, key, (lane - self.lo) as u32, xfer, is_provisional(key).then(|| self.prov.content(key)));
+            c.emit(shape, cell, key, lane as u32, xfer, is_provisional(key).then(|| self.prov.content(key)));
         }
         // A shape's first emission (this worker, this wave): its skeleton
         // registered, and THE DECODE GUARD - its row is what its key and
@@ -566,14 +564,15 @@ impl<'a> UnitSink<'a> {
             }
         }
         let bit = 1u64 << local;
-        match (xfer, self.sources) {
-            (Some(x), Some(sources)) => {
-                let s = &sources.rows[self.src_base as usize + lane];
-                if self.src_regions.last() != Some(&(route, s.region)) {
-                    self.src_regions.push((route, s.region));
+        match xfer {
+            Some(x) if self.record_edges => {
+                let (entry, s_cell) = self.lanes[lane];
+                let s_region = self.srcs[entry as usize].0;
+                if self.src_regions.last() != Some(&(route, s_region)) {
+                    self.src_regions.push((route, s_region));
                 }
-                let sl = self.src_local[lane - self.lo];
-                self.bundles.insert(route, key, sl, x, super::bundle::offset(s.cell, cell), bit);
+                let sl = self.src_local[entry as usize];
+                self.bundles.insert(route, key, sl, x, super::bundle::offset(s_cell, cell), bit);
             }
             _ => self.bundles.insert(route, key, 0, NO_XFER, 0, bit),
         }
@@ -670,7 +669,7 @@ impl<'a> UnitSink<'a> {
             b
         };
         self.reference = true;
-        let r = self.emit(w.shape_hash, cell, key, self.lo, None, init, |b| b.push_row(&w, key, cell));
+        let r = self.emit(w.shape_hash, cell, key, 0, None, init, |b| b.push_row(&w, key, cell));
         self.reference = false;
         r
     }
@@ -704,6 +703,17 @@ impl<'a> UnitSink<'a> {
             }
         }
         self.decide()?;
+        // The unit's noted sources.
+        let slots = super::GEOMETRY.slots;
+        for (lane, &h) in self.drop_min.iter().enumerate() {
+            if h != u32::MAX {
+                let (entry, cell) = self.lanes[lane];
+                let (region, key) = self.srcs[entry as usize];
+                let (slot, local) = super::GEOMETRY.slot_local(cell);
+                debug_assert_eq!(slot, region % slots);
+                self.notes.push((region, key, local, h));
+            }
+        }
         let v = &self.verdicts;
         let drop = |route: u32, key: Key, c: u32| v.get(&(route, key, c as u8)) == Some(&VERDICT_NO);
         let buckets = self.bundles.drain(if self.disallowed { Some(&drop) } else { None });

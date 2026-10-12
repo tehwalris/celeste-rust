@@ -7,8 +7,9 @@
 use anyhow::{Context, Result};
 use celeste_engine::runtime2::Rt2;
 use celeste_rust::trace::refengine::RefEngine;
-use celeste_rust::frame::{frame_files, frame_paths, load_row, widen_rt2_to, widened_keys, wins_of, Block, FrameStep, Visited};
-use celeste_rust::storage::{show_id, StateId};
+use celeste_rust::frame::{widen_rt2_to, widened_keys, wins_of, Block, FrameStep, Visited};
+use celeste_rust::storage::layer::Tree;
+use celeste_rust::storage::Sk;
 use celeste_rust::abstraction::Level;
 use celeste_rust::search::inspect::{brief, cell_names, parse_xy, player_summary, project_all, project_onto, project_row, Proj};
 use clap::{Parser, Subcommand};
@@ -452,8 +453,8 @@ enum Command {
         /// `<checkpoint-dir>/levelNN`).
         #[arg(long)]
         level_dir: String,
-        /// The row, `LAYER:SEQ:ROW` (its frame, its file's seq, its index in the
-        /// file).
+        /// The row, `LAYER:N`: the N-th state of frame LAYER in the tree's
+        /// order (by region, key, cell).
         #[arg(long)]
         row: String,
         /// The level whose kernels run it (the tree's).
@@ -653,51 +654,42 @@ enum Command {
     },
 }
 
-/// A tree's storage metadata through its last frame: its rows decode
-/// against it (`storage::decode::TreeKeys`).
-fn tree_of(dir: &std::path::Path) -> Result<celeste_rust::storage::marks::Resolver> {
-    let mut last = 0;
-    while dir.join("frames").join(format!("f{:03}", last + 1)).is_dir() {
-        last += 1;
-    }
-    celeste_rust::storage::marks::Resolver::load(dir, last)
+/// A tree through its last frame (`storage::layer::Tree`): its codebooks,
+/// its frames' states, their rows decoded on demand.
+fn tree_of(dir: &std::path::Path) -> Result<Tree> {
+    Tree::open_all(dir)
 }
 
 /// `coarse-census`: one frame's states EXACTLY (each row's named value
 /// cells and their codes, by name), the named value cells under an `erase`
 /// prefix left out (pointers count as structure); and the frame's row count.
-fn erased_states(dir: &std::path::Path, frame: u32, erase: &[String], room: (i16, i16)) -> Result<(u64, rustc_hash::FxHashSet<Box<[u8]>>)> {
+fn erased_states(dir: &std::path::Path, frame: u32, erase: &[String], room: (i16, i16), threads: usize) -> Result<(u64, rustc_hash::FxHashSet<Box<[u8]>>)> {
     use celeste_engine::exact::Code;
     use celeste_engine::runtime2::{Cell2, AV};
     let ids = celeste_rust::compiled::ids();
     let code = |v: AV| -> Code { Code::of(if let AV::Ptr(_) = v { AV::Ptr(0) } else { v }) };
     let (mut rows, mut states) = (0u64, rustc_hash::FxHashSet::default());
-    let tree = celeste_rust::storage::marks::Resolver::load(dir, frame)?;
-    for (_, path) in frame_paths(dir, frame)? {
-        let ff = celeste_rust::search::checkpoint::FrameFile::open(&path)?;
-        let width = ff.width();
-        for lo in (0..width).step_by(1 << 20) {
-            let Some(rt2) = ff.load_rows(&[lo..(lo + (1 << 20)).min(width)], room, &tree)? else { break };
-            rows += rt2.width as u64;
-            let names = cell_names(&rt2, ids);
-            let mut cells: Vec<(String, usize)> = (0..rt2.cols.len())
-                .filter(|&c| matches!(rt2.structure[c], Cell2::Val))
-                .map(|c| (names.get(&c).cloned().unwrap_or_else(|| format!("cell{c}")), c))
-                .filter(|(nm, _)| !erase.iter().any(|p| nm.starts_with(p.as_str())))
-                .collect();
-            cells.sort();
-            for r in 0..rt2.width {
-                let mut b: Vec<u8> = Vec::new();
-                for (nm, c) in &cells {
-                    let k = code(rt2.cols[*c].at(r));
-                    b.extend_from_slice(nm.as_bytes());
-                    b.push(0);
-                    b.push(k.kind);
-                    b.extend_from_slice(&k.a.to_le_bytes());
-                    b.extend_from_slice(&k.b.to_le_bytes());
-                }
-                states.insert(b.into_boxed_slice());
+    let tree = Tree::open(dir, frame)?;
+    for (_, rt2) in tree.rows(frame, room, 1 << 20, &|_| true, threads)? {
+        rows += rt2.width as u64;
+        let names = cell_names(&rt2, ids);
+        let mut cells: Vec<(String, usize)> = (0..rt2.cols.len())
+            .filter(|&c| matches!(rt2.structure[c], Cell2::Val))
+            .map(|c| (names.get(&c).cloned().unwrap_or_else(|| format!("cell{c}")), c))
+            .filter(|(nm, _)| !erase.iter().any(|p| nm.starts_with(p.as_str())))
+            .collect();
+        cells.sort();
+        for r in 0..rt2.width {
+            let mut b: Vec<u8> = Vec::new();
+            for (nm, c) in &cells {
+                let k = code(rt2.cols[*c].at(r));
+                b.extend_from_slice(nm.as_bytes());
+                b.push(0);
+                b.push(k.kind);
+                b.extend_from_slice(&k.a.to_le_bytes());
+                b.extend_from_slice(&k.b.to_le_bytes());
             }
+            states.insert(b.into_boxed_slice());
         }
     }
     Ok((rows, states))
@@ -718,10 +710,10 @@ fn where_(c: u32) -> String {
     celeste_rust::search::pos_graph::cell_xy(c).map(|(x, y)| format!("({x}, {y})")).unwrap_or_else(|| "no player".to_string())
 }
 
-/// The predecessors of state `id`, first reached at `layer`, recorded at
-/// that frame (`tree`: its ids and keys).
-fn preds_of(edges: &celeste_rust::storage::edges::EdgeStore, tree: &celeste_rust::storage::marks::Resolver, id: StateId, layer: u32) -> Result<Vec<StateId>> {
-    edges.preds_at(tree.sk(id)?, layer)?.into_iter().map(|(s, _)| tree.id_of(s)).collect()
+/// The predecessors of state `s`, first reached at `layer`, recorded at
+/// that frame (states of layer `layer - 1`).
+fn preds_of(edges: &celeste_rust::storage::edges::EdgeStore, s: Sk, layer: u32) -> Result<Vec<Sk>> {
+    Ok(edges.preds_at(s, layer)?.into_iter().map(|(p, _)| p).collect())
 }
 
 /// Every row of `rt2` (of layer `layer`) through ONE forward frame of
@@ -969,31 +961,29 @@ fn main() -> Result<()> {
             celeste_rust::metrics::dump("forward", Some(dir), &[("level", level.to_string())]);
         }
         Command::DiagProject { fine_dir, coarse_dir, level, from, to, fine_marks, coarse_marks } => {
-            use celeste_rust::frame::load_frame;
             let load_marks = |p: Option<String>| p.map(|p| Visited::load(std::path::Path::new(&p))).transpose();
             let (fine_marks, coarse_marks) = (load_marks(fine_marks)?, load_marks(coarse_marks)?);
             let (fine, coarse) = (std::path::Path::new(&fine_dir), std::path::Path::new(&coarse_dir));
+            let (fine_tree, coarse_tree) = (Tree::open(fine, to)?, Tree::open(coarse, to)?);
             // The fine rows' projections keyed in the COARSE tree's key space.
-            let mut reached = Visited::new(celeste_rust::storage::meta::tree_keys(coarse, to)?);
-            let (fine_tree, coarse_tree) = (tree_of(fine)?, tree_of(coarse)?);
+            let mut reached = Visited::new(coarse_tree.space.clone());
             let (mut total, mut missed, mut unmarked) = (0usize, 0usize, 0usize);
             let mut misses: Vec<String> = Vec::new();
             for f in 0..=to {
-                for b in load_frame(coarse, f, cfg.room, &coarse_tree)? {
-                    let cells = b.positions()?;
-                    for (k, &c) in b.keys().iter().zip(&cells) {
-                        reached.insert(b.shard_shape(), *k, c);
-                    }
+                for s in coarse_tree.layer(f, None, cfg.threads())?.0.states_iter() {
+                    let (shape, key, cell) = coarse_tree.state(s)?;
+                    reached.insert(shape, key, cell);
                 }
                 if f < from {
                     continue;
                 }
                 let (mut n, mut miss, mut unm) = (0usize, 0usize, 0usize);
-                for block in load_frame(fine, f, cfg.room, &fine_tree)? {
-                    let cells = block.positions()?;
+                for (sks, rt2) in fine_tree.rows(f, cfg.room, 1 << 20, &|_| true, cfg.threads())? {
+                    let block = Block::from_rt2(rt2);
                     let (ws, wk, wc) = widened_keys(&block, level, reached.keys())?;
-                    for i in 0..block.lanes() {
-                        if fine_marks.as_ref().is_some_and(|m| !m.contains(block.shard_shape(), block.keys()[i], cells[i])) {
+                    for (i, sk) in sks.iter().enumerate() {
+                        let (shape, key, cell) = fine_tree.state(*sk)?;
+                        if fine_marks.as_ref().is_some_and(|m| !m.contains(shape, key, cell)) {
                             continue;
                         }
                         n += 1;
@@ -1030,74 +1020,62 @@ fn main() -> Result<()> {
             let dir = std::path::Path::new(&checkpoint_dir);
             // Fingerprints over CONTENT (`exact::ContentHash`): a raised tree's
             // dictionaries grew in another order than a fresh one's.
-            // A state by what it is (shape, key, cell), from its id alone.
-            let resolver = celeste_rust::storage::marks::Resolver::load(dir, to)?;
-            let content = resolver.space.content_hash();
+            let tree = Tree::open(dir, to)?;
+            let content = tree.space.content_hash();
+            let geo = celeste_rust::storage::GEOMETRY;
             let mut by_cell: rustc_hash::FxHashMap<u32, usize> = Default::default();
-            let mut died = false;
             for frame in 0..=to {
-                let mut n = 0usize;
-                let mut acc: u64 = 0;
-                // A forward whose frontier died has no frames past the empty one.
-                if died && !dir.join("frames").join(format!("f{frame:03}")).is_dir() {
-                    println!("f{frame:03} 0 {acc:016x}");
-                    continue;
-                }
-                for (_, file) in frame_files(dir, frame)? {
-                    for r in 0..file.width() {
-                        let (shape, k, c) = resolver.resolve(file.id_at(r))?;
-                        anyhow::ensure!(shape == file.shape_hash(), "f{frame}: state {} not of its file's shape", show_id(file.id_at(r)));
-                        acc = acc.wrapping_add(content.state(shape, k, c));
-                        n += 1;
-                        if frame == to && top_cells.is_some() {
-                            *by_cell.entry(c).or_default() += 1;
-                        }
+                // A forward whose frontier died has no frames past the empty
+                // one: their layers are empty.
+                let (layer, _) = tree.layer(frame, None, cfg.threads())?;
+                let (n, acc) = layer.content_fingerprint(&tree.space, &tree.shapes)?;
+                if frame == to && top_cells.is_some() {
+                    for s in layer.states_iter() {
+                        *by_cell.entry(s.cell(&geo)).or_default() += 1;
                     }
                 }
                 println!("f{frame:03} {n} {acc:016x}");
-                died = n == 0;
             }
             // The recorded edges per frame, by what they join: (shape, key,
             // cell) of target and source, and the transfer - table positions
             // depend on a raise, these do not. A state by what it is
-            // (`ContentHash::state`: `mix64(key hash ^ cell << 1)`); a drop
-            // note's by its id, each entry's key hashed once.
-            let entries = resolver.per_entry(|shape, k| content.key(shape, k));
-            let node = |id: StateId| -> Result<u64> {
-                let (kh, cell) = entries.get(id)?;
-                Ok(celeste_engine::runtime2::mix64(kh ^ (cell as u64) << 1))
-            };
+            // (`ContentHash::state`: `mix64(key hash ^ cell << 1)`).
             if edges {
                 let eg = celeste_rust::storage::edges::EdgeStore::open(&dir.join("edges"), to)?;
                 // STREAMED: one frame at a time, its blocks on every thread
                 // (each key hashed once a block, each pair once).
                 let hashes = celeste_rust::storage::bench::EdgeHashes::new(eg.pairs());
-                let shapes = resolver.shapes();
+                let shapes = &tree.shapes;
                 for frame in 1..=to {
                     let (n, acc) = hashes.frame(&eg, frame, &content, shapes, cfg.threads())?;
                     println!("e{frame:03} {n} {acc:016x}");
                     if dump_edges == Some(frame) {
-                        let geo = celeste_rust::storage::GEOMETRY;
-                        let node = |s: celeste_rust::storage::Sk| content.state(shapes[s.shape(&geo) as usize], s.key, s.cell(&geo));
+                        let node = |s: Sk| content.state(shapes[s.shape(&geo) as usize], s.key, s.cell(&geo));
                         for e in eg.edges_at(frame, cfg.threads())? {
                             eprintln!("edge {:016x} {:016x} {:?}", node(e.dst), node(e.src), eg.pair(e.xfer));
                         }
                     }
                 }
             }
+            // The level -1 drop notes per frame: each noted source by what it
+            // is and its horizon.
             if dropped {
                 for frame in 1..=to {
-                    let p = celeste_rust::frame::dropped_path(dir, frame);
                     // A forward whose frontier died has no frames past it.
-                    if !dir.join("frames").join(format!("f{frame:03}")).is_dir() {
+                    if !celeste_rust::storage::layer::frame_exists(dir, frame) {
                         break;
                     }
-                    let notes: Vec<(u64, u32)> = celeste_rust::search::checkpoint::load_value_from(&p).with_context(|| p.display().to_string())?;
-                    let mut acc = 0u64;
-                    for &(id, h) in &notes {
-                        acc = acc.wrapping_add(celeste_engine::runtime2::mix64(node(id)? ^ (h as u64).rotate_left(32)));
+                    let notes = celeste_rust::storage::layer::read_notes(&celeste_rust::storage::layer::notes_path(dir, frame))?;
+                    let (mut n, mut acc) = (0u64, 0u64);
+                    for &(region, key, h, mask) in &notes {
+                        let shape = tree.shape_of(region)?;
+                        for local in celeste_rust::storage::layer::bits(mask) {
+                            let node = content.state(shape, key, geo.cell(region % geo.slots, local));
+                            acc = acc.wrapping_add(celeste_engine::runtime2::mix64(node ^ (h as u64).rotate_left(32)));
+                            n += 1;
+                        }
                     }
-                    println!("d{frame:03} {} {acc:016x}", notes.len());
+                    println!("d{frame:03} {n} {acc:016x}");
                 }
             }
             if let Some(top) = top_cells {
@@ -1125,11 +1103,13 @@ fn main() -> Result<()> {
             let t = std::time::Instant::now();
             let st = celeste_rust::frame::ForwardState::at(&dir, frame, true, level, &cfg)?;
             eprintln!(
-                "[bench] kernels built in {t_kernels:.2} s; f{frame} loaded in {:.2} s: {} lanes, visited {} states; {} threads",
+                "[bench] kernels built in {t_kernels:.2} s; f{frame} loaded in {:.2} s: {} lanes in {} entries, visited {} states; {} threads; rss {:.2} GB",
                 t.elapsed().as_secs_f64(),
-                st.frontier_lanes(),
+                st.frontier().states(),
+                st.frontier().entries(),
                 st.visited_len(),
-                cfg.threads()
+                cfg.threads(),
+                celeste_rust::metrics::current_rss_gb()
             );
             let scratch = dir.join("bench-edges");
             let ms = |d: std::time::Duration| d.as_secs_f64() * 1e3;
@@ -1141,7 +1121,7 @@ fn main() -> Result<()> {
                 let t_all = t.elapsed();
                 let w = &wave.stats;
                 eprintln!(
-                    "[bench] rep {rep}: wave {:.0} ms (idle {:.0}%, regions {:.0} worker-ms) end {:.0} total {:.0} ms | in {} emitted {} kept {} | units {} slices {} routes {} | edges {} bundles {} ({:.3} B)",
+                    "[bench] rep {rep}: wave {:.0} ms (idle {:.0}%, regions {:.0} worker-ms) end {:.0} total {:.0} ms | in {} emitted {} kept {} | units {} slices {} routes {} | edges {} bundles {} ({:.3} B) | rss start {:.2} wave {:.2} end {:.2} peak {:.2} GB",
                     ms(w.t_wave),
                     w.wave_idle * 100.0,
                     ms(w.t_regions),
@@ -1156,8 +1136,12 @@ fn main() -> Result<()> {
                     w.edge_records,
                     w.edge_bundles,
                     w.edge_bytes as f64 / w.edge_records.max(1) as f64,
+                    w.rss_start,
+                    w.rss_wave,
+                    w.rss_end,
+                    celeste_rust::metrics::peak_rss_gb(),
                 );
-                let (n, acc) = celeste_rust::storage::bench::layer_fingerprint(&wave.next, &visited);
+                let (n, acc) = wave.next.content_fingerprint(&visited.keys, visited.shapes())?;
                 let mut out = format!("f{:03} {n} {acc:016x}\n", frame + 1);
                 if edges {
                     let (n, acc) = celeste_rust::storage::bench::edge_fingerprint(&scratch, frame + 1, &xfers, &visited, cfg.threads())?;
@@ -1244,11 +1228,11 @@ fn main() -> Result<()> {
             let n_frames = (to - from + 1) as usize;
             // Per cell, its new states per frame.
             let mut per: std::collections::HashMap<u32, Vec<u64>> = Default::default();
+            let tree = Tree::open(dir, to)?;
+            let geo = celeste_rust::storage::GEOMETRY;
             for f in from..=to {
-                for (_, file) in frame_files(dir, f)? {
-                    for (cell, rows) in file.cell_counts() {
-                        per.entry(cell as u32).or_insert_with(|| vec![0; n_frames])[(f - from) as usize] += rows as u64;
-                    }
+                for s in tree.layer(f, None, cfg.threads())?.0.states_iter() {
+                    per.entry(s.cell(&geo)).or_insert_with(|| vec![0; n_frames])[(f - from) as usize] += 1;
                 }
             }
             let visited = |v: &[u64]| v.iter().sum::<u64>();
@@ -1326,16 +1310,19 @@ fn main() -> Result<()> {
             let ids = celeste_rust::compiled::ids();
             let graph = celeste_rust::storage::edges::EdgeStore::open(&edges_dir, to)?;
             let rem_cells = |rt2: &Rt2| rt2.player_xy_cells(ids, ids.f_rem);
-            // One stored row, by id, as a one-lane block.
-            let tree = celeste_rust::storage::marks::Resolver::load(dir, to)?;
-            let row_of = |s: celeste_rust::storage::Sk| -> Result<Block> { Ok(Block::from_rt2(load_row(dir, tree.id_of(s)?, cfg.room, &tree)?.0)) };
+            // One stored state's row, as a one-lane block.
+            let tree = Tree::open(dir, to)?;
+            let row_of = |s: Sk| -> Result<Block> {
+                let f = tree.layer_of(s, to)?.ok_or_else(|| anyhow::anyhow!("state {}: in no frame through f{to}", s.show()))?;
+                Ok(Block::from_rt2(tree.row(f, s, cfg.room)?))
+            };
             // Every successor of `row` at remainder `rem` over all 64 inputs:
             // its projection onto the level and its player's remainder; and
             // the reference steps it took.
             type Succ = ((u64, Option<(u64, u64)>, u32), Option<(u32, u32)>);
             // The tree's key space: projections keyed as its rows (`None`: a
             // code it never stored).
-            let space = celeste_rust::storage::meta::tree_keys(dir, to)?;
+            let space = &tree.space;
             let successors = |eng: &mut RefEngine, row: &Block, rem: (u32, u32)| -> Result<(Vec<Succ>, u64)> {
                 // As the kernels read it: projected onto the level (the start
                 // row is stored exact), then the probe's remainder.
@@ -1369,7 +1356,7 @@ fn main() -> Result<()> {
                             }
                             None => None,
                         };
-                        let (shape, keys, cells) = widened_keys(&blk, level, &space)?;
+                        let (shape, keys, cells) = widened_keys(&blk, level, space)?;
                         out.push(((shape, keys[0], cells[0]), q));
                     }
                 }
@@ -1418,7 +1405,7 @@ fn main() -> Result<()> {
                 let src = r.src;
                 let src_row = row_of(src)?;
                 let tgt_row = row_of(r.target)?;
-                let (tshape, tkeys, tcells) = widened_keys(&tgt_row, level, &space)?;
+                let (tshape, tkeys, tcells) = widened_keys(&tgt_row, level, space)?;
                 anyhow::ensure!(tkeys[0].is_some(), "arc-check: the target {} does not key in its own tree", r.target.show());
                 let target = (tshape, tkeys[0], tcells[0]);
                 let (gx, gy) = (r.x.guard, r.y.guard);
@@ -1588,7 +1575,7 @@ fn main() -> Result<()> {
             let erase = prefixes(&erase);
             let mut through: rustc_hash::FxHashSet<Box<[u8]>> = Default::default();
             for frame in from..=to {
-                let (rows, states) = erased_states(std::path::Path::new(&level_dir), frame, &erase, cfg.room)?;
+                let (rows, states) = erased_states(std::path::Path::new(&level_dir), frame, &erase, cfg.room, cfg.threads())?;
                 let n = states.len();
                 through.extend(states);
                 println!("f{frame:03}: {rows} rows -> {n} states ({:.2}x fewer); {} states through f{frame:03}", rows as f64 / n.max(1) as f64, through.len());
@@ -1626,22 +1613,21 @@ fn main() -> Result<()> {
                 moved
             };
             let (mut stored, mut emitted_rows, mut moved) = (0usize, 0usize, 0usize);
-            let files = frame_files(dir, frame)?;
-            let tree = celeste_rust::storage::marks::Resolver::load(dir, frame)?;
-            for (_, f) in &files {
-                if let Some(rt2) = f.load_all(cfg.room, &tree)? {
-                    stored += rt2.width;
-                    moved += check(&rt2, "stored", moved);
-                }
+            let tree = Tree::open(dir, frame)?;
+            let blocks = tree.rows(frame, cfg.room, 1 << 20, &|_| true, cfg.threads())?;
+            for (_, rt2) in &blocks {
+                stored += rt2.width;
+                moved += check(rt2, "stored", moved);
             }
             if emitted > 0 {
                 let kernels = celeste_rust::compiled::FrameEngine::new(&cfg, level)?;
                 kernels.warm();
-                let all: Vec<(usize, u32)> = files.iter().enumerate().flat_map(|(fi, (_, f))| (0..f.width()).map(move |r| (fi, r))).collect();
+                let all: Vec<(usize, u32)> = blocks.iter().enumerate().flat_map(|(bi, (_, rt2))| (0..rt2.width as u32).map(move |r| (bi, r))).collect();
                 let n = emitted.min(all.len());
                 for k in 0..n {
-                    let (fi, r) = all[k * all.len() / n];
-                    let rt2 = files[fi].1.load_rows(&[r..r + 1], cfg.room, &tree)?.ok_or_else(|| anyhow::anyhow!("no row"))?;
+                    let (bi, r) = all[k * all.len() / n];
+                    let mut rt2 = blocks[bi].1.clone_block();
+                    rt2.retain_lanes(&[r]);
                     for b in rerun(&kernels, rt2, frame)?.0 {
                         emitted_rows += b.lanes();
                         moved += check(b.rt2(), "emitted", moved);
@@ -1657,31 +1643,25 @@ fn main() -> Result<()> {
             let kernels = celeste_rust::compiled::FrameEngine::new(&cfg, level)?;
             kernels.warm();
             let only = cell.map(cell_at).transpose()?;
-            // Every candidate row (seq, row), then `samples` evenly spaced.
-            let files = frame_files(dir, frame)?;
-            let tree = celeste_rust::storage::marks::Resolver::load(dir, frame)?;
-            let mut all: Vec<(usize, u32)> = Vec::new();
-            for (fi, (_, f)) in files.iter().enumerate() {
-                match only {
-                    Some(c) => all.extend(f.rows_of_cell(c).into_iter().flatten().map(|r| (fi, r))),
-                    None => all.extend((0..f.width()).map(|r| (fi, r))),
-                }
-            }
+            // Every candidate state, then `samples` evenly spaced.
+            let tree = Tree::open(dir, frame)?;
+            let geo = celeste_rust::storage::GEOMETRY;
+            let all: Vec<Sk> = tree.layer(frame, None, cfg.threads())?.0.states_iter().filter(|s| only.is_none_or(|c| s.cell(&geo) == c)).collect();
             anyhow::ensure!(!all.is_empty(), "no rows at step {frame}");
             let n = samples.min(all.len());
-            let picked: Vec<(usize, u32)> = (0..n).map(|k| all[k * all.len() / n]).collect();
+            let picked: Vec<Sk> = (0..n).map(|k| all[k * all.len() / n]).collect();
             // One row: (its report, reference-only successors, kernel-only,
             // skipped over the path cap, lanes converted alike).
-            let one = |reference: &mut RefEngine, (fi, r): (usize, u32)| -> Result<(String, usize, usize, usize, usize)> {
-                let (seq, f) = &files[fi];
-                let rt2 = f.load_rows(&[r..r + 1], cfg.room, &tree)?.ok_or_else(|| anyhow::anyhow!("no row"))?;
-                let at = where_(f.cell_at(r));
+            let one = |reference: &mut RefEngine, sk: Sk| -> Result<(String, usize, usize, usize, usize)> {
+                let rt2 = tree.row(frame, sk, cfg.room)?;
+                let at = where_(sk.cell(&geo));
+                let id = sk.show();
                 // The row, its kernel successors and its reference leaves
                 // convert alike on the tracer's side and the reference's
                 // (`block::check_agreement`).
                 let mut alike = 0;
                 let mut agree = |reference: &RefEngine, b: &Rt2| -> Result<()> {
-                    reference.check_agreement(b).map_err(|e| e.context(format!("row s{seq} r{r} at {at}: the one converter")))?;
+                    reference.check_agreement(b).map_err(|e| e.context(format!("state {id} at {at}: the one converter")))?;
                     alike += b.width;
                     Ok(())
                 };
@@ -1699,7 +1679,7 @@ fn main() -> Result<()> {
                 let mut rset: std::collections::BTreeSet<Proj> = Default::default();
                 let leaves = match reference.run_lane(&input, 0) {
                     Err(e) if e.downcast_ref::<celeste_rust::trace::refdriver::TooManyPaths>().is_some() => {
-                        return Ok((format!("[ref-check] row s{seq} r{r} at {at}: SKIPPED ({e})\n"), 0, 0, 1, alike));
+                        return Ok((format!("[ref-check] state {id} at {at}: SKIPPED ({e})\n"), 0, 0, 1, alike));
                     }
                     other => other?,
                 };
@@ -1710,7 +1690,7 @@ fn main() -> Result<()> {
                 let missing: Vec<&Proj> = rset.difference(&kset).collect();
                 let extra: Vec<&Proj> = kset.difference(&rset).collect();
                 let verdict = if missing.is_empty() && extra.is_empty() { "ok" } else { "DIFFERS" };
-                let mut out = format!("[ref-check] row s{seq} r{r} at {at}: kernels {} successors, reference {}: {verdict} ({} only in the reference, {} only in the kernels)\n", kset.len(), rset.len(), missing.len(), extra.len());
+                let mut out = format!("[ref-check] state {id} at {at}: kernels {} successors, reference {}: {verdict} ({} only in the reference, {} only in the kernels)\n", kset.len(), rset.len(), missing.len(), extra.len());
                 for p in missing.iter().take(show) {
                     out += &format!("    only in the REFERENCE (soundness gap): {}\n", brief(p));
                 }
@@ -1750,15 +1730,17 @@ fn main() -> Result<()> {
             let ids = celeste_rust::compiled::ids();
             let dir = std::path::Path::new(&level_dir);
             let erase = prefixes(&erase);
-            let parts: Vec<u32> = row.split(':').map(|s| s.trim().parse()).collect::<Result<_, _>>()?;
-            let [layer, seq, r] = parts[..] else { anyhow::bail!("--row L:S:R") };
+            let parts: Vec<u64> = row.split(':').map(|s| s.trim().parse()).collect::<Result<_, _>>()?;
+            let [layer, r] = parts[..] else { anyhow::bail!("--row L:N") };
+            let layer = layer as u32;
             cfg.check(dir, level)?;
             let engine = celeste_rust::compiled::FrameEngine::new(&cfg, level)?;
-            let (_, f) = frame_files(dir, layer)?.into_iter().find(|(s, _)| *s == seq).ok_or_else(|| anyhow::anyhow!("no file l{layer} s{seq}"))?;
-            anyhow::ensure!(r < f.width(), "row {r} past the file's {}", f.width());
-            let rt2 = f.load_rows(&[r..r + 1], cfg.room, &celeste_rust::storage::marks::Resolver::load(dir, layer)?)?.ok_or_else(|| anyhow::anyhow!("no row"))?;
+            let tree = Tree::open(dir, layer)?;
+            let (states, _) = tree.layer(layer, None, cfg.threads())?;
+            let sk = states.states_iter().nth(r as usize).ok_or_else(|| anyhow::anyhow!("state {r} past frame {layer}'s {}", states.states()))?;
+            let rt2 = tree.row(layer, sk, cfg.room)?;
             let me = project_row(&rt2, &cell_names(&rt2, ids), 0, &erase);
-            println!("[rerun] l{layer} s{seq} r{r} (state {}) at {}:", show_id(f.id_at(r)), where_(f.cell_at(r)));
+            println!("[rerun] l{layer} n{r} (state {}) at {}:", sk.show(), where_(sk.cell(&celeste_rust::storage::GEOMETRY)));
             for (n, v) in &me {
                 println!("    {n} = {v}");
             }
@@ -1803,23 +1785,21 @@ fn main() -> Result<()> {
             // Projections compared EXACTLY (the projection itself as the key).
             let mut real_cells: HashMap<u32, HashMap<Proj, u32>> = Default::default();
             let mut real_vals = Dist::new();
+            let geo = celeste_rust::storage::GEOMETRY;
             let mut real_of = |c: u32, vals: Option<&mut Dist>| -> Result<HashMap<Proj, u32>> {
                 if let Some(m) = real_cells.get(&c) {
                     return Ok(m.clone());
                 }
-                let (Some(real), mut vals) = (real, vals) else { return Ok(HashMap::new()) };
+                let (Some(real_tree), mut vals) = (real_tree.as_ref(), vals) else { return Ok(HashMap::new()) };
                 let mut m: HashMap<Proj, u32> = Default::default();
                 for s in 0..=step {
-                    for (_, f) in frame_files(real, s)? {
-                        for range in f.rows_of_cell(c) {
-                            let Some(rt2) = f.load_rows(&[range], cfg.room, real_tree.as_ref().expect("with --real"))? else { continue };
-                            for r in 0..rt2.width {
-                                let p = project(&rt2, r as u32);
-                                if let (Some(vals), true) = (vals.as_deref_mut(), s == step) {
-                                    tally(vals, &p);
-                                }
-                                m.entry(p).or_insert(s);
+                    for (_, rt2) in real_tree.rows(s, cfg.room, 1 << 20, &|x| x.cell(&geo) == c, 1)? {
+                        for r in 0..rt2.width {
+                            let p = project(&rt2, r as u32);
+                            if let (Some(vals), true) = (vals.as_deref_mut(), s == step) {
+                                tally(vals, &p);
                             }
+                            m.entry(p).or_insert(s);
                         }
                     }
                 }
@@ -1828,21 +1808,17 @@ fn main() -> Result<()> {
             };
             // The samples: the coarse tree's new states at `step` in the cells.
             let (mut total, mut sp_vals, mut co_vals) = (0u64, Dist::new(), Dist::new());
-            let mut chosen: Vec<StateId> = Vec::new();
+            let mut chosen: Vec<Sk> = Vec::new();
             for &want in &wants {
                 let here_real = real_of(want, Some(&mut real_vals))?;
-                for (_, f) in frame_files(coarse, step)? {
-                    for range in f.rows_of_cell(want) {
-                        let lo = range.start;
-                        let Some(rt2) = f.load_rows(&[range], cfg.room, &coarse_tree)? else { continue };
-                        for r in 0..rt2.width {
-                            total += 1;
-                            let p = project(&rt2, r as u32);
-                            let is_real = real.is_some() && here_real.get(&p).is_some_and(|&s| s <= step);
-                            tally(if is_real { &mut co_vals } else { &mut sp_vals }, &p);
-                            if !is_real {
-                                chosen.push(f.id_at(lo + r as u32));
-                            }
+                for (sks, rt2) in coarse_tree.rows(step, cfg.room, 1 << 20, &|x| x.cell(&geo) == want, 1)? {
+                    for r in 0..rt2.width {
+                        total += 1;
+                        let p = project(&rt2, r as u32);
+                        let is_real = real.is_some() && here_real.get(&p).is_some_and(|&s| s <= step);
+                        tally(if is_real { &mut co_vals } else { &mut sp_vals }, &p);
+                        if !is_real {
+                            chosen.push(sks[r]);
                         }
                     }
                 }
@@ -1875,9 +1851,10 @@ fn main() -> Result<()> {
             let n = samples.min(chosen.len());
             for k in 0..n {
                 let (mut id, mut layer) = (chosen[k * chosen.len() / n], step);
-                let (rt2, shape, c, _) = load_row(coarse, id, cfg.room, &coarse_tree)?;
+                let rt2 = coarse_tree.row(layer, id, cfg.room)?;
+                let (shape, _, c) = coarse_tree.state(id)?;
                 let mut cur = project(&rt2, 0);
-                println!("\n[spurious] sample {k}: f{layer} {} shape {shape:016x} {}", show_id(id), where_(c));
+                println!("\n[spurious] sample {k}: f{layer} {} shape {shape:016x} {}", id.show(), where_(c));
                 if real.is_none() {
                     for (name, v) in &cur {
                         println!("    {name} = {v}");
@@ -1890,12 +1867,13 @@ fn main() -> Result<()> {
                     if layer == 0 {
                         break;
                     }
-                    let preds = preds_of(&edges, &coarse_tree, id, layer)?;
+                    let preds = preds_of(&edges, id, layer)?;
                     // Prefer a REAL predecessor: then this step is the first
                     // spurious one.
-                    let mut pick: Option<(StateId, Rt2, Proj, u32, bool)> = None;
+                    let mut pick: Option<(Sk, Rt2, Proj, u32, bool)> = None;
                     for &p in &preds {
-                        let (rt, _, pc, _) = load_row(coarse, p, cfg.room, &coarse_tree)?;
+                        let rt = coarse_tree.row(layer - 1, p, cfg.room)?;
+                        let pc = p.cell(&geo);
                         let pp = project(&rt, 0);
                         let is_real = real.is_some() && real_of(pc, None)?.get(&pp).is_some_and(|&s| s < layer);
                         if is_real || pick.is_none() {
@@ -1915,14 +1893,14 @@ fn main() -> Result<()> {
                         .map(|(nm, v)| format!("{nm}: {} -> {v}", pp.get(nm).map(|s| s.as_str()).unwrap_or("absent")))
                         .collect();
                     if is_real {
-                        println!("  FIRST SPURIOUS STEP f{} {} -> f{layer}: {} ({} preds): {}", layer - 1, show_id(p), where_(pc), preds.len(), changed.join(", "));
+                        println!("  FIRST SPURIOUS STEP f{} {} -> f{layer}: {} ({} preds): {}", layer - 1, p.show(), where_(pc), preds.len(), changed.join(", "));
                         // The whole real predecessor, unprojected: the floors too.
                         let full = project_row(&rt, &cell_names(&rt, ids), 0, &[]);
                         println!("    predecessor (full): {}", full.iter().filter(|(n, _)| !n.contains("hitbox") && !n.contains(".type.") && !n.ends_with(".solids") && !n.contains(".flip.y") && !n.ends_with(".spr") || n.starts_with("spring") || n.starts_with("balloon")).map(|(n, v)| format!("{n}={v}")).collect::<Vec<_>>().join(" "));
                         found = true;
                         break;
                     }
-                    println!("  <- f{:03} {} [{}] ({} preds){}: {}", layer - 1, where_(pc), show_id(p), preds.len(), if real.is_some() { " still spurious" } else { "" }, changed.join(", "));
+                    println!("  <- f{:03} {} [{}] ({} preds){}: {}", layer - 1, where_(pc), p.show(), preds.len(), if real.is_some() { " still spurious" } else { "" }, changed.join(", "));
                     chain.push((layer - 1, pc, rt.row_keys[0]));
                     id = p;
                     layer -= 1;
@@ -2014,17 +1992,11 @@ fn main() -> Result<()> {
                 ubools: Vec<u64>,
             }
             let mut by_shape: std::collections::BTreeMap<u64, S> = Default::default();
-            for (_, p) in frame_paths(dir, frame)? {
-                let ff = celeste_rust::search::checkpoint::FrameFile::open(&p)?;
-                let width = ff.width();
-                // The whole file in 1M-row pieces, or one cell's rows.
-                let pieces: Vec<std::ops::Range<u32>> = match only_cell {
-                    Some(c) => ff.rows_of_cell(c),
-                    None => (0..width).step_by(1 << 20).map(|lo| lo..(lo + (1 << 20)).min(width)).collect(),
-                };
-                for piece in pieces {
-                    let Some(rt2) = ff.load_rows(&[piece], cfg.room, &tree)? else { break };
-                    let st = by_shape.entry(ff.shape_hash()).or_insert_with(|| {
+            let geo = celeste_rust::storage::GEOMETRY;
+            // The frame in 1M-row pieces, or one cell's rows.
+            for (_, rt2) in tree.rows(frame, cfg.room, 1 << 20, &|x| only_cell.is_none_or(|c| x.cell(&geo) == c), cfg.threads())? {
+                {
+                    let st = by_shape.entry(rt2.shape_hash).or_insert_with(|| {
                         let names = cell_names(&rt2, ids);
                         S { rows: 0, cols: vec![Default::default(); rt2.cols.len()], varying: vec![false; rt2.cols.len()], names, spd: Default::default(), ivals: vec![0; rt2.cols.len()], ubools: vec![0; rt2.cols.len()] }
                     });
@@ -2092,18 +2064,15 @@ fn main() -> Result<()> {
                 println!("step | new | distinct states | speed pairs | inner (no speed)");
                 for s in 0..=frame {
                     let mut new = 0u64;
-                    for (_, f) in frame_files(dir, s)? {
-                        for range in f.rows_of_cell(want) {
-                            let Some(rt2) = f.load_rows(&[range], cfg.room, &tree)? else { continue };
-                            let names = cell_names(&rt2, ids);
-                            for r in 0..rt2.width {
-                                let mut p = project_row(&rt2, &names, r as u32, &erase);
-                                new += 1;
-                                all.insert(p.clone());
-                                let sp: Proj = ["spd.x", "spd.y"].iter().map(|k| (k.to_string(), p.remove(*k).unwrap_or_default())).collect();
-                                spd.insert(sp);
-                                inner.insert(p);
-                            }
+                    for (_, rt2) in tree.rows(s, cfg.room, 1 << 20, &|x| x.cell(&geo) == want, cfg.threads())? {
+                        let names = cell_names(&rt2, ids);
+                        for r in 0..rt2.width {
+                            let mut p = project_row(&rt2, &names, r as u32, &erase);
+                            new += 1;
+                            all.insert(p.clone());
+                            let sp: Proj = ["spd.x", "spd.y"].iter().map(|k| (k.to_string(), p.remove(*k).unwrap_or_default())).collect();
+                            spd.insert(sp);
+                            inner.insert(p);
                         }
                     }
                     if new > 0 && first.is_none() {
@@ -2168,11 +2137,7 @@ fn main() -> Result<()> {
             let level = spec;
             anyhow::ensure!(level.is_some() || keyed.iter().all(|k| k.is_none()), "keyed trajectory lines need --spec");
             let space = match &tree {
-                Some(t) => {
-                    let t = std::path::Path::new(t);
-                    let last = (0..).take_while(|f| t.join("frames").join(format!("f{f:03}")).is_dir()).last().unwrap_or(0);
-                    celeste_rust::storage::meta::tree_keys(t, last)?
-                }
+                Some(t) => tree_of(std::path::Path::new(t))?.space,
                 None => {
                     anyhow::ensure!(keyed.iter().all(|k| k.is_none()), "keyed trajectory lines need --tree (the tree their keys are in)");
                     Default::default()
@@ -2261,26 +2226,20 @@ fn main() -> Result<()> {
             let lvl = level;
             cfg.check(dir, lvl)?;
             let bytes = celeste_rust::concrete::read_inputs(&inputs)?;
-            // (key, cell) -> (layer, seq, row): where the tree first has it.
-            let mut at: rustc_hash::FxHashMap<(u64, u64, u32), (u32, u32, u32)> = Default::default();
-            let mut layers = 0u32;
-            while dir.join("frames").join(format!("f{:03}", layers)).exists() {
-                for (seq, file) in frame_files(dir, layers)? {
-                    if let Some(rt2) = file.load_all(cfg.room, &tree)? {
-                        let b = Block::from_rt2(rt2);
-                        let cells = b.positions()?;
-                        for (r, (k, &c)) in b.keys().iter().zip(&cells).enumerate() {
-                            at.entry((k.0, k.1, c)).or_insert((layers, seq, r as u32));
-                        }
-                    }
+            // (key, cell) -> (layer, state): where the tree first has it.
+            let mut at: rustc_hash::FxHashMap<(u64, u64, u32), (u32, Sk)> = Default::default();
+            let geo = celeste_rust::storage::GEOMETRY;
+            let layers = tree.last + 1;
+            for f in 0..layers {
+                for sk in tree.layer(f, None, cfg.threads())?.0.states_iter() {
+                    at.entry((sk.key.0, sk.key.1, sk.cell(&geo))).or_insert((f, sk));
                 }
-                layers += 1;
             }
-            let space = celeste_rust::storage::meta::tree_keys(dir, layers.saturating_sub(1))?;
+            let space = &tree.space;
             eprintln!("[follow] {} rows in {layers} layers, {} inputs", at.len(), bytes.len());
             let mut eng = RefEngine::new(&cfg)?;
             let mut states = vec![eng.initial()?];
-            let mut parent: Option<(u32, u32, u32)> = None;
+            let mut parent: Option<(u32, Sk)> = None;
             for (f, &byte) in bytes.iter().enumerate() {
                 let f = f as u32 + 1;
                 let mut next = Vec::new();
@@ -2295,7 +2254,7 @@ fn main() -> Result<()> {
                     if wins_of(block.rt2(), &cfg)?.iter().any(|&w| w) {
                         won = true;
                     }
-                    let (_, keys, cells) = widened_keys(block, lvl, &space)?;
+                    let (_, keys, cells) = widened_keys(block, lvl, space)?;
                     if let Some(&loc) = keys[0].and_then(|k| at.get(&(k.0, k.1, cells[0]))) {
                         found = Some(loc);
                     }
@@ -2303,10 +2262,9 @@ fn main() -> Result<()> {
                 // A win is not stored in the tree: check the kernels make it.
                 let Some(loc) = found.filter(|_| !won) else {
                     println!("[follow] f{f} input {byte}: {} ({} concrete leaves)", if won { "WIN" } else { "NOT IN THE TREE" }, next.len());
-                    let (layer, seq, r) = parent.ok_or_else(|| anyhow::anyhow!("the first step is already missing"))?;
-                    let (_, file) = frame_files(dir, layer)?.into_iter().find(|(s, _)| *s == seq).ok_or_else(|| anyhow::anyhow!("no file l{layer} s{seq}"))?;
-                    let rt2 = file.load_rows(&[r..r + 1], cfg.room, &tree)?.ok_or_else(|| anyhow::anyhow!("no row"))?;
-                    println!("    parent row (layer {layer} s{seq} r{r}, state {}): {}", show_id(file.id_at(r)), brief(&project_onto(&mut rt2.clone_block(), lvl)[0]));
+                    let (layer, sk) = parent.ok_or_else(|| anyhow::anyhow!("the first step is already missing"))?;
+                    let rt2 = tree.row(layer, sk, cfg.room)?;
+                    println!("    parent row (layer {layer}, state {}): {}", sk.show(), brief(&project_onto(&mut rt2.clone_block(), lvl)[0]));
                     for s in &states {
                         println!("    concrete parent: {}", brief(&project_all(s)[0]));
                     }
@@ -2339,7 +2297,7 @@ fn main() -> Result<()> {
                     }
                     return Ok(());
                 };
-                println!("[follow] f{f} input {byte}: in the tree at layer {} (s{} r{})", loc.0, loc.1, loc.2);
+                println!("[follow] f{f} input {byte}: in the tree at layer {} (state {})", loc.0, loc.1.show());
                 parent = Some(loc);
                 states = next.into_iter().map(Block::into_rt2).collect();
             }

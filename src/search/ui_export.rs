@@ -50,11 +50,11 @@ use crate::search::pos_graph::cell_xy;
 #[derive(Serialize, Clone, Debug)]
 pub struct FwdLine {
     pub f: u32,
-    pub in_blocks: u64,
+    pub in_entries: u64,
     pub in_lanes: u64,
     pub raw: u64,
     pub kept: u64,
-    pub out_blocks: u64,
+    pub out_entries: u64,
     pub out_lanes: u64,
     pub visited: u64,
     pub emit_ms: u64,
@@ -199,7 +199,7 @@ fn read_forward_stats(dir: &Path) -> Result<Vec<FwdLine>> {
     let mut lines = text.lines();
     let header: Vec<&str> = lines.next().unwrap_or("").split('\t').collect();
     let col = |name: &str| header.iter().position(|h| *h == name).with_context(|| format!("{}: no column {name:?}", path.display()));
-    let c: Vec<usize> = ["frame", "blocks_in", "lanes_in", "lanes_raw", "lanes_kept", "blocks_out", "lanes_out", "visited", "wave_ms", "wave_idle_pct", "layer_ms", "ckpt_ms", "pos_ms", "total_ms", "rss_end_gb"]
+    let c: Vec<usize> = ["frame", "entries_in", "lanes_in", "lanes_raw", "lanes_kept", "entries_out", "lanes_out", "visited", "wave_ms", "wave_idle_pct", "layer_ms", "ckpt_ms", "pos_ms", "total_ms", "rss_end_gb"]
         .iter()
         .map(|n| col(n))
         .collect::<Result<_>>()?;
@@ -214,11 +214,11 @@ fn read_forward_stats(dir: &Path) -> Result<Vec<FwdLine>> {
             f,
             FwdLine {
                 f,
-                in_blocks: n(1)?,
+                in_entries: n(1)?,
                 in_lanes: n(2)?,
                 raw: n(3)?,
                 kept: n(4)?,
-                out_blocks: n(5)?,
+                out_entries: n(5)?,
                 out_lanes: n(6)?,
                 visited: n(7)?,
                 emit_ms: n(8)?,
@@ -378,50 +378,28 @@ struct FrameCounts {
     marked: Vec<FxHashMap<u32, u32>>,
 }
 
-fn frame_counts(dir: &Path, f: u32, marks: Option<(&MarkTable, &crate::storage::marks::Resolver)>, nsets: usize) -> Result<FrameCounts> {
-    use crate::storage::decode::TreeKeys;
+fn frame_counts(tree: &crate::storage::layer::Tree, f: u32, marks: Option<&MarkTable>, nsets: usize) -> Result<FrameCounts> {
+    let geo = crate::storage::GEOMETRY;
     let mut out = FrameCounts { cells: FxHashMap::default(), wins: FxHashMap::default(), marked: vec![FxHashMap::default(); nsets] };
-    let files = match crate::frame::frame_files(dir, f) {
-        Ok(v) => v,
-        Err(_) if !dir.join("frames").join(format!("f{f:03}")).exists() => Vec::new(),
-        Err(e) => return Err(e).with_context(|| format!("{} frame {f}", dir.display())),
-    };
-    let mut per_set = vec![0u32; nsets];
-    for (_, file) in files {
-        for (cell, n) in file.cell_counts() {
-            *out.cells.entry(cell).or_default() += n;
-        }
-        for &(_, cell) in file.win_rows() {
-            *out.wins.entry(cell).or_default() += 1;
-        }
-        let Some((t, tree)) = marks else { continue };
-        let shape = file.shape_hash();
-        // Rows in id order: a cell's rows come in short runs; look a cell up
-        // once a run, and skip an unmarked cell's rows without their keys.
-        let cells = file.row_cells();
-        let mut start = 0usize;
-        while start < cells.len() {
-            let cell = cells[start];
-            let end = start + cells[start..].iter().take_while(|&&c| c == cell).count();
-            let (lo, hi) = (start as u32, end as u32);
-            start = end;
+    let (layer, wins) = tree.layer(f, None, 1).with_context(|| format!("{} frame {f}", tree.dir.display()))?;
+    for w in wins {
+        *out.wins.entry(w.cell(&geo)).or_default() += 1;
+    }
+    for (region, key, mask) in layer.iter() {
+        let shape = tree.shape_of(region)?;
+        let slot = region % geo.slots;
+        for local in crate::storage::layer::bits(mask) {
+            let cell = geo.cell(slot, local);
+            *out.cells.entry(cell).or_default() += 1;
+            let Some(t) = marks else { continue };
             if !t.cells.contains(&(shape, cell)) {
                 continue;
             }
-            let shard = &t.shards[mark_shard(shape, cell)];
-            per_set.fill(0);
-            for r in lo..hi {
-                if let Some(&m) = shard.get(&(shape, cell, tree.key(file.id_at(r), shape)?)) {
-                    let mut bits = m;
-                    while bits != 0 {
-                        per_set[bits.trailing_zeros() as usize] += 1;
-                        bits &= bits - 1;
-                    }
-                }
-            }
-            for (s, &n) in per_set.iter().enumerate() {
-                if n > 0 {
-                    *out.marked[s].entry(cell).or_default() += n;
+            if let Some(&m) = t.shards[mark_shard(shape, cell)].get(&(shape, cell, key)) {
+                let mut bits = m;
+                while bits != 0 {
+                    *out.marked[bits.trailing_zeros() as usize].entry(cell).or_default() += 1;
+                    bits &= bits - 1;
                 }
             }
         }
@@ -439,15 +417,7 @@ fn sparse(m: FxHashMap<u32, u32>) -> Sparse {
 /// pass, the sets of `marks` split by layer (`[k]`: per frame, set `k`'s
 /// marked states per cell). Frames in parallel.
 fn read_tree(dir: &Path, marks: Option<&MarkTable>, nsets: usize) -> Result<(LevelData, Vec<Vec<Sparse>>)> {
-    let fdir = dir.join("frames");
-    let mut nframes = 0u32;
-    for e in std::fs::read_dir(&fdir).with_context(|| format!("listing {}", fdir.display()))? {
-        let name = e?.file_name();
-        let name = name.to_string_lossy();
-        if let Some(n) = name.strip_prefix('f').and_then(|s| s.parse::<u32>().ok()) {
-            nframes = nframes.max(n + 1);
-        }
-    }
+    let nframes = crate::storage::layer::last_frame(dir).map_or(0, |l| l + 1);
     // The pos graph, to draw wins where the player left from (below). An
     // absent graph draws wins in place; an unloadable one is an error.
     let graph_path = dir.join("posgraph.bin");
@@ -458,13 +428,14 @@ fn read_tree(dir: &Path, marks: Option<&MarkTable>, nsets: usize) -> Result<(Lev
     };
     // The largest (latest) frames first, so the tail is small ones.
     let n = nframes as usize;
-    // A marked state's key: its id's entry in the storage metadata.
-    let tree = match marks {
-        Some(_) if n > 0 => Some(crate::storage::marks::Resolver::load(dir, n as u32 - 1)?),
-        _ => None,
+    let tree = match n {
+        0 => None,
+        _ => Some(crate::storage::layer::Tree::open(dir, n as u32 - 1)?),
     };
-    let marks = marks.zip(tree.as_ref());
-    let mut counts = crate::par::Pool::per_core().map(n, |i| frame_counts(dir, (n - 1 - i) as u32, marks, nsets))?;
+    let mut counts = match &tree {
+        Some(tree) => crate::par::Pool::per_core().map(n, |i| frame_counts(tree, (n - 1 - i) as u32, marks, nsets))?,
+        None => Vec::new(),
+    };
     counts.reverse();
     let mut frames: Vec<(Sparse, Sparse)> = Vec::with_capacity(n);
     let mut layers: Vec<Vec<Sparse>> = vec![Vec::with_capacity(n); nsets];
