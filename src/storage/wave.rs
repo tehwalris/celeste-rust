@@ -63,6 +63,7 @@ impl StateLayers {
 
     /// Every state of `layer` (a frame's, in `visited`) first reached at `frame`.
     pub fn set_layer(&mut self, visited: &VisitedSet, layer: &Layer, frame: u32) -> Result<()> {
+        // (The layer is merged into the visited set already.)
         for (region, key, mask) in layer.iter() {
             let e = visited.table(region).and_then(|t| t.find(key)).ok_or_else(|| anyhow!("a state of r{region} the visited set lacks"))?;
             for local in bits(mask) {
@@ -117,16 +118,17 @@ struct UnitSpec {
 }
 
 /// Cut each part's entries into units of about `unit` lanes, never across
-/// a shape.
+/// a shape (`entries`: numbered over the part's set, `RegionSet::entry_starts`).
 fn units_of(parts: &[Part], unit: usize) -> Vec<UnitSpec> {
     let slots = GEOMETRY.slots;
     let mut out = Vec::new();
     for (pi, p) in parts.iter().enumerate() {
         let mut cur: Option<(u32, usize, u32)> = None;
-        for (region, rg) in p.layer.regions() {
+        let mut e = 0usize;
+        for (region, t) in p.layer.set.tables() {
             let shape = region / slots;
-            for e in rg {
-                let n = p.layer.masks()[e].count_ones();
+            for &m in t.masks() {
+                let n = m.count_ones();
                 cur = match cur {
                     Some((sh, a, l)) if sh == shape && (l as usize) < unit => Some((sh, a, l + n)),
                     Some((_, a, l)) => {
@@ -135,10 +137,11 @@ fn units_of(parts: &[Part], unit: usize) -> Vec<UnitSpec> {
                     }
                     None => Some((shape, e, n)),
                 };
+                e += 1;
             }
         }
         if let Some((_, a, l)) = cur {
-            out.push(UnitSpec { part: pi as u32, entries: a..p.layer.entries(), lanes: l });
+            out.push(UnitSpec { part: pi as u32, entries: a..e, lanes: l });
         }
     }
     out
@@ -216,21 +219,24 @@ struct UnitScratch {
 /// (`frame::not_expanded`, decided here for every frontier, fresh or
 /// resumed), the rest through the engine into the sink.
 #[allow(clippy::too_many_arguments)]
-fn run_unit(engine: &dyn FrameStep, u: u32, spec: &UnitSpec, part: Part, shapes: &[u64], sink: &mut UnitSink, sc: &mut UnitScratch, layer_frame: u32, ceiling: Option<u32>, s: &crate::settings::Settings) -> Result<()> {
+fn run_unit(engine: &dyn FrameStep, u: u32, spec: &UnitSpec, part: Part, starts: &[usize], shapes: &[u64], sink: &mut UnitSink, sc: &mut UnitScratch, layer_frame: u32, ceiling: Option<u32>, s: &crate::settings::Settings) -> Result<()> {
     let geo = GEOMETRY;
     let t_dec = phases::start(s.diag.phases);
     sink.begin(u, part.old);
     sc.rows.clear();
     sc.cells.clear();
     let layer = part.layer;
-    let mut ri = layer.region_index(spec.entries.start);
-    let (mut region, mut rg) = layer.region_at(ri);
-    for e in spec.entries.clone() {
-        while e >= rg.end {
-            ri += 1;
-            (region, rg) = layer.region_at(ri);
+    let tables = layer.set.tables();
+    let (mut ti, mut local) = layer.set.locate(starts, spec.entries.start)?;
+    let mut region = tables[ti].0;
+    for _ in spec.entries.clone() {
+        while local as usize >= tables[ti].1.len() {
+            (ti, local) = (ti + 1, 0);
+            region = tables[ti].0;
         }
-        let (key, mask) = layer.entry(e);
+        let t = &tables[ti].1;
+        let (key, mask) = (t.key(local), t.mask(local));
+        local += 1;
         let si = sink.push_source(region, key);
         for local in bits(mask) {
             let cell = geo.cell(region % geo.slots, local);
@@ -292,12 +298,12 @@ pub fn run_wave(engine: &dyn FrameStep, parts: &[Part], cx: WaveCtx) -> Result<W
     ensure!(raised.is_none() || layers.is_some(), "frame {frame}: a raise needs the tree's layers");
     ensure!(raised.is_some() || parts.iter().all(|p| !p.old), "frame {frame}: the tree's own sources re-expanded outside a raise");
     let units = units_of(parts, unit_lanes(st.lanes_in as u64));
+    let starts: Vec<Vec<usize>> = parts.iter().map(|p| p.layer.set.entry_starts()).collect();
     let slices = slices_of(&units);
     let routes = Routes::default();
     let prov = Provisional::default();
-    // The routes' regions' tables are taken out of the visited set until the
-    // frame's end; the workers' transfer tables are shared with the gather.
-    let tables: Vec<Option<Box<super::visited::RegionTable>>> = std::mem::take(visited.tables_mut_vec());
+    // The visited set is read only until the frame's end; the workers'
+    // transfer tables are shared with the gather.
     let xtabs: Vec<std::sync::RwLock<Vec<crate::search::arc_edges::Pair>>> = (0..workers).map(|_| Default::default()).collect();
     let mut sinks: Vec<UnitSink> = (0..workers)
         .map(|w| UnitSink::new(visited, &routes, skeletons, &prov, filters, frame, level, w as u32, &xtabs[w], record, pos.is_some(), raised.map(|r| RaiseCtx { raised: r }), s))
@@ -314,7 +320,7 @@ pub fn run_wave(engine: &dyn FrameStep, parts: &[Part], cx: WaveCtx) -> Result<W
         upto: slices.iter().map(|_| (0..workers).map(|_| AtomicUsize::new(0)).collect()).collect(),
         chunks: slices.iter().map(|_| Default::default()).collect(),
         gathered: AtomicUsize::new(0),
-        gather: std::sync::Mutex::new(Gather { tables, xfers, merged: vec![0; workers], remaps: vec![Vec::new(); workers], routes: 0 }),
+        gather: std::sync::Mutex::new(Gather { xfers, merged: vec![0; workers], remaps: vec![Vec::new(); workers], routes: 0 }),
         states: Default::default(),
         jobs: Default::default(),
         jobs_left: AtomicUsize::new(0),
@@ -338,7 +344,7 @@ pub fn run_wave(engine: &dyn FrameStep, parts: &[Part], cx: WaveCtx) -> Result<W
             .iter_mut()
             .zip(scratch.iter_mut())
             .map(|(sink, sc)| {
-                let (units, pipe, slice_of, slices, routes, shapes) = (&units, &pipe, &slice_of, &slices, &routes, &shapes);
+                let (units, pipe, slice_of, slices, routes, shapes, starts) = (&units, &pipe, &slice_of, &slices, &routes, &shapes, &starts);
                 let visited: &VisitedSet = visited;
                 std::thread::Builder::new().stack_size(WORKER_STACK).spawn_scoped(scope, move || -> Result<(std::time::Duration, std::time::Duration)> {
                     crate::compiled::asm_kernel::set_thread_stack(WORKER_STACK);
@@ -366,7 +372,10 @@ pub fn run_wave(engine: &dyn FrameStep, parts: &[Part], cx: WaveCtx) -> Result<W
                             let tp = phases::start(s.diag.phases);
                             let rcx = RegionCtx { frame, record, remaps: &job.remaps, layers: raised.and(layers) };
                             let cs: Vec<&Chunk> = job.chunks.iter().collect();
-                            let r = super::route::run_route(&mut job.state.lock().expect("a route"), job.slice, &cs, &rcx, sc);
+                            let mut route = job.state.lock().expect("a route");
+                            let vt = route.region.and_then(|r| visited.table(r));
+                            let r = super::route::run_route(&mut route, vt, job.slice, &cs, &rcx, sc);
+                            drop(route);
                             if s.diag.phases {
                                 pipe.inflight.fetch_sub(job.chunks.iter().map(Chunk::alloc_bytes).sum(), Ordering::AcqRel);
                             }
@@ -388,7 +397,7 @@ pub fn run_wave(engine: &dyn FrameStep, parts: &[Part], cx: WaveCtx) -> Result<W
                             }
                             let t = Instant::now();
                             let spec = &units[u];
-                            run_unit(engine, u as u32, spec, parts[spec.part as usize], shapes, sink, &mut us, frame - 1, ceiling, s)?;
+                            run_unit(engine, u as u32, spec, parts[spec.part as usize], &starts[spec.part as usize], shapes, sink, &mut us, frame - 1, ceiling, s)?;
                             let k = slice_of[u] as usize;
                             pipe.upto[k][sink.worker as usize].fetch_max(sink.xfers_met(), Ordering::AcqRel);
                             if s.diag.phases {
@@ -448,7 +457,6 @@ pub fn run_wave(engine: &dyn FrameStep, parts: &[Part], cx: WaveCtx) -> Result<W
     if s.diag.phases {
         let gb = |b: usize| b as f64 / 1e9;
         let routes = pipe.states.read().expect("the routes");
-        let tables: usize = routes.iter().map(|r| r.lock().expect("a route").table.alloc_bytes()).sum();
         let rest = routes.iter().fold([0usize; 3], |a, r| {
             let b = r.lock().expect("a route").alloc_bytes();
             [a[0] + b[0], a[1] + b[1], a[2] + b[2]]
@@ -463,10 +471,11 @@ pub fn run_wave(engine: &dyn FrameStep, parts: &[Part], cx: WaveCtx) -> Result<W
             [a[0] + b[0], a[1] + b[1], a[2] + b[2], a[3] + b[3]]
         });
         eprintln!(
-            "[wavemem] f{frame}: frontier {:.3} GB ({} entries), route tables {:.3}, routes' new-cell slots {:.3}, provisional bundles {:.3}, segments {:.3}, chunks in flight at most {:.3}, sinks {:.3} (bundles {:.3}, drop notes {:.3}, pos pairs {:.3}, rest {:.3}), region scratch {:.3} (bundles {:.3}, encoder {:.3}, raw {:.3}, rest {:.3}) GB; anon {:.2} GB",
+            "[wavemem] f{frame}: frontier {:.3} GB ({} entries), visited {:.3} GB ({} entries), the next layer's tables {:.3}, provisional bundles {:.3}, segments {:.3}, chunks in flight at most {:.3}, sinks {:.3} (bundles {:.3}, drop notes {:.3}, pos pairs {:.3}, rest {:.3}), region scratch {:.3} (bundles {:.3}, encoder {:.3}, raw {:.3}, rest {:.3}) GB; anon {:.2} GB",
             gb(st.frontier_bytes),
             st.entries_in,
-            gb(tables),
+            gb(visited.alloc_bytes()),
+            visited.entries(),
             gb(rest[0]),
             gb(rest[1]),
             gb(rest[2]),
@@ -497,7 +506,7 @@ pub fn run_wave(engine: &dyn FrameStep, parts: &[Part], cx: WaveCtx) -> Result<W
     st.units = units.len();
     drop(sinks);
     let Pipe { gather, states, .. } = pipe;
-    let Gather { mut tables, xfers, .. } = gather.into_inner().expect("the gather");
+    let Gather { xfers, .. } = gather.into_inner().expect("the gather");
     let mut states: Vec<RouteState> = states
         .into_inner()
         .expect("the routes")
@@ -521,10 +530,7 @@ pub fn run_wave(engine: &dyn FrameStep, parts: &[Part], cx: WaveCtx) -> Result<W
         let i = visited.add_shape(h);
         shapes_numbered.push((i, h));
     }
-    // (`add_shape` sized the visited set's emptied table list for them.)
-    tables.resize_with(visited.tables_mut_vec().len().max(tables.len()), || None);
     let regions: Vec<Option<u32>> = states.iter().map(|r| visited.region(r.shape, r.slot)).collect();
-    st.fresh_events = states.iter().map(|r| r.fresh_events).sum();
     let inserted: u64 = states.iter().map(|r| r.new_states).sum();
     // Per route (in parallel): sealed - its new states listed by key.
     type Sealed = super::route::Sealed;
@@ -559,21 +565,21 @@ pub fn run_wave(engine: &dyn FrameStep, parts: &[Part], cx: WaveCtx) -> Result<W
             all.into_iter().map(|x| x.1).collect()
         })
     };
-    // THE NEXT LAYER: the routes' new states by region.
+    // THE NEXT LAYER: the routes' new states, frozen, by region.
     let mut new: Vec<Sealed> = Vec::new();
     for x in sealed {
         if let Some(sl) = x? {
-            if !sl.keys.is_empty() {
+            if !sl.table.is_empty() {
                 new.push(sl);
             }
         }
     }
     new.sort_unstable_by_key(|x| x.region);
-    let mut next = Layer::with_capacity(new.iter().map(|x| x.keys.len()).sum());
+    let mut next = Layer::default();
     for sl in new {
-        next.push_region(sl.region, &sl.keys, &sl.masks)?;
+        next.set.push(sl.region, sl.table)?;
     }
-    let mut shapes_in: Vec<u32> = next.regions().map(|(r, _)| r / GEOMETRY.slots).collect();
+    let mut shapes_in: Vec<u32> = next.set.tables().iter().map(|(r, _)| r / GEOMETRY.slots).collect();
     shapes_in.dedup();
     for si in shapes_in {
         let h = visited.shape_hash(si);
@@ -581,7 +587,10 @@ pub fn run_wave(engine: &dyn FrameStep, parts: &[Part], cx: WaveCtx) -> Result<W
     }
     ensure!(next.states() == inserted, "frame {frame}: the region phase inserted {inserted} new states, the next layer lists {}", next.states());
     let wins = layer_wins(visited, &next, frame, level, s)?;
-    // The tables back into the visited set; the routes' segments into the file.
+    // The new states into the visited set (they are new: none held).
+    let held = visited.merge(&next.set, s.threads())?;
+    ensure!(held == 0, "frame {frame}: {held} of the next layer's states the visited set held already");
+    // The routes' segments into the file.
     let mut segs = Vec::new();
     let mut src_index: Vec<(u32, Vec<u32>)> = Vec::new();
     for (r, region) in states.into_iter().zip(&regions) {
@@ -593,9 +602,7 @@ pub fn run_wave(engine: &dyn FrameStep, parts: &[Part], cx: WaveCtx) -> Result<W
             src_index.push((region, r.sources.into_iter().collect()));
         }
         segs.extend(r.segs.into_iter().map(|g| g.1));
-        tables[region as usize] = Some(r.table);
     }
-    *visited.tables_mut_vec() = tables;
     st.lanes_kept = next.states() as usize;
     if let Some(dir) = edges_dir {
         xfers.flush(dir)?;
@@ -635,31 +642,35 @@ const WIN_CHUNK: u32 = 1 << 12;
 /// position its cell.
 fn layer_wins(visited: &VisitedSet, next: &Layer, frame: u32, level: crate::abstraction::Level, s: &crate::settings::Settings) -> Result<Vec<(u32, u64)>> {
     let geo = GEOMETRY;
-    let mut chunks: Vec<(u32, std::ops::Range<usize>)> = Vec::new();
-    for (region, rg) in next.regions() {
-        let (mut a, mut n) = (rg.start, 0u32);
-        for e in rg.clone() {
-            n += next.masks()[e].count_ones();
+    let tables = next.set.tables();
+    let starts = next.set.entry_starts();
+    // Chunks of a table's entries: (table, entries).
+    let mut chunks: Vec<(usize, std::ops::Range<u32>)> = Vec::new();
+    for (ti, (_, t)) in tables.iter().enumerate() {
+        let (mut a, mut n) = (0u32, 0u32);
+        for (e, &m) in t.masks().iter().enumerate() {
+            n += m.count_ones();
             if n >= WIN_CHUNK {
-                chunks.push((region, a..e + 1));
-                (a, n) = (e + 1, 0);
+                chunks.push((ti, a..e as u32 + 1));
+                (a, n) = (e as u32 + 1, 0);
             }
         }
-        if a < rg.end {
-            chunks.push((region, a..rg.end));
+        if (a as usize) < t.len() {
+            chunks.push((ti, a..t.len() as u32));
         }
     }
-    let parts = par_map(&chunks, s.threads(), |(region, rg)| -> Result<Vec<(u32, u64)>> {
+    let parts = par_map(&chunks, s.threads(), |(ti, rg)| -> Result<Vec<(u32, u64)>> {
+        let (region, t) = (tables[*ti].0, &tables[*ti].1);
         let shape = visited.shape_hash(region / geo.slots);
         let skel = next.skeletons.get(&shape).ok_or_else(|| anyhow!("no skeleton of shape {shape:016x}"))?;
         let slot = region % geo.slots;
         let mut rows: Vec<(Key, u32)> = Vec::with_capacity(WIN_CHUNK as usize + 64);
         let mut at: Vec<(u32, u32)> = Vec::with_capacity(WIN_CHUNK as usize + 64);
         for e in rg.clone() {
-            let (key, mask) = next.entry(e);
+            let (key, mask) = (t.key(e), t.mask(e));
             for local in bits(mask) {
                 rows.push((key, geo.cell(slot, local)));
-                at.push((e as u32, local));
+                at.push((starts[*ti] as u32 + e, local));
             }
         }
         let rt2 = super::decode::decode_rows(&visited.keys, skel, &rows)?;
@@ -696,11 +707,9 @@ struct Job {
     remaps: std::sync::Arc<Vec<Vec<u32>>>,
 }
 
-/// What the gather owns: the regions' tables not yet given to a route,
-/// the global transfer table, per worker its merged length and its ids'
-/// global ones, the routes made so far.
+/// What the gather owns: the global transfer table, per worker its merged
+/// length and its ids' global ones, the routes made so far.
 struct Gather<'a> {
-    tables: Vec<Option<Box<super::visited::RegionTable>>>,
     xfers: &'a mut XferTable,
     merged: Vec<usize>,
     remaps: Vec<Vec<u32>>,
@@ -753,7 +762,7 @@ impl Pipe<'_> {
     /// thread at a time): its transfers' global ids - each worker's pairs
     /// first met in it, its table's new pairs up to its length after its
     /// units of the slice (`upto`): the slice's pairs not merged before, a
-    /// function of the slice - the new routes with their regions' tables,
+    /// function of the slice - the new routes with their regions,
     /// its chunks by route as jobs.
     fn gather_ready(&self, n_slices: usize, routes: &Routes, visited: &VisitedSet) -> Result<()> {
         let mut g = self.gather.lock().expect("the gather");
@@ -778,8 +787,7 @@ impl Pipe<'_> {
                 let mut states = self.states.write().expect("the routes");
                 for (shape, slot) in routes.list().into_iter().skip(g.routes) {
                     let region = visited.region(shape, slot);
-                    let table = region.and_then(|r| g.tables.get_mut(r as usize).and_then(Option::take));
-                    states.push(std::sync::Arc::new(std::sync::Mutex::new(RouteState::new(shape, slot, region, table))));
+                    states.push(std::sync::Arc::new(std::sync::Mutex::new(RouteState::new(shape, slot, region))));
                 }
                 g.routes = states.len();
             }
@@ -820,7 +828,7 @@ impl Pipe<'_> {
 /// packed key. The dictionaries then are a function of the frame's new
 /// states.
 fn finalize_keys(visited: &mut VisitedSet, states: &[RouteState], prov: &Provisional, adds: &mut KeyAdditions) -> FxHashMap<Key, Key> {
-    let mut keys: Vec<Key> = states.iter().flat_map(|r| r.table.keys_from(r.start).iter().copied().filter(|&k| is_provisional(k))).collect();
+    let mut keys: Vec<Key> = states.iter().flat_map(|r| r.next.iter().map(|x| x.0).filter(|&k| is_provisional(k))).collect();
     keys.sort_unstable();
     keys.dedup();
     if keys.is_empty() {
@@ -942,17 +950,11 @@ pub fn seed(visited: &mut VisitedSet, blocks: &[Block], level: crate::abstractio
                 }
             }
         }
-        let t = visited.table_mut(region);
-        for (&k, &m) in keys.iter().zip(&masks) {
-            let e = match t.find(k) {
-                Some(e) => e,
-                None => t.push_key(geo.words, k),
-            };
-            t.or_cells(e, m);
-        }
         next.push_region(region, &keys, &masks)?;
         i = j;
     }
+    let held = visited.merge(&next.set, s.threads())?;
+    ensure!(held == 0, "frame 0 into a visited set that held {held} of its states");
     for (h, rec) in skels {
         let (cart, cache) = (canon[0].cart.clone(), canon[0].cache.clone());
         next.skeletons.insert(h, std::sync::Arc::new(rec.rt2(cart, cache)));

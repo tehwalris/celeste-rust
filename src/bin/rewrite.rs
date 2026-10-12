@@ -1157,11 +1157,16 @@ fn main() -> Result<()> {
             let t = std::time::Instant::now();
             let st = celeste_rust::frame::ForwardState::at(&dir, frame, true, level, &cfg)?;
             eprintln!(
-                "[bench] kernels built in {t_kernels:.2} s; f{frame} loaded in {:.2} s: {} lanes in {} entries, visited {} states; {} threads; rss {:.2} GB",
+                "[bench] kernels built in {t_kernels:.2} s; f{frame} loaded in {:.2} s: {} lanes in {} entries ({:.3} GB, {:.2} B a state), visited {} states in {} entries ({:.3} GB, {:.2} B a state); {} threads; rss {:.2} GB",
                 t.elapsed().as_secs_f64(),
                 st.frontier().states(),
                 st.frontier().entries(),
+                st.frontier().alloc_bytes() as f64 / 1e9,
+                st.frontier().alloc_bytes() as f64 / st.frontier().states().max(1) as f64,
                 st.visited_len(),
+                st.visited().entries(),
+                st.visited().alloc_bytes() as f64 / 1e9,
+                st.visited().alloc_bytes() as f64 / st.visited_len().max(1) as f64,
                 cfg.threads(),
                 celeste_rust::metrics::current_rss_gb()
             );
