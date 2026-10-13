@@ -546,3 +546,18 @@ the refilled dashes, and runs the corridor and the exit chamber to f164.
 That is the room's evident design (strip -> balloon -> shaft), and it
 needs the second dash between the strip and the balloon. One dash spends
 itself on the strip and falls 2-3 px short.
+
+### Night of 2026-10-13: the hull forward (log)
+
+- 02:50 Handover. The hull agent's full 1-dash forward with the hull build
+  (`hull-mod`, local; /var/tmp/hull-exp/mod-full): no level -1, balloon
+  seed 0, r0sxhe. It reached f223 in 12:50 (OOM at f224 under a 45G cap)
+  with no forward win at the exit. Its hull tree holds states right of
+  the strip at ceiling height from f171, with djump 1 from f184 (5.0M by
+  f223). Those are an over-approximation: a hull widens each state's
+  remainder set to its bounding arc.
+- 03:00 Started (1) `search --level-minus-one 240,5 --to 240
+  --concrete-balloon-seeds 0` with the hull build (/var/tmp/mod-ck/hx240),
+  and (2) the exact reach over the hull tree to f223, decoding every
+  reached state right of the strip above y 110
+  (/var/tmp/mod-ck/logs/hullreach.*).
