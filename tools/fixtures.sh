@@ -2,8 +2,8 @@
 # THE FIXTURES of the fast check ladder (plans/devloop.md): small trees at
 # known frames under $CELESTE_FIXTURES (default /var/tmp/celeste-fixtures,
 # never committed), each built once by a pinned command and checked against
-# its pinned fingerprint (gates/fixtures/NAME.ckhash: `ckhash --edges` and,
-# under level -1, `--dropped`, through its last frame). A fixture is an
+# its pinned fingerprint (gates/fixtures/NAME.ckhash: `ckhash --edges
+# --hulls` through its last frame: its frames, edges and hulls). A fixture is an
 # INPUT: the single-frame checks run one frame from it with the code being
 # tested and compare that frame's output with gates/fixtures/NAME.frame.
 #
@@ -36,10 +36,12 @@ L1_62="--hundred --loading-jank 2 --level-minus-one 94,5"
 spec() {
     DEP=""; TREE=.; FLAGS=""
     case $1 in
-        # Room (1,0) 200m r0sxh, the mid frame f55 -> f56 (14.5M edges).
+        # Room (1,0) 200m r0sxh, the mid frame f55 -> f56 (85k new states
+        # and 125k grown in: 2.2M emissions, 2.5M edges re-pushed).
         r10) ROOM=1,0; CMD="forward --room 1,0 --level r0sxh --to 56"; LAST=56 ;;
         # Room (6,2) 100% 2300m r0sxhf under level -1 (94,5), f50 -> f51
-        # (1.8M lanes in, 72M emissions); the reference frame is r62h57.
+        # (305k new states and 579k grown in: 6.6M emissions, 8.3M edges
+        # re-pushed); the reference frame is r62h57.
         r62h) FLAGS=$L1_62; ROOM=6,2; CMD="forward --room 6,2 --level r0sxhf --to 51"; LAST=51 ;;
         # Room (4,2) 2100m at the object level r0sxhn under level -1 (71,5), f60 -> f61.
         r42n) FLAGS="--level-minus-one 71,5"; ROOM=4,2; CMD="forward --room 4,2 --level r0sxhn --to 61"; LAST=61 ;;
@@ -83,9 +85,8 @@ sources() {
 
 # The tree's fingerprint (as pinned).
 fingerprint() {
-    local dir=$1/$TREE extra=""
-    [[ $FLAGS == *level-minus-one* ]] && extra=--dropped
-    ./safe-run.sh -- "$B" ckhash --room "$ROOM" --to "$LAST" --edges $extra --checkpoint-dir "$dir" 2>/dev/null
+    local dir=$1/$TREE
+    ./safe-run.sh -- "$B" ckhash --room "$ROOM" --to "$LAST" --edges --hulls --checkpoint-dir "$dir" 2>/dev/null
 }
 
 build() {

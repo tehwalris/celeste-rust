@@ -1544,9 +1544,10 @@ mod tests {
     /// THE HULL FORWARD LIES BETWEEN THE EXACT REACH AND THE WIDENED FORWARD,
     /// room (1,0) to f44 (the gate's forward): with every hull widened to
     /// the whole circle (`hull::WIDEN`: every state's remainder widened, the
-    /// forward before hulls) the frames are exactly the pinned gate's
-    /// (gates/ckhash_room10_f000-044.txt); the hull forward keeps a SUBSET of
-    /// those states, each in a layer no earlier than the widened one's; and
+    /// forward before hulls) the frames are exactly the forward gate's
+    /// before hulls (gates/ckhash_room10_f000-044_widened.txt); the hull
+    /// forward keeps a SUBSET of those states, each in a layer no earlier
+    /// than the widened one's; and
     /// it holds every state the exact-remainder reach (`search::reach`)
     /// reaches, in a layer no later than the frame it is reached at, with
     /// every remainder the reach brings it in its hull.
@@ -1574,7 +1575,7 @@ mod tests {
         ForwardState::start(init(), &hull, true, None, level, &s).expect("start").extend(&e, &hull, to, None).expect("hull");
         let t = crate::storage::layer::Tree::open(&wide, to).expect("tree");
         let lines: Vec<String> = (0..=to).map(|f| { let (n, acc) = t.layer(f, None, 4).expect("layer").0.content_fingerprint(&t.space, &t.shapes).expect("fp"); format!("f{f:03} {n} {acc:016x}") }).collect();
-        let pinned = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/gates/ckhash_room10_f000-044.txt")).expect("the gate");
+        let pinned = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/gates/ckhash_room10_f000-044_widened.txt")).expect("the gate");
         assert_eq!(lines, pinned.lines().collect::<Vec<_>>(), "the widened forward is not the gate's");
         let (ws, hs) = (states(&wide), states(&hull));
         let first_in = |sets: &[rustc_hash::FxHashSet<u64>], h: u64| sets.iter().position(|x| x.contains(&h));

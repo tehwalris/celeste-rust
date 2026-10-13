@@ -1,4 +1,4 @@
-[gate] h35 support 7952 bc27fa975b1101c1
+[gate] h35 support 1290 40880986722096b7
 [gate] h35 W f000 1 76b86f07182c84d1
 [gate] h35 W f001 2 144fc1f77b93e187
 [gate] h35 W f002 3 69a3cc588c81a619
@@ -23,17 +23,17 @@
 [gate] h35 W f021 3 71d73f4c33c10030
 [gate] h35 W f022 3 f493158db4d339d5
 [gate] h35 W f023 3 2f038daab8218e5c
-[gate] h35 W f024 10 c9798cf81128fe72
-[gate] h35 W f025 45 389e58151169b62e
-[gate] h35 W f026 216 75c8a17ba1949393
-[gate] h35 W f027 727 1994969da9e56a97
-[gate] h35 W f028 1549 70e9d2adf29a6234
-[gate] h35 W f029 2523 ed9a754b5eb44b1c
-[gate] h35 W f030 3328 676cbf6f79434579
-[gate] h35 W f031 2642 9deb85379f41de13
-[gate] h35 W f032 881 9f89cea3c42d27e3
-[gate] h35 W f033 813 e9d6904061da8124
-[gate] h35 W f034 836 8191206c94f486b9
-[gate] h35 W f035 530 34dcdba72cdcfd8b
+[gate] h35 W f024 10 33ffb4cd5c2a9f53
+[gate] h35 W f025 29 cb026b3a866957f7
+[gate] h35 W f026 89 8f7352c45febade6
+[gate] h35 W f027 176 2fc582d9cdb19a5a
+[gate] h35 W f028 273 1cd75ec3dbc14be0
+[gate] h35 W f029 365 31bb7585d4549e79
+[gate] h35 W f030 418 6d933d1b24b186bb
+[gate] h35 W f031 261 29721bdb9756b830
+[gate] h35 W f032 181 992914dc9f480eb1
+[gate] h35 W f033 180 5cbef775f8c3c765
+[gate] h35 W f034 186 29731297cb035496
+[gate] h35 W f035 124 dd20538880881252
 [gate] h35 arc optimum 33
 [gate] h35 concrete optimum 33 inputs 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,17,0,0,2,32,0,0,0,0

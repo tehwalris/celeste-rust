@@ -1471,10 +1471,10 @@ fn main() -> Result<()> {
                 let mut o = Sampled::default();
                 let src = r.src;
                 let src_row = row_of(src)?;
-                let tgt_row = row_of(r.target)?;
-                let (tshape, tkeys, tcells) = widened_keys(&tgt_row, level, space)?;
-                anyhow::ensure!(tkeys[0].is_some(), "arc-check: the target {} does not key in its own tree", r.target.show());
-                let target = (tshape, tkeys[0], tcells[0]);
+                // The target by what it is (a hull tree records edges into
+                // states it reaches later or never: not every target has a
+                // frame).
+                let target = (tree.shape_of(r.target.region)?, Some(r.target.key), r.target.cell(&celeste_rust::storage::GEOMETRY));
                 let (gx, gy) = (r.x.guard, r.y.guard);
                 // Every record of this (pred, target), and its guards as rectangles.
                 let pair: Vec<&Rec> = recs.iter().filter(|q| q.target == r.target && q.src == src).collect();

@@ -1,4 +1,4 @@
-[gate] h50 support 700 aa0dd9e74c11ca30
+[gate] h50 support 268 746f580ac07677b9
 [gate] h50 W f000 1 48833875cc7b961b
 [gate] h50 W f001 2 58c38ec65312f833
 [gate] h50 W f002 3 64fd609f1e55ac2e
@@ -37,19 +37,19 @@
 [gate] h50 W f035 4 13548c6d1f569fc1
 [gate] h50 W f036 4 9196a8466991ebb7
 [gate] h50 W f037 4 1d56e88b44985704
-[gate] h50 W f038 12 c041cfe9ee79d28a
-[gate] h50 W f039 32 e3a21329b90d0694
-[gate] h50 W f040 59 c513709da03bb3e1
-[gate] h50 W f041 92 1e443ea307a97a38
-[gate] h50 W f042 112 ed033fb6ef03edc5
-[gate] h50 W f043 148 cc28cdae2e34f573
-[gate] h50 W f044 134 ab06178e422b3742
-[gate] h50 W f045 117 df8d5aea3ad619ec
-[gate] h50 W f046 114 afb34a2c70be12d2
-[gate] h50 W f047 114 5406afdb5faa4826
-[gate] h50 W f048 101 85fc46d6443ef1e8
-[gate] h50 W f049 76 a06276de5e353322
-[gate] h50 W f050 35 f9baf33192cf844c
+[gate] h50 W f038 8 13a261cc306beb72
+[gate] h50 W f039 19 f3fd557da80f789e
+[gate] h50 W f040 35 98313643f461e6ae
+[gate] h50 W f041 44 72cfd5b0f39dfb68
+[gate] h50 W f042 52 104e1c6105603c8e
+[gate] h50 W f043 51 5d956752074d0f3d
+[gate] h50 W f044 52 f9c735724d201638
+[gate] h50 W f045 46 cdd2c7835827b523
+[gate] h50 W f046 50 ce944ef174ef56de
+[gate] h50 W f047 48 a31649454fb0c7d4
+[gate] h50 W f048 46 986a78bab27049bc
+[gate] h50 W f049 31 fb8d9e1abedef866
+[gate] h50 W f050 22 c91ca0b4e9dd068b
 [gate] h50 arc optimum 47
 [gate] h50 support 241 b40eef34b113ca2a
 [gate] h50 W f000 1 48833875cc7b961b
@@ -91,17 +91,17 @@
 [gate] h50 W f036 4 b732e2ed7801784b
 [gate] h50 W f037 4 603be7af81c3b864
 [gate] h50 W f038 8 057cab2ef0a3380e
-[gate] h50 W f039 19 c53a8224c8a2797f
-[gate] h50 W f040 32 c847eb5e784686b6
-[gate] h50 W f041 41 347b42312286de1e
-[gate] h50 W f042 47 12b1f43e23c28fcc
-[gate] h50 W f043 49 3d65d561772dd015
-[gate] h50 W f044 49 e7e1d7dfec62c28d
-[gate] h50 W f045 49 10bd13917abab7b6
-[gate] h50 W f046 53 63269cbcadeedab3
-[gate] h50 W f047 52 b2634333a93192fa
-[gate] h50 W f048 54 464a804e86648013
-[gate] h50 W f049 39 2484502c4742de3e
+[gate] h50 W f039 18 ef00a7f1ba4ca50c
+[gate] h50 W f040 31 f20e112b69f0b243
+[gate] h50 W f041 40 75b262d0ef62cca5
+[gate] h50 W f042 46 846eaaaf8133698d
+[gate] h50 W f043 47 a91ad6f3625959fe
+[gate] h50 W f044 43 64d9caf5d1dfc1b4
+[gate] h50 W f045 43 1bd9382d7a9daa5c
+[gate] h50 W f046 47 69cdc85451353708
+[gate] h50 W f047 45 308d57947fca2022
+[gate] h50 W f048 42 f6900d1b2ca64412
+[gate] h50 W f049 29 0bad5b95a331642e
 [gate] h50 W f050 22 950df9c0a9ee3e11
 [gate] h50 arc optimum 47
 [gate] h50 concrete optimum 47 inputs 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,2,34,0,0,0,0,0,0,0,0

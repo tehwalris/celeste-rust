@@ -142,7 +142,7 @@ storage() {
     local tree=$1 f=$2 room=$3 level=$4; shift 4
     ./safe-run.sh -- "$B" bench-storage --capture "$F/cap-$tree/f$(printf %03d "$f")" --tree "$F/$tree" --room "$room" --level "$level" --threads "$TH" --reps 1 "$@" > "$C/storage-$tree.txt" || return 1
     cat "$C/storage-$tree.txt" >&2
-    { grep -o "f$(printf %03d "$f") [0-9]* [0-9a-f]*" "$C/storage-$tree.txt"; grep -o "e$(printf %03d "$f") [0-9]* [0-9a-f]*" "$C/storage-$tree.txt"; } | diff "$G/$tree.frame" - >&2
+    { grep -o "f$(printf %03d "$f") [0-9]* [0-9a-f]*" "$C/storage-$tree.txt"; grep -o "e$(printf %03d "$f") [0-9]* [0-9a-f]*" "$C/storage-$tree.txt"; } | diff <(grep -E '^[fe][0-9]' "$G/$tree.frame") - >&2
 }
 
 big() {
@@ -177,7 +177,7 @@ t2() {
 gate10_forward() {
     ./safe-run.sh -- "$B" forward --to 44 --room 1,0 --checkpoint-dir "$C/t2/g10" > "$C/t2/g10.out" || return 1
     grep '^posgraph' "$C/t2/g10.out" | diff gates/posgraph_room10_f044.txt - >&2 || return 1
-    ./safe-run.sh -- "$B" ckhash --to 44 --room 1,0 --checkpoint-dir "$C/t2/g10" | diff gates/ckhash_room10_f000-044.txt - >&2
+    ./safe-run.sh -- "$B" ckhash --to 44 --room 1,0 --hulls --checkpoint-dir "$C/t2/g10" | diff gates/ckhash_room10_f000-044.txt - >&2
 }
 gate10_arc() {
     ./safe-run.sh -- "$B" search --to 35 --win-at 9,101 --checkpoint-dir "$C/t2/arc10" --prefer gates/known_room10_win9-101.txt --save-marks "$C/t2/arc10-marks" > "$C/t2/arc10.out" || return 1
@@ -216,7 +216,7 @@ print(json.dumps(r, sort_keys=True))' "$C/t2/ui-$d/run.json" | sha256sum | sed "
 # fingerprint is the r60s fixture's pin.
 forward60() {
     ./safe-run.sh -- "$B" forward --room 6,0 --level r0sxhfp --to 71 --split-frame --checkpoint-dir "$C/t2/p60" > /dev/null || return 1
-    ./safe-run.sh -- "$B" ckhash --room 6,0 --to 71 --edges --checkpoint-dir "$C/t2/p60" 2> /dev/null | diff "$G/r60s.ckhash" - >&2
+    ./safe-run.sh -- "$B" ckhash --room 6,0 --to 71 --edges --hulls --checkpoint-dir "$C/t2/p60" 2> /dev/null | diff "$G/r60s.ckhash" - >&2
 }
 
 widen60() {
