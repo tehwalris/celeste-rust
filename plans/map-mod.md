@@ -515,7 +515,7 @@ The 1-dash assumptions, each checked against the mod's Lua (2026-10-13):
 
 `search --max-djump 2 --level r0sxhe --level-minus-one 190,5 --to 190
 --concrete-balloon-seeds 0` (/var/tmp/mod-ck/two190): forward 190 frames
-(peak ~80M rows a frame at f150, ~50 GB), remainder-free first win f148,
+(peak ~80M new rows a frame around f150, the forward's RSS ~11 GB; the arc phase's peak 47 GB), remainder-free first win f148,
 ARC BOUND 164, concrete win 164 (depth-first at the bound, 310 steps):
 OPTIMAL 164 from the load under max_djump 2, 39 min in all. Validated
 (`tools/mod_submit.py --max-djump 2`): real PICO-8 leaves the room on f164
