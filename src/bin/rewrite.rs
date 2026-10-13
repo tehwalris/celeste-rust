@@ -187,6 +187,15 @@ enum Command {
         /// At most this many states a frame decoded in `--decode-rect`.
         #[arg(long, default_value_t = 20)]
         decode_max: usize,
+        /// Routes from the load: a comma list of input bytes, or a FILE of
+        /// them one a line (`#` lines skipped; a line's text after
+        /// `inputs ` if it has one). Each is stepped by the reference
+        /// engine; its state at every frame must be reached with its exact
+        /// remainder, else the run fails naming the first frame that loses
+        /// it. A route's check stops where its player dies; a route past a
+        /// win is lost there (a win is not expanded).
+        #[arg(long)]
+        route: Option<String>,
     },
     CheckKnown {
         /// The search's checkpoint dir (its `level{i:02}` trees).
@@ -1042,8 +1051,8 @@ fn main() -> Result<()> {
                 }
             }
         }
-        Command::Reach { checkpoint_dir, level_index, to, save_marks, cells, decode_rect, decode_max } => {
-            reach_command(&checkpoint_dir, level_index, to, save_marks.as_deref(), cells.as_deref(), decode_rect.as_deref(), decode_max, &cfg)?;
+        Command::Reach { checkpoint_dir, level_index, to, save_marks, cells, decode_rect, decode_max, route } => {
+            reach_command(&checkpoint_dir, level_index, to, save_marks.as_deref(), cells.as_deref(), decode_rect.as_deref(), decode_max, route.as_deref(), &cfg)?;
         }
         Command::CheckKnown { checkpoint_dir, level, inputs, horizon } => {
             use celeste_rust::search::arc_dp::solve;
@@ -2612,7 +2621,7 @@ mod tests {
 
 /// `rewrite reach` (search::reach): the run, its table and its outputs.
 #[allow(clippy::too_many_arguments)]
-fn reach_command(checkpoint_dir: &str, level_index: usize, to: u32, save: Option<&str>, cells_out: Option<&str>, decode_rect: Option<&str>, decode_max: usize, cfg: &celeste_rust::settings::Settings) -> Result<()> {
+fn reach_command(checkpoint_dir: &str, level_index: usize, to: u32, save: Option<&str>, cells_out: Option<&str>, decode_rect: Option<&str>, decode_max: usize, route: Option<&str>, cfg: &celeste_rust::settings::Settings) -> Result<()> {
     use celeste_rust::search::pos_graph::cell_xy;
     use std::io::Write;
     let dir = std::path::Path::new(checkpoint_dir).join(format!("level{level_index:02}"));
@@ -2633,6 +2642,52 @@ fn reach_command(checkpoint_dir: &str, level_index: usize, to: u32, save: Option
         .transpose()?;
     let mut cells_file = cells_out.map(|p| std::fs::File::create(p).map(std::io::BufWriter::new)).transpose()?;
     let has_notes = dir.join("dropped").is_dir();
+    // `--route`: each route's state and exact remainder per frame (until
+    // a death).
+    type At = Option<(celeste_rust::storage::Sk, (u32, u32), (i32, i32))>;
+    let mut routes: Vec<Vec<At>> = Vec::new();
+    let specs: Vec<String> = match route {
+        None => Vec::new(),
+        Some(spec) if std::path::Path::new(spec).is_file() => std::fs::read_to_string(spec)?
+            .lines()
+            .filter(|l| !l.trim().is_empty() && !l.starts_with('#'))
+            .map(|l| l.split_once("inputs ").map_or(l, |x| x.1).trim().to_string())
+            .collect(),
+        Some(spec) => vec![spec.to_string()],
+    };
+    for spec in &specs {
+        use celeste_rust::trace::refengine::RefEngine;
+        let mut route_at: Vec<At> = Vec::new();
+        let inputs = celeste_rust::concrete::read_inputs(spec)?;
+        let mut eng = RefEngine::new(cfg)?;
+        let mut row = celeste_rust::frame::Block::canonical(eng.initial()?)?;
+        route_at.push(None);
+        let mut seen_player = false;
+        for &b in inputs.iter().take(steps as usize) {
+            row = eng.step_one(row.rt2(), b)?;
+            let player = !row.rt2().player_objects(celeste_rust::compiled::ids()).is_empty();
+            if seen_player && !player {
+                break;
+            }
+            seen_player |= player;
+            if !player {
+                route_at.push(None);
+                continue;
+            }
+            let (shape, keys, cells) = celeste_rust::frame::widened_keys(&row, level, &tree.space)?;
+            let si = tree.shapes.iter().position(|&h| h == shape);
+            let (Some(si), Some(k)) = (si, keys[0]) else {
+                anyhow::bail!("--route: frame {}: the route's state has no node in the tree (shape or key unknown to it)", route_at.len());
+            };
+            let sk = celeste_rust::storage::Sk::at(&geo, si as u32, k, cells[0]);
+            route_at.push(Some((sk, celeste_rust::search::arc_dp::rem_of(row.rt2())?, cell_xy(cells[0]).unwrap_or((-1, -1)))));
+        }
+        routes.push(route_at);
+    }
+    if !routes.is_empty() {
+        println!("[reach] --route: {} routes, {} frames to check", routes.len(), routes.iter().flatten().filter(|r| r.is_some()).count());
+    }
+    let mut route_lost: Option<(usize, u32)> = None;
     let point = celeste_rust::search::arc_dp::start_point(cfg)?;
     let t0 = std::time::Instant::now();
     // Written frame by frame (a run stopped part way keeps them): the
@@ -2655,6 +2710,15 @@ fn reach_command(checkpoint_dir: &str, level_index: usize, to: u32, save: Option
     let pool = celeste_rust::par::Pool::new(cfg.threads());
     let r = celeste_rust::search::reach::reach(&dir, steps, point, cfg.threads(), |fr, pushes, cur, inexact| {
         let t = fr.frame;
+        for (ri, route_at) in routes.iter().enumerate() {
+            if let Some(Some((sk, q, xy))) = route_at.get(t as usize) {
+                let hit = cur.binary_search_by_key(sk, |c| c.0).ok().map(|i| cur[i].1.contains(q.0, q.1));
+                if hit != Some(true) {
+                    println!("[reach] ROUTE {ri} LOST at f{t} (player {xy:?}): {}", if hit.is_none() { "its state is not reached" } else { "its remainder is outside the state's set" });
+                    route_lost.get_or_insert((ri, t));
+                }
+            }
+        }
         let shapes = rem_shapes(t, cur, inexact, &pool)?;
         if let Some(f) = &mut rem_file {
             f.write_all(shapes.as_bytes())?;
@@ -2716,6 +2780,12 @@ fn reach_command(checkpoint_dir: &str, level_index: usize, to: u32, save: Option
         Ok(())
     })?;
     println!("[reach] {} to f{to}, {:.1} s", dir.display(), t0.elapsed().as_secs_f64());
+    if !routes.is_empty() {
+        match route_lost {
+            None => println!("[reach] --route: every route's state reached at every frame with its exact remainder"),
+            Some((ri, t)) => anyhow::bail!("--route: route {ri} is LOST at f{t} (a real state the reach excludes: a bug, unless the route passed a win)"),
+        }
+    }
     print!("{tsv}");
     // Against the forward: its visited states and its emissions (records)
     // over the same frames.
