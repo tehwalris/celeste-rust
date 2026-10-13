@@ -7,7 +7,12 @@ PICO-8 with the MOD'S OWN Lua (it must leave the room on its last frame),
 the tasdatabase file is written from the player's first frame on (the spawn's
 frames are not in it), and Celia plays it on fixp with the mod's cart.
 
-    tools/mod_submit.py ROUTE MOD.p8 OUT.tas [--seeds 0] [--level 1]
+    tools/mod_submit.py ROUTE MOD.p8 OUT.tas [--seeds 0] [--level 1] [--max-djump N]
+
+`--max-djump N`: the game with N dashes from the start (PICO-8: replay.py
+--max-djump; Celia: its dash override, CELIA_DASHES) - NOT the default game:
+a TAS file does not record it, so such a file beats the room only with the
+override set.
 
 ROUTE: a comma list of input bytes from the load (a `route_frame_N.txt` or
 `witness_frame_N.txt`; `#` lines skipped). Exits non-zero unless both
@@ -25,8 +30,10 @@ sys.path.insert(0, os.path.join(M, "pico8_diff"))
 import p8cart  # noqa: E402
 
 
-def replay(cart, inputs, seeds, lua=None):
+def replay(cart, inputs, seeds, lua=None, max_djump=None):
     cmd = [f"{M}/pico8_diff/replay.py", "--cart", cart, "--room", "0,0", "--balloon-seeds", seeds, "--inputs", ",".join(map(str, inputs)), "--frames", str(len(inputs) + 1)]
+    if max_djump is not None:
+        cmd += ["--max-djump", str(max_djump)]
     if lua:
         cmd += ["--lua", lua, "--begin-game"]
     out = subprocess.run(cmd, capture_output=True, text=True, cwd=M, timeout=900).stdout
@@ -48,10 +55,13 @@ def main():
     ap.add_argument("out")
     ap.add_argument("--seeds", default="0")
     ap.add_argument("--level", type=int, default=1)
+    ap.add_argument("--max-djump", type=int, help="the start's dashes (NOT the default game; Celia's override)")
     a = ap.parse_args()
     inputs = [int(x) for x in re.findall(r"\d+", "".join(l for l in open(a.route) if not l.startswith("#")))]
     # 1. The jump presses that fire in the minimal cart only (spd.y -2 on their frame).
-    lines = replay(a.cart, inputs, a.seeds)
+    if a.max_djump is not None:
+        print(f"[submit] max_djump {a.max_djump}: NOT THE DEFAULT GAME (Celia's dash override; the file does not record it)")
+    lines = replay(a.cart, inputs, a.seeds, max_djump=a.max_djump)
     spd_y = {int(m.group(1)): m.group(2) for m in (re.match(r"f(\d+) .* spd \S+,(\S+)", l) for l in lines) if m}
     canon, prev = [], 0
     for i, b in enumerate(inputs):
@@ -64,25 +74,28 @@ def main():
     work = tempfile.mkdtemp(prefix="mod-submit-")
     lua = os.path.join(work, "game.lua")
     open(lua, "w").write(p8cart.Cart(a.cart).lua + "\n")
-    e_min = exit_frame(replay(a.cart, canon, a.seeds))
-    e_mod = exit_frame(replay(a.cart, canon, a.seeds, lua))
+    e_min = exit_frame(replay(a.cart, canon, a.seeds, max_djump=a.max_djump))
+    e_mod = exit_frame(replay(a.cart, canon, a.seeds, lua, a.max_djump))
     print(f"[submit] PICO-8: the minimal cart leaves the room on f{e_min}, the mod's own Lua on f{e_mod} (route: {len(canon)} frames)")
     if e_mod != len(canon):
         sys.exit(f"[submit] FAILED: the mod's Lua does not leave the room on the route's last frame ({e_mod})")
     # 3. The file from the player's first frame (the spawn's frames out).
-    first = next(int(re.match(r"f(\d+)", l).group(1)) for l in replay(a.cart, canon, a.seeds, lua) if " player " in l)
+    first = next(int(re.match(r"f(\d+)", l).group(1)) for l in replay(a.cart, canon, a.seeds, lua, a.max_djump) if " player " in l)
     body = canon[first - 1:]
     assert not any(canon[:first - 1]), "an input before the player exists"
     open(a.out, "w").write(f"[{'' if a.seeds == '0' else a.seeds}]" + ",".join(map(str, body)))
     print(f"[submit] {a.out}: {len(body)} inputs from the player's first frame f{first} (Celia's count {len(body) - 1})")
     # 4. Celia on fixp, the mod's cart.
     env = dict(os.environ, CELIA_CART=a.cart, CELIA_FIXP="1")
+    if a.max_djump is not None:
+        env["CELIA_DASHES"] = str(a.max_djump)
     out = subprocess.run([f"{M}/safe-run.sh", "--memory", "8G", "--", f"{M}/tools/celia/validate.sh", str(a.level), a.out], capture_output=True, text=True, env=env, timeout=1800).stdout
     line = next((l for l in out.splitlines() if l.startswith(f"level {a.level} ")), out.strip()[-300:])
     print(f"[submit] Celia fixp: {line}")
     if "finished" not in line:
         sys.exit("[submit] FAILED in Celia")
-    print("[submit] VALID: PICO-8 (the mod's Lua) and Celia fixp")
+    dashes = "" if a.max_djump is None else f" WITH max_djump {a.max_djump} (NOT the default game)"
+    print(f"[submit] VALID{dashes}: PICO-8 (the mod's Lua) and Celia fixp")
 
 
 if __name__ == "__main__":

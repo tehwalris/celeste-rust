@@ -96,6 +96,10 @@ function D.tick()
     if os.getenv("CELIA_JANK_OFFSET") then
       tas.loading_jank_offset = tonumber(os.getenv("CELIA_JANK_OFFSET"))
       tas:load_level(tas:level_index(), false)
+    elseif os.getenv("CELIA_DASHES") and D.n == 1 then
+      -- No level change applied the override: reload the level as Celia's
+      -- own +/- keys do (cctas: load_level(level_index(), false)).
+      tas:load_level(tas:level_index(), false)
     end
     local cart = pico8.cart
     print("[celia] level " .. D.n .. " room " .. cart.room.x .. "," .. cart.room.y .. " max_djump " .. pico8.cart.max_djump
