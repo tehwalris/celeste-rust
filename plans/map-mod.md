@@ -593,3 +593,9 @@ itself on the strip and falls 2-3 px short.
   as `hull-mod-reach` (the hull tree is format 16, which develop does not
   read). Rerun with --max-segs 128: f130 in 20 s at a fraction of the
   memory.
+- 05:50 The lean reach (128 segments) died of OOM at f199 (90 GB). The
+  coarsened supersets snowball: 21M states at f197, 99.7% of them inexact.
+  Even that superset had NOTHING right of the strip at ceiling height
+  through f198. `reach --edge-cache F` is new (a state's edges kept only F
+  frames after its last reach, the target table renumbered; tested: the
+  same sets). Rerun with --max-segs 512 --edge-cache 4.
