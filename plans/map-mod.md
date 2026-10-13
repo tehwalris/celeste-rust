@@ -547,6 +547,40 @@ That is the room's evident design (strip -> balloon -> shaft), and it
 needs the second dash between the strip and the balloon. One dash spends
 itself on the strip and falls 2-3 px short.
 
+### Summary for the morning (2026-10-13)
+
+**One dash (the game as Celia plays it: level 1, max_djump 1): no route
+exits the room by f300, and the balloon is out of reach at every
+horizon.**
+- The full pipeline with the hull forward (r0sxhe, level -1 at H,
+  unseeded forward, concrete seed 0) to the REAL exit: REFUTED at h240,
+  h270 and h300. At h270/h300 the forward reaches the exit at f246, but
+  only through its widenings; the arcs refute every one. h300: 31 min,
+  peak 71 GB. Sanity check: the same pipeline reproduces the strip
+  crossing's optimum 157 with the known route surviving every pruning.
+- Why, exactly: the strip crossing (the only way right) spends the dash,
+  and its exit is pinned near (96,111) with spd.x <= 1.55, falling. The
+  balloon needs x >= 113 at y <= 119, and the best exact approaches are
+  (110,119) and (112,121): 2-3 px short (the geometric limit above). No
+  exact state is ever right of the strip at ceiling height: bal200 through
+  f200, the hull tree through f198.
+- The hull tree's djump-1 states right of the strip (from f184) are
+  artifacts of its remainder hulls.
+- Independent checks: real PICO-8 with the mod's own Lua and Celia fixp
+  reproduce our engine frame by frame on the best crossing; arc-check
+  (sampled around the strip, 0 disagreements); 252 real crossing routes
+  are all inside the exact reach.
+
+**Two dashes (NOT the default game; Celia's dash override): optimal 164,
+valid on PICO-8 and in Celia with the override.** It uses the balloon:
+dash 1 crosses the strip, dash 2 reaches the balloon, the refill climbs
+the shaft. That is the room's evident design. File
+/var/tmp/mod/submit/TAS1-2dash.tas (+ README), UI `mod00-2dash`.
+
+**The open question for Philippe:** was the room meant (or tested) with
+2 dashes? Celia's override (its +/- keys) survives level loads and a TAS
+file does not record it.
+
 ### Night of 2026-10-13: the hull forward (log)
 
 - 02:50 Handover. The hull agent's full 1-dash forward with the hull build
