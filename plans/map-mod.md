@@ -561,3 +561,8 @@ itself on the strip and falls 2-3 px short.
   and (2) the exact reach over the hull tree to f223, decoding every
   reached state right of the strip above y 110
   (/var/tmp/mod-ck/logs/hullreach.*).
+- 03:08 hx240 (hull forward, level -1 240,5, unseeded forward, concrete
+  seed 0): REFUTED to h240, no forward win at all. Forward 57 s, 66.7M
+  states visited, the peak frame ~1.4M new (f220); 142 s in all. Level -1
+  cuts the hull forward hard near the horizon.
+- 03:12 hx270 started (level -1 270,5).
