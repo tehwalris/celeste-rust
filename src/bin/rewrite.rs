@@ -1125,8 +1125,9 @@ fn main() -> Result<()> {
                     if !celeste_rust::storage::layer::frame_exists(dir, frame) {
                         break;
                     }
-                    let grown = celeste_rust::storage::hulls::read(&celeste_rust::storage::hulls::path(dir, frame), cfg.threads())?;
-                    let (n, acc) = celeste_rust::storage::hulls::fingerprint(&grown, &tree.space, &tree.shapes)?;
+                    let hf = celeste_rust::storage::hulls::read(&celeste_rust::storage::hulls::path(dir, frame), cfg.threads())?;
+                    let (new, _) = tree.layer(frame, None, cfg.threads())?;
+                    let (n, acc) = celeste_rust::storage::hulls::fingerprint(hf.states(&new)?.into_iter(), &tree.space, &tree.shapes)?;
                     println!("h{frame:03} {n} {acc:016x}");
                 }
             }
@@ -1206,7 +1207,7 @@ fn main() -> Result<()> {
                 );
                 let (n, acc) = wave.next.content_fingerprint(&visited.keys, visited.shapes())?;
                 let mut out = format!("f{:03} {n} {acc:016x}\n", frame + 1);
-                let (nh, ah) = celeste_rust::storage::hulls::fingerprint(&wave.frontier_states(frame + 1), &visited.keys, visited.shapes())?;
+                let (nh, ah) = celeste_rust::storage::hulls::fingerprint(wave.frontier_states(frame + 1), &visited.keys, visited.shapes())?;
                 out += &format!("h{:03} {nh} {ah:016x}\n", frame + 1);
                 if edges {
                     let (n, acc) = celeste_rust::storage::bench::edge_fingerprint(&scratch, frame + 1, &xfers, &visited, cfg.threads())?;
@@ -2534,13 +2535,16 @@ fn hull_stats(dir: &std::path::Path, to: u32, threads: usize) -> Result<()> {
         v.sort_unstable();
         v[((v.len() - 1) as f64 * f) as usize]
     };
+    let last_frame = celeste_rust::storage::layer::last_frame(dir).ok_or_else(|| anyhow::anyhow!("{}: no frames", dir.display()))?;
+    let tree = celeste_rust::storage::layer::Tree::open(dir, to.min(last_frame))?;
     println!("frame\tnew\tgrown\tgrowth_x_med\tgrowth_x_p90\tgrowth_y_med\tgrowth_y_p90\tgrown_full_x");
     for f in 0..=to {
         let p = hulls::path(dir, f);
         if !p.exists() {
             break;
         }
-        let g = hulls::read(&p, threads)?;
+        let (layer, _) = tree.layer(f, None, threads)?;
+        let g = hulls::read(&p, threads)?.states(&layer)?;
         let (mut new, mut grown, mut full) = (0u64, 0u64, 0u64);
         let (mut gx, mut gy) = (Vec::new(), Vec::new());
         for (sk, layer, h) in g {

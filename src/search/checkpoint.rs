@@ -20,8 +20,9 @@ const MAGIC: &[u8; 4] = b"C8TB";
 /// (plans/keys-only.md). 16: THE HULL FORWARD - a frame's states are
 /// those its remainder hulls first reach, its hull file the frontier with
 /// every state's layer and hull; no drop notes (plans/architecture.md "The
-/// forward frame").
-pub const FORMAT_VERSION: u32 = 16;
+/// forward frame"). 17: a hull file holds its frame's new states by their
+/// hulls alone (in the frame file's order), its grown ones by layer.
+pub const FORMAT_VERSION: u32 = 17;
 
 /// Save any serializable value (the marks, the pos-graph) under the same
 /// header, uncompressed bincode.

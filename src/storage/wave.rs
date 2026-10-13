@@ -99,13 +99,10 @@ impl Wave {
     }
 
     /// The next frontier's states with their layers and hulls (`frame`:
-    /// the wave's), sorted: its hull file's content.
-    pub fn frontier_states(&self, frame: u32) -> Vec<Grown> {
+    /// the wave's): the new ones in order, then the grown ones.
+    pub fn frontier_states(&self, frame: u32) -> impl Iterator<Item = Grown> + '_ {
         let layer = u16::try_from(frame).expect("a frame past u16");
-        let mut v: Vec<Grown> = self.next.states_iter().zip(&self.hulls).map(|(s, &h)| (s, layer, h)).collect();
-        v.extend(self.grown.iter().map(|o| (o.sk, o.layer, o.hull)));
-        v.sort_unstable_by_key(|x| x.0);
-        v
+        self.next.states_iter().zip(&self.hulls).map(move |(s, &h)| (s, layer, h)).chain(self.grown.iter().map(|o| (o.sk, o.layer, o.hull)))
     }
 }
 

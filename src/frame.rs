@@ -14,7 +14,6 @@ use anyhow::{Context, Result};
 use celeste_engine::runtime2::Rt2;
 
 use crate::search::hull::Hull;
-use crate::storage::layer::Layer;
 use crate::storage::wave::Frontier;
 
 /// Wave phase timers (`--phases`, which the wave's sinks carry): TSC ticks
@@ -768,10 +767,10 @@ fn checkpoint(dir: &std::path::Path, frame: u32, wave: &crate::storage::wave::Wa
     layer::write_frame(&path, &meta, &wave.next, &wave.wins, s.threads())?;
     layer::check_frame_file(&path, &wave.next, &wave.wins, s.threads())?;
     anyhow::ensure!(u16::try_from(frame).is_ok(), "frame {frame}: past a u16 layer");
-    let grown = wave.frontier_states(frame);
     let hp = hulls::path(dir, frame);
-    hulls::write(&hp, &grown, s.threads())?;
-    hulls::check(&hp, &grown, s.threads())?;
+    let of = |o: &crate::storage::wave::Old| (o.sk, o.layer, o.hull);
+    hulls::write(&hp, frame, &wave.hulls, &wave.grown, of, s.threads())?;
+    hulls::check(&hp, frame, &wave.hulls, &wave.grown, of, s.threads())?;
     Ok(!wave.wins.is_empty())
 }
 
@@ -1266,53 +1265,67 @@ pub fn restore_visited(dir: &std::path::Path, last: u32, room: Option<(i16, i16)
         visited.restore_shape(i as u32, h)?;
     }
     visited.keys = tree.space.clone();
-    let mut new = Layer::default();
+    use crate::storage::visited::StateInfo;
+    let mut frontier = Frontier::default();
     for f in 0..=last {
         let (layer, _) = tree.layer(f, if f == last { room } else { None }, threads)?;
         let held = visited.merge(&layer.set, threads)?;
         anyhow::ensure!(held == 0, "{}: f{f}: {held} states stored twice", dir.display());
-        if f == last {
-            new = layer;
-        }
-    }
-    let mut grown: Vec<hulls::Grown> = Vec::new();
-    // The last frame's old states' hulls before it (what they pushed last).
-    let mut was: rustc_hash::FxHashMap<crate::storage::Sk, Hull> = Default::default();
-    for f in 0..=last {
         let p = hulls::path(dir, f);
         if f > 0 && !p.exists() && tree.frames[f as usize].is_empty() {
             // Past a frontier that died: no frame, no hulls.
             continue;
         }
-        grown = hulls::read(&p, threads).with_context(|| format!("{}: frame {f}'s hulls", dir.display()))?;
+        let hf = hulls::read(&p, threads).with_context(|| format!("{}: frame {f}'s hulls", dir.display()))?;
+        anyhow::ensure!(hf.frame == f && hf.hulls.len() as u64 == layer.states(), "{}: frame {f}'s hull file is of frame {} with {} new states, the frame has {}", dir.display(), hf.frame, hf.hulls.len(), layer.states());
+        let f16 = u16::try_from(f).map_err(|_| anyhow::anyhow!("frame {f}: past a u16 layer"))?;
+        // The new states: the layer's, in its order (per region its first
+        // state's place).
+        let mut at = Vec::with_capacity(layer.set.tables().len());
+        let mut n = 0usize;
+        for (ti, (region, t)) in layer.set.tables().iter().enumerate() {
+            at.push((*region, (ti, n)));
+            n += t.states() as usize;
+        }
+        visited.set_infos(
+            &at,
+            |&(ti, first)| {
+                let t = &layer.set.tables()[ti].1;
+                let hulls = &hf.hulls[first..first + t.states() as usize];
+                t.iter().flat_map(|(key, mask)| crate::storage::layer::bits(mask).map(move |c| (key, c))).zip(hulls).map(|((key, c), &hull)| (key, c, StateInfo { hull, layer: f16 })).collect()
+            },
+            threads,
+        )?;
+        // The grown ones: older states, by region.
+        let mut by: rustc_hash::FxHashMap<u32, Vec<u32>> = Default::default();
+        for (i, g) in hf.grown.iter().enumerate() {
+            by.entry(g.0.region).or_default().push(i as u32);
+        }
+        let mut groups: Vec<(u32, Vec<u32>)> = by.into_iter().collect();
+        groups.sort_unstable_by_key(|g| g.0);
         if f == last {
-            for &(sk, layer, _) in grown.iter().filter(|g| g.1 as u32 != last) {
+            // What the last frame's old states pushed before it.
+            let mut old = Vec::with_capacity(hf.grown.len());
+            for &(sk, layer, hull) in &hf.grown {
+                anyhow::ensure!(layer < f16, "{}: a grown state of layer {layer} in frame {f}'s hulls", dir.display());
                 let i = visited.state(sk.region, sk.key, sk.local as u32).ok_or_else(|| anyhow::anyhow!("{}: an old state of frame {f}'s frontier without a hull before", dir.display()))?;
                 anyhow::ensure!(i.layer == layer, "{}: an old state's layer {layer} in frame {f}'s hulls, {} before", dir.display(), i.layer);
-                was.insert(sk, i.hull);
+                old.push(crate::storage::wave::Old { sk, layer, hull, was: i.hull });
             }
+            frontier = Frontier { new: layer, hulls: hf.hulls.clone(), old };
         }
-        let mut groups: Vec<(u32, std::ops::Range<usize>)> = Vec::new();
-        let mut a = 0;
-        while a < grown.len() {
-            let region = grown[a].0.region;
-            let b = a + grown[a..].partition_point(|x| x.0.region == region);
-            groups.push((region, a..b));
-            a = b;
-        }
-        visited.set_infos(&groups, |g| grown[g.clone()].iter().map(|&(sk, layer, hull)| (sk.key, sk.local as u32, crate::storage::visited::StateInfo { hull, layer })).collect(), threads)?;
+        visited.set_infos(
+            &groups,
+            |idx| {
+                let mut v: Vec<(crate::storage::visited::Key, u32, StateInfo)> = idx.iter().map(|&i| hf.grown[i as usize]).map(|(sk, layer, hull)| (sk.key, sk.local as u32, StateInfo { hull, layer })).collect();
+                v.sort_unstable_by_key(|x| (x.0, x.1));
+                v
+            },
+            threads,
+        )?;
     }
     anyhow::ensure!(visited.infos() <= visited.len(), "{}: {} states, {} with a hull stored", dir.display(), visited.len(), visited.infos());
-    // The frontier: frame `last`'s hull file - its new states are the frame's
-    // layer, in its order; its old ones pushed the hull they had before it.
-    let layer16 = u16::try_from(last).map_err(|_| anyhow::anyhow!("frame {last}: past a u16 layer"))?;
-    let (fresh, old): (Vec<hulls::Grown>, Vec<hulls::Grown>) = grown.into_iter().partition(|g| g.1 == layer16);
-    anyhow::ensure!(fresh.iter().map(|g| g.0).eq(new.states_iter()), "{}: frame {last}'s hull file does not list the frame's new states", dir.display());
-    let hulls = fresh.into_iter().map(|g| g.2).collect();
-    let mut old: Vec<crate::storage::wave::Old> = old.into_iter().map(|(sk, layer, hull)| crate::storage::wave::Old { sk, layer, hull, was: was.get(&sk).copied().unwrap_or(hull) }).collect();
-    anyhow::ensure!(old.iter().all(|o| was.contains_key(&o.sk)), "{}: an old state of frame {last}'s frontier without its hull before", dir.display());
-    old.sort_unstable_by_key(|o| (o.layer, o.sk));
-    Ok((visited, tree.first_win(), Frontier { new, hulls, old }))
+    Ok((visited, tree.first_win(), frontier))
 }
 
 /// One row of a marks file: `(shape, cell, key.0, key.1, dist)`.
@@ -1477,6 +1490,7 @@ mod tests {
 
 
     use super::*;
+    use crate::storage::layer::Layer;
     use crate::trace::refengine::RefEngine;
     use celeste_core::pico8_num::Pico8Num as P8;
     use celeste_engine::runtime2::{Col, AV};
