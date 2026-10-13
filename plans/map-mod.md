@@ -538,3 +538,11 @@ Two cross-checks of the exact reach itself (2026-10-13):
   disagree, 0 unpredicted; 4,085 probes outside every guard, 0 reach the
   target. The old full mode cannot load a frame of this tree (billions of
   records: OOM at 60 GB).
+
+The 2-dash optimum USES the balloon. It crosses the strip with dash 1
+(f103-f110 at y 109), takes dash 2 out of the strip straight to the
+balloon (x 113-121 on f116-f127; the balloon pops), climbs the shaft with
+the refilled dashes, and runs the corridor and the exit chamber to f164.
+That is the room's evident design (strip -> balloon -> shaft), and it
+needs the second dash between the strip and the balloon. One dash spends
+itself on the strip and falls 2-3 px short.
