@@ -524,3 +524,17 @@ cart and the override (CELIA_DASHES=2, applied on level 1 by a reload as
 Celia's +/- keys do) finishes it in 118f (Celia's count). Without the
 override it dies at frame 27. File: /var/tmp/mod/submit/TAS1-2dash.tas
 (+ README: NOT a submission). UI: `mod00-2dash`.
+
+Two cross-checks of the exact reach itself (2026-10-13):
+- `rewrite reach --route` (new: known routes stepped by the reference
+  engine, each frame's state checked reached with its exact remainder):
+  all 252 real strip crossings of cross160 (f157-160), each extended by
+  12 frames of R to its death: 30,596 route-frames, every one reached
+  exactly (bal200 to f172).
+- `rewrite arc-check --sources 300 --source-rect 40..127,90..128` (new
+  mode: a tree too big to load a frame's records samples sources and
+  checks all their out-records) on bal200 f140-f175: 369,583 records, 0
+  without a transfer; 2,160 sampled, 8,640 probes inside guards, 0
+  disagree, 0 unpredicted; 4,085 probes outside every guard, 0 reach the
+  target. The old full mode cannot load a frame of this tree (billions of
+  records: OOM at 60 GB).
