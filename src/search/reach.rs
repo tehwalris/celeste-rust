@@ -69,11 +69,17 @@ pub struct ReachOpts {
     /// union per state ever reached, the run's biggest memory after the
     /// frame's sets.
     pub first_arrival: bool,
+    /// Keep a state's out-edges only while it was reached in the last this
+    /// many frames (0: keep every state's to the end). A state reached
+    /// again after that has them read again: time for memory on a long
+    /// reach, the per-state edge cache and the target table otherwise grow
+    /// with every state ever reached.
+    pub edge_cache: u32,
 }
 
 impl Default for ReachOpts {
     fn default() -> Self {
-        ReachOpts { max_segs: MAX_SEGS, first_arrival: false }
+        ReachOpts { max_segs: MAX_SEGS, first_arrival: false, edge_cache: 0 }
     }
 }
 
@@ -205,6 +211,8 @@ pub fn reach(dir: &std::path::Path, horizon: u32, point: (u32, u32), threads: us
     let mut acc: FxHashMap<Sk, (Region, u32)> = FxHashMap::default();
     let mut pushes: Vec<Pushes> = Vec::new();
     let mut acc_segs = 0u64;
+    // The edge counts of the cache entries evicted (`edge_cache`).
+    let (mut ev_raw, mut ev_edges, mut ev_pushed) = (0u64, 0u64, 0u64);
     // The tree's layers as loaded (frame `f`: the states first reached at `f`).
     let mut layers: Vec<crate::storage::layer::Layer> = Vec::new();
     let mut frames = Vec::new();
@@ -457,12 +465,40 @@ pub fn reach(dir: &std::path::Path, horizon: u32, point: (u32, u32), threads: us
             tt.elapsed().as_secs_f64()
         );
         visit(&frames[frames.len() - 1], pushes.last().copied(), &cur, &inexact)?;
+        // The edge cache: states reached in the last `edge_cache` frames or
+        // at the next keep their edges; the targets the kept edges name are
+        // renumbered.
+        if opts.edge_cache > 0 && (t + 1) % opts.edge_cache == 0 {
+            let keep_from = (t + 1).saturating_sub(opts.edge_cache);
+            out.retain(|s, o| {
+                let keep = last.get(s).is_some_and(|&l| l >= keep_from) || nx.binary_search_by_key(s, |c| c.0).is_ok();
+                if !keep {
+                    ev_raw += o.0 as u64;
+                    ev_edges += o.1.len() as u64;
+                    ev_pushed += o.1.iter().filter(|e| e.1 & PUSHED != 0).count() as u64;
+                }
+                keep
+            });
+            let (mut new_index, mut new_names): (FxHashMap<Sk, u32>, Vec<Sk>) = Default::default();
+            for (_, (_, es)) in out.iter_mut() {
+                for e in es.iter_mut() {
+                    let sk = names[e.0 as usize];
+                    let n = new_names.len() as u32;
+                    e.0 = *new_index.entry(sk).or_insert_with(|| {
+                        new_names.push(sk);
+                        n
+                    });
+                }
+            }
+            (index, names) = (new_index, new_names);
+        }
         cur = nx;
         inexact = next_inexact;
     }
-    let edges_raw = out.values().map(|o| o.0 as u64).sum();
-    let edges = out.values().map(|o| o.1.len() as u64).sum();
-    let edges_pushed = out.values().map(|o| o.1.iter().filter(|e| e.1 & PUSHED != 0).count() as u64).sum();
+    // (An edge evicted and read again counts again.)
+    let edges_raw = ev_raw + out.values().map(|o| o.0 as u64).sum::<u64>();
+    let edges = ev_edges + out.values().map(|o| o.1.len() as u64).sum::<u64>();
+    let edges_pushed = ev_pushed + out.values().map(|o| o.1.iter().filter(|e| e.1 & PUSHED != 0).count() as u64).sum::<u64>();
     let mut entries = Vec::new();
     for (_, n) in acc.values() {
         if entries.len() <= *n as usize {
@@ -560,6 +596,16 @@ mod tests {
         // Edges: the distinct ones of the recorded, the pushed of those.
         assert!(r.edges_pushed > 0 && r.edges_pushed <= r.edges && r.edges <= r.edges_raw);
         assert!(r.pushes.iter().map(|p| p.nonempty).sum::<u64>() >= r.edges_pushed);
+        // An edge cache (states' edges dropped 3 frames after their last
+        // reach, read again) reaches the same sets every frame.
+        let mut sets3: Vec<Vec<(crate::storage::Sk, super::Region)>> = Vec::new();
+        let r3 = super::reach(&dir, 35, p0, 4, super::ReachOpts { edge_cache: 3, ..Default::default() }, |_, _, cur, _| {
+            sets3.push(cur.to_vec());
+            Ok(())
+        })
+        .expect("reach with an edge cache");
+        assert_eq!(sets3, sets, "the edge cache changes no frame's sets");
+        assert_eq!(r3.last, r.last);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
