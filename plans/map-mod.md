@@ -577,3 +577,6 @@ itself on the strip and falls 2-3 px short.
   further: rerun after hx300.
 - 03:45 hx300: forward at f268, past its peak (26M new rows at f254,
   RSS 43 GB).
+- 04:10 hx300: REFUTED to h300 (the hull forward 1663 s, peak 71 GB; the
+  forward's first win f246, every one refuted by the arcs; 1849 s in
+  all). With one dash there is no exit by f300.
