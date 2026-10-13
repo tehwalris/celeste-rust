@@ -563,7 +563,7 @@ horizon.**
   balloon needs x >= 113 at y <= 119, and the best exact approaches are
   (110,119) and (112,121): 2-3 px short (the geometric limit above). No
   exact state is ever right of the strip at ceiling height: bal200 through
-  f200, the hull tree through f198.
+  f200, the hull tree through f199.
 - The hull tree's djump-1 states right of the strip (from f184) are
   artifacts of its remainder hulls.
 - Independent checks: real PICO-8 with the mod's own Lua and Celia fixp
@@ -633,3 +633,11 @@ file does not record it.
   through f198. `reach --edge-cache F` is new (a state's edges kept only F
   frames after its last reach, the target table renumbered; tested: the
   same sets). Rerun with --max-segs 512 --edge-cache 4.
+- 05:32 The hull-tree reach with --max-segs 512 --edge-cache 4 reached f199
+  (OOM at 97 GB on f200): NOTHING right of the strip at ceiling height
+  (x 97-127, y <= 110) through f199. The hull tree's djump-1 states
+  there (f184 on) are artifacts of its remainder hulls. The memory still
+  grows ~4 GB a frame past f190 (18M states a frame, mostly inexact
+  supersets of the left side), so f223 does not fit. The hx runs were
+  fresh, not resumed: hull-mod's resume bug (fixed on develop f652026,
+  format 17) did not apply to them.
