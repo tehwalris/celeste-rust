@@ -561,31 +561,31 @@ itself on the strip and falls 2-3 px short.
   and (2) the exact reach over the hull tree to f223, decoding every
   reached state right of the strip above y 110
   (/var/tmp/mod-ck/logs/hullreach.*).
-- 03:08 hx240 (hull forward, level -1 240,5, unseeded forward, concrete
+- 03:03 hx240 (hull forward, level -1 240,5, unseeded forward, concrete
   seed 0): REFUTED to h240, no forward win at all. Forward 57 s, 66.7M
   states visited, the peak frame ~1.4M new (f220); 142 s in all. Level -1
   cuts the hull forward hard near the horizon.
 - 03:12 hx270 started (level -1 270,5).
-- 03:17 hx270: REFUTED to h270. The hull forward's first win is at f246:
+- 03:08 hx270: REFUTED to h270. The hull forward's first win is at f246:
   the forward reaches the exit only through its widenings (hulls, held
   buttons), and the arcs refute every one of those wins. 248 s, peak 17 GB.
-- 03:18 hx300 started.
-- 03:38 The exact reach over the hull tree (to f223, decoding every reached
+- 03:12 hx300 started.
+- 03:30 The exact reach over the hull tree (to f223, decoding every reached
   state at x 97-127, y <= 110) reached f170 with NONE there: the same as
   over bal200. I stopped it at 44 GB (its 45G cap) to give hx300 the
   memory. The hull tree's states there start at f171, so it needs to go
   further: rerun after hx300.
-- 03:45 hx300: forward at f268, past its peak (26M new rows at f254,
+- 03:30 hx300: forward at f268, past its peak (26M new rows at f254,
   RSS 43 GB).
-- 04:10 hx300: REFUTED to h300 (the hull forward 1663 s, peak 71 GB; the
+- 03:39 hx300: REFUTED to h300 (the hull forward 1663 s, peak 71 GB; the
   forward's first win f246, every one refuted by the arcs; 1849 s in
   all). With one dash there is no exit by f300.
-- 04:20 A sanity check of the hull pipeline on this room. The cross160
+- 03:42 A sanity check of the hull pipeline on this room. The cross160
   target (the strip's far side, x 96-103, y 105-120) with level -1 160,5
   and `--prefer` the old forward's f157 witness gives OPTIMAL 157 (as
   cross160 did), in 116 s. The known route survives every pruning step:
   157 states, the node and W at every frame boundary, level -1.
-- 04:45 The hull tree's exact reach, rerun: the hull agent's build (1024
+- 04:00 The hull tree's exact reach, rerun: the hull agent's build (1024
   segments, first arrival on) reached f175 at 61 GB, growing 3.5 GB a
   frame, and would not fit to f223. Nothing was right of the strip at
   ceiling height through f175. `reach --max-segs N` and opt-in
@@ -593,7 +593,7 @@ itself on the strip and falls 2-3 px short.
   as `hull-mod-reach` (the hull tree is format 16, which develop does not
   read). Rerun with --max-segs 128: f130 in 20 s at a fraction of the
   memory.
-- 05:50 The lean reach (128 segments) died of OOM at f199 (90 GB). The
+- 04:33 The lean reach (128 segments) died of OOM at f199 (90 GB). The
   coarsened supersets snowball: 21M states at f197, 99.7% of them inexact.
   Even that superset had NOTHING right of the strip at ceiling height
   through f198. `reach --edge-cache F` is new (a state's edges kept only F
