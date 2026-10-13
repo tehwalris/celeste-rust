@@ -58,6 +58,25 @@ const MAX_SEGS: usize = 1 << 10;
 /// upper.
 const ACC_SEGS: usize = 32;
 
+/// What a reach keeps besides the reached sets.
+#[derive(Clone, Copy, Debug)]
+pub struct ReachOpts {
+    /// The most x segments a reached set keeps exactly (`MAX_SEGS`
+    /// default): lower trades precision (more inexact states, supersets)
+    /// for memory.
+    pub max_segs: usize,
+    /// Track FIRST ARRIVAL (`FrameReach::entered`, `Reach::entries`): a
+    /// union per state ever reached, the run's biggest memory after the
+    /// frame's sets.
+    pub first_arrival: bool,
+}
+
+impl Default for ReachOpts {
+    fn default() -> Self {
+        ReachOpts { max_segs: MAX_SEGS, first_arrival: false }
+    }
+}
+
 /// One frame's exact reach, summed.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct FrameReach {
@@ -166,7 +185,8 @@ pub fn points(r: &Region) -> u64 {
 /// and sets, and the inexact ones with their coarsest grid (the caller's
 /// facts, written as they come).
 #[allow(clippy::type_complexity)]
-pub fn reach(dir: &std::path::Path, horizon: u32, point: (u32, u32), threads: usize, mut visit: impl FnMut(&FrameReach, Option<Pushes>, &[(Sk, Region)], &FxHashMap<Sk, u8>) -> Result<()>) -> Result<Reach> {
+pub fn reach(dir: &std::path::Path, horizon: u32, point: (u32, u32), threads: usize, opts: ReachOpts, mut visit: impl FnMut(&FrameReach, Option<Pushes>, &[(Sk, Region)], &FxHashMap<Sk, u8>) -> Result<()>) -> Result<Reach> {
+    anyhow::ensure!((1..=super::arcs::MAX_SEGS).contains(&opts.max_segs), "max_segs {} outside 1..={}", opts.max_segs, super::arcs::MAX_SEGS);
     let geo = GEOMETRY;
     let seeds = super::arc_dp::Seeds::load(dir, horizon)?;
     let tree = crate::storage::layer::Tree::open(dir, horizon)?;
@@ -219,12 +239,23 @@ pub fn reach(dir: &std::path::Path, horizon: u32, point: (u32, u32), threads: us
             layers.push(tree.layer(layers.len() as u32, None, threads)?.0);
         }
         let mut by_layer: Vec<Vec<Sk>> = vec![Vec::new(); t as usize + 1];
+        let mut outside = 0u64;
         for (s, _) in &cur {
             if wins.binary_search(s).is_ok() || out.contains_key(s) {
                 continue;
             }
-            let f = (0..=t as usize).rev().find(|&f| layers[f].contains(*s)).ok_or_else(|| anyhow::anyhow!("f{t}: reached state {} is in no layer", s.show()))?;
-            by_layer[f].push(*s);
+            match (0..=t as usize).rev().find(|&f| layers[f].contains(*s)) {
+                Some(f) => by_layer[f].push(*s),
+                // A tree holds every state an exact remainder reaches (a
+                // hull forward's hulls hold the exact sets), so a state
+                // outside it is reached only by a COARSENED set (a
+                // superset): it has no edges, and nothing exact reaches it.
+                None if inexact.contains_key(s) => outside += 1,
+                None => anyhow::bail!("f{t}: state {} is reached with an EXACT remainder set but is in no layer of the tree: the forward lost it", s.show()),
+            }
+        }
+        if outside > 0 {
+            eprintln!("[reach] f{t:03}: {outside} states reached by coarsened sets only, outside the tree (left)");
         }
         for (f, ids) in by_layer.iter().enumerate() {
             for batch in ids.chunks(BATCH) {
@@ -249,8 +280,9 @@ pub fn reach(dir: &std::path::Path, horizon: u32, point: (u32, u32), threads: us
         let t_read = tt.elapsed().as_secs_f64();
         // First arrival: a state enters where `R_t` adds to its union so far.
         let acc_ref = &acc;
+        let grow_tasks = if opts.first_arrival { cur.len().div_ceil(GROW_CHUNK) } else { 0 };
         let grown = pool.map_with(
-            cur.len().div_ceil(GROW_CHUNK),
+            grow_tasks,
             || Ok((Vec::new(), Vec::new())),
             |(v, scratch): &mut (Vec<Piece>, Vec<Seg>), c| {
                 let mut res: Vec<(u32, Region)> = Vec::new();
@@ -358,14 +390,14 @@ pub fn reach(dir: &std::path::Path, horizon: u32, point: (u32, u32), threads: us
                             v.extend(tmp.iter().map(|&p| grid(p, snapped)));
                         }
                         if v.len() > lim {
-                            let (u, k) = union(v, scratch, snapped, MAX_SEGS);
+                            let (u, k) = union(v, scratch, snapped, opts.max_segs);
                             snapped = snapped.max(k);
                             v.clear();
                             u.pieces(v);
                             lim = (2 * v.len()).max(256);
                         }
                     }
-                    let (u, k) = union(v, scratch, snapped, MAX_SEGS);
+                    let (u, k) = union(v, scratch, snapped, opts.max_segs);
                     snapped = snapped.max(k);
                     if !u.is_empty() {
                         res.push((names_ref[d as usize], u, snapped, from));
@@ -479,7 +511,7 @@ mod tests {
         let tree = crate::storage::layer::Tree::open(&dir, 35).expect("tree");
         let mut per_frame: Vec<Vec<crate::storage::Sk>> = Vec::new();
         let mut sets: Vec<Vec<(crate::storage::Sk, super::Region)>> = Vec::new();
-        let r = super::reach(&dir, 35, p0, 4, |_, _, cur, inexact| {
+        let r = super::reach(&dir, 35, p0, 4, super::ReachOpts { first_arrival: true, ..Default::default() }, |_, _, cur, inexact| {
             assert!(inexact.is_empty(), "room (1,0) to h35 needs no coarsening");
             per_frame.push(cur.iter().map(|c| c.0).collect());
             sets.push(cur.to_vec());

@@ -172,6 +172,14 @@ enum Command {
         /// win is lost there (a win is not expanded).
         #[arg(long)]
         route: Option<String>,
+        /// The most x segments a reached set keeps exactly (past it: snapped
+        /// outward, INEXACT): lower for less memory on a long reach.
+        #[arg(long, default_value_t = 1024)]
+        max_segs: usize,
+        /// Also count FIRST ARRIVAL (`entered`, the summary's expansions): a
+        /// union per state ever reached, kept to the end.
+        #[arg(long)]
+        first_arrival: bool,
     },
     CheckKnown {
         /// The search's checkpoint dir (its `level{i:02}` trees).
@@ -959,8 +967,9 @@ fn main() -> Result<()> {
                 prev = Some((s.arc_marks.expect("asked for"), lvl));
             }
         }
-        Command::Reach { checkpoint_dir, level_index, to, save_marks, cells, decode_rect, decode_max, route } => {
-            reach_command(&checkpoint_dir, level_index, to, save_marks.as_deref(), cells.as_deref(), decode_rect.as_deref(), decode_max, route.as_deref(), &cfg)?;
+        Command::Reach { checkpoint_dir, level_index, to, save_marks, cells, decode_rect, decode_max, route, max_segs, first_arrival } => {
+            let opts = celeste_rust::search::reach::ReachOpts { max_segs, first_arrival };
+            reach_command(&checkpoint_dir, level_index, to, save_marks.as_deref(), cells.as_deref(), decode_rect.as_deref(), decode_max, route.as_deref(), opts, &cfg)?;
         }
         Command::CheckKnown { checkpoint_dir, level, inputs, horizon } => {
             use celeste_rust::search::arc_dp::solve;
@@ -2560,7 +2569,7 @@ mod tests {
 
 /// `rewrite reach` (search::reach): the run, its table and its outputs.
 #[allow(clippy::too_many_arguments)]
-fn reach_command(checkpoint_dir: &str, level_index: usize, to: u32, save: Option<&str>, cells_out: Option<&str>, decode_rect: Option<&str>, decode_max: usize, route: Option<&str>, cfg: &celeste_rust::settings::Settings) -> Result<()> {
+fn reach_command(checkpoint_dir: &str, level_index: usize, to: u32, save: Option<&str>, cells_out: Option<&str>, decode_rect: Option<&str>, decode_max: usize, route: Option<&str>, opts: celeste_rust::search::reach::ReachOpts, cfg: &celeste_rust::settings::Settings) -> Result<()> {
     use celeste_rust::search::pos_graph::cell_xy;
     use std::io::Write;
     let dir = std::path::Path::new(checkpoint_dir).join(format!("level{level_index:02}"));
@@ -2647,7 +2656,7 @@ fn reach_command(checkpoint_dir: &str, level_index: usize, to: u32, save: Option
     }
     let mut tsv = String::from(TSV_HEAD);
     let pool = celeste_rust::par::Pool::new(cfg.threads());
-    let r = celeste_rust::search::reach::reach(&dir, steps, point, cfg.threads(), |fr, pushes, cur, inexact| {
+    let r = celeste_rust::search::reach::reach(&dir, steps, point, cfg.threads(), opts, |fr, pushes, cur, inexact| {
         let t = fr.frame;
         for (ri, route_at) in routes.iter().enumerate() {
             if let Some(Some((sk, q, xy))) = route_at.get(t as usize) {
@@ -2755,14 +2764,16 @@ fn reach_command(checkpoint_dir: &str, level_index: usize, to: u32, save: Option
     let range = |a: usize, b: usize| e.iter().skip(a).take(b.saturating_sub(a)).sum::<u64>();
     let mut summary = String::new();
     summary += &format!("[reach] states ever reached: {live} (the forward visited {visited}: {:.2}%)\n", 100.0 * live as f64 / visited.max(1) as f64);
-    summary += &format!(
-        "[reach] first arrival (a lower bound: unions coarsened past 32 segments): entries per state 1: {}, 2: {}, 3-5: {}, 6+: {}; {entered} expansions against the forward's {expanded} ({:.2}%), {entered_edges} distinct out-edges pushed (the forward emitted {emitted} lanes)\n",
-        range(1, 2),
-        range(2, 3),
-        range(3, 6),
-        range(6, usize::MAX),
-        100.0 * entered as f64 / expanded.max(1) as f64
-    );
+    if opts.first_arrival {
+        summary += &format!(
+            "[reach] first arrival (a lower bound: unions coarsened past 32 segments): entries per state 1: {}, 2: {}, 3-5: {}, 6+: {}; {entered} expansions against the forward's {expanded} ({:.2}%), {entered_edges} distinct out-edges pushed (the forward emitted {emitted} lanes)\n",
+            range(1, 2),
+            range(2, 3),
+            range(3, 6),
+            range(6, usize::MAX),
+            100.0 * entered as f64 / expanded.max(1) as f64
+        );
+    }
     summary += &format!(
         "[reach] the upper bound, a state entering at every frame it is reached: {reached} expansions ({:.2}%), {reached_edges} distinct out-edges pushed\n",
         100.0 * reached as f64 / expanded.max(1) as f64
