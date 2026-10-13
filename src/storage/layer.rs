@@ -236,6 +236,11 @@ pub struct FrameHeader {
     pub keys: KeyAdditions,
     /// The skeletons of the shapes the file holds states of.
     pub skeletons: Vec<SkelRecord>,
+    /// The skeletons first EMITTED at the frame of the shapes it holds no
+    /// state of: a hull tree reaches a state of such a shape later by a
+    /// re-push, with no emission of the shape that frame - a resume
+    /// registers every file's (`frame::restore_visited`).
+    pub emitted: Vec<SkelRecord>,
     /// Per region held (ascending) its block.
     pub regions: Vec<RegionIndex>,
 }
@@ -255,6 +260,8 @@ pub struct FrameMeta<'a> {
     pub frame: u32,
     pub shapes: &'a [(u32, u64)],
     pub keys: &'a KeyAdditions,
+    /// `FrameHeader::emitted`.
+    pub emitted: &'a [SkelRecord],
 }
 
 /// One region's block: its entries' keys (delta-coded, ascending), masks
@@ -370,7 +377,8 @@ pub fn write_frame(path: &Path, meta: &FrameMeta, layer: &Layer, wins: &[(u32, u
     }
     let mut skeletons: Vec<SkelRecord> = layer.skeletons.values().map(|s| SkelRecord::of(s)).collect::<Result<_>>()?;
     skeletons.sort_by_key(|s| s.shape_hash);
-    let header = FrameHeader { frame: meta.frame, side: GEOMETRY.side, shapes: meta.shapes.to_vec(), keys: meta.keys.clone(), skeletons, regions: index };
+    ensure!(meta.emitted.iter().all(|e| !layer.skeletons.contains_key(&e.shape_hash)), "write_frame: an emitted skeleton of a shape the layer holds");
+    let header = FrameHeader { frame: meta.frame, side: GEOMETRY.side, shapes: meta.shapes.to_vec(), keys: meta.keys.clone(), skeletons, emitted: meta.emitted.to_vec(), regions: index };
     let hb = bincode::serialize(&header).context("a frame file's header")?;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -706,7 +714,7 @@ mod tests {
         let a = layer_of(&[(3, (0, 5), 0b1011), (3, (0, 9), 1 << 63), (3, (1 << 40, 2), 7), (70, (0, 1), 1), (4095, (5, 5), 0xffff_0000)]);
         let wins = vec![(1u32, 1u64 << 63), (4, 0x0001_0000)];
         let adds = KeyAdditions::default();
-        let meta = FrameMeta { frame: 7, shapes: &[], keys: &adds };
+        let meta = FrameMeta { frame: 7, shapes: &[], keys: &adds, emitted: &[] };
         let p = frame_path(&dir, 7);
         write_frame(&p, &meta, &a, &wins, 3).unwrap();
         check_frame_file(&p, &a, &wins, 2).unwrap();

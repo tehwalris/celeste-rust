@@ -708,8 +708,10 @@ pub struct ForwardState {
     xfers: crate::storage::edges::XferTable,
     /// The tree's out-edge files (the re-push reads an old state's edges).
     outs: crate::storage::out::OutStore,
-    /// The shapes' skeletons the emissions register (the next layers').
+    /// The shapes' skeletons the emissions register (the next layers'),
+    /// and the shapes whose skeleton a frame file holds.
     skeletons: crate::storage::decode::Skeletons,
+    persisted: rustc_hash::FxHashSet<u64>,
     observer: Option<crate::search::pos_graph::PosObserver>,
     /// The last frame computed (and checkpointed).
     pub frames: u32,
@@ -746,10 +748,10 @@ pub fn start_hull(s: &crate::settings::Settings) -> Result<Hull> {
 /// layer and hull - each read back and checked to hold exactly the wave's
 /// (`layer::check_frame_file`, `hulls::check`: the complete storage
 /// check). Returns whether a state wins.
-fn checkpoint(dir: &std::path::Path, frame: u32, wave: &crate::storage::wave::Wave, s: &crate::settings::Settings) -> Result<bool> {
+fn checkpoint(dir: &std::path::Path, frame: u32, wave: &crate::storage::wave::Wave, emitted: &[crate::storage::layer::SkelRecord], s: &crate::settings::Settings) -> Result<bool> {
     use crate::storage::{hulls, layer};
     let path = layer::frame_path(dir, frame);
-    let meta = layer::FrameMeta { frame, shapes: &wave.shapes, keys: &wave.keys };
+    let meta = layer::FrameMeta { frame, shapes: &wave.shapes, keys: &wave.keys, emitted };
     layer::write_frame(&path, &meta, &wave.next, &wave.wins, s.threads())?;
     layer::check_frame_file(&path, &wave.next, &wave.wins, s.threads())?;
     anyhow::ensure!(u16::try_from(frame).is_ok(), "frame {frame}: past a u16 layer");
@@ -778,7 +780,7 @@ impl ForwardState {
         s.write(dir, level)?;
         let mut visited = crate::storage::visited::VisitedSet::new(crate::storage::GEOMETRY);
         let seeded = crate::storage::wave::seed(&mut visited, &initial, level, start_hull(s)?, s)?;
-        let won = checkpoint(dir, 0, &seeded, s)?;
+        let won = checkpoint(dir, 0, &seeded, &[], s)?;
         let observer = record.then(crate::search::pos_graph::PosObserver::default);
         // An (empty) graph from the start: every tree with frames has one.
         if let Some(o) = observer.as_ref() {
@@ -787,7 +789,7 @@ impl ForwardState {
         let edges_dir = dir.join("edges");
         crate::storage::edges::set_done(&edges_dir, 0, 0)?;
         let outs = crate::storage::out::OutStore::open(&edges_dir, 0)?;
-        Ok(ForwardState { frontier: seeded.frontier(), visited, xfers: Default::default(), outs, skeletons: Default::default(), observer, frames: 0, win_frame: won.then_some(0), filter: Some(filter) })
+        Ok(ForwardState { frontier: seeded.frontier(), visited, xfers: Default::default(), outs, skeletons: Default::default(), persisted: Default::default(), observer, frames: 0, win_frame: won.then_some(0), filter: Some(filter) })
     }
 
     /// The forward as its checkpoint tree left it (`None`: no tree); extending
@@ -834,7 +836,8 @@ impl ForwardState {
         s.check(dir, level)?;
         let edges_dir = dir.join("edges");
         let filter = TreeFilter::read(dir)?;
-        let (visited, win_frame, frontier) = restore_visited(dir, last, Some(s.room), s.threads())?;
+        let (visited, win_frame, frontier, skeletons) = restore_visited(dir, last, s.room, s.threads())?;
+        let persisted = skeletons.shapes().into_iter().collect();
         let xfers = crate::storage::edges::XferTable::load(&edges_dir)?;
         let outs = crate::storage::out::OutStore::open(&edges_dir, last)?;
         let observer = if record {
@@ -845,7 +848,7 @@ impl ForwardState {
         } else {
             None
         };
-        Ok(ForwardState { frontier, visited, xfers, outs, skeletons: Default::default(), observer, frames: last, win_frame, filter })
+        Ok(ForwardState { frontier, visited, xfers, outs, skeletons, persisted, observer, frames: last, win_frame, filter })
     }
 
     /// The visited set's size: every distinct state reached so far.
@@ -948,7 +951,11 @@ impl ForwardState {
             self.frontier = Frontier::default();
             // Before the frame is trusted (every file, then done.txt).
             let t = std::time::Instant::now();
-            let won = checkpoint(dir, frame, &wave, s)?;
+            // The skeletons first emitted here, of shapes the frame holds
+            // no state of: a later re-push may reach one (`FrameHeader::emitted`).
+            let emitted = self.skeletons.records(|h| self.persisted.contains(&h) || wave.next.skeletons.contains_key(&h));
+            let won = checkpoint(dir, frame, &wave, &emitted, s)?;
+            self.persisted.extend(self.skeletons.shapes());
             let t_ckpt = t.elapsed();
             let t = std::time::Instant::now();
             if let Some(o) = self.observer.as_ref() {
@@ -1240,9 +1247,10 @@ pub(crate) fn append_forward_stats(dir: &std::path::Path, row: &[(&str, String)]
 /// a state stored twice is an error) and its hull files (replayed in order:
 /// a state's layer and hull are its last file's), its first win, and frame
 /// `last`'s FRONTIER - the states whose hull grew there, its new states with
-/// their skeletons (in a search from `room`, if given). Each frame's regions
-/// in parallel.
-pub fn restore_visited(dir: &std::path::Path, last: u32, room: Option<(i16, i16)>, threads: usize) -> Result<(crate::storage::visited::VisitedSet, Option<u32>, Frontier)> {
+/// their skeletons - and the skeletons registry as the emissions left it
+/// (every frame file's skeletons, in a search from `room`). Each frame's
+/// regions in parallel.
+pub fn restore_visited(dir: &std::path::Path, last: u32, room: (i16, i16), threads: usize) -> Result<(crate::storage::visited::VisitedSet, Option<u32>, Frontier, crate::storage::decode::Skeletons)> {
     use crate::storage::hulls;
     let geo = crate::storage::GEOMETRY;
     let tree = crate::storage::layer::Tree::open(dir, last)?;
@@ -1253,8 +1261,14 @@ pub fn restore_visited(dir: &std::path::Path, last: u32, room: Option<(i16, i16)
     visited.keys = tree.space.clone();
     use crate::storage::visited::StateInfo;
     let mut frontier = Frontier::default();
+    // The emissions' skeletons: every frame file's from frame 1 on (a
+    // layer's are the registry's; frame 0's are the start's reference rows').
+    let skeletons = crate::storage::decode::Skeletons::default();
     for f in 0..=last {
-        let (layer, _) = tree.layer(f, if f == last { room } else { None }, threads)?;
+        for r in tree.file(f).filter(|_| f > 0).iter().flat_map(|x| x.header.skeletons.iter().chain(&x.header.emitted)) {
+            skeletons.register(&r.rt2_in(room)?)?;
+        }
+        let (layer, _) = tree.layer(f, (f == last).then_some(room), threads)?;
         let held = visited.merge(&layer.set, threads)?;
         anyhow::ensure!(held == 0, "{}: f{f}: {held} states stored twice", dir.display());
         let p = hulls::path(dir, f);
@@ -1314,7 +1328,7 @@ pub fn restore_visited(dir: &std::path::Path, last: u32, room: Option<(i16, i16)
         )?;
     }
     anyhow::ensure!(visited.infos() <= visited.len(), "{}: {} states, {} with a hull stored", dir.display(), visited.len(), visited.infos());
-    Ok((visited, tree.first_win(), frontier))
+    Ok((visited, tree.first_win(), frontier, skeletons))
 }
 
 /// One row of a marks file: `(shape, cell, key.0, key.1, dist)`.
@@ -1508,8 +1522,10 @@ mod tests {
 
     /// KEYS ONLY: a frame file holds the frame's new states as keys and
     /// cell masks. The frontier a resume reads from them is the forward's
-    /// own - every entry's key and cells, every shape's skeleton - at every
-    /// frame to f36, and the files are a few bytes a state (the row-and-id
+    /// own - every entry's key and cells, every shape's skeleton, and every
+    /// skeleton the emissions registered (a re-push may reach a state of a
+    /// shape no emission of its frame has) - at every frame to f36, and the
+    /// files are a few bytes a state (the row-and-id
     /// files of format 14 were ~8 B a state; the rows themselves ~50 B).
     #[test]
     fn a_resumed_frontier_is_the_forwards_own() {
@@ -1532,6 +1548,7 @@ mod tests {
             assert_eq!(st.frontier.new.iter().collect::<Vec<_>>(), back.frontier.new.iter().collect::<Vec<_>>(), "f{f}: the frontier's entries");
             assert_eq!((&st.frontier.hulls, &st.frontier.old), (&back.frontier.hulls, &back.frontier.old), "f{f}: the frontier's hulls");
             assert_eq!(skel(&st.frontier.new), skel(&back.frontier.new), "f{f}: the frontier's skeletons");
+            assert_eq!(st.skeletons.records(|_| false), back.skeletons.records(|_| false), "f{f}: the registered skeletons");
             assert_eq!(st.visited.len(), back.visited.len(), "f{f}: the visited set");
             states += st.frontier.new.states();
             bytes += std::fs::metadata(crate::storage::layer::frame_path(&dir, f)).expect("stat").len();

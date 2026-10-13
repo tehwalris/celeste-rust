@@ -281,6 +281,18 @@ impl Skeletons {
         Ok(())
     }
 
+    /// The records of the shapes registered, but not `skip`ped.
+    pub fn records(&self, skip: impl Fn(u64) -> bool) -> Vec<super::layer::SkelRecord> {
+        let mut v: Vec<super::layer::SkelRecord> = self.0.read().expect("skeletons").iter().filter(|(h, _)| !skip(**h)).map(|(_, r)| r.0.clone()).collect();
+        v.sort_by_key(|r| r.shape_hash);
+        v
+    }
+
+    /// The shapes registered.
+    pub fn shapes(&self) -> Vec<u64> {
+        self.0.read().expect("skeletons").keys().copied().collect()
+    }
+
     /// The skeleton of `shape`.
     pub fn get(&self, shape: u64) -> Result<std::sync::Arc<Rt2>> {
         self.0.read().expect("skeletons").get(&shape).map(|x| x.1.clone()).ok_or_else(|| anyhow!("ROWS FROM KEYS: no skeleton of shape {shape:016x} (it was never emitted)"))

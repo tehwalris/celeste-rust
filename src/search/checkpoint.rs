@@ -21,8 +21,9 @@ const MAGIC: &[u8; 4] = b"C8TB";
 /// those its remainder hulls first reach, its hull file the frontier with
 /// every state's layer and hull; no drop notes (plans/architecture.md "The
 /// forward frame"). 17: a hull file holds its frame's new states by their
-/// hulls alone (in the frame file's order), its grown ones by layer.
-pub const FORMAT_VERSION: u32 = 17;
+/// hulls alone (in the frame file's order), its grown ones by layer. 18: a
+/// frame file holds the skeletons first emitted at it (`emitted`).
+pub const FORMAT_VERSION: u32 = 18;
 
 /// Save any serializable value (the marks, the pos-graph) under the same
 /// header, uncompressed bincode.
