@@ -485,19 +485,62 @@ impl<'a> UnitSink<'a> {
         }
     }
 
-    /// The hull of the unit's source `s` at `cell` (a lane of the unit).
+    /// The lane of the unit's source `s` at `cell`.
     #[inline]
-    fn src_hull(&self, s: u32, cell: u32) -> Hull {
+    fn src_lane(&self, s: u32, cell: u32) -> usize {
         let (slot, local) = super::GEOMETRY.slot_local(cell);
         let mut e = self.src_first[s as usize];
         while e != u32::MAX {
             let (next, sl, mask, lane) = self.entry_next[e as usize];
             if sl == slot && mask >> local & 1 == 1 {
-                return self.hulls[(lane + (mask & ((1u64 << local) - 1)).count_ones()) as usize];
+                return (lane + (mask & ((1u64 << local) - 1)).count_ones()) as usize;
             }
             e = next;
         }
         panic!("unit {}: a bundle's source cell {cell} of source {s} is no lane of the unit", self.unit)
+    }
+
+    /// The EDGES of bundle `b` (target slot `slot`; not `NO_XFER`'s) by
+    /// the unit's ENTRY they leave (a source key's cells in several regions
+    /// are several entries): `f(entry, its target cells, the shift to
+    /// their source cells)` - one shift of the grid between two cells'
+    /// regions (`bundle::shift_into`), else (into or out of `NO_CELL`) one
+    /// cell at a time and no shift: its source is `src_lane`'s.
+    #[inline]
+    fn by_entry(&self, slot: u32, b: &super::route::Ub, mut f: impl FnMut(u32, u64, Option<i32>)) {
+        use super::bundle::{shift_into, source_cell, TO_NONE};
+        let geo = super::GEOMETRY;
+        let none = geo.no_cell_slot();
+        if b.o < TO_NONE && slot != none {
+            let mut left = b.mask;
+            let mut e = self.src_first[b.s as usize];
+            while e != u32::MAX && left != 0 {
+                let (next, sl, _, _) = self.entry_next[e as usize];
+                if let Some((inside, k)) = (sl != none).then(|| shift_into(slot, sl, b.o)).flatten() {
+                    let part = left & inside;
+                    if part != 0 {
+                        left &= !part;
+                        f(e, part, Some(k));
+                    }
+                }
+                e = next;
+            }
+            assert!(left == 0, "unit {}: a bundle's source cells in no entry of the unit", self.unit);
+            return;
+        }
+        // Into or out of NO_CELL: cell by cell.
+        let mut m = b.mask;
+        while m != 0 {
+            let c = m.trailing_zeros();
+            m &= m - 1;
+            let s_slot = geo.slot_local(source_cell(geo.cell(slot, c), b.o)).0;
+            let mut e = self.src_first[b.s as usize];
+            while e != u32::MAX && self.entry_next[e as usize].1 != s_slot {
+                e = self.entry_next[e as usize].0;
+            }
+            assert!(e != u32::MAX, "unit {}: a bundle's source cell in no entry of the unit", self.unit);
+            f(e, 1u64 << c, None);
+        }
     }
 
     /// Does level -1 drop rows at emission (`minus_one_drops`)?
@@ -923,26 +966,43 @@ impl<'a> UnitSink<'a> {
         }
         slots.clear();
         slots.resize(n as usize, HullAcc::EMPTY);
+        // A bundle's edges: (source lane, target cell).
+        let mut edges: Vec<(u32, u8)> = Vec::with_capacity(64);
         for b in bundles {
             let (off, tm) = (offs[b.t as usize], targets[b.t as usize].1);
             debug_assert_eq!(b.mask & !tm, 0, "a bundle's cells outside its target's");
-            let mut m = b.mask;
-            while m != 0 {
-                let c = m.trailing_zeros();
-                m &= m - 1;
-                let at = (off + (tm & ((1u64 << c) - 1)).count_ones()) as usize;
-                if b.x == NO_XFER {
-                    slots[at].add_hull(&Hull::full());
-                    continue;
+            let at = |c: u32| (off + (tm & ((1u64 << c) - 1)).count_ones()) as usize;
+            if b.x == NO_XFER {
+                for c in super::layer::bits(b.mask) {
+                    slots[at(c)].add_hull(&Hull::full());
                 }
-                let h = self.src_hull(b.s, super::bundle::source_cell(geo.cell(slot, c), b.o));
-                let (tx, ty) = self.xfer_pairs[b.x as usize];
+                continue;
+            }
+            edges.clear();
+            self.by_entry(slot, b, |e, part, k| {
+                let (_, _, lanes, lane) = self.entry_next[e as usize];
+                match k {
+                    Some(k) => {
+                        let src = super::bundle::shift(part, k);
+                        assert!(src & !lanes == 0, "unit {}: a bundle's source cell is no lane of the unit", self.unit);
+                        edges.extend(super::layer::bits(src).map(|s| (lane + (lanes & ((1u64 << s) - 1)).count_ones(), (s as i32 - k) as u8)));
+                    }
+                    None => {
+                        let c = part.trailing_zeros();
+                        let src = super::bundle::source_cell(geo.cell(slot, c), b.o);
+                        edges.push((self.src_lane(b.s, src) as u32, c as u8));
+                    }
+                }
+            });
+            let (tx, ty) = self.xfer_pairs[b.x as usize];
+            for &(lane, c) in &edges {
+                let h = self.hulls[lane as usize];
                 let pushed = self.push_cache.get(&h, &h, b.x, || {
                     let mut a = HullAcc::EMPTY;
                     h.push(tx, ty, &mut a).then_some(a)
                 });
                 if let Some(a) = pushed {
-                    slots[at].merge(&a);
+                    slots[at(c as u32)].merge(&a);
                 }
             }
         }
@@ -1016,15 +1076,12 @@ impl<'a> UnitSink<'a> {
     }
 
     /// A RE-PUSH unit's pushes (`wave::run_repush`) as the chunks of their
-    /// routes: `targets` (route, key, cells), `pushes` (`target << 6 |
-    /// cell`, hull; merged here) - no bundle: the edges are recorded.
+    /// routes: `targets` (route, key, cells), each one's cells' hulls a run
+    /// of `slots` (`runs`: its start) - no bundle: the edges are recorded.
     #[inline(never)]
-    pub(crate) fn repush_chunks(&mut self, targets: &[(u32, Key, u64)], pushes: &mut Vec<(u32, HullAcc)>) {
-        pushes.sort_unstable_by_key(|x| x.0);
-        // Per target its route's chunk and its index there.
+    pub(crate) fn repush_chunks(&mut self, targets: &[(u32, Key, u64)], runs: &[(u32, u32)], slots: &[HullAcc]) {
         let mut order: Vec<u32> = (0..targets.len() as u32).collect();
         order.sort_unstable_by_key(|&t| targets[t as usize].0);
-        let mut place = vec![(0u32, 0u32); targets.len()];
         let mut chunks: Vec<Chunk> = Vec::new();
         let empty: std::sync::Arc<[(u32, Key)]> = Vec::new().into();
         for &t in &order {
@@ -1032,20 +1089,11 @@ impl<'a> UnitSink<'a> {
             if chunks.last().is_none_or(|c| c.route != route) {
                 chunks.push(Chunk { route, unit: self.unit, worker: self.worker, targets: Vec::new(), pushes: Vec::new(), sources: empty.clone(), bundles: Vec::new(), src_regions: Vec::new() });
             }
-            let ci = chunks.len() as u32 - 1;
             let c = chunks.last_mut().expect("pushed");
-            place[t as usize] = (ci, c.targets.len() as u32);
+            let lt = c.targets.len() as u32;
             c.targets.push((key, cells));
-        }
-        let mut last: Option<u32> = None;
-        for &(k, a) in pushes.iter() {
-            let (ci, lt) = place[(k >> 6) as usize];
-            let c = &mut chunks[ci as usize];
-            match (last, c.pushes.last_mut()) {
-                (Some(l), Some(p)) if l == k => p.2.merge(&a),
-                _ => c.pushes.push((lt, (k & 63) as u8, a)),
-            }
-            last = Some(k);
+            let run = &slots[runs[t as usize].0 as usize..];
+            c.pushes.extend(super::layer::bits(cells).zip(run).map(|(cell, h)| (lt, cell as u8, *h)));
         }
         self.outbox.append(&mut chunks);
     }
@@ -1053,10 +1101,9 @@ impl<'a> UnitSink<'a> {
     /// The unit's bundles (`buckets`: route, targets, bundles) as its
     /// OUT-EDGE block's parts (`storage::out`): each bundle's cells split
     /// by the source ENTRY they leave (a source key's cells in two regions
-    /// are two entries) - the entry found as `src_hull` finds a lane.
+    /// are two entries, `by_entry`).
     #[inline(never)]
     fn out_parts_of(&mut self, buckets: &[(u32, Vec<(Key, u64)>, Vec<super::route::Ub>)]) {
-        let geo = super::GEOMETRY;
         let mut p = std::mem::take(&mut self.out_parts);
         p.clear();
         // Routes, pairs, targets: sorted, and each one's rank.
@@ -1098,19 +1145,10 @@ impl<'a> UnitSink<'a> {
                 let (t, x) = (t_rank[bi][u.t as usize], x_rank[&u.x]);
                 // The cells by source entry (one, mostly).
                 let mut parts: [(u32, u64); 4] = [(u32::MAX, 0); 4];
-                let mut m = u.mask;
-                while m != 0 {
-                    let c = m.trailing_zeros();
-                    m &= m - 1;
-                    let s_slot = geo.slot_local(super::bundle::source_cell(geo.cell(slot, c), u.o)).0;
-                    let mut e = self.src_first[u.s as usize];
-                    while e != u32::MAX && self.entry_next[e as usize].1 != s_slot {
-                        e = self.entry_next[e as usize].0;
-                    }
-                    assert!(e != u32::MAX, "unit {}: a bundle's source cell in no entry of the unit", self.unit);
+                self.by_entry(slot, u, |e, part, _| {
                     let k = parts.iter().position(|q| q.0 == e || q.0 == u32::MAX).expect("a target region's cells leave at most four source regions");
-                    parts[k] = (e, parts[k].1 | 1u64 << c);
-                }
+                    parts[k] = (e, parts[k].1 | part);
+                });
                 for &(e, mask) in parts.iter().take_while(|q| q.0 != u32::MAX) {
                     p.rows.push((super::out::row_key(e, t, x, u.o), mask));
                 }

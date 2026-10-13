@@ -843,16 +843,72 @@ fn mark_filter(sealed: &mut [super::route::Sealed], f: &crate::frame::MarkFilter
     Ok(())
 }
 
-/// A worker's buffers for its re-push units: the out file's block, the
-/// pushes' targets (by (route, key): their index, cells) and the pushes.
+/// A re-push unit's pushes by target (route, key): per target its cells
+/// and their merged hulls, a run of `slots` in cell order (moved to the
+/// end, its capacity doubled, when a cell joins a full one).
+#[derive(Default)]
+struct CellAccs {
+    idx: FxHashMap<(u32, Key), u32>,
+    /// Per target: (route, key, cells), (its run's start, its capacity).
+    targets: Vec<(u32, Key, u64)>,
+    runs: Vec<(u32, u32)>,
+    slots: Vec<HullAcc>,
+}
+
+impl CellAccs {
+    fn clear(&mut self) {
+        self.idx.clear();
+        self.targets.clear();
+        self.runs.clear();
+        self.slots.clear();
+    }
+
+    /// Target (route, key)'s index (new: no cell yet).
+    fn target(&mut self, route: u32, key: Key) -> u32 {
+        let n = self.targets.len() as u32;
+        let t = *self.idx.entry((route, key)).or_insert(n);
+        if t == n {
+            self.targets.push((route, key, 0));
+            self.runs.push((self.slots.len() as u32, 0));
+        }
+        t
+    }
+
+    /// `a` merged into target `t`'s cell `c`.
+    #[inline]
+    fn merge(&mut self, t: u32, c: u32, a: &HullAcc) {
+        let m = self.targets[t as usize].2;
+        let (start, cap) = self.runs[t as usize];
+        let rank = (m & ((1u64 << c) - 1)).count_ones();
+        if m >> c & 1 != 0 {
+            self.slots[(start + rank) as usize].merge(a);
+            return;
+        }
+        let len = m.count_ones();
+        let start = if len < cap {
+            start
+        } else {
+            let at = self.slots.len() as u32;
+            let cap = (cap * 2).clamp(4, 64);
+            self.slots.extend_from_within(start as usize..(start + len) as usize);
+            self.slots.resize((at + cap) as usize, HullAcc::EMPTY);
+            self.runs[t as usize] = (at, cap);
+            at
+        };
+        let (s, r, l) = (start as usize, rank as usize, len as usize);
+        self.slots.copy_within(s + r..s + l, s + r + 1);
+        self.slots[s + r] = *a;
+        self.targets[t as usize].2 = m | 1u64 << c;
+    }
+}
+
+/// A worker's buffers for its re-push units: the out file's block and the
+/// pushes by target.
 #[derive(Default)]
 struct RepushScratch {
     dec: Option<zstd::bulk::Decompressor<'static>>,
     raw: Vec<u8>,
-    t_idx: FxHashMap<(u32, Key), u32>,
-    targets: Vec<(u32, Key, u64)>,
-    acc: FxHashMap<u32, HullAcc>,
-    pushes: Vec<(u32, HullAcc)>,
+    accs: CellAccs,
     /// Per block target its unit target (`u32::MAX`: none yet), per block
     /// route its cells level -1 drops at the frame (`None`: not yet asked).
     t_of: Vec<u32>,
@@ -869,13 +925,12 @@ struct RepushScratch {
 /// Returns the edges looked at.
 #[inline(never)]
 fn run_repush(u: u32, old: &[Old], outs: &super::out::OutStore, sink: &mut UnitSink, sc: &mut RepushScratch) -> Result<u64> {
+    use super::bundle::{source_cell, source_cells, TO_NONE};
     use std::cell::Cell;
     let geo = GEOMETRY;
+    let none_slot = geo.no_cell_slot();
     sink.begin(u);
-    sc.t_idx.clear();
-    sc.targets.clear();
-    sc.acc.clear();
-    sc.pushes.clear();
+    sc.accs.clear();
     let Some(first) = old.first() else { return Ok(0) };
     let f = first.layer as u32 + 1;
     let file = outs.file(f).ok_or_else(|| anyhow!("re-push unit {u}: no out-edges of frame {f}"))?;
@@ -886,6 +941,8 @@ fn run_repush(u: u32, old: &[Old], outs: &super::out::OutStore, sink: &mut UnitS
     let cursor = Cell::new(0usize);
     // The entry being read: its first old state, and its old cells.
     let entry = Cell::new((0usize, 0u64));
+    // A bundle's edges out of old states: (source cell, target cell).
+    let mut pairs_of = [(0u8, 0u8); 64];
     for bi in file.blocks(lo, hi) {
         // A block none of the unit's states is in is not read.
         let (bf, bl) = file.range(bi);
@@ -897,12 +954,11 @@ fn run_repush(u: u32, old: &[Old], outs: &super::out::OutStore, sink: &mut UnitS
         let blk = super::out::Block::open(&sc.raw)?;
         let routes: Vec<u32> = blk.routes.iter().map(|&(shape, slot)| sink.route(shape, slot)).collect();
         let pairs: Vec<(crate::search::arcs::Transfer, crate::search::arcs::Transfer)> = blk.pairs.iter().map(|p| (p.0.transfer(), p.1.transfer())).collect();
-        let (t_idx, targets, acc_of) = (&mut sc.t_idx, &mut sc.targets, &mut sc.acc);
         sc.t_of.clear();
         sc.t_of.resize(blk.targets.len(), u32::MAX);
         sc.late.clear();
         sc.late.resize(blk.routes.len(), None);
-        let (t_of, late, cache) = (&mut sc.t_of, &mut sc.late, &mut sc.cache);
+        let (accs, t_of, late, cache) = (&mut sc.accs, &mut sc.t_of, &mut sc.late, &mut sc.cache);
         cache.next_epoch();
         let mut bad = false;
         blk.entries(
@@ -920,26 +976,55 @@ fn run_repush(u: u32, old: &[Old], outs: &super::out::OutStore, sink: &mut UnitS
                     false
                 }
             },
-            |_, _, it| {
+            |region, _, it| {
                 let (a, cells) = entry.get();
+                let s_slot = region % geo.slots;
                 for ob in it {
                     let (Some(&(r, t_key)), Some(&(tx, ty))) = (blk.targets.get(ob.t as usize), pairs.get(ob.x as usize)) else {
                         bad = true;
                         return;
                     };
-                    let ((shape, slot), route) = (blk.routes[r as usize], routes[r as usize]);
-                    let dropped = *late[r as usize].get_or_insert_with(|| (0..64u32).filter(|&c| (slot != geo.no_cell_slot() || c == 0) && sink.minus_one_drop(shape, geo.cell(slot, c))).fold(0u64, |a, c| a | 1u64 << c));
-                    let mut m = ob.mask & !dropped;
-                    while m != 0 {
-                        let c = m.trailing_zeros();
-                        m &= m - 1;
-                        let s_local = geo.slot_local(super::bundle::source_cell(geo.cell(slot, c), ob.o)).1;
-                        if cells >> s_local & 1 == 0 {
-                            continue;
+                    let ((shape, t_slot), route) = (blk.routes[r as usize], routes[r as usize]);
+                    let dropped = *late[r as usize].get_or_insert_with(|| (0..64u32).filter(|&c| (t_slot != none_slot || c == 0) && sink.minus_one_drop(shape, geo.cell(t_slot, c))).fold(0u64, |a, c| a | 1u64 << c));
+                    let m = ob.mask & !dropped;
+                    if m == 0 {
+                        continue;
+                    }
+                    // The edges out of old cells: the target cells shifted
+                    // to their sources (the common case), else cell by cell.
+                    let mut n = 0usize;
+                    if ob.o < TO_NONE && t_slot != none_slot && s_slot != none_slot {
+                        let Some((src, k)) = source_cells(t_slot, s_slot, ob.o, m) else {
+                            bad = true;
+                            return;
+                        };
+                        let mut live = src & cells;
+                        while live != 0 {
+                            let s = live.trailing_zeros();
+                            live &= live - 1;
+                            pairs_of[n] = (s as u8, (s as i32 - k) as u8);
+                            n += 1;
                         }
+                    } else {
+                        let mut mm = m;
+                        while mm != 0 {
+                            let c = mm.trailing_zeros();
+                            mm &= mm - 1;
+                            let (slot, s) = geo.slot_local(source_cell(geo.cell(t_slot, c), ob.o));
+                            if slot != s_slot {
+                                bad = true;
+                                return;
+                            }
+                            if cells >> s & 1 != 0 {
+                                pairs_of[n] = (s as u8, c as u8);
+                                n += 1;
+                            }
+                        }
+                    }
+                    edges += n as u64;
+                    for &(s, c) in &pairs_of[..n] {
                         // Old states of an entry are by cell: a cell's rank among them.
-                        let o = &old[a + (cells & ((1u64 << s_local) - 1)).count_ones() as usize];
-                        edges += 1;
+                        let o = &old[a + (cells & ((1u64 << s) - 1)).count_ones() as usize];
                         let Some(acc) = cache.get(&o.hull, &o.was, ob.x, || {
                             let mut a = HullAcc::EMPTY;
                             o.hull.push_grown(&o.was, tx, ty, &mut a).then_some(a)
@@ -948,26 +1033,20 @@ fn run_repush(u: u32, old: &[Old], outs: &super::out::OutStore, sink: &mut UnitS
                         };
                         let t = match t_of[ob.t as usize] {
                             u32::MAX => {
-                                let n = targets.len() as u32;
-                                let t = *t_idx.entry((route, t_key)).or_insert(n);
-                                if t == n {
-                                    targets.push((route, t_key, 0));
-                                }
+                                let t = accs.target(route, t_key);
                                 t_of[ob.t as usize] = t;
                                 t
                             }
                             t => t,
                         };
-                        targets[t as usize].2 |= 1u64 << c;
-                        acc_of.entry(t << 6 | c).or_insert(HullAcc::EMPTY).merge(&acc);
+                        accs.merge(t, c as u32, &acc);
                     }
                 }
             },
         )?;
-        ensure!(!bad, "re-push unit {u}: an out block's bundle names a target or transfer past its tables");
+        ensure!(!bad, "re-push unit {u}: an out block's bundle names a target or transfer past its tables, or a source cell outside its entry's region");
     }
-    sc.pushes.extend(sc.acc.drain());
-    sink.repush_chunks(&sc.targets, &mut sc.pushes);
+    sink.repush_chunks(&sc.accs.targets, &sc.accs.runs, &sc.accs.slots);
     Ok(edges)
 }
 

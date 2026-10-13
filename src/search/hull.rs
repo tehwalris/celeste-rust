@@ -26,6 +26,7 @@ use super::arcs::{Action, Piece, Region, Seg, Transfer, CIRCLE};
 /// An ARC of the circle: `last + 1` points from `start`, wrapping past the
 /// end (`last + 1` is at most `CIRCLE`; the whole circle starts at 0).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Default)]
+#[repr(C)]
 pub struct Arc {
     pub start: u16,
     pub last: u16,
@@ -82,6 +83,7 @@ impl Arc {
 /// A state's HULL: one arc per axis, the box of the remainders it is
 /// reached with. Never empty.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Default)]
+#[repr(C)]
 pub struct Hull {
     pub x: Arc,
     pub y: Arc,
@@ -161,6 +163,13 @@ impl Hull {
             return false;
         }
         self.push(tx, ty, acc)
+    }
+
+    /// `x.start, x.last, y.start, y.last` in one word, low first
+    /// (`to_bytes` little-endian).
+    #[inline]
+    pub fn word(&self) -> u64 {
+        self.x.start as u64 | (self.x.last as u64) << 16 | (self.y.start as u64) << 32 | (self.y.last as u64) << 48
     }
 
     /// Little-endian `x.start, x.last, y.start, y.last`.
@@ -268,8 +277,8 @@ impl PushCache {
     /// pushed the first time) along transfer `x`, `f()` on a miss.
     #[inline]
     pub fn get(&mut self, h: &Hull, was: &Hull, x: u32, f: impl FnOnce() -> Option<HullAcc>) -> Option<HullAcc> {
-        let (a, b) = (u64::from_le_bytes(h.to_bytes()), u64::from_le_bytes(was.to_bytes()));
-        let k = celeste_engine::runtime2::mix64(a ^ b.rotate_left(23) ^ (x as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15)) as usize & (PUSH_CACHE - 1);
+        let (a, b) = (h.word(), was.word());
+        let k = ((a ^ b.rotate_left(29) ^ (x as u64) << 45).wrapping_mul(0x9e37_79b9_7f4a_7c15) >> (64 - PUSH_CACHE.trailing_zeros())) as usize;
         let e = &mut self.slots[k];
         if (e.0, e.1, e.2, e.3) == (a, b, x, self.epoch) {
             return e.4;
@@ -293,11 +302,12 @@ const CUT: [u32; 2] = [0, CIRCLE / 2];
 
 /// A HULL BEING ACCUMULATED (module doc): per axis, per chart, the linear
 /// hull `[lo, hi]` in the chart's coordinates of every point added (`lo >
-/// hi`: none). Merging is min and max: the result does not depend on the
-/// order things are added in.
+/// hi`: none) - `lo` and `hi` by `axis * 2 + chart`. Merging is min and
+/// max: the result does not depend on the order things are added in.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct HullAcc {
-    c: [[(u16, u16); 2]; 2],
+    lo: [u16; 4],
+    hi: [u16; 4],
 }
 
 impl Default for HullAcc {
@@ -307,24 +317,25 @@ impl Default for HullAcc {
 }
 
 impl HullAcc {
-    pub const EMPTY: HullAcc = HullAcc { c: [[(u16::MAX, 0); 2]; 2] };
+    pub const EMPTY: HullAcc = HullAcc { lo: [u16::MAX; 4], hi: [0; 4] };
 
     /// Nothing added (on either axis: a box with an empty side is empty)?
     #[inline]
     pub fn is_empty(&self) -> bool {
-        self.c[0][0].0 > self.c[0][0].1 || self.c[1][0].0 > self.c[1][0].1
+        self.lo[0] > self.hi[0] || self.lo[2] > self.hi[2]
     }
 
     /// Add segment `s` of axis `axis` (0: x, 1: y).
     #[inline]
     pub fn add_seg(&mut self, axis: usize, s: Seg) {
         debug_assert!(s.lo < s.hi && s.hi <= CIRCLE);
-        for (c, iv) in self.c[axis].iter_mut().enumerate() {
-            let a = (s.lo + CIRCLE - CUT[c]) % CIRCLE;
-            let b = (s.hi - 1 + CIRCLE - CUT[c]) % CIRCLE;
+        for (c, cut) in CUT.into_iter().enumerate() {
+            let a = (s.lo + CIRCLE - cut) % CIRCLE;
+            let b = (s.hi - 1 + CIRCLE - cut) % CIRCLE;
             let (lo, hi) = if a <= b { (a, b) } else { (0, CIRCLE - 1) };
-            iv.0 = iv.0.min(lo as u16);
-            iv.1 = iv.1.max(hi as u16);
+            let i = axis * 2 + c;
+            self.lo[i] = self.lo[i].min(lo as u16);
+            self.hi[i] = self.hi[i].max(hi as u16);
         }
     }
 
@@ -338,9 +349,9 @@ impl HullAcc {
     /// Add everything `o` holds.
     #[inline]
     pub fn merge(&mut self, o: &HullAcc) {
-        for (a, b) in self.c.iter_mut().flatten().zip(o.c.iter().flatten()) {
-            a.0 = a.0.min(b.0);
-            a.1 = a.1.max(b.1);
+        for i in 0..4 {
+            self.lo[i] = self.lo[i].min(o.lo[i]);
+            self.hi[i] = self.hi[i].max(o.hi[i]);
         }
     }
 
@@ -356,7 +367,8 @@ impl HullAcc {
         }
         let axis = |a: usize| {
             let mut best: Option<Arc> = None;
-            for (c, &(lo, hi)) in self.c[a].iter().enumerate() {
+            for c in 0..2 {
+                let (lo, hi) = (self.lo[a * 2 + c], self.hi[a * 2 + c]);
                 let len = hi as u32 - lo as u32 + 1;
                 if best.is_none_or(|b| len < b.len()) {
                     best = Some(if len == CIRCLE { Arc::full() } else { Arc { start: ((lo as u32 + CUT[c]) % CIRCLE) as u16, last: (len - 1) as u16 } });

@@ -76,6 +76,54 @@ pub fn source_cell(t: u32, o: u32) -> u32 {
     }
 }
 
+/// A cell-to-cell offset code `o` (below `TO_NONE`) from target slot
+/// `t_slot` back to source slot `s_slot` (neither `NO_CELL`'s) as ONE
+/// SHIFT `k` of the regions' 8 x 8 grids (a source cell's index is its
+/// target's plus `k`): the target cells whose source is in the source
+/// region, and `k`. `None` when there is none.
+#[inline]
+pub fn shift_into(t_slot: u32, s_slot: u32, o: u32) -> Option<(u64, i32)> {
+    let geo = super::GEOMETRY;
+    debug_assert!(o < TO_NONE && t_slot != geo.no_cell_slot() && s_slot != geo.no_cell_slot());
+    let (side, pr) = (geo.side as i32, geo.per_row);
+    let (dx, dy) = ((o >> 11) as i32 - 1024, (o & 2047) as i32 - 1024);
+    // A source cell is its target cell plus (ddx, ddy) in the regions' grids.
+    let ddx = ((t_slot % pr) as i32 - (s_slot % pr) as i32) * side - dx;
+    let ddy = ((t_slot / pr) as i32 - (s_slot / pr) as i32) * side - dy;
+    if ddx.abs() >= side || ddy.abs() >= side {
+        return None;
+    }
+    // The columns and rows the shift moves off the grid.
+    const COL: u64 = 0x0101_0101_0101_0101;
+    let cols = if ddx >= 0 { (0xffu64 << (8 - ddx)) & 0xff } else { (1u64 << -ddx) - 1 } * COL;
+    let rows = match ddy {
+        0 => 0,
+        d if d > 0 => !0u64 << (8 * (8 - d)),
+        d => (1u64 << (8 * -d)) - 1,
+    };
+    Some((!(cols | rows), 8 * ddy + ddx))
+}
+
+/// Cells `m` moved by `k` (`shift_into`; `m` inside its cells).
+#[inline]
+pub fn shift(m: u64, k: i32) -> u64 {
+    if k >= 0 {
+        m << k
+    } else {
+        m >> -k
+    }
+}
+
+/// The SOURCE cells of target cells `mask` (not empty) of slot `t_slot`
+/// at offset code `o`, all in source slot `s_slot`'s region
+/// (`shift_into`): the shifted mask and the shift. `None` when a cell of
+/// `mask` leaves the region: no bundle of a source in it holds that cell.
+#[inline]
+pub fn source_cells(t_slot: u32, s_slot: u32, o: u32, mask: u64) -> Option<(u64, i32)> {
+    let (inside, k) = shift_into(t_slot, s_slot, o)?;
+    (mask & !inside == 0).then(|| (shift(mask, k), k))
+}
+
 /// An offset in a block: `(dx + 8) << 4 | (dy + 8)` for |d| <= 7 (never 0),
 /// else 0 and the code as a varint.
 #[inline]
@@ -570,6 +618,49 @@ mod tests {
         let mut b = Vec::new();
         put_off(&mut b, offset(5, 6));
         assert_eq!(b.len(), 1, "a near offset is one byte");
+    }
+
+    /// `source_cells` is `source_cell` cell by cell: every cell of a mask
+    /// shifted to its source when all of them stay in the source region,
+    /// `None` otherwise.
+    #[test]
+    fn source_cells_shift_the_grid() {
+        let geo = super::super::GEOMETRY;
+        let mut v = 11u64;
+        let (mut some, mut none) = (0, 0);
+        for _ in 0..20000 {
+            let t_slot = (lcg(&mut v) % (geo.slots as u64 - 1)) as u32;
+            let (rx, ry) = ((t_slot % geo.per_row) as i32, (t_slot / geo.per_row) as i32);
+            let s_slot = ((ry + (lcg(&mut v) % 3) as i32 - 1).clamp(0, geo.per_row as i32 - 1) * geo.per_row as i32 + (rx + (lcg(&mut v) % 3) as i32 - 1).clamp(0, geo.per_row as i32 - 1)) as u32;
+            let (dx, dy) = ((lcg(&mut v) % 17) as i32 - 8, (lcg(&mut v) % 17) as i32 - 8);
+            let o = ((dx + 1024) as u32) << 11 | (dy + 1024) as u32;
+            let mut mask = lcg(&mut v) & lcg(&mut v) & lcg(&mut v);
+            if lcg(&mut v) % 2 == 0 {
+                // Only the cells whose source is in the region.
+                mask &= (0..64u32).filter(|&c| geo.slot_local(source_cell(geo.cell(t_slot, c), o)).0 == s_slot).fold(0, |m, c| m | 1u64 << c);
+            }
+            if mask == 0 {
+                continue;
+            }
+            let each: Option<u64> = (0..64u32).filter(|&c| mask >> c & 1 != 0).try_fold(0u64, |m, c| {
+                let (slot, local) = geo.slot_local(source_cell(geo.cell(t_slot, c), o));
+                (slot == s_slot).then_some(m | 1u64 << local)
+            });
+            match source_cells(t_slot, s_slot, o, mask) {
+                Some((src, k)) => {
+                    assert_eq!(Some(src), each, "slots {t_slot} {s_slot} offset ({dx}, {dy}) mask {mask:x}");
+                    for c in (0..64u32).filter(|&c| mask >> c & 1 != 0) {
+                        assert_eq!(geo.slot_local(source_cell(geo.cell(t_slot, c), o)).1 as i32, c as i32 + k);
+                    }
+                    some += 1;
+                }
+                None => {
+                    assert!(each.is_none(), "slots {t_slot} {s_slot} offset ({dx}, {dy}) mask {mask:x}: refused");
+                    none += 1;
+                }
+            }
+        }
+        assert!(some > 1000 && none > 1000, "{some} shifted, {none} refused");
     }
 
     /// A block decodes to its bundles in every order, wide keys and shapes
