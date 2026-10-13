@@ -234,7 +234,7 @@ impl VisitedSet {
             let mut g = w.lock().expect("a merge");
             let (t, n) = &mut *g;
             let before = t.states();
-            t.merge(n);
+            t.merge(n, |_, _| {});
             before + n.states() - t.states()
         });
         Ok(held.into_iter().sum())
@@ -329,12 +329,12 @@ impl VisitedSet {
             let (t, m, i) = &mut *g;
             let (region, new, hulls, grown) = parts[*i];
             let before = t.states();
-            t.merge(new);
+            let mut entries: Vec<u32> = Vec::with_capacity(new.len());
+            t.merge(new, |_, e| entries.push(e));
             let held = before + new.states() - t.states();
             let mut h = hulls.iter();
             let mut batch: Vec<(u32, StateInfo)> = Vec::new();
-            for (key, mask) in new.iter() {
-                let e = t.find(key).expect("merged");
+            for ((_, mask), &e) in new.iter().zip(&entries) {
                 batch.clear();
                 let mut c = mask;
                 while c != 0 {

@@ -439,7 +439,7 @@ pub fn run_wave(engine: &dyn FrameStep, front: &Frontier, cx: WaveCtx) -> Result
                         if let Some(job) = pipe.pop_job() {
                             let t = Instant::now();
                             let tp = phases::start(s.diag.phases);
-                            let rcx = RegionCtx { frame, record, remaps: &job.remaps, new_xfers: xfers_before as u32 };
+                            let rcx = RegionCtx { frame, visited, record, remaps: &job.remaps, new_xfers: xfers_before as u32 };
                             let cs: Vec<&Chunk> = job.chunks.iter().collect();
                             let mut route = job.state.lock().expect("a route");
                             let r = super::route::run_route(&mut route, job.slice, &cs, &rcx, sc);

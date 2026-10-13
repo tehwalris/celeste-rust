@@ -366,8 +366,9 @@ impl RegionTable {
     }
 
     /// Every entry `(k, cells)` of the frozen `other` ORed into this indexed
-    /// table (made where absent), the index sized first: a merge.
-    pub fn merge(&mut self, other: &RegionTable) {
+    /// table (made where absent), the index sized first: a merge. Calls
+    /// `at(i, e)` with each of `other`'s entries' place `e` here.
+    pub fn merge(&mut self, other: &RegionTable, mut at: impl FnMut(usize, u32)) {
         debug_assert!(!self.is_frozen());
         let add = other.iter().filter(|(k, _)| self.find(*k).is_none()).count();
         let widest = (0..other.len()).map(|e| bytes_of(other.wkey(e))).max().unwrap_or(1);
@@ -375,8 +376,8 @@ impl RegionTable {
             self.repack(widest);
         }
         self.reserve(add);
-        for (k, m) in other.iter() {
-            self.insert_or(k, m);
+        for (i, (k, m)) in other.iter().enumerate() {
+            at(i, self.insert_or(k, m).0);
         }
     }
 
@@ -582,8 +583,8 @@ mod tests {
         // Merge a frozen table into a fresh indexed one, twice: the second
         // adds nothing new.
         let mut g = RegionTable::new();
-        g.merge(&f);
-        g.merge(&f);
+        g.merge(&f, |_, _| {});
+        g.merge(&f, |_, _| {});
         assert_eq!(g.len(), f.len());
         assert_eq!(g.states(), f.states());
         // Across chunks: 100k entries (three chunks and part of a fourth),
@@ -603,7 +604,7 @@ mod tests {
         assert!(fb.iter().map(|x| wide(x.0)).collect::<Vec<_>>().windows(2).all(|w| w[0] < w[1]));
         assert_eq!(fb.states(), 100_000);
         let mut gb = RegionTable::new();
-        gb.merge(&fb);
+        gb.merge(&fb, |_, _| {});
         assert_eq!((gb.len(), gb.states()), (100_000, 100_000));
         assert_eq!(gb.mask_of((1, 99_999)), 1 << (99_999 % 64));
         // Narrow keys stay narrow.

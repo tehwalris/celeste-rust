@@ -42,26 +42,39 @@ const PROV: u32 = u32::MAX;
 /// A route's TOUCHED states this frame: per key pushed into (one probe of
 /// `index` a key, as the dedup's), the cells pushed and the RUN of their
 /// hulls so far in `slots` (by cell; a run moves to the end when its key
-/// gains a cell).
+/// gains a cell), and what the visited set holds of the key.
 #[derive(Default)]
 pub struct Touched {
     index: FxHashMap<Key, u32>,
-    /// Per key: the key, its cells, its run's start.
-    keys: Vec<(Key, u64, u32)>,
+    keys: Vec<TouchedKey>,
     slots: Vec<HullAcc>,
     states: usize,
 }
 
+/// A touched key: its cells, its run's start, and its entry in the visited
+/// set's table with the cells held there (none: 0).
+#[derive(Clone, Copy, Debug)]
+pub struct TouchedKey {
+    pub key: Key,
+    pub cells: u64,
+    pub start: u32,
+    pub entry: u32,
+    pub held: u64,
+}
+
 impl Touched {
-    /// Merge `cells` (by cell, ascending: `(cell, hull)`) into key `key`'s.
+    /// Merge `cells` (by cell, ascending: `(cell, hull)`) into key `key`'s;
+    /// a key new to the route is looked up (`held`: its visited entry and
+    /// cells).
     #[inline]
-    pub fn push(&mut self, key: Key, cells: &[(u8, HullAcc)]) {
+    pub fn push(&mut self, key: Key, cells: &[(u8, HullAcc)], held: impl FnOnce(Key) -> (u32, u64)) {
         let n = self.keys.len() as u32;
         let e = *self.index.entry(key).or_insert(n);
         if e == n {
-            self.keys.push((key, 0, self.slots.len() as u32));
+            let (entry, held) = held(key);
+            self.keys.push(TouchedKey { key, cells: 0, start: self.slots.len() as u32, entry, held });
         }
-        let (_, mask, start) = self.keys[e as usize];
+        let TouchedKey { cells: mask, start, .. } = self.keys[e as usize];
         let add = cells.iter().fold(0u64, |m, x| m | 1u64 << x.0);
         let rank = |m: u64, c: u8| (m & ((1u64 << c) - 1)).count_ones() as usize;
         if add & !mask == 0 {
@@ -83,7 +96,7 @@ impl Touched {
             self.slots[at + rank(next, c)].merge(a);
         }
         self.states += (add & !mask).count_ones() as usize;
-        self.keys[e as usize] = (key, next, at as u32);
+        (self.keys[e as usize].cells, self.keys[e as usize].start) = (next, at as u32);
     }
 
     pub fn is_empty(&self) -> bool {
@@ -97,25 +110,25 @@ impl Touched {
 
     /// The keys pushed into.
     pub fn keys(&self) -> impl Iterator<Item = Key> + '_ {
-        self.keys.iter().map(|k| k.0)
+        self.keys.iter().map(|k| k.key)
     }
 
     /// The keys pushed into, each `key(k)` (a provisional key made final:
-    /// distinct keys stay distinct), sorted: per key its cells and its
-    /// run's start in the hulls so far (by cell).
-    pub fn into_sorted(self, key: impl Fn(Key) -> Result<Key>) -> Result<(Vec<(Key, u64, u32)>, Vec<HullAcc>)> {
+    /// distinct keys stay distinct), sorted, and the hulls so far (each
+    /// key's run by cell).
+    pub fn into_sorted(self, key: impl Fn(Key) -> Result<Key>) -> Result<(Vec<TouchedKey>, Vec<HullAcc>)> {
         let mut keys = self.keys;
         for k in &mut keys {
-            k.0 = key(k.0)?;
+            k.key = key(k.key)?;
         }
-        keys.sort_unstable_by_key(|k| k.0);
-        ensure!(keys.windows(2).all(|w| w[0].0 != w[1].0), "two touched keys made one final key");
+        keys.sort_unstable_by_key(|k| k.key);
+        ensure!(keys.windows(2).all(|w| w[0].key != w[1].key), "two touched keys made one final key");
         Ok((keys, self.slots))
     }
 
     /// Bytes held.
     pub fn alloc_bytes(&self) -> usize {
-        self.index.capacity() * (std::mem::size_of::<(Key, u32)>() + 1) + self.keys.capacity() * std::mem::size_of::<(Key, u64, u32)>() + self.slots.capacity() * std::mem::size_of::<HullAcc>()
+        self.index.capacity() * (std::mem::size_of::<(Key, u32)>() + 1) + self.keys.capacity() * std::mem::size_of::<TouchedKey>() + self.slots.capacity() * std::mem::size_of::<HullAcc>()
     }
 }
 
@@ -225,6 +238,9 @@ impl RouteState {
 /// What the region phase reads besides its route.
 pub struct RegionCtx<'a> {
     pub frame: u32,
+    /// The visited set (read only until the frame's end): a touched key's
+    /// entry looked up once, here, not at the frame's end.
+    pub visited: &'a VisitedSet,
     /// Are edges recorded?
     pub record: bool,
     /// Per worker, its local transfer ids' global ones.
@@ -524,6 +540,8 @@ pub fn run_route(st: &mut RouteState, slice: u32, chunks: &[&Chunk], cx: &Region
     sc.s_list.clear();
     sc.t_loc.clear();
     sc.t_keys.clear();
+    let vt = cx.visited.region(st.shape, st.slot).and_then(|r| cx.visited.table(r));
+    let held = |k: Key| if is_provisional(k) { (0, 0) } else { vt.and_then(|t| t.find(k).map(|e| (e, t.mask(e)))).unwrap_or((0, 0)) };
     for c in chunks {
         // THE PUSHES.
         let mut i = 0usize;
@@ -539,7 +557,7 @@ pub fn run_route(st: &mut RouteState, slice: u32, chunks: &[&Chunk], cx: &Region
             if is_provisional(key) {
                 st.prov_keys.insert(key);
             }
-            st.touched.push(key, &cells);
+            st.touched.push(key, &cells, held);
         }
         st.pushes += c.pushes.len() as u64;
         if !record {
@@ -651,11 +669,9 @@ pub fn seal(st: &mut RouteState, region: u32, finals: &FxHashMap<Key, Key>, renu
     // THE STATES (final keys, sorted): new, grown, or nothing.
     let final_key = |k: Key| if is_provisional(k) { finals.get(&k).copied().ok_or_else(|| anyhow::anyhow!("a provisional key without its final key")) } else { Ok(k) };
     let (touched, accs) = std::mem::take(&mut st.touched).into_sorted(final_key)?;
-    let vt = visited.table(region);
     let (mut keys, mut masks, mut hulls): (Vec<Key>, Vec<u64>, Vec<Hull>) = (Vec::new(), Vec::new(), Vec::new());
     let mut grown: Vec<super::wave::Old> = Vec::new();
-    for (key, cells, start) in touched {
-        let (ve, held) = vt.and_then(|t| t.find(key).map(|ve| (ve, t.mask(ve)))).unwrap_or((0, 0));
+    for TouchedKey { key, cells, start, entry: ve, held } in touched {
         let fresh = cells & !held;
         if fresh != 0 {
             keys.push(key);
