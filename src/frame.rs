@@ -877,8 +877,9 @@ impl ForwardState {
     }
 
     /// ONE WAVE of `extend` - frame `frames + 1`, under the tree's level -1
-    /// filter (`replay`: none - a capture's emissions are past it already,
-    /// `bench-storage`), its pos graph fed when recording - without the
+    /// filter (a capture's replayed emissions are past it already,
+    /// `bench-storage`; its re-pushes are not), its pos graph fed when
+    /// recording - without the
     /// checkpoint: the state is left as it was (the visited set and the
     /// transfer table are copied; the frontier is read), the edges go to
     /// `edges_dir` (a scratch dir; `None`: not recorded). Returns the wave
@@ -889,13 +890,11 @@ impl ForwardState {
         engine: &dyn FrameStep,
         dir: &std::path::Path,
         edges_dir: Option<&std::path::Path>,
-        replay: bool,
     ) -> Result<(crate::storage::wave::Wave, crate::storage::visited::VisitedSet, crate::storage::edges::XferTable)> {
         // The frame the tree would make: under the table it was built with.
-        let minus_one = match (self.filter, replay) {
-            (_, true) => None,
-            (Some(f), false) => f.checked_minus_one(dir, &engine.settings())?,
-            (None, false) => anyhow::bail!("{}: no level -1 record (a tree from before records)", dir.display()),
+        let minus_one = match self.filter {
+            Some(f) => f.checked_minus_one(dir, &engine.settings())?,
+            None => anyhow::bail!("{}: no level -1 record (a tree from before records)", dir.display()),
         };
         let (mut visited, mut xfers) = (self.visited.clone(), self.xfers.clone());
         let cx = crate::storage::wave::WaveCtx {

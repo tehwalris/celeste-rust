@@ -140,7 +140,7 @@ backward() {
 # replayed; its new states and edges are the frame check's (TREE.frame).
 storage() {
     local tree=$1 f=$2 room=$3 level=$4; shift 4
-    ./safe-run.sh -- "$B" bench-storage --capture "$F/cap-$tree/f$(printf %03d "$f")" --tree "$F/$tree" --room "$room" --level "$level" --threads "$TH" --reps 1 "$@" > "$C/storage-$tree.txt" || return 1
+    ./safe-run.sh -- "$B" bench-storage --capture "$F/cap-$tree/f$(printf %03d "$f")" --tree "$F/$tree" --room "$room" --level "$level" --threads "$TH" --reps 1 --l1-table "$F/$tree/l1-table.bin" "$@" > "$C/storage-$tree.txt" || return 1
     cat "$C/storage-$tree.txt" >&2
     { grep -o "f$(printf %03d "$f") [0-9]* [0-9a-f]*" "$C/storage-$tree.txt"; grep -o "e$(printf %03d "$f") [0-9]* [0-9a-f]*" "$C/storage-$tree.txt"; } | diff <(grep -E '^[fe][0-9]' "$G/$tree.frame") - >&2
 }

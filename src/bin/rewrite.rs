@@ -1177,7 +1177,7 @@ fn main() -> Result<()> {
             for rep in 0..reps {
                 let _ = std::fs::remove_dir_all(&scratch);
                 let t = std::time::Instant::now();
-                let (wave, visited, xfers) = st.bench_wave(&engine, &dir, edges.then_some(scratch.as_path()), false)?;
+                let (wave, visited, xfers) = st.bench_wave(&engine, &dir, edges.then_some(scratch.as_path()))?;
                 let t_all = t.elapsed();
                 let w = &wave.stats;
                 eprintln!(
