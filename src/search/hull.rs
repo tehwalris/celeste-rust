@@ -237,10 +237,12 @@ fn image(a: Arc, t: Transfer, out: &mut [Seg; 4]) -> usize {
 /// A small direct-mapped cache of pushes, `(hull, the hull it last pushed,
 /// transfer) -> the push` (`None`: nothing): a source's cells and a unit's
 /// sources share hulls (a full one most of all) and transfers, and a push
-/// depends on nothing else. The transfer is the caller's id; `clear` it when
-/// the ids change meaning.
+/// depends on nothing else. The transfer is the caller's id; start a new
+/// `epoch` when the ids change meaning (an entry of an older one never
+/// matches).
 pub struct PushCache {
-    slots: Vec<(u64, u64, u32, Option<HullAcc>)>,
+    slots: Vec<(u64, u64, u32, u32, Option<HullAcc>)>,
+    epoch: u32,
 }
 
 /// Entries of a `PushCache` (a power of two).
@@ -248,13 +250,18 @@ const PUSH_CACHE: usize = 1 << 11;
 
 impl Default for PushCache {
     fn default() -> Self {
-        PushCache { slots: vec![(u64::MAX, u64::MAX, u32::MAX, None); PUSH_CACHE] }
+        PushCache { slots: vec![(u64::MAX, u64::MAX, u32::MAX, u32::MAX, None); PUSH_CACHE], epoch: 0 }
     }
 }
 
 impl PushCache {
-    pub fn clear(&mut self) {
-        self.slots.fill((u64::MAX, u64::MAX, u32::MAX, None));
+    /// The transfer ids change meaning from here.
+    pub fn next_epoch(&mut self) {
+        self.epoch = self.epoch.wrapping_add(1);
+        if self.epoch == u32::MAX {
+            self.slots.fill((u64::MAX, u64::MAX, u32::MAX, u32::MAX, None));
+            self.epoch = 0;
+        }
     }
 
     /// The push of `h` (`was`: its last pushed hull; itself for a hull
@@ -264,11 +271,11 @@ impl PushCache {
         let (a, b) = (u64::from_le_bytes(h.to_bytes()), u64::from_le_bytes(was.to_bytes()));
         let k = celeste_engine::runtime2::mix64(a ^ b.rotate_left(23) ^ (x as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15)) as usize & (PUSH_CACHE - 1);
         let e = &mut self.slots[k];
-        if (e.0, e.1, e.2) == (a, b, x) {
-            return e.3;
+        if (e.0, e.1, e.2, e.3) == (a, b, x, self.epoch) {
+            return e.4;
         }
         let r = f();
-        *e = (a, b, x, r);
+        *e = (a, b, x, self.epoch, r);
         r
     }
 }

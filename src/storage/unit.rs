@@ -271,11 +271,11 @@ pub struct UnitSink<'a> {
     xfer_len: u32,
     /// The units' chunks.
     pub outbox: Vec<Chunk>,
-    /// Record the units' OUT-EDGES (`storage::out`): its last unit's block
-    /// (raw, and whether a target key is provisional), and the rows it is
-    /// built from.
+    /// Record the units' OUT-EDGES (`storage::out`): its last unit's blocks
+    /// (raw, and whether a target key is provisional), and the parts they
+    /// are built from.
     record_out: bool,
-    pub out_block: Option<(Vec<u8>, bool)>,
+    pub out_blocks: Vec<(Vec<u8>, bool)>,
     out_parts: super::out::Parts,
     /// Record `edges` (the pos graph) at all.
     pub edges_on: bool,
@@ -359,7 +359,7 @@ impl<'a> UnitSink<'a> {
             xfer_len: 0,
             outbox: Vec::new(),
             record_out,
-            out_block: None,
+            out_blocks: Vec::new(),
             out_parts: Default::default(),
             edges_on,
             pos_edges: Default::default(),
@@ -988,9 +988,7 @@ impl<'a> UnitSink<'a> {
             self.outbox.push(Chunk { route, unit: self.unit, worker: self.worker, targets, pushes, sources: sources.clone(), bundles, src_regions });
         }
         if self.record_out && !self.out_parts.rows.is_empty() {
-            let mut raw = Vec::new();
-            let prov = super::out::encode_parts(&mut self.out_parts, &mut raw);
-            self.out_block = Some((raw, prov));
+            self.out_blocks = super::out::encode_blocks(&mut self.out_parts);
             if self.out_parts.rows.capacity() > 1 << 20 {
                 self.out_parts = Default::default();
             }

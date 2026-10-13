@@ -367,7 +367,7 @@ pub fn run_wave(engine: &dyn FrameStep, front: &Frontier, cx: WaveCtx) -> Result
     let mut sinks: Vec<UnitSink> = (0..workers).map(|w| UnitSink::new(visited, &routes, skeletons, &prov, filters, frame, level, w as u32, &xtabs[w], pos.is_some(), record, s)).collect();
     // Per kernel unit its out-edge block (`storage::out`): compressed, or
     // raw where a target key is provisional (encoded again at the end).
-    let out_blocks: Vec<std::sync::Mutex<Option<OutBlock>>> = (0..n_kernel).map(|_| Default::default()).collect();
+    let out_blocks: Vec<std::sync::Mutex<Vec<OutBlock>>> = (0..n_kernel).map(|_| Default::default()).collect();
     let repushed = std::sync::atomic::AtomicU64::new(0);
     let mut scratch: Vec<super::route::Scratch> = (0..workers).map(|_| super::route::Scratch::default()).collect();
     let mut slice_of = vec![0u32; units.len()];
@@ -461,10 +461,11 @@ pub fn run_wave(engine: &dyn FrameStep, front: &Frontier, cx: WaveCtx) -> Result
                             match &units[u] {
                                 UnitSpec::Kernel { entries, state, .. } => {
                                     run_unit(engine, u as u32, entries.clone(), *state, layer, hulls, starts, shapes, sink, &mut us, frame - 1, ceiling, s)?;
-                                    if let Some((raw, prov)) = sink.out_block.take() {
-                                        let b = if prov { OutBlock::Raw(raw) } else { OutBlock::Sealed(super::out::Sealed::of(&raw, z.get_or_insert_with(|| zstd::bulk::Compressor::new(1).expect("a zstd compressor")))?) };
-                                        *out_blocks[u].lock().expect("an out block") = Some(b);
+                                    let mut v = Vec::new();
+                                    for (raw, prov) in std::mem::take(&mut sink.out_blocks) {
+                                        v.push(if prov { OutBlock::Raw(raw) } else { OutBlock::Sealed(super::out::Sealed::of(&raw, z.get_or_insert_with(|| zstd::bulk::Compressor::new(1).expect("a zstd compressor")))?) });
                                     }
+                                    *out_blocks[u].lock().expect("an out block") = v;
                                 }
                                 UnitSpec::Repush { old } => {
                                     let tr = phases::start(s.diag.phases);
@@ -748,18 +749,25 @@ pub fn run_wave(engine: &dyn FrameStep, front: &Frontier, cx: WaveCtx) -> Result
         st.edge_bytes = super::edges::write_file(&path, frame, segs, src_index)?;
         // The out-edges, the kernel units' blocks in unit order (the
         // provisional ones encoded with their final keys).
-        let blocks = par_map(&out_blocks, s.threads(), |b| -> Result<Option<super::out::Sealed>> {
-            match b.lock().expect("an out block").take() {
-                None => Ok(None),
-                Some(OutBlock::Sealed(x)) => Ok(x),
-                Some(OutBlock::Raw(raw)) => {
-                    let mut fixed = Vec::new();
-                    super::out::fixup(&raw, &finals, &mut fixed)?;
-                    super::out::Sealed::of(&fixed, &mut zstd::bulk::Compressor::new(1)?)
+        let blocks = par_map(&out_blocks, s.threads(), |b| -> Result<Vec<super::out::Sealed>> {
+            let mut out = Vec::new();
+            for x in std::mem::take(&mut *b.lock().expect("an out block")) {
+                match x {
+                    OutBlock::Sealed(x) => out.extend(x),
+                    OutBlock::Raw(raw) => {
+                        let mut fixed = Vec::new();
+                        super::out::fixup(&raw, &finals, &mut fixed)?;
+                        out.extend(super::out::Sealed::of(&fixed, &mut zstd::bulk::Compressor::new(1)?)?);
+                    }
                 }
             }
+            Ok(out)
         });
-        let blocks: Vec<super::out::Sealed> = blocks.into_iter().filter_map(|b| b.transpose()).collect::<Result<_>>()?;
+        let mut all: Vec<super::out::Sealed> = Vec::new();
+        for b in blocks {
+            all.extend(b?);
+        }
+        let blocks = all;
         st.out_bytes = super::out::write(&super::out::path(dir, frame), frame, &blocks)?;
     }
     mark("files", &mut ends);
@@ -889,7 +897,7 @@ fn run_repush(u: u32, old: &[Old], outs: &super::out::OutStore, sink: &mut UnitS
         sc.late.clear();
         sc.late.resize(blk.routes.len(), None);
         let (t_of, late, cache) = (&mut sc.t_of, &mut sc.late, &mut sc.cache);
-        cache.clear();
+        cache.next_epoch();
         let mut bad = false;
         blk.entries(
             |region, key| {

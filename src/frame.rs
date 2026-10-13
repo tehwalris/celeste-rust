@@ -1300,18 +1300,9 @@ pub fn restore_visited(dir: &std::path::Path, last: u32, room: Option<(i16, i16)
             groups.push((region, a..b));
             a = b;
         }
-        visited.set_infos(
-            &groups,
-            |g, put| {
-                for &(sk, layer, hull) in &grown[g.clone()] {
-                    put(sk.key, sk.local as u32, crate::storage::visited::StateInfo { hull, layer })?;
-                }
-                Ok(())
-            },
-            threads,
-        )?;
+        visited.set_infos(&groups, |g| grown[g.clone()].iter().map(|&(sk, layer, hull)| (sk.key, sk.local as u32, crate::storage::visited::StateInfo { hull, layer })).collect(), threads)?;
     }
-    anyhow::ensure!(visited.infos() == visited.len(), "{}: {} states, {} with a hull", dir.display(), visited.len(), visited.infos());
+    anyhow::ensure!(visited.infos() <= visited.len(), "{}: {} states, {} with a hull stored", dir.display(), visited.len(), visited.infos());
     // The frontier: frame `last`'s hull file - its new states are the frame's
     // layer, in its order; its old ones pushed the hull they had before it.
     let layer16 = u16::try_from(last).map_err(|_| anyhow::anyhow!("frame {last}: past a u16 layer"))?;
@@ -1604,12 +1595,14 @@ mod tests {
             assert!(inexact.is_empty(), "room (1,0) to f44 needs no coarsening");
             for (sk, r) in cur {
                 let layer = (0..=sums.frame).find(|&f| layers[f as usize].contains(*sk)).unwrap_or_else(|| panic!("f{}: an exactly reached state no layer holds", sums.frame));
-                let info = st.visited().state(sk.region, sk.key, sk.local as u32).expect("a hull");
-                assert_eq!(info.layer as u32, layer, "f{}: the state's recorded layer", sums.frame);
-                for (y, xs) in r.slabs() {
-                    assert!(info.hull.y.contains_seg(y), "f{}: a reached y segment outside the hull", sums.frame);
-                    for x in xs {
-                        assert!(info.hull.x.contains_seg(x), "f{}: a reached x segment outside the hull", sums.frame);
+                // (A full hull is not stored: it holds everything.)
+                if let Some(info) = st.visited().state(sk.region, sk.key, sk.local as u32) {
+                    assert_eq!(info.layer as u32, layer, "f{}: the state's recorded layer", sums.frame);
+                    for (y, xs) in r.slabs() {
+                        assert!(info.hull.y.contains_seg(y), "f{}: a reached y segment outside the hull", sums.frame);
+                        for x in xs {
+                            assert!(info.hull.x.contains_seg(x), "f{}: a reached x segment outside the hull", sums.frame);
+                        }
                     }
                 }
                 checked += 1;

@@ -606,7 +606,8 @@ pub fn seal(st: &mut RouteState, region: u32, finals: &FxHashMap<Key, Key>, renu
         }
         match held.and_then(|h| h.1).filter(|h| h.1 >> c & 1 == 1) {
             Some((ve, _)) => {
-                let StateInfo { hull, layer } = visited.info(region, ve, c as u32).ok_or_else(|| anyhow::anyhow!("r{region}: a visited state without its hull"))?;
+                // No hull stored: it is FULL, and grows no more.
+                let Some(StateInfo { hull, layer }) = visited.info(region, ve, c as u32) else { continue };
                 let mut a = acc;
                 a.add_hull(&hull);
                 let h = a.hull().expect("a hull holds points");

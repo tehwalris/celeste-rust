@@ -184,6 +184,62 @@ pub fn encode_parts(p: &mut Parts, out: &mut Vec<u8>) -> bool {
     provisional
 }
 
+/// Rows per block (`encode_blocks`): a re-push decompresses whole blocks
+/// for the entries it wants, so blocks are small (room (1,0) f80 with one
+/// block a kernel unit decompressed 5.3 GB for 2.6M re-pushed states).
+pub const BLOCK_ROWS: usize = 1 << 11;
+
+/// `p` as raw blocks of whole entries, about `BLOCK_ROWS` rows each, each
+/// with the routes, pairs and targets it uses (`encode_parts` each);
+/// whether a target key is provisional, per block.
+pub fn encode_blocks(p: &mut Parts) -> Vec<(Vec<u8>, bool)> {
+    p.rows.sort_unstable_by_key(|r| r.0);
+    let mut out = Vec::new();
+    let mut i = 0usize;
+    let (mut t_new, mut x_new) = (vec![u32::MAX; p.targets.len()], vec![u32::MAX; p.pairs.len()]);
+    while i < p.rows.len() {
+        // Whole entries, up to the block's rows.
+        let mut j = i;
+        while j < p.rows.len() && (j - i < BLOCK_ROWS || (p.rows[j].0 >> 96) == (p.rows[j - 1].0 >> 96)) {
+            j += 1;
+        }
+        let rows = &p.rows[i..j];
+        let mut ts: Vec<u32> = rows.iter().map(|r| (r.0 >> 64) as u32).collect();
+        ts.sort_unstable();
+        ts.dedup();
+        let mut xs: Vec<u32> = rows.iter().map(|r| (r.0 >> 32) as u32).collect();
+        xs.sort_unstable();
+        xs.dedup();
+        let mut rs: Vec<u32> = ts.iter().map(|&t| p.targets[t as usize].0).collect();
+        rs.sort_unstable();
+        rs.dedup();
+        let mut b = Parts { routes: rs.iter().map(|&r| p.routes[r as usize]).collect(), pairs: xs.iter().map(|&x| p.pairs[x as usize]).collect(), ..Default::default() };
+        for (k, &t) in ts.iter().enumerate() {
+            t_new[t as usize] = k as u32;
+            let (r, key) = p.targets[t as usize];
+            b.targets.push((rs.binary_search(&r).expect("a route of the block") as u32, key));
+        }
+        for (k, &x) in xs.iter().enumerate() {
+            x_new[x as usize] = k as u32;
+        }
+        let e0 = (rows[0].0 >> 96) as u32;
+        let e1 = (rows[rows.len() - 1].0 >> 96) as u32;
+        b.entries = p.entries[e0 as usize..=e1 as usize].to_vec();
+        b.rows = rows
+            .iter()
+            .map(|&(k, m)| {
+                let (e, t, x, o) = ((k >> 96) as u32, (k >> 64) as u32, (k >> 32) as u32, k as u32);
+                (row_key(e - e0, t_new[t as usize], x_new[x as usize], o), m)
+            })
+            .collect();
+        let mut raw = Vec::new();
+        let prov = encode_parts(&mut b, &mut raw);
+        out.push((raw, prov));
+        i = j;
+    }
+    out
+}
+
 /// ENCODE `rows` (any order; equal (entry, target, transfer, offset) rows
 /// merged) as a raw block into `out` (cleared): `encode_parts` of their
 /// indices. Returns whether a target key is provisional.
