@@ -38,31 +38,46 @@ impl StateInfo {
 /// table: entries keep their places) the cells with one and where their RUN
 /// starts in `slots` (the cells in order). A state whose hull is FULL has no
 /// slot. A run moves to the end when its entry gains a cell; dead slots are
-/// reclaimed once they outnumber the live ones. 10 B a state stored and 12 B
-/// an entry (a hash map of states took ~25 B a state).
+/// reclaimed once they are a third of the slots, and the arrays grow by a
+/// quarter: 10 B a state stored and 12 B an entry, at most ~1.9x that held
+/// (room (1,0) f99: 0.78 GB for 31M stored states and 4.5M entries when
+/// dead slots waited to be half and the arrays doubled).
 #[derive(Clone, Default)]
 pub struct RegionInfos {
-    at: Vec<(u32, u64)>,
+    starts: Vec<u32>,
+    masks: Vec<u64>,
     slots: Vec<StateInfo>,
     dead: usize,
+}
+
+/// Room in `v` for `more` (grown by a quarter at least: not doubled).
+fn grow<T>(v: &mut Vec<T>, more: usize) {
+    if v.len() + more > v.capacity() {
+        v.reserve_exact(more.max(v.len() / 4));
+    }
 }
 
 impl RegionInfos {
     /// Entry `e`'s cell `local`'s, if stored (`None`: full, or no state).
     #[inline]
     pub fn get(&self, e: u32, local: u32) -> Option<StateInfo> {
-        let &(start, mask) = self.at.get(e as usize)?;
-        (mask >> local & 1 == 1).then(|| self.slots[start as usize + (mask & ((1u64 << local) - 1)).count_ones() as usize])
+        let mask = *self.masks.get(e as usize)?;
+        (mask >> local & 1 == 1).then(|| self.slots[self.starts[e as usize] as usize + (mask & ((1u64 << local) - 1)).count_ones() as usize])
     }
 
     /// Entry `e`'s cells set (`updates`: by cell, ascending, distinct; a
     /// full hull's slot goes).
     pub fn set(&mut self, e: u32, updates: &[(u32, StateInfo)]) {
         debug_assert!(updates.windows(2).all(|w| w[0].0 < w[1].0));
-        if self.at.len() <= e as usize {
-            self.at.resize(e as usize + 1, (0, 0));
+        let e = e as usize;
+        if self.masks.len() <= e {
+            let more = e + 1 - self.masks.len();
+            grow(&mut self.starts, more);
+            grow(&mut self.masks, more);
+            self.starts.resize(e + 1, 0);
+            self.masks.resize(e + 1, 0);
         }
-        let (start, mask) = self.at[e as usize];
+        let (start, mask) = (self.starts[e], self.masks[e]);
         let mut next = mask;
         for &(c, i) in updates {
             if i.is_full() {
@@ -82,6 +97,7 @@ impl RegionInfos {
         // A new run at the end.
         let at = self.slots.len();
         assert!(at + 64 < u32::MAX as usize, "a region of 2^32 hulls");
+        grow(&mut self.slots, next.count_ones() as usize);
         let mut u = updates.iter().peekable();
         let mut m = next;
         while m != 0 {
@@ -97,8 +113,8 @@ impl RegionInfos {
             self.slots.push(v);
         }
         self.dead += mask.count_ones() as usize;
-        self.at[e as usize] = (at as u32, next);
-        if self.dead > 1024 && self.dead * 2 > self.slots.len() {
+        (self.starts[e], self.masks[e]) = (at as u32, next);
+        if self.dead > 1024 && self.dead * 3 > self.slots.len() {
             self.compact();
         }
     }
@@ -106,7 +122,7 @@ impl RegionInfos {
     /// The live runs, entry by entry, at the start of a new slot array.
     fn compact(&mut self) {
         let mut slots = Vec::with_capacity(self.slots.len() - self.dead);
-        for (start, mask) in self.at.iter_mut() {
+        for (start, mask) in self.starts.iter_mut().zip(&self.masks) {
             let n = mask.count_ones() as usize;
             let a = slots.len() as u32;
             slots.extend_from_slice(&self.slots[*start as usize..*start as usize + n]);
@@ -122,7 +138,7 @@ impl RegionInfos {
     }
 
     pub fn alloc_bytes(&self) -> usize {
-        self.at.capacity() * std::mem::size_of::<(u32, u64)>() + self.slots.capacity() * std::mem::size_of::<StateInfo>()
+        self.starts.capacity() * 4 + self.masks.capacity() * 8 + self.slots.capacity() * std::mem::size_of::<StateInfo>()
     }
 }
 
