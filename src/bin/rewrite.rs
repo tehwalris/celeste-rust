@@ -253,8 +253,8 @@ enum Command {
         cells: Option<usize>,
         /// Also fingerprint each frame's recorded edges (`e{frame} count
         /// hash`) by the states they join and their transfers: two trees
-        /// with the same lines have the same graph (a raised tree against a
-        /// fresh one).
+        /// with the same lines have the same graph, whatever ids they gave
+        /// its transfers.
         #[arg(long)]
         edges: bool,
         /// Also fingerprint each frame's FRONTIER (`h{frame} count hash`,
@@ -865,8 +865,9 @@ fn main() -> Result<()> {
             for (li, &lvl) in levels.iter().enumerate() {
                 let last = li + 1 == levels.len();
                 let dir = base.join(format!("level{li:02}"));
-                // THE FORWARD. Level 0's tree is reused, extended, or RAISED
-                // to this run's level -1 horizon (`grow_tree`). A finer
+                // THE FORWARD. Level 0's tree is reused or extended
+                // (`grow_tree`: one filtered by level -1 below this horizon
+                // is refused, a hull tree cannot be raised). A finer
                 // level's tree is filtered by the coarser marks for one
                 // horizon: kept only for the same marks, horizon and level
                 // -1, else built again (it is the cheap one).
@@ -998,7 +999,7 @@ fn main() -> Result<()> {
             eprintln!("[fwd] engine up in {:.2} s ({level}{})", t.elapsed().as_secs_f64(), if reference { ", REFERENCE engine" } else { "" });
             let dir = std::path::Path::new(&checkpoint_dir);
             let t = std::time::Instant::now();
-            // Resumed, RAISED to this run's level -1 horizon, or started.
+            // Resumed or started (`grow_tree`).
             let fwd = celeste_rust::frame::grow_tree(
                 dir,
                 to,
@@ -1078,8 +1079,8 @@ fn main() -> Result<()> {
             dump_edges,
         } => {
             let dir = std::path::Path::new(&checkpoint_dir);
-            // Fingerprints over CONTENT (`exact::ContentHash`): a raised tree's
-            // dictionaries grew in another order than a fresh one's.
+            // Fingerprints over CONTENT (`exact::ContentHash`): whatever order
+            // the tree's dictionaries grew in.
             let tree = Tree::open(dir, to)?;
             let content = tree.space.content_hash();
             let geo = celeste_rust::storage::GEOMETRY;
@@ -1097,8 +1098,8 @@ fn main() -> Result<()> {
                 println!("f{frame:03} {n} {acc:016x}");
             }
             // The recorded edges per frame, by what they join: (shape, key,
-            // cell) of target and source, and the transfer - table positions
-            // depend on a raise, these do not. A state by what it is
+            // cell) of target and source, and the transfer - not its id in
+            // the table. A state by what it is
             // (`ContentHash::state`: `mix64(key hash ^ cell << 1)`).
             if edges {
                 let eg = celeste_rust::storage::edges::EdgeStore::open(&dir.join("edges"), to)?;
@@ -2616,13 +2617,12 @@ fn reach_command(checkpoint_dir: &str, level_index: usize, to: u32, save: Option
         })
         .transpose()?;
     let mut cells_file = cells_out.map(|p| std::fs::File::create(p).map(std::io::BufWriter::new)).transpose()?;
-    let has_notes = dir.join("dropped").is_dir();
     let point = celeste_rust::search::arc_dp::start_point(cfg)?;
     let t0 = std::time::Instant::now();
     // Written frame by frame (a run stopped part way keeps them): the
     // frames' sums (`reach.tsv`) and the reached sets' shapes
     // (`rem_stats.tsv`).
-    const TSV_HEAD: &str = "frame\tstates\tnew\tentered\tentered_edges\treached_edges\tpushes\tpushes_nonempty\tpoints\tcells\tforward_layer\tcoarsened\tinexact\tmax_k\tx_min\tx_max\ty_min\ty_max\tl1_noted_sources\n";
+    const TSV_HEAD: &str = "frame\tstates\tnew\tentered\tentered_edges\treached_edges\tpushes\tpushes_nonempty\tpoints\tcells\tforward_layer\tcoarsened\tinexact\tmax_k\tx_min\tx_max\ty_min\ty_max\n";
     let save_dir = save.map(std::path::Path::new);
     if let Some(d) = save_dir {
         std::fs::create_dir_all(d)?;
@@ -2661,17 +2661,10 @@ fn reach_command(checkpoint_dir: &str, level_index: usize, to: u32, save: Option
                 }
             }
         }
-        // The forward's states of layer `t` a level -1 drop touched (some
-        // successor at `t + 1` dropped as too late): a reached state from
-        // an earlier layer has its notes at its own layer, so they are not
-        // matched against the reach. A dropped successor of a state reached
-        // at `t` is no earlier than `t + 1`: too late for the tree's win.
-        let notes_path = celeste_rust::storage::layer::notes_path(&dir, t + 1);
-        let noted = if has_notes && notes_path.exists() { celeste_rust::storage::layer::read_notes(&notes_path)?.iter().map(|n| n.3.count_ones() as u64).sum() } else { 0 };
         let p = pushes.unwrap_or_default();
         let line = format!(
-            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
-            t, fr.states, fr.new, fr.entered, fr.entered_edges, fr.reached_edges, p.edges, p.nonempty, fr.points, fr.cells, fr.forward_layer, fr.coarsened, fr.inexact, fr.max_k, x0, x1, y0, y1, noted
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+            t, fr.states, fr.new, fr.entered, fr.entered_edges, fr.reached_edges, p.edges, p.nonempty, fr.points, fr.cells, fr.forward_layer, fr.coarsened, fr.inexact, fr.max_k, x0, x1, y0, y1
         );
         if let Some(f) = &mut tsv_file {
             f.write_all(line.as_bytes())?;

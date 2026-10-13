@@ -6,14 +6,11 @@
 //!
 //!   * in memory: the frontier a wave expands (its units decoded to rows
 //!     right before the kernels: `wave`), the next layer a wave builds;
-//!   * on disk: the FRAME FILES (`frames/f{frame}.bin`, a raise's additions
-//!     `frames/f{frame}.r{seq}.bin`): per region a zstd block of its new
-//!     entries' keys, masks and win masks, and a header with what the
-//!     frame added to the tree's codebooks - the shapes it numbered, the
-//!     key space's new codes and bit runs - and the skeletons its shapes'
-//!     rows decode with (`SkelRecord`);
-//!   * as level -1's drop notes (`dropped/f{frame}.bin`): per noted source
-//!     entry and horizon, the cells.
+//!   * on disk: the FRAME FILES (`frames/f{frame}.bin`): per region a zstd
+//!     block of its new entries' keys, masks and win masks, and a header
+//!     with what the frame added to the tree's codebooks - the shapes it
+//!     numbered, the key space's new codes and bit runs - and the
+//!     skeletons its shapes' rows decode with (`SkelRecord`).
 //!
 //! `Tree` reads a tree's frame files: the key space, the shapes, a frame's
 //! layer, its rows decoded (the diagnostics), a state's layer.
@@ -104,25 +101,6 @@ impl Layer {
         Ok((n, acc))
     }
 
-    /// The DISJOINT union with `other` (a frame and its raises: a state is
-    /// in one of them; held twice is an error). Skeletons: both (equal
-    /// where both have a shape: checked).
-    pub fn union(self, other: Layer) -> Result<Layer> {
-        if other.is_empty() && other.skeletons.is_empty() {
-            return Ok(self);
-        }
-        let mut skeletons = self.skeletons.clone();
-        for (h, s) in &other.skeletons {
-            match skeletons.get(h) {
-                Some(a) => ensure!(SkelRecord::of(a)? == SkelRecord::of(s)?, "two skeletons of shape {h:016x} in one frame"),
-                None => {
-                    skeletons.insert(*h, s.clone());
-                }
-            }
-        }
-        Ok(Layer { set: self.set.union(&other.set)?, skeletons })
-    }
-
     /// Bytes allocated.
     pub fn alloc_bytes(&self) -> usize {
         self.set.alloc_bytes()
@@ -210,37 +188,17 @@ impl SkelRecord {
     }
 }
 
-/// The frame files' and drop notes' magic.
+/// The frame files' magic.
 const MAGIC: &[u8; 4] = b"CSL1";
 
-/// A frame file's path: the wave's (`raise` None) or a raise's additions.
-pub fn frame_path(dir: &Path, frame: u32, raise: Option<u32>) -> PathBuf {
-    let f = dir.join("frames");
-    match raise {
-        None => f.join(format!("f{frame:03}.bin")),
-        Some(seq) => f.join(format!("f{frame:03}.r{seq:04}.bin")),
-    }
+/// Frame `frame`'s file.
+pub fn frame_path(dir: &Path, frame: u32) -> PathBuf {
+    dir.join("frames").join(format!("f{frame:03}.bin"))
 }
 
-/// Is frame `frame` in the tree (its wave's file)?
+/// Is frame `frame` in the tree?
 pub fn frame_exists(dir: &Path, frame: u32) -> bool {
-    frame_path(dir, frame, None).is_file()
-}
-
-/// The raise seqs of frame `frame`'s files, ascending.
-pub fn raise_seqs(dir: &Path, frame: u32) -> Result<Vec<u32>> {
-    let prefix = format!("f{frame:03}.r");
-    let mut out = Vec::new();
-    let fdir = dir.join("frames");
-    for e in std::fs::read_dir(&fdir).with_context(|| fdir.display().to_string())? {
-        let n = e?.file_name();
-        let n = n.to_string_lossy();
-        if let Some(rest) = n.strip_prefix(&prefix).and_then(|r| r.strip_suffix(".bin")) {
-            out.push(rest.parse::<u32>().with_context(|| format!("{}: a frame file name", n))?);
-        }
-    }
-    out.sort_unstable();
-    Ok(out)
+    frame_path(dir, frame).is_file()
 }
 
 /// The last frame of the tree in `dir` with a file (frames from 0 on,
@@ -555,118 +513,15 @@ pub fn check_frame_file(path: &Path, layer: &Layer, wins: &[(u32, u64)], threads
     Ok(())
 }
 
-/// A frame's files: its wave's, then its raises' (by seq).
-pub fn frame_files(dir: &Path, frame: u32) -> Result<Vec<FrameFile>> {
-    let mut out = vec![FrameFile::open(&frame_path(dir, frame, None))?];
-    for seq in raise_seqs(dir, frame)? {
-        out.push(FrameFile::open(&frame_path(dir, frame, Some(seq)))?);
-    }
-    Ok(out)
-}
-
-/// A level -1 DROP NOTE: a noted source entry `(region, key)`, the
-/// smallest horizon admitting one of its dropped successors, and the cells
-/// it holds for (`dropped/f{frame}.bin`, sorted by (region, key, horizon)).
-pub type Note = (u32, Key, u32, u64);
-
-/// Frame `frame`'s drop notes' file.
-pub fn notes_path(dir: &Path, frame: u32) -> PathBuf {
-    dir.join("dropped").join(format!("f{frame:03}.bin"))
-}
-
-/// Write drop notes (sorted, each (region, key, horizon) once; a cell in
-/// one note per (region, key): checked), zstd. Atomic.
-pub fn write_notes(path: &Path, notes: &[Note]) -> Result<()> {
-    use std::io::Write;
-    ensure!(notes.windows(2).all(|w| (w[0].0, w[0].1, w[0].2) < (w[1].0, w[1].1, w[1].2)), "drop notes not sorted");
-    let mut raw = Vec::new();
-    put_varint(&mut raw, notes.len() as u64);
-    let mut prev: Option<(u32, Key)> = None;
-    let mut cells = 0u64;
-    for &(region, key, h, mask) in notes {
-        ensure!(mask != 0, "a drop note without cells");
-        if prev.is_some_and(|p| p.0 == region && p.1 == key) {
-            ensure!(cells & mask == 0, "a source noted twice in region {region}");
-        } else {
-            cells = 0;
-        }
-        cells |= mask;
-        put_varint(&mut raw, region as u64);
-        raw.extend_from_slice(&key.0.to_le_bytes());
-        raw.extend_from_slice(&key.1.to_le_bytes());
-        put_varint(&mut raw, h as u64);
-        raw.extend_from_slice(&mask.to_le_bytes());
-        prev = Some((region, key));
-    }
-    let z = zstd::bulk::compress(&raw, 1)?;
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let tmp = path.with_file_name(format!("tmp-{}", path.file_name().and_then(|s| s.to_str()).unwrap_or("notes.bin")));
-    {
-        let mut f = std::io::BufWriter::new(std::fs::File::create(&tmp)?);
-        f.write_all(MAGIC)?;
-        f.write_all(&crate::search::checkpoint::FORMAT_VERSION.to_le_bytes())?;
-        f.write_all(&(raw.len() as u64).to_le_bytes())?;
-        f.write_all(&z)?;
-        f.flush()?;
-    }
-    std::fs::rename(&tmp, path)?;
-    Ok(())
-}
-
-/// Read drop notes (`write_notes`).
-pub fn read_notes(path: &Path) -> Result<Vec<Note>> {
-    let b = std::fs::read(path).with_context(|| path.display().to_string())?;
-    ensure!(b.len() >= 16 && &b[0..4] == MAGIC, "{}: not a drop notes file", path.display());
-    let version = u32::from_le_bytes(b[4..8].try_into().unwrap());
-    ensure!(version == crate::search::checkpoint::FORMAT_VERSION, "{}: format version {version}, this binary's is {}", path.display(), crate::search::checkpoint::FORMAT_VERSION);
-    let n_raw = u64::from_le_bytes(b[8..16].try_into().unwrap()) as usize;
-    let raw = zstd::bulk::decompress(&b[16..], n_raw).with_context(|| path.display().to_string())?;
-    let mut pos = 0usize;
-    let n = get_varint(&raw, &mut pos) as usize;
-    let mut out = Vec::with_capacity(n);
-    for _ in 0..n {
-        let region = get_varint(&raw, &mut pos) as u32;
-        ensure!(pos + 16 <= raw.len(), "{}: cut short", path.display());
-        let key = (u64::from_le_bytes(raw[pos..pos + 8].try_into().unwrap()), u64::from_le_bytes(raw[pos + 8..pos + 16].try_into().unwrap()));
-        pos += 16;
-        let h = get_varint(&raw, &mut pos) as u32;
-        ensure!(pos + 8 <= raw.len(), "{}: cut short", path.display());
-        let mask = u64::from_le_bytes(raw[pos..pos + 8].try_into().unwrap());
-        pos += 8;
-        out.push((region, key, h, mask));
-    }
-    ensure!(pos == raw.len(), "{}: bytes past its notes", path.display());
-    Ok(out)
-}
-
-/// Notes (any order; each source cell at most once) sorted, the notes of
-/// one (region, key, horizon) merged.
-pub fn notes_of(mut notes: Vec<Note>) -> Result<Vec<Note>> {
-    notes.sort_unstable_by_key(|n| (n.0, n.1, n.2));
-    let mut out: Vec<Note> = Vec::with_capacity(notes.len());
-    for n in notes {
-        match out.last_mut() {
-            Some(m) if (m.0, m.1, m.2) == (n.0, n.1, n.2) => {
-                ensure!(m.3 & n.3 == 0, "a source of region {} noted twice", n.0);
-                m.3 |= n.3;
-            }
-            _ => out.push(n),
-        }
-    }
-    Ok(out)
-}
-
 /// A TREE's frame files through a frame: its codebooks (the shapes by
 /// index, the key space: every file's additions, any order) and each
-/// frame's files. A forward whose frontier died has no frames past the
-/// empty one: they are empty.
+/// frame's file. A forward whose frontier died has no files past the
+/// empty frame: those frames are empty.
 pub struct Tree {
     pub dir: PathBuf,
     pub last: u32,
-    /// Per frame `0..=last` its files (none past a dead frontier).
-    pub frames: Vec<Vec<FrameFile>>,
+    /// Per frame `0..=last` its file (none past a dead frontier).
+    pub frames: Vec<Option<FrameFile>>,
     pub shapes: Vec<u64>,
     pub space: KeySpace,
 }
@@ -674,23 +529,21 @@ pub struct Tree {
 impl Tree {
     /// The tree in `dir` through frame `last`.
     pub fn open(dir: &Path, last: u32) -> Result<Tree> {
-        let mut frames: Vec<Vec<FrameFile>> = Vec::with_capacity(last as usize + 1);
+        let mut frames: Vec<Option<FrameFile>> = Vec::with_capacity(last as usize + 1);
         let mut adds = KeyAdditions::default();
         let mut shapes: Vec<(u32, u64)> = Vec::new();
         for f in 0..=last {
             if !frame_exists(dir, f) {
-                let died = frames.last().is_some_and(|fs| fs.iter().all(|x| x.header.states() == 0));
+                let died = frames.last().is_some_and(|x| x.as_ref().is_none_or(|x| x.header.states() == 0));
                 ensure!(died, "{}: no frame f{f}, and the frontier before it was not empty", dir.display());
-                frames.push(Vec::new());
+                frames.push(None);
                 continue;
             }
-            let fs = frame_files(dir, f)?;
-            for x in &fs {
-                ensure!(x.header.frame == f, "{}: of frame {}, not {f}", x.path.display(), x.header.frame);
-                shapes.extend(x.header.shapes.iter().copied());
-                adds.extend(x.header.keys.clone());
-            }
-            frames.push(fs);
+            let x = FrameFile::open(&frame_path(dir, f))?;
+            ensure!(x.header.frame == f, "{}: of frame {}, not {f}", x.path.display(), x.header.frame);
+            shapes.extend(x.header.shapes.iter().copied());
+            adds.extend(x.header.keys.clone());
+            frames.push(Some(x));
         }
         shapes.sort_unstable();
         ensure!(shapes.iter().enumerate().all(|(i, s)| s.0 as usize == i), "{}: the shapes are not numbered 0..{}", dir.display(), shapes.len());
@@ -704,34 +557,36 @@ impl Tree {
         Tree::open(dir, last)
     }
 
-    /// Frame `f`'s states (its files' union), skeletons in a search from
-    /// `room` if given, and its wins by entry.
+    /// Frame `f`'s states, skeletons in a search from `room` if given, and
+    /// its wins.
     pub fn layer(&self, f: u32, room: Option<(i16, i16)>, threads: usize) -> Result<(Layer, Vec<Sk>)> {
-        let files = self.frames.get(f as usize).ok_or_else(|| anyhow!("{}: no frame {f} (the tree is open to {})", self.dir.display(), self.last))?;
-        let mut out = Layer::default();
+        let file = self.frames.get(f as usize).ok_or_else(|| anyhow!("{}: no frame {f} (the tree is open to {})", self.dir.display(), self.last))?;
+        let Some(file) = file else { return Ok((Layer::default(), Vec::new())) };
+        let (l, w) = file.layer(room, threads)?;
+        let starts = l.set.entry_starts();
         let mut wins = Vec::new();
-        for file in files {
-            let (l, w) = file.layer(room, threads)?;
-            let starts = l.set.entry_starts();
-            for &(e, m) in &w {
-                let (ti, local) = l.set.locate(&starts, e as usize)?;
-                let (region, t) = &l.set.tables()[ti];
-                let key = t.key(local);
-                wins.extend(bits(m).map(|c| Sk { region: *region, key, local: c as u8 }));
-            }
-            out = out.union(l)?;
+        for &(e, m) in &w {
+            let (ti, local) = l.set.locate(&starts, e as usize)?;
+            let (region, t) = &l.set.tables()[ti];
+            let key = t.key(local);
+            wins.extend(bits(m).map(|c| Sk { region: *region, key, local: c as u8 }));
         }
-        Ok((out, wins))
+        Ok((l, wins))
+    }
+
+    /// Frame `f`'s file (`None`: past a dead frontier, or past `last`).
+    pub fn file(&self, f: u32) -> Option<&FrameFile> {
+        self.frames.get(f as usize).and_then(|x| x.as_ref())
     }
 
     /// Frame `f`'s states.
     pub fn states(&self, f: u32) -> u64 {
-        self.frames.get(f as usize).map_or(0, |fs| fs.iter().map(|x| x.header.states()).sum())
+        self.file(f).map_or(0, |x| x.header.states())
     }
 
     /// The first frame with a win (`None`: none through `last`).
     pub fn first_win(&self) -> Option<u32> {
-        self.frames.iter().position(|fs| fs.iter().any(|x| x.header.wins() > 0)).map(|f| f as u32)
+        self.frames.iter().position(|x| x.as_ref().is_some_and(|x| x.header.wins() > 0)).map(|f| f as u32)
     }
 
     /// The shape of region `region`.
@@ -753,16 +608,10 @@ impl Tree {
     /// The cells of `(region, key)` frame `f` holds (0: none), reading
     /// that region's blocks only.
     pub fn mask_at(&self, f: u32, region: u32, key: Key) -> Result<u64> {
-        let mut m = 0u64;
-        for file in self.frames.get(f as usize).map_or(&[][..], |v| v.as_slice()) {
-            if let Ok(i) = file.header.regions.binary_search_by_key(&region, |r| r.region) {
-                let e = file.region(i)?;
-                if let Ok(k) = e.keys.binary_search(&key) {
-                    m |= e.masks[k];
-                }
-            }
-        }
-        Ok(m)
+        let Some(file) = self.file(f) else { return Ok(0) };
+        let Ok(i) = file.header.regions.binary_search_by_key(&region, |r| r.region) else { return Ok(0) };
+        let e = file.region(i)?;
+        Ok(e.keys.binary_search(&key).map_or(0, |k| e.masks[k]))
     }
 
     /// The frame (layer) holding state `s` among frames `0..=upto`, by a
@@ -778,8 +627,7 @@ impl Tree {
 
     /// The skeleton of `shape` in frame `f`'s files, in a search from `room`.
     pub fn skeleton(&self, f: u32, shape: u64, room: (i16, i16)) -> Result<Rt2> {
-        let files = self.frames.get(f as usize).map_or(&[][..], |v| v.as_slice());
-        let r = files.iter().flat_map(|x| x.header.skeletons.iter()).find(|r| r.shape_hash == shape).ok_or_else(|| anyhow!("{}: frame {f} has no skeleton of shape {shape:016x}", self.dir.display()))?;
+        let r = self.file(f).into_iter().flat_map(|x| x.header.skeletons.iter()).find(|r| r.shape_hash == shape).ok_or_else(|| anyhow!("{}: frame {f} has no skeleton of shape {shape:016x}", self.dir.display()))?;
         r.rt2_in(room)
     }
 
@@ -850,17 +698,16 @@ mod tests {
     }
 
     /// A frame file round-trips its states and wins exactly (the storage
-    /// check passes), and a raise's file joins its frame's as a disjoint
-    /// union; a state in both is refused.
+    /// check passes).
     #[test]
-    fn frame_files_round_trip_and_union() {
+    fn frame_files_round_trip() {
         let dir = std::env::temp_dir().join(format!("celeste-layer-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let a = layer_of(&[(3, (0, 5), 0b1011), (3, (0, 9), 1 << 63), (3, (1 << 40, 2), 7), (70, (0, 1), 1), (4095, (5, 5), 0xffff_0000)]);
         let wins = vec![(1u32, 1u64 << 63), (4, 0x0001_0000)];
         let adds = KeyAdditions::default();
         let meta = FrameMeta { frame: 7, shapes: &[], keys: &adds };
-        let p = frame_path(&dir, 7, None);
+        let p = frame_path(&dir, 7);
         write_frame(&p, &meta, &a, &wins, 3).unwrap();
         check_frame_file(&p, &a, &wins, 2).unwrap();
         let f = FrameFile::open(&p).unwrap();
@@ -868,18 +715,6 @@ mod tests {
         assert_eq!(f.header.wins(), 2);
         let (back, w) = f.layer(None, 1).unwrap();
         assert_eq!((back.iter().collect::<Vec<_>>(), w), (a.iter().collect::<Vec<_>>(), wins.clone()));
-        let b = layer_of(&[(3, (0, 5), 0b0100), (5, (0, 0), 1)]);
-        let u = a.clone().union(b).unwrap();
-        assert_eq!(u.states(), a.states() + 2);
-        assert_eq!(u.mask_of(3, (0, 5)), 0b1111);
-        assert!(u.contains(Sk { region: 5, key: (0, 0), local: 0 }));
-        assert!(a.clone().union(layer_of(&[(3, (0, 5), 0b0001)])).is_err());
-        let notes = notes_of(vec![(3, (0, 5), 90, 0b10), (70, (0, 1), 91, 1), (3, (0, 5), 90, 0b01), (3, (0, 5), 95, 0b1000)]).unwrap();
-        assert_eq!(notes, vec![(3, (0, 5), 90, 0b11), (3, (0, 5), 95, 0b1000), (70, (0, 1), 91, 1)]);
-        assert!(notes_of(vec![(3, (0, 5), 90, 0b10), (3, (0, 5), 90, 0b11)]).is_err(), "a cell noted twice");
-        let np = notes_path(&dir, 7);
-        write_notes(&np, &notes).unwrap();
-        assert_eq!(read_notes(&np).unwrap(), notes);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

@@ -418,43 +418,6 @@ impl RegionTable {
         Ok(RegionTable { kw, keys: Self::chunk_keys(keys.iter().map(|&k| wide(k)), kw), masks: Self::chunk_masks(masks.iter().copied()), len: keys.len(), index: None })
     }
 
-    /// The disjoint union of two frozen tables (a frame and its raise: a
-    /// cell in both is an error).
-    pub fn union(&self, other: &RegionTable) -> Result<RegionTable> {
-        let (mut keys, mut masks) = (Vec::with_capacity(self.len() + other.len()), Vec::with_capacity(self.len() + other.len()));
-        let (mut i, mut j) = (0, 0);
-        while i < self.len() || j < other.len() {
-            let a = (i < self.len()).then(|| self.wkey(i));
-            let b = (j < other.len()).then(|| other.wkey(j));
-            match (a, b) {
-                (Some(x), Some(y)) if x == y => {
-                    ensure!(self.mask(i as u32) & other.mask(j as u32) == 0, "a state held by a frame and its raise");
-                    keys.push(narrow(x));
-                    masks.push(self.mask(i as u32) | other.mask(j as u32));
-                    i += 1;
-                    j += 1;
-                }
-                (Some(x), Some(y)) if x < y => {
-                    keys.push(narrow(x));
-                    masks.push(self.mask(i as u32));
-                    i += 1;
-                }
-                (Some(x), None) => {
-                    keys.push(narrow(x));
-                    masks.push(self.mask(i as u32));
-                    i += 1;
-                }
-                (_, Some(y)) => {
-                    keys.push(narrow(y));
-                    masks.push(other.mask(j as u32));
-                    j += 1;
-                }
-                (None, None) => unreachable!(),
-            }
-        }
-        RegionTable::from_sorted(&keys, &masks)
-    }
-
     pub fn alloc_bytes(&self) -> usize {
         self.keys.iter().map(|c| c.capacity()).sum::<usize>() + self.masks.iter().map(|c| c.capacity() * 8).sum::<usize>() + (self.keys.capacity() + self.masks.capacity()) * 24 + self.index.as_ref().map_or(0, |ix| ix.slots.capacity() * 4)
     }
@@ -534,37 +497,6 @@ impl RegionSet {
     /// Does the set hold state `s`?
     pub fn contains(&self, s: Sk) -> bool {
         self.mask_of(s.region, s.key) >> s.local & 1 == 1
-    }
-
-    /// The disjoint union with `other` (frozen sets).
-    pub fn union(&self, other: &RegionSet) -> Result<RegionSet> {
-        let mut out = RegionSet::default();
-        let (mut i, mut j) = (0, 0);
-        while i < self.tables.len() || j < other.tables.len() {
-            let a = self.tables.get(i).map(|t| t.0);
-            let b = other.tables.get(j).map(|t| t.0);
-            match (a, b) {
-                (Some(x), Some(y)) if x == y => {
-                    out.push(x, self.tables[i].1.union(&other.tables[j].1)?)?;
-                    i += 1;
-                    j += 1;
-                }
-                (Some(x), Some(y)) if x < y => {
-                    out.push(x, self.tables[i].1.clone())?;
-                    i += 1;
-                }
-                (Some(x), None) => {
-                    out.push(x, self.tables[i].1.clone())?;
-                    i += 1;
-                }
-                (_, Some(y)) => {
-                    out.push(y, other.tables[j].1.clone())?;
-                    j += 1;
-                }
-                (None, None) => unreachable!(),
-            }
-        }
-        Ok(out)
     }
 
     /// Bytes allocated.
@@ -685,24 +617,21 @@ mod tests {
         assert!((1000..=2000).contains(&slots), "{slots} index slots for 1000 entries");
     }
 
-    /// Sets: frozen tables pushed in region order, union, membership.
+    /// Sets: frozen tables pushed in region order, membership, entries
+    /// by index.
     #[test]
-    fn a_region_set_unions_and_finds() {
+    fn a_region_set_finds() {
         let mut a = RegionSet::default();
         a.push(3, RegionTable::from_sorted(&[(0, 5), (0, 9)], &[0b11, 1]).unwrap()).unwrap();
         a.push(70, RegionTable::from_sorted(&[(0, 1)], &[1]).unwrap()).unwrap();
         assert!(a.push(5, RegionTable::frozen()).is_err(), "regions out of order");
-        let mut b = RegionSet::default();
-        b.push(3, RegionTable::from_sorted(&[(0, 5), (1, 0)], &[0b100, 1]).unwrap()).unwrap();
-        b.push(9, RegionTable::from_sorted(&[(0, 0)], &[1]).unwrap()).unwrap();
-        let u = a.union(&b).unwrap();
-        assert_eq!(u.iter().collect::<Vec<_>>(), vec![(3, (0, 5), 0b111), (3, (0, 9), 1), (3, (1, 0), 1), (9, (0, 0), 1), (70, (0, 1), 1)]);
-        assert!(u.contains(Sk { region: 3, key: (0, 5), local: 2 }));
-        assert!(!u.contains(Sk { region: 3, key: (0, 5), local: 3 }));
-        assert!(a.union(&a).is_err(), "a state twice");
-        let starts = u.entry_starts();
-        assert_eq!(u.locate(&starts, 3).unwrap(), (1, 0));
-        assert_eq!(u.locate(&starts, 4).unwrap(), (2, 0));
-        assert!(u.locate(&starts, 5).is_err());
+        a.push(90, RegionTable::from_sorted(&[(0, 0)], &[1]).unwrap()).unwrap();
+        assert_eq!(a.iter().collect::<Vec<_>>(), vec![(3, (0, 5), 0b11), (3, (0, 9), 1), (70, (0, 1), 1), (90, (0, 0), 1)]);
+        assert!(a.contains(Sk { region: 3, key: (0, 5), local: 1 }));
+        assert!(!a.contains(Sk { region: 3, key: (0, 5), local: 2 }));
+        let starts = a.entry_starts();
+        assert_eq!(a.locate(&starts, 2).unwrap(), (1, 0));
+        assert_eq!(a.locate(&starts, 3).unwrap(), (2, 0));
+        assert!(a.locate(&starts, 4).is_err());
     }
 }

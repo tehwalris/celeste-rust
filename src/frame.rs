@@ -592,13 +592,8 @@ pub enum TreeFilter {
     /// None (`off`): the frames do not depend on the horizon.
     Off,
     /// Level -1 at `m`, with its table's fingerprint: the tree serves
-    /// horizons up to `m.h`. A level-0 tree notes every frame's drops
-    /// (`dropped/`), so a RAISE extends it exactly to a larger one.
+    /// horizons up to `m.h` (and cannot be raised past it: `grow_tree`).
     MinusOne { m: MinusOne, table: u64 },
-    /// Filtered at this horizon by a binary that noted no drops (a bare
-    /// number, the `gemskip-campaign` record): serves complete horizons up
-    /// to it, cannot be extended.
-    Legacy(u32),
 }
 
 impl TreeFilter {
@@ -626,9 +621,6 @@ impl TreeFilter {
         if s == "off" {
             return Ok(Some(TreeFilter::Off));
         }
-        if let Ok(h) = s.parse::<u32>() {
-            return Ok(Some(TreeFilter::Legacy(h)));
-        }
         let w: Vec<&str> = s.split_whitespace().collect();
         let parsed = match w[..] {
             ["h", h, "speed", sp, "table", fp] => (|| Some((h.parse().ok()?, sp.parse().ok()?, u64::from_str_radix(fp, 16).ok()?)))(),
@@ -642,7 +634,6 @@ impl TreeFilter {
         let s = match self {
             TreeFilter::Off => "off".to_string(),
             TreeFilter::MinusOne { m, table } => format!("h {} speed {} table {table:016x}", m.h, m.speed),
-            TreeFilter::Legacy(h) => h.to_string(),
         };
         std::fs::create_dir_all(dir)?;
         let tmp = dir.join("level_minus_one.tmp");
@@ -652,13 +643,10 @@ impl TreeFilter {
     }
 
     /// The filter a forward extending the tree runs under.
-    fn minus_one(&self, dir: &std::path::Path) -> Result<Option<MinusOne>> {
+    fn minus_one(&self) -> Option<MinusOne> {
         match *self {
-            TreeFilter::Off => Ok(None),
-            TreeFilter::MinusOne { m, .. } => Ok(Some(m)),
-            TreeFilter::Legacy(h) => {
-                anyhow::bail!("{}: filtered by level -1 at step {h} before drops were noted: it cannot be extended (delete it)", dir.display())
-            }
+            TreeFilter::Off => None,
+            TreeFilter::MinusOne { m, .. } => Some(m),
         }
     }
 
@@ -667,7 +655,7 @@ impl TreeFilter {
     /// settings (`--override-settings`) or by another binary would filter
     /// the new frames otherwise than the tree's.
     fn checked_minus_one(&self, dir: &std::path::Path, s: &crate::settings::Settings) -> Result<Option<MinusOne>> {
-        let m = self.minus_one(dir)?;
+        let m = self.minus_one();
         if let (TreeFilter::MinusOne { table, .. }, Some(m)) = (self, m) {
             let got = m.table(s).fingerprint();
             anyhow::ensure!(
@@ -682,12 +670,11 @@ impl TreeFilter {
     /// The level -1 filter the tree in `dir` was built under, its table
     /// checked against the recorded fingerprint: what a check of the tree
     /// (`search::known`) must apply, whatever the environment says. Refused
-    /// without a record or for a legacy one (its table is unknown).
+    /// without a record (its table is unknown).
     pub fn of_tree(dir: &std::path::Path, s: &crate::settings::Settings) -> Result<Option<MinusOne>> {
         match TreeFilter::read(dir)? {
             None => anyhow::bail!("{}: no level -1 record (a tree from before records): its filter is unknown", dir.display()),
             Some(TreeFilter::Off) => Ok(None),
-            Some(TreeFilter::Legacy(h)) => anyhow::bail!("{}: filtered by level -1 at step {h} before the table was recorded: its filter is unknown", dir.display()),
             Some(TreeFilter::MinusOne { m, table }) => {
                 anyhow::ensure!(
                     m.table(s).fingerprint() == table,
@@ -706,7 +693,6 @@ impl TreeFilter {
         match *self {
             TreeFilter::Off => None,
             TreeFilter::MinusOne { m, .. } => Some(m.h),
-            TreeFilter::Legacy(h) => Some(h),
         }
     }
 }
@@ -762,7 +748,7 @@ pub fn start_hull(s: &crate::settings::Settings) -> Result<Hull> {
 /// check). Returns whether a state wins.
 fn checkpoint(dir: &std::path::Path, frame: u32, wave: &crate::storage::wave::Wave, s: &crate::settings::Settings) -> Result<bool> {
     use crate::storage::{hulls, layer};
-    let path = layer::frame_path(dir, frame, None);
+    let path = layer::frame_path(dir, frame);
     let meta = layer::FrameMeta { frame, shapes: &wave.shapes, keys: &wave.keys };
     layer::write_frame(&path, &meta, &wave.next, &wave.wins, s.threads())?;
     layer::check_frame_file(&path, &wave.next, &wave.wins, s.threads())?;
@@ -814,7 +800,7 @@ impl ForwardState {
         let done = crate::storage::edges::done_frame(&edges_dir).unwrap_or(last);
         if done < last {
             for f in done + 1..=last {
-                std::fs::remove_file(crate::storage::layer::frame_path(dir, f, None))?;
+                std::fs::remove_file(crate::storage::layer::frame_path(dir, f))?;
                 let _ = std::fs::remove_file(crate::storage::hulls::path(dir, f));
             }
             eprintln!("[resume] frames f{} to f{last} discarded: their files were not complete", done + 1);
@@ -1020,7 +1006,6 @@ pub fn grow_tree(
     if crate::storage::layer::frame_exists(dir, 0) {
         match TreeFilter::read(dir)? {
             None => anyhow::bail!("{}: the tree has no level -1 record (built before records): delete it", dir.display()),
-            Some(TreeFilter::Legacy(h)) => anyhow::bail!("{}: filtered by level -1 at step {h} before the table was recorded: delete it", dir.display()),
             Some(TreeFilter::Off) => {
                 if want.is_some() {
                     eprintln!("[forward] {}: the tree is not filtered by level -1; it stays unfiltered", dir.display());
@@ -1272,7 +1257,7 @@ pub fn restore_visited(dir: &std::path::Path, last: u32, room: Option<(i16, i16)
         let held = visited.merge(&layer.set, threads)?;
         anyhow::ensure!(held == 0, "{}: f{f}: {held} states stored twice", dir.display());
         let p = hulls::path(dir, f);
-        if f > 0 && !p.exists() && tree.frames[f as usize].is_empty() {
+        if f > 0 && !p.exists() && tree.file(f).is_none() {
             // Past a frontier that died: no frame, no hulls.
             continue;
         }
@@ -1545,7 +1530,7 @@ mod tests {
             assert_eq!(skel(&st.frontier.new), skel(&back.frontier.new), "f{f}: the frontier's skeletons");
             assert_eq!(st.visited.len(), back.visited.len(), "f{f}: the visited set");
             states += st.frontier.new.states();
-            bytes += std::fs::metadata(crate::storage::layer::frame_path(&dir, f, None)).expect("stat").len();
+            bytes += std::fs::metadata(crate::storage::layer::frame_path(&dir, f)).expect("stat").len();
         }
         assert!(states > 20_000, "{states} states: past the spawn");
         assert!(bytes < states * 3 + 36 * 8192, "{bytes} B for {states} states: the files hold keys and masks only");
@@ -1629,8 +1614,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
-    /// A tree's level -1 record round-trips, reads the campaign's bare
-    /// number as a legacy filter, and is absent (unknown) on an old tree.
+    /// A tree's level -1 record round-trips, and is absent (unknown) on an
+    /// old tree; a garbled one is an error.
     #[test]
     fn a_trees_level_minus_one_record_round_trips() {
         let dir = std::env::temp_dir().join(format!("celeste-tree-filter-{}", std::process::id()));
@@ -1639,14 +1624,12 @@ mod tests {
         assert!(TreeFilter::of_tree(&dir, &Default::default()).is_err(), "a check refuses an unknown filter");
         TreeFilter::Off.write(&dir).expect("write");
         assert_eq!(TreeFilter::of_tree(&dir, &Default::default()).expect("off"), None, "a check of an unfiltered tree applies no level -1");
-        TreeFilter::Legacy(111).write(&dir).expect("write");
-        assert!(TreeFilter::of_tree(&dir, &Default::default()).is_err(), "a legacy record's table is unknown");
-        for f in [TreeFilter::Off, TreeFilter::MinusOne { m: MinusOne { h: 186, speed: 5 }, table: 0x0123_4567_89ab_cdef }, TreeFilter::Legacy(111)] {
+        for f in [TreeFilter::Off, TreeFilter::MinusOne { m: MinusOne { h: 186, speed: 5 }, table: 0x0123_4567_89ab_cdef }] {
             f.write(&dir).expect("write");
             assert_eq!(TreeFilter::read(&dir).expect("read"), Some(f));
         }
         std::fs::write(dir.join("level_minus_one.txt"), "116\n").expect("write");
-        assert_eq!(TreeFilter::read(&dir).expect("read"), Some(TreeFilter::Legacy(116)));
+        assert!(TreeFilter::read(&dir).is_err(), "a bare horizon (an old binary's record) is an error");
         std::fs::write(dir.join("level_minus_one.txt"), "h 3 speed\n").expect("write");
         assert!(TreeFilter::read(&dir).is_err(), "a garbled record is an error");
         let _ = std::fs::remove_dir_all(&dir);

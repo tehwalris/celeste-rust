@@ -487,11 +487,11 @@ struct FrameSums {
 }
 
 /// A storage region of a tree: its states over all frames, and per frame
-/// holding it its block `(frame, file, block)`.
+/// holding it its block `(frame, block)`.
 struct RegionBlocks {
     region: u32,
     states: u64,
-    blocks: Vec<(usize, usize, usize)>,
+    blocks: Vec<(usize, usize)>,
 }
 
 /// One storage region counted in every frame holding it: each block
@@ -503,8 +503,8 @@ fn count_region(tree: &Tree, rb: &RegionBlocks, sets: &[MarkedSet], sums: &[std:
     let (shape, slot) = (tree.shape_of(rb.region)?, rb.region % geo.slots);
     let locals = if slot == geo.no_cell_slot() { 1 } else { u64::MAX };
     let rows: Vec<CellRows> = sets.iter().map(|m| CellRows::of(m, shape, slot, locals)).collect();
-    for &(f, fi, bi) in &rb.blocks {
-        let file = &tree.frames[f][fi];
+    for &(f, bi) in &rb.blocks {
+        let file = tree.frames[f].as_ref().expect("a frame with a region block");
         let e = file.region(bi).with_context(|| format!("{} region {}", file.path().display(), rb.region))?;
         file.release_region(bi)?;
         let (mut states, mut wins, mut held) = ([0u32; 64], [0u32; 64], 0u64);
@@ -569,13 +569,11 @@ fn read_tree(dir: &Path, sets: &[MarkedSet], threads: usize) -> Result<(LevelDat
     if n > 0 {
         let tree = Tree::open(dir, n as u32 - 1)?;
         let mut by_region: FxHashMap<u32, RegionBlocks> = FxHashMap::default();
-        for (f, files) in tree.frames.iter().enumerate() {
-            for (fi, file) in files.iter().enumerate() {
-                for (bi, r) in file.header.regions.iter().enumerate() {
-                    let rb = by_region.entry(r.region).or_insert_with(|| RegionBlocks { region: r.region, states: 0, blocks: Vec::new() });
-                    rb.states += r.states as u64;
-                    rb.blocks.push((f, fi, bi));
-                }
+        for (f, file) in tree.frames.iter().enumerate() {
+            for (bi, r) in file.iter().flat_map(|x| x.header.regions.iter().enumerate()) {
+                let rb = by_region.entry(r.region).or_insert_with(|| RegionBlocks { region: r.region, states: 0, blocks: Vec::new() });
+                rb.states += r.states as u64;
+                rb.blocks.push((f, bi));
             }
         }
         let mut regions: Vec<RegionBlocks> = by_region.into_values().collect();

@@ -34,7 +34,7 @@ fn runs_ours(line: &str, python: bool) -> bool {
         let first = call[j + 2..].split([',', ']']).next().unwrap_or("").trim();
         return ["binary", "concrete", "bin", "rewrite"].contains(&first) || first.contains("target/") || first.contains("cargo");
     }
-    // Shell: the binary variables of check.sh, fixtures.sh and raise.sh, a
+    // Shell: the binary variables of check.sh and fixtures.sh, a
     // path into target/, cargo - not where assigned or tested for (`-x`).
     let code = t.split(" #").next().unwrap_or(t);
     let invokes = |pat: &str| code.match_indices(pat).any(|(i, _)| !code[..i].ends_with("-x ") && !code[..i].ends_with('='));

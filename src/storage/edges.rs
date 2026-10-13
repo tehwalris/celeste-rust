@@ -3,11 +3,10 @@
 //! Every edge of frame `f` leaves a state of layer `f - 1` and is stored in
 //! its TARGET's region: per (target region, frame) its bundles
 //! (`storage::bundle`: source key, transfer, offset, target key -> target
-//! cells) in one or more SEGMENTS - a wave's slices; a raise adds a file -
-//! each a zstd block. Per frame ONE file `edges/f{frame}.bin` (a raise adds
-//! `f{frame}.r{seq}.bin`): a header - the segments, by region, and per
-//! target region the SOURCE regions its edges leave (the out-edge lookup) -
-//! and the blocks. Transfers are global ids into `edges/xfer.bin`,
+//! cells) in one or more SEGMENTS - a wave's slices - each a zstd block.
+//! Per frame ONE file `edges/f{frame}.bin`: a header - the segments, by
+//! region, and per target region the SOURCE regions its edges leave (the
+//! out-edge lookup) - and the blocks. Transfers are global ids into `edges/xfer.bin`,
 //! CANONICAL: a frame's new pairs are numbered at its end by their edges
 //! in the frame and their content (`XferTable::canonical`; a bundle
 //! holding one waits for it, as one into
@@ -187,12 +186,9 @@ impl Segment {
     }
 }
 
-/// The edge file of frame `frame` (`raised`: a raise's, by its first seq).
-pub fn file_path(dir: &Path, frame: u32, raised: Option<u32>) -> PathBuf {
-    match raised {
-        None => dir.join(format!("f{frame:03}.bin")),
-        Some(seq) => dir.join(format!("f{frame:03}.r{seq:04}.bin")),
-    }
+/// The edge file of frame `frame`.
+pub fn file_path(dir: &Path, frame: u32) -> PathBuf {
+    dir.join(format!("f{frame:03}.bin"))
 }
 
 /// Write frame `frame`'s edge file from its segments (any order) and its
@@ -345,9 +341,9 @@ impl Decoder {
 }
 
 /// A level's recorded graph up to a horizon, mapped: per frame its edge
-/// files, and the global transfer table.
+/// file (none past a dead frontier), and the global transfer table.
 pub struct EdgeStore {
-    frames: Vec<Vec<EdgeFile>>,
+    frames: Vec<Option<EdgeFile>>,
     xfers: Vec<Pair>,
     pub edges: u64,
     pub bytes: u64,
@@ -356,39 +352,24 @@ pub struct EdgeStore {
 impl EdgeStore {
     /// Map frames `1..=horizon`'s edge files under `dir` (`<level>/edges`).
     pub fn open(dir: &Path, horizon: u32) -> Result<Self> {
-        let mut frames: Vec<Vec<EdgeFile>> = (0..=horizon).map(|_| Vec::new()).collect();
+        let mut frames: Vec<Option<EdgeFile>> = vec![None];
         let (mut edges, mut bytes) = (0u64, 0u64);
-        let mut paths: Vec<(u32, PathBuf)> = Vec::new();
-        for e in std::fs::read_dir(dir).into_iter().flatten().flatten() {
-            let p = e.path();
-            let Some(n) = p.file_name().and_then(|s| s.to_str()) else { continue };
-            let Some(f) = frame_of_name(n) else { continue };
-            if !n.ends_with(".bin") || f == 0 || f > horizon {
-                continue;
+        for f in 1..=horizon {
+            let p = file_path(dir, f);
+            let file = if p.exists() { Some(EdgeFile::open(&p, f)?) } else { None };
+            if let Some(file) = &file {
+                edges += file.head.segs.iter().map(|s| s.edges).sum::<u64>();
+                bytes += file.map.len() as u64;
             }
-            paths.push((f, p));
-        }
-        // A frame's own file first, then its raises' (by seq).
-        paths.sort();
-        for (f, p) in paths {
-            let file = EdgeFile::open(&p, f)?;
-            edges += file.head.segs.iter().map(|s| s.edges).sum::<u64>();
-            bytes += file.map.len() as u64;
-            frames[f as usize].push(file);
+            frames.push(file);
         }
         let xfers = XferTable::load_pairs(dir)?;
         Ok(EdgeStore { frames, xfers, edges, bytes })
     }
 
-    /// Frame `frame`'s edge file (the next past the store's horizon, just
-    /// written and trusted) mapped in: the forward's store grows with it.
-    pub fn add_frame(&mut self, dir: &Path, frame: u32) -> Result<()> {
-        ensure!(frame as usize == self.frames.len(), "edge store: frame {frame} after {}", self.frames.len() - 1);
-        let file = EdgeFile::open(&file_path(dir, frame, None), frame)?;
-        self.edges += file.head.segs.iter().map(|s| s.edges).sum::<u64>();
-        self.bytes += file.map.len() as u64;
-        self.frames.push(vec![file]);
-        Ok(())
+    /// Frame `frame`'s edge file.
+    fn file(&self, frame: u32) -> Option<&EdgeFile> {
+        self.frames.get(frame as usize).and_then(|x| x.as_ref())
     }
 
     /// The transfer of global id `xfer`.
@@ -403,7 +384,7 @@ impl EdgeStore {
 
     /// Does frame `frame` have recorded edges?
     pub fn has_frame(&self, frame: u32) -> bool {
-        self.frames.get(frame as usize).is_some_and(|v| !v.is_empty())
+        self.file(frame).is_some()
     }
 
     /// The last frame of the store.
@@ -414,11 +395,9 @@ impl EdgeStore {
     /// Per target region the first frame with edges into it.
     pub fn first_frames(&self) -> FxHashMap<u32, u32> {
         let mut m: FxHashMap<u32, u32> = FxHashMap::default();
-        for (f, files) in self.frames.iter().enumerate().rev() {
-            for file in files {
-                for h in &file.head.segs {
-                    m.insert(h.region, f as u32);
-                }
+        for (f, file) in self.frames.iter().enumerate().rev() {
+            for h in file.iter().flat_map(|x| &x.head.segs) {
+                m.insert(h.region, f as u32);
             }
         }
         m
@@ -426,8 +405,7 @@ impl EdgeStore {
 
     /// The target regions with edges at frame `frame`, sorted, distinct.
     pub fn regions(&self, frame: u32) -> Vec<u32> {
-        let mut v: Vec<u32> = self.frames.get(frame as usize).into_iter().flatten().flat_map(|f| f.head.segs.iter().map(|s| s.region)).collect();
-        v.dedup();
+        let mut v: Vec<u32> = self.file(frame).into_iter().flat_map(|f| f.head.segs.iter().map(|s| s.region)).collect();
         v.sort_unstable();
         v.dedup();
         v
@@ -435,12 +413,12 @@ impl EdgeStore {
 
     /// The segments of target region `region` at frame `frame`.
     pub fn segments(&self, frame: u32, region: u32) -> Vec<SegRef<'_>> {
-        self.frames.get(frame as usize).into_iter().flatten().flat_map(|f| f.segs_of(region).iter().map(move |h| f.seg(h))).collect()
+        self.file(frame).into_iter().flat_map(|f| f.segs_of(region).iter().map(move |h| f.seg(h))).collect()
     }
 
     /// Every segment of frame `frame`, by region.
     pub fn all_segments(&self, frame: u32) -> Vec<SegRef<'_>> {
-        let mut v: Vec<SegRef> = self.frames.get(frame as usize).into_iter().flatten().flat_map(|f| f.head.segs.iter().map(move |h| f.seg(h))).collect();
+        let mut v: Vec<SegRef> = self.file(frame).into_iter().flat_map(|f| f.head.segs.iter().map(move |h| f.seg(h))).collect();
         v.sort_by_key(|s| s.region);
         v
     }
@@ -448,7 +426,7 @@ impl EdgeStore {
     /// The target regions holding edges that leave source region `source`
     /// at frame `frame` (the out-edge lookup), sorted, distinct.
     pub fn targets_of(&self, frame: u32, source: u32) -> Vec<u32> {
-        let mut v: Vec<u32> = self.frames.get(frame as usize).into_iter().flatten().flat_map(|f| f.targets().get(&source).into_iter().flatten().copied()).collect();
+        let mut v: Vec<u32> = self.file(frame).into_iter().flat_map(|f| f.targets().get(&source).into_iter().flatten().copied()).collect();
         v.sort_unstable();
         v.dedup();
         v
@@ -568,9 +546,8 @@ pub fn set_done(dir: &Path, frame: u32, xfers: usize) -> Result<()> {
     Ok(())
 }
 
-/// The frame an edge file's name is of: `f{frame}.bin`, `f{frame}.r{seq}.bin`
-/// - the digits after the `f`, however many (the names pad to 3:
-/// `f1000.bin` is frame 1000).
+/// The frame an edge file's name is of (`f{frame}.bin`): the digits after
+/// the `f`, however many (the names pad to 3: `f1000.bin` is frame 1000).
 pub fn frame_of_name(name: &str) -> Option<u32> {
     let digits = name.strip_prefix('f')?;
     let end = digits.find(|c: char| !c.is_ascii_digit()).unwrap_or(digits.len());
@@ -628,7 +605,7 @@ pub(crate) fn write_test_edges(dir: &Path, frames: &[(u32, Vec<(Sk, Sk, u32)>)],
     let mut last = 0;
     for (frame, edges) in frames {
         let (segs, sources) = segments_of(edges)?;
-        write_file(&file_path(dir, *frame, None), *frame, segs, sources)?;
+        write_file(&file_path(dir, *frame), *frame, segs, sources)?;
         last = last.max(*frame);
     }
     set_done(dir, last, pairs.len())
@@ -669,8 +646,8 @@ mod tests {
     /// Edge file names past frame 999 (split frame: step 1000 is frame 500).
     #[test]
     fn edge_file_names_give_their_frame_at_any_width() {
-        for (frame, raised) in [(7, None), (999, Some(3)), (1000, None), (1234, Some(12))] {
-            let p = file_path(Path::new("e"), frame, raised);
+        for frame in [7, 999, 1000, 1234] {
+            let p = file_path(Path::new("e"), frame);
             let name = p.file_name().and_then(|s| s.to_str()).expect("a name");
             assert_eq!(frame_of_name(name), Some(frame), "{name}");
         }
@@ -679,7 +656,7 @@ mod tests {
         }
         let dir = std::env::temp_dir().join(format!("celeste-edge-names-{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("tmp");
-        for f in ["f999.bin", "f1000.bin", "f1000.r0001.bin", "f0998.bin", "done.txt"] {
+        for f in ["f999.bin", "f1000.bin", "f1000.tmp", "f0998.bin", "done.txt"] {
             std::fs::write(dir.join(f), b"").expect("write");
         }
         discard_after(&dir, 999).expect("discard");
@@ -705,7 +682,8 @@ mod tests {
         let t2 = st(1, 9, cell(6, 4));
         let far = st(1, 2, cell(100, 40));
         let none = st(0, 7, crate::search::pos_graph::NO_CELL);
-        let mut edges = vec![(a, t1, 3), (b, t2, 3), (a, t2, 4), (a, far, 3), (none, t1, 0), (t1, none, 1)];
+        let extra = (st(0, 6, cell(2, 4)), t1, 2);
+        let edges = vec![(a, t1, 3), (b, t2, 3), (a, t2, 4), (a, far, 3), (none, t1, 0), (t1, none, 1), extra];
         let pairs: Vec<Pair> = (0..5)
             .map(|i| {
                 let ax = crate::search::arc_edges::AxisXfer { lo: 0, hi: 1 << 16, tag: 0, val: i };
@@ -713,11 +691,6 @@ mod tests {
             })
             .collect();
         write_test_edges(&dir, &[(4, edges.clone())], &pairs).unwrap();
-        // A raise's file: one more edge into t1's region.
-        let extra = (st(0, 6, cell(2, 4)), t1, 2);
-        let (segs, src) = segments_of(&[extra]).unwrap();
-        write_file(&file_path(&dir, 4, Some(1)), 4, segs, src).unwrap();
-        edges.push(extra);
         let store = EdgeStore::open(&dir, 4).unwrap();
         assert_eq!(store.edges, edges.len() as u64);
         let mut got = store.edges_at(4, 2).unwrap();

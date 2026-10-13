@@ -683,30 +683,30 @@ pub fn run_wave(engine: &dyn FrameStep, front: &Frontier, cx: WaveCtx) -> Result
     drop(parts);
     ensure!(held == 0, "frame {frame}: {held} of the next layer's states the visited set held already");
     mark("absorb", &mut ends);
-    let mut next = Layer::default();
-    let mut hulls: Vec<Hull> = Vec::new();
     // The grown states by (layer, state): the routes' in region order, each
-    // sorted, put in layer order (stable).
-    let mut by_state: Vec<Old> = Vec::new();
-    for sl in new {
-        by_state.extend(sl.grown);
-        if !sl.table.is_empty() {
-            next.set.push(sl.region, sl.table)?;
-            hulls.extend(sl.hulls);
-        }
-    }
+    // sorted, put in layer order (stable: a counting sort).
     let mut at = vec![0usize; frame as usize + 1];
-    for o in &by_state {
-        at[o.layer as usize] += 1;
+    for sl in &new {
+        for o in &sl.grown {
+            at[o.layer as usize] += 1;
+        }
     }
     let mut sum = 0;
     for a in at.iter_mut() {
         (*a, sum) = (sum, sum + *a);
     }
-    let mut grown: Vec<Old> = vec![Old { sk: Sk::default(), layer: 0, hull: Hull::default(), was: Hull::default() }; by_state.len()];
-    for o in by_state {
-        grown[at[o.layer as usize]] = o;
-        at[o.layer as usize] += 1;
+    let mut grown: Vec<Old> = vec![Old { sk: Sk::default(), layer: 0, hull: Hull::default(), was: Hull::default() }; sum];
+    let mut next = Layer::default();
+    let mut hulls: Vec<Hull> = Vec::with_capacity(new.iter().map(|sl| sl.hulls.len()).sum());
+    for sl in new {
+        for o in sl.grown {
+            grown[at[o.layer as usize]] = o;
+            at[o.layer as usize] += 1;
+        }
+        if !sl.table.is_empty() {
+            next.set.push(sl.region, sl.table)?;
+            hulls.extend(sl.hulls);
+        }
     }
     let mut shapes_in: Vec<u32> = next.set.tables().iter().map(|(r, _)| r / GEOMETRY.slots).collect();
     shapes_in.dedup();
@@ -742,7 +742,7 @@ pub fn run_wave(engine: &dyn FrameStep, front: &Frontier, cx: WaveCtx) -> Result
     st.grown = grown.len();
     if let Some(dir) = edges_dir {
         xfers.flush(dir)?;
-        let path = super::edges::file_path(dir, frame, None);
+        let path = super::edges::file_path(dir, frame);
         st.edge_bytes = super::edges::write_file(&path, frame, segs, src_index)?;
         // The out-edges, the kernel units' blocks in unit order (the
         // provisional ones encoded with their final keys).

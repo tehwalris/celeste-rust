@@ -247,11 +247,9 @@ pub fn bench_storage(a: &BenchArgs) -> Result<()> {
     let tree = super::layer::Tree::open(a.tree, frame - 1)?;
     let mut skeletons: rustc_hash::FxHashMap<u64, celeste_engine::runtime2::Rt2> = Default::default();
     for f in (0..frame).rev() {
-        for file in &tree.frames[f as usize] {
-            for r in &file.header.skeletons {
-                if !skeletons.contains_key(&r.shape_hash) {
-                    skeletons.insert(r.shape_hash, r.rt2_in(a.settings.room)?);
-                }
+        for r in tree.file(f).iter().flat_map(|x| &x.header.skeletons) {
+            if !skeletons.contains_key(&r.shape_hash) {
+                skeletons.insert(r.shape_hash, r.rt2_in(a.settings.room)?);
             }
         }
     }

@@ -164,8 +164,9 @@ def run(job, outdir, binary):
         tree = os.path.join(jd, "tree")
         release_tree()
         # `reuse`: a level-0 tree of this room and level (a retry with a
-        # longer objects ladder, or another horizon: the search raises a tree
-        # filtered by level -1 below it), moved in so `search` reuses it.
+        # longer objects ladder, or a horizon at most the tree's: a tree
+        # filtered by level -1 below the horizon is refused, a hull tree
+        # cannot be raised), moved in so `search` reuses it.
         if job.get("reuse") and os.path.isdir(job["reuse"]):
             os.makedirs(tree)
             shutil.move(job["reuse"], os.path.join(tree, "level00"))

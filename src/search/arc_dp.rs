@@ -1375,10 +1375,8 @@ impl Seeds {
         let (Some(start), None) = (start.next(), start.next()) else { anyhow::bail!("{}: frame 0 is not one state", dir.display()) };
         let mut wins: Vec<(Sk, u32)> = Vec::new();
         for f in 1..=horizon {
-            for file in &tree.frames[f as usize] {
-                if file.header.wins() > 0 {
-                    wins.extend(file.wins()?.into_iter().map(|w| (w, f)));
-                }
+            if let Some(file) = tree.file(f).filter(|x| x.header.wins() > 0) {
+                wins.extend(file.wins()?.into_iter().map(|w| (w, f)));
             }
         }
         let store = EdgeStore::open(&dir.join("edges"), horizon)?;

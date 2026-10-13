@@ -17,8 +17,8 @@
 //! command would silently change category).
 //!
 //! The level -1 filter is recorded apart (`frame::TreeFilter`,
-//! `level_minus_one.txt`): a raise changes it, and a tree serves every
-//! horizon up to it. Threads and the diagnostics never change a
+//! `level_minus_one.txt`): a tree serves every horizon up to it, and is
+//! never raised past it (`frame::grow_tree`). Threads and the diagnostics never change a
 //! tree. The level the tree's rows are widened at (the engine's `Level`) is
 //! a line of the record: a tree used at another level is refused like any
 //! other difference.
