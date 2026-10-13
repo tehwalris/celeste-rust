@@ -59,6 +59,13 @@ impl Arc {
         (p + CIRCLE - self.start as u32) % CIRCLE <= self.last as u32
     }
 
+    /// Does it hold every point of segment `s`?
+    pub fn contains_seg(self, s: Seg) -> bool {
+        let at = |p: u32| (p + CIRCLE - self.start as u32) % CIRCLE;
+        let (a, b) = (at(s.lo), at(s.hi - 1));
+        a <= b && b <= self.last as u32 && b - a == s.hi - 1 - s.lo
+    }
+
     /// The arc as segments of `0..CIRCLE` (one, or two across the end).
     #[inline]
     pub fn segs(self, mut f: impl FnMut(Seg)) {
@@ -135,6 +142,27 @@ impl Hull {
         true
     }
 
+    /// THE PUSH of a GROWN hull (`self`; `was`, the hull it last pushed,
+    /// inside it): `push`, but only where the edge's image grows past
+    /// `was`'s - every image of `was` was pushed then (an image dropped
+    /// then, by level -1 or the ladder's filter, is dropped at every later
+    /// frame too). The image grows when the box was empty and is not, or
+    /// when an axis it rotates meets more of the guard than before (a
+    /// constant's image is its point either way). Returns whether it pushed.
+    #[inline]
+    pub fn push_grown(&self, was: &Hull, tx: Transfer, ty: Transfer, acc: &mut HullAcc) -> bool {
+        let (nx, ny) = (meet(self.x, tx.guard), meet(self.y, ty.guard));
+        if nx == 0 || ny == 0 {
+            return false;
+        }
+        let (ox, oy) = (meet(was.x, tx.guard), meet(was.y, ty.guard));
+        let grows = |t: Transfer, n: u32, o: u32| matches!(t.action, Action::Rotate(_)) && n != o;
+        if ox != 0 && oy != 0 && !grows(tx, nx, ox) && !grows(ty, ny, oy) {
+            return false;
+        }
+        self.push(tx, ty, acc)
+    }
+
     /// Little-endian `x.start, x.last, y.start, y.last`.
     pub fn to_bytes(&self) -> [u8; HULL_BYTES] {
         let mut b = [0u8; HULL_BYTES];
@@ -148,6 +176,18 @@ impl Hull {
         let v = |i: usize| u16::from_le_bytes([b[2 * i], b[2 * i + 1]]);
         Hull { x: Arc { start: v(0), last: v(1) }, y: Arc { start: v(2), last: v(3) } }
     }
+}
+
+/// The points of arc `a` inside segment `g`.
+#[inline]
+fn meet(a: Arc, g: Seg) -> u32 {
+    let mut n = 0;
+    a.segs(|s| {
+        if let Some(c) = clip(s, g) {
+            n += c.hi - c.lo;
+        }
+    });
+    n
 }
 
 /// `s` clipped to `g`.
@@ -193,6 +233,52 @@ fn image(a: Arc, t: Transfer, out: &mut [Seg; 4]) -> usize {
         Action::Rotate(_) => n,
     }
 }
+
+/// A small direct-mapped cache of pushes, `(hull, the hull it last pushed,
+/// transfer) -> the push` (`None`: nothing): a source's cells and a unit's
+/// sources share hulls (a full one most of all) and transfers, and a push
+/// depends on nothing else. The transfer is the caller's id; `clear` it when
+/// the ids change meaning.
+pub struct PushCache {
+    slots: Vec<(u64, u64, u32, Option<HullAcc>)>,
+}
+
+/// Entries of a `PushCache` (a power of two).
+const PUSH_CACHE: usize = 1 << 11;
+
+impl Default for PushCache {
+    fn default() -> Self {
+        PushCache { slots: vec![(u64::MAX, u64::MAX, u32::MAX, None); PUSH_CACHE] }
+    }
+}
+
+impl PushCache {
+    pub fn clear(&mut self) {
+        self.slots.fill((u64::MAX, u64::MAX, u32::MAX, None));
+    }
+
+    /// The push of `h` (`was`: its last pushed hull; itself for a hull
+    /// pushed the first time) along transfer `x`, `f()` on a miss.
+    #[inline]
+    pub fn get(&mut self, h: &Hull, was: &Hull, x: u32, f: impl FnOnce() -> Option<HullAcc>) -> Option<HullAcc> {
+        let (a, b) = (u64::from_le_bytes(h.to_bytes()), u64::from_le_bytes(was.to_bytes()));
+        let k = celeste_engine::runtime2::mix64(a ^ b.rotate_left(23) ^ (x as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15)) as usize & (PUSH_CACHE - 1);
+        let e = &mut self.slots[k];
+        if (e.0, e.1, e.2) == (a, b, x) {
+            return e.3;
+        }
+        let r = f();
+        *e = (a, b, x, r);
+        r
+    }
+}
+
+/// TESTS ONLY: every hull the forward accumulates (and the start's) WIDENED
+/// to the whole circle - the forward before hulls, every state's remainder
+/// widened, which the hull forward must stay inside (`frame::tests`).
+/// Process-global: nextest runs each test in its own process.
+#[cfg(test)]
+pub static WIDEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// The charts' cut points: chart `c`'s coordinate of point `p` is
 /// `(p - CUT[c]) mod CIRCLE`.
@@ -256,6 +342,10 @@ impl HullAcc {
     pub fn hull(&self) -> Option<Hull> {
         if self.is_empty() {
             return None;
+        }
+        #[cfg(test)]
+        if WIDEN.load(std::sync::atomic::Ordering::Relaxed) {
+            return Some(Hull::full());
         }
         let axis = |a: usize| {
             let mut best: Option<Arc> = None;
@@ -341,6 +431,29 @@ mod tests {
                         assert!(got.contains(px, py), "{h:?} {tx:?} {ty:?}: ({px}, {py}) of the image is not in {got:?}");
                     }
                 }
+            }
+        }
+        // A grown hull's push: nothing where the image did not grow; else
+        // the whole push.
+        for _ in 0..3000 {
+            let was = Hull { x: arc(&mut s), y: arc(&mut s) };
+            let mut grow = HullAcc::EMPTY;
+            grow.add_hull(&was);
+            grow.add_hull(&Hull { x: arc(&mut s), y: arc(&mut s) });
+            let h = grow.hull().unwrap();
+            let (tx, ty) = (transfer(&mut s), transfer(&mut s));
+            let (mut a, mut b, mut old) = (HullAcc::EMPTY, HullAcc::EMPTY, HullAcc::EMPTY);
+            let full = h.push(tx, ty, &mut a);
+            let grown = h.push_grown(&was, tx, ty, &mut b);
+            if grown {
+                assert_eq!(a, b, "a grown push is the whole push");
+            } else if full {
+                // Skipped: the old push's image already holds the new one.
+                assert!(was.push(tx, ty, &mut old), "skipped a push whose old image was empty");
+                let (mut img_new, mut img_old) = (Vec::new(), Vec::new());
+                h.to_region().push(tx, ty, &mut img_new);
+                was.to_region().push(tx, ty, &mut img_old);
+                assert_eq!(Region::from_pieces(&mut img_new, &mut Vec::new()), Region::from_pieces(&mut img_old, &mut Vec::new()), "{was:?} -> {h:?} {tx:?} {ty:?}: skipped a push whose image grew");
             }
         }
         // Order: many pushes into one accumulator, forwards and backwards.

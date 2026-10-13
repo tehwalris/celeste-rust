@@ -160,6 +160,18 @@ enum Command {
         #[arg(long)]
         decode_rect: Option<String>,
     },
+    /// THE HULL FORWARD's frontiers, from a tree's hull files: per frame
+    /// its new and grown states and how far they grew, and over the tree
+    /// how often a state's hull grew and how wide hulls end (per axis, in
+    /// points of the 65536-point circle).
+    HullStats {
+        /// The tree (a forward's checkpoint dir, or a search's `levelNN`).
+        #[arg(long, default_value = DEFAULT_CHECKPOINT_DIR)]
+        checkpoint_dir: String,
+        /// Its last frame to read.
+        #[arg(long)]
+        to: u32,
+    },
     CheckKnown {
         /// The search's checkpoint dir (its `level{i:02}` trees).
         #[arg(long)]
@@ -938,6 +950,9 @@ fn main() -> Result<()> {
                 prev = Some((s.arc_marks.expect("asked for"), lvl));
             }
         }
+        Command::HullStats { checkpoint_dir, to } => {
+            hull_stats(std::path::Path::new(&checkpoint_dir), to, cfg.threads())?;
+        }
         Command::Reach { checkpoint_dir, level_index, to, save_marks, cells, decode_rect } => {
             reach_command(&checkpoint_dir, level_index, to, save_marks.as_deref(), cells.as_deref(), decode_rect.as_deref(), &cfg)?;
         }
@@ -1110,7 +1125,7 @@ fn main() -> Result<()> {
                     if !celeste_rust::storage::layer::frame_exists(dir, frame) {
                         break;
                     }
-                    let grown = celeste_rust::storage::hulls::read(&celeste_rust::storage::hulls::path(dir, frame))?;
+                    let grown = celeste_rust::storage::hulls::read(&celeste_rust::storage::hulls::path(dir, frame), cfg.threads())?;
                     let (n, acc) = celeste_rust::storage::hulls::fingerprint(&grown, &tree.space, &tree.shapes)?;
                     println!("h{frame:03} {n} {acc:016x}");
                 }
@@ -1164,11 +1179,10 @@ fn main() -> Result<()> {
                 let t_all = t.elapsed();
                 let w = &wave.stats;
                 eprintln!(
-                    "[bench] rep {rep}: wave {:.0} ms (idle {:.0}%, regions {:.0} worker-ms) re-push {:.0} end {:.0} total {:.0} ms | in {} old {} emitted {} re-pushed {} pushes {} kept {} grown {} | units {} slices {} routes {} | edges {} bundles {} ({:.3} B) | rss start {:.2} wave {:.2} end {:.2} peak {:.2} GB",
+                    "[bench] rep {rep}: wave {:.0} ms (idle {:.0}%, regions {:.0} worker-ms) end {:.0} total {:.0} ms | in {} old {} emitted {} re-pushed {} pushes {} kept {} grown {} | units {} slices {} routes {} | edges {} bundles {} ({:.3} B; out {:.3} B) | rss start {:.2} wave {:.2} end {:.2} peak {:.2} GB",
                     ms(w.t_wave),
                     w.wave_idle * 100.0,
                     ms(w.t_regions),
-                    ms(w.t_repush),
                     ms(w.t_layer),
                     ms(t_all),
                     w.lanes_in,
@@ -1184,6 +1198,7 @@ fn main() -> Result<()> {
                     w.edge_records,
                     w.edge_bundles,
                     w.edge_bytes as f64 / w.edge_records.max(1) as f64,
+                    w.out_bytes as f64 / w.edge_records.max(1) as f64,
                     w.rss_start,
                     w.rss_wave,
                     w.rss_end,
@@ -2507,6 +2522,76 @@ mod tests {
 }
 
 /// `rewrite reach` (search::reach): the run, its table and its outputs.
+/// `rewrite hull-stats` (its doc).
+fn hull_stats(dir: &std::path::Path, to: u32, threads: usize) -> Result<()> {
+    use celeste_rust::search::hull::Hull;
+    use celeste_rust::storage::{hulls, Sk};
+    let mut last: rustc_hash::FxHashMap<Sk, (Hull, u32)> = Default::default();
+    let q = |v: &mut Vec<u32>, f: f64| -> u32 {
+        if v.is_empty() {
+            return 0;
+        }
+        v.sort_unstable();
+        v[((v.len() - 1) as f64 * f) as usize]
+    };
+    println!("frame\tnew\tgrown\tgrowth_x_med\tgrowth_x_p90\tgrowth_y_med\tgrowth_y_p90\tgrown_full_x");
+    for f in 0..=to {
+        let p = hulls::path(dir, f);
+        if !p.exists() {
+            break;
+        }
+        let g = hulls::read(&p, threads)?;
+        let (mut new, mut grown, mut full) = (0u64, 0u64, 0u64);
+        let (mut gx, mut gy) = (Vec::new(), Vec::new());
+        for (sk, layer, h) in g {
+            match last.get_mut(&sk) {
+                None => {
+                    anyhow::ensure!(layer as u32 == f, "f{f}: a first hull at layer {layer}");
+                    new += 1;
+                    last.insert(sk, (h, 1));
+                }
+                Some((was, n)) => {
+                    grown += 1;
+                    gx.push(h.x.len() - was.x.len());
+                    gy.push(h.y.len() - was.y.len());
+                    full += h.x.is_full() as u64;
+                    *was = h;
+                    *n += 1;
+                }
+            }
+        }
+        println!("{f}\t{new}\t{grown}\t{}\t{}\t{}\t{}\t{full}", q(&mut gx, 0.5), q(&mut gx, 0.9), q(&mut gy, 0.5), q(&mut gy, 0.9));
+    }
+    let mut times: Vec<u32> = last.values().map(|x| x.1).collect();
+    let (mut wx, mut wy): (Vec<u32>, Vec<u32>) = last.values().map(|x| (x.0.x.len(), x.0.y.len())).unzip();
+    let n = times.len().max(1) as f64;
+    let entries: u64 = times.iter().map(|&t| t as u64).sum();
+    let mut hist = [0u64; 6];
+    for &t in &times {
+        hist[(t as usize).min(6) - 1] += 1;
+    }
+    println!(
+        "states {}: hulls set {} times ({:.2} a state; 1: {}, 2: {}, 3: {}, 4: {}, 5: {}, 6+: {}); final width x med {} p90 {} y med {} p90 {}; full in x {:.1}%, in y {:.1}%",
+        times.len(),
+        entries,
+        entries as f64 / n,
+        hist[0],
+        hist[1],
+        hist[2],
+        hist[3],
+        hist[4],
+        hist[5],
+        q(&mut wx, 0.5),
+        q(&mut wx, 0.9),
+        q(&mut wy, 0.5),
+        q(&mut wy, 0.9),
+        100.0 * wx.iter().filter(|&&w| w == 65536).count() as f64 / n,
+        100.0 * wy.iter().filter(|&&w| w == 65536).count() as f64 / n
+    );
+    times.clear();
+    Ok(())
+}
+
 fn reach_command(checkpoint_dir: &str, level_index: usize, to: u32, save: Option<&str>, cells_out: Option<&str>, decode_rect: Option<&str>, cfg: &celeste_rust::settings::Settings) -> Result<()> {
     use celeste_rust::search::pos_graph::cell_xy;
     use std::io::Write;

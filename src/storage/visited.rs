@@ -143,15 +143,86 @@ impl VisitedSet {
         let t = self.set.table(region).ok_or_else(|| anyhow::anyhow!("region {region}: no table for its states' hulls"))?;
         let m = self.info.entry(region).or_default();
         for (key, local, i) in states {
-            let e = t.find(key).filter(|&e| t.mask(e) >> local & 1 == 1).ok_or_else(|| anyhow::anyhow!("region {region}: a hull for a state the set lacks"))?;
-            m.insert(e << 6 | local, i);
+            Self::put(t, m, region, key, local, i)?;
         }
         Ok(())
+    }
+
+    #[inline]
+    fn put(t: &RegionTable, m: &mut FxHashMap<u32, StateInfo>, region: u32, key: Key, local: u32, i: StateInfo) -> Result<()> {
+        let e = t.find(key).filter(|&e| t.mask(e) >> local & 1 == 1).ok_or_else(|| anyhow::anyhow!("region {region}: a hull for a state the set lacks"))?;
+        m.insert(e << 6 | local, i);
+        Ok(())
+    }
+
+    /// `set_info` for many regions at once, on `threads` threads: per
+    /// group `(region, g)` (distinct regions) `each(g, put)` puts its
+    /// states.
+    #[allow(clippy::type_complexity)]
+    pub fn set_infos<G: Sync>(&mut self, groups: &[(u32, G)], each: impl Fn(&G, &mut dyn FnMut(Key, u32, StateInfo) -> Result<()>) -> Result<()> + Sync, threads: usize) -> Result<()> {
+        for (region, _) in groups {
+            self.info.entry(*region).or_default();
+        }
+        let want: FxHashMap<u32, usize> = groups.iter().enumerate().map(|(i, g)| (g.0, i)).collect();
+        let set = &self.set;
+        let work: Vec<std::sync::Mutex<(u32, &mut FxHashMap<u32, StateInfo>, usize)>> = self.info.iter_mut().filter_map(|(r, m)| want.get(r).map(|&i| std::sync::Mutex::new((*r, m, i)))).collect();
+        let done = super::wave::par_map(&work, threads, |w| -> Result<()> {
+            let mut g = w.lock().expect("a region's hulls");
+            let (region, m, i) = &mut *g;
+            let t = set.table(*region).ok_or_else(|| anyhow::anyhow!("region {region}: no table for its states' hulls"))?;
+            each(&groups[*i].1, &mut |key, local, info| Self::put(t, m, *region, key, local, info))
+        });
+        done.into_iter().collect()
     }
 
     /// The states with a layer and hull.
     pub fn infos(&self) -> usize {
         self.info.values().map(|m| m.len()).sum()
+    }
+
+    /// A FRAME's states in, regions on `threads` threads: per region (each
+    /// once) its NEW entries (frozen, of a numbered shape) with their hulls
+    /// in its state order - merged in at layer `layer` - and the states
+    /// whose hull grew (held already) with their new hulls. Returns the
+    /// new cells held already (0: the frame's new states are new).
+    #[allow(clippy::type_complexity)]
+    pub fn absorb(&mut self, parts: &[(u32, &RegionTable, &[Hull], &[super::wave::Old])], layer: u16, threads: usize) -> Result<u64> {
+        for &(region, ..) in parts {
+            anyhow::ensure!(((region / self.geo.slots) as usize) < self.shapes.len(), "an absorbed region {region} of no numbered shape");
+            self.set.table_mut(region, RegionTable::new);
+            self.info.entry(region).or_default();
+        }
+        let want: FxHashMap<u32, usize> = parts.iter().enumerate().map(|(i, p)| (p.0, i)).collect();
+        let mut tables: FxHashMap<u32, &mut RegionTable> = self.set.tables_mut().iter_mut().filter(|(r, _)| want.contains_key(r)).map(|(r, t)| (*r, t)).collect();
+        let work: Vec<std::sync::Mutex<(&mut RegionTable, &mut FxHashMap<u32, StateInfo>, usize)>> = self
+            .info
+            .iter_mut()
+            .filter_map(|(r, m)| want.get(r).map(|&i| std::sync::Mutex::new((tables.remove(r).expect("a table made above"), m, i))))
+            .collect();
+        let held = super::wave::par_map(&work, threads, |w| -> Result<u64> {
+            let mut g = w.lock().expect("a region");
+            let (t, m, i) = &mut *g;
+            let (region, new, hulls, grown) = parts[*i];
+            let before = t.states();
+            t.merge(new);
+            let held = before + new.states() - t.states();
+            let mut h = hulls.iter();
+            for (key, mask) in new.iter() {
+                let e = t.find(key).expect("merged");
+                let mut c = mask;
+                while c != 0 {
+                    let local = c.trailing_zeros();
+                    c &= c - 1;
+                    m.insert(e << 6 | local, StateInfo { hull: *h.next().ok_or_else(|| anyhow::anyhow!("region {region}: fewer hulls than new states"))?, layer });
+                }
+            }
+            anyhow::ensure!(h.next().is_none(), "region {region}: more hulls than new states");
+            for o in grown {
+                Self::put(t, m, region, o.sk.key, o.sk.local as u32, StateInfo { hull: o.hull, layer: o.layer })?;
+            }
+            Ok(held)
+        });
+        held.into_iter().sum()
     }
 
     /// States held.

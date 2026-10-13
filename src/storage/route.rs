@@ -27,7 +27,6 @@ use std::sync::RwLock;
 
 use super::bundle::{self, Bundle};
 use super::edges::Segment;
-use super::hulls::Grown;
 use super::set::RegionTable;
 use super::visited::{Key, StateInfo, VisitedSet};
 use super::Sk;
@@ -40,26 +39,32 @@ pub const NO_XFER: u32 = u32::MAX;
 /// `Scratch::e_of`'s mark of a provisional target.
 const PROV: u32 = u32::MAX;
 
-/// A route's TOUCHED states this frame: the keys pushed into (an indexed
-/// table, the cells pushed) and per `(entry << 6 | cell)` the hull pushed
-/// so far (entries keep their places, through a rekey too).
+/// A route's TOUCHED states this frame: per state `(key, cell)` pushed
+/// into, the hull pushed so far.
 #[derive(Default)]
 pub struct Touched {
-    pub keys: RegionTable,
-    pub accs: FxHashMap<u32, HullAcc>,
+    pub accs: FxHashMap<(Key, u8), HullAcc>,
 }
 
 impl Touched {
     /// Merge `acc` into state `(key, cell)`.
     #[inline]
     pub fn push(&mut self, key: Key, cell: u32, acc: &HullAcc) {
-        let (e, _) = self.keys.insert_or(key, 1u64 << cell);
-        self.accs.entry(e << 6 | cell).or_default().merge(acc);
+        self.accs.entry((key, cell as u8)).or_insert(HullAcc::EMPTY).merge(acc);
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.accs.is_empty()
+    }
+
+    /// States pushed into.
+    pub fn len(&self) -> usize {
+        self.accs.len()
     }
 
     /// Bytes held.
     pub fn alloc_bytes(&self) -> usize {
-        self.keys.alloc_bytes() + self.accs.capacity() * (std::mem::size_of::<(u32, HullAcc)>() + 1)
+        self.accs.capacity() * (std::mem::size_of::<((Key, u8), HullAcc)>() + 1)
     }
 }
 
@@ -132,8 +137,9 @@ pub struct RouteState {
     /// with the visited set at the frame's end, `seal`; the visited set is
     /// read only).
     pub touched: Touched,
-    /// The provisional keys its bundles name (keys made final at the
-    /// frame's end: a target pushed nothing still has its edges).
+    /// The provisional keys it was pushed into or its bundles name (keys
+    /// made final at the frame's end: a target pushed nothing still has
+    /// its edges).
     pub prov_keys: FxHashSet<Key>,
     /// The bundles that WAIT for the frame's end: into a provisional
     /// target (a code new this frame: no final key yet) or with a transfer
@@ -161,7 +167,7 @@ impl RouteState {
 
     /// Does the frame's end owe it anything: states pushed into, or edges?
     pub fn is_used(&self) -> bool {
-        !self.touched.keys.is_empty() || !self.segs.is_empty() || !self.prov.is_empty()
+        !self.touched.is_empty() || !self.segs.is_empty() || !self.prov.is_empty()
     }
 }
 
@@ -457,6 +463,7 @@ impl Default for Scratch {
 /// then the slice's segment encoded - its bundles as the units made them (a
 /// key's bundles of two units hold other cells; they stay two). Edges are
 /// recorded only with `cx.record`.
+#[inline(never)]
 pub fn run_route(st: &mut RouteState, slice: u32, chunks: &[&Chunk], cx: &RegionCtx, sc: &mut Scratch) -> Result<()> {
     let n: usize = chunks.iter().map(|c| c.bundles.len()).sum();
     st.recs += n as u64;
@@ -469,7 +476,11 @@ pub fn run_route(st: &mut RouteState, slice: u32, chunks: &[&Chunk], cx: &Region
     for c in chunks {
         // THE PUSHES.
         for &(t, cell, ref acc) in &c.pushes {
-            st.touched.push(c.targets[t as usize].0, cell as u32, acc);
+            let key = c.targets[t as usize].0;
+            if is_provisional(key) {
+                st.prov_keys.insert(key);
+            }
+            st.touched.push(key, cell as u32, acc);
         }
         st.pushes += c.pushes.len() as u64;
         if !record {
@@ -545,7 +556,7 @@ pub struct Sealed {
     pub region: u32,
     pub table: RegionTable,
     pub hulls: Vec<Hull>,
-    pub grown: Vec<Grown>,
+    pub grown: Vec<super::wave::Old>,
 }
 
 /// The frame's new transfers' canonical ids (`edges::XferTable::
@@ -578,46 +589,42 @@ pub fn seal(st: &mut RouteState, region: u32, finals: &FxHashMap<Key, Key>, renu
     for seg in &mut st.segs {
         seg.1.region = region;
     }
-    let touched = std::mem::take(&mut st.touched);
-    let mut keys = touched.keys;
-    keys.rekey(|k| if is_provisional(k) { finals.get(&k).copied().ok_or_else(|| anyhow::anyhow!("a provisional key without its final key")) } else { Ok(k) })?;
-    // THE STATES: new, grown, or nothing.
+    // THE STATES (final keys, sorted): new, grown, or nothing.
+    let mut states: Vec<(Key, u8, HullAcc)> = Vec::with_capacity(st.touched.len());
+    for ((k, c), acc) in std::mem::take(&mut st.touched).accs {
+        let k = if is_provisional(k) { finals.get(&k).copied().ok_or_else(|| anyhow::anyhow!("a provisional key without its final key"))? } else { k };
+        states.push((k, c, acc));
+    }
+    states.sort_unstable_by_key(|x| (x.0, x.1));
     let vt = visited.table(region);
-    let mut new: Vec<(Key, u64, Vec<Hull>)> = Vec::new();
-    let mut grown: Vec<Grown> = Vec::new();
-    for e in 0..keys.len() as u32 {
-        let (key, mask) = (keys.key(e), keys.mask(e));
-        let held = vt.and_then(|t| t.find(key).map(|ve| (ve, t.mask(ve))));
-        let mut fresh: (u64, Vec<Hull>) = (0, Vec::new());
-        let mut m = mask;
-        while m != 0 {
-            let c = m.trailing_zeros();
-            m &= m - 1;
-            let acc = touched.accs.get(&(e << 6 | c)).ok_or_else(|| anyhow::anyhow!("r{region}: a touched state without its pushes"))?;
-            match held.filter(|h| h.1 >> c & 1 == 1) {
-                Some((ve, _)) => {
-                    let StateInfo { hull, layer } = visited.info(region, ve, c).ok_or_else(|| anyhow::anyhow!("r{region}: a visited state without its hull"))?;
-                    let mut a = *acc;
-                    a.add_hull(&hull);
-                    let h = a.hull().expect("a hull holds points");
-                    if h != hull {
-                        grown.push((Sk { region, key, local: c as u8 }, layer, h));
-                    }
-                }
-                None => {
-                    fresh.0 |= 1u64 << c;
-                    fresh.1.push(acc.hull().ok_or_else(|| anyhow::anyhow!("r{region}: a touched state pushed nothing"))?);
+    let (mut keys, mut masks, mut hulls): (Vec<Key>, Vec<u64>, Vec<Hull>) = (Vec::new(), Vec::new(), Vec::new());
+    let mut grown: Vec<super::wave::Old> = Vec::new();
+    let mut held: Option<(Key, Option<(u32, u64)>)> = None;
+    for (key, c, acc) in states {
+        if held.is_none_or(|h| h.0 != key) {
+            held = Some((key, vt.and_then(|t| t.find(key).map(|ve| (ve, t.mask(ve))))));
+        }
+        match held.and_then(|h| h.1).filter(|h| h.1 >> c & 1 == 1) {
+            Some((ve, _)) => {
+                let StateInfo { hull, layer } = visited.info(region, ve, c as u32).ok_or_else(|| anyhow::anyhow!("r{region}: a visited state without its hull"))?;
+                let mut a = acc;
+                a.add_hull(&hull);
+                let h = a.hull().expect("a hull holds points");
+                if h != hull {
+                    grown.push(super::wave::Old { sk: Sk { region, key, local: c }, layer, hull: h, was: hull });
                 }
             }
-        }
-        if fresh.0 != 0 {
-            new.push((key, fresh.0, fresh.1));
+            None => {
+                if keys.last() != Some(&key) {
+                    keys.push(key);
+                    masks.push(0);
+                }
+                *masks.last_mut().expect("pushed") |= 1u64 << c;
+                hulls.push(acc.hull().ok_or_else(|| anyhow::anyhow!("r{region}: a touched state pushed nothing"))?);
+            }
         }
     }
-    new.sort_unstable_by_key(|x| x.0);
-    grown.sort_unstable_by_key(|x| x.0);
-    let table = RegionTable::from_sorted(&new.iter().map(|x| x.0).collect::<Vec<_>>(), &new.iter().map(|x| x.1).collect::<Vec<_>>())?;
-    let hulls: Vec<Hull> = new.into_iter().flat_map(|x| x.2).collect();
+    let table = RegionTable::from_sorted(&keys, &masks)?;
     // Each job's bundles that waited, decoded and encoded again with the
     // final keys and ids (a segment a job, as it was made).
     let mut dz = zstd::bulk::Decompressor::new()?;

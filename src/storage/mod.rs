@@ -13,6 +13,7 @@
 //!   * `bundle`  - the edges' format: bundles in zstd blocks
 //!   * `edges`   - the edge files (per target region and frame), the global
 //!                 transfer table, the reader (`EdgeStore`)
+//!   * `out`     - the out-edge files (per source, the re-push's read)
 //!   * `set`     - THE ONE STATE SET: per region (key -> cell mask), indexed
 //!                 (the visited set, the next layer while a wave builds it)
 //!                 or frozen (the frontier, a frame read back)
@@ -33,6 +34,7 @@ pub mod decode;
 pub mod edges;
 pub mod hulls;
 pub mod layer;
+pub mod out;
 pub mod route;
 pub mod set;
 pub mod unit;

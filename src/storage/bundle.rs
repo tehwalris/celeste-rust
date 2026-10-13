@@ -92,7 +92,7 @@ pub(crate) fn put_off(out: &mut Vec<u8>, o: u32) {
 }
 
 #[inline]
-fn get_off(b: &[u8], pos: &mut usize) -> u32 {
+pub(crate) fn get_off(b: &[u8], pos: &mut usize) -> u32 {
     let x = b[*pos];
     *pos += 1;
     if x != 0 {

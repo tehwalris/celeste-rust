@@ -29,16 +29,26 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use rustc_hash::FxHashMap;
 
 use super::decode::Skeletons;
-use super::edges::{EdgeStore, XferTable};
+use super::edges::XferTable;
 use super::hulls::Grown;
 use super::layer::{bits, Layer};
-use super::route::{Chunk, RegionCtx, RouteState, Routes, Touched};
+use super::route::{Chunk, RegionCtx, RouteState, Routes};
 use super::unit::UnitSink;
-use super::visited::{Key, StateInfo, VisitedSet};
+use super::visited::{Key, VisitedSet};
 use super::{Sk, GEOMETRY};
 use crate::frame::{phases, Block, Filters, FrameStats, FrameStep};
 use crate::search::hull::{Hull, HullAcc};
-use celeste_engine::exact::{is_provisional, Code, KeyAdditions, MissKey, Provisional};
+use celeste_engine::exact::{Code, KeyAdditions, MissKey, Provisional};
+
+/// An OLD frontier state: expanded at its layer, its hull grown since its
+/// last push (`was`: the hull it last pushed).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Old {
+    pub sk: Sk,
+    pub layer: u16,
+    pub hull: Hull,
+    pub was: Hull,
+}
 
 /// A FRONTIER (module doc): the states whose hull grew at a frame - the
 /// NEW ones (first reached there: a layer, its skeletons, their hulls in
@@ -48,8 +58,8 @@ use celeste_engine::exact::{is_provisional, Code, KeyAdditions, MissKey, Provisi
 pub struct Frontier {
     pub new: Layer,
     pub hulls: Vec<Hull>,
-    /// Sorted by state.
-    pub old: Vec<Grown>,
+    /// Sorted by (layer, state).
+    pub old: Vec<Old>,
 }
 
 impl Frontier {
@@ -70,9 +80,9 @@ pub struct Wave {
     /// hulls in its state order.
     pub next: Layer,
     pub hulls: Vec<Hull>,
-    /// The states expanded before whose hull GREW, with their layers and
-    /// new hulls (sorted by state).
-    pub grown: Vec<Grown>,
+    /// The states expanded before whose hull GREW (sorted by (layer,
+    /// state)).
+    pub grown: Vec<Old>,
     /// The win states among the new ones: per entry of `next` (ascending)
     /// its win cells.
     pub wins: Vec<(u32, u64)>,
@@ -93,7 +103,7 @@ impl Wave {
     pub fn frontier_states(&self, frame: u32) -> Vec<Grown> {
         let layer = u16::try_from(frame).expect("a frame past u16");
         let mut v: Vec<Grown> = self.next.states_iter().zip(&self.hulls).map(|(s, &h)| (s, layer, h)).collect();
-        v.extend(self.grown.iter().copied());
+        v.extend(self.grown.iter().map(|o| (o.sk, o.layer, o.hull)));
         v.sort_unstable_by_key(|x| x.0);
         v
     }
@@ -113,11 +123,22 @@ fn unit_lanes(lanes: u64) -> usize {
 
 /// A unit: a run of whole entries of one shape of the frontier's new
 /// layer (at most `unit_lanes` + 63 states), and its first state's place
-/// in the layer's state order (its hulls').
-struct UnitSpec {
-    entries: std::ops::Range<usize>,
-    state: usize,
-    lanes: u32,
+/// in the layer's state order (its hulls'); or a RE-PUSH unit, a run of
+/// whole entries of the old states of one layer (`old` the run's place in
+/// the frontier's old states).
+enum UnitSpec {
+    Kernel { entries: std::ops::Range<usize>, state: usize, lanes: u32 },
+    Repush { old: std::ops::Range<usize> },
+}
+
+impl UnitSpec {
+    /// The states it runs (its weight in a slice).
+    fn lanes(&self) -> usize {
+        match self {
+            UnitSpec::Kernel { lanes, .. } => *lanes as usize,
+            UnitSpec::Repush { old } => old.len(),
+        }
+    }
 }
 
 /// Cut the layer's entries into units of about `unit` lanes, never across a
@@ -134,7 +155,7 @@ fn units_of(layer: &Layer, unit: usize) -> Vec<UnitSpec> {
             cur = match cur {
                 Some((sh, a, s0, l)) if sh == shape && (l as usize) < unit => Some((sh, a, s0, l + n)),
                 Some((_, a, s0, l)) => {
-                    out.push(UnitSpec { entries: a..e, state: s0, lanes: l });
+                    out.push(UnitSpec::Kernel { entries: a..e, state: s0, lanes: l });
                     Some((shape, e, st, n))
                 }
                 None => Some((shape, e, st, n)),
@@ -144,7 +165,32 @@ fn units_of(layer: &Layer, unit: usize) -> Vec<UnitSpec> {
         }
     }
     if let Some((_, a, s0, l)) = cur {
-        out.push(UnitSpec { entries: a..e, state: s0, lanes: l });
+        out.push(UnitSpec::Kernel { entries: a..e, state: s0, lanes: l });
+    }
+    out
+}
+
+/// States per RE-PUSH unit (whole entries: at most 63 more): a re-push runs
+/// no kernel, so a unit takes more states than a kernel unit.
+const REPUSH_UNIT: usize = 1 << 14;
+
+/// Cut the old states (sorted by (layer, state)) into re-push units of one
+/// layer each, never cutting an entry.
+fn repush_units_of(old: &[Old]) -> Vec<UnitSpec> {
+    let mut out = Vec::new();
+    let mut a = 0usize;
+    while a < old.len() {
+        let layer = old[a].layer;
+        let mut b = a;
+        while b < old.len() && old[b].layer == layer && b - a < REPUSH_UNIT {
+            b += 1;
+        }
+        // Whole entries: the run's last entry's cells all in.
+        while b < old.len() && old[b].layer == layer && (old[b].sk.region, old[b].sk.key) == (old[b - 1].sk.region, old[b - 1].sk.key) {
+            b += 1;
+        }
+        out.push(UnitSpec::Repush { old: a..b });
+        a = b;
     }
     out
 }
@@ -165,7 +211,7 @@ fn slices_of(units: &[UnitSpec]) -> Vec<std::ops::Range<usize>> {
     let mut out = Vec::new();
     let (mut a, mut lanes) = (0usize, 0usize);
     for (k, u) in units.iter().enumerate() {
-        lanes += u.lanes as usize;
+        lanes += u.lanes();
         if lanes >= SLICE_LANES {
             out.push(a..k + 1);
             (a, lanes) = (k + 1, 0);
@@ -199,9 +245,9 @@ pub struct WaveCtx<'a> {
     /// The level's `edges/` dir: edges recorded (and the frame's edge file
     /// written) only with one.
     pub edges_dir: Option<&'a std::path::Path>,
-    /// The tree's recorded edges so far (the old states' re-push reads
-    /// them; `None`: a frontier without old states).
-    pub store: Option<&'a EdgeStore>,
+    /// The tree's out-edges so far (the old states' re-push reads them;
+    /// `None`: a frontier without old states).
+    pub outs: Option<&'a super::out::OutStore>,
     /// The shapes' skeletons the emissions register (the forward's, kept
     /// across frames): the next layer's.
     pub skeletons: &'a Skeletons,
@@ -225,17 +271,17 @@ struct UnitScratch {
 /// resumed), the rest through the engine into the sink, each lane with its
 /// hull (`hulls`: the layer's, in its state order).
 #[allow(clippy::too_many_arguments)]
-fn run_unit(engine: &dyn FrameStep, u: u32, spec: &UnitSpec, layer: &Layer, hulls: &[Hull], starts: &[usize], shapes: &[u64], sink: &mut UnitSink, sc: &mut UnitScratch, layer_frame: u32, ceiling: Option<u32>, s: &crate::settings::Settings) -> Result<()> {
+fn run_unit(engine: &dyn FrameStep, u: u32, entries: std::ops::Range<usize>, state: usize, layer: &Layer, hulls: &[Hull], starts: &[usize], shapes: &[u64], sink: &mut UnitSink, sc: &mut UnitScratch, layer_frame: u32, ceiling: Option<u32>, s: &crate::settings::Settings) -> Result<()> {
     let geo = GEOMETRY;
     let t_dec = phases::start(s.diag.phases);
     sink.begin(u);
     sc.rows.clear();
     sc.cells.clear();
-    let mut state = spec.state;
+    let mut state = state;
     let tables = layer.set.tables();
-    let (mut ti, mut local) = layer.set.locate(starts, spec.entries.start)?;
+    let (mut ti, mut local) = layer.set.locate(starts, entries.start)?;
     let mut region = tables[ti].0;
-    for _ in spec.entries.clone() {
+    for _ in entries {
         while local as usize >= tables[ti].1.len() {
             (ti, local) = (ti + 1, 0);
             region = tables[ti].0;
@@ -275,7 +321,7 @@ fn run_unit(engine: &dyn FrameStep, u: u32, spec: &UnitSpec, layer: &Layer, hull
 /// frontier `front` (the states whose hull grew at `cx.frame - 1`).
 pub fn run_wave(engine: &dyn FrameStep, front: &Frontier, cx: WaveCtx) -> Result<Wave> {
     use std::time::Instant;
-    let WaveCtx { visited, xfers, pos, filters, frame, edges_dir, store, skeletons, ceiling } = cx;
+    let WaveCtx { visited, xfers, pos, filters, frame, edges_dir, outs, skeletons, ceiling } = cx;
     // A platforms-unknown level knows only `PLATFORM_WORLD_FRAMES` worlds.
     let (level, s) = (engine.level(), &engine.settings());
     let game_frame = frame.div_ceil(s.steps_per_frame());
@@ -286,7 +332,7 @@ pub fn run_wave(engine: &dyn FrameStep, front: &Frontier, cx: WaveCtx) -> Result
     );
     ensure!(frame > 0, "a wave makes frame 1 on");
     ensure!(front.hulls.len() as u64 == front.new.states(), "frame {frame}: {} hulls for the frontier's {} new states", front.hulls.len(), front.new.states());
-    ensure!(store.is_some() || front.old.is_empty(), "frame {frame}: old states to re-push without the tree's edges");
+    ensure!(outs.is_some() || front.old.is_empty(), "frame {frame}: old states to re-push without the tree's out-edges");
     let t_warm = Instant::now();
     engine.warm();
     if let Some(m) = filters.minus_one {
@@ -306,7 +352,9 @@ pub fn run_wave(engine: &dyn FrameStep, front: &Frontier, cx: WaveCtx) -> Result
     st.frontier_bytes = layer.alloc_bytes() + std::mem::size_of_val(front.hulls.as_slice()) + std::mem::size_of_val(front.old.as_slice());
     st.rss_start = crate::metrics::current_rss_gb();
     let record = edges_dir.is_some();
-    let units = units_of(layer, unit_lanes(st.lanes_in as u64));
+    let mut units = units_of(layer, unit_lanes(st.lanes_in as u64));
+    let n_kernel = units.len();
+    units.extend(repush_units_of(&front.old));
     let starts: Vec<usize> = layer.set.entry_starts();
     let slices = slices_of(&units);
     let routes = Routes::default();
@@ -316,7 +364,11 @@ pub fn run_wave(engine: &dyn FrameStep, front: &Frontier, cx: WaveCtx) -> Result
     let xtabs: Vec<std::sync::RwLock<Vec<crate::search::arc_edges::Pair>>> = (0..workers).map(|_| Default::default()).collect();
     // The frame's new transfers are numbered from here (canonically at its end).
     let xfers_before = xfers.pairs.len();
-    let mut sinks: Vec<UnitSink> = (0..workers).map(|w| UnitSink::new(visited, &routes, skeletons, &prov, filters, frame, level, w as u32, &xtabs[w], pos.is_some(), s)).collect();
+    let mut sinks: Vec<UnitSink> = (0..workers).map(|w| UnitSink::new(visited, &routes, skeletons, &prov, filters, frame, level, w as u32, &xtabs[w], pos.is_some(), record, s)).collect();
+    // Per kernel unit its out-edge block (`storage::out`): compressed, or
+    // raw where a target key is provisional (encoded again at the end).
+    let out_blocks: Vec<std::sync::Mutex<Option<OutBlock>>> = (0..n_kernel).map(|_| Default::default()).collect();
+    let repushed = std::sync::atomic::AtomicU64::new(0);
     let mut scratch: Vec<super::route::Scratch> = (0..workers).map(|_| super::route::Scratch::default()).collect();
     let mut slice_of = vec![0u32; units.len()];
     for (k, r) in slices.iter().enumerate() {
@@ -353,7 +405,7 @@ pub fn run_wave(engine: &dyn FrameStep, front: &Frontier, cx: WaveCtx) -> Result
             .iter_mut()
             .zip(scratch.iter_mut())
             .map(|(sink, sc)| {
-                let (units, pipe, slice_of, slices, routes, shapes, starts, hulls) = (&units, &pipe, &slice_of, &slices, &routes, &shapes, &starts, &front.hulls);
+                let (units, pipe, slice_of, slices, routes, shapes, starts, hulls, out_blocks, repushed) = (&units, &pipe, &slice_of, &slices, &routes, &shapes, &starts, &front.hulls, &out_blocks, &repushed);
                 let visited: &VisitedSet = visited;
                 std::thread::Builder::new().stack_size(WORKER_STACK).spawn_scoped(scope, move || -> Result<(std::time::Duration, std::time::Duration)> {
                     crate::compiled::asm_kernel::set_thread_stack(WORKER_STACK);
@@ -371,6 +423,8 @@ pub fn run_wave(engine: &dyn FrameStep, front: &Frontier, cx: WaveCtx) -> Result
                     let (mut busy, mut in_regions) = (std::time::Duration::ZERO, std::time::Duration::ZERO);
                     let mut idle_spins = 0u32;
                     let mut us = UnitScratch::default();
+                    let mut rs = RepushScratch::default();
+                    let mut z: Option<zstd::bulk::Compressor<'static>> = None;
                     loop {
                         if pipe.failed.load(Ordering::Acquire) {
                             stop.1 = true;
@@ -404,8 +458,21 @@ pub fn run_wave(engine: &dyn FrameStep, front: &Frontier, cx: WaveCtx) -> Result
                                 continue;
                             }
                             let t = Instant::now();
-                            let spec = &units[u];
-                            run_unit(engine, u as u32, spec, layer, hulls, starts, shapes, sink, &mut us, frame - 1, ceiling, s)?;
+                            match &units[u] {
+                                UnitSpec::Kernel { entries, state, .. } => {
+                                    run_unit(engine, u as u32, entries.clone(), *state, layer, hulls, starts, shapes, sink, &mut us, frame - 1, ceiling, s)?;
+                                    if let Some((raw, prov)) = sink.out_block.take() {
+                                        let b = if prov { OutBlock::Raw(raw) } else { OutBlock::Sealed(super::out::Sealed::of(&raw, z.get_or_insert_with(|| zstd::bulk::Compressor::new(1).expect("a zstd compressor")))?) };
+                                        *out_blocks[u].lock().expect("an out block") = Some(b);
+                                    }
+                                }
+                                UnitSpec::Repush { old } => {
+                                    let tr = phases::start(s.diag.phases);
+                                    let n = run_repush(u as u32, &front.old[old.clone()], outs.expect("checked above"), sink, &mut rs)?;
+                                    repushed.fetch_add(n, Ordering::Relaxed);
+                                    phases::add(phases::REPUSH, tr);
+                                }
+                            }
                             let k = slice_of[u] as usize;
                             pipe.upto[k][sink.worker as usize].fetch_max(sink.xfers_met(), Ordering::AcqRel);
                             if s.diag.phases {
@@ -456,6 +523,7 @@ pub fn run_wave(engine: &dyn FrameStep, front: &Frontier, cx: WaveCtx) -> Result
         // The wave's anonymous peak (sampled) apart from the frame end's.
         crate::metrics::mem_phase(&format!("f{frame} units and region jobs"));
     }
+    st.repush_edges = repushed.into_inner();
     let busy: std::time::Duration = spent.iter().map(|w| w.0).sum();
     st.t_regions = spent.iter().map(|w| w.1).sum();
     st.t_wave = t_units;
@@ -469,15 +537,6 @@ pub fn run_wave(engine: &dyn FrameStep, front: &Frontier, cx: WaveCtx) -> Result
         .into_iter()
         .map(|a| std::sync::Arc::try_unwrap(a).map_err(|_| anyhow::anyhow!("a route still shared")).and_then(|m| m.into_inner().map_err(|_| anyhow::anyhow!("a route lock poisoned"))))
         .collect::<Result<_>>()?;
-    // THE RE-PUSH of the old states (no kernel): into the same routes.
-    let t = Instant::now();
-    if !front.old.is_empty() {
-        let store = store.expect("checked above");
-        let (n, pushes) = repush(&front.old, store, &xfers.pairs, &mut states, visited, filters, frame, s)?;
-        st.repush_edges = n;
-        st.repush_pushes = pushes;
-    }
-    st.t_repush = t.elapsed();
     st.rss_wave = crate::metrics::current_rss_gb();
     if s.diag.phases {
         let gb = |b: usize| b as f64 / 1e9;
@@ -540,7 +599,14 @@ pub fn run_wave(engine: &dyn FrameStep, front: &Frontier, cx: WaveCtx) -> Result
     let t = Instant::now();
     let tl = phases::start(s.diag.phases);
     let mut adds = KeyAdditions::default();
+    let mut ends: Vec<(&str, std::time::Duration)> = Vec::new();
+    let mut lap = Instant::now();
+    let mut mark = |what: &'static str, ends: &mut Vec<(&str, std::time::Duration)>| {
+        ends.push((what, lap.elapsed()));
+        lap = Instant::now();
+    };
     let finals = finalize_keys(visited, &states, &prov, &mut adds);
+    mark("keys", &mut ends);
     drop(prov);
     (st.key_bits, st.key_codes, st.new_codes) = (visited.keys.max_bits(), visited.keys.codes(), adds.codes.len());
     // New shapes numbered (in hash order): a route's with touched states or
@@ -555,7 +621,7 @@ pub fn run_wave(engine: &dyn FrameStep, front: &Frontier, cx: WaveCtx) -> Result
     }
     let regions: Vec<Option<u32>> = states.iter().map(|r| visited.region(r.shape, r.slot)).collect();
     st.pushes = states.iter().map(|r| r.pushes).sum();
-    st.touched = states.iter().map(|r| r.touched.accs.len() as u64).sum();
+    st.touched = states.iter().map(|r| r.touched.len() as u64).sum();
     // The frame's new transfers in canonical order (by their edges, then
     // content), whatever the slices that met them first (their bundles
     // waited for their ids).
@@ -607,20 +673,43 @@ pub fn run_wave(engine: &dyn FrameStep, front: &Frontier, cx: WaveCtx) -> Result
         }
     }
     new.sort_unstable_by_key(|x| x.region);
+    mark("seal", &mut ends);
     if let Some(f) = filters.marks {
         mark_filter(&mut new, f, visited, skeletons, frame, s)?;
     }
+    // Into the visited set: the new states (new: none held) with their
+    // layer and hull, the grown states' hulls.
+    let layer16 = u16::try_from(frame).map_err(|_| anyhow!("frame {frame}: past a u16 layer"))?;
+    let parts: Vec<(u32, &super::set::RegionTable, &[Hull], &[Old])> = new.iter().map(|sl| (sl.region, &sl.table, sl.hulls.as_slice(), sl.grown.as_slice())).collect();
+    let held = visited.absorb(&parts, layer16, s.threads())?;
+    drop(parts);
+    ensure!(held == 0, "frame {frame}: {held} of the next layer's states the visited set held already");
+    mark("absorb", &mut ends);
     let mut next = Layer::default();
     let mut hulls: Vec<Hull> = Vec::new();
-    let mut grown: Vec<Grown> = Vec::new();
+    // The grown states by (layer, state): the routes' in region order, each
+    // sorted, put in layer order (stable).
+    let mut by_state: Vec<Old> = Vec::new();
     for sl in new {
-        grown.extend(sl.grown);
+        by_state.extend(sl.grown);
         if !sl.table.is_empty() {
             next.set.push(sl.region, sl.table)?;
             hulls.extend(sl.hulls);
         }
     }
-    grown.sort_unstable_by_key(|x| x.0);
+    let mut at = vec![0usize; frame as usize + 1];
+    for o in &by_state {
+        at[o.layer as usize] += 1;
+    }
+    let mut sum = 0;
+    for a in at.iter_mut() {
+        (*a, sum) = (sum, sum + *a);
+    }
+    let mut grown: Vec<Old> = vec![Old { sk: Sk::default(), layer: 0, hull: Hull::default(), was: Hull::default() }; by_state.len()];
+    for o in by_state {
+        grown[at[o.layer as usize]] = o;
+        at[o.layer as usize] += 1;
+    }
     let mut shapes_in: Vec<u32> = next.set.tables().iter().map(|(r, _)| r / GEOMETRY.slots).collect();
     shapes_in.dedup();
     for si in shapes_in {
@@ -628,15 +717,13 @@ pub fn run_wave(engine: &dyn FrameStep, front: &Frontier, cx: WaveCtx) -> Result
         next.skeletons.insert(h, skeletons.get(h)?);
     }
     ensure!(next.states() == hulls.len() as u64, "frame {frame}: the next layer holds {} states, {} hulls", next.states(), hulls.len());
+    mark("layer", &mut ends);
     let wins = layer_wins(visited, &next, frame, s)?;
+    mark("wins", &mut ends);
     if s.diag.phases {
         crate::metrics::mem_phase(&format!("f{frame} the next layer's wins decoded"));
     }
-    // The new states into the visited set (they are new: none held), with
-    // their layer and hull; the grown states' hulls.
-    let held = visited.merge(&next.set, s.threads())?;
-    ensure!(held == 0, "frame {frame}: {held} of the next layer's states the visited set held already");
-    set_infos(visited, &next, &hulls, &grown, frame)?;
+
     if s.diag.phases {
         crate::metrics::mem_phase(&format!("f{frame} the next layer merged into the visited set"));
     }
@@ -659,6 +746,25 @@ pub fn run_wave(engine: &dyn FrameStep, front: &Frontier, cx: WaveCtx) -> Result
         xfers.flush(dir)?;
         let path = super::edges::file_path(dir, frame, None);
         st.edge_bytes = super::edges::write_file(&path, frame, segs, src_index)?;
+        // The out-edges, the kernel units' blocks in unit order (the
+        // provisional ones encoded with their final keys).
+        let blocks = par_map(&out_blocks, s.threads(), |b| -> Result<Option<super::out::Sealed>> {
+            match b.lock().expect("an out block").take() {
+                None => Ok(None),
+                Some(OutBlock::Sealed(x)) => Ok(x),
+                Some(OutBlock::Raw(raw)) => {
+                    let mut fixed = Vec::new();
+                    super::out::fixup(&raw, &finals, &mut fixed)?;
+                    super::out::Sealed::of(&fixed, &mut zstd::bulk::Compressor::new(1)?)
+                }
+            }
+        });
+        let blocks: Vec<super::out::Sealed> = blocks.into_iter().filter_map(|b| b.transpose()).collect::<Result<_>>()?;
+        st.out_bytes = super::out::write(&super::out::path(dir, frame), frame, &blocks)?;
+    }
+    mark("files", &mut ends);
+    if s.diag.phases {
+        eprintln!("[end] f{frame}: {}", ends.iter().map(|(w, d)| format!("{w} {:.0} ms", d.as_secs_f64() * 1e3)).collect::<Vec<_>>().join(", "));
     }
     phases::add(phases::LAYER, tl);
     collect_freed();
@@ -673,23 +779,6 @@ pub fn run_wave(engine: &dyn FrameStep, front: &Frontier, cx: WaveCtx) -> Result
     st.lanes_out = next.states() as usize;
     phases::print_phases(s.diag.phases, t_frame.elapsed(), workers);
     Ok(Wave { next, hulls, grown, wins, stats: st, shapes: shapes_numbered, keys: adds })
-}
-
-/// The new states' layer (`frame`) and hulls, and the grown states' new
-/// hulls, into the visited set (which holds them all), region by region.
-fn set_infos(visited: &mut VisitedSet, next: &Layer, hulls: &[Hull], grown: &[Grown], frame: u32) -> Result<()> {
-    let layer = u16::try_from(frame).map_err(|_| anyhow!("frame {frame}: past a u16 layer"))?;
-    let mut items: Vec<(u32, Key, u32, StateInfo)> = next.states_iter().zip(hulls).map(|(s, &hull)| (s.region, s.key, s.local as u32, StateInfo { hull, layer })).collect();
-    items.extend(grown.iter().map(|&(s, layer, hull)| (s.region, s.key, s.local as u32, StateInfo { hull, layer })));
-    items.sort_unstable_by_key(|x| x.0);
-    let mut a = 0;
-    while a < items.len() {
-        let region = items[a].0;
-        let b = a + items[a..].partition_point(|x| x.0 == region);
-        visited.set_info(region, items[a..b].iter().map(|x| (x.1, x.2, x.3)))?;
-        a = b;
-    }
-    Ok(())
 }
 
 /// THE OBJECTS LADDER's filter (`frame::MarkFilter`) on the frame's new and
@@ -709,7 +798,7 @@ fn mark_filter(sealed: &mut [super::route::Sealed], f: &crate::frame::MarkFilter
         for (key, mask) in sl.table.iter() {
             rows.extend(bits(mask).map(|c| (key, geo.cell(slot, c))));
         }
-        rows.extend(sl.grown.iter().map(|g| (g.0.key, geo.cell(slot, g.0.local as u32))));
+        rows.extend(sl.grown.iter().map(|g| (g.sk.key, geo.cell(slot, g.sk.local as u32))));
         if rows.is_empty() {
             continue;
         }
@@ -746,138 +835,126 @@ fn mark_filter(sealed: &mut [super::route::Sealed], f: &crate::frame::MarkFilter
     Ok(())
 }
 
-/// Old-state sources per job of the re-push: states of one layer, by
-/// (shape, key, cell), with their hulls.
-type Sources = Vec<((u32, Key), u32, Hull)>;
+/// A worker's buffers for its re-push units: the out file's block, the
+/// pushes' targets (by (route, key): their index, cells) and the pushes.
+#[derive(Default)]
+struct RepushScratch {
+    dec: Option<zstd::bulk::Decompressor<'static>>,
+    raw: Vec<u8>,
+    t_idx: FxHashMap<(u32, Key), u32>,
+    targets: Vec<(u32, Key, u64)>,
+    acc: FxHashMap<u32, HullAcc>,
+    pushes: Vec<(u32, HullAcc)>,
+    /// Per block target its unit target (`u32::MAX`: none yet), per block
+    /// route its cells level -1 drops at the frame (`None`: not yet asked).
+    t_of: Vec<u32>,
+    late: Vec<Option<u64>>,
+    /// Pushes by (hull, last pushed hull, the block's transfer index).
+    cache: crate::search::hull::PushCache,
+}
 
-/// THE RE-PUSH (module doc): the frontier's OLD states - expanded at their
-/// layer, their hull grown since - pushed again along their edges, which
-/// were recorded at their layer + 1 in their TARGETS' regions (`store`). A
-/// job a target region (its route's touched table its own): per frame its
-/// segments decoded, each block's sources met against the layer's old
-/// states (both sorted), and every record of one pushed - level -1 dropping
-/// a target cell too late at `frame` as at an emission. Into `states` (a
-/// route made for a region none had). Returns the edges read for a source
-/// and the pushes merged.
-#[allow(clippy::too_many_arguments)]
-fn repush(old: &[Grown], store: &EdgeStore, pairs: &[crate::search::arc_edges::Pair], states: &mut Vec<RouteState>, visited: &VisitedSet, filters: Filters, frame: u32, s: &crate::settings::Settings) -> Result<(u64, u64)> {
-    use rustc_hash::FxHashMap;
+/// ONE RE-PUSH UNIT (module doc): old states `old` of one layer (whole
+/// entries, sorted by state), each pushing its grown hull along its
+/// OUT-EDGES (`storage::out`: its layer + 1's file) where an edge's image
+/// grows (`Hull::push_grown`); level -1 drops a target too late at this
+/// frame, as at an emission; the pushes into the sink's chunks by route.
+/// Returns the edges looked at.
+#[inline(never)]
+fn run_repush(u: u32, old: &[Old], outs: &super::out::OutStore, sink: &mut UnitSink, sc: &mut RepushScratch) -> Result<u64> {
+    use std::cell::Cell;
     let geo = GEOMETRY;
-    // Per layer its sources, sorted by (shape, key, cell); and per
-    // (target region) the (frame, layer) items reading it.
-    let mut by_layer: std::collections::BTreeMap<u16, Sources> = Default::default();
-    for &(sk, layer, h) in old {
-        ensure!((layer as u32) < frame, "frame {frame}: an old state of layer {layer}");
-        by_layer.entry(layer).or_default().push(((sk.shape(&geo), sk.key), sk.cell(&geo), h));
-    }
-    let layers: Vec<(u16, Sources)> = by_layer
-        .into_iter()
-        .map(|(l, mut v)| {
-            v.sort_unstable_by_key(|x| (x.0, x.1));
-            (l, v)
-        })
-        .collect();
-    let mut jobs: FxHashMap<u32, Vec<(u32, usize)>> = FxHashMap::default();
-    for (li, (layer, srcs)) in layers.iter().enumerate() {
-        let f = *layer as u32 + 1;
-        let mut regions: Vec<u32> = srcs.iter().map(|x| super::region_of(&geo, x.0 .0, geo.slot_local(x.1).0)).collect();
-        regions.sort_unstable();
-        regions.dedup();
-        for r in regions {
-            for t in store.targets_of(f, r) {
-                jobs.entry(t).or_default().push((f, li));
-            }
-        }
-    }
-    // The jobs' routes: the wave's, or made here.
-    let mut route_of: FxHashMap<(u64, u32), usize> = states.iter().enumerate().map(|(i, r)| ((r.shape, r.slot), i)).collect();
-    let mut work: Vec<(u32, Vec<(u32, usize)>, usize)> = Vec::new();
-    for (region, mut items) in jobs {
-        items.sort_unstable();
-        items.dedup();
-        let shape = visited.shape_hash(region / geo.slots);
-        let k = (shape, region % geo.slots);
-        let i = *route_of.entry(k).or_insert_with(|| {
-            states.push(RouteState::new(k.0, k.1, Some(region)));
-            states.len() - 1
-        });
-        work.push((region, items, i));
-    }
-    work.sort_unstable_by_key(|w| w.0);
-    let l1 = filters.minus_one.map(|m| (m, m.table(s)));
-    let counts: Vec<std::sync::Mutex<(u64, u64)>> = work.iter().map(|_| std::sync::Mutex::new((0, 0))).collect();
-    let tables: Vec<std::sync::Mutex<Touched>> = work.iter().map(|w| std::sync::Mutex::new(std::mem::take(&mut states[w.2].touched))).collect();
-    let results = par_map(&(0..work.len()).collect::<Vec<_>>(), s.threads(), |&j| -> Result<()> {
-        let (region, items, _) = &work[j];
-        let (region, slot) = (*region, *region % geo.slots);
-        let shape = visited.shape_hash(region / geo.slots);
-        let mut touched = tables[j].lock().expect("a re-push table");
-        let (mut edges, mut pushes) = (0u64, 0u64);
-        let mut dec = super::edges::Decoder::default();
-        // Level -1 at this frame, per target cell (64 a region).
-        let late: u64 = match l1 {
-            None => 0,
-            Some((m, t)) => (0..geo.side * geo.side).filter(|&c| t.admitted_from(shape, geo.cell(slot, c), frame) > m.h).fold(0u64, |a, c| a | 1u64 << c),
-        };
-        let mut ranks: Vec<(usize, usize)> = Vec::new();
-        for &(f, li) in items {
-            let srcs = &layers[li].1;
-            for seg in store.segments(f, region) {
-                let blk = dec.open(&seg)?;
-                // Each block source's run in the layer's old states.
-                ranks.clear();
-                let mut j0 = 0usize;
-                for &src in &blk.sources {
-                    j0 += srcs[j0..].partition_point(|x| x.0 < src);
-                    let n = srcs[j0..].partition_point(|x| x.0 == src);
-                    ranks.push((j0, j0 + n));
+    sink.begin(u);
+    sc.t_idx.clear();
+    sc.targets.clear();
+    sc.acc.clear();
+    sc.pushes.clear();
+    let Some(first) = old.first() else { return Ok(0) };
+    let f = first.layer as u32 + 1;
+    let file = outs.file(f).ok_or_else(|| anyhow!("re-push unit {u}: no out-edges of frame {f}"))?;
+    let last = old.last().expect("a unit's states");
+    let (lo, hi) = ((first.sk.region, first.sk.key), (last.sk.region, last.sk.key));
+    let dec = sc.dec.get_or_insert_with(|| zstd::bulk::Decompressor::new().expect("a zstd decompressor"));
+    let mut edges = 0u64;
+    let cursor = Cell::new(0usize);
+    // The entry being read: its first old state, and its old cells.
+    let entry = Cell::new((0usize, 0u64));
+    for bi in file.blocks(lo, hi) {
+        file.block(bi, dec, &mut sc.raw)?;
+        let blk = super::out::Block::open(&sc.raw)?;
+        let routes: Vec<u32> = blk.routes.iter().map(|&(shape, slot)| sink.route(shape, slot)).collect();
+        let pairs: Vec<(crate::search::arcs::Transfer, crate::search::arcs::Transfer)> = blk.pairs.iter().map(|p| (p.0.transfer(), p.1.transfer())).collect();
+        let (t_idx, targets, acc_of) = (&mut sc.t_idx, &mut sc.targets, &mut sc.acc);
+        sc.t_of.clear();
+        sc.t_of.resize(blk.targets.len(), u32::MAX);
+        sc.late.clear();
+        sc.late.resize(blk.routes.len(), None);
+        let (t_of, late, cache) = (&mut sc.t_of, &mut sc.late, &mut sc.cache);
+        cache.clear();
+        let mut bad = false;
+        blk.entries(
+            |region, key| {
+                let mut c = cursor.get();
+                while c < old.len() && (old[c].sk.region, old[c].sk.key) < (region, key) {
+                    c += 1;
                 }
-                if ranks.iter().all(|r| r.0 == r.1) {
-                    continue;
+                cursor.set(c);
+                if c < old.len() && (old[c].sk.region, old[c].sk.key) == (region, key) {
+                    let cells = old[c..].iter().take_while(|o| (o.sk.region, o.sk.key) == (region, key)).fold(0u64, |m, o| m | 1u64 << o.sk.local);
+                    entry.set((c, cells));
+                    true
+                } else {
+                    false
                 }
-                let t_keys = &blk.t_keys;
-                let mut bad = false;
-                blk.records(|r| {
-                    let (a, b) = ranks[r.s as usize];
-                    if a == b {
+            },
+            |_, _, it| {
+                let (a, cells) = entry.get();
+                for ob in it {
+                    let (Some(&(r, t_key)), Some(&(tx, ty))) = (blk.targets.get(ob.t as usize), pairs.get(ob.x as usize)) else {
+                        bad = true;
                         return;
-                    }
-                    let mut m = r.mask & !late;
+                    };
+                    let ((shape, slot), route) = (blk.routes[r as usize], routes[r as usize]);
+                    let dropped = *late[r as usize].get_or_insert_with(|| (0..64u32).filter(|&c| (slot != geo.no_cell_slot() || c == 0) && sink.minus_one_drop(shape, geo.cell(slot, c))).fold(0u64, |a, c| a | 1u64 << c));
+                    let mut m = ob.mask & !dropped;
                     while m != 0 {
                         let c = m.trailing_zeros();
                         m &= m - 1;
-                        let s_cell = super::bundle::source_cell(geo.cell(slot, c), r.o);
-                        let Some(&(_, _, h)) = srcs[a..b].iter().find(|x| x.1 == s_cell) else { continue };
-                        edges += 1;
-                        let Some(p) = pairs.get(r.x as usize) else {
-                            bad = true;
-                            return;
-                        };
-                        let mut acc = HullAcc::EMPTY;
-                        if h.push(p.0.transfer(), p.1.transfer(), &mut acc) {
-                            touched.push(t_keys[r.t as usize], c, &acc);
-                            pushes += 1;
+                        let s_local = geo.slot_local(super::bundle::source_cell(geo.cell(slot, c), ob.o)).1;
+                        if cells >> s_local & 1 == 0 {
+                            continue;
                         }
+                        // Old states of an entry are by cell: a cell's rank among them.
+                        let o = &old[a + (cells & ((1u64 << s_local) - 1)).count_ones() as usize];
+                        edges += 1;
+                        let Some(acc) = cache.get(&o.hull, &o.was, ob.x, || {
+                            let mut a = HullAcc::EMPTY;
+                            o.hull.push_grown(&o.was, tx, ty, &mut a).then_some(a)
+                        }) else {
+                            continue;
+                        };
+                        let t = match t_of[ob.t as usize] {
+                            u32::MAX => {
+                                let n = targets.len() as u32;
+                                let t = *t_idx.entry((route, t_key)).or_insert(n);
+                                if t == n {
+                                    targets.push((route, t_key, 0));
+                                }
+                                t_of[ob.t as usize] = t;
+                                t
+                            }
+                            t => t,
+                        };
+                        targets[t as usize].2 |= 1u64 << c;
+                        acc_of.entry(t << 6 | c).or_insert(HullAcc::EMPTY).merge(&acc);
                     }
-                })?;
-                ensure!(!bad, "frame {frame}: a recorded edge of f{f} into r{region} without its transfer");
-            }
-        }
-        *counts[j].lock().expect("a re-push count") = (edges, pushes);
-        Ok(())
-    });
-    for r in results {
-        r?;
+                }
+            },
+        )?;
+        ensure!(!bad, "re-push unit {u}: an out block's bundle names a target or transfer past its tables");
     }
-    let (mut edges, mut pushes) = (0u64, 0u64);
-    for ((w, t), n) in work.iter().zip(tables).zip(counts) {
-        states[w.2].touched = t.into_inner().expect("a re-push table");
-        let (e, p) = n.into_inner().expect("a re-push count");
-        states[w.2].pushes += p;
-        edges += e;
-        pushes += p;
-    }
-    Ok((edges, pushes))
+    sc.pushes.extend(sc.acc.drain());
+    sink.repush_chunks(&sc.targets, &mut sc.pushes);
+    Ok(edges)
 }
 
 /// The freed pages of the frame's (exited) worker threads back to the OS
@@ -952,6 +1029,13 @@ fn layer_wins(visited: &VisitedSet, next: &Layer, frame: u32, s: &crate::setting
         out.extend(p?);
     }
     Ok(out)
+}
+
+/// A kernel unit's out-edge block: compressed, or raw until its
+/// provisional target keys are final.
+enum OutBlock {
+    Sealed(Option<super::out::Sealed>),
+    Raw(Vec<u8>),
 }
 
 /// A region job: one route's chunks of one slice (in unit order), and the
@@ -1084,7 +1168,7 @@ impl Pipe<'_> {
 /// packed key. The dictionaries then are a function of the frame's new
 /// states.
 fn finalize_keys(visited: &mut VisitedSet, states: &[RouteState], prov: &Provisional, adds: &mut KeyAdditions) -> FxHashMap<Key, Key> {
-    let mut keys: Vec<Key> = states.iter().flat_map(|r| r.touched.keys.iter().map(|x| x.0).filter(|&k| is_provisional(k)).chain(r.prov_keys.iter().copied())).collect();
+    let mut keys: Vec<Key> = states.iter().flat_map(|r| r.prov_keys.iter().copied()).collect();
     keys.sort_unstable();
     keys.dedup();
     if keys.is_empty() {
@@ -1209,10 +1293,17 @@ pub fn seed(visited: &mut VisitedSet, blocks: &[Block], level: crate::abstractio
         next.push_region(region, &keys, &masks)?;
         i = j;
     }
-    let held = visited.merge(&next.set, s.threads())?;
-    ensure!(held == 0, "frame 0 into a visited set that held {held} of its states");
     let hulls = vec![start; next.states() as usize];
-    set_infos(visited, &next, &hulls, &[], 0)?;
+    let mut parts: Vec<(u32, &super::set::RegionTable, &[Hull], &[Old])> = Vec::new();
+    let mut at = 0usize;
+    for (region, t) in next.set.tables() {
+        let n = t.states() as usize;
+        parts.push((*region, t, &hulls[at..at + n], &[]));
+        at += n;
+    }
+    let held = visited.absorb(&parts, 0, s.threads())?;
+    drop(parts);
+    ensure!(held == 0, "frame 0 into a visited set that held {held} of its states");
     for (h, rec) in skels {
         let (cart, cache) = (canon[0].cart.clone(), canon[0].cache.clone());
         next.skeletons.insert(h, std::sync::Arc::new(rec.rt2(cart, cache)));
@@ -1240,7 +1331,7 @@ pub fn one_frame(engine: &dyn FrameStep, rows: Vec<Block>, frame: u32) -> Result
     let skeletons = Skeletons::default();
     let s = engine.settings();
     let start = seed(&mut visited, &rows, engine.level(), Hull::full(), &s)?.frontier();
-    let cx = WaveCtx { visited: &mut visited, xfers: &mut xfers, pos: None, filters: Filters::default(), frame, edges_dir: None, store: None, skeletons: &skeletons, ceiling: None };
+    let cx = WaveCtx { visited: &mut visited, xfers: &mut xfers, pos: None, filters: Filters::default(), frame, edges_dir: None, outs: None, skeletons: &skeletons, ceiling: None };
     let wave = run_wave(engine, &start, cx)?;
     let next = super::layer::decode_states(&wave.next, &visited.keys, visited.shapes(), usize::MAX, &|_| true)?.into_iter().map(|(_, rt2)| Block::from_rt2(rt2)).collect();
     Ok(OneFrame { next, keys: visited.keys })

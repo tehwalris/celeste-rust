@@ -21,7 +21,7 @@ use crate::storage::wave::Frontier;
 /// summed over workers, printed by `print_phases`. Off, `start` is a branch.
 pub mod phases {
     use std::sync::atomic::{AtomicU64, Ordering};
-    pub const NAMES: [&str; 9] = ["pack", "kernel", "emit", "unit end (chunks)", "regions (dedup, bundles, segments)", "frame end (keys, next layer, wins decode, edge file)", "slice.setup", "unit (all of engine.run)", "unit decode (rows from keys, not expanded)"];
+    pub const NAMES: [&str; 10] = ["pack", "kernel", "emit", "unit end (chunks)", "regions (pushes merged, segments)", "frame end (keys, next layer, wins decode, edge files)", "slice.setup", "unit (all of engine.run)", "unit decode (rows from keys, not expanded)", "re-push units"];
     pub const PACK: usize = 0;
     pub const KERNEL: usize = 1;
     pub const EMIT: usize = 2;
@@ -31,7 +31,8 @@ pub mod phases {
     pub const SETUP: usize = 6;
     pub const UNIT: usize = 7;
     pub const DECODE: usize = 8;
-    static TICKS: [AtomicU64; 9] = [const { AtomicU64::new(0) }; 9];
+    pub const REPUSH: usize = 9;
+    static TICKS: [AtomicU64; 10] = [const { AtomicU64::new(0) }; 10];
     /// A phase's start (`on`: `--phases`; off, 0 and every `add` a no-op).
     #[inline]
     pub fn start(on: bool) -> u64 {
@@ -539,7 +540,6 @@ pub struct FrameStats {
     /// The old states' recorded edges read, and every push merged (the
     /// units' and the re-push's); the states pushed into.
     pub repush_edges: u64,
-    pub repush_pushes: u64,
     pub pushes: u64,
     pub touched: u64,
     /// New states, and old states whose hull grew.
@@ -554,8 +554,6 @@ pub struct FrameStats {
     /// The region phase: its jobs' time summed over the workers (they run
     /// inside the wave, overlapping the units).
     pub t_regions: std::time::Duration,
-    /// The re-push, wall.
-    pub t_repush: std::time::Duration,
     /// The frame's end (keys, the next layer, its wins decoded, the edge
     /// file), wall.
     pub t_layer: std::time::Duration,
@@ -563,10 +561,12 @@ pub struct FrameStats {
     /// The slices, and the routes (target regions) with new states or edges.
     pub slices: usize,
     pub routes: u64,
-    /// Edges recorded, their bundles, and the frame's edge file bytes.
+    /// Edges recorded, their bundles, and the frame's edge file bytes and
+    /// out file bytes.
     pub edge_records: u64,
     pub edge_bundles: u64,
     pub edge_bytes: u64,
+    pub out_bytes: u64,
     /// The input frontier's bytes (its keys and masks).
     pub frontier_bytes: usize,
     /// Bytes allocated in the visited set.
@@ -721,8 +721,8 @@ pub struct ForwardState {
     visited: crate::storage::visited::VisitedSet,
     /// The tree's transfers (`storage::edges::XferTable`).
     xfers: crate::storage::edges::XferTable,
-    /// The tree's edge files (the re-push reads an old state's edges).
-    store: crate::storage::edges::EdgeStore,
+    /// The tree's out-edge files (the re-push reads an old state's edges).
+    outs: crate::storage::out::OutStore,
     /// The shapes' skeletons the emissions register (the next layers').
     skeletons: crate::storage::decode::Skeletons,
     observer: Option<crate::search::pos_graph::PosObserver>,
@@ -748,6 +748,10 @@ pub struct ForwardResult {
 /// The start's remainder hull: its exact remainder (`arc_dp::start_point`,
 /// the backward's start point too).
 pub fn start_hull(s: &crate::settings::Settings) -> Result<Hull> {
+    #[cfg(test)]
+    if crate::search::hull::WIDEN.load(std::sync::atomic::Ordering::Relaxed) {
+        return Ok(Hull::full());
+    }
     let (x, y) = crate::search::arc_dp::start_point(s)?;
     Ok(Hull::point(x, y))
 }
@@ -766,8 +770,8 @@ fn checkpoint(dir: &std::path::Path, frame: u32, wave: &crate::storage::wave::Wa
     anyhow::ensure!(u16::try_from(frame).is_ok(), "frame {frame}: past a u16 layer");
     let grown = wave.frontier_states(frame);
     let hp = hulls::path(dir, frame);
-    hulls::write(&hp, &grown)?;
-    hulls::check(&hp, &grown)?;
+    hulls::write(&hp, &grown, s.threads())?;
+    hulls::check(&hp, &grown, s.threads())?;
     Ok(!wave.wins.is_empty())
 }
 
@@ -796,8 +800,8 @@ impl ForwardState {
         }
         let edges_dir = dir.join("edges");
         crate::storage::edges::set_done(&edges_dir, 0, 0)?;
-        let store = crate::storage::edges::EdgeStore::open(&edges_dir, 0)?;
-        Ok(ForwardState { frontier: seeded.frontier(), visited, xfers: Default::default(), store, skeletons: Default::default(), observer, frames: 0, win_frame: won.then_some(0), filter: Some(filter) })
+        let outs = crate::storage::out::OutStore::open(&edges_dir, 0)?;
+        Ok(ForwardState { frontier: seeded.frontier(), visited, xfers: Default::default(), outs, skeletons: Default::default(), observer, frames: 0, win_frame: won.then_some(0), filter: Some(filter) })
     }
 
     /// The forward as its checkpoint tree left it (`None`: no tree); extending
@@ -846,7 +850,7 @@ impl ForwardState {
         let filter = TreeFilter::read(dir)?;
         let (visited, win_frame, frontier) = restore_visited(dir, last, Some(s.room), s.threads())?;
         let xfers = crate::storage::edges::XferTable::load(&edges_dir)?;
-        let store = crate::storage::edges::EdgeStore::open(&edges_dir, last)?;
+        let outs = crate::storage::out::OutStore::open(&edges_dir, last)?;
         let observer = if record {
             let path = pos_graph_path(dir);
             let graph = crate::search::pos_graph::PosGraph::load(&path)
@@ -855,7 +859,7 @@ impl ForwardState {
         } else {
             None
         };
-        Ok(ForwardState { frontier, visited, xfers, store, skeletons: Default::default(), observer, frames: last, win_frame, filter })
+        Ok(ForwardState { frontier, visited, xfers, outs, skeletons: Default::default(), observer, frames: last, win_frame, filter })
     }
 
     /// The visited set's size: every distinct state reached so far.
@@ -912,7 +916,7 @@ impl ForwardState {
             filters: Filters { marks: None, minus_one },
             frame: self.frames + 1,
             edges_dir,
-            store: Some(&self.store),
+            outs: Some(&self.outs),
             skeletons: &self.skeletons,
             ceiling: self.ceiling(&engine.settings()),
         };
@@ -949,7 +953,7 @@ impl ForwardState {
                 filters,
                 frame,
                 edges_dir: Some(&edges_dir),
-                store: Some(&self.store),
+                outs: Some(&self.outs),
                 skeletons: &self.skeletons,
                 ceiling,
             };
@@ -967,7 +971,7 @@ impl ForwardState {
             let t_pos = t.elapsed();
             // The frame's LAST write: every file above is trusted from here.
             crate::storage::edges::set_done(&edges_dir, frame, self.xfers.pairs.len())?;
-            self.store.add_frame(&edges_dir, frame)?;
+            self.outs.add_frame(&edges_dir, frame)?;
             log_frame(dir, frame, &wave.stats, t_ckpt, t_pos, t_frame.elapsed(), self.visited_len())?;
             ensure_disk_space(dir, &mut last_free)?;
             self.frames = frame;
@@ -1130,8 +1134,8 @@ fn log_frame(
     let ms = |d: std::time::Duration| d.as_secs_f64() * 1e3;
     eprintln!(
         "[fwd] f{frame:03} in {}/{} old {} raw {} re-pushed {} pushes {} touched {} kept {} grown {} out {}/{} visited {} | \
-         wave {:.0} (idle {:.0}%, regions {:.0} worker-ms) re-push {:.0} layer {:.0} ckpt {:.0} pos {:.0} total {:.0} ms | \
-         units {} slices {} routes {} edges {} bundles {} ({:.3} B) | \
+         wave {:.0} (idle {:.0}%, regions {:.0} worker-ms) layer {:.0} ckpt {:.0} pos {:.0} total {:.0} ms | \
+         units {} slices {} routes {} edges {} bundles {} ({:.3} B; out {:.3} B) | \
          in {:.2} visited {:.2} GB rss start {:.2} wave {:.2} end {:.2} peak {:.2} GB (anon; file {:.2}) | \
          keys {} bits, {} codes (+{})",
         st.entries_in,
@@ -1149,7 +1153,6 @@ fn log_frame(
         ms(st.t_wave),
         st.wave_idle * 100.0,
         ms(st.t_regions),
-        ms(st.t_repush),
         ms(st.t_layer),
         ms(t_ckpt),
         ms(t_pos),
@@ -1160,6 +1163,7 @@ fn log_frame(
         st.edge_records,
         st.edge_bundles,
         st.edge_bytes as f64 / st.edge_records.max(1) as f64,
+        st.out_bytes as f64 / st.edge_records.max(1) as f64,
         st.frontier_bytes as f64 / 1e9,
         st.visited_bytes as f64 / 1e9,
         st.rss_start,
@@ -1173,7 +1177,6 @@ fn log_frame(
     );
     crate::metrics::record("fwd.wave", st.t_wave);
     crate::metrics::record("fwd.regions", st.t_regions);
-    crate::metrics::record("fwd.repush", st.t_repush);
     crate::metrics::record("fwd.layer", st.t_layer);
     crate::metrics::record("fwd.checkpoint", t_ckpt);
     crate::metrics::record("fwd.posgraph", t_pos);
@@ -1209,7 +1212,6 @@ pub(crate) fn forward_stats_row(
         ("wave_ms", format!("{:.0}", ms(st.t_wave))),
         ("wave_idle_pct", format!("{:.0}", st.wave_idle * 100.0)),
         ("regions_worker_ms", format!("{:.0}", ms(st.t_regions))),
-        ("repush_ms", format!("{:.0}", ms(st.t_repush))),
         ("layer_ms", format!("{:.0}", ms(st.t_layer))),
         ("ckpt_ms", format!("{:.0}", ms(t_ckpt))),
         ("pos_ms", format!("{:.0}", ms(t_pos))),
@@ -1274,28 +1276,51 @@ pub fn restore_visited(dir: &std::path::Path, last: u32, room: Option<(i16, i16)
         }
     }
     let mut grown: Vec<hulls::Grown> = Vec::new();
+    // The last frame's old states' hulls before it (what they pushed last).
+    let mut was: rustc_hash::FxHashMap<crate::storage::Sk, Hull> = Default::default();
     for f in 0..=last {
         let p = hulls::path(dir, f);
         if f > 0 && !p.exists() && tree.frames[f as usize].is_empty() {
             // Past a frontier that died: no frame, no hulls.
             continue;
         }
-        grown = hulls::read(&p).with_context(|| format!("{}: frame {f}'s hulls", dir.display()))?;
+        grown = hulls::read(&p, threads).with_context(|| format!("{}: frame {f}'s hulls", dir.display()))?;
+        if f == last {
+            for &(sk, layer, _) in grown.iter().filter(|g| g.1 as u32 != last) {
+                let i = visited.state(sk.region, sk.key, sk.local as u32).ok_or_else(|| anyhow::anyhow!("{}: an old state of frame {f}'s frontier without a hull before", dir.display()))?;
+                anyhow::ensure!(i.layer == layer, "{}: an old state's layer {layer} in frame {f}'s hulls, {} before", dir.display(), i.layer);
+                was.insert(sk, i.hull);
+            }
+        }
+        let mut groups: Vec<(u32, std::ops::Range<usize>)> = Vec::new();
         let mut a = 0;
         while a < grown.len() {
             let region = grown[a].0.region;
             let b = a + grown[a..].partition_point(|x| x.0.region == region);
-            visited.set_info(region, grown[a..b].iter().map(|&(sk, layer, hull)| (sk.key, sk.local as u32, crate::storage::visited::StateInfo { hull, layer })))?;
+            groups.push((region, a..b));
             a = b;
         }
+        visited.set_infos(
+            &groups,
+            |g, put| {
+                for &(sk, layer, hull) in &grown[g.clone()] {
+                    put(sk.key, sk.local as u32, crate::storage::visited::StateInfo { hull, layer })?;
+                }
+                Ok(())
+            },
+            threads,
+        )?;
     }
     anyhow::ensure!(visited.infos() == visited.len(), "{}: {} states, {} with a hull", dir.display(), visited.len(), visited.infos());
     // The frontier: frame `last`'s hull file - its new states are the frame's
-    // layer, in its order.
+    // layer, in its order; its old ones pushed the hull they had before it.
     let layer16 = u16::try_from(last).map_err(|_| anyhow::anyhow!("frame {last}: past a u16 layer"))?;
     let (fresh, old): (Vec<hulls::Grown>, Vec<hulls::Grown>) = grown.into_iter().partition(|g| g.1 == layer16);
     anyhow::ensure!(fresh.iter().map(|g| g.0).eq(new.states_iter()), "{}: frame {last}'s hull file does not list the frame's new states", dir.display());
     let hulls = fresh.into_iter().map(|g| g.2).collect();
+    let mut old: Vec<crate::storage::wave::Old> = old.into_iter().map(|(sk, layer, hull)| crate::storage::wave::Old { sk, layer, hull, was: was.get(&sk).copied().unwrap_or(hull) }).collect();
+    anyhow::ensure!(old.iter().all(|o| was.contains_key(&o.sk)), "{}: an old state of frame {last}'s frontier without its hull before", dir.display());
+    old.sort_unstable_by_key(|o| (o.layer, o.sk));
     Ok((visited, tree.first_win(), Frontier { new, hulls, old }))
 }
 
@@ -1522,6 +1547,81 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// THE HULL FORWARD LIES BETWEEN THE EXACT REACH AND THE WIDENED FORWARD,
+    /// room (1,0) to f44 (the gate's forward): with every hull widened to
+    /// the whole circle (`hull::WIDEN`: every state's remainder widened, the
+    /// forward before hulls) the frames are exactly the pinned gate's
+    /// (gates/ckhash_room10_f000-044.txt); the hull forward keeps a SUBSET of
+    /// those states, each in a layer no earlier than the widened one's; and
+    /// it holds every state the exact-remainder reach (`search::reach`)
+    /// reaches, in a layer no later than the frame it is reached at, with
+    /// every remainder the reach brings it in its hull.
+    #[test]
+    fn the_hull_forward_lies_between_the_exact_reach_and_the_widened_forward() {
+        use crate::search::hull::WIDEN;
+        use std::sync::atomic::Ordering;
+        let s = crate::settings::Settings { threads: Some(8), ..Default::default() };
+        let base = std::env::temp_dir().join(format!("celeste-hull-between-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let level = crate::abstraction::Level::parse("r0sx").expect("level");
+        let e = crate::compiled::FrameEngine::new(&s, level).expect("kernels");
+        let init = || vec![Block::canonical(RefEngine::new(&s).expect("engine").initial().expect("init")).expect("block")];
+        let to = 44;
+        // Per frame, its states by content.
+        let states = |d: &std::path::Path| -> Vec<rustc_hash::FxHashSet<u64>> {
+            let t = crate::storage::layer::Tree::open(d, to).expect("tree");
+            let content = t.space.content_hash();
+            (0..=to).map(|f| t.layer(f, None, 4).expect("layer").0.states_iter().map(|sk| { let (shape, key, cell) = t.state(sk).expect("state"); content.state(shape, key, cell) }).collect()).collect()
+        };
+        let (wide, hull) = (base.join("widened"), base.join("hull"));
+        WIDEN.store(true, Ordering::Relaxed);
+        ForwardState::start(init(), &wide, true, None, level, &s).expect("start").extend(&e, &wide, to, None).expect("widened");
+        WIDEN.store(false, Ordering::Relaxed);
+        ForwardState::start(init(), &hull, true, None, level, &s).expect("start").extend(&e, &hull, to, None).expect("hull");
+        let t = crate::storage::layer::Tree::open(&wide, to).expect("tree");
+        let lines: Vec<String> = (0..=to).map(|f| { let (n, acc) = t.layer(f, None, 4).expect("layer").0.content_fingerprint(&t.space, &t.shapes).expect("fp"); format!("f{f:03} {n} {acc:016x}") }).collect();
+        let pinned = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/gates/ckhash_room10_f000-044.txt")).expect("the gate");
+        assert_eq!(lines, pinned.lines().collect::<Vec<_>>(), "the widened forward is not the gate's");
+        let (ws, hs) = (states(&wide), states(&hull));
+        let first_in = |sets: &[rustc_hash::FxHashSet<u64>], h: u64| sets.iter().position(|x| x.contains(&h));
+        let (mut n_hull, mut n_wide) = (0usize, 0usize);
+        for (f, layer) in hs.iter().enumerate() {
+            n_hull += layer.len();
+            n_wide += ws[f].len();
+            for &h in layer {
+                let w = first_in(&ws, h).unwrap_or_else(|| panic!("f{f}: a hull state the widened forward never reaches"));
+                assert!(w <= f, "f{f}: a hull state the widened forward reaches only at f{w}");
+            }
+        }
+        assert!(n_hull < n_wide, "{n_hull} hull states, {n_wide} widened: the hulls cut nothing");
+        // The exact reach, inside the hull tree's states and hulls.
+        let st = ForwardState::at(&hull, to, false, level, &s).expect("at");
+        let tree = crate::storage::layer::Tree::open(&hull, to).expect("tree");
+        let layers: Vec<Layer> = (0..=to).map(|f| tree.layer(f, None, 4).expect("layer").0).collect();
+        let p0 = crate::search::arc_dp::start_point(&s).expect("start");
+        let mut checked = 0u64;
+        crate::search::reach::reach(&hull, to, p0, 4, |sums, _, cur, inexact| {
+            assert!(inexact.is_empty(), "room (1,0) to f44 needs no coarsening");
+            for (sk, r) in cur {
+                let layer = (0..=sums.frame).find(|&f| layers[f as usize].contains(*sk)).unwrap_or_else(|| panic!("f{}: an exactly reached state no layer holds", sums.frame));
+                let info = st.visited().state(sk.region, sk.key, sk.local as u32).expect("a hull");
+                assert_eq!(info.layer as u32, layer, "f{}: the state's recorded layer", sums.frame);
+                for (y, xs) in r.slabs() {
+                    assert!(info.hull.y.contains_seg(y), "f{}: a reached y segment outside the hull", sums.frame);
+                    for x in xs {
+                        assert!(info.hull.x.contains_seg(x), "f{}: a reached x segment outside the hull", sums.frame);
+                    }
+                }
+                checked += 1;
+            }
+            Ok(())
+        })
+        .expect("reach");
+        assert!(checked > 1000, "{checked} reached states checked");
+        eprintln!("[hull] f0-f{to}: {n_hull} hull states, {n_wide} widened, {checked} exactly reached (state, frame)s inside the hulls");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     /// A tree's level -1 record round-trips, reads the campaign's bare
     /// number as a legacy filter, and is absent (unknown) on an old tree.
     #[test]
@@ -1582,7 +1682,7 @@ mod tests {
         let e = RefEngine::new(&s).expect("engine");
         let init = vec![Block::canonical(e.initial().expect("init")).expect("block")];
         let e = Mutex::new(e);
-        let frontier = |st: &ForwardState| -> (Vec<(u32, (u64, u64), u64)>, Vec<Hull>, Vec<crate::storage::hulls::Grown>) { (st.frontier.new.iter().collect(), st.frontier.hulls.clone(), st.frontier.old.clone()) };
+        let frontier = |st: &ForwardState| -> (Vec<(u32, (u64, u64), u64)>, Vec<Hull>, Vec<crate::storage::wave::Old>) { (st.frontier.new.iter().collect(), st.frontier.hulls.clone(), st.frontier.old.clone()) };
         let mut st = ForwardState::start(init, &dir, true, None, crate::abstraction::Level::EXACT, &s).expect("start");
         for b in crate::storage::layer::decode_states(&st.frontier.new, &st.visited.keys, st.visited.shapes(), usize::MAX, &|_| true).expect("decode") {
             assert!(not_expanded(&Block::from_rt2(b.1), 0, None, &s).expect("not expanded").iter().all(|&x| x), "frame 0: the berry is lost");
@@ -1780,7 +1880,7 @@ mod tests {
             let (routes, skeletons) = (crate::storage::route::Routes::default(), crate::storage::decode::Skeletons::default());
             let prov = celeste_engine::exact::Provisional::default();
             let xtab = Default::default();
-            let mut sink = crate::storage::unit::UnitSink::new(&visited, &routes, &skeletons, &prov, Filters::default(), 1, level, 0, &xtab, false, &s);
+            let mut sink = crate::storage::unit::UnitSink::new(&visited, &routes, &skeletons, &prov, Filters::default(), 1, level, 0, &xtab, false, false, &s);
             sink.begin(0);
             let si = sink.push_source(0, (0, 0));
             sink.push_lane(si, cells[0], Hull::full());
@@ -1847,7 +1947,7 @@ mod tests {
             let (routes, skeletons) = (crate::storage::route::Routes::default(), crate::storage::decode::Skeletons::default());
             let prov = celeste_engine::exact::Provisional::default();
             let xtab = Default::default();
-            let mut sink = crate::storage::unit::UnitSink::new(&visited, &routes, &skeletons, &prov, Filters::default(), 1, level, 0, &xtab, false, &s);
+            let mut sink = crate::storage::unit::UnitSink::new(&visited, &routes, &skeletons, &prov, Filters::default(), 1, level, 0, &xtab, false, false, &s);
             sink.begin(0);
             let si = sink.push_source(0, (0, 0));
             sink.push_lane(si, cells[0], Hull::full());
