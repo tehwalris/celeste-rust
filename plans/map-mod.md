@@ -570,3 +570,10 @@ itself on the strip and falls 2-3 px short.
   the forward reaches the exit only through its widenings (hulls, held
   buttons), and the arcs refute every one of those wins. 248 s, peak 17 GB.
 - 03:18 hx300 started.
+- 03:38 The exact reach over the hull tree (to f223, decoding every reached
+  state at x 97-127, y <= 110) reached f170 with NONE there: the same as
+  over bal200. I stopped it at 44 GB (its 45G cap) to give hx300 the
+  memory. The hull tree's states there start at f171, so it needs to go
+  further: rerun after hx300.
+- 03:45 hx300: forward at f268, past its peak (26M new rows at f254,
+  RSS 43 GB).
