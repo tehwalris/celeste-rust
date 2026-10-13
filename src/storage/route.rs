@@ -39,32 +39,86 @@ pub const NO_XFER: u32 = u32::MAX;
 /// `Scratch::e_of`'s mark of a provisional target.
 const PROV: u32 = u32::MAX;
 
-/// A route's TOUCHED states this frame: per state `(key, cell)` pushed
-/// into, the hull pushed so far.
+/// A route's TOUCHED states this frame: per key pushed into (one probe of
+/// `index` a key, as the dedup's), the cells pushed and the RUN of their
+/// hulls so far in `slots` (by cell; a run moves to the end when its key
+/// gains a cell).
 #[derive(Default)]
 pub struct Touched {
-    pub accs: FxHashMap<(Key, u8), HullAcc>,
+    index: FxHashMap<Key, u32>,
+    /// Per key: the key, its cells, its run's start.
+    keys: Vec<(Key, u64, u32)>,
+    slots: Vec<HullAcc>,
+    states: usize,
 }
 
 impl Touched {
-    /// Merge `acc` into state `(key, cell)`.
+    /// Merge `cells` (by cell, ascending: `(cell, hull)`) into key `key`'s.
     #[inline]
-    pub fn push(&mut self, key: Key, cell: u32, acc: &HullAcc) {
-        self.accs.entry((key, cell as u8)).or_insert(HullAcc::EMPTY).merge(acc);
+    pub fn push(&mut self, key: Key, cells: &[(u8, HullAcc)]) {
+        let n = self.keys.len() as u32;
+        let e = *self.index.entry(key).or_insert(n);
+        if e == n {
+            self.keys.push((key, 0, self.slots.len() as u32));
+        }
+        let (_, mask, start) = self.keys[e as usize];
+        let add = cells.iter().fold(0u64, |m, x| m | 1u64 << x.0);
+        let rank = |m: u64, c: u8| (m & ((1u64 << c) - 1)).count_ones() as usize;
+        if add & !mask == 0 {
+            for &(c, ref a) in cells {
+                self.slots[start as usize + rank(mask, c)].merge(a);
+            }
+            return;
+        }
+        // The key's run with the new cells, at the end.
+        let next = mask | add;
+        let at = self.slots.len();
+        let mut m = next;
+        while m != 0 {
+            let c = m.trailing_zeros() as u8;
+            m &= m - 1;
+            self.slots.push(if mask >> c & 1 == 1 { self.slots[start as usize + rank(mask, c)] } else { HullAcc::EMPTY });
+        }
+        for &(c, ref a) in cells {
+            self.slots[at + rank(next, c)].merge(a);
+        }
+        self.states += (add & !mask).count_ones() as usize;
+        self.keys[e as usize] = (key, next, at as u32);
     }
 
     pub fn is_empty(&self) -> bool {
-        self.accs.is_empty()
+        self.keys.is_empty()
     }
 
     /// States pushed into.
     pub fn len(&self) -> usize {
-        self.accs.len()
+        self.states
+    }
+
+    /// The keys pushed into.
+    pub fn keys(&self) -> impl Iterator<Item = Key> + '_ {
+        self.keys.iter().map(|k| k.0)
+    }
+
+    /// Every state pushed into, `(key, cell, hull so far)`.
+    pub fn states(&self) -> impl Iterator<Item = (Key, u8, HullAcc)> + '_ {
+        self.keys.iter().flat_map(move |&(key, mask, start)| {
+            let mut m = mask;
+            let mut i = start as usize;
+            std::iter::from_fn(move || {
+                (m != 0).then(|| {
+                    let c = m.trailing_zeros() as u8;
+                    m &= m - 1;
+                    i += 1;
+                    (key, c, self.slots[i - 1])
+                })
+            })
+        })
     }
 
     /// Bytes held.
     pub fn alloc_bytes(&self) -> usize {
-        self.accs.capacity() * (std::mem::size_of::<((Key, u8), HullAcc)>() + 1)
+        self.index.capacity() * (std::mem::size_of::<(Key, u32)>() + 1) + self.keys.capacity() * std::mem::size_of::<(Key, u64, u32)>() + self.slots.capacity() * std::mem::size_of::<HullAcc>()
     }
 }
 
@@ -475,12 +529,20 @@ pub fn run_route(st: &mut RouteState, slice: u32, chunks: &[&Chunk], cx: &Region
     sc.t_keys.clear();
     for c in chunks {
         // THE PUSHES.
-        for &(t, cell, ref acc) in &c.pushes {
+        let mut i = 0usize;
+        let mut cells: Vec<(u8, HullAcc)> = Vec::new();
+        while i < c.pushes.len() {
+            let t = c.pushes[i].0;
+            cells.clear();
+            while i < c.pushes.len() && c.pushes[i].0 == t {
+                cells.push((c.pushes[i].1, c.pushes[i].2));
+                i += 1;
+            }
             let key = c.targets[t as usize].0;
             if is_provisional(key) {
                 st.prov_keys.insert(key);
             }
-            st.touched.push(key, cell as u32, acc);
+            st.touched.push(key, &cells);
         }
         st.pushes += c.pushes.len() as u64;
         if !record {
@@ -591,7 +653,7 @@ pub fn seal(st: &mut RouteState, region: u32, finals: &FxHashMap<Key, Key>, renu
     }
     // THE STATES (final keys, sorted): new, grown, or nothing.
     let mut states: Vec<(Key, u8, HullAcc)> = Vec::with_capacity(st.touched.len());
-    for ((k, c), acc) in std::mem::take(&mut st.touched).accs {
+    for (k, c, acc) in std::mem::take(&mut st.touched).states() {
         let k = if is_provisional(k) { finals.get(&k).copied().ok_or_else(|| anyhow::anyhow!("a provisional key without its final key"))? } else { k };
         states.push((k, c, acc));
     }
