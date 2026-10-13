@@ -485,3 +485,28 @@ crossing plus R,R,R and a dash up-right reaches the shaft floor at
 max_djump_overload) survives level loads and a TAS file does not record
 it. Whether the room is meant for 2 dashes is a question for Philippe.
 `--max-djump N` (recorded in the tree) runs such a game.
+
+The 1-dash assumptions, each checked against the mod's Lua (2026-10-13):
+- Every exact-reach state right of the strip (x >= 95, y >= 96), f157-f190,
+  decoded (`rewrite reach --decode-rect 95..127,96..128 --decode-max`):
+  18,222 states, all djump 0 and the balloon present (spr 22). 17,905 of
+  them are inexact supersets. No refill ever happens on the right.
+- Ground: only flag-0 tiles are solid (`solid_at`). Spikes (flag 1) cannot
+  be stood on. The only standable tiles are the spring's base (row 13
+  col 6) and the shaft floor (row 13 cols 10-13). Row 15 cols 10-11 lie
+  under the strip: standing there is y 112, which kills
+  (`(y+h-1)%8 >= 6`, yspd >= 0).
+- The spring never hides: `hide_in` is set only by a breaking fall floor,
+  and the room has none. It re-arms 10 frames after a bounce.
+- The ceiling block's corner: `move` runs x before y, so a diagonal
+  cannot slip past x 65 at y < 109.
+- Wall jumps: the faces near the strip push LEFT (the ceiling block's
+  left face x 72, the floor block's left face x 80). The pit's left wall
+  (x 48) pushes right but sits under the spring base (bump at y 109,
+  x <= 54).
+- Strawberries: (16,40), (16,48), (40,72), all left of x 48: a refill
+  there does not change the ceiling geometry.
+- The down-spike at row 14 col 13 kills at yspd = 0 (`yspd<=0`).
+- The jump buffer the minimal cart drops (and Celia keeps) fires a press
+  at the first frame with grace or a wall in range. That is the same as
+  pressing then: reachability is unchanged.
