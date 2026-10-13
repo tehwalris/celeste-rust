@@ -180,6 +180,11 @@ enum Command {
         /// union per state ever reached, kept to the end.
         #[arg(long)]
         first_arrival: bool,
+        /// Keep a state's out-edges only while it was reached in the last
+        /// this many frames (0: all, to the end); read again when reached
+        /// again. Memory for time on a long reach.
+        #[arg(long, default_value_t = 0)]
+        edge_cache: u32,
     },
     CheckKnown {
         /// The search's checkpoint dir (its `level{i:02}` trees).
@@ -967,8 +972,8 @@ fn main() -> Result<()> {
                 prev = Some((s.arc_marks.expect("asked for"), lvl));
             }
         }
-        Command::Reach { checkpoint_dir, level_index, to, save_marks, cells, decode_rect, decode_max, route, max_segs, first_arrival } => {
-            let opts = celeste_rust::search::reach::ReachOpts { max_segs, first_arrival };
+        Command::Reach { checkpoint_dir, level_index, to, save_marks, cells, decode_rect, decode_max, route, max_segs, first_arrival, edge_cache } => {
+            let opts = celeste_rust::search::reach::ReachOpts { max_segs, first_arrival, edge_cache };
             reach_command(&checkpoint_dir, level_index, to, save_marks.as_deref(), cells.as_deref(), decode_rect.as_deref(), decode_max, route.as_deref(), opts, &cfg)?;
         }
         Command::CheckKnown { checkpoint_dir, level, inputs, horizon } => {
