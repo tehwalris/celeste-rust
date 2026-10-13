@@ -566,3 +566,7 @@ itself on the strip and falls 2-3 px short.
   states visited, the peak frame ~1.4M new (f220); 142 s in all. Level -1
   cuts the hull forward hard near the horizon.
 - 03:12 hx270 started (level -1 270,5).
+- 03:17 hx270: REFUTED to h270. The hull forward's first win is at f246:
+  the forward reaches the exit only through its widenings (hulls, held
+  buttons), and the arcs refute every one of those wins. 248 s, peak 17 GB.
+- 03:18 hx300 started.
