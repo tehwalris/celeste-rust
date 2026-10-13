@@ -641,3 +641,4 @@ file does not record it.
   supersets of the left side), so f223 does not fit. The hx runs were
   fresh, not resumed: hull-mod's resume bug (fixed on develop f652026,
   format 17) did not apply to them.
+- 05:40 UI: `mod00-exit-h300` (the 1-dash h300 refutation).
