@@ -580,3 +580,8 @@ itself on the strip and falls 2-3 px short.
 - 04:10 hx300: REFUTED to h300 (the hull forward 1663 s, peak 71 GB; the
   forward's first win f246, every one refuted by the arcs; 1849 s in
   all). With one dash there is no exit by f300.
+- 04:20 A sanity check of the hull pipeline on this room. The cross160
+  target (the strip's far side, x 96-103, y 105-120) with level -1 160,5
+  and `--prefer` the old forward's f157 witness gives OPTIMAL 157 (as
+  cross160 did), in 116 s. The known route survives every pruning step:
+  157 states, the node and W at every frame boundary, level -1.
