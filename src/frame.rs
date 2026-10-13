@@ -755,8 +755,9 @@ fn checkpoint(dir: &std::path::Path, frame: u32, wave: &crate::storage::wave::Wa
     anyhow::ensure!(u16::try_from(frame).is_ok(), "frame {frame}: past a u16 layer");
     let hp = hulls::path(dir, frame);
     let of = |o: &crate::storage::wave::Old| (o.sk, o.layer, o.hull);
-    hulls::write(&hp, frame, &wave.hulls, &wave.grown, of, s.threads())?;
-    hulls::check(&hp, frame, &wave.hulls, &wave.grown, of, s.threads())?;
+    let runs: Vec<&[crate::storage::wave::Old]> = wave.grown.iter().map(|x| x.1.as_slice()).collect();
+    hulls::write(&hp, frame, &wave.hulls, &runs, of, s.threads())?;
+    hulls::check(&hp, frame, &wave.hulls, &runs, of, s.threads())?;
     Ok(!wave.wins.is_empty())
 }
 
@@ -813,7 +814,7 @@ impl ForwardState {
             dir.display(),
             st.frontier.new.states(),
             st.frontier.new.entries(),
-            st.frontier.old.len(),
+            st.frontier.old_states(),
             st.visited.len(),
             st.visited.entries(),
             st.win_frame,
@@ -1290,12 +1291,15 @@ pub fn restore_visited(dir: &std::path::Path, last: u32, room: Option<(i16, i16)
         groups.sort_unstable_by_key(|g| g.0);
         if f == last {
             // What the last frame's old states pushed before it.
-            let mut old = Vec::with_capacity(hf.grown.len());
+            let mut old: crate::storage::wave::ByLayer = Vec::new();
             for &(sk, layer, hull) in &hf.grown {
                 anyhow::ensure!(layer < f16, "{}: a grown state of layer {layer} in frame {f}'s hulls", dir.display());
                 let i = visited.state(sk.region, sk.key, sk.local as u32).ok_or_else(|| anyhow::anyhow!("{}: an old state of frame {f}'s frontier without a hull before", dir.display()))?;
                 anyhow::ensure!(i.layer == layer, "{}: an old state's layer {layer} in frame {f}'s hulls, {} before", dir.display(), i.layer);
-                old.push(crate::storage::wave::Old { sk, layer, hull, was: i.hull });
+                if old.last().is_none_or(|x| x.0 != layer) {
+                    old.push((layer, Vec::new()));
+                }
+                old.last_mut().expect("pushed").1.push(crate::storage::wave::Old { sk, layer, hull, was: i.hull });
             }
             frontier = Frontier { new: layer, hulls: hf.hulls.clone(), old };
         }
@@ -1672,7 +1676,7 @@ mod tests {
         let e = RefEngine::new(&s).expect("engine");
         let init = vec![Block::canonical(e.initial().expect("init")).expect("block")];
         let e = Mutex::new(e);
-        let frontier = |st: &ForwardState| -> (Vec<(u32, (u64, u64), u64)>, Vec<Hull>, Vec<crate::storage::wave::Old>) { (st.frontier.new.iter().collect(), st.frontier.hulls.clone(), st.frontier.old.clone()) };
+        let frontier = |st: &ForwardState| -> (Vec<(u32, (u64, u64), u64)>, Vec<Hull>, crate::storage::wave::ByLayer) { (st.frontier.new.iter().collect(), st.frontier.hulls.clone(), st.frontier.old.clone()) };
         let mut st = ForwardState::start(init, &dir, true, None, crate::abstraction::Level::EXACT, &s).expect("start");
         for b in crate::storage::layer::decode_states(&st.frontier.new, &st.visited.keys, st.visited.shapes(), usize::MAX, &|_| true).expect("decode") {
             assert!(not_expanded(&Block::from_rt2(b.1), 0, None, &s).expect("not expanded").iter().all(|&x| x), "frame 0: the berry is lost");

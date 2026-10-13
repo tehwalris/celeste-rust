@@ -148,18 +148,33 @@ fn decode_grown(raw: &[u8], want: usize) -> Result<Vec<Grown>> {
     Ok(out)
 }
 
+/// A hull file's blocks: per block whether it holds grown states, its run
+/// and its range there (`write`'s runs; the new states' hulls are run 0 of
+/// their own).
+fn cuts<G>(hulls: &[Hull], runs: &[&[G]]) -> Vec<(bool, usize, std::ops::Range<usize>)> {
+    let mut cuts: Vec<(bool, usize, std::ops::Range<usize>)> = (0..hulls.len()).step_by(NEW_BLOCK).map(|a| (false, 0, a..(a + NEW_BLOCK).min(hulls.len()))).collect();
+    for (i, run) in runs.iter().enumerate() {
+        cuts.extend((0..run.len()).step_by(GROWN_BLOCK).map(|a| (true, i, a..(a + GROWN_BLOCK).min(run.len()))));
+    }
+    cuts
+}
+
 /// Write frame `frame`'s frontier: its new states' `hulls` (in its state
-/// order) and its `grown` states (`of` each: sorted by layer and state,
-/// distinct: checked), blocks on `threads` threads. Atomic. Returns the
-/// file's bytes.
-pub fn write<G: Sync>(path: &Path, frame: u32, hulls: &[Hull], grown: &[G], of: impl Fn(&G) -> Grown + Sync, threads: usize) -> Result<u64> {
+/// order) and its grown states in `runs` (`of` each; all of them sorted by
+/// layer and state, distinct: checked), blocks on `threads` threads.
+/// Atomic. Returns the file's bytes.
+pub fn write<G: Sync>(path: &Path, frame: u32, hulls: &[Hull], runs: &[&[G]], of: impl Fn(&G) -> Grown + Sync, threads: usize) -> Result<u64> {
     use std::io::Write;
-    ensure!(grown.windows(2).all(|w| (of(&w[0]).1, of(&w[0]).0) < (of(&w[1]).1, of(&w[1]).0)), "{}: the grown states not sorted by layer and state, and distinct", path.display());
-    let mut cuts: Vec<(bool, std::ops::Range<usize>)> = (0..hulls.len()).step_by(NEW_BLOCK).map(|a| (false, a..(a + NEW_BLOCK).min(hulls.len()))).collect();
-    cuts.extend((0..grown.len()).step_by(GROWN_BLOCK).map(|a| (true, a..(a + GROWN_BLOCK).min(grown.len()))));
-    let blocks: Vec<Result<(Vec<u8>, u32)>> = super::wave::par_map(&cuts, threads, |(g, r)| {
+    let key = |g: &G| {
+        let g = of(g);
+        (g.1, g.0)
+    };
+    let sorted = runs.iter().all(|r| r.windows(2).all(|w| key(&w[0]) < key(&w[1]))) && runs.iter().filter(|r| !r.is_empty()).collect::<Vec<_>>().windows(2).all(|w| key(w[0].last().expect("a run")) < key(&w[1][0]));
+    ensure!(sorted, "{}: the grown states not sorted by layer and state, and distinct", path.display());
+    let cuts = cuts(hulls, runs);
+    let blocks: Vec<Result<(Vec<u8>, u32)>> = super::wave::par_map(&cuts, threads, |(g, i, r)| {
         let raw = if *g {
-            encode_grown(grown[r.clone()].iter().map(&of), r.len())
+            encode_grown(runs[*i][r.clone()].iter().map(&of), r.len())
         } else {
             hulls[r.clone()].iter().flat_map(|h| h.to_bytes()).collect()
         };
@@ -168,7 +183,7 @@ pub fn write<G: Sync>(path: &Path, frame: u32, hulls: &[Hull], grown: &[G], of: 
     let mut header = Header { frame, blocks: Vec::with_capacity(cuts.len()) };
     let mut data = Vec::with_capacity(cuts.len());
     let mut offset = 0u64;
-    for ((g, r), b) in cuts.iter().zip(blocks) {
+    for ((g, _, r), b) in cuts.iter().zip(blocks) {
         let (z, raw) = b?;
         header.blocks.push(Block { grown: *g, offset, len: z.len() as u32, raw, states: r.len() as u32 });
         offset += z.len() as u64;
@@ -194,9 +209,23 @@ pub fn write<G: Sync>(path: &Path, frame: u32, hulls: &[Hull], grown: &[G], of: 
     Ok(16 + hb.len() as u64 + offset)
 }
 
-/// Read a hull file (`write`), its blocks on `threads` threads.
-pub fn read(path: &Path, threads: usize) -> Result<Frontier> {
-    let b = std::fs::read(path).with_context(|| path.display().to_string())?;
+/// A block of a hull file (`data`: the bytes past its header) decoded: its
+/// hulls (a new states' block) or its grown states.
+fn decode(path: &Path, data: &[u8], x: &Block) -> Result<(Vec<Hull>, Vec<Grown>)> {
+    let z = &data[x.offset as usize..(x.offset + x.len as u64) as usize];
+    let raw = zstd::bulk::decompress(z, x.raw as usize).with_context(|| format!("{}: a block", path.display()))?;
+    ensure!(raw.len() == x.raw as usize, "{}: a block of {} raw bytes, its index says {}", path.display(), raw.len(), x.raw);
+    if x.grown {
+        Ok((Vec::new(), decode_grown(&raw, x.states as usize).with_context(|| format!("{}: a grown block", path.display()))?))
+    } else {
+        ensure!(raw.len() == x.states as usize * HULL_BYTES, "{}: a hulls block of {} bytes for {} states", path.display(), raw.len(), x.states);
+        Ok((raw.chunks_exact(HULL_BYTES).map(Hull::from_bytes).collect(), Vec::new()))
+    }
+}
+
+/// A hull file's bytes, its header checked: the header, and where its
+/// blocks start.
+fn open(path: &Path, b: &[u8]) -> Result<(Header, usize)> {
     ensure!(b.len() >= 16 && &b[0..4] == MAGIC, "{}: not a hull file", path.display());
     let version = u32::from_le_bytes(b[4..8].try_into().unwrap());
     ensure!(version == crate::search::checkpoint::FORMAT_VERSION, "{}: format version {version}, this binary's is {}", path.display(), crate::search::checkpoint::FORMAT_VERSION);
@@ -207,17 +236,14 @@ pub fn read(path: &Path, threads: usize) -> Result<Frontier> {
     let end = header.blocks.last().map_or(0, |x| x.offset + x.len as u64);
     ensure!(b.len() as u64 == data as u64 + end, "{}: {} bytes, its index says {}", path.display(), b.len(), data as u64 + end);
     ensure!(header.blocks.windows(2).all(|w| w[0].grown <= w[1].grown), "{}: a new states' block after a grown one", path.display());
-    let parts = super::wave::par_map(&header.blocks, threads, |x| -> Result<(Vec<Hull>, Vec<Grown>)> {
-        let z = &b[data + x.offset as usize..data + (x.offset + x.len as u64) as usize];
-        let raw = zstd::bulk::decompress(z, x.raw as usize).with_context(|| format!("{}: a block", path.display()))?;
-        ensure!(raw.len() == x.raw as usize, "{}: a block of {} raw bytes, its index says {}", path.display(), raw.len(), x.raw);
-        if x.grown {
-            Ok((Vec::new(), decode_grown(&raw, x.states as usize).with_context(|| format!("{}: a grown block", path.display()))?))
-        } else {
-            ensure!(raw.len() == x.states as usize * HULL_BYTES, "{}: a hulls block of {} bytes for {} states", path.display(), raw.len(), x.states);
-            Ok((raw.chunks_exact(HULL_BYTES).map(Hull::from_bytes).collect(), Vec::new()))
-        }
-    });
+    Ok((header, data))
+}
+
+/// Read a hull file (`write`), its blocks on `threads` threads.
+pub fn read(path: &Path, threads: usize) -> Result<Frontier> {
+    let b = std::fs::read(path).with_context(|| path.display().to_string())?;
+    let (header, data) = open(path, &b)?;
+    let parts = super::wave::par_map(&header.blocks, threads, |x| decode(path, &b[data..], x));
     let mut out = Frontier { frame: header.frame, ..Default::default() };
     for p in parts {
         let (h, g) = p?;
@@ -248,12 +274,21 @@ pub fn fingerprint(states: impl Iterator<Item = Grown>, space: &celeste_engine::
 }
 
 /// The hull file just written, READ BACK and compared with what was
-/// written (`write`'s arguments): FATAL otherwise (a resume would expand
-/// another frontier than the forward's).
-pub fn check<G: Sync>(path: &Path, frame: u32, hulls: &[Hull], grown: &[G], of: impl Fn(&G) -> Grown + Sync, threads: usize) -> Result<()> {
-    let back = read(path, threads)?;
-    let same = back.frame == frame && back.hulls == hulls && back.grown.len() == grown.len() && back.grown.iter().zip(grown).all(|(a, b)| *a == of(b));
-    ensure!(same, "{}: STORED HULLS DIFFER from the forward's ({} + {} states read back, {} + {} in memory)", path.display(), back.hulls.len(), back.grown.len(), hulls.len(), grown.len());
+/// written (`write`'s arguments), block by block on `threads` threads:
+/// FATAL otherwise (a resume would expand another frontier than the
+/// forward's).
+pub fn check<G: Sync>(path: &Path, frame: u32, hulls: &[Hull], runs: &[&[G]], of: impl Fn(&G) -> Grown + Sync, threads: usize) -> Result<()> {
+    let b = std::fs::read(path).with_context(|| path.display().to_string())?;
+    let (header, data) = open(path, &b)?;
+    let cuts = cuts(hulls, runs);
+    ensure!(header.frame == frame && header.blocks.len() == cuts.len(), "{}: STORED HULLS DIFFER from the forward's (frame {} in {} blocks read back, frame {frame} in {} blocks written)", path.display(), header.frame, header.blocks.len(), cuts.len());
+    let same = super::wave::par_map(&header.blocks.iter().zip(&cuts).collect::<Vec<_>>(), threads, |(x, (g, i, r))| -> Result<bool> {
+        let (h, gr) = decode(path, &b[data..], x)?;
+        Ok(x.grown == *g && if *g { gr.len() == r.len() && gr.iter().zip(&runs[*i][r.clone()]).all(|(a, b)| *a == of(b)) } else { h == hulls[r.clone()] })
+    });
+    for ok in same {
+        ensure!(ok?, "{}: STORED HULLS DIFFER from the forward's", path.display());
+    }
     Ok(())
 }
 
@@ -283,12 +318,18 @@ mod tests {
         grown.extend(big);
         let hulls: Vec<Hull> = (0..NEW_BLOCK as u32 + 5).map(|i| h(i as u16, (i * 7) as u16)).collect();
         let p = path(&dir, 12);
-        write(&p, 12, &hulls, &grown, |g| *g, 3).unwrap();
-        check(&p, 12, &hulls, &grown, |g| *g, 2).unwrap();
+        // In runs, cut anywhere.
+        let runs: Vec<&[Grown]> = vec![&grown[..2], &[], &grown[2..9], &grown[9..]];
+        write(&p, 12, &hulls, &runs, |g| *g, 3).unwrap();
+        check(&p, 12, &hulls, &runs, |g| *g, 2).unwrap();
         assert_eq!(read(&p, 1).unwrap(), Frontier { frame: 12, hulls: hulls.clone(), grown: grown.clone() });
-        assert!(check(&p, 13, &hulls, &grown, |g| *g, 2).is_err(), "another frame");
-        assert!(write(&p, 12, &hulls, &[grown[1], grown[0]], |g| *g, 2).is_err(), "unsorted");
-        write(&p, 12, &[], &[] as &[Grown], |g| *g, 2).unwrap();
+        assert!(check(&p, 13, &hulls, &runs, |g| *g, 2).is_err(), "another frame");
+        let mut moved = grown.clone();
+        moved[5].2 = h(1, 1);
+        assert!(check(&p, 12, &hulls, &[&moved[..2], &[], &moved[2..9], &moved[9..]], |g| *g, 2).is_err(), "another hull");
+        assert!(write(&p, 12, &hulls, &[&[grown[1], grown[0]]], |g| *g, 2).is_err(), "unsorted");
+        assert!(write(&p, 12, &hulls, &[&grown[1..2], &grown[0..1]], |g| *g, 2).is_err(), "runs unsorted");
+        write(&p, 12, &[], &[] as &[&[Grown]], |g| *g, 2).unwrap();
         assert_eq!(read(&p, 2).unwrap(), Frontier { frame: 12, ..Default::default() });
         std::fs::remove_dir_all(&dir).unwrap();
     }

@@ -100,20 +100,17 @@ impl Touched {
         self.keys.iter().map(|k| k.0)
     }
 
-    /// Every state pushed into, `(key, cell, hull so far)`.
-    pub fn states(&self) -> impl Iterator<Item = (Key, u8, HullAcc)> + '_ {
-        self.keys.iter().flat_map(move |&(key, mask, start)| {
-            let mut m = mask;
-            let mut i = start as usize;
-            std::iter::from_fn(move || {
-                (m != 0).then(|| {
-                    let c = m.trailing_zeros() as u8;
-                    m &= m - 1;
-                    i += 1;
-                    (key, c, self.slots[i - 1])
-                })
-            })
-        })
+    /// The keys pushed into, each `key(k)` (a provisional key made final:
+    /// distinct keys stay distinct), sorted: per key its cells and its
+    /// run's start in the hulls so far (by cell).
+    pub fn into_sorted(self, key: impl Fn(Key) -> Result<Key>) -> Result<(Vec<(Key, u64, u32)>, Vec<HullAcc>)> {
+        let mut keys = self.keys;
+        for k in &mut keys {
+            k.0 = key(k.0)?;
+        }
+        keys.sort_unstable_by_key(|k| k.0);
+        ensure!(keys.windows(2).all(|w| w[0].0 != w[1].0), "two touched keys made one final key");
+        Ok((keys, self.slots))
     }
 
     /// Bytes held.
@@ -652,38 +649,31 @@ pub fn seal(st: &mut RouteState, region: u32, finals: &FxHashMap<Key, Key>, renu
         seg.1.region = region;
     }
     // THE STATES (final keys, sorted): new, grown, or nothing.
-    let mut states: Vec<(Key, u8, HullAcc)> = Vec::with_capacity(st.touched.len());
-    for (k, c, acc) in std::mem::take(&mut st.touched).states() {
-        let k = if is_provisional(k) { finals.get(&k).copied().ok_or_else(|| anyhow::anyhow!("a provisional key without its final key"))? } else { k };
-        states.push((k, c, acc));
-    }
-    states.sort_unstable_by_key(|x| (x.0, x.1));
+    let final_key = |k: Key| if is_provisional(k) { finals.get(&k).copied().ok_or_else(|| anyhow::anyhow!("a provisional key without its final key")) } else { Ok(k) };
+    let (touched, accs) = std::mem::take(&mut st.touched).into_sorted(final_key)?;
     let vt = visited.table(region);
     let (mut keys, mut masks, mut hulls): (Vec<Key>, Vec<u64>, Vec<Hull>) = (Vec::new(), Vec::new(), Vec::new());
     let mut grown: Vec<super::wave::Old> = Vec::new();
-    let mut held: Option<(Key, Option<(u32, u64)>)> = None;
-    for (key, c, acc) in states {
-        if held.is_none_or(|h| h.0 != key) {
-            held = Some((key, vt.and_then(|t| t.find(key).map(|ve| (ve, t.mask(ve))))));
+    for (key, cells, start) in touched {
+        let (ve, held) = vt.and_then(|t| t.find(key).map(|ve| (ve, t.mask(ve)))).unwrap_or((0, 0));
+        let fresh = cells & !held;
+        if fresh != 0 {
+            keys.push(key);
+            masks.push(fresh);
         }
-        match held.and_then(|h| h.1).filter(|h| h.1 >> c & 1 == 1) {
-            Some((ve, _)) => {
-                // No hull stored: it is FULL, and grows no more.
-                let Some(StateInfo { hull, layer }) = visited.info(region, ve, c as u32) else { continue };
-                let mut a = acc;
-                a.add_hull(&hull);
-                let h = a.hull().expect("a hull holds points");
-                if h != hull {
-                    grown.push(super::wave::Old { sk: Sk { region, key, local: c }, layer, hull: h, was: hull });
-                }
-            }
-            None => {
-                if keys.last() != Some(&key) {
-                    keys.push(key);
-                    masks.push(0);
-                }
-                *masks.last_mut().expect("pushed") |= 1u64 << c;
+        for (i, c) in super::layer::bits(cells).enumerate() {
+            let acc = accs[start as usize + i];
+            if held >> c & 1 == 0 {
                 hulls.push(acc.hull().ok_or_else(|| anyhow::anyhow!("r{region}: a touched state pushed nothing"))?);
+                continue;
+            }
+            // No hull stored: it is FULL, and grows no more.
+            let Some(StateInfo { hull, layer }) = visited.info(region, ve, c) else { continue };
+            let mut a = acc;
+            a.add_hull(&hull);
+            let h = a.hull().expect("a hull holds points");
+            if h != hull {
+                grown.push(super::wave::Old { sk: Sk { region, key, local: c as u8 }, layer, hull: h, was: hull });
             }
         }
     }

@@ -50,6 +50,15 @@ pub struct Old {
     pub was: Hull,
 }
 
+/// OLD states by layer: per layer (ascending; none without a state) its
+/// states, sorted.
+pub type ByLayer = Vec<(u16, Vec<Old>)>;
+
+/// The states of `by`.
+pub fn by_layer_states(by: &ByLayer) -> usize {
+    by.iter().map(|x| x.1.len()).sum()
+}
+
 /// A FRONTIER (module doc): the states whose hull grew at a frame - the
 /// NEW ones (first reached there: a layer, its skeletons, their hulls in
 /// its state order), expanded by the kernels, and the OLD ones (expanded
@@ -58,8 +67,7 @@ pub struct Old {
 pub struct Frontier {
     pub new: Layer,
     pub hulls: Vec<Hull>,
-    /// Sorted by (layer, state).
-    pub old: Vec<Old>,
+    pub old: ByLayer,
 }
 
 impl Frontier {
@@ -67,11 +75,15 @@ impl Frontier {
         self.new.is_empty() && self.old.is_empty()
     }
 
-    /// States held.
-    pub fn states(&self) -> u64 {
-        self.new.states() + self.old.len() as u64
+    /// Old states held.
+    pub fn old_states(&self) -> usize {
+        by_layer_states(&self.old)
     }
 
+    /// States held.
+    pub fn states(&self) -> u64 {
+        self.new.states() + self.old_states() as u64
+    }
 }
 
 /// One wave's output.
@@ -80,9 +92,8 @@ pub struct Wave {
     /// hulls in its state order.
     pub next: Layer,
     pub hulls: Vec<Hull>,
-    /// The states expanded before whose hull GREW (sorted by (layer,
-    /// state)).
-    pub grown: Vec<Old>,
+    /// The states expanded before whose hull GREW.
+    pub grown: ByLayer,
     /// The win states among the new ones: per entry of `next` (ascending)
     /// its win cells.
     pub wins: Vec<(u32, u64)>,
@@ -102,7 +113,7 @@ impl Wave {
     /// the wave's): the new ones in order, then the grown ones.
     pub fn frontier_states(&self, frame: u32) -> impl Iterator<Item = Grown> + '_ {
         let layer = u16::try_from(frame).expect("a frame past u16");
-        self.next.states_iter().zip(&self.hulls).map(move |(s, &h)| (s, layer, h)).chain(self.grown.iter().map(|o| (o.sk, o.layer, o.hull)))
+        self.next.states_iter().zip(&self.hulls).map(move |(s, &h)| (s, layer, h)).chain(self.grown.iter().flat_map(|x| &x.1).map(|o| (o.sk, o.layer, o.hull)))
     }
 }
 
@@ -121,11 +132,11 @@ fn unit_lanes(lanes: u64) -> usize {
 /// A unit: a run of whole entries of one shape of the frontier's new
 /// layer (at most `unit_lanes` + 63 states), and its first state's place
 /// in the layer's state order (its hulls'); or a RE-PUSH unit, a run of
-/// whole entries of the old states of one layer (`old` the run's place in
-/// the frontier's old states).
+/// whole entries of the old states of one layer (the frontier's `layer`th
+/// list, `old` the run's place in it).
 enum UnitSpec {
     Kernel { entries: std::ops::Range<usize>, state: usize, lanes: u32 },
-    Repush { old: std::ops::Range<usize> },
+    Repush { layer: usize, old: std::ops::Range<usize> },
 }
 
 impl UnitSpec {
@@ -133,7 +144,7 @@ impl UnitSpec {
     fn lanes(&self) -> usize {
         match self {
             UnitSpec::Kernel { lanes, .. } => *lanes as usize,
-            UnitSpec::Repush { old } => old.len(),
+            UnitSpec::Repush { old, .. } => old.len(),
         }
     }
 }
@@ -171,23 +182,21 @@ fn units_of(layer: &Layer, unit: usize) -> Vec<UnitSpec> {
 /// no kernel, so a unit takes more states than a kernel unit.
 const REPUSH_UNIT: usize = 1 << 14;
 
-/// Cut the old states (sorted by (layer, state)) into re-push units of one
-/// layer each, never cutting an entry.
-fn repush_units_of(old: &[Old]) -> Vec<UnitSpec> {
+/// Cut the old states into re-push units of one layer each, never cutting
+/// an entry.
+fn repush_units_of(by: &ByLayer) -> Vec<UnitSpec> {
     let mut out = Vec::new();
-    let mut a = 0usize;
-    while a < old.len() {
-        let layer = old[a].layer;
-        let mut b = a;
-        while b < old.len() && old[b].layer == layer && b - a < REPUSH_UNIT {
-            b += 1;
+    for (layer, (_, old)) in by.iter().enumerate() {
+        let mut a = 0usize;
+        while a < old.len() {
+            let mut b = (a + REPUSH_UNIT).min(old.len());
+            // Whole entries: the run's last entry's cells all in.
+            while b < old.len() && (old[b].sk.region, old[b].sk.key) == (old[b - 1].sk.region, old[b - 1].sk.key) {
+                b += 1;
+            }
+            out.push(UnitSpec::Repush { layer, old: a..b });
+            a = b;
         }
-        // Whole entries: the run's last entry's cells all in.
-        while b < old.len() && old[b].layer == layer && (old[b].sk.region, old[b].sk.key) == (old[b - 1].sk.region, old[b - 1].sk.key) {
-            b += 1;
-        }
-        out.push(UnitSpec::Repush { old: a..b });
-        a = b;
     }
     out
 }
@@ -345,8 +354,8 @@ pub fn run_wave(engine: &dyn FrameStep, front: &Frontier, cx: WaveCtx) -> Result
     let layer = &front.new;
     st.entries_in = layer.entries();
     st.lanes_in = layer.states() as usize;
-    st.old_in = front.old.len();
-    st.frontier_bytes = layer.alloc_bytes() + std::mem::size_of_val(front.hulls.as_slice()) + std::mem::size_of_val(front.old.as_slice());
+    st.old_in = front.old_states();
+    st.frontier_bytes = layer.alloc_bytes() + std::mem::size_of_val(front.hulls.as_slice()) + front.old_states() * std::mem::size_of::<Old>();
     st.rss_start = crate::metrics::current_rss_gb();
     let record = edges_dir.is_some();
     let mut units = units_of(layer, unit_lanes(st.lanes_in as u64));
@@ -464,9 +473,9 @@ pub fn run_wave(engine: &dyn FrameStep, front: &Frontier, cx: WaveCtx) -> Result
                                     }
                                     *out_blocks[u].lock().expect("an out block") = v;
                                 }
-                                UnitSpec::Repush { old } => {
+                                UnitSpec::Repush { layer, old } => {
                                     let tr = phases::start(s.diag.phases);
-                                    let n = run_repush(u as u32, &front.old[old.clone()], outs.expect("checked above"), sink, &mut rs)?;
+                                    let n = run_repush(u as u32, &front.old[*layer].1[old.clone()], outs.expect("checked above"), sink, &mut rs)?;
                                     repushed.fetch_add(n, Ordering::Relaxed);
                                     phases::add(phases::REPUSH, tr);
                                 }
@@ -683,31 +692,36 @@ pub fn run_wave(engine: &dyn FrameStep, front: &Frontier, cx: WaveCtx) -> Result
     drop(parts);
     ensure!(held == 0, "frame {frame}: {held} of the next layer's states the visited set held already");
     mark("absorb", &mut ends);
-    // The grown states by (layer, state): the routes' in region order, each
-    // sorted, put in layer order (stable: a counting sort).
-    let mut at = vec![0usize; frame as usize + 1];
-    for sl in &new {
-        for o in &sl.grown {
-            at[o.layer as usize] += 1;
-        }
-    }
-    let mut sum = 0;
-    for a in at.iter_mut() {
-        (*a, sum) = (sum, sum + *a);
-    }
-    let mut grown: Vec<Old> = vec![Old { sk: Sk::default(), layer: 0, hull: Hull::default(), was: Hull::default() }; sum];
+    // The grown states by layer, each layer's by state: every route's
+    // (sorted by state) put in layer order (stable), then per layer the
+    // routes' runs in region order - both in parallel.
+    let mut runs: Vec<Vec<Old>> = Vec::with_capacity(new.len());
     let mut next = Layer::default();
     let mut hulls: Vec<Hull> = Vec::with_capacity(new.iter().map(|sl| sl.hulls.len()).sum());
     for sl in new {
-        for o in sl.grown {
-            grown[at[o.layer as usize]] = o;
-            at[o.layer as usize] += 1;
-        }
+        runs.push(sl.grown);
         if !sl.table.is_empty() {
             next.set.push(sl.region, sl.table)?;
             hulls.extend(sl.hulls);
         }
     }
+    let runs: Vec<std::sync::Mutex<Vec<Old>>> = runs.into_iter().map(std::sync::Mutex::new).collect();
+    par_map(&runs, s.threads(), |r| r.lock().expect("a route's grown states").sort_by_key(|o| o.layer));
+    let runs: Vec<Vec<Old>> = runs.into_iter().map(|r| r.into_inner().expect("a route's grown states")).collect();
+    let mut count = vec![0usize; frame as usize + 1];
+    for o in runs.iter().flatten() {
+        count[o.layer as usize] += 1;
+    }
+    let layers: Vec<u16> = (0..=frame as u16).filter(|&l| count[l as usize] > 0).collect();
+    let grown: ByLayer = par_map(&layers, s.threads(), |&l| {
+        let mut v = Vec::with_capacity(count[l as usize]);
+        for r in &runs {
+            let (a, b) = (r.partition_point(|o| o.layer < l), r.partition_point(|o| o.layer <= l));
+            v.extend_from_slice(&r[a..b]);
+        }
+        (l, v)
+    });
+    drop(runs);
     let mut shapes_in: Vec<u32> = next.set.tables().iter().map(|(r, _)| r / GEOMETRY.slots).collect();
     shapes_in.dedup();
     for si in shapes_in {
@@ -739,7 +753,7 @@ pub fn run_wave(engine: &dyn FrameStep, front: &Frontier, cx: WaveCtx) -> Result
         segs.extend(r.segs.into_iter().map(|g| g.1));
     }
     st.lanes_kept = next.states() as usize;
-    st.grown = grown.len();
+    st.grown = by_layer_states(&grown);
     if let Some(dir) = edges_dir {
         xfers.flush(dir)?;
         let path = super::edges::file_path(dir, frame);

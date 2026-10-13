@@ -1163,7 +1163,7 @@ fn main() -> Result<()> {
                 st.frontier().new.entries(),
                 st.frontier().new.alloc_bytes() as f64 / 1e9,
                 st.frontier().new.alloc_bytes() as f64 / st.frontier().new.states().max(1) as f64,
-                st.frontier().old.len(),
+                st.frontier().old_states(),
                 st.visited_len(),
                 st.visited().entries(),
                 st.visited().alloc_bytes() as f64 / 1e9,
