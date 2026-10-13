@@ -431,6 +431,15 @@ enum Command {
         /// reference into thousands of paths).
         #[arg(long)]
         path_cap: Option<usize>,
+        /// A tree too big to load a frame's records whole: per frame, this
+        /// many SOURCES (evenly spaced over the states first reached the
+        /// frame before, those in `--source-rect` if given) and all their
+        /// out-records; `--samples` of those checked. 0: every record.
+        #[arg(long, default_value_t = 0)]
+        sources: usize,
+        /// "x0..x1,y0..y1": only sources whose player cell is inside.
+        #[arg(long, allow_hyphen_values = true)]
+        source_rect: Option<String>,
     },
     /// DIAGNOSTIC: how coarse a level could be. Per frame, the distinct
     /// states of a tree with the named cells (`inspect::cell_names`) whose
@@ -1464,7 +1473,7 @@ fn main() -> Result<()> {
                 states_in[3]
             );
         }
-        Command::ArcCheck { level_dir, from, to, samples, level, fault, path_cap } => {
+        Command::ArcCheck { level_dir, from, to, samples, level, fault, path_cap, sources, source_rect } => {
             use celeste_engine::runtime2::{Col, AV};
             use celeste_rust::search::arcs::{point, Rect, Rects, Set, CIRCLE};
             let dir = std::path::Path::new(&level_dir);
@@ -1648,15 +1657,46 @@ fn main() -> Result<()> {
             let mut kinds = std::collections::BTreeMap::<String, u64>::new();
             let t0 = std::time::Instant::now();
             let workers = cfg.threads();
+            let rect = source_rect
+                .as_deref()
+                .map(|r| -> Result<((i32, i32), (i32, i32))> {
+                    let (x, y) = r.split_once(',').ok_or_else(|| anyhow::anyhow!("--source-rect x0..x1,y0..y1"))?;
+                    let range = |t: &str| -> Result<(i32, i32)> {
+                        let (a, b) = t.split_once("..").ok_or_else(|| anyhow::anyhow!("--source-rect x0..x1,y0..y1"))?;
+                        Ok((a.trim().parse()?, b.trim().parse()?))
+                    };
+                    Ok((range(x)?, range(y)?))
+                })
+                .transpose()?;
+            let geo = celeste_rust::storage::GEOMETRY;
             for frame in from..=to {
-                let all = graph.edges_at(frame, cfg.threads())?;
-                let missing = all.iter().filter(|e| graph.pair(e.xfer).is_none()).count() as u64;
+                let mut missing = 0u64;
+                let recs: Vec<Rec> = if sources == 0 {
+                    let all = graph.edges_at(frame, cfg.threads())?;
+                    missing = all.iter().filter(|e| graph.pair(e.xfer).is_none()).count() as u64;
+                    all.iter()
+                        .filter_map(|e| graph.pair(e.xfer).map(|p| (e, p)))
+                        .map(|(e, p)| Ok(Rec { target: e.dst, src: e.src, x: corrupt(p.0.transfer())?, y: p.1.transfer() }))
+                        .collect::<Result<_>>()?
+                } else {
+                    // Sources from the layer before (their out-records are
+                    // this frame's), evenly spaced; all their out-records.
+                    let (layer, _) = tree.layer(frame - 1, None, cfg.threads())?;
+                    let inside = |s: &Sk| rect.is_none_or(|((x0, x1), (y0, y1))| celeste_rust::search::pos_graph::cell_xy(s.cell(&geo)).is_some_and(|(x, y)| (x0..=x1).contains(&x) && (y0..=y1).contains(&y)));
+                    let all: Vec<Sk> = layer.states_iter().filter(inside).collect();
+                    let stride = (all.len() / sources).max(1);
+                    let srcs: Vec<Sk> = all.iter().step_by(stride).take(sources).copied().collect();
+                    let mut out = Vec::new();
+                    for (k, dst, x) in celeste_rust::search::arc_dp::out_edges(&graph, frame, &srcs, cfg.threads())? {
+                        match graph.pair(x) {
+                            Some(p) => out.push(Rec { target: dst, src: srcs[k], x: corrupt(p.0.transfer())?, y: p.1.transfer() }),
+                            None => missing += 1,
+                        }
+                    }
+                    out.sort_by_key(|r| (r.src, r.target));
+                    out
+                };
                 missing_total += missing;
-                let recs: Vec<Rec> = all
-                    .iter()
-                    .filter_map(|e| graph.pair(e.xfer).map(|p| (e, p)))
-                    .map(|(e, p)| Ok(Rec { target: e.dst, src: e.src, x: corrupt(p.0.transfer())?, y: p.1.transfer() }))
-                    .collect::<Result<_>>()?;
                 records_total += recs.len() as u64;
                 for r in &recs {
                     for (axis, t) in [("x", &r.x), ("y", &r.y)] {
