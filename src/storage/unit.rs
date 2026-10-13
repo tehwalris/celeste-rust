@@ -228,8 +228,10 @@ pub struct UnitSink<'a> {
     /// its offset) is a lane's by its rank in its entry's cells.
     src_first: Vec<u32>,
     entry_next: Vec<(u32, u32, u64, u32)>,
-    /// A route's pushes being merged (`pushes`): `(target << 6 | cell, hull)`.
-    push_buf: Vec<(u32, HullAcc)>,
+    /// A route's pushes being merged (`pushes`): per target cell reached a
+    /// slot (the targets' cells in order), and each target's first slot.
+    push_slots: Vec<HullAcc>,
+    push_offs: Vec<u32>,
     /// Pushes by (hull, local transfer id): ids are this worker's for the
     /// frame.
     push_cache: crate::search::hull::PushCache,
@@ -335,7 +337,8 @@ impl<'a> UnitSink<'a> {
             src_idx: Default::default(),
             src_first: Vec::new(),
             entry_next: Vec::new(),
-            push_buf: Vec::new(),
+            push_slots: Vec::new(),
+            push_offs: Vec::new(),
             push_cache: Default::default(),
             route_ids: FxHashMap::default(),
             route_slot: FxHashMap::default(),
@@ -381,7 +384,7 @@ impl<'a> UnitSink<'a> {
     pub fn alloc_bytes(&self) -> [usize; 4] {
         [
             self.bundles.alloc_bytes(),
-            std::mem::size_of::<Hull>() * self.hulls.capacity() + 4 * self.src_first.capacity() + 20 * self.entry_next.capacity() + std::mem::size_of::<(u32, HullAcc)>() * self.push_buf.capacity(),
+            std::mem::size_of::<Hull>() * self.hulls.capacity() + 4 * self.src_first.capacity() + 20 * self.entry_next.capacity() + std::mem::size_of::<HullAcc>() * self.push_slots.capacity() + 4 * self.push_offs.capacity(),
             9 * self.pos_edges.capacity() + 8 * self.pos_recent.capacity(),
             24 * (self.srcs.capacity() + self.unit_sources.capacity())
                 + 4 * self.src_local.capacity()
@@ -910,44 +913,59 @@ impl<'a> UnitSink<'a> {
     #[inline(never)]
     fn pushes(&mut self, slot: u32, targets: &[(Key, u64)], bundles: &[super::route::Ub]) -> Vec<(u32, u8, HullAcc)> {
         let geo = super::GEOMETRY;
-        let mut buf = std::mem::take(&mut self.push_buf);
-        buf.clear();
+        // A slot per target cell reached (a bundle's cells are its target's).
+        let (mut slots, mut offs) = (std::mem::take(&mut self.push_slots), std::mem::take(&mut self.push_offs));
+        offs.clear();
+        let mut n = 0u32;
+        for &(_, m) in targets {
+            offs.push(n);
+            n += m.count_ones();
+        }
+        slots.clear();
+        slots.resize(n as usize, HullAcc::EMPTY);
         for b in bundles {
-            debug_assert!((b.t as usize) < targets.len() && b.t < 1 << 26);
+            let (off, tm) = (offs[b.t as usize], targets[b.t as usize].1);
+            debug_assert_eq!(b.mask & !tm, 0, "a bundle's cells outside its target's");
             let mut m = b.mask;
             while m != 0 {
                 let c = m.trailing_zeros();
                 m &= m - 1;
-                let one = if b.x == NO_XFER {
+                let at = (off + (tm & ((1u64 << c) - 1)).count_ones()) as usize;
+                if b.x == NO_XFER {
+                    slots[at].add_hull(&Hull::full());
+                    continue;
+                }
+                let h = self.src_hull(b.s, super::bundle::source_cell(geo.cell(slot, c), b.o));
+                let (tx, ty) = self.xfer_pairs[b.x as usize];
+                let pushed = self.push_cache.get(&h, &h, b.x, || {
                     let mut a = HullAcc::EMPTY;
-                    a.add_hull(&Hull::full());
-                    a
-                } else {
-                    let h = self.src_hull(b.s, super::bundle::source_cell(geo.cell(slot, c), b.o));
-                    let (tx, ty) = self.xfer_pairs[b.x as usize];
-                    let pushed = self.push_cache.get(&h, &h, b.x, || {
-                        let mut a = HullAcc::EMPTY;
-                        h.push(tx, ty, &mut a).then_some(a)
-                    });
-                    match pushed {
-                        Some(a) => a,
-                        None => continue,
-                    }
-                };
-                buf.push((b.t << 6 | c, one));
+                    h.push(tx, ty, &mut a).then_some(a)
+                });
+                if let Some(a) = pushed {
+                    slots[at].merge(&a);
+                }
             }
         }
-        buf.sort_unstable_by_key(|x| x.0);
-        let mut out: Vec<(u32, u8, HullAcc)> = Vec::with_capacity(buf.len() / 2);
-        for &(k, a) in &buf {
-            match out.last_mut() {
-                Some(l) if (l.0, l.1) == (k >> 6, (k & 63) as u8) => l.2.merge(&a),
-                _ => out.push((k >> 6, (k & 63) as u8, a)),
+        let mut out: Vec<(u32, u8, HullAcc)> = Vec::with_capacity(n as usize);
+        let mut at = 0usize;
+        for (t, &(_, m)) in targets.iter().enumerate() {
+            let mut c = m;
+            while c != 0 {
+                let k = c.trailing_zeros();
+                c &= c - 1;
+                if !slots[at].is_empty() {
+                    out.push((t as u32, k as u8, slots[at]));
+                }
+                at += 1;
             }
         }
-        self.push_buf = buf;
+        if slots.capacity() > 1 << 20 {
+            (slots, offs) = (Vec::new(), Vec::new());
+        }
+        (self.push_slots, self.push_offs) = (slots, offs);
         out
     }
+
 
     /// The unit is over: its rows checked, its last verdicts decided (a
     /// disallowed target's records go), its buckets the chunks of their

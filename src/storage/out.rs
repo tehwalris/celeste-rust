@@ -193,7 +193,26 @@ pub const BLOCK_ROWS: usize = 1 << 11;
 /// with the routes, pairs and targets it uses (`encode_parts` each);
 /// whether a target key is provisional, per block.
 pub fn encode_blocks(p: &mut Parts) -> Vec<(Vec<u8>, bool)> {
-    p.rows.sort_unstable_by_key(|r| r.0);
+    // By entry (a counting sort: a unit's entries are few), then each
+    // entry's rows by key.
+    let mut at = vec![0usize; p.entries.len() + 1];
+    for r in &p.rows {
+        at[(r.0 >> 96) as usize + 1] += 1;
+    }
+    for e in 1..at.len() {
+        at[e] += at[e - 1];
+    }
+    let mut fill = at.clone();
+    let mut by = vec![(0u128, 0u64); p.rows.len()];
+    for &r in &p.rows {
+        let e = (r.0 >> 96) as usize;
+        by[fill[e]] = r;
+        fill[e] += 1;
+    }
+    for e in 0..p.entries.len() {
+        by[at[e]..at[e + 1]].sort_unstable_by_key(|r| r.0);
+    }
+    p.rows = by;
     let mut out = Vec::new();
     let mut i = 0usize;
     let (mut t_new, mut x_new) = (vec![u32::MAX; p.targets.len()], vec![u32::MAX; p.pairs.len()]);
@@ -510,6 +529,11 @@ impl OutFile {
         let a = self.heads.partition_point(|h| h.last < lo);
         let b = self.heads.partition_point(|h| h.first <= hi);
         a..b.max(a)
+    }
+
+    /// Block `i`'s first and last entry.
+    pub fn range(&self, i: usize) -> ((u32, Key), (u32, Key)) {
+        (self.heads[i].first, self.heads[i].last)
     }
 
     /// Block `i`'s raw bytes into `out`.

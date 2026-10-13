@@ -887,6 +887,12 @@ fn run_repush(u: u32, old: &[Old], outs: &super::out::OutStore, sink: &mut UnitS
     // The entry being read: its first old state, and its old cells.
     let entry = Cell::new((0usize, 0u64));
     for bi in file.blocks(lo, hi) {
+        // A block none of the unit's states is in is not read.
+        let (bf, bl) = file.range(bi);
+        let k = old.partition_point(|o| (o.sk.region, o.sk.key) < bf);
+        if old.get(k).is_none_or(|o| (o.sk.region, o.sk.key) > bl) {
+            continue;
+        }
         file.block(bi, dec, &mut sc.raw)?;
         let blk = super::out::Block::open(&sc.raw)?;
         let routes: Vec<u32> = blk.routes.iter().map(|&(shape, slot)| sink.route(shape, slot)).collect();

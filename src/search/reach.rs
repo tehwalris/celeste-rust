@@ -219,12 +219,23 @@ pub fn reach(dir: &std::path::Path, horizon: u32, point: (u32, u32), threads: us
             layers.push(tree.layer(layers.len() as u32, None, threads)?.0);
         }
         let mut by_layer: Vec<Vec<Sk>> = vec![Vec::new(); t as usize + 1];
+        let mut outside = 0u64;
         for (s, _) in &cur {
             if wins.binary_search(s).is_ok() || out.contains_key(s) {
                 continue;
             }
-            let f = (0..=t as usize).rev().find(|&f| layers[f].contains(*s)).ok_or_else(|| anyhow::anyhow!("f{t}: reached state {} is in no layer", s.show()))?;
-            by_layer[f].push(*s);
+            match (0..=t as usize).rev().find(|&f| layers[f].contains(*s)) {
+                Some(f) => by_layer[f].push(*s),
+                // The hull forward keeps every state an exact remainder
+                // reaches (its hulls hold the exact sets), so a state outside
+                // the tree is reached only by a COARSENED set (a superset):
+                // it has no edges, and nothing exact reaches it.
+                None if inexact.contains_key(s) => outside += 1,
+                None => anyhow::bail!("f{t}: state {} is reached with an EXACT remainder set but is in no layer of the tree: the hull forward lost it", s.show()),
+            }
+        }
+        if outside > 0 {
+            eprintln!("[reach] f{t:03}: {outside} states reached by coarsened sets only, outside the tree (left)");
         }
         for (f, ids) in by_layer.iter().enumerate() {
             for batch in ids.chunks(BATCH) {
