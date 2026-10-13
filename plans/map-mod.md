@@ -585,3 +585,11 @@ itself on the strip and falls 2-3 px short.
   and `--prefer` the old forward's f157 witness gives OPTIMAL 157 (as
   cross160 did), in 116 s. The known route survives every pruning step:
   157 states, the node and W at every frame boundary, level -1.
+- 04:45 The hull tree's exact reach, rerun: the hull agent's build (1024
+  segments, first arrival on) reached f175 at 61 GB, growing 3.5 GB a
+  frame, and would not fit to f223. Nothing was right of the strip at
+  ceiling height through f175. `reach --max-segs N` and opt-in
+  `--first-arrival` are now on exact-reach, merged locally into hull-mod
+  as `hull-mod-reach` (the hull tree is format 16, which develop does not
+  read). Rerun with --max-segs 128: f130 in 20 s at a fraction of the
+  memory.
