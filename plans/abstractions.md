@@ -158,6 +158,19 @@ tree's `rnd` interval, the `rnd` caveat's).
 - **Refuted by**: nothing needs to: the transfer of every recorded edge
   (`search::arc_edges`, plans/architecture.md "Arcs") says EXACTLY what the
   frame did to it, and the backward over them is exact in the remainder.
+- **The forward's HULL** (2026-10-13, plans/architecture.md "The hull
+  forward"): the forward no longer takes every state at every remainder; it
+  keeps per state the box of two arcs holding every remainder it has been
+  reached with (from the start's exact one, pushed along the recorded
+  edges' exact transfers; a merge that is never smaller than the union).
+  A widening of the REACHED remainders - a box holds points no path brings
+  - and sound for the same reason: it contains them. It decides only which
+  states the tree holds, how early and which are expanded; the arcs, exact
+  over the recorded edges, and the concrete search inside their winning
+  sets refute what it over-admits, as they refute the whole-circle
+  widening it replaces (its special case: every hull full, `hull::WIDEN`).
+  A test holds it between the exact reach and the old forward
+  (`frame::tests::the_hull_forward_lies_between_the_exact_reach_and_the_widened_forward`).
 - **History**: until 2026-10-05 the remainder was refined by rungs
   (`RemPrecision::Bits(1..=15)`, then exact), which DRIFTED: a move that
   straddles a bucket edge emits a sliver row the boundary widens to the whole

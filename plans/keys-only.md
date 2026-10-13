@@ -11,6 +11,9 @@ frontier being expanded and the next layer being built: the mod room's
 
 The running log was `PROGRESS.md` at the worktree root (not committed).
 
+(2026-10-13: the hull forward - plans/architecture.md - removed the raise
+and the drop notes this doc describes; frames now come with hull files.)
+
 ## The design
 
 **ONE STATE SET, used three times** (`storage::set`, 2026-10-12; Philippe:

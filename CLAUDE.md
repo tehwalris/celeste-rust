@@ -7,10 +7,11 @@ optimal per-room TASes. It traces the cart's Lua into a graph IR, assembles
 that into branch-free AVX-512 kernels at startup, and searches in three
 steps (`rewrite search`, plans/architecture.md "The search"):
 
-1. a level-0 FORWARD over columnar blocks of abstract states (the player's
-   sub-pixel remainder widened to the whole pixel, optionally the room's
-   objects too), recording every edge WITH what the frame did to the
-   remainder (its transfer);
+1. a level-0 FORWARD over columnar blocks of abstract states (optionally the
+   room's objects widened), each state with a HULL of the sub-pixel
+   remainders it is reached with (a box of arcs, pushed along the edges:
+   plans/architecture.md "The hull forward"), recording every edge WITH
+   what the frame did to the remainder (its transfer);
 2. a BACKWARD over the rotation graph ("arcs"): per node the exact set of
    remainders that still win by the horizon. Its optimum is exact in the
    remainder and a lower bound on the game's (no win refutes the horizon);
@@ -40,9 +41,9 @@ cleanup toward ~10k is in progress.
   what it widens, why it is sound, what refutes it, its status. Generated
   from the widening table (`celeste_engine::widening::TABLE`, interpreted
   by the tracer and by `Rt2::widen_to`; plans/widen-table.md).
-- `plans/keys-only.md` (a state is its key: the frontier, the frame files
-  and the drop notes are per-region (key, cell mask) entries; rows are
-  decoded per unit right before the kernels), `plans/storage-v2.md` (the
+- `plans/keys-only.md` (a state is its key: the frontier and the frame
+  files are per-region (key, cell mask) entries; rows are decoded per unit
+  right before the kernels), `plans/storage-v2.md` (the
   visited set), `plans/edges-target.md` (the edge files: ID-free bundles in
   their target regions; the routed forward) and `plans/exact-keys.md` (a
   state's key is its packed field codes, not a hash).
@@ -55,7 +56,9 @@ cleanup toward ~10k is in progress.
   each. Check it before proposing something that sounds familiar.
 - `plans/level-minus-one.md` - the cost-to-go filter.
 - `src/frame.rs` (~2.3k lines: the block, the frame step, the forward),
-  `src/storage/` (the wave, its units, the visited set, the edge files) and
+  `src/search/hull.rs` (a state's remainder hull and its push),
+  `src/storage/` (the wave, its units and re-pushes, the visited set, the
+  edge, out-edge and hull files) and
   `src/search/` (checkpoint, edges, arcs, arc_dp, known: the search).
 - `BENCHMARK_DATA.md` - dated measurements, newest first; partly stale (see
   its first line).

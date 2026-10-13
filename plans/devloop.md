@@ -95,25 +95,32 @@ up to 2x.)
 
 Every frame step checks the frame twice over: `bench-frame` runs `--reps`
 times and refuses a rep whose lines differ (determinism), and the lines
-are `ckhash --edges`'s for the frame, so they equal the real tree's
-(checked: room (1,0) f44 and f56, and the reference frame f57).
+are `ckhash --edges --hulls`'s for the frame (`f`, `h`, `e`), so they equal
+the real tree's (checked: room (1,0) f44 and f56, and the reference frame
+f57). Under the hull forward (2026-10-13) the fixture frames are smaller
+than they were: r10 f55 -> f56 has 85k new and 125k grown states in, 2.2M
+emissions and 2.5M edges re-pushed (14.5M edges before); the steps' times
+above are from before.
 
 ### t2: short end to end (< 2 min)
 
 | step | protects | time |
 |---|---|---|
-| gate10-forward | `forward --to 44`, posgraph and ckhash against gates/ (CLAUDE.md's oracles 1-2) | 2.8 s |
+| gate10-forward | `forward --to 44`, posgraph and `ckhash --hulls` against gates/ (CLAUDE.md's oracles 1-2) | 2.8 s |
 | gate10-arc | `search --to 35 --win-at 9,101 --prefer` (oracle 3 and the known route) | 1.8 s |
 | search42-objects | room (4,2) `r0sxhn,r0sxh` (the objects ladder) to f50 at a synthetic win (32,56): arc bounds 47/47, concrete optimum 47; its witness as the known route; every `[gate]` line pinned | 5.0 s |
 | export-ui | `rewrite export-ui` of gate10-arc's and search42's searches with their marks (`--save-marks`): every binary file and run.json without its timings, pinned by digest (`gates/fixtures/export-ui.sha256`; pinned 2026-10-12 from the in-memory export, which the streamed one reproduces byte for byte, as it does the mod room's balloon run) | 0.2 s |
-| forward60-platforms | room (6,0) `r0sxhfp` split frame to step 71: `ckhash --edges` = the r60s fixture's pin | 25.5 s (the platform kernels' walk ~20 s) |
+| forward60-platforms | room (6,0) `r0sxhfp` split frame to step 71: `ckhash --edges --hulls` = the r60s fixture's pin | 25.5 s (the platform kernels' walk ~20 s) |
 | frame-r60s | one platform frame (step 70 -> 71) and its exact metrics: 49,469 kernel instructions a slice | 25.0 s (the same walk again) |
 | widen-r60s | `widen-check` of r60s steps 70 and 71 (stored rows): the widening table's two sides at `hfp`, at a boundary and mid-frame | ~2 s |
 
 ### big: the reference frame
 
-Room (6,2) 100% (`--hundred --loading-jank 2
---level-minus-one 94,5`) r0sxhf f56 -> f57: 5,857,035 lanes in,
+Under the hull forward (2026-10-13): 704,524 new and 1,206,211 grown states
+in, 18,601,288 emissions and 27,056,166 edges re-pushed, 800,821 new
+states; 258,065,198 dynamic kernel instructions over 44,239 slices;
+frame-r62h57 5.5 s (the wave 0.28 s), storage-r62h57 1.9 s. Before
+(the remainder-free forward), r0sxhf f56 -> f57: 5,857,035 lanes in,
 6,735,699 new states, 257,724,013 edges, 2,660,121,881 dynamic kernel
 instructions over 366,186 slices (7,264 a slice: plans/kernel-opt-decisions.md
 measured 2.660G and 7,264). frame-r62h57 8.2-11.1 s (kernels 4.1 s, the f56
@@ -129,10 +136,9 @@ Not part of any tier: run them when their reason applies.
 - the two `#[ignore]`d tests (`--run-ignored all`) and the full arc-check of
   the gate tree, after touching the tracer, lowering, codegen, edge
   recording, resume or level -1;
-- `gates/raise.sh` after touching the forward's filters, the notes or the
-  edge files;
-- 3 against 32 threads and a resume, identical (`ckhash --edges`), after
-  touching the wave's scheduling;
+- 3 against 32 threads and a resume, identical (every frame, hull, edge
+  and out file, byte for byte), after touching the wave's scheduling, the
+  hulls, the out store or resume;
 - a full search with `--ceiling` and `--prefer` (the category runner) before
   a result is claimed.
 
@@ -141,8 +147,8 @@ Not part of any tier: run them when their reason applies.
 `tools/fixtures.sh ensure|build|pin|list NAME...` (`all`, `big`). Trees under
 `/var/tmp/celeste-fixtures` (`CELESTE_FIXTURES`), never committed; each
 built by a pinned command and checked against its pinned fingerprint
-(`gates/fixtures/NAME.ckhash`: `ckhash --edges`, and `--dropped` under level
--1, through its last frame). A manifest records the spec, the file formats,
+(`gates/fixtures/NAME.ckhash`: `ckhash --edges --hulls` through its last
+frame). A manifest records the spec, the file formats,
 the transfer table's order and the sources. `ensure` rebuilds a fixture
 whose spec, file formats or table order changed (loudly: `STALE fixture ...
 REBUILDING`); one built from other sources is reported, not rebuilt: a
@@ -190,7 +196,8 @@ visited states), 0.20 s (r62h57 f56, 37M; 0.62 s at format 14).
   [--threads T] [--metrics FILE]`: the forward as it stood after frame F
   (`ForwardState::at`: visited set, transfers, level -1 filter, pos graph;
   later frames ignored), the wave of F+1 run `--reps` times from copies.
-  stdout: `f{F+1}` and `e{F+1}` lines (`ckhash --edges`'s); stderr per rep:
+  stdout: `f{F+1}`, `h{F+1}` and `e{F+1}` lines (`ckhash --edges
+  --hulls`'s); stderr per rep:
   the wave (with the region jobs' worker time inside it) and the frame
   end's walls, the workers' phases (`[phases]`: pack, kernel, emit, unit
   end, regions, frame end), `kernel lanes: traced N missed 0` (a miss is

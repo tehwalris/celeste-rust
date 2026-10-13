@@ -68,13 +68,12 @@ makes it sound where the probe only counted:
 - **H bounds the horizon, and a tree remembers it**: a search refuses
   `--to` past H, and a tree is extended under the filter it was built
   under (`<level>/level_minus_one.txt`), whatever the environment says.
-  For a LARGER horizon the level-0 tree is RAISED, not rebuilt: every frame
-  noted the sources of its drops with `f + d` (`CostToGo::admitted_from`),
-  so a raise to H' re-expands just the sources with `f + d <= H'` and what
-  they add, frame by frame, and ends as exactly the tree a fresh run at H'
-  makes (plans/architecture.md, "Raising the horizon"). Count-ups (`--to H`,
-  H+1, ...) with `--level-minus-one` = each horizon pay the forward
-  once.
+  For a LARGER horizon the tree is built again: since the hull forward
+  (2026-10-13) level -1 drops PUSHES, and a dropped push leaves a hull
+  smaller and a state later or unreached, so a tree's frames depend on H
+  throughout (plans/architecture.md "The hull forward"). The raise that
+  re-expanded the noted sources of the drops (2026-10-08 to 2026-10-13)
+  served the remainder-free forward only.
 
 The table is horizon-independent: one per room.
 

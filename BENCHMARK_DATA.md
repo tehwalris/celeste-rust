@@ -1,5 +1,38 @@
 > STALE in parts: dated sections, newest first, each measured on the code of its date (before 2026-08-31: the deleted pre-rebuild search; plans/ links may name merged or deleted docs, see plans/architecture.md "Where the old plans went") - re-measure before relying on a number.
 
+# The hull forward, 2026-10-13 (branch `hull-forward`)
+
+The forward keeps per state a hull of the remainders it is reached with
+(plans/architecture.md "The hull forward") instead of widening every
+state's remainder to the whole circle. Release, 16 threads, `rewrite
+search` with `--prefer` the known route, the hull build (`edd643c`'s code)
+and develop `26de6cd` back to back, warm level -1 caches, under another
+search's load (load 20-45; the same pair's wall clocks moved up to 2x from
+run to run, the instruction counts by <1%). `perf stat -e instructions`.
+
+| search | build | wall | CPU | instructions | peak RSS | tree | forward | backward | states expanded (re-pushed) | optimum |
+|---|---|---|---|---|---|---|---|---|---|---|
+| (4,2) 2100m `--level r0sxhn --level-minus-one 71,5 --ceiling 71` | hull | 3.5 s | 28 s | 0.23 T | 0.87 GB | 20 MB | 2.9 s | 0.07 s | 0.6M (0.9M) | 71 |
+| | develop | 4.8 s | 44 s | 0.40 T | 0.91 GB | 29 MB | 3.6 s | 0.73 s | 6.6M | 71 |
+| (6,2) 100% `--level r0sxhf,r0sxh --level-minus-one 94,5 --ceiling 94` | hull | 62.9 s | 422 s | 2.91 T | 3.36 GB | 0.84 GB | 48.8 + 10.9 s | 0.57 + 0.46 s | 30.6M (44.9M) | 93 |
+| | develop | 112.9 s | 1110 s | 9.75 T | 4.33 GB | 1.85 GB | 96.4 + 10.9 s | 2.31 + 0.51 s | 315.1M | 93 |
+| (1,0) 200m `--ceiling 99` | hull | 80.3 s | 782 s | 5.86 T | 4.30 GB | 1.39 GB | 79.7 s | 0.16 s | 65.8M (94.5M) | 99 |
+| | develop | 45.3 s | 612 s | 6.25 T | 2.26 GB | 0.60 GB | 42.9 s | 1.88 s | 205.8M | 99 |
+
+Room (1,0)'s walls over four pairs with this code: hull 53.5, 48.5, 54.2,
+80.3 s; develop 58.5, 44.4, 82.7, 45.3 s (the 80.3 s run: 95 s system
+time and 147k involuntary context switches against develop's 34 s and
+15k: another job's peak). Its forward's frame at f80 (bench-frame, the
+`r10t` tree): 191 G instructions a frame on this code's predecessor
+`46e861e` against develop's 164 G; 221.6 G before the grid shift and the
+per-target runs (`46e861e`), the frame's end 130 ms against develop's 40
+(seal 33, absorb 35, layer 30, wins 15, files 15 ms, from 280 ms before
+`eca152c`). Room (1,0)'s hulls end wide (72% of the states full in x,
+60% in y; 2.4 hull settings a state), so its frontier holds as many states
+as the old forward's; the rooms where hulls stay narrow gain most.
+Memory: the visited set's hulls 0.58 GB at f99 (31M of 68M states stored,
+10 B each; 0.87 GB before `ae852b0`).
+
 # The UI export streamed, 2026-10-12 (branch `ui-export-stream`)
 
 `rewrite export-ui` of the mod room's balloon run (`/var/tmp/mod-ck/bal200`:

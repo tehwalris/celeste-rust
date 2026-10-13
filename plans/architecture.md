@@ -63,15 +63,19 @@ crates/celeste-names     FROZEN name tables (FIELD_NAMES order = canonical      
 crates/celeste-engine    Rt2 block model, boundary/keys, lane primitives        deps: core, names
 .  (celeste-rust)        everything else                                         deps: all
   src/frame.rs           Block, FrameStep, ForwardState (start, resume,
-                         extend, raise), MarkFilter, the frame files
+                         extend), MarkFilter, the frame files
   src/storage/           THE STORAGE (plans/storage-v2.md, plans/edges-target.md):
-                         visited (posmask region tables), unit (UnitSink: the
-                         kernels' emissions into bundles), route (the region
-                         phase), wave (the frame's pipeline and end), bundle
+                         visited (region tables, every state's layer and
+                         hull), unit (UnitSink: the kernels' emissions into
+                         bundles and pushes), route (the region phase), wave
+                         (the frame's pipeline, re-pushes and end), bundle
                          and edges (the edge files, transfers, EdgeStore),
-                         layer (the frontier, frame files, drop notes and
-                         the tree reader: states as keys), decode, bench (the
+                         out (the out-edges, by source), hulls (the hull
+                         files), layer (the frontier, frame files and the
+                         tree reader: states as keys), decode, bench (the
                          capture and `bench-storage`)
+  src/search/hull.rs     a state's remainder HULL, its push, the order-free
+                         merge (`HullAcc`)
   src/search/            checkpoint, arc_edges (the transfer decode), arcs
                          (remainder sets, their arena), arc_dp (THE SEARCH:
                          the backward push, optimum, reach, concrete search),
@@ -385,6 +389,111 @@ declines. The checks the ranges do not fold: `spd +- dash_accel` in
 is stored `max(v, 0)`, the others decrement under `> 0`, which no range
 analysis reads); interval `+ k` as compares saved 0.4% in (4,2).
 
+## The hull forward (2026-10-13, branch `hull-forward`)
+
+The forward used to widen every state's sub-pixel remainder to the whole
+circle (the table's "player remainder"): a state reached at all was
+expanded with every remainder, and every successor any remainder allows
+was kept. It now keeps per state a REMAINDER HULL - the remainders it has
+been reached with so far, over-approximated per axis by one ARC of the
+circle (`search::hull::Hull`, 8 B: the box of two arcs) - and pushes it
+along the recorded edges through their exact transfers.
+
+- **The start** is the start's exact remainder (a point).
+- **A push** along an edge (`Hull::push`): per axis the arc's points inside
+  the transfer's guard, moved by its action (a rotation, or the collision's
+  constant); nothing when either axis misses (a box's image is empty with
+  either side empty). A target ACCUMULATES its pushes in a frame
+  order-free (`HullAcc`): per axis two CHARTS - the circle cut at 0 and at
+  1/2 - each a linear `[lo, hi]` merged by min and max (commutative,
+  associative: region jobs run in any order); the arc is the shorter
+  chart's. That is the exact hull of the union whenever the union fits in
+  half the circle, and a superset of it otherwise (always one of the
+  union).
+- **The frontier** of frame t is every state whose hull GREW at t: the NEW
+  ones (first reached at t: frame t's layer, its frame file) and the GROWN
+  ones (reached before; `wave::Frontier::old`, per layer). The new ones run
+  the kernels once - the only time a state is ever expanded - and their
+  edges are recorded at t + 1 as before; the pushes go with the emissions
+  (`UnitSink::pushes`). A grown one runs no kernel: its RE-PUSH
+  (`wave::run_repush`) reads its out-edges (the OUT STORE, below) and pushes
+  its grown hull along each edge whose image grows past the image of the
+  hull it last pushed (`Hull::push_grown`: an axis it rotates meets more of
+  the guard, or the box was empty and is not) - an image dropped then (by
+  level -1 or the ladder's filter) is dropped at every later frame too, so
+  the skip loses nothing.
+- **Level -1 acts at every push**, emitted or re-pushed: a push into a
+  target at frame t + 1 is dropped where `t + 1 + d(target) > H`.
+- **The frame's end** (`route::seal`): per touched state, its new hull from
+  its pushes and its hull so far; a state the visited set lacks is NEW
+  (layer t + 1), one whose hull grew is GROWN (the next frontier), the rest
+  nothing. A full hull is not stored (`visited::RegionInfos`: 10 B a state
+  otherwise) and grows no more. The objects ladder's filter is applied to
+  the new and grown states.
+
+**Sound** (every concrete winner stays): by induction over frames, a
+concrete path from the start that is at state p with remainder r at
+frame t finds p in the tree with layer <= t and r in its hull. p's
+successor q under the path's input is a recorded edge of p (p was
+expanded at its layer; the successors of a state do not depend on the
+frame), and r is in the edge's guard with the action taking it to q's
+remainder (the transfers are exact: `arc-check`). r entered p's hull at
+some frame t' <= t; at t' + 1 that hull was pushed along the edge (or its
+image had been pushed earlier, unchanged), so q holds the image, with
+layer <= t' + 1 <= t + 1. Level -1 drops only targets that cannot exit by
+H from that frame or any later one (d is a lower bound and the frame only
+grows), and the mark filter only nodes the coarser level proves losing;
+the merge only adds. An edge level -1 dropped at its source's EMISSION
+(frame L + 1, the earliest that source can move) is useless at every frame
+the source can be at. The forward with every hull widened to the whole
+circle is exactly the old one (`hull::WIDEN`, test-only: it reproduces the
+old gate, `gates/ckhash_room10_f000-044_widened.txt`), and the hull
+forward holds a SUBSET of its states, each in a layer no earlier, and
+every state the exact-remainder reach reaches with its remainders
+(`the_hull_forward_lies_between_the_exact_reach_and_the_widened_forward`).
+
+**What refutes it**: the hull is a widening (a box of arcs holds
+remainders no path brings) - but it only decides which states the tree
+holds, how early, and which are expanded. The arcs are EXACT in the
+remainder over the recorded edges (the backward), and the concrete search
+prunes by their winning sets alone, so a state or an edge the hull admits
+and no path reaches is never a win. Nothing outside the forward reads a
+hull.
+
+**What changed for the readers.** A frame's states are those first
+reached there (as before: a layer is the frame a state was first reached
+at), but an edge recorded at frame f may enter a state first reached
+LATER (its push was empty or dropped at f) or never. The backward
+therefore reads a changed target's in-edges from its region's first frame
+with edges, with no per-target layer bound (`arc_dp::Backward::first`):
+the bound it had ("an edge recorded at f enters a layer <= f") is false
+here - room (4,2)'s known route was pruned by it at step 39 (`NOT IN W's
+SUPPORT`). `arc-check` keys an edge's target by its key, not by its row
+(it may have no frame). A tree is NEVER RAISED (`grow_tree` refuses one
+filtered by level -1 below the horizon): a push level -1 dropped leaves a
+hull smaller and a state later or unreached, so the frames depend on the
+horizon throughout; the raise, its frame and edge files and the drop notes
+are gone.
+
+**Measured** (BENCHMARK_DATA.md, 2026-10-13; release, 16 threads, the
+full `search` back to back with develop `26de6cd` on a machine another
+search loaded - wall clocks moved up to 2x between runs, instructions did
+not): the same optimum and witness in each, and
+
+| room | instructions | forward states expanded (re-pushed) | backward | tree | peak RSS |
+|---|---|---|---|---|---|
+| (4,2) 2100m `r0sxhn`, L1 71 | 0.23 T against 0.40 | 0.6M (0.9M) against 6.6M | 0.07 s against 0.73 | 20 MB against 29 | 0.87 GB against 0.91 |
+| (6,2) 100% `r0sxhf,r0sxh`, L1 94 | 2.91 T against 9.75 | 30.6M (44.9M) against 315.1M | 1.0 s against 2.8 | 0.84 GB against 1.85 | 3.4 GB against 4.3 |
+| (1,0) 200m `r0sx`, ceiling 99 | 5.86 T against 6.25 | 65.8M (94.5M) against 205.8M | 0.16 s against 1.88 | 1.39 GB against 0.60 | 4.3 GB against 2.3 |
+
+Room (1,0) is the worst case: its hulls grow to the whole circle (72% of
+its states full in x, 60% in y), so its frontier holds as many states as
+the old forward's and the re-pushes add their edges; its wall clock is
+develop's within the noise (54 s median against 52 over four pairs). The
+tree is larger by its out store (by source, for the re-pushes) and the
+hull files; the peak by the visited set's hulls (10 B a stored state)
+and the out store's mapped pages.
+
 ## The forward frame and the storage (keys only, 2026-10-12)
 
 One storage system (plans/storage-v2.md built the visited set;
@@ -404,59 +513,70 @@ plans/keys-only.md the rest: no state ids, no rows held):
 - **A LAYER** (`storage::layer::Layer`): per region (ascending) its
   entries - key (ascending) and cell mask, 24 B an entry - and the
   skeletons its shapes' rows decode with. The forward's FRONTIER is a layer
-  (the last frame's new states) and the wave builds the NEXT one: no row
-  layer exists in memory (the mod room's +95 run held 32 + 31 GB of them at
-  f77 before).
+  (the last frame's new states, with their hulls) and its grown states
+  (by layer: their state, layer, hull and the hull they last pushed), and
+  the wave builds the next: no row layer exists in memory.
 - **The wave** (`storage::wave::run_wave`), one pipeline a frame: the
   frontier cut into UNITS of whole entries of one shape (a 256th of the
   frame, 1024-4096 states plus at most 63) and the units into SLICES (~256k
   states). A unit is DECODED right before the kernels (`decode::decode_rows`,
   a field's code once per entry); `frame::not_expanded` is decided on it -
-  for the forward's own frontier, a resume's and a raise's alike - and only
-  its expanded lanes run. Per emission the unit's sink
-  (`storage::unit::UnitSink`) drops level -1's rows (noting their sources
-  per entry and horizon), keys the row and ORs it into its BUNDLE (source
-  key, transfer, offset, target key -> target cells) in a unit-local
-  table, keyed by the target's ROUTE (shape, region slot). Nothing is looked
-  up in the visited set and no row is copied. At its end the unit's
-  bundles are per route a CHUNK. When a slice's units are done its
-  transfers get their global ids and its chunks become REGION JOBS (one
-  per (route, slice)), which the workers take before the next slice's
-  units: the region phase overlaps the kernels.
-- **The region phase** (`storage::route::run_route`): per chunk target one
-  probe of its region's visited table (read only) and, where it has cells
-  the visited set lacks, an OR into the route's next-layer table - the
-  cells that table lacked too are the new states - and the job's bundles
-  encoded into one zstd SEGMENT of the frame's edge file. A route's next
-  table is written only by its jobs, one at a time.
+  for the forward's own frontier and a resume's alike - and only its
+  expanded lanes run. Per emission the unit's sink
+  (`storage::unit::UnitSink`) drops level -1's rows, keys the row and ORs it
+  into its BUNDLE (source key, transfer, offset, target key -> target
+  cells) in a unit-local table, keyed by the target's ROUTE (shape, region
+  slot). Nothing is looked up in the visited set and no row is copied. At
+  its end the unit's bundles are per route a CHUNK, with per target cell
+  the merged PUSH of the bundles' sources' hulls (a bundle's target cells
+  map to its source cells by one shift of the region grid,
+  `bundle::shift_into`), and its out-edges one OUT BLOCK. The RE-PUSH units
+  (the grown states, by layer, ~16k states a unit) make chunks of pushes
+  only. When a slice's units are done its transfers get their global ids
+  and its chunks become REGION JOBS (one per (route, slice)), which the
+  workers take before the next slice's units: the region phase overlaps
+  the kernels.
+- **The region phase** (`storage::route::run_route`): per chunk target its
+  pushes merged into the route's TOUCHED states (`route::Touched`: per key
+  one probe, its cells' hulls in a run), and the job's bundles encoded into
+  one zstd SEGMENT of the frame's edge file. A route's touched states are
+  written only by its jobs, one at a time.
 - **The frame's end**: provisional keys made final, new shapes numbered,
-  each route's next table FROZEN (`route::seal`): the NEXT LAYER, its count
-  checked against the region phase's insertions; its states DECODED once
-  more in chunks on every thread for their wins (and, under `--key-check`,
-  each row's key and cell); merged into the visited set; the edge file
-  written. The
-  forward then writes the FRAME FILE (`frames/f{F}.bin`: per region a zstd
-  block of the new entries' keys, masks and win masks; a header with the
-  shapes numbered, the key space's additions and the shapes' skeletons),
-  READS IT BACK and compares it with the layer, region by region and entry
-  by entry (`layer::check_frame_file`, FATAL on a difference); the drop
-  notes (`dropped/f{F}.bin`: (region, key, horizon) -> cells); the pos
-  graph; then `done.txt`. The DECODE GUARD: a shape's first emitted row
-  (each worker, each wave) must be what its key and cell decode to, and
-  every emission's skeleton the shape's (FATAL otherwise); `--key-check`
-  compares every row.
+  each route SEALED (`route::seal`: its touched keys sorted, each against
+  the visited set - new, grown, or nothing; "The hull forward"): the NEXT
+  LAYER and the grown states; the ladder's filter on both; both merged into
+  the visited set with their layers and hulls (`VisitedSet::absorb`); the
+  new states DECODED in chunks on every thread for their wins (and, under
+  `--key-check`, each row's key and cell); the edge file and the OUT FILE
+  written. The forward then writes the FRAME FILE (`frames/f{F}.bin`: per
+  region a zstd block of the new entries' keys, masks and win masks; a
+  header with the shapes numbered, the key space's additions, the shapes'
+  skeletons and those first emitted there) and the HULL FILE
+  (`hulls/f{F}.bin`, `storage::hulls`: the new states' hulls in the frame
+  file's order, the grown states with their layers and hulls), READS BOTH
+  BACK and compares them with the forward's (`layer::check_frame_file`,
+  `hulls::check`, FATAL on a difference); the pos graph; then `done.txt`.
+  The DECODE GUARD: a shape's first emitted row (each worker, each wave)
+  must be what its key and cell decode to, and every emission's skeleton
+  the shape's (FATAL otherwise); `--key-check` compares every row.
 - **Resume** rebuilds the visited set from the frame files (each frame's
-  layer merged in, regions in parallel; a state stored twice is an error);
-  the frontier is the last frame's layer. Readers (`layer::Tree`) give a frame's layer, a
-  state's layer, rows decoded on demand.
+  layer merged in, regions in parallel; a state stored twice is an error),
+  replays the hull files in order (a state's layer and hull are its last
+  file's), registers every skeleton the files hold (a re-push may reach a
+  state of a shape the frame emits nothing of), and takes the last frame's
+  hull file as the frontier, each grown state with the hull it last pushed.
+  Readers (`layer::Tree`) give a frame's layer, a state's layer, rows
+  decoded on demand.
 
 The result is a function of the frame, not of scheduling or the thread
-count: room (1,0) r0sx f0-f56 at 3 and 32 threads and over a resume at
-f45, the frame files, edge files, `xfer.bin` and the pos graph are
-byte-identical (two slices a frame from f50), and `gates/raise.sh`
-passes. `rewrite bench-storage` replays one captured frame
-(`--emit-capture`) through this code without the kernels, and reproduces
-the real tree's `ckhash` lines of that frame.
+count: room (4,2) `r0sxhn` under level -1 (71,5) f0-f60 at 16 and 5
+threads and over a resume at f40 (at 7 threads), every frame, hull, edge
+and out file, `xfer.bin` and `done.txt` are byte-identical (244 files,
+2026-10-13); the t1 frames' lines and metrics are the same at 3, 16 and 32
+threads. `rewrite bench-storage` replays one captured frame
+(`--emit-capture`) through this code without the kernels (its re-pushes run
+for real, under the tree's level -1), and reproduces the real tree's
+`ckhash` lines of that frame.
 
 ## The recorded graph (edges target, 2026-10-11)
 
@@ -465,7 +585,7 @@ remainder (its transfer); the backward reads the edge files and re-runs no
 kernel. An edge recorded at frame f leaves a state of layer f - 1.
 
 - **The edge file** (`storage::edges`, v6; plans/edges-target.md): per
-  frame `edges/f{frame}.bin` (a raise adds `f{frame}.r{seq}.bin`): a header
+  frame `edges/f{frame}.bin`: a header
   - the segments by TARGET region (one a slice that reached it), and per
   target region the source regions its edges leave - and the zstd blocks.
   A block holds BUNDLES: `(source shape and key, transfer, offset, target
@@ -476,6 +596,19 @@ kernel. An edge recorded at frame f leaves a state of layer f - 1.
   content-canonical (each slice appends its new pairs in value order).
   Room (6,2) 100% f57: 257.7M edges in 50.9M bundles, 29 MB (0.113 B an
   edge; storage v2's unit blocks 3.15 B).
+- **Every expanded state's edges, once** (the hull forward): a state is
+  expanded at its layer L and all its kernel successors are recorded at
+  L + 1, whether the frame's push into them was empty, dropped or not - so
+  a target may be first reached later, or never (it has no frame).
+- **The out store** (`storage::out`, `edges/out/f{frame}.bin`): the same
+  edges by SOURCE, for the re-pushes - per kernel unit sub-blocks of whole
+  entries (~2048 bundles), each its routes, transfer pairs and target keys
+  as dictionaries and per source entry its bundles, zstd; a header indexes
+  the blocks by their first and last entry, so a re-push unit (the grown
+  states of one layer, sorted) decompresses only the blocks holding its
+  states. A unit whose targets had provisional keys has its block fixed up
+  at the frame's end. ~0.25 GB a frame on room (1,0) at f80 (14.6x
+  compressed).
 - **`EdgeStore`**: per (frame, region) its segments (`segments`), every
   block (`all_segments`, `par_blocks`), the target regions a source region
   reaches (`targets_of`), and for the diagnostics a state's in-edges
@@ -519,11 +652,12 @@ the list (coarsest first; one level is the usual case):
    loosens). The UI's `arc.marks.bin` are the same reached nodes.
 3. **The arc phase** (`arc_dp::solve`; plans/arc-memory.md): ONE BACKWARD
    PUSH over the recorded in-edges (`arc_dp::backward`). `W_t(n)` only grows
-   as `t` falls (more time never hurts, and the layers never bind: an edge
-   recorded at frame f leaves layer f - 1 and enters a layer <= f), so
-   `W_t(p) = W_{t+1}(p) ∪ U pull_e(W_{t+1}(m))` over the edges `p -> m`
-   whose target CHANGED at t + 1: frame by frame from the wins, the changed
-   nodes' in-edges at frames <= t + 1 are read from their target regions'
+   as `t` falls (more time never hurts, and a state's edges do not depend on
+   the frame), so `W_t(p) = W_{t+1}(p) ∪ U pull_e(W_{t+1}(m))` over the
+   edges `p -> m` whose target CHANGED at t + 1: frame by frame from the
+   wins, the changed nodes' in-edges are read - from their region's first
+   frame with edges on, whatever the target's layer (a hull tree's edge may
+   enter a state first reached after it: "The hull forward") - from their target regions'
    blocks (each block's sorted targets met by galloping through the
    region's sorted changed ones: a block costs its own size, not the
    group's), in bounded ROUNDS (~20M in-edges, 0.8 GB, at most), and pulled into their
@@ -562,55 +696,17 @@ the list (coarsest first; one level is the usual case):
 Resume: rerun the same command; the forward resumes or is reused, the arc
 phase reruns (minutes). A fresh forward clears `frames/` and `edges/`.
 
-**Raising the horizon** (2026-10-08, `frame::grow_tree`,
-`ForwardState::raise`). Campaigns count horizons up (`--to H`, then H+1,
-...): a low H lets level -1 cut far more. Level -1 at H drops exactly the
-(shape, cell) queues with `f + d > H`, so at H' > H every frame keeps a
-superset, and the tree built for H misses those rows and all they reach. A
-tree records the filter its frames were built under,
-`<level>/level_minus_one.txt` (`TreeFilter`: `off`, `h H speed S table FP`,
-or a bare number - `gemskip-campaign`'s record, which noted nothing); a
-forward extends a tree under ITS filter, never the environment's, so one
-tree is filtered alike at every frame (`--to H` under a tree filtered at
-H2 >= H just uses it, as before). A level-0 forward under level -1 NOTES the
-SOURCES of every dropped row: `dropped/f{t}.bin`, per source (a state of
-layer t-1, by region and key, its cells a mask) the smallest horizon that
-admits one of its dropped successors (`CostToGo::admitted_from` = f + d,
-noted per lane in the unit). A
-search past the tree's H then RAISES it to the run's H' before extending:
-frame by frame from 1, the sources whose note is <= H' and the states the
-raise added one frame earlier run one wave under H', against the WHOLE
-tree's visited set. A new state joins the frame (the raise's frame file
-`frames/f{t}.r{seq}.bin`, `frame::Raised`), an old one gets its edge; a
-re-expanded source's edges into cells the OLD filter admitted exist
-already and are not recorded again (the noted sources and the raise's own
-are two parts of the frontier, and a unit runs one). The new edges go into
-the frame's RAISED edge file
-`f{frame}.r{seq}.bin` beside its own; `EdgeStore` reads both. The notes of
-the frame are rewritten (the untouched sources keep theirs). The result is
-the tree a fresh forward under H' makes: the same (key, cell) set per frame,
-the same edges, the same pos graph, the same notes - unless H' reaches a
-state SOONER than the tree did, which would move it to an earlier layer: a
-hit on a state of a later layer is refused (`route::run_route`, through every
-state's layer, `wave::StateLayers`, built for the raise; possible only where
-the table's d is not consistent along a real edge; it has not fired). Checked by `gates/raise.sh` (a tree raised H1 -> H2 -> ...
-against a fresh tree per horizon: `ckhash --edges`, the pos graph, the
-search's `[gate]` lines and answer): room (1,0) 55 -> 56 -> 58 and 60 -> 61
--> 65; room (4,2) `r0sxhn,r0sxh --no-witness` 70 -> 71 -> 73 (level 1
-rebuilt each time) and with the concrete search 69 -> 70 -> 71 -> 72
-(REFUTED, REFUTED, the same 71-frame witness twice); a raise to OFF (no
-level -1) 48 -> 50; `arc-check` on the raised (1,0) tree, 0
-disagreements; on storage v2 `gates/raise.sh 1,0 55 56 58` again.
-MEASURED (release, 8 threads, room (1,0) `forward`, level -1 at 97 then
-98, before storage v2): the raise 97 -> 98 took 29 s (22.6 s raising
-f1-f97: 6.3M sources re-expanded, 6.1M states added; the door's reload
-6 s) and 4.8 GB peak, against 265 s and 6.0 GB for a fresh 98 - and its
-tree is identical (`ckhash --edges`, pos graph). The notes
-cost the forward nothing measurable (fresh 98: 265 s, the build before
-them 272 s) and 82 MB on a 29 GB tree. Refused, loudly: the orb room (its
-not-expanded rows depend on the horizon), another S or a changed table, a
-tree without a record (only used where complete), and a tree whose raise was
-interrupted (`raising.txt`: half raised, delete it). A FINER level's tree
+**The horizon and level -1** (`frame::grow_tree`). A tree records the
+filter its frames were built under, `<level>/level_minus_one.txt`
+(`TreeFilter`: `off`, or `h H speed S table FP`); a forward extends a tree
+under ITS filter, never the environment's, so one tree is filtered alike at
+every frame, and `--to H` under a tree filtered at H2 >= H uses it as it
+is. A tree filtered BELOW the run's horizon is refused: the hull forward's
+frames depend on the horizon through every push level -1 dropped, so it
+cannot be raised exactly (the raise of 2026-10-08 - re-expanding the noted
+sources of the drops frame by frame - did that for the remainder-free
+forward; it is gone with its drop notes and raised files). Refused, loudly:
+another S or a changed table, a tree without a record. A FINER level's tree
 (the objects ladder) is filtered by the coarser marks for one horizon; it is
 kept only for the same marks (with deadlines), horizon and level -1
 (`filtered_for.txt`), else built again - it is the cheap one.
@@ -632,7 +728,7 @@ The level is a value (2026-10-10): the engines carry it (`FrameEngine`,
 settings record (`<level>/settings.txt`, `settings::Settings`, written when a
 forward starts it, with the room, category and region settings;
 `Settings::check` refuses another `--level` or any other setting on resume,
-reuse, a raise, the arc phase and the diagnostics; a tree without the record
+reuse, the arc phase and the diagnostics; a tree without the record
 is refused). One kernel set is resident; a call at another level drops it and builds
 that level's. Fused graphs are dropped
 after assembly unless `--kernel-explain`.
@@ -708,7 +804,8 @@ unions, so the union over all paths is pushed exactly (`search::arcs`).
 
 **The design.**
 
-1. **Forward, remainder-free** (level 0's forward as today). Each emitted row
+1. **Forward** (remainder-free until 2026-10-13; now over remainder
+   hulls, "The hull forward"). Each emitted row
    carries, per axis, the remainder after `rem -= 1/2 + amount` (the image)
    and at the frame's end before the widening (final), recorded with the edge,
    not in the row (keys unchanged): guard = the image's width at the end it
@@ -830,7 +927,9 @@ compares the search's start against it, field by field.
 
 Every change to the loop, the kernels or the tracer must reproduce the
 three pinned room (1,0) oracles (commands and comparison in CLAUDE.md):
-`gates/ckhash_room10_f000-044.txt` (frontier sets f0-f44),
+`gates/ckhash_room10_f000-044.txt` (each frame's new states and its
+frontier's hulls f0-f44, `ckhash --hulls`; the forward before hulls is
+`..._widened.txt`, which a test holds the WIDEN forward to),
 `gates/posgraph_room10_f044.txt` (pos-graph edges), and
 `gates/arc_room10_win9-101_h35.txt` (the search at a synthetic win at h35:
 W's support, W's fingerprint at every frame, the arc optimum 33 and the
@@ -839,8 +938,9 @@ first line was the remainder-free marks until 2026-10-11, plans/arc-memory.md). 
 recording `arc-check`. A kernels-against-interpreter check: `rewrite
 ref-check` (row by row; the kernels over-approximate where the reference
 splits an interval, so ckhash equality with the reference engine is no
-test). After a change to the forward's filters, the notes or the edge files:
-`gates/raise.sh` (a raised tree against fresh ones, "Raising the horizon").
+test). After a change to the forward, the hull files or the out store: a
+resume against an uninterrupted forward, byte for byte ("The forward
+frame and the storage").
 
 **A known solution against the pruning** (`search::known`, 2026-10-08).
 Every pruning step of the search - level -1, the objects ladder's filter,
