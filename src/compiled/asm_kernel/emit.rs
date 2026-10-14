@@ -471,11 +471,6 @@ impl Plan {
         p
     }
 
-    /// Body `bi`'s key fields.
-    fn fields(&self, bi: usize) -> impl Iterator<Item = &KeyField> {
-        let r = &self.bodies[bi].reads;
-        self.body_reads[r.start as usize..r.end as usize].iter().map(|&i| &self.reads[i as usize].1)
-    }
 }
 
 /// A slice's columns (module doc), one per entry of the kernel's plan: the
@@ -687,7 +682,7 @@ impl AsmKernel {
                 out_keys[i] = if miss >> i & 1 == 0 && part.missing.is_empty() {
                     (packed.0[1][i], packed.0[0][i])
                 } else {
-                    sink.provisional().intern(self.miss_key(bi, buf, i, sk, shape, packed.get(i), &part.missing))
+                    sink.provisional().intern(self.miss_key(bi, buf, i, &c.read_miss, shape, packed.get(i), &part.missing))
                 };
             }
             emitted += take.count_ones() as u64;
@@ -703,15 +698,17 @@ impl AsmKernel {
 
     /// Body `bi`'s lane `i`'s exact content where a code is missing: its
     /// fields that hit packed (`partial`), the outcome's and the body's
-    /// missing codes.
+    /// missing codes - a body's field is missing where its read missed the
+    /// lane (`read_miss`: the read's dictionary lacks the lane's code, or
+    /// the key space its shape).
     #[allow(clippy::too_many_arguments)]
-    fn miss_key(&self, bi: usize, buf: &[u8], i: usize, sk: Option<&ShapeKeys>, shape: u64, partial: u128, part_missing: &[(u32, Code)]) -> MissKey {
-        use celeste_engine::exact::NONE;
+    fn miss_key(&self, bi: usize, buf: &[u8], i: usize, read_miss: &[u16], shape: u64, partial: u128, part_missing: &[(u32, Code)]) -> MissKey {
         let mut missing: Vec<(u32, Code)> = part_missing.to_vec();
-        for f in self.plan.fields(bi) {
-            let c = f.code(buf, i);
-            if sk.is_none_or(|sk| sk.field(f.cell as usize).is_none_or(|d| d.find(c) == NONE)) {
-                missing.push((f.cell, c));
+        let r = &self.plan.bodies[bi].reads;
+        for &k in &self.plan.body_reads[r.start as usize..r.end as usize] {
+            if read_miss[k as usize] >> i & 1 == 1 {
+                let f = &self.plan.reads[k as usize].1;
+                missing.push((f.cell, f.code(buf, i)));
             }
         }
         missing.sort_unstable_by_key(|m| m.0);
