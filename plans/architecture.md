@@ -923,6 +923,19 @@ The ground truth for both the start and the verdict is the boot chain on a
 real PICO-8 (`chain.py --boot`). `chain.py --check-start CONCRETE_RUN`
 compares the search's start against it, field by field.
 
+**Frame 0 is the start as the engine made it** (`wave::seed`): keyed by its
+own codes, not by its boundary view (`Rt2::widen_to`). The kernels' lattice
+walk starts from it (the start shape's constants are pinned), and nothing
+looks it up by projection (`arc_dp::Seeds::load` takes frame 0's one state,
+`known::Pruning::start`). The view differs where a `Flag::Always` entry
+moves the start: a strawberry's bob in any 100% start, and under the
+loading jank a key's sprite (its update sets `spr` 9.5, the view 8) and a
+balloon's phase (`offset + 0.01`). Until 2026-10-14 the seed keyed the view
+and stored the start: since keys-only (a state's row is what its key
+decodes to) every such start was refused at frame 0 (`ROWS FROM KEYS`,
+gemskip 100% 2500m), and storing the view instead makes the start shape's
+kernel decline the lane (its pin is the start's `spr`).
+
 ## Gates
 
 Every change to the loop, the kernels or the tracer must reproduce the
