@@ -421,6 +421,49 @@ impl VisitedSet {
         self.set.alloc_bytes() + self.info.values().map(|m| m.alloc_bytes()).sum::<usize>()
     }
 
+    /// The stored hulls' and layers' statistics (`[memory]`, a diagnostic):
+    /// states with a stored hull, distinct hulls (counted up to `cap`), the
+    /// states the most common 256, 4096 and 65536 hulls cover, distinct
+    /// layers, and the entries whose stored states share one layer (of the
+    /// entries with any).
+    pub fn hull_stats(&self, cap: usize) -> String {
+        let mut by: FxHashMap<u64, u64> = FxHashMap::default();
+        let (mut states, mut over, mut one_layer, mut entries) = (0u64, false, 0u64, 0u64);
+        let mut layers = [0u64; 1 << 16];
+        for m in self.info.values() {
+            for (e, &mask) in m.masks.iter().enumerate() {
+                let n = mask.count_ones() as usize;
+                if n == 0 {
+                    continue;
+                }
+                let run = &m.slots[m.starts[e] as usize..m.starts[e] as usize + n];
+                entries += 1;
+                one_layer += run.iter().all(|i| i.layer == run[0].layer) as u64;
+                for i in run {
+                    states += 1;
+                    layers[i.layer as usize] += 1;
+                    if by.len() < cap || by.contains_key(&i.hull.word()) {
+                        *by.entry(i.hull.word()).or_default() += 1;
+                    } else {
+                        over = true;
+                    }
+                }
+            }
+        }
+        let mut counts: Vec<u64> = by.values().copied().collect();
+        counts.sort_unstable_by(|a, b| b.cmp(a));
+        let top = |k: usize| counts.iter().take(k).sum::<u64>() as f64 / states.max(1) as f64 * 100.0;
+        format!(
+            "{states} stored hulls: {}{} distinct, the top 256 cover {:.1}%, 4096 {:.1}%, 65536 {:.1}%; {} distinct layers; {one_layer} of {entries} entries hold one layer",
+            if over { ">" } else { "" },
+            by.len(),
+            top(256),
+            top(4096),
+            top(65536),
+            layers.iter().filter(|&&c| c > 0).count()
+        )
+    }
+
     /// Its bytes by part (`[memory]`): the set's keys, masks, hash index and
     /// lists; the hull store's entry index, live, dead and spare slots; the
     /// key space.
