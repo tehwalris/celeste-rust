@@ -450,7 +450,8 @@ struct BlockHead {
 /// A block as the frame's end writes it: zstd, its raw length, its first
 /// and last entry.
 pub struct Sealed {
-    pub z: Vec<u8>,
+    /// In memory, or in the frame's spool.
+    pub z: super::spool::Body,
     pub raw: u32,
     pub first: (u32, Key),
     pub last: (u32, Key),
@@ -473,7 +474,14 @@ impl Sealed {
         )?;
         let (Some(first), Some(last)) = (first, last) else { return Ok(None) };
         ensure!(raw.len() < u32::MAX as usize, "an out block of {} bytes", raw.len());
-        Ok(Some(Sealed { z: super::bundle::compress(raw, z)?, raw: raw.len() as u32, first, last }))
+        Ok(Some(Sealed { z: super::spool::Body::Mem(super::bundle::compress(raw, z)?), raw: raw.len() as u32, first, last }))
+    }
+}
+
+impl Sealed {
+    /// Its bytes into `spool`, if there is one.
+    pub fn spill(self, spool: Option<&super::spool::Spool>) -> Result<Sealed> {
+        Ok(Sealed { z: self.z.spill(spool)?, ..self })
     }
 }
 
@@ -485,7 +493,7 @@ pub fn path(edges_dir: &Path, frame: u32) -> PathBuf {
 /// WRITE frame `frame`'s out file from its units' blocks in unit order
 /// (their entries ascending across blocks: checked). Atomic. Returns its
 /// bytes.
-pub fn write(path: &Path, frame: u32, blocks: &[Sealed]) -> Result<u64> {
+pub fn write(path: &Path, frame: u32, blocks: &[Sealed], spool: Option<&super::spool::Spool>) -> Result<u64> {
     use std::io::Write;
     ensure!(blocks.windows(2).all(|w| w[0].last < w[1].first), "{}: the out blocks' entries are not ascending", path.display());
     let mut heads = Vec::with_capacity(blocks.len());
@@ -503,8 +511,9 @@ pub fn write(path: &Path, frame: u32, blocks: &[Sealed]) -> Result<u64> {
         f.write_all(&crate::search::checkpoint::FORMAT_VERSION.to_le_bytes())?;
         f.write_all(&(hb.len() as u64).to_le_bytes())?;
         f.write_all(&hb)?;
+        let mut buf = Vec::new();
         for b in blocks {
-            f.write_all(&b.z)?;
+            b.z.with(spool, &mut buf, |z| f.write_all(z))??;
         }
         f.flush()?;
     }
@@ -651,7 +660,7 @@ mod tests {
         encode(&[row(9, 4, 77, 3, (0, 1), 4, 1024 << 11 | 1024, 1)], &mut second);
         let blocks = vec![Sealed::of(&fixed, &mut z).unwrap().unwrap(), Sealed::of(&second, &mut z).unwrap().unwrap()];
         let path = path(&dir, 3);
-        write(&path, 3, &blocks).unwrap();
+        write(&path, 3, &blocks, None).unwrap();
         let f = OutFile::open(&path, 3).unwrap();
         assert_eq!(f.blocks((5, (0, 0)), (5, (0, 9))), 0..1);
         assert_eq!(f.blocks((8, (0, 0)), (9, (0, 4))), 1..2);
@@ -660,13 +669,17 @@ mod tests {
         let mut back = Vec::new();
         f.block(1, &mut d, &mut back).unwrap();
         assert_eq!(back, second);
-        assert!(write(&path, 3, &[blocks[1].clone_for_test(), blocks[0].clone_for_test()]).is_err(), "unordered blocks");
+        assert!(write(&path, 3, &[blocks[1].clone_for_test(), blocks[0].clone_for_test()], None).is_err(), "unordered blocks");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
     impl Sealed {
         fn clone_for_test(&self) -> Sealed {
-            Sealed { z: self.z.clone(), raw: self.raw, first: self.first, last: self.last }
+            let z = match &self.z {
+                crate::storage::spool::Body::Mem(v) => crate::storage::spool::Body::Mem(v.clone()),
+                crate::storage::spool::Body::Spool(s) => crate::storage::spool::Body::Spool(*s),
+            };
+            Sealed { z, raw: self.raw, first: self.first, last: self.last }
         }
     }
 }

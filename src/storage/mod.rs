@@ -14,6 +14,8 @@
 //!   * `edges`   - the edge files (per target region and frame), the global
 //!                 transfer table, the reader (`EdgeStore`)
 //!   * `out`     - the out-edge files (per source, the re-push's read)
+//!   * `spool`   - a frame's scratch file of the blocks its files get at
+//!                 its end
 //!   * `set`     - THE ONE STATE SET: per region (key -> cell mask), indexed
 //!                 (the visited set, the next layer while a wave builds it)
 //!                 or frozen (the frontier, a frame read back)
@@ -37,6 +39,7 @@ pub mod layer;
 pub mod out;
 pub mod route;
 pub mod set;
+pub mod spool;
 pub mod unit;
 pub mod visited;
 pub mod wave;

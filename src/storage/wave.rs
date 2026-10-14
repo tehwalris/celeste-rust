@@ -362,6 +362,15 @@ pub fn run_wave(engine: &dyn FrameStep, front: Frontier, cx: WaveCtx) -> Result<
     st.frontier_bytes = layer.alloc_bytes() + std::mem::size_of_val(front.hulls.as_slice()) + front.old_states() * std::mem::size_of::<Old>();
     st.rss_start = crate::metrics::current_rss_gb();
     let record = edges_dir.is_some();
+    // The frame's SPOOL (`storage::spool`): the out blocks and the jobs'
+    // segments wait there for the frame's end, not in memory.
+    let spool: Option<std::sync::Arc<super::spool::Spool>> = match edges_dir {
+        Some(dir) => {
+            std::fs::create_dir_all(dir)?;
+            Some(std::sync::Arc::new(super::spool::Spool::create(&dir.join(format!("f{frame:03}.spool")))?))
+        }
+        None => None,
+    };
     let mut units = units_of(layer, unit_lanes(st.lanes_in as u64));
     let n_kernel = units.len();
     units.extend(repush_units_of(&front.old));
@@ -419,7 +428,7 @@ pub fn run_wave(engine: &dyn FrameStep, front: Frontier, cx: WaveCtx) -> Result<
             .iter_mut()
             .zip(scratch.iter_mut())
             .map(|(sink, sc)| {
-                let (units, pipe, slice_of, slices, routes, shapes, starts, hulls, old_by, out_blocks, repushed) = (&units, &pipe, &slice_of, &slices, &routes, &shapes, &starts, &front.hulls, &front.old, &out_blocks, &repushed);
+                let (units, pipe, slice_of, slices, routes, shapes, starts, hulls, old_by, out_blocks, repushed, spool) = (&units, &pipe, &slice_of, &slices, &routes, &shapes, &starts, &front.hulls, &front.old, &out_blocks, &repushed, spool.as_deref());
                 let visited: &VisitedSet = visited;
                 std::thread::Builder::new().stack_size(WORKER_STACK).spawn_scoped(scope, move || -> Result<(std::time::Duration, std::time::Duration, [u64; 4])> {
                     crate::compiled::asm_kernel::set_thread_stack(WORKER_STACK);
@@ -447,7 +456,7 @@ pub fn run_wave(engine: &dyn FrameStep, front: Frontier, cx: WaveCtx) -> Result<
                         if let Some(job) = pipe.pop_job() {
                             let t = Instant::now();
                             let tp = phases::start(s.diag.phases);
-                            let rcx = RegionCtx { frame, record, remaps: &job.remaps, new_xfers: xfers_before as u32 };
+                            let rcx = RegionCtx { frame, record, remaps: &job.remaps, new_xfers: xfers_before as u32, spool };
                             let cs: Vec<&Chunk> = job.chunks.iter().collect();
                             let mut route = job.state.lock().expect("a route");
                             let r = super::route::run_route(&mut route, job.slice, &cs, &rcx, sc);
@@ -478,7 +487,11 @@ pub fn run_wave(engine: &dyn FrameStep, front: Frontier, cx: WaveCtx) -> Result<
                                     let to = phases::start(s.diag.phases);
                                     let mut v = Vec::new();
                                     for (raw, prov) in std::mem::take(&mut sink.out_blocks) {
-                                        v.push(if prov { OutBlock::Raw(raw) } else { OutBlock::Sealed(super::out::Sealed::of(&raw, z.get_or_insert_with(|| zstd::bulk::Compressor::new(1).expect("a zstd compressor")))?) });
+                                        v.push(if prov {
+                                            OutBlock::Raw(raw)
+                                        } else {
+                                            OutBlock::Sealed(super::out::Sealed::of(&raw, z.get_or_insert_with(|| zstd::bulk::Compressor::new(1).expect("a zstd compressor")))?.map(|x| x.spill(spool)).transpose()?)
+                                        });
                                     }
                                     *out_blocks[u].lock().expect("an out block") = v;
                                     phases::add(phases::OUT_BLOCKS, to);
@@ -598,7 +611,7 @@ pub fn run_wave(engine: &dyn FrameStep, front: Frontier, cx: WaveCtx) -> Result<
                     .expect("an out block")
                     .iter()
                     .map(|x| match x {
-                        OutBlock::Sealed(z) => z.as_ref().map_or(0, |z| z.z.capacity()),
+                        OutBlock::Sealed(z) => z.as_ref().map_or(0, |z| z.z.held()),
                         OutBlock::Raw(r) => r.capacity(),
                     })
                     .sum::<usize>()
@@ -618,7 +631,7 @@ pub fn run_wave(engine: &dyn FrameStep, front: Frontier, cx: WaveCtx) -> Result<
             tb.iter().sum::<usize>() as f64 / ts.max(1) as f64
         );
         eprintln!(
-            "[wavemem] f{frame}: frontier {:.3} GB ({} entries, {} old states), visited {:.3} GB ({} entries), transfers {:.3}, the out store's index {:.3}, the routes' touched states {:.3}, provisional bundles {:.3}, segments {:.3}, out blocks {:.3}, chunks in flight at most {:.3}, sinks {:.3} (bundles {:.3}, lane hulls {:.3}, pos pairs {:.3}, transfers {:.3}: {x_all} met, at most {x_max} a worker, rest {:.3}), region scratch {:.3} (bundles {:.3}, encoder {:.3}, raw {:.3}, rest {:.3}) GB; anon {:.2} GB",
+            "[wavemem] f{frame}: frontier {:.3} GB ({} entries, {} old states), visited {:.3} GB ({} entries), transfers {:.3}, the out store's index {:.3}, the routes' touched states {:.3}, provisional bundles {:.3}, segments {:.3}, out blocks {:.3}, spooled {:.3}, chunks in flight at most {:.3}, sinks {:.3} (bundles {:.3}, lane hulls {:.3}, pos pairs {:.3}, transfers {:.3}: {x_all} met, at most {x_max} a worker, rest {:.3}), region scratch {:.3} (bundles {:.3}, encoder {:.3}, raw {:.3}, rest {:.3}) GB; anon {:.2} GB",
             gb(st.frontier_bytes),
             st.entries_in,
             st.old_in,
@@ -630,6 +643,7 @@ pub fn run_wave(engine: &dyn FrameStep, front: Frontier, cx: WaveCtx) -> Result<
             gb(rest[1]),
             gb(rest[2]),
             gb(out_held),
+            gb(spool.as_ref().map_or(0, |sp| sp.bytes() as usize)),
             gb(inflight_max.load(Ordering::Acquire)),
             gb(sk.iter().sum()),
             gb(sk[0]),
@@ -691,7 +705,7 @@ pub fn run_wave(engine: &dyn FrameStep, front: Frontier, cx: WaveCtx) -> Result<
     // provisional ones encoded with their final keys.
     let out_file = match edges_dir {
         Some(dir) => {
-            let (path, finals, threads, out_blocks) = (super::out::path(dir, frame), finals.clone(), s.threads(), std::mem::take(&mut out_blocks));
+            let (path, finals, threads, out_blocks, spool) = (super::out::path(dir, frame), finals.clone(), s.threads(), std::mem::take(&mut out_blocks), spool.clone());
             Some(std::thread::Builder::new().name("out file".into()).spawn(move || -> Result<u64> {
                 let blocks = par_map(&out_blocks, threads, |b| -> Result<Vec<super::out::Sealed>> {
                     let mut out = Vec::new();
@@ -711,7 +725,7 @@ pub fn run_wave(engine: &dyn FrameStep, front: Frontier, cx: WaveCtx) -> Result<
                 for b in blocks {
                     all.extend(b?);
                 }
-                super::out::write(&path, frame, &all)
+                super::out::write(&path, frame, &all, spool.as_deref())
             })?)
         }
         None => None,
@@ -822,7 +836,7 @@ pub fn run_wave(engine: &dyn FrameStep, front: Frontier, cx: WaveCtx) -> Result<
     }
     let edge_file = match edges_dir {
         Some(dir) => {
-            let (dir, flush, finals, threads) = (dir.to_path_buf(), xfers.take_flush(), finals.clone(), s.threads());
+            let (dir, flush, finals, threads, spool) = (dir.to_path_buf(), xfers.take_flush(), finals.clone(), s.threads(), spool.clone());
             Some(std::thread::Builder::new().name("edge file".into()).spawn(move || -> Result<u64> {
                 flush.write(&dir)?;
                 let renumber = perm.as_deref().map(|perm| super::route::Renumber { first: xfers_before as u32, perm });
@@ -840,7 +854,7 @@ pub fn run_wave(engine: &dyn FrameStep, front: Frontier, cx: WaveCtx) -> Result<
                     jobs.sort_unstable_by_key(|g| g.0);
                     segs.extend(jobs.into_iter().map(|g| g.1));
                 }
-                super::edges::write_file(&super::edges::file_path(&dir, frame), frame, segs, src_index)
+                super::edges::write_file(&super::edges::file_path(&dir, frame), frame, segs, src_index, spool.as_deref())
             })?)
         }
         None => None,

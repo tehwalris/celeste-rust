@@ -317,6 +317,8 @@ pub struct RegionCtx<'a> {
     /// The global ids from here on are this frame's new transfers', in the
     /// order the slices met them: provisional until the frame's end.
     pub new_xfers: u32,
+    /// The frame's spool: a job's segment goes there (`spool`).
+    pub spool: Option<&'a super::spool::Spool>,
 }
 
 /// A unit's bundles, by route: an emission is APPENDED to its route's
@@ -564,7 +566,7 @@ impl Chunk {
 impl RouteState {
     /// Bytes its touched table, provisional bundles and segments hold.
     pub fn alloc_bytes(&self) -> [usize; 3] {
-        [self.touched.alloc_bytes() + 24 * self.prov_keys.capacity(), self.prov.iter().map(|s| s.1.bytes.capacity()).sum::<usize>(), self.segs.iter().map(|s| s.1.bytes.capacity()).sum::<usize>()]
+        [self.touched.alloc_bytes() + 24 * self.prov_keys.capacity(), self.prov.iter().map(|s| s.1.bytes.held()).sum::<usize>(), self.segs.iter().map(|s| s.1.bytes.held()).sum::<usize>()]
     }
 }
 
@@ -681,7 +683,9 @@ pub fn run_route(st: &mut RouteState, slice: u32, chunks: &[&Chunk], cx: &Region
         let keys = &sc.t_keys;
         sc.enc.encode(&sc.tbs, keys.len(), |l| keys[l as usize], &sc.s_list, &mut sc.raw);
         let region = st.region.unwrap_or(u32::MAX);
-        st.segs.push(((0, slice), Segment::of_raw(region, &sc.raw, sc.tbs.len() as u32, sc.tbs.iter().map(|t| t.mask.count_ones() as u64).sum(), &mut sc.z)?));
+        let mut seg = Segment::of_raw(region, &sc.raw, sc.tbs.len() as u32, sc.tbs.iter().map(|t| t.mask.count_ones() as u64).sum(), &mut sc.z)?;
+        seg.bytes = seg.bytes.spill(cx.spool)?;
+        st.segs.push(((0, slice), seg));
     }
     if !sc.prov.is_empty() {
         st.prov.push((slice, Segment::encode(u32::MAX, &sc.prov, &mut sc.enc, &mut sc.raw, &mut sc.z)?));
@@ -858,7 +862,8 @@ pub fn sealed(touch: Touch, parts: Vec<SealPart>) -> Result<Sealed> {
 /// order already).
 pub fn reencode(seg: &Segment, region: u32, finals: &FxHashMap<Key, Key>, renumber: Option<&Renumber>, enc: &mut bundle::Encoder, z: &mut zstd::bulk::Compressor<'static>) -> Result<Segment> {
     let (mut dz, mut raw) = (zstd::bulk::Decompressor::new()?, Vec::new());
-    bundle::decompress(&seg.bytes, seg.raw as usize, &mut dz, &mut raw)?;
+    let super::spool::Body::Mem(bytes) = &seg.bytes else { anyhow::bail!("a waiting segment spooled") };
+    bundle::decompress(bytes, seg.raw as usize, &mut dz, &mut raw)?;
     let mut v: Vec<Bundle> = Vec::with_capacity(seg.bundles as usize);
     let mut missing = false;
     bundle::Block::open(&raw, &bundle::ORDER)?.bundles(|mut b| {

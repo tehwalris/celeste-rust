@@ -287,8 +287,9 @@ struct FileHead {
 /// One target region's encoded segment, as a wave hands it to the file.
 pub struct Segment {
     pub region: u32,
-    /// The zstd block and its raw length.
-    pub bytes: Vec<u8>,
+    /// The zstd block (in memory, or in the frame's spool) and its raw
+    /// length.
+    pub bytes: super::spool::Body,
     pub raw: u32,
     pub bundles: u32,
     pub edges: u64,
@@ -299,7 +300,7 @@ impl Segment {
     /// `region`.
     pub fn of_raw(region: u32, raw: &[u8], bundles: u32, edges: u64, z: &mut zstd::bulk::Compressor<'static>) -> Result<Segment> {
         ensure!(raw.len() < u32::MAX as usize, "an edge segment of {} bytes", raw.len());
-        Ok(Segment { region, bytes: bundle::compress(raw, z)?, raw: raw.len() as u32, bundles, edges })
+        Ok(Segment { region, bytes: super::spool::Body::Mem(bundle::compress(raw, z)?), raw: raw.len() as u32, bundles, edges })
     }
 
     /// `bundles` (distinct) as a segment of `region` (`enc`: a scratch encoder).
@@ -308,7 +309,7 @@ impl Segment {
         ensure!(raw.len() < u32::MAX as usize, "an edge segment of {} bytes", raw.len());
         Ok(Segment {
             region,
-            bytes: bundle::compress(raw, z)?,
+            bytes: super::spool::Body::Mem(bundle::compress(raw, z)?),
             raw: raw.len() as u32,
             bundles: bundles.len() as u32,
             edges: bundles.iter().map(|b| b.mask.count_ones() as u64).sum(),
@@ -324,7 +325,7 @@ pub fn file_path(dir: &Path, frame: u32) -> PathBuf {
 /// Write frame `frame`'s edge file from its segments (any order) and its
 /// source-region index (`sources`: per target region the source regions,
 /// any order). Atomic (renamed into place). Returns its bytes.
-pub fn write_file(path: &Path, frame: u32, mut segs: Vec<Segment>, mut sources: Vec<(u32, Vec<u32>)>) -> Result<u64> {
+pub fn write_file(path: &Path, frame: u32, mut segs: Vec<Segment>, mut sources: Vec<(u32, Vec<u32>)>, spool: Option<&super::spool::Spool>) -> Result<u64> {
     use std::io::Write;
     segs.sort_by_key(|s| s.region);
     sources.sort_unstable_by_key(|s| s.0);
@@ -347,8 +348,9 @@ pub fn write_file(path: &Path, frame: u32, mut segs: Vec<Segment>, mut sources: 
         out.write_all(&VERSION.to_le_bytes())?;
         out.write_all(&(head.len() as u64).to_le_bytes())?;
         out.write_all(&head)?;
+        let mut buf = Vec::new();
         for s in &segs {
-            out.write_all(&s.bytes)?;
+            s.bytes.with(spool, &mut buf, |b| out.write_all(b))??;
         }
         out.flush()?;
     }
@@ -736,7 +738,7 @@ pub(crate) fn write_test_edges(dir: &Path, frames: &[(u32, Vec<(Sk, Sk, u32)>)],
     let mut last = 0;
     for (frame, edges) in frames {
         let (segs, sources) = segments_of(edges)?;
-        write_file(&file_path(dir, *frame), *frame, segs, sources)?;
+        write_file(&file_path(dir, *frame), *frame, segs, sources, None)?;
         last = last.max(*frame);
     }
     set_done(dir, last, pairs.len())
