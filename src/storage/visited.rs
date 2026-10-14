@@ -108,14 +108,20 @@ impl VisitedSet {
             let ch = &changes[i].1;
             lo.map_or(0, |k| ch.partition_point(|c| c.key < k))..hi.map_or(ch.len(), |k| ch.partition_point(|c| c.key < k))
         };
-        self.upsert_with(&regions, threads, |i, lo, hi| range(i, lo, hi).len(), |i, lo, hi| Ok(changes[i].1[range(i, lo, hi)].to_vec()))
+        self.upsert_with(&regions, threads, |i, lo, hi| range(i, lo, hi).len(), |i, lo, hi| Ok(std::borrow::Cow::Borrowed(&changes[i].1[range(i, lo, hi)])))
     }
 
     /// `upsert_all` with each run's changes MADE by the run (`make(i, lo,
     /// hi)`: region `regions[i]`'s changes with keys in `[lo, hi)`, `None`
-    /// unbounded; `count` their number, the runs' order) - not all held at
-    /// once.
-    pub fn upsert_with(&mut self, regions: &[u32], threads: usize, count: impl Fn(usize, Option<Key>, Option<Key>) -> usize, make: impl Fn(usize, Option<Key>, Option<Key>) -> Result<Vec<Change>> + Sync) -> Result<Upserted> {
+    /// unbounded - borrowed where they are held already; `count` their
+    /// number, the runs' order) - not all held at once.
+    pub fn upsert_with<'c>(
+        &mut self,
+        regions: &[u32],
+        threads: usize,
+        count: impl Fn(usize, Option<Key>, Option<Key>) -> usize,
+        make: impl Fn(usize, Option<Key>, Option<Key>) -> Result<std::borrow::Cow<'c, [Change]>> + Sync,
+    ) -> Result<Upserted> {
         // A run: its region's index in `regions`, its place among the
         // region's runs, its keys' range, its blocks.
         type Run = (usize, usize, (Option<Key>, Option<Key>), Vec<Block>);
@@ -212,7 +218,7 @@ impl VisitedSet {
                 let (e, g) = at(i, lo, hi);
                 (starts[i][e.end] - starts[i][e.start]) as usize + g.len()
             },
-            |i, lo, hi| -> Result<Vec<Change>> {
+            |i, lo, hi| -> Result<std::borrow::Cow<'_, [Change]>> {
                 let (region, new, hulls, grown) = parts[i];
                 let (e, g) = at(i, lo, hi);
                 let mut fresh: Vec<Change> = Vec::with_capacity((starts[i][e.end] - starts[i][e.start]) as usize);
@@ -235,7 +241,7 @@ impl VisitedSet {
                 }
                 out.extend(g);
                 anyhow::ensure!(out.windows(2).all(|w| (w[0].key, w[0].cell) < (w[1].key, w[1].cell)), "region {region}: grown states not by key and cell");
-                Ok(out)
+                Ok(std::borrow::Cow::Owned(out))
             },
         )
     }
