@@ -708,7 +708,7 @@ pub fn run_wave(engine: &dyn FrameStep, front: &Frontier, cx: WaveCtx) -> Result
                             let c = &cells[k];
                             let mut st = c.lock().expect("a route");
                             let r = match regions[k] {
-                                Some(region) => super::route::seal(&mut st, region, finals, visited).map(Some),
+                                Some(region) => super::route::seal(&mut st, region, frame, finals, visited).map(Some),
                                 // A route of a new shape whose records the
                                 // coarser level all dropped.
                                 None if !st.is_used() => Ok(None),
@@ -786,6 +786,8 @@ pub fn run_wave(engine: &dyn FrameStep, front: &Frontier, cx: WaveCtx) -> Result
         let mut big: Vec<&Sealed> = new.iter().collect();
         big.sort_by(|a, b| b.t.iter().sum::<std::time::Duration>().cmp(&a.t.iter().sum()));
         let parts = |t: &[f64; 3]| format!("sort {:.0}, compare {:.0}, table {:.0} ms", t[0], t[1], t[2]);
+        let ages = new.iter().fold([[0u64; 7]; 2], |a, sl| std::array::from_fn(|i| std::array::from_fn(|k| a[i][k] + sl.held_by_age[i][k])));
+        eprintln!("[seal] f{frame}: held states compared: {} full, by age (frame less layer) 1: {}, 2-3: {}, 4-7: {}, 8-15: {}, 16-31: {}, 32+: {}; of them grown: {}, {}, {}, {}, {}, {}", ages[0][0], ages[0][1], ages[0][2], ages[0][3], ages[0][4], ages[0][5], ages[0][6], ages[1][1], ages[1][2], ages[1][3], ages[1][4], ages[1][5], ages[1][6]);
         eprintln!(
             "[seal] f{frame}: {} routes, {} waiting bundles in {} segments, worker time {}; the longest: {}",
             new.len(),

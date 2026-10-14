@@ -636,6 +636,11 @@ pub struct Sealed {
     pub t: [std::time::Duration; 3],
     /// The bundles that waited (their segments, bundles: `reencode`).
     pub waited: (usize, u64),
+    /// The held states it compared: full (no hull stored), and by AGE
+    /// (frame less layer: 1, 2-3, 4-7, 8-15, 16-31, 32+), and the grown
+    /// ones by age (`--phases`' `[seal]`: how old the states a frame
+    /// reaches again are).
+    pub held_by_age: [[u64; 7]; 2],
 }
 
 /// The frame's new transfers' canonical ids (`edges::XferTable::
@@ -663,7 +668,7 @@ impl Renumber<'_> {
 /// whose hull grew GREW. The bundles that waited stay in `st.prov`, encoded
 /// again with their final keys and ids by `reencode` (the edge file's
 /// writer, beside the rest of the frame's end).
-pub fn seal(st: &mut RouteState, region: u32, finals: &FxHashMap<Key, Key>, visited: &VisitedSet) -> Result<Sealed> {
+pub fn seal(st: &mut RouteState, region: u32, frame: u32, finals: &FxHashMap<Key, Key>, visited: &VisitedSet) -> Result<Sealed> {
     st.region = Some(region);
     for seg in &mut st.segs {
         seg.1.region = region;
@@ -681,6 +686,7 @@ pub fn seal(st: &mut RouteState, region: u32, finals: &FxHashMap<Key, Key>, visi
     mark(0);
     let (mut keys, mut masks, mut hulls): (Vec<Key>, Vec<u64>, Vec<Hull>) = (Vec::new(), Vec::new(), Vec::new());
     let (mut grown, mut grown_at): (Vec<super::wave::Old>, Vec<u32>) = (Vec::new(), Vec::new());
+    let mut held_by_age = [[0u64; 7]; 2];
     let infos = visited.region_infos(region);
     // The touched keys are by key, their runs and visited entries anywhere:
     // each fetched ahead (`AHEAD` keys), its visited run once its entry is in.
@@ -709,13 +715,26 @@ pub fn seal(st: &mut RouteState, region: u32, finals: &FxHashMap<Key, Key>, visi
                 continue;
             }
             // No hull stored: it is FULL, and grows no more.
-            let Some(StateInfo { hull, layer }) = infos.and_then(|m| m.get(ve, c)) else { continue };
+            let Some(StateInfo { hull, layer }) = infos.and_then(|m| m.get(ve, c)) else {
+                held_by_age[0][0] += 1;
+                continue;
+            };
+            let age = |l: u16| match frame.saturating_sub(l as u32) {
+                0..=1 => 1,
+                2..=3 => 2,
+                4..=7 => 3,
+                8..=15 => 4,
+                16..=31 => 5,
+                _ => 6,
+            };
+            held_by_age[0][age(layer)] += 1;
             let mut a = acc;
             a.add_hull(&hull);
             let h = a.hull().expect("a hull holds points");
             if h != hull {
                 grown.push(super::wave::Old { sk: Sk { region, key, local: c as u8 }, layer, hull: h, was: hull });
                 grown_at.push(ve);
+                held_by_age[1][age(layer)] += 1;
             }
         }
     }
@@ -723,7 +742,7 @@ pub fn seal(st: &mut RouteState, region: u32, finals: &FxHashMap<Key, Key>, visi
     let table = RegionTable::from_sorted(&keys, &masks)?;
     mark(2);
     let waited = (st.prov.len(), st.prov.iter().map(|x| x.1.bundles as u64).sum());
-    Ok(Sealed { region, table, hulls, grown, grown_at, touched: n_touched, t, waited })
+    Ok(Sealed { region, table, hulls, grown, grown_at, touched: n_touched, t, waited, held_by_age })
 }
 
 /// A job's bundles that WAITED (`RouteState::prov`), decoded and encoded
