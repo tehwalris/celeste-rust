@@ -769,10 +769,12 @@ pub fn run_wave(engine: &dyn FrameStep, front: &Frontier, cx: WaveCtx) -> Result
         big.sort_by(|a, b| b.t.iter().sum::<std::time::Duration>().cmp(&a.t.iter().sum()));
         let parts = |t: &[f64; 4]| format!("sort {:.0}, compare {:.0}, table {:.0}, waiting bundles {:.0} ms", t[0], t[1], t[2], t[3]);
         eprintln!(
-            "[seal] f{frame}: {} routes, worker time {}; the longest: {}",
+            "[seal] f{frame}: {} routes, {} waiting bundles in {} segments, worker time {}; the longest: {}",
             new.len(),
+            new.iter().map(|sl| sl.waited.1).sum::<u64>(),
+            new.iter().map(|sl| sl.waited.0).sum::<usize>(),
             parts(&sum),
-            big.iter().take(3).map(|sl| format!("r{} ({} states: {})", sl.region, sl.touched, parts(&sl.t.map(ms)))).collect::<Vec<_>>().join("; ")
+            big.iter().take(3).map(|sl| format!("r{} ({} states, {} waiting bundles in {} segments: {})", sl.region, sl.touched, sl.waited.1, sl.waited.0, parts(&sl.t.map(ms)))).collect::<Vec<_>>().join("; ")
         );
     }
     if let Some(f) = filters.marks {

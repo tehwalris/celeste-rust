@@ -634,6 +634,8 @@ pub struct Sealed {
     /// bundles that waited encoded again (`--phases`' `[seal]`).
     pub touched: usize,
     pub t: [std::time::Duration; 4],
+    /// The bundles that waited (their segments, bundles).
+    pub waited: (usize, u64),
 }
 
 /// The frame's new transfers' canonical ids (`edges::XferTable::
@@ -724,6 +726,7 @@ pub fn seal(st: &mut RouteState, region: u32, finals: &FxHashMap<Key, Key>, renu
     // final keys and ids (a segment a job, as it was made).
     let mut dz = zstd::bulk::Decompressor::new()?;
     let mut raw: Vec<u8> = Vec::new();
+    let waited = (st.prov.len(), st.prov.iter().map(|x| x.1.bundles as u64).sum());
     for (slice, seg) in std::mem::take(&mut st.prov) {
         bundle::decompress(&seg.bytes, seg.raw as usize, &mut dz, &mut raw)?;
         let mut v: Vec<Bundle> = Vec::with_capacity(seg.bundles as usize);
@@ -748,5 +751,5 @@ pub fn seal(st: &mut RouteState, region: u32, finals: &FxHashMap<Key, Key>, renu
     // waited by slice (one job a (route, slice): the keys are distinct).
     st.segs.sort_unstable_by_key(|s| s.0);
     mark(3);
-    Ok(Sealed { region, table, hulls, grown, grown_at, touched: n_touched, t })
+    Ok(Sealed { region, table, hulls, grown, grown_at, touched: n_touched, t, waited })
 }
