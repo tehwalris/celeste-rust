@@ -905,9 +905,9 @@ pub fn run_wave(engine: &dyn FrameStep, front: Frontier, cx: WaveCtx) -> Result<
     mark("absorb", &mut st);
     // The grown states by layer, each layer's by state: every route's
     // (sorted by state) put in layer order (in parallel), then the routes'
-    // runs, in region order, appended to their layers' lists and freed one
-    // by one - the runs and the lists are never both whole (both were: 48 B
-    // a grown state twice at the frame's end).
+    // runs, in region order, appended to their layers' lists and freed a
+    // group at a time - the runs and the lists are never both whole (both
+    // were: 48 B a grown state twice at the frame's end).
     let mut runs: Vec<Vec<Old>> = Vec::with_capacity(new.len());
     let mut next = Layer::default();
     let mut hulls: Vec<Hull> = Vec::with_capacity(new.iter().map(|sl| sl.hulls.len()).sum());
@@ -927,17 +927,28 @@ pub fn run_wave(engine: &dyn FrameStep, front: Frontier, cx: WaveCtx) -> Result<
     for o in runs.iter().flatten() {
         count[o.layer as usize] += 1;
     }
-    let mut by: Vec<Vec<Old>> = count.iter().map(|&n| Vec::with_capacity(n)).collect();
-    for r in runs {
-        let mut a = 0;
-        while a < r.len() {
-            let l = r[a].layer;
-            let b = a + r[a..].partition_point(|o| o.layer == l);
-            by[l as usize].extend_from_slice(&r[a..b]);
-            a = b;
+    // A group of routes at a time (in region order, about a 32nd of the
+    // grown states), its layers' slices appended in parallel, then freed.
+    let by: Vec<std::sync::Mutex<Vec<Old>>> = count.iter().map(|&n| std::sync::Mutex::new(Vec::with_capacity(n))).collect();
+    let layers: Vec<usize> = (0..count.len()).filter(|&l| count[l] > 0).collect();
+    let group_states = count.iter().sum::<usize>() / 32 + 1;
+    let mut runs = runs;
+    while !runs.is_empty() {
+        let (mut k, mut n) = (0, 0);
+        while k < runs.len() && n < group_states {
+            n += runs[k].len();
+            k += 1;
         }
+        let group: Vec<Vec<Old>> = runs.drain(..k).collect();
+        par_map(&layers, s.threads(), |&l| {
+            let mut v = by[l].lock().expect("a layer's grown states");
+            for r in &group {
+                let (a, b) = (r.partition_point(|o| (o.layer as usize) < l), r.partition_point(|o| (o.layer as usize) <= l));
+                v.extend_from_slice(&r[a..b]);
+            }
+        });
     }
-    let grown: ByLayer = by.into_iter().enumerate().filter(|x| !x.1.is_empty()).map(|(l, v)| (l as u16, v)).collect();
+    let grown: ByLayer = by.into_iter().enumerate().map(|(l, v)| (l as u16, v.into_inner().expect("a layer's grown states"))).filter(|x| !x.1.is_empty()).collect();
     let mut shapes_in: Vec<u32> = next.set.tables().iter().map(|(r, _)| r / GEOMETRY.slots).collect();
     shapes_in.dedup();
     for si in shapes_in {
