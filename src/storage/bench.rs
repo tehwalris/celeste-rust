@@ -431,7 +431,8 @@ impl Counters {
         std::array::from_fn(|k| now[k].wrapping_sub(at[k]))
     }
 
-    fn read(&self) -> [u64; 4] {
+    /// The counts so far (every thread joined so far).
+    pub fn read(&self) -> [u64; 4] {
         let mut out = [0u64; 4];
         for (o, &fd) in out.iter_mut().zip(&self.fds) {
             // SAFETY: an open perf event fd: a plain read of its u64 count.
@@ -439,6 +440,32 @@ impl Counters {
         }
         out
     }
+}
+
+/// The counters a bench installed for the frame's STEPS (`step_counts`):
+/// the frame end's and the checkpoint's steps read them at their marks.
+static STEPS: std::sync::OnceLock<Counters> = std::sync::OnceLock::new();
+
+/// Install `c` as the step counters (once a process); the installed ones.
+pub fn count_steps(c: Counters) -> &'static Counters {
+    STEPS.get_or_init(|| c)
+}
+
+/// The step counters' counts now (`None`: no bench installed them). Read
+/// on the thread that opened them, between steps (each step's threads
+/// joined: their counts are in).
+pub fn step_counts() -> Option<[u64; 4]> {
+    STEPS.get().map(Counters::read)
+}
+
+/// The counts between two `step_counts`.
+pub fn counts_since(at: Option<[u64; 4]>) -> ([u64; 4], Option<[u64; 4]>) {
+    let now = step_counts();
+    let d = match (at, now) {
+        (Some(a), Some(b)) => std::array::from_fn(|k| b[k].wrapping_sub(a[k])),
+        _ => [0; 4],
+    };
+    (d, now)
 }
 
 impl Drop for Counters {
@@ -455,12 +482,13 @@ pub fn load_average() -> f64 {
     std::fs::read_to_string("/proc/loadavg").ok().and_then(|s| s.split_whitespace().next()?.parse().ok()).unwrap_or(0.0)
 }
 
-/// A report line: its label, per rep its seconds (`None`: not measured),
-/// and the element its cost is per (name, count per rep).
+/// A report line: its label, per rep its seconds, the element its cost is
+/// per (name, count per rep), and per rep its counts (`Counters`; a step's).
 struct Line {
     label: String,
     secs: Vec<f64>,
     per: Option<(&'static str, Vec<f64>)>,
+    counts: Option<Vec<[u64; 4]>>,
 }
 
 /// THE COST REPORT of a frame's reps (`bench-frame`; plans/fwd-bench.md):
@@ -477,7 +505,7 @@ pub fn print_cost(frame: u32, reps: &[Rep]) {
     let col = |f: &dyn Fn(&Rep) -> f64| reps.iter().map(f).collect::<Vec<f64>>();
     let dur = |d: std::time::Duration| d.as_secs_f64();
     let mut lines: Vec<Line> = Vec::new();
-    let mut line = |label: &str, secs: Vec<f64>, per: Option<(&'static str, Vec<f64>)>| lines.push(Line { label: label.to_string(), secs, per });
+    let mut line = |label: &str, secs: Vec<f64>, per: Option<(&'static str, Vec<f64>)>| lines.push(Line { label: label.to_string(), secs, per, counts: None });
     let n = |f: fn(&crate::frame::FrameStats) -> f64| col(&|r| f(&r.stats));
     let lanes_in = n(|s| s.lanes_in as f64);
     let emissions = n(|s| s.lanes_raw as f64);
@@ -499,7 +527,7 @@ pub fn print_cost(frame: u32, reps: &[Rep]) {
     let unit_parts = [ph::SETUP, ph::PACK, ph::KERNEL, ph::EMIT];
     let disjoint = [ph::DECODE, ph::UNIT, ph::END_UNIT, ph::OUT_BLOCKS, ph::REPUSH, ph::REGIONS, ph::GATHER];
     let mut ws: Vec<Line> = Vec::new();
-    let mut wline = |label: &str, secs: Vec<f64>, per: Option<(&'static str, Vec<f64>)>| ws.push(Line { label: label.to_string(), secs, per });
+    let mut wline = |label: &str, secs: Vec<f64>, per: Option<(&'static str, Vec<f64>)>| ws.push(Line { label: label.to_string(), secs, per, counts: None });
     wline("unit decode (rows from keys)", p(ph::DECODE), Some(("lane in", lanes_in.clone())));
     wline("slice setup", p(ph::SETUP), Some(("lane in", lanes_in.clone())));
     wline("pack", p(ph::PACK), Some(("lane in", lanes_in.clone())));
@@ -526,15 +554,15 @@ pub fn print_cost(frame: u32, reps: &[Rep]) {
         ("edge", edges.clone()),
     ];
     for (k, (name, per)) in crate::frame::END_STEPS.iter().zip(per_end).enumerate() {
-        steps.push(Line { label: format!("end: {name}"), secs: col(&|r| dur(r.stats.t_end[k])), per: Some(per) });
+        steps.push(Line { label: format!("end: {name}"), secs: col(&|r| dur(r.stats.t_end[k])), per: Some(per), counts: Some(reps.iter().map(|r| r.stats.end_counts[k]).collect()) });
     }
-    steps.push(Line { label: "end: rest (untimed)".into(), secs: col(&|r| dur(r.stats.t_layer) - r.stats.t_end.iter().map(|&d| dur(d)).sum::<f64>()), per: None });
+    steps.push(Line { label: "end: rest (untimed)".into(), secs: col(&|r| dur(r.stats.t_layer) - r.stats.t_end.iter().map(|&d| dur(d)).sum::<f64>()), per: None, counts: None });
     if r0.ckpt.is_some() {
         let per_ckpt = [new_states.clone(), new_states.clone(), frontier_out.clone(), frontier_out.clone()];
         for (k, (name, per)) in crate::frame::CKPT_STEPS.iter().zip(per_ckpt).enumerate() {
-            steps.push(Line { label: format!("checkpoint: {name}"), secs: col(&|r| r.ckpt.map_or(0.0, |c| dur(c.0.t[k]))), per: Some(("state", per)) });
+            steps.push(Line { label: format!("checkpoint: {name}"), secs: col(&|r| r.ckpt.map_or(0.0, |c| dur(c.0.t[k]))), per: Some(("state", per)), counts: Some(reps.iter().map(|r| r.ckpt.map_or([0; 4], |c| c.0.counts[k])).collect()) });
         }
-        steps.push(Line { label: "checkpoint: pos graph".into(), secs: col(&|r| r.ckpt.map_or(0.0, |c| dur(c.1))), per: None });
+        steps.push(Line { label: "checkpoint: pos graph".into(), secs: col(&|r| r.ckpt.map_or(0.0, |c| dur(c.1))), per: None, counts: None });
     }
     let mm = |v: &[f64]| (v.iter().copied().fold(f64::INFINITY, f64::min), v.iter().copied().fold(f64::NEG_INFINITY, f64::max));
     let per_text = |l: &Line| match &l.per {
@@ -571,10 +599,19 @@ pub fn print_cost(frame: u32, reps: &[Rep]) {
         eprintln!("[cost] {:<42} {:>9.2} {:>9.2}  {:>5.1}%  {}", l.label, a, b, 100.0 * a / ba.max(1e-9), per_text(l));
     }
     eprintln!("[cost] {:<42} {:>9.2} {:>9.2}", "  of a budget (workers x wave)", ba, mm(&budget).1);
-    eprintln!("[cost] {:<42} {:>9} {:>9}  per element (the min)", "frame end and checkpoint, wall", "s min", "s max");
+    let counted = reps.iter().all(|r| r.counts.is_some());
+    eprintln!("[cost] {:<42} {:>9} {:>9}  {:>27}  per element (the min)", "frame end and checkpoint, wall", "s min", "s max", if counted { "G ins, user cyc, kernel cyc" } else { "" });
     for l in &steps {
         let (a, b) = mm(&l.secs);
-        eprintln!("[cost] {:<42} {:>9.3} {:>9.3}  {}", l.label, a, b, per_text(l));
+        // A step's counts, the min over the reps of each.
+        let c = match (&l.counts, counted) {
+            (Some(v), true) => {
+                let m = |k: usize| v.iter().map(|c| c[k]).min().unwrap_or(0) as f64 / 1e9;
+                format!("{:>8.2} {:>8.2} {:>9.2}", m(0), m(1), m(2))
+            }
+            _ => String::new(),
+        };
+        eprintln!("[cost] {:<42} {:>9.3} {:>9.3}  {:>27}  {}", l.label, a, b, c, per_text(l));
     }
     if reps.iter().all(|r| r.counts.is_some()) {
         let c = |k: usize| col(&|r| r.counts.map_or(0.0, |c| c[k] as f64));

@@ -625,9 +625,15 @@ pub fn run_wave(engine: &dyn FrameStep, front: &Frontier, cx: WaveCtx) -> Result
     let tl = phases::start(s.diag.phases);
     let mut adds = KeyAdditions::default();
     let mut lap = Instant::now();
+    let mut at = super::bench::step_counts();
     let mut mark = |what: &'static str, st: &mut FrameStats| {
         let k = crate::frame::END_STEPS.iter().position(|&w| w == what).expect("a frame end step");
         st.t_end[k] += lap.elapsed();
+        let (d, now) = super::bench::counts_since(at);
+        at = now;
+        for (a, b) in st.end_counts[k].iter_mut().zip(d) {
+            *a += b;
+        }
         lap = Instant::now();
     };
     let finals = finalize_keys(visited, &states, &prov, &mut adds);

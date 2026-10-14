@@ -589,6 +589,9 @@ pub struct FrameStats {
     /// file), wall, and its steps' (`END_STEPS`).
     pub t_layer: std::time::Duration,
     pub t_end: [std::time::Duration; END_STEPS.len()],
+    /// Per step its counts (user instructions and cycles, kernel cycles,
+    /// page faults: `storage::bench::step_counts`; zeros outside a bench).
+    pub end_counts: [[u64; 4]; END_STEPS.len()],
     /// `--phases`: the wave's phases, seconds summed over the workers
     /// (`phases::take`; zeros without).
     pub phase_s: [f64; phases::N],
@@ -789,6 +792,8 @@ pub struct Checkpointed {
     pub frame_bytes: u64,
     pub hull_bytes: u64,
     pub t: [std::time::Duration; CKPT_STEPS.len()],
+    /// Per step its counts (`FrameStats::end_counts`).
+    pub counts: [[u64; 4]; CKPT_STEPS.len()],
 }
 
 /// A checkpoint's steps (`Checkpointed::t`).
@@ -803,8 +808,10 @@ fn checkpoint(dir: &std::path::Path, frame: u32, wave: &crate::storage::wave::Wa
     use crate::storage::{hulls, layer};
     let mut c = Checkpointed { won: !wave.wins.is_empty(), ..Default::default() };
     let mut lap = std::time::Instant::now();
+    let mut at = crate::storage::bench::step_counts();
     let mut mark = |k: usize| {
         c.t[k] = lap.elapsed();
+        (c.counts[k], at) = crate::storage::bench::counts_since(at);
         lap = std::time::Instant::now();
     };
     let path = layer::frame_path(dir, frame);

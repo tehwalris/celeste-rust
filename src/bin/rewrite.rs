@@ -1182,7 +1182,7 @@ fn main() -> Result<()> {
             let ms = |d: std::time::Duration| d.as_secs_f64() * 1e3;
             let mut lines: Option<String> = None;
             let mut costs: Vec<celeste_rust::storage::bench::Rep> = Vec::new();
-            let counters = celeste_rust::storage::bench::Counters::open();
+            let counters = celeste_rust::storage::bench::Counters::open().map(celeste_rust::storage::bench::count_steps);
             for rep in 0..reps {
                 let _ = std::fs::remove_dir_all(&scratch);
                 let load = celeste_rust::storage::bench::load_average();
