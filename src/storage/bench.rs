@@ -360,18 +360,18 @@ pub struct Rep {
     pub workers: usize,
     pub wall: std::time::Duration,
     pub load: f64,
-    pub counts: Option<[u64; 3]>,
+    pub counts: Option<[u64; 4]>,
 }
 
 /// HARDWARE COUNTERS over a rep, every thread it starts included (Linux
 /// `perf_event_open`, `inherit`: a thread's counts join its parent's when
 /// it exits, and a frame's threads are all joined by its end): user-mode
-/// instructions, user-mode cycles, kernel-mode cycles. Instructions do
+/// instructions, user-mode cycles, kernel-mode cycles, page faults. Instructions do
 /// not move with the machine's load as walls do (a shared machine's other
 /// jobs slow a rep, they do not add to its instructions). `None` where the
 /// kernel refuses (`perf_event_paranoid`).
 pub struct Counters {
-    fds: [i32; 3],
+    fds: [i32; 4],
 }
 
 impl Counters {
@@ -395,12 +395,14 @@ impl Counters {
             config1: u64,
         }
         const HW: u32 = 0;
+        const SW: u32 = 1;
         const CYCLES: u64 = 0;
         const INSTRUCTIONS: u64 = 1;
+        const PAGE_FAULTS: u64 = 2;
         let (disabled, inherit, excl_user, excl_kernel, excl_hv) = (1u64, 1u64 << 1, 1u64 << 4, 1u64 << 5, 1u64 << 6);
-        let mut fds = [-1i32; 3];
-        for (fd, (config, excl)) in fds.iter_mut().zip([(INSTRUCTIONS, excl_kernel | excl_hv), (CYCLES, excl_kernel | excl_hv), (CYCLES, excl_user | excl_hv)]) {
-            let attr = Attr { kind: HW, size: std::mem::size_of::<Attr>() as u32, config, sample_period: 0, sample_type: 0, read_format: 0, flags: disabled | inherit | excl, wakeup_events: 0, bp_type: 0, config1: 0 };
+        let mut fds = [-1i32; 4];
+        for (fd, (kind, config, excl)) in fds.iter_mut().zip([(HW, INSTRUCTIONS, excl_kernel | excl_hv), (HW, CYCLES, excl_kernel | excl_hv), (HW, CYCLES, excl_user | excl_hv), (SW, PAGE_FAULTS, 0)]) {
+            let attr = Attr { kind, size: std::mem::size_of::<Attr>() as u32, config, sample_period: 0, sample_type: 0, read_format: 0, flags: disabled | inherit | excl, wakeup_events: 0, bp_type: 0, config1: 0 };
             // SAFETY: a valid attr for the calling thread (pid 0, any cpu,
             // no group, no flags); the fd is closed in `Drop`.
             let r = unsafe { libc::syscall(libc::SYS_perf_event_open, &attr as *const Attr, 0, -1, -1, 0) };
@@ -415,7 +417,7 @@ impl Counters {
     /// Counting; the counts so far (`stop` takes the difference: a reset
     /// would not reset the exited threads' counts, which `inherit` keeps
     /// apart).
-    pub fn start(&self) -> [u64; 3] {
+    pub fn start(&self) -> [u64; 4] {
         for &fd in &self.fds {
             // SAFETY: an open perf event fd; ENABLE 0x2400.
             unsafe { libc::ioctl(fd, 0x2400, 0) };
@@ -424,13 +426,13 @@ impl Counters {
     }
 
     /// The counts since `start` (`at`: what it returned).
-    pub fn stop(&self, at: [u64; 3]) -> [u64; 3] {
+    pub fn stop(&self, at: [u64; 4]) -> [u64; 4] {
         let now = self.read();
         std::array::from_fn(|k| now[k].wrapping_sub(at[k]))
     }
 
-    fn read(&self) -> [u64; 3] {
-        let mut out = [0u64; 3];
+    fn read(&self) -> [u64; 4] {
+        let mut out = [0u64; 4];
         for (o, &fd) in out.iter_mut().zip(&self.fds) {
             // SAFETY: an open perf event fd: a plain read of its u64 count.
             unsafe { libc::read(fd, o as *mut u64 as *mut libc::c_void, 8) };
@@ -576,10 +578,10 @@ pub fn print_cost(frame: u32, reps: &[Rep]) {
     }
     if reps.iter().all(|r| r.counts.is_some()) {
         let c = |k: usize| col(&|r| r.counts.map_or(0.0, |c| c[k] as f64));
-        let (ins, cyc, kcyc) = (c(0), c(1), c(2));
+        let (ins, cyc, kcyc, faults) = (c(0), c(1), c(2), c(3));
         let (ia, ib) = mm(&ins);
         eprintln!(
-            "[cost] counted, every thread: user instructions {:.1} G - {:.1} G ({:.0} an emission, {:.0} a lane in), user cycles {:.1} G (IPC {:.2}), kernel-mode cycles {:.1} G ({:.0}% of all)",
+            "[cost] counted, every thread: user instructions {:.1} G - {:.1} G ({:.0} an emission, {:.0} a lane in), user cycles {:.1} G (IPC {:.2}), kernel-mode cycles {:.1} G ({:.0}% of all), page faults {:.2} M - {:.2} M",
             ia / 1e9,
             ib / 1e9,
             ia / emissions[0].max(1.0),
@@ -587,7 +589,9 @@ pub fn print_cost(frame: u32, reps: &[Rep]) {
             mm(&cyc).0 / 1e9,
             ins[0] / cyc[0].max(1.0),
             mm(&kcyc).0 / 1e9,
-            100.0 * kcyc[0] / (kcyc[0] + cyc[0]).max(1.0)
+            100.0 * kcyc[0] / (kcyc[0] + cyc[0]).max(1.0),
+            mm(&faults).0 / 1e6,
+            mm(&faults).1 / 1e6
         );
     }
     let gb = |b: u64| b as f64 / 1e9;
