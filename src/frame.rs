@@ -936,6 +936,11 @@ impl ForwardState {
         &self.frontier
     }
 
+    /// The out store and the transfer table (`bench-frame`'s `[memory]`).
+    pub fn outs_and_xfers(&self) -> (&crate::storage::out::OutStore, &crate::storage::edges::XferTable) {
+        (&self.outs, &self.xfers)
+    }
+
     /// The tree's ceiling for the frontier's `not_expanded` (its level -1
     /// horizon; a tree without a record by the run's `s`, as it was built).
     fn ceiling(&self, s: &crate::settings::Settings) -> Option<u32> {

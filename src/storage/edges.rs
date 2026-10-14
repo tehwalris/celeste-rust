@@ -36,6 +36,13 @@ pub struct XferTable {
     flushed: usize,
 }
 
+impl XferTable {
+    /// Bytes held: the pairs, the index (a hash map's slot and control byte each).
+    pub fn bytes(&self) -> [usize; 2] {
+        [self.pairs.capacity() * std::mem::size_of::<Pair>(), self.index.capacity() * (std::mem::size_of::<(Pair, u32)>() + 1)]
+    }
+}
+
 fn xfer_path(dir: &Path) -> PathBuf {
     dir.join("xfer.bin")
 }

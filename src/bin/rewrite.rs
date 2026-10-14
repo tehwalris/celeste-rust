@@ -1178,6 +1178,10 @@ fn main() -> Result<()> {
                 cfg.threads(),
                 celeste_rust::metrics::current_rss_gb()
             );
+            {
+                let (fr, (outs, xfers)) = (st.frontier(), st.outs_and_xfers());
+                celeste_rust::storage::bench::print_memory(&format!("f{frame} loaded"), st.visited(), &fr.new, &fr.hulls, &fr.old, outs, xfers);
+            }
             let scratch = dir.join("bench-edges");
             let ms = |d: std::time::Duration| d.as_secs_f64() * 1e3;
             let mut lines: Option<String> = None;
@@ -1222,6 +1226,9 @@ fn main() -> Result<()> {
                     celeste_rust::metrics::peak_rss_gb(),
                 );
                 costs.push(celeste_rust::storage::bench::Rep { stats: *w, ckpt, workers: cfg.threads(), wall: t_all, load, counts });
+                if rep + 1 == reps {
+                    celeste_rust::storage::bench::print_memory(&format!("f{} made (the out store as loaded)", frame + 1), &visited, &wave.next, &wave.hulls, &wave.grown, st.outs_and_xfers().0, &xfers);
+                }
                 let (n, acc) = wave.next.content_fingerprint(&visited.keys, visited.shapes())?;
                 let mut out = format!("f{:03} {n} {acc:016x}\n", frame + 1);
                 let (nh, ah) = celeste_rust::storage::hulls::fingerprint(wave.frontier_states(frame + 1), &visited.keys, visited.shapes())?;

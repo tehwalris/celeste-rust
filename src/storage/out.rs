@@ -575,6 +575,11 @@ pub struct OutStore {
 }
 
 impl OutStore {
+    /// Bytes its block indices hold (the files are mapped, not counted).
+    pub fn index_bytes(&self) -> usize {
+        self.frames.iter().flatten().map(|f| f.heads.capacity() * std::mem::size_of::<BlockHead>()).sum()
+    }
+
     /// Frames `1..=horizon`'s out files under `edges_dir`.
     pub fn open(edges_dir: &Path, horizon: u32) -> Result<Self> {
         let mut s = OutStore { frames: vec![None], bytes: 0 };

@@ -153,7 +153,15 @@ impl RegionInfos {
     }
 
     pub fn alloc_bytes(&self) -> usize {
-        self.starts.capacity() * 4 + self.masks.capacity() * 8 + self.slots.capacity() * std::mem::size_of::<StateInfo>()
+        self.bytes().iter().sum()
+    }
+
+    /// Bytes allocated (`[memory]`): the per-entry index (run starts and
+    /// cell masks), the live slots, the dead ones (runs moved away), the
+    /// room past them.
+    pub fn bytes(&self) -> [usize; 4] {
+        let slot = std::mem::size_of::<StateInfo>();
+        [self.starts.capacity() * 4 + self.masks.capacity() * 8, (self.slots.len() - self.dead) * slot, self.dead * slot, (self.slots.capacity() - self.slots.len()) * slot]
     }
 }
 
@@ -411,5 +419,27 @@ impl VisitedSet {
     /// Bytes allocated: the set's, and the hulls'.
     pub fn alloc_bytes(&self) -> usize {
         self.set.alloc_bytes() + self.info.values().map(|m| m.alloc_bytes()).sum::<usize>()
+    }
+
+    /// Its bytes by part (`[memory]`): the set's keys, masks, hash index and
+    /// lists; the hull store's entry index, live, dead and spare slots; the
+    /// key space.
+    pub fn census(&self) -> Vec<(&'static str, usize)> {
+        let s = self.set.bytes();
+        let i = self.info.values().fold([0usize; 4], |a, m| {
+            let b = m.bytes();
+            std::array::from_fn(|k| a[k] + b[k])
+        });
+        vec![
+            ("visited: keys", s[0]),
+            ("visited: cell masks", s[1]),
+            ("visited: hash index", s[2]),
+            ("visited: lists", s[3] + self.info.capacity() * (std::mem::size_of::<(u32, RegionInfos)>() + 1)),
+            ("hulls: entry index (run starts, cells)", i[0]),
+            ("hulls: live slots (hull 8 B + layer 2 B)", i[1]),
+            ("hulls: dead slots", i[2]),
+            ("hulls: spare room", i[3]),
+            ("key space", self.keys.alloc_bytes()),
+        ]
     }
 }

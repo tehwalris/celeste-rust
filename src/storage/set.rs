@@ -432,7 +432,18 @@ impl RegionTable {
     }
 
     pub fn alloc_bytes(&self) -> usize {
-        self.keys.iter().map(|c| c.capacity()).sum::<usize>() + self.masks.iter().map(|c| c.capacity() * 8).sum::<usize>() + (self.keys.capacity() + self.masks.capacity()) * 24 + self.index.as_ref().map_or(0, |ix| ix.slots.capacity() * 4)
+        self.bytes().iter().sum()
+    }
+
+    /// Bytes allocated (`[memory]`): the keys (with their chunks' room), the
+    /// masks, the hash index, the chunk lists.
+    pub fn bytes(&self) -> [usize; 4] {
+        [
+            self.keys.iter().map(|c| c.capacity()).sum::<usize>(),
+            self.masks.iter().map(|c| c.capacity() * 8).sum::<usize>(),
+            self.index.as_ref().map_or(0, |ix| ix.slots.capacity() * 4),
+            (self.keys.capacity() + self.masks.capacity()) * 24,
+        ]
     }
 }
 
@@ -514,7 +525,18 @@ impl RegionSet {
 
     /// Bytes allocated.
     pub fn alloc_bytes(&self) -> usize {
-        self.tables.capacity() * std::mem::size_of::<(u32, RegionTable)>() + self.tables.iter().map(|t| t.1.alloc_bytes()).sum::<usize>()
+        self.bytes().iter().sum()
+    }
+
+    /// `RegionTable::bytes` summed, the region list in the last.
+    pub fn bytes(&self) -> [usize; 4] {
+        let mut b = [0, 0, 0, self.tables.capacity() * std::mem::size_of::<(u32, RegionTable)>()];
+        for (_, t) in &self.tables {
+            for (a, x) in b.iter_mut().zip(t.bytes()) {
+                *a += x;
+            }
+        }
+        b
     }
 
     /// The `(region, table)` holding entry `e` of the whole set (its

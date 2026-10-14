@@ -678,3 +678,32 @@ pub fn dir_fingerprint(dir: &Path) -> Result<(u64, u64, u64)> {
     }
     Ok((files.len() as u64, bytes, acc))
 }
+
+/// THE MEMORY CENSUS of a forward between frames (`bench-frame`'s
+/// `[memory]`): what its structures allocate, by part, against the visited
+/// set's states and entries, beside the process's resident set (the rest:
+/// the kernels, the allocator's retained and fragmented pages, what no
+/// part counts).
+pub fn print_memory(when: &str, visited: &super::visited::VisitedSet, new: &super::layer::Layer, hulls: &[crate::search::hull::Hull], old: &super::wave::ByLayer, outs: &super::out::OutStore, xfers: &super::edges::XferTable) {
+    let mut parts: Vec<(&str, usize)> = visited.census();
+    let f = new.set.bytes();
+    parts.push(("frontier: new states' keys, masks, index", f.iter().sum()));
+    parts.push(("frontier: new states' hulls", std::mem::size_of_val(hulls)));
+    parts.push(("frontier: old states (48 B each)", old.iter().map(|x| x.1.capacity() * std::mem::size_of::<super::wave::Old>()).sum::<usize>() + old.capacity() * 32));
+    parts.push(("out store: block indices", outs.index_bytes()));
+    let x = xfers.bytes();
+    parts.push(("transfers: pairs", x[0]));
+    parts.push(("transfers: index", x[1]));
+    let (v, e) = (visited.len().max(1) as f64, visited.entries().max(1) as f64);
+    let total: usize = parts.iter().map(|p| p.1).sum();
+    let gb = |b: usize| b as f64 / 1e9;
+    eprintln!("[memory] {when}: {} states in {} entries ({:.2} states an entry), {} new and {} old in the frontier", visited.len(), visited.entries(), v / e, new.states(), super::wave::by_layer_states(old));
+    eprintln!("[memory] {:<44} {:>9} {:>9} {:>9}", "part", "GB", "B/state", "B/entry");
+    for (name, b) in &parts {
+        eprintln!("[memory] {:<44} {:>9.3} {:>9.2} {:>9.2}", name, gb(*b), *b as f64 / v, *b as f64 / e);
+    }
+    let anon = crate::metrics::current_rss_gb();
+    eprintln!("[memory] {:<44} {:>9.3} {:>9.2}", "counted", gb(total), total as f64 / v);
+    eprintln!("[memory] {:<44} {:>9.3} {:>9.2}", "anonymous resident (RssAnon)", anon, anon * 1e9 / v);
+    eprintln!("[memory] {:<44} {:>9.3} {:>9.2}", "  not counted (kernels, allocator, rest)", anon - gb(total), (anon * 1e9 - total as f64) / v);
+}
