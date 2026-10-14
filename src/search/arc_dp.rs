@@ -408,6 +408,27 @@ const MADE: u32 = 1 << 30;
 const ROUND_EMITS: usize = 20 << 20;
 const _: () = assert!(std::mem::size_of::<Emit>() == 40, "ROUND_EMITS is sized for 40-B emissions");
 
+/// A step's own sets past this many bytes are compacted between its
+/// rounds (`compact_local`).
+const LOCAL_COMPACT: usize = 1 << 30;
+
+/// A step's own sets cut to those its sets so far (`acc`) name - a round
+/// replaces the sets of the sources it reached, and the replaced ones are
+/// named by nothing - `acc`'s codes renumbered; the sets and their index.
+fn compact_local(acc: &mut [Acc], local: &RegionArena) -> (RegionArena, FxHashMap<u64, u32>) {
+    let (mut kept, mut index, mut to) = (RegionArena::default(), FxHashMap::default(), vec![u32::MAX; local.len()]);
+    for a in acc.iter_mut().filter(|a| a.set & LOCAL != 0) {
+        let l = (a.set & !LOCAL) as usize;
+        if to[l] == u32::MAX {
+            let r = local.get(l as u32);
+            to[l] = kept.push(r);
+            index.entry(region_hash(r)).or_insert(to[l]);
+        }
+        a.set = to[l] | LOCAL;
+    }
+    (kept, index)
+}
+
 fn region_hash(r: RegionRef) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut hs = rustc_hash::FxHasher::default();
@@ -513,8 +534,11 @@ pub struct Backward<'a> {
     /// Per target region, the steps that read its in-edges.
     opens: FxHashMap<u32, u32>,
     /// A round's in-edges (`ROUND_EMITS`; tests shrink it to exercise the
-    /// rounds).
+    /// rounds), and the step's own sets' bytes past which they are
+    /// compacted between rounds (`LOCAL_COMPACT`; the tests' rounds compact
+    /// always).
     round_emits: usize,
+    local_compact: usize,
     read: ReadStats,
     n_changed: u64,
     n_emits: u64,
@@ -557,6 +581,7 @@ impl<'a> Backward<'a> {
             spill: None,
             opens: FxHashMap::default(),
             round_emits: ROUND_EMITS,
+            local_compact: LOCAL_COMPACT,
             read: ReadStats::default(),
             n_changed: 0,
             n_emits: 0,
@@ -583,6 +608,7 @@ impl<'a> Backward<'a> {
     #[cfg(test)]
     fn with_rounds(mut self, emits: usize) -> Self {
         self.round_emits = emits;
+        self.local_compact = 0;
         self
     }
 
@@ -868,6 +894,9 @@ impl<'a> Backward<'a> {
             d_read += t0.elapsed();
             let t0 = std::time::Instant::now();
             acc = self.fold_round(acc, &parts, &mut local, &mut local_interned);
+            if start < total && local.bytes() > self.local_compact {
+                (local, local_interned) = compact_local(&mut acc, &local);
+            }
             d_pull += t0.elapsed();
         }
         self.n_emits += n_emits as u64;
