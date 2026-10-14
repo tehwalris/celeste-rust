@@ -250,21 +250,22 @@ pub struct RegionCtx<'a> {
     pub new_xfers: u32,
 }
 
-/// A unit's bundles, by route: one probe and an OR an emission in a table
-/// keyed by (bucket, target key, source, transfer, offset) - the last
-/// bundle remembered: a body's lanes mostly share it. Each route's bundles
-/// in a bucket of their own; at the unit's end each bucket's distinct
-/// targets are listed and its bundles name them by index (`drain`).
+/// A unit's bundles, by route: an emission is APPENDED to its route's
+/// bucket (merged into the bucket's last bundle when it is the same, as a
+/// body's lanes mostly are); at the unit's end each bucket is merged
+/// (`drain`: a bundle's later appends ORed into its first, in a table the
+/// bucket's size - small, cache-resident, where one table over the unit
+/// missed the cache on most appends: 86% of them are new bundles), its
+/// distinct targets listed and its bundles naming them by index.
 #[derive(Default)]
 pub struct UnitBundles {
     buckets: Vec<(u32, Vec<(Key, Ub)>)>,
     bucket_of: FxHashMap<u32, u32>,
     last_route: Option<(u32, u32)>,
-    /// `bucket << 32 | position + 1`; 0 empty.
-    index: Vec<u64>,
-    n: usize,
-    last: Option<(u32, u32)>,
-    /// `drain`'s target index.
+    /// `drain`'s merge table (`index + 1` into `merged`; 0 empty), the
+    /// merged bucket, and its target index.
+    slots: Vec<u32>,
+    merged: Vec<(Key, Ub)>,
     t_idx: rustc_hash2::FxHashMap<Key, u32>,
     /// Emptied buckets, kept for the next units (their pages stay mapped),
     /// at most `SPARE_KEEP` bundles' room in all: kept without a bound,
@@ -278,11 +279,8 @@ pub struct UnitBundles {
 const SPARE_KEEP: usize = 1 << 19;
 
 #[inline]
-fn ub_hash(k: u32, t_key: Key, b: &Ub) -> u64 {
-    let h = t_key.1.wrapping_mul(0x9e37_79b9_7f4a_7c15)
-        ^ t_key.0.wrapping_mul(0xc2b2_ae3d_27d4_eb4f)
-        ^ ((k as u64) << 32 | b.s as u64).wrapping_mul(0x1656_67b1_9e37_79f9)
-        ^ ((b.x as u64) << 32 | b.o as u64).wrapping_mul(0x85eb_ca77_c2b2_ae63);
+fn ub_hash(t_key: Key, b: &Ub) -> u64 {
+    let h = t_key.1.wrapping_mul(0x9e37_79b9_7f4a_7c15) ^ t_key.0.wrapping_mul(0xc2b2_ae3d_27d4_eb4f) ^ (b.s as u64).wrapping_mul(0x1656_67b1_9e37_79f9) ^ ((b.x as u64) << 32 | b.o as u64).wrapping_mul(0x85eb_ca77_c2b2_ae63);
     celeste_engine::runtime2::mix64(h)
 }
 
@@ -290,13 +288,10 @@ impl UnitBundles {
     /// Bytes its tables hold (`--phases`' `[wavemem]`).
     pub fn alloc_bytes(&self) -> usize {
         let b = 16 + std::mem::size_of::<Ub>();
-        self.buckets.iter().map(|x| x.1.capacity() * b).sum::<usize>() + self.spare.iter().map(|v| v.capacity() * b).sum::<usize>() + 8 * self.index.capacity() + 24 * self.t_idx.capacity()
+        self.buckets.iter().map(|x| x.1.capacity() * b).sum::<usize>() + self.spare.iter().map(|v| v.capacity() * b).sum::<usize>() + b * self.merged.capacity() + 4 * self.slots.capacity() + 24 * self.t_idx.capacity()
     }
 
     pub fn clear(&mut self) {
-        if self.n > 0 {
-            self.index.fill(0);
-        }
         let mut room: usize = self.spare.iter().map(Vec::capacity).sum();
         for (_, mut v) in self.buckets.drain(..) {
             if room + v.capacity() <= SPARE_KEEP {
@@ -306,21 +301,13 @@ impl UnitBundles {
             }
         }
         self.bucket_of.clear();
-        (self.last_route, self.last, self.n) = (None, None, 0);
+        self.last_route = None;
     }
 
-    /// OR `bit` into the bundle `(route, t_key; source s, x, o)`.
+    /// OR `bit` into the bundle `(route, t_key; source s, x, o)`: appended
+    /// to the route's bucket (merged at `drain`).
     #[inline]
     pub fn insert(&mut self, route: u32, t_key: Key, s: u32, x: u32, o: u32, bit: u64) {
-        let probe = Ub { t: 0, s, x, o, mask: 0 };
-        let same = |r: &(Key, Ub)| r.0 == t_key && r.1.s == s && r.1.x == x && r.1.o == o;
-        if let Some((k, p)) = self.last {
-            let (r, v) = &mut self.buckets[k as usize];
-            if *r == route && same(&v[p as usize]) {
-                v[p as usize].1.mask |= bit;
-                return;
-            }
-        }
         let k = match self.last_route {
             Some((r, k)) if r == route => k,
             _ => {
@@ -338,61 +325,61 @@ impl UnitBundles {
                 k
             }
         };
-        if self.index.is_empty() {
-            self.index = vec![0; 1 << 12];
-        }
-        let m = self.index.len() - 1;
-        let mut i = ub_hash(k, t_key, &probe) as usize & m;
-        loop {
-            let e = self.index[i];
-            if e == 0 {
-                break;
-            }
-            let (bk, p) = ((e >> 32) as u32, (e as u32) - 1);
-            if bk == k && same(&self.buckets[k as usize].1[p as usize]) {
-                self.buckets[k as usize].1[p as usize].1.mask |= bit;
-                self.last = Some((k, p));
+        let v = &mut self.buckets[k as usize].1;
+        if let Some(l) = v.last_mut() {
+            if l.0 == t_key && l.1.s == s && l.1.x == x && l.1.o == o {
+                l.1.mask |= bit;
                 return;
             }
-            i = (i + 1) & m;
         }
-        let v = &mut self.buckets[k as usize].1;
-        v.push((t_key, Ub { mask: bit, ..probe }));
-        let p = v.len() as u32 - 1;
-        self.index[i] = (k as u64) << 32 | (p as u64 + 1);
-        self.last = Some((k, p));
-        self.n += 1;
-        if self.n * 2 > self.index.len() {
-            let cap = self.index.len() * 2;
-            self.index = vec![0; cap];
-            let m = cap - 1;
-            for (k, (_, v)) in self.buckets.iter().enumerate() {
-                for (p, (t_key, u)) in v.iter().enumerate() {
-                    let mut i = ub_hash(k as u32, *t_key, u) as usize & m;
-                    while self.index[i] != 0 {
-                        i = (i + 1) & m;
-                    }
-                    self.index[i] = (k as u64) << 32 | (p as u64 + 1);
+        v.push((t_key, Ub { t: 0, s, x, o, mask: bit }));
+    }
+
+    /// `v`'s bundles merged into `merged`: each distinct (target key,
+    /// source, transfer, offset) once, at its first place, its cells the
+    /// union of its appends'.
+    fn merge(slots: &mut Vec<u32>, merged: &mut Vec<(Key, Ub)>, v: &[(Key, Ub)]) {
+        merged.clear();
+        let cap = (2 * v.len()).next_power_of_two().max(16);
+        slots.clear();
+        slots.resize(cap, 0);
+        let m = cap - 1;
+        for &(k, u) in v {
+            let mut i = ub_hash(k, &u) as usize & m;
+            loop {
+                let e = slots[i];
+                if e == 0 {
+                    merged.push((k, u));
+                    slots[i] = merged.len() as u32;
+                    break;
                 }
+                let g = &mut merged[e as usize - 1];
+                if g.0 == k && g.1.s == u.s && g.1.x == u.x && g.1.o == u.o {
+                    g.1.mask |= u.mask;
+                    break;
+                }
+                i = (i + 1) & m;
             }
         }
     }
 
-    /// The buckets as `(route, targets, bundles)`: per bucket its distinct
-    /// targets (key, cells reached) and its bundles naming them by index,
-    /// the cells `drop(route, key, cell)` says cleared first (the coarser
-    /// level's disallowed targets; a bundle left without cells goes); the
-    /// table cleared.
+    /// The buckets as `(route, targets, bundles)`: per bucket its bundles
+    /// merged (`merge`), its distinct targets (key, cells reached) and its
+    /// bundles naming them by index, the cells `drop(route, key, cell)`
+    /// says cleared first (the coarser level's disallowed targets; a bundle
+    /// left without cells goes); the table cleared.
     #[allow(clippy::type_complexity)]
     pub fn drain(&mut self, drop: Option<&dyn Fn(u32, Key, u32) -> bool>) -> Vec<(u32, Vec<(Key, u64)>, Vec<Ub>)> {
         let buckets = std::mem::take(&mut self.buckets);
         let mut out = Vec::with_capacity(buckets.len());
+        let mut merged = std::mem::take(&mut self.merged);
         for &(route, ref v) in &buckets {
+            Self::merge(&mut self.slots, &mut merged, v);
             self.t_idx.clear();
             let mut targets: Vec<(Key, u64)> = Vec::new();
-            let mut bundles: Vec<Ub> = Vec::with_capacity(v.len());
+            let mut bundles: Vec<Ub> = Vec::with_capacity(merged.len());
             let mut last: Option<(Key, u32)> = None;
-            for &(t_key, mut u) in v {
+            for &(t_key, mut u) in &merged {
                 let mut m = u.mask;
                 if let Some(drop) = drop {
                     let mut c = m;
@@ -428,6 +415,11 @@ impl UnitBundles {
                 out.push((route, targets, bundles));
             }
         }
+        if merged.capacity() > SPARE_KEEP {
+            merged = Vec::new();
+            self.slots = Vec::new();
+        }
+        self.merged = merged;
         self.buckets = buckets;
         self.clear();
         out
