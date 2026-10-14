@@ -530,22 +530,31 @@ plans/keys-only.md the rest: no state ids, no rows held):
   its end the unit's bundles are per route a CHUNK, with per target cell
   the merged PUSH of the bundles' sources' hulls (a bundle's target cells
   map to its source cells by one shift of the region grid,
-  `bundle::shift_into`), and its out-edges one OUT BLOCK. The RE-PUSH units
-  (the grown states, by layer, ~16k states a unit) make chunks of pushes
-  only. When a slice's units are done its transfers get their global ids
-  and its chunks become REGION JOBS (one per (route, slice)), which the
-  workers take before the next slice's units: the region phase overlaps
-  the kernels.
+  `bundle::shift_into`), and its out-edges one OUT BLOCK, appended to the
+  frame's SPOOL (`storage::spool`: an unlinked scratch file the out file's
+  writer copies from at the end). A transfer the tree's table holds is
+  named by its global id (the table is read only during the wave, shared
+  by the workers); only a pair new this frame gets a worker-local id. The
+  RE-PUSH units (the grown states, by layer, ~16k states a unit) make
+  chunks of pushes only. When a slice's units are done its new transfers
+  get their global ids (the gather numbers them in a table of their own,
+  appended at the frame's end) and its chunks become REGION JOBS (one per
+  (route, slice)), which the workers take before the next slice's units:
+  the region phase overlaps the kernels.
 - **The region phase** (`storage::route::run_route`): per chunk target its
   pushes merged into the route's TOUCHED states (`route::Touched`: per key
   one probe, its cells' hulls in a run), and the job's bundles encoded into
-  one zstd SEGMENT of the frame's edge file. A route's touched states are
-  written only by its jobs, one at a time.
+  one zstd SEGMENT of the frame's edge file (spooled too). A route's
+  touched states are written only by its jobs, one at a time. The wave
+  takes the frontier and drops it once its units are done.
 - **The frame's end**: provisional keys made final, new shapes numbered,
   each route SEALED (`route::seal`: its touched keys sorted, each against
-  the visited set - new, grown, or nothing; "The hull forward"): the NEXT
-  LAYER and the grown states; the ladder's filter on both; both merged into
-  the visited set with their layers and hulls (`VisitedSet::absorb`); the
+  the visited set in parts - new, grown, or nothing; "The hull forward";
+  a route put together by the worker that ends its last part, so it is
+  freed then): the NEXT LAYER and the grown states; the ladder's filter on
+  both; both merged into the visited set with their layers and hulls
+  (`VisitedSet::absorb`: each run of a region's packed blocks makes its
+  own changes); the
   new states DECODED in chunks on every thread for their wins (and, under
   `--key-check`, each row's key and cell); the edge file and the OUT FILE
   written. The forward then writes the FRAME FILE (`frames/f{F}.bin`: per
@@ -667,8 +676,11 @@ the list (coarsest first; one level is the usual case):
    in the gate. W is kept as varints - per node its state's delta, layer and
    spans, per span its length and set, ~4 B a node and ~3 a span - in a
    scratch file beside the tree, mapped back (`<level>/arc-scratch`,
-   unlinked once mapped), over a flat arena of the distinct sets
-   (`RegionArena`, bounds in 16 bits). `arc_dp::optimum` reads
+   unlinked once mapped), over an arena of the distinct sets
+   (`RegionArena`: records of u16 words in 64 MB chunks, a full chunk
+   written to the scratch dir and mapped back, so W's sets are page
+   cache, not anonymous memory; a step's own sets an in-memory arena,
+   compacted between rounds past 1 GB). `arc_dp::optimum` reads
    the optimum off the start's sets. That optimum is exact in the remainder
    and over-approximates the level's other widenings (and `rnd`): a LOWER
    BOUND, and no win REFUTES H. A node IS its state (`Sk`: region, key,
