@@ -38,10 +38,10 @@ impl StateInfo {
 /// table: entries keep their places) the cells with one and where their RUN
 /// starts in `slots` (the cells in order). A state whose hull is FULL has no
 /// slot. A run moves to the end when its entry gains a cell; dead slots are
-/// reclaimed once they are a third of the slots, and the arrays grow by a
-/// quarter: 10 B a state stored and 12 B an entry, at most ~1.9x that held
-/// (room (1,0) f99: 0.78 GB for 31M stored states and 4.5M entries when
-/// dead slots waited to be half and the arrays doubled).
+/// reclaimed once they are an eighth of the slots (a third before: a big
+/// room's f230 held 2.25 B a visited state in dead slots); a frame's merge
+/// reserves exactly the room its moved runs take (`reserve`: the quarter a
+/// growth adds held 1.23 B a state of spare room there).
 #[derive(Clone, Default)]
 pub struct RegionInfos {
     starts: Vec<u32>,
@@ -50,7 +50,21 @@ pub struct RegionInfos {
     dead: usize,
 }
 
-/// Room in `v` for `more` (grown by a quarter at least: not doubled).
+/// A vector's room for a total length, exactly.
+trait ReserveTo {
+    fn reserve_to(&mut self, len: usize);
+}
+
+impl<T> ReserveTo for Vec<T> {
+    fn reserve_to(&mut self, len: usize) {
+        if len > self.capacity() {
+            self.reserve_exact(len - self.len());
+        }
+    }
+}
+
+/// Room in `v` for `more` (grown by a quarter at least: not doubled; a
+/// frame's merge reserves its room exactly first, `RegionInfos::reserve`).
 fn grow<T>(v: &mut Vec<T>, more: usize) {
     if v.len() + more > v.capacity() {
         v.reserve_exact(more.max(v.len() / 4));
@@ -78,6 +92,23 @@ impl RegionInfos {
         if let Some(&s) = self.starts.get(e as usize) {
             super::prefetch(self.slots.as_ptr().wrapping_add(s as usize));
         }
+    }
+
+    /// Room for `entries` entries in all and `slots` more slots, exactly (a
+    /// frame's merge, before its `set`s).
+    pub fn reserve(&mut self, entries: usize, slots: usize) {
+        for v in [&mut self.starts as &mut dyn ReserveTo, &mut self.masks] {
+            v.reserve_to(entries);
+        }
+        if self.slots.len() + slots > self.slots.capacity() {
+            self.slots.reserve_exact(slots);
+        }
+    }
+
+    /// The cells of entry `e` with a slot (0: none).
+    #[inline]
+    pub fn mask(&self, e: u32) -> u64 {
+        self.masks.get(e as usize).copied().unwrap_or(0)
     }
 
     /// Entry `e`'s cells set (`updates`: by cell, ascending, distinct; a
@@ -129,7 +160,7 @@ impl RegionInfos {
         }
         self.dead += mask.count_ones() as usize;
         (self.starts[e], self.masks[e]) = (at as u32, next);
-        if self.dead > 1024 && self.dead * 3 > self.slots.len() {
+        if self.dead > 1024 && self.dead * 8 > self.slots.len() {
             self.compact();
         }
     }
@@ -163,6 +194,11 @@ impl RegionInfos {
         let slot = std::mem::size_of::<StateInfo>();
         [self.starts.capacity() * 4 + self.masks.capacity() * 8, (self.slots.len() - self.dead) * slot, self.dead * slot, (self.slots.capacity() - self.slots.len()) * slot]
     }
+}
+
+/// Of the next `n` hulls of `h`, how many are full (`StateInfo::is_full`).
+fn hulls_full(h: &mut std::slice::Iter<Hull>, n: usize) -> usize {
+    h.take(n).filter(|x| x.x.is_full() && x.y.is_full()).count()
 }
 
 /// The visited set: the shapes (index -> hash, in the order the tree
@@ -368,6 +404,23 @@ impl VisitedSet {
             let mut entries: Vec<u32> = Vec::with_capacity(new.len());
             t.merge(new, |_, e| entries.push(e));
             let held = before + new.states() - t.states();
+            // Room for the runs the new states move or make (their entries'
+            // stored cells and the new ones not full), and for a grown
+            // state's entry that loses a cell (its hull now full), exactly.
+            let mut room = 0usize;
+            let mut h = hulls.iter();
+            for ((_, mask), &e) in new.iter().zip(&entries) {
+                let stored = mask.count_ones() as usize - hulls_full(&mut h, mask.count_ones() as usize);
+                if stored > 0 {
+                    room += m.mask(e).count_ones() as usize + stored;
+                }
+            }
+            for (o, &e) in grown.iter().zip(grown_at) {
+                if o.hull.x.is_full() && o.hull.y.is_full() {
+                    room += m.mask(e).count_ones() as usize;
+                }
+            }
+            m.reserve(t.len(), room);
             let mut h = hulls.iter();
             let mut batch: Vec<(u32, StateInfo)> = Vec::new();
             for ((_, mask), &e) in new.iter().zip(&entries) {
