@@ -150,6 +150,11 @@ impl XferTable {
         let mut new: Vec<Pair> = tails.iter().flat_map(|t| t.iter()).filter(|p| self.index.find(&self.pairs, p).is_none()).copied().collect();
         new.sort_unstable();
         new.dedup();
+        // Room by an eighth at least (doubling held up to a whole table's
+        // worth of spare pairs: 0.13 GB at a big room's f230).
+        if self.pairs.len() + new.len() > self.pairs.capacity() {
+            self.pairs.reserve_exact(new.len().max(self.pairs.len() / 8));
+        }
         for p in new {
             self.pairs.push(p);
             self.index.insert(&self.pairs, self.pairs.len() as u32 - 1);
