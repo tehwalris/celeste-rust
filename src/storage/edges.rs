@@ -740,7 +740,7 @@ mod tests {
         let id = |x: u32| if (x as usize) < first { x } else { first as u32 + perm[x as usize - first] };
         for (p, x) in [pair(9), pair(7), pair(8), pair(3), pair(5)].iter().zip(ids_a.concat().into_iter().chain(ids_b.concat())) {
             assert_eq!(t.pairs[id(x) as usize], *p);
-            assert_eq!(t.index[p], id(x));
+            assert_eq!(t.index.find(&t.pairs, p), Some(id(x)));
         }
         assert_eq!(t.canonical(first, &[5, 1, 1, 0]), None, "in order already");
     }
