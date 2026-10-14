@@ -747,7 +747,9 @@ pub fn run_wave(engine: &dyn FrameStep, front: &Frontier, cx: WaveCtx) -> Result
         }
     }
     let runs: Vec<std::sync::Mutex<Vec<Old>>> = runs.into_iter().map(std::sync::Mutex::new).collect();
-    par_map(&runs, s.threads(), |r| r.lock().expect("a route's grown states").sort_by_key(|o| o.layer));
+    // By layer, then state (a route's are by state: the stable sort by layer,
+    // without its buffer).
+    par_map(&runs, s.threads(), |r| r.lock().expect("a route's grown states").sort_unstable_by_key(|o| (o.layer, o.sk)));
     let runs: Vec<Vec<Old>> = runs.into_iter().map(|r| r.into_inner().expect("a route's grown states")).collect();
     let mut count = vec![0usize; frame as usize + 1];
     for o in runs.iter().flatten() {

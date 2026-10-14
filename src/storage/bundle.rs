@@ -501,11 +501,23 @@ impl Encoder {
             let run = &mut self.st[a..a + len as usize];
             run.sort_unstable();
             debug_assert!(run.windows(2).all(|w| w[0] != w[1]), "bundles distinct");
-            for &st in run.iter() {
-                let vals = [mask, ox >> 32, ox & 0xffff_ffff, st >> 32, st & 0xffff_ffff];
-                put_record(out, &ORDER, prev.as_ref(), &vals);
-                prev = Some(vals);
+            // The group's first record after the last group's; the rest
+            // share its mask, offset and transfer: `put_record` at level 3
+            // (the source's delta, the target) or 4 (the target's delta).
+            let vals = |st: u64| [mask, ox >> 32, ox & 0xffff_ffff, st >> 32, st & 0xffff_ffff];
+            put_record(out, &ORDER, prev.as_ref(), &vals(run[0]));
+            for w in run.windows(2) {
+                let ((ps, pt), (s, t)) = ((w[0] >> 32, w[0] & 0xffff_ffff), (w[1] >> 32, w[1] & 0xffff_ffff));
+                if s == ps {
+                    out.push(4);
+                    put_varint(out, t - pt);
+                } else {
+                    out.push(3);
+                    put_varint(out, s - ps);
+                    put_varint(out, t);
+                }
             }
+            prev = Some(vals(run[run.len() - 1]));
             a += len as usize;
         }
     }

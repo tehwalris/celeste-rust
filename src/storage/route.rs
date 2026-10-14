@@ -252,20 +252,20 @@ pub struct RegionCtx<'a> {
 
 /// A unit's bundles, by route: an emission is APPENDED to its route's
 /// bucket (merged into the bucket's last bundle when it is the same, as a
-/// body's lanes mostly are); at the unit's end each bucket is merged
-/// (`drain`: a bundle's later appends ORed into its first, in a table the
-/// bucket's size - small, cache-resident, where one table over the unit
-/// missed the cache on most appends: 86% of them are new bundles), its
-/// distinct targets listed and its bundles naming them by index.
+/// body's lanes mostly are); at the unit's end each bucket is merged in
+/// place (`drain`: a bundle's later appends ORed into its first, in a
+/// table the bucket's size - small, cache-resident, where one table over
+/// the unit missed the cache on most appends: 86% of them are new
+/// bundles), its distinct targets listed and its bundles naming them by
+/// index.
 #[derive(Default)]
 pub struct UnitBundles {
     buckets: Vec<(u32, Vec<(Key, Ub)>)>,
     bucket_of: FxHashMap<u32, u32>,
     last_route: Option<(u32, u32)>,
-    /// `drain`'s merge table (`index + 1` into `merged`; 0 empty), the
-    /// merged bucket, and its target index.
+    /// `drain`'s merge table (`index + 1` into the bucket; 0 empty) and
+    /// its target index.
     slots: Vec<u32>,
-    merged: Vec<(Key, Ub)>,
     t_idx: rustc_hash2::FxHashMap<Key, u32>,
     /// Emptied buckets, kept for the next units (their pages stay mapped),
     /// at most `SPARE_KEEP` bundles' room in all: kept without a bound,
@@ -288,7 +288,7 @@ impl UnitBundles {
     /// Bytes its tables hold (`--phases`' `[wavemem]`).
     pub fn alloc_bytes(&self) -> usize {
         let b = 16 + std::mem::size_of::<Ub>();
-        self.buckets.iter().map(|x| x.1.capacity() * b).sum::<usize>() + self.spare.iter().map(|v| v.capacity() * b).sum::<usize>() + b * self.merged.capacity() + 4 * self.slots.capacity() + 24 * self.t_idx.capacity()
+        self.buckets.iter().map(|x| x.1.capacity() * b).sum::<usize>() + self.spare.iter().map(|v| v.capacity() * b).sum::<usize>() + 4 * self.slots.capacity() + 24 * self.t_idx.capacity()
     }
 
     pub fn clear(&mut self) {
@@ -335,25 +335,27 @@ impl UnitBundles {
         v.push((t_key, Ub { t: 0, s, x, o, mask: bit }));
     }
 
-    /// `v`'s bundles merged into `merged`: each distinct (target key,
-    /// source, transfer, offset) once, at its first place, its cells the
-    /// union of its appends'.
-    fn merge(slots: &mut Vec<u32>, merged: &mut Vec<(Key, Ub)>, v: &[(Key, Ub)]) {
-        merged.clear();
+    /// `v`'s bundles MERGED in place: each distinct (target key, source,
+    /// transfer, offset) once, at its first place (the first `n` returned),
+    /// its cells the union of its appends'.
+    fn merge(slots: &mut Vec<u32>, v: &mut [(Key, Ub)]) -> usize {
         let cap = (2 * v.len()).next_power_of_two().max(16);
         slots.clear();
         slots.resize(cap, 0);
         let m = cap - 1;
-        for &(k, u) in v {
+        let mut n = 0usize;
+        for r in 0..v.len() {
+            let (k, u) = v[r];
             let mut i = ub_hash(k, &u) as usize & m;
             loop {
                 let e = slots[i];
                 if e == 0 {
-                    merged.push((k, u));
-                    slots[i] = merged.len() as u32;
+                    v[n] = (k, u);
+                    n += 1;
+                    slots[i] = n as u32;
                     break;
                 }
-                let g = &mut merged[e as usize - 1];
+                let g = &mut v[e as usize - 1];
                 if g.0 == k && g.1.s == u.s && g.1.x == u.x && g.1.o == u.o {
                     g.1.mask |= u.mask;
                     break;
@@ -361,6 +363,7 @@ impl UnitBundles {
                 i = (i + 1) & m;
             }
         }
+        n
     }
 
     /// The buckets as `(route, targets, bundles)`: per bucket its bundles
@@ -370,16 +373,16 @@ impl UnitBundles {
     /// left without cells goes); the table cleared.
     #[allow(clippy::type_complexity)]
     pub fn drain(&mut self, drop: Option<&dyn Fn(u32, Key, u32) -> bool>) -> Vec<(u32, Vec<(Key, u64)>, Vec<Ub>)> {
-        let buckets = std::mem::take(&mut self.buckets);
+        let mut buckets = std::mem::take(&mut self.buckets);
         let mut out = Vec::with_capacity(buckets.len());
-        let mut merged = std::mem::take(&mut self.merged);
-        for &(route, ref v) in &buckets {
-            Self::merge(&mut self.slots, &mut merged, v);
+        for (route, v) in &mut buckets {
+            let route = *route;
+            let n = Self::merge(&mut self.slots, v);
             self.t_idx.clear();
             let mut targets: Vec<(Key, u64)> = Vec::new();
-            let mut bundles: Vec<Ub> = Vec::with_capacity(merged.len());
+            let mut bundles: Vec<Ub> = Vec::with_capacity(n);
             let mut last: Option<(Key, u32)> = None;
-            for &(t_key, mut u) in &merged {
+            for &(t_key, mut u) in &v[..n] {
                 let mut m = u.mask;
                 if let Some(drop) = drop {
                     let mut c = m;
@@ -415,11 +418,9 @@ impl UnitBundles {
                 out.push((route, targets, bundles));
             }
         }
-        if merged.capacity() > SPARE_KEEP {
-            merged = Vec::new();
+        if self.slots.capacity() > 2 * SPARE_KEEP {
             self.slots = Vec::new();
         }
-        self.merged = merged;
         self.buckets = buckets;
         self.clear();
         out
