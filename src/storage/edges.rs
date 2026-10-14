@@ -102,14 +102,22 @@ impl PairIndex {
         self.n += 1;
     }
 
-    /// Every id from `first` on out (their pairs about to be renumbered):
-    /// the index rebuilt from the ones below.
-    fn truncate(&mut self, pairs: &[Pair], first: usize) {
-        let old = std::mem::take(&mut self.slots);
-        self.slots = vec![0; old.len()];
-        self.n = 0;
-        for s in old.into_iter().filter(|&s| s != 0 && ((s - 1) as usize) < first) {
-            self.place(pairs, s - 1);
+    /// The ids from `first` on renumbered (`perm`: per id less `first`,
+    /// its new id less `first`; `pairs` as before): each one's slot found
+    /// by its pair and set, the rest of the index as it is.
+    fn renumber(&mut self, pairs: &[Pair], first: usize, perm: &[u32]) {
+        let m = self.slots.len() - 1;
+        let at: Vec<usize> = (first..pairs.len())
+            .map(|id| {
+                let mut i = Self::hash(&pairs[id]) as usize & m;
+                while self.slots[i] != id as u32 + 1 {
+                    i = (i + 1) & m;
+                }
+                i
+            })
+            .collect();
+        for (k, i) in at.into_iter().enumerate() {
+            self.slots[i] = first as u32 + perm[k] + 1;
         }
     }
 }
@@ -183,12 +191,9 @@ impl XferTable {
             perm[from as usize] = to as u32;
         }
         let sorted: Vec<Pair> = order.iter().map(|&i| new[i as usize]).collect();
-        self.index.truncate(&self.pairs, first);
+        self.index.renumber(&self.pairs, first, &perm);
         self.pairs.truncate(first);
-        for p in sorted {
-            self.pairs.push(p);
-            self.index.insert(&self.pairs, self.pairs.len() as u32 - 1);
-        }
+        self.pairs.extend(sorted);
         Some(perm)
     }
 

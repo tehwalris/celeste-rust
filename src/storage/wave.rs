@@ -691,37 +691,50 @@ pub fn run_wave(engine: &dyn FrameStep, front: &Frontier, cx: WaveCtx) -> Result
     // Per route (in parallel): sealed - its new and grown states.
     type Sealed = super::route::Sealed;
     let sealed: Vec<Result<Option<Sealed>>> = {
-        let next = AtomicUsize::new(0);
-        let cells: Vec<std::sync::Mutex<&mut RouteState>> = states.iter_mut().map(std::sync::Mutex::new).collect();
-        // The biggest routes first: the last one started bounds the wall.
-        let mut order: Vec<usize> = (0..cells.len()).collect();
-        order.sort_by_cached_key(|&k| std::cmp::Reverse(cells[k].lock().expect("a route").touched.len()));
+        // The routes' touched keys sorted (each route on a thread, the
+        // biggest first), then compared with the visited set in parts (a
+        // big route's on every thread), then each route's parts put
+        // together.
+        let cells: Vec<std::sync::Mutex<(usize, &mut RouteState)>> = states.iter_mut().enumerate().map(std::sync::Mutex::new).collect();
+        let mut order: Vec<&std::sync::Mutex<(usize, &mut RouteState)>> = cells.iter().collect();
+        order.sort_by_cached_key(|c| std::cmp::Reverse(c.lock().expect("a route").1.touched.len()));
+        let touches = par_map(&order, workers, |c| -> Result<(usize, Option<super::route::Touch>)> {
+            let mut g = c.lock().expect("a route");
+            let k = g.0;
+            match regions[k] {
+                Some(region) => Ok((k, Some(super::route::seal_sort(&mut g.1, region, &finals)?))),
+                // A route of a new shape whose records the coarser level
+                // all dropped.
+                None if !g.1.is_used() => Ok((k, None)),
+                None => Err(anyhow::anyhow!("frame {frame}: a used route of an unnumbered shape")),
+            }
+        });
+        let mut touches: Vec<(usize, Option<super::route::Touch>)> = touches.into_iter().collect::<Result<_>>()?;
+        touches.sort_by_key(|x| x.0);
+        let mut parts: Vec<(usize, std::ops::Range<usize>)> = Vec::new();
+        for (i, (_, t)) in touches.iter().enumerate() {
+            if let Some(t) = t {
+                let n = t.touched.len();
+                parts.extend((0..n.max(1)).step_by(super::route::SEAL_PART).map(|a| (i, a..(a + super::route::SEAL_PART).min(n))));
+            }
+        }
+        parts.sort_by_key(|p| std::cmp::Reverse(p.1.len()));
         let visited: &VisitedSet = visited;
-        std::thread::scope(|scope| {
-            let hs: Vec<_> = (0..workers)
-                .map(|_| {
-                    let (next, cells, order, regions, finals) = (&next, &cells, &order, &regions, &finals);
-                    scope.spawn(move || {
-                        let mut out = Vec::new();
-                        loop {
-                            let Some(&k) = order.get(next.fetch_add(1, Ordering::Relaxed)) else { return out };
-                            let c = &cells[k];
-                            let mut st = c.lock().expect("a route");
-                            let r = match regions[k] {
-                                Some(region) => super::route::seal(&mut st, region, frame, finals, visited).map(Some),
-                                // A route of a new shape whose records the
-                                // coarser level all dropped.
-                                None if !st.is_used() => Ok(None),
-                                None => Err(anyhow::anyhow!("frame {frame}: a used route of an unnumbered shape")),
-                            };
-                            out.push((k, r));
-                        }
-                    })
-                })
-                .collect();
-            let mut all: Vec<(usize, Result<Option<Sealed>>)> = hs.into_iter().flat_map(|h| h.join().expect("a seal worker panicked")).collect();
-            all.sort_by_key(|x| x.0);
-            all.into_iter().map(|x| x.1).collect()
+        let done = par_map(&parts, workers, |(i, rg)| -> Result<(usize, usize, super::route::SealPart)> {
+            let t = touches[*i].1.as_ref().expect("a part of a route with touched keys");
+            Ok((*i, rg.start, super::route::seal_part(t, rg.clone(), frame, visited)?))
+        });
+        let mut by: Vec<Vec<(usize, super::route::SealPart)>> = (0..touches.len()).map(|_| Vec::new()).collect();
+        for d in done {
+            let (i, a, p) = d?;
+            by[i].push((a, p));
+        }
+        let routes: Vec<std::sync::Mutex<Option<(Option<super::route::Touch>, Vec<(usize, super::route::SealPart)>)>>> = touches.into_iter().zip(by).map(|((_, t), p)| std::sync::Mutex::new(Some((t, p)))).collect();
+        par_map(&routes, workers, |r| -> Result<Option<Sealed>> {
+            let (t, mut p) = r.lock().expect("a route").take().expect("taken once");
+            let Some(t) = t else { return Ok(None) };
+            p.sort_by_key(|x| x.0);
+            super::route::sealed(t, p.into_iter().map(|x| x.1).collect()).map(Some)
         })
     };
     if s.diag.phases {

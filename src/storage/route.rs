@@ -617,9 +617,9 @@ pub struct Sealed {
     pub table: RegionTable,
     pub hulls: Vec<Hull>,
     pub grown: Vec<super::wave::Old>,
-    /// The states it compared, and its steps' walls: the touched keys
-    /// sorted, each compared with the visited set, the new table
-    /// (`--phases`' `[seal]`).
+    /// The states it compared, and its steps' times: the touched keys
+    /// sorted, compared with the visited set (its parts' summed), the new
+    /// table (`--phases`' `[seal]`).
     pub touched: usize,
     pub t: [std::time::Duration; 3],
     /// The bundles that waited (their segments, bundles: `reencode`).
@@ -649,36 +649,63 @@ impl Renumber<'_> {
     }
 }
 
-/// THE FRAME'S END of a route (its shape numbered: `region`): provisional
-/// keys made final (`finals`); each touched state's hull - its pushes', and
-/// the visited set's - compared with the visited set's (`visited`, read
-/// only): a state it lacks is NEW (frozen, sorted by key: canonical), one
-/// whose hull grew GREW. The bundles that waited stay in `st.prov`, encoded
-/// again with their final keys and ids by `reencode` (the edge file's
-/// writer, beside the rest of the frame's end).
-pub fn seal(st: &mut RouteState, region: u32, frame: u32, finals: &FxHashMap<Key, Key>, visited: &VisitedSet) -> Result<Sealed> {
+/// THE FRAME'S END of a route, its first step (its shape numbered:
+/// `region`): provisional keys made final (`finals`), the touched keys
+/// sorted, with their pushes' hulls (each key's run by cell). Then its
+/// touched keys are compared with the visited set in PARTS (`seal_part`, a
+/// big route's on every thread) and the parts put together (`sealed`).
+/// The bundles that waited stay in `st.prov`, encoded again with their
+/// final keys and ids by `reencode` (the edge file's writer, beside the
+/// rest of the frame's end).
+pub fn seal_sort(st: &mut RouteState, region: u32, finals: &FxHashMap<Key, Key>) -> Result<Touch> {
     st.region = Some(region);
     for seg in &mut st.segs {
         seg.1.region = region;
     }
-    // THE STATES (final keys, sorted): new, grown, or nothing.
     let final_key = |k: Key| if is_provisional(k) { finals.get(&k).copied().ok_or_else(|| anyhow::anyhow!("a provisional key without its final key")) } else { Ok(k) };
-    let mut lap = std::time::Instant::now();
-    let mut t = [std::time::Duration::ZERO; 3];
-    let mut mark = |k: usize| {
-        t[k] = lap.elapsed();
-        lap = std::time::Instant::now();
-    };
+    let t = std::time::Instant::now();
     let n_touched = st.touched.len();
     let (touched, accs) = std::mem::take(&mut st.touched).into_sorted(final_key)?;
-    mark(0);
+    let waited = (st.prov.len(), st.prov.iter().map(|x| x.1.bundles as u64).sum());
+    Ok(Touch { region, touched, accs, n_touched, waited, t_sort: t.elapsed() })
+}
+
+/// A route's touched keys sorted, with their pushes' hulls (`seal_sort`).
+pub struct Touch {
+    pub region: u32,
+    pub touched: Vec<TouchedKey>,
+    pub accs: Vec<HullAcc>,
+    n_touched: usize,
+    waited: (usize, u64),
+    t_sort: std::time::Duration,
+}
+
+/// Touched keys a seal part takes.
+pub const SEAL_PART: usize = 1 << 15;
+
+/// A part of a route's touched keys compared (`seal_part`): its new
+/// states (keys, cells, hulls), its grown states, the held states by age.
+pub struct SealPart {
+    keys: Vec<Key>,
+    masks: Vec<u64>,
+    hulls: Vec<Hull>,
+    grown: Vec<super::wave::Old>,
+    held_by_age: [[u64; 7]; 2],
+    t: std::time::Duration,
+}
+
+/// The touched keys `part` (sorted) of `touch` COMPARED with the visited
+/// set's region table (`visited`, read only: walked with a `Cursor`, each
+/// block decoded once): each touched state's hull - its pushes', and the
+/// visited set's - a state it lacks NEW, one whose hull grew GREW.
+pub fn seal_part(touch: &Touch, part: std::ops::Range<usize>, frame: u32, visited: &VisitedSet) -> Result<SealPart> {
+    let t = std::time::Instant::now();
+    let (region, accs) = (touch.region, &touch.accs);
     let (mut keys, mut masks, mut hulls): (Vec<Key>, Vec<u64>, Vec<Hull>) = (Vec::new(), Vec::new(), Vec::new());
     let mut grown: Vec<super::wave::Old> = Vec::new();
     let mut held_by_age = [[0u64; 7]; 2];
-    // The region's packed table walked with the sorted keys: each block
-    // decoded once, when a key falls in it.
     let mut cursor = visited.table(region).map(RegionTable::cursor);
-    for &TouchedKey { key, cells, start } in &touched {
+    for &TouchedKey { key, cells, start } in &touch.touched[part] {
         let entry = match cursor.as_mut() {
             Some(c) => c.seek(key)?,
             None => None,
@@ -718,11 +745,29 @@ pub fn seal(st: &mut RouteState, region: u32, frame: u32, finals: &FxHashMap<Key
             }
         }
     }
-    mark(1);
+    Ok(SealPart { keys, masks, hulls, grown, held_by_age, t: t.elapsed() })
+}
+
+/// A route's SEALED states from its parts, in order: the new ones frozen
+/// (sorted by key: canonical) with their hulls, the grown ones.
+pub fn sealed(touch: Touch, parts: Vec<SealPart>) -> Result<Sealed> {
+    let t = std::time::Instant::now();
+    let n = |f: fn(&SealPart) -> usize| parts.iter().map(f).sum::<usize>();
+    let (mut keys, mut masks, mut hulls, mut grown) = (Vec::with_capacity(n(|p| p.keys.len())), Vec::with_capacity(n(|p| p.keys.len())), Vec::with_capacity(n(|p| p.hulls.len())), Vec::with_capacity(n(|p| p.grown.len())));
+    let mut held_by_age = [[0u64; 7]; 2];
+    let mut t_compare = std::time::Duration::ZERO;
+    for p in parts {
+        keys.extend(p.keys);
+        masks.extend(p.masks);
+        hulls.extend(p.hulls);
+        grown.extend(p.grown);
+        for (a, b) in held_by_age.iter_mut().flatten().zip(p.held_by_age.iter().flatten()) {
+            *a += b;
+        }
+        t_compare += p.t;
+    }
     let table = RegionTable::from_sorted(&keys, &masks)?;
-    mark(2);
-    let waited = (st.prov.len(), st.prov.iter().map(|x| x.1.bundles as u64).sum());
-    Ok(Sealed { region, table, hulls, grown, touched: n_touched, t, waited, held_by_age })
+    Ok(Sealed { region: touch.region, table, hulls, grown, touched: touch.n_touched, t: [touch.t_sort, t_compare, t.elapsed()], waited: touch.waited, held_by_age })
 }
 
 /// A job's bundles that WAITED (`RouteState::prov`), decoded and encoded
