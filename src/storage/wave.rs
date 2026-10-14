@@ -373,7 +373,7 @@ pub fn run_wave(engine: &dyn FrameStep, front: &Frontier, cx: WaveCtx) -> Result
     let mut sinks: Vec<UnitSink> = (0..workers).map(|w| UnitSink::new(visited, &routes, skeletons, &prov, filters, frame, level, w as u32, &xtabs[w], pos.is_some(), record, s)).collect();
     // Per kernel unit its out-edge block (`storage::out`): compressed, or
     // raw where a target key is provisional (encoded again at the end).
-    let out_blocks: Vec<std::sync::Mutex<Vec<OutBlock>>> = (0..n_kernel).map(|_| Default::default()).collect();
+    let mut out_blocks: Vec<std::sync::Mutex<Vec<OutBlock>>> = (0..n_kernel).map(|_| Default::default()).collect();
     let repushed = std::sync::atomic::AtomicU64::new(0);
     let mut scratch: Vec<super::route::Scratch> = (0..workers).map(|_| super::route::Scratch::default()).collect();
     let mut slice_of = vec![0u32; units.len()];
@@ -636,8 +636,38 @@ pub fn run_wave(engine: &dyn FrameStep, front: &Frontier, cx: WaveCtx) -> Result
         }
         lap = Instant::now();
     };
-    let finals = finalize_keys(visited, &states, &prov, &mut adds);
+    let finals = std::sync::Arc::new(finalize_keys(visited, &states, &prov, &mut adds));
     mark("keys", &mut st);
+    // THE OUT FILE, written beside the rest of the frame's end (it needs
+    // the final keys only): the kernel units' blocks in unit order, the
+    // provisional ones encoded with their final keys.
+    let out_file = match edges_dir {
+        Some(dir) => {
+            let (path, finals, threads, out_blocks) = (super::out::path(dir, frame), finals.clone(), s.threads(), std::mem::take(&mut out_blocks));
+            Some(std::thread::Builder::new().name("out file".into()).spawn(move || -> Result<u64> {
+                let blocks = par_map(&out_blocks, threads, |b| -> Result<Vec<super::out::Sealed>> {
+                    let mut out = Vec::new();
+                    for x in std::mem::take(&mut *b.lock().expect("an out block")) {
+                        match x {
+                            OutBlock::Sealed(x) => out.extend(x),
+                            OutBlock::Raw(raw) => {
+                                let mut fixed = Vec::new();
+                                super::out::fixup(&raw, &finals, &mut fixed)?;
+                                out.extend(super::out::Sealed::of(&fixed, &mut zstd::bulk::Compressor::new(1)?)?);
+                            }
+                        }
+                    }
+                    Ok(out)
+                });
+                let mut all: Vec<super::out::Sealed> = Vec::new();
+                for b in blocks {
+                    all.extend(b?);
+                }
+                super::out::write(&path, frame, &all)
+            })?)
+        }
+        None => None,
+    };
     drop(prov);
     (st.key_bits, st.key_codes, st.new_codes) = (visited.keys.max_bits(), visited.keys.codes(), adds.codes.len());
     // New shapes numbered (in hash order): a route's with touched states or
@@ -708,6 +738,30 @@ pub fn run_wave(engine: &dyn FrameStep, front: &Frontier, cx: WaveCtx) -> Result
     }
     new.sort_unstable_by_key(|x| x.region);
     mark("seal", &mut st);
+    // THE EDGE FILE (and the frame's new transfers), written beside the
+    // rest of the frame's end: the routes' segments are final once sealed.
+    let mut segs = Vec::new();
+    let mut src_index: Vec<(u32, Vec<u32>)> = Vec::new();
+    for (r, region) in states.into_iter().zip(&regions) {
+        let Some(region) = *region else { continue };
+        st.edge_bundles += r.segs.iter().map(|g| g.1.bundles as u64).sum::<u64>();
+        st.edge_records += r.segs.iter().map(|g| g.1.edges).sum::<u64>();
+        st.routes += 1;
+        if !r.sources.is_empty() {
+            src_index.push((region, r.sources.into_iter().collect()));
+        }
+        segs.extend(r.segs.into_iter().map(|g| g.1));
+    }
+    let edge_file = match edges_dir {
+        Some(dir) => {
+            let (dir, flush) = (dir.to_path_buf(), xfers.take_flush());
+            Some(std::thread::Builder::new().name("edge file".into()).spawn(move || -> Result<u64> {
+                flush.write(&dir)?;
+                super::edges::write_file(&super::edges::file_path(&dir, frame), frame, segs, src_index)
+            })?)
+        }
+        None => None,
+    };
     if s.diag.phases && !new.is_empty() {
         let ms = |d: std::time::Duration| d.as_secs_f64() * 1e3;
         let sum = new.iter().fold([0.0f64; 4], |a, sl| std::array::from_fn(|k| a[k] + ms(sl.t[k])));
@@ -782,48 +836,15 @@ pub fn run_wave(engine: &dyn FrameStep, front: &Frontier, cx: WaveCtx) -> Result
     if s.diag.phases {
         crate::metrics::mem_phase(&format!("f{frame} the next layer merged into the visited set"));
     }
-    // The routes' segments into the file.
-    let mut segs = Vec::new();
-    let mut src_index: Vec<(u32, Vec<u32>)> = Vec::new();
-    for (r, region) in states.into_iter().zip(&regions) {
-        let Some(region) = *region else { continue };
-        st.edge_bundles += r.segs.iter().map(|g| g.1.bundles as u64).sum::<u64>();
-        st.edge_records += r.segs.iter().map(|g| g.1.edges).sum::<u64>();
-        st.routes += 1;
-        if !r.sources.is_empty() {
-            src_index.push((region, r.sources.into_iter().collect()));
-        }
-        segs.extend(r.segs.into_iter().map(|g| g.1));
-    }
     st.lanes_kept = next.states() as usize;
     st.grown = by_layer_states(&grown);
-    if let Some(dir) = edges_dir {
-        xfers.flush(dir)?;
-        let path = super::edges::file_path(dir, frame);
-        st.edge_bytes = super::edges::write_file(&path, frame, segs, src_index)?;
+    // The writers joined: the files are whole when the wave returns.
+    if let Some(h) = edge_file {
+        st.edge_bytes = h.join().map_err(|_| anyhow!("frame {frame}: the edge file's writer panicked"))??;
         mark("edge file", &mut st);
-        // The out-edges, the kernel units' blocks in unit order (the
-        // provisional ones encoded with their final keys).
-        let blocks = par_map(&out_blocks, s.threads(), |b| -> Result<Vec<super::out::Sealed>> {
-            let mut out = Vec::new();
-            for x in std::mem::take(&mut *b.lock().expect("an out block")) {
-                match x {
-                    OutBlock::Sealed(x) => out.extend(x),
-                    OutBlock::Raw(raw) => {
-                        let mut fixed = Vec::new();
-                        super::out::fixup(&raw, &finals, &mut fixed)?;
-                        out.extend(super::out::Sealed::of(&fixed, &mut zstd::bulk::Compressor::new(1)?)?);
-                    }
-                }
-            }
-            Ok(out)
-        });
-        let mut all: Vec<super::out::Sealed> = Vec::new();
-        for b in blocks {
-            all.extend(b?);
-        }
-        let blocks = all;
-        st.out_bytes = super::out::write(&super::out::path(dir, frame), frame, &blocks)?;
+    }
+    if let Some(h) = out_file {
+        st.out_bytes = h.join().map_err(|_| anyhow!("frame {frame}: the out file's writer panicked"))??;
         mark("out file", &mut st);
     }
     if s.diag.phases {

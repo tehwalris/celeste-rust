@@ -108,21 +108,40 @@ impl XferTable {
     /// Write the pairs merged since the last flush past the trusted length
     /// (the frame's done marker trusts them).
     pub fn flush(&mut self, dir: &Path) -> Result<()> {
-        use std::io::{Seek, Write};
+        self.take_flush().write(dir)
+    }
+
+    /// `flush` in two: the pairs not written yet, encoded (taken as
+    /// written), and their write (`Flush::write`, on any thread).
+    pub fn take_flush(&mut self) -> Flush {
         let first = self.flushed;
-        if self.pairs.len() > first {
-            std::fs::create_dir_all(dir)?;
-            let mut f = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(xfer_path(dir))?;
-            f.set_len((first * PAIR_BYTES) as u64)?;
-            f.seek(std::io::SeekFrom::Start((first * PAIR_BYTES) as u64))?;
-            let mut buf = Vec::with_capacity((self.pairs.len() - first) * PAIR_BYTES);
-            for p in &self.pairs[first..] {
-                encode_pair(&mut buf, p);
-            }
-            f.write_all(&buf)?;
-            f.sync_data()?;
+        let mut buf = Vec::with_capacity((self.pairs.len() - first) * PAIR_BYTES);
+        for p in &self.pairs[first..] {
+            encode_pair(&mut buf, p);
         }
         self.flushed = self.pairs.len();
+        Flush { first, buf }
+    }
+}
+
+/// A transfer table's pairs to append (`XferTable::take_flush`).
+pub struct Flush {
+    first: usize,
+    buf: Vec<u8>,
+}
+
+impl Flush {
+    /// Appended to `dir`'s table (synced), after the `first` pairs before.
+    pub fn write(self, dir: &Path) -> Result<()> {
+        use std::io::{Seek, Write};
+        if !self.buf.is_empty() {
+            std::fs::create_dir_all(dir)?;
+            let mut f = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(xfer_path(dir))?;
+            f.set_len((self.first * PAIR_BYTES) as u64)?;
+            f.seek(std::io::SeekFrom::Start((self.first * PAIR_BYTES) as u64))?;
+            f.write_all(&self.buf)?;
+            f.sync_data()?;
+        }
         Ok(())
     }
 }
