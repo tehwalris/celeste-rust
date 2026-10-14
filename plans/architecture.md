@@ -615,9 +615,9 @@ kernel. An edge recorded at frame f leaves a state of layer f - 1.
   edges by SOURCE, for the re-pushes - per kernel unit sub-blocks of whole
   entries (~2048 bundles), each its routes, transfer pairs and target keys
   as dictionaries and per source entry its bundles, zstd; a header indexes
-  the blocks by their first and last entry, so a re-push unit (the grown
-  states of one layer, sorted) decompresses only the blocks holding its
-  states. A unit whose targets had provisional keys has its block fixed up
+  the blocks by their first and last entry (read where the file is mapped,
+  56 B a head, not held in memory), so a re-push unit (the grown states of
+  one layer, sorted) decompresses only the blocks holding its states. A unit whose targets had provisional keys has its block fixed up
   at the frame's end. ~0.25 GB a frame on room (1,0) at f80 (14.6x
   compressed).
 - **`EdgeStore`**: per (frame, region) its segments (`segments`), every

@@ -502,7 +502,8 @@ pub fn write(path: &Path, frame: u32, blocks: &[Sealed], spool: Option<&super::s
         heads.push(BlockHead { first: b.first, last: b.last, offset, len: b.z.len() as u32, raw: b.raw });
         offset += b.z.len() as u64;
     }
-    let hb = bincode::serialize(&(frame, heads)).context("an out file's header")?;
+    let hb = bincode::serialize(&(frame, &heads)).context("an out file's header")?;
+    ensure!(hb.len() == 12 + heads.len() * HEAD_BYTES, "an out file's header of {} bytes for {} blocks: not the layout `OutFile` reads", hb.len(), heads.len());
     std::fs::create_dir_all(path.parent().expect("an out dir"))?;
     let tmp = path.with_extension("tmp");
     {
@@ -524,9 +525,19 @@ pub fn write(path: &Path, frame: u32, blocks: &[Sealed], spool: Option<&super::s
 /// One out file, mapped.
 pub struct OutFile {
     map: memmap2::Mmap,
-    heads: Vec<BlockHead>,
+    /// Its blocks, and where the first one's head is in `map` (the
+    /// header's heads are read where they are, not deserialized: an
+    /// index of every frame's blocks held in memory was 64 B a block, 1.9
+    /// GB at the fixtures' room's f303).
+    blocks: usize,
+    heads: usize,
     data: usize,
 }
+
+/// Bytes a `BlockHead` takes in a header (bincode 1's fixed-width little-
+/// endian encoding, `write`'s): first (u32, u64, u64), last (the same),
+/// offset u64, len u32, raw u32.
+const HEAD_BYTES: usize = 56;
 
 impl OutFile {
     pub fn open(path: &Path, frame: u32) -> Result<Self> {
@@ -538,41 +549,69 @@ impl OutFile {
         let v = u32::from_le_bytes(map[4..8].try_into().unwrap());
         ensure!(v == crate::search::checkpoint::FORMAT_VERSION, "{}: format version {v}, this binary's is {}", path.display(), crate::search::checkpoint::FORMAT_VERSION);
         let n = u64::from_le_bytes(map[8..16].try_into().unwrap()) as usize;
-        ensure!(map.len() >= 16 + n, "{}: truncated header", path.display());
-        let (f, heads): (u32, Vec<BlockHead>) = bincode::deserialize(&map[16..16 + n]).with_context(|| path.display().to_string())?;
+        ensure!(map.len() >= 16 + n && n >= 12, "{}: truncated header", path.display());
+        let f = u32::from_le_bytes(map[16..20].try_into().unwrap());
+        let blocks = u64::from_le_bytes(map[20..28].try_into().unwrap()) as usize;
+        ensure!(n == 12 + blocks * HEAD_BYTES, "{}: a header of {n} bytes for {blocks} blocks", path.display());
         ensure!(f == frame, "{}: the out-edges of frame {f}, not {frame}", path.display());
-        let data = 16 + n;
-        let end = heads.last().map_or(0, |h| h.offset + h.len as u64);
-        ensure!(map.len() as u64 == data as u64 + end, "{}: {} bytes, its header says {}", path.display(), map.len(), data as u64 + end);
-        Ok(OutFile { map, heads, data })
+        let out = OutFile { map, blocks, heads: 28, data: 16 + n };
+        let end = if blocks == 0 {
+            0
+        } else {
+            let h = out.head(blocks - 1);
+            h.offset + h.len as u64
+        };
+        ensure!(out.map.len() as u64 == out.data as u64 + end, "{}: {} bytes, its header says {}", path.display(), out.map.len(), out.data as u64 + end);
+        Ok(out)
+    }
+
+    /// Block `i`'s head, read from the header.
+    #[inline]
+    fn head(&self, i: usize) -> BlockHead {
+        let b = &self.map[self.heads + i * HEAD_BYTES..self.heads + (i + 1) * HEAD_BYTES];
+        let (u32_at, u64_at) = (|a: usize| u32::from_le_bytes(b[a..a + 4].try_into().unwrap()), |a: usize| u64::from_le_bytes(b[a..a + 8].try_into().unwrap()));
+        BlockHead { first: (u32_at(0), (u64_at(4), u64_at(12))), last: (u32_at(20), (u64_at(24), u64_at(32))), offset: u64_at(40), len: u32_at(48), raw: u32_at(52) }
     }
 
     /// The blocks that may hold entries in `lo..=hi`.
     pub fn blocks(&self, lo: (u32, Key), hi: (u32, Key)) -> std::ops::Range<usize> {
-        let a = self.heads.partition_point(|h| h.last < lo);
-        let b = self.heads.partition_point(|h| h.first <= hi);
+        let point = |f: &dyn Fn(&BlockHead) -> bool| {
+            let (mut a, mut b) = (0usize, self.blocks);
+            while a < b {
+                let m = (a + b) / 2;
+                if f(&self.head(m)) {
+                    a = m + 1;
+                } else {
+                    b = m;
+                }
+            }
+            a
+        };
+        let a = point(&|h| h.last < lo);
+        let b = point(&|h| h.first <= hi);
         a..b.max(a)
     }
 
     /// Block `i`'s first and last entry.
     pub fn range(&self, i: usize) -> ((u32, Key), (u32, Key)) {
-        (self.heads[i].first, self.heads[i].last)
+        let h = self.head(i);
+        (h.first, h.last)
     }
 
     /// Block `i`'s raw bytes into `out`.
     pub fn block(&self, i: usize, z: &mut zstd::bulk::Decompressor<'static>, out: &mut Vec<u8>) -> Result<()> {
-        let h = &self.heads[i];
+        let h = self.head(i);
         let a = self.data + h.offset as usize;
         super::bundle::decompress(&self.map[a..a + h.len as usize], h.raw as usize, z, out)
     }
 
     /// Its blocks.
     pub fn len(&self) -> usize {
-        self.heads.len()
+        self.blocks
     }
 
     pub fn is_empty(&self) -> bool {
-        self.heads.is_empty()
+        self.blocks == 0
     }
 }
 
@@ -584,9 +623,10 @@ pub struct OutStore {
 }
 
 impl OutStore {
-    /// Bytes its block indices hold (the files are mapped, not counted).
+    /// Bytes its block indices hold in memory: none (the files' headers
+    /// are read where they are mapped); the list of files.
     pub fn index_bytes(&self) -> usize {
-        self.frames.iter().flatten().map(|f| f.heads.capacity() * std::mem::size_of::<BlockHead>()).sum()
+        self.frames.capacity() * std::mem::size_of::<Option<OutFile>>()
     }
 
     /// Frames `1..=horizon`'s out files under `edges_dir`.
