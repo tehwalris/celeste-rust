@@ -103,14 +103,25 @@ impl VisitedSet {
     /// between their first keys; every run on `threads` threads, the
     /// biggest first.
     pub fn upsert_all(&mut self, changes: Vec<(u32, Vec<Change>)>, threads: usize) -> Result<Upserted> {
-        // A run: its region's index in `changes`, its place among the
-        // region's runs, its changes, its blocks.
-        type Run = (usize, usize, std::ops::Range<usize>, Vec<Block>);
-        let mut runs: Vec<Run> = Vec::new();
-        let mut regions: Vec<u32> = Vec::with_capacity(changes.len());
-        for (i, (region, ch)) in changes.iter().enumerate() {
+        let regions: Vec<u32> = changes.iter().map(|c| c.0).collect();
+        let range = |i: usize, lo: Option<Key>, hi: Option<Key>| {
+            let ch = &changes[i].1;
+            lo.map_or(0, |k| ch.partition_point(|c| c.key < k))..hi.map_or(ch.len(), |k| ch.partition_point(|c| c.key < k))
+        };
+        self.upsert_with(&regions, threads, |i, lo, hi| range(i, lo, hi).len(), |i, lo, hi| Ok(changes[i].1[range(i, lo, hi)].to_vec()))
+    }
+
+    /// `upsert_all` with each run's changes MADE by the run (`make(i, lo,
+    /// hi)`: region `regions[i]`'s changes with keys in `[lo, hi)`, `None`
+    /// unbounded; `count` their number, the runs' order) - not all held at
+    /// once.
+    pub fn upsert_with(&mut self, regions: &[u32], threads: usize, count: impl Fn(usize, Option<Key>, Option<Key>) -> usize, make: impl Fn(usize, Option<Key>, Option<Key>) -> Result<Vec<Change>> + Sync) -> Result<Upserted> {
+        // A run: its region's index in `regions`, its place among the
+        // region's runs, its keys' range, its blocks.
+        type Run = (usize, usize, (Option<Key>, Option<Key>), Vec<Block>);
+        let mut runs: Vec<(usize, Run)> = Vec::new();
+        for (i, region) in regions.iter().enumerate() {
             anyhow::ensure!(((region / self.geo.slots) as usize) < self.shapes.len(), "an upserted region {region} of no numbered shape");
-            regions.push(*region);
             let blocks = self.set.table_mut(*region, RegionTable::packed).take_blocks();
             // Runs of blocks, each with the changes from its first key to
             // the next run's (the first from the start, the last to the end).
@@ -125,33 +136,32 @@ impl VisitedSet {
                 g
             };
             if groups.is_empty() {
-                runs.push((i, 0, 0..ch.len(), Vec::new()));
+                runs.push((count(i, None, None), (i, 0, (None, None), Vec::new())));
                 continue;
             }
-            let starts: Vec<usize> = std::iter::once(0)
-                .chain(groups.iter().skip(1).map(|g| ch.partition_point(|c| c.key < g[0].first())))
-                .chain(std::iter::once(ch.len()))
-                .collect();
+            let firsts: Vec<Option<Key>> = std::iter::once(None).chain(groups.iter().skip(1).map(|g| Some(g[0].first()))).chain(std::iter::once(None)).collect();
             for (k, g) in groups.into_iter().enumerate() {
-                runs.push((i, k, starts[k]..starts[k + 1], g));
+                let (lo, hi) = (firsts[k], firsts[k + 1]);
+                runs.push((count(i, lo, hi) + g.len() * super::set::PACK_ENTRIES, (i, k, (lo, hi), g)));
             }
         }
-        runs.sort_by_cached_key(|r| std::cmp::Reverse(r.2.len() + r.3.len() * super::set::PACK_ENTRIES));
-        let work: Vec<std::sync::Mutex<Option<Run>>> = runs.into_iter().map(|r| std::sync::Mutex::new(Some(r))).collect();
+        runs.sort_by_key(|r| std::cmp::Reverse(r.0));
+        let work: Vec<std::sync::Mutex<Option<Run>>> = runs.into_iter().map(|r| std::sync::Mutex::new(Some(r.1))).collect();
         let done = super::wave::par_map(&work, threads, |w| -> Result<(usize, usize, Vec<Block>, Upserted)> {
-            let (i, k, rg, blocks) = w.lock().expect("a run").take().expect("a run taken once");
-            let (out, n) = super::set::upsert_blocks(blocks, &changes[i].1[rg])?;
+            let (i, k, (lo, hi), blocks) = w.lock().expect("a run").take().expect("a run taken once");
+            let changes = make(i, lo, hi)?;
+            let (out, n) = super::set::upsert_blocks(blocks, &changes)?;
             Ok((i, k, out, n))
         });
         // Each region's runs back in order.
-        let mut parts: Vec<Vec<(usize, Vec<Block>)>> = (0..changes.len()).map(|_| Vec::new()).collect();
+        let mut parts: Vec<Vec<(usize, Vec<Block>)>> = (0..regions.len()).map(|_| Vec::new()).collect();
         let mut total = Upserted::default();
         for d in done {
             let (i, k, out, n) = d?;
             parts[i].push((k, out));
             total += n;
         }
-        for (region, mut p) in regions.into_iter().zip(parts) {
+        for (&region, mut p) in regions.iter().zip(parts) {
             p.sort_by_key(|x| x.0);
             *self.set.table_mut(region, RegionTable::packed) = RegionTable::of_blocks(p.into_iter().flat_map(|x| x.1).collect())?;
         }
@@ -171,33 +181,63 @@ impl VisitedSet {
     /// already - 0, the frame's new states are new).
     #[allow(clippy::type_complexity)]
     pub fn absorb(&mut self, parts: &[(u32, &RegionTable, &[Hull], &[super::wave::Old])], layer: u16, threads: usize) -> Result<Upserted> {
-        let changes: Vec<(u32, Vec<Change>)> = super::wave::par_map(parts, threads, |&(region, new, hulls, grown)| -> Result<(u32, Vec<Change>)> {
-            anyhow::ensure!(new.states() == hulls.len() as u64, "region {region}: {} new states, {} hulls", new.states(), hulls.len());
-            // The new states and the grown ones, merged by key and cell.
-            let mut fresh: Vec<Change> = Vec::with_capacity(hulls.len());
-            let mut h = hulls.iter();
-            for (key, mask) in new.iter() {
-                for cell in super::layer::bits(mask) {
-                    let hull = *h.next().expect("counted above");
-                    fresh.push(Change { key, cell: cell as u8, info: Some(StateInfo { hull, layer }), new: true });
-                }
+        // Per region its new entries' first states (their hulls' places).
+        let starts: Vec<Vec<u32>> = super::wave::par_map(parts, threads, |&(region, new, hulls, _)| -> Result<Vec<u32>> {
+            let mut at = Vec::with_capacity(new.len() + 1);
+            let mut n = 0u32;
+            for m in new.masks() {
+                at.push(n);
+                n += m.count_ones();
             }
-            let mut out: Vec<Change> = Vec::with_capacity(fresh.len() + grown.len());
-            let mut g = grown.iter().map(|o| Change { key: o.sk.key, cell: o.sk.local, info: Some(StateInfo { hull: o.hull, layer: o.layer }), new: false }).peekable();
-            for c in fresh {
-                while g.peek().is_some_and(|x| (x.key, x.cell) < (c.key, c.cell)) {
-                    out.push(g.next().expect("peeked"));
-                }
-                anyhow::ensure!(g.peek().is_none_or(|x| (x.key, x.cell) != (c.key, c.cell)), "region {region}: a state new and grown at once");
-                out.push(c);
-            }
-            out.extend(g);
-            anyhow::ensure!(out.windows(2).all(|w| (w[0].key, w[0].cell) < (w[1].key, w[1].cell)), "region {region}: grown states not by key and cell");
-            Ok((region, out))
+            at.push(n);
+            anyhow::ensure!(n as usize == hulls.len(), "region {region}: {n} new states, {} hulls", hulls.len());
+            Ok(at)
         })
         .into_iter()
         .collect::<Result<_>>()?;
-        self.upsert_all(changes, threads)
+        // A run's entries and grown states: those with keys in [lo, hi).
+        let at = |i: usize, lo: Option<Key>, hi: Option<Key>| {
+            let (_, new, _, grown) = parts[i];
+            let e = |k: Option<Key>, end: usize| k.map_or(end, |k| new.lower_bound(k));
+            let g = |k: Option<Key>, end: usize| k.map_or(end, |k| grown.partition_point(|o| o.sk.key < k));
+            (e(lo, 0)..e(hi, new.len()), g(lo, 0)..g(hi, grown.len()))
+        };
+        let regions: Vec<u32> = parts.iter().map(|p| p.0).collect();
+        // The new states and the grown ones, merged by key and cell (each
+        // run makes its own: they were all held at once, 32 B a state).
+        self.upsert_with(
+            &regions,
+            threads,
+            |i, lo, hi| {
+                let (e, g) = at(i, lo, hi);
+                (starts[i][e.end] - starts[i][e.start]) as usize + g.len()
+            },
+            |i, lo, hi| -> Result<Vec<Change>> {
+                let (region, new, hulls, grown) = parts[i];
+                let (e, g) = at(i, lo, hi);
+                let mut fresh: Vec<Change> = Vec::with_capacity((starts[i][e.end] - starts[i][e.start]) as usize);
+                let mut h = hulls[starts[i][e.start] as usize..starts[i][e.end] as usize].iter();
+                for x in e {
+                    let (key, mask) = (new.key(x as u32), new.mask(x as u32));
+                    for cell in super::layer::bits(mask) {
+                        let hull = *h.next().expect("counted above");
+                        fresh.push(Change { key, cell: cell as u8, info: Some(StateInfo { hull, layer }), new: true });
+                    }
+                }
+                let mut out: Vec<Change> = Vec::with_capacity(fresh.len() + g.len());
+                let mut g = grown[g].iter().map(|o| Change { key: o.sk.key, cell: o.sk.local, info: Some(StateInfo { hull: o.hull, layer: o.layer }), new: false }).peekable();
+                for c in fresh {
+                    while g.peek().is_some_and(|x| (x.key, x.cell) < (c.key, c.cell)) {
+                        out.push(g.next().expect("peeked"));
+                    }
+                    anyhow::ensure!(g.peek().is_none_or(|x| (x.key, x.cell) != (c.key, c.cell)), "region {region}: a state new and grown at once");
+                    out.push(c);
+                }
+                out.extend(g);
+                anyhow::ensure!(out.windows(2).all(|w| (w[0].key, w[0].cell) < (w[1].key, w[1].cell)), "region {region}: grown states not by key and cell");
+                Ok(out)
+            },
+        )
     }
 
     /// States held.

@@ -1443,7 +1443,9 @@ pub fn restore_visited(dir: &std::path::Path, last: u32, room: (i16, i16), threa
                 let i = was.ok_or_else(|| anyhow::anyhow!("{}: an old state of frame {f}'s frontier without a hull before", dir.display()))?;
                 anyhow::ensure!(i.layer == layer, "{}: an old state's layer {layer} in frame {f}'s hulls, {} before", dir.display(), i.layer);
                 if old.last().is_none_or(|x| x.0 != layer) {
-                    old.push((layer, Vec::new()));
+                    // Each layer's room exactly (the grown states are by layer).
+                    let n = hf.grown.partition_point(|g| g.1 <= layer) - hf.grown.partition_point(|g| g.1 < layer);
+                    old.push((layer, Vec::with_capacity(n)));
                 }
                 old.last_mut().expect("pushed").1.push(crate::storage::wave::Old { sk, layer, hull, was: i.hull });
             }

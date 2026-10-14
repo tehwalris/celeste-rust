@@ -441,6 +441,22 @@ impl RegionTable {
         }
     }
 
+    /// The first entry whose key is `k` or past it (a plain table: binary
+    /// search).
+    pub fn lower_bound(&self, k: Key) -> usize {
+        let w = wide(k);
+        let (mut lo, mut hi) = (0usize, self.len);
+        while lo < hi {
+            let mid = (lo + hi) / 2;
+            if self.wkey(mid) < w {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        lo
+    }
+
     /// The entry holding `k` (a plain table: binary search).
     pub fn find(&self, k: Key) -> Option<u32> {
         let w = wide(k);
