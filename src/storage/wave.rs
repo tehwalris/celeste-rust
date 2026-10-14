@@ -577,6 +577,19 @@ pub fn run_wave(engine: &dyn FrameStep, front: &Frontier, cx: WaveCtx) -> Result
             let b = k.alloc_bytes();
             [a[0] + b[0], a[1] + b[1], a[2] + b[2], a[3] + b[3]]
         });
+        let tb = states.iter().fold([0usize; 4], |a, r| {
+            let b = r.touched.bytes();
+            std::array::from_fn(|k| a[k] + b[k])
+        });
+        let (tk, ts): (usize, usize) = states.iter().fold((0, 0), |a, r| (a.0 + r.touched.key_count(), a.1 + r.touched.len()));
+        eprintln!(
+            "[wavemem] f{frame}: touched {ts} states in {tk} keys: index {:.3}, keys {:.3}, live slots {:.3}, dead or spare slots {:.3} GB ({:.1} B a touched state)",
+            gb(tb[0]),
+            gb(tb[1]),
+            gb(tb[2]),
+            gb(tb[3]),
+            tb.iter().sum::<usize>() as f64 / ts.max(1) as f64
+        );
         eprintln!(
             "[wavemem] f{frame}: frontier {:.3} GB ({} entries, {} old states), visited {:.3} GB ({} entries), the routes' touched states {:.3}, provisional bundles {:.3}, segments {:.3}, chunks in flight at most {:.3}, sinks {:.3} (bundles {:.3}, lane hulls {:.3}, pos pairs {:.3}, rest {:.3}), region scratch {:.3} (bundles {:.3}, encoder {:.3}, raw {:.3}, rest {:.3}) GB; anon {:.2} GB",
             gb(st.frontier_bytes),

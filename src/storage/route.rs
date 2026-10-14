@@ -43,11 +43,12 @@ const PROV: u32 = u32::MAX;
 /// `index`: `u32` slots of the keys' places, open addressing, at most 3/4
 /// full), the cells pushed and the RUN of their hulls so far in `slots`
 /// (by cell; a run moves to the end when its key gains a cell, and the
-/// runs are compacted once the moved ones' slots outnumber the live). What
+/// runs are compacted once the moved ones' slots are half the live; the
+/// arrays grow by an eighth). What
 /// the visited set holds of them is read at the frame's end (`seal`, the
-/// keys sorted against the region's packed table). ~40 B a touched state
-/// (63 with a hash map of keys and runs never compacted: a big room's
-/// f231, 12.8M touched states).
+/// keys sorted against the region's packed table). ~30 B a touched state
+/// (63 with a hash map of keys, runs never compacted and arrays doubled:
+/// a big room's f231, 12.8M touched states).
 #[derive(Default)]
 pub struct Touched {
     index: Vec<u32>,
@@ -63,6 +64,15 @@ pub struct TouchedKey {
     pub key: Key,
     pub cells: u64,
     pub start: u32,
+}
+
+/// Room in `v` for `more`, grown by an eighth at least (not doubled: a
+/// frame's touched tables are its biggest transient).
+#[inline]
+fn grow<T>(v: &mut Vec<T>, more: usize) {
+    if v.len() + more > v.capacity() {
+        v.reserve_exact(more.max(v.len() / 8).max(64));
+    }
 }
 
 #[inline]
@@ -91,6 +101,7 @@ impl Touched {
         loop {
             match self.index[i] {
                 0 => {
+                    grow(&mut self.keys, 1);
                     self.keys.push(TouchedKey { key, cells: 0, start: self.slots.len() as u32 });
                     self.index[i] = self.keys.len() as u32;
                     return self.keys.len() as u32 - 1;
@@ -117,6 +128,7 @@ impl Touched {
         // The key's run with the new cells, at the end.
         let next = mask | add;
         let at = self.slots.len();
+        grow(&mut self.slots, next.count_ones() as usize);
         let mut m = next;
         while m != 0 {
             let c = m.trailing_zeros() as u8;
@@ -129,14 +141,14 @@ impl Touched {
         self.states += (add & !mask).count_ones() as usize;
         self.dead += mask.count_ones() as usize;
         (self.keys[e as usize].cells, self.keys[e as usize].start) = (next, at as u32);
-        if self.dead > 4096 && self.dead > self.states {
+        if self.dead > 4096 && self.dead * 2 > self.states {
             self.compact();
         }
     }
 
     /// The live runs, key by key, at the start of new slots.
     fn compact(&mut self) {
-        let mut slots = Vec::with_capacity(self.states + self.states / 4);
+        let mut slots = Vec::with_capacity(self.states + self.states / 8);
         for k in &mut self.keys {
             let n = k.cells.count_ones() as usize;
             let a = slots.len() as u32;
@@ -176,7 +188,19 @@ impl Touched {
 
     /// Bytes held.
     pub fn alloc_bytes(&self) -> usize {
-        self.index.capacity() * 4 + self.keys.capacity() * std::mem::size_of::<TouchedKey>() + self.slots.capacity() * std::mem::size_of::<HullAcc>()
+        self.bytes().iter().sum()
+    }
+
+    /// Bytes held by part (`[wavemem]`): the index, the keys, the slots
+    /// live, the slots dead or spare; and the keys and states held.
+    pub fn bytes(&self) -> [usize; 4] {
+        let slot = std::mem::size_of::<HullAcc>();
+        [self.index.capacity() * 4, self.keys.capacity() * std::mem::size_of::<TouchedKey>(), self.states * slot, (self.slots.capacity() - self.states) * slot]
+    }
+
+    /// Keys touched.
+    pub fn key_count(&self) -> usize {
+        self.keys.len()
     }
 }
 
