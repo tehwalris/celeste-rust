@@ -352,4 +352,53 @@ mod tests {
             assert_eq!(v.state(region, (0, k * 2), (k % 64) as u32), info(k));
         }
     }
+
+    /// `absorb` (each run making its own changes from the frame's new
+    /// table and grown states) leaves the visited set as the changes made
+    /// all at once and upserted do: a region of several runs, new keys and
+    /// grown states in every run, before the first key and past the last.
+    #[test]
+    fn absorb_is_the_upsert_of_the_frames_changes() {
+        let region = 3;
+        let hull = |x: u64| Hull::from_bytes(&(x.wrapping_mul(0x9e37_79b9_7f4a_7c15) & 0x7fff_7fff_7fff_7fff).to_le_bytes());
+        let n = 300 * crate::storage::set::PACK_ENTRIES as u64;
+        let held: Vec<Change> = (0..n).map(|k| Change { key: (0, 4 + k * 4), cell: (k % 64) as u8, info: Some(StateInfo { hull: hull(k), layer: (k % 7) as u16 }), new: true }).collect();
+        let fresh = || {
+            let mut v = VisitedSet::new(super::super::GEOMETRY);
+            v.add_shape(7);
+            v.upsert_all(vec![(region, held.clone())], 8).unwrap();
+            v
+        };
+        // The frame's new entries (keys between the held ones, before the
+        // first and past the last; 1-3 cells), and grown held states.
+        let new_keys: Vec<(u64, u64)> = std::iter::once((0, 1)).chain((0..n).step_by(97).map(|k| (0, 6 + k * 4))).chain(std::iter::once((0, 8 + n * 4))).collect();
+        let masks: Vec<u64> = new_keys.iter().map(|k| 0b101u64 << (k.1 % 60) | (k.1 % 3 == 0) as u64).collect();
+        let table = RegionTable::from_sorted(&new_keys, &masks).unwrap();
+        let hulls: Vec<Hull> = (0..table.states()).map(|i| hull(1000 + i)).collect();
+        let grown: Vec<super::super::wave::Old> = (0..n)
+            .step_by(53)
+            .map(|k| super::super::wave::Old { sk: super::super::Sk { region, key: (0, 4 + k * 4), local: (k % 64) as u8 }, layer: (k % 7) as u16, hull: hull(k + 7), was: hull(k) })
+            .collect();
+        let layer = 40;
+        let mut a = fresh();
+        let got = a.absorb(&[(region, &table, &hulls, &grown)], layer, 8).unwrap();
+        // The same changes, made at once.
+        let mut changes: Vec<Change> = Vec::new();
+        let mut h = hulls.iter();
+        for (key, mask) in table.iter() {
+            for cell in crate::storage::layer::bits(mask) {
+                changes.push(Change { key, cell: cell as u8, info: Some(StateInfo { hull: *h.next().unwrap(), layer }), new: true });
+            }
+        }
+        changes.extend(grown.iter().map(|o| Change { key: o.sk.key, cell: o.sk.local, info: Some(StateInfo { hull: o.hull, layer: o.layer }), new: false }));
+        changes.sort_by_key(|c| (c.key, c.cell));
+        let mut b = fresh();
+        let want = b.upsert_all(vec![(region, changes.clone())], 8).unwrap();
+        assert_eq!((got.added, got.held_new), (want.added, want.held_new));
+        assert_eq!((a.len(), a.entries()), (b.len(), b.entries()));
+        for c in changes.iter().chain(held.iter().step_by(1013)) {
+            assert_eq!(a.state(region, c.key, c.cell as u32), b.state(region, c.key, c.cell as u32), "state {:?} cell {}", c.key, c.cell);
+        }
+        assert!(a.table(region).unwrap().blocks().len() > 2 * RUN_BLOCKS, "several runs");
+    }
 }
