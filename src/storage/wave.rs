@@ -687,7 +687,7 @@ pub fn run_wave(engine: &dyn FrameStep, front: &Frontier, cx: WaveCtx) -> Result
     // content), whatever the slices that met them first (their bundles
     // waited for their ids).
     let perm = xfers.canonical(xfers_before, &xfer_counts);
-    let renumber = perm.as_deref().map(|perm| super::route::Renumber { first: xfers_before as u32, perm });
+
     // Per route (in parallel): sealed - its new and grown states.
     type Sealed = super::route::Sealed;
     let sealed: Vec<Result<Option<Sealed>>> = {
@@ -698,10 +698,9 @@ pub fn run_wave(engine: &dyn FrameStep, front: &Frontier, cx: WaveCtx) -> Result
         order.sort_by_cached_key(|&k| std::cmp::Reverse(cells[k].lock().expect("a route").touched.len()));
         let visited: &VisitedSet = visited;
         std::thread::scope(|scope| {
-            let hs: Vec<_> = scratch
-                .iter_mut()
-                .map(|sc| {
-                    let (next, cells, order, regions, finals, renumber) = (&next, &cells, &order, &regions, &finals, renumber.as_ref());
+            let hs: Vec<_> = (0..workers)
+                .map(|_| {
+                    let (next, cells, order, regions, finals) = (&next, &cells, &order, &regions, &finals);
                     scope.spawn(move || {
                         let mut out = Vec::new();
                         loop {
@@ -709,7 +708,7 @@ pub fn run_wave(engine: &dyn FrameStep, front: &Frontier, cx: WaveCtx) -> Result
                             let c = &cells[k];
                             let mut st = c.lock().expect("a route");
                             let r = match regions[k] {
-                                Some(region) => super::route::seal(&mut st, region, finals, renumber, visited, sc).map(Some),
+                                Some(region) => super::route::seal(&mut st, region, finals, visited).map(Some),
                                 // A route of a new shape whose records the
                                 // coarser level all dropped.
                                 None if !st.is_used() => Ok(None),
@@ -739,24 +738,43 @@ pub fn run_wave(engine: &dyn FrameStep, front: &Frontier, cx: WaveCtx) -> Result
     new.sort_unstable_by_key(|x| x.region);
     mark("seal", &mut st);
     // THE EDGE FILE (and the frame's new transfers), written beside the
-    // rest of the frame's end: the routes' segments are final once sealed.
-    let mut segs = Vec::new();
+    // rest of the frame's end: per route its jobs' segments (final once
+    // sealed) and those that waited, encoded again with their final keys
+    // and transfer ids (`route::reencode`, here) - in the file per route
+    // the jobs' by slice, then the waited ones by slice.
+    type RouteSegs = (u32, Vec<((u8, u32), super::edges::Segment)>, Vec<(u32, super::edges::Segment)>);
+    let mut routes_segs: Vec<RouteSegs> = Vec::new();
     let mut src_index: Vec<(u32, Vec<u32>)> = Vec::new();
     for (r, region) in states.into_iter().zip(&regions) {
         let Some(region) = *region else { continue };
-        st.edge_bundles += r.segs.iter().map(|g| g.1.bundles as u64).sum::<u64>();
-        st.edge_records += r.segs.iter().map(|g| g.1.edges).sum::<u64>();
+        st.edge_bundles += r.segs.iter().map(|g| g.1.bundles as u64).sum::<u64>() + r.prov.iter().map(|g| g.1.bundles as u64).sum::<u64>();
+        st.edge_records += r.segs.iter().map(|g| g.1.edges).sum::<u64>() + r.prov.iter().map(|g| g.1.edges).sum::<u64>();
         st.routes += 1;
         if !r.sources.is_empty() {
             src_index.push((region, r.sources.into_iter().collect()));
         }
-        segs.extend(r.segs.into_iter().map(|g| g.1));
+        routes_segs.push((region, r.segs, r.prov));
     }
     let edge_file = match edges_dir {
         Some(dir) => {
-            let (dir, flush) = (dir.to_path_buf(), xfers.take_flush());
+            let (dir, flush, finals, threads) = (dir.to_path_buf(), xfers.take_flush(), finals.clone(), s.threads());
             Some(std::thread::Builder::new().name("edge file".into()).spawn(move || -> Result<u64> {
                 flush.write(&dir)?;
+                let renumber = perm.as_deref().map(|perm| super::route::Renumber { first: xfers_before as u32, perm });
+                // The waited segments, one job each, on every thread.
+                let waited: Vec<(usize, u32, &super::edges::Segment)> = routes_segs.iter().enumerate().flat_map(|(k, r)| r.2.iter().map(move |(slice, seg)| (k, *slice, seg))).collect();
+                let again = par_map(&waited, threads, |&(k, _, seg)| super::route::reencode(seg, routes_segs[k].0, &finals, renumber.as_ref(), &mut super::bundle::Encoder::default(), &mut zstd::bulk::Compressor::new(1)?));
+                let mut per: Vec<Vec<((u8, u32), super::edges::Segment)>> = (0..routes_segs.len()).map(|_| Vec::new()).collect();
+                for (&(k, slice, _), seg) in waited.iter().zip(again) {
+                    per[k].push(((1, slice), seg?));
+                }
+                drop(waited);
+                let mut segs = Vec::new();
+                for ((_, mut jobs, _), waited) in routes_segs.into_iter().zip(per) {
+                    jobs.extend(waited);
+                    jobs.sort_unstable_by_key(|g| g.0);
+                    segs.extend(jobs.into_iter().map(|g| g.1));
+                }
                 super::edges::write_file(&super::edges::file_path(&dir, frame), frame, segs, src_index)
             })?)
         }
@@ -764,10 +782,10 @@ pub fn run_wave(engine: &dyn FrameStep, front: &Frontier, cx: WaveCtx) -> Result
     };
     if s.diag.phases && !new.is_empty() {
         let ms = |d: std::time::Duration| d.as_secs_f64() * 1e3;
-        let sum = new.iter().fold([0.0f64; 4], |a, sl| std::array::from_fn(|k| a[k] + ms(sl.t[k])));
+        let sum = new.iter().fold([0.0f64; 3], |a, sl| std::array::from_fn(|k| a[k] + ms(sl.t[k])));
         let mut big: Vec<&Sealed> = new.iter().collect();
         big.sort_by(|a, b| b.t.iter().sum::<std::time::Duration>().cmp(&a.t.iter().sum()));
-        let parts = |t: &[f64; 4]| format!("sort {:.0}, compare {:.0}, table {:.0}, waiting bundles {:.0} ms", t[0], t[1], t[2], t[3]);
+        let parts = |t: &[f64; 3]| format!("sort {:.0}, compare {:.0}, table {:.0} ms", t[0], t[1], t[2]);
         eprintln!(
             "[seal] f{frame}: {} routes, {} waiting bundles in {} segments, worker time {}; the longest: {}",
             new.len(),

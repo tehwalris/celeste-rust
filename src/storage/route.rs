@@ -630,11 +630,11 @@ pub struct Sealed {
     /// Per grown state its entry in the visited set's region table.
     pub grown_at: Vec<u32>,
     /// The states it compared, and its steps' walls: the touched keys
-    /// sorted, each compared with the visited set, the new table, the
-    /// bundles that waited encoded again (`--phases`' `[seal]`).
+    /// sorted, each compared with the visited set, the new table
+    /// (`--phases`' `[seal]`).
     pub touched: usize,
-    pub t: [std::time::Duration; 4],
-    /// The bundles that waited (their segments, bundles).
+    pub t: [std::time::Duration; 3],
+    /// The bundles that waited (their segments, bundles: `reencode`).
     pub waited: (usize, u64),
 }
 
@@ -660,10 +660,10 @@ impl Renumber<'_> {
 /// keys made final (`finals`); each touched state's hull - its pushes', and
 /// the visited set's - compared with the visited set's (`visited`, read
 /// only): a state it lacks is NEW (frozen, sorted by key: canonical), one
-/// whose hull grew GREW; the bundles that waited encoded with their final
-/// keys and transfer ids (`renumber`: `None` where the frame's new
-/// transfers are in order already).
-pub fn seal(st: &mut RouteState, region: u32, finals: &FxHashMap<Key, Key>, renumber: Option<&Renumber>, visited: &VisitedSet, sc: &mut Scratch) -> Result<Sealed> {
+/// whose hull grew GREW. The bundles that waited stay in `st.prov`, encoded
+/// again with their final keys and ids by `reencode` (the edge file's
+/// writer, beside the rest of the frame's end).
+pub fn seal(st: &mut RouteState, region: u32, finals: &FxHashMap<Key, Key>, visited: &VisitedSet) -> Result<Sealed> {
     st.region = Some(region);
     for seg in &mut st.segs {
         seg.1.region = region;
@@ -671,7 +671,7 @@ pub fn seal(st: &mut RouteState, region: u32, finals: &FxHashMap<Key, Key>, renu
     // THE STATES (final keys, sorted): new, grown, or nothing.
     let final_key = |k: Key| if is_provisional(k) { finals.get(&k).copied().ok_or_else(|| anyhow::anyhow!("a provisional key without its final key")) } else { Ok(k) };
     let mut lap = std::time::Instant::now();
-    let mut t = [std::time::Duration::ZERO; 4];
+    let mut t = [std::time::Duration::ZERO; 3];
     let mut mark = |k: usize| {
         t[k] = lap.elapsed();
         lap = std::time::Instant::now();
@@ -722,34 +722,33 @@ pub fn seal(st: &mut RouteState, region: u32, finals: &FxHashMap<Key, Key>, renu
     mark(1);
     let table = RegionTable::from_sorted(&keys, &masks)?;
     mark(2);
-    // Each job's bundles that waited, decoded and encoded again with the
-    // final keys and ids (a segment a job, as it was made).
-    let mut dz = zstd::bulk::Decompressor::new()?;
-    let mut raw: Vec<u8> = Vec::new();
     let waited = (st.prov.len(), st.prov.iter().map(|x| x.1.bundles as u64).sum());
-    for (slice, seg) in std::mem::take(&mut st.prov) {
-        bundle::decompress(&seg.bytes, seg.raw as usize, &mut dz, &mut raw)?;
-        let mut v: Vec<Bundle> = Vec::with_capacity(seg.bundles as usize);
-        let mut missing = false;
-        bundle::Block::open(&raw, &bundle::ORDER)?.bundles(|mut b| {
-            if is_provisional(b.t_key) {
-                match finals.get(&b.t_key) {
-                    Some(&k) => b.t_key = k,
-                    None => missing = true,
-                }
-            }
-            if let Some(rn) = renumber {
-                b.x = rn.id(b.x);
-            }
-            v.push(b);
-        })?;
-        ensure!(!missing, "a provisional target key without its final key");
-        ensure!(v.len() == seg.bundles as usize, "a waiting segment of {} bundles decoded to {}", seg.bundles, v.len());
-        st.segs.push(((1, slice), Segment::encode(region, &v, &mut sc.enc, &mut sc.raw, &mut sc.z)?));
-    }
-    // The file's order: the jobs' segments by slice, then the ones that
-    // waited by slice (one job a (route, slice): the keys are distinct).
-    st.segs.sort_unstable_by_key(|s| s.0);
-    mark(3);
     Ok(Sealed { region, table, hulls, grown, grown_at, touched: n_touched, t, waited })
+}
+
+/// A job's bundles that WAITED (`RouteState::prov`), decoded and encoded
+/// again as a segment of `region` with their final keys (`finals`) and
+/// transfer ids (`renumber`: `None` where the frame's new transfers are in
+/// order already).
+pub fn reencode(seg: &Segment, region: u32, finals: &FxHashMap<Key, Key>, renumber: Option<&Renumber>, enc: &mut bundle::Encoder, z: &mut zstd::bulk::Compressor<'static>) -> Result<Segment> {
+    let (mut dz, mut raw) = (zstd::bulk::Decompressor::new()?, Vec::new());
+    bundle::decompress(&seg.bytes, seg.raw as usize, &mut dz, &mut raw)?;
+    let mut v: Vec<Bundle> = Vec::with_capacity(seg.bundles as usize);
+    let mut missing = false;
+    bundle::Block::open(&raw, &bundle::ORDER)?.bundles(|mut b| {
+        if is_provisional(b.t_key) {
+            match finals.get(&b.t_key) {
+                Some(&k) => b.t_key = k,
+                None => missing = true,
+            }
+        }
+        if let Some(rn) = renumber {
+            b.x = rn.id(b.x);
+        }
+        v.push(b);
+    })?;
+    ensure!(!missing, "a provisional target key without its final key");
+    ensure!(v.len() == seg.bundles as usize, "a waiting segment of {} bundles decoded to {}", seg.bundles, v.len());
+    let mut out = Vec::new();
+    Segment::encode(region, &v, enc, &mut out, z)
 }
