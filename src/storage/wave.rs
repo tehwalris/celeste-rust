@@ -818,9 +818,12 @@ pub fn run_wave(engine: &dyn FrameStep, front: &Frontier, cx: WaveCtx) -> Result
     // layer and hull, the grown states' hulls.
     let layer16 = u16::try_from(frame).map_err(|_| anyhow!("frame {frame}: past a u16 layer"))?;
     let parts: Vec<(u32, &super::set::RegionTable, &[Hull], &[Old])> = new.iter().map(|sl| (sl.region, &sl.table, sl.hulls.as_slice(), sl.grown.as_slice())).collect();
-    let held = visited.absorb(&parts, layer16, s.threads())?;
+    let up = visited.absorb(&parts, layer16, s.threads())?;
     drop(parts);
-    ensure!(held == 0, "frame {frame}: {held} of the next layer's states the visited set held already");
+    ensure!(up.held_new == 0, "frame {frame}: {} of the next layer's states the visited set held already", up.held_new);
+    if s.diag.phases {
+        eprintln!("[absorb] f{frame}: {} states added; packed blocks kept {}, decoded {}, made {}", up.added, up.kept, up.decoded, up.made);
+    }
     mark("absorb", &mut st);
     // The grown states by layer, each layer's by state: every route's
     // (sorted by state) put in layer order (stable), then per layer the
@@ -1518,7 +1521,7 @@ pub fn seed(visited: &mut VisitedSet, blocks: &[Block], level: crate::abstractio
         parts.push((*region, t, &hulls[at..at + n], &[]));
         at += n;
     }
-    let held = visited.absorb(&parts, 0, s.threads())?;
+    let held = visited.absorb(&parts, 0, s.threads())?.held_new;
     drop(parts);
     ensure!(held == 0, "frame 0 into a visited set that held {held} of its states");
     for (h, rec) in skels {

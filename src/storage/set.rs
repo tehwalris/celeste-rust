@@ -262,12 +262,19 @@ pub struct Change {
 pub struct Upserted {
     pub added: u64,
     pub held_new: u64,
+    /// Blocks kept as they were, decoded, and made (`--phases`' `[absorb]`).
+    pub kept: u64,
+    pub decoded: u64,
+    pub made: u64,
 }
 
 impl std::ops::AddAssign for Upserted {
     fn add_assign(&mut self, o: Upserted) {
         self.added += o.added;
         self.held_new += o.held_new;
+        self.kept += o.kept;
+        self.decoded += o.decoded;
+        self.made += o.made;
     }
 }
 
@@ -583,19 +590,23 @@ pub fn upsert_blocks(blocks: Vec<Block>, changes: &[Change]) -> Result<(Vec<Bloc
             if w.rows.len() == 0 || w.rows.len() >= PACK_ENTRIES / 2 {
                 w.flush(true)?;
                 w.out.push(block);
+                n.kept += 1;
             } else {
                 rows.decode(&block, &mut raw)?;
+                n.decoded += 1;
                 n += merge_rows(&rows, &[], &mut w)?;
             }
             continue;
         }
         rows.decode(&block, &mut raw)?;
+        n.decoded += 1;
         n += merge_rows(&rows, &changes[ci..hi], &mut w)?;
         ci = hi;
     }
     rows.clear();
     n += merge_rows(&rows, &changes[ci..], &mut w)?;
     w.flush(true)?;
+    n.made = (w.out.len() as u64).saturating_sub(n.kept);
     Ok((w.out, n))
 }
 
@@ -890,12 +901,9 @@ mod tests {
                 ch.insert((key, cell), (info, new));
             }
             let changes: Vec<Change> = ch.iter().map(|(&(k, c), &(info, new))| Change { key: narrow(k), cell: c, info, new }).collect();
-            let want = Upserted {
-                added: ch.keys().filter(|k| !model.contains_key(k)).count() as u64,
-                held_new: ch.iter().filter(|(k, v)| v.1 && model.contains_key(k)).count() as u64,
-            };
+            let want = (ch.keys().filter(|k| !model.contains_key(k)).count() as u64, ch.iter().filter(|(k, v)| v.1 && model.contains_key(k)).count() as u64);
             let got = t.upsert(&changes).unwrap();
-            assert_eq!(got, want, "round {round}");
+            assert_eq!((got.added, got.held_new), want, "round {round}");
             for ((k, c), (info, _)) in ch {
                 model.insert((k, c), info.filter(|i| !i.is_full()));
             }

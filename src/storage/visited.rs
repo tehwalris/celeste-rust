@@ -167,10 +167,10 @@ impl VisitedSet {
     /// its NEW entries (a plain table, of a numbered shape) with their
     /// hulls in its state order - in at layer `layer` - and the states
     /// whose hull grew (held already; sorted by state) with their new
-    /// hulls. Returns the new states held already (0: the frame's new
-    /// states are new).
+    /// hulls. Returns what it did (`held_new`: the new states held
+    /// already - 0, the frame's new states are new).
     #[allow(clippy::type_complexity)]
-    pub fn absorb(&mut self, parts: &[(u32, &RegionTable, &[Hull], &[super::wave::Old])], layer: u16, threads: usize) -> Result<u64> {
+    pub fn absorb(&mut self, parts: &[(u32, &RegionTable, &[Hull], &[super::wave::Old])], layer: u16, threads: usize) -> Result<Upserted> {
         let changes: Vec<(u32, Vec<Change>)> = super::wave::par_map(parts, threads, |&(region, new, hulls, grown)| -> Result<(u32, Vec<Change>)> {
             anyhow::ensure!(new.states() == hulls.len() as u64, "region {region}: {} new states, {} hulls", new.states(), hulls.len());
             // The new states and the grown ones, merged by key and cell.
@@ -197,7 +197,7 @@ impl VisitedSet {
         })
         .into_iter()
         .collect::<Result<_>>()?;
-        Ok(self.upsert_all(changes, threads)?.held_new)
+        self.upsert_all(changes, threads)
     }
 
     /// States held.
@@ -288,7 +288,8 @@ mod tests {
         // 300 blocks' worth of entries, one cell each.
         let n = 300 * crate::storage::set::PACK_ENTRIES as u64;
         let first: Vec<Change> = (0..n).map(|k| Change { key: (0, k * 2), cell: (k % 64) as u8, info: info(k), new: true }).collect();
-        assert_eq!(v.upsert_all(vec![(region, first)], 8).unwrap(), Upserted { added: n, held_new: 0 });
+        let got = v.upsert_all(vec![(region, first)], 8).unwrap();
+        assert_eq!((got.added, got.held_new), (n, 0));
         assert!(v.table(region).unwrap().blocks().len() > 2 * RUN_BLOCKS);
         // Changes in the first and the last run only: an update, a new
         // cell, a new key between two held ones, a key past the end.
@@ -300,7 +301,7 @@ mod tests {
         ];
         second.sort_by_key(|c| (c.key, c.cell));
         let got = v.upsert_all(vec![(region, second)], 8).unwrap();
-        assert_eq!(got, Upserted { added: 3, held_new: 0 }, "(0, 2) cell 1 held: an update");
+        assert_eq!((got.added, got.held_new), (3, 0), "(0, 2) cell 1 held: an update");
         assert_eq!(v.len() as u64, n + 3);
         assert_eq!(v.state(region, (0, 2 * (n - 1)), 62), info(5));
         assert_eq!(v.state(region, (0, 2), 1), info(999));
