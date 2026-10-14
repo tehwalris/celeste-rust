@@ -102,18 +102,28 @@ impl Placed {
 /// The 16 lanes of the 32-bit column at byte `o`.
 #[inline]
 fn col(buf: &[u8], o: usize) -> [u32; 16] {
-    let b: &[u8; 64] = buf[o..o + 64].try_into().unwrap();
-    std::array::from_fn(|i| u32::from_le_bytes([b[4 * i], b[4 * i + 1], b[4 * i + 2], b[4 * i + 3]]))
+    let b = &buf[o..o + 64];
+    // SAFETY: 64 readable bytes (the slice above), read as 16 words.
+    unsafe { std::ptr::read_unaligned(b.as_ptr().cast::<[u32; 16]>()) }.map(u32::from_le)
 }
 
-/// The lanes where `c` holds `v`.
+/// The lanes where `c` holds `v` (one AVX-512 compare: every build has
+/// it, `celeste_engine::kernel`).
 #[inline]
 fn eq_mask(c: &[u32; 16], v: u32) -> u16 {
-    let mut m = 0u16;
-    for (i, &x) in c.iter().enumerate() {
-        m |= ((x == v) as u16) << i;
-    }
-    m
+    use core::arch::x86_64::{_mm512_cmpeq_epi32_mask, _mm512_loadu_si512, _mm512_set1_epi32};
+    // SAFETY: `c` is 64 readable bytes; AVX-512F is enabled in every build.
+    unsafe { _mm512_cmpeq_epi32_mask(_mm512_loadu_si512(c.as_ptr().cast()), _mm512_set1_epi32(v as i32)) }
+}
+
+/// The lanes where two columns of 16 words (64 bytes each) are equal.
+#[inline]
+pub(super) fn eq16(a: &[u8], b: &[u8]) -> u16 {
+    use core::arch::x86_64::{_mm512_cmpeq_epi32_mask, _mm512_loadu_si512};
+    assert!(a.len() >= 64 && b.len() >= 64, "a column of 16 words");
+    // SAFETY: both hold 64 readable bytes (checked); AVX-512F is enabled in
+    // every build.
+    unsafe { _mm512_cmpeq_epi32_mask(_mm512_loadu_si512(a.as_ptr().cast()), _mm512_loadu_si512(b.as_ptr().cast())) }
 }
 
 /// A boolean root's `(value, known)` lane masks.
