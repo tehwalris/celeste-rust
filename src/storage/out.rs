@@ -216,6 +216,11 @@ pub fn encode_blocks(p: &mut Parts) -> Vec<(Vec<u8>, bool)> {
     let mut out = Vec::new();
     let mut i = 0usize;
     let (mut t_new, mut x_new) = (vec![u32::MAX; p.targets.len()], vec![u32::MAX; p.pairs.len()]);
+    // Per target and pair, the last block holding it (distinct ones listed
+    // once, then sorted: a block's rows are ~2000, its targets and pairs
+    // far fewer).
+    let (mut t_in, mut x_in) = (vec![u32::MAX; p.targets.len()], vec![u32::MAX; p.pairs.len()]);
+    let mut block = 0u32;
     while i < p.rows.len() {
         // Whole entries, up to the block's rows.
         let mut j = i;
@@ -223,12 +228,21 @@ pub fn encode_blocks(p: &mut Parts) -> Vec<(Vec<u8>, bool)> {
             j += 1;
         }
         let rows = &p.rows[i..j];
-        let mut ts: Vec<u32> = rows.iter().map(|r| (r.0 >> 64) as u32).collect();
+        let (mut ts, mut xs): (Vec<u32>, Vec<u32>) = (Vec::new(), Vec::new());
+        for r in rows {
+            let (t, x) = ((r.0 >> 64) as u32, (r.0 >> 32) as u32);
+            if t_in[t as usize] != block {
+                t_in[t as usize] = block;
+                ts.push(t);
+            }
+            if x_in[x as usize] != block {
+                x_in[x as usize] = block;
+                xs.push(x);
+            }
+        }
+        block += 1;
         ts.sort_unstable();
-        ts.dedup();
-        let mut xs: Vec<u32> = rows.iter().map(|r| (r.0 >> 32) as u32).collect();
         xs.sort_unstable();
-        xs.dedup();
         let mut rs: Vec<u32> = ts.iter().map(|&t| p.targets[t as usize].0).collect();
         rs.sort_unstable();
         rs.dedup();

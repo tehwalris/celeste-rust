@@ -148,6 +148,8 @@ const VERDICT_BATCH: usize = 1024;
 const XFER_CACHE: usize = 1 << 12;
 /// Entries of `UnitSink::pos_edge`'s cache (a power of two).
 const POS_RECENT: usize = 1 << 10;
+/// Entries of `UnitSink::src_seen` (a power of two).
+const SRC_SEEN: usize = 1 << 8;
 
 /// The lanes of a slice mask, lowest first.
 #[inline]
@@ -239,9 +241,11 @@ pub struct UnitSink<'a> {
     route_ids: FxHashMap<(u64, u32), u32>,
     route_slot: FxHashMap<u32, (u64, u32)>,
     last_route: (u64, u32, u32),
-    /// The unit's bundles by route, and its (route, source region) pairs.
+    /// The unit's bundles by route, and its (route, source region) pairs
+    /// (`src_seen`: the ones met, direct mapped, `pair + 1`).
     bundles: UnitBundles,
     src_regions: Vec<(u32, u32)>,
+    src_seen: Vec<u64>,
     /// Per target the coarser level's verdict (`MarkFilter`), once a unit,
     /// decided in batches (a projection per block, not per row).
     verdicts: rustc_hash2::FxHashMap<Target, u8>,
@@ -279,6 +283,9 @@ pub struct UnitSink<'a> {
     record_out: bool,
     pub out_blocks: Vec<(Vec<u8>, bool)>,
     out_parts: super::out::Parts,
+    /// Per local transfer id, the last unit whose out-edges hold it and its
+    /// rank among that unit's (`out_parts_of`).
+    x_rank: Vec<(u32, u32)>,
     /// Record `edges` (the pos graph) at all.
     pub edges_on: bool,
     /// The distinct pos-graph edges this worker produced, and the ones met
@@ -345,6 +352,7 @@ impl<'a> UnitSink<'a> {
             last_route: (0, u32::MAX, u32::MAX),
             bundles: UnitBundles::default(),
             src_regions: Vec::new(),
+            src_seen: Vec::new(),
             verdicts: Default::default(),
             scratch: Vec::new(),
             scratch_at: Vec::new(),
@@ -364,6 +372,7 @@ impl<'a> UnitSink<'a> {
             record_out,
             out_blocks: Vec::new(),
             out_parts: Default::default(),
+            x_rank: Vec::new(),
             edges_on,
             pos_edges: Default::default(),
             pos_recent: Vec::new(),
@@ -426,6 +435,8 @@ impl<'a> UnitSink<'a> {
         self.unit = unit;
         self.bundles.clear();
         self.src_regions.clear();
+        self.src_seen.clear();
+        self.src_seen.resize(SRC_SEEN, 0);
         self.verdicts.clear();
         self.disallowed = false;
         self.srcs.clear();
@@ -803,7 +814,12 @@ impl<'a> UnitSink<'a> {
         let mut pending: Option<(u32, Key, u32, u32, u32, u64)> = None;
         for i in lanes_of(take) {
             let route = t.route[i];
-            if self.src_regions.last() != Some(&(route, t.s_region[i])) {
+            // A (route, source region) pair once a unit, mostly: a direct
+            // mapped table of the pairs met (`end` sorts and dedups the rest).
+            let pair = (route as u64) << 32 | t.s_region[i] as u64;
+            let slot = (pair.wrapping_mul(0x9e37_79b9_7f4a_7c15) >> (64 - SRC_SEEN.trailing_zeros())) as usize;
+            if self.src_seen[slot] != pair + 1 {
+                self.src_seen[slot] = pair + 1;
                 self.src_regions.push((route, t.s_region[i]));
             }
             let b = (route, e.keys[i], t.src[i], xfers[i], t.offset[i]);
@@ -1111,16 +1127,22 @@ impl<'a> UnitSink<'a> {
         p.routes = keys.clone();
         p.routes.sort_unstable();
         p.routes.dedup();
+        // The distinct transfers (marked in `x_rank`, by the unit), by pair:
+        // each one's rank.
         let tab = self.xfer_tab.read().expect("a transfer table");
-        let mut xs: Vec<u32> = buckets.iter().flat_map(|b| b.2.iter().map(|u| u.x)).filter(|&x| x != NO_XFER).collect();
-        xs.sort_unstable();
-        xs.dedup();
-        let mut by_pair: Vec<(crate::search::arc_edges::Pair, u32)> = xs.iter().map(|&x| (tab[x as usize], x)).collect();
+        self.x_rank.resize(self.xfer_len as usize, (u32::MAX, 0));
+        let unit = self.unit;
+        let mut by_pair: Vec<(crate::search::arc_edges::Pair, u32)> = Vec::new();
+        for u in buckets.iter().flat_map(|b| &b.2) {
+            if u.x != NO_XFER && self.x_rank[u.x as usize].0 != unit {
+                self.x_rank[u.x as usize].0 = unit;
+                by_pair.push((tab[u.x as usize], u.x));
+            }
+        }
         drop(tab);
         by_pair.sort_unstable();
-        let mut x_rank: rustc_hash2::FxHashMap<u32, u32> = Default::default();
         for (rank, &(_, x)) in by_pair.iter().enumerate() {
-            x_rank.insert(x, rank as u32);
+            self.x_rank[x as usize].1 = rank as u32;
         }
         p.pairs = by_pair.into_iter().map(|x| x.0).collect();
         let mut ts: Vec<((u32, Key), u32, u32)> = Vec::new();
@@ -1142,7 +1164,7 @@ impl<'a> UnitSink<'a> {
                 if u.x == NO_XFER {
                     continue;
                 }
-                let (t, x) = (t_rank[bi][u.t as usize], x_rank[&u.x]);
+                let (t, x) = (t_rank[bi][u.t as usize], self.x_rank[u.x as usize].1);
                 // The cells by source entry (one, mostly).
                 let mut parts: [(u32, u64); 4] = [(u32::MAX, 0); 4];
                 self.by_entry(slot, u, |e, part, _| {
