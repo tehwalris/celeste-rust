@@ -40,16 +40,21 @@ pub const NO_XFER: u32 = u32::MAX;
 const PROV: u32 = u32::MAX;
 
 /// A route's TOUCHED states this frame: per key pushed into (one probe of
-/// `index` a key), the cells pushed and the RUN of their hulls so far in
-/// `slots` (by cell; a run moves to the end when its key gains a cell).
-/// What the visited set holds of them is read at the frame's end (`seal`,
-/// the keys sorted against the region's packed table).
+/// `index`: `u32` slots of the keys' places, open addressing, at most 3/4
+/// full), the cells pushed and the RUN of their hulls so far in `slots`
+/// (by cell; a run moves to the end when its key gains a cell, and the
+/// runs are compacted once the moved ones' slots outnumber the live). What
+/// the visited set holds of them is read at the frame's end (`seal`, the
+/// keys sorted against the region's packed table). ~40 B a touched state
+/// (63 with a hash map of keys and runs never compacted: a big room's
+/// f231, 12.8M touched states).
 #[derive(Default)]
 pub struct Touched {
-    index: rustc_hash2::FxHashMap<Key, u32>,
+    index: Vec<u32>,
     keys: Vec<TouchedKey>,
     slots: Vec<HullAcc>,
     states: usize,
+    dead: usize,
 }
 
 /// A touched key: its cells and its run's start.
@@ -60,15 +65,46 @@ pub struct TouchedKey {
     pub start: u32,
 }
 
+#[inline]
+fn key_hash(k: Key) -> u64 {
+    celeste_engine::runtime2::mix64(k.0.wrapping_mul(0x9e37_79b9_7f4a_7c15) ^ k.1)
+}
+
 impl Touched {
+    /// Key `key`'s place in `keys`, made (no cell yet) if absent.
+    #[inline]
+    fn place(&mut self, key: Key) -> u32 {
+        if (self.keys.len() + 1) * 4 > self.index.len() * 3 {
+            let cap = ((self.keys.len() + 1) * 2).next_power_of_two().max(64);
+            self.index = vec![0; cap];
+            let m = cap - 1;
+            for (e, k) in self.keys.iter().enumerate() {
+                let mut i = key_hash(k.key) as usize & m;
+                while self.index[i] != 0 {
+                    i = (i + 1) & m;
+                }
+                self.index[i] = e as u32 + 1;
+            }
+        }
+        let m = self.index.len() - 1;
+        let mut i = key_hash(key) as usize & m;
+        loop {
+            match self.index[i] {
+                0 => {
+                    self.keys.push(TouchedKey { key, cells: 0, start: self.slots.len() as u32 });
+                    self.index[i] = self.keys.len() as u32;
+                    return self.keys.len() as u32 - 1;
+                }
+                s if self.keys[s as usize - 1].key == key => return s - 1,
+                _ => i = (i + 1) & m,
+            }
+        }
+    }
+
     /// Merge `cells` (by cell, ascending: `(cell, hull)`) into key `key`'s.
     #[inline]
     pub fn push(&mut self, key: Key, cells: &[(u8, HullAcc)]) {
-        let n = self.keys.len() as u32;
-        let e = *self.index.entry(key).or_insert(n);
-        if e == n {
-            self.keys.push(TouchedKey { key, cells: 0, start: self.slots.len() as u32 });
-        }
+        let e = self.place(key);
         let TouchedKey { cells: mask, start, .. } = self.keys[e as usize];
         let add = cells.iter().fold(0u64, |m, x| m | 1u64 << x.0);
         let rank = |m: u64, c: u8| (m & ((1u64 << c) - 1)).count_ones() as usize;
@@ -91,7 +127,24 @@ impl Touched {
             self.slots[at + rank(next, c)].merge(a);
         }
         self.states += (add & !mask).count_ones() as usize;
+        self.dead += mask.count_ones() as usize;
         (self.keys[e as usize].cells, self.keys[e as usize].start) = (next, at as u32);
+        if self.dead > 4096 && self.dead > self.states {
+            self.compact();
+        }
+    }
+
+    /// The live runs, key by key, at the start of new slots.
+    fn compact(&mut self) {
+        let mut slots = Vec::with_capacity(self.states + self.states / 4);
+        for k in &mut self.keys {
+            let n = k.cells.count_ones() as usize;
+            let a = slots.len() as u32;
+            slots.extend_from_slice(&self.slots[k.start as usize..k.start as usize + n]);
+            k.start = a;
+        }
+        self.slots = slots;
+        self.dead = 0;
     }
 
     pub fn is_empty(&self) -> bool {
@@ -123,7 +176,7 @@ impl Touched {
 
     /// Bytes held.
     pub fn alloc_bytes(&self) -> usize {
-        self.index.capacity() * (std::mem::size_of::<(Key, u32)>() + 1) + self.keys.capacity() * std::mem::size_of::<TouchedKey>() + self.slots.capacity() * std::mem::size_of::<HullAcc>()
+        self.index.capacity() * 4 + self.keys.capacity() * std::mem::size_of::<TouchedKey>() + self.slots.capacity() * std::mem::size_of::<HullAcc>()
     }
 }
 
