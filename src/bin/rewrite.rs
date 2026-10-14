@@ -1161,6 +1161,7 @@ fn main() -> Result<()> {
             let t = std::time::Instant::now();
             engine.warm();
             let t_kernels = t.elapsed().as_secs_f64();
+            eprintln!("[bench] kernels built: rss {:.2} GB", celeste_rust::metrics::current_rss_gb());
             let t = std::time::Instant::now();
             let mut st = celeste_rust::frame::ForwardState::at(&dir, frame, true, level, &cfg)?;
             eprintln!(

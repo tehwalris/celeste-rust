@@ -702,8 +702,17 @@ pub fn print_memory(when: &str, visited: &super::visited::VisitedSet, new: &supe
     for (name, b) in &parts {
         eprintln!("[memory] {:<44} {:>9.3} {:>9.2} {:>9.2}", name, gb(*b), *b as f64 / v, *b as f64 / e);
     }
+    let before = crate::metrics::current_rss_gb();
+    // SAFETY: mimalloc's documented API, callable from any thread.
+    unsafe { libmimalloc_sys::mi_collect(true) };
     let anon = crate::metrics::current_rss_gb();
+    let mut commit = 0usize;
+    let mut z = [0usize; 7];
+    // SAFETY: valid out-pointers for mimalloc's documented API.
+    unsafe { libmimalloc_sys::mi_process_info(&mut z[0], &mut z[1], &mut z[2], &mut z[3], &mut z[4], &mut commit, &mut z[5], &mut z[6]) };
     eprintln!("[memory] {:<44} {:>9.3} {:>9.2}", "counted", gb(total), total as f64 / v);
-    eprintln!("[memory] {:<44} {:>9.3} {:>9.2}", "anonymous resident (RssAnon)", anon, anon * 1e9 / v);
+    eprintln!("[memory] {:<44} {:>9.3} {:>9.2}", "anonymous resident (RssAnon)", before, before * 1e9 / v);
+    eprintln!("[memory] {:<44} {:>9.3} {:>9.2}", "  after mi_collect", anon, anon * 1e9 / v);
+    eprintln!("[memory] {:<44} {:>9.3} {:>9.2}", "  mimalloc's committed memory", gb(commit), commit as f64 / v);
     eprintln!("[memory] {:<44} {:>9.3} {:>9.2}", "  not counted (kernels, allocator, rest)", anon - gb(total), (anon * 1e9 - total as f64) / v);
 }
