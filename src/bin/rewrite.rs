@@ -15,9 +15,10 @@ use celeste_rust::search::inspect::{brief, cell_names, parse_xy, player_summary,
 use clap::{Parser, Subcommand};
 
 /// mimalloc, not glibc: glibc retains gigabytes of freed slot chunks across
-/// its arenas (plans/lessons.md).
+/// its arenas (plans/lessons.md). Counted (`metrics::Counting`): the `[mem]`
+/// lines' live heap.
 #[global_allocator]
-static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+static GLOBAL: celeste_rust::metrics::Counting<mimalloc::MiMalloc> = celeste_rust::metrics::Counting(mimalloc::MiMalloc);
 
 /// On DISK, not the tmpfs at `/tmp`: a full-room tree is gigabytes.
 const DEFAULT_CHECKPOINT_DIR: &str = "/var/tmp/celeste-checkpoints";
