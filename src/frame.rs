@@ -822,11 +822,9 @@ fn checkpoint(dir: &std::path::Path, frame: u32, wave: &crate::storage::wave::Wa
     mark(1);
     anyhow::ensure!(u16::try_from(frame).is_ok(), "frame {frame}: past a u16 layer");
     let hp = hulls::path(dir, frame);
-    let of = |o: &crate::storage::wave::Old| (o.sk, o.layer, o.hull);
-    let runs: Vec<&[crate::storage::wave::Old]> = wave.grown.iter().map(|x| x.1.as_slice()).collect();
-    let hull_bytes = hulls::write(&hp, frame, &wave.hulls, &runs, of, s.threads())?;
+    let hull_bytes = hulls::write(&hp, frame, &wave.hulls, &wave.grown[..], s.threads())?;
     mark(2);
-    hulls::check(&hp, frame, &wave.hulls, &runs, of, s.threads())?;
+    hulls::check(&hp, frame, &wave.hulls, &wave.grown[..], s.threads())?;
     mark(3);
     (c.frame_bytes, c.hull_bytes) = (frame_bytes, hull_bytes);
     Ok(c)
@@ -1442,12 +1440,12 @@ pub fn restore_visited(dir: &std::path::Path, last: u32, room: (i16, i16), threa
                 anyhow::ensure!(layer < f16, "{}: a grown state of layer {layer} in frame {f}'s hulls", dir.display());
                 let i = was.ok_or_else(|| anyhow::anyhow!("{}: an old state of frame {f}'s frontier without a hull before", dir.display()))?;
                 anyhow::ensure!(i.layer == layer, "{}: an old state's layer {layer} in frame {f}'s hulls, {} before", dir.display(), i.layer);
-                if old.last().is_none_or(|x| x.0 != layer) {
+                if old.last().is_none_or(|x| x.layer != layer) {
                     // Each layer's room exactly (the grown states are by layer).
                     let n = hf.grown.partition_point(|g| g.1 <= layer) - hf.grown.partition_point(|g| g.1 < layer);
-                    old.push((layer, Vec::with_capacity(n)));
+                    old.push(crate::storage::wave::OldLayer::new(layer, n));
                 }
-                old.last_mut().expect("pushed").1.push(crate::storage::wave::Old { sk, layer, hull, was: i.hull });
+                old.last_mut().expect("pushed").push(&crate::storage::wave::Old { sk, layer, hull, was: i.hull });
             }
             frontier = Frontier { new: layer, hulls: hf.hulls.clone(), old };
         }

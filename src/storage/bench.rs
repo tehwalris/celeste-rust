@@ -702,7 +702,7 @@ pub fn print_memory(when: &str, visited: &super::visited::VisitedSet, new: &supe
     let f = new.set.bytes();
     parts.push(("frontier: new states' keys, masks, index", f.iter().sum()));
     parts.push(("frontier: new states' hulls", std::mem::size_of_val(hulls)));
-    parts.push(("frontier: old states (48 B each)", old.iter().map(|x| x.1.capacity() * std::mem::size_of::<super::wave::Old>()).sum::<usize>() + old.capacity() * 32));
+    parts.push(("frontier: old states", old.iter().map(super::wave::OldLayer::bytes).sum::<usize>() + old.capacity() * std::mem::size_of::<super::wave::OldLayer>()));
     parts.push(("out store: block indices", outs.index_bytes()));
     let x = xfers.bytes();
     parts.push(("transfers: pairs", x[0]));

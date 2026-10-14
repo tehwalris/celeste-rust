@@ -514,7 +514,9 @@ plans/keys-only.md the rest: no state ids, no rows held):
   entries - key (ascending) and cell mask, 24 B an entry - and the
   skeletons its shapes' rows decode with. The forward's FRONTIER is a layer
   (the last frame's new states, with their hulls) and its grown states
-  (by layer: their state, layer, hull and the hull they last pushed), and
+  (by layer, `wave::OldLayer`: per entry its region, key and cells, per
+  state its hull and the hull it last pushed - 16 B a state and 32 an
+  entry), and
   the wave builds the next: no row layer exists in memory.
 - **The wave** (`storage::wave::run_wave`), one pipeline a frame: the
   frontier cut into UNITS of whole entries of one shape (a 256th of the

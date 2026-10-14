@@ -52,11 +52,93 @@ pub struct Old {
 
 /// OLD states by layer: per layer (ascending; none without a state) its
 /// states, sorted.
-pub type ByLayer = Vec<(u16, Vec<Old>)>;
+pub type ByLayer = Vec<OldLayer>;
 
 /// The states of `by`.
 pub fn by_layer_states(by: &ByLayer) -> usize {
-    by.iter().map(|x| x.1.len()).sum()
+    by.iter().map(OldLayer::len).sum()
+}
+
+/// The OLD states of one LAYER, sorted by state: per ENTRY (region, key)
+/// its cells and its first state, per state (by entry, then cell) its hull
+/// and the hull it last pushed - 32 B an entry and 16 a state, where an
+/// `Old` was 48 a state (the frontier's ~95M old states at the fixtures'
+/// room's plateau, held through the wave, and the next frontier's at the
+/// frame's end).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct OldLayer {
+    pub layer: u16,
+    entries: Vec<OldEntry>,
+    hulls: Vec<[Hull; 2]>,
+}
+
+/// An entry of an `OldLayer`: its key, cells, region and first state.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct OldEntry {
+    key: Key,
+    cells: u64,
+    region: u32,
+    first: u32,
+}
+
+impl OldLayer {
+    /// An empty layer `layer`, with room for `states`.
+    pub fn new(layer: u16, states: usize) -> Self {
+        OldLayer { layer, entries: Vec::new(), hulls: Vec::with_capacity(states) }
+    }
+
+    /// Append `o` (of this layer, past every state held).
+    pub fn push(&mut self, o: &Old) {
+        debug_assert_eq!(o.layer, self.layer, "an old state of another layer");
+        let bit = 1u64 << o.sk.local;
+        match self.entries.last_mut() {
+            Some(e) if (e.region, e.key) == (o.sk.region, o.sk.key) => {
+                debug_assert!(e.cells < bit, "an old state before the last");
+                e.cells |= bit;
+            }
+            last => {
+                debug_assert!(last.is_none_or(|e| (e.region, e.key) < (o.sk.region, o.sk.key)), "an old state before the last");
+                let first = u32::try_from(self.hulls.len()).expect("a layer past u32 old states");
+                self.entries.push(OldEntry { key: o.sk.key, cells: bit, region: o.sk.region, first });
+            }
+        }
+        self.hulls.push([o.hull, o.was]);
+    }
+
+    /// States held.
+    pub fn len(&self) -> usize {
+        self.hulls.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.hulls.is_empty()
+    }
+
+    /// Bytes held.
+    pub fn bytes(&self) -> usize {
+        self.entries.capacity() * std::mem::size_of::<OldEntry>() + self.hulls.capacity() * std::mem::size_of::<[Hull; 2]>()
+    }
+
+    /// Entry `e`'s states as `Old`s, by cell.
+    fn entry_olds(&self, e: usize) -> impl Iterator<Item = Old> + '_ {
+        let x = self.entries[e];
+        super::layer::bits(x.cells).enumerate().map(move |(k, c)| {
+            let [hull, was] = self.hulls[x.first as usize + k];
+            Old { sk: Sk { region: x.region, key: x.key, local: c as u8 }, layer: self.layer, hull, was }
+        })
+    }
+
+    /// Every state, in order.
+    pub fn iter(&self) -> impl Iterator<Item = Old> + '_ {
+        (0..self.entries.len()).flat_map(move |e| self.entry_olds(e))
+    }
+
+    /// States `r` (by place), in order.
+    pub fn range(&self, r: std::ops::Range<usize>) -> impl Iterator<Item = Old> + '_ {
+        let e = self.entries.partition_point(|x| x.first as usize <= r.start).saturating_sub(1);
+        let skip = r.start - self.entries.get(e).map_or(0, |x| x.first as usize);
+        (e..self.entries.len()).flat_map(move |e| self.entry_olds(e)).skip(skip).take(r.len())
+    }
 }
 
 /// A FRONTIER (module doc): the states whose hull grew at a frame - the
@@ -113,7 +195,7 @@ impl Wave {
     /// the wave's): the new ones in order, then the grown ones.
     pub fn frontier_states(&self, frame: u32) -> impl Iterator<Item = Grown> + '_ {
         let layer = u16::try_from(frame).expect("a frame past u16");
-        self.next.states_iter().zip(&self.hulls).map(move |(s, &h)| (s, layer, h)).chain(self.grown.iter().flat_map(|x| &x.1).map(|o| (o.sk, o.layer, o.hull)))
+        self.next.states_iter().zip(&self.hulls).map(move |(s, &h)| (s, layer, h)).chain(self.grown.iter().flat_map(OldLayer::iter).map(|o| (o.sk, o.layer, o.hull)))
     }
 }
 
@@ -136,7 +218,7 @@ fn unit_lanes(lanes: u64) -> usize {
 /// list, `old` the run's place in it).
 enum UnitSpec {
     Kernel { entries: std::ops::Range<usize>, state: usize, lanes: u32 },
-    Repush { layer: usize, old: std::ops::Range<usize> },
+    Repush { layer: usize, entries: std::ops::Range<usize>, states: usize },
 }
 
 impl UnitSpec {
@@ -144,7 +226,7 @@ impl UnitSpec {
     fn lanes(&self) -> usize {
         match self {
             UnitSpec::Kernel { lanes, .. } => *lanes as usize,
-            UnitSpec::Repush { old, .. } => old.len(),
+            UnitSpec::Repush { states, .. } => *states,
         }
     }
 }
@@ -186,15 +268,17 @@ const REPUSH_UNIT: usize = 1 << 14;
 /// an entry.
 fn repush_units_of(by: &ByLayer) -> Vec<UnitSpec> {
     let mut out = Vec::new();
-    for (layer, (_, old)) in by.iter().enumerate() {
+    for (layer, old) in by.iter().enumerate() {
+        let n = old.entries.len();
+        let first = |e: usize| old.entries.get(e).map_or(old.len(), |x| x.first as usize);
         let mut a = 0usize;
-        while a < old.len() {
-            let mut b = (a + REPUSH_UNIT).min(old.len());
-            // Whole entries: the run's last entry's cells all in.
-            while b < old.len() && (old[b].sk.region, old[b].sk.key) == (old[b - 1].sk.region, old[b - 1].sk.key) {
+        while a < n {
+            // Whole entries, until the unit holds REPUSH_UNIT states.
+            let mut b = a + 1;
+            while b < n && first(b) - first(a) < REPUSH_UNIT {
                 b += 1;
             }
-            out.push(UnitSpec::Repush { layer, old: a..b });
+            out.push(UnitSpec::Repush { layer, entries: a..b, states: first(b) - first(a) });
             a = b;
         }
     }
@@ -359,7 +443,7 @@ pub fn run_wave(engine: &dyn FrameStep, front: Frontier, cx: WaveCtx) -> Result<
     st.entries_in = layer.entries();
     st.lanes_in = layer.states() as usize;
     st.old_in = front.old_states();
-    st.frontier_bytes = layer.alloc_bytes() + std::mem::size_of_val(front.hulls.as_slice()) + front.old_states() * std::mem::size_of::<Old>();
+    st.frontier_bytes = layer.alloc_bytes() + std::mem::size_of_val(front.hulls.as_slice()) + front.old.iter().map(OldLayer::bytes).sum::<usize>();
     st.rss_start = crate::metrics::current_rss_gb();
     let record = edges_dir.is_some();
     // The frame's SPOOL (`storage::spool`): the out blocks and the jobs'
@@ -496,9 +580,9 @@ pub fn run_wave(engine: &dyn FrameStep, front: Frontier, cx: WaveCtx) -> Result<
                                     *out_blocks[u].lock().expect("an out block") = v;
                                     phases::add(phases::OUT_BLOCKS, to);
                                 }
-                                UnitSpec::Repush { layer, old } => {
+                                UnitSpec::Repush { layer, entries, .. } => {
                                     let tr = phases::start(s.diag.phases);
-                                    let n = run_repush(u as u32, &old_by[*layer].1[old.clone()], outs.expect("checked above"), sink, &mut rs)?;
+                                    let n = run_repush(u as u32, &old_by[*layer], entries.clone(), outs.expect("checked above"), sink, &mut rs)?;
                                     repushed.fetch_add(n, Ordering::Relaxed);
                                     phases::add(phases::REPUSH, tr);
                                 }
@@ -929,7 +1013,7 @@ pub fn run_wave(engine: &dyn FrameStep, front: Frontier, cx: WaveCtx) -> Result<
     }
     // A group of routes at a time (in region order, about a 32nd of the
     // grown states), its layers' slices appended in parallel, then freed.
-    let by: Vec<std::sync::Mutex<Vec<Old>>> = count.iter().map(|&n| std::sync::Mutex::new(Vec::with_capacity(n))).collect();
+    let by: Vec<std::sync::Mutex<OldLayer>> = count.iter().enumerate().map(|(l, &n)| std::sync::Mutex::new(OldLayer::new(l as u16, n))).collect();
     let layers: Vec<usize> = (0..count.len()).filter(|&l| count[l] > 0).collect();
     let group_states = count.iter().sum::<usize>() / 32 + 1;
     let mut runs = runs;
@@ -944,11 +1028,13 @@ pub fn run_wave(engine: &dyn FrameStep, front: Frontier, cx: WaveCtx) -> Result<
             let mut v = by[l].lock().expect("a layer's grown states");
             for r in &group {
                 let (a, b) = (r.partition_point(|o| (o.layer as usize) < l), r.partition_point(|o| (o.layer as usize) <= l));
-                v.extend_from_slice(&r[a..b]);
+                for o in &r[a..b] {
+                    v.push(o);
+                }
             }
         });
     }
-    let grown: ByLayer = by.into_iter().enumerate().map(|(l, v)| (l as u16, v.into_inner().expect("a layer's grown states"))).filter(|x| !x.1.is_empty()).collect();
+    let grown: ByLayer = by.into_iter().map(|v| v.into_inner().expect("a layer's grown states")).filter(|x| !x.is_empty()).collect();
     let mut shapes_in: Vec<u32> = next.set.tables().iter().map(|(r, _)| r / GEOMETRY.slots).collect();
     shapes_in.dedup();
     for si in shapes_in {
@@ -1137,18 +1223,18 @@ struct RepushScratch {
 /// frame, as at an emission; the pushes into the sink's chunks by route.
 /// Returns the edges looked at.
 #[inline(never)]
-fn run_repush(u: u32, old: &[Old], outs: &super::out::OutStore, sink: &mut UnitSink, sc: &mut RepushScratch) -> Result<u64> {
+fn run_repush(u: u32, layer: &OldLayer, entries: std::ops::Range<usize>, outs: &super::out::OutStore, sink: &mut UnitSink, sc: &mut RepushScratch) -> Result<u64> {
     use super::bundle::{source_cell, source_cells, TO_NONE};
     use std::cell::Cell;
     let geo = GEOMETRY;
     let none_slot = geo.no_cell_slot();
     sink.begin(u);
     sc.accs.clear();
-    let Some(first) = old.first() else { return Ok(0) };
-    let f = first.layer as u32 + 1;
+    let old = &layer.entries[entries];
+    let (Some(first), Some(last)) = (old.first(), old.last()) else { return Ok(0) };
+    let f = layer.layer as u32 + 1;
     let file = outs.file(f).ok_or_else(|| anyhow!("re-push unit {u}: no out-edges of frame {f}"))?;
-    let last = old.last().expect("a unit's states");
-    let (lo, hi) = ((first.sk.region, first.sk.key), (last.sk.region, last.sk.key));
+    let (lo, hi) = ((first.region, first.key), (last.region, last.key));
     let dec = sc.dec.get_or_insert_with(|| zstd::bulk::Decompressor::new().expect("a zstd decompressor"));
     let mut edges = 0u64;
     let cursor = Cell::new(0usize);
@@ -1160,8 +1246,8 @@ fn run_repush(u: u32, old: &[Old], outs: &super::out::OutStore, sink: &mut UnitS
     for bi in file.blocks(lo, hi) {
         // A block none of the unit's states is in is not read.
         let (bf, bl) = file.range(bi);
-        let k = old.partition_point(|o| (o.sk.region, o.sk.key) < bf);
-        if old.get(k).is_none_or(|o| (o.sk.region, o.sk.key) > bl) {
+        let k = old.partition_point(|o| (o.region, o.key) < bf);
+        if old.get(k).is_none_or(|o| (o.region, o.key) > bl) {
             continue;
         }
         file.block(bi, dec, &mut sc.raw)?;
@@ -1181,13 +1267,12 @@ fn run_repush(u: u32, old: &[Old], outs: &super::out::OutStore, sink: &mut UnitS
         blk.entries(
             |region, key| {
                 let mut c = cursor.get();
-                while c < old.len() && (old[c].sk.region, old[c].sk.key) < (region, key) {
+                while c < old.len() && (old[c].region, old[c].key) < (region, key) {
                     c += 1;
                 }
                 cursor.set(c);
-                if c < old.len() && (old[c].sk.region, old[c].sk.key) == (region, key) {
-                    let cells = old[c..].iter().take_while(|o| (o.sk.region, o.sk.key) == (region, key)).fold(0u64, |m, o| m | 1u64 << o.sk.local);
-                    entry.set((c, cells));
+                if c < old.len() && (old[c].region, old[c].key) == (region, key) {
+                    entry.set((old[c].first as usize, old[c].cells));
                     wanted.set(wanted.get() + 1);
                     true
                 } else {
@@ -1242,10 +1327,10 @@ fn run_repush(u: u32, old: &[Old], outs: &super::out::OutStore, sink: &mut UnitS
                     edges += n as u64;
                     for &(s, c) in &pairs_of[..n] {
                         // Old states of an entry are by cell: a cell's rank among them.
-                        let o = &old[a + (cells & ((1u64 << s) - 1)).count_ones() as usize];
-                        let Some(acc) = cache.get(&o.hull, &o.was, ob.x, || {
+                        let [hull, was] = &layer.hulls[a + (cells & ((1u64 << s) - 1)).count_ones() as usize];
+                        let Some(acc) = cache.get(hull, was, ob.x, || {
                             let mut a = HullAcc::EMPTY;
-                            o.hull.push_grown(&o.was, tx, ty, &mut a).then_some(a)
+                            hull.push_grown(was, tx, ty, &mut a).then_some(a)
                         }) else {
                             continue;
                         };
@@ -1650,4 +1735,54 @@ pub fn one_frame(engine: &dyn FrameStep, rows: Vec<Block>, frame: u32) -> Result
     let wave = run_wave(engine, start, cx)?;
     let next = super::layer::decode_states(&wave.next, &visited.keys, visited.shapes(), usize::MAX, &|_| true)?.into_iter().map(|(_, rt2)| Block::from_rt2(rt2)).collect();
     Ok(OneFrame { next, keys: visited.keys })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// An `OldLayer` gives back the old states pushed into it, whole and by
+    /// any range of places, and its re-push units are whole entries of at
+    /// least `REPUSH_UNIT` states (the last one aside), as cut over a list
+    /// of the states.
+    #[test]
+    fn an_old_layer_gives_back_its_states() {
+        let mut v = 7u64;
+        let mut next = move || {
+            v = v.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            v >> 11
+        };
+        let hull = |x: u64| Hull::from_bytes(&(x & 0x7fff_7fff_7fff_7fff).to_le_bytes());
+        let mut olds: Vec<Old> = (0..60_000)
+            .map(|_| {
+                let (r, k, c) = (next() % 5, next() % 9000, next() % 64);
+                Old { sk: Sk { region: r as u32, key: (0, k), local: c as u8 }, layer: 9, hull: hull(next()), was: hull(next()) }
+            })
+            .collect();
+        olds.sort_unstable_by_key(|o| o.sk);
+        olds.dedup_by_key(|o| o.sk);
+        let mut l = OldLayer::new(9, olds.len());
+        for o in &olds {
+            l.push(o);
+        }
+        assert_eq!(l.len(), olds.len());
+        assert!(l.entries.len() < olds.len(), "entries of several states");
+        assert_eq!(l.iter().collect::<Vec<_>>(), olds);
+        for r in [0..0, 0..1, 3..4, 100..2000, 17..olds.len(), olds.len() - 1..olds.len()] {
+            assert_eq!(l.range(r.clone()).collect::<Vec<_>>(), olds[r.clone()], "range {r:?}");
+        }
+        // The units: REPUSH_UNIT states, then the last one's entry whole.
+        let units = repush_units_of(&vec![l.clone()]);
+        let mut a = 0usize;
+        for u in &units {
+            let UnitSpec::Repush { layer: 0, states, .. } = u else { panic!("a re-push unit") };
+            let mut b = (a + REPUSH_UNIT).min(olds.len());
+            while b < olds.len() && (olds[b].sk.region, olds[b].sk.key) == (olds[b - 1].sk.region, olds[b - 1].sk.key) {
+                b += 1;
+            }
+            assert_eq!(*states, b - a);
+            a = b;
+        }
+        assert_eq!(a, olds.len());
+    }
 }
