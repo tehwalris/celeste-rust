@@ -279,6 +279,12 @@ def run(job, outdir, binary):
         res["uct_db"] = f"{'finished' if ok_db else 'NOT finished'} {n_db} inputs"
         cuts = [c for c in [prologue] + ([lead] if lead < prologue else []) + [prologue - 1] if not any(ours[:c])]
         tries = [(seeds, c) for c in cuts] + [(sd, c) for sd in love.nudged_seeds(seeds, rooms.seed_slots(rooms.parse(room), binary)) for c in cuts]
+        # Each candidate once: a room without balloons nudges nothing (room
+        # (0,3) gemskip100 checked its two cuts 22 times, 2026-10-14).
+        tries = [t for i, t in enumerate(tries) if t not in tries[:i]]
+        # Every candidate's row; without a VALID one the record shows the
+        # first (the file's seeds at the reference's cut), not the last tried.
+        tried = []
         for sd, cut in tries:
             if sd != seeds and replay_exit(room, ours, sd, cat, jank)[0] != opt:
                 continue
@@ -287,11 +293,12 @@ def run(job, outdir, binary):
             # A replay that fails (PICO-8 printed nothing; a chain.py
             # SystemExit) is this candidate's result, not the runner's end.
             try:
-                res["real_play"] = check_uploads.check(mine, False, cat, binary)
+                row = check_uploads.check(mine, False, cat, binary)
             except (Exception, SystemExit) as ex:
-                res["real_play"] = f"check failed: {type(ex).__name__}: {ex}"[:300]
-            res["upload_cut"] = cut
-            if res["real_play"].endswith("\tVALID"):
+                row = f"check failed: {type(ex).__name__}: {ex}"[:300]
+            tried.append((cut, sd, row))
+            if row.endswith("\tVALID"):
+                res["real_play"], res["upload_cut"] = row, cut
                 if sd != seeds:
                     res["upload_seeds"] = ",".join(sd)
                 up = os.path.join(outdir, "upload", cat)
@@ -301,6 +308,9 @@ def run(job, outdir, binary):
                 ok, st, n = love.uct(level, mine, cat)
                 res["uct_ours"] = f"{'finished' if ok else st} {n} inputs (information only)"
                 break
+        if tried and not res.get("upload"):
+            res["real_play"], res["real_play_cut"] = tried[0][2], tried[0][0]
+            res["real_play_tried"] = f"{len(tried)} candidates (cuts {sorted({t[0] for t in tried})}, {len({tuple(t[1]) for t in tried})} seed lists), none VALID"
     res["status"] = "no reference" if ref is None else "IMPROVED" if opt < ref else ("tie" if opt == ref else "WORSE?")
     res["verified"] = (e == opt) and not res.get("diagonal_dashes") and res.get("berry", True) and bool(res.get("upload"))
     # 5. the UI
@@ -319,13 +329,45 @@ def run(job, outdir, binary):
             runs["runs"] = [r for r in runs["runs"] if r["id"] != rid]
             tasn = entry["file"].replace(".tas", "")
             label = categories.LABEL.get(cat, cat)
-            runs["runs"].append({"id": rid, "label": f"Room ({room}) · {label}: exit at frame {opt} against {tasn}'s {ref} (community TAS drawn as the reference path)", "category": label, "pick": f"ours {opt} vs TAS {ref}"})
+            runs["runs"].append({"id": rid, "label": ui_label(room, label, opt, tasn, ref, res), "category": label, "pick": f"ours {opt} vs TAS {ref}" + ("" if res["verified"] else " (not validated)")})
             json.dump(runs, open(f"{UI}/runs.json", "w"), indent=1)
             res["ui"] = rid
         except Exception as ex:  # the result stands; the UI can be redone
             res["ui_error"] = str(ex)[:200]
     drop_tree()
     return res
+
+
+def ui_label(room, label, opt, tasn, ref, res):
+    r"""The web UI's label of a run that beats the reference: an unverified
+    one (`res["verified"]` false) says so and why, never only "exit at ...
+    against ..." (room (0,3) gemskip100's 141 was listed so, 2026-10-14,
+    with UCT and Celia dying at frame 80).
+
+    >>> ui_label("0,3", "gemskip100", 141, "TAS25", 142, {"verified": True})
+    "Room (0,3) · gemskip100: exit at frame 141 against TAS25's 142 (community TAS drawn as the reference path)"
+    >>> ui_label("0,3", "gemskip100", 141, "TAS25", 142, {"verified": False, "ours_original_cart_exit": 141, "real_play": "gemskip100 TAS25 room 0,3\tours 116 db 117\tIL exit 116f berry true\tUCT DID NOT FINISH (died at keypress frame 81) 116\tCelia DID NOT FINISH (DIED at frame 80) 0\tchain exit 116f berry true\tboot exit 116f berry true\tINVALID"})
+    "Room (0,3) · gemskip100: exit at frame 141 against TAS25's 142 - NOT VALIDATED: real play INVALID (ours 116 db 117; UCT DID NOT FINISH (died at keypress frame 81) 116; Celia DID NOT FINISH (DIED at frame 80) 0; boot exit 116f berry true) (community TAS drawn as the reference path)"
+    """
+    head = f"Room ({room}) · {label}: exit at frame {opt} against {tasn}'s {ref}"
+    tail = " (community TAS drawn as the reference path)"
+    if res.get("verified"):
+        return head + tail
+    why = []
+    if res.get("ours_original_cart_exit") != opt:
+        why.append(f"the original cart exits at {res.get('ours_original_cart_exit')}")
+    if res.get("diagonal_dashes"):
+        why.append(f"diagonal dashes at {res['diagonal_dashes']}")
+    if res.get("berry") is False:
+        why.append("no berry")
+    row = res.get("real_play")
+    if row:
+        cols = row.split("\t")
+        keep = [c for c in cols[1:-1] if c.startswith(("ours", "UCT", "Celia", "boot"))]
+        why.append(f"real play {cols[-1]} ({'; '.join(keep)})")
+    else:
+        why.append("no real-play check")
+    return f"{head} - NOT VALIDATED: {'; '.join(why)}{tail}"
 
 
 def expand(job, cache, binary):
