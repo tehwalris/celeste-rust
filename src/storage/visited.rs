@@ -442,8 +442,11 @@ impl VisitedSet {
                 for i in run {
                     states += 1;
                     layers[i.layer as usize] += 1;
-                    if by.len() < cap || by.contains_key(&i.hull.word()) {
-                        *by.entry(i.hull.word()).or_default() += 1;
+                    // Mixed: FxHash leaves a word's high half out of the low
+                    // bits a table indexes by (the y arc).
+                    let w = celeste_engine::runtime2::mix64(i.hull.word());
+                    if by.len() < cap || by.contains_key(&w) {
+                        *by.entry(w).or_default() += 1;
                     } else {
                         over = true;
                     }
