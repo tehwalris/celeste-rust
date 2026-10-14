@@ -936,6 +936,39 @@ decodes to) every such start was refused at frame 0 (`ROWS FROM KEYS`,
 gemskip 100% 2500m), and storing the view instead makes the start shape's
 kernel decline the lane (its pin is the start's `spr`).
 
+**The no-player phase's bounds cover every respawn** (`trace::kernel`:
+`no_player_ranges`, `explore_respawn`, `NoPlayer`; 2026-10-14). Before the
+player exists no input matters, so the walk traces the spawn phase under the
+HULLS its concrete states take, per shape (a bound is a premise every lane
+is checked against: outside, the kernel declines). The start's chain gives
+them. A death reloads the room and updates every object once: under the
+loading jank a state the start's chain never takes (room (0,3) J 1: the
+spawn at y 124 in the shape whose chain ends the hull at 120 - the 2500m
+run's KERNEL COVERAGE GAP at f45). So the walk EXPLORES every respawn entry
+it reaches (a spawn-phase outcome of a node outside the phase) into the same
+hulls: every outcome of every frame up to the player, a state being its
+shape and its constants (the trace pins exactly those), explored once. The
+entry's unknowns are the walk's (the dead phase's `freeze` and
+`delay_restart`, the level's widened fields) and stay unknown inputs. NO
+MERGE SELECTS ON THE STATE'S OWN UNKNOWN INPUTS (`verify::trace_frame`'s
+`merge_refused_on`; `Domain::reads_merge_refused`, beside the refusal on a
+condition reading an unknown atom in `state::merge` and
+`Interp::joins_independent`): `_update`'s `if freeze>0 then ... return end`
+would merge the frozen branch into `y = Sel(freeze > 0, 124, 120)`, after
+which nothing about the spawn is a constant; refused, the frozen branch
+repeats its parent and the other is the chain's next state (room (0,3): 25
+states and 50 outcomes a respawn). The level's widened fields still merge:
+refusing every merge doubled the paths at every `if` and ran out of memory
+at 20 GB. A field bounds its shape where it varies over the explored
+states and each holds it a constant; one some state holds unknown bounds
+nothing (room (5,2): `max_djump` 1 or 2 after the orb, unknown from a dead
+phase) - FATAL for a field of the spawn. Also FATAL: a phase still without
+the player after 240 frames (the start's chain too); a respawn state that
+does not trace. A shape no explored state has is bounded by the spawn
+object's hull, by type. Tried and dropped: closing the
+bounds over the walk's own symbolic outcomes widens without end, at IL
+starts too (the spawn's `y` [98, 120] -> [-7223, 7445] in seven rounds).
+
 ## Gates
 
 Every change to the loop, the kernels or the tracer must reproduce the

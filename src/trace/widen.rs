@@ -764,7 +764,7 @@ mod tests {
             let roots = slots_where(&st, Level::EXACT, dead);
             with_key += roots.iter().any(|p| p.last() == Some(&iface::key("spr"))) as usize;
             with_player += !objects_of_type(&st, "player").is_empty() as usize;
-            let f = trace_frame(&mut it, &reset, &frame, st.clone(), &roots, &[], &[], false, &[]).expect("trace");
+            let f = trace_frame(&mut it, &reset, &frame, st.clone(), &roots, &[], &[], false, &[], &[]).expect("trace");
             // Everything a successor depends on, its booleans decided as far as a
             // BDD over independent atoms can (a guard re-merged after a branch on
             // `frames` is `c or not c`, true).

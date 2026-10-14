@@ -170,6 +170,10 @@ pub fn trace_frame<'a>(
     // them through `Op::Restrict`, specialized on the range; outside it is
     // the restriction's own error (`trace::error`), like a pin.
     bounds: &[(Path, (i32, i32))],
+    // Input slots NO MERGE SELECTS ON: a condition that reads one makes two
+    // successors, each with its own values (`Domain::reads_merge_refused`;
+    // a respawn's exploration, `kernel::explore_respawn`).
+    merge_refused_on: &[Path],
 ) -> Result<Frame> {
     it.trace_start_nodes = it.d.node_count();
     let mut st = st;
@@ -186,6 +190,11 @@ pub fn trace_frame<'a>(
     it.d.fork_origins.clear();
     it.d.evaluated.clear();
     let iface = iface::symbolize(&mut it.d, &mut st, roots, pin, ival)?;
+    let refused = merge_refused_on
+        .iter()
+        .map(|p| iface.slots.iter().position(|q| q == p).map(|i| i as u32).ok_or_else(|| anyhow!("merge-refused {} is not an input slot", iface::show(p))))
+        .collect::<Result<Vec<u32>>>()?;
+    it.d.set_merge_refused(refused);
     // The lattice's pins (`symbolize` made their slots read the constants;
     // the raw cells feed only these checks).
     for (i, c) in &iface.pins {
@@ -1661,7 +1670,7 @@ mod tests {
         }
         let key = pm1_key(&player, &st, &it.d).expect("pm1 key");
         assert_eq!(key.len(), 6, "the pm1 key is six cells");
-        let f = trace_frame(&mut it, &reset, &frame, st, &roots, &key, &[], false, &[]).expect("trace");
+        let f = trace_frame(&mut it, &reset, &frame, st, &roots, &key, &[], false, &[], &[]).expect("trace");
         assert_eq!(f.iface.pins.len(), 6, "all six pinned");
 
         // No error in whichever outcome claims this assignment.
@@ -1892,7 +1901,7 @@ end
         }
 
         let before = it.d.graph.len();
-        let f = trace_frame(&mut it, &reset, &frame, st.clone(), &roots, &[], &[], false, &[])
+        let f = trace_frame(&mut it, &reset, &frame, st.clone(), &roots, &[], &[], false, &[], &[])
             .unwrap_or_else(|e| panic!("[verify] symbolic frame stopped at: {e:#}"));
         eprintln!(
             "[verify] {} input cells, {} outcome(s), {} nodes ({} new)",

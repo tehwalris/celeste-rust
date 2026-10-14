@@ -307,9 +307,11 @@ fn merge_inner<D: Domain>(
     }
 
     // A condition that reads an unknown atom cannot be selected on (its lanes
-    // would decline the `Known` premise): two successors, refused at the
-    // first select. A rejoin (`merge_on`) reports it instead.
-    let refuse_selects = !rejoin && d.reads_unknown_atom(cond);
+    // would decline the `Known` premise), nor one that reads an input the
+    // trace refuses merges on (`Domain::reads_merge_refused`): two
+    // successors, refused at the first select. A rejoin (`merge_on`)
+    // reports it instead.
+    let refuse_selects = !rejoin && (d.reads_unknown_atom(cond) || d.reads_merge_refused(cond));
     let mut joined = Joined { writes: Vec::new(), selects: false, first_select: None };
     for (rt, rf) in t_order.iter().zip(f_order.iter()) {
         match (rt, rf) {
