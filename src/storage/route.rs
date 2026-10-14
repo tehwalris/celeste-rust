@@ -626,6 +626,8 @@ pub struct Sealed {
     pub table: RegionTable,
     pub hulls: Vec<Hull>,
     pub grown: Vec<super::wave::Old>,
+    /// Per grown state its entry in the visited set's region table.
+    pub grown_at: Vec<u32>,
 }
 
 /// The frame's new transfers' canonical ids (`edges::XferTable::
@@ -662,7 +664,8 @@ pub fn seal(st: &mut RouteState, region: u32, finals: &FxHashMap<Key, Key>, renu
     let final_key = |k: Key| if is_provisional(k) { finals.get(&k).copied().ok_or_else(|| anyhow::anyhow!("a provisional key without its final key")) } else { Ok(k) };
     let (touched, accs) = std::mem::take(&mut st.touched).into_sorted(final_key)?;
     let (mut keys, mut masks, mut hulls): (Vec<Key>, Vec<u64>, Vec<Hull>) = (Vec::new(), Vec::new(), Vec::new());
-    let mut grown: Vec<super::wave::Old> = Vec::new();
+    let (mut grown, mut grown_at): (Vec<super::wave::Old>, Vec<u32>) = (Vec::new(), Vec::new());
+    let infos = visited.region_infos(region);
     for TouchedKey { key, cells, start, entry: ve, held } in touched {
         let fresh = cells & !held;
         if fresh != 0 {
@@ -676,12 +679,13 @@ pub fn seal(st: &mut RouteState, region: u32, finals: &FxHashMap<Key, Key>, renu
                 continue;
             }
             // No hull stored: it is FULL, and grows no more.
-            let Some(StateInfo { hull, layer }) = visited.info(region, ve, c) else { continue };
+            let Some(StateInfo { hull, layer }) = infos.and_then(|m| m.get(ve, c)) else { continue };
             let mut a = acc;
             a.add_hull(&hull);
             let h = a.hull().expect("a hull holds points");
             if h != hull {
                 grown.push(super::wave::Old { sk: Sk { region, key, local: c as u8 }, layer, hull: h, was: hull });
+                grown_at.push(ve);
             }
         }
     }
@@ -713,5 +717,5 @@ pub fn seal(st: &mut RouteState, region: u32, finals: &FxHashMap<Key, Key>, renu
     // The file's order: the jobs' segments by slice, then the ones that
     // waited by slice (one job a (route, slice): the keys are distinct).
     st.segs.sort_unstable_by_key(|s| s.0);
-    Ok(Sealed { region, table, hulls, grown })
+    Ok(Sealed { region, table, hulls, grown, grown_at })
 }

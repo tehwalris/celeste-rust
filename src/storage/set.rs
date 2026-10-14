@@ -370,14 +370,26 @@ impl RegionTable {
     /// `at(i, e)` with each of `other`'s entries' place `e` here.
     pub fn merge(&mut self, other: &RegionTable, mut at: impl FnMut(usize, u32)) {
         debug_assert!(!self.is_frozen());
-        let add = other.iter().filter(|(k, _)| self.find(*k).is_none()).count();
+        // Each entry's place here, if any: ONE probe an entry (entries keep
+        // their places through a repack and a reindex), then the index
+        // sized for the rest, which are appended without another probe.
+        let found: Vec<u32> = other.iter().map(|(k, _)| self.find(k).unwrap_or(u32::MAX)).collect();
+        let add = found.iter().filter(|&&e| e == u32::MAX).count();
         let widest = (0..other.len()).map(|e| bytes_of(other.wkey(e))).max().unwrap_or(1);
         if widest > self.kw {
             self.repack(widest);
         }
         self.reserve(add);
-        for (i, (k, m)) in other.iter().enumerate() {
-            at(i, self.insert_or(k, m).0);
+        for (i, ((k, m), &e)) in other.iter().zip(&found).enumerate() {
+            at(
+                i,
+                if e == u32::MAX {
+                    self.push(k, m)
+                } else {
+                    self.or_cells(e, m);
+                    e
+                },
+            );
         }
     }
 

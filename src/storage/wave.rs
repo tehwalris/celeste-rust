@@ -657,17 +657,20 @@ pub fn run_wave(engine: &dyn FrameStep, front: &Frontier, cx: WaveCtx) -> Result
     let sealed: Vec<Result<Option<Sealed>>> = {
         let next = AtomicUsize::new(0);
         let cells: Vec<std::sync::Mutex<&mut RouteState>> = states.iter_mut().map(std::sync::Mutex::new).collect();
+        // The biggest routes first: the last one started bounds the wall.
+        let mut order: Vec<usize> = (0..cells.len()).collect();
+        order.sort_by_cached_key(|&k| std::cmp::Reverse(cells[k].lock().expect("a route").touched.len()));
         let visited: &VisitedSet = visited;
         std::thread::scope(|scope| {
             let hs: Vec<_> = scratch
                 .iter_mut()
                 .map(|sc| {
-                    let (next, cells, regions, finals, renumber) = (&next, &cells, &regions, &finals, renumber.as_ref());
+                    let (next, cells, order, regions, finals, renumber) = (&next, &cells, &order, &regions, &finals, renumber.as_ref());
                     scope.spawn(move || {
                         let mut out = Vec::new();
                         loop {
-                            let k = next.fetch_add(1, Ordering::Relaxed);
-                            let Some(c) = cells.get(k) else { return out };
+                            let Some(&k) = order.get(next.fetch_add(1, Ordering::Relaxed)) else { return out };
+                            let c = &cells[k];
                             let mut st = c.lock().expect("a route");
                             let r = match regions[k] {
                                 Some(region) => super::route::seal(&mut st, region, finals, renumber, visited, sc).map(Some),
@@ -706,7 +709,7 @@ pub fn run_wave(engine: &dyn FrameStep, front: &Frontier, cx: WaveCtx) -> Result
     // Into the visited set: the new states (new: none held) with their
     // layer and hull, the grown states' hulls.
     let layer16 = u16::try_from(frame).map_err(|_| anyhow!("frame {frame}: past a u16 layer"))?;
-    let parts: Vec<(u32, &super::set::RegionTable, &[Hull], &[Old])> = new.iter().map(|sl| (sl.region, &sl.table, sl.hulls.as_slice(), sl.grown.as_slice())).collect();
+    let parts: Vec<(u32, &super::set::RegionTable, &[Hull], &[Old], &[u32])> = new.iter().map(|sl| (sl.region, &sl.table, sl.hulls.as_slice(), sl.grown.as_slice(), sl.grown_at.as_slice())).collect();
     let held = visited.absorb(&parts, layer16, s.threads())?;
     drop(parts);
     ensure!(held == 0, "frame {frame}: {held} of the next layer's states the visited set held already");
@@ -870,6 +873,11 @@ fn mark_filter(sealed: &mut [super::route::Sealed], f: &crate::frame::MarkFilter
         sl.hulls = hulls;
         let mut k = n_new;
         sl.grown.retain(|_| {
+            k += 1;
+            ok[k - 1]
+        });
+        let mut k = n_new;
+        sl.grown_at.retain(|_| {
             k += 1;
             ok[k - 1]
         });
@@ -1430,11 +1438,11 @@ pub fn seed(visited: &mut VisitedSet, blocks: &[Block], level: crate::abstractio
         i = j;
     }
     let hulls = vec![start; next.states() as usize];
-    let mut parts: Vec<(u32, &super::set::RegionTable, &[Hull], &[Old])> = Vec::new();
+    let mut parts: Vec<(u32, &super::set::RegionTable, &[Hull], &[Old], &[u32])> = Vec::new();
     let mut at = 0usize;
     for (region, t) in next.set.tables() {
         let n = t.states() as usize;
-        parts.push((*region, t, &hulls[at..at + n], &[]));
+        parts.push((*region, t, &hulls[at..at + n], &[], &[]));
         at += n;
     }
     let held = visited.absorb(&parts, 0, s.threads())?;
