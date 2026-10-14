@@ -103,7 +103,9 @@ impl VisitedSet {
     /// between their first keys; every run on `threads` threads, the
     /// biggest first.
     pub fn upsert_all(&mut self, changes: Vec<(u32, Vec<Change>)>, threads: usize) -> Result<Upserted> {
-        type Run = (usize, std::ops::Range<usize>, Vec<Block>);
+        // A run: its region's index in `changes`, its place among the
+        // region's runs, its changes, its blocks.
+        type Run = (usize, usize, std::ops::Range<usize>, Vec<Block>);
         let mut runs: Vec<Run> = Vec::new();
         let mut regions: Vec<u32> = Vec::with_capacity(changes.len());
         for (i, (region, ch)) in changes.iter().enumerate() {
@@ -123,7 +125,7 @@ impl VisitedSet {
                 g
             };
             if groups.is_empty() {
-                runs.push((i, 0..ch.len(), Vec::new()));
+                runs.push((i, 0, 0..ch.len(), Vec::new()));
                 continue;
             }
             let starts: Vec<usize> = std::iter::once(0)
@@ -131,23 +133,22 @@ impl VisitedSet {
                 .chain(std::iter::once(ch.len()))
                 .collect();
             for (k, g) in groups.into_iter().enumerate() {
-                runs.push((i, starts[k]..starts[k + 1], g));
+                runs.push((i, k, starts[k]..starts[k + 1], g));
             }
         }
-        runs.sort_by_cached_key(|r| std::cmp::Reverse(r.1.len() + r.2.len() * super::set::PACK_ENTRIES));
+        runs.sort_by_cached_key(|r| std::cmp::Reverse(r.2.len() + r.3.len() * super::set::PACK_ENTRIES));
         let work: Vec<std::sync::Mutex<Option<Run>>> = runs.into_iter().map(|r| std::sync::Mutex::new(Some(r))).collect();
         let done = super::wave::par_map(&work, threads, |w| -> Result<(usize, usize, Vec<Block>, Upserted)> {
-            let (i, rg, blocks) = w.lock().expect("a run").take().expect("a run taken once");
-            let start = rg.start;
+            let (i, k, rg, blocks) = w.lock().expect("a run").take().expect("a run taken once");
             let (out, n) = super::set::upsert_blocks(blocks, &changes[i].1[rg])?;
-            Ok((i, start, out, n))
+            Ok((i, k, out, n))
         });
         // Each region's runs back in order.
         let mut parts: Vec<Vec<(usize, Vec<Block>)>> = (0..changes.len()).map(|_| Vec::new()).collect();
         let mut total = Upserted::default();
         for d in done {
-            let (i, start, out, n) = d?;
-            parts[i].push((start, out));
+            let (i, k, out, n) = d?;
+            parts[i].push((k, out));
             total += n;
         }
         for (region, mut p) in regions.into_iter().zip(parts) {
@@ -267,5 +268,47 @@ impl VisitedSet {
     pub fn census(&self) -> Vec<(&'static str, usize)> {
         let s = self.set.bytes();
         vec![("visited: packed blocks (keys, cells, layers, hulls)", s[0]), ("visited: block and region lists", s[1] + s[2]), ("key space", self.keys.alloc_bytes())]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::search::hull::Hull;
+
+    /// A region big enough for several runs of blocks, upserted twice with
+    /// changes in some runs only: every state found again with its info,
+    /// the blocks in key order (`RegionTable::of_blocks` checks it).
+    #[test]
+    fn a_big_region_upserts_run_by_run() {
+        let mut v = VisitedSet::new(super::super::GEOMETRY);
+        v.add_shape(7);
+        let region = 3;
+        let info = |x: u64| Some(StateInfo { hull: Hull::from_bytes(&(x & 0x7fff_7fff_7fff_7fff).to_le_bytes()), layer: (x % 100) as u16 });
+        // 300 blocks' worth of entries, one cell each.
+        let n = 300 * crate::storage::set::PACK_ENTRIES as u64;
+        let first: Vec<Change> = (0..n).map(|k| Change { key: (0, k * 2), cell: (k % 64) as u8, info: info(k), new: true }).collect();
+        assert_eq!(v.upsert_all(vec![(region, first)], 8).unwrap(), Upserted { added: n, held_new: 0 });
+        assert!(v.table(region).unwrap().blocks().len() > 2 * RUN_BLOCKS);
+        // Changes in the first and the last run only: an update, a new
+        // cell, a new key between two held ones, a key past the end.
+        let mut second = vec![
+            Change { key: (0, 2), cell: 1, info: info(999), new: false },
+            Change { key: (0, 3), cell: 5, info: None, new: true },
+            Change { key: (0, 2 * (n - 1)), cell: 62, info: info(5), new: true },
+            Change { key: (0, 2 * n + 10), cell: 0, info: info(6), new: true },
+        ];
+        second.sort_by_key(|c| (c.key, c.cell));
+        let got = v.upsert_all(vec![(region, second)], 8).unwrap();
+        assert_eq!(got, Upserted { added: 3, held_new: 0 }, "(0, 2) cell 1 held: an update");
+        assert_eq!(v.len() as u64, n + 3);
+        assert_eq!(v.state(region, (0, 2 * (n - 1)), 62), info(5));
+        assert_eq!(v.state(region, (0, 2), 1), info(999));
+        assert_eq!(v.state(region, (0, 3), 5), None, "a full hull: no info");
+        assert_eq!(v.table(region).unwrap().mask_of((0, 3)), 1 << 5);
+        assert_eq!(v.state(region, (0, 2 * n + 10), 0), info(6));
+        for k in (0..n).step_by(4999) {
+            assert_eq!(v.state(region, (0, k * 2), (k % 64) as u32), info(k));
+        }
     }
 }
