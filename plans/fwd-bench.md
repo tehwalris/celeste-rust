@@ -54,6 +54,15 @@ Min and max over the reps, with the load average at each rep's start:
 - the bytes written (edge, out, frame, hull files) and the anonymous RSS
   at the wave's start, after it, at the end, and the peak; `--phases`'
   `[mem]` and `[wavemem]` lines in the log break the memory down by phase.
+  A `[mem]` line gives the anonymous resident set and the LIVE HEAP
+  (`metrics::Counting`, the bytes the allocations hold), each now and at
+  its sampled peak since the line before: the difference is what the
+  allocator keeps besides (freed pages not returned). `[wavemem]` gives
+  the wave's structures at its end: the frontier, the visited set, the
+  transfers, the touched states, the out blocks and segments still in
+  memory and those spooled, the chunks in flight, the sinks (their
+  transfer tables: the pairs new this frame they met), the region
+  scratch.
 
 ## How to run it
 
