@@ -172,9 +172,9 @@ impl Segment {
         Ok(Segment { region, bytes: bundle::compress(raw, z)?, raw: raw.len() as u32, bundles, edges })
     }
 
-    /// `bundles` (distinct) as a segment of `region`.
-    pub fn encode(region: u32, bundles: &mut [Bundle], raw: &mut Vec<u8>, z: &mut zstd::bulk::Compressor<'static>) -> Result<Segment> {
-        bundle::encode(bundles, &bundle::ORDER, raw);
+    /// `bundles` (distinct) as a segment of `region` (`enc`: a scratch encoder).
+    pub fn encode(region: u32, bundles: &[Bundle], enc: &mut bundle::Encoder, raw: &mut Vec<u8>, z: &mut zstd::bulk::Compressor<'static>) -> Result<Segment> {
+        enc.encode_bundles(bundles, raw);
         ensure!(raw.len() < u32::MAX as usize, "an edge segment of {} bytes", raw.len());
         Ok(Segment {
             region,
@@ -585,10 +585,11 @@ pub(crate) fn segments_of(edges: &[(Sk, Sk, u32)]) -> Result<(Vec<Segment>, Vec<
     }
     let mut z = zstd::bulk::Compressor::new(1)?;
     let mut raw = Vec::new();
+    let mut enc = bundle::Encoder::default();
     let mut segs = Vec::new();
     for (region, m) in by {
-        let mut bundles: Vec<Bundle> = m.into_iter().map(|((s_shape, s_key, x, o, t_key), mask)| Bundle { s_shape, s_key, x, o, t_key, mask }).collect();
-        segs.push(Segment::encode(region, &mut bundles, &mut raw, &mut z)?);
+        let bundles: Vec<Bundle> = m.into_iter().map(|((s_shape, s_key, x, o, t_key), mask)| Bundle { s_shape, s_key, x, o, t_key, mask }).collect();
+        segs.push(Segment::encode(region, &bundles, &mut enc, &mut raw, &mut z)?);
     }
     Ok((segs, sources.into_iter().collect()))
 }

@@ -611,7 +611,7 @@ pub fn run_route(st: &mut RouteState, slice: u32, chunks: &[&Chunk], cx: &Region
         st.segs.push(((0, slice), Segment::of_raw(region, &sc.raw, sc.tbs.len() as u32, sc.tbs.iter().map(|t| t.mask.count_ones() as u64).sum(), &mut sc.z)?));
     }
     if !sc.prov.is_empty() {
-        st.prov.push((slice, Segment::encode(u32::MAX, &mut sc.prov, &mut sc.raw, &mut sc.z)?));
+        st.prov.push((slice, Segment::encode(u32::MAX, &sc.prov, &mut sc.enc, &mut sc.raw, &mut sc.z)?));
         sc.prov.clear();
     }
     sc.bound();
@@ -628,6 +628,11 @@ pub struct Sealed {
     pub grown: Vec<super::wave::Old>,
     /// Per grown state its entry in the visited set's region table.
     pub grown_at: Vec<u32>,
+    /// The states it compared, and its steps' walls: the touched keys
+    /// sorted, each compared with the visited set, the new table, the
+    /// bundles that waited encoded again (`--phases`' `[seal]`).
+    pub touched: usize,
+    pub t: [std::time::Duration; 4],
 }
 
 /// The frame's new transfers' canonical ids (`edges::XferTable::
@@ -662,11 +667,33 @@ pub fn seal(st: &mut RouteState, region: u32, finals: &FxHashMap<Key, Key>, renu
     }
     // THE STATES (final keys, sorted): new, grown, or nothing.
     let final_key = |k: Key| if is_provisional(k) { finals.get(&k).copied().ok_or_else(|| anyhow::anyhow!("a provisional key without its final key")) } else { Ok(k) };
+    let mut lap = std::time::Instant::now();
+    let mut t = [std::time::Duration::ZERO; 4];
+    let mut mark = |k: usize| {
+        t[k] = lap.elapsed();
+        lap = std::time::Instant::now();
+    };
+    let n_touched = st.touched.len();
     let (touched, accs) = std::mem::take(&mut st.touched).into_sorted(final_key)?;
+    mark(0);
     let (mut keys, mut masks, mut hulls): (Vec<Key>, Vec<u64>, Vec<Hull>) = (Vec::new(), Vec::new(), Vec::new());
     let (mut grown, mut grown_at): (Vec<super::wave::Old>, Vec<u32>) = (Vec::new(), Vec::new());
     let infos = visited.region_infos(region);
-    for TouchedKey { key, cells, start, entry: ve, held } in touched {
+    // The touched keys are by key, their runs and visited entries anywhere:
+    // each fetched ahead (`AHEAD` keys), its visited run once its entry is in.
+    const AHEAD: usize = 16;
+    for (i, &TouchedKey { key, cells, start, entry: ve, held }) in touched.iter().enumerate() {
+        if let Some(k) = touched.get(i + AHEAD) {
+            super::prefetch(accs.as_ptr().wrapping_add(k.start as usize));
+            if let (Some(m), true) = (infos, k.held != 0) {
+                m.prefetch_entry(k.entry);
+            }
+        }
+        if let (Some(m), Some(k)) = (infos, touched.get(i + AHEAD / 2)) {
+            if k.held != 0 {
+                m.prefetch_run(k.entry);
+            }
+        }
         let fresh = cells & !held;
         if fresh != 0 {
             keys.push(key);
@@ -689,7 +716,9 @@ pub fn seal(st: &mut RouteState, region: u32, finals: &FxHashMap<Key, Key>, renu
             }
         }
     }
+    mark(1);
     let table = RegionTable::from_sorted(&keys, &masks)?;
+    mark(2);
     // Each job's bundles that waited, decoded and encoded again with the
     // final keys and ids (a segment a job, as it was made).
     let mut dz = zstd::bulk::Decompressor::new()?;
@@ -712,10 +741,11 @@ pub fn seal(st: &mut RouteState, region: u32, finals: &FxHashMap<Key, Key>, renu
         })?;
         ensure!(!missing, "a provisional target key without its final key");
         ensure!(v.len() == seg.bundles as usize, "a waiting segment of {} bundles decoded to {}", seg.bundles, v.len());
-        st.segs.push(((1, slice), Segment::encode(region, &mut v, &mut sc.raw, &mut sc.z)?));
+        st.segs.push(((1, slice), Segment::encode(region, &v, &mut sc.enc, &mut sc.raw, &mut sc.z)?));
     }
     // The file's order: the jobs' segments by slice, then the ones that
     // waited by slice (one job a (route, slice): the keys are distinct).
     st.segs.sort_unstable_by_key(|s| s.0);
-    Ok(Sealed { region, table, hulls, grown, grown_at })
+    mark(3);
+    Ok(Sealed { region, table, hulls, grown, grown_at, touched: n_touched, t })
 }

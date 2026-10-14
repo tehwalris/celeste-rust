@@ -65,6 +65,21 @@ impl RegionInfos {
         (mask >> local & 1 == 1).then(|| self.slots[self.starts[e as usize] as usize + (mask & ((1u64 << local) - 1)).count_ones() as usize])
     }
 
+    /// `get(e, _)`'s entry fetched ahead (`super::prefetch`).
+    #[inline]
+    pub fn prefetch_entry(&self, e: u32) {
+        super::prefetch(self.masks.as_ptr().wrapping_add(e as usize));
+        super::prefetch(self.starts.as_ptr().wrapping_add(e as usize));
+    }
+
+    /// `get(e, _)`'s run fetched ahead (its entry read: fetch that first).
+    #[inline]
+    pub fn prefetch_run(&self, e: u32) {
+        if let Some(&s) = self.starts.get(e as usize) {
+            super::prefetch(self.slots.as_ptr().wrapping_add(s as usize));
+        }
+    }
+
     /// Entry `e`'s cells set (`updates`: by cell, ascending, distinct; a
     /// full hull's slot goes).
     pub fn set(&mut self, e: u32, updates: &[(u32, StateInfo)]) {

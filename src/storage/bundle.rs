@@ -312,7 +312,8 @@ fn put_record(out: &mut Vec<u8>, order: &[F; 5], prev: Option<&[u64; 5]>, vals: 
 }
 
 /// Encode `bundles` (distinct, any order) as a raw block in `order` into
-/// `out` (cleared).
+/// `out` (cleared): the reference the grouped `Encoder` is checked against.
+#[cfg(test)]
 pub fn encode(bundles: &[Bundle], order: &[F; 5], out: &mut Vec<u8>) {
     out.clear();
     let mut t: Vec<Key> = bundles.iter().map(|b| b.t_key).collect();
@@ -390,6 +391,34 @@ impl Encoder {
 const _: () = assert!(matches!(ORDER, [F::M, F::O, F::X, F::S, F::T]), "Encoder groups ORDER's fields");
 
 impl Encoder {
+    /// `bundles` (distinct, any order) as a raw block in `ORDER` into `out`
+    /// (cleared) - what `encode` writes - through `encode` below, the
+    /// targets and sources numbered as met: the bundles that wait for the
+    /// frame's end, encoded in the region phase and again at `route::seal`
+    /// (the generic sort of every record was most of a big route's seal).
+    pub fn encode_bundles(&mut self, bundles: &[Bundle], out: &mut Vec<u8>) {
+        let mut t_id: rustc_hash2::FxHashMap<Key, u32> = Default::default();
+        let mut s_id: rustc_hash2::FxHashMap<(u32, Key), u32> = Default::default();
+        let (mut t_keys, mut s_list): (Vec<Key>, Vec<(u32, Key)>) = (Vec::new(), Vec::new());
+        let items: Vec<Tb> = bundles
+            .iter()
+            .map(|b| {
+                let n = t_keys.len() as u32;
+                let t = *t_id.entry(b.t_key).or_insert(n);
+                if t == n {
+                    t_keys.push(b.t_key);
+                }
+                let n = s_list.len() as u32;
+                let s = *s_id.entry((b.s_shape, b.s_key)).or_insert(n);
+                if s == n {
+                    s_list.push((b.s_shape, b.s_key));
+                }
+                Tb { t, s, x: b.x, o: b.o, mask: b.mask }
+            })
+            .collect();
+        self.encode(&items, t_keys.len(), |l| t_keys[l as usize], &s_list, out);
+    }
+
     /// `items` (distinct) as a raw block in `ORDER` into `out` (cleared):
     /// target ids below `n_ids`, their keys `t_key(id)`; source indices into
     /// `sources` (distinct; each one some item's).
@@ -712,6 +741,10 @@ mod tests {
         for _ in 0..2 {
             enc.encode(&items, ids.len() * 3 + 1, |t| ids[(t as usize - 1) / 3], &srcs, &mut b2);
             assert_eq!(a, b2, "Encoder and encode agree");
+            let mut shuffled = bundles.clone();
+            shuffled.reverse();
+            enc.encode_bundles(&shuffled, &mut b2);
+            assert_eq!(a, b2, "encode_bundles and encode agree");
         }
         let mut raw = Vec::new();
         encode(&[], &ORDER, &mut raw);

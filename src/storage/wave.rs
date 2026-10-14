@@ -702,6 +702,19 @@ pub fn run_wave(engine: &dyn FrameStep, front: &Frontier, cx: WaveCtx) -> Result
     }
     new.sort_unstable_by_key(|x| x.region);
     mark("seal", &mut st);
+    if s.diag.phases && !new.is_empty() {
+        let ms = |d: std::time::Duration| d.as_secs_f64() * 1e3;
+        let sum = new.iter().fold([0.0f64; 4], |a, sl| std::array::from_fn(|k| a[k] + ms(sl.t[k])));
+        let mut big: Vec<&Sealed> = new.iter().collect();
+        big.sort_by(|a, b| b.t.iter().sum::<std::time::Duration>().cmp(&a.t.iter().sum()));
+        let parts = |t: &[f64; 4]| format!("sort {:.0}, compare {:.0}, table {:.0}, waiting bundles {:.0} ms", t[0], t[1], t[2], t[3]);
+        eprintln!(
+            "[seal] f{frame}: {} routes, worker time {}; the longest: {}",
+            new.len(),
+            parts(&sum),
+            big.iter().take(3).map(|sl| format!("r{} ({} states: {})", sl.region, sl.touched, parts(&sl.t.map(ms)))).collect::<Vec<_>>().join("; ")
+        );
+    }
     if let Some(f) = filters.marks {
         mark_filter(&mut new, f, visited, skeletons, frame, s)?;
     }
