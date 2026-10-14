@@ -112,8 +112,14 @@ impl RegionInfos {
     }
 
     /// Entry `e`'s cells set (`updates`: by cell, ascending, distinct; a
-    /// full hull's slot goes).
+    /// full hull's slot goes); dead slots reclaimed once they are an eighth.
     pub fn set(&mut self, e: u32, updates: &[(u32, StateInfo)]) {
+        self.set_reclaiming(e, updates, 8);
+    }
+
+    /// `set`, dead slots reclaimed once they are `1 / reclaim` of the slots
+    /// (a resume's replay: a third, then `tighten` once).
+    fn set_reclaiming(&mut self, e: u32, updates: &[(u32, StateInfo)], reclaim: usize) {
         debug_assert!(updates.windows(2).all(|w| w[0].0 < w[1].0));
         let e = e as usize;
         if self.masks.len() <= e {
@@ -160,9 +166,19 @@ impl RegionInfos {
         }
         self.dead += mask.count_ones() as usize;
         (self.starts[e], self.masks[e]) = (at as u32, next);
-        if self.dead > 1024 && self.dead * 8 > self.slots.len() {
+        if self.dead > 1024 && self.dead * reclaim > self.slots.len() {
             self.compact();
         }
+    }
+
+    /// No dead slots and no spare room (a resume's end).
+    fn tighten(&mut self) {
+        if self.dead > 0 {
+            self.compact();
+        }
+        self.slots.shrink_to_fit();
+        self.starts.shrink_to_fit();
+        self.masks.shrink_to_fit();
     }
 
     /// The live runs, entry by entry, at the start of a new slot array.
@@ -327,7 +343,7 @@ impl VisitedSet {
         for (key, local, i) in states {
             if cur.is_none_or(|c| c.0 != key) {
                 if let Some((_, e)) = cur {
-                    m.set(e, &batch);
+                    m.set_reclaiming(e, &batch, 3);
                 }
                 batch.clear();
                 let e = t.find(key).ok_or_else(|| anyhow::anyhow!("region {region}: a hull for a state the set lacks"))?;
@@ -339,7 +355,7 @@ impl VisitedSet {
             batch.push((local, i));
         }
         if let Some((_, e)) = cur {
-            m.set(e, &batch);
+            m.set_reclaiming(e, &batch, 3);
         }
         Ok(())
     }
@@ -362,6 +378,14 @@ impl VisitedSet {
             Self::put_all(t, m, *region, &mut each(&groups[*i].1).into_iter())
         });
         done.into_iter().collect()
+    }
+
+    /// Every region's hull store without dead slots or spare room (a
+    /// resume's end: its replay reclaims at a third, `RegionInfos::set` at
+    /// an eighth).
+    pub fn tighten(&mut self, threads: usize) {
+        let work: Vec<std::sync::Mutex<&mut RegionInfos>> = self.info.values_mut().map(std::sync::Mutex::new).collect();
+        super::wave::par_map(&work, threads, |m| m.lock().expect("a region's hulls").tighten());
     }
 
     /// The states with a layer and hull stored (not full).

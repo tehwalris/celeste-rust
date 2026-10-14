@@ -31,15 +31,86 @@ use crate::search::arc_edges::{decode_pair, encode_pair, Pair, PAIR_BYTES};
 #[derive(Default, Clone)]
 pub struct XferTable {
     pub pairs: Vec<Pair>,
-    index: FxHashMap<Pair, u32>,
+    index: PairIndex,
     /// Pairs written to `xfer.bin` (`flush`).
     flushed: usize,
 }
 
 impl XferTable {
-    /// Bytes held: the pairs, the index (a hash map's slot and control byte each).
+    /// Bytes held: the pairs, the index.
     pub fn bytes(&self) -> [usize; 2] {
-        [self.pairs.capacity() * std::mem::size_of::<Pair>(), self.index.capacity() * (std::mem::size_of::<(Pair, u32)>() + 1)]
+        [self.pairs.capacity() * std::mem::size_of::<Pair>(), self.index.slots.capacity() * 4]
+    }
+}
+
+/// A pair's id by content: open addressing over `u32` slots (`id + 1`; 0
+/// empty) of ids into the table's pairs, linear probing, at most 3/4 full
+/// - ~6 B a pair, where a hash map of pairs took ~37 (a big room's f230:
+/// 0.27 GB for 4.1M pairs).
+#[derive(Default, Clone)]
+struct PairIndex {
+    slots: Vec<u32>,
+    n: usize,
+}
+
+impl PairIndex {
+    #[inline]
+    fn hash(p: &Pair) -> u64 {
+        use celeste_engine::runtime2::mix64;
+        let w = |a: &crate::search::arc_edges::AxisXfer| mix64((a.lo as u64) << 32 | a.hi as u64) ^ ((a.val as u32 as u64) << 8 | a.tag as u64);
+        mix64(w(&p.0) ^ w(&p.1).rotate_left(31))
+    }
+
+    /// `p`'s id among `pairs`, if indexed.
+    #[inline]
+    fn find(&self, pairs: &[Pair], p: &Pair) -> Option<u32> {
+        if self.slots.is_empty() {
+            return None;
+        }
+        let m = self.slots.len() - 1;
+        let mut i = Self::hash(p) as usize & m;
+        loop {
+            match self.slots[i] {
+                0 => return None,
+                s if pairs[s as usize - 1] == *p => return Some(s - 1),
+                _ => i = (i + 1) & m,
+            }
+        }
+    }
+
+    /// Pair `id` of `pairs` (absent) indexed.
+    fn insert(&mut self, pairs: &[Pair], id: u32) {
+        if (self.n + 1) * 4 > self.slots.len() * 3 {
+            let cap = ((self.n + 1) * 2).next_power_of_two().max(16);
+            let old = std::mem::replace(&mut self.slots, vec![0; cap]);
+            self.n = 0;
+            for s in old.into_iter().filter(|&s| s != 0) {
+                self.place(pairs, s - 1);
+            }
+        }
+        self.place(pairs, id);
+    }
+
+    #[inline]
+    fn place(&mut self, pairs: &[Pair], id: u32) {
+        let m = self.slots.len() - 1;
+        let mut i = Self::hash(&pairs[id as usize]) as usize & m;
+        while self.slots[i] != 0 {
+            i = (i + 1) & m;
+        }
+        self.slots[i] = id + 1;
+        self.n += 1;
+    }
+
+    /// Every id from `first` on out (their pairs about to be renumbered):
+    /// the index rebuilt from the ones below.
+    fn truncate(&mut self, pairs: &[Pair], first: usize) {
+        let old = std::mem::take(&mut self.slots);
+        self.slots = vec![0; old.len()];
+        self.n = 0;
+        for s in old.into_iter().filter(|&s| s != 0 && ((s - 1) as usize) < first) {
+            self.place(pairs, s - 1);
+        }
     }
 }
 
@@ -52,7 +123,10 @@ impl XferTable {
     /// it; empty without one.
     pub fn load(dir: &Path) -> Result<Self> {
         let pairs = Self::load_pairs(dir)?;
-        let index = pairs.iter().enumerate().map(|(i, p)| (*p, i as u32)).collect();
+        let mut index = PairIndex::default();
+        for id in 0..pairs.len() as u32 {
+            index.insert(&pairs, id);
+        }
         Ok(XferTable { flushed: pairs.len(), pairs, index })
     }
 
@@ -73,14 +147,14 @@ impl XferTable {
     /// value order); per tail its pairs' global ids. A wave merges per
     /// slice, so these ids are PROVISIONAL until its end (`canonical`).
     pub fn merge(&mut self, tails: &[&[Pair]]) -> Vec<Vec<u32>> {
-        let mut new: Vec<Pair> = tails.iter().flat_map(|t| t.iter()).filter(|p| !self.index.contains_key(p)).copied().collect();
+        let mut new: Vec<Pair> = tails.iter().flat_map(|t| t.iter()).filter(|p| self.index.find(&self.pairs, p).is_none()).copied().collect();
         new.sort_unstable();
         new.dedup();
         for p in new {
-            self.index.insert(p, self.pairs.len() as u32);
             self.pairs.push(p);
+            self.index.insert(&self.pairs, self.pairs.len() as u32 - 1);
         }
-        tails.iter().map(|t| t.iter().map(|p| self.index[p]).collect()).collect()
+        tails.iter().map(|t| t.iter().map(|p| self.index.find(&self.pairs, p).expect("a merged pair")).collect()).collect()
     }
 
     /// The pairs from `first` on (a wave's: merged slice by slice, in the
@@ -104,10 +178,11 @@ impl XferTable {
             perm[from as usize] = to as u32;
         }
         let sorted: Vec<Pair> = order.iter().map(|&i| new[i as usize]).collect();
+        self.index.truncate(&self.pairs, first);
         self.pairs.truncate(first);
         for p in sorted {
-            self.index.insert(p, self.pairs.len() as u32);
             self.pairs.push(p);
+            self.index.insert(&self.pairs, self.pairs.len() as u32 - 1);
         }
         Some(perm)
     }

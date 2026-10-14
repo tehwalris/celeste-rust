@@ -1425,6 +1425,7 @@ pub fn restore_visited(dir: &std::path::Path, last: u32, room: (i16, i16), threa
         )?;
     }
     anyhow::ensure!(visited.infos() <= visited.len(), "{}: {} states, {} with a hull stored", dir.display(), visited.len(), visited.infos());
+    visited.tighten(threads);
     Ok((visited, tree.first_win(), frontier, skeletons))
 }
 
