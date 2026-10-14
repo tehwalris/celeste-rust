@@ -30,6 +30,9 @@ pub struct CaptureWriter {
     dir: PathBuf,
     worker: u32,
     out: std::io::BufWriter<std::fs::File>,
+    /// The stream's transfers: per sink id its index, and the pairs.
+    xfer_ids: rustc_hash::FxHashMap<u32, u32>,
+    xfers: Vec<crate::search::arc_edges::Pair>,
 }
 
 impl CaptureWriter {
@@ -43,7 +46,7 @@ impl CaptureWriter {
             std::fs::write(dir.join("env.txt"), format!("frame {frame}\nlevel {level}\nsettings {}\n", s.cart_key())).expect("the capture's env");
         }
         let f = std::fs::File::create(dir.join(format!("w{worker:03}.bin"))).expect("a capture stream");
-        Some(CaptureWriter { dir, worker, out: std::io::BufWriter::with_capacity(8 << 20, f) })
+        Some(CaptureWriter { dir, worker, out: std::io::BufWriter::with_capacity(8 << 20, f), xfer_ids: Default::default(), xfers: Vec::new() })
     }
 
     pub fn unit(&mut self, unit: u32, lanes: u32) {
@@ -85,11 +88,21 @@ impl CaptureWriter {
         self.out.write_all(&b).expect("a capture write");
     }
 
-    /// The stream done; the worker's transfer table beside it.
-    pub fn finish(mut self, xfers: &[crate::search::arc_edges::Pair]) -> Result<()> {
+    /// Transfer `x` (the sink's id) as the stream names it: an index into
+    /// the stream's own table of pairs (`pair`: its pair, on first use).
+    pub fn xfer(&mut self, x: u32, pair: impl FnOnce() -> crate::search::arc_edges::Pair) -> u32 {
+        let n = self.xfers.len() as u32;
+        *self.xfer_ids.entry(x).or_insert_with(|| {
+            self.xfers.push(pair());
+            n
+        })
+    }
+
+    /// The stream done; its transfer table beside it.
+    pub fn finish(mut self) -> Result<()> {
         self.out.flush()?;
-        let mut buf = Vec::with_capacity(xfers.len() * crate::search::arc_edges::PAIR_BYTES);
-        for p in xfers {
+        let mut buf = Vec::with_capacity(self.xfers.len() * crate::search::arc_edges::PAIR_BYTES);
+        for p in &self.xfers {
             crate::search::arc_edges::encode_pair(&mut buf, p);
         }
         std::fs::write(self.dir.join(format!("x{:03}.bin", self.worker)), buf)?;

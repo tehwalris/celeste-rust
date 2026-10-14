@@ -649,7 +649,12 @@ pub fn run_route(st: &mut RouteState, slice: u32, chunks: &[&Chunk], cx: &Region
             if b.x == NO_XFER {
                 continue;
             }
-            let x = *remap.get(b.x as usize).ok_or_else(|| anyhow::anyhow!("frame {}: a bundle's transfer {} of worker {} has no global id", cx.frame, b.x, c.worker))?;
+            // A pair the tree's table held is its global id; a new one the
+            // worker's local id, past them (`UnitSink::xfer_id`).
+            let x = match b.x.checked_sub(cx.new_xfers) {
+                None => b.x,
+                Some(l) => *remap.get(l as usize).ok_or_else(|| anyhow::anyhow!("frame {}: a bundle's transfer {} of worker {} has no global id", cx.frame, b.x, c.worker))?,
+            };
             let e = sc.e_of[b.t as usize];
             if e == PROV || x >= cx.new_xfers {
                 let (s_shape, s_key) = c.sources[b.s as usize];

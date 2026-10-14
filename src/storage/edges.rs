@@ -150,6 +150,25 @@ impl XferTable {
         Ok(b[..n * PAIR_BYTES].chunks_exact(PAIR_BYTES).map(decode_pair).collect())
     }
 
+    /// `p`'s id, if the table holds it.
+    #[inline]
+    pub fn find(&self, p: &Pair) -> Option<u32> {
+        self.index.find(&self.pairs, p)
+    }
+
+    /// A wave's new pairs (`fresh`: a table of them alone, its ids less
+    /// this one's length) appended, in their order.
+    pub fn append(&mut self, fresh: XferTable) {
+        if self.pairs.len() + fresh.pairs.len() > self.pairs.capacity() {
+            self.pairs.reserve_exact(fresh.pairs.len().max(self.pairs.len() / 8));
+        }
+        for p in fresh.pairs {
+            debug_assert!(self.find(&p).is_none(), "a fresh pair the table holds");
+            self.pairs.push(p);
+            self.index.insert(&self.pairs, self.pairs.len() as u32 - 1);
+        }
+    }
+
     /// The workers' NEW pairs (`tails`: what each worker's table gained
     /// since its last merge) into the table: the ones it lacks appended (in
     /// value order); per tail its pairs' global ids. A wave merges per

@@ -991,7 +991,8 @@ impl ForwardState {
             skeletons: &self.skeletons,
             ceiling: self.ceiling(&engine.settings()),
         };
-        let wave = crate::storage::wave::run_wave(engine, &self.frontier, cx)?;
+        let front = if copy { self.frontier.clone() } else { std::mem::take(&mut self.frontier) };
+        let wave = crate::storage::wave::run_wave(engine, front, cx)?;
         Ok((wave, visited, xfers))
     }
 
@@ -1043,9 +1044,8 @@ impl ForwardState {
                 skeletons: &self.skeletons,
                 ceiling,
             };
-            let wave = crate::storage::wave::run_wave(engine, &self.frontier, cx)?;
-            // The frontier is spent: its keys go before the frame is written.
-            self.frontier = Frontier::default();
+            // The frontier is spent by the wave (dropped before its end).
+            let wave = crate::storage::wave::run_wave(engine, std::mem::take(&mut self.frontier), cx)?;
             // Before the frame is trusted (every file, then done.txt).
             let t = std::time::Instant::now();
             // The skeletons first emitted here, of shapes the frame holds
@@ -2022,8 +2022,8 @@ mod tests {
             let visited = crate::storage::visited::VisitedSet::new(crate::storage::GEOMETRY);
             let (routes, skeletons) = (crate::storage::route::Routes::default(), crate::storage::decode::Skeletons::default());
             let prov = celeste_engine::exact::Provisional::default();
-            let xtab = Default::default();
-            let mut sink = crate::storage::unit::UnitSink::new(&visited, &routes, &skeletons, &prov, Filters::default(), 1, level, 0, &xtab, false, false, &s);
+            let (base, xtab) = (crate::storage::edges::XferTable::default(), Default::default());
+            let mut sink = crate::storage::unit::UnitSink::new(&visited, &routes, &skeletons, &prov, Filters::default(), 1, level, 0, &base, &xtab, false, false, &s);
             sink.begin(0);
             let si = sink.push_source(0, (0, 0));
             sink.push_lane(si, cells[0], Hull::full());
@@ -2089,8 +2089,8 @@ mod tests {
             let visited = crate::storage::visited::VisitedSet::new(crate::storage::GEOMETRY);
             let (routes, skeletons) = (crate::storage::route::Routes::default(), crate::storage::decode::Skeletons::default());
             let prov = celeste_engine::exact::Provisional::default();
-            let xtab = Default::default();
-            let mut sink = crate::storage::unit::UnitSink::new(&visited, &routes, &skeletons, &prov, Filters::default(), 1, level, 0, &xtab, false, false, &s);
+            let (base, xtab) = (crate::storage::edges::XferTable::default(), Default::default());
+            let mut sink = crate::storage::unit::UnitSink::new(&visited, &routes, &skeletons, &prov, Filters::default(), 1, level, 0, &base, &xtab, false, false, &s);
             sink.begin(0);
             let si = sink.push_source(0, (0, 0));
             sink.push_lane(si, cells[0], Hull::full());

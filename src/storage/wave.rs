@@ -325,7 +325,7 @@ fn run_unit(engine: &dyn FrameStep, u: u32, entries: std::ops::Range<usize>, sta
 
 /// ONE FORWARD FRAME (module doc): the wave of frame `cx.frame` from the
 /// frontier `front` (the states whose hull grew at `cx.frame - 1`).
-pub fn run_wave(engine: &dyn FrameStep, front: &Frontier, cx: WaveCtx) -> Result<Wave> {
+pub fn run_wave(engine: &dyn FrameStep, front: Frontier, cx: WaveCtx) -> Result<Wave> {
     use std::time::Instant;
     let WaveCtx { visited, xfers, pos, filters, frame, edges_dir, outs, skeletons, ceiling } = cx;
     // A platforms-unknown level knows only `PLATFORM_WORLD_FRAMES` worlds.
@@ -348,6 +348,10 @@ pub fn run_wave(engine: &dyn FrameStep, front: &Frontier, cx: WaveCtx) -> Result
         // Not `[fwd] f...`: log readers (`export-ui`) parse those as frames.
         eprintln!("[warm] f{frame}: engine and level -1 table built in {:.1} s, before the wave", t_warm.elapsed().as_secs_f64());
     }
+    // What the last frame's end and checkpoint freed back to the OS before
+    // the wave's threads (new heaps) allocate: kept, it adds to the wave's
+    // peak (the fixture room's f279 started with 6.3 GB of it).
+    collect_freed();
     let mut st = FrameStats::default();
     let workers = s.threads();
     let t_frame = Instant::now();
@@ -369,8 +373,12 @@ pub fn run_wave(engine: &dyn FrameStep, front: &Frontier, cx: WaveCtx) -> Result
     // transfer tables are shared with the gather.
     let xtabs: Vec<std::sync::RwLock<Vec<crate::search::arc_edges::Pair>>> = (0..workers).map(|_| Default::default()).collect();
     // The frame's new transfers are numbered from here (canonically at its end).
+    // The tree's table is read only (shared by the workers) until the
+    // frame's end; the gather numbers the frame's new pairs after it, in a
+    // table of their own (`Gather::fresh`).
     let xfers_before = xfers.pairs.len();
-    let mut sinks: Vec<UnitSink> = (0..workers).map(|w| UnitSink::new(visited, &routes, skeletons, &prov, filters, frame, level, w as u32, &xtabs[w], pos.is_some(), record, s)).collect();
+    let base: &XferTable = xfers;
+    let mut sinks: Vec<UnitSink> = (0..workers).map(|w| UnitSink::new(visited, &routes, skeletons, &prov, filters, frame, level, w as u32, base, &xtabs[w], pos.is_some(), record, s)).collect();
     // Per kernel unit its out-edge block (`storage::out`): compressed, or
     // raw where a target key is provisional (encoded again at the end).
     let mut out_blocks: Vec<std::sync::Mutex<Vec<OutBlock>>> = (0..n_kernel).map(|_| Default::default()).collect();
@@ -387,7 +395,7 @@ pub fn run_wave(engine: &dyn FrameStep, front: &Frontier, cx: WaveCtx) -> Result
         upto: slices.iter().map(|_| (0..workers).map(|_| AtomicUsize::new(0)).collect()).collect(),
         chunks: slices.iter().map(|_| Default::default()).collect(),
         gathered: AtomicUsize::new(0),
-        gather: std::sync::Mutex::new(Gather { xfers, merged: vec![0; workers], remaps: vec![Vec::new(); workers], routes: 0 }),
+        gather: std::sync::Mutex::new(Gather { fresh: XferTable::default(), first: xfers_before as u32, merged: vec![0; workers], remaps: vec![Vec::new(); workers], routes: 0 }),
         states: Default::default(),
         jobs: Default::default(),
         jobs_left: AtomicUsize::new(0),
@@ -411,7 +419,7 @@ pub fn run_wave(engine: &dyn FrameStep, front: &Frontier, cx: WaveCtx) -> Result
             .iter_mut()
             .zip(scratch.iter_mut())
             .map(|(sink, sc)| {
-                let (units, pipe, slice_of, slices, routes, shapes, starts, hulls, out_blocks, repushed) = (&units, &pipe, &slice_of, &slices, &routes, &shapes, &starts, &front.hulls, &out_blocks, &repushed);
+                let (units, pipe, slice_of, slices, routes, shapes, starts, hulls, old_by, out_blocks, repushed) = (&units, &pipe, &slice_of, &slices, &routes, &shapes, &starts, &front.hulls, &front.old, &out_blocks, &repushed);
                 let visited: &VisitedSet = visited;
                 std::thread::Builder::new().stack_size(WORKER_STACK).spawn_scoped(scope, move || -> Result<(std::time::Duration, std::time::Duration, [u64; 4])> {
                     crate::compiled::asm_kernel::set_thread_stack(WORKER_STACK);
@@ -477,7 +485,7 @@ pub fn run_wave(engine: &dyn FrameStep, front: &Frontier, cx: WaveCtx) -> Result
                                 }
                                 UnitSpec::Repush { layer, old } => {
                                     let tr = phases::start(s.diag.phases);
-                                    let n = run_repush(u as u32, &front.old[*layer].1[old.clone()], outs.expect("checked above"), sink, &mut rs)?;
+                                    let n = run_repush(u as u32, &old_by[*layer].1[old.clone()], outs.expect("checked above"), sink, &mut rs)?;
                                     repushed.fetch_add(n, Ordering::Relaxed);
                                     phases::add(phases::REPUSH, tr);
                                 }
@@ -535,12 +543,17 @@ pub fn run_wave(engine: &dyn FrameStep, front: &Frontier, cx: WaveCtx) -> Result
         crate::metrics::mem_phase(&format!("f{frame} units and region jobs"));
     }
     st.repush_edges = repushed.into_inner();
-    if s.diag.phases && !front.old.is_empty() {
+    let (had_old, n_units) = (!front.old.is_empty(), units.len());
+    // The frontier is spent: dropped before the frame's end builds the next.
+    drop(units);
+    drop(starts);
+    drop(front);
+    if s.diag.phases && had_old {
         let r = spent.iter().fold([0u64; 4], |a, w| std::array::from_fn(|k| a[k] + w.2[k]));
         eprintln!(
             "[repush] f{frame}: {} old states in {} units read {} out blocks ({:.1} MB raw), {} entries in them, {} read ({:.1}%), {} edges looked at",
             st.old_in,
-            units.len() - n_kernel,
+            n_units - n_kernel,
             r[0],
             r[1] as f64 / 1e6,
             r[2],
@@ -555,7 +568,7 @@ pub fn run_wave(engine: &dyn FrameStep, front: &Frontier, cx: WaveCtx) -> Result
     st.wave_idle = idle_fraction(t_units, workers, busy);
     st.slices = slices.len();
     let Pipe { gather, states, inflight_max, .. } = pipe;
-    let Gather { xfers, remaps, .. } = gather.into_inner().expect("the gather");
+    let Gather { fresh, remaps, .. } = gather.into_inner().expect("the gather");
     let mut states: Vec<RouteState> = states
         .into_inner()
         .expect("the routes")
@@ -573,10 +586,24 @@ pub fn run_wave(engine: &dyn FrameStep, front: &Frontier, cx: WaveCtx) -> Result
             let b = k.alloc_bytes();
             [a[0] + b[0], a[1] + b[1], a[2] + b[2], a[3] + b[3]]
         });
-        let sk = sinks.iter().fold([0usize; 4], |a, k| {
+        let sk = sinks.iter().fold([0usize; 5], |a, k| {
             let b = k.alloc_bytes();
-            [a[0] + b[0], a[1] + b[1], a[2] + b[2], a[3] + b[3]]
+            std::array::from_fn(|i| a[i] + b[i])
         });
+        let (x_all, x_max) = sinks.iter().fold((0usize, 0usize), |a, k| (a.0 + k.xfers_met(), a.1.max(k.xfers_met())));
+        let out_held: usize = out_blocks
+            .iter()
+            .map(|b| {
+                b.lock()
+                    .expect("an out block")
+                    .iter()
+                    .map(|x| match x {
+                        OutBlock::Sealed(z) => z.as_ref().map_or(0, |z| z.z.capacity()),
+                        OutBlock::Raw(r) => r.capacity(),
+                    })
+                    .sum::<usize>()
+            })
+            .sum();
         let tb = states.iter().fold([0usize; 4], |a, r| {
             let b = r.touched.bytes();
             std::array::from_fn(|k| a[k] + b[k])
@@ -591,21 +618,25 @@ pub fn run_wave(engine: &dyn FrameStep, front: &Frontier, cx: WaveCtx) -> Result
             tb.iter().sum::<usize>() as f64 / ts.max(1) as f64
         );
         eprintln!(
-            "[wavemem] f{frame}: frontier {:.3} GB ({} entries, {} old states), visited {:.3} GB ({} entries), the routes' touched states {:.3}, provisional bundles {:.3}, segments {:.3}, chunks in flight at most {:.3}, sinks {:.3} (bundles {:.3}, lane hulls {:.3}, pos pairs {:.3}, rest {:.3}), region scratch {:.3} (bundles {:.3}, encoder {:.3}, raw {:.3}, rest {:.3}) GB; anon {:.2} GB",
+            "[wavemem] f{frame}: frontier {:.3} GB ({} entries, {} old states), visited {:.3} GB ({} entries), transfers {:.3}, the out store's index {:.3}, the routes' touched states {:.3}, provisional bundles {:.3}, segments {:.3}, out blocks {:.3}, chunks in flight at most {:.3}, sinks {:.3} (bundles {:.3}, lane hulls {:.3}, pos pairs {:.3}, transfers {:.3}: {x_all} met, at most {x_max} a worker, rest {:.3}), region scratch {:.3} (bundles {:.3}, encoder {:.3}, raw {:.3}, rest {:.3}) GB; anon {:.2} GB",
             gb(st.frontier_bytes),
             st.entries_in,
             st.old_in,
             gb(visited.alloc_bytes()),
             visited.entries(),
+            gb(base.bytes().iter().sum::<usize>() + fresh.bytes().iter().sum::<usize>()),
+            gb(outs.map_or(0, |o| o.index_bytes())),
             gb(rest[0]),
             gb(rest[1]),
             gb(rest[2]),
+            gb(out_held),
             gb(inflight_max.load(Ordering::Acquire)),
             gb(sk.iter().sum()),
             gb(sk[0]),
             gb(sk[1]),
             gb(sk[2]),
             gb(sk[3]),
+            gb(sk[4]),
             gb(sc.iter().sum()),
             gb(sc[0]),
             gb(sc[1]),
@@ -615,7 +646,7 @@ pub fn run_wave(engine: &dyn FrameStep, front: &Frontier, cx: WaveCtx) -> Result
         );
     }
     // Per new transfer, the edges the frame recorded with it.
-    let mut xfer_counts = vec![0u64; xfers.pairs.len() - xfers_before];
+    let mut xfer_counts = vec![0u64; fresh.pairs.len()];
     for (sink, remap) in sinks.iter().zip(&remaps) {
         for (&n, &g) in sink.xfer_counts().iter().zip(remap) {
             if g as usize >= xfers_before {
@@ -630,8 +661,12 @@ pub fn run_wave(engine: &dyn FrameStep, front: &Frontier, cx: WaveCtx) -> Result
             p.record_pairs(sink.pos_pairs());
         }
     }
-    st.units = units.len();
+    st.units = n_units;
     drop(sinks);
+    xfers.append(fresh);
+    // The workers' buffers (freed here, made by the exited workers) back
+    // before the frame's end allocates.
+    collect_freed();
 
     // THE FRAME'S END.
     let t = Instant::now();
@@ -750,6 +785,10 @@ pub fn run_wave(engine: &dyn FrameStep, front: &Frontier, cx: WaveCtx) -> Result
             super::route::sealed(t, p.into_iter().map(|x| x.1).collect()).map(Some)
         })
     };
+    // The routes' touched tables are freed (by other threads than the ones
+    // that made them, which have exited): their pages back before the next
+    // steps allocate.
+    collect_freed();
     if s.diag.phases {
         crate::metrics::mem_phase(&format!("f{frame} the routes sealed (keys final, new and grown states)"));
     }
@@ -837,10 +876,13 @@ pub fn run_wave(engine: &dyn FrameStep, front: &Frontier, cx: WaveCtx) -> Result
     if s.diag.phases {
         eprintln!("[absorb] f{frame}: {} states added; packed blocks kept {}, decoded {}, made {}", up.added, up.kept, up.decoded, up.made);
     }
+    collect_freed();
     mark("absorb", &mut st);
     // The grown states by layer, each layer's by state: every route's
-    // (sorted by state) put in layer order (stable), then per layer the
-    // routes' runs in region order - both in parallel.
+    // (sorted by state) put in layer order (in parallel), then the routes'
+    // runs, in region order, appended to their layers' lists and freed one
+    // by one - the runs and the lists are never both whole (both were: 48 B
+    // a grown state twice at the frame's end).
     let mut runs: Vec<Vec<Old>> = Vec::with_capacity(new.len());
     let mut next = Layer::default();
     let mut hulls: Vec<Hull> = Vec::with_capacity(new.iter().map(|sl| sl.hulls.len()).sum());
@@ -860,16 +902,17 @@ pub fn run_wave(engine: &dyn FrameStep, front: &Frontier, cx: WaveCtx) -> Result
     for o in runs.iter().flatten() {
         count[o.layer as usize] += 1;
     }
-    let layers: Vec<u16> = (0..=frame as u16).filter(|&l| count[l as usize] > 0).collect();
-    let grown: ByLayer = par_map(&layers, s.threads(), |&l| {
-        let mut v = Vec::with_capacity(count[l as usize]);
-        for r in &runs {
-            let (a, b) = (r.partition_point(|o| o.layer < l), r.partition_point(|o| o.layer <= l));
-            v.extend_from_slice(&r[a..b]);
+    let mut by: Vec<Vec<Old>> = count.iter().map(|&n| Vec::with_capacity(n)).collect();
+    for r in runs {
+        let mut a = 0;
+        while a < r.len() {
+            let l = r[a].layer;
+            let b = a + r[a..].partition_point(|o| o.layer == l);
+            by[l as usize].extend_from_slice(&r[a..b]);
+            a = b;
         }
-        (l, v)
-    });
-    drop(runs);
+    }
+    let grown: ByLayer = by.into_iter().enumerate().filter(|x| !x.1.is_empty()).map(|(l, v)| (l as u16, v)).collect();
     let mut shapes_in: Vec<u32> = next.set.tables().iter().map(|(r, _)| r / GEOMETRY.slots).collect();
     shapes_in.dedup();
     for si in shapes_in {
@@ -1280,10 +1323,12 @@ struct Job {
     remaps: std::sync::Arc<Vec<Vec<u32>>>,
 }
 
-/// What the gather owns: the global transfer table, per worker its merged
-/// length and its ids' global ones, the routes made so far.
-struct Gather<'a> {
-    xfers: &'a mut XferTable,
+/// What the gather owns: the frame's new transfers (`fresh`: their global
+/// ids are `first` on), per worker its merged length and its local ids'
+/// global ones, the routes made so far.
+struct Gather {
+    fresh: XferTable,
+    first: u32,
     merged: Vec<usize>,
     remaps: Vec<Vec<u32>>,
     routes: usize,
@@ -1301,7 +1346,7 @@ struct Pipe<'a> {
     upto: Vec<Vec<AtomicUsize>>,
     chunks: Vec<std::sync::Mutex<Vec<Chunk>>>,
     gathered: AtomicUsize,
-    gather: std::sync::Mutex<Gather<'a>>,
+    gather: std::sync::Mutex<Gather>,
     states: std::sync::RwLock<Vec<std::sync::Arc<std::sync::Mutex<RouteState>>>>,
     jobs: std::sync::Mutex<std::collections::VecDeque<Job>>,
     jobs_left: AtomicUsize,
@@ -1349,8 +1394,9 @@ impl Pipe<'_> {
             let upto: Vec<usize> = self.upto[k].iter().zip(&g.merged).map(|(u, &m)| u.load(Ordering::Acquire).max(m)).collect();
             let tabs: Vec<std::sync::RwLockReadGuard<Vec<crate::search::arc_edges::Pair>>> = (0..g.merged.len()).map(|w| self.xtab(w)).collect();
             let tails: Vec<&[crate::search::arc_edges::Pair]> = tabs.iter().enumerate().map(|(w, t)| &t[g.merged[w]..upto[w]]).collect();
-            for (w, ids) in g.xfers.merge(&tails).into_iter().enumerate() {
-                g.remaps[w].extend(ids);
+            let first = g.first;
+            for (w, ids) in g.fresh.merge(&tails).into_iter().enumerate() {
+                g.remaps[w].extend(ids.into_iter().map(|i| first + i));
                 g.merged[w] = upto[w];
             }
             drop(tails);
@@ -1565,7 +1611,7 @@ pub fn one_frame(engine: &dyn FrameStep, rows: Vec<Block>, frame: u32) -> Result
     let s = engine.settings();
     let start = seed(&mut visited, &rows, engine.level(), Hull::full(), &s)?.frontier();
     let cx = WaveCtx { visited: &mut visited, xfers: &mut xfers, pos: None, filters: Filters::default(), frame, edges_dir: None, outs: None, skeletons: &skeletons, ceiling: None };
-    let wave = run_wave(engine, &start, cx)?;
+    let wave = run_wave(engine, start, cx)?;
     let next = super::layer::decode_states(&wave.next, &visited.keys, visited.shapes(), usize::MAX, &|_| true)?.into_iter().map(|(_, rt2)| Block::from_rt2(rt2)).collect();
     Ok(OneFrame { next, keys: visited.keys })
 }
