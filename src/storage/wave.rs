@@ -952,7 +952,7 @@ fn mark_filter(sealed: &mut [super::route::Sealed], f: &crate::frame::MarkFilter
 /// end, its capacity doubled, when a cell joins a full one).
 #[derive(Default)]
 struct CellAccs {
-    idx: FxHashMap<(u32, Key), u32>,
+    idx: rustc_hash2::FxHashMap<(u32, Key), u32>,
     /// Per target: (route, key, cells), (its run's start, its capacity).
     targets: Vec<(u32, Key, u64)>,
     runs: Vec<(u32, u32)>,

@@ -45,7 +45,7 @@ const PROV: u32 = u32::MAX;
 /// gains a cell), and what the visited set holds of the key.
 #[derive(Default)]
 pub struct Touched {
-    index: FxHashMap<Key, u32>,
+    index: rustc_hash2::FxHashMap<Key, u32>,
     keys: Vec<TouchedKey>,
     slots: Vec<HullAcc>,
     states: usize,
