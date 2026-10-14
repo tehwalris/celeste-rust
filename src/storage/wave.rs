@@ -773,31 +773,42 @@ pub fn run_wave(engine: &dyn FrameStep, front: Frontier, cx: WaveCtx) -> Result<
         });
         let mut touches: Vec<(usize, Option<super::route::Touch>)> = touches.into_iter().collect::<Result<_>>()?;
         touches.sort_by_key(|x| x.0);
+        // The parts route by route (the biggest first), in order: a
+        // route's last part puts it together on the worker that ends it,
+        // so its touched keys and its parts go as soon as it is sealed
+        // (all the routes' were held until every part was done).
+        let mut by_size: Vec<usize> = (0..touches.len()).filter(|&i| touches[i].1.is_some()).collect();
+        by_size.sort_by_key(|&i| std::cmp::Reverse(touches[i].1.as_ref().map_or(0, |t| t.touched.len())));
         let mut parts: Vec<(usize, std::ops::Range<usize>)> = Vec::new();
-        for (i, (_, t)) in touches.iter().enumerate() {
-            if let Some(t) = t {
-                let n = t.touched.len();
-                parts.extend((0..n.max(1)).step_by(super::route::SEAL_PART).map(|a| (i, a..(a + super::route::SEAL_PART).min(n))));
-            }
+        let mut left: Vec<AtomicUsize> = (0..touches.len()).map(|_| AtomicUsize::new(0)).collect();
+        for i in by_size {
+            let n = touches[i].1.as_ref().map_or(0, |t| t.touched.len());
+            let before = parts.len();
+            parts.extend((0..n.max(1)).step_by(super::route::SEAL_PART).map(|a| (i, a..(a + super::route::SEAL_PART).min(n))));
+            *left[i].get_mut() = parts.len() - before;
         }
-        parts.sort_by_key(|p| std::cmp::Reverse(p.1.len()));
+        let touches: Vec<std::sync::RwLock<Option<super::route::Touch>>> = touches.into_iter().map(|(_, t)| std::sync::RwLock::new(t)).collect();
+        let got: Vec<std::sync::Mutex<Vec<(usize, super::route::SealPart)>>> = (0..touches.len()).map(|_| Default::default()).collect();
+        let out: Vec<std::sync::Mutex<Option<Sealed>>> = (0..touches.len()).map(|_| Default::default()).collect();
         let visited: &VisitedSet = visited;
-        let done = par_map(&parts, workers, |(i, rg)| -> Result<(usize, usize, super::route::SealPart)> {
-            let t = touches[*i].1.as_ref().expect("a part of a route with touched keys");
-            Ok((*i, rg.start, super::route::seal_part(t, rg.clone(), frame, visited)?))
-        });
-        let mut by: Vec<Vec<(usize, super::route::SealPart)>> = (0..touches.len()).map(|_| Vec::new()).collect();
-        for d in done {
-            let (i, a, p) = d?;
-            by[i].push((a, p));
+        let (left, touches_ref, got_ref, out_ref) = (&left, &touches, &got, &out);
+        for r in par_map(&parts, workers, |(i, rg)| -> Result<()> {
+            let p = {
+                let t = touches_ref[*i].read().expect("a route's touched keys");
+                super::route::seal_part(t.as_ref().expect("a part of a route with touched keys"), rg.clone(), frame, visited)?
+            };
+            got_ref[*i].lock().expect("a route's parts").push((rg.start, p));
+            if left[*i].fetch_sub(1, Ordering::AcqRel) == 1 {
+                let t = touches_ref[*i].write().expect("a route's touched keys").take().expect("sealed once");
+                let mut p = std::mem::take(&mut *got_ref[*i].lock().expect("a route's parts"));
+                p.sort_by_key(|x| x.0);
+                *out_ref[*i].lock().expect("a sealed route") = Some(super::route::sealed(t, p.into_iter().map(|x| x.1).collect())?);
+            }
+            Ok(())
+        }) {
+            r?;
         }
-        let routes: Vec<std::sync::Mutex<Option<(Option<super::route::Touch>, Vec<(usize, super::route::SealPart)>)>>> = touches.into_iter().zip(by).map(|((_, t), p)| std::sync::Mutex::new(Some((t, p)))).collect();
-        par_map(&routes, workers, |r| -> Result<Option<Sealed>> {
-            let (t, mut p) = r.lock().expect("a route").take().expect("taken once");
-            let Some(t) = t else { return Ok(None) };
-            p.sort_by_key(|x| x.0);
-            super::route::sealed(t, p.into_iter().map(|x| x.1).collect()).map(Some)
-        })
+        out.into_iter().map(|o| Ok(o.into_inner().expect("a sealed route"))).collect::<Vec<Result<Option<Sealed>>>>()
     };
     // The routes' touched tables are freed (by other threads than the ones
     // that made them, which have exited): their pages back before the next
