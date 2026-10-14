@@ -1182,14 +1182,17 @@ fn main() -> Result<()> {
             let ms = |d: std::time::Duration| d.as_secs_f64() * 1e3;
             let mut lines: Option<String> = None;
             let mut costs: Vec<celeste_rust::storage::bench::Rep> = Vec::new();
+            let counters = celeste_rust::storage::bench::Counters::open();
             for rep in 0..reps {
                 let _ = std::fs::remove_dir_all(&scratch);
                 let load = celeste_rust::storage::bench::load_average();
+                let at = counters.as_ref().map(|c| c.start());
                 let t = std::time::Instant::now();
                 // The last rep runs on the state's own visited set (no copy beside it).
                 let (wave, visited, xfers) = st.bench_wave(&engine, &dir, edges.then_some(scratch.as_path()), rep + 1 < reps)?;
                 let ckpt = if checkpoint { Some(st.bench_checkpoint(&wave, &scratch.join("ckpt"), &cfg)?) } else { None };
                 let t_all = t.elapsed();
+                let counts = counters.as_ref().zip(at).map(|(c, at)| c.stop(at));
                 let w = &wave.stats;
                 eprintln!(
                     "[bench] rep {rep}: wave {:.0} ms (idle {:.0}%, regions {:.0} worker-ms) end {:.0}{} total {:.0} ms | in {} old {} emitted {} re-pushed {} pushes {} kept {} grown {} | units {} slices {} routes {} | edges {} bundles {} ({:.3} B; out {:.3} B) | rss start {:.2} wave {:.2} end {:.2} peak {:.2} GB",
@@ -1218,7 +1221,7 @@ fn main() -> Result<()> {
                     w.rss_end,
                     celeste_rust::metrics::peak_rss_gb(),
                 );
-                costs.push(celeste_rust::storage::bench::Rep { stats: *w, ckpt, workers: cfg.threads(), wall: t_all, load });
+                costs.push(celeste_rust::storage::bench::Rep { stats: *w, ckpt, workers: cfg.threads(), wall: t_all, load, counts });
                 let (n, acc) = wave.next.content_fingerprint(&visited.keys, visited.shapes())?;
                 let mut out = format!("f{:03} {n} {acc:016x}\n", frame + 1);
                 let (nh, ah) = celeste_rust::storage::hulls::fingerprint(wave.frontier_states(frame + 1), &visited.keys, visited.shapes())?;
