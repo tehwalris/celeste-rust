@@ -1,226 +1,35 @@
 //! THE VISITED SET: every state the forward has reached - a `set::RegionSet`
-//! (per (shape, region) a table of entries: a position-free key and a mask
-//! over the region's cells), INDEXED, with the shapes it numbered and the key
-//! space its keys are in, and per state its LAYER and remainder HULL
-//! (`StateInfo`, `RegionInfos`: none for a state whose hull is the whole
-//! torus - it never grows, nor is it pushed again). READ-ONLY during a wave:
-//! the wave's new states go to the next layer (another `RegionSet`), which
-//! the frame's end merges in with the hulls that grew (`absorb`).
+//! of PACKED tables (per (shape, region) its entries - a position-free key
+//! and a mask over the region's cells - sorted, in compressed blocks, each
+//! state with its LAYER and remainder HULL: `set::StateInfo`, none for a
+//! state whose hull is the whole torus - it never grows, nor is it pushed
+//! again), with the shapes it numbered and the key space its keys are in.
+//! READ-ONLY during a wave: a frame's seal walks a region with the sorted
+//! keys it touched (`set::Cursor`), and the frame's end merges its new
+//! states and the hulls that grew in (`absorb`: `set::RegionTable::upsert`,
+//! a big region's runs of blocks apart).
 
 use anyhow::Result;
 use rustc_hash::FxHashMap;
 
-use super::set::{RegionSet, RegionTable};
+use super::set::{Block, Change, RegionSet, RegionTable, Upserted};
 use super::{region_of, Geometry};
 use crate::search::hull::Hull;
 
+pub use super::set::StateInfo;
 /// A state's EXACT packed key within its shape (`celeste_engine::exact`).
 pub use celeste_engine::exact::Key;
 use celeste_engine::exact::KeySpace;
 
-/// A state's LAYER (the frame the forward first reached it, whose wave
-/// expanded it) and its remainder HULL so far.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct StateInfo {
-    pub hull: Hull,
-    pub layer: u16,
-}
-
-impl StateInfo {
-    /// Is its hull the whole torus (then it is not stored)?
-    #[inline]
-    pub fn is_full(&self) -> bool {
-        self.hull.x.is_full() && self.hull.y.is_full()
-    }
-}
-
-/// One region's LAYERS AND HULLS: per entry (its place in the region's
-/// table: entries keep their places) the cells with one and where their RUN
-/// starts in `slots` (the cells in order). A state whose hull is FULL has no
-/// slot. A run moves to the end when its entry gains a cell; dead slots are
-/// reclaimed once they are an eighth of the slots (a third before: a big
-/// room's f230 held 2.25 B a visited state in dead slots); a frame's merge
-/// reserves exactly the room its moved runs take (`reserve`: the quarter a
-/// growth adds held 1.23 B a state of spare room there).
-#[derive(Clone, Default)]
-pub struct RegionInfos {
-    starts: Vec<u32>,
-    masks: Vec<u64>,
-    slots: Vec<StateInfo>,
-    dead: usize,
-}
-
-/// A vector's room for a total length, exactly.
-trait ReserveTo {
-    fn reserve_to(&mut self, len: usize);
-}
-
-impl<T> ReserveTo for Vec<T> {
-    fn reserve_to(&mut self, len: usize) {
-        if len > self.capacity() {
-            self.reserve_exact(len - self.len());
-        }
-    }
-}
-
-/// Room in `v` for `more` (grown by a quarter at least: not doubled; a
-/// frame's merge reserves its room exactly first, `RegionInfos::reserve`).
-fn grow<T>(v: &mut Vec<T>, more: usize) {
-    if v.len() + more > v.capacity() {
-        v.reserve_exact(more.max(v.len() / 4));
-    }
-}
-
-impl RegionInfos {
-    /// Entry `e`'s cell `local`'s, if stored (`None`: full, or no state).
-    #[inline]
-    pub fn get(&self, e: u32, local: u32) -> Option<StateInfo> {
-        let mask = *self.masks.get(e as usize)?;
-        (mask >> local & 1 == 1).then(|| self.slots[self.starts[e as usize] as usize + (mask & ((1u64 << local) - 1)).count_ones() as usize])
-    }
-
-    /// `get(e, _)`'s entry fetched ahead (`super::prefetch`).
-    #[inline]
-    pub fn prefetch_entry(&self, e: u32) {
-        super::prefetch(self.masks.as_ptr().wrapping_add(e as usize));
-        super::prefetch(self.starts.as_ptr().wrapping_add(e as usize));
-    }
-
-    /// `get(e, _)`'s run fetched ahead (its entry read: fetch that first).
-    #[inline]
-    pub fn prefetch_run(&self, e: u32) {
-        if let Some(&s) = self.starts.get(e as usize) {
-            super::prefetch(self.slots.as_ptr().wrapping_add(s as usize));
-        }
-    }
-
-    /// Room for `entries` entries in all and `slots` more slots, exactly (a
-    /// frame's merge, before its `set`s).
-    pub fn reserve(&mut self, entries: usize, slots: usize) {
-        for v in [&mut self.starts as &mut dyn ReserveTo, &mut self.masks] {
-            v.reserve_to(entries);
-        }
-        if self.slots.len() + slots > self.slots.capacity() {
-            self.slots.reserve_exact(slots);
-        }
-    }
-
-    /// The cells of entry `e` with a slot (0: none).
-    #[inline]
-    pub fn mask(&self, e: u32) -> u64 {
-        self.masks.get(e as usize).copied().unwrap_or(0)
-    }
-
-    /// Entry `e`'s cells set (`updates`: by cell, ascending, distinct; a
-    /// full hull's slot goes); dead slots reclaimed once they are an eighth.
-    pub fn set(&mut self, e: u32, updates: &[(u32, StateInfo)]) {
-        self.set_reclaiming(e, updates, 8);
-    }
-
-    /// `set`, dead slots reclaimed once they are `1 / reclaim` of the slots
-    /// (a resume's replay: a third, then `tighten` once).
-    fn set_reclaiming(&mut self, e: u32, updates: &[(u32, StateInfo)], reclaim: usize) {
-        debug_assert!(updates.windows(2).all(|w| w[0].0 < w[1].0));
-        let e = e as usize;
-        if self.masks.len() <= e {
-            let more = e + 1 - self.masks.len();
-            grow(&mut self.starts, more);
-            grow(&mut self.masks, more);
-            self.starts.resize(e + 1, 0);
-            self.masks.resize(e + 1, 0);
-        }
-        let (start, mask) = (self.starts[e], self.masks[e]);
-        let mut next = mask;
-        for &(c, i) in updates {
-            if i.is_full() {
-                next &= !(1u64 << c);
-            } else {
-                next |= 1u64 << c;
-            }
-        }
-        if next == mask {
-            for &(c, i) in updates {
-                if mask >> c & 1 == 1 {
-                    self.slots[start as usize + (mask & ((1u64 << c) - 1)).count_ones() as usize] = i;
-                }
-            }
-            return;
-        }
-        // A new run at the end.
-        let at = self.slots.len();
-        assert!(at + 64 < u32::MAX as usize, "a region of 2^32 hulls");
-        grow(&mut self.slots, next.count_ones() as usize);
-        let mut u = updates.iter().peekable();
-        let mut m = next;
-        while m != 0 {
-            let c = m.trailing_zeros();
-            m &= m - 1;
-            while u.peek().is_some_and(|x| x.0 < c) {
-                u.next();
-            }
-            let v = match u.peek() {
-                Some(&&(uc, i)) if uc == c => i,
-                _ => self.slots[start as usize + (mask & ((1u64 << c) - 1)).count_ones() as usize],
-            };
-            self.slots.push(v);
-        }
-        self.dead += mask.count_ones() as usize;
-        (self.starts[e], self.masks[e]) = (at as u32, next);
-        if self.dead > 1024 && self.dead * reclaim > self.slots.len() {
-            self.compact();
-        }
-    }
-
-    /// No dead slots and no spare room (a resume's end).
-    fn tighten(&mut self) {
-        if self.dead > 0 {
-            self.compact();
-        }
-        self.slots.shrink_to_fit();
-        self.starts.shrink_to_fit();
-        self.masks.shrink_to_fit();
-    }
-
-    /// The live runs, entry by entry, at the start of a new slot array.
-    fn compact(&mut self) {
-        let mut slots = Vec::with_capacity(self.slots.len() - self.dead);
-        for (start, mask) in self.starts.iter_mut().zip(&self.masks) {
-            let n = mask.count_ones() as usize;
-            let a = slots.len() as u32;
-            slots.extend_from_slice(&self.slots[*start as usize..*start as usize + n]);
-            *start = a;
-        }
-        self.slots = slots;
-        self.dead = 0;
-    }
-
-    /// States with a slot.
-    pub fn stored(&self) -> usize {
-        self.slots.len() - self.dead
-    }
-
-    pub fn alloc_bytes(&self) -> usize {
-        self.bytes().iter().sum()
-    }
-
-    /// Bytes allocated (`[memory]`): the per-entry index (run starts and
-    /// cell masks), the live slots, the dead ones (runs moved away), the
-    /// room past them.
-    pub fn bytes(&self) -> [usize; 4] {
-        let slot = std::mem::size_of::<StateInfo>();
-        [self.starts.capacity() * 4 + self.masks.capacity() * 8, (self.slots.len() - self.dead) * slot, self.dead * slot, (self.slots.capacity() - self.slots.len()) * slot]
-    }
-}
-
-/// Of the next `n` hulls of `h`, how many are full (`StateInfo::is_full`).
-fn hulls_full(h: &mut std::slice::Iter<Hull>, n: usize) -> usize {
-    h.take(n).filter(|x| x.x.is_full() && x.y.is_full()).count()
-}
+/// Blocks a region's run of an `upsert_all` takes (a big region's runs are
+/// upserted apart, on every thread: a big room's biggest region holds
+/// ~2000 blocks).
+const RUN_BLOCKS: usize = 64;
 
 /// The visited set: the shapes (index -> hash, in the order the tree
-/// numbered them), the states (`RegionSet`, by `storage::region_of`), the
-/// key space their keys are in (read-only during a wave), and per state its
-/// layer and hull (per region, `RegionInfos`).
+/// numbered them), the states (`RegionSet` of packed tables, by
+/// `storage::region_of`), the key space their keys are in (read-only during
+/// a wave).
 #[derive(Clone)]
 pub struct VisitedSet {
     pub geo: Geometry,
@@ -228,12 +37,11 @@ pub struct VisitedSet {
     shapes: Vec<u64>,
     shape_idx: FxHashMap<u64, u32>,
     set: RegionSet,
-    info: FxHashMap<u32, RegionInfos>,
 }
 
 impl VisitedSet {
     pub fn new(geo: Geometry) -> Self {
-        VisitedSet { geo, keys: KeySpace::new(), shapes: Vec::new(), shape_idx: FxHashMap::default(), set: RegionSet::default(), info: FxHashMap::default() }
+        VisitedSet { geo, keys: KeySpace::new(), shapes: Vec::new(), shape_idx: FxHashMap::default(), set: RegionSet::default() }
     }
 
     pub fn shape_index(&self, shape: u64) -> Option<u32> {
@@ -277,206 +85,118 @@ impl VisitedSet {
         self.shape_index(shape).map(|s| region_of(&self.geo, s, slot))
     }
 
+    /// Region `region`'s packed table, if any state is held there.
     #[inline]
     pub fn table(&self, region: u32) -> Option<&RegionTable> {
         self.set.table(region)
     }
 
-    /// The state's entry, if `(shape, slot, key)` has one.
-    #[inline]
-    pub fn find(&self, shape: u64, slot: u32, k: Key) -> Option<(u32, u32)> {
-        let r = self.region(shape, slot)?;
-        Some((r, self.table(r)?.find(k)?))
-    }
-
-    /// MERGE the frozen set `new` (a frame's states, of numbered shapes) in:
-    /// per region its entries ORed in, made where absent; the regions on
-    /// `threads` threads. Returns the cells that were held already (0: the
-    /// set and `new` disjoint, as a frame's new states are).
-    pub fn merge(&mut self, new: &RegionSet, threads: usize) -> Result<u64> {
-        for (region, _) in new.tables() {
-            anyhow::ensure!(((region / self.geo.slots) as usize) < self.shapes.len(), "a merged region {region} of no numbered shape");
-            self.set.table_mut(*region, RegionTable::new);
-        }
-        let mut work: Vec<std::sync::Mutex<(&mut RegionTable, &RegionTable)>> = Vec::with_capacity(new.tables().len());
-        let mut theirs = new.tables().iter().peekable();
-        for (r, t) in self.set.tables_mut() {
-            if let Some((_, n)) = theirs.next_if(|x| x.0 == *r) {
-                work.push(std::sync::Mutex::new((t, n)));
-            }
-        }
-        let held = super::wave::par_map(&work, threads, |w| {
-            let mut g = w.lock().expect("a merge");
-            let (t, n) = &mut *g;
-            let before = t.states();
-            t.merge(n, |_, _| {});
-            before + n.states() - t.states()
-        });
-        Ok(held.into_iter().sum())
-    }
-
-    /// The layer and hull of the state at cell `local` of entry `e` of
-    /// region `region`'s table (`None`: its hull is FULL, or no state).
-    #[inline]
-    pub fn info(&self, region: u32, e: u32, local: u32) -> Option<StateInfo> {
-        self.info.get(&region)?.get(e, local)
-    }
-
-    /// Region `region`'s layers and hulls (`RegionInfos::get`), if any.
-    #[inline]
-    pub fn region_infos(&self, region: u32) -> Option<&RegionInfos> {
-        self.info.get(&region)
-    }
-
-    /// The layer and hull of state `(region, key, local)` (`None`: full, or
-    /// no state).
+    /// The layer and hull of state `(region, key, local)` (`None`: full,
+    /// or no state; a reader's single lookup).
     pub fn state(&self, region: u32, key: Key, local: u32) -> Option<StateInfo> {
-        let e = self.table(region)?.find(key)?;
-        self.info(region, e, local)
+        self.table(region)?.lookup_info(key, local)?.1
     }
 
-    /// `states` (sorted by key and cell, held by the set: checked) put in
-    /// `m`, an entry at a time.
-    fn put_all(t: &RegionTable, m: &mut RegionInfos, region: u32, states: &mut dyn Iterator<Item = (Key, u32, StateInfo)>) -> Result<()> {
-        let mut batch: Vec<(u32, StateInfo)> = Vec::new();
-        let mut cur: Option<(Key, u32)> = None;
-        for (key, local, i) in states {
-            if cur.is_none_or(|c| c.0 != key) {
-                if let Some((_, e)) = cur {
-                    m.set_reclaiming(e, &batch, 3);
+    /// UPSERT per region its changes (`set::Change`, sorted by key and
+    /// cell, distinct): regions made where absent (of numbered shapes); a
+    /// big region's runs of `RUN_BLOCKS` blocks apart, with the changes
+    /// between their first keys; every run on `threads` threads, the
+    /// biggest first.
+    pub fn upsert_all(&mut self, changes: Vec<(u32, Vec<Change>)>, threads: usize) -> Result<Upserted> {
+        type Run = (usize, std::ops::Range<usize>, Vec<Block>);
+        let mut runs: Vec<Run> = Vec::new();
+        let mut regions: Vec<u32> = Vec::with_capacity(changes.len());
+        for (i, (region, ch)) in changes.iter().enumerate() {
+            anyhow::ensure!(((region / self.geo.slots) as usize) < self.shapes.len(), "an upserted region {region} of no numbered shape");
+            regions.push(*region);
+            let blocks = self.set.table_mut(*region, RegionTable::packed).take_blocks();
+            // Runs of blocks, each with the changes from its first key to
+            // the next run's (the first from the start, the last to the end).
+            let groups: Vec<Vec<Block>> = {
+                let mut g: Vec<Vec<Block>> = Vec::new();
+                for b in blocks {
+                    if g.last().is_none_or(|x| x.len() == RUN_BLOCKS) {
+                        g.push(Vec::with_capacity(RUN_BLOCKS));
+                    }
+                    g.last_mut().expect("pushed").push(b);
                 }
-                batch.clear();
-                let e = t.find(key).ok_or_else(|| anyhow::anyhow!("region {region}: a hull for a state the set lacks"))?;
-                cur = Some((key, e));
+                g
+            };
+            if groups.is_empty() {
+                runs.push((i, 0..ch.len(), Vec::new()));
+                continue;
             }
-            let (_, e) = cur.expect("set above");
-            anyhow::ensure!(t.mask(e) >> local & 1 == 1, "region {region}: a hull for a state the set lacks");
-            anyhow::ensure!(batch.last().is_none_or(|b| b.0 < local), "region {region}: hulls not by key and cell");
-            batch.push((local, i));
+            let starts: Vec<usize> = std::iter::once(0)
+                .chain(groups.iter().skip(1).map(|g| ch.partition_point(|c| c.key < g[0].first())))
+                .chain(std::iter::once(ch.len()))
+                .collect();
+            for (k, g) in groups.into_iter().enumerate() {
+                runs.push((i, starts[k]..starts[k + 1], g));
+            }
         }
-        if let Some((_, e)) = cur {
-            m.set_reclaiming(e, &batch, 3);
-        }
-        Ok(())
-    }
-
-    /// SET layers and hulls, many regions at once, on `threads` threads:
-    /// per group `(region, g)` (distinct regions) `each(g)` its states,
-    /// sorted by key and cell.
-    #[allow(clippy::type_complexity)]
-    pub fn set_infos<G: Sync>(&mut self, groups: &[(u32, G)], each: impl Fn(&G) -> Vec<(Key, u32, StateInfo)> + Sync, threads: usize) -> Result<()> {
-        for (region, _) in groups {
-            self.info.entry(*region).or_default();
-        }
-        let want: FxHashMap<u32, usize> = groups.iter().enumerate().map(|(i, g)| (g.0, i)).collect();
-        let set = &self.set;
-        let work: Vec<std::sync::Mutex<(u32, &mut RegionInfos, usize)>> = self.info.iter_mut().filter_map(|(r, m)| want.get(r).map(|&i| std::sync::Mutex::new((*r, m, i)))).collect();
-        let done = super::wave::par_map(&work, threads, |w| -> Result<()> {
-            let mut g = w.lock().expect("a region's hulls");
-            let (region, m, i) = &mut *g;
-            let t = set.table(*region).ok_or_else(|| anyhow::anyhow!("region {region}: no table for its states' hulls"))?;
-            Self::put_all(t, m, *region, &mut each(&groups[*i].1).into_iter())
+        runs.sort_by_cached_key(|r| std::cmp::Reverse(r.1.len() + r.2.len() * super::set::PACK_ENTRIES));
+        let work: Vec<std::sync::Mutex<Option<Run>>> = runs.into_iter().map(|r| std::sync::Mutex::new(Some(r))).collect();
+        let done = super::wave::par_map(&work, threads, |w| -> Result<(usize, usize, Vec<Block>, Upserted)> {
+            let (i, rg, blocks) = w.lock().expect("a run").take().expect("a run taken once");
+            let start = rg.start;
+            let (out, n) = super::set::upsert_blocks(blocks, &changes[i].1[rg])?;
+            Ok((i, start, out, n))
         });
-        done.into_iter().collect()
-    }
-
-    /// Every region's hull store without dead slots or spare room (a
-    /// resume's end: its replay reclaims at a third, `RegionInfos::set` at
-    /// an eighth).
-    pub fn tighten(&mut self, threads: usize) {
-        let work: Vec<std::sync::Mutex<&mut RegionInfos>> = self.info.values_mut().map(std::sync::Mutex::new).collect();
-        super::wave::par_map(&work, threads, |m| m.lock().expect("a region's hulls").tighten());
+        // Each region's runs back in order.
+        let mut parts: Vec<Vec<(usize, Vec<Block>)>> = (0..changes.len()).map(|_| Vec::new()).collect();
+        let mut total = Upserted::default();
+        for d in done {
+            let (i, start, out, n) = d?;
+            parts[i].push((start, out));
+            total += n;
+        }
+        for (region, mut p) in regions.into_iter().zip(parts) {
+            p.sort_by_key(|x| x.0);
+            *self.set.table_mut(region, RegionTable::packed) = RegionTable::of_blocks(p.into_iter().flat_map(|x| x.1).collect())?;
+        }
+        Ok(total)
     }
 
     /// The states with a layer and hull stored (not full).
-    pub fn infos(&self) -> usize {
-        self.info.values().map(|m| m.stored()).sum()
+    pub fn infos(&self) -> u64 {
+        self.set.tables().iter().map(|t| t.1.infos()).sum()
     }
 
-    /// A FRAME's states in, regions on `threads` threads (the biggest
-    /// first): per region (each once) its NEW entries (frozen, of a
-    /// numbered shape) with their hulls in its state order - merged in at
-    /// layer `layer` - and the states whose hull grew (held already; sorted
-    /// by state) with their new hulls and their entries in the region's
-    /// table (`seal`'s: entries keep their places). Returns the new cells
-    /// held already (0: the frame's new states are new).
+    /// A FRAME's states in, on `threads` threads: per region (each once)
+    /// its NEW entries (a plain table, of a numbered shape) with their
+    /// hulls in its state order - in at layer `layer` - and the states
+    /// whose hull grew (held already; sorted by state) with their new
+    /// hulls. Returns the new states held already (0: the frame's new
+    /// states are new).
     #[allow(clippy::type_complexity)]
-    pub fn absorb(&mut self, parts: &[(u32, &RegionTable, &[Hull], &[super::wave::Old], &[u32])], layer: u16, threads: usize) -> Result<u64> {
-        for &(region, ..) in parts {
-            anyhow::ensure!(((region / self.geo.slots) as usize) < self.shapes.len(), "an absorbed region {region} of no numbered shape");
-            self.set.table_mut(region, RegionTable::new);
-            self.info.entry(region).or_default();
-        }
-        let want: FxHashMap<u32, usize> = parts.iter().enumerate().map(|(i, p)| (p.0, i)).collect();
-        let mut tables: FxHashMap<u32, &mut RegionTable> = self.set.tables_mut().iter_mut().filter(|(r, _)| want.contains_key(r)).map(|(r, t)| (*r, t)).collect();
-        let mut work: Vec<std::sync::Mutex<(&mut RegionTable, &mut RegionInfos, usize)>> = self
-            .info
-            .iter_mut()
-            .filter_map(|(r, m)| want.get(r).map(|&i| std::sync::Mutex::new((tables.remove(r).expect("a table made above"), m, i))))
-            .collect();
-        // The biggest regions first: the last one started bounds the wall.
-        let size = |w: &std::sync::Mutex<(&mut RegionTable, &mut RegionInfos, usize)>| {
-            let i = w.lock().expect("a region").2;
-            parts[i].1.len() + parts[i].3.len()
-        };
-        work.sort_by_cached_key(|w| std::cmp::Reverse(size(w)));
-        let held = super::wave::par_map(&work, threads, |w| -> Result<u64> {
-            let mut g = w.lock().expect("a region");
-            let (t, m, i) = &mut *g;
-            let (region, new, hulls, grown, grown_at) = parts[*i];
-            let before = t.states();
-            let mut entries: Vec<u32> = Vec::with_capacity(new.len());
-            t.merge(new, |_, e| entries.push(e));
-            let held = before + new.states() - t.states();
-            // Room for the runs the new states move or make (their entries'
-            // stored cells and the new ones not full), and for a grown
-            // state's entry that loses a cell (its hull now full), exactly.
-            let mut room = 0usize;
+    pub fn absorb(&mut self, parts: &[(u32, &RegionTable, &[Hull], &[super::wave::Old])], layer: u16, threads: usize) -> Result<u64> {
+        let changes: Vec<(u32, Vec<Change>)> = super::wave::par_map(parts, threads, |&(region, new, hulls, grown)| -> Result<(u32, Vec<Change>)> {
+            anyhow::ensure!(new.states() == hulls.len() as u64, "region {region}: {} new states, {} hulls", new.states(), hulls.len());
+            // The new states and the grown ones, merged by key and cell.
+            let mut fresh: Vec<Change> = Vec::with_capacity(hulls.len());
             let mut h = hulls.iter();
-            for ((_, mask), &e) in new.iter().zip(&entries) {
-                let stored = mask.count_ones() as usize - hulls_full(&mut h, mask.count_ones() as usize);
-                if stored > 0 {
-                    room += m.mask(e).count_ones() as usize + stored;
+            for (key, mask) in new.iter() {
+                for cell in super::layer::bits(mask) {
+                    let hull = *h.next().expect("counted above");
+                    fresh.push(Change { key, cell: cell as u8, info: Some(StateInfo { hull, layer }), new: true });
                 }
             }
-            for (o, &e) in grown.iter().zip(grown_at) {
-                if o.hull.x.is_full() && o.hull.y.is_full() {
-                    room += m.mask(e).count_ones() as usize;
+            let mut out: Vec<Change> = Vec::with_capacity(fresh.len() + grown.len());
+            let mut g = grown.iter().map(|o| Change { key: o.sk.key, cell: o.sk.local, info: Some(StateInfo { hull: o.hull, layer: o.layer }), new: false }).peekable();
+            for c in fresh {
+                while g.peek().is_some_and(|x| (x.key, x.cell) < (c.key, c.cell)) {
+                    out.push(g.next().expect("peeked"));
                 }
+                anyhow::ensure!(g.peek().is_none_or(|x| (x.key, x.cell) != (c.key, c.cell)), "region {region}: a state new and grown at once");
+                out.push(c);
             }
-            m.reserve(t.len(), room);
-            let mut h = hulls.iter();
-            let mut batch: Vec<(u32, StateInfo)> = Vec::new();
-            for ((_, mask), &e) in new.iter().zip(&entries) {
-                batch.clear();
-                let mut c = mask;
-                while c != 0 {
-                    let local = c.trailing_zeros();
-                    c &= c - 1;
-                    batch.push((local, StateInfo { hull: *h.next().ok_or_else(|| anyhow::anyhow!("region {region}: fewer hulls than new states"))?, layer }));
-                }
-                m.set(e, &batch);
-            }
-            anyhow::ensure!(h.next().is_none(), "region {region}: more hulls than new states");
-            // The grown states, an entry at a time, at their entries.
-            anyhow::ensure!(grown.len() == grown_at.len(), "region {region}: {} grown states, {} entries", grown.len(), grown_at.len());
-            let mut a = 0usize;
-            while a < grown.len() {
-                let e = grown_at[a];
-                let b = a + grown[a..].iter().zip(&grown_at[a..]).take_while(|(o, &x)| x == e && o.sk.key == grown[a].sk.key).count();
-                anyhow::ensure!(t.key(e) == grown[a].sk.key, "region {region}: a grown state's entry holds another key");
-                batch.clear();
-                for o in &grown[a..b] {
-                    anyhow::ensure!(t.mask(e) >> o.sk.local & 1 == 1, "region {region}: a hull for a state the set lacks");
-                    anyhow::ensure!(batch.last().is_none_or(|x: &(u32, StateInfo)| x.0 < o.sk.local as u32), "region {region}: hulls not by key and cell");
-                    batch.push((o.sk.local as u32, StateInfo { hull: o.hull, layer: o.layer }));
-                }
-                m.set(e, &batch);
-                a = b;
-            }
-            Ok(held)
-        });
-        held.into_iter().sum()
+            out.extend(g);
+            anyhow::ensure!(out.windows(2).all(|w| (w[0].key, w[0].cell) < (w[1].key, w[1].cell)), "region {region}: grown states not by key and cell");
+            Ok((region, out))
+        })
+        .into_iter()
+        .collect::<Result<_>>()?;
+        Ok(self.upsert_all(changes, threads)?.held_new)
     }
 
     /// States held.
@@ -493,9 +213,9 @@ impl VisitedSet {
         self.set.entries()
     }
 
-    /// Bytes allocated: the set's, and the hulls'.
+    /// Bytes allocated.
     pub fn alloc_bytes(&self) -> usize {
-        self.set.alloc_bytes() + self.info.values().map(|m| m.alloc_bytes()).sum::<usize>()
+        self.set.alloc_bytes()
     }
 
     /// The stored hulls' and layers' statistics (`[memory]`, a diagnostic):
@@ -503,17 +223,15 @@ impl VisitedSet {
     /// states the most common 256, 4096 and 65536 hulls cover, distinct
     /// layers, and the entries whose stored states share one layer (of the
     /// entries with any).
-    pub fn hull_stats(&self, cap: usize) -> String {
+    pub fn hull_stats(&self, cap: usize) -> Result<String> {
         let mut by: FxHashMap<u64, u64> = FxHashMap::default();
         let (mut states, mut over, mut one_layer, mut entries) = (0u64, false, 0u64, 0u64);
-        let mut layers = [0u64; 1 << 16];
-        for m in self.info.values() {
-            for (e, &mask) in m.masks.iter().enumerate() {
-                let n = mask.count_ones() as usize;
-                if n == 0 {
-                    continue;
+        let mut layers = vec![0u64; 1 << 16];
+        for (_, t) in self.set.tables() {
+            t.for_each_packed(|_, _, _, run| {
+                if run.is_empty() {
+                    return;
                 }
-                let run = &m.slots[m.starts[e] as usize..m.starts[e] as usize + n];
                 entries += 1;
                 one_layer += run.iter().all(|i| i.layer == run[0].layer) as u64;
                 for i in run {
@@ -528,12 +246,12 @@ impl VisitedSet {
                         over = true;
                     }
                 }
-            }
+            })?;
         }
         let mut counts: Vec<u64> = by.values().copied().collect();
         counts.sort_unstable_by(|a, b| b.cmp(a));
         let top = |k: usize| counts.iter().take(k).sum::<u64>() as f64 / states.max(1) as f64 * 100.0;
-        format!(
+        Ok(format!(
             "{states} stored hulls: {}{} distinct, the top 256 cover {:.1}%, 4096 {:.1}%, 65536 {:.1}%; {} distinct layers; {one_layer} of {entries} entries hold one layer",
             if over { ">" } else { "" },
             by.len(),
@@ -541,28 +259,13 @@ impl VisitedSet {
             top(4096),
             top(65536),
             layers.iter().filter(|&&c| c > 0).count()
-        )
+        ))
     }
 
-    /// Its bytes by part (`[memory]`): the set's keys, masks, hash index and
-    /// lists; the hull store's entry index, live, dead and spare slots; the
-    /// key space.
+    /// Its bytes by part (`[memory]`): the packed blocks (keys, masks,
+    /// layers and hulls, zstd), the block and region lists, the key space.
     pub fn census(&self) -> Vec<(&'static str, usize)> {
         let s = self.set.bytes();
-        let i = self.info.values().fold([0usize; 4], |a, m| {
-            let b = m.bytes();
-            std::array::from_fn(|k| a[k] + b[k])
-        });
-        vec![
-            ("visited: keys", s[0]),
-            ("visited: cell masks", s[1]),
-            ("visited: hash index", s[2]),
-            ("visited: lists", s[3] + self.info.capacity() * (std::mem::size_of::<(u32, RegionInfos)>() + 1)),
-            ("hulls: entry index (run starts, cells)", i[0]),
-            ("hulls: live slots (hull 8 B + layer 2 B)", i[1]),
-            ("hulls: dead slots", i[2]),
-            ("hulls: spare room", i[3]),
-            ("key space", self.keys.alloc_bytes()),
-        ]
+        vec![("visited: packed blocks (keys, cells, layers, hulls)", s[0]), ("visited: block and region lists", s[1] + s[2]), ("key space", self.keys.alloc_bytes())]
     }
 }

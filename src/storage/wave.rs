@@ -439,7 +439,7 @@ pub fn run_wave(engine: &dyn FrameStep, front: &Frontier, cx: WaveCtx) -> Result
                         if let Some(job) = pipe.pop_job() {
                             let t = Instant::now();
                             let tp = phases::start(s.diag.phases);
-                            let rcx = RegionCtx { frame, visited, record, remaps: &job.remaps, new_xfers: xfers_before as u32 };
+                            let rcx = RegionCtx { frame, record, remaps: &job.remaps, new_xfers: xfers_before as u32 };
                             let cs: Vec<&Chunk> = job.chunks.iter().collect();
                             let mut route = job.state.lock().expect("a route");
                             let r = super::route::run_route(&mut route, job.slice, &cs, &rcx, sc);
@@ -804,7 +804,7 @@ pub fn run_wave(engine: &dyn FrameStep, front: &Frontier, cx: WaveCtx) -> Result
     // Into the visited set: the new states (new: none held) with their
     // layer and hull, the grown states' hulls.
     let layer16 = u16::try_from(frame).map_err(|_| anyhow!("frame {frame}: past a u16 layer"))?;
-    let parts: Vec<(u32, &super::set::RegionTable, &[Hull], &[Old], &[u32])> = new.iter().map(|sl| (sl.region, &sl.table, sl.hulls.as_slice(), sl.grown.as_slice(), sl.grown_at.as_slice())).collect();
+    let parts: Vec<(u32, &super::set::RegionTable, &[Hull], &[Old])> = new.iter().map(|sl| (sl.region, &sl.table, sl.hulls.as_slice(), sl.grown.as_slice())).collect();
     let held = visited.absorb(&parts, layer16, s.threads())?;
     drop(parts);
     ensure!(held == 0, "frame {frame}: {held} of the next layer's states the visited set held already");
@@ -940,11 +940,7 @@ fn mark_filter(sealed: &mut [super::route::Sealed], f: &crate::frame::MarkFilter
             k += 1;
             ok[k - 1]
         });
-        let mut k = n_new;
-        sl.grown_at.retain(|_| {
-            k += 1;
-            ok[k - 1]
-        });
+
     }
     Ok(())
 }
@@ -1502,11 +1498,11 @@ pub fn seed(visited: &mut VisitedSet, blocks: &[Block], level: crate::abstractio
         i = j;
     }
     let hulls = vec![start; next.states() as usize];
-    let mut parts: Vec<(u32, &super::set::RegionTable, &[Hull], &[Old], &[u32])> = Vec::new();
+    let mut parts: Vec<(u32, &super::set::RegionTable, &[Hull], &[Old])> = Vec::new();
     let mut at = 0usize;
     for (region, t) in next.set.tables() {
         let n = t.states() as usize;
-        parts.push((*region, t, &hulls[at..at + n], &[], &[]));
+        parts.push((*region, t, &hulls[at..at + n], &[]));
         at += n;
     }
     let held = visited.absorb(&parts, 0, s.threads())?;

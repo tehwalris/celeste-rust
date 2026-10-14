@@ -40,9 +40,10 @@ pub const NO_XFER: u32 = u32::MAX;
 const PROV: u32 = u32::MAX;
 
 /// A route's TOUCHED states this frame: per key pushed into (one probe of
-/// `index` a key, as the dedup's), the cells pushed and the RUN of their
-/// hulls so far in `slots` (by cell; a run moves to the end when its key
-/// gains a cell), and what the visited set holds of the key.
+/// `index` a key), the cells pushed and the RUN of their hulls so far in
+/// `slots` (by cell; a run moves to the end when its key gains a cell).
+/// What the visited set holds of them is read at the frame's end (`seal`,
+/// the keys sorted against the region's packed table).
 #[derive(Default)]
 pub struct Touched {
     index: rustc_hash2::FxHashMap<Key, u32>,
@@ -51,28 +52,22 @@ pub struct Touched {
     states: usize,
 }
 
-/// A touched key: its cells, its run's start, and its entry in the visited
-/// set's table with the cells held there (none: 0).
+/// A touched key: its cells and its run's start.
 #[derive(Clone, Copy, Debug)]
 pub struct TouchedKey {
     pub key: Key,
     pub cells: u64,
     pub start: u32,
-    pub entry: u32,
-    pub held: u64,
 }
 
 impl Touched {
-    /// Merge `cells` (by cell, ascending: `(cell, hull)`) into key `key`'s;
-    /// a key new to the route is looked up (`held`: its visited entry and
-    /// cells).
+    /// Merge `cells` (by cell, ascending: `(cell, hull)`) into key `key`'s.
     #[inline]
-    pub fn push(&mut self, key: Key, cells: &[(u8, HullAcc)], held: impl FnOnce(Key) -> (u32, u64)) {
+    pub fn push(&mut self, key: Key, cells: &[(u8, HullAcc)]) {
         let n = self.keys.len() as u32;
         let e = *self.index.entry(key).or_insert(n);
         if e == n {
-            let (entry, held) = held(key);
-            self.keys.push(TouchedKey { key, cells: 0, start: self.slots.len() as u32, entry, held });
+            self.keys.push(TouchedKey { key, cells: 0, start: self.slots.len() as u32 });
         }
         let TouchedKey { cells: mask, start, .. } = self.keys[e as usize];
         let add = cells.iter().fold(0u64, |m, x| m | 1u64 << x.0);
@@ -238,9 +233,6 @@ impl RouteState {
 /// What the region phase reads besides its route.
 pub struct RegionCtx<'a> {
     pub frame: u32,
-    /// The visited set (read only until the frame's end): a touched key's
-    /// entry looked up once, here, not at the frame's end.
-    pub visited: &'a VisitedSet,
     /// Are edges recorded?
     pub record: bool,
     /// Per worker, its local transfer ids' global ones.
@@ -533,8 +525,6 @@ pub fn run_route(st: &mut RouteState, slice: u32, chunks: &[&Chunk], cx: &Region
     sc.s_list.clear();
     sc.t_loc.clear();
     sc.t_keys.clear();
-    let vt = cx.visited.region(st.shape, st.slot).and_then(|r| cx.visited.table(r));
-    let held = |k: Key| if is_provisional(k) { (0, 0) } else { vt.and_then(|t| t.find(k).map(|e| (e, t.mask(e)))).unwrap_or((0, 0)) };
     for c in chunks {
         // THE PUSHES.
         let mut i = 0usize;
@@ -550,7 +540,7 @@ pub fn run_route(st: &mut RouteState, slice: u32, chunks: &[&Chunk], cx: &Region
             if is_provisional(key) {
                 st.prov_keys.insert(key);
             }
-            st.touched.push(key, &cells, held);
+            st.touched.push(key, &cells);
         }
         st.pushes += c.pushes.len() as u64;
         if !record {
@@ -627,8 +617,6 @@ pub struct Sealed {
     pub table: RegionTable,
     pub hulls: Vec<Hull>,
     pub grown: Vec<super::wave::Old>,
-    /// Per grown state its entry in the visited set's region table.
-    pub grown_at: Vec<u32>,
     /// The states it compared, and its steps' walls: the touched keys
     /// sorted, each compared with the visited set, the new table
     /// (`--phases`' `[seal]`).
@@ -685,24 +673,17 @@ pub fn seal(st: &mut RouteState, region: u32, frame: u32, finals: &FxHashMap<Key
     let (touched, accs) = std::mem::take(&mut st.touched).into_sorted(final_key)?;
     mark(0);
     let (mut keys, mut masks, mut hulls): (Vec<Key>, Vec<u64>, Vec<Hull>) = (Vec::new(), Vec::new(), Vec::new());
-    let (mut grown, mut grown_at): (Vec<super::wave::Old>, Vec<u32>) = (Vec::new(), Vec::new());
+    let mut grown: Vec<super::wave::Old> = Vec::new();
     let mut held_by_age = [[0u64; 7]; 2];
-    let infos = visited.region_infos(region);
-    // The touched keys are by key, their runs and visited entries anywhere:
-    // each fetched ahead (`AHEAD` keys), its visited run once its entry is in.
-    const AHEAD: usize = 16;
-    for (i, &TouchedKey { key, cells, start, entry: ve, held }) in touched.iter().enumerate() {
-        if let Some(k) = touched.get(i + AHEAD) {
-            super::prefetch(accs.as_ptr().wrapping_add(k.start as usize));
-            if let (Some(m), true) = (infos, k.held != 0) {
-                m.prefetch_entry(k.entry);
-            }
-        }
-        if let (Some(m), Some(k)) = (infos, touched.get(i + AHEAD / 2)) {
-            if k.held != 0 {
-                m.prefetch_run(k.entry);
-            }
-        }
+    // The region's packed table walked with the sorted keys: each block
+    // decoded once, when a key falls in it.
+    let mut cursor = visited.table(region).map(RegionTable::cursor);
+    for &TouchedKey { key, cells, start } in &touched {
+        let entry = match cursor.as_mut() {
+            Some(c) => c.seek(key)?,
+            None => None,
+        };
+        let held = entry.as_ref().map_or(0, |e| e.mask);
         let fresh = cells & !held;
         if fresh != 0 {
             keys.push(key);
@@ -715,7 +696,7 @@ pub fn seal(st: &mut RouteState, region: u32, frame: u32, finals: &FxHashMap<Key
                 continue;
             }
             // No hull stored: it is FULL, and grows no more.
-            let Some(StateInfo { hull, layer }) = infos.and_then(|m| m.get(ve, c)) else {
+            let Some(StateInfo { hull, layer }) = entry.as_ref().and_then(|e| e.info(c)) else {
                 held_by_age[0][0] += 1;
                 continue;
             };
@@ -733,7 +714,6 @@ pub fn seal(st: &mut RouteState, region: u32, frame: u32, finals: &FxHashMap<Key
             let h = a.hull().expect("a hull holds points");
             if h != hull {
                 grown.push(super::wave::Old { sk: Sk { region, key, local: c as u8 }, layer, hull: h, was: hull });
-                grown_at.push(ve);
                 held_by_age[1][age(layer)] += 1;
             }
         }
@@ -742,7 +722,7 @@ pub fn seal(st: &mut RouteState, region: u32, frame: u32, finals: &FxHashMap<Key
     let table = RegionTable::from_sorted(&keys, &masks)?;
     mark(2);
     let waited = (st.prov.len(), st.prov.iter().map(|x| x.1.bundles as u64).sum());
-    Ok(Sealed { region, table, hulls, grown, grown_at, touched: n_touched, t, waited, held_by_age })
+    Ok(Sealed { region, table, hulls, grown, touched: n_touched, t, waited, held_by_age })
 }
 
 /// A job's bundles that WAITED (`RouteState::prov`), decoded and encoded

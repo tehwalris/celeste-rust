@@ -43,14 +43,6 @@ pub mod wave;
 
 use crate::search::pos_graph::{GRID, NO_CELL};
 
-/// A hint that `p`'s cache line is read soon (a loop over random places
-/// fetches the ones some iterations ahead while it works on this one).
-#[inline(always)]
-pub(crate) fn prefetch<T>(p: *const T) {
-    // SAFETY: a prefetch is a hint: it never faults, whatever the address.
-    unsafe { core::arch::x86_64::_mm_prefetch::<{ core::arch::x86_64::_MM_HINT_T0 }>(p as *const i8) }
-}
-
 /// The storage regions: `side` x `side` cells (`GEOMETRY`: 8; the tests
 /// also check 16), aligned at 0 as the kernels' `RegionGrid::of` (`div_euclid`; the
 /// grid's origin -64 is a multiple of both), each nested in one kernel

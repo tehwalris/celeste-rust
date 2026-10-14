@@ -709,6 +709,9 @@ pub fn print_memory(when: &str, visited: &super::visited::VisitedSet, new: &supe
     eprintln!("[memory] {:<44} {:>9.3} {:>9.2}", "counted", gb(total), total as f64 / v);
     eprintln!("[memory] {:<44} {:>9.3} {:>9.2}", "anonymous resident (RssAnon)", before, before * 1e9 / v);
     eprintln!("[memory] {:<44} {:>9.3} {:>9.2}", "  after mi_collect", anon, anon * 1e9 / v);
-    eprintln!("[memory] hulls: {}", visited.hull_stats(1 << 24));
+    match visited.hull_stats(1 << 24) {
+        Ok(h) => eprintln!("[memory] hulls: {h}"),
+        Err(e) => eprintln!("[memory] hulls: {e:#}"),
+    }
     eprintln!("[memory] {:<44} {:>9.3} {:>9.2}", "  not counted (kernels, allocator, rest)", anon - gb(total), (anon * 1e9 - total as f64) / v);
 }
