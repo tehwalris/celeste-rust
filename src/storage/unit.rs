@@ -269,7 +269,7 @@ pub struct UnitSink<'a> {
     /// this frame is this worker's LOCAL id `l`, named `first_new + l` (the
     /// gather gives it its global id: the region phase's remaps). Only the
     /// new pairs cost the worker anything (each worker held every pair it
-    /// met: ~130 B a pair a worker).
+    /// met: ~170 B a pair a worker).
     base: &'a super::edges::XferTable,
     first_new: u32,
     xfer_ids: FxHashMap<crate::search::arc_edges::Pair, u32>,
