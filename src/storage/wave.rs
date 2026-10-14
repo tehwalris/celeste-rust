@@ -406,14 +406,14 @@ pub fn run_wave(engine: &dyn FrameStep, front: &Frontier, cx: WaveCtx) -> Result
     // slice's last unit GATHERS the slices that are complete, in order:
     // their transfers' global ids, new routes, their chunks as jobs. Region
     // work overlaps the next slices' kernels; no barrier but the frame's end.
-    let spent: Vec<(std::time::Duration, std::time::Duration)> = std::thread::scope(|scope| {
+    let spent: Vec<(std::time::Duration, std::time::Duration, [u64; 4])> = std::thread::scope(|scope| {
         let handles: Vec<_> = sinks
             .iter_mut()
             .zip(scratch.iter_mut())
             .map(|(sink, sc)| {
                 let (units, pipe, slice_of, slices, routes, shapes, starts, hulls, out_blocks, repushed) = (&units, &pipe, &slice_of, &slices, &routes, &shapes, &starts, &front.hulls, &out_blocks, &repushed);
                 let visited: &VisitedSet = visited;
-                std::thread::Builder::new().stack_size(WORKER_STACK).spawn_scoped(scope, move || -> Result<(std::time::Duration, std::time::Duration)> {
+                std::thread::Builder::new().stack_size(WORKER_STACK).spawn_scoped(scope, move || -> Result<(std::time::Duration, std::time::Duration, [u64; 4])> {
                     crate::compiled::asm_kernel::set_thread_stack(WORKER_STACK);
                     // Any way out of this worker but the end of the frame -
                     // an error returned, a panic - stops the others.
@@ -508,7 +508,7 @@ pub fn run_wave(engine: &dyn FrameStep, front: &Frontier, cx: WaveCtx) -> Result
                     }
                     crate::compiled::dispatch::fold_hits();
                     stop.1 = true;
-                    Ok((busy, in_regions))
+                    Ok((busy, in_regions, rs.read))
                 })
                 .expect("spawn wave worker")
             })
@@ -535,6 +535,20 @@ pub fn run_wave(engine: &dyn FrameStep, front: &Frontier, cx: WaveCtx) -> Result
         crate::metrics::mem_phase(&format!("f{frame} units and region jobs"));
     }
     st.repush_edges = repushed.into_inner();
+    if s.diag.phases && !front.old.is_empty() {
+        let r = spent.iter().fold([0u64; 4], |a, w| std::array::from_fn(|k| a[k] + w.2[k]));
+        eprintln!(
+            "[repush] f{frame}: {} old states in {} units read {} out blocks ({:.1} MB raw), {} entries in them, {} read ({:.1}%), {} edges looked at",
+            st.old_in,
+            units.len() - n_kernel,
+            r[0],
+            r[1] as f64 / 1e6,
+            r[2],
+            r[3],
+            100.0 * r[3] as f64 / r[2].max(1) as f64,
+            st.repush_edges
+        );
+    }
     let busy: std::time::Duration = spent.iter().map(|w| w.0).sum();
     st.t_regions = spent.iter().map(|w| w.1).sum();
     st.t_wave = t_units;
@@ -935,6 +949,9 @@ struct RepushScratch {
     late: Vec<Option<u64>>,
     /// Pushes by (hull, last pushed hull, the block's transfer index).
     cache: crate::search::hull::PushCache,
+    /// Out blocks read, their raw bytes, their entries, the entries
+    /// re-pushed (`--phases`' `[repush]`).
+    read: [u64; 4],
 }
 
 /// ONE RE-PUSH UNIT (module doc): old states `old` of one layer (whole
@@ -963,6 +980,7 @@ fn run_repush(u: u32, old: &[Old], outs: &super::out::OutStore, sink: &mut UnitS
     let entry = Cell::new((0usize, 0u64));
     // A bundle's edges out of old states: (source cell, target cell).
     let mut pairs_of = [(0u8, 0u8); 64];
+    let wanted = Cell::new(0u64);
     for bi in file.blocks(lo, hi) {
         // A block none of the unit's states is in is not read.
         let (bf, bl) = file.range(bi);
@@ -972,6 +990,9 @@ fn run_repush(u: u32, old: &[Old], outs: &super::out::OutStore, sink: &mut UnitS
         }
         file.block(bi, dec, &mut sc.raw)?;
         let blk = super::out::Block::open(&sc.raw)?;
+        sc.read[0] += 1;
+        sc.read[1] += sc.raw.len() as u64;
+        sc.read[2] += blk.len() as u64;
         let routes: Vec<u32> = blk.routes.iter().map(|&(shape, slot)| sink.route(shape, slot)).collect();
         let pairs: Vec<(crate::search::arcs::Transfer, crate::search::arcs::Transfer)> = blk.pairs.iter().map(|p| (p.0.transfer(), p.1.transfer())).collect();
         sc.t_of.clear();
@@ -991,6 +1012,7 @@ fn run_repush(u: u32, old: &[Old], outs: &super::out::OutStore, sink: &mut UnitS
                 if c < old.len() && (old[c].sk.region, old[c].sk.key) == (region, key) {
                     let cells = old[c..].iter().take_while(|o| (o.sk.region, o.sk.key) == (region, key)).fold(0u64, |m, o| m | 1u64 << o.sk.local);
                     entry.set((c, cells));
+                    wanted.set(wanted.get() + 1);
                     true
                 } else {
                     false
@@ -1066,6 +1088,7 @@ fn run_repush(u: u32, old: &[Old], outs: &super::out::OutStore, sink: &mut UnitS
         )?;
         ensure!(!bad, "re-push unit {u}: an out block's bundle names a target or transfer past its tables, or a source cell outside its entry's region");
     }
+    sc.read[3] += wanted.get();
     sink.repush_chunks(&sc.accs.targets, &sc.accs.runs, &sc.accs.slots);
     Ok(edges)
 }
