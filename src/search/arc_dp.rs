@@ -457,7 +457,7 @@ fn id_ranges(mut sample: Vec<Sk>, total: usize, parts: usize) -> Vec<Sk> {
 /// The first index at or past `j` whose key is not below `k`, in `v` sorted
 /// by key with every key before `j` below `k`: GALLOPING from `j`. A read
 /// walks each of a region's segments' sorted targets against the group's;
-/// stepping one by one cost every segment the whole group (26% of the mod
+/// stepping one by one cost every segment the whole group (26% of a big
 /// room's backward; 256k-lane slices cut its frames into 2.3x the segments).
 fn seek<A, B>(v: &[((u64, u64), A, B)], j: usize, k: (u64, u64)) -> usize {
     let mut lo = j;
@@ -968,7 +968,7 @@ impl<'a> Backward<'a> {
         self.max_cur = self.max_cur.max(self.cur.len());
         // The step's workers are gone: their heaps' freed pages go back now
         // (mimalloc reclaims an exited thread's segments lazily otherwise -
-        // ~3 GB held on the mod room).
+        // ~3 GB held on a big room).
         // SAFETY: mimalloc's documented API, callable from any thread.
         unsafe { libmimalloc_sys::mi_collect(true) };
         let d_merge = t0.elapsed();

@@ -210,7 +210,7 @@ pub struct RouteState {
     /// new this frame (no canonical id yet: `edges::XferTable::canonical`),
     /// per job (slice) a segment encoded with the provisional keys and ids,
     /// encoded again at the frame's end with the final ones (`seal`). Held
-    /// as zstd blocks, not bundles: the mod room's f53 (+95) held 103M into
+    /// as zstd blocks, not bundles: a big room's f53 (+95) held 103M into
     /// provisional targets, 5.8 GB as structs.
     pub prov: Vec<(u32, Segment)>,
     /// Its segments with their kind (0: a job's, 1: a job's bundles that
@@ -268,7 +268,7 @@ pub struct UnitBundles {
     t_idx: rustc_hash2::FxHashMap<Key, u32>,
     /// Emptied buckets, kept for the next units (their pages stay mapped),
     /// at most `SPARE_KEEP` bundles' room in all: kept without a bound,
-    /// every bucket grew to the largest route's (56 MB a worker on the mod
+    /// every bucket grew to the largest route's (56 MB a worker on a big
     /// room's f53); bound to 128k, the units regrew theirs (the reference
     /// frame's emit +4%).
     spare: Vec<Vec<(Key, Ub)>>,
@@ -443,7 +443,7 @@ pub struct Scratch {
     /// The job's targets: their names in the job (dense, as met) by key,
     /// and their keys - so the encoder's arrays are the job's size, not its
     /// region's (a region of 24M entries made each job's ranks 96 MB: 2 GB
-    /// over 16 workers on the mod room).
+    /// over 16 workers on a big room).
     t_loc: rustc_hash2::FxHashMap<Key, u32>,
     t_keys: Vec<Key>,
     e_of: Vec<u32>,
@@ -457,7 +457,7 @@ pub struct Scratch {
 }
 
 /// Bundles a worker's region scratch keeps room for between jobs: a
-/// heavy route's job is millions of bundles (the mod room's f69: 3.1M),
+/// heavy route's job is millions of bundles (a big room's f69: 3.1M),
 /// and every worker kept its largest job's buffers - 2.4 GB at 16
 /// threads. At 256k the big jobs' buffers were made again job after job
 /// (the reference frame's region phase +20%); at 1M not (~25 MB a worker).

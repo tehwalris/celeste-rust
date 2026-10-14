@@ -12,7 +12,7 @@
 //! Lean by construction, so every use gains alike:
 //!
 //!   * a key is stored in the bytes its table's largest key needs (`kw`, 1
-//!     to 16: the mod room's 67-bit keys take 9 B, a 40-bit shape's 5 B,
+//!     to 16: a big room's 67-bit keys take 9 B, a 40-bit shape's 5 B,
 //!     a table holding provisional keys 16); a wider key repacks the table;
 //!   * the index is open addressing over `u32` slots - the entry and, in the
 //!     bits the table's size leaves, a tag of the key's hash, so a probe
@@ -101,7 +101,7 @@ const CH: usize = 1 << CH_BITS;
 /// `CH` entries (the last one growing up to `CH`): a table that grows a few
 /// percent a frame - the visited set's - is never copied, and holds at
 /// most part of one chunk unused (a whole-array growth copied the visited
-/// set every frame, both copies alive: 3.4 GB at the mod room's f77).
+/// set every frame, both copies alive: 3.4 GB at a big room's f77).
 #[derive(Clone)]
 pub struct RegionTable {
     /// Bytes a key takes.

@@ -241,7 +241,7 @@ pub fn bench_storage(a: &BenchArgs) -> Result<()> {
     let emits: u64 = cap.units.iter().map(|u| u.emits).sum();
     eprintln!("[bench-storage] capture of f{frame}: {} units, {} streams, {emits} emissions, mapped in {:.1} s", cap.units.len(), cap.maps.len(), t.elapsed().as_secs_f64());
     let t = Instant::now();
-    let st = crate::frame::ForwardState::at(a.tree, frame - 1, true, a.level, a.settings)?;
+    let mut st = crate::frame::ForwardState::at(a.tree, frame - 1, true, a.level, a.settings)?;
     eprintln!("[bench-storage] the tree at f{} ({} states, {} states in) in {:.1} s", frame - 1, st.visited_len(), st.frontier().states(), t.elapsed().as_secs_f64());
     // Every shape's skeleton: the latest frame's that holds it.
     let tree = super::layer::Tree::open(a.tree, frame - 1)?;
@@ -259,7 +259,7 @@ pub fn bench_storage(a: &BenchArgs) -> Result<()> {
     for rep in 0..a.reps {
         let _ = std::fs::remove_dir_all(&scratch);
         let t = Instant::now();
-        let (wave, visited, xfers) = st.bench_wave(&engine, a.tree, Some(&scratch))?;
+        let (wave, visited, xfers) = st.bench_wave(&engine, a.tree, Some(&scratch), rep + 1 < a.reps)?;
         let all = t.elapsed();
         let w = &wave.stats;
         let (n, acc) = wave.next.content_fingerprint(&visited.keys, visited.shapes())?;
@@ -347,4 +347,190 @@ impl EdgeHashes {
         })?;
         Ok(parts.into_iter().fold((0, 0), |(n, acc), (m, a)| (n + m, acc.wrapping_add(a))))
     }
+}
+
+/// One `bench-frame` rep for its COST REPORT (`print_cost`): the frame's
+/// stats (`--phases` on: `FrameStats::phase_s`), its checkpoint's steps
+/// and the pos graph's wall (`--checkpoint`), the wave's workers, the
+/// whole rep's wall and the machine's load average at its start.
+pub struct Rep {
+    pub stats: crate::frame::FrameStats,
+    pub ckpt: Option<(crate::frame::Checkpointed, std::time::Duration)>,
+    pub workers: usize,
+    pub wall: std::time::Duration,
+    pub load: f64,
+}
+
+/// The 1-minute load average (`/proc/loadavg`; 0 unread).
+pub fn load_average() -> f64 {
+    std::fs::read_to_string("/proc/loadavg").ok().and_then(|s| s.split_whitespace().next()?.parse().ok()).unwrap_or(0.0)
+}
+
+/// A report line: its label, per rep its seconds (`None`: not measured),
+/// and the element its cost is per (name, count per rep).
+struct Line {
+    label: String,
+    secs: Vec<f64>,
+    per: Option<(&'static str, Vec<f64>)>,
+}
+
+/// THE COST REPORT of a frame's reps (`bench-frame`; plans/fwd-bench.md):
+/// the frame's wall split into the wave, the frame end and the
+/// checkpoint; the wave's WORKER-SECONDS by phase (`frame::phases`) with
+/// the idle share; the frame end's and the checkpoint's steps (walls, on
+/// one thread or all); each with its cost per element (ns a lane in, an
+/// emission, a re-pushed edge, a push, a new state, ...); the bytes
+/// written and the memory. Min and max over the reps (a shared machine:
+/// quote the min, with the load).
+pub fn print_cost(frame: u32, reps: &[Rep]) {
+    use crate::frame::phases as ph;
+    let Some(r0) = reps.first() else { return };
+    let col = |f: &dyn Fn(&Rep) -> f64| reps.iter().map(f).collect::<Vec<f64>>();
+    let dur = |d: std::time::Duration| d.as_secs_f64();
+    let mut lines: Vec<Line> = Vec::new();
+    let mut line = |label: &str, secs: Vec<f64>, per: Option<(&'static str, Vec<f64>)>| lines.push(Line { label: label.to_string(), secs, per });
+    let n = |f: fn(&crate::frame::FrameStats) -> f64| col(&|r| f(&r.stats));
+    let lanes_in = n(|s| s.lanes_in as f64);
+    let emissions = n(|s| s.lanes_raw as f64);
+    let new_states = n(|s| s.lanes_kept as f64);
+    let frontier_out = n(|s| (s.lanes_kept + s.grown) as f64);
+    let edges = n(|s| s.edge_records as f64);
+    let ckpt_total = |r: &Rep| r.ckpt.map_or(0.0, |(c, pos)| c.t.iter().map(|&d| dur(d)).sum::<f64>() + dur(pos));
+    line("frame (wave + end + checkpoint)", col(&|r| dur(r.stats.t_wave) + dur(r.stats.t_layer) + ckpt_total(r)), Some(("new state", new_states.clone())));
+    line("  wave (units and region jobs)", col(&|r| dur(r.stats.t_wave)), Some(("emission", emissions.clone())));
+    line("  frame end", col(&|r| dur(r.stats.t_layer)), Some(("new state", new_states.clone())));
+    if r0.ckpt.is_some() {
+        line("  checkpoint (files written, read back)", col(&ckpt_total), Some(("frontier state", frontier_out.clone())));
+    }
+    let wall_lines = lines.len();
+    // The wave's worker-seconds.
+    let p = |k: usize| col(&|r| r.stats.phase_s[k]);
+    let budget = col(&|r| dur(r.stats.t_wave) * r.workers as f64);
+    let idle = col(&|r| r.stats.wave_idle * dur(r.stats.t_wave) * r.workers as f64);
+    let unit_parts = [ph::SETUP, ph::PACK, ph::KERNEL, ph::EMIT];
+    let disjoint = [ph::DECODE, ph::UNIT, ph::END_UNIT, ph::OUT_BLOCKS, ph::REPUSH, ph::REGIONS, ph::GATHER];
+    let mut ws: Vec<Line> = Vec::new();
+    let mut wline = |label: &str, secs: Vec<f64>, per: Option<(&'static str, Vec<f64>)>| ws.push(Line { label: label.to_string(), secs, per });
+    wline("unit decode (rows from keys)", p(ph::DECODE), Some(("lane in", lanes_in.clone())));
+    wline("slice setup", p(ph::SETUP), Some(("lane in", lanes_in.clone())));
+    wline("pack", p(ph::PACK), Some(("lane in", lanes_in.clone())));
+    wline("kernel", p(ph::KERNEL), Some(("lane in", lanes_in.clone())));
+    wline("emit", p(ph::EMIT), Some(("emission", emissions.clone())));
+    wline("unit rest (engine.run less the above)", col(&|r| r.stats.phase_s[ph::UNIT] - unit_parts.iter().map(|&k| r.stats.phase_s[k]).sum::<f64>()), Some(("lane in", lanes_in.clone())));
+    wline("unit end (chunks, pushes, out rows)", p(ph::END_UNIT), Some(("emission", emissions.clone())));
+    wline("unit out blocks (zstd)", p(ph::OUT_BLOCKS), Some(("edge", edges.clone())));
+    wline("re-push units", p(ph::REPUSH), Some(("re-pushed edge", n(|s| s.repush_edges as f64))));
+    wline("region jobs", p(ph::REGIONS), Some(("push", n(|s| s.pushes as f64))));
+    wline("slice gather", p(ph::GATHER), None);
+    wline("busy, untimed", col(&|r| dur(r.stats.t_wave) * r.workers as f64 * (1.0 - r.stats.wave_idle) - disjoint.iter().map(|&k| r.stats.phase_s[k]).sum::<f64>()), None);
+    wline("idle", idle, None);
+    // The frame end's and the checkpoint's steps.
+    let mut steps: Vec<Line> = Vec::new();
+    let per_end: [(&'static str, Vec<f64>); 8] = [
+        ("new code", n(|s| s.new_codes as f64)),
+        ("touched state", n(|s| s.touched as f64)),
+        ("new state", new_states.clone()),
+        ("frontier state", frontier_out.clone()),
+        ("frontier state", frontier_out.clone()),
+        ("new state", new_states.clone()),
+        ("edge", edges.clone()),
+        ("edge", edges.clone()),
+    ];
+    for (k, (name, per)) in crate::frame::END_STEPS.iter().zip(per_end).enumerate() {
+        steps.push(Line { label: format!("end: {name}"), secs: col(&|r| dur(r.stats.t_end[k])), per: Some(per) });
+    }
+    steps.push(Line { label: "end: rest (untimed)".into(), secs: col(&|r| dur(r.stats.t_layer) - r.stats.t_end.iter().map(|&d| dur(d)).sum::<f64>()), per: None });
+    if r0.ckpt.is_some() {
+        let per_ckpt = [new_states.clone(), new_states.clone(), frontier_out.clone(), frontier_out.clone()];
+        for (k, (name, per)) in crate::frame::CKPT_STEPS.iter().zip(per_ckpt).enumerate() {
+            steps.push(Line { label: format!("checkpoint: {name}"), secs: col(&|r| r.ckpt.map_or(0.0, |c| dur(c.0.t[k]))), per: Some(("state", per)) });
+        }
+        steps.push(Line { label: "checkpoint: pos graph".into(), secs: col(&|r| r.ckpt.map_or(0.0, |c| dur(c.1))), per: None });
+    }
+    let mm = |v: &[f64]| (v.iter().copied().fold(f64::INFINITY, f64::min), v.iter().copied().fold(f64::NEG_INFINITY, f64::max));
+    let per_text = |l: &Line| match &l.per {
+        // The min's cost per element (the elements are the same every rep).
+        Some((name, v)) if v.first().is_some_and(|&x| x > 0.0) => format!("{:>9.1} ns/{name}", mm(&l.secs).0 * 1e9 / v[0]),
+        _ => String::new(),
+    };
+    let loads = col(&|r| r.load);
+    let s = &r0.stats;
+    eprintln!(
+        "[cost] f{frame:03}: {} reps, {} workers, load {:.1}-{:.1} | in {} new + {} old, {} emissions, {} re-pushed edges, {} pushes, {} new + {} grown states out, {} edges | min / max over the reps",
+        reps.len(),
+        r0.workers,
+        mm(&loads).0,
+        mm(&loads).1,
+        s.lanes_in,
+        s.old_in,
+        s.lanes_raw,
+        s.repush_edges,
+        s.pushes,
+        s.lanes_kept,
+        s.grown,
+        s.edge_records
+    );
+    eprintln!("[cost] {:<42} {:>9} {:>9}  per element (the min)", "wall", "s min", "s max");
+    for l in &lines[..wall_lines] {
+        let (a, b) = mm(&l.secs);
+        eprintln!("[cost] {:<42} {:>9.3} {:>9.3}  {}", l.label, a, b, per_text(l));
+    }
+    let (ba, _) = mm(&budget);
+    eprintln!("[cost] {:<42} {:>9} {:>9}  {:>6}  per element (the min)", "wave worker-seconds", "min", "max", "share");
+    for l in &ws {
+        let (a, b) = mm(&l.secs);
+        eprintln!("[cost] {:<42} {:>9.2} {:>9.2}  {:>5.1}%  {}", l.label, a, b, 100.0 * a / ba.max(1e-9), per_text(l));
+    }
+    eprintln!("[cost] {:<42} {:>9.2} {:>9.2}", "  of a budget (workers x wave)", ba, mm(&budget).1);
+    eprintln!("[cost] {:<42} {:>9} {:>9}  per element (the min)", "frame end and checkpoint, wall", "s min", "s max");
+    for l in &steps {
+        let (a, b) = mm(&l.secs);
+        eprintln!("[cost] {:<42} {:>9.3} {:>9.3}  {}", l.label, a, b, per_text(l));
+    }
+    let gb = |b: u64| b as f64 / 1e9;
+    let (fb, hb) = r0.ckpt.map_or((0, 0), |c| (c.0.frame_bytes, c.0.hull_bytes));
+    eprintln!(
+        "[cost] bytes written: edge file {:.3} GB, out file {:.3} GB, frame file {:.3} GB, hull file {:.3} GB | anonymous RSS start {:.2} wave {:.2} end {:.2} GB, peak (VmHWM) {:.2} GB",
+        gb(s.edge_bytes),
+        gb(s.out_bytes),
+        gb(fb),
+        gb(hb),
+        s.rss_start,
+        s.rss_wave,
+        s.rss_end,
+        crate::metrics::peak_rss_gb()
+    );
+}
+
+/// The bytes of every file under `dir` (recursively, by relative path):
+/// `(files, bytes, hash)` - `bench-frame`'s `b` line, so a change to how a
+/// frame's files are written proves them byte-identical.
+pub fn dir_fingerprint(dir: &Path) -> Result<(u64, u64, u64)> {
+    use celeste_engine::runtime2::mix64;
+    let mut files: Vec<(PathBuf, PathBuf)> = Vec::new();
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        for e in std::fs::read_dir(&d).with_context(|| d.display().to_string())? {
+            let p = e?.path();
+            if p.is_dir() {
+                stack.push(p);
+            } else {
+                files.push((p.strip_prefix(dir)?.to_path_buf(), p));
+            }
+        }
+    }
+    files.sort();
+    let (mut bytes, mut acc) = (0u64, 0u64);
+    for (rel, p) in &files {
+        let b = std::fs::read(p).with_context(|| p.display().to_string())?;
+        let mut h = mix64(b.len() as u64 ^ rel.to_string_lossy().bytes().fold(0u64, |a, c| mix64(a ^ c as u64)));
+        for w in b.chunks(8) {
+            let mut x = [0u8; 8];
+            x[..w.len()].copy_from_slice(w);
+            h = mix64(h ^ u64::from_le_bytes(x));
+        }
+        acc = acc.rotate_left(5) ^ h;
+        bytes += b.len() as u64;
+    }
+    Ok((files.len() as u64, bytes, acc))
 }

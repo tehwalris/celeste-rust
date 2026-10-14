@@ -673,7 +673,7 @@ the list (coarsest first; one level is the usual case):
    and over-approximates the level's other widenings (and `rnd`): a LOWER
    BOUND, and no win REFUTES H. A node IS its state (`Sk`: region, key,
    cell, as the edge files name it), so the gate's fingerprints, the marks
-   files and the concrete search's node keys need no metadata. The mod
+   files and the concrete search's node keys need no metadata. A big
    room at h155 (230M nodes, 430M spans, 6.0G in-edges read): the arc phase
    in ~15 GB anonymous under a 30 GB cap, where the remainder-free BFS and
    its 12 B-an-edge graph were OOM-killed at ~104 GB.
@@ -721,7 +721,7 @@ the new states once for their wins. The DECODE GUARD checks a shape's
 first emitted row each worker and wave against its decode
 (`decode::Skeletons`, FATAL otherwise); `--key-check` checks every row; every
 frame file is read back and compared with the forward's states. Frames
-take ~0.08 B a state on the mod room (fm85: 307 MB for 3.68B states;
+take ~0.08 B a state on a big room (fm85: 307 MB for 3.68B states;
 format 14 ~9 B).
 The level is a value (2026-10-10): the engines carry it (`FrameEngine`,
 `RefEngine::at_level`, `FrameStep::level`), and a tree records it in its

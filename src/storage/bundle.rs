@@ -576,7 +576,7 @@ impl<'a> Block<'a> {
 
 /// zstd -1 of a raw block, at its size (the compressor's buffer is the
 /// raw block's bound: a frame's segments, held to its end, took 5x their
-/// bytes - 1.1 GB at the mod room's f69).
+/// bytes - 1.1 GB at a big room's f69).
 pub fn compress(raw: &[u8], z: &mut zstd::bulk::Compressor<'static>) -> Result<Vec<u8>> {
     let mut v = z.compress(raw)?;
     v.shrink_to_fit();
