@@ -805,7 +805,7 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     // `bench-frame` times the workers' phases; `--metrics` counts the
     // kernels' census and slices (read when the kernels are built).
-    let cfg = celeste_rust::settings::startup(&cli.settings, |s| {
+    let cfg = celeste_rust::settings::startup(&cli.settings, false, |s| {
         if let Command::BenchFrame { metrics, .. } = &cli.command {
             s.diag.phases = true;
             s.diag.kernel_metrics = metrics.is_some();

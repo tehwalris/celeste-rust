@@ -86,8 +86,15 @@ pub fn sources_in(root: &std::path::Path, s: &crate::settings::Settings) -> Resu
     if s.onlydiag {
         game = forbid_straight_dashes(&game)?;
     }
-    if let Some(seeds) = &s.balloon_seeds {
+    // The float tools always seed (a file without `[seeds]` is every seed 0:
+    // UCT's `load_level` and Celia's `init_seed_objs` reset them so).
+    let float = matches!(s.arith, crate::settings::Arith::Float(_));
+    let seeds = s.balloon_seeds.clone().or_else(|| float.then(String::new));
+    if let Some(seeds) = &seeds {
         game = fix_balloon_seeds(&game, seeds, root, s.room)?;
+    }
+    if let crate::settings::Arith::Float(tool) = s.arith {
+        game = tool_seeds(&game, seeds.as_deref().unwrap_or(""), tool, root, s.room, s.loading_jank.is_some())?;
     }
     Ok(format!("{}\n{}\n{}\n", b3, b4, game))
 }
@@ -119,6 +126,65 @@ fn fix_balloon_seeds(game: &str, seeds: &str, root: &std::path::Path, (rx, ry): 
         }
     }
     Ok(game.replacen(PAT, &format!("this.offset={expr}"), 1))
+}
+
+/// A float tool's seeds (`--arith float`): what the tool does with a file's
+/// `[seeds]` beyond the balloons' phases at their creation
+/// (`fix_balloon_seeds`), in its own expressions (plans/float-solver.md,
+/// section 1).
+/// - A CHEST's last shake: its `rnd(3)` (where its berry appears) returns
+///   UCT's `offset + 1` (`TAS.lua`: the chest's update under a patched
+///   `rnd` when `timer - 1 <= 0`), Celia's `seed + 1 + 0x0.0001`
+///   (`vanilla_seeds.lua`, when `timer <= 1` before the update); its
+///   earlier shakes only move it until then, and stay `rnd(3)`.
+/// - Celia's BALLOONS: after the load (and its jank) `init_seed_objs` and
+///   `set_seed` make each balloon's `offset` its seed (`0 - 0 + seed`) and
+///   its `y` `start + sin(offset) * 2`, undoing the loading frame's bob.
+fn tool_seeds(game: &str, seeds: &str, tool: crate::settings::FloatTool, root: &std::path::Path, (rx, ry): (i16, i16), jank: bool) -> Result<String> {
+    use crate::settings::FloatTool;
+    let texts: Vec<&str> = seeds.split(',').map(str::trim).filter(|s| !s.is_empty()).collect();
+    // A seed as the tool reads it (`tonumber`), written back exactly.
+    let seed = |i: usize| -> Result<String> {
+        Ok(match texts.get(i) {
+            Some(t) => format!("{}", t.parse::<f64>().with_context(|| format!("--balloon-seeds: {t:?}"))?),
+            None => "0".to_string(),
+        })
+    };
+    let cart = celeste_core::cart_data::CartData::load(root.join("cart"))?;
+    let seeded: Vec<RoomObject> = room_objects(&cart, (rx, ry)).into_iter().filter(|o| o.seeded).collect();
+    let mut game = game.to_string();
+    // The chests: by their tile position (`start` is `x - 4`).
+    let mut expr = "rnd(3)".to_string();
+    for (i, o) in seeded.iter().enumerate().rev() {
+        if o.tile == CHEST {
+            let last = match tool {
+                FloatTool::Uct => format!("({}+1)", seed(i)?),
+                // 0x0.0001 is 2^-16: 0.0000152587890625 exactly.
+                FloatTool::Celia => format!("({}+1+0.0000152587890625)", seed(i)?),
+            };
+            let (x, y) = (o.tx * 8 - 4, o.ty * 8);
+            expr = format!("((this.timer<=0 and this.start=={x} and this.y=={y}) and {last} or {expr})");
+        }
+    }
+    const SHAKE: &str = "this.x=this.start-1+rnd(3)";
+    anyhow::ensure!(game.matches(SHAKE).count() == 1, "the chest's `{SHAKE}` was not found exactly once");
+    game = game.replacen(SHAKE, &format!("this.x=this.start-1+{expr}"), 1);
+    if tool == FloatTool::Celia {
+        let mut offset = "o.offset".to_string();
+        for (i, o) in seeded.iter().enumerate().rev() {
+            if o.tile == BALLOON {
+                offset = format!("((o.x=={} and o.start=={}) and {} or {offset})", o.tx * 8, o.ty * 8, seed(i)?);
+            }
+        }
+        let reseed = format!(" for i=1,#objects do local o=objects[i] if o.type==balloon then o.offset={offset} o.y=o.start+sin(o.offset)*2 end end");
+        // After the load: after the loading frame's draw where there is one.
+        let call = format!("load_room({rx}, {ry})");
+        let at = if jank { "_draw()" } else { call.as_str() };
+        let pos = game.find(&call).ok_or_else(|| anyhow::anyhow!("Celia's seeds: the start room's `{call}` was not found"))?;
+        let end = pos + game[pos..].find(at).ok_or_else(|| anyhow::anyhow!("Celia's seeds: no `{at}` after the load"))? + at.len();
+        game.insert_str(end, &reseed);
+    }
+    Ok(game)
 }
 
 /// The tiles `load_room` makes an object of, in the ORIGINAL cart, with the

@@ -178,7 +178,7 @@ fn print_frame(st: &Rt2, frame_num: u32, input_byte: u8) {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    let cfg = celeste_rust::settings::startup(&cli.settings, |_| {})?;
+    let cfg = celeste_rust::settings::startup(&cli.settings, false, |_| {})?;
     if cli.dump_start {
         dump_start(&RefEngine::new(&cfg)?.initial()?);
         return Ok(());

@@ -37,9 +37,42 @@ use std::path::{Path, PathBuf};
 /// on a change).
 pub const VERSION: u32 = 1;
 
+/// The game's arithmetic (`--arith`, plans/float-solver.md): the real
+/// game's 16.16, or the float tools' Lua doubles - with the tool, which
+/// decides the room's start and the seeds' meaning.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Arith {
+    Fixed,
+    Float(FloatTool),
+}
+
+/// The float tool a float run models (`--float-tool`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FloatTool {
+    /// UniversalClassicTas: the room loaded alone (the IL load), the file's
+    /// seeds set on its balloons and chests (`set_seeds`).
+    Uct,
+    /// Celia: the room entered with its loading jank (`--loading-jank J`),
+    /// the seeds set after it (`init_seed_objs`, `set_seed`).
+    Celia,
+}
+
+impl std::fmt::Display for Arith {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Arith::Fixed => write!(f, "fixed"),
+            Arith::Float(FloatTool::Uct) => write!(f, "float-uct"),
+            Arith::Float(FloatTool::Celia) => write!(f, "float-celia"),
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Settings {
     // RECORDED in a tree.
+    /// The game's arithmetic (`--arith`, `--float-tool`). Recorded only
+    /// where it is not `fixed`, so a fixed tree's record is what it was.
+    pub arith: Arith,
     /// The start room (`--room`).
     pub room: (i16, i16),
     /// A synthetic win rectangle `(x0, x1, y0, y1)` (`--win-at`).
@@ -95,6 +128,7 @@ pub struct Diagnostics {
 impl Default for Settings {
     fn default() -> Self {
         Settings {
+            arith: Arith::Fixed,
             room: (1, 0),
             win_at: None,
             split_frame: false,
@@ -152,7 +186,7 @@ impl Settings {
     /// tree. `level`: the tree's level spec.
     fn recorded(&self, level: &str) -> Vec<(&'static str, String)> {
         let opt = |v: Option<String>| v.unwrap_or_else(|| "none".to_string());
-        vec![
+        let mut lines = vec![
             ("room", format!("{},{}", self.room.0, self.room.1)),
             ("win_at", opt(self.win_at.map(|(x0, x1, y0, y1)| format!("{x0}..{x1},{y0}..{y1}")))),
             ("split_frame", u8::from(self.split_frame).to_string()),
@@ -164,7 +198,11 @@ impl Settings {
             ("loading_jank", opt(self.loading_jank.map(|j| j.to_string()))),
             ("balloon_seeds", opt(self.balloon_seeds.clone())),
             ("level", level.to_string()),
-        ]
+        ];
+        if self.arith != Arith::Fixed {
+            lines.push(("arith", self.arith.to_string()));
+        }
+        lines
     }
 
     /// What the cart (so the kernels and the level -1 table) is a function
@@ -283,6 +321,14 @@ fn parse_win_at(s: &str) -> std::result::Result<(i16, i16, i16, i16), String> {
 /// `rewrite` command line).
 #[derive(clap::Args, Clone, Debug)]
 pub struct SettingsArgs {
+    /// The game's arithmetic: `fixed` (PICO-8's 16.16, the real game) or
+    /// `float` (the Lua doubles of the TAS tools; plans/float-solver.md).
+    #[arg(long, global = true, default_value = "fixed")]
+    pub arith: String,
+    /// With `--arith float`: the tool modelled, `uct` (UniversalClassicTas:
+    /// the IL load, its seeds) or `celia` (the loading jank, its seeds).
+    #[arg(long, global = true)]
+    pub float_tool: Option<String>,
     /// The start room "x,y".
     #[arg(long, global = true, default_value = "1,0", value_parser = |s: &str| pair::<i16>(s, "--room"))]
     pub room: (i16, i16),
@@ -390,7 +436,20 @@ impl SettingsArgs {
             None => None,
         };
         anyhow::ensure!(self.threads != Some(0), "--threads 0");
+        let arith = match (self.arith.as_str(), self.float_tool.as_deref()) {
+            ("fixed", None) => Arith::Fixed,
+            ("fixed", Some(t)) => anyhow::bail!("--float-tool {t}: only with --arith float"),
+            ("float", None | Some("uct")) => Arith::Float(FloatTool::Uct),
+            ("float", Some("celia")) => Arith::Float(FloatTool::Celia),
+            ("float", Some(t)) => anyhow::bail!("--float-tool: `uct` or `celia`, not {t:?}"),
+            (a, _) => anyhow::bail!("--arith: `fixed` or `float`, not {a:?}"),
+        };
+        anyhow::ensure!(
+            !(arith == Arith::Float(FloatTool::Uct) && loading_jank.is_some()),
+            "--float-tool uct loads a room alone: no --loading-jank (Celia models the jank: --float-tool celia)"
+        );
         Ok(Settings {
+            arith,
             room: self.room,
             win_at: self.win_at,
             split_frame: self.split_frame,
@@ -495,9 +554,14 @@ pub fn refuse_env() -> Result<()> {
 /// A binary's settings from its flags (the environment refused), logged:
 /// one `[settings]` line with every setting not at its default. The binary
 /// passes them to everything that reads them; nothing reads a global.
-pub fn startup(args: &SettingsArgs, adjust: impl FnOnce(&mut Settings)) -> Result<Settings> {
+/// `float`: whether the command runs in float (`--arith float`); every
+/// other one REFUSES it (the float pipeline is built a milestone at a time,
+/// plans/float-solver.md: a command that would run fixed under a float
+/// flag is the footgun).
+pub fn startup(args: &SettingsArgs, float: bool, adjust: impl FnOnce(&mut Settings)) -> Result<Settings> {
     refuse_env()?;
     let mut s = args.settings()?;
+    anyhow::ensure!(float || s.arith == Arith::Fixed, "--arith {}: this command runs in fixed only so far (plans/float-solver.md, section 13)", s.arith);
     adjust(&mut s);
     let d = Settings::default();
     let mut set: Vec<String> = Vec::new();
@@ -506,6 +570,11 @@ pub fn startup(args: &SettingsArgs, adjust: impl FnOnce(&mut Settings)) -> Resul
             set.push(format!("{name}{v}"));
         }
     };
+    note("--arith ", s.arith != d.arith, match s.arith {
+        Arith::Fixed => "fixed".to_string(),
+        Arith::Float(FloatTool::Uct) => "float --float-tool uct".to_string(),
+        Arith::Float(FloatTool::Celia) => "float --float-tool celia".to_string(),
+    });
     note("--room ", s.room != d.room, format!("{},{}", s.room.0, s.room.1));
     note("--win-at ", s.win_at.is_some(), s.win_at.map_or(String::new(), |(x0, x1, y0, y1)| format!("{x0}..{x1},{y0}..{y1}")));
     note("--split-frame", s.split_frame, String::new());
@@ -561,6 +630,12 @@ mod tests {
             assert!(parse(bad).is_err(), "{bad:?}");
         }
         assert_eq!(parse(&["--region", "off"]).expect("off").region, None);
+        assert_eq!(parse(&["--arith", "float"]).expect("float").arith, Arith::Float(FloatTool::Uct));
+        let celia = parse(&["--arith", "float", "--float-tool", "celia", "--loading-jank", "2"]).expect("celia");
+        assert_eq!((celia.arith, celia.loading_jank), (Arith::Float(FloatTool::Celia), Some(2)));
+        for bad in [&["--arith", "double"][..], &["--float-tool", "celia"], &["--arith", "float", "--float-tool", "pico8"], &["--arith", "float", "--loading-jank", "2"]] {
+            assert!(parse(bad).is_err(), "{bad:?}");
+        }
     }
 
     /// The record round-trips; every differing setting is named; a tree
@@ -584,6 +659,16 @@ mod tests {
             assert!(e.contains(k), "{k} not in {e}");
         }
         assert!(!e.contains("room:"), "{e}");
+        // The arithmetic: a fixed record has no line for it (what it always
+        // was); either way across is refused.
+        assert!(!sample.text("r0sxhf").contains("arith"));
+        let float = Settings { arith: Arith::Float(FloatTool::Uct), ..sample.clone() };
+        let e = float.check(&dir, lvl("r0sxhf")).expect_err("a float run on a fixed tree").to_string();
+        assert!(e.contains("arith: the tree's (missing), this run's float-uct"), "{e}");
+        std::fs::write(path(&dir), float.text("r0sxhf")).expect("write");
+        let e = sample.check(&dir, lvl("r0sxhf")).expect_err("a fixed run on a float tree").to_string();
+        assert!(e.contains("arith: in the tree's record"), "{e}");
+        std::fs::write(path(&dir), sample.text("r0sxhf")).expect("write");
         // `--override-settings`: only the region grid, and only with the flag.
         let grid = Settings { region: None, ..sample.clone() };
         let e = grid.check(&dir, lvl("r0sxhf")).expect_err("another grid, no override").to_string();
