@@ -639,20 +639,25 @@ function init_object(type,x,y)
 		return obj.collide(type,ox,oy) ~=nil
 	end
 
+	-- The original cart's expressions, exactly (`rem += ox`, `amount =
+	-- flr(rem + 0.5)`, `rem -= amount`, as the float tools patch `+=`):
+	-- equal to any rewrite in 16.16, but not in doubles. `__split_by_round`
+	-- is the tracer's hint (the fragments of `rem` on which the amount is
+	-- one integer), the identity on a number.
 	obj.move=function(ox,oy)
 		local amount
 		-- [x] get move amount
- 	obj.rem.x = obj.rem.x + (ox) + 0.5
-		obj.rem.x = __split_by_flr(obj.rem.x)
-		amount = flr(obj.rem.x)
-		obj.rem.x = obj.rem.x - 0.5 - (amount)
+ 	obj.rem.x = obj.rem.x + (ox)
+		obj.rem.x = __split_by_round(obj.rem.x)
+		amount = flr(obj.rem.x + 0.5)
+		obj.rem.x = obj.rem.x - (amount)
 		obj.move_x(amount,0)
 
 		-- [y] get move amount
-		obj.rem.y = obj.rem.y + (oy) + 0.5
-		obj.rem.y = __split_by_flr(obj.rem.y)
-		amount = flr(obj.rem.y)
-		obj.rem.y = obj.rem.y - 0.5 - (amount)
+		obj.rem.y = obj.rem.y + (oy)
+		obj.rem.y = __split_by_round(obj.rem.y)
+		amount = flr(obj.rem.y + 0.5)
+		obj.rem.y = obj.rem.y - (amount)
 		obj.move_y(amount)
 	end
 

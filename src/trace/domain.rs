@@ -819,6 +819,22 @@ impl Symbolic {
         }
     }
 
+    /// `a + r` where `a` is `x - r`: `x` EXACTLY (16.16 addition is exact;
+    /// this tracer is 16.16's, `Domain::A = Fixed`), where the static ranges
+    /// bound `x - r`, so the cancelled sum overflowed nowhere (`x - r` keeps
+    /// its own check wherever else it is read). `move` reads `flr(rem +
+    /// 0.5)` of `__split_by_round`'s fragment, itself `x - 0.5`.
+    fn cancel_add(&mut self, a: NodeId, r: NodeId) -> Option<NodeId> {
+        let (op, x, k) = {
+            let node = self.graph.get(a);
+            (node.op.clone(), node.args.first().copied(), node.args.get(1).copied())
+        };
+        match (op, x, k) {
+            (Op::Sub, Some(x), Some(k)) if k == r && self.bounded(a) => Some(x),
+            _ => None,
+        }
+    }
+
     /// A boolean every lane holds in BOTH values (buttons, held trails,
     /// escaped atoms): an unmemoized `Ints` fork of `[0, 1]` with no validity,
     /// so `SplitOk(2)` folds true and the fragments to `0` and `1`.
@@ -1036,6 +1052,11 @@ impl Domain for Symbolic {
         }
         if let Arith::Sub = op {
             if let Some(n) = self.cancel_sub(*a, *b)? {
+                return Ok(n);
+            }
+        }
+        if let Arith::Add = op {
+            if let Some(n) = self.cancel_add(*a, *b) {
                 return Ok(n);
             }
         }
