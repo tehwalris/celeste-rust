@@ -56,6 +56,15 @@ fn previous((x, y): (i16, i16)) -> Option<(i16, i16)> {
     }
 }
 
+/// The J Celia's IL load into `room` applies (cctas.lua `load_level`, offset
+/// 0): the previous room's object count at its load, the title left out;
+/// `None` for the first room (no previous room, no jank).
+pub fn celia_jank(room: (i16, i16)) -> Result<Option<usize>> {
+    let Some(prev) = previous(room) else { return Ok(None) };
+    let cart = celeste_core::cart_data::CartData::load("cart")?;
+    Ok(Some(room_objects(&cart, prev).len()))
+}
+
 /// The starts of `s.room` under settings `s` (the category, the balloon
 /// seeds; `--loading-jank` is what this enumerates, so refused).
 pub fn starts(s: &crate::settings::Settings) -> Result<Starts> {
@@ -66,6 +75,7 @@ pub fn starts(s: &crate::settings::Settings) -> Result<Starts> {
         return Ok(Starts { room: s.room, level, previous: None, previous_objects: Vec::new(), spawn_frame: None, feasible: Vec::new(), classes: Vec::new(), celia: None });
     };
     let objs = room_objects(&cart, prev);
+    let celia = celia_jank(s.room)?;
     // J = 1 + the objects before the player when it leaves: the previous
     // room's objects but the spawn, less any subset of the destroyable ones,
     // plus the room title if it is still up and the spawn's smoke if it can
@@ -100,7 +110,7 @@ pub fn starts(s: &crate::settings::Settings) -> Result<Starts> {
         room: s.room,
         level,
         previous: Some(prev),
-        celia: Some(objs.len()),
+        celia,
         previous_objects: objs,
         spawn_frame: Some(start),
         feasible,

@@ -50,10 +50,13 @@ pub enum Arith {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FloatTool {
     /// UniversalClassicTas: the room loaded alone (the IL load), the file's
-    /// seeds set on its balloons and chests (`set_seeds`).
+    /// seeds set on its balloons and chests (`set_seeds`). A secondary
+    /// report (Philippe, plans/float-solver.md section 15).
     Uct,
-    /// Celia: the room entered with its loading jank (`--loading-jank J`),
-    /// the seeds set after it (`init_seed_objs`, `set_seed`).
+    /// Celia, THE float tool (the community's): the room entered with its
+    /// loading jank (`--loading-jank J`, by default its IL load's:
+    /// `starts::celia_jank`), the seeds set after it (`init_seed_objs`,
+    /// `set_seed`).
     Celia,
 }
 
@@ -325,8 +328,10 @@ pub struct SettingsArgs {
     /// `float` (the Lua doubles of the TAS tools; plans/float-solver.md).
     #[arg(long, global = true, default_value = "fixed")]
     pub arith: String,
-    /// With `--arith float`: the tool modelled, `uct` (UniversalClassicTas:
-    /// the IL load, its seeds) or `celia` (the loading jank, its seeds).
+    /// With `--arith float`: the tool modelled, `celia` (the default: Celia's
+    /// float mode, its IL load's loading jank unless `--loading-jank` is
+    /// given, its seeds) or `uct` (UniversalClassicTas: the IL load, its
+    /// seeds).
     #[arg(long, global = true)]
     pub float_tool: Option<String>,
     /// The start room "x,y".
@@ -439,8 +444,8 @@ impl SettingsArgs {
         let arith = match (self.arith.as_str(), self.float_tool.as_deref()) {
             ("fixed", None) => Arith::Fixed,
             ("fixed", Some(t)) => anyhow::bail!("--float-tool {t}: only with --arith float"),
-            ("float", None | Some("uct")) => Arith::Float(FloatTool::Uct),
-            ("float", Some("celia")) => Arith::Float(FloatTool::Celia),
+            ("float", Some("uct")) => Arith::Float(FloatTool::Uct),
+            ("float", None | Some("celia")) => Arith::Float(FloatTool::Celia),
             ("float", Some(t)) => anyhow::bail!("--float-tool: `uct` or `celia`, not {t:?}"),
             (a, _) => anyhow::bail!("--arith: `fixed` or `float`, not {a:?}"),
         };
@@ -448,6 +453,11 @@ impl SettingsArgs {
             !(arith == Arith::Float(FloatTool::Uct) && loading_jank.is_some()),
             "--float-tool uct loads a room alone: no --loading-jank (Celia models the jank: --float-tool celia)"
         );
+        // Celia enters a room as its IL load does, unless told the jank.
+        let loading_jank = match (arith, loading_jank) {
+            (Arith::Float(FloatTool::Celia), None) => crate::starts::celia_jank(self.room)?,
+            (_, j) => j,
+        };
         Ok(Settings {
             arith,
             room: self.room,
@@ -630,10 +640,15 @@ mod tests {
             assert!(parse(bad).is_err(), "{bad:?}");
         }
         assert_eq!(parse(&["--region", "off"]).expect("off").region, None);
-        assert_eq!(parse(&["--arith", "float"]).expect("float").arith, Arith::Float(FloatTool::Uct));
-        let celia = parse(&["--arith", "float", "--float-tool", "celia", "--loading-jank", "2"]).expect("celia");
+        // Celia by default, from its IL load: room (1,0)'s J is room (0,0)'s
+        // two objects; the first room has no jank; `--loading-jank` overrides.
+        let celia = parse(&["--arith", "float"]).expect("float");
         assert_eq!((celia.arith, celia.loading_jank), (Arith::Float(FloatTool::Celia), Some(2)));
-        for bad in [&["--arith", "double"][..], &["--float-tool", "celia"], &["--arith", "float", "--float-tool", "pico8"], &["--arith", "float", "--loading-jank", "2"]] {
+        assert_eq!(parse(&["--arith", "float", "--room", "0,0"]).expect("float").loading_jank, None);
+        assert_eq!(parse(&["--arith", "float", "--float-tool", "celia", "--loading-jank", "5"]).expect("celia").loading_jank, Some(5));
+        let uct = parse(&["--arith", "float", "--float-tool", "uct"]).expect("uct");
+        assert_eq!((uct.arith, uct.loading_jank), (Arith::Float(FloatTool::Uct), None));
+        for bad in [&["--arith", "double"][..], &["--float-tool", "celia"], &["--arith", "float", "--float-tool", "pico8"], &["--arith", "float", "--float-tool", "uct", "--loading-jank", "2"]] {
             assert!(parse(bad).is_err(), "{bad:?}");
         }
     }

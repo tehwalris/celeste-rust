@@ -4,8 +4,9 @@ Branch `float-dual` (from develop `7e814b41`). This replaces the first
 brief's plan (a float reference engine and a dual concrete search only):
 Philippe asked for the whole pipeline parameterized by the arithmetic,
 with abstraction and refinement of the numeric fields at its core. The
-dual (both-valid) search is one piece of it (section 10). Nothing below is
-built yet; "measured" marks the few things I ran.
+dual (both-valid) search is one piece of it (section 10). Sections 0-14
+are the design as proposed ("measured" marks what I ran then); section 15
+records what was decided and what milestones 1 and 2 built and measured.
 
 ## 0. The goal
 
@@ -138,7 +139,8 @@ column 0, where Lua's loop limit is negative and it scans nothing.
 Probably unreachable (the player's `x >= -1`), but a silent disagreement
 with the cart. Q8.
 
-**Decision needed (Q4).** Float must follow the original's expressions.
+**Decided (Q4): (b), one form for both** (section 15: the cart form A2,
+and why the speed guard stays). The options as proposed:
 
 - (a) **Recommended:** a source patch applied for the float arithmetic
   only, the same mechanism as `--nodiag`'s (exactly-once replacements).
@@ -184,14 +186,14 @@ with the cart. Q8.
 
 **Differential tests against the real UCT**, as assertions:
 
-- `tools/uct/golden.sh` (a regen script, like `regen-pico8-golden.sh`)
-  runs UCT headlessly with an EXACT trace mode in `driver.lua`: per cart
-  update, every object's fields as hex floats.
+- `tools/uct/golden.py` (a regen script, like `regen-pico8-golden.sh`)
+  runs UCT headlessly with an EXACT trace mode (`tools/uct/exact.lua`):
+  per cart update, every object's fields as hex floats.
   - It stores per input file a golden (text, compressed, not JSON).
   - Inputs:
     - community files of every category, canonicalized for `jbuffer`
-      (the trace logs `jbuffer`; a buffered jump's press is re-timed to
-      its frame, and the trajectory is checked unchanged);
+      (the trace logs the jump sounds; a buffered jump's press is re-timed
+      to its frame, and the trajectory is checked unchanged);
     - our witnesses;
     - random sequences that only press jump where a jump fires at once.
       UCT then never buffers, so the two carts run the same program.
@@ -488,7 +490,14 @@ flag, is not on develop; it gets the same review when it lands.)
 
 - **Float.** The concrete search with `RefEngine<Float>`, looking states
   up in the float W. The memo is on exact states (f64 bits).
-- **Dual (both-valid).**
+- **Dual (both-valid)**, the goal (Philippe: a run valid in either
+  arithmetic counts, ideally in both; fixed-only and float-only optima are
+  results too, so each half's own search stays).
+  - The win under Q2 (b): at frame f the float half (Celia float, its jank
+    start) exits and the fixed half (real play) has exited at f or
+    before. A fixed half that exits first waits as EXITED; a float half
+    that exits first is no win (the file would end before real play
+    leaves) and is pruned.
   - Both trees are built to the same horizon:
     `<dir>/fixed/level..` and `<dir>/float/level..`, each recording its
     arithmetic.
@@ -507,7 +516,9 @@ flag, is not on develop; it gets the same review when it lands.)
   - The bound is the larger of the two arc bounds. The breadth-first
     layers run to H, so the first dual win is the optimal both-valid
     run, and no win by H refutes every count up to H.
-- **The count when the exits differ (Q2).** Options:
+- **The count when the exits differ (Q2): decided (b)** (section 15):
+  the count is Celia float's exit, and the fixed exit must be no later.
+  The options as proposed:
   - (a) both exit by C, file length C + 1. UCT's clean save may shorten
     it to the float exit, and that shorter file must not be what gets
     re-uploaded.
@@ -632,6 +643,8 @@ tests, my own fixture and scratch dirs) and small commits.
 
 ## 14. Open questions
 
+(Q1, Q2, Q3-Q9 are answered: section 15.)
+
 - **Q1. Which float starts must a dual-valid run satisfy?**
   - UCT: IL load, its seeds.
   - Celia: loading jank `J`, its seeds.
@@ -655,3 +668,108 @@ tests, my own fixture and scratch dirs) and small commits.
   separate change?
 - **Q9. Budgets.** W endpoints at 8 B instead of 2; hulls possibly
   stored rounded outward. Fine to size them from the first float trees?
+
+## 15. Status (2026-10-15): decided, built, measured
+
+### Decisions (the answers to section 14)
+
+- **Q1 (Philippe)**: the float tool that matters is CELIA's float mode,
+  with its loading-jank start. UCT stays a secondary report. So `--arith
+  float` is Celia by default, from Celia's IL load (its `J`; `--loading-jank`
+  overrides it), and `--float-tool uct` is the secondary.
+- **Q2 (Philippe)**: rule (b). The file's length is the float exit (Celia
+  float), and real play (fixed point, PICO-8) must exit no later.
+- **The policy (Philippe)**: a run valid in EITHER arithmetic counts as a
+  valid submission, but ideally ours work in both. So the dual search is
+  the goal, and fixed-only and float-only optima are useful results too.
+- **Q3**: bit-exact on this machine's glibc (2.42) is the definition.
+  Every float or dual witness also gets a robustness report (a correctly
+  rounded `sin`, and ±1 ulp on every `sin` call); a witness that fails it
+  is flagged loudly, not rejected.
+- **Q4**: ONE cart form for both arithmetics, the original's expressions
+  (below). Fixed unchanged, shown (commit `e764d83c`).
+- **Q5**: the compile-time parameter (`celeste_core::arith::Arithmetic`,
+  `Fixed` and `Float`).
+- **Q6**: byte-identical means the pins and gates AND the trees' on-disk
+  bytes; kernel metrics may move and are re-pinned with evidence.
+- **Q7**: no jump buffer; community files are re-timed (below).
+- **Q8**: `tile_flag_at` fixed on its own branch (`tile-flag-fix`).
+- **Q9**: budgets sized from the first float trees.
+
+### The cart form (A2) and the speed guard
+
+`move` is the original's three statements with the hint
+`__split_by_round(rem)` (the fragments on which `flr(rem + 1/2)` is one
+integer: in 16.16 the floor fork of `rem + 1/2` shifted back, its arc
+capture the split it was; in doubles the exact cut points), and an exact
+16.16 fold `(x - r) + r -> x` where the ranges bound `x - r`, so the fixed
+kernels compute what they did. Fixed is unchanged, measured (every
+fixture fingerprint, gate, W and optimum; one kernel metric re-pinned:
+`r42n` +6 fused nodes of 1.14M instructions; frame time equal).
+
+The `_update` guard (an object at speed 0 skips `move`) STAYS. Dropping it
+breaks the kernels and the reference engine at the object levels (a
+balloon's widened `y` meets `is_solid`); keeping it only for non-players
+changes the level -1 tables. Where the guard differs from the original
+(which always calls `move`), in either arithmetic:
+
+- an object at speed 0 inside a solid: the original's `move(0, 0)` runs
+  one iteration of `move_x`'s loop (`sign(0) = 0`), finds the solid and
+  zeroes `spd` and `rem`; ours keeps `rem`. Only where the draw's clamp
+  or a spawn puts the player in a wall with a remainder;
+- float only: `rem = -0` becomes `+0` in the original (`-0 + 0`), equal
+  in value (no read tells them apart: no division, `tostring` or `atan2`
+  of a remainder), so the trajectories are the same and only the bits of
+  a state differ;
+- float only: `rem = 1/2 - 2^-54` would step a pixel, but no move leaves
+  it: after any move `rem` is in `[-1/2, 1/2 - 2^-53]` (`r1 = 1/2 - 2^-54`
+  gives `k = 1` and `rem = -1/2`; every other `r1 - k` is exact, and for
+  `|r1| >= 1/2` a multiple of `2^-53`).
+
+The oracle compares every bit after every update and agrees on every
+golden, so none of the three occurs in them.
+
+### Milestone 1: the float oracle
+
+`FloatRefEngine` (`ReferenceEngine<Float>`) under `--arith float`
+(Celia, from its IL load's jank `J = starts::celia_jank(room)` unless
+`--loading-jank` says otherwise) or `--arith float --float-tool uct`: the
+traced cart (the same source as fixed's) with the tool's start and seeds (`trace::cart::tool_seeds`: UCT's chest
+`offset + 1`; Celia's chest `seed + 1 + 2^-16` and its balloons reseeded
+after the jank; every seed 0 where a file gives none). Only `rewrite
+census` takes `--arith float` so far; every other command refuses it (the
+footgun is a fixed run under a float flag).
+
+**The goldens** (`gates/uct/`, `gates/celia/`, text traces compressed
+with zstd, regenerated by `tools/uct/golden.py` and
+`tools/celia/golden.py`): the tools' EXACT state after every update of a
+playback (`exact.lua`: every number of every object as a hex float, read
+after `_update` and `_draw`, since the player's draw clamps it), for
+
+- every tasdatabase file of any%, nodiag, 100%, gemskip any%, gemskip
+  nodiag and gemskip 100% (deaths and timeouts included: the trace goes on
+  to the tool's last update);
+- 2 random files a level (`random_inputs`: held directions, jump and dash
+  presses at random): deaths, walls and spikes at odd remainders.
+
+UCT plays from its IL load, Celia from its loading jank (`J` from `rewrite
+starts`' `celia`). The tests `trace::oracle::tests::the_float_engine_plays_
+every_golden_as_{uct,celia}_does` replay each in the float engine from the
+same start and compare every number and boolean we hold with the tool's,
+BIT for bit, after every update; the update that leaves the room must be
+the tool's last. One relaxation: a chest's `x` while it shakes is the
+tools' unseeded `rnd` (`UNSEEDED`): ours is the range, theirs must lie in
+it.
+
+**The jump buffer.** The original cart buffers a jump press for 4 frames;
+the traced cart does not. `tools/uct/canonical_jumps.py` re-times every
+buffered jump of a tool's run to its own frame (the press moved, the file
+extended where the jump fires past its end) and the golden scripts check
+that the re-timed file makes the same run in the tool and leaves no
+buffered jump. A jump is read from the player's state (`jbuffer` positive
+at the jump check, 0 after it); UCT's traces also hook the jump sounds
+(`psfx` 1, 2) and the two must agree on every update (Celia copies the
+cart every step, which defeats a hook). Celia's files are re-timed from
+Celia's own run: its start differs, so its run does (any% 2,1 dies in
+UCT and finishes in Celia).
+

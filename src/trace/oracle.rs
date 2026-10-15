@@ -322,12 +322,15 @@ mod tests {
         let field = |k: &str| w.iter().find_map(|x| x.strip_prefix(&format!("{k}="))).ok_or_else(|| anyhow!("no {k}="));
         let (x, y) = field("room")?.split_once(',').ok_or_else(|| anyhow!("room"))?;
         let seeds = field("seeds")?;
+        // Celia's start is its IL load's jank, the default (the manifest's
+        // J, from `rewrite starts`, must be it).
         let loading_jank = match tool {
             FloatTool::Uct => None,
-            FloatTool::Celia => match field("jank")? {
-                "-" => None,
-                j => Some(j.parse()?),
-            },
+            FloatTool::Celia => {
+                let j = crate::starts::celia_jank((x.parse()?, y.parse()?))?;
+                ensure!(j.map_or("-".to_string(), |j| j.to_string()) == field("jank")?, "Celia's J {j:?} is not the manifest's");
+                j
+            }
         };
         let s = crate::settings::Settings {
             arith: crate::settings::Arith::Float(tool),
