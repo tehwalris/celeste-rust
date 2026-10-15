@@ -245,6 +245,8 @@ pub fn replay(eng: &mut FloatRefEngine, trace: &[Update]) -> Result<usize> {
         let mut leaves = eng.frame_states(&st, u.input.unwrap_or(0)).with_context(|| format!("update {n}"))?;
         ensure!(leaves.len() == 1, "update {n}: {} successors of a concrete frame (an unseeded rnd?)", leaves.len());
         st = leaves.remove(0);
+        // The frame's garbage goes (else every frame clones all before it).
+        st.gc();
         if room(&st) != start {
             ensure!(n + 1 == trace.len(), "update {n}: we left the room, the tool played on to update {}", trace.len() - 1);
             return Ok(n + 1);
