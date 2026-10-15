@@ -575,6 +575,26 @@ enum Command {
         #[arg(long)]
         horizon: u32,
     },
+    /// THE CENSUS (plans/float-solver.md, section 12): a reference-engine
+    /// forward over the level r0sx's nodes (every object exact, the
+    /// remainder widened) in the run's arithmetic (`--arith`), every input,
+    /// deduplicated exactly, to frame `--to` or past `--max-nodes` nodes.
+    /// Per frame: the new nodes, the wins, the distinct player speeds
+    /// (`spd.x`, `spd.y`) of the frame's new nodes and of all so far, and the
+    /// speed bundles (new nodes with `spd.x` left out); with `--exact`, over
+    /// concrete states, also the distinct remainders. Run it in each
+    /// arithmetic on one room to compare.
+    Census {
+        /// The last frame.
+        #[arg(long)]
+        to: u32,
+        /// Stop once more nodes than this are met.
+        #[arg(long, default_value_t = 2_000_000)]
+        max_nodes: usize,
+        /// Over CONCRETE states (the remainder exact) instead of the nodes.
+        #[arg(long)]
+        exact: bool,
+    },
     /// DIAGNOSTIC: per-column cardinalities of one frame, streamed. Per
     /// shape: rows, every varying column's distinct value count (capped at
     /// `cap`), named, and the distinct (spd.x, spd.y) pairs.
@@ -805,7 +825,9 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     // `bench-frame` times the workers' phases; `--metrics` counts the
     // kernels' census and slices (read when the kernels are built).
-    let cfg = celeste_rust::settings::startup(&cli.settings, false, |s| {
+    // Only the census runs in float so far.
+    let float = matches!(cli.command, Command::Census { .. });
+    let cfg = celeste_rust::settings::startup(&cli.settings, float, |s| {
         if let Command::BenchFrame { metrics, .. } = &cli.command {
             s.diag.phases = true;
             s.diag.kernel_metrics = metrics.is_some();
@@ -2069,6 +2091,24 @@ fn main() -> Result<()> {
             println!("transfers per pair: {hist:?}");
             println!("pairs whose transfers are exactly x-pieces x y-pieces: {product} ({:.1}%); x part constant {x_const} ({:.1}%), y part constant {y_const} ({:.1}%)", 100.0 * product as f64 / n_pairs as f64, 100.0 * x_const as f64 / n_pairs as f64, 100.0 * y_const as f64 / n_pairs as f64);
             println!("distinct transfer sets {}, x sets {}, y sets {} (the tree's table: {} pairs)", sets.len(), xsets.len(), ysets.len(), pairs.len());
+        }
+        Command::Census { to, max_nodes, exact } => {
+            println!(
+                "arith {} room {}{}: frame new wins total spd.x spd.y spd.x_all spd.y_all bundles rem.x_all rem.y_all",
+                cfg.arith,
+                room_text(&cfg),
+                if exact { " exact" } else { "" }
+            );
+            let each = |f: &celeste_rust::census::Frame| {
+                println!(
+                    "f{:03} {} {} {} {} {} {} {} {} {} {}",
+                    f.frame, f.new, f.wins, f.total, f.spd_x, f.spd_y, f.spd_x_all, f.spd_y_all, f.bundles, f.rem_x_all, f.rem_y_all
+                )
+            };
+            match cfg.arith {
+                celeste_rust::settings::Arith::Fixed => celeste_rust::census::run::<celeste_core::arith::Fixed>(&cfg, to, max_nodes, cfg.threads(), exact, each)?,
+                celeste_rust::settings::Arith::Float(_) => celeste_rust::census::run::<celeste_core::arith::Float>(&cfg, to, max_nodes, cfg.threads(), exact, each)?,
+            };
         }
         Command::ColCensus { level_dir, frame, cap, cell, erase, every } => {
             use celeste_engine::exact::Code;

@@ -60,6 +60,14 @@ pub trait Arithmetic: 'static + Copy + Default + Debug + Send + Sync + PartialEq
     fn num_eq(a: Self::Num, b: Self::Num) -> bool;
     /// The largest value `rnd(x)` returns (`x > 0`): just below `x`.
     fn rnd_top(x: Self::Num) -> Option<Self::Num>;
+    /// The largest number below `x`.
+    fn below(x: Self::Num) -> Option<Self::Num>;
+    /// A 16.16 constant (raw), exactly (every one is a double).
+    fn from_fixed_raw(raw: i32) -> Self::Num;
+    /// The number's bits (identity: a dedup key).
+    fn bits(v: Self::Num) -> u64;
+    /// The number of these bits (`bits`' inverse), if they are one.
+    fn from_bits(b: u64) -> Option<Self::Num>;
     /// A number for a message.
     fn show(v: Self::Num) -> String;
     /// A number as the console's `printh` prints it.
@@ -165,6 +173,18 @@ impl Arithmetic for Fixed {
     }
     fn rnd_top(x: P8) -> Option<P8> {
         (x > P8::from_i16(0)).then(|| P8::from_raw(x.as_raw_u32() as i32 - 1))
+    }
+    fn below(x: P8) -> Option<P8> {
+        (x.as_raw_u32() as i32).checked_sub(1).map(P8::from_raw)
+    }
+    fn from_fixed_raw(raw: i32) -> P8 {
+        P8::from_raw(raw)
+    }
+    fn bits(v: P8) -> u64 {
+        v.to_bits() as u64
+    }
+    fn from_bits(b: u64) -> Option<P8> {
+        u32::try_from(b).ok().map(|r| P8::from_raw(r as i32))
     }
     fn show(v: P8) -> String {
         format!("{}", (v.to_bits() as i32) as f64 / 65536.0)
@@ -309,6 +329,18 @@ impl Arithmetic for Float {
     /// (`fl((1 - 2^-53) x) < x` for every finite `x > 0`).
     fn rnd_top(x: F) -> Option<F> {
         (x.value() > 0.0).then(|| x.pred()).flatten()
+    }
+    fn below(x: F) -> Option<F> {
+        x.pred()
+    }
+    fn from_fixed_raw(raw: i32) -> F {
+        F::new(raw as f64 / 65536.0).expect("a 16.16 constant is a finite double")
+    }
+    fn bits(v: F) -> u64 {
+        v.to_bits()
+    }
+    fn from_bits(b: u64) -> Option<F> {
+        F::new(f64::from_bits(b))
     }
     fn show(v: F) -> String {
         v.show()

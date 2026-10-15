@@ -98,6 +98,15 @@ impl<A: Arithmetic> ReferenceEngine<A> {
         &self.base
     }
 
+    /// One whole GAME frame of a state under EVERY input: the buttons are
+    /// forks (the cursor takes each value a read needs), as are the state's
+    /// intervals where a branch reads them (`move`'s remainder fragments).
+    /// Every leaf (`rewrite census`). Not under the split frame.
+    pub fn frame_all_inputs(&mut self, st: &State<RefDomain<A>>) -> Result<Vec<State<RefDomain<A>>>> {
+        anyhow::ensure!(self.settings.steps_per_frame() == 1, "frame_all_inputs: not under the split frame");
+        run_frame_all(&mut self.it, self.body, st, &[], Level::EXACT, self.path_cap)
+    }
+
     /// One whole GAME frame of a CONCRETE state under input `byte` (bit 0
     /// left, ... 5 dash): every leaf (it forks only where no input decides,
     /// `rnd`), over the split frame's two steps where it is on.
