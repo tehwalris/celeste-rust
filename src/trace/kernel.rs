@@ -207,11 +207,14 @@ fn successor_regions(
 /// each numeric field to the hull it took, PER SHAPE: the phase may change
 /// shape before the player appears (room (3,0): the start's shape lasts one
 /// frame, and a later spawn shape traced unbounded made every fall floor
-/// "near", 2^12 outcomes). A RESPAWN after a death enters the phase again
-/// (the room reloaded and every object updated once): the walk explores
-/// each one it reaches (`explore_respawn`) into the same hulls. A shape no
-/// explored state has gets the spawn object's hull by type
-/// (`NoPlayer::bounds`). A lane outside declines.
+/// "near", 2^12 outcomes). The chain runs the fly fruit exact; the walk and
+/// the forward run the level's widenings, under which the phase reaches
+/// shapes the chain never takes (a widened fly fruit gone at any frame:
+/// room (6,0) at `r0sxhfp`), so the start is also EXPLORED at the level's
+/// own widenings (`explore_no_player`) into the same hulls, and so is every
+/// RESPAWN the walk reaches (the room reloaded after a death, every object
+/// updated once). A shape no explored state has gets the spawn object's hull
+/// by type (`NoPlayer::bounds`). A lane outside declines.
 fn no_player_ranges(
     it: &mut super::interp::Interp<'static, super::domain::Symbolic>,
     reset: &'static full_moon::ast::Ast,
@@ -261,29 +264,34 @@ fn no_player_ranges(
         return Ok(NoPlayer::default());
     }
     np.on = true;
+    let c = shapes::field_constants(start, &it.d, &opts)?;
+    let (n, followed, ended) = explore_no_player(it, reset, fr, start.clone(), c, opts, &mut np, "the start's")?;
+    eprintln!("[walk] the start explored: {n} states explored, {followed} outcomes followed, {ended} reach the player");
     Ok(np)
 }
 
-/// Frames a no-player phase may last (the start's chain, a respawn's
-/// exploration): one that has not reached the player by then is FATAL.
+/// Frames a no-player phase may last (the start's chain, an exploration):
+/// one that has not reached the player by then is FATAL.
 const NO_PLAYER_FRAMES: usize = 240;
 
-/// THE RESPAWN EXPLORATION: from a respawn entry the walk reached (`entry`,
-/// its constants `consts`: the room reloaded after a death), every outcome
-/// of every frame up to the player's appearance, into `np`'s hulls. The
-/// entry is the walk's outcome, so fields the walk holds unknown (the dead
-/// phase's `freeze` and `delay_restart`, the level's widened fields) stay
+/// THE NO-PLAYER EXPLORATION: from an entry of the no-player phase
+/// (`entry`, its constants `consts`: the start, or a respawn entry the walk
+/// reached - the room reloaded after a death), every outcome of every frame
+/// up to the player's appearance, AT THE LEVEL'S OWN WIDENINGS (`opts`, the
+/// fly fruit as the level has it: what the walk and the forward reach), into
+/// `np`'s hulls. Fields the entry holds unknown (a respawn's: the dead
+/// phase's `freeze` and `delay_restart`; the level's widened fields) stay
 /// unknown inputs. No merge selects on the state's OWN unknowns (not the
 /// level's widened fields): `_update`'s `if freeze>0 then ... return end`
 /// would merge the frozen branch into the spawn's fields (`y = Sel(freeze >
 /// 0, 124, 120)`), after which none is a constant; refused, each branch
 /// keeps its constants (the frozen one repeats its parent). A state is its
 /// shape and its constants (the trace pins exactly those), so a repeated one
-/// is explored once. FATAL: a state still without the player after
-/// `NO_PLAYER_FRAMES` frames, a state that does not trace. Returns the
-/// states explored, the outcomes followed and those where the player
-/// appears.
-fn explore_respawn(
+/// is explored once. FATAL (`what`: whose phase): a state still without the
+/// player after `NO_PLAYER_FRAMES` frames, a state that does not trace.
+/// Returns the states explored, the outcomes followed and those where the
+/// player appears.
+fn explore_no_player(
     it: &mut super::interp::Interp<'static, super::domain::Symbolic>,
     reset: &'static full_moon::ast::Ast,
     fr: &'static full_moon::ast::Ast,
@@ -291,48 +299,44 @@ fn explore_respawn(
     consts: std::collections::BTreeMap<super::iface::Path, super::iface::Conc>,
     opts: crate::abstraction::Level,
     np: &mut NoPlayer,
+    what: &str,
 ) -> Result<(usize, usize, usize)> {
     use super::shapes;
-    // As the start's chain: the fly fruit exact.
-    let fruit = std::mem::replace(&mut it.d.level.fruit, false);
-    let chain_opts = crate::abstraction::Level { fruit: false, ..opts };
-    let run = (|| -> Result<(usize, usize, usize)> {
-        let mut seen: std::collections::BTreeSet<String> = Default::default();
-        let mut todo = vec![(entry, consts, 0usize)];
-        let (mut states, mut followed, mut ended) = (0usize, 0usize, 0usize);
-        while let Some((st, consts, depth)) = todo.pop() {
-            if !seen.insert(format!("{:?} {consts:?}", st.shape()?)) {
+    // The level's fly fruit (`note`: a widened one's fields bound nothing).
+    let fruit = it.d.level.fruit;
+    let mut seen: std::collections::BTreeSet<String> = Default::default();
+    let mut todo = vec![(entry, consts, 0usize)];
+    let (mut states, mut followed, mut ended) = (0usize, 0usize, 0usize);
+    while let Some((st, consts, depth)) = todo.pop() {
+        if !seen.insert(format!("{:?} {consts:?}", st.shape()?)) {
+            continue;
+        }
+        states += 1;
+        np.note(&st, &consts, fruit)?;
+        anyhow::ensure!(depth < NO_PLAYER_FRAMES, "{what} no-player phase did not reach the player within {NO_PLAYER_FRAMES} frames");
+        let roots = shapes::state_paths(&st)?;
+        let pin: Vec<(super::iface::Path, super::iface::Conc)> = consts.iter().filter(|(p, _)| roots.contains(p)).map(|(p, c)| (p.clone(), *c)).collect();
+        // The state's own unknowns (not the level's widened fields, not
+        // the buttons the frame resets): no merge selects on them, so
+        // each branch keeps its own constants.
+        let widened = shapes::boundary_widened_paths(&st, &opts);
+        let buttons = super::iface::key("__button_states");
+        let unknown: Vec<super::iface::Path> = roots.iter().filter(|p| !consts.contains_key(*p) && !widened.contains(*p) && p.first() != Some(&buttons)).cloned().collect();
+        let f = super::verify::trace_frame(it, reset, fr, st, &roots, &pin, &[], true, &[], &unknown).map_err(|e| e.context(format!("{what} no-player state {depth} frames after its entry did not trace")))?;
+        for o in &f.outs {
+            followed += 1;
+            if shapes::player_path(&o.st).is_some() {
+                ended += 1;
                 continue;
             }
-            states += 1;
-            np.note(&st, &consts, fruit)?;
-            anyhow::ensure!(depth < NO_PLAYER_FRAMES, "a respawn's no-player phase did not reach the player within {NO_PLAYER_FRAMES} frames");
-            let roots = shapes::state_paths(&st)?;
-            let pin: Vec<(super::iface::Path, super::iface::Conc)> = consts.iter().filter(|(p, _)| roots.contains(p)).map(|(p, c)| (p.clone(), *c)).collect();
-            // The state's own unknowns (not the level's widened fields, not
-            // the buttons the frame resets): no merge selects on them, so
-            // each branch keeps its own constants.
-            let widened = shapes::boundary_widened_paths(&st, &chain_opts);
-            let buttons = super::iface::key("__button_states");
-            let unknown: Vec<super::iface::Path> = roots.iter().filter(|p| !consts.contains_key(*p) && !widened.contains(*p) && p.first() != Some(&buttons)).cloned().collect();
-            let f = super::verify::trace_frame(it, reset, fr, st, &roots, &pin, &[], true, &[], &unknown).map_err(|e| e.context(format!("a respawn's no-player state {depth} frames after its entry did not trace")))?;
-            for o in &f.outs {
-                followed += 1;
-                if shapes::player_path(&o.st).is_some() {
-                    ended += 1;
-                    continue;
-                }
-                let c = shapes::field_constants(&o.st, &it.d, &chain_opts)?;
-                let heap = shapes::heap_constants(&o.st, &it.d);
-                let mut next = o.st.clone();
-                shapes::rebase(&mut next, &mut it.d, &heap)?;
-                todo.push((next, c, depth + 1));
-            }
+            let c = shapes::field_constants(&o.st, &it.d, &opts)?;
+            let heap = shapes::heap_constants(&o.st, &it.d);
+            let mut next = o.st.clone();
+            shapes::rebase(&mut next, &mut it.d, &heap)?;
+            todo.push((next, c, depth + 1));
         }
-        Ok((states, followed, ended))
-    })();
-    it.d.level.fruit = fruit;
-    run
+    }
+    Ok((states, followed, ended))
 }
 
 /// A numeric field's hull per path (raw 16.16, inclusive).
@@ -461,6 +465,62 @@ mod tests {
             traced += 1;
         }
         assert!(traced >= 2, "{traced} (shape, region) nodes traced");
+    }
+
+    /// THE START'S LANES ARE INSIDE THE BOUNDS OF EVERY SPAWN SHAPE WITHOUT
+    /// THE FLY FRUIT. At a fruit level the walk widens the fly fruit, which
+    /// may be gone at any frame: from the start the forward reaches the spawn
+    /// phase's shapes without it, which the start's chain (the fruit exact)
+    /// never takes. A respawn's exploration with the fruit exact gave such a
+    /// shape the respawn's hull alone (`y` <= 120, `spd.y` >= -3.5), and the
+    /// start's lane one frame in (`y` 124, `spd.y` -4) declined (room (6,0),
+    /// `r0sxhfp`, the split frame: t2's platform room, 2026-10-15). Every
+    /// such node's bound on a spawn field holds the start's value one frame
+    /// in (the reference engine's).
+    #[test]
+    fn the_start_is_inside_the_bounds_of_its_fruit_gone_shapes() {
+        use super::super::{iface, shapes, widen};
+        use celeste_engine::runtime2::{Col, AV};
+        let s = crate::settings::Settings { room: (6, 0), ..Default::default() };
+        let opts = crate::abstraction::Level::parse("r0sxhf").expect("level");
+        // The spawn's region: its player dies there too, and its respawns are explored.
+        let only = [super::Region { ix: 1, iy: 7 }];
+        let lw = super::room_constant_lattice(std::path::Path::new("."), opts, &super::Walk { settings: &s, only: Some(&only) }).unwrap_or_else(|e| panic!("{e:#}"));
+        // The start one frame in, concrete: its spawn's field at a path below it.
+        let mut eng = crate::trace::refengine::RefEngine::new(&s).expect("engine");
+        let row = eng.step_one(&eng.initial().expect("start"), 0).expect("one frame").into_rt2();
+        let ids = crate::compiled::ids();
+        let spawn = *row.objects_of_type(ids, ids.g_player_spawn).first().expect("the spawn, one frame in");
+        let value = |below: &[iface::Step]| -> Option<i32> {
+            let (mut obj, mut cell) = (spawn, None);
+            for step in below {
+                let iface::Step::Key(k) = step else { return None };
+                if let Some(c) = cell {
+                    let Col::U(AV::Ptr(sub)) = row.cols[c as usize] else { return None };
+                    obj = sub;
+                }
+                cell = Some(row.obj_field_cell(obj, celeste_names::field_id(k)?)?);
+            }
+            match row.cols[cell? as usize].at(0) {
+                AV::Num(n) => Some(n.as_raw_u32() as i32),
+                _ => None,
+            }
+        };
+        let mut checked = 0;
+        for ((shape, region), f) in &lw.frames {
+            let rep = &lw.reps[shape];
+            if region.is_some() || shapes::player_path(rep).is_some() || !widen::objects_of_type(rep, "fly_fruit").is_empty() {
+                continue;
+            }
+            for o in widen::objects_of_type(rep, "player_spawn") {
+                for (p, (lo, hi)) in f.bounds.iter().filter(|(p, _)| p.starts_with(&o)) {
+                    let Some(v) = value(&p[o.len()..]) else { continue };
+                    assert!((*lo..=*hi).contains(&v), "a spawn shape without the fly fruit bounds {} to [{}, {}]: the start's lane one frame in holds {}", iface::show(p), *lo as f64 / 65536.0, *hi as f64 / 65536.0, v as f64 / 65536.0);
+                    checked += 1;
+                }
+            }
+        }
+        assert!(checked >= 6, "{checked} spawn bounds of shapes without the fly fruit checked");
     }
 
     /// A RESPAWN IS INSIDE ITS SHAPE'S BOUNDS. Room (0,3) gemskip 100% under
@@ -731,7 +791,7 @@ pub fn room_constant_lattice(
                             if no_player.entries.insert(format!("{tk} {c:?}")) {
                                 let mut entry = o.st.clone();
                                 shapes::rebase(&mut entry, &mut it.d, &o.heap_constants)?;
-                                let (n, followed, ended) = explore_respawn(&mut it, reset, fr, entry, c.clone(), opts, &mut no_player)?;
+                                let (n, followed, ended) = explore_no_player(&mut it, reset, fr, entry, c.clone(), opts, &mut no_player, "a respawn's")?;
                                 let shape_no = |x: &String| lattice.keys().position(|y| y == x).map_or("new".to_string(), |i| format!("#{i}"));
                                 eprintln!(
                                     "[walk] respawn entry {} (shape {}, from shape {} {:?}): {n} states explored, {followed} outcomes followed, {ended} reach the player",
@@ -910,8 +970,8 @@ struct WalkOutcome {
     /// `shapes::heap_constants` of `st`, in the worker's arena.
     heap_constants: std::collections::HashMap<u32, super::iface::Conc>,
     /// A RESPAWN entry (a state of the no-player phase from a node outside
-    /// it: the room reloaded after a death), its constants as the
-    /// no-player chain pins them (the fly fruit exact).
+    /// it: the room reloaded after a death), its constants at the level
+    /// (`explore_no_player` pins them).
     respawn: Option<std::collections::BTreeMap<super::iface::Path, super::iface::Conc>>,
 }
 
@@ -1021,7 +1081,7 @@ fn walk_trace(
         let heap_constants = shapes::heap_constants(&o.st, &tr.it.d);
         let spawn_phase = |st: &super::state::State<super::domain::Symbolic>| shapes::player_path(st).is_none() && !super::widen::objects_of_type(st, "player_spawn").is_empty();
         let respawn = if grid.is_some() && spawn_phase(&o.st) && super::widen::objects_of_type(&job.st, "player_spawn").is_empty() {
-            Some(shapes::field_constants(&o.st, &tr.it.d, &crate::abstraction::Level { fruit: false, ..opts })?)
+            Some(shapes::field_constants(&o.st, &tr.it.d, &opts)?)
         } else {
             None
         };
