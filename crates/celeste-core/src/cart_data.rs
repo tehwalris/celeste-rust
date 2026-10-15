@@ -62,6 +62,12 @@ impl CartData {
         }
     }
 
+    /// `fget` on whole numbers: tile `i`'s flag `b` (0..8).
+    pub fn fget_whole(&self, i: u8, b: i16) -> Result<bool> {
+        let b = usize::try_from(b).ok().filter(|&b| b < 8).ok_or_else(|| anyhow!("b is out of range"))?;
+        Ok(self.flag_data[i as usize] & (1 << b) != 0)
+    }
+
     pub fn fget(&self, i: Pico8Num, b: Pico8Num) -> Result<bool> {
         let i = Self::as_usize_below(i, "i", self.flag_data.len())?;
         let b = Self::as_usize_below(b, "b", 8)?;

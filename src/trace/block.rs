@@ -37,6 +37,7 @@ use celeste_names as gen;
 
 use crate::builtins::BUILTIN_NAMES;
 use crate::trace::domain::{Domain, Symbolic};
+use celeste_core::arith::Fixed;
 use crate::trace::heap::{BodyId, ClosureId, Heap, TableId, Value};
 use crate::trace::refbridge;
 use crate::trace::refdomain::RefDomain;
@@ -243,7 +244,7 @@ pub fn fn_info_of<D: Domain>(base: &State<D>) -> Result<FnInfo> {
 /// Lane `lane` of a block as a state in domain `d` (plus the builtins of
 /// `base`'s globals, which a block drops), and its unknown-boolean fields
 /// except the buttons, for the driver to fork.
-pub fn from_block<D: Domain, E: Domain>(
+pub fn from_block<D: Domain<A = Fixed>, E: Domain>(
     d: &mut D,
     rt2: &Rt2,
     lane: usize,
@@ -299,7 +300,7 @@ struct FromBlock<'a, D: Domain> {
     unknown: Vec<(TableId, String)>,
 }
 
-impl<D: Domain> FromBlock<'_, D> {
+impl<D: Domain<A = Fixed>> FromBlock<'_, D> {
     fn is_unknown(&self, cell: u32) -> bool {
         matches!(self.rt2.structure[cell as usize], Cell2::Val) && self.rt2.cols[cell as usize].at(self.lane) == AV::UBool
     }

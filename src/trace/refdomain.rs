@@ -16,7 +16,8 @@
 
 use anyhow::{bail, Result};
 
-use crate::pico8_num::{Pico8Num as P8, Pico8NumInterval as Iv};
+use celeste_core::arith::{Arithmetic, Fixed};
+
 use crate::trace::domain::{Arith, Cmp, Domain, Fun1, Fun2};
 
 /// A depth-first cursor over a decision tree, enumerated by re-execution.
@@ -82,142 +83,128 @@ impl Cursor {
     }
 }
 
-/// The reference domain: the cursor is its only state.
+/// The reference domain of arithmetic `A`: the cursor is its only state.
+/// `RefDomain` is 16.16's.
 #[derive(Debug, Default)]
-pub struct RefDomain {
+pub struct RefDomain<A: Arithmetic = Fixed> {
     pub cursor: Cursor,
+    arith: std::marker::PhantomData<A>,
 }
 
-impl RefDomain {
+impl<A: Arithmetic> RefDomain<A> {
     pub fn new() -> Self {
-        RefDomain { cursor: Cursor::new() }
+        RefDomain { cursor: Cursor::new(), arith: std::marker::PhantomData }
     }
 }
 
-/// The unknown number: the whole 16.16 range.
-fn unknown() -> Iv {
-    Iv::new(P8::from_raw(i32::MIN), P8::from_raw(i32::MAX))
+fn is_unknown<A: Arithmetic>(v: &A::Ival) -> bool {
+    *v == A::unknown()
 }
 
-fn is_unknown(v: &Iv) -> bool {
-    v.low == P8::from_raw(i32::MIN) && v.high == P8::from_raw(i32::MAX)
-}
-
-/// How many distinct integer floors `v` spans: 1 to 65536 (in `i32`: the
-/// unknown number's 65536 floors overflow an `i16` difference).
-fn floor_span(v: &Iv) -> u32 {
-    (v.high.whole_part_as_i16() as i32 - v.low.whole_part_as_i16() as i32 + 1) as u32
-}
-
-/// The part of `v` in its `k`-th floor (`k < floor_span(v)`).
-fn floor_fragment(v: &Iv, k: u32) -> Iv {
-    let base = v.low.whole_part_as_i16() as i32 + k as i32;
-    // `[base, base + 1 - eps]`: a fragment spans exactly one floor.
-    let (floor, top) = (P8::from_raw(base << 16), P8::from_raw((base << 16) | 0xffff));
-    Iv::new(v.low.max(floor), v.high.min(top))
+/// How many distinct integer floors `v` spans (`Arithmetic::floors`).
+fn floor_span<A: Arithmetic>(v: &A::Ival) -> Result<u32> {
+    A::floors(*v).ok_or_else(|| anyhow::anyhow!("{} spans more than 65536 floors", show::<A>(v)))
 }
 
 /// A number for an error message: a point as its decimal value, an
 /// interval as `[lo, hi]`.
-pub fn show(v: &Iv) -> String {
-    let dec = |n: P8| (n.to_bits() as i32) as f64 / 65536.0;
-    match v.to_number() {
-        Some(n) => format!("{}", dec(n)),
-        None => format!("[{}, {}]", dec(v.low), dec(v.high)),
+pub fn show<A: Arithmetic>(v: &A::Ival) -> String {
+    match A::as_point(*v) {
+        Some(n) => A::show(n),
+        None => {
+            let (lo, hi) = A::bounds(*v);
+            format!("[{}, {}]", A::show(lo), A::show(hi))
+        }
     }
 }
 
 /// `r`, or the overflow error naming the operation and its operands.
-fn exact(r: Option<Iv>, op: impl FnOnce() -> String) -> Result<Iv> {
-    r.ok_or_else(|| {
-        anyhow::anyhow!(
-            "reference arithmetic overflow: {} leaves the 16.16 range (PICO-8 would wrap or \
-             saturate; the reference raises)",
-            op()
-        )
-    })
+fn exact<A: Arithmetic>(r: Option<A::Ival>, op: impl FnOnce() -> String) -> Result<A::Ival> {
+    r.ok_or_else(|| anyhow::anyhow!("reference arithmetic overflow: {} leaves {}", op(), A::RANGE_NOTE))
 }
 
-impl Domain for RefDomain {
-    type Num = Iv;
+impl<A: Arithmetic> Domain for RefDomain<A> {
+    type A = A;
+    type Num = A::Ival;
     type Bool = bool;
 
-    fn num(&mut self, v: P8) -> Iv {
-        Iv::from_number(v)
+    fn num(&mut self, v: A::Num) -> A::Ival {
+        A::point(v)
     }
     fn boolean(&mut self, b: bool) -> bool {
         b
     }
 
-    fn arith(&mut self, op: Arith, a: &Iv, b: &Iv) -> Result<Iv> {
-        // An unknown number (the whole 16.16 range) stays unknown, as the
+    fn arith(&mut self, op: Arith, a: &A::Ival, b: &A::Ival) -> Result<A::Ival> {
+        // An unknown number (the whole range) stays unknown, as the
         // kernels' `UnknownNum` folds: it stands for any value, not for a
         // range every value of which must fit.
-        if is_unknown(a) || is_unknown(b) {
-            return Ok(unknown());
+        if is_unknown::<A>(a) || is_unknown::<A>(b) {
+            return Ok(A::unknown());
         }
         // Points and intervals alike: the exact result, or the overflow error.
-        let said = |sym: &str| format!("{} {sym} {}", show(a), show(b));
+        let said = |sym: &str| format!("{} {sym} {}", show::<A>(a), show::<A>(b));
         match op {
-            Arith::Add => exact(a.checked_add(*b), || said("+")),
-            Arith::Sub => exact(a.checked_sub(*b), || said("-")),
-            Arith::Mul => exact(a.checked_mul(*b), || said("*")),
-            Arith::Div => exact(a.checked_div(*b), || said("/") + " (or divides by zero)"),
-            // Never overflows: in `[0, |y|)`, or 0 for `y == 0`.
-            Arith::Rem => match (a.to_number(), b.to_number()) {
-                (Some(x), Some(y)) => Ok(Iv::from_number(x % y)),
+            Arith::Add => exact::<A>(A::ival_add(*a, *b), || said("+")),
+            Arith::Sub => exact::<A>(A::ival_sub(*a, *b), || said("-")),
+            Arith::Mul => exact::<A>(A::ival_mul(*a, *b), || said("*")),
+            Arith::Div => exact::<A>(A::ival_div(*a, *b), || said("/") + " (or divides by zero)"),
+            Arith::Rem => match (A::as_point(*a), A::as_point(*b)) {
+                (Some(x), Some(y)) => exact::<A>(A::rem(x, y).map(A::point), || said("%")),
                 _ => bail!("interval rem {}: points only", said("%")),
             },
         }
     }
 
-    fn fun1(&mut self, f: Fun1, a: &Iv) -> Result<Iv> {
+    fn fun1(&mut self, f: Fun1, a: &A::Ival) -> Result<A::Ival> {
         Ok(match f {
-            Fun1::Neg => exact(a.checked_neg(), || format!("-{}", show(a)))?,
-            Fun1::Abs => exact(a.checked_abs(), || format!("abs({})", show(a)))?,
+            Fun1::Neg => exact::<A>(A::ival_neg(*a), || format!("-{}", show::<A>(a)))?,
+            Fun1::Abs => exact::<A>(A::ival_abs(*a), || format!("abs({})", show::<A>(a)))?,
             Fun1::Flr => {
-                if floor_span(a) > 1 {
+                if floor_span::<A>(a)? > 1 {
                     bail!("flr of an interval spanning >1 floor - call __split_by_flr first");
                 }
-                Iv::from_number(a.low.flr())
+                A::point(A::flr(A::bounds(*a).0))
             }
-            Fun1::Sin => match a.to_number() {
-                Some(x) => Iv::from_number(x.pico8_sin()),
-                None => Iv::new(P8::from_i16(-1), P8::from_i16(1)),
+            Fun1::Sin => match A::as_point(*a) {
+                Some(x) => A::point(A::sin(x).ok_or_else(|| anyhow::anyhow!("sin({}) is not finite", A::show(x)))?),
+                None => A::ival(A::from_i16(-1), A::from_i16(1)),
             },
         })
     }
 
-    fn fun2(&mut self, f: Fun2, a: &Iv, b: &Iv) -> Result<Iv> {
+    fn fun2(&mut self, f: Fun2, a: &A::Ival, b: &A::Ival) -> Result<A::Ival> {
+        let ((al, ah), (bl, bh)) = (A::bounds(*a), A::bounds(*b));
         Ok(match f {
-            Fun2::Min => Iv::new(a.low.min(b.low), a.high.min(b.high)),
-            Fun2::Max => Iv::new(a.low.max(b.low), a.high.max(b.high)),
+            Fun2::Min => A::ival(A::min(al, bl), A::min(ah, bh)),
+            Fun2::Max => A::ival(A::max(al, bl), A::max(ah, bh)),
         })
     }
 
-    fn compare(&mut self, op: Cmp, a: &Iv, b: &Iv) -> Result<bool> {
+    fn compare(&mut self, op: Cmp, a: &A::Ival, b: &A::Ival) -> Result<bool> {
+        let ((al, ah), (bl, bh)) = (A::bounds(*a), A::bounds(*b));
         // Eq: two points compare directly; disjoint intervals are unequal;
         // overlapping ones may be either (fork, as the orderings below).
         if op == Cmp::Eq {
-            return Ok(match (a.to_number(), b.to_number()) {
-                (Some(x), Some(y)) => x == y,
-                _ if a.high < b.low || b.high < a.low => false,
+            return Ok(match (A::as_point(*a), A::as_point(*b)) {
+                (Some(x), Some(y)) => A::num_eq(x, y),
+                _ if A::lt(ah, bl) || A::lt(bh, al) => false,
                 _ => self.cursor.choose(2) == 0,
             });
         }
         // Definite when the intervals are separated, else fork.
         let definite_true = match op {
-            Cmp::Lt => a.high < b.low,
-            Cmp::Le => a.high <= b.low,
-            Cmp::Gt => a.low > b.high,
-            Cmp::Ge => a.low >= b.high,
+            Cmp::Lt => A::lt(ah, bl),
+            Cmp::Le => A::le(ah, bl),
+            Cmp::Gt => A::lt(bh, al),
+            Cmp::Ge => A::le(bh, al),
             Cmp::Eq => unreachable!(),
         };
         let definite_false = match op {
-            Cmp::Lt => a.low >= b.high,
-            Cmp::Le => a.low > b.high,
-            Cmp::Gt => a.high <= b.low,
-            Cmp::Ge => a.high < b.low,
+            Cmp::Lt => A::le(bh, al),
+            Cmp::Le => A::lt(bh, al),
+            Cmp::Gt => A::le(ah, bl),
+            Cmp::Ge => A::lt(ah, bl),
             Cmp::Eq => unreachable!(),
         };
         Ok(if definite_true {
@@ -243,20 +230,20 @@ impl Domain for RefDomain {
         Some(*c)
     }
 
-    fn sel_num(&mut self, _c: &bool, _t: &Iv, _f: &Iv) -> Iv {
+    fn sel_num(&mut self, _c: &bool, _t: &A::Ival, _f: &A::Ival) -> A::Ival {
         unreachable!("RefDomain never merges: decide is always Some");
     }
     fn sel_bool(&mut self, _c: &bool, _t: &bool, _f: &bool) -> bool {
         unreachable!("RefDomain never merges: decide is always Some");
     }
 
-    fn mget(&mut self, _x: &Iv, _y: &Iv) -> Result<Iv> {
+    fn mget(&mut self, _x: &A::Ival, _y: &A::Ival) -> Result<A::Ival> {
         // Concrete coords are folded by the caller; the cart splits interval
         // coords before collision.
         bail!("RefDomain::mget with non-const coords - TODO (should be split first)");
     }
 
-    fn tile_flag_at(&mut self, _x: &Iv, _y: &Iv, _w: &Iv, _h: &Iv, _flag: &Iv) -> Result<bool> {
+    fn tile_flag_at(&mut self, _x: &A::Ival, _y: &A::Ival, _w: &A::Ival, _h: &A::Ival, _flag: &A::Ival) -> Result<bool> {
         bail!("RefDomain::tile_flag_at with non-const coords - TODO (collision wiring)");
     }
 
@@ -264,35 +251,45 @@ impl Domain for RefDomain {
         Ok(self.cursor.choose(2) == 1)
     }
 
-    fn range_num(&mut self, lo: P8, hi: P8) -> Result<Iv> {
-        Ok(Iv::new(lo, hi))
+    fn range_num(&mut self, lo: A::Num, hi: A::Num) -> Result<A::Ival> {
+        Ok(A::ival(lo, hi))
     }
 
-    fn as_const(&self, v: &Iv) -> Option<P8> {
-        v.to_number()
+    fn as_const(&self, v: &A::Ival) -> Option<A::Num> {
+        A::as_point(*v)
     }
 
-    fn is_interval(&self, v: &Iv) -> bool {
-        v.to_number().is_none()
+    fn is_interval(&self, v: &A::Ival) -> bool {
+        A::as_point(*v).is_none()
     }
 
-    fn describe(&self, v: &Iv) -> String {
-        match v.to_number() {
+    fn describe(&self, v: &A::Ival) -> String {
+        match A::as_point(*v) {
             Some(n) => format!("{:?}", n),
-            None => format!("[{:?}, {:?}]", v.low, v.high),
+            None => {
+                let (lo, hi) = A::bounds(*v);
+                format!("[{:?}, {:?}]", lo, hi)
+            }
         }
     }
 
-    fn fork_flr(&mut self, v: &Iv, _ways: u8) -> (Iv, bool) {
-        let n = floor_span(v);
+    fn fork_flr(&mut self, v: &A::Ival, _ways: u8) -> (A::Ival, bool) {
+        let n = floor_span::<A>(v).expect("a fork of more than 65536 floors");
         let k = self.cursor.choose(n);
-        (floor_fragment(v, k), true)
+        (A::floor_fragment(*v, k), true)
+    }
+
+    fn fork_round(&mut self, v: &A::Ival) -> Result<A::Ival> {
+        let n = A::rounds(*v)?.ok_or_else(|| anyhow::anyhow!("__split_by_round of {}: more than 65536 values", show::<A>(v)))?;
+        let k = self.cursor.choose(n);
+        A::round_fragment(*v, k)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::pico8_num::{Pico8Num as P8, Pico8NumInterval as Iv};
 
     #[test]
     fn cursor_enumerates_a_two_by_three_tree_depth_first() {
@@ -343,7 +340,7 @@ mod tests {
     #[test]
     fn straddling_compare_forks_both_ways() {
         let mut results = Vec::new();
-        let mut d = RefDomain::new();
+        let mut d = RefDomain::<Fixed>::new();
         loop {
             d.cursor.reset();
             let a = Iv::new(P8::from_i16(3), P8::from_i16(7));
@@ -358,7 +355,7 @@ mod tests {
 
     #[test]
     fn separated_compare_is_definite_no_fork() {
-        let mut d = RefDomain::new();
+        let mut d = RefDomain::<Fixed>::new();
         d.cursor.reset();
         let a = Iv::new(P8::from_i16(1), P8::from_i16(2));
         let b = Iv::from_number(P8::from_i16(5));
@@ -381,7 +378,7 @@ mod tests {
     /// wraps or saturates. Off the edge a point is `Pico8Num`'s result.
     #[test]
     fn every_overflow_raises_for_points_and_intervals() {
-        let mut d = RefDomain::new();
+        let mut d = RefDomain::<Fixed>::new();
         let (max, min) = (raw(i32::MAX), raw(i32::MIN));
         let one = Iv::from_number(P8::from_i16(1));
         let two = Iv::from_number(P8::from_i16(2));
@@ -430,13 +427,13 @@ mod tests {
     /// spans 65536, which an `i16` difference wrapped to one.
     #[test]
     fn a_range_of_many_floors_is_not_one_floor() {
-        let mut d = RefDomain::new();
-        assert_eq!(floor_span(&unknown()), 65536);
-        assert_eq!(floor_span(&Iv::new(P8::from_i16(-20000), P8::from_i16(20000))), 40001);
-        assert!(d.fun1(Fun1::Flr, &unknown()).is_err(), "flr of the unknown number is no point");
-        assert_eq!(floor_fragment(&unknown(), 0), Iv::new(P8::from_raw(i32::MIN), P8::from_raw(i32::MIN | 0xffff)));
-        assert_eq!(floor_fragment(&unknown(), 65535), Iv::new(P8::from_i16(32767), P8::from_raw(i32::MAX)));
-        assert_eq!(floor_fragment(&Iv::new(P8::from_raw(-0x1_8000), P8::from_raw(0x8000)), 1), Iv::new(P8::from_i16(-1), P8::from_raw(-1)));
+        let mut d = RefDomain::<Fixed>::new();
+        assert_eq!(floor_span::<Fixed>(&Fixed::unknown()).unwrap(), 65536);
+        assert_eq!(floor_span::<Fixed>(&Iv::new(P8::from_i16(-20000), P8::from_i16(20000))).unwrap(), 40001);
+        assert!(d.fun1(Fun1::Flr, &Fixed::unknown()).is_err(), "flr of the unknown number is no point");
+        assert_eq!(Fixed::floor_fragment(Fixed::unknown(), 0), Iv::new(P8::from_raw(i32::MIN), P8::from_raw(i32::MIN | 0xffff)));
+        assert_eq!(Fixed::floor_fragment(Fixed::unknown(), 65535), Iv::new(P8::from_i16(32767), P8::from_raw(i32::MAX)));
+        assert_eq!(Fixed::floor_fragment(Iv::new(P8::from_raw(-0x1_8000), P8::from_raw(0x8000)), 1), Iv::new(P8::from_i16(-1), P8::from_raw(-1)));
         d.cursor.reset();
         let (frag, _) = d.fork_flr(&Iv::new(P8::from_i16(-20000), P8::from_i16(20000)), 0);
         assert_eq!(frag, Iv::new(P8::from_i16(-20000), P8::from_raw((-20000 << 16) | 0xffff)));

@@ -63,7 +63,7 @@ pub fn eval(g: &Graph, root: NodeId, env: &Env) -> Result<Conc> {
 fn run(g: &Graph, need: &[bool], env: &Env, strict: bool) -> Result<Vec<Option<Conc>>> {
     let n = need.len();
     let mut val: Vec<Option<Conc>> = vec![None; n];
-    let mut c = Concrete;
+    let mut c = Concrete::<celeste_core::arith::Fixed>::default();
     for id in 0..n {
         if !need[id] {
             continue;

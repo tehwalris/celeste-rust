@@ -26,7 +26,7 @@ pub fn materialize_absent_fields<D: Domain>(st: &mut State<D>, d: &mut D) -> Res
             let Some(Value::Table(t)) = iface::get(st, &obj) else { bail!("{}: not a table", iface::show(&obj)) };
             match st.heap.tables[&t].hash.get(f) {
                 None | Some(Value::Nil) => {
-                    let zero = Value::Num(d.num(P8::from_raw(0)));
+                    let zero = Value::Num(d.num(<D::A as celeste_core::arith::Arithmetic>::from_i16(0)));
                     st.heap.tables.get_mut(&t).unwrap().hash.insert(f.to_string(), zero);
                 }
                 Some(Value::Num(_)) => {}
@@ -339,7 +339,7 @@ fn read_slot(st: &mut State<Symbolic>, d: &mut Symbolic, e: &Entry, s: &Slot, p:
 }
 
 /// An object's `(x, y)`: constants, floors and springs never move.
-fn position<D: Domain>(st: &State<D>, d: &D, obj: &Path) -> Result<(P8, P8)> {
+fn position<D: Domain<A = celeste_core::arith::Fixed>>(st: &State<D>, d: &D, obj: &Path) -> Result<(P8, P8)> {
     let get = |f: &str| -> Result<P8> {
         let p = field(obj, &[f]);
         match iface::get(st, &p) {

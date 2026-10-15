@@ -78,7 +78,7 @@ pub struct ArcAxis<D: Domain> {
 impl<D: Domain> ArcAxis<D> {
     /// No split taken (the values are placeholders).
     pub fn none(d: &mut D) -> Self {
-        let zero = d.num(crate::pico8_num::Pico8Num::from_i16(0));
+        let zero = d.num(<D::A as celeste_core::arith::Arithmetic>::from_i16(0));
         ArcAxis { took: d.boolean(false), pre: zero.clone(), frag: zero.clone(), ox: zero }
     }
 }

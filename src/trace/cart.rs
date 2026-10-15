@@ -25,6 +25,7 @@ pub const NATIVE: &[&str] = &[
     "abs",
     "flr",
     "__split_by_flr",
+    "__split_by_round",
     "__split_at",
     "print",
     "sin",

@@ -7,7 +7,7 @@ use anyhow::{anyhow, bail, Result};
 use full_moon::ast;
 use full_moon::tokenizer::{Symbol, TokenType};
 
-use crate::pico8_num::Pico8Num as P8;
+use celeste_core::arith::Arithmetic;
 
 use super::domain::{refuse_unknown, Arith, Cmp, Domain, Fun1, Fun2};
 use super::heap::{BodyId, TableId, Value};
@@ -690,7 +690,7 @@ impl<'a, D: Domain> Interp<'a, D> {
             let mut next: Outcome<D> = Vec::new();
             for (s, fl) in std::mem::take(&mut running) {
                 debug_assert!(fl.is_normal(), "only a running state re-enters the body");
-                let off = self.d.num(P8::from_i16(k as i16));
+                let off = self.d.num(<D::A as Arithmetic>::from_i16(k as i16));
                 let iv = self.d.arith(Arith::Add, &start, &off)?;
                 let cond = self.d.compare(Cmp::Le, &iv, &limit)?;
                 match self.decide(&cond) {
@@ -717,7 +717,7 @@ impl<'a, D: Domain> Interp<'a, D> {
             }
         }
         // Where the model ENDS, for states still running only.
-        let off = self.d.num(P8::from_i16(bound as i16));
+        let off = self.d.num(<D::A as Arithmetic>::from_i16(bound as i16));
         let iv = self.d.arith(Arith::Add, &start, &off)?;
         let over = self.d.compare(Cmp::Le, &iv, &limit)?;
         for (s, _) in running.iter_mut() {
@@ -753,17 +753,17 @@ impl<'a, D: Domain> Interp<'a, D> {
         &mut self,
         f: &'a ast::NumericFor,
         name: &str,
-        from: P8,
-        to: P8,
+        from: <D::A as Arithmetic>::Num,
+        to: <D::A as Arithmetic>::Num,
         s: State<D>,
     ) -> Result<Outcome<D>> {
 
         // A `break` ends the LOOP for that state, which carries on after it.
         let mut running: Outcome<D> = vec![(s, Flow::Normal)];
         let mut done: Outcome<D> = Vec::new();
-        let one = P8::from_i16(1);
+        let one = <D::A as Arithmetic>::from_i16(1);
         let mut i = from;
-        while i <= to && running.iter().any(|(_, f)| f.is_normal()) {
+        while <D::A as Arithmetic>::le(i, to) && running.iter().any(|(_, f)| f.is_normal()) {
             let mut next: Outcome<D> = Vec::new();
             for (mut cur, fl) in running {
                 if !fl.is_normal() {
@@ -787,7 +787,7 @@ impl<'a, D: Domain> Interp<'a, D> {
             running = next;
             // Past 32767 the console's counter WRAPS (and the loop never
             // ends): an error, as every overflow.
-            i = i.checked_add(one).ok_or_else(|| anyhow!("`for {name}={from:?},{to:?}`: the counter overflows past {i:?} (PICO-8 would wrap it)"))?;
+            i = <D::A as Arithmetic>::add(i, one).ok_or_else(|| anyhow!("`for {name}={from:?},{to:?}`: the counter overflows past {i:?} (PICO-8 would wrap it)"))?;
         }
         done.extend(running.into_iter().map(|(s, _)| (s, Flow::Normal)));
         Ok(done)
@@ -820,7 +820,7 @@ impl<'a, D: Domain> Interp<'a, D> {
                 let TokenType::Number { text } = n.token_type() else {
                     bail!("expected a number literal");
                 };
-                let v: P8 = text.parse()?;
+                let v = <D::A as Arithmetic>::parse_literal(text)?;
                 let n = self.d.num(v);
                 Ok(vec![(st, Value::Num(n))])
             }
@@ -862,7 +862,7 @@ impl<'a, D: Domain> Interp<'a, D> {
                                      on rehash history, not on the keys"
                                 )
                             })? as i16;
-                            let n = self.d.num(P8::from_i16(len));
+                            let n = self.d.num(<D::A as Arithmetic>::from_i16(len));
                             (st, Value::Num(n))
                         }
                         ast::UnOp::Not(_) => {
@@ -1051,7 +1051,7 @@ impl<'a, D: Domain> Interp<'a, D> {
         if let Some(op) = num_op {
             let (Value::Num(x), Value::Num(y)) = (a, b) else {
                 // Lua raises.
-                let zero = Value::Num(self.d.num(P8::from_i16(0)));
+                let zero = Value::Num(self.d.num(<D::A as Arithmetic>::from_i16(0)));
                 let why = format!("arithmetic on {} and {}", kind_of(a), kind_of(b));
                 return Ok((zero, Some(why)));
             };
@@ -1143,7 +1143,7 @@ impl<'a, D: Domain> Interp<'a, D> {
                     .d
                     .as_const(n)
                     .ok_or_else(|| refuse_unknown("a table index"))?;
-                let i = c.as_i16().ok_or_else(|| anyhow!("fractional table index"))?;
+                let i = <D::A as Arithmetic>::as_i16(c).ok_or_else(|| anyhow!("fractional table index"))?;
                 Key::Index(i)
             }
             other => bail!("unsupported table key {:?}", other),
@@ -1234,7 +1234,7 @@ impl<'a, D: Domain> Interp<'a, D> {
                             argsets = grown;
                         }
                         for (st, args) in argsets {
-                            if self.arc_capture && matches!(val, Value::Builtin("__split_by_flr")) {
+                            if self.arc_capture && matches!(val, Value::Builtin("__split_by_flr" | "__split_by_round")) {
                                 self.split_site = Some(self.split_site_of(arguments, &st)?);
                             }
                             let got = self
@@ -1298,7 +1298,7 @@ impl<'a, D: Domain> Interp<'a, D> {
                 Some(Value::Num(n)) => self
                     .d
                     .as_const(n)
-                    .and_then(|v| v.as_i16())
+                    .and_then(<D::A as Arithmetic>::as_i16)
                     .ok_or_else(|| anyhow!("tile_flag_at: room.{} is not a known integer", k)),
                 other => bail!("tile_flag_at: room.{} is {:?}", k, other),
             }
@@ -1311,8 +1311,8 @@ impl<'a, D: Domain> Interp<'a, D> {
         let mut found = false;
         'scan: for i in 0..16i16 {
             for j in 0..16i16 {
-                let t = cart.mget(P8::from_i16(rx * 16 + i), P8::from_i16(ry * 16 + j))?;
-                if cart.fget(P8::from_i16(t as i16), P8::from_i16(flag))? {
+                let t = cart.mget_whole(rx * 16 + i, ry * 16 + j);
+                if cart.fget_whole(t, flag)? {
                     found = true;
                     break 'scan;
                 }
@@ -1535,6 +1535,52 @@ impl<'a, D: Domain> Interp<'a, D> {
         Ok(())
     }
 
+    /// `__split_by_flr(x)`: the fork at `flr`. The fork is a CHOICE, not a
+    /// state fan-out: one node whose value depends on the fragment (one
+    /// fragment on an exact value). Validity goes in the GUARD (fragments
+    /// partition the lane); coverage is the fork's own error (a lane
+    /// spanning more floors than fragments cannot run in this body).
+    fn split_floor(&mut self, st: State<D>, x: D::Num, player_axis: Option<usize>) -> Result<Multi<D, Value<D>>> {
+        // A value every lane holds alike: each fragment runs as its
+        // own trace state, rejoined when the call returns.
+        if let Some(frags) = self.d.literal_fragments(&x)? {
+            // Its fragments rejoin into one hull: no body keeps the piece.
+            anyhow::ensure!(player_axis.is_none(), "arc capture: the player's remainder split on axis {player_axis:?} is a literal split");
+            if frags.len() == 1 {
+                return Ok(vec![(st, Value::Num(frags[0].clone()))]);
+            }
+            let (id, depth) = (self.next_split, st.stack.len());
+            self.next_split += 1;
+            return Ok(frags
+                .into_iter()
+                .enumerate()
+                .map(|(c, v)| {
+                    let mut s = st.clone();
+                    s.frag.push((depth, id, c as u16));
+                    (s, Value::Num(v))
+                })
+                .collect());
+        }
+        let mut st = st;
+        if !self.d.is_interval(&x) {
+            if let Some(axis) = player_axis {
+                self.capture_player_split(&mut st, axis, &x, &x)?;
+            }
+            Ok(vec![(st, Value::Num(x))])
+        } else {
+            // The coverage error is derived where evaluated.
+            let ways = self.d.flr_ways(&x);
+            let (v, valid) = self.d.fork_flr(&x, ways);
+            let at = st.decided(&mut self.d);
+            self.d.evaluated_at(&v, &at);
+            st.guard = self.d.and(&st.guard, &valid);
+            if let Some(axis) = player_axis {
+                self.capture_player_split(&mut st, axis, &x, &v)?;
+            }
+            Ok(vec![(st, Value::Num(v))])
+        }
+    }
+
     fn call_builtin(
         &mut self,
         name: &'static str,
@@ -1572,13 +1618,16 @@ impl<'a, D: Domain> Interp<'a, D> {
                     .clone()
                     .ok_or_else(|| anyhow!("{}: no cart loaded", name))?;
                 let (a, b) = (num(0)?, num(1)?);
+                let int = |v, what| <D::A as Arithmetic>::as_i16(v).ok_or_else(|| anyhow!("{name}: {what} is not an integer"));
                 match (self.d.as_const(&a), self.d.as_const(&b)) {
                     (Some(x), Some(y)) => {
+                        let (x, y) = (int(x, "the first argument")?, int(y, "the second argument")?);
                         if name == "mget" {
-                            let t = cart.mget(x, y)?;
-                            (st, Value::Num(self.d.num(P8::from_i16(t as i16))))
+                            let t = cart.mget_whole(x, y);
+                            (st, Value::Num(self.d.num(<D::A as Arithmetic>::from_i16(t as i16))))
                         } else {
-                            let r = cart.fget(x, y)?;
+                            let t = u8::try_from(x).map_err(|_| anyhow!("fget: i is out of range"))?;
+                            let r = cart.fget_whole(t, y)?;
                             (st, Value::Bool(self.d.boolean(r)))
                         }
                     }
@@ -1589,7 +1638,7 @@ impl<'a, D: Domain> Interp<'a, D> {
             // Native: folds on concrete coordinates, else one graph node.
             "tile_flag_at" => {
                 let (x, y, w, h, fl) = (num(0)?, num(1)?, num(2)?, num(3)?, num(4)?);
-                let gi = |v: P8| v.as_i16().ok_or_else(|| anyhow!("tile_flag_at: non-integer"));
+                let gi = |v| <D::A as Arithmetic>::as_i16(v).ok_or_else(|| anyhow!("tile_flag_at: non-integer"));
                 // THE FLAG DECIDES FIRST: a flag no tile of the room carries
                 // is false everywhere, exactly; others are answered like solid.
                 let Some(fi) = self.d.as_const(&fl).map(gi).transpose()? else {
@@ -1635,7 +1684,7 @@ impl<'a, D: Domain> Interp<'a, D> {
                         None => bail!("printh of an undecided boolean"),
                     },
                     Some(Value::Num(n)) => match self.d.as_const(n) {
-                        Some(v) => fmt_p8(v),
+                        Some(v) => <D::A as Arithmetic>::printh(v)?,
                         None => bail!("printh of a symbolic number"),
                     },
                     Some(other) => bail!("printh of {:?}", other),
@@ -1649,8 +1698,7 @@ impl<'a, D: Domain> Interp<'a, D> {
             "__hex" => {
                 let Some(Value::Num(n)) = args.first() else { bail!("__hex of a non-number: {:?}", args.first()) };
                 let Some(v) = self.d.as_const(n) else { bail!("__hex of a symbolic number") };
-                let raw = v.to_bits();
-                self.prints.push(format!("0x{:04x}.{:04x}", raw >> 16, raw & 0xffff));
+                self.prints.push(<D::A as Arithmetic>::hex(v));
                 (st, Value::Nil)
             }
             // A merge hint: the tracer merges at every join anyway.
@@ -1673,61 +1721,48 @@ impl<'a, D: Domain> Interp<'a, D> {
                 tab.set_index(n as i16, Value::Nil);
                 (st, Value::Nil)
             }
-            // The fork is a CHOICE, not a state fan-out: one node whose value
-            // depends on the fragment (one fragment on an exact value).
-            // Validity goes in the GUARD (fragments partition the lane);
-            // coverage is the fork's own error (a lane spanning more floors
-            // than fragments cannot run in this body).
-            "__split_by_flr" | "__split_at" => {
+            // The forks (`split_floor`; `__split_by_round` below).
+            "__split_by_flr" | "__split_at" | "__split_by_round" => {
                 let x = num(0)?;
-                let site = match (self.arc_capture && name == "__split_by_flr", self.split_site.take()) {
+                let site = match (self.arc_capture && name != "__split_at", self.split_site.take()) {
                     (false, _) => None,
                     (true, Some(site)) => Some(site),
-                    (true, None) => bail!("arc capture: a `__split_by_flr` call the tracer did not see the argument of"),
+                    (true, None) => bail!("arc capture: a `{name}` call the tracer did not see the argument of"),
                 };
                 let player_axis = match site {
                     Some(SplitSite::Player(axis)) => Some(axis),
                     _ => None,
                 };
-                // A value every lane holds alike: each fragment runs as its
-                // own trace state, rejoined when the call returns.
-                if let Some(frags) = self.d.literal_fragments(&x)? {
-                    // Its fragments rejoin into one hull: no body keeps the piece.
-                    anyhow::ensure!(player_axis.is_none(), "arc capture: the player's remainder split on axis {player_axis:?} is a literal split");
-                    if frags.len() == 1 {
-                        return Ok(vec![(st, Value::Num(frags[0].clone()))]);
-                    }
-                    let (id, depth) = (self.next_split, st.stack.len());
-                    self.next_split += 1;
-                    return Ok(frags
+                if name != "__split_by_round" {
+                    return self.split_floor(st, x, player_axis);
+                }
+                // `__split_by_round(v)`: the fragments of `v` on which
+                // `flr(v + 1/2)` is one integer (`move`'s pixel amount, the
+                // original cart's expression). In 16.16 `v + 1/2 - 1/2` is
+                // exact, so they are the floor fork's of `v + 1/2` shifted
+                // back, and the arc capture records the split of `v + 1/2`.
+                if <D::A as Arithmetic>::ROUND_BY_SHIFTED_FLOOR {
+                    let one = <D::A as Arithmetic>::from_i16(1);
+                    let half = <D::A as Arithmetic>::div(one, <D::A as Arithmetic>::from_i16(2)).expect("1/2");
+                    let half = self.d.num(half);
+                    let t = self.d.arith(Arith::Add, &x, &half)?;
+                    let shifted = self.split_floor(st, t, player_axis)?;
+                    return shifted
                         .into_iter()
-                        .enumerate()
-                        .map(|(c, v)| {
-                            let mut s = st.clone();
-                            s.frag.push((depth, id, c as u16));
-                            (s, Value::Num(v))
+                        .map(|(s, v)| {
+                            let Value::Num(v) = v else { bail!("__split_by_round: a fragment that is not a number") };
+                            Ok((s, Value::Num(self.d.arith(Arith::Sub, &v, &half)?)))
                         })
-                        .collect());
+                        .collect();
                 }
-                if !self.d.is_interval(&x) {
-                    let mut st = st;
-                    if let Some(axis) = player_axis {
-                        self.capture_player_split(&mut st, axis, &x, &x)?;
-                    }
-                    (st, args[0].clone())
-                } else {
-                    // The coverage error is derived where evaluated.
-                    let ways = self.d.flr_ways(&x);
-                    let (v, valid) = self.d.fork_flr(&x, ways);
-                    let at = st.decided(&mut self.d);
-                    self.d.evaluated_at(&v, &at);
-                    let mut st = st;
-                    st.guard = self.d.and(&st.guard, &valid);
-                    if let Some(axis) = player_axis {
-                        self.capture_player_split(&mut st, axis, &x, &v)?;
-                    }
-                    (st, Value::Num(v))
+                // Elsewhere (doubles: `+ 1/2` rounds) the domain forks at
+                // the exact cut points.
+                let v = self.d.fork_round(&x)?;
+                let mut st = st;
+                if let Some(axis) = player_axis {
+                    self.capture_player_split(&mut st, axis, &x, &v)?;
                 }
+                (st, Value::Num(v))
             }
             "__new_unknown_boolean" => (st, Value::Bool(self.d.unknown_bool()?)),
             // `rnd(x)`: the whole range [0, x), a sound over-approximation of
@@ -1735,16 +1770,15 @@ impl<'a, D: Domain> Interp<'a, D> {
             // refused.
             "rnd" => {
                 let x = match args.first() {
-                    None => P8::from_i16(1),
+                    None => <D::A as Arithmetic>::from_i16(1),
                     Some(Value::Num(n)) => self
                         .d
                         .as_const(n)
                         .ok_or_else(|| anyhow!("rnd: a non-constant bound is not modelled"))?,
                     Some(other) => bail!("rnd: expected a number, got {:?}", other),
                 };
-                anyhow::ensure!(x > P8::from_i16(0), "rnd: a non-positive bound {x:?} is not modelled");
-                let hi = P8::from_raw(x.as_raw_u32() as i32 - 1);
-                (st, Value::Num(self.d.range_num(P8::from_i16(0), hi)?))
+                let hi = <D::A as Arithmetic>::rnd_top(x).ok_or_else(|| anyhow!("rnd: a non-positive bound {x:?} is not modelled"))?;
+                (st, Value::Num(self.d.range_num(<D::A as Arithmetic>::from_i16(0), hi)?))
             }
             "min" | "max" => {
                 let f = if name == "min" { Fun2::Min } else { Fun2::Max };
@@ -1759,7 +1793,7 @@ impl<'a, D: Domain> Interp<'a, D> {
 
 /// A numeric `for`'s limit: known now, or only at run time.
 enum Bound<D: Domain> {
-    Concrete(P8, P8),
+    Concrete(<D::A as Arithmetic>::Num, <D::A as Arithmetic>::Num),
     Symbolic(D::Num, D::Num),
 }
 
@@ -1901,6 +1935,7 @@ impl Pairing {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::pico8_num::Pico8Num as P8;
     use crate::trace::domain::{Concrete, Symbolic};
     use crate::trace::heap::Heap;
     use crate::transpile::graph::Op;
@@ -1945,7 +1980,7 @@ mod tests {
             result = hyp2(t) + acc
             "#,
         );
-        let (it, v) = run(Concrete, &ast);
+        let (it, v) = run(Concrete::<celeste_core::arith::Fixed>::default(), &ast);
         let Value::Num(n) = v else { panic!("expected a number, got {:?}", v) };
         assert_eq!(it.d.as_const(&n), Some(P8::from_i16(31)));
     }
@@ -2142,7 +2177,7 @@ mod tests {
             ("local m = -32767 - 1\n x = -m", "-(-32768)"),
             ("local m = -32767 - 1\n x = abs(m)", "abs(-32768)"),
         ] {
-            for err in [refused(Symbolic::default(), src).err(), refused(Concrete, src).err()] {
+            for err in [refused(Symbolic::default(), src).err(), refused(Concrete::<celeste_core::arith::Fixed>::default(), src).err()] {
                 let e = format!("{:#}", err.unwrap_or_else(|| panic!("{src}: refused")));
                 assert!(e.contains("arithmetic overflow") && e.contains("leaves the 16.16 range"), "{src}: {e}");
                 let shown = what.replace("-(-32768)", "--32768");
@@ -2151,7 +2186,7 @@ mod tests {
         }
         // A counter past the range, a literal past it.
         for (src, what) in [("for i = 32760, 32767 do end", "the counter overflows"), ("x = 32768", "leaves the 16.16 range")] {
-            let e = format!("{:#}", refused(Concrete, src).expect_err(src));
+            let e = format!("{:#}", refused(Concrete::<celeste_core::arith::Fixed>::default(), src).expect_err(src));
             assert!(e.contains(what), "{src}: {e}");
         }
         // One step inside: exact.
@@ -2183,17 +2218,6 @@ mod tests {
         let err = it.exec_block(ast.nodes(), st).err().expect("refused");
         assert!(format!("{err:#}").contains("more than 255 fragments"), "{err:#}");
     }
-}
-
-/// A number as `printh` renders it (`printh(1/3)` prints `0.3333`).
-fn fmt_p8(v: P8) -> String {
-    if let Some(i) = v.as_i16() {
-        return format!("{}", i);
-    }
-    let raw = v.as_raw_u32() as i32 as f64 / 65536.0;
-    let s = format!("{:.4}", raw);
-    let s = s.trim_end_matches('0').trim_end_matches('.').to_string();
-    s
 }
 
 /// A value's Lua type name, for `poison` (one gap regardless of operands).

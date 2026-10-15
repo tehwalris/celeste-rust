@@ -11,6 +11,7 @@ use std::fmt::Debug;
 use anyhow::{bail, Result};
 
 use crate::pico8_num::Pico8Num as P8;
+use celeste_core::arith::{Arithmetic, Fixed};
 use crate::transpile::graph::{Graph, NodeId, Op};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -101,10 +102,13 @@ pub struct Fork {
 }
 
 pub trait Domain {
+    /// The game's arithmetic (`celeste_core::arith`): what a literal, a
+    /// constant and every operation on numbers mean.
+    type A: Arithmetic;
     type Num: Clone + Debug + PartialEq;
     type Bool: Clone + Debug + PartialEq;
 
-    fn num(&mut self, v: P8) -> Self::Num;
+    fn num(&mut self, v: <Self::A as Arithmetic>::Num) -> Self::Num;
     fn boolean(&mut self, b: bool) -> Self::Bool;
 
     fn arith(&mut self, op: Arith, a: &Self::Num, b: &Self::Num) -> Result<Self::Num>;
@@ -148,7 +152,7 @@ pub trait Domain {
     fn unknown_bool(&mut self) -> Result<Self::Bool>;
 
     /// A number known only to lie in `[lo, hi]` (`rnd`); `Concrete` refuses.
-    fn range_num(&mut self, lo: P8, hi: P8) -> Result<Self::Num> {
+    fn range_num(&mut self, lo: <Self::A as Arithmetic>::Num, hi: <Self::A as Arithmetic>::Num) -> Result<Self::Num> {
         bail!("a number in [{lo:?}, {hi:?}] has no concrete value - this domain runs real inputs only")
     }
 
@@ -159,7 +163,7 @@ pub trait Domain {
 
     /// A number this value definitely is. Needed where the HEAP depends on it
     /// (index, key, loop bound); unknown is a refusal.
-    fn as_const(&self, v: &Self::Num) -> Option<P8>;
+    fn as_const(&self, v: &Self::Num) -> Option<<Self::A as Arithmetic>::Num>;
 
     /// What this value IS, for an error message.
     fn describe(&self, _v: &Self::Num) -> String {
@@ -190,6 +194,14 @@ pub trait Domain {
     /// it; the identity on exact values.
     fn fork_flr(&mut self, v: &Self::Num, _ways: u8) -> (Self::Num, Self::Bool) {
         (v.clone(), self.boolean(true))
+    }
+
+    /// Fork at `flr(x + 1/2)` (`__split_by_round`) in an arithmetic where
+    /// the fragments are NOT the floor fork's of `x + 1/2` shifted back
+    /// (`Float`: `x + 1/2 - 1/2` rounds). The restricted value; the identity
+    /// on exact values. 16.16 shifts instead (`Interp`), exactly.
+    fn fork_round(&mut self, v: &Self::Num) -> Result<Self::Num> {
+        bail!("__split_by_round of {v:?}: this domain has no exact round fork")
     }
 
     /// `n`, an operator with an own error (`trace::error`), was computed
@@ -274,65 +286,73 @@ const ESCAPE_ATOMS: usize = 6;
 // ---------------------------------------------------------------- concrete
 
 /// A number for an error message, as its decimal value.
-fn show(n: P8) -> String {
-    format!("{}", n.as_raw_u32() as i32 as f64 / 65536.0)
+fn show<A: Arithmetic>(n: A::Num) -> String {
+    A::show(n)
 }
 
 /// THE overflow error of the concrete domain (and so of the tracer's
-/// constant folding, `Symbolic::arith`): the operation that left the 16.16
-/// range. The game never overflows, so one is a modelling surprise, never a
-/// wrapped value (the reference engine's is `refdomain`'s).
-fn overflow(what: String) -> anyhow::Error {
-    anyhow::anyhow!("arithmetic overflow: {what} leaves the 16.16 range (PICO-8 would wrap or saturate; overflow is an error)")
+/// constant folding, `Symbolic::arith`): the operation that left the
+/// arithmetic's range. The game never overflows, so one is a modelling
+/// surprise, never a wrapped value (the reference engine's is `refdomain`'s).
+fn overflow<A: Arithmetic>(what: String) -> anyhow::Error {
+    anyhow::anyhow!("arithmetic overflow: {what} leaves {}", A::RANGE_NOTE)
 }
 
-#[derive(Default)]
-pub struct Concrete;
+/// The concrete domain of arithmetic `A`: numbers are values. `Concrete`
+/// is 16.16's, the ORACLE and the tracer's constant folding.
+pub struct Concrete<A: Arithmetic = Fixed>(std::marker::PhantomData<A>);
 
-impl Domain for Concrete {
-    type Num = P8;
+impl<A: Arithmetic> Default for Concrete<A> {
+    fn default() -> Self {
+        Concrete(std::marker::PhantomData)
+    }
+}
+
+impl<A: Arithmetic> Domain for Concrete<A> {
+    type A = A;
+    type Num = A::Num;
     type Bool = bool;
 
-    fn num(&mut self, v: P8) -> P8 {
+    fn num(&mut self, v: A::Num) -> A::Num {
         v
     }
     fn boolean(&mut self, b: bool) -> bool {
         b
     }
-    /// The exact result; one past the 16.16 range (where PICO-8 wraps or
-    /// saturates) is an error, as everywhere (`overflow`).
-    fn arith(&mut self, op: Arith, a: &P8, b: &P8) -> Result<P8> {
+    /// The exact result; one past the arithmetic's range (where PICO-8 wraps
+    /// or saturates, or a double is not finite) is an error, as everywhere
+    /// (`overflow`).
+    fn arith(&mut self, op: Arith, a: &A::Num, b: &A::Num) -> Result<A::Num> {
         let (r, sym) = match op {
-            Arith::Add => (a.checked_add(*b), "+"),
-            Arith::Sub => (a.checked_sub(*b), "-"),
-            Arith::Mul => (a.checked_mul(*b), "*"),
-            Arith::Div => (a.checked_div(*b), "/"),
-            // Never overflows: in `[0, |b|)`, or 0 for `b == 0`.
-            Arith::Rem => (Some(*a % *b), "%"),
+            Arith::Add => (A::add(*a, *b), "+"),
+            Arith::Sub => (A::sub(*a, *b), "-"),
+            Arith::Mul => (A::mul(*a, *b), "*"),
+            Arith::Div => (A::div(*a, *b), "/"),
+            Arith::Rem => (A::rem(*a, *b), "%"),
         };
-        r.ok_or_else(|| overflow(format!("{} {sym} {}", show(*a), show(*b))))
+        r.ok_or_else(|| overflow::<A>(format!("{} {sym} {}", show::<A>(*a), show::<A>(*b))))
     }
-    fn fun1(&mut self, f: Fun1, a: &P8) -> Result<P8> {
+    fn fun1(&mut self, f: Fun1, a: &A::Num) -> Result<A::Num> {
         Ok(match f {
-            Fun1::Neg => a.checked_neg().ok_or_else(|| overflow(format!("-{}", show(*a))))?,
-            Fun1::Abs => a.checked_abs().ok_or_else(|| overflow(format!("abs({})", show(*a))))?,
-            Fun1::Flr => a.flr(),
-            Fun1::Sin => a.pico8_sin(),
+            Fun1::Neg => A::neg(*a).ok_or_else(|| overflow::<A>(format!("-{}", show::<A>(*a))))?,
+            Fun1::Abs => A::abs(*a).ok_or_else(|| overflow::<A>(format!("abs({})", show::<A>(*a))))?,
+            Fun1::Flr => A::flr(*a),
+            Fun1::Sin => A::sin(*a).ok_or_else(|| overflow::<A>(format!("sin({})", show::<A>(*a))))?,
         })
     }
-    fn fun2(&mut self, f: Fun2, a: &P8, b: &P8) -> Result<P8> {
+    fn fun2(&mut self, f: Fun2, a: &A::Num, b: &A::Num) -> Result<A::Num> {
         Ok(match f {
-            Fun2::Min => (*a).min(*b),
-            Fun2::Max => (*a).max(*b),
+            Fun2::Min => A::min(*a, *b),
+            Fun2::Max => A::max(*a, *b),
         })
     }
-    fn compare(&mut self, op: Cmp, a: &P8, b: &P8) -> Result<bool> {
+    fn compare(&mut self, op: Cmp, a: &A::Num, b: &A::Num) -> Result<bool> {
         Ok(match op {
-            Cmp::Lt => a < b,
-            Cmp::Le => a <= b,
-            Cmp::Gt => a > b,
-            Cmp::Ge => a >= b,
-            Cmp::Eq => a == b,
+            Cmp::Lt => A::lt(*a, *b),
+            Cmp::Le => A::le(*a, *b),
+            Cmp::Gt => A::lt(*b, *a),
+            Cmp::Ge => A::le(*b, *a),
+            Cmp::Eq => A::num_eq(*a, *b),
         })
     }
     fn not(&mut self, a: &bool) -> bool {
@@ -344,7 +364,7 @@ impl Domain for Concrete {
     fn decide(&self, c: &bool) -> Option<bool> {
         Some(*c)
     }
-    fn sel_num(&mut self, c: &bool, t: &P8, f: &P8) -> P8 {
+    fn sel_num(&mut self, c: &bool, t: &A::Num, f: &A::Num) -> A::Num {
         if *c {
             *t
         } else {
@@ -358,20 +378,23 @@ impl Domain for Concrete {
             *f
         }
     }
-    fn mget(&mut self, _: &P8, _: &P8) -> Result<P8> {
+    fn mget(&mut self, _: &A::Num, _: &A::Num) -> Result<A::Num> {
         bail!("mget with unknown coordinates cannot happen concretely")
     }
-    fn tile_flag_at(&mut self, _: &P8, _: &P8, _: &P8, _: &P8, _: &P8) -> Result<bool> {
+    fn tile_flag_at(&mut self, _: &A::Num, _: &A::Num, _: &A::Num, _: &A::Num, _: &A::Num) -> Result<bool> {
         bail!("tile_flag_at with unknown coordinates cannot happen concretely")
     }
     fn unknown_bool(&mut self) -> Result<bool> {
         bail!("the concrete domain has no unknown booleans - supply real inputs")
     }
-    fn as_const(&self, v: &P8) -> Option<P8> {
+    fn as_const(&self, v: &A::Num) -> Option<A::Num> {
         Some(*v)
     }
+    fn fork_round(&mut self, v: &A::Num) -> Result<A::Num> {
+        Ok(*v)
+    }
 
-    fn describe(&self, v: &P8) -> String {
+    fn describe(&self, v: &A::Num) -> String {
         format!("{:?}", v)
     }
 }
@@ -984,6 +1007,7 @@ impl Symbolic {
 }
 
 impl Domain for Symbolic {
+    type A = Fixed;
     type Num = NodeId;
     type Bool = NodeId;
 
@@ -996,7 +1020,7 @@ impl Domain for Symbolic {
     fn arith(&mut self, op: Arith, a: &NodeId, b: &NodeId) -> Result<NodeId> {
         // Fold known operands, so what the heap depends on stays concrete.
         if let (Some(x), Some(y)) = (self.as_p8(*a), self.as_p8(*b)) {
-            let mut c = Concrete;
+            let mut c = Concrete::<Fixed>::default();
             return Ok(self.konst(c.arith(op, &x, &y)?));
         }
         if self.is_unknown_num(*a) || self.is_unknown_num(*b) {
@@ -1029,7 +1053,7 @@ impl Domain for Symbolic {
     }
     fn fun1(&mut self, f: Fun1, a: &NodeId) -> Result<NodeId> {
         if let Some(x) = self.as_p8(*a) {
-            let mut c = Concrete;
+            let mut c = Concrete::<Fixed>::default();
             return Ok(self.konst(c.fun1(f, &x)?));
         }
         // `sin` of anything is in [-1, 1]; other builtins of unknown: unknown.
@@ -1063,7 +1087,7 @@ impl Domain for Symbolic {
     }
     fn fun2(&mut self, f: Fun2, a: &NodeId, b: &NodeId) -> Result<NodeId> {
         if let (Some(x), Some(y)) = (self.as_p8(*a), self.as_p8(*b)) {
-            let mut c = Concrete;
+            let mut c = Concrete::<Fixed>::default();
             return Ok(self.konst(c.fun2(f, &x, &y)?));
         }
         if self.is_unknown_num(*a) || self.is_unknown_num(*b) {
@@ -1088,7 +1112,7 @@ impl Domain for Symbolic {
     }
     fn compare(&mut self, op: Cmp, a: &NodeId, b: &NodeId) -> Result<NodeId> {
         if let (Some(x), Some(y)) = (self.as_p8(*a), self.as_p8(*b)) {
-            let mut c = Concrete;
+            let mut c = Concrete::<Fixed>::default();
             let r = c.compare(op, &x, &y)?;
             return Ok(self.graph.leaf(Op::ConstBool(r)));
         }

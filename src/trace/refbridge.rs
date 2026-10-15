@@ -24,7 +24,7 @@ pub fn from_block(
 
 /// Set the six buttons of a reference state from an input byte (bit 0 left,
 /// 1 right, 2 up, 3 down, 4 jump, 5 dash). Returns the button table.
-pub fn set_buttons(st: &mut State<RefDomain>, byte: u8) -> Result<TableId> {
+pub fn set_buttons<A: celeste_core::arith::Arithmetic>(st: &mut State<RefDomain<A>>, byte: u8) -> Result<TableId> {
     let Some(Value::Table(t)) = st.heap.tables[&st.globals].hash.get(BUTTON_GLOBAL).cloned() else {
         bail!("no {BUTTON_GLOBAL} table")
     };

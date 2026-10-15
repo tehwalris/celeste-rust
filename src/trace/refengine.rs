@@ -19,20 +19,24 @@ use crate::trace::refbridge::{from_block, set_buttons, to_block};
 use crate::trace::refdomain::RefDomain;
 use crate::trace::refdriver::{fresh_interp, run_frame_all};
 use crate::pico8_num::{Pico8Num as P8, Pico8NumInterval as Iv};
+use celeste_core::arith::{Arithmetic, Fixed, Float};
 use crate::trace::heap::Value;
 use crate::trace::iface;
 use crate::trace::state::State;
 use crate::trace::widen::{field, objects_of_type};
 use crate::trace::verify::run_one;
 
-pub struct RefEngine {
-    it: Interp<'static, RefDomain>,
+/// The reference engine of arithmetic `A`: `RefEngine` is the real game's
+/// (16.16), the oracle of the kernels; `FloatRefEngine` the float tools'
+/// (UniversalClassicTas, Celia), the float oracle (plans/float-solver.md).
+pub struct ReferenceEngine<A: Arithmetic> {
+    it: Interp<'static, RefDomain<A>>,
     /// `__reset_button_states();_update();_draw()`: the buttons are forks.
     body: &'static ast::Ast,
     /// `_update();_draw()` with no reset: the caller has set the buttons.
     body_concrete: &'static ast::Ast,
     /// The post-`_init` state: the room's start, and what a block does not carry.
-    base: State<RefDomain>,
+    base: State<RefDomain<A>>,
     fn_info: FnInfo,
     /// The most fork paths one frame may take (`refdriver::TooManyPaths`).
     path_cap: usize,
@@ -43,12 +47,17 @@ pub struct RefEngine {
     settings: std::sync::Arc<crate::settings::Settings>,
 }
 
+/// The real game's reference engine (16.16).
+pub type RefEngine = ReferenceEngine<Fixed>;
+/// The float tools' reference engine (Lua doubles).
+pub type FloatRefEngine = ReferenceEngine<Float>;
+
 // The raw pointers inside (`Interp`'s AST references) point into the
 // `'static` ASTs leaked in `new`, immutable and never freed, so moving the
 // engine to another thread is sound.
-unsafe impl Send for RefEngine {}
+unsafe impl<A: Arithmetic> Send for ReferenceEngine<A> {}
 
-impl RefEngine {
+impl<A: Arithmetic> ReferenceEngine<A> {
     /// Parse the cart, run its toplevel and `_init` for the start room of
     /// settings `s`, the engine's settings from then on.
     pub fn new(s: &crate::settings::Settings) -> Result<Self> {
@@ -64,12 +73,12 @@ impl RefEngine {
         let cache = Arc::new(CollisionCache::new(&cart, rx, ry)?);
 
         let mut it = fresh_interp(cart, cache);
-        let st0 = crate::trace::cart::fresh_state::<RefDomain>(&mut it.d);
+        let st0 = crate::trace::cart::fresh_state::<RefDomain<A>>(&mut it.d);
         let mut st0 = run_one(&mut it, top, st0)?;
         crate::trace::cart::inject_tile_flag_at(&mut st0);
         let base = run_one(&mut it, init, st0)?;
         let fn_info = fn_info_of(&base)?;
-        Ok(RefEngine { it, body, body_concrete, base, fn_info, path_cap: 1_000_000, level: Level::EXACT, settings: std::sync::Arc::new(s.clone()) })
+        Ok(ReferenceEngine { it, body, body_concrete, base, fn_info, path_cap: 1_000_000, level: Level::EXACT, settings: std::sync::Arc::new(s.clone()) })
     }
 
     /// The engine with `run_lane` at `level`.
@@ -84,6 +93,30 @@ impl RefEngine {
         self.path_cap = cap;
     }
 
+    /// The room's start (post-`_init`) as a state.
+    pub fn start_state(&self) -> &State<RefDomain<A>> {
+        &self.base
+    }
+
+    /// One whole GAME frame of a CONCRETE state under input `byte` (bit 0
+    /// left, ... 5 dash): every leaf (it forks only where no input decides,
+    /// `rnd`), over the split frame's two steps where it is on.
+    pub fn frame_states(&mut self, st: &State<RefDomain<A>>, byte: u8) -> Result<Vec<State<RefDomain<A>>>> {
+        let mut out = vec![st.clone()];
+        for _ in 0..self.settings.steps_per_frame() {
+            let mut next = Vec::new();
+            for st in &out {
+                let mut st = st.clone();
+                set_buttons(&mut st, byte)?;
+                next.extend(run_frame_all(&mut self.it, self.body_concrete, &st, &[], Level::EXACT, self.path_cap)?);
+            }
+            out = next;
+        }
+        Ok(out)
+    }
+}
+
+impl RefEngine {
     /// The room's start (post-`_init`) as a one-row block, without keys.
     pub fn initial(&self) -> Result<Rt2> {
         to_block(&self.base, self.settings.room)
@@ -280,7 +313,7 @@ fn ran_from(st: &State<RefDomain>, byte: Option<u8>) -> String {
         .flat_map(|ty| objects_of_type(st, ty))
         .map(|o| {
             let n = |f: &str| match iface::get(st, &field(&o, &[f])) {
-                Some(Value::Num(v)) => crate::trace::refdomain::show(&v),
+                Some(Value::Num(v)) => crate::trace::refdomain::show::<celeste_core::arith::Fixed>(&v),
                 other => format!("{other:?}"),
             };
             format!("{} at ({}, {})", iface::show(&o), n("x"), n("y"))

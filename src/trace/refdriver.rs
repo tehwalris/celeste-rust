@@ -14,13 +14,15 @@ use celeste_core::cart_data::CartData;
 use celeste_core::collision_cache::CollisionCache;
 use full_moon::ast;
 
+use celeste_core::arith::Arithmetic;
+
 use crate::trace::interp::Interp;
 use crate::trace::refdomain::{Cursor, RefDomain};
 use crate::trace::state::State;
 
 /// An `Interp<RefDomain>` with the room's cart and collision cache. The caller
 /// runs the cart toplevel and `_init` on it once, then reuses it every frame.
-pub fn fresh_interp<'a>(cart: Arc<CartData>, cache: Arc<CollisionCache>) -> Interp<'a, RefDomain> {
+pub fn fresh_interp<'a, A: Arithmetic>(cart: Arc<CartData>, cache: Arc<CollisionCache>) -> Interp<'a, RefDomain<A>> {
     let mut it = Interp::new(RefDomain::new());
     it.cart = Some(cart);
     it.cache = Some(cache);
@@ -43,14 +45,14 @@ pub fn fresh_interp<'a>(cart: Arc<CartData>, cache: Arc<CollisionCache>) -> Inte
 ///
 /// More than `cap` paths is an error, `TooManyPaths` (every path's output is
 /// held: the cap bounds the memory).
-pub fn run_frame_all<'a>(
-    it: &mut Interp<'a, RefDomain>,
+pub fn run_frame_all<'a, A: Arithmetic>(
+    it: &mut Interp<'a, RefDomain<A>>,
     body: &'a ast::Ast,
-    input: &State<RefDomain>,
+    input: &State<RefDomain<A>>,
     unknown: &[(crate::trace::heap::TableId, String)],
     level: crate::abstraction::Level,
     cap: usize,
-) -> Result<Vec<State<RefDomain>>> {
+) -> Result<Vec<State<RefDomain<A>>>> {
     it.d.cursor = Cursor::new();
     let mut outputs = Vec::new();
     let mut paths = 0usize;
@@ -115,17 +117,18 @@ impl std::error::Error for TooManyPaths {}
 /// whole number in it, by the cursor, and `collideable` is `state ~= 2` - the
 /// cart keeps the two in step, so a stored unknown `collideable` is not a
 /// separate choice.
-fn concretize_near_floors(st: &mut State<RefDomain>, d: &mut RefDomain) -> Result<()> {
-    use crate::pico8_num::{Pico8Num as P8, Pico8NumInterval as Iv};
+fn concretize_near_floors<A: Arithmetic>(st: &mut State<RefDomain<A>>, d: &mut RefDomain<A>) -> Result<()> {
     use crate::trace::heap::Value;
     use crate::trace::iface;
     use crate::trace::widen::{field, objects_of_type};
     for obj in objects_of_type(st, "fall_floor") {
         let (ps, pc) = (field(&obj, &["state"]), field(&obj, &["collideable"]));
         let Some(Value::Num(v)) = iface::get(st, &ps) else { bail!("{}: not a number", iface::show(&ps)) };
-        let (lo, hi) = (v.low.as_i16_or_err()?, v.high.as_i16_or_err()?);
+        let int = |n| A::as_i16(n).ok_or_else(|| anyhow::anyhow!("{}: {} is not an integer", iface::show(&ps), A::show(n)));
+        let (lo, hi) = A::bounds(v);
+        let (lo, hi) = (int(lo)?, int(hi)?);
         let k = lo + d.cursor.choose((hi - lo + 1) as u32) as i16;
-        iface::set(st, &ps, Value::Num(Iv::from_number(P8::from_i16(k))))?;
+        iface::set(st, &ps, Value::Num(A::point(A::from_i16(k))))?;
         iface::set(st, &pc, Value::Bool(k != 2))?;
     }
     Ok(())
