@@ -216,6 +216,11 @@ pub fn encode_blocks(p: &mut Parts) -> Vec<(Vec<u8>, bool)> {
     let mut out = Vec::new();
     let mut i = 0usize;
     let (mut t_new, mut x_new) = (vec![u32::MAX; p.targets.len()], vec![u32::MAX; p.pairs.len()]);
+    // Per target and pair, the last block holding it (distinct ones listed
+    // once, then sorted: a block's rows are ~2000, its targets and pairs
+    // far fewer).
+    let (mut t_in, mut x_in) = (vec![u32::MAX; p.targets.len()], vec![u32::MAX; p.pairs.len()]);
+    let mut block = 0u32;
     while i < p.rows.len() {
         // Whole entries, up to the block's rows.
         let mut j = i;
@@ -223,12 +228,21 @@ pub fn encode_blocks(p: &mut Parts) -> Vec<(Vec<u8>, bool)> {
             j += 1;
         }
         let rows = &p.rows[i..j];
-        let mut ts: Vec<u32> = rows.iter().map(|r| (r.0 >> 64) as u32).collect();
+        let (mut ts, mut xs): (Vec<u32>, Vec<u32>) = (Vec::new(), Vec::new());
+        for r in rows {
+            let (t, x) = ((r.0 >> 64) as u32, (r.0 >> 32) as u32);
+            if t_in[t as usize] != block {
+                t_in[t as usize] = block;
+                ts.push(t);
+            }
+            if x_in[x as usize] != block {
+                x_in[x as usize] = block;
+                xs.push(x);
+            }
+        }
+        block += 1;
         ts.sort_unstable();
-        ts.dedup();
-        let mut xs: Vec<u32> = rows.iter().map(|r| (r.0 >> 32) as u32).collect();
         xs.sort_unstable();
-        xs.dedup();
         let mut rs: Vec<u32> = ts.iter().map(|&t| p.targets[t as usize].0).collect();
         rs.sort_unstable();
         rs.dedup();
@@ -436,7 +450,8 @@ struct BlockHead {
 /// A block as the frame's end writes it: zstd, its raw length, its first
 /// and last entry.
 pub struct Sealed {
-    pub z: Vec<u8>,
+    /// In memory, or in the frame's spool.
+    pub z: super::spool::Body,
     pub raw: u32,
     pub first: (u32, Key),
     pub last: (u32, Key),
@@ -459,7 +474,14 @@ impl Sealed {
         )?;
         let (Some(first), Some(last)) = (first, last) else { return Ok(None) };
         ensure!(raw.len() < u32::MAX as usize, "an out block of {} bytes", raw.len());
-        Ok(Some(Sealed { z: super::bundle::compress(raw, z)?, raw: raw.len() as u32, first, last }))
+        Ok(Some(Sealed { z: super::spool::Body::Mem(super::bundle::compress(raw, z)?), raw: raw.len() as u32, first, last }))
+    }
+}
+
+impl Sealed {
+    /// Its bytes into `spool`, if there is one.
+    pub fn spill(self, spool: Option<&super::spool::Spool>) -> Result<Sealed> {
+        Ok(Sealed { z: self.z.spill(spool)?, ..self })
     }
 }
 
@@ -471,7 +493,7 @@ pub fn path(edges_dir: &Path, frame: u32) -> PathBuf {
 /// WRITE frame `frame`'s out file from its units' blocks in unit order
 /// (their entries ascending across blocks: checked). Atomic. Returns its
 /// bytes.
-pub fn write(path: &Path, frame: u32, blocks: &[Sealed]) -> Result<u64> {
+pub fn write(path: &Path, frame: u32, blocks: &[Sealed], spool: Option<&super::spool::Spool>) -> Result<u64> {
     use std::io::Write;
     ensure!(blocks.windows(2).all(|w| w[0].last < w[1].first), "{}: the out blocks' entries are not ascending", path.display());
     let mut heads = Vec::with_capacity(blocks.len());
@@ -480,7 +502,8 @@ pub fn write(path: &Path, frame: u32, blocks: &[Sealed]) -> Result<u64> {
         heads.push(BlockHead { first: b.first, last: b.last, offset, len: b.z.len() as u32, raw: b.raw });
         offset += b.z.len() as u64;
     }
-    let hb = bincode::serialize(&(frame, heads)).context("an out file's header")?;
+    let hb = bincode::serialize(&(frame, &heads)).context("an out file's header")?;
+    ensure!(hb.len() == 12 + heads.len() * HEAD_BYTES, "an out file's header of {} bytes for {} blocks: not the layout `OutFile` reads", hb.len(), heads.len());
     std::fs::create_dir_all(path.parent().expect("an out dir"))?;
     let tmp = path.with_extension("tmp");
     {
@@ -489,8 +512,9 @@ pub fn write(path: &Path, frame: u32, blocks: &[Sealed]) -> Result<u64> {
         f.write_all(&crate::search::checkpoint::FORMAT_VERSION.to_le_bytes())?;
         f.write_all(&(hb.len() as u64).to_le_bytes())?;
         f.write_all(&hb)?;
+        let mut buf = Vec::new();
         for b in blocks {
-            f.write_all(&b.z)?;
+            b.z.with(spool, &mut buf, |z| f.write_all(z))??;
         }
         f.flush()?;
     }
@@ -501,9 +525,19 @@ pub fn write(path: &Path, frame: u32, blocks: &[Sealed]) -> Result<u64> {
 /// One out file, mapped.
 pub struct OutFile {
     map: memmap2::Mmap,
-    heads: Vec<BlockHead>,
+    /// Its blocks, and where the first one's head is in `map` (the
+    /// header's heads are read where they are, not deserialized: an
+    /// index of every frame's blocks held in memory was 64 B a block, 1.9
+    /// GB at the fixtures' room's f303).
+    blocks: usize,
+    heads: usize,
     data: usize,
 }
+
+/// Bytes a `BlockHead` takes in a header (bincode 1's fixed-width little-
+/// endian encoding, `write`'s): first (u32, u64, u64), last (the same),
+/// offset u64, len u32, raw u32.
+const HEAD_BYTES: usize = 56;
 
 impl OutFile {
     pub fn open(path: &Path, frame: u32) -> Result<Self> {
@@ -515,41 +549,69 @@ impl OutFile {
         let v = u32::from_le_bytes(map[4..8].try_into().unwrap());
         ensure!(v == crate::search::checkpoint::FORMAT_VERSION, "{}: format version {v}, this binary's is {}", path.display(), crate::search::checkpoint::FORMAT_VERSION);
         let n = u64::from_le_bytes(map[8..16].try_into().unwrap()) as usize;
-        ensure!(map.len() >= 16 + n, "{}: truncated header", path.display());
-        let (f, heads): (u32, Vec<BlockHead>) = bincode::deserialize(&map[16..16 + n]).with_context(|| path.display().to_string())?;
+        ensure!(map.len() >= 16 + n && n >= 12, "{}: truncated header", path.display());
+        let f = u32::from_le_bytes(map[16..20].try_into().unwrap());
+        let blocks = u64::from_le_bytes(map[20..28].try_into().unwrap()) as usize;
+        ensure!(n == 12 + blocks * HEAD_BYTES, "{}: a header of {n} bytes for {blocks} blocks", path.display());
         ensure!(f == frame, "{}: the out-edges of frame {f}, not {frame}", path.display());
-        let data = 16 + n;
-        let end = heads.last().map_or(0, |h| h.offset + h.len as u64);
-        ensure!(map.len() as u64 == data as u64 + end, "{}: {} bytes, its header says {}", path.display(), map.len(), data as u64 + end);
-        Ok(OutFile { map, heads, data })
+        let out = OutFile { map, blocks, heads: 28, data: 16 + n };
+        let end = if blocks == 0 {
+            0
+        } else {
+            let h = out.head(blocks - 1);
+            h.offset + h.len as u64
+        };
+        ensure!(out.map.len() as u64 == out.data as u64 + end, "{}: {} bytes, its header says {}", path.display(), out.map.len(), out.data as u64 + end);
+        Ok(out)
+    }
+
+    /// Block `i`'s head, read from the header.
+    #[inline]
+    fn head(&self, i: usize) -> BlockHead {
+        let b = &self.map[self.heads + i * HEAD_BYTES..self.heads + (i + 1) * HEAD_BYTES];
+        let (u32_at, u64_at) = (|a: usize| u32::from_le_bytes(b[a..a + 4].try_into().unwrap()), |a: usize| u64::from_le_bytes(b[a..a + 8].try_into().unwrap()));
+        BlockHead { first: (u32_at(0), (u64_at(4), u64_at(12))), last: (u32_at(20), (u64_at(24), u64_at(32))), offset: u64_at(40), len: u32_at(48), raw: u32_at(52) }
     }
 
     /// The blocks that may hold entries in `lo..=hi`.
     pub fn blocks(&self, lo: (u32, Key), hi: (u32, Key)) -> std::ops::Range<usize> {
-        let a = self.heads.partition_point(|h| h.last < lo);
-        let b = self.heads.partition_point(|h| h.first <= hi);
+        let point = |f: &dyn Fn(&BlockHead) -> bool| {
+            let (mut a, mut b) = (0usize, self.blocks);
+            while a < b {
+                let m = (a + b) / 2;
+                if f(&self.head(m)) {
+                    a = m + 1;
+                } else {
+                    b = m;
+                }
+            }
+            a
+        };
+        let a = point(&|h| h.last < lo);
+        let b = point(&|h| h.first <= hi);
         a..b.max(a)
     }
 
     /// Block `i`'s first and last entry.
     pub fn range(&self, i: usize) -> ((u32, Key), (u32, Key)) {
-        (self.heads[i].first, self.heads[i].last)
+        let h = self.head(i);
+        (h.first, h.last)
     }
 
     /// Block `i`'s raw bytes into `out`.
     pub fn block(&self, i: usize, z: &mut zstd::bulk::Decompressor<'static>, out: &mut Vec<u8>) -> Result<()> {
-        let h = &self.heads[i];
+        let h = self.head(i);
         let a = self.data + h.offset as usize;
         super::bundle::decompress(&self.map[a..a + h.len as usize], h.raw as usize, z, out)
     }
 
     /// Its blocks.
     pub fn len(&self) -> usize {
-        self.heads.len()
+        self.blocks
     }
 
     pub fn is_empty(&self) -> bool {
-        self.heads.is_empty()
+        self.blocks == 0
     }
 }
 
@@ -561,6 +623,12 @@ pub struct OutStore {
 }
 
 impl OutStore {
+    /// Bytes its block indices hold in memory: none (the files' headers
+    /// are read where they are mapped); the list of files.
+    pub fn index_bytes(&self) -> usize {
+        self.frames.capacity() * std::mem::size_of::<Option<OutFile>>()
+    }
+
     /// Frames `1..=horizon`'s out files under `edges_dir`.
     pub fn open(edges_dir: &Path, horizon: u32) -> Result<Self> {
         let mut s = OutStore { frames: vec![None], bytes: 0 };
@@ -632,7 +700,7 @@ mod tests {
         encode(&[row(9, 4, 77, 3, (0, 1), 4, 1024 << 11 | 1024, 1)], &mut second);
         let blocks = vec![Sealed::of(&fixed, &mut z).unwrap().unwrap(), Sealed::of(&second, &mut z).unwrap().unwrap()];
         let path = path(&dir, 3);
-        write(&path, 3, &blocks).unwrap();
+        write(&path, 3, &blocks, None).unwrap();
         let f = OutFile::open(&path, 3).unwrap();
         assert_eq!(f.blocks((5, (0, 0)), (5, (0, 9))), 0..1);
         assert_eq!(f.blocks((8, (0, 0)), (9, (0, 4))), 1..2);
@@ -641,13 +709,17 @@ mod tests {
         let mut back = Vec::new();
         f.block(1, &mut d, &mut back).unwrap();
         assert_eq!(back, second);
-        assert!(write(&path, 3, &[blocks[1].clone_for_test(), blocks[0].clone_for_test()]).is_err(), "unordered blocks");
+        assert!(write(&path, 3, &[blocks[1].clone_for_test(), blocks[0].clone_for_test()], None).is_err(), "unordered blocks");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
     impl Sealed {
         fn clone_for_test(&self) -> Sealed {
-            Sealed { z: self.z.clone(), raw: self.raw, first: self.first, last: self.last }
+            let z = match &self.z {
+                crate::storage::spool::Body::Mem(v) => crate::storage::spool::Body::Mem(v.clone()),
+                crate::storage::spool::Body::Spool(s) => crate::storage::spool::Body::Spool(*s),
+            };
+            Sealed { z, raw: self.raw, first: self.first, last: self.last }
         }
     }
 }

@@ -1,31 +1,31 @@
-//! THE ONE STATE SET (plans/keys-only.md): per storage region a TABLE of
-//! entries - an exact key (the state without its position) and the mask of
-//! its cells in the region. It is the visited set, the frontier and the
-//! next layer, three copies of one type:
+//! THE ONE STATE SET (plans/keys-only.md, plans/visited-packed.md): per
+//! storage region a TABLE of entries - an exact key (the state without its
+//! position) and the mask of its cells in the region - SORTED by key. It is
+//! the visited set, the frontier and the next layer, in one of two forms:
 //!
-//!   * INDEXED (a hash index over the keys): insert or OR, membership - the
-//!     visited set, and the next layer while a wave builds it;
-//!   * FROZEN (the entries sorted by key, no index): iteration in (region,
-//!     key) order, membership by binary search - the frontier, a frame's
-//!     layer read from its file, the next layer once its wave ends.
+//!   * PLAIN: the keys and masks in arrays - entry by number, iteration in
+//!     (region, key) order, membership by binary search: the frontier, a
+//!     frame's layer read from its file, the next layer;
+//!   * PACKED: the entries in compressed BLOCKS of about `PACK_ENTRIES`,
+//!     each of its states with its INFO (`StateInfo`: layer and remainder
+//!     hull; a full hull has none - its entry's BARE cells): the visited
+//!     set. A frame walks it with its sorted keys (`Cursor`: each block
+//!     decoded once, when a key falls in it) and rewrites it with its
+//!     sorted changes (`upsert`: blocks no change falls in kept as they
+//!     are). No hash index, no per-entry run index: ~3 B a state where the
+//!     indexed table and its hull store took ~14 (a big room's f230).
 //!
-//! Lean by construction, so every use gains alike:
-//!
-//!   * a key is stored in the bytes its table's largest key needs (`kw`, 1
-//!     to 16: the mod room's 67-bit keys take 9 B, a 40-bit shape's 5 B,
-//!     a table holding provisional keys 16); a wider key repacks the table;
-//!   * the index is open addressing over `u32` slots - the entry and, in the
-//!     bits the table's size leaves, a tag of the key's hash, so a probe
-//!     reads a key only on a tag match - at a load between 0.5 and 0.85
-//!     (non-power-of-two capacity), ~5.6 B an entry;
-//!   * the entries' arrays are chunks of 32768 entries: a table grows
-//!     without a copy, and holds part of one chunk unused at most.
+//! A plain table's key is stored in the bytes its largest key needs (`kw`,
+//! 1 to 16: a big room's 67-bit keys take 9 B); its arrays are chunks of
+//! 32768 entries. A packed block holds its keys delta-coded, its masks, its
+//! bare cells, its states' layers and hulls, column by column, zstd.
 
 use anyhow::{anyhow, ensure, Result};
 
+use super::bundle::{get_varint, get_varint128, put_varint, put_varint128};
 use super::visited::Key;
 use super::{Sk, GEOMETRY};
-use celeste_engine::exact::slot_hash;
+use crate::search::hull::{Hull, HULL_BYTES};
 
 const _: () = assert!(GEOMETRY.words == 1, "a set holds a u64 mask an entry: 8 x 8 storage regions");
 
@@ -45,91 +45,309 @@ fn bytes_of(w: u128) -> usize {
     (16 - (w.leading_zeros() / 8) as usize).max(1)
 }
 
-/// The most of an index's capacity its entries fill before it grows, and
-/// the fill it grows to.
-const MAX_LOAD: f64 = 0.85;
-const GROW_LOAD: f64 = 0.5;
-
-/// Room a table's last chunk grows by when full (an eighth of it, at least
-/// 64 entries; at most the chunk).
-#[inline]
-fn grown(len: usize, need: usize) -> usize {
-    need.max(len + (len / 8).max(64))
+/// A state's LAYER (the frame the forward first reached it, whose wave
+/// expanded it) and its remainder HULL so far: a packed table's per-state
+/// info.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StateInfo {
+    pub hull: Hull,
+    pub layer: u16,
 }
 
-/// A table's hash index: `u32` slots, 0 empty, else `tag << bits | entry + 1`
-/// (`bits` the entry's width at this capacity, the tag the low bits of the
-/// key's hash); the slot of a hash at `h * cap >> 64`, linear probing.
-#[derive(Clone, Default)]
-struct Index {
-    slots: Vec<u32>,
-    bits: u32,
-}
-
-impl Index {
-    fn with_cap(cap: usize) -> Index {
-        assert!(cap < 1 << 31, "a region table of {cap} index slots");
-        Index { slots: vec![0; cap], bits: 32 - (cap as u32).leading_zeros() }
-    }
-
+impl StateInfo {
+    /// Is its hull the whole torus (then it is not stored: a bare cell)?
     #[inline]
-    fn home(&self, h: u64) -> usize {
-        ((h as u128 * self.slots.len() as u128) >> 64) as usize
-    }
-
-    #[inline]
-    fn tag(&self, h: u64) -> u32 {
-        (h as u32) & (u32::MAX >> self.bits)
-    }
-
-    #[inline]
-    fn next(&self, i: usize) -> usize {
-        if i + 1 == self.slots.len() {
-            0
-        } else {
-            i + 1
-        }
+    pub fn is_full(&self) -> bool {
+        self.hull.x.is_full() && self.hull.y.is_full()
     }
 }
 
-/// Entries a chunk of a table's arrays holds (`RegionTable`): a table grows
-/// by chunks, never copied.
+/// Entries a plain table's chunk holds.
 const CH_BITS: u32 = 15;
 const CH: usize = 1 << CH_BITS;
 
-/// ONE REGION'S ENTRIES (module doc). The keys and masks live in CHUNKS of
-/// `CH` entries (the last one growing up to `CH`): a table that grows a few
-/// percent a frame - the visited set's - is never copied, and holds at
-/// most part of one chunk unused (a whole-array growth copied the visited
-/// set every frame, both copies alive: 3.4 GB at the mod room's f77).
+/// Entries a packed block holds (whole entries; a block made from fewer
+/// changes' neighbours may hold fewer).
+pub const PACK_ENTRIES: usize = 1024;
+
+/// ONE REGION'S ENTRIES (module doc).
 #[derive(Clone)]
 pub struct RegionTable {
-    /// Bytes a key takes.
-    kw: usize,
-    /// Per chunk its keys, `kw` bytes each, then 16 zero bytes (a key is
-    /// read as 16).
-    keys: Vec<Vec<u8>>,
-    masks: Vec<Vec<u64>>,
     len: usize,
-    /// `None`: frozen (sorted by key).
-    index: Option<Index>,
+    form: Form,
+}
+
+#[derive(Clone)]
+enum Form {
+    /// Per chunk its keys, `kw` bytes each, then 16 zero bytes (a key is
+    /// read as 16), and its masks.
+    Plain { kw: usize, keys: Vec<Vec<u8>>, masks: Vec<Vec<u64>> },
+    /// The blocks, by key; the states held and those with an info.
+    Packed { blocks: Vec<Block>, states: u64, infos: u64 },
+}
+
+/// A packed table's BLOCK: its first and last key and counts (what a
+/// lookup searches), its raw length and its zstd bytes.
+#[derive(Clone)]
+pub struct Block {
+    first: u128,
+    last: u128,
+    entries: u32,
+    states: u32,
+    infos: u32,
+    raw: u32,
+    bytes: Box<[u8]>,
+}
+
+impl Block {
+    /// Its first key.
+    pub fn first(&self) -> Key {
+        narrow(self.first)
+    }
+}
+
+/// A packed block DECODED: per entry its key, cells, bare cells (no info:
+/// full hulls) and its first info's place (`at`: one past the last at the
+/// end), and the infos by entry and cell.
+#[derive(Default)]
+pub struct Rows {
+    keys: Vec<u128>,
+    masks: Vec<u64>,
+    bare: Vec<u64>,
+    at: Vec<u32>,
+    infos: Vec<StateInfo>,
+}
+
+impl Rows {
+    fn clear(&mut self) {
+        self.keys.clear();
+        self.masks.clear();
+        self.bare.clear();
+        self.at.clear();
+        self.at.push(0);
+        self.infos.clear();
+    }
+
+    fn len(&self) -> usize {
+        self.keys.len()
+    }
+
+    /// Append an entry: its key, cells, bare cells and its infos (one per
+    /// cell not bare, by cell).
+    #[inline]
+    fn push(&mut self, key: u128, mask: u64, bare: u64, infos: &[StateInfo]) {
+        debug_assert_eq!((mask & !bare).count_ones() as usize, infos.len());
+        debug_assert!(self.keys.last().is_none_or(|&k| k < key), "a packed table's keys out of order");
+        self.keys.push(key);
+        self.masks.push(mask);
+        self.bare.push(bare);
+        self.infos.extend_from_slice(infos);
+        self.at.push(self.infos.len() as u32);
+    }
+
+    /// Entry `i`'s infos.
+    #[inline]
+    fn infos_of(&self, i: usize) -> &[StateInfo] {
+        &self.infos[self.at[i] as usize..self.at[i + 1] as usize]
+    }
+
+    /// Entries `a..b` as a block.
+    fn encode(&self, a: usize, b: usize, raw: &mut Vec<u8>) -> Result<Block> {
+        raw.clear();
+        let (ia, ib) = (self.at[a] as usize, self.at[b] as usize);
+        put_varint(raw, (b - a) as u64);
+        put_varint(raw, (ib - ia) as u64);
+        let mut prev = 0u128;
+        for (k, &key) in self.keys[a..b].iter().enumerate() {
+            put_varint128(raw, if k == 0 { key } else { key - prev });
+            prev = key;
+        }
+        for &m in &self.masks[a..b] {
+            raw.extend_from_slice(&m.to_le_bytes());
+        }
+        for &m in &self.bare[a..b] {
+            put_varint(raw, m);
+        }
+        for i in &self.infos[ia..ib] {
+            raw.extend_from_slice(&i.layer.to_le_bytes());
+        }
+        for i in &self.infos[ia..ib] {
+            raw.extend_from_slice(&i.hull.to_bytes());
+        }
+        ensure!(raw.len() < u32::MAX as usize, "a packed block of {} bytes", raw.len());
+        let states: u32 = self.masks[a..b].iter().map(|m| m.count_ones()).sum();
+        Ok(Block { first: self.keys[a], last: self.keys[b - 1], entries: (b - a) as u32, states, infos: (ib - ia) as u32, raw: raw.len() as u32, bytes: zstd_pack(raw)? })
+    }
+
+    /// `block` decoded into these rows (cleared first).
+    fn decode(&mut self, block: &Block, raw: &mut Vec<u8>) -> Result<()> {
+        self.clear();
+        zstd_unpack(&block.bytes, block.raw as usize, raw)?;
+        let b = &raw[..];
+        let mut pos = 0usize;
+        let n = get_varint(b, &mut pos) as usize;
+        let ni = get_varint(b, &mut pos) as usize;
+        ensure!(n == block.entries as usize && ni == block.infos as usize, "a packed block of {n} entries and {ni} infos, its index says {} and {}", block.entries, block.infos);
+        let mut prev = 0u128;
+        for k in 0..n {
+            let d = get_varint128(b, &mut pos);
+            prev = if k == 0 { d } else { prev + d };
+            self.keys.push(prev);
+        }
+        ensure!(pos + 8 * n <= b.len(), "a packed block cut short");
+        self.masks.extend(b[pos..pos + 8 * n].chunks_exact(8).map(|x| u64::from_le_bytes(x.try_into().unwrap())));
+        pos += 8 * n;
+        let mut at = 0u32;
+        for k in 0..n {
+            let bare = get_varint(b, &mut pos);
+            self.bare.push(bare);
+            at += (self.masks[k] & !bare).count_ones();
+            self.at.push(at);
+        }
+        ensure!(at as usize == ni && pos + (2 + HULL_BYTES) * ni == b.len(), "a packed block's infos do not match its cells");
+        let (layers, hulls) = b[pos..].split_at(2 * ni);
+        self.infos.extend(layers.chunks_exact(2).zip(hulls.chunks_exact(HULL_BYTES)).map(|(l, h)| StateInfo { layer: u16::from_le_bytes([l[0], l[1]]), hull: Hull::from_bytes(h) }));
+        ensure!(self.keys.first() == Some(&block.first) && self.keys.last() == Some(&block.last), "a packed block's keys are not its index's");
+        Ok(())
+    }
+}
+
+thread_local! {
+    /// Per thread its zstd contexts for packed blocks.
+    static ZSTD: std::cell::RefCell<Option<(zstd::bulk::Compressor<'static>, zstd::bulk::Decompressor<'static>)>> = const { std::cell::RefCell::new(None) };
+}
+
+/// `raw` compressed (zstd level 1, the thread's context).
+fn zstd_pack(raw: &[u8]) -> Result<Box<[u8]>> {
+    ZSTD.with(|z| {
+        let mut z = z.borrow_mut();
+        let (c, _) = match &mut *z {
+            Some(x) => x,
+            None => z.insert((zstd::bulk::Compressor::new(1)?, zstd::bulk::Decompressor::new()?)),
+        };
+        Ok(c.compress(raw)?.into_boxed_slice())
+    })
+}
+
+/// `bytes` decompressed into `out` (`raw` bytes; the thread's context).
+fn zstd_unpack(bytes: &[u8], raw: usize, out: &mut Vec<u8>) -> Result<()> {
+    ZSTD.with(|z| {
+        let mut z = z.borrow_mut();
+        let (_, d) = match &mut *z {
+            Some(x) => x,
+            None => z.insert((zstd::bulk::Compressor::new(1)?, zstd::bulk::Decompressor::new()?)),
+        };
+        out.clear();
+        out.reserve(raw);
+        let n = d.decompress_to_buffer(bytes, out)?;
+        ensure!(n == raw, "a packed block decompressed to {n} bytes, not {raw}");
+        Ok(())
+    })
+}
+
+/// One change of a packed table (`upsert`): state `(key, cell)` with its
+/// info (`None`: a full hull - no info, a bare cell), and whether it is
+/// NEW (then held already is an error the caller counts: `Upserted`).
+#[derive(Clone, Copy, Debug)]
+pub struct Change {
+    pub key: Key,
+    pub cell: u8,
+    pub info: Option<StateInfo>,
+    pub new: bool,
+}
+
+/// What an `upsert` did: the states it added, and the NEW changes whose
+/// state the table held already.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Upserted {
+    pub added: u64,
+    pub held_new: u64,
+    /// Blocks kept as they were, decoded, and made (`--phases`' `[absorb]`).
+    pub kept: u64,
+    pub decoded: u64,
+    pub made: u64,
+}
+
+impl std::ops::AddAssign for Upserted {
+    fn add_assign(&mut self, o: Upserted) {
+        self.added += o.added;
+        self.held_new += o.held_new;
+        self.kept += o.kept;
+        self.decoded += o.decoded;
+        self.made += o.made;
+    }
+}
+
+/// An entry as a `Cursor` finds it: its cells, its bare cells (no info: a
+/// full hull) and the other cells' infos, by cell.
+pub struct Entry<'r> {
+    pub mask: u64,
+    pub bare: u64,
+    pub infos: &'r [StateInfo],
+}
+
+impl Entry<'_> {
+    /// Cell `c`'s info (`None`: not held, or bare).
+    #[inline]
+    pub fn info(&self, c: u32) -> Option<StateInfo> {
+        let with = self.mask & !self.bare;
+        (with >> c & 1 == 1).then(|| self.infos[(with & ((1u64 << c) - 1)).count_ones() as usize])
+    }
+}
+
+/// A packed table WALKED by keys in ascending order (a frame's seal): each
+/// block decoded once, when a key falls in it.
+pub struct Cursor<'a> {
+    blocks: &'a [Block],
+    b: usize,
+    loaded: usize,
+    i: usize,
+    rows: Rows,
+    raw: Vec<u8>,
+}
+
+impl<'a> Cursor<'a> {
+    /// The entry of key `k`, if held (keys asked in ascending order).
+    pub fn seek(&mut self, k: Key) -> Result<Option<Entry<'_>>> {
+        let w = wide(k);
+        self.b += self.blocks[self.b..].partition_point(|x| x.last < w);
+        let Some(block) = self.blocks.get(self.b) else { return Ok(None) };
+        if w < block.first {
+            return Ok(None);
+        }
+        if self.loaded != self.b {
+            self.rows.decode(block, &mut self.raw)?;
+            (self.loaded, self.i) = (self.b, 0);
+        }
+        self.i += self.rows.keys[self.i..].partition_point(|&x| x < w);
+        let i = self.i;
+        Ok((self.rows.keys.get(i) == Some(&w)).then(|| Entry { mask: self.rows.masks[i], bare: self.rows.bare[i], infos: self.rows.infos_of(i) }))
+    }
 }
 
 impl Default for RegionTable {
     fn default() -> Self {
-        RegionTable::new()
+        RegionTable::frozen()
     }
 }
 
 impl RegionTable {
-    /// An empty indexed table.
-    pub fn new() -> Self {
-        RegionTable { kw: 1, keys: Vec::new(), masks: Vec::new(), len: 0, index: Some(Index::default()) }
+    /// An empty plain table.
+    pub fn frozen() -> Self {
+        RegionTable { len: 0, form: Form::Plain { kw: 1, keys: Vec::new(), masks: Vec::new() } }
     }
 
-    /// An empty frozen table.
-    pub fn frozen() -> Self {
-        RegionTable { kw: 1, keys: Vec::new(), masks: Vec::new(), len: 0, index: None }
+    /// An empty packed table.
+    pub fn packed() -> Self {
+        RegionTable { len: 0, form: Form::Packed { blocks: Vec::new(), states: 0, infos: 0 } }
+    }
+
+    /// A packed table of `blocks` (by key, distinct: an `upsert_blocks`'
+    /// parts in order; checked).
+    pub fn of_blocks(blocks: Vec<Block>) -> Result<Self> {
+        ensure!(blocks.windows(2).all(|w| w[0].last < w[1].first), "packed blocks out of order");
+        let (len, states, infos) = blocks.iter().fold((0usize, 0u64, 0u64), |a, b| (a.0 + b.entries as usize, a.1 + b.states as u64, a.2 + b.infos as u64));
+        Ok(RegionTable { len, form: Form::Packed { blocks, states, infos } })
     }
 
     pub fn len(&self) -> usize {
@@ -140,11 +358,39 @@ impl RegionTable {
         self.len == 0
     }
 
-    pub fn is_frozen(&self) -> bool {
-        self.index.is_none()
+    pub fn is_packed(&self) -> bool {
+        matches!(self.form, Form::Packed { .. })
     }
 
-    /// Entry `e`'s key.
+    /// A plain table's arrays (a packed one's are blocks: FATAL).
+    #[inline]
+    fn plain(&self) -> (usize, &[Vec<u8>], &[Vec<u64>]) {
+        match &self.form {
+            Form::Plain { kw, keys, masks } => (*kw, keys, masks),
+            Form::Packed { .. } => panic!("a packed table read by entry number"),
+        }
+    }
+
+    /// A packed table's blocks (a plain one has none).
+    pub fn blocks(&self) -> &[Block] {
+        match &self.form {
+            Form::Packed { blocks, .. } => blocks,
+            Form::Plain { .. } => &[],
+        }
+    }
+
+    /// Its blocks taken out (a packed table: left empty).
+    pub fn take_blocks(&mut self) -> Vec<Block> {
+        match &mut self.form {
+            Form::Packed { blocks, states, infos } => {
+                (*states, *infos, self.len) = (0, 0, 0);
+                std::mem::take(blocks)
+            }
+            Form::Plain { .. } => Vec::new(),
+        }
+    }
+
+    /// Entry `e`'s key (a plain table).
     #[inline]
     pub fn key(&self, e: u32) -> Key {
         narrow(self.wkey(e as usize))
@@ -152,100 +398,119 @@ impl RegionTable {
 
     #[inline]
     fn wkey(&self, e: usize) -> u128 {
-        let c = &self.keys[e >> CH_BITS];
-        let o = (e & (CH - 1)) * self.kw;
+        let (kw, keys, _) = self.plain();
+        let c = &keys[e >> CH_BITS];
+        let o = (e & (CH - 1)) * kw;
         let w = u128::from_le_bytes(c[o..o + 16].try_into().expect("16 bytes"));
-        if self.kw == 16 {
+        if kw == 16 {
             w
         } else {
-            w & ((1u128 << (8 * self.kw)) - 1)
+            w & ((1u128 << (8 * kw)) - 1)
         }
     }
 
-    /// Entry `e`'s cells.
+    /// Entry `e`'s cells (a plain table).
     #[inline]
     pub fn mask(&self, e: u32) -> u64 {
-        self.masks[e as usize >> CH_BITS][e as usize & (CH - 1)]
+        self.plain().2[e as usize >> CH_BITS][e as usize & (CH - 1)]
     }
 
-    /// Every entry's cells, in order.
+    /// Every entry's cells, in order (a plain table).
     pub fn masks(&self) -> impl Iterator<Item = u64> + '_ {
-        self.masks.iter().flatten().copied()
+        self.plain().2.iter().flatten().copied()
     }
 
-    /// Every entry `(key, cells)`, in order (a frozen table's: by key).
+    /// Every entry `(key, cells)`, by key (a plain table).
     pub fn iter(&self) -> impl Iterator<Item = (Key, u64)> + '_ {
         (0..self.len).map(move |e| (narrow(self.wkey(e)), self.mask(e as u32)))
     }
 
     /// States held.
     pub fn states(&self) -> u64 {
-        self.masks().map(|m| m.count_ones() as u64).sum()
+        match &self.form {
+            Form::Plain { .. } => self.masks().map(|m| m.count_ones() as u64).sum(),
+            Form::Packed { states, .. } => *states,
+        }
     }
 
-    /// The entry holding `k`.
-    #[inline]
+    /// States held with an info (not full: a packed table's).
+    pub fn infos(&self) -> u64 {
+        match &self.form {
+            Form::Plain { .. } => 0,
+            Form::Packed { infos, .. } => *infos,
+        }
+    }
+
+    /// The first entry whose key is `k` or past it (a plain table: binary
+    /// search).
+    pub fn lower_bound(&self, k: Key) -> usize {
+        let w = wide(k);
+        let (mut lo, mut hi) = (0usize, self.len);
+        while lo < hi {
+            let mid = (lo + hi) / 2;
+            if self.wkey(mid) < w {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        lo
+    }
+
+    /// The entry holding `k` (a plain table: binary search).
     pub fn find(&self, k: Key) -> Option<u32> {
         let w = wide(k);
-        match &self.index {
-            Some(ix) => {
-                if ix.slots.is_empty() {
-                    return None;
-                }
-                let h = slot_hash(k);
-                let (tag, mut i) = (ix.tag(h), ix.home(h));
-                let low = (1u32 << ix.bits) - 1;
-                loop {
-                    let s = ix.slots[i];
-                    if s == 0 {
-                        return None;
-                    }
-                    if s >> ix.bits == tag {
-                        let e = (s & low) - 1;
-                        if self.wkey(e as usize) == w {
-                            return Some(e);
-                        }
-                    }
-                    i = ix.next(i);
-                }
-            }
-            None => {
-                let (mut lo, mut hi) = (0usize, self.len);
-                while lo < hi {
-                    let mid = (lo + hi) / 2;
-                    match self.wkey(mid).cmp(&w) {
-                        std::cmp::Ordering::Less => lo = mid + 1,
-                        std::cmp::Ordering::Greater => hi = mid,
-                        std::cmp::Ordering::Equal => return Some(mid as u32),
-                    }
-                }
-                None
+        let (mut lo, mut hi) = (0usize, self.len);
+        while lo < hi {
+            let mid = (lo + hi) / 2;
+            match self.wkey(mid).cmp(&w) {
+                std::cmp::Ordering::Less => lo = mid + 1,
+                std::cmp::Ordering::Greater => hi = mid,
+                std::cmp::Ordering::Equal => return Some(mid as u32),
             }
         }
+        None
     }
 
-    /// The cells of `k` held (0: none).
+    /// The cells of `k` held (0: none; either form).
     pub fn mask_of(&self, k: Key) -> u64 {
-        self.find(k).map_or(0, |e| self.mask(e))
+        match &self.form {
+            Form::Plain { .. } => self.find(k).map_or(0, |e| self.mask(e)),
+            Form::Packed { .. } => self.lookup(k).map_or(0, |(m, _)| m),
+        }
     }
 
-    /// OR `mask` into entry `e`; the cells it held before.
-    #[inline]
-    pub fn or_cells(&mut self, e: u32, mask: u64) -> u64 {
-        let m = &mut self.masks[e as usize >> CH_BITS][e as usize & (CH - 1)];
-        let had = *m;
-        *m |= mask;
-        had
+    /// A packed table's entry of `k`: its cells and cell `local`'s info
+    /// (`None`: not held, or full) - one block decoded (a reader's single
+    /// lookup; a frame walks a `Cursor`).
+    pub fn lookup_info(&self, k: Key, local: u32) -> Option<(u64, Option<StateInfo>)> {
+        let mut c = self.cursor();
+        let e = c.seek(k).expect("a packed block decodes")?;
+        Some((e.mask, e.info(local)))
     }
 
-    /// Room in the index for `n` more entries (a merge: at once).
-    fn reserve(&mut self, n: usize) {
-        let need = self.len + n;
-        if let Some(ix) = &self.index {
-            if need as f64 > MAX_LOAD * ix.slots.len() as f64 {
-                self.reindex(need);
+    fn lookup(&self, k: Key) -> Option<(u64, u64)> {
+        let mut c = self.cursor();
+        let e = c.seek(k).expect("a packed block decodes")?;
+        Some((e.mask, e.bare))
+    }
+
+    /// A cursor over a packed table (keys asked in ascending order).
+    pub fn cursor(&self) -> Cursor<'_> {
+        Cursor { blocks: self.blocks(), b: 0, loaded: usize::MAX, i: 0, rows: Rows::default(), raw: Vec::new() }
+    }
+
+    /// Every entry of a packed table, decoded block by block: `f(key,
+    /// cells, bare cells, infos)`.
+    pub fn for_each_packed(&self, mut f: impl FnMut(Key, u64, u64, &[StateInfo])) -> Result<()> {
+        let (mut rows, mut raw) = (Rows::default(), Vec::new());
+        for b in self.blocks() {
+            rows.decode(b, &mut raw)?;
+            for i in 0..rows.len() {
+                f(narrow(rows.keys[i]), rows.masks[i], rows.bare[i], rows.infos_of(i));
             }
         }
+        Ok(())
     }
 
     /// The keys, chunk by chunk, in `kw` bytes each.
@@ -288,140 +553,186 @@ impl RegionTable {
         out
     }
 
-    /// The keys repacked in `kw` bytes each.
-    fn repack(&mut self, kw: usize) {
-        debug_assert!(kw >= self.kw && kw <= 16);
-        self.keys = Self::chunk_keys((0..self.len).map(|e| self.wkey(e)), kw);
-        self.kw = kw;
-    }
-
-    /// The index rebuilt for `n` entries at the growth load.
-    fn reindex(&mut self, n: usize) {
-        let cap = ((n.max(4) as f64 / GROW_LOAD).ceil() as usize).max(8);
-        let mut ix = Index::with_cap(cap);
-        for e in 0..self.len {
-            Self::place(&mut ix, slot_hash(narrow(self.wkey(e))), e as u32);
-        }
-        self.index = Some(ix);
-    }
-
-    #[inline]
-    fn place(ix: &mut Index, h: u64, e: u32) {
-        let mut i = ix.home(h);
-        while ix.slots[i] != 0 {
-            i = ix.next(i);
-        }
-        ix.slots[i] = ix.tag(h) << ix.bits | (e + 1);
-    }
-
-    /// Append the entry `(k, mask)` (absent: an indexed table checks it
-    /// where it debugs; a frozen one needs `k` past its last key: checked);
-    /// its number.
-    pub fn push(&mut self, k: Key, mask: u64) -> u32 {
-        let w = wide(k);
-        let e = self.len;
-        assert!(e < u32::MAX as usize, "a region table of 2^32 entries");
-        if self.index.is_none() {
-            assert!(e == 0 || self.wkey(e - 1) < w, "a frozen table's keys out of order");
-        }
-        let kw = bytes_of(w);
-        if kw > self.kw {
-            self.repack(kw);
-        }
-        let i = e & (CH - 1);
-        if i == 0 {
-            self.keys.push(Vec::with_capacity(64 * self.kw + 16));
-            self.masks.push(Vec::with_capacity(64));
-        }
-        let (c, m) = (self.keys.last_mut().expect("a chunk"), self.masks.last_mut().expect("a chunk"));
-        if m.len() == m.capacity() {
-            let n = grown(m.len(), m.len() + 1).min(CH);
-            m.reserve_exact(n - m.len());
-            c.reserve_exact(n * self.kw + 16 - c.len());
-        }
-        c.truncate(i * self.kw);
-        c.extend_from_slice(&w.to_le_bytes()[..self.kw]);
-        c.extend_from_slice(&[0; 16]);
-        m.push(mask);
-        self.len += 1;
-        if let Some(ix) = &mut self.index {
-            if (e + 1) as f64 > MAX_LOAD * ix.slots.len() as f64 {
-                self.reindex(e + 1);
-            } else {
-                Self::place(ix, slot_hash(k), e as u32);
-            }
-        }
-        e as u32
-    }
-
-    /// OR `mask` into `k`'s entry, made if absent (an indexed table): its
-    /// number and the cells it held before.
-    #[inline]
-    pub fn insert_or(&mut self, k: Key, mask: u64) -> (u32, u64) {
-        debug_assert!(!self.is_frozen());
-        match self.find(k) {
-            Some(e) => (e, self.or_cells(e, mask)),
-            None => (self.push(k, mask), 0),
-        }
-    }
-
-    /// Every entry `(k, cells)` of the frozen `other` ORed into this indexed
-    /// table (made where absent), the index sized first: a merge. Calls
-    /// `at(i, e)` with each of `other`'s entries' place `e` here.
-    pub fn merge(&mut self, other: &RegionTable, mut at: impl FnMut(usize, u32)) {
-        debug_assert!(!self.is_frozen());
-        let add = other.iter().filter(|(k, _)| self.find(*k).is_none()).count();
-        let widest = (0..other.len()).map(|e| bytes_of(other.wkey(e))).max().unwrap_or(1);
-        if widest > self.kw {
-            self.repack(widest);
-        }
-        self.reserve(add);
-        for (i, (k, m)) in other.iter().enumerate() {
-            at(i, self.insert_or(k, m).0);
-        }
-    }
-
-    /// Every key `k` made `f(k)` (an indexed table: the index rebuilt if
-    /// any key changed): the frame's provisional keys made final.
-    pub fn rekey(&mut self, f: impl Fn(Key) -> Result<Key>) -> Result<()> {
-        let keys: Vec<u128> = (0..self.len).map(|e| f(narrow(self.wkey(e))).map(wide)).collect::<Result<_>>()?;
-        if keys.iter().enumerate().all(|(e, &k)| k == self.wkey(e)) {
-            return Ok(());
-        }
-        let kw = keys.iter().map(|&w| bytes_of(w)).max().unwrap_or(1);
-        self.keys = Self::chunk_keys(keys.into_iter(), kw);
-        self.kw = kw;
-        if self.index.is_some() {
-            self.reindex(self.len);
-        }
-        Ok(())
-    }
-
-    /// FROZEN: the entries sorted by key, the keys in the bytes their
-    /// largest needs, the index dropped, the chunks at their size.
-    pub fn freeze(&mut self) {
-        let mut v: Vec<(u128, u64)> = (0..self.len).map(|e| (self.wkey(e), self.mask(e as u32))).collect();
-        v.sort_unstable_by_key(|x| x.0);
-        debug_assert!(v.windows(2).all(|w| w[0].0 != w[1].0), "a key twice in a table");
-        let kw = v.last().map_or(1, |x| bytes_of(x.0));
-        self.keys = Self::chunk_keys(v.iter().map(|x| x.0), kw);
-        self.masks = Self::chunk_masks(v.iter().map(|x| x.1));
-        self.kw = kw;
-        self.index = None;
-    }
-
-    /// A frozen table from `(key, cells)` sorted by key (a frame file's
+    /// A plain table from `(key, cells)` sorted by key (a frame file's
     /// region; checked).
     pub fn from_sorted(keys: &[Key], masks: &[u64]) -> Result<RegionTable> {
         ensure!(keys.len() == masks.len(), "a region with {} keys and {} masks", keys.len(), masks.len());
         ensure!(keys.windows(2).all(|w| w[0] < w[1]), "a region's keys not ascending");
         let kw = keys.last().map_or(1, |&k| bytes_of(wide(k)));
-        Ok(RegionTable { kw, keys: Self::chunk_keys(keys.iter().map(|&k| wide(k)), kw), masks: Self::chunk_masks(masks.iter().copied()), len: keys.len(), index: None })
+        Ok(RegionTable { len: keys.len(), form: Form::Plain { kw, keys: Self::chunk_keys(keys.iter().map(|&k| wide(k)), kw), masks: Self::chunk_masks(masks.iter().copied()) } })
+    }
+
+    /// UPSERT `changes` into a packed table (sorted by key and cell,
+    /// distinct): each state set with its info (`Change::info`; `None` or
+    /// a full hull: bare), made where absent. Blocks no change falls in
+    /// are kept as they are.
+    pub fn upsert(&mut self, changes: &[Change]) -> Result<Upserted> {
+        ensure!(self.is_packed(), "an upsert into a plain table");
+        let (blocks, n) = upsert_blocks(self.take_blocks(), changes)?;
+        *self = RegionTable::of_blocks(blocks)?;
+        Ok(n)
     }
 
     pub fn alloc_bytes(&self) -> usize {
-        self.keys.iter().map(|c| c.capacity()).sum::<usize>() + self.masks.iter().map(|c| c.capacity() * 8).sum::<usize>() + (self.keys.capacity() + self.masks.capacity()) * 24 + self.index.as_ref().map_or(0, |ix| ix.slots.capacity() * 4)
+        self.bytes().iter().sum()
     }
+
+    /// Bytes allocated (`[memory]`): a plain table's keys (with their
+    /// chunks' room) and masks, a packed table's blocks (zstd), the lists.
+    pub fn bytes(&self) -> [usize; 3] {
+        match &self.form {
+            Form::Plain { keys, masks, .. } => [keys.iter().map(|c| c.capacity()).sum::<usize>(), masks.iter().map(|c| c.capacity() * 8).sum::<usize>(), (keys.capacity() + masks.capacity()) * 24],
+            Form::Packed { blocks, .. } => [blocks.iter().map(|b| b.bytes.len()).sum(), 0, blocks.capacity() * std::mem::size_of::<Block>()],
+        }
+    }
+}
+
+/// UPSERT `changes` (sorted by key and cell, distinct) into the packed
+/// `blocks` (by key): the blocks after, and what it did. A block no change
+/// falls in is kept as it is, unless the entries made before it are fewer
+/// than half a block (then it joins them); the others are decoded, merged
+/// with their changes and cut again at `PACK_ENTRIES` entries. Blocks are
+/// independent: a big table's runs of blocks are upserted apart (with the
+/// changes between their first keys) and put back in order.
+pub fn upsert_blocks(blocks: Vec<Block>, changes: &[Change]) -> Result<(Vec<Block>, Upserted)> {
+    debug_assert!(changes.windows(2).all(|w| (wide(w[0].key), w[0].cell) < (wide(w[1].key), w[1].cell)), "changes not by key and cell");
+    let mut w = Writer::default();
+    let (mut rows, mut raw) = (Rows::default(), Vec::new());
+    let mut ci = 0usize;
+    let mut n = Upserted::default();
+    for block in blocks {
+        let hi = ci + changes[ci..].partition_point(|c| wide(c.key) <= block.last);
+        if ci == hi {
+            if w.rows.len() == 0 || w.rows.len() >= PACK_ENTRIES / 2 {
+                w.flush(true)?;
+                w.out.push(block);
+                n.kept += 1;
+            } else {
+                rows.decode(&block, &mut raw)?;
+                n.decoded += 1;
+                n += merge_rows(&rows, &[], &mut w)?;
+            }
+            continue;
+        }
+        rows.decode(&block, &mut raw)?;
+        n.decoded += 1;
+        n += merge_rows(&rows, &changes[ci..hi], &mut w)?;
+        ci = hi;
+    }
+    rows.clear();
+    n += merge_rows(&rows, &changes[ci..], &mut w)?;
+    w.flush(true)?;
+    n.made = (w.out.len() as u64).saturating_sub(n.kept);
+    Ok((w.out, n))
+}
+
+/// The blocks an upsert makes: the entries made and not yet in a block,
+/// the blocks made.
+#[derive(Default)]
+struct Writer {
+    rows: Rows,
+    out: Vec<Block>,
+    raw: Vec<u8>,
+}
+
+impl Writer {
+    /// Blocks of `PACK_ENTRIES` from the entries made (`all`: the rest too).
+    fn flush(&mut self, all: bool) -> Result<()> {
+        if self.rows.at.is_empty() {
+            self.rows.clear();
+        }
+        let n = self.rows.len();
+        let mut a = 0usize;
+        while n - a >= PACK_ENTRIES || (all && a < n) {
+            let b = (a + PACK_ENTRIES).min(n);
+            self.out.push(self.rows.encode(a, b, &mut self.raw)?);
+            a = b;
+        }
+        if a > 0 {
+            // The rest to the front.
+            let ia = self.rows.at[a] as usize;
+            self.rows.keys.drain(..a);
+            self.rows.masks.drain(..a);
+            self.rows.bare.drain(..a);
+            self.rows.infos.drain(..ia);
+            self.rows.at.drain(..a);
+            for x in &mut self.rows.at {
+                *x -= ia as u32;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Entries `rows` merged with `changes` (by key and cell; their keys at
+/// most the rows' last, or any past it where `rows` is empty) into the
+/// writer, in key order.
+fn merge_rows(rows: &Rows, changes: &[Change], w: &mut Writer) -> Result<Upserted> {
+    if w.rows.at.is_empty() {
+        w.rows.clear();
+    }
+    let mut n = Upserted::default();
+    let (mut r, mut c) = (0usize, 0usize);
+    let mut infos: Vec<StateInfo> = Vec::with_capacity(64);
+    while r < rows.len() || c < changes.len() {
+        let rk = rows.keys.get(r).copied();
+        let ck = changes.get(c).map(|x| wide(x.key));
+        match (rk, ck) {
+            (Some(rk), ck) if ck.is_none_or(|ck| rk < ck) => {
+                w.rows.push(rk, rows.masks[r], rows.bare[r], rows.infos_of(r));
+                r += 1;
+            }
+            (rk, Some(ck)) => {
+                let d = c + changes[c..].iter().take_while(|x| wide(x.key) == ck).count();
+                let (mask, bare, old) = if rk == Some(ck) {
+                    r += 1;
+                    (rows.masks[r - 1], rows.bare[r - 1], rows.infos_of(r - 1))
+                } else {
+                    (0, 0, &[][..])
+                };
+                let (mut mask2, mut bare2) = (mask, bare);
+                for x in &changes[c..d] {
+                    let bit = 1u64 << x.cell;
+                    if mask & bit == 0 {
+                        n.added += 1;
+                    } else if x.new {
+                        n.held_new += 1;
+                    }
+                    mask2 |= bit;
+                    match x.info {
+                        Some(i) if !i.is_full() => bare2 &= !bit,
+                        _ => bare2 |= bit,
+                    }
+                }
+                // The infos by cell: a change's, else the entry's.
+                infos.clear();
+                let with_old = mask & !bare;
+                let mut k = c;
+                let mut cells = mask2 & !bare2;
+                while cells != 0 {
+                    let cell = cells.trailing_zeros();
+                    cells &= cells - 1;
+                    while k < d && (changes[k].cell as u32) < cell {
+                        k += 1;
+                    }
+                    let i = match changes.get(k) {
+                        Some(x) if k < d && x.cell as u32 == cell => x.info.expect("a cell with an info"),
+                        _ => {
+                            ensure!(with_old >> cell & 1 == 1, "a packed entry's cell {cell} without an info");
+                            old[(with_old & ((1u64 << cell) - 1)).count_ones() as usize]
+                        }
+                    };
+                    infos.push(i);
+                }
+                w.rows.push(ck, mask2, bare2, &infos);
+                c = d;
+            }
+            (None, None) => unreachable!("the loop's condition"),
+            (Some(_), None) => unreachable!("matched above"),
+        }
+    }
+    w.flush(false)?;
+    Ok(n)
 }
 
 /// A SET OF STATES: per region (ascending) its table (module doc).
@@ -502,7 +813,18 @@ impl RegionSet {
 
     /// Bytes allocated.
     pub fn alloc_bytes(&self) -> usize {
-        self.tables.capacity() * std::mem::size_of::<(u32, RegionTable)>() + self.tables.iter().map(|t| t.1.alloc_bytes()).sum::<usize>()
+        self.bytes().iter().sum()
+    }
+
+    /// `RegionTable::bytes` summed, the region list in the last.
+    pub fn bytes(&self) -> [usize; 3] {
+        let mut b = [0, 0, self.tables.capacity() * std::mem::size_of::<(u32, RegionTable)>()];
+        for (_, t) in &self.tables {
+            for (a, x) in b.iter_mut().zip(t.bytes()) {
+                *a += x;
+            }
+        }
+        b
     }
 
     /// The `(region, table)` holding entry `e` of the whole set (its
@@ -532,94 +854,115 @@ impl RegionSet {
 mod tests {
     use super::*;
 
-    /// A table indexed and frozen holds what was put in: keys of every
-    /// width (1 to 16 bytes, provisional ones included) and a growing
-    /// count, found again after every repack, reindex, rekey and freeze;
-    /// absent keys are not found; a merge ORs and adds.
-    #[test]
-    fn a_region_table_keeps_its_entries_through_every_change() {
-        let mut t = RegionTable::new();
-        let mut want: std::collections::BTreeMap<u128, u64> = Default::default();
-        let mut x = 0x9e37_79b9_7f4a_7c15u64;
-        let mut next = || {
+    fn rng(seed: u64) -> impl FnMut() -> u64 {
+        let mut x = seed | 1;
+        move || {
             x ^= x << 13;
             x ^= x >> 7;
             x ^= x << 17;
             x
-        };
-        for i in 0..20_000u64 {
-            let width = 1 + (i / 1500) as u32 % 16;
-            let w = (next() as u128) << 64 | next() as u128;
-            let w = if width == 16 { w | 1 << 127 } else { w & ((1u128 << (8 * width)) - 1) };
-            let m = 1u64 << (next() % 64);
-            let (e, had) = t.insert_or(narrow(w), m);
-            assert_eq!(had, want.get(&w).copied().unwrap_or(0));
-            *want.entry(w).or_default() |= m;
-            assert_eq!(t.mask(e), want[&w]);
         }
-        for (&w, &m) in &want {
-            assert_eq!(t.mask_of(narrow(w)), m);
-        }
-        assert_eq!(t.find((0, 0x1234_5678_9abc)), want.get(&0x1234_5678_9abc).map(|_| t.find((0, 0x1234_5678_9abc)).unwrap()));
-        // Rekey: every key's top bit cleared where set (a provisional key
-        // made final).
-        t.rekey(|k| Ok((k.0 & !(1 << 63), k.1))).unwrap();
-        let rk: std::collections::BTreeMap<u128, u64> = want.iter().fold(Default::default(), |mut a, (&w, &m)| {
-            *a.entry(w & !(1 << 127)).or_default() |= m;
-            a
-        });
-        assert_eq!(t.len(), rk.len(), "no two keys merged by the rekey in this test");
-        for (&w, &m) in &rk {
-            assert_eq!(t.mask_of(narrow(w)), m);
-        }
-        let mut f = t.clone();
-        f.freeze();
-        assert!(f.is_frozen());
-        assert_eq!(f.iter().map(|(k, m)| (wide(k), m)).collect::<Vec<_>>(), rk.iter().map(|(&w, &m)| (w, m)).collect::<Vec<_>>());
-        for (&w, &m) in rk.iter().step_by(7) {
-            assert_eq!(f.mask_of(narrow(w)), m);
-            assert_eq!(f.mask_of(narrow(w ^ 1 << 100)), rk.get(&(w ^ 1 << 100)).copied().unwrap_or(0));
-        }
-        // Merge a frozen table into a fresh indexed one, twice: the second
-        // adds nothing new.
-        let mut g = RegionTable::new();
-        g.merge(&f, |_, _| {});
-        g.merge(&f, |_, _| {});
-        assert_eq!(g.len(), f.len());
-        assert_eq!(g.states(), f.states());
-        // Across chunks: 100k entries (three chunks and part of a fourth),
-        // a repack at entry 70000, found, frozen, merged.
-        let mut big = RegionTable::new();
-        for i in 0..100_000u64 {
-            let k = if i < 70_000 { (0, i * 7919 % 1_000_003) } else { (1, i) };
-            assert_eq!(big.insert_or(k, 1 << (i % 64)).1, 0);
-        }
-        assert_eq!((big.len(), big.kw), (100_000, 9));
-        for i in (0..100_000u64).step_by(13) {
-            let k = if i < 70_000 { (0, i * 7919 % 1_000_003) } else { (1, i) };
-            assert_eq!(big.mask_of(k), 1 << (i % 64));
-        }
-        let mut fb = big.clone();
-        fb.freeze();
-        assert!(fb.iter().map(|x| wide(x.0)).collect::<Vec<_>>().windows(2).all(|w| w[0] < w[1]));
-        assert_eq!(fb.states(), 100_000);
-        let mut gb = RegionTable::new();
-        gb.merge(&fb, |_, _| {});
-        assert_eq!((gb.len(), gb.states()), (100_000, 100_000));
-        assert_eq!(gb.mask_of((1, 99_999)), 1 << (99_999 % 64));
-        // Narrow keys stay narrow.
-        let mut n = RegionTable::new();
-        for k in 0..1000u64 {
-            n.push((0, k * 3), 1);
-        }
-        assert_eq!(n.kw, 2);
-        assert!(n.keys.iter().map(|c| c.capacity()).sum::<usize>() < 1000 * 3, "more than 3 B of keys a two-byte key");
-        let slots = n.index.as_ref().expect("indexed").slots.len();
-        assert!((1000..=2000).contains(&slots), "{slots} index slots for 1000 entries");
     }
 
-    /// Sets: frozen tables pushed in region order, membership, entries
-    /// by index.
+    /// A plain table holds what it was made of, keys of every width (1 to
+    /// 16 bytes) across chunks; found by binary search, absent keys not.
+    #[test]
+    fn a_plain_table_finds_its_entries() {
+        let mut next = rng(0x9e37_79b9_7f4a_7c15);
+        let mut want: std::collections::BTreeMap<u128, u64> = Default::default();
+        for i in 0..80_000u64 {
+            let width = 1 + (i / 5000) as u32 % 16;
+            let w = (next() as u128) << 64 | next() as u128;
+            let w = if width == 16 { w | 1 << 127 } else { w & ((1u128 << (8 * width)) - 1) };
+            *want.entry(w).or_default() |= 1u64 << (next() % 64);
+        }
+        let (keys, masks): (Vec<Key>, Vec<u64>) = want.iter().map(|(&w, &m)| (narrow(w), m)).unzip();
+        let t = RegionTable::from_sorted(&keys, &masks).unwrap();
+        assert_eq!(t.len(), want.len());
+        assert_eq!(t.iter().map(|(k, m)| (wide(k), m)).collect::<Vec<_>>(), want.iter().map(|(&w, &m)| (w, m)).collect::<Vec<_>>());
+        for (&w, &m) in want.iter().step_by(7) {
+            assert_eq!(t.mask_of(narrow(w)), m);
+            assert_eq!(t.mask_of(narrow(w ^ 1 << 100)), want.get(&(w ^ 1 << 100)).copied().unwrap_or(0));
+        }
+        assert!(RegionTable::from_sorted(&[(0, 2), (0, 1)], &[1, 1]).is_err(), "keys out of order");
+        // Narrow keys stay narrow.
+        let n = RegionTable::from_sorted(&(0..1000u64).map(|k| (0, k * 3)).collect::<Vec<_>>(), &[1; 1000]).unwrap();
+        assert!(n.bytes()[0] < 1000 * 3 + 64, "more than 3 B of keys a two-byte key");
+    }
+
+    /// A packed table upserted again and again holds what a model holds:
+    /// every state's cells, bare cells (full hulls) and infos, found by a
+    /// cursor and by a single lookup, absent ones not; the counts (added,
+    /// new states held already) are the model's; untouched blocks kept.
+    #[test]
+    fn a_packed_table_upserts_as_a_model() {
+        let mut next = rng(0x2545_f491_4f6c_dd1d);
+        let mut model: std::collections::BTreeMap<(u128, u8), Option<StateInfo>> = Default::default();
+        let mut t = RegionTable::packed();
+        let hull = |x: u64| Hull::from_bytes(&x.to_le_bytes());
+        let full = Hull::full();
+        for round in 0..12u64 {
+            // Changes: new keys, new cells of held keys, updates (some to full).
+            let held: Vec<u128> = model.keys().map(|k| k.0).collect();
+            let mut ch: std::collections::BTreeMap<(u128, u8), (Option<StateInfo>, bool)> = Default::default();
+            for _ in 0..(if round == 0 { 5000 } else { 1500 }) {
+                let key = if held.is_empty() || next() % 3 == 0 { ((next() % 4) as u128) << 64 | (next() % 200_000) as u128 } else { held[(next() % held.len() as u64) as usize] };
+                let cell = (next() % 64) as u8;
+                let info = match next() % 10 {
+                    0 => Some(StateInfo { hull: full, layer: round as u16 }),
+                    1 => None,
+                    _ => Some(StateInfo { hull: hull(next() & 0x7fff_7fff_7fff_7fff), layer: (next() % 300) as u16 }),
+                };
+                let new = !model.contains_key(&(key, cell)) && next() % 2 == 0;
+                ch.insert((key, cell), (info, new));
+            }
+            let changes: Vec<Change> = ch.iter().map(|(&(k, c), &(info, new))| Change { key: narrow(k), cell: c, info, new }).collect();
+            let want = (ch.keys().filter(|k| !model.contains_key(k)).count() as u64, ch.iter().filter(|(k, v)| v.1 && model.contains_key(k)).count() as u64);
+            let got = t.upsert(&changes).unwrap();
+            assert_eq!((got.added, got.held_new), want, "round {round}");
+            for ((k, c), (info, _)) in ch {
+                model.insert((k, c), info.filter(|i| !i.is_full()));
+            }
+            assert_eq!(t.states(), model.len() as u64);
+            assert_eq!(t.infos(), model.values().filter(|i| i.is_some()).count() as u64);
+            assert!(t.blocks().iter().all(|b| b.entries as usize <= PACK_ENTRIES));
+            // Every entry, by a cursor.
+            let mut by_key: std::collections::BTreeMap<u128, Vec<(u8, Option<StateInfo>)>> = Default::default();
+            for (&(k, c), &i) in &model {
+                by_key.entry(k).or_default().push((c, i));
+            }
+            let mut cur = t.cursor();
+            for (k, cells) in by_key.iter().step_by(3) {
+                let e = cur.seek(narrow(*k)).unwrap().expect("a held key");
+                assert_eq!(e.mask, cells.iter().fold(0, |m, x| m | 1u64 << x.0));
+                for &(c, i) in cells {
+                    assert_eq!(e.info(c as u32), i);
+                }
+            }
+            let mut cur = t.cursor();
+            for k in (0..300_000u128).step_by(997) {
+                assert_eq!(cur.seek(narrow(k)).unwrap().map(|e| e.mask), by_key.get(&k).map(|c| c.iter().fold(0, |m, x| m | 1u64 << x.0)));
+            }
+            let (&(k, c), &i) = model.iter().nth(model.len() / 2).unwrap();
+            assert_eq!(t.lookup_info(narrow(k), c as u32).map(|x| x.1), Some(i));
+            let mut walked = 0u64;
+            t.for_each_packed(|_, m, _, _| walked += m.count_ones() as u64).unwrap();
+            assert_eq!(walked, model.len() as u64);
+        }
+        // Changes in the first block alone: every other block kept as it
+        // was (the same allocation).
+        assert!(t.blocks().len() > 3);
+        let kept: Vec<*const u8> = t.blocks().iter().map(|b| b.bytes.as_ptr()).collect();
+        let first = t.blocks()[0].first;
+        let k = *model.keys().find(|k| k.0 == first).expect("the first key");
+        t.upsert(&[Change { key: narrow(k.0), cell: k.1, info: Some(StateInfo { hull: hull(1), layer: 7 }), new: false }]).unwrap();
+        assert_eq!(t.lookup_info(narrow(k.0), k.1 as u32).and_then(|x| x.1), Some(StateInfo { hull: hull(1), layer: 7 }));
+        assert!(t.blocks()[1..].iter().all(|b| kept.contains(&b.bytes.as_ptr())), "a block no change fell in made again");
+        assert!(!kept.contains(&t.blocks()[0].bytes.as_ptr()), "the changed block kept");
+    }
+
+    /// Sets: plain tables pushed in region order, membership, entries by
+    /// index.
     #[test]
     fn a_region_set_finds() {
         let mut a = RegionSet::default();

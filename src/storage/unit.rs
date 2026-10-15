@@ -148,6 +148,8 @@ const VERDICT_BATCH: usize = 1024;
 const XFER_CACHE: usize = 1 << 12;
 /// Entries of `UnitSink::pos_edge`'s cache (a power of two).
 const POS_RECENT: usize = 1 << 10;
+/// Entries of `UnitSink::src_seen` (a power of two).
+const SRC_SEEN: usize = 1 << 8;
 
 /// The lanes of a slice mask, lowest first.
 #[inline]
@@ -239,9 +241,11 @@ pub struct UnitSink<'a> {
     route_ids: FxHashMap<(u64, u32), u32>,
     route_slot: FxHashMap<u32, (u64, u32)>,
     last_route: (u64, u32, u32),
-    /// The unit's bundles by route, and its (route, source region) pairs.
+    /// The unit's bundles by route, and its (route, source region) pairs
+    /// (`src_seen`: the ones met, direct mapped, `pair + 1`).
     bundles: UnitBundles,
     src_regions: Vec<(u32, u32)>,
+    src_seen: Vec<u64>,
     /// Per target the coarser level's verdict (`MarkFilter`), once a unit,
     /// decided in batches (a projection per block, not per row).
     verdicts: rustc_hash2::FxHashMap<Target, u8>,
@@ -260,6 +264,14 @@ pub struct UnitSink<'a> {
     /// The level -1 table of `filters.minus_one`, resolved once.
     l1: Option<&'static crate::trace::level_minus_one::CostToGo>,
     drop_last: Option<((u64, u32), bool)>,
+    /// TRANSFER IDS: a pair the tree's table holds (`base`, read only
+    /// during the wave, shared by the workers) is its global id; a pair new
+    /// this frame is this worker's LOCAL id `l`, named `first_new + l` (the
+    /// gather gives it its global id: the region phase's remaps). Only the
+    /// new pairs cost the worker anything (each worker held every pair it
+    /// met: ~170 B a pair a worker).
+    base: &'a super::edges::XferTable,
+    first_new: u32,
     xfer_ids: FxHashMap<crate::search::arc_edges::Pair, u32>,
     /// Per local transfer id its decoded transfers (the pushes').
     xfer_pairs: Vec<(Transfer, Transfer)>,
@@ -267,8 +279,8 @@ pub struct UnitSink<'a> {
     /// frame's new transfers are numbered by their count: `wave`).
     xfer_counts: Vec<u64>,
     xfer_cache: Vec<(crate::compiled::asm_kernel::RawWords, u32)>,
-    /// The worker's transfer table (the wave's gather reads it), and its
-    /// length.
+    /// The worker's table of local transfers (the wave's gather reads it),
+    /// and its length.
     xfer_tab: &'a std::sync::RwLock<Vec<crate::search::arc_edges::Pair>>,
     xfer_len: u32,
     /// The units' chunks.
@@ -279,6 +291,9 @@ pub struct UnitSink<'a> {
     record_out: bool,
     pub out_blocks: Vec<(Vec<u8>, bool)>,
     out_parts: super::out::Parts,
+    /// The unit's transfers, each one's rank among them by pair
+    /// (`out_parts_of`).
+    x_rank: FxHashMap<u32, u32>,
     /// Record `edges` (the pos graph) at all.
     pub edges_on: bool,
     /// The distinct pos-graph edges this worker produced, and the ones met
@@ -302,6 +317,16 @@ pub struct UnitSink<'a> {
     last_shape: u64,
 }
 
+/// Transfer `x`'s pair: a global id's in the tree's table `base`, a local
+/// one's (`first_new` on) in the worker's table `tab`.
+#[inline]
+fn pair_of(base: &super::edges::XferTable, tab: &[crate::search::arc_edges::Pair], first_new: u32, x: u32) -> crate::search::arc_edges::Pair {
+    match x.checked_sub(first_new) {
+        Some(l) => tab[l as usize],
+        None => base.pairs[x as usize],
+    }
+}
+
 impl<'a> UnitSink<'a> {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -313,6 +338,7 @@ impl<'a> UnitSink<'a> {
         frame: u32,
         level: crate::abstraction::Level,
         worker: u32,
+        base: &'a super::edges::XferTable,
         xfer_tab: &'a std::sync::RwLock<Vec<crate::search::arc_edges::Pair>>,
         edges_on: bool,
         record_out: bool,
@@ -345,6 +371,7 @@ impl<'a> UnitSink<'a> {
             last_route: (0, u32::MAX, u32::MAX),
             bundles: UnitBundles::default(),
             src_regions: Vec::new(),
+            src_seen: Vec::new(),
             verdicts: Default::default(),
             scratch: Vec::new(),
             scratch_at: Vec::new(),
@@ -354,6 +381,8 @@ impl<'a> UnitSink<'a> {
             phases: s.diag.phases,
             l1,
             drop_last: None,
+            base,
+            first_new: u32::try_from(base.pairs.len()).expect("transfers past u32"),
             xfer_ids: Default::default(),
             xfer_pairs: Vec::new(),
             xfer_counts: Vec::new(),
@@ -364,6 +393,7 @@ impl<'a> UnitSink<'a> {
             record_out,
             out_blocks: Vec::new(),
             out_parts: Default::default(),
+            x_rank: Default::default(),
             edges_on,
             pos_edges: Default::default(),
             pos_recent: Vec::new(),
@@ -379,20 +409,25 @@ impl<'a> UnitSink<'a> {
     }
 
     /// Bytes this worker's buffers hold (`--phases`' `[wavemem]`): its
-    /// bundles, its lanes' hulls, its pos-graph pairs, the rest (the unit's
-    /// sources and lanes, transfers, chunks not yet handed over).
-    pub fn alloc_bytes(&self) -> [usize; 4] {
+    /// bundles, its lanes' hulls, its pos-graph pairs, its transfers (by
+    /// pair, decoded, counted, its table, its ranks), the rest (the unit's
+    /// sources and lanes, chunks not yet handed over).
+    pub fn alloc_bytes(&self) -> [usize; 5] {
+        use std::mem::size_of;
         [
             self.bundles.alloc_bytes(),
-            std::mem::size_of::<Hull>() * self.hulls.capacity() + 4 * self.src_first.capacity() + 20 * self.entry_next.capacity() + std::mem::size_of::<HullAcc>() * self.push_slots.capacity() + 4 * self.push_offs.capacity(),
+            size_of::<Hull>() * self.hulls.capacity() + 4 * self.src_first.capacity() + 20 * self.entry_next.capacity() + size_of::<HullAcc>() * self.push_slots.capacity() + 4 * self.push_offs.capacity(),
             9 * self.pos_edges.capacity() + 8 * self.pos_recent.capacity(),
+            (size_of::<crate::search::arc_edges::Pair>() + 8) * self.xfer_ids.capacity()
+                + size_of::<(Transfer, Transfer)>() * self.xfer_pairs.capacity()
+                + 8 * self.xfer_counts.capacity()
+                + size_of::<crate::search::arc_edges::Pair>() * self.xfer_tab.read().expect("a transfer table").capacity()
+                + 8 * self.x_rank.capacity()
+                + size_of::<(crate::compiled::asm_kernel::RawWords, u32)>() * self.xfer_cache.capacity(),
             24 * (self.srcs.capacity() + self.unit_sources.capacity())
                 + 4 * self.src_local.capacity()
                 + 8 * self.lanes.capacity()
                 + 32 * self.src_idx.capacity()
-                + 40 * self.xfer_ids.capacity()
-                + 8 * self.xfer_counts.capacity()
-                + std::mem::size_of::<(crate::compiled::asm_kernel::RawWords, u32)>() * self.xfer_cache.capacity()
                 + self.outbox.iter().map(|c| c.alloc_bytes()).sum::<usize>(),
         ]
     }
@@ -426,6 +461,8 @@ impl<'a> UnitSink<'a> {
         self.unit = unit;
         self.bundles.clear();
         self.src_regions.clear();
+        self.src_seen.clear();
+        self.src_seen.resize(SRC_SEEN, 0);
         self.verdicts.clear();
         self.disallowed = false;
         self.srcs.clear();
@@ -633,19 +670,34 @@ impl<'a> UnitSink<'a> {
         id
     }
 
-    /// The transfer pair `t` as this worker's id (interned on first use).
+    /// The transfer pair `t`'s id: its global one if the tree's table holds
+    /// it, else this worker's local one (interned on first use).
     pub fn xfer_id(&mut self, t: crate::search::arc_edges::Pair) -> u32 {
+        if let Some(g) = self.base.find(&t) {
+            return g;
+        }
         if let Some(&id) = self.xfer_ids.get(&t) {
             return id;
         }
-        let id = self.xfer_len;
-        assert!(id < NO_XFER, "worker {}: {id} transfers in one frame", self.worker);
+        let id = self.first_new.checked_add(self.xfer_len).filter(|&id| id < NO_XFER).unwrap_or_else(|| panic!("worker {}: {} transfers past the table's {}", self.worker, self.xfer_len, self.first_new));
         self.xfer_tab.write().expect("a transfer table").push(t);
         self.xfer_len += 1;
         self.xfer_ids.insert(t, id);
         self.xfer_pairs.push((t.0.transfer(), t.1.transfer()));
         self.xfer_counts.push(0);
         id
+    }
+
+    /// Transfer `x`'s decoded pair (the pushes').
+    #[inline]
+    fn transfers(&self, x: u32) -> (Transfer, Transfer) {
+        match x.checked_sub(self.first_new) {
+            Some(l) => self.xfer_pairs[l as usize],
+            None => {
+                let p = &self.base.pairs[x as usize];
+                (p.0.transfer(), p.1.transfer())
+            }
+        }
     }
 
     /// Per local transfer id, the edges this worker recorded with it.
@@ -733,9 +785,11 @@ impl<'a> UnitSink<'a> {
         }
         self.emitted += take.count_ones() as u64;
         if let Some(c) = &mut self.capture {
+            let tab = self.xfer_tab.read().expect("a transfer table");
             for i in lanes_of(take) {
                 let key = e.keys[i];
-                c.emit(shape, t.cells[i], key, e.lanes[i] as u32, e.xfers.map(|x| x[i]), is_provisional(key).then(|| self.prov.content(key)));
+                let x = e.xfers.map(|x| c.xfer(x[i], || pair_of(self.base, &tab, self.first_new, x[i])));
+                c.emit(shape, t.cells[i], key, e.lanes[i] as u32, x, is_provisional(key).then(|| self.prov.content(key)));
             }
         }
         // A shape's first emission (this worker, this wave): its skeleton
@@ -803,7 +857,12 @@ impl<'a> UnitSink<'a> {
         let mut pending: Option<(u32, Key, u32, u32, u32, u64)> = None;
         for i in lanes_of(take) {
             let route = t.route[i];
-            if self.src_regions.last() != Some(&(route, t.s_region[i])) {
+            // A (route, source region) pair once a unit, mostly: a direct
+            // mapped table of the pairs met (`end` sorts and dedups the rest).
+            let pair = (route as u64) << 32 | t.s_region[i] as u64;
+            let slot = (pair.wrapping_mul(0x9e37_79b9_7f4a_7c15) >> (64 - SRC_SEEN.trailing_zeros())) as usize;
+            if self.src_seen[slot] != pair + 1 {
+                self.src_seen[slot] = pair + 1;
                 self.src_regions.push((route, t.s_region[i]));
             }
             let b = (route, e.keys[i], t.src[i], xfers[i], t.offset[i]);
@@ -828,7 +887,10 @@ impl<'a> UnitSink<'a> {
     /// transfer.
     #[inline]
     fn bundle(&mut self, route: u32, t_key: Key, s: u32, x: u32, o: u32, m: u64) {
-        self.xfer_counts[x as usize] += m.count_ones() as u64;
+        debug_assert!(x != NO_XFER, "a bundle without a transfer is counted for none");
+        if let Some(l) = x.checked_sub(self.first_new) {
+            self.xfer_counts[l as usize] += m.count_ones() as u64;
+        }
         self.bundles.insert(route, t_key, s, x, o, m);
     }
 
@@ -943,7 +1005,7 @@ impl<'a> UnitSink<'a> {
         self.guarded.clear();
         self.last_shape = 0;
         match self.capture.take() {
-            Some(c) => c.finish(&self.xfer_tab.read().expect("a transfer table")),
+            Some(c) => c.finish(),
             None => Ok(()),
         }
     }
@@ -994,7 +1056,7 @@ impl<'a> UnitSink<'a> {
                     }
                 }
             });
-            let (tx, ty) = self.xfer_pairs[b.x as usize];
+            let (tx, ty) = self.transfers(b.x);
             for &(lane, c) in &edges {
                 let h = self.hulls[lane as usize];
                 let pushed = self.push_cache.get(&h, &h, b.x, || {
@@ -1111,16 +1173,22 @@ impl<'a> UnitSink<'a> {
         p.routes = keys.clone();
         p.routes.sort_unstable();
         p.routes.dedup();
+        // The distinct transfers (in `x_rank`), by pair: each one's rank.
         let tab = self.xfer_tab.read().expect("a transfer table");
-        let mut xs: Vec<u32> = buckets.iter().flat_map(|b| b.2.iter().map(|u| u.x)).filter(|&x| x != NO_XFER).collect();
-        xs.sort_unstable();
-        xs.dedup();
-        let mut by_pair: Vec<(crate::search::arc_edges::Pair, u32)> = xs.iter().map(|&x| (tab[x as usize], x)).collect();
+        self.x_rank.clear();
+        let mut by_pair: Vec<(crate::search::arc_edges::Pair, u32)> = Vec::new();
+        for u in buckets.iter().flat_map(|b| &b.2) {
+            if u.x != NO_XFER {
+                if let std::collections::hash_map::Entry::Vacant(v) = self.x_rank.entry(u.x) {
+                    v.insert(0);
+                    by_pair.push((pair_of(self.base, &tab, self.first_new, u.x), u.x));
+                }
+            }
+        }
         drop(tab);
         by_pair.sort_unstable();
-        let mut x_rank: rustc_hash2::FxHashMap<u32, u32> = Default::default();
         for (rank, &(_, x)) in by_pair.iter().enumerate() {
-            x_rank.insert(x, rank as u32);
+            self.x_rank.insert(x, rank as u32);
         }
         p.pairs = by_pair.into_iter().map(|x| x.0).collect();
         let mut ts: Vec<((u32, Key), u32, u32)> = Vec::new();
@@ -1142,7 +1210,7 @@ impl<'a> UnitSink<'a> {
                 if u.x == NO_XFER {
                     continue;
                 }
-                let (t, x) = (t_rank[bi][u.t as usize], x_rank[&u.x]);
+                let (t, x) = (t_rank[bi][u.t as usize], self.x_rank[&u.x]);
                 // The cells by source entry (one, mostly).
                 let mut parts: [(u32, u64); 4] = [(u32::MAX, 0); 4];
                 self.by_entry(slot, u, |e, part, _| {

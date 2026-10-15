@@ -218,6 +218,12 @@ impl CollisionCache {
     }
 
     /// The tile scan: does any tile of the room under the box have `flag`.
+    /// The cart's loop, `for i=max(0,flr(x/8)),min(15,(x+w-1)/8)` (and
+    /// `j` likewise): its limit is a FRACTION, so the last column is the
+    /// FLOOR of `(x+w-1)/8`. Truncating toward zero instead (as this did
+    /// until 2026-10-15) scanned column 0 for a box wholly left of the room
+    /// (`x+w-1` in [-7, -1]), where the cart scans nothing (row 0 likewise
+    /// above it). The first column truncates or floors alike under the `max`.
     fn tile_flag_at_impl(
         cart_data: &CartData,
         room_x: i16,
@@ -229,9 +235,9 @@ impl CollisionCache {
         flag: i16,
     ) -> Result<bool> {
         let tile_min_x = cmp::max(0, x / 8);
-        let tile_max_x = cmp::min(15, (x + w - 1) / 8);
+        let tile_max_x = cmp::min(15, (x + w - 1).div_euclid(8));
         let tile_min_y = cmp::max(0, y / 8);
-        let tile_max_y = cmp::min(15, (y + h - 1) / 8);
+        let tile_max_y = cmp::min(15, (y + h - 1).div_euclid(8));
 
         for ty in tile_min_y..=tile_max_y {
             for tx in tile_min_x..=tile_max_x {

@@ -102,18 +102,28 @@ impl Placed {
 /// The 16 lanes of the 32-bit column at byte `o`.
 #[inline]
 fn col(buf: &[u8], o: usize) -> [u32; 16] {
-    let b: &[u8; 64] = buf[o..o + 64].try_into().unwrap();
-    std::array::from_fn(|i| u32::from_le_bytes([b[4 * i], b[4 * i + 1], b[4 * i + 2], b[4 * i + 3]]))
+    let b = &buf[o..o + 64];
+    // SAFETY: 64 readable bytes (the slice above), read as 16 words.
+    unsafe { std::ptr::read_unaligned(b.as_ptr().cast::<[u32; 16]>()) }.map(u32::from_le)
 }
 
-/// The lanes where `c` holds `v`.
+/// The lanes where `c` holds `v` (one AVX-512 compare: every build has
+/// it, `celeste_engine::kernel`).
 #[inline]
 fn eq_mask(c: &[u32; 16], v: u32) -> u16 {
-    let mut m = 0u16;
-    for (i, &x) in c.iter().enumerate() {
-        m |= ((x == v) as u16) << i;
-    }
-    m
+    use core::arch::x86_64::{_mm512_cmpeq_epi32_mask, _mm512_loadu_si512, _mm512_set1_epi32};
+    // SAFETY: `c` is 64 readable bytes; AVX-512F is enabled in every build.
+    unsafe { _mm512_cmpeq_epi32_mask(_mm512_loadu_si512(c.as_ptr().cast()), _mm512_set1_epi32(v as i32)) }
+}
+
+/// The lanes where two columns of 16 words (64 bytes each) are equal.
+#[inline]
+pub(super) fn eq16(a: &[u8], b: &[u8]) -> u16 {
+    use core::arch::x86_64::{_mm512_cmpeq_epi32_mask, _mm512_loadu_si512};
+    assert!(a.len() >= 64 && b.len() >= 64, "a column of 16 words");
+    // SAFETY: both hold 64 readable bytes (checked); AVX-512F is enabled in
+    // every build.
+    unsafe { _mm512_cmpeq_epi32_mask(_mm512_loadu_si512(a.as_ptr().cast()), _mm512_loadu_si512(b.as_ptr().cast())) }
 }
 
 /// A boolean root's `(value, known)` lane masks.
@@ -471,11 +481,6 @@ impl Plan {
         p
     }
 
-    /// Body `bi`'s key fields.
-    fn fields(&self, bi: usize) -> impl Iterator<Item = &KeyField> {
-        let r = &self.bodies[bi].reads;
-        self.body_reads[r.start as usize..r.end as usize].iter().map(|&i| &self.reads[i as usize].1)
-    }
 }
 
 /// A slice's columns (module doc), one per entry of the kernel's plan: the
@@ -687,7 +692,7 @@ impl AsmKernel {
                 out_keys[i] = if miss >> i & 1 == 0 && part.missing.is_empty() {
                     (packed.0[1][i], packed.0[0][i])
                 } else {
-                    sink.provisional().intern(self.miss_key(bi, buf, i, sk, shape, packed.get(i), &part.missing))
+                    sink.provisional().intern(self.miss_key(bi, buf, i, &c.read_miss, shape, packed.get(i), &part.missing))
                 };
             }
             emitted += take.count_ones() as u64;
@@ -703,15 +708,17 @@ impl AsmKernel {
 
     /// Body `bi`'s lane `i`'s exact content where a code is missing: its
     /// fields that hit packed (`partial`), the outcome's and the body's
-    /// missing codes.
+    /// missing codes - a body's field is missing where its read missed the
+    /// lane (`read_miss`: the read's dictionary lacks the lane's code, or
+    /// the key space its shape).
     #[allow(clippy::too_many_arguments)]
-    fn miss_key(&self, bi: usize, buf: &[u8], i: usize, sk: Option<&ShapeKeys>, shape: u64, partial: u128, part_missing: &[(u32, Code)]) -> MissKey {
-        use celeste_engine::exact::NONE;
+    fn miss_key(&self, bi: usize, buf: &[u8], i: usize, read_miss: &[u16], shape: u64, partial: u128, part_missing: &[(u32, Code)]) -> MissKey {
         let mut missing: Vec<(u32, Code)> = part_missing.to_vec();
-        for f in self.plan.fields(bi) {
-            let c = f.code(buf, i);
-            if sk.is_none_or(|sk| sk.field(f.cell as usize).is_none_or(|d| d.find(c) == NONE)) {
-                missing.push((f.cell, c));
+        let r = &self.plan.bodies[bi].reads;
+        for &k in &self.plan.body_reads[r.start as usize..r.end as usize] {
+            if read_miss[k as usize] >> i & 1 == 1 {
+                let f = &self.plan.reads[k as usize].1;
+                missing.push((f.cell, f.code(buf, i)));
             }
         }
         missing.sort_unstable_by_key(|m| m.0);

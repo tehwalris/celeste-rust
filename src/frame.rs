@@ -17,10 +17,27 @@ use crate::search::hull::Hull;
 use crate::storage::wave::Frontier;
 
 /// Wave phase timers (`--phases`, which the wave's sinks carry): TSC ticks
-/// summed over workers, printed by `print_phases`. Off, `start` is a branch.
+/// summed over workers, taken per frame (`take`) into `FrameStats::phase_s`
+/// and printed (`print`). Off, `start` is a branch.
 pub mod phases {
     use std::sync::atomic::{AtomicU64, Ordering};
-    pub const NAMES: [&str; 10] = ["pack", "kernel", "emit", "unit end (chunks)", "regions (pushes merged, segments)", "frame end (keys, next layer, wins decode, edge files)", "slice.setup", "unit (all of engine.run)", "unit decode (rows from keys, not expanded)", "re-push units"];
+    /// The phases. `UNIT` (a kernel unit's `engine.run`) holds `SETUP`,
+    /// `PACK`, `KERNEL` and `EMIT`; the rest are disjoint.
+    pub const NAMES: [&str; N] = [
+        "pack",
+        "kernel",
+        "emit",
+        "unit end (chunks)",
+        "regions (pushes merged, segments)",
+        "frame end (keys, next layer, wins decode, edge files)",
+        "slice.setup",
+        "unit (all of engine.run)",
+        "unit decode (rows from keys, not expanded)",
+        "re-push units",
+        "unit out blocks (zstd)",
+        "slice gather (transfer ids, jobs)",
+    ];
+    pub const N: usize = 12;
     pub const PACK: usize = 0;
     pub const KERNEL: usize = 1;
     pub const EMIT: usize = 2;
@@ -31,7 +48,9 @@ pub mod phases {
     pub const UNIT: usize = 7;
     pub const DECODE: usize = 8;
     pub const REPUSH: usize = 9;
-    static TICKS: [AtomicU64; 10] = [const { AtomicU64::new(0) }; 10];
+    pub const OUT_BLOCKS: usize = 10;
+    pub const GATHER: usize = 11;
+    static TICKS: [AtomicU64; N] = [const { AtomicU64::new(0) }; N];
     /// A phase's start (`on`: `--phases`; off, 0 and every `add` a no-op).
     #[inline]
     pub fn start(on: bool) -> u64 {
@@ -51,22 +70,29 @@ pub mod phases {
         TICKS[p].fetch_add(t - t0, Ordering::Relaxed);
         t
     }
-    pub fn print_phases(on: bool, wall: std::time::Duration, workers: usize) {
-        if !on {
-            return;
-        }
-        let v: Vec<u64> = TICKS.iter().map(|a| a.swap(0, Ordering::Relaxed)).collect();
-        // TSC rate: ticks per second, measured against the wall clock.
-        let t0 = std::time::Instant::now();
-        let c0 = unsafe { core::arch::x86_64::_rdtsc() };
-        std::thread::sleep(std::time::Duration::from_millis(50));
-        let hz = (unsafe { core::arch::x86_64::_rdtsc() } - c0) as f64 / t0.elapsed().as_secs_f64();
+    /// The TSC's ticks per second, measured once against the wall clock.
+    fn hz() -> f64 {
+        static HZ: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+        *HZ.get_or_init(|| {
+            let t0 = std::time::Instant::now();
+            let c0 = unsafe { core::arch::x86_64::_rdtsc() };
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            (unsafe { core::arch::x86_64::_rdtsc() } - c0) as f64 / t0.elapsed().as_secs_f64()
+        })
+    }
+    /// The phases' seconds since the last `take` (summed over workers),
+    /// the counters reset.
+    pub fn take() -> [f64; N] {
+        let hz = hz();
+        std::array::from_fn(|p| TICKS[p].swap(0, Ordering::Relaxed) as f64 / hz)
+    }
+    /// `secs` (a `take`) against the budget `workers` x `wall`.
+    pub fn print(secs: &[f64; N], wall: std::time::Duration, workers: usize) {
         let budget = wall.as_secs_f64() * workers as f64;
-        let line: Vec<String> = NAMES.iter().zip(&v).map(|(n, &t)| format!("{n} {:.1}s ({:.0}%)", t as f64 / hz, 100.0 * t as f64 / hz / budget)).collect();
+        let line: Vec<String> = NAMES.iter().zip(secs).map(|(n, &t)| format!("{n} {t:.1}s ({:.0}%)", 100.0 * t / budget)).collect();
         eprintln!("[phases] worker-seconds of {:.1} ({} x {:.2} s): {}", budget, workers, wall.as_secs_f64(), line.join(", "));
     }
 }
-
 
 /// A columnar batch of lanes of one shape: the kernels' own `Rt2`, with its
 /// key column where it was decoded from keys. Only the per-lane key and
@@ -526,6 +552,12 @@ pub trait FrameStep: Sync {
     fn settings(&self) -> std::sync::Arc<crate::settings::Settings>;
 }
 
+/// The frame end's steps (`FrameStats::t_end`): provisional keys made
+/// final, the routes sealed, the ladder's filter, the visited set's merge,
+/// the next layer and the grown states built, their wins decoded, the edge
+/// file and the out file written.
+pub const END_STEPS: [&str; 8] = ["keys", "seal", "filter", "absorb", "layer", "wins", "edge file", "out file"];
+
 /// One forward frame's timings and sizes, for the `[fwd]` log line.
 #[derive(Default, Clone, Copy)]
 pub struct FrameStats {
@@ -554,8 +586,15 @@ pub struct FrameStats {
     /// inside the wave, overlapping the units).
     pub t_regions: std::time::Duration,
     /// The frame's end (keys, the next layer, its wins decoded, the edge
-    /// file), wall.
+    /// file), wall, and its steps' (`END_STEPS`).
     pub t_layer: std::time::Duration,
+    pub t_end: [std::time::Duration; END_STEPS.len()],
+    /// Per step its counts (user instructions and cycles, kernel cycles,
+    /// page faults: `storage::bench::step_counts`; zeros outside a bench).
+    pub end_counts: [[u64; 4]; END_STEPS.len()],
+    /// `--phases`: the wave's phases, seconds summed over the workers
+    /// (`phases::take`; zeros without).
+    pub phase_s: [f64; phases::N],
     pub units: usize,
     /// The slices, and the routes (target regions) with new states or edges.
     pub slices: usize,
@@ -720,6 +759,8 @@ pub struct ForwardState {
     /// The filter the tree's frames were built under (`None`: a tree from
     /// before records, which is not extended).
     pub filter: Option<TreeFilter>,
+    /// A bench wave took the visited set (`bench_wave` without `copy`).
+    spent: bool,
 }
 
 /// What a forward run reports.
@@ -743,24 +784,50 @@ pub fn start_hull(s: &crate::settings::Settings) -> Result<Hull> {
     Ok(Hull::point(x, y))
 }
 
+/// What a checkpoint wrote, and its steps' walls (`CKPT_STEPS`).
+#[derive(Clone, Copy, Default)]
+pub struct Checkpointed {
+    /// Does a new state win?
+    pub won: bool,
+    pub frame_bytes: u64,
+    pub hull_bytes: u64,
+    pub t: [std::time::Duration; CKPT_STEPS.len()],
+    /// Per step its counts (`FrameStats::end_counts`).
+    pub counts: [[u64; 4]; CKPT_STEPS.len()],
+}
+
+/// A checkpoint's steps (`Checkpointed::t`).
+pub const CKPT_STEPS: [&str; 4] = ["frame file", "frame check", "hull file", "hull check"];
+
 /// CHECKPOINT a wave: frame `frame`'s file - its new states and wins - and
 /// its hull file - its frontier, every state whose hull grew, with its
 /// layer and hull - each read back and checked to hold exactly the wave's
 /// (`layer::check_frame_file`, `hulls::check`: the complete storage
-/// check). Returns whether a state wins.
-fn checkpoint(dir: &std::path::Path, frame: u32, wave: &crate::storage::wave::Wave, emitted: &[crate::storage::layer::SkelRecord], s: &crate::settings::Settings) -> Result<bool> {
+/// check).
+fn checkpoint(dir: &std::path::Path, frame: u32, wave: &crate::storage::wave::Wave, emitted: &[crate::storage::layer::SkelRecord], s: &crate::settings::Settings) -> Result<Checkpointed> {
     use crate::storage::{hulls, layer};
+    let mut c = Checkpointed { won: !wave.wins.is_empty(), ..Default::default() };
+    let mut lap = std::time::Instant::now();
+    let mut at = crate::storage::bench::step_counts();
+    let mut mark = |k: usize| {
+        c.t[k] = lap.elapsed();
+        (c.counts[k], at) = crate::storage::bench::counts_since(at);
+        lap = std::time::Instant::now();
+    };
     let path = layer::frame_path(dir, frame);
     let meta = layer::FrameMeta { frame, shapes: &wave.shapes, keys: &wave.keys, emitted };
-    layer::write_frame(&path, &meta, &wave.next, &wave.wins, s.threads())?;
+    let frame_bytes = layer::write_frame(&path, &meta, &wave.next, &wave.wins, s.threads())?;
+    mark(0);
     layer::check_frame_file(&path, &wave.next, &wave.wins, s.threads())?;
+    mark(1);
     anyhow::ensure!(u16::try_from(frame).is_ok(), "frame {frame}: past a u16 layer");
     let hp = hulls::path(dir, frame);
-    let of = |o: &crate::storage::wave::Old| (o.sk, o.layer, o.hull);
-    let runs: Vec<&[crate::storage::wave::Old]> = wave.grown.iter().map(|x| x.1.as_slice()).collect();
-    hulls::write(&hp, frame, &wave.hulls, &runs, of, s.threads())?;
-    hulls::check(&hp, frame, &wave.hulls, &runs, of, s.threads())?;
-    Ok(!wave.wins.is_empty())
+    let hull_bytes = hulls::write(&hp, frame, &wave.hulls, &wave.grown[..], s.threads())?;
+    mark(2);
+    hulls::check(&hp, frame, &wave.hulls, &wave.grown[..], s.threads())?;
+    mark(3);
+    (c.frame_bytes, c.hull_bytes) = (frame_bytes, hull_bytes);
+    Ok(c)
 }
 
 impl ForwardState {
@@ -785,7 +852,7 @@ impl ForwardState {
         anyhow::ensure!(initial.iter().all(|b| b.rt2().player_objects(ids).is_empty()), "frame 0: an initial row holds a player, whose remainder the start's hull does not describe");
         let mut visited = crate::storage::visited::VisitedSet::new(crate::storage::GEOMETRY);
         let seeded = crate::storage::wave::seed(&mut visited, &initial, start_hull(s)?, s)?;
-        let won = checkpoint(dir, 0, &seeded, &[], s)?;
+        let won = checkpoint(dir, 0, &seeded, &[], s)?.won;
         let observer = record.then(crate::search::pos_graph::PosObserver::default);
         // An (empty) graph from the start: every tree with frames has one.
         if let Some(o) = observer.as_ref() {
@@ -794,7 +861,7 @@ impl ForwardState {
         let edges_dir = dir.join("edges");
         crate::storage::edges::set_done(&edges_dir, 0, 0)?;
         let outs = crate::storage::out::OutStore::open(&edges_dir, 0)?;
-        Ok(ForwardState { frontier: seeded.frontier(), visited, xfers: Default::default(), outs, skeletons: Default::default(), persisted: Default::default(), observer, frames: 0, win_frame: won.then_some(0), filter: Some(filter) })
+        Ok(ForwardState { frontier: seeded.frontier(), visited, xfers: Default::default(), outs, skeletons: Default::default(), persisted: Default::default(), observer, frames: 0, win_frame: won.then_some(0), filter: Some(filter), spent: false })
     }
 
     /// The forward as its checkpoint tree left it (`None`: no tree); extending
@@ -853,7 +920,7 @@ impl ForwardState {
         } else {
             None
         };
-        Ok(ForwardState { frontier, visited, xfers, outs, skeletons, persisted, observer, frames: last, win_frame, filter })
+        Ok(ForwardState { frontier, visited, xfers, outs, skeletons, persisted, observer, frames: last, win_frame, filter, spent: false })
     }
 
     /// The visited set's size: every distinct state reached so far.
@@ -872,6 +939,11 @@ impl ForwardState {
         &self.frontier
     }
 
+    /// The out store and the transfer table (`bench-frame`'s `[memory]`).
+    pub fn outs_and_xfers(&self) -> (&crate::storage::out::OutStore, &crate::storage::edges::XferTable) {
+        (&self.outs, &self.xfers)
+    }
+
     /// The tree's ceiling for the frontier's `not_expanded` (its level -1
     /// horizon; a tree without a record by the run's `s`, as it was built).
     fn ceiling(&self, s: &crate::settings::Settings) -> Option<u32> {
@@ -884,24 +956,33 @@ impl ForwardState {
     /// ONE WAVE of `extend` - frame `frames + 1`, under the tree's level -1
     /// filter (a capture's replayed emissions are past it already,
     /// `bench-storage`; its re-pushes are not), its pos graph fed when
-    /// recording - without the
-    /// checkpoint: the state is left as it was (the visited set and the
-    /// transfer table are copied; the frontier is read), the edges go to
+    /// recording - without the checkpoint (`bench_checkpoint`): the
+    /// frontier is read; with `copy` the state is left as it was (the
+    /// visited set and the transfer table are copied: another wave may
+    /// follow), else they are MOVED in (no copy held beside the wave's: the
+    /// state is spent, and refuses another wave). The edges go to
     /// `edges_dir` (a scratch dir; `None`: not recorded). Returns the wave
     /// with the visited set and transfer table it ran against, which hold
     /// its new states and pairs (`bench-frame`, run per rep).
     pub fn bench_wave(
-        &self,
+        &mut self,
         engine: &dyn FrameStep,
         dir: &std::path::Path,
         edges_dir: Option<&std::path::Path>,
+        copy: bool,
     ) -> Result<(crate::storage::wave::Wave, crate::storage::visited::VisitedSet, crate::storage::edges::XferTable)> {
+        anyhow::ensure!(!self.spent, "{}: the forward state at f{} ran its last wave (its visited set was moved)", dir.display(), self.frames);
         // The frame the tree would make: under the table it was built with.
         let minus_one = match self.filter {
             Some(f) => f.checked_minus_one(dir, &engine.settings())?,
             None => anyhow::bail!("{}: no level -1 record (a tree from before records)", dir.display()),
         };
-        let (mut visited, mut xfers) = (self.visited.clone(), self.xfers.clone());
+        let (mut visited, mut xfers) = if copy {
+            (self.visited.clone(), self.xfers.clone())
+        } else {
+            self.spent = true;
+            (std::mem::replace(&mut self.visited, crate::storage::visited::VisitedSet::new(crate::storage::GEOMETRY)), std::mem::take(&mut self.xfers))
+        };
         let cx = crate::storage::wave::WaveCtx {
             visited: &mut visited,
             xfers: &mut xfers,
@@ -913,8 +994,23 @@ impl ForwardState {
             skeletons: &self.skeletons,
             ceiling: self.ceiling(&engine.settings()),
         };
-        let wave = crate::storage::wave::run_wave(engine, &self.frontier, cx)?;
+        let front = if copy { self.frontier.clone() } else { std::mem::take(&mut self.frontier) };
+        let wave = crate::storage::wave::run_wave(engine, front, cx)?;
         Ok((wave, visited, xfers))
+    }
+
+    /// `extend`'s CHECKPOINT of a `bench_wave`'s `wave` (frame `frames +
+    /// 1`) into `dir` (a scratch dir): the frame file and the hull file,
+    /// each read back and checked, then the pos graph saved. Returns the
+    /// checkpoint's steps and the pos graph's wall.
+    pub fn bench_checkpoint(&self, wave: &crate::storage::wave::Wave, dir: &std::path::Path, s: &crate::settings::Settings) -> Result<(Checkpointed, std::time::Duration)> {
+        let emitted = self.skeletons.records(|h| self.persisted.contains(&h) || wave.next.skeletons.contains_key(&h));
+        let c = checkpoint(dir, self.frames + 1, wave, &emitted, s)?;
+        let t = std::time::Instant::now();
+        if let Some(o) = self.observer.as_ref() {
+            save_pos_graph(dir, &o.snapshot())?;
+        }
+        Ok((c, t.elapsed()))
     }
 
     /// Compute and checkpoint frames `frames+1 ..= to` under the tree's
@@ -932,6 +1028,7 @@ impl ForwardState {
             Some(f) => f.checked_minus_one(dir, s)?,
             None => anyhow::bail!("{}: no level -1 record (a tree from before records): it cannot be extended (delete it)", dir.display()),
         };
+        anyhow::ensure!(!self.spent, "{}: the forward state at f{} ran a bench wave without a copy", dir.display(), self.frames);
         let filters = Filters { marks, minus_one };
         let ceiling = self.ceiling(s);
         let mut last_free = None;
@@ -950,15 +1047,14 @@ impl ForwardState {
                 skeletons: &self.skeletons,
                 ceiling,
             };
-            let wave = crate::storage::wave::run_wave(engine, &self.frontier, cx)?;
-            // The frontier is spent: its keys go before the frame is written.
-            self.frontier = Frontier::default();
+            // The frontier is spent by the wave (dropped before its end).
+            let wave = crate::storage::wave::run_wave(engine, std::mem::take(&mut self.frontier), cx)?;
             // Before the frame is trusted (every file, then done.txt).
             let t = std::time::Instant::now();
             // The skeletons first emitted here, of shapes the frame holds
             // no state of: a later re-push may reach one (`FrameHeader::emitted`).
             let emitted = self.skeletons.records(|h| self.persisted.contains(&h) || wave.next.skeletons.contains_key(&h));
-            let won = checkpoint(dir, frame, &wave, &emitted, s)?;
+            let won = checkpoint(dir, frame, &wave, &emitted, s)?.won;
             self.persisted.extend(self.skeletons.shapes());
             let t_ckpt = t.elapsed();
             let t = std::time::Instant::now();
@@ -1246,16 +1342,23 @@ pub(crate) fn append_forward_stats(dir: &std::path::Path, row: &[(&str, String)]
     Ok(())
 }
 
+/// Changes a resume holds before it upserts them (`restore_visited`): ~1 GB.
+const RESUME_CHANGES: usize = 1 << 25;
+
 /// The VISITED SET of a tree's frames `0..=last`, rebuilt from its frame
-/// files (each frame's states inserted, its codebooks' additions applied;
-/// a state stored twice is an error) and its hull files (replayed in order:
-/// a state's layer and hull are its last file's), its first win, and frame
+/// files (each frame's states, its codebooks' additions applied; a state
+/// stored twice is an error) and its hull files (replayed in order: a
+/// state's layer and hull are its last file's), its first win, and frame
 /// `last`'s FRONTIER - the states whose hull grew there, its new states with
 /// their skeletons - and the skeletons registry as the emissions left it
-/// (every frame file's skeletons, in a search from `room`). Each frame's
-/// regions in parallel.
+/// (every frame file's skeletons, in a search from `room`). The frames'
+/// states and hulls are gathered per region as CHANGES and upserted into
+/// the packed tables a batch of frames at a time (`RESUME_CHANGES`), every
+/// region on every thread; the last frame's grown states read what they
+/// held before it (their `was`) between its new states and its growth.
 pub fn restore_visited(dir: &std::path::Path, last: u32, room: (i16, i16), threads: usize) -> Result<(crate::storage::visited::VisitedSet, Option<u32>, Frontier, crate::storage::decode::Skeletons)> {
     use crate::storage::hulls;
+    use crate::storage::set::Change;
     let geo = crate::storage::GEOMETRY;
     let tree = crate::storage::layer::Tree::open(dir, last)?;
     let mut visited = crate::storage::visited::VisitedSet::new(geo);
@@ -1268,70 +1371,99 @@ pub fn restore_visited(dir: &std::path::Path, last: u32, room: (i16, i16), threa
     // The emissions' skeletons: every frame file's from frame 1 on (a
     // layer's are the registry's; frame 0's are the start's reference rows').
     let skeletons = crate::storage::decode::Skeletons::default();
+    // Per region its changes not yet upserted, in frame order.
+    let mut pending: rustc_hash::FxHashMap<u32, Vec<Change>> = Default::default();
+    let mut held = 0usize;
+    // The pending changes upserted: per region by state, a state's last
+    // change kept (its last file's layer and hull), NEW where any was (two
+    // NEW: the state stored twice).
+    let flush = |pending: &mut rustc_hash::FxHashMap<u32, Vec<Change>>, visited: &mut crate::storage::visited::VisitedSet, held: &mut usize| -> Result<()> {
+        let mut per: Vec<(u32, Vec<Change>)> = std::mem::take(pending).into_iter().collect();
+        per.sort_unstable_by_key(|x| x.0);
+        let per: Vec<std::sync::Mutex<(u32, Vec<Change>)>> = per.into_iter().map(std::sync::Mutex::new).collect();
+        let sorted = crate::storage::wave::par_map(&per, threads, |m| -> Result<(u32, Vec<Change>)> {
+            let (region, mut v) = std::mem::take(&mut *m.lock().expect("a region's changes"));
+            v.sort_by_key(|c| (c.key, c.cell));
+            let mut out: Vec<Change> = Vec::with_capacity(v.len());
+            for c in v {
+                match out.last_mut() {
+                    Some(l) if (l.key, l.cell) == (c.key, c.cell) => {
+                        anyhow::ensure!(!(l.new && c.new), "{}: a state of region {region} stored twice", dir.display());
+                        *l = Change { new: l.new || c.new, ..c };
+                    }
+                    _ => out.push(c),
+                }
+            }
+            Ok((region, out))
+        });
+        let per: Vec<(u32, Vec<Change>)> = sorted.into_iter().collect::<Result<_>>()?;
+        *held += visited.upsert_all(per, threads)?.held_new as usize;
+        Ok(())
+    };
     for f in 0..=last {
         for r in tree.file(f).filter(|_| f > 0).iter().flat_map(|x| x.header.skeletons.iter().chain(&x.header.emitted)) {
             skeletons.register(&r.rt2_in(room)?)?;
         }
         let (layer, _) = tree.layer(f, (f == last).then_some(room), threads)?;
-        let held = visited.merge(&layer.set, threads)?;
-        anyhow::ensure!(held == 0, "{}: f{f}: {held} states stored twice", dir.display());
         let p = hulls::path(dir, f);
         if f > 0 && !p.exists() && tree.file(f).is_none() {
             // Past a frontier that died: no frame, no hulls.
+            anyhow::ensure!(layer.is_empty(), "{}: frame {f} holds states and no hull file", dir.display());
             continue;
         }
         let hf = hulls::read(&p, threads).with_context(|| format!("{}: frame {f}'s hulls", dir.display()))?;
         anyhow::ensure!(hf.frame == f && hf.hulls.len() as u64 == layer.states(), "{}: frame {f}'s hull file is of frame {} with {} new states, the frame has {}", dir.display(), hf.frame, hf.hulls.len(), layer.states());
         let f16 = u16::try_from(f).map_err(|_| anyhow::anyhow!("frame {f}: past a u16 layer"))?;
-        // The new states: the layer's, in its order (per region its first
-        // state's place).
-        let mut at = Vec::with_capacity(layer.set.tables().len());
-        let mut n = 0usize;
-        for (ti, (region, t)) in layer.set.tables().iter().enumerate() {
-            at.push((*region, (ti, n)));
-            n += t.states() as usize;
-        }
-        visited.set_infos(
-            &at,
-            |&(ti, first)| {
-                let t = &layer.set.tables()[ti].1;
-                let hulls = &hf.hulls[first..first + t.states() as usize];
-                t.iter().flat_map(|(key, mask)| crate::storage::layer::bits(mask).map(move |c| (key, c))).zip(hulls).map(|((key, c), &hull)| (key, c, StateInfo { hull, layer: f16 })).collect()
-            },
-            threads,
-        )?;
-        // The grown ones: older states, by region.
-        let mut by: rustc_hash::FxHashMap<u32, Vec<u32>> = Default::default();
-        for (i, g) in hf.grown.iter().enumerate() {
-            by.entry(g.0.region).or_default().push(i as u32);
-        }
-        let mut groups: Vec<(u32, Vec<u32>)> = by.into_iter().collect();
-        groups.sort_unstable_by_key(|g| g.0);
-        if f == last {
-            // What the last frame's old states pushed before it.
-            let mut old: crate::storage::wave::ByLayer = Vec::new();
-            for &(sk, layer, hull) in &hf.grown {
-                anyhow::ensure!(layer < f16, "{}: a grown state of layer {layer} in frame {f}'s hulls", dir.display());
-                let i = visited.state(sk.region, sk.key, sk.local as u32).ok_or_else(|| anyhow::anyhow!("{}: an old state of frame {f}'s frontier without a hull before", dir.display()))?;
-                anyhow::ensure!(i.layer == layer, "{}: an old state's layer {layer} in frame {f}'s hulls, {} before", dir.display(), i.layer);
-                if old.last().is_none_or(|x| x.0 != layer) {
-                    old.push((layer, Vec::new()));
+        // The new states, in the layer's order (its hulls').
+        let mut h = hf.hulls.iter();
+        for (region, t) in layer.set.tables() {
+            let v = pending.entry(*region).or_default();
+            for (key, mask) in t.iter() {
+                for c in crate::storage::layer::bits(mask) {
+                    let hull = *h.next().expect("counted above");
+                    v.push(Change { key, cell: c as u8, info: Some(StateInfo { hull, layer: f16 }), new: true });
                 }
-                old.last_mut().expect("pushed").1.push(crate::storage::wave::Old { sk, layer, hull, was: i.hull });
+            }
+        }
+        if f == last {
+            // What the last frame's old states pushed before it: the visited
+            // set before its growth.
+            flush(&mut pending, &mut visited, &mut held)?;
+            // Read by region, each region's walked with its states sorted.
+            let mut by: Vec<(u32, crate::storage::visited::Key, u8, usize)> = hf.grown.iter().enumerate().map(|(i, g)| (g.0.region, g.0.key, g.0.local, i)).collect();
+            by.sort_unstable();
+            let mut was: Vec<Option<StateInfo>> = vec![None; hf.grown.len()];
+            for run in by.chunk_by(|a, b| a.0 == b.0) {
+                let Some(t) = visited.table(run[0].0) else { continue };
+                let mut c = t.cursor();
+                for &(_, key, local, i) in run {
+                    was[i] = c.seek(key)?.and_then(|e| e.info(local as u32));
+                }
+            }
+            let mut old: crate::storage::wave::ByLayer = Vec::new();
+            for (&(sk, layer, hull), was) in hf.grown.iter().zip(was) {
+                anyhow::ensure!(layer < f16, "{}: a grown state of layer {layer} in frame {f}'s hulls", dir.display());
+                let i = was.ok_or_else(|| anyhow::anyhow!("{}: an old state of frame {f}'s frontier without a hull before", dir.display()))?;
+                anyhow::ensure!(i.layer == layer, "{}: an old state's layer {layer} in frame {f}'s hulls, {} before", dir.display(), i.layer);
+                if old.last().is_none_or(|x| x.layer != layer) {
+                    // Each layer's room exactly (the grown states are by layer).
+                    let n = hf.grown.partition_point(|g| g.1 <= layer) - hf.grown.partition_point(|g| g.1 < layer);
+                    old.push(crate::storage::wave::OldLayer::new(layer, n));
+                }
+                old.last_mut().expect("pushed").push(&crate::storage::wave::Old { sk, layer, hull, was: i.hull });
             }
             frontier = Frontier { new: layer, hulls: hf.hulls.clone(), old };
         }
-        visited.set_infos(
-            &groups,
-            |idx| {
-                let mut v: Vec<(crate::storage::visited::Key, u32, StateInfo)> = idx.iter().map(|&i| hf.grown[i as usize]).map(|(sk, layer, hull)| (sk.key, sk.local as u32, StateInfo { hull, layer })).collect();
-                v.sort_unstable_by_key(|x| (x.0, x.1));
-                v
-            },
-            threads,
-        )?;
+        // The grown ones: older states.
+        for &(sk, layer, hull) in &hf.grown {
+            pending.entry(sk.region).or_default().push(Change { key: sk.key, cell: sk.local, info: Some(StateInfo { hull, layer }), new: false });
+        }
+        if f == last || pending.values().map(Vec::len).sum::<usize>() >= RESUME_CHANGES {
+            flush(&mut pending, &mut visited, &mut held)?;
+        }
     }
-    anyhow::ensure!(visited.infos() <= visited.len(), "{}: {} states, {} with a hull stored", dir.display(), visited.len(), visited.infos());
+    anyhow::ensure!(held == 0, "{}: {held} states stored twice", dir.display());
+    anyhow::ensure!(visited.infos() <= visited.len() as u64, "{}: {} states, {} with a hull stored", dir.display(), visited.len(), visited.infos());
     Ok((visited, tree.first_win(), frontier, skeletons))
 }
 
@@ -1895,8 +2027,8 @@ mod tests {
             let visited = crate::storage::visited::VisitedSet::new(crate::storage::GEOMETRY);
             let (routes, skeletons) = (crate::storage::route::Routes::default(), crate::storage::decode::Skeletons::default());
             let prov = celeste_engine::exact::Provisional::default();
-            let xtab = Default::default();
-            let mut sink = crate::storage::unit::UnitSink::new(&visited, &routes, &skeletons, &prov, Filters::default(), 1, level, 0, &xtab, false, false, &s);
+            let (base, xtab) = (crate::storage::edges::XferTable::default(), Default::default());
+            let mut sink = crate::storage::unit::UnitSink::new(&visited, &routes, &skeletons, &prov, Filters::default(), 1, level, 0, &base, &xtab, false, false, &s);
             sink.begin(0);
             let si = sink.push_source(0, (0, 0));
             sink.push_lane(si, cells[0], Hull::full());
@@ -1962,8 +2094,8 @@ mod tests {
             let visited = crate::storage::visited::VisitedSet::new(crate::storage::GEOMETRY);
             let (routes, skeletons) = (crate::storage::route::Routes::default(), crate::storage::decode::Skeletons::default());
             let prov = celeste_engine::exact::Provisional::default();
-            let xtab = Default::default();
-            let mut sink = crate::storage::unit::UnitSink::new(&visited, &routes, &skeletons, &prov, Filters::default(), 1, level, 0, &xtab, false, false, &s);
+            let (base, xtab) = (crate::storage::edges::XferTable::default(), Default::default());
+            let mut sink = crate::storage::unit::UnitSink::new(&visited, &routes, &skeletons, &prov, Filters::default(), 1, level, 0, &base, &xtab, false, false, &s);
             sink.begin(0);
             let si = sink.push_source(0, (0, 0));
             sink.push_lane(si, cells[0], Hull::full());
