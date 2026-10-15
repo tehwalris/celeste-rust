@@ -408,6 +408,27 @@ const MADE: u32 = 1 << 30;
 const ROUND_EMITS: usize = 20 << 20;
 const _: () = assert!(std::mem::size_of::<Emit>() == 40, "ROUND_EMITS is sized for 40-B emissions");
 
+/// A step's own sets past this many bytes are compacted between its
+/// rounds (`compact_local`).
+const LOCAL_COMPACT: usize = 1 << 30;
+
+/// A step's own sets cut to those its sets so far (`acc`) name - a round
+/// replaces the sets of the sources it reached, and the replaced ones are
+/// named by nothing - `acc`'s codes renumbered; the sets and their index.
+fn compact_local(acc: &mut [Acc], local: &RegionArena) -> (RegionArena, FxHashMap<u64, u32>) {
+    let (mut kept, mut index, mut to) = (RegionArena::default(), FxHashMap::default(), vec![u32::MAX; local.len()]);
+    for a in acc.iter_mut().filter(|a| a.set & LOCAL != 0) {
+        let l = (a.set & !LOCAL) as usize;
+        if to[l] == u32::MAX {
+            let r = local.get(l as u32);
+            to[l] = kept.push(r);
+            index.entry(region_hash(r)).or_insert(to[l]);
+        }
+        a.set = to[l] | LOCAL;
+    }
+    (kept, index)
+}
+
 fn region_hash(r: RegionRef) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut hs = rustc_hash::FxHasher::default();
@@ -457,7 +478,7 @@ fn id_ranges(mut sample: Vec<Sk>, total: usize, parts: usize) -> Vec<Sk> {
 /// The first index at or past `j` whose key is not below `k`, in `v` sorted
 /// by key with every key before `j` below `k`: GALLOPING from `j`. A read
 /// walks each of a region's segments' sorted targets against the group's;
-/// stepping one by one cost every segment the whole group (26% of the mod
+/// stepping one by one cost every segment the whole group (26% of a big
 /// room's backward; 256k-lane slices cut its frames into 2.3x the segments).
 fn seek<A, B>(v: &[((u64, u64), A, B)], j: usize, k: (u64, u64)) -> usize {
     let mut lo = j;
@@ -513,8 +534,11 @@ pub struct Backward<'a> {
     /// Per target region, the steps that read its in-edges.
     opens: FxHashMap<u32, u32>,
     /// A round's in-edges (`ROUND_EMITS`; tests shrink it to exercise the
-    /// rounds).
+    /// rounds), and the step's own sets' bytes past which they are
+    /// compacted between rounds (`LOCAL_COMPACT`; the tests' rounds compact
+    /// always).
     round_emits: usize,
+    local_compact: usize,
     read: ReadStats,
     n_changed: u64,
     n_emits: u64,
@@ -557,6 +581,7 @@ impl<'a> Backward<'a> {
             spill: None,
             opens: FxHashMap::default(),
             round_emits: ROUND_EMITS,
+            local_compact: LOCAL_COMPACT,
             read: ReadStats::default(),
             n_changed: 0,
             n_emits: 0,
@@ -569,10 +594,12 @@ impl<'a> Backward<'a> {
         }
     }
 
-    /// The closed spans and W's nodes in scratch files in `dir` (created).
+    /// The closed spans, W's nodes and the arena's sealed chunks in
+    /// scratch files in `dir` (created).
     pub fn spill_to(mut self, dir: &std::path::Path) -> anyhow::Result<Self> {
         std::fs::create_dir_all(dir)?;
         self.run_bytes = Spill::file(dir.join("runs.bin"))?;
+        self.sets.spill_to(dir);
         self.spill = Some(dir.to_path_buf());
         Ok(self)
     }
@@ -581,6 +608,7 @@ impl<'a> Backward<'a> {
     #[cfg(test)]
     fn with_rounds(mut self, emits: usize) -> Self {
         self.round_emits = emits;
+        self.local_compact = 0;
         self
     }
 
@@ -709,9 +737,9 @@ impl<'a> Backward<'a> {
     }
 
     /// A set code's set (`local`: the step's own sets).
-    fn set_of<'s>(&'s self, code: u32, local: &'s [Region]) -> RegionRef<'s> {
+    fn set_of<'s>(&'s self, code: u32, local: &'s RegionArena) -> RegionRef<'s> {
         if code & LOCAL != 0 {
-            local[(code & !LOCAL) as usize].as_ref()
+            local.get(code & !LOCAL)
         } else {
             self.sets.get(code)
         }
@@ -725,7 +753,7 @@ impl<'a> Backward<'a> {
     /// Fold one round's in-edges into the step's sets so far (`acc`, by
     /// id): per source in parallel id ranges, its set so far (or at `t + 1`)
     /// united with the round's pulls. New sets go into `local`.
-    fn fold_round(&self, acc: Vec<Acc>, parts: &[(Vec<Emit>, ReadStats)], local: &mut Vec<Region>, local_interned: &mut FxHashMap<u64, u32>) -> Vec<Acc> {
+    fn fold_round(&self, acc: Vec<Acc>, parts: &[(Vec<Emit>, ReadStats)], local: &mut RegionArena, local_interned: &mut FxHashMap<u64, u32>) -> Vec<Acc> {
         let n_emits: usize = parts.iter().map(|p| p.0.len()).sum();
         let bounds = id_ranges(parts.iter().flat_map(|p| p.0.iter().step_by(64).map(|e| e.p)).collect(), n_emits, self.threads * 4);
         let (cur, pairs, local_ro) = (&self.cur, self.pairs, &*local);
@@ -783,7 +811,7 @@ impl<'a> Backward<'a> {
                     Some(b) if self.set_of(b, local_ro) == r => b,
                     _ => {
                         let h = region_hash(r.as_ref());
-                        match self.arena_code(&r, h).or_else(|| local_interned.get(&h).copied().filter(|&s| local_ro[s as usize] == r).map(|s| s | LOCAL)) {
+                        match self.arena_code(&r, h).or_else(|| local_interned.get(&h).copied().filter(|&s| local_ro.get(s) == r).map(|s| s | LOCAL)) {
                             Some(s) => s,
                             None => {
                                 made.push(r);
@@ -806,14 +834,14 @@ impl<'a> Backward<'a> {
                 .map(|r| {
                     let h = region_hash(r.as_ref());
                     match local_interned.get(&h) {
-                        Some(&s) if local[s as usize] == r => s | LOCAL,
+                        Some(&s) if local.get(s) == r => s | LOCAL,
                         found => {
                             let s = local.len() as u32;
                             assert!(s < MADE, "more distinct sets in a step than set codes");
                             if found.is_none() {
                                 local_interned.insert(h, s);
                             }
-                            local.push(r);
+                            local.push(r.as_ref());
                             s | LOCAL
                         }
                     }
@@ -847,7 +875,7 @@ impl<'a> Backward<'a> {
         }
         let n_read = self.changed.len();
         self.n_changed += n_read as u64;
-        let (mut acc, mut local, mut local_interned) = (Vec::new(), Vec::new(), FxHashMap::default());
+        let (mut acc, mut local, mut local_interned) = (Vec::new(), RegionArena::default(), FxHashMap::default());
         let items = self.read_items(t);
         let total = items.last().map_or(0, |x| x.0);
         let (mut start, mut n_emits, mut rounds) = (0usize, 0usize, 0u32);
@@ -866,6 +894,9 @@ impl<'a> Backward<'a> {
             d_read += t0.elapsed();
             let t0 = std::time::Instant::now();
             acc = self.fold_round(acc, &parts, &mut local, &mut local_interned);
+            if start < total && local.bytes() > self.local_compact {
+                (local, local_interned) = compact_local(&mut acc, &local);
+            }
             d_pull += t0.elapsed();
         }
         self.n_emits += n_emits as u64;
@@ -940,12 +971,12 @@ impl<'a> Backward<'a> {
                 if x.set & LOCAL != 0 {
                     let l = (x.set & !LOCAL) as usize;
                     if to_arena[l] == u32::MAX {
-                        let r = std::mem::take(&mut local[l]);
-                        let h = region_hash(r.as_ref());
+                        let r = local.get(l as u32);
+                        let h = region_hash(r);
                         to_arena[l] = match self.interned.get(&h) {
                             Some(&s) if self.sets.get(s) == r => s,
                             found => {
-                                let s = self.sets.push(r.as_ref());
+                                let s = self.sets.push(r);
                                 assert!(s < MADE, "more distinct sets than set codes");
                                 if found.is_none() {
                                     self.interned.insert(h, s);
@@ -960,6 +991,7 @@ impl<'a> Backward<'a> {
             }
             closed.extend(o.closed);
         }
+        let (step_sets, step_kept, step_bytes) = (local.len(), to_arena.iter().filter(|&&s| s != u32::MAX).count(), local.bytes());
         drop(local);
         let run = Run::new(close_at, closed, &mut self.run_bytes);
         self.runs.push(run);
@@ -968,14 +1000,14 @@ impl<'a> Backward<'a> {
         self.max_cur = self.max_cur.max(self.cur.len());
         // The step's workers are gone: their heaps' freed pages go back now
         // (mimalloc reclaims an exited thread's segments lazily otherwise -
-        // ~3 GB held on the mod room).
+        // ~3 GB held on a big room).
         // SAFETY: mimalloc's documented API, callable from any thread.
         unsafe { libmimalloc_sys::mi_collect(true) };
         let d_merge = t0.elapsed();
         self.d_merge += d_merge;
         let ms = |d: std::time::Duration| d.as_secs_f64() * 1e3;
         eprintln!(
-            "[arc] f{t:03}: {n_read} changed at f{} -> {n_emits} in-edges ({rounds} rounds); {} nodes with a set, {} changed | read {:.0} pull {:.0} merge {:.0} ms | anon {:.2} GB: frame {:.2}, runs {:.2}, {} sets {:.2}",
+            "[arc] f{t:03}: {n_read} changed at f{} -> {n_emits} in-edges ({rounds} rounds); {} nodes with a set, {} changed | read {:.0} pull {:.0} merge {:.0} ms | anon {:.2} GB: frame {:.2}, runs {:.2}, {} sets {:.2} ({:.2} mapped), the step's {step_sets} sets {:.2} ({step_kept} kept)",
             t + 1,
             self.cur.len(),
             self.changed.len(),
@@ -987,6 +1019,8 @@ impl<'a> Backward<'a> {
             self.run_bytes.len() as f64 / 1e9,
             self.sets.len(),
             (self.sets.bytes() + self.interned.capacity() * 16) as f64 / 1e9,
+            self.sets.mapped_bytes() as f64 / 1e9,
+            step_bytes as f64 / 1e9,
         );
         if (self.horizon - 1 - t) % 4 == 0 {
             let (k, med, p90, max) = fragmentation(self.cur.iter().filter(|c| c.layer & WIN == 0).map(|c| self.sets.get(c.set)));
@@ -1087,7 +1121,7 @@ impl<'a> Backward<'a> {
         let opens: Vec<u32> = self.opens.values().copied().collect();
         let (o_mean, o_max) = (opens.iter().map(|&o| o as f64).sum::<f64>() / opens.len().max(1) as f64, opens.iter().copied().max().unwrap_or(0));
         eprintln!(
-            "[arc] backward: {} sets changed, {} in-edges read ({} emissions in {} rounds, at most {} a round), {} segments decoded: {:.2} GB stored ({:.3} GB the store), {:.2} GB raw, {} bundles; {} target regions read on {o_mean:.1} steps each (at most {o_max}), {} (region, frame) opens; at most {} nodes a frame; read {:.2} s, pull {:.2} s, merge {:.2} s; {} nodes, {} spans, {} distinct sets: W {:.2} GB (nodes and spans {:.2}, sets {:.2})",
+            "[arc] backward: {} sets changed, {} in-edges read ({} emissions in {} rounds, at most {} a round), {} segments decoded: {:.2} GB stored ({:.3} GB the store), {:.2} GB raw, {} bundles; {} target regions read on {o_mean:.1} steps each (at most {o_max}), {} (region, frame) opens; at most {} nodes a frame; read {:.2} s, pull {:.2} s, merge {:.2} s; {} nodes, {} spans, {} distinct sets: W {:.2} GB (nodes and spans {:.2}, sets {:.2}, {:.2} of them mapped)",
             self.n_changed,
             self.read.edges,
             self.n_emits,
@@ -1110,6 +1144,7 @@ impl<'a> Backward<'a> {
             w.bytes() as f64 / 1e9,
             (w.data.len() + 16 * w.blocks.len()) as f64 / 1e9,
             w.sets.bytes() as f64 / 1e9,
+            w.sets.arena.mapped_bytes() as f64 / 1e9,
         );
         for f in &self.fragments {
             eprintln!("{f}");

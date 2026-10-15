@@ -1,0 +1,120 @@
+//! A frame's SPOOL: compressed blocks the wave makes long before the
+//! frame's end writes them - the out file's per kernel unit, the edge
+//! file's segments per region job - appended to a scratch file as they are
+//! made and copied into their files by the writers. Page cache the kernel
+//! can write back and reclaim, not the anonymous memory they held to the
+//! frame's end (the fixture room's f279: 1.44 GB of out blocks and 0.86 GB
+//! of segments). The file is unlinked once created: nothing is left behind,
+//! whatever ends the process.
+
+use anyhow::{Context, Result};
+use std::os::unix::fs::FileExt;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+/// The scratch file, appended by any thread (each block at its own offset).
+pub struct Spool {
+    file: std::fs::File,
+    end: AtomicU64,
+}
+
+/// A block's place in the spool.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Spooled {
+    at: u64,
+    len: u32,
+}
+
+impl Spool {
+    /// A spool at `path` (created, then unlinked).
+    pub fn create(path: &std::path::Path) -> Result<Self> {
+        let file = std::fs::File::options().read(true).write(true).create(true).truncate(true).open(path).with_context(|| path.display().to_string())?;
+        std::fs::remove_file(path).with_context(|| path.display().to_string())?;
+        Ok(Spool { file, end: AtomicU64::new(0) })
+    }
+
+    /// Append `b`; its place.
+    pub fn put(&self, b: &[u8]) -> Result<Spooled> {
+        let len = u32::try_from(b.len()).context("a spooled block past 4 GB")?;
+        let at = self.end.fetch_add(b.len() as u64, Ordering::Relaxed);
+        self.file.write_all_at(b, at).context("writing the frame's spool")?;
+        Ok(Spooled { at, len })
+    }
+
+    /// The block at `s` into `buf`.
+    pub fn read(&self, s: Spooled, buf: &mut Vec<u8>) -> Result<()> {
+        buf.resize(s.len as usize, 0);
+        self.file.read_exact_at(buf, s.at).context("reading the frame's spool")
+    }
+
+    /// Bytes spooled.
+    pub fn bytes(&self) -> u64 {
+        self.end.load(Ordering::Relaxed)
+    }
+}
+
+/// A block's compressed bytes: in memory, or spooled.
+#[derive(Debug)]
+pub enum Body {
+    Mem(Vec<u8>),
+    Spool(Spooled),
+}
+
+impl Body {
+    pub fn len(&self) -> usize {
+        match self {
+            Body::Mem(v) => v.len(),
+            Body::Spool(s) => s.len as usize,
+        }
+    }
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+    /// Bytes it holds in memory.
+    pub fn held(&self) -> usize {
+        match self {
+            Body::Mem(v) => v.capacity(),
+            Body::Spool(_) => 0,
+        }
+    }
+    /// Into `spool`, if there is one.
+    pub fn spill(self, spool: Option<&Spool>) -> Result<Body> {
+        match (self, spool) {
+            (Body::Mem(v), Some(sp)) => Ok(Body::Spool(sp.put(&v)?)),
+            (b, _) => Ok(b),
+        }
+    }
+    /// Its bytes: `f` on them (a spooled block read into `buf` first).
+    pub fn with<R>(&self, spool: Option<&Spool>, buf: &mut Vec<u8>, f: impl FnOnce(&[u8]) -> R) -> Result<R> {
+        match self {
+            Body::Mem(v) => Ok(f(v)),
+            Body::Spool(s) => {
+                spool.context("a spooled block without its spool")?.read(*s, buf)?;
+                Ok(f(buf))
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn spooled_blocks_read_back_from_threads() {
+        let path = std::env::temp_dir().join(format!("spool-test-{}", std::process::id()));
+        let sp = Spool::create(&path).unwrap();
+        assert!(!path.exists(), "the spool is unlinked");
+        let blocks: Vec<Vec<u8>> = (0..64u32).map(|k| (0..k * 37 + 1).map(|i| (i ^ k) as u8).collect()).collect();
+        let bodies: Vec<Body> = std::thread::scope(|s| {
+            let hs: Vec<_> = blocks.chunks(8).map(|c| s.spawn(|| c.iter().map(|b| Body::Mem(b.clone()).spill(Some(&sp)).unwrap()).collect::<Vec<_>>())).collect();
+            hs.into_iter().flat_map(|h| h.join().unwrap()).collect()
+        });
+        assert_eq!(sp.bytes(), blocks.iter().map(|b| b.len() as u64).sum::<u64>());
+        let mut buf = Vec::new();
+        for (b, body) in blocks.iter().zip(&bodies) {
+            assert_eq!((body.len(), body.held()), (b.len(), 0));
+            assert!(body.with(Some(&sp), &mut buf, |x| x == &b[..]).unwrap());
+        }
+        assert!(Body::Spool(Spooled { at: 0, len: 1 }).with(None, &mut buf, |_| ()).is_err(), "no spool, no bytes");
+    }
+}

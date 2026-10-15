@@ -40,40 +40,82 @@ pub const NO_XFER: u32 = u32::MAX;
 const PROV: u32 = u32::MAX;
 
 /// A route's TOUCHED states this frame: per key pushed into (one probe of
-/// `index` a key, as the dedup's), the cells pushed and the RUN of their
-/// hulls so far in `slots` (by cell; a run moves to the end when its key
-/// gains a cell), and what the visited set holds of the key.
+/// `index`: `u32` slots of the keys' places, open addressing, at most 3/4
+/// full), the cells pushed and the RUN of their hulls so far in `slots`
+/// (by cell; a run moves to the end when its key gains a cell, and the
+/// runs are compacted once the moved ones' slots are half the live; the
+/// arrays grow by an eighth). What
+/// the visited set holds of them is read at the frame's end (`seal`, the
+/// keys sorted against the region's packed table). ~30 B a touched state
+/// (63 with a hash map of keys, runs never compacted and arrays doubled:
+/// a big room's f231, 12.8M touched states).
 #[derive(Default)]
 pub struct Touched {
-    index: FxHashMap<Key, u32>,
+    index: Vec<u32>,
     keys: Vec<TouchedKey>,
     slots: Vec<HullAcc>,
     states: usize,
+    dead: usize,
 }
 
-/// A touched key: its cells, its run's start, and its entry in the visited
-/// set's table with the cells held there (none: 0).
+/// A touched key: its cells and its run's start.
 #[derive(Clone, Copy, Debug)]
 pub struct TouchedKey {
     pub key: Key,
     pub cells: u64,
     pub start: u32,
-    pub entry: u32,
-    pub held: u64,
+}
+
+/// Room in `v` for `more`, grown by an eighth at least (not doubled: a
+/// frame's touched tables are its biggest transient).
+#[inline]
+fn grow<T>(v: &mut Vec<T>, more: usize) {
+    if v.len() + more > v.capacity() {
+        v.reserve_exact(more.max(v.len() / 8).max(64));
+    }
+}
+
+#[inline]
+fn key_hash(k: Key) -> u64 {
+    celeste_engine::runtime2::mix64(k.0.wrapping_mul(0x9e37_79b9_7f4a_7c15) ^ k.1)
 }
 
 impl Touched {
-    /// Merge `cells` (by cell, ascending: `(cell, hull)`) into key `key`'s;
-    /// a key new to the route is looked up (`held`: its visited entry and
-    /// cells).
+    /// Key `key`'s place in `keys`, made (no cell yet) if absent.
     #[inline]
-    pub fn push(&mut self, key: Key, cells: &[(u8, HullAcc)], held: impl FnOnce(Key) -> (u32, u64)) {
-        let n = self.keys.len() as u32;
-        let e = *self.index.entry(key).or_insert(n);
-        if e == n {
-            let (entry, held) = held(key);
-            self.keys.push(TouchedKey { key, cells: 0, start: self.slots.len() as u32, entry, held });
+    fn place(&mut self, key: Key) -> u32 {
+        if (self.keys.len() + 1) * 4 > self.index.len() * 3 {
+            let cap = ((self.keys.len() + 1) * 2).next_power_of_two().max(64);
+            self.index = vec![0; cap];
+            let m = cap - 1;
+            for (e, k) in self.keys.iter().enumerate() {
+                let mut i = key_hash(k.key) as usize & m;
+                while self.index[i] != 0 {
+                    i = (i + 1) & m;
+                }
+                self.index[i] = e as u32 + 1;
+            }
         }
+        let m = self.index.len() - 1;
+        let mut i = key_hash(key) as usize & m;
+        loop {
+            match self.index[i] {
+                0 => {
+                    grow(&mut self.keys, 1);
+                    self.keys.push(TouchedKey { key, cells: 0, start: self.slots.len() as u32 });
+                    self.index[i] = self.keys.len() as u32;
+                    return self.keys.len() as u32 - 1;
+                }
+                s if self.keys[s as usize - 1].key == key => return s - 1,
+                _ => i = (i + 1) & m,
+            }
+        }
+    }
+
+    /// Merge `cells` (by cell, ascending: `(cell, hull)`) into key `key`'s.
+    #[inline]
+    pub fn push(&mut self, key: Key, cells: &[(u8, HullAcc)]) {
+        let e = self.place(key);
         let TouchedKey { cells: mask, start, .. } = self.keys[e as usize];
         let add = cells.iter().fold(0u64, |m, x| m | 1u64 << x.0);
         let rank = |m: u64, c: u8| (m & ((1u64 << c) - 1)).count_ones() as usize;
@@ -86,6 +128,7 @@ impl Touched {
         // The key's run with the new cells, at the end.
         let next = mask | add;
         let at = self.slots.len();
+        grow(&mut self.slots, next.count_ones() as usize);
         let mut m = next;
         while m != 0 {
             let c = m.trailing_zeros() as u8;
@@ -96,7 +139,24 @@ impl Touched {
             self.slots[at + rank(next, c)].merge(a);
         }
         self.states += (add & !mask).count_ones() as usize;
+        self.dead += mask.count_ones() as usize;
         (self.keys[e as usize].cells, self.keys[e as usize].start) = (next, at as u32);
+        if self.dead > 4096 && self.dead * 2 > self.states {
+            self.compact();
+        }
+    }
+
+    /// The live runs, key by key, at the start of new slots.
+    fn compact(&mut self) {
+        let mut slots = Vec::with_capacity(self.states + self.states / 8);
+        for k in &mut self.keys {
+            let n = k.cells.count_ones() as usize;
+            let a = slots.len() as u32;
+            slots.extend_from_slice(&self.slots[k.start as usize..k.start as usize + n]);
+            k.start = a;
+        }
+        self.slots = slots;
+        self.dead = 0;
     }
 
     pub fn is_empty(&self) -> bool {
@@ -128,7 +188,19 @@ impl Touched {
 
     /// Bytes held.
     pub fn alloc_bytes(&self) -> usize {
-        self.index.capacity() * (std::mem::size_of::<(Key, u32)>() + 1) + self.keys.capacity() * std::mem::size_of::<TouchedKey>() + self.slots.capacity() * std::mem::size_of::<HullAcc>()
+        self.bytes().iter().sum()
+    }
+
+    /// Bytes held by part (`[wavemem]`): the index, the keys, the slots
+    /// live, the slots dead or spare; and the keys and states held.
+    pub fn bytes(&self) -> [usize; 4] {
+        let slot = std::mem::size_of::<HullAcc>();
+        [self.index.capacity() * 4, self.keys.capacity() * std::mem::size_of::<TouchedKey>(), self.states * slot, (self.slots.capacity() - self.states) * slot]
+    }
+
+    /// Keys touched.
+    pub fn key_count(&self) -> usize {
+        self.keys.len()
     }
 }
 
@@ -210,7 +282,7 @@ pub struct RouteState {
     /// new this frame (no canonical id yet: `edges::XferTable::canonical`),
     /// per job (slice) a segment encoded with the provisional keys and ids,
     /// encoded again at the frame's end with the final ones (`seal`). Held
-    /// as zstd blocks, not bundles: the mod room's f53 (+95) held 103M into
+    /// as zstd blocks, not bundles: a big room's f53 (+95) held 103M into
     /// provisional targets, 5.8 GB as structs.
     pub prov: Vec<(u32, Segment)>,
     /// Its segments with their kind (0: a job's, 1: a job's bundles that
@@ -238,9 +310,6 @@ impl RouteState {
 /// What the region phase reads besides its route.
 pub struct RegionCtx<'a> {
     pub frame: u32,
-    /// The visited set (read only until the frame's end): a touched key's
-    /// entry looked up once, here, not at the frame's end.
-    pub visited: &'a VisitedSet,
     /// Are edges recorded?
     pub record: bool,
     /// Per worker, its local transfer ids' global ones.
@@ -248,27 +317,30 @@ pub struct RegionCtx<'a> {
     /// The global ids from here on are this frame's new transfers', in the
     /// order the slices met them: provisional until the frame's end.
     pub new_xfers: u32,
+    /// The frame's spool: a job's segment goes there (`spool`).
+    pub spool: Option<&'a super::spool::Spool>,
 }
 
-/// A unit's bundles, by route: one probe and an OR an emission in a table
-/// keyed by (bucket, target key, source, transfer, offset) - the last
-/// bundle remembered: a body's lanes mostly share it. Each route's bundles
-/// in a bucket of their own; at the unit's end each bucket's distinct
-/// targets are listed and its bundles name them by index (`drain`).
+/// A unit's bundles, by route: an emission is APPENDED to its route's
+/// bucket (merged into the bucket's last bundle when it is the same, as a
+/// body's lanes mostly are); at the unit's end each bucket is merged in
+/// place (`drain`: a bundle's later appends ORed into its first, in a
+/// table the bucket's size - small, cache-resident, where one table over
+/// the unit missed the cache on most appends: 86% of them are new
+/// bundles), its distinct targets listed and its bundles naming them by
+/// index.
 #[derive(Default)]
 pub struct UnitBundles {
     buckets: Vec<(u32, Vec<(Key, Ub)>)>,
     bucket_of: FxHashMap<u32, u32>,
     last_route: Option<(u32, u32)>,
-    /// `bucket << 32 | position + 1`; 0 empty.
-    index: Vec<u64>,
-    n: usize,
-    last: Option<(u32, u32)>,
-    /// `drain`'s target index.
+    /// `drain`'s merge table (`index + 1` into the bucket; 0 empty) and
+    /// its target index.
+    slots: Vec<u32>,
     t_idx: rustc_hash2::FxHashMap<Key, u32>,
     /// Emptied buckets, kept for the next units (their pages stay mapped),
     /// at most `SPARE_KEEP` bundles' room in all: kept without a bound,
-    /// every bucket grew to the largest route's (56 MB a worker on the mod
+    /// every bucket grew to the largest route's (56 MB a worker on a big
     /// room's f53); bound to 128k, the units regrew theirs (the reference
     /// frame's emit +4%).
     spare: Vec<Vec<(Key, Ub)>>,
@@ -278,11 +350,8 @@ pub struct UnitBundles {
 const SPARE_KEEP: usize = 1 << 19;
 
 #[inline]
-fn ub_hash(k: u32, t_key: Key, b: &Ub) -> u64 {
-    let h = t_key.1.wrapping_mul(0x9e37_79b9_7f4a_7c15)
-        ^ t_key.0.wrapping_mul(0xc2b2_ae3d_27d4_eb4f)
-        ^ ((k as u64) << 32 | b.s as u64).wrapping_mul(0x1656_67b1_9e37_79f9)
-        ^ ((b.x as u64) << 32 | b.o as u64).wrapping_mul(0x85eb_ca77_c2b2_ae63);
+fn ub_hash(t_key: Key, b: &Ub) -> u64 {
+    let h = t_key.1.wrapping_mul(0x9e37_79b9_7f4a_7c15) ^ t_key.0.wrapping_mul(0xc2b2_ae3d_27d4_eb4f) ^ (b.s as u64).wrapping_mul(0x1656_67b1_9e37_79f9) ^ ((b.x as u64) << 32 | b.o as u64).wrapping_mul(0x85eb_ca77_c2b2_ae63);
     celeste_engine::runtime2::mix64(h)
 }
 
@@ -290,13 +359,10 @@ impl UnitBundles {
     /// Bytes its tables hold (`--phases`' `[wavemem]`).
     pub fn alloc_bytes(&self) -> usize {
         let b = 16 + std::mem::size_of::<Ub>();
-        self.buckets.iter().map(|x| x.1.capacity() * b).sum::<usize>() + self.spare.iter().map(|v| v.capacity() * b).sum::<usize>() + 8 * self.index.capacity() + 24 * self.t_idx.capacity()
+        self.buckets.iter().map(|x| x.1.capacity() * b).sum::<usize>() + self.spare.iter().map(|v| v.capacity() * b).sum::<usize>() + 4 * self.slots.capacity() + 24 * self.t_idx.capacity()
     }
 
     pub fn clear(&mut self) {
-        if self.n > 0 {
-            self.index.fill(0);
-        }
         let mut room: usize = self.spare.iter().map(Vec::capacity).sum();
         for (_, mut v) in self.buckets.drain(..) {
             if room + v.capacity() <= SPARE_KEEP {
@@ -306,21 +372,13 @@ impl UnitBundles {
             }
         }
         self.bucket_of.clear();
-        (self.last_route, self.last, self.n) = (None, None, 0);
+        self.last_route = None;
     }
 
-    /// OR `bit` into the bundle `(route, t_key; source s, x, o)`.
+    /// OR `bit` into the bundle `(route, t_key; source s, x, o)`: appended
+    /// to the route's bucket (merged at `drain`).
     #[inline]
     pub fn insert(&mut self, route: u32, t_key: Key, s: u32, x: u32, o: u32, bit: u64) {
-        let probe = Ub { t: 0, s, x, o, mask: 0 };
-        let same = |r: &(Key, Ub)| r.0 == t_key && r.1.s == s && r.1.x == x && r.1.o == o;
-        if let Some((k, p)) = self.last {
-            let (r, v) = &mut self.buckets[k as usize];
-            if *r == route && same(&v[p as usize]) {
-                v[p as usize].1.mask |= bit;
-                return;
-            }
-        }
         let k = match self.last_route {
             Some((r, k)) if r == route => k,
             _ => {
@@ -338,61 +396,64 @@ impl UnitBundles {
                 k
             }
         };
-        if self.index.is_empty() {
-            self.index = vec![0; 1 << 12];
-        }
-        let m = self.index.len() - 1;
-        let mut i = ub_hash(k, t_key, &probe) as usize & m;
-        loop {
-            let e = self.index[i];
-            if e == 0 {
-                break;
-            }
-            let (bk, p) = ((e >> 32) as u32, (e as u32) - 1);
-            if bk == k && same(&self.buckets[k as usize].1[p as usize]) {
-                self.buckets[k as usize].1[p as usize].1.mask |= bit;
-                self.last = Some((k, p));
+        let v = &mut self.buckets[k as usize].1;
+        if let Some(l) = v.last_mut() {
+            if l.0 == t_key && l.1.s == s && l.1.x == x && l.1.o == o {
+                l.1.mask |= bit;
                 return;
             }
-            i = (i + 1) & m;
         }
-        let v = &mut self.buckets[k as usize].1;
-        v.push((t_key, Ub { mask: bit, ..probe }));
-        let p = v.len() as u32 - 1;
-        self.index[i] = (k as u64) << 32 | (p as u64 + 1);
-        self.last = Some((k, p));
-        self.n += 1;
-        if self.n * 2 > self.index.len() {
-            let cap = self.index.len() * 2;
-            self.index = vec![0; cap];
-            let m = cap - 1;
-            for (k, (_, v)) in self.buckets.iter().enumerate() {
-                for (p, (t_key, u)) in v.iter().enumerate() {
-                    let mut i = ub_hash(k as u32, *t_key, u) as usize & m;
-                    while self.index[i] != 0 {
-                        i = (i + 1) & m;
-                    }
-                    self.index[i] = (k as u64) << 32 | (p as u64 + 1);
-                }
-            }
-        }
+        v.push((t_key, Ub { t: 0, s, x, o, mask: bit }));
     }
 
-    /// The buckets as `(route, targets, bundles)`: per bucket its distinct
-    /// targets (key, cells reached) and its bundles naming them by index,
-    /// the cells `drop(route, key, cell)` says cleared first (the coarser
-    /// level's disallowed targets; a bundle left without cells goes); the
-    /// table cleared.
+    /// `v`'s bundles MERGED in place: each distinct (target key, source,
+    /// transfer, offset) once, at its first place (the first `n` returned),
+    /// its cells the union of its appends'.
+    fn merge(slots: &mut Vec<u32>, v: &mut [(Key, Ub)]) -> usize {
+        let cap = (2 * v.len()).next_power_of_two().max(16);
+        slots.clear();
+        slots.resize(cap, 0);
+        let m = cap - 1;
+        let mut n = 0usize;
+        for r in 0..v.len() {
+            let (k, u) = v[r];
+            let mut i = ub_hash(k, &u) as usize & m;
+            loop {
+                let e = slots[i];
+                if e == 0 {
+                    v[n] = (k, u);
+                    n += 1;
+                    slots[i] = n as u32;
+                    break;
+                }
+                let g = &mut v[e as usize - 1];
+                if g.0 == k && g.1.s == u.s && g.1.x == u.x && g.1.o == u.o {
+                    g.1.mask |= u.mask;
+                    break;
+                }
+                i = (i + 1) & m;
+            }
+        }
+        n
+    }
+
+    /// The buckets as `(route, targets, bundles)`: per bucket its bundles
+    /// merged (`merge`), its distinct targets (key, cells reached) and its
+    /// bundles naming them by index, the cells `drop(route, key, cell)`
+    /// says cleared first (the coarser level's disallowed targets; a bundle
+    /// left without cells goes); the table cleared.
     #[allow(clippy::type_complexity)]
     pub fn drain(&mut self, drop: Option<&dyn Fn(u32, Key, u32) -> bool>) -> Vec<(u32, Vec<(Key, u64)>, Vec<Ub>)> {
-        let buckets = std::mem::take(&mut self.buckets);
+        let mut buckets = std::mem::take(&mut self.buckets);
         let mut out = Vec::with_capacity(buckets.len());
-        for &(route, ref v) in &buckets {
+        for (route, v) in &mut buckets {
+            let route = *route;
+            let n = Self::merge(&mut self.slots, v);
             self.t_idx.clear();
             let mut targets: Vec<(Key, u64)> = Vec::new();
-            let mut bundles: Vec<Ub> = Vec::with_capacity(v.len());
+            let mut bundles: Vec<Ub> = Vec::with_capacity(n);
             let mut last: Option<(Key, u32)> = None;
-            for &(t_key, mut u) in v {
+            for &(t_key, mut u) in &v[..n] {
                 let mut m = u.mask;
                 if let Some(drop) = drop {
                     let mut c = m;
@@ -428,6 +489,9 @@ impl UnitBundles {
                 out.push((route, targets, bundles));
             }
         }
+        if self.slots.capacity() > 2 * SPARE_KEEP {
+            self.slots = Vec::new();
+        }
         self.buckets = buckets;
         self.clear();
         out
@@ -443,7 +507,7 @@ pub struct Scratch {
     /// The job's targets: their names in the job (dense, as met) by key,
     /// and their keys - so the encoder's arrays are the job's size, not its
     /// region's (a region of 24M entries made each job's ranks 96 MB: 2 GB
-    /// over 16 workers on the mod room).
+    /// over 16 workers on a big room).
     t_loc: rustc_hash2::FxHashMap<Key, u32>,
     t_keys: Vec<Key>,
     e_of: Vec<u32>,
@@ -457,7 +521,7 @@ pub struct Scratch {
 }
 
 /// Bundles a worker's region scratch keeps room for between jobs: a
-/// heavy route's job is millions of bundles (the mod room's f69: 3.1M),
+/// heavy route's job is millions of bundles (a big room's f69: 3.1M),
 /// and every worker kept its largest job's buffers - 2.4 GB at 16
 /// threads. At 256k the big jobs' buffers were made again job after job
 /// (the reference frame's region phase +20%); at 1M not (~25 MB a worker).
@@ -502,7 +566,7 @@ impl Chunk {
 impl RouteState {
     /// Bytes its touched table, provisional bundles and segments hold.
     pub fn alloc_bytes(&self) -> [usize; 3] {
-        [self.touched.alloc_bytes() + 24 * self.prov_keys.capacity(), self.prov.iter().map(|s| s.1.bytes.capacity()).sum::<usize>(), self.segs.iter().map(|s| s.1.bytes.capacity()).sum::<usize>()]
+        [self.touched.alloc_bytes() + 24 * self.prov_keys.capacity(), self.prov.iter().map(|s| s.1.bytes.held()).sum::<usize>(), self.segs.iter().map(|s| s.1.bytes.held()).sum::<usize>()]
     }
 }
 
@@ -540,8 +604,6 @@ pub fn run_route(st: &mut RouteState, slice: u32, chunks: &[&Chunk], cx: &Region
     sc.s_list.clear();
     sc.t_loc.clear();
     sc.t_keys.clear();
-    let vt = cx.visited.region(st.shape, st.slot).and_then(|r| cx.visited.table(r));
-    let held = |k: Key| if is_provisional(k) { (0, 0) } else { vt.and_then(|t| t.find(k).map(|e| (e, t.mask(e)))).unwrap_or((0, 0)) };
     for c in chunks {
         // THE PUSHES.
         let mut i = 0usize;
@@ -557,7 +619,7 @@ pub fn run_route(st: &mut RouteState, slice: u32, chunks: &[&Chunk], cx: &Region
             if is_provisional(key) {
                 st.prov_keys.insert(key);
             }
-            st.touched.push(key, &cells, held);
+            st.touched.push(key, &cells);
         }
         st.pushes += c.pushes.len() as u64;
         if !record {
@@ -589,7 +651,12 @@ pub fn run_route(st: &mut RouteState, slice: u32, chunks: &[&Chunk], cx: &Region
             if b.x == NO_XFER {
                 continue;
             }
-            let x = *remap.get(b.x as usize).ok_or_else(|| anyhow::anyhow!("frame {}: a bundle's transfer {} of worker {} has no global id", cx.frame, b.x, c.worker))?;
+            // A pair the tree's table held is its global id; a new one the
+            // worker's local id, past them (`UnitSink::xfer_id`).
+            let x = match b.x.checked_sub(cx.new_xfers) {
+                None => b.x,
+                Some(l) => *remap.get(l as usize).ok_or_else(|| anyhow::anyhow!("frame {}: a bundle's transfer {} of worker {} has no global id", cx.frame, b.x, c.worker))?,
+            };
             let e = sc.e_of[b.t as usize];
             if e == PROV || x >= cx.new_xfers {
                 let (s_shape, s_key) = c.sources[b.s as usize];
@@ -616,10 +683,12 @@ pub fn run_route(st: &mut RouteState, slice: u32, chunks: &[&Chunk], cx: &Region
         let keys = &sc.t_keys;
         sc.enc.encode(&sc.tbs, keys.len(), |l| keys[l as usize], &sc.s_list, &mut sc.raw);
         let region = st.region.unwrap_or(u32::MAX);
-        st.segs.push(((0, slice), Segment::of_raw(region, &sc.raw, sc.tbs.len() as u32, sc.tbs.iter().map(|t| t.mask.count_ones() as u64).sum(), &mut sc.z)?));
+        let mut seg = Segment::of_raw(region, &sc.raw, sc.tbs.len() as u32, sc.tbs.iter().map(|t| t.mask.count_ones() as u64).sum(), &mut sc.z)?;
+        seg.bytes = seg.bytes.spill(cx.spool)?;
+        st.segs.push(((0, slice), seg));
     }
     if !sc.prov.is_empty() {
-        st.prov.push((slice, Segment::encode(u32::MAX, &mut sc.prov, &mut sc.raw, &mut sc.z)?));
+        st.prov.push((slice, Segment::encode(u32::MAX, &sc.prov, &mut sc.enc, &mut sc.raw, &mut sc.z)?));
         sc.prov.clear();
     }
     sc.bound();
@@ -634,6 +703,18 @@ pub struct Sealed {
     pub table: RegionTable,
     pub hulls: Vec<Hull>,
     pub grown: Vec<super::wave::Old>,
+    /// The states it compared, and its steps' times: the touched keys
+    /// sorted, compared with the visited set (its parts' summed), the new
+    /// table (`--phases`' `[seal]`).
+    pub touched: usize,
+    pub t: [std::time::Duration; 3],
+    /// The bundles that waited (their segments, bundles: `reencode`).
+    pub waited: (usize, u64),
+    /// The held states it compared: full (no hull stored), and by AGE
+    /// (frame less layer: 1, 2-3, 4-7, 8-15, 16-31, 32+), and the grown
+    /// ones by age (`--phases`' `[seal]`: how old the states a frame
+    /// reaches again are).
+    pub held_by_age: [[u64; 7]; 2],
 }
 
 /// The frame's new transfers' canonical ids (`edges::XferTable::
@@ -654,24 +735,68 @@ impl Renumber<'_> {
     }
 }
 
-/// THE FRAME'S END of a route (its shape numbered: `region`): provisional
-/// keys made final (`finals`); each touched state's hull - its pushes', and
-/// the visited set's - compared with the visited set's (`visited`, read
-/// only): a state it lacks is NEW (frozen, sorted by key: canonical), one
-/// whose hull grew GREW; the bundles that waited encoded with their final
-/// keys and transfer ids (`renumber`: `None` where the frame's new
-/// transfers are in order already).
-pub fn seal(st: &mut RouteState, region: u32, finals: &FxHashMap<Key, Key>, renumber: Option<&Renumber>, visited: &VisitedSet, sc: &mut Scratch) -> Result<Sealed> {
+/// THE FRAME'S END of a route, its first step (its shape numbered:
+/// `region`): provisional keys made final (`finals`), the touched keys
+/// sorted, with their pushes' hulls (each key's run by cell). Then its
+/// touched keys are compared with the visited set in PARTS (`seal_part`, a
+/// big route's on every thread) and the parts put together (`sealed`).
+/// The bundles that waited stay in `st.prov`, encoded again with their
+/// final keys and ids by `reencode` (the edge file's writer, beside the
+/// rest of the frame's end).
+pub fn seal_sort(st: &mut RouteState, region: u32, finals: &FxHashMap<Key, Key>) -> Result<Touch> {
     st.region = Some(region);
     for seg in &mut st.segs {
         seg.1.region = region;
     }
-    // THE STATES (final keys, sorted): new, grown, or nothing.
     let final_key = |k: Key| if is_provisional(k) { finals.get(&k).copied().ok_or_else(|| anyhow::anyhow!("a provisional key without its final key")) } else { Ok(k) };
+    let t = std::time::Instant::now();
+    let n_touched = st.touched.len();
     let (touched, accs) = std::mem::take(&mut st.touched).into_sorted(final_key)?;
+    let waited = (st.prov.len(), st.prov.iter().map(|x| x.1.bundles as u64).sum());
+    Ok(Touch { region, touched, accs, n_touched, waited, t_sort: t.elapsed() })
+}
+
+/// A route's touched keys sorted, with their pushes' hulls (`seal_sort`).
+pub struct Touch {
+    pub region: u32,
+    pub touched: Vec<TouchedKey>,
+    pub accs: Vec<HullAcc>,
+    n_touched: usize,
+    waited: (usize, u64),
+    t_sort: std::time::Duration,
+}
+
+/// Touched keys a seal part takes.
+pub const SEAL_PART: usize = 1 << 15;
+
+/// A part of a route's touched keys compared (`seal_part`): its new
+/// states (keys, cells, hulls), its grown states, the held states by age.
+pub struct SealPart {
+    keys: Vec<Key>,
+    masks: Vec<u64>,
+    hulls: Vec<Hull>,
+    grown: Vec<super::wave::Old>,
+    held_by_age: [[u64; 7]; 2],
+    t: std::time::Duration,
+}
+
+/// The touched keys `part` (sorted) of `touch` COMPARED with the visited
+/// set's region table (`visited`, read only: walked with a `Cursor`, each
+/// block decoded once): each touched state's hull - its pushes', and the
+/// visited set's - a state it lacks NEW, one whose hull grew GREW.
+pub fn seal_part(touch: &Touch, part: std::ops::Range<usize>, frame: u32, visited: &VisitedSet) -> Result<SealPart> {
+    let t = std::time::Instant::now();
+    let (region, accs) = (touch.region, &touch.accs);
     let (mut keys, mut masks, mut hulls): (Vec<Key>, Vec<u64>, Vec<Hull>) = (Vec::new(), Vec::new(), Vec::new());
     let mut grown: Vec<super::wave::Old> = Vec::new();
-    for TouchedKey { key, cells, start, entry: ve, held } in touched {
+    let mut held_by_age = [[0u64; 7]; 2];
+    let mut cursor = visited.table(region).map(RegionTable::cursor);
+    for &TouchedKey { key, cells, start } in &touch.touched[part] {
+        let entry = match cursor.as_mut() {
+            Some(c) => c.seek(key)?,
+            None => None,
+        };
+        let held = entry.as_ref().map_or(0, |e| e.mask);
         let fresh = cells & !held;
         if fresh != 0 {
             keys.push(key);
@@ -684,42 +809,77 @@ pub fn seal(st: &mut RouteState, region: u32, finals: &FxHashMap<Key, Key>, renu
                 continue;
             }
             // No hull stored: it is FULL, and grows no more.
-            let Some(StateInfo { hull, layer }) = visited.info(region, ve, c) else { continue };
+            let Some(StateInfo { hull, layer }) = entry.as_ref().and_then(|e| e.info(c)) else {
+                held_by_age[0][0] += 1;
+                continue;
+            };
+            let age = |l: u16| match frame.saturating_sub(l as u32) {
+                0..=1 => 1,
+                2..=3 => 2,
+                4..=7 => 3,
+                8..=15 => 4,
+                16..=31 => 5,
+                _ => 6,
+            };
+            held_by_age[0][age(layer)] += 1;
             let mut a = acc;
             a.add_hull(&hull);
             let h = a.hull().expect("a hull holds points");
             if h != hull {
                 grown.push(super::wave::Old { sk: Sk { region, key, local: c as u8 }, layer, hull: h, was: hull });
+                held_by_age[1][age(layer)] += 1;
             }
         }
     }
-    let table = RegionTable::from_sorted(&keys, &masks)?;
-    // Each job's bundles that waited, decoded and encoded again with the
-    // final keys and ids (a segment a job, as it was made).
-    let mut dz = zstd::bulk::Decompressor::new()?;
-    let mut raw: Vec<u8> = Vec::new();
-    for (slice, seg) in std::mem::take(&mut st.prov) {
-        bundle::decompress(&seg.bytes, seg.raw as usize, &mut dz, &mut raw)?;
-        let mut v: Vec<Bundle> = Vec::with_capacity(seg.bundles as usize);
-        let mut missing = false;
-        bundle::Block::open(&raw, &bundle::ORDER)?.bundles(|mut b| {
-            if is_provisional(b.t_key) {
-                match finals.get(&b.t_key) {
-                    Some(&k) => b.t_key = k,
-                    None => missing = true,
-                }
-            }
-            if let Some(rn) = renumber {
-                b.x = rn.id(b.x);
-            }
-            v.push(b);
-        })?;
-        ensure!(!missing, "a provisional target key without its final key");
-        ensure!(v.len() == seg.bundles as usize, "a waiting segment of {} bundles decoded to {}", seg.bundles, v.len());
-        st.segs.push(((1, slice), Segment::encode(region, &mut v, &mut sc.raw, &mut sc.z)?));
+    Ok(SealPart { keys, masks, hulls, grown, held_by_age, t: t.elapsed() })
+}
+
+/// A route's SEALED states from its parts, in order: the new ones frozen
+/// (sorted by key: canonical) with their hulls, the grown ones.
+pub fn sealed(touch: Touch, parts: Vec<SealPart>) -> Result<Sealed> {
+    let t = std::time::Instant::now();
+    let n = |f: fn(&SealPart) -> usize| parts.iter().map(f).sum::<usize>();
+    let (mut keys, mut masks, mut hulls, mut grown) = (Vec::with_capacity(n(|p| p.keys.len())), Vec::with_capacity(n(|p| p.keys.len())), Vec::with_capacity(n(|p| p.hulls.len())), Vec::with_capacity(n(|p| p.grown.len())));
+    let mut held_by_age = [[0u64; 7]; 2];
+    let mut t_compare = std::time::Duration::ZERO;
+    for p in parts {
+        keys.extend(p.keys);
+        masks.extend(p.masks);
+        hulls.extend(p.hulls);
+        grown.extend(p.grown);
+        for (a, b) in held_by_age.iter_mut().flatten().zip(p.held_by_age.iter().flatten()) {
+            *a += b;
+        }
+        t_compare += p.t;
     }
-    // The file's order: the jobs' segments by slice, then the ones that
-    // waited by slice (one job a (route, slice): the keys are distinct).
-    st.segs.sort_unstable_by_key(|s| s.0);
-    Ok(Sealed { region, table, hulls, grown })
+    let table = RegionTable::from_sorted(&keys, &masks)?;
+    Ok(Sealed { region: touch.region, table, hulls, grown, touched: touch.n_touched, t: [touch.t_sort, t_compare, t.elapsed()], waited: touch.waited, held_by_age })
+}
+
+/// A job's bundles that WAITED (`RouteState::prov`), decoded and encoded
+/// again as a segment of `region` with their final keys (`finals`) and
+/// transfer ids (`renumber`: `None` where the frame's new transfers are in
+/// order already).
+pub fn reencode(seg: &Segment, region: u32, finals: &FxHashMap<Key, Key>, renumber: Option<&Renumber>, enc: &mut bundle::Encoder, z: &mut zstd::bulk::Compressor<'static>) -> Result<Segment> {
+    let (mut dz, mut raw) = (zstd::bulk::Decompressor::new()?, Vec::new());
+    let super::spool::Body::Mem(bytes) = &seg.bytes else { anyhow::bail!("a waiting segment spooled") };
+    bundle::decompress(bytes, seg.raw as usize, &mut dz, &mut raw)?;
+    let mut v: Vec<Bundle> = Vec::with_capacity(seg.bundles as usize);
+    let mut missing = false;
+    bundle::Block::open(&raw, &bundle::ORDER)?.bundles(|mut b| {
+        if is_provisional(b.t_key) {
+            match finals.get(&b.t_key) {
+                Some(&k) => b.t_key = k,
+                None => missing = true,
+            }
+        }
+        if let Some(rn) = renumber {
+            b.x = rn.id(b.x);
+        }
+        v.push(b);
+    })?;
+    ensure!(!missing, "a provisional target key without its final key");
+    ensure!(v.len() == seg.bundles as usize, "a waiting segment of {} bundles decoded to {}", seg.bundles, v.len());
+    let mut out = Vec::new();
+    Segment::encode(region, &v, enc, &mut out, z)
 }

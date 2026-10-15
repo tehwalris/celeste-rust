@@ -15,9 +15,10 @@ use celeste_rust::search::inspect::{brief, cell_names, parse_xy, player_summary,
 use clap::{Parser, Subcommand};
 
 /// mimalloc, not glibc: glibc retains gigabytes of freed slot chunks across
-/// its arenas (plans/lessons.md).
+/// its arenas (plans/lessons.md). Counted (`metrics::Counting`): the `[mem]`
+/// lines' live heap.
 #[global_allocator]
-static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+static GLOBAL: celeste_rust::metrics::Counting<mimalloc::MiMalloc> = celeste_rust::metrics::Counting(mimalloc::MiMalloc);
 
 /// On DISK, not the tmpfs at `/tmp`: a full-room tree is gigabytes.
 const DEFAULT_CHECKPOINT_DIR: &str = "/var/tmp/celeste-checkpoints";
@@ -302,6 +303,12 @@ enum Command {
         /// Write the first rep's exact metrics to this file.
         #[arg(long)]
         metrics: Option<String>,
+        /// Checkpoint each rep's frame as the forward does (the frame file
+        /// and the hull file, each read back and checked; the pos graph),
+        /// into the scratch dir, timed; prints a `b{F+1}` line over the
+        /// bytes of every file the frame wrote (needs `--edges`).
+        #[arg(long, default_value_t = false)]
+        checkpoint: bool,
     },
     /// ONE BACKWARD FRAME of the arc phase, repeatably: a finished level-0
     /// tree's edge files to `--horizon` opened (`arc_dp::Seeds`; timed), the
@@ -1143,8 +1150,9 @@ fn main() -> Result<()> {
                 }
             }
         }
-        Command::BenchFrame { level_dir, frame, reps, level, edges, metrics } => {
+        Command::BenchFrame { level_dir, frame, reps, level, edges, metrics, checkpoint } => {
             use celeste_rust::compiled::dispatch::{print_stats, take_kernel_stats};
+            anyhow::ensure!(!checkpoint || edges, "--checkpoint needs --edges (the frame's files as the forward writes them)");
             let dir = std::path::PathBuf::from(&level_dir);
             let frame = match frame {
                 Some(f) => f,
@@ -1154,8 +1162,9 @@ fn main() -> Result<()> {
             let t = std::time::Instant::now();
             engine.warm();
             let t_kernels = t.elapsed().as_secs_f64();
+            eprintln!("[bench] kernels built: rss {:.2} GB", celeste_rust::metrics::current_rss_gb());
             let t = std::time::Instant::now();
-            let st = celeste_rust::frame::ForwardState::at(&dir, frame, true, level, &cfg)?;
+            let mut st = celeste_rust::frame::ForwardState::at(&dir, frame, true, level, &cfg)?;
             eprintln!(
                 "[bench] kernels built in {t_kernels:.2} s; f{frame} loaded in {:.2} s: {} lanes in {} entries ({:.3} GB, {:.2} B a state) and {} old states, visited {} states in {} entries ({:.3} GB, {:.2} B a state); {} threads; rss {:.2} GB",
                 t.elapsed().as_secs_f64(),
@@ -1171,21 +1180,33 @@ fn main() -> Result<()> {
                 cfg.threads(),
                 celeste_rust::metrics::current_rss_gb()
             );
+            {
+                let (fr, (outs, xfers)) = (st.frontier(), st.outs_and_xfers());
+                celeste_rust::storage::bench::print_memory(&format!("f{frame} loaded"), st.visited(), &fr.new, &fr.hulls, &fr.old, outs, xfers);
+            }
             let scratch = dir.join("bench-edges");
             let ms = |d: std::time::Duration| d.as_secs_f64() * 1e3;
             let mut lines: Option<String> = None;
+            let mut costs: Vec<celeste_rust::storage::bench::Rep> = Vec::new();
+            let counters = celeste_rust::storage::bench::Counters::open().map(celeste_rust::storage::bench::count_steps);
             for rep in 0..reps {
                 let _ = std::fs::remove_dir_all(&scratch);
+                let load = celeste_rust::storage::bench::load_average();
+                let at = counters.as_ref().map(|c| c.start());
                 let t = std::time::Instant::now();
-                let (wave, visited, xfers) = st.bench_wave(&engine, &dir, edges.then_some(scratch.as_path()))?;
+                // The last rep runs on the state's own visited set (no copy beside it).
+                let (wave, visited, xfers) = st.bench_wave(&engine, &dir, edges.then_some(scratch.as_path()), rep + 1 < reps)?;
+                let ckpt = if checkpoint { Some(st.bench_checkpoint(&wave, &scratch.join("ckpt"), &cfg)?) } else { None };
                 let t_all = t.elapsed();
+                let counts = counters.as_ref().zip(at).map(|(c, at)| c.stop(at));
                 let w = &wave.stats;
                 eprintln!(
-                    "[bench] rep {rep}: wave {:.0} ms (idle {:.0}%, regions {:.0} worker-ms) end {:.0} total {:.0} ms | in {} old {} emitted {} re-pushed {} pushes {} kept {} grown {} | units {} slices {} routes {} | edges {} bundles {} ({:.3} B; out {:.3} B) | rss start {:.2} wave {:.2} end {:.2} peak {:.2} GB",
+                    "[bench] rep {rep}: wave {:.0} ms (idle {:.0}%, regions {:.0} worker-ms) end {:.0}{} total {:.0} ms | in {} old {} emitted {} re-pushed {} pushes {} kept {} grown {} | units {} slices {} routes {} | edges {} bundles {} ({:.3} B; out {:.3} B) | rss start {:.2} wave {:.2} end {:.2} peak {:.2} GB",
                     ms(w.t_wave),
                     w.wave_idle * 100.0,
                     ms(w.t_regions),
                     ms(w.t_layer),
+                    ckpt.map_or(String::new(), |(c, pos)| format!(" checkpoint {:.0}", ms(c.t.iter().sum::<std::time::Duration>() + pos))),
                     ms(t_all),
                     w.lanes_in,
                     w.old_in,
@@ -1206,6 +1227,10 @@ fn main() -> Result<()> {
                     w.rss_end,
                     celeste_rust::metrics::peak_rss_gb(),
                 );
+                costs.push(celeste_rust::storage::bench::Rep { stats: *w, ckpt, workers: cfg.threads(), wall: t_all, load, counts });
+                if rep + 1 == reps {
+                    celeste_rust::storage::bench::print_memory(&format!("f{} made (the out store as loaded)", frame + 1), &visited, &wave.next, &wave.hulls, &wave.grown, st.outs_and_xfers().0, &xfers);
+                }
                 let (n, acc) = wave.next.content_fingerprint(&visited.keys, visited.shapes())?;
                 let mut out = format!("f{:03} {n} {acc:016x}\n", frame + 1);
                 let (nh, ah) = celeste_rust::storage::hulls::fingerprint(wave.frontier_states(frame + 1), &visited.keys, visited.shapes())?;
@@ -1213,6 +1238,10 @@ fn main() -> Result<()> {
                 if edges {
                     let (n, acc) = celeste_rust::storage::bench::edge_fingerprint(&scratch, frame + 1, &xfers, &visited, cfg.threads())?;
                     out += &format!("e{:03} {n} {acc:016x}\n", frame + 1);
+                }
+                if checkpoint {
+                    let (files, bytes, acc) = celeste_rust::storage::bench::dir_fingerprint(&scratch)?;
+                    out += &format!("b{:03} {files} {bytes} {acc:016x}\n", frame + 1);
                 }
                 match &lines {
                     None => print!("{out}"),
@@ -1237,6 +1266,7 @@ fn main() -> Result<()> {
             let _ = std::fs::remove_dir_all(&scratch);
             let ks = take_kernel_stats();
             anyhow::ensure!(ks.missed == 0, "KERNEL COVERAGE GAP: {} lanes missed", ks.missed);
+            celeste_rust::storage::bench::print_cost(frame + 1, &costs);
         }
         Command::BenchBackward { level_dir, horizon, frame, reps } => {
             anyhow::ensure!(frame < horizon, "--frame {frame}: below the horizon {horizon}");

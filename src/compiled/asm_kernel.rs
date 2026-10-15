@@ -108,18 +108,7 @@ impl DupMemo {
         if self.stamp[p] == self.slice {
             return self.mask[p];
         }
-        let block = |o: usize| -> [u32; 16] {
-            let b: &[u8; 64] = buf[o..o + 64].try_into().unwrap();
-            std::array::from_fn(|i| u32::from_le_bytes([b[4 * i], b[4 * i + 1], b[4 * i + 2], b[4 * i + 3]]))
-        };
-        let eq16 = |a: usize, b: usize| -> u16 {
-            let (x, y) = (block(a), block(b));
-            let mut m = 0u16;
-            for i in 0..16 {
-                m |= ((x[i] == y[i]) as u16) << i;
-            }
-            m
-        };
+        let eq16 = |a: usize, b: usize| -> u16 { emit::eq16(&buf[a..a + 64], &buf[b..b + 64]) };
         let (a, b, kind) = pairs.pairs[p];
         let m = match kind {
             RootKind::Num => eq16(a, b),

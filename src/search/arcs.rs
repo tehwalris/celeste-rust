@@ -227,8 +227,10 @@ pub struct Piece {
 }
 
 /// A segment as a `Region` stores it: `[lo, last]`, `last` its last point
-/// (so the whole circle, `[0, CIRCLE)`, fits 16 bits a bound).
+/// (so the whole circle, `[0, CIRCLE)`, fits 16 bits a bound). Two `u16`s
+/// (`repr(C)`: a `RegionArena` record's words are viewed as these).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[repr(C)]
 struct Stored {
     lo: u16,
     last: u16,
@@ -245,8 +247,10 @@ impl Stored {
 }
 
 /// A slab of a `Region`: its y segment, its x set `xs[start..end]` (the
-/// start is the previous slab's end). 6 B.
+/// start is the previous slab's end). 6 B: three `u16`s (`repr(C)`, as
+/// `Stored`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[repr(C)]
 struct Slab {
     y: Stored,
     end: u16,
@@ -500,52 +504,184 @@ impl PartialEq<Region> for RegionRef<'_> {
     }
 }
 
-/// Many sets in two flat lists (a slab 6 B, a segment 4, 8 B a set
-/// besides): the backward's arena of distinct winning sets, without a
-/// `Region`'s two allocations each.
-#[derive(Clone)]
+const _: () = assert!(std::mem::size_of::<Stored>() == 4 && std::mem::align_of::<Stored>() == 2, "Stored is two u16s");
+const _: () = assert!(std::mem::size_of::<Slab>() == 6 && std::mem::align_of::<Slab>() == 2, "Slab is three u16s");
+
+/// Words (`u16`) a CHUNK of a `RegionArena` holds at most (64 MB). A record
+/// is at most `2 + 5 * MAX_SEGS` words: it never straddles two chunks.
+const CHUNK_WORDS: usize = 1 << 25;
+
+/// Many sets as RECORDS of `u16` words - the set's slab and segment counts,
+/// then its slabs (3 words each) and its segments (2 words) - in CHUNKS,
+/// and per set its record's place (8 B): the backward's arena of distinct
+/// winning sets, without a `Region`'s two allocations each. The open chunk
+/// grows; a full one is SEALED - kept as it is, or (`spill_to`) written to
+/// a scratch file and mapped back (page cache, which the kernel can
+/// reclaim, not anonymous memory; the file unlinked once mapped). Records
+/// never move, so the arena grows without copying itself (one flat list
+/// each for slabs and segments, doubling, held both copies at its growth:
+/// a backward of 75M sets, 49.6 GB, peaked at 89.9 GB).
 pub struct RegionArena {
-    slabs: Vec<Slab>,
-    xs: Vec<Stored>,
-    /// Set `i`: `slabs[at[i].0..at[i + 1].0]`, `xs[at[i].1..at[i + 1].1]`.
-    at: Vec<(u32, u32)>,
+    /// Set `i`'s record: its chunk (high 32 bits; `sealed.len()` is the open
+    /// one) and its first word there.
+    at: Vec<u64>,
+    /// A chunk's words at most (`CHUNK_WORDS`; tests seal smaller ones).
+    chunk: usize,
+    sealed: Vec<Words>,
+    open: Vec<u16>,
+    /// Words in the sealed chunks, and in those of them mapped.
+    sealed_words: u64,
+    mapped_words: u64,
+    spill: Option<std::path::PathBuf>,
+}
+
+/// A sealed chunk's words.
+enum Words {
+    Mem(Vec<u16>),
+    Map(memmap2::Mmap),
+}
+
+impl Words {
+    fn words(&self) -> &[u16] {
+        match self {
+            Words::Mem(v) => v,
+            // SAFETY: a map starts on a page (aligned for u16) and holds
+            // whole words (`RegionArena::seal` writes them).
+            Words::Map(m) => unsafe { std::slice::from_raw_parts(m.as_ptr().cast::<u16>(), m.len() / 2) },
+        }
+    }
+}
+
+/// The set whose record starts `w`.
+fn record(w: &[u16]) -> RegionRef<'_> {
+    let (ns, nx) = (w[0] as usize, w[1] as usize);
+    let (s, x) = (&w[2..2 + 3 * ns], &w[2 + 3 * ns..2 + 3 * ns + 2 * nx]);
+    // SAFETY: `Slab` and `Stored` are `repr(C)` structs of three and two
+    // `u16`s (asserted above: no padding, align 2), and every bit pattern is
+    // one of them; the slices are in bounds (indexed above).
+    unsafe { RegionRef { slabs: std::slice::from_raw_parts(s.as_ptr().cast::<Slab>(), ns), xs: std::slice::from_raw_parts(x.as_ptr().cast::<Stored>(), nx) } }
 }
 
 impl Default for RegionArena {
     fn default() -> Self {
-        RegionArena { slabs: Vec::new(), xs: Vec::new(), at: vec![(0, 0)] }
+        RegionArena { at: Vec::new(), chunk: CHUNK_WORDS, sealed: Vec::new(), open: Vec::new(), sealed_words: 0, mapped_words: 0, spill: None }
     }
 }
 
 impl RegionArena {
+    /// Seal its full chunks into scratch files in `dir` (which must exist).
+    pub fn spill_to(&mut self, dir: &std::path::Path) {
+        self.spill = Some(dir.to_path_buf());
+    }
     pub fn len(&self) -> usize {
-        self.at.len() - 1
+        self.at.len()
     }
     pub fn is_empty(&self) -> bool {
-        self.len() == 0
+        self.at.is_empty()
     }
     /// Append `r`; its index.
     pub fn push(&mut self, r: RegionRef) -> u32 {
-        let i = self.len() as u32;
-        self.slabs.extend_from_slice(r.slabs);
-        self.xs.extend_from_slice(r.xs);
-        assert!(self.slabs.len() < u32::MAX as usize && self.xs.len() < u32::MAX as usize, "a region arena past u32 offsets");
-        self.at.push((self.slabs.len() as u32, self.xs.len() as u32));
+        let i = u32::try_from(self.at.len()).expect("a region arena past u32 sets");
+        let need = 2 + 3 * r.slabs.len() + 2 * r.xs.len();
+        if self.open.len() + need > self.chunk {
+            self.seal();
+        }
+        self.at.push((self.sealed.len() as u64) << 32 | self.open.len() as u64);
+        self.open.extend([r.slabs.len() as u16, r.xs.len() as u16]);
+        for s in r.slabs {
+            self.open.extend([s.y.lo, s.y.last, s.end]);
+        }
+        for x in r.xs {
+            self.open.extend([x.lo, x.last]);
+        }
         i
     }
-    pub fn get(&self, i: u32) -> RegionRef<'_> {
-        let (a, b) = (self.at[i as usize], self.at[i as usize + 1]);
-        RegionRef { slabs: &self.slabs[a.0 as usize..b.0 as usize], xs: &self.xs[a.1 as usize..b.1 as usize] }
+    /// The open chunk sealed (`Words`), a new one opened.
+    fn seal(&mut self) {
+        let open = std::mem::take(&mut self.open);
+        self.sealed_words += open.len() as u64;
+        let w = match &self.spill {
+            None => Words::Mem(open),
+            Some(dir) => {
+                let path = dir.join(format!("sets-{:05}.bin", self.sealed.len()));
+                let map = || -> std::io::Result<memmap2::Mmap> {
+                    // SAFETY: u16 words as their bytes.
+                    std::fs::write(&path, unsafe { std::slice::from_raw_parts(open.as_ptr().cast::<u8>(), open.len() * 2) })?;
+                    let f = std::fs::File::open(&path)?;
+                    // SAFETY: the file is this process's own, complete, and
+                    // unlinked right after: nothing else writes it.
+                    let m = unsafe { memmap2::Mmap::map(&f)? };
+                    std::fs::remove_file(&path)?;
+                    Ok(m)
+                };
+                let m = map().unwrap_or_else(|e| panic!("FATAL: the arc phase's set chunk {}: {e}", path.display()));
+                self.mapped_words += open.len() as u64;
+                Words::Map(m)
+            }
+        };
+        self.sealed.push(w);
     }
-    /// The bytes its sets take (the lists' used lengths).
+    pub fn get(&self, i: u32) -> RegionRef<'_> {
+        let a = self.at[i as usize];
+        let c = (a >> 32) as usize;
+        let w = if c == self.sealed.len() { &self.open[..] } else { self.sealed[c].words() };
+        record(&w[a as u32 as usize..])
+    }
+    /// The bytes its sets take (their records and places).
     pub fn bytes(&self) -> usize {
-        self.slabs.len() * std::mem::size_of::<Slab>() + self.xs.len() * std::mem::size_of::<Stored>() + self.at.len() * 8
+        (self.sealed_words as usize + self.open.len()) * 2 + self.at.len() * 8
+    }
+    /// The bytes of its sealed chunks mapped from scratch files.
+    pub fn mapped_bytes(&self) -> usize {
+        self.mapped_words as usize * 2
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_arena_returns_its_sets_across_sealed_and_spilled_chunks() {
+        // Random regions (a few pieces each), pushed into arenas with small
+        // chunks - kept in memory, and spilled to files - read back equal.
+        let mut rng = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = move |n: u32| {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            (rng % n as u64) as u32
+        };
+        let mut regions = Vec::new();
+        let mut scratch = Vec::new();
+        for _ in 0..500 {
+            let mut pieces: Vec<Piece> = (0..1 + next(6))
+                .map(|_| {
+                    let (x, y) = (next(CIRCLE - 2), next(CIRCLE - 2));
+                    Piece { x: Seg { lo: x, hi: x + 1 + next(CIRCLE - 1 - x) }, y: Seg { lo: y, hi: y + 1 + next(CIRCLE - 1 - y) } }
+                })
+                .collect();
+            regions.push(Region::from_pieces(&mut pieces, &mut scratch));
+        }
+        regions.push(Region::default());
+        let dir = std::env::temp_dir().join(format!("arena-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        for spill in [false, true] {
+            let mut a = RegionArena { chunk: 64, ..RegionArena::default() };
+            if spill {
+                a.spill_to(&dir);
+            }
+            let ids: Vec<u32> = regions.iter().map(|r| a.push(r.as_ref())).collect();
+            assert!(a.sealed.len() > 10, "small chunks seal");
+            assert_eq!(a.mapped_bytes() > 0, spill);
+            for (r, &i) in regions.iter().zip(&ids) {
+                assert_eq!(a.get(i), *r);
+            }
+            assert_eq!(a.bytes(), regions.iter().map(|r| 4 + 6 * r.slabs.len() + 4 * r.xs.len() + 8).sum::<usize>());
+        }
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0, "the chunk files are unlinked once mapped");
+        std::fs::remove_dir(&dir).unwrap();
+    }
 
     #[test]
     fn a_rotation_wraps_and_an_intersection_cuts() {

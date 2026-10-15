@@ -617,6 +617,12 @@ impl KeySpace {
         self.gen
     }
 
+    /// Bytes its dictionaries hold (approximately: their vectors' room).
+    pub fn alloc_bytes(&self) -> usize {
+        let field = |f: &FieldDict| std::mem::size_of::<FieldDict>() + f.codes.capacity() * std::mem::size_of::<Code>() + f.num_slots.capacity() * std::mem::size_of::<NumSlot>() + f.others.capacity() * std::mem::size_of::<(Code, u32)>() + f.runs.capacity() * 2;
+        self.shapes.values().map(|s| s.fields.iter().flatten().map(field).sum::<usize>() + s.fields.capacity() * std::mem::size_of::<Option<FieldDict>>()).sum::<usize>() + self.run_counts.capacity() * 20
+    }
+
     fn bump(&mut self) {
         self.gen = GEN.fetch_add(1, Ordering::Relaxed);
     }
