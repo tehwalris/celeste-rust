@@ -221,6 +221,13 @@ pub trait Domain {
         false
     }
 
+    /// Does undecided `c` read an input this trace REFUSES MERGES on
+    /// (`verify::trace_frame`'s `merge_refused_on`)? A merge that would
+    /// select on `c` is two successors instead, as on an unknown atom.
+    fn reads_merge_refused(&mut self, _c: &Self::Bool) -> bool {
+        false
+    }
+
     /// The next comparisons read a COUNTDOWN (the interpreter's hint, from
     /// the field read: `widen::countdown_fields`): an unknown number there mints a
     /// countdown atom (`Symbolic::countdown_atom`) also with the fly fruit
@@ -415,6 +422,11 @@ pub struct Symbolic {
     lane_memo: rustc_hash::FxHashMap<NodeId, bool>,
     /// `reads_unknown_atom`'s memo: structural, like `lane_memo`.
     atom_memo: rustc_hash::FxHashMap<NodeId, bool>,
+    /// The input cells THIS trace refuses merges on, sorted
+    /// (`verify::trace_frame`'s `merge_refused_on`; set by every trace).
+    merge_refused: Vec<u32>,
+    /// `reads_merge_refused`'s memo, for `merge_refused`.
+    merge_refused_memo: rustc_hash::FxHashMap<NodeId, bool>,
     /// Fork choices handed out THIS FRAME by `(value, kind)`: a second fork
     /// of one value reuses the first's choice instead of an empty dimension.
     /// Cleared with `forks`.
@@ -448,6 +460,14 @@ pub struct Symbolic {
 pub use crate::transpile::graph::Pieces;
 
 impl Symbolic {
+    /// The input cells this trace refuses merges on (`reads_merge_refused`).
+    pub fn set_merge_refused(&mut self, mut cells: Vec<u32>) {
+        cells.sort_unstable();
+        cells.dedup();
+        self.merge_refused = cells;
+        self.merge_refused_memo.clear();
+    }
+
     /// Forget the static ranges (a new frame, new cells).
     pub fn clear_ranges(&mut self) {
         self.assumptions.clear();
@@ -1346,6 +1366,34 @@ impl Domain for Symbolic {
 
     fn set_countdown_hint(&mut self, on: bool) {
         self.countdown_hint = on;
+    }
+
+    fn reads_merge_refused(&mut self, c: &NodeId) -> bool {
+        if self.merge_refused.is_empty() || self.decide(c).is_some() {
+            return false;
+        }
+        // Post-order and memoized, as `reads_unknown_atom`.
+        let mut stack: Vec<(NodeId, bool)> = vec![(*c, false)];
+        while let Some((x, expanded)) = stack.pop() {
+            if self.merge_refused_memo.contains_key(&x) {
+                continue;
+            }
+            let node = self.graph.get(x);
+            if node.args.is_empty() {
+                let refused = matches!(node.op, Op::Cell(i) if self.merge_refused.binary_search(&i).is_ok());
+                self.merge_refused_memo.insert(x, refused);
+                continue;
+            }
+            let args = node.args.clone();
+            if expanded {
+                let r = args.iter().any(|a| self.merge_refused_memo[a]);
+                self.merge_refused_memo.insert(x, r);
+            } else {
+                stack.push((x, true));
+                stack.extend(args.iter().filter(|a| !self.merge_refused_memo.contains_key(a)).map(|a| (*a, false)));
+            }
+        }
+        self.merge_refused_memo[c]
     }
 
     fn join_bool_independent(&mut self, c: &NodeId, t: &NodeId, f: &NodeId) -> Option<NodeId> {

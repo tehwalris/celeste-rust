@@ -77,3 +77,12 @@ fn the_scan_sees_an_unwrapped_run() {
     assert!(!runs_ours("if [ ! -x \"$B\" ]; then", false));
     assert!(!runs_ours("    out = subprocess.run(cmd, capture_output=True)", true));
 }
+
+/// The category runner's pure parts hold their doctests (`ui_label`: an
+/// unverified result is labelled so in the web UI).
+#[test]
+fn the_category_runner_doctests_pass() {
+    let tools = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tools");
+    let out = std::process::Command::new("python3").args(["-m", "doctest", "category_runner.py"]).current_dir(&tools).output().expect("python3");
+    assert!(out.status.success(), "tools/category_runner.py doctests:\n{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+}

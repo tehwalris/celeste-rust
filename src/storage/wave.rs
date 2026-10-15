@@ -1618,31 +1618,32 @@ pub fn par_map<T: Sync, R: Send>(items: &[T], threads: usize, f: impl Fn(&T) -> 
     out.into_iter().map(|e| e.1).collect()
 }
 
-/// Frame 0: the initial states into an empty visited set - keyed as the
-/// forward keys a reference row (`UnitSink::row_key`: the level's held
-/// buttons widened) and stored as they are, so each must DECODE from its
+/// Frame 0: the initial states into an empty visited set, each KEYED AS IT
+/// IS - not by its boundary view (`Rt2::widen_to`) - so it decodes from its
 /// key and cell to exactly itself (`decode::check_piece`; a row its key does
-/// not determine is fatal) - each with the hull `start` (the start's
+/// not determine is fatal), each with the hull `start` (the start's
 /// remainder; the whole circle for rows of no known one). Returns the
 /// layer (its skeletons the rows' own), its hulls, its wins, the shapes
 /// numbered and the key space's codes.
-pub fn seed(visited: &mut VisitedSet, blocks: &[Block], level: crate::abstraction::Level, start: Hull, s: &crate::settings::Settings) -> Result<Wave> {
+///
+/// The start is the state the kernels' lattice walk starts from (its
+/// constants are the start shape's pins, `trace::kernel`), and nothing
+/// looks it up by its projection (`arc_dp::Seeds::load` takes frame 0's
+/// one state, `known::Pruning::start`). Its view differs from it where a
+/// `Flag::Always` entry moves it - a strawberry's bob, and under the
+/// loading jank a key's sprite and a balloon's phase - and a row keyed by
+/// its view decodes to the view: the start would be stored lossy, and the
+/// kernels' pins would decline it.
+pub fn seed(visited: &mut VisitedSet, blocks: &[Block], start: Hull, s: &crate::settings::Settings) -> Result<Wave> {
     let geo = visited.geo;
     let ids = crate::compiled::ids();
-    let level = crate::abstraction::Level { held: level.held, ..crate::abstraction::Level::EXACT };
     let mut canon: Vec<celeste_engine::runtime2::Rt2> = Vec::with_capacity(blocks.len());
-    let mut views: Vec<celeste_engine::runtime2::Rt2> = Vec::with_capacity(blocks.len());
     for b in blocks {
         let mut r = b.rt2().clone_block();
         r.canonical();
-        let mut v = r.clone_block();
-        crate::frame::widen_rt2_to(&mut v, level);
-        v.canonical();
-        ensure!(v.shape_hash == r.shape_hash, "an initial row's key view changed its shape");
         canon.push(r);
-        views.push(v);
     }
-    let keys_added = visited.keys.absorb(&views.iter().collect::<Vec<_>>(), ids);
+    let keys_added = visited.keys.absorb(&canon.iter().collect::<Vec<_>>(), ids);
     let mut shapes: Vec<u64> = canon.iter().map(|r| r.shape_hash).filter(|s| visited.shape_index(*s).is_none()).collect();
     shapes.sort_unstable();
     shapes.dedup();
@@ -1654,8 +1655,8 @@ pub fn seed(visited: &mut VisitedSet, blocks: &[Block], level: crate::abstractio
     // Every row's state, checked to decode to the row; its win.
     let mut states: Vec<(Sk, bool)> = Vec::new();
     let mut skels: FxHashMap<u64, super::layer::SkelRecord> = FxHashMap::default();
-    for (r, v) in canon.iter_mut().zip(&views) {
-        let keys: Vec<Key> = visited.keys.lookup_keys(v, ids).into_iter().map(|k| k.expect("seeded codes")).collect();
+    for r in canon.iter_mut() {
+        let keys: Vec<Key> = visited.keys.lookup_keys(r, ids).into_iter().map(|k| k.expect("seeded codes")).collect();
         let cells = crate::search::pos_graph::block_cells(r)?;
         r.row_keys = keys.clone();
         super::decode::check_piece(&visited.keys, r, &cells).map_err(|e| e.context("frame 0"))?;
@@ -1722,15 +1723,16 @@ pub struct OneFrame {
 
 /// ONE FRAME of the rows `rows` against an EMPTY tree, no edges: every
 /// successor is new (the diagnostics' `rerun`, the tests). The rows are
-/// seeded as a tree's start is (`seed`: each must decode from its key),
-/// with the whole circle as their hulls (a row's remainder is widened:
-/// every successor of every remainder).
+/// seeded as a tree's start is (`seed`: each keyed as it is - the callers
+/// pass rows widened to the engine's level), with the whole circle as their
+/// hulls (a row's remainder is widened: every successor of every
+/// remainder).
 pub fn one_frame(engine: &dyn FrameStep, rows: Vec<Block>, frame: u32) -> Result<OneFrame> {
     let mut visited = VisitedSet::new(super::GEOMETRY);
     let mut xfers = XferTable::default();
     let skeletons = Skeletons::default();
     let s = engine.settings();
-    let start = seed(&mut visited, &rows, engine.level(), Hull::full(), &s)?.frontier();
+    let start = seed(&mut visited, &rows, Hull::full(), &s)?.frontier();
     let cx = WaveCtx { visited: &mut visited, xfers: &mut xfers, pos: None, filters: Filters::default(), frame, edges_dir: None, outs: None, skeletons: &skeletons, ceiling: None };
     let wave = run_wave(engine, start, cx)?;
     let next = super::layer::decode_states(&wave.next, &visited.keys, visited.shapes(), usize::MAX, &|_| true)?.into_iter().map(|(_, rt2)| Block::from_rt2(rt2)).collect();
@@ -1740,6 +1742,41 @@ pub fn one_frame(engine: &dyn FrameStep, rows: Vec<Block>, frame: u32) -> Result
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::settings::Settings;
+
+    /// FRAME 0 IS THE ENGINE'S START, exactly, also where its boundary view
+    /// is another row (a `Flag::Always` entry moves it): a strawberry's bob
+    /// (room (2,0) 100%), and under the loading jank a key's sprite (room
+    /// (0,3) gemskip 100%, J 1: its update set `spr` to 9.5, the view's 8)
+    /// and a balloon's phase (room (7,0), J 1). Keyed by its view, the start
+    /// decoded to the view and `seed` refused it (`ROWS FROM KEYS`).
+    #[test]
+    fn frame_zero_is_the_start_where_its_view_is_not() {
+        let ids = crate::compiled::ids();
+        let cases = [
+            Settings { room: (2, 0), hundred: true, ..Default::default() },
+            Settings { room: (0, 3), hundred: true, gemskip: true, loading_jank: Some(1), ..Default::default() },
+            Settings { room: (7, 0), loading_jank: Some(1), ..Default::default() },
+        ];
+        for s in cases {
+            let start = Block::canonical(crate::trace::refengine::RefEngine::new(&s).expect("engine").initial().expect("start")).expect("block");
+            let mut view = start.rt2().clone_block();
+            crate::frame::widen_rt2_to(&mut view, crate::abstraction::Level::EXACT);
+            view.canonical();
+            assert_ne!(celeste_engine::exact::exact_rows(&view, ids), celeste_engine::exact::exact_rows(start.rt2(), ids), "room {:?}: the start is its own view", s.room);
+            let mut visited = VisitedSet::new(GEOMETRY);
+            let wave = seed(&mut visited, std::slice::from_ref(&start), Hull::full(), &s).unwrap_or_else(|e| panic!("room {:?}: frame 0: {e:#}", s.room));
+            let decoded = super::super::layer::decode_states(&wave.next, &visited.keys, visited.shapes(), usize::MAX, &|_| true).expect("decode");
+            let [(sks, row)] = &decoded[..] else { panic!("room {:?}: frame 0 is {} blocks", s.room, decoded.len()) };
+            assert_eq!(sks.len(), 1, "room {:?}: frame 0 is one state", s.room);
+            assert_eq!(
+                (celeste_engine::exact::exact_rows(row, ids), sks[0].cell(&GEOMETRY)),
+                (celeste_engine::exact::exact_rows(start.rt2(), ids), start.positions().expect("cell")[0]),
+                "room {:?}: frame 0 is not the start",
+                s.room
+            );
+        }
+    }
 
     /// An `OldLayer` gives back the old states pushed into it, whole and by
     /// any range of places, and its re-push units are whole entries of at
