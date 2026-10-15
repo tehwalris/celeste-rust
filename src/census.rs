@@ -281,8 +281,11 @@ fn room_of<A: Arithmetic>(st: &St<A>) -> Option<(u64, u64)> {
 /// THE CENSUS of arithmetic `A` under `s`: frames 1..=`to`, stopping early
 /// once more than `max_nodes` nodes are met; `threads` engines. `exact`:
 /// over CONCRETE states instead (the remainder exact, every state
-/// distinct), the real diversity of speeds and remainders.
-pub fn run<A: Arithmetic>(s: &crate::settings::Settings, to: u32, max_nodes: usize, threads: usize, exact: bool, mut each: impl FnMut(&Frame)) -> Result<Vec<Frame>> {
+/// distinct), the real diversity of speeds and remainders. `sample`: only
+/// that many of a frame's new nodes are expanded (those whose key hashes
+/// lowest: deterministic), to see the speeds and remainders of frames a
+/// full census cannot reach; its counts are then the sample's lineage's.
+pub fn run<A: Arithmetic>(s: &crate::settings::Settings, to: u32, max_nodes: usize, sample: Option<usize>, threads: usize, exact: bool, mut each: impl FnMut(&Frame)) -> Result<Vec<Frame>> {
     ensure!(s.steps_per_frame() == 1, "the census runs whole frames: no --split-frame");
     ensure!(s.win_at.is_none(), "the census wins by leaving the room: no --win-at");
     let mut engines: Vec<ReferenceEngine<A>> = (0..threads.max(1)).map(|_| ReferenceEngine::<A>::new(s)).collect::<Result<_>>()?;
@@ -347,6 +350,12 @@ pub fn run<A: Arithmetic>(s: &crate::settings::Settings, to: u32, max_nodes: usi
         let (mut fx, mut fy, mut bundles) = (FxHashSet::default(), FxHashSet::default(), FxHashSet::default());
         for part in parts {
             for (key, won, leaf) in part? {
+                let hash = {
+                    use std::hash::{Hash, Hasher};
+                    let mut h = rustc_hash::FxHasher::default();
+                    key.hash(&mut h);
+                    h.finish()
+                };
                 if !visited.insert(key) {
                     continue;
                 }
@@ -371,7 +380,7 @@ pub fn run<A: Arithmetic>(s: &crate::settings::Settings, to: u32, max_nodes: usi
                 if won {
                     f.wins += 1;
                 } else {
-                    next.push(leaf);
+                    next.push((hash, leaf));
                 }
             }
         }
@@ -380,7 +389,11 @@ pub fn run<A: Arithmetic>(s: &crate::settings::Settings, to: u32, max_nodes: usi
         (f.rem_x_all, f.rem_y_all) = (rem_x.len(), rem_y.len());
         each(&f);
         out.push(f);
-        frontier = next;
+        if let Some(n) = sample {
+            next.sort_unstable_by_key(|(h, _)| *h);
+            next.truncate(n);
+        }
+        frontier = next.into_iter().map(|(_, leaf)| leaf).collect();
     }
     Ok(out)
 }
@@ -397,7 +410,7 @@ mod tests {
         let s = crate::settings::Settings { threads: Some(8), ..Default::default() };
         let pinned = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/gates/ckhash_room10_f000-044_widened.txt")).expect("the gate");
         let want: Vec<usize> = pinned.lines().map(|l| l.split_whitespace().nth(1).expect("a count").parse().expect("a count")).collect();
-        let frames = run::<celeste_core::arith::Fixed>(&s, 27, usize::MAX, 8, false, |_| {}).expect("census");
+        let frames = run::<celeste_core::arith::Fixed>(&s, 27, usize::MAX, None, 8, false, |_| {}).expect("census");
         for f in &frames {
             assert_eq!(f.new, want[f.frame as usize], "frame {}: the census's new nodes against the widened forward's", f.frame);
         }

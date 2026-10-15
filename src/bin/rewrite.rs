@@ -594,6 +594,10 @@ enum Command {
         /// Over CONCRETE states (the remainder exact) instead of the nodes.
         #[arg(long)]
         exact: bool,
+        /// Expand only this many of a frame's new nodes (a deterministic
+        /// sample): the speeds and remainders of later frames.
+        #[arg(long)]
+        sample: Option<usize>,
     },
     /// DIAGNOSTIC: per-column cardinalities of one frame, streamed. Per
     /// shape: rows, every varying column's distinct value count (capped at
@@ -2092,12 +2096,13 @@ fn main() -> Result<()> {
             println!("pairs whose transfers are exactly x-pieces x y-pieces: {product} ({:.1}%); x part constant {x_const} ({:.1}%), y part constant {y_const} ({:.1}%)", 100.0 * product as f64 / n_pairs as f64, 100.0 * x_const as f64 / n_pairs as f64, 100.0 * y_const as f64 / n_pairs as f64);
             println!("distinct transfer sets {}, x sets {}, y sets {} (the tree's table: {} pairs)", sets.len(), xsets.len(), ysets.len(), pairs.len());
         }
-        Command::Census { to, max_nodes, exact } => {
+        Command::Census { to, max_nodes, exact, sample } => {
             println!(
-                "arith {} room {}{}: frame new wins total spd.x spd.y spd.x_all spd.y_all bundles rem.x_all rem.y_all",
+                "arith {} room {}{}{}: frame new wins total spd.x spd.y spd.x_all spd.y_all bundles rem.x_all rem.y_all",
                 cfg.arith,
                 room_text(&cfg),
-                if exact { " exact" } else { "" }
+                if exact { " exact" } else { "" },
+                sample.map_or(String::new(), |n| format!(" sample {n}"))
             );
             let each = |f: &celeste_rust::census::Frame| {
                 println!(
@@ -2106,8 +2111,8 @@ fn main() -> Result<()> {
                 )
             };
             match cfg.arith {
-                celeste_rust::settings::Arith::Fixed => celeste_rust::census::run::<celeste_core::arith::Fixed>(&cfg, to, max_nodes, cfg.threads(), exact, each)?,
-                celeste_rust::settings::Arith::Float(_) => celeste_rust::census::run::<celeste_core::arith::Float>(&cfg, to, max_nodes, cfg.threads(), exact, each)?,
+                celeste_rust::settings::Arith::Fixed => celeste_rust::census::run::<celeste_core::arith::Fixed>(&cfg, to, max_nodes, sample, cfg.threads(), exact, each)?,
+                celeste_rust::settings::Arith::Float(_) => celeste_rust::census::run::<celeste_core::arith::Float>(&cfg, to, max_nodes, sample, cfg.threads(), exact, each)?,
             };
         }
         Command::ColCensus { level_dir, frame, cap, cell, erase, every } => {
