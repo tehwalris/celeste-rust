@@ -17,6 +17,9 @@
 #      ~/src/github.com/gonengazit/Celia), LOVE (default /var/tmp/love/squashfs-root/AppRun).
 # CELIA_CAPTURE=DIR (one LEVEL FILE pair): also write every played frame to
 # DIR (capture.lua; tools/compare_video.py --tool celia renders them).
+# CELIA_EXACT=FILE (one LEVEL FILE pair): also write the cart's exact state
+# after every step of the playback to FILE (exact.lua, in
+# tools/uct/exact.lua's format: the float oracle's second ground truth).
 # Each run has its own LOVE save identity (no clash with a concurrent run).
 set -e
 CELIA=${CELIA:-$HOME/src/github.com/gonengazit/Celia}
@@ -31,6 +34,7 @@ sed -i "s/t.identity = \"Celia\"/t.identity = \"$ID\"/" "$RUN/game/conf.lua"
 grep -q "\"$ID\"" "$RUN/game/conf.lua" || { echo "validate.sh: could not set the save identity" >&2; exit 1; }
 cp "$(dirname "$0")/driver.lua" "$RUN/game/celia_driver.lua"
 cp "$(dirname "$0")/capture.lua" "$RUN/game/celia_capture.lua"
+cp "$(dirname "$0")/exact.lua" "$RUN/game/celia_exact.lua"
 cat >> "$RUN/game/main.lua" <<'HOOK'
 
 if os.getenv("CELIA_LEVEL") then
@@ -40,8 +44,11 @@ if os.getenv("CELIA_LEVEL") then
   local orig_update = love.update
   local cap = os.getenv("CELIA_CAPTURE") and require("celia_capture")
   if cap then cap.install(drv) end
+  local exact = os.getenv("CELIA_EXACT") and require("celia_exact")
+  if exact then exact.install(drv) end
   love.update = function(dt)
     if cap and tastool then cap.wrap(tastool) end
+    if exact and tastool then exact.wrap(tastool) end
     orig_update(dt); drv.tas = tastool; drv.tick()
   end
 end

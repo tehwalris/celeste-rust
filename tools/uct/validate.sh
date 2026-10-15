@@ -8,6 +8,9 @@
 #   tools/uct/validate.sh LEVEL FILE.tas [more LEVEL FILE pairs...]
 # UCT_CAPTURE=DIR (one LEVEL FILE pair): also write every played frame to DIR
 # (tools/uct/capture.lua; tools/compare_video.py renders them).
+# UCT_EXACT=FILE (one LEVEL FILE pair): also write the cart's exact state after
+# every update of the playback to FILE (tools/uct/exact.lua: the float oracle's
+# ground truth, tools/uct/golden.py).
 # A playback that DIES before the exit is a failure ("DID NOT FINISH (died
 # ...)"), whatever UCT saved afterwards (driver.lua). UCT_TRACE=1: print the
 # driver's per-update "[trace]" lines (player, balloons); UCT_LOG=1: all of LOVE's output.
@@ -27,7 +30,7 @@ find "$HOME/.local/share/love" -maxdepth 1 -name 'uct-validate-tmp.*' -mmin +144
 cp -r "$UCT/CelesteTAS" "$RUN/game"
 sed -i "s/t.identity=\"CelesteTAS\"/t.identity=\"$ID\"/" "$RUN/game/conf.lua"
 grep -q "\"$ID\"" "$RUN/game/conf.lua" || { echo "validate.sh: could not set the save identity" >&2; exit 1; }
-cp "$(dirname "$0")/driver.lua" "$(dirname "$0")/capture.lua" "$RUN/game/"
+cp "$(dirname "$0")/driver.lua" "$(dirname "$0")/capture.lua" "$(dirname "$0")/exact.lua" "$RUN/game/"
 cat >> "$RUN/game/main.lua" <<'HOOK'
 
 if os.getenv("UCT_LEVEL") then
@@ -38,6 +41,7 @@ if os.getenv("UCT_LEVEL") then
   local orig_update = love.update
   love.update = function(dt) orig_update(dt); drv.tick() end
   if os.getenv("UCT_CAPTURE") then require("capture").install(drv) end
+  if os.getenv("UCT_EXACT") then require("exact").install(drv) end
 end
 HOOK
 mkdir -p "$SAVE/TAS"
