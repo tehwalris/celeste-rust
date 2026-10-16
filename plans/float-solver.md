@@ -1217,3 +1217,60 @@ fragment and validity against `round_fragment`, around the cut below 1).
   over zeros of both signs, subnormals, ties, the cut below 1, overflow;
   points and intervals. Mutations (a tie to the first argument, `f64::min`'s
   corner tie, no cut moves) each fail a test.
+
+### Milestone 5, step 3: the float kernels in the forward (built)
+
+The kernel pipeline is generic: the lattice walk, the binding and the
+lowering take the arithmetic (`trace::kernel`, `trace::emit`,
+`transpile::lower`), and the runtime its lanes (`compiled::KernelLanes`).
+16.16's slot is sixteen `i32` lanes; the doubles' is eight `f64` lanes in
+each of two halves (`Compiled::halves`). The registry, the packing, the dup
+refs, the column-wise emission (keys, position codes, transfers through
+`Rem::transfer`) and the sink's transfer cache read every buffer through
+it, so the slices, the emission and the sink see sixteen lanes of
+`N::Raw` whatever the arithmetic. `compiled::Kernels<N>`: `FrameEngine`
+(16.16) and `FloatKernels`. Every float kernel call checks MXCSR first.
+
+`rewrite forward` and `rewrite search` run the float kernels under `--arith
+float` (`forward --reference`: the reference engine); `ref-check` runs in
+float. One fix on the way: `wave::one_frame` (the diagnostics' `rerun`)
+dropped a seed's own successor against the seed (a player standing still:
+a self-loop), which `ref-check` reported as a kernel soundness gap. It
+forgets the seeds once keyed now.
+
+The checks, room (1,0) to f44 and (1,3) to f46:
+
+| | (1,0) f44 | (1,3) f46 |
+|---|---|---|
+| states (total, last frame) | 500,744, 93,807 | 554,934, 99,317 |
+| `kernel lanes: missed` | 0 | 0 |
+| `--key-check` | clean | clean |
+| `ref-check` (rows sampled at f30/f40/f44, f40/f46) | 0 differ | 0 differ |
+| `arc-check` | 18.2M records, 0 without a transfer, 0 disagree | 17.1M, 0, 0 |
+| float forward wall, kernels (reference engine, M3/M4) | 2.6 s (44.5 min) | 17.5 s with `--key-check` (66 min) |
+
+The kernel trees ARE the reference engine's: `ckhash --edges --hulls`
+of room (1,0) to f44 is equal frame by frame (states, edges and hulls)
+between `forward --arith float` and `forward --arith float --reference`,
+and so is the posgraph line. The state counts are M3/M4's reference-engine
+float numbers exactly. The
+float arc gate's search (`--to 35 --win-at 9,101`) finds the optimum 33 in
+3.1 s, its concrete witness the fixed gate's known route, which survives
+every pruning step.
+
+### Milestone 5, step 4: the float gates (pinned)
+
+Beside the three room (1,0) oracles, their float twins (`check.sh t2`,
+`gate10f-forward` and `gate10f-arc`):
+
+- `gates/float_posgraph_room10_f044.txt` and
+  `gates/float_ckhash_room10_f000-044.txt`: `rewrite forward --arith float
+  --to 44 --room 1,0`'s posgraph line and `ckhash --hulls`;
+- `gates/float_arc_room10_win9-101_h35.txt`: `rewrite search --arith float
+  --to 35 --win-at 9,101 --prefer gates/known_room10_win9-101.txt`'s
+  `[gate]` lines: the support, W at every frame, the arc optimum 33 and
+  the concrete witness (the fixed gate's known route, which survives every
+  pruning step in float too). The same at 3 and 32 threads.
+
+The same re-pinning rule as the fixed gates: only on evidence that the
+sets did not move.

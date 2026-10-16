@@ -160,6 +160,8 @@ t2() {
     mkdir -p "$C/t2"
     step gate10-forward gate10_forward
     step gate10-arc gate10_arc
+    step gate10f-forward gate10f_forward
+    step gate10f-arc gate10f_arc
     step search42-objects search42
     step export-ui export_ui
     step forward60-platforms forward60
@@ -182,6 +184,18 @@ gate10_forward() {
 gate10_arc() {
     ./safe-run.sh -- "$B" search --to 35 --win-at 9,101 --checkpoint-dir "$C/t2/arc10" --prefer gates/known_room10_win9-101.txt --save-marks "$C/t2/arc10-marks" > "$C/t2/arc10.out" || return 1
     grep '^\[gate\]' "$C/t2/arc10.out" | diff gates/arc_room10_win9-101_h35.txt - >&2
+}
+# The same oracles in float (`--arith float`, the doubles' kernels; plans/
+# float-solver.md, milestone 5): the forward's posgraph and fingerprint,
+# and the arc gate's search with its concrete witness.
+gate10f_forward() {
+    ./safe-run.sh -- "$B" forward --arith float --to 44 --room 1,0 --checkpoint-dir "$C/t2/g10f" > "$C/t2/g10f.out" || return 1
+    grep '^posgraph' "$C/t2/g10f.out" | diff gates/float_posgraph_room10_f044.txt - >&2 || return 1
+    ./safe-run.sh -- "$B" ckhash --arith float --to 44 --room 1,0 --hulls --checkpoint-dir "$C/t2/g10f" | diff gates/float_ckhash_room10_f000-044.txt - >&2
+}
+gate10f_arc() {
+    ./safe-run.sh -- "$B" search --arith float --to 35 --win-at 9,101 --checkpoint-dir "$C/t2/arc10f" --prefer gates/known_room10_win9-101.txt > "$C/t2/arc10f.out" || return 1
+    grep '^\[gate\]' "$C/t2/arc10f.out" | diff gates/float_arc_room10_win9-101_h35.txt - >&2
 }
 # The objects ladder (r0sxhn filtering r0sxh) at a synthetic win, its
 # witness as the known route: every level's [gate] lines pinned.

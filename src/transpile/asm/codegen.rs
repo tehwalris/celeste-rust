@@ -251,7 +251,8 @@ pub enum RootKind {
 }
 
 /// How an `Op::Cell` input is packed (absent from the map = `Num`):
-/// `Num` 16 x i32 (64 B); `Bool` a u16 `val` mask at +0 of 64 B (known);
+/// `Num` 16 x i32 (64 B; the doubles' 8 x f64 a half); `Bool` a u16 `val`
+/// mask (the doubles' u8 a half) at +0 of 64 B (known);
 /// `UBool` `val` at +0, `known` at +2 of 64 B; `Ival` `lo` at +0, `hi` at +64.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum CellRepr {
