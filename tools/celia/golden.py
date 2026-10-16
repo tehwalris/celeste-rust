@@ -19,7 +19,7 @@ gates/celia/CAT_LEVEL.trace.zst and a line to gates/celia/manifest.txt:
 
 J is the loading jank of Celia's IL load (`rewrite starts`' `celia`; `-`:
 the first room, which has none). The test (`trace::oracle::tests`) replays
-every line through the float reference engine under `--float-tool celia
+every line through the float reference engine under `--arith float
 --loading-jank J`. A file UCT or Celia errors on is skipped.
 READ THE DIFF before committing: a golden that moved means Celia's run did.
 """

@@ -24,7 +24,7 @@
 //!   * `hulls`   - the hull files: each frame's frontier with its states'
 //!                 layers and remainder hulls
 //!   * `decode`  - rows from (shape skeleton, key, cell)
-//!   * `bench`   - `rewrite bench-frame`'s fingerprints, counters and reports
+//!   * `bench`   - `rewrite bench frame`'s fingerprints, counters and reports
 //!
 //! A state is `(shape, key, cell)` (the key holds no position:
 //! `runtime2::pos_code`) and is named so everywhere (`Sk`): the edges, the

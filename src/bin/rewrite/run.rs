@@ -1,52 +1,72 @@
-//! Runs the game (the reference engine) with a fixed input sequence and
-//! prints the player per frame: the basis for checking a witness against a
-//! real PICO-8 (`pico8_diff/replay.py`, same frame convention).
+//! ONE CONCRETE RUN (`rewrite run`): the reference engine runs an input
+//! sequence from the room's entry, the player printed per frame, or the
+//! start state dumped as a real PICO-8's (`pico8_diff/replay.py --dump`).
 
 use anyhow::Result;
-use celeste_engine::runtime2::{Rt2, AV, NONE};
+use celeste_engine::runtime2::{Rt2, AV, NONE, P8};
 use celeste_rust::concrete::{format_input, num_at, objects_of_type};
-use celeste_rust::pico8_num::Pico8Num;
+use celeste_rust::settings::Settings;
 use celeste_rust::trace::refengine::RefEngine;
-use clap::Parser;
 
-#[derive(Parser)]
-#[command(name = "concrete_run")]
-#[command(
-    about = "Run game with specific input sequence",
-    long_about = "Single-lane concrete execution: the reference engine (the interpreter on the traced cart) runs an input sequence from the start room's entry and prints the player's state each frame. The same inputs on a real PICO-8: pico8_diff/replay.py. The settings (--room, the category, --loading-jank, --balloon-seeds, ...) are the shared flags.",
-    after_long_help = "Examples:\n  target/quick/concrete_run -i 42,0,0,0,0,16,2,2,2,2 -f 10\n  target/quick/concrete_run --room 6,2 --hundred --loading-jank 2 --dump-start -i 0"
-)]
-struct Cli {
-    /// Comma-separated input bytes (e.g., "52,0,0,0,0,0")
-    /// Each byte encodes buttons: bit0=left, bit1=right, bit2=up, bit3=down, bit4=jump, bit5=dash
+/// `run`'s arguments.
+#[derive(clap::Args)]
+pub struct Args {
+    /// Comma-separated input bytes (e.g. "52,0,0,0,0,0"), or a `tas/`
+    /// file: bit 0 left, 1 right, 2 up, 3 down, 4 jump, 5 dash.
     #[arg(short, long)]
     inputs: String,
-
-    /// Number of frames to run (default: length of inputs)
+    /// Frames to run (default: the inputs'; past them, no input).
     #[arg(short, long)]
     frames: Option<u32>,
-
-    /// Also print the first object of this type's number fields each frame
-    /// (e.g. `fly_fruit`: its `step`, `y`, `spd`, `rem`).
+    /// Also print the first object of this type's number fields each
+    /// frame (e.g. `fly_fruit`: its `step`, `y`, `spd`, `rem`).
     #[arg(long)]
     object: Option<String>,
-
-    /// Print the start state (every object's fields, as `pico8_diff/replay.py
-    /// --dump` prints them on a real PICO-8) and exit: the search's room
-    /// entry, to compare field by field with a real chain's
-    /// (`pico8_diff/chain.py --check-start`).
+    /// Print the start state (every object's fields, as
+    /// `pico8_diff/replay.py --dump` prints them on a real PICO-8) and
+    /// exit: the search's room entry, to compare field by field with a
+    /// real chain's (`pico8_diff/chain.py --check-start`).
     #[arg(long)]
     dump_start: bool,
+}
 
-    #[command(flatten)]
-    settings: celeste_rust::settings::SettingsArgs,
+/// `run`: the inputs through the reference engine, the player printed per
+/// frame.
+pub fn run(cfg: &Settings, a: Args) -> Result<()> {
+    let Args { inputs, frames, object, dump_start } = a;
+    let mut eng = RefEngine::new(cfg)?;
+    let mut state = eng.initial()?;
+    if dump_start {
+        dump_start_state(&state);
+        return Ok(());
+    }
+    let inputs = celeste_rust::concrete::read_inputs(&inputs)?;
+    let frames = frames.unwrap_or(inputs.len() as u32);
+    println!("Running {frames} frames with {} inputs", inputs.len());
+    println!("Decoded: {}", inputs.iter().map(|&i| format_input(i)).collect::<Vec<_>>().join(", "));
+    if let Some((x, y)) = first_object(&state, "player_spawn").and_then(|p| position(&state, p)) {
+        println!("Frame 0: player_spawn at ({}, {})", format_num(x), format_num(y));
+    } else if let Some((x, y)) = first_object(&state, "player").and_then(|p| position(&state, p)) {
+        println!("Frame 0: player at ({}, {})", format_num(x), format_num(y));
+    }
+    for f in 1..=frames {
+        let byte = inputs.get(f as usize - 1).copied().unwrap_or(0);
+        let mut out = eng.frame(&state, byte)?;
+        anyhow::ensure!(out.len() == 1, "frame {f}: {} leaves (an `rnd` fork: give the balloons' seeds)", out.len());
+        state = out.remove(0).into_rt2();
+        print_frame(&state, f, byte);
+        if let Some(t) = &object {
+            print_object(&state, t);
+        }
+    }
+    Ok(())
 }
 
 /// The object types `--dump-start` names (pico8_diff/replay.py TYPES).
 const TYPES: &[&str] = &["player", "player_spawn", "spring", "balloon", "fall_floor", "smoke", "fruit", "fly_fruit", "lifeup", "fake_wall", "key", "chest", "platform", "message", "big_chest", "orb", "flag", "room_title"];
 
 /// PICO-8's `tostr(v, true)`: the 16.16 bits as `0xwwww.ffff`.
-fn hex(n: Pico8Num) -> String {
+fn hex(n: P8) -> String {
     let b = n.to_bits();
     format!("0x{:04x}.{:04x}", b >> 16, b & 0xffff)
 }
@@ -76,7 +96,7 @@ fn dump_value(st: &Rt2, c: u32) -> Option<String> {
 }
 
 /// `obj I TYPE k=v ...` per object in `objects` order, keys sorted.
-fn dump_start(st: &Rt2) {
+fn dump_start_state(st: &Rt2) {
     use celeste_engine::runtime2::Cell2;
     let mut names = std::collections::HashMap::new();
     for t in TYPES {
@@ -104,7 +124,7 @@ fn dump_start(st: &Rt2) {
 
 /// Formats as floor.frac_hex, NOT sign-magnitude: `-4.76ec` is
 /// (-4 << 16) | 0x76ec = -3.5355, not -(4 + 0x76ec/65536).
-fn format_num(n: Pico8Num) -> String {
+fn format_num(n: P8) -> String {
     let whole = n.whole_part_as_i16();
     let frac = n.fraction_part_as_u16();
     if frac == 0 {
@@ -118,11 +138,11 @@ fn first_object(st: &Rt2, type_name: &str) -> Option<u32> {
     objects_of_type(st, type_name).first().copied()
 }
 
-fn xy(st: &Rt2, obj: u32, field: &str) -> Option<(Pico8Num, Pico8Num)> {
+fn xy(st: &Rt2, obj: u32, field: &str) -> Option<(P8, P8)> {
     Some((num_at(st, obj, &[field, "x"])?, num_at(st, obj, &[field, "y"])?))
 }
 
-fn position(st: &Rt2, obj: u32) -> Option<(Pico8Num, Pico8Num)> {
+fn position(st: &Rt2, obj: u32) -> Option<(P8, P8)> {
     Some((num_at(st, obj, &["x"])?, num_at(st, obj, &["y"])?))
 }
 
@@ -145,7 +165,7 @@ fn print_object(st: &Rt2, type_name: &str) {
     println!("  {type_name}: {}", parts.join(" "));
 }
 
-fn freeze(st: &Rt2) -> Option<Pico8Num> {
+fn freeze(st: &Rt2) -> Option<P8> {
     let cell = st.globals[celeste_names::global_id("freeze")? as usize];
     match (cell != NONE).then(|| st.cols[cell as usize].at(0))? {
         AV::Num(n) => Some(n),
@@ -157,7 +177,7 @@ fn print_frame(st: &Rt2, frame_num: u32, input_byte: u8) {
     let freeze = freeze(st).map(format_num).unwrap_or("?".to_string());
     let input = format_input(input_byte);
     if let Some((player, (x, y))) = first_object(st, "player").and_then(|p| Some((p, position(st, p)?))) {
-        let (spd_x, spd_y) = xy(st, player, "spd").unwrap_or((Pico8Num::from_i16(0), Pico8Num::from_i16(0)));
+        let (spd_x, spd_y) = xy(st, player, "spd").unwrap_or((P8::from_i16(0), P8::from_i16(0)));
         let rem = match xy(st, player, "rem") {
             Some((rx, ry)) => format!(" rem=({}, {})", format_num(rx), format_num(ry)),
             None => String::new(),
@@ -173,63 +193,5 @@ fn print_frame(st: &Rt2, frame_num: u32, input_byte: u8) {
         println!("Frame {frame_num}: player_spawn at ({}, {}) freeze={freeze} input={input}", format_num(x), format_num(y));
     } else {
         println!("Frame {frame_num}: no player/player_spawn found, freeze={freeze} input={input}");
-    }
-}
-
-fn main() -> Result<()> {
-    let cli = Cli::parse();
-    let cfg = celeste_rust::settings::startup(&cli.settings, false, |_| {})?;
-    if cli.dump_start {
-        dump_start(&RefEngine::new(&cfg)?.initial()?);
-        return Ok(());
-    }
-
-    let inputs: Vec<u8> = cli
-        .inputs
-        .split(',')
-        .map(|s| s.trim().parse::<u8>().expect("Invalid input byte"))
-        .collect();
-
-    let num_frames = cli.frames.unwrap_or(inputs.len() as u32);
-
-    println!("Running {} frames with {} inputs", num_frames, inputs.len());
-    println!("Input sequence: {:?}", inputs);
-    println!("Decoded: {}", inputs.iter().map(|&i| format_input(i)).collect::<Vec<_>>().join(", "));
-    println!();
-
-    println!("Running game init...");
-    let mut eng = RefEngine::new(&cfg)?;
-    let mut state = eng.initial()?;
-    println!("Init complete.\n");
-
-    if let Some((x, y)) = first_object(&state, "player_spawn").and_then(|p| position(&state, p)) {
-        println!("Frame 0: player_spawn at ({}, {})", format_num(x), format_num(y));
-    } else if let Some((x, y)) = first_object(&state, "player").and_then(|p| position(&state, p)) {
-        println!("Frame 0: player at ({}, {})", format_num(x), format_num(y));
-    }
-
-    for frame_num in 1..=num_frames {
-        let input_byte = inputs.get(frame_num as usize - 1).copied().unwrap_or(0);
-        state = eng.step_one(&state, input_byte)?.into_rt2();
-        print_frame(&state, frame_num, input_byte);
-        if let Some(t) = &cli.object {
-            print_object(&state, t);
-        }
-    }
-
-    Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    /// The command line is well-formed: no flag defined twice (a
-    /// subcommand's own against the shared settings), every one parseable
-    /// (`clap`'s debug assertions, which a release build skips).
-    #[test]
-    fn the_command_line_is_well_formed() {
-        use clap::CommandFactory;
-        let cmd = super::Cli::command();
-        assert_eq!(celeste_rust::settings::duplicate_flags(&cmd), Vec::<String>::new(), "flags defined twice");
-        cmd.debug_assert();
     }
 }

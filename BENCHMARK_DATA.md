@@ -15,7 +15,7 @@ level -1 table at startup) are in plans/devloop.md.
 
 ## The pinned frames (exact)
 
-`bench-frame --metrics` of the fixtures (`check.sh` t1 and big; the pins
+`bench frame --metrics` of the fixtures (`check.sh` t1 and big; the pins
 in `gates/fixtures/NAME.metrics` and `NAME.frame`). The kernels are
 straight-line code, so their dynamic instruction count is exact (call-outs'
 callees aside). "in" is the frame's expanded states.
@@ -29,7 +29,7 @@ callees aside). "in" is the frame's expanded states.
 | r62h57 (big) | (6,2) 100% `r0sxhf`, level -1 (94,5) | f56 -> f57 | 704,524 | 18,601,288 | 800,821 | 18,601,288 | 4.54 MB | 258.1M | 44,239 | `140b7028` 2026-10-16 |
 
 The kernels are ~2-3% of a hot frame's work; the rest is emission, unit
-ends, re-pushes and the region phase (`bench-frame`'s `[cost]` lines).
+ends, re-pushes and the region phase (`bench frame`'s `[cost]` lines).
 The float twins (`f10`, `f42n`) are pinned by their f/h/e lines only (the
 kernel census is 16.16's); plans/float.md has their costs.
 

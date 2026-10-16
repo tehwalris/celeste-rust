@@ -447,30 +447,11 @@ fn region_hash<C: Circle>(r: RegionRef<C>) -> u64 {
     hs.finish()
 }
 
-/// Run `f(lo, hi)` over `0..n` in chunks of `chunk` on `threads` workers;
-/// the results in chunk order.
+/// Run `f(lo, hi)` over `0..n` in chunks of `chunk` on `threads` workers
+/// (`par::Pool`); the results in chunk order.
 fn par_chunks<T: Send>(n: usize, chunk: usize, threads: usize, f: impl Fn(usize, usize) -> T + Sync) -> Vec<T> {
-    let next = std::sync::atomic::AtomicUsize::new(0);
-    let workers = threads.max(1).min(n.div_ceil(chunk.max(1))).max(1);
-    let mut parts: Vec<(usize, T)> = std::thread::scope(|sc| {
-        let hs: Vec<_> = (0..workers)
-            .map(|_| {
-                sc.spawn(|| {
-                    let mut out = Vec::new();
-                    loop {
-                        let lo = next.fetch_add(chunk, std::sync::atomic::Ordering::Relaxed);
-                        if lo >= n {
-                            return out;
-                        }
-                        out.push((lo, f(lo, (lo + chunk).min(n))));
-                    }
-                })
-            })
-            .collect();
-        hs.into_iter().flat_map(|h| h.join().expect("a worker panicked")).collect()
-    });
-    parts.sort_unstable_by_key(|p| p.0);
-    parts.into_iter().map(|p| p.1).collect()
+    let chunk = chunk.max(1);
+    crate::par::Pool::new(threads).map(n.div_ceil(chunk), |c| Ok(f(c * chunk, ((c + 1) * chunk).min(n)))).expect("an infallible map")
 }
 
 /// State ranges `[bounds[k], bounds[k + 1])` cutting `total` states into
@@ -521,7 +502,7 @@ pub fn backward<N: Rem>(store: &EdgeStore<N>, pairs: &[Xfer<N>], wins: &[(Sk, u3
 
 /// The backward between two frames: `W_{t+1}` (the frame done last), which
 /// of its sets changed there, and the spans closed so far. `rewrite
-/// bench-backward` times one `step`.
+/// bench backward` times one `step`.
 pub struct Backward<'a, N: Rem = P8> {
     store: &'a EdgeStore<N>,
     /// Per target region the first frame with edges into it.
@@ -1280,7 +1261,7 @@ impl<'a, N: Rem> ReachEdges<'a, N> {
 /// Sound as a filter where `W`'s deadline is: a concrete winning path's
 /// remainder at frame `t` is in `W_t` of its node (W holds every winner)
 /// and is the image of its remainder at `t - 1` along the recorded edge (the
-/// arc model `arc-check` probes), so by induction it is in `R_t`. Tighter:
+/// arc model `check arcs` probes), so by induction it is in `R_t`. Tighter:
 /// a node `W` lets win from some remainder no path from the start brings is
 /// not marked.
 ///
@@ -1480,7 +1461,7 @@ pub struct Witness {
 }
 
 impl Witness {
-    /// The inputs as a comma list (`concrete_run -i`, `pico8_diff/replay.py`).
+    /// The inputs as a comma list (`rewrite run -i`, `pico8_diff/replay.py`).
     pub fn inputs_text(&self) -> String {
         self.inputs.iter().map(|b| b.to_string()).collect::<Vec<_>>().join(",")
     }
@@ -1778,80 +1759,62 @@ pub fn concrete_search<N: Rem>(
     for k in 0..frames {
         let t = std::time::Instant::now();
         let t_w = spf * (k + 1);
+        // In chunks of 16 parents, a reference engine per worker (each
+        // takes a free one: as many as workers), successors in chunk order.
         const CHUNK: usize = 16;
-        let next_chunk = std::sync::atomic::AtomicUsize::new(0);
-        let parts: Vec<Result<(Vec<(usize, Vec<Succ<N>>)>, u64)>> = std::thread::scope(|sc| {
-            let hs: Vec<_> = engines
-                .iter()
-                .map(|engine| {
-                    let (cur, next_chunk) = (&cur, &next_chunk);
-                    sc.spawn(move || -> Result<(Vec<(usize, Vec<Succ<N>>)>, u64)> {
-                        let mut eng = engine.lock().expect("an engine");
-                        let (mut out, mut steps) = (Vec::new(), 0u64);
-                        loop {
-                            let lo = next_chunk.fetch_add(CHUNK, std::sync::atomic::Ordering::Relaxed);
-                            if lo >= cur.len() {
-                                return Ok((out, steps));
+        let parts: Vec<(Vec<Succ<N>>, u64)> = crate::par::Pool::new(engines.len()).map_with(
+            cur.len().div_ceil(CHUNK),
+            || engines.iter().find_map(|e| e.try_lock().ok()).ok_or_else(|| anyhow::anyhow!("no free reference engine")),
+            |eng, c| {
+                let lo = c * CHUNK;
+                let (mut got, mut steps) = (Vec::new(), 0u64);
+                // Dedup within the chunk already (the first in order, as
+                // the merge keeps it): most successors are repeats.
+                let mut chunk_seen: FxHashSet<celeste_engine::exact::ExactRow> = FxHashSet::default();
+                'chunk: for (p, row) in cur.iter().enumerate().skip(lo).take(CHUNK) {
+                    let mut ran = Covered::default();
+                    for byte in input_order(prefer, k) {
+                        if ran.covers(byte) {
+                            continue;
+                        }
+                        let (succ, read) = eng.frame_reads(row, byte).map_err(|e| e.context(format!("the frame after layer {k} with input {byte}")))?;
+                        ran.push(byte, read);
+                        for b in succ {
+                            steps += 1;
+                            let cell = b.positions()?[0];
+                            // Dedup on the EXACT state, never the level's
+                            // widened key (`exact_state`).
+                            let exact = exact_state(&b, cell);
+                            let win = wins_of(b.rt2(), s)?.iter().any(|&x| x);
+                            if !win && chunk_seen.contains(&exact) {
+                                continue;
                             }
-                            // Dedup within the chunk already (the first in
-                            // order, as the merge keeps it): most successors
-                            // are repeats.
-                            let mut got = Vec::new();
-                            let mut chunk_seen: FxHashSet<celeste_engine::exact::ExactRow> = FxHashSet::default();
-                            'chunk: for (p, row) in cur.iter().enumerate().skip(lo).take(CHUNK) {
-                                let mut ran = Covered::default();
-                                for byte in input_order(prefer, k) {
-                                    if ran.covers(byte) {
-                                        continue;
-                                    }
-                                    let (succ, read) = eng.frame_reads(row, byte).map_err(|e| e.context(format!("the frame after layer {k} with input {byte}")))?;
-                                    ran.push(byte, read);
-                                    for b in succ {
-                                        steps += 1;
-                                        let cell = b.positions()?[0];
-                                        // Dedup on the EXACT state, never the level's
-                                        // widened key (`exact_state`).
-                                        let exact = exact_state(&b, cell);
-                                        let win = wins_of(b.rt2(), s)?.iter().any(|&x| x);
-                                        if !win && chunk_seen.contains(&exact) {
-                                            continue;
-                                        }
-                                        if !win {
-                                            let (shape, nk, cells) = lookup_keys(&b, level, seeded, keys)?;
-                                            let Some(i) = node.get(shape, nk[0], cells[0]) else { continue };
-                                            let q = rem_of::<N>(b.rt2())?;
-                                            if !w.at(t_w, i).is_some_and(|r| r.contains(q.0, q.1)) {
-                                                continue;
-                                            }
-                                        }
-                                        chunk_seen.insert(exact.clone());
-                                        // A win keeps no state (only its link), and the chunk
-                                        // ends at its first: the earliest win (chunks merge in
-                                        // order) ends the search. Every successor of the last
-                                        // layer can win - kept whole, room (4,3) 100% reached
-                                        // 100 GB there.
-                                        got.push(Succ { parent: p as u32, byte, cell, win, exact, row: (!win).then(|| b.into_rt2()) });
-                                        if win {
-                                            break 'chunk;
-                                        }
-                                    }
+                            if !win {
+                                let (shape, nk, cells) = lookup_keys(&b, level, seeded, keys)?;
+                                let Some(i) = node.get(shape, nk[0], cells[0]) else { continue };
+                                let q = rem_of::<N>(b.rt2())?;
+                                if !w.at(t_w, i).is_some_and(|r| r.contains(q.0, q.1)) {
+                                    continue;
                                 }
                             }
-                            out.push((lo, got));
+                            chunk_seen.insert(exact.clone());
+                            // A win keeps no state (only its link), and the chunk
+                            // ends at its first: the earliest win (chunks merge in
+                            // order) ends the search. Every successor of the last
+                            // layer can win - kept whole, room (4,3) 100% reached
+                            // 100 GB there.
+                            got.push(Succ { parent: p as u32, byte, cell, win, exact, row: (!win).then(|| b.into_rt2()) });
+                            if win {
+                                break 'chunk;
+                            }
                         }
-                    })
-                })
-                .collect();
-            hs.into_iter().map(|h| h.join().expect("a concrete worker panicked")).collect()
-        });
-        let mut chunks: Vec<(usize, Vec<Succ<N>>)> = Vec::new();
-        for p in parts {
-            let (c, s) = p?;
-            chunks.extend(c);
-            steps += s;
-        }
-        chunks.sort_unstable_by_key(|c| c.0);
-        let succs = chunks.into_iter().flat_map(|c| c.1);
+                    }
+                }
+                Ok((got, steps))
+            },
+        )?;
+        steps += parts.iter().map(|p| p.1).sum::<u64>();
+        let succs = parts.into_iter().flat_map(|p| p.0);
         // Each exact state once, in order; the first win ends the search.
         let mut seen: FxHashSet<celeste_engine::exact::ExactRow> = FxHashSet::default();
         let (mut next, mut links): (Vec<Rt2<N>>, Vec<(u32, u8, u32)>) = (Vec::new(), Vec::new());
@@ -1935,7 +1898,7 @@ pub struct Arcs<N: Rem = P8> {
 
 /// One node's term of the gate's `W f{t}` line: the node's content hash
 /// (`exact::ContentHash::state`) folded with its set's rectangles
-/// (`rewrite bench-backward` prints the same line for one frame).
+/// (`rewrite bench backward` prints the same line for one frame).
 pub fn gate_w_hash<C: Circle>(node: u64, r: RegionRef<C>) -> u64 {
     use celeste_engine::runtime2::mix64;
     let mut h = node;

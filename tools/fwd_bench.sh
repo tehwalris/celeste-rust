@@ -1,7 +1,7 @@
 #!/bin/bash
 # THE FORWARD FRAME BENCHMARK (plans/devloop.md): one forward frame F ->
 # F+1 of a fixture tree, run as the forward runs it - the wave (units and
-# region jobs), the frame's end and the checkpoint (`rewrite bench-frame
+# region jobs), the frame's end and the checkpoint (`rewrite bench frame
 # --edges --checkpoint --reps N`) - its output checked against the
 # fixture's PIN (`f`/`h`/`e`/`b` lines: the new states, the frontier's
 # hulls, the edges by content, every file's bytes) and its COST REPORT
@@ -62,15 +62,17 @@ run_one() {
     local name=$1 reps=${2:-3}
     local dir=$ROOT/$name
     [[ -f $dir/fixture.txt ]] || { echo "[fwd_bench] $name: no fixture (tools/fwd_bench.sh make $name F -- FLAGS)" >&2; exit 1; }
-    local f flags
+    local f l1
     f=$(awk '$1 == "frame" {print $2}' "$dir/fixture.txt")
-    flags=$(sed -n 's/^flags //p' "$dir/fixture.txt")
+    # The tree's settings are its record's; only its pinned level -1 table
+    # is passed on.
+    l1=$(sed -n 's/^flags //p' "$dir/fixture.txt" | grep -o -- '--l1-table [^ ]*' || true)
     mkdir -p "$dir/runs"
     local log
     log=$dir/runs/$(date +%Y%m%d-%H%M%S).log
     echo "[fwd_bench] $name: f$f -> f$((f + 1)), $reps reps, $TH threads, $B; load $(cut -d' ' -f1-3 /proc/loadavg); log $log" >&2
     # shellcheck disable=SC2086
-    ./safe-run.sh --memory "$MEM" -- "$B" bench-frame --level-dir "$dir" --frame "$f" --edges --checkpoint --reps "$reps" --threads "$TH" $flags \
+    ./safe-run.sh --memory "$MEM" -- "$B" bench frame --tree "$dir" --frame "$f" --edges --checkpoint --reps "$reps" --threads "$TH" $l1 \
         > "$log.out" 2> "$log" || { tail -5 "$log" >&2; echo "[fwd_bench] $name: FAILED" >&2; exit 1; }
     grep -E '^[fheb][0-9]{3} ' "$log.out" > "$log.lines" || true
     local pin

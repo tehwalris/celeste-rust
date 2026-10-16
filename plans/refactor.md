@@ -21,6 +21,12 @@ Measured on `docs-refresh` after merging develop `0765e7c5`. Lines are
 | S10 | the help bug (in C1); one DFS budget (`arc_dp::DFS_BUDGET`, 200k: the dual's pairs count both halves' leaves, so 2x: the 400k was that); stale docs: `arc_dp`'s "an edge enters a layer <= f", `search/mod.rs`'s module list (checkpoint files as row pieces), "The forward frame" citations | ~0 |
 | C4 | `bench-storage`, `--emit-capture`, the capture writers and the replay (`storage::bench`, the sinks' rowless mode), the `cap-r10`/`cap-r62h57` fixtures; every frame step runs `bench-frame --checkpoint`, its `b` line (the bytes of the frame's files) pinned from develop's binary for all seven frames | -364 Rust, -31 shell |
 | C5 (done) | the kernel mix report (`--kernel-mix DIR`, its files, guard families, leaf classes, the spike-fold and fold estimates) and tools/kernel_mix.py; `compiled::mix` is the census the `--metrics` pins read, byte-identical (the per-instruction categories stay: they pin the codegen's mix for R2's slices) | -545 Rust, -276 Python |
+| C6 (R1's half) | `concrete_run` is `rewrite run` (`-i` takes a `tas/` file too); whole frames under `--split-frame`; a frame that forks is an error; callers: chain.py `--check-start REWRITE`, CLAUDE.md, 62 `tas/` headers. `transpile` is R2's | -43 Rust |
+| S1 | the search's driver in the library (`search::driver`: `search::run(&SearchSpec) -> SearchResult`, `search::check_known`); one driver for the search and the dual search (`run_levels` builds a level's kernels and start itself); the binary prints the verdict and maps it to the exit code (`report`) | -43 Rust (rewrite.rs -363) |
+| S8 | settings from one table: `Settings` is the flags' struct (clap derive: one field list, its docs, defaults and parsers; `Default` the flags' defaults), and `rows` gives the record, the startup log, the level -1 cache key and the record read back (`Settings::of_tree`, for S2); `--float-tool` folded into `--arith fixed\|float\|float-celia\|float-uct` (the record's text) | +21 Rust (with `of_tree` and its test) |
+| perf fix | `out::Block::entries` hands the re-push a named iterator (`OutBundles`), not a `dyn Iterator`: C4's edits had stopped LLVM devirtualizing it (+0.6-0.75% instructions, bisected) | +25 Rust |
+| S2 | the commands that read a finished tree (`ckhash`, `census`, `spurious`, `export-ui`, `check ...`, `bench ...`) take `--tree DIR` (or a search's `--checkpoint-dir`) and their settings, level, level -1 filter and last frame from the tree's records (`search::tree::TreeDir`, `Settings::of_tree`), refusing them as flags; `check known` the levels and horizon from `result.json`; one row selector (`Rows`: `--frame`, `--cell`); the `check` (ref, arcs, widen, known, replay) and `bench` (frame, backward) groups; rewrite.rs split into src/bin/rewrite/{main,check,bench,diag,run,l1}.rs | +222 Rust (the binary in six modules: +159; `TreeDir` 43), -6 shell |
+| S7 | one worker pool: `wave::par_map`, `arc_dp::par_chunks` (helpers kept, three lines each on `par::Pool`), `check arcs`' sampler, `EdgeStore::par_scan`/`par_blocks` (an accumulator a segment), the decode check, the spool test, and the concrete and dual searches' breadth-first layers (`map_with`, each worker taking a free engine) on `par::Pool`; left hand-rolled, with reasons: the wave's pipeline (a scheduler: per-worker sinks, region jobs, gathering), the out/edge file writer threads, the backward's budgeted read round, the big-stack builder threads (frame.rs turns a panic into a recorded refusal), the memory sampler | -111 Rust |
 
 ## SIZE
 
@@ -71,6 +77,10 @@ transcripts since 2026-10-12 ("runs"; approximate). Marks: **core**,
 (duplicate of X).
 
 ### `rewrite` subcommands (30)
+
+As they were before R1 (its Progress table says what went; the checks and
+benchmarks are now `check ref|arcs|widen|known|replay` and `bench
+frame|backward`, `concrete_run` is `rewrite run`).
 
 | command | purpose | evidence | mark |
 |---|---|---|---|
@@ -207,14 +217,14 @@ Concrete simplification candidates, ordered by lines saved x safety
 
 | # | candidate | where | saves | risk |
 |---|---|---|---|---|
-| S1 | **The search's driver lives in the binary**: `run_levels`, `search`, `dual`, `check_known`, `search_record` (~350 lines) belong in the library as `search::run(&SearchSpec) -> SearchResult`; the binary prints and maps verdicts to exit codes. `filtered_for.txt` is written by the binary. | bin/rewrite.rs 1054-1435 | ~150 | low (t2) |
-| S2 | **A `Tree` handle** for read-only commands: settings, level, filter and last frame from the tree's own records; one row selector; `--room`/`--level` refused on diagnostics (today restated in every call, and several commands do not check them at all) | rewrite.rs (`tree_of`, ~18 loads, 4 last-frame loops), check.sh, fixtures.sh | ~200 | low |
+| S1 (done) | **The search's driver lives in the binary**: `run_levels`, `search`, `dual`, `check_known`, `search_record` (~350 lines) belong in the library as `search::run(&SearchSpec) -> SearchResult`; the binary prints and maps verdicts to exit codes. `filtered_for.txt` is written by the binary. | bin/rewrite.rs 1054-1435 | ~150 | low (t2) |
+| S2 (done) | **A `Tree` handle** for read-only commands: settings, level, filter and last frame from the tree's own records; one row selector; `--room`/`--level` refused on diagnostics (today restated in every call, and several commands do not check them at all) | rewrite.rs (`tree_of`, ~18 loads, 4 last-frame loops), check.sh, fixtures.sh | ~200 | low |
 | S3 | **One concrete search** for one engine and for a pair: `dual::search` repeats `arc_dp::concrete_search`'s DFS-then-BFS, memo and input classes (and its own budget) | search/dual.rs (484), arc_dp.rs (~260) | ~250 | medium (arc gate witness, dual gate) |
 | S4 | **arc_dp.rs split** into the backward, reach and the concrete search; its module doc is stale ("an edge enters a layer <= f" is false for hull trees; `search/mod.rs` still describes checkpoint files as row pieces) | search/arc_dp.rs | ~0 (clarity) | none |
 | S5 | **The remainder model twice**: `rem::Rem` is ~25 forwarding methods; `rem_f64` re-implements the hull's two-chart arcs and the transfer decode for a 2^64 circle. One hull and transfer generic over the circle's point type | search/rem.rs (318), rem_f64.rs (878), hull.rs (560), arc_edges.rs (322) | ~350 | medium (fixed bytes, float gates) |
 | S6 | **Four file formats, four block codecs**: frame, hull, edge and out files each write their own header, zstd blocks, varints and read-back check | storage/layer.rs, hulls.rs, edges.rs, bundle.rs, out.rs | ~250 | medium (`b` lines pin the bytes) |
-| S7 | **One worker pool**: `par::Pool` exists, yet 48 `thread::scope`/spawn sites in 14 files hand-roll the atomic cursor, big stacks and ordered results | storage/wave.rs, decode.rs, edges.rs, spool.rs, search/arc_dp.rs, arc_check.rs, dual.rs, census.rs, trace/* | ~150 | low (determinism pins) |
-| S8 | **Settings written four times** (struct, clap args, `recorded()`, `startup`'s log): table-driven | settings.rs | ~80 | low |
+| S7 (done in R1's files) | **One worker pool**: `par::Pool` exists, yet 48 `thread::scope`/spawn sites in 14 files hand-roll the atomic cursor, big stacks and ordered results | storage/wave.rs, decode.rs, edges.rs, spool.rs, search/arc_dp.rs, arc_check.rs, dual.rs, census.rs, trace/* | ~150 | low (determinism pins) |
+| S8 (done) | **Settings written four times** (struct, clap args, `recorded()`, `startup`'s log): table-driven | settings.rs | ~80 | low |
 | S9 | **Steps vs frames**: the split frame's steps leak into the tree, the marks, level -1's H and `Found.frame`; the split cart is a 939-line near-copy of the minimal cart, not a patch | frame.rs, search/*, lua/celeste-minimal-split.lua | ~100 Rust + the Lua twin generated | medium (the split cart's text feeds the traces) |
 | S10 (done, but `trace/refdriver.rs`: R2's) | **Small bugs and stale bits**: `rewrite --help` shows `check-known`'s text under `reach` (a doc comment in the wrong place) and none for `check-known`; `refdriver.rs`'s error names a deleted doc; DFS budgets 200k vs 400k; stale section names in comments | rewrite.rs, trace/refdriver.rs, search/* | ~20 | none |
 | S11 | **Cart patches written twice** (Rust and replay.py, with different semantics) and the move of pico8_diff/ into tools/ | trace/cart.rs, pico8_diff/replay.py | ~60 Python | medium (replays) |

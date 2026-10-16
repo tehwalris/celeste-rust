@@ -1,4 +1,4 @@
-//! THE TRANSFERS AGAINST THE REFERENCE ENGINE (`rewrite arc-check`), in
+//! THE TRANSFERS AGAINST THE REFERENCE ENGINE (`rewrite check arcs`), in
 //! either arithmetic: every record of frames `from..=to` has a transfer
 //! (completeness), and a sample of them, per frame, is probed. From the
 //! record's source row at a remainder INSIDE its guards (their corners and
@@ -133,8 +133,8 @@ pub fn run<N: Rem>(o: &Opts) -> Result<()> {
                     Some((cx, cy)) => {
                         let at = |c: usize| -> Result<Point<N>> {
                             match blk.rt2().cols[c].at(0) {
-                                AV::Num(n) => N::point(n).ok_or_else(|| anyhow!("arc-check: a remainder {n:?} outside [-1/2, 1/2)")),
-                                other => anyhow::bail!("arc-check: a concrete remainder expected, got {other:?}"),
+                                AV::Num(n) => N::point(n).ok_or_else(|| anyhow!("check arcs: a remainder {n:?} outside [-1/2, 1/2)")),
+                                other => anyhow::bail!("check arcs: a concrete remainder expected, got {other:?}"),
                             }
                         };
                         Some((at(cx)?, at(cy)?))
@@ -188,13 +188,13 @@ pub fn run<N: Rem>(o: &Opts) -> Result<()> {
             let stray: Vec<(Point<N>, Point<N>)> = succs.iter().filter(|(id, _)| *id == target).filter_map(|(_, q)| *q).filter(|q| !pair.iter().any(|o| predicts::<N::C>(&o.t, p, Some(*q)))).collect();
             if !stray.is_empty() {
                 o.unpredicted += 1;
-                o.msgs.push(format!("[arc-check] f{frame} pred {} -> {}: inside {p:?} the reference reaches the target at {stray:?}, which no record of the pair taking the point predicts", src.show(), r.target.show()));
+                o.msgs.push(format!("[check arcs] f{frame} pred {} -> {}: inside {p:?} the reference reaches the target at {stray:?}, which no record of the pair taking the point predicts", src.show(), r.target.show()));
             }
             if !ok {
                 o.inside_bad += 1;
                 let reached: Vec<&Option<(Point<N>, Point<N>)>> = succs.iter().filter(|(id, _)| *id == target).map(|(_, q)| q).collect();
                 o.msgs.push(format!(
-                    "[arc-check] f{frame} pred {} -> {}: inside {p:?} the transfer x {:?} y {:?} predicts ({:?}, {:?}); the reference reaches the target with remainders {reached:?}",
+                    "[check arcs] f{frame} pred {} -> {}: inside {p:?} the transfer x {:?} y {:?} predicts ({:?}, {:?}); the reference reaches the target with remainders {reached:?}",
                     src.show(),
                     r.target.show(),
                     r.t.0,
@@ -223,7 +223,7 @@ pub fn run<N: Rem>(o: &Opts) -> Result<()> {
                 o.steps += steps;
                 if succs.iter().any(|(id, _)| *id == target) {
                     o.outside_bad += 1;
-                    o.msgs.push(format!("[arc-check] f{frame} pred {} -> {}: OUTSIDE every guard of the pair at {p:?}, the reference reaches the target", src.show(), r.target.show()));
+                    o.msgs.push(format!("[check arcs] f{frame} pred {} -> {}: OUTSIDE every guard of the pair at {p:?}, the reference reaches the target", src.show(), r.target.show()));
                 }
             }
         }
@@ -255,38 +255,27 @@ pub fn run<N: Rem>(o: &Opts) -> Result<()> {
         // engine per worker), reported in record order.
         let stride = (recs.len() / o.samples.max(1)).max(1);
         let picked: Vec<&Rec<N>> = recs.iter().step_by(stride).take(o.samples).collect();
-        let next = std::sync::atomic::AtomicUsize::new(0);
-        let mut done: Vec<(usize, Sampled)> = std::thread::scope(|sc| {
-            let hs: Vec<_> = (0..workers.min(picked.len()))
-                .map(|_| {
-                    sc.spawn(|| -> Result<Vec<(usize, Sampled)>> {
-                        let mut eng = ReferenceEngine::<N::A>::new(cfg)?;
-                        if let Some(cap) = o.path_cap {
-                            eng.set_path_cap(cap);
-                        }
-                        let mut out = Vec::new();
-                        loop {
-                            let k = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            let Some(r) = picked.get(k) else { return Ok(out) };
-                            match check(&mut eng, frame, r, &recs) {
-                                Ok(o) => out.push((k, o)),
-                                Err(e) if e.downcast_ref::<crate::trace::refdriver::TooManyPaths>().is_some() => {
-                                    let msg = format!("[arc-check] f{frame} pred {} -> {}: SKIPPED ({e})", r.src.show(), r.target.show());
-                                    out.push((k, Sampled { skipped: 1, msgs: vec![msg], ..Default::default() }));
-                                }
-                                Err(e) => return Err(e),
-                            }
-                        }
-                    })
-                })
-                .collect();
-            hs.into_iter().map(|h| h.join().expect("an arc-check worker panicked")).collect::<Result<Vec<_>>>()
-        })?
-        .into_iter()
-        .flatten()
-        .collect();
-        done.sort_by_key(|d| d.0);
-        for (_, o) in done {
+        let done: Vec<Sampled> = crate::par::Pool::new(workers).map_with(
+            picked.len(),
+            || {
+                let mut eng = ReferenceEngine::<N::A>::new(cfg)?;
+                if let Some(cap) = o.path_cap {
+                    eng.set_path_cap(cap);
+                }
+                Ok(eng)
+            },
+            |eng, k| {
+                let r = picked[k];
+                match check(eng, frame, r, &recs) {
+                    Err(e) if e.downcast_ref::<crate::trace::refdriver::TooManyPaths>().is_some() => {
+                        let msg = format!("[check arcs] f{frame} pred {} -> {}: SKIPPED ({e})", r.src.show(), r.target.show());
+                        Ok(Sampled { skipped: 1, msgs: vec![msg], ..Default::default() })
+                    }
+                    other => other,
+                }
+            },
+        )?;
+        for o in done {
             for m in &o.msgs {
                 eprintln!("{m}");
             }
@@ -301,7 +290,7 @@ pub fn run<N: Rem>(o: &Opts) -> Result<()> {
             total.steps += o.steps;
         }
         eprintln!(
-            "[arc-check] f{frame:03}: {} records, {missing} without a transfer; so far inside {} ({} bad, {} unpredicted), outside {} ({} bad), {} ref steps, {:.1} s",
+            "[check arcs] f{frame:03}: {} records, {missing} without a transfer; so far inside {} ({} bad, {} unpredicted), outside {} ({} bad), {} ref steps, {:.1} s",
             recs.len(),
             total.inside,
             total.inside_bad,
@@ -312,12 +301,12 @@ pub fn run<N: Rem>(o: &Opts) -> Result<()> {
             t0.elapsed().as_secs_f64()
         );
     }
-    println!("arc-check f{}-f{to}: {records_total} records; transfers per axis {kinds:?}", o.from);
+    println!("check arcs f{}-f{to}: {records_total} records; transfers per axis {kinds:?}", o.from);
     println!("completeness: {missing_total} recorded edges without a transfer");
     println!(
         "agreement: {sampled} sampled records ({} from a row without a player, {} SKIPPED over the path cap); inside the guard {} probes, {} disagree, {} reach the target unpredicted; outside every guard {} probes, {} reach the target; {} reference steps",
         total.no_player, total.skipped, total.inside, total.inside_bad, total.unpredicted, total.outside, total.outside_bad, total.steps
     );
-    anyhow::ensure!(missing_total == 0 && total.inside_bad == 0 && total.unpredicted == 0 && total.outside_bad == 0, "arc-check: disagreement");
+    anyhow::ensure!(missing_total == 0 && total.inside_bad == 0 && total.unpredicted == 0 && total.outside_bad == 0, "check arcs: disagreement");
     Ok(())
 }

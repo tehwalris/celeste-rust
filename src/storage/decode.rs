@@ -390,9 +390,7 @@ pub fn check_piece<N: EngineNum>(keys: &KeySpace<N>, rt2: &Rt2<N>, cells: &[u32]
     if rt2.width <= size {
         return chunk(0);
     }
-    std::thread::scope(|scope| {
-        let hs: Vec<_> = (0..rt2.width).step_by(size).map(|lo| scope.spawn(move || chunk(lo))).collect();
-        hs.into_iter().map(|h| h.join().expect("a decode check panicked")).collect::<Result<Vec<()>>>()
-    })?;
+    let n = rt2.width.div_ceil(size);
+    crate::par::Pool::new(n).map(n, |k| chunk(k * size))?;
     Ok(())
 }

@@ -5,7 +5,7 @@
 # (frame::win_rect). On a real PICO-8 the player is at (55,44) at f55, and
 # outside the rect at every earlier frame.
 #
-# Input bytes for concrete_run (-i) / pico8_diff/replay.py --room 6,3, one
+# Input bytes for rewrite run (-i) / pico8_diff/replay.py --room 6,3, one
 # per frame starting at frame 1. bit0=left bit1=right bit2=up bit3=down
 # bit4=jump bit5=dash.
 #

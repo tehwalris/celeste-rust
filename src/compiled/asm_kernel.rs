@@ -224,7 +224,7 @@ struct AsmKernel<N: KernelLanes = P8> {
     fused_nodes: usize,
     /// Per input cell, its traced path (named by packing failures).
     input_names: Vec<String>,
-    /// `bench-frame --metrics`: the slices this kernel ran (`compiled::mix`).
+    /// `bench frame --metrics`: the slices this kernel ran (`compiled::mix`).
     mix_slices: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
 }
 

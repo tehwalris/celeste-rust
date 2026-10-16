@@ -1,6 +1,6 @@
 # Room (2,0) "300 m" exit witness for celeste-minimal, derived 2026-08-15.
 #
-# Input bytes for concrete_run (-i), one per frame starting at frame 1.
+# Input bytes for rewrite run (-i), one per frame starting at frame 1.
 # bit0=left bit1=right bit2=up bit3=down bit4=jump bit5=dash.
 # Frames 1-25 are the spawn prologue (inputs ignored). The player object is
 # created DURING frame 26 and updates in the same frame - the first input
@@ -31,6 +31,6 @@
 # next_room on frames 96 and 97; frame 97 loads room (5,0), whose balloon.init
 # calls the unimplemented `rnd`. That crash is 2 frames PAST the exit and
 # is harmless; run -f 95 to avoid it):
-#   ./target/release/concrete_run -i "$(grep -v '^#' tas/room_2_0_exit_frame_95.txt | tr -d '\n')" -f 95
+#   ./target/release/rewrite run -i tas/room_2_0_exit_frame_95.txt -f 95
 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
 1,42,0,0,0,0,0,0,0,38,0,0,0,0,0,2,2,2,2,18,2,2,2,2,2,2,38,38,38,0,0,0,2,2,2,2,2,2,2,2,2,2,1,17,1,1,1,1,1,4,4,36,4,36,0,0,0,2,2,1,2,2,2,18,0,0,16,0,0,0

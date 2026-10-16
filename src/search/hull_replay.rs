@@ -1,5 +1,5 @@
 //! THE HULL FORWARD REPLAYED over a tree's recorded graph (`rewrite
-//! hull-replay`): from the start's hull, every hull pushed along the
+//! check replay`): from the start's hull, every hull pushed along the
 //! recorded edges through their transfers, frame by frame, re-pushed where
 //! it grows - what the forward did, without the engine (a node's successors
 //! do not depend on its hull: it is expanded with its remainder widened;

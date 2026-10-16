@@ -45,10 +45,11 @@ celeste-rust (src/)
                         trees (grow_tree, TreeFilter), wins, MarkFilter
   storage/              the visited set, the wave, the region phase, the
                         frame/hull/edge/out files, decode, bench
-  search/               arcs, hull, rem (+ rem_f64), arc_edges, arc_dp (the
-                        backward, reach, optimum, concrete search), dual,
-                        known, arc_check, reach, hull_replay, pos_graph,
-                        result, ui_export, inspect, checkpoint
+  search/               driver (the search's levels), arcs, hull, rem (+
+                        rem_f64), arc_edges, arc_dp (the backward, reach,
+                        optimum, concrete search), dual, known, arc_check,
+                        reach, hull_replay, tree (a finished tree opened),
+                        pos_graph, result, ui_export, inspect, checkpoint
   trace/                the tracer (interp, state, heap, domain, verify, widen,
                         error, kernel = the lattice walk), the reference engine
                         (refengine, refdomain, refdriver, refbridge, block),
@@ -59,8 +60,10 @@ celeste-rust (src/)
   settings.rs           the run's settings (flags), the tree's record
   starts.rs             the feasible loading-jank J's and their classes
   par.rs, metrics.rs, concrete.rs, game_runner.rs
-  bin/                  rewrite (search + tools), transpile (level -1),
-                        concrete_run
+  bin/rewrite/          the search and its commands (main), the checks of a
+                        tree (check), benches (bench), diagnostics (diag),
+                        one concrete run (run), level -1 (l1)
+  bin/transpile.rs      the level -1 table
 ```
 
 The traced program is `lua/builtin_level_3.lua` + `lua/builtin_level_4.lua`
@@ -89,7 +92,7 @@ To the outer loop a state is opaque: `(shape, key, cell)`.
 ## The arithmetic: fixed or float
 
 `--arith fixed` (PICO-8's 16.16, the default and the real game) or `--arith
-float` (the TAS tools' Lua doubles; `--float-tool celia|uct`). It is a
+float` (the TAS tools' Lua doubles: Celia's; `float-uct` for UCT's). It is a
 compile-time trait (`celeste_core::arith::Arith`; `Rem` for the remainder
 model): the binary dispatches once, and a tree, kernel set and W of
 different arithmetics cannot mix. Fixed monomorphizes to the same code and
@@ -415,14 +418,14 @@ verification surface behind it:
   synthetic win (W's support and fingerprint per frame, optimum 33, the
   witness), their float twins and the dual gate.
 - **The known-route check** (`search::known`): `search --prefer FILE` and
-  `rewrite check-known` step a known solution through the reference engine
+  `rewrite check known` step a known solution through the reference engine
   and FAIL at the first pruning step that drops it: level -1, the ladder's
   filter, the node's W at the exact remainder, the reach marks. Pruning
   errors produce a wrong optimum or a false tie, never a fake improvement,
   so nothing else notices them.
-- **Kernels against the reference**: `ref-check` (row by row),
-  `--key-check` (keys against the boundary), `widen-check` (the widening
-  table's two sides agree), `arc-check` (every edge has a transfer;
+- **Kernels against the reference**: `check ref` (row by row),
+  `--key-check` (keys against the boundary), `check widen` (the widening
+  table's two sides agree), `check arcs` (every edge has a transfer;
   sampled transfers probed with the reference inside and outside their
   guards). `kernel lanes: missed 0` in every log.
 - **The float oracle** (`trace::oracle`): the float reference engine
@@ -449,7 +452,7 @@ verification surface behind it:
   refutes.
 - **The split frame with `p`** reaches slightly fewer states than unsplit
   in room (2,1) (unexplained).
-- **`arc-check` at object levels** forks every straddling comparison on a
+- **`check arcs` at object levels** forks every straddling comparison on a
   widened phase (balloons, springs): room (7,0) `r0sxhn` exceeds its path
   cap. A different probe (concrete members of the row) is needed.
 - **The transfer capture costs the forward** (five roots per axis per body

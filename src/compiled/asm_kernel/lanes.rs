@@ -50,7 +50,7 @@ pub trait KernelLanes: crate::search::rem::Rem {
     /// Before every call of a kernel of this arithmetic: the doubles check
     /// the floating-point environment (`asm::check_mxcsr`), FATAL if wrong.
     fn before_call();
-    /// The kernel census (`compiled::mix`: `bench-frame --metrics`),
+    /// The kernel census (`compiled::mix`: `bench frame --metrics`),
     /// 16.16's diagnostic; another arithmetic refuses it.
     fn mix_report(inp: &crate::compiled::mix::Input<'_, Self::Arith>) -> anyhow::Result<crate::compiled::mix::Census>;
 }
@@ -216,6 +216,6 @@ impl KernelLanes for LuaF64 {
         crate::transpile::asm::check_mxcsr().unwrap_or_else(|e| panic!("a float kernel call: {e:#}"));
     }
     fn mix_report(_: &crate::compiled::mix::Input<'_, celeste_core::arith::Float>) -> anyhow::Result<crate::compiled::mix::Census> {
-        anyhow::bail!("the kernel census (bench-frame --metrics) is 16.16's: not under float arithmetic")
+        anyhow::bail!("the kernel census (bench frame --metrics) is 16.16's: not under float arithmetic")
     }
 }

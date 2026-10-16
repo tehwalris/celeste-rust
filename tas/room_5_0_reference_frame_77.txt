@@ -3,7 +3,7 @@
 # 0 / 0.1 / 0.25 / 0.5 and PICO-8's own rnd did not):
 #   pico8_diff/replay.py --room 5,0 --balloon-seeds 0.636 tas/room_5_0_reference_frame_77.txt
 #
-# Input bytes for concrete_run (-i) / pico8_diff/replay.py --room 5,0, one
+# Input bytes for rewrite run (-i) / pico8_diff/replay.py --room 5,0, one
 # per frame starting at frame 1. bit0=left bit1=right bit2=up bit3=down
 # bit4=jump bit5=dash.
 #

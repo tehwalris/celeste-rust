@@ -42,12 +42,8 @@ memmap2 = "0.9"
 zstd = "0.13"
 
 [[bin]]
-name = "concrete_run"
-path = "src/bin/concrete_run.rs"
-
-[[bin]]
 name = "rewrite"
-path = "src/bin/rewrite.rs"
+path = "src/bin/rewrite/main.rs"
 
 # The edit-loop profile: optimized enough for compute-bound tests, without
 # release's fat-LTO full-workspace relink on every edit. Never make the

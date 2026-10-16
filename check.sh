@@ -55,7 +55,6 @@ TH=${THREADS:-16}
 # A lane runs one step at a time, so a tier's caps add up to 10G a lane;
 # the test runs (nextest) get 20G.
 MEM=10G
-L1_62="--hundred --loading-jank 2 --level-minus-one 94,5"
 mkdir -p "$C"
 # The failed and skipped steps, by name (lanes are subshells: a file).
 : > "$C/failed"
@@ -126,13 +125,16 @@ t0() {
     echo "    (the skipped are #[ignore]d: t2 runs the slow ones, all the pre-merge ones, local the local goldens)"
 }
 
-# frame NAME FRAME ROOM LEVEL FLAGS...: one forward frame from a fixture,
-# checkpointed as the forward does: its f/h/e lines, the b line over the
-# bytes of every file it wrote, and the exact metrics against the pins;
-# timings shown.
+# The commands that read a fixture take its settings and level from its
+# records (`search::tree::TreeDir`): only the frame and the run's own flags
+# are given.
+
+# frame NAME FRAME FLAGS...: one forward frame from a fixture, checkpointed
+# as the forward does: its f/h/e lines, the b line over the bytes of every
+# file it wrote, and the exact metrics against the pins; timings shown.
 frame() {
-    local name=$1 f=$2 room=$3 level=$4; shift 4
-    ./safe-run.sh --memory "$MEM" -- "$B" bench-frame --level-dir "$F/$name" --frame "$f" --room "$room" --level "$level" --edges --checkpoint --threads "$TH" --metrics "$C/$name.metrics" --l1-table "$F/$name/l1-table.bin" "$@" > "$C/$name.frame" || return 1
+    local name=$1 f=$2; shift 2
+    ./safe-run.sh --memory "$MEM" -- "$B" bench frame --tree "$F/$name" --frame "$f" --edges --checkpoint --threads "$TH" --metrics "$C/$name.metrics" --l1-table "$F/$name/l1-table.bin" "$@" > "$C/$name.frame" || return 1
     same "$C/$name.frame" "$G/$name.frame" || return 1
     if [[ $PIN == --pin ]]; then
         same "$C/$name.metrics" "$G/$name.metrics"
@@ -141,11 +143,11 @@ frame() {
     fi
 }
 
-# framef NAME FRAME ROOM LEVEL FLAGS...: `frame` without the metrics (a
-# float fixture's: the kernel census is 16.16's).
+# framef NAME FRAME: `frame` without the metrics (a float fixture's: the
+# kernel census is 16.16's).
 framef() {
-    local name=$1 f=$2 room=$3 level=$4; shift 4
-    ./safe-run.sh --memory "$MEM" -- "$B" bench-frame --level-dir "$F/$name" --frame "$f" --room "$room" --level "$level" --edges --checkpoint --threads "$TH" --l1-table "$F/$name/l1-table.bin" "$@" > "$C/$name.frame" || return 1
+    local name=$1 f=$2
+    ./safe-run.sh --memory "$MEM" -- "$B" bench frame --tree "$F/$name" --frame "$f" --edges --checkpoint --threads "$TH" --l1-table "$F/$name/l1-table.bin" > "$C/$name.frame" || return 1
     same "$C/$name.frame" "$G/$name.frame"
 }
 
@@ -154,72 +156,65 @@ fhe() {
     grep -v '^b' "$G/$1.frame"
 }
 
-# keycheck NAME FRAME ROOM LEVEL FLAGS...: frame's rows' keys recomputed
-# (--key-check), and the same f/e lines.
+# keycheck NAME FRAME: frame's rows' keys recomputed (--key-check), and
+# the same f/h/e lines.
 keycheck() {
-    local name=$1 f=$2 room=$3 level=$4; shift 4
-    ./safe-run.sh --memory "$MEM" -- "$B" bench-frame --level-dir "$F/$name" --frame "$f" --room "$room" --level "$level" --edges --threads "$TH" --key-check --l1-table "$F/$name/l1-table.bin" "$@" > "$C/keycheck-$name.frame" || return 1
+    local name=$1 f=$2
+    ./safe-run.sh --memory "$MEM" -- "$B" bench frame --tree "$F/$name" --frame "$f" --edges --threads "$TH" --key-check --l1-table "$F/$name/l1-table.bin" > "$C/keycheck-$name.frame" || return 1
     diff <(fhe "$name") "$C/keycheck-$name.frame" >&2
 }
 
-# widencheck NAME FRAME ROOM LEVEL FLAGS...: `rewrite widen-check` of a
-# fixture's frame (the stored rows, and 64 rows' emissions).
+# widencheck NAME FRAME: `rewrite check widen` of a fixture's frame (the
+# stored rows, and 64 rows' emissions).
 widencheck() {
-    local name=$1 f=$2 room=$3 level=$4; shift 4
-    ./safe-run.sh --memory "$MEM" -- "$B" widen-check --level-dir "$F/$name" --frame "$f" --room "$room" --level "$level" --emitted 64 --l1-table "$F/$name/l1-table.bin" "$@"
+    ./safe-run.sh --memory "$MEM" -- "$B" check widen --tree "$F/$1" --frame "$2" --emitted 64 --l1-table "$F/$1/l1-table.bin"
 }
 
-# refcheck NAME FRAME ROOM FLAGS...: the kernels against the reference
-# engine, 32 sampled rows of a fixture's frame (at r0sxh).
+# refcheck NAME FRAME: the kernels against the reference engine, 32
+# sampled rows of a fixture's frame (an r0sxh fixture's).
 refcheck() {
-    local name=$1 f=$2 room=$3; shift 3
-    ./safe-run.sh --memory "$MEM" -- "$B" ref-check --level-dir "$F/$name" --frame "$f" --level r0sxh --room "$room" --samples 32 --threads "$TH" "$@"
+    ./safe-run.sh --memory "$MEM" -- "$B" check ref --tree "$F/$1" --frame "$2" --samples 32 --threads "$TH"
 }
 
-# arccheck NAME ROOM FLAGS...: the recorded transfers of a fixture's f56
-# against the reference engine, 32 sampled records (at r0sxh).
+# arccheck NAME FLAGS...: the recorded transfers of a fixture's f56
+# against the reference engine, 32 sampled records (an r0sxh fixture's).
 arccheck() {
-    local name=$1 room=$2; shift 2
-    ./safe-run.sh --memory "$MEM" -- "$B" arc-check --level-dir "$F/$name" --room "$room" --from 56 --to 56 --samples 32 --level r0sxh --threads "$TH" --path-cap 4096 "$@"
+    local name=$1; shift
+    ./safe-run.sh --memory "$MEM" -- "$B" check arcs --tree "$F/$name" --from 56 --to 56 --samples 32 --threads "$TH" --path-cap 4096 "$@"
 }
 
-# faultcheck NAME ROOM FLAGS...: `arccheck` with a corrupted transfer
-# (`--fault action`) must FAIL, on a disagreement: the check is live.
+# faultcheck NAME: `arccheck` with a corrupted transfer (`--fault action`)
+# must FAIL, on a disagreement: the check is live.
 faultcheck() {
-    if arccheck "$@" --fault action 2> "$C/fault-$1.err"; then
-        echo "arc-check passed a corrupted transfer" >&2
+    if arccheck "$1" --fault action 2> "$C/fault-$1.err"; then
+        echo "check arcs passed a corrupted transfer" >&2
         return 1
     fi
-    grep -q 'arc-check: disagreement' "$C/fault-$1.err" || { tail -5 "$C/fault-$1.err" >&2; return 1; }
+    grep -q 'check arcs: disagreement' "$C/fault-$1.err" || { tail -5 "$C/fault-$1.err" >&2; return 1; }
 }
 
+# backward NAME: one backward frame of a search fixture (W f45 of h56).
 backward() {
-    ./safe-run.sh --memory "$MEM" -- "$B" bench-backward --level-dir "$F/r10arc/level00" --horizon 56 --frame 45 --win-at 40,64 --threads "$TH" --reps 3 > "$C/backward.txt" || return 1
-    same "$C/backward.txt" "$G/r10arc.backward"
-}
-# The same backward frame over the float twin's tree (`f10arc`).
-backwardf() {
-    ./safe-run.sh --memory "$MEM" -- "$B" bench-backward --arith float --level-dir "$F/f10arc/level00" --horizon 56 --frame 45 --win-at 40,64 --threads "$TH" --reps 3 > "$C/backward-f.txt" || return 1
-    same "$C/backward-f.txt" "$G/f10arc.backward"
+    ./safe-run.sh --memory "$MEM" -- "$B" bench backward --tree "$F/$1/level00" --horizon 56 --frame 45 --threads "$TH" --reps 3 > "$C/backward-$1.txt" || return 1
+    same "$C/backward-$1.txt" "$G/$1.backward"
 }
 
 t1() {
     build
     step fixtures tools/fixtures.sh ensure r10 r62h r42n r42x r10arc f10 f42n f42x f10arc
     grep -h '^\[fixtures\]' "$C/fixtures.err"
-    local FL="--arith float"
-    # One lane a fixture family (a fixture's steps in order: `bench-frame`
+    # One lane a fixture family (a fixture's steps in order: `bench frame`
     # writes its scratch into the fixture).
     lane r10 t1_r10
     lane r62h t1_r62h
     lane r42 t1_r42
-    lane f10 t1_f10 $FL
-    lane f42 t1_f42 $FL
+    lane f10 t1_f10
+    lane f42 t1_f42
     lanes
     for n in r10 r62h r42n; do grep -hE '^\[bench\] rep 0' "$C/frame-$n.err" | sed "s/^/    $n /" | cut -c1-200; done
-    grep -h '^\[bench-backward\] rep 0' "$C/backward-r10arc.err" | sed 's/^/    /'
-    for s in r10 r62h r42n f10 f42n; do grep -h '^\[widen-check\] step' "$C/widen-$s.out" | sed 's/^/    /'; done
-    for s in refcheck-r10 refcheck-r42x refcheck-f10 refcheck-f42x; do grep -h '^\[ref-check\] [0-9]' "$C/$s.out" | sed "s/^/    /"; done
+    grep -h '^\[bench backward\] rep 0' "$C/backward-r10arc.err" | sed 's/^/    /'
+    for s in r10 r62h r42n f10 f42n; do grep -h '^\[check widen\] step' "$C/widen-$s.out" | sed 's/^/    /'; done
+    for s in refcheck-r10 refcheck-r42x refcheck-f10 refcheck-f42x; do grep -h '^\[check ref\] [0-9]' "$C/$s.out" | sed "s/^/    /"; done
     for s in arccheck-r10 arccheck-r42x arccheck-f10 arccheck-f42x; do grep -h '^agreement' "$C/$s.out" | sed "s/^/    /" | cut -c1-200; done
 }
 # The forward, one frame each, exact, its files' bytes (and the run's
@@ -229,42 +224,42 @@ t1() {
 # row, and the rows the kernels emit from 64 of them, kept as they are by
 # the block side); one backward frame (W f45 of h56).
 t1_r10() {
-    step frame-r10 frame r10 55 1,0 r0sxh
-    step keycheck-r10 keycheck r10 55 1,0 r0sxh
-    step refcheck-r10 refcheck r10 55 1,0
-    step arccheck-r10 arccheck r10 1,0
-    step arcfault-r10 faultcheck r10 1,0
-    step widen-r10 widencheck r10 55 1,0 r0sxh
-    step backward-r10arc backward
+    step frame-r10 frame r10 55
+    step keycheck-r10 keycheck r10 55
+    step refcheck-r10 refcheck r10 55
+    step arccheck-r10 arccheck r10
+    step arcfault-r10 faultcheck r10
+    step widen-r10 widencheck r10 55
+    step backward-r10arc backward r10arc
 }
 t1_r62h() {
-    step frame-r62h frame r62h 50 6,2 r0sxhf $L1_62
-    step widen-r62h widencheck r62h 50 6,2 r0sxhf $L1_62
+    step frame-r62h frame r62h 50
+    step widen-r62h widencheck r62h 50
 }
 t1_r42() {
-    step frame-r42n frame r42n 60 4,2 r0sxhn --level-minus-one 71,5
-    step keycheck-r42n keycheck r42n 60 4,2 r0sxhn --level-minus-one 71,5
-    step widen-r42n widencheck r42n 60 4,2 r0sxhn --level-minus-one 71,5
-    step refcheck-r42x refcheck r42x 55 4,2 --level-minus-one 71,5
-    step arccheck-r42x arccheck r42x 4,2 --level-minus-one 71,5
+    step frame-r42n frame r42n 60
+    step keycheck-r42n keycheck r42n 60
+    step widen-r42n widencheck r42n 60
+    step refcheck-r42x refcheck r42x 55
+    step arccheck-r42x arccheck r42x
 }
 # The same in FLOAT (`--arith float`, the doubles' kernels, Celia's start):
 # the frames exact (their f/h/e/b lines; no metrics), the keys, the kernels
 # and the transfers against the float reference, the widening.
 t1_f10() {
-    step frame-f10 framef f10 55 1,0 r0sxh "$@"
-    step refcheck-f10 refcheck f10 55 1,0 "$@"
-    step arccheck-f10 arccheck f10 1,0 "$@"
-    step arcfault-f10 faultcheck f10 1,0 "$@"
-    step widen-f10 widencheck f10 55 1,0 r0sxh "$@"
-    step backward-f10arc backwardf
+    step frame-f10 framef f10 55
+    step refcheck-f10 refcheck f10 55
+    step arccheck-f10 arccheck f10
+    step arcfault-f10 faultcheck f10
+    step widen-f10 widencheck f10 55
+    step backward-f10arc backward f10arc
 }
 t1_f42() {
-    step frame-f42n framef f42n 60 4,2 r0sxhn "$@" --level-minus-one 71,5
-    step keycheck-f42n keycheck f42n 60 4,2 r0sxhn "$@" --level-minus-one 71,5
-    step widen-f42n widencheck f42n 60 4,2 r0sxhn "$@" --level-minus-one 71,5
-    step refcheck-f42x refcheck f42x 55 4,2 "$@" --level-minus-one 71,5
-    step arccheck-f42x arccheck f42x 4,2 "$@" --level-minus-one 71,5
+    step frame-f42n framef f42n 60
+    step keycheck-f42n keycheck f42n 60
+    step widen-f42n widencheck f42n 60
+    step refcheck-f42x refcheck f42x 55
+    step arccheck-f42x arccheck f42x
 }
 
 t2() {
@@ -293,7 +288,7 @@ t2_properties() {
     step reference10 reference10
     step reference10f reference10 --arith float
     step hull10 hull10
-    step hull10f hull10 --arith float
+    step hull10f hull10 float
 }
 t2_platforms() {
     step forward60-platforms forward60
@@ -306,7 +301,7 @@ t2_platforms() {
 gate10_forward() {
     ./safe-run.sh --memory "$MEM" -- "$B" forward --to 44 --room 1,0 --checkpoint-dir "$C/t2/g10" > "$C/t2/g10.out" || return 1
     grep '^posgraph' "$C/t2/g10.out" | diff gates/posgraph_room10_f044.txt - >&2 || return 1
-    ./safe-run.sh --memory "$MEM" -- "$B" ckhash --to 44 --room 1,0 --hulls --checkpoint-dir "$C/t2/g10" | diff gates/ckhash_room10_f000-044.txt - >&2
+    ./safe-run.sh --memory "$MEM" -- "$B" ckhash --tree "$C/t2/g10" --to 44 --hulls | diff gates/ckhash_room10_f000-044.txt - >&2
 }
 gate10_arc() {
     ./safe-run.sh --memory "$MEM" -- "$B" search --to 35 --win-at 9,101 --checkpoint-dir "$C/t2/arc10" --prefer gates/known_room10_win9-101.txt --save-marks "$C/t2/arc10-marks" > "$C/t2/arc10.out" || return 1
@@ -318,7 +313,7 @@ gate10_arc() {
 gate10f_forward() {
     ./safe-run.sh --memory "$MEM" -- "$B" forward --arith float --to 44 --room 1,0 --checkpoint-dir "$C/t2/g10f" > "$C/t2/g10f.out" || return 1
     grep '^posgraph' "$C/t2/g10f.out" | diff gates/float_posgraph_room10_f044.txt - >&2 || return 1
-    ./safe-run.sh --memory "$MEM" -- "$B" ckhash --arith float --to 44 --room 1,0 --hulls --checkpoint-dir "$C/t2/g10f" | diff gates/float_ckhash_room10_f000-044.txt - >&2
+    ./safe-run.sh --memory "$MEM" -- "$B" ckhash --tree "$C/t2/g10f" --to 44 --hulls | diff gates/float_ckhash_room10_f000-044.txt - >&2
 }
 gate10f_arc() {
     ./safe-run.sh --memory "$MEM" -- "$B" search --arith float --to 35 --win-at 9,101 --checkpoint-dir "$C/t2/arc10f" --prefer gates/known_room10_win9-101.txt --save-marks "$C/t2/arc10f-marks" > "$C/t2/arc10f.out" || return 1
@@ -345,9 +340,8 @@ search42() {
 # float gate's run and the dual's too (each tree read in its own
 # arithmetic; the dual's arc pass the float half's).
 export_ui() {
-    for s in arc10:1,0 s42:4,2 arc10f:1,0 dual10:1,0; do
-        local d=${s%%:*} room=${s##*:}
-        ./safe-run.sh --memory "$MEM" -- "$B" export-ui --room "$room" --checkpoint-dir "$C/t2/$d" --arc "$C/t2/$d-marks" --out "$C/t2/ui-$d" > /dev/null || return 1
+    for d in arc10 s42 arc10f dual10; do
+        ./safe-run.sh --memory "$MEM" -- "$B" export-ui --checkpoint-dir "$C/t2/$d" --arc "$C/t2/$d-marks" --out "$C/t2/ui-$d" > /dev/null || return 1
         (cd "$C/t2" && sha256sum ui-$d/*.bin)
         python3 -c '
 import json, sys
@@ -372,46 +366,46 @@ reference10() {
     local d=$C/t2/reference10${1:+-float}
     ./safe-run.sh --memory "$MEM" -- "$B" forward "$@" --to 36 --room 1,0 --checkpoint-dir "$d-kernels" > /dev/null || return 1
     ./safe-run.sh --memory "$MEM" -- "$B" forward "$@" --reference --to 27 --room 1,0 --checkpoint-dir "$d-reference" > /dev/null || return 1
-    ./safe-run.sh --memory "$MEM" -- "$B" ckhash "$@" --to 27 --room 1,0 --edges --hulls --checkpoint-dir "$d-kernels" > "$d-kernels.ckhash" || return 1
-    ./safe-run.sh --memory "$MEM" -- "$B" ckhash "$@" --to 27 --room 1,0 --edges --hulls --checkpoint-dir "$d-reference" > "$d-reference.ckhash" || return 1
+    ./safe-run.sh --memory "$MEM" -- "$B" ckhash --tree "$d-kernels" --to 27 --edges --hulls > "$d-kernels.ckhash" || return 1
+    ./safe-run.sh --memory "$MEM" -- "$B" ckhash --tree "$d-reference" --to 27 --edges --hulls > "$d-reference.ckhash" || return 1
     diff "$d-kernels.ckhash" "$d-reference.ckhash" >&2
 }
 # THE HULL FORWARD'S TREE REPLAYS FROM ITS RECORDED GRAPH [ARITH]:
 # reference10's kernels' tree (to f36), its hulls pushed along its recorded
 # edges and transfers from the start, reaches exactly its states at every
-# frame (`hull-replay` checks each): every edge was recorded. (That a known
-# route holds in the tree is the gates' `--prefer`, search::known.)
+# frame (`check replay` checks each): every edge was recorded. (That a
+# known route holds in the tree is the gates' `--prefer`, search::known.)
 hull10() {
-    ./safe-run.sh --memory "$MEM" -- "$B" hull-replay "$@" --checkpoint-dir "$C/t2/reference10${1:+-float}-kernels" --to 36
+    ./safe-run.sh --memory "$MEM" -- "$B" check replay --tree "$C/t2/reference10${1:+-float}-kernels" --to 36
 }
 
 # A platform room (platforms unknown, split frame) to step 71: the tree's
 # fingerprint is the r60s fixture's pin.
 forward60() {
     ./safe-run.sh --memory "$MEM" -- "$B" forward --room 6,0 --level r0sxhfp --to 71 --split-frame --checkpoint-dir "$C/t2/p60" > /dev/null || return 1
-    ./safe-run.sh --memory "$MEM" -- "$B" ckhash --room 6,0 --to 71 --edges --hulls --checkpoint-dir "$C/t2/p60" 2> /dev/null | diff "$G/r60s.ckhash" - >&2
+    ./safe-run.sh --memory "$MEM" -- "$B" ckhash --tree "$C/t2/p60" --to 71 --edges --hulls 2> /dev/null | diff "$G/r60s.ckhash" - >&2
 }
 
 widen60() {
     for f in 70 71; do
-        ./safe-run.sh --memory "$MEM" -- "$B" widen-check --level-dir "$F/r60s" --frame $f --room 6,0 --level r0sxhfp --split-frame || return 1
+        ./safe-run.sh --memory "$MEM" -- "$B" check widen --tree "$F/r60s" --frame $f || return 1
     done
 }
 
 big() {
     build
     step fixtures-big tools/fixtures.sh ensure r62h57 r60s
-    step frame-r62h57 frame r62h57 56 6,2 r0sxhf $L1_62
+    step frame-r62h57 frame r62h57 56
     grep -hE '^\[bench\] (kernels|rep)|^\[phases\]' "$C/frame-r62h57.err" | sed 's/^/    /' | cut -c1-220
     # The platform kernels' frame (step 70 -> 71) and exact metrics: its
     # lines are t2's forward60's too; their build is ~20-40 s of tracing.
-    step frame-r60s frame r60s 70 6,0 r0sxhfp --split-frame
+    step frame-r60s frame r60s 70
     grep -hE '^\[bench\] (kernels|rep)' "$C/frame-r60s.err" | sed 's/^/    /' | cut -c1-200
 }
 
 # THE INSTRUCTION BUDGET (gates/perf.txt): a bench frame's one rep in
 # user-space instructions, counted by `perf stat -e instructions:u` over a
-# 3-rep and a 1-rep run of the RELEASE binary's `bench-frame` (their
+# 3-rep and a 1-rep run of the RELEASE binary's `bench frame` (their
 # difference over 2: the kernel build, the tree's load and the process
 # start cancel; the rep's fingerprints are in it). Instructions do not move
 # with the machine's load as walls do: run to run within ~0.2% at load
@@ -422,21 +416,21 @@ perftier() {
     build
     step build-release ./safe-run.sh --memory 20G -- ./one-cargo.sh cargo build --release --bins
     step fixtures-perf tools/fixtures.sh ensure r62h r62h57 f42n
-    step perf-r62h perfcount r62h 50 6,2 r0sxhf $L1_62
-    step perf-r62h57 perfcount r62h57 56 6,2 r0sxhf $L1_62
-    step perf-f42n perfcount f42n 60 4,2 r0sxhn --arith float --level-minus-one 71,5
+    step perf-r62h perfcount r62h 50
+    step perf-r62h57 perfcount r62h57 56
+    step perf-f42n perfcount f42n 60
     cat "$C"/perf-*.line 2> /dev/null | sed 's/^/    /'
 }
-# perfcount NAME FRAME ROOM LEVEL FLAGS...: one rep of the fixture's frame
+# perfcount NAME FRAME: one rep of the fixture's frame
 # (its f/h/e lines the pinned ones: the work measured is the pinned work)
 # against its line in gates/perf.txt: more than 2% over FAILS; more than 2%
 # under passes, and says to re-pin.
 perfcount() {
-    local name=$1 f=$2 room=$3 level=$4; shift 4
+    local name=$1 f=$2
     local n i1 i3 rep pin
     rm -f "$C/perf-$name.line"
     for n in 1 3; do
-        ./safe-run.sh --memory "$MEM" -- perf stat -x, -e instructions:u -o "$C/perf-$name-$n.stat" -- "$RB" bench-frame --level-dir "$F/$name" --frame "$f" --room "$room" --level "$level" --edges --threads 16 --l1-table "$F/$name/l1-table.bin" --reps "$n" "$@" > "$C/perf-$name-$n.frame" || return 1
+        ./safe-run.sh --memory "$MEM" -- perf stat -x, -e instructions:u -o "$C/perf-$name-$n.stat" -- "$RB" bench frame --tree "$F/$name" --frame "$f" --edges --threads 16 --l1-table "$F/$name/l1-table.bin" --reps "$n" > "$C/perf-$name-$n.frame" || return 1
         diff <(fhe "$name") "$C/perf-$name-$n.frame" >&2 || return 1
     done
     i1=$(awk -F, '$3 ~ /^instructions/ {print $1}' "$C/perf-$name-1.stat")

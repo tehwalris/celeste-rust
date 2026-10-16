@@ -1,4 +1,4 @@
-//! THE FRAME BENCHMARK's measures (`rewrite bench-frame`, plans/devloop.md
+//! THE FRAME BENCHMARK's measures (`rewrite bench frame`, plans/devloop.md
 //! "The forward frame benchmark"): the fingerprints of a frame's output
 //! (its edge file as `ckhash --edges` counts it; the bytes of every file
 //! it wrote), the hardware counters over a rep and the frame's steps, the
@@ -74,7 +74,7 @@ impl EdgeHashes {
     }
 }
 
-/// One `bench-frame` rep for its COST REPORT (`print_cost`): the frame's
+/// One `bench frame` rep for its COST REPORT (`print_cost`): the frame's
 /// stats (`--phases` on: `FrameStats::phase_s`), its checkpoint's steps
 /// and the pos graph's wall (`--checkpoint`), the wave's workers, the
 /// whole rep's wall, the machine's load average at its start and the
@@ -216,7 +216,7 @@ struct Line {
     counts: Option<Vec<[u64; 4]>>,
 }
 
-/// THE COST REPORT of a frame's reps (`bench-frame`; plans/devloop.md):
+/// THE COST REPORT of a frame's reps (`bench frame`; plans/devloop.md):
 /// the frame's wall split into the wave, the frame end and the
 /// checkpoint; the wave's WORKER-SECONDS by phase (`frame::phases`) with
 /// the idle share; the frame end's and the checkpoint's steps (walls, on
@@ -372,7 +372,7 @@ pub fn print_cost(frame: u32, reps: &[Rep]) {
 }
 
 /// The bytes of every file under `dir` (recursively, by relative path):
-/// `(files, bytes, hash)` - `bench-frame`'s `b` line, so a change to how a
+/// `(files, bytes, hash)` - `bench frame`'s `b` line, so a change to how a
 /// frame's files are written proves them byte-identical.
 pub fn dir_fingerprint(dir: &Path) -> Result<(u64, u64, u64)> {
     use celeste_engine::runtime2::mix64;
@@ -404,7 +404,7 @@ pub fn dir_fingerprint(dir: &Path) -> Result<(u64, u64, u64)> {
     Ok((files.len() as u64, bytes, acc))
 }
 
-/// THE MEMORY CENSUS of a forward between frames (`bench-frame`'s
+/// THE MEMORY CENSUS of a forward between frames (`bench frame`'s
 /// `[memory]`): what its structures allocate, by part, against the visited
 /// set's states and entries, beside the process's resident set (the rest:
 /// the kernels, the allocator's retained and fragmented pages, what no

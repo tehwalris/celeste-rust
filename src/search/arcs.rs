@@ -75,7 +75,7 @@ pub trait Circle: Copy + std::fmt::Debug + Default + PartialEq + Eq + std::hash:
     fn mid(s: Seg<Self::P>) -> Self::P;
     /// The action's kind, for a report.
     fn kind(a: &Self::Act) -> &'static str;
-    /// `a` CORRUPTED, to check a check (`rewrite arc-check --fault`): its
+    /// `a` CORRUPTED, to check a check (`rewrite check arcs --fault`): its
     /// guard's lowest point dropped (`guard`), or its image moved.
     fn faulty(a: &Self::Act, guard: bool) -> Self::Act;
 }

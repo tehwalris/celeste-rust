@@ -4,7 +4,7 @@
 The definitive fidelity check for a witness: `lua/celeste-minimal.lua`
 (the exact Lua the search runs) plus the cart's map and flag data, driven
 frame by frame with `btn` overridden to read the scripted inputs, headless
-under `pico8 -x`. Same frame convention as `concrete_run`: frame f is the
+under `pico8 -x`. Same frame convention as `rewrite run`: frame f is the
 f-th `_update();_draw()` after `_init()`, and the input byte for frame f is
 `inputs[f-1]` (bit0=left bit1=right bit2=up bit3=down bit4=jump bit5=dash).
 

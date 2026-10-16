@@ -20,7 +20,7 @@
 # (NAME/l1-table.bin, --l1-table): the table cache is keyed on the
 # binary, so without it every rebuild of the binary would rebuild the table
 # (12-60 s) before the frame; the tree records the table's fingerprint and
-# `bench-frame` refuses another.
+# `bench frame` refuses another.
 #
 # A fixture built from other sources than the checkout's is reported, not
 # rebuilt: its content is pinned by its fingerprint, and a code change that
@@ -89,11 +89,9 @@ sources() {
     { git ls-files -s src crates lua cart Cargo.lock; git diff HEAD -- src crates lua cart Cargo.lock; } | sha1sum | cut -c1-16
 }
 
-# The tree's fingerprint (as pinned).
+# The tree's fingerprint (as pinned; its settings its record's).
 fingerprint() {
-    local dir=$1/$TREE arith
-    arith=$(grep -o -- '--arith [a-z]*' <<< "$FLAGS" || true)
-    ./safe-run.sh --memory "$MEM" -- "$B" ckhash --room "$ROOM" $arith --to "$LAST" --edges --hulls --checkpoint-dir "$dir" 2>/dev/null
+    ./safe-run.sh --memory "$MEM" -- "$B" ckhash --tree "$1/$TREE" --to "$LAST" --edges --hulls 2>/dev/null
 }
 
 # build NAME [pin|verify]: build NAME from scratch with this checkout and

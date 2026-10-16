@@ -1,12 +1,18 @@
 //! THE RUN'S SETTINGS: every setting of a run, from its COMMAND LINE
-//! (`SettingsArgs`, flattened into every binary's arguments), in ONE value
-//! (`Settings`, made by `startup`) that the binary PASSES to what reads it.
-//! There is no global: an engine (`FrameEngine`, `RefEngine`) owns its
-//! settings, and the wave, the storage and the search take them from it or
-//! as a parameter; the kernel registry and the level -1 table, cached per
-//! process, are keyed on them.
+//! (`Settings` is the flags' struct, flattened into every binary's
+//! arguments), in ONE value (made by `startup`) that the binary PASSES to
+//! what reads it. There is no global: an engine (`FrameEngine`,
+//! `RefEngine`) owns its settings, and the wave, the storage and the search
+//! take them from it or as a parameter; the kernel registry and the level -1
+//! table, cached per process, are keyed on them.
 //! Nothing reads the environment: a `CELESTE_*` variable is refused at
 //! startup (`refuse_env`, with the flag that replaced it).
+//!
+//! ONE TABLE: the struct's fields are the flags (their docs, defaults and
+//! parsers), and `rows` is every setting as text, from which come the
+//! tree's record (`recorded`), the startup log, the level -1 table's cache
+//! key (`cart_key`) and a tree's record read back (`of_tree`: the record's
+//! values are the flags' texts).
 //!
 //! The settings that change what a level's tree holds are RECORDED in the
 //! tree (`<level dir>/settings.txt`) when its frame 0 is written, and
@@ -14,7 +20,8 @@
 //! is an error, never a silently mixed tree. A resume does NOT default the
 //! flags to the recorded ones: the same command line would then mean another
 //! search depending on what is on disk (a deleted tree rerun by "the same"
-//! command would silently change category).
+//! command would silently change category). Only a command that reads a
+//! finished tree takes its settings from the record (`of_tree`).
 //!
 //! The level -1 filter is recorded apart (`frame::TreeFilter`,
 //! `level_minus_one.txt`): a tree serves every horizon up to it, and is
@@ -29,6 +36,7 @@
 //! (`compiled::asm_kernel::BuildOptions`).
 
 use anyhow::{Context, Result};
+use clap::Parser;
 use std::path::{Path, PathBuf};
 
 /// The record's format: a tree without one, or with another, is refused
@@ -45,7 +53,7 @@ pub enum Arith {
     Float(FloatTool),
 }
 
-/// The float tool a float run models (`--float-tool`).
+/// The float tool a float run models (`--arith float-celia|float-uct`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FloatTool {
     /// UniversalClassicTas: the room loaded alone (the IL load), the file's
@@ -69,85 +77,190 @@ impl std::fmt::Display for Arith {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// THE FLAGS (every binary flattens them; `global`: given anywhere on a
+/// `rewrite` command line), and the run's settings.
+#[derive(clap::Args, Clone, Debug, PartialEq, Eq)]
 pub struct Settings {
     // RECORDED in a tree.
-    /// The game's arithmetic (`--arith`, `--float-tool`). Recorded only
-    /// where it is not `fixed`, so a fixed tree's record is what it was.
+    /// The game's arithmetic: `fixed` (PICO-8's 16.16, the real game), or
+    /// the TAS tools' Lua doubles (plans/float.md): `float` or `float-celia`
+    /// (Celia's float mode: its IL load's loading jank unless
+    /// `--loading-jank` is given, its seeds), `float-uct`
+    /// (UniversalClassicTas: the IL load, its seeds). Recorded where not
+    /// `fixed`.
+    #[arg(long, global = true, default_value = "fixed", value_parser = parse_arith)]
     pub arith: Arith,
-    /// The start room (`--room`).
+    /// The start room "x,y".
+    #[arg(long, global = true, default_value = "1,0", value_parser = |s: &str| pair::<i16>(s, "--room"))]
     pub room: (i16, i16),
-    /// A synthetic win rectangle `(x0, x1, y0, y1)` (`--win-at`).
-    pub win_at: Option<(i16, i16, i16, i16)>,
-    /// Two search steps a frame (`--split-frame`).
+    /// A synthetic win: the player at "x,y", or in "x0..x1,y0..y1" (a test
+    /// configuration: a tree under it is another search), or `none`.
+    #[arg(long, global = true, default_value = "none", value_parser = parse_win_at)]
+    pub win_at: std::option::Option<(i16, i16, i16, i16)>,
+    /// Two search steps a frame (the split cart).
+    #[arg(long, global = true)]
     pub split_frame: bool,
-    /// The kernels' region grid `(px, S)` (`--region`; `None`: off).
-    pub region: Option<(i32, i32)>,
+    /// The kernels' region grid "px,S" (px a multiple of 8, 1 <= S <= 7),
+    /// or `off`.
+    #[arg(long, global = true, default_value = "16,6", value_parser = parse_region)]
+    pub region: std::option::Option<(i32, i32)>,
+    /// 100%: a room is won only with its berry taken.
+    #[arg(long, global = true)]
     pub hundred: bool,
+    /// No Diagonal Dashes: a dash may not start diagonal.
+    #[arg(long, global = true)]
     pub nodiag: bool,
+    /// Only Diagonal Dashes: a dash must start diagonal (the straight and
+    /// facing-only dash arms raise).
+    #[arg(long, global = true)]
     pub onlydiag: bool,
+    /// The gemskip categories: the orb room won without the orb, one dash after it.
+    #[arg(long, global = true)]
     pub gemskip: bool,
-    /// The loading frame's object J (`--loading-jank`; `None`: IL load).
-    pub loading_jank: Option<usize>,
-    /// The balloons' fixed phases (`--balloon-seeds`).
-    pub balloon_seeds: Option<String>,
+    /// The room as real play enters it: its loading frame from object J
+    /// (pico8_diff/chain.py), or `none` (the IL load).
+    #[arg(long, global = true, default_value = "none", value_parser = parse_jank)]
+    pub loading_jank: std::option::Option<usize>,
+    /// The start room's balloons' phases fixed, "s1,s2,..", or `none`.
+    #[arg(long, global = true, default_value = "none", value_parser = parse_seeds)]
+    pub balloon_seeds: std::option::Option<String>,
     // NOT recorded.
-    /// The level -1 filter `(H, S)`, H in search steps (`--level-minus-one`;
-    /// the tree records it as `TreeFilter`).
+    /// The level -1 filter "H,S": H in search steps, S the table's speed
+    /// bound (the tree records it as `frame::TreeFilter`).
+    #[arg(long, global = true, value_parser = parse_minus_one)]
     pub level_minus_one: Option<(u32, i32)>,
-    /// The balloons' phases of the concrete phase only.
+    /// The balloons' phases of the concrete phase only (a tasdatabase file's
+    /// seeds): the witness is one real run under them.
+    #[arg(long, global = true)]
     pub concrete_balloon_seeds: Option<String>,
-    /// Worker threads (`None`: one per physical core).
+    /// Worker threads (default: one per physical core).
+    #[arg(long, global = true, value_parser = parse_threads)]
     pub threads: Option<usize>,
-    /// The level -1 table pinned by its file (the fixtures).
+    /// The level -1 table pinned by its FILE (read if it exists, else built
+    /// there): the fixtures', never a search's.
+    #[arg(long, global = true)]
     pub l1_table: Option<PathBuf>,
-    /// A tree recorded under other `OVERRIDABLE` settings is used under
-    /// these, loudly (`--override-settings`).
+    /// Use a tree recorded under other settings that do not change what it
+    /// holds (only `--region`), under this run's; every difference is logged.
+    /// Any other difference (room, win, split frame, category, loading jank,
+    /// balloons, level) is still refused. A tree without a record is refused.
+    #[arg(long, global = true)]
     pub override_settings: bool,
+    #[command(flatten)]
     pub diag: Diagnostics,
 }
 
 /// Self-checks, logs and dumps: none changes a result.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(clap::Args, Clone, Debug, Default, PartialEq, Eq)]
 pub struct Diagnostics {
-    /// Every emitted row's key recomputed by the boundary; every unit's copy
-    /// of a new state compared (claims off).
+    /// DIAGNOSTIC: every emitted row's key recomputed by the boundary, and
+    /// the row decoded back from its key and cell (the new layer is
+    /// decoded so) and compared.
+    #[arg(long, global = true)]
     pub key_check: bool,
-    /// Kernels keep their graphs: a decline names its premise.
+    /// DIAGNOSTIC: kernels keep their graphs, so a decline names its premise.
+    #[arg(long, global = true)]
     pub kernel_explain: bool,
-    /// The kernels' census and slice counters (`bench-frame --metrics`).
+    /// The kernels' census and slice counters (`bench frame --metrics`).
+    #[arg(skip)]
     pub kernel_metrics: bool,
-    /// The kernel build's and the lattice walk's progress.
+    /// DIAGNOSTIC: the kernel build's and the lattice walk's progress.
+    #[arg(long, global = true)]
     pub build_trace: bool,
-    /// The wave workers' phase timings.
+    /// DIAGNOSTIC: the wave workers' phase timings.
+    #[arg(long, global = true)]
     pub phases: bool,
 }
 
+/// `transpile`'s name for the flags.
+pub type SettingsArgs = Settings;
+
+/// The flags alone, parsed (the defaults; a record read back).
+#[derive(Parser)]
+struct Flags {
+    #[command(flatten)]
+    s: Settings,
+}
+
 impl Default for Settings {
+    /// The flags' defaults.
     fn default() -> Self {
-        Settings {
-            arith: Arith::Fixed,
-            room: (1, 0),
-            win_at: None,
-            split_frame: false,
-            region: Some((16, 6)),
-            hundred: false,
-            nodiag: false,
-            onlydiag: false,
-            gemskip: false,
-            loading_jank: None,
-            balloon_seeds: None,
-            level_minus_one: None,
-            concrete_balloon_seeds: None,
-            threads: None,
-            l1_table: None,
-            override_settings: false,
-            diag: Diagnostics::default(),
+        Flags::parse_from(["settings"]).s
+    }
+}
+
+/// One setting as text (`Settings::rows`): its key (the flag is `--key`,
+/// `_` as `-`), its value as the flag takes it (a switch's "1" or "0"),
+/// and whether a tree records it.
+struct Row {
+    key: &'static str,
+    text: String,
+    switch: bool,
+    recorded: bool,
+}
+
+impl Row {
+    /// The flag that gives it (none for a switch that is off).
+    fn flag(&self) -> Vec<String> {
+        let f = format!("--{}", self.key.replace('_', "-"));
+        match (self.switch, self.text.as_str()) {
+            (true, "1") => vec![f],
+            (true, _) => vec![],
+            (false, _) => vec![f, self.text.clone()],
         }
     }
 }
 
 impl Settings {
+    /// THE TABLE: every setting as text, the recorded ones in the record's
+    /// order (`arith`'s line goes after the level's, and only where not
+    /// fixed: `recorded`).
+    fn rows(&self) -> Vec<Row> {
+        let none = |v: Option<String>| v.unwrap_or_else(|| "none".to_string());
+        let row = |key, text, recorded| Row { key, text, switch: false, recorded };
+        let switch = |key, on: bool, recorded| Row { key, text: u8::from(on).to_string(), switch: true, recorded };
+        vec![
+            row("room", format!("{},{}", self.room.0, self.room.1), true),
+            row("win_at", none(self.win_at.map(|(x0, x1, y0, y1)| format!("{x0}..{x1},{y0}..{y1}"))), true),
+            switch("split_frame", self.split_frame, true),
+            row("region", none(self.region.map(|(px, s)| format!("{px},{s}"))), true),
+            switch("hundred", self.hundred, true),
+            switch("nodiag", self.nodiag, true),
+            switch("onlydiag", self.onlydiag, true),
+            switch("gemskip", self.gemskip, true),
+            row("loading_jank", none(self.loading_jank.map(|j| j.to_string())), true),
+            row("balloon_seeds", none(self.balloon_seeds.clone()), true),
+            row("arith", self.arith.to_string(), true),
+            row("level_minus_one", none(self.level_minus_one.map(|(h, s)| format!("{h},{s}"))), false),
+            row("concrete_balloon_seeds", none(self.concrete_balloon_seeds.clone()), false),
+            row("threads", none(self.threads.map(|t| t.to_string())), false),
+            row("l1_table", none(self.l1_table.as_ref().map(|p| p.display().to_string())), false),
+            switch("override_settings", self.override_settings, false),
+            switch("key_check", self.diag.key_check, false),
+            switch("kernel_explain", self.diag.kernel_explain, false),
+            switch("build_trace", self.diag.build_trace, false),
+            switch("phases", self.diag.phases, false),
+        ]
+    }
+
+    /// The settings the flags give, validated and resolved: Celia's loading
+    /// jank by default its IL load's.
+    pub fn resolved(mut self) -> Result<Settings> {
+        if let Some((px, _)) = self.region {
+            let side = crate::storage::GEOMETRY.side as i32;
+            anyhow::ensure!(px % side == 0, "--region {px},..: a kernel region must hold whole storage regions ({side} px)");
+        }
+        anyhow::ensure!(!(self.nodiag && self.onlydiag), "--nodiag and --onlydiag exclude each other");
+        anyhow::ensure!(
+            !(self.arith == Arith::Float(FloatTool::Uct) && self.loading_jank.is_some()),
+            "--arith float-uct loads a room alone: no --loading-jank (Celia models the jank: --arith float)"
+        );
+        if self.arith == Arith::Float(FloatTool::Celia) && self.loading_jank.is_none() {
+            self.loading_jank = crate::starts::celia_jank(self.room)?;
+        }
+        Ok(self)
+    }
+
     /// The settings a CONCRETE run uses (the concrete searches, the known
     /// route's check, `l1-check`, the dual witness's replay): the balloons'
     /// phases fixed - `--concrete-balloon-seeds`, else `--balloon-seeds`,
@@ -216,20 +329,9 @@ impl Settings {
     /// The record's lines, `(key, value)`, in a fixed order: what changes a
     /// tree. `level`: the tree's level spec.
     fn recorded(&self, level: &str) -> Vec<(&'static str, String)> {
-        let opt = |v: Option<String>| v.unwrap_or_else(|| "none".to_string());
-        let mut lines = vec![
-            ("room", format!("{},{}", self.room.0, self.room.1)),
-            ("win_at", opt(self.win_at.map(|(x0, x1, y0, y1)| format!("{x0}..{x1},{y0}..{y1}")))),
-            ("split_frame", u8::from(self.split_frame).to_string()),
-            ("region", opt(self.region.map(|(px, s)| format!("{px},{s}")))),
-            ("hundred", u8::from(self.hundred).to_string()),
-            ("nodiag", u8::from(self.nodiag).to_string()),
-            ("onlydiag", u8::from(self.onlydiag).to_string()),
-            ("gemskip", u8::from(self.gemskip).to_string()),
-            ("loading_jank", opt(self.loading_jank.map(|j| j.to_string()))),
-            ("balloon_seeds", opt(self.balloon_seeds.clone())),
-            ("level", level.to_string()),
-        ];
+        let rows = self.rows();
+        let mut lines: Vec<(&'static str, String)> = rows.iter().filter(|r| r.recorded && r.key != "arith").map(|r| (r.key, r.text.clone())).collect();
+        lines.push(("level", level.to_string()));
         if self.arith != Arith::Fixed {
             lines.push(("arith", self.arith.to_string()));
             // A float tree's balloons: the phase an interval unless seeded
@@ -263,24 +365,49 @@ impl Settings {
         Ok(())
     }
 
+    /// THE SETTINGS OF A FINISHED TREE, for a command that reads it: its
+    /// record read back (each line its flag's text) and its level -1 filter
+    /// (`frame::TreeFilter`), with the run's own settings from `run` (the
+    /// threads, `--l1-table`, the concrete phase's seeds, the diagnostics).
+    /// The tree's level with them.
+    pub fn of_tree(dir: &Path, run: &Settings) -> Result<(Settings, crate::abstraction::Level)> {
+        let rec = read_record(dir)?;
+        let mut args = vec!["tree".to_string()];
+        for r in Settings::default().rows().into_iter().filter(|r| r.recorded) {
+            let text = match rec.get(r.key) {
+                Some(v) => v.to_string(),
+                // A fixed tree's record has no `arith` line.
+                None if r.key == "arith" => "fixed".to_string(),
+                None => anyhow::bail!("{}: the record has no `{}`", path(dir).display(), r.key),
+            };
+            args.extend(Row { text, ..r }.flag());
+        }
+        let flags = Flags::try_parse_from(&args).map_err(|e| anyhow::anyhow!("{}: the record does not read back: {e}", path(dir).display()))?;
+        let level = crate::abstraction::Level::parse(rec.get("level").with_context(|| format!("{}: the record names no level", path(dir).display()))?).map_err(|e| anyhow::anyhow!(e))?;
+        let minus_one = match crate::frame::TreeFilter::read(dir)? {
+            Some(crate::frame::TreeFilter::MinusOne { m, .. }) => Some((m.h, m.speed)),
+            Some(crate::frame::TreeFilter::Off) => None,
+            None => anyhow::bail!("{}: no level -1 record (a tree from before records)", dir.display()),
+        };
+        let s = Settings {
+            level_minus_one: minus_one,
+            concrete_balloon_seeds: run.concrete_balloon_seeds.clone(),
+            threads: run.threads,
+            l1_table: run.l1_table.clone(),
+            override_settings: false,
+            diag: run.diag.clone(),
+            ..flags.s
+        };
+        s.check(dir, level)?;
+        Ok((s, level))
+    }
+
     /// The tree in `dir` was built under these settings, at `level`: else an
     /// error that names every difference.
     pub fn check(&self, dir: &Path, level: crate::abstraction::Level) -> Result<()> {
         let level = level.to_string();
-        let p = path(dir);
-        let recorded = match std::fs::read_to_string(&p) {
-            Ok(s) => s,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => anyhow::bail!(
-                "{}: the tree records no settings (built before {}): its room, category, split frame, regions and level are unknown - delete it",
-                dir.display(),
-                p.display()
-            ),
-            Err(e) => return Err(e).with_context(|| p.display().to_string()),
-        };
-        let mut rec = recorded.lines();
-        let head = rec.next().unwrap_or("");
-        anyhow::ensure!(head == format!("tree settings {VERSION}"), "{}: {head:?} is not a settings record of format {VERSION}", p.display());
-        let rec: std::collections::BTreeMap<&str, &str> = rec.filter_map(|l| l.split_once(' ')).collect();
+        let rec = read_record(dir)?;
+        let rec: std::collections::BTreeMap<&str, &str> = rec.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
         let mine = self.recorded(&level);
         let mut diffs: Vec<(&str, String)> = mine
             .iter()
@@ -313,6 +440,30 @@ impl Settings {
     }
 }
 
+/// The settings a tree decides (its record's, and the level -1 filter's),
+/// by key: a command that reads a finished tree refuses them as flags.
+pub fn tree_keys() -> Vec<&'static str> {
+    Settings::default().rows().into_iter().filter(|r| r.recorded).map(|r| r.key).chain(["level_minus_one"]).collect()
+}
+
+/// A tree's record (`settings.txt`): its lines, `key value`, by key.
+fn read_record(dir: &Path) -> Result<std::collections::BTreeMap<String, String>> {
+    let p = path(dir);
+    let recorded = match std::fs::read_to_string(&p) {
+        Ok(s) => s,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => anyhow::bail!(
+            "{}: the tree records no settings (built before {}): its room, category, split frame, regions and level are unknown - delete it",
+            dir.display(),
+            p.display()
+        ),
+        Err(e) => return Err(e).with_context(|| p.display().to_string()),
+    };
+    let mut rec = recorded.lines();
+    let head = rec.next().unwrap_or("");
+    anyhow::ensure!(head == format!("tree settings {VERSION}"), "{}: {head:?} is not a settings record of format {VERSION}", p.display());
+    Ok(rec.filter_map(|l| l.split_once(' ')).map(|(k, v)| (k.to_string(), v.to_string())).collect())
+}
+
 /// The recorded settings `--override-settings` may override: those that do
 /// not change what a tree holds. The kernels' region grid (`--region`) only
 /// specializes the kernels: they are exact on every grid, and a lane outside
@@ -331,13 +482,9 @@ pub fn path(dir: &Path) -> PathBuf {
 /// line; none: fixed point), for a reader that is not a search's run (the
 /// UI export, which reads a dual search's halves both).
 pub fn recorded_arith(dir: &Path) -> Result<Arith> {
-    let p = path(dir);
-    let text = std::fs::read_to_string(&p).with_context(|| p.display().to_string())?;
-    match text.lines().find_map(|l| l.strip_prefix("arith ")) {
+    match read_record(dir)?.get("arith") {
         None => Ok(Arith::Fixed),
-        Some("float-celia") => Ok(Arith::Float(FloatTool::Celia)),
-        Some("float-uct") => Ok(Arith::Float(FloatTool::Uct)),
-        Some(a) => anyhow::bail!("{}: arith {a:?}", p.display()),
+        Some(a) => parse_arith(a).map_err(|e| anyhow::anyhow!("{}: {e}", path(dir).display())),
     }
 }
 
@@ -347,8 +494,21 @@ fn pair<T: std::str::FromStr>(s: &str, what: &str) -> std::result::Result<(T, T)
     Ok((p(a)?, p(b)?))
 }
 
-/// `x,y` or `x0..x1,y0..y1` (inclusive) -> `(x0, x1, y0, y1)`.
-fn parse_win_at(s: &str) -> std::result::Result<(i16, i16, i16, i16), String> {
+/// `--arith`: `fixed`, `float` (Celia's), `float-celia`, `float-uct`.
+fn parse_arith(s: &str) -> std::result::Result<Arith, String> {
+    match s {
+        "fixed" => Ok(Arith::Fixed),
+        "float" | "float-celia" => Ok(Arith::Float(FloatTool::Celia)),
+        "float-uct" => Ok(Arith::Float(FloatTool::Uct)),
+        _ => Err(format!("--arith: `fixed`, `float` (`float-celia`) or `float-uct`, not {s:?}")),
+    }
+}
+
+/// `x,y` or `x0..x1,y0..y1` (inclusive) -> `(x0, x1, y0, y1)`; `none`.
+fn parse_win_at(s: &str) -> std::result::Result<Option<(i16, i16, i16, i16)>, String> {
+    if s == "none" {
+        return Ok(None);
+    }
     let (x, y) = s.split_once(',').ok_or_else(|| format!("--win-at: \"x,y\" or \"x0..x1,y0..y1\", not {s:?}"))?;
     let range = |t: &str| -> std::result::Result<(i16, i16), String> {
         let one = |u: &str| u.trim().parse::<i16>().map_err(|e| format!("--win-at: {u:?}: {e}"));
@@ -362,167 +522,52 @@ fn parse_win_at(s: &str) -> std::result::Result<(i16, i16, i16, i16), String> {
         Ok((lo, hi))
     };
     let ((x0, x1), (y0, y1)) = (range(x)?, range(y)?);
-    Ok((x0, x1, y0, y1))
+    Ok(Some((x0, x1, y0, y1)))
 }
 
-/// THE FLAGS (every binary flattens them; `global`: given anywhere on a
-/// `rewrite` command line).
-#[derive(clap::Args, Clone, Debug)]
-pub struct SettingsArgs {
-    /// The game's arithmetic: `fixed` (PICO-8's 16.16, the real game) or
-    /// `float` (the Lua doubles of the TAS tools; plans/float.md).
-    #[arg(long, global = true, default_value = "fixed")]
-    pub arith: String,
-    /// With `--arith float`: the tool modelled, `celia` (the default: Celia's
-    /// float mode, its IL load's loading jank unless `--loading-jank` is
-    /// given, its seeds) or `uct` (UniversalClassicTas: the IL load, its
-    /// seeds).
-    #[arg(long, global = true)]
-    pub float_tool: Option<String>,
-    /// The start room "x,y".
-    #[arg(long, global = true, default_value = "1,0", value_parser = |s: &str| pair::<i16>(s, "--room"))]
-    pub room: (i16, i16),
-    /// A synthetic win: the player at "x,y", or in "x0..x1,y0..y1" (a test
-    /// configuration: a tree under it is another search).
-    #[arg(long, global = true, value_parser = parse_win_at)]
-    pub win_at: Option<(i16, i16, i16, i16)>,
-    /// Two search steps a frame (the split cart).
-    #[arg(long, global = true)]
-    pub split_frame: bool,
-    /// The kernels' region grid "px,S" (1 <= S <= 7), or `off`.
-    #[arg(long, global = true, default_value = "16,6")]
-    pub region: String,
-    /// 100%: a room is won only with its berry taken.
-    #[arg(long, global = true)]
-    pub hundred: bool,
-    /// No Diagonal Dashes: a dash may not start diagonal.
-    #[arg(long, global = true)]
-    pub nodiag: bool,
-    /// Only Diagonal Dashes: a dash must start diagonal (the straight and
-    /// facing-only dash arms raise).
-    #[arg(long, global = true)]
-    pub onlydiag: bool,
-    /// The gemskip categories: the orb room won without the orb, one dash after it.
-    #[arg(long, global = true)]
-    pub gemskip: bool,
-    /// The room as real play enters it: its loading frame from object J
-    /// (pico8_diff/chain.py), or `none` (the IL load).
-    #[arg(long, global = true, default_value = "none")]
-    pub loading_jank: String,
-    /// The start room's balloons' phases fixed, "s1,s2,..".
-    #[arg(long, global = true)]
-    pub balloon_seeds: Option<String>,
-    /// The balloons' phases of the concrete phase only (a tasdatabase file's
-    /// seeds): the witness is one real run under them.
-    #[arg(long, global = true)]
-    pub concrete_balloon_seeds: Option<String>,
-    /// The level -1 filter "H,S": H in search steps, S the table's speed bound.
-    #[arg(long, global = true, value_parser = |s: &str| pair::<u32>(s, "--level-minus-one"))]
-    pub level_minus_one: Option<(u32, u32)>,
-    /// Worker threads (default: one per physical core).
-    #[arg(long, global = true)]
-    pub threads: Option<usize>,
-    /// The level -1 table pinned by its FILE (read if it exists, else built
-    /// there): the fixtures', never a search's.
-    #[arg(long, global = true)]
-    pub l1_table: Option<PathBuf>,
-    /// Use a tree recorded under other settings that do not change what it
-    /// holds (only `--region`), under this run's; every difference is logged.
-    /// Any other difference (room, win, split frame, category, loading jank,
-    /// balloons, level) is still refused. A tree without a record is refused.
-    #[arg(long, global = true)]
-    pub override_settings: bool,
-    /// DIAGNOSTIC: every emitted row's key recomputed by the boundary, and
-    /// the row decoded back from its key and cell (the new layer is
-    /// decoded so) and compared.
-    #[arg(long, global = true)]
-    pub key_check: bool,
-    /// DIAGNOSTIC: kernels keep their graphs, so a decline names its premise.
-    #[arg(long, global = true)]
-    pub kernel_explain: bool,
-    /// DIAGNOSTIC: the kernel build's and the lattice walk's progress.
-    #[arg(long, global = true)]
-    pub build_trace: bool,
-    /// DIAGNOSTIC: the wave workers' phase timings.
-    #[arg(long, global = true)]
-    pub phases: bool,
-}
-
-impl SettingsArgs {
-    /// The settings these flags give (validated).
-    pub fn settings(&self) -> Result<Settings> {
-        let region = match self.region.as_str() {
-            "off" => None,
-            s => {
-                let (px, sp) = pair::<i32>(s, "--region").map_err(anyhow::Error::msg)?;
-                anyhow::ensure!(px >= 1 && (1..=7).contains(&sp), "--region \"px,S\" with px >= 1 and 1 <= S <= 7, not {s:?}");
-                Some((px, sp))
-            }
-        };
-        if let Some((px, _)) = region {
-            let side = crate::storage::GEOMETRY.side as i32;
-            anyhow::ensure!(px % side == 0, "--region {px},..: a kernel region must hold whole storage regions ({side} px)");
-        }
-        anyhow::ensure!(!(self.nodiag && self.onlydiag), "--nodiag and --onlydiag exclude each other");
-        let loading_jank = match self.loading_jank.as_str() {
-            "none" => None,
-            s => {
-                let j: usize = s.trim().parse().map_err(|_| anyhow::anyhow!("--loading-jank: an object index >= 1 or `none`, not {s:?}"))?;
-                anyhow::ensure!(j >= 1, "--loading-jank must be >= 1");
-                Some(j)
-            }
-        };
-        let level_minus_one = match self.level_minus_one {
-            Some((h, s)) => {
-                anyhow::ensure!(h < u32::MAX, "--level-minus-one horizon {h}");
-                Some((h, i32::try_from(s).context("--level-minus-one speed")?))
-            }
-            None => None,
-        };
-        anyhow::ensure!(self.threads != Some(0), "--threads 0");
-        let arith = match (self.arith.as_str(), self.float_tool.as_deref()) {
-            ("fixed", None) => Arith::Fixed,
-            ("fixed", Some(t)) => anyhow::bail!("--float-tool {t}: only with --arith float"),
-            ("float", Some("uct")) => Arith::Float(FloatTool::Uct),
-            ("float", None | Some("celia")) => Arith::Float(FloatTool::Celia),
-            ("float", Some(t)) => anyhow::bail!("--float-tool: `uct` or `celia`, not {t:?}"),
-            (a, _) => anyhow::bail!("--arith: `fixed` or `float`, not {a:?}"),
-        };
-        anyhow::ensure!(
-            !(arith == Arith::Float(FloatTool::Uct) && loading_jank.is_some()),
-            "--float-tool uct loads a room alone: no --loading-jank (Celia models the jank: --float-tool celia)"
-        );
-        // Celia enters a room as its IL load does, unless told the jank.
-        let loading_jank = match (arith, loading_jank) {
-            (Arith::Float(FloatTool::Celia), None) => crate::starts::celia_jank(self.room)?,
-            (_, j) => j,
-        };
-        Ok(Settings {
-            arith,
-            room: self.room,
-            win_at: self.win_at,
-            split_frame: self.split_frame,
-            region,
-            hundred: self.hundred,
-            nodiag: self.nodiag,
-            onlydiag: self.onlydiag,
-            gemskip: self.gemskip,
-            loading_jank,
-            balloon_seeds: self.balloon_seeds.clone(),
-            level_minus_one,
-            concrete_balloon_seeds: self.concrete_balloon_seeds.clone(),
-            threads: self.threads,
-            l1_table: self.l1_table.clone(),
-            override_settings: self.override_settings,
-            diag: Diagnostics {
-                key_check: self.key_check,
-                kernel_explain: self.kernel_explain,
-                kernel_metrics: false,
-                build_trace: self.build_trace,
-                phases: self.phases,
-            },
-        })
+/// `px,S` with px >= 1 and 1 <= S <= 7; `off` (`none`: the record's).
+fn parse_region(s: &str) -> std::result::Result<Option<(i32, i32)>, String> {
+    if s == "off" || s == "none" {
+        return Ok(None);
     }
+    let (px, sp) = pair::<i32>(s, "--region")?;
+    if px < 1 || !(1..=7).contains(&sp) {
+        return Err(format!("--region \"px,S\" with px >= 1 and 1 <= S <= 7, not {s:?}"));
+    }
+    Ok(Some((px, sp)))
+}
+
+/// An object index >= 1, or `none`.
+fn parse_jank(s: &str) -> std::result::Result<Option<usize>, String> {
+    match s {
+        "none" => Ok(None),
+        _ => match s.trim().parse::<usize>() {
+            Ok(j) if j >= 1 => Ok(Some(j)),
+            _ => Err(format!("--loading-jank: an object index >= 1 or `none`, not {s:?}")),
+        },
+    }
+}
+
+/// "s1,s2,..", or `none`.
+fn parse_seeds(s: &str) -> std::result::Result<Option<String>, String> {
+    Ok((s != "none").then(|| s.to_string()))
+}
+
+/// Worker threads, at least one.
+fn parse_threads(s: &str) -> std::result::Result<usize, String> {
+    match s.parse::<usize>() {
+        Ok(n) if n >= 1 => Ok(n),
+        _ => Err(format!("--threads: a count >= 1, not {s:?}")),
+    }
+}
+
+/// "H,S" (H < 2^32 - 1).
+fn parse_minus_one(s: &str) -> std::result::Result<(u32, i32), String> {
+    let (h, sp) = pair::<u32>(s, "--level-minus-one")?;
+    if h == u32::MAX {
+        return Err(format!("--level-minus-one horizon {h}"));
+    }
+    Ok((h, i32::try_from(sp).map_err(|_| format!("--level-minus-one speed {sp}"))?))
 }
 
 /// The long flags a command line defines twice, per (sub)command, the
@@ -579,7 +624,7 @@ pub fn refuse_env() -> Result<()> {
         ("CELESTE_L1_TABLE", "--l1-table"),
         ("CELESTE_KERNEL_KEY_CHECK", "--key-check"),
         ("CELESTE_KERNEL_EXPLAIN", "--kernel-explain"),
-        ("CELESTE_KERNEL_METRICS", "bench-frame --metrics"),
+        ("CELESTE_KERNEL_METRICS", "bench frame --metrics"),
         ("CELESTE_BUILD_TRACE", "--build-trace"),
         ("CELESTE_PHASES", "--phases"),
     ];
@@ -603,43 +648,12 @@ pub fn refuse_env() -> Result<()> {
 /// other one REFUSES it (the float pipeline is built a milestone at a time,
 /// plans/float.md: a command that would run fixed under a float
 /// flag is the footgun).
-pub fn startup(args: &SettingsArgs, float: bool, adjust: impl FnOnce(&mut Settings)) -> Result<Settings> {
+pub fn startup(args: &Settings, float: bool, adjust: impl FnOnce(&mut Settings)) -> Result<Settings> {
     refuse_env()?;
-    let mut s = args.settings()?;
+    let mut s = args.clone().resolved()?;
     anyhow::ensure!(float || s.arith == Arith::Fixed, "--arith {}: this command runs in fixed only so far (plans/float.md, Open gaps)", s.arith);
     adjust(&mut s);
-    let d = Settings::default();
-    let mut set: Vec<String> = Vec::new();
-    let mut note = |name: &str, on: bool, v: String| {
-        if on {
-            set.push(format!("{name}{v}"));
-        }
-    };
-    note("--arith ", s.arith != d.arith, match s.arith {
-        Arith::Fixed => "fixed".to_string(),
-        Arith::Float(FloatTool::Uct) => "float --float-tool uct".to_string(),
-        Arith::Float(FloatTool::Celia) => "float --float-tool celia".to_string(),
-    });
-    note("--room ", s.room != d.room, format!("{},{}", s.room.0, s.room.1));
-    note("--win-at ", s.win_at.is_some(), s.win_at.map_or(String::new(), |(x0, x1, y0, y1)| format!("{x0}..{x1},{y0}..{y1}")));
-    note("--split-frame", s.split_frame, String::new());
-    note("--region ", s.region != d.region, s.region.map_or("off".to_string(), |(p, v)| format!("{p},{v}")));
-    note("--hundred", s.hundred, String::new());
-    note("--nodiag", s.nodiag, String::new());
-    note("--onlydiag", s.onlydiag, String::new());
-    note("--gemskip", s.gemskip, String::new());
-    note("--loading-jank ", s.loading_jank.is_some(), format!("{}", s.loading_jank.unwrap_or_default()));
-    note("--balloon-seeds ", s.balloon_seeds.is_some(), s.balloon_seeds.clone().unwrap_or_default());
-    note("--concrete-balloon-seeds ", s.concrete_balloon_seeds.is_some(), s.concrete_balloon_seeds.clone().unwrap_or_default());
-    note("--level-minus-one ", s.level_minus_one.is_some(), s.level_minus_one.map_or(String::new(), |(h, v)| format!("{h},{v}")));
-    note("--threads ", s.threads.is_some(), format!("{}", s.threads.unwrap_or_default()));
-    note("--override-settings", s.override_settings, String::new());
-    note("--l1-table ", s.l1_table.is_some(), format!("{}", s.l1_table.as_deref().unwrap_or(Path::new("")).display()));
-    note("--key-check", s.diag.key_check, String::new());
-    note("--kernel-explain", s.diag.kernel_explain, String::new());
-    note("(kernel metrics)", s.diag.kernel_metrics, String::new());
-    note("--build-trace", s.diag.build_trace, String::new());
-    note("--phases", s.diag.phases, String::new());
+    let set: Vec<String> = s.rows().into_iter().zip(Settings::default().rows()).filter(|(a, d)| a.text != d.text).flat_map(|(a, _)| a.flag()).collect();
     if !set.is_empty() {
         eprintln!("[settings] {}", set.join(" "));
     }
@@ -649,18 +663,11 @@ pub fn startup(args: &SettingsArgs, float: bool, adjust: impl FnOnce(&mut Settin
 #[cfg(test)]
 mod tests {
     use super::*;
-    use clap::Parser;
-
-    #[derive(Parser)]
-    struct Cli {
-        #[command(flatten)]
-        s: SettingsArgs,
-    }
 
     fn parse(args: &[&str]) -> Result<Settings> {
         let mut v = vec!["x"];
         v.extend(args);
-        Cli::try_parse_from(v).map_err(|e| anyhow::anyhow!("{e}"))?.s.settings()
+        Flags::try_parse_from(v).map_err(|e| anyhow::anyhow!("{e}"))?.s.resolved()
     }
 
     /// The flags parse into the settings and refuse what is malformed.
@@ -678,12 +685,32 @@ mod tests {
         let celia = parse(&["--arith", "float"]).expect("float");
         assert_eq!((celia.arith, celia.loading_jank), (Arith::Float(FloatTool::Celia), Some(2)));
         assert_eq!(parse(&["--arith", "float", "--room", "0,0"]).expect("float").loading_jank, None);
-        assert_eq!(parse(&["--arith", "float", "--float-tool", "celia", "--loading-jank", "5"]).expect("celia").loading_jank, Some(5));
-        let uct = parse(&["--arith", "float", "--float-tool", "uct"]).expect("uct");
+        assert_eq!(parse(&["--arith", "float-celia", "--loading-jank", "5"]).expect("celia").loading_jank, Some(5));
+        let uct = parse(&["--arith", "float-uct"]).expect("uct");
         assert_eq!((uct.arith, uct.loading_jank), (Arith::Float(FloatTool::Uct), None));
-        for bad in [&["--arith", "double"][..], &["--float-tool", "celia"], &["--arith", "float", "--float-tool", "pico8"], &["--arith", "float", "--float-tool", "uct", "--loading-jank", "2"]] {
+        for bad in [&["--arith", "double"][..], &["--arith", "float-pico8"], &["--arith", "float-uct", "--loading-jank", "2"]] {
             assert!(parse(bad).is_err(), "{bad:?}");
         }
+    }
+
+    /// A tree's record reads back into the settings it was written from
+    /// (`of_tree`), every recorded setting off its default, fixed and float;
+    /// the run's own settings come from the run.
+    #[test]
+    fn a_record_reads_back() {
+        let dir = std::env::temp_dir().join(format!("celeste-settings-back-{}", std::process::id()));
+        let lvl = crate::abstraction::Level::parse("r0sxhf").expect("a level");
+        let run = Settings { threads: Some(3), diag: Diagnostics { key_check: true, ..Default::default() }, ..Settings::default() };
+        let all = Settings { room: (6, 2), win_at: Some((8, 10, 64, 64)), split_frame: true, region: None, hundred: true, nodiag: true, gemskip: true, loading_jank: Some(2), balloon_seeds: Some("0,1".into()), ..run.clone() };
+        let float = Settings { arith: Arith::Float(FloatTool::Uct), loading_jank: None, onlydiag: true, nodiag: false, ..all.clone() };
+        for s in [Settings { threads: Some(3), ..run.clone() }, all, float] {
+            let _ = std::fs::remove_dir_all(&dir);
+            s.write(&dir, lvl).expect("write");
+            std::fs::write(dir.join("level_minus_one.txt"), "off\n").expect("the filter's record");
+            let (back, level) = Settings::of_tree(&dir, &run).expect("read back");
+            assert_eq!((back, level), (s, lvl));
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The record round-trips; every differing setting is named; a tree

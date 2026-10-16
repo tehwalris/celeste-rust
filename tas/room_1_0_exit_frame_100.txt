@@ -3,7 +3,7 @@
 # SAME route (76 player updates, the 2022 searcher's win at 0-based control
 # frame 75) counted with a 24-frame prologue instead of 23.
 #
-# Input bytes for concrete_run (-i), one per frame starting at frame 1.
+# Input bytes for rewrite run (-i), one per frame starting at frame 1.
 # bit0=left bit1=right bit2=up bit3=down bit4=jump bit5=dash.
 # This file assumed the player's first update is frame 25. It is frame 24
 # (the player is created during frame 24 and `all(objects)` visits it in the
@@ -18,6 +18,6 @@
 # 5->7, 47->49, 53->54, 62->63 (0-based control frames).
 #
 # Replay:
-#   ./target/release/concrete_run -i "$(grep -v '^#' tas/room_1_0_exit_frame_100.txt | tr -d '\n')" -f 100
+#   ./target/release/rewrite run -i tas/room_1_0_exit_frame_100.txt -f 100
 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
 42,0,0,0,0,0,2,18,2,2,18,2,2,2,2,18,1,1,1,0,16,0,0,0,36,2,2,2,2,2,2,0,2,2,2,2,2,2,2,10,10,10,42,42,0,0,0,2,2,18,2,2,2,2,18,2,2,2,2,2,2,2,2,18,2,0,0,0,16,0,0,0,0,16,0,0
