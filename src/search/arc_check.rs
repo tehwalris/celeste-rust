@@ -255,38 +255,27 @@ pub fn run<N: Rem>(o: &Opts) -> Result<()> {
         // engine per worker), reported in record order.
         let stride = (recs.len() / o.samples.max(1)).max(1);
         let picked: Vec<&Rec<N>> = recs.iter().step_by(stride).take(o.samples).collect();
-        let next = std::sync::atomic::AtomicUsize::new(0);
-        let mut done: Vec<(usize, Sampled)> = std::thread::scope(|sc| {
-            let hs: Vec<_> = (0..workers.min(picked.len()))
-                .map(|_| {
-                    sc.spawn(|| -> Result<Vec<(usize, Sampled)>> {
-                        let mut eng = ReferenceEngine::<N::A>::new(cfg)?;
-                        if let Some(cap) = o.path_cap {
-                            eng.set_path_cap(cap);
-                        }
-                        let mut out = Vec::new();
-                        loop {
-                            let k = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            let Some(r) = picked.get(k) else { return Ok(out) };
-                            match check(&mut eng, frame, r, &recs) {
-                                Ok(o) => out.push((k, o)),
-                                Err(e) if e.downcast_ref::<crate::trace::refdriver::TooManyPaths>().is_some() => {
-                                    let msg = format!("[check arcs] f{frame} pred {} -> {}: SKIPPED ({e})", r.src.show(), r.target.show());
-                                    out.push((k, Sampled { skipped: 1, msgs: vec![msg], ..Default::default() }));
-                                }
-                                Err(e) => return Err(e),
-                            }
-                        }
-                    })
-                })
-                .collect();
-            hs.into_iter().map(|h| h.join().expect("a check arcs worker panicked")).collect::<Result<Vec<_>>>()
-        })?
-        .into_iter()
-        .flatten()
-        .collect();
-        done.sort_by_key(|d| d.0);
-        for (_, o) in done {
+        let done: Vec<Sampled> = crate::par::Pool::new(workers).map_with(
+            picked.len(),
+            || {
+                let mut eng = ReferenceEngine::<N::A>::new(cfg)?;
+                if let Some(cap) = o.path_cap {
+                    eng.set_path_cap(cap);
+                }
+                Ok(eng)
+            },
+            |eng, k| {
+                let r = picked[k];
+                match check(eng, frame, r, &recs) {
+                    Err(e) if e.downcast_ref::<crate::trace::refdriver::TooManyPaths>().is_some() => {
+                        let msg = format!("[check arcs] f{frame} pred {} -> {}: SKIPPED ({e})", r.src.show(), r.target.show());
+                        Ok(Sampled { skipped: 1, msgs: vec![msg], ..Default::default() })
+                    }
+                    other => other,
+                }
+            },
+        )?;
+        for o in done {
             for m in &o.msgs {
                 eprintln!("{m}");
             }

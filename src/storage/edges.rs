@@ -565,52 +565,29 @@ impl<N: Rem> EdgeStore<N> {
         v
     }
 
-    /// Every edge of frame `frame` on `threads` workers: each folds the
-    /// edges of the segments it takes into its own accumulator (`init()`);
-    /// the accumulators, in no particular order (fold them commutatively).
+    /// Every edge of frame `frame` on `threads` workers (`par::Pool`): the
+    /// edges of each segment folded into an accumulator of its own
+    /// (`init()`); the accumulators, by segment (fold them commutatively).
     pub fn par_scan<A: Send>(&self, frame: u32, threads: usize, init: impl Fn() -> A + Sync, f: impl Fn(&mut A, Edge) + Sync) -> Result<Vec<A>> {
-        let segs = self.all_segments(frame);
         let geo = GEOMETRY;
-        let next = std::sync::atomic::AtomicUsize::new(0);
-        std::thread::scope(|sc| {
-            let hs: Vec<_> = (0..threads.max(1))
-                .map(|_| {
-                    sc.spawn(|| -> Result<A> {
-                        let (mut acc, mut dec) = (init(), Decoder::default());
-                        loop {
-                            let k = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            let Some(s) = segs.get(k) else { return Ok(acc) };
-                            dec.bundles(s, |b| expand(&geo, s.region, &b, |src, dst| f(&mut acc, Edge { src, dst, xfer: b.x })))?;
-                        }
-                    })
-                })
-                .collect();
-            hs.into_iter().map(|h| h.join().expect("an edge scan worker panicked")).collect()
-        })
+        self.par_blocks(frame, threads, init, |acc, region, blk| blk.bundles(|b| expand(&geo, region, &b, |src, dst| f(acc, Edge { src, dst, xfer: b.x }))))
     }
 
-    /// Every segment of frame `frame` opened, on `threads` workers: each
-    /// folds the blocks it takes (`f(acc, target region, block)`) into its
-    /// own accumulator; the accumulators, in no particular order.
+    /// Every segment of frame `frame` opened, on `threads` workers
+    /// (`par::Pool`): its blocks folded (`f(acc, target region, block)`)
+    /// into an accumulator of its own; the accumulators, by segment.
     pub fn par_blocks<A: Send>(&self, frame: u32, threads: usize, init: impl Fn() -> A + Sync, f: impl Fn(&mut A, u32, &bundle::Block) -> Result<()> + Sync) -> Result<Vec<A>> {
         let segs = self.all_segments(frame);
-        let next = std::sync::atomic::AtomicUsize::new(0);
-        std::thread::scope(|sc| {
-            let hs: Vec<_> = (0..threads.max(1))
-                .map(|_| {
-                    sc.spawn(|| -> Result<A> {
-                        let (mut acc, mut dec) = (init(), Decoder::default());
-                        loop {
-                            let k = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            let Some(s) = segs.get(k) else { return Ok(acc) };
-                            let blk = dec.open(s)?;
-                            f(&mut acc, s.region, &blk)?;
-                        }
-                    })
-                })
-                .collect();
-            hs.into_iter().map(|h| h.join().expect("an edge scan worker panicked")).collect()
-        })
+        crate::par::Pool::new(threads).map_with(
+            segs.len(),
+            || Ok(Decoder::default()),
+            |dec, k| {
+                let mut acc = init();
+                let blk = dec.open(&segs[k])?;
+                f(&mut acc, segs[k].region, &blk)?;
+                Ok(acc)
+            },
+        )
     }
 
     /// Every edge of frame `frame`, as a list, sorted.

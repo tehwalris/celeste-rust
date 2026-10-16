@@ -105,10 +105,7 @@ mod tests {
         let sp = Spool::create(&path).unwrap();
         assert!(!path.exists(), "the spool is unlinked");
         let blocks: Vec<Vec<u8>> = (0..64u32).map(|k| (0..k * 37 + 1).map(|i| (i ^ k) as u8).collect()).collect();
-        let bodies: Vec<Body> = std::thread::scope(|s| {
-            let hs: Vec<_> = blocks.chunks(8).map(|c| s.spawn(|| c.iter().map(|b| Body::Mem(b.clone()).spill(Some(&sp)).unwrap()).collect::<Vec<_>>())).collect();
-            hs.into_iter().flat_map(|h| h.join().unwrap()).collect()
-        });
+        let bodies: Vec<Body> = crate::par::Pool::new(8).map(blocks.len(), |k| Body::Mem(blocks[k].clone()).spill(Some(&sp))).unwrap();
         assert_eq!(sp.bytes(), blocks.iter().map(|b| b.len() as u64).sum::<u64>());
         let mut buf = Vec::new();
         for (b, body) in blocks.iter().zip(&bodies) {

@@ -1611,28 +1611,10 @@ fn finalize_keys<N: Rem>(visited: &mut VisitedSet<N>, states: &[RouteState<N>], 
     keys.iter().zip(&contents).map(|(&k, m)| (k, visited.keys.complete(m))).collect()
 }
 
-/// `f` over `items` on `threads` threads, results in `items`' order.
+/// `f` over `items` on `threads` threads, results in `items`' order
+/// (`par::Pool`).
 pub fn par_map<T: Sync, R: Send>(items: &[T], threads: usize, f: impl Fn(&T) -> R + Sync) -> Vec<R> {
-    let next = AtomicUsize::new(0);
-    let mut out: Vec<(usize, R)> = std::thread::scope(|scope| {
-        let hs: Vec<_> = (0..threads.clamp(1, items.len().max(1)))
-            .map(|_| {
-                let (next, f) = (&next, &f);
-                scope.spawn(move || {
-                    let mut mine = Vec::new();
-                    loop {
-                        let i = next.fetch_add(1, Ordering::Relaxed);
-                        let Some(x) = items.get(i) else { break };
-                        mine.push((i, f(x)));
-                    }
-                    mine
-                })
-            })
-            .collect();
-        hs.into_iter().flat_map(|h| h.join().expect("a parallel worker panicked")).collect()
-    });
-    out.sort_unstable_by_key(|e| e.0);
-    out.into_iter().map(|e| e.1).collect()
+    crate::par::Pool::new(threads).map(items.len(), |i| Ok(f(&items[i]))).expect("an infallible map")
 }
 
 /// Frame 0: the initial states into an empty visited set, each KEYED AS IT

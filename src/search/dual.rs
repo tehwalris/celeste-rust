@@ -309,68 +309,51 @@ pub fn search<X: Rem, F: Rem>(fixed: &Half<X>, float: &Half<F>, bound: u32, pref
     for k in 0..frames {
         let t = std::time::Instant::now();
         let t_w = spf * (k + 1);
+        // In chunks of 16 parents, an engine pair per worker (each takes a
+        // free one: as many as workers), successors in chunk order.
         const CHUNK: usize = 16;
-        let next_chunk = std::sync::atomic::AtomicUsize::new(0);
-        let parts: Vec<Result<(Vec<(usize, Vec<Succ<X, F>>)>, u64)>> = std::thread::scope(|sc| {
-            let hs: Vec<_> = engines
-                .iter()
-                .map(|engine| {
-                    let (cur, next_chunk, sx, sf) = (&cur, &next_chunk, &sx, &sf);
-                    sc.spawn(move || -> Result<(Vec<(usize, Vec<Succ<X, F>>)>, u64)> {
-                        let mut pair = engine.lock().expect("an engine pair");
-                        let (ex, ef) = &mut *pair;
-                        let (mut out, mut steps) = (Vec::new(), 0u64);
-                        loop {
-                            let lo = next_chunk.fetch_add(CHUNK, std::sync::atomic::Ordering::Relaxed);
-                            if lo >= cur.len() {
-                                return Ok((out, steps));
-                            }
-                            let mut got = Vec::new();
-                            let mut chunk_seen: FxHashSet<Key> = FxHashSet::default();
-                            'chunk: for (pi, p) in cur.iter().enumerate().skip(lo).take(CHUNK) {
-                                let mut ran = Covered::default();
-                                for byte in input_order(prefer, k) {
-                                    if ran.covers(byte) {
-                                        continue;
-                                    }
-                                    let (next, read) = successors(ex, ef, sx, sf, p, byte, t_w, &mut steps).map_err(|e| e.context(format!("the frame after layer {k} with input {byte}")))?;
-                                    ran.push(byte, read);
-                                    for n in next {
-                                        match n {
-                                            Next::Win { fixed_won } => {
-                                                // The chunk ends at its first win: the
-                                                // earliest (chunks merge in order) ends the search.
-                                                got.push(Succ { parent: pi as u32, byte, fixed_won, next: None });
-                                                break 'chunk;
-                                            }
-                                            Next::Pair { pair, key, fixed_won } => {
-                                                if chunk_seen.insert(key.clone()) {
-                                                    got.push(Succ { parent: pi as u32, byte, fixed_won, next: Some((pair, key)) });
-                                                }
-                                            }
-                                        }
+        let parts: Vec<(Vec<Succ<X, F>>, u64)> = crate::par::Pool::new(engines.len()).map_with(
+            cur.len().div_ceil(CHUNK),
+            || engines.iter().find_map(|e| e.try_lock().ok()).ok_or_else(|| anyhow!("no free engine pair")),
+            |pair, c| {
+                let (ex, ef) = &mut **pair;
+                let lo = c * CHUNK;
+                let (mut got, mut steps) = (Vec::new(), 0u64);
+                let mut chunk_seen: FxHashSet<Key> = FxHashSet::default();
+                'chunk: for (pi, p) in cur.iter().enumerate().skip(lo).take(CHUNK) {
+                    let mut ran = Covered::default();
+                    for byte in input_order(prefer, k) {
+                        if ran.covers(byte) {
+                            continue;
+                        }
+                        let (next, read) = successors(ex, ef, &sx, &sf, p, byte, t_w, &mut steps).map_err(|e| e.context(format!("the frame after layer {k} with input {byte}")))?;
+                        ran.push(byte, read);
+                        for n in next {
+                            match n {
+                                Next::Win { fixed_won } => {
+                                    // The chunk ends at its first win: the
+                                    // earliest (chunks merge in order) ends the search.
+                                    got.push(Succ { parent: pi as u32, byte, fixed_won, next: None });
+                                    break 'chunk;
+                                }
+                                Next::Pair { pair, key, fixed_won } => {
+                                    if chunk_seen.insert(key.clone()) {
+                                        got.push(Succ { parent: pi as u32, byte, fixed_won, next: Some((pair, key)) });
                                     }
                                 }
                             }
-                            out.push((lo, got));
                         }
-                    })
-                })
-                .collect();
-            hs.into_iter().map(|h| h.join().expect("a dual worker panicked")).collect()
-        });
-        let mut chunks: Vec<(usize, Vec<Succ<X, F>>)> = Vec::new();
-        for p in parts {
-            let (c, s) = p?;
-            chunks.extend(c);
-            steps += s;
-        }
-        chunks.sort_unstable_by_key(|c| c.0);
+                    }
+                }
+                Ok((got, steps))
+            },
+        )?;
+        steps += parts.iter().map(|p| p.1).sum::<u64>();
         // Each dual state once, in order; the first win ends the search.
         let mut seen: FxHashSet<Key> = FxHashSet::default();
         let (mut next, mut links): (Vec<Pair<X, F>>, Vec<(u32, u8, bool)>) = (Vec::new(), Vec::new());
         let mut won: Option<(u32, u8, bool)> = None;
-        for s in chunks.into_iter().flat_map(|c| c.1) {
+        for s in parts.into_iter().flat_map(|p| p.0) {
             match s.next {
                 None => {
                     won = Some((s.parent, s.byte, s.fixed_won));
