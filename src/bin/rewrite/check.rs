@@ -205,8 +205,8 @@ pub fn run(run: &Settings, c: Command) -> Result<()> {
             let to = t.frame(a.to)?;
             let tm = std::time::Instant::now();
             let frames = match t.settings.arith {
-                Arith::Fixed => replay::<P8>(&t.dir, to, P8::start_hull(&t.settings)?, t.settings.threads())?,
-                Arith::Float(_) => replay::<LuaF64>(&t.dir, to, LuaF64::start_hull(&t.settings)?, t.settings.threads())?,
+                Arith::Fixed => replay::<P8>(&t.dir, to, t.settings.threads())?,
+                Arith::Float(_) => replay::<LuaF64>(&t.dir, to, t.settings.threads())?,
             };
             println!("frame states edges");
             for (f, x) in frames.iter().enumerate() {

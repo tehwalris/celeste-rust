@@ -4,6 +4,7 @@
 //! it wrote), the hardware counters over a rep and the frame's steps, the
 //! cost report and the memory report.
 
+use crate::search::hull::HullOf;
 use anyhow::{ensure, Context, Result};
 use std::path::{Path, PathBuf};
 
@@ -409,7 +410,7 @@ pub fn dir_fingerprint(dir: &Path) -> Result<(u64, u64, u64)> {
 /// set's states and entries, beside the process's resident set (the rest:
 /// the kernels, the allocator's retained and fragmented pages, what no
 /// part counts).
-pub fn print_memory<N: crate::search::rem::Rem>(when: &str, visited: &super::visited::VisitedSet<N>, new: &super::layer::Layer<N>, hulls: &[N::Hull], old: &super::wave::ByLayer<N>, outs: &super::out::OutStore, xfers: &super::edges::XferTable<N>) {
+pub fn print_memory<N: crate::search::rem::Rem>(when: &str, visited: &super::visited::VisitedSet<N>, new: &super::layer::Layer<N>, hulls: &[HullOf<N>], old: &super::wave::ByLayer<N>, outs: &super::out::OutStore, xfers: &super::edges::XferTable<N>) {
     let mut parts: Vec<(&str, usize)> = visited.census();
     let f = new.set.bytes();
     parts.push(("frontier: new states' keys, masks, index", f.iter().sum()));

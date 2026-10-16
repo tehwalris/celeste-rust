@@ -20,6 +20,7 @@
 //! 32768 entries. A packed block holds its keys delta-coded, its masks, its
 //! bare cells, its states' layers and hulls, column by column, zstd.
 
+use crate::search::hull::HullOf;
 use anyhow::{anyhow, ensure, Result};
 
 use super::bundle::{get_varint, get_varint128, put_varint, put_varint128};
@@ -51,7 +52,7 @@ fn bytes_of(w: u128) -> usize {
 /// info.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct StateInfo<N: Rem = P8> {
-    pub hull: N::Hull,
+    pub hull: HullOf<N>,
     pub layer: u16,
 }
 
@@ -59,7 +60,7 @@ impl<N: Rem> StateInfo<N> {
     /// Is its hull the whole torus (then it is not stored: a bare cell)?
     #[inline]
     pub fn is_full(&self) -> bool {
-        N::is_full(&self.hull)
+        self.hull.is_full()
     }
 }
 
@@ -178,7 +179,7 @@ impl<N: Rem> Rows<N> {
             raw.extend_from_slice(&i.layer.to_le_bytes());
         }
         for i in &self.infos[ia..ib] {
-            N::hull_to_bytes(&i.hull, raw);
+            i.hull.to_bytes(raw);
         }
         ensure!(raw.len() < u32::MAX as usize, "a packed block of {} bytes", raw.len());
         let states: u32 = self.masks[a..b].iter().map(|m| m.count_ones()).sum();
@@ -189,9 +190,9 @@ impl<N: Rem> Rows<N> {
     fn decode(&mut self, block: &Block, raw: &mut Vec<u8>) -> Result<()> {
         let pos = self.decode_cells(block, raw)?;
         let ni = block.infos as usize;
-        ensure!(pos + (2 + N::HULL_BYTES) * ni == raw.len(), "a packed block's infos do not match its cells");
+        ensure!(pos + (2 + HullOf::<N>::BYTES) * ni == raw.len(), "a packed block's infos do not match its cells");
         let (layers, hulls) = raw[pos..].split_at(2 * ni);
-        self.infos.extend(layers.chunks_exact(2).zip(hulls.chunks_exact(N::HULL_BYTES)).map(|(l, h)| StateInfo { layer: u16::from_le_bytes([l[0], l[1]]), hull: N::hull_from_bytes(h) }));
+        self.infos.extend(layers.chunks_exact(2).zip(hulls.chunks_exact(HullOf::<N>::BYTES)).map(|(l, h)| StateInfo { layer: u16::from_le_bytes([l[0], l[1]]), hull: HullOf::<N>::from_bytes(h) }));
         Ok(())
     }
 

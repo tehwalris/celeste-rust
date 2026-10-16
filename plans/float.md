@@ -59,8 +59,9 @@ A compile-time choice: `celeste_core::arith::Arithmetic` (`Fixed`,
 `Float`), its numbers `EngineNum` (`Pico8Num`, `LuaF64`: a code is the raw
 bits, `u64` for a double), the graph's rules `transpile::garith::GraphArith`,
 the kernels' lanes `compiled::KernelLanes`, the remainder model
-`search::rem::Rem` (`P8`, `LuaF64`), the arcs' circle `search::arcs::Circle`
-(`Fixed16`, `rem_f64::Doubles`). Fixed is every default type parameter.
+`search::rem::Rem` (`P8`, `LuaF64`: the transfers), the circle its points
+are `search::arcs::Circle` (`Fixed16`, `rem_f64::Doubles`: the hulls, the
+arcs' sets). Fixed is every default type parameter.
 
 ## The remainder model and the round fork
 

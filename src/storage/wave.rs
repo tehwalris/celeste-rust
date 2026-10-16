@@ -23,6 +23,7 @@
 //! the frame's edge file. The result is a function of the frame, not of the
 //! scheduling (the pushes merge order-free: `search::hull`).
 
+use crate::search::hull::{AccOf, HullOf};
 use anyhow::{anyhow, ensure, Result};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -47,8 +48,8 @@ use celeste_engine::exact::{Code, KeyAdditions, MissKey, Provisional};
 pub struct Old<N: Rem = P8> {
     pub sk: Sk,
     pub layer: u16,
-    pub hull: N::Hull,
-    pub was: N::Hull,
+    pub hull: HullOf<N>,
+    pub was: HullOf<N>,
 }
 
 /// OLD states by layer: per layer (ascending; none without a state) its
@@ -70,7 +71,7 @@ pub fn by_layer_states<N: Rem>(by: &ByLayer<N>) -> usize {
 pub struct OldLayer<N: Rem = P8> {
     pub layer: u16,
     entries: Vec<OldEntry>,
-    hulls: Vec<[N::Hull; 2]>,
+    hulls: Vec<[HullOf<N>; 2]>,
 }
 
 /// An entry of an `OldLayer`: its key, cells, region and first state.
@@ -117,7 +118,7 @@ impl<N: Rem> OldLayer<N> {
 
     /// Bytes held.
     pub fn bytes(&self) -> usize {
-        self.entries.capacity() * std::mem::size_of::<OldEntry>() + self.hulls.capacity() * std::mem::size_of::<[N::Hull; 2]>()
+        self.entries.capacity() * std::mem::size_of::<OldEntry>() + self.hulls.capacity() * std::mem::size_of::<[HullOf<N>; 2]>()
     }
 
     /// Entry `e`'s states as `Old`s, by cell.
@@ -149,7 +150,7 @@ impl<N: Rem> OldLayer<N> {
 #[derive(Clone)]
 pub struct Frontier<N: Rem = P8> {
     pub new: Layer<N>,
-    pub hulls: Vec<N::Hull>,
+    pub hulls: Vec<HullOf<N>>,
     pub old: ByLayer<N>,
 }
 
@@ -180,7 +181,7 @@ pub struct Wave<N: Rem = P8> {
     /// The NEW states, by region and key, with their skeletons, and their
     /// hulls in its state order.
     pub next: Layer<N>,
-    pub hulls: Vec<N::Hull>,
+    pub hulls: Vec<HullOf<N>>,
     /// The states expanded before whose hull GREW.
     pub grown: ByLayer<N>,
     /// The win states among the new ones: per entry of `next` (ascending)
@@ -368,7 +369,7 @@ struct UnitScratch {
 /// resumed), the rest through the engine into the sink, each lane with its
 /// hull (`hulls`: the layer's, in its state order).
 #[allow(clippy::too_many_arguments)]
-fn run_unit<N: Rem>(engine: &dyn FrameStep<N>, u: u32, entries: std::ops::Range<usize>, state: usize, layer: &Layer<N>, hulls: &[N::Hull], starts: &[usize], shapes: &[u64], sink: &mut UnitSink<'_, N>, sc: &mut UnitScratch, layer_frame: u32, ceiling: Option<u32>, s: &crate::settings::Settings) -> Result<()> {
+fn run_unit<N: Rem>(engine: &dyn FrameStep<N>, u: u32, entries: std::ops::Range<usize>, state: usize, layer: &Layer<N>, hulls: &[HullOf<N>], starts: &[usize], shapes: &[u64], sink: &mut UnitSink<'_, N>, sc: &mut UnitScratch, layer_frame: u32, ceiling: Option<u32>, s: &crate::settings::Settings) -> Result<()> {
     let geo = GEOMETRY;
     let t_dec = phases::start(s.diag.phases);
     sink.begin(u);
@@ -985,7 +986,7 @@ pub fn run_wave<N: Rem>(engine: &dyn FrameStep<N>, front: Frontier<N>, cx: WaveC
     // Into the visited set: the new states (new: none held) with their
     // layer and hull, the grown states' hulls.
     let layer16 = u16::try_from(frame).map_err(|_| anyhow!("frame {frame}: past a u16 layer"))?;
-    let parts: Vec<(u32, &super::set::RegionTable, &[N::Hull], &[Old<N>])> = new.iter().map(|sl| (sl.region, &sl.table, sl.hulls.as_slice(), sl.grown.as_slice())).collect();
+    let parts: Vec<(u32, &super::set::RegionTable, &[HullOf<N>], &[Old<N>])> = new.iter().map(|sl| (sl.region, &sl.table, sl.hulls.as_slice(), sl.grown.as_slice())).collect();
     let up = visited.absorb(&parts, layer16, s.threads())?;
     drop(parts);
     ensure!(up.held_new == 0, "frame {frame}: {} of the next layer's states the visited set held already", up.held_new);
@@ -1001,7 +1002,7 @@ pub fn run_wave<N: Rem>(engine: &dyn FrameStep<N>, front: Frontier<N>, cx: WaveC
     // were: 48 B a grown state twice at the frame's end).
     let mut runs: Vec<Vec<Old<N>>> = Vec::with_capacity(new.len());
     let mut next = Layer::<N>::default();
-    let mut hulls: Vec<N::Hull> = Vec::with_capacity(new.iter().map(|sl| sl.hulls.len()).sum());
+    let mut hulls: Vec<HullOf<N>> = Vec::with_capacity(new.iter().map(|sl| sl.hulls.len()).sum());
     for sl in new {
         runs.push(sl.grown);
         if !sl.table.is_empty() {
@@ -1154,7 +1155,7 @@ struct CellAccs<N: Rem> {
     /// Per target: (route, key, cells), (its run's start, its capacity).
     targets: Vec<(u32, Key, u64)>,
     runs: Vec<(u32, u32)>,
-    slots: Vec<N::Acc>,
+    slots: Vec<AccOf<N>>,
 }
 
 impl<N: Rem> Default for CellAccs<N> {
@@ -1184,12 +1185,12 @@ impl<N: Rem> CellAccs<N> {
 
     /// `a` merged into target `t`'s cell `c`.
     #[inline]
-    fn merge(&mut self, t: u32, c: u32, a: &N::Acc) {
+    fn merge(&mut self, t: u32, c: u32, a: &AccOf<N>) {
         let m = self.targets[t as usize].2;
         let (start, cap) = self.runs[t as usize];
         let rank = (m & ((1u64 << c) - 1)).count_ones();
         if m >> c & 1 != 0 {
-            N::acc_merge(&mut self.slots[(start + rank) as usize], a);
+            self.slots[(start + rank) as usize].merge(a);
             return;
         }
         let len = m.count_ones();
@@ -1199,7 +1200,7 @@ impl<N: Rem> CellAccs<N> {
             let at = self.slots.len() as u32;
             let cap = (cap * 2).clamp(4, 64);
             self.slots.extend_from_within(start as usize..(start + len) as usize);
-            self.slots.resize((at + cap) as usize, N::Acc::default());
+            self.slots.resize((at + cap) as usize, AccOf::<N>::default());
             self.runs[t as usize] = (at, cap);
             at
         };
@@ -1346,8 +1347,8 @@ fn run_repush<N: Rem>(u: u32, layer: &OldLayer<N>, entries: std::ops::Range<usiz
                         // Old states of an entry are by cell: a cell's rank among them.
                         let [hull, was] = &layer.hulls[a + (cells & ((1u64 << s) - 1)).count_ones() as usize];
                         let Some(acc) = cache.get(hull, was, ob.x, || {
-                            let mut a = N::Acc::default();
-                            N::push_grown(hull, was, xfer, &mut a).then_some(a)
+                            let mut a = AccOf::<N>::default();
+                            hull.push_grown(was, xfer, &mut a).then_some(a)
                         }) else {
                             continue;
                         };
@@ -1633,7 +1634,7 @@ pub fn par_map<T: Sync, R: Send>(items: &[T], threads: usize, f: impl Fn(&T) -> 
 /// loading jank a key's sprite and a balloon's phase - and a row keyed by
 /// its view decodes to the view: the start would be stored lossy, and the
 /// kernels' pins would decline it.
-pub fn seed<N: Rem>(visited: &mut VisitedSet<N>, blocks: &[Block<N>], start: N::Hull, s: &crate::settings::Settings) -> Result<Wave<N>> {
+pub fn seed<N: Rem>(visited: &mut VisitedSet<N>, blocks: &[Block<N>], start: HullOf<N>, s: &crate::settings::Settings) -> Result<Wave<N>> {
     let geo = visited.geo;
     let ids = crate::compiled::ids();
     let mut canon: Vec<celeste_engine::runtime2::Rt2<N>> = Vec::with_capacity(blocks.len());
@@ -1694,7 +1695,7 @@ pub fn seed<N: Rem>(visited: &mut VisitedSet<N>, blocks: &[Block<N>], start: N::
         i = j;
     }
     let hulls = vec![start; next.states() as usize];
-    let mut parts: Vec<(u32, &super::set::RegionTable, &[N::Hull], &[Old<N>])> = Vec::new();
+    let mut parts: Vec<(u32, &super::set::RegionTable, &[HullOf<N>], &[Old<N>])> = Vec::new();
     let mut at = 0usize;
     for (region, t) in next.set.tables() {
         let n = t.states() as usize;
@@ -1732,7 +1733,7 @@ pub fn one_frame<N: Rem>(engine: &dyn FrameStep<N>, rows: Vec<Block<N>>, frame: 
     let mut xfers = XferTable::<N>::default();
     let skeletons = Skeletons::<N>::default();
     let s = engine.settings();
-    let start = seed(&mut visited, &rows, N::full(), &s)?.frontier();
+    let start = seed(&mut visited, &rows, HullOf::<N>::full(), &s)?.frontier();
     visited.forget_states();
     let cx = WaveCtx { visited: &mut visited, xfers: &mut xfers, pos: None, filters: Filters::default(), frame, edges_dir: None, outs: None, skeletons: &skeletons, ceiling: None };
     let wave = run_wave(engine, start, cx)?;

@@ -9,6 +9,7 @@
 //! each with its PUSHES: per target cell the hulls of the unit's sources
 //! pushed along the bundles' transfers (`search::hull`).
 
+use crate::search::hull::{AccOf, HullOf};
 use anyhow::Result;
 use celeste_core::arith::EngineNum;
 use celeste_core::pico8_num::Pico8Num as P8;
@@ -227,7 +228,7 @@ pub struct UnitSink<'a, N: Rem = P8> {
     srcs: Vec<(u32, Key)>,
     src_local: Vec<u32>,
     lanes: Vec<(u32, u32)>,
-    hulls: Vec<N::Hull>,
+    hulls: Vec<HullOf<N>>,
     unit_sources: Vec<(u32, Key)>,
     src_idx: rustc_hash2::FxHashMap<(u32, Key), u32>,
     /// The unit's lanes' hulls by source: per unit source its first entry,
@@ -238,7 +239,7 @@ pub struct UnitSink<'a, N: Rem = P8> {
     entry_next: Vec<(u32, u32, u64, u32)>,
     /// A route's pushes being merged (`pushes`): per target cell reached a
     /// slot (the targets' cells in order), and each target's first slot.
-    push_slots: Vec<N::Acc>,
+    push_slots: Vec<AccOf<N>>,
     push_offs: Vec<u32>,
     /// Pushes by (hull, local transfer id): ids are this worker's for the
     /// frame.
@@ -417,7 +418,7 @@ impl<'a, N: Rem> UnitSink<'a, N> {
         use std::mem::size_of;
         [
             self.bundles.alloc_bytes(),
-            size_of::<N::Hull>() * self.hulls.capacity() + 4 * self.src_first.capacity() + 20 * self.entry_next.capacity() + size_of::<N::Acc>() * self.push_slots.capacity() + 4 * self.push_offs.capacity(),
+            size_of::<HullOf<N>>() * self.hulls.capacity() + 4 * self.src_first.capacity() + 20 * self.entry_next.capacity() + size_of::<AccOf<N>>() * self.push_slots.capacity() + 4 * self.push_offs.capacity(),
             9 * self.pos_edges.capacity() + 8 * self.pos_recent.capacity(),
             (size_of::<N::Pair>() + 8) * self.xfer_ids.capacity()
                 + size_of::<crate::search::rem::Xfer<N>>() * self.xfer_pairs.capacity()
@@ -488,7 +489,7 @@ impl<'a, N: Rem> UnitSink<'a, N> {
     /// The unit's next lane: a state of source entry `entry` at `cell`,
     /// with its hull.
     #[inline]
-    pub fn push_lane(&mut self, entry: u32, cell: u32, hull: N::Hull) {
+    pub fn push_lane(&mut self, entry: u32, cell: u32, hull: HullOf<N>) {
         self.lanes.push((entry, cell));
         self.hulls.push(hull);
     }
@@ -984,7 +985,7 @@ impl<'a, N: Rem> UnitSink<'a, N> {
     /// a bundle without a transfer pushes the whole circle), merged -
     /// `(target, cell, hull so far)`, the cells nothing reached left out.
     #[inline(never)]
-    fn pushes(&mut self, slot: u32, targets: &[(Key, u64)], bundles: &[super::route::Ub]) -> Vec<(u32, u8, N::Acc)> {
+    fn pushes(&mut self, slot: u32, targets: &[(Key, u64)], bundles: &[super::route::Ub]) -> Vec<(u32, u8, AccOf<N>)> {
         let geo = super::GEOMETRY;
         // A slot per target cell reached (a bundle's cells are its target's).
         let (mut slots, mut offs) = (std::mem::take(&mut self.push_slots), std::mem::take(&mut self.push_offs));
@@ -995,7 +996,7 @@ impl<'a, N: Rem> UnitSink<'a, N> {
             n += m.count_ones();
         }
         slots.clear();
-        slots.resize(n as usize, N::Acc::default());
+        slots.resize(n as usize, AccOf::<N>::default());
         // A bundle's edges: (source lane, target cell).
         let mut edges: Vec<(u32, u8)> = Vec::with_capacity(64);
         for b in bundles {
@@ -1022,22 +1023,22 @@ impl<'a, N: Rem> UnitSink<'a, N> {
             for &(lane, c) in &edges {
                 let h = self.hulls[lane as usize];
                 let pushed = self.push_cache.get(&h, &h, b.x, || {
-                    let mut a = N::Acc::default();
-                    N::push(&h, &xfer, &mut a).then_some(a)
+                    let mut a = AccOf::<N>::default();
+                    h.push(&xfer, &mut a).then_some(a)
                 });
                 if let Some(a) = pushed {
-                    N::acc_merge(&mut slots[at(c as u32)], &a);
+                    slots[at(c as u32)].merge(&a);
                 }
             }
         }
-        let mut out: Vec<(u32, u8, N::Acc)> = Vec::with_capacity(n as usize);
+        let mut out: Vec<(u32, u8, AccOf<N>)> = Vec::with_capacity(n as usize);
         let mut at = 0usize;
         for (t, &(_, m)) in targets.iter().enumerate() {
             let mut c = m;
             while c != 0 {
                 let k = c.trailing_zeros();
                 c &= c - 1;
-                if !N::acc_is_empty(&slots[at]) {
+                if !slots[at].is_empty() {
                     out.push((t as u32, k as u8, slots[at]));
                 }
                 at += 1;
@@ -1103,7 +1104,7 @@ impl<'a, N: Rem> UnitSink<'a, N> {
     /// routes: `targets` (route, key, cells), each one's cells' hulls a run
     /// of `slots` (`runs`: its start) - no bundle: the edges are recorded.
     #[inline(never)]
-    pub(crate) fn repush_chunks(&mut self, targets: &[(u32, Key, u64)], runs: &[(u32, u32)], slots: &[N::Acc]) {
+    pub(crate) fn repush_chunks(&mut self, targets: &[(u32, Key, u64)], runs: &[(u32, u32)], slots: &[AccOf<N>]) {
         let mut order: Vec<u32> = (0..targets.len() as u32).collect();
         order.sort_unstable_by_key(|&t| targets[t as usize].0);
         let mut chunks: Vec<Chunk<N>> = Vec::new();

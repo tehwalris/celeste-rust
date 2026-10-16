@@ -825,7 +825,7 @@ impl<N: Rem> ForwardState<N> {
         let ids = crate::compiled::ids();
         anyhow::ensure!(initial.iter().all(|b| b.rt2().player_objects(ids).is_empty()), "frame 0: an initial row holds a player, whose remainder the start's hull does not describe");
         let mut visited = crate::storage::visited::VisitedSet::<N>::new(crate::storage::GEOMETRY);
-        let seeded = crate::storage::wave::seed(&mut visited, &initial, N::start_hull(s)?, s)?;
+        let seeded = crate::storage::wave::seed(&mut visited, &initial, crate::search::rem::start_hull::<N>(), s)?;
         let won = checkpoint(dir, 0, &seeded, &[], s)?.won;
         let observer = record.then(crate::search::pos_graph::PosObserver::default);
         // An (empty) graph from the start: every tree with frames has one.
@@ -1685,7 +1685,7 @@ mod tests {
         let st = ForwardState::<P8>::at(&hull, to, false, level, &s).expect("at");
         let tree = crate::storage::layer::Tree::<P8>::open(&hull, to).expect("tree");
         let layers: Vec<Layer> = (0..=to).map(|f| tree.layer(f, None, 4).expect("layer").0).collect();
-        let p0 = crate::search::rem::start_point::<P8>(&s).expect("start");
+        let p0 = crate::search::rem::start_point::<P8>();
         let mut checked = 0u64;
         crate::search::reach::exact(&hull, to, p0, 4, |t, cur, inexact| {
             assert!(inexact.is_empty(), "room (1,0) to f{to} needs no coarsening");

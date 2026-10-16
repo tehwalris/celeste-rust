@@ -20,6 +20,7 @@
 //! hull GREW, the rest nothing. No lookup happens in the units, no state is
 //! named by a number, no row is copied.
 
+use crate::search::hull::{AccOf, HullOf};
 use anyhow::{ensure, Result};
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::sync::RwLock;
@@ -49,7 +50,7 @@ const PROV: u32 = u32::MAX;
 pub struct Touched<N: Rem = P8> {
     index: Vec<u32>,
     keys: Vec<TouchedKey>,
-    slots: Vec<N::Acc>,
+    slots: Vec<AccOf<N>>,
     states: usize,
     dead: usize,
 }
@@ -116,14 +117,14 @@ impl<N: Rem> Touched<N> {
 
     /// Merge `cells` (by cell, ascending: `(cell, hull)`) into key `key`'s.
     #[inline]
-    pub fn push(&mut self, key: Key, cells: &[(u8, N::Acc)]) {
+    pub fn push(&mut self, key: Key, cells: &[(u8, AccOf<N>)]) {
         let e = self.place(key);
         let TouchedKey { cells: mask, start, .. } = self.keys[e as usize];
         let add = cells.iter().fold(0u64, |m, x| m | 1u64 << x.0);
         let rank = |m: u64, c: u8| (m & ((1u64 << c) - 1)).count_ones() as usize;
         if add & !mask == 0 {
             for &(c, ref a) in cells {
-                N::acc_merge(&mut self.slots[start as usize + rank(mask, c)], a);
+                self.slots[start as usize + rank(mask, c)].merge(a);
             }
             return;
         }
@@ -135,10 +136,10 @@ impl<N: Rem> Touched<N> {
         while m != 0 {
             let c = m.trailing_zeros() as u8;
             m &= m - 1;
-            self.slots.push(if mask >> c & 1 == 1 { self.slots[start as usize + rank(mask, c)] } else { N::Acc::default() });
+            self.slots.push(if mask >> c & 1 == 1 { self.slots[start as usize + rank(mask, c)] } else { AccOf::<N>::default() });
         }
         for &(c, ref a) in cells {
-            N::acc_merge(&mut self.slots[at + rank(next, c)], a);
+            self.slots[at + rank(next, c)].merge(a);
         }
         self.states += (add & !mask).count_ones() as usize;
         self.dead += mask.count_ones() as usize;
@@ -178,7 +179,7 @@ impl<N: Rem> Touched<N> {
     /// The keys pushed into, each `key(k)` (a provisional key made final:
     /// distinct keys stay distinct), sorted, and the hulls so far (each
     /// key's run by cell).
-    pub fn into_sorted(self, key: impl Fn(Key) -> Result<Key>) -> Result<(Vec<TouchedKey>, Vec<N::Acc>)> {
+    pub fn into_sorted(self, key: impl Fn(Key) -> Result<Key>) -> Result<(Vec<TouchedKey>, Vec<AccOf<N>>)> {
         let mut keys = self.keys;
         for k in &mut keys {
             k.key = key(k.key)?;
@@ -196,7 +197,7 @@ impl<N: Rem> Touched<N> {
     /// Bytes held by part (`[wavemem]`): the index, the keys, the slots
     /// live, the slots dead or spare; and the keys and states held.
     pub fn bytes(&self) -> [usize; 4] {
-        let slot = std::mem::size_of::<N::Acc>();
+        let slot = std::mem::size_of::<AccOf<N>>();
         [self.index.capacity() * 4, self.keys.capacity() * std::mem::size_of::<TouchedKey>(), self.states * slot, (self.slots.capacity() - self.states) * slot]
     }
 
@@ -247,7 +248,7 @@ pub struct Chunk<N: Rem = P8> {
     pub unit: u32,
     pub worker: u32,
     pub targets: Vec<(Key, u64)>,
-    pub pushes: Vec<(u32, u8, N::Acc)>,
+    pub pushes: Vec<(u32, u8, AccOf<N>)>,
     pub sources: std::sync::Arc<[(u32, Key)]>,
     pub bundles: Vec<Ub>,
     pub src_regions: Vec<u32>,
@@ -561,7 +562,7 @@ impl Scratch {
 impl<N: Rem> Chunk<N> {
     /// Bytes it holds (its unit's shared sources not counted).
     pub fn alloc_bytes(&self) -> usize {
-        24 * self.targets.capacity() + std::mem::size_of::<(u32, u8, N::Acc)>() * self.pushes.capacity() + std::mem::size_of::<Ub>() * self.bundles.capacity() + 4 * self.src_regions.capacity()
+        24 * self.targets.capacity() + std::mem::size_of::<(u32, u8, AccOf<N>)>() * self.pushes.capacity() + std::mem::size_of::<Ub>() * self.bundles.capacity() + 4 * self.src_regions.capacity()
     }
 }
 
@@ -609,7 +610,7 @@ pub fn run_route<N: Rem>(st: &mut RouteState<N>, slice: u32, chunks: &[&Chunk<N>
     for c in chunks {
         // THE PUSHES.
         let mut i = 0usize;
-        let mut cells: Vec<(u8, N::Acc)> = Vec::new();
+        let mut cells: Vec<(u8, AccOf<N>)> = Vec::new();
         while i < c.pushes.len() {
             let t = c.pushes[i].0;
             cells.clear();
@@ -700,7 +701,7 @@ pub fn run_route<N: Rem>(st: &mut RouteState<N>, slice: u32, chunks: &[&Chunk<N>
 pub struct Sealed<N: Rem = P8> {
     pub region: u32,
     pub table: RegionTable,
-    pub hulls: Vec<N::Hull>,
+    pub hulls: Vec<HullOf<N>>,
     pub grown: Vec<super::wave::Old<N>>,
     /// The states it compared, and its steps' times: the touched keys
     /// sorted, compared with the visited set (its parts' summed), the new
@@ -759,7 +760,7 @@ pub fn seal_sort<N: Rem>(st: &mut RouteState<N>, region: u32, finals: &FxHashMap
 pub struct Touch<N: Rem = P8> {
     pub region: u32,
     pub touched: Vec<TouchedKey>,
-    pub accs: Vec<N::Acc>,
+    pub accs: Vec<AccOf<N>>,
     n_touched: usize,
     waited: (usize, u64),
     t_sort: std::time::Duration,
@@ -773,7 +774,7 @@ pub const SEAL_PART: usize = 1 << 15;
 pub struct SealPart<N: Rem = P8> {
     keys: Vec<Key>,
     masks: Vec<u64>,
-    hulls: Vec<N::Hull>,
+    hulls: Vec<HullOf<N>>,
     grown: Vec<super::wave::Old<N>>,
     held_by_age: [[u64; 7]; 2],
     t: std::time::Duration,
@@ -786,7 +787,7 @@ pub struct SealPart<N: Rem = P8> {
 pub fn seal_part<N: Rem>(touch: &Touch<N>, part: std::ops::Range<usize>, frame: u32, visited: &VisitedSet<N>) -> Result<SealPart<N>> {
     let t = std::time::Instant::now();
     let (region, accs) = (touch.region, &touch.accs);
-    let (mut keys, mut masks, mut hulls): (Vec<Key>, Vec<u64>, Vec<N::Hull>) = (Vec::new(), Vec::new(), Vec::new());
+    let (mut keys, mut masks, mut hulls): (Vec<Key>, Vec<u64>, Vec<HullOf<N>>) = (Vec::new(), Vec::new(), Vec::new());
     let mut grown: Vec<super::wave::Old<N>> = Vec::new();
     let mut held_by_age = [[0u64; 7]; 2];
     let mut cursor = visited.table(region).map(RegionTable::cursor::<N>);
@@ -804,7 +805,7 @@ pub fn seal_part<N: Rem>(touch: &Touch<N>, part: std::ops::Range<usize>, frame: 
         for (i, c) in super::layer::bits(cells).enumerate() {
             let acc = accs[start as usize + i];
             if held >> c & 1 == 0 {
-                hulls.push(N::acc_hull(&acc).ok_or_else(|| anyhow::anyhow!("r{region}: a touched state pushed nothing"))?);
+                hulls.push(acc.hull().ok_or_else(|| anyhow::anyhow!("r{region}: a touched state pushed nothing"))?);
                 continue;
             }
             // No hull stored: it is FULL, and grows no more.
@@ -822,8 +823,8 @@ pub fn seal_part<N: Rem>(touch: &Touch<N>, part: std::ops::Range<usize>, frame: 
             };
             held_by_age[0][age(layer)] += 1;
             let mut a = acc;
-            N::acc_add_hull(&mut a, &hull);
-            let h = N::acc_hull(&a).expect("a hull holds points");
+            a.add_hull(&hull);
+            let h = a.hull().expect("a hull holds points");
             if h != hull {
                 grown.push(super::wave::Old { sk: Sk { region, key, local: c as u8 }, layer, hull: h, was: hull });
                 held_by_age[1][age(layer)] += 1;

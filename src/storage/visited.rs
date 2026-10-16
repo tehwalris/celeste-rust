@@ -9,6 +9,7 @@
 //! states and the hulls that grew in (`absorb`: `set::RegionTable::upsert`,
 //! a big region's runs of blocks apart).
 
+use crate::search::hull::HullOf;
 use anyhow::Result;
 use rustc_hash::FxHashMap;
 
@@ -193,7 +194,7 @@ impl<N: Rem> VisitedSet<N> {
     /// hulls. Returns what it did (`held_new`: the new states held
     /// already - 0, the frame's new states are new).
     #[allow(clippy::type_complexity)]
-    pub fn absorb(&mut self, parts: &[(u32, &RegionTable, &[N::Hull], &[super::wave::Old<N>])], layer: u16, threads: usize) -> Result<Upserted> {
+    pub fn absorb(&mut self, parts: &[(u32, &RegionTable, &[HullOf<N>], &[super::wave::Old<N>])], layer: u16, threads: usize) -> Result<Upserted> {
         // Per region its new entries' first states (their hulls' places).
         let starts: Vec<Vec<u32>> = super::wave::par_map(parts, threads, |&(region, new, hulls, _)| -> Result<Vec<u32>> {
             let mut at = Vec::with_capacity(new.len() + 1);
@@ -294,7 +295,7 @@ impl<N: Rem> VisitedSet<N> {
                     // Mixed: FxHash leaves a word's high half out of the low
                     // bits a table indexes by (the y arc). (A float hull's
                     // hash is not the hull: distinct counted by hash.)
-                    let w = celeste_engine::runtime2::mix64(N::hull_hash(&i.hull));
+                    let w = celeste_engine::runtime2::mix64(i.hull.hash());
                     if by.len() < cap || by.contains_key(&w) {
                         *by.entry(w).or_default() += 1;
                     } else {

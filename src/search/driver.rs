@@ -351,7 +351,7 @@ pub fn solve<N: crate::compiled::KernelLanes>(
     crate::metrics::mem_phase("arc: backward");
     let tb = tb.elapsed().as_secs_f64();
     let start = w.index(seeds.start);
-    let p0 = start_point::<N>(s)?;
+    let p0 = start_point::<N>();
     let arc_steps = optimum(&w, start, p0, horizon);
     // In frames: a win at step s is during frame ceil(s / spf) (a lower
     // bound still: a frame's win is a win at its last step at the latest).

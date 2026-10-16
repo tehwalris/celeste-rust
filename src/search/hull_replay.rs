@@ -6,6 +6,7 @@
 //! the hull only decides which pushes land). It reaches exactly the tree's
 //! states at the tree's frames, else an edge was not recorded (an error).
 
+use crate::search::hull::{AccOf, HullOf};
 use anyhow::{ensure, Result};
 use rustc_hash::FxHashMap;
 
@@ -22,9 +23,11 @@ pub struct Frame {
     pub edges: u64,
 }
 
-/// Replay the tree at `dir` through frame `to` from `start`'s hull on its
-/// layer-0 states; per frame its counts (index 0 the start).
-pub fn replay<N: Rem>(dir: &std::path::Path, to: u32, start: N::Hull, threads: usize) -> Result<Vec<Frame>> {
+/// Replay the tree at `dir` through frame `to` from the start's hull
+/// (`rem::start_hull`) on its layer-0 states; per frame its counts (index 0
+/// the start).
+pub fn replay<N: Rem>(dir: &std::path::Path, to: u32, threads: usize) -> Result<Vec<Frame>> {
+    let start = crate::search::rem::start_hull::<N>();
     // The recorded graph: out-edges by source (target, transfer).
     let tree = Tree::<N>::open(dir, to)?;
     let store = EdgeStore::<N>::open(&dir.join("edges"), to)?;
@@ -43,25 +46,25 @@ pub fn replay<N: Rem>(dir: &std::path::Path, to: u32, start: N::Hull, threads: u
     // targets merge; each state with its hull and the frame it was first
     // reached at.
     let starts: Vec<Sk> = tree.layer(0, None, threads)?.0.states_iter().collect();
-    let mut hull: FxHashMap<Sk, (N::Hull, u32)> = starts.iter().map(|&s| (s, (start, 0))).collect();
+    let mut hull: FxHashMap<Sk, (HullOf<N>, u32)> = starts.iter().map(|&s| (s, (start, 0))).collect();
     let mut grown = starts;
     for f in 1..=to {
-        let mut acc: FxHashMap<Sk, N::Acc> = FxHashMap::default();
+        let mut acc: FxHashMap<Sk, AccOf<N>> = FxHashMap::default();
         for s in &grown {
             let h = hull[s].0;
             for &(d, x) in succ.get(s).map_or(&[][..], |v| &v[..]) {
-                N::push(&h, &xfers[x as usize], acc.entry(d).or_default());
+                h.push(&xfers[x as usize], acc.entry(d).or_default());
             }
         }
         grown.clear();
         for (d, a) in acc {
-            let Some(pushed) = N::acc_hull(&a) else { continue };
+            let Some(pushed) = a.hull() else { continue };
             let merged = match hull.get(&d) {
                 None => Some(pushed),
                 Some((old, _)) => {
                     let mut m = a;
-                    N::acc_add_hull(&mut m, old);
-                    let merged = N::acc_hull(&m).expect("not empty");
+                    m.add_hull(old);
+                    let merged = m.hull().expect("not empty");
                     (merged != *old).then_some(merged)
                 }
             };

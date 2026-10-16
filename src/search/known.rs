@@ -350,7 +350,7 @@ fn hull_claim<N: Rem>(b: &Block<N>, s: u32, sk: Option<Sk>, from: Option<Held<N>
     let (x, y) = r.unwrap_or((zero, zero));
     // (A full hull is not stored: it holds every remainder.)
     if let Some(info) = h.visited.state(sk.region, sk.key, sk.local as u32) {
-        if !N::hull_holds(&info.hull, x, y) {
+        if !crate::search::rem::holds::<N>(&info.hull, x, y) {
             return miss(format!("its remainder ({x:?}, {y:?}) is OUTSIDE its state's hull {:?} (state {}, layer {layer}; {node})", info.hull, sk.show()));
         }
     }
@@ -358,7 +358,7 @@ fn hull_claim<N: Rem>(b: &Block<N>, s: u32, sk: Option<Sk>, from: Option<Held<N>
         let pl = h.tree.layer_of(ps, s - 1)?.expect("a held parent is in the tree");
         let edges: Vec<u32> = h.edges.preds_at(sk, pl + 1)?.into_iter().filter(|(src, _)| *src == ps).map(|(_, x)| x).collect();
         let pfrom = pr.unwrap_or((zero, zero));
-        if !edges.iter().any(|&x| h.edges.pair(x).is_some_and(|t| N::maps(&t, pfrom, r))) {
+        if !edges.iter().any(|&x| h.edges.pair(x).is_some_and(|t| crate::search::rem::maps::<N>(&t, pfrom, r))) {
             return miss(format!(
                 "no recorded edge from its parent (state {}, layer {pl}) takes the parent's remainder {pfrom:?} to {r:?}: {:?} ({node})",
                 ps.show(),

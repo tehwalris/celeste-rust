@@ -175,7 +175,7 @@ pub fn run<N: Rem>(o: &Opts) -> Result<()> {
         let probes: Vec<(Point<N>, Point<N>)> = if has_player {
             vec![(gx.lo, gy.lo), (last(gx), last(gy)), (N::C::mid(gx), N::C::mid(gy)), (gx.lo, last(gy))]
         } else {
-            let z = super::rem::start_point::<N>(cfg)?;
+            let z = super::rem::start_point::<N>();
             vec![z]
         };
         for p in probes {

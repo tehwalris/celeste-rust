@@ -1,15 +1,16 @@
 //! THE REMAINDER MODEL IN DOUBLES (plans/float.md, "The remainder model and the round fork"): the
-//! float tools' sub-pixel remainder, its hulls and its transfers, as
-//! `hull` and `arc_edges` are 16.16's.
+//! float tools' sub-pixel remainder: its points and its transfers, as
+//! `arcs` and `arc_edges` are 16.16's (the hulls are `hull`'s, over
+//! `Doubles`).
 //!
 //! ## Points
 //!
 //! A remainder is a double of `[-1/2, 1/2)`, a POINT its INDEX in value
 //! order: `0` is `-1/2`, `ZERO` is `0` (`-0.0` too: the two zeros are one
 //! value, and no read of a remainder tells them apart, section 15), and
-//! `POINTS - 1` is `1/2 - 2^-54`. The points form a circle as 16.16's do:
-//! a hull is an ARC of it per axis, accumulated order-free in two charts,
-//! cut at `-1/2` and at `0` (`hull`'s module doc, with `u64` coordinates).
+//! `POINTS - 1` is `1/2 - 2^-54`. The points form a circle as 16.16's do
+//! (`Doubles`): a hull is an ARC of it per axis (`hull::Hull<Doubles>`),
+//! accumulated order-free in two charts, cut at `-1/2` and at `0`.
 //!
 //! ## The move, and a transfer
 //!
@@ -73,246 +74,6 @@ pub fn value(i: u64) -> f64 {
         f64::from_bits(i - ZERO)
     } else {
         -f64::from_bits(ZERO - i)
-    }
-}
-
-/// An ARC of the circle of points: `last + 1` points from `start`,
-/// wrapping past the end.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Default)]
-pub struct Arc {
-    pub start: u64,
-    pub last: u64,
-}
-
-impl Arc {
-    pub fn point(p: u64) -> Arc {
-        debug_assert!(p < POINTS);
-        Arc { start: p, last: 0 }
-    }
-
-    pub fn full() -> Arc {
-        Arc { start: 0, last: POINTS - 1 }
-    }
-
-    #[inline]
-    pub fn len(self) -> u64 {
-        self.last + 1
-    }
-
-    #[inline]
-    pub fn is_full(self) -> bool {
-        self.len() == POINTS
-    }
-
-    #[inline]
-    pub fn contains(self, p: u64) -> bool {
-        (p + POINTS - self.start) % POINTS <= self.last
-    }
-
-    /// The arc as half-open segments of `0..POINTS` (one, or two across
-    /// the end).
-    #[inline]
-    pub fn segs(self, mut f: impl FnMut((u64, u64))) {
-        let (a, n) = (self.start, self.len());
-        if a + n <= POINTS {
-            f((a, a + n));
-        } else {
-            f((a, POINTS));
-            f((0, a + n - POINTS));
-        }
-    }
-}
-
-/// A state's hull: one arc per axis.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Default)]
-pub struct Hull {
-    pub x: Arc,
-    pub y: Arc,
-}
-
-/// Bytes a hull takes on disk: `x.start, x.last, y.start, y.last`, `u64`
-/// little-endian.
-pub const HULL_BYTES: usize = 32;
-
-impl Hull {
-    pub fn point(x: u64, y: u64) -> Hull {
-        Hull { x: Arc::point(x), y: Arc::point(y) }
-    }
-
-    pub fn full() -> Hull {
-        Hull { x: Arc::full(), y: Arc::full() }
-    }
-
-    fn words(&self) -> [u64; 4] {
-        [self.x.start, self.x.last, self.y.start, self.y.last]
-    }
-
-    pub fn to_bytes(&self, out: &mut Vec<u8>) {
-        for w in self.words() {
-            out.extend_from_slice(&w.to_le_bytes());
-        }
-    }
-
-    pub fn from_bytes(b: &[u8]) -> Hull {
-        let w = |i: usize| u64::from_le_bytes(b[8 * i..8 * i + 8].try_into().expect("8 bytes"));
-        Hull { x: Arc { start: w(0), last: w(1) }, y: Arc { start: w(2), last: w(3) } }
-    }
-
-    pub fn mixed(&self) -> u64 {
-        let w = self.words();
-        mix64(mix64(w[0] ^ w[1].rotate_left(32)) ^ w[2] ^ w[3].rotate_left(32))
-    }
-
-    /// THE PUSH along an edge of transfer `t` (`hull::Hull::push`): per
-    /// axis the arc's points inside the guard, moved by the action, into
-    /// `acc`; nothing where either axis's guard misses.
-    #[inline]
-    pub fn push(&self, t: &(Axis, Axis), acc: &mut HullAcc) -> bool {
-        let mut xs = [(0, 0); 2];
-        let nx = image(self.x, &t.0, &mut xs);
-        if nx == 0 {
-            return false;
-        }
-        let mut ys = [(0, 0); 2];
-        let ny = image(self.y, &t.1, &mut ys);
-        if ny == 0 {
-            return false;
-        }
-        xs[..nx].iter().for_each(|&s| acc.add_seg(0, s));
-        ys[..ny].iter().for_each(|&s| acc.add_seg(1, s));
-        true
-    }
-
-    /// The push of a GROWN hull (`hull::Hull::push_grown`): only where the
-    /// box was empty and is not, or an axis with a `Mono` action meets
-    /// more of its guard than `was` did (the same points have the same
-    /// image; a constant's image is its point either way).
-    #[inline]
-    pub fn push_grown(&self, was: &Hull, t: &(Axis, Axis), acc: &mut HullAcc) -> bool {
-        let (nx, ny) = (meet(self.x, &t.0), meet(self.y, &t.1));
-        if nx == 0 || ny == 0 {
-            return false;
-        }
-        let (ox, oy) = (meet(was.x, &t.0), meet(was.y, &t.1));
-        let grows = |a: &Axis, n: u64, o: u64| a.tag == MONO && n != o;
-        if ox != 0 && oy != 0 && !grows(&t.0, nx, ox) && !grows(&t.1, ny, oy) {
-            return false;
-        }
-        self.push(t, acc)
-    }
-}
-
-/// `s` clipped to the guard of `t`.
-#[inline]
-fn clip(s: (u64, u64), t: &Axis) -> Option<(u64, u64)> {
-    let (lo, hi) = (s.0.max(t.lo), s.1.min(t.hi));
-    (lo < hi).then_some((lo, hi))
-}
-
-/// The points of arc `a` inside the guard of `t`.
-#[inline]
-fn meet(a: Arc, t: &Axis) -> u64 {
-    let mut n = 0;
-    a.segs(|s| n += clip(s, t).map_or(0, |c| c.1 - c.0));
-    n
-}
-
-/// The image of arc `a` under axis transfer `t`, as segments into `out`;
-/// their count (0: the guard misses the arc). A `Mono` piece is monotone,
-/// so a segment's image lies between its ends' images.
-#[inline]
-fn image(a: Arc, t: &Axis, out: &mut [(u64, u64); 2]) -> usize {
-    let (mut n, mut hit) = (0usize, false);
-    a.segs(|s| {
-        if let Some((lo, hi)) = clip(s, t) {
-            hit = true;
-            if t.tag == MONO {
-                let (x, y) = (t.apply(lo), t.apply(hi - 1));
-                debug_assert!(x <= y, "a Mono transfer is monotone");
-                out[n] = (x, y + 1);
-                n += 1;
-            }
-        }
-    });
-    match t.tag {
-        MONO => n,
-        _ if hit => {
-            out[0] = (t.a, t.a + 1);
-            1
-        }
-        _ => 0,
-    }
-}
-
-/// The charts' cut points (`hull`'s `CUT`): `-1/2` and `0`.
-const CUT: [u64; 2] = [0, ZERO];
-
-/// A HULL BEING ACCUMULATED (`hull::HullAcc`): per axis and chart the
-/// linear hull `[lo, hi]` in the chart's coordinates (`lo > hi`: none),
-/// merged by min and max.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct HullAcc {
-    lo: [u64; 4],
-    hi: [u64; 4],
-}
-
-impl Default for HullAcc {
-    fn default() -> Self {
-        HullAcc { lo: [u64::MAX; 4], hi: [0; 4] }
-    }
-}
-
-impl HullAcc {
-    #[inline]
-    pub fn is_empty(&self) -> bool {
-        self.lo[0] > self.hi[0] || self.lo[2] > self.hi[2]
-    }
-
-    /// Add the half-open segment `s` of axis `axis` (0: x, 1: y).
-    #[inline]
-    pub fn add_seg(&mut self, axis: usize, s: (u64, u64)) {
-        debug_assert!(s.0 < s.1 && s.1 <= POINTS);
-        for (c, cut) in CUT.into_iter().enumerate() {
-            let a = (s.0 + POINTS - cut) % POINTS;
-            let b = (s.1 - 1 + POINTS - cut) % POINTS;
-            let (lo, hi) = if a <= b { (a, b) } else { (0, POINTS - 1) };
-            let i = axis * 2 + c;
-            self.lo[i] = self.lo[i].min(lo);
-            self.hi[i] = self.hi[i].max(hi);
-        }
-    }
-
-    #[inline]
-    pub fn add_hull(&mut self, h: &Hull) {
-        h.x.segs(|s| self.add_seg(0, s));
-        h.y.segs(|s| self.add_seg(1, s));
-    }
-
-    #[inline]
-    pub fn merge(&mut self, o: &HullAcc) {
-        for i in 0..4 {
-            self.lo[i] = self.lo[i].min(o.lo[i]);
-            self.hi[i] = self.hi[i].max(o.hi[i]);
-        }
-    }
-
-    /// The hull: per axis the shorter chart's arc (chart 0 on a tie).
-    pub fn hull(&self) -> Option<Hull> {
-        if self.is_empty() {
-            return None;
-        }
-        let axis = |a: usize| {
-            let mut best: Option<Arc> = None;
-            for (c, cut) in CUT.into_iter().enumerate() {
-                let (lo, hi) = (self.lo[a * 2 + c], self.hi[a * 2 + c]);
-                let len = hi - lo + 1;
-                if best.is_none_or(|b| len < b.len()) {
-                    best = Some(if len == POINTS { Arc::full() } else { Arc { start: (lo + cut) % POINTS, last: len - 1 } });
-                }
-            }
-            best.expect("two charts")
-        };
-        Some(Hull { x: axis(0), y: axis(1) })
     }
 }
 
@@ -419,7 +180,7 @@ fn first_in(mut lo: u64, mut hi: u64, p: impl Fn(u64) -> bool) -> u64 {
 /// `u64` words, the transfers `Axis` - monotone maps, so the PULL of a
 /// segment is the guard's points between two bisections, exactly; the
 /// image of a segment is the interval between its ends' images.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Doubles;
 
 impl Circle for Doubles {
@@ -451,6 +212,25 @@ impl Circle for Doubles {
     #[inline]
     fn len(w: u64) -> usize {
         w as usize
+    }
+    #[inline]
+    fn wide(p: u64) -> u64 {
+        p
+    }
+    #[inline]
+    fn narrow(v: u64) -> u64 {
+        v
+    }
+    const W_BYTES: usize = 8;
+    fn put_word(w: u64, out: &mut Vec<u8>) {
+        out.extend_from_slice(&w.to_le_bytes());
+    }
+    fn get_word(b: &[u8]) -> u64 {
+        u64::from_le_bytes(b[..8].try_into().expect("8 bytes"))
+    }
+    #[inline]
+    fn hash4(w: [u64; 4]) -> u64 {
+        mix64(mix64(w[0] ^ w[1].rotate_left(32)) ^ w[2] ^ w[3].rotate_left(32))
     }
     #[inline]
     fn guard(a: &Axis) -> Seg<u64> {
@@ -586,6 +366,24 @@ fn set_before_the_move(pre: f64, frag: (f64, f64), fin: Option<(f64, f64)>) -> R
 mod tests {
     use super::*;
     use celeste_core::lua_f64::LuaF64Interval as FI;
+
+    type Arc = crate::search::hull::Arc<Doubles>;
+    type Hull = crate::search::hull::Hull<Doubles>;
+    type HullAcc = crate::search::hull::HullAcc<Doubles>;
+    const HULL_BYTES: usize = Hull::BYTES;
+
+    /// `s` clipped to the guard of `t`.
+    fn clip(s: Seg<u64>, t: &Axis) -> Option<(u64, u64)> {
+        let (lo, hi) = (s.lo.max(t.lo), s.hi.min(t.hi));
+        (lo < hi).then_some((lo, hi))
+    }
+
+    /// The points of arc `a` inside the guard of `t`.
+    fn meet(a: Arc, t: &Axis) -> u64 {
+        let mut n = 0;
+        a.segs(|s| n += clip(s, t).map_or(0, |c| c.1 - c.0));
+        n
+    }
 
     /// How many 16.16 remainders (multiples of `2^-16`) the points `[lo, hi)`
     /// hold: 0 for a piece only doubles take.

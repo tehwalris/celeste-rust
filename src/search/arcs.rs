@@ -39,11 +39,12 @@ pub struct Seg<P = u32> {
 /// A CIRCLE of remainder points (`search::rem::Rem::C`): what a `Region`'s
 /// bounds are, how a record stores them, and an axis's transfer (`Act`) with
 /// its image and preimage.
-pub trait Circle: Copy + std::fmt::Debug + Default + PartialEq + Eq + std::hash::Hash + Send + Sync + 'static {
+pub trait Circle: Copy + std::fmt::Debug + Default + PartialEq + Eq + PartialOrd + Ord + std::hash::Hash + Send + Sync + 'static {
     /// A point.
     type P: Copy + Ord + std::hash::Hash + std::fmt::Debug + Default + Send + Sync + 'static;
-    /// A `RegionArena` record's word: a stored bound, or a count.
-    type W: Copy + Eq + std::hash::Hash + std::fmt::Debug + Default + Send + Sync + 'static;
+    /// A stored point or count (a `RegionArena` record's word, a hull's
+    /// bound), ordered as the points are.
+    type W: Copy + Ord + std::hash::Hash + std::fmt::Debug + Default + Send + Sync + 'static;
     /// One axis's transfer: a guard and an action.
     type Act: Copy + std::fmt::Debug + PartialEq + Send + Sync + 'static;
     /// The points are `0..SIZE`.
@@ -58,6 +59,17 @@ pub trait Circle: Copy + std::fmt::Debug + Default + PartialEq + Eq + std::hash:
     fn load(w: Self::W) -> Self::P;
     fn count(n: usize) -> Self::W;
     fn len(w: Self::W) -> usize;
+    /// A point (or `SIZE`) as a number, and back: the hull's arithmetic
+    /// (`hull`).
+    fn wide(p: Self::P) -> u64;
+    fn narrow(v: u64) -> Self::P;
+    /// A word's bytes on disk (little-endian), and its hash of a hull's
+    /// four (`x.start, x.last, y.start, y.last`: the hull statistics and
+    /// fingerprints, the push cache's slot).
+    const W_BYTES: usize;
+    fn put_word(w: Self::W, out: &mut Vec<u8>);
+    fn get_word(b: &[u8]) -> Self::W;
+    fn hash4(w: [Self::W; 4]) -> u64;
     /// The points an edge's axis takes.
     fn guard(a: &Self::Act) -> Seg<Self::P>;
     /// The point a constant action sends every point to.
@@ -81,7 +93,7 @@ pub trait Circle: Copy + std::fmt::Debug + Default + PartialEq + Eq + std::hash:
 }
 
 /// 16.16's circle: 65536 points, its transfers rotations or constants.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Fixed16;
 
 impl Circle for Fixed16 {
@@ -113,6 +125,26 @@ impl Circle for Fixed16 {
     #[inline]
     fn len(w: u16) -> usize {
         w as usize
+    }
+    #[inline]
+    fn wide(p: u32) -> u64 {
+        p as u64
+    }
+    #[inline]
+    fn narrow(v: u64) -> u32 {
+        v as u32
+    }
+    const W_BYTES: usize = 2;
+    fn put_word(w: u16, out: &mut Vec<u8>) {
+        out.extend_from_slice(&w.to_le_bytes());
+    }
+    fn get_word(b: &[u8]) -> u16 {
+        u16::from_le_bytes([b[0], b[1]])
+    }
+    /// The four words in one, low first: exact.
+    #[inline]
+    fn hash4(w: [u16; 4]) -> u64 {
+        w[0] as u64 | (w[1] as u64) << 16 | (w[2] as u64) << 32 | (w[3] as u64) << 48
     }
     #[inline]
     fn guard(a: &Transfer) -> Seg {

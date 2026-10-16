@@ -461,12 +461,11 @@ pub(super) fn lookup_view<N: EngineNum>(row: &Rt2<N>, seeded: bool) -> Result<Rt
 }
 
 /// A concrete state's remainder as a point of the torus (no player: the
-/// point of 0 on both axes).
+/// start's, the point of 0 on both axes).
 pub fn rem_of<N: Rem>(rt2: &Rt2<N>) -> Result<(Point<N>, Point<N>)> {
     use celeste_engine::runtime2::AV;
     let ids = crate::compiled::ids();
-    let zero = || N::point(<N::A as Arithmetic>::from_i16(0)).expect("0 is a remainder");
-    let Some((cx, cy)) = rt2.player_xy_cells(ids, ids.f_rem) else { return Ok((zero(), zero())) };
+    let Some((cx, cy)) = rt2.player_xy_cells(ids, ids.f_rem) else { return Ok(super::rem::start_point::<N>()) };
     let at = |c: usize| -> Result<Point<N>> {
         match rt2.cols[c].at(0) {
             AV::Num(n) => N::point(n).ok_or_else(|| anyhow::anyhow!("a remainder {n:?} outside [-1/2, 1/2)")),
