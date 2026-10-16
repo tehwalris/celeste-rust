@@ -2071,7 +2071,12 @@ pub fn solve<N: Rem>(
     let known = match (known, &node) {
         (Some(route), Some(node)) => {
             let minus_one = crate::frame::TreeFilter::of_tree(dir, s)?;
-            let p = super::known::Pruning { settings: s, level, horizon, node, keys: &space, start, w: &w, reached: arc_marks.as_ref(), minus_one, dir };
+            // The hull forward's claim keys every step's state: whole frames only.
+            if route.hulls && s.steps_per_frame() != 1 {
+                eprintln!("[known] the hull forward's claim is checked on whole frames only: not under --split-frame");
+            }
+            let hulls = (route.hulls && s.steps_per_frame() == 1).then(|| super::known::Hulls::open(dir, horizon, s)).transpose()?;
+            let p = super::known::Pruning { settings: s, level, horizon, node, keys: &space, start, w: &w, reached: arc_marks.as_ref(), minus_one, dir, hulls: hulls.as_ref() };
             super::known::check(route, &p)?
         }
         _ => None,

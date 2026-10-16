@@ -11,6 +11,12 @@ Measured on `docs-refresh` after merging develop `0765e7c5`. Lines are
 `wc -l`; "code / test / comment" split by a line classifier (test = inside
 `#[cfg(test)] mod` blocks and test-only files; blank lines not shown).
 
+## Progress (R1: the binary, search, storage, compiled; branch `refactor-r1`)
+
+| slice | what went | lines |
+|---|---|---|
+| C1 | `reach`, `hull-stats`, `census` (src/census.rs), `diag-project`, `edge-census`; `hull-route` folded into `check-known` (the hull forward's claim at every step, `known::Hulls`); `hull-replay` keeps the replay check, the sliver study went; `search::reach` keeps what its slow tests read; `export-ui --reach` | -1,380 Rust |
+
 ## SIZE
 
 **Rust: 65,641 lines** = 42,246 code + 10,767 test + 9,518 comment + 3,110
@@ -184,7 +190,7 @@ Concrete simplification candidates, ordered by lines saved x safety
 
 | # | candidate | where | saves | risk |
 |---|---|---|---|---|
-| C1 | the finished studies: `reach` (subcommand), `hull-stats`, `hull-replay` + `hull-route` (`search::hull_replay`), `census` (`src/census.rs`), `diag-project`, `edge-census` | rewrite.rs arms and helpers (`reach_command`, `rem_shapes`, `hull_stats`), hull_replay.rs, census.rs | ~1,400 | none (no pin reads them) |
+| C1 (done) | the finished studies: `reach` (subcommand), `hull-stats`, `hull-replay` + `hull-route` (`search::hull_replay`), `census` (`src/census.rs`), `diag-project`, `edge-census` | rewrite.rs arms and helpers (`reach_command`, `rem_shapes`, `hull_stats`), hull_replay.rs, census.rs | ~1,400 | none (no pin reads them) |
 | C2 | one census command for `col-census`, `cell-growth`, `coarse-census` (`ckhash --cells`), or cut them | rewrite.rs (+ `erased_states`) | ~250 | none |
 | C3 | `follow` and `rerun-row` folded into `check-known`'s miss report and `ref-check` | rewrite.rs | ~170 | none |
 | C4 | `bench-storage` + `--emit-capture` + the capture writers, if `bench-frame --checkpoint` covers the storage | storage/bench.rs (~450 of 731), unit.rs's capture, fixtures `cap-*` | ~550 | none (t1/big steps go) |

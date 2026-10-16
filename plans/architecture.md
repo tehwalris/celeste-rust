@@ -58,7 +58,7 @@ celeste-rust (src/)
   compiled/             FrameEngine, the kernel registry, emission, mix
   settings.rs           the run's settings (flags), the tree's record
   starts.rs             the feasible loading-jank J's and their classes
-  census.rs, par.rs, metrics.rs, concrete.rs, game_runner.rs
+  par.rs, metrics.rs, concrete.rs, game_runner.rs
   bin/                  rewrite (search + tools), transpile (level -1),
                         concrete_run
 ```

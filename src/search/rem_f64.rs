@@ -76,17 +76,6 @@ pub fn value(i: u64) -> f64 {
     }
 }
 
-/// How many 16.16 remainders (multiples of `2^-16`) the points `[lo, hi)`
-/// hold: 0 for a piece only doubles take.
-pub fn fixed_points(lo: u64, hi: u64) -> u64 {
-    if lo >= hi {
-        return 0;
-    }
-    // The 16.16 remainders at or above `v`: from `ceil(v 2^16)` to `2^15 - 1`.
-    let from = |i: u64| if i == POINTS { 32768 } else { (value(i) * 65536.0).ceil() as i64 };
-    (from(hi) - from(lo)) as u64
-}
-
 /// An ARC of the circle of points: `last + 1` points from `start`,
 /// wrapping past the end.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Default)]
@@ -597,6 +586,17 @@ fn set_before_the_move(pre: f64, frag: (f64, f64), fin: Option<(f64, f64)>) -> R
 mod tests {
     use super::*;
     use celeste_core::lua_f64::LuaF64Interval as FI;
+
+    /// How many 16.16 remainders (multiples of `2^-16`) the points `[lo, hi)`
+    /// hold: 0 for a piece only doubles take.
+    fn fixed_points(lo: u64, hi: u64) -> u64 {
+        if lo >= hi {
+            return 0;
+        }
+        // The 16.16 remainders at or above `v`: from `ceil(v 2^16)` to `2^15 - 1`.
+        let from = |i: u64| if i == POINTS { 32768 } else { (value(i) * 65536.0).ceil() as i64 };
+        (from(hi) - from(lo)) as u64
+    }
 
     fn n(v: f64) -> LuaF64 {
         LuaF64::new(v).unwrap()

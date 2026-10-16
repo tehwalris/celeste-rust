@@ -1724,17 +1724,17 @@ mod tests {
         let layers: Vec<Layer> = (0..=to).map(|f| tree.layer(f, None, 4).expect("layer").0).collect();
         let p0 = crate::search::arc_dp::start_point::<P8>(&s).expect("start");
         let mut checked = 0u64;
-        crate::search::reach::reach(&hull, to, p0, 4, |sums, _, cur, inexact| {
+        crate::search::reach::reach(&hull, to, p0, 4, |t, cur, inexact| {
             assert!(inexact.is_empty(), "room (1,0) to f{to} needs no coarsening");
             for (sk, r) in cur {
-                let layer = (0..=sums.frame).find(|&f| layers[f as usize].contains(*sk)).unwrap_or_else(|| panic!("f{}: an exactly reached state no layer holds", sums.frame));
+                let layer = (0..=t).find(|&f| layers[f as usize].contains(*sk)).unwrap_or_else(|| panic!("f{t}: an exactly reached state no layer holds"));
                 // (A full hull is not stored: it holds everything.)
                 if let Some(info) = st.visited().state(sk.region, sk.key, sk.local as u32) {
-                    assert_eq!(info.layer as u32, layer, "f{}: the state's recorded layer", sums.frame);
+                    assert_eq!(info.layer as u32, layer, "f{t}: the state's recorded layer");
                     for (y, xs) in r.slabs() {
-                        assert!(info.hull.y.contains_seg(y), "f{}: a reached y segment outside the hull", sums.frame);
+                        assert!(info.hull.y.contains_seg(y), "f{t}: a reached y segment outside the hull");
                         for x in xs {
-                            assert!(info.hull.x.contains_seg(x), "f{}: a reached x segment outside the hull", sums.frame);
+                            assert!(info.hull.x.contains_seg(x), "f{t}: a reached x segment outside the hull");
                         }
                     }
                 }

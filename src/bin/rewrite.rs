@@ -178,58 +178,15 @@ enum Command {
     /// A KNOWN solution against the pruning of finished search trees
     /// (`search::known`): stepped through the reference engine, at every
     /// step it must pass level -1 (the filter the tree recorded) and the
-    /// objects ladder's filter, and at every frame boundary
-    /// project onto an arc-graph node whose W holds its exact remainder,
-    /// reached (at a level that filters the next) - per level of `--level`,
-    /// the arc phase rerun over `<checkpoint-dir>/level{i:02}` as `search`
-    /// runs it, without the concrete search. Exits non-zero on the first
-    /// check that drops it, with the step, the node and the state.
-    /// EXACT-REMAINDER REACH over a finished tree's edges (search::reach):
-    /// from the start at its exact remainder, every frame's reached states
-    /// pushed along their out-edges through the transfers - the arc phase's
-    /// reach with W = everything. Prints per frame the reached states,
-    /// their remainder points and cells against the forward's layer, the
-    /// x/y extent, the FIRST ARRIVAL in (state, remainder) (the states an
-    /// exact-remainder forward would expand), the edge pushes, and (a level
-    /// -1 tree) the forward's states with a dropped successor; then the
-    /// totals against the forward (`summary.txt`). Exact in the remainder
-    /// up to the coarsened sets (counted), bounded by the tree: what the
-    /// forward did not keep (level -1, a filter) is not reached.
-    Reach {
-        /// The search's checkpoint dir (its `level{i:02}` trees).
-        #[arg(long)]
-        checkpoint_dir: String,
-        /// Which level's tree.
-        #[arg(long, default_value_t = 0)]
-        level_index: usize,
-        /// The horizon in frames (the tree must reach it).
-        #[arg(long)]
-        to: u32,
-        /// Write `reach.marks.bin` (each reached state, dist = horizon - the
-        /// last frame it is reached at: `export-ui --reach DIR`) and
-        /// `reach.tsv` (the per-frame table) into DIR.
-        #[arg(long)]
-        save_marks: Option<String>,
-        /// Also write every frame's reached cells (`frame x y states`) to FILE.
-        #[arg(long)]
-        cells: Option<String>,
-        /// Decode and print the reached states whose player is in
-        /// "x0..x1,y0..y1" (their named fields), at most 20 a frame.
-        #[arg(long)]
-        decode_rect: Option<String>,
-    },
-    /// THE HULL FORWARD's frontiers, from a tree's hull files: per frame
-    /// its new and grown states and how far they grew, and over the tree
-    /// how often a state's hull grew and how wide hulls end (per axis, in
-    /// points of the 65536-point circle).
-    HullStats {
-        /// The tree (a forward's checkpoint dir, or a search's `levelNN`).
-        #[arg(long, default_value = DEFAULT_CHECKPOINT_DIR)]
-        checkpoint_dir: String,
-        /// Its last frame to read.
-        #[arg(long)]
-        to: u32,
-    },
+    /// objects ladder's filter, be in the tree with its exact remainder
+    /// inside its state's hull, reached from its parent by a recorded edge
+    /// that maps the remainder (the hull forward's claim; whole frames
+    /// only), and at every frame boundary project onto an arc-graph node
+    /// whose W holds its exact remainder, reached (at a level that filters
+    /// the next) - per level of `--level`, the arc phase rerun over
+    /// `<checkpoint-dir>/level{i:02}` as `search` runs it, without the
+    /// concrete search. Exits non-zero on the first check that drops it,
+    /// with the step, the node and the state.
     CheckKnown {
         /// The search's checkpoint dir (its `level{i:02}` trees).
         #[arg(long)]
@@ -262,14 +219,11 @@ enum Command {
         #[arg(long)]
         reference: bool,
     },
-    /// DIAGNOSTIC: the hull forward REPLAYED over a tree's recorded graph
-    /// (`search::hull_replay`): per frame the states first reached - the
-    /// tree's, the replay's (checked equal), the replay's without the float
-    /// tree's TOP SLIVER (edges with a transfer piece no 16.16 remainder
-    /// takes, `rem_f64::fixed_points`; not sound: what the sliver costs),
-    /// and under option (c)'s exact sliver bit (`hull_replay::sliver_bit`)
-    /// with its sliver parts - the recorded edges, the sliver's, and the
-    /// sliver edges that pushed something.
+    /// THE TREE REPLAYS FROM ITS RECORDED GRAPH (`search::hull_replay`): the
+    /// start's hull pushed along the recorded edges through their transfers,
+    /// frame by frame, must reach exactly the tree's states first at each
+    /// frame (else an error: an edge was not recorded). Prints per frame
+    /// the states first reached and the edges recorded into it.
     HullReplay {
         /// The tree (a `forward` checkpoint dir, or a search's `levelNN`).
         #[arg(long)]
@@ -278,56 +232,6 @@ enum Command {
         #[arg(long)]
         to: u32,
     },
-    /// CHECK a known route against a hull tree (`search::hull_replay::route`):
-    /// stepped concretely in the tree's arithmetic, every state of it in the
-    /// tree by its frame, its remainder in its state's hull, and every step
-    /// a recorded edge whose transfer maps the remainder. Exits non-zero at
-    /// the first step that breaks it.
-    HullRoute {
-        #[arg(long)]
-        checkpoint_dir: String,
-        /// Last frame.
-        #[arg(long)]
-        to: u32,
-        /// The tree's level.
-        #[arg(long, value_parser = Level::parse, default_value = "r0sx")]
-        level: Level,
-        /// The route's inputs (`concrete::read_inputs`).
-        #[arg(long)]
-        inputs: String,
-    },
-    /// DIAGNOSTIC: is a coarser level's tree closed over a finer one's rows?
-    /// Every row of the FINE tree at frames `from..=to` (with `--fine-marks`,
-    /// only marked rows), projected onto `level` (`frame::widened_keys`), must
-    /// be a row of the COARSE tree at that frame or before - and with
-    /// `--coarse-marks`, a marked one. Per frame: the fine rows, the
-    /// projections not reached (a forward loss) and those reached but
-    /// unmarked (a backward loss); then the first misses' cells.
-    DiagProject {
-        /// The FINE level's tree.
-        #[arg(long)]
-        fine_dir: String,
-        /// The COARSE level's tree.
-        #[arg(long)]
-        coarse_dir: String,
-        /// The coarse level.
-        #[arg(long, value_parser = Level::parse)]
-        level: Level,
-        /// The first frame checked.
-        #[arg(long, default_value_t = 1)]
-        from: u32,
-        /// The last frame checked (both trees must reach it).
-        #[arg(long)]
-        to: u32,
-        /// The fine level's marks (`hNNN/levelNN.marks.bin`): only its
-        /// marked rows are projected.
-        #[arg(long)]
-        fine_marks: Option<String>,
-        /// The coarse level's marks: a reached projection must be marked.
-        #[arg(long)]
-        coarse_marks: Option<String>,
-    },
-
     /// Fingerprint a forward checkpoint tree: per frame, the lane count and an
     /// order-independent hash of its (row key, cell) set, independent of the
     /// storage format.
@@ -653,47 +557,6 @@ enum Command {
         #[arg(long)]
         chain_out: Option<String>,
     },
-    /// DIAGNOSTIC: the shape of a frame's recorded edges. Groups the edges
-    /// recorded at `frame` by (source, target) and reports how many
-    /// transfers a pair carries, how its x and y parts vary (a product of
-    /// per-axis pieces?), and how many distinct transfer SETS there are (what
-    /// one edge per pair with an interned set would store).
-    EdgeCensus {
-        /// The level's tree (the dir holding `frames/` and `edges/`; a search's
-        /// `<checkpoint-dir>/levelNN`).
-        #[arg(long)]
-        level_dir: String,
-        /// The frame whose recorded edges are grouped.
-        #[arg(long)]
-        frame: u32,
-        /// The last frame of the tree's edge files to open (at least `--frame`).
-        #[arg(long)]
-        horizon: u32,
-    },
-    /// THE CENSUS (float against fixed state counts): a reference-engine
-    /// forward over the level r0sx's nodes (every object exact, the
-    /// remainder widened) in the run's arithmetic (`--arith`), every input,
-    /// deduplicated exactly, to frame `--to` or past `--max-nodes` nodes.
-    /// Per frame: the new nodes, the wins, the distinct player speeds
-    /// (`spd.x`, `spd.y`) of the frame's new nodes and of all so far, and the
-    /// speed bundles (new nodes with `spd.x` left out); with `--exact`, over
-    /// concrete states, also the distinct remainders. Run it in each
-    /// arithmetic on one room to compare.
-    Census {
-        /// The last frame.
-        #[arg(long)]
-        to: u32,
-        /// Stop once more nodes than this are met.
-        #[arg(long, default_value_t = 2_000_000)]
-        max_nodes: usize,
-        /// Over CONCRETE states (the remainder exact) instead of the nodes.
-        #[arg(long)]
-        exact: bool,
-        /// Expand only this many of a frame's new nodes (a deterministic
-        /// sample): the speeds and remainders of later frames.
-        #[arg(long)]
-        sample: Option<usize>,
-    },
     /// DIAGNOSTIC: per-column cardinalities of one frame, streamed. Per
     /// shape: rows, every varying column's distinct value count (capped at
     /// `cap`), named, and the distinct (spd.x, spd.y) pairs.
@@ -752,13 +615,6 @@ enum Command {
         /// byte (the tasdatabase upload the category runner verified).
         #[arg(long)]
         download: Option<String>,
-        /// `rewrite reach --save-marks DIR` of the last level's tree: its
-        /// exactly reached states as a level of their own.
-        #[arg(long)]
-        reach: Option<String>,
-        /// That level's label.
-        #[arg(long)]
-        reach_label: Option<String>,
     },
     /// The room (`--room`) as the tools need it, as JSON on stdout: its
     /// level and its objects in creation order (the original cart's: tile,
@@ -1128,7 +984,7 @@ fn run_levels<N: Rem>(
         let concrete = last && finish == Finish::Concrete;
         let keep = last && finish == Finish::Arcs;
         // Every level saves its marks (the next overwrites).
-        let known = prefer.map(|inputs| celeste_rust::search::known::Route { inputs, filter: filter.as_ref() });
+        let known = prefer.map(|inputs| celeste_rust::search::known::Route { inputs, filter: filter.as_ref(), hulls: false });
         let s = solve::<N>(&dir, lvl, steps, concrete, keep, !last, save_marks.map(std::path::Path::new), prefer, known.as_ref(), cfg)?;
         res.levels.push(LevelResult { spec: lvl.to_string(), dir: format!("{prefix}level{li:02}"), forward_s, first_win, arc_bound: s.arc });
         let Some(bound) = s.arc else { return Ok(Levels::Refuted { li, lvl }) };
@@ -1448,7 +1304,7 @@ fn check_known<N: Rem>(checkpoint_dir: &str, level: &str, inputs: &str, horizon:
             dir.display()
         );
         let filter = prev.as_ref().map(|(m, l)| celeste_rust::frame::MarkFilter::new(m, *l, cfg.steps_per_frame()));
-        let route = celeste_rust::search::known::Route { inputs: &inputs, filter: filter.as_ref() };
+        let route = celeste_rust::search::known::Route { inputs: &inputs, filter: filter.as_ref(), hulls: true };
         let s = solve::<N>(&dir, lvl, steps, false, false, !last, None, None, Some(&route), cfg)?;
         let f = s.known.ok_or_else(|| anyhow::anyhow!("the known route does not exit by f{horizon}: nothing to check"))?;
         println!("[check-known] level {li} ({lvl}): the known route (exit f{f}) survives (arc bound {:?})", s.arc);
@@ -1775,13 +1631,11 @@ fn main() -> Result<()> {
     // Only these run in float so far.
     let float = matches!(
         cli.command,
-        Command::Census { .. }
-            | Command::Search { .. }
+        Command::Search { .. }
             | Command::ArcCheck { .. }
             | Command::Forward { .. }
             | Command::Ckhash { .. }
             | Command::HullReplay { .. }
-            | Command::HullRoute { .. }
             | Command::RefCheck { .. }
             | Command::WidenCheck { .. }
             | Command::CheckKnown { .. }
@@ -1849,12 +1703,6 @@ fn main() -> Result<()> {
                 println!("[robust] FRAGILE: {} of {} variants differ ({})", fragile.len(), rows.len() - 1, fragile.join(", "));
             }
         }
-        Command::HullStats { checkpoint_dir, to } => {
-            hull_stats(std::path::Path::new(&checkpoint_dir), to, cfg.threads())?;
-        }
-        Command::Reach { checkpoint_dir, level_index, to, save_marks, cells, decode_rect } => {
-            reach_command(&checkpoint_dir, level_index, to, save_marks.as_deref(), cells.as_deref(), decode_rect.as_deref(), &cfg)?;
-        }
         Command::CheckKnown { checkpoint_dir, level, inputs, horizon } => match cfg.arith {
             Arith::Fixed => check_known::<P8>(&checkpoint_dir, &level, &inputs, horizon, &cfg)?,
             Arith::Float(_) => check_known::<LuaF64>(&checkpoint_dir, &level, &inputs, horizon, &cfg)?,
@@ -1888,98 +1736,18 @@ fn main() -> Result<()> {
                 }
             }
         }
-        Command::HullRoute { checkpoint_dir, to, level, inputs } => {
-            use celeste_rust::search::hull_replay::route;
-            let dir = std::path::Path::new(&checkpoint_dir);
-            cfg.check(dir, level)?;
-            let inputs = celeste_rust::concrete::read_inputs(&inputs)?;
-            let t = std::time::Instant::now();
-            let exit = match cfg.arith {
-                Arith::Fixed => route::<P8>(dir, to, level, &inputs, &cfg)?,
-                Arith::Float(_) => route::<LuaF64>(dir, to, level, &inputs, &cfg)?,
-            };
-            let upto = exit.map_or(to.min(inputs.len() as u32), |f| f - 1);
-            println!(
-                "[hull-route] the route holds through frame {upto}: every state in the tree, its remainder in its hull, every step a recorded edge mapping it{} ({:.1} s)",
-                exit.map_or(String::new(), |f| format!("; it exits at frame {f}")),
-                t.elapsed().as_secs_f64()
-            );
-        }
         Command::HullReplay { checkpoint_dir, to } => {
-            use celeste_rust::search::{hull_replay, rem::Rem, rem_f64};
             let dir = std::path::Path::new(&checkpoint_dir);
             let t = std::time::Instant::now();
-            let (frames, bit) = match cfg.arith {
-                Arith::Fixed => (hull_replay::replay::<P8>(dir, to, P8::start_hull(&cfg)?, |_| false, cfg.threads())?, None),
-                Arith::Float(_) => {
-                    let sliver = |a: &rem_f64::Axis| rem_f64::fixed_points(a.lo, a.hi) == 0;
-                    let frames = hull_replay::replay::<LuaF64>(dir, to, LuaF64::start_hull(&cfg)?, |p| sliver(&p.0) || sliver(&p.1), cfg.threads())?;
-                    (frames, Some(hull_replay::sliver_bit(dir, to, cfg.threads())?))
-                }
+            let frames = match cfg.arith {
+                Arith::Fixed => celeste_rust::search::hull_replay::replay::<P8>(dir, to, P8::start_hull(&cfg)?, cfg.threads())?,
+                Arith::Float(_) => celeste_rust::search::hull_replay::replay::<LuaF64>(dir, to, LuaF64::start_hull(&cfg)?, cfg.threads())?,
             };
-            println!("frame states states_no_sliver states_c sliver_parts_c edges sliver_edges sliver_fired");
-            let (mut all, mut kept, mut c, mut parts) = (0u64, 0u64, 0u64, 0u64);
+            println!("frame states edges");
             for (f, x) in frames.iter().enumerate() {
-                let (cf, pf) = bit.as_ref().map_or((x.all, 0), |b| b[f]);
-                (all, kept, c, parts) = (all + x.all, kept + x.kept, c + cf, parts + pf);
-                println!("f{f:03} {} {} {cf} {pf} {} {} {}", x.all, x.kept, x.edges, x.dropped, x.fired);
+                println!("f{f:03} {} {}", x.states, x.edges);
             }
-            println!(
-                "total {all} {kept} {c} {parts} ({:.3}x without the sliver, {:.3}x with (c)'s bit and {:.3}x counting its sliver parts; replayed in {:.1} s)",
-                all as f64 / kept.max(1) as f64,
-                all as f64 / c.max(1) as f64,
-                all as f64 / (c + parts).max(1) as f64,
-                t.elapsed().as_secs_f64()
-            );
-        }
-        Command::DiagProject { fine_dir, coarse_dir, level, from, to, fine_marks, coarse_marks } => {
-            let load_marks = |p: Option<String>| p.map(|p| Visited::load(std::path::Path::new(&p))).transpose();
-            let (fine_marks, coarse_marks) = (load_marks(fine_marks)?, load_marks(coarse_marks)?);
-            let (fine, coarse) = (std::path::Path::new(&fine_dir), std::path::Path::new(&coarse_dir));
-            let (fine_tree, coarse_tree) = (Tree::<P8>::open(fine, to)?, Tree::<P8>::open(coarse, to)?);
-            // The fine rows' projections keyed in the COARSE tree's key space.
-            let mut reached = Visited::new(coarse_tree.space.clone());
-            let (mut total, mut missed, mut unmarked) = (0usize, 0usize, 0usize);
-            let mut misses: Vec<String> = Vec::new();
-            for f in 0..=to {
-                for s in coarse_tree.layer(f, None, cfg.threads())?.0.states_iter() {
-                    let (shape, key, cell) = coarse_tree.state(s)?;
-                    reached.insert(shape, key, cell);
-                }
-                if f < from {
-                    continue;
-                }
-                let (mut n, mut miss, mut unm) = (0usize, 0usize, 0usize);
-                for (sks, rt2) in fine_tree.rows(f, cfg.room, 1 << 20, &|_| true, cfg.threads())? {
-                    let block = Block::from_rt2(rt2);
-                    let (ws, wk, wc) = widened_keys(&block, level, reached.keys())?;
-                    for (i, sk) in sks.iter().enumerate() {
-                        let (shape, key, cell) = fine_tree.state(*sk)?;
-                        if fine_marks.as_ref().is_some_and(|m| !m.contains(shape, key, cell)) {
-                            continue;
-                        }
-                        n += 1;
-                        let Some(k) = wk[i].filter(|&k| reached.contains(ws, k, wc[i])) else {
-                            miss += 1;
-                            if misses.len() < 8 {
-                                misses.push(format!("f{f:03}: a fine row at {} projects to {}, which the coarse tree has not reached", where_(wc[i]), wk[i].map_or("a code the coarse tree never stored".to_string(), |k| format!("key {:016x}{:016x}", k.0, k.1))));
-                            }
-                            continue;
-                        };
-                        if coarse_marks.as_ref().is_some_and(|m| !m.contains(ws, k, wc[i])) {
-                            unm += 1;
-                        }
-                    }
-                }
-                println!("f{f:03}: fine rows {n}, projections not reached {miss}, reached but unmarked {unm}");
-                total += n;
-                missed += miss;
-                unmarked += unm;
-            }
-            for m in &misses {
-                println!("MISS {m}");
-            }
-            println!("of {total} fine rows' projections: {missed} not reached by the coarse tree (a forward loss), {unmarked} reached but unmarked (a backward loss)");
+            println!("[hull-replay] {}: the replay reaches the tree's states at every frame to f{to} ({:.1} s)", dir.display(), t.elapsed().as_secs_f64());
         }
         Command::Ckhash {
             checkpoint_dir,
@@ -2352,74 +2120,6 @@ fn main() -> Result<()> {
                 }
             }
         }
-        Command::EdgeCensus { level_dir, frame, horizon } => {
-            let g = celeste_rust::storage::edges::EdgeStore::<P8>::open(&std::path::Path::new(&level_dir).join("edges"), horizon)?;
-            let pairs = g.pairs();
-            let mut recs = g.edges_at(frame, cfg.threads())?;
-            recs.sort_unstable();
-            let n_edges = recs.len();
-            let mut hist = std::collections::BTreeMap::<usize, u64>::new();
-            let (mut n_pairs, mut product, mut x_const, mut y_const, mut dup) = (0u64, 0u64, 0u64, 0u64, 0u64);
-            let mut sets = rustc_hash::FxHashSet::<Vec<u32>>::default();
-            let mut xsets = rustc_hash::FxHashSet::<Vec<(u32, u32, u8, i32)>>::default();
-            let mut ysets = rustc_hash::FxHashSet::<Vec<(u32, u32, u8, i32)>>::default();
-            let mut i = 0;
-            while i < recs.len() {
-                let mut j = i;
-                while j < recs.len() && (recs[j].src, recs[j].dst) == (recs[i].src, recs[i].dst) {
-                    j += 1;
-                }
-                let mut ids: Vec<u32> = recs[i..j].iter().map(|e| e.xfer).collect();
-                let before = ids.len();
-                ids.dedup();
-                dup += (before - ids.len()) as u64;
-                n_pairs += 1;
-                *hist.entry(ids.len()).or_default() += 1;
-                let key = |a: &celeste_rust::search::arc_edges::AxisXfer| (a.lo, a.hi, a.tag, a.val);
-                let mut xs: Vec<_> = ids.iter().map(|&x| key(&pairs[x as usize].0)).collect();
-                let mut ys: Vec<_> = ids.iter().map(|&x| key(&pairs[x as usize].1)).collect();
-                xs.sort_unstable();
-                xs.dedup();
-                ys.sort_unstable();
-                ys.dedup();
-                if xs.len() == 1 {
-                    x_const += 1;
-                }
-                if ys.len() == 1 {
-                    y_const += 1;
-                }
-                if xs.len() * ys.len() == ids.len() {
-                    product += 1;
-                }
-                xsets.insert(xs);
-                ysets.insert(ys);
-                sets.insert(ids);
-                i = j;
-            }
-            println!("frame {frame}: {n_edges} edges, {n_pairs} (source, target) pairs, {:.2} transfers a pair, {dup} duplicate edges", n_edges as f64 / n_pairs as f64);
-            println!("transfers per pair: {hist:?}");
-            println!("pairs whose transfers are exactly x-pieces x y-pieces: {product} ({:.1}%); x part constant {x_const} ({:.1}%), y part constant {y_const} ({:.1}%)", 100.0 * product as f64 / n_pairs as f64, 100.0 * x_const as f64 / n_pairs as f64, 100.0 * y_const as f64 / n_pairs as f64);
-            println!("distinct transfer sets {}, x sets {}, y sets {} (the tree's table: {} pairs)", sets.len(), xsets.len(), ysets.len(), pairs.len());
-        }
-        Command::Census { to, max_nodes, exact, sample } => {
-            println!(
-                "arith {} room {}{}{}: frame new wins total spd.x spd.y spd.x_all spd.y_all bundles rem.x_all rem.y_all",
-                cfg.arith,
-                room_text(&cfg),
-                if exact { " exact" } else { "" },
-                sample.map_or(String::new(), |n| format!(" sample {n}"))
-            );
-            let each = |f: &celeste_rust::census::Frame| {
-                println!(
-                    "f{:03} {} {} {} {} {} {} {} {} {} {}",
-                    f.frame, f.new, f.wins, f.total, f.spd_x, f.spd_y, f.spd_x_all, f.spd_y_all, f.bundles, f.rem_x_all, f.rem_y_all
-                )
-            };
-            match cfg.arith {
-                celeste_rust::settings::Arith::Fixed => celeste_rust::census::run::<celeste_core::arith::Fixed>(&cfg, to, max_nodes, sample, cfg.threads(), exact, each)?,
-                celeste_rust::settings::Arith::Float(_) => celeste_rust::census::run::<celeste_core::arith::Float>(&cfg, to, max_nodes, sample, cfg.threads(), exact, each)?,
-            };
-        }
         Command::ColCensus { level_dir, frame, cap, cell, erase, every } => {
             use celeste_engine::exact::Code;
             use celeste_engine::runtime2::{Cell2, Col, AV};
@@ -2531,7 +2231,7 @@ fn main() -> Result<()> {
                 }
             }
         }
-        Command::ExportUi { checkpoint_dir, out, arc, witness, reference, download, reach, reach_label } => {
+        Command::ExportUi { checkpoint_dir, out, arc, witness, reference, download } => {
             celeste_rust::search::ui_export::export(
                 std::path::Path::new(&checkpoint_dir),
                 std::path::Path::new(&out),
@@ -2541,8 +2241,6 @@ fn main() -> Result<()> {
                     witness: witness.as_deref().map(std::path::Path::new),
                     reference: reference.as_deref().map(std::path::Path::new),
                     download: download.as_deref().map(std::path::Path::new),
-                    reach: reach.as_deref().map(std::path::Path::new),
-                    reach_label: reach_label.as_deref(),
                 },
             )?;
         }
@@ -2841,357 +2539,4 @@ mod tests {
         assert_eq!(celeste_rust::settings::duplicate_flags(&cmd), Vec::<String>::new(), "flags defined twice");
         cmd.debug_assert();
     }
-}
-
-/// `rewrite reach` (search::reach): the run, its table and its outputs.
-/// `rewrite hull-stats` (its doc).
-fn hull_stats(dir: &std::path::Path, to: u32, threads: usize) -> Result<()> {
-    use celeste_rust::search::hull::Hull;
-    use celeste_rust::storage::{hulls, Sk};
-    let mut last: rustc_hash::FxHashMap<Sk, (Hull, u32)> = Default::default();
-    let q = |v: &mut Vec<u32>, f: f64| -> u32 {
-        if v.is_empty() {
-            return 0;
-        }
-        v.sort_unstable();
-        v[((v.len() - 1) as f64 * f) as usize]
-    };
-    let last_frame = celeste_rust::storage::layer::last_frame(dir).ok_or_else(|| anyhow::anyhow!("{}: no frames", dir.display()))?;
-    let tree = celeste_rust::storage::layer::Tree::<P8>::open(dir, to.min(last_frame))?;
-    println!("frame\tnew\tgrown\tgrowth_x_med\tgrowth_x_p90\tgrowth_y_med\tgrowth_y_p90\tgrown_full_x");
-    for f in 0..=to {
-        let p = hulls::path(dir, f);
-        if !p.exists() {
-            break;
-        }
-        let (layer, _) = tree.layer(f, None, threads)?;
-        let g = hulls::read::<P8>(&p, threads)?.states(&layer)?;
-        let (mut new, mut grown, mut full) = (0u64, 0u64, 0u64);
-        let (mut gx, mut gy) = (Vec::new(), Vec::new());
-        for (sk, layer, h) in g {
-            match last.get_mut(&sk) {
-                None => {
-                    anyhow::ensure!(layer as u32 == f, "f{f}: a first hull at layer {layer}");
-                    new += 1;
-                    last.insert(sk, (h, 1));
-                }
-                Some((was, n)) => {
-                    grown += 1;
-                    gx.push(h.x.len() - was.x.len());
-                    gy.push(h.y.len() - was.y.len());
-                    full += h.x.is_full() as u64;
-                    *was = h;
-                    *n += 1;
-                }
-            }
-        }
-        println!("{f}\t{new}\t{grown}\t{}\t{}\t{}\t{}\t{full}", q(&mut gx, 0.5), q(&mut gx, 0.9), q(&mut gy, 0.5), q(&mut gy, 0.9));
-    }
-    let mut times: Vec<u32> = last.values().map(|x| x.1).collect();
-    let (mut wx, mut wy): (Vec<u32>, Vec<u32>) = last.values().map(|x| (x.0.x.len(), x.0.y.len())).unzip();
-    let n = times.len().max(1) as f64;
-    let entries: u64 = times.iter().map(|&t| t as u64).sum();
-    let mut hist = [0u64; 6];
-    for &t in &times {
-        hist[(t as usize).min(6) - 1] += 1;
-    }
-    println!(
-        "states {}: hulls set {} times ({:.2} a state; 1: {}, 2: {}, 3: {}, 4: {}, 5: {}, 6+: {}); final width x med {} p90 {} y med {} p90 {}; full in x {:.1}%, in y {:.1}%",
-        times.len(),
-        entries,
-        entries as f64 / n,
-        hist[0],
-        hist[1],
-        hist[2],
-        hist[3],
-        hist[4],
-        hist[5],
-        q(&mut wx, 0.5),
-        q(&mut wx, 0.9),
-        q(&mut wy, 0.5),
-        q(&mut wy, 0.9),
-        100.0 * wx.iter().filter(|&&w| w == 65536).count() as f64 / n,
-        100.0 * wy.iter().filter(|&&w| w == 65536).count() as f64 / n
-    );
-    times.clear();
-    Ok(())
-}
-
-fn reach_command(checkpoint_dir: &str, level_index: usize, to: u32, save: Option<&str>, cells_out: Option<&str>, decode_rect: Option<&str>, cfg: &celeste_rust::settings::Settings) -> Result<()> {
-    use celeste_rust::search::pos_graph::cell_xy;
-    use std::io::Write;
-    let dir = std::path::Path::new(checkpoint_dir).join(format!("level{level_index:02}"));
-    let steps = to * cfg.steps_per_frame();
-    let tree = Tree::<P8>::open(&dir, steps)?;
-    let level = tree_level(&dir)?;
-    cfg.check(&dir, level)?;
-    let geo = celeste_rust::storage::GEOMETRY;
-    let rect = decode_rect
-        .map(|r| {
-            let (x, y) = r.split_once(',').ok_or_else(|| anyhow::anyhow!("--decode-rect x0..x1,y0..y1"))?;
-            let range = |t: &str| -> Result<(i32, i32)> {
-                let (a, b) = t.split_once("..").ok_or_else(|| anyhow::anyhow!("--decode-rect x0..x1,y0..y1"))?;
-                Ok((a.trim().parse()?, b.trim().parse()?))
-            };
-            Ok::<_, anyhow::Error>((range(x)?, range(y)?))
-        })
-        .transpose()?;
-    let mut cells_file = cells_out.map(|p| std::fs::File::create(p).map(std::io::BufWriter::new)).transpose()?;
-    let point = celeste_rust::search::arc_dp::start_point::<P8>(cfg)?;
-    let t0 = std::time::Instant::now();
-    // Written frame by frame (a run stopped part way keeps them): the
-    // frames' sums (`reach.tsv`) and the reached sets' shapes
-    // (`rem_stats.tsv`).
-    const TSV_HEAD: &str = "frame\tstates\tnew\tentered\tentered_edges\treached_edges\tpushes\tpushes_nonempty\tpoints\tcells\tforward_layer\tcoarsened\tinexact\tmax_k\tx_min\tx_max\ty_min\ty_max\n";
-    let save_dir = save.map(std::path::Path::new);
-    if let Some(d) = save_dir {
-        std::fs::create_dir_all(d)?;
-    }
-    let mut tsv_file = save_dir.map(|d| std::fs::File::create(d.join("reach.tsv")).map(std::io::LineWriter::new)).transpose()?;
-    let mut rem_file = save_dir.map(|d| std::fs::File::create(d.join("rem_stats.tsv")).map(std::io::LineWriter::new)).transpose()?;
-    if let Some(f) = &mut tsv_file {
-        f.write_all(TSV_HEAD.as_bytes())?;
-    }
-    if let Some(f) = &mut rem_file {
-        f.write_all(b"frame\taxis\tof\tbucket\tstates\texact_states\n")?;
-    }
-    let mut tsv = String::from(TSV_HEAD);
-    let pool = celeste_rust::par::Pool::new(cfg.threads());
-    let r = celeste_rust::search::reach::reach(&dir, steps, point, cfg.threads(), |fr, pushes, cur, inexact| {
-        let t = fr.frame;
-        let shapes = rem_shapes(t, cur, inexact, &pool)?;
-        if let Some(f) = &mut rem_file {
-            f.write_all(shapes.as_bytes())?;
-        }
-        let (mut x0, mut x1, mut y0, mut y1) = (i32::MAX, i32::MIN, i32::MAX, i32::MIN);
-        let mut per_cell: rustc_hash::FxHashMap<u32, u64> = Default::default();
-        for (s, _) in cur {
-            let c = s.cell(&geo);
-            *per_cell.entry(c).or_default() += 1;
-            if let Some((x, y)) = cell_xy(c) {
-                (x0, x1, y0, y1) = (x0.min(x), x1.max(x), y0.min(y), y1.max(y));
-            }
-        }
-        if let Some(f) = &mut cells_file {
-            let mut v: Vec<(u32, u64)> = per_cell.into_iter().collect();
-            v.sort_unstable();
-            for (c, n) in v {
-                if let Some((x, y)) = cell_xy(c) {
-                    writeln!(f, "{t} {x} {y} {n}")?;
-                }
-            }
-        }
-        let p = pushes.unwrap_or_default();
-        let line = format!(
-            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
-            t, fr.states, fr.new, fr.entered, fr.entered_edges, fr.reached_edges, p.edges, p.nonempty, fr.points, fr.cells, fr.forward_layer, fr.coarsened, fr.inexact, fr.max_k, x0, x1, y0, y1
-        );
-        if let Some(f) = &mut tsv_file {
-            f.write_all(line.as_bytes())?;
-        }
-        tsv += &line;
-        if let Some(((rx0, rx1), (ry0, ry1))) = rect {
-            let inside: Vec<_> = cur
-                .iter()
-                .filter(|(s, _)| cell_xy(s.cell(&geo)).is_some_and(|(x, y)| (rx0..=rx1).contains(&x) && (ry0..=ry1).contains(&y)))
-                .take(20)
-                .collect();
-            for (s, reg) in inside {
-                let layer = (0..=t).find(|&f| tree.mask_at(f, s.region, s.key).is_ok_and(|m| m >> s.local & 1 == 1));
-                let Some(layer) = layer else { continue };
-                let row = tree.row(layer, *s, cfg.room)?;
-                let named = project_all(&row).swap_remove(0);
-                let keep = ["player.x", "player.y", "spd.x", "spd.y", "rem.x", "rem.y", "dash_effect_time"];
-                let mut text: Vec<String> = named.iter().filter(|(k, _)| keep.contains(&k.as_str()) || k.ends_with(".djump") || k.ends_with(".dash_time") || k.ends_with(".grace")).map(|(k, v)| format!("{k}={v}")).collect();
-                text.push(format!("rem-points={}", celeste_rust::search::reach::points(reg)));
-                if let Some(k) = inexact.get(s) {
-                    text.push(format!("INEXACT(2^{k} grid)"));
-                }
-                println!("[reach] f{t:03} in the rect: {}", text.join(" "));
-            }
-        }
-        Ok(())
-    })?;
-    println!("[reach] {} to f{to}, {:.1} s", dir.display(), t0.elapsed().as_secs_f64());
-    print!("{tsv}");
-    // Against the forward: its visited states and its emissions (records)
-    // over the same frames.
-    let fwd = std::fs::read_to_string(dir.join("forward.tsv")).unwrap_or_default();
-    let mut lines = fwd.lines();
-    let head: Vec<&str> = lines.next().unwrap_or("").split('\t').collect();
-    let col = |name: &str| head.iter().position(|h| *h == name);
-    let (mut visited, mut expanded, mut emitted) = (0u64, 0u64, 0u64);
-    if let (Some(vf), Some(ve), Some(vv)) = (col("frame"), col("edges"), col("visited")) {
-        for l in lines {
-            let c: Vec<&str> = l.split('\t').collect();
-            let f: u32 = c[vf].parse()?;
-            if f <= steps {
-                emitted += c[ve].parse::<u64>()?;
-                visited = visited.max(c[vv].parse()?);
-            }
-            if f < steps {
-                expanded = expanded.max(c[vv].parse()?);
-            }
-        }
-    }
-    let live = r.last.len() as u64;
-    let entered: u64 = r.frames.iter().map(|f| f.entered).sum();
-    let entered_edges: u64 = r.frames.iter().map(|f| f.entered_edges).sum();
-    let reached: u64 = r.frames.iter().filter(|f| f.frame < steps).map(|f| f.states).sum();
-    let reached_edges: u64 = r.frames.iter().map(|f| f.reached_edges).sum();
-    let e = &r.entries;
-    let range = |a: usize, b: usize| e.iter().skip(a).take(b.saturating_sub(a)).sum::<u64>();
-    let mut summary = String::new();
-    summary += &format!("[reach] states ever reached: {live} (the forward visited {visited}: {:.2}%)\n", 100.0 * live as f64 / visited.max(1) as f64);
-    summary += &format!(
-        "[reach] first arrival (a lower bound: unions coarsened past 32 segments): entries per state 1: {}, 2: {}, 3-5: {}, 6+: {}; {entered} expansions against the forward's {expanded} ({:.2}%), {entered_edges} distinct out-edges pushed (the forward emitted {emitted} lanes)\n",
-        range(1, 2),
-        range(2, 3),
-        range(3, 6),
-        range(6, usize::MAX),
-        100.0 * entered as f64 / expanded.max(1) as f64
-    );
-    summary += &format!(
-        "[reach] the upper bound, a state entering at every frame it is reached: {reached} expansions ({:.2}%), {reached_edges} distinct out-edges pushed\n",
-        100.0 * reached as f64 / expanded.max(1) as f64
-    );
-    summary += &format!(
-        "[reach] edges of the states ever reached: {} distinct (target, transfer) of {} recorded, {} of those ever pushed non-empty\n",
-        r.edges,
-        r.edges_raw,
-        r.edges_pushed
-    );
-    print!("{summary}");
-    if let Some(d) = save {
-        let d = std::path::Path::new(d);
-        std::fs::create_dir_all(d)?;
-        std::fs::write(d.join("summary.txt"), &summary)?;
-        let rows: Vec<celeste_rust::frame::MarkRow> = r
-            .last
-            .iter()
-            .map(|(s, &l)| celeste_rust::frame::mark_row(tree.shapes[s.shape(&geo) as usize], s.key, s.cell(&geo), l.min(u16::MAX as u32) as u16, steps))
-            .collect();
-        celeste_rust::frame::save_marks(&d.join("reach.marks.bin"), rows, steps, &tree.space)?;
-        println!("[reach] {} reached states saved to {}", r.last.len(), d.join("reach.marks.bin").display());
-    }
-    Ok(())
-}
-
-/// One frame's reached sets by shape, as `rem_stats.tsv` rows: per axis
-/// (`x`, `y`: the set's projection) the number of segments and the measure
-/// (points of the 2^16 circle), and the measure of the whole set (`xy`, of
-/// 2^32), each bucketed; every state and the exact ones apart.
-fn rem_shapes(t: u32, cur: &[(celeste_rust::storage::Sk, celeste_rust::search::arcs::Region)], inexact: &rustc_hash::FxHashMap<celeste_rust::storage::Sk, u8>, pool: &celeste_rust::par::Pool) -> Result<String> {
-    use celeste_rust::search::arcs::Seg;
-    const SEGS: [&str; 5] = ["1", "2-4", "5-64", "65-1024", "1025+"];
-    const MEASURE: [&str; 6] = ["point", "<=1/256", "<=1/16", "<=1/2", "<full", "full"];
-    let segs_bucket = |n: usize| match n {
-        0 | 1 => 0,
-        2..=4 => 1,
-        5..=64 => 2,
-        65..=1024 => 3,
-        _ => 4,
-    };
-    let measure_bucket = |p: u64, full: u64| match p {
-        _ if p >= full => 5,
-        0 | 1 => 0,
-        _ if p <= full >> 8 => 1,
-        _ if p <= full >> 4 => 2,
-        _ if p <= full >> 1 => 3,
-        _ => 4,
-    };
-    // [axis x, y][segs | measure][bucket][all, exact], and xy's measure.
-    type Counts = ([[[[u64; 2]; 6]; 2]; 2], [[u64; 2]; 6]);
-    const CHUNK: usize = 4096;
-    let parts = pool.map_with(
-        cur.len().div_ceil(CHUNK),
-        || Ok(Vec::<Seg>::new()),
-        |xs, c| {
-            let mut n: Counts = Default::default();
-            for (s, r) in &cur[c * CHUNK..((c + 1) * CHUNK).min(cur.len())] {
-                let k = !inexact.contains_key(s) as usize;
-                // A projection's (segments, points): merged where they touch.
-                let proj = |v: &mut Vec<Seg>| -> (usize, u64) {
-                    v.sort_unstable_by_key(|s| s.lo);
-                    let (mut n, mut p, mut hi) = (0usize, 0u64, None::<u32>);
-                    for s in v.iter() {
-                        match hi {
-                            Some(h) if s.lo <= h => {
-                                if s.hi > h {
-                                    p += (s.hi - h) as u64;
-                                    hi = Some(s.hi);
-                                }
-                            }
-                            _ => {
-                                n += 1;
-                                p += (s.hi - s.lo) as u64;
-                                hi = Some(s.hi);
-                            }
-                        }
-                    }
-                    (n, p)
-                };
-                xs.clear();
-                let mut ys: Vec<Seg> = Vec::new();
-                for (y, x) in r.slabs() {
-                    ys.push(y);
-                    xs.extend(x);
-                }
-                for (a, v) in [(0, &mut *xs), (1, &mut ys)] {
-                    let (segs, p) = proj(v);
-                    n.0[a][0][segs_bucket(segs)][0] += 1;
-                    n.0[a][1][measure_bucket(p, 1 << 16)][0] += 1;
-                    n.0[a][0][segs_bucket(segs)][1] += k as u64;
-                    n.0[a][1][measure_bucket(p, 1 << 16)][1] += k as u64;
-                }
-                let b = measure_bucket(celeste_rust::search::reach::points(r), 1 << 32);
-                n.1[b][0] += 1;
-                n.1[b][1] += k as u64;
-            }
-            Ok(n)
-        },
-    )?;
-    let mut n: Counts = Default::default();
-    for p in parts {
-        for a in 0..2 {
-            for m in 0..2 {
-                for b in 0..6 {
-                    for k in 0..2 {
-                        n.0[a][m][b][k] += p.0[a][m][b][k];
-                    }
-                }
-            }
-        }
-        for b in 0..6 {
-            for k in 0..2 {
-                n.1[b][k] += p.1[b][k];
-            }
-        }
-    }
-    let mut out = String::new();
-    for (a, axis) in ["x", "y"].iter().enumerate() {
-        for (b, name) in SEGS.iter().enumerate() {
-            if n.0[a][0][b][0] > 0 {
-                out += &format!("{t}\t{axis}\tsegments\t{name}\t{}\t{}\n", n.0[a][0][b][0], n.0[a][0][b][1]);
-            }
-        }
-        for (b, name) in MEASURE.iter().enumerate() {
-            if n.0[a][1][b][0] > 0 {
-                out += &format!("{t}\t{axis}\tmeasure\t{name}\t{}\t{}\n", n.0[a][1][b][0], n.0[a][1][b][1]);
-            }
-        }
-    }
-    for (b, name) in MEASURE.iter().enumerate() {
-        if n.1[b][0] > 0 {
-            out += &format!("{t}\txy\tmeasure\t{name}\t{}\t{}\n", n.1[b][0], n.1[b][1]);
-        }
-    }
-    Ok(out)
-}
-
-/// The level a tree was widened at (its settings record).
-fn tree_level(dir: &std::path::Path) -> Result<Level> {
-    let rec = std::fs::read_to_string(celeste_rust::settings::path(dir)).with_context(|| format!("{}: no settings record", dir.display()))?;
-    let spec = rec.lines().find_map(|l| l.strip_prefix("level ")).ok_or_else(|| anyhow::anyhow!("{}: the record names no level", dir.display()))?;
-    Level::parse(spec).map_err(|e| anyhow::anyhow!(e))
 }

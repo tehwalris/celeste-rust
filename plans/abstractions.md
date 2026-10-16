@@ -198,8 +198,8 @@ input, never a stored value); the concrete search's seeded-balloon view
   `sin(offset)` into `y`, which is stored as the bob band; every phase's
   `y` lies in it. Refuted by the concrete search, which runs the real
   seed, and by `r0sxh`.
-- **Soundness check**: `diag-project` found every row of a room (7,0) `t`
-  tree projects onto a row of the `n` tree.
+- **Soundness check**: `diag-project` (a diagnostic since deleted) found
+  every row of a room (7,0) `t` tree projects onto a row of the `n` tree.
 - **Measured**: room (7,0) step 108: `b` 20.2M, `n` 3.4M states. Room
   (0,1) f100: 14.8M against 40.0M with the balloon's `spr` exact. Where it
   is too loose for the concrete search alone (room (7,0): bound 80, the
