@@ -22,6 +22,8 @@
 //! half, so it holds a cut), and a superset of it otherwise.
 
 use super::arcs::{Action, Piece, Region, Seg, Transfer, CIRCLE};
+use super::rem::Rem;
+use celeste_core::pico8_num::Pico8Num as P8;
 
 /// An ARC of the circle: `last + 1` points from `start`, wrapping past the
 /// end (`last + 1` is at most `CIRCLE`; the whole circle starts at 0).
@@ -249,26 +251,26 @@ fn image(a: Arc, t: Transfer, out: &mut [Seg; 4]) -> usize {
 /// depends on nothing else. The transfer is the caller's id; start a new
 /// `epoch` when the ids change meaning (an entry of an older one never
 /// matches).
-pub struct PushCache {
-    slots: Vec<(u64, u64, u32, u32, Option<HullAcc>)>,
+pub struct PushCache<N: Rem = P8> {
+    slots: Vec<(N::Hull, N::Hull, u32, u32, Option<N::Acc>)>,
     epoch: u32,
 }
 
 /// Entries of a `PushCache` (a power of two).
 const PUSH_CACHE: usize = 1 << 11;
 
-impl Default for PushCache {
+impl<N: Rem> Default for PushCache<N> {
     fn default() -> Self {
-        PushCache { slots: vec![(u64::MAX, u64::MAX, u32::MAX, u32::MAX, None); PUSH_CACHE], epoch: 0 }
+        PushCache { slots: vec![(N::Hull::default(), N::Hull::default(), u32::MAX, u32::MAX, None); PUSH_CACHE], epoch: 0 }
     }
 }
 
-impl PushCache {
+impl<N: Rem> PushCache<N> {
     /// The transfer ids change meaning from here.
     pub fn next_epoch(&mut self) {
         self.epoch = self.epoch.wrapping_add(1);
         if self.epoch == u32::MAX {
-            self.slots.fill((u64::MAX, u64::MAX, u32::MAX, u32::MAX, None));
+            self.slots.fill((N::Hull::default(), N::Hull::default(), u32::MAX, u32::MAX, None));
             self.epoch = 0;
         }
     }
@@ -276,15 +278,15 @@ impl PushCache {
     /// The push of `h` (`was`: its last pushed hull; itself for a hull
     /// pushed the first time) along transfer `x`, `f()` on a miss.
     #[inline]
-    pub fn get(&mut self, h: &Hull, was: &Hull, x: u32, f: impl FnOnce() -> Option<HullAcc>) -> Option<HullAcc> {
-        let (a, b) = (h.word(), was.word());
+    pub fn get(&mut self, h: &N::Hull, was: &N::Hull, x: u32, f: impl FnOnce() -> Option<N::Acc>) -> Option<N::Acc> {
+        let (a, b) = (N::hull_hash(h), N::hull_hash(was));
         let k = ((a ^ b.rotate_left(29) ^ (x as u64) << 45).wrapping_mul(0x9e37_79b9_7f4a_7c15) >> (64 - PUSH_CACHE.trailing_zeros())) as usize;
         let e = &mut self.slots[k];
-        if (e.0, e.1, e.2, e.3) == (a, b, x, self.epoch) {
+        if (e.0, e.1, e.2, e.3) == (*h, *was, x, self.epoch) {
             return e.4;
         }
         let r = f();
-        *e = (a, b, x, self.epoch, r);
+        *e = (*h, *was, x, self.epoch, r);
         r
     }
 }

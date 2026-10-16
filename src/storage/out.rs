@@ -28,7 +28,8 @@ use std::path::{Path, PathBuf};
 
 use super::bundle::{get_varint, get_varint128, put_varint, put_varint128};
 use super::visited::Key;
-use crate::search::arc_edges::{decode_pair, encode_pair, Pair, PAIR_BYTES};
+use crate::search::rem::Rem;
+use celeste_core::pico8_num::Pico8Num as P8;
 use celeste_engine::exact::is_provisional;
 
 const MAGIC: &[u8; 4] = b"CSO1";
@@ -47,12 +48,12 @@ fn narrow(w: u128) -> Key {
 /// the target's route `(shape, slot)` and key, the transfer, the offset
 /// (`bundle::offset`), the target cells.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub struct Row {
+pub struct Row<N: Rem = P8> {
     pub s_region: u32,
     pub s_key: Key,
     pub route: (u64, u32),
     pub t_key: Key,
-    pub pair: Pair,
+    pub pair: N::Pair,
     pub o: u32,
     pub mask: u64,
 }
@@ -71,10 +72,9 @@ pub struct OutBundle {
 /// pairs, targets `(route, key)` and entries `(region, key)`, each sorted
 /// and distinct, and its rows `(entry, target, pair, offset) -> cells`
 /// (any order; equal ones merged).
-#[derive(Default)]
-pub struct Parts {
+pub struct Parts<N: Rem = P8> {
     pub routes: Vec<(u64, u32)>,
-    pub pairs: Vec<Pair>,
+    pub pairs: Vec<N::Pair>,
     pub targets: Vec<(u32, Key)>,
     pub entries: Vec<(u32, Key)>,
     pub rows: Vec<(u128, u64)>,
@@ -86,7 +86,13 @@ pub fn row_key(entry: u32, t: u32, x: u32, o: u32) -> u128 {
     (entry as u128) << 96 | (t as u128) << 64 | (x as u128) << 32 | o as u128
 }
 
-impl Parts {
+impl<N: Rem> Default for Parts<N> {
+    fn default() -> Self {
+        Parts { routes: Vec::new(), pairs: Vec::new(), targets: Vec::new(), entries: Vec::new(), rows: Vec::new() }
+    }
+}
+
+impl<N: Rem> Parts<N> {
     pub fn clear(&mut self) {
         self.routes.clear();
         self.pairs.clear();
@@ -99,7 +105,7 @@ impl Parts {
 /// ENCODE `p` as a raw block into `out` (cleared). Returns whether a
 /// target key is provisional (the block waits for the frame's end:
 /// `fixup`).
-pub fn encode_parts(p: &mut Parts, out: &mut Vec<u8>) -> bool {
+pub fn encode_parts<N: Rem>(p: &mut Parts<N>, out: &mut Vec<u8>) -> bool {
     out.clear();
     debug_assert!(p.routes.windows(2).all(|w| w[0] < w[1]) && p.pairs.windows(2).all(|w| w[0] < w[1]) && p.targets.windows(2).all(|w| w[0] < w[1]) && p.entries.windows(2).all(|w| w[0] < w[1]));
     p.rows.sort_unstable_by_key(|r| r.0);
@@ -110,7 +116,7 @@ pub fn encode_parts(p: &mut Parts, out: &mut Vec<u8>) -> bool {
     }
     put_varint(out, p.pairs.len() as u64);
     for x in &p.pairs {
-        encode_pair(out, x);
+        N::encode_pair(out, x);
     }
     put_varint(out, p.targets.len() as u64);
     let mut provisional = false;
@@ -192,7 +198,7 @@ pub const BLOCK_ROWS: usize = 1 << 11;
 /// `p` as raw blocks of whole entries, about `BLOCK_ROWS` rows each, each
 /// with the routes, pairs and targets it uses (`encode_parts` each);
 /// whether a target key is provisional, per block.
-pub fn encode_blocks(p: &mut Parts) -> Vec<(Vec<u8>, bool)> {
+pub fn encode_blocks<N: Rem>(p: &mut Parts<N>) -> Vec<(Vec<u8>, bool)> {
     // By entry (a counting sort: a unit's entries are few), then each
     // entry's rows by key.
     let mut at = vec![0usize; p.entries.len() + 1];
@@ -246,7 +252,7 @@ pub fn encode_blocks(p: &mut Parts) -> Vec<(Vec<u8>, bool)> {
         let mut rs: Vec<u32> = ts.iter().map(|&t| p.targets[t as usize].0).collect();
         rs.sort_unstable();
         rs.dedup();
-        let mut b = Parts { routes: rs.iter().map(|&r| p.routes[r as usize]).collect(), pairs: xs.iter().map(|&x| p.pairs[x as usize]).collect(), ..Default::default() };
+        let mut b = Parts::<N> { routes: rs.iter().map(|&r| p.routes[r as usize]).collect(), pairs: xs.iter().map(|&x| p.pairs[x as usize]).collect(), ..Default::default() };
         for (k, &t) in ts.iter().enumerate() {
             t_new[t as usize] = k as u32;
             let (r, key) = p.targets[t as usize];
@@ -276,8 +282,8 @@ pub fn encode_blocks(p: &mut Parts) -> Vec<(Vec<u8>, bool)> {
 /// ENCODE `rows` (any order; equal (entry, target, transfer, offset) rows
 /// merged) as a raw block into `out` (cleared): `encode_parts` of their
 /// indices. Returns whether a target key is provisional.
-pub fn encode(rows: &[Row], out: &mut Vec<u8>) -> bool {
-    let mut p = Parts::default();
+pub fn encode<N: Rem>(rows: &[Row<N>], out: &mut Vec<u8>) -> bool {
+    let mut p = Parts::<N>::default();
     p.routes = rows.iter().map(|r| r.route).collect();
     p.routes.sort_unstable();
     p.routes.dedup();
@@ -305,16 +311,16 @@ pub fn encode(rows: &[Row], out: &mut Vec<u8>) -> bool {
 
 /// A raw block, its header read: routes, pairs, targets; `entries` walks
 /// its entries.
-pub struct Block<'a> {
+pub struct Block<'a, N: Rem = P8> {
     pub routes: Vec<(u64, u32)>,
-    pub pairs: Vec<Pair>,
+    pub pairs: Vec<N::Pair>,
     /// (route, key) per target.
     pub targets: Vec<(u32, Key)>,
     body: &'a [u8],
     n: usize,
 }
 
-impl<'a> Block<'a> {
+impl<'a, N: Rem> Block<'a, N> {
     pub fn open(raw: &'a [u8]) -> Result<Self> {
         let mut pos = 0usize;
         let nr = get_varint(raw, &mut pos) as usize;
@@ -327,9 +333,9 @@ impl<'a> Block<'a> {
             routes.push((shape, get_varint(raw, &mut pos) as u32));
         }
         let np = get_varint(raw, &mut pos) as usize;
-        ensure!(pos + np * PAIR_BYTES <= raw.len(), "an out block cut short");
-        let pairs: Vec<Pair> = raw[pos..pos + np * PAIR_BYTES].chunks_exact(PAIR_BYTES).map(decode_pair).collect();
-        pos += np * PAIR_BYTES;
+        ensure!(pos + np * N::PAIR_BYTES <= raw.len(), "an out block cut short");
+        let pairs: Vec<N::Pair> = raw[pos..pos + np * N::PAIR_BYTES].chunks_exact(N::PAIR_BYTES).map(N::decode_pair).collect();
+        pos += np * N::PAIR_BYTES;
         let nt = get_varint(raw, &mut pos) as usize;
         ensure!(nt <= raw.len(), "an out block of {nt} targets in {} bytes", raw.len());
         let mut targets = Vec::with_capacity(nt);
@@ -403,7 +409,7 @@ impl<'a> Block<'a> {
     }
 
     /// The block's rows (`Row`s, merged bundles), every entry read.
-    pub fn rows(&self) -> Result<Vec<Row>> {
+    pub fn rows(&self) -> Result<Vec<Row<N>>> {
         let mut out = Vec::new();
         let mut bad = false;
         self.entries(
@@ -425,8 +431,8 @@ impl<'a> Block<'a> {
 
 /// A raw block with PROVISIONAL target keys encoded again with their final
 /// keys (`finals`, the frame's end's).
-pub fn fixup(raw: &[u8], finals: &rustc_hash::FxHashMap<Key, Key>, out: &mut Vec<u8>) -> Result<()> {
-    let mut rows = Block::open(raw)?.rows()?;
+pub fn fixup<N: Rem>(raw: &[u8], finals: &rustc_hash::FxHashMap<Key, Key>, out: &mut Vec<u8>) -> Result<()> {
+    let mut rows = Block::<N>::open(raw)?.rows()?;
     for r in &mut rows {
         if is_provisional(r.t_key) {
             r.t_key = *finals.get(&r.t_key).ok_or_else(|| anyhow::anyhow!("an out block's provisional target without its final key"))?;
@@ -459,8 +465,8 @@ pub struct Sealed {
 
 impl Sealed {
     /// `raw` compressed, its entry range read off it (`None`: no entry).
-    pub fn of(raw: &[u8], z: &mut zstd::bulk::Compressor<'static>) -> Result<Option<Sealed>> {
-        let b = Block::open(raw)?;
+    pub fn of<N: Rem>(raw: &[u8], z: &mut zstd::bulk::Compressor<'static>) -> Result<Option<Sealed>> {
+        let b = Block::<N>::open(raw)?;
         let (mut first, mut last) = (None, None);
         b.entries(
             |r, k| {
@@ -667,7 +673,7 @@ mod tests {
         let ax = |v: i32| crate::search::arc_edges::AxisXfer { lo: 0, hi: 1 << 16, tag: 0, val: v };
         let p = |v: i32| (ax(v), ax(-v));
         let prov = (celeste_engine::exact::PROVISIONAL | 3, 7);
-        let row = |r: u32, k: u64, sh: u64, slot: u32, t: Key, v: i32, o: u32, mask: u64| Row { s_region: r, s_key: (0, k), route: (sh, slot), t_key: t, pair: p(v), o, mask };
+        let row = |r: u32, k: u64, sh: u64, slot: u32, t: Key, v: i32, o: u32, mask: u64| Row::<P8> { s_region: r, s_key: (0, k), route: (sh, slot), t_key: t, pair: p(v), o, mask };
         let mut rows = vec![
             row(5, 9, 77, 3, (0, 1), 4, 2049 << 11 | 1025, 0b11),
             row(5, 9, 77, 3, (0, 1), 4, 2049 << 11 | 1025, 0b100),
@@ -690,15 +696,15 @@ mod tests {
         assert_eq!(seen, vec![(5, (0, 9), 1)]);
         let finals: rustc_hash::FxHashMap<Key, Key> = [(prov, (0, 3))].into_iter().collect();
         let mut fixed = Vec::new();
-        fixup(&raw, &finals, &mut fixed).unwrap();
-        assert!(Block::open(&fixed).unwrap().rows().unwrap().iter().any(|r| r.t_key == (0, 3)));
+        fixup::<P8>(&raw, &finals, &mut fixed).unwrap();
+        assert!(Block::<P8>::open(&fixed).unwrap().rows().unwrap().iter().any(|r| r.t_key == (0, 3)));
         // A file of two blocks.
         let dir = std::env::temp_dir().join(format!("celeste-out-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let mut z = zstd::bulk::Compressor::new(1).unwrap();
         let mut second = Vec::new();
         encode(&[row(9, 4, 77, 3, (0, 1), 4, 1024 << 11 | 1024, 1)], &mut second);
-        let blocks = vec![Sealed::of(&fixed, &mut z).unwrap().unwrap(), Sealed::of(&second, &mut z).unwrap().unwrap()];
+        let blocks = vec![Sealed::of::<P8>(&fixed, &mut z).unwrap().unwrap(), Sealed::of::<P8>(&second, &mut z).unwrap().unwrap()];
         let path = path(&dir, 3);
         write(&path, 3, &blocks, None).unwrap();
         let f = OutFile::open(&path, 3).unwrap();

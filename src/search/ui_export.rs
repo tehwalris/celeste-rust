@@ -1081,7 +1081,7 @@ mod tests {
         // Out of order: refused.
         let bad = dir.join("bad.bin");
         let rows: Vec<crate::frame::MarkRow> = vec![(7, 3, 5, 6, 0), (7, 3, 1, 2, 0)];
-        crate::search::checkpoint::save_value_to(&bad, &(rows, 9u32, celeste_engine::exact::KeySpace::default().to_additions())).unwrap();
+        crate::search::checkpoint::save_value_to(&bad, &(rows, 9u32, celeste_engine::exact::KeySpace::<celeste_engine::runtime2::P8>::default().to_additions())).unwrap();
         assert!(scan_marks(MarksMap::open(&bad).unwrap(), &bad, 2).is_err());
         std::fs::remove_dir_all(&dir).unwrap();
     }

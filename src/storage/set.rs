@@ -25,7 +25,8 @@ use anyhow::{anyhow, ensure, Result};
 use super::bundle::{get_varint, get_varint128, put_varint, put_varint128};
 use super::visited::Key;
 use super::{Sk, GEOMETRY};
-use crate::search::hull::{Hull, HULL_BYTES};
+use crate::search::rem::Rem;
+use celeste_core::pico8_num::Pico8Num as P8;
 
 const _: () = assert!(GEOMETRY.words == 1, "a set holds a u64 mask an entry: 8 x 8 storage regions");
 
@@ -49,16 +50,16 @@ fn bytes_of(w: u128) -> usize {
 /// expanded it) and its remainder HULL so far: a packed table's per-state
 /// info.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct StateInfo {
-    pub hull: Hull,
+pub struct StateInfo<N: Rem = P8> {
+    pub hull: N::Hull,
     pub layer: u16,
 }
 
-impl StateInfo {
+impl<N: Rem> StateInfo<N> {
     /// Is its hull the whole torus (then it is not stored: a bare cell)?
     #[inline]
     pub fn is_full(&self) -> bool {
-        self.hull.x.is_full() && self.hull.y.is_full()
+        N::is_full(&self.hull)
     }
 }
 
@@ -109,16 +110,21 @@ impl Block {
 /// A packed block DECODED: per entry its key, cells, bare cells (no info:
 /// full hulls) and its first info's place (`at`: one past the last at the
 /// end), and the infos by entry and cell.
-#[derive(Default)]
-pub struct Rows {
+pub struct Rows<N: Rem = P8> {
     keys: Vec<u128>,
     masks: Vec<u64>,
     bare: Vec<u64>,
     at: Vec<u32>,
-    infos: Vec<StateInfo>,
+    infos: Vec<StateInfo<N>>,
 }
 
-impl Rows {
+impl<N: Rem> Default for Rows<N> {
+    fn default() -> Self {
+        Rows { keys: Vec::new(), masks: Vec::new(), bare: Vec::new(), at: Vec::new(), infos: Vec::new() }
+    }
+}
+
+impl<N: Rem> Rows<N> {
     fn clear(&mut self) {
         self.keys.clear();
         self.masks.clear();
@@ -135,7 +141,7 @@ impl Rows {
     /// Append an entry: its key, cells, bare cells and its infos (one per
     /// cell not bare, by cell).
     #[inline]
-    fn push(&mut self, key: u128, mask: u64, bare: u64, infos: &[StateInfo]) {
+    fn push(&mut self, key: u128, mask: u64, bare: u64, infos: &[StateInfo<N>]) {
         debug_assert_eq!((mask & !bare).count_ones() as usize, infos.len());
         debug_assert!(self.keys.last().is_none_or(|&k| k < key), "a packed table's keys out of order");
         self.keys.push(key);
@@ -147,7 +153,7 @@ impl Rows {
 
     /// Entry `i`'s infos.
     #[inline]
-    fn infos_of(&self, i: usize) -> &[StateInfo] {
+    fn infos_of(&self, i: usize) -> &[StateInfo<N>] {
         &self.infos[self.at[i] as usize..self.at[i + 1] as usize]
     }
 
@@ -172,7 +178,7 @@ impl Rows {
             raw.extend_from_slice(&i.layer.to_le_bytes());
         }
         for i in &self.infos[ia..ib] {
-            raw.extend_from_slice(&i.hull.to_bytes());
+            N::hull_to_bytes(&i.hull, raw);
         }
         ensure!(raw.len() < u32::MAX as usize, "a packed block of {} bytes", raw.len());
         let states: u32 = self.masks[a..b].iter().map(|m| m.count_ones()).sum();
@@ -204,9 +210,9 @@ impl Rows {
             at += (self.masks[k] & !bare).count_ones();
             self.at.push(at);
         }
-        ensure!(at as usize == ni && pos + (2 + HULL_BYTES) * ni == b.len(), "a packed block's infos do not match its cells");
+        ensure!(at as usize == ni && pos + (2 + N::HULL_BYTES) * ni == b.len(), "a packed block's infos do not match its cells");
         let (layers, hulls) = b[pos..].split_at(2 * ni);
-        self.infos.extend(layers.chunks_exact(2).zip(hulls.chunks_exact(HULL_BYTES)).map(|(l, h)| StateInfo { layer: u16::from_le_bytes([l[0], l[1]]), hull: Hull::from_bytes(h) }));
+        self.infos.extend(layers.chunks_exact(2).zip(hulls.chunks_exact(N::HULL_BYTES)).map(|(l, h)| StateInfo { layer: u16::from_le_bytes([l[0], l[1]]), hull: N::hull_from_bytes(h) }));
         ensure!(self.keys.first() == Some(&block.first) && self.keys.last() == Some(&block.last), "a packed block's keys are not its index's");
         Ok(())
     }
@@ -249,10 +255,10 @@ fn zstd_unpack(bytes: &[u8], raw: usize, out: &mut Vec<u8>) -> Result<()> {
 /// info (`None`: a full hull - no info, a bare cell), and whether it is
 /// NEW (then held already is an error the caller counts: `Upserted`).
 #[derive(Clone, Copy, Debug)]
-pub struct Change {
+pub struct Change<N: Rem = P8> {
     pub key: Key,
     pub cell: u8,
-    pub info: Option<StateInfo>,
+    pub info: Option<StateInfo<N>>,
     pub new: bool,
 }
 
@@ -280,16 +286,16 @@ impl std::ops::AddAssign for Upserted {
 
 /// An entry as a `Cursor` finds it: its cells, its bare cells (no info: a
 /// full hull) and the other cells' infos, by cell.
-pub struct Entry<'r> {
+pub struct Entry<'r, N: Rem = P8> {
     pub mask: u64,
     pub bare: u64,
-    pub infos: &'r [StateInfo],
+    pub infos: &'r [StateInfo<N>],
 }
 
-impl Entry<'_> {
+impl<N: Rem> Entry<'_, N> {
     /// Cell `c`'s info (`None`: not held, or bare).
     #[inline]
-    pub fn info(&self, c: u32) -> Option<StateInfo> {
+    pub fn info(&self, c: u32) -> Option<StateInfo<N>> {
         let with = self.mask & !self.bare;
         (with >> c & 1 == 1).then(|| self.infos[(with & ((1u64 << c) - 1)).count_ones() as usize])
     }
@@ -297,18 +303,18 @@ impl Entry<'_> {
 
 /// A packed table WALKED by keys in ascending order (a frame's seal): each
 /// block decoded once, when a key falls in it.
-pub struct Cursor<'a> {
+pub struct Cursor<'a, N: Rem = P8> {
     blocks: &'a [Block],
     b: usize,
     loaded: usize,
     i: usize,
-    rows: Rows,
+    rows: Rows<N>,
     raw: Vec<u8>,
 }
 
-impl<'a> Cursor<'a> {
+impl<'a, N: Rem> Cursor<'a, N> {
     /// The entry of key `k`, if held (keys asked in ascending order).
-    pub fn seek(&mut self, k: Key) -> Result<Option<Entry<'_>>> {
+    pub fn seek(&mut self, k: Key) -> Result<Option<Entry<'_, N>>> {
         let w = wide(k);
         self.b += self.blocks[self.b..].partition_point(|x| x.last < w);
         let Some(block) = self.blocks.get(self.b) else { return Ok(None) };
@@ -483,27 +489,28 @@ impl RegionTable {
     /// A packed table's entry of `k`: its cells and cell `local`'s info
     /// (`None`: not held, or full) - one block decoded (a reader's single
     /// lookup; a frame walks a `Cursor`).
-    pub fn lookup_info(&self, k: Key, local: u32) -> Option<(u64, Option<StateInfo>)> {
-        let mut c = self.cursor();
+    pub fn lookup_info<N: Rem>(&self, k: Key, local: u32) -> Option<(u64, Option<StateInfo<N>>)> {
+        let mut c = self.cursor::<N>();
         let e = c.seek(k).expect("a packed block decodes")?;
         Some((e.mask, e.info(local)))
     }
 
     fn lookup(&self, k: Key) -> Option<(u64, u64)> {
-        let mut c = self.cursor();
+        // The cells and bare cells alone: the infos' model is any one.
+        let mut c = self.cursor::<P8>();
         let e = c.seek(k).expect("a packed block decodes")?;
         Some((e.mask, e.bare))
     }
 
     /// A cursor over a packed table (keys asked in ascending order).
-    pub fn cursor(&self) -> Cursor<'_> {
+    pub fn cursor<N: Rem>(&self) -> Cursor<'_, N> {
         Cursor { blocks: self.blocks(), b: 0, loaded: usize::MAX, i: 0, rows: Rows::default(), raw: Vec::new() }
     }
 
     /// Every entry of a packed table, decoded block by block: `f(key,
     /// cells, bare cells, infos)`.
-    pub fn for_each_packed(&self, mut f: impl FnMut(Key, u64, u64, &[StateInfo])) -> Result<()> {
-        let (mut rows, mut raw) = (Rows::default(), Vec::new());
+    pub fn for_each_packed<N: Rem>(&self, mut f: impl FnMut(Key, u64, u64, &[StateInfo<N>])) -> Result<()> {
+        let (mut rows, mut raw) = (Rows::<N>::default(), Vec::new());
         for b in self.blocks() {
             rows.decode(b, &mut raw)?;
             for i in 0..rows.len() {
@@ -566,7 +573,7 @@ impl RegionTable {
     /// distinct): each state set with its info (`Change::info`; `None` or
     /// a full hull: bare), made where absent. Blocks no change falls in
     /// are kept as they are.
-    pub fn upsert(&mut self, changes: &[Change]) -> Result<Upserted> {
+    pub fn upsert<N: Rem>(&mut self, changes: &[Change<N>]) -> Result<Upserted> {
         ensure!(self.is_packed(), "an upsert into a plain table");
         let (blocks, n) = upsert_blocks(self.take_blocks(), changes)?;
         *self = RegionTable::of_blocks(blocks)?;
@@ -594,10 +601,10 @@ impl RegionTable {
 /// with their changes and cut again at `PACK_ENTRIES` entries. Blocks are
 /// independent: a big table's runs of blocks are upserted apart (with the
 /// changes between their first keys) and put back in order.
-pub fn upsert_blocks(blocks: Vec<Block>, changes: &[Change]) -> Result<(Vec<Block>, Upserted)> {
+pub fn upsert_blocks<N: Rem>(blocks: Vec<Block>, changes: &[Change<N>]) -> Result<(Vec<Block>, Upserted)> {
     debug_assert!(changes.windows(2).all(|w| (wide(w[0].key), w[0].cell) < (wide(w[1].key), w[1].cell)), "changes not by key and cell");
-    let mut w = Writer::default();
-    let (mut rows, mut raw) = (Rows::default(), Vec::new());
+    let mut w = Writer::<N>::default();
+    let (mut rows, mut raw) = (Rows::<N>::default(), Vec::new());
     let mut ci = 0usize;
     let mut n = Upserted::default();
     for block in blocks {
@@ -628,14 +635,19 @@ pub fn upsert_blocks(blocks: Vec<Block>, changes: &[Change]) -> Result<(Vec<Bloc
 
 /// The blocks an upsert makes: the entries made and not yet in a block,
 /// the blocks made.
-#[derive(Default)]
-struct Writer {
-    rows: Rows,
+struct Writer<N: Rem> {
+    rows: Rows<N>,
     out: Vec<Block>,
     raw: Vec<u8>,
 }
 
-impl Writer {
+impl<N: Rem> Default for Writer<N> {
+    fn default() -> Self {
+        Writer { rows: Rows::default(), out: Vec::new(), raw: Vec::new() }
+    }
+}
+
+impl<N: Rem> Writer<N> {
     /// Blocks of `PACK_ENTRIES` from the entries made (`all`: the rest too).
     fn flush(&mut self, all: bool) -> Result<()> {
         if self.rows.at.is_empty() {
@@ -667,13 +679,13 @@ impl Writer {
 /// Entries `rows` merged with `changes` (by key and cell; their keys at
 /// most the rows' last, or any past it where `rows` is empty) into the
 /// writer, in key order.
-fn merge_rows(rows: &Rows, changes: &[Change], w: &mut Writer) -> Result<Upserted> {
+fn merge_rows<N: Rem>(rows: &Rows<N>, changes: &[Change<N>], w: &mut Writer<N>) -> Result<Upserted> {
     if w.rows.at.is_empty() {
         w.rows.clear();
     }
     let mut n = Upserted::default();
     let (mut r, mut c) = (0usize, 0usize);
-    let mut infos: Vec<StateInfo> = Vec::with_capacity(64);
+    let mut infos: Vec<StateInfo<N>> = Vec::with_capacity(64);
     while r < rows.len() || c < changes.len() {
         let rk = rows.keys.get(r).copied();
         let ck = changes.get(c).map(|x| wide(x.key));
@@ -853,6 +865,7 @@ impl RegionSet {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::search::hull::Hull;
 
     fn rng(seed: u64) -> impl FnMut() -> u64 {
         let mut x = seed | 1;
@@ -918,7 +931,7 @@ mod tests {
             }
             let changes: Vec<Change> = ch.iter().map(|(&(k, c), &(info, new))| Change { key: narrow(k), cell: c, info, new }).collect();
             let want = (ch.keys().filter(|k| !model.contains_key(k)).count() as u64, ch.iter().filter(|(k, v)| v.1 && model.contains_key(k)).count() as u64);
-            let got = t.upsert(&changes).unwrap();
+            let got = t.upsert::<P8>(&changes).unwrap();
             assert_eq!((got.added, got.held_new), want, "round {round}");
             for ((k, c), (info, _)) in ch {
                 model.insert((k, c), info.filter(|i| !i.is_full()));
@@ -931,7 +944,7 @@ mod tests {
             for (&(k, c), &i) in &model {
                 by_key.entry(k).or_default().push((c, i));
             }
-            let mut cur = t.cursor();
+            let mut cur = t.cursor::<P8>();
             for (k, cells) in by_key.iter().step_by(3) {
                 let e = cur.seek(narrow(*k)).unwrap().expect("a held key");
                 assert_eq!(e.mask, cells.iter().fold(0, |m, x| m | 1u64 << x.0));
@@ -939,14 +952,14 @@ mod tests {
                     assert_eq!(e.info(c as u32), i);
                 }
             }
-            let mut cur = t.cursor();
+            let mut cur = t.cursor::<P8>();
             for k in (0..300_000u128).step_by(997) {
                 assert_eq!(cur.seek(narrow(k)).unwrap().map(|e| e.mask), by_key.get(&k).map(|c| c.iter().fold(0, |m, x| m | 1u64 << x.0)));
             }
             let (&(k, c), &i) = model.iter().nth(model.len() / 2).unwrap();
-            assert_eq!(t.lookup_info(narrow(k), c as u32).map(|x| x.1), Some(i));
+            assert_eq!(t.lookup_info::<P8>(narrow(k), c as u32).map(|x| x.1), Some(i));
             let mut walked = 0u64;
-            t.for_each_packed(|_, m, _, _| walked += m.count_ones() as u64).unwrap();
+            t.for_each_packed::<P8>(|_, m, _, _| walked += m.count_ones() as u64).unwrap();
             assert_eq!(walked, model.len() as u64);
         }
         // Changes in the first block alone: every other block kept as it
@@ -955,8 +968,8 @@ mod tests {
         let kept: Vec<*const u8> = t.blocks().iter().map(|b| b.bytes.as_ptr()).collect();
         let first = t.blocks()[0].first;
         let k = *model.keys().find(|k| k.0 == first).expect("the first key");
-        t.upsert(&[Change { key: narrow(k.0), cell: k.1, info: Some(StateInfo { hull: hull(1), layer: 7 }), new: false }]).unwrap();
-        assert_eq!(t.lookup_info(narrow(k.0), k.1 as u32).and_then(|x| x.1), Some(StateInfo { hull: hull(1), layer: 7 }));
+        t.upsert::<P8>(&[Change { key: narrow(k.0), cell: k.1, info: Some(StateInfo { hull: hull(1), layer: 7 }), new: false }]).unwrap();
+        assert_eq!(t.lookup_info::<P8>(narrow(k.0), k.1 as u32).and_then(|x| x.1), Some(StateInfo { hull: hull(1), layer: 7 }));
         assert!(t.blocks()[1..].iter().all(|b| kept.contains(&b.bytes.as_ptr())), "a block no change fell in made again");
         assert!(!kept.contains(&t.blocks()[0].bytes.as_ptr()), "the changed block kept");
     }

@@ -26,16 +26,16 @@ use super::unit::UnitSink;
 use super::visited::Key;
 
 /// One wave worker's capture stream.
-pub struct CaptureWriter {
+pub struct CaptureWriter<N: crate::search::rem::Rem = celeste_core::pico8_num::Pico8Num> {
     dir: PathBuf,
     worker: u32,
     out: std::io::BufWriter<std::fs::File>,
     /// The stream's transfers: per sink id its index, and the pairs.
     xfer_ids: rustc_hash::FxHashMap<u32, u32>,
-    xfers: Vec<crate::search::arc_edges::Pair>,
+    xfers: Vec<N::Pair>,
 }
 
-impl CaptureWriter {
+impl<N: crate::search::rem::Rem> CaptureWriter<N> {
     /// The stream of `worker` at `frame`, if the run captures
     /// (`DIR/f{frame}/`).
     pub fn open(frame: u32, worker: u32, level: crate::abstraction::Level, s: &crate::settings::Settings) -> Option<Self> {
@@ -73,7 +73,7 @@ impl CaptureWriter {
     }
 
     #[inline]
-    pub fn emit(&mut self, shape: u64, cell: u32, key: Key, lane: u32, xfer: u32, miss: Option<celeste_engine::exact::MissKey>) {
+    pub fn emit(&mut self, shape: u64, cell: u32, key: Key, lane: u32, xfer: u32, miss: Option<celeste_engine::exact::MissKey<N>>) {
         if let Some(m) = miss {
             self.blob(4, &m);
         }
@@ -90,7 +90,7 @@ impl CaptureWriter {
 
     /// Transfer `x` (the sink's id) as the stream names it: an index into
     /// the stream's own table of pairs (`pair`: its pair, on first use).
-    pub fn xfer(&mut self, x: u32, pair: impl FnOnce() -> crate::search::arc_edges::Pair) -> u32 {
+    pub fn xfer(&mut self, x: u32, pair: impl FnOnce() -> N::Pair) -> u32 {
         let n = self.xfers.len() as u32;
         *self.xfer_ids.entry(x).or_insert_with(|| {
             self.xfers.push(pair());
@@ -101,9 +101,9 @@ impl CaptureWriter {
     /// The stream done; its transfer table beside it.
     pub fn finish(mut self) -> Result<()> {
         self.out.flush()?;
-        let mut buf = Vec::with_capacity(self.xfers.len() * crate::search::arc_edges::PAIR_BYTES);
+        let mut buf = Vec::with_capacity(self.xfers.len() * N::PAIR_BYTES);
         for p in &self.xfers {
-            crate::search::arc_edges::encode_pair(&mut buf, p);
+            N::encode_pair(&mut buf, p);
         }
         std::fs::write(self.dir.join(format!("x{:03}.bin", self.worker)), buf)?;
         Ok(())
@@ -300,8 +300,8 @@ pub fn bench_storage(a: &BenchArgs) -> Result<()> {
 /// `edges_dir` (`EdgeHashes::frame`; `xfers`: the merged table in memory,
 /// the dir's file may hold only the frame's new pairs).
 pub fn edge_fingerprint(edges_dir: &Path, frame: u32, xfers: &super::edges::XferTable, visited: &super::visited::VisitedSet, threads: usize) -> Result<(u64, u64)> {
-    let store = super::edges::EdgeStore::open(edges_dir, frame)?;
-    EdgeHashes::new(&xfers.pairs).frame(&store, frame, &visited.keys.content_hash(), visited.shapes(), threads)
+    let store = super::edges::EdgeStore::<celeste_core::pico8_num::Pico8Num>::open(edges_dir, frame)?;
+    EdgeHashes::new::<celeste_core::pico8_num::Pico8Num>(&xfers.pairs).frame(&store, frame, &visited.keys.content_hash(), visited.shapes(), threads)
 }
 
 /// `ckhash --edges`'s per-edge term: `mix64(node(dst) ^ node(src) <<< 21 ^
@@ -314,14 +314,14 @@ pub struct EdgeHashes {
 }
 
 impl EdgeHashes {
-    pub fn new(pairs: &[crate::search::arc_edges::Pair]) -> Self {
+    pub fn new<N: crate::search::rem::Rem>(pairs: &[N::Pair]) -> Self {
         let mix = celeste_engine::runtime2::mix64;
         EdgeHashes {
             pairs: pairs
                 .iter()
                 .map(|pair| {
                     let mut b = Vec::new();
-                    crate::search::arc_edges::encode_pair(&mut b, pair);
+                    N::encode_pair(&mut b, pair);
                     b.iter().fold(0u64, |h, &x| mix(h ^ x as u64))
                 })
                 .collect(),
@@ -330,7 +330,7 @@ impl EdgeHashes {
 
     /// Frame `frame`'s edges of `store`: `(count, sum of terms)` (`shapes`:
     /// the tree's by index).
-    pub fn frame(&self, store: &super::edges::EdgeStore, frame: u32, content: &celeste_engine::exact::ContentHash, shapes: &[u64], threads: usize) -> Result<(u64, u64)> {
+    pub fn frame<N: crate::search::rem::Rem>(&self, store: &super::edges::EdgeStore<N>, frame: u32, content: &celeste_engine::exact::ContentHash, shapes: &[u64], threads: usize) -> Result<(u64, u64)> {
         let mix = celeste_engine::runtime2::mix64;
         let geo = super::GEOMETRY;
         let parts = store.par_blocks(frame, threads, || (0u64, 0u64), |(n, acc), region, blk| {

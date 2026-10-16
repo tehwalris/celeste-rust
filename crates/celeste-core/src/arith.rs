@@ -401,6 +401,107 @@ impl Arithmetic for Float {
     }
 }
 
+/// A number as the engine STORES it - in blocks, codes and dictionaries:
+/// the arithmetic's `Num` with its raw bits. The blocks and the key space
+/// are generic over it (`runtime2::Rt2<N>`, `exact::Code<N>`), so a tree of
+/// one arithmetic and a block of the other are different types.
+pub trait EngineNum: Copy + Debug + PartialEq + Eq + Hash + Send + Sync + serde::Serialize + serde::de::DeserializeOwned + 'static {
+    type A: Arithmetic<Num = Self>;
+    /// The bits a code holds: 16.16's `u32` word, a double's `u64`.
+    type Raw: Copy + Debug + PartialEq + Eq + PartialOrd + Ord + Hash + Default + Send + Sync + From<u32> + TryInto<u32> + serde::Serialize + serde::de::DeserializeOwned + 'static;
+    /// A number interval's dictionary word: its two raws, packed.
+    type Word: Copy + Debug + PartialEq + Eq + Hash + Default + Send + Sync + 'static;
+    /// The last byte of a tree file's magic: 16.16's files keep theirs
+    /// (0: unchanged), the doubles' end in `f` - a tree of one arithmetic
+    /// is never read as the other's.
+    const FILE_TAG: u8;
+    fn raw(self) -> Self::Raw;
+    /// `raw`'s inverse; `None` for bits no number of the arithmetic has.
+    fn from_raw(r: Self::Raw) -> Option<Self>;
+    fn word(lo: Self::Raw, hi: Self::Raw) -> Self::Word;
+    /// A word folded to 64 bits (a hash table's slot, a fingerprint's
+    /// input): 16.16's word itself.
+    fn fold(w: Self::Word) -> u64;
+    /// A raw's little-endian bytes onto `out` (a state's exact bytes).
+    fn push_raw(r: Self::Raw, out: &mut Vec<u8>);
+    /// The whole part, as the position cells read it (`floor`, 16.16's
+    /// integer bits): `None` outside `i16`.
+    fn whole_i16(self) -> Option<i16>;
+    /// A position's code part: the value less `whole` whole pixels (the cell
+    /// holds those), exactly.
+    fn less_whole(self, whole: i16) -> Self::Raw;
+    /// `less_whole`'s inverse: the raw of a code part `r` plus `whole`
+    /// whole pixels.
+    fn plus_whole(r: Self::Raw, whole: i32) -> Self::Raw;
+}
+
+impl EngineNum for P8 {
+    type A = Fixed;
+    type Raw = u32;
+    type Word = u64;
+    const FILE_TAG: u8 = 0;
+    fn raw(self) -> u32 {
+        self.as_raw_u32()
+    }
+    fn from_raw(r: u32) -> Option<P8> {
+        Some(P8::from_raw(r as i32))
+    }
+    fn word(lo: u32, hi: u32) -> u64 {
+        (lo as u64) << 32 | hi as u64
+    }
+    fn fold(w: u64) -> u64 {
+        w
+    }
+    fn push_raw(r: u32, out: &mut Vec<u8>) {
+        out.extend_from_slice(&r.to_le_bytes());
+    }
+    fn whole_i16(self) -> Option<i16> {
+        Some(self.whole_part_as_i16())
+    }
+    fn less_whole(self, whole: i16) -> u32 {
+        self.as_raw_u32().wrapping_sub((whole as i32 as u32) << 16)
+    }
+    fn plus_whole(r: u32, whole: i32) -> u32 {
+        r.wrapping_add((whole as u32) << 16)
+    }
+}
+
+impl EngineNum for F {
+    type A = Float;
+    type Raw = u64;
+    type Word = u128;
+    const FILE_TAG: u8 = b'f';
+    fn raw(self) -> u64 {
+        self.to_bits()
+    }
+    fn from_raw(r: u64) -> Option<F> {
+        F::new(f64::from_bits(r))
+    }
+    fn word(lo: u64, hi: u64) -> u128 {
+        (lo as u128) << 64 | hi as u128
+    }
+    fn fold(w: u128) -> u64 {
+        // Two words: the high one odd-multiplied, so (a, b) and (b, a) differ.
+        ((w >> 64) as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15) ^ w as u64
+    }
+    fn push_raw(r: u64, out: &mut Vec<u8>) {
+        out.extend_from_slice(&r.to_le_bytes());
+    }
+    fn whole_i16(self) -> Option<i16> {
+        let w = self.value().floor();
+        (i16::MIN as f64..=i16::MAX as f64).contains(&w).then(|| w as i16)
+    }
+    fn less_whole(self, whole: i16) -> u64 {
+        // Exact: an integer at most the value taken off it keeps every bit
+        // of its fraction.
+        (self.value() - whole as f64).to_bits()
+    }
+    fn plus_whole(r: u64, whole: i32) -> u64 {
+        // Exact: the sum is the value `less_whole` took it from.
+        (f64::from_bits(r) + whole as f64).to_bits()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

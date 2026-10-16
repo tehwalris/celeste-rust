@@ -5,6 +5,7 @@
 //!   * `arc_edges`  - per recorded edge, the remainder transfer
 //!   * `arcs`       - sets of remainders as arcs of the circle
 //!   * `hull`       - a state's remainder hull (the forward's): one arc per axis
+//!   * `rem`        - the remainder model of an arithmetic: hulls and transfers
 //!   * `arc_dp`     - THE SEARCH: winning sets, optimum, concrete search
 //!   * `known`      - a known solution checked against every pruning step
 //!   * `pos_graph`  - player-position cells and the position graph
@@ -20,5 +21,6 @@ pub mod inspect;
 pub mod known;
 pub mod pos_graph;
 pub mod reach;
+pub mod rem;
 pub mod result;
 pub mod ui_export;

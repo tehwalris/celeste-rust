@@ -21,7 +21,8 @@ use std::path::{Path, PathBuf};
 
 use super::bundle::{get_varint, get_varint128, put_varint, put_varint128};
 use super::Sk;
-use crate::search::hull::{Hull, HULL_BYTES};
+use crate::search::rem::Rem;
+use celeste_core::pico8_num::Pico8Num as P8;
 
 const MAGIC: &[u8; 4] = b"CSH2";
 
@@ -32,39 +33,39 @@ const NEW_BLOCK: usize = 1 << 18;
 const GROWN_BLOCK: usize = 1 << 16;
 
 /// A frontier state: the state, its layer, its hull.
-pub type Grown = (Sk, u16, Hull);
+pub type Grown<N = P8> = (Sk, u16, <N as Rem>::Hull);
 
 /// GROWN STATES in runs, sorted by layer and state across them (`write`,
 /// `check`): a frontier's old states by layer, or states as they are.
-pub trait Runs: Sync {
+pub trait Runs<N: Rem>: Sync {
     /// The runs.
     fn count(&self) -> usize;
     /// Run `i`'s states.
     fn len(&self, i: usize) -> usize;
     /// Run `i`'s states `r`, in order.
-    fn get(&self, i: usize, r: std::ops::Range<usize>) -> Vec<Grown>;
+    fn get(&self, i: usize, r: std::ops::Range<usize>) -> Vec<Grown<N>>;
 }
 
-impl Runs for [&[Grown]] {
+impl<N: Rem> Runs<N> for [&[Grown<N>]] {
     fn count(&self) -> usize {
-        <[&[Grown]]>::len(self)
+        <[&[Grown<N>]]>::len(self)
     }
     fn len(&self, i: usize) -> usize {
         self[i].len()
     }
-    fn get(&self, i: usize, r: std::ops::Range<usize>) -> Vec<Grown> {
+    fn get(&self, i: usize, r: std::ops::Range<usize>) -> Vec<Grown<N>> {
         self[i][r].to_vec()
     }
 }
 
-impl Runs for [super::wave::OldLayer] {
+impl<N: Rem> Runs<N> for [super::wave::OldLayer<N>] {
     fn count(&self) -> usize {
-        <[super::wave::OldLayer]>::len(self)
+        <[super::wave::OldLayer<N>]>::len(self)
     }
     fn len(&self, i: usize) -> usize {
         self[i].len()
     }
-    fn get(&self, i: usize, r: std::ops::Range<usize>) -> Vec<Grown> {
+    fn get(&self, i: usize, r: std::ops::Range<usize>) -> Vec<Grown<N>> {
         self[i].range(r).map(|o| (o.sk, o.layer, o.hull)).collect()
     }
 }
@@ -97,27 +98,33 @@ struct Header {
 
 /// A HULL FILE's content: frame `frame`'s new states' hulls (in the
 /// frame's state order) and its grown states (sorted by layer and state).
-#[derive(Debug, Default, PartialEq, Eq)]
-pub struct Frontier {
+#[derive(Debug, PartialEq, Eq)]
+pub struct Frontier<N: Rem = P8> {
     pub frame: u32,
-    pub hulls: Vec<Hull>,
-    pub grown: Vec<Grown>,
+    pub hulls: Vec<N::Hull>,
+    pub grown: Vec<Grown<N>>,
 }
 
-impl Frontier {
+impl<N: Rem> Default for Frontier<N> {
+    fn default() -> Self {
+        Frontier { frame: 0, hulls: Vec::new(), grown: Vec::new() }
+    }
+}
+
+impl<N: Rem> Frontier<N> {
     /// Every state of the frontier with its layer and hull, the new ones
     /// (frame `frame`'s layer `new`, its states in order) first.
-    pub fn states(&self, new: &super::layer::Layer) -> Result<Vec<Grown>> {
+    pub fn states(&self, new: &super::layer::Layer<N>) -> Result<Vec<Grown<N>>> {
         ensure!(new.states() == self.hulls.len() as u64, "frame {}: {} new states, its hull file holds {} hulls", self.frame, new.states(), self.hulls.len());
         let layer = u16::try_from(self.frame).context("a frame past u16")?;
-        let mut out: Vec<Grown> = new.states_iter().zip(&self.hulls).map(|(s, &h)| (s, layer, h)).collect();
+        let mut out: Vec<Grown<N>> = new.states_iter().zip(&self.hulls).map(|(s, &h)| (s, layer, h)).collect();
         out.extend_from_slice(&self.grown);
         Ok(out)
     }
 }
 
 /// A grown block's bytes.
-fn encode_grown(states: impl Iterator<Item = Grown>, n: usize) -> Vec<u8> {
+fn encode_grown<N: Rem>(states: impl Iterator<Item = Grown<N>>, n: usize) -> Vec<u8> {
     let mut raw = Vec::with_capacity(n * 14 + 8);
     put_varint(&mut raw, n as u64);
     let mut prev: Option<(u16, u32, u128)> = None;
@@ -141,18 +148,18 @@ fn encode_grown(states: impl Iterator<Item = Grown>, n: usize) -> Vec<u8> {
             }
         }
         raw.push(s.local);
-        raw.extend_from_slice(&h.to_bytes());
+        N::hull_to_bytes(&h, &mut raw);
         prev = Some((layer, s.region, k));
     }
     raw
 }
 
 /// A grown block decoded.
-fn decode_grown(raw: &[u8], want: usize) -> Result<Vec<Grown>> {
+fn decode_grown<N: Rem>(raw: &[u8], want: usize) -> Result<Vec<Grown<N>>> {
     let mut pos = 0usize;
     let n = get_varint(raw, &mut pos) as usize;
     ensure!(n == want, "{n} grown states, the index says {want}");
-    let mut out: Vec<Grown> = Vec::with_capacity(n);
+    let mut out: Vec<Grown<N>> = Vec::with_capacity(n);
     let mut prev: Option<(u16, u32, u128)> = None;
     for _ in 0..n {
         ensure!(pos < raw.len(), "cut short");
@@ -172,10 +179,10 @@ fn decode_grown(raw: &[u8], want: usize) -> Result<Vec<Grown>> {
                 (layer as u16, get_varint(raw, &mut pos) as u32, get_varint128(raw, &mut pos))
             }
         };
-        ensure!(pos + 1 + HULL_BYTES <= raw.len(), "cut short");
+        ensure!(pos + 1 + N::HULL_BYTES <= raw.len(), "cut short");
         let local = raw[pos];
-        let h = Hull::from_bytes(&raw[pos + 1..pos + 1 + HULL_BYTES]);
-        pos += 1 + HULL_BYTES;
+        let h = N::hull_from_bytes(&raw[pos + 1..pos + 1 + N::HULL_BYTES]);
+        pos += 1 + N::HULL_BYTES;
         out.push((Sk { region, key: ((key >> 64) as u64, key as u64), local }, layer, h));
         prev = Some((layer, region, key));
     }
@@ -186,7 +193,7 @@ fn decode_grown(raw: &[u8], want: usize) -> Result<Vec<Grown>> {
 /// A hull file's blocks: per block whether it holds grown states, its run
 /// and its range there (`write`'s runs; the new states' hulls are run 0 of
 /// their own).
-fn cuts<R: Runs + ?Sized>(hulls: &[Hull], runs: &R) -> Vec<(bool, usize, std::ops::Range<usize>)> {
+fn cuts<N: Rem, R: Runs<N> + ?Sized>(hulls: &[N::Hull], runs: &R) -> Vec<(bool, usize, std::ops::Range<usize>)> {
     let mut cuts: Vec<(bool, usize, std::ops::Range<usize>)> = (0..hulls.len()).step_by(NEW_BLOCK).map(|a| (false, 0, a..(a + NEW_BLOCK).min(hulls.len()))).collect();
     for i in 0..runs.count() {
         let n = runs.len(i);
@@ -199,9 +206,9 @@ fn cuts<R: Runs + ?Sized>(hulls: &[Hull], runs: &R) -> Vec<(bool, usize, std::op
 /// order) and its grown states in `runs` (all of them sorted by layer and
 /// state, distinct: checked), blocks on `threads` threads. Atomic. Returns
 /// the file's bytes.
-pub fn write<R: Runs + ?Sized>(path: &Path, frame: u32, hulls: &[Hull], runs: &R, threads: usize) -> Result<u64> {
+pub fn write<N: Rem, R: Runs<N> + ?Sized>(path: &Path, frame: u32, hulls: &[N::Hull], runs: &R, threads: usize) -> Result<u64> {
     use std::io::Write;
-    let key = |g: &Grown| (g.1, g.0);
+    let key = |g: &Grown<N>| (g.1, g.0);
     let cuts = cuts(hulls, runs);
     // Per block its bytes, and a grown block's sorted states' first and last
     // (`None`: unsorted).
@@ -210,9 +217,13 @@ pub fn write<R: Runs + ?Sized>(path: &Path, frame: u32, hulls: &[Hull], runs: &R
         let (raw, ends) = if *g {
             let v = runs.get(*i, r.clone());
             let ends = v.windows(2).all(|w| key(&w[0]) < key(&w[1])).then(|| v.first().map(|f| (key(f), key(v.last().expect("a first")))));
-            (encode_grown(v.into_iter(), r.len()), ends)
+            (encode_grown::<N>(v.into_iter(), r.len()), ends)
         } else {
-            (hulls[r.clone()].iter().flat_map(|h| h.to_bytes()).collect(), Some(None))
+            let mut raw = Vec::with_capacity(r.len() * N::HULL_BYTES);
+            for h in &hulls[r.clone()] {
+                N::hull_to_bytes(h, &mut raw);
+            }
+            (raw, Some(None))
         };
         Ok((zstd::bulk::compress(&raw, 1)?, raw.len() as u32, ends))
     });
@@ -246,7 +257,7 @@ pub fn write<R: Runs + ?Sized>(path: &Path, frame: u32, hulls: &[Hull], runs: &R
     let tmp = path.with_extension("tmp");
     {
         let mut f = std::io::BufWriter::new(std::fs::File::create(&tmp).with_context(|| tmp.display().to_string())?);
-        f.write_all(MAGIC)?;
+        f.write_all(&super::magic::<N>(MAGIC))?;
         f.write_all(&crate::search::checkpoint::FORMAT_VERSION.to_le_bytes())?;
         f.write_all(&(hb.len() as u64).to_le_bytes())?;
         f.write_all(&hb)?;
@@ -261,22 +272,22 @@ pub fn write<R: Runs + ?Sized>(path: &Path, frame: u32, hulls: &[Hull], runs: &R
 
 /// A block of a hull file (`data`: the bytes past its header) decoded: its
 /// hulls (a new states' block) or its grown states.
-fn decode(path: &Path, data: &[u8], x: &Block) -> Result<(Vec<Hull>, Vec<Grown>)> {
+fn decode<N: Rem>(path: &Path, data: &[u8], x: &Block) -> Result<(Vec<N::Hull>, Vec<Grown<N>>)> {
     let z = &data[x.offset as usize..(x.offset + x.len as u64) as usize];
     let raw = zstd::bulk::decompress(z, x.raw as usize).with_context(|| format!("{}: a block", path.display()))?;
     ensure!(raw.len() == x.raw as usize, "{}: a block of {} raw bytes, its index says {}", path.display(), raw.len(), x.raw);
     if x.grown {
-        Ok((Vec::new(), decode_grown(&raw, x.states as usize).with_context(|| format!("{}: a grown block", path.display()))?))
+        Ok((Vec::new(), decode_grown::<N>(&raw, x.states as usize).with_context(|| format!("{}: a grown block", path.display()))?))
     } else {
-        ensure!(raw.len() == x.states as usize * HULL_BYTES, "{}: a hulls block of {} bytes for {} states", path.display(), raw.len(), x.states);
-        Ok((raw.chunks_exact(HULL_BYTES).map(Hull::from_bytes).collect(), Vec::new()))
+        ensure!(raw.len() == x.states as usize * N::HULL_BYTES, "{}: a hulls block of {} bytes for {} states", path.display(), raw.len(), x.states);
+        Ok((raw.chunks_exact(N::HULL_BYTES).map(N::hull_from_bytes).collect(), Vec::new()))
     }
 }
 
 /// A hull file's bytes, its header checked: the header, and where its
 /// blocks start.
-fn open(path: &Path, b: &[u8]) -> Result<(Header, usize)> {
-    ensure!(b.len() >= 16 && &b[0..4] == MAGIC, "{}: not a hull file", path.display());
+fn open<N: Rem>(path: &Path, b: &[u8]) -> Result<(Header, usize)> {
+    ensure!(b.len() >= 16 && b[0..4] == super::magic::<N>(MAGIC), "{}: not a hull file of the {} arithmetic", path.display(), <N::A as celeste_core::arith::Arithmetic>::NAME);
     let version = u32::from_le_bytes(b[4..8].try_into().unwrap());
     ensure!(version == crate::search::checkpoint::FORMAT_VERSION, "{}: format version {version}, this binary's is {}", path.display(), crate::search::checkpoint::FORMAT_VERSION);
     let hl = u64::from_le_bytes(b[8..16].try_into().unwrap()) as usize;
@@ -290,10 +301,10 @@ fn open(path: &Path, b: &[u8]) -> Result<(Header, usize)> {
 }
 
 /// Read a hull file (`write`), its blocks on `threads` threads.
-pub fn read(path: &Path, threads: usize) -> Result<Frontier> {
+pub fn read<N: Rem>(path: &Path, threads: usize) -> Result<Frontier<N>> {
     let b = std::fs::read(path).with_context(|| path.display().to_string())?;
-    let (header, data) = open(path, &b)?;
-    let parts = super::wave::par_map(&header.blocks, threads, |x| decode(path, &b[data..], x));
+    let (header, data) = open::<N>(path, &b)?;
+    let parts = super::wave::par_map(&header.blocks, threads, |x| decode::<N>(path, &b[data..], x));
     let mut out = Frontier { frame: header.frame, ..Default::default() };
     for p in parts {
         let (h, g) = p?;
@@ -308,7 +319,7 @@ pub fn read(path: &Path, threads: usize) -> Result<Frontier> {
 /// count and the sum of each one's term - its CONTENT hash
 /// (`ContentHash::state` of (shape, key, cell)) mixed with its layer and
 /// hull; `shapes`: the tree's by index. Any order.
-pub fn fingerprint(states: impl Iterator<Item = Grown>, space: &celeste_engine::exact::KeySpace, shapes: &[u64]) -> Result<(u64, u64)> {
+pub fn fingerprint<N: Rem>(states: impl Iterator<Item = Grown<N>>, space: &celeste_engine::exact::KeySpace<N>, shapes: &[u64]) -> Result<(u64, u64)> {
     use celeste_engine::runtime2::mix64;
     let content = space.content_hash();
     let geo = super::GEOMETRY;
@@ -316,7 +327,7 @@ pub fn fingerprint(states: impl Iterator<Item = Grown>, space: &celeste_engine::
     for (s, layer, h) in states {
         let shape = *shapes.get(s.shape(&geo) as usize).ok_or_else(|| anyhow::anyhow!("a frontier state of no shape"))?;
         let node = content.state(shape, s.key, s.cell(&geo));
-        let tag = mix64(u64::from_le_bytes(h.to_bytes()) ^ (layer as u64).rotate_left(48));
+        let tag = mix64(N::hull_hash(&h) ^ (layer as u64).rotate_left(48));
         acc = acc.wrapping_add(mix64(node ^ tag.rotate_left(17)));
         n += 1;
     }
@@ -327,13 +338,13 @@ pub fn fingerprint(states: impl Iterator<Item = Grown>, space: &celeste_engine::
 /// written (`write`'s arguments), block by block on `threads` threads:
 /// FATAL otherwise (a resume would expand another frontier than the
 /// forward's).
-pub fn check<R: Runs + ?Sized>(path: &Path, frame: u32, hulls: &[Hull], runs: &R, threads: usize) -> Result<()> {
+pub fn check<N: Rem, R: Runs<N> + ?Sized>(path: &Path, frame: u32, hulls: &[N::Hull], runs: &R, threads: usize) -> Result<()> {
     let b = std::fs::read(path).with_context(|| path.display().to_string())?;
-    let (header, data) = open(path, &b)?;
-    let cuts = cuts(hulls, runs);
+    let (header, data) = open::<N>(path, &b)?;
+    let cuts = cuts::<N, R>(hulls, runs);
     ensure!(header.frame == frame && header.blocks.len() == cuts.len(), "{}: STORED HULLS DIFFER from the forward's (frame {} in {} blocks read back, frame {frame} in {} blocks written)", path.display(), header.frame, header.blocks.len(), cuts.len());
     let same = super::wave::par_map(&header.blocks.iter().zip(&cuts).collect::<Vec<_>>(), threads, |(x, (g, i, r))| -> Result<bool> {
-        let (h, gr) = decode(path, &b[data..], x)?;
+        let (h, gr) = decode::<N>(path, &b[data..], x)?;
         Ok(x.grown == *g && if *g { gr == runs.get(*i, r.clone()) } else { h == hulls[r.clone()] })
     });
     for ok in same {
@@ -345,6 +356,7 @@ pub fn check<R: Runs + ?Sized>(path: &Path, frame: u32, hulls: &[Hull], runs: &R
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::search::hull::Hull;
 
     /// A hull file round-trips its frontier: wide keys, several regions
     /// and layers, a key with several cells, blocks of both parts past
@@ -370,17 +382,17 @@ mod tests {
         let p = path(&dir, 12);
         // In runs, cut anywhere.
         let runs: Vec<&[Grown]> = vec![&grown[..2], &[], &grown[2..9], &grown[9..]];
-        write(&p, 12, &hulls, &runs[..], 3).unwrap();
-        check(&p, 12, &hulls, &runs[..], 2).unwrap();
-        assert_eq!(read(&p, 1).unwrap(), Frontier { frame: 12, hulls: hulls.clone(), grown: grown.clone() });
-        assert!(check(&p, 13, &hulls, &runs[..], 2).is_err(), "another frame");
+        write::<P8, _>(&p, 12, &hulls, &runs[..], 3).unwrap();
+        check::<P8, _>(&p, 12, &hulls, &runs[..], 2).unwrap();
+        assert_eq!(read::<P8>(&p, 1).unwrap(), Frontier { frame: 12, hulls: hulls.clone(), grown: grown.clone() });
+        assert!(check::<P8, _>(&p, 13, &hulls, &runs[..], 2).is_err(), "another frame");
         let mut moved = grown.clone();
         moved[5].2 = h(1, 1);
-        assert!(check(&p, 12, &hulls, &[&moved[..2], &[], &moved[2..9], &moved[9..]][..], 2).is_err(), "another hull");
-        assert!(write(&p, 12, &hulls, &[&[grown[1], grown[0]][..]][..], 2).is_err(), "unsorted");
-        assert!(write(&p, 12, &hulls, &[&grown[1..2], &grown[0..1]][..], 2).is_err(), "runs unsorted");
-        write(&p, 12, &[], &[] as &[&[Grown]], 2).unwrap();
-        assert_eq!(read(&p, 2).unwrap(), Frontier { frame: 12, ..Default::default() });
+        assert!(check::<P8, _>(&p, 12, &hulls, &[&moved[..2], &[], &moved[2..9], &moved[9..]][..], 2).is_err(), "another hull");
+        assert!(write::<P8, _>(&p, 12, &hulls, &[&[grown[1], grown[0]][..]][..], 2).is_err(), "unsorted");
+        assert!(write::<P8, _>(&p, 12, &hulls, &[&grown[1..2], &grown[0..1]][..], 2).is_err(), "runs unsorted");
+        write::<P8, _>(&p, 12, &[], &[] as &[&[Grown]], 2).unwrap();
+        assert_eq!(read::<P8>(&p, 2).unwrap(), Frontier { frame: 12, ..Default::default() });
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

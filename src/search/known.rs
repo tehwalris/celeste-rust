@@ -243,7 +243,7 @@ fn verdict(b: &Block, s: u32, seeded: bool, l1: Option<(u32, &crate::trace::leve
         return Ok(None);
     }
     let Some(i) = (if s == 0 { p.start } else { p.node.get(shape, key, cell) }) else {
-        let tree = crate::storage::layer::Tree::open(p.dir, s)?;
+        let tree = crate::storage::layer::Tree::<celeste_engine::runtime2::P8>::open(p.dir, s)?;
         let layer = match key.and_then(|key| tree.sk(shape, key, cell)) {
             Some(sk) => tree.layer_of(sk, s)?.map(|l| (l, sk)),
             None => None,

@@ -216,7 +216,7 @@ impl KeyField {
             let r = left.trailing_zeros() as usize;
             let same = eq_mask(&lo, lo[r]) & eq_mask(&hi, hi[r]) & left;
             left &= !same;
-            let p = d.find_num_placed(Code::num(lo[r], hi[r]).word());
+            let p = d.find_num_placed(Code::<celeste_engine::runtime2::P8>::num(lo[r], hi[r]).word());
             placed.fill(same, p.unwrap_or(0));
             if p.is_none() {
                 miss |= same;

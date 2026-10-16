@@ -13,6 +13,7 @@
 
 use anyhow::{anyhow, Result};
 
+use celeste_core::arith::EngineNum;
 use celeste_engine::runtime2::{Col, Rt2, AV};
 
 /// Side of the position grid, in pixels: the start room plus a room's width
@@ -53,17 +54,17 @@ pub fn cell_xy(cell: u32) -> Option<(i32, i32)> {
 /// A numeric column's whole parts per lane (`None` if a lane is neither a
 /// number nor an interval). An INTERVAL's cell is its low corner: ONE rule,
 /// shared with the kernel's `pos_sources`.
-pub(crate) fn whole_i16_col(rt2: &Rt2, cell: u32) -> Option<Vec<i16>> {
+pub(crate) fn whole_i16_col<N: EngineNum>(rt2: &Rt2<N>, cell: u32) -> Option<Vec<i16>> {
     match &rt2.cols[cell as usize] {
-        Col::U(AV::Num(n)) => Some(vec![n.whole_part_as_i16(); rt2.width]),
-        Col::U(AV::Ival(a, _)) => Some(vec![a.whole_part_as_i16(); rt2.width]),
-        Col::N(vs) => Some(vs.iter().map(|n| n.whole_part_as_i16()).collect()),
-        Col::I(vs) => Some(vs.iter().map(|(a, _)| a.whole_part_as_i16()).collect()),
+        Col::U(AV::Num(n)) => Some(vec![n.whole_i16()?; rt2.width]),
+        Col::U(AV::Ival(a, _)) => Some(vec![a.whole_i16()?; rt2.width]),
+        Col::N(vs) => vs.iter().map(|n| n.whole_i16()).collect(),
+        Col::I(vs) => vs.iter().map(|(a, _)| a.whole_i16()).collect(),
         Col::V(vs) => vs
             .iter()
             .map(|v| match v {
-                AV::Num(n) => Some(n.whole_part_as_i16()),
-                AV::Ival(a, _) => Some(a.whole_part_as_i16()),
+                AV::Num(n) => n.whole_i16(),
+                AV::Ival(a, _) => a.whole_i16(),
                 _ => None,
             })
             .collect(),
@@ -73,25 +74,25 @@ pub(crate) fn whole_i16_col(rt2: &Rt2, cell: u32) -> Option<Vec<i16>> {
 
 /// A position column's whole-pixel RANGE per lane (`None` if a lane is
 /// neither number nor interval), for the win tests.
-pub fn whole_range_col(rt2: &Rt2, cell: u32) -> Option<Vec<(i16, i16)>> {
-    let one = |v: AV| -> Option<(i16, i16)> {
+pub fn whole_range_col<N: EngineNum>(rt2: &Rt2<N>, cell: u32) -> Option<Vec<(i16, i16)>> {
+    let one = |v: AV<N>| -> Option<(i16, i16)> {
         match v {
-            AV::Num(n) => Some((n.whole_part_as_i16(), n.whole_part_as_i16())),
-            AV::Ival(a, b) => Some((a.whole_part_as_i16(), b.whole_part_as_i16())),
+            AV::Num(n) => Some((n.whole_i16()?, n.whole_i16()?)),
+            AV::Ival(a, b) => Some((a.whole_i16()?, b.whole_i16()?)),
             _ => None,
         }
     };
     match &rt2.cols[cell as usize] {
         Col::U(v) => one(*v).map(|r| vec![r; rt2.width]),
-        Col::N(vs) => Some(vs.iter().map(|n| (n.whole_part_as_i16(), n.whole_part_as_i16())).collect()),
-        Col::I(vs) => Some(vs.iter().map(|(a, b)| (a.whole_part_as_i16(), b.whole_part_as_i16())).collect()),
+        Col::N(vs) => vs.iter().map(|n| Some((n.whole_i16()?, n.whole_i16()?))).collect(),
+        Col::I(vs) => vs.iter().map(|(a, b)| Some((a.whole_i16()?, b.whole_i16()?))).collect(),
         Col::V(vs) => vs.iter().map(|v| one(*v)).collect(),
     }
 }
 
 /// The block's player object (`player`, else `player_spawn`), if any. Per
 /// block: lanes share structure.
-pub fn player_object(rt2: &Rt2) -> Option<u32> {
+pub fn player_object<N: EngineNum>(rt2: &Rt2<N>) -> Option<u32> {
     rt2.position_object(crate::compiled::ids())
 }
 
@@ -99,7 +100,7 @@ pub fn player_object(rt2: &Rt2) -> Option<u32> {
 /// object, or a position that is not numeric, is `NO_CELL`. The start room
 /// is the block's own (its collision cache's room: every block of a search
 /// carries the start room's).
-pub fn block_cells(rt2: &Rt2) -> Result<Vec<u32>> {
+pub fn block_cells<N: EngineNum>(rt2: &Rt2<N>) -> Result<Vec<u32>> {
     let ids = crate::compiled::ids();
     let start = (rt2.cache.room_x, rt2.cache.room_y);
     let lanes = rt2.width;

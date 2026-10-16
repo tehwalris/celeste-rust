@@ -10,6 +10,8 @@
 //! walk dereferences BETWEEN steps but not at the end: the last step lands
 //! on the `Val` cell holding the scalar, the cell a kernel reads and writes.
 
+use celeste_core::arith::EngineNum;
+
 use crate::runtime2::{Cell2, Col, Rt2, AV, NONE};
 
 /// One step of a path. Mirrors the tracer's `iface::Step`, which
@@ -29,7 +31,7 @@ pub enum PathStep {
 /// is already a table is returned unchanged, so this is idempotent.
 /// (The global `objects` and the array it points at both answer to the
 /// name `objects`; callers comparing ids need to pick one.)
-pub fn deref(rt2: &Rt2, cell: u32) -> Result<u32, String> {
+pub fn deref<N: EngineNum>(rt2: &Rt2<N>, cell: u32) -> Result<u32, String> {
     match (&rt2.structure[cell as usize], &rt2.cols[cell as usize]) {
         (Cell2::Val, Col::U(AV::Ptr(t))) => Ok(*t),
         (Cell2::Val, Col::V(vs)) => {
@@ -51,7 +53,7 @@ pub fn deref(rt2: &Rt2, cell: u32) -> Result<u32, String> {
 }
 
 /// The canonical cell id a path names in this block.
-pub fn resolve_steps(rt2: &Rt2, p: &[PathStep]) -> Result<u32, String> {
+pub fn resolve_steps<N: EngineNum>(rt2: &Rt2<N>, p: &[PathStep]) -> Result<u32, String> {
     let mut cur: Option<u32> = None;
     for step in p {
         cur = Some(match (cur, step) {
@@ -106,7 +108,7 @@ pub fn resolve_steps(rt2: &Rt2, p: &[PathStep]) -> Result<u32, String> {
     cur.ok_or_else(|| "empty path".to_string())
 }
 
-fn kind(c: &Cell2) -> &'static str {
+fn kind<N>(c: &Cell2<N>) -> &'static str {
     match c {
         Cell2::Val => "value",
         Cell2::Obj(_) => "object",
@@ -122,7 +124,7 @@ fn kind(c: &Cell2) -> &'static str {
 /// Structure, globals and pointer columns (what a shape determines) carry
 /// over; every other value cell starts `AV::Nil`. Not a clone: `Rt2` is
 /// deliberately not `Clone`, and the values are dropped on purpose.
-pub fn reshape(src: &Rt2, width: usize) -> Rt2 {
+pub fn reshape<N: EngineNum>(src: &Rt2<N>, width: usize) -> Rt2<N> {
     let mut b = Rt2::empty(
         width,
         src.globals.len(),

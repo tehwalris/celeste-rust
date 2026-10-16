@@ -11,9 +11,10 @@
 
 use anyhow::{Context, Result};
 
-use celeste_engine::runtime2::Rt2;
+use celeste_core::arith::{Arithmetic, EngineNum};
+use celeste_engine::runtime2::{Rt2, P8};
 
-use crate::search::hull::Hull;
+use crate::search::rem::Rem;
 use crate::storage::wave::Frontier;
 
 /// Wave phase timers (`--phases`, which the wave's sinks carry): TSC ticks
@@ -97,14 +98,14 @@ pub mod phases {
 /// A columnar batch of lanes of one shape: the kernels' own `Rt2`, with its
 /// key column where it was decoded from keys. Only the per-lane key and
 /// position are exposed.
-pub struct Block {
-    rt2: Rt2,
+pub struct Block<N: EngineNum = P8> {
+    rt2: Rt2<N>,
 }
 
-impl Block {
+impl<N: EngineNum> Block<N> {
     /// Wrap an engine block: decoded rows with their key column, or rows
     /// with none (keys are a key space's: `exact::KeySpace`).
-    pub fn from_rt2(rt2: Rt2) -> Self {
+    pub fn from_rt2(rt2: Rt2<N>) -> Self {
         assert!(
             rt2.row_keys.is_empty() || rt2.row_keys.len() == rt2.width,
             "block with a partial key column ({} keys for {} lanes)",
@@ -117,16 +118,16 @@ impl Block {
     /// A reference-engine block, CANONICAL (ids, shape hash), without keys:
     /// a tree keys its rows (`UnitSink::row_key`), the concrete search
     /// compares them whole (`exact::exact_rows`).
-    pub fn canonical(mut rt2: Rt2) -> Result<Self> {
+    pub fn canonical(mut rt2: Rt2<N>) -> Result<Self> {
         rt2.canonical();
         Ok(Block { rt2 })
     }
 
-    pub fn into_rt2(self) -> Rt2 {
+    pub fn into_rt2(self) -> Rt2<N> {
         self.rt2
     }
 
-    pub fn rt2(&self) -> &Rt2 {
+    pub fn rt2(&self) -> &Rt2<N> {
         &self.rt2
     }
 
@@ -202,7 +203,7 @@ fn summit_flag((rx, ry): (i16, i16)) -> Option<(i16, i16, i16, i16)> {
 }
 
 /// Per lane: has it left the start room, or met the `win_rect`?
-pub fn exits_of(rt2: &Rt2, s: &crate::settings::Settings) -> Result<Vec<bool>> {
+pub fn exits_of<N: EngineNum>(rt2: &Rt2<N>, s: &crate::settings::Settings) -> Result<Vec<bool>> {
     let ids = crate::compiled::ids();
     let lanes = rt2.width;
     if let Some((txl, txh, tyl, tyh)) = win_rect(s) {
@@ -228,7 +229,7 @@ pub fn exits_of(rt2: &Rt2, s: &crate::settings::Settings) -> Result<Vec<bool>> {
 }
 
 /// Per lane: is the `room` global (`room.x`, `room.y`) = `(wx, wy)`?
-fn room_is(rt2: &Rt2, (wx, wy): (i16, i16)) -> Result<Vec<bool>> {
+fn room_is<N: EngineNum>(rt2: &Rt2<N>, (wx, wy): (i16, i16)) -> Result<Vec<bool>> {
     use celeste_engine::runtime2::{Col, AV};
     let ids = crate::compiled::ids();
     let lanes = rt2.width;
@@ -236,7 +237,7 @@ fn room_is(rt2: &Rt2, (wx, wy): (i16, i16)) -> Result<Vec<bool>> {
         .global_target(ids.g_room)
         .ok_or_else(|| anyhow::anyhow!("wins: no `room` global"))?;
     let is = |f: u32, name: &str, want: i16| -> Result<Vec<bool>> {
-        let want = crate::pico8_num::Pico8Num::from_i16(want);
+        let want = <N::A as Arithmetic>::from_i16(want);
         let c = rt2.obj_field_cell(room, f).ok_or_else(|| anyhow::anyhow!("wins: room table has no {name} field"))?;
         Ok(match &rt2.cols[c as usize] {
             Col::U(AV::Num(n)) => vec![*n == want; lanes],
@@ -251,7 +252,7 @@ fn room_is(rt2: &Rt2, (wx, wy): (i16, i16)) -> Result<Vec<bool>> {
 
 /// Per lane: on the win target? The exit, plus the orb in the orb room,
 /// and in a 100% run the room's berry taken.
-pub fn wins_of(rt2: &Rt2, s: &crate::settings::Settings) -> Result<Vec<bool>> {
+pub fn wins_of<N: EngineNum>(rt2: &Rt2<N>, s: &crate::settings::Settings) -> Result<Vec<bool>> {
     let mut wins = reaches_win(rt2, s)?;
     if s.hundred {
         // 100%: the exit counts only with this room's berry taken.
@@ -264,7 +265,7 @@ pub fn wins_of(rt2: &Rt2, s: &crate::settings::Settings) -> Result<Vec<bool>> {
 
 /// Per lane: the win target met, the berry aside (`wins_of` without its
 /// 100% condition).
-fn reaches_win(rt2: &Rt2, s: &crate::settings::Settings) -> Result<Vec<bool>> {
+fn reaches_win<N: EngineNum>(rt2: &Rt2<N>, s: &crate::settings::Settings) -> Result<Vec<bool>> {
     use celeste_engine::runtime2::AV;
     let exits = exits_of(rt2, s)?;
     if win_rect(s).is_some() || !orb_required(s) {
@@ -274,7 +275,7 @@ fn reaches_win(rt2: &Rt2, s: &crate::settings::Settings) -> Result<Vec<bool>> {
     let has_orb: Vec<bool> = {
         let c = rt2.globals[ids.g_max_djump as usize];
         anyhow::ensure!(c != celeste_engine::runtime2::NONE, "wins: no `max_djump` global");
-        let two = crate::pico8_num::Pico8Num::from_i16(2);
+        let two = <N::A as Arithmetic>::from_i16(2);
         (0..lanes).map(|l| rt2.cols[c as usize].at(l) == AV::Num(two)).collect()
     };
     Ok(exits.iter().zip(&has_orb).map(|(e, o)| *e && *o).collect())
@@ -284,7 +285,7 @@ fn reaches_win(rt2: &Rt2, s: &crate::settings::Settings) -> Result<Vec<bool>> {
 /// level_index()]`, an array the cart pads with nils up to that index)? An
 /// unknown value (a coarse level) counts as taken: a win there is only an
 /// over-approximation, and the exact level decides.
-pub fn got_fruit(rt2: &Rt2, (x, y): (i16, i16)) -> Result<Vec<bool>> {
+pub fn got_fruit<N: EngineNum>(rt2: &Rt2<N>, (x, y): (i16, i16)) -> Result<Vec<bool>> {
     use celeste_engine::runtime2::{Cell2, Col, AV};
     let lanes = rt2.width;
     let g = celeste_names::gen::global_id("got_fruit").expect("`got_fruit` is a global name");
@@ -306,7 +307,7 @@ pub const ORB_MIN_FRAMES_AFTER_CHEST: u32 = 70;
 
 /// Per lane in the orb room: is the chest still CLOSED too late to win by
 /// `horizon` (the ceiling)? Such rows are not expanded.
-pub fn orb_deadline_skip(rt2: &Rt2, frame: u32, horizon: u32) -> Vec<bool> {
+pub fn orb_deadline_skip<N: EngineNum>(rt2: &Rt2<N>, frame: u32, horizon: u32) -> Vec<bool> {
     use celeste_engine::runtime2::AV;
     let lanes = rt2.width;
     if frame + 1 + ORB_MIN_FRAMES_AFTER_CHEST <= horizon {
@@ -317,7 +318,7 @@ pub fn orb_deadline_skip(rt2: &Rt2, frame: u32, horizon: u32) -> Vec<bool> {
         return vec![false; lanes];
     };
     let Some(c) = rt2.obj_field_cell(chest, ids.f_state) else { return vec![false; lanes] };
-    let zero = crate::pico8_num::Pico8Num::from_i16(0);
+    let zero = <N::A as Arithmetic>::from_i16(0);
     (0..lanes).map(|l| rt2.cols[c as usize].at(l) == AV::Num(zero)).collect()
 }
 
@@ -325,7 +326,7 @@ pub fn orb_deadline_skip(rt2: &Rt2, frame: u32, horizon: u32) -> Vec<bool> {
 /// taken (`got_fruit` false, not unknown) and nothing left that holds or
 /// drops it - the fruit, the fly fruit (gone once it flew off), the key and
 /// its chest, a fake wall. Exact: every state the row stands for is lost.
-pub fn berry_lost(rt2: &Rt2, s: &crate::settings::Settings) -> Result<Vec<bool>> {
+pub fn berry_lost<N: EngineNum>(rt2: &Rt2<N>, s: &crate::settings::Settings) -> Result<Vec<bool>> {
     let lanes = rt2.width;
     let ids = crate::compiled::ids();
     let sources = [ids.g_fruit, ids.g_fly_fruit, ids.g_key, ids.g_chest, ids.g_fake_wall];
@@ -346,7 +347,7 @@ pub fn berry_lost(rt2: &Rt2, s: &crate::settings::Settings) -> Result<Vec<bool>>
 /// horizon, the orb deadline's. (A state not expanded at its layer is never
 /// re-pushed: it has no edges. One expanded is re-pushed whatever the orb's
 /// deadline says at the later frame: sound, only less pruned.)
-pub fn not_expanded(b: &Block, frame: u32, ceiling: Option<u32>, s: &crate::settings::Settings) -> Result<Vec<bool>> {
+pub fn not_expanded<N: EngineNum>(b: &Block<N>, frame: u32, ceiling: Option<u32>, s: &crate::settings::Settings) -> Result<Vec<bool>> {
     let mut skip = b.exits(s)?;
     // Under a win rectangle (`--win-at`, the summit's flag) a row that LEFT
     // the room is no win, but it is not this room's search either (its
@@ -430,12 +431,25 @@ fn minus_one_table(speed: i32, s: &crate::settings::Settings) -> Result<&'static
 }
 
 /// What a forward's flush filters by.
-#[derive(Clone, Copy, Default)]
-pub struct Filters<'a> {
+pub struct Filters<'a, N: EngineNum = P8> {
     /// The coarser level's arc marks (the objects ladder).
-    pub marks: Option<&'a MarkFilter<'a>>,
+    pub marks: Option<&'a MarkFilter<'a, N>>,
     /// Level -1.
     pub minus_one: Option<MinusOne>,
+}
+
+impl<N: EngineNum> Clone for Filters<'_, N> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<N: EngineNum> Copy for Filters<'_, N> {}
+
+impl<N: EngineNum> Default for Filters<'_, N> {
+    fn default() -> Self {
+        Filters { marks: None, minus_one: None }
+    }
 }
 
 /// THE TIME BAND (an estimate, not a bound; for the level -1 probe): can a
@@ -456,15 +470,15 @@ pub(crate) fn cell_too_late(cell: u32, frame: u32, h: u32, px: i32) -> bool {
 /// coarse node winning from t with r (coarse over-approximates, r exact).
 /// The projection is keyed in the COARSE tree's key space (the marks'): a
 /// code it lacks is a state the coarse tree never reached.
-pub struct MarkFilter<'a> {
-    marked: &'a Visited,
+pub struct MarkFilter<'a, N: EngineNum = P8> {
+    marked: &'a Visited<N>,
     coarser: crate::abstraction::Level,
     /// Search steps per frame (`Settings::steps_per_frame`).
     spf: u32,
 }
 
-impl<'a> MarkFilter<'a> {
-    pub fn new(marked: &'a Visited, coarser: crate::abstraction::Level, spf: u32) -> Self {
+impl<'a, N: EngineNum> MarkFilter<'a, N> {
+    pub fn new(marked: &'a Visited<N>, coarser: crate::abstraction::Level, spf: u32) -> Self {
         MarkFilter { marked, coarser, spf }
     }
 
@@ -476,7 +490,7 @@ impl<'a> MarkFilter<'a> {
     /// does not), so filtering it would drop marked paths - room (6,1)
     /// nodiag `r0sxhn,r0sxh` REFUTED 93, which the community TAS reaches.
     /// The next boundary filters its successors.
-    pub fn allowed(&self, rt2: &Rt2, frame: u32) -> Result<Vec<bool>> {
+    pub fn allowed(&self, rt2: &Rt2<N>, frame: u32) -> Result<Vec<bool>> {
         if frame % self.spf != 0 {
             return Ok(vec![true; rt2.width]);
         }
@@ -485,7 +499,7 @@ impl<'a> MarkFilter<'a> {
 
     /// Per lane of `rt2`, its projection's deadline at the coarser level
     /// (`None`: not marked there).
-    pub fn deadlines(&self, rt2: &Rt2) -> Result<Vec<Option<u16>>> {
+    pub fn deadlines(&self, rt2: &Rt2<N>) -> Result<Vec<Option<u16>>> {
         let (shape, keys, cells) = widened_keys_rt2(rt2, self.coarser, self.marked.keys())?;
         Ok(keys.iter().zip(&cells).map(|(k, &c)| k.and_then(|k| self.marked.deadline(shape, k, c))).collect())
     }
@@ -498,25 +512,25 @@ impl<'a> MarkFilter<'a> {
 
 /// Each lane's `(shape, key, cell)` at the `coarser` level (its node there)
 /// in the key space `keys` (`None`: a code the space lacks - no node).
-pub fn widened_keys(
-    block: &Block,
+pub fn widened_keys<N: EngineNum>(
+    block: &Block<N>,
     coarser: crate::abstraction::Level,
-    keys: &celeste_engine::exact::KeySpace,
+    keys: &celeste_engine::exact::KeySpace<N>,
 ) -> Result<(u64, Vec<Option<(u64, u64)>>, Vec<u32>)> {
     widened_keys_rt2(&block.rt2, coarser, keys)
 }
 
 /// `rt2` projected IN PLACE onto `level`, as its kernels would store it.
-pub fn widen_rt2_to(rt2: &mut Rt2, level: crate::abstraction::Level) {
+pub fn widen_rt2_to<N: EngineNum>(rt2: &mut Rt2<N>, level: crate::abstraction::Level) {
     rt2.widen_to(crate::compiled::ids(), level);
 }
 
 /// `(shape, keys, cells)` of the widened rows (the widened block's shape),
 /// keyed in `keys`.
-pub fn widened_keys_rt2(
-    rt2: &Rt2,
+pub fn widened_keys_rt2<N: EngineNum>(
+    rt2: &Rt2<N>,
     coarser: crate::abstraction::Level,
-    keys: &celeste_engine::exact::KeySpace,
+    keys: &celeste_engine::exact::KeySpace<N>,
 ) -> Result<(u64, Vec<Option<(u64, u64)>>, Vec<u32>)> {
     let mut w = rt2.clone_block();
     widen_rt2_to(&mut w, coarser);
@@ -532,10 +546,10 @@ pub fn widened_keys_rt2(
 
 /// The interface between the loop and the engines (kernels or reference):
 /// lanes in, every successor row out, widened for the level and keyed.
-pub trait FrameStep: Sync {
+pub trait FrameStep<N: Rem = P8>: Sync {
     /// One frame of `lanes` of `block` into `sink`; called concurrently on
     /// disjoint ranges (scratch in the sink or behind a lock).
-    fn run(&self, block: &Block, cell_in: &[u32], lanes: &[usize], sink: &mut crate::storage::unit::UnitSink) -> Result<()>;
+    fn run(&self, block: &Block<N>, cell_in: &[u32], lanes: &[usize], sink: &mut crate::storage::unit::UnitSink<N>) -> Result<()>;
 
     /// Build what the engine builds on first use (the kernels) before a
     /// wave's clock starts: built inside the wave, the first frame's workers
@@ -737,19 +751,19 @@ impl TreeFilter {
 }
 
 /// The forward's in-memory state, EXTENDED frame by frame (each checkpointed).
-pub struct ForwardState {
+pub struct ForwardState<N: Rem = P8> {
     /// The last frame's frontier: its new states (as keys, with their
     /// hulls) and the older states whose hull grew there.
-    frontier: Frontier,
+    frontier: Frontier<N>,
     /// Every state reached so far, with its layer and hull (`storage::visited`).
-    visited: crate::storage::visited::VisitedSet,
+    visited: crate::storage::visited::VisitedSet<N>,
     /// The tree's transfers (`storage::edges::XferTable`).
-    xfers: crate::storage::edges::XferTable,
+    xfers: crate::storage::edges::XferTable<N>,
     /// The tree's out-edge files (the re-push reads an old state's edges).
     outs: crate::storage::out::OutStore,
     /// The shapes' skeletons the emissions register (the next layers'),
     /// and the shapes whose skeleton a frame file holds.
-    skeletons: crate::storage::decode::Skeletons,
+    skeletons: crate::storage::decode::Skeletons<N>,
     persisted: rustc_hash::FxHashSet<u64>,
     observer: Option<crate::search::pos_graph::PosObserver>,
     /// The last frame computed (and checkpointed).
@@ -773,17 +787,6 @@ pub struct ForwardResult {
     pub pos_graph: Option<crate::search::pos_graph::PosGraph>,
 }
 
-/// The start's remainder hull: its exact remainder (`arc_dp::start_point`,
-/// the backward's start point too).
-pub fn start_hull(s: &crate::settings::Settings) -> Result<Hull> {
-    #[cfg(test)]
-    if crate::search::hull::WIDEN.load(std::sync::atomic::Ordering::Relaxed) {
-        return Ok(Hull::full());
-    }
-    let (x, y) = crate::search::arc_dp::start_point(s)?;
-    Ok(Hull::point(x, y))
-}
-
 /// What a checkpoint wrote, and its steps' walls (`CKPT_STEPS`).
 #[derive(Clone, Copy, Default)]
 pub struct Checkpointed {
@@ -804,7 +807,7 @@ pub const CKPT_STEPS: [&str; 4] = ["frame file", "frame check", "hull file", "hu
 /// layer and hull - each read back and checked to hold exactly the wave's
 /// (`layer::check_frame_file`, `hulls::check`: the complete storage
 /// check).
-fn checkpoint(dir: &std::path::Path, frame: u32, wave: &crate::storage::wave::Wave, emitted: &[crate::storage::layer::SkelRecord], s: &crate::settings::Settings) -> Result<Checkpointed> {
+fn checkpoint<N: Rem>(dir: &std::path::Path, frame: u32, wave: &crate::storage::wave::Wave<N>, emitted: &[crate::storage::layer::SkelRecord<N>], s: &crate::settings::Settings) -> Result<Checkpointed> {
     use crate::storage::{hulls, layer};
     let mut c = Checkpointed { won: !wave.wins.is_empty(), ..Default::default() };
     let mut lap = std::time::Instant::now();
@@ -822,19 +825,19 @@ fn checkpoint(dir: &std::path::Path, frame: u32, wave: &crate::storage::wave::Wa
     mark(1);
     anyhow::ensure!(u16::try_from(frame).is_ok(), "frame {frame}: past a u16 layer");
     let hp = hulls::path(dir, frame);
-    let hull_bytes = hulls::write(&hp, frame, &wave.hulls, &wave.grown[..], s.threads())?;
+    let hull_bytes = hulls::write::<N, _>(&hp, frame, &wave.hulls, &wave.grown[..], s.threads())?;
     mark(2);
-    hulls::check(&hp, frame, &wave.hulls, &wave.grown[..], s.threads())?;
+    hulls::check::<N, _>(&hp, frame, &wave.hulls, &wave.grown[..], s.threads())?;
     mark(3);
     (c.frame_bytes, c.hull_bytes) = (frame_bytes, hull_bytes);
     Ok(c)
 }
 
-impl ForwardState {
+impl<N: Rem> ForwardState<N> {
     /// Frame 0: `initial` into an empty visited set and checkpointed, each
     /// with the start's hull; the tree is filtered by `minus_one` and
     /// widened at `level` (both recorded, with the settings `s`).
-    pub fn start(initial: Vec<Block>, dir: &std::path::Path, record: bool, minus_one: Option<MinusOne>, level: crate::abstraction::Level, s: &crate::settings::Settings) -> Result<Self> {
+    pub fn start(initial: Vec<Block<N>>, dir: &std::path::Path, record: bool, minus_one: Option<MinusOne>, level: crate::abstraction::Level, s: &crate::settings::Settings) -> Result<Self> {
         // A fresh tree keeps nothing a killed run left (stale edge files).
         for sub in ["frames", "edges", "hulls"] {
             let p = dir.join(sub);
@@ -850,8 +853,8 @@ impl ForwardState {
         // exact where every other state holds it widened, beside its hull.
         let ids = crate::compiled::ids();
         anyhow::ensure!(initial.iter().all(|b| b.rt2().player_objects(ids).is_empty()), "frame 0: an initial row holds a player, whose remainder the start's hull does not describe");
-        let mut visited = crate::storage::visited::VisitedSet::new(crate::storage::GEOMETRY);
-        let seeded = crate::storage::wave::seed(&mut visited, &initial, start_hull(s)?, s)?;
+        let mut visited = crate::storage::visited::VisitedSet::<N>::new(crate::storage::GEOMETRY);
+        let seeded = crate::storage::wave::seed(&mut visited, &initial, N::start_hull(s)?, s)?;
         let won = checkpoint(dir, 0, &seeded, &[], s)?.won;
         let observer = record.then(crate::search::pos_graph::PosObserver::default);
         // An (empty) graph from the start: every tree with frames has one.
@@ -908,9 +911,9 @@ impl ForwardState {
         s.check(dir, level)?;
         let edges_dir = dir.join("edges");
         let filter = TreeFilter::read(dir)?;
-        let (visited, win_frame, frontier, skeletons) = restore_visited(dir, last, s.room, s.threads())?;
+        let (visited, win_frame, frontier, skeletons) = restore_visited::<N>(dir, last, s.room, s.threads())?;
         let persisted = skeletons.shapes().into_iter().collect();
-        let xfers = crate::storage::edges::XferTable::load(&edges_dir)?;
+        let xfers = crate::storage::edges::XferTable::<N>::load(&edges_dir)?;
         let outs = crate::storage::out::OutStore::open(&edges_dir, last)?;
         let observer = if record {
             let path = pos_graph_path(dir);
@@ -929,18 +932,18 @@ impl ForwardState {
     }
 
     /// The visited set (`bench-frame`, `bench-storage`).
-    pub fn visited(&self) -> &crate::storage::visited::VisitedSet {
+    pub fn visited(&self) -> &crate::storage::visited::VisitedSet<N> {
         &self.visited
     }
 
     /// The frontier: the last frame's states whose hull grew (`bench-frame`,
     /// `bench-storage`).
-    pub fn frontier(&self) -> &Frontier {
+    pub fn frontier(&self) -> &Frontier<N> {
         &self.frontier
     }
 
     /// The out store and the transfer table (`bench-frame`'s `[memory]`).
-    pub fn outs_and_xfers(&self) -> (&crate::storage::out::OutStore, &crate::storage::edges::XferTable) {
+    pub fn outs_and_xfers(&self) -> (&crate::storage::out::OutStore, &crate::storage::edges::XferTable<N>) {
         (&self.outs, &self.xfers)
     }
 
@@ -966,11 +969,11 @@ impl ForwardState {
     /// its new states and pairs (`bench-frame`, run per rep).
     pub fn bench_wave(
         &mut self,
-        engine: &dyn FrameStep,
+        engine: &dyn FrameStep<N>,
         dir: &std::path::Path,
         edges_dir: Option<&std::path::Path>,
         copy: bool,
-    ) -> Result<(crate::storage::wave::Wave, crate::storage::visited::VisitedSet, crate::storage::edges::XferTable)> {
+    ) -> Result<(crate::storage::wave::Wave<N>, crate::storage::visited::VisitedSet<N>, crate::storage::edges::XferTable<N>)> {
         anyhow::ensure!(!self.spent, "{}: the forward state at f{} ran its last wave (its visited set was moved)", dir.display(), self.frames);
         // The frame the tree would make: under the table it was built with.
         let minus_one = match self.filter {
@@ -1003,7 +1006,7 @@ impl ForwardState {
     /// 1`) into `dir` (a scratch dir): the frame file and the hull file,
     /// each read back and checked, then the pos graph saved. Returns the
     /// checkpoint's steps and the pos graph's wall.
-    pub fn bench_checkpoint(&self, wave: &crate::storage::wave::Wave, dir: &std::path::Path, s: &crate::settings::Settings) -> Result<(Checkpointed, std::time::Duration)> {
+    pub fn bench_checkpoint(&self, wave: &crate::storage::wave::Wave<N>, dir: &std::path::Path, s: &crate::settings::Settings) -> Result<(Checkpointed, std::time::Duration)> {
         let emitted = self.skeletons.records(|h| self.persisted.contains(&h) || wave.next.skeletons.contains_key(&h));
         let c = checkpoint(dir, self.frames + 1, wave, &emitted, s)?;
         let t = std::time::Instant::now();
@@ -1018,10 +1021,10 @@ impl ForwardState {
     /// frontier stops it (the backward seeds from wins at every frame).
     pub fn extend(
         &mut self,
-        engine: &dyn FrameStep,
+        engine: &dyn FrameStep<N>,
         dir: &std::path::Path,
         to: u32,
-        marks: Option<&MarkFilter>,
+        marks: Option<&MarkFilter<N>>,
     ) -> Result<()> {
         let s = &engine.settings();
         let minus_one = match self.filter {
@@ -1094,14 +1097,14 @@ impl ForwardState {
 /// another horizon). `engine` is built only when frames are computed, at
 /// `level`, the tree's, under the run's settings `s` (the tree's, checked).
 #[allow(clippy::too_many_arguments)]
-pub fn grow_tree(
+pub fn grow_tree<N: Rem>(
     dir: &std::path::Path,
     to: u32,
     want: Option<MinusOne>,
-    marks: Option<&MarkFilter>,
+    marks: Option<&MarkFilter<N>>,
     level: crate::abstraction::Level,
-    engine: impl FnOnce() -> Result<Box<dyn FrameStep>>,
-    initial: impl FnOnce() -> Result<Vec<Block>>,
+    engine: impl FnOnce() -> Result<Box<dyn FrameStep<N>>>,
+    initial: impl FnOnce() -> Result<Vec<Block<N>>>,
     s: &crate::settings::Settings,
 ) -> Result<ForwardResult> {
     if crate::storage::layer::frame_exists(dir, 0) {
@@ -1110,7 +1113,7 @@ pub fn grow_tree(
     if let Some(w) = want {
         anyhow::ensure!(to <= w.h, "--level-minus-one at step {} is below the horizon, step {to}", w.h);
     }
-    let complete = tree_first_win_through(dir, to)?;
+    let complete = tree_first_win_through::<N>(dir, to)?;
     if crate::storage::layer::frame_exists(dir, 0) {
         match TreeFilter::read(dir)? {
             None => anyhow::bail!("{}: the tree has no level -1 record (built before records): delete it", dir.display()),
@@ -1141,7 +1144,7 @@ pub fn grow_tree(
     let engine = engine()?;
     anyhow::ensure!(engine.level() == level, "the forward's engine is at {}, the tree at {level}", engine.level());
     anyhow::ensure!(*engine.settings() == *s, "the forward's engine runs under other settings than the tree's");
-    let mut st = match ForwardState::resume(dir, true, level, s)? {
+    let mut st = match ForwardState::<N>::resume(dir, true, level, s)? {
         Some(st) => st,
         None => ForwardState::start(initial()?, dir, true, want, level, s)?,
     };
@@ -1356,35 +1359,36 @@ const RESUME_CHANGES: usize = 1 << 25;
 /// the packed tables a batch of frames at a time (`RESUME_CHANGES`), every
 /// region on every thread; the last frame's grown states read what they
 /// held before it (their `was`) between its new states and its growth.
-pub fn restore_visited(dir: &std::path::Path, last: u32, room: (i16, i16), threads: usize) -> Result<(crate::storage::visited::VisitedSet, Option<u32>, Frontier, crate::storage::decode::Skeletons)> {
+#[allow(clippy::type_complexity)]
+pub fn restore_visited<N: Rem>(dir: &std::path::Path, last: u32, room: (i16, i16), threads: usize) -> Result<(crate::storage::visited::VisitedSet<N>, Option<u32>, Frontier<N>, crate::storage::decode::Skeletons<N>)> {
     use crate::storage::hulls;
     use crate::storage::set::Change;
     let geo = crate::storage::GEOMETRY;
-    let tree = crate::storage::layer::Tree::open(dir, last)?;
-    let mut visited = crate::storage::visited::VisitedSet::new(geo);
+    let tree = crate::storage::layer::Tree::<N>::open(dir, last)?;
+    let mut visited = crate::storage::visited::VisitedSet::<N>::new(geo);
     for (i, &h) in tree.shapes.iter().enumerate() {
         visited.restore_shape(i as u32, h)?;
     }
     visited.keys = tree.space.clone();
     use crate::storage::visited::StateInfo;
-    let mut frontier = Frontier::default();
+    let mut frontier = Frontier::<N>::default();
     // The emissions' skeletons: every frame file's from frame 1 on (a
     // layer's are the registry's; frame 0's are the start's reference rows').
-    let skeletons = crate::storage::decode::Skeletons::default();
+    let skeletons = crate::storage::decode::Skeletons::<N>::default();
     // Per region its changes not yet upserted, in frame order.
-    let mut pending: rustc_hash::FxHashMap<u32, Vec<Change>> = Default::default();
+    let mut pending: rustc_hash::FxHashMap<u32, Vec<Change<N>>> = Default::default();
     let mut held = 0usize;
     // The pending changes upserted: per region by state, a state's last
     // change kept (its last file's layer and hull), NEW where any was (two
     // NEW: the state stored twice).
-    let flush = |pending: &mut rustc_hash::FxHashMap<u32, Vec<Change>>, visited: &mut crate::storage::visited::VisitedSet, held: &mut usize| -> Result<()> {
-        let mut per: Vec<(u32, Vec<Change>)> = std::mem::take(pending).into_iter().collect();
+    let flush = |pending: &mut rustc_hash::FxHashMap<u32, Vec<Change<N>>>, visited: &mut crate::storage::visited::VisitedSet<N>, held: &mut usize| -> Result<()> {
+        let mut per: Vec<(u32, Vec<Change<N>>)> = std::mem::take(pending).into_iter().collect();
         per.sort_unstable_by_key(|x| x.0);
-        let per: Vec<std::sync::Mutex<(u32, Vec<Change>)>> = per.into_iter().map(std::sync::Mutex::new).collect();
-        let sorted = crate::storage::wave::par_map(&per, threads, |m| -> Result<(u32, Vec<Change>)> {
+        let per: Vec<std::sync::Mutex<(u32, Vec<Change<N>>)>> = per.into_iter().map(std::sync::Mutex::new).collect();
+        let sorted = crate::storage::wave::par_map(&per, threads, |m| -> Result<(u32, Vec<Change<N>>)> {
             let (region, mut v) = std::mem::take(&mut *m.lock().expect("a region's changes"));
             v.sort_by_key(|c| (c.key, c.cell));
-            let mut out: Vec<Change> = Vec::with_capacity(v.len());
+            let mut out: Vec<Change<N>> = Vec::with_capacity(v.len());
             for c in v {
                 match out.last_mut() {
                     Some(l) if (l.key, l.cell) == (c.key, c.cell) => {
@@ -1396,7 +1400,7 @@ pub fn restore_visited(dir: &std::path::Path, last: u32, room: (i16, i16), threa
             }
             Ok((region, out))
         });
-        let per: Vec<(u32, Vec<Change>)> = sorted.into_iter().collect::<Result<_>>()?;
+        let per: Vec<(u32, Vec<Change<N>>)> = sorted.into_iter().collect::<Result<_>>()?;
         *held += visited.upsert_all(per, threads)?.held_new as usize;
         Ok(())
     };
@@ -1411,7 +1415,7 @@ pub fn restore_visited(dir: &std::path::Path, last: u32, room: (i16, i16), threa
             anyhow::ensure!(layer.is_empty(), "{}: frame {f} holds states and no hull file", dir.display());
             continue;
         }
-        let hf = hulls::read(&p, threads).with_context(|| format!("{}: frame {f}'s hulls", dir.display()))?;
+        let hf = hulls::read::<N>(&p, threads).with_context(|| format!("{}: frame {f}'s hulls", dir.display()))?;
         anyhow::ensure!(hf.frame == f && hf.hulls.len() as u64 == layer.states(), "{}: frame {f}'s hull file is of frame {} with {} new states, the frame has {}", dir.display(), hf.frame, hf.hulls.len(), layer.states());
         let f16 = u16::try_from(f).map_err(|_| anyhow::anyhow!("frame {f}: past a u16 layer"))?;
         // The new states, in the layer's order (its hulls').
@@ -1432,15 +1436,15 @@ pub fn restore_visited(dir: &std::path::Path, last: u32, room: (i16, i16), threa
             // Read by region, each region's walked with its states sorted.
             let mut by: Vec<(u32, crate::storage::visited::Key, u8, usize)> = hf.grown.iter().enumerate().map(|(i, g)| (g.0.region, g.0.key, g.0.local, i)).collect();
             by.sort_unstable();
-            let mut was: Vec<Option<StateInfo>> = vec![None; hf.grown.len()];
+            let mut was: Vec<Option<StateInfo<N>>> = vec![None; hf.grown.len()];
             for run in by.chunk_by(|a, b| a.0 == b.0) {
                 let Some(t) = visited.table(run[0].0) else { continue };
-                let mut c = t.cursor();
+                let mut c = t.cursor::<N>();
                 for &(_, key, local, i) in run {
                     was[i] = c.seek(key)?.and_then(|e| e.info(local as u32));
                 }
             }
-            let mut old: crate::storage::wave::ByLayer = Vec::new();
+            let mut old: crate::storage::wave::ByLayer<N> = Vec::new();
             for (&(sk, layer, hull), was) in hf.grown.iter().zip(was) {
                 anyhow::ensure!(layer < f16, "{}: a grown state of layer {layer} in frame {f}'s hulls", dir.display());
                 let i = was.ok_or_else(|| anyhow::anyhow!("{}: an old state of frame {f}'s frontier without a hull before", dir.display()))?;
@@ -1478,7 +1482,7 @@ pub fn mark_row(shape: u64, key: (u64, u64), cell: u32, deadline: u16, horizon: 
 
 /// A marks file (`Visited::save`) from its rows, in any order, each state
 /// once, with the key space its keys are in.
-pub fn save_marks(path: &std::path::Path, mut rows: Vec<MarkRow>, horizon: u32, keys: &celeste_engine::exact::KeySpace) -> Result<()> {
+pub fn save_marks<N: EngineNum>(path: &std::path::Path, mut rows: Vec<MarkRow>, horizon: u32, keys: &celeste_engine::exact::KeySpace<N>) -> Result<()> {
     rows.sort_unstable();
     crate::search::checkpoint::save_value_to(path, &(rows, horizon, keys.to_additions()))
 }
@@ -1494,21 +1498,26 @@ pub fn load_marks(path: &std::path::Path) -> Result<(Vec<MarkRow>, u32, celeste_
 /// An in-memory set of states `(shape, cell, key)` (a level's MARKED states
 /// or a diagnostic's), saved as a marks file; its keys are in the key space
 /// of the tree it names.
-#[derive(Default)]
-pub struct Visited {
+pub struct Visited<N: EngineNum = P8> {
     /// Sharded by (shape, cell); each key maps to its DEADLINE, the last frame
     /// from which it still wins by the horizon (`u16::MAX`: none).
     shards: rustc_hash::FxHashMap<(u64, u32), rustc_hash::FxHashMap<(u64, u64), u16>>,
-    keys: celeste_engine::exact::KeySpace,
+    keys: celeste_engine::exact::KeySpace<N>,
 }
 
-impl Visited {
+impl<N: EngineNum> Default for Visited<N> {
+    fn default() -> Self {
+        Visited { shards: Default::default(), keys: Default::default() }
+    }
+}
+
+impl<N: EngineNum> Visited<N> {
     /// An empty set over the key space `keys`.
-    pub fn new(keys: celeste_engine::exact::KeySpace) -> Self {
+    pub fn new(keys: celeste_engine::exact::KeySpace<N>) -> Self {
         Visited { shards: Default::default(), keys }
     }
     /// The key space the keys are in.
-    pub fn keys(&self) -> &celeste_engine::exact::KeySpace {
+    pub fn keys(&self) -> &celeste_engine::exact::KeySpace<N> {
         &self.keys
     }
     /// `(entries, order-independent CONTENT hash of the (shape, key, cell)
@@ -1565,7 +1574,12 @@ impl Visited {
     pub fn len(&self) -> usize {
         self.shards.values().map(|s| s.len()).sum()
     }
+    pub fn is_empty(&self) -> bool {
+        self.shards.values().all(|s| s.is_empty())
+    }
+}
 
+impl Visited {
     /// THE MARKS FILE (also read by the UI export): bincode `(rows, horizon)`,
     /// `dist` = horizon - deadline; no deadline saves as 0 (filters alike).
     pub fn save(&self, path: &std::path::Path, horizon: u32) -> Result<()> {
@@ -1586,18 +1600,15 @@ impl Visited {
         }
         Ok(out)
     }
-    pub fn is_empty(&self) -> bool {
-        self.shards.values().all(|s| s.is_empty())
-    }
 }
 
 /// The first win of a tree complete through `horizon`; `None` if it is not.
-pub fn tree_first_win_through(dir: &std::path::Path, horizon: u32) -> Result<Option<Option<u32>>> {
+pub fn tree_first_win_through<N: EngineNum>(dir: &std::path::Path, horizon: u32) -> Result<Option<Option<u32>>> {
     let done = crate::storage::edges::done_frame(&dir.join("edges"));
     if done.is_none_or(|d| d < horizon) || !crate::storage::layer::frame_exists(dir, horizon) {
         return Ok(None);
     }
-    Ok(Some(crate::storage::layer::Tree::open(dir, horizon)?.first_win()))
+    Ok(Some(crate::storage::layer::Tree::<N>::open(dir, horizon)?.first_win()))
 }
 
 #[cfg(test)]
@@ -1634,6 +1645,7 @@ mod tests {
     use celeste_core::pico8_num::Pico8Num as P8;
     use celeste_engine::runtime2::{Col, AV};
     use crate::trace::refengine::RefFrameStep;
+    use crate::search::hull::Hull;
 
     /// A fresh forward keeps none of a killed run's files.
     #[test]
@@ -1717,7 +1729,7 @@ mod tests {
         let to = 44;
         // Per frame, its states by content.
         let states = |d: &std::path::Path| -> Vec<rustc_hash::FxHashSet<u64>> {
-            let t = crate::storage::layer::Tree::open(d, to).expect("tree");
+            let t = crate::storage::layer::Tree::<P8>::open(d, to).expect("tree");
             let content = t.space.content_hash();
             (0..=to).map(|f| t.layer(f, None, 4).expect("layer").0.states_iter().map(|sk| { let (shape, key, cell) = t.state(sk).expect("state"); content.state(shape, key, cell) }).collect()).collect()
         };
@@ -1726,7 +1738,7 @@ mod tests {
         ForwardState::start(init(), &wide, true, None, level, &s).expect("start").extend(&e, &wide, to, None).expect("widened");
         WIDEN.store(false, Ordering::Relaxed);
         ForwardState::start(init(), &hull, true, None, level, &s).expect("start").extend(&e, &hull, to, None).expect("hull");
-        let t = crate::storage::layer::Tree::open(&wide, to).expect("tree");
+        let t = crate::storage::layer::Tree::<P8>::open(&wide, to).expect("tree");
         let lines: Vec<String> = (0..=to).map(|f| { let (n, acc) = t.layer(f, None, 4).expect("layer").0.content_fingerprint(&t.space, &t.shapes).expect("fp"); format!("f{f:03} {n} {acc:016x}") }).collect();
         let pinned = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/gates/ckhash_room10_f000-044_widened.txt")).expect("the gate");
         assert_eq!(lines, pinned.lines().collect::<Vec<_>>(), "the widened forward is not the gate's");
@@ -1743,8 +1755,8 @@ mod tests {
         }
         assert!(n_hull < n_wide, "{n_hull} hull states, {n_wide} widened: the hulls cut nothing");
         // The exact reach, inside the hull tree's states and hulls.
-        let st = ForwardState::at(&hull, to, false, level, &s).expect("at");
-        let tree = crate::storage::layer::Tree::open(&hull, to).expect("tree");
+        let st = ForwardState::<P8>::at(&hull, to, false, level, &s).expect("at");
+        let tree = crate::storage::layer::Tree::<P8>::open(&hull, to).expect("tree");
         let layers: Vec<Layer> = (0..=to).map(|f| tree.layer(f, None, 4).expect("layer").0).collect();
         let p0 = crate::search::arc_dp::start_point(&s).expect("start");
         let mut checked = 0u64;
@@ -1879,7 +1891,7 @@ mod tests {
         assert_eq!(st.frames, ends - 1, "the untrusted frame is discarded");
         st.extend(&e, &b, ends, None).expect("rerun");
         for f in 0..=ends {
-            let keys = |d: &std::path::Path| -> Vec<(u32, (u64, u64), u64)> { crate::storage::layer::Tree::open(d, ends).expect("tree").layer(f, None, 2).expect("layer").0.iter().collect() };
+            let keys = |d: &std::path::Path| -> Vec<(u32, (u64, u64), u64)> { crate::storage::layer::Tree::<P8>::open(d, ends).expect("tree").layer(f, None, 2).expect("layer").0.iter().collect() };
             assert_eq!(keys(&a), keys(&b), "f{f}");
         }
         assert!(st.xfers.pairs.len() > 1, "transfers recorded");
@@ -1899,7 +1911,7 @@ mod tests {
         std::fs::create_dir_all(dir).expect("mkdir");
         // A frame's states by content (their keys are their tree's).
         let content = |d: &std::path::Path, frame: u32| -> (u64, u64) {
-            let t = crate::storage::layer::Tree::open(d, frame).expect("tree");
+            let t = crate::storage::layer::Tree::<P8>::open(d, frame).expect("tree");
             t.layer(frame, None, 2).expect("layer").0.content_fingerprint(&t.space, &t.shapes).expect("content")
         };
         let keyset = |frame: u32| content(dir, frame);
@@ -1968,7 +1980,7 @@ mod tests {
         let (k, r) = (base.join("kernels"), base.join("reference"));
         forward_run(&crate::compiled::FrameEngine::new(&s, Level::EXACT).expect("kernels"), init(), &k, 27, true).expect("the kernels' forward");
         forward_run(&RefFrameStep::new(&s, Level::EXACT).expect("engines"), init(), &r, 27, true).expect("the reference forward");
-        let (fk, fr) = (crate::storage::fingerprint(&k, 27, true, true, 4).expect("kernels"), crate::storage::fingerprint(&r, 27, true, true, 4).expect("reference"));
+        let (fk, fr) = (crate::storage::fingerprint::<P8>(&k, 27, true, true, 4).expect("kernels"), crate::storage::fingerprint::<P8>(&r, 27, true, true, 4).expect("reference"));
         assert_eq!(fk, fr, "the reference forward's tree is not the kernels'");
         assert!(fk.iter().any(|l| l.starts_with("f027 ") && !l.starts_with("f027 0 ")), "f27 holds states");
         let _ = std::fs::remove_dir_all(&base);
@@ -2218,7 +2230,7 @@ mod tests {
         let unsplit: Vec<(u32, usize)> = (0..24).map(|f| (f, 1)).chain([(24, 27), (25, 191), (26, 676), (27, 1883), (28, 4514)]).collect();
         let last = unsplit.last().unwrap().0;
         forward_run(&engine, init, dir, 2 * last, false).expect("split forward");
-        let tree = crate::storage::layer::Tree::open(dir, 2 * last).expect("the tree");
+        let tree = crate::storage::layer::Tree::<P8>::open(dir, 2 * last).expect("the tree");
         for (f, want) in unsplit {
             let got = tree.states(2 * f) as usize;
             assert_eq!(got, want, "frame {f} (step {}): the split frame reached {got} states, the unsplit {want}", 2 * f);

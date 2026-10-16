@@ -5,7 +5,7 @@
 //! finished tree (rows by name: `search::inspect`).
 
 use anyhow::{Context, Result};
-use celeste_engine::runtime2::Rt2;
+use celeste_engine::runtime2::{Rt2, P8};
 use celeste_rust::trace::refengine::RefEngine;
 use celeste_rust::frame::{widen_rt2_to, widened_keys, wins_of, Block, FrameStep, Visited};
 use celeste_rust::storage::layer::Tree;
@@ -754,7 +754,7 @@ fn erased_states(dir: &std::path::Path, frame: u32, erase: &[String], room: (i16
     let ids = celeste_rust::compiled::ids();
     let code = |v: AV| -> Code { Code::of(if let AV::Ptr(_) = v { AV::Ptr(0) } else { v }) };
     let (mut rows, mut states) = (0u64, rustc_hash::FxHashSet::default());
-    let tree = Tree::open(dir, frame)?;
+    let tree = Tree::<P8>::open(dir, frame)?;
     for (_, rt2) in tree.rows(frame, room, 1 << 20, &|_| true, threads)? {
         rows += rt2.width as u64;
         let names = cell_names(&rt2, ids);
@@ -1001,7 +1001,7 @@ fn main() -> Result<()> {
                 let last = li + 1 == levels.len();
                 let dir = std::path::Path::new(&checkpoint_dir).join(format!("level{li:02}"));
                 anyhow::ensure!(
-                    celeste_rust::frame::tree_first_win_through(&dir, steps)?.is_some(),
+                    celeste_rust::frame::tree_first_win_through::<P8>(&dir, steps)?.is_some(),
                     "{}: no tree through step {steps} (run the search first)",
                     dir.display()
                 );
@@ -1058,7 +1058,7 @@ fn main() -> Result<()> {
             let load_marks = |p: Option<String>| p.map(|p| Visited::load(std::path::Path::new(&p))).transpose();
             let (fine_marks, coarse_marks) = (load_marks(fine_marks)?, load_marks(coarse_marks)?);
             let (fine, coarse) = (std::path::Path::new(&fine_dir), std::path::Path::new(&coarse_dir));
-            let (fine_tree, coarse_tree) = (Tree::open(fine, to)?, Tree::open(coarse, to)?);
+            let (fine_tree, coarse_tree) = (Tree::<P8>::open(fine, to)?, Tree::<P8>::open(coarse, to)?);
             // The fine rows' projections keyed in the COARSE tree's key space.
             let mut reached = Visited::new(coarse_tree.space.clone());
             let (mut total, mut missed, mut unmarked) = (0usize, 0usize, 0usize);
@@ -1112,21 +1112,21 @@ fn main() -> Result<()> {
             dump_edges,
         } => {
             let dir = std::path::Path::new(&checkpoint_dir);
-            for line in celeste_rust::storage::fingerprint(dir, to, edges, hulls, cfg.threads())? {
+            for line in celeste_rust::storage::fingerprint::<P8>(dir, to, edges, hulls, cfg.threads())? {
                 println!("{line}");
             }
             let geo = celeste_rust::storage::GEOMETRY;
             if let Some(frame) = dump_edges {
-                let tree = Tree::open(dir, to)?;
+                let tree = Tree::<P8>::open(dir, to)?;
                 let content = tree.space.content_hash();
-                let eg = celeste_rust::storage::edges::EdgeStore::open(&dir.join("edges"), to)?;
+                let eg = celeste_rust::storage::edges::EdgeStore::<P8>::open(&dir.join("edges"), to)?;
                 let node = |s: Sk| content.state(tree.shapes[s.shape(&geo) as usize], s.key, s.cell(&geo));
                 for e in eg.edges_at(frame, cfg.threads())? {
                     eprintln!("edge {:016x} {:016x} {:?}", node(e.dst), node(e.src), eg.pair(e.xfer));
                 }
             }
             if let Some(top) = top_cells {
-                let tree = Tree::open(dir, to)?;
+                let tree = Tree::<P8>::open(dir, to)?;
                 let mut by_cell: rustc_hash::FxHashMap<u32, usize> = Default::default();
                 for s in tree.layer(to, None, cfg.threads())?.0.states_iter() {
                     *by_cell.entry(s.cell(&geo)).or_default() += 1;
@@ -1155,7 +1155,7 @@ fn main() -> Result<()> {
             let t_kernels = t.elapsed().as_secs_f64();
             eprintln!("[bench] kernels built: rss {:.2} GB", celeste_rust::metrics::current_rss_gb());
             let t = std::time::Instant::now();
-            let mut st = celeste_rust::frame::ForwardState::at(&dir, frame, true, level, &cfg)?;
+            let mut st = celeste_rust::frame::ForwardState::<P8>::at(&dir, frame, true, level, &cfg)?;
             eprintln!(
                 "[bench] kernels built in {t_kernels:.2} s; f{frame} loaded in {:.2} s: {} lanes in {} entries ({:.3} GB, {:.2} B a state) and {} old states, visited {} states in {} entries ({:.3} GB, {:.2} B a state); {} threads; rss {:.2} GB",
                 t.elapsed().as_secs_f64(),
@@ -1316,7 +1316,7 @@ fn main() -> Result<()> {
             let n_frames = (to - from + 1) as usize;
             // Per cell, its new states per frame.
             let mut per: std::collections::HashMap<u32, Vec<u64>> = Default::default();
-            let tree = Tree::open(dir, to)?;
+            let tree = Tree::<P8>::open(dir, to)?;
             let geo = celeste_rust::storage::GEOMETRY;
             for f in from..=to {
                 for s in tree.layer(f, None, cfg.threads())?.0.states_iter() {
@@ -1396,10 +1396,10 @@ fn main() -> Result<()> {
             cfg.check(dir, level)?;
             let edges_dir = dir.join("edges");
             let ids = celeste_rust::compiled::ids();
-            let graph = celeste_rust::storage::edges::EdgeStore::open(&edges_dir, to)?;
+            let graph = celeste_rust::storage::edges::EdgeStore::<P8>::open(&edges_dir, to)?;
             let rem_cells = |rt2: &Rt2| rt2.player_xy_cells(ids, ids.f_rem);
             // One stored state's row, as a one-lane block.
-            let tree = Tree::open(dir, to)?;
+            let tree = Tree::<P8>::open(dir, to)?;
             let row_of = |s: Sk| -> Result<Block> {
                 let f = tree.layer_of(s, to)?.ok_or_else(|| anyhow::anyhow!("state {}: in no frame through f{to}", s.show()))?;
                 Ok(Block::from_rt2(tree.row(f, s, cfg.room)?))
@@ -1701,7 +1701,7 @@ fn main() -> Result<()> {
                 moved
             };
             let (mut stored, mut emitted_rows, mut moved) = (0usize, 0usize, 0usize);
-            let tree = Tree::open(dir, frame)?;
+            let tree = Tree::<P8>::open(dir, frame)?;
             let blocks = tree.rows(frame, cfg.room, 1 << 20, &|_| true, cfg.threads())?;
             for (_, rt2) in &blocks {
                 stored += rt2.width;
@@ -1732,7 +1732,7 @@ fn main() -> Result<()> {
             kernels.warm();
             let only = cell.map(cell_at).transpose()?;
             // Every candidate state, then `samples` evenly spaced.
-            let tree = Tree::open(dir, frame)?;
+            let tree = Tree::<P8>::open(dir, frame)?;
             let geo = celeste_rust::storage::GEOMETRY;
             let all: Vec<Sk> = tree.layer(frame, None, cfg.threads())?.0.states_iter().filter(|s| only.is_none_or(|c| s.cell(&geo) == c)).collect();
             anyhow::ensure!(!all.is_empty(), "no rows at step {frame}");
@@ -1823,7 +1823,7 @@ fn main() -> Result<()> {
             let layer = layer as u32;
             cfg.check(dir, level)?;
             let engine = celeste_rust::compiled::FrameEngine::new(&cfg, level)?;
-            let tree = Tree::open(dir, layer)?;
+            let tree = Tree::<P8>::open(dir, layer)?;
             let (states, _) = tree.layer(layer, None, cfg.threads())?;
             let sk = states.states_iter().nth(r as usize).ok_or_else(|| anyhow::anyhow!("state {r} past frame {layer}'s {}", states.states()))?;
             let rt2 = tree.row(layer, sk, cfg.room)?;
@@ -1935,7 +1935,7 @@ fn main() -> Result<()> {
                 }
             }
             // Walk the samples back.
-            let edges = celeste_rust::storage::edges::EdgeStore::open(&coarse.join("edges"), step)?;
+            let edges = celeste_rust::storage::edges::EdgeStore::<P8>::open(&coarse.join("edges"), step)?;
             let n = samples.min(chosen.len());
             for k in 0..n {
                 let (mut id, mut layer) = (chosen[k * chosen.len() / n], step);
@@ -2013,7 +2013,7 @@ fn main() -> Result<()> {
             }
         }
         Command::EdgeCensus { level_dir, frame, horizon } => {
-            let g = celeste_rust::storage::edges::EdgeStore::open(&std::path::Path::new(&level_dir).join("edges"), horizon)?;
+            let g = celeste_rust::storage::edges::EdgeStore::<P8>::open(&std::path::Path::new(&level_dir).join("edges"), horizon)?;
             let pairs = g.pairs();
             let mut recs = g.edges_at(frame, cfg.threads())?;
             recs.sort_unstable();
@@ -2577,7 +2577,7 @@ fn hull_stats(dir: &std::path::Path, to: u32, threads: usize) -> Result<()> {
         v[((v.len() - 1) as f64 * f) as usize]
     };
     let last_frame = celeste_rust::storage::layer::last_frame(dir).ok_or_else(|| anyhow::anyhow!("{}: no frames", dir.display()))?;
-    let tree = celeste_rust::storage::layer::Tree::open(dir, to.min(last_frame))?;
+    let tree = celeste_rust::storage::layer::Tree::<P8>::open(dir, to.min(last_frame))?;
     println!("frame\tnew\tgrown\tgrowth_x_med\tgrowth_x_p90\tgrowth_y_med\tgrowth_y_p90\tgrown_full_x");
     for f in 0..=to {
         let p = hulls::path(dir, f);
@@ -2585,7 +2585,7 @@ fn hull_stats(dir: &std::path::Path, to: u32, threads: usize) -> Result<()> {
             break;
         }
         let (layer, _) = tree.layer(f, None, threads)?;
-        let g = hulls::read(&p, threads)?.states(&layer)?;
+        let g = hulls::read::<P8>(&p, threads)?.states(&layer)?;
         let (mut new, mut grown, mut full) = (0u64, 0u64, 0u64);
         let (mut gx, mut gy) = (Vec::new(), Vec::new());
         for (sk, layer, h) in g {
@@ -2642,7 +2642,7 @@ fn reach_command(checkpoint_dir: &str, level_index: usize, to: u32, save: Option
     use std::io::Write;
     let dir = std::path::Path::new(checkpoint_dir).join(format!("level{level_index:02}"));
     let steps = to * cfg.steps_per_frame();
-    let tree = Tree::open(&dir, steps)?;
+    let tree = Tree::<P8>::open(&dir, steps)?;
     let level = tree_level(&dir)?;
     cfg.check(&dir, level)?;
     let geo = celeste_rust::storage::GEOMETRY;

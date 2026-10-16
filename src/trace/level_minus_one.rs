@@ -2020,7 +2020,7 @@ pub fn probe(root: &FsPath, opts: &Opts, s: &crate::settings::Settings) -> Resul
         None => None,
     };
     // The tree's states, by frame.
-    let tree = crate::storage::layer::Tree::open(&opts.level_dir, opts.to)?;
+    let tree = crate::storage::layer::Tree::<celeste_engine::runtime2::P8>::open(&opts.level_dir, opts.to)?;
     let geo = crate::storage::GEOMETRY;
     say!(rep, "\nframe | states | too late (f + d > {}) | no exit path | band {},8 cut | death (kept) | left the room | other shape | not in the table | marked | MARKED TOO LATE", opts.ceiling, opts.ceiling)?;
     let mut samples: BTreeSet<String> = BTreeSet::new();

@@ -20,7 +20,9 @@
 //! depends on the player's position per lane) and the platforms' input
 //! (bound to the platform worlds).
 
-use crate::runtime2::{collapse_uniform, BoundaryIds, Col, Rt2, AV, NONE, P8};
+use celeste_core::arith::{Arithmetic, EngineNum};
+
+use crate::runtime2::{collapse_uniform, BoundaryIds, Col, Rt2, AV, NONE};
 
 /// A LEVEL: which objects the forward widens (plans/abstractions.md). Each
 /// widening over-approximates; the concrete search refutes it.
@@ -274,18 +276,19 @@ pub const FLOOR_HITBOX: [i16; 4] = [0, 0, 8, 8];
 /// windows `(lo, hi)` for `x` and `y`; `None` where one leaves the 16.16
 /// range (a floor's position is its map tile's, so never: an error, not a
 /// wrapped window).
-pub fn floor_player_window(floor: (P8, P8)) -> Option<[(P8, P8); 2]> {
+pub fn floor_player_window<N: EngineNum>(floor: (N, N)) -> Option<[(N, N); 2]> {
     let [px, py, pw, ph] = PLAYER_HITBOX;
     let [fx, fy, fw, fh] = FLOOR_HITBOX;
-    let at = |base: P8, d: i16| base.checked_add(P8::from_i16(d));
+    let at = |base: N, d: i16| <N::A as Arithmetic>::add(base, <N::A as Arithmetic>::from_i16(d));
     Some([(at(floor.0, fx - px - pw)?, at(floor.0, fx + fw - px)?), (at(floor.1, fy - py - ph)?, at(floor.1, fy + fh - py)?)])
 }
 
 /// Does a player in ranges `x`, `y` CERTAINLY overlap? A straddling range
 /// does not (the floor stays widened, the safe side). Shared with the tracer.
-pub fn player_overlaps_floor(window: [(P8, P8); 2], x: (P8, P8), y: (P8, P8)) -> bool {
+pub fn player_overlaps_floor<N: EngineNum>(window: [(N, N); 2], x: (N, N), y: (N, N)) -> bool {
     let [(xlo, xhi), (ylo, yhi)] = window;
-    x.0 > xlo && x.1 < xhi && y.0 > ylo && y.1 < yhi
+    let lt = <N::A as Arithmetic>::lt;
+    lt(xlo, x.0) && lt(x.1, xhi) && lt(ylo, y.0) && lt(y.1, yhi)
 }
 
 /// A moving platform's `x` (and `last`) range in pixels: it wraps between
@@ -666,7 +669,7 @@ fn resolved() -> &'static [Resolved] {
 }
 
 /// `(lo, hi)` of a numeric lane value, else `None`.
-fn span(v: AV) -> Option<(P8, P8)> {
+fn span<N: Copy>(v: AV<N>) -> Option<(N, N)> {
     match v {
         AV::Num(n) => Some((n, n)),
         AV::Ival(a, b) => Some((a, b)),
@@ -674,7 +677,26 @@ fn span(v: AV) -> Option<(P8, P8)> {
     }
 }
 
-impl Rt2 {
+/// A table constant (raw 16.16) in arithmetic `N`, exactly (every 16.16
+/// value is a double).
+fn constant<N: EngineNum>(raw: i32) -> N {
+    <N::A as Arithmetic>::from_fixed_raw(raw)
+}
+
+/// A stored range's ends in `N`. `REM` is the HALF-OPEN remainder
+/// [-1/2, 1/2): its last value is the arithmetic's last below 1/2 (16.16's
+/// `1/2 - 2^-16`, a double's `pred(1/2)`); every other range is its
+/// inclusive ends.
+fn range<N: EngineNum>(lo: i32, hi: i32) -> (N, N) {
+    if (lo, hi) == REM {
+        let half = constant::<N>(REM.1 + 1);
+        (constant(lo), <N::A as Arithmetic>::below(half).expect("a value below 1/2"))
+    } else {
+        (constant(lo), constant(hi))
+    }
+}
+
+impl<N: EngineNum> Rt2<N> {
     /// A level's widenings (`TABLE`), as its kernels bake them
     /// (`trace::widen`), so a finer row can be looked up as the level's
     /// node. Each asserts what its entry owes.
@@ -750,7 +772,7 @@ impl Rt2 {
     }
 
     /// Every lane of cell `c` satisfies `ok`, or panic naming the entry.
-    fn check_lanes(&self, name: &str, c: u32, what: &str, ok: impl Fn(AV) -> bool) {
+    fn check_lanes(&self, name: &str, c: u32, what: &str, ok: impl Fn(AV<N>) -> bool) {
         for lane in 0..self.width {
             let v = self.cols[c as usize].at(lane);
             assert!(ok(v), "widening {name:?}: lane {lane} holds {v:?}, {what}");
@@ -760,22 +782,23 @@ impl Rt2 {
     /// One slot's stored value written into cell `c` (`around`: a band's
     /// centre cell; `same`: a `SameAs`'s cell, before it was widened).
     fn widen_cell(&mut self, name: &str, s: &Slot, c: u32, around: Option<u32>, same: Option<u32>) {
-        let inside = |lo: P8, hi: P8| move |v: AV| span(v).is_some_and(|(a, b)| lo <= a && b <= hi);
-        let numeric = |v: AV| span(v).is_some();
+        let le = <N::A as Arithmetic>::le;
+        let inside = |lo: N, hi: N| move |v: AV<N>| span(v).is_some_and(|(a, b)| le(lo, a) && le(b, hi));
+        let numeric = |v: AV<N>| span(v).is_some();
         let new = match s.stored {
             Stored::Range { lo, hi, .. } => {
-                let (lo, hi) = (P8::from_raw(lo), P8::from_raw(hi));
+                let (lo, hi) = range::<N>(lo, hi);
                 self.check_lanes(name, c, "outside the widening", inside(lo, hi));
                 Col::U(AV::Ival(lo, hi))
             }
             Stored::Band { radius, .. } => {
                 let centre = around.expect("a band's centre");
-                let r = P8::from_raw(radius);
-                let band: Vec<(P8, P8)> = (0..self.width)
+                let r = constant::<N>(radius);
+                let band: Vec<(N, N)> = (0..self.width)
                     .map(|lane| match self.cols[centre as usize].at(lane) {
-                        AV::Num(s) => match (s.checked_sub(r), s.checked_add(r)) {
+                        AV::Num(s) => match (<N::A as Arithmetic>::sub(s, r), <N::A as Arithmetic>::add(s, r)) {
                             (Some(lo), Some(hi)) => (lo, hi),
-                            _ => panic!("widening {name:?}: lane {lane}'s band {s:?} +- {r:?} leaves the 16.16 range"),
+                            _ => panic!("widening {name:?}: lane {lane}'s band {s:?} +- {r:?} leaves the arithmetic's range"),
                         },
                         other => panic!("widening {name:?}: the band's centre is {other:?}"),
                     })
@@ -788,18 +811,20 @@ impl Rt2 {
             }
             Stored::Phase { lo, hi } => {
                 self.check_lanes(name, c, "not a number", numeric);
-                Col::U(AV::Ival(P8::from_raw(lo), P8::from_raw(hi)))
+                Col::U(AV::Ival(constant(lo), constant(hi)))
             }
             Stored::AtLeast(k) => {
-                let k = P8::from_raw(k);
-                let at_least = |v: AV| match v {
-                    AV::Num(n) => AV::Num(n.max(k)),
-                    AV::Ival(a, b) => AV::Ival(a.max(k), b.max(k)),
+                let k = constant::<N>(k);
+                // `max(v, k)`: v unless it is below k (the cart's max).
+                let max = |n: N| if <N::A as Arithmetic>::lt(n, k) { k } else { n };
+                let at_least = |v: AV<N>| match v {
+                    AV::Num(n) => AV::Num(max(n)),
+                    AV::Ival(a, b) => AV::Ival(max(a), max(b)),
                     other => panic!("widening {name:?}: {other:?} is not a number"),
                 };
                 match &self.cols[c as usize] {
                     Col::U(v) => Col::U(at_least(*v)),
-                    Col::N(vs) => Col::N(vs.iter().map(|n| (*n).max(k)).collect()),
+                    Col::N(vs) => Col::N(vs.iter().map(|n| max(*n)).collect()),
                     col => collapse_uniform(crate::runtime2::compress_num_v((0..self.width).map(|l| at_least(col.at(l))).collect())),
                 }
             }
@@ -813,7 +838,7 @@ impl Rt2 {
             }
             Stored::Num(k) => {
                 self.check_lanes(name, c, "not a number", numeric);
-                Col::U(AV::Num(P8::from_raw(k)))
+                Col::U(AV::Num(constant(k)))
             }
             Stored::Bool(b) => {
                 self.check_lanes(name, c, "not a boolean", |v| matches!(v, AV::Bool(_) | AV::UBool));
@@ -823,9 +848,10 @@ impl Rt2 {
                 if (0..self.width).all(|lane| matches!(self.cols[c as usize].at(lane), AV::Num(_))) {
                     return;
                 }
-                let full = |v: AV| matches!(v, AV::Ival(lo, hi) if hi.as_raw_u32() as i32 as i64 - lo.as_raw_u32() as i32 as i64 >= p as i64);
+                let width = constant::<N>(p);
+                let full = |v: AV<N>| matches!(v, AV::Ival(lo, hi) if <N::A as Arithmetic>::sub(hi, lo).is_some_and(|w| le(width, w)));
                 self.check_lanes(name, c, "not a full period", full);
-                Col::U(AV::Ival(P8::from_raw(0), P8::from_raw(p)))
+                Col::U(AV::Ival(constant(0), width))
             }
             // Checked equal before the entry (`widen_to`); the twin's slot
             // comes first in its entry, so it is widened already.
@@ -842,8 +868,9 @@ impl Rt2 {
     /// concrete row holds). `state` is an interval column, as the kernels
     /// store it.
     fn widen_near_floors(&mut self, ids: &BoundaryIds, r: &Resolved) {
-        let (slo, shi) = (P8::from_raw(FLOOR_STATE_RANGE.0), P8::from_raw(FLOOR_STATE_RANGE.1));
-        let span_of = |v: AV, what: &str| span(v).unwrap_or_else(|| panic!("near floor widening: {what} is {v:?}"));
+        let le = <N::A as Arithmetic>::le;
+        let (slo, shi) = range::<N>(FLOOR_STATE_RANGE.0, FLOOR_STATE_RANGE.1);
+        let span_of = |v: AV<N>, what: &str| span(v).unwrap_or_else(|| panic!("near floor widening: {what} is {v:?}"));
         let players: Vec<(u32, u32)> = self
             .player_objects(ids)
             .into_iter()
@@ -860,7 +887,7 @@ impl Rt2 {
                 col.and_then(|c| c.uniform_num(self.width)).unwrap_or_else(|| panic!("near floor widening: a fall floor's position is {col:?}, not one number"))
             };
             let (fx, fy) = (at(ids.f_x), at(ids.f_y));
-            let window = floor_player_window((fx, fy)).unwrap_or_else(|| panic!("near floor widening: a fall floor at ({fx:?}, {fy:?}): its window leaves the 16.16 range"));
+            let window = floor_player_window((fx, fy)).unwrap_or_else(|| panic!("near floor widening: a fall floor at ({fx:?}, {fy:?}): its window leaves the arithmetic's range"));
             let overlap: Vec<bool> = (0..self.width)
                 .map(|lane| {
                     players.iter().any(|&(cx, cy)| {
@@ -870,18 +897,18 @@ impl Rt2 {
                 .collect();
             let field = |k: usize| self.slot_cell(Some(obj), &r.fields[k]).unwrap_or_else(|| panic!("near floor widening: the fall floor has no `{:?}`", r.fields[k]));
             let (cs, cc) = (field(0), field(1));
-            let state: Vec<(P8, P8)> = (0..self.width)
+            let state: Vec<(N, N)> = (0..self.width)
                 .map(|lane| {
                     let (a, b) = span_of(self.cols[cs as usize].at(lane), "a fall floor's `state`");
                     if overlap[lane] {
                         (a, b)
                     } else {
-                        assert!(slo <= a && b <= shi, "near floor widening: lane {lane} of `state` is [{a:?}, {b:?}], which the widening does not contain");
+                        assert!(le(slo, a) && le(b, shi), "near floor widening: lane {lane} of `state` is [{a:?}, {b:?}], which the widening does not contain");
                         (slo, shi)
                     }
                 })
                 .collect();
-            let coll: Vec<AV> = (0..self.width)
+            let coll: Vec<AV<N>> = (0..self.width)
                 .map(|lane| {
                     let v = self.cols[cc as usize].at(lane);
                     assert!(matches!(v, AV::Bool(_) | AV::UBool), "near floor widening: lane {lane} of `collideable` is {v:?}");
@@ -901,6 +928,7 @@ impl Rt2 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::runtime2::P8;
 
     #[test]
     fn levels_parse_and_print() {

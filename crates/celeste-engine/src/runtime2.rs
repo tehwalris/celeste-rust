@@ -6,6 +6,7 @@
 
 use std::sync::Arc;
 
+use celeste_core::arith::EngineNum;
 use celeste_core::cart_data::CartData;
 use celeste_core::collision_cache::CollisionCache;
 use celeste_core::pico8_num::Pico8Num;
@@ -31,12 +32,13 @@ const MIX_C2: u64 = 0x94d0_49bb_1331_11eb;
 /// (`exact::Code::pos`).
 pub const POS_WHOLE: u32 = 0xffff_0000;
 
-/// One lane's abstract value. `Copy`, 12 bytes + tag.
+/// One lane's abstract value, its numbers of type `N` (the arithmetic's:
+/// 16.16 by default). `Copy`, 12 bytes + tag in 16.16.
 #[derive(Clone, Copy, PartialEq, Debug, Serialize, Deserialize)]
-pub enum AV {
-    Num(P8),
+pub enum AV<N = P8> {
+    Num(N),
     /// Closed interval [low, high].
-    Ival(P8, P8),
+    Ival(N, N),
     Bool(bool),
     UBool,
     /// An UNKNOWN number (a fully widened field); no kernel reads it.
@@ -50,19 +52,19 @@ pub enum AV {
 /// A column: one value per lane, or one value for every lane (`U`, which
 /// costs nothing per lane).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub enum Col {
-    U(AV),
-    V(Vec<AV>),
+pub enum Col<N = P8> {
+    U(AV<N>),
+    V(Vec<AV<N>>),
     /// An all-Num column stored raw: 4 B/lane, branchless op loops.
-    N(Vec<P8>),
+    N(Vec<N>),
     /// An all-interval column stored raw: (low, high) pairs, 8 B/lane.
-    I(Vec<(P8, P8)>),
+    I(Vec<(N, N)>),
 }
 
-impl Col {
+impl<N: Copy + PartialEq> Col<N> {
     /// The lane's value, independent of the column's representation.
     #[inline]
-    pub fn at(&self, lane: usize) -> AV {
+    pub fn at(&self, lane: usize) -> AV<N> {
         match self {
             Col::U(a) => *a,
             Col::V(v) => v[lane],
@@ -72,7 +74,7 @@ impl Col {
     }
 
     /// The one number every lane of a `width`-lane column holds, if any.
-    pub fn uniform_num(&self, width: usize) -> Option<P8> {
+    pub fn uniform_num(&self, width: usize) -> Option<N> {
         let AV::Num(n) = self.at(0) else { return None };
         (0..width).all(|lane| self.at(lane) == AV::Num(n)).then_some(n)
     }
@@ -81,12 +83,12 @@ impl Col {
 /// Shared heap structure; a `Val` cell's contents are `Rt2::cols` at the same
 /// index, other kinds are uniform. Closure captures are value snapshots.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub enum Cell2 {
+pub enum Cell2<N = P8> {
     Val,
     Obj(Vec<(u32, u32)>),
     Arr(Vec<u32>),
     Unk,
-    Clo(u32, Box<[Col]>),
+    Clo(u32, Box<[Col<N>]>),
     Bi(u32),
 }
 
@@ -125,11 +127,11 @@ pub struct BoundaryIds {
     pub f_start: u32,
 }
 
-pub struct Rt2 {
+pub struct Rt2<N = P8> {
     pub width: usize,
-    pub structure: Vec<Cell2>,
+    pub structure: Vec<Cell2<N>>,
     /// Per-cell value columns, parallel to `structure` (for `Cell2::Val`).
-    pub cols: Vec<Col>,
+    pub cols: Vec<Col<N>>,
     pub globals: Vec<u32>,
     pub strings: Vec<String>,
     pub cart: Arc<CartData>,
@@ -144,7 +146,7 @@ pub struct Rt2 {
 
 pub const NONE: u32 = u32::MAX;
 
-pub fn col_push(col: &mut Col, width: usize, v: AV) {
+pub fn col_push<N: Copy + PartialEq>(col: &mut Col<N>, width: usize, v: AV<N>) {
     match col {
         Col::U(a) if *a == v => {} // still uniform
         Col::U(a) => {
@@ -170,7 +172,7 @@ pub fn col_push(col: &mut Col, width: usize, v: AV) {
         Col::N(vs) => match v {
             AV::Num(n) => vs.push(n),
             other => {
-                let mut nv: Vec<AV> = vs.iter().map(|n| AV::Num(*n)).collect();
+                let mut nv: Vec<AV<N>> = vs.iter().map(|n| AV::Num(*n)).collect();
                 nv.push(other);
                 *col = Col::V(nv);
             }
@@ -178,7 +180,7 @@ pub fn col_push(col: &mut Col, width: usize, v: AV) {
         Col::I(vs) => match v {
             AV::Ival(a, b) => vs.push((a, b)),
             other => {
-                let mut nv: Vec<AV> = vs.iter().map(|(a, b)| AV::Ival(*a, *b)).collect();
+                let mut nv: Vec<AV<N>> = vs.iter().map(|(a, b)| AV::Ival(*a, *b)).collect();
                 nv.push(other);
                 *col = Col::V(nv);
             }
@@ -188,7 +190,7 @@ pub fn col_push(col: &mut Col, width: usize, v: AV) {
 }
 
 /// V -> N / I when every lane is a number / interval.
-pub(crate) fn compress_num_v(vs: Vec<AV>) -> Col {
+pub(crate) fn compress_num_v<N: Copy>(vs: Vec<AV<N>>) -> Col<N> {
     if vs.iter().all(|v| matches!(v, AV::Num(_))) {
         Col::N(
             vs.iter()
@@ -212,7 +214,7 @@ pub(crate) fn compress_num_v(vs: Vec<AV>) -> Col {
     }
 }
 
-fn compress_num(c: Col) -> Col {
+fn compress_num<N: Copy>(c: Col<N>) -> Col<N> {
     match c {
         Col::V(vs) => compress_num_v(vs),
         other => other,
@@ -221,7 +223,7 @@ fn compress_num(c: Col) -> Col {
 
 /// A column whose lanes all agree becomes `Col::U`. Kernel binding requires
 /// `Col::U` for uniform inputs, so every producer must apply it.
-pub fn collapse_uniform(c: Col) -> Col {
+pub fn collapse_uniform<N: Copy + PartialEq>(c: Col<N>) -> Col<N> {
     let all_same = match &c {
         Col::U(_) => return c,
         Col::N(vs) => vs.first().map_or(false, |f| vs.iter().all(|x| x == f)),
@@ -239,7 +241,7 @@ pub fn collapse_uniform(c: Col) -> Col {
     }
 }
 
-impl Rt2 {
+impl<N: EngineNum> Rt2<N> {
     /// An empty block shell.
     pub fn empty(
         width: usize,
@@ -247,7 +249,7 @@ impl Rt2 {
         static_strings: &[&str],
         cart: Arc<CartData>,
         cache: Arc<CollisionCache>,
-    ) -> Rt2 {
+    ) -> Rt2<N> {
         Rt2 {
             width,
             structure: Vec::new(),
@@ -267,7 +269,7 @@ impl Rt2 {
 }
 
 
-impl Rt2 {
+impl<N: EngineNum> Rt2<N> {
     /// The cell a table-valued global points at, if any.
     pub fn global_target(&self, g: u32) -> Option<u32> {
         let cell = self.globals[g as usize];
@@ -487,13 +489,13 @@ impl Rt2 {
         }
 
         // Compact over the live cells, remapping every pointer.
-        let remap_av = |v: AV, new_id: &[u32]| -> AV {
+        let remap_av = |v: AV<N>, new_id: &[u32]| -> AV<N> {
             match v {
                 AV::Ptr(t) => AV::Ptr(new_id[t as usize]),
                 other => other,
             }
         };
-        let remap_col = |c: &Col, new_id: &[u32]| -> Col {
+        let remap_col = |c: &Col<N>, new_id: &[u32]| -> Col<N> {
             match c {
                 Col::U(v) => Col::U(remap_av(*v, new_id)),
                 Col::V(vs) => Col::V(vs.iter().map(|v| remap_av(*v, new_id)).collect()),
@@ -501,8 +503,8 @@ impl Rt2 {
                 Col::I(vs) => Col::I(vs.clone()),
             }
         };
-        let mut new_structure: Vec<Cell2> = Vec::with_capacity(order.len());
-        let mut new_cols: Vec<Col> = Vec::with_capacity(order.len());
+        let mut new_structure: Vec<Cell2<N>> = Vec::with_capacity(order.len());
+        let mut new_cols: Vec<Col<N>> = Vec::with_capacity(order.len());
         for &old in &order {
             let cell = match &self.structure[old as usize] {
                 Cell2::Val => Cell2::Val,
@@ -537,14 +539,6 @@ impl Rt2 {
     }
 
 
-    /// The BOUNDARY: level-0 widenings, canonical renumbering (the GC) and
-    /// the shape hash, lanes kept.
-    pub fn boundary_canonicalize(&mut self, ids: &BoundaryIds) {
-        self.boundary_prepare();
-        self.boundary_widen(ids);
-        self.boundary_finish();
-    }
-
     /// The block as it is, CANONICAL (ids, shape hash; no widening): what a
     /// key space keys (`exact::KeySpace::row_keys`, `exact::exact_rows`).
     pub fn canonical(&mut self) {
@@ -554,7 +548,7 @@ impl Rt2 {
 
     /// Shared boundary head: check every column is at block width.
     fn boundary_prepare(&mut self) {
-        let full = |c: &Col| match c {
+        let full = |c: &Col<N>| match c {
             Col::U(_) => true,
             Col::V(v) => v.len() == self.width,
             Col::N(v) => v.len() == self.width,
@@ -568,11 +562,6 @@ impl Rt2 {
             }),
             "boundary: a closure capture is not at block width"
         );
-    }
-
-    /// The boundary's widenings: `widen_to` with every level flag off.
-    fn boundary_widen(&mut self, ids: &BoundaryIds) {
-        self.widen_to(ids, crate::widening::Level::EXACT);
     }
 
     /// Shared boundary tail: canonical ids and the shape hash. Row keys are
@@ -594,18 +583,18 @@ impl Rt2 {
 
     /// Gather `keep`'s lanes in `keep`'s order (reorder and/or filter).
     pub fn gather_lanes(&mut self, keep: &[u32]) {
-        let retain_col = |col: &mut Col| match col {
+        let retain_col = |col: &mut Col<N>| match col {
             Col::U(_) => {}
             Col::V(vs) => {
-                let nv: Vec<AV> = keep.iter().map(|&i| vs[i as usize]).collect();
+                let nv: Vec<AV<N>> = keep.iter().map(|&i| vs[i as usize]).collect();
                 *col = Col::V(nv);
             }
             Col::N(vs) => {
-                let nv: Vec<P8> = keep.iter().map(|&i| vs[i as usize]).collect();
+                let nv: Vec<N> = keep.iter().map(|&i| vs[i as usize]).collect();
                 *col = Col::N(nv);
             }
             Col::I(vs) => {
-                let nv: Vec<(P8, P8)> = keep.iter().map(|&i| vs[i as usize]).collect();
+                let nv: Vec<(N, N)> = keep.iter().map(|&i| vs[i as usize]).collect();
                 *col = Col::I(nv);
             }
         };
@@ -626,7 +615,7 @@ impl Rt2 {
     }
 
     /// A clone that shares the immutable context (cart/cache Arcs).
-    pub fn clone_block(&self) -> Rt2 {
+    pub fn clone_block(&self) -> Rt2<N> {
         Rt2 {
             width: self.width,
             structure: self.structure.clone(),
@@ -643,3 +632,12 @@ impl Rt2 {
 
 }
 
+impl<N: EngineNum> Rt2<N> {
+    /// The BOUNDARY: level-0 widenings, canonical renumbering (the GC) and
+    /// the shape hash, lanes kept.
+    pub fn boundary_canonicalize(&mut self, ids: &BoundaryIds) {
+        self.boundary_prepare();
+        self.widen_to(ids, crate::widening::Level::EXACT);
+        self.boundary_finish();
+    }
+}

@@ -1414,7 +1414,7 @@ impl Seeds {
                 wins.extend(file.wins()?.into_iter().map(|w| (w, f)));
             }
         }
-        let store = EdgeStore::open(&dir.join("edges"), horizon)?;
+        let store = EdgeStore::<crate::pico8_num::Pico8Num>::open(&dir.join("edges"), horizon)?;
         for f in 1..=horizon {
             let rows = tree.states(f);
             anyhow::ensure!(rows == 0 || store.has_frame(f), "{}: no edges for f{f}, which kept {rows} states", dir.display());
@@ -2144,7 +2144,7 @@ mod tests {
 
         /// The store up to `horizon`, its transfers, and its win seeds.
         fn open(&self, horizon: u32) -> (EdgeStore, Vec<(Transfer, Transfer)>, Vec<(Sk, u32)>) {
-            let store = EdgeStore::open(&self.dir, horizon).expect("open");
+            let store = EdgeStore::<celeste_core::pico8_num::Pico8Num>::open(&self.dir, horizon).expect("open");
             let pairs = store.pairs().iter().map(|p| (p.0.transfer(), p.1.transfer())).collect();
             let wins = self.wins.iter().map(|&k| (sid(k), self.layers[k as usize])).collect();
             (store, pairs, wins)

@@ -22,24 +22,31 @@ use std::path::{Path, PathBuf};
 
 use super::bundle::{self, Bundle};
 use super::{Geometry, Sk, GEOMETRY};
-use crate::search::arc_edges::{decode_pair, encode_pair, Pair, PAIR_BYTES};
+use crate::search::rem::Rem;
+use celeste_core::pico8_num::Pico8Num as P8;
 
 /// The global transfer table: every distinct pair the tree's edges carry,
 /// a pair's id its position. `edges/xfer.bin` (`encode_pair` each), its
 /// trusted length in the done marker (`done.txt`: pairs past it are a
 /// killed wave's).
-#[derive(Default, Clone)]
-pub struct XferTable {
-    pub pairs: Vec<Pair>,
+#[derive(Clone)]
+pub struct XferTable<N: Rem = P8> {
+    pub pairs: Vec<N::Pair>,
     index: PairIndex,
     /// Pairs written to `xfer.bin` (`flush`).
     flushed: usize,
 }
 
-impl XferTable {
+impl<N: Rem> Default for XferTable<N> {
+    fn default() -> Self {
+        XferTable { pairs: Vec::new(), index: PairIndex::default(), flushed: 0 }
+    }
+}
+
+impl<N: Rem> XferTable<N> {
     /// Bytes held: the pairs, the index.
     pub fn bytes(&self) -> [usize; 2] {
-        [self.pairs.capacity() * std::mem::size_of::<Pair>(), self.index.slots.capacity() * 4]
+        [self.pairs.capacity() * std::mem::size_of::<N::Pair>(), self.index.slots.capacity() * 4]
     }
 }
 
@@ -54,21 +61,14 @@ struct PairIndex {
 }
 
 impl PairIndex {
-    #[inline]
-    fn hash(p: &Pair) -> u64 {
-        use celeste_engine::runtime2::mix64;
-        let w = |a: &crate::search::arc_edges::AxisXfer| mix64((a.lo as u64) << 32 | a.hi as u64) ^ ((a.val as u32 as u64) << 8 | a.tag as u64);
-        mix64(w(&p.0) ^ w(&p.1).rotate_left(31))
-    }
-
     /// `p`'s id among `pairs`, if indexed.
     #[inline]
-    fn find(&self, pairs: &[Pair], p: &Pair) -> Option<u32> {
+    fn find<N: Rem>(&self, pairs: &[N::Pair], p: &N::Pair) -> Option<u32> {
         if self.slots.is_empty() {
             return None;
         }
         let m = self.slots.len() - 1;
-        let mut i = Self::hash(p) as usize & m;
+        let mut i = N::pair_hash(p) as usize & m;
         loop {
             match self.slots[i] {
                 0 => return None,
@@ -79,22 +79,22 @@ impl PairIndex {
     }
 
     /// Pair `id` of `pairs` (absent) indexed.
-    fn insert(&mut self, pairs: &[Pair], id: u32) {
+    fn insert<N: Rem>(&mut self, pairs: &[N::Pair], id: u32) {
         if (self.n + 1) * 4 > self.slots.len() * 3 {
             let cap = ((self.n + 1) * 2).next_power_of_two().max(16);
             let old = std::mem::replace(&mut self.slots, vec![0; cap]);
             self.n = 0;
             for s in old.into_iter().filter(|&s| s != 0) {
-                self.place(pairs, s - 1);
+                self.place::<N>(pairs, s - 1);
             }
         }
-        self.place(pairs, id);
+        self.place::<N>(pairs, id);
     }
 
     #[inline]
-    fn place(&mut self, pairs: &[Pair], id: u32) {
+    fn place<N: Rem>(&mut self, pairs: &[N::Pair], id: u32) {
         let m = self.slots.len() - 1;
-        let mut i = Self::hash(&pairs[id as usize]) as usize & m;
+        let mut i = N::pair_hash(&pairs[id as usize]) as usize & m;
         while self.slots[i] != 0 {
             i = (i + 1) & m;
         }
@@ -105,11 +105,11 @@ impl PairIndex {
     /// The ids from `first` on renumbered (`perm`: per id less `first`,
     /// its new id less `first`; `pairs` as before): each one's slot found
     /// by its pair and set, the rest of the index as it is.
-    fn renumber(&mut self, pairs: &[Pair], first: usize, perm: &[u32]) {
+    fn renumber<N: Rem>(&mut self, pairs: &[N::Pair], first: usize, perm: &[u32]) {
         let m = self.slots.len() - 1;
         let at: Vec<usize> = (first..pairs.len())
             .map(|id| {
-                let mut i = Self::hash(&pairs[id]) as usize & m;
+                let mut i = N::pair_hash(&pairs[id]) as usize & m;
                 while self.slots[i] != id as u32 + 1 {
                     i = (i + 1) & m;
                 }
@@ -126,46 +126,46 @@ fn xfer_path(dir: &Path) -> PathBuf {
     dir.join("xfer.bin")
 }
 
-impl XferTable {
+impl<N: Rem> XferTable<N> {
     /// The tree's table (`dir` = `<level>/edges`) as its done marker trusts
     /// it; empty without one.
     pub fn load(dir: &Path) -> Result<Self> {
         let pairs = Self::load_pairs(dir)?;
         let mut index = PairIndex::default();
         for id in 0..pairs.len() as u32 {
-            index.insert(&pairs, id);
+            index.insert::<N>(&pairs, id);
         }
         Ok(XferTable { flushed: pairs.len(), pairs, index })
     }
 
     /// The table's pairs alone, as `load` reads them (the readers need no
     /// index: a big room at h155 has 4.0M pairs).
-    pub fn load_pairs(dir: &Path) -> Result<Vec<Pair>> {
+    pub fn load_pairs(dir: &Path) -> Result<Vec<N::Pair>> {
         let n = match read_done(dir)? {
             Some(d) => d.xfers,
             None => 0,
         };
         let b = if n > 0 { std::fs::read(xfer_path(dir)).with_context(|| xfer_path(dir).display().to_string())? } else { Vec::new() };
-        ensure!(b.len() >= n * PAIR_BYTES, "{}: {} pairs, {} trusted", xfer_path(dir).display(), b.len() / PAIR_BYTES, n);
-        Ok(b[..n * PAIR_BYTES].chunks_exact(PAIR_BYTES).map(decode_pair).collect())
+        ensure!(b.len() >= n * N::PAIR_BYTES, "{}: {} pairs, {} trusted", xfer_path(dir).display(), b.len() / N::PAIR_BYTES, n);
+        Ok(b[..n * N::PAIR_BYTES].chunks_exact(N::PAIR_BYTES).map(N::decode_pair).collect())
     }
 
     /// `p`'s id, if the table holds it.
     #[inline]
-    pub fn find(&self, p: &Pair) -> Option<u32> {
-        self.index.find(&self.pairs, p)
+    pub fn find(&self, p: &N::Pair) -> Option<u32> {
+        self.index.find::<N>(&self.pairs, p)
     }
 
     /// A wave's new pairs (`fresh`: a table of them alone, its ids less
     /// this one's length) appended, in their order.
-    pub fn append(&mut self, fresh: XferTable) {
+    pub fn append(&mut self, fresh: XferTable<N>) {
         if self.pairs.len() + fresh.pairs.len() > self.pairs.capacity() {
             self.pairs.reserve_exact(fresh.pairs.len().max(self.pairs.len() / 8));
         }
         for p in fresh.pairs {
             debug_assert!(self.find(&p).is_none(), "a fresh pair the table holds");
             self.pairs.push(p);
-            self.index.insert(&self.pairs, self.pairs.len() as u32 - 1);
+            self.index.insert::<N>(&self.pairs, self.pairs.len() as u32 - 1);
         }
     }
 
@@ -173,8 +173,8 @@ impl XferTable {
     /// since its last merge) into the table: the ones it lacks appended (in
     /// value order); per tail its pairs' global ids. A wave merges per
     /// slice, so these ids are PROVISIONAL until its end (`canonical`).
-    pub fn merge(&mut self, tails: &[&[Pair]]) -> Vec<Vec<u32>> {
-        let mut new: Vec<Pair> = tails.iter().flat_map(|t| t.iter()).filter(|p| self.index.find(&self.pairs, p).is_none()).copied().collect();
+    pub fn merge(&mut self, tails: &[&[N::Pair]]) -> Vec<Vec<u32>> {
+        let mut new: Vec<N::Pair> = tails.iter().flat_map(|t| t.iter()).filter(|p| self.index.find::<N>(&self.pairs, p).is_none()).copied().collect();
         new.sort_unstable();
         new.dedup();
         // Room by an eighth at least (doubling held up to a whole table's
@@ -184,9 +184,9 @@ impl XferTable {
         }
         for p in new {
             self.pairs.push(p);
-            self.index.insert(&self.pairs, self.pairs.len() as u32 - 1);
+            self.index.insert::<N>(&self.pairs, self.pairs.len() as u32 - 1);
         }
-        tails.iter().map(|t| t.iter().map(|p| self.index.find(&self.pairs, p).expect("a merged pair")).collect()).collect()
+        tails.iter().map(|t| t.iter().map(|p| self.index.find::<N>(&self.pairs, p).expect("a merged pair")).collect()).collect()
     }
 
     /// The pairs from `first` on (a wave's: merged slice by slice, in the
@@ -209,8 +209,8 @@ impl XferTable {
         for (to, &from) in order.iter().enumerate() {
             perm[from as usize] = to as u32;
         }
-        let sorted: Vec<Pair> = order.iter().map(|&i| new[i as usize]).collect();
-        self.index.renumber(&self.pairs, first, &perm);
+        let sorted: Vec<N::Pair> = order.iter().map(|&i| new[i as usize]).collect();
+        self.index.renumber::<N>(&self.pairs, first, &perm);
         self.pairs.truncate(first);
         self.pairs.extend(sorted);
         Some(perm)
@@ -226,18 +226,19 @@ impl XferTable {
     /// written), and their write (`Flush::write`, on any thread).
     pub fn take_flush(&mut self) -> Flush {
         let first = self.flushed;
-        let mut buf = Vec::with_capacity((self.pairs.len() - first) * PAIR_BYTES);
+        let mut buf = Vec::with_capacity((self.pairs.len() - first) * N::PAIR_BYTES);
         for p in &self.pairs[first..] {
-            encode_pair(&mut buf, p);
+            N::encode_pair(&mut buf, p);
         }
         self.flushed = self.pairs.len();
-        Flush { first, buf }
+        Flush { first, pair_bytes: N::PAIR_BYTES, buf }
     }
 }
 
 /// A transfer table's pairs to append (`XferTable::take_flush`).
 pub struct Flush {
     first: usize,
+    pair_bytes: usize,
     buf: Vec<u8>,
 }
 
@@ -248,8 +249,8 @@ impl Flush {
         if !self.buf.is_empty() {
             std::fs::create_dir_all(dir)?;
             let mut f = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(xfer_path(dir))?;
-            f.set_len((self.first * PAIR_BYTES) as u64)?;
-            f.seek(std::io::SeekFrom::Start((self.first * PAIR_BYTES) as u64))?;
+            f.set_len((self.first * self.pair_bytes) as u64)?;
+            f.seek(std::io::SeekFrom::Start((self.first * self.pair_bytes) as u64))?;
             f.write_all(&self.buf)?;
             f.sync_data()?;
         }
@@ -474,14 +475,14 @@ impl Decoder {
 
 /// A level's recorded graph up to a horizon, mapped: per frame its edge
 /// file (none past a dead frontier), and the global transfer table.
-pub struct EdgeStore {
+pub struct EdgeStore<N: Rem = P8> {
     frames: Vec<Option<EdgeFile>>,
-    xfers: Vec<Pair>,
+    xfers: Vec<N::Pair>,
     pub edges: u64,
     pub bytes: u64,
 }
 
-impl EdgeStore {
+impl<N: Rem> EdgeStore<N> {
     /// Map frames `1..=horizon`'s edge files under `dir` (`<level>/edges`).
     pub fn open(dir: &Path, horizon: u32) -> Result<Self> {
         let mut frames: Vec<Option<EdgeFile>> = vec![None];
@@ -495,7 +496,7 @@ impl EdgeStore {
             }
             frames.push(file);
         }
-        let xfers = XferTable::load_pairs(dir)?;
+        let xfers = XferTable::<N>::load_pairs(dir)?;
         Ok(EdgeStore { frames, xfers, edges, bytes })
     }
 
@@ -505,12 +506,12 @@ impl EdgeStore {
     }
 
     /// The transfer of global id `xfer`.
-    pub fn pair(&self, xfer: u32) -> Option<Pair> {
+    pub fn pair(&self, xfer: u32) -> Option<N::Pair> {
         self.xfers.get(xfer as usize).copied()
     }
 
     /// The whole transfer table.
-    pub fn pairs(&self) -> &[Pair] {
+    pub fn pairs(&self) -> &[N::Pair] {
         &self.xfers
     }
 
@@ -730,8 +731,8 @@ pub(crate) fn segments_of(edges: &[(Sk, Sk, u32)]) -> Result<(Vec<Segment>, Vec<
 /// frame and its transfer table `pairs`: the backward's tests write their
 /// graphs with it.
 #[cfg(test)]
-pub(crate) fn write_test_edges(dir: &Path, frames: &[(u32, Vec<(Sk, Sk, u32)>)], pairs: &[Pair]) -> Result<()> {
-    let mut xt = XferTable::default();
+pub(crate) fn write_test_edges(dir: &Path, frames: &[(u32, Vec<(Sk, Sk, u32)>)], pairs: &[crate::search::arc_edges::Pair]) -> Result<()> {
+    let mut xt = XferTable::<P8>::default();
     xt.merge(&[pairs]);
     xt.flush(dir)?;
     ensure!(xt.pairs.len() == pairs.len(), "the test's transfer pairs are not distinct");
@@ -747,6 +748,7 @@ pub(crate) fn write_test_edges(dir: &Path, frames: &[(u32, Vec<(Sk, Sk, u32)>)],
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::search::arc_edges::Pair;
 
     /// A wave's new transfers, merged slice by slice, get their CANONICAL
     /// ids - by their edges' count, then content: the permutation, the
@@ -758,7 +760,7 @@ mod tests {
             let ax = crate::search::arc_edges::AxisXfer { lo: 0, hi: 1 << 16, tag: 0, val: v };
             (ax, ax)
         };
-        let mut t = XferTable::default();
+        let mut t = XferTable::<P8>::default();
         t.merge(&[&[pair(5), pair(1)]]);
         assert_eq!(t.canonical(0, &[2, 2]), None, "one merge is in order");
         let first = t.pairs.len();
@@ -771,7 +773,7 @@ mod tests {
         let id = |x: u32| if (x as usize) < first { x } else { first as u32 + perm[x as usize - first] };
         for (p, x) in [pair(9), pair(7), pair(8), pair(3), pair(5)].iter().zip(ids_a.concat().into_iter().chain(ids_b.concat())) {
             assert_eq!(t.pairs[id(x) as usize], *p);
-            assert_eq!(t.index.find(&t.pairs, p), Some(id(x)));
+            assert_eq!(t.index.find::<P8>(&t.pairs, p), Some(id(x)));
         }
         assert_eq!(t.canonical(first, &[5, 1, 1, 0]), None, "in order already");
     }
@@ -824,7 +826,7 @@ mod tests {
             })
             .collect();
         write_test_edges(&dir, &[(4, edges.clone())], &pairs).unwrap();
-        let store = EdgeStore::open(&dir, 4).unwrap();
+        let store = EdgeStore::<P8>::open(&dir, 4).unwrap();
         assert_eq!(store.edges, edges.len() as u64);
         let mut got = store.edges_at(4, 2).unwrap();
         got.sort_unstable();

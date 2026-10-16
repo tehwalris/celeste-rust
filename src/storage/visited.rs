@@ -14,7 +14,8 @@ use rustc_hash::FxHashMap;
 
 use super::set::{Block, Change, RegionSet, RegionTable, Upserted};
 use super::{region_of, Geometry};
-use crate::search::hull::Hull;
+use crate::search::rem::Rem;
+use celeste_core::pico8_num::Pico8Num as P8;
 
 pub use super::set::StateInfo;
 /// A state's EXACT packed key within its shape (`celeste_engine::exact`).
@@ -31,15 +32,15 @@ const RUN_BLOCKS: usize = 64;
 /// `storage::region_of`), the key space their keys are in (read-only during
 /// a wave).
 #[derive(Clone)]
-pub struct VisitedSet {
+pub struct VisitedSet<N: Rem = P8> {
     pub geo: Geometry,
-    pub keys: KeySpace,
+    pub keys: KeySpace<N>,
     shapes: Vec<u64>,
     shape_idx: FxHashMap<u64, u32>,
     set: RegionSet,
 }
 
-impl VisitedSet {
+impl<N: Rem> VisitedSet<N> {
     pub fn new(geo: Geometry) -> Self {
         VisitedSet { geo, keys: KeySpace::new(), shapes: Vec::new(), shape_idx: FxHashMap::default(), set: RegionSet::default() }
     }
@@ -93,7 +94,7 @@ impl VisitedSet {
 
     /// The layer and hull of state `(region, key, local)` (`None`: full,
     /// or no state; a reader's single lookup).
-    pub fn state(&self, region: u32, key: Key, local: u32) -> Option<StateInfo> {
+    pub fn state(&self, region: u32, key: Key, local: u32) -> Option<StateInfo<N>> {
         self.table(region)?.lookup_info(key, local)?.1
     }
 
@@ -102,7 +103,7 @@ impl VisitedSet {
     /// big region's runs of `RUN_BLOCKS` blocks apart, with the changes
     /// between their first keys; every run on `threads` threads, the
     /// biggest first.
-    pub fn upsert_all(&mut self, changes: Vec<(u32, Vec<Change>)>, threads: usize) -> Result<Upserted> {
+    pub fn upsert_all(&mut self, changes: Vec<(u32, Vec<Change<N>>)>, threads: usize) -> Result<Upserted> {
         let regions: Vec<u32> = changes.iter().map(|c| c.0).collect();
         let range = |i: usize, lo: Option<Key>, hi: Option<Key>| {
             let ch = &changes[i].1;
@@ -120,7 +121,7 @@ impl VisitedSet {
         regions: &[u32],
         threads: usize,
         count: impl Fn(usize, Option<Key>, Option<Key>) -> usize,
-        make: impl Fn(usize, Option<Key>, Option<Key>) -> Result<std::borrow::Cow<'c, [Change]>> + Sync,
+        make: impl Fn(usize, Option<Key>, Option<Key>) -> Result<std::borrow::Cow<'c, [Change<N>]>> + Sync,
     ) -> Result<Upserted> {
         // A run: its region's index in `regions`, its place among the
         // region's runs, its keys' range, its blocks.
@@ -186,7 +187,7 @@ impl VisitedSet {
     /// hulls. Returns what it did (`held_new`: the new states held
     /// already - 0, the frame's new states are new).
     #[allow(clippy::type_complexity)]
-    pub fn absorb(&mut self, parts: &[(u32, &RegionTable, &[Hull], &[super::wave::Old])], layer: u16, threads: usize) -> Result<Upserted> {
+    pub fn absorb(&mut self, parts: &[(u32, &RegionTable, &[N::Hull], &[super::wave::Old<N>])], layer: u16, threads: usize) -> Result<Upserted> {
         // Per region its new entries' first states (their hulls' places).
         let starts: Vec<Vec<u32>> = super::wave::par_map(parts, threads, |&(region, new, hulls, _)| -> Result<Vec<u32>> {
             let mut at = Vec::with_capacity(new.len() + 1);
@@ -218,10 +219,10 @@ impl VisitedSet {
                 let (e, g) = at(i, lo, hi);
                 (starts[i][e.end] - starts[i][e.start]) as usize + g.len()
             },
-            |i, lo, hi| -> Result<std::borrow::Cow<'_, [Change]>> {
+            |i, lo, hi| -> Result<std::borrow::Cow<'_, [Change<N>]>> {
                 let (region, new, hulls, grown) = parts[i];
                 let (e, g) = at(i, lo, hi);
-                let mut fresh: Vec<Change> = Vec::with_capacity((starts[i][e.end] - starts[i][e.start]) as usize);
+                let mut fresh: Vec<Change<N>> = Vec::with_capacity((starts[i][e.end] - starts[i][e.start]) as usize);
                 let mut h = hulls[starts[i][e.start] as usize..starts[i][e.end] as usize].iter();
                 for x in e {
                     let (key, mask) = (new.key(x as u32), new.mask(x as u32));
@@ -230,7 +231,7 @@ impl VisitedSet {
                         fresh.push(Change { key, cell: cell as u8, info: Some(StateInfo { hull, layer }), new: true });
                     }
                 }
-                let mut out: Vec<Change> = Vec::with_capacity(fresh.len() + g.len());
+                let mut out: Vec<Change<N>> = Vec::with_capacity(fresh.len() + g.len());
                 let mut g = grown[g].iter().map(|o| Change { key: o.sk.key, cell: o.sk.local, info: Some(StateInfo { hull: o.hull, layer: o.layer }), new: false }).peekable();
                 for c in fresh {
                     while g.peek().is_some_and(|x| (x.key, x.cell) < (c.key, c.cell)) {
@@ -275,7 +276,7 @@ impl VisitedSet {
         let (mut states, mut over, mut one_layer, mut entries) = (0u64, false, 0u64, 0u64);
         let mut layers = vec![0u64; 1 << 16];
         for (_, t) in self.set.tables() {
-            t.for_each_packed(|_, _, _, run| {
+            t.for_each_packed::<N>(|_, _, _, run| {
                 if run.is_empty() {
                     return;
                 }
@@ -285,8 +286,9 @@ impl VisitedSet {
                     states += 1;
                     layers[i.layer as usize] += 1;
                     // Mixed: FxHash leaves a word's high half out of the low
-                    // bits a table indexes by (the y arc).
-                    let w = celeste_engine::runtime2::mix64(i.hull.word());
+                    // bits a table indexes by (the y arc). (A float hull's
+                    // hash is not the hull: distinct counted by hash.)
+                    let w = celeste_engine::runtime2::mix64(N::hull_hash(&i.hull));
                     if by.len() < cap || by.contains_key(&w) {
                         *by.entry(w).or_default() += 1;
                     } else {

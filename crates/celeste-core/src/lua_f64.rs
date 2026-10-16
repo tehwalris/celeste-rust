@@ -49,6 +49,21 @@ impl Hash for LuaF64 {
     }
 }
 
+/// Stored as its bits (a block's skeleton, a frame file); a non-finite
+/// double is refused on reading.
+impl serde::Serialize for LuaF64 {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
+        s.serialize_u64(self.0.to_bits())
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for LuaF64 {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
+        let bits = <u64 as serde::Deserialize>::deserialize(d)?;
+        LuaF64::new(f64::from_bits(bits)).ok_or_else(|| serde::de::Error::custom(format!("{bits:#018x} is not a finite double")))
+    }
+}
+
 impl fmt::Debug for LuaF64 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "LuaF64({:?} = {:#018x})", self.0, self.0.to_bits())
