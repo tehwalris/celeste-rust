@@ -16,8 +16,8 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 /// What an assembly is built with: `trace` (`--build-trace`: the build's
-/// progress lines) and `mix` (`--kernel-mix` or `bench-frame --metrics`:
-/// instruction provenance kept, the assembly text kept for the report).
+/// progress lines) and `mix` (`bench-frame --metrics`: instruction
+/// provenance kept, the assembly text kept for the kernel census).
 #[derive(Clone, Copy, Debug, Default)]
 pub struct AsmOptions {
     pub trace: bool,

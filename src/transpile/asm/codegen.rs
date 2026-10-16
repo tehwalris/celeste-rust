@@ -297,13 +297,10 @@ pub struct Compiled {
     pub spill_slots: usize,
     /// The stack frame in bytes, for the caller's stack check.
     pub frame_bytes: u32,
-    /// `--kernel-mix` only (else empty): per SSA instruction `k`, the
+    /// `bench-frame --metrics` only (else empty): per SSA instruction `k`, the
     /// graph node it was lowered from (a root store: the root) and its kind;
     /// the text then marks each instruction's lines with a `#@k` line.
     pub prov: Vec<(NodeId, &'static str)>,
-    /// `--kernel-mix` only: per SSA instruction, whether plain bit
-    /// identities over the stream remove it (`foldable`).
-    pub foldable: Vec<bool>,
     /// The doubles' kernels: the body computes 8 lanes and runs TWICE per
     /// call, lanes 8..16 reading `input_bytes` and writing `out_bytes`
     /// past lanes 0..8 (so the buffers are twice those). A boolean is an
@@ -2450,7 +2447,6 @@ fn compile_with<A: GraphArith>(
     } else {
         Vec::new()
     };
-    let foldable = if mix { foldable(&lo.insts, lo.next_vreg) } else { Vec::new() };
     if opts.trace {
         eprintln!("[build]   {sym}: {} insts, {} vregs: lower {:.1}s, reschedule {:.1}s", lo.insts.len(), lo.next_vreg, t_lower.as_secs_f64(), t.elapsed().as_secs_f64());
     }
@@ -2584,166 +2580,8 @@ fn compile_with<A: GraphArith>(
         spill_slots,
         frame_bytes: frame,
         prov,
-        foldable,
         halves,
     })
-}
-
-/// A vreg's value as far as bit identities know it.
-#[derive(Clone, Copy, PartialEq)]
-enum Known {
-    Opaque,
-    /// The same i32 in every lane.
-    Const(i32),
-    /// Equal to another (opaque) vreg.
-    Alias(Vreg),
-}
-
-/// The instructions plain bit identities REMOVE (`--kernel-mix`'s
-/// estimate; nothing in the build uses it): constants folded through
-/// `x & -1 = x`, `x | -1 = -1`, `x | 0 = x`, `x & 0 = 0`, `c ? t : t = t`, a
-/// select or operation on constants, and so on; then every instruction no
-/// store needs (through the resolved operands) is removable. A constant a
-/// kept instruction still reads keeps its broadcast. Exact per lane: an
-/// identity holds for every input, so this drops no check.
-fn foldable(insts: &[Inst], n_vregs: Vreg) -> Vec<bool> {
-    let mut kn = vec![Known::Opaque; n_vregs as usize];
-    let res = |kn: &[Known], v: Vreg| -> Known {
-        match kn[v as usize] {
-            Known::Opaque => Known::Alias(v),
-            k => k,
-        }
-    };
-    let src = |kn: &[Known], s: &Src| -> Known {
-        match s {
-            Src::Reg(v) => res(kn, *v),
-            Src::BI32(c) => Known::Const(*c),
-            // Only the doubles' instructions read one, and they are opaque here.
-            Src::BQ(_) => Known::Opaque,
-        }
-    };
-    for inst in insts {
-        let (dst, k) = match inst {
-            Inst::BcastD { dst, val } => (*dst, Known::Const(*val)),
-            Inst::RBin { dst, op, a, b } => {
-                let (x, y) = (res(&kn, *a), src(&kn, b));
-                let k = match (op, x, y) {
-                    (_, Known::Const(p), Known::Const(q)) => Known::Const(match op {
-                        ROp::AddD => p.wrapping_add(q),
-                        ROp::SubD => p.wrapping_sub(q),
-                        ROp::MinSD => p.min(q),
-                        ROp::MaxSD => p.max(q),
-                        ROp::AndD => p & q,
-                        ROp::OrD => p | q,
-                        ROp::XorD => p ^ q,
-                        ROp::AndnD => !p & q,
-                    }),
-                    (ROp::AndD, z, Known::Const(-1)) | (ROp::AndD, Known::Const(-1), z) => z,
-                    (ROp::AndD, _, Known::Const(0)) | (ROp::AndD, Known::Const(0), _) => Known::Const(0),
-                    (ROp::OrD, _, Known::Const(-1)) | (ROp::OrD, Known::Const(-1), _) => Known::Const(-1),
-                    (ROp::OrD, z, Known::Const(0)) | (ROp::OrD, Known::Const(0), z) => z,
-                    (ROp::AndD | ROp::OrD | ROp::MinSD | ROp::MaxSD, p, q) if p == q => p,
-                    (ROp::XorD, z, Known::Const(0)) | (ROp::XorD, Known::Const(0), z) => z,
-                    (ROp::XorD | ROp::SubD, p, q) if p == q => Known::Const(0),
-                    (ROp::AndnD, Known::Const(-1), _) | (ROp::AndnD, _, Known::Const(0)) => Known::Const(0),
-                    (ROp::AndnD, Known::Const(0), z) => z,
-                    (ROp::AndnD, p, q) if p == q => Known::Const(0),
-                    (ROp::AddD | ROp::SubD, z, Known::Const(0)) => z,
-                    (ROp::AddD, Known::Const(0), z) => z,
-                    _ => Known::Opaque,
-                };
-                (*dst, k)
-            }
-            Inst::Cmp { dst, imm, a, b } => {
-                let k = match (res(&kn, *a), src(&kn, b)) {
-                    (Known::Const(p), Known::Const(q)) => {
-                        let t = match imm {
-                            0 => p == q,
-                            1 => p < q,
-                            2 => p <= q,
-                            4 => p != q,
-                            5 => p >= q,
-                            6 => p > q,
-                            _ => return vec![false; insts.len()],
-                        };
-                        Known::Const(if t { -1 } else { 0 })
-                    }
-                    (p, q) if p == q => match imm {
-                        0 | 2 | 5 => Known::Const(-1),
-                        _ => Known::Const(0),
-                    },
-                    _ => Known::Opaque,
-                };
-                (*dst, k)
-            }
-            Inst::Ternlog { dst, a, b, c, imm } => {
-                let (x, y, z) = (res(&kn, *a), res(&kn, *b), res(&kn, *c));
-                let k = match (x, y, z) {
-                    (Known::Const(p), Known::Const(q), Known::Const(r)) => {
-                        let mut out = 0i32;
-                        for bit in 0..32 {
-                            let i = ((p >> bit) & 1) << 2 | ((q >> bit) & 1) << 1 | ((r >> bit) & 1);
-                            out |= ((*imm as i32 >> i) & 1) << bit;
-                        }
-                        Known::Const(out)
-                    }
-                    _ if *imm == 0xca && y == z => y,
-                    (Known::Const(-1), _, _) if *imm == 0xca => y,
-                    (Known::Const(0), _, _) if *imm == 0xca => z,
-                    _ => Known::Opaque,
-                };
-                (*dst, k)
-            }
-            other => match inst_def(other) {
-                Some(d) => (d, Known::Opaque),
-                None => continue,
-            },
-        };
-        // An alias of itself is just opaque.
-        kn[dst as usize] = if k == Known::Alias(dst) { Known::Opaque } else { k };
-    }
-    // Liveness from the stores through resolved operands.
-    let mut def_at = vec![u32::MAX; n_vregs as usize];
-    for (i, inst) in insts.iter().enumerate() {
-        if let Some(d) = inst_def(inst) {
-            def_at[d as usize] = i as u32;
-        }
-    }
-    let mut const_def: HashMap<i32, u32> = HashMap::new();
-    for (i, inst) in insts.iter().enumerate() {
-        if let Inst::BcastD { val, .. } = inst {
-            const_def.entry(*val).or_insert(i as u32);
-        }
-    }
-    let mut needed = vec![false; insts.len()];
-    let mut stack: Vec<u32> = Vec::new();
-    let mut buf = Vec::new();
-    let need_vreg = |v: Vreg, stack: &mut Vec<u32>, needed: &mut Vec<bool>| {
-        let at = match res(&kn, v) {
-            Known::Alias(w) => def_at[w as usize],
-            // A constant operand needs its broadcast (or an embedded one).
-            Known::Const(c) => const_def.get(&c).copied().unwrap_or(u32::MAX),
-            Known::Opaque => def_at[v as usize],
-        };
-        if at != u32::MAX && !needed[at as usize] {
-            needed[at as usize] = true;
-            stack.push(at);
-        }
-    };
-    for (i, inst) in insts.iter().enumerate() {
-        if matches!(inst, Inst::Store { .. } | Inst::StoreMask { .. } | Inst::StoreMask8 { .. } | Inst::Call { .. }) {
-            needed[i] = true;
-            stack.push(i as u32);
-        }
-    }
-    while let Some(i) = stack.pop() {
-        buf.clear();
-        inst_uses(&insts[i as usize], &mut buf);
-        for &v in &buf {
-            need_vreg(v, &mut stack, &mut needed);
-        }
-    }
-    needed.iter().map(|n| !n).collect()
 }
 
 /// An instruction's kind for `Compiled::prov`: the variant, a binary op's

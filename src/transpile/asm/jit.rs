@@ -159,11 +159,6 @@ impl Loaded {
             func,
         })
     }
-
-    /// The loaded shared object (`--kernel-mix` keeps a copy).
-    pub fn path(&self) -> &Path {
-        &self.path
-    }
 }
 
 impl Drop for Loaded {
