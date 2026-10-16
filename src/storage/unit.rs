@@ -280,7 +280,7 @@ pub struct UnitSink<'a, N: Rem = P8> {
     first_new: u32,
     xfer_ids: FxHashMap<N::Pair, u32>,
     /// Per local transfer id its decoded transfers (the pushes').
-    xfer_pairs: Vec<N::Xfer>,
+    xfer_pairs: Vec<crate::search::rem::Xfer<N>>,
     /// Per local transfer id, the edges this worker recorded with it (the
     /// frame's new transfers are numbered by their count: `wave`).
     xfer_counts: Vec<u64>,
@@ -425,7 +425,7 @@ impl<'a, N: Rem> UnitSink<'a, N> {
             size_of::<N::Hull>() * self.hulls.capacity() + 4 * self.src_first.capacity() + 20 * self.entry_next.capacity() + size_of::<N::Acc>() * self.push_slots.capacity() + 4 * self.push_offs.capacity(),
             9 * self.pos_edges.capacity() + 8 * self.pos_recent.capacity(),
             (size_of::<N::Pair>() + 8) * self.xfer_ids.capacity()
-                + size_of::<N::Xfer>() * self.xfer_pairs.capacity()
+                + size_of::<crate::search::rem::Xfer<N>>() * self.xfer_pairs.capacity()
                 + 8 * self.xfer_counts.capacity()
                 + size_of::<N::Pair>() * self.xfer_tab.read().expect("a transfer table").capacity()
                 + 8 * self.x_rank.capacity()
@@ -696,7 +696,7 @@ impl<'a, N: Rem> UnitSink<'a, N> {
 
     /// Transfer `x`'s decoded pair (the pushes').
     #[inline]
-    fn transfers(&self, x: u32) -> N::Xfer {
+    fn transfers(&self, x: u32) -> crate::search::rem::Xfer<N> {
         match x.checked_sub(self.first_new) {
             Some(l) => self.xfer_pairs[l as usize],
             None => N::xfer(&self.base.pairs[x as usize]),

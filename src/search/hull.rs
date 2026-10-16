@@ -385,6 +385,7 @@ impl HullAcc {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::search::arcs::Fixed16;
 
     fn lcg(s: &mut u64) -> u32 {
         *s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
@@ -440,7 +441,7 @@ mod tests {
             let pushed = h.push(tx, ty, &mut acc);
             let mut img = Vec::new();
             h.to_region().push(tx, ty, &mut img);
-            let img = Region::from_pieces(&mut img, &mut Vec::new());
+            let img = Region::<Fixed16>::from_pieces(&mut img, &mut Vec::new());
             assert_eq!(pushed, !img.is_empty(), "{h:?} {tx:?} {ty:?}");
             assert_eq!(acc.is_empty(), !pushed);
             let Some(got) = acc.hull() else { continue };
@@ -474,7 +475,7 @@ mod tests {
                 let (mut img_new, mut img_old) = (Vec::new(), Vec::new());
                 h.to_region().push(tx, ty, &mut img_new);
                 was.to_region().push(tx, ty, &mut img_old);
-                assert_eq!(Region::from_pieces(&mut img_new, &mut Vec::new()), Region::from_pieces(&mut img_old, &mut Vec::new()), "{was:?} -> {h:?} {tx:?} {ty:?}: skipped a push whose image grew");
+                assert_eq!(Region::<Fixed16>::from_pieces(&mut img_new, &mut Vec::new()), Region::<Fixed16>::from_pieces(&mut img_old, &mut Vec::new()), "{was:?} -> {h:?} {tx:?} {ty:?}: skipped a push whose image grew");
             }
         }
         // Order: many pushes into one accumulator, forwards and backwards.

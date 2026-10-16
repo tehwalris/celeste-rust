@@ -427,6 +427,8 @@ pub trait EngineNum: Copy + Debug + PartialEq + Eq + Hash + Send + Sync + serde:
     /// The whole part, as the position cells read it (`floor`, 16.16's
     /// integer bits): `None` outside `i16`.
     fn whole_i16(self) -> Option<i16>;
+    /// The value as an `f64`, for a diagnostic's display (16.16's exactly).
+    fn to_f64(self) -> f64;
     /// A position's code part: the value less `whole` whole pixels (the cell
     /// holds those), exactly.
     fn less_whole(self, whole: i16) -> Self::Raw;
@@ -454,6 +456,9 @@ impl EngineNum for P8 {
     }
     fn push_raw(r: u32, out: &mut Vec<u8>) {
         out.extend_from_slice(&r.to_le_bytes());
+    }
+    fn to_f64(self) -> f64 {
+        self.as_raw_u32() as i32 as f64 / 65536.0
     }
     fn whole_i16(self) -> Option<i16> {
         Some(self.whole_part_as_i16())
@@ -486,6 +491,9 @@ impl EngineNum for F {
     }
     fn push_raw(r: u64, out: &mut Vec<u8>) {
         out.extend_from_slice(&r.to_le_bytes());
+    }
+    fn to_f64(self) -> f64 {
+        self.value()
     }
     fn whole_i16(self) -> Option<i16> {
         let w = self.value().floor();

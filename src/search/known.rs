@@ -30,31 +30,34 @@
 //! the check that failed, the node and the state, and the search FAILS.
 
 use super::arc_dp::{concrete_engines, exact_state, lookup_keys, lookup_view, rem_of, NodeKeys, Winning};
+use super::rem::Rem;
 use crate::frame::{wins_of, Block, MarkFilter, Visited};
+use celeste_core::arith::EngineNum;
+use celeste_core::pico8_num::Pico8Num as P8;
 
 /// A known solution to check, and the filter the level's forward ran under.
-pub struct Route<'a> {
+pub struct Route<'a, N: Rem = P8> {
     pub inputs: &'a [u8],
-    pub filter: Option<&'a MarkFilter<'a>>,
+    pub filter: Option<&'a MarkFilter<'a, N>>,
 }
 
 /// What the arc phase holds for the check (`arc_dp::solve`).
-pub struct Pruning<'a> {
+pub struct Pruning<'a, N: Rem = P8> {
     /// The search's settings (its room, category, split frame).
     pub settings: &'a crate::settings::Settings,
     pub level: crate::abstraction::Level,
     /// In search steps.
     pub horizon: u32,
-    pub node: &'a NodeKeys<'a>,
+    pub node: &'a NodeKeys<'a, N::C>,
     /// The tree's key space (concrete states keyed as its rows).
-    pub keys: &'a celeste_engine::exact::KeySpace,
+    pub keys: &'a celeste_engine::exact::KeySpace<N>,
     /// The start's node (`None`: no winning set at any frame): the tree
     /// holds the start as the engine made it, unwidened, so it is not looked
     /// up by its projection.
     pub start: Option<u32>,
-    pub w: &'a Winning,
+    pub w: &'a Winning<N::C>,
     /// This level's reached nodes (the next level's filter), if it has one.
-    pub reached: Option<&'a Visited>,
+    pub reached: Option<&'a Visited<N>>,
     /// The level -1 filter the tree was built under (`TreeFilter::of_tree`).
     pub minus_one: Option<crate::frame::MinusOne>,
     /// The tree's directory, for the report (its frame files read on a
@@ -65,16 +68,16 @@ pub struct Pruning<'a> {
 /// The route's concrete states per search step, each with its parent's
 /// index at the step before, up to the step before the exit; the exit step
 /// and the indices of its winning leaves' parents.
-struct Run {
-    layers: Vec<Vec<(u32, Block)>>,
+struct Run<N: EngineNum> {
+    layers: Vec<Vec<(u32, Block<N>)>>,
     exit: Option<(u32, Vec<u32>)>,
 }
 
-fn run(inputs: &[u8], horizon: u32, settings: &crate::settings::Settings) -> anyhow::Result<(Run, bool)> {
+fn run<N: Rem>(inputs: &[u8], horizon: u32, settings: &crate::settings::Settings) -> anyhow::Result<(Run<N>, bool)> {
     let spf = settings.steps_per_frame();
-    let (mut engines, seeded) = concrete_engines(1, settings)?;
+    let (mut engines, seeded) = concrete_engines::<N>(1, settings)?;
     let eng = &mut engines[0];
-    let mut layers: Vec<Vec<(u32, Block)>> = vec![vec![(0, Block::canonical(eng.initial()?)?)]];
+    let mut layers: Vec<Vec<(u32, Block<N>)>> = vec![vec![(0, Block::canonical(eng.initial()?)?)]];
     for s in 0..horizon {
         let Some(&byte) = inputs.get((s / spf) as usize) else { break };
         let (mut next, mut seen, mut won) = (Vec::new(), rustc_hash::FxHashSet::default(), Vec::new());
@@ -101,10 +104,10 @@ fn run(inputs: &[u8], horizon: u32, settings: &crate::settings::Settings) -> any
 /// Check the route against one level's pruning. `Ok(None)`: it does not win
 /// by the horizon (nothing to check); `Ok(Some(f))`: it wins during frame
 /// `f` and survives everything; an error: it is PRUNED (the report printed).
-pub fn check(route: &Route, p: &Pruning) -> anyhow::Result<Option<u32>> {
+pub fn check<N: Rem>(route: &Route<N>, p: &Pruning<N>) -> anyhow::Result<Option<u32>> {
     let t0 = std::time::Instant::now();
     let spf = p.settings.steps_per_frame();
-    let (run, seeded) = run(route.inputs, p.horizon, p.settings)?;
+    let (run, seeded) = run::<N>(route.inputs, p.horizon, p.settings)?;
     let Some((exit, winners)) = &run.exit else {
         eprintln!("[known] the known route does not exit by f{} ({} inputs): not checked", p.horizon / spf, route.inputs.len());
         return Ok(None);
@@ -170,9 +173,9 @@ pub fn check(route: &Route, p: &Pruning) -> anyhow::Result<Option<u32>> {
         eprintln!("[known] PRUNED at level {}: the known route (exit f{frame}) {what} at step {s} ({}):", p.level, at_frame(s as u32, spf));
         for t in s.saturating_sub(spf as usize)..=(s + spf as usize).min(last) {
             let (_, b) = &run.layers[t][idx[t]];
-            let (x, y) = rem_of(b.rt2())?;
+            let (x, y) = rem_of::<N>(b.rt2())?;
             eprintln!(
-                "[known]   step {t} ({}): {}\n[known]     state {} (remainder point ({x}, {y}))",
+                "[known]   step {t} ({}): {}\n[known]     state {} (remainder point ({x:?}, {y:?}))",
                 at_frame(t as u32, spf),
                 miss(t).map_or("passes", |m| m.what.as_str()),
                 crate::search::inspect::player_summary(b.rt2(), 0)
@@ -212,7 +215,7 @@ fn backward(what: String) -> Option<Miss> {
 }
 
 /// The first check state `b` at step `s` fails.
-fn verdict(b: &Block, s: u32, seeded: bool, l1: Option<(u32, &crate::trace::level_minus_one::CostToGo)>, route: &Route, p: &Pruning) -> anyhow::Result<Option<Miss>> {
+fn verdict<N: Rem>(b: &Block<N>, s: u32, seeded: bool, l1: Option<(u32, &crate::trace::level_minus_one::CostToGo)>, route: &Route<N>, p: &Pruning<N>) -> anyhow::Result<Option<Miss>> {
     let (shape, keys, cells) = lookup_keys(b, p.level, seeded, p.keys)?;
     let (key, cell) = (keys[0], cells[0]);
     let node = match key {
@@ -243,7 +246,7 @@ fn verdict(b: &Block, s: u32, seeded: bool, l1: Option<(u32, &crate::trace::leve
         return Ok(None);
     }
     let Some(i) = (if s == 0 { p.start } else { p.node.get(shape, key, cell) }) else {
-        let tree = crate::storage::layer::Tree::<celeste_engine::runtime2::P8>::open(p.dir, s)?;
+        let tree = crate::storage::layer::Tree::<N>::open(p.dir, s)?;
         let layer = match key.and_then(|key| tree.sk(shape, key, cell)) {
             Some(sk) => tree.layer_of(sk, s)?.map(|l| (l, sk)),
             None => None,
@@ -257,10 +260,10 @@ fn verdict(b: &Block, s: u32, seeded: bool, l1: Option<(u32, &crate::trace::leve
             None => forward(format!("NOT IN THE TREE by step {s}: the forward lost it since the step before (the kernels, the visited set, or a filter on a mid-frame step; `rewrite follow` shows its parent's kernel successors) ({node})")),
         });
     };
-    let (x, y) = rem_of(b.rt2())?;
+    let (x, y) = rem_of::<N>(b.rt2())?;
     match p.w.at(s, i) {
         None => return Ok(backward(format!("W_{s} of its node is EMPTY ({node})"))),
-        Some(r) if !r.contains(x, y) => return Ok(backward(format!("its remainder ({x}, {y}) is OUTSIDE W_{s} of its node, {r:?} ({node})"))),
+        Some(r) if !r.contains(x, y) => return Ok(backward(format!("its remainder ({x:?}, {y:?}) is OUTSIDE W_{s} of its node, {r:?} ({node})"))),
         Some(_) => {}
     }
     // The start is reached whenever its W holds it (`arc_dp::reach`).

@@ -47,6 +47,7 @@
 use celeste_core::lua_f64::LuaF64;
 use celeste_engine::runtime2::mix64;
 
+use super::arcs::{Circle, Seg};
 use super::rem::Capture;
 
 /// The index of `0` (and the count of doubles in `[-1/2, 0)`): `1/2`'s bits.
@@ -408,7 +409,12 @@ fn round(x: f64) -> f64 {
 /// The first point from which `p` holds (`p` false then true over the
 /// points: monotone), by bisection.
 fn first(p: impl Fn(u64) -> bool) -> u64 {
-    let (mut lo, mut hi) = (0u64, POINTS);
+    first_in(0, POINTS, p)
+}
+
+/// The first point of `lo..hi` from which `p` holds (`hi`: none), `p` false
+/// then true there.
+fn first_in(mut lo: u64, mut hi: u64, p: impl Fn(u64) -> bool) -> u64 {
     while lo < hi {
         let mid = lo + (hi - lo) / 2;
         if p(mid) {
@@ -418,6 +424,102 @@ fn first(p: impl Fn(u64) -> bool) -> u64 {
         }
     }
     lo
+}
+
+/// The doubles' circle (`arcs::Circle`): the `POINTS` points, stored as
+/// `u64` words, the transfers `Axis` - monotone maps, so the PULL of a
+/// segment is the guard's points between two bisections, exactly; the
+/// image of a segment is the interval between its ends' images.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct Doubles;
+
+impl Circle for Doubles {
+    type P = u64;
+    type W = u64;
+    type Act = Axis;
+    const SIZE: u64 = POINTS;
+    const MAX_SEGS: usize = 1 << 20;
+    #[inline]
+    fn next(p: u64) -> u64 {
+        p + 1
+    }
+    #[inline]
+    fn prev(p: u64) -> u64 {
+        p - 1
+    }
+    #[inline]
+    fn store(p: u64) -> u64 {
+        p
+    }
+    #[inline]
+    fn load(w: u64) -> u64 {
+        w
+    }
+    #[inline]
+    fn count(n: usize) -> u64 {
+        n as u64
+    }
+    #[inline]
+    fn len(w: u64) -> usize {
+        w as usize
+    }
+    #[inline]
+    fn guard(a: &Axis) -> Seg<u64> {
+        Seg { lo: a.lo, hi: a.hi }
+    }
+    #[inline]
+    fn const_point(a: &Axis) -> Option<u64> {
+        (a.tag == CONST).then_some(a.a)
+    }
+    fn image(a: &Axis, s: Seg<u64>, mut f: impl FnMut(Seg<u64>)) {
+        let (lo, hi) = (s.lo.max(a.lo), s.hi.min(a.hi));
+        if lo < hi {
+            f(if a.tag == MONO { Seg { lo: a.apply(lo), hi: a.apply(hi - 1) + 1 } } else { Seg { lo: a.a, hi: a.a + 1 } });
+        }
+    }
+    fn preimage(a: &Axis, s: Seg<u64>, mut f: impl FnMut(Seg<u64>)) {
+        if a.tag != MONO {
+            if s.lo <= a.a && a.a < s.hi {
+                f(Seg { lo: a.lo, hi: a.hi });
+            }
+            return;
+        }
+        // The guard's points whose image is in `s`: past every point whose
+        // image is below `s.lo`, before the first whose image reaches `s.hi`.
+        let lo = first_in(a.lo, a.hi, |r| a.apply(r) >= s.lo);
+        let hi = first_in(lo, a.hi, |r| a.apply(r) >= s.hi);
+        if lo < hi {
+            f(Seg { lo, hi });
+        }
+    }
+    #[inline]
+    fn seg_word(s: Seg<u64>) -> u64 {
+        mix64(s.lo) ^ s.hi.rotate_left(32)
+    }
+    fn mid(s: Seg<u64>) -> u64 {
+        s.lo + (s.hi - s.lo) / 2
+    }
+    fn kind(a: &Axis) -> &'static str {
+        if a.tag == MONO {
+            "mono"
+        } else {
+            "const"
+        }
+    }
+    /// The guard's lowest point dropped, or a `Mono` collapsed onto its
+    /// lowest point's image (wrong wherever the image moves), a constant
+    /// moved by one point.
+    fn faulty(a: &Axis, guard: bool) -> Axis {
+        let mut t = *a;
+        if guard {
+            t.lo = (t.lo + 1).min(t.hi - 1);
+        } else if t.tag == MONO {
+            t = Axis { tag: CONST, a: a.apply(a.lo), k: 0, ..t };
+        } else {
+            t.a = (t.a + 1) % POINTS;
+        }
+        t
+    }
 }
 
 /// Decode one axis (the module doc's rules). `Err` is a refusal.
@@ -680,6 +782,56 @@ mod tests {
                 let mut old = HullAcc::default();
                 assert!(was.push(&t, &mut old), "{h:?} from {was:?}: skipped, but the smaller one never pushed");
                 assert_eq!(old.hull(), acc.hull(), "{h:?} from {was:?}: skipped a push that grows");
+            }
+        }
+    }
+
+    /// THE PULL IS THE PREIMAGE, EXACTLY: a region of the doubles pulled
+    /// through real pieces (`decode_axis` of the cart's captures), probed
+    /// at the result's boundaries and their neighbours, the guards' ends
+    /// and random points: a point is in the pull iff the guards take it and
+    /// its image is in the region.
+    #[test]
+    fn a_doubles_region_pulls_to_its_exact_preimage() {
+        use crate::search::arcs::{Piece, Region};
+        let mut s = 17u64;
+        let mut pieces: Vec<Axis> = Vec::new();
+        for ox in [0.0, -2.0, 1.0, 0.6, -1.3, 2.75, -0.35, 3.0000000000000004] {
+            pieces.extend(captures(ox).iter().map(|c| decode_axis(c).unwrap()));
+        }
+        pieces.push(Axis { lo: 0, hi: POINTS, tag: CONST, a: ZERO, k: 0 });
+        let near = |s: &mut u64| match lcg(s) % 5 {
+            0 => lcg(s) % 64,
+            1 => POINTS - 1 - lcg(s) % 64,
+            2 => ZERO - 32 + lcg(s) % 64,
+            _ => lcg(s) % POINTS,
+        };
+        let seg = |s: &mut u64| {
+            let (a, b) = (near(s), near(s));
+            Seg { lo: a.min(b), hi: a.max(b) + 1 }
+        };
+        for _ in 0..300 {
+            let mut ps: Vec<Piece<u64>> = (0..1 + lcg(&mut s) % 6).map(|_| Piece { y: seg(&mut s), x: seg(&mut s) }).collect();
+            let r = Region::<Doubles>::from_pieces(&mut ps, &mut Vec::new());
+            let (tx, ty) = (pieces[(lcg(&mut s) % pieces.len() as u64) as usize], pieces[(lcg(&mut s) % pieces.len() as u64) as usize]);
+            let mut out = Vec::new();
+            r.pull(tx, ty, &mut out);
+            let pr = Region::<Doubles>::from_pieces(&mut out, &mut Vec::new());
+            let around = |v: u64| [v.wrapping_sub(1), v, v + 1].into_iter().filter(|&p| p < POINTS);
+            let mut px: Vec<u64> = vec![tx.lo, tx.hi - 1, near(&mut s), near(&mut s)];
+            let mut py: Vec<u64> = vec![ty.lo, ty.hi - 1, near(&mut s), near(&mut s)];
+            for (y, xs) in pr.slabs() {
+                py.extend(around(y.lo).chain(around(y.hi)));
+                for x in xs {
+                    px.extend(around(x.lo).chain(around(x.hi)));
+                }
+            }
+            for &x in &px {
+                for &y in &py {
+                    let takes = |a: &Axis, p: u64| a.lo <= p && p < a.hi;
+                    let want = takes(&tx, x) && takes(&ty, y) && r.contains(tx.apply(x), ty.apply(y));
+                    assert_eq!(pr.contains(x, y), want, "pull at ({x}, {y}) through {tx:?} {ty:?}");
+                }
             }
         }
     }

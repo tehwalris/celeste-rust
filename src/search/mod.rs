@@ -12,6 +12,7 @@
 //!   * `result`     - `result.json`: what a search decided, as a record
 //!   * `inspect`    - rows read by named fields, for the diagnostics
 //!   * `ui_export`  - `rewrite export-ui`: a finished run -> the web UI's data
+pub mod arc_check;
 pub mod arc_dp;
 pub mod arc_edges;
 pub mod arcs;

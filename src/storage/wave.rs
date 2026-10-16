@@ -1273,7 +1273,7 @@ fn run_repush<N: Rem>(u: u32, layer: &OldLayer<N>, entries: std::ops::Range<usiz
         sc.read[1] += sc.raw.len() as u64;
         sc.read[2] += blk.len() as u64;
         let routes: Vec<u32> = blk.routes.iter().map(|&(shape, slot)| sink.route(shape, slot)).collect();
-        let pairs: Vec<N::Xfer> = blk.pairs.iter().map(N::xfer).collect();
+        let pairs: Vec<crate::search::rem::Xfer<N>> = blk.pairs.iter().map(N::xfer).collect();
         sc.t_of.clear();
         sc.t_of.resize(blk.targets.len(), u32::MAX);
         sc.late.clear();

@@ -17,7 +17,7 @@ use celeste_core::lua_f64::LuaF64;
 use celeste_core::pico8_num::Pico8Num as P8;
 
 use super::arc_edges::{self, Pair};
-use super::arcs::{Set, Transfer};
+use super::arcs::{Circle, Fixed16, Set, Transfer};
 use super::hull::{Hull, HullAcc};
 use super::rem_f64;
 
@@ -46,8 +46,9 @@ pub trait Rem: EngineNum {
     type Acc: Copy + Debug + PartialEq + Eq + Default + Send + Sync + 'static;
     /// An edge's transfer pair as the tree's table records it.
     type Pair: Copy + Debug + PartialEq + Eq + Hash + PartialOrd + Ord + Send + Sync + 'static;
-    /// A pair as the pushes read it.
-    type Xfer: Copy + Debug + Send + Sync + 'static;
+    /// The circle of points the remainders are (`arcs::Circle`): the arcs'
+    /// sets, and a pair as the pushes and pulls read it (`Xfer`).
+    type C: Circle;
     /// Bytes a hull takes on disk.
     const HULL_BYTES: usize;
     /// Bytes a pair takes on disk.
@@ -66,14 +67,18 @@ pub trait Rem: EngineNum {
     /// Every remainder on both axes.
     fn full() -> Self::Hull;
     fn is_full(h: &Self::Hull) -> bool;
-    fn xfer(p: &Self::Pair) -> Self::Xfer;
+    fn xfer(p: &Self::Pair) -> Xfer<Self>;
+    /// A remainder as a point of the circle (`None`: not in `[-1/2, 1/2)`).
+    fn point(v: Self) -> Option<Point<Self>>;
+    /// The remainder at point `p` (`point`'s inverse).
+    fn at_point(p: Point<Self>) -> Self;
     /// THE PUSH of hull `h` along an edge of transfer `t` into `acc`: per
     /// axis its points inside the guard, moved by the action; nothing where
     /// either axis misses. Whether it pushed.
-    fn push(h: &Self::Hull, t: &Self::Xfer, acc: &mut Self::Acc) -> bool;
+    fn push(h: &Self::Hull, t: &Xfer<Self>, acc: &mut Self::Acc) -> bool;
     /// The push of a GROWN hull `h` (`was` the hull it last pushed), only
     /// where the edge's image grows past `was`'s.
-    fn push_grown(h: &Self::Hull, was: &Self::Hull, t: &Self::Xfer, acc: &mut Self::Acc) -> bool;
+    fn push_grown(h: &Self::Hull, was: &Self::Hull, t: &Xfer<Self>, acc: &mut Self::Acc) -> bool;
     fn acc_add_hull(acc: &mut Self::Acc, h: &Self::Hull);
     fn acc_merge(acc: &mut Self::Acc, o: &Self::Acc);
     /// The accumulated hull; `None` when nothing was added.
@@ -91,6 +96,12 @@ pub trait Rem: EngineNum {
     fn pair_hash(p: &Self::Pair) -> u64;
 }
 
+/// A pair as the pushes and pulls read it: per axis the circle's transfer.
+pub type Xfer<N> = (<<N as Rem>::C as Circle>::Act, <<N as Rem>::C as Circle>::Act);
+
+/// A point of `N`'s circle.
+pub type Point<N> = <<N as Rem>::C as Circle>::P;
+
 /// A 16.16 remainder's point of the circle.
 fn point(v: P8) -> u32 {
     super::arcs::point(v.as_raw_u32() as i32)
@@ -100,7 +111,7 @@ impl Rem for P8 {
     type Hull = Hull;
     type Acc = HullAcc;
     type Pair = Pair;
-    type Xfer = (Transfer, Transfer);
+    type C = Fixed16;
     const HULL_BYTES: usize = super::hull::HULL_BYTES;
     const PAIR_BYTES: usize = arc_edges::PAIR_BYTES;
 
@@ -109,7 +120,7 @@ impl Rem for P8 {
         if super::hull::WIDEN.load(std::sync::atomic::Ordering::Relaxed) {
             return Ok(Hull::full());
         }
-        let (x, y) = super::arc_dp::start_point(s)?;
+        let (x, y) = super::arc_dp::start_point::<P8>(s)?;
         Ok(Hull::point(x, y))
     }
     fn transfer(x: &Capture<P8>, y: &Capture<P8>) -> Result<Pair, String> {
@@ -138,6 +149,13 @@ impl Rem for P8 {
     }
     fn xfer(p: &Pair) -> (Transfer, Transfer) {
         (p.0.transfer(), p.1.transfer())
+    }
+    fn point(v: P8) -> Option<u32> {
+        let r = v.as_raw_u32() as i32;
+        (-32768..32768).contains(&r).then(|| point(v))
+    }
+    fn at_point(p: u32) -> P8 {
+        P8::from_raw(p as i32 - 32768)
     }
     #[inline]
     fn push(h: &Hull, t: &(Transfer, Transfer), acc: &mut HullAcc) -> bool {
@@ -190,7 +208,7 @@ impl Rem for LuaF64 {
     type Hull = rem_f64::Hull;
     type Acc = rem_f64::HullAcc;
     type Pair = rem_f64::Pair;
-    type Xfer = rem_f64::Pair;
+    type C = rem_f64::Doubles;
     const HULL_BYTES: usize = rem_f64::HULL_BYTES;
     const PAIR_BYTES: usize = rem_f64::PAIR_BYTES;
 
@@ -221,6 +239,12 @@ impl Rem for LuaF64 {
     }
     fn xfer(p: &rem_f64::Pair) -> rem_f64::Pair {
         *p
+    }
+    fn point(v: LuaF64) -> Option<u64> {
+        rem_f64::index(v.value())
+    }
+    fn at_point(p: u64) -> LuaF64 {
+        LuaF64::new(rem_f64::value(p)).expect("a remainder is finite")
     }
     #[inline]
     fn push(h: &rem_f64::Hull, t: &rem_f64::Pair, acc: &mut rem_f64::HullAcc) -> bool {

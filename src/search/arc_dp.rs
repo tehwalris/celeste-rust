@@ -25,7 +25,10 @@
 //! (`reach`, over the reached nodes' out-edges, `ReachEdges`), and the
 //! concrete search runs inside `W` (`concrete_search`).
 
-use super::arcs::{Region, RegionArena, RegionRef, Transfer};
+use super::arcs::{Circle, Fixed16, Piece, Region, RegionArena, RegionRef, Seg};
+use super::rem::{Point, Rem, Xfer};
+use celeste_core::arith::{Arithmetic, EngineNum};
+use celeste_core::pico8_num::Pico8Num as P8;
 use crate::storage::bundle::{get_varint, get_varint128, put_varint, put_varint128};
 use crate::storage::edges::EdgeStore;
 use crate::storage::{Sk, GEOMETRY};
@@ -97,11 +100,11 @@ const BLOCK: usize = 16;
 /// used first); per block of `BLOCK` nodes its first state and byte offset,
 /// in a scratch file mapped back when the backward has a directory for it
 /// (`Spill`).
-pub struct Winning {
+pub struct Winning<C: Circle = Fixed16> {
     n: usize,
     blocks: Vec<(Sk, u64)>,
     data: Bytes,
-    sets: Sets,
+    sets: Sets<C>,
     spans: usize,
 }
 
@@ -169,13 +172,13 @@ impl std::ops::Deref for Bytes {
 /// W's distinct sets: the backward's arena, numbered by use (`order[k]`:
 /// the arena's index of set `k`, the most used first - smaller varints)
 /// without copying the arena.
-struct Sets {
-    arena: RegionArena,
+struct Sets<C: Circle> {
+    arena: RegionArena<C>,
     order: Vec<u32>,
 }
 
-impl Sets {
-    fn get(&self, k: u32) -> RegionRef<'_> {
+impl<C: Circle> Sets<C> {
+    fn get(&self, k: u32) -> RegionRef<'_, C> {
         self.arena.get(self.order[k as usize])
     }
     fn len(&self) -> usize {
@@ -187,16 +190,23 @@ impl Sets {
 }
 
 /// One node of `Winning`: its state, its layer and its spans.
-#[derive(Clone, Copy)]
-pub struct Node<'a> {
+pub struct Node<'a, C: Circle = Fixed16> {
     pub id: Sk,
     pub layer: u32,
     count: u32,
     bytes: &'a [u8],
-    sets: &'a Sets,
+    sets: &'a Sets<C>,
 }
 
-impl<'a> Node<'a> {
+impl<C: Circle> Clone for Node<'_, C> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<C: Circle> Copy for Node<'_, C> {}
+
+impl<'a, C: Circle> Node<'a, C> {
     /// The spans `(lo, hi, set index)`, in frame order.
     fn raw(self) -> impl Iterator<Item = (u32, u32, u32)> + 'a {
         let mut pos = 0usize;
@@ -211,7 +221,7 @@ impl<'a> Node<'a> {
     }
     /// The spans `(lo, hi, set)`: `W_t = set` for `t` in `lo..=hi`, empty
     /// at the frames no span covers.
-    pub fn spans(self) -> impl Iterator<Item = (u32, u32, RegionRef<'a>)> + 'a {
+    pub fn spans(self) -> impl Iterator<Item = (u32, u32, RegionRef<'a, C>)> + 'a {
         let sets = self.sets;
         self.raw().map(move |(lo, hi, s)| (lo, hi, sets.get(s)))
     }
@@ -220,7 +230,7 @@ impl<'a> Node<'a> {
         self.raw().last().expect("a node has a span").1
     }
     /// `W_t` (`None` = empty).
-    pub fn at(self, t: u32) -> Option<RegionRef<'a>> {
+    pub fn at(self, t: u32) -> Option<RegionRef<'a, C>> {
         if t < self.layer {
             return None;
         }
@@ -230,17 +240,17 @@ impl<'a> Node<'a> {
 }
 
 /// `Winning::nodes`: every node, decoded in order.
-pub struct Nodes<'a> {
-    w: &'a Winning,
+pub struct Nodes<'a, C: Circle = Fixed16> {
+    w: &'a Winning<C>,
     k: usize,
     end: usize,
     pos: usize,
     id: Sk,
 }
 
-impl<'a> Iterator for Nodes<'a> {
-    type Item = Node<'a>;
-    fn next(&mut self) -> Option<Node<'a>> {
+impl<'a, C: Circle> Iterator for Nodes<'a, C> {
+    type Item = Node<'a, C>;
+    fn next(&mut self) -> Option<Node<'a, C>> {
         if self.k >= self.end {
             return None;
         }
@@ -253,9 +263,9 @@ impl<'a> Iterator for Nodes<'a> {
     }
 }
 
-impl Winning {
+impl<C: Circle> Winning<C> {
     /// The node at `pos` (whose previous node's state is `id`); both past it.
-    fn decode_at(&self, pos: &mut usize, id: &mut Sk) -> Node<'_> {
+    fn decode_at(&self, pos: &mut usize, id: &mut Sk) -> Node<'_, C> {
         *id = get_sk(&self.data, pos, *id);
         let layer = get_varint(&self.data, pos) as u32;
         let count = get_varint(&self.data, pos) as u32;
@@ -266,7 +276,7 @@ impl Winning {
         Node { id: *id, layer, count, bytes: &self.data[start..*pos], sets: &self.sets }
     }
     /// Node `i`.
-    pub fn node(&self, i: u32) -> Node<'_> {
+    pub fn node(&self, i: u32) -> Node<'_, C> {
         let (b, k) = (i as usize / BLOCK, i as usize % BLOCK);
         let (mut id, mut pos) = (self.blocks[b].0, self.blocks[b].1 as usize);
         for _ in 0..k {
@@ -275,12 +285,12 @@ impl Winning {
         self.decode_at(&mut pos, &mut id)
     }
     /// Every node, in id order.
-    pub fn nodes(&self) -> Nodes<'_> {
+    pub fn nodes(&self) -> Nodes<'_, C> {
         self.nodes_from(0, self.n)
     }
     /// Nodes `lo..hi` in id order (`lo` a multiple of `BLOCK`: a block's
     /// first node).
-    fn nodes_from(&self, lo: usize, hi: usize) -> Nodes<'_> {
+    fn nodes_from(&self, lo: usize, hi: usize) -> Nodes<'_, C> {
         assert!(lo % BLOCK == 0, "nodes from a block's first");
         Nodes { w: self, k: lo, end: hi.min(self.n), pos: 0, id: Sk::default() }
     }
@@ -306,7 +316,7 @@ impl Winning {
         self.node(i).id
     }
     /// `W_t(i)` (`None` = empty).
-    pub fn at(&self, t: u32, i: u32) -> Option<RegionRef<'_>> {
+    pub fn at(&self, t: u32, i: u32) -> Option<RegionRef<'_, C>> {
         self.node(i).at(t)
     }
     /// The bytes held: the encoding, the block index and the sets' arena.
@@ -415,7 +425,7 @@ const LOCAL_COMPACT: usize = 1 << 30;
 /// A step's own sets cut to those its sets so far (`acc`) name - a round
 /// replaces the sets of the sources it reached, and the replaced ones are
 /// named by nothing - `acc`'s codes renumbered; the sets and their index.
-fn compact_local(acc: &mut [Acc], local: &RegionArena) -> (RegionArena, FxHashMap<u64, u32>) {
+fn compact_local<C: Circle>(acc: &mut [Acc], local: &RegionArena<C>) -> (RegionArena<C>, FxHashMap<u64, u32>) {
     let (mut kept, mut index, mut to) = (RegionArena::default(), FxHashMap::default(), vec![u32::MAX; local.len()]);
     for a in acc.iter_mut().filter(|a| a.set & LOCAL != 0) {
         let l = (a.set & !LOCAL) as usize;
@@ -429,7 +439,7 @@ fn compact_local(acc: &mut [Acc], local: &RegionArena) -> (RegionArena, FxHashMa
     (kept, index)
 }
 
-fn region_hash(r: RegionRef) -> u64 {
+fn region_hash<C: Circle>(r: RegionRef<C>) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut hs = rustc_hash::FxHasher::default();
     r.hash(&mut hs);
@@ -497,7 +507,7 @@ fn seek<A, B>(v: &[((u64, u64), A, B)], j: usize, k: (u64, u64)) -> usize {
 /// BACKWARD: `W_t` for `t = horizon` down to 0 (`Backward::step`, a frame at
 /// a time), from the win states `wins` (id, layer); with `spill`, the
 /// closed spans and W's nodes go to scratch files there (`Spill`).
-pub fn backward(store: &EdgeStore, pairs: &[(Transfer, Transfer)], wins: &[(Sk, u32)], horizon: u32, threads: usize, spill: Option<&std::path::Path>) -> anyhow::Result<Winning> {
+pub fn backward<N: Rem>(store: &EdgeStore<N>, pairs: &[Xfer<N>], wins: &[(Sk, u32)], horizon: u32, threads: usize, spill: Option<&std::path::Path>) -> anyhow::Result<Winning<N::C>> {
     let mut b = Backward::new(store, pairs, wins, horizon, threads);
     if let Some(dir) = spill {
         b = b.spill_to(dir)?;
@@ -511,16 +521,16 @@ pub fn backward(store: &EdgeStore, pairs: &[(Transfer, Transfer)], wins: &[(Sk, 
 /// The backward between two frames: `W_{t+1}` (the frame done last), which
 /// of its sets changed there, and the spans closed so far. `rewrite
 /// bench-backward` times one `step`.
-pub struct Backward<'a> {
-    store: &'a EdgeStore,
+pub struct Backward<'a, N: Rem = P8> {
+    store: &'a EdgeStore<N>,
     /// Per target region the first frame with edges into it.
     first: FxHashMap<u32, u32>,
-    pairs: &'a [(Transfer, Transfer)],
+    pairs: &'a [Xfer<N>],
     horizon: u32,
     threads: usize,
     /// The ARENA of sets, equal sets once (found by hash; a collision with a
     /// different set is stored apart). Index 0: the whole torus.
-    sets: RegionArena,
+    sets: RegionArena<N::C>,
     interned: FxHashMap<u64, u32>,
     /// The nodes with a set at the frame done last, by id.
     cur: Vec<Cur>,
@@ -551,13 +561,13 @@ pub struct Backward<'a> {
     fragments: Vec<String>,
 }
 
-impl<'a> Backward<'a> {
+impl<'a, N: Rem> Backward<'a, N> {
     /// `W_horizon`: the win nodes present by the horizon (each step on
     /// `threads` workers).
-    pub fn new(store: &'a EdgeStore, pairs: &'a [(Transfer, Transfer)], wins: &[(Sk, u32)], horizon: u32, threads: usize) -> Self {
+    pub fn new(store: &'a EdgeStore<N>, pairs: &'a [Xfer<N>], wins: &[(Sk, u32)], horizon: u32, threads: usize) -> Self {
         assert!(horizon < WIN as u32, "a horizon past {WIN}");
         let mut sets = RegionArena::default();
-        let full = Region::full();
+        let full = Region::<N::C>::full();
         sets.push(full.as_ref());
         let mut interned: FxHashMap<u64, u32> = FxHashMap::default();
         interned.insert(region_hash(full.as_ref()), 0);
@@ -613,7 +623,7 @@ impl<'a> Backward<'a> {
     }
 
     /// The frame done last's nodes with a set, and each one's set.
-    pub fn current(&self) -> impl Iterator<Item = (Sk, RegionRef<'_>)> + '_ {
+    pub fn current(&self) -> impl Iterator<Item = (Sk, RegionRef<'_, N::C>)> + '_ {
         self.cur.iter().map(|c| (c.id, self.sets.get(c.set)))
     }
 
@@ -737,7 +747,7 @@ impl<'a> Backward<'a> {
     }
 
     /// A set code's set (`local`: the step's own sets).
-    fn set_of<'s>(&'s self, code: u32, local: &'s RegionArena) -> RegionRef<'s> {
+    fn set_of<'s>(&'s self, code: u32, local: &'s RegionArena<N::C>) -> RegionRef<'s, N::C> {
         if code & LOCAL != 0 {
             local.get(code & !LOCAL)
         } else {
@@ -746,18 +756,18 @@ impl<'a> Backward<'a> {
     }
 
     /// The arena's code of `r`, if it holds it.
-    fn arena_code(&self, r: &Region, h: u64) -> Option<u32> {
+    fn arena_code(&self, r: &Region<N::C>, h: u64) -> Option<u32> {
         self.interned.get(&h).copied().filter(|&s| self.sets.get(s) == *r)
     }
 
     /// Fold one round's in-edges into the step's sets so far (`acc`, by
     /// id): per source in parallel id ranges, its set so far (or at `t + 1`)
     /// united with the round's pulls. New sets go into `local`.
-    fn fold_round(&self, acc: Vec<Acc>, parts: &[(Vec<Emit>, ReadStats)], local: &mut RegionArena, local_interned: &mut FxHashMap<u64, u32>) -> Vec<Acc> {
+    fn fold_round(&self, acc: Vec<Acc>, parts: &[(Vec<Emit>, ReadStats)], local: &mut RegionArena<N::C>, local_interned: &mut FxHashMap<u64, u32>) -> Vec<Acc> {
         let n_emits: usize = parts.iter().map(|p| p.0.len()).sum();
         let bounds = id_ranges(parts.iter().flat_map(|p| p.0.iter().step_by(64).map(|e| e.p)).collect(), n_emits, self.threads * 4);
         let (cur, pairs, local_ro) = (&self.cur, self.pairs, &*local);
-        let outs: Vec<(Vec<Acc>, Vec<Region>)> = par_chunks(bounds.len() - 1, 1, self.threads, |k, _| {
+        let outs: Vec<(Vec<Acc>, Vec<Region<N::C>>)> = par_chunks(bounds.len() - 1, 1, self.threads, |k, _| {
             let (lo, hi) = (bounds[k], bounds[k + 1]);
             let a = &acc[acc.partition_point(|x| x.p < lo)..acc.partition_point(|x| x.p < hi)];
             let c = &cur[cur.partition_point(|x| x.id < lo)..cur.partition_point(|x| x.id < hi)];
@@ -1032,7 +1042,7 @@ impl<'a> Backward<'a> {
     /// The winning sets, once every frame down to 0 is done: the runs merged
     /// node by node (a heap over the runs) into `Winning`'s varints, the
     /// sets renumbered by use.
-    pub fn finish(mut self) -> anyhow::Result<Winning> {
+    pub fn finish(mut self) -> anyhow::Result<Winning<N::C>> {
         use std::cmp::Reverse;
         assert_eq!(self.runs.len(), self.horizon as usize, "finish before frame 0");
         let last = std::mem::take(&mut self.cur);
@@ -1158,9 +1168,9 @@ impl<'a> Backward<'a> {
 /// carry nothing) - loaded as `reach` first reaches their source, a frame's
 /// sources at a time (`out_edges`): what is held is the reached nodes'
 /// edges, 8 B each, not the graph between W's nodes.
-pub struct ReachEdges<'a> {
-    store: &'a EdgeStore,
-    w: &'a Winning,
+pub struct ReachEdges<'a, N: Rem = P8> {
+    store: &'a EdgeStore<N>,
+    w: &'a Winning<N::C>,
     /// The win states, sorted: never expanded, so never left.
     wins: Vec<Sk>,
     threads: usize,
@@ -1174,7 +1184,7 @@ pub struct ReachEdges<'a> {
 /// names the target regions each source region reaches; those regions'
 /// segments are decoded (on `threads` workers) and their bundles from the
 /// sources' keys kept where a source cell is one asked for.
-pub fn out_edges(store: &EdgeStore, frame: u32, sources: &[Sk], threads: usize) -> anyhow::Result<Vec<(usize, Sk, u32)>> {
+pub fn out_edges<N: Rem>(store: &EdgeStore<N>, frame: u32, sources: &[Sk], threads: usize) -> anyhow::Result<Vec<(usize, Sk, u32)>> {
     let geo = GEOMETRY;
     let mut wanted: rustc_hash2::FxHashMap<(u32, (u64, u64)), Vec<(u32, usize)>> = Default::default();
     let mut regions: Vec<u32> = Vec::new();
@@ -1212,8 +1222,8 @@ pub fn out_edges(store: &EdgeStore, frame: u32, sources: &[Sk], threads: usize) 
     Ok(out)
 }
 
-impl<'a> ReachEdges<'a> {
-    pub fn new(store: &'a EdgeStore, w: &'a Winning, wins: Vec<Sk>, threads: usize) -> Self {
+impl<'a, N: Rem> ReachEdges<'a, N> {
+    pub fn new(store: &'a EdgeStore<N>, w: &'a Winning<N::C>, wins: Vec<Sk>, threads: usize) -> Self {
         ReachEdges { store, w, wins, threads, loaded: FxHashMap::default(), edges: 0 }
     }
     /// Load the out-edges of those of `nodes` not loaded yet, frame by frame
@@ -1277,17 +1287,16 @@ impl<'a> ReachEdges<'a> {
 /// itself (a superset: the filter only loosens), which bounds the memory -
 /// W's sets are shared, a node's reached set is its own.
 #[allow(clippy::too_many_arguments)]
-pub fn reach(w: &Winning, g: &mut ReachEdges, pairs: &[(Transfer, Transfer)], start: Option<u32>, point: (u32, u32), horizon: u32, threads: usize) -> anyhow::Result<Vec<u32>> {
-    use super::arcs::Piece;
+pub fn reach<N: Rem>(w: &Winning<N::C>, g: &mut ReachEdges<N>, pairs: &[Xfer<N>], start: Option<u32>, point: (Point<N>, Point<N>), horizon: u32, threads: usize) -> anyhow::Result<Vec<u32>> {
     let n = w.len();
     let threads = threads.max(1);
     let mut last = vec![u32::MAX; n];
     const REACH_SEGS: usize = 32;
     // The current frame's sets, by node (`None`: W_t of the node).
-    let mut cur: Vec<(u32, Option<Region>)> = Vec::new();
+    let mut cur: Vec<(u32, Option<Region<N::C>>)> = Vec::new();
     if let Some(s) = start {
         if w.at(0, s).is_some_and(|r| r.contains(point.0, point.1)) {
-            let p = Piece { y: super::arcs::Seg { lo: point.1, hi: point.1 + 1 }, x: super::arcs::Seg { lo: point.0, hi: point.0 + 1 } };
+            let p = Piece { y: Seg { lo: point.1, hi: N::C::next(point.1) }, x: Seg { lo: point.0, hi: N::C::next(point.0) } };
             cur.push((s, Some(Region::from_pieces(&mut [p], &mut Vec::new()))));
             last[s as usize] = 0;
         }
@@ -1308,10 +1317,10 @@ pub fn reach(w: &Winning, g: &mut ReachEdges, pairs: &[(Transfer, Transfer)], st
         // tagged by target.
         g.load(cur.iter().map(|c| c.0))?;
         let (cur_ref, g) = (&cur, &*g);
-        let mut pushed: Vec<(u32, Piece)> = par_chunks(cur.len(), 64, threads, |lo, hi| {
+        let mut pushed: Vec<(u32, Piece<Point<N>>)> = par_chunks(cur.len(), 64, threads, |lo, hi| {
             let (mut out, mut tmp) = (Vec::new(), Vec::new());
             for (p, r) in &cur_ref[lo..hi] {
-                let r: RegionRef = match r {
+                let r: RegionRef<N::C> = match r {
                     Some(r) => r.as_ref(),
                     None => w.at(t, *p).expect("a node reached in W has a set"),
                 };
@@ -1339,7 +1348,7 @@ pub fn reach(w: &Winning, g: &mut ReachEdges, pairs: &[(Transfer, Transfer)], st
             a = b;
         }
         let pushed_ref = &pushed;
-        let next: Vec<(u32, Option<Region>)> = par_chunks(groups.len(), 256, threads, |lo, hi| {
+        let next: Vec<(u32, Option<Region<N::C>>)> = par_chunks(groups.len(), 256, threads, |lo, hi| {
             let (mut clipped, mut scratch) = (Vec::new(), Vec::new());
             groups[lo..hi]
                 .iter()
@@ -1380,7 +1389,7 @@ pub fn reach(w: &Winning, g: &mut ReachEdges, pairs: &[(Transfer, Transfer)], st
 /// refuted). Valid because the graph is the same at every frame but for
 /// the layers, and k steps from the start reach only layers <= k, so a
 /// layer never binds.
-pub fn optimum(w: &Winning, start: Option<u32>, point: (u32, u32), horizon: u32) -> Option<u32> {
+pub fn optimum<C: Circle>(w: &Winning<C>, start: Option<u32>, point: (C::P, C::P), horizon: u32) -> Option<u32> {
     let s = start?;
     (0..=horizon).rev().find(|&t| w.at(t, s).is_some_and(|r| r.contains(point.0, point.1))).map(|t| horizon - t)
 }
@@ -1391,20 +1400,20 @@ pub fn optimum(w: &Winning, start: Option<u32>, point: (u32, u32), horizon: u32)
 /// edge store - every frame that kept rows has its edges (one that kept
 /// none, under level -1, may have none) - and the tree's shapes and key
 /// space.
-pub struct Seeds {
+pub struct Seeds<N: Rem = P8> {
     pub start: Sk,
     pub wins: Vec<(Sk, u32)>,
-    pub store: EdgeStore,
+    pub store: EdgeStore<N>,
     /// The transfer table, decoded.
-    pub pairs: Vec<(Transfer, Transfer)>,
+    pub pairs: Vec<Xfer<N>>,
     /// The tree's shapes by index, and its key space.
     pub shapes: Vec<u64>,
-    pub space: celeste_engine::exact::KeySpace,
+    pub space: celeste_engine::exact::KeySpace<N>,
 }
 
-impl Seeds {
+impl<N: Rem> Seeds<N> {
     pub fn load(dir: &std::path::Path, horizon: u32) -> anyhow::Result<Self> {
-        let tree = crate::storage::layer::Tree::open(dir, horizon)?;
+        let tree = crate::storage::layer::Tree::<N>::open(dir, horizon)?;
         let (first, _) = tree.layer(0, None, 1)?;
         let mut start = first.states_iter();
         let (Some(start), None) = (start.next(), start.next()) else { anyhow::bail!("{}: frame 0 is not one state", dir.display()) };
@@ -1414,12 +1423,12 @@ impl Seeds {
                 wins.extend(file.wins()?.into_iter().map(|w| (w, f)));
             }
         }
-        let store = EdgeStore::<crate::pico8_num::Pico8Num>::open(&dir.join("edges"), horizon)?;
+        let store = EdgeStore::<N>::open(&dir.join("edges"), horizon)?;
         for f in 1..=horizon {
             let rows = tree.states(f);
             anyhow::ensure!(rows == 0 || store.has_frame(f), "{}: no edges for f{f}, which kept {rows} states", dir.display());
         }
-        let pairs = store.pairs().iter().map(|p| (p.0.transfer(), p.1.transfer())).collect();
+        let pairs = store.pairs().iter().map(N::xfer).collect();
         Ok(Seeds { start, wins, store, pairs, shapes: tree.shapes, space: tree.space })
     }
 
@@ -1439,14 +1448,20 @@ impl Seeds {
 }
 
 /// The start state's remainder as a point of the torus: the room's load has
-/// no player yet, so any point stands for it.
-pub fn start_point(_s: &crate::settings::Settings) -> anyhow::Result<(u32, u32)> {
-    Ok((super::arcs::point(0), super::arcs::point(0)))
+/// no player yet, so any point stands for it - the point of 0.
+pub fn start_point<N: Rem>(_s: &crate::settings::Settings) -> anyhow::Result<(Point<N>, Point<N>)> {
+    let p = zero_point::<N>();
+    Ok((p, p))
+}
+
+/// The point of the remainder 0 (a state with no player stands there).
+fn zero_point<N: Rem>() -> Point<N> {
+    N::point(<N::A as Arithmetic>::from_i16(0)).expect("0 is a remainder")
 }
 
 /// Fragmentation of winning sets (x segments per node, over all slabs) as
 /// (nodes, median, p90, max).
-pub fn fragmentation<'a>(sets: impl Iterator<Item = RegionRef<'a>>) -> (usize, usize, usize, usize) {
+pub fn fragmentation<'a, C: Circle>(sets: impl Iterator<Item = RegionRef<'a, C>>) -> (usize, usize, usize, usize) {
     let mut v: Vec<usize> = sets.map(|r| r.n_segs()).collect();
     if v.is_empty() {
         return (0, 0, 0, 0);
@@ -1486,16 +1501,16 @@ impl Witness {
 /// route: a node IS its state - its region (the shape's index and the
 /// cell's slot), its key and its cell - so only the tree's shapes are
 /// listed.
-pub struct NodeKeys<'w> {
-    w: &'w Winning,
+pub struct NodeKeys<'w, C: Circle = Fixed16> {
+    w: &'w Winning<C>,
     geo: crate::storage::Geometry,
     /// Shape hash -> shape index, sorted.
     shapes: Vec<(u64, u32)>,
 }
 
-impl<'w> NodeKeys<'w> {
+impl<'w, C: Circle> NodeKeys<'w, C> {
     /// Over `w`, the tree's shapes by index.
-    pub fn new(w: &'w Winning, shapes: &[u64]) -> anyhow::Result<Self> {
+    pub fn new(w: &'w Winning<C>, shapes: &[u64]) -> anyhow::Result<Self> {
         let mut by: Vec<(u64, u32)> = shapes.iter().enumerate().map(|(i, &h)| (h, i as u32)).collect();
         by.sort_unstable();
         anyhow::ensure!(by.windows(2).all(|p| p[0].0 != p[1].0), "a shape with two indices");
@@ -1510,7 +1525,7 @@ impl<'w> NodeKeys<'w> {
 
 /// A concrete state's node key at `level` (`lookup_view`, widened) in the
 /// tree's key space (`None`: a code the tree never stored - no node).
-pub(super) fn lookup_keys(b: &crate::frame::Block, level: crate::abstraction::Level, seeded: bool, keys: &celeste_engine::exact::KeySpace) -> anyhow::Result<(u64, Vec<Option<(u64, u64)>>, Vec<u32>)> {
+pub(super) fn lookup_keys<N: EngineNum>(b: &crate::frame::Block<N>, level: crate::abstraction::Level, seeded: bool, keys: &celeste_engine::exact::KeySpace<N>) -> anyhow::Result<(u64, Vec<Option<(u64, u64)>>, Vec<u32>)> {
     if !seeded {
         return crate::frame::widened_keys(b, level, keys);
     }
@@ -1520,7 +1535,7 @@ pub(super) fn lookup_keys(b: &crate::frame::Block, level: crate::abstraction::Le
 /// A concrete state's EXACT identity, UNWIDENED: its canonical bytes
 /// (`exact::exact_rows`) and its cell. Never the level's widened key:
 /// states sharing it need not share their fate (`522de36`).
-pub(super) fn exact_state(b: &crate::frame::Block, cell: u32) -> celeste_engine::exact::ExactRow {
+pub(super) fn exact_state<N: EngineNum>(b: &crate::frame::Block<N>, cell: u32) -> celeste_engine::exact::ExactRow {
     let mut v = celeste_engine::exact::exact_rows(b.rt2(), crate::compiled::ids()).swap_remove(0).into_vec();
     v.extend_from_slice(&cell.to_le_bytes());
     v.into_boxed_slice()
@@ -1533,38 +1548,38 @@ pub(super) fn exact_state(b: &crate::frame::Block, cell: u32) -> celeste_engine:
 /// bob `y` `[start - 2, start + 2]` (the forward recomputes `y` from the
 /// interval phase every frame); the view maps them there, so its key is the
 /// node that over-approximates the state.
-pub(super) fn lookup_view(row: &celeste_engine::runtime2::Rt2, seeded: bool) -> anyhow::Result<celeste_engine::runtime2::Rt2> {
+pub(super) fn lookup_view<N: EngineNum>(row: &celeste_engine::runtime2::Rt2<N>, seeded: bool) -> anyhow::Result<celeste_engine::runtime2::Rt2<N>> {
     use celeste_engine::runtime2::{Col, AV};
     use celeste_engine::widening::{BALLOON_BOB_RAW, BALLOON_PERIOD_RAW};
-    use crate::pico8_num::Pico8Num as P8;
     let mut rt2 = row.clone_block();
     if !seeded {
         return Ok(rt2);
     }
     let ids = crate::compiled::ids();
+    let num = <N::A as Arithmetic>::from_fixed_raw;
     for obj in rt2.objects_of_type(ids, ids.g_balloon) {
         let (Some(oc), Some(yc), Some(sc)) = (rt2.obj_field_cell(obj, ids.f_offset), rt2.obj_field_cell(obj, ids.f_y), rt2.obj_field_cell(obj, ids.f_start)) else { continue };
         let AV::Num(start) = rt2.cols[sc as usize].at(0) else { anyhow::bail!("a balloon's `start` is not a number") };
-        let s = start.as_raw_u32() as i32;
-        rt2.cols[oc as usize] = Col::U(AV::Ival(P8::from_raw(0), P8::from_raw(BALLOON_PERIOD_RAW)));
-        rt2.cols[yc as usize] = Col::U(AV::Ival(P8::from_raw(s - BALLOON_BOB_RAW), P8::from_raw(s + BALLOON_BOB_RAW)));
+        let bob = |f: fn(N, N) -> Option<N>| f(start, num(BALLOON_BOB_RAW)).ok_or_else(|| anyhow::anyhow!("a balloon's bob out of range"));
+        rt2.cols[oc as usize] = Col::U(AV::Ival(num(0), num(BALLOON_PERIOD_RAW)));
+        rt2.cols[yc as usize] = Col::U(AV::Ival(bob(<N::A as Arithmetic>::sub)?, bob(<N::A as Arithmetic>::add)?));
     }
     Ok(rt2)
 }
 
 /// A concrete state's remainder as a point of the torus (no player: the
-/// point (0, 0)).
-pub fn rem_of(rt2: &celeste_engine::runtime2::Rt2) -> anyhow::Result<(u32, u32)> {
+/// point of 0 on both axes).
+pub fn rem_of<N: Rem>(rt2: &celeste_engine::runtime2::Rt2<N>) -> anyhow::Result<(Point<N>, Point<N>)> {
     use celeste_engine::runtime2::AV;
     let ids = crate::compiled::ids();
-    let Some((cx, cy)) = rt2.player_xy_cells(ids, ids.f_rem) else { return Ok((super::arcs::point(0), super::arcs::point(0))) };
-    let raw = |c: usize| -> anyhow::Result<u32> {
+    let Some((cx, cy)) = rt2.player_xy_cells(ids, ids.f_rem) else { return Ok((zero_point::<N>(), zero_point::<N>())) };
+    let at = |c: usize| -> anyhow::Result<Point<N>> {
         match rt2.cols[c].at(0) {
-            AV::Num(n) => Ok(super::arcs::point(n.as_raw_u32() as i32)),
+            AV::Num(n) => N::point(n).ok_or_else(|| anyhow::anyhow!("a remainder {n:?} outside [-1/2, 1/2)")),
             other => anyhow::bail!("a concrete remainder expected, got {other:?}"),
         }
     };
-    Ok((raw(cx)?, raw(cy)?))
+    Ok((at(cx)?, at(cy)?))
 }
 
 /// `n` reference engines for concrete steps, and whether they run seeded:
@@ -1573,10 +1588,10 @@ pub fn rem_of(rt2: &celeste_engine::runtime2::Rt2) -> anyhow::Result<(u32, u32)>
 /// and W keep the phase an interval (sound for every seed), and a concrete
 /// state's key maps its phase to that interval (`lookup_view`). Built under
 /// the run's settings `run`: `_init` runs under them.
-pub(super) fn concrete_engines(n: usize, run: &crate::settings::Settings) -> anyhow::Result<(Vec<crate::trace::refengine::RefEngine>, bool)> {
+pub(super) fn concrete_engines<N: Rem>(n: usize, run: &crate::settings::Settings) -> anyhow::Result<(Vec<crate::trace::refengine::ReferenceEngine<N::A>>, bool)> {
     let seeded = run.concrete_balloon_seeds.is_some();
     let s = crate::settings::Settings { balloon_seeds: run.concrete_balloon_seeds.clone().or_else(|| run.balloon_seeds.clone()), ..run.clone() };
-    let engines = (0..n).map(|_| crate::trace::refengine::RefEngine::new(&s)).collect::<anyhow::Result<Vec<_>>>()?;
+    let engines = (0..n).map(|_| crate::trace::refengine::ReferenceEngine::<N::A>::new(&s)).collect::<anyhow::Result<Vec<_>>>()?;
     Ok((engines, seeded))
 }
 
@@ -1622,24 +1637,24 @@ fn input_order(prefer: Option<&[u8]>, k: u32) -> impl Iterator<Item = u8> {
 /// run in parallel, one reference engine per worker. `horizon` is in search
 /// steps, W's index: under the split frame layer k is W at step `2k`, a
 /// frame boundary, whose nodes key exactly as a whole frame's states.
-pub fn concrete_search(
+pub fn concrete_search<N: Rem>(
     level: crate::abstraction::Level,
     horizon: u32,
-    node: &NodeKeys<'_>,
-    keys: &celeste_engine::exact::KeySpace,
-    w: &Winning,
+    node: &NodeKeys<'_, N::C>,
+    keys: &celeste_engine::exact::KeySpace<N>,
+    w: &Winning<N::C>,
     bound: u32,
     prefer: Option<&[u8]>,
     s: &crate::settings::Settings,
 ) -> anyhow::Result<Option<Witness>> {
     use crate::frame::{wins_of, Block};
     use anyhow::Result;
-    use crate::trace::refengine::RefEngine;
+    use crate::trace::refengine::ReferenceEngine;
     use celeste_engine::runtime2::Rt2;
-    // Their frames run exact (`RefEngine::frame`); `level` is the lookups'.
+    // Their frames run exact (`ReferenceEngine::frame`); `level` is the lookups'.
     let workers = s.threads().max(1);
-    let (engines, seeded) = concrete_engines(workers, s)?;
-    let engines: Vec<std::sync::Mutex<RefEngine>> = engines.into_iter().map(std::sync::Mutex::new).collect();
+    let (engines, seeded) = concrete_engines::<N>(workers, s)?;
+    let engines: Vec<std::sync::Mutex<ReferenceEngine<N::A>>> = engines.into_iter().map(std::sync::Mutex::new).collect();
     let initial = engines[0].lock().expect("an engine").initial()?;
     // W is indexed by search STEP; the concrete search steps whole frames
     // (`RefEngine::frame`), and frame k ends at step `spf * k`.
@@ -1651,14 +1666,14 @@ pub fn concrete_search(
     crate::metrics::mem_phase("concrete: engines up");
     /// A successor that stays inside W (or wins), in (parent, input, leaf)
     /// order within its worker's chunk.
-    struct Succ {
+    struct Succ<N: EngineNum> {
         parent: u32,
         byte: u8,
         cell: u32,
         win: bool,
         exact: celeste_engine::exact::ExactRow,
         /// `None` for a win (its state is never expanded).
-        row: Option<Rt2>,
+        row: Option<Rt2<N>>,
     }
     let start = Block::canonical(initial)?;
     let start_cell = start.positions()?[0];
@@ -1667,11 +1682,11 @@ pub fn concrete_search(
     // lower bound, hence optimal; an exhausted or abandoned DFS proves nothing
     // and the breadth-first search runs.
     {
-        struct Dfs<'a> {
-            eng: &'a mut RefEngine,
-            node: &'a NodeKeys<'a>,
-            keys: &'a celeste_engine::exact::KeySpace,
-            w: &'a Winning,
+        struct Dfs<'a, N: Rem> {
+            eng: &'a mut ReferenceEngine<N::A>,
+            node: &'a NodeKeys<'a, N::C>,
+            keys: &'a celeste_engine::exact::KeySpace<N>,
+            w: &'a Winning<N::C>,
             level: crate::abstraction::Level,
             from: u32,
             frames: u32,
@@ -1685,7 +1700,7 @@ pub fn concrete_search(
             settings: &'a crate::settings::Settings,
         }
         /// `Ok(None)`: out of budget.
-        fn dfs(cx: &mut Dfs, st: &Rt2, k: u32) -> Result<Option<bool>> {
+        fn dfs<N: Rem>(cx: &mut Dfs<N>, st: &Rt2<N>, k: u32) -> Result<Option<bool>> {
             if k >= cx.frames {
                 return Ok(Some(false));
             }
@@ -1714,7 +1729,7 @@ pub fn concrete_search(
                     }
                     let (shape, nk, cells) = lookup_keys(&b, cx.level, cx.seeded, cx.keys)?;
                     let Some(i) = cx.node.get(shape, nk[0], cells[0]) else { continue };
-                    let q = rem_of(b.rt2())?;
+                    let q = rem_of::<N>(b.rt2())?;
                     if !cx.w.at(cx.spf * (cx.from + k + 1), i).is_some_and(|r| r.contains(q.0, q.1)) {
                         continue;
                     }
@@ -1754,19 +1769,19 @@ pub fn concrete_search(
     }
     // Per layer k >= 1, each state's (parent index in layer k-1, input, cell).
     let mut back: Vec<Vec<(u32, u8, u32)>> = Vec::new();
-    let mut cur: Vec<Rt2> = vec![start.into_rt2()];
+    let mut cur: Vec<Rt2<N>> = vec![start.into_rt2()];
     let mut steps = 0u64;
     for k in 0..frames {
         let t = std::time::Instant::now();
         let t_w = spf * (k + 1);
         const CHUNK: usize = 16;
         let next_chunk = std::sync::atomic::AtomicUsize::new(0);
-        let parts: Vec<Result<(Vec<(usize, Vec<Succ>)>, u64)>> = std::thread::scope(|sc| {
+        let parts: Vec<Result<(Vec<(usize, Vec<Succ<N>>)>, u64)>> = std::thread::scope(|sc| {
             let hs: Vec<_> = engines
                 .iter()
                 .map(|engine| {
                     let (cur, next_chunk) = (&cur, &next_chunk);
-                    sc.spawn(move || -> Result<(Vec<(usize, Vec<Succ>)>, u64)> {
+                    sc.spawn(move || -> Result<(Vec<(usize, Vec<Succ<N>>)>, u64)> {
                         let mut eng = engine.lock().expect("an engine");
                         let (mut out, mut steps) = (Vec::new(), 0u64);
                         loop {
@@ -1800,7 +1815,7 @@ pub fn concrete_search(
                                         if !win {
                                             let (shape, nk, cells) = lookup_keys(&b, level, seeded, keys)?;
                                             let Some(i) = node.get(shape, nk[0], cells[0]) else { continue };
-                                            let q = rem_of(b.rt2())?;
+                                            let q = rem_of::<N>(b.rt2())?;
                                             if !w.at(t_w, i).is_some_and(|r| r.contains(q.0, q.1)) {
                                                 continue;
                                             }
@@ -1825,7 +1840,7 @@ pub fn concrete_search(
                 .collect();
             hs.into_iter().map(|h| h.join().expect("a concrete worker panicked")).collect()
         });
-        let mut chunks: Vec<(usize, Vec<Succ>)> = Vec::new();
+        let mut chunks: Vec<(usize, Vec<Succ<N>>)> = Vec::new();
         for p in parts {
             let (c, s) = p?;
             chunks.extend(c);
@@ -1835,7 +1850,7 @@ pub fn concrete_search(
         let succs = chunks.into_iter().flat_map(|c| c.1);
         // Each exact state once, in order; the first win ends the search.
         let mut seen: FxHashSet<celeste_engine::exact::ExactRow> = FxHashSet::default();
-        let (mut next, mut links): (Vec<Rt2>, Vec<(u32, u8, u32)>) = (Vec::new(), Vec::new());
+        let (mut next, mut links): (Vec<Rt2<N>>, Vec<(u32, u8, u32)>) = (Vec::new(), Vec::new());
         let mut won: Option<(u32, u8, u32)> = None;
         for s in succs {
             if s.win {
@@ -1885,7 +1900,7 @@ pub fn concrete_search(
 }
 
 /// What the arc phase of a search found (`solve`).
-pub struct Solved {
+pub struct Solved<N: Rem = P8> {
     /// The optimum over the rotation graph, a lower bound on the game's, in
     /// FRAMES (`horizon` and the marks' deadlines are in search steps).
     /// `None`: the horizon is REFUTED.
@@ -1894,7 +1909,7 @@ pub struct Solved {
     pub concrete: Option<Witness>,
     /// The ARC-MARKED nodes with their deadlines (the last frame their
     /// winning set is non-empty): the next level's `frame::MarkFilter`.
-    pub arc_marks: Option<crate::frame::Visited>,
+    pub arc_marks: Option<crate::frame::Visited<N>>,
     /// The known route's exit frame when it was checked (`search::known`):
     /// it wins by the horizon and survives every pruning step.
     pub known: Option<u32>,
@@ -1903,13 +1918,13 @@ pub struct Solved {
 /// One node's term of the gate's `W f{t}` line: the node's content hash
 /// (`exact::ContentHash::state`) folded with its set's rectangles
 /// (`rewrite bench-backward` prints the same line for one frame).
-pub fn gate_w_hash(node: u64, r: RegionRef) -> u64 {
+pub fn gate_w_hash<C: Circle>(node: u64, r: RegionRef<C>) -> u64 {
     use celeste_engine::runtime2::mix64;
     let mut h = node;
     for (y, xs) in r.slabs() {
-        h = mix64(h ^ ((y.lo as u64) << 32 | y.hi as u64));
+        h = mix64(h ^ C::seg_word(y));
         for x in xs {
-            h = mix64(h ^ ((x.lo as u64) << 32 | x.hi as u64));
+            h = mix64(h ^ C::seg_word(x));
         }
     }
     h
@@ -1925,7 +1940,7 @@ pub fn gate_w_hash(node: u64, r: RegionRef) -> u64 {
 /// With `known`, checks a known solution against every pruning step before
 /// the concrete search (`search::known`): an error if one drops it.
 #[allow(clippy::too_many_arguments)]
-pub fn solve(
+pub fn solve<N: Rem>(
     dir: &std::path::Path,
     level: crate::abstraction::Level,
     horizon: u32,
@@ -1933,14 +1948,14 @@ pub fn solve(
     want_marks: bool,
     save: Option<&std::path::Path>,
     prefer: Option<&[u8]>,
-    known: Option<&super::known::Route>,
+    known: Option<&super::known::Route<N>>,
     s: &crate::settings::Settings,
-) -> anyhow::Result<Solved> {
+) -> anyhow::Result<Solved<N>> {
     use crate::frame::{mark_row, save_marks, MarkRow, Visited};
     s.check(dir, level)?;
     crate::metrics::mem_phase("arc: start");
     let threads = s.threads();
-    let seeds = Seeds::load(dir, horizon)?;
+    let seeds = Seeds::<N>::load(dir, horizon)?;
     crate::metrics::mem_phase("arc: edge files opened");
     let tb = std::time::Instant::now();
     // The closed spans and W's nodes go to scratch files beside the tree
@@ -1953,7 +1968,7 @@ pub fn solve(
     crate::metrics::mem_phase("arc: backward");
     let tb = tb.elapsed().as_secs_f64();
     let start = w.index(seeds.start);
-    let p0 = start_point(s)?;
+    let p0 = start_point::<N>(s)?;
     let arc_steps = optimum(&w, start, p0, horizon);
     // In frames: a win at step s is during frame ceil(s / spf) (a lower
     // bound still: a frame's win is a win at its last step at the latest).
@@ -2063,7 +2078,7 @@ pub fn solve(
 mod tests {
     use super::*;
     use crate::search::arc_edges::AxisXfer;
-    use crate::search::arcs::{pieces, point, Action, Seg, Set, CIRCLE};
+    use crate::search::arcs::{pieces, point, Action, Seg, Set, Transfer, CIRCLE};
 
     /// `seek` is the linear walk: from every start and for every key, over
     /// groups with repeated keys, gaps and runs.
@@ -2385,5 +2400,50 @@ mod tests {
             }
         }
         assert!(checked > 50, "only {checked} winning starts exercised");
+    }
+
+    /// THE FIRST FLOAT OPTIMUM, END TO END: room (1,0) to a synthetic win at
+    /// (4, 101) by f30, in Celia's doubles (the reference engine's tree) and
+    /// in 16.16 (the kernels'). Both arc bounds are 28 and the concrete
+    /// search wins there with one witness; the gate's known route (exit f29)
+    /// survives every pruning step of both; and a sample of the float tree's
+    /// transfers agrees with the reference engine (`arc_check`), which a
+    /// corrupted transfer fails.
+    #[test]
+    fn a_float_search_proves_room_10s_synthetic_optimum() {
+        use crate::abstraction::Level;
+        use crate::frame::{grow_tree, Block, FrameStep};
+        use crate::settings::{Arith, FloatTool, Settings};
+        use crate::trace::refengine::{FloatRefEngine, RefEngine, RefFrameStep};
+        use celeste_core::lua_f64::LuaF64;
+        let base = std::env::temp_dir().join(format!("celeste-float-search-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let known = crate::concrete::read_inputs(concat!(env!("CARGO_MANIFEST_DIR"), "/gates/known_room10_win9-101.txt")).expect("the gate's route");
+        let fixed = Settings { win_at: Some((4, 4, 101, 101)), ..Settings::default() };
+        let float = Settings { arith: Arith::Float(FloatTool::Celia), loading_jank: crate::starts::celia_jank(fixed.room).expect("jank"), ..fixed.clone() };
+        let level = Level::EXACT;
+        // 16.16.
+        let dir = base.join("fixed");
+        grow_tree::<P8>(&dir, 30, None, None, level, || Ok(Box::new(crate::compiled::FrameEngine::new(&fixed, level)?) as Box<dyn FrameStep>), || Ok(vec![Block::canonical(RefEngine::new(&fixed)?.initial()?)?]), &fixed).expect("the fixed forward");
+        let route = super::super::known::Route { inputs: &known, filter: None };
+        let sf = solve::<P8>(&dir, level, 30, true, false, None, None, Some(&route), &fixed).expect("the fixed arc phase");
+        // Doubles.
+        let dir = base.join("float");
+        grow_tree::<LuaF64>(&dir, 30, None, None, level, || Ok(Box::new(RefFrameStep::<LuaF64>::new(&float, level)?) as Box<dyn FrameStep<LuaF64>>), || Ok(vec![Block::canonical(FloatRefEngine::new(&float)?.initial()?)?]), &float).expect("the float forward");
+        let route = super::super::known::Route { inputs: &known, filter: None };
+        let sd = solve::<LuaF64>(&dir, level, 30, true, false, None, None, Some(&route), &float).expect("the float arc phase");
+        for (what, arc, wt, k) in [("16.16", sf.arc, sf.concrete.as_ref(), sf.known), ("doubles", sd.arc, sd.concrete.as_ref(), sd.known)] {
+            assert_eq!(arc, Some(28), "{what}: the arc bound");
+            assert_eq!(wt.map(|w| w.inputs.len()), Some(28), "{what}: the concrete optimum");
+            assert_eq!(k, Some(29), "{what}: the known route is checked and survives");
+        }
+        assert_eq!(sd.concrete.as_ref().map(|w| w.inputs.clone()), sf.concrete.as_ref().map(|w| w.inputs.clone()), "one witness for both (the same input order)");
+        let check = |fault| {
+            let o = super::super::arc_check::Opts { dir: &dir, from: 24, to: 30, samples: 6, level, fault, path_cap: None, settings: &float };
+            super::super::arc_check::run::<LuaF64>(&o, |e, rt2, b, _| e.frame_reads(rt2, b))
+        };
+        check(None).expect("the float transfers agree with the reference engine");
+        assert!(check(Some("action")).is_err(), "a corrupted transfer fails the check");
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

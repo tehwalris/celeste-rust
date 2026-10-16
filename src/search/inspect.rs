@@ -1,6 +1,7 @@
 //! A block's rows by NAME, for the diagnostics that compare rows across
 //! shapes and levels (shapes number their cells differently).
 
+use celeste_core::arith::EngineNum;
 use celeste_engine::runtime2::{BoundaryIds, Cell2, Col, Rt2, AV};
 use std::collections::{BTreeMap, HashMap};
 
@@ -8,10 +9,10 @@ use std::collections::{BTreeMap, HashMap};
 pub type Proj = BTreeMap<String, String>;
 
 /// A value cell for a diagnostic: numbers as decimals, intervals as ranges.
-pub fn av_show(v: AV) -> String {
+pub fn av_show<N: EngineNum>(v: AV<N>) -> String {
     match v {
-        AV::Num(n) => format!("{}", n.as_raw_u32() as i32 as f64 / 65536.0),
-        AV::Ival(a, b) => format!("[{}, {}]", a.as_raw_u32() as i32 as f64 / 65536.0, b.as_raw_u32() as i32 as f64 / 65536.0),
+        AV::Num(n) => format!("{}", n.to_f64()),
+        AV::Ival(a, b) => format!("[{}, {}]", a.to_f64(), b.to_f64()),
         other => format!("{other:?}"),
     }
 }
@@ -19,7 +20,7 @@ pub fn av_show(v: AV) -> String {
 /// A block's value cells by NAME: the player's (`player.x`, `spd.x`,
 /// `rem.y`, `dash_effect_time`) and every object's as `type[i].field[.sub]`.
 /// Globals are left out.
-pub fn cell_names(rt2: &Rt2, ids: &BoundaryIds) -> HashMap<usize, String> {
+pub fn cell_names<N: EngineNum>(rt2: &Rt2<N>, ids: &BoundaryIds) -> HashMap<usize, String> {
     let mut names = HashMap::new();
     if let Some(obj) = crate::search::pos_graph::player_object(rt2) {
         for (nm, f) in [("player.x", ids.f_x), ("player.y", ids.f_y), ("dash_effect_time", ids.f_dash_effect_time)] {
@@ -110,7 +111,7 @@ pub fn cell_names(rt2: &Rt2, ids: &BoundaryIds) -> HashMap<usize, String> {
 
 /// Row `r`'s named value cells, minus `erase` prefixes and pointers
 /// (renumbered between shapes).
-pub fn project_row(rt2: &Rt2, names: &HashMap<usize, String>, r: u32, erase: &[String]) -> Proj {
+pub fn project_row<N: EngineNum>(rt2: &Rt2<N>, names: &HashMap<usize, String>, r: u32, erase: &[String]) -> Proj {
     names
         .iter()
         .filter(|(c, n)| matches!(rt2.structure[**c], Cell2::Val) && !erase.iter().any(|e| n.starts_with(e.as_str())))
@@ -120,13 +121,13 @@ pub fn project_row(rt2: &Rt2, names: &HashMap<usize, String>, r: u32, erase: &[S
 }
 
 /// Every row of `rt2` projected (`project_row`, nothing erased).
-pub fn project_all(rt2: &Rt2) -> Vec<Proj> {
+pub fn project_all<N: EngineNum>(rt2: &Rt2<N>) -> Vec<Proj> {
     let names = cell_names(rt2, crate::compiled::ids());
     (0..rt2.width).map(|r| project_row(rt2, &names, r as u32, &[])).collect()
 }
 
 /// Every row of `rt2` widened onto `level` (`frame::widen_rt2_to`), projected.
-pub fn project_onto(rt2: &mut Rt2, level: crate::abstraction::Level) -> Vec<Proj> {
+pub fn project_onto<N: EngineNum>(rt2: &mut Rt2<N>, level: crate::abstraction::Level) -> Vec<Proj> {
     crate::frame::widen_rt2_to(rt2, level);
     project_all(rt2)
 }
@@ -148,7 +149,7 @@ pub fn brief(p: &Proj) -> String {
 }
 
 /// `brief` of lane `l`.
-pub fn player_summary(rt2: &Rt2, l: usize) -> String {
+pub fn player_summary<N: EngineNum>(rt2: &Rt2<N>, l: usize) -> String {
     let names = cell_names(rt2, crate::compiled::ids());
     brief(&project_row(rt2, &names, l as u32, &[]))
 }

@@ -108,7 +108,7 @@ trait Model {
 
 /// The hull forward's own model, its transfers `skip`ped where marked.
 struct Hulls<'a, N: Rem> {
-    xfers: &'a [N::Xfer],
+    xfers: &'a [crate::search::rem::Xfer<N>],
     skip: Option<&'a [bool]>,
 }
 
@@ -134,7 +134,7 @@ impl<N: Rem> Model for Hulls<'_, N> {
 pub fn replay<N: Rem>(dir: &std::path::Path, to: u32, start: N::Hull, drop: impl Fn(&N::Pair) -> bool, threads: usize) -> Result<Vec<Frame>> {
     let g = Graph::<N>::load(dir, to, threads)?;
     let dropped: Vec<bool> = g.pairs.iter().map(&drop).collect();
-    let xfers: Vec<N::Xfer> = g.pairs.iter().map(N::xfer).collect();
+    let xfers: Vec<crate::search::rem::Xfer<N>> = g.pairs.iter().map(N::xfer).collect();
     let mut out: Vec<Frame> = (0..=to as usize).map(|f| Frame { tree: g.states[f], edges: g.edges[f], ..Default::default() }).collect();
     for v in g.succ.values() {
         for &(_, x, at) in v {

@@ -862,6 +862,169 @@ fn win_at_text(cfg: &celeste_rust::settings::Settings) -> Option<String> {
     cfg.win_at.map(|(x0, x1, y0, y1)| format!("{},{}", r(x0, x1), r(y0, y1)))
 }
 
+/// `rewrite search` in arithmetic `N`: the levels' forwards (`engine` makes
+/// a level's frame step, `initial` the start), each level's arc phase, and
+/// the concrete search at the last; the result recorded beside the trees.
+#[allow(clippy::too_many_arguments)]
+fn search<N: celeste_rust::search::rem::Rem>(
+    cfg: &celeste_rust::settings::Settings,
+    to: Option<u32>,
+    ceiling: Option<u32>,
+    level: String,
+    checkpoint_dir: String,
+    no_witness: bool,
+    save_marks: Option<String>,
+    prefer: Option<String>,
+    engine: impl Fn(Level) -> Result<Box<dyn FrameStep<N>>>,
+    initial: impl Fn() -> Result<Vec<Block<N>>>,
+) -> Result<()> {
+    use celeste_rust::search::result::{LevelResult, SearchResult, Verdict};
+    let prefer: Option<Vec<u8>> = prefer.as_deref().map(celeste_rust::concrete::read_inputs).transpose()?;
+    use celeste_rust::search::arc_dp::solve;
+    let cfg = cfg.clone();
+    let horizon = match (ceiling, to) {
+        (Some(h), None) | (None, Some(h)) => h,
+        _ => anyhow::bail!("give the horizon: --to H, or --ceiling H for a known solution"),
+    };
+    // The horizon is in FRAMES; the tree, the arcs and the marks
+    // count search steps (two a frame under the split frame).
+    let steps = horizon * cfg.steps_per_frame();
+    let levels: Vec<Level> = level.split(',').map(Level::parse).collect::<std::result::Result<_, _>>().map_err(|e| anyhow::anyhow!(e))?;
+    let room = room_text(&cfg);
+    eprintln!("[search] room {room}, levels {level}, horizon {horizon}");
+    let t0 = std::time::Instant::now();
+    let base = std::path::Path::new(&checkpoint_dir);
+    // The record of THIS run: none until it decides.
+    std::fs::create_dir_all(base)?;
+    match std::fs::remove_file(celeste_rust::search::result::path(base)) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e.into()),
+        _ => {}
+    }
+    let mut res = SearchResult {
+        format: celeste_rust::search::result::FORMAT,
+        room: cfg.room,
+        level: level.clone(),
+        horizon,
+        ceiling: ceiling.is_some(),
+        steps_per_frame: cfg.steps_per_frame(),
+        levels: Vec::new(),
+        verdict: Verdict::BoundOnly,
+        optimal: None,
+        witness: None,
+        witness_file: None,
+        wall_s: 0.0,
+        peak_gb: 0.0,
+        error: None,
+    };
+    let record = |res: &mut SearchResult, verdict: Verdict| -> Result<()> {
+        res.verdict = verdict;
+        res.wall_s = t0.elapsed().as_secs_f64();
+        res.peak_gb = celeste_rust::metrics::peak_rss_gb();
+        res.write(base)
+    };
+    // The level -1 table first: a room whose table cannot be built
+    // is a recorded refusal (rerun without the filter), not a panic
+    // somewhere in the forward.
+    if let Some(m) = cfg.minus_one() {
+        if let Err(e) = m.try_table(&cfg) {
+            res.error = Some(format!("{e:#}"));
+            record(&mut res, Verdict::LevelMinusOneRefused)?;
+            return Err(e.context("--level-minus-one: building the level -1 table"));
+        }
+    }
+    // The previous level's arc-marked nodes: the next forward's filter.
+    let mut prev: Option<(Visited<N>, Level)> = None;
+    for (li, &lvl) in levels.iter().enumerate() {
+        let last = li + 1 == levels.len();
+        let dir = base.join(format!("level{li:02}"));
+        // THE FORWARD. Level 0's tree is reused or extended
+        // (`grow_tree`: one filtered by level -1 below this horizon
+        // is refused, a hull tree cannot be raised). A finer
+        // level's tree is filtered by the coarser marks for one
+        // horizon: kept only for the same marks, horizon and level
+        // -1, else built again (it is the cheap one).
+        let t = std::time::Instant::now();
+        let want = cfg.minus_one();
+        let filter = prev.as_ref().map(|(m, l)| celeste_rust::frame::MarkFilter::new(m, *l, cfg.steps_per_frame()));
+        if let Some((m, _)) = &prev {
+            let key = format!("steps {steps} level-1 {want:?} marks {} {:016x}\n", m.len(), m.filter_fingerprint());
+            let key_path = dir.join("filtered_for.txt");
+            if std::fs::read_to_string(&key_path).ok().as_deref() != Some(key.as_str()) {
+                if dir.exists() {
+                    eprintln!("[search] {}: filtered for other marks or another horizon: built again", dir.display());
+                    std::fs::remove_dir_all(&dir)?;
+                }
+                std::fs::create_dir_all(&dir)?;
+                std::fs::write(&key_path, key)?;
+            }
+        }
+        let first_win = celeste_rust::frame::grow_tree(
+            &dir,
+            steps,
+            want,
+            filter.as_ref(),
+            lvl,
+            || engine(lvl),
+            &initial,
+            &cfg,
+        )?
+        .win_frame;
+        let forward_s = t.elapsed().as_secs_f64();
+        // `f` counts search steps.
+        eprintln!("[search] level {li} ({lvl}): forward to f{steps} in {forward_s:.1} s; first win {first_win:?}");
+        celeste_rust::metrics::mem_phase("forward");
+        // THE ARC PHASE, and the concrete search at the LAST level only:
+        // a coarser level's bound is loose wherever its objects are
+        // (gemskip-nodiag 2800m h192: 379 s of a 450 s search went to a
+        // fruitless try at level 0's bound f186; the optimum was 191),
+        // and the finer level decides the optimum anyway.
+        let concrete = last && !no_witness;
+        // Every level saves its marks (the next overwrites).
+        let known = prefer.as_deref().map(|inputs| celeste_rust::search::known::Route { inputs, filter: filter.as_ref() });
+        let s = solve::<N>(&dir, lvl, steps, concrete, !last, save_marks.as_deref().map(std::path::Path::new), prefer.as_deref(), known.as_ref(), &cfg)?;
+        let wall = t0.elapsed().as_secs_f64();
+        res.levels.push(LevelResult { spec: lvl.to_string(), dir: format!("level{li:02}"), forward_s, first_win, arc_bound: s.arc });
+        let Some(bound) = s.arc else {
+            record(&mut res, Verdict::Refuted)?;
+            anyhow::ensure!(ceiling.is_none(), "ceiling {horizon} REFUTED by the arc search at level {li} ({lvl}): a known solution the model cannot reproduce");
+            println!("REFUTED: no win by f{horizon} (level {li}, {lvl}; {wall:.1} s)");
+            return Ok(());
+        };
+        println!("ARC BOUND: no win before f{bound} (level {li}, {lvl}: remainder-exact, the level's objects over-approximated)");
+        if let Some(w) = &s.concrete {
+            let f = w.inputs.len();
+            let path = base.join(format!("witness_frame_{f}.txt"));
+            std::fs::write(
+                &path,
+                format!(
+                    "# Room ({room}): the concrete witness of `rewrite search --level {level} --to {horizon}`{}.\n\
+                     # Arc bound f{bound} (level {li}, {lvl}); no concrete win before f{f} inside the winning sets (exhaustive).\n\
+                     # A balloon room's win may hold for some `rnd` draws only: replay with seeds.\n{}\n",
+                    win_at_text(&cfg).map_or(String::new(), |w| format!(" --win-at {w}")),
+                    w.inputs_text()
+                ),
+            )?;
+            res.optimal = Some(f as u32);
+            res.witness = Some(w.inputs.clone());
+            res.witness_file = Some(path.file_name().expect("a file").to_string_lossy().into_owned());
+            record(&mut res, Verdict::Optimal)?;
+            println!("OPTIMAL win frame: {f} ({wall:.1} s); witness {}", path.display());
+            return Ok(());
+        }
+        if no_witness && last {
+            return record(&mut res, Verdict::BoundOnly);
+        }
+        if last {
+            record(&mut res, Verdict::NoConcreteWin)?;
+            anyhow::ensure!(ceiling.is_none(), "ceiling {horizon}: no concrete witness by it - a known solution the model cannot reproduce");
+            println!("no concrete win by f{horizon} (arc bound f{bound}; {wall:.1} s)");
+            return Ok(());
+        }
+        prev = Some((s.arc_marks.expect("asked for"), lvl));
+    }
+    Ok(())
+}
+
 /// `rewrite forward` in arithmetic `N`: the tree at `dir` grown (or
 /// resumed) to frame `to` by `engine` from `initial`; its first win, wall
 /// time and position graph printed.
@@ -894,7 +1057,7 @@ fn main() -> Result<()> {
     // `bench-frame` times the workers' phases; `--metrics` counts the
     // kernels' census and slices (read when the kernels are built).
     // Only these run in float so far.
-    let float = matches!(cli.command, Command::Census { .. } | Command::Forward { .. } | Command::Ckhash { .. } | Command::HullReplay { .. } | Command::HullRoute { .. });
+    let float = matches!(cli.command, Command::Census { .. } | Command::Search { .. } | Command::ArcCheck { .. } | Command::Forward { .. } | Command::Ckhash { .. } | Command::HullReplay { .. } | Command::HullRoute { .. });
     let cfg = celeste_rust::settings::startup(&cli.settings, float, |s| {
         if let Command::BenchFrame { metrics, .. } = &cli.command {
             s.diag.phases = true;
@@ -903,151 +1066,38 @@ fn main() -> Result<()> {
     })?;
 
     match cli.command {
-        Command::Search { to, ceiling, level, checkpoint_dir, no_witness, save_marks, prefer } => {
-            use celeste_rust::search::result::{LevelResult, SearchResult, Verdict};
-            let prefer: Option<Vec<u8>> = prefer.as_deref().map(celeste_rust::concrete::read_inputs).transpose()?;
-            use celeste_rust::search::arc_dp::solve;
-            let horizon = match (ceiling, to) {
-                (Some(h), None) | (None, Some(h)) => h,
-                _ => anyhow::bail!("give the horizon: --to H, or --ceiling H for a known solution"),
-            };
-            // The horizon is in FRAMES; the tree, the arcs and the marks
-            // count search steps (two a frame under the split frame).
-            let steps = horizon * cfg.steps_per_frame();
-            let levels: Vec<Level> = level.split(',').map(Level::parse).collect::<std::result::Result<_, _>>().map_err(|e| anyhow::anyhow!(e))?;
-            let room = room_text(&cfg);
-            eprintln!("[search] room {room}, levels {level}, horizon {horizon}");
-            let t0 = std::time::Instant::now();
-            let base = std::path::Path::new(&checkpoint_dir);
-            // The record of THIS run: none until it decides.
-            std::fs::create_dir_all(base)?;
-            match std::fs::remove_file(celeste_rust::search::result::path(base)) {
-                Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e.into()),
-                _ => {}
-            }
-            let mut res = SearchResult {
-                format: celeste_rust::search::result::FORMAT,
-                room: cfg.room,
-                level: level.clone(),
-                horizon,
-                ceiling: ceiling.is_some(),
-                steps_per_frame: cfg.steps_per_frame(),
-                levels: Vec::new(),
-                verdict: Verdict::BoundOnly,
-                optimal: None,
-                witness: None,
-                witness_file: None,
-                wall_s: 0.0,
-                peak_gb: 0.0,
-                error: None,
-            };
-            let record = |res: &mut SearchResult, verdict: Verdict| -> Result<()> {
-                res.verdict = verdict;
-                res.wall_s = t0.elapsed().as_secs_f64();
-                res.peak_gb = celeste_rust::metrics::peak_rss_gb();
-                res.write(base)
-            };
-            // The level -1 table first: a room whose table cannot be built
-            // is a recorded refusal (rerun without the filter), not a panic
-            // somewhere in the forward.
-            if let Some(m) = cfg.minus_one() {
-                if let Err(e) = m.try_table(&cfg) {
-                    res.error = Some(format!("{e:#}"));
-                    record(&mut res, Verdict::LevelMinusOneRefused)?;
-                    return Err(e.context("--level-minus-one: building the level -1 table"));
-                }
-            }
-            // The previous level's arc-marked nodes: the next forward's filter.
-            let mut prev: Option<(Visited, Level)> = None;
-            for (li, &lvl) in levels.iter().enumerate() {
-                let last = li + 1 == levels.len();
-                let dir = base.join(format!("level{li:02}"));
-                // THE FORWARD. Level 0's tree is reused or extended
-                // (`grow_tree`: one filtered by level -1 below this horizon
-                // is refused, a hull tree cannot be raised). A finer
-                // level's tree is filtered by the coarser marks for one
-                // horizon: kept only for the same marks, horizon and level
-                // -1, else built again (it is the cheap one).
-                let t = std::time::Instant::now();
-                let want = cfg.minus_one();
-                let filter = prev.as_ref().map(|(m, l)| celeste_rust::frame::MarkFilter::new(m, *l, cfg.steps_per_frame()));
-                if let Some((m, _)) = &prev {
-                    let key = format!("steps {steps} level-1 {want:?} marks {} {:016x}\n", m.len(), m.filter_fingerprint());
-                    let key_path = dir.join("filtered_for.txt");
-                    if std::fs::read_to_string(&key_path).ok().as_deref() != Some(key.as_str()) {
-                        if dir.exists() {
-                            eprintln!("[search] {}: filtered for other marks or another horizon: built again", dir.display());
-                            std::fs::remove_dir_all(&dir)?;
-                        }
-                        std::fs::create_dir_all(&dir)?;
-                        std::fs::write(&key_path, key)?;
-                    }
-                }
-                let first_win = celeste_rust::frame::grow_tree(
-                    &dir,
-                    steps,
-                    want,
-                    filter.as_ref(),
-                    lvl,
-                    || Ok(Box::new(celeste_rust::compiled::FrameEngine::new(&cfg, lvl)?)),
-                    || Ok(vec![Block::canonical(RefEngine::new(&cfg)?.initial()?)?]),
+        Command::Search { to, ceiling, level, checkpoint_dir, no_witness, save_marks, prefer } => match cfg.arith {
+            Arith::Fixed => search::<P8>(
+                &cfg,
+                to,
+                ceiling,
+                level,
+                checkpoint_dir,
+                no_witness,
+                save_marks,
+                prefer,
+                |lvl| Ok(Box::new(celeste_rust::compiled::FrameEngine::new(&cfg, lvl)?)),
+                || Ok(vec![Block::canonical(RefEngine::new(&cfg)?.initial()?)?]),
+            )?,
+            Arith::Float(_) => {
+                // What the float search has not met yet is refused, not run.
+                anyhow::ensure!(!level.contains(','), "--arith float: one level so far (the objects ladder is fixed only)");
+                anyhow::ensure!(cfg.minus_one().is_none(), "--arith float: no level -1 table in float yet");
+                anyhow::ensure!(save_marks.is_none(), "--arith float: --save-marks (the UI's arc pass) is fixed only so far");
+                search::<LuaF64>(
                     &cfg,
+                    to,
+                    ceiling,
+                    level,
+                    checkpoint_dir,
+                    no_witness,
+                    save_marks,
+                    prefer,
+                    |lvl| Ok(Box::new(celeste_rust::trace::refengine::RefFrameStep::<LuaF64>::new(&cfg, lvl)?)),
+                    || Ok(vec![Block::canonical(FloatRefEngine::new(&cfg)?.initial()?)?]),
                 )?
-                .win_frame;
-                let forward_s = t.elapsed().as_secs_f64();
-                // `f` counts search steps.
-                eprintln!("[search] level {li} ({lvl}): forward to f{steps} in {forward_s:.1} s; first win {first_win:?}");
-                celeste_rust::metrics::mem_phase("forward");
-                // THE ARC PHASE, and the concrete search at the LAST level only:
-                // a coarser level's bound is loose wherever its objects are
-                // (gemskip-nodiag 2800m h192: 379 s of a 450 s search went to a
-                // fruitless try at level 0's bound f186; the optimum was 191),
-                // and the finer level decides the optimum anyway.
-                let concrete = last && !no_witness;
-                // Every level saves its marks (the next overwrites).
-                let known = prefer.as_deref().map(|inputs| celeste_rust::search::known::Route { inputs, filter: filter.as_ref() });
-                let s = solve(&dir, lvl, steps, concrete, !last, save_marks.as_deref().map(std::path::Path::new), prefer.as_deref(), known.as_ref(), &cfg)?;
-                let wall = t0.elapsed().as_secs_f64();
-                res.levels.push(LevelResult { spec: lvl.to_string(), dir: format!("level{li:02}"), forward_s, first_win, arc_bound: s.arc });
-                let Some(bound) = s.arc else {
-                    record(&mut res, Verdict::Refuted)?;
-                    anyhow::ensure!(ceiling.is_none(), "ceiling {horizon} REFUTED by the arc search at level {li} ({lvl}): a known solution the model cannot reproduce");
-                    println!("REFUTED: no win by f{horizon} (level {li}, {lvl}; {wall:.1} s)");
-                    return Ok(());
-                };
-                println!("ARC BOUND: no win before f{bound} (level {li}, {lvl}: remainder-exact, the level's objects over-approximated)");
-                if let Some(w) = &s.concrete {
-                    let f = w.inputs.len();
-                    let path = base.join(format!("witness_frame_{f}.txt"));
-                    std::fs::write(
-                        &path,
-                        format!(
-                            "# Room ({room}): the concrete witness of `rewrite search --level {level} --to {horizon}`{}.\n\
-                             # Arc bound f{bound} (level {li}, {lvl}); no concrete win before f{f} inside the winning sets (exhaustive).\n\
-                             # A balloon room's win may hold for some `rnd` draws only: replay with seeds.\n{}\n",
-                            win_at_text(&cfg).map_or(String::new(), |w| format!(" --win-at {w}")),
-                            w.inputs_text()
-                        ),
-                    )?;
-                    res.optimal = Some(f as u32);
-                    res.witness = Some(w.inputs.clone());
-                    res.witness_file = Some(path.file_name().expect("a file").to_string_lossy().into_owned());
-                    record(&mut res, Verdict::Optimal)?;
-                    println!("OPTIMAL win frame: {f} ({wall:.1} s); witness {}", path.display());
-                    return Ok(());
-                }
-                if no_witness && last {
-                    return record(&mut res, Verdict::BoundOnly);
-                }
-                if last {
-                    record(&mut res, Verdict::NoConcreteWin)?;
-                    anyhow::ensure!(ceiling.is_none(), "ceiling {horizon}: no concrete witness by it - a known solution the model cannot reproduce");
-                    println!("no concrete win by f{horizon} (arc bound f{bound}; {wall:.1} s)");
-                    return Ok(());
-                }
-                prev = Some((s.arc_marks.expect("asked for"), lvl));
             }
-        }
+        },
         Command::HullStats { checkpoint_dir, to } => {
             hull_stats(std::path::Path::new(&checkpoint_dir), to, cfg.threads())?;
         }
@@ -1366,7 +1416,7 @@ fn main() -> Result<()> {
             anyhow::ensure!(frame < horizon, "--frame {frame}: below the horizon {horizon}");
             let dir = std::path::Path::new(&level_dir);
             let t = std::time::Instant::now();
-            let seeds = celeste_rust::search::arc_dp::Seeds::load(dir, horizon)?;
+            let seeds = celeste_rust::search::arc_dp::Seeds::<P8>::load(dir, horizon)?;
             let content = seeds.space.content_hash();
             eprintln!("[bench-backward] h{horizon}'s edge files opened in {:.2} s: {} win rows, {} edges; {} threads", t.elapsed().as_secs_f64(), seeds.wins.len(), seeds.store.edges, cfg.threads());
             let mut first: Option<String> = None;
@@ -1493,274 +1543,17 @@ fn main() -> Result<()> {
             );
         }
         Command::ArcCheck { level_dir, from, to, samples, level, fault, path_cap } => {
-            use celeste_engine::runtime2::{Col, AV};
-            use celeste_rust::search::arcs::{point, Rect, Rects, Set, CIRCLE};
-            let dir = std::path::Path::new(&level_dir);
-            cfg.check(dir, level)?;
-            let edges_dir = dir.join("edges");
-            let ids = celeste_rust::compiled::ids();
-            let graph = celeste_rust::storage::edges::EdgeStore::<P8>::open(&edges_dir, to)?;
-            let rem_cells = |rt2: &Rt2| rt2.player_xy_cells(ids, ids.f_rem);
-            // One stored state's row, as a one-lane block.
-            let tree = Tree::<P8>::open(dir, to)?;
-            let row_of = |s: Sk| -> Result<Block> {
-                let f = tree.layer_of(s, to)?.ok_or_else(|| anyhow::anyhow!("state {}: in no frame through f{to}", s.show()))?;
-                Ok(Block::from_rt2(tree.row(f, s, cfg.room)?))
-            };
-            // Every successor of `row` at remainder `rem` over all 64 inputs:
-            // its projection onto the level and its player's remainder; and
-            // the reference steps it took.
-            type Succ = ((u64, Option<(u64, u64)>, u32), Option<(u32, u32)>);
-            // The tree's key space: projections keyed as its rows (`None`: a
-            // code it never stored).
-            let space = &tree.space;
-            let successors = |eng: &mut RefEngine, row: &Block, rem: (u32, u32)| -> Result<(Vec<Succ>, u64)> {
-                // As the kernels read it: projected onto the level (the start
-                // row is stored exact), then the probe's remainder.
-                let mut rt2 = row.rt2().clone_block();
-                widen_rt2_to(&mut rt2, level);
-                if let Some((cx, cy)) = rem_cells(&rt2) {
-                    rt2.cols[cx] = Col::U(AV::Num(celeste_rust::pico8_num::Pico8Num::from_raw(rem.0 as i32 - 32768)));
-                    rt2.cols[cy] = Col::U(AV::Num(celeste_rust::pico8_num::Pico8Num::from_raw(rem.1 as i32 - 32768)));
+            use celeste_rust::search::arc_check::{run, Opts};
+            let o = Opts { dir: std::path::Path::new(&level_dir), from, to, samples, level, fault: fault.as_deref(), path_cap, settings: &cfg };
+            match cfg.arith {
+                // 16.16 forks the level's unknowns as its kernels do.
+                Arith::Fixed => run::<P8>(&o, |e, rt2, b, lvl| e.step_at(rt2, b, lvl))?,
+                // Doubles: the row must be concrete once its remainder is the probe.
+                Arith::Float(_) => {
+                    anyhow::ensure!(level == Level::EXACT, "--arith float: arc-check at r0sx only so far (the row must be concrete at the probe)");
+                    run::<LuaF64>(&o, |e, rt2, b, _| e.frame_reads(rt2, b))?
                 }
-                let (mut out, mut steps) = (Vec::new(), 0u64);
-                // An input that agrees with one already run on the buttons it
-                // read makes the same successors (`RefEngine::step_reads`).
-                let mut ran: Vec<(u8, u8)> = Vec::new();
-                for b in 0..64u8 {
-                    if ran.iter().any(|(r, m)| (r ^ b) & m == 0) {
-                        continue;
-                    }
-                    let (blocks, read) = eng.step_at(&rt2, b, level)?;
-                    ran.push((b, read));
-                    for blk in blocks {
-                        steps += 1;
-                        let q = match rem_cells(blk.rt2()) {
-                            Some((cx, cy)) => {
-                                let raw = |c: usize| -> Result<u32> {
-                                    match blk.rt2().cols[c].at(0) {
-                                        AV::Num(n) => Ok(point(n.as_raw_u32() as i32)),
-                                        other => anyhow::bail!("arc-check: a concrete remainder expected, got {other:?}"),
-                                    }
-                                };
-                                Some((raw(cx)?, raw(cy)?))
-                            }
-                            None => None,
-                        };
-                        let (shape, keys, cells) = widened_keys(&blk, level, space)?;
-                        out.push(((shape, keys[0], cells[0]), q));
-                    }
-                }
-                Ok((out, steps))
-            };
-            // The injected fault (`--fault`), on one decoded x transfer.
-            let corrupt = |mut t: celeste_rust::search::arcs::Transfer| -> Result<celeste_rust::search::arcs::Transfer> {
-                use celeste_rust::search::arcs::Action;
-                match fault.as_deref() {
-                    None => {}
-                    Some("action") => {
-                        t.action = match t.action {
-                            Action::Rotate(v) => Action::Rotate(v + 1),
-                            Action::Const(c) => Action::Const((c + 1) % CIRCLE),
-                        }
-                    }
-                    Some("guard") => t.guard.lo = (t.guard.lo + 1).min(t.guard.hi - 1),
-                    Some(other) => anyhow::bail!("--fault {other}: `action` or `guard`"),
-                }
-                Ok(t)
-            };
-            /// A record with its transfer decoded.
-            struct Rec {
-                target: celeste_rust::storage::Sk,
-                src: celeste_rust::storage::Sk,
-                x: celeste_rust::search::arcs::Transfer,
-                y: celeste_rust::search::arcs::Transfer,
             }
-            /// One sampled record's verdicts, and what it printed.
-            #[derive(Default)]
-            struct Sampled {
-                inside: u64,
-                inside_bad: u64,
-                unpredicted: u64,
-                outside: u64,
-                outside_bad: u64,
-                no_player: u64,
-                steps: u64,
-                /// Over the path cap (`--path-cap`): not checked.
-                skipped: u64,
-                msgs: Vec<String>,
-            }
-            // One sampled record against the reference engine.
-            let check = |eng: &mut RefEngine, frame: u32, r: &Rec, recs: &[Rec]| -> Result<Sampled> {
-                let mut o = Sampled::default();
-                let src = r.src;
-                let src_row = row_of(src)?;
-                // The target by what it is (a hull tree records edges into
-                // states it reaches later or never: not every target has a
-                // frame).
-                let target = (tree.shape_of(r.target.region)?, Some(r.target.key), r.target.cell(&celeste_rust::storage::GEOMETRY));
-                let (gx, gy) = (r.x.guard, r.y.guard);
-                // Every record of this (pred, target), and its guards as rectangles.
-                let pair: Vec<&Rec> = recs.iter().filter(|q| q.target == r.target && q.src == src).collect();
-                let mut union = Rects::empty();
-                for q in &pair {
-                    union.add(Rect { x: q.x.guard_set(), y: q.y.guard_set() });
-                }
-                let has_player = rem_cells(src_row.rt2()).is_some();
-                if !has_player {
-                    o.no_player += 1;
-                }
-                let mid = |g: celeste_rust::search::arcs::Seg| (g.lo + g.hi) / 2;
-                let probes: Vec<(u32, u32)> = if has_player {
-                    vec![(gx.lo, gy.lo), (gx.hi - 1, gy.hi - 1), (mid(gx), mid(gy)), (gx.lo, gy.hi - 1)]
-                } else {
-                    vec![(CIRCLE / 2, CIRCLE / 2)]
-                };
-                for p in probes {
-                    o.inside += 1;
-                    let want = (r.x.action.image(&Set::point(p.0)), r.y.action.image(&Set::point(p.1)));
-                    let (succs, steps) = successors(eng, &src_row, p)?;
-                    o.steps += steps;
-                    let ok = succs.iter().any(|(id, q)| {
-                        *id == target
-                            && match q {
-                                Some((qx, qy)) => want.0.contains(*qx) && want.1.contains(*qy),
-                                None => true,
-                            }
-                    });
-                    // Every successor on the target lands where a record
-                    // of the pair that takes `p` predicts.
-                    let predicted = |q: &(u32, u32)| {
-                        pair.iter().any(|o| {
-                            o.x.takes(p.0)
-                                && o.y.takes(p.1)
-                                && o.x.action.image(&Set::point(p.0)).contains(q.0)
-                                && o.y.action.image(&Set::point(p.1)).contains(q.1)
-                        })
-                    };
-                    let stray: Vec<(u32, u32)> = succs.iter().filter(|(id, _)| *id == target).filter_map(|(_, q)| *q).filter(|q| !predicted(q)).collect();
-                    if !stray.is_empty() {
-                        o.unpredicted += 1;
-                        o.msgs.push(format!("[arc-check] f{frame} pred {} -> {}: inside {p:?} the reference reaches the target at {stray:?}, which no record of the pair taking the point predicts", src.show(), r.target.show()));
-                    }
-                    if !ok {
-                        o.inside_bad += 1;
-                        let reached: Vec<&Option<(u32, u32)>> = succs.iter().filter(|(id, _)| *id == target).map(|(_, q)| q).collect();
-                        o.msgs.push(format!(
-                            "[arc-check] f{frame} pred {} -> {}: inside {p:?} the transfer x {:?} y {:?} predicts {want:?}; the reference reaches the target with remainders {reached:?}",
-                            src.show(), r.target.show(), r.x, r.y
-                        ));
-                    }
-                }
-                if has_player {
-                    let mut outs: Vec<(u32, u32)> = Vec::new();
-                    for (x, y) in [(gx.lo.wrapping_sub(1), mid(gy)), (gx.hi, mid(gy)), (mid(gx), gy.lo.wrapping_sub(1)), (mid(gx), gy.hi), (gx.hi, gy.hi)] {
-                        if x < CIRCLE && y < CIRCLE && !union.contains(x, y) {
-                            outs.push((x, y));
-                        }
-                    }
-                    for p in outs {
-                        o.outside += 1;
-                        let (succs, steps) = successors(eng, &src_row, p)?;
-                        o.steps += steps;
-                        if succs.iter().any(|(id, _)| *id == target) {
-                            o.outside_bad += 1;
-                            o.msgs.push(format!("[arc-check] f{frame} pred {} -> {}: OUTSIDE every guard of the pair at {p:?}, the reference reaches the target", src.show(), r.target.show()));
-                        }
-                    }
-                }
-                Ok(o)
-            };
-            let (mut missing_total, mut records_total, mut sampled) = (0u64, 0u64, 0u64);
-            let mut total = Sampled::default();
-            let mut kinds = std::collections::BTreeMap::<String, u64>::new();
-            let t0 = std::time::Instant::now();
-            let workers = cfg.threads();
-            for frame in from..=to {
-                let all = graph.edges_at(frame, cfg.threads())?;
-                let missing = all.iter().filter(|e| graph.pair(e.xfer).is_none()).count() as u64;
-                missing_total += missing;
-                let recs: Vec<Rec> = all
-                    .iter()
-                    .filter_map(|e| graph.pair(e.xfer).map(|p| (e, p)))
-                    .map(|(e, p)| Ok(Rec { target: e.dst, src: e.src, x: corrupt(p.0.transfer())?, y: p.1.transfer() }))
-                    .collect::<Result<_>>()?;
-                records_total += recs.len() as u64;
-                for r in &recs {
-                    for (axis, t) in [("x", &r.x), ("y", &r.y)] {
-                        let whole = t.guard == celeste_rust::search::arcs::Seg { lo: 0, hi: celeste_rust::search::arcs::CIRCLE };
-                        let k = format!("{axis} {} {}", if whole { "whole" } else { "piece" }, match t.action { celeste_rust::search::arcs::Action::Rotate(_) => "rotate", _ => "const" });
-                        *kinds.entry(k).or_default() += 1;
-                    }
-                }
-                // `samples` records evenly spaced, checked in parallel (a
-                // reference engine per worker), reported in record order.
-                let stride = (recs.len() / samples.max(1)).max(1);
-                let picked: Vec<&Rec> = recs.iter().step_by(stride).take(samples).collect();
-                let next = std::sync::atomic::AtomicUsize::new(0);
-                let mut done: Vec<(usize, Sampled)> = std::thread::scope(|sc| {
-                    let hs: Vec<_> = (0..workers.min(picked.len()))
-                        .map(|_| {
-                            sc.spawn(|| -> Result<Vec<(usize, Sampled)>> {
-                                let mut eng = RefEngine::new(&cfg)?;
-                                if let Some(cap) = path_cap {
-                                    eng.set_path_cap(cap);
-                                }
-                                let mut out = Vec::new();
-                                loop {
-                                    let k = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                    let Some(r) = picked.get(k) else { return Ok(out) };
-                                    match check(&mut eng, frame, r, &recs) {
-                                        Ok(o) => out.push((k, o)),
-                                        Err(e) if e.downcast_ref::<celeste_rust::trace::refdriver::TooManyPaths>().is_some() => {
-                                            let msg = format!("[arc-check] f{frame} pred {} -> {}: SKIPPED ({e})", r.src.show(), r.target.show());
-                                            out.push((k, Sampled { skipped: 1, msgs: vec![msg], ..Default::default() }));
-                                        }
-                                        Err(e) => return Err(e),
-                                    }
-                                }
-                            })
-                        })
-                        .collect();
-                    hs.into_iter().map(|h| h.join().expect("an arc-check worker panicked")).collect::<Result<Vec<_>>>()
-                })?
-                .into_iter()
-                .flatten()
-                .collect();
-                done.sort_by_key(|d| d.0);
-                for (_, o) in done {
-                    for m in &o.msgs {
-                        eprintln!("{m}");
-                    }
-                    sampled += 1;
-                    total.skipped += o.skipped;
-                    total.inside += o.inside;
-                    total.inside_bad += o.inside_bad;
-                    total.unpredicted += o.unpredicted;
-                    total.outside += o.outside;
-                    total.outside_bad += o.outside_bad;
-                    total.no_player += o.no_player;
-                    total.steps += o.steps;
-                }
-                eprintln!(
-                    "[arc-check] f{frame:03}: {} records, {missing} without a transfer; so far inside {} ({} bad, {} unpredicted), outside {} ({} bad), {} ref steps, {:.1} s",
-                    recs.len(),
-                    total.inside,
-                    total.inside_bad,
-                    total.unpredicted,
-                    total.outside,
-                    total.outside_bad,
-                    total.steps,
-                    t0.elapsed().as_secs_f64()
-                );
-            }
-            println!("arc-check f{from}-f{to}: {records_total} records; transfers per axis {kinds:?}");
-            println!("completeness: {missing_total} recorded edges without a transfer");
-            println!(
-                "agreement: {sampled} sampled records ({} from a row without a player, {} SKIPPED over the path cap); inside the guard {} probes, {} disagree, {} reach the target unpredicted; outside every guard {} probes, {} reach the target; {} reference steps",
-                total.no_player, total.skipped, total.inside, total.inside_bad, total.unpredicted, total.outside, total.outside_bad, total.steps
-            );
-            anyhow::ensure!(missing_total == 0 && total.inside_bad == 0 && total.unpredicted == 0 && total.outside_bad == 0, "arc-check: disagreement");
         }
         Command::CoarseCensus { level_dir, from, to, erase } => {
             let erase = prefixes(&erase);
@@ -2760,7 +2553,7 @@ fn reach_command(checkpoint_dir: &str, level_index: usize, to: u32, save: Option
         })
         .transpose()?;
     let mut cells_file = cells_out.map(|p| std::fs::File::create(p).map(std::io::BufWriter::new)).transpose()?;
-    let point = celeste_rust::search::arc_dp::start_point(cfg)?;
+    let point = celeste_rust::search::arc_dp::start_point::<P8>(cfg)?;
     let t0 = std::time::Instant::now();
     // Written frame by frame (a run stopped part way keeps them): the
     // frames' sums (`reach.tsv`) and the reached sets' shapes

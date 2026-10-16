@@ -168,7 +168,7 @@ pub fn points(r: &Region) -> u64 {
 #[allow(clippy::type_complexity)]
 pub fn reach(dir: &std::path::Path, horizon: u32, point: (u32, u32), threads: usize, mut visit: impl FnMut(&FrameReach, Option<Pushes>, &[(Sk, Region)], &FxHashMap<Sk, u8>) -> Result<()>) -> Result<Reach> {
     let geo = GEOMETRY;
-    let seeds = super::arc_dp::Seeds::load(dir, horizon)?;
+    let seeds = super::arc_dp::Seeds::<celeste_core::pico8_num::Pico8Num>::load(dir, horizon)?;
     let tree = crate::storage::layer::Tree::open(dir, horizon)?;
     let wins = seeds.win_ids();
     let pairs: &[(Transfer, Transfer)] = &seeds.pairs;

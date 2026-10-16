@@ -1758,7 +1758,7 @@ mod tests {
         let st = ForwardState::<P8>::at(&hull, to, false, level, &s).expect("at");
         let tree = crate::storage::layer::Tree::<P8>::open(&hull, to).expect("tree");
         let layers: Vec<Layer> = (0..=to).map(|f| tree.layer(f, None, 4).expect("layer").0).collect();
-        let p0 = crate::search::arc_dp::start_point(&s).expect("start");
+        let p0 = crate::search::arc_dp::start_point::<P8>(&s).expect("start");
         let mut checked = 0u64;
         crate::search::reach::reach(&hull, to, p0, 4, |sums, _, cur, inexact| {
             assert!(inexact.is_empty(), "room (1,0) to f44 needs no coarsening");
