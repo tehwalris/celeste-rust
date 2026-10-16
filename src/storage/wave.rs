@@ -423,9 +423,9 @@ pub fn run_wave<N: Rem>(engine: &dyn FrameStep<N>, front: Frontier<N>, cx: WaveC
     let (level, s) = (engine.level(), &engine.settings());
     let game_frame = frame.div_ceil(s.steps_per_frame());
     ensure!(
-        !level.platforms || game_frame as usize <= crate::trace::kernel::PLATFORM_WORLD_FRAMES,
+        !level.platforms || game_frame as usize <= crate::trace::walk::PLATFORM_WORLD_FRAMES,
         "frame {frame} at {level}: the platform worlds cover {} frames",
-        crate::trace::kernel::PLATFORM_WORLD_FRAMES
+        crate::trace::walk::PLATFORM_WORLD_FRAMES
     );
     ensure!(frame > 0, "a wave makes frame 1 on");
     ensure!(front.hulls.len() as u64 == front.new.states(), "frame {frame}: {} hulls for the frontier's {} new states", front.hulls.len(), front.new.states());

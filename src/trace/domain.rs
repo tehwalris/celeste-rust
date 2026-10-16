@@ -299,7 +299,7 @@ pub trait Domain: Clone + Default {
     }
 
     /// Does undecided `c` read an input this trace REFUSES MERGES on
-    /// (`verify::trace_frame`'s `merge_refused_on`)? A merge that would
+    /// (`frame::trace_frame`'s `merge_refused_on`)? A merge that would
     /// select on `c` is two successors instead, as on an unknown atom.
     fn reads_merge_refused(&mut self, _c: &Self::Bool) -> bool {
         false
@@ -449,7 +449,7 @@ pub struct Symbolic<A: GraphArith = Fixed> {
     /// `reads_unknown_atom`'s memo: structural, like `lane_memo`.
     atom_memo: rustc_hash::FxHashMap<NodeId, bool>,
     /// The input cells THIS trace refuses merges on, sorted
-    /// (`verify::trace_frame`'s `merge_refused_on`; set by every trace).
+    /// (`frame::trace_frame`'s `merge_refused_on`; set by every trace).
     merge_refused: Vec<u32>,
     /// `reads_merge_refused`'s memo, for `merge_refused`.
     merge_refused_memo: rustc_hash::FxHashMap<NodeId, bool>,

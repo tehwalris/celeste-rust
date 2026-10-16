@@ -27,7 +27,7 @@ shape (numbers) or unknown (booleans): `rem` the whole [-0.5, 0.5), speed
 [-S, S], the other fields found inductively. Lattice pins stay while they
 hold. One frame from a node:
 
-1. **Trace** the shape (`verify::trace_frame`, level-0 widenings) with the
+1. **Trace** the shape (`frame::trace_frame`, level-0 widenings) with the
    objects' unpinned `rem`/`spd` as bounded interval inputs (the `move`
    fork's arity is the hull's width, level -1 only).
 2. **Copy the cone** of every outcome's `live`, error, position and fields:

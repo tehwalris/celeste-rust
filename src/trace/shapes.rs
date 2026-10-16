@@ -1,4 +1,4 @@
-//! A state as the walk (`kernel::room_constant_lattice`) sees it: which
+//! A state as the walk (`walk::room_constant_lattice`) sees it: which
 //! scalars are STATE (`state_paths`, what a trace symbolizes), its
 //! constants, and `blank`/`rebase` (the values do not matter: every
 //! non-frozen scalar is symbolized at a frame's start, so two states of one

@@ -317,8 +317,8 @@ impl Settings {
     }
 
     /// The kernels' region grid (`--region`; `None`: off).
-    pub fn region_grid(&self) -> Option<crate::trace::kernel::RegionGrid> {
-        self.region.map(|(px, speed)| crate::trace::kernel::RegionGrid { px, speed })
+    pub fn region_grid(&self) -> Option<crate::trace::walk::RegionGrid> {
+        self.region.map(|(px, speed)| crate::trace::walk::RegionGrid { px, speed })
     }
 
     /// The run's level -1 filter (`--level-minus-one H,S`), if given.

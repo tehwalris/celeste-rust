@@ -126,11 +126,11 @@ unknown split apart admit combinations no value gives).
 
 **One fork concept**: choose a node, partition its set, duplicate the
 downstream cone per part, fold. Buttons, held trails and escaped atoms are
-2-way forks every lane takes both ways. `verify::split_undecided_selects`
+2-way forks every lane takes both ways. `split::split_undecided_selects`
 runs after tracing: split a select driven by something lane-undecidable at
 its most upstream place, refold, dedupe outcomes. For the platforms it
 carries per path the (world, player pixel) POINTS its answers hold at
-(`verify::Points`). `lower::specialize_frame` enumerates per outcome only
+(`split::Points`). `lower::specialize_frame` enumerates per outcome only
 the forks in its own cone.
 
 **Error is derived, never carried** (`trace::error`): `error(n) =
@@ -158,7 +158,7 @@ Unknown `live` reads as live (over-approximate); unknown `error` reads as
 error: a declined lane is a FATAL `KERNEL COVERAGE GAP`. There is no
 fallback to the interpreter.
 
-**The lattice walk** (`trace::kernel::room_constant_lattice`) walks (shape,
+**The lattice walk** (`trace::walk::room_constant_lattice`) walks (shape,
 region) nodes from the start in parallel rounds, traced against the
 round's lattice snapshot. A region (`--region px,S`, default 16 px, S <= 7
 because `move`'s loop is unrolled for `|amount| <= 8`) bounds the player's

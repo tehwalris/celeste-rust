@@ -224,12 +224,12 @@ impl KeyField {
 /// Keyed on the words alone, `UnitSink::xfer_id_raw`'s cache gave a lane
 /// whichever body's transfer was interned first (a scheduling-dependent edge,
 /// room (1,0) f61, 2026-10-09).
-pub(crate) const RAW_WORDS: usize = 4 * crate::trace::verify::ARC_AXIS_ROOTS + 1;
+pub(crate) const RAW_WORDS: usize = 4 * crate::trace::frame::ARC_AXIS_ROOTS + 1;
 pub(crate) type RawWords<N = P8> = [<N as EngineNum>::Raw; RAW_WORDS];
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub(super) struct ArcSlots {
-    pub roots: [(usize, RootKind); 2 * crate::trace::verify::ARC_AXIS_ROOTS],
+    pub roots: [(usize, RootKind); 2 * crate::trace::frame::ARC_AXIS_ROOTS],
     pub fin: bool,
 }
 
@@ -238,7 +238,7 @@ impl ArcSlots {
     #[inline]
     fn read_roots(&self) -> impl Iterator<Item = (usize, (usize, RootKind))> + '_ {
         let fin = self.fin;
-        self.roots.iter().copied().enumerate().filter(move |(k, _)| fin || k % crate::trace::verify::ARC_AXIS_ROOTS != 4)
+        self.roots.iter().copied().enumerate().filter(move |(k, _)| fin || k % crate::trace::frame::ARC_AXIS_ROOTS != 4)
     }
 
     /// Lane `i`'s transfer as plain words off the output slots: per root
@@ -298,7 +298,7 @@ impl ArcSlots {
         let one = N::Raw::from(1u32);
         let num = |r: N::Raw| N::from_raw(r).unwrap_or_else(|| panic!("arc edges: shape {:#x} outcome {outcome} lane {lane}: a transfer root {r:?} is no number", chunk.shape_hash));
         let axis = |a: usize| -> Capture<N> {
-            let base = a * crate::trace::verify::ARC_AXIS_ROOTS;
+            let base = a * crate::trace::frame::ARC_AXIS_ROOTS;
             let pair = |k: usize| (num(words[2 * (base + k)]), num(words[2 * (base + k) + 1]));
             assert!(
                 self.roots[base].1 == RootKind::Bool && words[2 * base + 1] == one,

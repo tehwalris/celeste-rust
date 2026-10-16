@@ -1,84 +1,20 @@
-//! The kernel pipeline's front half: the constant-lattice walk over a room's
-//! (shape, region) nodes, then binding and lowering each traced frame.
+//! The constant-lattice WALK over a room's (shape, region) nodes: every frame
+//! a kernel is built from (`lower::lattice_kernel_refs` binds and lowers them),
+//! with the no-player phase's ranges and the region key.
 
 use anyhow::Result;
 
 use celeste_core::arith::{Arithmetic, Fixed};
 
-use super::emit::{Bound, Lowered};
-use super::verify::Frame;
+use super::lower::Bound;
 use crate::transpile::garith::GraphArith;
 
-
-/// One traced frame, bound and lowered, everything owned.
-pub struct Reference<A: GraphArith = Fixed> {
-    pub frame: Frame<A>,
-    pub bound: Bound<A>,
-    pub lowered: Lowered<A>,
-    pub cart: std::sync::Arc<celeste_core::cart_data::CartData>,
-    pub cache: std::sync::Arc<celeste_core::collision_cache::CollisionCache>,
-}
-
-/// Restate a lowering failure with its `Cell(n)`s named by interface path.
-fn name_cells<A: GraphArith>(f: &super::verify::Frame<A>, e: anyhow::Error) -> anyhow::Error {
-    let msg = format!("{:#}", e);
-    let mut seen: std::collections::BTreeSet<u32> = Default::default();
-    let mut at = msg.as_str();
-    while let Some(i) = at.find("Cell(") {
-        at = &at[i + 5..];
-        let end = at.find(')').unwrap_or(0);
-        if let Ok(n) = at[..end].parse::<u32>() {
-            seen.insert(n);
-        }
-    }
-    let mut lines = Vec::new();
-    for c in seen {
-        let name = f
-            .in_cells
-            .iter()
-            .position(|x| *x == c)
-            .map(|i| super::iface::show(&f.iface.slots[i]))
-            .unwrap_or_else(|| "not an input of this frame".to_string());
-        lines.push(format!("  Cell({}) = {}", c, name));
-    }
-    anyhow::anyhow!("{}\nwhere\n{}", msg, lines.join("\n"))
-}
-
-
-/// The constant-lattice `Reference`s for the start room, in walk order. A
-/// frame that fails to bind or lower is FATAL (a coverage gap otherwise).
-pub(crate) fn lattice_kernel_refs<A: GraphArith>(
-    root: &std::path::Path,
-    opts: crate::abstraction::Level,
-    s: &crate::settings::Settings,
-) -> Result<Vec<(Option<Region>, Reference<A>)>> {
-    let mut lw = room_constant_lattice(root, opts, &Walk { settings: s, only: None })?;
-    let room = crate::transpile::graph::Room { cart: lw.cart.clone(), cache: lw.cache.clone() };
-    // Each frame was bound by the walk in the worker arena it was traced in.
-    let frames: Vec<(Option<Region>, super::verify::Frame<A>, Bound<A>)> = std::mem::take(&mut lw.frames)
-        .into_iter()
-        .map(|((shape, region), wf)| -> Result<_> {
-            let bound = wf.bound.map_err(|e| anyhow::anyhow!("the walk's frame of shape {shape} region {region:?} did not bind: {e}"))?;
-            Ok((region, wf.frame, bound))
-        })
-        .collect::<Result<Vec<_>>>()?;
-    // Lower (the expensive half of a build), in parallel. Each frame is
-    // taken by exactly one worker (a `Frame` is not cloned).
-    let (cart, cache) = (lw.cart.clone(), lw.cache.clone());
-    let slots: Vec<std::sync::Mutex<Option<(Option<Region>, super::verify::Frame<A>, Bound<A>)>>> = frames.into_iter().map(|x| std::sync::Mutex::new(Some(x))).collect();
-    let refs = crate::par::Pool::per_core().stack(128 << 20).map(slots.len(), |i| {
-        let (key, f, bound) = slots[i].lock().expect("a frame's slot").take().expect("each frame is lowered once");
-        let lowered = super::emit::lower_frame(&bound, Some(room.clone()), s.diag.build_trace).map_err(|e| anyhow::anyhow!("lattice frame {} ({:?}) lower: {:#}", i, key, name_cells(&f, e)))?;
-        Ok((key, Reference { frame: f, bound, lowered, cart: cart.clone(), cache: cache.clone() }))
-    })?;
-    Ok(refs)
-}
 
 /// THE REGION KEY: a kernel is specialized on the player's whole-pixel
 /// position in one `px`-pixel grid square and speed in `[-speed, speed]`,
 /// so the range analysis folds away far-off collision tests; a lane outside
 /// declines loudly. Each bound is an `Op::Restrict` on its input cell
-/// (`verify::trace_frame`): the range analyses read the range off that node,
+/// (`frame::trace_frame`): the range analyses read the range off that node,
 /// and its own error, on the raw cell, is the per-lane check (`trace::error`).
 /// The dispatch picks the kernel by the lane's region, so `x`/`y` hold by
 /// construction; speed and remainder hold only by that check.
@@ -131,7 +67,7 @@ impl RegionGrid {
     }
 }
 
-/// The input bounds a frame is traced under (`verify::trace_frame`).
+/// The input bounds a frame is traced under (`frame::trace_frame`).
 pub type InputRanges<A = Fixed> = Vec<(super::iface::Path, (<A as Arithmetic>::Lit, <A as Arithmetic>::Lit))>;
 
 /// Frames of platform motion the platform worlds cover: a platforms-unknown
@@ -226,8 +162,8 @@ fn no_player_ranges<A: GraphArith>(
             np.note(&st, &consts, fruit)?;
             let roots = shapes::state_paths(&st)?;
             let pin = pins_of(&consts, &roots);
-            let spec = super::verify::TraceSpec { roots: &roots, pin: &pin, level: Some(chain_level), ..Default::default() };
-            let f = super::verify::trace_frame(it, chunks, st.clone(), &spec).map_err(|e| e.context(format!("the start's no-player chain, frame {k}")))?;
+            let spec = super::frame::TraceSpec { roots: &roots, pin: &pin, level: Some(chain_level), ..Default::default() };
+            let f = super::frame::trace_frame(it, chunks, st.clone(), &spec).map_err(|e| e.context(format!("the start's no-player chain, frame {k}")))?;
             let o = match f.outs.as_slice() {
                 [o] => o,
                 [] => anyhow::bail!("the start's no-player chain, frame {k}: the frame has no outcome"),
@@ -304,8 +240,8 @@ fn explore_no_player<A: GraphArith>(
         let widened = super::widen::slots_where(&st, opts, super::widen::stores_widened);
         let buttons = super::iface::key("__button_states");
         let unknown: Vec<super::iface::Path> = roots.iter().filter(|p| !consts.contains_key(*p) && !widened.contains(*p) && p.first() != Some(&buttons)).cloned().collect();
-        let spec = super::verify::TraceSpec { roots: &roots, pin: &pin, merge_refused_on: &unknown, ..Default::default() };
-        let f = super::verify::trace_frame(it, chunks, st, &spec).map_err(|e| e.context(format!("{what} no-player state {depth} frames after its entry did not trace")))?;
+        let spec = super::frame::TraceSpec { roots: &roots, pin: &pin, merge_refused_on: &unknown, ..Default::default() };
+        let f = super::frame::trace_frame(it, chunks, st, &spec).map_err(|e| e.context(format!("{what} no-player state {depth} frames after its entry did not trace")))?;
         for o in &f.outs {
             followed += 1;
             if shapes::player_path(&o.st).is_some() {
@@ -893,7 +829,7 @@ enum WalkTraced<A: GraphArith = Fixed> {
     /// Why the trace did not compile, and what it poisoned before refusing.
     Refused(String, std::collections::BTreeMap<String, usize>),
     Traced {
-        frame: super::verify::Frame<A>,
+        frame: super::frame::Frame<A>,
         bound: std::result::Result<Bound<A>, String>,
         nodes_added: usize,
         arena: usize,
@@ -908,7 +844,7 @@ enum WalkTraced<A: GraphArith = Fixed> {
 
 /// A walk node's converged frame, its bounds, and its binding (or why not).
 pub struct WalkFrame<A: GraphArith = Fixed> {
-    pub frame: super::verify::Frame<A>,
+    pub frame: super::frame::Frame<A>,
     pub bounds: InputRanges<A>,
     pub bound: std::result::Result<Bound<A>, String>,
 }
@@ -923,7 +859,7 @@ fn walk_trace<A: GraphArith>(
     room0: (i16, i16),
 ) -> Result<WalkTraced<A>> {
     use super::domain::Domain;
-    use super::{shapes, verify};
+    use super::{frame, shapes};
     // `illegal` accumulates per worker, so both `WalkTraced` exits DRAIN it.
     debug_assert!(tr.it.illegal.is_empty(), "a previous job left {} poison reasons behind", tr.it.illegal.len());
     tr.it.illegal.clear();
@@ -931,8 +867,8 @@ fn walk_trace<A: GraphArith>(
     if let Some(constants) = &job.rebase {
         shapes::rebase(&mut st, &mut tr.it.d, constants)?;
     }
-    let spec = verify::TraceSpec { roots: &job.roots, pin: &job.pin, ival: &job.ival, bounds: &job.bounds, ..Default::default() };
-    let f = match verify::trace_frame(&mut tr.it, tr.chunks, st, &spec) {
+    let spec = frame::TraceSpec { roots: &job.roots, pin: &job.pin, ival: &job.ival, bounds: &job.bounds, ..Default::default() };
+    let f = match frame::trace_frame(&mut tr.it, tr.chunks, st, &spec) {
         Ok(f) => f,
         // A refused trace's poisoned paths count too.
         Err(e) => return Ok(WalkTraced::Refused(format!("{:#}", e), std::mem::take(&mut tr.it.illegal))),
@@ -978,7 +914,7 @@ fn walk_trace<A: GraphArith>(
         };
         outs.push(WalkOutcome { key, constants, ival, regions, st: o.st.clone(), heap_constants, respawn });
     }
-    let bound = super::emit::bind(&f, &tr.it.d.graph).map_err(|e| format!("{:#}", e));
+    let bound = super::lower::bind(&f, &tr.it.d.graph).map_err(|e| format!("{:#}", e));
     let illegal = std::mem::take(&mut tr.it.illegal);
     // Decided HERE: `f.raise` names a node of this worker's arena.
     let can_raise = tr.it.d.decide(&f.raise) != Some(false);

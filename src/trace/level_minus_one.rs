@@ -35,7 +35,7 @@ use celeste_core::arith::{Arithmetic, EngineNum, Fixed, Float};
 use super::domain::{Domain, Symbolic};
 use super::heap::Value;
 use super::iface::{self, Conc, Path, Step};
-use super::kernel::{LatticeWalk, Tracer};
+use super::walk::{LatticeWalk, Tracer};
 use super::state::State;
 use super::widen::field;
 use crate::transpile::garith::{value_box, GraphArith};
@@ -444,8 +444,8 @@ impl<A: GraphArith> Table<'_, A> {
         // configurations): `level_minus_one`.
         let fruit = player.is_some() && !super::widen::objects_of_type(&st, "fly_fruit").is_empty();
         let level = crate::abstraction::Level { held: false, fruit, ..tr.it.d.level };
-        let spec = super::verify::TraceSpec { roots: &roots, pin: &pin_list, ival: &ival, bounds: &bound_list, level: Some(level), level_minus_one: true, ..Default::default() };
-        let f = super::verify::trace_frame(&mut tr.it, tr.chunks, st.clone(), &spec).map_err(|e| anyhow!("level -1 trace of shape {id}: {e:#}"))?;
+        let spec = super::frame::TraceSpec { roots: &roots, pin: &pin_list, ival: &ival, bounds: &bound_list, level: Some(level), level_minus_one: true, ..Default::default() };
+        let f = super::frame::trace_frame(&mut tr.it, tr.chunks, st.clone(), &spec).map_err(|e| anyhow!("level -1 trace of shape {id}: {e:#}"))?;
         let t_trace = t0.elapsed();
         let n_slots = f.iface.slots.len();
         let seeds: Vec<Seed<A>> = f
@@ -594,7 +594,7 @@ impl<A: GraphArith> Table<'_, A> {
         let roots: Vec<Roots> = roots_old.iter().map(|r| Roots { live: m(&r.live), error: m(&r.error), xy: r.xy.map(|(x, y)| (m(&x), m(&y))), fields: r.fields.iter().map(m).collect() }).collect();
         let cone = Cone { graph: cone, roots, forks, arities, n_forks: f.forks };
         let plain = cone.specialize();
-        let operands: Vec<String> = cone.forks.iter().map(|(k, (at, op))| format!("fork {k} ({at:?}): {}", super::emit::show_tree(&cone.graph, *op, 3))).collect();
+        let operands: Vec<String> = cone.forks.iter().map(|(k, (at, op))| format!("fork {k} ({at:?}): {}", super::lower::show_tree(&cone.graph, *op, 3))).collect();
         let stats = format!(
             "{} slots ({} pinned, {} interval), {} outcomes, forks {:?}, {} configurations ({} distinct), cone {} nodes, specialized {} nodes, trace {:.1} s, specialize {:.1} s",
             n_slots,
@@ -929,7 +929,7 @@ fn culprit<A: GraphArith>(g: &Graph<A>, vals: &[Val<A>], mut n: NodeId) -> Strin
             },
             _ => {}
         }
-        return format!("{} = {:?}, operands {:?}", super::emit::show_tree(g, n, 4), vals[n as usize], nd.args.iter().map(|a| vals[*a as usize]).collect::<Vec<_>>());
+        return format!("{} = {:?}, operands {:?}", super::lower::show_tree(g, n, 4), vals[n as usize], nd.args.iter().map(|a| vals[*a as usize]).collect::<Vec<_>>());
     }
 }
 
@@ -1652,8 +1652,8 @@ fn build<A: GraphArith>(root: &FsPath, spd_px: i32, threads: usize, rep: &mut St
     let t_all = std::time::Instant::now();
     let room0 = s.room;
     let spd_px = i16::try_from(spd_px).map_err(|_| anyhow!("the speed bound {spd_px} px is out of range"))?;
-    let walk = super::kernel::Walk { settings: s, only: None };
-    let lw = super::kernel::room_constant_lattice::<A>(root, crate::abstraction::Level { held: true, ..crate::abstraction::Level::EXACT }, &walk)?;
+    let walk = super::walk::Walk { settings: s, only: None };
+    let lw = super::walk::room_constant_lattice::<A>(root, crate::abstraction::Level { held: true, ..crate::abstraction::Level::EXACT }, &walk)?;
     say!(rep, "room {room0:?}: lattice walk {} shapes, {:.1} s", lw.lattice.len(), t_all.elapsed().as_secs_f64())?;
     let mut tr = lw.tracer.clone();
     let mut table = Table {

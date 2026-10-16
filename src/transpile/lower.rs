@@ -3,7 +3,7 @@
 //! `specialize_frame` resolves every fork configuration of the traced graph
 //! into ONE hash-consed arena, and `lower_outcomes` reads the per-outcome
 //! constants the kernel needs off the result. The ASM backend
-//! (`trace::emit::asm_fused`) assembles the same arena.
+//! (`trace::lower::asm_fused`) assembles the same arena.
 
 use std::collections::BTreeMap;
 
@@ -57,7 +57,7 @@ pub(crate) struct Outcome<A: GraphArith = Fixed> {
     pub(crate) of: OutFields<A>,
     pub(crate) error: NodeId,
     pub(crate) live: NodeId,
-    /// The transfer roots (`trace::emit::FrameOutcome::arc`), after `error`
+    /// The transfer roots (`trace::lower::FrameOutcome::arc`), after `error`
     /// and `live`: computed per body, stored in no row.
     pub(crate) arc: Vec<NodeId>,
 }
