@@ -782,9 +782,10 @@ mod tests {
     }
 
     /// The concrete search runs one input per class of `frame_reads`
-    /// (`arc_dp::Covered`): every input that agrees with a run input on the
-    /// buttons that run read must make the same successors, exactly. Checked
-    /// for all 64 inputs at states along room (1,0)'s 99-frame exit.
+    /// (`search::concrete::Covered`): every input that agrees with a run
+    /// input on the buttons that run read must make the same successors,
+    /// exactly. Checked for all 64 inputs at states along room (1,0)'s
+    /// 99-frame exit.
     #[test]
     fn inputs_agreeing_on_the_buttons_read_make_the_same_successors() {
         let inputs = crate::concrete::read_inputs("tas/room_1_0_exit_frame_99.txt").expect("the exit's inputs");

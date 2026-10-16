@@ -410,7 +410,7 @@ fn fold_compare<A: Arithmetic>(op: Cmp, a: A::Num, b: A::Num) -> bool {
 #[derive(Default, Clone)]
 pub struct Symbolic<A: GraphArith = Fixed> {
     pub graph: Graph<A>,
-    /// `--build-trace`: the tracer's progress lines (`trace::verify`).
+    /// `--build-trace`: the tracer's progress lines (`trace::frame`, `trace::split`).
     pub build_trace: bool,
     /// FORK choices handed out this frame (the fork ids), buttons included.
     pub forks: u8,
