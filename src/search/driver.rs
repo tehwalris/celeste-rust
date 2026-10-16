@@ -327,3 +327,48 @@ fn check_known_in<N: KernelLanes>(trees: &[(std::path::PathBuf, Settings, Level)
     println!("[check known] every level passes ({:.1} s)", t0.elapsed().as_secs_f64());
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// THE BREADTH-FIRST LAYERS of the concrete and the dual searches: the
+    /// gates' witnesses all come from the depth-first try at the bound, so
+    /// here it is skipped (`arc_dp::NO_DFS`). Room (1,0)'s arc gate (the
+    /// synthetic win (9,101), h35; `r0sx`), in 16.16 and in Celia's floats,
+    /// and the dual search: each optimum and witness pinned
+    /// (gates/bfs_room10_win9-101_h35.txt; `CELESTE_REGENERATE=1` rewrites
+    /// it), the same at 3 and 32 threads (the layers merge their chunks in
+    /// order).
+    #[test]
+    #[ignore = "slow, ./check.sh t2 runs it: room (1,0)'s kernels in both arithmetics, three searches at two thread counts, ~60 CPU-s"]
+    fn the_breadth_first_searches_are_pinned() {
+        super::super::arc_dp::NO_DFS.store(true, std::sync::atomic::Ordering::Relaxed);
+        let base = std::env::temp_dir().join(format!("celeste-bfs-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let mut runs: Vec<String> = Vec::new();
+        for threads in [3, 32] {
+            let fixed = Settings { win_at: Some((9, 9, 101, 101)), threads: Some(threads), ..Settings::default() };
+            let float = Settings { arith: Arith::Float(crate::settings::FloatTool::Celia), ..fixed.clone() }.resolved().expect("float settings");
+            let dual = fixed.float_half(crate::settings::FloatTool::Celia, None).expect("the float half");
+            let mut lines = Vec::new();
+            for (name, s, half) in [("search fixed", &fixed, None), ("search float", &float, None), ("dual", &fixed, Some(&dual))] {
+                let dir = base.join(format!("{name}-{threads}").replace(' ', "-"));
+                let spec = SearchSpec { settings: s, level: "r0sx", horizon: 35, ceiling: false, dir: &dir, bound_only: false, save_marks: None, prefer: None, dual: half };
+                let r = run(&spec).expect("the search");
+                assert_eq!(r.verdict, Verdict::Optimal, "{name} at {threads} threads");
+                let inputs = r.witness.expect("a witness").iter().map(|b| b.to_string()).collect::<Vec<_>>().join(",");
+                let exit = r.dual.and_then(|d| d.fixed_exit).map_or(String::new(), |x| format!(" fixed exit {x}"));
+                lines.push(format!("{name}: optimum {}{exit} inputs {inputs}", r.optimal.expect("an optimum")));
+            }
+            runs.push(lines.join("\n") + "\n");
+        }
+        assert_eq!(runs[0], runs[1], "the breadth-first searches differ at 3 and 32 threads");
+        let pin = concat!(env!("CARGO_MANIFEST_DIR"), "/gates/bfs_room10_win9-101_h35.txt");
+        if std::env::var_os("CELESTE_REGENERATE").is_some() {
+            std::fs::write(pin, &runs[0]).expect("write the pin");
+        }
+        assert_eq!(std::fs::read_to_string(pin).expect("the pin (CELESTE_REGENERATE=1 writes it)"), runs[0], "the breadth-first searches moved (gates/bfs_room10_win9-101_h35.txt)");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+}

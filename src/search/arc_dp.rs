@@ -1580,7 +1580,23 @@ pub(super) fn concrete_engines<N: Rem>(n: usize, run: &crate::settings::Settings
 /// The concrete steps (reference-engine successors) the depth-first try at
 /// the bound may take before it gives up (`concrete_search`; the dual
 /// search's pairs count both halves' leaves: twice this).
-pub(super) const DFS_BUDGET: u64 = 200_000;
+const DFS_BUDGET: u64 = 200_000;
+
+/// TESTS ONLY: no depth-first try (a budget of 0), so the breadth-first
+/// layers find the witness - the gates' witnesses all come from the try at
+/// the bound (`driver`'s breadth-first test). Process-global: nextest runs
+/// each test in its own process.
+#[cfg(test)]
+pub(super) static NO_DFS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The depth-first try's budget (`DFS_BUDGET`; 0 under `NO_DFS`).
+pub(super) fn dfs_budget() -> u64 {
+    #[cfg(test)]
+    if NO_DFS.load(std::sync::atomic::Ordering::Relaxed) {
+        return 0;
+    }
+    DFS_BUDGET
+}
 
 /// The inputs a state has been stepped under, each with the buttons its
 /// frame read (`RefEngine::frame_reads`). An input that agrees with one of
@@ -1685,6 +1701,7 @@ pub fn concrete_search<N: Rem>(
             seeded: bool,
             spf: u32,
             settings: &'a crate::settings::Settings,
+            budget: u64,
         }
         /// `Ok(None)`: out of budget.
         fn dfs<N: Rem>(cx: &mut Dfs<N>, st: &Rt2<N>, k: u32) -> Result<Option<bool>> {
@@ -1700,7 +1717,7 @@ pub fn concrete_search<N: Rem>(
                 ran.push(byte, read);
                 for b in succ {
                     cx.steps += 1;
-                    if cx.steps > DFS_BUDGET {
+                    if cx.steps > cx.budget {
                         return Ok(None);
                     }
                     let cell = b.positions()?[0];
@@ -1734,7 +1751,7 @@ pub fn concrete_search<N: Rem>(
         }
         let t = std::time::Instant::now();
         let mut eng = engines[0].lock().expect("an engine");
-        let mut cx = Dfs { eng: &mut eng, node, keys, w, level, from: frames - bound, frames: bound, dead: FxHashSet::default(), path: Vec::new(), steps: 0, prefer, seeded, spf, settings: s };
+        let mut cx = Dfs { eng: &mut eng, node, keys, w, level, from: frames - bound, frames: bound, dead: FxHashSet::default(), path: Vec::new(), steps: 0, prefer, seeded, spf, settings: s, budget: dfs_budget() };
         let found = dfs(&mut cx, start.rt2(), 0)?;
         eprintln!(
             "[concrete] depth-first at the bound f{bound}: {} after {} steps, {:.1} s",

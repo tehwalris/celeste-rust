@@ -31,7 +31,7 @@ use rustc_hash::FxHashSet;
 use celeste_engine::exact::ExactRow;
 use celeste_engine::runtime2::Rt2;
 
-use super::arc_dp::{concrete_engines, DFS_BUDGET, exact_state, input_order, lookup_keys, rem_of, Arcs, Covered, NodeKeys};
+use super::arc_dp::{concrete_engines, dfs_budget, exact_state, input_order, lookup_keys, rem_of, Arcs, Covered, NodeKeys};
 use super::rem::Rem;
 use crate::frame::{wins_of, Block};
 use crate::settings::Settings;
@@ -220,6 +220,7 @@ pub fn search<X: Rem, F: Rem>(fixed: &Half<X>, float: &Half<F>, bound: u32, pref
             fixed_exit: Option<u32>,
             steps: u64,
             prefer: Option<&'a [u8]>,
+            budget: u64,
         }
         /// `Ok(None)`: out of budget.
         fn dfs<X: Rem, F: Rem>(cx: &mut Dfs<X, F>, p: &Pair<X, F>, k: u32) -> Result<Option<bool>> {
@@ -235,7 +236,7 @@ pub fn search<X: Rem, F: Rem>(fixed: &Half<X>, float: &Half<F>, bound: u32, pref
                 let (next, read) = successors(cx.ex, cx.ef, cx.sx, cx.sf, p, byte, t, &mut cx.steps).map_err(|e| e.context(format!("the frame after {k} frames of the depth-first try, with input {byte}")))?;
                 ran.push(byte, read);
                 // A pair's steps count both halves' leaves.
-                if cx.steps > 2 * DFS_BUDGET {
+                if cx.steps > 2 * cx.budget {
                     return Ok(None);
                 }
                 for n in next {
@@ -275,7 +276,7 @@ pub fn search<X: Rem, F: Rem>(fixed: &Half<X>, float: &Half<F>, bound: u32, pref
         let t = std::time::Instant::now();
         let mut pair = engines[0].lock().expect("an engine pair");
         let (ex0, ef0) = &mut *pair;
-        let mut cx = Dfs { ex: ex0, ef: ef0, sx: &sx, sf: &sf, from: frames - bound, frames: bound, spf, dead: FxHashSet::default(), path: Vec::new(), fixed_exit: None, steps: 0, prefer };
+        let mut cx = Dfs { ex: ex0, ef: ef0, sx: &sx, sf: &sf, from: frames - bound, frames: bound, spf, dead: FxHashSet::default(), path: Vec::new(), fixed_exit: None, steps: 0, prefer, budget: dfs_budget() };
         let found = dfs(&mut cx, &start, 0)?;
         eprintln!(
             "[dual] depth-first at the bound f{bound}: {} after {} steps, {:.1} s",

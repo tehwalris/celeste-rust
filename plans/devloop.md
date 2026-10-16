@@ -124,8 +124,10 @@ The steps run in four lanes:
   reach and the widened forward (f34), the bounds the region and platform
   kernels check, the split frame at a near level, a run killed before its
   done marker, the respawn and near-floor walks, the float goldens (UCT,
-  Celia), the fly fruit's pin, the exact reach of the known route, and the
-  maps' tile scans.
+  Celia), the fly fruit's pin, the exact reach of the known route, the
+  maps' tile scans, and the concrete and dual searches' breadth-first
+  layers (room (1,0)'s arc gate with the depth-first try skipped: the
+  witnesses pinned, the same at 3 and 32 threads).
 
 ### big, perf, local, fixtures
 
