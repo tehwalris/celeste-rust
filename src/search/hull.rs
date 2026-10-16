@@ -252,7 +252,7 @@ fn image(a: Arc, t: Transfer, out: &mut [Seg; 4]) -> usize {
 /// `epoch` when the ids change meaning (an entry of an older one never
 /// matches).
 pub struct PushCache<N: Rem = P8> {
-    slots: Vec<(N::Hull, N::Hull, u32, u32, Option<N::Acc>)>,
+    slots: Vec<(N::HullKey, N::HullKey, u32, u32, Option<N::Acc>)>,
     epoch: u32,
 }
 
@@ -261,7 +261,7 @@ const PUSH_CACHE: usize = 1 << 11;
 
 impl<N: Rem> Default for PushCache<N> {
     fn default() -> Self {
-        PushCache { slots: vec![(N::Hull::default(), N::Hull::default(), u32::MAX, u32::MAX, None); PUSH_CACHE], epoch: 0 }
+        PushCache { slots: vec![(N::HullKey::default(), N::HullKey::default(), u32::MAX, u32::MAX, None); PUSH_CACHE], epoch: 0 }
     }
 }
 
@@ -270,7 +270,7 @@ impl<N: Rem> PushCache<N> {
     pub fn next_epoch(&mut self) {
         self.epoch = self.epoch.wrapping_add(1);
         if self.epoch == u32::MAX {
-            self.slots.fill((N::Hull::default(), N::Hull::default(), u32::MAX, u32::MAX, None));
+            self.slots.fill((N::HullKey::default(), N::HullKey::default(), u32::MAX, u32::MAX, None));
             self.epoch = 0;
         }
     }
@@ -279,14 +279,15 @@ impl<N: Rem> PushCache<N> {
     /// pushed the first time) along transfer `x`, `f()` on a miss.
     #[inline]
     pub fn get(&mut self, h: &N::Hull, was: &N::Hull, x: u32, f: impl FnOnce() -> Option<N::Acc>) -> Option<N::Acc> {
-        let (a, b) = (N::hull_hash(h), N::hull_hash(was));
+        let (ka, kb) = (N::hull_key(h), N::hull_key(was));
+        let (a, b) = (N::key_hash(&ka), N::key_hash(&kb));
         let k = ((a ^ b.rotate_left(29) ^ (x as u64) << 45).wrapping_mul(0x9e37_79b9_7f4a_7c15) >> (64 - PUSH_CACHE.trailing_zeros())) as usize;
         let e = &mut self.slots[k];
-        if (e.0, e.1, e.2, e.3) == (*h, *was, x, self.epoch) {
+        if (e.0, e.1, e.2, e.3) == (ka, kb, x, self.epoch) {
             return e.4;
         }
         let r = f();
-        *e = (*h, *was, x, self.epoch, r);
+        *e = (ka, kb, x, self.epoch, r);
         r
     }
 }

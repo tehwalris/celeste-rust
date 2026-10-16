@@ -41,6 +41,9 @@ pub struct Capture<N> {
 pub trait Rem: EngineNum {
     /// A state's hull: the box of the remainders it has been reached with.
     type Hull: Copy + Debug + PartialEq + Eq + Hash + PartialOrd + Ord + Default + Send + Sync + 'static;
+    /// A hull as a cache compares it (`hull::PushCache`): 16.16's packs into
+    /// one word.
+    type HullKey: Copy + Debug + PartialEq + Eq + Default + Send + Sync + 'static;
     /// A hull being accumulated: merged by an order-free rule (region jobs
     /// run in any order), `Default` the empty one.
     type Acc: Copy + Debug + PartialEq + Eq + Default + Send + Sync + 'static;
@@ -87,8 +90,11 @@ pub trait Rem: EngineNum {
     /// Append `h`'s `HULL_BYTES` bytes.
     fn hull_to_bytes(h: &Self::Hull, out: &mut Vec<u8>);
     fn hull_from_bytes(b: &[u8]) -> Self::Hull;
-    /// A hash of a hull (a cache's slot, the hull statistics).
+    /// A hash of a hull (the hull statistics).
     fn hull_hash(h: &Self::Hull) -> u64;
+    /// `h`'s cache key, and the key's hash (a cache's slot).
+    fn hull_key(h: &Self::Hull) -> Self::HullKey;
+    fn key_hash(k: &Self::HullKey) -> u64;
     /// Append `p`'s `PAIR_BYTES` bytes.
     fn encode_pair(out: &mut Vec<u8>, p: &Self::Pair);
     fn decode_pair(b: &[u8]) -> Self::Pair;
@@ -109,6 +115,7 @@ fn point(v: P8) -> u32 {
 
 impl Rem for P8 {
     type Hull = Hull;
+    type HullKey = u64;
     type Acc = HullAcc;
     type Pair = Pair;
     type C = Fixed16;
@@ -190,6 +197,15 @@ impl Rem for P8 {
     fn hull_hash(h: &Hull) -> u64 {
         h.word()
     }
+    /// The hull's four `u16`s in one word: exact.
+    #[inline]
+    fn hull_key(h: &Hull) -> u64 {
+        h.word()
+    }
+    #[inline]
+    fn key_hash(k: &u64) -> u64 {
+        *k
+    }
     fn encode_pair(out: &mut Vec<u8>, p: &Pair) {
         arc_edges::encode_pair(out, p)
     }
@@ -206,6 +222,7 @@ impl Rem for P8 {
 
 impl Rem for LuaF64 {
     type Hull = rem_f64::Hull;
+    type HullKey = rem_f64::Hull;
     type Acc = rem_f64::HullAcc;
     type Pair = rem_f64::Pair;
     type C = rem_f64::Doubles;
@@ -278,6 +295,14 @@ impl Rem for LuaF64 {
     #[inline]
     fn hull_hash(h: &rem_f64::Hull) -> u64 {
         h.mixed()
+    }
+    #[inline]
+    fn hull_key(h: &rem_f64::Hull) -> rem_f64::Hull {
+        *h
+    }
+    #[inline]
+    fn key_hash(k: &rem_f64::Hull) -> u64 {
+        k.mixed()
     }
     fn encode_pair(out: &mut Vec<u8>, p: &rem_f64::Pair) {
         p.0.encode(out);
