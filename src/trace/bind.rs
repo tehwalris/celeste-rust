@@ -161,15 +161,6 @@ pub fn renumber_cells<A: GraphArith>(
     Ok((out, roots.iter().map(|r| map[*r as usize]).collect()))
 }
 
-/// Resolve a traced frame's INPUT interface against a block: the canonical
-/// cell for each `Op::Cell(i)`.
-///
-/// Inputs only: an outcome that allocates names cells the input block does
-/// not have, so outputs bind against their own shape (`block::skeleton`).
-pub fn bind_inputs<N: EngineNum, A: GraphArith>(rt2: &Rt2<N>, iface: &super::iface::Iface<A>) -> Result<Vec<u32>> {
-    resolve_all(rt2, &iface.slots)
-}
-
 /// Resolve a whole interface, naming the path that failed - and REFUSE
 /// if two paths land on one cell.
 ///

@@ -249,7 +249,9 @@ pub struct AsmBody {
     pub roots: Vec<NodeId>,
 }
 
-/// `asm_fused` on a specialization already computed (`Lowered::spec`).
+/// A lowered frame's specialization (`Lowered::spec`) as the assembler
+/// takes it: the fused graph, its bodies, their roots in one list, and the
+/// input cells' reprs.
 pub fn asm_fused_from<A: GraphArith>(
     bound: &Bound<A>,
     spec: &(Graph<A>, Vec<crate::transpile::lower::SpecializedBody>),
@@ -259,27 +261,13 @@ pub fn asm_fused_from<A: GraphArith>(
     Vec<NodeId>,
     std::collections::HashMap<u32, crate::transpile::asm::CellRepr>,
 )> {
-    asm_fused_of(bound, spec.0.clone(), spec.1.clone())
-}
-
-fn asm_fused_of<A: GraphArith>(
-    bound: &Bound<A>,
-    fused: Graph<A>,
-    raw_bodies: Vec<crate::transpile::lower::SpecializedBody>,
-) -> Result<(
-    Graph<A>,
-    Vec<AsmBody>,
-    Vec<NodeId>,
-    std::collections::HashMap<u32, crate::transpile::asm::CellRepr>,
-)> {
     let mut flat_roots = Vec::new();
-    let mut bodies = Vec::with_capacity(raw_bodies.len());
-    for (outcome, splits, roots) in raw_bodies {
+    let mut bodies = Vec::with_capacity(spec.1.len());
+    for (outcome, splits, roots) in spec.1.iter().cloned() {
         flat_roots.extend(roots.iter().copied());
         bodies.push(AsmBody { outcome, splits, roots });
     }
-    let reprs = asm_input_reprs(bound)?;
-    Ok((fused, bodies, flat_roots, reprs))
+    Ok((spec.0.clone(), bodies, flat_roots, asm_input_reprs(bound)?))
 }
 
 /// Lower a traced frame - ALL of its output shapes together, so the part

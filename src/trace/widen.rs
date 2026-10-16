@@ -785,7 +785,7 @@ mod tests {
         }
         let (root, s) = (std::path::Path::new("."), crate::settings::Settings { room: (4, 0), ..Default::default() });
         let chunks = cart::Chunks::parse(root, &s).expect("chunks");
-        let (reset, frame) = (&chunks.reset, &chunks.frame);
+        let frame = &chunks.frame;
         let mut it: Interp<Symbolic> = Interp::new(Symbolic::default());
         let mut st = cart::boot(&mut it, &chunks, root, s.room).expect("boot");
         let dead = |s: &Slot| matches!(s.stored, Stored::Num(_) | Stored::Bool(_));
@@ -798,7 +798,7 @@ mod tests {
             let roots = slots_where(&st, Level::EXACT, dead);
             with_key += roots.iter().any(|p| p.last() == Some(&iface::key("spr"))) as usize;
             with_player += !objects_of_type(&st, "player").is_empty() as usize;
-            let f = trace_frame(&mut it, reset, frame, st.clone(), &roots, &[], &[], false, &[], &[]).expect("trace");
+            let f = trace_frame(&mut it, &chunks, st.clone(), &crate::trace::verify::TraceSpec { roots: &roots, concrete: true, ..Default::default() }).expect("trace");
             // Everything a successor depends on, its booleans decided as far as a
             // BDD over independent atoms can (a guard re-merged after a branch on
             // `frames` is `c or not c`, true).

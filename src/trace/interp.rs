@@ -445,7 +445,7 @@ impl<'a, D: Domain> Interp<'a, D> {
         let mut out: Outcome<D> = Vec::new();
         for (s, cv) in self.eval(cond_e, st)? {
             let cond = self.truthy(&cv);
-            out.extend(match self.decide(&cond) {
+            out.extend(match self.d.decide(&cond) {
                 Some(true) => self.exec_block(blk, s)?,
                 Some(false) => self.exec_arms(rest, els, s)?,
                 None => {
@@ -658,7 +658,7 @@ impl<'a, D: Domain> Interp<'a, D> {
                 let off = self.d.int(k as i16);
                 let iv = self.d.arith(Arith::Add, &start, &off)?;
                 let cond = self.d.compare(Cmp::Le, &iv, &limit)?;
-                match self.decide(&cond) {
+                match self.d.decide(&cond) {
                     Some(false) => done.push((s, Flow::Normal)),
                     Some(true) => next.extend(self.for_body(f, name, &iv, s)?),
                     None => {
@@ -734,10 +734,6 @@ impl<'a, D: Domain> Interp<'a, D> {
 
     // ------------------------------------------------------- expressions
 
-    /// The condition's value, if the domain knows it.
-    fn decide(&self, cond: &D::Bool) -> Option<bool> {
-        self.d.decide(cond)
-    }
 
 
     fn truthy(&mut self, v: &Value<D>) -> D::Bool {
@@ -892,7 +888,7 @@ impl<'a, D: Domain> Interp<'a, D> {
             let mut out = Vec::new();
             for (st, a) in self.eval(lhs, st)? {
                 let t = self.truthy(&a);
-                match self.decide(&t) {
+                match self.d.decide(&t) {
                     Some(x) if x == is_and => out.extend(self.eval(rhs, st)?),
                     Some(_) => out.push((st, a)),
                     None => {

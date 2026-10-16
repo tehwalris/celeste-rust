@@ -217,21 +217,16 @@ pub fn room_of<A: GraphArith>(st: &State<Symbolic<A>>, d: &Symbolic<A>) -> (i16,
     (at("x"), at("y"))
 }
 
-/// The scalar fields the level's widenings store as something other than
-/// one value per state (`widen::stores_widened`: the player's `rem`, a live
-/// fruit's `off`/`y`, the level's object fields, the held trails), so never
-/// compile-time constants whatever a trace computes. The lattice must not
-/// bake these, or a widened block will not bind.
-pub fn boundary_widened_paths<A: GraphArith>(st: &State<Symbolic<A>>, opts: &crate::abstraction::Level) -> std::collections::BTreeSet<Path> {
-    super::widen::slots_where(st, *opts, super::widen::stores_widened).into_iter().collect()
-}
-
 /// The scalar fields of `st` that are compile-time constants (exact
 /// `Const(v,v)` or `ConstBool`): what the per-shape constant lattice bakes in.
 pub fn field_constants<A: GraphArith>(st: &State<Symbolic<A>>, d: &Symbolic<A>, opts: &crate::abstraction::Level) -> Result<std::collections::BTreeMap<Path, super::iface::Conc<A>>> {
     use super::domain::Domain;
     use super::iface::Conc;
-    let widened = boundary_widened_paths(st, opts);
+    // The fields the level's widenings store as something other than one
+    // value per state (the player's `rem`, a live fruit's `off`/`y`, the
+    // level's object fields, the held trails) are never constants, whatever
+    // a trace computes: baked, a widened block would not bind.
+    let widened: std::collections::BTreeSet<Path> = super::widen::slots_where(st, *opts, super::widen::stores_widened).into_iter().collect();
     // The buttons are dead at the boundary (blocks hold them unknown; every
     // frame resets them before reading), so the start state's concrete
     // `false` is not a constant of the shape and must not be baked.
@@ -269,13 +264,4 @@ pub fn player_path<D: Domain>(st: &State<D>) -> Option<Path> {
             ty.push(iface::key("type"));
             iface::get(st, &ty) == Some(Value::Table(want))
         })
-}
-
-/// The slots every level's widenings make INTERVAL inputs
-/// (`widen::interval_input` of the `Flag::Always` entries: the player's
-/// `rem.x` and `rem.y`, a live fruit's `y`/`off`), so a kernel expecting
-/// `num` binds. Found by `type`, not by index: which object is the player
-/// changes within a room.
-pub fn ival_paths<A: GraphArith>(st: &State<Symbolic<A>>) -> Vec<Path> {
-    super::widen::slots_where(st, crate::abstraction::Level::EXACT, super::widen::interval_input)
 }

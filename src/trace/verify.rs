@@ -6,7 +6,6 @@
 //! compilation (a bad merge, a wrong guard, a select on the wrong condition).
 
 use anyhow::{anyhow, bail, Result};
-use full_moon::ast;
 
 use crate::transpile::graph::NodeId;
 
@@ -146,28 +145,58 @@ fn out_fields<A: GraphArith>(
     Ok((out, ubool))
 }
 
-/// Symbolize `root`, free the buttons, and trace one frame.
-pub fn trace_frame<'a, A: GraphArith>(
-    it: &mut Interp<'a, Symbolic<A>>,
-    reset: &'a ast::Ast,
-    frame: &'a ast::Ast,
-    st: State<Symbolic<A>>,
-    roots: &[Path],
-    pin: &[(Path, Conc<A>)],
-    // Slots the boundary WIDENS to an interval (`rem`).
-    ival: &[Path],
-    // Apply the boundary widenings INSIDE the frame (a row hashes on what it
-    // stores) and capture the arc transfers. Off for the concrete check.
-    widen: bool,
-    // Input slots BOUNDED to a range (literals, inclusive): the body reads
-    // them through `Op::Restrict`, specialized on the range; outside it is
-    // the restriction's own error (`trace::error`), like a pin.
-    bounds: &[(Path, (A::Lit, A::Lit))],
-    // Input slots NO MERGE SELECTS ON: a condition that reads one makes two
-    // successors, each with its own values (`Domain::reads_merge_refused`;
-    // a respawn's exploration, `kernel::explore_respawn`).
-    merge_refused_on: &[Path],
-) -> Result<Frame<A>> {
+/// What one frame is traced under (`trace_frame`).
+pub struct TraceSpec<'s, A: GraphArith = Fixed> {
+    /// The input slots: every scalar under them is a cell.
+    pub roots: &'s [Path],
+    /// Slots the body reads as a constant (`Op::Pin`): the lattice's.
+    pub pin: &'s [(Path, Conc<A>)],
+    /// Slots the boundary WIDENS to an interval (`rem`).
+    pub ival: &'s [Path],
+    /// Input slots BOUNDED to a range (literals, inclusive): the body reads
+    /// them through `Op::Restrict`, specialized on the range; outside it is
+    /// the restriction's own error (`trace::error`), like a pin.
+    pub bounds: &'s [(Path, (A::Lit, A::Lit))],
+    /// Input slots NO MERGE SELECTS ON: a condition that reads one makes two
+    /// successors, each with its own values (`Domain::reads_merge_refused`;
+    /// a respawn's exploration, `kernel::explore_no_player`).
+    pub merge_refused_on: &'s [Path],
+    /// A concrete check's trace: no boundary widening inside the frame (a
+    /// row hashes on what it stores) and no arc capture.
+    pub concrete: bool,
+    /// The level traced, where not the tracer's own (`Symbolic::level`).
+    pub level: Option<crate::abstraction::Level>,
+    /// Level -1's trace: `move`'s fork takes the static range's full width
+    /// (`Symbolic::uncapped_ways`) and undecided selects stay selects
+    /// (`Symbolic::no_known_forks`).
+    pub level_minus_one: bool,
+}
+
+impl<A: GraphArith> Default for TraceSpec<'_, A> {
+    fn default() -> Self {
+        TraceSpec { roots: &[], pin: &[], ival: &[], bounds: &[], merge_refused_on: &[], concrete: false, level: None, level_minus_one: false }
+    }
+}
+
+/// Symbolize `spec.roots`, free the buttons, and trace one frame (`chunks`'
+/// reset, then its frame), the tracer's level and flags as `spec` says and
+/// restored after.
+pub fn trace_frame<'a, A: GraphArith>(it: &mut Interp<'a, Symbolic<A>>, chunks: &'a super::cart::Chunks, st: State<Symbolic<A>>, spec: &TraceSpec<A>) -> Result<Frame<A>> {
+    let saved = (it.d.level, it.d.uncapped_ways, it.d.no_known_forks);
+    if let Some(level) = spec.level {
+        it.d.level = level;
+    }
+    if spec.level_minus_one {
+        (it.d.uncapped_ways, it.d.no_known_forks) = (true, true);
+    }
+    let f = trace(it, chunks, st, spec);
+    (it.d.level, it.d.uncapped_ways, it.d.no_known_forks) = saved;
+    f
+}
+
+fn trace<'a, A: GraphArith>(it: &mut Interp<'a, Symbolic<A>>, chunks: &'a super::cart::Chunks, st: State<Symbolic<A>>, spec: &TraceSpec<A>) -> Result<Frame<A>> {
+    let TraceSpec { roots, pin, ival, bounds, merge_refused_on, .. } = *spec;
+    let widen = !spec.concrete;
     it.trace_start_nodes = it.d.node_count();
     let mut st = st;
     // Fork choices are per FRAME, buttons included.
@@ -236,7 +265,10 @@ pub fn trace_frame<'a, A: GraphArith>(
         _ => bail!("tracing a frame needs the cart and the room's collision cache"),
     };
     let in_rt2 = super::block::skeleton(&st, cart.clone(), cache.clone())?;
-    let in_cells = super::bind::bind_inputs(&in_rt2, &iface)?;
+    // The canonical cell of each `Op::Cell(i)`. Inputs only: an outcome that
+    // allocates names cells the input block does not have, so outputs bind
+    // against their own shape.
+    let in_cells = super::bind::resolve_all(&in_rt2, &iface.slots)?;
     let mut st = st;
     // The level's widened slots read as the table says (held trails forked
     // both ways, the fly fruit's replaced, near floors' `collideable`
@@ -257,8 +289,8 @@ pub fn trace_frame<'a, A: GraphArith>(
     } else {
         None
     };
-    let st = super::cart::run_one(it, reset, st)?;
-    let finished = it.exec_block(frame.nodes(), st)?;
+    let st = super::cart::run_one(it, &chunks.reset, st)?;
+    let finished = it.exec_block(chunks.frame.nodes(), st)?;
     // The whole frame's error (inputs this kernel was not built for), OR-ed
     // into every outcome's.
     let global = {
@@ -267,66 +299,8 @@ pub fn trace_frame<'a, A: GraphArith>(
     };
     let mut outs = Vec::new();
     for (s, f) in finished {
-        if let Flow::Break = f {
-            bail!("break at frame toplevel");
-        }
-        let mut s = s;
-        s.gc();
-        // Absent-as-zero fields: shape, not precision, so every level.
-        super::widen::materialize_absent_fields(&mut s, &mut it.d)?;
-        // The transfer roots: the remainder read BEFORE the widenings.
-        let (arc, arc_fin) = match s.arc.as_deref() {
-            None => (Vec::new(), false),
-            Some(axes) => {
-                let players = super::widen::objects_of_type(&s, "player");
-                anyhow::ensure!(players.len() <= 1, "arc capture: {} player objects at the frame's end", players.len());
-                let mut roots = Vec::with_capacity(2 * ARC_AXIS_ROOTS);
-                for (k, a) in axes.iter().enumerate() {
-                    let fin = match players.first() {
-                        Some(pl) => match iface::get(&s, &super::widen::field(pl, &["rem", ["x", "y"][k]])) {
-                            Some(Value::Num(n)) => n,
-                            other => bail!("arc capture: the player's rem.{} is {other:?}", ["x", "y"][k]),
-                        },
-                        None => {
-                            let zero = A::lit(A::from_i16(0));
-                            it.d.graph.leaf(crate::transpile::graph::Op::Const(zero, zero))
-                        }
-                    };
-                    roots.extend([a.took, a.pre, a.frag, a.ox, fin]);
-                }
-                (roots, !players.is_empty())
-            }
-        };
-        // THE WIDENINGS: before `out_fields` (reads the state), after `gc`.
-        let owed = if widen { super::widen::widen(&mut s, &mut it.d)? } else { Vec::new() };
-        let (fields, ubool) = out_fields(&s, &it.d)?;
-        // Owed beyond its operators: the frame's, where the model ended
-        // (`State::ended`), and the widenings' of the slots it stores.
-        let error = owed
-            .iter()
-            .filter(|(p, _)| fields.iter().any(|(q, _, _)| q == p))
-            .fold(it.d.graph.fold(crate::transpile::graph::Op::Or, vec![global, s.ended]), |e, (_, w)| it.d.graph.fold(crate::transpile::graph::Op::Or, vec![e, *w]));
-        // This outcome's engine numbering; fields and dead cells share one
-        // cell space.
-        let rt2 = super::block::skeleton(&s, cart.clone(), cache.clone())?;
-        let paths: Vec<Path> =
-            fields.iter().map(|(p, _, _)| p.clone()).chain(ubool.iter().cloned()).collect();
-        let all = super::bind::resolve_all(&rt2, &paths)?;
-        let (cells, ubool_cells) = all.split_at(fields.len());
-        let (guard, shape) = (s.guard.clone(), s.shape()?);
-        outs.push(FrameOut {
-            guard,
-            error,
-            fields,
-            ubool,
-            shape,
-            rt2,
-            cells: cells.to_vec(),
-            ubool_cells: ubool_cells.to_vec(),
-            st: s,
-            arc,
-            arc_fin,
-        });
+        anyhow::ensure!(!matches!(f, Flow::Break), "break at frame toplevel");
+        outs.push(finish_outcome(it, s, widen, global, (&cart, &cache))?);
     }
     // Split selects on conditions a lane can hold undecided, until none is.
     if !it.d.no_known_forks {
@@ -364,32 +338,11 @@ pub fn trace_frame<'a, A: GraphArith>(
         o.error = it.d.graph.fold(crate::transpile::graph::Op::Or, vec![o.error, e]);
     }
     if it.d.build_trace {
-        eprintln!("[build] trace_frame (widen {widen}): {} forks at the end, {} outcomes, {} pins", it.d.forks, outs.len(), pin.len());
-    }
-    // DIAGNOSTIC: forks by origin, and how many each outcome sees.
-    if it.d.build_trace {
         let mut by: std::collections::BTreeMap<&str, usize> = Default::default();
         for (_, o) in &it.d.fork_origins {
             *by.entry(o.as_str()).or_default() += 1;
         }
-        use crate::transpile::graph::Op;
-        let roots: Vec<NodeId> = outs.iter().flat_map(|o| o.roots(false)).collect();
-        let reach = it.d.graph.reachable(&roots);
-        let mut live: std::collections::BTreeSet<u8> = Default::default();
-        for (i, r) in reach.iter().enumerate() {
-            if !*r {
-                continue;
-            }
-            if let Op::Split(d) | Op::SplitValid(d) | Op::SplitInt(d) | Op::RSplit(d) | Op::RSplitValid(d) = it.d.graph.get(i as NodeId).op {
-                live.insert(d);
-            }
-        }
-        eprintln!(
-            "[build] trace_frame: {} forks, {} with an origin: {by:?}; live {}",
-            it.d.forks,
-            it.d.fork_origins.len(),
-            live.len()
-        );
+        eprintln!("[build] trace_frame (widen {widen}): {} outcomes, {} pins, {} forks by origin {by:?}", outs.len(), pin.len(), it.d.forks);
     }
     let fork_ways: Vec<u8> = (0..it.d.forks).map(|d| it.d.graph.fork_ways(d)).collect();
     let raise = {
@@ -402,6 +355,75 @@ pub fn trace_frame<'a, A: GraphArith>(
         r
     };
     Ok(Frame { iface, fork_origins: it.d.fork_origins.clone(), forks: it.d.forks, fork_ways, outs, raise, in_cells, in_rt2 })
+}
+
+/// A finished path of the frame as an outcome: collected, its absent-as-
+/// zero fields written, its transfer roots read, widened (`widen`), its
+/// fields typed and bound to its own engine numbering; its error the
+/// frame's (`global`), where its model ended, and what its widenings owe.
+fn finish_outcome<A: GraphArith>(
+    it: &mut Interp<'_, Symbolic<A>>,
+    mut s: State<Symbolic<A>>,
+    widen: bool,
+    global: NodeId,
+    (cart, cache): (&std::sync::Arc<celeste_core::cart_data::CartData>, &std::sync::Arc<celeste_core::collision_cache::CollisionCache>),
+) -> Result<FrameOut<A>> {
+    s.gc();
+    // Absent-as-zero fields: shape, not precision, so every level.
+    super::widen::materialize_absent_fields(&mut s, &mut it.d)?;
+    // The transfer roots: the remainder read BEFORE the widenings.
+    let (arc, arc_fin) = match s.arc.as_deref() {
+        None => (Vec::new(), false),
+        Some(axes) => {
+            let players = super::widen::objects_of_type(&s, "player");
+            anyhow::ensure!(players.len() <= 1, "arc capture: {} player objects at the frame's end", players.len());
+            let mut roots = Vec::with_capacity(2 * ARC_AXIS_ROOTS);
+            for (k, a) in axes.iter().enumerate() {
+                let fin = match players.first() {
+                    Some(pl) => match iface::get(&s, &super::widen::field(pl, &["rem", ["x", "y"][k]])) {
+                        Some(Value::Num(n)) => n,
+                        other => bail!("arc capture: the player's rem.{} is {other:?}", ["x", "y"][k]),
+                    },
+                    None => {
+                        let zero = A::lit(A::from_i16(0));
+                        it.d.graph.leaf(crate::transpile::graph::Op::Const(zero, zero))
+                    }
+                };
+                roots.extend([a.took, a.pre, a.frag, a.ox, fin]);
+            }
+            (roots, !players.is_empty())
+        }
+    };
+    // THE WIDENINGS: before `out_fields` (reads the state), after `gc`.
+    let owed = if widen { super::widen::widen(&mut s, &mut it.d)? } else { Vec::new() };
+    let (fields, ubool) = out_fields(&s, &it.d)?;
+    // Owed beyond its operators: the frame's, where the model ended
+    // (`State::ended`), and the widenings' of the slots it stores.
+    let error = owed
+        .iter()
+        .filter(|(p, _)| fields.iter().any(|(q, _, _)| q == p))
+        .fold(it.d.graph.fold(crate::transpile::graph::Op::Or, vec![global, s.ended]), |e, (_, w)| it.d.graph.fold(crate::transpile::graph::Op::Or, vec![e, *w]));
+    // This outcome's engine numbering; fields and dead cells share one
+    // cell space.
+    let rt2 = super::block::skeleton(&s, cart.clone(), cache.clone())?;
+    let paths: Vec<Path> =
+        fields.iter().map(|(p, _, _)| p.clone()).chain(ubool.iter().cloned()).collect();
+    let all = super::bind::resolve_all(&rt2, &paths)?;
+    let (cells, ubool_cells) = all.split_at(fields.len());
+    let (guard, shape) = (s.guard.clone(), s.shape()?);
+    Ok(FrameOut {
+        guard,
+        error,
+        fields,
+        ubool,
+        shape,
+        rt2,
+        cells: cells.to_vec(),
+        ubool_cells: ubool_cells.to_vec(),
+        st: s,
+        arc,
+        arc_fin,
+    })
 }
 
 /// An outcome's row as `Waiting` indexes it: its shape class and its fields.
@@ -502,6 +524,30 @@ fn settle_error<A: GraphArith>(d: &mut Symbolic<A>, points: Option<&mut Points<A
     o
 }
 
+/// Where a split of condition `c` cuts: the lowest comparison (or unknown
+/// atom) under it a lane can hold both ways; `c` itself if none.
+fn split_atom<A: GraphArith>(d: &Symbolic<A>, c: NodeId) -> NodeId {
+    use crate::transpile::graph::Op;
+    d.graph
+        .cone(&[c])
+        .into_iter()
+        .find(|n| matches!(d.graph.get(*n).op, Op::Lt | Op::Le | Op::Gt | Op::Ge | Op::Eq | Op::UnknownBool(_)) && d.lane_undecidable(*n))
+        .unwrap_or(c)
+}
+
+/// The answers a split of `atom` takes at the points `pts` (`Points`), each
+/// with its points: an answer no point gives is no side, and one side left
+/// means the points DECIDE it. Without points, both answers.
+fn sides<A: GraphArith>(d: &Symbolic<A>, points: Option<&mut Points<A>>, room: Option<&crate::transpile::graph::Room>, pts: Option<&PointSet>, atom: NodeId) -> Vec<(bool, Option<PointSet>)> {
+    match (points, pts) {
+        (Some(p), Some(here)) => {
+            let (yes, no) = p.answers(d, room, atom);
+            [(true, yes.and(here)), (false, no.and(here))].into_iter().filter(|(_, s)| !s.is_empty()).map(|(a, s)| (a, Some(s))).collect()
+        }
+        _ => vec![(true, None), (false, None)],
+    }
+}
+
 /// `MayErr::may`'s bound on the cases it opens under one error.
 const MAY_CASES: usize = 4096;
 
@@ -550,18 +596,8 @@ impl<A: GraphArith> MayErr<'_, '_, A> {
                 }
                 Some(sel) if self.cases < MAY_CASES => {
                     self.cases += 1;
-                    let c = d.graph.get(sel).args[0];
-                    let atom = d.graph.cone(&[c])
-                        .into_iter()
-                        .find(|m| matches!(d.graph.get(*m).op, Op::Lt | Op::Le | Op::Gt | Op::Ge | Op::Eq | Op::UnknownBool(_)) && d.lane_undecidable(*m))
-                        .unwrap_or(c);
-                    let sides: Vec<(bool, Option<PointSet>)> = match (self.points.as_deref_mut(), pts) {
-                        (Some(p), Some(here)) => {
-                            let (yes, no) = p.answers(d, self.room, atom);
-                            [(true, yes.and(here)), (false, no.and(here))].into_iter().filter(|(_, s)| !s.is_empty()).map(|(a, s)| (a, Some(s))).collect()
-                        }
-                        _ => vec![(true, None), (false, None)],
-                    };
+                    let atom = split_atom(d, d.graph.get(sel).args[0]);
+                    let sides = sides(d, self.points.as_deref_mut(), self.room, pts, atom);
                     let decided = sides.len() == 1;
                     let (may_true, may_false) = d.may_answers(atom);
                     let reach = d.graph.cone(&[n]);
@@ -917,20 +953,8 @@ fn split_undecided_selects<A: GraphArith>(d: &mut Symbolic<A>, outs: Vec<FrameOu
             }
             continue;
         };
-        // Split on the lowest comparison a lane can hold both ways.
-        let atom = d.graph.cone(&[c])
-            .into_iter()
-            .find(|n| matches!(d.graph.get(*n).op, Op::Lt | Op::Le | Op::Gt | Op::Ge | Op::Eq | Op::UnknownBool(_)) && d.lane_undecidable(*n))
-            .unwrap_or(c);
-        // Each answer's points: an answer no point gives is no side, and one
-        // side left means DECIDED.
-        let sides: Vec<(bool, Option<PointSet>)> = match (points.as_mut(), &pts) {
-            (Some(p), Some(here)) => {
-                let (yes, no) = p.answers(d, room, atom);
-                [(true, yes.and(here)), (false, no.and(here))].into_iter().filter(|(_, s)| !s.is_empty()).map(|(a, s)| (a, Some(s))).collect()
-            }
-            _ => vec![(true, None), (false, None)],
-        };
+        let atom = split_atom(d, c);
+        let sides = sides(d, points.as_mut(), room, pts.as_ref(), atom);
         let decided = sides.len() == 1;
         if decided {
             n_decided += 1;
@@ -1170,23 +1194,7 @@ fn three_valued<A: GraphArith>(d: &mut Symbolic<A>, root: NodeId) -> NodeId {
                 } else {
                     Some(vec![(yes, a[k])])
                 };
-                combos = match (combos, alts) {
-                    (Some(cs), Some(alts)) if cs.len() * alts.len() <= ARMS => Some(
-                        cs.iter()
-                            .flat_map(|(c, vs)| {
-                                alts.iter().map(move |(ac, v)| {
-                                    let mut vs = vs.clone();
-                                    vs.push(*v);
-                                    ((*c, *ac), vs)
-                                })
-                            })
-                            .collect::<Vec<_>>()
-                            .into_iter()
-                            .map(|((c, ac), vs)| (d.graph.fold(Op::And, vec![c, ac]), vs))
-                            .collect(),
-                    ),
-                    _ => None,
-                };
+                combos = arm_product(d, combos, alts);
             }
             let boolean_op = is_bool_op(&op);
             match combos {
@@ -1229,6 +1237,26 @@ fn three_valued<A: GraphArith>(d: &mut Symbolic<A>, root: NodeId) -> NodeId {
         map.insert(n, new);
     }
     map[&root]
+}
+
+/// Each of `combos` (a condition and the operands so far) with each of
+/// `alts` (where the next operand takes which value): the conditions AND-ed,
+/// the value appended. `None` past `ARMS` (or where either is).
+fn arm_product<A: GraphArith>(d: &mut Symbolic<A>, combos: Option<Vec<(NodeId, Vec<NodeId>)>>, alts: Option<Vec<(NodeId, NodeId)>>) -> Option<Vec<(NodeId, Vec<NodeId>)>> {
+    use crate::transpile::graph::Op;
+    let (cs, alts) = (combos?, alts?);
+    if cs.len() * alts.len() > ARMS {
+        return None;
+    }
+    let mut next = Vec::with_capacity(cs.len() * alts.len());
+    for (c, vs) in &cs {
+        for (ac, v) in &alts {
+            let mut vs = vs.clone();
+            vs.push(*v);
+            next.push((d.graph.fold(Op::And, vec![*c, *ac]), vs));
+        }
+    }
+    Some(next)
 }
 
 /// `three_valued`'s bound on the arms an exact-only op is distributed over.
@@ -1313,20 +1341,7 @@ fn arms<A: GraphArith>(
         let mut combos: Option<Vec<(NodeId, Vec<NodeId>)>> = Some(vec![(yes, Vec::new())]);
         for x in &args {
             let alts = if numeric(d, *x) { arms(d, *x, map, affected, boolean, memo) } else { Some(vec![(yes, *map.get(x).unwrap_or(x))]) };
-            combos = match (combos, alts) {
-                (Some(cs), Some(alts)) if cs.len() * alts.len() <= ARMS => {
-                    let mut next = Vec::with_capacity(cs.len() * alts.len());
-                    for (c, vs) in &cs {
-                        for (ac, v) in &alts {
-                            let mut vs = vs.clone();
-                            vs.push(*v);
-                            next.push((d.graph.fold(Op::And, vec![*c, *ac]), vs));
-                        }
-                    }
-                    Some(next)
-                }
-                _ => None,
-            };
+            combos = arm_product(d, combos, alts);
         }
         combos.map(|cs| cs.into_iter().map(|(c, vs)| (c, d.graph.fold(op.clone(), vs))).collect())
     };
@@ -1510,7 +1525,7 @@ mod tests {
     fn a_body_pinned_to_a_pm1_key_refuses_any_other_key() {
         let (root, s) = (std::path::Path::new("."), crate::settings::Settings::default());
         let chunks = cart::Chunks::parse(root, &s).expect("chunks");
-        let (reset, frame) = (&chunks.reset, &chunks.frame);
+        let frame = &chunks.frame;
         let mut it: Interp<Symbolic> = Interp::new(Symbolic::default());
         let mut st = cart::boot(&mut it, &chunks, root, s.room).expect("boot");
         let mut player = None;
@@ -1528,7 +1543,7 @@ mod tests {
         }
         let key = pm1_key(&player, &st, &it.d).expect("pm1 key");
         assert_eq!(key.len(), 6, "the pm1 key is six cells");
-        let f = trace_frame(&mut it, reset, frame, st, &roots, &key, &[], false, &[], &[]).expect("trace");
+        let f = trace_frame(&mut it, &chunks, st, &TraceSpec { roots: &roots, pin: &key, concrete: true, ..Default::default() }).expect("trace");
         assert_eq!(f.iface.pins.len(), 6, "all six pinned");
 
         // No error in whichever outcome claims this assignment.
