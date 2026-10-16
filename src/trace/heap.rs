@@ -301,36 +301,27 @@ impl<D: Domain> Heap<D> {
     /// The tables, scopes and closures reachable from `roots`.
     pub fn reachable(&self, roots: &[Root]) -> (BTreeSet<TableId>, BTreeSet<ScopeId>, BTreeSet<ClosureId>) {
         let mut live: (BTreeSet<TableId>, BTreeSet<ScopeId>, BTreeSet<ClosureId>) = Default::default();
-        for r in self.visit(roots) {
-            match r {
-                Root::Table(t) => live.0.insert(t),
-                Root::Scope(s) => live.1.insert(s),
-                Root::Closure(c) => live.2.insert(c),
-            };
-        }
+        self.visit(roots, |r| match r {
+            Root::Table(t) => live.0.insert(t),
+            Root::Scope(s) => live.1.insert(s),
+            Root::Closure(c) => live.2.insert(c),
+        });
         live
     }
 
-    /// Every object reachable from `roots`, each once, BREADTH-FIRST: the
-    /// canonical order `shape_and_order` numbers objects by. The ONE place
-    /// that knows what an object refers to (with `push_value`).
-    fn visit(&self, roots: &[Root]) -> Vec<Root> {
-        let mut seen: (BTreeSet<TableId>, BTreeSet<ScopeId>, BTreeSet<ClosureId>) = Default::default();
+    /// Every object reachable from `roots`, BREADTH-FIRST (the canonical
+    /// order `shape_and_order` numbers objects by): `first` is told of each
+    /// and says whether it is new (an object seen before is not entered).
+    /// The ONE place that knows what an object refers to (with `push_value`).
+    fn visit(&self, roots: &[Root], mut first: impl FnMut(Root) -> bool) {
         let mut queue: Vec<Root> = roots.to_vec();
-        let mut order: Vec<Root> = Vec::new();
         let mut i = 0;
         while i < queue.len() {
             let r = queue[i];
             i += 1;
-            let fresh = match r {
-                Root::Table(t) => seen.0.insert(t),
-                Root::Scope(s) => seen.1.insert(s),
-                Root::Closure(c) => seen.2.insert(c),
-            };
-            if !fresh {
+            if !first(r) {
                 continue;
             }
-            order.push(r);
             match r {
                 Root::Closure(c) => queue.extend(self.closures.get(&c).map(|cl| Root::Scope(cl.env))),
                 Root::Table(t) => {
@@ -348,7 +339,6 @@ impl<D: Domain> Heap<D> {
                 }
             }
         }
-        order
     }
 }
 
@@ -408,17 +398,32 @@ impl<D: Domain> Heap<D> {
     /// `shape`, and the canonical BFS order of the reachable objects it was
     /// numbered by - the order a merge pairs the two sides' objects in.
     pub fn shape_and_order(&self, roots: &[Root]) -> Result<(Shape, Vec<Root>)> {
-        let order = self.visit(roots);
         let mut t_num: BTreeMap<TableId, u32> = BTreeMap::new();
         let mut s_num: BTreeMap<ScopeId, u32> = BTreeMap::new();
         let mut c_num: BTreeMap<ClosureId, u32> = BTreeMap::new();
-        for r in &order {
-            match *r {
-                Root::Table(t) => t_num.insert(t, t_num.len() as u32),
-                Root::Scope(s) => s_num.insert(s, s_num.len() as u32),
-                Root::Closure(c) => c_num.insert(c, c_num.len() as u32),
+        let mut order: Vec<Root> = Vec::new();
+        self.visit(roots, |r| {
+            // The next number, on first sight.
+            let number = |m: &mut BTreeMap<u32, u32>, id: u32| {
+                let k = m.len() as u32;
+                match m.entry(id) {
+                    std::collections::btree_map::Entry::Vacant(e) => {
+                        e.insert(k);
+                        true
+                    }
+                    std::collections::btree_map::Entry::Occupied(_) => false,
+                }
             };
-        }
+            let new = match r {
+                Root::Table(t) => number(&mut t_num, t),
+                Root::Scope(s) => number(&mut s_num, s),
+                Root::Closure(c) => number(&mut c_num, c),
+            };
+            if new {
+                order.push(r);
+            }
+            new
+        });
         let slot = |v: &Value<D>| -> Slot {
             match v {
                 Value::Nil => Slot::Nil,
