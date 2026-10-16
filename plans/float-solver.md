@@ -1383,3 +1383,74 @@ the reference refuses.
 
 `missed 0` in every forward. Before the balloon fix, the same (7,0) tree
 traced 2.9M lanes to f40 against 77k after, with the same position graph.
+
+### Milestone 6: the dual search (built)
+
+`rewrite dual` (`search::dual`, section 10 as decided in section 15):
+
+- Each half runs its levels (forward and arc phase, the objects ladder,
+  level -1 in its own arithmetic) to the same horizon: the fixed half under
+  the run's settings, real play from `--loading-jank J` (the category's
+  boot chain J: `pico8_diff/chain.py entry_jank`), in `<dir>/fixed`; the
+  float half under the float tool's own start (`--float-half celia|uct`;
+  Celia's IL jank unless `--float-loading-jank`), in `<dir>/float`
+  (`Settings::float_half`). `solve` keeps the last level's arcs (`Arcs`);
+  the driver is `run_levels`, shared with `search`.
+- The dual concrete search: a state is (the fixed half's exact state or
+  EXITED, the float half's); under an input both reference engines step,
+  their `rnd` leaves paired; a successor is admitted iff every live half
+  lies in its own W. Rule (b): a fixed half that wins waits as EXITED; a
+  float win is the dual win only with the fixed half exited by then, else
+  pruned. Dedup and the depth-first memo on the full dual state; an input
+  skipped only where both halves' read buttons agree; a depth-first try at
+  the larger arc bound, then breadth-first layers to the horizon
+  (exhaustive inside both W: the first win is the dual optimum).
+- The witness is replayed in both arithmetics before it is written (the
+  float half first wins on the last frame; the fixed half by its claimed
+  exit), recorded in `result.json` (`dual`: the float tool, its J, the
+  fixed exit) and `witness_frame_F.txt`.
+- Gate: t2's `gate10d-dual` (room (1,0)'s synthetic win: both bounds 33,
+  the dual witness the known route).
+
+Two things the first real rooms needed:
+
+- A platform carrying the player (`hit.move_x(x - last, 1)`): 16.16
+  cancels `(x + move) - x` exactly; in doubles the cancel holds where `x`
+  is an integer (every world's is: `Symbolic::integral_inputs`, checked
+  in `platform_worlds`) and the move an integer or a literal with integer
+  ends (exact below 2^53; `fl` monotone and exact at the ends). Without it
+  room (1,2)'s float `r0sxhnp` hit a KERNEL COVERAGE GAP at f56.
+- Float trees hold a balloon's phase as the `rnd` interval unless
+  `--balloon-seeds` fixes it; the tool's seeds (Celia's and UCT's: every
+  seed 0 without a list) are the CONCRETE runs' (`Settings::concrete`),
+  keyed through `lookup_view`, as fixed under `--concrete-balloon-seeds`.
+  Seeded, every phase and bob counted frames: room (1,2)'s float `r0sxh`
+  needed 128 key bits, past the 127 a key holds.
+
+Every witness is checked with `tools/uct/check_uploads.py` (PICO-8 IL,
+the chain from the previous room, the boot chain; UCT; Celia float) and
+Celia `--fixp` (`tools/celia/validate.sh`, `CELIA_FIXP=1`); the tool file
+cuts the frames before the player's first.
+
+**The validation rooms** (2026-10-16; frames from the room's load, the
+database's count in parentheses: the tool file starts on the player's first
+frame, its count is its inputs less one). Each fixed half from real play's
+J (the category's boot chain, `chain.py entry_jank`), each float half
+Celia's IL load and seeds; release binary, `--memory 40G`.
+
+| room | fixed (real play) | float (Celia) | dual | the dual witness in the tools |
+|---|---|---|---|---|
+| nodiag 1800m (1,2), J3 / Celia J4, `r0sxhnp,r0sxhn,r0sxh,r0sx`, h118 | bound 113 | bound 113, the dual witness: 113 | **113 (85)**, fixed exit 113; 133 s | the 85 upload's file (`tas/room_1_2_nodiag_frame_113.txt`): PICO-8 IL, chain and boot exit 85f; Celia float 85; Celia `--fixp` 85; UCT dies (keypress 70: its IL load has no jank). Cut a frame early (86) it finishes in UCT and dies in real play and Celia, as plans/nodiag.md says |
+| gemskip 100% 2500m (0,3), J1 / Celia J1, `r0sxhn,r0sxh`, level -1 (150,5), h150 | bound 141 | bound 141, the dual witness: **141 (116)** | **141 (116)**, fixed exit 141; 634 s | a NEW file, not our submitted 116 (which dies in float): PICO-8 IL, chain and boot exit 116f with the berry; UCT finishes 116; Celia float 116; Celia `--fixp` 116. VALID everywhere |
+| gemskip any% 2600m (1,3), J8 / Celia J8, `r0sxhn,r0sxh`, level -1 (160,5), h160 | bound 151 | **149 (123)**: bound 149, witness at the bound (the community route's) | **151 (125)**, fixed exit 151; 205 s | PICO-8 IL, chain and boot exit 125f; UCT 125; Celia float 125; Celia `--fixp` 125. VALID everywhere. The float-only 123: UCT and Celia float finish it, PICO-8 and Celia `--fixp` kill it |
+
+So: 2500m has a dual run at our 116 (the submitted file is fixed-only; this
+one is valid in every tool); 2600m's float optimum is the community's 123
+(proven: float bound 149 at `r0sxh`) and its dual optimum is the fixed
+optimum, 125; nodiag 1800m's dual optimum is the 85 already uploaded.
+Every float half's known route (Celia's tasdatabase run, where it exits by
+the horizon) survived every pruning step. `rewrite robust`: every dual
+witness and the float 123 are ROBUST (glibc's `sin`, every call one ulp
+up, one ulp down, and 8 random runs: the same exit frame). The witnesses
+are unsubmitted routes: under /var/tmp/float-check/m6/val, never
+committed.
