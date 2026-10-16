@@ -931,13 +931,12 @@ impl<N: Rem> ForwardState<N> {
         self.visited.len()
     }
 
-    /// The visited set (`bench-frame`, `bench-storage`).
+    /// The visited set (`bench-frame`).
     pub fn visited(&self) -> &crate::storage::visited::VisitedSet<N> {
         &self.visited
     }
 
-    /// The frontier: the last frame's states whose hull grew (`bench-frame`,
-    /// `bench-storage`).
+    /// The frontier: the last frame's states whose hull grew (`bench-frame`).
     pub fn frontier(&self) -> &Frontier<N> {
         &self.frontier
     }
@@ -957,9 +956,7 @@ impl<N: Rem> ForwardState<N> {
     }
 
     /// ONE WAVE of `extend` - frame `frames + 1`, under the tree's level -1
-    /// filter (a capture's replayed emissions are past it already,
-    /// `bench-storage`; its re-pushes are not), its pos graph fed when
-    /// recording - without the checkpoint (`bench_checkpoint`): the
+    /// filter, its pos graph fed when recording - without the checkpoint (`bench_checkpoint`): the
     /// frontier is read; with `copy` the state is left as it was (the
     /// visited set and the transfer table are copied: another wave may
     /// follow), else they are MOVED in (no copy held beside the wave's: the

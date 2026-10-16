@@ -26,8 +26,7 @@
 //! The deep diagnostics have owners: `--key-check` and `--phases` the
 //! wave's sinks (`storage::unit::UnitSink`), `--build-trace`,
 //! `--kernel-explain`, `--kernel-mix` and the metrics the kernel build's
-//! options (`compiled::asm_kernel::BuildOptions`), `--emit-capture` the
-//! sinks' capture writers.
+//! options (`compiled::asm_kernel::BuildOptions`).
 
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
@@ -124,8 +123,6 @@ pub struct Diagnostics {
     pub build_trace: bool,
     /// The wave workers' phase timings.
     pub phases: bool,
-    /// Capture the wave's emissions into this dir (`DIR/f{F}/` per frame).
-    pub emit_capture: Option<PathBuf>,
 }
 
 impl Default for Settings {
@@ -454,9 +451,6 @@ pub struct SettingsArgs {
     /// DIAGNOSTIC: the wave workers' phase timings.
     #[arg(long, global = true)]
     pub phases: bool,
-    /// DIAGNOSTIC: capture every wave's emissions into DIR/f{F}/ (`bench-storage`).
-    #[arg(long, global = true)]
-    pub emit_capture: Option<PathBuf>,
 }
 
 impl SettingsArgs {
@@ -532,7 +526,6 @@ impl SettingsArgs {
                 kernel_metrics: false,
                 build_trace: self.build_trace,
                 phases: self.phases,
-                emit_capture: self.emit_capture.clone(),
             },
         })
     }
@@ -596,7 +589,6 @@ pub fn refuse_env() -> Result<()> {
         ("CELESTE_KERNEL_METRICS", "bench-frame --metrics"),
         ("CELESTE_BUILD_TRACE", "--build-trace"),
         ("CELESTE_PHASES", "--phases"),
-        ("CELESTE_EMIT_CAPTURE", "--emit-capture"),
     ];
     let mut bad: Vec<String> = std::env::vars_os()
         .filter_map(|(k, _)| k.to_str().map(str::to_string))
@@ -656,7 +648,6 @@ pub fn startup(args: &SettingsArgs, float: bool, adjust: impl FnOnce(&mut Settin
     note("(kernel metrics)", s.diag.kernel_metrics, String::new());
     note("--build-trace", s.diag.build_trace, String::new());
     note("--phases", s.diag.phases, String::new());
-    note("--emit-capture ", s.diag.emit_capture.is_some(), format!("{:?}", s.diag.emit_capture));
     if !set.is_empty() {
         eprintln!("[settings] {}", set.join(" "));
     }

@@ -760,7 +760,7 @@ pub fn run_wave<N: Rem>(engine: &dyn FrameStep<N>, front: Frontier<N>, cx: WaveC
         }
     }
     for sink in &mut sinks {
-        sink.finish()?;
+        sink.finish();
         st.lanes_raw += sink.emitted as usize;
         if let Some(p) = pos {
             p.record_pairs(sink.pos_pairs());

@@ -308,17 +308,14 @@ pub struct UnitSink<'a, N: Rem = P8> {
     pos_recent: Vec<(u32, u32)>,
     /// Emissions past level -1 (each one a record).
     pub emitted: u64,
-    /// `--emit-capture`: this worker's stream (`bench`).
-    capture: Option<super::bench::CaptureWriter<N>>,
     /// The shapes this worker noted (`note_shape`), registered
     /// (`Skeletons`) and checked this frame (`guard`).
     noted: FxHashSet<u64>,
     registered: FxHashSet<u64>,
     guarded: FxHashSet<u64>,
     /// Inside `emit_row` (the reference engine's rows: no guard, no key
-    /// check), or the emissions come without rows (`bench::Replay`).
+    /// check).
     reference: bool,
-    rowless: bool,
     /// The last emission's shape, once registered and guarded (0: none).
     last_shape: u64,
 }
@@ -404,12 +401,10 @@ impl<'a, N: Rem> UnitSink<'a, N> {
             pos_edges: Default::default(),
             pos_recent: Vec::new(),
             emitted: 0,
-            capture: super::bench::CaptureWriter::open(frame, worker, level, s),
             noted: Default::default(),
             registered: Default::default(),
             guarded: Default::default(),
             reference: false,
-            rowless: false,
             last_shape: 0,
         }
     }
@@ -455,9 +450,6 @@ impl<'a, N: Rem> UnitSink<'a, N> {
     pub fn note_shape(&mut self, r: &celeste_engine::exact::ShapeRecord) {
         if self.noted.insert(r.hash) {
             self.prov.note_shape(r);
-            if let Some(c) = &mut self.capture {
-                c.shape(r);
-            }
         }
     }
 
@@ -502,7 +494,7 @@ impl<'a, N: Rem> UnitSink<'a, N> {
     }
 
     /// The unit's sources and lanes are in: their hulls by source and
-    /// cell, the capture's unit record.
+    /// cell.
     pub fn sources_done(&mut self) {
         let geo = super::GEOMETRY;
         self.src_first.clear();
@@ -522,9 +514,6 @@ impl<'a, N: Rem> UnitSink<'a, N> {
             let s = self.src_local[e] as usize;
             self.entry_next[e].0 = self.src_first[s];
             self.src_first[s] = e as u32;
-        }
-        if let Some(c) = &mut self.capture {
-            c.unit(self.unit, self.lanes.len() as u32);
         }
     }
 
@@ -787,14 +776,6 @@ impl<'a, N: Rem> UnitSink<'a, N> {
             return Ok(());
         }
         self.emitted += take.count_ones() as u64;
-        if let Some(c) = &mut self.capture {
-            let tab = self.xfer_tab.read().expect("a transfer table");
-            for i in lanes_of(take) {
-                let key = e.keys[i];
-                let x = c.xfer(e.xfers[i], || pair_of(self.base, &tab, self.first_new, e.xfers[i]));
-                c.emit(shape, t.cells[i], key, e.lanes[i] as u32, x, is_provisional(key).then(|| self.prov.content(key)));
-            }
-        }
         // A shape's first emission (this worker, this wave): its skeleton
         // registered, and THE DECODE GUARD - its row is what its key and
         // cell decode to (the new layer is decoded). Looked at only when the
@@ -806,7 +787,7 @@ impl<'a, N: Rem> UnitSink<'a, N> {
             }
             self.last_shape = if self.guarded.contains(&shape) { shape } else { 0 };
         }
-        if self.last_shape != shape && !self.reference && !self.rowless {
+        if self.last_shape != shape && !self.reference {
             if let Some(i) = lanes_of(take).find(|&i| !is_provisional(e.keys[i])) {
                 let mut b = RowBuf::new(init());
                 push(&mut b, i);
@@ -815,7 +796,7 @@ impl<'a, N: Rem> UnitSink<'a, N> {
                 self.last_shape = shape;
             }
         }
-        if self.key_check && !self.reference && !self.rowless {
+        if self.key_check && !self.reference {
             let b = Self::buf_of(&mut self.check, shape, &init);
             for i in lanes_of(take) {
                 push(&mut self.check[b], i);
@@ -990,22 +971,11 @@ impl<'a, N: Rem> UnitSink<'a, N> {
         r
     }
 
-    /// The emissions come without rows (`bench::Replay`, a capture): no
-    /// decode guard, no key check.
-    pub fn replaying(&mut self) {
-        self.rowless = true;
-    }
-
-    /// The worker's units are over: its capture stream and transfer table
-    /// written (`--emit-capture`); the shapes it checked are checked again
+    /// The worker's units are over: the shapes it checked are checked again
     /// next frame.
-    pub fn finish(&mut self) -> Result<()> {
+    pub fn finish(&mut self) {
         self.guarded.clear();
         self.last_shape = 0;
-        match self.capture.take() {
-            Some(c) => c.finish(),
-            None => Ok(()),
-        }
     }
 
     /// The PUSHES of a route's bundles (`bundles` naming `targets` by

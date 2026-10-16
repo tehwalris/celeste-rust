@@ -14,7 +14,8 @@ byte-identical, or re-pins them on evidence.
 
 - **The fixture frames' fingerprints**: the `f`, `h` and `e` lines (new
   states, frontier hulls, edges, by content) of single frames, 16.16 and
-  float (t1, big). The fixtures themselves are rebuilt from scratch against
+  float (t1, big), and their `b` lines (the bytes of every file the frame
+  wrote: frame, hull, edge and out files, the pos graph). The fixtures themselves are rebuilt from scratch against
   their pins by `./check.sh fixtures`.
 - **The room (1,0) gates** (t2): the f0-f44 posgraph and `ckhash`, and the
   arc gate. The arc gate pins the marks, W at every frame f0-f35, the
@@ -45,7 +46,7 @@ counts as the evidence.
 | `t0` | the unit tests (nextest, quick; the `#[ignore]`d aside): the pre-commit run | 2-3 s (+15-40 s test build after an edit) |
 | `t1` | single frames from the fixtures, fixed and float, in 5 lanes: THE REFACTOR GATE | 35 s |
 | `t2` | end to end and the slow tests, in 4 lanes | 55 s |
-| `big` | the reference frame (6,2) f56 -> f57, its storage replay, the platform frame | 38 s |
+| `big` | the reference frame (6,2) f56 -> f57, the platform frame | 38 s |
 | `perf` | the instruction budget: the RELEASE build, measured; milestones and `all`, not every change | ~4 min after an edit (the release build ~3.5 min, the frames 33 s) |
 | `local` | the local goldens | 2 s |
 | `fixtures` | every fixture rebuilt from scratch against its pin | 3-4 min |
@@ -94,10 +95,9 @@ r42x), f10 and f42 (f42n, f42x).
 
 | steps | what |
 |---|---|
-| frame-r10, -r62h, -r42n | `bench-frame --edges --metrics` of r10 f55, r62h f50, r42n f60: the f/h/e lines and the exact metrics |
+| frame-r10, -r62h, -r42n | `bench-frame --edges --checkpoint --metrics` of r10 f55, r62h f50, r42n f60: the f/h/e/b lines and the exact metrics |
 | frame-f10, -f42n | the same in float (no metrics) |
 | keycheck-r10, -r42n, -f42n | `--key-check`: every emitted row's key recomputed from its fields, and decoded back |
-| storage-r10 | `bench-storage` of r10's f56 capture: the storage alone, its f/e lines frame-r10's |
 | refcheck-r10, -r42x, -f10, -f42x | `ref-check`: 32 rows through the kernels and the reference engine; the converters agree |
 | arccheck-, arcfault- (r10, f10; arccheck also r42x, f42x) | `arc-check`: 32 recorded transfers against the reference; with `--fault action` it must fail |
 | widen-r10, -r62h, -r42n, -f10, -f42n | `widen-check`: the widening table's two sides agree on every stored row and 64 rows' emissions |
@@ -128,8 +128,8 @@ The steps run in four lanes:
 ### big, perf, local, fixtures
 
 - **big**: frame-r62h57 (the reference frame (6,2) 100% f56 -> f57: 800,821
-  new states, 27M edges re-pushed), storage-r62h57 (its capture replayed),
-  and frame-r60s (the platform frame step 70 -> 71 and its metrics).
+  new states, 27M edges re-pushed) and frame-r60s (the platform frame step
+  70 -> 71), with their b lines and metrics.
 - **perf, the instruction budget** (`gates/perf.txt`): one rep's user-space
   instructions on three bench frames, of the RELEASE binary (fat LTO, one
   codegen unit; the tier builds it): r62h f50 (18.86 G), r62h57 f56
@@ -228,9 +228,8 @@ are never committed.
 | r42n, f42n | room (4,2) 2100m `r0sxhn`, level -1 (71,5), to f61; frame 60 -> 61 | 15-25 s |
 | r42x, f42x | room (4,2) `r0sxh` (objects exact) to f56: the reference checks' object room | 14-18 s |
 | r10arc, f10arc | `search --level r0sxh --to 56 --win-at 40,64`: the backward's tree | 4-5 s |
-| cap-r10 | r10's f56 emissions (`--emit-capture`) | 2 s |
 | r60s | room (6,0) 700m `r0sxhfp`, split frame, to step 71 | 26-40 s |
-| r62h57, cap-r62h57 (big) | room (6,2) 100% to f57, the reference frame; its capture | 57 s; 8 s |
+| r62h57 (big) | room (6,2) 100% to f57, the reference frame | 57 s |
 
 ## Re-pinning
 

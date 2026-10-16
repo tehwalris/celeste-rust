@@ -4,17 +4,17 @@
 #   ./check.sh t0           the unit tests (nextest, quick profile; the
 #                           #[ignore]d ones aside): the pre-commit run
 #   ./check.sh t1 [--pin]   single frames from the fixtures (tools/fixtures.sh),
-#                           16.16 and float: the forward's exact output and
-#                           metrics, the keys, the widening table, a backward
-#                           frame, the storage, the kernels and transfers
+#                           16.16 and float: the forward's exact output, its
+#                           files' bytes and metrics, the keys, the widening
+#                           table, a backward frame, the kernels and transfers
 #                           against the reference engine. THE REFACTOR GATE
 #   ./check.sh t2 [--pin]   end to end: the room (1,0) gates, float and dual,
 #                           the objects ladder, the UI export, a platform
 #                           room; the reference's tree against the kernels',
 #                           the hull replay; and the slow tests
 #                           (#[ignore = "slow, ..."])
-#   ./check.sh big [--pin]  the reference frame (6,2) 100% f56 -> f57 with its
-#                           capture replayed, and the platform frame's metrics
+#   ./check.sh big [--pin]  the reference frame (6,2) 100% f56 -> f57 and the
+#                           platform frame, with their files' bytes and metrics
 #   ./check.sh perf [--pin] user-space instructions of three bench frames
 #                           against gates/perf.txt, the RELEASE binary (built
 #                           here): more than 2% over FAILS; milestones and
@@ -126,11 +126,13 @@ t0() {
     echo "    (the skipped are #[ignore]d: t2 runs the slow ones, all the pre-merge ones, local the local goldens)"
 }
 
-# frame NAME FRAME ROOM LEVEL FLAGS...: one forward frame from a fixture, its
-# f/e lines and exact metrics against the pins; timings shown.
+# frame NAME FRAME ROOM LEVEL FLAGS...: one forward frame from a fixture,
+# checkpointed as the forward does: its f/h/e lines, the b line over the
+# bytes of every file it wrote, and the exact metrics against the pins;
+# timings shown.
 frame() {
     local name=$1 f=$2 room=$3 level=$4; shift 4
-    ./safe-run.sh --memory "$MEM" -- "$B" bench-frame --level-dir "$F/$name" --frame "$f" --room "$room" --level "$level" --edges --threads "$TH" --metrics "$C/$name.metrics" --l1-table "$F/$name/l1-table.bin" "$@" > "$C/$name.frame" || return 1
+    ./safe-run.sh --memory "$MEM" -- "$B" bench-frame --level-dir "$F/$name" --frame "$f" --room "$room" --level "$level" --edges --checkpoint --threads "$TH" --metrics "$C/$name.metrics" --l1-table "$F/$name/l1-table.bin" "$@" > "$C/$name.frame" || return 1
     same "$C/$name.frame" "$G/$name.frame" || return 1
     if [[ $PIN == --pin ]]; then
         same "$C/$name.metrics" "$G/$name.metrics"
@@ -143,8 +145,13 @@ frame() {
 # float fixture's: the kernel mix census is 16.16's).
 framef() {
     local name=$1 f=$2 room=$3 level=$4; shift 4
-    ./safe-run.sh --memory "$MEM" -- "$B" bench-frame --level-dir "$F/$name" --frame "$f" --room "$room" --level "$level" --edges --threads "$TH" --l1-table "$F/$name/l1-table.bin" "$@" > "$C/$name.frame" || return 1
+    ./safe-run.sh --memory "$MEM" -- "$B" bench-frame --level-dir "$F/$name" --frame "$f" --room "$room" --level "$level" --edges --checkpoint --threads "$TH" --l1-table "$F/$name/l1-table.bin" "$@" > "$C/$name.frame" || return 1
     same "$C/$name.frame" "$G/$name.frame"
+}
+
+# fhe NAME: the pinned frame's f/h/e lines (a step without `--checkpoint`).
+fhe() {
+    grep -v '^b' "$G/$1.frame"
 }
 
 # keycheck NAME FRAME ROOM LEVEL FLAGS...: frame's rows' keys recomputed
@@ -152,7 +159,7 @@ framef() {
 keycheck() {
     local name=$1 f=$2 room=$3 level=$4; shift 4
     ./safe-run.sh --memory "$MEM" -- "$B" bench-frame --level-dir "$F/$name" --frame "$f" --room "$room" --level "$level" --edges --threads "$TH" --key-check --l1-table "$F/$name/l1-table.bin" "$@" > "$C/keycheck-$name.frame" || return 1
-    diff "$G/$name.frame" "$C/keycheck-$name.frame" >&2
+    diff <(fhe "$name") "$C/keycheck-$name.frame" >&2
 }
 
 # widencheck NAME FRAME ROOM LEVEL FLAGS...: `rewrite widen-check` of a
@@ -196,18 +203,9 @@ backwardf() {
     same "$C/backward-f.txt" "$G/f10arc.backward"
 }
 
-# storage TREE FRAME ROOM LEVEL FLAGS...: the capture of TREE's frame FRAME
-# replayed; its new states and edges are the frame check's (TREE.frame).
-storage() {
-    local tree=$1 f=$2 room=$3 level=$4; shift 4
-    ./safe-run.sh --memory "$MEM" -- "$B" bench-storage --capture "$F/cap-$tree/f$(printf %03d "$f")" --tree "$F/$tree" --room "$room" --level "$level" --threads "$TH" --reps 1 --l1-table "$F/$tree/l1-table.bin" "$@" > "$C/storage-$tree.txt" || return 1
-    cat "$C/storage-$tree.txt" >&2
-    { grep -o "f$(printf %03d "$f") [0-9]* [0-9a-f]*" "$C/storage-$tree.txt"; grep -o "e$(printf %03d "$f") [0-9]* [0-9a-f]*" "$C/storage-$tree.txt"; } | diff <(grep -E '^[fe][0-9]' "$G/$tree.frame") - >&2
-}
-
 t1() {
     build
-    step fixtures tools/fixtures.sh ensure r10 r62h r42n r42x r10arc cap-r10 f10 f42n f42x f10arc
+    step fixtures tools/fixtures.sh ensure r10 r62h r42n r42x r10arc f10 f42n f42x f10arc
     grep -h '^\[fixtures\]' "$C/fixtures.err"
     local FL="--arith float"
     # One lane a fixture family (a fixture's steps in order: `bench-frame`
@@ -224,16 +222,15 @@ t1() {
     for s in refcheck-r10 refcheck-r42x refcheck-f10 refcheck-f42x; do grep -h '^\[ref-check\] [0-9]' "$C/$s.out" | sed "s/^/    /"; done
     for s in arccheck-r10 arccheck-r42x arccheck-f10 arccheck-f42x; do grep -h '^agreement' "$C/$s.out" | sed "s/^/    /" | cut -c1-200; done
 }
-# The forward, one frame each, exact (and the run's timings); every emitted
-# row's key recomputed from its fields; the storage alone (the f56 capture
-# replayed); the kernels and the recorded transfers against the reference
-# engine, sampled, and a corrupted transfer refused; the widening table's two
-# sides (every stored row, and the rows the kernels emit from 64 of them,
-# kept as they are by the block side); one backward frame (W f45 of h56).
+# The forward, one frame each, exact, its files' bytes (and the run's
+# timings); every emitted row's key recomputed from its fields; the kernels
+# and the recorded transfers against the reference engine, sampled, and a
+# corrupted transfer refused; the widening table's two sides (every stored
+# row, and the rows the kernels emit from 64 of them, kept as they are by
+# the block side); one backward frame (W f45 of h56).
 t1_r10() {
     step frame-r10 frame r10 55 1,0 r0sxh
     step keycheck-r10 keycheck r10 55 1,0 r0sxh
-    step storage-r10 storage r10 56 1,0 r0sxh
     step refcheck-r10 refcheck r10 55 1,0
     step arccheck-r10 arccheck r10 1,0
     step arcfault-r10 faultcheck r10 1,0
@@ -252,7 +249,7 @@ t1_r42() {
     step arccheck-r42x arccheck r42x 4,2 --level-minus-one 71,5
 }
 # The same in FLOAT (`--arith float`, the doubles' kernels, Celia's start):
-# the frames exact (their f/h/e lines; no metrics), the keys, the kernels
+# the frames exact (their f/h/e/b lines; no metrics), the keys, the kernels
 # and the transfers against the float reference, the widening.
 t1_f10() {
     step frame-f10 framef f10 55 1,0 r0sxh "$@"
@@ -403,11 +400,9 @@ widen60() {
 
 big() {
     build
-    step fixtures-big tools/fixtures.sh ensure r62h57 cap-r62h57 r60s
+    step fixtures-big tools/fixtures.sh ensure r62h57 r60s
     step frame-r62h57 frame r62h57 56 6,2 r0sxhf $L1_62
     grep -hE '^\[bench\] (kernels|rep)|^\[phases\]' "$C/frame-r62h57.err" | sed 's/^/    /' | cut -c1-220
-    step storage-r62h57 storage r62h57 57 6,2 r0sxhf $L1_62
-    sed 's/^/    /' "$C/storage-r62h57.txt" | cut -c1-220
     # The platform kernels' frame (step 70 -> 71) and exact metrics: its
     # lines are t2's forward60's too; their build is ~20-40 s of tracing.
     step frame-r60s frame r60s 70 6,0 r0sxhfp --split-frame
@@ -442,7 +437,7 @@ perfcount() {
     rm -f "$C/perf-$name.line"
     for n in 1 3; do
         ./safe-run.sh --memory "$MEM" -- perf stat -x, -e instructions:u -o "$C/perf-$name-$n.stat" -- "$RB" bench-frame --level-dir "$F/$name" --frame "$f" --room "$room" --level "$level" --edges --threads 16 --l1-table "$F/$name/l1-table.bin" --reps "$n" "$@" > "$C/perf-$name-$n.frame" || return 1
-        diff "$G/$name.frame" "$C/perf-$name-$n.frame" >&2 || return 1
+        diff <(fhe "$name") "$C/perf-$name-$n.frame" >&2 || return 1
     done
     i1=$(awk -F, '$3 ~ /^instructions/ {print $1}' "$C/perf-$name-1.stat")
     i3=$(awk -F, '$3 ~ /^instructions/ {print $1}' "$C/perf-$name-3.stat")

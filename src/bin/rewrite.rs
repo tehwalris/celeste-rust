@@ -327,29 +327,6 @@ enum Command {
         #[arg(long, default_value_t = 1)]
         reps: usize,
     },
-    /// BENCH: replay one captured frame through the REAL storage code
-    /// (`storage::bench`): a forward or `bench-frame` run with
-    /// `--emit-capture DIR` writes each wave's `DIR/f{F}/`; this replays
-    /// its units against `--tree`'s visited set at frame F-1 through the
-    /// whole wave - the sinks, the region phase, the frame's end, the edge
-    /// file - printing per rep the wall times and the `ckhash` lines of the
-    /// new states (`f`) and of the edges (`e`), to compare with the real
-    /// tree's (`ckhash --edges`). Run it with the capture's settings
-    /// (`DIR/f{F}/env.txt`: the level and the settings line).
-    BenchStorage {
-        /// A captured frame's directory (`DIR/f{F}`).
-        #[arg(long)]
-        capture: String,
-        /// The level dir the capture's frame was run on (its frames to F-1).
-        #[arg(long)]
-        tree: String,
-        /// The level the capture was run at (its `env.txt`).
-        #[arg(long, value_parser = Level::parse, default_value = "r0sx")]
-        level: Level,
-        /// Replay the capture this many times.
-        #[arg(long, default_value_t = 3)]
-        reps: usize,
-    },
     /// DIAGNOSTIC: the TRANSFERS of a level-0 tree's edges, checked. Every
     /// recorded edge carries a transfer; then `--samples` records per frame,
     /// the source row stepped by the REFERENCE engine at the level (all 64
@@ -1887,16 +1864,6 @@ fn main() -> Result<()> {
             Arith::Fixed => bench_backward::<P8>(&cfg, &level_dir, horizon, frame, reps)?,
             Arith::Float(_) => bench_backward::<LuaF64>(&cfg, &level_dir, horizon, frame, reps)?,
         },
-        Command::BenchStorage { capture, tree, level, reps } => {
-            cfg.check(std::path::Path::new(&tree), level)?;
-            celeste_rust::storage::bench::bench_storage(&celeste_rust::storage::bench::BenchArgs {
-                capture: std::path::Path::new(&capture),
-                tree: std::path::Path::new(&tree),
-                level,
-                settings: &cfg,
-                reps,
-            })?;
-        }
         Command::ArcCheck { level_dir, from, to, samples, level, fault, path_cap } => {
             use celeste_rust::search::arc_check::{run, Opts};
             let o = Opts { dir: std::path::Path::new(&level_dir), from, to, samples, level, fault: fault.as_deref(), path_cap, settings: &cfg };
