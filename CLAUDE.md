@@ -210,10 +210,10 @@ A cargo workspace; the dependency order is load-bearing: `celeste-core`
 (numbers, the arithmetic trait, cart, collision) and `celeste-names`
 (frozen tables) <- `celeste-engine` (`Rt2` blocks, exact keys, lane
 primitives, the widening table) <- `celeste-rust` (`src/frame.rs` the
-forward, `src/storage/`, `src/search/` the backward and concrete search,
-`src/trace/` the tracer, the reference engine and level -1,
-`src/transpile/` graph IR and assembler, `src/compiled/` the kernel
-registry, `src/settings.rs`, the bins). Details: plans/architecture.md;
+forward, `src/storage/`, `src/search/` the backward, the concrete search
+and level -1, `src/trace/` the tracer, `src/engines/` the reference
+engine, `src/transpile/` graph IR and assembler, `src/compiled/` the kernel
+registry, `src/settings.rs`, the `rewrite` binary in `src/bin/rewrite/`). Details: plans/architecture.md;
 sizes: plans/refactor.md.
 
 There is NO checked-in kernel artifact: the registry retraces the start
@@ -223,11 +223,12 @@ checkout's Lua.
 
 ## The commands
 
-Every binary documents itself: `rewrite --help` (the search, every
+One binary documents itself: `rewrite --help` (the search, every
 diagnostic, `run`: one concrete run), `rewrite <command> --help` (`rewrite
-check --help`: the checks of a tree; `rewrite bench --help`), `transpile
---help` (the level -1 table). The settings flags (`--room`, the category,
-`--level-minus-one`, `--threads`, ...) are shared by both; a command that
+check --help`: the checks of a tree; `rewrite bench --help`; `rewrite l1
+--help`: the level -1 table, its probe and check). The settings flags
+(`--room`, the category, `--level-minus-one`, `--threads`, ...) are shared
+by every command; a command that
 reads a finished tree (`--tree DIR`, or a search's `--checkpoint-dir`)
 takes them from the tree's records instead and refuses them. The most
 common:
