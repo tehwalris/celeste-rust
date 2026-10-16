@@ -88,7 +88,7 @@ To the outer loop a state is opaque: `(shape, key, cell)`.
 ## The arithmetic: fixed or float
 
 `--arith fixed` (PICO-8's 16.16, the default and the real game) or `--arith
-float` (the TAS tools' Lua doubles; `--float-tool celia|uct`). It is a
+float` (the TAS tools' Lua doubles: Celia's; `float-uct` for UCT's). It is a
 compile-time trait (`celeste_core::arith::Arith`; `Rem` for the remainder
 model): the binary dispatches once, and a tree, kernel set and W of
 different arithmetics cannot mix. Fixed monomorphizes to the same code and

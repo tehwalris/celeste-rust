@@ -15,7 +15,7 @@ git (deleted 2026-10-16; last at `fafb3bf7`).
 **Celia** (gonengazit/Celia, float mode) is THE float tool: `--arith float`
 is Celia from its IL load (its loading jank `J`, `starts::celia_jank`,
 unless `--loading-jank`) with its seeds. **UniversalClassicTas** (UCT,
-`--float-tool uct`: the IL load, no jank) is a secondary report. Both run
+`--arith float-uct`: the IL load, no jank) is a secondary report. Both run
 the original cart in LÖVE 11.5's LuaJIT on x86-64, and compute the same:
 
 | the cart's | the tools compute (`celeste_core::lua_f64`) |

@@ -67,9 +67,9 @@ const EXAMPLES: &str = "Examples:
 struct Cli {
     #[command(subcommand)]
     command: Command,
-    /// The run's settings (`settings::SettingsArgs`): given anywhere on the line.
+    /// The run's settings (`settings::Settings`, its flags): given anywhere on the line.
     #[command(flatten)]
-    settings: celeste_rust::settings::SettingsArgs,
+    settings: celeste_rust::settings::Settings,
 }
 
 #[derive(Subcommand)]
