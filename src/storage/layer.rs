@@ -6,8 +6,8 @@
 //!
 //!   * in memory: the frontier a wave expands (its units decoded to rows
 //!     right before the kernels: `wave`), the next layer a wave builds;
-//!   * on disk: the FRAME FILES (`frames/f{frame}.bin`): per region a zstd
-//!     block of its new entries' keys, masks and win masks, and a header
+//!   * on disk: the FRAME FILES (`frames/f{frame}.bin`, `storage::file`): per
+//!     region a block of its new entries' keys, masks and win masks, and a header
 //!     with what the frame added to the tree's codebooks - the shapes it
 //!     numbered, the key space's new codes and bit runs - and the
 //!     skeletons its shapes' rows decode with (`SkelRecord`).
@@ -26,6 +26,7 @@ use celeste_engine::exact::{Key, KeyAdditions, KeySpace};
 use celeste_engine::runtime2::{mix64, Cell2, Col, Rt2, P8};
 
 use super::bundle::{get_varint, get_varint128, put_varint, put_varint128};
+use super::file::{self, At, Mapped, FORMAT_VERSION};
 use super::decode::Repr;
 use super::set::{RegionSet, RegionTable};
 use super::{Sk, GEOMETRY};
@@ -225,10 +226,8 @@ pub struct RegionIndex {
     pub entries: u32,
     pub states: u32,
     pub wins: u32,
-    /// The block's bytes from the data's start, stored and raw.
-    pub offset: u64,
-    pub len: u32,
-    pub raw: u32,
+    /// Its block.
+    pub at: At,
 }
 
 /// A frame file's header.
@@ -335,10 +334,8 @@ fn decode_region(raw: &[u8]) -> Result<RegionEntries> {
 /// WRITE a frame file (`frame_path`): `layer`'s states with their win
 /// masks (`wins`: sorted entry indices of `layer` with a win, and the win
 /// cells), its skeletons, what the frame added to the codebooks. Regions
-/// compressed in parallel. Atomic (a `tmp-` sibling renamed into place).
-/// Returns its bytes.
+/// compressed in parallel. Returns its bytes.
 pub fn write_frame<N: EngineNum>(path: &Path, meta: &FrameMeta<N>, layer: &Layer<N>, wins: &[(u32, u64)], threads: usize) -> Result<u64> {
-    use std::io::Write;
     ensure!(wins.windows(2).all(|w| w[0].0 < w[1].0), "write_frame: wins not by entry");
     let tables = layer.set.tables();
     let starts = layer.set.entry_starts();
@@ -355,99 +352,60 @@ pub fn write_frame<N: EngineNum>(path: &Path, meta: &FrameMeta<N>, layer: &Layer
         win_at.push(a..wi);
     }
     ensure!(wi == wins.len(), "write_frame: a win past the layer");
-    let blocks: Vec<Result<(Vec<u8>, u32)>> = super::wave::par_map(&(0..tables.len()).collect::<Vec<_>>(), threads, |&i| {
+    let blocks: Vec<(Vec<u8>, usize)> = crate::par::Pool::new(threads).map_with(tables.len(), || Ok(zstd::bulk::Compressor::new(1)?), |z, i| {
         let t = &tables[i].1;
         let w: Vec<(u32, u64)> = wins[win_at[i].clone()].iter().map(|&(e, m)| (e - starts[i] as u32, m)).collect();
         let keys: Vec<Key> = t.iter().map(|x| x.0).collect();
         let mut raw = Vec::new();
         let masks: Vec<u64> = t.masks().collect();
         encode_region(&keys, &masks, &w, &mut raw);
-        Ok((zstd::bulk::compress(&raw, 1)?, raw.len() as u32))
-    });
-    let mut index = Vec::with_capacity(tables.len());
-    let mut offset = 0u64;
-    let mut data = Vec::new();
-    for (i, b) in blocks.into_iter().enumerate() {
-        let (z, raw) = b?;
-        let (region, t) = &tables[i];
-        let w = &wins[win_at[i].clone()];
-        index.push(RegionIndex {
-            region: *region,
-            entries: t.len() as u32,
-            states: t.states() as u32,
-            wins: w.iter().map(|x| x.1.count_ones()).sum(),
-            offset,
-            len: z.len() as u32,
-            raw,
-        });
-        offset += z.len() as u64;
-        data.push(z);
-    }
+        Ok((file::compress(&raw, z)?, raw.len()))
+    })?;
+    let ats = At::place(blocks.iter().map(|b| (b.0.len(), b.1)));
+    let index: Vec<RegionIndex> = tables
+        .iter()
+        .zip(&win_at)
+        .zip(ats)
+        .map(|(((region, t), w), at)| RegionIndex { region: *region, entries: t.len() as u32, states: t.states() as u32, wins: wins[w.clone()].iter().map(|x| x.1.count_ones()).sum(), at })
+        .collect();
     let mut skeletons: Vec<SkelRecord<N>> = layer.skeletons.values().map(|s| SkelRecord::of(s)).collect::<Result<_>>()?;
     skeletons.sort_by_key(|s| s.shape_hash);
     ensure!(meta.emitted.iter().all(|e| !layer.skeletons.contains_key(&e.shape_hash)), "write_frame: an emitted skeleton of a shape the layer holds");
     let header = FrameHeader { frame: meta.frame, side: GEOMETRY.side, shapes: meta.shapes.to_vec(), keys: meta.keys.clone(), skeletons, emitted: meta.emitted.to_vec(), regions: index };
-    let hb = bincode::serialize(&header).context("a frame file's header")?;
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let tmp = path.with_file_name(format!("tmp-{}", path.file_name().and_then(|s| s.to_str()).unwrap_or("frame.bin")));
-    let mut bytes = 16 + hb.len() as u64;
-    {
-        let mut f = std::io::BufWriter::new(std::fs::File::create(&tmp)?);
-        f.write_all(&super::magic::<N>(MAGIC))?;
-        f.write_all(&crate::search::checkpoint::FORMAT_VERSION.to_le_bytes())?;
-        f.write_all(&(hb.len() as u64).to_le_bytes())?;
-        f.write_all(&hb)?;
-        for z in &data {
+    file::write(path, file::magic::<N>(MAGIC), FORMAT_VERSION, &header, |f| {
+        for (z, _) in &blocks {
             f.write_all(z)?;
-            bytes += z.len() as u64;
         }
-        f.flush()?;
-    }
-    std::fs::rename(&tmp, path)?;
-    Ok(bytes)
+        Ok(())
+    })
 }
 
 /// A frame file, mapped, its header decoded.
 pub struct FrameFile<N: EngineNum = P8> {
-    map: memmap2::Mmap,
+    file: Mapped,
     pub header: FrameHeader<N>,
-    data: usize,
-    path: PathBuf,
 }
 
 impl<N: EngineNum> FrameFile<N> {
     pub fn open(path: &Path) -> Result<Self> {
-        let file = std::fs::File::open(path).with_context(|| path.display().to_string())?;
-        // SAFETY: a frame file is written once (renamed into place) and
-        // never modified.
-        let map = unsafe { memmap2::Mmap::map(&file)? };
-        ensure!(map.len() >= 16 && map[0..4] == super::magic::<N>(MAGIC), "{}: not a frame file of the {} arithmetic", path.display(), <N::A as celeste_core::arith::Arithmetic>::NAME);
-        let version = u32::from_le_bytes(map[4..8].try_into().unwrap());
-        ensure!(version == crate::search::checkpoint::FORMAT_VERSION, "{}: format version {version}, this binary's is {}", path.display(), crate::search::checkpoint::FORMAT_VERSION);
-        let hl = u64::from_le_bytes(map[8..16].try_into().unwrap()) as usize;
-        ensure!(map.len() >= 16 + hl, "{}: truncated header", path.display());
-        let header: FrameHeader<N> = bincode::deserialize(&map[16..16 + hl]).with_context(|| format!("{}: its header", path.display()))?;
+        let file = Mapped::open(path, file::magic::<N>(MAGIC), FORMAT_VERSION, &format!("a frame file of the {} arithmetic", <N::A as celeste_core::arith::Arithmetic>::NAME))?;
+        let header: FrameHeader<N> = file.header()?;
         ensure!(header.side == GEOMETRY.side, "{}: built with storage regions of {} cells, this process uses {}", path.display(), header.side, GEOMETRY.side);
-        let data = 16 + hl;
-        let end = header.regions.last().map_or(0, |r| r.offset + r.len as u64);
-        ensure!(map.len() as u64 == data as u64 + end, "{}: {} bytes, its index says {}", path.display(), map.len(), data as u64 + end);
-        Ok(FrameFile { map, header, data, path: path.to_path_buf() })
+        file.ends_at(header.regions.last().map_or(0, |r| r.at.end()))?;
+        Ok(FrameFile { file, header })
     }
 
     pub fn path(&self) -> &Path {
-        &self.path
+        self.file.path()
     }
 
     /// Region `i` (of `header.regions`) decoded.
     pub fn region(&self, i: usize) -> Result<RegionEntries> {
         let r = &self.header.regions[i];
-        let a = self.data + r.offset as usize;
-        let raw = zstd::bulk::decompress(&self.map[a..a + r.len as usize], r.raw as usize).with_context(|| format!("{}: region {}", self.path.display(), r.region))?;
-        ensure!(raw.len() == r.raw as usize, "{}: region {} decompressed to {} bytes, not {}", self.path.display(), r.region, raw.len(), r.raw);
-        let e = decode_region(&raw).with_context(|| format!("{}: region {}", self.path.display(), r.region))?;
-        ensure!(e.keys.len() == r.entries as usize, "{}: region {}: {} entries, its index says {}", self.path.display(), r.region, e.keys.len(), r.entries);
+        let mut raw = Vec::new();
+        self.file.block(r.at, &mut zstd::bulk::Decompressor::new()?, &mut raw).with_context(|| format!("region {}", r.region))?;
+        let e = decode_region(&raw).with_context(|| format!("{}: region {}", self.path().display(), r.region))?;
+        ensure!(e.keys.len() == r.entries as usize, "{}: region {}: {} entries, its index says {}", self.path().display(), r.region, e.keys.len(), r.entries);
         Ok(e)
     }
 
@@ -455,11 +413,7 @@ impl<N: EngineNum> FrameFile<N> {
     /// them; a later read faults them back in): a reader streaming a tree
     /// does not hold the blocks it has read.
     pub fn release_region(&self, i: usize) -> Result<()> {
-        let r = &self.header.regions[i];
-        // SAFETY: a read-only shared mapping of a file never modified (see
-        // `open`): a page dropped reads back the same.
-        unsafe { self.map.unchecked_advise_range(memmap2::UncheckedAdvice::DontNeed, self.data + r.offset as usize, r.len as usize)? };
-        Ok(())
+        self.file.release(self.file.stored(self.header.regions[i].at))
     }
 
     /// The file's states as a layer, its skeletons in a search from `room`
@@ -473,10 +427,10 @@ impl<N: EngineNum> FrameFile<N> {
         for (i, p) in parts.into_iter().enumerate() {
             let p = p?;
             let base = layer.entries() as u32;
-            layer.push_region(self.header.regions[i].region, &p.keys, &p.masks).with_context(|| self.path.display().to_string())?;
+            layer.push_region(self.header.regions[i].region, &p.keys, &p.masks).with_context(|| self.path().display().to_string())?;
             wins.extend(p.wins.into_iter().map(|(e, m)| (base + e, m)));
         }
-        ensure!(layer.set.tables().len() == n, "{}: an empty region", self.path.display());
+        ensure!(layer.set.tables().len() == n, "{}: an empty region", self.path().display());
         if let Some(room) = room {
             for s in &self.header.skeletons {
                 layer.skeletons.insert(s.shape_hash, Arc::new(s.rt2_in(room)?));
@@ -556,7 +510,7 @@ impl<N: EngineNum> Tree<N> {
                 continue;
             }
             let x = FrameFile::open(&frame_path(dir, f))?;
-            ensure!(x.header.frame == f, "{}: of frame {}, not {f}", x.path.display(), x.header.frame);
+            ensure!(x.header.frame == f, "{}: of frame {}, not {f}", x.path().display(), x.header.frame);
             shapes.extend(x.header.shapes.iter().copied());
             adds.extend(x.header.keys.clone());
             frames.push(Some(x));

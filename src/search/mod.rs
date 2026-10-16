@@ -13,7 +13,6 @@
 //!   * `hull`        - a state's remainder hull (the forward's): one arc per axis
 //!   * `rem`         - the remainder model of an arithmetic: hulls and transfers
 //!                     (`rem_f64`: the doubles')
-//!   * `checkpoint`  - the tree's format version and small files (marks, pos graph)
 //!   * `pos_graph`   - player-position cells and the position graph
 //!   * `result`      - `result.json`: what a search decided, as a record
 //!   * `robust`      - a float witness against the host libm's `sin`
@@ -27,7 +26,6 @@ pub mod arc_check;
 pub mod arc_edges;
 pub mod arcs;
 pub mod backward;
-pub mod checkpoint;
 pub mod concrete;
 pub mod driver;
 pub mod dual;

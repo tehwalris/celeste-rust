@@ -862,7 +862,7 @@ pub fn sealed<N: Rem>(touch: Touch<N>, parts: Vec<SealPart<N>>) -> Result<Sealed
 pub fn reencode(seg: &Segment, region: u32, finals: &FxHashMap<Key, Key>, renumber: Option<&Renumber>, enc: &mut bundle::Encoder, z: &mut zstd::bulk::Compressor<'static>) -> Result<Segment> {
     let (mut dz, mut raw) = (zstd::bulk::Decompressor::new()?, Vec::new());
     let super::spool::Body::Mem(bytes) = &seg.bytes else { anyhow::bail!("a waiting segment spooled") };
-    bundle::decompress(bytes, seg.raw as usize, &mut dz, &mut raw)?;
+    super::file::decompress(bytes, seg.raw as usize, &mut dz, &mut raw)?;
     let mut v: Vec<Bundle> = Vec::with_capacity(seg.bundles as usize);
     let mut missing = false;
     bundle::Block::open(&raw, &bundle::ORDER)?.bundles(|mut b| {

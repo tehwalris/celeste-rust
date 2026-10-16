@@ -272,21 +272,17 @@ type MarkId = (u64, u32, Key);
 /// a big balloon run's 431M rows (13.8 GB) held as a hash table
 /// took the export to 96 GB.
 struct MarksMap {
-    map: memmap2::Mmap,
+    map: crate::storage::file::Mapped,
     rows: usize,
 }
 
-/// Bytes before the first row: the checkpoint value header (16) and the
-/// bincode `Vec` length (8).
-const MARKS_ROWS_AT: usize = 24;
+/// Bytes of the value before the first row: the bincode `Vec` length.
+const MARKS_ROWS_AT: usize = 8;
 
 impl MarksMap {
     fn open(path: &Path) -> Result<Self> {
-        let file = std::fs::File::open(path)?;
-        // SAFETY: a marks file is written once (renamed into place) and
-        // never modified afterwards.
-        let map = unsafe { memmap2::Mmap::map(&file)? };
-        let payload = crate::search::checkpoint::value_payload(&map, path)?;
+        let map = crate::storage::file::open_value(path)?;
+        let payload = map.header_bytes();
         anyhow::ensure!(payload.len() >= 8, "{}: too short for a marks file", path.display());
         let n = u64::from_le_bytes(payload[0..8].try_into().unwrap());
         let body = payload.len() as u64 - 8;
@@ -298,12 +294,12 @@ impl MarksMap {
 
     fn u64_at(&self, i: usize, o: usize) -> u64 {
         let a = MARKS_ROWS_AT + i * 32 + o;
-        u64::from_le_bytes(self.map[a..a + 8].try_into().unwrap())
+        u64::from_le_bytes(self.map.header_bytes()[a..a + 8].try_into().unwrap())
     }
 
     fn u32_at(&self, i: usize, o: usize) -> u32 {
         let a = MARKS_ROWS_AT + i * 32 + o;
-        u32::from_le_bytes(self.map[a..a + 4].try_into().unwrap())
+        u32::from_le_bytes(self.map.header_bytes()[a..a + 4].try_into().unwrap())
     }
 
     /// Row `i`'s `(shape, cell)`.
@@ -331,10 +327,7 @@ impl MarksMap {
     /// a later read faults them back in), so a scan does not hold what it
     /// has read.
     fn release(&self, a: usize, b: usize) -> Result<()> {
-        // SAFETY: a read-only shared mapping of a file never modified (see
-        // `open`): a page dropped reads back the same.
-        unsafe { self.map.unchecked_advise_range(memmap2::UncheckedAdvice::DontNeed, MARKS_ROWS_AT + a * 32, (b - a) * 32)? };
-        Ok(())
+        self.map.release(&self.map.header_bytes()[MARKS_ROWS_AT + a * 32..MARKS_ROWS_AT + b * 32])
     }
 }
 
@@ -1073,7 +1066,7 @@ mod tests {
         // Out of order: refused.
         let bad = dir.join("bad.bin");
         let rows: Vec<crate::frame::MarkRow> = vec![(7, 3, 5, 6, 0), (7, 3, 1, 2, 0)];
-        crate::search::checkpoint::save_value_to(&bad, &(rows, 9u32, celeste_engine::exact::KeySpace::<celeste_engine::runtime2::P8>::default().to_additions())).unwrap();
+        crate::storage::file::save_value(&bad, &(rows, 9u32, celeste_engine::exact::KeySpace::<celeste_engine::runtime2::P8>::default().to_additions())).unwrap();
         assert!(scan_marks(MarksMap::open(&bad).unwrap(), &bad, 2).is_err());
         std::fs::remove_dir_all(&dir).unwrap();
     }

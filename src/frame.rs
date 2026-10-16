@@ -1149,14 +1149,11 @@ pub fn grow_tree<N: Rem>(
     Ok(ForwardResult { win_frame: st.win_frame, frames: st.frames, pos_graph: st.pos_graph() })
 }
 
-/// Persist the position graph (an atomic rename), every frame BEFORE its
-/// done marker, so it covers every trusted frame; a frame discarded after a
+/// Persist the position graph (atomically), every frame BEFORE its done
+/// marker, so it covers every trusted frame; a frame discarded after a
 /// crash adds its edges again when it is rerun.
 fn save_pos_graph(dir: &std::path::Path, graph: &crate::search::pos_graph::PosGraph) -> Result<()> {
-    let tmp = dir.join("posgraph.tmp");
-    graph.save(&tmp)?;
-    std::fs::rename(&tmp, pos_graph_path(dir))?;
-    Ok(())
+    graph.save(&pos_graph_path(dir))
 }
 
 pub fn pos_graph_path(dir: &std::path::Path) -> std::path::PathBuf {
@@ -1481,14 +1478,12 @@ pub fn mark_row(shape: u64, key: (u64, u64), cell: u32, deadline: u16, horizon: 
 /// once, with the key space its keys are in.
 pub fn save_marks<N: EngineNum>(path: &std::path::Path, mut rows: Vec<MarkRow>, horizon: u32, keys: &celeste_engine::exact::KeySpace<N>) -> Result<()> {
     rows.sort_unstable();
-    crate::search::checkpoint::save_value_to(path, &(rows, horizon, keys.to_additions()))
+    crate::storage::file::save_value(path, &(rows, horizon, keys.to_additions()))
 }
 
 /// A marks file's rows, horizon and key space.
 pub fn load_marks(path: &std::path::Path) -> Result<(Vec<MarkRow>, u32, celeste_engine::exact::KeySpace)> {
-    let bytes = std::fs::read(path)?;
-    let payload = crate::search::checkpoint::value_payload(&bytes, path)?;
-    let (rows, horizon, adds): (Vec<MarkRow>, u32, celeste_engine::exact::KeyAdditions) = bincode::deserialize(payload).with_context(|| format!("deserializing {}", path.display()))?;
+    let (rows, horizon, adds): (Vec<MarkRow>, u32, celeste_engine::exact::KeyAdditions) = crate::storage::file::load_value(path)?;
     Ok((rows, horizon, celeste_engine::exact::KeySpace::from_additions(adds).with_context(|| format!("{}: its key space", path.display()))?))
 }
 

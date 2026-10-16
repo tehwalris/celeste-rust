@@ -615,24 +615,6 @@ impl<'a> Block<'a> {
     }
 }
 
-/// zstd -1 of a raw block, at its size (the compressor's buffer is the
-/// raw block's bound: a frame's segments, held to its end, took 5x their
-/// bytes - 1.1 GB at a big room's f69).
-pub fn compress(raw: &[u8], z: &mut zstd::bulk::Compressor<'static>) -> Result<Vec<u8>> {
-    let mut v = z.compress(raw)?;
-    v.shrink_to_fit();
-    Ok(v)
-}
-
-/// A stored block's raw bytes (`raw_len` from its header) into `out`.
-pub fn decompress(stored: &[u8], raw_len: usize, z: &mut zstd::bulk::Decompressor<'static>, out: &mut Vec<u8>) -> Result<()> {
-    out.clear();
-    out.reserve(raw_len);
-    let n = z.decompress_to_buffer(stored, out)?;
-    ensure!(n == raw_len, "an edge block decompressed to {n} bytes, its header says {raw_len}");
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -726,9 +708,9 @@ mod tests {
         for order in orders {
             let mut raw = Vec::new();
             encode(&bundles, &order, &mut raw);
-            let stored = compress(&raw, &mut z).unwrap();
+            let stored = super::super::file::compress(&raw, &mut z).unwrap();
             let mut back = Vec::new();
-            decompress(&stored, raw.len(), &mut d, &mut back).unwrap();
+            super::super::file::decompress(&stored, raw.len(), &mut d, &mut back).unwrap();
             assert_eq!(back, raw);
             let mut got = Vec::new();
             Block::open(&back, &order).unwrap().bundles(|b| got.push(b)).unwrap();

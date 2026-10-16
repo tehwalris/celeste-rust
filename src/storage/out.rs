@@ -7,9 +7,10 @@
 //! f80: 438M bundles decoded for 133M edges pushed). Here a source's edges
 //! are one contiguous run, found by key.
 //!
-//! A file is per kernel UNIT of the frame (a run of entries of one shape,
-//! in (region, key) order: the units are, so the file is too) a zstd BLOCK,
-//! and a header listing each block's first and last entry. A block, raw:
+//! A file (`storage::file`) is per kernel UNIT of the frame (a run of entries
+//! of one shape, in (region, key) order: the units are, so the file is too)
+//! a BLOCK, and a header listing each block's first and last entry. A block,
+//! raw:
 //!
 //!   * its ROUTES (target shape hash, slot) and its PAIRS (the transfers,
 //!     `arc_edges::encode_pair`): a block names no global id, so it is final
@@ -23,10 +24,11 @@
 //! A unit's targets may hold PROVISIONAL keys (codes new this frame): its
 //! block is encoded again at the frame's end with the final keys (`fixup`).
 
-use anyhow::{ensure, Context, Result};
+use anyhow::{ensure, Result};
 use std::path::{Path, PathBuf};
 
 use super::bundle::{get_varint, get_varint128, put_varint, put_varint128};
+use super::file::{self, At, Mapped, FORMAT_VERSION};
 use super::visited::Key;
 use crate::search::rem::Rem;
 use celeste_core::pico8_num::Pico8Num as P8;
@@ -473,9 +475,7 @@ pub fn fixup<N: Rem>(raw: &[u8], finals: &rustc_hash::FxHashMap<Key, Key>, out: 
 struct BlockHead {
     first: (u32, Key),
     last: (u32, Key),
-    offset: u64,
-    len: u32,
-    raw: u32,
+    at: At,
 }
 
 /// A block as the frame's end writes it: zstd, its raw length, its first
@@ -504,8 +504,7 @@ impl Sealed {
             |_, _, _| {},
         )?;
         let (Some(first), Some(last)) = (first, last) else { return Ok(None) };
-        ensure!(raw.len() < u32::MAX as usize, "an out block of {} bytes", raw.len());
-        Ok(Some(Sealed { z: super::spool::Body::Mem(super::bundle::compress(raw, z)?), raw: raw.len() as u32, first, last }))
+        Ok(Some(Sealed { z: super::spool::Body::Mem(file::compress(raw, z)?), raw: raw.len() as u32, first, last }))
     }
 }
 
@@ -525,44 +524,27 @@ pub fn path(edges_dir: &Path, frame: u32) -> PathBuf {
 /// (their entries ascending across blocks: checked). Atomic. Returns its
 /// bytes.
 pub fn write(path: &Path, frame: u32, blocks: &[Sealed], spool: Option<&super::spool::Spool>) -> Result<u64> {
-    use std::io::Write;
     ensure!(blocks.windows(2).all(|w| w[0].last < w[1].first), "{}: the out blocks' entries are not ascending", path.display());
-    let mut heads = Vec::with_capacity(blocks.len());
-    let mut offset = 0u64;
-    for b in blocks {
-        heads.push(BlockHead { first: b.first, last: b.last, offset, len: b.z.len() as u32, raw: b.raw });
-        offset += b.z.len() as u64;
-    }
-    let hb = bincode::serialize(&(frame, &heads)).context("an out file's header")?;
-    ensure!(hb.len() == 12 + heads.len() * HEAD_BYTES, "an out file's header of {} bytes for {} blocks: not the layout `OutFile` reads", hb.len(), heads.len());
-    std::fs::create_dir_all(path.parent().expect("an out dir"))?;
-    let tmp = path.with_extension("tmp");
-    {
-        let mut f = std::io::BufWriter::with_capacity(1 << 20, std::fs::File::create(&tmp).with_context(|| tmp.display().to_string())?);
-        f.write_all(MAGIC)?;
-        f.write_all(&crate::search::checkpoint::FORMAT_VERSION.to_le_bytes())?;
-        f.write_all(&(hb.len() as u64).to_le_bytes())?;
-        f.write_all(&hb)?;
+    let ats = At::place(blocks.iter().map(|b| (b.z.len(), b.raw as usize)));
+    let heads: Vec<BlockHead> = blocks.iter().zip(ats).map(|(b, at)| BlockHead { first: b.first, last: b.last, at }).collect();
+    let n = bincode::serialized_size(&(frame, &heads))?;
+    ensure!(n == (12 + heads.len() * HEAD_BYTES) as u64, "an out file's header of {n} bytes for {} blocks: not the layout `OutFile` reads", heads.len());
+    file::write(path, *MAGIC, FORMAT_VERSION, &(frame, &heads), |f| {
         let mut buf = Vec::new();
         for b in blocks {
             b.z.with(spool, &mut buf, |z| f.write_all(z))??;
         }
-        f.flush()?;
-    }
-    std::fs::rename(&tmp, path)?;
-    Ok(16 + hb.len() as u64 + offset)
+        Ok(())
+    })
 }
 
 /// One out file, mapped.
 pub struct OutFile {
-    map: memmap2::Mmap,
-    /// Its blocks, and where the first one's head is in `map` (the
-    /// header's heads are read where they are, not deserialized: an
-    /// index of every frame's blocks held in memory was 64 B a block, 1.9
-    /// GB at the fixtures' room's f303).
+    file: Mapped,
+    /// Its blocks (their heads are read where they are in the header, not
+    /// deserialized: an index of every frame's blocks held in memory was
+    /// 64 B a block, 1.9 GB at the fixtures' room's f303).
     blocks: usize,
-    heads: usize,
-    data: usize,
 }
 
 /// Bytes a `BlockHead` takes in a header (bincode 1's fixed-width little-
@@ -572,36 +554,25 @@ const HEAD_BYTES: usize = 56;
 
 impl OutFile {
     pub fn open(path: &Path, frame: u32) -> Result<Self> {
-        let file = std::fs::File::open(path).with_context(|| path.display().to_string())?;
-        // SAFETY: an out file is written once (renamed into place) and never
-        // modified.
-        let map = unsafe { memmap2::Mmap::map(&file)? };
-        ensure!(map.len() >= 16 && &map[0..4] == MAGIC, "{}: not an out file", path.display());
-        let v = u32::from_le_bytes(map[4..8].try_into().unwrap());
-        ensure!(v == crate::search::checkpoint::FORMAT_VERSION, "{}: format version {v}, this binary's is {}", path.display(), crate::search::checkpoint::FORMAT_VERSION);
-        let n = u64::from_le_bytes(map[8..16].try_into().unwrap()) as usize;
-        ensure!(map.len() >= 16 + n && n >= 12, "{}: truncated header", path.display());
-        let f = u32::from_le_bytes(map[16..20].try_into().unwrap());
-        let blocks = u64::from_le_bytes(map[20..28].try_into().unwrap()) as usize;
+        let file = Mapped::open(path, *MAGIC, FORMAT_VERSION, "an out file")?;
+        let h = file.header_bytes();
+        let n = h.len();
+        ensure!(n >= 12, "{}: truncated header", path.display());
+        let f = u32::from_le_bytes(h[0..4].try_into().unwrap());
+        let blocks = u64::from_le_bytes(h[4..12].try_into().unwrap()) as usize;
         ensure!(n == 12 + blocks * HEAD_BYTES, "{}: a header of {n} bytes for {blocks} blocks", path.display());
         ensure!(f == frame, "{}: the out-edges of frame {f}, not {frame}", path.display());
-        let out = OutFile { map, blocks, heads: 28, data: 16 + n };
-        let end = if blocks == 0 {
-            0
-        } else {
-            let h = out.head(blocks - 1);
-            h.offset + h.len as u64
-        };
-        ensure!(out.map.len() as u64 == out.data as u64 + end, "{}: {} bytes, its header says {}", path.display(), out.map.len(), out.data as u64 + end);
+        let out = OutFile { file, blocks };
+        out.file.ends_at(if blocks == 0 { 0 } else { out.head(blocks - 1).at.end() })?;
         Ok(out)
     }
 
     /// Block `i`'s head, read from the header.
     #[inline]
     fn head(&self, i: usize) -> BlockHead {
-        let b = &self.map[self.heads + i * HEAD_BYTES..self.heads + (i + 1) * HEAD_BYTES];
+        let b = &self.file.header_bytes()[12 + i * HEAD_BYTES..12 + (i + 1) * HEAD_BYTES];
         let (u32_at, u64_at) = (|a: usize| u32::from_le_bytes(b[a..a + 4].try_into().unwrap()), |a: usize| u64::from_le_bytes(b[a..a + 8].try_into().unwrap()));
-        BlockHead { first: (u32_at(0), (u64_at(4), u64_at(12))), last: (u32_at(20), (u64_at(24), u64_at(32))), offset: u64_at(40), len: u32_at(48), raw: u32_at(52) }
+        BlockHead { first: (u32_at(0), (u64_at(4), u64_at(12))), last: (u32_at(20), (u64_at(24), u64_at(32))), at: At { offset: u64_at(40), len: u32_at(48), raw: u32_at(52) } }
     }
 
     /// The blocks that may hold entries in `lo..=hi`.
@@ -631,9 +602,7 @@ impl OutFile {
 
     /// Block `i`'s raw bytes into `out`.
     pub fn block(&self, i: usize, z: &mut zstd::bulk::Decompressor<'static>, out: &mut Vec<u8>) -> Result<()> {
-        let h = self.head(i);
-        let a = self.data + h.offset as usize;
-        super::bundle::decompress(&self.map[a..a + h.len as usize], h.raw as usize, z, out)
+        self.file.block(self.head(i).at, z, out)
     }
 
     /// Its blocks.
@@ -676,7 +645,7 @@ impl OutStore {
         }
         ensure!(frame as usize == self.frames.len(), "out store: frame {frame} after {}", self.frames.len() - 1);
         let f = OutFile::open(&path(edges_dir, frame), frame)?;
-        self.bytes += f.map.len() as u64;
+        self.bytes += f.file.len();
         self.frames.push(Some(f));
         Ok(())
     }

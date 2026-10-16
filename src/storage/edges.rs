@@ -4,9 +4,9 @@
 //! its TARGET's region: per (target region, frame) its bundles
 //! (`storage::bundle`: source key, transfer, offset, target key -> target
 //! cells) in one or more SEGMENTS - a wave's slices - each a zstd block.
-//! Per frame ONE file `edges/f{frame}.bin`: a header - the segments, by
-//! region, and per target region the SOURCE regions its edges leave (the
-//! out-edge lookup) - and the blocks. Transfers are global ids into `edges/xfer.bin`,
+//! Per frame ONE file `edges/f{frame}.bin` (`storage::file`): a header - the
+//! segments, by region, and per target region the SOURCE regions its edges
+//! leave (the out-edge lookup) - and the blocks. Transfers are global ids into `edges/xfer.bin`,
 //! CANONICAL: a frame's new pairs are numbered at its end by their edges
 //! in the frame and their content (`XferTable::canonical`; a bundle
 //! holding one waits for it, as one into
@@ -21,6 +21,7 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
 use super::bundle::{self, Bundle};
+use super::file::{self, At, Mapped};
 use super::{Geometry, Sk, GEOMETRY};
 use crate::search::rem::Rem;
 use celeste_core::pico8_num::Pico8Num as P8;
@@ -267,11 +268,7 @@ const VERSION: u32 = 6;
 #[derive(Serialize, Deserialize, Clone, Copy, Debug)]
 struct SegHead {
     region: u32,
-    /// Offset of its zstd block in the file's data region, its length and
-    /// its raw length.
-    at: u64,
-    len: u32,
-    raw: u32,
+    at: At,
     bundles: u32,
     edges: u64,
 }
@@ -300,21 +297,13 @@ impl Segment {
     /// A raw block of `bundles` bundles and `edges` edges as a segment of
     /// `region`.
     pub fn of_raw(region: u32, raw: &[u8], bundles: u32, edges: u64, z: &mut zstd::bulk::Compressor<'static>) -> Result<Segment> {
-        ensure!(raw.len() < u32::MAX as usize, "an edge segment of {} bytes", raw.len());
-        Ok(Segment { region, bytes: super::spool::Body::Mem(bundle::compress(raw, z)?), raw: raw.len() as u32, bundles, edges })
+        Ok(Segment { region, bytes: super::spool::Body::Mem(file::compress(raw, z)?), raw: raw.len() as u32, bundles, edges })
     }
 
     /// `bundles` (distinct) as a segment of `region` (`enc`: a scratch encoder).
     pub fn encode(region: u32, bundles: &[Bundle], enc: &mut bundle::Encoder, raw: &mut Vec<u8>, z: &mut zstd::bulk::Compressor<'static>) -> Result<Segment> {
         enc.encode_bundles(bundles, raw);
-        ensure!(raw.len() < u32::MAX as usize, "an edge segment of {} bytes", raw.len());
-        Ok(Segment {
-            region,
-            bytes: super::spool::Body::Mem(bundle::compress(raw, z)?),
-            raw: raw.len() as u32,
-            bundles: bundles.len() as u32,
-            edges: bundles.iter().map(|b| b.mask.count_ones() as u64).sum(),
-        })
+        Self::of_raw(region, raw, bundles.len() as u32, bundles.iter().map(|b| b.mask.count_ones() as u64).sum(), z)
     }
 }
 
@@ -327,43 +316,27 @@ pub fn file_path(dir: &Path, frame: u32) -> PathBuf {
 /// source-region index (`sources`: per target region the source regions,
 /// any order). Atomic (renamed into place). Returns its bytes.
 pub fn write_file(path: &Path, frame: u32, mut segs: Vec<Segment>, mut sources: Vec<(u32, Vec<u32>)>, spool: Option<&super::spool::Spool>) -> Result<u64> {
-    use std::io::Write;
     segs.sort_by_key(|s| s.region);
     sources.sort_unstable_by_key(|s| s.0);
     for s in &mut sources {
         s.1.sort_unstable();
         s.1.dedup();
     }
-    let mut heads = Vec::with_capacity(segs.len());
-    let mut at = 0u64;
-    for s in &segs {
-        heads.push(SegHead { region: s.region, at, len: s.bytes.len() as u32, raw: s.raw, bundles: s.bundles, edges: s.edges });
-        at += s.bytes.len() as u64;
-    }
-    let head = bincode::serialize(&FileHead { frame, segs: heads, sources }).context("serializing an edge file header")?;
-    std::fs::create_dir_all(path.parent().expect("an edges dir"))?;
-    let tmp = path.with_extension("tmp");
-    {
-        let mut out = std::io::BufWriter::with_capacity(1 << 20, std::fs::File::create(&tmp).with_context(|| tmp.display().to_string())?);
-        out.write_all(MAGIC)?;
-        out.write_all(&VERSION.to_le_bytes())?;
-        out.write_all(&(head.len() as u64).to_le_bytes())?;
-        out.write_all(&head)?;
+    let ats = At::place(segs.iter().map(|s| (s.bytes.len(), s.raw as usize)));
+    let heads = segs.iter().zip(ats).map(|(s, at)| SegHead { region: s.region, at, bundles: s.bundles, edges: s.edges }).collect();
+    file::write(path, *MAGIC, VERSION, &FileHead { frame, segs: heads, sources }, |out| {
         let mut buf = Vec::new();
         for s in &segs {
             s.bytes.with(spool, &mut buf, |b| out.write_all(b))??;
         }
-        out.flush()?;
-    }
-    std::fs::rename(&tmp, path)?;
-    Ok(16 + head.len() as u64 + at)
+        Ok(())
+    })
 }
 
 /// One edge file, mapped.
 struct EdgeFile {
-    map: memmap2::Mmap,
+    file: Mapped,
     head: FileHead,
-    data: usize,
     /// Per source region the target regions its edges reach (`head.sources`
     /// inverted on first use).
     targets: std::sync::OnceLock<FxHashMap<u32, Vec<u32>>>,
@@ -371,23 +344,12 @@ struct EdgeFile {
 
 impl EdgeFile {
     fn open(path: &Path, frame: u32) -> Result<Self> {
-        let file = std::fs::File::open(path).with_context(|| path.display().to_string())?;
-        // SAFETY: edge files are written once (renamed into place) and
-        // never modified afterwards.
-        let map = unsafe { memmap2::Mmap::map(&file)? };
-        ensure!(map.len() >= 16 && &map[0..4] == MAGIC, "{}: not an edge file of this format (a tree from before target-region edges: rebuild it)", path.display());
-        let v = u32::from_le_bytes(map[4..8].try_into().unwrap());
-        ensure!(v == VERSION, "{}: edge file version {v}, expected {VERSION}", path.display());
-        let n = u64::from_le_bytes(map[8..16].try_into().unwrap()) as usize;
-        ensure!(map.len() >= 16 + n, "{}: truncated header", path.display());
-        let head: FileHead = bincode::deserialize(&map[16..16 + n]).with_context(|| path.display().to_string())?;
+        let file = Mapped::open(path, *MAGIC, VERSION, "an edge file of this format (a tree from before target-region edges: rebuild it)")?;
+        let head: FileHead = file.header()?;
         ensure!(head.frame == frame, "{}: the edges of frame {}, not {frame}", path.display(), head.frame);
         ensure!(head.segs.windows(2).all(|w| w[0].region <= w[1].region), "{}: segments not by region", path.display());
-        let data = 16 + n;
-        for s in &head.segs {
-            ensure!(data as u64 + s.at + s.len as u64 <= map.len() as u64, "{}: a segment past the file", path.display());
-        }
-        Ok(EdgeFile { map, head, data, targets: std::sync::OnceLock::new() })
+        file.ends_at(head.segs.last().map_or(0, |s| s.at.end()))?;
+        Ok(EdgeFile { file, head, targets: std::sync::OnceLock::new() })
     }
 
     /// The segments of `region`.
@@ -399,8 +361,7 @@ impl EdgeFile {
     }
 
     fn seg<'a>(&'a self, h: &'a SegHead) -> SegRef<'a> {
-        let a = self.data + h.at as usize;
-        SegRef { region: h.region, bytes: &self.map[a..a + h.len as usize], raw: h.raw as usize, bundles: h.bundles, edges: h.edges }
+        SegRef { region: h.region, bytes: self.file.stored(h.at), raw: h.at.raw as usize, bundles: h.bundles, edges: h.edges }
     }
 
     fn targets(&self) -> &FxHashMap<u32, Vec<u32>> {
@@ -463,7 +424,7 @@ impl Default for Decoder {
 impl Decoder {
     /// Segment `s`'s raw block, opened (its dictionaries read).
     pub fn open<'a>(&'a mut self, s: &SegRef) -> Result<bundle::Block<'a>> {
-        bundle::decompress(s.bytes, s.raw, &mut self.z, &mut self.raw)?;
+        file::decompress(s.bytes, s.raw, &mut self.z, &mut self.raw)?;
         bundle::Block::open(&self.raw, &bundle::ORDER)
     }
 
@@ -492,7 +453,7 @@ impl<N: Rem> EdgeStore<N> {
             let file = if p.exists() { Some(EdgeFile::open(&p, f)?) } else { None };
             if let Some(file) = &file {
                 edges += file.head.segs.iter().map(|s| s.edges).sum::<u64>();
-                bytes += file.map.len() as u64;
+                bytes += file.file.len();
             }
             frames.push(file);
         }

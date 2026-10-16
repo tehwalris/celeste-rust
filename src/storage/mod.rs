@@ -10,6 +10,9 @@
 //!   * `wave`    - the frame: units and region jobs in one pipeline, the
 //!                 frame's end (keys made final, the next layer frozen and
 //!                 merged into the visited set)
+//!   * `file`    - THE ONE CONTAINER of the tree's files: a magic, a
+//!                 version, a header, zstd blocks; written atomically, read
+//!                 mapped
 //!   * `bundle`  - the edges' format: bundles in zstd blocks
 //!   * `edges`   - the edge files (per target region and frame), the global
 //!                 transfer table, the reader (`EdgeStore`)
@@ -34,6 +37,7 @@ pub mod bench;
 pub mod bundle;
 pub mod decode;
 pub mod edges;
+pub mod file;
 pub mod hulls;
 pub mod layer;
 pub mod out;
@@ -45,15 +49,6 @@ pub mod visited;
 pub mod wave;
 
 use crate::search::pos_graph::{GRID, NO_CELL};
-
-/// A tree file's magic in arithmetic `N`: 16.16's as it is, the doubles'
-/// last byte `EngineNum::FILE_TAG`.
-pub fn magic<N: celeste_core::arith::EngineNum>(m: &[u8; 4]) -> [u8; 4] {
-    match N::FILE_TAG {
-        0 => *m,
-        t => [m[0], m[1], m[2], t],
-    }
-}
 
 /// THE TREE'S FINGERPRINT (`rewrite ckhash`), over CONTENT
 /// (`exact::ContentHash`: whatever order its dictionaries grew in): per

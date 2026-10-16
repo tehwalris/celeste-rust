@@ -152,11 +152,11 @@ pub struct PosGraph {
 impl PosGraph {
     /// Persist (`frame::save_pos_graph`).
     pub fn save(&self, path: &std::path::Path) -> anyhow::Result<()> {
-        crate::search::checkpoint::save_value_to(path, self)
+        crate::storage::file::save_value(path, self)
     }
 
     pub fn load(path: &std::path::Path) -> anyhow::Result<Self> {
-        crate::search::checkpoint::load_value_from(path)
+        crate::storage::file::load_value(path)
     }
 
     pub fn pairs(&self) -> usize {
