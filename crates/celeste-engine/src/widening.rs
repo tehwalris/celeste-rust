@@ -353,9 +353,10 @@ pub static TABLE: &[Entry] = &[
         why: "A live strawberry's bob forgotten, `off` and `y` TOGETHER (one without the other is a \
               row no level has). `off` is a nonnegative integer read only as `sin(off / 40)`, \
               periodic in it with period 40 bit-exactly (`pico8_num::test_pico8_sin_period_40_bit_exact`), \
-              so one period [0, 39] covers every phase; `y` is the band `start +- 2.5` the bob stays \
-              in, owed. The fruit's collision reads `y`, so a collect becomes possible at any phase: \
-              refuted by the CONCRETE SEARCH.",
+              so one period [0, 39] covers every phase (in doubles `sin` is not bit-periodic, but \
+              `off` feeds only `y`, and [0, 39] makes every `y` of the band); `y` is the band \
+              `start +- 2.5` the bob stays in, owed. The fruit's collision reads `y`, so a collect \
+              becomes possible at any phase: refuted by the CONCRETE SEARCH.",
     },
     Entry {
         name: "timers",
@@ -447,13 +448,17 @@ pub static TABLE: &[Entry] = &[
         slots: &[
             slot(&["spr"], Stored::Range { lo: BALLOON_SPR_RANGE.0, hi: BALLOON_SPR_RANGE.1 }, Input::Stored),
             slot(&["y"], Stored::Band { around: "start", radius: BALLOON_BOB_RAW }, Input::Stored),
+            slot(&["offset"], Stored::Phase { lo: 0, hi: BALLOON_PERIOD_RAW }, Input::Stored),
         ],
         kind: Kind::Over,
         hook: None,
         why: "The balloon's sprite (0 popped, 22 present) its range and its `y` the bob band \
               `start +- 2` (the bob runs only when `spr == 22`, and an exact `y` would give every \
-              state a twin). Its update becomes \"maybe refill the dash\". Refuted by the CONCRETE \
-              SEARCH.",
+              state a twin). Its update becomes \"maybe refill the dash\". The phase `offset` is read \
+              only as `sin(offset)` into `y`, so one period [0, 1) covers every `y` the bob makes \
+              (an unseeded `rnd` phase is that period already; a SEEDED one, which the float tools \
+              always set, would otherwise split on every undecided `spr == 22`: room (4,2)'s six \
+              balloons made f^6 states before the player). Refuted by the CONCRETE SEARCH.",
     },
     Entry {
         name: "near fall floor",
