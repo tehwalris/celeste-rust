@@ -90,9 +90,9 @@ sounds like one of these. The full write-ups are in git history.
 - **The kernel re-run backward** (gone 2026-10-05): the recorded graph took
   room (0,0) from 2:32 h to 23:50; an incremental version saved 15 s of 524.
 - **The remainder-free BFS and the loaded rotation graph** (2026-10-04 ..
-  10-11): marks were a loose superset of W's support (29% of a big room's
-  states), its CSR 12 B an edge, OOM-killed at ~104 GB at h155. One push
-  over the in-edges read from the edge files: ~15 GB.
+  10-11): marks were a loose superset of W's support (29% of a big tree's
+  states), its CSR 12 B an edge, OOM-killed at ~104 GB. One push over the
+  in-edges read from the edge files: ~15 GB on the same tree.
 - **The backward as a region worklist** (`26d976d`, removed `2e75fd9`):
   regions opened 2.9 times instead of 10.2, but it read MORE (41.2M
   in-edges against 39.3M): a region opened before its successors' values

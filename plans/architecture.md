@@ -309,7 +309,8 @@ state first reached later, or never (its push was empty or dropped).
 - **Edge files** (`storage::edges`, `edges/f{F}.bin`): segments by TARGET
   region; a block holds bundles `(source shape and key, transfer, offset,
   target key) -> mask` over the target region's 64 cells, with sorted
-  dictionaries and a trie of records. ~0.11 B an edge on a big room.
+  dictionaries and a trie of records. ~0.11 B an edge (room (6,2) 100%,
+  f57).
 - **Transfers**: one table per tree, `edges/xfer.bin`.
 - **Out files** (`storage::out`, `edges/out/f{F}.bin`): the same edges by
   SOURCE, for the re-pushes; a header indexes blocks by entry range.

@@ -184,7 +184,7 @@ frame files' region blocks (keys, cell masks, win masks), the tree's
 forward record (`forward.tsv`: the per-frame sizes and timings) and the
 marks files, streamed - region by region, the marks files mapped and
 merged with each region's keys - so its memory does not grow with the tree
-(the mod room's 82 GB balloon run: 1.6 GB of heap). A run is one horizon: one level per `--level` of
+(an 82 GB tree: 1.6 GB of heap). A run is one horizon: one level per `--level` of
 the search, and with `--arc DIR` (what `search --save-marks DIR` wrote) the
 last level gets the remainder-free backward's marks and one more level is
 the remainder-exact ARC backward over the same tree (`forward_of` in

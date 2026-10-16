@@ -99,7 +99,7 @@ level; witnesses `tas/room_X_Y_nodiag_frame_N.txt`, uploads
 | (7,0) 800m | 84 | 99 (TAS8) | 99, tie | bound 99 at both levels |
 | (0,1) 900m | 100 | 108 (TAS9) | 108, tie | bounds 106, 108 |
 | (2,1) 1100m | 82 | 87 (TAS11) | **85, -2** | `r0sxhnp,r0sxhn`, no level -1: bounds 82, 85 |
-| (5,1) 1400m | 104 | 121 (TAS14) | **119, -2** | level -1 (121,5), 60 GB (BENCHMARK_DATA.md 2026-10-07) |
+| (5,1) 1400m | 104 | 121 (TAS14) | **119, -2** | level -1 (121,5): bounds 100, 119; level 0 1.02G visited, 62.5M kept at its widest; 60 GB |
 | (6,1) 1500m | 89 | 93 (TAS15) | **92, -1** | split, `r0sxhn`, level -1 (186,5) steps: bound 90; `--to 91` no concrete win (exhaustive); `--to 92` wins |
 | (0,2) 1700m | 81 | 89 (TAS17) | **87, -2** | bound 87 at level 0 |
 | (1,2) 1800m | 103 | 118 (TAS18) | **113, -5** | `r0sxhnp,r0sxhn,r0sxh,r0sx`, no level -1: bounds 107, 109, 113; `--to 112` refuted. Upload 85f (real play) |

@@ -139,7 +139,7 @@ impl<N: Rem> XferTable<N> {
     }
 
     /// The table's pairs alone, as `load` reads them (the readers need no
-    /// index: a big room at h155 has 4.0M pairs).
+    /// index: a big room's tree has 4.0M pairs).
     pub fn load_pairs(dir: &Path) -> Result<Vec<N::Pair>> {
         let n = match read_done(dir)? {
             Some(d) => d.xfers,

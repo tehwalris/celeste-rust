@@ -72,8 +72,8 @@ echo "[safe-run] memory limit $MEMORY_LIMIT (MemAvailable $(( avail_mib / 1024 )
 # mimalloc: freed pages go back to the OS after 100 ms (mimalloc v2's own
 # default is 10). A wave unit takes ~12 ms and frees its buffers (the
 # chunks it hands to the region jobs, its decoded rows) on whatever thread
-# finishes them; at 0 every unit faulted them in again: the mod room's
-# fmp f52 -> f53 12.0M faults, kernel mode 156 G cycles. At 100 ms: 1.3M
+# finishes them; at 0 every unit faulted them in again: a big frame
+# (89M lanes in) 12.0M faults, kernel mode 156 G cycles. At 100 ms: 1.3M
 # faults, 39 G cycles, the wave 6-10% faster, its anonymous peak +10%
 # (5.70 -> 6.25 GB; the reference frame 1.70 -> 1.94); at 10 ms half of
 # both (2026-10-12, branch emit-batch). 0 was set for the door (its

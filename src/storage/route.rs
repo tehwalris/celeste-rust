@@ -284,7 +284,7 @@ pub struct RouteState<N: Rem = P8> {
     /// new this frame (no canonical id yet: `edges::XferTable::canonical`),
     /// per job (slice) a segment encoded with the provisional keys and ids,
     /// encoded again at the frame's end with the final ones (`seal`). Held
-    /// as zstd blocks, not bundles: a big room's f53 (+95) held 103M into
+    /// as zstd blocks, not bundles: a big room's f53 held 103M into
     /// provisional targets, 5.8 GB as structs.
     pub prov: Vec<(u32, Segment)>,
     /// Its segments with their kind (0: a job's, 1: a job's bundles that

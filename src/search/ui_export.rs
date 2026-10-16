@@ -20,7 +20,7 @@
 //! by frame: every frame holds marked states all over a marks file, so a
 //! frame-by-frame merge mapped the whole file (13.5 GB below). Loading
 //! everything (every marked state in a hash table, every frame's layer
-//! decoded at once) took the mod room's balloon run (82 GB tree, 13.3B
+//! decoded at once) took a big balloon run (82 GB tree, 13.3B
 //! states, 431M marks) to 96 GB; streamed it peaks at 1.6 GB of heap
 //! (7.2 GB with the mapped rows).
 //!
@@ -269,7 +269,7 @@ type MarkId = (u64, u32, Key);
 /// A marks file, mapped: `save_marks`' rows `(shape, cell, k0, k1, dist)`
 /// (32 bytes each), SORTED by state `(shape, cell, key)` (checked by
 /// `scan_marks`), then the horizon. Read in place and never loaded:
-/// the mod room's balloon run's 431M rows (13.8 GB) held as a hash table
+/// a big balloon run's 431M rows (13.8 GB) held as a hash table
 /// took the export to 96 GB.
 struct MarksMap {
     map: memmap2::Mmap,
