@@ -116,13 +116,13 @@ pub struct Hull<C: Circle = Fixed16> {
     pub y: Arc<C>,
 }
 
-/// Equal as its four words at once (16.16's: one 8-byte compare; the
-/// fields one by one cost the push cache's lookup, `PushCache::get`, 2.6%
-/// of room (6,2)'s f56 in release instructions).
+/// Equal as the circle compares four words (`Circle::same4`: 16.16's at
+/// once, one 8-byte compare - field by field cost the push cache's lookup
+/// 2.6% of r62h57's f56 in release instructions; the doubles' word by word).
 impl<C: Circle> PartialEq for Hull<C> {
     #[inline]
     fn eq(&self, o: &Self) -> bool {
-        self.words() == o.words()
+        C::same4(self.words(), o.words())
     }
 }
 

@@ -233,6 +233,10 @@ impl Circle for Doubles {
         mix64(mix64(w[0] ^ w[1].rotate_left(32)) ^ w[2] ^ w[3].rotate_left(32))
     }
     #[inline]
+    fn same4(a: [u64; 4], b: [u64; 4]) -> bool {
+        a[0] == b[0] && a[1] == b[1] && a[2] == b[2] && a[3] == b[3]
+    }
+    #[inline]
     fn guard(a: &Axis) -> Seg<u64> {
         Seg { lo: a.lo, hi: a.hi }
     }

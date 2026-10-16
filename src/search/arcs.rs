@@ -70,6 +70,10 @@ pub trait Circle: Copy + std::fmt::Debug + Default + PartialEq + Eq + PartialOrd
     fn put_word(w: Self::W, out: &mut Vec<u8>);
     fn get_word(b: &[u8]) -> Self::W;
     fn hash4(w: [Self::W; 4]) -> u64;
+    /// Are a hull's four words `a` and `b` equal (the push cache's lookup,
+    /// `hull::PushCache::get`)? 16.16's at once (one 8-byte compare); the
+    /// doubles' word by word (a miss most often differs in the first).
+    fn same4(a: [Self::W; 4], b: [Self::W; 4]) -> bool;
     /// The points an edge's axis takes.
     fn guard(a: &Self::Act) -> Seg<Self::P>;
     /// The point a constant action sends every point to.
@@ -145,6 +149,10 @@ impl Circle for Fixed16 {
     #[inline]
     fn hash4(w: [u16; 4]) -> u64 {
         w[0] as u64 | (w[1] as u64) << 16 | (w[2] as u64) << 32 | (w[3] as u64) << 48
+    }
+    #[inline]
+    fn same4(a: [u16; 4], b: [u16; 4]) -> bool {
+        a == b
     }
     #[inline]
     fn guard(a: &Transfer) -> Seg {
