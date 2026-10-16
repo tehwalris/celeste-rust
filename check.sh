@@ -195,7 +195,7 @@ gate10f_forward() {
     ./safe-run.sh -- "$B" ckhash --arith float --to 44 --room 1,0 --hulls --checkpoint-dir "$C/t2/g10f" | diff gates/float_ckhash_room10_f000-044.txt - >&2
 }
 gate10f_arc() {
-    ./safe-run.sh -- "$B" search --arith float --to 35 --win-at 9,101 --checkpoint-dir "$C/t2/arc10f" --prefer gates/known_room10_win9-101.txt > "$C/t2/arc10f.out" || return 1
+    ./safe-run.sh -- "$B" search --arith float --to 35 --win-at 9,101 --checkpoint-dir "$C/t2/arc10f" --prefer gates/known_room10_win9-101.txt --save-marks "$C/t2/arc10f-marks" > "$C/t2/arc10f.out" || return 1
     grep '^\[gate\]' "$C/t2/arc10f.out" | diff gates/float_arc_room10_win9-101_h35.txt - >&2
 }
 # The dual search (`rewrite dual`, plans/float-solver.md milestone 6) at the
@@ -203,7 +203,7 @@ gate10f_arc() {
 # valid in both; its bound and its witness pinned (each half's [gate] lines
 # are the two gates above).
 gate10d_dual() {
-    ./safe-run.sh -- "$B" dual --to 35 --win-at 9,101 --checkpoint-dir "$C/t2/dual10" --prefer gates/known_room10_win9-101.txt > "$C/t2/dual10.out" || return 1
+    ./safe-run.sh -- "$B" dual --to 35 --win-at 9,101 --checkpoint-dir "$C/t2/dual10" --prefer gates/known_room10_win9-101.txt --save-marks "$C/t2/dual10-marks" > "$C/t2/dual10.out" || return 1
     grep -E '^DUAL BOUND|^\[gate\] h35 dual' "$C/t2/dual10.out" | diff gates/dual_room10_win9-101_h35.txt - >&2
 }
 # The objects ladder (r0sxhn filtering r0sxh) at a synthetic win, its
@@ -217,7 +217,9 @@ search42() {
 # marks: every binary file, and run.json without its timings (the search's
 # wall, the forward's per-frame walls and memory), pinned by digest.
 export_ui() {
-    for s in arc10:1,0 s42:4,2; do
+    # The float gate's run and the dual's too (each tree read in its own
+    # arithmetic; the dual's arc pass the float half's).
+    for s in arc10:1,0 s42:4,2 arc10f:1,0 dual10:1,0; do
         local d=${s%%:*} room=${s##*:}
         ./safe-run.sh -- "$B" export-ui --room "$room" --checkpoint-dir "$C/t2/$d" --arc "$C/t2/$d-marks" --out "$C/t2/ui-$d" > /dev/null || return 1
         (cd "$C/t2" && sha256sum ui-$d/*.bin)

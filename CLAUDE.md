@@ -283,7 +283,9 @@ On a real PICO-8, headless: `pico8_diff/replay.py --room X,Y FILE` (and
 ### The UI (`ui/`)
 
 A phone-first web view of one finished search (`search --save-marks DIR`,
-then `rewrite export-ui --help`); building and serving it: `ui/README.md`
+in either arithmetic, or `dual --save-marks DIR`: the float half's arc pass
+and the dual witness; then `rewrite export-ui --help`, which reads each tree
+in the arithmetic it records); building and serving it: `ui/README.md`
 and UI-HOSTING.md. It is served under `/celeste/` on port 3011 only, never
 uncapped (`systemd-run --user --scope -p MemoryMax=2G`), and nothing
 generated (`ui/dist`, `ui/node_modules`, the exported data) is committed.

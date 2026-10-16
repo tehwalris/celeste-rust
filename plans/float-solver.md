@@ -1463,3 +1463,19 @@ call one ulp up, one ulp down, and 8 random runs give the same exit frame.
 Nothing else was run through it. The witnesses
 are unsubmitted routes: under /var/tmp/float-check/m6/val, never
 committed.
+
+### The UI in float (built, item 4)
+
+- `search --arith float --save-marks DIR` writes the float arc pass as the
+  fixed one does (`frame::save_marks` was generic already; the refusal is
+  gone); `rewrite export-ui` takes `--arith float` and reads each tree in the
+  arithmetic its record names (`settings::recorded_arith`), so a dual
+  search's record exports too, its levels named by half (`fixed: r0sxh`,
+  `float: r0sxh`) and its optimum the pair's, not the float half's bound.
+- `dual --save-marks DIR`: the float half's arc pass (the count's) and the
+  dual witness with the float half's path (`dual::path_cells`), labelled.
+- t2's `export-ui` exports the float gate's run and the dual gate's beside
+  the fixed ones (`gates/fixtures/export-ui.sha256`, the fixed lines
+  unchanged). The dual's fixed half exports byte-identical to the fixed
+  gate's tree (`l00.frames.bin`) and its float half to the float gate's:
+  the halves ARE the single searches.

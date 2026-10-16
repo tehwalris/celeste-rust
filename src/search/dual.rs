@@ -451,6 +451,23 @@ pub fn first_win<N: Rem>(inputs: &[u8], s: &Settings) -> Result<Option<u32>> {
     Ok(None)
 }
 
+/// The player's cell at every frame of `inputs` (the start's first, a
+/// player-less frame `pos_graph::NO_CELL`), as a concrete run of `s`
+/// (`Settings::concrete`) - the UI's path of a dual witness, its float
+/// half's. A frame that forks (`rnd`) follows its first leaf.
+pub fn path_cells<N: Rem>(inputs: &[u8], s: &Settings) -> Result<Vec<u32>> {
+    let mut eng = ReferenceEngine::<N::A>::new(&s.concrete().0)?;
+    let start = Block::canonical(eng.initial()?)?;
+    let mut cells = vec![start.positions()?[0]];
+    let mut row = start.into_rt2();
+    for &byte in inputs {
+        let b = eng.frame(&row, byte)?.into_iter().next().ok_or_else(|| anyhow!("a frame with no successor"))?;
+        cells.push(b.positions()?[0]);
+        row = b.into_rt2();
+    }
+    Ok(cells)
+}
+
 /// THE WITNESS, REPLAYED (a guard, not trusted): `inputs` from each half's
 /// start through its reference engine, every `rnd` leaf followed. The float
 /// half must first win on the last frame (the file's length); the fixed half

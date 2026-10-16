@@ -155,6 +155,11 @@ enum Command {
         /// The float half's loading jank J (Celia only; default: its IL load's).
         #[arg(long)]
         float_loading_jank: Option<usize>,
+        /// The web UI's arc pass of the FLOAT half (the count) into this
+        /// directory, as `search --save-marks` writes it, with the dual
+        /// witness's path (`export-ui --arc DIR`).
+        #[arg(long)]
+        save_marks: Option<String>,
     },
     /// A float witness's ROBUSTNESS to the host libm (plans/float-solver.md,
     /// section 15, Q3): `--inputs` replayed in float (the run's float tool,
@@ -1269,7 +1274,17 @@ fn search<N: celeste_rust::search::rem::Rem>(
 /// concrete search between the larger arc bound and the horizon; its
 /// witness replayed in both arithmetics and recorded.
 #[allow(clippy::too_many_arguments)]
-fn dual(cfg: &celeste_rust::settings::Settings, float: &celeste_rust::settings::Settings, to: Option<u32>, ceiling: Option<u32>, level: String, checkpoint_dir: String, no_witness: bool, prefer: Option<String>) -> Result<()> {
+fn dual(
+    cfg: &celeste_rust::settings::Settings,
+    float: &celeste_rust::settings::Settings,
+    to: Option<u32>,
+    ceiling: Option<u32>,
+    level: String,
+    checkpoint_dir: String,
+    no_witness: bool,
+    prefer: Option<String>,
+    save_marks: Option<String>,
+) -> Result<()> {
     use celeste_rust::search::result::{DualResult, Verdict};
     let prefer: Option<Vec<u8>> = prefer.as_deref().map(celeste_rust::concrete::read_inputs).transpose()?;
     let horizon = horizon_of(to, ceiling)?;
@@ -1329,7 +1344,7 @@ fn dual(cfg: &celeste_rust::settings::Settings, float: &celeste_rust::settings::
         &base.join("float"),
         "float/",
         Finish::Arcs,
-        None,
+        save_marks.as_deref(),
         prefer.as_deref(),
         &mut res,
         |lvl| Ok(Box::new(celeste_rust::compiled::FloatKernels::new(float, lvl)?)),
@@ -1373,6 +1388,14 @@ fn dual(cfg: &celeste_rust::settings::Settings, float: &celeste_rust::settings::
     res.witness_file = Some(path.file_name().expect("a file").to_string_lossy().into_owned());
     if let Some(d) = &mut res.dual {
         d.fixed_exit = Some(w.fixed_exit);
+    }
+    // The UI's path: the float half's cells along the witness.
+    if let Some(out) = &save_marks {
+        let cells = celeste_rust::search::dual::path_cells::<LuaF64>(&w.inputs, float)?;
+        let path = std::path::Path::new(out).join("witness.txt");
+        celeste_rust::search::arc_dp::Witness { inputs: w.inputs.clone(), cells }.save(&path)?;
+        let label = format!("label dual witness, valid in both arithmetics: {} exits on frame {f}, real play on frame {} (the float half's path)\n", float.arith, w.fixed_exit);
+        std::fs::write(&path, label + &std::fs::read_to_string(&path)?)?;
     }
     record(&mut res, Verdict::Optimal)?;
     println!("[gate] h{horizon} dual optimum {f} fixed exit {} inputs {}", w.fixed_exit, w.inputs_text());
@@ -1591,6 +1614,7 @@ fn main() -> Result<()> {
             | Command::CheckKnown { .. }
             | Command::L1Check { .. }
             | Command::Robust { .. }
+            | Command::ExportUi { .. }
     );
     let cfg = celeste_rust::settings::startup(&cli.settings, float, |s| {
         if let Command::BenchFrame { metrics, .. } = &cli.command {
@@ -1613,31 +1637,27 @@ fn main() -> Result<()> {
                 |lvl| Ok(Box::new(celeste_rust::compiled::FrameEngine::new(&cfg, lvl)?)),
                 || Ok(vec![Block::canonical(RefEngine::new(&cfg)?.initial()?)?]),
             )?,
-            Arith::Float(_) => {
-                // What the float search has not met yet is refused, not run.
-                anyhow::ensure!(save_marks.is_none(), "--arith float: --save-marks (the UI's arc pass) is fixed only so far");
-                search::<LuaF64>(
-                    &cfg,
-                    to,
-                    ceiling,
-                    level,
-                    checkpoint_dir,
-                    no_witness,
-                    save_marks,
-                    prefer,
-                    |lvl| Ok(Box::new(celeste_rust::compiled::FloatKernels::new(&cfg, lvl)?)),
-                    || Ok(vec![Block::canonical(FloatRefEngine::new(&cfg)?.initial()?)?]),
-                )?
-            }
+            Arith::Float(_) => search::<LuaF64>(
+                &cfg,
+                to,
+                ceiling,
+                level,
+                checkpoint_dir,
+                no_witness,
+                save_marks,
+                prefer,
+                |lvl| Ok(Box::new(celeste_rust::compiled::FloatKernels::new(&cfg, lvl)?)),
+                || Ok(vec![Block::canonical(FloatRefEngine::new(&cfg)?.initial()?)?]),
+            )?,
         },
-        Command::Dual { to, ceiling, level, checkpoint_dir, no_witness, prefer, float_half, float_loading_jank } => {
+        Command::Dual { to, ceiling, level, checkpoint_dir, no_witness, prefer, float_half, float_loading_jank, save_marks } => {
             let tool = match float_half.as_str() {
                 "celia" => celeste_rust::settings::FloatTool::Celia,
                 "uct" => celeste_rust::settings::FloatTool::Uct,
                 t => anyhow::bail!("--float-half: `celia` or `uct`, not {t:?}"),
             };
             let float = cfg.float_half(tool, float_loading_jank)?;
-            dual(&cfg, &float, to, ceiling, level, checkpoint_dir, no_witness, prefer)?;
+            dual(&cfg, &float, to, ceiling, level, checkpoint_dir, no_witness, prefer, save_marks)?;
         }
         Command::Robust { inputs, random } => {
             use celeste_core::lua_f64::{with_sin_nudge, SinNudge};

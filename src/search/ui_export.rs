@@ -498,7 +498,7 @@ struct RegionBlocks {
 /// decoded, counted, merged with the marked sets' rows at the region's
 /// cells (found once for all frames) and unmapped; the counts added to the
 /// frames' `sums`; the region's marks rows unmapped at the end.
-fn count_region(tree: &Tree, rb: &RegionBlocks, sets: &[MarkedSet], sums: &[std::sync::Mutex<FrameSums>]) -> Result<()> {
+fn count_region<N: celeste_core::arith::EngineNum>(tree: &Tree<N>, rb: &RegionBlocks, sets: &[MarkedSet], sums: &[std::sync::Mutex<FrameSums>]) -> Result<()> {
     let geo = crate::storage::GEOMETRY;
     let (shape, slot) = (tree.shape_of(rb.region)?, rb.region % geo.slots);
     let locals = if slot == geo.no_cell_slot() { 1 } else { u64::MAX };
@@ -554,7 +554,7 @@ fn sparse(m: FxHashMap<u32, u64>) -> Result<Sparse> {
 /// per frame) are read in turn and its cells' marks rows found once, and
 /// both are unmapped when read: what it holds is the per-cell counts and,
 /// per thread, one block and one region's rows, whatever the tree's size.
-fn read_tree(dir: &Path, sets: &[MarkedSet], threads: usize) -> Result<(LevelData, Vec<Vec<Sparse>>)> {
+fn read_tree<N: celeste_core::arith::EngineNum>(dir: &Path, sets: &[MarkedSet], threads: usize) -> Result<(LevelData, Vec<Vec<Sparse>>)> {
     let n = last_frame(dir).map_or(0, |l| l as usize + 1);
     // The pos graph, to draw wins where the player left from (below). An
     // absent graph draws wins in place; an unloadable one is an error.
@@ -567,7 +567,7 @@ fn read_tree(dir: &Path, sets: &[MarkedSet], threads: usize) -> Result<(LevelDat
     let sums: Vec<std::sync::Mutex<FrameSums>> =
         (0..n).map(|_| std::sync::Mutex::new(FrameSums { cells: Default::default(), wins: Default::default(), marked: vec![Default::default(); sets.len()] })).collect();
     if n > 0 {
-        let tree = Tree::open(dir, n as u32 - 1)?;
+        let tree = Tree::<N>::open(dir, n as u32 - 1)?;
         let mut by_region: FxHashMap<u32, RegionBlocks> = FxHashMap::default();
         for (f, file) in tree.frames.iter().enumerate() {
             for (bi, r) in file.iter().flat_map(|x| x.header.regions.iter().enumerate()) {
@@ -762,26 +762,39 @@ fn read_witness(path: &Path) -> Result<Witness> {
     Ok(Witness { label, inputs, path: path_xy, dashes })
 }
 
+/// A level's name in the UI: its spec, under its half's name in a dual
+/// search's record (`fixed/level00`, `float/level00`).
+fn level_label(l: &super::result::LevelResult) -> String {
+    match l.dir.split_once('/') {
+        Some((half, _)) => format!("{half}: {}", l.spec),
+        None => l.spec.clone(),
+    }
+}
+
 /// `--arc DIR` (`search --save-marks DIR`, which holds the LAST level's
 /// sets): the last forward level gets the winning sets' support, and a level
 /// after it the ARC backward over the same tree; the optimum is the arc
-/// search's (`last`: the record's last level). Returns the witness if present.
-fn attach_arc(hr: &mut HorizonRun, optimal: &mut Option<u32>, dir: &Path, last: &super::result::LevelResult) -> Result<Option<Witness>> {
+/// search's (`last`: the record's last level) unless `keep_optimal` (a dual
+/// search's, whose optimum is the pair's, not the float half's bound).
+/// Returns the witness if present.
+fn attach_arc(hr: &mut HorizonRun, optimal: &mut Option<u32>, dir: &Path, last: &super::result::LevelResult, keep_optimal: bool) -> Result<Option<Witness>> {
     let rows = |name: &str| -> Result<u64> { Ok(MarksMap::open(&dir.join(name))?.rows as u64) };
     let found = last.arc_bound;
     hr.partial = false;
     let li = hr.levels.len() - 1;
     let lr = &mut hr.levels[li];
-    lr.precision = format!("{}, rem free", last.spec);
+    lr.precision = format!("{}, rem free", level_label(last));
     lr.refuted = lr.first_win.is_none();
     lr.marked = Some(rows("level0.marks.bin")?);
-    let mut arc = level_run(li + 1, format!("arc: {}, rem exact", last.spec), Vec::new(), found);
+    let mut arc = level_run(li + 1, format!("arc: {}, rem exact", level_label(last)), Vec::new(), found);
     arc.marked = found.map(|_| rows("arc.marks.bin")).transpose()?;
     arc.refuted = found.is_none();
     arc.forward_of = Some(li);
     hr.levels.push(arc);
     hr.refuted_at = hr.levels.iter().position(|l| l.refuted);
-    *optimal = if hr.refuted_at.is_none() { found } else { None };
+    if !keep_optimal {
+        *optimal = if hr.refuted_at.is_none() { found } else { None };
+    }
     let w = dir.join("witness.txt");
     w.exists().then(|| read_witness(&w)).transpose()
 }
@@ -813,13 +826,13 @@ pub fn export(checkpoint_dir: &Path, out: &Path, s: &crate::settings::Settings, 
     let tree_dir = |level: usize| checkpoint_dir.join(&res.levels[level].dir);
     let mut levels = Vec::new();
     for (i, l) in res.levels.iter().enumerate() {
-        levels.push(level_run(i, l.spec.clone(), read_forward_stats(&tree_dir(i))?, l.first_win));
+        levels.push(level_run(i, level_label(l), read_forward_stats(&tree_dir(i))?, l.first_win));
     }
     let nforward = levels.len();
     let (wall_s, mut optimal) = (Some(res.wall_s), res.optimal);
     let mut hr = HorizonRun { h, levels, refuted_at: None, partial: true };
     let witness = match arc {
-        Some(dir) => attach_arc(&mut hr, &mut optimal, dir, last)?,
+        Some(dir) => attach_arc(&mut hr, &mut optimal, dir, last, res.dual.is_some())?,
         None => None,
     };
     let witness = match paths.witness {
@@ -886,7 +899,12 @@ pub fn export(checkpoint_dir: &Path, out: &Path, s: &crate::settings::Settings, 
             set_levels.push(l);
             maps.push(m);
         }
-        let (data, layers) = read_tree(&dir, &maps, threads).with_context(|| format!("frames of {}", dir.display()))?;
+        // In the tree's own arithmetic (a dual search's halves differ).
+        let (data, layers) = match crate::settings::recorded_arith(&dir)? {
+            crate::settings::Arith::Fixed => read_tree::<celeste_engine::runtime2::P8>(&dir, &maps, threads),
+            crate::settings::Arith::Float(_) => read_tree::<celeste_core::lua_f64::LuaF64>(&dir, &maps, threads),
+        }
+        .with_context(|| format!("frames of {}", dir.display()))?;
         // Every marked state is a state of the tree: each set's layers
         // hold all its rows.
         for ((m, l), layer) in maps.iter().zip(&set_levels).zip(&layers) {
