@@ -257,7 +257,24 @@ the diagnostics, ...) are shared by all three. The most common:
 # An object room, and the objects ladder (plans/results.md, "How to run a room").
 ./safe-run.sh -- ./target/release/rewrite search --room 7,0 --level r0sxhn,r0sxh \
     --level-minus-one 84,5 --ceiling 84 --checkpoint-dir DIR --prefer tas/FILE.txt
+# The same in the float tools' doubles (Celia's start and seeds by default;
+# --float-tool uct for UniversalClassicTas): plans/float-solver.md.
+./safe-run.sh -- ./target/release/rewrite search --arith float --room 7,0 ...
+# THE DUAL SEARCH: the shortest file valid in BOTH arithmetics under rule (b)
+# (the float tool's exit is the count; real play, 16.16 from --loading-jank J,
+# the category's boot-chain J, must have left by then). Each half's levels to
+# the same horizon under DIR/fixed and DIR/float, then the search over pairs;
+# the witness replayed in both, to DIR/witness_frame_F.txt and DIR/result.json.
+./safe-run.sh --memory 40G -- ./target/release/rewrite dual --room 0,3 --gemskip --hundred \
+    --loading-jank 1 --level r0sxhn,r0sxh --level-minus-one 150,5 --to 150 --checkpoint-dir DIR \
+    [--prefer FILE] [--float-half celia|uct]
+# A float witness against a nudged libm `sin` (one ulp up, down, random per call).
+./safe-run.sh -- ./target/quick/rewrite robust --arith float --room X,Y [category] --inputs FILE
 ```
+
+Every witness in every tool (PICO-8 IL, chain and boot chain; UCT; Celia):
+`tools/uct/check_uploads.py --cat CAT TAS<level>.tas`, plus Celia's
+fixed-point mode with `CELIA_FIXP=1 tools/celia/validate.sh LEVEL FILE`.
 
 On a real PICO-8, headless: `pico8_diff/replay.py --room X,Y FILE` (and
 `--help`; `--lua ~/src/github.com/tehwalris/celeste_ocaml/celeste.lua
