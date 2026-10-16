@@ -161,7 +161,7 @@ sounds like one of these. The full write-ups are in git history.
   and 5,454.
 - **The overflow checks** (2026-10-11): +1.9-3.0% kernel instructions,
   outputs identical.
-- **What multiplies in an object room** (`coarse-census --erase`): room
+- **What multiplies in an object room** (`coarse-census --erase`, now `census --erase`): room
   (3,0) f47 the fly fruit 2.30x, the speed 2.29x; room (7,0) step 108
   floors 4.6x, speed 3.2x; room (2,0) f68 `p_jump` 1.98x, speed 26.6x.
 - **`mget` outside the map** is 0 in PICO-8; the branch-free kernel reads

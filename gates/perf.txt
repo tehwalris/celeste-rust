@@ -1,8 +1,9 @@
-# ./check.sh perf: one rep of each bench frame in user-space instructions
-# (perf stat -e instructions:u over `bench-frame --reps 3` less `--reps 1`, over 2:
-# the kernel build and the tree's load cancel; 16 threads). More than 2% over
+# ./check.sh perf: one rep of each bench frame in user-space instructions of the
+# RELEASE binary (perf stat -e instructions:u over `bench-frame --reps 3` less
+# `--reps 1`, over 2: the kernel build and the tree's load cancel; 16 threads).
+# Pinned from develop fa251711's release build (2026-10-16). More than 2% over
 # its pin FAILS. Re-pin (./check.sh perf --pin) only on evidence - an intended
 # speedup, or a change that has to cost - and say why in the commit.
-r62h 19760527085
-r62h57 47959844395
-f42n 6388452599
+r62h 18861315198
+r62h57 45418149417
+f42n 5997150214

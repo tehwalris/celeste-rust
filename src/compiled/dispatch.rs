@@ -69,11 +69,9 @@ pub struct KernelStats {
     pub unique: u64,
 }
 
-/// Take (and reset) the kernels' counters; the mix diagnostic's slice
-/// counts are written first (`--kernel-mix`).
+/// Take (and reset) the kernels' counters.
 pub fn take_kernel_stats() -> KernelStats {
     fold_hits();
-    super::mix::write_calls();
     let [traced, missed] = std::array::from_fn(|i| KERNEL_HITS[i].swap(0, std::sync::atomic::Ordering::Relaxed));
     let [calls, rows, slice_lanes, bodies, bodies_taken, lane_emits, unique] = super::asm_kernel::take_call_stats();
     KernelStats { traced, missed, calls, rows, slice_lanes, bodies, bodies_taken, lane_emits, unique }

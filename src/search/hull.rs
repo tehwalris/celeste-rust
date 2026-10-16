@@ -1,5 +1,5 @@
 //! A STATE'S REMAINDER HULL (the hull forward, plans/architecture.md "The
-//! forward frame"): the sub-pixel remainders a state has been reached
+//! forward"): the sub-pixel remainders a state has been reached
 //! with so far, over-approximated by ONE ARC of the circle per axis (their
 //! box). The forward keeps a hull per state and pushes it along the
 //! recorded edges through their transfers (`push`: per axis the arc's

@@ -1,5 +1,5 @@
-//! THE FRAME of the hull forward (plans/architecture.md "The forward
-//! frame"): its frontier is the
+//! THE FRAME of the hull forward (plans/architecture.md "The forward"):
+//! its frontier is the
 //! states whose remainder HULL grew at the frame before - the NEW ones
 //! (first reached then) and OLD ones (expanded before).
 //!
@@ -760,7 +760,7 @@ pub fn run_wave<N: Rem>(engine: &dyn FrameStep<N>, front: Frontier<N>, cx: WaveC
         }
     }
     for sink in &mut sinks {
-        sink.finish()?;
+        sink.finish();
         st.lanes_raw += sink.emitted as usize;
         if let Some(p) = pos {
             p.record_pairs(sink.pos_pairs());

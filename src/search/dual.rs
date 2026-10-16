@@ -31,7 +31,7 @@ use rustc_hash::FxHashSet;
 use celeste_engine::exact::ExactRow;
 use celeste_engine::runtime2::Rt2;
 
-use super::arc_dp::{concrete_engines, exact_state, input_order, lookup_keys, rem_of, Arcs, Covered, NodeKeys};
+use super::arc_dp::{concrete_engines, DFS_BUDGET, exact_state, input_order, lookup_keys, rem_of, Arcs, Covered, NodeKeys};
 use super::rem::Rem;
 use crate::frame::{wins_of, Block};
 use crate::settings::Settings;
@@ -234,7 +234,8 @@ pub fn search<X: Rem, F: Rem>(fixed: &Half<X>, float: &Half<F>, bound: u32, pref
                 let t = cx.spf * (cx.from + k + 1);
                 let (next, read) = successors(cx.ex, cx.ef, cx.sx, cx.sf, p, byte, t, &mut cx.steps).map_err(|e| e.context(format!("the frame after {k} frames of the depth-first try, with input {byte}")))?;
                 ran.push(byte, read);
-                if cx.steps > DFS_BUDGET {
+                // A pair's steps count both halves' leaves.
+                if cx.steps > 2 * DFS_BUDGET {
                     return Ok(None);
                 }
                 for n in next {
@@ -271,8 +272,6 @@ pub fn search<X: Rem, F: Rem>(fixed: &Half<X>, float: &Half<F>, bound: u32, pref
             }
             Ok(Some(false))
         }
-        /// Concrete steps (both halves') the fast path may take.
-        const DFS_BUDGET: u64 = 400_000;
         let t = std::time::Instant::now();
         let mut pair = engines[0].lock().expect("an engine pair");
         let (ex0, ef0) = &mut *pair;
