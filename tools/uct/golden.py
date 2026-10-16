@@ -5,11 +5,18 @@ tasdatabase's files (plans/float-solver.md, section 3).
     tools/uct/golden.py CAT LEVEL [LEVEL...]     one category's levels
     tools/uct/golden.py CAT all                  every level the category has
     tools/uct/golden.py random N LEVEL...|all    N random files a level
+    tools/uct/golden.py witness all              our witnesses (below)
 
 A RANDOM file (`random_inputs`: held directions, jump and dash presses at
 random, every seed 0; deterministic in its index and level) is a golden of
 category `randomI`: it reaches states no community file does (deaths,
 walls and spikes at odd remainders).
+
+A WITNESS is one of our validated runs, listed in gates/witnesses/witnesses.txt
+(`KEY CATEGORY LEVEL FILE`): its golden is named by KEY, the category gives
+its dashes. A run valid in fixed point only dies in the tool, and the
+golden holds that death: exactly the divergence the float engine must
+reproduce.
 
 Per file (the database's `classic/CAT/TAS<level>.tas`): run it in UCT with
 the exact trace (tools/uct/exact.lua via validate.sh: UCT_EXACT), re-time
@@ -109,17 +116,17 @@ def random_inputs(i, level, n=90):
     return out[:n]
 
 
-def canonical(cat, level, tmp, play=None, tool="uct"):
+def canonical(cat, level, tmp, play=None, tool="uct", path=None):
     """The category's file for `level` (a `randomI` category: random file
-    I) as the tool plays it (`play(level, path, cat, trace)`, its status;
-    default UCT), its buffered jumps re-timed: (the file to play, its
-    seeds, its inputs, the tool's trace of it, its status, the inputs
-    re-timed). Raises `Skip`."""
+    I; `path`: that file, played as category `cat`) as the tool plays it
+    (`play(level, path, cat, trace)`, its status; default UCT), its
+    buffered jumps re-timed: (the file to play, its seeds, its inputs, the
+    tool's trace of it, its status, the inputs re-timed). Raises `Skip`."""
     play = play or uct
-    if cat.startswith("random"):
+    if path is None and cat.startswith("random"):
         path = os.path.join(tmp, "random.tas")
         open(path, "w").write(tasdb.text([], random_inputs(int(cat[len("random"):]), level)))
-    else:
+    elif path is None:
         e = [x for x in tasdb.entries(cat) if x.get("file") == tasdb.file_of_level(level)]
         if not e:
             raise Skip("no file")
@@ -178,21 +185,35 @@ def golden(trace, out, last):
     return sum(1 for l in text.splitlines() if l.startswith("u "))
 
 
-def one(cat, level, tmp):
+def one(job, tmp):
+    key, level, cat, path = job
     try:
-        _, seeds, inputs, trace, status, retimed = canonical(cat, level, tmp)
+        _, seeds, inputs, trace, status, retimed = canonical(cat, level, tmp, path=path)
     except Skip as e:
         return None, str(e)
     room = rooms.room_of(level)
-    updates = golden(trace, os.path.join(OUT, f"{cat}_{level}.trace.zst"), lambda u: uct_last(u, len(inputs)))
+    updates = golden(trace, os.path.join(OUT, f"{key}_{level}.trace.zst"), lambda u: uct_last(u, len(inputs)))
     seed_text = ",".join(seeds) if seeds else "-"
-    line = f"{cat} {level} room={room[0]},{room[1]} seeds={seed_text} gemskip={int(categories.one_dash(cat))} updates={updates} uct={status.replace(' ', '_')} retimed={retimed}"
+    line = f"{key} {level} room={room[0]},{room[1]} seeds={seed_text} gemskip={int(categories.one_dash(cat))} updates={updates} uct={status.replace(' ', '_')} retimed={retimed}"
     return line, None
 
 
+WITNESSES = os.path.join(ROOT, "gates", "witnesses", "witnesses.txt")
+
+
 def jobs(argv):
-    """The (category, level) pairs of the command line."""
+    """The jobs of the command line: (manifest key, level, category, the
+    file or None)."""
     cat, levels = argv[0], argv[1:]
+    if cat == "witness":
+        if levels != ["all"]:
+            sys.exit("witness all: the witnesses are gates/witnesses/witnesses.txt's")
+        out = []
+        for line in open(WITNESSES):
+            w = line.split()
+            if w and not w[0].startswith("#"):
+                out.append((w[0], int(w[2]), w[1], os.path.join(ROOT, w[3])))
+        return out
     cats = [cat]
     if cat == "random":
         cats, levels = [f"random{i}" for i in range(int(levels[0]))], levels[1:]
@@ -200,7 +221,7 @@ def jobs(argv):
             levels = list(range(1, 32))
     elif levels == ["all"]:
         levels = sorted({tasdb.level_of_file(e["file"]) for e in tasdb.entries(cat) if e.get("file")})
-    return [(c, int(level)) for c in cats for level in levels]
+    return [(c, int(level), c, None) for c in cats for level in levels]
 
 
 def run(argv, out, one):
@@ -209,15 +230,16 @@ def run(argv, out, one):
     os.makedirs(out, exist_ok=True)
     manifest = os.path.join(out, "manifest.txt")
     lines = [l for l in open(manifest).read().splitlines()] if os.path.exists(manifest) else []
-    for cat, level in jobs(argv):
+    for job in jobs(argv):
+        key, level = job[0], job[1]
         with tempfile.TemporaryDirectory(dir="/var/tmp") as tmp:
-            line, why = one(cat, level, tmp)
-        lines = [l for l in lines if l.split()[:2] != [cat, str(level)]]
+            line, why = one(job, tmp)
+        lines = [l for l in lines if l.split()[:2] != [key, str(level)]]
         if line:
             lines.append(line)
             print(line, flush=True)
         else:
-            print(f"{cat} {level}: skipped: {why}", flush=True)
+            print(f"{key} {level}: skipped: {why}", flush=True)
     lines.sort(key=lambda l: (l.split()[0], int(l.split()[1])))
     open(manifest, "w").write("\n".join(lines) + "\n")
 

@@ -350,6 +350,42 @@ mod tests {
         replay(&mut eng, &trace)
     }
 
+    /// THE FIXED-POINT WITNESS EXITS IN 16.16: the gemskip 100% 2500m (116)
+    /// witness, whose goldens DIE in both tools, leaves the room in the fixed
+    /// reference engine from the same IL load (the file's first input on the
+    /// player's first frame) - so the goldens' death is the arithmetic's, and
+    /// the float engine reproduces it.
+    #[test]
+    fn the_fixed_point_witnesses_exit_in_fixed_point() {
+        use crate::trace::refengine::RefEngine;
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        for (file, room, hundred) in [("gates/witnesses/gemskip100_TAS25.tas", (0, 3), true)] {
+            let text = std::fs::read_to_string(root.join(file)).expect("the witness");
+            let (seeds, body) = text.trim().strip_prefix('[').and_then(|t| t.split_once(']')).expect("[seeds]inputs");
+            let inputs: Vec<u8> = body.split(',').map(|v| v.trim().parse().expect("an input")).collect();
+            let s = crate::settings::Settings { room, gemskip: true, hundred, balloon_seeds: Some(seeds.to_string()), ..Default::default() };
+            let mut eng = RefEngine::new(&s).expect("the engine");
+            let mut st = eng.start_state().clone();
+            let start = (iface::get(&st, &[iface::key("room"), iface::key("x")]), iface::get(&st, &[iface::key("room"), iface::key("y")]));
+            let (mut k, mut frames) = (0usize, 0u32);
+            let exited = loop {
+                let player = !crate::trace::widen::objects_of_type(&st, "player").is_empty();
+                let input = if player { inputs.get(k).copied() } else { Some(0) };
+                let Some(input) = input else { break false };
+                k += usize::from(player);
+                frames += 1;
+                let mut leaves = eng.frame_states(&st, input).expect("a frame");
+                assert_eq!(leaves.len(), 1, "{file}: frame {frames}: a concrete frame forked");
+                st = leaves.remove(0);
+                st.gc();
+                if (iface::get(&st, &[iface::key("room"), iface::key("x")]), iface::get(&st, &[iface::key("room"), iface::key("y")])) != start {
+                    break true;
+                }
+            };
+            assert!(exited && k == inputs.len(), "{file}: the fixed engine {} after {k} of {} inputs (frame {frames})", if exited { "exited" } else { "did not exit" }, inputs.len());
+        }
+    }
+
     #[test]
     fn hex_floats_parse_exactly() {
         for v in [0.1f64, -0.5, 1.0 / 3.0, 0.0, 123.456, -3.5355339059327378, 1e-10] {

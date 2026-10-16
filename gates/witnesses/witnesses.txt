@@ -1,0 +1,9 @@
+# Our validated witnesses as float goldens (tools/uct/golden.py witness all,
+# tools/celia/golden.py witness all): KEY CATEGORY LEVEL FILE (the tool's
+# format: the first input on the player's first frame, the PICO-8 alignment).
+# room (1,0)'s arc gate witness (gates/known_room10_win9-101.txt, a synthetic
+# win at (9,101): the playback runs on past it)
+witness-room10gate any 2 gates/witnesses/room10_gate.tas
+# gemskip 100% 2500m, 116f (submitted): valid in fixed point, dies in float
+# (a sub-pixel drift from f21, a rounding flip at f63)
+witness-gemskip100 gemskip100 25 gates/witnesses/gemskip100_TAS25.tas

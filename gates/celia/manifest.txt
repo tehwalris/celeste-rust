@@ -164,3 +164,5 @@ random1 28 room=3,3 seeds=- gemskip=0 jank=3 updates=169 celia=DID_NOT_FINISH_(T
 random1 29 room=4,3 seeds=- gemskip=0 jank=7 updates=43 celia=DID_NOT_FINISH_(DIED_at_frame_14) retimed=1
 random1 30 room=5,3 seeds=- gemskip=0 jank=6 updates=38 celia=DID_NOT_FINISH_(DIED_at_frame_7) retimed=0
 random1 31 room=6,3 seeds=- gemskip=0 jank=7 updates=143 celia=DID_NOT_FINISH_(TIMEOUT:_no_exit_by_frame_151_player_22_96) retimed=2
+witness-gemskip100 25 room=0,3 seeds=0 gemskip=1 jank=1 updates=104 celia=DID_NOT_FINISH_(DIED_at_frame_80) retimed=0
+witness-room10gate 2 room=1,0 seeds=- gemskip=0 jank=2 updates=63 celia=DID_NOT_FINISH_(TIMEOUT:_no_exit_by_frame_71_player_17_112) retimed=0

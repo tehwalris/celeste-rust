@@ -164,3 +164,5 @@ random1 28 room=3,3 seeds=- gemskip=0 updates=169 uct=DID_NOT_FINISH_(raw_save_o
 random1 29 room=4,3 seeds=- gemskip=0 updates=43 uct=DID_NOT_FINISH_(died_at_keypress_frame_15) retimed=1
 random1 30 room=5,3 seeds=- gemskip=0 updates=38 uct=DID_NOT_FINISH_(died_at_keypress_frame_8) retimed=0
 random1 31 room=6,3 seeds=- gemskip=0 updates=143 uct=DID_NOT_FINISH_(raw_save_only) retimed=2
+witness-gemskip100 25 room=0,3 seeds=0 gemskip=1 updates=105 uct=DID_NOT_FINISH_(died_at_keypress_frame_81) retimed=0
+witness-room10gate 2 room=1,0 seeds=- gemskip=0 updates=63 uct=DID_NOT_FINISH_(raw_save_only) retimed=0

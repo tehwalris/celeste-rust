@@ -6,6 +6,7 @@ loading jank and its own seeds; plans/float-solver.md, section 3).
     tools/celia/golden.py CAT LEVEL [LEVEL...]     one category's levels
     tools/celia/golden.py CAT all                  every level the category has
     tools/celia/golden.py random N LEVEL...|all    N random files a level
+    tools/celia/golden.py witness all              our witnesses (gates/witnesses/)
 
 Per file: played in Celia with the exact trace (exact.lua via validate.sh:
 CELIA_EXACT), its buffered jumps re-timed from Celia's own run and checked
@@ -64,17 +65,18 @@ def celia_last(updates, n):
     return max(i for i, w in enumerate(updates) if int(w[3]) <= n)
 
 
-def one(cat, level, tmp):
+def one(job, tmp):
+    key, level, cat, path = job
     try:
-        _, seeds, inputs, trace, status, retimed = uct.canonical(cat, level, tmp, celia, "celia")
+        _, seeds, inputs, trace, status, retimed = uct.canonical(cat, level, tmp, celia, "celia", path)
     except uct.Skip as e:
         return None, str(e)
     room = rooms.room_of(level)
     j = jank(room, cat)
-    updates = uct.golden(trace, os.path.join(OUT, f"{cat}_{level}.trace.zst"), lambda u: celia_last(u, len(inputs)))
+    updates = uct.golden(trace, os.path.join(OUT, f"{key}_{level}.trace.zst"), lambda u: celia_last(u, len(inputs)))
     seed_text = ",".join(seeds) if seeds else "-"
     line = (
-        f"{cat} {level} room={room[0]},{room[1]} seeds={seed_text} gemskip={int(categories.one_dash(cat))} "
+        f"{key} {level} room={room[0]},{room[1]} seeds={seed_text} gemskip={int(categories.one_dash(cat))} "
         f"jank={'-' if j is None else j} updates={updates} celia={status.replace(' ', '_')} retimed={retimed}"
     )
     return line, None
