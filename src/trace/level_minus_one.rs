@@ -25,7 +25,7 @@
 //! DEATH (a dead end), cells outside `WINDOW` (clipped). A level-0 tree's
 //! recorded transitions check that none dropped a real move.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path as FsPath, PathBuf};
 
 use anyhow::{anyhow, bail, ensure, Result};
@@ -37,6 +37,7 @@ use super::heap::Value;
 use super::iface::{self, Conc, Path, Step};
 use super::kernel::{LatticeWalk, Tracer};
 use super::state::State;
+use super::widen::field;
 use crate::transpile::garith::{value_box, GraphArith};
 use crate::transpile::graph::{Graph, NodeId, Op, Room, Val};
 
@@ -183,24 +184,7 @@ fn berry_left_behind<A: GraphArith>(st: &State<Symbolic<A>>, d: &Symbolic<A>, ro
 
 /// The player, else the player spawn (`pos_graph::player_object`'s rule).
 fn located_object<A: GraphArith>(st: &State<Symbolic<A>>) -> Option<Path> {
-    if let Some(p) = super::shapes::player_path(st) {
-        return Some(p);
-    }
-    let Some(Value::Table(want)) = iface::get(st, &[iface::key("player_spawn")]) else { return None };
-    let Some(Value::Table(objects)) = iface::get(st, &[iface::key("objects")]) else { return None };
-    (0..st.heap.tables[&objects].arr.len()).map(|i| vec![iface::key("objects"), Step::Idx(i)]).find(|base| {
-        let mut ty = base.clone();
-        ty.push(iface::key("type"));
-        iface::get(st, &ty) == Some(Value::Table(want))
-    })
-}
-
-fn with(base: &Path, names: &[&str]) -> Path {
-    let mut p = base.clone();
-    for n in names {
-        p.push(iface::key(n));
-    }
-    p
+    super::shapes::player_path(st).or_else(|| super::widen::objects_of_type(st, "player_spawn").into_iter().next())
 }
 
 /// Is `p` an object's `rem.x/y`?
@@ -216,7 +200,7 @@ fn motion_paths<A: GraphArith>(st: &State<Symbolic<A>>) -> Vec<Path> {
         let base = vec![iface::key("objects"), Step::Idx(i)];
         for sub in ["rem", "spd"] {
             for ax in ["x", "y"] {
-                let p = with(&base, &[sub, ax]);
+                let p = field(&base, &[sub, ax]);
                 if matches!(iface::get(st, &p), Some(Value::Num(_))) {
                     out.push(p);
                 }
@@ -395,7 +379,7 @@ impl<A: GraphArith> Table<'_, A> {
         let player = super::shapes::player_path(&st);
         let located = located_object(&st);
         let (xp, yp) = match &located {
-            Some(o) => (Some(with(o, &["x"])), Some(with(o, &["y"]))),
+            Some(o) => (Some(field(o, &["x"])), Some(field(o, &["y"]))),
             None => (None, None),
         };
         // Seed unpinned numeric slots: an earlier pass's range, else the
@@ -405,7 +389,7 @@ impl<A: GraphArith> Table<'_, A> {
                 continue;
             }
             let Some(Value::Num(n)) = iface::get(&st, p) else { continue };
-            let is_player = |f: &str| player.as_ref().is_some_and(|pl| *p == with(pl, &[f, "x"]) || *p == with(pl, &[f, "y"]));
+            let is_player = |f: &str| player.as_ref().is_some_and(|pl| *p == field(pl, &[f, "x"]) || *p == field(pl, &[f, "y"]));
             // The start state's OWN interval (its representative holds a
             // blank there). A slot only a later frame writes an interval to
             // (`ival_extra`: a balloon's bob) holds its start value.
@@ -513,8 +497,8 @@ impl<A: GraphArith> Table<'_, A> {
             let node_of = |p: &Path| o.fields.iter().find(|(q, _, _)| q == p).map(|(_, n, _)| *n);
             let xy = match &tloc {
                 Some(ob) => Some((
-                    node_of(&with(ob, &["x"])).ok_or_else(|| anyhow!("shape {id}: an outcome's located object has no x"))?,
-                    node_of(&with(ob, &["y"])).ok_or_else(|| anyhow!("shape {id}: an outcome's located object has no y"))?,
+                    node_of(&field(ob, &["x"])).ok_or_else(|| anyhow!("shape {id}: an outcome's located object has no x"))?,
+                    node_of(&field(ob, &["y"])).ok_or_else(|| anyhow!("shape {id}: an outcome's located object has no y"))?,
                 )),
                 None => None,
             };
@@ -1688,7 +1672,7 @@ fn build<A: GraphArith>(root: &FsPath, spd_px: i32, threads: usize, rep: &mut St
         let st = &lw.reps[&lw.start_key];
         let o = located_object(st).ok_or_else(|| anyhow!("the start state has no player or spawn"))?;
         let at = |f: &str| -> Result<i16> {
-            let Some(Value::Num(n)) = iface::get(st, &with(&o, &[f])) else { bail!("start object {f} is not a number") };
+            let Some(Value::Num(n)) = iface::get(st, &field(&o, &[f])) else { bail!("start object {f} is not a number") };
             let v = lw.tracer.it.d.as_const(&n).ok_or_else(|| anyhow!("start object {f} is not a constant"))?;
             A::as_i16(v).ok_or_else(|| anyhow!("start object {f} is not a whole pixel"))
         };
@@ -1740,7 +1724,7 @@ fn build<A: GraphArith>(root: &FsPath, spd_px: i32, threads: usize, rep: &mut St
             // The player's speed range joins the successor's own speed.
             let (sp, zero) = (A::from_i16(spd_px), A::from_i16(0));
             for ax in ["x", "y"] {
-                let q = with(&pl, &["spd", ax]);
+                let q = field(&pl, &["spd", ax]);
                 let r = ranges.get(&q).copied().unwrap_or((zero, zero));
                 ranges.insert(q, (least(r.0, A::from_i16(-spd_px)), most(r.1, sp)));
             }
@@ -1962,38 +1946,14 @@ fn build<A: GraphArith>(root: &FsPath, spd_px: i32, threads: usize, rep: &mut St
             rev[e as usize].push(s as u32);
         }
     }
-    let mut dist = vec![u32::MAX; n];
-    let mut q: VecDeque<u32> = VecDeque::new();
-    for i in 0..n {
-        if g1.exits[i] {
-            dist[i] = 1;
-            q.push_back(i as u32);
-        }
-    }
-    while let Some(i) = q.pop_front() {
-        let dn = dist[i as usize] + 1;
-        for &s in &rev[i as usize] {
-            if dist[s as usize] == u32::MAX {
-                dist[s as usize] = dn;
-                q.push_back(s);
-            }
-        }
-    }
     let end_node = g1.index[&(end_id, end_xy.0, end_xy.1)];
-    say!(
-        rep,
-        "\nd: {} of {n} nodes reach an exit; the prefix's end d = {}, so the start state's d = {}; max finite d = {}",
-        dist.iter().filter(|d| **d != u32::MAX).count(),
-        dist[end_node as usize],
-        dist[end_node as usize].saturating_add(chain.len() as u32 - 1),
-        dist.iter().filter(|d| **d != u32::MAX).max().copied().unwrap_or(0)
-    )?;
     let sound = sound_d(&g1, &rev, chain.len() as u32 - 1, end_node);
     let start_d = sound[end_node as usize].saturating_add(chain.len() as u32 - 1);
     say!(
         rep,
-        "sound d (a death costs a respawn; clipped parts dropped, the window checked on every filtered row): {} of {n} nodes finite; the start state's d = {start_d}; {} clipped and {} death nodes",
+        "\nsound d (a death costs a respawn; clipped parts dropped, the window checked on every filtered row): {} of {n} nodes finite, the largest {}; the start state's d = {start_d}; {} clipped and {} death nodes",
         sound.iter().filter(|d| **d != u32::MAX).count(),
+        sound.iter().filter(|d| **d != u32::MAX).max().copied().unwrap_or(0),
         g1.clipped.iter().filter(|c| **c).count(),
         g1.deaths.iter().filter(|c| **c).count()
     )?;
