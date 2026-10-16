@@ -32,7 +32,7 @@ pub trait GraphArith: Arithmetic<Num: celeste_core::arith::EngineNum<A = Self>> 
     /// `-0 == 0`)? Where not, a pin checks `Op::Same`.
     const EQ_IS_IDENTITY: bool;
     /// A static range, as pieces (`pieces_of`).
-    type Pieces: Clone + Debug + PartialEq + Default;
+    type Pieces: Clone + Debug + PartialEq + Default + Send;
 
     /// `SplitOk(n)` of the literal interval `[lo, hi]`, in the kernel's own
     /// arithmetic.

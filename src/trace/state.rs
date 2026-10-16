@@ -150,6 +150,15 @@ impl<D: Domain> Clone for State<D> {
 }
 
 impl<D: Domain> State<D> {
+    /// An empty program: a globals table, a root scope, every lane live.
+    pub fn new(d: &mut D) -> Self {
+        let mut heap = Heap::default();
+        let globals = heap.new_table();
+        let scope = heap.new_scope(None);
+        let guard = d.boolean(true);
+        State { heap, globals, scope, stack: Vec::new(), guard, ended: d.boolean(false), path: Vec::new(), frag: Vec::new(), arc: None }
+    }
+
     pub fn roots(&self) -> Vec<Root> {
         let mut r = vec![Root::Table(self.globals), Root::Scope(self.scope)];
         r.extend(self.stack.iter().map(|s| Root::Scope(*s)));
@@ -511,9 +520,7 @@ mod tests {
     #[test]
     fn where_a_path_ended_merges_per_case() {
         let mut d = Symbolic::default();
-        let mut t: State<Symbolic> = State { heap: Heap::default(), globals: 0, scope: 0, stack: Vec::new(), guard: d.boolean(true), ended: d.boolean(false), path: Vec::new(), frag: Vec::new(), arc: None };
-        t.globals = t.heap.new_table();
-        t.scope = t.heap.new_scope(None);
+        let mut t: State<Symbolic> = State::new(&mut d);
         let mut f = t.clone();
         let sym = d.graph.leaf(Op::Cell(1));
         let zero = d.num(P8::from_i16(0));
@@ -534,19 +541,7 @@ mod tests {
     #[test]
     fn merging_costs_a_select_only_where_the_arms_disagree() {
         let mut d = Symbolic::default();
-        let mut s: State<Symbolic> = State {
-            heap: Heap::default(),
-            globals: 0,
-            scope: 0,
-            stack: Vec::new(),
-            guard: d.boolean(true),
-            ended: d.boolean(false),
-            path: Vec::new(),
-            frag: Vec::new(),
-            arc: None,
-        };
-        s.globals = s.heap.new_table();
-        s.scope = s.heap.new_scope(None);
+        let mut s: State<Symbolic> = State::new(&mut d);
         let player = s.heap.new_table();
         s.heap.tables.get_mut(&s.globals).unwrap().hash.insert("p".into(), Value::Table(player));
 
@@ -589,9 +584,7 @@ mod tests {
     #[test]
     fn a_merge_selects_on_the_separating_decision_not_the_guard() {
         let mut d = Symbolic::default();
-        let mut s: State<Symbolic> = State { heap: Heap::default(), globals: 0, scope: 0, stack: Vec::new(), guard: d.boolean(true), ended: d.boolean(false), path: Vec::new(), frag: Vec::new(), arc: None };
-        s.globals = s.heap.new_table();
-        s.scope = s.heap.new_scope(None);
+        let mut s: State<Symbolic> = State::new(&mut d);
         let a = d.num(P8::from_i16(1));
         let b = d.num(P8::from_i16(2));
         s.heap.tables.get_mut(&s.globals).unwrap().hash.insert("x".into(), Value::Num(a));
@@ -618,9 +611,8 @@ mod tests {
         assert_eq!(m.state.path, vec![(g, true)], "the merged path is the common prefix");
 
         // Paths not diverging at one shared decision fall back to the guard.
-        let mut p: State<Symbolic> = State { heap: Heap::default(), globals: 0, scope: 0, stack: Vec::new(), guard: g, ended: d.boolean(false), path: vec![(g, true)], frag: Vec::new(), arc: None };
-        p.globals = p.heap.new_table();
-        p.scope = p.heap.new_scope(None);
+        let mut p: State<Symbolic> = State::new(&mut d);
+        (p.guard, p.path) = (g, vec![(g, true)]);
         let mut q = p.clone();
         q.guard = c;
         q.path = vec![(c, false)];
@@ -632,9 +624,7 @@ mod tests {
     #[test]
     fn differing_shapes_do_not_merge() {
         let mut d = Symbolic::default();
-        let mut s: State<Symbolic> = State { heap: Heap::default(), globals: 0, scope: 0, stack: Vec::new(), guard: d.boolean(true), ended: d.boolean(false), path: Vec::new(), frag: Vec::new(), arc: None };
-        s.globals = s.heap.new_table();
-        s.scope = s.heap.new_scope(None);
+        let mut s: State<Symbolic> = State::new(&mut d);
         let obj = s.heap.new_table();
         s.heap.tables.get_mut(&s.globals).unwrap().arr.push(Value::Table(obj));
 
@@ -654,9 +644,7 @@ mod tests {
     #[test]
     fn garbage_does_not_prevent_a_merge() {
         let mut d = Symbolic::default();
-        let mut s: State<Symbolic> = State { heap: Heap::default(), globals: 0, scope: 0, stack: Vec::new(), guard: d.boolean(true), ended: d.boolean(false), path: Vec::new(), frag: Vec::new(), arc: None };
-        s.globals = s.heap.new_table();
-        s.scope = s.heap.new_scope(None);
+        let mut s: State<Symbolic> = State::new(&mut d);
         let mut f = s.clone();
         // One arm allocated a temporary nothing points at.
         let _garbage = f.heap.new_table();

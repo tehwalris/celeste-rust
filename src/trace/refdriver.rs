@@ -8,10 +8,7 @@
 //! snapshotted or backtracked.
 
 use anyhow::{bail, Result};
-use std::sync::Arc;
 
-use celeste_core::cart_data::CartData;
-use celeste_core::collision_cache::CollisionCache;
 use full_moon::ast;
 
 use celeste_core::arith::Arithmetic;
@@ -19,15 +16,6 @@ use celeste_core::arith::Arithmetic;
 use crate::trace::interp::Interp;
 use crate::trace::refdomain::{Cursor, RefDomain};
 use crate::trace::state::State;
-
-/// An `Interp<RefDomain>` with the room's cart and collision cache. The caller
-/// runs the cart toplevel and `_init` on it once, then reuses it every frame.
-pub fn fresh_interp<'a, A: Arithmetic>(cart: Arc<CartData>, cache: Arc<CollisionCache>) -> Interp<'a, RefDomain<A>> {
-    let mut it = Interp::new(RefDomain::new());
-    it.cart = Some(cart);
-    it.cache = Some(cache);
-    it
-}
 
 /// Run one frame of `body` from `input` along every fork path; one output state
 /// per leaf. For a game frame `body` is

@@ -62,42 +62,15 @@ pub(crate) fn lattice_kernel_refs<A: GraphArith>(
             Ok((region, wf.frame, bound))
         })
         .collect::<Result<Vec<_>>>()?;
-    // Lower (the expensive half of a build), in parallel.
+    // Lower (the expensive half of a build), in parallel. Each frame is
+    // taken by exactly one worker (a `Frame` is not cloned).
     let (cart, cache) = (lw.cart.clone(), lw.cache.clone());
-    let room = &room;
-    let n_workers = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).min(frames.len().max(1));
-    let next = std::sync::atomic::AtomicUsize::new(0);
-    // Each frame is taken by exactly one worker (a `Frame` is not cloned).
-    let slots: Vec<std::sync::Mutex<Option<(Option<Region>, super::verify::Frame<A>, Bound<A>)>>> =
-        frames.into_iter().map(|x| std::sync::Mutex::new(Some(x))).collect();
-    let slots = &slots;
-    let mut built: Vec<(usize, Result<(Option<Region>, Reference<A>)>)> = std::thread::scope(|scope| {
-        let handles: Vec<_> = (0..n_workers)
-            .map(|_| {
-                let (cart, cache, next) = (cart.clone(), cache.clone(), &next);
-                std::thread::Builder::new()
-                    .stack_size(128 * 1024 * 1024)
-                    .spawn_scoped(scope, move || {
-                        let mut out = Vec::new();
-                        loop {
-                            let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            let Some((key, f, bound)) = slots.get(i).and_then(|m| m.lock().unwrap().take()) else { break };
-                            let r = (|| -> Result<(Option<Region>, Reference<A>)> {
-                                let lowered = super::emit::lower_frame(&bound, Some(room.clone()), s.diag.build_trace)
-                                    .map_err(|e| anyhow::anyhow!("lattice frame {} ({:?}) lower: {:#}", i, key, name_cells(&f, e)))?;
-                                Ok((key, Reference { frame: f, bound, lowered, cart: cart.clone(), cache: cache.clone() }))
-                            })();
-                            out.push((i, r));
-                        }
-                        out
-                    })
-                    .expect("spawn lattice frame worker")
-            })
-            .collect();
-        handles.into_iter().flat_map(|h| h.join().expect("lattice frame worker panicked")).collect()
-    });
-    built.sort_by_key(|(i, _)| *i);
-    let refs = built.into_iter().map(|(_, r)| r).collect::<Result<Vec<_>>>()?;
+    let slots: Vec<std::sync::Mutex<Option<(Option<Region>, super::verify::Frame<A>, Bound<A>)>>> = frames.into_iter().map(|x| std::sync::Mutex::new(Some(x))).collect();
+    let refs = crate::par::Pool::per_core().stack(128 << 20).map(slots.len(), |i| {
+        let (key, f, bound) = slots[i].lock().expect("a frame's slot").take().expect("each frame is lowered once");
+        let lowered = super::emit::lower_frame(&bound, Some(room.clone()), s.diag.build_trace).map_err(|e| anyhow::anyhow!("lattice frame {} ({:?}) lower: {:#}", i, key, name_cells(&f, e)))?;
+        Ok((key, Reference { frame: f, bound, lowered, cart: cart.clone(), cache: cache.clone() }))
+    })?;
     Ok(refs)
 }
 
@@ -544,37 +517,18 @@ mod tests {
     }
 }
 
-/// The walk's tracer at room `s.room`'s start: the cart's toplevel and
-/// `_init` run in it, every frame it traces at `opts`. The ASTs are leaked:
-/// the kept tracer's `Interp` borrows them.
+/// The walk's tracer at room `s.room`'s start (`cart::boot`), every frame
+/// it traces at `opts`.
 fn boot<A: GraphArith>(root: &std::path::Path, s: &crate::settings::Settings, opts: crate::abstraction::Level) -> Result<(Tracer<A>, super::state::State<super::domain::Symbolic<A>>)> {
-    use super::cart;
-    use super::verify::run_one;
-    use anyhow::anyhow;
-    let src = cart::sources_in(root, s)?;
-    let leak = |a: full_moon::ast::Ast| -> &'static full_moon::ast::Ast { Box::leak(Box::new(a)) };
-    let top = leak(full_moon::parse(&src).map_err(|e| anyhow!("parse: {:?}", e))?);
-    cart::check_absent_fields(top)?;
-    let init = leak(full_moon::parse("_init()").map_err(|e| anyhow!("parse _init: {:?}", e))?);
-    let reset = leak(full_moon::parse("__reset_button_states()").map_err(|e| anyhow!("reset: {:?}", e))?);
-    let fr = leak(full_moon::parse(cart::FRAME_CODE).map_err(|e| anyhow!("frame: {:?}", e))?);
-
+    let chunks = super::cart::Chunks::parse(root, s)?.leak();
     let mut it = super::interp::Interp::new(super::domain::Symbolic::<A>::default());
-    let cart_data = std::sync::Arc::new(celeste_core::cart_data::CartData::load(root.join("cart"))?);
-    let (rx, ry) = s.room;
-    it.cache = Some(std::sync::Arc::new(celeste_core::collision_cache::CollisionCache::new(&cart_data, rx, ry)?));
-    it.cart = Some(cart_data);
     it.d.build_trace = s.diag.build_trace;
-    // The level's widenings, for every frame this walk traces.
     it.d.level = opts;
     if opts.platforms {
         it.d.worlds = Some(std::sync::Arc::new(crate::concrete::platform_worlds::<A>(PLATFORM_WORLD_FRAMES, s)?));
     }
-    let st = cart::fresh_state(&mut it.d);
-    let mut st = run_one(&mut it, top, st)?;
-    cart::inject_tile_flag_at(&mut st);
-    let start = run_one(&mut it, init, st)?;
-    Ok((Tracer { it, reset, fr }, start))
+    let start = super::cart::boot(&mut it, chunks, root, s.room)?;
+    Ok((Tracer { it, reset: &chunks.reset, fr: &chunks.frame }, start))
 }
 
 /// The per-shape constant lattice by FIXPOINT over (shape, region) nodes:
@@ -697,41 +651,18 @@ pub fn room_constant_lattice<A: GraphArith>(
                 Ok(WalkJob { node: (k.clone(), *region), st, roots, pin, ival, bounds, rebase })
             })
             .collect::<Result<_>>()?;
-        let next = std::sync::atomic::AtomicUsize::new(0);
-        let (jobs_ref, next_ref) = (&jobs, &next);
-        let results: Vec<Result<Vec<(usize, WalkTraced<A>)>>> = std::thread::scope(|scope| {
-            // Each worker owns its copy (`Tracer` is `Send`, not `Sync`).
-            let handles: Vec<_> = tracers
-                .iter_mut()
-                .map(|tr| {
-                    std::thread::Builder::new()
-                        .stack_size(128 * 1024 * 1024)
-                        .spawn_scoped(scope, move || -> Result<Vec<(usize, WalkTraced<A>)>> {
-                            let mut done = Vec::new();
-                            loop {
-                                let i = next_ref.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                let Some(job) = jobs_ref.get(i) else { break };
-                                // A FRESH arena per job, so a graph depends on
-                                // the job, not scheduling (`renumber_cells`).
-                                let mut fresh = Tracer { it: tr.it.clone(), reset: tr.reset, fr: tr.fr };
-                                done.push((i, walk_trace(&mut fresh, job, opts, grid, only, room0)?));
-                            }
-                            Ok(done)
-                        })
-                        .expect("spawn walk worker")
-                })
-                .collect();
-            handles.into_iter().map(|h| h.join().expect("walk worker panicked")).collect()
-        });
-        let mut traced: Vec<(usize, WalkTraced<A>)> = Vec::new();
-        for r in results {
-            traced.extend(r?);
-        }
-        traced.sort_by_key(|(i, _)| *i);
+        // Each worker clones its own copy (a `Tracer` is `Send`, not `Sync`),
+        // and per job a FRESH arena from it, so a graph depends on the job,
+        // not on scheduling (`renumber_cells`).
+        let free = std::sync::Mutex::new(tracers.iter_mut().collect::<Vec<_>>());
+        let traced: Vec<WalkTraced<A>> = crate::par::Pool::new(n_workers).stack(128 << 20).map_with(
+            jobs.len(),
+            || free.lock().expect("the walk's tracers").pop().ok_or_else(|| anyhow::anyhow!("a tracer per walk worker")),
+            |tr, i| walk_trace(&mut Tracer { it: tr.it.clone(), reset: tr.reset, fr: tr.fr }, &jobs[i], opts, grid, only, room0),
+        )?;
         let mut next_frontier: std::collections::BTreeSet<WalkNode> = Default::default();
         let mut respawned = false;
-        for (i, t) in traced {
-            let job = &jobs[i];
+        for (job, t) in jobs.iter().zip(traced) {
             let (k, region) = (&job.node.0, job.node.1);
             match t {
                 WalkTraced::Refused(e, poisoned) => {
@@ -1060,9 +991,6 @@ pub struct Tracer<A: GraphArith = Fixed> {
     pub fr: &'static full_moon::ast::Ast,
 }
 
-// SAFETY: the raw pointers inside point into the leaked `'static` ASTs,
-// immutable and never freed, so a copy can move to a worker.
-unsafe impl<A: GraphArith> Send for Tracer<A> {}
 
 /// What a lattice walk runs under: the run's settings (the cart, the room,
 /// the region grid, `--build-trace`) and, for a test, `only` the player

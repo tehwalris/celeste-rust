@@ -57,7 +57,7 @@ pub enum ForkKind {
 }
 
 /// The origin of the forks `Domain::unknown_bool` mints: the six buttons, in
-/// `__reset_button_states`' order (how `verify::at_buttons` finds them).
+/// `__reset_button_states`' order (how `verify`'s tests find them).
 pub const UNKNOWN_BOOL_ORIGIN: &str = "__new_unknown_boolean";
 
 /// HOW a fork partitions its value's set into configurations.

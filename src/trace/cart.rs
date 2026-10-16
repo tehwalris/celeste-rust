@@ -7,7 +7,7 @@
 use anyhow::{anyhow, Context, Result};
 
 use super::domain::Domain;
-use super::heap::{Heap, Value};
+use super::heap::Value;
 use super::interp::{Flow, Interp};
 use super::state::State;
 
@@ -52,10 +52,6 @@ pub fn inject_tile_flag_at<D: Domain>(st: &mut State<D>) {
         .insert("tile_flag_at".to_string(), Value::Builtin("tile_flag_at"));
 }
 
-/// The cart's Lua under settings `s`, read from the checkout.
-pub fn sources(s: &crate::settings::Settings) -> Result<String> {
-    sources_in(std::path::Path::new("."), s)
-}
 
 
 /// What ONE FRAME is, for the tracer (`trace_frame` runs the button reset
@@ -399,48 +395,62 @@ pub fn check_absent_fields(ast: &full_moon::ast::Ast) -> Result<()> {
     Ok(())
 }
 
+/// An empty program with the native builtins (`NATIVE`) as globals.
 pub fn fresh_state<D: Domain>(d: &mut D) -> State<D> {
-    let mut heap: Heap<D> = Heap::default();
-    let globals = heap.new_table();
-    let scope = heap.new_scope(None);
-    let t = d.boolean(true);
-    let mut st = State {
-        heap,
-        globals,
-        scope,
-        stack: Vec::new(),
-        guard: t,
-        ended: d.boolean(false),
-        path: Vec::new(),
-        frag: Vec::new(),
-        arc: None,
-    };
+    let mut st = State::new(d);
+    let globals = &mut st.heap.tables.get_mut(&st.globals).expect("the globals table").hash;
     for name in NATIVE {
-        st.heap
-            .tables
-            .get_mut(&globals)
-            .unwrap()
-            .hash
-            .insert((*name).to_string(), Value::Builtin(name));
+        globals.insert((*name).to_string(), Value::Builtin(name));
     }
     st
 }
 
-/// Run a chunk to completion, requiring it to end in exactly one state.
-pub fn run_chunk<'a, D: Domain>(
-    it: &mut Interp<'a, D>,
-    ast: &'a full_moon::ast::Ast,
-    st: State<D>,
-) -> Result<State<D>> {
+/// Run one chunk and require exactly one end state (a `break` at its
+/// toplevel is an error).
+pub fn run_one<'a, D: Domain>(it: &mut Interp<'a, D>, ast: &'a full_moon::ast::Ast, st: State<D>) -> Result<State<D>> {
     let out = it.exec_block(ast.nodes(), st)?;
-    if out.len() != 1 {
-        return Err(anyhow!("chunk ended in {} states", out.len()));
+    anyhow::ensure!(out.len() == 1, "expected one state, got {}", out.len());
+    let (s, f) = out.into_iter().next().expect("one state");
+    anyhow::ensure!(!matches!(f, Flow::Break), "break at chunk toplevel");
+    Ok(s)
+}
+
+/// The cart's chunks under settings `s`, parsed: the toplevel (its
+/// absent-as-zero fields checked), `_init()`, the button reset and one frame
+/// (`FRAME_CODE`).
+pub struct Chunks {
+    pub top: full_moon::ast::Ast,
+    pub init: full_moon::ast::Ast,
+    pub reset: full_moon::ast::Ast,
+    pub frame: full_moon::ast::Ast,
+}
+
+impl Chunks {
+    pub fn parse(root: &std::path::Path, s: &crate::settings::Settings) -> Result<Chunks> {
+        let parse = |what: &str, src: &str| full_moon::parse(src).map_err(|e| anyhow!("parse {what}: {e:?}"));
+        let top = parse("the cart", &sources_in(root, s)?)?;
+        check_absent_fields(&top)?;
+        Ok(Chunks { top, init: parse("_init", "_init()")?, reset: parse("the reset", "__reset_button_states()")?, frame: parse("the frame", FRAME_CODE)? })
     }
-    let (s, f) = out.into_iter().next().unwrap();
-    match f {
-        Flow::Normal | Flow::Return(_) => Ok(s),
-        Flow::Break => Err(anyhow!("break at chunk toplevel")),
+
+    /// For an interpreter kept past its caller (the walk's tracer, a
+    /// reference engine), which borrows its chunks.
+    pub fn leak(self) -> &'static Chunks {
+        Box::leak(Box::new(self))
     }
+}
+
+/// Room `room`'s START in `it`: the cart's data (read relative to `root`)
+/// and the room's collision cache loaded into it, the toplevel run, the
+/// native `tile_flag_at` in place of the Lua one, `_init()` run.
+pub fn boot<'a, D: Domain>(it: &mut Interp<'a, D>, chunks: &'a Chunks, root: &std::path::Path, (rx, ry): (i16, i16)) -> Result<State<D>> {
+    let cart = std::sync::Arc::new(celeste_core::cart_data::CartData::load(root.join("cart"))?);
+    it.cache = Some(std::sync::Arc::new(celeste_core::collision_cache::CollisionCache::new(&cart, rx, ry)?));
+    it.cart = Some(cart);
+    let st = fresh_state(&mut it.d);
+    let mut st = run_one(it, &chunks.top, st)?;
+    inject_tile_flag_at(&mut st);
+    run_one(it, &chunks.init, st)
 }
 
 #[cfg(test)]

@@ -99,13 +99,7 @@ fn root_legend<A: GraphArith>(f: &crate::trace::verify::Frame<A>) -> String {
 /// width and height, and a hitbox is fixed per object type and never
 /// written during a frame.
 pub fn bind<A: GraphArith>(f: &crate::trace::verify::Frame<A>, g: &Graph<A>) -> Result<Bound<A>> {
-    let mut roots: Vec<NodeId> = Vec::new();
-    for o in &f.outs {
-        roots.extend(o.fields.iter().map(|(_, nd, _)| *nd));
-        roots.push(o.guard);
-        roots.push(o.error);
-        roots.extend(o.arc.iter().copied());
-    }
+    let roots: Vec<NodeId> = f.outs.iter().flat_map(|o| o.roots(true)).collect();
     let (mut graph, mut roots) = crate::trace::bind::renumber_cells(g, &f.in_cells, &roots)
         .map_err(|e| anyhow::anyhow!("{:#}\nwhere the roots are\n{}", e, root_legend(f)))?;
     // The frame's own fork arities (`Frame::fork_ways`).

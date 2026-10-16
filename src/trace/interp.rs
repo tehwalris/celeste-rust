@@ -55,9 +55,10 @@ pub struct Interp<'a, D: Domain> {
     pub d: D,
     /// Function bodies, by `BodyId`.
     bodies: Vec<&'a ast::FunctionBody>,
-    /// AST node -> its id, so one `function ... end` evaluated twice is the
-    /// SAME body: the body is part of the SHAPE, so states must agree on it.
-    body_ids: std::collections::HashMap<*const ast::FunctionBody, BodyId>,
+    /// AST node (by address) -> its id, so one `function ... end` evaluated
+    /// twice is the SAME body: the body is part of the SHAPE, so states must
+    /// agree on it.
+    body_ids: std::collections::HashMap<usize, BodyId>,
     /// See `hint_name`.
     hint: Vec<String>,
     /// Paths poisoned by `poison` (a Lua error), counted by reason so a
@@ -227,8 +228,8 @@ impl<'a, D: Domain> Interp<'a, D> {
     }
 
     fn intern_body(&mut self, b: &'a ast::FunctionBody) -> BodyId {
-        // By POINTER: the AST outlives the interpreter and never moves.
-        let k = b as *const ast::FunctionBody;
+        // By ADDRESS: the AST outlives the interpreter and never moves.
+        let k = b as *const ast::FunctionBody as usize;
         if let Some(id) = self.body_ids.get(&k) {
             return *id;
         }
@@ -1945,26 +1946,17 @@ mod tests {
     use super::*;
     use crate::pico8_num::Pico8Num as P8;
     use crate::trace::domain::{Concrete, Symbolic};
-    use crate::trace::heap::Heap;
     use crate::transpile::graph::Op;
 
     fn parse(src: &str) -> full_moon::ast::Ast {
         full_moon::parse(src).expect("parse")
     }
 
-    fn fresh<D: Domain>(d: &mut D) -> State<D> {
-        let mut heap: Heap<D> = Heap::default();
-        let globals = heap.new_table();
-        let scope = heap.new_scope(None);
-        let t = d.boolean(true);
-        let f = d.boolean(false);
-        State { heap, globals, scope, stack: Vec::new(), guard: t, ended: f, path: Vec::new(), frag: Vec::new(), arc: None }
-    }
 
     /// Run `src` and read back the global `result`.
     fn run<'a, D: Domain>(d: D, ast: &'a full_moon::ast::Ast) -> (Interp<'a, D>, Value<D>) {
         let mut it = Interp::new(d);
-        let st = fresh::<D>(&mut it.d);
+        let st = State::new(&mut it.d);
         let out = it.exec_block(ast.nodes(), st).expect("exec");
         assert_eq!(out.len(), 1, "expected one outcome");
         let s = &out[0].0;
@@ -2029,7 +2021,7 @@ mod tests {
         let mut d = Symbolic::<celeste_core::arith::Fixed>::default();
         let sym = d.graph.leaf(Op::Cell(1));
         let mut it = Interp::new(d);
-        let mut st = fresh::<Symbolic>(&mut it.d);
+        let mut st = State::new(&mut it.d);
         let g = st.globals;
         st.heap.tables.get_mut(&g).unwrap().hash.insert("input".into(), Value::Num(sym));
 
@@ -2067,7 +2059,7 @@ mod tests {
         d.forget_intervals();
         let sym = d.graph.leaf(Op::Cell(1));
         let mut it = Interp::new(d);
-        let mut st = fresh::<Symbolic>(&mut it.d);
+        let mut st = State::new(&mut it.d);
         let g = st.globals;
         st.heap.tables.get_mut(&g).unwrap().hash.insert("input".into(), Value::Num(sym));
 
@@ -2102,7 +2094,7 @@ mod tests {
         let mut d = Symbolic::<celeste_core::arith::Fixed>::default();
         let sym = d.graph.leaf(Op::Cell(1));
         let mut it = Interp::new(d);
-        let mut st = fresh::<Symbolic>(&mut it.d);
+        let mut st = State::new(&mut it.d);
         let g = st.globals;
         st.heap.tables.get_mut(&g).unwrap().hash.insert("input".into(), Value::Num(sym));
 
@@ -2140,7 +2132,7 @@ mod tests {
         // The literal [-4, 1): the fruit's `rem.y + spd.y`.
         let input = d.graph.leaf(Op::Const(-4 << 16, (1 << 16) - 1));
         let mut it = Interp::new(d);
-        let mut st = fresh::<Symbolic>(&mut it.d);
+        let mut st = State::new(&mut it.d);
         let g = st.globals;
         let globals = &mut st.heap.tables.get_mut(&g).unwrap().hash;
         globals.insert("input".into(), Value::Num(input));
@@ -2171,7 +2163,7 @@ mod tests {
         fn refused<D: Domain>(d: D, src: &str) -> Result<()> {
             let ast = parse(src);
             let mut it = Interp::new(d);
-            let mut st = fresh::<D>(&mut it.d);
+            let mut st = State::new(&mut it.d);
             let g = st.globals;
             st.heap.tables.get_mut(&g).unwrap().hash.insert("abs".into(), Value::Builtin("abs"));
             it.exec_block(ast.nodes(), st).map(|_| ())
@@ -2200,7 +2192,7 @@ mod tests {
         // One step inside: exact.
         let ast = parse("x = 32766.99998 + 1\n y = -32767 - 1\n z = 181 * 181");
         let mut it = Interp::new(Symbolic::<celeste_core::arith::Fixed>::default());
-        let st = fresh::<Symbolic>(&mut it.d);
+        let st = State::new(&mut it.d);
         let out = it.exec_block(ast.nodes(), st).expect("in range");
         let s = &out[0].0;
         let num = |k: &str| match s.heap.tables[&s.globals].hash[k].clone() {
@@ -2218,7 +2210,7 @@ mod tests {
         d.level.fruit = true;
         let input = d.graph.leaf(Op::Const(0, (300 << 16) - 1));
         let mut it = Interp::new(d);
-        let mut st = fresh::<Symbolic>(&mut it.d);
+        let mut st = State::new(&mut it.d);
         let g = st.globals;
         let globals = &mut st.heap.tables.get_mut(&g).unwrap().hash;
         globals.insert("input".into(), Value::Num(input));
