@@ -13,7 +13,10 @@
 
 use anyhow::{anyhow, bail, Result};
 
+use celeste_core::arith::EngineNum;
 use celeste_engine::runtime2::{Cell2, Rt2};
+
+use crate::transpile::garith::GraphArith;
 use celeste_engine::slots;
 
 use super::iface::{show, Path, Step};
@@ -31,11 +34,11 @@ fn steps(p: &[Step]) -> Vec<slots::PathStep> {
 }
 
 /// The canonical cell id a traced path names in this block.
-pub fn resolve(rt2: &Rt2, p: &[Step]) -> Result<u32> {
+pub fn resolve<N: EngineNum>(rt2: &Rt2<N>, p: &[Step]) -> Result<u32> {
     slots::resolve_steps(rt2, &steps(p)).map_err(|e| anyhow!("{}", e))
 }
 
-fn kind(c: &Cell2) -> &'static str {
+fn kind<N: EngineNum>(c: &Cell2<N>) -> &'static str {
     match c {
         Cell2::Val => "value",
         Cell2::Obj(_) => "object",
@@ -48,8 +51,8 @@ fn kind(c: &Cell2) -> &'static str {
 
 /// How the first root that reaches `target` does so, as a chain of ops:
 /// so an error names a path instead of a node id.
-fn why_reached(
-    g: &crate::transpile::graph::Graph,
+fn why_reached<A: GraphArith>(
+    g: &crate::transpile::graph::Graph<A>,
     roots: &[crate::transpile::graph::NodeId],
     target: crate::transpile::graph::NodeId,
 ) -> String {
@@ -95,11 +98,11 @@ fn why_reached(
 /// order (its evaluator indexes them so); the emitter needs the engine's
 /// sparse canonical ids. `canon` must be INJECTIVE (checked), or two input
 /// slots silently become one cell.
-pub fn renumber_cells(
-    g: &crate::transpile::graph::Graph,
+pub fn renumber_cells<A: GraphArith>(
+    g: &crate::transpile::graph::Graph<A>,
     canon: &[u32],
     roots: &[crate::transpile::graph::NodeId],
-) -> Result<(crate::transpile::graph::Graph, Vec<crate::transpile::graph::NodeId>)> {
+) -> Result<(crate::transpile::graph::Graph<A>, Vec<crate::transpile::graph::NodeId>)> {
     use crate::transpile::graph::{NodeId, Op};
     let mut seen: std::collections::HashMap<u32, usize> = Default::default();
     for (i, c) in canon.iter().enumerate() {
@@ -163,7 +166,7 @@ pub fn renumber_cells(
 ///
 /// Inputs only: an outcome that allocates names cells the input block does
 /// not have, so outputs bind against their own shape (`block::skeleton`).
-pub fn bind_inputs(rt2: &Rt2, iface: &super::iface::Iface) -> Result<Vec<u32>> {
+pub fn bind_inputs<N: EngineNum, A: GraphArith>(rt2: &Rt2<N>, iface: &super::iface::Iface<A>) -> Result<Vec<u32>> {
     resolve_all(rt2, &iface.slots)
 }
 
@@ -173,7 +176,7 @@ pub fn bind_inputs(rt2: &Rt2, iface: &super::iface::Iface) -> Result<Vec<u32>> {
 /// Two paths sharing a cell would mean two outputs written to one column,
 /// a silently well-formed wrong block. `iface::scalars` yields one path per
 /// distinct slot, so a collision is a bug in the structure.
-pub fn resolve_all(rt2: &Rt2, paths: &[Path]) -> Result<Vec<u32>> {
+pub fn resolve_all<N: EngineNum>(rt2: &Rt2<N>, paths: &[Path]) -> Result<Vec<u32>> {
     let cells: Vec<u32> = paths
         .iter()
         .map(|p| resolve(rt2, p).map_err(|e| anyhow!("{}: {:#}", show(p), e)))
@@ -340,7 +343,7 @@ mod tests {
             st = run_one(&mut it, &frame, st).expect("warm-up");
         }
 
-        let rt2 = crate::trace::block::skeleton(&st, cd, cache).expect("structure");
+        let rt2: Rt2 = crate::trace::block::skeleton(&st, cd, cache).expect("structure");
         let mut seen: std::collections::HashMap<u32, Path> = Default::default();
         let (mut ok, mut unnameable) = (0usize, 0usize);
         for p in crate::trace::iface::scalars(&st, &[]).expect("scalars") {

@@ -18,8 +18,7 @@ use std::collections::HashMap;
 
 use anyhow::Result;
 
-use crate::pico8_num::{Pico8Num, Pico8NumInterval};
-
+use super::garith::GraphArith;
 use super::graph::{Graph, NodeId, Op, Room, Val};
 
 /// The sentinel `simplify` uses for "this node was not reachable".
@@ -40,7 +39,7 @@ pub struct Stats {
 ///
 /// Returns the new graph, a FULL-length node map (`UNREACHABLE` where a
 /// node was not reached), and what it found.
-pub fn fold(g: &Graph, roots: &[NodeId], room: Option<&Room>) -> Result<(Graph, Vec<NodeId>, Stats)> {
+pub fn fold<A: GraphArith>(g: &Graph<A>, roots: &[NodeId], room: Option<&Room>) -> Result<(Graph<A>, Vec<NodeId>, Stats)> {
     let mut out = g.like();
     let (map, st) = fold_into(g, roots, room, &mut out)?;
     Ok((out, map, st))
@@ -49,12 +48,9 @@ pub fn fold(g: &Graph, roots: &[NodeId], room: Option<&Room>) -> Result<(Graph, 
 /// Every input cell at its weakest value - a bool cell unknown, a number
 /// cell the full range (a bounded input's range is its `Op::Restrict`'s).
 /// The kind is the graph's (`Graph::cell_kind`, recorded at `symbolize`).
-pub(crate) fn seed_cells(g: &Graph) -> HashMap<u32, Val> {
-    let full = Val::Num(Pico8NumInterval::new(
-        Pico8Num::from_raw(i32::MIN),
-        Pico8Num::from_raw(i32::MAX),
-    ));
-    let mut cells: HashMap<u32, Val> = HashMap::new();
+pub(crate) fn seed_cells<A: GraphArith>(g: &Graph<A>) -> HashMap<u32, Val<A>> {
+    let full = Val::Num(A::unknown());
+    let mut cells: HashMap<u32, Val<A>> = HashMap::new();
     for id in 0..g.len() {
         if let Op::Cell(c) = g.get(id as NodeId).op {
             let v = if g.cell_kind(c) == super::graph::CellKind::Bool { Val::Bool(None) } else { full };
@@ -68,11 +64,11 @@ pub(crate) fn seed_cells(g: &Graph) -> HashMap<u32, Val> {
 /// hash-consed arena, so equal results are the same node. A bounded input's
 /// range comes from its `Op::Restrict`, never from a seed: a fact assumed
 /// here would be checked nowhere.
-pub fn fold_into(
-    g: &Graph,
+pub fn fold_into<A: GraphArith>(
+    g: &Graph<A>,
     roots: &[NodeId],
     room: Option<&Room>,
-    out: &mut Graph,
+    out: &mut Graph<A>,
 ) -> Result<(Vec<NodeId>, Stats)> {
     let need = super::bdd::reachable(g, roots);
     let cells = seed_cells(g);
@@ -95,9 +91,9 @@ pub fn fold_into(
                 st.bools += 1;
                 out.leaf(Op::ConstBool(b))
             }
-            Val::Num(i) if i.to_number().is_some() && !matches!(node.op, Op::Const(..)) => {
+            Val::Num(i) if A::as_point(i).is_some() && !matches!(node.op, Op::Const(..)) => {
                 st.nums += 1;
-                let raw = i.to_number().unwrap().as_raw_u32() as i32;
+                let raw = A::lit(A::as_point(i).expect("guarded above"));
                 out.leaf(Op::Const(raw, raw))
             }
             _ => {
@@ -114,6 +110,7 @@ pub fn fold_into(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::pico8_num::Pico8Num;
 
     /// `abs` is non-negative, so a comparison of it against zero is not a free
     /// variable however opaque its operand is.

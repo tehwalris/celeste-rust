@@ -10,7 +10,9 @@ use std::collections::BTreeSet;
 
 use anyhow::{anyhow, bail, Result};
 
-use crate::pico8_num::Pico8Num as P8;
+use celeste_core::arith::Fixed;
+
+use crate::transpile::garith::GraphArith;
 use crate::transpile::graph::Op;
 
 use super::domain::{Domain, Symbolic};
@@ -56,8 +58,8 @@ pub fn key(k: &str) -> Step {
 
 /// A scalar outside any domain: what a slot concretely holds.
 #[derive(Clone, Copy, PartialEq, Debug)]
-pub enum Conc {
-    Num(P8),
+pub enum Conc<A: GraphArith = Fixed> {
+    Num(A::Num),
     Bool(bool),
 }
 
@@ -151,10 +153,10 @@ fn collect<D: Domain>(
 ///
 /// `pins`: `(cell index, value)` for inputs BAKED INTO the body. The cell is
 /// still an input, read only by its `Op::Pin` check (`error::pins_hold`).
-pub struct Iface {
+pub struct Iface<A: GraphArith = Fixed> {
     pub slots: Vec<Path>,
-    pub init: Vec<Conc>,
-    pub pins: Vec<(usize, Conc)>,
+    pub init: Vec<Conc<A>>,
+    pub pins: Vec<(usize, Conc<A>)>,
     /// Parallel to `slots`: a number slot holds an INTERVAL (the widened
     /// fields; `init` still records a point), which the emitter makes an
     /// `ival` input. A boolean slot may be unknown in a lane (a near level's
@@ -172,13 +174,13 @@ pub struct Iface {
 /// `pin` holds slots at the CALLER's value instead of reading a cell, so the
 /// trace folds through the constant. A pinned slot is still an input cell,
 /// read only by its `Op::Pin` (`trace_frame`), whose check is the assumption.
-pub fn symbolize(
-    d: &mut Symbolic,
-    st: &mut State<Symbolic>,
+pub fn symbolize<A: GraphArith>(
+    d: &mut Symbolic<A>,
+    st: &mut State<Symbolic<A>>,
     roots: &[Path],
-    pin: &[(Path, Conc)],
+    pin: &[(Path, Conc<A>)],
     ival: &[Path],
-) -> Result<Iface> {
+) -> Result<Iface<A>> {
     let mut slots: Vec<Path> = Vec::new();
     for r in roots {
         for p in scalars(st, r)? {
@@ -187,7 +189,7 @@ pub fn symbolize(
             }
         }
     }
-    let mut pins: Vec<(usize, Conc)> = Vec::new();
+    let mut pins: Vec<(usize, Conc<A>)> = Vec::new();
     for (p, c) in pin {
         let i = slots
             .iter()
@@ -202,7 +204,7 @@ pub fn symbolize(
     for (i, p) in slots.iter().enumerate() {
         let pinned = pins.iter().find(|(j, _)| *j == i).map(|(_, c)| *c);
         let cell = d.graph.leaf(Op::Cell(i as u32));
-        let held = match get(st, p).unwrap() {
+        let held: Conc<A> = match get(st, p).unwrap() {
             Value::Num(n) => Conc::Num(
                 d.as_const(&n)
                     .ok_or_else(|| anyhow!("{} was already symbolic", show(p)))?,
@@ -252,7 +254,7 @@ pub fn symbolize(
 
 /// Read every scalar under `root` as a CONCRETE value (the oracle side of the
 /// differential check). A slot that stayed symbolic is an error, never skipped.
-pub fn read_concrete(d: &Symbolic, st: &State<Symbolic>, root: &[Step]) -> Result<Vec<(Path, Conc)>> {
+pub fn read_concrete<A: GraphArith>(d: &Symbolic<A>, st: &State<Symbolic<A>>, root: &[Step]) -> Result<Vec<(Path, Conc<A>)>> {
     let mut out = Vec::new();
     for p in scalars(st, root)? {
         let c = match get(st, &p).unwrap() {

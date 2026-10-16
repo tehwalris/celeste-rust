@@ -13,8 +13,9 @@
 //! |---|---|---|
 //! | `Flr(x)`, `x` a set not within one integer | `not Known(Flr(x))` | the kernel floors the low end (`zi_flr_ok` is the test) |
 //! | a fork's fragment (`Split`, `SplitInt`) of a set | not covered: `not SplitOk(ways)` | a lane spanning more parts than are enumerated has none to go to |
+//! | a round fork's fragment (`RSplit`, doubles) of a set | not covered: `not RSplitOk(ways)` | as `Split` |
 //! | `Sel(c, t, f)`, `c` lane-undecidable | `not Known(c)` | the kernel picks an arm by `c`'s value bit |
-//! | `Add`, `Sub`, `Neg`, `Abs`, `Mul`, `Div` of a point or an interval whose exact result the static ranges do not put inside the 16.16 range | `not NoWrap(op)` | the kernel computes the console's operation in i32 (an endpoint at a time): `+ - *` and negation wrap, `/` saturates, `abs` of MIN stays MIN; overflow is never expected in this game, so it is an ERROR, as the reference engine's (`refdomain`) |
+//! | an operation that can leave the arithmetic's range (`GraphArith::range_error`: 16.16's `Add`, `Sub`, `Neg`, `Abs`, `Mul`, `Div`; the doubles' `Add`, `Sub`, `Mul`, `Div`, `Rem`) of a point or an interval whose exact result the static ranges do not put inside it | `not NoWrap(op)` | 16.16: the kernel computes the console's operation in i32 (an endpoint at a time): `+ - *` and negation wrap, `/` saturates, `abs` of MIN stays MIN. Doubles: a result that is not finite (`%` by zero is NaN). Overflow is never expected in this game, so it is an ERROR, as the reference engine's (`refdomain`) |
 //! | `Restrict(lo, hi)(x)` | `Lo(x) < lo or Hi(x) > hi`, on the raw `x` | the body was specialized on the range: the static ranges folded comparisons with it |
 //!
 //! A RESTRICTION's own error is charged to EVERY outcome of the frame, not
@@ -38,7 +39,8 @@
 //!
 //! A PIN (`Pin(c)(x)`, the point assumption) has no data output: every use
 //! of its input reads the constant `c`, so nothing reaches the node and its
-//! check, `x == c` on the raw input, is the frame's own (`pins_hold`), ORed
+//! check, `x` is `c` on the raw input (`==`, or `Same` where `==` is not
+//! bit identity: a double's `-0 == 0`), is the frame's own (`pins_hold`), ORed
 //! into every outcome's error by `verify::trace_frame`. Charged once there
 //! rather than per outcome as a restriction is: the same lanes decline, and
 //! the kernels are smaller (the per-outcome form cost up to +0.3% dynamic
@@ -51,14 +53,15 @@
 use crate::transpile::graph::{NodeId, Op};
 
 use super::domain::Symbolic;
+use crate::transpile::garith::GraphArith;
 
 /// Every PIN of the frame holds (`Symbolic::pin`, in the order made): the
 /// conjunction of `x` inside `c` on the raw inputs; `true` without pins. Its
 /// negation is an error of the whole frame, never a guard: a disagreeing lane
 /// is real and must decline loudly.
-pub fn pins_hold(d: &mut Symbolic) -> NodeId {
+pub fn pins_hold<A: GraphArith>(d: &mut Symbolic<A>) -> NodeId {
     use crate::transpile::graph::Pinned;
-    let pins: Vec<(NodeId, Pinned)> = d
+    let pins: Vec<(NodeId, Pinned<A>)> = d
         .assumptions
         .iter()
         .filter_map(|a| match d.graph.get(*a).op {
@@ -71,7 +74,15 @@ pub fn pins_hold(d: &mut Symbolic) -> NodeId {
         let t = match c {
             Pinned::Num(v, w) if v == w => {
                 let k = d.graph.leaf(Op::Const(v, v));
-                d.graph.fold(Op::Eq, vec![x, k])
+                d.graph.fold(if A::EQ_IS_IDENTITY { Op::Eq } else { Op::Same }, vec![x, k])
+            }
+            // A literal interval where `==` is not identity: the very ends
+            // (the body computes with them), bit for bit.
+            Pinned::Num(lo, hi) if !A::EQ_IS_IDENTITY => {
+                let (klo, khi) = (d.graph.leaf(Op::Const(lo, lo)), d.graph.leaf(Op::Const(hi, hi)));
+                let (xlo, xhi) = (d.graph.fold(Op::Lo, vec![x]), d.graph.fold(Op::Hi, vec![x]));
+                let (a, b) = (d.graph.fold(Op::Same, vec![xlo, klo]), d.graph.fold(Op::Same, vec![xhi, khi]));
+                d.graph.fold(Op::And, vec![a, b])
             }
             // Inside a literal interval: both ends, on the raw input.
             Pinned::Num(lo, hi) => {
@@ -90,7 +101,7 @@ pub fn pins_hold(d: &mut Symbolic) -> NodeId {
 }
 
 /// The error of the values `roots` (`for_outcomes`, one outcome).
-pub fn of(d: &mut Symbolic, roots: &[NodeId]) -> NodeId {
+pub fn of<A: GraphArith>(d: &mut Symbolic<A>, roots: &[NodeId]) -> NodeId {
     for_outcomes(d, &[roots.to_vec()])[0]
 }
 
@@ -102,7 +113,7 @@ pub fn of(d: &mut Symbolic, roots: &[NodeId]) -> NodeId {
 /// One bottom-up pass for all outcomes: each node's set of sources below it,
 /// interned (most nodes share their operands' set). A cone walk per outcome
 /// would be outcomes x graph.
-pub fn for_outcomes(d: &mut Symbolic, outcomes: &[Vec<NodeId>]) -> Vec<NodeId> {
+pub fn for_outcomes<A: GraphArith>(d: &mut Symbolic<A>, outcomes: &[Vec<NodeId>]) -> Vec<NodeId> {
     let sites: Vec<NodeId> = d.evaluated.values().copied().collect();
     // Every outcome reads every restriction (the module doc); the pins are
     // charged once for the frame (`pins_hold`).
@@ -191,7 +202,7 @@ pub fn for_outcomes(d: &mut Symbolic, outcomes: &[Vec<NodeId>]) -> Vec<NodeId> {
 }
 
 /// `n`'s own error, where it has one.
-fn own_error(d: &mut Symbolic, n: NodeId) -> Option<NodeId> {
+fn own_error<A: GraphArith>(d: &mut Symbolic<A>, n: NodeId) -> Option<NodeId> {
     let node = d.graph.get(n);
     let (op, a) = (node.op.clone(), node.args.first().copied());
     // "Can a lane's value here be a SET?" assumes every other operator's own
@@ -206,6 +217,11 @@ fn own_error(d: &mut Symbolic, n: NodeId) -> Option<NodeId> {
             let covered = d.graph.fold(Op::SplitOk(ways), vec![a?]);
             d.graph.fold(Op::Not, vec![covered])
         }
+        Op::RSplit(k) if d.abstract_beneath_lane_ops(a?) => {
+            let ways = d.graph.fork_ways(k);
+            let covered = d.graph.fold(Op::RSplitOk(ways), vec![a?]);
+            d.graph.fold(Op::Not, vec![covered])
+        }
         // Only where a LANE can hold `c` both ways (`Symbolic::lane_undecidable`):
         // a condition the kernel decides per lane owns nothing.
         Op::Sel if d.lane_undecidable(a?) => undecided(d, a?),
@@ -216,7 +232,7 @@ fn own_error(d: &mut Symbolic, n: NodeId) -> Option<NodeId> {
         // result inside the 16.16 range; `NoWrap` folds to true where the
         // literal operand cannot overflow (`x * 0.5`, `x / 2`: `one_operand`)
         // and the lowering's interval fold decides it where the hulls do.
-        Op::Add | Op::Sub | Op::Neg | Op::Abs | Op::Mul | Op::Div if !d.bounded(n) => {
+        ref op if A::range_error(op) && !d.bounded(n) => {
             let fits = d.graph.fold(Op::NoWrap, vec![n]);
             d.graph.fold(Op::Not, vec![fits])
         }
@@ -239,18 +255,18 @@ fn own_error(d: &mut Symbolic, n: NodeId) -> Option<NodeId> {
 /// is exact by construction? True for a floor fork's fragment, a literal
 /// whose ends share a floor, a select of such values, and a value that is
 /// one number on the lane. Anything else is checked per lane.
-fn within_one_integer(d: &Symbolic, n: NodeId) -> bool {
+fn within_one_integer<A: GraphArith>(d: &Symbolic<A>, n: NodeId) -> bool {
     let node = d.graph.get(n);
     match node.op {
         Op::Split(_) => true,
-        Op::Const(lo, hi) => lo >> 16 == hi >> 16,
+        Op::Const(lo, hi) => A::num_eq(A::flr(A::from_lit(lo)), A::flr(A::from_lit(hi))),
         Op::Sel => within_one_integer(d, node.args[1]) && within_one_integer(d, node.args[2]),
         _ => !d.abstract_beneath_lane_ops(n),
     }
 }
 
 /// `not Known(b)`: the lane holds `b` undecided.
-fn undecided(d: &mut Symbolic, b: NodeId) -> NodeId {
+fn undecided<A: GraphArith>(d: &mut Symbolic<A>, b: NodeId) -> NodeId {
     let k = d.graph.fold(Op::Known, vec![b]);
     d.graph.fold(Op::Not, vec![k])
 }

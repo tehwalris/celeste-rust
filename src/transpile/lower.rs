@@ -128,7 +128,7 @@ pub(crate) fn specialize_frame(
         let mut forks: std::collections::BTreeSet<u8> = Default::default();
         for (i, n) in need.iter().enumerate() {
             if *n {
-                if let Op::Split(d) | Op::SplitValid(d) | Op::SplitInt(d) = graph.get(i as NodeId).op {
+                if let Op::Split(d) | Op::SplitValid(d) | Op::SplitInt(d) | Op::RSplit(d) | Op::RSplitValid(d) = graph.get(i as NodeId).op {
                     forks.insert(d);
                 }
             }
@@ -165,7 +165,7 @@ pub(crate) fn specialize_frame(
         let validity_read: std::collections::BTreeSet<u8> = (0..graph.len())
             .filter(|&n| need[n])
             .filter_map(|n| match graph.get(n as NodeId).op {
-                Op::SplitValid(d) => Some(d),
+                Op::SplitValid(d) | Op::RSplitValid(d) => Some(d),
                 _ => None,
             })
             .collect();

@@ -679,7 +679,7 @@ fn span<N: Copy>(v: AV<N>) -> Option<(N, N)> {
 
 /// A table constant (raw 16.16) in arithmetic `N`, exactly (every 16.16
 /// value is a double).
-fn constant<N: EngineNum>(raw: i32) -> N {
+pub fn constant<N: EngineNum>(raw: i32) -> N {
     <N::A as Arithmetic>::from_fixed_raw(raw)
 }
 
@@ -687,7 +687,7 @@ fn constant<N: EngineNum>(raw: i32) -> N {
 /// [-1/2, 1/2): its last value is the arithmetic's last below 1/2 (16.16's
 /// `1/2 - 2^-16`, a double's `pred(1/2)`); every other range is its
 /// inclusive ends.
-fn range<N: EngineNum>(lo: i32, hi: i32) -> (N, N) {
+pub fn range<N: EngineNum>(lo: i32, hi: i32) -> (N, N) {
     if (lo, hi) == REM {
         let half = constant::<N>(REM.1 + 1);
         (constant(lo), <N::A as Arithmetic>::below(half).expect("a value below 1/2"))
@@ -815,8 +815,9 @@ impl<N: EngineNum> Rt2<N> {
             }
             Stored::AtLeast(k) => {
                 let k = constant::<N>(k);
-                // `max(v, k)`: v unless it is below k (the cart's max).
-                let max = |n: N| if <N::A as Arithmetic>::lt(n, k) { k } else { n };
+                // `max(v, k)`, the cart's (`trace::widen` bakes `Op::Max(v,
+                // k)`; a double's tie, `-0` against `0`, gives `k`).
+                let max = |n: N| <N::A as Arithmetic>::max(n, k);
                 let at_least = |v: AV<N>| match v {
                     AV::Num(n) => AV::Num(max(n)),
                     AV::Ival(a, b) => AV::Ival(max(a), max(b)),

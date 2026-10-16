@@ -186,6 +186,26 @@ pub enum Op<A: Arithmetic = Fixed> {
     // ---- cart lookups ----
     Mget,
     TileFlagAt,
+
+    // ---- the round fork, where `x + 1/2` rounds (doubles) ----
+    /// `RSplit(d)`: the operand RESTRICTED to fork d's outcome in the ROUND
+    /// partition: fragment `c` is where `flr(x + 1/2)` takes the `c`-th
+    /// value from the low end's, cut at the arithmetic's exact points
+    /// (`Arithmetic::round_fragment`). Eliminated by specialization. 16.16
+    /// never makes one: its round fork is the floor fork of `x + 1/2`,
+    /// shifted back exactly.
+    RSplit(u8),
+    /// `SplitValid`'s twin: which lanes fall in the chosen fragment.
+    RSplitValid(u8),
+    /// `RSplit(d)` specialized: `Frag`/`FragOk`'s twins.
+    RFrag(u8),
+    RFragOk(u8),
+    /// `SplitOk`'s twin: does this lane's interval take at most `n` values
+    /// of `flr(x + 1/2)` (the arity)? Otherwise the lane declines.
+    RSplitOk(u8),
+    /// `Same(x, y)`: are two numbers the same BITS? A pin's check where the
+    /// cart's `==` is not identity (a double's `-0 == 0`).
+    Same,
 }
 
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
@@ -329,6 +349,9 @@ impl<A: GraphArith> Graph<A> {
                 Op::SplitValid(d) if s[d as usize] != OPEN && s[d as usize] & ANY_VALID != 0 => out.leaf(Op::ConstBool(true)),
                 Op::SplitValid(d) if s[d as usize] != OPEN => out.fold(Op::FragOk(s[d as usize]), vec![arg(&map, 0)]),
                 Op::SplitInt(d) if s[d as usize] != OPEN => out.fold(Op::IntFrag(s[d as usize] & !ANY_VALID), vec![arg(&map, 0)]),
+                Op::RSplit(d) if s[d as usize] != OPEN => out.fold(Op::RFrag(s[d as usize] & !ANY_VALID), vec![arg(&map, 0)]),
+                Op::RSplitValid(d) if s[d as usize] != OPEN && s[d as usize] & ANY_VALID != 0 => out.leaf(Op::ConstBool(true)),
+                Op::RSplitValid(d) if s[d as usize] != OPEN => out.fold(Op::RFragOk(s[d as usize]), vec![arg(&map, 0)]),
                 _ => {
                     let args: Vec<NodeId> =
                         node.args.iter().map(|a| map[*a as usize]).collect();
@@ -374,11 +397,28 @@ impl<A: GraphArith> Graph<A> {
         match op {
             // Fragment 0 is never empty, so `FragOk(0)` is true (as in `eval`),
             // making configuration 0 as cheap as no fork.
-            Op::FragOk(0) => return self.leaf(Op::ConstBool(true)),
+            Op::FragOk(0) | Op::RFragOk(0) => return self.leaf(Op::ConstBool(true)),
             // The span premise over a LITERAL is decided once (`zi_span_ok`).
             Op::SplitOk(n) => {
                 if let Op::Const(lo, hi) = self.nodes[args[0] as usize].op {
                     return self.leaf(Op::ConstBool(A::lit_split_ok(lo, hi, n)));
+                }
+            }
+            Op::RSplitOk(n) => {
+                if let Op::Const(lo, hi) = self.nodes[args[0] as usize].op {
+                    if let Some(k) = round_count::<A>(A::ival(A::from_lit(lo), A::from_lit(hi))) {
+                        return self.leaf(Op::ConstBool(k <= n as u32));
+                    }
+                }
+            }
+            // Two literal points are the same bits or not.
+            Op::Same => {
+                let point = |g: &Graph<A>, i: usize| match g.nodes[args[i] as usize].op {
+                    Op::Const(lo, hi) if lo == hi => Some(A::from_lit(lo)),
+                    _ => None,
+                };
+                if let (Some(x), Some(y)) = (point(self, 0), point(self, 1)) {
+                    return self.leaf(Op::ConstBool(A::bits(x) == A::bits(y)));
                 }
             }
             // `IntFrag(c)` of a literal is a constant (as in `eval`): buttons
@@ -704,9 +744,56 @@ impl<A: GraphArith> Graph<A> {
                     let _ = d;
                     a!(0)
                 }
-                Op::SplitInt(_) if lenient => a!(0),
-                Op::Split(d) | Op::SplitValid(d) | Op::SplitInt(d) => {
+                Op::SplitInt(_) | Op::RSplit(_) if lenient => a!(0),
+                Op::Split(d) | Op::SplitValid(d) | Op::SplitInt(d) | Op::RSplit(d) | Op::RSplitValid(d) => {
                     bail!("node {}: split {} has no value outside an outcome", i, d)
+                }
+                // `SplitOk`'s twin over the values of `flr(x + 1/2)`.
+                Op::RSplitOk(ways) => {
+                    let iv = a!(0).as_num("RSplitOk")?;
+                    if round_count::<A>(iv).is_some_and(|k| k <= *ways as u32) {
+                        Val::Bool(Some(true))
+                    } else if !strict_err {
+                        Val::Bool(None)
+                    } else {
+                        bail!("node {}: RSplitOk of an interval that may not fit", i)
+                    }
+                }
+                // The RESOLVED round fork, as `Frag`/`FragOk` (`ev` below).
+                Op::RFrag(c) | Op::RFragOk(c) => {
+                    let iv = a!(0).as_num("RFrag")?;
+                    // Values taken minus one (past 65536: every fragment).
+                    let n = round_count::<A>(iv).map_or(i64::MAX, |k| k as i64 - 1);
+                    let c = *c as i64;
+                    if lenient {
+                        return Ok(match (&node.op, c) {
+                            (Op::RFrag(_), _) => a!(0),
+                            (_, 0) => Val::Bool(Some(true)),
+                            _ if n < c => Val::Bool(Some(false)),
+                            _ => Val::Bool(None),
+                        });
+                    }
+                    let valid = n >= c;
+                    match &node.op {
+                        Op::RFrag(_) if valid => Val::Num(A::round_fragment(iv, c as u32)?),
+                        Op::RFrag(_) => a!(0),
+                        _ => Val::Bool(Some(valid)),
+                    }
+                }
+                // Bits: decided only on two points, or two values apart.
+                Op::Same => {
+                    let (x, y) = (a!(0).as_num("Same")?, a!(1).as_num("Same")?);
+                    match (A::as_point(x), A::as_point(y)) {
+                        (Some(p), Some(q)) => Val::Bool(Some(A::bits(p) == A::bits(q))),
+                        _ => {
+                            let ((xl, xh), (yl, yh)) = (A::bounds(x), A::bounds(y));
+                            if A::lt(xh, yl) || A::lt(yh, xl) {
+                                Val::Bool(Some(false))
+                            } else {
+                                Val::Bool(None)
+                            }
+                        }
+                    }
                 }
                 // ONE lane's end, over the lanes: anywhere in the hull (except a
                 // span's or a literal's). Never the hull's end as a point, or
@@ -748,6 +835,12 @@ impl<A: GraphArith> Graph<A> {
                         Op::Div => A::ival_div(arg(0)?, arg(1)?).is_some(),
                         Op::Neg => A::ival_neg(arg(0)?).is_some(),
                         Op::Abs => A::ival_abs(arg(0)?).is_some(),
+                        // `%` (a double's own error, `GraphArith::range_error`):
+                        // on points only.
+                        Op::Rem => match (A::as_point(arg(0)?), A::as_point(arg(1)?)) {
+                            (Some(p), Some(q)) => A::rem(p, q).is_some(),
+                            _ => bail!("node {}: NoWrap of `%` over an interval is not modelled", i),
+                        },
                         _ => true,
                     };
                     Val::Bool(if fits || !lenient { Some(fits) } else { None })
@@ -910,6 +1003,10 @@ impl<A: GraphArith> Graph<A> {
             | Op::SplitOk(_)
             | Op::NoWrap
             | Op::FragOk(_)
+            | Op::RSplitValid(_)
+            | Op::RSplitOk(_)
+            | Op::RFragOk(_)
+            | Op::Same
             | Op::Lt
             | Op::Le
             | Op::Gt
@@ -1662,6 +1759,11 @@ mod tests {
         let (out, map, _) = crate::transpile::ival::fold(&g, &[le_r], None).expect("fold");
         assert_eq!(out.get(map[le_r as usize]).op, Op::Le, "the fold leaves it to the lanes");
     }
+}
+
+/// How many values `flr(x + 1/2)` takes over `iv` (`None`: past 65536).
+fn round_count<A: Arithmetic>(iv: A::Ival) -> Option<u32> {
+    A::rounds(iv).ok().flatten()
 }
 
 /// `Graph::fold`'s literal arithmetic: the exact result, or a panic naming

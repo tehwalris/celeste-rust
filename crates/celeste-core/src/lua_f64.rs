@@ -275,10 +275,13 @@ impl LuaF64Interval {
     }
 
     /// The four corner products, each rounded: rounding is monotone, and on
-    /// a box the exact product's extremes are corners.
+    /// a box the exact product's extremes are corners. The ends are the
+    /// least and the most corner in the TOTAL order (`-0` below `0`):
+    /// deterministic, so the kernels compute the same bits (`f64::min` may
+    /// return either zero).
     pub fn checked_mul(self, b: Self) -> Option<Self> {
         let c = [self.lo.0 * b.lo.0, self.lo.0 * b.hi.0, self.hi.0 * b.lo.0, self.hi.0 * b.hi.0];
-        Self::of(c.iter().copied().fold(f64::INFINITY, f64::min), c.iter().copied().fold(f64::NEG_INFINITY, f64::max))
+        Self::of(least(c), most(c))
     }
 
     /// `None` where the divisor's interval holds 0 (of either sign).
@@ -287,7 +290,7 @@ impl LuaF64Interval {
             return None;
         }
         let c = [self.lo.0 / b.lo.0, self.lo.0 / b.hi.0, self.hi.0 / b.lo.0, self.hi.0 / b.hi.0];
-        Self::of(c.iter().copied().fold(f64::INFINITY, f64::min), c.iter().copied().fold(f64::NEG_INFINITY, f64::max))
+        Self::of(least(c), most(c))
     }
 
     pub fn neg(self) -> Self {
@@ -354,6 +357,16 @@ impl LuaF64Interval {
         let (lo, hi) = (Self::round_cut(t)?, Self::round_cut(t + 1.0)?.next_down());
         Ok(Self { lo: self.lo.lua_max(LuaF64(lo)), hi: self.hi.lua_min(LuaF64(hi)) })
     }
+}
+
+/// The least corner in the total order (`f64::total_cmp`: `-0` below `0`).
+fn least(c: [f64; 4]) -> f64 {
+    c.into_iter().fold(f64::INFINITY, |a, b| if b.total_cmp(&a).is_lt() { b } else { a })
+}
+
+/// The most corner in the total order.
+fn most(c: [f64; 4]) -> f64 {
+    c.into_iter().fold(f64::NEG_INFINITY, |a, b| if b.total_cmp(&a).is_gt() { b } else { a })
 }
 
 #[cfg(test)]
@@ -426,6 +439,23 @@ mod tests {
         assert_eq!(big.checked_mul(n(2.0)), None);
         assert_eq!(n(1.0).checked_div(n(0.0)), None);
         assert_eq!(LuaF64::new(f64::NAN), None);
+    }
+
+    /// A product's or quotient's ends are its least and most corner in the
+    /// TOTAL order, so a zero end has a definite sign: `[-1, 1] * [0, 0]`
+    /// holds both zeros and is `[-0, 0]`, whatever `f64::min` would pick.
+    #[test]
+    fn corner_ends_are_deterministic_at_zero() {
+        let i = |a: f64, b: f64| LuaF64Interval::new(n(a), n(b));
+        let m = i(-1.0, 1.0).checked_mul(i(0.0, 0.0)).unwrap();
+        assert_eq!((m.lo.0.to_bits(), m.hi.0.to_bits()), ((-0.0f64).to_bits(), 0.0f64.to_bits()));
+        let m = i(0.0, 0.0).checked_mul(i(-2.0, -1.0)).unwrap();
+        assert_eq!((m.lo.0.to_bits(), m.hi.0.to_bits()), ((-0.0f64).to_bits(), (-0.0f64).to_bits()));
+        let q = i(-0.0, 0.0).checked_div(i(2.0, 4.0)).unwrap();
+        assert_eq!((q.lo.0.to_bits(), q.hi.0.to_bits()), ((-0.0f64).to_bits(), 0.0f64.to_bits()));
+        // Points are the IEEE result itself.
+        let p = i(-3.0, -3.0).checked_mul(i(0.0, 0.0)).unwrap();
+        assert_eq!(p.as_point().map(|v| v.0.to_bits()), Some((-0.0f64).to_bits()));
     }
 
     /// The round split's cuts are where `flr(x + 1/2)` really changes:

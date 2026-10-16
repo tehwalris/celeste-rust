@@ -257,7 +257,7 @@ pub fn field_constants(st: &State<Symbolic>, d: &Symbolic, opts: &crate::abstrac
 
 /// The path of the player INSTANCE in `objects` (the entry whose `type`
 /// is the `player` global), if the state has one.
-pub fn player_path(st: &State<Symbolic>) -> Option<Path> {
+pub fn player_path<D: Domain>(st: &State<D>) -> Option<Path> {
     let Value::Table(want) = iface::get(st, &[iface::key("player")])? else { return None };
     let Value::Table(objects) = iface::get(st, &[iface::key("objects")])? else { return None };
     let n = st.heap.tables[&objects].arr.len();

@@ -14,35 +14,35 @@ use anyhow::{anyhow, bail, Result};
 use celeste_core::cart_data::CartData;
 use celeste_core::collision_cache::CollisionCache;
 
-use crate::pico8_num::Pico8Num as P8;
+use crate::transpile::garith::GraphArith;
 use crate::transpile::graph::{Graph, NodeId, Op};
 
 use super::domain::{Arith, Cmp, Concrete, Domain, Fun1, Fun2};
 use super::iface::Conc;
 
 /// What the leaves stand for.
-pub struct Env<'a> {
+pub struct Env<'a, A: GraphArith = celeste_core::arith::Fixed> {
     /// `Op::Cell(i)` - the frame's input slots, in `Iface` order.
-    pub cells: &'a [Conc],
+    pub cells: &'a [Conc<A>],
     pub cart: Option<Arc<CartData>>,
     pub cache: Option<Arc<CollisionCache>>,
 }
 
-fn num(c: Conc) -> Result<P8> {
+fn num<A: GraphArith>(c: Conc<A>) -> Result<A::Num> {
     match c {
         Conc::Num(n) => Ok(n),
         Conc::Bool(b) => bail!("expected a number, got {}", b),
     }
 }
 
-fn boolean(c: Conc) -> Result<bool> {
+fn boolean<A: GraphArith>(c: Conc<A>) -> Result<bool> {
     match c {
         Conc::Bool(b) => Ok(b),
         Conc::Num(n) => bail!("expected a boolean, got {:?}", n),
     }
 }
 
-pub fn eval(g: &Graph, root: NodeId, env: &Env) -> Result<Conc> {
+pub fn eval<A: GraphArith>(g: &Graph<A>, root: NodeId, env: &Env<A>) -> Result<Conc<A>> {
     let n = root as usize + 1;
     let mut need = vec![false; n];
     need[root as usize] = true;
@@ -60,26 +60,26 @@ pub fn eval(g: &Graph, root: NodeId, env: &Env) -> Result<Conc> {
 
 /// One forward pass. `strict`: a node that cannot be evaluated is an error,
 /// else a `None` that propagates.
-fn run(g: &Graph, need: &[bool], env: &Env, strict: bool) -> Result<Vec<Option<Conc>>> {
+fn run<A: GraphArith>(g: &Graph<A>, need: &[bool], env: &Env<A>, strict: bool) -> Result<Vec<Option<Conc<A>>>> {
     let n = need.len();
-    let mut val: Vec<Option<Conc>> = vec![None; n];
-    let mut c = Concrete::<celeste_core::arith::Fixed>::default();
+    let mut val: Vec<Option<Conc<A>>> = vec![None; n];
+    let mut c = Concrete::<A>::default();
     for id in 0..n {
         if !need[id] {
             continue;
         }
         let node = g.get(id as NodeId);
-        let a = |i: usize| -> Result<Conc> {
+        let a = |i: usize| -> Result<Conc<A>> {
             val[node.args[i] as usize]
                 .ok_or_else(|| anyhow!("operand {} of node {} was not evaluated", i, id))
         };
-        let one = || -> Result<Conc> {
+        let one = || -> Result<Conc<A>> {
         let v = match node.op {
             Op::Const(lo, hi) => {
                 if lo != hi {
-                    bail!("node {} is the interval [{}, {}], not a value", id, lo, hi);
+                    bail!("node {} is the interval [{:?}, {:?}], not a value", id, lo, hi);
                 }
-                Conc::Num(P8::from_raw(lo))
+                Conc::Num(A::from_lit(lo))
             }
             Op::ConstBool(b) => Conc::Bool(b),
             Op::UnknownNum | Op::UnknownBool(_) => bail!("node {} is an unknown, not a value", id),
@@ -128,6 +128,8 @@ fn run(g: &Graph, need: &[bool], env: &Env, strict: bool) -> Result<Vec<Option<C
                 };
                 Conc::Bool(c.compare(op, &num(a(0)?)?, &num(a(1)?)?)?)
             }
+            // Bit identity (a pin's check where `==` is not).
+            Op::Same => Conc::Bool(A::bits(num(a(0)?)?) == A::bits(num(a(1)?)?)),
             Op::Not => Conc::Bool(!boolean(a(0)?)?),
             Op::And => Conc::Bool(boolean(a(0)?)? && boolean(a(1)?)?),
             Op::Or => Conc::Bool(boolean(a(0)?)? || boolean(a(1)?)?),
@@ -144,12 +146,14 @@ fn run(g: &Graph, need: &[bool], env: &Env, strict: bool) -> Result<Vec<Option<C
             Op::Pin(_) => bail!("node {id}: a pin has no value (its uses read the constant)"),
             // Every leaf was substituted, so everything is determined.
             Op::Known => Conc::Bool(true),
-            // Concrete arithmetic wraps as PICO-8 does: never an interval.
+            // A concrete operation outside the arithmetic's range is an error
+            // of its own (`Concrete::arith`): never an interval.
             Op::NoWrap => Conc::Bool(true),
             Op::Mget => {
                 let cart = env.cart.clone().ok_or_else(|| anyhow!("mget: no cart"))?;
-                let t = cart.mget(num(a(0)?)?, num(a(1)?)?)?;
-                Conc::Num(P8::from_i16(t as i16))
+                let whole = |v: A::Num| A::as_i16(v).ok_or_else(|| anyhow!("mget: {} is not an integer", A::show(v)));
+                let t = cart.mget_whole(whole(num(a(0)?)?)?, whole(num(a(1)?)?)?);
+                Conc::Num(A::from_i16(t as i16))
             }
             Op::TileFlagAt => {
                 let cart = env.cart.clone().ok_or_else(|| anyhow!("tile_flag_at: no cart"))?;
@@ -157,7 +161,7 @@ fn run(g: &Graph, need: &[bool], env: &Env, strict: bool) -> Result<Vec<Option<C
                     .cache
                     .clone()
                     .ok_or_else(|| anyhow!("tile_flag_at: no collision cache"))?;
-                let gi = |v: P8| v.as_i16().ok_or_else(|| anyhow!("tile_flag_at: non-integer"));
+                let gi = |v: A::Num| A::as_i16(v).ok_or_else(|| anyhow!("tile_flag_at: non-integer"));
                 // Any flag (solid 0, ice 4); one no tile carries folds at trace time.
                 let r = cache.flag_at(
                     &cart,
@@ -172,6 +176,7 @@ fn run(g: &Graph, need: &[bool], env: &Env, strict: bool) -> Result<Vec<Option<C
             // A fork has no one value: resolve the configuration first
             // (`Graph::specialize_subset_into`).
             Op::Split(_) | Op::SplitValid(_) | Op::SplitInt(_) | Op::IntFrag(_) | Op::SplitOk(_) | Op::Frag(_) | Op::FragOk(_)
+            | Op::RSplit(_) | Op::RSplitValid(_) | Op::RFrag(_) | Op::RFragOk(_) | Op::RSplitOk(_)
             | Op::Lo | Op::Hi => {
                 bail!("node {} is {:?}: resolve the fork configuration before evaluating", id, node.op)
             }
@@ -190,12 +195,13 @@ fn run(g: &Graph, need: &[bool], env: &Env, strict: bool) -> Result<Vec<Option<C
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::pico8_num::Pico8Num as P8;
 
     #[test]
     fn it_evaluates_what_the_symbolic_domain_built() {
         // The same expression over cells (evaluated) and over constants
         // (folded by the domain) must agree.
-        let mut d = super::super::domain::Symbolic::default();
+        let mut d = super::super::domain::Symbolic::<celeste_core::arith::Fixed>::default();
         let three = P8::from_i16(3);
         let four = P8::from_i16(4);
         let (x, y) = (d.graph.leaf(Op::Cell(0)), d.graph.leaf(Op::Cell(1)));
@@ -214,7 +220,7 @@ mod tests {
 
     #[test]
     fn a_button_is_a_fork_evaluated_per_configuration() {
-        let mut d = super::super::domain::Symbolic::default();
+        let mut d = super::super::domain::Symbolic::<celeste_core::arith::Fixed>::default();
         let f = d.unknown_bool().unwrap();
         let (t, e) = (d.num(P8::from_i16(1)), d.num(P8::from_i16(0)));
         let out = d.sel_num(&f, &t, &e);

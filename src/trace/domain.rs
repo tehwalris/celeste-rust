@@ -53,6 +53,7 @@ pub enum Fun2 {
 pub enum ForkKind {
     Floors,
     Ints,
+    Rounds,
 }
 
 /// The origin of the forks `Domain::unknown_bool` mints: the six buttons, in
@@ -68,6 +69,10 @@ pub enum Partition {
     /// (`SplitInt` -> `IntFrag`). `memo` false keeps two forks of one node
     /// independent (`p_jump`/`p_dash` both fork `[0, 1<<16]`).
     Ints { ways: u8, memo: bool },
+    /// Cut an interval where `flr(x + 1/2)` changes, at the arithmetic's
+    /// exact cut points (`RSplit` -> `RFrag`): a double's round fork
+    /// (`Domain::fork_round`).
+    Rounds { ways: u8 },
 }
 
 impl Partition {
@@ -75,19 +80,20 @@ impl Partition {
         match self {
             Partition::Floors { .. } => ForkKind::Floors,
             Partition::Ints { .. } => ForkKind::Ints,
+            Partition::Rounds { .. } => ForkKind::Rounds,
         }
     }
 
     /// The fork's arity.
     fn ways(&self) -> u8 {
         match self {
-            Partition::Floors { ways } | Partition::Ints { ways, .. } => *ways,
+            Partition::Floors { ways } | Partition::Ints { ways, .. } | Partition::Rounds { ways } => *ways,
         }
     }
 
     fn memoized(&self) -> bool {
         match self {
-            Partition::Floors { .. } => true,
+            Partition::Floors { .. } | Partition::Rounds { .. } => true,
             Partition::Ints { memo, .. } => *memo,
         }
     }
@@ -198,10 +204,17 @@ pub trait Domain {
 
     /// Fork at `flr(x + 1/2)` (`__split_by_round`) in an arithmetic where
     /// the fragments are NOT the floor fork's of `x + 1/2` shifted back
-    /// (`Float`: `x + 1/2 - 1/2` rounds). The restricted value; the identity
-    /// on exact values. 16.16 shifts instead (`Interp`), exactly.
-    fn fork_round(&mut self, v: &Self::Num) -> Result<Self::Num> {
+    /// (`Float`: `x + 1/2 - 1/2` rounds): `fork_flr`'s twin, at the exact
+    /// cut points (`Arithmetic::round_fragment`). The restricted value and
+    /// which lanes fall in it; called on intervals only (`is_interval`).
+    /// 16.16 shifts instead (`Interp`), exactly.
+    fn fork_round(&mut self, v: &Self::Num, _ways: u8) -> Result<(Self::Num, Self::Bool)> {
         bail!("__split_by_round of {v:?}: this domain has no exact round fork")
+    }
+
+    /// The arity of `fork_round` on `v` (`flr_ways`' twin).
+    fn round_ways(&mut self, _v: &Self::Num) -> u8 {
+        MOVE_WAYS
     }
 
     /// `n`, an operator with an own error (`trace::error`), was computed
@@ -397,8 +410,8 @@ impl<A: Arithmetic> Domain for Concrete<A> {
     fn as_const(&self, v: &A::Num) -> Option<A::Num> {
         Some(*v)
     }
-    fn fork_round(&mut self, v: &A::Num) -> Result<A::Num> {
-        Ok(*v)
+    fn fork_round(&mut self, v: &A::Num, _ways: u8) -> Result<(A::Num, bool)> {
+        Ok((*v, true))
     }
 
     fn describe(&self, v: &A::Num) -> String {
@@ -536,6 +549,9 @@ impl<A: GraphArith> Symbolic<A> {
                 Op::Known => false,
                 // Validity/coverage masks: per-lane comparisons.
                 Op::SplitValid(_) | Op::SplitOk(_) | Op::FragOk(_) | Op::NoWrap => false,
+                Op::RSplitValid(_) | Op::RSplitOk(_) | Op::RFragOk(_) => false,
+                // A pin's check on the raw input.
+                Op::Same => false,
                 Op::ConstBool(_) => false,
                 // Not a condition.
                 _ => false,
@@ -563,7 +579,7 @@ impl<A: GraphArith> Symbolic<A> {
                 Op::Const(lo, hi) => lo != hi,
                 Op::Span => true,
                 Op::UnknownNum | Op::UnknownBool(_) => true,
-                Op::Split(_) | Op::Frag(_) => true,
+                Op::Split(_) | Op::Frag(_) | Op::RSplit(_) | Op::RFrag(_) => true,
                 Op::SplitInt(_) | Op::IntFrag(_) | Op::Lo | Op::Hi => false,
                 Op::ConstBool(_) | Op::Known | Op::NoWrap => false,
                 // THE CONDITION DOES NOT MAKE THE RESULT A SET: `Sel(c, 5, 7)`
@@ -602,9 +618,10 @@ impl<A: GraphArith> Symbolic<A> {
                 Op::Span => true,
                 // A fragment is a narrower interval; validity/coverage masks
                 // follow the operand.
-                Op::Split(_) | Op::Frag(_) => true,
+                Op::Split(_) | Op::Frag(_) | Op::RSplit(_) | Op::RFrag(_) => true,
                 Op::SplitInt(_) | Op::IntFrag(_) => false,
                 Op::SplitValid(_) | Op::SplitOk(_) | Op::FragOk(_) => any(memo, &args),
+                Op::RSplitValid(_) | Op::RSplitOk(_) | Op::RFragOk(_) => any(memo, &args),
                 // The ends of an interval are exact numbers.
                 Op::Lo | Op::Hi => false,
                 // A premise is a mask query: every lane decides it.
@@ -616,7 +633,7 @@ impl<A: GraphArith> Symbolic<A> {
                 Op::Restrict(..) => any(memo, &args),
                 // No data output (its uses read the constant).
                 Op::Pin(_) => false,
-                Op::Lt | Op::Le | Op::Gt | Op::Ge | Op::Eq => any(memo, &args),
+                Op::Lt | Op::Le | Op::Gt | Op::Ge | Op::Eq | Op::Same => any(memo, &args),
                 Op::Not | Op::And | Op::Or => any(memo, &args),
                 // The condition counts.
                 Op::Sel => any(memo, &args),
@@ -906,6 +923,10 @@ impl<A: GraphArith> Symbolic<A> {
                 self.graph.set_fork_ways(d, *ways);
                 (self.graph.fold(Op::SplitInt(d), vec![*v]), self.graph.fold(Op::SplitValid(d), vec![*v]))
             }
+            Partition::Rounds { ways } => {
+                self.graph.set_fork_ways(d, *ways);
+                (self.graph.fold(Op::RSplit(d), vec![*v]), self.graph.fold(Op::RSplitValid(d), vec![*v]))
+            }
         };
         if p.memoized() {
             self.fork_memo.insert((*v, kind), (d, (value, valid)));
@@ -987,7 +1008,7 @@ impl<A: GraphArith> Symbolic<A> {
             let node = self.graph.get(x);
             let dependent = matches!(
                 node.op,
-                Op::Cell(_) | Op::Split(_) | Op::SplitValid(_) | Op::SplitInt(_)
+                Op::Cell(_) | Op::Split(_) | Op::SplitValid(_) | Op::SplitInt(_) | Op::RSplit(_) | Op::RSplitValid(_)
             );
             if dependent || node.args.is_empty() {
                 self.lane_memo.insert(x, !dependent);
@@ -1270,7 +1291,7 @@ impl<A: GraphArith> Domain for Symbolic<A> {
             let r = match node.op {
                 Op::Cell(c) => ival.contains(&c),
                 Op::Const(lo, hi) => lo != hi,
-                Op::Split(_) => true,
+                Op::Split(_) | Op::RSplit(_) => true,
                 // An exact whole number per configuration.
                 Op::SplitInt(_) | Op::Lo | Op::Hi => false,
                 // A span's bounds differ (`fold` collapses a literal span).
@@ -1295,6 +1316,30 @@ impl<A: GraphArith> Domain for Symbolic<A> {
     fn fork_flr(&mut self, v: &NodeId, ways: u8) -> (NodeId, NodeId) {
         let f = self.fork(v, Partition::Floors { ways }, "a floor fork (`move`)");
         (f.value, f.valid)
+    }
+
+    /// A literal interval is refused: every lane would take each fragment
+    /// (`split_floor`'s literal splits have no round twin).
+    fn fork_round(&mut self, v: &NodeId, ways: u8) -> Result<(NodeId, NodeId)> {
+        if let Op::Const(lo, hi) = self.graph.get(*v).op {
+            bail!("__split_by_round of the literal [{}, {}]: a literal round fork is not modelled", A::show(A::from_lit(lo)), A::show(A::from_lit(hi)));
+        }
+        let f = self.fork(v, Partition::Rounds { ways }, "a round fork (`move`)");
+        Ok((f.value, f.valid))
+    }
+
+    /// `flr_ways`, counting the values of `flr(x + 1/2)`.
+    fn round_ways(&mut self, v: &NodeId) -> u8 {
+        if !self.has_ranges() {
+            return MOVE_WAYS;
+        }
+        match self.range_of(*v) {
+            Some(ps) => {
+                let w = A::rounds_spanned(&ps, self.uncapped_ways);
+                (if self.uncapped_ways { w } else { w.min(MOVE_WAYS as i64) }) as u8
+            }
+            None => MOVE_WAYS,
+        }
     }
 
     fn flr_ways(&mut self, v: &NodeId) -> u8 {
@@ -1586,6 +1631,63 @@ mod tests {
 
     fn p(v: i16) -> P8 {
         P8::from_i16(v)
+    }
+
+    /// THE ROUND FORK (doubles): `rem + ox` of an interval remainder, forked
+    /// at `flr(x + 1/2)`, resolves per configuration to the reference
+    /// engine's fragment (`LuaF64Interval::round_fragment`) bit for bit,
+    /// valid exactly where the reference has that many, and its own
+    /// coverage (`RSplitOk`) says whether a lane takes at most `ways`
+    /// values. Around the cut below 1, where `0.5 - 2^-54 + 0.5` rounds up.
+    #[test]
+    fn a_round_fork_resolves_to_the_reference_fragments() {
+        use crate::transpile::graph::{CellKind, Val, OPEN};
+        use celeste_core::arith::Float;
+        use celeste_core::lua_f64::{LuaF64, LuaF64Interval};
+        let f = |v: f64| LuaF64::new(v).expect("finite");
+        let ways = 3u8;
+        for ox in [0.0, 0.3, 1.0, -1.7, 2.5, 0.5f64.next_down()] {
+            let mut d = Symbolic::<Float>::default();
+            d.ival_cells.insert(0);
+            d.forget_intervals();
+            d.graph.set_cell_kind(0, CellKind::Ival);
+            let x = d.graph.leaf(Op::Cell(0));
+            let k = d.num(f(ox));
+            let y = d.arith(Arith::Add, &x, &k).expect("add");
+            let (v, valid) = d.fork_round(&y, ways).expect("a round fork");
+            let fork = d.forks - 1;
+            let covered = d.graph.fold(Op::RSplitOk(ways), vec![y]);
+            for (lo, hi) in [(-0.5, 0.5f64.next_down()), (-0.5, -0.5), (0.2, 0.4), (0.5f64.next_down(), 0.5), (-2.25, 1.75), (0.0, 0.0)] {
+                let iv = LuaF64Interval::new(f(lo), f(hi));
+                let cells = std::collections::HashMap::from([(0u32, Val::<Float>::Num(iv))]);
+                let yv = iv.checked_add(LuaF64Interval::point(f(ox))).expect("finite");
+                let n = yv.rounds().expect("rounds").expect("few");
+                for c in 0..ways {
+                    let mut splits = vec![OPEN; d.forks as usize];
+                    splits[fork as usize] = c;
+                    let mut g = d.graph.like();
+                    let map = d.graph.specialize_subset_into(&splits, None, &mut g);
+                    // Strict, a lane spanning more values than the fork's
+                    // arity is an error of the evaluation (as `SplitOk`).
+                    let vals = match g.eval(&cells) {
+                        Ok(vals) => vals,
+                        Err(e) => {
+                            assert!(n > ways as u32 && format!("{e}").contains("RSplitOk"), "ox {ox} [{lo}, {hi}] c {c}: {e}");
+                            continue;
+                        }
+                    };
+                    assert_eq!(vals[map[covered as usize] as usize], Val::Bool(Some(true)), "ox {ox} [{lo}, {hi}]: coverage");
+                    assert!(n <= ways as u32, "ox {ox} [{lo}, {hi}]: {n} values covered by {ways}");
+                    let ok = (c as u32) < n;
+                    assert_eq!(vals[map[valid as usize] as usize], Val::Bool(Some(ok)), "ox {ox} [{lo}, {hi}] c {c}: validity");
+                    if ok {
+                        let want = yv.round_fragment(c as u32).expect("a fragment");
+                        let Val::Num(got) = vals[map[v as usize] as usize] else { panic!("a number") };
+                        assert_eq!((got.lo.to_bits(), got.hi.to_bits()), (want.lo.to_bits(), want.hi.to_bits()), "ox {ox} [{lo}, {hi}] c {c}: the fragment");
+                    }
+                }
+            }
+        }
     }
 
     /// The fake wall's `spd.x = -sign(spd.x)*1.5` before `move`: three pieces

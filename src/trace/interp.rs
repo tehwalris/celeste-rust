@@ -1764,9 +1764,20 @@ impl<'a, D: Domain> Interp<'a, D> {
                         .collect();
                 }
                 // Elsewhere (doubles: `+ 1/2` rounds) the domain forks at
-                // the exact cut points.
-                let v = self.d.fork_round(&x)?;
+                // the exact cut points, as `split_floor` forks: the identity
+                // on one number, else a choice whose validity goes in the
+                // guard and whose coverage is the fork's own error.
                 let mut st = st;
+                let v = if self.d.is_interval(&x) {
+                    let ways = self.d.round_ways(&x);
+                    let (v, valid) = self.d.fork_round(&x, ways)?;
+                    let at = st.decided(&mut self.d);
+                    self.d.evaluated_at(&v, &at);
+                    st.guard = self.d.and(&st.guard, &valid);
+                    v
+                } else {
+                    x.clone()
+                };
                 if let Some(axis) = player_axis {
                     self.capture_player_split(&mut st, axis, &x, &v)?;
                 }

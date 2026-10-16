@@ -429,7 +429,7 @@ impl AsmKernel {
                                 None
                             }
                         },
-                        Op::Le | Op::Ge | Op::Lt | Op::Gt | Op::Eq | Op::SplitOk(_) => {
+                        Op::Le | Op::Ge | Op::Lt | Op::Gt | Op::Eq | Op::Same | Op::SplitOk(_) | Op::RSplitOk(_) => {
                             nd.args.iter().copied().find(|&a| matches!(self.fused.get(a).op, Op::Sel))
                         }
                         _ => None,

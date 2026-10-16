@@ -100,12 +100,14 @@ pub fn reset_slices() {
 pub(crate) fn op_kind(op: &Op) -> &'static str {
     match op {
         Op::Const(..) | Op::ConstBool(_) | Op::Cell(_) | Op::UnknownNum | Op::UnknownBool(_) => "leaf",
-        Op::Lt | Op::Le | Op::Gt | Op::Ge | Op::Eq => "cmp",
+        Op::Lt | Op::Le | Op::Gt | Op::Ge | Op::Eq | Op::Same => "cmp",
         Op::Not | Op::And | Op::Or | Op::Known | Op::SplitValid(_) | Op::FragOk(_) | Op::SplitOk(_) | Op::NoWrap => "bool",
+        Op::RSplitValid(_) | Op::RFragOk(_) | Op::RSplitOk(_) => "bool",
         Op::Sel => "sel",
         Op::Restrict(..) | Op::Pin(_) => "restrict",
         Op::Mget | Op::TileFlagAt => "call",
         Op::Split(_) | Op::Add | Op::Sub | Op::Mul | Op::Div | Op::Rem | Op::Neg | Op::Abs | Op::Flr | Op::Sin | Op::Min | Op::Max | Op::Span | Op::Frag(_) | Op::SplitInt(_) | Op::IntFrag(_) | Op::Lo | Op::Hi => "num",
+        Op::RSplit(_) | Op::RFrag(_) => "num",
     }
 }
 
@@ -205,7 +207,7 @@ fn error_kind_inner(g: &Graph, term: NodeId) -> &'static str {
                     _ => "err:sel-undecided",
                 }
             }
-            Op::SplitOk(_) => return "err:fork-cover",
+            Op::SplitOk(_) | Op::RSplitOk(_) => return "err:fork-cover",
             Op::NoWrap => return "err:nowrap",
             Op::Lt | Op::Gt
                 if node.args.iter().any(|a| matches!(g.get(*a).op, Op::Lo | Op::Hi))
@@ -523,7 +525,7 @@ pub(crate) fn report(inp: &Input) -> Result<Census> {
         b |= match node.op {
             Op::TileFlagAt => 1,
             Op::Mget => 2,
-            Op::FragOk(_) | Op::Frag(_) | Op::IntFrag(_) | Op::SplitOk(_) => 4,
+            Op::FragOk(_) | Op::Frag(_) | Op::IntFrag(_) | Op::SplitOk(_) | Op::RFragOk(_) | Op::RFrag(_) | Op::RSplitOk(_) => 4,
             Op::Add | Op::Sub | Op::Mul | Op::Div | Op::Rem | Op::Flr | Op::Min | Op::Max | Op::Neg | Op::Abs => 8,
             _ => 0,
         };

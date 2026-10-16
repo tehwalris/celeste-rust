@@ -97,7 +97,7 @@ pub fn to_rt2<D: Domain, N: EngineNum>(
 /// The tracer's block of `st`: its shape, every number and boolean `Nil`
 /// (graph nodes: the kernels compute them). What a traced frame's input and
 /// outcomes bind against (`bind::resolve_all`).
-pub fn skeleton<D: Domain>(st: &State<D>, cart: Arc<CartData>, cache: Arc<CollisionCache>) -> Result<Rt2> {
+pub fn skeleton<D: Domain, N: EngineNum>(st: &State<D>, cart: Arc<CartData>, cache: Arc<CollisionCache>) -> Result<Rt2<N>> {
     to_rt2(st, cart, cache, |_| Ok(AV::Nil), |_| Ok(AV::Nil))
 }
 
@@ -412,7 +412,7 @@ pub fn check_agreement(rt2: &Rt2, fn_info: &FnInfo, base: &State<RefDomain>, roo
             ref other => bail!("lane {lane}: a traced boolean {other:?}, not a constant"),
         };
         let mut b = to_rt2(&traced, cart.clone(), cache.clone(), num, boolean)?;
-        let s = skeleton(&traced, cart.clone(), cache.clone())?;
+        let s = skeleton::<_, P8>(&traced, cart.clone(), cache.clone())?;
         let first = |x: &Rt2, y: &Rt2| (0..x.structure.len().max(y.structure.len())).find(|&c| x.structure.get(c) != y.structure.get(c) || x.cols.get(c) != y.cols.get(c));
         ensure!(
             a.structure == b.structure && a.cols == b.cols && a.globals == b.globals && a.strings == b.strings,

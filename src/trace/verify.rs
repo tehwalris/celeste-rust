@@ -13,6 +13,8 @@ use crate::transpile::graph::NodeId;
 use crate::transpile::graph::Graph;
 
 use super::domain::{Domain, Symbolic};
+use crate::transpile::garith::GraphArith;
+use celeste_core::arith::Fixed;
 use super::heap::Value;
 use super::iface::{self, Conc, Iface, Path};
 #[cfg(test)]
@@ -21,7 +23,7 @@ use super::interp::{Flow, Interp};
 use super::state::State;
 
 /// One traced outcome of a frame.
-pub struct FrameOut {
+pub struct FrameOut<A: GraphArith = Fixed> {
     pub guard: NodeId,
     /// Where this outcome's row is undefined (`trace::error`); live lanes on
     /// which it holds decline. Derived, never carried.
@@ -40,11 +42,11 @@ pub struct FrameOut {
     /// The ENGINE structure of this outcome's end state, and the cell each of
     /// `fields`/`ubool` lands on. Per outcome: NOT comparable with
     /// `Frame::in_cells` unless the shape was kept.
-    pub rt2: celeste_engine::runtime2::Rt2,
+    pub rt2: celeste_engine::runtime2::Rt2<A::Num>,
     pub cells: Vec<u32>,
     pub ubool_cells: Vec<u32>,
     /// The state itself, so a shape walk can step forward from it.
-    pub st: State<Symbolic>,
+    pub st: State<Symbolic<A>>,
     /// THE TRANSFER ROOTS (`search::arc_edges`, level-0 traces only): per axis
     /// `took`, `pre`, `frag`, `ox` (the player's split) and `fin` (the
     /// remainder before widening; 0 without a player). Never stored in the row.
@@ -56,7 +58,7 @@ pub struct FrameOut {
 /// Roots per axis in `FrameOut::arc`: took, pre, frag, ox, fin.
 pub const ARC_AXIS_ROOTS: usize = 5;
 
-impl Clone for FrameOut {
+impl<A: GraphArith> Clone for FrameOut<A> {
     /// For `split_undecided_selects`: `Rt2::clone_block` shares the cart.
     fn clone(&self) -> Self {
         FrameOut {
@@ -75,8 +77,8 @@ impl Clone for FrameOut {
     }
 }
 
-pub struct Frame {
-    pub iface: Iface,
+pub struct Frame<A: GraphArith = Fixed> {
+    pub iface: Iface<A>,
     /// What each both-values fork was minted for, for the kernel dump.
     pub fork_origins: Vec<(u8, String)>,
     /// How many FORK choices this frame made; the emitter enumerates them.
@@ -84,7 +86,7 @@ pub struct Frame {
     /// The forks' arities AS TRACED (a later frame overwrites the arena's;
     /// `emit::bind` installs these).
     pub fork_ways: Vec<u8>,
-    pub outs: Vec<FrameOut>,
+    pub outs: Vec<FrameOut<A>>,
     /// THE RAISE ROW's liveness: the OR of the path guards at every
     /// `Interp::poison` site (`false` where nothing raises). Not in `outs`: a
     /// raise has no field values, and `outs` consumers index positionally.
@@ -93,7 +95,7 @@ pub struct Frame {
     /// engine's numbering for `Op::Cell(i)`.
     pub in_cells: Vec<u32>,
     /// The engine structure of that state, the block shape a kernel runs on.
-    pub in_rt2: celeste_engine::runtime2::Rt2,
+    pub in_rt2: celeste_engine::runtime2::Rt2<A::Num>,
 }
 
 /// Run one chunk and require exactly one normal end state (the oracle has
@@ -116,9 +118,9 @@ pub fn run_one<'a, D: Domain>(
 
 /// Every scalar the frame ends with, as graph nodes, split into data and the
 /// dead slots (`FrameOut::ubool`).
-fn out_fields(
-    st: &State<Symbolic>,
-    d: &Symbolic,
+fn out_fields<A: GraphArith>(
+    st: &State<Symbolic<A>>,
+    d: &Symbolic<A>,
 ) -> Result<(Vec<(Path, NodeId, &'static str)>, Vec<Path>)> {
     let mut out = Vec::new();
     let mut ubool = Vec::new();
@@ -154,27 +156,27 @@ fn out_fields(
 }
 
 /// Symbolize `root`, free the buttons, and trace one frame.
-pub fn trace_frame<'a>(
-    it: &mut Interp<'a, Symbolic>,
+pub fn trace_frame<'a, A: GraphArith>(
+    it: &mut Interp<'a, Symbolic<A>>,
     reset: &'a ast::Ast,
     frame: &'a ast::Ast,
-    st: State<Symbolic>,
+    st: State<Symbolic<A>>,
     roots: &[Path],
-    pin: &[(Path, Conc)],
+    pin: &[(Path, Conc<A>)],
     // Slots the boundary WIDENS to an interval (`rem`).
     ival: &[Path],
     // Apply the boundary widenings INSIDE the frame (a row hashes on what it
     // stores) and capture the arc transfers. Off for the concrete check.
     widen: bool,
-    // Input slots BOUNDED to a range (raw 16.16, inclusive): the body reads
+    // Input slots BOUNDED to a range (literals, inclusive): the body reads
     // them through `Op::Restrict`, specialized on the range; outside it is
     // the restriction's own error (`trace::error`), like a pin.
-    bounds: &[(Path, (i32, i32))],
+    bounds: &[(Path, (A::Lit, A::Lit))],
     // Input slots NO MERGE SELECTS ON: a condition that reads one makes two
     // successors, each with its own values (`Domain::reads_merge_refused`;
     // a respawn's exploration, `kernel::explore_respawn`).
     merge_refused_on: &[Path],
-) -> Result<Frame> {
+) -> Result<Frame<A>> {
     it.trace_start_nodes = it.d.node_count();
     let mut st = st;
     // Fork choices are per FRAME, buttons included.
@@ -200,7 +202,7 @@ pub fn trace_frame<'a>(
     for (i, c) in &iface.pins {
         let cell = it.d.graph.leaf(crate::transpile::graph::Op::Cell(*i as u32));
         let c = match *c {
-            iface::Conc::Num(v) => crate::transpile::graph::Pinned::Num(v.as_raw_u32() as i32, v.as_raw_u32() as i32),
+            iface::Conc::Num(v) => crate::transpile::graph::Pinned::Num(A::lit(v), A::lit(v)),
             iface::Conc::Bool(b) => crate::transpile::graph::Pinned::Bool(b),
         };
         it.d.pin(cell, c);
@@ -211,7 +213,7 @@ pub fn trace_frame<'a>(
     // nothing folds that check away.
     let player = super::shapes::player_path(&st);
     // The player's raw input position and region, for `Points`.
-    let mut position: [Option<(NodeId, (i32, i32))>; 2] = [None, None];
+    let mut position: [Option<(NodeId, (A::Lit, A::Lit))>; 2] = [None, None];
     for (p, (lo, hi)) in bounds {
         let i = iface.slots.iter().position(|q| q == p).ok_or_else(|| anyhow!("bounded {} is not an input slot", iface::show(p)))?;
         let cell = it.d.graph.leaf(crate::transpile::graph::Op::Cell(i as u32));
@@ -222,8 +224,8 @@ pub fn trace_frame<'a>(
         if held != cell {
             // Pinned: the pin guard checks the lane, the range the pin.
             let v = it.d.as_const(&held).ok_or_else(|| anyhow!("bounded {} is neither its cell nor pinned", iface::show(p)))?;
-            let raw = v.as_raw_u32() as i32;
-            anyhow::ensure!((*lo..=*hi).contains(&raw), "bounded {} is pinned to {raw:#x}, outside [{lo:#x}, {hi:#x}]", iface::show(p));
+            let (l, h) = (A::from_lit(*lo), A::from_lit(*hi));
+            anyhow::ensure!(A::le(l, v) && A::le(v, h), "bounded {} is pinned to {}, outside [{}, {}]", iface::show(p), A::hex(v), A::hex(l), A::hex(h));
             continue;
         }
         let r = it.d.restrict(cell, *lo, *hi);
@@ -294,7 +296,10 @@ pub fn trace_frame<'a>(
                             Some(Value::Num(n)) => n,
                             other => bail!("arc capture: the player's rem.{} is {other:?}", ["x", "y"][k]),
                         },
-                        None => it.d.graph.leaf(crate::transpile::graph::Op::Const(0, 0)),
+                        None => {
+                            let zero = A::lit(A::from_i16(0));
+                            it.d.graph.leaf(crate::transpile::graph::Op::Const(zero, zero))
+                        }
                     };
                     roots.extend([a.took, a.pre, a.frag, a.ox, fin]);
                 }
@@ -392,7 +397,7 @@ pub fn trace_frame<'a>(
             if !*r {
                 continue;
             }
-            if let Op::Split(d) | Op::SplitValid(d) | Op::SplitInt(d) = it.d.graph.get(i as NodeId).op {
+            if let Op::Split(d) | Op::SplitValid(d) | Op::SplitInt(d) | Op::RSplit(d) | Op::RSplitValid(d) = it.d.graph.get(i as NodeId).op {
                 live.insert(d);
             }
         }
@@ -455,7 +460,7 @@ impl Lite {
 
     /// Absorb another with the same row: live where either is; error
     /// `(g1 and e1) or (g2 and e2)`.
-    fn merge(&mut self, d: &mut Symbolic, guard: NodeId, error: NodeId, rests: &[NodeId]) {
+    fn merge<A: GraphArith>(&mut self, d: &mut Symbolic<A>, guard: NodeId, error: NodeId, rests: &[NodeId]) {
         for r in rests {
             if !self.rests.contains(r) && self.rests.len() < MAX_RESTS {
                 self.rests.push(*r);
@@ -475,7 +480,7 @@ impl Waiting {
         (class[o.t], o.fields.clone())
     }
 
-    fn push(&mut self, d: &mut Symbolic, class: &[usize], o: Lite, pts: Option<PointSet>, size: usize) {
+    fn push<A: GraphArith>(&mut self, d: &mut Symbolic<A>, class: &[usize], o: Lite, pts: Option<PointSet>, size: usize) {
         let key = Self::key(class, &o);
         if let Some(&i) = self.index.get(&key) {
             let (p, pp) = self.slots[i].as_mut().expect("an indexed outcome is waiting");
@@ -507,7 +512,7 @@ impl Waiting {
 /// undecided select left. By case analysis on the error alone (not the
 /// outcome, whose split sides would double per round) and not three-valued
 /// (a hull loses what a select's condition says, e.g. the platform wrap).
-fn settle_error(d: &mut Symbolic, points: Option<&mut Points>, pts: Option<&PointSet>, room: Option<&crate::transpile::graph::Room>, mut o: Lite) -> Lite {
+fn settle_error<A: GraphArith>(d: &mut Symbolic<A>, points: Option<&mut Points<A>>, pts: Option<&PointSet>, room: Option<&crate::transpile::graph::Room>, mut o: Lite) -> Lite {
     let mut m = MayErr { points, room, memo: Default::default(), cases: 0 };
     let here = pts.cloned();
     o.error = m.may(d, o.error, here.as_ref()).0;
@@ -522,15 +527,15 @@ const MAY_CASES: usize = 4096;
 /// error); a node reading an undecided select is split on its lowest
 /// undecidable comparison, each case under that answer's `may` guard and
 /// narrowed points; others as they are. Past `MAY_CASES`, three-valued.
-struct MayErr<'a, 'r> {
-    points: Option<&'a mut Points>,
+struct MayErr<'a, 'r, A: GraphArith> {
+    points: Option<&'a mut Points<A>>,
     room: Option<&'r crate::transpile::graph::Room>,
     memo: rustc_hash::FxHashMap<(NodeId, Option<Vec<u64>>), (NodeId, NodeId)>,
     cases: usize,
 }
 
-impl MayErr<'_, '_> {
-    fn may(&mut self, d: &mut Symbolic, n: NodeId, pts: Option<&PointSet>) -> (NodeId, NodeId) {
+impl<A: GraphArith> MayErr<'_, '_, A> {
+    fn may(&mut self, d: &mut Symbolic<A>, n: NodeId, pts: Option<&PointSet>) -> (NodeId, NodeId) {
         use crate::transpile::graph::Op;
         let key = (n, pts.map(|p| p.0.clone()));
         if let Some(hit) = self.memo.get(&key) {
@@ -540,7 +545,7 @@ impl MayErr<'_, '_> {
             let node = d.graph.get(n);
             (node.op.clone(), node.args.clone())
         };
-        let reads_undecided = |d: &mut Symbolic, n: NodeId| cone(&d.graph, &[n]).into_iter().find(|m| d.graph.get(*m).op == Op::Sel && d.lane_undecidable(d.graph.get(*m).args[0]));
+        let reads_undecided = |d: &mut Symbolic<A>, n: NodeId| cone(&d.graph, &[n]).into_iter().find(|m| d.graph.get(*m).op == Op::Sel && d.lane_undecidable(d.graph.get(*m).args[0]));
         let out = match op {
             Op::Or | Op::And => {
                 let parts: Vec<(NodeId, NodeId)> = args.iter().map(|a| self.may(d, *a, pts)).collect();
@@ -608,7 +613,7 @@ impl MayErr<'_, '_> {
 
 /// `Symbolic::evaluated`'s conditions for every reached node, rewritten by
 /// `three_valued`.
-fn three_valued_evaluated(d: &mut Symbolic, outs: &[FrameOut]) {
+fn three_valued_evaluated<A: GraphArith>(d: &mut Symbolic<A>, outs: &[FrameOut<A>]) {
     let mut roots: Vec<NodeId> = Vec::new();
     for o in outs {
         roots.extend(o.fields.iter().map(|f| f.1));
@@ -674,7 +679,7 @@ impl PointSet {
 /// from ONE platform arrangement. A point's comparison is decided by
 /// `eval_lenient_in` with cells pinned; undecided goes both ways. Compile time
 /// only: the kernel sees each outcome's pixels (`position_guard`).
-pub struct Points {
+pub struct Points<A: GraphArith = Fixed> {
     /// Per world, the value of each platform cell: `(cell, raw)`.
     worlds: Vec<Vec<(u32, i32)>>,
     platform: rustc_hash::FxHashSet<u32>,
@@ -682,10 +687,13 @@ pub struct Points {
     /// count. `None` without a player.
     pos: [Option<(u32, NodeId, i32, usize)>; 2],
     memo: rustc_hash::FxHashMap<NodeId, (PointSet, PointSet)>,
+    arith: std::marker::PhantomData<A>,
 }
 
-impl Points {
-    fn new(d: &Symbolic, pos: [Option<(NodeId, (i32, i32))>; 2]) -> Result<Points> {
+impl<A: GraphArith> Points<A> {
+    /// The world table and the pixels are 16.16 (`concrete::WORLD_FIELDS`):
+    /// another arithmetic raises.
+    fn new(d: &Symbolic<A>, pos: [Option<(NodeId, (A::Lit, A::Lit))>; 2]) -> Result<Points<A>> {
         use crate::transpile::graph::Op;
         let table = d.worlds.clone().ok_or_else(|| anyhow!("the platforms are unknown but there is no world table"))?;
         let cell = |n: NodeId| match d.graph.get(n).op {
@@ -705,13 +713,14 @@ impl Points {
         let mut out = [None, None];
         for (k, p) in pos.iter().enumerate() {
             if let Some((n, (lo, hi))) = p {
+                let (lo, hi) = A::lit_raw_fixed(*lo, *hi).ok_or_else(|| anyhow!("platform worlds under {} arithmetic: the world table is 16.16", A::NAME))?;
                 const ONE: i32 = 1 << 16;
                 anyhow::ensure!(lo % ONE == 0 && hi % ONE == 0, "the player's position range is not whole pixels");
                 let (a, b) = (lo.div_euclid(ONE), hi.div_euclid(ONE));
                 out[k] = Some((cell(*n)?, *n, a, (b - a + 1) as usize));
             }
         }
-        Ok(Points { worlds, platform, pos: out, memo: Default::default() })
+        Ok(Points { worlds, platform, pos: out, memo: Default::default(), arith: std::marker::PhantomData })
     }
 
     fn per_world(&self) -> usize {
@@ -729,9 +738,8 @@ impl Points {
     }
 
     /// Where `c` can come out true, and where false.
-    fn answers(&mut self, d: &Symbolic, room: Option<&crate::transpile::graph::Room>, c: NodeId) -> (PointSet, PointSet) {
+    fn answers(&mut self, d: &Symbolic<A>, room: Option<&crate::transpile::graph::Room>, c: NodeId) -> (PointSet, PointSet) {
         use crate::transpile::graph::Val;
-        use celeste_core::pico8_num::{Pico8Num, Pico8NumInterval};
         if let Some(hit) = self.memo.get(&c) {
             return hit.clone();
         }
@@ -747,8 +755,8 @@ impl Points {
         let root = map[&c] as usize;
         // Every cell at its weakest; a bounded input narrows at its `Restrict`.
         let base = crate::transpile::ival::seed_cells(&g);
-        let exact = |v: i32| Val::Num(Pico8NumInterval::new(Pico8Num::from_raw(v), Pico8Num::from_raw(v)));
-        let eval = |cells: &std::collections::HashMap<u32, Val>| -> Option<bool> {
+        let exact = |v: i32| Val::<A>::Num(A::point(A::from_fixed_raw(v)));
+        let eval = |cells: &std::collections::HashMap<u32, Val<A>>| -> Option<bool> {
             let v = match room {
                 Some(r) => g.eval_lenient_in(cells, r),
                 None => g.eval_lenient(cells),
@@ -823,7 +831,7 @@ impl Points {
 
     /// The lanes an outcome at `pts` is live on: the pixels some world of
     /// `pts` has (`true` if all).
-    fn position_guard(&self, d: &mut Symbolic, pts: &PointSet) -> NodeId {
+    fn position_guard(&self, d: &mut Symbolic<A>, pts: &PointSet) -> NodeId {
         use crate::transpile::graph::Op;
         let (nx, ny) = (self.pos[0].map_or(1, |p| p.3), self.pos[1].map_or(1, |p| p.3));
         let at = |i: usize, j: usize| (0..self.worlds.len()).any(|w| pts.contains(self.index(w, i, j)));
@@ -832,9 +840,10 @@ impl Points {
             return yes;
         }
         // `lo <= cell <= hi` over whole pixels of one axis.
-        let within = |d: &mut Symbolic, axis: usize, lo: usize, hi: usize| -> NodeId {
+        let within = |d: &mut Symbolic<A>, axis: usize, lo: usize, hi: usize| -> NodeId {
             let Some((_, n, first, _)) = self.pos[axis] else { return d.graph.leaf(Op::ConstBool(true)) };
             let (a, b) = ((first + lo as i32) << 16, (first + hi as i32) << 16);
+            let (a, b) = (A::lit(A::from_fixed_raw(a)), A::lit(A::from_fixed_raw(b)));
             let (ka, kb) = (d.graph.leaf(Op::Const(a, a)), d.graph.leaf(Op::Const(b, b)));
             let ge = d.graph.fold(Op::Ge, vec![n, ka]);
             let le = d.graph.fold(Op::Le, vec![n, kb]);
@@ -884,7 +893,7 @@ impl Points {
 /// is left; equal outcomes fuse. The error is settled (`settle_error`) and
 /// the guard rewritten three-valued, neither split. With `Points`, a
 /// comparison with one answer at a path's points is decided without a split.
-fn split_undecided_selects(d: &mut Symbolic, outs: Vec<FrameOut>, mut points: Option<Points>, room: Option<&crate::transpile::graph::Room>) -> Result<Vec<FrameOut>> {
+fn split_undecided_selects<A: GraphArith>(d: &mut Symbolic<A>, outs: Vec<FrameOut<A>>, mut points: Option<Points<A>>, room: Option<&crate::transpile::graph::Room>) -> Result<Vec<FrameOut<A>>> {
     use crate::transpile::graph::Op;
     const MAX_OUTCOMES: usize = 4096;
     let n_in = outs.len();
@@ -1102,7 +1111,7 @@ fn split_undecided_selects(d: &mut Symbolic, outs: Vec<FrameOut>, mut points: Op
 /// `Sel(Known(c), Sel(c, x, y), hull)`, a sound "may be live". Ops the kernel
 /// computes on exact operands only (`exact_only`) are pushed into the arms,
 /// up to `ARMS` combinations (pushing everything is exact but exponential).
-fn three_valued(d: &mut Symbolic, root: NodeId) -> NodeId {
+fn three_valued<A: GraphArith>(d: &mut Symbolic<A>, root: NodeId) -> NodeId {
     use crate::transpile::graph::Op;
     let nodes = cone(&d.graph, &[root]);
     // Already-wrapped selects stay (they keep the registration bounding their
@@ -1118,7 +1127,7 @@ fn three_valued(d: &mut Symbolic, root: NodeId) -> NodeId {
             (k.op == Op::Known && inner.op == Op::Sel && inner.args[0] == k.args[0]).then_some(node.args[1])
         })
         .collect();
-    let undecided = |d: &mut Symbolic, n: NodeId| !wrapped.contains(&n) && d.graph.get(n).op == Op::Sel && d.lane_undecidable(d.graph.get(n).args[0]);
+    let undecided = |d: &mut Symbolic<A>, n: NodeId| !wrapped.contains(&n) && d.graph.get(n).op == Op::Sel && d.lane_undecidable(d.graph.get(n).args[0]);
     if !nodes.iter().any(|n| undecided(d, *n)) {
         return root;
     }
@@ -1230,7 +1239,8 @@ fn three_valued(d: &mut Symbolic, root: NodeId) -> NodeId {
                     if d.build_trace {
                         eprintln!("[build] three_valued: {op:?} past {ARMS} arms, the whole range");
                     }
-                    d.graph.leaf(Op::Const(i32::MIN, i32::MAX))
+                    let (lo, hi) = A::bounds(A::unknown());
+                    d.graph.leaf(Op::Const(A::lit(lo), A::lit(hi)))
                 }
             }
         } else if a == args {
@@ -1251,9 +1261,9 @@ const ARMS: usize = 64;
 
 /// Ops the kernel computes on exact operands only (`asm::codegen`'s
 /// `as_num`); `Mul`/`Div` also take an interval times a positive literal.
-fn exact_only(d: &Symbolic, op: &crate::transpile::graph::Op, args: &[NodeId]) -> bool {
+fn exact_only<A: GraphArith>(d: &Symbolic<A>, op: &crate::transpile::graph::Op<A>, args: &[NodeId]) -> bool {
     use crate::transpile::graph::Op;
-    let pos = |n: NodeId| matches!(d.graph.get(n).op, Op::Const(lo, hi) if lo == hi && lo > 0);
+    let pos = |n: NodeId| matches!(d.graph.get(n).op, Op::Const(lo, hi) if lo == hi && A::lt(A::from_i16(0), A::from_lit(lo)));
     match op {
         Op::TileFlagAt | Op::Mget | Op::Rem | Op::Sin => true,
         Op::Mul => !(pos(args[0]) || pos(args[1])),
@@ -1263,17 +1273,18 @@ fn exact_only(d: &Symbolic, op: &crate::transpile::graph::Op, args: &[NodeId]) -
 }
 
 /// Ops whose value is a boolean.
-fn is_bool_op(op: &crate::transpile::graph::Op) -> bool {
+fn is_bool_op<A: GraphArith>(op: &crate::transpile::graph::Op<A>) -> bool {
     use crate::transpile::graph::Op;
     matches!(
         op,
         Op::Lt | Op::Le | Op::Gt | Op::Ge | Op::Eq | Op::Not | Op::And | Op::Or | Op::Known | Op::ConstBool(_) | Op::UnknownBool(_) | Op::TileFlagAt
             | Op::SplitValid(_) | Op::SplitOk(_) | Op::FragOk(_) | Op::NoWrap
+            | Op::RSplitValid(_) | Op::RSplitOk(_) | Op::RFragOk(_) | Op::Same
     )
 }
 
 /// The hull `[min lo, max hi]` of numbers.
-fn hull_of(d: &mut Symbolic, vals: &[NodeId]) -> NodeId {
+fn hull_of<A: GraphArith>(d: &mut Symbolic<A>, vals: &[NodeId]) -> NodeId {
     use crate::transpile::graph::Op;
     let (mut lo, mut hi) = (d.graph.fold(Op::Lo, vec![vals[0]]), d.graph.fold(Op::Hi, vec![vals[0]]));
     for v in &vals[1..] {
@@ -1286,8 +1297,8 @@ fn hull_of(d: &mut Symbolic, vals: &[NodeId]) -> NodeId {
 
 /// A hulled number as its exact values and where: `(condition, value)`
 /// over its undecided selects (Kleene conditions). `None` past `ARMS`.
-fn arms(
-    d: &mut Symbolic,
+fn arms<A: GraphArith>(
+    d: &mut Symbolic<A>,
     n: NodeId,
     map: &rustc_hash::FxHashMap<NodeId, NodeId>,
     affected: &rustc_hash::FxHashSet<NodeId>,
@@ -1303,7 +1314,7 @@ fn arms(
         let node = d.graph.get(n);
         (node.op.clone(), node.args.clone())
     };
-    let numeric = |d: &Symbolic, x: NodeId| affected.contains(&x) && !boolean.contains(&x) && !is_bool_op(&d.graph.get(x).op);
+    let numeric = |d: &Symbolic<A>, x: NodeId| affected.contains(&x) && !boolean.contains(&x) && !is_bool_op(&d.graph.get(x).op);
     let out = if !affected.contains(&n) {
         Some(vec![(yes, *map.get(&n).unwrap_or(&n))])
     } else if op == Op::Sel && (d.lane_undecidable(args[0]) || d.lane_undecidable(*map.get(&args[0]).unwrap_or(&args[0]))) {
@@ -1372,8 +1383,8 @@ const MAX_RESTS: usize = 32;
 /// variant beside "solid" and "hidden", 3x outcomes per floor instead of 2.
 /// EXACT: a lane takes the half its own answer gives. Taken only where BOTH
 /// halves merge, so it never adds an outcome.
-fn absorbed(
-    d: &mut Symbolic,
+fn absorbed<A: GraphArith>(
+    d: &mut Symbolic<A>,
     class: &[usize],
     o: &Lite,
     cands: &[NodeId],
@@ -1421,7 +1432,7 @@ fn absorbed(
 /// changed nodes are mapped. Where a node was EVALUATED moves with it (the
 /// cone is widened to those conditions first), else the rebuild's own error
 /// would hold on every lane.
-fn rebuild_all(d: &mut Symbolic, cone: &[NodeId], subst: &rustc_hash::FxHashMap<NodeId, NodeId>) -> rustc_hash::FxHashMap<NodeId, NodeId> {
+fn rebuild_all<A: GraphArith>(d: &mut Symbolic<A>, cone: &[NodeId], subst: &rustc_hash::FxHashMap<NodeId, NodeId>) -> rustc_hash::FxHashMap<NodeId, NodeId> {
     use super::domain::{Cmp, Domain};
     use crate::transpile::graph::Op;
     let mut all: Vec<NodeId> = cone.to_vec();
@@ -1502,7 +1513,7 @@ pub fn pm1_paths(player: &Path) -> Vec<Path> {
 
 /// The pm1 key a state is in, as `trace_frame`'s pin list.
 #[cfg(test)]
-pub fn pm1_key(player: &Path, st: &State<Symbolic>, d: &Symbolic) -> Result<Vec<(Path, Conc)>> {
+pub fn pm1_key<A: GraphArith>(player: &Path, st: &State<Symbolic<A>>, d: &Symbolic<A>) -> Result<Vec<(Path, Conc<A>)>> {
     let mut out = Vec::new();
     for p in pm1_paths(player) {
         let c = match iface::get(st, &p) {
@@ -1523,7 +1534,7 @@ pub fn pm1_key(player: &Path, st: &State<Symbolic>, d: &Symbolic) -> Result<Vec<
 
 /// Write a concrete button assignment, for the oracle side.
 #[cfg(test)]
-pub fn set_buttons(d: &mut Symbolic, st: &mut State<Symbolic>, bits: &[bool; 6]) -> Result<()> {
+pub fn set_buttons<A: GraphArith>(d: &mut Symbolic<A>, st: &mut State<Symbolic<A>>, bits: &[bool; 6]) -> Result<()> {
     for (i, b) in bits.iter().enumerate() {
         let v = d.boolean(*b);
         iface::set(st, &[iface::key("__button_states"), Step::Idx(i)], Value::Bool(v))?;
@@ -1534,7 +1545,7 @@ pub fn set_buttons(d: &mut Symbolic, st: &mut State<Symbolic>, bits: &[bool; 6])
 /// The input vector for one PERTURBATION of the traced state (checking only
 /// the traced values would pass a graph that folded its inputs away).
 #[cfg(test)]
-pub fn cells_with(iface: &Iface, over: &[(Path, Conc)]) -> Result<Vec<Conc>> {
+pub fn cells_with<A: GraphArith>(iface: &Iface<A>, over: &[(Path, Conc<A>)]) -> Result<Vec<Conc<A>>> {
     let mut v = iface.init.clone();
     for (p, c) in over {
         let i = iface
@@ -1551,7 +1562,7 @@ pub fn cells_with(iface: &Iface, over: &[(Path, Conc)]) -> Result<Vec<Conc>> {
 /// `__button_states` order) for the concrete evaluator: the outcomes' cone
 /// specialized into a fresh graph, and the map. Other forks stay standing.
 #[cfg(test)]
-pub fn at_buttons(g: &Graph, f: &Frame, bits: &[bool; 6]) -> Result<(Graph, Vec<NodeId>)> {
+pub fn at_buttons<A: GraphArith>(g: &Graph<A>, f: &Frame<A>, bits: &[bool; 6]) -> Result<(Graph<A>, Vec<NodeId>)> {
     let buttons: Vec<u8> = f.fork_origins.iter().filter(|(_, o)| o == super::domain::UNKNOWN_BOOL_ORIGIN).map(|(d, _)| *d).collect();
     if buttons.len() != 6 {
         bail!("the frame minted {} unknown booleans, not the six buttons", buttons.len());
@@ -1570,13 +1581,13 @@ pub fn at_buttons(g: &Graph, f: &Frame, bits: &[bool; 6]) -> Result<(Graph, Vec<
 /// Check one traced frame against the oracle at one (inputs, buttons)
 /// point. Returns `(claiming outcome, fields compared)`.
 #[cfg(test)]
-pub fn check_at(
-    it: &Interp<'_, Symbolic>,
-    f: &Frame,
-    at: &(Graph, Vec<NodeId>),
-    cells: &[Conc],
+pub fn check_at<A: GraphArith>(
+    it: &Interp<'_, Symbolic<A>>,
+    f: &Frame<A>,
+    at: &(Graph<A>, Vec<NodeId>),
+    cells: &[Conc<A>],
     bits: &[bool; 6],
-    oracle: &[(Path, Conc)],
+    oracle: &[(Path, Conc<A>)],
 ) -> Result<(usize, usize)> {
     let env = super::eval::Env {
         cells,
@@ -1963,24 +1974,45 @@ end
     /// DECLINED point is a counted refusal, not a wrong answer.
     #[test]
     fn a_traced_frame_agrees_with_the_oracle() {
+        traced_frame_agrees::<Fixed>(false);
+    }
+
+    /// The float twin (plans/float-solver.md, milestone 5): the doubles'
+    /// trace of the same frame against the float REFERENCE ENGINE
+    /// (`RefDomain<Float>`, run as `ReferenceEngine::frame_states` runs a
+    /// concrete state), over the same sweep and every input, bit for bit.
+    #[test]
+    fn a_traced_float_frame_agrees_with_the_reference_engine() {
+        traced_frame_agrees::<celeste_core::arith::Float>(true);
+    }
+
+    /// `reference`: the oracle is the reference engine's interpreter
+    /// (`RefDomain`), else the tracer's own on constants.
+    fn traced_frame_agrees<A: GraphArith>(reference: bool) {
+        use super::super::refdomain::RefDomain;
         let src = cart::sources(&crate::settings::Settings::default()).expect("sources");
         let top = full_moon::parse(&src).expect("parse");
         let init = full_moon::parse("_init()").expect("parse _init");
         let reset = full_moon::parse("__reset_button_states()").expect("parse reset");
         let frame = full_moon::parse(cart::FRAME_CODE).expect("parse frame");
 
-        let mut it: Interp<Symbolic> = Interp::new(Symbolic::default());
+        let mut it: Interp<Symbolic<A>> = Interp::new(Symbolic::<A>::default());
         let cd = std::sync::Arc::new(celeste_core::cart_data::CartData::load("cart").expect("cart"));
         let (rx, ry) = crate::settings::Settings::default().room;
-        it.cache = Some(std::sync::Arc::new(
-            celeste_core::collision_cache::CollisionCache::new(&cd, rx, ry).expect("cache"),
-        ));
-        it.cart = Some(cd);
+        let cache = std::sync::Arc::new(celeste_core::collision_cache::CollisionCache::new(&cd, rx, ry).expect("cache"));
+        it.cache = Some(cache.clone());
+        it.cart = Some(cd.clone());
 
-        let st = cart::fresh_state::<Symbolic>(&mut it.d);
+        let st = cart::fresh_state::<Symbolic<A>>(&mut it.d);
         let mut st = run_one(&mut it, &top, st).expect("toplevel");
         cart::inject_tile_flag_at(&mut st);
         let mut st = run_one(&mut it, &init, st).expect("_init");
+        // The reference engine's interpreter, through the same start.
+        let mut rit: Interp<RefDomain<A>> = super::super::refdriver::fresh_interp(cd.clone(), cache.clone());
+        let rst = cart::fresh_state::<RefDomain<A>>(&mut rit.d);
+        let mut rst = run_one(&mut rit, &top, rst).expect("reference toplevel");
+        cart::inject_tile_flag_at(&mut rst);
+        let mut rst = run_one(&mut rit, &init, rst).expect("reference _init");
 
         // Warm up past the spawn animation, which reads no buttons.
         let mut player = None;
@@ -1990,6 +2022,7 @@ end
                 break;
             }
             st = run_one(&mut it, &frame, st).unwrap_or_else(|e| panic!("[verify] warm-up frame {n} stopped at: {e:#}"));
+            rst = run_one(&mut rit, &frame, rst).unwrap_or_else(|e| panic!("[verify] reference warm-up frame {n} stopped at: {e:#}"));
         }
         let (warm, player) = player.expect("[verify] a player within 40 warm-up frames");
         eprintln!("[verify] player at {} after {} warm-up frames", iface::show(&player), warm);
@@ -2040,11 +2073,11 @@ end
             Conc::Num(n) => n,
             Conc::Bool(_) => panic!("{} is a boolean", iface::show(p)),
         };
-        let n = crate::pico8_num::Pico8Num::from_i16;
+        let n = A::from_i16;
         // `at + d`, a pixel offset from the state's position.
-        let off = |at: crate::pico8_num::Pico8Num, d: i16| Conc::Num(at.checked_add(n(d)).expect("on screen"));
+        let off = |at: A::Num, d: i16| Conc::<A>::Num(A::add(at, n(d)).expect("on screen"));
         // Position x speed: hits walls, floors and the pit (non-trivial shapes).
-        let mut perts: Vec<(String, Vec<(Path, Conc)>)> = Vec::new();
+        let mut perts: Vec<(String, Vec<(Path, Conc<A>)>)> = Vec::new();
         for dx in [-8i16, -1, 0, 1, 8] {
             for dy in [-8i16, -1, 0, 1, 8, 24, 64] {
                 // Falling speed 8 exceeds the unroll bound: the REFUSAL case.
@@ -2154,7 +2187,7 @@ end
         let mut declined = 0usize;
         let mut declined_at: std::collections::BTreeMap<String, usize> = Default::default();
         let mut used: std::collections::BTreeSet<usize> = Default::default();
-        let at: Vec<(crate::transpile::graph::Graph, Vec<NodeId>)> = (0u8..64)
+        let at: Vec<(crate::transpile::graph::Graph<A>, Vec<NodeId>)> = (0u8..64)
             .map(|m| at_buttons(&it.d.graph, &f, &std::array::from_fn(|i| m & (1 << i) != 0)).expect("the six buttons"))
             .collect();
         // Every (sweep point, buttons) in parallel: each worker runs the
@@ -2164,21 +2197,22 @@ end
             Checked(usize, usize),
             Declined(String),
         }
-        struct Worker<'a> {
-            it: Interp<'a, Symbolic>,
+        struct Worker<'a, A: GraphArith> {
+            it: Interp<'a, Symbolic<A>>,
+            rit: Interp<'a, RefDomain<A>>,
             frame: &'a ast::Ast,
         }
-        // SAFETY: the interpreter's raw pointers point into this test's
+        // SAFETY: the interpreters' raw pointers point into this test's
         // ASTs, which outlive the scope and are only read.
-        unsafe impl Send for Worker<'_> {}
+        unsafe impl<A: GraphArith> Send for Worker<'_, A> {}
         let points: Vec<(usize, u8)> = (0..perts.len()).flat_map(|i| (0u8..64).map(move |m| (i, m))).collect();
         let next = std::sync::atomic::AtomicUsize::new(0);
         let workers = std::thread::available_parallelism().map_or(4, |n| n.get()).min(16);
         let mut results: Vec<(usize, Point)> = std::thread::scope(|sc| {
             let hs: Vec<_> = (0..workers)
                 .map(|_| {
-                    let mut w = Worker { it: it.clone(), frame: &frame };
-                    let (st, perts, f, at, points, next) = (&st, &perts, &f, &at, &points, &next);
+                    let mut w = Worker { it: it.clone(), rit: rit.clone(), frame: &frame };
+                    let (st, rst, perts, f, at, points, next) = (&st, &rst, &perts, &f, &at, &points, &next);
                     std::thread::Builder::new()
                         .stack_size(64 << 20)
                         .spawn_scoped(sc, move || {
@@ -2191,19 +2225,23 @@ end
                                 for (i, b) in bits.iter_mut().enumerate() {
                                     *b = mask & (1 << i) != 0;
                                 }
-                                let mut o = st.clone();
-                                for (p, c) in over {
-                                    let v = match c {
-                                        Conc::Num(n) => Value::Num(w.it.d.num(*n)),
-                                        Conc::Bool(b) => Value::Bool(w.it.d.boolean(*b)),
-                                    };
-                                    iface::set(&mut o, p, v).expect("override a heap slot");
-                                }
-                                set_buttons(&mut w.it.d, &mut o, &bits).unwrap_or_else(|e| panic!("[verify] {label} {bits:?}: {e:#}"));
-                                let mut o = run_one(&mut w.it, w.frame, o).unwrap_or_else(|e| panic!("[verify] oracle {label} {bits:?} stopped at: {e:#}"));
-                                // The absent-as-zero fields, as every frame's outcomes write them.
-                                crate::trace::widen::materialize_absent_fields(&mut o, &mut w.it.d).expect("materialize the absent fields");
-                                let want = iface::read_concrete(&w.it.d, &o, &[]).unwrap_or_else(|e| panic!("[verify] oracle {label} {bits:?} not concrete: {e:#}"));
+                                let want = if reference {
+                                    reference_frame(&mut w.rit, w.frame, rst, over, mask).unwrap_or_else(|e| panic!("[verify] reference {label} {bits:?}: {e:#}"))
+                                } else {
+                                    let mut o = st.clone();
+                                    for (p, c) in over {
+                                        let v = match c {
+                                            Conc::Num(n) => Value::Num(w.it.d.num(*n)),
+                                            Conc::Bool(b) => Value::Bool(w.it.d.boolean(*b)),
+                                        };
+                                        iface::set(&mut o, p, v).expect("override a heap slot");
+                                    }
+                                    set_buttons(&mut w.it.d, &mut o, &bits).unwrap_or_else(|e| panic!("[verify] {label} {bits:?}: {e:#}"));
+                                    let mut o = run_one(&mut w.it, w.frame, o).unwrap_or_else(|e| panic!("[verify] oracle {label} {bits:?} stopped at: {e:#}"));
+                                    // The absent-as-zero fields, as every frame's outcomes write them.
+                                    crate::trace::widen::materialize_absent_fields(&mut o, &mut w.it.d).expect("materialize the absent fields");
+                                    iface::read_concrete(&w.it.d, &o, &[]).unwrap_or_else(|e| panic!("[verify] oracle {label} {bits:?} not concrete: {e:#}"))
+                                };
                                 let point = match check_at(&w.it, f, &at[mask as usize], &cells, &bits, &want) {
                                     Ok((which, n)) => Point::Checked(which, n),
                                     // A refusal, not a wrong answer: counted.
@@ -2273,5 +2311,40 @@ end
             f.outs.len(),
             "some outcome was never reached by the sweep"
         );
+    }
+
+    /// The reference engine's frame of `start` with `over` written and the
+    /// buttons `byte` (as `ReferenceEngine::frame_states` runs a concrete
+    /// state): its one successor's scalars, every one a point.
+    fn reference_frame<'a, A: GraphArith>(
+        rit: &mut Interp<'a, super::super::refdomain::RefDomain<A>>,
+        frame: &'a ast::Ast,
+        start: &State<super::super::refdomain::RefDomain<A>>,
+        over: &[(Path, Conc<A>)],
+        byte: u8,
+    ) -> Result<Vec<(Path, Conc<A>)>> {
+        let mut o = start.clone();
+        for (p, c) in over {
+            let v = match c {
+                Conc::Num(n) => Value::Num(rit.d.num(*n)),
+                Conc::Bool(b) => Value::Bool(*b),
+            };
+            iface::set(&mut o, p, v)?;
+        }
+        super::super::refbridge::set_buttons(&mut o, byte)?;
+        let outs = super::super::refdriver::run_frame_all(rit, frame, &o, &[], crate::abstraction::Level::EXACT, 1 << 16)?;
+        anyhow::ensure!(outs.len() == 1, "{} successors of a concrete state", outs.len());
+        let mut o = outs.into_iter().next().expect("one");
+        crate::trace::widen::materialize_absent_fields(&mut o, &mut rit.d)?;
+        let mut want = Vec::new();
+        for p in iface::scalars(&o, &[])? {
+            let c = match iface::get(&o, &p).expect("a scalar") {
+                Value::Num(v) => Conc::Num(A::as_point(v).ok_or_else(|| anyhow!("{} is an interval", iface::show(&p)))?),
+                Value::Bool(b) => Conc::Bool(b),
+                _ => unreachable!("scalars only yields scalars"),
+            };
+            want.push((p, c));
+        }
+        Ok(want)
     }
 }

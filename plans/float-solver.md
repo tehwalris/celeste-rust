@@ -1133,3 +1133,49 @@ which is pushed. So they are LOCAL goldens:
 - `trace::oracle::tests::the_local_goldens` replays them. Where the store
   is absent, it prints SKIPPED, and nextest shows that output on success
   (`.config/nextest.toml`).
+
+### Milestone 5, step 1: the tracer, generic (built)
+
+The tracer and the graph IR take the arithmetic: `Symbolic<A>`,
+`Frame<A>`, `FrameOut<A>`, `Iface<A>`, `Conc<A>`, `trace_frame::<A>`, the
+widenings (`trace::widen`), the error derivation (`trace::error`), the
+evaluators (`trace::eval`, `Graph::eval*`), `ival`, `bdd`. 16.16 is
+byte-identical: the t1 ladder (forward outputs and metrics, KEY_CHECK, the
+ref-check and arc-check against the reference engine) and the unit suite
+pass unchanged.
+
+What the doubles needed beyond the moves:
+
+- **The round fork.** `RSplit(d)`/`RSplitValid(d)`, specialized to
+  `RFrag(c)`/`RFragOk(c)`, with coverage `RSplitOk(n)` as the fork's own
+  error: `SplitOk`'s twins over the values of `flr(fl(x + 1/2))`, cut at
+  `LuaF64Interval::round_fragment`'s points. `Domain::fork_round` returns
+  the fragment and its validity, as `fork_flr` does, and `Interp` forks it
+  as `split_floor` does (validity into the guard, the coverage error where
+  it is evaluated); a literal round fork is refused. 16.16 keeps its
+  shifted floor fork and never makes one.
+- **Pins by identity.** A double's `==` holds for `-0` against `0`, so a
+  float pin checks `Same` (bit identity), and an interval pin both ends.
+  16.16's pins keep `Eq` (`GraphArith::EQ_IS_IDENTITY`).
+- **Own errors.** `GraphArith::range_error`: the doubles' `+ - * /` and
+  `%` (by zero: NaN) leave the finite doubles; negation and `abs` cannot.
+- **Hooks.** The near floors' and platforms' hooks, `Points` and the
+  literal pins read raw 16.16 tables; in float they raise. The static
+  containment proof (`widen::within`) is 16.16's; in float every widened
+  slot's containment is checked per lane.
+- **Deterministic interval ends.** `LuaF64Interval::checked_mul`/`div`
+  took their ends with `f64::min`/`max`, which may return either zero on a
+  `-0`/`0` tie. They take the least and most corner in the total order now
+  (`-0` below `0`), which a kernel can compute bit for bit. Points are
+  unchanged; an interval with zero corners of both signs is `[-0, 0]`.
+- **`AtLeast`.** The block side's `max(v, k)` is the cart's `max` (the
+  tracer bakes `Op::Max(v, k)`): a double's tie gives `k`.
+
+The check, `a_traced_float_frame_agrees_with_the_reference_engine`: room
+(0,0)'s frame traced with the player and the globals symbolic, against the
+float reference engine (`RefDomain<Float>`, run as `frame_states` runs a
+concrete state) at 126 sweep points times the 64 inputs: 7,872 points
+agree bit for bit (413,248 field comparisons), 192 decline (the unrolled
+fall, as in 16.16), every outcome claimed. The round fork has its own:
+`a_round_fork_resolves_to_the_reference_fragments` (each configuration's
+fragment and validity against `round_fragment`, around the cut below 1).

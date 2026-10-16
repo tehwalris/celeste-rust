@@ -22,14 +22,17 @@ use celeste_core::pico8_num::{Pico8Num, Pico8NumInterval};
 
 use super::graph::{one_operand, Graph, NodeId, Op};
 
-pub trait GraphArith: Arithmetic {
+pub trait GraphArith: Arithmetic<Num: celeste_core::arith::EngineNum<A = Self>> {
     /// Do `min` and `max` commute (bit for bit)?
     const MINMAX_COMMUTE: bool;
     /// Is addition exact, so `(x - r) + r` is `x` and `(r + c) - r` is `c`
     /// wherever the ranges bound them (16.16: yes; doubles round)?
     const EXACT_ADDITION: bool;
+    /// Is the cart's `==` on numbers bit identity (16.16: yes; a double's
+    /// `-0 == 0`)? Where not, a pin checks `Op::Same`.
+    const EQ_IS_IDENTITY: bool;
     /// A static range, as pieces (`pieces_of`).
-    type Pieces: Clone + Debug + PartialEq;
+    type Pieces: Clone + Debug + PartialEq + Default;
 
     /// `SplitOk(n)` of the literal interval `[lo, hi]`, in the kernel's own
     /// arithmetic.
@@ -66,9 +69,17 @@ pub trait GraphArith: Arithmetic {
     fn bounded(p: &Self::Pieces) -> bool;
     /// The most floors a piece spans (`uncapped`: the hull's), at least 1.
     fn floors_spanned(p: &Self::Pieces, uncapped: bool) -> i64;
+    /// `floors_spanned`'s twin for the values of `flr(x + 1/2)` (the round
+    /// fork's arity).
+    fn rounds_spanned(p: &Self::Pieces, uncapped: bool) -> i64;
     /// A literal interval as raw 16.16, where the arithmetic is 16.16's
     /// (the literal splits of the levels with unknowns are so far).
     fn lit_raw_fixed(lo: Self::Lit, hi: Self::Lit) -> Option<(i32, i32)>;
+    /// Can `op` leave the arithmetic's range (`NoWrap`, its own error,
+    /// `trace::error`)? 16.16: `+ - * /`, negation and `abs` wrap or
+    /// saturate. Doubles: `+ - * /` and `%` can leave the finite doubles
+    /// (`%` by zero is NaN); negation and `abs` of a finite double cannot.
+    fn range_error(op: &Op<Self>) -> bool;
 }
 
 // ---- 16.16 ----
@@ -111,6 +122,7 @@ pub fn normalize_pieces(mut v: Pieces) -> Option<Pieces> {
 impl GraphArith for Fixed {
     const MINMAX_COMMUTE: bool = true;
     const EXACT_ADDITION: bool = true;
+    const EQ_IS_IDENTITY: bool = true;
     type Pieces = Pieces;
 
     fn lit_split_ok(lo: i32, hi: i32, n: u8) -> bool {
@@ -313,7 +325,7 @@ impl GraphArith for Fixed {
                 Some(vec![(a[0].0, b[b.len() - 1].1)])
             }
             // A fragment lies within its operand.
-            Op::Split(_) | Op::SplitInt(_) | Op::Frag(_) | Op::IntFrag(_) => rec(memo, 0),
+            Op::Split(_) | Op::SplitInt(_) | Op::Frag(_) | Op::IntFrag(_) | Op::RSplit(_) | Op::RFrag(_) => rec(memo, 0),
             // A lane's end, over the lanes (see `eval`'s `Lo`).
             Op::Lo | Op::Hi => {
                 let low = matches!(op, Op::Lo);
@@ -362,8 +374,24 @@ impl GraphArith for Fixed {
         w.max(1)
     }
 
+    /// `flr(x + 1/2)` is `(raw + 1/2) >> 16`, exactly.
+    fn rounds_spanned(ps: &Pieces, uncapped: bool) -> i64 {
+        let r = |v: i64| (v + 0x8000) >> 16;
+        let w = if uncapped {
+            let lo = ps.iter().map(|p| r(p.0)).min().unwrap_or(0);
+            let hi = ps.iter().map(|p| r(p.1)).max().unwrap_or(0);
+            (hi - lo + 1).min(i64::from(u8::MAX))
+        } else {
+            ps.iter().map(|p| r(p.1) - r(p.0) + 1).max().unwrap_or(1)
+        };
+        w.max(1)
+    }
+
     fn lit_raw_fixed(lo: i32, hi: i32) -> Option<(i32, i32)> {
         Some((lo, hi))
+    }
+    fn range_error(op: &Op<Fixed>) -> bool {
+        matches!(op, Op::Add | Op::Sub | Op::Neg | Op::Abs | Op::Mul | Op::Div)
     }
 }
 
@@ -418,6 +446,7 @@ fn below(x: f64) -> f64 {
 impl GraphArith for Float {
     const MINMAX_COMMUTE: bool = false;
     const EXACT_ADDITION: bool = false;
+    const EQ_IS_IDENTITY: bool = false;
     type Pieces = FloatPieces;
 
     fn lit_split_ok(lo: u64, hi: u64, n: u8) -> bool {
@@ -574,7 +603,7 @@ impl GraphArith for Float {
                 let (a, b) = (rec(memo, 0)?, rec(memo, 1)?);
                 Some(vec![(a[0].0, b[b.len() - 1].1)])
             }
-            Op::Split(_) | Op::SplitInt(_) | Op::Frag(_) | Op::IntFrag(_) => rec(memo, 0),
+            Op::Split(_) | Op::SplitInt(_) | Op::Frag(_) | Op::IntFrag(_) | Op::RSplit(_) | Op::RFrag(_) => rec(memo, 0),
             Op::Lo | Op::Hi => {
                 let low = matches!(op, Op::Lo);
                 let arg = g.get(args[0]).clone();
@@ -622,7 +651,23 @@ impl GraphArith for Float {
         (w as i64).max(1)
     }
 
+    /// `flr(fl(x + 1/2))`, monotone in `x` (`LuaF64Interval::rounds`).
+    fn rounds_spanned(ps: &FloatPieces, uncapped: bool) -> i64 {
+        let r = |v: f64| (v + 0.5).floor();
+        let w = if uncapped {
+            let lo = ps.iter().map(|p| r(p.0)).fold(f64::INFINITY, f64::min);
+            let hi = ps.iter().map(|p| r(p.1)).fold(f64::NEG_INFINITY, f64::max);
+            (hi - lo + 1.0).min(u8::MAX as f64)
+        } else {
+            ps.iter().map(|p| r(p.1) - r(p.0) + 1.0).fold(1.0, f64::max)
+        };
+        (w as i64).max(1)
+    }
+
     fn lit_raw_fixed(_lo: u64, _hi: u64) -> Option<(i32, i32)> {
         None
+    }
+    fn range_error(op: &Op<Float>) -> bool {
+        matches!(op, Op::Add | Op::Sub | Op::Mul | Op::Div | Op::Rem)
     }
 }

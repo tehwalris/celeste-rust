@@ -26,6 +26,7 @@
 
 use rustc_hash::FxHashMap;
 
+use super::garith::GraphArith;
 use super::graph::{Graph, NodeId, Op};
 
 /// `simplify_local`'s settings for the lowering: the most BDD nodes one
@@ -172,7 +173,7 @@ impl Bdd {
 
 /// Does this op PRODUCE a boolean, whatever its operands are? Used only to
 /// decide whether a `Sel` is a boolean select.
-fn inherently_bool(op: &Op) -> bool {
+fn inherently_bool<A: GraphArith>(op: &Op<A>) -> bool {
     matches!(
         op,
         Op::ConstBool(_)
@@ -182,6 +183,9 @@ fn inherently_bool(op: &Op) -> bool {
             | Op::Known
             | Op::SplitValid(_)
             | Op::SplitOk(_)
+            | Op::RSplitValid(_)
+            | Op::RSplitOk(_)
+            | Op::Same
             | Op::NoWrap
             | Op::Lt
             | Op::Le
@@ -194,7 +198,7 @@ fn inherently_bool(op: &Op) -> bool {
 
 /// Nodes reachable from `roots`, walking operands - everything that can
 /// affect what those roots compute, and nothing else.
-pub fn reachable(g: &Graph, roots: &[NodeId]) -> Vec<bool> {
+pub fn reachable<A: GraphArith>(g: &Graph<A>, roots: &[NodeId]) -> Vec<bool> {
     let mut need = vec![false; g.len()];
     let mut stack: Vec<NodeId> = roots.to_vec();
     while let Some(n) = stack.pop() {
@@ -236,7 +240,7 @@ pub struct Stats {
 /// Flatten a same-op tree (`Or`-of-`Or`s or `And`-of-`And`s) in `g` into
 /// its non-`op` leaves. `None` when the tree is bigger than `cap`, which
 /// bounds the work per candidate rather than trusting the input.
-fn flatten(g: &Graph, root: NodeId, want_and: bool, cap: usize) -> Option<Vec<NodeId>> {
+fn flatten<A: GraphArith>(g: &Graph<A>, root: NodeId, want_and: bool, cap: usize) -> Option<Vec<NodeId>> {
     let mut leaves = Vec::new();
     let mut stack = vec![root];
     while let Some(x) = stack.pop() {
@@ -256,7 +260,7 @@ fn flatten(g: &Graph, root: NodeId, want_and: bool, cap: usize) -> Option<Vec<No
 
 /// `x` and `y` are complements by their spelling: one is `Not` of the
 /// other, or they are complementary comparisons over the same operands.
-fn syntactic_complements(g: &Graph, x: NodeId, y: NodeId) -> bool {
+fn syntactic_complements<A: GraphArith>(g: &Graph<A>, x: NodeId, y: NodeId) -> bool {
     let (nx, ny) = (g.get(x), g.get(y));
     match (&nx.op, &ny.op) {
         (Op::Not, _) if nx.args[0] == y => true,
@@ -287,7 +291,7 @@ enum LocalVar {
 }
 
 /// A `Sel` between booleans (by an arm's own op).
-fn is_bool_sel(g: &Graph, n: NodeId) -> bool {
+fn is_bool_sel<A: GraphArith>(g: &Graph<A>, n: NodeId) -> bool {
     let node = g.get(n);
     matches!(node.op, Op::Sel) && (inherently_bool(&g.get(node.args[1]).op) || inherently_bool(&g.get(node.args[2]).op))
 }
@@ -331,7 +335,7 @@ impl Local {
     }
 
     /// `n`'s function, `None` if the local table overflowed.
-    fn func(&mut self, g: &Graph, n: NodeId) -> Option<Ref> {
+    fn func<A: GraphArith>(&mut self, g: &Graph<A>, n: NodeId) -> Option<Ref> {
         if let Some(r) = self.memo.get(&n) {
             return Some(*r);
         }
@@ -406,7 +410,7 @@ impl Local {
 /// The common-factor collapse (see `simplify_local`) of node `id` of the
 /// REWRITTEN graph: the operator and factor set to rebuild it from, and
 /// whether it was the syntactic-complement shape.
-fn factor_local(g: &Graph, local: &mut Local, id: NodeId, expand: usize) -> Option<(Op, Vec<NodeId>, bool)> {
+fn factor_local<A: GraphArith>(g: &Graph<A>, local: &mut Local, id: NodeId, expand: usize) -> Option<(Op<A>, Vec<NodeId>, bool)> {
     use std::collections::BTreeSet;
     let dual = match g.get(id).op {
         Op::Or => false,
@@ -519,7 +523,7 @@ fn factor_local(g: &Graph, local: &mut Local, id: NodeId, expand: usize) -> Opti
 /// (`folding_is_exact_not_merely_sound`) is exactness in Kleene, and this
 /// rewrite is a refinement (at `A = true`, `p = ⊥` the merged form is `⊥`).
 /// Dropping a duplicate leaf, by contrast, IS exact in Kleene.
-pub fn simplify_local(g: &Graph, roots: &[NodeId], cap: usize, expand: usize) -> (Graph, Vec<NodeId>, Stats) {
+pub fn simplify_local<A: GraphArith>(g: &Graph<A>, roots: &[NodeId], cap: usize, expand: usize) -> (Graph<A>, Vec<NodeId>, Stats) {
     let need = reachable(g, roots);
     let mut out = g.like();
     let mut map: Vec<NodeId> = vec![UNREACHABLE; g.len()];

@@ -27,7 +27,7 @@ use crate::trace::domain::{Arith, Cmp, Domain, Fun1, Fun2};
 /// appends `(0, n)` and returns 0. After a run reaches a leaf, `advance()`
 /// bumps the deepest choice (popping exhausted ones) and returns whether any
 /// path remains. `reset()` rewinds the position for the next run.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct Cursor {
     /// The path: `(choice, count)` per fork, in encounter order.
     decisions: Vec<(u32, u32)>,
@@ -85,7 +85,7 @@ impl Cursor {
 
 /// The reference domain of arithmetic `A`: the cursor is its only state.
 /// `RefDomain` is 16.16's.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct RefDomain<A: Arithmetic = Fixed> {
     pub cursor: Cursor,
     arith: std::marker::PhantomData<A>,
@@ -279,10 +279,10 @@ impl<A: Arithmetic> Domain for RefDomain<A> {
         (A::floor_fragment(*v, k), true)
     }
 
-    fn fork_round(&mut self, v: &A::Ival) -> Result<A::Ival> {
+    fn fork_round(&mut self, v: &A::Ival, _ways: u8) -> Result<(A::Ival, bool)> {
         let n = A::rounds(*v)?.ok_or_else(|| anyhow::anyhow!("__split_by_round of {}: more than 65536 values", show::<A>(v)))?;
         let k = self.cursor.choose(n);
-        A::round_fragment(*v, k)
+        Ok((A::round_fragment(*v, k)?, true))
     }
 }
 
