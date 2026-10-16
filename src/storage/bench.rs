@@ -299,9 +299,9 @@ pub fn bench_storage(a: &BenchArgs) -> Result<()> {
 /// `rewrite ckhash --edges`'s `e{frame}` line over the frame's edge file in
 /// `edges_dir` (`EdgeHashes::frame`; `xfers`: the merged table in memory,
 /// the dir's file may hold only the frame's new pairs).
-pub fn edge_fingerprint(edges_dir: &Path, frame: u32, xfers: &super::edges::XferTable, visited: &super::visited::VisitedSet, threads: usize) -> Result<(u64, u64)> {
-    let store = super::edges::EdgeStore::<celeste_core::pico8_num::Pico8Num>::open(edges_dir, frame)?;
-    EdgeHashes::new::<celeste_core::pico8_num::Pico8Num>(&xfers.pairs).frame(&store, frame, &visited.keys.content_hash(), visited.shapes(), threads)
+pub fn edge_fingerprint<N: crate::search::rem::Rem>(edges_dir: &Path, frame: u32, xfers: &super::edges::XferTable<N>, visited: &super::visited::VisitedSet<N>, threads: usize) -> Result<(u64, u64)> {
+    let store = super::edges::EdgeStore::<N>::open(edges_dir, frame)?;
+    EdgeHashes::new::<N>(&xfers.pairs).frame(&store, frame, &visited.keys.content_hash(), visited.shapes(), threads)
 }
 
 /// `ckhash --edges`'s per-edge term: `mix64(node(dst) ^ node(src) <<< 21 ^
@@ -698,7 +698,7 @@ pub fn dir_fingerprint(dir: &Path) -> Result<(u64, u64, u64)> {
 /// set's states and entries, beside the process's resident set (the rest:
 /// the kernels, the allocator's retained and fragmented pages, what no
 /// part counts).
-pub fn print_memory(when: &str, visited: &super::visited::VisitedSet, new: &super::layer::Layer, hulls: &[crate::search::hull::Hull], old: &super::wave::ByLayer, outs: &super::out::OutStore, xfers: &super::edges::XferTable) {
+pub fn print_memory<N: crate::search::rem::Rem>(when: &str, visited: &super::visited::VisitedSet<N>, new: &super::layer::Layer<N>, hulls: &[N::Hull], old: &super::wave::ByLayer<N>, outs: &super::out::OutStore, xfers: &super::edges::XferTable<N>) {
     let mut parts: Vec<(&str, usize)> = visited.census();
     let f = new.set.bytes();
     parts.push(("frontier: new states' keys, masks, index", f.iter().sum()));

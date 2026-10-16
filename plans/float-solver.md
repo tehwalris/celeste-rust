@@ -1493,3 +1493,15 @@ gemskip any% witness included); and every local witness leaves its room
 in the fixed engine. That check now follows every `rnd` lineage (some
 lineage exits on the last input, none before): the 2500m dual witness
 forks at frame 65 (a chest's unseeded shake in 16.16).
+
+### Float in the check ladder's t1 (item 4, section 11's plan)
+
+Float twins of the fixed fixtures (`tools/fixtures.sh`: `f10`, `f42n`,
+`f42x`, `f10arc`, `--arith float`, Celia's start) and their t1 steps:
+one frame each of f10 and f42n (`bench-frame --arith float`; their
+f/h/e lines equal the fixtures' own frames 56 and 61; no `--metrics`, the
+kernel mix census being 16.16's), the f42n keys (`--key-check`), a float
+backward frame (`bench-backward --arith float`, W f45 of h56, equal to
+its search's), and ref-check, arc-check and widen-check on f10, f42x and
+f42n. `bench-frame`, `bench-backward` and the storage bench's helpers are
+generic now.
