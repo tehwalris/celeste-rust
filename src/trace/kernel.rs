@@ -226,6 +226,7 @@ fn no_player_ranges<A: GraphArith>(
     start: &super::state::State<super::domain::Symbolic<A>>,
     opts: crate::abstraction::Level,
 ) -> Result<NoPlayer<A>> {
+    use super::domain::Domain as _;
     use super::iface::Conc;
     use super::shapes;
     if shapes::player_path(start).is_some() {
@@ -237,22 +238,40 @@ fn no_player_ranges<A: GraphArith>(
     // fruit's fields, unknown at a fruit level, bound nothing there.
     let fruit = std::mem::replace(&mut it.d.level.fruit, false);
     let chain_opts = crate::abstraction::Level { fruit: false, ..opts };
-    let mut ended = false;
-    let run = (|| -> Result<()> {
+    // Only a phase run to its END bounds anything, and only one that runs
+    // concretely. Two things stop that, and end the chain bounding nothing
+    // (said in the log): a start holding an `rnd` draw (a balloon's `offset`
+    // without `--balloon-seeds`), which no pin can hold, and a frame whose
+    // unpinned fields (the level's widened ones) fork it into several
+    // outcomes. Every other refusal is an error.
+    let run = (|| -> Result<bool> {
+        let drawn = shapes::state_paths(start)?.into_iter().find(|p| match super::iface::get(start, p) {
+            Some(super::heap::Value::Num(n)) => it.d.as_const(&n).is_none(),
+            Some(super::heap::Value::Bool(b)) => it.d.decide(&b).is_none(),
+            _ => false,
+        });
+        if let Some(p) = drawn {
+            eprintln!("[walk] the start holds an `rnd` draw ({}): its no-player phase cannot run concretely, no hull bounds it", super::iface::show(&p));
+            return Ok(false);
+        }
         let mut st = start.clone();
         // Read before `rebase` blanks them; the next trace pins them back.
         let mut consts = shapes::field_constants(start, &it.d, &chain_opts)?;
-        // Only a phase run to its END bounds anything; one that cannot run
-        // concretely (an `rnd` draw) bounds nothing.
-        for _ in 0..NO_PLAYER_FRAMES {
+        for k in 0..NO_PLAYER_FRAMES {
             np.note(&st, &consts, fruit)?;
             let roots = shapes::state_paths(&st)?;
             let pin: Vec<(super::iface::Path, Conc<A>)> = consts.iter().filter(|(p, _)| roots.contains(p)).map(|(p, c)| (p.clone(), *c)).collect();
-            let Ok(f) = super::verify::trace_frame(it, reset, fr, st.clone(), &roots, &pin, &[], true, &[], &[]) else { return Ok(()) };
-            let [o] = f.outs.as_slice() else { return Ok(()) };
+            let f = super::verify::trace_frame(it, reset, fr, st.clone(), &roots, &pin, &[], true, &[], &[]).map_err(|e| e.context(format!("the start's no-player chain, frame {k}")))?;
+            let o = match f.outs.as_slice() {
+                [o] => o,
+                [] => anyhow::bail!("the start's no-player chain, frame {k}: the frame has no outcome"),
+                outs => {
+                    eprintln!("[walk] the start's no-player chain forks into {} outcomes at frame {k}: no hull bounds its phase", outs.len());
+                    return Ok(false);
+                }
+            };
             if shapes::player_path(&o.st).is_some() {
-                ended = true;
-                return Ok(());
+                return Ok(true);
             }
             consts = shapes::field_constants(&o.st, &it.d, &chain_opts)?;
             let heap = shapes::heap_constants(&o.st, &it.d);
@@ -263,8 +282,7 @@ fn no_player_ranges<A: GraphArith>(
         anyhow::bail!("the start's no-player phase did not reach the player within {NO_PLAYER_FRAMES} frames")
     })();
     it.d.level.fruit = fruit;
-    run?;
-    if !ended {
+    if !run? {
         return Ok(NoPlayer::default());
     }
     np.on = true;
@@ -452,6 +470,26 @@ impl<A: GraphArith> NoPlayer<A> {
 
 #[cfg(test)]
 mod tests {
+    /// THE NO-PLAYER CHAIN ENDS QUIETLY ONLY WHERE IT CANNOT RUN CONCRETELY.
+    /// Room (5,0)'s balloon draws its `offset` from `rnd` in `_init`: the
+    /// chain bounds nothing, and says so. Any other refusal of a chain frame
+    /// (here the graph budget) is an error, never "no bounds": until
+    /// 2026-10-16 every trace error ended the chain silently.
+    #[test]
+    fn the_no_player_chain_refuses_loudly_but_for_an_rnd_draw() {
+        use crate::settings::Settings;
+        let level = crate::abstraction::Level::parse("r0sxh").expect("level");
+        let chain = |s: Settings, max_nodes: Option<usize>| {
+            let (mut tr, start) = super::boot::<celeste_core::arith::Fixed>(std::path::Path::new("."), &s, level).expect("boot");
+            tr.it.max_nodes = max_nodes.unwrap_or(tr.it.max_nodes);
+            super::no_player_ranges(&mut tr.it, tr.reset, tr.fr, &start, level)
+        };
+        let unseeded = chain(Settings { room: (5, 0), ..Default::default() }, None).expect("an `rnd` draw ends the chain quietly");
+        assert!(!unseeded.on, "a start with an `rnd` draw bounds nothing");
+        let e = chain(Settings::default(), Some(1)).err().expect("a refused chain frame is an error");
+        let e = format!("{e:#}");
+        assert!(e.contains("no-player chain, frame 0") && e.contains("the trace grew the graph"), "{e}");
+    }
 
     #[test]
     #[ignore = "slow, ./check.sh t2 runs it: room (6,1)'s lattice walk, ~15 s"]
@@ -506,6 +544,39 @@ mod tests {
     }
 }
 
+/// The walk's tracer at room `s.room`'s start: the cart's toplevel and
+/// `_init` run in it, every frame it traces at `opts`. The ASTs are leaked:
+/// the kept tracer's `Interp` borrows them.
+fn boot<A: GraphArith>(root: &std::path::Path, s: &crate::settings::Settings, opts: crate::abstraction::Level) -> Result<(Tracer<A>, super::state::State<super::domain::Symbolic<A>>)> {
+    use super::cart;
+    use super::verify::run_one;
+    use anyhow::anyhow;
+    let src = cart::sources_in(root, s)?;
+    let leak = |a: full_moon::ast::Ast| -> &'static full_moon::ast::Ast { Box::leak(Box::new(a)) };
+    let top = leak(full_moon::parse(&src).map_err(|e| anyhow!("parse: {:?}", e))?);
+    cart::check_absent_fields(top)?;
+    let init = leak(full_moon::parse("_init()").map_err(|e| anyhow!("parse _init: {:?}", e))?);
+    let reset = leak(full_moon::parse("__reset_button_states()").map_err(|e| anyhow!("reset: {:?}", e))?);
+    let fr = leak(full_moon::parse(cart::FRAME_CODE).map_err(|e| anyhow!("frame: {:?}", e))?);
+
+    let mut it = super::interp::Interp::new(super::domain::Symbolic::<A>::default());
+    let cart_data = std::sync::Arc::new(celeste_core::cart_data::CartData::load(root.join("cart"))?);
+    let (rx, ry) = s.room;
+    it.cache = Some(std::sync::Arc::new(celeste_core::collision_cache::CollisionCache::new(&cart_data, rx, ry)?));
+    it.cart = Some(cart_data);
+    it.d.build_trace = s.diag.build_trace;
+    // The level's widenings, for every frame this walk traces.
+    it.d.level = opts;
+    if opts.platforms {
+        it.d.worlds = Some(std::sync::Arc::new(crate::concrete::platform_worlds::<A>(PLATFORM_WORLD_FRAMES, s)?));
+    }
+    let st = cart::fresh_state(&mut it.d);
+    let mut st = run_one(&mut it, top, st)?;
+    cart::inject_tile_flag_at(&mut st);
+    let start = run_one(&mut it, init, st)?;
+    Ok((Tracer { it, reset, fr }, start))
+}
+
 /// The per-shape constant lattice by FIXPOINT over (shape, region) nodes:
 /// trace forward from the spawn with each shape's known constants PINNED,
 /// INTERSECT each outcome's constants into its shape's lattice, re-trace a
@@ -517,39 +588,12 @@ pub fn room_constant_lattice<A: GraphArith>(
     walk: &Walk,
 ) -> Result<LatticeWalk<A>> {
     use super::domain::Symbolic;
-    use super::interp::Interp;
-    use super::verify::run_one;
-    use super::{cart, shapes};
-    use anyhow::{anyhow, bail};
+    use super::shapes;
+    use anyhow::bail;
 
     let (s, only) = (walk.settings, walk.only);
-    let src = cart::sources_in(root, s)?;
-    // Leaked: the kept tracer's `Interp` borrows the ASTs.
-    let leak = |a: full_moon::ast::Ast| -> &'static full_moon::ast::Ast { Box::leak(Box::new(a)) };
-    let top = leak(full_moon::parse(&src).map_err(|e| anyhow!("parse: {:?}", e))?);
-    cart::check_absent_fields(top)?;
-    let init = leak(full_moon::parse("_init()").map_err(|e| anyhow!("parse _init: {:?}", e))?);
-    let reset = leak(full_moon::parse("__reset_button_states()").map_err(|e| anyhow!("reset: {:?}", e))?);
-    let fr = leak(full_moon::parse(cart::FRAME_CODE).map_err(|e| anyhow!("frame: {:?}", e))?);
-
-    let mut it: Interp<'static, Symbolic<A>> = Interp::new(Symbolic::<A>::default());
-    let cart_data = std::sync::Arc::new(celeste_core::cart_data::CartData::load(root.join("cart"))?);
-    let (rx, ry) = s.room;
-    let cache = std::sync::Arc::new(celeste_core::collision_cache::CollisionCache::new(&cart_data, rx, ry)?);
-    it.cache = Some(cache.clone());
-    it.cart = Some(cart_data.clone());
-    it.d.build_trace = s.diag.build_trace;
-    // The level's widenings, for every frame this walk traces.
-    it.d.level = opts;
-    if opts.platforms {
-        it.d.worlds = Some(std::sync::Arc::new(crate::concrete::platform_worlds::<A>(PLATFORM_WORLD_FRAMES, s)?));
-    }
-
-    let st = cart::fresh_state::<Symbolic<A>>(&mut it.d);
-    let st = run_one(&mut it, top, st)?;
-    let mut st = st;
-    cart::inject_tile_flag_at(&mut st);
-    let start = run_one(&mut it, init, st)?;
+    let (Tracer { mut it, reset, fr }, start) = boot::<A>(root, s, opts)?;
+    let (cart_data, cache) = (it.cart.clone().expect("boot loads the cart"), it.cache.clone().expect("boot loads the collision cache"));
 
     let key = |st: &super::state::State<Symbolic<A>>| -> Result<String> { Ok(format!("{:?}", st.shape()?)) };
 

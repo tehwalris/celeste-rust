@@ -223,8 +223,11 @@ phase under the hulls its concrete states take. A death reloads the room,
 so the walk explores every respawn entry it reaches, and the start, at the
 level's own widenings, into the same hulls. No merge selects on the state's
 own unknown inputs (`merge_refused_on`). Fatal: a spawn field held unknown,
-a phase without a player after 240 frames, an explored state that does not
-trace.
+a phase without a player after 240 frames, an explored state or a frame of
+the start's concrete chain that does not trace. The chain alone may end
+early, bounding nothing (a `[walk]` line says so): on a start holding an
+`rnd` draw (an unseeded balloon's `offset`) or a frame forking into several
+outcomes (the level's unpinned widened fields).
 
 ## The forward: hulls and storage
 
