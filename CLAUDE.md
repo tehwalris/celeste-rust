@@ -161,8 +161,9 @@ budget): a change keeps them byte-identical, or re-pins them on evidence.
 | `t0` | before every commit: the unit tests | ~3 s (+ the test build) |
 | `t1` | after any change to the forward, kernels, tracer or storage: single frames, fixed and float | ~35 s |
 | `t2` | before handing a change over: end to end, and the slow tests | ~55 s |
-| `big`, `perf` | the reference and platform frames; the instruction budget (2% over a pin fails) | ~40 s, ~30 s |
-| `all` | before a merge: every tier, the local goldens, every fixture rebuilt, the pre-merge tests | ~7 min |
+| `big` | the reference and platform frames | ~40 s |
+| `perf` | milestones and pre-merge: the instruction budget of the RELEASE build (2% over a pin fails) | ~4 min after an edit (the release build ~3.5 min, the frames 33 s) |
+| `all` | before a merge: every tier, the local goldens, every fixture rebuilt, the pre-merge tests | ~11 min |
 
 - **Run tests with NEXTEST, never bare `cargo test`** (tests mutate
   process-global state; under cargo test the suite once took 70-85 minutes

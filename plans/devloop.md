@@ -46,17 +46,18 @@ counts as the evidence.
 | `t1` | single frames from the fixtures, fixed and float, in 5 lanes: THE REFACTOR GATE | 35 s |
 | `t2` | end to end and the slow tests, in 4 lanes | 55 s |
 | `big` | the reference frame (6,2) f56 -> f57, its storage replay, the platform frame | 38 s |
-| `perf` | the instruction budget | 29 s |
+| `perf` | the instruction budget: the RELEASE build, measured; milestones and `all`, not every change | ~4 min after an edit (the release build ~3.5 min, the frames 33 s) |
 | `local` | the local goldens | 2 s |
 | `fixtures` | every fixture rebuilt from scratch against its pin | 3-4 min |
-| `all` | the pre-merge run: every tier above and the pre-merge tests (53 s) | 7 min |
+| `all` | the pre-merge run: every tier above and the pre-merge tests (53 s) | ~11 min (the release build in it) |
 
 Develop's ladder before this one (2026-10-16, measured against this one
 back to back, twice): t0 123 s, t1 61 s, t2 81 s, big 7 s.
 
 Run the inner loop while editing, t0 before every commit, and t1 after any
 change to the forward, the kernels, the tracer or the storage. Run t2
-before handing a change over, and `all` before a merge. Background anything
+before handing a change over, perf at milestones (a change meant to be
+faster, or one that may cost), and `all` before a merge. Background anything
 over ~30 s and wait for it with a Monitor until-loop; do not poll.
 
 ### t0: the unit tests
@@ -130,11 +131,18 @@ The steps run in four lanes:
   new states, 27M edges re-pushed), storage-r62h57 (its capture replayed),
   and frame-r60s (the platform frame step 70 -> 71 and its metrics).
 - **perf, the instruction budget** (`gates/perf.txt`): one rep's user-space
-  instructions on three bench frames: r62h f50 (19.76 G), r62h57 f56
-  (47.96 G) and float f42n f60 (6.39 G).
+  instructions on three bench frames, of the RELEASE binary (fat LTO, one
+  codegen unit; the tier builds it): r62h f50 (18.86 G), r62h57 f56
+  (45.42 G) and float f42n f60 (6.00 G), pinned from develop
+  `fa251711`.
   - The count is `perf stat -e instructions:u` of a `bench-frame --reps 3`
     run, less a `--reps 1` run, over 2. The kernel build, the tree's load
     and the start cancel out. Always 16 threads.
+  - Not the quick binary: its 16 codegen units re-partition on unrelated
+    edits (the wave's generics are instantiated in the binary crate), and
+    a diagnostic's edit in `rewrite.rs` moved all three frames by +2.2-3.1%
+    (2026-10-16). Release, and quick at one codegen unit, are stable
+    across such edits.
   - A frame more than 2% over its pin FAILS. One more than 2% under says to
     re-pin.
   - Run to run the counts stay within 0.2% at load 30-190. A loop injected

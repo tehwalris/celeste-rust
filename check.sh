@@ -16,7 +16,9 @@
 #   ./check.sh big [--pin]  the reference frame (6,2) 100% f56 -> f57 with its
 #                           capture replayed, and the platform frame's metrics
 #   ./check.sh perf [--pin] user-space instructions of three bench frames
-#                           against gates/perf.txt: more than 2% over FAILS
+#                           against gates/perf.txt, the RELEASE binary (built
+#                           here): more than 2% over FAILS; milestones and
+#                           `all`, not every slice
 #   ./check.sh local        the local goldens (/var/tmp/float-goldens; loud
 #                           SKIPPED where the store is absent)
 #   ./check.sh fixtures     every fixture rebuilt from scratch against its
@@ -29,7 +31,8 @@
 # steps in order; the reports print when every lane is done). `--pin`
 # writes the outputs as the new pins (gates/) instead of comparing: only on
 # evidence, and say why in the commit. Timings are reported, never pinned.
-# Builds the quick binary first. Env: CARGO_TARGET_DIR, CELESTE_FIXTURES,
+# Builds the quick binary first (perf: the release one too). Env:
+# CARGO_TARGET_DIR, CELESTE_FIXTURES,
 # CHECK_DIR (the scratch, default /var/tmp/celeste-check), THREADS (default
 # 16; the metrics are the same at every thread count; perf always runs 16).
 set -uo pipefail
@@ -39,6 +42,10 @@ PIN=${2:-}
 T=${CARGO_TARGET_DIR:-$PWD/target}
 B=$T/quick/rewrite
 export BIN=$B
+# The instruction budget's binary (perf): release, fat LTO and one codegen
+# unit. The quick profile's 16 units re-partition on unrelated edits and
+# moved a frame's instructions by 2-3% (2026-10-16).
+RB=$T/release/rewrite
 F=${CELESTE_FIXTURES:-/var/tmp/celeste-fixtures}
 G=gates/fixtures
 C=${CHECK_DIR:-/var/tmp/celeste-check}
@@ -409,14 +416,16 @@ big() {
 
 # THE INSTRUCTION BUDGET (gates/perf.txt): a bench frame's one rep in
 # user-space instructions, counted by `perf stat -e instructions:u` over a
-# 3-rep and a 1-rep run of `bench-frame` (their difference over 2: the
-# kernel build, the tree's load and the process start cancel; the rep's
-# fingerprints are in it). Instructions do not move with the machine's
-# load as walls do: run to run within ~0.2% at load 30-190. 16 threads
-# always (the pin's).
+# 3-rep and a 1-rep run of the RELEASE binary's `bench-frame` (their
+# difference over 2: the kernel build, the tree's load and the process
+# start cancel; the rep's fingerprints are in it). Instructions do not move
+# with the machine's load as walls do: run to run within ~0.2% at load
+# 30-190. 16 threads always (the pin's). The quick binary is not measured:
+# its codegen units re-partition on unrelated edits (2-3%).
 PERF_PINS=gates/perf.txt
 perftier() {
     build
+    step build-release ./safe-run.sh --memory 20G -- ./one-cargo.sh cargo build --release --bins
     step fixtures-perf tools/fixtures.sh ensure r62h r62h57 f42n
     step perf-r62h perfcount r62h 50 6,2 r0sxhf $L1_62
     step perf-r62h57 perfcount r62h57 56 6,2 r0sxhf $L1_62
@@ -432,7 +441,7 @@ perfcount() {
     local n i1 i3 rep pin
     rm -f "$C/perf-$name.line"
     for n in 1 3; do
-        ./safe-run.sh --memory "$MEM" -- perf stat -x, -e instructions:u -o "$C/perf-$name-$n.stat" -- "$B" bench-frame --level-dir "$F/$name" --frame "$f" --room "$room" --level "$level" --edges --threads 16 --l1-table "$F/$name/l1-table.bin" --reps "$n" "$@" > "$C/perf-$name-$n.frame" || return 1
+        ./safe-run.sh --memory "$MEM" -- perf stat -x, -e instructions:u -o "$C/perf-$name-$n.stat" -- "$RB" bench-frame --level-dir "$F/$name" --frame "$f" --room "$room" --level "$level" --edges --threads 16 --l1-table "$F/$name/l1-table.bin" --reps "$n" "$@" > "$C/perf-$name-$n.frame" || return 1
         diff "$G/$name.frame" "$C/perf-$name-$n.frame" >&2 || return 1
     done
     i1=$(awk -F, '$3 ~ /^instructions/ {print $1}' "$C/perf-$name-1.stat")
