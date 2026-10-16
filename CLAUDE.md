@@ -27,8 +27,8 @@ runs valid in both).
 Every any% room has a confirmed optimum, and the categories nodiag, 100%
 and gemskip are mostly done (plans/results.md).
 
-State of the code (2026-10-16): 65.4k lines of Rust (42.1k code, 9.5k
-comments, 10.7k tests, 3.1k blank), up from 36.5k on 2026-10-05. A
+State of the code (2026-10-16): 65.6k lines of Rust (42.2k code, 10.8k
+tests, 9.5k comments, 3.1k blank), up from 36.5k on 2026-10-05. A
 refactor to shorten and simplify it is starting: plans/refactor.md
 (temporary).
 

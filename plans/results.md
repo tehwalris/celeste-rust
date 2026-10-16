@@ -178,7 +178,7 @@ uploads `tas/tasdatabase/gemskip*/upload/`.
 | nodiag | 2800m (3,3) | 181 | 231 | **191, -40** | `--to 192` on the kept level-0 tree: bounds 186, 191 |
 | nodiag | 2900m (4,3) | 93 | 123 | **109, -14** | bounds 106, 109 |
 | nodiag | 3000m (5,3) | 88 | 120 | **106, -14** | `r0sxhn` bound 106; upload seeds nudged for UCT |
-| 100% | 2500m (0,3) | 117 | 142 | **141 (116f), -1** | real play J 1, level -1 (150,5): bound 141. Fixed point only, like the database's own file (`gates/witnesses/gemskip100_TAS25.tas`); a run valid in float too: plans/float.md |
+| 100% | 2500m (0,3) | 117 | 142 | **141 (116f), -1** | real play J 1, level -1 (150,5): bound 141. Fixed point only, like the database's own file (`gates/witnesses/gemskip100_TAS25.tas`) |
 | 100% | 2800m (3,3) | 164 | - | **213 (163f), -1** | the database's file never exits on PICO-8; real play J 3, `--to` 195 and 210 refuted, bound 213 |
 | 100% | 2900m (4,3) | 86 | - | **115 (85f), -1** | real play J 5 (after our 2800m), optimal there |
 
