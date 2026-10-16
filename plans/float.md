@@ -109,7 +109,7 @@ One axis, one frame: `r1 = fl(r + ox)`, `k = floor(fl(r1 + 0.5))`,
   tables built in every room of the Celia goldens but the platform rooms
   and the summit, which fixed refuses too; room (1,0)'s start d is 44, as
   fixed's.
-- The objects ladder (`--level r0sxhn,r0sxh`) and `check-known` run in
+- The objects ladder (`--level r0sxhn,r0sxh`) and `check known` run in
   float.
 
 ## The kernels' safety
@@ -128,10 +128,10 @@ The float kernels are the same graph, lowered to `vaddpd`-class AVX-512 on
   same glibc symbol).
 - `NoWrap` is FINITE: an operation that can leave the finite doubles is
   its own error, and a lane in error is a fatal coverage gap.
-- Checked as in fixed: `ref-check`, `--key-check`, `widen-check`,
-  `arc-check`, `missed 0`; the float trees of (1,0) to f44 and (1,3) to f46
+- Checked as in fixed: `check ref`, `--key-check`, `check widen`,
+  `check arcs`, `missed 0`; the float trees of (1,0) to f44 and (1,3) to f46
   equal the float reference engine's, frame by frame (`ckhash --edges
-  --hulls`). The kernel mix census (`--kernel-mix`, `bench-frame
+  --hulls`). The kernel mix census (`--kernel-mix`, `bench frame
   --metrics`) is 16.16's only.
 
 ## The dual search and rule (b)
@@ -199,7 +199,7 @@ tool file starts on the player's first frame.
   ignored test).
 - t1: the float twins of the fixtures (`f10`, `f42n`, `f42x`, `f10arc`):
   one frame each of f10 and f42n exact, f42n's keys, a backward frame,
-  ref-check, arc-check and widen-check.
+  check ref, check arcs and check widen.
 - t2: the room (1,0) gates in float (`gates/float_*`: posgraph, ckhash,
   the arc gate with its witness) and the dual gate (`gates/dual_*`), their
   UI exports.
@@ -210,7 +210,7 @@ tool file starts on the player's first frame.
 - Level -1 tables do not build for the platform rooms (6,0), (2,1), (1,2),
   in fixed either; `l1-check` ran over the 94 Celia goldens outside them,
   and over one UCT golden only.
-- At `n`, `ref-check` and `arc-check` skip most rows over the path cap (the
+- At `n`, `check ref` and `check arcs` skip most rows over the path cap (the
   reference forks a widened object per path), in both arithmetics; object
   rooms are checked at `r0sxh`.
 - The robustness report has not been run on the earlier float witnesses.

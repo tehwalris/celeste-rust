@@ -1,4 +1,4 @@
-//! THE KERNEL CENSUS (`bench-frame --metrics`, plans/devloop.md: the exact
+//! THE KERNEL CENSUS (`bench frame --metrics`, plans/devloop.md: the exact
 //! metrics): per kernel, at build time (`report`), its static counts - the
 //! traced and fused graphs' nodes by kind, the roots by role, the guards'
 //! terms, and its machine instructions by CATEGORY - and the slices it

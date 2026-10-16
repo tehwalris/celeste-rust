@@ -20,7 +20,7 @@ TABLE`): per entry its flag (every level, or `h`, `f`, `n`, `p`), its
 objects, per slot what it STORES, how the frame READS it, whether it is
 EXACT or an OVER-APPROXIMATION, and why. The tracer interprets the table in
 the graph (`trace::widen`), the block side over columns (`Rt2::widen_to`);
-neither has a widening the table does not name, and `rewrite widen-check`
+neither has a widening the table does not name, and `rewrite check widen`
 checks that they agree. The table below is GENERATED
 (`widening::render_markdown`) and a test keeps it equal
 (`the_abstractions_doc_lists_the_table`; `CELESTE_REGENERATE=1` rewrites it).
@@ -175,7 +175,7 @@ input, never a stored value); the concrete search's seeded-balloon view
   escape fork); the fruit's atoms keep refusing merges. Equality reads its
   ends unless an operand reads an unknown. Refuted by the ladder
   (`r0sxhfn,r0sxhn,r0sxh`) and the concrete search.
-- **`arc-check` at `f`** steps the reference at the level with the
+- **`check arcs` at `f`** steps the reference at the level with the
   kernels' forks (`RefEngine::step_at`), under two exact pins, each checked
   against the unpinned reference: the fly fruit's `spd.y`/`rem.y` pinned
   to 0, and at `n` a floor isolated from the player (20 px, no spring near)

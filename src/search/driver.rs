@@ -1,5 +1,5 @@
 //! THE SEARCH'S DRIVER (`rewrite search`, `rewrite dual`, `rewrite
-//! check-known`; plans/architecture.md "The search"): per level of
+//! check known`; plans/architecture.md "The search"): per level of
 //! `--level`, coarsest first, the forward (`frame::grow_tree`; a finer
 //! level filtered by the coarser one's arc-marked nodes) and its arc phase
 //! (`arc_dp::solve`), then at the last level the concrete search - or, for
@@ -279,38 +279,51 @@ fn run_levels<N: KernelLanes>(
     anyhow::bail!("no level given")
 }
 
-/// `rewrite check-known`: a KNOWN route (`inputs`) against the pruning of
-/// the finished search in `dir` (levels `level`, horizon `horizon` frames):
-/// per level the arc phase rerun as the search ran it, without the
-/// concrete search, and the route checked at every step (`search::known`,
-/// the hull forward's claim too). An error at the first check that drops
-/// it.
-pub fn check_known(dir: &Path, level: &str, inputs: &[u8], horizon: u32, cfg: &Settings) -> Result<()> {
-    match cfg.arith {
-        Arith::Fixed => check_known_in::<P8>(dir, level, inputs, horizon, cfg),
-        Arith::Float(_) => check_known_in::<LuaF64>(dir, level, inputs, horizon, cfg),
+/// `rewrite check known`: a KNOWN route (`inputs`) against the pruning of
+/// the finished search in `dir`: per level the arc phase rerun as the
+/// search ran it, without the concrete search, and the route checked at
+/// every step (`search::known`, the hull forward's claim too). The levels
+/// and the horizon are the search's record's (`result.json`; a dual
+/// search's half, `DIR/fixed` or `DIR/float`, reads `DIR`'s), the horizon
+/// unless `horizon` gives one; each tree's settings its own record's, the
+/// run's own (threads, the concrete phase's seeds) from `run`. An error at
+/// the first check that drops the route.
+pub fn check_known(dir: &Path, inputs: &[u8], horizon: Option<u32>, run: &Settings) -> Result<()> {
+    let res = SearchResult::read(dir).or_else(|e| match dir.parent() {
+        Some(p) if super::result::path(p).exists() => SearchResult::read(p),
+        _ => Err(e),
+    })?;
+    let horizon = horizon.unwrap_or(res.horizon);
+    let mut trees = Vec::new();
+    for (li, spec) in res.level.split(',').enumerate() {
+        let d = dir.join(format!("level{li:02}"));
+        let (s, lvl) = Settings::of_tree(&d, run)?;
+        anyhow::ensure!(lvl.to_string() == Level::parse(spec).map_err(|e| anyhow::anyhow!(e))?.to_string(), "{}: level {lvl}, the search's record says {spec}", d.display());
+        trees.push((d, s, lvl));
+    }
+    match trees[0].1.arith {
+        Arith::Fixed => check_known_in::<P8>(&trees, inputs, horizon),
+        Arith::Float(_) => check_known_in::<LuaF64>(&trees, inputs, horizon),
     }
 }
 
-fn check_known_in<N: KernelLanes>(base: &Path, level: &str, inputs: &[u8], horizon: u32, cfg: &Settings) -> Result<()> {
-    let steps = horizon * cfg.steps_per_frame();
-    let levels: Vec<Level> = level.split(',').map(Level::parse).collect::<std::result::Result<_, _>>().map_err(|e| anyhow::anyhow!(e))?;
+fn check_known_in<N: KernelLanes>(trees: &[(std::path::PathBuf, Settings, Level)], inputs: &[u8], horizon: u32) -> Result<()> {
     let t0 = std::time::Instant::now();
     let mut prev: Option<(Visited<N>, Level)> = None;
-    for (li, &lvl) in levels.iter().enumerate() {
-        let last = li + 1 == levels.len();
-        let dir = base.join(format!("level{li:02}"));
-        anyhow::ensure!(crate::frame::tree_first_win_through::<N>(&dir, steps)?.is_some(), "{}: no tree through step {steps} (run the search first)", dir.display());
+    for (li, (dir, cfg, lvl)) in trees.iter().enumerate() {
+        let (last, lvl) = (li + 1 == trees.len(), *lvl);
+        let steps = horizon * cfg.steps_per_frame();
+        anyhow::ensure!(crate::frame::tree_first_win_through::<N>(dir, steps)?.is_some(), "{}: no tree through step {steps} (run the search first)", dir.display());
         let filter = prev.as_ref().map(|(m, l)| MarkFilter::new(m, *l, cfg.steps_per_frame()));
         let route = super::known::Route { inputs, filter: filter.as_ref(), hulls: true };
-        let s = solve::<N>(&dir, lvl, steps, false, false, !last, None, None, Some(&route), cfg)?;
+        let s = solve::<N>(dir, lvl, steps, false, false, !last, None, None, Some(&route), cfg)?;
         let f = s.known.ok_or_else(|| anyhow::anyhow!("the known route does not exit by f{horizon}: nothing to check"))?;
-        println!("[check-known] level {li} ({lvl}): the known route (exit f{f}) survives (arc bound {:?})", s.arc);
+        println!("[check known] level {li} ({lvl}): the known route (exit f{f}) survives (arc bound {:?})", s.arc);
         if last {
             break;
         }
         prev = Some((s.arc_marks.expect("asked for"), lvl));
     }
-    println!("[check-known] every level passes ({:.1} s)", t0.elapsed().as_secs_f64());
+    println!("[check known] every level passes ({:.1} s)", t0.elapsed().as_secs_f64());
     Ok(())
 }

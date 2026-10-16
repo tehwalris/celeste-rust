@@ -1,4 +1,4 @@
-# rewrite bench-frame --metrics: room 6,2, r0sxhf, f50 -> f51
+# rewrite bench frame --metrics: room 6,2, r0sxhf, f50 -> f51
 all.bodies 42743
 all.bodies.distinct_error 2327
 all.bodies.distinct_live 2853

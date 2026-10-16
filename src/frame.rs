@@ -931,17 +931,17 @@ impl<N: Rem> ForwardState<N> {
         self.visited.len()
     }
 
-    /// The visited set (`bench-frame`).
+    /// The visited set (`bench frame`).
     pub fn visited(&self) -> &crate::storage::visited::VisitedSet<N> {
         &self.visited
     }
 
-    /// The frontier: the last frame's states whose hull grew (`bench-frame`).
+    /// The frontier: the last frame's states whose hull grew (`bench frame`).
     pub fn frontier(&self) -> &Frontier<N> {
         &self.frontier
     }
 
-    /// The out store and the transfer table (`bench-frame`'s `[memory]`).
+    /// The out store and the transfer table (`bench frame`'s `[memory]`).
     pub fn outs_and_xfers(&self) -> (&crate::storage::out::OutStore, &crate::storage::edges::XferTable<N>) {
         (&self.outs, &self.xfers)
     }
@@ -963,7 +963,7 @@ impl<N: Rem> ForwardState<N> {
     /// state is spent, and refuses another wave). The edges go to
     /// `edges_dir` (a scratch dir; `None`: not recorded). Returns the wave
     /// with the visited set and transfer table it ran against, which hold
-    /// its new states and pairs (`bench-frame`, run per rep).
+    /// its new states and pairs (`bench frame`, run per rep).
     pub fn bench_wave(
         &mut self,
         engine: &dyn FrameStep<N>,

@@ -25,15 +25,15 @@ byte-identical, or re-pins them on evidence.
   `[gate]` line, and its UI export.
 - **The float and dual gates** (t2), and the float twins' frames (t1).
 - **The differential checks against the reference engine**:
-  - t1: `ref-check`, `arc-check` (and `arc-check --fault action` must fail),
-    `--key-check` and `widen-check`;
+  - t1: `check ref`, `check arcs` (and `check arcs --fault action` must fail),
+    `--key-check` and `check widen`;
   - t2: `reference10[f]`, the reference engine's forward tree equal to the
     kernels', f0-f27 with edges and hulls, fixed and float;
   - t2: `hull10[f]`, the hull replay over the recorded edges.
 - **A platform room** (t2): its forward to step 71. Big has its frame.
 - **The instruction budget** (perf).
 
-The metrics (`bench-frame --metrics`: the kernel census, the dynamic kernel
+The metrics (`bench frame --metrics`: the kernel census, the dynamic kernel
 instructions, lanes, edges; t1, big) are exact too, but coupled to the
 tracer and the codegen: a change there moves them. Re-pin them with the
 counts as the evidence.
@@ -95,12 +95,12 @@ r42x), f10 and f42 (f42n, f42x).
 
 | steps | what |
 |---|---|
-| frame-r10, -r62h, -r42n | `bench-frame --edges --checkpoint --metrics` of r10 f55, r62h f50, r42n f60: the f/h/e/b lines and the exact metrics |
+| frame-r10, -r62h, -r42n | `bench frame --edges --checkpoint --metrics` of r10 f55, r62h f50, r42n f60: the f/h/e/b lines and the exact metrics |
 | frame-f10, -f42n | the same in float (no metrics) |
 | keycheck-r10, -r42n, -f42n | `--key-check`: every emitted row's key recomputed from its fields, and decoded back |
-| refcheck-r10, -r42x, -f10, -f42x | `ref-check`: 32 rows through the kernels and the reference engine; the converters agree |
-| arccheck-, arcfault- (r10, f10; arccheck also r42x, f42x) | `arc-check`: 32 recorded transfers against the reference; with `--fault action` it must fail |
-| widen-r10, -r62h, -r42n, -f10, -f42n | `widen-check`: the widening table's two sides agree on every stored row and 64 rows' emissions |
+| refcheck-r10, -r42x, -f10, -f42x | `check ref`: 32 rows through the kernels and the reference engine; the converters agree |
+| arccheck-, arcfault- (r10, f10; arccheck also r42x, f42x) | `check arcs`: 32 recorded transfers against the reference; with `--fault action` it must fail |
+| widen-r10, -r62h, -r42n, -f10, -f42n | `check widen`: the widening table's two sides agree on every stored row and 64 rows' emissions |
 | backward-r10arc, -f10arc | one arc backward step, W f45 of h56 |
 
 ### t2: end to end
@@ -114,7 +114,7 @@ The steps run in four lanes:
   `export-ui` (the UI export of four of these searches, by digest);
 - **properties**: `reference10` and `reference10f` (`forward --reference`
   against the kernels' forward, `ckhash --edges --hulls` f0-f27), and
-  `hull10[f]` (`hull-replay` over the kernels' tree to f36: its recorded
+  `hull10[f]` (`check replay` over the kernels' tree to f36: its recorded
   edges reproduce its states at every frame);
 - **platforms**: `forward60-platforms` (room (6,0) `r0sxhfp` split frame to
   step 71, its `ckhash --edges --hulls` the r60s pin) and `widen-r60s`;
@@ -135,7 +135,7 @@ The steps run in four lanes:
   codegen unit; the tier builds it): r62h f50 (18.86 G), r62h57 f56
   (45.42 G) and float f42n f60 (6.00 G), pinned from develop
   `fa251711`.
-  - The count is `perf stat -e instructions:u` of a `bench-frame --reps 3`
+  - The count is `perf stat -e instructions:u` of a `bench frame --reps 3`
     run, less a `--reps 1` run, over 2. The kernel build, the tree's load
     and the start cancel out. Always 16 threads.
   - Not the quick binary: its 16 codegen units re-partition on unrelated
@@ -166,7 +166,7 @@ perf is the regression check. This is the profiling workflow, for speed
 work on the forward outside the kernels: emission, unit ends, re-pushes, the
 region phase, the frame end, the checkpoint.
 
-`rewrite bench-frame --edges --checkpoint --reps N` runs frame F -> F+1 of a
+`rewrite bench frame --edges --checkpoint --reps N` runs frame F -> F+1 of a
 fixture tree (`ForwardState::at`). It prints the pins: the `f`, `h` and `e`
 lines and `b` (the bytes of every file the frame wrote). Every rep must
 agree. Its stderr `[cost]` lines give:
@@ -194,7 +194,7 @@ Wall times need a quiet machine:
 - prefer worker-seconds and per-element costs, or perf's instruction counts;
 - never quote a speedup from one noisy pair.
 
-For a profile, `perf record -g -m 8 -- rewrite bench-frame ...`:
+For a profile, `perf record -g -m 8 -- rewrite bench frame ...`:
 
 - `-m 8`: the mlock budget is per user.
 - The kernels are `.so`s in `$TMPDIR/asm-scratch/PID/`, gone when the next
@@ -215,9 +215,9 @@ are never committed.
   pinned by its fingerprint.
 - Transfer ids are canonical (`edges::XferTable::canonical`), so a frame
   check's edge bytes are a function of the search.
-- Level -1 fixtures keep their table (`NAME/l1-table.bin`; `bench-frame`
+- Level -1 fixtures keep their table (`NAME/l1-table.bin`; `bench frame`
   refuses another).
-- `bench-frame` writes its scratch into the fixture, so a fixture's steps
+- `bench frame` writes its scratch into the fixture, so a fixture's steps
   share one lane.
 
 | fixture | what | build |
@@ -247,7 +247,7 @@ then the tiers' `--pin`.
 
 ## Gaps
 
-- **The n level against the reference.** `ref-check` and `arc-check` at
+- **The n level against the reference.** `check ref` and `check arcs` at
   `r0sxhn` fork the widened objects into thousands of paths a row. t1
   checks the object room at `r0sxh`, and the n kernels end to end
   (search42) and by key-check.

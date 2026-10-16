@@ -14,6 +14,7 @@
 //!   * `result`      - `result.json`: what a search decided, as a record
 //!   * `robust`      - a float witness against the host libm's `sin`
 //!   * `inspect`     - rows read by named fields, for the diagnostics
+//!   * `tree`        - a finished tree as the commands that read it open it
 //!   * `ui_export`   - `rewrite export-ui`: a finished run -> the web UI's data
 //!   * `arc_check`, `hull_replay`, `reach` - checks of a tree: its transfers
 //!                     against the reference engine, its states replayed from
@@ -35,6 +36,7 @@ pub mod rem;
 pub mod rem_f64;
 pub mod result;
 pub mod robust;
+pub mod tree;
 pub mod ui_export;
 
 pub use driver::{check_known, run, SearchSpec};

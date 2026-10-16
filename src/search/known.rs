@@ -1,4 +1,4 @@
-//! A KNOWN solution against the search's pruning (`rewrite check-known`, and
+//! A KNOWN solution against the search's pruning (`rewrite check known`, and
 //! `rewrite search --prefer` when the file wins by the horizon).
 //!
 //! The search prunes by several things - level -1, the objects ladder's
@@ -24,7 +24,7 @@
 //!   the node is REACHED (`arc_dp::reach`) with a deadline >= s. The start
 //!   is the tree's frame-0 row (stored unwidened), its W the arc optimum's.
 //!
-//! `rewrite check-known` also checks THE HULL FORWARD'S CLAIM (`Hulls`;
+//! `rewrite check known` also checks THE HULL FORWARD'S CLAIM (`Hulls`;
 //! whole frames only): at every step the route's state is in the tree by
 //! then, its exact remainder inside its state's hull, and the step from its
 //! parent a recorded edge whose transfer takes the parent's remainder to its
@@ -50,7 +50,7 @@ use celeste_core::pico8_num::Pico8Num as P8;
 pub struct Route<'a, N: Rem = P8> {
     pub inputs: &'a [u8],
     pub filter: Option<&'a MarkFilter<'a, N>>,
-    /// Also the hull forward's claim (`Hulls`): `rewrite check-known`.
+    /// Also the hull forward's claim (`Hulls`): `rewrite check known`.
     pub hulls: bool,
 }
 

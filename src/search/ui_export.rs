@@ -808,13 +808,12 @@ pub struct Paths<'a> {
     pub download: Option<&'a Path>,
 }
 
-/// The export. `checkpoint_dir` is a search's (`result.json`, `levelNN/`);
-/// `s` the run's settings (its start room: the record's must agree; its
-/// threads); `arc` its `search --save-marks` directory.
-pub fn export(checkpoint_dir: &Path, out: &Path, s: &crate::settings::Settings, arc: Option<&Path>, paths: Paths) -> Result<()> {
-    let (room, threads) = (s.room, s.threads());
+/// The export. `checkpoint_dir` is a search's (`result.json`, `levelNN/`:
+/// its room the record's); `threads` the workers; `arc` its `search
+/// --save-marks` directory.
+pub fn export(checkpoint_dir: &Path, out: &Path, threads: usize, arc: Option<&Path>, paths: Paths) -> Result<()> {
     let res = super::result::SearchResult::read(checkpoint_dir)?;
-    anyhow::ensure!(res.room == room, "{}: the search ran in room {:?}, this run's --room is {room:?}", checkpoint_dir.display(), res.room);
+    let room = res.room;
     let last = res.levels.last().with_context(|| format!("{}: the search recorded no level ({:?})", checkpoint_dir.display(), res.verdict))?;
     // `h` counts search steps (the trees' frames).
     let h = res.horizon * res.steps_per_frame;

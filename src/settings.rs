@@ -161,7 +161,7 @@ pub struct Diagnostics {
     /// DIAGNOSTIC: kernels keep their graphs, so a decline names its premise.
     #[arg(long, global = true)]
     pub kernel_explain: bool,
-    /// The kernels' census and slice counters (`bench-frame --metrics`).
+    /// The kernels' census and slice counters (`bench frame --metrics`).
     #[arg(skip)]
     pub kernel_metrics: bool,
     /// DIAGNOSTIC: the kernel build's and the lattice walk's progress.
@@ -440,6 +440,12 @@ impl Settings {
     }
 }
 
+/// The settings a tree decides (its record's, and the level -1 filter's),
+/// by key: a command that reads a finished tree refuses them as flags.
+pub fn tree_keys() -> Vec<&'static str> {
+    Settings::default().rows().into_iter().filter(|r| r.recorded).map(|r| r.key).chain(["level_minus_one"]).collect()
+}
+
 /// A tree's record (`settings.txt`): its lines, `key value`, by key.
 fn read_record(dir: &Path) -> Result<std::collections::BTreeMap<String, String>> {
     let p = path(dir);
@@ -618,7 +624,7 @@ pub fn refuse_env() -> Result<()> {
         ("CELESTE_L1_TABLE", "--l1-table"),
         ("CELESTE_KERNEL_KEY_CHECK", "--key-check"),
         ("CELESTE_KERNEL_EXPLAIN", "--kernel-explain"),
-        ("CELESTE_KERNEL_METRICS", "bench-frame --metrics"),
+        ("CELESTE_KERNEL_METRICS", "bench frame --metrics"),
         ("CELESTE_BUILD_TRACE", "--build-trace"),
         ("CELESTE_PHASES", "--phases"),
     ];

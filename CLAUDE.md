@@ -97,8 +97,11 @@ latter.
   They are parsed once into `settings::Settings` and PASSED (no globals). A
   tree records the settings that change it (`<level>/settings.txt`) and
   refuses a run under others (`--override-settings` passes only
-  `--region`); flags never default to the record. A new tree setting is a
-  field, a record line and a flag, and bumps `settings::VERSION`. Add a
+  `--region`); a run's flags never default to the record. A command that
+  only READS a finished tree takes its settings from the record and refuses
+  them as flags. A new tree setting is a field of `Settings` (its flag) and
+  a row of `Settings::rows` (its record line), and bumps
+  `settings::VERSION`. Add a
   knob only when necessary; prefer Rust to Python (Python only drives
   external tools: PICO-8, UCT, Celia, the tasdatabase).
 - **Never commit generated JSON** (a 28 MB `cfg_analysis.json` once
@@ -221,10 +224,13 @@ checkout's Lua.
 ## The commands
 
 Every binary documents itself: `rewrite --help` (the search, every
-diagnostic, `run`: one concrete run), `rewrite <command> --help`,
-`transpile --help` (the level -1 table). The settings flags (`--room`, the
-category, `--level-minus-one`, `--threads`, ...) are shared by both. The
-most common:
+diagnostic, `run`: one concrete run), `rewrite <command> --help` (`rewrite
+check --help`: the checks of a tree; `rewrite bench --help`), `transpile
+--help` (the level -1 table). The settings flags (`--room`, the category,
+`--level-minus-one`, `--threads`, ...) are shared by both; a command that
+reads a finished tree (`--tree DIR`, or a search's `--checkpoint-dir`)
+takes them from the tree's records instead and refuses them. The most
+common:
 
 ```bash
 # THE SEARCH: --ceiling H for a known solution (a refutation or no witness
@@ -239,12 +245,13 @@ most common:
 # THE DUAL SEARCH: the shortest file valid in both arithmetics (plans/float.md).
 ./safe-run.sh --memory 40G -- ./target/release/rewrite dual --room 0,3 --gemskip --hundred \
     --loading-jank 1 --level r0sxhn,r0sxh --level-minus-one 150,5 --to 150 --checkpoint-dir DIR
-# A known solution against every pruning step of finished trees.
-./safe-run.sh -- ./target/quick/rewrite check-known --checkpoint-dir DIR --level SPEC \
-    --horizon H --room X,Y --inputs tas/FILE.txt
-# One forward at one level; then its fingerprint.
+# A known solution against every pruning step of a finished search (its
+# settings, levels and horizon from its records).
+./safe-run.sh -- ./target/quick/rewrite check known --checkpoint-dir DIR --inputs tas/FILE.txt
+# One forward at one level; then its fingerprint (a command that reads a
+# tree takes its settings from the tree's records: no --room, --level, ...).
 ./safe-run.sh -- ./target/release/rewrite forward --to 44 --room 1,0 --checkpoint-dir DIR
-./safe-run.sh -- ./target/quick/rewrite ckhash --to 44 --checkpoint-dir DIR
+./safe-run.sh -- ./target/quick/rewrite ckhash --tree DIR --to 44
 # A float witness against a nudged libm `sin`.
 ./safe-run.sh -- ./target/quick/rewrite robust --arith float --room X,Y [category] --inputs FILE
 # On a real PICO-8, headless (--lua .../celeste_ocaml/celeste.lua --begin-game: the original cart).

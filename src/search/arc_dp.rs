@@ -521,7 +521,7 @@ pub fn backward<N: Rem>(store: &EdgeStore<N>, pairs: &[Xfer<N>], wins: &[(Sk, u3
 
 /// The backward between two frames: `W_{t+1}` (the frame done last), which
 /// of its sets changed there, and the spans closed so far. `rewrite
-/// bench-backward` times one `step`.
+/// bench backward` times one `step`.
 pub struct Backward<'a, N: Rem = P8> {
     store: &'a EdgeStore<N>,
     /// Per target region the first frame with edges into it.
@@ -1280,7 +1280,7 @@ impl<'a, N: Rem> ReachEdges<'a, N> {
 /// Sound as a filter where `W`'s deadline is: a concrete winning path's
 /// remainder at frame `t` is in `W_t` of its node (W holds every winner)
 /// and is the image of its remainder at `t - 1` along the recorded edge (the
-/// arc model `arc-check` probes), so by induction it is in `R_t`. Tighter:
+/// arc model `check arcs` probes), so by induction it is in `R_t`. Tighter:
 /// a node `W` lets win from some remainder no path from the start brings is
 /// not marked.
 ///
@@ -1935,7 +1935,7 @@ pub struct Arcs<N: Rem = P8> {
 
 /// One node's term of the gate's `W f{t}` line: the node's content hash
 /// (`exact::ContentHash::state`) folded with its set's rectangles
-/// (`rewrite bench-backward` prints the same line for one frame).
+/// (`rewrite bench backward` prints the same line for one frame).
 pub fn gate_w_hash<C: Circle>(node: u64, r: RegionRef<C>) -> u64 {
     use celeste_engine::runtime2::mix64;
     let mut h = node;

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compare an EXACT metrics file (`rewrite bench-frame --metrics`) with its
+"""Compare an EXACT metrics file (`rewrite bench frame --metrics`) with its
 pinned copy (gates/fixtures/NAME.metrics): every key whose value moved, with
 the percent change, the per-kernel `k.<sym>.*` lines summarized (how many
 kernels appeared, disappeared or changed; the largest changes listed).
