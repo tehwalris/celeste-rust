@@ -134,9 +134,10 @@ region jobs 2.1 s, frame end 0.25 s at 16 threads, edge file v6;
 
 Not part of any tier: run them when their reason applies.
 
-- the two `#[ignore]`d tests (`--run-ignored all`) and the full arc-check of
-  the gate tree, after touching the tracer, lowering, codegen, edge
-  recording, resume or level -1;
+- the `#[ignore]`d tests (`--run-ignored only`: the resume, the floors'
+  pin, room (7,1)'s level -1 table and room (1,0)'s float one) and the full
+  arc-check of the gate tree, after touching the tracer, lowering, codegen,
+  edge recording, resume or level -1;
 - 3 against 32 threads and a resume, identical (every frame, hull, edge
   and out file, byte for byte), after touching the wave's scheduling, the
   hulls, the out store or resume;

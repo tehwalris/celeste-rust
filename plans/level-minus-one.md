@@ -168,6 +168,45 @@ the table's fastest path from (16, 48) (the `--l1-path` probe printed it;
 cut 2026-10-10, branch `settings-explicit`). Bigger: speed per node instead of [-S, S]
 everywhere (would bend the top's straight cut along gravity and walls).
 
+## In doubles (`--arith float`, 2026-10-16)
+
+The table is built in the run's arithmetic (`build::<A>`): the float
+tracer's frames, the float interval evaluation, ranges of doubles. What
+each premise becomes (plans/float-solver.md, "After milestone 5"):
+
+- the evaluation bounds every lane: the doubles' interval ops round the
+  corners with the operation's own rounding, which is monotone (no
+  outward rounding: float-solver.md section 4);
+- ranges are kept in the TOTAL order (`-0` below `0`), so a range holds
+  its lanes' bits; the jump of a range grown twice goes to `+-f64::MAX`
+  (`Arithmetic::unknown`: a lane is finite, `NoWrap`);
+- a fork's span is the arithmetic's own count: floors, or for the
+  doubles' round fork (`RSplit`, `__split_by_round`) the values of
+  `flr(x + 1/2)`;
+- a pixel seeds its located coordinate as every number of its value (a
+  double's `0` and `-0`), unless the lattice pins the coordinate's bits.
+
+Fixed is unchanged (the fixtures' tables rebuild to their fingerprints).
+Measured in float, Celia's starts:
+
+| room | entries | start d | fixed (real play or IL load) |
+|---|---|---|---|
+| (1,0) | 18,722 | 44 | 17,904, 44 |
+| (4,2) | 23,888 | 49 | 23,790, 49 |
+| (6,2) 100%, J2 | 64,173 | 48 | 63,912, 49 |
+| (0,3) gemskip 100%, J1 | 77,328 | 48 | |
+| (1,3) gemskip | 80,372 | 46 | |
+
+Soundness checks: the probe against float `r0sxhn`/`r0sxhf` trees' recorded
+transitions, 0 violations ((7,0) 41,909 pairs, (0,3) 63,216, (3,0)
+21,528); `l1-check` of every float golden Celia finishes (gates/celia:
+the tasdatabase's any%, 100%, nodiag, gemskip any%, gemskip 100% and
+gemskip nodiag files as Celia plays them) against its table: 94 runs,
+8,054 states on the exiting lineages checked, 0 too late. Not built: the
+platform rooms (6,0), (2,1), (1,2), whose tables do not converge clean in
+fixed either ((2,1): 694,080 violations; (6,0) still tracing after 19
+min), and the summit.
+
 ## Limits
 
 - `unroll_bound("abs(amount)") = 8` caps S at 7.

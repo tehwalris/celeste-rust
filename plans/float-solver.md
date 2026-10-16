@@ -462,9 +462,9 @@ Revisit after the census.
 | timers, key sprite | dead fields: exact |
 | fly fruit (`f`) | `spd.y` in [-3.5, 0.5] (`appr` clamps at -3.5; `sin(..)*0.5` in [-0.5, 0.5]); `rem.y` in [-0.5, 0.5) by section 6.1; the unknowns unchanged: sound |
 | fall floor / balloon countdowns, spring phase, near floor (`n`) | integers: unchanged |
-| balloon phase (`n`) | `y` in `start ± 2` holds in float (as the bob) |
+| balloon phase (`n`) | `y` in `start ± 2` holds in float (as the bob); since the object levels' milestone `offset` is one period [0, 1) here too (a seeded phase, which the float tools always set, split every frame) |
 | platform path and remainder (`p`) | `x` integral on the path; `rem.x` in [-0.5, 0.5) by 6.1 applied to the platform: sound |
-| balloon offset | the full-period canonical `[0, 1)`: sound in float, because of the interval rule `sin(full period) = [-1, 1]`; a seeded point stays exact |
+| balloon offset | the full-period canonical `[0, 1)`: sound in float, because of the interval rule `sin(full period) = [-1, 1]`; a seeded point stays exact (but at `n`, above) |
 | absent delays | exact |
 
 The table's generated doc gains a float column, and `widen::SlotErrors`
@@ -1275,3 +1275,111 @@ Beside the three room (1,0) oracles, their float twins (`check.sh t2`,
 
 The same re-pinning rule as the fixed gates: only on evidence that the
 sets did not move.
+
+### After milestone 5: the object levels, level -1 and the ladder in float (built)
+
+What real object rooms need, in float, each with its oracle checks
+(below) and fixed point unchanged.
+
+**The level flags' hooks** (`h f n p`; `e` is the map mod's and not on
+develop, so not here):
+
+- The reference engine's level step (`ReferenceEngine::step_at`, what
+  `arc-check`, `check-known` and the known-route check fork a row with)
+  and its two pins are generic. The pins' distance tests (`PLAYER_STEP`,
+  `PLAYER_FAR`, `OTHERS_FAR`) compare `|a - b|` EXACTLY: the difference as
+  TwoSum's rounded sum and its error (16.16's differences are exact
+  doubles, so fixed compares as its raw `i64` did).
+- Near floors: the window (`widening::floor_player_window`, generic
+  already) on the floor's own numbers.
+- Platforms: the world table in the arithmetic (`concrete::platform_worlds`
+  runs the platforms in the run's reference engine: a double's `0.65`
+  moves them otherwise), matched by bits; the speeds' hull in the total
+  order. `verify::Points` pins a pixel or a world's `x` to every number of
+  its VALUE (`garith::value_box`: a double's `0` is both zeros, which a
+  comparison cannot tell apart).
+- The static containment proof (`widen::within`, `bounds`) on exact
+  doubles instead of raw 16.16: exact for 16.16, the doubles' own rounding
+  for float (`fl` is monotone). Without it a platform's wrap `x < -16 ?
+  128 : x` was owed per lane on the hull `[-17, 128]` and declined every
+  lane (room (2,1) `r0sxhnp`, a KERNEL COVERAGE GAP at f2).
+- Literal pins (`widen::pin_literal`, a platform's `rem.x`, the fly
+  fruit's): an interval pin is CONTAINMENT in both arithmetics. Step 1's
+  float form ("the very ends, bit for bit") was wrong for the only
+  interval pin there is, and was never reached (the hooks raised in float).
+- A literal round fork: `__split_by_round` of a literal (a platform's
+  `rem.x + spd.x`, the fly fruit's `rem.y + spd.y`) splits into the
+  arithmetic's round fragments (`Arithmetic::round_fragment`), as a
+  literal floor fork splits into its floors (`Domain::literal_fragments`).
+- The balloon's phase at `n`: the float tools always SEED the balloons, and
+  a seeded `offset` (a point) split on every undecided `spr == 22`: room
+  (4,2)'s six balloons made f^6 states before the player (4,096 at f5,
+  531,441 at f9), in fixed too under `--balloon-seeds`. The `n` level's
+  balloon entry now also stores `offset` as one period [0, 1)
+  (`Stored::Phase`): it is read only as `sin(offset)` into `y`, which the
+  same entry widens to the bob band. (4,2) then holds 1 state a frame
+  until the player, as unseeded fixed does. Fixed without seeds stores the
+  same `[0, 1)` it did; its kernels lose the dead phase arithmetic
+  (`r42n`'s metrics re-pinned: dynamic instructions -4.3%, error terms
+  -13%; its `f`/`e` lines, key-check and widen-check unchanged).
+
+**Level -1** (`trace::level_minus_one`) is generic over the arithmetic:
+the table is built in the run's (`--arith`, `transpile
+--level-minus-one-table`, the search's filter, `l1-check`, the probe).
+The premises, rechecked for doubles:
+
+- The traced frame is the kernels' graph in the arithmetic (step 1), and
+  its interval evaluation bounds every lane: monotone ops on the rounded
+  corners (section 4), `sin` of an interval `[-1, 1]`, an overflow TOP.
+- Ranges hold their lanes' BITS: observations join and are checked in the
+  total order (`-0` below `0`); a range grown twice jumps to the
+  arithmetic's extreme (`Arithmetic::unknown`'s ends, `+-f64::MAX` for
+  doubles: a lane is finite, `NoWrap`).
+- Fork spans are checked with the arithmetic's own count: floors for
+  `Split`, rounds for the doubles' `RSplit` (`RSplitOk` read as true like
+  `SplitOk`, checked directly).
+- A literal shifted by a point is the arithmetic's interval op on the
+  literal (the reference's `rnd` interval computes exactly that).
+- `rem`'s range is the half-open `REM` in the arithmetic (`[-1/2,
+  pred(1/2)]`); position hulls must be whole pixels (`Arithmetic::as_i16`
+  of both ends).
+- A node's pixel seeds its located coordinate as every number of its
+  value (`value_box`), unless the lattice pins the coordinate: then the
+  pin's bits, which every lane holds (the pin is checked per lane).
+- The filter itself (`CostToGo`: shape hash and cell) is
+  arithmetic-free; a float tree records its float table's fingerprint.
+
+Fixed is unchanged: the fixtures' pinned tables (`r42n`: 23,790 entries,
+`b60f526c3ef2be3a`; `r62h`: 63,912, `1bdde7989657111c`) rebuild to the
+same fingerprints. In float (plans/level-minus-one.md, "In doubles"):
+tables for (1,0), (4,2), (6,2) 100%, (0,3) gemskip 100% J1 and (1,3)
+gemskip (start d 44, 49, 48, 48, 46); the probe against three float
+trees' recorded transitions, 0 violations; `l1-check` of the 94 Celia
+goldens outside the platform rooms and the summit, 0 states too late. The
+platform rooms' tables do not converge clean, in fixed either.
+
+**The objects ladder** needed nothing new: room (4,2) any% under Celia's
+start and seeds 0, `--level r0sxhn,r0sxh --level-minus-one 71,5
+--ceiling 71 --prefer` Celia's tasdatabase run: arc bound 71 at both
+levels, the concrete optimum 71 (depth-first at the bound), the known
+run surviving every pruning step at both levels (and `check-known` on
+the finished trees), 30 s.
+
+**The oracle checks**, float kernel trees (Celia's starts), quick
+profile. The reference engine forks a level's widened objects per path:
+at `n` most rows fork past the path cap (4,096) and are SKIPPED, as in
+fixed, which checks its object room at `r0sxh` (plans/devloop.md); `p`
+the reference refuses.
+
+| room, level | key-check | ref-check | widen-check | arc-check |
+|---|---|---|---|---|
+| (1,0) `r0sxh` to f40 | clean | 96 rows, 0 differ | f35: 5,877 stored + 1,207 emitted, 0 moved | 363 records, 1,323 probes inside, 538 outside, 0 disagree |
+| (7,0) `r0sxhn` to f40 | clean | all 96 over the cap | f36: 8,713 + 1,034, 0 moved | 18 checked (345 over the cap), 0 disagree |
+| (0,3) `r0sxhn` to f40 | clean | all 96 over the cap | f36: 13,753 + 649, 0 moved | 20 checked (324 over), 0 disagree |
+| (4,2) `r0sxhn` to f55 | clean | 21 rows (75 over), 0 differ | f50: 13,896 + 876, 0 moved | 20 checked (377 over), 0 disagree |
+| (4,2) `r0sxh` to f45 | clean | 96 rows, 0 differ | | 197 records, 617 + 236 probes, 0 disagree |
+| (3,0) `r0sxhf` to f40 | clean | 77 rows (19 over), 0 differ | f36: 12,761 + 943, 0 moved | 340 records, 1,060 + 454 probes, 0 disagree |
+| (2,1) `r0sxhnp` to f28 | clean | (refused: `p`) | f26: 489 + 1,595, 0 moved | (refused: `p`) |
+
+`missed 0` in every forward. Before the balloon fix, the same (7,0) tree
+traced 2.9M lanes to f40 against 77k after, with the same position graph.
