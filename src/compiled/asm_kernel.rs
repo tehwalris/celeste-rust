@@ -224,7 +224,7 @@ struct AsmKernel<N: KernelLanes = P8> {
     fused_nodes: usize,
     /// Per input cell, its traced path (named by packing failures).
     input_names: Vec<String>,
-    /// `--kernel-mix`: the slices this kernel ran (`compiled::mix`).
+    /// `bench-frame --metrics`: the slices this kernel ran (`compiled::mix`).
     mix_slices: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
 }
 
@@ -905,9 +905,6 @@ struct BuildOptions {
     /// `--kernel-explain`: kernels keep their fused graphs, so a decline
     /// names its premise.
     keep_graphs: bool,
-    /// `--kernel-mix DIR`: the per-kernel reports' directory.
-    mix_dir: Option<std::path::PathBuf>,
-    room: (i16, i16),
 }
 
 use crate::trace::kernel::Region;
@@ -992,10 +989,8 @@ impl<N: KernelLanes> Registry<N> {
             None => eprintln!("[region] no region key (--region off)"),
         }
         let build = BuildOptions {
-            asm: crate::transpile::asm::AsmOptions { trace: s.diag.build_trace, mix: s.diag.kernel_mix.is_some() || s.diag.kernel_metrics },
+            asm: crate::transpile::asm::AsmOptions { trace: s.diag.build_trace, mix: s.diag.kernel_metrics },
             keep_graphs: s.diag.kernel_explain,
-            mix_dir: s.diag.kernel_mix.clone(),
-            room: s.room,
         };
         let build = &build;
         let t_trace = std::time::Instant::now();
@@ -1293,23 +1288,10 @@ fn build_one_shape<N: KernelLanes>(r: &crate::trace::kernel::Reference<N::Arith>
             guards.push((b.roots[nfields], b.roots[nfields + 1]));
             off += b.roots.len();
         }
-        let names: HashMap<u32, String> = compiled.input_cells.iter().copied().zip(input_names.iter().cloned()).collect();
-        let census = N::mix_report(&crate::compiled::mix::Input {
-            traced: &r.bound.graph,
-            fused: &fused,
-            roots: &flat_roots,
-            roles: &roles,
-            bodies: &guards,
-            compiled: &compiled,
-            so: loaded.path(),
-            names: &names,
-            cart: &room.cart,
-            room: build.room,
-            dir: build.mix_dir.as_deref(),
-        })
-        .with_context(|| format!("the mix report of {}", compiled.sym))?;
+        let census = N::mix_report(&crate::compiled::mix::Input { traced: &r.bound.graph, fused: &fused, roots: &flat_roots, roles: &roles, bodies: &guards, compiled: &compiled })
+            .with_context(|| format!("the census of {}", compiled.sym))?;
         compiled.asm = String::new();
-        Some(crate::compiled::mix::counter(&compiled.sym, census, build.mix_dir.clone()))
+        Some(crate::compiled::mix::counter(&compiled.sym, census))
     } else {
         None
     };

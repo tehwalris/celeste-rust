@@ -25,8 +25,8 @@
 //!
 //! The deep diagnostics have owners: `--key-check` and `--phases` the
 //! wave's sinks (`storage::unit::UnitSink`), `--build-trace`,
-//! `--kernel-explain`, `--kernel-mix` and the metrics the kernel build's
-//! options (`compiled::asm_kernel::BuildOptions`).
+//! `--kernel-explain` and the metrics the kernel build's options
+//! (`compiled::asm_kernel::BuildOptions`).
 
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
@@ -115,8 +115,6 @@ pub struct Diagnostics {
     pub key_check: bool,
     /// Kernels keep their graphs: a decline names its premise.
     pub kernel_explain: bool,
-    /// The instruction-mix report per kernel, into this dir.
-    pub kernel_mix: Option<PathBuf>,
     /// The kernels' census and slice counters (`bench-frame --metrics`).
     pub kernel_metrics: bool,
     /// The kernel build's and the lattice walk's progress.
@@ -442,9 +440,6 @@ pub struct SettingsArgs {
     /// DIAGNOSTIC: kernels keep their graphs, so a decline names its premise.
     #[arg(long, global = true)]
     pub kernel_explain: bool,
-    /// DIAGNOSTIC: the instruction-mix report per kernel into DIR (keeps the .so files).
-    #[arg(long, global = true)]
-    pub kernel_mix: Option<PathBuf>,
     /// DIAGNOSTIC: the kernel build's and the lattice walk's progress.
     #[arg(long, global = true)]
     pub build_trace: bool,
@@ -522,7 +517,6 @@ impl SettingsArgs {
             diag: Diagnostics {
                 key_check: self.key_check,
                 kernel_explain: self.kernel_explain,
-                kernel_mix: self.kernel_mix.clone(),
                 kernel_metrics: false,
                 build_trace: self.build_trace,
                 phases: self.phases,
@@ -585,7 +579,6 @@ pub fn refuse_env() -> Result<()> {
         ("CELESTE_L1_TABLE", "--l1-table"),
         ("CELESTE_KERNEL_KEY_CHECK", "--key-check"),
         ("CELESTE_KERNEL_EXPLAIN", "--kernel-explain"),
-        ("CELESTE_KERNEL_MIX", "--kernel-mix"),
         ("CELESTE_KERNEL_METRICS", "bench-frame --metrics"),
         ("CELESTE_BUILD_TRACE", "--build-trace"),
         ("CELESTE_PHASES", "--phases"),
@@ -644,7 +637,6 @@ pub fn startup(args: &SettingsArgs, float: bool, adjust: impl FnOnce(&mut Settin
     note("--l1-table ", s.l1_table.is_some(), format!("{}", s.l1_table.as_deref().unwrap_or(Path::new("")).display()));
     note("--key-check", s.diag.key_check, String::new());
     note("--kernel-explain", s.diag.kernel_explain, String::new());
-    note("--kernel-mix ", s.diag.kernel_mix.is_some(), format!("{}", s.diag.kernel_mix.as_deref().unwrap_or(Path::new("")).display()));
     note("(kernel metrics)", s.diag.kernel_metrics, String::new());
     note("--build-trace", s.diag.build_trace, String::new());
     note("--phases", s.diag.phases, String::new());

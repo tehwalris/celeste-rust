@@ -295,7 +295,7 @@ enum Command {
         /// deleted per rep), as the search's forward does.
         #[arg(long, default_value_t = false)]
         edges: bool,
-        /// Write the first rep's exact metrics to this file.
+        /// Write the first rep's exact metrics to this file (`compiled::mix`).
         #[arg(long)]
         metrics: Option<String>,
         /// Checkpoint each rep's frame as the forward does (the frame file
@@ -1512,7 +1512,7 @@ where
 }
 
 /// `bench-frame` (`Command::BenchFrame`) in the arithmetic of `N`, its
-/// kernels `K` (`--metrics`, the kernel mix census, is 16.16's).
+/// kernels `K` (`--metrics`, the kernel census, is 16.16's).
 #[allow(clippy::too_many_arguments)]
 fn bench_frame<K, N>(cfg: &celeste_rust::settings::Settings, level_dir: &str, frame: Option<u32>, reps: usize, level: Level, edges: bool, metrics: Option<String>, checkpoint: bool) -> Result<()>
 where
@@ -1856,7 +1856,7 @@ fn main() -> Result<()> {
         Command::BenchFrame { level_dir, frame, reps, level, edges, metrics, checkpoint } => match cfg.arith {
             Arith::Fixed => bench_frame::<celeste_rust::compiled::FrameEngine, P8>(&cfg, &level_dir, frame, reps, level, edges, metrics, checkpoint)?,
             Arith::Float(_) => {
-                anyhow::ensure!(metrics.is_none(), "--arith float: bench-frame --metrics (the kernel mix census) is 16.16's");
+                anyhow::ensure!(metrics.is_none(), "--arith float: bench-frame --metrics (the kernel census) is 16.16's");
                 bench_frame::<celeste_rust::compiled::FloatKernels, LuaF64>(&cfg, &level_dir, frame, reps, level, edges, None, checkpoint)?
             }
         },
@@ -2230,14 +2230,9 @@ fn frame_metrics(room: &str, level: Level, frame: u32, w: &celeste_rust::frame::
     put("calls.lanes_missed", ks.missed);
     let kernels = celeste_rust::compiled::mix::kernel_metrics();
     put("kernels.built", kernels.len() as u64);
-    // The per-kernel census keys summed; the census's guard-family and
-    // leaf-class detail (the mix diagnostic's) left out.
-    let summed = |k: &str| {
-        k.starts_with("kind.") || k.starts_with("traced.") || k.starts_with("cat.") || k.starts_with("rootrole.")
-            || matches!(k, "nodes" | "fused_nodes" | "insts" | "spill_slots" | "ssa" | "bodies" | "bodies.distinct_error" | "bodies.distinct_live" | "error_terms" | "live_conjuncts" | "roots")
-    };
+    // Every kernel's census summed.
     for (sym, slices, census) in &kernels {
-        for (k, v) in census.iter().filter(|(k, _)| summed(k)) {
+        for (k, v) in census {
             put(&format!("all.{k}"), *v);
         }
         if *slices == 0 {

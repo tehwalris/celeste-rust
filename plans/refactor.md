@@ -20,6 +20,7 @@ Measured on `docs-refresh` after merging develop `0765e7c5`. Lines are
 | C3 | `follow` folded into the known check's miss report: where the tree lost the route's state, its state at the frame boundary before is stepped by the level's kernels (`known::explain`), the route's state among the successors or not, the closest listed; `rerun-row` is `ref-check --row N` (the row and its kernel successors printed) | -66 Rust |
 | S10 | the help bug (in C1); one DFS budget (`arc_dp::DFS_BUDGET`, 200k: the dual's pairs count both halves' leaves, so 2x: the 400k was that); stale docs: `arc_dp`'s "an edge enters a layer <= f", `search/mod.rs`'s module list (checkpoint files as row pieces), "The forward frame" citations | ~0 |
 | C4 | `bench-storage`, `--emit-capture`, the capture writers and the replay (`storage::bench`, the sinks' rowless mode), the `cap-r10`/`cap-r62h57` fixtures; every frame step runs `bench-frame --checkpoint`, its `b` line (the bytes of the frame's files) pinned from develop's binary for all seven frames | -364 Rust, -31 shell |
+| C5 (done) | the kernel mix report (`--kernel-mix DIR`, its files, guard families, leaf classes, the spike-fold and fold estimates) and tools/kernel_mix.py; `compiled::mix` is the census the `--metrics` pins read, byte-identical (the per-instruction categories stay: they pin the codegen's mix for R2's slices) | -545 Rust, -276 Python |
 
 ## SIZE
 
@@ -198,7 +199,7 @@ Concrete simplification candidates, ordered by lines saved x safety
 | C2 (done) | one census command for `col-census`, `cell-growth`, `coarse-census` (`ckhash --cells`), or cut them | rewrite.rs (+ `erased_states`) | ~250 | none |
 | C3 (done) | `follow` and `rerun-row` folded into `check-known`'s miss report and `ref-check` | rewrite.rs | ~170 | none |
 | C4 (done) | `bench-storage` + `--emit-capture` + the capture writers, if `bench-frame --checkpoint` covers the storage | storage/bench.rs (~450 of 731), unit.rs's capture, fixtures `cap-*` | ~550 | none (t1/big steps go) |
-| C5 | the kernel mix report (`--kernel-mix`, the per-instruction provenance, kernel_mix.py), keeping the counts the `--metrics` pins need (or none, if the pins move to `perf stat` instruction counts) | compiled/mix.rs, codegen's `prov`, tools/kernel_mix.py | ~500-900 | low |
+| C5 (done) | the kernel mix report (`--kernel-mix`, the per-instruction provenance, kernel_mix.py), keeping the counts the `--metrics` pins need (or none, if the pins move to `perf stat` instruction counts) | compiled/mix.rs, codegen's `prov`, tools/kernel_mix.py | ~500-900 | low |
 | C6 | `transpile` and `concrete_run` folded into `rewrite` (`l1 table/probe/check`, `run`): one level -1 builder (today three: `frame::minus_one_table`, transpile, `l1-check`; only the first has the cache key, the pin and the win-rect check); whole frames under `--split-frame` | bin/transpile.rs, bin/concrete_run.rs, rewrite.rs | ~250 | low (table fingerprints) |
 | C7 | the UI's ladder-era data model | ui_export.rs, ui/src (space.ts 1,741) | ~1,300 | parked by Philippe |
 

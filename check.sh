@@ -142,7 +142,7 @@ frame() {
 }
 
 # framef NAME FRAME ROOM LEVEL FLAGS...: `frame` without the metrics (a
-# float fixture's: the kernel mix census is 16.16's).
+# float fixture's: the kernel census is 16.16's).
 framef() {
     local name=$1 f=$2 room=$3 level=$4; shift 4
     ./safe-run.sh --memory "$MEM" -- "$B" bench-frame --level-dir "$F/$name" --frame "$f" --room "$room" --level "$level" --edges --checkpoint --threads "$TH" --l1-table "$F/$name/l1-table.bin" "$@" > "$C/$name.frame" || return 1

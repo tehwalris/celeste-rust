@@ -198,8 +198,7 @@ For a profile, `perf record -g -m 8 -- rewrite bench-frame ...`:
 
 - `-m 8`: the mlock budget is per user.
 - The kernels are `.so`s in `$TMPDIR/asm-scratch/PID/`, gone when the next
-  process starts. Run `perf report` first, or keep them with `--kernel-mix
-  DIR`.
+  process starts: run `perf report` first.
 
 ## The fixtures
 
