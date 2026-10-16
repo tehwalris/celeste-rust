@@ -105,7 +105,7 @@ transcripts since 2026-10-12 ("runs"; approximate). Marks: **core**,
 | tools/category_runner.py, tools/celeste/ | a category end to end; the shared game model | every category campaign | core |
 | tools/uct/{validate.sh, check_uploads.py}, tools/celia/validate.sh | witnesses in UCT, Celia, PICO-8 chains | every upload | core |
 | tools/{uct,celia}/{golden.py, exact.lua}, tools/uct/canonical_jumps.py | the float oracle's goldens | t0 oracle tests | core (float) |
-| pico8_diff/replay.py, chain.py | PICO-8 replay, chains, the boot chain | every result | core (move to tools/: jank-tools phase 1b) |
+| pico8_diff/replay.py, chain.py | PICO-8 replay, chains, the boot chain | every result | core (planned: move to tools/) |
 | tools/fwd_bench.sh | the forward frame benchmark | perf work on `fwd-perf2` | diag |
 | tools/perf_inline.py | per-line cycles through inlined frames | perf work | diag |
 | tools/kernel_mix.py | aggregate a `--kernel-mix` dir | the 2026-10-10 kernel study | dead? |
@@ -156,7 +156,7 @@ tree records"):
 Command flags worth a look: `search --no-witness` (unused by scripts),
 `trajectory --spec/--tree` (keyed lines of the rem-ladder days), `ckhash
 --cells/--dump-edges`, `reach --decode-rect/--cells`, `export-ui --arc`
-(the marks dir; jank-tools J5 wanted it under the checkpoint dir). Six
+(the marks dir; better under the checkpoint dir). Six
 spellings name a tree (`--checkpoint-dir`, `--level-dir`, `--tree`,
 `--coarse/--real`, `--fine-dir/--coarse-dir`, `--capture`), three a
 horizon (`--to`, `--horizon`, `--step`).
@@ -190,7 +190,7 @@ Concrete simplification candidates, ordered by lines saved x safety
 | C4 | `bench-storage` + `--emit-capture` + the capture writers, if `bench-frame --checkpoint` covers the storage | storage/bench.rs (~450 of 731), unit.rs's capture, fixtures `cap-*` | ~550 | none (t1/big steps go) |
 | C5 | the kernel mix report (`--kernel-mix`, the per-instruction provenance, kernel_mix.py), keeping the counts the `--metrics` pins need (or none, if the pins move to `perf stat` instruction counts) | compiled/mix.rs, codegen's `prov`, tools/kernel_mix.py | ~500-900 | low |
 | C6 | `transpile` and `concrete_run` folded into `rewrite` (`l1 table/probe/check`, `run`): one level -1 builder (today three: `frame::minus_one_table`, transpile, `l1-check`; only the first has the cache key, the pin and the win-rect check); whole frames under `--split-frame` | bin/transpile.rs, bin/concrete_run.rs, rewrite.rs | ~250 | low (table fingerprints) |
-| C7 | the UI's ladder-era data model (J10 of jank-tools) | ui_export.rs, ui/src (space.ts 1,741) | ~1,300 | parked by Philippe |
+| C7 | the UI's ladder-era data model | ui_export.rs, ui/src (space.ts 1,741) | ~1,300 | parked by Philippe |
 
 ### Structure
 
@@ -206,35 +206,116 @@ Concrete simplification candidates, ordered by lines saved x safety
 | S8 | **Settings written four times** (struct, clap args, `recorded()`, `startup`'s log): table-driven | settings.rs | ~80 | low |
 | S9 | **Steps vs frames**: the split frame's steps leak into the tree, the marks, level -1's H and `Found.frame`; the split cart is a 939-line near-copy of the minimal cart, not a patch | frame.rs, search/*, lua/celeste-minimal-split.lua | ~100 Rust + the Lua twin generated | medium (the split cart's text feeds the traces) |
 | S10 | **Small bugs and stale bits**: `rewrite --help` shows `check-known`'s text under `reach` (a doc comment in the wrong place) and none for `check-known`; `refdriver.rs`'s error names a deleted doc; DFS budgets 200k vs 400k; stale section names in comments | rewrite.rs, trace/refdriver.rs, search/* | ~20 | none |
-| S11 | **Cart patches written twice** (Rust and replay.py, with different semantics; jank-tools J14) and the move of pico8_diff/ into tools/ | trace/cart.rs, pico8_diff/replay.py | ~60 Python | medium (replays) |
-| S12 | **The engine crate knows the game** (`BoundaryIds`, `player_objects`) and the reference engine sits in `trace/` above `frame`/`storage` (jank-trace T21): an `engines/` module beside `compiled` | celeste-engine runtime2.rs, trace/ref* | ~0 (layering) | low |
+| S11 | **Cart patches written twice** (Rust and replay.py, with different semantics) and the move of pico8_diff/ into tools/ | trace/cart.rs, pico8_diff/replay.py | ~60 Python | medium (replays) |
+| S12 | **The engine crate knows the game** (`BoundaryIds`, `player_objects`) and the reference engine sits in `trace/` above `frame`/`storage`: an `engines/` module beside `compiled` | celeste-engine runtime2.rs, trace/ref* | ~0 (layering) | low |
 
-### The tracer (`src/trace`, `src/transpile` where they meet)
+### The tracer (`src/trace`)
 
-**Tracer: see audit (pending)** - a separate read-only audit
-(`/var/tmp/tracer-audit.md`) will give the responsibility map, the
-findings with file and line, and a target shape; its top findings and
-their line estimates go here when it lands.
+From the tracer audit (2026-10-16, develop `5eff48f5`; read-only, nothing
+built; the full text with file:line excerpts was `/var/tmp/tracer-audit.md`,
+not committed). Verdict: sound but heavy. The invariants hold (errors
+derived, overflow raises, no silent deopt, one state/block converter); the
+weight is unused helpers, duplicated walks and evaluators, ~700 lines of
+merge machinery only `Symbolic` reaches, copied test boots and thread
+pools, and history-laden comments. 36 findings (T1-T36), together ~1,800-
+2,300 lines (~13%) with fixed outputs byte-identical. Going further
+(dropping the re-trace per level, replacing the split pass) changes
+behaviour and is out of scope.
 
-Still open from jank-trace (2026-10-11, ~1,500 lines in all; T7 and T9's
-divergence are done, T4 partly): dead code and pass-through wrappers (T1
-~190), hand-written Clone/PartialEq over `D: Domain` (T2 ~100), test-side
-duplication (T3 ~110), the interpreter's raw-pointer AST keys and eight
-boot copies (T5 ~130), two path vocabularies and five "find the player"s
-(T6 ~60), duplication in interp/state (T8 ~100), the trace-to-kernel
-hand-off in four types with two root orders and string kinds (T10 ~250),
-the reference engine's eight entry points (T11 ~45), domain ops mirroring
-`Op` (T12 ~100), six memoized graph predicates (T14 ~80), fork origins as
-strings (T15), three builtin lists (T16), the walk keyed on `format!("{:?}",
-Shape)` (T18), interpreter special cases keyed by spelling (T19), two
-"run the room with no input" mechanisms (T20).
+**Responsibilities** (production lines; test lines apart):
+
+| responsibility | where | prod | test |
+|---|---|---|---|
+| Lua interpreter core | interp.rs, heap.rs, state.rs | 2,333 | 287 |
+| merge/join machinery (Symbolic only) | interp.rs `collapse*`, joins, rejoin; state.rs `merge*` | 711 | 173 |
+| domains: trait, `Concrete`, `Symbolic`, `RefDomain` | domain.rs, refdomain.rs | 1,966 | 618 |
+| frame driver, split pass, `Points`, three-valued | verify.rs | 1,477 | 868 |
+| widening | widen.rs | 743 | 130 |
+| error derivation | error.rs | 267 | 264 |
+| lattice walk, regions, no-player exploration | kernel.rs | 930 | 110 |
+| reference engine | refengine.rs, refdriver.rs, refbridge.rs | 749 | 208 |
+| oracle and probe harnesses (only their tests call them) | oracle.rs, probe.rs | 419 | 416 |
+| cart text and patches, `NATIVE` | cart.rs | 427 | 45 |
+| blocks and shapes | block.rs, shapes.rs | 712 | 0 |
+| paths (`iface`) | iface.rs | 274 | 0 |
+| bind and emit | bind.rs, emit.rs, kernel.rs:1-102 | 636 | 206 |
+| level -1 table builder | level_minus_one.rs | 2,212 | 116 |
+
+The tracer proper is ~11,290 production lines; level -1 and the two
+harnesses are not tracing.
+
+**Top findings** (lines saved, confidence):
+
+| # | finding | saves |
+|---|---|---|
+| T1 | comment slop: stale, historical and duplicated docs (error.rs repeats architecture.md's table) | ~300 (0.7) |
+| T2 | `eval.rs`, a third point evaluator, test-only: use `Graph::eval` on points | ~200 (0.6) |
+| T5 | `body_ids` keyed by raw pointer forces 5 `unsafe impl Send`; 5 hand-rolled pools | ~100 (0.8) |
+| T12 | `widen::within`/`bounds`, a fourth static-range analysis (in `f64`): fold into `pieces_of` | ~100 (0.4) |
+| T3 | dead `Symbolic::abstractness`, `reads_interval_cmp` | ~90 (1.0) |
+| T4 | the boot sequence copied 9 times; `run_one` duplicates `cart::run_chunk` | ~90 (0.9) |
+| T8 | graph walks reimplemented (seven memoized predicates) | ~70 (0.8) |
+| T10 | `RefDomain` re-derives `Graph::eval`'s interval rules: share `ival::apply` | ~70 (0.6) |
+| T24 | hand-written Clone/PartialEq/Default over `D: Domain` | ~70 (0.8) |
+| T6 | `Concrete` as a `Domain` is test-only; production uses four methods | ~60 (0.9) |
+| T7 | `Symbolic`'s op prologue written 4 times | ~60 (0.8) |
+| T15 | print-only diagnostics inside tests | ~50 (0.7) |
+| T13, T20 | split pass duplicates; `FrameOut::roots()`, `State::new()` constructors | ~45 each |
+| T11 | dead `LatticeWalk` outputs (a full graph clone, a per-trace fork census) | ~40 (1.0) |
+| T14, T18, T21-T23, T25 | five ways to find the player; `trace_frame`'s 10 positional parameters and domain flags toggled around it; error enrichers; the reference engine in three files; `Arithmetic` noise; Symbolic-only trait hooks | ~40 each |
+
+The rest (T9, T16-T17, T19, T26-T36) are 5-30 lines each, or moves: T30
+puts the oracle and probe harnesses under `#[cfg(test)]` (419 lines out of
+production), T29 and slice TS10 move level -1 out of `src/trace/`.
+
+**Evaluators.** Eleven evaluators or rewriters touch op semantics. Two
+interpreter domains are irreducible: `Symbolic` (it builds the graph) and
+`RefDomain` (the independent oracle: merging it into the tracer would
+destroy the check). On the graph side there should be one interval
+evaluator (`Graph::eval_full`) and one piecewise range analysis
+(`GraphArith::pieces_of`); `Concrete`-as-domain, `eval.rs`,
+`widen::within`/`bounds` and `Symbolic::eval_literal` collapse into them
+(~400 lines).
+
+**Target shape**: `trace/lua/{interp, builtins, merge, heap+state}`,
+`trace/domain/{mod, concrete, symbolic, refdomain}`, `trace/frame.rs` (the
+driver, a `TraceSpec`), `trace/split.rs` (the split pass), `widen.rs`,
+`error.rs`, `trace/walk.rs`, `trace/boundary/{iface, shapes, bind,
+block}`, `trace/lower.rs`, one `refengine` module; level -1 to
+`src/search/level_minus_one/`. Tracer production ~11,290 -> ~9,650
+(-14.5%); `src/trace` in all 17,344 -> ~15,000.
+
+**Its slices** (each re-runs t0; the pins named catch its mistakes):
+
+| slice | findings | saves | extra pins |
+|---|---|---|---|
+| TS1 dead code | T3, T11, T28, T34, T35's `__split_at` arm | ~180 | fixture frames, level -1 fingerprint |
+| TS2 test scaffolding | T4 (`cart::boot`), T5, T9, T15, T20 | ~350 | `Send`, fixture frames, gates, ref-check |
+| TS3 harnesses out of production | T30, T2 | ~200 | t0 point counts, float goldens, corpora |
+| TS4 interpreter hygiene | T16, T31, T32, T23, T24, T6 | ~250 | frames, metrics, gates, float gates |
+| TS5 Symbolic dedupe | T7, T8, T25, `eval_literal` | ~190 | metrics (fold order!), key-check |
+| TS6 driver and split pass | T18, T13, T17, T26 | ~140 | metrics, the t2 platform room, widen-check |
+| TS7 walk, reference engine, lowering | T27, T14, T22, T19, T21 | ~190 | walk tests, ref-check, arc-check |
+| TS8 range analyses (riskiest) | T10, T12, as two commits | ~170 | ref-check, arc-check, float gates, metrics |
+| TS9 comments and names | T1, T36, T33 | ~325 | t0 |
+| TS10 level -1 out of `src/trace/` | T29 | ~50 (2,200 moved) | level -1 fingerprint, t1 under level -1 |
+
+**Caution for any slice touching `Symbolic`**: the hash-consed arena
+numbers nodes in creation order, so changing the order of `fold`/`leaf`
+calls changes kernel code and the metrics even when rows stay identical.
+Keep the fold order; check the metrics.
+
+**Frozen**: `cart::NATIVE`'s unimplemented builtins (`__widen_rem`,
+`__new_vector`, `__split_at`) are `GLOBAL_NAMES` entries: every block
+carries their cells, so deleting them changes every shape hash. Only the
+interpreter's dead `__split_at` arm may go (TS1).
 
 ## Headline candidates
 
 | rank | candidate | lines saved |
 |---|---|---|
 | 1 | C1 finished studies | ~1,400 |
-| 2 | tracer (jank-trace, pending the audit) | ~1,500 |
+| 2 | the tracer (the audit's TS1-TS10) | ~1,800-2,300 |
 | 3 | C7 the UI's ladder-era model (parked) | ~1,300 |
 | 4 | C5 the kernel mix report | ~500-900 |
 | 5 | C4 `bench-storage` and the capture | ~550 |
@@ -274,8 +355,9 @@ agent's devloop.md work).
 7. **The remainder model** (S5): gate fixed and float t1 frames and the
    float gates; instruction counts.
 8. **The storage codecs** (S6): gate the `b` lines (file bytes).
-9. **The tracer**, in the audit's slices: gate t1's kernel metrics exactly
-   (same kernels), the oracle, ref-check.
+9. **The tracer**, in the audit's slices TS1-TS10 (above), each with its
+   extra pins; t1's kernel metrics exactly (same kernels), the oracle,
+   ref-check.
 10. **Steps vs frames, the split cart** (S9), **tooling** (S11, S12):
     gate r60s and the platform room in t2; every witness replays to the
     same exit.

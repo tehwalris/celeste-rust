@@ -49,7 +49,8 @@ refactor to shorten and simplify it is starting: plans/refactor.md
   each. Check it before proposing something that sounds familiar.
 - `plans/refactor.md` - sizes, features, knobs and simplification
   candidates for the refactor (deleted when it is done).
-- `BENCHMARK_DATA.md` - dated measurements, newest first; partly stale.
+- `BENCHMARK_DATA.md` - the reference numbers for today's code (the pinned
+  frames, whole searches), each dated with its commit.
 
 The original OCaml implementation (`~/src/github.com/tehwalris/celeste_ocaml`)
 is the reference for interpreter semantics. Its `celeste.lua` is the
@@ -106,7 +107,10 @@ latter.
   or upload): those live outside the repo.
 - `crates/celeste-names/src/gen.rs` is FROZEN, not generated: `FIELD_NAMES`'
   order is the canonical field order keys and shape hashes depend on. New
-  names may be APPENDED by hand, never inserted.
+  names may be APPENDED by hand, never inserted. Its `GLOBAL_NAMES` include
+  `cart::NATIVE`'s unimplemented builtins (`__widen_rem`, `__new_vector`,
+  `__split_at`): every block carries them, so removing one changes every
+  shape hash.
 - `plans/abstractions.md`'s widening table is generated and test-checked
   (`CELESTE_REGENERATE=1` on `the_abstractions_doc_lists_the_table`).
 
