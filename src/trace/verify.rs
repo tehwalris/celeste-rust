@@ -354,7 +354,7 @@ pub fn trace_frame<'a, A: GraphArith>(
             for o in &outs {
                 reads.extend(o.fields.iter().map(|(_, n, _)| *n).chain([o.guard]).chain(o.arc.iter().copied()));
             }
-            let reach = crate::transpile::bdd::reachable(&it.d.graph, &reads);
+            let reach = it.d.graph.reachable(&reads);
             for x in pinned {
                 anyhow::ensure!(!reach[x as usize], "a pinned input (node {x}, {:?}) is read past its pin", it.d.graph.get(x).op);
             }
@@ -374,7 +374,7 @@ pub fn trace_frame<'a, A: GraphArith>(
         }
         use crate::transpile::graph::Op;
         let roots: Vec<NodeId> = outs.iter().flat_map(|o| o.roots(false)).collect();
-        let reach = crate::transpile::bdd::reachable(&it.d.graph, &roots);
+        let reach = it.d.graph.reachable(&roots);
         let mut live: std::collections::BTreeSet<u8> = Default::default();
         for (i, r) in reach.iter().enumerate() {
             if !*r {
@@ -528,7 +528,7 @@ impl<A: GraphArith> MayErr<'_, '_, A> {
             let node = d.graph.get(n);
             (node.op.clone(), node.args.clone())
         };
-        let reads_undecided = |d: &mut Symbolic<A>, n: NodeId| cone(&d.graph, &[n]).into_iter().find(|m| d.graph.get(*m).op == Op::Sel && d.lane_undecidable(d.graph.get(*m).args[0]));
+        let reads_undecided = |d: &mut Symbolic<A>, n: NodeId| d.graph.cone(&[n]).into_iter().find(|m| d.graph.get(*m).op == Op::Sel && d.lane_undecidable(d.graph.get(*m).args[0]));
         let out = match op {
             Op::Or | Op::And => {
                 let parts: Vec<(NodeId, NodeId)> = args.iter().map(|a| self.may(d, *a, pts)).collect();
@@ -551,7 +551,7 @@ impl<A: GraphArith> MayErr<'_, '_, A> {
                 Some(sel) if self.cases < MAY_CASES => {
                     self.cases += 1;
                     let c = d.graph.get(sel).args[0];
-                    let atom = cone(&d.graph, &[c])
+                    let atom = d.graph.cone(&[c])
                         .into_iter()
                         .find(|m| matches!(d.graph.get(*m).op, Op::Lt | Op::Le | Op::Gt | Op::Ge | Op::Eq | Op::UnknownBool(_)) && d.lane_undecidable(*m))
                         .unwrap_or(c);
@@ -564,7 +564,7 @@ impl<A: GraphArith> MayErr<'_, '_, A> {
                     };
                     let decided = sides.len() == 1;
                     let (may_true, may_false) = d.may_answers(atom);
-                    let reach = cone(&d.graph, &[n]);
+                    let reach = d.graph.cone(&[n]);
                     let (mut t, mut f) = (d.graph.leaf(Op::ConstBool(false)), d.graph.leaf(Op::ConstBool(false)));
                     for (answer, side) in sides {
                         let to = d.graph.leaf(Op::ConstBool(answer));
@@ -599,7 +599,7 @@ impl<A: GraphArith> MayErr<'_, '_, A> {
 fn three_valued_evaluated<A: GraphArith>(d: &mut Symbolic<A>, outs: &[FrameOut<A>]) {
     let roots: Vec<NodeId> = outs.iter().flat_map(|o| o.roots(false)).collect();
     let mut done: rustc_hash::FxHashSet<NodeId> = Default::default();
-    let mut todo = cone(&d.graph, &roots);
+    let mut todo = d.graph.cone(&roots);
     while !todo.is_empty() {
         let mut next: Vec<NodeId> = Vec::new();
         for n in todo {
@@ -614,7 +614,7 @@ fn three_valued_evaluated<A: GraphArith>(d: &mut Symbolic<A>, outs: &[FrameOut<A
                 next.push(at2);
             }
         }
-        todo = cone(&d.graph, &next).into_iter().filter(|n| !done.contains(n)).collect();
+        todo = d.graph.cone(&next).into_iter().filter(|n| !done.contains(n)).collect();
     }
 }
 
@@ -719,7 +719,7 @@ impl<A: GraphArith> Points<A> {
             return hit.clone();
         }
         // The cone as its own graph, so an evaluation costs only the cone.
-        let nodes = cone(&d.graph, &[c]);
+        let nodes = d.graph.cone(&[c]);
         let mut g = d.graph.like();
         let mut map: rustc_hash::FxHashMap<NodeId, NodeId> = Default::default();
         for &n in &nodes {
@@ -888,7 +888,7 @@ fn split_undecided_selects<A: GraphArith>(d: &mut Symbolic<A>, outs: Vec<FrameOu
             fields: o.fields.iter().map(|f| f.1).chain(o.arc.iter().copied()).collect(),
             rests: Vec::new(),
         };
-        let size = cone(&d.graph, &lite.row()).len();
+        let size = d.graph.cone(&lite.row()).len();
         work.push(d, &class, lite, everywhere.clone(), size);
     }
     let (mut n_splits, mut n_decided, mut n_rest) = (0usize, 0usize, 0usize);
@@ -896,7 +896,7 @@ fn split_undecided_selects<A: GraphArith>(d: &mut Symbolic<A>, outs: Vec<FrameOu
     while let Some((o, pts)) = work.pop(&class) {
         anyhow::ensure!(work.len() + done.len() < MAX_OUTCOMES, "more than {MAX_OUTCOMES} outcomes splitting undecided selects");
         // The outcome's own cone, in node order (the arena's is quadratic).
-        let reach = cone(&d.graph, &o.row());
+        let reach = d.graph.cone(&o.row());
         let first: Option<NodeId> = reach
             .iter()
             .filter(|n| d.graph.get(**n).op == Op::Sel)
@@ -918,7 +918,7 @@ fn split_undecided_selects<A: GraphArith>(d: &mut Symbolic<A>, outs: Vec<FrameOu
             continue;
         };
         // Split on the lowest comparison a lane can hold both ways.
-        let atom = cone(&d.graph, &[c])
+        let atom = d.graph.cone(&[c])
             .into_iter()
             .find(|n| matches!(d.graph.get(*n).op, Op::Lt | Op::Le | Op::Gt | Op::Ge | Op::Eq | Op::UnknownBool(_)) && d.lane_undecidable(*n))
             .unwrap_or(c);
@@ -955,7 +955,7 @@ fn split_undecided_selects<A: GraphArith>(d: &mut Symbolic<A>, outs: Vec<FrameOu
             let not_atom = d.graph.fold(Op::Not, vec![atom]);
             let is_atom = |n: NodeId| n == atom || n == not_atom;
             let mut out: Vec<NodeId> = Vec::new();
-            for n in cone(&d.graph, &[c]) {
+            for n in d.graph.cone(&[c]) {
                 let node = d.graph.get(n);
                 if matches!(node.op, Op::And | Op::Or) && node.args.iter().any(|a| is_atom(*a)) {
                     for a in node.args.iter().copied().filter(|a| !is_atom(*a)) {
@@ -967,7 +967,7 @@ fn split_undecided_selects<A: GraphArith>(d: &mut Symbolic<A>, outs: Vec<FrameOu
             }
             out
         };
-        let reach = cone(&d.graph, &o.every());
+        let reach = d.graph.cone(&o.every());
         let mut made: Vec<(Lite, Option<PointSet>, Vec<NodeId>)> = Vec::new();
         for (answer, side_pts) in sides {
             let to = d.graph.leaf(Op::ConstBool(answer));
@@ -1017,12 +1017,12 @@ fn split_undecided_selects<A: GraphArith>(d: &mut Symbolic<A>, outs: Vec<FrameOu
                 Some(halves) => {
                     n_rest += 1;
                     for h in halves {
-                        let size = cone(&d.graph, &h.row()).len();
+                        let size = d.graph.cone(&h.row()).len();
                         work.push(d, &class, h, side_pts.clone(), size);
                     }
                 }
                 None => {
-                    let size = cone(&d.graph, &side.row()).len();
+                    let size = d.graph.cone(&side.row()).len();
                     work.push(d, &class, side, side_pts, size);
                 }
             }
@@ -1088,7 +1088,7 @@ fn split_undecided_selects<A: GraphArith>(d: &mut Symbolic<A>, outs: Vec<FrameOu
 /// up to `ARMS` combinations (pushing everything is exact but exponential).
 fn three_valued<A: GraphArith>(d: &mut Symbolic<A>, root: NodeId) -> NodeId {
     use crate::transpile::graph::Op;
-    let nodes = cone(&d.graph, &[root]);
+    let nodes = d.graph.cone(&[root]);
     // Already-wrapped selects stay (they keep the registration bounding their
     // error): idempotent.
     let wrapped: rustc_hash::FxHashSet<NodeId> = nodes
@@ -1334,20 +1334,6 @@ fn arms<A: GraphArith>(
     out
 }
 
-/// The nodes `roots` reach, ascending (operands precede their node).
-pub(crate) fn cone<A: crate::transpile::garith::GraphArith>(g: &crate::transpile::graph::Graph<A>, roots: &[NodeId]) -> Vec<NodeId> {
-    let mut seen: rustc_hash::FxHashSet<NodeId> = Default::default();
-    let mut stack: Vec<NodeId> = roots.to_vec();
-    while let Some(n) = stack.pop() {
-        if seen.insert(n) {
-            stack.extend(g.get(n).args.iter().copied());
-        }
-    }
-    let mut out: Vec<NodeId> = seen.into_iter().collect();
-    out.sort_unstable();
-    out
-}
-
 /// How many case-split candidates an outcome carries (`Lite::rests`).
 const MAX_RESTS: usize = 32;
 
@@ -1373,7 +1359,7 @@ fn absorbed<A: GraphArith>(
         if d.lane_undecidable(cv) || d.decide(&cv).is_some() {
             continue;
         }
-        let reach = reach.get_or_insert_with(|| cone(&d.graph, &o.row()));
+        let reach = reach.get_or_insert_with(|| d.graph.cone(&o.row()));
         if reach.binary_search(&cv).is_err() {
             continue;
         }
@@ -1418,7 +1404,7 @@ fn rebuild_all<A: GraphArith>(d: &mut Symbolic<A>, cone: &[NodeId], subst: &rust
             break;
         }
         all.extend(more);
-        all = self::cone(&d.graph, &all);
+        all = d.graph.cone(&all);
     }
     let cone = &all[..];
     let mut map: rustc_hash::FxHashMap<NodeId, NodeId> = subst.clone();
@@ -1434,13 +1420,8 @@ fn rebuild_all<A: GraphArith>(d: &mut Symbolic<A>, cone: &[NodeId], subst: &rust
         if mapped == args {
             continue;
         }
-        let cmp = match op {
-            Op::Lt => Some(Cmp::Lt),
-            Op::Le => Some(Cmp::Le),
-            Op::Gt => Some(Cmp::Gt),
-            Op::Ge => Some(Cmp::Ge),
-            _ => None,
-        };
+        // The orderings (`compare` folds an equality by its literals only).
+        let cmp = Cmp::of(&op).filter(|c| *c != Cmp::Eq);
         let by_range = cmp.and_then(|k| d.compare(k, &mapped[0], &mapped[1]).ok()).filter(|r| matches!(d.graph.get(*r).op, Op::ConstBool(_)));
         let n = match by_range {
             Some(r) => r,
@@ -1516,7 +1497,7 @@ mod tests {
             cfg[*d as usize] = *b as u8;
         }
         let roots: Vec<NodeId> = f.outs.iter().flat_map(|o| o.roots(false)).collect();
-        let need = crate::transpile::bdd::reachable(g, &roots);
+        let need = g.reachable(&roots);
         let mut out = g.like();
         let map = g.specialize_subset_into(&cfg, Some(&need), &mut out);
         Ok((out, map))

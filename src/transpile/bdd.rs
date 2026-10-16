@@ -196,21 +196,6 @@ fn inherently_bool<A: GraphArith>(op: &Op<A>) -> bool {
     )
 }
 
-/// Nodes reachable from `roots`, walking operands - everything that can
-/// affect what those roots compute, and nothing else.
-pub fn reachable<A: GraphArith>(g: &Graph<A>, roots: &[NodeId]) -> Vec<bool> {
-    let mut need = vec![false; g.len()];
-    let mut stack: Vec<NodeId> = roots.to_vec();
-    while let Some(n) = stack.pop() {
-        if need[n as usize] {
-            continue;
-        }
-        need[n as usize] = true;
-        stack.extend(g.get(n).args.iter().copied());
-    }
-    need
-}
-
 /// What `simplify_local` did, for reporting (so a simplifier that gave up
 /// can be told from one that found nothing).
 #[derive(Debug, Default, Clone, Copy)]
@@ -524,7 +509,7 @@ fn factor_local<A: GraphArith>(g: &Graph<A>, local: &mut Local, id: NodeId, expa
 /// rewrite is a refinement (at `A = true`, `p = ⊥` the merged form is `⊥`).
 /// Dropping a duplicate leaf, by contrast, IS exact in Kleene.
 pub fn simplify_local<A: GraphArith>(g: &Graph<A>, roots: &[NodeId], cap: usize, expand: usize) -> (Graph<A>, Vec<NodeId>, Stats) {
-    let need = reachable(g, roots);
+    let need = g.reachable(roots);
     let mut out = g.like();
     let mut map: Vec<NodeId> = vec![UNREACHABLE; g.len()];
     let mut st = Stats { before: need.iter().filter(|x| **x).count(), ..Default::default() };
@@ -609,7 +594,7 @@ pub fn simplify_local<A: GraphArith>(g: &Graph<A>, roots: &[NodeId], cap: usize,
         map[id] = result;
     }
     let mapped: Vec<NodeId> = roots.iter().map(|r| map[*r as usize]).collect();
-    st.after = reachable(&out, &mapped).iter().filter(|x| **x).count();
+    st.after = out.reachable(&mapped).iter().filter(|x| **x).count();
     (out, map, st)
 }
 

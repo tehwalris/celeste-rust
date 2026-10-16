@@ -441,12 +441,7 @@ impl<D: Domain> Joined<D> {
         let j = join(d, cond, a, b)?;
         // Only the selects THIS merge made read `cond`'s value bit: a select an
         // earlier merge left in a slot both sides share reads its own condition.
-        let sel = a != b
-            && match &j {
-                Value::Num(n) => d.is_select_num(n),
-                Value::Bool(x) => d.is_select_bool(x),
-                _ => false,
-            };
+        let sel = a != b && d.is_select(&j);
         let first = sel && self.first_select.is_none();
         let changed = j != *a;
         if first || changed {

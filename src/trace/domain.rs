@@ -46,6 +46,64 @@ pub enum Fun2 {
     Max,
 }
 
+impl<A: GraphArith> From<Arith> for Op<A> {
+    fn from(a: Arith) -> Op<A> {
+        match a {
+            Arith::Add => Op::Add,
+            Arith::Sub => Op::Sub,
+            Arith::Mul => Op::Mul,
+            Arith::Div => Op::Div,
+            Arith::Rem => Op::Rem,
+        }
+    }
+}
+
+impl<A: GraphArith> From<Cmp> for Op<A> {
+    fn from(c: Cmp) -> Op<A> {
+        match c {
+            Cmp::Lt => Op::Lt,
+            Cmp::Le => Op::Le,
+            Cmp::Gt => Op::Gt,
+            Cmp::Ge => Op::Ge,
+            Cmp::Eq => Op::Eq,
+        }
+    }
+}
+
+impl<A: GraphArith> From<Fun1> for Op<A> {
+    fn from(f: Fun1) -> Op<A> {
+        match f {
+            Fun1::Neg => Op::Neg,
+            Fun1::Abs => Op::Abs,
+            Fun1::Flr => Op::Flr,
+            Fun1::Sin => Op::Sin,
+        }
+    }
+}
+
+impl<A: GraphArith> From<Fun2> for Op<A> {
+    fn from(f: Fun2) -> Op<A> {
+        match f {
+            Fun2::Min => Op::Min,
+            Fun2::Max => Op::Max,
+        }
+    }
+}
+
+impl Cmp {
+    /// The comparison `op` is, if it is one.
+    pub fn of<A: GraphArith>(op: &Op<A>) -> Option<Cmp> {
+        Some(match op {
+            Op::Lt => Cmp::Lt,
+            Op::Le => Cmp::Le,
+            Op::Gt => Cmp::Gt,
+            Op::Ge => Cmp::Ge,
+            Op::Eq => Cmp::Eq,
+            _ => return None,
+        })
+    }
+}
+
 /// Which op family carries a fork (the memo's second key): `Floors` and
 /// `Ints` over one value resolve differently and may not share a choice.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -172,10 +230,8 @@ pub trait Domain: Clone + Default {
     /// (index, key, loop bound); unknown is a refusal.
     fn as_const(&self, v: &Self::Num) -> Option<<Self::A as Arithmetic>::Num>;
 
-    /// What this value IS, for an error message.
-    fn describe(&self, _v: &Self::Num) -> String {
-        "<opaque>".to_string()
-    }
+    /// What this number IS, for a message: its value where known.
+    fn describe(&self, v: &Self::Num) -> String;
 
     /// Is this value an INTERVAL (a set of numbers)? Forking a single number
     /// buys nothing.
@@ -186,12 +242,7 @@ pub trait Domain: Clone + Default {
     /// Is a merged value a SELECT the kernel reads by its condition (`Op::Sel`)?
     /// Only a select reads the merge's condition, so only it can make the
     /// merge refuse (`state::merge`).
-    fn is_select_num(&self, _v: &Self::Num) -> bool {
-        false
-    }
-
-    /// `is_select_num` for a boolean.
-    fn is_select_bool(&self, _b: &Self::Bool) -> bool {
+    fn is_select(&self, _v: &super::heap::Value<Self>) -> bool {
         false
     }
 
@@ -286,10 +337,6 @@ pub trait Domain: Clone + Default {
         None
     }
 
-    /// A number for a diagnostic (a fork's origin): its value if known.
-    fn describe_num(&self, n: &Self::Num) -> String {
-        format!("{n:?}")
-    }
 }
 
 /// The tag of a countdown's atom id (`Symbolic::countdown_atom`).
@@ -396,7 +443,8 @@ pub struct Symbolic<A: GraphArith = Fixed> {
     /// (a platform's `x`: an integer in every world, `concrete::platform_worlds`
     /// checks), for `cancel_sub` in an arithmetic whose addition rounds.
     pub integral_inputs: rustc_hash::FxHashSet<NodeId>,
-    /// `lane_independent`'s memo; structural, so it outlives a frame.
+    /// `lane_independent`'s memo (whether a lane's data reaches a node);
+    /// structural, so it outlives a frame.
     lane_memo: rustc_hash::FxHashMap<NodeId, bool>,
     /// `reads_unknown_atom`'s memo: structural, like `lane_memo`.
     atom_memo: rustc_hash::FxHashMap<NodeId, bool>,
@@ -685,7 +733,7 @@ impl<A: GraphArith> Symbolic<A> {
 
     /// Does any of `ns` read an unknown number or boolean atom?
     fn reads_unknown(&self, ns: &[NodeId]) -> bool {
-        crate::trace::verify::cone(&self.graph, ns).into_iter().any(|n| matches!(self.graph.get(n).op, Op::UnknownNum | Op::UnknownBool(_)))
+        self.graph.cone(ns).into_iter().any(|n| matches!(self.graph.get(n).op, Op::UnknownNum | Op::UnknownBool(_)))
     }
 
     /// `a - r` where `a` is `r + c`: `c` EXACTLY, also under a select's
@@ -915,30 +963,8 @@ impl<A: GraphArith> Symbolic<A> {
 
     /// Does no lane's data reach `n` - no input cell or fork?
     pub fn lane_independent(&mut self, n: NodeId) -> bool {
-        let mut stack: Vec<(NodeId, bool)> = vec![(n, false)];
-        while let Some((x, expanded)) = stack.pop() {
-            if self.lane_memo.contains_key(&x) {
-                continue;
-            }
-            let node = self.graph.get(x);
-            let dependent = matches!(
-                node.op,
-                Op::Cell(_) | Op::Split(_) | Op::SplitValid(_) | Op::SplitInt(_) | Op::RSplit(_) | Op::RSplitValid(_)
-            );
-            if dependent || node.args.is_empty() {
-                self.lane_memo.insert(x, !dependent);
-                continue;
-            }
-            let args = node.args.clone();
-            if expanded {
-                let r = args.iter().all(|a| self.lane_memo[a]);
-                self.lane_memo.insert(x, r);
-            } else {
-                stack.push((x, true));
-                stack.extend(args.iter().filter(|a| !self.lane_memo.contains_key(a)).map(|a| (*a, false)));
-            }
-        }
-        self.lane_memo[&n]
+        let dependent = |op: &Op<A>| matches!(op, Op::Cell(_) | Op::Split(_) | Op::SplitValid(_) | Op::SplitInt(_) | Op::RSplit(_) | Op::RSplitValid(_)).then_some(true);
+        !cone_any(&self.graph, &mut self.lane_memo, n, dependent)
     }
 
     /// `op` over LITERAL operands (one an interval) in `Graph::eval`'s
@@ -974,6 +1000,38 @@ impl<A: GraphArith> Symbolic<A> {
         }
     }
 
+    /// The steps every operation on `args` takes first, in order: constants
+    /// fold (`point`), so what the heap depends on stays concrete; the
+    /// unknown number makes `unknown`; and an operand selecting the unknown
+    /// number on some lanes (`unknown_select`, the first operand first)
+    /// distributes the operation (`again`) over its arms, exactly: `op(Sel(c,
+    /// t, f)) = Sel(c, op(t), op(f))`, same error. `None` where none applies.
+    fn prologue(
+        &mut self,
+        args: &[NodeId],
+        point: impl FnOnce(&mut Self, &[A::Num]) -> Result<NodeId>,
+        unknown: impl FnOnce(&mut Self) -> NodeId,
+        again: impl Fn(&mut Self, &[NodeId]) -> Result<NodeId>,
+    ) -> Result<Option<NodeId>> {
+        if let Some(xs) = args.iter().map(|a| self.as_point(*a)).collect::<Option<Vec<_>>>() {
+            return point(self, &xs).map(Some);
+        }
+        if args.iter().any(|a| self.is_unknown_num(*a)) {
+            return Ok(Some(unknown(self)));
+        }
+        for (k, a) in args.iter().enumerate() {
+            if let Some((c, t, f)) = self.unknown_select(*a) {
+                let mut at = args.to_vec();
+                at[k] = t;
+                let x = again(self, &at)?;
+                at[k] = f;
+                let y = again(self, &at)?;
+                return Ok(Some(self.graph.fold(Op::Sel, vec![c, x, y])));
+            }
+        }
+        Ok(None)
+    }
+
     fn konst(&mut self, v: A::Num) -> NodeId {
         let l = A::lit(v);
         self.graph.leaf(Op::Const(l, l))
@@ -999,20 +1057,8 @@ impl<A: GraphArith> Domain for Symbolic<A> {
         self.graph.leaf(Op::ConstBool(b))
     }
     fn arith(&mut self, op: Arith, a: &NodeId, b: &NodeId) -> Result<NodeId> {
-        // Fold known operands, so what the heap depends on stays concrete.
-        if let (Some(x), Some(y)) = (self.as_point(*a), self.as_point(*b)) {
-            return Ok(self.konst(fold_arith::<A>(op, x, y)?));
-        }
-        if self.is_unknown_num(*a) || self.is_unknown_num(*b) {
-            return Ok(self.unknown_num());
-        }
-        if let Some((c, t, f)) = self.unknown_select(*a) {
-            let (x, y) = (self.arith(op, &t, b)?, self.arith(op, &f, b)?);
-            return Ok(self.sel_num(&c, &x, &y));
-        }
-        if let Some((c, t, f)) = self.unknown_select(*b) {
-            let (x, y) = (self.arith(op, a, &t)?, self.arith(op, a, &f)?);
-            return Ok(self.sel_num(&c, &x, &y));
+        if let Some(n) = self.prologue(&[*a, *b], |d, x| Ok(d.konst(fold_arith::<A>(op, x[0], x[1])?)), Self::unknown_num, |d, x| d.arith(op, &x[0], &x[1]))? {
+            return Ok(n);
         }
         if let Arith::Sub = op {
             if let Some(n) = self.cancel_sub(*a, *b)? {
@@ -1024,32 +1070,19 @@ impl<A: GraphArith> Domain for Symbolic<A> {
                 return Ok(n);
             }
         }
-        let g = match op {
-            Arith::Add => Op::Add,
-            Arith::Sub => Op::Sub,
-            Arith::Mul => Op::Mul,
-            Arith::Div => Op::Div,
-            Arith::Rem => Op::Rem,
-        };
-        if let Some(n) = self.literal_num(g.clone(), &[*a, *b]) {
+        if let Some(n) = self.literal_num(op.into(), &[*a, *b]) {
             return Ok(n);
         }
-        Ok(self.graph.fold(g, vec![*a, *b]))
+        Ok(self.graph.fold(op.into(), vec![*a, *b]))
     }
     fn fun1(&mut self, f: Fun1, a: &NodeId) -> Result<NodeId> {
-        if let Some(x) = self.as_point(*a) {
-            return Ok(self.konst(fold_fun1::<A>(f, x)?));
-        }
         // `sin` of anything is in [-1, 1]; other builtins of unknown: unknown.
-        if self.is_unknown_num(*a) {
-            return Ok(match f {
-                Fun1::Sin => self.graph.leaf(Op::Const(A::lit(A::from_i16(-1)), A::lit(A::from_i16(1)))),
-                _ => self.unknown_num(),
-            });
-        }
-        if let Some((c, t, e)) = self.unknown_select(*a) {
-            let (x, y) = (self.fun1(f, &t)?, self.fun1(f, &e)?);
-            return Ok(self.sel_num(&c, &x, &y));
+        let unknown = |d: &mut Self| match f {
+            Fun1::Sin => d.graph.leaf(Op::Const(A::lit(A::from_i16(-1)), A::lit(A::from_i16(1)))),
+            _ => d.unknown_num(),
+        };
+        if let Some(n) = self.prologue(&[*a], |d, x| Ok(d.konst(fold_fun1::<A>(f, x[0])?)), unknown, |d, x| d.fun1(f, &x[0]))? {
+            return Ok(n);
         }
         // `sin` of an interval is [-1, 1]: the emitter cannot lower `Sin`
         // over a ZI.
@@ -1058,66 +1091,30 @@ impl<A: GraphArith> Domain for Symbolic<A> {
             let hi = self.konst(A::from_i16(1));
             return Ok(self.graph.fold(Op::Span, vec![lo, hi]));
         }
-        let g = match f {
-            Fun1::Neg => Op::Neg,
-            Fun1::Abs => Op::Abs,
-            Fun1::Flr => Op::Flr,
-            Fun1::Sin => Op::Sin,
-        };
-        if let Some(n) = self.literal_num(g.clone(), &[*a]) {
+        if let Some(n) = self.literal_num(f.into(), &[*a]) {
             return Ok(n);
         }
-        Ok(self.graph.fold(g, vec![*a]))
+        Ok(self.graph.fold(f.into(), vec![*a]))
     }
     fn fun2(&mut self, f: Fun2, a: &NodeId, b: &NodeId) -> Result<NodeId> {
-        if let (Some(x), Some(y)) = (self.as_point(*a), self.as_point(*b)) {
-            return Ok(self.konst(fold_fun2::<A>(f, x, y)));
-        }
-        if self.is_unknown_num(*a) || self.is_unknown_num(*b) {
-            return Ok(self.unknown_num());
-        }
-        if let Some((c, t, e)) = self.unknown_select(*a) {
-            let (x, y) = (self.fun2(f, &t, b)?, self.fun2(f, &e, b)?);
-            return Ok(self.sel_num(&c, &x, &y));
-        }
-        if let Some((c, t, e)) = self.unknown_select(*b) {
-            let (x, y) = (self.fun2(f, a, &t)?, self.fun2(f, a, &e)?);
-            return Ok(self.sel_num(&c, &x, &y));
-        }
-        let g = match f {
-            Fun2::Min => Op::Min,
-            Fun2::Max => Op::Max,
-        };
-        if let Some(n) = self.literal_num(g.clone(), &[*a, *b]) {
+        if let Some(n) = self.prologue(&[*a, *b], |d, x| Ok(d.konst(fold_fun2::<A>(f, x[0], x[1]))), Self::unknown_num, |d, x| d.fun2(f, &x[0], &x[1]))? {
             return Ok(n);
         }
-        Ok(self.graph.fold(g, vec![*a, *b]))
+        if let Some(n) = self.literal_num(f.into(), &[*a, *b]) {
+            return Ok(n);
+        }
+        Ok(self.graph.fold(f.into(), vec![*a, *b]))
     }
     fn compare(&mut self, op: Cmp, a: &NodeId, b: &NodeId) -> Result<NodeId> {
-        if let (Some(x), Some(y)) = (self.as_point(*a), self.as_point(*b)) {
-            return Ok(self.graph.leaf(Op::ConstBool(fold_compare::<A>(op, x, y))));
-        }
         // With an unknown number nothing is decided.
-        if self.is_unknown_num(*a) || self.is_unknown_num(*b) {
-            return Ok(if self.countdown_hint || !self.level.fruit { self.countdown_atom() } else { self.unknown_bool_atom() });
-        }
-        if let Some((c, t, f)) = self.unknown_select(*a) {
-            let (x, y) = (self.compare(op, &t, b)?, self.compare(op, &f, b)?);
-            return Ok(self.sel_bool(&c, &x, &y));
-        }
-        if let Some((c, t, f)) = self.unknown_select(*b) {
-            let (x, y) = (self.compare(op, a, &t)?, self.compare(op, a, &f)?);
-            return Ok(self.sel_bool(&c, &x, &y));
+        let unknown = |d: &mut Self| if d.countdown_hint || !d.level.fruit { d.countdown_atom() } else { d.unknown_bool_atom() };
+        let point = |d: &mut Self, x: &[A::Num]| Ok(d.graph.leaf(Op::ConstBool(fold_compare::<A>(op, x[0], x[1]))));
+        if let Some(n) = self.prologue(&[*a, *b], point, unknown, |d, x| d.compare(op, &x[0], &x[1]))? {
+            return Ok(n);
         }
         // Two literals: decided by their intervals, or a fresh atom of their own.
-        let lit = match op {
-            Cmp::Lt => Op::Lt,
-            Cmp::Le => Op::Le,
-            Cmp::Gt => Op::Gt,
-            Cmp::Ge => Op::Ge,
-            Cmp::Eq => Op::Eq,
-        };
-        match self.eval_literal(&lit, &[*a, *b]) {
+        let g: Op<A> = op.into();
+        match self.eval_literal(&g, &[*a, *b]) {
             Some(crate::transpile::graph::Val::Bool(Some(r))) => return Ok(self.graph.leaf(Op::ConstBool(r))),
             Some(crate::transpile::graph::Val::Bool(None)) => return Ok(self.unknown_bool_atom()),
             _ => {}
@@ -1125,18 +1122,11 @@ impl<A: GraphArith> Domain for Symbolic<A> {
         // Decided by static ranges iff every pair of pieces agrees.
         if self.has_ranges() {
             if let (Some(xs), Some(ys)) = (self.range_of(*a), self.range_of(*b)) {
-                if let Some(r) = A::decide_cmp(&lit, &xs, &ys) {
+                if let Some(r) = A::decide_cmp(&g, &xs, &ys) {
                     return Ok(self.graph.leaf(Op::ConstBool(r)));
                 }
             }
         }
-        let g = match op {
-            Cmp::Lt => Op::Lt,
-            Cmp::Le => Op::Le,
-            Cmp::Gt => Op::Gt,
-            Cmp::Ge => Op::Ge,
-            Cmp::Eq => Op::Eq,
-        };
         Ok(self.graph.fold(g, vec![*a, *b]))
     }
     fn not(&mut self, a: &NodeId) -> NodeId {
@@ -1270,12 +1260,8 @@ impl<A: GraphArith> Domain for Symbolic<A> {
         }
     }
 
-    fn is_select_num(&self, v: &NodeId) -> bool {
-        matches!(self.graph.get(*v).op, Op::Sel)
-    }
-
-    fn is_select_bool(&self, b: &NodeId) -> bool {
-        matches!(self.graph.get(*b).op, Op::Sel)
+    fn is_select(&self, v: &super::heap::Value<Self>) -> bool {
+        matches!(v, super::heap::Value::Num(n) | super::heap::Value::Bool(n) if self.graph.get(*n).op == Op::Sel)
     }
 
     fn evaluated_at(&mut self, n: &NodeId, at: &NodeId) {
@@ -1318,28 +1304,10 @@ impl<A: GraphArith> Domain for Symbolic<A> {
         if !self.unknowns() || self.decide(c).is_some() {
             return false;
         }
-        // Post-order and memoized: a frame's conditions share their cones.
-        let mut stack: Vec<(NodeId, bool)> = vec![(*c, false)];
-        while let Some((x, expanded)) = stack.pop() {
-            if self.atom_memo.contains_key(&x) {
-                continue;
-            }
-            let node = self.graph.get(x);
-            if matches!(node.op, Op::UnknownBool(_)) || node.args.is_empty() {
-                let atom = matches!(node.op, Op::UnknownBool(k) if !is_countdown_atom(k));
-                self.atom_memo.insert(x, atom);
-                continue;
-            }
-            let args = node.args.clone();
-            if expanded {
-                let r = args.iter().any(|a| self.atom_memo[a]);
-                self.atom_memo.insert(x, r);
-            } else {
-                stack.push((x, true));
-                stack.extend(args.iter().filter(|a| !self.atom_memo.contains_key(a)).map(|a| (*a, false)));
-            }
-        }
-        self.atom_memo[c]
+        cone_any(&self.graph, &mut self.atom_memo, *c, |op| match op {
+            Op::UnknownBool(k) => Some(!is_countdown_atom(*k)),
+            _ => None,
+        })
     }
 
     fn set_countdown_hint(&mut self, on: bool) {
@@ -1350,28 +1318,11 @@ impl<A: GraphArith> Domain for Symbolic<A> {
         if self.merge_refused.is_empty() || self.decide(c).is_some() {
             return false;
         }
-        // Post-order and memoized, as `reads_unknown_atom`.
-        let mut stack: Vec<(NodeId, bool)> = vec![(*c, false)];
-        while let Some((x, expanded)) = stack.pop() {
-            if self.merge_refused_memo.contains_key(&x) {
-                continue;
-            }
-            let node = self.graph.get(x);
-            if node.args.is_empty() {
-                let refused = matches!(node.op, Op::Cell(i) if self.merge_refused.binary_search(&i).is_ok());
-                self.merge_refused_memo.insert(x, refused);
-                continue;
-            }
-            let args = node.args.clone();
-            if expanded {
-                let r = args.iter().any(|a| self.merge_refused_memo[a]);
-                self.merge_refused_memo.insert(x, r);
-            } else {
-                stack.push((x, true));
-                stack.extend(args.iter().filter(|a| !self.merge_refused_memo.contains_key(a)).map(|a| (*a, false)));
-            }
-        }
-        self.merge_refused_memo[c]
+        let refused = &self.merge_refused;
+        cone_any(&self.graph, &mut self.merge_refused_memo, *c, |op| match op {
+            Op::Cell(i) => Some(refused.binary_search(i).is_ok()),
+            _ => None,
+        })
     }
 
     fn join_bool_independent(&mut self, c: &NodeId, t: &NodeId, f: &NodeId) -> Option<NodeId> {
@@ -1399,13 +1350,6 @@ impl<A: GraphArith> Domain for Symbolic<A> {
         self.unknown_atoms
     }
 
-    fn describe_num(&self, n: &NodeId) -> String {
-        match self.graph.get(*n).op {
-            Op::Const(lo, hi) if lo == hi => A::show(A::from_lit(lo)),
-            Op::Const(lo, hi) => format!("{}..{}", A::show(A::from_lit(lo)), A::show(A::from_lit(hi))),
-            _ => "?".to_string(),
-        }
-    }
 
     fn escaped_atom(&mut self, b: &NodeId, since: u32, origin: &dyn Fn(&Self) -> String) -> Option<NodeId> {
         // Only with unknowns, and never a countdown's atom (`countdown_atom`):
@@ -1421,7 +1365,7 @@ impl<A: GraphArith> Domain for Symbolic<A> {
         // countdown's `b` reads is enumerated with them all the same, so the
         // restriction below reads no atom (one left in it is unknown on every
         // lane: the fork's coverage would decline them all).
-        let atoms: Vec<NodeId> = crate::trace::verify::cone(&self.graph, &[*b])
+        let atoms: Vec<NodeId> = self.graph.cone(&[*b])
             .into_iter()
             .filter(|n| matches!(self.graph.get(*n).op, Op::UnknownBool(k) if is_countdown_atom(k) || (k >= since && k != u32::MAX)))
             .collect();
@@ -1499,15 +1443,38 @@ impl<A: GraphArith> Domain for Symbolic<A> {
     }
 
     fn describe(&self, v: &NodeId) -> String {
-        // One level of operands too: whether a select's arms are constants.
         let n = self.graph.get(*v);
-        let args: Vec<String> = n
-            .args
-            .iter()
-            .map(|a| format!("{:?}", self.graph.get(*a).op))
-            .collect();
-        format!("node {} = {:?}({})", v, n.op, args.join(", "))
+        match n.op {
+            Op::Const(lo, hi) if lo == hi => A::show(A::from_lit(lo)),
+            Op::Const(lo, hi) => format!("{}..{}", A::show(A::from_lit(lo)), A::show(A::from_lit(hi))),
+            // One level of operands too: whether a select's arms are constants.
+            _ => format!("node {} = {:?}({})", v, n.op, n.args.iter().map(|a| format!("{:?}", self.graph.get(*a).op)).collect::<Vec<_>>().join(", ")),
+        }
     }
+}
+
+/// Does a node of `n`'s cone satisfy `leaf`? `leaf` decides a node it
+/// answers for (not looked beneath); every other node is its operands' OR,
+/// an operand-free one `false`. Post-order and memoized in `memo`: a
+/// frame's conditions share their cones.
+fn cone_any<A: GraphArith>(g: &Graph<A>, memo: &mut rustc_hash::FxHashMap<NodeId, bool>, n: NodeId, leaf: impl Fn(&Op<A>) -> Option<bool>) -> bool {
+    let mut stack: Vec<(NodeId, bool)> = vec![(n, false)];
+    while let Some((x, expanded)) = stack.pop() {
+        if memo.contains_key(&x) {
+            continue;
+        }
+        let node = g.get(x);
+        if let Some(v) = leaf(&node.op) {
+            memo.insert(x, v);
+        } else if expanded || node.args.is_empty() {
+            let v = node.args.iter().any(|a| memo[a]);
+            memo.insert(x, v);
+        } else {
+            stack.push((x, true));
+            stack.extend(node.args.iter().filter(|a| !memo.contains_key(a)).map(|a| (*a, false)));
+        }
+    }
+    memo[&n]
 }
 
 /// The `move` fork's arity: exact speed plus a rem within one grid cell
@@ -1703,8 +1670,8 @@ mod tests {
         assert_eq!(less, d.sel_num(&c, &fifty_nine, &u));
         let done = d.compare(Cmp::Le, &less, &zero).unwrap();
         let node = d.graph.get(done).clone();
-        assert!(crate::trace::verify::cone(&d.graph, &[done]).iter().all(|n| d.graph.get(*n).op != Op::UnknownNum), "{node:?}");
-        assert!(crate::trace::verify::cone(&d.graph, &[done]).iter().any(|n| matches!(d.graph.get(*n).op, Op::UnknownBool(_))), "the unknown lanes: an atom");
+        assert!(d.graph.cone(&[done]).iter().all(|n| d.graph.get(*n).op != Op::UnknownNum), "{node:?}");
+        assert!(d.graph.cone(&[done]).iter().any(|n| matches!(d.graph.get(*n).op, Op::UnknownBool(_))), "the unknown lanes: an atom");
     }
 
     /// `x == k` on an interval `x` may be true where `k` is in `x` and false

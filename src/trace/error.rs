@@ -113,7 +113,7 @@ pub fn for_outcomes<A: GraphArith>(d: &mut Symbolic<A>, outcomes: &[Vec<NodeId>]
     // charged once for the frame (`pins_hold`).
     let assumed: Vec<NodeId> = d.assumptions.iter().copied().filter(|a| matches!(d.graph.get(*a).op, Op::Restrict(..))).collect();
     let all: Vec<NodeId> = outcomes.iter().flatten().copied().chain(sites).chain(assumed.iter().copied()).collect();
-    let reach = crate::transpile::bdd::reachable(&d.graph, &all);
+    let reach = d.graph.reachable(&all);
     // The sources and their own errors, in node order.
     let mut sources: Vec<(NodeId, NodeId)> = Vec::new();
     let mut index: rustc_hash::FxHashMap<NodeId, usize> = Default::default();
@@ -475,7 +475,7 @@ mod tests {
         let m = d.graph.fold(Op::Mul, vec![past, two]);
         let fits = d.graph.fold(Op::NoWrap, vec![m]);
         let e = of(&mut d, &[m]);
-        assert!(crate::transpile::bdd::reachable(&d.graph, &[e])[fits as usize], "the product's NoWrap is owed");
+        assert!(d.graph.reachable(&[e])[fits as usize], "the product's NoWrap is owed");
     }
 
     #[test]
@@ -495,7 +495,7 @@ mod tests {
         let t = d.graph.fold(Op::Add, vec![y, one]);
         let fits = d.graph.fold(Op::NoWrap, vec![t]);
         let e = of(&mut d, &[t]);
-        assert!(crate::transpile::bdd::reachable(&d.graph, &[e])[fits as usize], "the sum's NoWrap is owed");
+        assert!(d.graph.reachable(&[e])[fits as usize], "the sum's NoWrap is owed");
     }
 
     #[test]

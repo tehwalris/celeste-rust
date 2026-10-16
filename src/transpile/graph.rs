@@ -312,6 +312,34 @@ impl<A: GraphArith> Graph<A> {
         &self.nodes[id as usize]
     }
 
+    /// Per node of the arena: does one of `roots` read it (through
+    /// operands)?
+    pub fn reachable(&self, roots: &[NodeId]) -> Vec<bool> {
+        let mut need = vec![false; self.len()];
+        let mut stack: Vec<NodeId> = roots.to_vec();
+        while let Some(n) = stack.pop() {
+            if !std::mem::replace(&mut need[n as usize], true) {
+                stack.extend(self.get(n).args.iter().copied());
+            }
+        }
+        need
+    }
+
+    /// The nodes `roots` read, ascending (operands precede their node).
+    /// Its cost is the cone's, not the arena's.
+    pub fn cone(&self, roots: &[NodeId]) -> Vec<NodeId> {
+        let mut seen: rustc_hash::FxHashSet<NodeId> = Default::default();
+        let mut stack: Vec<NodeId> = roots.to_vec();
+        while let Some(n) = stack.pop() {
+            if seen.insert(n) {
+                stack.extend(self.get(n).args.iter().copied());
+            }
+        }
+        let mut out: Vec<NodeId> = seen.into_iter().collect();
+        out.sort_unstable();
+        out
+    }
+
     pub fn len(&self) -> usize {
         self.nodes.len()
     }

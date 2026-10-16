@@ -149,7 +149,7 @@ pub fn bind<A: GraphArith>(f: &crate::trace::verify::Frame<A>, g: &Graph<A>) -> 
             }
             crate::transpile::graph::Op::UnknownNum => {
                 // Name the roots that read it: the field, the guard or the error.
-                let reaches = |r: NodeId| crate::trace::verify::cone(&graph, &[r]).contains(&n);
+                let reaches = |r: NodeId| graph.cone(&[r]).contains(&n);
                 let which: Vec<String> = roots.iter().enumerate().filter(|(_, r)| reaches(**r)).map(|(i, r)| format!("#{i} {}", show_tree(&graph, *r, 4))).collect();
                 anyhow::bail!("an unknown number reaches the kernel: node {n} is read by root(s)\n{}\nwhere the roots are\n{}", which.join("\n"), root_legend(f))
             }

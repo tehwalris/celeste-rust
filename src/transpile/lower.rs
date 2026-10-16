@@ -50,20 +50,6 @@ pub(crate) fn build_profile() -> String {
         .join(", ")
 }
 
-/// Nodes reachable from `roots`, walking operands.
-fn reachable<A: GraphArith>(g: &Graph<A>, roots: &[NodeId]) -> Vec<bool> {
-    let mut live = vec![false; g.len()];
-    let mut stack: Vec<NodeId> = roots.to_vec();
-    while let Some(n) = stack.pop() {
-        if live[n as usize] {
-            continue;
-        }
-        live[n as usize] = true;
-        stack.extend(g.get(n).args.iter().copied());
-    }
-    live
-}
-
 /// One output shape: the cells it writes, and the two booleans that say
 /// which lanes reach it (`live`) and on which of those its row is undefined
 /// (`error`, `trace::error`).
@@ -163,7 +149,7 @@ pub(crate) fn specialize_frame<A: GraphArith>(
         want.push(*live);
         want.extend(extra.iter().copied());
         // An outcome reaches a fraction of the graph; map only that.
-        let need = reachable(graph, &want);
+        let need = graph.reachable(&want);
         let bits = bits_of(&need);
         let validity_read: std::collections::BTreeSet<u8> = (0..graph.len())
             .filter(|&n| need[n])

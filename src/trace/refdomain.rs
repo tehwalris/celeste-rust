@@ -264,13 +264,7 @@ impl<A: Arithmetic> Domain for RefDomain<A> {
     }
 
     fn describe(&self, v: &A::Ival) -> String {
-        match A::as_point(*v) {
-            Some(n) => format!("{:?}", n),
-            None => {
-                let (lo, hi) = A::bounds(*v);
-                format!("[{:?}, {:?}]", lo, hi)
-            }
-        }
+        show::<A>(v)
     }
 
     fn fork_flr(&mut self, v: &A::Ival, _ways: u8) -> (A::Ival, bool) {

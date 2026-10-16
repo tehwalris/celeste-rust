@@ -1362,7 +1362,7 @@ impl<'a, D: Domain> Interp<'a, D> {
             let at = (num("x"), num("y"));
             for (k, x) in t.hash.iter_mut() {
                 swap(&mut *d, x, &|d: &D| match &at {
-                    (Some(px), Some(py)) => format!("{k} at x {} y {}", d.describe_num(px), d.describe_num(py)),
+                    (Some(px), Some(py)) => format!("{k} at x {} y {}", d.describe(px), d.describe(py)),
                     _ => k.clone(),
                 });
             }

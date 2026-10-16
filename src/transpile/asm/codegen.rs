@@ -1416,20 +1416,6 @@ fn schedule<A: GraphArith>(g: &Graph<A>, live: &[bool], roots: &[NodeId], batch:
     order
 }
 
-/// Nodes reachable from `roots`.
-fn reachable<A: GraphArith>(g: &Graph<A>, roots: &[NodeId]) -> Vec<bool> {
-    let mut live = vec![false; g.len()];
-    let mut stack = roots.to_vec();
-    while let Some(n) = stack.pop() {
-        if live[n as usize] {
-            continue;
-        }
-        live[n as usize] = true;
-        stack.extend(g.get(n).args.iter().copied());
-    }
-    live
-}
-
 // ---- register allocation: linear scan ----
 
 #[derive(Clone, Copy)]
@@ -2339,7 +2325,7 @@ fn compile_with<A: GraphArith>(
     halves: bool,
     mut lower: impl FnMut(&mut Lower<'_, A>, NodeId) -> Result<()>,
 ) -> Result<Compiled> {
-    let live = reachable(g, roots);
+    let live = g.reachable(roots);
 
     // Assign input offsets to reachable cells, ascending by cell id.
     let mut cells: Vec<u32> = (0..g.len() as NodeId)

@@ -559,7 +559,7 @@ impl<A: GraphArith> Table<'_, A> {
             }
             rs.extend(&r.fields);
         }
-        let need = crate::transpile::bdd::reachable(arena, &rs);
+        let need = arena.reachable(&rs);
         let mut cone = arena.like();
         cone.reset_forks();
         for k in 0..f.forks {
@@ -661,7 +661,7 @@ impl<A: GraphArith> Cone<A> {
             roots.extend(r.xy.iter().flat_map(|(x, y)| [*x, *y]));
             roots.extend(&r.fields);
         }
-        let need = crate::transpile::bdd::reachable(&self.graph, &roots);
+        let need = self.graph.reachable(&roots);
         for c in 0..n_configs {
             let mut splits = vec![0u8; self.n_forks as usize];
             let mut rest = c;
