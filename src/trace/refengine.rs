@@ -131,12 +131,23 @@ where
     /// the same successors.
     fn step_reads(&mut self, row: &Rt2<A::Num>, byte: u8) -> Result<(Vec<Block<A::Num>>, u8)> {
         let (mut st, _) = from_block(row, 0, &self.fn_info, &self.base)?;
-        let buttons = set_buttons(&mut st, byte)?;
+        let (leaves, mask) = self.under_buttons(&mut st, byte, &[], Level::EXACT)?;
+        Ok((self.blocks(&leaves)?, mask))
+    }
+
+    /// One frame of `st` under input `byte`, its `unknown` fields forked
+    /// at `level`: every leaf, and the buttons the frame read.
+    fn under_buttons(&mut self, st: &mut State<RefDomain<A>>, byte: u8, unknown: &[(crate::trace::heap::TableId, String)], level: Level) -> Result<(Vec<State<RefDomain<A>>>, u8)> {
+        let buttons = set_buttons(st, byte)?;
         self.it.button_reads = Some((buttons, 0));
-        let leaves = run_frame_all(&mut self.it, self.body_concrete, &st, &[], Level::EXACT, self.path_cap);
+        let leaves = run_frame_all(&mut self.it, self.body_concrete, st, unknown, level, self.path_cap);
         let (_, mask) = self.it.button_reads.take().expect("set above");
-        let out = leaves.map_err(|e| e.context(ran_from(&st, Some(byte))))?.iter().map(|l| Block::canonical(to_block(l, self.settings.room)?)).collect::<Result<_>>()?;
-        Ok((out, mask))
+        Ok((leaves.map_err(|e| e.context(ran_from(st, Some(byte))))?, mask))
+    }
+
+    /// Leaves as keyed one-row blocks.
+    fn blocks(&self, leaves: &[State<RefDomain<A>>]) -> Result<Vec<Block<A::Num>>> {
+        leaves.iter().map(|l| Block::canonical(to_block(l, self.settings.room)?)).collect()
     }
 
     /// One whole GAME frame: `step` once, or under the split frame
@@ -162,12 +173,7 @@ where
         }
         Ok((out, mask))
     }
-}
 
-impl<A: Arithmetic> ReferenceEngine<A>
-where
-    A::Num: EngineNum<A = A>,
-{
     /// `step` at an abstract `level` (`rewrite arc-check`): the row's
     /// unknowns are forked as the level's kernels fork them (each unknown
     /// boolean both ways, a near floor's `state` per value, a comparison
@@ -204,11 +210,7 @@ where
         if pin && level.fruit {
             pin_fly_fruit_motion(&mut st)?;
         }
-        let buttons = set_buttons(&mut st, byte)?;
-        self.it.button_reads = Some((buttons, 0));
-        let leaves = run_frame_all(&mut self.it, self.body_concrete, &st, &unknown, level, self.path_cap);
-        let (_, mask) = self.it.button_reads.take().expect("set above");
-        let leaves = leaves.map_err(|e| e.context(ran_from(&st, Some(byte))))?;
+        let (leaves, mask) = self.under_buttons(&mut st, byte, &unknown, level)?;
         if pinned_floors {
             // What the floors' pin assumes: no player went far this frame.
             let before = players(&st)?;
@@ -221,8 +223,7 @@ where
                 }
             }
         }
-        let out = leaves.iter().map(|l| Block::canonical(to_block(l, self.settings.room)?)).collect::<Result<_>>()?;
-        Ok((out, mask))
+        Ok((self.blocks(&leaves)?, mask))
     }
 
     /// `step` where the frame must not fork: the one successor.

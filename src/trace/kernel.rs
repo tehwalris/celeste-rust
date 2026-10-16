@@ -117,13 +117,7 @@ impl RegionGrid {
         let lit = |raw: i32| A::lit(A::from_fixed_raw(raw));
         let (rlo, rhi) = celeste_engine::widening::range::<A::Num>(celeste_engine::widening::REM.0, celeste_engine::widening::REM.1);
         let rem = (A::lit(rlo), A::lit(rhi));
-        let field = |fs: &[&str]| -> super::iface::Path {
-            let mut q = pl.clone();
-            for f in fs {
-                q.push(super::iface::key(f));
-            }
-            q
-        };
+        let field = |fs: &[&str]| super::widen::field(pl, fs);
         let (x0, y0) = (r.ix as i32 * self.px, r.iy as i32 * self.px);
         vec![
             (field(&["x"]), (lit(x0 * ONE), lit((x0 + self.px - 1) * ONE))),
@@ -199,7 +193,6 @@ fn no_player_ranges<A: GraphArith>(
     opts: crate::abstraction::Level,
 ) -> Result<NoPlayer<A>> {
     use super::domain::Domain as _;
-    use super::iface::Conc;
     use super::shapes;
     if shapes::player_path(start).is_some() {
         return Ok(NoPlayer::default());
@@ -233,7 +226,7 @@ fn no_player_ranges<A: GraphArith>(
         for k in 0..NO_PLAYER_FRAMES {
             np.note(&st, &consts, fruit)?;
             let roots = shapes::state_paths(&st)?;
-            let pin: Vec<(super::iface::Path, Conc<A>)> = consts.iter().filter(|(p, _)| roots.contains(p)).map(|(p, c)| (p.clone(), *c)).collect();
+            let pin = pins_of(&consts, &roots);
             let spec = super::verify::TraceSpec { roots: &roots, pin: &pin, level: Some(chain_level), ..Default::default() };
             let f = super::verify::trace_frame(it, chunks, st.clone(), &spec).map_err(|e| e.context(format!("the start's no-player chain, frame {k}")))?;
             let o = match f.outs.as_slice() {
@@ -247,11 +240,7 @@ fn no_player_ranges<A: GraphArith>(
             if shapes::player_path(&o.st).is_some() {
                 return Ok(true);
             }
-            consts = shapes::field_constants(&o.st, &it.d, &chain_opts)?;
-            let heap = shapes::heap_constants(&o.st, &it.d);
-            let mut next = o.st.clone();
-            shapes::rebase(&mut next, &mut it.d, &heap)?;
-            st = next;
+            (st, consts) = next_entry(&mut it.d, &o.st, &chain_opts)?;
         }
         anyhow::bail!("the start's no-player phase did not reach the player within {NO_PLAYER_FRAMES} frames")
     })();
@@ -309,7 +298,7 @@ fn explore_no_player<A: GraphArith>(
         np.note(&st, &consts, fruit)?;
         anyhow::ensure!(depth < NO_PLAYER_FRAMES, "{what} no-player phase did not reach the player within {NO_PLAYER_FRAMES} frames");
         let roots = shapes::state_paths(&st)?;
-        let pin: Vec<(super::iface::Path, super::iface::Conc<A>)> = consts.iter().filter(|(p, _)| roots.contains(p)).map(|(p, c)| (p.clone(), *c)).collect();
+        let pin = pins_of(&consts, &roots);
         // The state's own unknowns (not the level's widened fields, not
         // the buttons the frame resets): no merge selects on them, so
         // each branch keeps its own constants.
@@ -324,14 +313,31 @@ fn explore_no_player<A: GraphArith>(
                 ended += 1;
                 continue;
             }
-            let c = shapes::field_constants(&o.st, &it.d, &opts)?;
-            let heap = shapes::heap_constants(&o.st, &it.d);
-            let mut next = o.st.clone();
-            shapes::rebase(&mut next, &mut it.d, &heap)?;
+            let (next, c) = next_entry(&mut it.d, &o.st, &opts)?;
             todo.push((next, c, depth + 1));
         }
     }
     Ok((states, followed, ended))
+}
+
+/// The constants of `consts` at input slots of `roots`: a trace's pins.
+fn pins_of<A: GraphArith>(consts: &std::collections::BTreeMap<super::iface::Path, super::iface::Conc<A>>, roots: &[super::iface::Path]) -> Vec<(super::iface::Path, super::iface::Conc<A>)> {
+    consts.iter().filter(|(p, _)| roots.contains(p)).map(|(p, c)| (p.clone(), *c)).collect()
+}
+
+/// The next frame's entry from outcome `st`: its constants at `opts` (read
+/// before `rebase` blanks them; the next trace pins them back), and the
+/// state rebased into `d`'s arena.
+fn next_entry<A: GraphArith>(
+    d: &mut super::domain::Symbolic<A>,
+    st: &super::state::State<super::domain::Symbolic<A>>,
+    opts: &crate::abstraction::Level,
+) -> Result<(super::state::State<super::domain::Symbolic<A>>, std::collections::BTreeMap<super::iface::Path, super::iface::Conc<A>>)> {
+    let consts = super::shapes::field_constants(st, d, opts)?;
+    let heap = super::shapes::heap_constants(st, d);
+    let mut next = st.clone();
+    super::shapes::rebase(&mut next, d, &heap)?;
+    Ok((next, consts))
 }
 
 /// A numeric field's hull per path (raw 16.16, inclusive).
@@ -636,8 +642,7 @@ pub fn room_constant_lattice<A: GraphArith>(
                 let roots = shapes::state_paths(&st)?;
                 let ival = with_extra(super::widen::slots_where(&st, opts, super::widen::interval_input), ival_extra.get(k));
                 // Pin the shape's known constants that are inputs here.
-                let pin: Vec<(super::iface::Path, super::iface::Conc<A>)> =
-                    lattice[k].iter().filter(|(p, _)| roots.iter().any(|r| r == *p)).map(|(p, c)| (p.clone(), *c)).collect();
+                let pin = pins_of(&lattice[k], &roots);
                 let bounds: Bounds<A> = match (grid, *region, shapes::player_path(&st)) {
                     (Some(g), Some(r), Some(pl)) => {
                         g.bounds::<A>(&pl, r).into_iter().filter(|(p, _)| roots.iter().any(|q| q == p)).collect()
