@@ -1,19 +1,22 @@
 //! The search around the forward (`frame::ForwardState`, `storage`):
 //!
-//!   * `checkpoint` - frame checkpoint files: one per (frame, shape piece),
-//!                    raw fixed-width columns, rows in id order
-//!   * `arc_edges`  - per recorded edge, the remainder transfer
-//!   * `arcs`       - sets of remainders as arcs of the circle
-//!   * `hull`       - a state's remainder hull (the forward's): one arc per axis
-//!   * `rem`        - the remainder model of an arithmetic: hulls and transfers
-//!   * `arc_dp`     - THE SEARCH: winning sets, optimum, concrete search
-//!   * `dual`       - the dual search: a run valid in both arithmetics
-//!   * `known`      - a known solution checked against every pruning step
-//!   * `pos_graph`  - player-position cells and the position graph
-//!   * `result`     - `result.json`: what a search decided, as a record
-//!   * `robust`     - a float witness against the host libm's `sin` (Q3)
-//!   * `inspect`    - rows read by named fields, for the diagnostics
-//!   * `ui_export`  - `rewrite export-ui`: a finished run -> the web UI's data
+//!   * `arc_edges`   - per recorded edge, the remainder transfer
+//!   * `arcs`        - sets of remainders as arcs of the circle
+//!   * `hull`        - a state's remainder hull (the forward's): one arc per axis
+//!   * `rem`         - the remainder model of an arithmetic: hulls and transfers
+//!                     (`rem_f64`: the doubles')
+//!   * `arc_dp`      - THE SEARCH: winning sets, optimum, reach, concrete search
+//!   * `dual`        - the dual search: a run valid in both arithmetics
+//!   * `known`       - a known solution checked against every pruning step
+//!   * `checkpoint`  - the tree's format version and small files (marks, pos graph)
+//!   * `pos_graph`   - player-position cells and the position graph
+//!   * `result`      - `result.json`: what a search decided, as a record
+//!   * `robust`      - a float witness against the host libm's `sin`
+//!   * `inspect`     - rows read by named fields, for the diagnostics
+//!   * `ui_export`   - `rewrite export-ui`: a finished run -> the web UI's data
+//!   * `arc_check`, `hull_replay`, `reach` - checks of a tree: its transfers
+//!                     against the reference engine, its states replayed from
+//!                     its recorded edges, the exact reach its hulls hold
 pub mod arc_check;
 pub mod arc_dp;
 pub mod arc_edges;

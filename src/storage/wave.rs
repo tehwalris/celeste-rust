@@ -1,5 +1,5 @@
-//! THE FRAME of the hull forward (plans/architecture.md "The forward
-//! frame"): its frontier is the
+//! THE FRAME of the hull forward (plans/architecture.md "The forward"):
+//! its frontier is the
 //! states whose remainder HULL grew at the frame before - the NEW ones
 //! (first reached then) and OLD ones (expanded before).
 //!

@@ -7,14 +7,15 @@
 //! a win node's set the whole torus from its layer on.
 //!
 //! ONE BACKWARD PUSH over the recorded IN-edges (`backward`). `W_t(n)` only
-//! grows as `t` falls - more time never hurts, and the layers never bind:
-//! an edge recorded at frame `f` leaves a state of layer `f - 1` and enters
-//! one of layer <= `f`, so `W_t(p)` reads `W_{t+1}(m)` only where `m` has
-//! one. Hence `W_t(p) = W_{t+1}(p) ∪ U pull_e(W_{t+1}(m))` over the edges
-//! `p -> m` whose target CHANGED at `t + 1`: frame by frame, the changed
-//! nodes' in-edges are read from their TARGET regions' blocks in the edge
-//! files (`Backward::read_round`; edges are stored there) and their sets
-//! pulled into the sources. No graph is held and nothing marks nodes first:
+//! grows as `t` falls - more time never hurts. An edge recorded at frame
+//! `f` leaves a state of layer `f - 1`; it may enter a state first reached
+//! later, or never (the hull forward records it whatever its push), and
+//! `W_t(p)` reads `W_{t+1}(m)` only where `m` has one. Hence `W_t(p) =
+//! W_{t+1}(p) ∪ U pull_e(W_{t+1}(m))` over the edges `p -> m` whose target
+//! CHANGED at `t + 1`: frame by frame, the changed nodes' in-edges are read
+//! from their TARGET regions' blocks in the edge files, from the region's
+//! first frame with edges (`Backward::read_round`; edges are stored there),
+//! and their sets pulled into the sources. No graph is held and nothing marks nodes first:
 //! a node no winning set reaches is never touched. Nodes are states by
 //! what they are (`Sk`: region, key, cell), as the edge files name them.
 //! Exact because "intersect with the guard, then act" distributes over
@@ -1595,6 +1596,11 @@ pub(super) fn concrete_engines<N: Rem>(n: usize, run: &crate::settings::Settings
     Ok((engines, seeded))
 }
 
+/// The concrete steps (reference-engine successors) the depth-first try at
+/// the bound may take before it gives up (`concrete_search`; the dual
+/// search's pairs count both halves' leaves: twice this).
+pub(super) const DFS_BUDGET: u64 = 200_000;
+
 /// The inputs a state has been stepped under, each with the buttons its
 /// frame read (`RefEngine::frame_reads`). An input that agrees with one of
 /// them on every button that one read runs the same frame - the same reads,
@@ -1745,8 +1751,6 @@ pub fn concrete_search<N: Rem>(
             }
             Ok(Some(false))
         }
-        /// Concrete steps the fast path may take before it gives up.
-        const DFS_BUDGET: u64 = 200_000;
         let t = std::time::Instant::now();
         let mut eng = engines[0].lock().expect("an engine");
         let mut cx = Dfs { eng: &mut eng, node, keys, w, level, from: frames - bound, frames: bound, dead: FxHashSet::default(), path: Vec::new(), steps: 0, prefer, seeded, spf, settings: s };

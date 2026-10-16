@@ -18,6 +18,7 @@ Measured on `docs-refresh` after merging develop `0765e7c5`. Lines are
 | C1 | `reach`, `hull-stats`, `census` (src/census.rs), `diag-project`, `edge-census`; `hull-route` folded into `check-known` (the hull forward's claim at every step, `known::Hulls`); `hull-replay` keeps the replay check, the sliver study went; `search::reach` keeps what its slow tests read; `export-ui --reach` | -1,380 Rust |
 | C2 | `col-census`, `cell-growth`, `coarse-census` are one `census`: the columns at a frame (`--cell`), the saturation (`--erase`, `--cell`, `--every`), the most visited positions (`--cells K`); dropped: cell-growth's `--by-age` and col-census's speed-pair columns (`--erase spd.` gives the second) | -103 Rust |
 | C3 | `follow` folded into the known check's miss report: where the tree lost the route's state, its state at the frame boundary before is stepped by the level's kernels (`known::explain`), the route's state among the successors or not, the closest listed; `rerun-row` is `ref-check --row N` (the row and its kernel successors printed) | -66 Rust |
+| S10 | the help bug (in C1); one DFS budget (`arc_dp::DFS_BUDGET`, 200k: the dual's pairs count both halves' leaves, so 2x: the 400k was that); stale docs: `arc_dp`'s "an edge enters a layer <= f", `search/mod.rs`'s module list (checkpoint files as row pieces), "The forward frame" citations | ~0 |
 
 ## SIZE
 
@@ -213,7 +214,7 @@ Concrete simplification candidates, ordered by lines saved x safety
 | S7 | **One worker pool**: `par::Pool` exists, yet 48 `thread::scope`/spawn sites in 14 files hand-roll the atomic cursor, big stacks and ordered results | storage/wave.rs, decode.rs, edges.rs, spool.rs, search/arc_dp.rs, arc_check.rs, dual.rs, census.rs, trace/* | ~150 | low (determinism pins) |
 | S8 | **Settings written four times** (struct, clap args, `recorded()`, `startup`'s log): table-driven | settings.rs | ~80 | low |
 | S9 | **Steps vs frames**: the split frame's steps leak into the tree, the marks, level -1's H and `Found.frame`; the split cart is a 939-line near-copy of the minimal cart, not a patch | frame.rs, search/*, lua/celeste-minimal-split.lua | ~100 Rust + the Lua twin generated | medium (the split cart's text feeds the traces) |
-| S10 | **Small bugs and stale bits**: `rewrite --help` shows `check-known`'s text under `reach` (a doc comment in the wrong place) and none for `check-known`; `refdriver.rs`'s error names a deleted doc; DFS budgets 200k vs 400k; stale section names in comments | rewrite.rs, trace/refdriver.rs, search/* | ~20 | none |
+| S10 (done, but `trace/refdriver.rs`: R2's) | **Small bugs and stale bits**: `rewrite --help` shows `check-known`'s text under `reach` (a doc comment in the wrong place) and none for `check-known`; `refdriver.rs`'s error names a deleted doc; DFS budgets 200k vs 400k; stale section names in comments | rewrite.rs, trace/refdriver.rs, search/* | ~20 | none |
 | S11 | **Cart patches written twice** (Rust and replay.py, with different semantics) and the move of pico8_diff/ into tools/ | trace/cart.rs, pico8_diff/replay.py | ~60 Python | medium (replays) |
 | S12 | **The engine crate knows the game** (`BoundaryIds`, `player_objects`) and the reference engine sits in `trace/` above `frame`/`storage`: an `engines/` module beside `compiled` | celeste-engine runtime2.rs, trace/ref* | ~0 (layering) | low |
 
