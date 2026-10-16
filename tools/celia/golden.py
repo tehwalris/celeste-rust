@@ -7,6 +7,7 @@ loading jank and its own seeds; plans/float-solver.md, section 3).
     tools/celia/golden.py CAT all                  every level the category has
     tools/celia/golden.py random N LEVEL...|all    N random files a level
     tools/celia/golden.py witness all              our witnesses (gates/witnesses/)
+    tools/celia/golden.py local all                our LOCAL witnesses (tools/uct/golden.py)
 
 Per file: played in Celia with the exact trace (exact.lua via validate.sh:
 CELIA_EXACT), its buffered jumps re-timed from Celia's own run and checked
@@ -37,7 +38,6 @@ _spec = importlib.util.spec_from_file_location("uct_golden", os.path.join(os.pat
 uct = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(uct)
 
-OUT = os.path.join(ROOT, "gates", "celia")
 REWRITE = os.path.join(ROOT, "target", "quick", "rewrite")
 
 
@@ -65,7 +65,7 @@ def celia_last(updates, n):
     return max(i for i, w in enumerate(updates) if int(w[3]) <= n)
 
 
-def one(job, tmp):
+def one(job, tmp, out):
     key, level, cat, path = job
     try:
         _, seeds, inputs, trace, status, retimed = uct.canonical(cat, level, tmp, celia, "celia", path)
@@ -73,7 +73,7 @@ def one(job, tmp):
         return None, str(e)
     room = rooms.room_of(level)
     j = jank(room, cat)
-    updates = uct.golden(trace, os.path.join(OUT, f"{key}_{level}.trace.zst"), lambda u: celia_last(u, len(inputs)))
+    updates = uct.golden(trace, os.path.join(out, f"{key}_{level}.trace.zst"), lambda u: celia_last(u, len(inputs)))
     seed_text = ",".join(seeds) if seeds else "-"
     line = (
         f"{key} {level} room={room[0]},{room[1]} seeds={seed_text} gemskip={int(categories.one_dash(cat))} "
@@ -83,7 +83,7 @@ def one(job, tmp):
 
 
 def main():
-    uct.run(sys.argv[1:], OUT, one)
+    uct.run(sys.argv[1:], uct.out_dir(sys.argv[1:], "celia"), one)
 
 
 if __name__ == "__main__":

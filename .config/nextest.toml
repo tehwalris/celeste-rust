@@ -1,0 +1,6 @@
+# The local goldens' test (trace::oracle) prints what it replayed, or that it
+# SKIPPED them (the store holds our unsubmitted routes and is never
+# committed): shown on success too, so a skip is never silent.
+[[profile.default.overrides]]
+filter = "test(the_local_goldens)"
+success-output = "immediate"

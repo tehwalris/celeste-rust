@@ -357,32 +357,89 @@ mod tests {
     /// the float engine reproduces it.
     #[test]
     fn the_fixed_point_witnesses_exit_in_fixed_point() {
-        use crate::trace::refengine::RefEngine;
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-        for (file, room, hundred) in [("gates/witnesses/gemskip100_TAS25.tas", (0, 3), true)] {
-            let text = std::fs::read_to_string(root.join(file)).expect("the witness");
-            let (seeds, body) = text.trim().strip_prefix('[').and_then(|t| t.split_once(']')).expect("[seeds]inputs");
-            let inputs: Vec<u8> = body.split(',').map(|v| v.trim().parse().expect("an input")).collect();
-            let s = crate::settings::Settings { room, gemskip: true, hundred, balloon_seeds: Some(seeds.to_string()), ..Default::default() };
-            let mut eng = RefEngine::new(&s).expect("the engine");
-            let mut st = eng.start_state().clone();
-            let start = (iface::get(&st, &[iface::key("room"), iface::key("x")]), iface::get(&st, &[iface::key("room"), iface::key("y")]));
-            let (mut k, mut frames) = (0usize, 0u32);
-            let exited = loop {
-                let player = !crate::trace::widen::objects_of_type(&st, "player").is_empty();
-                let input = if player { inputs.get(k).copied() } else { Some(0) };
-                let Some(input) = input else { break false };
-                k += usize::from(player);
-                frames += 1;
-                let mut leaves = eng.frame_states(&st, input).expect("a frame");
-                assert_eq!(leaves.len(), 1, "{file}: frame {frames}: a concrete frame forked");
-                st = leaves.remove(0);
-                st.gc();
-                if (iface::get(&st, &[iface::key("room"), iface::key("x")]), iface::get(&st, &[iface::key("room"), iface::key("y")])) != start {
-                    break true;
-                }
-            };
-            assert!(exited && k == inputs.len(), "{file}: the fixed engine {} after {k} of {} inputs (frame {frames})", if exited { "exited" } else { "did not exit" }, inputs.len());
+        exits_in_fixed_point(&root.join("gates/witnesses/gemskip100_TAS25.tas"), "gemskip100", 25).unwrap_or_else(|e| panic!("{e:#}"));
+    }
+
+    /// A witness file (`[seeds]inputs`, the tools' format) of category `cat`
+    /// at `level` leaves its room on its last input in the FIXED reference
+    /// engine, from the IL load.
+    fn exits_in_fixed_point(path: &std::path::Path, cat: &str, level: i16) -> Result<()> {
+        use crate::trace::refengine::RefEngine;
+        let (gemskip, rest) = cat.strip_prefix("gemskip").map_or((false, cat), |r| (true, r));
+        let (hundred, nodiag) = match rest {
+            "any" => (false, false),
+            "100" => (true, false),
+            "nodiag" => (false, true),
+            other => bail!("{}: category {other:?}", path.display()),
+        };
+        let text = std::fs::read_to_string(path).with_context(|| path.display().to_string())?;
+        let (seeds, body) = text.trim().strip_prefix('[').and_then(|t| t.split_once(']')).ok_or_else(|| anyhow!("{}: not [seeds]inputs", path.display()))?;
+        let inputs: Vec<u8> = body.split(',').map(|v| v.trim().parse()).collect::<Result<_, _>>()?;
+        let room = ((level - 1) % 8, (level - 1) / 8);
+        let s = crate::settings::Settings { room, gemskip, hundred, nodiag, balloon_seeds: Some(seeds.to_string()), ..Default::default() };
+        let mut eng = RefEngine::new(&s)?;
+        let mut st = eng.start_state().clone();
+        let at = |st: &State<RefDomain>| (iface::get(st, &[iface::key("room"), iface::key("x")]), iface::get(st, &[iface::key("room"), iface::key("y")]));
+        let start = at(&st);
+        let (mut k, mut frames) = (0usize, 0u32);
+        let exited = loop {
+            let player = !crate::trace::widen::objects_of_type(&st, "player").is_empty();
+            let input = if player { inputs.get(k).copied() } else { Some(0) };
+            let Some(input) = input else { break false };
+            k += usize::from(player);
+            frames += 1;
+            let mut leaves = eng.frame_states(&st, input)?;
+            ensure!(leaves.len() == 1, "{}: frame {frames}: a concrete frame forked", path.display());
+            st = leaves.remove(0);
+            st.gc();
+            if at(&st) != start {
+                break true;
+            }
+        };
+        ensure!(exited && k == inputs.len(), "{}: the fixed engine {} after {k} of {} inputs (frame {frames})", path.display(), if exited { "exited" } else { "did not exit" }, inputs.len());
+        Ok(())
+    }
+
+    /// Our UNSUBMITTED routes' goldens and witnesses: Philippe's rule is that
+    /// our unsubmitted and teased routes are never revealed, so they are
+    /// never committed (committed goldens: community files, and our routes
+    /// already submitted). This local store is `tools/uct/golden.py local
+    /// all`'s and `tools/celia/golden.py local all`'s.
+    const LOCAL_GOLDENS: &str = "/var/tmp/float-goldens";
+
+    /// THE LOCAL GOLDENS (`LOCAL_GOLDENS`): each tool's goldens of our
+    /// unsubmitted witnesses replay as the committed ones do, and every local
+    /// witness leaves its room in the fixed engine. Where the store is absent
+    /// the test says SKIPPED on its output, which nextest shows on success
+    /// (.config/nextest.toml): never a silent pass.
+    #[test]
+    fn the_local_goldens() {
+        let base = std::path::Path::new(LOCAL_GOLDENS);
+        let read = |p: &std::path::Path| match std::fs::read_to_string(p) {
+            Ok(t) => Some(t),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                println!("[local goldens] SKIPPED: {} is absent (our unsubmitted routes live only in {LOCAL_GOLDENS}, never in the repo)", p.display());
+                None
+            }
+            Err(e) => panic!("{}: {e}", p.display()),
+        };
+        let entries = |t: &str| -> Vec<Vec<String>> { t.lines().filter(|l| !l.trim().is_empty() && !l.starts_with('#')).map(|l| l.split_whitespace().map(str::to_string).collect()).collect() };
+        for tool in [FloatTool::Uct, FloatTool::Celia] {
+            let dir = base.join(tool_dir(tool));
+            let Some(m) = read(&dir.join("manifest.txt")) else { continue };
+            let lines: Vec<&str> = m.lines().filter(|l| !l.trim().is_empty()).collect();
+            let n: usize = lines.iter().map(|line| replay_golden(&dir, line, tool).unwrap_or_else(|e| panic!("{}: {line}: {e:#}", dir.display()))).sum();
+            println!("[local goldens] {}: {} goldens, {n} updates compared", tool_dir(tool), lines.len());
+            assert!(!lines.is_empty() && n > 0, "{}: no local golden compared anything", dir.display());
+        }
+        if let Some(t) = read(&base.join("witnesses/witnesses.txt")) {
+            let ws = entries(&t);
+            for w in &ws {
+                let [_, cat, level, file] = &w[..] else { panic!("a local witness line {w:?}: KEY CATEGORY LEVEL FILE") };
+                exits_in_fixed_point(&base.join(file), cat, level.parse().expect("a level")).unwrap_or_else(|e| panic!("{e:#}"));
+            }
+            println!("[local goldens] witnesses: {} leave their rooms in fixed point", ws.len());
         }
     }
 

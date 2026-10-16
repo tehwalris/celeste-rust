@@ -987,3 +987,14 @@ The first float optimum is room (1,0) at the synthetic win, on the
 reference engine's tree. The UCT goldens stay the secondary report. Our
 validated witnesses joined the golden set in milestone 3
 (`gates/witnesses`): the gate witness and gemskip 100% 116.
+
+**What a committed golden may be.** Community database files, and our
+routes that are already submitted. Philippe's rule is that our unsubmitted
+or teased routes are never revealed, and this branch reaches `develop`,
+which is pushed. So they are LOCAL goldens:
+
+- They live in `/var/tmp/float-goldens/` (`witnesses/witnesses.txt`, and
+  per tool its manifest and traces), made by `golden.py local all`.
+- `trace::oracle::tests::the_local_goldens` replays them. Where the store
+  is absent, it prints SKIPPED, and nextest shows that output on success
+  (`.config/nextest.toml`).

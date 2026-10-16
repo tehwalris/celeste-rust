@@ -6,6 +6,7 @@ tasdatabase's files (plans/float-solver.md, section 3).
     tools/uct/golden.py CAT all                  every level the category has
     tools/uct/golden.py random N LEVEL...|all    N random files a level
     tools/uct/golden.py witness all              our witnesses (below)
+    tools/uct/golden.py local all                our LOCAL witnesses (below)
 
 A RANDOM file (`random_inputs`: held directions, jump and dash presses at
 random, every seed 0; deterministic in its index and level) is a golden of
@@ -16,7 +17,12 @@ A WITNESS is one of our validated runs, listed in gates/witnesses/witnesses.txt
 (`KEY CATEGORY LEVEL FILE`): its golden is named by KEY, the category gives
 its dashes. A run valid in fixed point only dies in the tool, and the
 golden holds that death: exactly the divergence the float engine must
-reproduce.
+reproduce. Committed witnesses are our SUBMITTED runs only: an unsubmitted
+or teased route is never revealed, so it is a LOCAL witness, listed in
+/var/tmp/float-goldens/witnesses/witnesses.txt (FILE relative to that
+directory) with its goldens and manifest in /var/tmp/float-goldens/uct/,
+outside the repo (the test `trace::oracle::tests::the_local_goldens` replays
+them, and says SKIPPED where they are absent).
 
 Per file (the database's `classic/CAT/TAS<level>.tas`): run it in UCT with
 the exact trace (tools/uct/exact.lua via validate.sh: UCT_EXACT), re-time
@@ -43,7 +49,8 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(HERE))
 from celeste import ROOT, categories, rooms, tasdb  # noqa: E402
 
-OUT = os.path.join(ROOT, "gates", "uct")
+# Our unsubmitted routes: never in the repo (the module doc).
+LOCAL = "/var/tmp/float-goldens"
 DRAW_ONLY = {"smoke", "room_title", "lifeup", "message", "flag"}
 
 
@@ -185,14 +192,14 @@ def golden(trace, out, last):
     return sum(1 for l in text.splitlines() if l.startswith("u "))
 
 
-def one(job, tmp):
+def one(job, tmp, out):
     key, level, cat, path = job
     try:
         _, seeds, inputs, trace, status, retimed = canonical(cat, level, tmp, path=path)
     except Skip as e:
         return None, str(e)
     room = rooms.room_of(level)
-    updates = golden(trace, os.path.join(OUT, f"{key}_{level}.trace.zst"), lambda u: uct_last(u, len(inputs)))
+    updates = golden(trace, os.path.join(out, f"{key}_{level}.trace.zst"), lambda u: uct_last(u, len(inputs)))
     seed_text = ",".join(seeds) if seeds else "-"
     line = f"{key} {level} room={room[0]},{room[1]} seeds={seed_text} gemskip={int(categories.one_dash(cat))} updates={updates} uct={status.replace(' ', '_')} retimed={retimed}"
     return line, None
@@ -205,14 +212,15 @@ def jobs(argv):
     """The jobs of the command line: (manifest key, level, category, the
     file or None)."""
     cat, levels = argv[0], argv[1:]
-    if cat == "witness":
+    if cat in ("witness", "local"):
         if levels != ["all"]:
-            sys.exit("witness all: the witnesses are gates/witnesses/witnesses.txt's")
+            sys.exit(f"{cat} all: the witnesses are {WITNESSES}'s, or the local {LOCAL}/witnesses/witnesses.txt's")
+        listing, base = (WITNESSES, ROOT) if cat == "witness" else (os.path.join(LOCAL, "witnesses", "witnesses.txt"), LOCAL)
         out = []
-        for line in open(WITNESSES):
+        for line in open(listing):
             w = line.split()
             if w and not w[0].startswith("#"):
-                out.append((w[0], int(w[2]), w[1], os.path.join(ROOT, w[3])))
+                out.append((w[0], int(w[2]), w[1], os.path.join(base, w[3])))
         return out
     cats = [cat]
     if cat == "random":
@@ -233,7 +241,7 @@ def run(argv, out, one):
     for job in jobs(argv):
         key, level = job[0], job[1]
         with tempfile.TemporaryDirectory(dir="/var/tmp") as tmp:
-            line, why = one(job, tmp)
+            line, why = one(job, tmp, out)
         lines = [l for l in lines if l.split()[:2] != [key, str(level)]]
         if line:
             lines.append(line)
@@ -244,8 +252,14 @@ def run(argv, out, one):
     open(manifest, "w").write("\n".join(lines) + "\n")
 
 
+def out_dir(argv, tool):
+    """Where `argv`'s goldens go: the repo's gates/TOOL, or the local
+    store's TOOL for `local`."""
+    return os.path.join(LOCAL, tool) if argv[:1] == ["local"] else os.path.join(ROOT, "gates", tool)
+
+
 def main():
-    run(sys.argv[1:], OUT, one)
+    run(sys.argv[1:], out_dir(sys.argv[1:], "uct"), one)
 
 
 if __name__ == "__main__":
