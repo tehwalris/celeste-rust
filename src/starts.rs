@@ -12,7 +12,7 @@
 use anyhow::{Context, Result};
 
 use crate::trace::cart::{room_objects, RoomObject};
-use crate::trace::refengine::RefEngine;
+use crate::engines::reference::RefEngine;
 
 /// Object tiles whose object a play can destroy before the exit: a berry
 /// taken (26), a fly fruit taken or flown off (28), a key taken (8), a chest

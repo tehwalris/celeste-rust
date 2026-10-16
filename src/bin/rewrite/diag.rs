@@ -13,7 +13,7 @@ use celeste_rust::search::tree::TreeDir;
 use celeste_rust::settings::{Arith, Settings};
 use celeste_rust::storage::layer::Tree;
 use celeste_rust::storage::Sk;
-use celeste_rust::trace::refengine::RefEngine;
+use celeste_rust::engines::reference::RefEngine;
 use std::path::PathBuf;
 
 use crate::{cell_at, prefixes, where_, Rows};

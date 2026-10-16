@@ -21,9 +21,6 @@
 //! where the arms disagree; the arena stays topologically ordered for free.
 
 pub mod refdomain;
-pub mod refdriver;
-pub mod refengine;
-pub mod refbridge;
 #[cfg(test)]
 mod oracle;
 pub mod bind;

@@ -15,7 +15,7 @@ use celeste_rust::search::tree::TreeDir;
 use celeste_rust::settings::{Arith, Settings};
 use celeste_rust::storage::layer::Tree;
 use celeste_rust::storage::Sk;
-use celeste_rust::trace::refengine::{FloatRefEngine, RefEngine};
+use celeste_rust::engines::reference::{FloatRefEngine, RefEngine};
 use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
 
 mod bench;
@@ -496,12 +496,12 @@ fn main() -> Result<()> {
             let what = if reference { ", REFERENCE engine" } else { "" };
             match cfg.arith {
                 Arith::Fixed => {
-                    let engine: Box<dyn FrameStep> = if reference { Box::new(celeste_rust::trace::refengine::RefFrameStep::<P8>::new(&cfg, level)?) } else { Box::new(celeste_rust::compiled::FrameEngine::new(&cfg, level)?) };
+                    let engine: Box<dyn FrameStep> = if reference { Box::new(celeste_rust::engines::reference::RefFrameStep::<P8>::new(&cfg, level)?) } else { Box::new(celeste_rust::compiled::FrameEngine::new(&cfg, level)?) };
                     eprintln!("[fwd] engine up in {:.2} s ({level}{what})", t.elapsed().as_secs_f64());
                     forward(dir, a.to, level, &cfg, engine, || Ok(vec![Block::canonical(RefEngine::new(&cfg)?.initial()?)?]))
                 }
                 Arith::Float(_) => {
-                    let engine: Box<dyn FrameStep<LuaF64>> = if reference { Box::new(celeste_rust::trace::refengine::RefFrameStep::<LuaF64>::new(&cfg, level)?) } else { Box::new(celeste_rust::compiled::FloatKernels::new(&cfg, level)?) };
+                    let engine: Box<dyn FrameStep<LuaF64>> = if reference { Box::new(celeste_rust::engines::reference::RefFrameStep::<LuaF64>::new(&cfg, level)?) } else { Box::new(celeste_rust::compiled::FloatKernels::new(&cfg, level)?) };
                     eprintln!("[fwd] engine up in {:.2} s ({level}{what}, {})", t.elapsed().as_secs_f64(), cfg.arith);
                     forward(dir, a.to, level, &cfg, engine, || Ok(vec![Block::canonical(FloatRefEngine::new(&cfg)?.initial()?)?]))
                 }

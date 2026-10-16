@@ -3,7 +3,7 @@
 //!
 //! It plugs into `Interp<D>` like `Symbolic`, but runs one
 //! ABSTRACT scalar path and enumerates the fork tree by RE-EXECUTION
-//! (`refdriver`). `Num` is an interval (a point is `[n,n]`); `Bool` is a
+//! (`engines::reference::run_frame_all`). `Num` is an interval (a point is `[n,n]`); `Bool` is a
 //! plain `bool`: every fork (a straddling comparison, an unknown button, a
 //! `__split_by_flr` fragment) is resolved by a DECISION CURSOR, so `decide`
 //! never returns `None` and `Interp` never merges.

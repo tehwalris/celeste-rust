@@ -45,7 +45,7 @@ where
         .map_err(|_| anyhow::anyhow!("the level -1 builder panicked"))??;
     println!("[l1-check] table: {} entries, start d {}, fingerprint {:016x}", table.len(), table.start_d, table.fingerprint());
     // The known run: under the concrete run's seeds (a float tool's).
-    let mut eng = celeste_rust::trace::refengine::ReferenceEngine::<A>::new(&cfg.concrete().0)?;
+    let mut eng = celeste_rust::engines::reference::ReferenceEngine::<A>::new(&cfg.concrete().0)?;
     // Each leaf with its lineage's states too late (an `rnd` leaf
     // that never exits may rightly be too late: only an exiting
     // lineage is the solution).

@@ -254,7 +254,7 @@ where
     let ids = celeste_rust::compiled::ids();
     // One row: (its report, reference-only successors, kernel-only,
     // skipped over the path cap, lanes converted alike).
-    let one = |reference: &mut celeste_rust::trace::refengine::ReferenceEngine<A>, sk: Sk| -> Result<(String, usize, usize, usize, usize)> {
+    let one = |reference: &mut celeste_rust::engines::reference::ReferenceEngine<A>, sk: Sk| -> Result<(String, usize, usize, usize, usize)> {
         let rt2 = tree.row(frame, sk, cfg.room)?;
         let at = where_(sk.cell(&geo));
         let id = sk.show();
@@ -262,7 +262,7 @@ where
         // convert alike on the tracer's side and the reference's
         // (`block::check_agreement`).
         let mut alike = 0;
-        let mut agree = |reference: &celeste_rust::trace::refengine::ReferenceEngine<A>, b: &Rt2<A::Num>| -> Result<()> {
+        let mut agree = |reference: &celeste_rust::engines::reference::ReferenceEngine<A>, b: &Rt2<A::Num>| -> Result<()> {
             reference.check_agreement(b).map_err(|e| e.context(format!("state {id} at {at}: the one converter")))?;
             alike += b.width;
             Ok(())
@@ -294,7 +294,7 @@ where
         widen_rt2_to(&mut input, level);
         let mut rset: std::collections::BTreeSet<Proj> = Default::default();
         let leaves = match reference.run_lane(&input, 0) {
-            Err(e) if e.downcast_ref::<celeste_rust::trace::refdriver::TooManyPaths>().is_some() => {
+            Err(e) if e.downcast_ref::<celeste_rust::engines::reference::TooManyPaths>().is_some() => {
                 return Ok((format!("[check ref] state {id} at {at}: SKIPPED ({e})\n"), 0, 0, 1, alike));
             }
             other => other?,
@@ -327,7 +327,7 @@ where
     let done = celeste_rust::par::Pool::new(cfg.threads()).map_with(
         n,
         || {
-            let mut reference = celeste_rust::trace::refengine::ReferenceEngine::<A>::new(cfg)?.at_level(level);
+            let mut reference = celeste_rust::engines::reference::ReferenceEngine::<A>::new(cfg)?.at_level(level);
             if let Some(cap) = a.path_cap {
                 reference.set_path_cap(cap);
             }

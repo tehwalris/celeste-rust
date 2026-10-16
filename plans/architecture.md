@@ -50,10 +50,13 @@ celeste-rust (src/)
                         optimum, concrete search), dual, known, arc_check,
                         reach, hull_replay, tree (a finished tree opened),
                         pos_graph, result, ui_export, inspect, checkpoint
-  trace/                the tracer (interp, state, heap, domain, verify, widen,
-                        error, kernel = the lattice walk), the reference engine
-                        (refengine, refdomain, refdriver, refbridge, block),
-                        level_minus_one, cart patches, oracle, probe
+  trace/                the tracer: interp, state, heap, domain (Symbolic) and
+                        refdomain (RefDomain), frame (one frame traced), split
+                        (the split pass), widen, error, walk (the lattice
+                        walk), lower, bind, block (states <-> blocks), cart;
+                        level_minus_one; oracle and probe (test-only)
+  engines/              the reference engine (`reference`: the interpreter
+                        over RefDomain as a frame step)
   transpile/            graph IR, garith, ival, bdd, lowering, asm (codegen,
                         float codegen, call-outs, jit)
   compiled/             FrameEngine, the kernel registry, emission, mix
@@ -76,7 +79,7 @@ reference for semantics only.
 1. **The frame step** (`frame::FrameStep`): a range of input lanes of one
    block in; every output row out through the storage's `UnitSink`, keyed,
    with its cell (player position), widened for the level. Two impls: the
-   compiled `compiled::FrameEngine` and the reference `trace::refengine`
+   compiled `compiled::FrameEngine` and the reference `engines::reference`
    (`RefEngine`: the tracer's interpreter over `RefDomain`, one lane and
    one fork path at a time). Both convert states to blocks through one
    converter (`trace::block`), so their rows key alike.

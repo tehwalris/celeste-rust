@@ -35,7 +35,7 @@ use super::arc_dp::{concrete_engines, DFS_BUDGET, exact_state, input_order, look
 use super::rem::Rem;
 use crate::frame::{wins_of, Block};
 use crate::settings::Settings;
-use crate::trace::refengine::ReferenceEngine;
+use crate::engines::reference::ReferenceEngine;
 
 /// One half: its arcs, the settings its engines run under, and how its
 /// states key (`seeded`: `--concrete-balloon-seeds`).

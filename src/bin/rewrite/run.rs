@@ -6,7 +6,7 @@ use anyhow::Result;
 use celeste_engine::runtime2::{Rt2, AV, NONE, P8};
 use celeste_rust::concrete::{format_input, num_at, objects_of_type};
 use celeste_rust::settings::Settings;
-use celeste_rust::trace::refengine::RefEngine;
+use celeste_rust::engines::reference::RefEngine;
 
 /// `run`'s arguments.
 #[derive(clap::Args)]

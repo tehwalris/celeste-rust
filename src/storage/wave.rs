@@ -1761,7 +1761,7 @@ mod tests {
             Settings { room: (7, 0), loading_jank: Some(1), ..Default::default() },
         ];
         for s in cases {
-            let start = Block::canonical(crate::trace::refengine::RefEngine::new(&s).expect("engine").initial().expect("start")).expect("block");
+            let start = Block::canonical(crate::engines::reference::RefEngine::new(&s).expect("engine").initial().expect("start")).expect("block");
             let mut view = start.rt2().clone_block();
             crate::frame::widen_rt2_to(&mut view, crate::abstraction::Level::EXACT);
             view.canonical();

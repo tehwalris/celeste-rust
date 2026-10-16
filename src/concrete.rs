@@ -6,7 +6,7 @@ use anyhow::{anyhow, Result};
 use celeste_core::arith::{Arithmetic, EngineNum};
 use celeste_engine::runtime2::{Rt2, AV};
 
-use crate::trace::refengine::ReferenceEngine;
+use crate::engines::reference::ReferenceEngine;
 
 /// Human-readable input byte, e.g. "R+J", or "-" for none (bit 0 left,
 /// 1 right, 2 up, 3 down, 4 jump, 5 dash).
@@ -104,7 +104,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::trace::refengine::RefEngine;
+    use crate::engines::reference::RefEngine;
 
     /// The split frame (`--split-frame`) must run exactly the original
     /// frame, down to the SHAPE (equal states in two shapes never dedupe).

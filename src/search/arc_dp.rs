@@ -1571,9 +1571,9 @@ pub fn rem_of<N: Rem>(rt2: &celeste_engine::runtime2::Rt2<N>) -> anyhow::Result<
 /// an interval (sound for every seed), and a concrete state's key maps its
 /// phase to that interval (`lookup_view`). Built under the run's settings
 /// `run`: `_init` runs under them.
-pub(super) fn concrete_engines<N: Rem>(n: usize, run: &crate::settings::Settings) -> anyhow::Result<(Vec<crate::trace::refengine::ReferenceEngine<N::A>>, bool)> {
+pub(super) fn concrete_engines<N: Rem>(n: usize, run: &crate::settings::Settings) -> anyhow::Result<(Vec<crate::engines::reference::ReferenceEngine<N::A>>, bool)> {
     let (s, seeded) = run.concrete();
-    let engines = (0..n).map(|_| crate::trace::refengine::ReferenceEngine::<N::A>::new(&s)).collect::<anyhow::Result<Vec<_>>>()?;
+    let engines = (0..n).map(|_| crate::engines::reference::ReferenceEngine::<N::A>::new(&s)).collect::<anyhow::Result<Vec<_>>>()?;
     Ok((engines, seeded))
 }
 
@@ -1636,7 +1636,7 @@ pub fn concrete_search<N: Rem>(
 ) -> anyhow::Result<Option<Witness>> {
     use crate::frame::{wins_of, Block};
     use anyhow::Result;
-    use crate::trace::refengine::ReferenceEngine;
+    use crate::engines::reference::ReferenceEngine;
     use celeste_engine::runtime2::Rt2;
     // Their frames run exact (`ReferenceEngine::frame`); `level` is the lookups'.
     let workers = s.threads().max(1);

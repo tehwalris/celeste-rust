@@ -24,7 +24,7 @@ use crate::frame::{widen_rt2_to, widened_keys, Block};
 use crate::storage::edges::EdgeStore;
 use crate::storage::layer::Tree;
 use crate::storage::Sk;
-use crate::trace::refengine::ReferenceEngine;
+use crate::engines::reference::ReferenceEngine;
 
 /// What to check (the command line's).
 pub struct Opts<'a> {
@@ -267,7 +267,7 @@ pub fn run<N: Rem>(o: &Opts) -> Result<()> {
             |eng, k| {
                 let r = picked[k];
                 match check(eng, frame, r, &recs) {
-                    Err(e) if e.downcast_ref::<crate::trace::refdriver::TooManyPaths>().is_some() => {
+                    Err(e) if e.downcast_ref::<crate::engines::reference::TooManyPaths>().is_some() => {
                         let msg = format!("[check arcs] f{frame} pred {} -> {}: SKIPPED ({e})", r.src.show(), r.target.show());
                         Ok(Sampled { skipped: 1, msgs: vec![msg], ..Default::default() })
                     }

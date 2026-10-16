@@ -293,7 +293,7 @@ mod tests {
     #[ignore = "slow, ./check.sh t2 runs it: room (1,0)'s kernels and a forward, ~25 CPU-s"]
     fn the_exact_reach_holds_the_known_route_inside_the_tree() {
         use crate::frame::Block;
-        use crate::trace::refengine::RefEngine;
+        use crate::engines::reference::RefEngine;
         let s = crate::settings::Settings { win_at: Some((9, 9, 101, 101)), threads: Some(4), ..Default::default() };
         let dir = std::env::temp_dir().join(format!("celeste-reach-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);

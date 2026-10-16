@@ -1638,10 +1638,10 @@ mod tests {
 
     use super::*;
     use crate::storage::layer::Layer;
-    use crate::trace::refengine::RefEngine;
+    use crate::engines::reference::RefEngine;
     use celeste_core::pico8_num::Pico8Num as P8;
     use celeste_engine::runtime2::{Col, AV};
-    use crate::trace::refengine::RefFrameStep;
+    use crate::engines::reference::RefFrameStep;
     use crate::search::hull::Hull;
 
     /// A fresh forward keeps none of a killed run's files.
