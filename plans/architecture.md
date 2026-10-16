@@ -5,7 +5,7 @@ keep, and where it is open. Elsewhere: the level flags in
 plans/abstractions.md, the cost-to-go filter in plans/level-minus-one.md,
 the float arithmetic in plans/float.md, results in plans/results.md,
 abandoned approaches in plans/lessons.md, the checks in plans/devloop.md.
-Line counts and the refactor's candidates: plans/refactor.md.
+What the 2026-10-16 refactor left open: "Open issues" below.
 
 ## The search in one paragraph
 
@@ -477,6 +477,41 @@ verification surface behind it:
 - **Level -1**: the platform rooms' tables do not converge; see
   plans/level-minus-one.md for its precision limits.
 
+**Left by the 2026-10-16 refactor** (its working doc was
+plans/refactor.md: `git show c4dd3241:plans/refactor.md`).
+
+- Open candidates:
+  - The cart patches are written twice, in Rust (`trace::cart`) and in
+    `pico8_diff/replay.py` with different semantics; `pico8_diff/` belongs
+    under `tools/`.
+  - The engine crate knows the game (`runtime2::BoundaryIds`,
+    `Rt2::player_objects`).
+  - A horizon is spelt `--to` (frames for the search, steps for the tree
+    commands) and `--horizon`; a tree `--checkpoint-dir` (the search,
+    `forward`) and `--tree` (the commands that read one).
+  - The tracer beyond its audit: one trace for every level (today each
+    level re-traces), the split pass replaced. These change behaviour.
+  - `--onlydiag` has no run yet (kept by Philippe); `--override-settings`
+    passes `--region` only.
+- Dropped, with the reason:
+  - Folding `widen::within` into `GraphArith::pieces_of` (the audit's
+    T12): `within`'s facts from a select's `x op k` condition would change
+    `range_of` wherever it is read (comparison folding, `bounded`, fork
+    arity), so the kernels and owed checks would move by construction,
+    not byte-identically; ~100 lines.
+  - `RefDomain` sharing `Graph::eval`'s interval rules (T10): they agree
+    case by case, and that agreement is a check - with one shared rule a
+    wrong `Graph::compare` decision would pass both the lowering and the
+    oracle `check ref` runs the kernels against; ~30 lines.
+  - T8's classifier helper (deeper stack frames for ~15 lines); T21's
+    typed lowering errors (`name_cells` reparses `Cell(n)` out of an error
+    string; messages only).
+  - Thread pools left hand-rolled (not `par::Pool`): the wave's pipeline (a
+    scheduler: per-worker sinks, region jobs), the out and edge file
+    writers, the backward's budgeted read round, the big-stack builder
+    threads (a panic becomes a recorded refusal), the memory sampler,
+    level -1's `observe` pool and condvar queue.
+
 ## Where the old plans went
 
 The plans were merged on 2026-10-04 and again on 2026-10-16. Code comments
@@ -489,7 +524,7 @@ still cite the old names; the originals are in git history (`git show
 | format-study, forward, fwd-bench, kernel-mix, kernel-opt-decisions | this file ("The codegen"); the benchmark: plans/devloop.md |
 | footguns | CLAUDE.md (the rules); this file ("Per-tree records") |
 | widen-table | plans/abstractions.md; its open to-do: "Open issues" above |
-| jank-trace, jank-tools | plans/refactor.md |
+| jank-trace, jank-tools | "Open issues" above (`git show c4dd3241:plans/refactor.md`) |
 | nodiag, hundred, gemskip | plans/results.md |
 | float-solver | plans/float.md |
 | waves, buckets, arcs, graph-model, memory, parallel, regions, held-buttons, fly-fruit, fall-floors, platforms-unknown, room30, ... (merged 2026-10-04) | this file, plans/abstractions.md, plans/lessons.md (`git show arc-sets:plans/NAME.md`) |

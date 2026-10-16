@@ -27,10 +27,10 @@ runs valid in both).
 Every any% room has a confirmed optimum, and the categories nodiag, 100%
 and gemskip are mostly done (plans/results.md).
 
-State of the code (2026-10-16): 65.6k lines of Rust (42.2k code, 10.8k
-tests, 9.5k comments, 3.1k blank), up from 36.5k on 2026-10-05. A
-refactor to shorten and simplify it is starting: plans/refactor.md
-(temporary).
+State of the code (2026-10-16, after the refactor that shortened and
+simplified it): 60.6k lines of Rust (38.1k code, 9.8k tests, 9.1k
+comments, 3.5k blank), down from 64.8k (42.1k code) at `fa251711`; what it
+left open is in plans/architecture.md "Open issues".
 
 ## Read these before doing anything substantial
 
@@ -47,8 +47,6 @@ refactor to shorten and simplify it is starting: plans/refactor.md
   witness; how to run a room.
 - `plans/lessons.md` - abandoned approaches and the measurement that killed
   each. Check it before proposing something that sounds familiar.
-- `plans/refactor.md` - sizes, features, knobs and simplification
-  candidates for the refactor (deleted when it is done).
 - `BENCHMARK_DATA.md` - the reference numbers for today's code (the pinned
   frames, whole searches), each dated with its commit.
 
@@ -213,8 +211,7 @@ primitives, the widening table) <- `celeste-rust` (`src/frame.rs` the
 forward, `src/storage/`, `src/search/` the backward, the concrete search
 and level -1, `src/trace/` the tracer, `src/engines/` the reference
 engine, `src/transpile/` graph IR and assembler, `src/compiled/` the kernel
-registry, `src/settings.rs`, the `rewrite` binary in `src/bin/rewrite/`). Details: plans/architecture.md;
-sizes: plans/refactor.md.
+registry, `src/settings.rs`, the `rewrite` binary in `src/bin/rewrite/`). Details: plans/architecture.md.
 
 There is NO checked-in kernel artifact: the registry retraces the start
 room's shapes at startup, specializes them for the level and assembles
@@ -236,7 +233,9 @@ common:
 ```bash
 # THE SEARCH: --ceiling H for a known solution (a refutation or no witness
 # is an error), --to H otherwise. Witness: DIR/witness_frame_F.txt; outcome:
-# DIR/result.json.
+# DIR/result.json. UNITS: the search's --to/--ceiling count frames; a tree,
+# `forward --to` and --level-minus-one's H count search steps (2 a frame
+# under --split-frame: H = 2C; `settings::Clock`).
 ./safe-run.sh -- ./target/release/rewrite search --room 1,0 --ceiling 99 --checkpoint-dir DIR
 # An object room with the objects ladder, level -1 and the known route checked.
 ./safe-run.sh -- ./target/release/rewrite search --room 7,0 --level r0sxhn,r0sxh \
