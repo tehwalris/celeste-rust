@@ -70,6 +70,58 @@ impl fmt::Debug for LuaF64 {
     }
 }
 
+/// A witness's ROBUSTNESS to the host libm (plans/float-solver.md, section
+/// 15, Q3): `sin`'s result moved by one ulp - up on every call, down on
+/// every call, or each call by a pseudo-random choice of -1, 0 or +1 from
+/// the seed - on THIS thread, while `with_sin_nudge` runs (a correctly
+/// rounded or another faithful `sin` is within an ulp of glibc's).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SinNudge {
+    Off,
+    Up,
+    Down,
+    Random(u64),
+}
+
+thread_local! {
+    static SIN_NUDGE: std::cell::Cell<SinNudge> = const { std::cell::Cell::new(SinNudge::Off) };
+}
+
+/// `f` with `sin` nudged on this thread (`SinNudge`); restored after, a
+/// panic included. Only a robustness report sets it (`rewrite robust`).
+pub fn with_sin_nudge<R>(nudge: SinNudge, f: impl FnOnce() -> R) -> R {
+    struct Restore(SinNudge);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            SIN_NUDGE.with(|c| c.set(self.0));
+        }
+    }
+    let _restore = Restore(SIN_NUDGE.with(|c| c.replace(nudge)));
+    f()
+}
+
+/// glibc's `sin` result `s`, nudged as this thread says (`SinNudge`).
+fn nudged(s: f64) -> f64 {
+    SIN_NUDGE.with(|c| match c.get() {
+        SinNudge::Off => s,
+        SinNudge::Up => s.next_up(),
+        SinNudge::Down => s.next_down(),
+        SinNudge::Random(state) => {
+            // xorshift64: the next state, its value picking the move.
+            let mut x = state.max(1);
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            c.set(SinNudge::Random(x));
+            match x % 3 {
+                0 => s.next_down(),
+                1 => s,
+                _ => s.next_up(),
+            }
+        }
+    })
+}
+
 #[link(name = "m")]
 extern "C" {
     /// The C library's `sin`: on this machine glibc's, as LuaJIT's
@@ -177,7 +229,7 @@ impl LuaF64 {
         let radians = Self::fin(turns.0 * 2.0)?;
         // `black_box`: the argument is a run-time value, never folded by the
         // compiler with another libm.
-        let s = unsafe { libm_sin(std::hint::black_box(radians.0)) };
+        let s = nudged(unsafe { libm_sin(std::hint::black_box(radians.0)) });
         Self::fin(-s)
     }
 
@@ -432,6 +484,21 @@ mod tests {
         assert_eq!(n(0.75).lua_sin(), Some(n(1.0)));
         let x = 0.37f64;
         assert_eq!(n(x).lua_sin().unwrap().to_bits(), (-((x * std::f64::consts::PI) * 2.0).sin()).to_bits());
+    }
+
+    /// A nudged `sin` moves glibc's result by one ulp, only inside
+    /// `with_sin_nudge`, and only on that thread.
+    #[test]
+    fn a_nudged_sin_moves_one_ulp_and_is_restored() {
+        let x = n(0.37);
+        let base = x.lua_sin().unwrap().value();
+        let up = with_sin_nudge(SinNudge::Up, || x.lua_sin().unwrap().value());
+        let down = with_sin_nudge(SinNudge::Down, || x.lua_sin().unwrap().value());
+        // The result is negated: glibc's moved up is ours moved down.
+        assert_eq!((up, down), (base.next_down(), base.next_up()));
+        assert_eq!(x.lua_sin().unwrap().value(), base, "restored");
+        let picks: std::collections::BTreeSet<u64> = with_sin_nudge(SinNudge::Random(7), || (0..64).map(|_| x.lua_sin().unwrap().value().to_bits()).collect());
+        assert_eq!(picks.len(), 3, "each call -1, 0 or +1 ulp");
     }
 
     /// Non-finite results are refused, never carried.

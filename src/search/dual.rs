@@ -426,6 +426,31 @@ pub fn search<X: Rem, F: Rem>(fixed: &Half<X>, float: &Half<F>, bound: u32, pref
     Ok(None)
 }
 
+/// The first frame some lineage of `inputs` wins on, from `s`'s start, as
+/// a concrete run (`Settings::concrete`: a float tool's seeds), every `rnd`
+/// leaf followed; `None`: none by the inputs' end.
+pub fn first_win<N: Rem>(inputs: &[u8], s: &Settings) -> Result<Option<u32>> {
+    let mut eng = ReferenceEngine::<N::A>::new(&s.concrete().0)?;
+    let mut cur: Vec<Rt2<N>> = vec![eng.initial()?];
+    for (f, &byte) in inputs.iter().enumerate() {
+        let mut next: Vec<Rt2<N>> = Vec::new();
+        let mut seen: FxHashSet<ExactRow> = FxHashSet::default();
+        for row in &cur {
+            for b in eng.frame(row, byte)? {
+                if wins_of(b.rt2(), s)?.iter().any(|&x| x) {
+                    return Ok(Some(f as u32 + 1));
+                }
+                let cell = b.positions()?[0];
+                if seen.insert(exact_state(&b, cell)) {
+                    next.push(b.into_rt2());
+                }
+            }
+        }
+        cur = next;
+    }
+    Ok(None)
+}
+
 /// THE WITNESS, REPLAYED (a guard, not trusted): `inputs` from each half's
 /// start through its reference engine, every `rnd` leaf followed. The float
 /// half must first win on the last frame (the file's length); the fixed half
@@ -433,28 +458,6 @@ pub fn search<X: Rem, F: Rem>(fixed: &Half<X>, float: &Half<F>, bound: u32, pref
 /// luck, the stated best case). Each half is one run of its own tool, so
 /// each is checked on its own.
 pub fn replay<X: Rem, F: Rem>(w: &DualWitness, fixed: &Settings, float: &Settings) -> Result<()> {
-    /// The first frame some lineage of `inputs` wins on, from `s`'s start.
-    fn first_win<N: Rem>(inputs: &[u8], s: &Settings) -> Result<Option<u32>> {
-        let mut eng = ReferenceEngine::<N::A>::new(&s.concrete().0)?;
-        let mut cur: Vec<Rt2<N>> = vec![eng.initial()?];
-        for (f, &byte) in inputs.iter().enumerate() {
-            let mut next: Vec<Rt2<N>> = Vec::new();
-            let mut seen: FxHashSet<ExactRow> = FxHashSet::default();
-            for row in &cur {
-                for b in eng.frame(row, byte)? {
-                    if wins_of(b.rt2(), s)?.iter().any(|&x| x) {
-                        return Ok(Some(f as u32 + 1));
-                    }
-                    let cell = b.positions()?[0];
-                    if seen.insert(exact_state(&b, cell)) {
-                        next.push(b.into_rt2());
-                    }
-                }
-            }
-            cur = next;
-        }
-        Ok(None)
-    }
     let c = w.inputs.len() as u32;
     let f = first_win::<F>(&w.inputs, float)?;
     ensure!(f == Some(c), "the dual witness replayed: the float half first wins at {f:?}, not f{c}");
