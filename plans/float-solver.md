@@ -761,6 +761,14 @@ the tool's last. One relaxation: a chest's `x` while it shakes is the
 tools' unseeded `rnd` (`UNSEEDED`): ours is the range, theirs must lie in
 it.
 
+**Result: bit-exact everywhere.** UCT: 166 goldens, 17,433 updates. Celia:
+166 goldens, 17,376 updates. Every number and boolean equal after every
+update (both tests ~6 s, quick profile). What it took, beyond section 2's
+plan: the original `move` form (A2), the tools' seeds (chests, Celia's
+reseed), the traces read after the draw (the clamp), the jump re-timing
+extended past a file's end, and Celia's own re-timing. Not yet in the set:
+our witnesses (mostly community files' twins; cheap to add).
+
 **The jump buffer.** The original cart buffers a jump press for 4 frames;
 the traced cart does not. `tools/uct/canonical_jumps.py` re-times every
 buffered jump of a tool's run to its own frame (the press moved, the file
@@ -768,8 +776,104 @@ extended where the jump fires past its end) and the golden scripts check
 that the re-timed file makes the same run in the tool and leaves no
 buffered jump. A jump is read from the player's state (`jbuffer` positive
 at the jump check, 0 after it); UCT's traces also hook the jump sounds
-(`psfx` 1, 2) and the two must agree on every update (Celia copies the
-cart every step, which defeats a hook). Celia's files are re-timed from
+(`psfx` 1, 2) and the two must agree on every update that leaves a
+player (Celia copies the cart every step, which defeats a hook). Celia's files are re-timed from
 Celia's own run: its start differs, so its run does (any% 2,1 dies in
 UCT and finishes in Celia).
 
+
+### Milestone 2: the census
+
+`rewrite census` (section 12) in both arithmetics from the same start
+(the IL load: `--float-tool uct` in float, so the two columns differ only
+by the arithmetic; Celia's jank start changes only the start state), 28
+threads, to a budget of 80k nodes or states. Two modes:
+
+- NODES: the level r0sx (the remainder widened to the pixel, everything
+  else exact): what a float forward over today's abstraction would hold.
+  The fixed column equals the pinned widened forward (the test).
+- `--exact`: CONCRETE states (the remainder kept): what the concrete
+  search walks, and the real diversity of speeds and remainders.
+
+| room | nodes at | fixed | float | float/fixed | states at | fixed | float | float/fixed | spd.x | spd.y | rem.x | rem.y |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| (0,0) | f34 | 30,281 | 52,174 | 1.72 | f35 | 62,612 | 65,225 | 1.04 | 51/41 | 22/22 | 179/84 | 25/25 |
+| (1,0) | f31 | 44,590 | 74,917 | 1.68 | f31 | 63,755 | 66,206 | 1.04 | 51/41 | 27/27 | 182/88 | 26/26 |
+| (2,0) springs | f32 | 30,324 | 58,738 | 1.94 | f33 | 63,516 | 66,090 | 1.04 | 46/36 | 24/24 | 172/78 | 24/24 |
+| (4,2) balloons, seeds 0 | f43 | 28,121 | 56,588 | 2.01 | f44 | 48,257 | 50,703 | 1.05 | 45/33 | 23/23 | 110/64 | 22/23 |
+| (5,0) balloon, seed 0 | f35 | 27,634 | 51,620 | 1.87 | f36 | 47,794 | 50,392 | 1.05 | 45/33 | 19/19 | 110/64 | 16/16 |
+| (0,3) gemskip | f32 | 30,564 | 60,745 | 1.99 | f33 | 61,392 | 64,170 | 1.05 | 45/35 | 26/26 | 170/76 | 30/32 |
+| (1,3) | f34 | 24,099 | 62,513 | 2.59 | f33 | 60,598 | 61,455 | 1.01 | 46/36 | 18/18 | 172/78 | 6/6 |
+
+(The last frame both columns finished under the budget, totals so far;
+`spd.x` etc. are the distinct values over every concrete state so far,
+fixed/float.)
+
+The node ratio grows with the frames in most rooms: (1,3) 1.97, 2.21,
+2.59, 2.91 at f32-f35 (and there the phantom nodes reach speeds no fixed
+node has: 57/50 distinct `spd.x`, 38/27 `spd.y` at f35); (4,2) 1.85 to
+2.12 over f41-f44; (1,0) is the exception, 1.84 down to 1.63. The first
+frame where the two differ: 2-3 frames after the player spawns (nodes),
+5-6 (states). The budget reaches only ~10 frames past the spawn, so
+`census --exact --sample 3000` (3,000 concrete states expanded a frame,
+the lowest key hashes) looks ~90 frames further; its counts are lower
+bounds, fixed/float at the last frame:
+
+| room | frame | states met | spd.x | spd.y | rem.x | rem.y |
+|---|---|---|---|---|---|---|
+| (1,0) | f110 | 1.22M / 1.20M | 59/59 | 78/66 | 3,613/2,612 | 784/918 |
+| (2,0) springs | f110 | 1.35M / 1.35M | 114/132 | 108/118 | 3,011/2,001 | 1,824/2,242 |
+| (4,2) balloons | f110 | 1.24M / 1.24M | 59/60 | 77/79 | 1,185/858 | 3,220/4,520 |
+| (0,3) gemskip | f130 | 1.56M / 1.54M | 59/61 | 80/91 | 1,576/719 | 1,350/2,496 |
+
+Deep in the rooms the speeds stay within ~15% of fixed's either way;
+float has fewer `rem.x` and more `rem.y` values (up to 1.8x at (0,3)).
+
+**Speeds: no buckets needed.** Over concrete states float is fixed's size
+(x0.96-1.07 everywhere). In the first frames it has FEWER distinct `spd.x`
+(about 20% fewer) and about half the distinct `rem.x` (why 16.16 makes
+more values is not investigated), `spd.y` the same; deeper in, the speeds
+stay within ~15%. By section 12's rule the float forward runs T1 (exact)
+speeds; T3 buckets are not needed.
+
+**The remainder's widening is NOT free in float: the top sliver.** Over
+nodes float holds 1.7-2.6x fixed's (2.9x at (1,3) f35), mostly growing
+with the frames. It is not the speeds. A node's widened remainder `[-1/2,
+pred(1/2)]` holds the few doubles just below 1/2 whose sum with an
+INTEGER speed rounds onto the next cut: `fl(r - 2) = -3/2` for `r` in
+`{1/2 - 2^-54, 1/2 - 2^-53}`, so the player moves one pixel, not two. In
+16.16 `r + s` is exact and the top value `1/2 - 2^-16` never reaches the
+cut, so a node at an integer speed has ONE outcome per input in fixed and
+TWO in float (y=110 from y=112 at `spd.y = -2`, room (1,0) f25: the first
+difference). Measured: the float census with the top 1024 doubles below
+1/2 left out (a diagnostic, not sound) has fixed's counts or fewer (room
+(1,0) f28: 6,974 against fixed's 7,284 and float's 13,150; (2,0) f33:
+48,139 / 52,313 / 104,470; (0,3) gemskip f33: 49,475 / 54,147 /
+108,149).
+
+The sliver is reachable in principle (`1/2 - 2^-53` is a possible
+remainder after a move; `1/2 - 2^-54` is not: section 15's guard
+argument), so dropping it from the widening is unsound. Dropping only the
+unreachable `1/2 - 2^-54` (exact) removes little: room (1,0) f28 12,350
+against 13,150. The arcs are
+exact in the remainder, so W refutes the phantom nodes, but the float
+forward pays for them. Options, for milestone 3 (decide on the first float
+trees):
+
+- (a) accept ~2x the forward's nodes;
+- (b) the hull forward (the remainder's exact transfer images instead of
+  the whole pixel): a node gets the sliver only where an image reaches it;
+- (c) one exact bit of refinement: the remainder's domain split into the
+  pixel and the sliver, the sliver part a node of its own made only by an
+  edge whose exact transfer image meets it.
+
+(b) and (c) are exact (an image is the transfer's, monotone), so nothing
+new needs refuting; what they cost is the measurement.
+
+### Next
+
+Milestone 3 (float trees without kernels, the reference engine as the
+frame step) with Celia float as the float side, and the sliver measured
+there first: (a) against (b)/(c) on room (1,0) and (1,3), where it costs
+the most. The UCT goldens stay as the secondary report; our witnesses join
+the golden set when the first float witnesses exist.
