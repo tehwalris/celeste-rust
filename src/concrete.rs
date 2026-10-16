@@ -85,6 +85,12 @@ where
         let mut world = Vec::new();
         for p in objects_of_type(&state, "platform") {
             let field = |path: &[&str]| num_at(&state, p, path).ok_or_else(|| anyhow!("a platform without a numeric `{}`", path.join(".")));
+            // Its `x` and `last` are integers (the tracer's platform hook
+            // declares the input so: `Symbolic::integral_inputs`).
+            for path in [&["x"][..], &["last"]] {
+                let v = field(path)?;
+                anyhow::ensure!(A::num_eq(A::flr(v), v), "a platform's `{}` is {v:?}, not an integer", path.join("."));
+            }
             world.push([field(&["x"])?, field(&["last"])?, field(&["rem", "x"])?, field(&["spd", "x"])?, field(&["y"])?, field(&["dir"])?]);
         }
         if seen.insert(world.clone()) {

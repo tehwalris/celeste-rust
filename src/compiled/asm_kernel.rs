@@ -417,7 +417,7 @@ impl<N: KernelLanes> AsmKernel<N> {
                     .map(|&a| format!("{}={:?}<{:?}>", a, self.fused.get(a).op, vals[a as usize]))
                     .collect();
                 eprintln!("[kernel]   error disjunct {} {:?} = {:?}; args {}", n, node.op, vals[n as usize], args.join(", "));
-                // Follow Sels to the first undecided condition.
+                // Follow Sels (and undecided booleans) to the first undecided condition.
                 let mut cur = n;
                 for _ in 0..12 {
                     let nd = self.fused.get(cur);
@@ -448,11 +448,21 @@ impl<N: KernelLanes> AsmKernel<N> {
                         Op::Le | Op::Ge | Op::Lt | Op::Gt | Op::Eq | Op::Same | Op::SplitOk(_) | Op::RSplitOk(_) => {
                             nd.args.iter().copied().find(|&a| matches!(self.fused.get(a).op, Op::Sel))
                         }
+                        // An undecided boolean: down its first undecided operand.
+                        Op::And | Op::Or | Op::Not => nd.args.iter().copied().find(|&a| vals[a as usize] == Val::Bool(None)),
                         _ => None,
                     };
                     match next {
                         Some(x) => cur = x,
-                        None => break,
+                        None => {
+                            // Where the walk stops: the undecided node itself.
+                            if !matches!(nd.op, Op::Sel) {
+                                let args: Vec<String> = nd.args.iter().map(|&a| format!("{}={:?}<{:?}>", a, self.fused.get(a).op, vals[a as usize])).collect();
+                                eprintln!("[kernel]     undecided at {} {:?} = {:?}; args {}", cur, nd.op, vals[cur as usize], args.join(", "));
+                                eprintln!("[kernel]       = {}", crate::trace::emit::show_tree(&self.fused, cur, 6));
+                            }
+                            break;
+                        }
                     }
                 }
                 // The FAILING premise: false conjuncts through the strict

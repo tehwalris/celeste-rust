@@ -153,6 +153,19 @@ impl Default for Settings {
 }
 
 impl Settings {
+    /// The settings a CONCRETE run uses (the concrete searches, the known
+    /// route's check, `l1-check`, the dual witness's replay): the balloons'
+    /// phases fixed - `--concrete-balloon-seeds`, else `--balloon-seeds`,
+    /// else, for a float tool (which always seeds), every seed 0 - and
+    /// whether a concrete state keys through `arc_dp::lookup_view` (its
+    /// balloons are seeded where the tree's hold the phase an interval).
+    pub fn concrete(&self) -> (Settings, bool) {
+        let float = matches!(self.arith, Arith::Float(_));
+        let seeds = self.concrete_balloon_seeds.clone().or_else(|| self.balloon_seeds.clone()).or_else(|| float.then(String::new));
+        let seeded = self.concrete_balloon_seeds.is_some() || (float && self.balloon_seeds.is_none());
+        (Settings { balloon_seeds: seeds, ..self.clone() }, seeded)
+    }
+
     /// The FLOAT half of a dual search (`rewrite dual`, `search::dual`):
     /// these settings - the fixed half's, real play from its
     /// `--loading-jank` - under the float tool `tool`, from the tool's own
@@ -224,6 +237,9 @@ impl Settings {
         ];
         if self.arith != Arith::Fixed {
             lines.push(("arith", self.arith.to_string()));
+            // A float tree's balloons: the phase an interval unless seeded
+            // (`trace::cart::sources_in`; trees before 2026-10-16 always seeded).
+            lines.push(("float_balloon_phase", (if self.balloon_seeds.is_some() { "seeded" } else { "interval" }).to_string()));
         }
         lines
     }

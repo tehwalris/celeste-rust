@@ -1582,15 +1582,15 @@ pub fn rem_of<N: Rem>(rt2: &celeste_engine::runtime2::Rt2<N>) -> anyhow::Result<
     Ok((at(cx)?, at(cy)?))
 }
 
-/// `n` reference engines for concrete steps, and whether they run seeded:
-/// `--concrete-balloon-seeds` fixes the balloons' phases (a tasdatabase
-/// file's seeds), so a concrete run is one real run under them - the tree
-/// and W keep the phase an interval (sound for every seed), and a concrete
-/// state's key maps its phase to that interval (`lookup_view`). Built under
-/// the run's settings `run`: `_init` runs under them.
+/// `n` reference engines for concrete steps, and whether they run seeded
+/// (`Settings::concrete`): `--concrete-balloon-seeds` (a tasdatabase file's
+/// seeds), or a float tool's own seeds, fix the balloons' phases, so a
+/// concrete run is one real run under them - the tree and W keep the phase
+/// an interval (sound for every seed), and a concrete state's key maps its
+/// phase to that interval (`lookup_view`). Built under the run's settings
+/// `run`: `_init` runs under them.
 pub(super) fn concrete_engines<N: Rem>(n: usize, run: &crate::settings::Settings) -> anyhow::Result<(Vec<crate::trace::refengine::ReferenceEngine<N::A>>, bool)> {
-    let seeded = run.concrete_balloon_seeds.is_some();
-    let s = crate::settings::Settings { balloon_seeds: run.concrete_balloon_seeds.clone().or_else(|| run.balloon_seeds.clone()), ..run.clone() };
+    let (s, seeded) = run.concrete();
     let engines = (0..n).map(|_| crate::trace::refengine::ReferenceEngine::<N::A>::new(&s)).collect::<anyhow::Result<Vec<_>>>()?;
     Ok((engines, seeded))
 }

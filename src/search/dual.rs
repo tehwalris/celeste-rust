@@ -435,7 +435,7 @@ pub fn search<X: Rem, F: Rem>(fixed: &Half<X>, float: &Half<F>, bound: u32, pref
 pub fn replay<X: Rem, F: Rem>(w: &DualWitness, fixed: &Settings, float: &Settings) -> Result<()> {
     /// The first frame some lineage of `inputs` wins on, from `s`'s start.
     fn first_win<N: Rem>(inputs: &[u8], s: &Settings) -> Result<Option<u32>> {
-        let mut eng = ReferenceEngine::<N::A>::new(s)?;
+        let mut eng = ReferenceEngine::<N::A>::new(&s.concrete().0)?;
         let mut cur: Vec<Rt2<N>> = vec![eng.initial()?];
         for (f, &byte) in inputs.iter().enumerate() {
             let mut next: Vec<Rt2<N>> = Vec::new();

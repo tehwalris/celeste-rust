@@ -86,15 +86,18 @@ pub fn sources_in(root: &std::path::Path, s: &crate::settings::Settings) -> Resu
     if s.onlydiag {
         game = forbid_straight_dashes(&game)?;
     }
+    // The balloons' phases where `--balloon-seeds` fixes them; else each
+    // balloon's `rnd(1)`, an interval at every level (sound for every seed).
     // The float tools always seed (a file without `[seeds]` is every seed 0:
-    // UCT's `load_level` and Celia's `init_seed_objs` reset them so).
-    let float = matches!(s.arith, crate::settings::Arith::Float(_));
-    let seeds = s.balloon_seeds.clone().or_else(|| float.then(String::new));
-    if let Some(seeds) = &seeds {
+    // UCT's `load_level` and Celia's `init_seed_objs` reset them so): their
+    // seeds are the CONCRETE runs' (`Settings::concrete`), a tree without
+    // `--balloon-seeds` holds the phase an interval (as fixed under
+    // `--concrete-balloon-seeds`), so its states do not count frames.
+    if let Some(seeds) = &s.balloon_seeds {
         game = fix_balloon_seeds(&game, seeds, root, s.room)?;
     }
     if let crate::settings::Arith::Float(tool) = s.arith {
-        game = tool_seeds(&game, seeds.as_deref().unwrap_or(""), tool, root, s.room, s.loading_jank.is_some())?;
+        game = tool_seeds(&game, s.balloon_seeds.as_deref(), tool, root, s.room, s.loading_jank.is_some())?;
     }
     Ok(format!("{}\n{}\n{}\n", b3, b4, game))
 }
@@ -140,9 +143,12 @@ fn fix_balloon_seeds(game: &str, seeds: &str, root: &std::path::Path, (rx, ry): 
 /// - Celia's BALLOONS: after the load (and its jank) `init_seed_objs` and
 ///   `set_seed` make each balloon's `offset` its seed (`0 - 0 + seed`) and
 ///   its `y` `start + sin(offset) * 2`, undoing the loading frame's bob.
-fn tool_seeds(game: &str, seeds: &str, tool: crate::settings::FloatTool, root: &std::path::Path, (rx, ry): (i16, i16), jank: bool) -> Result<String> {
+///   Only where the balloons are seeded (`seeds`; a tree without seeds
+///   holds every phase).
+/// Chests take their seeds from `seeds` (every seed 0 without).
+fn tool_seeds(game: &str, seeds: Option<&str>, tool: crate::settings::FloatTool, root: &std::path::Path, (rx, ry): (i16, i16), jank: bool) -> Result<String> {
     use crate::settings::FloatTool;
-    let texts: Vec<&str> = seeds.split(',').map(str::trim).filter(|s| !s.is_empty()).collect();
+    let texts: Vec<&str> = seeds.unwrap_or("").split(',').map(str::trim).filter(|s| !s.is_empty()).collect();
     // A seed as the tool reads it (`tonumber`), written back exactly.
     let seed = |i: usize| -> Result<String> {
         Ok(match texts.get(i) {
@@ -169,7 +175,7 @@ fn tool_seeds(game: &str, seeds: &str, tool: crate::settings::FloatTool, root: &
     const SHAKE: &str = "this.x=this.start-1+rnd(3)";
     anyhow::ensure!(game.matches(SHAKE).count() == 1, "the chest's `{SHAKE}` was not found exactly once");
     game = game.replacen(SHAKE, &format!("this.x=this.start-1+{expr}"), 1);
-    if tool == FloatTool::Celia {
+    if tool == FloatTool::Celia && seeds.is_some() {
         let mut offset = "o.offset".to_string();
         for (i, o) in seeded.iter().enumerate().rev() {
             if o.tile == BALLOON {

@@ -338,7 +338,8 @@ mod tests {
             arith: crate::settings::Arith::Float(tool),
             room: (x.parse()?, y.parse()?),
             gemskip: field("gemskip")? == "1",
-            balloon_seeds: (seeds != "-").then(|| seeds.to_string()),
+            // The tool's run: always seeded (every seed 0 without a list).
+            balloon_seeds: Some(if seeds == "-" { String::new() } else { seeds.to_string() }),
             loading_jank,
             ..Default::default()
         };

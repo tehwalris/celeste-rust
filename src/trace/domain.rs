@@ -456,6 +456,10 @@ pub struct Symbolic<A: GraphArith = Fixed> {
     pub worlds: Option<std::sync::Arc<crate::concrete::PlatformWorlds<A>>>,
     /// This frame's platforms' `x` input cells, in the worlds' order.
     pub platform_cells: Vec<NodeId>,
+    /// This frame's inputs the hooks declare INTEGER-valued on every lane
+    /// (a platform's `x`: an integer in every world, `concrete::platform_worlds`
+    /// checks), for `cancel_sub` in an arithmetic whose addition rounds.
+    pub integral_inputs: rustc_hash::FxHashSet<NodeId>,
     /// `lane_independent`'s memo; structural, so it outlives a frame.
     lane_memo: rustc_hash::FxHashMap<NodeId, bool>,
     /// `reads_unknown_atom`'s memo: structural, like `lane_memo`.
@@ -838,9 +842,9 @@ impl<A: GraphArith> Symbolic<A> {
         let op = self.graph.get(a).op.clone();
         let args = self.graph.get(a).args.clone();
         match op {
-            // `(r + c) - r` is `c` only where addition is exact (16.16).
-            Op::Add if A::EXACT_ADDITION && args[0] == r && self.bounded(a) => Ok(Some(args[1])),
-            Op::Add if A::EXACT_ADDITION && args[1] == r && self.bounded(a) => Ok(Some(args[0])),
+            // `(r + c) - r` is `c` only where the sum is exact.
+            Op::Add if args[0] == r && self.exact_sum(a, args[0], args[1]) => Ok(Some(args[1])),
+            Op::Add if args[1] == r && self.exact_sum(a, args[1], args[0]) => Ok(Some(args[0])),
             Op::Sel => {
                 let (c, t, f) = (args[0], args[1], args[2]);
                 let (tc, fc) = (self.cancel_sub(t, r)?, self.cancel_sub(f, r)?);
@@ -858,6 +862,56 @@ impl<A: GraphArith> Symbolic<A> {
                 Ok(Some(self.graph.fold(Op::Sel, vec![c, t2, f2])))
             }
             _ => Ok(None),
+        }
+    }
+
+    /// Does `sum - r` lie in `c` on every lane, `sum` being `r + c`? Where
+    /// the static ranges bound the sum, and the arithmetic's addition is
+    /// exact (16.16); or `r` is an integer (`integral`), the sum's magnitude
+    /// is below 2^53 (where every integer is a double), and `c` is an
+    /// integer too (the sum is exact, so the difference is `c`) or a literal
+    /// whose ends are integers (a move's rejoined fragments, `[0, 1]`: `fl`
+    /// is monotone and exact at the ends, so the difference lies in the
+    /// literal, which stands for every value in it). A platform's `x -
+    /// last`: its `x` plus its move.
+    fn exact_sum(&mut self, sum: NodeId, r: NodeId, c: NodeId) -> bool {
+        if !self.bounded(sum) {
+            return false;
+        }
+        if A::EXACT_ADDITION {
+            return true;
+        }
+        const EXACT: i64 = 1 << 53;
+        let small = self.range_of(sum).and_then(|p| A::floor_hull(&p)).is_some_and(|(lo, hi)| lo > -EXACT && hi < EXACT);
+        let whole = |l: A::Lit| {
+            let v = A::from_lit(l);
+            A::num_eq(A::flr(v), v)
+        };
+        let whole_literal = matches!(self.graph.get(c).op, Op::Const(lo, hi) if whole(lo) && whole(hi));
+        small && self.integral(r, 0) && (whole_literal || self.integral(c, 0))
+    }
+
+    /// Is `n` an integer on every lane? A whole literal, a floor, an integer
+    /// fork's fragment, an input a hook declares integral
+    /// (`integral_inputs`), and sums, differences, negations, `abs`, `min`,
+    /// `max` and selects of those (a double past 2^52 is an integer, so a
+    /// rounded sum of integers is one too). Structural; `false` if unsure.
+    fn integral(&self, n: NodeId, depth: u32) -> bool {
+        if depth > 32 {
+            return false;
+        }
+        let node = self.graph.get(n);
+        let all = |args: &[NodeId]| args.iter().all(|&a| self.integral(a, depth + 1));
+        match node.op {
+            Op::Const(lo, hi) if lo == hi => {
+                let v = A::from_lit(lo);
+                A::num_eq(A::flr(v), v)
+            }
+            Op::Flr | Op::IntFrag(_) => true,
+            Op::Restrict(..) if self.integral_inputs.contains(&n) => true,
+            Op::Add | Op::Sub | Op::Neg | Op::Abs | Op::Min | Op::Max => all(&node.args),
+            Op::Sel => all(&node.args[1..]),
+            _ => false,
         }
     }
 
