@@ -870,10 +870,120 @@ trees):
 (b) and (c) are exact (an image is the transfer's, monotone), so nothing
 new needs refuting; what they cost is the measurement.
 
+### Milestone 3: float trees without kernels
+
+**What was built.**
+
+- The forward and its storage are generic over the number type
+  (`celeste_core::arith::EngineNum`: blocks, codes, key spaces, layers,
+  frames, hulls, routes, waves, edges, out files) and over the remainder
+  model (`search::rem::Rem`: the hull, its order-free accumulator, the
+  transfer pair, the push). Fixed is the default type parameter and is
+  unchanged: the ladder (t0 with the ignored tests, t1, t2) passes with
+  every pin, fingerprint and gate, and a float tree's files carry their own
+  magic byte.
+- The float remainder model (`search::rem_f64`, section 6):
+  - a point is a double of `[-1/2, 1/2)` by value, `-0` being `0`
+    (`2^63 - 2^54` points, in a `u64`);
+  - a hull is an arc per axis with two charts, as in 16.16;
+  - a transfer is `Mono(ox, k)` (`r -> fl(fl(r + ox) - k)`, the cart's two
+    operations) or `Const`, on a guard found exactly by bisection with
+    the operation itself;
+  - the decode refuses what it does not model, as 16.16's does;
+  - tested against the cart on 55 speeds (the pieces partition the points
+    and act as `move` does at every probe), and the push is tested sound.
+- The reference engine is generic. `RefFrameStep<N>` runs a unit's lanes
+  in parallel on its pool of engines and emits them a chunk at a time.
+- `rewrite forward --arith float` always runs the reference engine (there
+  are no float kernels); `ckhash` reads float trees.
+- Two checks on a finished tree:
+  - `rewrite hull-replay` replays the hull forward over the recorded graph.
+    The replay must reach exactly the tree's states at the tree's frames,
+    else it is an error. It also counts the replay without the sliver's
+    edges, and under (c)'s exact bit.
+  - `rewrite hull-route` steps a known route concretely in the tree's
+    arithmetic. Every state of it must be in the tree by its frame, with
+    its remainder inside its state's hull, and every step must be a
+    recorded edge whose transfer maps the remainder.
+  - The test `room_10_trees_replay_and_hold_their_routes` runs both in both
+    arithmetics.
+
+**Measured** (room (1,0) and (1,3), level `r0sx`, Celia float from its
+jank start, 32 threads).
+
+- The replay reproduces every tree exactly: fixed (1,0) to f44, (1,3) to
+  f40, and both float trees.
+- These routes hold through the float tree of (1,0) to f44: Celia's any%,
+  nodiag, both random files, and our gate witness. In fixed, the gate
+  witness and the community any% hold.
+- Room (1,0) in UCT float is the same tree as in Celia through f35, state
+  for state (the jank does not reach the player there). So there the
+  float/fixed ratio is the arithmetic's alone.
+
+| | (1,0) f44 | (1,3) f40 |
+|---|---|---|
+| fixed hull forward, states (total) | 461,632 | 106,167 |
+| float hull forward (b) | 500,744 (1.085x) | 132,170 (1.245x) |
+| at the last frame, float/fixed | 93,807 / 86,156 (1.089x) | 34,215 / 25,936 (1.319x) |
+| float without the sliver (not sound) | 428,614 (0.928x) | 102,250 (0.963x) |
+| float, (c)'s exact sliver bit | 485,950 (1.053x) | 126,335 (1.190x) |
+| ... of them with the bit set (c's sliver parts) | 384,522 | 83,480 |
+| edges with a sliver piece | 22.7% of 18.2M | 26.6% of 3.6M |
+| of them, edges whose push fires | 15.4% (3.5% of all) | 14.9% (4.0% of all) |
+| float forward wall time, peak RSS | 44.5 min, 8.0 GB | 12.3 min, 8.3 GB |
+| fixed kernels, the same forward | ~3 s | ~5 s |
+
+- The per-frame ratio in (1,0) rises to 1.22x at f33 and settles at
+  1.03-1.10x over f36-f44. In (1,3) it grows with the frames: 1.17x at
+  f37, then 1.19x, 1.28x and 1.32x at f40.
+- The sliver accounts for ALL of the gap. Without it, float holds 7%
+  (1,0) and 4% (1,3) FEWER states than fixed. (M2's census found float
+  has fewer distinct `rem.x` values too.)
+- The float forward's time is the reference engine's: about 7 ms of wall
+  time per lane at f44 on 32 threads. The fixed reference engine on (1,0)
+  to f36 took 222 s (56k lanes, 8.0M leaves), the float one 356 s (64k
+  lanes, 12.8M leaves). Both spend 28 µs a leaf. Float's extra cost is
+  its lanes (1.14x) and the sliver's extra fragments (1.4x the leaves a
+  lane), not the arithmetic.
+- The peak memory is the 32 interpreters' fork paths: about 128 lanes'
+  leaves held at once. The trees themselves are small (18 MB).
+
+**Decision: (b), the hull forward.**
+
+- (b) leaves 1.09x in (1,0) and 1.25-1.32x in (1,3), down from the widened
+  forward's 1.7-2.9x.
+- (c) does not pay. With its bit EXACT (an image sets it only where some
+  point maps into the top `[1/2 - 2^-40, 1/2)`), it still sets the bit on
+  79% (1,0) and 66% (1,3) of the states. Its node count (states plus
+  sliver parts) is 1.6-1.7x (b)'s.
+  - The reason: the top doubles are reached legitimately. The lower piece
+    of every non-integer speed maps the doubles just below its cut to just
+    below 1/2 (`r1 = c - ulp`, `r' = 1/2 - ulp`). Any hull that holds the
+    top of that piece's guard holds them too. Concretely they are as rare
+    as M2 found, but no interval (hull) abstraction can tell.
+- (a), the widened forward, is the 1.7-2.9x of milestone 2.
+- The arcs and the concrete search are exact in the remainder, so the
+  sliver's states cost forward size and time, never soundness. Revisit
+  only if a real room's ratio runs away (watch (1,3) past f40), e.g.
+  with a finer remainder abstraction than an interval.
+
+**Not covered yet:**
+
+- the level flags (`h`, `n`, `f`, `p`) in float: only `r0sx` has run;
+- level -1 in float;
+- a float `arc-check` (milestone 4; `hull-route` checks the transfers on
+  known routes only).
+
 ### Next
 
-Milestone 3 (float trees without kernels, the reference engine as the
-frame step) with Celia float as the float side, and the sliver measured
-there first: (a) against (b)/(c) on room (1,0) and (1,3), where it costs
-the most. The UCT goldens stay as the secondary report; our witnesses join
-the golden set when the first float witnesses exist.
+Milestone 4: float arcs and the float concrete search.
+
+- arc sets over the `u64` points;
+- the pull through `Mono` (the exact preimage by bisection);
+- the backward;
+- the float concrete search, and float `arc-check`.
+
+The first float optimum is room (1,0) at the synthetic win, on the
+reference engine's tree. The UCT goldens stay the secondary report. Our
+validated witnesses joined the golden set in milestone 3
+(`gates/witnesses`): the gate witness and gemskip 100% 116.
