@@ -47,7 +47,7 @@ pub fn run_frame_all<'a, A: Arithmetic>(
     // (`RefDomain::compare`) as the kernels' undecided atoms do. Unknown
     // platforms have no reference form yet.
     if level.platforms {
-        anyhow::bail!("the reference engine does not run platforms-unknown levels (plans/platforms-unknown.md)");
+        anyhow::bail!("the reference engine does not run platforms-unknown levels (`p`, plans/abstractions.md)");
     }
     loop {
         it.d.cursor.reset();
