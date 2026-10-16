@@ -193,7 +193,7 @@ tools/uct/check_uploads.py [--cat CAT] FILE.tas...   # IL, UCT, Celia, chain, BO
 tools/celia/validate.sh LEVEL FILE.tas               # Celia headless (CELIA_DASHES=1 gemskip, CELIA_FIXP=1 fixed point)
 pico8_diff/chain.py CAT LEVEL FILE --boot            # real PICO-8 from 100m with the database's files
 pico8_diff/chain.py CAT LEVEL FILE --modes           # IL / jank / chain entry states diffed field by field
-pico8_diff/chain.py CAT LEVEL x --check-start target/quick/concrete_run   # the search's start vs the boot chain
+pico8_diff/chain.py CAT LEVEL x --check-start target/quick/rewrite   # the search's start vs the boot chain
 target/quick/rewrite starts --room X,Y [category] --balloon-seeds 0   # every J and its start class
 ```
 
@@ -220,11 +220,11 @@ checkout's Lua.
 
 ## The commands
 
-Every binary documents itself: `rewrite --help` (the search and every
-diagnostic), `rewrite <command> --help`, `transpile --help` (the level -1
-table), `concrete_run --help` (single-lane concrete execution). The
-settings flags (`--room`, the category, `--level-minus-one`, `--threads`,
-...) are shared by all three. The most common:
+Every binary documents itself: `rewrite --help` (the search, every
+diagnostic, `run`: one concrete run), `rewrite <command> --help`,
+`transpile --help` (the level -1 table). The settings flags (`--room`, the
+category, `--level-minus-one`, `--threads`, ...) are shared by both. The
+most common:
 
 ```bash
 # THE SEARCH: --ceiling H for a known solution (a refutation or no witness

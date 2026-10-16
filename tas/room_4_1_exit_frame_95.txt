@@ -3,7 +3,7 @@
 # with PICO-8's own rnd; seeds [0] and [0.5, 0.5, 0.5] kill the player:
 #   pico8_diff/replay.py --room 4,1 --balloon-seeds 0.32205,0.20335,0.3813 tas/room_4_1_exit_frame_95.txt
 #
-# Input bytes for concrete_run (-i) / pico8_diff/replay.py --room 4,1, one
+# Input bytes for rewrite run (-i) / pico8_diff/replay.py --room 4,1, one
 # per frame starting at frame 1. bit0=left bit1=right bit2=up bit3=down
 # bit4=jump bit5=dash.
 #

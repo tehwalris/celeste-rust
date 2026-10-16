@@ -2,7 +2,7 @@
 # orb start with max_djump=2, 26a0e54).
 #   pico8_diff/replay.py --room 2,3 --balloon-seeds 0,0.02485 tas/room_2_3_reference_frame_106.txt
 #
-# Input bytes for concrete_run (-i) / pico8_diff/replay.py --room 2,3, one
+# Input bytes for rewrite run (-i) / pico8_diff/replay.py --room 2,3, one
 # per frame starting at frame 1. bit0=left bit1=right bit2=up bit3=down
 # bit4=jump bit5=dash.
 #

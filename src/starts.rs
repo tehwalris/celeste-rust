@@ -138,7 +138,7 @@ fn spawn_frame(s: &crate::settings::Settings, room: (i16, i16)) -> Result<u32> {
 #[cfg(test)]
 mod tests {
     /// The starts of two rooms as the Python model (pico8_diff/chain.py,
-    /// PICO-8 for the spawn frame, one `concrete_run --dump-start` per J)
+    /// PICO-8 for the spawn frame, one `rewrite run --dump-start` per J)
     /// gave them, as every level 2-31 did (2026-10-11): room (3,0) takes
     /// J 3 or 4 into ONE class, room (4,1) J 2 and 3 into two.
     #[test]

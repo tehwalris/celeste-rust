@@ -1,6 +1,6 @@
 # Room (2,0) SPIKE-death witness (task #172, (2,0) member derivation).
 #
-# Input bytes for concrete_run (-i), one per frame starting at frame 1.
+# Input bytes for rewrite run (-i), one per frame starting at frame 1.
 # bit0=left bit1=right bit2=up bit3=down bit4=jump bit5=dash.
 # Frames 1-25 are the spawn prologue. Hold right the whole run: the player
 # walks off the spawn ledge, lands on spring 1 (px 40-47, bounce DURING
@@ -16,8 +16,8 @@
 # the death frame's boundary state is clean steady-spring.
 #
 # Replay:
-#   CELESTE_START_ROOM=2,0 ./target/release/concrete_run \
-#     -i "$(grep -v '^#' tas/room_2_0_death_spikes_frame_64.txt | tr -d '\n')" -f 64
+#   ./target/release/rewrite run --room 2,0 \
+#     -i tas/room_2_0_death_spikes_frame_64.txt -f 64
 # Expect: player present through frame 63, absent from frame 64.
 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
 2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2

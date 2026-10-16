@@ -139,7 +139,7 @@ def entry_jank(cat, level):
 
 
 def check_start(cat, level, binary):
-    """The SEARCH's start state for `level` (`concrete_run --dump-start`
+    """The SEARCH's start state for `level` (`rewrite run --dump-start`
     under --loading-jank = the boot chain's J) against the boot
     chain's room entry on a real PICO-8, field by field: the objects both
     carts have (the minimal one lacks room_title, message and flag), the
@@ -150,7 +150,7 @@ def check_start(cat, level, binary):
     rx, ry = room_of(level)
     flags = ["--room", f"{rx},{ry}", "--loading-jank", str(j) if j else "none", "--balloon-seeds", "0"] + (["--gemskip"] if categories.one_dash(cat) else [])
     root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    ours = subprocess.run([os.path.join(root, "safe-run.sh"), "--", binary, "-i", "0", "--dump-start"] + flags, capture_output=True, text=True, cwd=root, check=True).stdout.splitlines()
+    ours = subprocess.run([os.path.join(root, "safe-run.sh"), "--", binary, "run", "-i", "0", "--dump-start"] + flags, capture_output=True, text=True, cwd=root, check=True).stdout.splitlines()
     skip = ("room_title", "message", "flag")
     pico = [fields(l) for l in ref if l.startswith("obj ") and l.split()[2] not in skip]
     mine = [fields(l) for l in ours if l.startswith("obj ")]
@@ -199,7 +199,7 @@ def main():
     g.add_argument("--boot", action="store_true", help="the chain from 100m (the game's start)")
     ap.add_argument("--modes", action="store_true", help="also the IL and jank modes, their entry states diffed against the chain's")
     ap.add_argument("--trace-objects", action="store_true", help="print the last room's frame lines with every object")
-    ap.add_argument("--check-start", metavar="CONCRETE_RUN", help="(FILE ignored) the search's start state (this concrete_run binary's --dump-start) against the boot chain's room entry, field by field")
+    ap.add_argument("--check-start", metavar="REWRITE", help="(FILE ignored) the search's start state (this rewrite binary's `run --dump-start`) against the boot chain's room entry, field by field")
     ap.add_argument("--feasible", metavar="REWRITE", help="(FILE ignored) every J a play of the previous room can enter with, grouped by the start state they give (this rewrite binary's `starts`)")
     ap.add_argument("--entry-jank", action="store_true", help="(FILE ignored) print the J the category's boot chain enters the level with")
     ap.add_argument("--vary", action="store_true", help="(FILE ignored) the room's entry state after every category's boot chain, and the fields that differ")

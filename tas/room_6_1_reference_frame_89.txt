@@ -1,6 +1,6 @@
 # Room (6,1) "1500 m" reference for celeste-minimal, derived 2026-10-01.
 #
-# Input bytes for concrete_run (-i) / pico8_diff/replay.py --room 6,1, one
+# Input bytes for rewrite run (-i) / pico8_diff/replay.py --room 6,1, one
 # per frame starting at frame 1. bit0=left bit1=right bit2=up bit3=down
 # bit4=jump bit5=dash.
 #

@@ -42,10 +42,6 @@ memmap2 = "0.9"
 zstd = "0.13"
 
 [[bin]]
-name = "concrete_run"
-path = "src/bin/concrete_run.rs"
-
-[[bin]]
 name = "rewrite"
 path = "src/bin/rewrite.rs"
 

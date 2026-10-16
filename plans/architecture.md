@@ -59,8 +59,7 @@ celeste-rust (src/)
   settings.rs           the run's settings (flags), the tree's record
   starts.rs             the feasible loading-jank J's and their classes
   par.rs, metrics.rs, concrete.rs, game_runner.rs
-  bin/                  rewrite (search + tools), transpile (level -1),
-                        concrete_run
+  bin/                  rewrite (search + tools, `run`), transpile (level -1)
 ```
 
 The traced program is `lua/builtin_level_3.lua` + `lua/builtin_level_4.lua`

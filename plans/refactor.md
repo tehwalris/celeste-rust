@@ -21,6 +21,7 @@ Measured on `docs-refresh` after merging develop `0765e7c5`. Lines are
 | S10 | the help bug (in C1); one DFS budget (`arc_dp::DFS_BUDGET`, 200k: the dual's pairs count both halves' leaves, so 2x: the 400k was that); stale docs: `arc_dp`'s "an edge enters a layer <= f", `search/mod.rs`'s module list (checkpoint files as row pieces), "The forward frame" citations | ~0 |
 | C4 | `bench-storage`, `--emit-capture`, the capture writers and the replay (`storage::bench`, the sinks' rowless mode), the `cap-r10`/`cap-r62h57` fixtures; every frame step runs `bench-frame --checkpoint`, its `b` line (the bytes of the frame's files) pinned from develop's binary for all seven frames | -364 Rust, -31 shell |
 | C5 (done) | the kernel mix report (`--kernel-mix DIR`, its files, guard families, leaf classes, the spike-fold and fold estimates) and tools/kernel_mix.py; `compiled::mix` is the census the `--metrics` pins read, byte-identical (the per-instruction categories stay: they pin the codegen's mix for R2's slices) | -545 Rust, -276 Python |
+| C6 (R1's half) | `concrete_run` is `rewrite run` (`-i` takes a `tas/` file too); whole frames under `--split-frame`; a frame that forks is an error; callers: chain.py `--check-start REWRITE`, CLAUDE.md, 62 `tas/` headers. `transpile` is R2's | -43 Rust |
 
 ## SIZE
 

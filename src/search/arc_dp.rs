@@ -1480,7 +1480,7 @@ pub struct Witness {
 }
 
 impl Witness {
-    /// The inputs as a comma list (`concrete_run -i`, `pico8_diff/replay.py`).
+    /// The inputs as a comma list (`rewrite run -i`, `pico8_diff/replay.py`).
     pub fn inputs_text(&self) -> String {
         self.inputs.iter().map(|b| b.to_string()).collect::<Vec<_>>().join(",")
     }
