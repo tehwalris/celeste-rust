@@ -8,8 +8,8 @@ mod codegen;
 mod jit;
 
 pub use callout::{AsmCtx, CollisionEnv};
-pub use codegen::{compile, CellRepr, Compiled, RootKind};
-pub use jit::{assemble, KernelFn, Loaded};
+pub use codegen::{compile, AsmArith, CellRepr, Compiled, RootKind};
+pub use jit::{assemble, check_mxcsr, KernelFn, Loaded};
 
 use anyhow::Result;
 use std::collections::HashMap;
@@ -27,8 +27,8 @@ pub struct AsmOptions {
 /// Compile `roots` of `g` to assembly, assemble it, and load it. Returns
 /// the layout metadata and the loaded function. All input cells numeric;
 /// use `compile_and_load_reprs` when a cell is bool.
-pub fn compile_and_load(
-    g: &crate::transpile::graph::Graph,
+pub fn compile_and_load<A: AsmArith>(
+    g: &crate::transpile::graph::Graph<A>,
     roots: &[crate::transpile::graph::NodeId],
     tag: &str,
 ) -> Result<(Compiled, Loaded)> {
@@ -37,8 +37,8 @@ pub fn compile_and_load(
 
 /// `compile_and_load` with an explicit per-cell input repr (a cell absent
 /// from `cell_reprs` is `Num`).
-pub fn compile_and_load_reprs(
-    g: &crate::transpile::graph::Graph,
+pub fn compile_and_load_reprs<A: AsmArith>(
+    g: &crate::transpile::graph::Graph<A>,
     roots: &[crate::transpile::graph::NodeId],
     tag: &str,
     cell_reprs: &HashMap<u32, CellRepr>,
@@ -71,3 +71,5 @@ pub fn compile_and_load_reprs(
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod tests_float;

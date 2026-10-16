@@ -60,16 +60,37 @@ fn unique_stem(tag: &str) -> String {
     format!("k_{}_{}", tag, n)
 }
 
+/// What no kernel may hold: a FUSED multiply-add (one rounding where the
+/// cart rounds twice; `vfmadd*`, `vfmsub*`, `vfnmadd*`, `vfnmsub*`, the FMA4
+/// forms) or an MXCSR write (`ldmxcsr`: the rounding mode and subnormal
+/// handling are the process's, checked, never set). The text is ours and
+/// gcc only assembles it (`-x assembler`, no compiler, no contraction), so
+/// this scan of the text is the whole guarantee.
+fn refuse_forbidden(asm: &str) -> Result<()> {
+    for (n, line) in asm.lines().enumerate() {
+        let mn = line.split_whitespace().next().unwrap_or("");
+        if mn.starts_with("vfm") || mn.starts_with("vfnm") || mn.starts_with("ldmxcsr") || mn.starts_with("vldmxcsr") {
+            bail!("kernel text line {}: `{}` is forbidden (a fused multiply-add or an MXCSR write)", n + 1, line.trim());
+        }
+    }
+    Ok(())
+}
+
 /// Write `asm` to a `.s` file and assemble it into a shared object with
-/// `gcc -shared -fPIC`. Returns the `.so` path. The `.s` (the bulk of the
-/// scratch) is removed once it has assembled, kept on failure for the error.
+/// `gcc -x assembler -shared -fPIC` (assembled, never compiled). Returns the
+/// `.so` path. The `.s` (the bulk of the scratch) is removed once it has
+/// assembled, kept on failure for the error. A text holding a forbidden
+/// instruction is refused (`refuse_forbidden`).
 pub fn assemble(asm: &str, tag: &str) -> Result<PathBuf> {
+    refuse_forbidden(asm)?;
     let dir = scratch_dir();
     let stem = unique_stem(tag);
     let src = dir.join(format!("{stem}.s"));
     let obj = dir.join(format!("{stem}.so"));
     std::fs::write(&src, asm)?;
     let out = std::process::Command::new("gcc")
+        .arg("-x")
+        .arg("assembler")
         .arg("-shared")
         .arg("-fPIC")
         .arg("-o")
@@ -85,6 +106,22 @@ pub fn assemble(asm: &str, tag: &str) -> Result<PathBuf> {
     }
     let _ = std::fs::remove_file(&src);
     Ok(obj)
+}
+
+/// THE DOUBLES' FLOATING-POINT ENVIRONMENT: round to nearest, FTZ and DAZ
+/// off, every exception masked (MXCSR `0x1f80`, the sticky flags aside), as
+/// LuaJIT runs. A library built with fast-math can set FTZ/DAZ for the whole
+/// process; the float kernels and the reference engine would then flush
+/// subnormals alike and agree on a wrong answer. Checked at every float
+/// kernel call.
+pub fn check_mxcsr() -> Result<()> {
+    let mut v: u32 = 0;
+    // SAFETY: `stmxcsr` stores the 32-bit MXCSR to the given address.
+    unsafe { std::arch::asm!("stmxcsr [{}]", in(reg) &mut v, options(nostack, preserves_flags)) };
+    if v & !0x3f != 0x1f80 {
+        bail!("MXCSR is {v:#06x}: the float kernels need round-to-nearest, FTZ and DAZ off and every exception masked (0x1f80)");
+    }
+    Ok(())
 }
 
 /// A loaded shared object plus the resolved symbol. `dlclose` on drop.

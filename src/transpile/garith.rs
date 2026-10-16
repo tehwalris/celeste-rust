@@ -445,9 +445,12 @@ fn normalize_float(mut v: FloatPieces) -> Option<FloatPieces> {
     Some(out)
 }
 
-/// The next double below `x` (`x` finite).
-fn below(x: f64) -> f64 {
-    x.next_down()
+/// `IntFrag(c)` of a value: fragment `c`'s low end, the floor `c`
+/// integers above `v`'s, at least `v`, as the reference's
+/// `floor_fragment` takes it (the cart's `max`, its tie to the floor).
+fn int_frag_low(v: LuaF64, c: u8) -> LuaF64 {
+    let base = LuaF64::new(v.value().floor() + c as f64).expect("a floor near a finite double is finite");
+    v.lua_max(base)
 }
 
 impl GraphArith for Float {
@@ -461,22 +464,16 @@ impl GraphArith for Float {
     }
 
     fn lit_int_frag(lo: u64, c: u8) -> u64 {
-        let v = Float::from_lit(lo).value();
-        // Fragment `c`'s low end: the floor `c` integers above `lo`'s, at
-        // least `lo` (exact: integers are doubles here).
-        Float::lit(LuaF64::new((v.floor() + c as f64).max(v)).expect("finite"))
+        Float::lit(int_frag_low(Float::from_lit(lo), c))
     }
 
     fn ev_int_frag(iv: LuaF64Interval, c: u8, lenient: bool) -> LuaF64Interval {
-        let (lo, hi) = (iv.lo.value(), iv.hi.value());
-        let base = lo.floor() + c as f64;
-        let l = lo.max(base);
-        let n = |v: f64| LuaF64::new(v).expect("finite");
+        let l = int_frag_low(iv.lo, c);
         if lenient {
-            let h = hi.max(hi.floor() + c as f64);
-            LuaF64Interval::new(n(l), n(h.max(l)))
+            let h = int_frag_low(iv.hi, c).lua_max(l);
+            LuaF64Interval::new(l, h)
         } else {
-            LuaF64Interval::point(n(l))
+            LuaF64Interval::point(l)
         }
     }
 
@@ -493,20 +490,20 @@ impl GraphArith for Float {
         }
     }
 
+    /// The reference's fragment (`LuaF64Interval::floor_fragment`), bit for
+    /// bit: its ends are the cart's `max`/`min` of the operand's and the
+    /// floor's, so a `-0` end against the floor `0` takes the floor's.
     fn ev_frag(iv: LuaF64Interval, c: u8) -> LuaF64Interval {
-        let (lo, hi) = (iv.lo.value(), iv.hi.value());
-        let base = lo.floor() + c as f64;
-        let n = |v: f64| LuaF64::new(v).expect("finite");
-        LuaF64Interval::new(n(lo.max(base)), n(hi.min(below(base + 1.0))))
+        iv.floor_fragment(c as u32)
     }
 
-    /// A double's `NoWrap` is "finite": decided only where the operation
-    /// has no arithmetic to fail (the static ranges decide the rest, in
-    /// `trace::error`).
+    /// A double's `NoWrap` is "finite". Undecided exactly where the operation can leave the finite doubles
+    /// (`range_error`: `%` by zero included); anything else is finite.
     fn fold_no_wrap(g: &Graph<Float>, x: NodeId) -> Option<bool> {
-        match g.get(x).op {
-            Op::Add | Op::Sub | Op::Neg | Op::Abs | Op::Mul | Op::Div => None,
-            _ => Some(true),
+        if Self::range_error(&g.get(x).op) {
+            None
+        } else {
+            Some(true)
         }
     }
 

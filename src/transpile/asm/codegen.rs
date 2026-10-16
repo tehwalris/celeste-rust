@@ -2,13 +2,23 @@
 //! tri-state boolean ops, bit-for-bit `celeste_engine::kernel` (checked by
 //! `super::tests`). Lower to SSA over vregs (GVN), list-schedule,
 //! linear-scan allocate, emit.
+//!
+//! Per arithmetic (`AsmArith`): 16.16 lowers to 16 `i32` lanes a zmm
+//! (this file); the doubles to 8 `f64` lanes (`float`), whose body runs
+//! twice per 16-lane call (`Compiled::halves`). The boolean layer (vector
+//! masks), the scheduler, the allocator and the emitter are shared.
 
 use std::collections::HashMap;
 use std::fmt::Write;
 
 use anyhow::{bail, Result};
 
+use celeste_core::arith::{Fixed, Float};
+
+use crate::transpile::garith::GraphArith;
 use crate::transpile::graph::{self, Graph, NodeId, Op};
+
+mod float;
 
 // Registers: zmm26..=31 are reserved scratches (zmm27 unused), 26 homes.
 const ZERO: u8 = 31; // constant 0, for Neg
@@ -27,6 +37,27 @@ const CTX_MGET: u32 = 24;
 const CTX_TILE: u32 = 32;
 const CTX_TILE_LANES: u32 = 40;
 const CTX_ENV: u32 = 48;
+// The doubles' call-outs (8 `f64` lanes), after `env`.
+const CTX_FSIN: u32 = 56;
+const CTX_FMGET: u32 = 64;
+const CTX_FTILE: u32 = 72;
+const CTX_FTILE_LANES: u32 = 80;
+// The offsets ARE `AsmCtx`'s layout.
+const _: () = {
+    use super::callout::AsmCtx;
+    use std::mem::offset_of;
+    assert!(offset_of!(AsmCtx, div) == CTX_DIV as usize);
+    assert!(offset_of!(AsmCtx, rem) == CTX_REM as usize);
+    assert!(offset_of!(AsmCtx, sin) == CTX_SIN as usize);
+    assert!(offset_of!(AsmCtx, mget) == CTX_MGET as usize);
+    assert!(offset_of!(AsmCtx, tile_flag) == CTX_TILE as usize);
+    assert!(offset_of!(AsmCtx, tile_flag_lanes) == CTX_TILE_LANES as usize);
+    assert!(offset_of!(AsmCtx, env) == CTX_ENV as usize);
+    assert!(offset_of!(AsmCtx, fsin) == CTX_FSIN as usize);
+    assert!(offset_of!(AsmCtx, fmget) == CTX_FMGET as usize);
+    assert!(offset_of!(AsmCtx, ftile_flag) == CTX_FTILE as usize);
+    assert!(offset_of!(AsmCtx, ftile_flag_lanes) == CTX_FTILE_LANES as usize);
+};
 const SAVE_BYTES: u32 = 32 * 64; // save all 32 zmm across a call
 const ARGBUF_BYTES: u32 = 8 * 64; // up to 6 SIMD args + a result buffer
 
@@ -41,6 +72,13 @@ enum CallOp {
     TileFlag,
     /// Per-lane box: `args = [x, y, w, h]`, `scalars = [flag]`.
     TileFlagLanes,
+    /// The doubles' (8 `f64` lanes): the tools' `sin`, `LuaF64::lua_sin`.
+    FSin,
+    FMget,
+    /// Uniform box: `scalars = [w, h, flag]` as integers.
+    FTileFlag,
+    /// Per-lane box: `args = [x, y, w, h]`, `scalars = [flag]`.
+    FTileFlagLanes,
 }
 
 const FLR_MASK: i32 = 0xffff_0000u32 as i32;
@@ -52,6 +90,8 @@ type Vreg = u32;
 enum NumVal {
     Reg(Vreg),
     ConstI32(i32),
+    /// A double, by its bits (8 `f64` lanes).
+    ConstQ(u64),
 }
 
 /// One plane of a tri-state boolean: a per-lane VECTOR mask (all-ones or
@@ -76,6 +116,8 @@ enum Value {
 enum Src {
     Reg(Vreg),
     BI32(i32),
+    /// A 64-bit constant broadcast `{1to8}`.
+    BQ(u64),
 }
 
 #[derive(Clone, Copy)]
@@ -96,14 +138,35 @@ enum ROp {
 enum SrcKey {
     Reg(Vreg),
     I32(i32),
+    Q(u64),
 }
 impl Src {
     fn key(self) -> SrcKey {
         match self {
             Src::Reg(v) => SrcKey::Reg(v),
             Src::BI32(c) => SrcKey::I32(c),
+            Src::BQ(c) => SrcKey::Q(c),
         }
     }
+}
+
+/// An IEEE double operation (`vaddpd`..`vdivpd`), rounded once.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+enum FOp {
+    Add,
+    Sub,
+    Mul,
+    Div,
+}
+
+/// A 64-bit integer lane operation on a double's BITS.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+enum QOp {
+    Add,
+    Sub,
+    And,
+    Or,
+    Xor,
 }
 
 /// A pure instruction's value identity for GVN (commutative operands sorted).
@@ -122,6 +185,13 @@ enum Key {
     BlendImm(u16, Vreg, Vreg),
     Cmp(u8, Vreg, SrcKey),
     Ternlog(Vreg, Vreg, Vreg, u8),
+    BcastQ(u64),
+    LoadMask8(u32),
+    FBin(FOp, Vreg, SrcKey),
+    FRnd(Vreg, u8),
+    FCmp(u8, Vreg, SrcKey),
+    QBin(QOp, Vreg, SrcKey),
+    QCmp(u8, Vreg, SrcKey),
 }
 
 /// The SSA instruction stream: each writes exactly one vreg (`dst`).
@@ -153,6 +223,23 @@ enum Inst {
     Store { off: u32, src: Src },
     /// Store a vector mask as a 16-bit lane mask (boolean roots).
     StoreMask { off: u32, src: Vreg },
+    // ---- the doubles' (8 `f64` lanes) ----
+    /// Broadcast a 64-bit constant (`vpbroadcastq`).
+    BcastQ { dst: Vreg, val: u64 },
+    /// Load an 8-bit lane mask and expand it to a 64-bit vector mask.
+    LoadMask8 { dst: Vreg, off: u32 },
+    /// `dst = a op b`, IEEE, one rounding (`vaddpd`/`vsubpd`/`vmulpd`/`vdivpd`).
+    FBin { dst: Vreg, op: FOp, a: Vreg, b: Src },
+    /// `vrndscalepd $imm` (`0x09`: round down, the exact `floor`).
+    FRnd { dst: Vreg, a: Vreg, imm: u8 },
+    /// Ordered quiet compare (`vcmppd` predicate `imm`) to a vector mask.
+    FCmp { dst: Vreg, imm: u8, a: Vreg, b: Src },
+    /// A 64-bit integer lane op on the bits (`vpaddq`..`vpxorq`).
+    QBin { dst: Vreg, op: QOp, a: Vreg, b: Src },
+    /// A 64-bit integer compare of the bits (`vpcmpq` predicate `imm`).
+    QCmp { dst: Vreg, imm: u8, a: Vreg, b: Src },
+    /// Store a 64-bit vector mask as an 8-bit lane mask (boolean roots).
+    StoreMask8 { off: u32, src: Vreg },
 }
 
 /// The type of a root value: how to read its output slot.
@@ -216,6 +303,11 @@ pub struct Compiled {
     /// `--kernel-mix` only: per SSA instruction, whether plain bit
     /// identities over the stream remove it (`foldable`).
     pub foldable: Vec<bool>,
+    /// The doubles' kernels: the body computes 8 lanes and runs TWICE per
+    /// call, lanes 8..16 reading `input_bytes` and writing `out_bytes`
+    /// past lanes 0..8 (so the buffers are twice those). A boolean is an
+    /// 8-bit mask per half (`val` at +0, `known` at +2).
+    pub halves: bool,
 }
 
 // ---- constant pool ----
@@ -223,6 +315,7 @@ pub struct Compiled {
 #[derive(Default)]
 struct Pool {
     d: Vec<i32>,
+    q: Vec<u64>,
 }
 impl Pool {
     fn d(&mut self, v: i32) -> String {
@@ -232,12 +325,19 @@ impl Pool {
         });
         format!(".LCd{i}")
     }
+    fn q(&mut self, v: u64) -> String {
+        let i = self.q.iter().position(|x| *x == v).unwrap_or_else(|| {
+            self.q.push(v);
+            self.q.len() - 1
+        });
+        format!(".LCq{i}")
+    }
 }
 
 // ---- lowering: graph -> Inst stream ----
 
-struct Lower<'a> {
-    g: &'a Graph,
+struct Lower<'a, A: GraphArith> {
+    g: &'a Graph<A>,
     vals: Vec<Option<Value>>,
     insts: Vec<Inst>,
     next_vreg: Vreg,
@@ -249,7 +349,7 @@ struct Lower<'a> {
     memo: HashMap<Key, Vreg>,
 }
 
-impl<'a> Lower<'a> {
+impl<A: GraphArith> Lower<'_, A> {
     fn fresh(&mut self) -> Vreg {
         let v = self.next_vreg;
         self.next_vreg += 1;
@@ -272,86 +372,19 @@ impl<'a> Lower<'a> {
         match nv {
             NumVal::Reg(v) => v,
             NumVal::ConstI32(c) => self.pure(Key::BcastD(c), |d| Inst::BcastD { dst: d, val: c }),
+            NumVal::ConstQ(c) => self.pure(Key::BcastQ(c), |d| Inst::BcastQ { dst: d, val: c }),
         }
     }
     fn num_src(&self, nv: NumVal) -> Src {
         match nv {
             NumVal::Reg(v) => Src::Reg(v),
             NumVal::ConstI32(c) => Src::BI32(c),
-        }
-    }
-    fn muldq(&mut self, a: Vreg, b: Vreg) -> Vreg {
-        // vpmuldq is commutative in its two source lanes.
-        let (a, b) = if a <= b { (a, b) } else { (b, a) };
-        self.pure(Key::Muldq(a, b), move |d| Inst::Muldq { dst: d, a, b })
-    }
-    fn sraq(&mut self, a: Vreg, imm: u8) -> Vreg {
-        self.pure(Key::Sraq(a, imm), move |d| Inst::Sraq { dst: d, a, imm })
-    }
-
-    fn sllq(&mut self, a: Vreg, imm: u8) -> Vreg {
-        self.pure(Key::Sllq(a, imm), move |d| Inst::Sllq { dst: d, a, imm })
-    }
-    fn shrd(&mut self, a: Vreg, imm: u8, arith: bool) -> Vreg {
-        self.pure(Key::ShrD(a, imm, arith), move |d| Inst::ShrD { dst: d, a, imm, arith })
-    }
-
-    /// PICO-8 `x / 2^s` (raw divisor `2^(16+s)`, `0 <= s <= 14`), inline:
-    /// `Pico8Num`'s division TRUNCATES toward zero and never saturates for
-    /// these divisors, so it is the arithmetic shift of `x` biased by
-    /// `2^s - 1` where `x` is negative (`(x + ((x >> 31) >>> (32 - s))) >> s`;
-    /// no overflow: the bias is added to negatives only).
-    /// `asm::tests::inline_div_rem_by_a_power_of_two_is_pico8s` checks it
-    /// bit-exact against `Pico8Num` over the whole i32 range.
-    fn div_pow2(&mut self, x: Vreg, s: u8) -> Vreg {
-        if s == 0 {
-            return x;
-        }
-        let sign = self.shrd(x, 31, true);
-        let bias = self.shrd(sign, 32 - s, false);
-        let biased = self.dbin(ROp::AddD, x, bias);
-        self.shrd(biased, s, true)
-    }
-
-    /// `s` if `id` is the literal `2^(16+s)` with `0 <= s <= 14` (a divisor
-    /// `div_pow2` takes).
-    fn pow2_divisor(&self, id: NodeId) -> Option<u8> {
-        match self.g.get(id).op {
-            Op::Const(lo, hi) if lo == hi && lo > 0 && (lo as u32).is_power_of_two() => {
-                let m = (lo as u32).trailing_zeros();
-                (16..=30).contains(&m).then(|| (m - 16) as u8)
-            }
-            _ => None,
+            NumVal::ConstQ(c) => Src::BQ(c),
         }
     }
 
-    /// The mask `2^m - 1` if `id` is the literal `2^m` (raw, `m <= 30`):
-    /// PICO-8's `%` is `rem_euclid` on the raw bits, which for a positive power
-    /// of two is the low bits, negatives included.
-    fn pow2_modulus_mask(&self, id: NodeId) -> Option<i32> {
-        match self.g.get(id).op {
-            Op::Const(lo, hi) if lo == hi && lo > 0 && (lo as u32).is_power_of_two() => Some(lo - 1),
-            _ => None,
-        }
-    }
-
-    fn blend_imm(&mut self, mask: u16, a: Vreg, b: Vreg) -> Vreg {
-        self.pure(Key::BlendImm(mask, a, b), move |d| Inst::BlendImm { dst: d, mask, a, b })
-    }
-
-    /// 16.16 multiply, `zn_mul`'s even/odd `vpmuldq` weave.
-    fn zn_mul(&mut self, a: Vreg, b: Vreg) -> Vreg {
-        let ev = self.muldq(a, b);
-        let ev = self.sraq(ev, 16);
-        let ah = self.sraq(a, 32);
-        let bh = self.sraq(b, 32);
-        let od = self.muldq(ah, bh);
-        let od = self.sraq(od, 16);
-        let od = self.sllq(od, 32);
-        self.blend_imm(0xaaaa, ev, od)
-    }
-
-    // ---- boolean / mask layer (ZB as vector masks) ----
+    // ---- mask planes (shared: a vector mask is all-ones or zero per
+    // lane, whatever the lane width) ----
 
     /// A mask plane in a register (constants broadcast).
     fn mask_reg(&mut self, m: MaskVal) -> Vreg {
@@ -389,11 +422,6 @@ impl<'a> Lower<'a> {
     fn not_mask(&mut self, a: Vreg) -> Vreg {
         let key = Key::RBin(6, a, SrcKey::I32(-1));
         self.pure(key, move |d| Inst::RBin { dst: d, op: ROp::XorD, a, b: Src::BI32(-1) })
-    }
-
-    /// Signed 32-bit compare to a vector mask.
-    fn cmp(&mut self, imm: u8, a: Vreg, b: Src) -> Vreg {
-        self.pure(Key::Cmp(imm, a, b.key()), move |d| Inst::Cmp { dst: d, imm, a, b })
     }
 
     /// `dst = LUT_imm(a, b, c)` (`vpternlogd`).
@@ -497,6 +525,264 @@ impl<'a> Lower<'a> {
         }
     }
 
+    fn ival_regs(&mut self, iv: [NumVal; 2]) -> [Vreg; 2] {
+        [self.num_reg(iv[0]), self.num_reg(iv[1])]
+    }
+
+    fn as_num(&self, id: NodeId) -> Result<NumVal> {
+        match self.vals[id as usize] {
+            Some(Value::Num(n)) => Ok(n),
+            _ => bail!(
+                "node {} (op {:?}, domain {}; args {}) is not a numeric value where one was needed; interval source: {}",
+                id,
+                self.g.get(id).op,
+                self.dom(id),
+                self.g
+                    .get(id)
+                    .args
+                    .iter()
+                    .map(|&a| format!("{a}={:?}/d{}", self.g.get(a).op, self.dom(a)))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                self.interval_source(id)
+            ),
+        }
+    }
+
+    /// `id`'s subtree to `depth`, with domains (for errors).
+    fn describe(&self, id: NodeId, depth: usize) -> String {
+        let node = self.g.get(id);
+        let known = match self.vals[id as usize] {
+            Some(Value::Bool([_, MaskVal::Const(true)])) => "K",
+            Some(Value::Bool(_)) => "?",
+            _ => "",
+        };
+        if depth == 0 || node.args.is_empty() {
+            return format!("{id}={:?}/d{}{known}", node.op, self.dom(id));
+        }
+        format!(
+            "{id}={:?}/d{}{known}({})",
+            node.op,
+            self.dom(id),
+            node.args.iter().map(|&a| self.describe(a, depth - 1)).collect::<Vec<_>>().join(", ")
+        )
+    }
+
+    /// The chain of interval operands that made `id` an interval.
+    fn interval_source(&self, id: NodeId) -> String {
+        let mut out = Vec::new();
+        let mut cur = id;
+        for _ in 0..64 {
+            let node = self.g.get(cur);
+            out.push(format!("{cur}={:?}", node.op));
+            let next = match node.op {
+                Op::Sel => {
+                    let arm = node.args[1..].iter().copied().find(|&x| self.dom(x) == 2);
+                    if arm.is_none() {
+                        out.push(format!("<- condition {}", self.describe(node.args[0], 5)));
+                    }
+                    arm
+                }
+                _ => node.args.iter().copied().find(|&x| self.dom(x) == 2),
+            };
+            match next {
+                Some(x) => cur = x,
+                None => break,
+            }
+        }
+        out.join(" <- ")
+    }
+
+    fn as_bool(&self, id: NodeId) -> Result<[MaskVal; 2]> {
+        match self.vals[id as usize] {
+            Some(Value::Bool(b)) => Ok(b),
+            _ => bail!("node {} is not a boolean value where one was needed", id),
+        }
+    }
+
+    fn as_ival(&self, id: NodeId) -> Result<[NumVal; 2]> {
+        match self.vals[id as usize] {
+            Some(Value::Ival(i)) => Ok(i),
+            // A number is the degenerate interval [x, x] (zi_of_zn).
+            Some(Value::Num(n)) => Ok([n, n]),
+            _ => bail!("node {} is not an interval where one was needed", id),
+        }
+    }
+
+    /// A node's domain: 0 number, 1 boolean, 2 interval.
+    fn dom(&self, id: NodeId) -> u8 {
+        match self.vals[id as usize] {
+            Some(Value::Num(_)) => 0,
+            Some(Value::Bool(_)) => 1,
+            Some(Value::Ival(_)) => 2,
+            None => 0,
+        }
+    }
+
+    /// The ops every arithmetic lowers alike (the boolean layer, selects,
+    /// interval ends, pass-throughs): their value, or `None` for the
+    /// arithmetic's own lowering.
+    fn lower_common(&mut self, id: NodeId) -> Result<Option<Value>> {
+        let node = self.g.get(id);
+        let a = node.args.clone();
+        Ok(Some(match &node.op {
+            Op::ConstBool(b) => Value::Bool([MaskVal::Const(*b), MaskVal::Const(true)]),
+            // Undecided in every lane: the known plane is all zeros.
+            Op::UnknownBool(_) => Value::Bool([MaskVal::Const(false), MaskVal::Const(false)]),
+            // `emit::bind` keeps it out of every root's cone.
+            Op::UnknownNum => bail!("node {}: an unknown number reached the kernel", id),
+            Op::Not => {
+                let b = self.as_bool(a[0])?;
+                let nv = self.m_not(b[0]);
+                Value::Bool([nv, b[1]])
+            }
+            op @ (Op::And | Op::Or) => {
+                let (p, q) = (self.as_bool(a[0])?, self.as_bool(a[1])?);
+                let ([pv, pk], [qv, qk]) = (p, q);
+                // Kleene, per lane; the identities fold decided planes.
+                let kk = self.m_and(pk, qk);
+                if matches!(op, Op::And) {
+                    // known = (pk & qk) | (~pv & pk) | (~qv & qk)
+                    let val = self.m_and(pv, qv);
+                    let kfa = self.m_andn(pv, pk);
+                    let kfb = self.m_andn(qv, qk);
+                    let kf = self.m_or(kfa, kfb);
+                    let known = self.m_or(kk, kf);
+                    Value::Bool([val, known])
+                } else {
+                    // known = (pk & qk) | (pv & pk) | (qv & qk)
+                    let val = self.m_or(pv, qv);
+                    let kta = self.m_and(pv, pk);
+                    let ktb = self.m_and(qv, qk);
+                    let kt = self.m_or(kta, ktb);
+                    let known = self.m_or(kk, kt);
+                    Value::Bool([val, known])
+                }
+            }
+            Op::Lo | Op::Hi => {
+                if self.dom(a[0]) == 2 {
+                    let iv = self.as_ival(a[0])?;
+                    Value::Num(iv[if matches!(node.op, Op::Lo) { 0 } else { 1 }])
+                } else {
+                    Value::Num(self.as_num(a[0])?)
+                }
+            }
+            Op::Sel => {
+                let cv = self.as_bool(a[0])?[0];
+                // On the JOINED arm domain (a number beside an interval is [n, n]).
+                match self.dom(a[1]).max(self.dom(a[2])) {
+                    1 => {
+                        let (t, f) = (self.as_bool(a[1])?, self.as_bool(a[2])?);
+                        let val = self.m_sel(cv, t[0], f[0]);
+                        let known = self.m_sel(cv, t[1], f[1]);
+                        Value::Bool([val, known])
+                    }
+                    2 => {
+                        let (t, f) = (self.as_ival(a[1])?, self.as_ival(a[2])?);
+                        let lo = self.n_sel(cv, t[0], f[0]);
+                        let hi = self.n_sel(cv, t[1], f[1]);
+                        Value::Ival([lo, hi])
+                    }
+                    _ => {
+                        let (t, f) = (self.as_num(a[1])?, self.as_num(a[2])?);
+                        Value::Num(self.n_sel(cv, t, f))
+                    }
+                }
+            }
+            Op::Span => {
+                // The hull [lo of arg0, hi of arg1].
+                let a0 = self.as_ival(a[0])?;
+                let a1 = self.as_ival(a[1])?;
+                Value::Ival([a0[0], a1[1]])
+            }
+            // The operand unchanged: the range is the node's own error
+            // (`trace::error`), checked on the raw operand.
+            Op::Restrict(..) => match self.vals[a[0] as usize] {
+                Some(v) => v,
+                None => bail!("node {}: its operand was not lowered", id),
+            },
+            _ => return Ok(None),
+        }))
+    }
+}
+
+impl Lower<'_, Fixed> {
+    fn muldq(&mut self, a: Vreg, b: Vreg) -> Vreg {
+        // vpmuldq is commutative in its two source lanes.
+        let (a, b) = if a <= b { (a, b) } else { (b, a) };
+        self.pure(Key::Muldq(a, b), move |d| Inst::Muldq { dst: d, a, b })
+    }
+    fn sraq(&mut self, a: Vreg, imm: u8) -> Vreg {
+        self.pure(Key::Sraq(a, imm), move |d| Inst::Sraq { dst: d, a, imm })
+    }
+
+    fn sllq(&mut self, a: Vreg, imm: u8) -> Vreg {
+        self.pure(Key::Sllq(a, imm), move |d| Inst::Sllq { dst: d, a, imm })
+    }
+    fn shrd(&mut self, a: Vreg, imm: u8, arith: bool) -> Vreg {
+        self.pure(Key::ShrD(a, imm, arith), move |d| Inst::ShrD { dst: d, a, imm, arith })
+    }
+
+    /// PICO-8 `x / 2^s` (raw divisor `2^(16+s)`, `0 <= s <= 14`), inline:
+    /// `Pico8Num`'s division TRUNCATES toward zero and never saturates for
+    /// these divisors, so it is the arithmetic shift of `x` biased by
+    /// `2^s - 1` where `x` is negative (`(x + ((x >> 31) >>> (32 - s))) >> s`;
+    /// no overflow: the bias is added to negatives only).
+    /// `asm::tests::inline_div_rem_by_a_power_of_two_is_pico8s` checks it
+    /// bit-exact against `Pico8Num` over the whole i32 range.
+    fn div_pow2(&mut self, x: Vreg, s: u8) -> Vreg {
+        if s == 0 {
+            return x;
+        }
+        let sign = self.shrd(x, 31, true);
+        let bias = self.shrd(sign, 32 - s, false);
+        let biased = self.dbin(ROp::AddD, x, bias);
+        self.shrd(biased, s, true)
+    }
+
+    /// `s` if `id` is the literal `2^(16+s)` with `0 <= s <= 14` (a divisor
+    /// `div_pow2` takes).
+    fn pow2_divisor(&self, id: NodeId) -> Option<u8> {
+        match self.g.get(id).op {
+            Op::Const(lo, hi) if lo == hi && lo > 0 && (lo as u32).is_power_of_two() => {
+                let m = (lo as u32).trailing_zeros();
+                (16..=30).contains(&m).then(|| (m - 16) as u8)
+            }
+            _ => None,
+        }
+    }
+
+    /// The mask `2^m - 1` if `id` is the literal `2^m` (raw, `m <= 30`):
+    /// PICO-8's `%` is `rem_euclid` on the raw bits, which for a positive power
+    /// of two is the low bits, negatives included.
+    fn pow2_modulus_mask(&self, id: NodeId) -> Option<i32> {
+        match self.g.get(id).op {
+            Op::Const(lo, hi) if lo == hi && lo > 0 && (lo as u32).is_power_of_two() => Some(lo - 1),
+            _ => None,
+        }
+    }
+
+    fn blend_imm(&mut self, mask: u16, a: Vreg, b: Vreg) -> Vreg {
+        self.pure(Key::BlendImm(mask, a, b), move |d| Inst::BlendImm { dst: d, mask, a, b })
+    }
+
+    /// 16.16 multiply, `zn_mul`'s even/odd `vpmuldq` weave.
+    fn zn_mul(&mut self, a: Vreg, b: Vreg) -> Vreg {
+        let ev = self.muldq(a, b);
+        let ev = self.sraq(ev, 16);
+        let ah = self.sraq(a, 32);
+        let bh = self.sraq(b, 32);
+        let od = self.muldq(ah, bh);
+        let od = self.sraq(od, 16);
+        let od = self.sllq(od, 32);
+        self.blend_imm(0xaaaa, ev, od)
+    }
+
+    /// Signed 32-bit compare to a vector mask.
+    fn cmp(&mut self, imm: u8, a: Vreg, b: Src) -> Vreg {
+        self.pure(Key::Cmp(imm, a, b.key()), move |d| Inst::Cmp { dst: d, imm, a, b })
+    }
+
     // ---- interval layer (ZI as two i32 planes) ----
 
     /// A 32-bit-lane binary op with a broadcast CONSTANT second operand.
@@ -523,9 +809,6 @@ impl<'a> Lower<'a> {
     }
     fn absd(&mut self, a: Vreg) -> Vreg {
         self.pure(Key::Abs(a), move |d| Inst::Abs { dst: d, a })
-    }
-    fn ival_regs(&mut self, iv: [NumVal; 2]) -> [Vreg; 2] {
-        [self.num_reg(iv[0]), self.num_reg(iv[1])]
     }
     /// `zn_flr`: `x & 0xffff_0000`.
     fn flr(&mut self, a: Vreg) -> Vreg {
@@ -672,97 +955,17 @@ impl<'a> Lower<'a> {
         }
     }
 
-    fn as_num(&self, id: NodeId) -> Result<NumVal> {
-        match self.vals[id as usize] {
-            Some(Value::Num(n)) => Ok(n),
-            _ => bail!(
-                "node {} (op {:?}, domain {}; args {}) is not a numeric value where one was needed; interval source: {}",
-                id,
-                self.g.get(id).op,
-                self.dom(id),
-                self.g
-                    .get(id)
-                    .args
-                    .iter()
-                    .map(|&a| format!("{a}={:?}/d{}", self.g.get(a).op, self.dom(a)))
-                    .collect::<Vec<_>>()
-                    .join(", "),
-                self.interval_source(id)
-            ),
-        }
-    }
 
-    /// `id`'s subtree to `depth`, with domains (for errors).
-    fn describe(&self, id: NodeId, depth: usize) -> String {
-        let node = self.g.get(id);
-        let known = match self.vals[id as usize] {
-            Some(Value::Bool([_, MaskVal::Const(true)])) => "K",
-            Some(Value::Bool(_)) => "?",
-            _ => "",
-        };
-        if depth == 0 || node.args.is_empty() {
-            return format!("{id}={:?}/d{}{known}", node.op, self.dom(id));
-        }
-        format!(
-            "{id}={:?}/d{}{known}({})",
-            node.op,
-            self.dom(id),
-            node.args.iter().map(|&a| self.describe(a, depth - 1)).collect::<Vec<_>>().join(", ")
-        )
-    }
 
-    /// The chain of interval operands that made `id` an interval.
-    fn interval_source(&self, id: NodeId) -> String {
-        let mut out = Vec::new();
-        let mut cur = id;
-        for _ in 0..64 {
-            let node = self.g.get(cur);
-            out.push(format!("{cur}={:?}", node.op));
-            let next = match node.op {
-                Op::Sel => {
-                    let arm = node.args[1..].iter().copied().find(|&x| self.dom(x) == 2);
-                    if arm.is_none() {
-                        out.push(format!("<- condition {}", self.describe(node.args[0], 5)));
-                    }
-                    arm
-                }
-                _ => node.args.iter().copied().find(|&x| self.dom(x) == 2),
-            };
-            match next {
-                Some(x) => cur = x,
-                None => break,
-            }
-        }
-        out.join(" <- ")
-    }
 
-    fn as_bool(&self, id: NodeId) -> Result<[MaskVal; 2]> {
-        match self.vals[id as usize] {
-            Some(Value::Bool(b)) => Ok(b),
-            _ => bail!("node {} is not a boolean value where one was needed", id),
-        }
-    }
 
-    fn as_ival(&self, id: NodeId) -> Result<[NumVal; 2]> {
-        match self.vals[id as usize] {
-            Some(Value::Ival(i)) => Ok(i),
-            // A number is the degenerate interval [x, x] (zi_of_zn).
-            Some(Value::Num(n)) => Ok([n, n]),
-            _ => bail!("node {} is not an interval where one was needed", id),
-        }
-    }
 
-    /// A node's domain: 0 number, 1 boolean, 2 interval.
-    fn dom(&self, id: NodeId) -> u8 {
-        match self.vals[id as usize] {
-            Some(Value::Num(_)) => 0,
-            Some(Value::Bool(_)) => 1,
-            Some(Value::Ival(_)) => 2,
-            None => 0,
-        }
-    }
 
     fn lower_node(&mut self, id: NodeId) -> Result<()> {
+        if let Some(v) = self.lower_common(id)? {
+            self.vals[id as usize] = Some(v);
+            return Ok(());
+        }
         let node = self.g.get(id);
         let a = node.args.clone();
         let val = match &node.op {
@@ -936,11 +1139,6 @@ impl<'a> Lower<'a> {
                 let lo = self.num_reg(iv[0]);
                 Value::Num(NumVal::Reg(self.flr(lo)))
             }
-            Op::ConstBool(b) => Value::Bool([MaskVal::Const(*b), MaskVal::Const(true)]),
-            // Undecided in every lane: the known plane is all zeros.
-            Op::UnknownBool(_) => Value::Bool([MaskVal::Const(false), MaskVal::Const(false)]),
-            // `emit::bind` keeps it out of every root's cone.
-            Op::UnknownNum => bail!("node {}: an unknown number reached the kernel", id),
             op @ (Op::Lt | Op::Le | Op::Gt | Op::Ge) => {
                 if self.dom(a[0]) == 2 || self.dom(a[1]) == 2 {
                     // Interval comparison -> tri-state ZB (zi_cmp).
@@ -1004,34 +1202,6 @@ impl<'a> Lower<'a> {
                     }
                 }
             }
-            Op::Not => {
-                let b = self.as_bool(a[0])?;
-                let nv = self.m_not(b[0]);
-                Value::Bool([nv, b[1]])
-            }
-            op @ (Op::And | Op::Or) => {
-                let (p, q) = (self.as_bool(a[0])?, self.as_bool(a[1])?);
-                let ([pv, pk], [qv, qk]) = (p, q);
-                // Kleene, per lane; the identities fold decided planes.
-                let kk = self.m_and(pk, qk);
-                if matches!(op, Op::And) {
-                    // known = (pk & qk) | (~pv & pk) | (~qv & qk)
-                    let val = self.m_and(pv, qv);
-                    let kfa = self.m_andn(pv, pk);
-                    let kfb = self.m_andn(qv, qk);
-                    let kf = self.m_or(kfa, kfb);
-                    let known = self.m_or(kk, kf);
-                    Value::Bool([val, known])
-                } else {
-                    // known = (pk & qk) | (pv & pk) | (qv & qk)
-                    let val = self.m_or(pv, qv);
-                    let kta = self.m_and(pv, pk);
-                    let ktb = self.m_and(qv, qk);
-                    let kt = self.m_or(kta, ktb);
-                    let known = self.m_or(kk, kt);
-                    Value::Bool([val, known])
-                }
-            }
             Op::Known => {
                 // `Known(Flr(x))` reads the INTERVAL `x` (zi_flr_ok): the
                 // result is exact BY this premise and would answer itself.
@@ -1064,54 +1234,12 @@ impl<'a> Lower<'a> {
                     _ => Value::Bool([MaskVal::Const(true), MaskVal::Const(true)]),
                 }
             }
-            Op::Lo | Op::Hi => {
-                if self.dom(a[0]) == 2 {
-                    let iv = self.as_ival(a[0])?;
-                    Value::Num(iv[if matches!(node.op, Op::Lo) { 0 } else { 1 }])
-                } else {
-                    Value::Num(self.as_num(a[0])?)
-                }
-            }
-            Op::Sel => {
-                let cv = self.as_bool(a[0])?[0];
-                // On the JOINED arm domain (a number beside an interval is [n, n]).
-                match self.dom(a[1]).max(self.dom(a[2])) {
-                    1 => {
-                        let (t, f) = (self.as_bool(a[1])?, self.as_bool(a[2])?);
-                        let val = self.m_sel(cv, t[0], f[0]);
-                        let known = self.m_sel(cv, t[1], f[1]);
-                        Value::Bool([val, known])
-                    }
-                    2 => {
-                        let (t, f) = (self.as_ival(a[1])?, self.as_ival(a[2])?);
-                        let lo = self.n_sel(cv, t[0], f[0]);
-                        let hi = self.n_sel(cv, t[1], f[1]);
-                        Value::Ival([lo, hi])
-                    }
-                    _ => {
-                        let (t, f) = (self.as_num(a[1])?, self.as_num(a[2])?);
-                        Value::Num(self.n_sel(cv, t, f))
-                    }
-                }
-            }
-            Op::Span => {
-                // The hull [lo of arg0, hi of arg1].
-                let a0 = self.as_ival(a[0])?;
-                let a1 = self.as_ival(a[1])?;
-                Value::Ival([a0[0], a1[1]])
-            }
             Op::Frag(c) => {
                 let iv = self.as_ival(a[0])?;
                 let ar = self.ival_regs(iv);
                 let (frag, _) = self.zi_fork_flr(ar, *c);
                 Value::Ival([NumVal::Reg(frag[0]), NumVal::Reg(frag[1])])
             }
-            // The operand unchanged: the range is the node's own error
-            // (`trace::error`), checked on the raw operand.
-            Op::Restrict(..) => match self.vals[a[0] as usize] {
-                Some(v) => v,
-                None => bail!("node {}: its operand was not lowered", id),
-            },
             Op::FragOk(c) => {
                 let iv = self.as_ival(a[0])?;
                 let ar = self.ival_regs(iv);
@@ -1240,7 +1368,7 @@ impl<'a> Lower<'a> {
 
 /// A node lowering order over BATCHES of roots: each batch's unplaced cone
 /// depth-major (ILP) while only ~`batch` roots' temporaries are live.
-fn schedule(g: &Graph, live: &[bool], roots: &[NodeId], batch: usize) -> Vec<NodeId> {
+fn schedule<A: GraphArith>(g: &Graph<A>, live: &[bool], roots: &[NodeId], batch: usize) -> Vec<NodeId> {
     // ALAP depth (consumers have larger ids; operands are strictly shallower,
     // so depth-major is a valid order) keeps shared live ranges short.
     let maxd = g.len() as u32;
@@ -1288,7 +1416,7 @@ fn schedule(g: &Graph, live: &[bool], roots: &[NodeId], batch: usize) -> Vec<Nod
 }
 
 /// Nodes reachable from `roots`.
-fn reachable(g: &Graph, roots: &[NodeId]) -> Vec<bool> {
+fn reachable<A: GraphArith>(g: &Graph<A>, roots: &[NodeId]) -> Vec<bool> {
     let mut live = vec![false; g.len()];
     let mut stack = roots.to_vec();
     while let Some(n) = stack.pop() {
@@ -1339,7 +1467,13 @@ fn inst_uses(inst: &Inst, out: &mut Vec<Vreg>) {
         }
         Inst::Call { args, .. } => out.extend(args.iter().copied()),
         Inst::Store { src, .. } => push_src(src, out),
-        Inst::StoreMask { src, .. } => out.push(*src),
+        Inst::StoreMask { src, .. } | Inst::StoreMask8 { src, .. } => out.push(*src),
+        Inst::BcastQ { .. } | Inst::LoadMask8 { .. } => {}
+        Inst::FBin { a, b, .. } | Inst::FCmp { a, b, .. } | Inst::QBin { a, b, .. } | Inst::QCmp { a, b, .. } => {
+            out.push(*a);
+            push_src(b, out);
+        }
+        Inst::FRnd { a, .. } => out.push(*a),
     }
 }
 
@@ -1488,8 +1622,15 @@ fn inst_def(inst: &Inst) -> Option<Vreg> {
         | Inst::BlendImm { dst, .. }
         | Inst::Cmp { dst, .. }
         | Inst::Ternlog { dst, .. }
-        | Inst::Call { dst, .. } => Some(*dst),
-        Inst::Store { .. } | Inst::StoreMask { .. } => None,
+        | Inst::Call { dst, .. }
+        | Inst::BcastQ { dst, .. }
+        | Inst::LoadMask8 { dst, .. }
+        | Inst::FBin { dst, .. }
+        | Inst::FRnd { dst, .. }
+        | Inst::FCmp { dst, .. }
+        | Inst::QBin { dst, .. }
+        | Inst::QCmp { dst, .. } => Some(*dst),
+        Inst::Store { .. } | Inst::StoreMask { .. } | Inst::StoreMask8 { .. } => None,
     }
 }
 
@@ -1702,6 +1843,7 @@ impl<'a> Emitter<'a> {
                 writeln!(self.out, "    vmovdqu64 {}(%r13), %zmm{}", off, dst).unwrap();
             }
             &Inst::BcastD { val, .. } => self.constant(val, dst),
+            &Inst::BcastQ { val, .. } => self.constant_q(val, dst),
             other => {
                 unreachable!("non-rematerializable def marked remat: {:?}", std::mem::discriminant(other))
             }
@@ -1718,6 +1860,17 @@ impl<'a> Emitter<'a> {
             _ => {
                 let l = self.pool.d(val);
                 writeln!(self.out, "    vpbroadcastd {l}(%rip), %zmm{dst}").unwrap();
+            }
+        }
+    }
+
+    /// The 64-bit constant `val` in every lane of `dst` (`constant`'s twin).
+    fn constant_q(&mut self, val: u64, dst: u8) {
+        match val {
+            0 => writeln!(self.out, "    vpxord %zmm{dst}, %zmm{dst}, %zmm{dst}").unwrap(),
+            _ => {
+                let l = self.pool.q(val);
+                writeln!(self.out, "    vpbroadcastq {l}(%rip), %zmm{dst}").unwrap();
             }
         }
     }
@@ -1750,6 +1903,10 @@ impl<'a> Emitter<'a> {
             Src::BI32(c) => {
                 let l = self.pool.d(c);
                 format!("{l}(%rip){{1to16}}")
+            }
+            Src::BQ(c) => {
+                let l = self.pool.q(c);
+                format!("{l}(%rip){{1to8}}")
             }
         }
     }
@@ -1886,27 +2043,28 @@ impl<'a> Emitter<'a> {
                 let arg = |i: u32| self.argbuf_off + i * 64;
                 // 3. C args; `stack_arg`: tile_flag's pushed 7th scalar.
                 let (ctx_off, stack_arg): (u32, bool) = match op {
-                    CallOp::Div | CallOp::Rem | CallOp::Sin => {
+                    CallOp::Div | CallOp::Rem | CallOp::Sin | CallOp::FSin => {
                         writeln!(self.out, "    leaq {}(%rsp), %rdi", resbuf).unwrap();
                         writeln!(self.out, "    leaq {}(%rsp), %rsi", arg(0)).unwrap();
-                        if !matches!(op, CallOp::Sin) {
+                        if !matches!(op, CallOp::Sin | CallOp::FSin) {
                             writeln!(self.out, "    leaq {}(%rsp), %rdx", arg(1)).unwrap();
                         }
                         let c = match op {
                             CallOp::Div => CTX_DIV,
                             CallOp::Rem => CTX_REM,
+                            CallOp::FSin => CTX_FSIN,
                             _ => CTX_SIN,
                         };
                         (c, false)
                     }
-                    CallOp::Mget => {
+                    CallOp::Mget | CallOp::FMget => {
                         writeln!(self.out, "    movq {}(%r15), %rdi", CTX_ENV).unwrap();
                         writeln!(self.out, "    leaq {}(%rsp), %rsi", resbuf).unwrap();
                         writeln!(self.out, "    leaq {}(%rsp), %rdx", arg(0)).unwrap();
                         writeln!(self.out, "    leaq {}(%rsp), %rcx", arg(1)).unwrap();
-                        (CTX_MGET, false)
+                        (if matches!(op, CallOp::FMget) { CTX_FMGET } else { CTX_MGET }, false)
                     }
-                    CallOp::TileFlag => {
+                    CallOp::TileFlag | CallOp::FTileFlag => {
                         writeln!(self.out, "    movq {}(%r15), %rdi", CTX_ENV).unwrap();
                         writeln!(self.out, "    leaq {}(%rsp), %rsi", resbuf).unwrap();
                         writeln!(self.out, "    leaq {}(%rsp), %rdx", arg(0)).unwrap();
@@ -1915,9 +2073,9 @@ impl<'a> Emitter<'a> {
                         writeln!(self.out, "    movl ${}, %r9d", scalars[1]).unwrap();
                         writeln!(self.out, "    subq $16, %rsp").unwrap();
                         writeln!(self.out, "    movl ${}, (%rsp)", scalars[2]).unwrap();
-                        (CTX_TILE, true)
+                        (if matches!(op, CallOp::FTileFlag) { CTX_FTILE } else { CTX_TILE }, true)
                     }
-                    CallOp::TileFlagLanes => {
+                    CallOp::TileFlagLanes | CallOp::FTileFlagLanes => {
                         writeln!(self.out, "    movq {}(%r15), %rdi", CTX_ENV).unwrap();
                         writeln!(self.out, "    leaq {}(%rsp), %rsi", resbuf).unwrap();
                         writeln!(self.out, "    leaq {}(%rsp), %rdx", arg(0)).unwrap();
@@ -1926,7 +2084,7 @@ impl<'a> Emitter<'a> {
                         writeln!(self.out, "    leaq {}(%rsp), %r9", arg(3)).unwrap();
                         writeln!(self.out, "    subq $16, %rsp").unwrap();
                         writeln!(self.out, "    movl ${}, (%rsp)", scalars[0]).unwrap();
-                        (CTX_TILE_LANES, true)
+                        (if matches!(op, CallOp::FTileFlagLanes) { CTX_FTILE_LANES } else { CTX_TILE_LANES }, true)
                     }
                 };
                 // 4. call through the ctx.
@@ -1950,6 +2108,11 @@ impl<'a> Emitter<'a> {
                     writeln!(self.out, "    movzwl {}(%rsp), %eax", resbuf).unwrap();
                     writeln!(self.out, "    kmovw %eax, %k1").unwrap();
                     writeln!(self.out, "    vpmovm2d %k1, %zmm{}", d).unwrap();
+                } else if matches!(op, CallOp::FTileFlag | CallOp::FTileFlagLanes) {
+                    // An 8-lane mask, as 64-bit lanes.
+                    writeln!(self.out, "    movzbl {}(%rsp), %eax", resbuf).unwrap();
+                    writeln!(self.out, "    kmovb %eax, %k1").unwrap();
+                    writeln!(self.out, "    vpmovm2q %k1, %zmm{}", d).unwrap();
                 } else {
                     writeln!(self.out, "    vmovdqu64 {}(%rsp), %zmm{}", resbuf, d).unwrap();
                 }
@@ -1969,8 +2132,87 @@ impl<'a> Emitter<'a> {
                         writeln!(self.out, "    vpbroadcastd {}(%rip), %zmm{}", l, OPA).unwrap();
                         OPA
                     }
+                    Src::BQ(c) => {
+                        let l = self.pool.q(*c);
+                        writeln!(self.out, "    vpbroadcastq {}(%rip), %zmm{}", l, OPA).unwrap();
+                        OPA
+                    }
                 };
                 writeln!(self.out, "    vmovdqu64 %zmm{}, {}(%r14)", r, off).unwrap();
+            }
+            Inst::StoreMask8 { off, src } => {
+                let rs = self.use_reg(*src, OPA);
+                writeln!(self.out, "    vpmovq2m %zmm{}, %k1", rs).unwrap();
+                writeln!(self.out, "    kmovb %k1, %eax").unwrap();
+                writeln!(self.out, "    movb %al, {}(%r14)", off).unwrap();
+            }
+            Inst::BcastQ { dst, val } => {
+                if self.skip_def(*dst) {
+                    return;
+                }
+                let d = self.def_reg(*dst);
+                self.constant_q(*val, d);
+            }
+            Inst::LoadMask8 { dst, off } => {
+                if self.skip_def(*dst) {
+                    return;
+                }
+                let d = self.def_reg(*dst);
+                writeln!(self.out, "    movzbl {}(%r13), %eax", off).unwrap();
+                writeln!(self.out, "    kmovb %eax, %k1").unwrap();
+                writeln!(self.out, "    vpmovm2q %k1, %zmm{}", d).unwrap();
+                self.store_def(*dst, d);
+            }
+            Inst::FBin { dst, op, a, b } => {
+                let ra = self.use_reg(*a, OPA);
+                let bop = self.src_operand(*b, OPB);
+                let d = self.def_reg(*dst);
+                let mn = match op {
+                    FOp::Add => "vaddpd",
+                    FOp::Sub => "vsubpd",
+                    FOp::Mul => "vmulpd",
+                    FOp::Div => "vdivpd",
+                };
+                // AT&T: `dst = a op b`.
+                writeln!(self.out, "    {} {}, %zmm{}, %zmm{}", mn, bop, ra, d).unwrap();
+                self.store_def(*dst, d);
+            }
+            Inst::FRnd { dst, a, imm } => {
+                let ra = self.use_reg(*a, OPA);
+                let d = self.def_reg(*dst);
+                writeln!(self.out, "    vrndscalepd ${}, %zmm{}, %zmm{}", imm, ra, d).unwrap();
+                self.store_def(*dst, d);
+            }
+            Inst::FCmp { dst, imm, a, b } => {
+                let ra = self.use_reg(*a, OPA);
+                let bop = self.src_operand(*b, OPB);
+                let d = self.def_reg(*dst);
+                // AT&T: `k1 = a pred b`.
+                writeln!(self.out, "    vcmppd ${}, {}, %zmm{}, %k1", imm, bop, ra).unwrap();
+                writeln!(self.out, "    vpmovm2q %k1, %zmm{}", d).unwrap();
+                self.store_def(*dst, d);
+            }
+            Inst::QBin { dst, op, a, b } => {
+                let ra = self.use_reg(*a, OPA);
+                let bop = self.src_operand(*b, OPB);
+                let d = self.def_reg(*dst);
+                let mn = match op {
+                    QOp::Add => "vpaddq",
+                    QOp::Sub => "vpsubq",
+                    QOp::And => "vpandq",
+                    QOp::Or => "vporq",
+                    QOp::Xor => "vpxorq",
+                };
+                writeln!(self.out, "    {} {}, %zmm{}, %zmm{}", mn, bop, ra, d).unwrap();
+                self.store_def(*dst, d);
+            }
+            Inst::QCmp { dst, imm, a, b } => {
+                let ra = self.use_reg(*a, OPA);
+                let bop = self.src_operand(*b, OPB);
+                let d = self.def_reg(*dst);
+                writeln!(self.out, "    vpcmpq ${}, {}, %zmm{}, %k1", imm, bop, ra).unwrap();
+                writeln!(self.out, "    vpmovm2q %k1, %zmm{}", d).unwrap();
+                self.store_def(*dst, d);
             }
         }
     }
@@ -2046,7 +2288,7 @@ fn drop_redundant_reloads(body: &str) -> String {
 /// `$zero` for the zeroing idiom.
 fn constant_key(mn: &str, ops: &str, a: &str) -> Option<String> {
     match mn {
-        "vpbroadcastd" if a.ends_with("(%rip)") => Some(a.to_string()),
+        "vpbroadcastd" | "vpbroadcastq" if a.ends_with("(%rip)") => Some(a.to_string()),
         "vpxord" => {
             let mut it = ops.split(", ");
             let first = it.next()?;
@@ -2056,13 +2298,45 @@ fn constant_key(mn: &str, ops: &str, a: &str) -> Option<String> {
     }
 }
 
+/// An arithmetic the kernels compile: its lowering of a graph to the shared
+/// instruction stream (`compile_with`).
+pub trait AsmArith: GraphArith {
+    fn compile_kernel(g: &Graph<Self>, roots: &[NodeId], sym: &str, cell_reprs: &HashMap<u32, CellRepr>, opts: super::AsmOptions) -> Result<Compiled>;
+}
+
+impl AsmArith for Fixed {
+    fn compile_kernel(g: &Graph<Fixed>, roots: &[NodeId], sym: &str, cell_reprs: &HashMap<u32, CellRepr>, opts: super::AsmOptions) -> Result<Compiled> {
+        compile_with(g, roots, sym, cell_reprs, opts, false, |lo, id| lo.lower_node(id))
+    }
+}
+
+impl AsmArith for Float {
+    fn compile_kernel(g: &Graph<Float>, roots: &[NodeId], sym: &str, cell_reprs: &HashMap<u32, CellRepr>, opts: super::AsmOptions) -> Result<Compiled> {
+        compile_with(g, roots, sym, cell_reprs, opts, true, |lo, id| lo.lower_node_f64(id))
+    }
+}
+
 /// Compile `roots` of `g` into AVX-512 assembly, with the buffer layouts.
-pub fn compile(
-    g: &Graph,
+pub fn compile<A: AsmArith>(
+    g: &Graph<A>,
     roots: &[NodeId],
     sym: &str,
     cell_reprs: &HashMap<u32, CellRepr>,
     opts: super::AsmOptions,
+) -> Result<Compiled> {
+    A::compile_kernel(g, roots, sym, cell_reprs, opts)
+}
+
+/// `compile` with the arithmetic's lowering (`lower`, one node) and lane
+/// layout (`halves`: 8 lanes a body, run twice; `Compiled::halves`).
+fn compile_with<A: GraphArith>(
+    g: &Graph<A>,
+    roots: &[NodeId],
+    sym: &str,
+    cell_reprs: &HashMap<u32, CellRepr>,
+    opts: super::AsmOptions,
+    halves: bool,
+    mut lower: impl FnMut(&mut Lower<'_, A>, NodeId) -> Result<()>,
 ) -> Result<Compiled> {
     let live = reachable(g, roots);
 
@@ -2105,7 +2379,7 @@ pub fn compile(
     let mix = opts.mix;
     let mut prov_node: Vec<NodeId> = Vec::new();
     for id in order {
-        lo.lower_node(id)?;
+        lower(&mut lo, id)?;
         if mix {
             prov_node.resize(lo.insts.len(), id);
         }
@@ -2164,8 +2438,13 @@ pub fn compile(
             Some(Value::Bool(b)) => {
                 let val = lo.mask_reg(b[0]);
                 let known = lo.mask_reg(b[1]);
-                lo.insts.push(Inst::StoreMask { off: base, src: val });
-                lo.insts.push(Inst::StoreMask { off: base + 2, src: known });
+                if halves {
+                    lo.insts.push(Inst::StoreMask8 { off: base, src: val });
+                    lo.insts.push(Inst::StoreMask8 { off: base + 2, src: known });
+                } else {
+                    lo.insts.push(Inst::StoreMask { off: base, src: val });
+                    lo.insts.push(Inst::StoreMask { off: base + 2, src: known });
+                }
                 RootKind::Bool
             }
             None => bail!("root {} was never lowered", r),
@@ -2197,7 +2476,7 @@ pub fn compile(
             def_of[d as usize] = i as u32;
             // A load (reads `%r13`) and a constant are rematerializable;
             // nothing else is.
-            remat[d as usize] = matches!(inst, Inst::Load { .. } | Inst::BcastD { .. });
+            remat[d as usize] = matches!(inst, Inst::Load { .. } | Inst::BcastD { .. } | Inst::BcastQ { .. });
         }
     }
 
@@ -2247,6 +2526,12 @@ pub fn compile(
     writeln!(asm, ".globl {sym}").unwrap();
     writeln!(asm, "{sym}:").unwrap();
     // Three pushes 16-align rsp (entry is 8 mod 16); the frame is a 64-multiple.
+    // The halves' loop counter is `%r12`, pushed with `%rbx` (five pushes,
+    // aligned too); both are callee-saved, so the call-outs keep them.
+    if halves {
+        writeln!(asm, "    push %rbx").unwrap();
+        writeln!(asm, "    push %r12").unwrap();
+    }
     writeln!(asm, "    push %r13").unwrap();
     writeln!(asm, "    push %r14").unwrap();
     writeln!(asm, "    push %r15").unwrap();
@@ -2257,9 +2542,20 @@ pub fn compile(
         writeln!(asm, "    sub ${}, %rsp", frame).unwrap();
     }
     writeln!(asm, "    vpxorq %zmm{Z}, %zmm{Z}, %zmm{Z}", Z = ZERO).unwrap();
+    if halves {
+        // Lanes 0..8, then lanes 8..16 one input and one output buffer on.
+        writeln!(asm, "    movl $2, %r12d").unwrap();
+        writeln!(asm, ".Lhalf:").unwrap();
+    }
     asm.push_str(&body);
     if mix {
         writeln!(asm, "#@end").unwrap();
+    }
+    if halves {
+        writeln!(asm, "    addq ${}, %r13", input_bytes).unwrap();
+        writeln!(asm, "    addq ${}, %r14", out_bytes).unwrap();
+        writeln!(asm, "    decl %r12d").unwrap();
+        writeln!(asm, "    jnz .Lhalf").unwrap();
     }
     if frame > 0 {
         writeln!(asm, "    add ${}, %rsp", frame).unwrap();
@@ -2267,6 +2563,10 @@ pub fn compile(
     writeln!(asm, "    pop %r15").unwrap();
     writeln!(asm, "    pop %r14").unwrap();
     writeln!(asm, "    pop %r13").unwrap();
+    if halves {
+        writeln!(asm, "    pop %r12").unwrap();
+        writeln!(asm, "    pop %rbx").unwrap();
+    }
     writeln!(asm, "    vzeroupper").unwrap();
     writeln!(asm, "    ret").unwrap();
 
@@ -2275,6 +2575,12 @@ pub fn compile(
     writeln!(asm, ".align 64").unwrap();
     for (i, v) in em.pool.d.iter().enumerate() {
         writeln!(asm, ".LCd{i}: .long {}", *v as u32).unwrap();
+    }
+    if !em.pool.q.is_empty() {
+        writeln!(asm, ".align 8").unwrap();
+        for (i, v) in em.pool.q.iter().enumerate() {
+            writeln!(asm, ".LCq{i}: .quad {:#018x}", v).unwrap();
+        }
     }
 
     Ok(Compiled {
@@ -2292,6 +2598,7 @@ pub fn compile(
         frame_bytes: frame,
         prov,
         foldable,
+        halves,
     })
 }
 
@@ -2324,6 +2631,8 @@ fn foldable(insts: &[Inst], n_vregs: Vreg) -> Vec<bool> {
         match s {
             Src::Reg(v) => res(kn, *v),
             Src::BI32(c) => Known::Const(*c),
+            // Only the doubles' instructions read one, and they are opaque here.
+            Src::BQ(_) => Known::Opaque,
         }
     };
     for inst in insts {
@@ -2435,7 +2744,7 @@ fn foldable(insts: &[Inst], n_vregs: Vreg) -> Vec<bool> {
         }
     };
     for (i, inst) in insts.iter().enumerate() {
-        if matches!(inst, Inst::Store { .. } | Inst::StoreMask { .. } | Inst::Call { .. }) {
+        if matches!(inst, Inst::Store { .. } | Inst::StoreMask { .. } | Inst::StoreMask8 { .. } | Inst::Call { .. }) {
             needed[i] = true;
             stack.push(i as u32);
         }
@@ -2482,5 +2791,16 @@ fn inst_kind(inst: &Inst) -> &'static str {
         Inst::Call { .. } => "call",
         Inst::Store { .. } => "store",
         Inst::StoreMask { .. } => "storemask",
+        Inst::BcastQ { .. } => "bcastq",
+        Inst::LoadMask8 { .. } => "loadmask8",
+        Inst::FBin { op: FOp::Add, .. } => "fadd",
+        Inst::FBin { op: FOp::Sub, .. } => "fsub",
+        Inst::FBin { op: FOp::Mul, .. } => "fmul",
+        Inst::FBin { op: FOp::Div, .. } => "fdiv",
+        Inst::FRnd { .. } => "floor",
+        Inst::FCmp { .. } => "fcmp",
+        Inst::QBin { .. } => "qbin",
+        Inst::QCmp { .. } => "qcmp",
+        Inst::StoreMask8 { .. } => "storemask8",
     }
 }

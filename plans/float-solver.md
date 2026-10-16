@@ -1184,3 +1184,36 @@ agree bit for bit (413,248 field comparisons), 192 decline (the unrolled
 fall, as in 16.16), every outcome claimed. The round fork has its own:
 `a_round_fork_resolves_to_the_reference_fragments` (each configuration's
 fragment and validity against `round_fragment`, around the cut below 1).
+
+### Milestone 5, step 2: the float codegen (built)
+
+`transpile::asm` takes the arithmetic (`AsmArith`): 16.16 lowers as before
+(the boolean layer, selects and interval ends now shared,
+`Lower::lower_common`; t1 unchanged), the doubles in
+`asm/codegen/float.rs`:
+
+- Eight `f64` lanes a zmm. The body runs twice per call (`Compiled::halves`:
+  lanes 8..16 one input and one output buffer on, `%r12` counting), so the
+  runtime keeps its 16-lane slices; buffers keep 16.16's sizes (64 bytes a
+  number, 128 an interval), a boolean an 8-bit mask a half.
+- Each operation the reference's, bit for bit: IEEE `vaddpd`..`vdivpd`;
+  `flr` as `vrndscalepd $9`; `%` as `a - flr(a / b) * b`, three rounded
+  ops; `min`/`max` a compare and a blend (the second argument on a tie);
+  negation and `abs` on the sign bit; interval products and quotients the
+  least and most corner in the total order; the floor and round forks'
+  fragments `floor_fragment`'s and `round_fragment`'s formulas step by step,
+  `round_cut`'s four moves included (`RSplitOk` also requires every cut a
+  fragment reads to settle, else the reference raises); `sin` a per-lane
+  call-out to `LuaF64::lua_sin`; the collision look-ups call-outs on whole
+  numbers.
+- Own errors: a result is finite (`|x| <= MAX`), a quotient's divisor
+  excludes zero.
+- No fused multiply-add: none is emitted, gcc only assembles
+  (`-x assembler`), and `jit::assemble` refuses a text holding one
+  (`vfm*`, `vfnm*`) or an MXCSR write.
+- `asm::check_mxcsr`: round-to-nearest, FTZ and DAZ off, exceptions masked
+  (`0x1f80`), checked at every float kernel call.
+- `asm::tests_float`: every operation against `LuaF64`/`LuaF64Interval`
+  over zeros of both signs, subnormals, ties, the cut below 1, overflow;
+  points and intervals. Mutations (a tie to the first argument, `f64::min`'s
+  corner tie, no cut moves) each fail a test.

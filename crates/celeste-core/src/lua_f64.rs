@@ -297,11 +297,14 @@ impl LuaF64Interval {
         Self { lo: self.hi.neg(), hi: self.lo.neg() }
     }
 
+    /// `math.abs` over the interval: each end's `abs` where the interval
+    /// keeps one sign (so a point's is `LuaF64::abs`, `-0` giving `0`, as
+    /// LuaJIT's), else `[0, max(|lo|, hi)]`.
     pub fn abs(self) -> Self {
         if self.lo.0 >= 0.0 {
-            self
+            Self { lo: self.lo.abs(), hi: self.hi.abs() }
         } else if self.hi.0 <= 0.0 {
-            self.neg()
+            Self { lo: self.hi.abs(), hi: self.lo.abs() }
         } else {
             Self { lo: LuaF64(0.0), hi: self.lo.abs().lua_max(self.hi) }
         }
@@ -456,6 +459,20 @@ mod tests {
         // Points are the IEEE result itself.
         let p = i(-3.0, -3.0).checked_mul(i(0.0, 0.0)).unwrap();
         assert_eq!(p.as_point().map(|v| v.0.to_bits()), Some((-0.0f64).to_bits()));
+    }
+
+    /// An interval's `abs` of a point is the point's (`math.abs(-0)` is
+    /// `0`), and a `-0` end becomes `0`.
+    #[test]
+    fn abs_of_a_point_is_math_abs() {
+        for v in [-0.0, 0.0, -1.5, 2.25, -f64::MIN_POSITIVE / 4.0, f64::MIN_POSITIVE / 4.0] {
+            let p = LuaF64Interval::point(n(v)).abs();
+            assert_eq!((p.lo.0.to_bits(), p.hi.0.to_bits()), (v.abs().to_bits(), v.abs().to_bits()), "{v}");
+        }
+        let i = LuaF64Interval::new(n(-0.0), n(5.0)).abs();
+        assert_eq!((i.lo.0.to_bits(), i.hi.0), (0.0f64.to_bits(), 5.0));
+        let i = LuaF64Interval::new(n(-3.0), n(-0.0)).abs();
+        assert_eq!((i.lo.0.to_bits(), i.hi.0), (0.0f64.to_bits(), 3.0));
     }
 
     /// The round split's cuts are where `flr(x + 1/2)` really changes:
