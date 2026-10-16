@@ -809,7 +809,7 @@ pub fn export(checkpoint_dir: &Path, out: &Path, threads: usize, arc: Option<&Pa
     let room = res.room;
     let last = res.levels.last().with_context(|| format!("{}: the search recorded no level ({:?})", checkpoint_dir.display(), res.verdict))?;
     // `h` counts search steps (the trees' frames).
-    let h = res.horizon * res.steps_per_frame;
+    let h = crate::settings::Clock { per_frame: res.steps_per_frame }.steps(res.horizon);
     let tree_dir = |level: usize| checkpoint_dir.join(&res.levels[level].dir);
     let mut levels = Vec::new();
     for (i, l) in res.levels.iter().enumerate() {

@@ -66,7 +66,7 @@ pub fn run(spec: &SearchSpec) -> Result<SearchResult> {
         level: spec.level.to_string(),
         horizon: spec.horizon,
         ceiling: spec.ceiling,
-        steps_per_frame: s.steps_per_frame(),
+        steps_per_frame: s.clock().per_frame,
         levels: Vec::new(),
         verdict: Verdict::BoundOnly,
         optimal: None,
@@ -117,7 +117,7 @@ fn single<N: KernelLanes>(spec: &SearchSpec, levels: &[Level], res: &mut SearchR
         return Ok(Verdict::LevelMinusOneRefused);
     }
     let finish = if spec.bound_only { Finish::Bound } else { Finish::Concrete };
-    let solved = match run_levels::<N>(s, spec.horizon * s.steps_per_frame(), levels, spec.dir, "", finish, spec.save_marks, spec.prefer, res)? {
+    let solved = match run_levels::<N>(s, s.clock().steps(spec.horizon), levels, spec.dir, "", finish, spec.save_marks, spec.prefer, res)? {
         None => return Ok(Verdict::Refuted),
         Some(solved) => solved,
     };
@@ -160,7 +160,7 @@ fn witness(dir: &Path, res: &mut SearchResult, w: &Witness, header: &str) -> Res
 fn dual(spec: &SearchSpec, float: &Settings, levels: &[Level], res: &mut SearchResult) -> Result<Verdict> {
     let cfg = spec.settings;
     let room = format!("{},{}", cfg.room.0, cfg.room.1);
-    let (horizon, steps) = (spec.horizon, spec.horizon * cfg.steps_per_frame());
+    let (horizon, steps) = (spec.horizon, cfg.clock().steps(spec.horizon));
     eprintln!("[dual] room {room}, levels {}, horizon {horizon}; the fixed half real play, the float half {}", spec.level, float.arith);
     if !tables(&[cfg, float], res) {
         return Ok(Verdict::LevelMinusOneRefused);
@@ -241,7 +241,7 @@ fn run_levels<N: KernelLanes>(
         // horizon and level -1, else built again (it is the cheap one).
         let t = std::time::Instant::now();
         let want = cfg.minus_one();
-        let filter = prev.as_ref().map(|(m, l)| MarkFilter::new(m, *l, cfg.steps_per_frame()));
+        let filter = prev.as_ref().map(|(m, l)| MarkFilter::new(m, *l, cfg.clock()));
         if let Some((m, _)) = &prev {
             let key = format!("steps {steps} level-1 {want:?} marks {} {:016x}\n", m.len(), m.filter_fingerprint());
             let key_path = dir.join("filtered_for.txt");
@@ -353,9 +353,9 @@ pub fn solve<N: crate::compiled::KernelLanes>(
     let start = w.index(seeds.start);
     let p0 = start_point::<N>();
     let arc_steps = optimum(&w, start, p0, horizon);
-    // In frames: a win at step s is during frame ceil(s / spf) (a lower
+    // In frames: a win at step s is during the frame it completes (a lower
     // bound still: a frame's win is a win at its last step at the latest).
-    let arc = arc_steps.map(|k| k.div_ceil(s.steps_per_frame()));
+    let arc = arc_steps.map(|k| s.clock().frame_of(k));
     eprintln!("[arc] backward {tb:.2} s; optimum {arc_steps:?} (steps)");
     // Fingerprints over CONTENT (`exact::ContentHash`): independent of the
     // order the tree's dictionaries grew in (a raise). A node is its state:
@@ -439,10 +439,10 @@ pub fn solve<N: crate::compiled::KernelLanes>(
         (Some(route), Some(side)) => {
             let minus_one = crate::frame::TreeFilter::of_tree(dir, s)?;
             // The hull forward's claim keys every step's state: whole frames only.
-            if route.hulls && s.steps_per_frame() != 1 {
+            if route.hulls && s.split_frame {
                 eprintln!("[known] the hull forward's claim is checked on whole frames only: not under --split-frame");
             }
-            let hulls = (route.hulls && s.steps_per_frame() == 1).then(|| super::known::Hulls::open(dir, horizon, s)).transpose()?;
+            let hulls = (route.hulls && !s.split_frame).then(|| super::known::Hulls::open(dir, horizon, s)).transpose()?;
             let p = super::known::Pruning { side, horizon, start, reached: arc_marks.as_ref(), minus_one, dir, hulls: hulls.as_ref() };
             super::known::check(route, &p)?
         }
@@ -497,9 +497,9 @@ fn check_known_in<N: KernelLanes>(trees: &[(std::path::PathBuf, Settings, Level)
     let mut prev: Option<(Visited<N>, Level)> = None;
     for (li, (dir, cfg, lvl)) in trees.iter().enumerate() {
         let (last, lvl) = (li + 1 == trees.len(), *lvl);
-        let steps = horizon * cfg.steps_per_frame();
+        let steps = cfg.clock().steps(horizon);
         anyhow::ensure!(crate::frame::tree_first_win_through::<N>(dir, steps)?.is_some(), "{}: no tree through step {steps} (run the search first)", dir.display());
-        let filter = prev.as_ref().map(|(m, l)| MarkFilter::new(m, *l, cfg.steps_per_frame()));
+        let filter = prev.as_ref().map(|(m, l)| MarkFilter::new(m, *l, cfg.clock()));
         let route = super::known::Route { inputs, filter: filter.as_ref(), hulls: true };
         let s = solve::<N>(dir, lvl, steps, false, false, !last, None, None, Some(&route), cfg)?;
         let f = s.known.ok_or_else(|| anyhow::anyhow!("the known route does not exit by f{horizon}: nothing to check"))?;

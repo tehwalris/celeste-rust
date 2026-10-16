@@ -15,7 +15,7 @@
 //! * the ladder's filter admits it (`MarkFilter::allowed`, every step past
 //!   the start: mid-frame steps pass by construction, the boundaries are
 //!   filtered);
-//! * at a frame boundary (`s` a multiple of `steps_per_frame`, where a
+//! * at a frame boundary (`Clock::boundary`: where a
 //!   concrete state keys exactly as the tree's rows; mid-frame rows carry the
 //!   split frame's cut widening, which `Rt2::widen_to` does not): its
 //!   projection is a node of `W`'s support (in the tree AND with a winning
@@ -108,12 +108,13 @@ struct Run<N: EngineNum> {
 }
 
 fn run<N: Rem>(inputs: &[u8], horizon: u32, settings: &crate::settings::Settings) -> anyhow::Result<(Run<N>, bool)> {
-    let spf = settings.steps_per_frame();
+    let clock = settings.clock();
     let (mut engines, seeded) = concrete_engines::<N>(1, settings)?;
     let eng = &mut engines[0];
     let mut layers: Vec<Vec<(u32, Block<N>)>> = vec![vec![(0, Block::canonical(eng.initial()?)?)]];
     for s in 0..horizon {
-        let Some(&byte) = inputs.get((s / spf) as usize) else { break };
+        // The step to `s + 1` is in frame `frame_of(s + 1)`: its input.
+        let Some(&byte) = inputs.get(clock.frame_of(s + 1) as usize - 1) else { break };
         let (mut next, mut seen, mut won) = (Vec::new(), rustc_hash::FxHashSet::default(), Vec::new());
         for (p, (_, b)) in layers.last().expect("the start").iter().enumerate() {
             for c in eng.step(b.rt2(), byte)? {
@@ -140,13 +141,13 @@ fn run<N: Rem>(inputs: &[u8], horizon: u32, settings: &crate::settings::Settings
 /// `f` and survives everything; an error: it is PRUNED (the report printed).
 pub(super) fn check<N: KernelLanes>(route: &Route<N>, p: &Pruning<N>) -> anyhow::Result<Option<u32>> {
     let t0 = std::time::Instant::now();
-    let spf = p.side.s.steps_per_frame();
+    let clock = p.side.s.clock();
     let (run, seeded) = run::<N>(route.inputs, p.horizon, p.side.s)?;
     let Some((exit, winners)) = &run.exit else {
-        eprintln!("[known] the known route does not exit by f{} ({} inputs): not checked", p.horizon / spf, route.inputs.len());
+        eprintln!("[known] the known route does not exit by f{} ({} inputs): not checked", clock.frame_of(p.horizon), route.inputs.len());
         return Ok(None);
     };
-    let frame = exit.div_ceil(spf);
+    let frame = clock.frame_of(*exit);
     let l1 = p.minus_one.map(|m| (m.h, m.table(p.side.s)));
     // Per step and state: the first check it fails (`None`: it passes), and
     // where the tree holds it (with `hulls`: its state and remainder).
@@ -215,13 +216,14 @@ pub(super) fn check<N: KernelLanes>(route: &Route<N>, p: &Pruning<N>) -> anyhow:
             None => ((0..=last).find(|&s| miss(s).is_some()).expect("a pruned lineage fails somewhere"), "is dropped by the arc phase"),
         };
         first = first.min(s as u32);
-        eprintln!("[known] PRUNED at level {}: the known route (exit f{frame}) {what} at step {s} ({}):", p.side.level, at_frame(s as u32, spf));
-        for t in s.saturating_sub(spf as usize)..=(s + spf as usize).min(last) {
+        eprintln!("[known] PRUNED at level {}: the known route (exit f{frame}) {what} at step {s} ({}):", p.side.level, clock.show(s as u32));
+        let per_frame = clock.per_frame as usize;
+        for t in s.saturating_sub(per_frame)..=(s + per_frame).min(last) {
             let (_, b) = &run.layers[t][idx[t]];
             let (x, y) = rem_of::<N>(b.rt2())?;
             eprintln!(
                 "[known]   step {t} ({}): {}\n[known]     state {} (remainder point ({x:?}, {y:?}))",
-                at_frame(t as u32, spf),
+                clock.show(t as u32),
                 miss(t).map_or("passes", |m| m.what.as_str()),
                 crate::search::inspect::player_summary(b.rt2(), 0)
             );
@@ -236,7 +238,7 @@ pub(super) fn check<N: KernelLanes>(route: &Route<N>, p: &Pruning<N>) -> anyhow:
     anyhow::bail!(
         "the known route (exit f{frame}) is PRUNED at level {} by step {first} ({}): a real winner the search drops - the [known] report above names the check",
         p.side.level,
-        at_frame(first, spf)
+        clock.show(first)
     )
 }
 
@@ -248,8 +250,8 @@ pub(super) fn check<N: KernelLanes>(route: &Route<N>, p: &Pruning<N>) -> anyhow:
 /// in the kernels), and the successors closest to it.
 fn explain<N: KernelLanes>(run: &Run<N>, idx: &[usize], s: usize, seeded: bool, p: &Pruning<N>) -> anyhow::Result<Vec<String>> {
     use crate::search::inspect::{brief, project_onto, Proj};
-    let spf = p.side.s.steps_per_frame() as usize;
-    let s0 = s.checked_sub(spf).ok_or_else(|| anyhow::anyhow!("the start is the tree's"))?;
+    let per_frame = p.side.s.clock().per_frame as usize;
+    let s0 = s.checked_sub(per_frame).ok_or_else(|| anyhow::anyhow!("the start is the tree's"))?;
     let tree = crate::storage::layer::Tree::<N>::open(p.dir, s as u32)?;
     let (sk, layer) = if s0 == 0 {
         (tree.layer(0, None, 1)?.0.states_iter().next().ok_or_else(|| anyhow::anyhow!("no frame-0 state"))?, 0)
@@ -260,7 +262,7 @@ fn explain<N: KernelLanes>(run: &Run<N>, idx: &[usize], s: usize, seeded: bool, 
     };
     let kernels = crate::compiled::Kernels::<N>::new(p.side.s, p.side.level)?;
     let mut blocks = vec![Block::from_rt2(tree.row(layer, sk, p.side.s.room)?)];
-    for k in 0..spf {
+    for k in 0..per_frame {
         blocks = crate::storage::wave::one_frame(&kernels, blocks, layer + 1 + k as u32)?.next;
     }
     let kset: std::collections::BTreeSet<Proj> = blocks.into_iter().flat_map(|b| project_onto(&mut b.into_rt2(), p.side.level)).collect();
@@ -284,15 +286,6 @@ fn explain<N: KernelLanes>(run: &Run<N>, idx: &[usize], s: usize, seeded: bool, 
         out.push(format!("  a kernel successor at distance {}: {}", dist(k), diff.join("; ")));
     }
     Ok(out)
-}
-
-/// A step as the frame it belongs to.
-fn at_frame(s: u32, spf: u32) -> String {
-    if s % spf == 0 {
-        format!("frame {}", s / spf)
-    } else {
-        format!("mid-frame {}", s / spf + 1)
-    }
 }
 
 /// A failed check: the report's line, and whether the FORWARD lost the
@@ -411,7 +404,7 @@ fn verdict<N: Rem>(b: &Block<N>, s: u32, from: Option<Held<N>>, seeded: bool, l1
             Err(m) => return Ok((Some(m), None)),
         }
     }
-    if s % p.side.s.steps_per_frame() != 0 {
+    if !p.side.s.clock().boundary(s) {
         return Ok((None, held));
     }
     let Some(i) = (if s == 0 { p.start } else { p.side.node.get(shape, key, cell) }) else {

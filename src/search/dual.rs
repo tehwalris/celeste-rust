@@ -196,15 +196,15 @@ impl DualWitness {
 pub fn search<X: Rem, F: Rem>(fixed: &Half<X>, float: &Half<F>, bound: u32, prefer: Option<&[u8]>) -> Result<Option<DualWitness>> {
     let horizon = fixed.arcs.horizon;
     ensure!(float.arcs.horizon == horizon, "the halves' horizons differ ({horizon} and {} steps)", float.arcs.horizon);
-    let spf = fixed.settings.steps_per_frame();
-    ensure!(float.settings.steps_per_frame() == spf, "the halves step frames differently");
-    ensure!(horizon % spf == 0, "the horizon {horizon} is not a whole number of frames ({spf} steps each)");
+    let clock = fixed.settings.clock();
+    ensure!(float.settings.clock() == clock, "the halves step frames differently");
+    ensure!(clock.boundary(horizon), "the horizon {horizon} is not a whole number of frames ({} steps each)", clock.per_frame);
     fn side<'a, N: Rem>(h: &Half<'a, N>) -> Result<Side<'a, N>> {
         Ok(Side { w: &h.arcs.w, node: NodeKeys::new(&h.arcs.w, &h.arcs.shapes)?, keys: &h.arcs.space, level: h.arcs.level, s: h.settings, seeded: h.settings.concrete().1 })
     }
     let workers = fixed.settings.threads().max(1);
     eprintln!("[dual] W {} fixed and {} float nodes; {workers} workers; the bound f{bound}", fixed.arcs.w.len(), float.arcs.w.len());
-    let Some(path) = super::concrete::search(&Pairs { sx: side(fixed)?, sf: side(float)? }, horizon / spf, bound, spf, prefer, workers)? else { return Ok(None) };
+    let Some(path) = super::concrete::search(&Pairs { sx: side(fixed)?, sf: side(float)? }, clock.frame_of(horizon), bound, clock, prefer, workers)? else { return Ok(None) };
     // Real play leaves at the first edge that says so (one does at most).
     let fixed_exit = path.labels.iter().position(|&w| w).ok_or_else(|| anyhow!("a dual win whose fixed half never exited"))? as u32;
     Ok(Some(DualWitness { inputs: path.inputs, fixed_exit }))

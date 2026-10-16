@@ -422,7 +422,7 @@ pub fn run_wave<N: Rem>(engine: &dyn FrameStep<N>, front: Frontier<N>, cx: WaveC
     let WaveCtx { visited, xfers, pos, filters, frame, edges_dir, outs, skeletons, ceiling } = cx;
     // A platforms-unknown level knows only `PLATFORM_WORLD_FRAMES` worlds.
     let (level, s) = (engine.level(), &engine.settings());
-    let game_frame = frame.div_ceil(s.steps_per_frame());
+    let game_frame = s.clock().frame_of(frame);
     ensure!(
         !level.platforms || game_frame as usize <= crate::trace::walk::PLATFORM_WORLD_FRAMES,
         "frame {frame} at {level}: the platform worlds cover {} frames",

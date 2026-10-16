@@ -51,6 +51,11 @@ from the tree's record instead, and refuses them on its command line.
 environment variables are refused. Run everything under ./safe-run.sh (a
 memory cap).
 
+UNITS: a game frame is one search step, or two under --split-frame. The
+search's horizon (search/dual --to, --ceiling) and its results count FRAMES;
+a tree counts STEPS - forward --to, --level-minus-one's H, and the tree
+commands' --to and --frame (`settings::Clock`).
+
 Checking a change: ./check.sh t0|t1|t2|big (plans/devloop.md).";
 
 /// `rewrite --help`'s examples.
@@ -186,11 +191,12 @@ impl Command {
 
 #[derive(clap::Args)]
 pub struct SearchArgs {
-    /// The horizon: every frame up to it is searched.
+    /// The horizon in FRAMES (also under --split-frame): every frame up to
+    /// it is searched.
     #[arg(long)]
     to: Option<u32>,
-    /// A KNOWN solution's frame (a replayed TAS) as the horizon: a
-    /// refutation, or no concrete witness by it, is an error.
+    /// A KNOWN solution's frame (a replayed TAS) as the horizon, in FRAMES:
+    /// a refutation, or no concrete witness by it, is an error.
     #[arg(long)]
     ceiling: Option<u32>,
     /// The levels (`Level::parse`), comma-separated, coarsest first:
@@ -226,9 +232,10 @@ pub struct SearchArgs {
 
 #[derive(clap::Args)]
 pub struct DualArgs {
+    /// The horizon in FRAMES (as `search --to`).
     #[arg(long)]
     to: Option<u32>,
-    /// A KNOWN dual run's frame: a refutation, or no dual witness by it, is an error.
+    /// A KNOWN dual run's frame (FRAMES): a refutation, or no dual witness by it, is an error.
     #[arg(long)]
     ceiling: Option<u32>,
     #[arg(long, default_value = "r0sx")]
@@ -256,7 +263,8 @@ pub struct DualArgs {
 
 #[derive(clap::Args)]
 pub struct ForwardArgs {
-    /// Last frame to compute.
+    /// The last tree frame to compute, in SEARCH STEPS (2 a game frame
+    /// under --split-frame; `settings::Clock`).
     #[arg(long)]
     to: u32,
     /// The level (`Level::parse`, e.g. `r0sxhn`).

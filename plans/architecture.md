@@ -405,9 +405,15 @@ arm raise, so it is no move, exactly.
 
 **The split frame** (`--split-frame`, rooms (6,0), (6,1)): `_update` as two
 steps around the player's move; kernels shrink ~10-20x with identical
-states at frame boundaries. The tree, the arcs, the marks and level -1
-count steps; `--to`/`--ceiling` stay frames; the concrete search steps
-whole frames and looks states up at frame boundaries. The ladder filters
+states at frame boundaries. UNITS (`settings::Clock`, where every
+conversion is): STEPS are the internal unit, since a mid-frame state is a
+node of its own (the backward pulls W through it). The tree and its
+files, the edges, W, the marks, level -1's H (`--level-minus-one H,S`:
+`2C` for a horizon of C frames) and the tree commands' `--to`/`--frame`
+(`forward`, `ckhash`, `check`, `bench`, `census`) count steps. The search's
+`--to`/`--ceiling`, its bounds, witnesses and `result.json` count FRAMES;
+the concrete search steps whole frames and looks states up at frame
+boundaries. The ladder filters
 at frame boundaries only (mid-frame rows do not key as the coarser tree's:
 room (6,1) wrongly refuted 93 until `5ccf712`).
 

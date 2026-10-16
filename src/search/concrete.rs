@@ -28,7 +28,7 @@ use super::arcs::Circle;
 use super::rem::{Point, Rem};
 use crate::abstraction::Level;
 use crate::frame::{wins_of, Block};
-use crate::settings::Settings;
+use crate::settings::{Clock, Settings};
 use crate::storage::{Sk, GEOMETRY};
 use crate::engines::reference::ReferenceEngine;
 
@@ -73,11 +73,12 @@ pub(super) struct Path<L> {
 }
 
 /// THE CONCRETE SEARCH of `c` from its start: a depth-first try at `bound`
-/// (frames), then breadth-first to `frames`; W at frame `k` is step `spf *
-/// k` (a frame boundary: there a state keys exactly as a whole frame's).
+/// (frames), then breadth-first to `frames`; W at frame `k` is step
+/// `clock.steps(k)` (a frame boundary: there a state keys exactly as a
+/// whole frame's).
 /// `prefer` orders the inputs (a known route first: only WHICH optimum is
 /// found). `None`: no win by `frames`.
-pub(super) fn search<C: Concrete>(c: &C, frames: u32, bound: u32, spf: u32, prefer: Option<&[u8]>, workers: usize) -> Result<Option<Path<C::Label>>> {
+pub(super) fn search<C: Concrete>(c: &C, frames: u32, bound: u32, clock: Clock, prefer: Option<&[u8]>, workers: usize) -> Result<Option<Path<C::Label>>> {
     let name = C::NAME;
     ensure!(bound <= frames, "the bound f{bound} is past the horizon f{frames}");
     let engines: Vec<std::sync::Mutex<C::Engine>> = c.engines(workers.max(1))?.into_iter().map(std::sync::Mutex::new).collect();
@@ -95,7 +96,7 @@ pub(super) fn search<C: Concrete>(c: &C, frames: u32, bound: u32, spf: u32, pref
             eng: &'a mut C::Engine,
             from: u32,
             frames: u32,
-            spf: u32,
+            clock: Clock,
             prefer: Option<&'a [u8]>,
             /// Exhausted states by (identity, frame).
             dead: FxHashSet<(C::Key, u32)>,
@@ -113,7 +114,7 @@ pub(super) fn search<C: Concrete>(c: &C, frames: u32, bound: u32, spf: u32, pref
                 if ran.covers(byte) {
                     continue;
                 }
-                let t = cx.spf * (cx.from + k + 1);
+                let t = cx.clock.steps(cx.from + k + 1);
                 let (next, read) = cx.c.successors(cx.eng, st, byte, t, &|_| false, &mut cx.steps).map_err(|e| e.context(format!("the frame after {k} frames of the depth-first try, with input {byte}")))?;
                 ran.push(byte, read);
                 if cx.steps > cx.budget {
@@ -148,7 +149,7 @@ pub(super) fn search<C: Concrete>(c: &C, frames: u32, bound: u32, spf: u32, pref
         }
         let t = std::time::Instant::now();
         let mut eng = engines[0].lock().expect("an engine");
-        let mut cx = Dfs { c, eng: &mut eng, from: frames - bound, frames: bound, spf, prefer, dead: FxHashSet::default(), path: Vec::new(), steps: 0, budget: c.budget() };
+        let mut cx = Dfs { c, eng: &mut eng, from: frames - bound, frames: bound, clock, prefer, dead: FxHashSet::default(), path: Vec::new(), steps: 0, budget: c.budget() };
         let found = dfs(&mut cx, &start, 0)?;
         eprintln!(
             "[{name}] depth-first at the bound f{bound}: {} after {} steps, {:.1} s",
@@ -181,7 +182,7 @@ pub(super) fn search<C: Concrete>(c: &C, frames: u32, bound: u32, spf: u32, pref
     }
     for k in 0..frames {
         let t = std::time::Instant::now();
-        let t_w = spf * (k + 1);
+        let t_w = clock.steps(k + 1);
         // In chunks of 16 parents, an engine a worker (each takes a free
         // one: as many as workers), successors in chunk order.
         const CHUNK: usize = 16;
@@ -383,10 +384,10 @@ impl Witness {
 /// THE CONCRETE SEARCH of one level (`search` over `Single`): `horizon` in
 /// search steps (W's index), `bound` the arc optimum in frames.
 pub(super) fn concrete_search<N: Rem>(side: &Side<'_, N>, horizon: u32, bound: u32, prefer: Option<&[u8]>) -> Result<Option<Witness>> {
-    let (s, spf) = (side.s, side.s.steps_per_frame());
-    ensure!(horizon % spf == 0, "the horizon {horizon} is not a whole number of frames ({spf} steps each)");
+    let (s, clock) = (side.s, side.s.clock());
+    ensure!(clock.boundary(horizon), "the horizon {horizon} is not a whole number of frames ({} steps each)", clock.per_frame);
     eprintln!("[concrete] {} nodes; {} workers; the arc bound f{bound}", side.w.len(), s.threads().max(1));
-    let path = search(&Single(side), horizon / spf, bound, spf, prefer, s.threads())?;
+    let path = search(&Single(side), clock.frame_of(horizon), bound, clock, prefer, s.threads())?;
     Ok(path.map(|p| Witness { inputs: p.inputs, cells: p.labels }))
 }
 

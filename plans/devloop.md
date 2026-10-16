@@ -223,6 +223,11 @@ are never committed.
   refuses another).
 - `bench frame` writes its scratch into the fixture, so a fixture's steps
   share one lane.
+- A fixture's frames are the tree's: SEARCH STEPS (two a game frame under
+  `--split-frame`, as r60s's "to step 71"; `settings::Clock`, plans/
+  architecture.md "The split frame"). So are `forward --to`, the tree
+  commands' `--to`/`--frame` and level -1's H; `search --to`/`--ceiling`
+  count frames.
 
 | fixture | what | build |
 |---|---|---|

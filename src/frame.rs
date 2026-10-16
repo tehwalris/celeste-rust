@@ -444,13 +444,13 @@ pub(crate) fn cell_too_late(cell: u32, frame: u32, h: u32, px: i32) -> bool {
 pub struct MarkFilter<'a, N: EngineNum = P8> {
     marked: &'a Visited<N>,
     coarser: crate::abstraction::Level,
-    /// Search steps per frame (`Settings::steps_per_frame`).
-    spf: u32,
+    /// Frames and steps (`settings::Clock`).
+    clock: crate::settings::Clock,
 }
 
 impl<'a, N: EngineNum> MarkFilter<'a, N> {
-    pub fn new(marked: &'a Visited<N>, coarser: crate::abstraction::Level, spf: u32) -> Self {
-        MarkFilter { marked, coarser, spf }
+    pub fn new(marked: &'a Visited<N>, coarser: crate::abstraction::Level, clock: crate::settings::Clock) -> Self {
+        MarkFilter { marked, coarser, clock }
     }
 
     /// Per lane of `rt2` (rows of frame `frame`): admitted? Under the split
@@ -462,7 +462,7 @@ impl<'a, N: EngineNum> MarkFilter<'a, N> {
     /// nodiag `r0sxhn,r0sxh` REFUTED 93, which the community TAS reaches.
     /// The next boundary filters its successors.
     pub fn allowed(&self, rt2: &Rt2<N>, frame: u32) -> Result<Vec<bool>> {
-        if frame % self.spf != 0 {
+        if !self.clock.boundary(frame) {
             return Ok(vec![true; rt2.width]);
         }
         Ok(self.deadlines(rt2)?.into_iter().map(|d| d.is_some_and(|d| u32::from(d) >= frame)).collect())
@@ -1593,12 +1593,12 @@ mod tests {
         let (shape, keys, cells) = widened_keys(&block, coarse, &space).expect("keys");
         let mut marked = Visited::new(space.clone());
         marked.insert_until(shape, keys[0].expect("keyed"), cells[0], 5);
-        let f = MarkFilter::new(&marked, coarse, 1);
+        let f = MarkFilter::new(&marked, coarse, crate::settings::Clock { per_frame: 1 });
         assert_eq!(f.allowed(block.rt2(), 5).expect("filter"), vec![true], "at the deadline");
         assert_eq!(f.allowed(block.rt2(), 6).expect("filter"), vec![false], "past it");
-        assert_eq!(MarkFilter::new(&Visited::new(Default::default()), coarse, 1).allowed(block.rt2(), 0).expect("filter"), vec![false], "a key space without its codes");
+        assert_eq!(MarkFilter::new(&Visited::new(Default::default()), coarse, crate::settings::Clock { per_frame: 1 }).allowed(block.rt2(), 0).expect("filter"), vec![false], "a key space without its codes");
         let empty = Visited::new(space);
-        assert_eq!(MarkFilter::new(&empty, coarse, 1).allowed(block.rt2(), 0).expect("filter"), vec![false], "not marked");
+        assert_eq!(MarkFilter::new(&empty, coarse, crate::settings::Clock { per_frame: 1 }).allowed(block.rt2(), 0).expect("filter"), vec![false], "not marked");
     }
 
 

@@ -97,7 +97,7 @@ pub struct Settings {
     /// configuration: a tree under it is another search), or `none`.
     #[arg(long, global = true, default_value = "none", value_parser = parse_win_at)]
     pub win_at: std::option::Option<(i16, i16, i16, i16)>,
-    /// Two search steps a frame (the split cart).
+    /// Two search steps a frame (the split cart, `Clock`).
     #[arg(long, global = true)]
     pub split_frame: bool,
     /// The kernels' region grid "px,S" (px a multiple of 8, 1 <= S <= 7),
@@ -125,8 +125,10 @@ pub struct Settings {
     #[arg(long, global = true, default_value = "none", value_parser = parse_seeds)]
     pub balloon_seeds: std::option::Option<String>,
     // NOT recorded.
-    /// The level -1 filter "H,S": H in search steps, S the table's speed
-    /// bound (the tree records it as `frame::TreeFilter`).
+    /// The level -1 filter "H,S": H in SEARCH STEPS (2 a game frame under
+    /// --split-frame, where the search's --to/--ceiling count frames;
+    /// `Clock`), S the table's speed bound (the tree records it as
+    /// `frame::TreeFilter`).
     #[arg(long, global = true, value_parser = parse_minus_one)]
     pub level_minus_one: Option<(u32, i32)>,
     /// The balloons' phases of the concrete phase only (a tasdatabase file's
@@ -300,15 +302,9 @@ impl Settings {
         self.threads.unwrap_or_else(|| (std::thread::available_parallelism().map(|n| n.get()).unwrap_or(2) / 2).max(1))
     }
 
-    /// Search steps per game frame: 2 under the split frame
-    /// (`--split-frame`: part a up to and including the player's move,
-    /// part b the rest; step `2k` is the end of frame `k`), else 1.
-    pub fn steps_per_frame(&self) -> u32 {
-        if self.split_frame {
-            2
-        } else {
-            1
-        }
+    /// The run's frames and search steps (`Clock`).
+    pub fn clock(&self) -> Clock {
+        Clock { per_frame: if self.split_frame { 2 } else { 1 } }
     }
 
     /// The room that means "won" (`game_runner::win_room` of `--room`).
@@ -658,6 +654,43 @@ pub fn startup(args: &Settings, float: bool, adjust: impl FnOnce(&mut Settings))
         eprintln!("[settings] {}", set.join(" "));
     }
     Ok(s)
+}
+
+/// FRAMES AND SEARCH STEPS (plans/architecture.md "The split frame"): a
+/// game frame is `per_frame` search steps - 2 under `--split-frame` (part a
+/// up to and including the player's move, part b the rest; step `2k` ends
+/// frame `k`), else 1. Steps are the internal unit: the tree and its
+/// files, the edges, W, the marks, level -1's `H` and the tree commands'
+/// `--to`/`--frame` count them (a mid-frame state is a node of its own).
+/// The search's horizon (`--to`, `--ceiling`), its bounds, witnesses and
+/// `result.json` count frames. Every conversion is here.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Clock {
+    pub per_frame: u32,
+}
+
+impl Clock {
+    /// `frames` frames in steps.
+    pub fn steps(self, frames: u32) -> u32 {
+        frames * self.per_frame
+    }
+    /// The frame step `step` ends or is inside (a mid-frame step's frame
+    /// is the one it completes).
+    pub fn frame_of(self, step: u32) -> u32 {
+        step.div_ceil(self.per_frame)
+    }
+    /// Does step `step` end a frame?
+    pub fn boundary(self, step: u32) -> bool {
+        step % self.per_frame == 0
+    }
+    /// Step `step` for a report: "frame F", or "mid-frame F".
+    pub fn show(self, step: u32) -> String {
+        if self.boundary(step) {
+            format!("frame {}", step / self.per_frame)
+        } else {
+            format!("mid-frame {}", self.frame_of(step))
+        }
+    }
 }
 
 #[cfg(test)]

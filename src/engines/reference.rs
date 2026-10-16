@@ -89,7 +89,7 @@ impl<A: Arithmetic> ReferenceEngine<A> {
     /// `rnd`), over the split frame's two steps where it is on.
     pub fn frame_states(&mut self, st: &State<RefDomain<A>>, byte: u8) -> Result<Vec<State<RefDomain<A>>>> {
         let mut out = vec![st.clone()];
-        for _ in 0..self.settings.steps_per_frame() {
+        for _ in 0..self.settings.clock().per_frame {
             let mut next = Vec::new();
             for st in &out {
                 let mut st = st.clone();
@@ -145,7 +145,7 @@ where
     }
 
     /// One whole GAME frame: `step` once, or under the split frame
-    /// (`Settings::steps_per_frame`) its two parts, both under `byte` (the
+    /// (`Settings::clock`) its two parts, both under `byte` (the
     /// buttons are the frame's; part a reads none). Every leaf of both.
     pub fn frame(&mut self, row: &Rt2<A::Num>, byte: u8) -> Result<Vec<Block<A::Num>>> {
         Ok(self.frame_reads(row, byte)?.0)
@@ -156,7 +156,7 @@ where
     /// has the same successors, so the concrete search runs one of them.
     pub fn frame_reads(&mut self, row: &Rt2<A::Num>, byte: u8) -> Result<(Vec<Block<A::Num>>, u8)> {
         let (mut out, mut mask) = self.step_reads(row, byte)?;
-        for _ in 1..self.settings.steps_per_frame() {
+        for _ in 1..self.settings.clock().per_frame {
             let mut next = Vec::new();
             for b in &out {
                 let (o, m) = self.step_reads(b.rt2(), byte)?;

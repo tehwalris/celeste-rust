@@ -359,7 +359,7 @@ where
 {
     let (cfg, level): (&Settings, Level) = (&t.settings, t.level);
     anyhow::ensure!(
-        !(level.floors_near && frame % cfg.steps_per_frame() != 0),
+        !(level.floors_near && !cfg.clock().boundary(frame)),
         "step {frame} is mid split frame at a near level: the graph side keeps a floor's computed `collideable` there, the block side does not"
     );
     let ids = celeste_rust::compiled::ids();
