@@ -1,33 +1,32 @@
-# Results: every room's optimum (2026-09-13 .. 2026-10-04)
+# Results: every room's optimum
 
 Frames count from the room's load (frame 1), spawn prologue included: the
-optimum is the frame DURING which the room changes (or, at the summit, the
-player first touches the flag). The reference is the community TAS from
-`CelesteClassic/tasdatabase` (`classic/any/TAS<level+1>.tas`), replayed in the
-ORIGINAL cart on a real PICO-8 with its input 0 on the first frame the player
-exists ("offset" = the prologue length), then fitted to celeste-minimal by
-`rewrite trajectory` (`tas/room_X_Y_reference_frame_N.txt`).
+optimum is the frame DURING which the room changes (at the summit: the
+player first touches the flag). The reference is the community TAS
+(`CelesteClassic/tasdatabase`), replayed in the ORIGINAL cart on a real
+PICO-8 with its first input on the first frame the player exists ("offset"
+= the prologue length), then fitted to celeste-minimal by `rewrite
+trajectory` (`tas/room_X_Y_reference_frame_N.txt`). The database counts
+`frames = exit frame - prologue - 1` (UCT's clean save: inputs - 1); "f"
+marks a count in its terms.
 
-**Every optimum TIES its community TAS.** One corrected this project's own
-earlier claim by a frame: room (0,0)'s 94 "proven optimal" by the
-pre-rebuild ladder (`51a4d99`, 2026-08-07, `tas/room_0_0_exit_frame_94.txt`).
-Room (1,0)'s 99 is NOT an improvement on the 2022 searcher: its 0-based
-control frame 75 is 76 player updates, the same as TAS2's 76 inputs and as
-our 99 (prologue 23 + 76). `tas/room_1_0_exit_frame_100.txt` is that route
-with an idle player update on frame 24 (it assumed the player first updates
-on frame 25; under `all()` it updates on frame 24, the frame it is created).
-Replayed on PICO-8, its frames 25-100 are the 99's frames 24-99 shifted by
-one, the same integer position on every frame. A tie. Room (6,0) was first
-reported as 2 frames under TAS7; that was an offset error in the replay
-(`d1ae910`): it ties.
+Every witness here exits at its frame on a real PICO-8 (`pico8_diff/
+replay.py`), balloon rooms under the seeds named. Every result before
+2026-10-08 was searched from an IL LOAD (the room loaded alone); real play
+enters through a transition ("Real play" below).
 
-"Proven how": with `--ceiling C` the ladder confirms C through the exact
-level and REFUTES C-1 at the named level (no win by C-1 at a level that
-over-approximates the game). Where a single horizon ran, the lower bound is
-the first level whose first win equals H. Level numbers are 0-based indices
-into the ladder used. Witnesses are DFS walks through the exact level's marks
-with the reference engine (`rewrite witness`), replayed on a real PICO-8
-(`pico8_diff/replay.py`).
+## any% (2026-09-13 .. 2026-10-04)
+
+**Every optimum TIES its community TAS.** Room (0,0)'s earlier "proven" 94
+(`51a4d99`) was a frame too long. Room (1,0)'s 99 equals the 2022
+searcher's 76-update route (its "100" counted the prologue as 24:
+`tas/room_1_0_exit_frame_100.txt` is the same route a frame later). Room
+(6,0) was first reported 2 under TAS7: an offset error in the replay.
+
+"Proven how" is the precision ladder of the time (deleted 2026-10-05): with
+`--ceiling C` it confirms C at the exact level and REFUTES C-1 at the named
+level (0-based index into the ladder used); a single horizon's lower bound
+is the first level whose first win equals H. (3,3) is the first arc result.
 
 | room | name | optimum | reference | proven how | witness (`tas/`) | date | commit | key insight |
 |---|---|---|---|---|---|---|---|---|
@@ -64,344 +63,211 @@ with the reference engine (`rewrite witness`), replayed on a real PICO-8
 | (6,3) | summit | 55 | TAS31, 23 + 34 = 55 (touches the flag) | default ladder, `--ceiling 55`; h54 refuted at level 6 | `room_6_3_exit_frame_55.txt` | 10-02 | `0e67dfe` | no exit: the win is the flag's rect, x 55..67, y 41..52 (`c195f8c`, the original cart's `flag.draw`) |
 | (7,3) | title | - | - | not a level (`level_index() == 31` is the title screen) | | | | |
 
-## The arc pipeline (2026-10-05): the known optima again
+### The arc pipeline reproduces them (2026-10-05)
 
-`rewrite search` with no rem rungs (branch `arc-only`; plans/architecture.md
-"The search"), on rooms whose optimum the ladder had proven. Release binary,
-`--ceiling` the known optimum, the same level -1 filters; every witness
-replayed on a real PICO-8 (`pico8_diff/replay.py`) exits on the optimum's
-frame. Wall times are on a machine other searches shared (load 40-60 on 32
-threads); peak is `VmHWM` (`/usr/bin/time`), the mapped edge runs and
-checkpoints included.
+`rewrite search` with no rem rungs, `--ceiling` the known optimum, the
+same level -1 filters; release, on a shared machine.
 
-| room | level(s), level -1 | known | arc bound | concrete search | found | PICO-8 | wall | peak | the ladder's |
-|---|---|---|---|---|---|---|---|---|---|
-| (1,0) | `r0sx`, - | 99 | 99 | DFS at the bound: 383 steps, 0.2 s | 99 | exits f99 (inputs = `room_1_0_exit_frame_99.txt`) | 5:33 (forward 4:32; 8.8M nodes, 214M edges, arc 62 s) | 32.7 GB (forward 10.1) | 2:56 one default ladder, 25 GB; arc-sets: 6:58 + 5:43, 18.2 GB |
-| (4,2) | `r0sxhn`, (71,5) | 71 | 71 | DFS: 191 steps | 71 | exits f71, seeds 0 and 0.5 | 0:50 | 3.2 GB | 9 GB |
-| (5,3) | `r0sxhn`, (79,5) | 79 | 78 | DFS at 78: none (7.2k steps, 4.7 s); BFS: 165k steps, 66 s | 79 | exits f79, seeds 0,0,0.1855,0 and zeros | 5:44 (the level -1 table 4:05) | 5.0 GB | 28.5 GB |
-| (3,3) | `r0sxhn`, (172,5) | 172 | 172 | DFS: 608 steps, 0.9 s | 172 | exits f172, seeds 0,0.1534 (inputs = `room_3_3_arc_witness_frame_172.txt`) | 10:29 (forward 8:32; 16.1M nodes, 412M edges) | 40.1 GB* | six ladders out of memory |
-| (7,0) | `r0sxhn`, (84,5) | 84 | 80 | DFS at 80: none, 172k steps, 4:18; at 81: 1.29M steps, 28 min; stopped | - | | | 13.4 GB | 5.2 GB |
-| (7,0) | `r0sxhn,r0sxh`, (84,5) | 84 | 80, then 84 | level 0: DFS at 80 none (172k, 4:18); level 1 (filtered, 6.9 s): DFS at 84, 292 steps | 84 | exits f84, seeds 0 and 0.25 | 14:40 | 11.5 GB | |
+| room | level(s), level -1 | arc bound | concrete search | found | wall | peak |
+|---|---|---|---|---|---|---|
+| (1,0) | `r0sx`, - | 99 | DFS at the bound, 383 steps | 99 | 5:33 | 32.7 GB |
+| (4,2) | `r0sxhn`, (71,5) | 71 | DFS, 191 steps | 71 | 0:50 | 3.2 GB |
+| (5,3) | `r0sxhn`, (79,5) | 78 | DFS at 78: none (7.2k steps); BFS 165k steps | 79 | 5:44 | 5.0 GB |
+| (3,3) | `r0sxhn`, (172,5) | 172 | DFS, 608 steps | 172 | 10:29 | 40.1 GB |
+| (7,0) | `r0sxhn`, (84,5) | 80 | DFS at 80: none (172k); at 81 1.29M steps; stopped | - | | 13.4 GB |
+| (7,0) | `r0sxhn,r0sxh`, (84,5) | 80, 84 | level 1 (filtered, 6.9 s): DFS at 84, 292 steps | 84 | 14:40 | 11.5 GB |
 
-\* (3,3) ran on the edge format before `9b967c3` (36 B per loaded edge,
-against 8 B since): its peak is the old graph's.
+The cost is the concrete search's region, the concrete states the level
+lets into W: a few hundred steps where the bound is the optimum, ~6.5x a
+frame of slack in (7,0), where the objects ladder takes over.
 
-What decides the cost is the concrete search's region: the concrete states
-the level lets into W. Where the bound is the optimum it is a few hundred
-steps; one frame of slack in (5,3) was 165k; four in (7,0) would have been
-~300M (the region grew 6.5x a frame) - there the objects ladder takes over.
-Room (7,0) with exact objects at level 0 alone (`r0sxh`, unfiltered) is no
-alternative: 48.8M states kept at f55 (against 2.6M at `r0sxhn`), 300 s a
-frame, stopped.
+## No Diagonal Dashes (2026-10-04 .. 10-08; every improvement submitted)
 
-**Room (4,3) No Diagonal Dashes at h111** (`CELESTE_NODIAG=1`, level -1
-(111,5); the nodiag TAS29 is 111): the `r0sxhn` forward visited 311M states
-(10:14, peak 14 GB); its arc graph, 38.2M nodes and 769M edges, loaded in
-3:18 (bfs 49 s, edges 127 s, graph 22 s; the old separate arc records were
-OOM-killed at 60 GB on this tree), the backward 12 s, the bound 104; no
-concrete win at 104 (18.7k steps). Alone, the breadth-first search then grew
-~1.4x a layer (29k states at layer 46 of 111): OOM-killed at 40 GB twice
-(the graph's edges alive, then interpreter states in the layers: `1b76615`,
-`66d962a`) and stopped at 37.6 GB a third time (every successor's row kept
-until the merge: `3135c9a`, not rerun here). The objects ladder
-`r0sxhn,r0sxh` instead: the filtered `r0sxh`
-forward 2:28, its bound 106, the witness at 106 in 392 steps - **106, five
-frames under TAS29**, exiting on a real PICO-8 with seeds 0, 0.5 and
-PICO-8's rnd, no diagonal dash (`tas/room_4_3_nodiag_frame_106.txt`,
-plans/nodiag.md). 9:23 with the level-0 tree reused, peak 40.7 GB (VmHWM,
-mapped files included).
+`--nodiag`: the cart's diagonal dash arm raises, so a diagonal dash start
+is no move, exactly, in the kernels and the reference alike. References:
+the community nodiag TAS at the room's any% offset. Levels `r0sxhn,r0sxh`
+with level -1 at the reference unless said; "bounds" are the arc bounds per
+level; witnesses `tas/room_X_Y_nodiag_frame_N.txt`, uploads
+`tas/tasdatabase/nodiag/upload/`.
 
-**The ladder filtered by reach (2026-10-08).** The finer level is filtered
-by the nodes the rotation graph REACHES inside W from the start's
-remainder (`arc_dp::reach`), not every node with a winning set: in room
-(3,2) nodiag 1.3-2.7% of them. That made **(3,2) nodiag 148, four frames
-under TAS20's 152**: level 0 `r0sxhn` bound 133, level 1 `r0sxh` bound 148
-and its witness in 446 steps, exiting f148 in the original cart under the
-file's seeds (plans/nodiag.md). The level-1 arc phase peaked at 75 GB.
-**(2,0) nodiag 100, eight under TAS3's 108**, by a single `r0sxh` level at
-`--to 100` (47 min, 36 GB): the springs exact (`n`'s "maybe bounce" at
-every spring is 2.4x the states by f65) and the horizon at the answer, not
-at the reference - level -1's cut moves with it.
-**(3,0) nodiag 93, a tie with TAS4**, by the three-level ladder
-`r0sxhfn,r0sxhn,r0sxh` at `--to 93`: the fruit AND the floors abstract at
-level 0 (it builds since `nodiag-30`: countdown atoms under the fruit, and
-equality's may-answers per operand), bound 76; `r0sxhn` filtered by its
-reach (383,604 nodes) bound 93 and the witness at 93 - the community route.
-Its level 0 needs `CELESTE_REGION=8,6`: at 16 px the floors' square's three
-kernels were 81 MB of code each and a frame of ~5M lanes took 19 min
-(plans/nodiag.md).
+| room | any% | ref | ours | how |
+|---|---|---|---|---|
+| (2,0) 300m | 95 | 108 (TAS3) | **100, -8** | `r0sxh --to 100` alone (`n` was 2.4x the states): bound 100; 47 min, 36 GB |
+| (3,0) 400m | 89 | 93 (TAS4) | 93, tie | `r0sxhfn,r0sxhn,r0sxh --to 93`, `--region 8,6`: bounds 76, 93; the witness is TAS4's route |
+| (5,0) 600m | 77 | 94 (TAS6) | **93, -1** | no level -1: bounds 91, 93 |
+| (6,0) 700m | 70 | 74 (TAS7) | **73, -1** | split, `r0sxhfp,r0sxh,r0sx`, no level -1: bounds 68, 73; `--to 69` refuted |
+| (7,0) 800m | 84 | 99 (TAS8) | 99, tie | bound 99 at both levels |
+| (0,1) 900m | 100 | 108 (TAS9) | 108, tie | bounds 106, 108 |
+| (2,1) 1100m | 82 | 87 (TAS11) | **85, -2** | `r0sxhnp,r0sxhn`, no level -1: bounds 82, 85 |
+| (5,1) 1400m | 104 | 121 (TAS14) | **119, -2** | level -1 (121,5), 60 GB (BENCHMARK_DATA.md 2026-10-07) |
+| (6,1) 1500m | 89 | 93 (TAS15) | **92, -1** | split, `r0sxhn`, level -1 (186,5) steps: bound 90; `--to 91` no concrete win (exhaustive); `--to 92` wins |
+| (0,2) 1700m | 81 | 89 (TAS17) | **87, -2** | bound 87 at level 0 |
+| (1,2) 1800m | 103 | 118 (TAS18) | **113, -5** | `r0sxhnp,r0sxhn,r0sxh,r0sx`, no level -1: bounds 107, 109, 113; `--to 112` refuted. Upload 85f (real play) |
+| (3,2) 2000m | 128 | 152 (TAS20) | **148, -4** | bounds 133, 148 (the reach filter); exits under TAS20's seeds 0,0,0,0 only; peak 75 GB |
+| (4,2) 2100m | 71 | 71 (TAS21) | 71, tie | the any% recipe (validation) |
+| (5,2) 2200m | 150 | 158 (TAS22) | **157, -1** | `r0sxhn` alone: bound 157 |
+| (1,3) 2600m | 127 | 135 (TAS26) | **133, -2** | `r0sxhn` alone: bound 133 |
+| (3,3) 2800m | 172 | 184 (TAS28) | **179, -5** | `r0sxhn` alone: bound 179 |
+| (4,3) 2900m | 85 | 111 (TAS29) | **106, -5** | bounds 104, 106; seeds 0, 0.5 and rnd |
+| (5,3) 3000m | 79 | 96 (TAS30) | 96, tie | bounds 92, 96 |
+| (1,1) 1000m | 94 | 94 (TAS10) | - | not run |
 
-**The platform rooms, by the reach ladder down to exact objects
-(2026-10-08, branch `nodiag-finish`).** `--level <level 0>,...,r0sxh,r0sx`
-on one kept level-0 tree: the filtered finer forwards are tiny, and at
-`r0sxh` the arc bound is the answer, so a lower horizon is REFUTED by the
-arcs and a higher one finds the witness at the bound. **(1,2) nodiag 113,
-five under TAS18's 118**: `r0sxhnp` bound 107, `r0sxhn` 109, `r0sxh` 113;
-`--to 112` REFUTED at `r0sxh`; the witness in 176 steps (359 s, 11.3 GB).
-**(6,0) nodiag 73, one under TAS7's 74** (split frame): `r0sxhfp` to step
-148 (42 min, 28.4 GB), bound f68; `r0sxh` bound f73, `--to 69` REFUTED;
-the witness in 134 steps. Both exit at the optimum in the original cart on
-PICO-8 and finish in UniversalClassicTas (1800m one frame later there:
-plans/nodiag.md).
+Our improvements differ from the community runs in the route, not the
+counting: both replayed in the original cart in one harness, the player
+first exists on the same frame. Every upload went through UCT's clean save
+(`tools/uct/validate.sh`). UCT computes in doubles: in (1,2) its player is
+a pixel off PICO-8's while riding a platform, so the 113 finishes in UCT
+only a frame later (86f), and that 86 dies in real play; the upload is
+the PICO-8 alignment, 85f, valid in IL, Celia, the chain and the boot
+chain (re-searched from the real-play starts J 3 and J 4: 113 both).
 
-## 100% (2026-10-08, branch `hundred`; plans/hundred.md)
+## 100% (2026-10-08 .. 10-09)
 
-`CELESTE_HUNDRED=1`: the exit counts only with the room's berry taken. Of
-the 18 rooms of the tasdatabase's 100% list, 15 are verified end to end
-(original cart on PICO-8 with the berry, UniversalClassicTas with no
-death): four IMPROVE on the community TAS - 100m 115 (-3), 500m 152 (-1),
-2300m 89 (-5), 2600m 161 (-2) - and eleven tie (400m 89, 900m 122, 1200m
-78, 1300m 153, 1500m 114, 1700m 90, 1900m 131, 2500m 134, 2800m 187, 2900m
-109, 3000m 114). Open: 300m and 1400m (level 0 past 55 GB before level -1
-cuts), 700m (the `f` level's arc phase past 55 GB). Two exact changes made
-them fit: rows whose berry is lost are not expanded, and level -1 drops
-exits that leave the berry behind. Witnesses: `tas/room_X_Y_hundred_frame_N.txt`.
+`--hundred`: the exit counts only with the room's berry taken (an unknown
+`got_fruit` at a coarse level counts as taken; the concrete search
+decides). Two exact cuts made rooms fit: a row whose berry is lost is not
+expanded (`frame::berry_lost`), and level -1 drops exits that leave the
+berry behind. Runs `--ceiling REF`, level -1 at (REF, 5),
+`--concrete-balloon-seeds` the file's seeds. The search takes every chest
+draw; the runner tries the file's chest seed, then each class of draws,
+and the upload carries the one that works. Witnesses
+`tas/room_X_Y_hundred_frame_N.txt`; uploads `tas/tasdatabase/100/upload/`.
 
-## Real play: the loading jank (2026-10-08, branch `loading-jank`)
+| room | DB | ref | ours (DB) | levels: bounds | status |
+|---|---|---|---|---|---|
+| (0,0) 100m | 90 | 118 | **115 (87f), -3** | `r0sxhn,r0sxh`: 115 | optimal; VALID in real play |
+| (2,0) 300m | 103 | 129 | - | `r0sxh` | OPEN: level 0 past 55 GB before level -1 cuts |
+| (3,0) 400m | 61 | 89 | 89 (61f), tie | real play J 3: `r0sxhfn,r0sxhn,r0sxh`, `--to 88` refuted | optimal (the any% witness takes the fruit) |
+| (4,0) 500m | 123 | 153 | **152 (122f), -1** | `r0sxhn,r0sxh`: 152 | optimal; VALID (chest seed -1) |
+| (6,0) 700m | 75 | 99 | - | split `r0sxhfp,r0sxh,r0sx` | OPEN: the arc phase past 55 GB (`f` cannot see that an early dash sends the fruit off) |
+| (0,1) 900m | 94 | 122 | 122 (94f), tie | 114, 122 | |
+| (3,1) 1200m | 52 | 78 | 78 (52f), tie | `r0sxhf,r0sxh`: 76, 78 | |
+| (4,1) 1300m | 127 | 153 | 153 (127f), tie | 153 | |
+| (5,1) 1400m | 103 | 129 | - | `r0sxhn,r0sxh` | OPEN: level 0 63.8M kept at f94, +11% a frame |
+| (6,1) 1500m | 88 | 114 | 114 (88f), tie | split: f112, f113 | |
+| (0,2) 1700m | 64 | 90 | 90 (64f), tie | 90 | |
+| (2,2) 1900m | 107 | 131 | 131 (107f), tie | 131 | |
+| (6,2) 2300m | 68 | 94 | **93 (67f), -1** | real play J 2: `r0sxhf,r0sxh`: 89, 93 | optimal from real play; VALID everywhere |
+| (0,3) 2500m | 108 | 134 | 134 (108f), tie | 134 | |
+| (1,3) 2600m | 137 | 163 | **161 (135f), -2** | 161; real play J 6: 161 | optimal; VALID (chest seed 0.5) |
+| (3,3) 2800m | 137 | 187 | 187 (137f), tie | 187 | |
+| (4,3) 2900m | 79 | 109 | 109 (79f), tie | 106, 107 | |
+| (5,3) 3000m | 82 | 114 | 114 (82f), tie | 102, 114 | |
 
-**Every result above was searched and verified from an IL LOAD** (the room
-loaded alone, as UniversalClassicTas loads it). Real play does not enter a
-room that way. The leaving player's `_update` calls `next_room()` from inside
-`_update`'s `foreach(objects, ...)`. PICO-8's `all` resumes at the same index
-in the NEW list, so the new room's objects from the leaving player's index J
-on get one update (move, then update) on the loading frame. Then the frame
-draws. Celia (gonengazit/Celia, the community's current tool) models this:
-its IL load updates objects from the previous room's object count on.
+The submitted 2300m 63f held only from an IL load: it dies in Celia, the
+chain and the boot chain (real play enters at J 2: the fly fruit one bob
+ahead). Withdrawn (`tas/invalid`); 67f is the real-play optimum.
 
-Found on 100% 2300m (6,2). Our 63 (TAS23, submitted) exits in the IL load
-and in UCT. It dies in Celia, in the chain from (5,2) and in the boot chain.
-J = 2 there, so the fly fruit is one bob ahead (`step` 0.55, not 0.5). The
-database's 68 exits in all of them. A community member doubted the 63 and
-was right.
+## Gemskip (2026-10-08 .. 10-16)
 
-The tools:
+`--gemskip`: the orb room (5,2) is won by its bare exit and every later
+room starts with ONE dash (the replay's `--one-dash`, UCT's `UCT_DASHES=1`).
+gemskip nodiag adds `--nodiag`, gemskip 100% `--hundred`. Levels
+`r0sxhn,r0sxh` unless said; "OPTIMAL" = the last level's arc bound equals
+the witness's frame. Witnesses `tas/room_X_Y_gemskip*_frame_N.txt`,
+uploads `tas/tasdatabase/gemskip*/upload/`.
 
-- `pico8_diff/chain.py` plays rooms on a real PICO-8 through the real
-  transitions, using the tasdatabase's files (the category's, else
-  FALLBACK's).
-  - `--boot` starts from 100m: this is the ground truth.
-  - `--modes` diffs the room-entry state of the IL load and of the jank
-    model against the chain's, field by field.
-  - `--check-start` does the same for the search's own start state.
-  - `--feasible REWRITE` lists every J a play of the previous room can
-    give (`rewrite starts`).
-  - `--vary` compares the entry state after every category's boot chain.
-- `tools/celia/validate.sh` runs Celia headless.
-- `tools/uct/check_uploads.py` runs IL, UCT, Celia, the chain and the boot
-  chain, and gives a verdict.
+| category | room | DB | ref | ours | how |
+|---|---|---|---|---|---|
+| any% | 2900m (4,3) | 60 | 90 | 90, tie | `r0sxhn` bound 90 |
+| any% | 2600m (1,3) | 123 | - | 151 | the community run dies on PICO-8 at every offset (UCT only); `--to 149` refuted, bound 151. PARKED, no upload |
+| any% | Summit (6,3) | - | 64 | **57, -7** | `r0sx --to 64` (no objects, no level -1): bound 57 |
+| nodiag | 2400m (7,2) | 90 | 114 | **99, -15** | `r0sxhn` bound 99 |
+| nodiag | 2600m (1,3) | 154 | 180 | **169, -11** | `r0sxhn` bound 169 |
+| nodiag | 2700m (2,3) | 151 | 175 | **147, -28** | bounds 132, 147 |
+| nodiag | 2800m (3,3) | 181 | 231 | **191, -40** | `--to 192` on the kept level-0 tree: bounds 186, 191 |
+| nodiag | 2900m (4,3) | 93 | 123 | **109, -14** | bounds 106, 109 |
+| nodiag | 3000m (5,3) | 88 | 120 | **106, -14** | `r0sxhn` bound 106; upload seeds nudged for UCT |
+| 100% | 2500m (0,3) | 117 | 142 | **141 (116f), -1** | real play J 1, level -1 (150,5): bound 141. Fixed point only, like the database's own file (`gates/witnesses/gemskip100_TAS25.tas`); a run valid in float too: plans/float.md |
+| 100% | 2800m (3,3) | 164 | - | **213 (163f), -1** | the database's file never exits on PICO-8; real play J 3, `--to` 195 and 210 refuted, bound 213 |
+| 100% | 2900m (4,3) | 86 | - | **115 (85f), -1** | real play J 5 (after our 2800m), optimal there |
 
-Every database 100%/any% file from 100m to 2300m replays in the boot chain
-at its database count. The jank model (`replay.py --jank J`, and the search's
-`CELESTE_LOADING_JANK=J`) gives the chain's entry state exactly. Only these
-fields differ: `seconds`, `music_timer`, `new_bg` and `frames` (timer, music,
-background), and the key's sprite, which is drawn from `frames`.
+Gemskip any% 2600m: UCT kills our 151 at keypress 64 (its doubles let the
+player fall a pixel at f79, the 1800m nodiag kind). Policy (Philippe,
+2026-10-08): our result is the PICO-8 optimum; where UCT disagrees, look
+for a same-length variant valid in both, never a longer run; a room whose
+community run is valid only in UCT is parked. Gemskip 100% 2800m: the
+first optimal witness died in UCT and Celia (a remainder of 0x0.7fff in
+16.16 is exactly 0.5 in doubles); a second one is VALID everywhere, and
+`pico8_diff/chain.py` plays it (`OVERRIDES`) so the boot chain runs
+unbroken from 100m to 3000m.
 
-**The jank model checked against real chains, every room.** Each any%
-database file from 200m to 3000m was played through the transition from the
-previous room (`chain.py --modes`):
-- The jank model at the chain's J gives the chain's entry state in EVERY
-  room. The only difference is `got_fruit` bookkeeping at 500m. It also
-  gives the same exit.
-- This covers platforms ((6,0), (2,1), (1,2)), balloons, springs, fall
-  floors, the fly fruits, keys and chests.
-- The IL load differs from real play in gameplay fields in 14 rooms. It has
-  14 differing fields at (6,0), where the platforms are a frame off.
-- At 1100m (2,1) the database's own any% file DIES from the IL load but exits
-  (57) in real play.
-- The search's start (`concrete_run --dump-start` under the boot chain's J)
-  matches the boot chain's entry field by field in all 37 cases checked. The
-  only exception is a key's sprite, which is drawn from the cosmetic
-  `frames`.
+## Real play: the loading jank (2026-10-08)
 
-**What the room entry depends on.** The jank index J depends on how the
-previous room was played: J = 1 + the objects before the player when it
-leaves. That is the previous room's objects less the spawn, less every
-destroyed one (a berry taken, a fly fruit, a key, a chest, a fake wall),
-plus the room title or the spawn's smoke if the exit came soon enough.
-- 100% runs collect berries, which lowers J. Room (1,0) is entered with
-  J 1 in 100% and J 2 in any%: the spawn itself is one frame ahead.
-- Room (5,0)'s spawn and balloon move, in 100% and key.
-- `--vary` over all levels, comparing 8 categories' boot chains: only J
-  moves objects.
-- Among the globals, only these vary: `max_djump` (the category's orb),
-  `got_fruit` (the category's own record, not this room's) and the
-  cosmetic ones.
-- No held button carries over (a new player has `p_jump`/`p_dash` false).
-- `freeze` at entry can be 2 after a dash on the exit frame. It freezes
-  every object alike, so no count changes.
-- `rnd` is seeded by the file's `[seeds]`, the stated caveat.
+Real play enters a room through a transition: the new room's objects from
+the leaving player's index J on get one update on the loading frame
+(plans/architecture.md "The room's start"). UniversalClassicTas loads a
+room alone and misses it; Celia models it.
 
-The search therefore takes the room's start as a set of J classes.
-`category_runner` runs the main search at the boot chain's J (its witness is
-valid after the database's previous rooms) and one search-only job per other
-feasible start (`rewrite starts`). The history-widened optimum is the
-least of them.
+- The jank model at the chain's J gives the chain's entry state in every
+  any% room 200m-3000m (the only difference: `got_fruit` bookkeeping at
+  500m; cosmetic fields aside), platforms, balloons, springs, floors, fly
+  fruits, keys and chests included. The IL load differs from real play in
+  gameplay fields in 14 rooms.
+- J = 1 + the objects before the player when it leaves: the room's objects
+  less the spawn and every destroyed one, plus the title or the spawn's
+  smoke if the exit came soon enough. 100% runs collect berries, which
+  lowers J. Only J moves objects across the categories' boot chains; no
+  held button carries over; `freeze` at entry may be 2 (it freezes every
+  object alike).
+- The search takes the start as a set of J classes (`rewrite starts`); the
+  runner runs the boot chain's J (its witness carries the upload) and one
+  search per other class.
+- **Celia's J is not always the boot chain's**: it counts the previous
+  room's objects as if nothing were destroyed (any% differs at levels 5, 8,
+  13, 18; 100% after most berries). A submittable witness must exit in
+  both. Decision (Philippe, 2026-10-08): Celia should be fixed upstream;
+  parked, both must pass until then.
+- Re-verification (IL / UCT / Celia / boot chain): every tie VALID; 100%
+  2300m 63f and nodiag 1800m 86f INVALID (both replaced, above); every
+  other nodiag and gemskip upload VALID. The database's own gemskip any%
+  2600m dies on PICO-8 and finishes in UCT and Celia (doubles); the boot
+  chain restarts after it.
 
-Re-verification (2026-10-08). IL / UCT / Celia / boot chain, all at the
-claimed count unless noted:
-- 100%:
-  - 100m 87, 500m 122 and 2600m 135 are VALID.
-  - **2300m 63 is INVALID: it dies in Celia, the chain and the boot chain.**
-  - All 11 ties are VALID.
-- nodiag: **1800m 86 (TAS18, submitted) is INVALID**, dying in Celia, the
-  chain and the boot chain. The runner had cut it one frame early so that
-  UCT would finish it.
-  - Re-searched at J 3 (the boot chain's) and at J 4 (Celia's, its other
-    start class): 113 both, the same optimum as before.
-  - At the PICO-8 alignment the witness is **85, VALID** in IL, Celia, the
-    chain and the boot chain. Only UCT fails it.
-  - The runner now chooses the upload's cut by real play; UCT is
-    information only.
-  - Every other nodiag upload is VALID.
+## Caveats on "optimal"
 
-**Celia's J is not always the boot chain's.** Celia uses the previous room's
-object count, as if nothing had been destroyed there. Real play destroys
-objects:
-- any% differs at levels 5, 8, 13 and 18 (a fly fruit flown off, a fake wall
-  broken, ...);
-- 100% and key differ at most levels after a berry.
+- **`rnd`** is an interval at every level: a confirmation is "some draw
+  wins", a refutation holds for every draw; every balloon witness was
+  replayed per seed (the tables' seed lists).
+- **The silent interval wrap**: the kernels wrapped an overflowing interval
+  `+`/`-`/negation until `549ecf5`/`b47b118` (2026-10-03). Every any% result
+  but (3,3)'s and (5,0)'s rerun ran on the wrapping binary. Only intervals
+  reaching the 16.16 limits were affected: the countdowns at `n` (and `t`,
+  which no result uses). Rooms (1,1) and (6,1) re-run after the fix
+  reproduce their counts at every frame; the other `n` rooms were not
+  re-run.
+- The arc result (3,3) over-approximates the objects and held buttons
+  (`r0sxhn`); the remainder is exact and the witness concrete.
 
-Where the two give different start states, a submittable witness must exit
-in both. `check_uploads` requires both, and the runner searches Celia's class
-too. Which convention the database verifies with (Celia's IL, or a
-full-game playback) is a question for the community.
-**Decision (Philippe, 2026-10-08): Celia should be FIXED** (upstream: count
-the objects real play leaves, not the room's original count). Parked until
-one of our results actually passes one convention and fails the other, or
-the project's cleanup phase. Until then both must pass.
-- gemskipany and gemskipnodiag: every upload is VALID. The gemskipany boot
-  chain breaks at the database's own 2600m, which dies on PICO-8 in every
-  mode but finishes in UCT and Celia (they compute in doubles). Past it the
-  boot restarts at 2700m.
-- gemskip100 (2026-10-09, branch `gs2900-verify`): the database's 2800m
-  (TAS28, 164) never exits on PICO-8 (it finishes in Celia only). Instead of
-  restarting the boot chain after it, we searched the room as real play
-  enters it (J 3, the only feasible start class; `r0sxhn,r0sxh`, level -1 at
-  H, `--to` 195 and 210 refuted at level 0, 216 raised: arc bound 213 at both
-  levels, concrete optimum **213 = 163f**, 1 under the database). The first
-  witness exits on PICO-8 but dies in UCT and Celia (doubles: a remainder
-  that is 0x0.7fff in 16.16 is exactly 0.5 there); a second optimal witness
-  (the concrete search's input order without `--prefer`) is VALID in IL,
-  UCT (163), Celia (163), the chain and the boot chain, chest seed 1.5.
-  It is `tas/tasdatabase/gemskip100/upload/TAS28.tas`, and
-  `pico8_diff/chain.py` plays it in the gemskip100 chain (`OVERRIDES`):
-  the boot chain runs unbroken from 100m to 3000m. 2900m is entered with
-  J 5 (start state matches field by field); our 115 (85f) is VALID there and
-  optimal at J 5.
+## How to run a room
 
-## Caveats on what "optimal" means here
-
-- **Balloon rooms**: `rnd` is an interval at every level, so a confirmation is
-  "some draw wins" and a refutation holds for every draw. Each witness was
-  replayed per seed; several exit only for some (the table's seed lists).
-- **The silent interval wrap** (plans/architecture.md, "Interval
-  overflow"): the ASM kernels wrapped an overflowing interval `+`/`-`/negation
-  until `549ecf5` (2026-10-03 15:15) and `b47b118` (2026-10-03 18:07; now a
-  lane error, countdowns the unknown number). EVERY result in the table except
-  room (3,3)'s arc result and room (5,0)'s rerun (2026-10-04, after both) was
-  computed with the wrapping binary. What the wrap could affect: only an interval whose
-  endpoint reaches the 16.16 limits - in practice the countdowns widened to
-  the whole range at the `t` (timers) and `n` (near) levels, which the cart
-  decrements before `delay <= 0`. At `t` it was decisive: shaking floors never
-  fell (found in room (3,3), where it refuted TAS28's own second half); no
-  table result uses `t`. At `n` the kernels had leaned on it (dropping it
-  declined room (1,1) at f35 until the near-floor owes were fixed in
-  `549ecf5`); after both fixes, room (1,1) `r0sxhn` to f94 and room (6,1)
-  split `r0sxhn` to step 90 reproduce the committed runs' kept and visited
-  counts at every frame. The other `n` rooms ((7,0) recheck, (0,1), (2,1),
-  (4,1), (5,1), (7,1), (0,2), (1,2), (3,2), (4,2), (0,3), (2,3), (4,3),
-  (5,3)) were not re-run. Rooms whose ladders have no `n`/`t` level hold no
-  full-range countdown interval. Interval `Mul`/`Div` by a constant is still
-  unchecked (open).
-- **The arcs result (3,3)** still over-approximates the objects and held
-  buttons (level 0 `r0sxhn`); the remainder is exact. The 172 witness is
-  concrete.
-- The room (3,3) second-half experiment (from TAS28's state after 113 inputs)
-  found 59 optimal from there, under `n`.
-
-## How to run a room (the arc search, 2026-10-05)
-
-```
-./safe-run.sh -- ./target/release/rewrite search --room X,Y --level r0sxhn \
-  --ceiling C --level-minus-one C,5 --checkpoint-dir DIR [--save-marks UIDIR]
-  [--hundred | --nodiag | --gemskip ...] [--loading-jank J]
+```bash
+./safe-run.sh -- ./target/release/rewrite search --room X,Y --level r0sxhn,r0sxh \
+    --level-minus-one C,5 --ceiling C --checkpoint-dir DIR --prefer tas/FILE.txt \
+    [--hundred | --nodiag | --gemskip] [--loading-jank J] [--concrete-balloon-seeds S]
 ```
 
-- The level: `r0sx` for a room without objects, `r0sxhn` with springs, fall
-  floors, balloons, key and chest (everything abstract but where the player
-  overlaps a floor; held buttons unknown); `f` for the fly fruit. The
-  concrete search refutes what the level invents. `p` for moving platforms
-  (with `n`: `r0sxhnp`). `--split-frame` where the unsplit kernels
-  are too big (rooms (6,0), (6,1)): `--ceiling` stays in frames, level -1's
-  horizon is in steps (`2 x C`).
-- **When the level-0 bound is well below the reference** (room (7,0):
-  `r0sxhn` 80 against 84) the concrete search's region grows several-fold a
-  frame of slack: run the objects ladder, `--level r0sxhn,r0sxh` (the exact
-  objects' forward filtered by `r0sxhn`'s arc-marked nodes; 6.9 s for (7,0)).
-- The level -1 filter (plans/level-minus-one.md) with H = the ceiling (or
-  `--to`), where its table builds; the table is cached on disk
-  (`/var/tmp/celeste-l1-cache`).
-- `--ceiling C` is a known solution (the replayed community TAS): a
-  refutation, or no concrete witness by C, is an error, never a result.
-  Without a reference, `--to H` with H generous: the forward is the cost, and
-  the concrete search stops at the first concrete win.
-- The witness lands in `DIR/witness_frame_F.txt`. **Balloon rooms**: replay it
-  with the TAS's seeds (`pico8_diff/replay.py --balloon-seeds a,b`, the
-  tasdatabase header) and with 0 / 0.5 / PICO-8's own rnd - the concrete search
-  takes every `rnd` leaf, so a witness may exit for some draws only.
-- **When a level grows, look at the states before reasoning about counts**:
-  `rewrite cell-growth --by-age`, `col-census --cell x,y` (what varies at one
-  position), `coarse-census --erase FIELD` (the merge ceiling of a widening),
-  `spurious --real T --coarse C` (a coarse tree's states a finer tree never
-  reaches, traced to the first spurious step; `--chain-out`), `rerun-row`
-  (one stored row through a level's kernels), `ref-check` (kernels against
-  the reference engine, row by row), `follow` (a known concrete solution
-  stepped against a level's tree). That chain found the floor-collision join
-  bug (99.8% of room (7,0)'s fully-unknown states at one cell were
-  impossible) and room (1,3)'s keying bug.
-- Finding the reference: scan prologue offsets (the first frame the player
-  exists is the convention; it ranged 23-37), replay in the original cart
-  (`replay.py --lua ~/src/github.com/tehwalris/celeste_ocaml/celeste.lua
-  --begin-game`), then `rewrite trajectory` to fit it to celeste-minimal (the
-  minimal cart has no jump buffer, so raw inputs often do not transfer).
-- Before 2026-10-05 a room ran a precision LADDER (`CELESTE_LADDER="r0sxhn,
-  r1sxhn,...,r4sxhn,r4sxh,...,r15sxh,rxsx"`): every result in the table
-  above but (3,3)'s came from one; the recipes are in its "proven how" column.
-
-## Runtime and memory worth keeping
-
-| room | level 0 to the ceiling | whole search | peak |
-|---|---|---|---|
-| (0,0) | f79 first win, 22.8M states at f93 | 2:32 h (kernel walk) -> 23:50 (graph) -> 15:31 (regions, reverted) | 31-45 GB |
-| (1,0) | 6.8M at f99 | 1:39.7 held ladder (`--ceiling 99`); 2:56 one default ladder at 99, 4:51 count-up | 5.8 GB held; 25 GB default |
-| (2,0) | 24.0M at f80 with level -1 (62.8M without) | 27:28 incl. the 472 s table | 28.0 GB |
-| (3,0) | frontier peak 22.7M at f74 | 34 min (level 0 resumed) | 12.8 GB, 210 GB of checkpoints |
-| (4,0) | 7.98M at f76 | 3:54 | 8 GB |
-| (5,0) | 1.94M/frame max, 35.2M visited (10-04 rerun) | 4:37 (`--ceiling 77`) | 10.9 GB |
-| (6,0) | 1.68G visited to step 150 (split) | overnight | |
-| (7,0) | 71M visited (recheck, unsplit, level -1) | | 5.2 GB |
-| (0,1) | 14.8M states/frame max, 224M visited | minutes after level 0 | 14 GB |
-| (1,1) | 3.37M/frame max, 110M visited | ~15 min (second ladder) | 19.4 GB |
-| (2,1) | 3.86M/frame max, 121M visited | ~20 min | 25 GB |
-| (3,1) | 54.8M at f70 (ice), 573M visited, ~45 min | | 37 GB |
-| (4,1) | 7.68M/frame max, 264M visited | ~15 min | 37 GB |
-| (5,1) | 441M visited | | 35 GB |
-| (6,1) | 20.4M a step max, 743M visited | | 28 GB |
-| (7,1) | 4.9M/frame max, 119M visited | | 16 GB |
-| (0,2) | 87M visited with the filter | | 5.4 GB |
-| (1,2) | 94M visited | | 43 GB (levels 1-3) |
-| (2,2) | 21.9M visited | | 21 GB |
-| (3,2) | 122M visited | | 33 GB |
-| (4,2) | 6.6M visited | | 9 GB |
-| (5,2) | 35M at f80 before the chest deadline; then minutes | | |
-| (6,2) | 63M states at f75, 742M visited (no filter) | | 36 GB |
-| (7,2) | 66M visited | | |
-| (0,3) | 159M visited | | 27 GB |
-| (3,3) | 13.8M marked nodes, 346M edges at h171 | arc search 74 s after level 0 | 29 GB |
-| (4,3) | 91M visited | | |
-| (5,3) | 13.0M visited | | 28.5 GB |
-| (6,3) | 38M visited, 4.1M at f55 | ~8 min | 8.4 GB |
-
-Memory is the state COUNT, not the bytes per state: ~100-150 B per frontier
-row, 16-24 B per door entry. Machine: 7950X3D, 16 cores, 125 GB; long runs
-used `safe-run.sh --memory 85G..95G` explicitly.
+- The level: `r0sx` without objects; `r0sxhn` with springs, fall floors,
+  balloons, key and chest; `f` for a fly fruit, `p` for platforms
+  (`r0sxhnp`; level -1 refuses `p`). `--split-frame` where the kernels are
+  too big ((6,0), (6,1)): `--ceiling` stays in frames, level -1's H is in
+  steps (2 x C).
+- **The ladder** where the level-0 bound is well below the reference; down
+  to `r0sxh` (and `r0sx`) the arc bound is the answer, so a lower horizon
+  is refuted by the arcs and a higher one finds the witness at the bound.
+  Count up from the bound on the kept level-0 tree.
+- `--ceiling C` is a known solution: a refutation or no witness is an
+  error. Without one, `--to H` with H generous.
+- `tools/category_runner.py` runs a category end to end: the real-play
+  start classes, the search with `--prefer` the community file, the
+  original-cart replay, UCT and Celia, one upload file.
+- Balloon rooms: replay the witness with the file's seeds and with 0 / 0.5
+  / PICO-8's rnd (`pico8_diff/replay.py --balloon-seeds a,b`).
+- When a level grows, look at the states before reasoning about counts
+  (`cell-growth`, `col-census --cell`, `coarse-census --erase`, `spurious`,
+  `rerun-row`, `ref-check`, `follow`): that chain found the floor-collision
+  join bug and room (1,3)'s keying bug.
+- Finding the reference: scan prologue offsets (23-37), replay in the
+  original cart (`replay.py --lua ~/src/github.com/tehwalris/celeste_ocaml/
+  celeste.lua --begin-game`), then `rewrite trajectory` (the minimal cart
+  has no jump buffer, so raw inputs often do not transfer).

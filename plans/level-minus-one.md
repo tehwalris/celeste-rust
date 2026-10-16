@@ -1,216 +1,138 @@
-# Level -1: a position-only cost-to-go table from the traced frames
+# Level -1: a position-only cost-to-go table
 
-A sound lower bound on the frames to the exit from every (shape, player cell),
-built from the same traced frames the kernels come from, used as a FILTER on
-level 0 under a known ceiling. It replaced the experimental time band
-(`CELESTE_BAND="H,px"`, `frame::band`, 8 px/frame), which was a measurement,
-not a bound: a spring snaps the player up to 8 px and `spd.y = -3` moves it
-3 more in the same frame. Code: `src/trace/level_minus_one.rs`.
+A sound LOWER BOUND `d` on the frames to the exit from every (heap shape,
+player cell), built from the same traced frames the kernels come from, used
+as a FILTER on the forward under a horizon H: a push into a cell at frame
+t is dropped when `t + d > H`. Code: `src/trace/level_minus_one.rs`,
+`frame::TreeFilter`, `UnitSink`'s level -1 drop.
 
 ```bash
-# as a filter inside a search (H = the ceiling, S = the speed bound in px/frame)
+# as a filter inside a search (H the horizon, S the speed bound in px/frame)
 ./safe-run.sh -- ./target/release/rewrite search --room 2,0 --ceiling 95 --level-minus-one 95,5
-# as a probe: the table against a level-0 tree, with the too-late share per frame
-./safe-run.sh -- ./target/quick/transpile --room 2,0 \
-    --level-minus-one S LEVEL_DIR CEILING FROM TO [MARKS]
+# the table alone, with its fingerprint (cached in /var/tmp/celeste-l1-cache)
+./safe-run.sh -- ./target/quick/transpile --room 2,0 --level-minus-one-table 5
+# as a probe: the table against a tree's recorded transitions
+./safe-run.sh -- ./target/quick/transpile --room 2,0 --probe S LEVEL_DIR CEILING FROM TO [MARKS]
+# a known solution against the table (fails if a state of it is too late)
+./safe-run.sh -- ./target/quick/rewrite l1-check --room X,Y --inputs tas/FILE --horizon EXIT
 ```
+
+It replaced the time band (`CELESTE_BAND`, 8 px a frame), a measurement,
+not a bound: a spring snaps the player up 8 px and `spd.y = -3` adds 3.
 
 ## What it computes
 
-A node is `(heap shape, cell of the player)`. Every other input is one RANGE
-per shape (numbers) or unknown (booleans): the player's `rem` the whole
-[-0.5, 0.5), its speed [-S, S], the other fields discovered inductively. The
-heap shape stays concrete; the lattice pins stay pinned while they hold.
+A node is `(heap shape, player cell)`. Every other input is one RANGE per
+shape (numbers) or unknown (booleans): `rem` the whole [-0.5, 0.5), speed
+[-S, S], the other fields found inductively. Lattice pins stay while they
+hold. One frame from a node:
 
-One frame from a node:
-
-1. **Trace** the shape (`verify::trace_frame`, level-0 widenings) with every
-   object's unpinned `rem`/`spd` as interval inputs, bounded, so
-   `Domain::flr_ways` sizes the `move` forks from the static ranges (11-way at
-   S=5; `Symbolic::uncapped_ways` gives the hull's width, level -1 only).
-2. **Copy the cone** of every outcome's `live`, error, position and fields,
-   with substitutions: a fork over a literal (a button) stands for its whole
-   literal; `Known(..)` is true (this evaluator JOINS undecided selects, which
-   is sound - `Symbolic::no_known_forks`); `SplitOk(..)` is checked directly
-   (every fork operand spans at most its arity).
-3. **Specialize** on every fork configuration into one shared graph: per
-   configuration the move amount is one number, so the pixel steps and their
-   collisions are exact at an exact position.
+1. **Trace** the shape (`verify::trace_frame`, level-0 widenings) with the
+   objects' unpinned `rem`/`spd` as bounded interval inputs (the `move`
+   fork's arity is the hull's width, level -1 only).
+2. **Copy the cone** of every outcome's `live`, error, position and fields:
+   a button fork stands for its whole literal; `Known(..)` is true (this
+   evaluator joins undecided selects, which is sound); `SplitOk` is checked.
+3. **Specialize** per fork configuration: the move amount is one number, so
+   pixel steps and collisions are exact at an exact position.
 4. **Evaluate** over the ranges (`Graph::eval_narrow_top_in`): an outcome
    whose `live` is not definitely false is a successor at the cells its
-   position hull covers; an outcome in another room is the EXIT; the error
-   must be false on every live outcome.
+   position hull covers; one in another room is the EXIT; the error must be
+   false on every live outcome.
 
-Passes: a BFS over the reachable nodes, then an INDUCTIVE check - every value
-flowing into a shape must lie in its ranges and agree with its pins, else the
-range widens (the hull for its first two growths, then that end straight to
-the 16.16 extreme) or the pin drops, and the pass is redone.
+A BFS over reachable nodes, then an INDUCTIVE check: every value flowing
+into a shape must lie in its ranges and agree with its pins, else the range
+widens (the hull twice, then that end to the extreme) or the pin drops, and
+the pass is redone. `d` is a multi-source shortest path backward: an exit
+edge 1, a DEATH 1 + the start's d (the room restarts). The spawn runs as a
+CHAIN from the start state. A shape with a player and a fly fruit is traced
+with the `f` level's fruit (only the player is measured, so a forgotten
+fruit only weakens d).
 
-`d(node)` is `sound_d`: a multi-source shortest path backward, an exit edge 1,
-a DEATH successor 1 + the start state's d (the room restarts and replays the
-spawn; a second run is the fixpoint). The spawn runs as a CHAIN from the start
-state (as a position-only node it never converges: `solids=false` and one
-speed range per shape let it rise forever).
+## As a filter: why it is sound
 
-## As a filter (`frame::level_minus_one`, `CostToGo::too_late`)
+- **The window is checked, not assumed**: no real player is outside x in
+  [-1, 121] plus one move, below y = 128 or above y = -4; `too_late` panics
+  on an in-room row outside it.
+- **Only table nodes are refused**: a row without a player cell, outside
+  the room, or of a shape or cell the table never reached is kept.
+- **A tree remembers its filter** (`<level>/level_minus_one.txt`: H, S and
+  the table's fingerprint): a search refuses a horizon past H, a tree is
+  extended only under its own filter, and a larger horizon builds the tree
+  again (a dropped push leaves hulls smaller and states later, so the
+  frames depend on H throughout).
+- `--hundred`: an exit that certainly leaves the berry behind has no
+  successor in the table.
 
-A flush queue (one player cell) is dropped when `f + d(shape, cell) > H`. What
-makes it sound where the probe only counted:
+The table is horizon-independent: one per room and settings.
 
-- **the window is CHECKED, not assumed**: no real player is outside x in
-  [-1, 121] plus one move (the draw clamp, skipped on a dash's freeze frame),
-  below y = 128 (the update kills) or above y = -4 (the room changes);
-  `too_late` panics on any in-room row outside it. A clipped successor part
-  is dropped (seeding it as a possible exit, d = 1, was sound and useless:
-  room (2,0) f80 kept exactly the unfiltered 62.8M);
-- **only table nodes are refused**: a row without a player cell, outside the
-  room, or of a shape or cell the table never reached is kept;
-- **H bounds the horizon, and a tree remembers it**: a search refuses
-  `--to` past H, and a tree is extended under the filter it was built
-  under (`<level>/level_minus_one.txt`), whatever the environment says.
-  For a LARGER horizon the tree is built again: since the hull forward
-  (2026-10-13) level -1 drops PUSHES, and a dropped push leaves a hull
-  smaller and a state later or unreached, so a tree's frames depend on H
-  throughout (plans/architecture.md "The hull forward"). The raise that
-  re-expanded the noted sources of the drops (2026-10-08 to 2026-10-13)
-  served the remainder-free forward only.
+## Checks done
 
-The table is horizon-independent: one per room.
+- Recorded transitions against the table, 0 violations: room (2,0)
+  (463,567 pairs and 162 exit crossings at S = 5 and 6), (1,0) (383,247),
+  (0,2) (288,366).
+- Marked states too late: 0 (room (2,0) h95, 19.2M; room (1,0) f50-f99).
+- `l1-check` of known solutions, 0 too late: (1,0) 99, (5,0) 77, (2,3) 106,
+  (6,2) 75, (3,0) 89, (6,2) nodiag 80, (6,2) gemskip 120; in float, 94
+  Celia goldens (8,054 states).
 
-## Soundness checks done
+## Measurements
 
-- Room (2,0), against the recorded `posgraph.bin` of a level-0 tree: 463,567
-  in-room pairs and 162 exit crossings, 0 violations at S=5 and S=6.
-- The backward's marks at h95 (19,245,834 states): 0 marked states too late.
-  With the filter on, h95's level-0 marks are EXACTLY the band run's: the
-  filter dropped no state on a path to a win.
-- Room (1,0) at S=5, ceiling 99: 0 violations against 383,247 recorded pairs,
-  0 marked states too late at every frame f50-f99.
-- Room (0,2): 288,366 recorded in-room transitions of an unfiltered `r0sxhn`
-  tree, 0 not in the table.
-
-- A known solution against the table: `rewrite --room X,Y
-  l1-check --inputs tas/FILE --horizon EXIT` steps it with the reference
-  engine and fails if any state of the exiting lineage is too late. 0 too
-  late (2026-10-07): (1,0) at 99, (5,0) at 77, (2,3) at 106, (6,2) at 75,
-  (3,0) at 89, (6,2) nodiag at 80, (6,2) gemskip (TAS23's 120).
-
-## Measurements that matter
-
-| room | table build | nodes | start's d | known optimum | effect |
+| room | table build | nodes | start's d | optimum | effect |
 |---|---|---|---|---|---|
-| (1,0) | 19.9 s | 17,904 | 44 | 99 | drops 34% of level 0's rows f0-f99, all from f73; pays in memory (4.25 vs 5.76 GB), not time |
-| (2,0) | 472 s (S=5, 16 threads) | 154,408 | 45 | 95 | f80 24.0M states against 62.8M (49 s vs 131 s a frame), f90 1.0M, f95 1; OPTIMAL 95 in 27:28 at 28 GB with no band |
-| (5,1) | 39 s | | 45 | 104 | resumed at f88: f90 7.0M kept (unfiltered f89 37.7M) -> 1.1M at f95 |
-| (0,2) | 3:52 | 61,208 | 45 | 81 | f61 6.28M vs 6.96M, f70 1.3M (unfiltered f75 65.8M, killed at 30 GB) |
+| (1,0) | 19.9 s | 17,904 | 44 | 99 | drops 34% of level 0's rows f0-f99, all from f73; memory, not time |
+| (2,0) | 472 s | 154,408 | 45 | 95 | f80 24.0M states against 62.8M; OPTIMAL 95 in 27:28 |
+| (5,1) | 39 s | | 45 | 104 | f90 7.0M kept (unfiltered f89 37.7M) -> 1.1M at f95 |
+| (0,2) | 3:52 | 61,208 | 45 | 81 | f70 1.3M (unfiltered f75 65.8M, killed at 30 GB) |
 | (6,1) | 6:43 | 78,544 | 49 | 89 | |
-| (7,1) | 32 s | 21,250 | 45 | 86 | |
 
-d is weak by design: the start's d is ~45 against optima of 80-130 (the
-player may move at S px/frame in any direction at every node). It bites only
-in the last ~20 frames - which is exactly where a room's level 0 explodes
-when its frames do not dedupe (springs, ice). It does NOT rescue a room
-whose every frame is new: room (6,0) with platforms exact kept the
-unfiltered counts at f50 (d = 31 against the real 46); that needed `p`.
+d is weak by design (start's d ~45 against optima of 80-130: the player
+may move S px a frame in any direction). It bites in the last ~20 frames,
+exactly where a room's level 0 explodes when its frames do not dedupe
+(springs, ice). It does not rescue a room whose every frame is new (room
+(6,0) with platforms exact: d 31 against the real 46; that needed `p`).
 
-## Build failures and their fixes (each a premise the table CHECKS that the evaluator could not decide; none weakened)
+## Build failures and their fixes
 
-- **The balloon's phase** (rooms (6,1), (7,1)): the start representative
-  holds a blanked 0 where every state holds the literal [0, 1); the walk now
-  records the start's own intervals (`LatticeWalk::start_ivals`), a slot every
-  state holds as one literal is read as that literal (`Shape::lits`), and
-  `Lo`/`Hi`/`Sub` lift selects out (`Lift::Ends`).
-- **A tile loop over a joined `x`** (rooms (7,1), (0,2), (6,1)): over
-  `sel(spd ~= 0, x moved, x)` the loop's two ends are independent; lifting
-  every op through the select decides it but grows the graph ~25x, so it is
-  the FALLBACK per node in violation (`Traced::precise`).
-- **The fake wall's speed** (room (0,2)): a 3-piece move operand; the arity is
-  now the hull's width at level -1 (1,210 configurations).
-- **The point split** (2026-09-20) and the move arity cap (`7dce5b4`) had
-  silently broken level -1 everywhere, room (1,0) included, unnoticed because
-  the room being run did not use it. Repaired in `4b31c1b`.
-- **The fly fruit** (rooms (3,0), (6,2); 2026-10-07): exact, its flight
-  (`spd.y = appr(spd.y, -3.5, 0.25)`, `fly` unknown) grows `spd.y` by 0.25 a
-  pass until the widening jumps to the 16.16 extreme; its `move` fork then
-  spans 65,536 floors at arity 2 and `rem.y` leaves [-0.5, 0.5). Now a shape
-  with a player and a fly fruit is traced with the `f` level's fruit
-  (the widening table's "fly fruit": `step`/`y` unknown, `spd.y`/`rem.y` their
-  literal ranges, `fly` unknown; the evaluator reads the unknown number as
-  TOP). Sound because only the player is measured: a forgotten fruit is
-  "maybe collected, maybe gone" everywhere, which only weakens d. The spawn
-  prefix stays exact (one concrete chain). Room (3,0): 64,650 nodes, start
-  d 45, 5:38; room (6,2): 62,484 nodes, start d 45, 2:25 (the same table with
-  `--gemskip`).
-- **A start slot only a later frame writes an interval to** (rooms (5,0),
-  (2,3): the balloon's bob `y`, "not a literal range"): the start state holds
-  a constant there; only slots the start state itself holds as an interval
-  (`LatticeWalk::start_ivals`, now with `None` for a non-literal) are seeded
-  from the start's literal, the rest from the representative's value. Room
-  (5,0): 17,342 nodes, start d 46; room (2,3): 19,222 nodes, start d 44.
-- Rooms that built before keep their fingerprints ((1,0) `b909eb5d1645fad6`,
-  (4,2) `af00ed208170568a`, (7,0) `9d3b5f393a563677`).
-- **Still refused**: the summit (it measures the room exit); not re-checked:
-  room (1,2) (a platform room).
-- **Reverted** (`4b31c1b`, Philippe: the table was not asked for every room
-  and did not rescue room (6,0)): platform phases from concrete snapshots, an
-  "unmodelled node gets d = 1" rule, range-reading other objects' forks.
+Each a premise the table checks that the evaluator could not decide; none
+weakened:
 
-## Deferred: the off-screen lane (precision)
+- the balloon's phase: the walk records the start's own intervals, and a
+  slot every state holds as one literal is read as that literal;
+- a tile loop over a joined `x`: lifting every op through the select is
+  the fallback per node in violation (`Traced::precise`; ~25x the graph);
+- the fake wall's speed: the move arity is the hull's width;
+- the fly fruit's flight grew `spd.y` to the 16.16 extreme: traced with the
+  `f` level's fruit since 2026-10-07;
+- a start slot only a later frame writes an interval to: only slots the
+  start holds as an interval are seeded from its literal.
 
-Room (2,0)'s left pocket stays in the frontier 16 frames too long: the table's
-fastest path leaves the room on the left and flies up outside it at 5
-px/frame. `freeze` and `djump` are one full range per shape (no condition
-refinement), so `_update`'s "moved" and `_draw`'s "clamp skipped" join every
-frame, with a dash every frame. Chosen fix (C, not built): small counters
-exact per node - a node is (shape, cell, `freeze`, `djump`) - up to 6x the
-nodes; the filter would take the minimum d over a cell's counters. Check with
-the table's fastest path from (16, 48) (the `--l1-path` probe printed it;
-cut 2026-10-10, branch `settings-explicit`). Bigger: speed per node instead of [-S, S]
-everywhere (would bend the top's straight cut along gravity and walls).
+Still refused or not converging: the summit (it measures the room exit) and
+the platform rooms (6,0), (2,1), (1,2), in fixed and float.
 
-## In doubles (`--arith float`, 2026-10-16)
+## Deferred: the off-screen lane
 
-The table is built in the run's arithmetic (`build::<A>`): the float
-tracer's frames, the float interval evaluation, ranges of doubles. What
-each premise becomes (plans/float-solver.md, "After milestone 5"):
+Room (2,0)'s left pocket stays in the frontier 16 frames too long: the
+table's fastest path leaves the room on the left and flies up outside it.
+`freeze` and `djump` are one full range per shape, so `_update`'s "moved"
+and `_draw`'s clamp join every frame, with a dash every frame. Chosen fix,
+not built: small counters exact per node (shape, cell, `freeze`, `djump`),
+up to 6x the nodes, the filter taking the minimum d over a cell's
+counters. Bigger: speed per node instead of [-S, S] everywhere.
 
-- the evaluation bounds every lane: the doubles' interval ops round the
-  corners with the operation's own rounding, which is monotone (no
-  outward rounding: float-solver.md section 4);
-- ranges are kept in the TOTAL order (`-0` below `0`), so a range holds
-  its lanes' bits; the jump of a range grown twice goes to `+-f64::MAX`
-  (`Arithmetic::unknown`: a lane is finite, `NoWrap`);
-- a fork's span is the arithmetic's own count: floors, or for the
-  doubles' round fork (`RSplit`, `__split_by_round`) the values of
-  `flr(x + 1/2)`;
-- a pixel seeds its located coordinate as every number of its value (a
-  double's `0` and `-0`), unless the lattice pins the coordinate's bits.
+## In doubles (`--arith float`)
 
-Fixed is unchanged (the fixtures' tables rebuild to their fingerprints).
-Measured in float, Celia's starts:
-
-| room | entries | start d | fixed (real play or IL load) |
-|---|---|---|---|
-| (1,0) | 18,722 | 44 | 17,904, 44 |
-| (4,2) | 23,888 | 49 | 23,790, 49 |
-| (6,2) 100%, J2 | 64,173 | 48 | 63,912, 49 |
-| (0,3) gemskip 100%, J1 | 77,328 | 48 | |
-| (1,3) gemskip | 80,372 | 46 | |
-
-Soundness checks: the probe against float `r0sxhn`/`r0sxhf` trees' recorded
-transitions, 0 violations ((7,0) 41,909 pairs, (0,3) 63,216, (3,0)
-21,528); `l1-check` of every float golden Celia finishes (gates/celia:
-the tasdatabase's any%, 100%, nodiag, gemskip any%, gemskip 100% and
-gemskip nodiag files as Celia plays them) against its table: 94 runs,
-8,054 states on the exiting lineages checked, 0 too late. Not built: the
-platform rooms (6,0), (2,1), (1,2), whose tables do not converge clean in
-fixed either ((2,1): 694,080 violations; (6,0) still tracing after 19
-min), and the summit.
+The table is built in the run's arithmetic: the doubles' interval ops
+round each corner with the operation's own (monotone) rounding; ranges are
+kept in the total order (`-0` below `0`); a grown range jumps to
+`+-f64::MAX`; the round fork counts the values of `flr(x + 1/2)`. Float
+tables are within ~1-3% of the fixed ones' sizes with the same start d
+(plans/float.md). Fixed is unchanged (the fixtures' tables rebuild to their
+fingerprints).
 
 ## Limits
 
 - `unroll_bound("abs(amount)") = 8` caps S at 7.
-- Deaths are modelled only through the respawn's d; the window is a claim
-  from the code checked on every row the filter sees.
-- No condition refinement in the evaluator: counters (`freeze`, `djump`,
-  `dash_time`, `grace`, springs' `delay`) go to the full range.
+- Deaths are modelled only through the respawn's d.
+- No condition refinement: counters (`freeze`, `djump`, `dash_time`,
+  `grace`, the springs' `delay`) go to the full range.
