@@ -491,7 +491,9 @@ case $TIER in
     local) localgoldens ;;
     fixtures) fixtures ;;
     all) for TIER in t0 t1 t2 big perf local fixtures premerge; do
+             t=$SECONDS
              case $TIER in perf) perftier ;; local) localgoldens ;; *) $TIER ;; esac
+             echo "[$TIER] $((SECONDS - t)) s"
          done; TIER=all ;;
     *) sed -n '2,30p' "$0"; exit 2 ;;
 esac
