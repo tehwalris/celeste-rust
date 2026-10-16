@@ -478,6 +478,7 @@ mod tests {
     /// states, and holds the known route's state at every frame (the gate's
     /// witness, stepped by the reference engine and keyed in the tree).
     #[test]
+    #[ignore = "slow, ./check.sh t2 runs it: room (1,0)'s kernels and a forward, ~25 CPU-s"]
     fn the_exact_reach_holds_the_known_route_inside_the_tree() {
         use crate::frame::Block;
         use crate::trace::refengine::RefEngine;

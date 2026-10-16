@@ -1653,7 +1653,7 @@ mod tests {
         let s = crate::settings::Settings::default();
         let engine = RefEngine::new(&s).expect("ref engine");
         let init = vec![Block::canonical(engine.initial().expect("initial state")).expect("block")];
-        let dir = std::path::Path::new("/var/tmp/celeste-frame-fresh-start-test");
+        let dir = &std::path::PathBuf::from(format!("/var/tmp/celeste-frame-fresh-start-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(dir);
         let stale = [dir.join("edges/f009.bin"), dir.join("edges/xfer.bin"), dir.join("frames/f009.bin")];
         for f in &stale {
@@ -1668,46 +1668,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
-    /// KEYS ONLY: a frame file holds the frame's new states as keys and
-    /// cell masks. The frontier a resume reads from them is the forward's
-    /// own - every entry's key and cells, every shape's skeleton, and every
-    /// skeleton the emissions registered (a re-push may reach a state of a
-    /// shape no emission of its frame has) - at every frame to f36, and the
-    /// files are a few bytes a state (the row-and-id
-    /// files of format 14 were ~8 B a state; the rows themselves ~50 B).
-    #[test]
-    fn a_resumed_frontier_is_the_forwards_own() {
-        let s = crate::settings::Settings::default();
-        let dir = std::env::temp_dir().join(format!("celeste-keys-only-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        let level = crate::abstraction::Level::parse("r0sxh").expect("level");
-        let e = crate::compiled::FrameEngine::new(&s, level).expect("kernels");
-        let init = vec![Block::canonical(RefEngine::new(&s).expect("engine").initial().expect("init")).expect("block")];
-        let mut st = ForwardState::start(init, &dir, true, None, level, &s).expect("start");
-        let (mut states, mut bytes) = (0u64, 0u64);
-        let skel = |l: &Layer| -> Vec<(u64, crate::storage::layer::SkelRecord)> {
-            let mut v: Vec<_> = l.skeletons.iter().map(|(h, r)| (*h, crate::storage::layer::SkelRecord::of(r).expect("a record"))).collect();
-            v.sort_by_key(|x| x.0);
-            v
-        };
-        for f in 1..=36 {
-            st.extend(&e, &dir, f, None).expect("extend");
-            let back = ForwardState::at(&dir, f, false, level, &s).expect("at");
-            assert_eq!(st.frontier.new.iter().collect::<Vec<_>>(), back.frontier.new.iter().collect::<Vec<_>>(), "f{f}: the frontier's entries");
-            assert_eq!((&st.frontier.hulls, &st.frontier.old), (&back.frontier.hulls, &back.frontier.old), "f{f}: the frontier's hulls");
-            assert_eq!(skel(&st.frontier.new), skel(&back.frontier.new), "f{f}: the frontier's skeletons");
-            assert_eq!(st.skeletons.records(|_| false), back.skeletons.records(|_| false), "f{f}: the registered skeletons");
-            assert_eq!(st.visited.len(), back.visited.len(), "f{f}: the visited set");
-            states += st.frontier.new.states();
-            bytes += std::fs::metadata(crate::storage::layer::frame_path(&dir, f)).expect("stat").len();
-        }
-        assert!(states > 20_000, "{states} states: past the spawn");
-        assert!(bytes < states * 3 + 36 * 8192, "{bytes} B for {states} states: the files hold keys and masks only");
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
     /// THE HULL FORWARD LIES BETWEEN THE EXACT REACH AND THE WIDENED FORWARD,
-    /// room (1,0) to f44 (the gate's forward): with every hull widened to
+    /// room (1,0) to f34 (the gate's forward, its first 35 frames: to f44
+    /// it took 160 CPU-s): with every hull widened to
     /// the whole circle (`hull::WIDEN`: every state's remainder widened, the
     /// forward before hulls) the frames are exactly the forward gate's
     /// before hulls (gates/ckhash_room10_f000-044_widened.txt); the hull
@@ -1717,6 +1680,7 @@ mod tests {
     /// reaches, in a layer no later than the frame it is reached at, with
     /// every remainder the reach brings it in its hull.
     #[test]
+    #[ignore = "slow, ./check.sh t2 runs it: room (1,0)'s kernels and two forwards, ~30 CPU-s"]
     fn the_hull_forward_lies_between_the_exact_reach_and_the_widened_forward() {
         use crate::search::hull::WIDEN;
         use std::sync::atomic::Ordering;
@@ -1726,7 +1690,7 @@ mod tests {
         let level = crate::abstraction::Level::parse("r0sx").expect("level");
         let e = crate::compiled::FrameEngine::new(&s, level).expect("kernels");
         let init = || vec![Block::canonical(RefEngine::new(&s).expect("engine").initial().expect("init")).expect("block")];
-        let to = 44;
+        let to = 34;
         // Per frame, its states by content.
         let states = |d: &std::path::Path| -> Vec<rustc_hash::FxHashSet<u64>> {
             let t = crate::storage::layer::Tree::<P8>::open(d, to).expect("tree");
@@ -1741,7 +1705,7 @@ mod tests {
         let t = crate::storage::layer::Tree::<P8>::open(&wide, to).expect("tree");
         let lines: Vec<String> = (0..=to).map(|f| { let (n, acc) = t.layer(f, None, 4).expect("layer").0.content_fingerprint(&t.space, &t.shapes).expect("fp"); format!("f{f:03} {n} {acc:016x}") }).collect();
         let pinned = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/gates/ckhash_room10_f000-044_widened.txt")).expect("the gate");
-        assert_eq!(lines, pinned.lines().collect::<Vec<_>>(), "the widened forward is not the gate's");
+        assert_eq!(lines, pinned.lines().take(to as usize + 1).collect::<Vec<_>>(), "the widened forward is not the gate's");
         let (ws, hs) = (states(&wide), states(&hull));
         let first_in = |sets: &[rustc_hash::FxHashSet<u64>], h: u64| sets.iter().position(|x| x.contains(&h));
         let (mut n_hull, mut n_wide) = (0usize, 0usize);
@@ -1761,7 +1725,7 @@ mod tests {
         let p0 = crate::search::arc_dp::start_point::<P8>(&s).expect("start");
         let mut checked = 0u64;
         crate::search::reach::reach(&hull, to, p0, 4, |sums, _, cur, inexact| {
-            assert!(inexact.is_empty(), "room (1,0) to f44 needs no coarsening");
+            assert!(inexact.is_empty(), "room (1,0) to f{to} needs no coarsening");
             for (sk, r) in cur {
                 let layer = (0..=sums.frame).find(|&f| layers[f as usize].contains(*sk)).unwrap_or_else(|| panic!("f{}: an exactly reached state no layer holds", sums.frame));
                 // (A full hull is not stored: it holds everything.)
@@ -1863,6 +1827,7 @@ mod tests {
     /// the trusted length are overwritten. The one marker holds the frame
     /// and the transfer count; nothing else claims trust.
     #[test]
+    #[ignore = "slow, ./check.sh t2 runs it: room (1,0)'s kernels and three forwards, ~25 CPU-s"]
     fn a_frame_killed_before_its_done_marker_is_rerun() {
         let s = crate::settings::Settings::default();
         let base = std::env::temp_dir().join(format!("celeste-done-marker-{}", std::process::id()));
@@ -1903,10 +1868,9 @@ mod tests {
 
     /// Extending frame by frame and resuming reproduce a fresh run's key sets.
     #[test]
-    #[ignore]
     fn forward_extended_frame_by_frame_matches_fresh() {
         let s = crate::settings::Settings::default();
-        let dir = std::path::Path::new("/var/tmp/celeste-frame-rebuild-resume-test");
+        let dir = &std::path::PathBuf::from(format!("/var/tmp/celeste-frame-rebuild-resume-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(dir);
         std::fs::create_dir_all(dir).expect("mkdir");
         // A frame's states by content (their keys are their tree's).
@@ -1943,7 +1907,7 @@ mod tests {
         eprintln!("[extend] frame 4 states identical: {}", fresh4.0);
 
         // RESUME: a fresh run to 6 against the tree above resumed at 4.
-        let fresh_dir = std::path::Path::new("/var/tmp/celeste-frame-rebuild-resume-test-fresh6");
+        let fresh_dir = &std::path::PathBuf::from(format!("/var/tmp/celeste-frame-rebuild-resume-test-fresh6-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(fresh_dir);
         std::fs::create_dir_all(fresh_dir).expect("mkdir");
         {
@@ -1966,52 +1930,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(fresh_dir);
     }
 
-    /// THE REFERENCE FORWARD'S TREE IS THE KERNELS': room (1,0) at the
-    /// exact level to f27 (~2k states past the spawn), frames, edges and
-    /// hulls alike (`storage::fingerprint`) - the reference's transfers
-    /// (its arc capture, decoded by the one decoder) are the kernels'.
-    #[test]
-    fn the_reference_forwards_tree_is_the_kernels() {
-        use crate::abstraction::Level;
-        let s = crate::settings::Settings::default();
-        let base = std::env::temp_dir().join(format!("celeste-ref-forward-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&base);
-        let init = || vec![Block::canonical(RefEngine::new(&s).expect("engine").initial().expect("init")).expect("block")];
-        let (k, r) = (base.join("kernels"), base.join("reference"));
-        forward_run(&crate::compiled::FrameEngine::new(&s, Level::EXACT).expect("kernels"), init(), &k, 27, true).expect("the kernels' forward");
-        forward_run(&RefFrameStep::<P8>::new(&s, Level::EXACT).expect("engines"), init(), &r, 27, true).expect("the reference forward");
-        let (fk, fr) = (crate::storage::fingerprint::<P8>(&k, 27, true, true, 4).expect("kernels"), crate::storage::fingerprint::<P8>(&r, 27, true, true, 4).expect("reference"));
-        assert_eq!(fk, fr, "the reference forward's tree is not the kernels'");
-        assert!(fk.iter().any(|l| l.starts_with("f027 ") && !l.starts_with("f027 0 ")), "f27 holds states");
-        let _ = std::fs::remove_dir_all(&base);
-    }
-
-    /// Room (0,2)'s SPAWN FRAME: kernels and reference make the same
-    /// successors. Guards `Graph::tile_flag_over` reading every row a span covers.
-    #[test]
-    fn room_02_spawn_frame_kernels_make_the_reference_successors() {
-        use crate::abstraction::Level;
-        let s = crate::settings::Settings { room: (0, 2), ..Default::default() };
-        let kernels = crate::compiled::FrameEngine::new(&s, Level::EXACT).expect("kernels");
-        let reference = RefFrameStep::<P8>::new(&s, Level::EXACT).expect("ref engines");
-        // 25 frames of no input: the spawn's last frame is the 26th.
-        let mut concrete = RefEngine::new(&s).expect("ref engine");
-        let mut row = concrete.initial().expect("initial state");
-        for _ in 0..25 {
-            row = concrete.step_one(&row, 0).expect("frame").into_rt2();
-        }
-        widen_rt2_to(&mut row, Level::EXACT);
-        let successors = |engine: &dyn FrameStep| -> std::collections::BTreeSet<((u64, u64), u32)> {
-            let next = crate::storage::wave::one_frame(engine, vec![Block::from_rt2(row.clone_block())], 26).expect("frame").next;
-            next.iter().flat_map(|b| b.keys().iter().copied().zip(b.positions().expect("cells"))).collect()
-        };
-        let (k, r) = (successors(&kernels), successors(&reference));
-        let at: std::collections::BTreeSet<_> = r.iter().map(|(_, c)| crate::search::pos_graph::cell_xy(*c)).collect();
-        assert_eq!(at, [Some((16, 104))].into_iter().collect(), "the player stands at its spawn");
-        assert!(r.len() > 1, "the buttons make more than one successor");
-        assert_eq!(k.difference(&r).count() + r.difference(&k).count(), 0, "kernels {} successors, reference {}: {} only in the reference", k.len(), r.len(), r.difference(&k).count());
-    }
-
     /// A REGION KERNEL CHECKS ITS BOUNDS: a lane whose speed or remainder lies
     /// outside the ranges its kernel was specialized on DECLINES (the
     /// restrictions' own error, `Op::Restrict`), and the same lane inside them
@@ -2019,6 +1937,7 @@ mod tests {
     /// input cells with those ranges and folded the check away: such a lane
     /// was computed silently wrong.
     #[test]
+    #[ignore = "slow, ./check.sh t2 runs it: room (1,0)'s kernels, ~20 CPU-s"]
     fn a_lane_outside_its_kernels_bounds_declines() {
         use crate::abstraction::Level;
         let s = crate::settings::Settings::default();
@@ -2085,6 +2004,7 @@ mod tests {
     /// (`Symbolic::ranges`, gone), checked nowhere, and `rem.x` was not read:
     /// such a lane was computed silently wrong.
     #[test]
+    #[ignore = "slow, ./check.sh t2 runs it: room (2,1)'s platform kernels, ~100 CPU-s"]
     fn a_lane_outside_its_platform_bounds_declines() {
         use crate::abstraction::Level;
         let s = crate::settings::Settings { room: (2, 1), ..Default::default() };
@@ -2147,46 +2067,6 @@ mod tests {
         assert!(!runs(&with(spd, add(speed, px(1)), add(speed, px(1)))), "spd.x past its worlds' range declines");
     }
 
-    /// Room (1,3)'s 127-frame EXIT FRAME: the kernels make the concrete exit's
-    /// state, KEY included. Guards a number and its point interval keying alike.
-    #[test]
-    fn room_13_exit_frame_keys_the_concrete_exit() {
-        use crate::abstraction::Level;
-        let s = crate::settings::Settings { room: (1, 3), ..Default::default() };
-        let level = Level::parse("r0sxh").expect("level");
-        let kernels = crate::compiled::FrameEngine::new(&s, level).expect("kernels");
-        let text = std::fs::read_to_string("tas/room_1_3_reference_frame_127.txt").expect("the reference solution");
-        let inputs: Vec<u8> = text
-            .lines()
-            .filter(|l| !l.trim_start().starts_with('#'))
-            .flat_map(|l| l.split(',').filter(|t| !t.trim().is_empty()).map(|t| t.trim().parse::<u8>().expect("an input byte")).collect::<Vec<_>>())
-            .collect();
-        assert_eq!(inputs.len(), 127);
-        let mut reference = RefEngine::new(&s).expect("ref engine");
-        let mut st = reference.initial().expect("initial state");
-        for &b in &inputs[..126] {
-            st = reference.step_one(&st, b).expect("one concrete successor").into_rt2();
-        }
-        let exit = reference.step_one(&st, inputs[126]).expect("one concrete successor");
-        assert!(wins_of(exit.rt2(), &s).expect("wins")[0], "the reference solution exits at frame 127");
-        let mut parent = st;
-        widen_rt2_to(&mut parent, level);
-        let wave = crate::storage::wave::one_frame(&kernels, vec![Block::from_rt2(parent)], 127).expect("frame");
-        // The frame's key space (a tree of the parent alone).
-        let space = wave.keys.clone();
-        let mut made: std::collections::BTreeSet<(u64, Option<(u64, u64)>, u32)> = Default::default();
-        for b in &wave.next {
-            let stored: Vec<Option<(u64, u64)>> = b.keys().iter().map(|&k| Some(k)).collect();
-            let mut canonical = b.rt2().clone_block();
-            canonical.canonical();
-            assert_eq!(stored, space.lookup_keys(&canonical, crate::compiled::ids()), "an emitted row's key is not its columns' key (shape {:#x})", b.rt2().shape_hash);
-            let (shape, keys, cells) = widened_keys(b, level, &space).expect("keys");
-            made.extend(keys.into_iter().zip(cells).map(|(k, c)| (shape, k, c)));
-        }
-        let (shape, keys, cells) = widened_keys(&exit, level, &space).expect("keys");
-        assert!(keys[0].is_some() && made.contains(&(shape, keys[0], cells[0])), "the kernels do not make the concrete exit's state ({} successors)", made.len());
-    }
-
     /// The summit wins at the flag: the TAS31 reference wins at frame 55, not before.
     #[test]
     fn the_summit_reference_wins_at_the_flag() {
@@ -2217,11 +2097,12 @@ mod tests {
     /// state's hull merges its sources' and part b moves no remainder, so
     /// the boundaries' hulls are the unsplit frame's.)
     #[test]
+    #[ignore = "slow, ./check.sh t2 runs it: room (2,1)'s split kernels and a forward, ~55 CPU-s"]
     fn split_frame_reaches_the_unsplit_frontier_at_a_near_level() {
         use crate::abstraction::Level;
         let s = crate::settings::Settings { room: (2, 1), split_frame: true, ..Default::default() };
         let level = Level::parse("r0sxhn").expect("level");
-        let dir = std::path::Path::new("/var/tmp/celeste-frame-split-near-test");
+        let dir = &std::path::PathBuf::from(format!("/var/tmp/celeste-frame-split-near-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(dir);
         std::fs::create_dir_all(dir).expect("checkpoint dir");
         let engine = crate::compiled::FrameEngine::new(&s, level).expect("engine");

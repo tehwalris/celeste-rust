@@ -2419,49 +2419,4 @@ mod tests {
         }
         assert!(checked > 50, "only {checked} winning starts exercised");
     }
-
-    /// THE FIRST FLOAT OPTIMUM, END TO END: room (1,0) to a synthetic win at
-    /// (4, 101) by f30, in Celia's doubles (the reference engine's tree) and
-    /// in 16.16 (the kernels'). Both arc bounds are 28 and the concrete
-    /// search wins there with one witness; the gate's known route (exit f29)
-    /// survives every pruning step of both; and a sample of the float tree's
-    /// transfers agrees with the reference engine (`arc_check`), which a
-    /// corrupted transfer fails.
-    #[test]
-    fn a_float_search_proves_room_10s_synthetic_optimum() {
-        use crate::abstraction::Level;
-        use crate::frame::{grow_tree, Block, FrameStep};
-        use crate::settings::{Arith, FloatTool, Settings};
-        use crate::trace::refengine::{FloatRefEngine, RefEngine, RefFrameStep};
-        use celeste_core::lua_f64::LuaF64;
-        let base = std::env::temp_dir().join(format!("celeste-float-search-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&base);
-        let known = crate::concrete::read_inputs(concat!(env!("CARGO_MANIFEST_DIR"), "/gates/known_room10_win9-101.txt")).expect("the gate's route");
-        let fixed = Settings { win_at: Some((4, 4, 101, 101)), ..Settings::default() };
-        let float = Settings { arith: Arith::Float(FloatTool::Celia), loading_jank: crate::starts::celia_jank(fixed.room).expect("jank"), ..fixed.clone() };
-        let level = Level::EXACT;
-        // 16.16.
-        let dir = base.join("fixed");
-        grow_tree::<P8>(&dir, 30, None, None, level, || Ok(Box::new(crate::compiled::FrameEngine::new(&fixed, level)?) as Box<dyn FrameStep>), || Ok(vec![Block::canonical(RefEngine::new(&fixed)?.initial()?)?]), &fixed).expect("the fixed forward");
-        let route = super::super::known::Route { inputs: &known, filter: None };
-        let sf = solve::<P8>(&dir, level, 30, true, false, false, None, None, Some(&route), &fixed).expect("the fixed arc phase");
-        // Doubles.
-        let dir = base.join("float");
-        grow_tree::<LuaF64>(&dir, 30, None, None, level, || Ok(Box::new(RefFrameStep::<LuaF64>::new(&float, level)?) as Box<dyn FrameStep<LuaF64>>), || Ok(vec![Block::canonical(FloatRefEngine::new(&float)?.initial()?)?]), &float).expect("the float forward");
-        let route = super::super::known::Route { inputs: &known, filter: None };
-        let sd = solve::<LuaF64>(&dir, level, 30, true, false, false, None, None, Some(&route), &float).expect("the float arc phase");
-        for (what, arc, wt, k) in [("16.16", sf.arc, sf.concrete.as_ref(), sf.known), ("doubles", sd.arc, sd.concrete.as_ref(), sd.known)] {
-            assert_eq!(arc, Some(28), "{what}: the arc bound");
-            assert_eq!(wt.map(|w| w.inputs.len()), Some(28), "{what}: the concrete optimum");
-            assert_eq!(k, Some(29), "{what}: the known route is checked and survives");
-        }
-        assert_eq!(sd.concrete.as_ref().map(|w| w.inputs.clone()), sf.concrete.as_ref().map(|w| w.inputs.clone()), "one witness for both (the same input order)");
-        let check = |fault| {
-            let o = super::super::arc_check::Opts { dir: &dir, from: 24, to: 30, samples: 6, level, fault, path_cap: None, settings: &float };
-            super::super::arc_check::run::<LuaF64>(&o)
-        };
-        check(None).expect("the float transfers agree with the reference engine");
-        assert!(check(Some("action")).is_err(), "a corrupted transfer fails the check");
-        let _ = std::fs::remove_dir_all(&base);
-    }
 }

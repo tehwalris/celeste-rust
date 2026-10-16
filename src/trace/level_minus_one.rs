@@ -2291,7 +2291,7 @@ mod room_tests {
     /// Room (7,1)'s table builds and passes its own checks: start d = 45
     /// (the optimum is 86).
     #[test]
-    #[ignore = "~30 s with 8 threads: a lattice walk and five passes"]
+    #[ignore = "pre-merge, ./check.sh all runs it: a lattice walk and five passes, ~250 CPU-s"]
     fn room_71_table_builds_with_its_balloon() {
         if !std::path::Path::new("lua/celeste-minimal.lua").exists() {
             return;
@@ -2310,7 +2310,7 @@ mod room_tests {
     /// Room (1,0)'s table in FLOAT (Celia's start) builds and passes its own
     /// checks: start d = 44, as fixed's.
     #[test]
-    #[ignore = "~10 s: a float lattice walk and its passes"]
+    #[ignore = "pre-merge, ./check.sh all runs it: a float lattice walk and its passes, ~110 CPU-s"]
     fn room_10_float_table_builds() {
         if !std::path::Path::new("lua/celeste-minimal.lua").exists() {
             return;

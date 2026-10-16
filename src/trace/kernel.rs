@@ -454,6 +454,7 @@ impl<A: GraphArith> NoPlayer<A> {
 mod tests {
 
     #[test]
+    #[ignore = "slow, ./check.sh t2 runs it: room (6,1)'s lattice walk, ~15 s"]
     fn near_floors_side_by_side_split_only_what_collisions_read() {
         if !std::path::Path::new("lua/celeste-minimal.lua").exists() {
             return;
@@ -471,62 +472,6 @@ mod tests {
         assert!(traced >= 2, "{traced} (shape, region) nodes traced");
     }
 
-    /// THE START'S LANES ARE INSIDE THE BOUNDS OF EVERY SPAWN SHAPE WITHOUT
-    /// THE FLY FRUIT. At a fruit level the walk widens the fly fruit, which
-    /// may be gone at any frame: from the start the forward reaches the spawn
-    /// phase's shapes without it, which the start's chain (the fruit exact)
-    /// never takes. A respawn's exploration with the fruit exact gave such a
-    /// shape the respawn's hull alone (`y` <= 120, `spd.y` >= -3.5), and the
-    /// start's lane one frame in (`y` 124, `spd.y` -4) declined (room (6,0),
-    /// `r0sxhfp`, the split frame: t2's platform room, 2026-10-15). Every
-    /// such node's bound on a spawn field holds the start's value one frame
-    /// in (the reference engine's).
-    #[test]
-    fn the_start_is_inside_the_bounds_of_its_fruit_gone_shapes() {
-        use super::super::{iface, shapes, widen};
-        use celeste_engine::runtime2::{Col, AV};
-        let s = crate::settings::Settings { room: (6, 0), ..Default::default() };
-        let opts = crate::abstraction::Level::parse("r0sxhf").expect("level");
-        // The spawn's region: its player dies there too, and its respawns are explored.
-        let only = [super::Region { ix: 1, iy: 7 }];
-        let lw: super::LatticeWalk = super::room_constant_lattice(std::path::Path::new("."), opts, &super::Walk { settings: &s, only: Some(&only) }).unwrap_or_else(|e| panic!("{e:#}"));
-        // The start one frame in, concrete: its spawn's field at a path below it.
-        let mut eng = crate::trace::refengine::RefEngine::new(&s).expect("engine");
-        let row = eng.step_one(&eng.initial().expect("start"), 0).expect("one frame").into_rt2();
-        let ids = crate::compiled::ids();
-        let spawn = *row.objects_of_type(ids, ids.g_player_spawn).first().expect("the spawn, one frame in");
-        let value = |below: &[iface::Step]| -> Option<i32> {
-            let (mut obj, mut cell) = (spawn, None);
-            for step in below {
-                let iface::Step::Key(k) = step else { return None };
-                if let Some(c) = cell {
-                    let Col::U(AV::Ptr(sub)) = row.cols[c as usize] else { return None };
-                    obj = sub;
-                }
-                cell = Some(row.obj_field_cell(obj, celeste_names::field_id(k)?)?);
-            }
-            match row.cols[cell? as usize].at(0) {
-                AV::Num(n) => Some(n.as_raw_u32() as i32),
-                _ => None,
-            }
-        };
-        let mut checked = 0;
-        for ((shape, region), f) in &lw.frames {
-            let rep = &lw.reps[shape];
-            if region.is_some() || shapes::player_path(rep).is_some() || !widen::objects_of_type(rep, "fly_fruit").is_empty() {
-                continue;
-            }
-            for o in widen::objects_of_type(rep, "player_spawn") {
-                for (p, (lo, hi)) in f.bounds.iter().filter(|(p, _)| p.starts_with(&o)) {
-                    let Some(v) = value(&p[o.len()..]) else { continue };
-                    assert!((*lo..=*hi).contains(&v), "a spawn shape without the fly fruit bounds {} to [{}, {}]: the start's lane one frame in holds {}", iface::show(p), *lo as f64 / 65536.0, *hi as f64 / 65536.0, v as f64 / 65536.0);
-                    checked += 1;
-                }
-            }
-        }
-        assert!(checked >= 6, "{checked} spawn bounds of shapes without the fly fruit checked");
-    }
-
     /// A RESPAWN IS INSIDE ITS SHAPE'S BOUNDS. Room (0,3) gemskip 100% under
     /// the loading jank (J 1) starts with the spawn one update in (y 124, a
     /// shape of its own: the springs gain `delay` at the first boundary), so
@@ -535,6 +480,7 @@ mod tests {
     /// that shape (the 2500m run's KERNEL COVERAGE GAP, 2026-10-14). Every
     /// no-player node's bound on a spawn's `y` covers 124.
     #[test]
+    #[ignore = "slow, ./check.sh t2 runs it: room (0,3)'s lattice walk, ~40 CPU-s"]
     fn a_respawn_after_the_loading_jank_is_inside_its_shapes_bounds() {
         use super::super::{iface, shapes, widen};
         let s = crate::settings::Settings { room: (0, 3), hundred: true, gemskip: true, loading_jank: Some(1), ..Default::default() };

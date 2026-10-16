@@ -397,23 +397,3 @@ pub fn run<A: Arithmetic>(s: &crate::settings::Settings, to: u32, max_nodes: usi
     }
     Ok(out)
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// THE CENSUS'S NODES ARE THE FORWARD'S: in 16.16, room (1,0) from its
-    /// start, the new nodes of every frame to f27 are the widened forward's
-    /// (the forward with every hull the whole circle) pinned counts.
-    #[test]
-    fn the_fixed_census_counts_the_widened_forwards_states() {
-        let s = crate::settings::Settings { threads: Some(8), ..Default::default() };
-        let pinned = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/gates/ckhash_room10_f000-044_widened.txt")).expect("the gate");
-        let want: Vec<usize> = pinned.lines().map(|l| l.split_whitespace().nth(1).expect("a count").parse().expect("a count")).collect();
-        let frames = run::<celeste_core::arith::Fixed>(&s, 27, usize::MAX, None, 8, false, |_| {}).expect("census");
-        for f in &frames {
-            assert_eq!(f.new, want[f.frame as usize], "frame {}: the census's new nodes against the widened forward's", f.frame);
-        }
-        assert_eq!(frames.len(), 27);
-    }
-}

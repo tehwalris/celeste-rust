@@ -269,6 +269,7 @@ mod tests {
     /// object's every number and boolean equal after every update, up to the
     /// room's exit.
     #[test]
+    #[ignore = "slow, ./check.sh t2 runs it: every UCT golden, ~30 CPU-s"]
     fn the_float_engine_plays_every_golden_as_uct_does() {
         replay_all(FloatTool::Uct);
     }
@@ -277,6 +278,7 @@ mod tests {
     /// (the same files as Celia plays them: tools/celia/golden.py) replayed
     /// from Celia's start (its loading jank `J`, its seeds).
     #[test]
+    #[ignore = "slow, ./check.sh t2 runs it: every Celia golden, ~30 CPU-s"]
     fn the_float_engine_plays_every_golden_as_celia_does() {
         replay_all(FloatTool::Celia);
     }
@@ -419,10 +421,13 @@ mod tests {
 
     /// THE LOCAL GOLDENS (`LOCAL_GOLDENS`): each tool's goldens of our
     /// unsubmitted witnesses replay as the committed ones do, and every local
-    /// witness leaves its room in the fixed engine. Where the store is absent
-    /// the test says SKIPPED on its output, which nextest shows on success
-    /// (.config/nextest.toml): never a silent pass.
+    /// witness leaves its room in the fixed engine. The store is the
+    /// machine's, not the checkout's, so t0 does not run it (`./check.sh
+    /// local` does, in the pre-merge run). Where the store is absent the test
+    /// says SKIPPED on its output, which nextest shows on success
+    /// (.config/nextest.toml) and check.sh repeats: never a silent pass.
     #[test]
+    #[ignore = "local, ./check.sh local runs it: reads the machine-local store /var/tmp/float-goldens"]
     fn the_local_goldens() {
         let base = std::path::Path::new(LOCAL_GOLDENS);
         let read = |p: &std::path::Path| match std::fs::read_to_string(p) {

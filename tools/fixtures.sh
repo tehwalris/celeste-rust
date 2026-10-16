@@ -12,6 +12,8 @@
 #   tools/fixtures.sh build NAME...    rebuild
 #   tools/fixtures.sh pin NAME...      rebuild and PIN its fingerprint (say
 #                                      why in the commit)
+#   tools/fixtures.sh verify NAME...   rebuild beside it and check the pin
+#                                      (./check.sh fixtures: all big)
 #   tools/fixtures.sh list
 #
 # A fixture under level -1 keeps the table it was built under
@@ -29,6 +31,8 @@ cd "$(dirname "$0")/.."
 ROOT=${CELESTE_FIXTURES:-/var/tmp/celeste-fixtures}
 B=${BIN:-${CARGO_TARGET_DIR:-./target}/quick/rewrite}
 PINS=gates/fixtures
+# Every build's memory cap (safe-run.sh), as check.sh's.
+MEM=20G
 
 L1_62="--hundred --loading-jank 2 --level-minus-one 94,5"
 # NAME -> FLAGS (the settings) | ROOM | COMMAND | TREE (the level dir under the fixture) | LAST
@@ -93,33 +97,46 @@ sources() {
 fingerprint() {
     local dir=$1/$TREE arith
     arith=$(grep -o -- '--arith [a-z]*' <<< "$FLAGS" || true)
-    ./safe-run.sh -- "$B" ckhash --room "$ROOM" $arith --to "$LAST" --edges --hulls --checkpoint-dir "$dir" 2>/dev/null
+    ./safe-run.sh --memory "$MEM" -- "$B" ckhash --room "$ROOM" $arith --to "$LAST" --edges --hulls --checkpoint-dir "$dir" 2>/dev/null
 }
 
+# build NAME [pin|verify]: build NAME from scratch with this checkout and
+# check it against its pin, then install it; `pin`: pin it instead;
+# `verify`: discard it (the installed fixture stays), a missing pin fails.
 build() {
-    local name=$1 pin=${2:-}
+    local name=$1 mode=${2:-}
     spec "$name"
     local dir=$ROOT/$name tmp=$ROOT/$name.tmp
+    [[ $mode == verify ]] && tmp=$ROOT/$name.verify
     [[ -n $DEP ]] && ensure "$DEP" && spec "$name"
-    echo "[fixtures] building $name: $CMD $FLAGS" >&2
-    rm -rf "$tmp" "$dir"
+    echo "[fixtures] building $name${mode:+ ($mode)}: $CMD $FLAGS" >&2
+    rm -rf "$tmp"
+    [[ $mode == verify ]] || rm -rf "$dir"
     mkdir -p "$tmp"
     local t0=$SECONDS
     if [[ $CMD == capture* ]]; then
         # One wave of the tree fixture, captured (--emit-capture).
         local f=${CMD#capture }
-        ./safe-run.sh -- "$B" bench-frame --level-dir "$ROOT/$DEP" --frame $((f - 1)) --edges --room "$ROOM" --level "$(level_of "$DEP")" $FLAGS --l1-table "$ROOT/$DEP/l1-table.bin" --emit-capture "$tmp" > "$tmp/build.out" 2> "$tmp/build.log" \
+        ./safe-run.sh --memory "$MEM" -- "$B" bench-frame --level-dir "$ROOT/$DEP" --frame $((f - 1)) --edges --room "$ROOM" --level "$(level_of "$DEP")" $FLAGS --l1-table "$ROOT/$DEP/l1-table.bin" --emit-capture "$tmp" > "$tmp/build.out" 2> "$tmp/build.log" \
             || { echo "[fixtures] $name: the capture FAILED (see $tmp/build.log)" >&2; exit 1; }
         # The captured wave is the tree fixture's frame check: the same lines.
-        if [[ -z $pin && -f $PINS/$DEP.frame ]] && ! diff -q "$PINS/$DEP.frame" "$tmp/build.out" > /dev/null; then
+        if [[ $mode == verify && ! -f $PINS/$DEP.frame ]]; then
+            echo "[fixtures] $name: no $PINS/$DEP.frame to verify the capture against" >&2
+            exit 1
+        fi
+        if [[ $mode != pin && -f $PINS/$DEP.frame ]] && ! diff -q "$PINS/$DEP.frame" "$tmp/build.out" > /dev/null; then
             echo "[fixtures] $name: the captured wave's f/e lines differ from $PINS/$DEP.frame" >&2
             exit 1
         fi
     else
-        ./safe-run.sh -- "$B" $CMD $FLAGS --l1-table "$tmp/l1-table.bin" --checkpoint-dir "$tmp" > "$tmp/build.out" 2> "$tmp/build.log" \
+        ./safe-run.sh --memory "$MEM" -- "$B" $CMD $FLAGS --l1-table "$tmp/l1-table.bin" --checkpoint-dir "$tmp" > "$tmp/build.out" 2> "$tmp/build.log" \
             || { echo "[fixtures] $name: the build FAILED (see $tmp/build.log)" >&2; exit 1; }
         fingerprint "$tmp" > "$tmp/ckhash.txt"
-        if [[ -n $pin || ! -f $PINS/$name.ckhash ]]; then
+        if [[ $mode == verify && ! -f $PINS/$name.ckhash ]]; then
+            echo "[fixtures] $name: no pinned fingerprint $PINS/$name.ckhash to verify against" >&2
+            exit 1
+        fi
+        if [[ $mode == pin || ! -f $PINS/$name.ckhash ]]; then
             cp "$tmp/ckhash.txt" "$PINS/$name.ckhash"
             echo "[fixtures] $name: fingerprint PINNED to $PINS/$name.ckhash" >&2
         elif ! diff -q "$PINS/$name.ckhash" "$tmp/ckhash.txt" > /dev/null; then
@@ -128,6 +145,11 @@ build() {
             echo "[fixtures]   The forward changed. If intended: tools/fixtures.sh pin $name, and say why in the commit." >&2
             exit 1
         fi
+    fi
+    if [[ $mode == verify ]]; then
+        rm -rf "$tmp"
+        echo "[fixtures] $name: rebuilt in $((SECONDS - t0)) s, as pinned" >&2
+        return
     fi
     {
         echo "name $name"
@@ -169,16 +191,17 @@ ensure() {
 }
 
 case ${1:-} in
-    ensure|build|pin)
+    ensure|build|pin|verify)
         verb=$1; shift
-        names=$*
-        [[ $names == all ]] && names=$ALL
-        [[ $names == big ]] && names=$BIG
+        names=""
+        for w in "$@"; do
+            case $w in all) names+=" $ALL" ;; big) names+=" $BIG" ;; *) names+=" $w" ;; esac
+        done
         for n in $names; do
             case $verb in
                 ensure) ensure "$n" ;;
                 build) build "$n" ;;
-                pin) build "$n" pin ;;
+                pin|verify) build "$n" "$verb" ;;
             esac
         done
         ;;
@@ -188,5 +211,5 @@ case ${1:-} in
             printf '%-11s %s\n' "$n" "$( [[ -f $ROOT/$n/manifest.txt ]] && grep ^built "$ROOT/$n/manifest.txt" || echo missing)"
         done
         ;;
-    *) sed -n '2,22p' "$0"; exit 2 ;;
+    *) sed -n '2,24p' "$0"; exit 2 ;;
 esac

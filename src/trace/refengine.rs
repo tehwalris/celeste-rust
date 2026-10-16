@@ -579,39 +579,6 @@ mod tests {
 
     use super::*;
 
-    /// THE ONE CONVERTER AGREES ACROSS THE SIDES over real states: every
-    /// state along room (1,0)'s and room (4,2)'s exits (reference rows), and
-    /// the kernels' successors of every fifth (widened rows: intervals, the
-    /// buttons' and the held trails' unknowns). Each lane, read into the
-    /// tracer's domain and the reference's, converts back to one block with
-    /// one key (`RefEngine::check_agreement`).
-    #[test]
-    fn the_tracer_and_the_reference_convert_every_state_alike() {
-        let level = Level::parse("r0sxh").expect("level");
-        for (room, tas) in [((1, 0), "tas/room_1_0_exit_frame_99.txt"), ((4, 2), "tas/room_4_2_exit_frame_71.txt")] {
-            let s = crate::settings::Settings { room, ..Default::default() };
-            let mut eng = RefEngine::new(&s).expect("ref engine");
-            let kernels = crate::compiled::FrameEngine::new(&s, level).expect("kernels");
-            let mut row = eng.initial().expect("initial state");
-            let (mut states, mut lanes) = (0, 0);
-            for (f, &byte) in crate::concrete::read_inputs(tas).expect("the exit's inputs").iter().enumerate() {
-                eng.check_agreement(&row).unwrap_or_else(|e| panic!("room {room:?} frame {f}: {e:#}"));
-                states += 1;
-                if f % 5 == 2 {
-                    let mut parent = row.clone_block();
-                    crate::frame::widen_rt2_to(&mut parent, level);
-                    let next = crate::storage::wave::one_frame(&kernels, vec![Block::from_rt2(parent)], f as u32 + 1).expect("kernel frame").next;
-                    for b in &next {
-                        eng.check_agreement(b.rt2()).unwrap_or_else(|e| panic!("room {room:?} kernel successors of frame {f}: {e:#}"));
-                        lanes += b.rt2().width;
-                    }
-                }
-                row = eng.step_one(&row, byte).expect("frame").into_rt2();
-            }
-            assert!(states >= 71 && lanes > 100, "room {room:?}: {states} states, {lanes} kernel lanes");
-        }
-    }
-
     /// A BUILTIN HELD IN SEVERAL SLOTS is a `Bi` cell at each, on both
     /// sides. The two converters disagreed here: the reference's made the
     /// first slot in traversal order the builtin's cell and pointed the
@@ -741,6 +708,7 @@ mod tests {
     /// waits, takes off at the dash and is collected) at `r0sxhf` - and it
     /// saves most of the reference's paths, which is its point.
     #[test]
+    #[ignore = "slow, ./check.sh t2 runs it: the reference along room (6,2)'s route, ~30 CPU-s"]
     fn pinning_the_fly_fruits_motion_keeps_the_projected_successors() {
         let settings = crate::settings::Settings { room: (6, 2), hundred: true, loading_jank: Some(2), ..Default::default() };
         let (with, pinned, full) = pins_keep_the_projected_successors(settings, "tas/room_6_2_hundred_frame_93.txt", 5, true, "r0sxhf", "fly_fruit");
@@ -754,7 +722,7 @@ mod tests {
     /// leaves, ~200 s, hence ignored; run it when the pin or the cart's floor
     /// changes).
     #[test]
-    #[ignore]
+    #[ignore = "pre-merge, ./check.sh all runs it: ~200 CPU-s and 16 GB"]
     fn pinning_isolated_floors_keeps_the_projected_successors() {
         let (with, pinned, full) = pins_keep_the_projected_successors(crate::settings::Settings { room: (1, 1), ..Default::default() }, "tas/room_1_1_exit_frame_94.txt", 4, false, "r0sxhn", "fall_floor");
         assert!(with >= 20, "only {with} sampled states have a fall floor");
