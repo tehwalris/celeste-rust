@@ -108,6 +108,7 @@ above are from before.
 |---|---|---|
 | gate10-forward | `forward --to 44`, posgraph and `ckhash --hulls` against gates/ (CLAUDE.md's oracles 1-2) | 2.8 s |
 | gate10-arc | `search --to 35 --win-at 9,101 --prefer` (oracle 3 and the known route) | 1.8 s |
+| gate10f-forward, gate10f-arc | the same two in float (`--arith float`, the doubles' kernels; `gates/float_*`, plans/float-solver.md milestone 5) | 4.0 s, 3.2 s |
 | search42-objects | room (4,2) `r0sxhn,r0sxh` (the objects ladder) to f50 at a synthetic win (32,56): arc bounds 47/47, concrete optimum 47; its witness as the known route; every `[gate]` line pinned | 5.0 s |
 | export-ui | `rewrite export-ui` of gate10-arc's and search42's searches with their marks (`--save-marks`): every binary file and run.json without its timings, pinned by digest (`gates/fixtures/export-ui.sha256`; pinned 2026-10-12 from the in-memory export, which the streamed one reproduces byte for byte, as it does the mod room's balloon run) | 0.2 s |
 | forward60-platforms | room (6,0) `r0sxhfp` split frame to step 71: `ckhash --edges --hulls` = the r60s fixture's pin | 25.5 s (the platform kernels' walk ~20 s) |

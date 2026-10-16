@@ -894,8 +894,8 @@ new needs refuting; what they cost is the measurement.
     and act as `move` does at every probe), and the push is tested sound.
 - The reference engine is generic. `RefFrameStep<N>` runs a unit's lanes
   in parallel on its pool of engines and emits them a chunk at a time.
-- `rewrite forward --arith float` always runs the reference engine (there
-  are no float kernels); `ckhash` reads float trees.
+- `rewrite forward --arith float` ran the reference engine (M5 added the
+  float kernels: `--reference` now); `ckhash` reads float trees.
 - Two checks on a finished tree:
   - `rewrite hull-replay` replays the hull forward over the recorded graph.
     The replay must reach exactly the tree's states at the tree's frames,
