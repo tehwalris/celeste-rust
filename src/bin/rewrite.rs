@@ -5,6 +5,7 @@
 //! finished tree (rows by name: `search::inspect`).
 
 use anyhow::{Context, Result};
+use celeste_core::arith::{Arithmetic, Fixed};
 use celeste_core::lua_f64::LuaF64;
 use celeste_engine::runtime2::{Rt2, P8};
 use celeste_rust::settings::Arith;
@@ -13,6 +14,7 @@ use celeste_rust::frame::{widen_rt2_to, widened_keys, wins_of, Block, FrameStep,
 use celeste_rust::storage::layer::Tree;
 use celeste_rust::storage::Sk;
 use celeste_rust::abstraction::Level;
+use celeste_rust::search::rem::Rem;
 use celeste_rust::search::inspect::{brief, cell_names, parse_xy, player_summary, project_all, project_onto, project_row, Proj};
 use clap::{Parser, Subcommand};
 
@@ -1184,12 +1186,189 @@ fn forward<N: celeste_rust::search::rem::Rem>(
     Ok(())
 }
 
+/// `check-known` (`Command::CheckKnown`) in the arithmetic of `N`.
+fn check_known<N: Rem>(checkpoint_dir: &str, level: &str, inputs: &str, horizon: u32, cfg: &celeste_rust::settings::Settings) -> Result<()> {
+    use celeste_rust::search::arc_dp::solve;
+    let inputs = celeste_rust::concrete::read_inputs(inputs)?;
+    let steps = horizon * cfg.steps_per_frame();
+    let levels: Vec<Level> = level.split(',').map(Level::parse).collect::<std::result::Result<_, _>>().map_err(|e| anyhow::anyhow!(e))?;
+    let t0 = std::time::Instant::now();
+    let mut prev: Option<(Visited<N>, Level)> = None;
+    for (li, &lvl) in levels.iter().enumerate() {
+        let last = li + 1 == levels.len();
+        let dir = std::path::Path::new(checkpoint_dir).join(format!("level{li:02}"));
+        anyhow::ensure!(
+            celeste_rust::frame::tree_first_win_through::<N>(&dir, steps)?.is_some(),
+            "{}: no tree through step {steps} (run the search first)",
+            dir.display()
+        );
+        let filter = prev.as_ref().map(|(m, l)| celeste_rust::frame::MarkFilter::new(m, *l, cfg.steps_per_frame()));
+        let route = celeste_rust::search::known::Route { inputs: &inputs, filter: filter.as_ref() };
+        let s = solve::<N>(&dir, lvl, steps, false, !last, None, None, Some(&route), cfg)?;
+        let f = s.known.ok_or_else(|| anyhow::anyhow!("the known route does not exit by f{horizon}: nothing to check"))?;
+        println!("[check-known] level {li} ({lvl}): the known route (exit f{f}) survives (arc bound {:?})", s.arc);
+        if last {
+            break;
+        }
+        prev = Some((s.arc_marks.expect("asked for"), lvl));
+    }
+    println!("[check-known] every level passes ({:.1} s)", t0.elapsed().as_secs_f64());
+    Ok(())
+}
+
+/// `l1-check` (`Command::L1Check`): a known solution against the level -1
+/// table, in the arithmetic `A` (its table, its reference engine).
+fn l1_check<A: Arithmetic>(inputs: &str, horizon: u32, spd: i32, cfg: &celeste_rust::settings::Settings) -> Result<()>
+where
+    A::Num: celeste_core::arith::EngineNum<A = A>,
+{
+    let bytes = celeste_rust::concrete::read_inputs(inputs)?;
+    let threads = cfg.threads();
+    let owned = cfg.clone();
+    let table = std::thread::Builder::new()
+        .stack_size(256 * 1024 * 1024)
+        .spawn(move || celeste_rust::trace::level_minus_one::cost_to_go(std::path::Path::new("."), spd, threads, &owned))?
+        .join()
+        .map_err(|_| anyhow::anyhow!("the level -1 builder panicked"))??;
+    println!("[l1-check] table: {} entries, start d {}, fingerprint {:016x}", table.len(), table.start_d, table.fingerprint());
+    let mut eng = celeste_rust::trace::refengine::ReferenceEngine::<A>::new(cfg)?;
+    // Each leaf with its lineage's states too late (an `rnd` leaf
+    // that never exits may rightly be too late: only an exiting
+    // lineage is the solution).
+    let mut states: Vec<(Rt2<A::Num>, Vec<u32>)> = vec![(eng.initial()?, Vec::new())];
+    let (mut checked, mut unknown) = (0usize, 0usize);
+    let mut exited: Option<Vec<Vec<u32>>> = None;
+    for f in 0..=bytes.len() as u32 {
+        let mut line = Vec::new();
+        for (s, late) in &mut states {
+            let shape = s.shape_hash_of();
+            for cell in celeste_rust::search::pos_graph::block_cells(s)? {
+                let at = celeste_rust::search::pos_graph::cell_xy(cell);
+                match table.d_of(shape, cell) {
+                    None => {
+                        unknown += 1;
+                        line.push(format!("{at:?} not a table node"));
+                    }
+                    Some(d) => {
+                        checked += 1;
+                        let bad = table.too_late(shape, cell, f, horizon);
+                        if bad {
+                            late.push(f);
+                        }
+                        line.push(format!("{at:?} d {}{}", if d == u32::MAX { "inf".to_string() } else { d.to_string() }, if bad { " too late" } else { "" }));
+                    }
+                }
+            }
+        }
+        println!("[l1-check] f{f}: {}", line.join(", "));
+        let Some(&byte) = bytes.get(f as usize) else { break };
+        let mut next = Vec::new();
+        let mut wins = Vec::new();
+        for (s, late) in &states {
+            for b in eng.step(s, byte)? {
+                if wins_of(b.rt2(), cfg)?.iter().any(|&x| x) {
+                    wins.push(late.clone());
+                } else {
+                    next.push((b.into_rt2(), late.clone()));
+                }
+            }
+        }
+        if !wins.is_empty() {
+            println!("[l1-check] exit during frame {} ({} of {} leaves)", f + 1, wins.len(), wins.len() + next.len());
+            exited = Some(wins);
+            break;
+        }
+        states = next;
+    }
+    let wins = exited.ok_or_else(|| anyhow::anyhow!("the inputs never exit the room"))?;
+    let late: usize = wins.iter().map(|l| l.len()).sum();
+    println!("[l1-check] {checked} states checked, {unknown} not table nodes; on the exiting lineages {late} TOO LATE for horizon {horizon} (frames {:?})", wins.iter().flatten().collect::<std::collections::BTreeSet<_>>());
+    anyhow::ensure!(late == 0, "the level -1 table calls {late} states of a known solution too late: UNSOUND");
+    Ok(())
+}
+
+/// `widen-check` (`Command::WidenCheck`) in the arithmetic of `N`, its kernels `K`.
+fn widen_check<K, N>(cfg: &celeste_rust::settings::Settings, level_dir: &str, frame: u32, level: Level, emitted: usize) -> Result<()>
+where
+    K: FrameStep<N> + KernelsNew,
+    N: Rem,
+{
+    anyhow::ensure!(
+        !(level.floors_near && frame % cfg.steps_per_frame() != 0),
+        "step {frame} is mid split frame at a near level: the graph side keeps a floor's computed `collideable` there, the block side does not"
+    );
+    let dir = std::path::Path::new(level_dir);
+    cfg.check(dir, level)?;
+    let ids = celeste_rust::compiled::ids();
+    // Every lane of `rt2` against its block-side widening, exactly:
+    // the lanes it moved (the first few printed, `shown` so far).
+    let check = |rt2: &Rt2<N>, what: &str, shown: usize| -> usize {
+        let mut moved = 0;
+        let mut a = rt2.clone_block();
+        a.canonical();
+        let mut b = rt2.clone_block();
+        widen_rt2_to(&mut b, level);
+        b.canonical();
+        let (ea, eb) = (celeste_engine::exact::exact_rows(&a, ids), celeste_engine::exact::exact_rows(&b, ids));
+        for l in 0..rt2.width {
+            if a.shape_hash == b.shape_hash && ea[l] == eb[l] {
+                continue;
+            }
+            moved += 1;
+            if shown + moved <= 8 {
+                let (pa, pb) = (project_all(&a).swap_remove(l), project_all(&b).swap_remove(l));
+                let diff: Vec<String> = pa.iter().filter(|(k, v)| pb.get(*k) != Some(v)).map(|(k, v)| format!("{k}: {v} -> {}", pb.get(k).map_or("-", |s| s.as_str()))).collect();
+                println!("[widen-check] {what} row {l} of shape {:#x} MOVED: {}", a.shape_hash, diff.join(", "));
+            }
+        }
+        moved
+    };
+    let (mut stored, mut emitted_rows, mut moved) = (0usize, 0usize, 0usize);
+    let tree = Tree::<N>::open(dir, frame)?;
+    let blocks = tree.rows(frame, cfg.room, 1 << 20, &|_| true, cfg.threads())?;
+    for (_, rt2) in &blocks {
+        stored += rt2.width;
+        moved += check(rt2, "stored", moved);
+    }
+    if emitted > 0 {
+        let kernels = K::new(cfg, level)?;
+        kernels.warm();
+        let all: Vec<(usize, u32)> = blocks.iter().enumerate().flat_map(|(bi, (_, rt2))| (0..rt2.width as u32).map(move |r| (bi, r))).collect();
+        let n = emitted.min(all.len());
+        for k in 0..n {
+            let (bi, r) = all[k * all.len() / n];
+            let mut rt2 = blocks[bi].1.clone_block();
+            rt2.retain_lanes(&[r]);
+            for b in rerun(&kernels, rt2, frame)?.0 {
+                emitted_rows += b.lanes();
+                moved += check(b.rt2(), "emitted", moved);
+            }
+        }
+    }
+    println!("[widen-check] step {frame} at {level}: {stored} stored rows, {emitted_rows} emitted from {emitted}; {moved} moved by the block side's widening");
+    anyhow::ensure!(moved == 0, "widen-check: {moved} rows the block side's widening changes (the table's two sides disagree)");
+    Ok(())
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     // `bench-frame` times the workers' phases; `--metrics` counts the
     // kernels' census and slices (read when the kernels are built).
     // Only these run in float so far.
-    let float = matches!(cli.command, Command::Census { .. } | Command::Search { .. } | Command::ArcCheck { .. } | Command::Forward { .. } | Command::Ckhash { .. } | Command::HullReplay { .. } | Command::HullRoute { .. } | Command::RefCheck { .. });
+    let float = matches!(
+        cli.command,
+        Command::Census { .. }
+            | Command::Search { .. }
+            | Command::ArcCheck { .. }
+            | Command::Forward { .. }
+            | Command::Ckhash { .. }
+            | Command::HullReplay { .. }
+            | Command::HullRoute { .. }
+            | Command::RefCheck { .. }
+            | Command::WidenCheck { .. }
+            | Command::CheckKnown { .. }
+            | Command::L1Check { .. }
+    );
     let cfg = celeste_rust::settings::startup(&cli.settings, float, |s| {
         if let Command::BenchFrame { metrics, .. } = &cli.command {
             s.diag.phases = true;
@@ -1213,8 +1392,6 @@ fn main() -> Result<()> {
             )?,
             Arith::Float(_) => {
                 // What the float search has not met yet is refused, not run.
-                anyhow::ensure!(!level.contains(','), "--arith float: one level so far (the objects ladder is fixed only)");
-                anyhow::ensure!(cfg.minus_one().is_none(), "--arith float: no level -1 table in float yet");
                 anyhow::ensure!(save_marks.is_none(), "--arith float: --save-marks (the UI's arc pass) is fixed only so far");
                 search::<LuaF64>(
                     &cfg,
@@ -1236,33 +1413,10 @@ fn main() -> Result<()> {
         Command::Reach { checkpoint_dir, level_index, to, save_marks, cells, decode_rect } => {
             reach_command(&checkpoint_dir, level_index, to, save_marks.as_deref(), cells.as_deref(), decode_rect.as_deref(), &cfg)?;
         }
-        Command::CheckKnown { checkpoint_dir, level, inputs, horizon } => {
-            use celeste_rust::search::arc_dp::solve;
-            let inputs = celeste_rust::concrete::read_inputs(&inputs)?;
-            let steps = horizon * cfg.steps_per_frame();
-            let levels: Vec<Level> = level.split(',').map(Level::parse).collect::<std::result::Result<_, _>>().map_err(|e| anyhow::anyhow!(e))?;
-            let t0 = std::time::Instant::now();
-            let mut prev: Option<(Visited, Level)> = None;
-            for (li, &lvl) in levels.iter().enumerate() {
-                let last = li + 1 == levels.len();
-                let dir = std::path::Path::new(&checkpoint_dir).join(format!("level{li:02}"));
-                anyhow::ensure!(
-                    celeste_rust::frame::tree_first_win_through::<P8>(&dir, steps)?.is_some(),
-                    "{}: no tree through step {steps} (run the search first)",
-                    dir.display()
-                );
-                let filter = prev.as_ref().map(|(m, l)| celeste_rust::frame::MarkFilter::new(m, *l, cfg.steps_per_frame()));
-                let route = celeste_rust::search::known::Route { inputs: &inputs, filter: filter.as_ref() };
-                let s = solve(&dir, lvl, steps, false, !last, None, None, Some(&route), &cfg)?;
-                let f = s.known.ok_or_else(|| anyhow::anyhow!("the known route does not exit by f{horizon}: nothing to check"))?;
-                println!("[check-known] level {li} ({lvl}): the known route (exit f{f}) survives (arc bound {:?})", s.arc);
-                if last {
-                    break;
-                }
-                prev = Some((s.arc_marks.expect("asked for"), lvl));
-            }
-            println!("[check-known] every level passes ({:.1} s)", t0.elapsed().as_secs_f64());
-        }
+        Command::CheckKnown { checkpoint_dir, level, inputs, horizon } => match cfg.arith {
+            Arith::Fixed => check_known::<P8>(&checkpoint_dir, &level, &inputs, horizon, &cfg)?,
+            Arith::Float(_) => check_known::<LuaF64>(&checkpoint_dir, &level, &inputs, horizon, &cfg)?,
+        },
         Command::Forward {
             to,
             level,
@@ -1682,13 +1836,8 @@ fn main() -> Result<()> {
             use celeste_rust::search::arc_check::{run, Opts};
             let o = Opts { dir: std::path::Path::new(&level_dir), from, to, samples, level, fault: fault.as_deref(), path_cap, settings: &cfg };
             match cfg.arith {
-                // 16.16 forks the level's unknowns as its kernels do.
-                Arith::Fixed => run::<P8>(&o, |e, rt2, b, lvl| e.step_at(rt2, b, lvl))?,
-                // Doubles: the row must be concrete once its remainder is the probe.
-                Arith::Float(_) => {
-                    anyhow::ensure!(level == Level::EXACT, "--arith float: arc-check at r0sx only so far (the row must be concrete at the probe)");
-                    run::<LuaF64>(&o, |e, rt2, b, _| e.frame_reads(rt2, b))?
-                }
+                Arith::Fixed => run::<P8>(&o)?,
+                Arith::Float(_) => run::<LuaF64>(&o)?,
             }
         }
         Command::CoarseCensus { level_dir, from, to, erase } => {
@@ -1701,62 +1850,10 @@ fn main() -> Result<()> {
                 println!("f{frame:03}: {rows} rows -> {n} states ({:.2}x fewer); {} states through f{frame:03}", rows as f64 / n.max(1) as f64, through.len());
             }
         }
-        Command::WidenCheck { level_dir, frame, level, emitted } => {
-            anyhow::ensure!(
-                !(level.floors_near && frame % cfg.steps_per_frame() != 0),
-                "step {frame} is mid split frame at a near level: the graph side keeps a floor's computed `collideable` there, the block side does not"
-            );
-            let dir = std::path::Path::new(&level_dir);
-            cfg.check(dir, level)?;
-            let ids = celeste_rust::compiled::ids();
-            // Every lane of `rt2` against its block-side widening, exactly:
-            // the lanes it moved (the first few printed, `shown` so far).
-            let check = |rt2: &Rt2, what: &str, shown: usize| -> usize {
-                let mut moved = 0;
-                let mut a = rt2.clone_block();
-                a.canonical();
-                let mut b = rt2.clone_block();
-                widen_rt2_to(&mut b, level);
-                b.canonical();
-                let (ea, eb) = (celeste_engine::exact::exact_rows(&a, ids), celeste_engine::exact::exact_rows(&b, ids));
-                for l in 0..rt2.width {
-                    if a.shape_hash == b.shape_hash && ea[l] == eb[l] {
-                        continue;
-                    }
-                    moved += 1;
-                    if shown + moved <= 8 {
-                        let (pa, pb) = (project_all(&a).swap_remove(l), project_all(&b).swap_remove(l));
-                        let diff: Vec<String> = pa.iter().filter(|(k, v)| pb.get(*k) != Some(v)).map(|(k, v)| format!("{k}: {v} -> {}", pb.get(k).map_or("-", |s| s.as_str()))).collect();
-                        println!("[widen-check] {what} row {l} of shape {:#x} MOVED: {}", a.shape_hash, diff.join(", "));
-                    }
-                }
-                moved
-            };
-            let (mut stored, mut emitted_rows, mut moved) = (0usize, 0usize, 0usize);
-            let tree = Tree::<P8>::open(dir, frame)?;
-            let blocks = tree.rows(frame, cfg.room, 1 << 20, &|_| true, cfg.threads())?;
-            for (_, rt2) in &blocks {
-                stored += rt2.width;
-                moved += check(rt2, "stored", moved);
-            }
-            if emitted > 0 {
-                let kernels = celeste_rust::compiled::FrameEngine::new(&cfg, level)?;
-                kernels.warm();
-                let all: Vec<(usize, u32)> = blocks.iter().enumerate().flat_map(|(bi, (_, rt2))| (0..rt2.width as u32).map(move |r| (bi, r))).collect();
-                let n = emitted.min(all.len());
-                for k in 0..n {
-                    let (bi, r) = all[k * all.len() / n];
-                    let mut rt2 = blocks[bi].1.clone_block();
-                    rt2.retain_lanes(&[r]);
-                    for b in rerun(&kernels, rt2, frame)?.0 {
-                        emitted_rows += b.lanes();
-                        moved += check(b.rt2(), "emitted", moved);
-                    }
-                }
-            }
-            println!("[widen-check] step {frame} at {level}: {stored} stored rows, {emitted_rows} emitted from {emitted}; {moved} moved by the block side's widening");
-            anyhow::ensure!(moved == 0, "widen-check: {moved} rows the block side's widening changes (the table's two sides disagree)");
-        }
+        Command::WidenCheck { level_dir, frame, level, emitted } => match cfg.arith {
+            Arith::Fixed => widen_check::<celeste_rust::compiled::FrameEngine, P8>(&cfg, &level_dir, frame, level, emitted)?,
+            Arith::Float(_) => widen_check::<celeste_rust::compiled::FloatKernels, LuaF64>(&cfg, &level_dir, frame, level, emitted)?,
+        },
         Command::RefCheck { level_dir, frame, level, samples, cell, show, path_cap, full } => {
             let o = RefCheckArgs { level_dir, frame, level, samples, cell, show, path_cap, full };
             match cfg.arith {
@@ -2362,70 +2459,10 @@ fn main() -> Result<()> {
             }
             println!("[follow] every frame is in the tree");
         }
-        Command::L1Check { inputs, horizon, spd } => {
-            let bytes = celeste_rust::concrete::read_inputs(&inputs)?;
-            let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
-            let owned = cfg.clone();
-            let table = std::thread::Builder::new()
-                .stack_size(256 * 1024 * 1024)
-                .spawn(move || celeste_rust::trace::level_minus_one::cost_to_go(std::path::Path::new("."), spd, threads, &owned))?
-                .join()
-                .map_err(|_| anyhow::anyhow!("the level -1 builder panicked"))??;
-            println!("[l1-check] table: {} entries, start d {}, fingerprint {:016x}", table.len(), table.start_d, table.fingerprint());
-            let mut eng = RefEngine::new(&cfg)?;
-            // Each leaf with its lineage's states too late (an `rnd` leaf
-            // that never exits may rightly be too late: only an exiting
-            // lineage is the solution).
-            let mut states: Vec<(Rt2, Vec<u32>)> = vec![(eng.initial()?, Vec::new())];
-            let (mut checked, mut unknown) = (0usize, 0usize);
-            let mut exited: Option<Vec<Vec<u32>>> = None;
-            for f in 0..=bytes.len() as u32 {
-                let mut line = Vec::new();
-                for (s, late) in &mut states {
-                    let shape = s.shape_hash_of();
-                    for cell in celeste_rust::search::pos_graph::block_cells(s)? {
-                        let at = celeste_rust::search::pos_graph::cell_xy(cell);
-                        match table.d_of(shape, cell) {
-                            None => {
-                                unknown += 1;
-                                line.push(format!("{at:?} not a table node"));
-                            }
-                            Some(d) => {
-                                checked += 1;
-                                let bad = table.too_late(shape, cell, f, horizon);
-                                if bad {
-                                    late.push(f);
-                                }
-                                line.push(format!("{at:?} d {}{}", if d == u32::MAX { "inf".to_string() } else { d.to_string() }, if bad { " too late" } else { "" }));
-                            }
-                        }
-                    }
-                }
-                println!("[l1-check] f{f}: {}", line.join(", "));
-                let Some(&byte) = bytes.get(f as usize) else { break };
-                let mut next = Vec::new();
-                let mut wins = Vec::new();
-                for (s, late) in &states {
-                    for b in eng.step(s, byte)? {
-                        if wins_of(b.rt2(), &cfg)?.iter().any(|&x| x) {
-                            wins.push(late.clone());
-                        } else {
-                            next.push((b.into_rt2(), late.clone()));
-                        }
-                    }
-                }
-                if !wins.is_empty() {
-                    println!("[l1-check] exit during frame {} ({} of {} leaves)", f + 1, wins.len(), wins.len() + next.len());
-                    exited = Some(wins);
-                    break;
-                }
-                states = next;
-            }
-            let wins = exited.ok_or_else(|| anyhow::anyhow!("the inputs never exit the room"))?;
-            let late: usize = wins.iter().map(|l| l.len()).sum();
-            println!("[l1-check] {checked} states checked, {unknown} not table nodes; on the exiting lineages {late} TOO LATE for horizon {horizon} (frames {:?})", wins.iter().flatten().collect::<std::collections::BTreeSet<_>>());
-            anyhow::ensure!(late == 0, "the level -1 table calls {late} states of a known solution too late: UNSOUND");
-        }
+        Command::L1Check { inputs, horizon, spd } => match cfg.arith {
+            Arith::Fixed => l1_check::<Fixed>(&inputs, horizon, spd, &cfg)?,
+            Arith::Float(_) => l1_check::<celeste_core::arith::Float>(&inputs, horizon, spd, &cfg)?,
+        },
     }
 
     Ok(())

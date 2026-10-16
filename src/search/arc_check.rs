@@ -88,9 +88,10 @@ fn predicts<C: Circle>(t: &(C::Act, C::Act), p: (C::P, C::P), q: Option<(C::P, C
     }
 }
 
-/// Run the check; `step` is one reference frame of a row under an input at
-/// a level: its successors and the buttons it read.
-pub fn run<N: Rem>(o: &Opts, step: impl Fn(&mut ReferenceEngine<N::A>, &Rt2<N>, u8, Level) -> Result<(Vec<Block<N>>, u8)> + Sync) -> Result<()> {
+/// Run the check: each probe steps the reference engine at the level
+/// (`ReferenceEngine::step_at`: the row's unknowns forked as the kernels
+/// fork them; its successors and the buttons it read).
+pub fn run<N: Rem>(o: &Opts) -> Result<()> {
     let (dir, to, level, cfg) = (o.dir, o.to, o.level, o.settings);
     cfg.check(dir, level)?;
     let ids = crate::compiled::ids();
@@ -124,7 +125,7 @@ pub fn run<N: Rem>(o: &Opts, step: impl Fn(&mut ReferenceEngine<N::A>, &Rt2<N>, 
             if ran.iter().any(|(r, m)| (r ^ b) & m == 0) {
                 continue;
             }
-            let (blocks, read) = step(eng, &rt2, b, level)?;
+            let (blocks, read) = eng.step_at(&rt2, b, level)?;
             ran.push((b, read));
             for blk in blocks {
                 steps += 1;

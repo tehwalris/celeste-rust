@@ -76,15 +76,9 @@ pub fn pins_hold<A: GraphArith>(d: &mut Symbolic<A>) -> NodeId {
                 let k = d.graph.leaf(Op::Const(v, v));
                 d.graph.fold(if A::EQ_IS_IDENTITY { Op::Eq } else { Op::Same }, vec![x, k])
             }
-            // A literal interval where `==` is not identity: the very ends
-            // (the body computes with them), bit for bit.
-            Pinned::Num(lo, hi) if !A::EQ_IS_IDENTITY => {
-                let (klo, khi) = (d.graph.leaf(Op::Const(lo, lo)), d.graph.leaf(Op::Const(hi, hi)));
-                let (xlo, xhi) = (d.graph.fold(Op::Lo, vec![x]), d.graph.fold(Op::Hi, vec![x]));
-                let (a, b) = (d.graph.fold(Op::Same, vec![xlo, klo]), d.graph.fold(Op::Same, vec![xhi, khi]));
-                d.graph.fold(Op::And, vec![a, b])
-            }
-            // Inside a literal interval: both ends, on the raw input.
+            // Inside a literal interval (`widen::pin_literal`: the body reads
+            // the literal, the input disconnected): both ends, on the raw
+            // input, by value (a double's `-0` lies in a range from `-1/2`).
             Pinned::Num(lo, hi) => {
                 let (klo, khi) = (d.graph.leaf(Op::Const(lo, lo)), d.graph.leaf(Op::Const(hi, hi)));
                 let (xlo, xhi) = (d.graph.fold(Op::Lo, vec![x]), d.graph.fold(Op::Hi, vec![x]));

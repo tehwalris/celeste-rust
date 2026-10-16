@@ -9,7 +9,7 @@
 
 use anyhow::{anyhow, bail, Result};
 
-use celeste_core::pico8_num::Pico8Num as P8;
+use celeste_core::arith::EngineNum;
 use celeste_engine::widening::{constant, range};
 use celeste_engine::widening::{floor_player_window, Entry, Flag, Hook, Input, Level, Slot, Stored, Target, FLOOR_HITBOX, PLATFORM_PATH, PLAYER_HITBOX, REM, TABLE};
 
@@ -137,13 +137,6 @@ fn ival<A: GraphArith>(d: &mut Symbolic<A>, lo: i32, hi: i32) -> NodeId {
 fn ival_of<A: GraphArith>(d: &mut Symbolic<A>, lo: i32, hi: i32) -> NodeId {
     let (lo, hi) = (A::lit(constant::<A::Num>(lo)), A::lit(constant::<A::Num>(hi)));
     d.graph.leaf(Op::Const(lo, hi))
-}
-
-/// A number as raw 16.16, where the arithmetic is 16.16's: the hooks'
-/// tables and windows are (`what` names the hook for the error).
-fn raw_fixed<A: GraphArith>(v: A::Num, what: &str) -> Result<i32> {
-    let l = A::lit(v);
-    A::lit_raw_fixed(l, l).map(|(r, _)| r).ok_or_else(|| anyhow!("{what} is 16.16's: not modelled in {} arithmetic", A::NAME))
 }
 
 /// What the output widenings OWE: per widened slot, the condition that the
@@ -281,14 +274,11 @@ fn bounds_inside<A: GraphArith>(d: &mut Symbolic<A>, v: NodeId, lo: A::Num, hi: 
     d.graph.fold(Op::And, vec![above, below])
 }
 
-/// `v` in `[lo, hi]`: `None` if proved statically (`within`, 16.16's
-/// only: in another arithmetic it is always checked), else the per-lane
-/// condition.
+/// `v` in `[lo, hi]`: `None` if proved statically (`within`), else the
+/// per-lane condition.
 fn contain<A: GraphArith>(d: &mut Symbolic<A>, v: NodeId, (lo, hi): (A::Num, A::Num)) -> Option<NodeId> {
-    if let Some((l, h)) = A::lit_raw_fixed(A::lit(lo), A::lit(hi)) {
-        if within(d, v, (l as i64, h as i64), &mut Vec::new()) {
-            return None;
-        }
+    if within(d, v, (lo.to_f64(), hi.to_f64()), &mut Vec::new()) {
+        return None;
     }
     Some(bounds_inside(d, v, lo, hi))
 }
@@ -333,14 +323,11 @@ pub fn read_inputs<A: GraphArith>(st: &mut State<Symbolic<A>>, d: &mut Symbolic<
 /// An input `v` READ AS the literal `[lo, hi]` (`Input::Literal`, a
 /// platform's `rem.x`): pinned to it (`Op::Pin`, the input disconnected, its
 /// check `v` inside the literal), unless the graph proves it inside.
-fn pin_literal<A: GraphArith>(d: &mut Symbolic<A>, v: NodeId, lo: i32, hi: i32) -> Result<()> {
+fn pin_literal<A: GraphArith>(d: &mut Symbolic<A>, v: NodeId, lo: i32, hi: i32) {
     let (l, h) = range::<A::Num>(lo, hi);
-    let (l, h) = (A::lit(l), A::lit(h));
-    let (rl, rh) = A::lit_raw_fixed(l, h).ok_or_else(|| anyhow!("a literal input is 16.16's: not modelled in {} arithmetic", A::NAME))?;
-    if !within(d, v, (rl as i64, rh as i64), &mut Vec::new()) {
-        d.pin(v, crate::transpile::graph::Pinned::Num(l, h));
+    if !within(d, v, (l.to_f64(), h.to_f64()), &mut Vec::new()) {
+        d.pin(v, crate::transpile::graph::Pinned::Num(A::lit(l), A::lit(h)));
     }
-    Ok(())
 }
 
 /// One slot's input (`Input`).
@@ -356,7 +343,7 @@ fn read_slot<A: GraphArith>(st: &mut State<Symbolic<A>>, d: &mut Symbolic<A>, e:
         (Input::Unknown, Some(Value::Num(_))) => Value::Num(d.unknown_num()),
         (Input::Literal, Some(Value::Num(v))) => {
             let Stored::Range { lo, hi, .. } = s.stored else { bail!("{}: a literal input reads a range", iface::show(p)) };
-            pin_literal(d, v, lo, hi)?;
+            pin_literal(d, v, lo, hi);
             let r = ival(d, lo, hi);
             return iface::set(st, p, Value::Num(r));
         }
@@ -365,16 +352,12 @@ fn read_slot<A: GraphArith>(st: &mut State<Symbolic<A>>, d: &mut Symbolic<A>, e:
     iface::set(st, p, new)
 }
 
-/// An object's `(x, y)`: constants, floors and springs never move. As
-/// 16.16 (`floor_player_window`'s).
-fn position<A: GraphArith>(st: &State<Symbolic<A>>, d: &Symbolic<A>, obj: &Path) -> Result<(P8, P8)> {
-    let get = |f: &str| -> Result<P8> {
+/// An object's `(x, y)`: constants, floors and springs never move.
+fn position<A: GraphArith>(st: &State<Symbolic<A>>, d: &Symbolic<A>, obj: &Path) -> Result<(A::Num, A::Num)> {
+    let get = |f: &str| -> Result<A::Num> {
         let p = field(obj, &[f]);
         match iface::get(st, &p) {
-            Some(Value::Num(v)) => {
-                let v = d.as_const(&v).ok_or_else(|| anyhow::anyhow!("{}: not a constant", iface::show(&p)))?;
-                Ok(P8::from_raw(raw_fixed::<A>(v, "the near floors' window")?))
-            }
+            Some(Value::Num(v)) => d.as_const(&v).ok_or_else(|| anyhow::anyhow!("{}: not a constant", iface::show(&p))),
             _ => bail!("{}: not a number", iface::show(&p)),
         }
     };
@@ -466,12 +449,12 @@ fn widen_near_floors<A: GraphArith>(st: &mut State<Symbolic<A>>, d: &mut Symboli
         let [ps, pc] = &paths[..] else { bail!("the near floors' entry has two slots") };
         hitbox(st, d, &obj, FLOOR_HITBOX)?;
         let at = position(st, d, &obj)?;
-        let [(xlo, xhi), (ylo, yhi)] = floor_player_window(at).ok_or_else(|| anyhow!("{}: a fall floor at {at:?}: its window leaves the 16.16 range", iface::show(&obj)))?;
+        let [(xlo, xhi), (ylo, yhi)] = floor_player_window(at).ok_or_else(|| anyhow!("{}: a fall floor at {at:?}: its window leaves the arithmetic's range", iface::show(&obj)))?;
         // `lo < v < hi` for every value a lane may hold (straddling is no
         // overlap, the safe side), as `widening::player_overlaps_floor`.
-        let inside = |d: &mut Symbolic<A>, v: NodeId, lo: P8, hi: P8| -> Result<NodeId> {
+        let inside = |d: &mut Symbolic<A>, v: NodeId, lo: A::Num, hi: A::Num| -> Result<NodeId> {
             let (a, b) = if d.is_interval(&v) { (d.graph.fold(Op::Lo, vec![v]), d.graph.fold(Op::Hi, vec![v])) } else { (v, v) };
-            let (klo, khi) = (d.num(A::from_fixed_raw(lo.as_raw_u32() as i32)), d.num(A::from_fixed_raw(hi.as_raw_u32() as i32)));
+            let (klo, khi) = (d.num(lo), d.num(hi));
             let above = d.compare(Cmp::Gt, &a, &klo)?;
             let below = d.compare(Cmp::Lt, &b, &khi)?;
             Ok(d.and(&above, &below))
@@ -486,7 +469,7 @@ fn widen_near_floors<A: GraphArith>(st: &mut State<Symbolic<A>>, d: &mut Symboli
             overlap = d.or(&overlap, &both);
             if mid {
                 let [(dxlo, dxhi), (dylo, dyhi)] = PLAYER_PROBE;
-                let shift = |v: P8, by: i16| v.checked_add(P8::from_i16(by)).ok_or_else(|| anyhow!("{}: the probe window {v:?} + {by} leaves the 16.16 range", iface::show(&obj)));
+                let shift = |v: A::Num, by: i16| A::add(v, A::from_i16(by)).ok_or_else(|| anyhow!("{}: the probe window {v:?} + {by} leaves the arithmetic's range", iface::show(&obj)));
                 let x = inside(d, px, shift(xlo, dxlo)?, shift(xhi, dxhi)?)?;
                 let y = inside(d, py, shift(ylo, dylo)?, shift(yhi, dyhi)?)?;
                 let both = d.and(&x, &y);
@@ -547,14 +530,15 @@ fn widen_near_floors<A: GraphArith>(st: &mut State<Symbolic<A>>, d: &mut Symboli
 /// (`0` or its one moving speed, read as the latter: a two-point set no
 /// single `Pin` states).
 pub fn platform_inputs<A: GraphArith>(st: &mut State<Symbolic<A>>, d: &mut Symbolic<A>) -> Result<Vec<NodeId>> {
-    let worlds = d.worlds.clone().ok_or_else(|| anyhow::anyhow!("the platforms are unknown but there is no world table"))?;
+    let table = d.worlds.clone().ok_or_else(|| anyhow::anyhow!("the platforms are unknown but there is no world table"))?;
+    let worlds = &table.0;
     let platforms = objects_of_type(st, "platform");
     let first = worlds.first().ok_or_else(|| anyhow::anyhow!("no platform world"))?;
     anyhow::ensure!(first.len() == platforms.len(), "a platform world has {} platforms, the state {}", first.len(), platforms.len());
-    fn konst<A: GraphArith>(st: &State<Symbolic<A>>, d: &Symbolic<A>, p: &Path) -> Result<i32> {
+    fn konst<A: GraphArith>(st: &State<Symbolic<A>>, d: &Symbolic<A>, p: &Path) -> Result<A::Num> {
         match iface::get(st, p) {
             Some(Value::Num(n)) => match d.graph.get(n).op {
-                Op::Const(a, b) if a == b => raw_fixed::<A>(A::from_lit(a), "the platforms' hook"),
+                Op::Const(a, b) if a == b => Ok(A::from_lit(a)),
                 ref o => bail!("{}: a platform's {} is not a known constant ({o:?})", iface::show(p), iface::show(p)),
             },
             _ => bail!("{}: not a number", iface::show(p)),
@@ -567,13 +551,19 @@ pub fn platform_inputs<A: GraphArith>(st: &mut State<Symbolic<A>>, d: &mut Symbo
         let (y, dir) = (konst(st, d, &field(obj, &["y"]))?, konst(st, d, &field(obj, &["dir"]))?);
         let j = (0..first.len())
             .find(|&j| !taken[j] && first[j][4] == y && first[j][5] == dir)
-            .ok_or_else(|| anyhow::anyhow!("no platform world entry at y {y:#x} dir {dir:#x} left for {}", iface::show(obj)))?;
+            .ok_or_else(|| anyhow::anyhow!("no platform world entry at y {} dir {} left for {}", A::show(y), A::show(dir), iface::show(obj)))?;
         taken[j] = true;
         let spd = field(obj, &["spd", "x"]);
-        let moving: Vec<i32> = {
-            let mut v: Vec<i32> = worlds.iter().map(|w| w[j][3]).filter(|s| *s != 0).collect();
-            v.sort_unstable();
-            v.dedup();
+        // Its distinct moving speeds (by bits; a double's `-0` would not
+        // be moving either).
+        let zero = A::from_i16(0);
+        let moving: Vec<A::Num> = {
+            let mut v: Vec<A::Num> = Vec::new();
+            for s in worlds.iter().map(|w| w[j][3]).filter(|s| !A::num_eq(*s, zero)) {
+                if !v.contains(&s) {
+                    v.push(s);
+                }
+            }
             v
         };
         if let (Some(Value::Num(sv)), None, [v]) = (iface::get(st, &spd), super::shapes::player_path(st), moving.as_slice()) {
@@ -581,7 +571,7 @@ pub fn platform_inputs<A: GraphArith>(st: &mut State<Symbolic<A>>, d: &mut Symbo
             // as the literal (fragments, not a fork per platform); asserted
             // per lane that the speed is 0 or that one.
             if matches!(d.graph.get(sv).op, Op::Cell(_)) {
-                let (z, k) = (A::lit(A::from_i16(0)), A::lit(constant::<A::Num>(*v)));
+                let (z, k) = (A::lit(zero), A::lit(*v));
                 let (k0, kv) = (d.graph.leaf(Op::Const(z, z)), d.graph.leaf(Op::Const(k, k)));
                 let (a, b) = (d.graph.fold(Op::Eq, vec![sv, k0]), d.graph.fold(Op::Eq, vec![sv, kv]));
                 obligations.push(d.graph.fold(Op::Or, vec![a, b]));
@@ -589,23 +579,27 @@ pub fn platform_inputs<A: GraphArith>(st: &mut State<Symbolic<A>>, d: &mut Symbo
             }
         } else if let Some(Value::Num(sv)) = iface::get(st, &spd) {
             if matches!(d.graph.get(sv).op, Op::Cell(_)) {
-                let lo = worlds.iter().map(|w| w[j][3]).min().expect("a world");
-                let hi = worlds.iter().map(|w| w[j][3]).max().expect("a world");
-                let r = d.restrict(sv, A::lit(constant::<A::Num>(lo)), A::lit(constant::<A::Num>(hi)));
+                // The hull in the total order (`-0` below `0`), as an
+                // interval's ends are.
+                let speeds = || worlds.iter().map(|w| w[j][3]);
+                let order = |a: &A::Num, b: &A::Num| a.to_f64().total_cmp(&b.to_f64());
+                let lo = speeds().min_by(order).expect("a world");
+                let hi = speeds().max_by(order).expect("a world");
+                let r = d.restrict(sv, A::lit(lo), A::lit(hi));
                 iface::set(st, &spd, Value::Num(r))?;
             }
         }
         let (x, last, rem) = (field(obj, &["x"]), field(obj, &["last"]), field(obj, &["rem", "x"]));
         let Some(Value::Num(xv)) = iface::get(st, &x) else { bail!("{}: not a number", iface::show(&x)) };
         anyhow::ensure!(matches!(d.graph.get(xv).op, Op::Cell(_)), "a platform's `x` must be an input cell");
-        let (plo, phi) = (constant::<A::Num>((PLATFORM_PATH.0 as i32) << 16), constant::<A::Num>((PLATFORM_PATH.1 as i32) << 16));
+        let (plo, phi) = (A::from_i16(PLATFORM_PATH.0), A::from_i16(PLATFORM_PATH.1));
         let xr = d.restrict(xv, A::lit(plo), A::lit(phi));
         iface::set(st, &x, Value::Num(xr))?;
         iface::set(st, &last, Value::Num(xr))?;
         // `rem.x` is replaced by the literal whole remainder: sound for a
         // lane whose own lies inside, which is owed.
         let Some(Value::Num(rv)) = iface::get(st, &rem) else { bail!("{}: not a number", iface::show(&rem)) };
-        pin_literal(d, rv, REM.0, REM.1)?;
+        pin_literal(d, rv, REM.0, REM.1);
         let r = ival(d, REM.0, REM.1);
         iface::set(st, &rem, Value::Num(r))?;
         cells[j] = Some(xv);
@@ -614,10 +608,18 @@ pub fn platform_inputs<A: GraphArith>(st: &mut State<Symbolic<A>>, d: &mut Symbo
     Ok(obligations)
 }
 
-/// Does `v` provably lie in `[lo, hi]` (raw)? Through select arms and under
+/// A static range of a value, as exact doubles (16.16's values and a
+/// double's both are; infinite ends unbounded), compared by value.
+/// Computing it with `f64` arithmetic is EXACT for 16.16 (sums of its values
+/// round nowhere near its range) and is the doubles' own rounding for
+/// `Arith::Float`: `fl` is monotone, so `fl(a + b)` over ranges lies between
+/// the rounded sums of the ends.
+type Bounds = (f64, f64);
+
+/// Does `v` provably lie in `[lo, hi]`? Through select arms and under
 /// point-split branches with what they say about the compared value (so a
 /// wrap `x < -16 ? 128 : ...` is bounded). Static; `false` if unsure.
-fn within<A: GraphArith>(d: &Symbolic<A>, v: NodeId, (lo, hi): (i64, i64), facts: &mut Vec<(NodeId, i64, i64)>) -> bool {
+fn within<A: GraphArith>(d: &Symbolic<A>, v: NodeId, (lo, hi): Bounds, facts: &mut Vec<(NodeId, f64, f64)>) -> bool {
     // Its own bounds first: the enclosing branch may bound a select whole.
     if let Some((a, b)) = bounds(d, v, facts) {
         if lo <= a && b <= hi {
@@ -645,12 +647,13 @@ fn within<A: GraphArith>(d: &Symbolic<A>, v: NodeId, (lo, hi): (i64, i64), facts
     }
 }
 
-/// `c` as `x op k` (`k` a literal point, either side): `x` and its raw range
-/// `(when true, when false)`.
-fn comparison_facts<A: GraphArith>(d: &Symbolic<A>, c: NodeId) -> Option<(NodeId, (i64, i64), (i64, i64))> {
+/// `c` as `x op k` (`k` a literal point, either side): `x` and its range
+/// `(when true, when false)`; `k`'s neighbours are the arithmetic's
+/// (`Arithmetic::below`, and above as `-below(-k)`).
+fn comparison_facts<A: GraphArith>(d: &Symbolic<A>, c: NodeId) -> Option<(NodeId, Bounds, Bounds)> {
     let node = d.graph.get(c);
     let point = |n: NodeId| match d.graph.get(n).op {
-        Op::Const(a, b) if a == b => A::lit_raw_fixed(a, b).map(|(a, _)| a as i64),
+        Op::Const(a, b) if a == b => Some(A::from_lit(a)),
         _ => None,
     };
     if !matches!(node.op, Op::Lt | Op::Le | Op::Gt | Op::Ge) {
@@ -671,32 +674,33 @@ fn comparison_facts<A: GraphArith>(d: &Symbolic<A>, c: NodeId) -> Option<(NodeId
         ),
         _ => return None,
     };
+    let pred = A::below(k)?.to_f64();
+    let succ = A::below(A::neg(k)?).and_then(A::neg)?.to_f64();
+    let (k, inf) = (k.to_f64(), f64::INFINITY);
     let (yes, no) = match op {
-        Op::Lt => ((i64::MIN, k - 1), (k, i64::MAX)),
-        Op::Le => ((i64::MIN, k), (k + 1, i64::MAX)),
-        Op::Gt => ((k + 1, i64::MAX), (i64::MIN, k)),
-        _ => ((k, i64::MAX), (i64::MIN, k - 1)),
+        Op::Lt => ((-inf, pred), (k, inf)),
+        Op::Le => ((-inf, k), (succ, inf)),
+        Op::Gt => ((succ, inf), (-inf, k)),
+        _ => ((k, inf), (-inf, pred)),
     };
     Some((x, yes, no))
 }
 
-/// A static raw range of `n` (literals, a bounded input - a platform's
+/// A static range of `n` (literals, a bounded input - a platform's
 /// `x` among them -, sums and differences), narrowed by the enclosing branches; `None` otherwise.
-fn bounds<A: GraphArith>(d: &Symbolic<A>, n: NodeId, facts: &[(NodeId, i64, i64)]) -> Option<(i64, i64)> {
+fn bounds<A: GraphArith>(d: &Symbolic<A>, n: NodeId, facts: &[(NodeId, f64, f64)]) -> Option<Bounds> {
     let node = d.graph.get(n);
-    let structural = || -> Option<(i64, i64)> {
+    let num = |l: A::Lit| A::from_lit(l).to_f64();
+    let structural = || -> Option<Bounds> {
         Some(match node.op {
-            Op::Const(a, b) => {
-                let (a, b) = A::lit_raw_fixed(a, b)?;
-                (a as i64, b as i64)
-            }
+            Op::Const(a, b) => (num(a), num(b)),
             Op::Sel => {
                 let (a, b) = (bounds(d, node.args[1], facts)?, bounds(d, node.args[2], facts)?);
                 (a.0.min(b.0), a.1.max(b.1))
             }
             Op::Flr => {
                 let a = bounds(d, node.args[0], facts)?;
-                (a.0.div_euclid(1 << 16) << 16, a.1.div_euclid(1 << 16) << 16)
+                (a.0.floor(), a.1.floor())
             }
             // A fork's fragment lies inside its operand.
             Op::Split(_) | Op::Frag(_) | Op::IntFrag(_) | Op::RSplit(_) | Op::RFrag(_) => bounds(d, node.args[0], facts)?,
@@ -710,8 +714,7 @@ fn bounds<A: GraphArith>(d: &Symbolic<A>, n: NodeId, facts: &[(NodeId, i64, i64)
             }
             // A bounded input (`Op::Restrict`; as `graph::pieces_of`).
             Op::Restrict(lo, hi) => {
-                let (lo, hi) = A::lit_raw_fixed(lo, hi)?;
-                let (lo, hi) = (lo as i64, hi as i64);
+                let (lo, hi) = (num(lo), num(hi));
                 match bounds(d, node.args[0], facts) {
                     Some(a) if a.0.max(lo) <= a.1.min(hi) => (a.0.max(lo), a.1.min(hi)),
                     Some(a) => a,
@@ -724,7 +727,7 @@ fn bounds<A: GraphArith>(d: &Symbolic<A>, n: NodeId, facts: &[(NodeId, i64, i64)
     // From its structure, else only from the enclosing branches.
     let mut r = match structural() {
         Some(r) => r,
-        None if facts.iter().any(|f| f.0 == n) => (i64::MIN, i64::MAX),
+        None if facts.iter().any(|f| f.0 == n) => (f64::NEG_INFINITY, f64::INFINITY),
         None => return None,
     };
     for &(m, flo, fhi) in facts {
@@ -738,6 +741,7 @@ fn bounds<A: GraphArith>(d: &Symbolic<A>, n: NodeId, facts: &[(NodeId, i64, i64)
 #[cfg(test)]
 mod tests {
     use super::*;
+    use celeste_core::pico8_num::Pico8Num as P8;
     use crate::trace::cart;
     use crate::trace::interp::Interp;
     use crate::trace::verify::{run_one, trace_frame};

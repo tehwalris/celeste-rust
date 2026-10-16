@@ -596,7 +596,7 @@ pub fn room_constant_lattice<A: GraphArith>(
     // The level's widenings, for every frame this walk traces.
     it.d.level = opts;
     if opts.platforms {
-        it.d.worlds = Some(std::sync::Arc::new(crate::concrete::platform_worlds(PLATFORM_WORLD_FRAMES, s)?));
+        it.d.worlds = Some(std::sync::Arc::new(crate::concrete::platform_worlds::<A>(PLATFORM_WORLD_FRAMES, s)?));
     }
 
     let st = cart::fresh_state::<Symbolic<A>>(&mut it.d);

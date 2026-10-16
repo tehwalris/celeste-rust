@@ -680,19 +680,16 @@ impl PointSet {
 /// `eval_lenient_in` with cells pinned; undecided goes both ways. Compile time
 /// only: the kernel sees each outcome's pixels (`position_guard`).
 pub struct Points<A: GraphArith = Fixed> {
-    /// Per world, the value of each platform cell: `(cell, raw)`.
-    worlds: Vec<Vec<(u32, i32)>>,
+    /// Per world, the value of each platform cell: `(cell, x)`.
+    worlds: Vec<Vec<(u32, A::Num)>>,
     platform: rustc_hash::FxHashSet<u32>,
     /// The player's input `x`/`y`: cell, node, the region's first pixel and
     /// count. `None` without a player.
-    pos: [Option<(u32, NodeId, i32, usize)>; 2],
+    pos: [Option<(u32, NodeId, i16, usize)>; 2],
     memo: rustc_hash::FxHashMap<NodeId, (PointSet, PointSet)>,
-    arith: std::marker::PhantomData<A>,
 }
 
 impl<A: GraphArith> Points<A> {
-    /// The world table and the pixels are 16.16 (`concrete::WORLD_FIELDS`):
-    /// another arithmetic raises.
     fn new(d: &Symbolic<A>, pos: [Option<(NodeId, (A::Lit, A::Lit))>; 2]) -> Result<Points<A>> {
         use crate::transpile::graph::Op;
         let table = d.worlds.clone().ok_or_else(|| anyhow!("the platforms are unknown but there is no world table"))?;
@@ -700,8 +697,8 @@ impl<A: GraphArith> Points<A> {
             Op::Cell(c) => Ok(c),
             ref o => Err(anyhow!("a pinned input is {o:?}, not a cell")),
         };
-        let mut worlds = Vec::with_capacity(table.len());
-        for w in table.iter() {
+        let mut worlds = Vec::with_capacity(table.0.len());
+        for w in table.0.iter() {
             anyhow::ensure!(w.len() == d.platform_cells.len(), "a world has {} platforms, the frame {}", w.len(), d.platform_cells.len());
             let mut pins = Vec::new();
             for (p, x) in w.iter().zip(&d.platform_cells) {
@@ -713,14 +710,13 @@ impl<A: GraphArith> Points<A> {
         let mut out = [None, None];
         for (k, p) in pos.iter().enumerate() {
             if let Some((n, (lo, hi))) = p {
-                let (lo, hi) = A::lit_raw_fixed(*lo, *hi).ok_or_else(|| anyhow!("platform worlds under {} arithmetic: the world table is 16.16", A::NAME))?;
-                const ONE: i32 = 1 << 16;
-                anyhow::ensure!(lo % ONE == 0 && hi % ONE == 0, "the player's position range is not whole pixels");
-                let (a, b) = (lo.div_euclid(ONE), hi.div_euclid(ONE));
+                let pixel = |l: A::Lit| A::as_i16(A::from_lit(l)).ok_or_else(|| anyhow!("the player's position range is not whole pixels"));
+                let (a, b) = (pixel(*lo)?, pixel(*hi)?);
+                anyhow::ensure!(a <= b, "the player's position range is empty");
                 out[k] = Some((cell(*n)?, *n, a, (b - a + 1) as usize));
             }
         }
-        Ok(Points { worlds, platform, pos: out, memo: Default::default(), arith: std::marker::PhantomData })
+        Ok(Points { worlds, platform, pos: out, memo: Default::default() })
     }
 
     fn per_world(&self) -> usize {
@@ -755,7 +751,8 @@ impl<A: GraphArith> Points<A> {
         let root = map[&c] as usize;
         // Every cell at its weakest; a bounded input narrows at its `Restrict`.
         let base = crate::transpile::ival::seed_cells(&g);
-        let exact = |v: i32| Val::<A>::Num(A::point(A::from_fixed_raw(v)));
+        let value = |v: A::Num| Val::<A>::Num(crate::transpile::garith::value_box::<A>(v));
+        let pixel = |p: i16, i: usize| value(A::from_i16(p + i as i16));
         let eval = |cells: &std::collections::HashMap<u32, Val<A>>| -> Option<bool> {
             let v = match room {
                 Some(r) => g.eval_lenient_in(cells, r),
@@ -797,7 +794,7 @@ impl<A: GraphArith> Points<A> {
             if reads_platform {
                 for (k, v) in &self.worlds[ws[0]] {
                     if cells.contains_key(k) {
-                        cells.insert(*k, exact(*v));
+                        cells.insert(*k, value(*v));
                     }
                 }
             }
@@ -813,10 +810,10 @@ impl<A: GraphArith> Points<A> {
                 for j in &js {
                     let mut at = cells.clone();
                     if let (Some(i), Some(p)) = (i, px) {
-                        at.insert(p.0, exact((p.2 + *i as i32) << 16));
+                        at.insert(p.0, pixel(p.2, *i));
                     }
                     if let (Some(j), Some(p)) = (j, py) {
-                        at.insert(p.0, exact((p.2 + *j as i32) << 16));
+                        at.insert(p.0, pixel(p.2, *j));
                     }
                     let r = eval(&at);
                     let ii = i.map_or(all_i.clone(), |i| vec![i]);
@@ -842,8 +839,7 @@ impl<A: GraphArith> Points<A> {
         // `lo <= cell <= hi` over whole pixels of one axis.
         let within = |d: &mut Symbolic<A>, axis: usize, lo: usize, hi: usize| -> NodeId {
             let Some((_, n, first, _)) = self.pos[axis] else { return d.graph.leaf(Op::ConstBool(true)) };
-            let (a, b) = ((first + lo as i32) << 16, (first + hi as i32) << 16);
-            let (a, b) = (A::lit(A::from_fixed_raw(a)), A::lit(A::from_fixed_raw(b)));
+            let (a, b) = (A::lit(A::from_i16(first + lo as i16)), A::lit(A::from_i16(first + hi as i16)));
             let (ka, kb) = (d.graph.leaf(Op::Const(a, a)), d.graph.leaf(Op::Const(b, b)));
             let ge = d.graph.fold(Op::Ge, vec![n, ka]);
             let le = d.graph.fold(Op::Le, vec![n, kb]);

@@ -90,6 +90,39 @@ pub trait GraphArith: Arithmetic<Num: celeste_core::arith::EngineNum<A = Self>> 
     fn range_error(op: &Op<Self>) -> bool;
 }
 
+/// Every number of `v`'s VALUE, as an interval: `v` alone wherever it is
+/// alone in its value (16.16: always), a double's zero both zeros. An input
+/// a compile-time decision pins to a value (a pixel, a platform's `x`) is
+/// pinned to this: a comparison cannot tell `-0` from `0`, a quotient can,
+/// and the decision must hold for every lane of that value.
+pub fn value_box<A: GraphArith>(v: A::Num) -> A::Ival {
+    use celeste_core::arith::EngineNum;
+    if A::alone_in_its_value(v) {
+        return A::point(v);
+    }
+    let w = A::neg(v).expect("negating a value alone in neither sign stays in range");
+    let (lo, hi) = if v.to_f64().total_cmp(&w.to_f64()).is_le() { (v, w) } else { (w, v) };
+    A::ival(lo, hi)
+}
+
+#[cfg(test)]
+mod value_box_tests {
+    /// A value's box: the point where the value has one number (16.16
+    /// always), both zeros for a double's zero.
+    #[test]
+    fn a_doubles_zero_boxes_both_zeros() {
+        use celeste_core::arith::{Arithmetic, Fixed, Float};
+        use celeste_core::lua_f64::LuaF64;
+        let f = |v: f64| LuaF64::new(v).expect("finite");
+        assert_eq!(super::value_box::<Fixed>(Fixed::from_i16(0)), Fixed::point(Fixed::from_i16(0)));
+        assert_eq!(super::value_box::<Float>(f(3.0)), Float::point(f(3.0)));
+        for z in [0.0, -0.0] {
+            let (lo, hi) = Float::bounds(super::value_box::<Float>(f(z)));
+            assert_eq!((lo.value().to_bits(), hi.value().to_bits()), ((-0.0f64).to_bits(), 0.0f64.to_bits()), "{z:?}");
+        }
+    }
+}
+
 // ---- 16.16 ----
 
 /// One fork-grid step (the integers) in raw 16.16 units.

@@ -260,9 +260,10 @@ pub trait Domain {
     fn set_countdown_hint(&mut self, _on: bool) {}
 
     /// `__split_by_flr` of a literal interval: its integer fragments, run as
-    /// separate trace states and rejoined when the call returns. `None`: an
-    /// ordinary per-lane fork.
-    fn literal_fragments(&mut self, _v: &Self::Num) -> Result<Option<Vec<Self::Num>>> {
+    /// separate trace states and rejoined when the call returns; with
+    /// `round`, `__split_by_round`'s (where `flr(v + 1/2)` is one integer:
+    /// `Arithmetic::round_fragment`). `None`: an ordinary per-lane fork.
+    fn literal_fragments(&mut self, _v: &Self::Num, _round: bool) -> Result<Option<Vec<Self::Num>>> {
         Ok(None)
     }
 
@@ -452,7 +453,7 @@ pub struct Symbolic<A: GraphArith = Fixed> {
     pub no_known_forks: bool,
     /// THE PLATFORM WORLDS: every arrangement of the moving platforms' `(x,
     /// last, rem.x, spd.x)`. The split pass decides comparisons per world.
-    pub worlds: Option<std::sync::Arc<Vec<Vec<[i32; crate::concrete::WORLD_FIELDS]>>>>,
+    pub worlds: Option<std::sync::Arc<crate::concrete::PlatformWorlds<A>>>,
     /// This frame's platforms' `x` input cells, in the worlds' order.
     pub platform_cells: Vec<NodeId>,
     /// `lane_independent`'s memo; structural, so it outlives a frame.
@@ -1319,10 +1320,10 @@ impl<A: GraphArith> Domain for Symbolic<A> {
     }
 
     /// A literal interval is refused: every lane would take each fragment
-    /// (`split_floor`'s literal splits have no round twin).
+    /// (the interpreter splits a literal first: `literal_fragments`).
     fn fork_round(&mut self, v: &NodeId, ways: u8) -> Result<(NodeId, NodeId)> {
         if let Op::Const(lo, hi) = self.graph.get(*v).op {
-            bail!("__split_by_round of the literal [{}, {}]: a literal round fork is not modelled", A::show(A::from_lit(lo)), A::show(A::from_lit(hi)));
+            bail!("__split_by_round of the literal [{}, {}] as a per-lane fork", A::show(A::from_lit(lo)), A::show(A::from_lit(hi)));
         }
         let f = self.fork(v, Partition::Rounds { ways }, "a round fork (`move`)");
         Ok((f.value, f.valid))
@@ -1548,38 +1549,35 @@ impl<A: GraphArith> Domain for Symbolic<A> {
         Some(out)
     }
 
-    fn literal_fragments(&mut self, v: &NodeId) -> Result<Option<Vec<NodeId>>> {
+    fn literal_fragments(&mut self, v: &NodeId, round: bool) -> Result<Option<Vec<NodeId>>> {
         if !self.unknowns() {
             return Ok(None);
         }
         let Op::Const(lo, hi) = self.graph.get(*v).op else { return Ok(None) };
-        let Some((lo, hi)) = A::lit_raw_fixed(lo, hi) else {
-            anyhow::bail!("__split_by_flr of a literal interval: 16.16 only so far (the levels with unknowns)")
-        };
         if lo == hi {
             return Ok(None);
         }
-        // On the INTEGERS: a fragment need only make `flr` exact, and they
-        // rejoin into one hull (`move` reads it only via its floor and a
-        // linear `rem - 0.5 - amount`).
-        let step = 1i64 << 16;
-        let (lo, hi) = (lo as i64, hi as i64);
-        let (fl, fh) = (lo.div_euclid(step) * step, hi.div_euclid(step) * step);
+        // On the INTEGERS: a fragment need only make `flr` (`flr(v + 1/2)`)
+        // exact, and they rejoin into one hull (`move` reads it only via its
+        // floor and a linear `rem - 0.5 - amount`). The arithmetic's own
+        // fragments, the fork's (`Arithmetic::floor_fragment`, `round_fragment`).
+        let iv = A::ival(A::from_lit(lo), A::from_lit(hi));
+        let what = if round { "__split_by_round" } else { "__split_by_flr" };
+        let show = || format!("[{}, {}]", A::show(A::from_lit(lo)), A::show(A::from_lit(hi)));
+        let n = if round { A::rounds(iv)? } else { A::floors(iv) };
+        let n = n.ok_or_else(|| anyhow::anyhow!("{what} of the literal {}: past 65536 integers", show()))?;
         // Too many is refused at trace time (else a body erroring on every lane).
         anyhow::ensure!(
-            (fh - fl) / step < crate::transpile::graph::MAX_WAYS as i64,
-            "__split_by_flr of the literal [{}, {}] spans {} integers, more than {} fragments",
-            lo as f64 / 65536.0,
-            hi as f64 / 65536.0,
-            (fh - fl) / step + 1,
+            (n as usize) <= crate::transpile::graph::MAX_WAYS,
+            "{what} of the literal {} spans {n} integers, more than {} fragments",
+            show(),
             crate::transpile::graph::MAX_WAYS
         );
         let mut out = Vec::new();
-        let mut base = fl;
-        while base <= fh {
-            let (a, b) = (lo.max(base), hi.min(base + step - 1));
-            out.push(self.graph.leaf(Op::Const(A::lit(A::from_fixed_raw(a as i32)), A::lit(A::from_fixed_raw(b as i32)))));
-            base += step;
+        for k in 0..n {
+            let frag = if round { A::round_fragment(iv, k)? } else { A::floor_fragment(iv, k) };
+            let (a, b) = A::bounds(frag);
+            out.push(self.graph.leaf(Op::Const(A::lit(a), A::lit(b))));
         }
         Ok(Some(out))
     }
@@ -1688,6 +1686,30 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// `__split_by_round` of a LITERAL (a platform's `rem.x + spd.x` in
+    /// float) splits into the arithmetic's round fragments, as a literal
+    /// `__split_by_flr` into its floors; a point is no split.
+    #[test]
+    fn a_literal_round_split_takes_the_arithmetics_round_fragments() {
+        use celeste_core::arith::{Arithmetic, Float};
+        use celeste_core::lua_f64::{LuaF64, LuaF64Interval};
+        let f = |v: f64| LuaF64::new(v).expect("finite");
+        let mut d = Symbolic::<Float>::default();
+        d.level.platforms = true;
+        // The literal rem [-1/2, pred(1/2)] plus a platform's speed -0.65.
+        let iv = LuaF64Interval::new(f(-0.5), f(0.5f64.next_down())).checked_add(LuaF64Interval::point(f(-0.65))).expect("finite");
+        let lit = d.graph.leaf(Op::Const(Float::lit(iv.lo), Float::lit(iv.hi)));
+        let frags = d.literal_fragments(&lit, true).expect("in range").expect("a split");
+        let n = iv.rounds().expect("rounds").expect("few");
+        assert_eq!((frags.len(), n), (2, 2), "flr(x + 1/2) is -1 or 0 over [{:?}, {:?}]", iv.lo, iv.hi);
+        for (k, v) in frags.iter().enumerate() {
+            let want = iv.round_fragment(k as u32).expect("a fragment");
+            assert_eq!(d.graph.get(*v).op, Op::Const(Float::lit(want.lo), Float::lit(want.hi)), "fragment {k}");
+        }
+        let point = d.graph.leaf(Op::Const(Float::lit(f(0.25)), Float::lit(f(0.25))));
+        assert!(d.literal_fragments(&point, true).expect("in range").is_none(), "a point is no split");
     }
 
     /// The fake wall's `spd.x = -sign(spd.x)*1.5` before `move`: three pieces

@@ -35,7 +35,8 @@ struct Cli {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    let cfg = celeste_rust::settings::startup(&cli.settings, false, |_| {})?;
+    // Both commands are the level -1 table's, built in the run's arithmetic.
+    let cfg = celeste_rust::settings::startup(&cli.settings, true, |_| {})?;
     let threads_or = |n: usize| cfg.threads.unwrap_or(n);
     match (cli.probe, cli.level_minus_one_table) {
         (Some(args), None) => {

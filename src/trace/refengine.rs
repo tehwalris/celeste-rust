@@ -18,8 +18,7 @@ use crate::trace::block::{fn_info_of, FnInfo};
 use crate::trace::refbridge::{from_block, set_buttons, to_block};
 use crate::trace::refdomain::RefDomain;
 use crate::trace::refdriver::{fresh_interp, run_frame_all};
-use crate::pico8_num::{Pico8Num as P8, Pico8NumInterval as Iv};
-use celeste_core::arith::{Arithmetic, Fixed, Float};
+use celeste_core::arith::{Arithmetic, EngineNum, Fixed, Float};
 use crate::trace::heap::Value;
 use crate::trace::iface;
 use crate::trace::state::State;
@@ -130,37 +129,13 @@ impl<A: Arithmetic> ReferenceEngine<A> {
 
 impl<A: Arithmetic> ReferenceEngine<A>
 where
-    A::Num: Rem<A = A>,
+    A::Num: EngineNum<A = A>,
 {
     /// The room's start (post-`_init`) as a one-row block, without keys.
     pub fn initial(&self) -> Result<Rt2<A::Num>> {
         to_block(&self.base, self.settings.room)
     }
 
-    /// One frame of lane `lane` at the engine's level (`at_level`): every
-    /// fork leaf (the buttons, and each unknown boolean of the row, are
-    /// forked per path), each with its remainder TRANSFER - the
-    /// interpreter's arc capture (`Interp::arc_capture`: the player's split
-    /// per axis, as the tracer captures it for the kernels), decoded by the
-    /// arithmetic's decoder (`Rem::transfer`: 16.16's is the kernels'
-    /// `search::arc_edges::decode_axis`; a refusal is fatal, as theirs).
-    pub fn run_lane(&mut self, block: &Rt2<A::Num>, lane: usize) -> Result<Vec<(Block<A::Num>, <A::Num as Rem>::Pair)>> {
-        let (mut st, unknown) = from_block(block, lane, &self.fn_info, &self.base)?;
-        let zero = A::point(A::from_i16(0));
-        let none = || ArcAxis { took: false, pre: zero, frag: zero, ox: zero };
-        st.arc = Some(Box::new([none(), none()]));
-        self.it.arc_capture = true;
-        let leaves = run_frame_all(&mut self.it, self.body, &st, &unknown, self.level, self.path_cap);
-        self.it.arc_capture = false;
-        let leaves = leaves.map_err(|e| e.context(ran_from(&st, None)))?;
-        leaves
-            .iter()
-            .map(|l| {
-                let pair = transfer_of::<A::Num>(l).map_err(|e| e.context(ran_from(&st, None)))?;
-                Ok((Block::canonical(to_block(l, self.settings.room)?)?, pair))
-            })
-            .collect()
-    }
     /// One CONCRETE frame of row 0 of `row` under input `byte`: every leaf,
     /// keyed. It forks only where no input decides (`rnd`); unknown fields of
     /// the row are read as their placeholder, not forked.
@@ -208,7 +183,10 @@ where
     }
 }
 
-impl RefEngine {
+impl<A: Arithmetic> ReferenceEngine<A>
+where
+    A::Num: EngineNum<A = A>,
+{
     /// `step` at an abstract `level` (`rewrite arc-check`): the row's
     /// unknowns are forked as the level's kernels fork them (each unknown
     /// boolean both ways, a near floor's `state` per value, a comparison
@@ -221,13 +199,13 @@ impl RefEngine {
     /// fruit level the fly fruit's `spd.y` and `rem.y` are 0
     /// (`pin_fly_fruit_motion`), at a near level a floor isolated from the
     /// player is in state 0 (`pin_isolated_floors`).
-    pub fn step_at(&mut self, row: &Rt2, byte: u8, level: Level) -> Result<(Vec<Block>, u8)> {
+    pub fn step_at(&mut self, row: &Rt2<A::Num>, byte: u8, level: Level) -> Result<(Vec<Block<A::Num>>, u8)> {
         self.step_at_pinned(row, byte, level, true)
     }
 
     /// `step_at`, the pins (`pin_fly_fruit_motion`, `pin_isolated_floors`)
     /// optional: the test compares the two.
-    fn step_at_pinned(&mut self, row: &Rt2, byte: u8, level: Level, pin: bool) -> Result<(Vec<Block>, u8)> {
+    fn step_at_pinned(&mut self, row: &Rt2<A::Num>, byte: u8, level: Level, pin: bool) -> Result<(Vec<Block<A::Num>>, u8)> {
         let (mut st, mut unknown) = from_block(row, 0, &self.fn_info, &self.base)?;
         let mut pinned_floors = false;
         if level.floors_near {
@@ -256,8 +234,8 @@ impl RefEngine {
             for leaf in &leaves {
                 for (x, y) in players(leaf)? {
                     ensure!(
-                        before.iter().any(|&(bx, by)| apart_by(x, bx) <= raw(PLAYER_STEP) && apart_by(y, by) <= raw(PLAYER_STEP)),
-                        "pinned floors: a player at ({x:?}, {y:?}) is more than {PLAYER_STEP:?} from every player of the input {before:?}"
+                        before.iter().any(|&(bx, by)| within::<A>(x, bx, PLAYER_STEP) && within::<A>(y, by, PLAYER_STEP)),
+                        "pinned floors: a player at ({x:?}, {y:?}) is more than {PLAYER_STEP} px from every player of the input {before:?}"
                     );
                 }
             }
@@ -267,10 +245,40 @@ impl RefEngine {
     }
 
     /// `step` where the frame must not fork: the one successor.
-    pub fn step_one(&mut self, row: &Rt2, byte: u8) -> Result<Block> {
+    pub fn step_one(&mut self, row: &Rt2<A::Num>, byte: u8) -> Result<Block<A::Num>> {
         let mut out = self.step(row, byte)?;
         ensure!(out.len() == 1, "concrete frame produced {} leaves (expected exactly 1)", out.len());
         Ok(out.remove(0))
+    }
+}
+
+impl<A: Arithmetic> ReferenceEngine<A>
+where
+    A::Num: Rem<A = A>,
+{
+    /// One frame of lane `lane` at the engine's level (`at_level`): every
+    /// fork leaf (the buttons, and each unknown boolean of the row, are
+    /// forked per path), each with its remainder TRANSFER - the
+    /// interpreter's arc capture (`Interp::arc_capture`: the player's split
+    /// per axis, as the tracer captures it for the kernels), decoded by the
+    /// arithmetic's decoder (`Rem::transfer`: 16.16's is the kernels'
+    /// `search::arc_edges::decode_axis`; a refusal is fatal, as theirs).
+    pub fn run_lane(&mut self, block: &Rt2<A::Num>, lane: usize) -> Result<Vec<(Block<A::Num>, <A::Num as Rem>::Pair)>> {
+        let (mut st, unknown) = from_block(block, lane, &self.fn_info, &self.base)?;
+        let zero = A::point(A::from_i16(0));
+        let none = || ArcAxis { took: false, pre: zero, frag: zero, ox: zero };
+        st.arc = Some(Box::new([none(), none()]));
+        self.it.arc_capture = true;
+        let leaves = run_frame_all(&mut self.it, self.body, &st, &unknown, self.level, self.path_cap);
+        self.it.arc_capture = false;
+        let leaves = leaves.map_err(|e| e.context(ran_from(&st, None)))?;
+        leaves
+            .iter()
+            .map(|l| {
+                let pair = transfer_of::<A::Num>(l).map_err(|e| e.context(ran_from(&st, None)))?;
+                Ok((Block::canonical(to_block(l, self.settings.room)?)?, pair))
+            })
+            .collect()
     }
 }
 
@@ -316,18 +324,18 @@ fn transfer_of<N: Rem>(leaf: &State<RefDomain<N::A>>) -> Result<N::Pair> {
 /// 100% f27: ~140 leaves a step); the test
 /// `pinning_the_fly_fruits_motion_keeps_the_projected_successors` checks the
 /// sets agree.
-fn pin_fly_fruit_motion(st: &mut State<RefDomain>) -> Result<()> {
+fn pin_fly_fruit_motion<A: Arithmetic>(st: &mut State<RefDomain<A>>) -> Result<()> {
     use celeste_engine::widening::{Flag, Stored, TABLE};
     for e in TABLE.iter().filter(|e| e.flag == Flag::Fruit) {
         for paths in crate::trace::widen::entry_paths(st, e) {
             for (s, p) in e.slots.iter().zip(&paths) {
                 match s.stored {
                     Stored::UnknownNum => ensure!(
-                        matches!(iface::get(st, p), Some(Value::Num(v)) if v.low == P8::from_raw(i32::MIN) && v.high == P8::from_raw(i32::MAX)),
+                        matches!(iface::get(st, p), Some(Value::Num(v)) if v == A::unknown()),
                         "pinning the fly fruit's motion: {} is not the unknown number",
                         iface::show(p)
                     ),
-                    Stored::Range { .. } => iface::set(st, p, Value::Num(Iv::from_number(P8::from_i16(0))))?,
+                    Stored::Range { .. } => iface::set(st, p, Value::Num(A::point(A::from_i16(0))))?,
                     _ => {}
                 }
             }
@@ -336,29 +344,55 @@ fn pin_fly_fruit_motion(st: &mut State<RefDomain>) -> Result<()> {
     Ok(())
 }
 
-/// How far a player (or its spawn) moves in one frame at most, per axis
-/// (the dash's 5 and the remainder's carry; a spring's snap stays inside
-/// it), checked on every leaf of a step that pinned floors
+/// How far a player (or its spawn) moves in one frame at most, per axis, in
+/// pixels (the dash's 5 and the remainder's carry; a spring's snap stays
+/// inside it), checked on every leaf of a step that pinned floors
 /// (`step_at_pinned`).
-const PLAYER_STEP: P8 = P8::from_i16(8);
+const PLAYER_STEP: f64 = 8.0;
 /// A floor is ISOLATED from a player at least this far (Chebyshev) at the
 /// frame's start: through the frame it stays 12 away, and the player's box
 /// (x+1..x+7, y+3..y+8) probed 3 to a side and 1 up or down
 /// (`widen::PLAYER_PROBE`, the floor's own `check(player, +-1)`) reaches a
 /// floor's 8x8 only within 10 across and 9 down or 6 up.
-const PLAYER_FAR: P8 = P8::from_i16(20);
+const PLAYER_FAR: f64 = 20.0;
 /// ... and with no object but floors (and the fly fruit) closer than this
 /// (a spring on it reads its `collideable` and breaks with it).
-const OTHERS_FAR: P8 = P8::from_i16(16);
+const OTHERS_FAR: f64 = 16.0;
 
-/// `|a - b|` in raw 16.16, exact (`i64`: two coordinates far apart never
-/// wrap into near ones).
-fn apart_by(a: P8, b: P8) -> i64 {
-    (raw(a) - raw(b)).abs()
+/// `|a - b|` against `d` EXACTLY: the difference as the rounded `s` and its
+/// error `e` (Knuth's TwoSum; `s + e` is the difference exactly). 16.16's
+/// values are doubles whose differences are exact (`e = 0`), so this is
+/// its raw comparison.
+fn distance_cmp<A: Arithmetic>(a: A::Num, b: A::Num, d: f64) -> std::cmp::Ordering
+where
+    A::Num: EngineNum,
+{
+    let (x, y) = (a.to_f64(), b.to_f64());
+    let (x, y) = if x >= y { (x, y) } else { (y, x) };
+    // `s + e == x - y` exactly, `s >= 0`.
+    let s = x - y;
+    let bb = s - x;
+    let e = (x - (s - bb)) + (-y - bb);
+    match s.partial_cmp(&d).expect("finite coordinates") {
+        std::cmp::Ordering::Equal => e.partial_cmp(&0.0).expect("finite"),
+        o => o,
+    }
 }
 
-fn raw(v: P8) -> i64 {
-    v.as_raw_u32() as i32 as i64
+/// `|a - b| >= d`, exactly.
+fn far<A: Arithmetic>(a: A::Num, b: A::Num, d: f64) -> bool
+where
+    A::Num: EngineNum,
+{
+    distance_cmp::<A>(a, b, d) != std::cmp::Ordering::Less
+}
+
+/// `|a - b| <= d`, exactly.
+fn within<A: Arithmetic>(a: A::Num, b: A::Num, d: f64) -> bool
+where
+    A::Num: EngineNum,
+{
+    distance_cmp::<A>(a, b, d) != std::cmp::Ordering::Greater
 }
 
 /// What a reference frame ran from, for its error: the input (`None`: the
@@ -380,7 +414,7 @@ fn ran_from<A: Arithmetic>(st: &State<RefDomain<A>>, byte: Option<u8>) -> String
 }
 
 /// The positions of every player and player spawn, concrete.
-fn players(st: &State<RefDomain>) -> Result<Vec<(P8, P8)>> {
+fn players<A: Arithmetic>(st: &State<RefDomain<A>>) -> Result<Vec<(A::Num, A::Num)>> {
     let mut out = Vec::new();
     for ty in ["player", "player_spawn"] {
         for o in objects_of_type(st, ty) {
@@ -391,9 +425,9 @@ fn players(st: &State<RefDomain>) -> Result<Vec<(P8, P8)>> {
 }
 
 /// An object's `(x, y)`, when both are points.
-fn position(st: &State<RefDomain>, obj: &iface::Path) -> Result<Option<(P8, P8)>> {
+fn position<A: Arithmetic>(st: &State<RefDomain<A>>, obj: &iface::Path) -> Result<Option<(A::Num, A::Num)>> {
     let num = |f: &str| match iface::get(st, &field(obj, &[f])) {
-        Some(Value::Num(v)) => Ok(v.to_number()),
+        Some(Value::Num(v)) => Ok(A::as_point(v)),
         other => Err(anyhow::anyhow!("{}.{f}: not a number: {other:?}", iface::show(obj))),
     };
     Ok(num("x")?.zip(num("y")?))
@@ -412,7 +446,10 @@ fn position(st: &State<RefDomain>, obj: &iface::Path) -> Result<Option<(P8, P8)>
 /// such floor's three states as a PRODUCT (room (3,0), 12 floors: over 1M
 /// paths a step). Whether any floor was pinned; the caller checks
 /// `PLAYER_STEP` on the leaves.
-fn pin_isolated_floors(st: &mut State<RefDomain>) -> Result<bool> {
+fn pin_isolated_floors<A: Arithmetic>(st: &mut State<RefDomain<A>>) -> Result<bool>
+where
+    A::Num: EngineNum,
+{
     let ppos = players(st)?;
     let floors = objects_of_type(st, "fall_floor");
     // The fly fruit is not solid and collides with the player alone (its `y`
@@ -430,19 +467,19 @@ fn pin_isolated_floors(st: &mut State<RefDomain>) -> Result<bool> {
             others.push(position(st, &o)?);
         }
     }
-    let apart = |a: (P8, P8), b: (P8, P8), d: P8| apart_by(a.0, b.0) >= raw(d) || apart_by(a.1, b.1) >= raw(d);
+    let apart = |a: (A::Num, A::Num), b: (A::Num, A::Num), d: f64| far::<A>(a.0, b.0, d) || far::<A>(a.1, b.1, d);
     let mut any = false;
     for f in &floors {
         let ps = field(f, &["state"]);
         let Some(Value::Num(state)) = iface::get(st, &ps) else { anyhow::bail!("{}: not a number", iface::show(&ps)) };
         let Some(at) = position(st, f)? else { continue };
-        if state.to_number().is_some()
+        if A::as_point(state).is_some()
             || !ppos.iter().all(|&p| apart(p, at, PLAYER_FAR))
             || !others.iter().all(|o| o.is_some_and(|o| ppos.contains(&o) || apart(o, at, OTHERS_FAR)))
         {
             continue;
         }
-        iface::set(st, &ps, Value::Num(Iv::from_number(P8::from_i16(0))))?;
+        iface::set(st, &ps, Value::Num(A::point(A::from_i16(0))))?;
         iface::set(st, &field(f, &["collideable"]), Value::Bool(true))?;
         any = true;
     }
@@ -518,6 +555,28 @@ impl<N: Rem> crate::frame::FrameStep<N> for RefFrameStep<N> {
 
 #[cfg(test)]
 mod tests {
+    /// The pins' distance tests are EXACT in doubles, where `a - b` rounds:
+    /// TwoSum's error decides a rounded difference equal to the bound.
+    #[test]
+    fn distances_compare_exactly_in_doubles() {
+        use celeste_core::arith::{Fixed, Float};
+        use celeste_core::lua_f64::LuaF64;
+        use celeste_core::pico8_num::Pico8Num as P8;
+        let f = |v: f64| LuaF64::new(v).expect("finite");
+        // 8 + 2^-49 is 8 apart from 0 by a hair: not within 8, far by 8.
+        let a = f(8.0 + 2f64.powi(-49));
+        assert!(!super::within::<Float>(a, f(0.0), 8.0) && super::far::<Float>(a, f(0.0), 8.0));
+        // 2^53 - 0.5 rounds to 2^53: the exact difference is below it.
+        let (x, y) = (f(2f64.powi(53)), f(0.5));
+        assert_eq!(x.value() - y.value(), 2f64.powi(53), "the rounded difference");
+        assert!(super::within::<Float>(x, y, 2f64.powi(53)) && !super::far::<Float>(x, y, 2f64.powi(53)));
+        assert!(super::within::<Float>(y, x, 2f64.powi(53)), "symmetric");
+        // 16.16: the raw comparison it replaced.
+        let (p, q) = (P8::from_raw(8 << 16), P8::from_raw(-1));
+        assert!(!super::within::<Fixed>(p, q, 8.0) && super::far::<Fixed>(p, q, 8.0));
+        assert!(super::within::<Fixed>(p, P8::from_raw(0), 8.0) && super::far::<Fixed>(p, P8::from_raw(0), 8.0));
+    }
+
     use super::*;
 
     /// THE ONE CONVERTER AGREES ACROSS THE SIDES over real states: every

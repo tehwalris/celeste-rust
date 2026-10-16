@@ -30,13 +30,14 @@ use std::path::{Path as FsPath, PathBuf};
 
 use anyhow::{anyhow, bail, ensure, Result};
 
-use celeste_core::pico8_num::{Pico8Num as P8, Pico8NumInterval};
+use celeste_core::arith::{Arithmetic, EngineNum, Fixed, Float};
 
 use super::domain::{Domain, Symbolic};
 use super::heap::Value;
 use super::iface::{self, Conc, Path, Step};
 use super::kernel::{LatticeWalk, Tracer};
 use super::state::State;
+use crate::transpile::garith::{value_box, GraphArith};
 use crate::transpile::graph::{Graph, NodeId, Op, Room, Val};
 
 /// A report line, to the report and at once to stderr (a run is minutes).
@@ -50,11 +51,40 @@ macro_rules! say {
     }};
 }
 
-/// A raw 16.16 range, inclusive.
-type Range = (i64, i64);
+/// A range of the arithmetic's numbers, inclusive, in the TOTAL order (a
+/// double's `-0` below `0`: `least`, `most`, `below`), so a range holds its
+/// lanes' bits, not only their values.
+type Range<A> = (<A as Arithmetic>::Num, <A as Arithmetic>::Num);
 
-/// The rem range every object's `rem` is seeded with and must stay in.
-const REM: Range = (-0x8000, 0x7fff);
+/// The rem range every object's `rem` is seeded with and must stay in
+/// (`widening::REM`: [-1/2, 1/2)).
+fn rem_range<A: GraphArith>() -> Range<A> {
+    celeste_engine::widening::range::<A::Num>(celeste_engine::widening::REM.0, celeste_engine::widening::REM.1)
+}
+
+/// Is `a` below `b` in the total order (exact: 16.16's and a double's values
+/// are both exact doubles)?
+fn below<N: EngineNum>(a: N, b: N) -> bool {
+    a.to_f64().total_cmp(&b.to_f64()).is_lt()
+}
+
+/// The lesser of two ends in the total order.
+fn least<N: EngineNum>(a: N, b: N) -> N {
+    if below(b, a) {
+        b
+    } else {
+        a
+    }
+}
+
+/// The greater of two ends in the total order.
+fn most<N: EngineNum>(a: N, b: N) -> N {
+    if below(a, b) {
+        b
+    } else {
+        a
+    }
+}
 
 /// More fork configurations than this in one shape is refused, not traced.
 const MAX_CONFIGS: usize = 1 << 14;
@@ -85,59 +115,61 @@ pub struct Opts {
 
 /// What flowed into one input slot of a shape, joined over the edges.
 #[derive(Clone, Copy, PartialEq, Debug)]
-enum Obs {
-    Num(i64, i64),
+enum Obs<A: GraphArith> {
+    Num(A::Num, A::Num),
     /// A LITERAL interval every lane holds (an `rnd` draw), not a hull.
-    Lit(i64, i64),
+    Lit(A::Num, A::Num),
     Bool { f: bool, t: bool, u: bool },
 }
 
-impl Obs {
-    fn of(v: Val) -> Obs {
+impl<A: GraphArith> Obs<A> {
+    fn of(v: Val<A>) -> Obs<A> {
         match v {
-            Val::Num(i) => Obs::Num(raw(i.low), raw(i.high)),
+            Val::Num(i) => {
+                let (lo, hi) = A::bounds(i);
+                Obs::Num(lo, hi)
+            }
             Val::Bool(Some(false)) => Obs::Bool { f: true, t: false, u: false },
             Val::Bool(Some(true)) => Obs::Bool { f: false, t: true, u: false },
             Val::Bool(None) => Obs::Bool { f: false, t: false, u: true },
         }
     }
     /// What flowed in as a hull of the lanes' values: a literal is one.
-    fn hull(self) -> Obs {
+    fn hull(self) -> Obs<A> {
         match self {
             Obs::Lit(a, b) => Obs::Num(a, b),
             o => o,
         }
     }
-    fn join(self, o: Obs) -> Result<Obs> {
+    fn join(self, o: Obs<A>) -> Result<Obs<A>> {
         Ok(match (self, o) {
             (Obs::Lit(a, b), Obs::Lit(c, d)) if (a, b) == (c, d) => Obs::Lit(a, b),
-            (Obs::Num(a, b) | Obs::Lit(a, b), Obs::Num(c, d) | Obs::Lit(c, d)) => Obs::Num(a.min(c), b.max(d)),
+            (Obs::Num(a, b) | Obs::Lit(a, b), Obs::Num(c, d) | Obs::Lit(c, d)) => Obs::Num(least(a, c), most(b, d)),
             (Obs::Bool { f, t, u }, Obs::Bool { f: g, t: s, u: v }) => Obs::Bool { f: f || g, t: t || s, u: u || v },
             _ => bail!("a slot observed as both a number and a boolean"),
         })
     }
 }
 
-fn raw(p: P8) -> i64 {
-    p.as_raw_u32() as i32 as i64
-}
-
-fn px(r: i64) -> f64 {
-    r as f64 / 65536.0
+/// A number for a message, in pixels.
+fn px<N: EngineNum>(v: N) -> f64 {
+    v.to_f64()
 }
 
 /// Widen `seed` to contain `obs`: the hull, or with `jump` (a slot that grew
-/// twice) the moved end to the 16.16 extreme, so unbounded growth converges.
-fn widen(seed: Range, obs: Range, jump: bool) -> Range {
-    let lo = if obs.0 < seed.0 { if jump { i32::MIN as i64 } else { obs.0 } } else { seed.0 };
-    let hi = if obs.1 > seed.1 { if jump { i32::MAX as i64 } else { obs.1 } } else { seed.1 };
+/// twice) the moved end to the arithmetic's extreme (`Arithmetic::unknown`'s
+/// end), so unbounded growth converges.
+fn widen<A: GraphArith>(seed: Range<A>, obs: Range<A>, jump: bool) -> Range<A> {
+    let (min, max) = A::bounds(A::unknown());
+    let lo = if below(obs.0, seed.0) { if jump { min } else { obs.0 } } else { seed.0 };
+    let hi = if below(seed.1, obs.1) { if jump { max } else { obs.1 } } else { seed.1 };
     (lo, hi)
 }
 
 /// Does outcome state `st` certainly not hold `room`'s berry as taken
 /// (`got_fruit[1 + level_index()]` nil or the constant false)? An unknown
 /// or selected value may be true: the exit is kept.
-fn berry_left_behind(st: &State<Symbolic>, d: &Symbolic, room: (i16, i16)) -> bool {
+fn berry_left_behind<A: GraphArith>(st: &State<Symbolic<A>>, d: &Symbolic<A>, room: (i16, i16)) -> bool {
     let Some(Value::Table(t)) = iface::get(st, &[iface::key("got_fruit")]) else { return true };
     let k = 1 + crate::game_runner::level_index(room.0, room.1);
     let tab = &st.heap.tables[&t];
@@ -150,7 +182,7 @@ fn berry_left_behind(st: &State<Symbolic>, d: &Symbolic, room: (i16, i16)) -> bo
 }
 
 /// The player, else the player spawn (`pos_graph::player_object`'s rule).
-fn located_object(st: &State<Symbolic>) -> Option<Path> {
+fn located_object<A: GraphArith>(st: &State<Symbolic<A>>) -> Option<Path> {
     if let Some(p) = super::shapes::player_path(st) {
         return Some(p);
     }
@@ -177,7 +209,7 @@ fn is_rem(p: &Path) -> bool {
 }
 
 /// Every object's `rem.x/y` and `spd.x/y` slots.
-fn motion_paths(st: &State<Symbolic>) -> Vec<Path> {
+fn motion_paths<A: GraphArith>(st: &State<Symbolic<A>>) -> Vec<Path> {
     let Some(Value::Table(objects)) = iface::get(st, &[iface::key("objects")]) else { return Vec::new() };
     let mut out = Vec::new();
     for i in 0..st.heap.tables[&objects].arr.len() {
@@ -196,10 +228,13 @@ fn motion_paths(st: &State<Symbolic>) -> Vec<Path> {
 
 /// How an input slot is given a value.
 #[derive(Clone)]
-enum Seed {
-    Pin(Conc),
-    X,
-    Y,
+enum Seed<A: GraphArith> {
+    Pin(Conc<A>),
+    /// The located object's `x` / `y`: the node's pixel, or where the
+    /// lattice pins it, the pin (the bits every lane holds: a double's `0`
+    /// is not `-0`, which a pixel's value box holds too).
+    X(Option<A::Num>),
+    Y(Option<A::Num>),
     /// A numeric range, by path into the shape's `ranges`.
     Range(Path),
     Unknown,
@@ -223,49 +258,57 @@ struct Roots {
     fields: Vec<NodeId>,
 }
 
+/// What a fork splits at: `flr` (`Split`, `SplitInt`) or `flr(x + 1/2)`
+/// (`RSplit`, the doubles' `__split_by_round`).
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum ForkAt {
+    Floor,
+    Round,
+}
+
 /// One configuration's per-outcome roots and fork operands (with arities).
 struct Config {
     outs: Vec<Roots>,
-    operands: Vec<(u8, NodeId)>,
+    operands: Vec<(u8, ForkAt, NodeId)>,
 }
 
 /// Every fork configuration of a cone, specialized into one shared graph.
-struct Spec {
-    graph: Graph,
+struct Spec<A: GraphArith> {
+    graph: Graph<A>,
     configs: Vec<Config>,
 }
 
 /// A shape's frame before specialization: the cone, its roots and forks.
-struct Cone {
-    graph: Graph,
+struct Cone<A: GraphArith> {
+    graph: Graph<A>,
     roots: Vec<Roots>,
-    forks: BTreeMap<u8, NodeId>,
+    forks: BTreeMap<u8, (ForkAt, NodeId)>,
     /// `(fork, arity)` of every fork in `forks`.
     arities: Vec<(u8, u8)>,
     n_forks: u8,
 }
 
 /// A shape traced for level -1.
-struct Traced {
-    seeds: Vec<Seed>,
+struct Traced<A: GraphArith> {
+    seeds: Vec<Seed<A>>,
     outs: Vec<OutSpec>,
     /// The frame specialized as traced: what every node is evaluated with.
-    plain: Spec,
+    plain: Spec<A>,
     /// The frame with every select LIFTED (~25x larger), built lazily for
     /// nodes whose plain evaluation is in violation (`eval_node`).
-    precise: std::sync::OnceLock<Spec>,
+    precise: std::sync::OnceLock<Spec<A>>,
     /// Which trace this is (`TRACES`), part of a node's signature (`Table::sig`).
     generation: u64,
-    cone: Cone,
+    cone: Cone<A>,
     /// The static ranges it was traced under (the arities' source).
-    bounds: BTreeMap<Path, Range>,
-    pins: BTreeMap<Path, Conc>,
+    bounds: BTreeMap<Path, Range<A>>,
+    pins: BTreeMap<Path, Conc<A>>,
     stats: String,
 }
 
-struct Shape {
+struct Shape<A: GraphArith> {
     key: String,
-    ranges: BTreeMap<Path, Range>,
+    ranges: BTreeMap<Path, Range<A>>,
     /// `rnd`-derived ranges every lane holds as a LITERAL (`Obs::Lit`), read
     /// as that literal so a lane's own ends stay exact.
     lits: BTreeSet<Path>,
@@ -273,7 +316,7 @@ struct Shape {
     /// REPLACES them rather than joining the 0 in.
     unseeded: BTreeSet<Path>,
     demoted: BTreeSet<Path>,
-    traced: Option<Traced>,
+    traced: Option<Traced<A>>,
 }
 
 /// One node's frame, as its successors.
@@ -286,8 +329,8 @@ struct NodeOut {
 }
 
 /// A worker's accumulated observations and violations.
-struct Acc {
-    obs: Vec<Option<Obs>>,
+struct Acc<A: GraphArith> {
+    obs: Vec<Option<Obs<A>>>,
     /// Successors clipped to `WINDOW`, per target shape.
     clipped: Vec<u64>,
     violations: Vec<String>,
@@ -296,20 +339,20 @@ struct Acc {
     precise: usize,
 }
 
-struct Table<'a> {
-    lw: &'a LatticeWalk,
+struct Table<'a, A: GraphArith> {
+    lw: &'a LatticeWalk<A>,
     room: Room,
     room0: (i16, i16),
     /// `--hundred`: a successor that leaves the berry behind is no exit.
     hundred: bool,
-    spd_px: i32,
-    shapes: Vec<Shape>,
+    spd_px: i16,
+    shapes: Vec<Shape<A>>,
     by_key: HashMap<String, usize>,
     obs_keys: Vec<(usize, Path)>,
     obs_index: BTreeMap<(usize, Path), usize>,
 }
 
-impl<'a> Table<'a> {
+impl<A: GraphArith> Table<'_, A> {
     fn shape_id(&mut self, key: &str) -> Result<usize> {
         if let Some(&i) = self.by_key.get(key) {
             return Ok(i);
@@ -339,12 +382,12 @@ impl<'a> Table<'a> {
 
     /// Trace shape `id` under its ranges and pins and specialize every fork
     /// configuration into one shared graph.
-    fn trace(&mut self, tr: &mut Tracer, id: usize) -> Result<()> {
+    fn trace(&mut self, tr: &mut Tracer<A>, id: usize) -> Result<()> {
         let t0 = std::time::Instant::now();
         let key = self.shapes[id].key.clone();
         let st = self.lw.reps[&key].clone();
         let roots = super::shapes::state_paths(&st)?;
-        let pins: BTreeMap<Path, Conc> = self.lw.lattice[&key]
+        let pins: BTreeMap<Path, Conc<A>> = self.lw.lattice[&key]
             .iter()
             .filter(|(p, _)| roots.iter().any(|r| r == *p) && !self.shapes[id].demoted.contains(*p))
             .map(|(p, c)| (p.clone(), *c))
@@ -372,23 +415,23 @@ impl<'a> Table<'a> {
                 let (lo, hi) = self.lw.start_ivals[p].ok_or_else(|| anyhow!("{key}: the start state's interval {} is not a literal range", iface::show(p)))?;
                 ensure!(self.lit_slot(&key, p), "{key}: the start state's interval {} is not an `rnd` slot", iface::show(p));
                 self.shapes[id].lits.insert(p.clone());
-                (lo as i64, hi as i64)
+                (A::from_lit(lo), A::from_lit(hi))
             } else if is_player("rem") {
-                REM
+                rem_range::<A>()
             } else if is_player("spd") {
-                (-(self.spd_px as i64) << 16, (self.spd_px as i64) << 16)
+                (A::from_i16(-self.spd_px), A::from_i16(self.spd_px))
             } else {
                 let v = tr.it.d.as_const(&n).ok_or_else(|| anyhow!("{key}: {} is not a constant in the representative", iface::show(p)))?;
                 if key != self.lw.start_key {
                     self.shapes[id].unseeded.insert(p.clone());
                 }
-                (raw(v), raw(v))
+                (v, v)
             };
             self.shapes[id].ranges.insert(p.clone(), r);
         }
         // Interval inputs: unpinned rem and speed (`move` forks), and the boundary's.
         let mut ival: Vec<Path> = Vec::new();
-        let mut bounds: BTreeMap<Path, Range> = BTreeMap::new();
+        let mut bounds: BTreeMap<Path, Range<A>> = BTreeMap::new();
         for p in motion_paths(&st) {
             if pins.contains_key(&p) {
                 continue;
@@ -401,8 +444,8 @@ impl<'a> Table<'a> {
                 ival.push(p);
             }
         }
-        let pin_list: Vec<(Path, Conc)> = pins.iter().map(|(p, c)| (p.clone(), *c)).collect();
-        let bound_list: Vec<(Path, (i32, i32))> = bounds.iter().map(|(p, r)| (p.clone(), (r.0 as i32, r.1 as i32))).collect();
+        let pin_list: Vec<(Path, Conc<A>)> = pins.iter().map(|(p, c)| (p.clone(), *c)).collect();
+        let bound_list: Vec<(Path, (A::Lit, A::Lit))> = bounds.iter().map(|(p, r)| (p.clone(), (A::lit(r.0), A::lit(r.1)))).collect();
         // Held trails are unknown booleans, not forks.
         tr.it.d.level.held = false;
         // Move-fork arity from the ranges' full width; restored below.
@@ -436,16 +479,20 @@ impl<'a> Table<'a> {
         let f = f?;
         let t_trace = t0.elapsed();
         let n_slots = f.iface.slots.len();
-        let seeds: Vec<Seed> = f
+        let seeds: Vec<Seed<A>> = f
             .iface
             .slots
             .iter()
             .zip(&f.iface.init)
             .map(|(p, c)| {
+                let pinned = || match pins.get(p) {
+                    Some(Conc::Num(v)) => Some(*v),
+                    _ => None,
+                };
                 if Some(p) == xp.as_ref() {
-                    Seed::X
+                    Seed::X(pinned())
                 } else if Some(p) == yp.as_ref() {
-                    Seed::Y
+                    Seed::Y(pinned())
                 } else if let Some(c) = pins.get(p) {
                     Seed::Pin(*c)
                 } else {
@@ -456,7 +503,7 @@ impl<'a> Table<'a> {
                 }
             })
             .collect();
-        ensure!(located.is_none() || seeds.iter().filter(|s| matches!(s, Seed::X | Seed::Y)).count() == 2, "shape {id}: the located object's x/y are not input slots");
+        ensure!(located.is_none() || seeds.iter().filter(|s| matches!(s, Seed::X(_) | Seed::Y(_))).count() == 2, "shape {id}: the located object's x/y are not input slots");
 
         // The outcomes and every root read from them.
         let d = &tr.it.d;
@@ -519,9 +566,9 @@ impl<'a> Table<'a> {
             cone.set_fork_ways(k, f.fork_ways[k as usize]);
         }
         let mut cmap: Vec<NodeId> = vec![NodeId::MAX; arena.len()];
-        let mut forks: BTreeMap<u8, NodeId> = BTreeMap::new();
+        let mut forks: BTreeMap<u8, (ForkAt, NodeId)> = BTreeMap::new();
         // The literal slots' cells (`Shape::lits`), read as their literal.
-        let lit_cells: HashMap<u32, (i32, i32)> = f
+        let lit_cells: HashMap<u32, (A::Lit, A::Lit)> = f
             .iface
             .slots
             .iter()
@@ -529,10 +576,10 @@ impl<'a> Table<'a> {
             .filter(|(_, p)| self.shapes[id].lits.contains(*p))
             .map(|(i, p)| {
                 let r = self.shapes[id].ranges[p];
-                (i as u32, (r.0 as i32, r.1 as i32))
+                (i as u32, (A::lit(r.0), A::lit(r.1)))
             })
             .collect();
-        let mut lifted: HashMap<(Op, Vec<NodeId>), NodeId> = HashMap::new();
+        let mut lifted: HashMap<(Op<A>, Vec<NodeId>), NodeId> = HashMap::new();
         for i in 0..arena.len() {
             if !need[i] {
                 continue;
@@ -545,10 +592,16 @@ impl<'a> Table<'a> {
                     let (lo, hi) = lit_cells[&c];
                     cone.leaf(Op::Const(lo, hi))
                 }
-                Op::Known | Op::SplitOk(_) | Op::NoWrap => cone.leaf(Op::ConstBool(true)),
+                Op::Known | Op::SplitOk(_) | Op::RSplitOk(_) | Op::NoWrap => cone.leaf(Op::ConstBool(true)),
                 _ => {
-                    if let Op::Split(k) | Op::SplitInt(k) = nd.op {
-                        forks.entry(k).or_insert(args[0]);
+                    match nd.op {
+                        Op::Split(k) | Op::SplitInt(k) => {
+                            forks.entry(k).or_insert((ForkAt::Floor, args[0]));
+                        }
+                        Op::RSplit(k) => {
+                            forks.entry(k).or_insert((ForkAt::Round, args[0]));
+                        }
+                        _ => {}
                     }
                     lift(&mut cone, nd.op.clone(), args, Lift::Ends, &mut lifted)
                 }
@@ -557,9 +610,12 @@ impl<'a> Table<'a> {
         // `SplitValid` without its `Split` in the cone still names a fork.
         for i in 0..arena.len() {
             if need[i] {
-                if let Op::SplitValid(k) = arena.get(i as NodeId).op {
-                    forks.entry(k).or_insert(cmap[arena.get(i as NodeId).args[0] as usize]);
-                }
+                let at = match arena.get(i as NodeId).op {
+                    Op::SplitValid(k) => (k, ForkAt::Floor),
+                    Op::RSplitValid(k) => (k, ForkAt::Round),
+                    _ => continue,
+                };
+                forks.entry(at.0).or_insert((at.1, cmap[arena.get(i as NodeId).args[0] as usize]));
             }
         }
         let arities: Vec<(u8, u8)> = forks.keys().map(|k| (*k, f.fork_ways[*k as usize])).collect();
@@ -569,7 +625,7 @@ impl<'a> Table<'a> {
         let roots: Vec<Roots> = roots_old.iter().map(|r| Roots { live: m(&r.live), error: m(&r.error), xy: r.xy.map(|(x, y)| (m(&x), m(&y))), fields: r.fields.iter().map(m).collect() }).collect();
         let cone = Cone { graph: cone, roots, forks, arities, n_forks: f.forks };
         let plain = cone.specialize();
-        let operands: Vec<String> = cone.forks.iter().map(|(k, op)| format!("fork {k}: {}", super::emit::show_tree(&cone.graph, *op, 3))).collect();
+        let operands: Vec<String> = cone.forks.iter().map(|(k, (at, op))| format!("fork {k} ({at:?}): {}", super::emit::show_tree(&cone.graph, *op, 3))).collect();
         let stats = format!(
             "{} slots ({} pinned, {} interval), {} outcomes, forks {:?}, {} configurations ({} distinct), cone {} nodes, specialized {} nodes, trace {:.1} s, specialize {:.1} s",
             n_slots,
@@ -591,15 +647,15 @@ impl<'a> Table<'a> {
 
 }
 
-impl Cone {
+impl<A: GraphArith> Cone<A> {
     /// Every fork configuration in one shared graph, duplicates kept once.
-    fn specialize(&self) -> Spec {
+    fn specialize(&self) -> Spec<A> {
         let n_configs: usize = self.arities.iter().map(|(_, w)| *w as usize).product();
         let mut shared = self.graph.like();
         let mut configs: Vec<Config> = Vec::new();
         let mut seen: HashSet<Vec<NodeId>> = HashSet::new();
         // Only what a root or a fork operand reads (`lift` leaves dead nodes).
-        let mut roots: Vec<NodeId> = self.forks.values().copied().collect();
+        let mut roots: Vec<NodeId> = self.forks.values().map(|f| f.1).collect();
         for r in &self.roots {
             roots.extend([r.live, r.error]);
             roots.extend(r.xy.iter().flat_map(|(x, y)| [*x, *y]));
@@ -620,7 +676,7 @@ impl Cone {
                 .iter()
                 .map(|r| Roots { live: m(r.live), error: m(r.error), xy: r.xy.map(|(x, y)| (m(x), m(y))), fields: r.fields.iter().map(|n| m(*n)).collect() })
                 .collect();
-            let operands: Vec<(u8, NodeId)> = self.forks.iter().map(|(k, op)| (self.graph.fork_ways(*k), map[*op as usize])).collect();
+            let operands: Vec<(u8, ForkAt, NodeId)> = self.forks.iter().map(|(k, (at, op))| (self.graph.fork_ways(*k), *at, map[*op as usize])).collect();
             let mut sig: Vec<NodeId> = Vec::new();
             for r in &outs_c {
                 sig.extend([r.live, r.error]);
@@ -629,7 +685,7 @@ impl Cone {
                 }
                 sig.extend(&r.fields);
             }
-            sig.extend(operands.iter().map(|o| o.1));
+            sig.extend(operands.iter().map(|o| o.2));
             if seen.insert(sig) {
                 configs.push(Config { outs: outs_c, operands });
             }
@@ -638,10 +694,10 @@ impl Cone {
     }
 
     /// The cone with its selects lifted (`lift`), specialized.
-    fn precise(&self) -> Spec {
+    fn precise(&self) -> Spec<A> {
         let g = &self.graph;
         let mut out = g.like();
-        let mut memo: HashMap<(Op, Vec<NodeId>), NodeId> = HashMap::new();
+        let mut memo: HashMap<(Op<A>, Vec<NodeId>), NodeId> = HashMap::new();
         let mut map: Vec<NodeId> = Vec::with_capacity(g.len());
         for i in 0..g.len() {
             let nd = g.get(i as NodeId);
@@ -652,7 +708,7 @@ impl Cone {
         let lifted = Cone {
             graph: out,
             roots: self.roots.iter().map(|r| Roots { live: m(r.live), error: m(r.error), xy: r.xy.map(|(x, y)| (m(x), m(y))), fields: r.fields.iter().map(|n| m(*n)).collect() }).collect(),
-            forks: self.forks.iter().map(|(k, n)| (*k, m(*n))).collect(),
+            forks: self.forks.iter().map(|(k, (at, n))| (*k, (*at, m(*n)))).collect(),
             arities: self.arities.clone(),
             n_forks: self.n_forks,
         };
@@ -663,20 +719,23 @@ impl Cone {
 /// Traces made so far (`Traced::generation`).
 static TRACES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// A literal interval plus/minus a point, as the shifted literal (in range).
-fn lit_shift(g: &Graph, op: &Op, args: &[NodeId]) -> Option<(i32, i32)> {
+/// A literal interval plus/minus a point, as the shifted literal: what the
+/// arithmetic's interval op makes of it (its ends are the lanes' ends: the
+/// operation is monotone and rounds monotonically), where in range.
+fn lit_shift<A: GraphArith>(g: &Graph<A>, op: &Op<A>, args: &[NodeId]) -> Option<(A::Lit, A::Lit)> {
     let c = |n: NodeId| match g.get(n).op {
-        Op::Const(lo, hi) => Some((lo as i64, hi as i64)),
+        Op::Const(lo, hi) => Some((lo != hi, A::ival(A::from_lit(lo), A::from_lit(hi)))),
         _ => None,
     };
-    let (a, b) = (c(*args.first()?)?, c(*args.get(1)?)?);
-    let (lo, hi) = match op {
-        Op::Add if a.0 < a.1 && b.0 == b.1 => (a.0 + b.0, a.1 + b.0),
-        Op::Add if b.0 < b.1 && a.0 == a.1 => (b.0 + a.0, b.1 + a.0),
-        Op::Sub if a.0 < a.1 && b.0 == b.1 => (a.0 - b.0, a.1 - b.0),
+    let ((wide_a, a), (wide_b, b)) = (c(*args.first()?)?, c(*args.get(1)?)?);
+    let r = match op {
+        Op::Add if wide_a && !wide_b => A::ival_add(a, b)?,
+        Op::Add if wide_b && !wide_a => A::ival_add(b, a)?,
+        Op::Sub if wide_a && !wide_b => A::ival_sub(a, b)?,
         _ => return None,
     };
-    (lo >= i32::MIN as i64 && hi <= i32::MAX as i64).then_some((lo as i32, hi as i32))
+    let (lo, hi) = A::bounds(r);
+    Some((A::lit(lo), A::lit(hi)))
 }
 
 /// Which ops `lift` lifts selects out of.
@@ -692,7 +751,7 @@ enum Lift {
 /// b)) = sel(c, op(a), op(b))` (exact per lane), so a joined select keeps
 /// that its operands moved together. Selects on different conditions stay
 /// joined; never across a fork op. A shifted literal is `lit_shift`'s.
-fn lift(g: &mut Graph, op: Op, args: Vec<NodeId>, what: Lift, memo: &mut HashMap<(Op, Vec<NodeId>), NodeId>) -> NodeId {
+fn lift<A: GraphArith>(g: &mut Graph<A>, op: Op<A>, args: Vec<NodeId>, what: Lift, memo: &mut HashMap<(Op<A>, Vec<NodeId>), NodeId>) -> NodeId {
     let liftable = match what {
         Lift::Ends => matches!(op, Op::Sub | Op::Lo | Op::Hi),
         Lift::All => matches!(
@@ -707,7 +766,7 @@ fn lift(g: &mut Graph, op: Op, args: Vec<NodeId>, what: Lift, memo: &mut HashMap
     if !liftable {
         return g.fold(op, args);
     }
-    let cond = |g: &Graph, a: NodeId| match g.get(a).op {
+    let cond = |g: &Graph<A>, a: NodeId| match g.get(a).op {
         Op::Sel => Some(g.get(a).args[0]),
         _ => None,
     };
@@ -721,7 +780,7 @@ fn lift(g: &mut Graph, op: Op, args: Vec<NodeId>, what: Lift, memo: &mut HashMap
     if let Some(&r) = memo.get(&(op.clone(), args.clone())) {
         return r;
     }
-    let arm = |g: &Graph, k: usize| -> Vec<NodeId> { args.iter().map(|a| if cond(g, *a).is_some() { g.get(*a).args[k] } else { *a }).collect() };
+    let arm = |g: &Graph<A>, k: usize| -> Vec<NodeId> { args.iter().map(|a| if cond(g, *a).is_some() { g.get(*a).args[k] } else { *a }).collect() };
     let (ta, fa) = (arm(g, 1), arm(g, 2));
     let t = lift(g, op.clone(), ta, what, memo);
     let f = lift(g, op.clone(), fa, what, memo);
@@ -732,20 +791,22 @@ fn lift(g: &mut Graph, op: Op, args: Vec<NodeId>, what: Lift, memo: &mut HashMap
 
 /// One node's frame: every configuration over the shape's ranges at cell
 /// `xy` (free of the `Table`, whose tracer is not `Sync`).
-fn eval_node(shapes: &[Shape], room: &Room, id: usize, xy: (i16, i16), acc: &mut Acc) -> Result<NodeOut> {
+fn eval_node<A: GraphArith>(shapes: &[Shape<A>], room: &Room, id: usize, xy: (i16, i16), acc: &mut Acc<A>) -> Result<NodeOut> {
     let sh = &shapes[id];
     let t = sh.traced.as_ref().expect("a node's shape is traced before its layer");
-    let exact = |v: i64| Val::Num(Pico8NumInterval::new(P8::from_raw(v as i32), P8::from_raw(v as i32)));
-    let mut cells: HashMap<u32, Val> = HashMap::with_capacity(t.seeds.len());
+    // A pixel, every number of its value (`value_box`: a double's `-0`).
+    let pixel = |v: i16| Val::Num(value_box::<A>(A::from_i16(v)));
+    let mut cells: HashMap<u32, Val<A>> = HashMap::with_capacity(t.seeds.len());
     for (i, s) in t.seeds.iter().enumerate() {
         let v = match s {
             Seed::Pin(Conc::Num(n)) => Val::exact_num(*n),
             Seed::Pin(Conc::Bool(b)) => Val::Bool(Some(*b)),
-            Seed::X => exact((xy.0 as i64) << 16),
-            Seed::Y => exact((xy.1 as i64) << 16),
+            Seed::X(Some(v)) | Seed::Y(Some(v)) => Val::exact_num(*v),
+            Seed::X(None) => pixel(xy.0),
+            Seed::Y(None) => pixel(xy.1),
             Seed::Range(p) => {
                 let r = sh.ranges[p];
-                Val::Num(Pico8NumInterval::new(P8::from_raw(r.0 as i32), P8::from_raw(r.1 as i32)))
+                Val::Num(A::ival(r.0, r.1))
             }
             Seed::Unknown => Val::Bool(None),
         };
@@ -766,27 +827,18 @@ fn eval_node(shapes: &[Shape], room: &Room, id: usize, xy: (i16, i16), acc: &mut
         (&t.plain, vals)
     };
     let mut out = NodeOut::default();
-    let violation = |acc: &mut Acc, msg: String| {
+    let violation = |acc: &mut Acc<A>, msg: String| {
         acc.n_violations += 1;
         if acc.violations.len() < 12 {
             acc.violations.push(msg);
         }
     };
-    // A position hull as whole pixels, or why not.
-    let whole = |v: Val| -> std::result::Result<(i64, i64), String> {
-        let Val::Num(i) = v else { return Err("not a number".into()) };
-        let (lo, hi) = (raw(i.low), raw(i.high));
-        if lo & 0xffff != 0 || hi & 0xffff != 0 {
-            return Err(format!("[{}, {}] is not whole pixels", px(lo), px(hi)));
-        }
-        Ok((lo >> 16, hi >> 16))
-    };
     for (ci, cfg) in sp.configs.iter().enumerate() {
-        for &(ways, n) in &cfg.operands {
+        for &(ways, at, n) in &cfg.operands {
             if let Val::Num(i) = vals[n as usize] {
-                let floors = (raw(i.high) >> 16) - (raw(i.low) >> 16) + 1;
-                if floors > ways as i64 {
-                    violation(acc, format!("shape {id} cell {xy:?} configuration {ci}: a fork operand spans {floors} floors, arity {ways}"));
+                match spans::<A>(i, at) {
+                    Some(k) if k <= ways as i64 => {}
+                    k => violation(acc, format!("shape {id} cell {xy:?} configuration {ci}: a fork operand spans {} {}, arity {ways}", k.map_or("too many".into(), |k| k.to_string()), if at == ForkAt::Round { "rounds" } else { "floors" })),
                 }
             }
         }
@@ -800,7 +852,7 @@ fn eval_node(shapes: &[Shape], room: &Room, id: usize, xy: (i16, i16), acc: &mut
             }
             for (slot, n) in spec.fields.iter().zip(&r.fields) {
                 let o = match sp.graph.get(*n).op {
-                    Op::Const(lo, hi) if lo < hi => Obs::Lit(lo as i64, hi as i64),
+                    Op::Const(lo, hi) if lo != hi => Obs::Lit(A::from_lit(lo), A::from_lit(hi)),
                     _ => Obs::of(vals[*n as usize]),
                 };
                 acc.obs[*slot] = Some(match acc.obs[*slot] {
@@ -814,7 +866,7 @@ fn eval_node(shapes: &[Shape], room: &Room, id: usize, xy: (i16, i16), acc: &mut
                     let bx = match (located, r.xy) {
                         (true, Some((xn, yn))) => {
                             let what = format!("shape {id} cell {xy:?} configuration {ci} outcome {oi} (to shape {tid})");
-                            let ((xl, xh), (yl, yh)) = match (whole(vals[xn as usize]), whole(vals[yn as usize])) {
+                            let ((xl, xh), (yl, yh)) = match (whole::<A>(vals[xn as usize]), whole::<A>(vals[yn as usize])) {
                                 (Ok(x), Ok(y)) => (x, y),
                                 (Err(e), _) | (_, Err(e)) => {
                                     violation(acc, format!("{what}: a successor position {e}"));
@@ -847,17 +899,35 @@ fn eval_node(shapes: &[Shape], room: &Room, id: usize, xy: (i16, i16), acc: &mut
     Ok(out)
 }
 
+/// How many fragments a fork at `at` takes over `i` (`Arithmetic::floors`,
+/// `rounds`); `None` past 65536.
+fn spans<A: GraphArith>(i: A::Ival, at: ForkAt) -> Option<i64> {
+    match at {
+        ForkAt::Floor => A::floors(i),
+        ForkAt::Round => A::rounds(i).ok().flatten(),
+    }
+    .map(i64::from)
+}
+
+/// A position hull as whole pixels, or why not.
+fn whole<A: GraphArith>(v: Val<A>) -> std::result::Result<(i64, i64), String> {
+    let Val::Num(i) = v else { return Err("not a number".into()) };
+    let (lo, hi) = A::bounds(i);
+    match (A::as_i16(lo), A::as_i16(hi)) {
+        (Some(a), Some(b)) => Ok((a as i64, b as i64)),
+        _ => Err(format!("[{}, {}] is not whole pixels", px(lo), px(hi))),
+    }
+}
+
 /// Would `eval_node` report a violation of this evaluation?
-fn in_violation(spec: &Spec, vals: &[Val]) -> bool {
-    let whole = |v: Val| matches!(v, Val::Num(i) if raw(i.low) & 0xffff == 0 && raw(i.high) & 0xffff == 0);
-    let cells = |i: Pico8NumInterval| (raw(i.high) >> 16) - (raw(i.low) >> 16) + 1;
+fn in_violation<A: GraphArith>(spec: &Spec<A>, vals: &[Val<A>]) -> bool {
     spec.configs.iter().any(|cfg| {
-        cfg.operands.iter().any(|&(ways, n)| matches!(vals[n as usize], Val::Num(i) if cells(i) > ways as i64))
+        cfg.operands.iter().any(|&(ways, at, n)| matches!(vals[n as usize], Val::Num(i) if spans::<A>(i, at).is_none_or(|k| k > ways as i64)))
             || cfg.outs.iter().any(|r| {
                 vals[r.live as usize] != Val::Bool(Some(false))
                     && (vals[r.error as usize] != Val::Bool(Some(false))
-                        || r.xy.is_some_and(|(x, y)| match (vals[x as usize], vals[y as usize]) {
-                            (Val::Num(a), Val::Num(b)) if whole(vals[x as usize]) && whole(vals[y as usize]) => cells(a) * cells(b) > MAX_BOX,
+                        || r.xy.is_some_and(|(x, y)| match (whole(vals[x as usize]), whole(vals[y as usize])) {
+                            (Ok((xl, xh)), Ok((yl, yh))) => (xh - xl + 1) * (yh - yl + 1) > MAX_BOX,
                             _ => true,
                         }))
             })
@@ -865,7 +935,7 @@ fn in_violation(spec: &Spec, vals: &[Val]) -> bool {
 }
 
 /// The node (down `Or`s and selects) that keeps `n` from being false.
-fn culprit(g: &Graph, vals: &[Val], mut n: NodeId) -> String {
+fn culprit<A: GraphArith>(g: &Graph<A>, vals: &[Val<A>], mut n: NodeId) -> String {
     loop {
         let nd = g.get(n);
         let not_false = |a: &NodeId| vals[*a as usize] != Val::Bool(Some(false));
@@ -1036,7 +1106,7 @@ pub fn cost_to_go(root: &FsPath, spd_px: i32, threads: usize, s: &crate::setting
         Err(e) => eprintln!("[level -1] the cached table {} is unreadable ({e:#}): building it", path.display()),
     }
     let mut rep = String::new();
-    let b = build(root, spd_px, threads, &mut rep, s)?;
+    let b = build_in(root, spd_px, threads, &mut rep, s)?;
     let mut d = rustc_hash::FxHashMap::default();
     for (&h, &id) in &b.by_hash {
         for (i, &(sid, x, y)) in b.g1.nodes.iter().enumerate() {
@@ -1174,14 +1244,14 @@ fn unpack(p: u64) -> (usize, i16, i16) {
 
 /// What a node's frame depends on besides its cell.
 #[derive(Clone, PartialEq)]
-struct Sig {
+struct Sig<A: GraphArith> {
     generation: u64,
-    ranges: Vec<Range>,
+    ranges: Vec<Range<A>>,
 }
 
-impl Table<'_> {
+impl<A: GraphArith> Table<'_, A> {
     /// The shape's `Sig`, `None` while it is not traced.
-    fn sig(&self, id: usize) -> Option<Sig> {
+    fn sig(&self, id: usize) -> Option<Sig<A>> {
         let sh = &self.shapes[id];
         let t = sh.traced.as_ref()?;
         let ranges = t
@@ -1214,17 +1284,22 @@ struct NodeEval {
 /// Node answers kept across passes (valid while the shape's `Sig` holds).
 /// Observations are the join over exactly the nodes held (`agg`, `count`);
 /// a pass that does not reach them all re-observes the reached ones.
-#[derive(Default)]
-struct Memo {
+struct Memo<A: GraphArith> {
     nodes: rustc_hash::FxHashMap<u64, NodeEval>,
-    sig: Vec<Option<Sig>>,
-    agg: Vec<Vec<Option<Obs>>>,
+    sig: Vec<Option<Sig<A>>>,
+    agg: Vec<Vec<Option<Obs<A>>>>,
     count: Vec<usize>,
 }
 
-impl Memo {
+impl<A: GraphArith> Default for Memo<A> {
+    fn default() -> Self {
+        Memo { nodes: Default::default(), sig: Vec::new(), agg: Vec::new(), count: Vec::new() }
+    }
+}
+
+impl<A: GraphArith> Memo<A> {
     /// Forget every shape whose `Sig` is not `sigs`'.
-    fn keep(&mut self, sigs: &[Option<Sig>]) {
+    fn keep(&mut self, sigs: &[Option<Sig<A>>]) {
         self.grow(sigs.len(), 0);
         let stale: Vec<bool> = (0..self.sig.len()).map(|s| self.sig[s].is_none() || self.sig[s] != sigs[s]).collect();
         self.nodes.retain(|k, _| !stale[unpack(*k).0]);
@@ -1251,7 +1326,7 @@ impl Memo {
     }
 }
 
-fn join_obs(into: &mut [Option<Obs>], from: &[Option<Obs>]) -> Result<()> {
+fn join_obs<A: GraphArith>(into: &mut [Option<Obs<A>>], from: &[Option<Obs<A>>]) -> Result<()> {
     for (a, b) in into.iter_mut().zip(from) {
         if let Some(o) = b {
             *a = Some(match *a {
@@ -1272,7 +1347,7 @@ struct Rec {
 }
 
 /// Evaluate node `k`: its `NodeEval`, its observations joined into `obs`.
-fn eval_key(shapes: &[Shape], room: &Room, k: u64, n_obs: usize, obs: &mut [Option<Obs>]) -> Result<NodeEval> {
+fn eval_key<A: GraphArith>(shapes: &[Shape<A>], room: &Room, k: u64, n_obs: usize, obs: &mut [Option<Obs<A>>]) -> Result<NodeEval> {
     let (id, x, y) = unpack(k);
     let mut acc = Acc { obs: vec![None; n_obs], clipped: vec![0; shapes.len()], violations: Vec::new(), n_violations: 0, precise: 0 };
     let out = eval_node(shapes, room, id, (x, y), &mut acc)?;
@@ -1311,13 +1386,13 @@ fn eval_key(shapes: &[Shape], room: &Room, k: u64, n_obs: usize, obs: &mut [Opti
 }
 
 /// The observations of `keys` (nodes of traced shapes), evaluated again.
-fn observe(shapes: &[Shape], room: &Room, keys: &[u64], threads: usize, n_obs: usize) -> Result<Vec<Option<Obs>>> {
+fn observe<A: GraphArith>(shapes: &[Shape<A>], room: &Room, keys: &[u64], threads: usize, n_obs: usize) -> Result<Vec<Option<Obs<A>>>> {
     let next = std::sync::atomic::AtomicUsize::new(0);
-    let results: Vec<Result<Vec<Option<Obs>>>> = std::thread::scope(|scope| {
+    let results: Vec<Result<Vec<Option<Obs<A>>>>> = std::thread::scope(|scope| {
         let hs: Vec<_> = (0..threads)
             .map(|_| {
                 let next = &next;
-                scope.spawn(move || -> Result<Vec<Option<Obs>>> {
+                scope.spawn(move || -> Result<Vec<Option<Obs<A>>>> {
                     let mut obs = vec![None; n_obs];
                     while let Some(&k) = keys.get(next.fetch_add(1, std::sync::atomic::Ordering::Relaxed)) {
                         eval_key(shapes, room, k, n_obs, &mut obs)?;
@@ -1346,7 +1421,7 @@ struct Queue {
 
 /// One pass's parallel walk over the reachable nodes (memo, else `eval_key`);
 /// nodes of untraced shapes are set aside in `pending` for the caller.
-struct Explore {
+struct Explore<A: GraphArith> {
     /// Node id -> key, in order of discovery.
     keys: Vec<u64>,
     index: rustc_hash::FxHashMap<u64, u32>,
@@ -1355,7 +1430,7 @@ struct Explore {
     pending: Vec<(u32, u64)>,
     fresh: Vec<(u64, NodeEval)>,
     /// Observations of this pass's evaluations, per shape.
-    fresh_obs: Vec<Option<Vec<Option<Obs>>>>,
+    fresh_obs: Vec<Option<Vec<Option<Obs<A>>>>>,
     /// Memo hits per shape.
     hits: Vec<usize>,
     n_violations: usize,
@@ -1365,8 +1440,8 @@ struct Explore {
     violations: Vec<String>,
 }
 
-impl Explore {
-    fn new(root: u64) -> Explore {
+impl<A: GraphArith> Explore<A> {
+    fn new(root: u64) -> Explore<A> {
         let mut index: rustc_hash::FxHashMap<u64, u32> = HashMap::default();
         index.insert(root, 0);
         Explore {
@@ -1387,7 +1462,7 @@ impl Explore {
     }
 
     /// Answer every node reachable from `stack` through traced shapes.
-    fn run(&mut self, shapes: &[Shape], room: &Room, memo: &Memo, threads: usize, n_obs: usize) -> Result<()> {
+    fn run(&mut self, shapes: &[Shape<A>], room: &Room, memo: &Memo<A>, threads: usize, n_obs: usize) -> Result<()> {
         use std::sync::{Condvar, Mutex};
         let n_shapes = shapes.len();
         let traced = |k: u64| shapes[unpack(k).0].traced.is_some();
@@ -1397,10 +1472,10 @@ impl Explore {
         let wake = Condvar::new();
         let index = Mutex::new((std::mem::take(&mut self.index), std::mem::take(&mut self.keys)));
         /// What a worker hands back.
-        struct Done {
+        struct Done<A: GraphArith> {
             recs: Vec<(u32, Rec)>,
             fresh: Vec<(u64, NodeEval)>,
-            obs: Vec<Option<Vec<Option<Obs>>>>,
+            obs: Vec<Option<Vec<Option<Obs<A>>>>>,
             hits: Vec<usize>,
             n_violations: usize,
             n_precise: usize,
@@ -1408,11 +1483,11 @@ impl Explore {
             clipped: Vec<u64>,
             violations: Vec<String>,
         }
-        let results: Vec<Result<Done>> = std::thread::scope(|scope| {
+        let results: Vec<Result<Done<A>>> = std::thread::scope(|scope| {
             let hs: Vec<_> = (0..threads)
                 .map(|_| {
                     let (queue, wake, index, traced) = (&queue, &wake, &index, &traced);
-                    scope.spawn(move || -> Result<Done> {
+                    scope.spawn(move || -> Result<Done<A>> {
                         // A panicking worker stops the others (else they wait forever).
                         struct OnPanic<'q>(&'q Mutex<Queue>, &'q Condvar);
                         impl Drop for OnPanic<'_> {
@@ -1593,12 +1668,23 @@ impl Graph1 {
     }
 }
 
-/// The table: lattice walk, spawn chain, passes to inductive ranges, d.
-fn build(root: &FsPath, spd_px: i32, threads: usize, rep: &mut String, s: &crate::settings::Settings) -> Result<Built> {
+/// `build` in the run's arithmetic (`Settings::arith`).
+fn build_in(root: &FsPath, spd_px: i32, threads: usize, rep: &mut String, s: &crate::settings::Settings) -> Result<Built> {
+    match s.arith {
+        crate::settings::Arith::Fixed => build::<Fixed>(root, spd_px, threads, rep, s),
+        crate::settings::Arith::Float(_) => build::<Float>(root, spd_px, threads, rep, s),
+    }
+}
+
+/// The table: lattice walk, spawn chain, passes to inductive ranges, d. In
+/// the arithmetic `A`: its traced frames, its interval evaluation, its
+/// ranges.
+fn build<A: GraphArith>(root: &FsPath, spd_px: i32, threads: usize, rep: &mut String, s: &crate::settings::Settings) -> Result<Built> {
     let t_all = std::time::Instant::now();
     let room0 = s.room;
+    let spd_px = i16::try_from(spd_px).map_err(|_| anyhow!("the speed bound {spd_px} px is out of range"))?;
     let walk = super::kernel::Walk { settings: s, only: None };
-    let lw = super::kernel::room_constant_lattice(root, crate::abstraction::Level { held: true, ..crate::abstraction::Level::EXACT }, &walk)?;
+    let lw = super::kernel::room_constant_lattice::<A>(root, crate::abstraction::Level { held: true, ..crate::abstraction::Level::EXACT }, &walk)?;
     say!(rep, "room {room0:?}: lattice walk {} shapes, {:.1} s", lw.lattice.len(), t_all.elapsed().as_secs_f64())?;
     let mut tr = lw.tracer.clone();
     let mut table = Table {
@@ -1619,8 +1705,7 @@ fn build(root: &FsPath, spd_px: i32, threads: usize, rep: &mut String, s: &crate
         let at = |f: &str| -> Result<i16> {
             let Some(Value::Num(n)) = iface::get(st, &with(&o, &[f])) else { bail!("start object {f} is not a number") };
             let v = lw.tracer.it.d.as_const(&n).ok_or_else(|| anyhow!("start object {f} is not a constant"))?;
-            ensure!(raw(v) & 0xffff == 0, "start object {f} is not a whole pixel");
-            Ok((raw(v) >> 16) as i16)
+            A::as_i16(v).ok_or_else(|| anyhow!("start object {f} is not a whole pixel"))
         };
         (at("x")?, at("y")?)
     };
@@ -1645,7 +1730,7 @@ fn build(root: &FsPath, spd_px: i32, threads: usize, rep: &mut String, s: &crate
             bail!("the spawn prefix at frame {f} {xy:?}: the successor is not one cell ({tid}, {bx:?})")
         };
         // The successor's values are its seeds.
-        let mut ranges: BTreeMap<Path, Range> = BTreeMap::new();
+        let mut ranges: BTreeMap<Path, Range<A>> = BTreeMap::new();
         let mut lits: BTreeSet<Path> = BTreeSet::new();
         let tkey = table.shapes[tid].key.clone();
         for (slot, o) in acc.obs.iter().enumerate() {
@@ -1668,11 +1753,11 @@ fn build(root: &FsPath, spd_px: i32, threads: usize, rep: &mut String, s: &crate
         chain.push((tid, (xl, yl)));
         if let Some(pl) = super::shapes::player_path(&lw.reps[&table.shapes[tid].key]) {
             // The player's speed range joins the successor's own speed.
-            let sp = (spd_px as i64) << 16;
+            let (sp, zero) = (A::from_i16(spd_px), A::from_i16(0));
             for ax in ["x", "y"] {
                 let q = with(&pl, &["spd", ax]);
-                let r = ranges.get(&q).copied().unwrap_or((0, 0));
-                ranges.insert(q, (r.0.min(-sp), r.1.max(sp)));
+                let r = ranges.get(&q).copied().unwrap_or((zero, zero));
+                ranges.insert(q, (least(r.0, A::from_i16(-spd_px)), most(r.1, sp)));
             }
             table.shapes[tid].ranges = ranges;
             table.shapes[tid].traced = None;
@@ -1685,13 +1770,13 @@ fn build(root: &FsPath, spd_px: i32, threads: usize, rep: &mut String, s: &crate
     let mut pass = 0usize;
     // How often each range has grown (`widen`).
     let mut grown: BTreeMap<(usize, Path), u32> = BTreeMap::new();
-    let mut memo = Memo::default();
+    let mut memo = Memo::<A>::default();
     let g1 = loop {
         pass += 1;
         ensure!(pass <= 16, "the level -1 ranges did not converge in 16 passes");
         let t_pass = std::time::Instant::now();
         let mut t_trace = std::time::Duration::ZERO;
-        let sigs: Vec<Option<Sig>> = (0..table.shapes.len()).map(|s| table.sig(s)).collect();
+        let sigs: Vec<Option<Sig<A>>> = (0..table.shapes.len()).map(|s| table.sig(s)).collect();
         memo.keep(&sigs);
         let mut ex = Explore::new(pack((end_id, end_xy.0, end_xy.1)));
         loop {
@@ -1716,7 +1801,7 @@ fn build(root: &FsPath, spd_px: i32, threads: usize, rep: &mut String, s: &crate
         let n_shapes = table.shapes.len();
         memo.grow(n_shapes, n_obs);
         // Per shape: the memo's join (if all its nodes were reached) and this pass's.
-        let mut obs: Vec<Option<Obs>> = vec![None; n_obs];
+        let mut obs: Vec<Option<Obs<A>>> = vec![None; n_obs];
         let mut reached: Vec<Vec<u64>> = vec![Vec::new(); n_shapes];
         for &k in &ex.keys {
             reached[unpack(k).0].push(k);
@@ -1724,7 +1809,7 @@ fn build(root: &FsPath, spd_px: i32, threads: usize, rep: &mut String, s: &crate
         let mut reobserved = 0usize;
         for s in 0..n_shapes {
             let hits = ex.hits.get(s).copied().unwrap_or(0);
-            let mut agg: Vec<Option<Obs>> = if hits == memo.count[s] {
+            let mut agg: Vec<Option<Obs<A>>> = if hits == memo.count[s] {
                 std::mem::take(&mut memo.agg[s])
             } else {
                 // Re-observe the reached memo nodes, forget the rest.
@@ -1780,14 +1865,14 @@ fn build(root: &FsPath, spd_px: i32, threads: usize, rep: &mut String, s: &crate
             if let Some(c) = t.pins.get(p) {
                 let o = o.hull();
                 let holds = match (c, o) {
-                    (Conc::Num(v), Obs::Num(lo, hi)) => lo == raw(*v) && hi == raw(*v),
+                    (Conc::Num(v), Obs::Num(lo, hi)) => lo == *v && hi == *v,
                     (Conc::Bool(b), Obs::Bool { f, t, u }) => !u && (if *b { !f } else { !t }),
                     _ => false,
                 };
                 if !holds {
                     changes.push(format!("shape {id}: pin {} = {c:?} does not hold ({o:?}): dropped", iface::show(p)));
                     if let (Conc::Num(v), Obs::Num(lo, hi)) = (c, o) {
-                        sh.ranges.insert(p.clone(), widen((raw(*v), raw(*v)), (lo, hi), false));
+                        sh.ranges.insert(p.clone(), widen::<A>((*v, *v), (lo, hi), false));
                     }
                     sh.demoted.insert(p.clone());
                     sh.traced = None;
@@ -1803,7 +1888,7 @@ fn build(root: &FsPath, spd_px: i32, threads: usize, rep: &mut String, s: &crate
                 let r = sh.ranges[p];
                 if o != Obs::Lit(r.0, r.1) {
                     let Obs::Num(lo, hi) = o.hull() else { bail!("shape {id}: {} observed {o:?}", iface::show(p)) };
-                    let w = (r.0.min(lo), r.1.max(hi));
+                    let w = (least(r.0, lo), most(r.1, hi));
                     changes.push(format!("shape {id}: the literal {} = [{}, {}] observed {o:?}: the range [{}, {}]", iface::show(p), px(r.0), px(r.1), px(w.0), px(w.1)));
                     sh.lits.remove(p);
                     sh.ranges.insert(p.clone(), w);
@@ -1830,13 +1915,14 @@ fn build(root: &FsPath, spd_px: i32, threads: usize, rep: &mut String, s: &crate
                     }
                     continue;
                 }
-                if lo < r.0 || hi > r.1 {
+                if below(lo, r.0) || below(r.1, hi) {
                     // `move` keeps rem in [-0.5, 0.5): outside is a finding.
-                    ensure!(!is_rem(p) || (lo >= REM.0 && hi <= REM.1), "shape {id}: {} = [{}, {}] leaves rem's [-0.5, 0.5)", iface::show(p), px(lo), px(hi));
+                    let rem = rem_range::<A>();
+                    ensure!(!is_rem(p) || !(below(lo, rem.0) || below(rem.1, hi)), "shape {id}: {} = [{}, {}] leaves rem's [-0.5, 0.5)", iface::show(p), px(lo), px(hi));
                     let n = grown.entry((*id, p.clone())).or_insert(0);
                     *n += 1;
-                    let w = widen(r, (lo, hi), *n > 2);
-                    let w = if is_rem(p) { (w.0.max(REM.0), w.1.min(REM.1)) } else { w };
+                    let w = widen::<A>(r, (lo, hi), *n > 2);
+                    let w = if is_rem(p) { (most(w.0, rem.0), least(w.1, rem.1)) } else { w };
                     changes.push(format!("shape {id}: {} [{}, {}] observed [{}, {}]: widened to [{}, {}]", iface::show(p), px(r.0), px(r.1), px(lo), px(hi), px(w.0), px(w.1)));
                     sh.ranges.insert(p.clone(), w);
                     if t.bounds.contains_key(p) {
@@ -1938,7 +2024,7 @@ fn build(root: &FsPath, spd_px: i32, threads: usize, rep: &mut String, s: &crate
 pub fn probe(root: &FsPath, opts: &Opts, s: &crate::settings::Settings) -> Result<String> {
     let mut rep = String::new();
     let t_all = std::time::Instant::now();
-    let Built { by_hash, g1, sound, chain, .. } = build(root, opts.spd_px, opts.threads, &mut rep, s)?;
+    let Built { by_hash, g1, sound, chain, .. } = build_in(root, opts.spd_px, opts.threads, &mut rep, s)?;
 
     // Min sound d per 8 px tile (0-9, a-z, '+' above, '*' no path, '.' no node).
     say!(rep, "\nsound d per 8 px tile, the smallest over the table's shapes:")?;
@@ -2010,6 +2096,20 @@ pub fn probe(root: &FsPath, opts: &Opts, s: &crate::settings::Settings) -> Resul
         say!(rep, "  not allowed: {b}")?;
     }
 
+    // The comparison with the tree (a tree of the run's arithmetic).
+    match s.arith {
+        crate::settings::Arith::Fixed => compare_with_tree::<celeste_engine::runtime2::P8>(opts, &by_hash, &g1, &sound, &mut rep)?,
+        crate::settings::Arith::Float(_) => compare_with_tree::<celeste_core::lua_f64::LuaF64>(opts, &by_hash, &g1, &sound, &mut rep)?,
+    }
+    say!(rep, "\ntotal {:.1} s", t_all.elapsed().as_secs_f64())?;
+    Ok(rep)
+}
+
+/// `probe`'s comparison with a level-0 tree: per frame, what the filter
+/// would drop, and the marked states it calls too late.
+fn compare_with_tree<N: EngineNum>(opts: &Opts, by_hash: &HashMap<u64, usize>, g1: &Graph1, sound: &[u32], rep: &mut String) -> Result<()> {
+    use crate::search::pos_graph::{cell_xy, NO_CELL};
+    let xy_of = |c: u32| -> (i16, i16) { if c == NO_CELL { (NONE, NONE) } else { cell_xy(c).map(|(x, y)| (x as i16, y as i16)).expect("a grid cell") } };
     // The comparison with the tree.
     let marks = match &opts.marks {
         Some(p) => {
@@ -2020,7 +2120,7 @@ pub fn probe(root: &FsPath, opts: &Opts, s: &crate::settings::Settings) -> Resul
         None => None,
     };
     // The tree's states, by frame.
-    let tree = crate::storage::layer::Tree::<celeste_engine::runtime2::P8>::open(&opts.level_dir, opts.to)?;
+    let tree = crate::storage::layer::Tree::<N>::open(&opts.level_dir, opts.to)?;
     let geo = crate::storage::GEOMETRY;
     say!(rep, "\nframe | states | too late (f + d > {}) | no exit path | band {},8 cut | death (kept) | left the room | other shape | not in the table | marked | MARKED TOO LATE", opts.ceiling, opts.ceiling)?;
     let mut samples: BTreeSet<String> = BTreeSet::new();
@@ -2106,13 +2206,13 @@ pub fn probe(root: &FsPath, opts: &Opts, s: &crate::settings::Settings) -> Resul
     for x in &samples {
         say!(rep, "  {x}")?;
     }
-    say!(rep, "\ntotal {:.1} s", t_all.elapsed().as_secs_f64())?;
-    Ok(rep)
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use celeste_core::pico8_num::{Pico8Num as P8, Pico8NumInterval};
 
     fn num(lo: i32, hi: i32) -> Val {
         Val::Num(Pico8NumInterval::new(P8::from_raw(lo), P8::from_raw(hi)))
@@ -2205,5 +2305,24 @@ mod room_tests {
             .unwrap()
             .unwrap_or_else(|e| panic!("{e:#}"));
         assert_eq!(t.start_d, 45);
+    }
+
+    /// Room (1,0)'s table in FLOAT (Celia's start) builds and passes its own
+    /// checks: start d = 44, as fixed's.
+    #[test]
+    #[ignore = "~10 s: a float lattice walk and its passes"]
+    fn room_10_float_table_builds() {
+        if !std::path::Path::new("lua/celeste-minimal.lua").exists() {
+            return;
+        }
+        let s = crate::settings::Settings { room: (1, 0), arith: crate::settings::Arith::Float(crate::settings::FloatTool::Celia), loading_jank: crate::starts::celia_jank((1, 0)).expect("Celia's J"), ..Default::default() };
+        let t = std::thread::Builder::new()
+            .stack_size(256 * 1024 * 1024)
+            .spawn(move || super::cost_to_go(std::path::Path::new("."), 5, 8, &s))
+            .unwrap()
+            .join()
+            .unwrap()
+            .unwrap_or_else(|e| panic!("{e:#}"));
+        assert_eq!(t.start_d, 44);
     }
 }

@@ -1543,31 +1543,36 @@ impl<'a, D: Domain> Interp<'a, D> {
         Ok(())
     }
 
+    /// A split of a value every lane holds alike (`Domain::literal_fragments`):
+    /// each fragment runs as its own trace state, rejoined when the call
+    /// returns.
+    fn literal_split(&mut self, st: State<D>, frags: Vec<D::Num>, player_axis: Option<usize>) -> Result<Multi<D, Value<D>>> {
+        // Its fragments rejoin into one hull: no body keeps the piece.
+        anyhow::ensure!(player_axis.is_none(), "arc capture: the player's remainder split on axis {player_axis:?} is a literal split");
+        if frags.len() == 1 {
+            return Ok(vec![(st, Value::Num(frags[0].clone()))]);
+        }
+        let (id, depth) = (self.next_split, st.stack.len());
+        self.next_split += 1;
+        Ok(frags
+            .into_iter()
+            .enumerate()
+            .map(|(c, v)| {
+                let mut s = st.clone();
+                s.frag.push((depth, id, c as u16));
+                (s, Value::Num(v))
+            })
+            .collect())
+    }
+
     /// `__split_by_flr(x)`: the fork at `flr`. The fork is a CHOICE, not a
     /// state fan-out: one node whose value depends on the fragment (one
     /// fragment on an exact value). Validity goes in the GUARD (fragments
     /// partition the lane); coverage is the fork's own error (a lane
     /// spanning more floors than fragments cannot run in this body).
     fn split_floor(&mut self, st: State<D>, x: D::Num, player_axis: Option<usize>) -> Result<Multi<D, Value<D>>> {
-        // A value every lane holds alike: each fragment runs as its
-        // own trace state, rejoined when the call returns.
-        if let Some(frags) = self.d.literal_fragments(&x)? {
-            // Its fragments rejoin into one hull: no body keeps the piece.
-            anyhow::ensure!(player_axis.is_none(), "arc capture: the player's remainder split on axis {player_axis:?} is a literal split");
-            if frags.len() == 1 {
-                return Ok(vec![(st, Value::Num(frags[0].clone()))]);
-            }
-            let (id, depth) = (self.next_split, st.stack.len());
-            self.next_split += 1;
-            return Ok(frags
-                .into_iter()
-                .enumerate()
-                .map(|(c, v)| {
-                    let mut s = st.clone();
-                    s.frag.push((depth, id, c as u16));
-                    (s, Value::Num(v))
-                })
-                .collect());
+        if let Some(frags) = self.d.literal_fragments(&x, false)? {
+            return self.literal_split(st, frags, player_axis);
         }
         let mut st = st;
         if !self.d.is_interval(&x) {
@@ -1767,6 +1772,9 @@ impl<'a, D: Domain> Interp<'a, D> {
                 // the exact cut points, as `split_floor` forks: the identity
                 // on one number, else a choice whose validity goes in the
                 // guard and whose coverage is the fork's own error.
+                if let Some(frags) = self.d.literal_fragments(&x, true)? {
+                    return self.literal_split(st, frags, player_axis);
+                }
                 let mut st = st;
                 let v = if self.d.is_interval(&x) {
                     let ways = self.d.round_ways(&x);

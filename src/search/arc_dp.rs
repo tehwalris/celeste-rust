@@ -2440,7 +2440,7 @@ mod tests {
         assert_eq!(sd.concrete.as_ref().map(|w| w.inputs.clone()), sf.concrete.as_ref().map(|w| w.inputs.clone()), "one witness for both (the same input order)");
         let check = |fault| {
             let o = super::super::arc_check::Opts { dir: &dir, from: 24, to: 30, samples: 6, level, fault, path_cap: None, settings: &float };
-            super::super::arc_check::run::<LuaF64>(&o, |e, rt2, b, _| e.frame_reads(rt2, b))
+            super::super::arc_check::run::<LuaF64>(&o)
         };
         check(None).expect("the float transfers agree with the reference engine");
         assert!(check(Some("action")).is_err(), "a corrupted transfer fails the check");
