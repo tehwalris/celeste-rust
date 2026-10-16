@@ -3,6 +3,7 @@
 //! a number is a point or an interval, a boolean a `bool`.
 
 use anyhow::{bail, Result};
+use celeste_core::arith::{Arithmetic, EngineNum};
 use celeste_engine::runtime2::{Rt2, AV};
 
 use crate::trace::block::{self, FnInfo, BUTTON_GLOBAL};
@@ -10,16 +11,16 @@ use crate::trace::heap::{TableId, Value};
 use crate::trace::refdomain::RefDomain;
 use crate::trace::state::State;
 
-/// Lane `lane` of a block as a reference state (plus the base state's
-/// builtins), and its unknown-boolean fields except the buttons, for the
-/// driver to fork (`block::from_block`).
-pub fn from_block(
-    rt2: &Rt2,
+/// Lane `lane` of a block as a reference state of the block's arithmetic
+/// (plus the base state's builtins), and its unknown-boolean fields except
+/// the buttons, for the driver to fork (`block::from_block`).
+pub fn from_block<N: EngineNum>(
+    rt2: &Rt2<N>,
     lane: usize,
     fn_info: &FnInfo,
-    base: &State<RefDomain>,
-) -> Result<(State<RefDomain>, Vec<(TableId, String)>)> {
-    block::from_block(&mut RefDomain::new(), rt2, lane, fn_info, base)
+    base: &State<RefDomain<N::A>>,
+) -> Result<(State<RefDomain<N::A>>, Vec<(TableId, String)>)> {
+    block::from_block(&mut RefDomain::<N::A>::new(), rt2, lane, fn_info, base)
 }
 
 /// Set the six buttons of a reference state from an input byte (bit 0 left,
@@ -38,16 +39,19 @@ pub fn set_buttons<A: celeste_core::arith::Arithmetic>(st: &mut State<RefDomain<
 /// A reference state as a one-lane block (`block::to_rt2`, no row keys:
 /// `frame::Block::canonical` makes them canonical; a tree keys them).
 /// `room`: the search's start room (the block's cart and collision cache).
-pub fn to_block(st: &State<RefDomain>, room: (i16, i16)) -> Result<Rt2> {
+pub fn to_block<N: EngineNum>(st: &State<RefDomain<N::A>>, room: (i16, i16)) -> Result<Rt2<N>> {
     let (cart, cache) = crate::compiled::room_context(room)?;
     block::to_rt2(
         st,
         cart,
         cache,
         |iv| {
-            Ok(match iv.to_number() {
+            Ok(match <N::A as Arithmetic>::as_point(*iv) {
                 Some(n) => AV::Num(n),
-                None => AV::Ival(iv.low, iv.high),
+                None => {
+                    let (lo, hi) = <N::A as Arithmetic>::bounds(*iv);
+                    AV::Ival(lo, hi)
+                }
             })
         },
         |b| Ok(AV::Bool(*b)),

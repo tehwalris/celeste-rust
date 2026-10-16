@@ -26,7 +26,8 @@ use crate::trace::state::State;
 use crate::trace::widen::{field, objects_of_type};
 use crate::trace::verify::run_one;
 use crate::trace::state::ArcAxis;
-use crate::search::arc_edges::{decode_axis, AxisXfer, Pair, RawAxis};
+use crate::search::rem::{Capture, Rem};
+use celeste_core::pico8_num::Pico8Num;
 
 /// The reference engine of arithmetic `A`: `RefEngine` is the real game's
 /// (16.16), the oracle of the kernels; `FloatRefEngine` the float tools'
@@ -127,16 +128,43 @@ impl<A: Arithmetic> ReferenceEngine<A> {
     }
 }
 
-impl RefEngine {
+impl<A: Arithmetic> ReferenceEngine<A>
+where
+    A::Num: Rem<A = A>,
+{
     /// The room's start (post-`_init`) as a one-row block, without keys.
-    pub fn initial(&self) -> Result<Rt2> {
+    pub fn initial(&self) -> Result<Rt2<A::Num>> {
         to_block(&self.base, self.settings.room)
     }
 
+    /// One frame of lane `lane` at the engine's level (`at_level`): every
+    /// fork leaf (the buttons, and each unknown boolean of the row, are
+    /// forked per path), each with its remainder TRANSFER - the
+    /// interpreter's arc capture (`Interp::arc_capture`: the player's split
+    /// per axis, as the tracer captures it for the kernels), decoded by the
+    /// arithmetic's decoder (`Rem::transfer`: 16.16's is the kernels'
+    /// `search::arc_edges::decode_axis`; a refusal is fatal, as theirs).
+    pub fn run_lane(&mut self, block: &Rt2<A::Num>, lane: usize) -> Result<Vec<(Block<A::Num>, <A::Num as Rem>::Pair)>> {
+        let (mut st, unknown) = from_block(block, lane, &self.fn_info, &self.base)?;
+        let zero = A::point(A::from_i16(0));
+        let none = || ArcAxis { took: false, pre: zero, frag: zero, ox: zero };
+        st.arc = Some(Box::new([none(), none()]));
+        self.it.arc_capture = true;
+        let leaves = run_frame_all(&mut self.it, self.body, &st, &unknown, self.level, self.path_cap);
+        self.it.arc_capture = false;
+        let leaves = leaves.map_err(|e| e.context(ran_from(&st, None)))?;
+        leaves
+            .iter()
+            .map(|l| {
+                let pair = transfer_of::<A::Num>(l).map_err(|e| e.context(ran_from(&st, None)))?;
+                Ok((Block::canonical(to_block(l, self.settings.room)?)?, pair))
+            })
+            .collect()
+    }
     /// One CONCRETE frame of row 0 of `row` under input `byte`: every leaf,
     /// keyed. It forks only where no input decides (`rnd`); unknown fields of
     /// the row are read as their placeholder, not forked.
-    pub fn step(&mut self, row: &Rt2, byte: u8) -> Result<Vec<Block>> {
+    pub fn step(&mut self, row: &Rt2<A::Num>, byte: u8) -> Result<Vec<Block<A::Num>>> {
         Ok(self.step_reads(row, byte)?.0)
     }
 
@@ -145,7 +173,7 @@ impl RefEngine {
     /// of the buttons read alone - the output writes every button `UBool`
     /// (`block::to_rt2`) - so an input that agrees with `byte` on the mask has
     /// the same successors.
-    fn step_reads(&mut self, row: &Rt2, byte: u8) -> Result<(Vec<Block>, u8)> {
+    fn step_reads(&mut self, row: &Rt2<A::Num>, byte: u8) -> Result<(Vec<Block<A::Num>>, u8)> {
         let (mut st, _) = from_block(row, 0, &self.fn_info, &self.base)?;
         let buttons = set_buttons(&mut st, byte)?;
         self.it.button_reads = Some((buttons, 0));
@@ -158,14 +186,14 @@ impl RefEngine {
     /// One whole GAME frame: `step` once, or under the split frame
     /// (`Settings::steps_per_frame`) its two parts, both under `byte` (the
     /// buttons are the frame's; part a reads none). Every leaf of both.
-    pub fn frame(&mut self, row: &Rt2, byte: u8) -> Result<Vec<Block>> {
+    pub fn frame(&mut self, row: &Rt2<A::Num>, byte: u8) -> Result<Vec<Block<A::Num>>> {
         Ok(self.frame_reads(row, byte)?.0)
     }
 
     /// `frame`, and the buttons it read (`step_reads`; the union over its
     /// steps and their leaves): every input that agrees with `byte` there
     /// has the same successors, so the concrete search runs one of them.
-    pub fn frame_reads(&mut self, row: &Rt2, byte: u8) -> Result<(Vec<Block>, u8)> {
+    pub fn frame_reads(&mut self, row: &Rt2<A::Num>, byte: u8) -> Result<(Vec<Block<A::Num>>, u8)> {
         let (mut out, mut mask) = self.step_reads(row, byte)?;
         for _ in 1..self.settings.steps_per_frame() {
             let mut next = Vec::new();
@@ -178,7 +206,9 @@ impl RefEngine {
         }
         Ok((out, mask))
     }
+}
 
+impl RefEngine {
     /// `step` at an abstract `level` (`rewrite arc-check`): the row's
     /// unknowns are forked as the level's kernels fork them (each unknown
     /// boolean both ways, a near floor's `state` per value, a comparison
@@ -248,53 +278,28 @@ impl RefEngine {
     pub fn check_agreement(&self, row: &Rt2) -> Result<()> {
         crate::trace::block::check_agreement(row, &self.fn_info, &self.base, self.settings.room)
     }
-
-    /// One frame of lane `lane` at the engine's level (`at_level`): every
-    /// fork leaf (the buttons, and each unknown boolean of the row, are
-    /// forked per path), each with its remainder TRANSFER - the
-    /// interpreter's arc capture (`Interp::arc_capture`: the player's split
-    /// per axis, as the tracer captures it for the kernels) read as the
-    /// kernels' `RawAxis` and decoded by the one decoder
-    /// (`search::arc_edges::decode_axis`; a refusal is fatal, as theirs).
-    pub fn run_lane(&mut self, block: &Rt2, lane: usize) -> Result<Vec<(Block, Pair)>> {
-        let (mut st, unknown) = from_block(block, lane, &self.fn_info, &self.base)?;
-        let none = || ArcAxis { took: false, pre: Iv::from_number(P8::from_i16(0)), frag: Iv::from_number(P8::from_i16(0)), ox: Iv::from_number(P8::from_i16(0)) };
-        st.arc = Some(Box::new([none(), none()]));
-        self.it.arc_capture = true;
-        let leaves = run_frame_all(&mut self.it, self.body, &st, &unknown, self.level, self.path_cap);
-        self.it.arc_capture = false;
-        let leaves = leaves.map_err(|e| e.context(ran_from(&st, None)))?;
-        leaves
-            .iter()
-            .map(|l| {
-                let pair = transfer_of(l).map_err(|e| e.context(ran_from(&st, None)))?;
-                Ok((Block::canonical(to_block(l, self.settings.room)?)?, pair))
-            })
-            .collect()
-    }
 }
 
 /// A leaf's remainder transfer: its arc capture and the player's remainder
 /// at the frame's end (before any widening: the leaf is the interpreter's),
-/// per axis the kernels' `RawAxis`, decoded.
-fn transfer_of(leaf: &State<RefDomain>) -> Result<Pair> {
+/// per axis a `Capture`, decoded (`Rem::transfer`).
+fn transfer_of<N: Rem>(leaf: &State<RefDomain<N::A>>) -> Result<N::Pair> {
     let axes = leaf.arc.as_deref().ok_or_else(|| anyhow::anyhow!("arc capture: a leaf without one"))?;
     let players = objects_of_type(leaf, "player");
     ensure!(players.len() <= 1, "arc capture: {} player objects at the frame's end", players.len());
-    let raw = |v: &Iv| (v.low.as_raw_u32() as i32, v.high.as_raw_u32() as i32);
-    let axis = |k: usize| -> Result<AxisXfer> {
+    let ends = |v: &<N::A as Arithmetic>::Ival| <N::A as Arithmetic>::bounds(*v);
+    let axis = |k: usize| -> Result<Capture<N>> {
         let a = &axes[k];
         let fin = match players.first() {
             Some(pl) => match iface::get(leaf, &field(pl, &["rem", ["x", "y"][k]])) {
-                Some(Value::Num(n)) => Some(raw(&n)),
+                Some(Value::Num(n)) => Some(ends(&n)),
                 other => anyhow::bail!("arc capture: the player's rem.{} is {other:?}", ["x", "y"][k]),
             },
             None => None,
         };
-        let r = RawAxis { took: a.took, pre: raw(&a.pre), frag: raw(&a.frag), ox: raw(&a.ox), fin };
-        decode_axis(&r).map_err(|e| anyhow::anyhow!("the reference's transfer on axis {} ({r:?}) is refused: {e}", ["x", "y"][k]))
+        Ok(Capture { took: a.took, pre: ends(&a.pre), frag: ends(&a.frag), ox: ends(&a.ox), fin })
     };
-    Ok((axis(0)?, axis(1)?))
+    N::transfer(&axis(0)?, &axis(1)?).map_err(|e| anyhow::anyhow!("the reference's transfer is refused: {e}"))
 }
 
 /// A fly fruit's `spd.y` and `rem.y` (at a fruit level the ranges
@@ -356,13 +361,13 @@ fn raw(v: P8) -> i64 {
 
 /// What a reference frame ran from, for its error: the input (`None`: the
 /// buttons forked) and where every player and player spawn was.
-fn ran_from(st: &State<RefDomain>, byte: Option<u8>) -> String {
+fn ran_from<A: Arithmetic>(st: &State<RefDomain<A>>, byte: Option<u8>) -> String {
     let at: Vec<String> = ["player", "player_spawn"]
         .iter()
         .flat_map(|ty| objects_of_type(st, ty))
         .map(|o| {
             let n = |f: &str| match iface::get(st, &field(&o, &[f])) {
-                Some(Value::Num(v)) => crate::trace::refdomain::show::<celeste_core::arith::Fixed>(&v),
+                Some(Value::Num(v)) => crate::trace::refdomain::show::<A>(&v),
                 other => format!("{other:?}"),
             };
             format!("{} at ({}, {})", iface::show(&o), n("x"), n("y"))
@@ -447,22 +452,22 @@ fn pin_isolated_floors(st: &mut State<RefDomain>) -> Result<bool> {
 /// shared), every fork leaf one row with its source lane's cell and its
 /// transfer - so its tree is the kernels': frames, edges and hulls
 /// (`ckhash --edges --hulls`).
-pub struct RefFrameStep {
-    engines: Vec<std::sync::Mutex<RefEngine>>,
+pub struct RefFrameStep<N: Rem = Pico8Num> {
+    engines: Vec<std::sync::Mutex<ReferenceEngine<N::A>>>,
     level: Level,
     settings: std::sync::Arc<crate::settings::Settings>,
 }
 
-impl RefFrameStep {
+impl<N: Rem> RefFrameStep<N> {
     /// `s.threads()` engines at `level`.
     pub fn new(s: &crate::settings::Settings, level: Level) -> Result<Self> {
-        let engines = (0..s.threads().max(1)).map(|_| Ok(std::sync::Mutex::new(RefEngine::new(s)?.at_level(level)))).collect::<Result<_>>()?;
+        let engines = (0..s.threads().max(1)).map(|_| Ok(std::sync::Mutex::new(ReferenceEngine::<N::A>::new(s)?.at_level(level)))).collect::<Result<_>>()?;
         Ok(RefFrameStep { engines, level, settings: std::sync::Arc::new(s.clone()) })
     }
 
     /// An engine no other worker holds (there are as many as workers; a
     /// caller past them waits on one).
-    fn engine(&self) -> std::sync::MutexGuard<'_, RefEngine> {
+    fn engine(&self) -> std::sync::MutexGuard<'_, ReferenceEngine<N::A>> {
         let start = {
             use std::hash::{Hash, Hasher};
             let mut h = rustc_hash::FxHasher::default();
@@ -476,18 +481,25 @@ impl RefFrameStep {
     }
 }
 
-impl crate::frame::FrameStep for RefFrameStep {
+impl<N: Rem> crate::frame::FrameStep<N> for RefFrameStep<N> {
     fn run(
         &self,
-        block: &Block,
+        block: &Block<N>,
         _cell_in: &[u32],
         lanes: &[usize],
-        sink: &mut crate::storage::unit::UnitSink,
+        sink: &mut crate::storage::unit::UnitSink<N>,
     ) -> Result<()> {
-        let mut engine = self.engine();
-        for &lane in lanes {
-            for (b, pair) in engine.run_lane(block.rt2(), lane)? {
-                sink.emit_row(b.rt2(), lane, b.positions()?[0], pair)?;
+        // The lanes in parallel, each on an engine of the pool (a frame of
+        // one lane is milliseconds, and a unit is often a whole frontier),
+        // emitted in order a chunk at a time (a lane's leaves are hundreds
+        // of rows: a whole unit's held at once was gigabytes).
+        let n = self.engines.len();
+        for chunk in lanes.chunks(4 * n) {
+            let rows = crate::storage::wave::par_map(chunk, n, |&lane| self.engine().run_lane(block.rt2(), lane));
+            for (&lane, rows) in chunk.iter().zip(rows) {
+                for (b, pair) in rows? {
+                    sink.emit_row(b.rt2(), lane, b.positions()?[0], pair)?;
+                }
             }
         }
         Ok(())

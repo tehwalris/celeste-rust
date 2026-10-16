@@ -1168,9 +1168,9 @@ pub fn pos_graph_path(dir: &std::path::Path) -> std::path::PathBuf {
 
 /// A fresh forward from `initial` to `max_frames` (the tests' driver).
 #[cfg(test)]
-pub fn forward_run(
-    engine: &dyn FrameStep,
-    initial: Vec<Block>,
+pub fn forward_run<N: Rem>(
+    engine: &dyn FrameStep<N>,
+    initial: Vec<Block<N>>,
     dir: &std::path::Path,
     max_frames: u32,
     record: bool,
@@ -1841,7 +1841,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         let e = RefEngine::new(&s).expect("engine");
         let init = vec![Block::canonical(e.initial().expect("init")).expect("block")];
-        let e = RefFrameStep::new(&s, crate::abstraction::Level::EXACT).expect("engines");
+        let e = RefFrameStep::<P8>::new(&s, crate::abstraction::Level::EXACT).expect("engines");
         let frontier = |st: &ForwardState| -> (Vec<(u32, (u64, u64), u64)>, Vec<Hull>, crate::storage::wave::ByLayer) { (st.frontier.new.iter().collect(), st.frontier.hulls.clone(), st.frontier.old.clone()) };
         let mut st = ForwardState::start(init, &dir, true, None, crate::abstraction::Level::EXACT, &s).expect("start");
         for b in crate::storage::layer::decode_states(&st.frontier.new, &st.visited.keys, st.visited.shapes(), usize::MAX, &|_| true).expect("decode") {
@@ -1919,7 +1919,7 @@ mod tests {
         {
             let e = RefEngine::new(&s).expect("engine");
             let init = vec![Block::canonical(e.initial().expect("init")).expect("block")];
-            forward_run(&RefFrameStep::new(&s, crate::abstraction::Level::EXACT).expect("engines"), init, dir, 4, true).expect("fresh");
+            forward_run(&RefFrameStep::<P8>::new(&s, crate::abstraction::Level::EXACT).expect("engines"), init, dir, 4, true).expect("fresh");
         }
         let fresh4 = keyset(4);
         assert!(fresh4.0 > 0, "fresh frame 4 empty");
@@ -1928,7 +1928,7 @@ mod tests {
         {
             let e = RefEngine::new(&s).expect("engine");
             let init = vec![Block::canonical(e.initial().expect("init")).expect("block")];
-            let e = RefFrameStep::new(&s, crate::abstraction::Level::EXACT).expect("engines");
+            let e = RefFrameStep::<P8>::new(&s, crate::abstraction::Level::EXACT).expect("engines");
             let mut st = ForwardState::start(init, dir, true, None, crate::abstraction::Level::EXACT, &s).expect("start");
             assert!(pos_graph_path(dir).exists(), "start must leave a graph beside f0");
             for to in 1..=4 {
@@ -1949,10 +1949,10 @@ mod tests {
         {
             let e = RefEngine::new(&s).expect("engine");
             let init = vec![Block::canonical(e.initial().expect("init")).expect("block")];
-            forward_run(&RefFrameStep::new(&s, crate::abstraction::Level::EXACT).expect("engines"), init, fresh_dir, 6, true).expect("fresh 6");
+            forward_run(&RefFrameStep::<P8>::new(&s, crate::abstraction::Level::EXACT).expect("engines"), init, fresh_dir, 6, true).expect("fresh 6");
         }
         {
-            let e = RefFrameStep::new(&s, crate::abstraction::Level::EXACT).expect("engines");
+            let e = RefFrameStep::<P8>::new(&s, crate::abstraction::Level::EXACT).expect("engines");
             let mut st = ForwardState::resume(dir, true, crate::abstraction::Level::EXACT, &s).expect("resume").expect("a tree to resume");
             assert_eq!(st.frames, 4);
             let visited_before = st.visited_len();
@@ -1979,7 +1979,7 @@ mod tests {
         let init = || vec![Block::canonical(RefEngine::new(&s).expect("engine").initial().expect("init")).expect("block")];
         let (k, r) = (base.join("kernels"), base.join("reference"));
         forward_run(&crate::compiled::FrameEngine::new(&s, Level::EXACT).expect("kernels"), init(), &k, 27, true).expect("the kernels' forward");
-        forward_run(&RefFrameStep::new(&s, Level::EXACT).expect("engines"), init(), &r, 27, true).expect("the reference forward");
+        forward_run(&RefFrameStep::<P8>::new(&s, Level::EXACT).expect("engines"), init(), &r, 27, true).expect("the reference forward");
         let (fk, fr) = (crate::storage::fingerprint::<P8>(&k, 27, true, true, 4).expect("kernels"), crate::storage::fingerprint::<P8>(&r, 27, true, true, 4).expect("reference"));
         assert_eq!(fk, fr, "the reference forward's tree is not the kernels'");
         assert!(fk.iter().any(|l| l.starts_with("f027 ") && !l.starts_with("f027 0 ")), "f27 holds states");
@@ -1993,7 +1993,7 @@ mod tests {
         use crate::abstraction::Level;
         let s = crate::settings::Settings { room: (0, 2), ..Default::default() };
         let kernels = crate::compiled::FrameEngine::new(&s, Level::EXACT).expect("kernels");
-        let reference = RefFrameStep::new(&s, Level::EXACT).expect("ref engines");
+        let reference = RefFrameStep::<P8>::new(&s, Level::EXACT).expect("ref engines");
         // 25 frames of no input: the spawn's last frame is the 26th.
         let mut concrete = RefEngine::new(&s).expect("ref engine");
         let mut row = concrete.initial().expect("initial state");

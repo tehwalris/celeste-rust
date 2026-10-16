@@ -187,6 +187,18 @@ impl<N: Rem> Rows<N> {
 
     /// `block` decoded into these rows (cleared first).
     fn decode(&mut self, block: &Block, raw: &mut Vec<u8>) -> Result<()> {
+        let pos = self.decode_cells(block, raw)?;
+        let ni = block.infos as usize;
+        ensure!(pos + (2 + N::HULL_BYTES) * ni == raw.len(), "a packed block's infos do not match its cells");
+        let (layers, hulls) = raw[pos..].split_at(2 * ni);
+        self.infos.extend(layers.chunks_exact(2).zip(hulls.chunks_exact(N::HULL_BYTES)).map(|(l, h)| StateInfo { layer: u16::from_le_bytes([l[0], l[1]]), hull: N::hull_from_bytes(h) }));
+        Ok(())
+    }
+
+    /// `block`'s keys, cells and bare cells (no infos: they are the
+    /// model's) decoded into these rows (cleared first); where its infos
+    /// start in `raw`.
+    fn decode_cells(&mut self, block: &Block, raw: &mut Vec<u8>) -> Result<usize> {
         self.clear();
         zstd_unpack(&block.bytes, block.raw as usize, raw)?;
         let b = &raw[..];
@@ -210,11 +222,9 @@ impl<N: Rem> Rows<N> {
             at += (self.masks[k] & !bare).count_ones();
             self.at.push(at);
         }
-        ensure!(at as usize == ni && pos + (2 + N::HULL_BYTES) * ni == b.len(), "a packed block's infos do not match its cells");
-        let (layers, hulls) = b[pos..].split_at(2 * ni);
-        self.infos.extend(layers.chunks_exact(2).zip(hulls.chunks_exact(N::HULL_BYTES)).map(|(l, h)| StateInfo { layer: u16::from_le_bytes([l[0], l[1]]), hull: N::hull_from_bytes(h) }));
+        ensure!(at as usize == ni, "a packed block's infos do not match its cells");
         ensure!(self.keys.first() == Some(&block.first) && self.keys.last() == Some(&block.last), "a packed block's keys are not its index's");
-        Ok(())
+        Ok(pos)
     }
 }
 
@@ -496,10 +506,17 @@ impl RegionTable {
     }
 
     fn lookup(&self, k: Key) -> Option<(u64, u64)> {
-        // The cells and bare cells alone: the infos' model is any one.
-        let mut c = self.cursor::<P8>();
-        let e = c.seek(k).expect("a packed block decodes")?;
-        Some((e.mask, e.bare))
+        let (blocks, w) = (self.blocks(), wide(k));
+        let block = blocks.get(blocks.partition_point(|x| x.last < w))?;
+        if w < block.first {
+            return None;
+        }
+        // The cells and bare cells alone: no info is read, so the rows'
+        // model is any one.
+        let (mut rows, mut raw) = (Rows::<P8>::default(), Vec::new());
+        rows.decode_cells(block, &mut raw).expect("a packed block decodes");
+        let i = rows.keys.binary_search(&w).ok()?;
+        Some((rows.masks[i], rows.bare[i]))
     }
 
     /// A cursor over a packed table (keys asked in ascending order).

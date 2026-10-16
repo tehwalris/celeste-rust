@@ -5,8 +5,10 @@
 //! finished tree (rows by name: `search::inspect`).
 
 use anyhow::{Context, Result};
+use celeste_core::lua_f64::LuaF64;
 use celeste_engine::runtime2::{Rt2, P8};
-use celeste_rust::trace::refengine::RefEngine;
+use celeste_rust::settings::Arith;
+use celeste_rust::trace::refengine::{FloatRefEngine, RefEngine};
 use celeste_rust::frame::{widen_rt2_to, widened_keys, wins_of, Block, FrameStep, Visited};
 use celeste_rust::storage::layer::Tree;
 use celeste_rust::storage::Sk;
@@ -201,9 +203,44 @@ enum Command {
         #[arg(long, default_value = DEFAULT_CHECKPOINT_DIR)]
         checkpoint_dir: String,
         /// Run the REFERENCE engine instead of the kernels: `ckhash` of the
-        /// two trees must agree. Slow. Not at held-unknown levels.
+        /// two trees must agree. Slow. Not at held-unknown levels. Under
+        /// `--arith float` always (there are no float kernels).
         #[arg(long)]
         reference: bool,
+    },
+    /// DIAGNOSTIC: the hull forward REPLAYED over a tree's recorded graph
+    /// (`search::hull_replay`): per frame the states first reached - the
+    /// tree's, the replay's (checked equal), the replay's without the float
+    /// tree's TOP SLIVER (edges with a transfer piece no 16.16 remainder
+    /// takes, `rem_f64::fixed_points`; not sound: what the sliver costs),
+    /// and under option (c)'s exact sliver bit (`hull_replay::sliver_bit`)
+    /// with its sliver parts - the recorded edges, the sliver's, and the
+    /// sliver edges that pushed something.
+    HullReplay {
+        /// The tree (a `forward` checkpoint dir, or a search's `levelNN`).
+        #[arg(long)]
+        checkpoint_dir: String,
+        /// Last frame.
+        #[arg(long)]
+        to: u32,
+    },
+    /// CHECK a known route against a hull tree (`search::hull_replay::route`):
+    /// stepped concretely in the tree's arithmetic, every state of it in the
+    /// tree by its frame, its remainder in its state's hull, and every step
+    /// a recorded edge whose transfer maps the remainder. Exits non-zero at
+    /// the first step that breaks it.
+    HullRoute {
+        #[arg(long)]
+        checkpoint_dir: String,
+        /// Last frame.
+        #[arg(long)]
+        to: u32,
+        /// The tree's level.
+        #[arg(long, value_parser = Level::parse, default_value = "r0sx")]
+        level: Level,
+        /// The route's inputs (`concrete::read_inputs`).
+        #[arg(long)]
+        inputs: String,
     },
     /// DIAGNOSTIC: is a coarser level's tree closed over a finer one's rows?
     /// Every row of the FINE tree at frames `from..=to` (with `--fine-marks`,
@@ -825,12 +862,39 @@ fn win_at_text(cfg: &celeste_rust::settings::Settings) -> Option<String> {
     cfg.win_at.map(|(x0, x1, y0, y1)| format!("{},{}", r(x0, x1), r(y0, y1)))
 }
 
+/// `rewrite forward` in arithmetic `N`: the tree at `dir` grown (or
+/// resumed) to frame `to` by `engine` from `initial`; its first win, wall
+/// time and position graph printed.
+fn forward<N: celeste_rust::search::rem::Rem>(
+    dir: &std::path::Path,
+    to: u32,
+    level: Level,
+    cfg: &celeste_rust::settings::Settings,
+    engine: Box<dyn FrameStep<N>>,
+    initial: impl FnOnce() -> Result<Vec<Block<N>>>,
+) -> Result<()> {
+    let t = std::time::Instant::now();
+    // Resumed or started (`grow_tree`).
+    let fwd = celeste_rust::frame::grow_tree(dir, to, cfg.minus_one(), None, level, || Ok(engine), initial, cfg)?;
+    let wall = t.elapsed().as_secs_f64();
+    match fwd.win_frame {
+        Some(h) => println!("win at f{h} ({wall:.2} s)"),
+        None => println!("no win by f{} ({wall:.2} s)", fwd.frames),
+    }
+    if let Some(pg) = &fwd.pos_graph {
+        let (pairs, fp) = pg.fingerprint();
+        println!("posgraph f{:03} {pairs} {fp:016x}", fwd.frames);
+    }
+    celeste_rust::metrics::dump("forward", Some(dir), &[("level", level.to_string())]);
+    Ok(())
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     // `bench-frame` times the workers' phases; `--metrics` counts the
     // kernels' census and slices (read when the kernels are built).
-    // Only the census runs in float so far.
-    let float = matches!(cli.command, Command::Census { .. });
+    // Only these run in float so far.
+    let float = matches!(cli.command, Command::Census { .. } | Command::Forward { .. } | Command::Ckhash { .. } | Command::HullReplay { .. } | Command::HullRoute { .. });
     let cfg = celeste_rust::settings::startup(&cli.settings, float, |s| {
         if let Command::BenchFrame { metrics, .. } = &cli.command {
             s.diag.phases = true;
@@ -1024,35 +1088,67 @@ fn main() -> Result<()> {
             reference,
         } => {
             let t = std::time::Instant::now();
-            let engine: Box<dyn FrameStep> = if reference {
-                Box::new(celeste_rust::trace::refengine::RefFrameStep::new(&cfg, level)?)
-            } else {
-                Box::new(celeste_rust::compiled::FrameEngine::new(&cfg, level)?)
+            let dir = std::path::Path::new(&checkpoint_dir);
+            match cfg.arith {
+                Arith::Fixed => {
+                    let engine: Box<dyn FrameStep> = if reference {
+                        Box::new(celeste_rust::trace::refengine::RefFrameStep::<P8>::new(&cfg, level)?)
+                    } else {
+                        Box::new(celeste_rust::compiled::FrameEngine::new(&cfg, level)?)
+                    };
+                    eprintln!("[fwd] engine up in {:.2} s ({level}{})", t.elapsed().as_secs_f64(), if reference { ", REFERENCE engine" } else { "" });
+                    forward(dir, to, level, &cfg, engine, || Ok(vec![Block::canonical(RefEngine::new(&cfg)?.initial()?)?]))?;
+                }
+                Arith::Float(_) => {
+                    let engine: Box<dyn FrameStep<LuaF64>> = Box::new(celeste_rust::trace::refengine::RefFrameStep::<LuaF64>::new(&cfg, level)?);
+                    eprintln!("[fwd] engine up in {:.2} s ({level}, REFERENCE engine, {})", t.elapsed().as_secs_f64(), cfg.arith);
+                    forward(dir, to, level, &cfg, engine, || Ok(vec![Block::canonical(FloatRefEngine::new(&cfg)?.initial()?)?]))?;
+                }
+            }
+        }
+        Command::HullRoute { checkpoint_dir, to, level, inputs } => {
+            use celeste_rust::search::hull_replay::route;
+            let dir = std::path::Path::new(&checkpoint_dir);
+            cfg.check(dir, level)?;
+            let inputs = celeste_rust::concrete::read_inputs(&inputs)?;
+            let t = std::time::Instant::now();
+            let exit = match cfg.arith {
+                Arith::Fixed => route::<P8>(dir, to, level, &inputs, &cfg)?,
+                Arith::Float(_) => route::<LuaF64>(dir, to, level, &inputs, &cfg)?,
             };
-            eprintln!("[fwd] engine up in {:.2} s ({level}{})", t.elapsed().as_secs_f64(), if reference { ", REFERENCE engine" } else { "" });
+            let upto = exit.map_or(to.min(inputs.len() as u32), |f| f - 1);
+            println!(
+                "[hull-route] the route holds through frame {upto}: every state in the tree, its remainder in its hull, every step a recorded edge mapping it{} ({:.1} s)",
+                exit.map_or(String::new(), |f| format!("; it exits at frame {f}")),
+                t.elapsed().as_secs_f64()
+            );
+        }
+        Command::HullReplay { checkpoint_dir, to } => {
+            use celeste_rust::search::{hull_replay, rem::Rem, rem_f64};
             let dir = std::path::Path::new(&checkpoint_dir);
             let t = std::time::Instant::now();
-            // Resumed or started (`grow_tree`).
-            let fwd = celeste_rust::frame::grow_tree(
-                dir,
-                to,
-                cfg.minus_one(),
-                None,
-                level,
-                || Ok(engine),
-                || Ok(vec![Block::canonical(RefEngine::new(&cfg)?.initial()?)?]),
-                &cfg,
-            )?;
-            let wall = t.elapsed().as_secs_f64();
-            match fwd.win_frame {
-                Some(h) => println!("win at f{h} ({wall:.2} s)"),
-                None => println!("no win by f{} ({wall:.2} s)", fwd.frames),
+            let (frames, bit) = match cfg.arith {
+                Arith::Fixed => (hull_replay::replay::<P8>(dir, to, P8::start_hull(&cfg)?, |_| false, cfg.threads())?, None),
+                Arith::Float(_) => {
+                    let sliver = |a: &rem_f64::Axis| rem_f64::fixed_points(a.lo, a.hi) == 0;
+                    let frames = hull_replay::replay::<LuaF64>(dir, to, LuaF64::start_hull(&cfg)?, |p| sliver(&p.0) || sliver(&p.1), cfg.threads())?;
+                    (frames, Some(hull_replay::sliver_bit(dir, to, cfg.threads())?))
+                }
+            };
+            println!("frame states states_no_sliver states_c sliver_parts_c edges sliver_edges sliver_fired");
+            let (mut all, mut kept, mut c, mut parts) = (0u64, 0u64, 0u64, 0u64);
+            for (f, x) in frames.iter().enumerate() {
+                let (cf, pf) = bit.as_ref().map_or((x.all, 0), |b| b[f]);
+                (all, kept, c, parts) = (all + x.all, kept + x.kept, c + cf, parts + pf);
+                println!("f{f:03} {} {} {cf} {pf} {} {} {}", x.all, x.kept, x.edges, x.dropped, x.fired);
             }
-            if let Some(pg) = &fwd.pos_graph {
-                let (pairs, fp) = pg.fingerprint();
-                println!("posgraph f{:03} {pairs} {fp:016x}", fwd.frames);
-            }
-            celeste_rust::metrics::dump("forward", Some(dir), &[("level", level.to_string())]);
+            println!(
+                "total {all} {kept} {c} {parts} ({:.3}x without the sliver, {:.3}x with (c)'s bit and {:.3}x counting its sliver parts; replayed in {:.1} s)",
+                all as f64 / kept.max(1) as f64,
+                all as f64 / c.max(1) as f64,
+                all as f64 / (c + parts).max(1) as f64,
+                t.elapsed().as_secs_f64()
+            );
         }
         Command::DiagProject { fine_dir, coarse_dir, level, from, to, fine_marks, coarse_marks } => {
             let load_marks = |p: Option<String>| p.map(|p| Visited::load(std::path::Path::new(&p))).transpose();
@@ -1112,7 +1208,14 @@ fn main() -> Result<()> {
             dump_edges,
         } => {
             let dir = std::path::Path::new(&checkpoint_dir);
-            for line in celeste_rust::storage::fingerprint::<P8>(dir, to, edges, hulls, cfg.threads())? {
+            let lines = match cfg.arith {
+                Arith::Fixed => celeste_rust::storage::fingerprint::<P8>(dir, to, edges, hulls, cfg.threads())?,
+                Arith::Float(_) => {
+                    anyhow::ensure!(dump_edges.is_none() && top_cells.is_none(), "--dump-edges, --cells: fixed trees only so far");
+                    celeste_rust::storage::fingerprint::<LuaF64>(dir, to, edges, hulls, cfg.threads())?
+                }
+            };
+            for line in lines {
                 println!("{line}");
             }
             let geo = celeste_rust::storage::GEOMETRY;

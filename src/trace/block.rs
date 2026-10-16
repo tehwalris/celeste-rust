@@ -31,13 +31,13 @@ use std::sync::Arc;
 use anyhow::{anyhow, bail, ensure, Result};
 use celeste_core::cart_data::CartData;
 use celeste_core::collision_cache::CollisionCache;
+use celeste_core::arith::{Arithmetic, EngineNum};
 use celeste_core::pico8_num::Pico8Num as P8;
 use celeste_engine::runtime2::{Cell2, Col, Rt2, AV, NONE};
 use celeste_names as gen;
 
 use crate::builtins::BUILTIN_NAMES;
 use crate::trace::domain::{Domain, Symbolic};
-use celeste_core::arith::Fixed;
 use crate::trace::heap::{BodyId, ClosureId, Heap, TableId, Value};
 use crate::trace::refbridge;
 use crate::trace::refdomain::RefDomain;
@@ -48,16 +48,16 @@ use celeste_engine::exact::exact_rows;
 pub const BUTTON_GLOBAL: &str = "__button_states";
 
 /// The block of `st`, one lane: its structure, and its values by `num` and
-/// `boolean` (the domain's part), strings and the buttons' `UBool` by the
-/// converter. Canonical cell order, its shape hash set, no row keys
-/// (`frame::Block::canonical` makes them).
-pub fn to_rt2<D: Domain>(
+/// `boolean` (the domain's part, in the block's numbers `N`), strings and
+/// the buttons' `UBool` by the converter. Canonical cell order, its shape
+/// hash set, no row keys (`frame::Block::canonical` makes them).
+pub fn to_rt2<D: Domain, N: EngineNum>(
     st: &State<D>,
     cart: Arc<CartData>,
     cache: Arc<CollisionCache>,
-    num: impl Fn(&D::Num) -> Result<AV>,
-    boolean: impl Fn(&D::Bool) -> Result<AV>,
-) -> Result<Rt2> {
+    num: impl Fn(&D::Num) -> Result<AV<N>>,
+    boolean: impl Fn(&D::Bool) -> Result<AV<N>>,
+) -> Result<Rt2<N>> {
     let globals = &st.heap.tables[&st.globals].hash;
     let buttons = match globals.get(BUTTON_GLOBAL) {
         Some(Value::Table(t)) => Some(*t),
@@ -76,7 +76,7 @@ pub fn to_rt2<D: Domain>(
     // after the static ones.
     let mut strings: Vec<String> = gen::STRINGS.iter().map(|s| s.to_string()).collect();
     let old = std::mem::take(&mut rt2.strings);
-    let mut renumber = |col: &mut Col| {
+    let mut renumber = |col: &mut Col<N>| {
         if let Col::U(AV::Str(s)) = col {
             strings.push(old[*s as usize].clone());
             *s = (strings.len() - 1) as u32;
@@ -101,9 +101,9 @@ pub fn skeleton<D: Domain>(st: &State<D>, cart: Arc<CartData>, cache: Arc<Collis
     to_rt2(st, cart, cache, |_| Ok(AV::Nil), |_| Ok(AV::Nil))
 }
 
-struct ToRt2<'a, D: Domain, N, B> {
+struct ToRt2<'a, D: Domain, E: EngineNum, N, B> {
     st: &'a State<D>,
-    rt2: Rt2,
+    rt2: Rt2<E>,
     /// Each heap object's one cell.
     tables: HashMap<TableId, u32>,
     closures: HashMap<ClosureId, u32>,
@@ -113,12 +113,12 @@ struct ToRt2<'a, D: Domain, N, B> {
     boolean: B,
 }
 
-impl<D: Domain, N, B> ToRt2<'_, D, N, B>
+impl<D: Domain, E: EngineNum, N, B> ToRt2<'_, D, E, N, B>
 where
-    N: Fn(&D::Num) -> Result<AV>,
-    B: Fn(&D::Bool) -> Result<AV>,
+    N: Fn(&D::Num) -> Result<AV<E>>,
+    B: Fn(&D::Bool) -> Result<AV<E>>,
 {
-    fn cell(&mut self, cell: Cell2, col: Col) -> u32 {
+    fn cell(&mut self, cell: Cell2<E>, col: Col<E>) -> u32 {
         self.rt2.structure.push(cell);
         self.rt2.cols.push(col);
         (self.rt2.structure.len() - 1) as u32
@@ -243,10 +243,11 @@ pub fn fn_info_of<D: Domain>(base: &State<D>) -> Result<FnInfo> {
 
 /// Lane `lane` of a block as a state in domain `d` (plus the builtins of
 /// `base`'s globals, which a block drops), and its unknown-boolean fields
-/// except the buttons, for the driver to fork.
-pub fn from_block<D: Domain<A = Fixed>, E: Domain>(
+/// except the buttons, for the driver to fork. The block's numbers are the
+/// domain's arithmetic's.
+pub fn from_block<N: EngineNum, D: Domain<A = N::A>, E: Domain>(
     d: &mut D,
-    rt2: &Rt2,
+    rt2: &Rt2<N>,
     lane: usize,
     fn_info: &FnInfo,
     base: &State<E>,
@@ -290,9 +291,9 @@ pub fn from_block<D: Domain<A = Fixed>, E: Domain>(
     Ok((st, unknown))
 }
 
-struct FromBlock<'a, D: Domain> {
+struct FromBlock<'a, N: EngineNum, D: Domain> {
     d: &'a mut D,
-    rt2: &'a Rt2,
+    rt2: &'a Rt2<N>,
     lane: usize,
     fn_info: &'a FnInfo,
     heap: Heap<D>,
@@ -300,7 +301,7 @@ struct FromBlock<'a, D: Domain> {
     unknown: Vec<(TableId, String)>,
 }
 
-impl<D: Domain<A = Fixed>> FromBlock<'_, D> {
+impl<N: EngineNum, D: Domain<A = N::A>> FromBlock<'_, N, D> {
     fn is_unknown(&self, cell: u32) -> bool {
         matches!(self.rt2.structure[cell as usize], Cell2::Val) && self.rt2.cols[cell as usize].at(self.lane) == AV::UBool
     }
@@ -312,12 +313,15 @@ impl<D: Domain<A = Fixed>> FromBlock<'_, D> {
         }
     }
 
-    fn value(&mut self, v: AV) -> Result<Value<D>> {
+    fn value(&mut self, v: AV<N>) -> Result<Value<D>> {
         Ok(match v {
             AV::Num(n) => Value::Num(self.d.num(n)),
             AV::Ival(lo, hi) => Value::Num(self.d.range_num(lo, hi)?),
             // The whole range; a straddling comparison forks.
-            AV::UNum => Value::Num(self.d.range_num(P8::from_raw(i32::MIN), P8::from_raw(i32::MAX))?),
+            AV::UNum => {
+                let (lo, hi) = <N::A as Arithmetic>::bounds(<N::A as Arithmetic>::unknown());
+                Value::Num(self.d.range_num(lo, hi)?)
+            }
             AV::Bool(b) => Value::Bool(self.d.boolean(b)),
             AV::UBool => Value::Bool(self.d.boolean(false)),
             AV::Str(s) => Value::Str(Arc::from(self.rt2.strings[s as usize].as_str())),
