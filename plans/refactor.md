@@ -22,6 +22,7 @@ Measured on `docs-refresh` after merging develop `0765e7c5`. Lines are
 | C4 | `bench-storage`, `--emit-capture`, the capture writers and the replay (`storage::bench`, the sinks' rowless mode), the `cap-r10`/`cap-r62h57` fixtures; every frame step runs `bench-frame --checkpoint`, its `b` line (the bytes of the frame's files) pinned from develop's binary for all seven frames | -364 Rust, -31 shell |
 | C5 (done) | the kernel mix report (`--kernel-mix DIR`, its files, guard families, leaf classes, the spike-fold and fold estimates) and tools/kernel_mix.py; `compiled::mix` is the census the `--metrics` pins read, byte-identical (the per-instruction categories stay: they pin the codegen's mix for R2's slices) | -545 Rust, -276 Python |
 | C6 (R1's half) | `concrete_run` is `rewrite run` (`-i` takes a `tas/` file too); whole frames under `--split-frame`; a frame that forks is an error; callers: chain.py `--check-start REWRITE`, CLAUDE.md, 62 `tas/` headers. `transpile` is R2's | -43 Rust |
+| S1 | the search's driver in the library (`search::driver`: `search::run(&SearchSpec) -> SearchResult`, `search::check_known`); one driver for the search and the dual search (`run_levels` builds a level's kernels and start itself); the binary prints the verdict and maps it to the exit code (`report`) | -43 Rust (rewrite.rs -363) |
 
 ## SIZE
 
@@ -208,7 +209,7 @@ Concrete simplification candidates, ordered by lines saved x safety
 
 | # | candidate | where | saves | risk |
 |---|---|---|---|---|
-| S1 | **The search's driver lives in the binary**: `run_levels`, `search`, `dual`, `check_known`, `search_record` (~350 lines) belong in the library as `search::run(&SearchSpec) -> SearchResult`; the binary prints and maps verdicts to exit codes. `filtered_for.txt` is written by the binary. | bin/rewrite.rs 1054-1435 | ~150 | low (t2) |
+| S1 (done) | **The search's driver lives in the binary**: `run_levels`, `search`, `dual`, `check_known`, `search_record` (~350 lines) belong in the library as `search::run(&SearchSpec) -> SearchResult`; the binary prints and maps verdicts to exit codes. `filtered_for.txt` is written by the binary. | bin/rewrite.rs 1054-1435 | ~150 | low (t2) |
 | S2 | **A `Tree` handle** for read-only commands: settings, level, filter and last frame from the tree's own records; one row selector; `--room`/`--level` refused on diagnostics (today restated in every call, and several commands do not check them at all) | rewrite.rs (`tree_of`, ~18 loads, 4 last-frame loops), check.sh, fixtures.sh | ~200 | low |
 | S3 | **One concrete search** for one engine and for a pair: `dual::search` repeats `arc_dp::concrete_search`'s DFS-then-BFS, memo and input classes (and its own budget) | search/dual.rs (484), arc_dp.rs (~260) | ~250 | medium (arc gate witness, dual gate) |
 | S4 | **arc_dp.rs split** into the backward, reach and the concrete search; its module doc is stale ("an edge enters a layer <= f" is false for hull trees; `search/mod.rs` still describes checkpoint files as row pieces) | search/arc_dp.rs | ~0 (clarity) | none |

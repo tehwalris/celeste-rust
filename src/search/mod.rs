@@ -5,7 +5,8 @@
 //!   * `hull`        - a state's remainder hull (the forward's): one arc per axis
 //!   * `rem`         - the remainder model of an arithmetic: hulls and transfers
 //!                     (`rem_f64`: the doubles')
-//!   * `arc_dp`      - THE SEARCH: winning sets, optimum, reach, concrete search
+//!   * `driver`      - THE SEARCH's driver: its levels, the outcome (`run`)
+//!   * `arc_dp`      - the arc phase: winning sets, optimum, reach, concrete search
 //!   * `dual`        - the dual search: a run valid in both arithmetics
 //!   * `known`       - a known solution checked against every pruning step
 //!   * `checkpoint`  - the tree's format version and small files (marks, pos graph)
@@ -22,6 +23,7 @@ pub mod arc_dp;
 pub mod arc_edges;
 pub mod arcs;
 pub mod checkpoint;
+pub mod driver;
 pub mod dual;
 pub mod hull;
 pub mod hull_replay;
@@ -34,3 +36,5 @@ pub mod rem_f64;
 pub mod result;
 pub mod robust;
 pub mod ui_export;
+
+pub use driver::{check_known, run, SearchSpec};
