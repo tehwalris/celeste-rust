@@ -974,19 +974,106 @@ jank start, 32 threads).
 - a float `arc-check` (milestone 4; `hull-route` checks the transfers on
   known routes only).
 
+### Milestone 4: float arcs and the float concrete search
+
+**What was built.**
+
+- The arcs' sets are generic over the CIRCLE of points
+  (`search::arcs::Circle`):
+  - `Fixed16`: 16.16's 65536 points, `u16` words, rotations;
+  - `rem_f64::Doubles`: the doubles' points, `u64` words, `Mono` and
+    `Const` transfers.
+  `Region`, `RegionRef` and `RegionArena` take the circle, and so does the
+  pull. A `Mono` axis pulls a segment to the guard's points between two
+  bisections, exactly (section 6). Its push (used by `reach` only) is the
+  interval between the ends' images, a superset.
+- The arc phase is generic over the remainder model `Rem` (its circle is
+  `Rem::C`):
+  - the backward and `Winning`;
+  - `optimum`, `reach` and the concrete search, with a reference engine
+    of the tree's arithmetic;
+  - `solve`;
+  - the known-route check (`search::known`).
+- `rewrite search --arith float` grows the tree with the reference engine
+  and runs the same arc phase. It refuses what float has not met yet: a
+  second level (the objects ladder), level -1, and `--save-marks`.
+- `rewrite arc-check` is one generic module (`search::arc_check`).
+  - 16.16 steps its probes with `step_at`; its output on the ladder's
+    fixtures is unchanged, byte for byte.
+  - Doubles step concrete rows (level `r0sx`). The guard ends are the cut
+    points, and an outside probe is one ulp past them.
+
+**The first float optimum: room (1,0), the synthetic win at (9, 101), by
+f35, Celia float from its jank start.**
+
+- Arc bound 33, concrete optimum 33. The depth-first try at the bound wins
+  at once (`--prefer` the gate's route).
+- The witness is the gate's own inputs. It holds in the tools themselves:
+  in Celia's exact trace of those inputs (`gates/celia/witness-room10gate_2`)
+  and in UCT's, the player is at (9, 101) after update 32, i.e. frame 33.
+  In 16.16 it is the gate's witness. So it is valid in both arithmetics.
+- The known route survives every pruning step in float, as in fixed.
+- 256 s, against fixed's 1.9 s: the reference engine's forward is nearly
+  all of it. The backward and the concrete search take under a second.
+- W is bigger in float.
+  - Support: 2,420 nodes against fixed's 1,290 (1.9x).
+  - Per frame: 987 against 418 at f30, and 921 against 261 at f31 (3.5x).
+  - The sliver's states can win too, and W is exact over all of them.
+    The concrete search still admits only real remainders.
+- The test `arc_dp::tests::a_float_search_proves_room_10s_synthetic_optimum`
+  pins the end-to-end chain on a smaller case: the win at (4, 101) by f30.
+  - The arc bound is 28 in both arithmetics, with one witness for both.
+  - The known route survives in both.
+  - The float transfers pass `arc_check`, and a corrupted transfer fails
+    it.
+  - About 40 s.
+
+**Float `arc-check`** on the (9, 101) tree, frames 1-35, 64 samples a
+frame:
+
+- 1.24M records, every one with a transfer.
+- 751 records sampled: 2,863 probes inside the guards and 1,408 outside.
+  Nothing disagrees, and nothing reaches a target unpredicted.
+- Faults are caught:
+  - `--fault action`: 621 of 1,408 inside probes disagree;
+  - `--fault guard`: 326 of 910 outside probes reach the target.
+
+**Fixed is unchanged:**
+
+- the ladder (t0, t1, t2, and the ignored tests);
+- the room (1,0) arc gate, byte for byte;
+- `arc-check`'s output on the fixtures, byte for byte.
+
+**Room (1,3) past f40** (section 15's milestone 3 open question):
+the float/fixed ratio peaks and then falls; it does not run away.
+
+| frame | f40 | f41 | f42 | f43 | f44 | f45 | f46 |
+|---|---|---|---|---|---|---|---|
+| fixed | 25,936 | 31,766 | 39,525 | 49,730 | 60,255 | 70,049 | 83,110 |
+| float (b) | 34,215 | 42,730 | 53,860 | 64,390 | 76,058 | 86,409 | 99,317 |
+| ratio | 1.32x | 1.35x | 1.36x | 1.29x | 1.26x | 1.23x | 1.20x |
+| without the sliver | 0.95x | 0.97x | 0.98x | 0.99x | 0.99x | 1.02x | 1.03x |
+
+- Through f46: 554,934 states against 440,602 (1.26x). Without the sliver
+  it is 437,725 (0.99x), so the sliver is still the whole gap.
+- (c)'s bit would hold 538,809 states (1.22x) plus 435,378 sliver parts:
+  no better, as at f40.
+- 66 min to f46 on 32 threads (the ladder ran beside part of it), peak
+  12.6 GB.
+
 ### Next
 
-Milestone 4: float arcs and the float concrete search.
+Milestone 5: float kernels. The reference engine is the whole of a float
+search's time: (1,0) to f44 takes 45 min against seconds. Real rooms
+(exits at f70-f160) need the kernels. Not covered in float yet:
 
-- arc sets over the `u64` points;
-- the pull through `Mono` (the exact preimage by bisection);
-- the backward;
-- the float concrete search, and float `arc-check`.
+- the level flags (`h`, `n`, `f`, `p`): the reference engine's
+  `step_at` and its pins are 16.16's;
+- level -1;
+- the objects ladder;
+- the UI's marks.
 
-The first float optimum is room (1,0) at the synthetic win, on the
-reference engine's tree. The UCT goldens stay the secondary report. Our
-validated witnesses joined the golden set in milestone 3
-(`gates/witnesses`): the gate witness and gemskip 100% 116.
+The UCT goldens stay the secondary report.
 
 **What a committed golden may be.** Community database files, and our
 routes that are already submitted. Philippe's rule is that our unsubmitted
