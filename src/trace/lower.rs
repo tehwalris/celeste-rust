@@ -16,7 +16,7 @@ use celeste_core::arith::Fixed;
 use crate::transpile::garith::GraphArith;
 use crate::transpile::graph::{Graph, NodeId};
 use crate::transpile::asm::CellRepr;
-use crate::transpile::kernel::{Emit, OutField, OutFields};
+use crate::transpile::kernel::{ColTy, Emit, OutField, OutFields};
 
 use super::frame::Frame;
 use super::walk::{room_constant_lattice, Region, Walk};
@@ -51,7 +51,7 @@ pub fn show_tree<A: GraphArith>(g: &Graph<A>, root: NodeId, depth: usize) -> Str
 /// One output shape of a traced frame: the cells it writes, and the two
 /// booleans that say which lanes reach it and on which its row is undefined.
 pub struct FrameOutcome<A: GraphArith = Fixed> {
-    pub outputs: Vec<(u32, NodeId, &'static str)>,
+    pub outputs: Vec<(u32, NodeId, ColTy)>,
     pub live: NodeId,
     pub error: NodeId,
     /// Fields stored as the UNKNOWN NUMBER (uniform, but no graph constant
@@ -277,16 +277,16 @@ pub fn lower_frame<A: GraphArith>(
                 fields: o
                     .outputs
                     .iter()
-                    .map(|(cell, node, ty)| OutField {
-                        cell: *cell,
+                    .map(|&(cell, node, ty)| OutField {
+                        cell,
                         ty,
-                        node: *node,
+                        node,
                         konst_av: None,
                         // Excluded from the per-lane key fold.
                         widen_uniform: o
                             .widen
                             .iter()
-                            .find(|(c, _)| *c == *cell)
+                            .find(|(c, _)| *c == cell)
                             .map(|(_, av)| *av),
                     })
                     .collect(),

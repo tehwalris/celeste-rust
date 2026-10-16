@@ -471,7 +471,7 @@ pub(crate) fn lower_outcomes<A: GraphArith>(e: &Emit<A>, outs: &mut [Outcome<A>]
                 match sp.get(node).op {
                     // A point in an INTERVAL field is the interval `[v, v]`: an interval
                     // column keys a point as one (`asm_kernel::KeyRead::NumAsIval`).
-                    Op::Const(lo, hi) if lo == hi && f.ty == "ZI" => Some(AV::Ival(A::from_lit(lo), A::from_lit(lo))),
+                    Op::Const(lo, hi) if lo == hi && f.ty == super::kernel::ColTy::Ival => Some(AV::Ival(A::from_lit(lo), A::from_lit(lo))),
                     Op::Const(lo, hi) if lo == hi => Some(AV::Num(A::from_lit(lo))),
                     Op::Const(lo, hi) => Some(AV::Ival(A::from_lit(lo), A::from_lit(hi))),
                     Op::ConstBool(b) => Some(AV::Bool(b)),

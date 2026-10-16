@@ -1432,10 +1432,9 @@ fn acc_template<N: KernelLanes>(r: &crate::trace::lower::LoweredFrame<N::Arith>,
             inits.push((
                 cell,
                 match f.ty {
-                    "ZN" => ColInit::EmptyNum,
-                    "ZB" => ColInit::EmptyBool,
-                    "ZI" => ColInit::EmptyIval,
-                    other => anyhow::bail!("outcome {oi} field {cell}: output type {other}"),
+                    crate::transpile::kernel::ColTy::Num => ColInit::EmptyNum,
+                    crate::transpile::kernel::ColTy::Bool => ColInit::EmptyBool,
+                    crate::transpile::kernel::ColTy::Ival => ColInit::EmptyIval,
                 },
             ));
         }
