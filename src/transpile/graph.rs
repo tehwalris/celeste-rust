@@ -635,6 +635,11 @@ impl<A: GraphArith> Graph<A> {
         self.eval_inner(cells, false, true, None)
     }
 
+    /// `eval` with the map: `mget` and `tile_flag_at` of exact coordinates.
+    pub fn eval_in(&self, cells: &HashMap<u32, Val<A>>, room: &Room) -> Result<Vec<Val<A>>> {
+        self.eval_inner(cells, false, true, Some(room))
+    }
+
     /// As `eval`, but an unmodelled node is TOP for its kind (sound) instead
     /// of an error. The same match, so the two cannot diverge.
     pub fn eval_lenient(&self, cells: &HashMap<u32, Val<A>>) -> Result<Vec<Val<A>>> {

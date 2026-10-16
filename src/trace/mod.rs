@@ -25,22 +25,22 @@ pub mod refdomain;
 pub mod refdriver;
 pub mod refengine;
 pub mod refbridge;
-pub mod oracle;
+#[cfg(test)]
+mod oracle;
 pub mod bind;
 pub mod block;
 pub mod cart;
 pub mod domain;
 pub mod emit;
 pub mod error;
-#[cfg(test)]
-pub mod eval;
 pub mod heap;
 pub mod iface;
 pub mod kernel;
 pub mod interp;
 pub mod level_minus_one;
 pub mod shapes;
-pub mod probe;
+#[cfg(test)]
+mod probe;
 pub mod state;
 pub mod verify;
 pub mod widen;

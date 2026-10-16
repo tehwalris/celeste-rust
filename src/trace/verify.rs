@@ -1460,7 +1460,16 @@ fn rebuild_all<A: GraphArith>(d: &mut Symbolic<A>, cone: &[NodeId], subst: &rust
 mod tests {
     use super::*;
     use crate::trace::cart;
-    use crate::transpile::graph::Graph;
+    use crate::transpile::graph::{Graph, Val};
+
+    /// Input cells `cells` (in `Iface` order) as exact values, for
+    /// `Graph::eval`.
+    fn exact(cells: &[Conc]) -> std::collections::HashMap<u32, Val> {
+        cells.iter().enumerate().map(|(i, c)| (i as u32, match c {
+            Conc::Num(n) => Val::exact_num(*n),
+            Conc::Bool(b) => Val::Bool(Some(*b)),
+        })).collect()
+    }
 
     /// Test fixture: the six "pm1 key" paths (`has_dashed`, `freeze`, and the
     /// player's `dash_time`, `djump`, `p_dash`, `p_jump`).
@@ -1543,19 +1552,12 @@ mod tests {
 
         // No error in whichever outcome claims this assignment.
         let (g, map) = at_buttons(&it.d.graph, &f, &[false; 6]).expect("the six buttons");
+        let room = crate::transpile::graph::Room { cart: it.cart.clone().expect("cart"), cache: it.cache.clone().expect("cache") };
         let ok_at = |cells: &[Conc]| -> bool {
-            let env = super::super::eval::Env {
-                cells,
-                cart: it.cart.clone(),
-                cache: it.cache.clone(),
-            };
-            let live: Vec<&FrameOut> = f
-                .outs
-                .iter()
-                .filter(|o| super::super::eval::eval(&g, map[o.guard as usize], &env).expect("guard") == Conc::Bool(true))
-                .collect();
+            let v = g.eval_in(&exact(cells), &room).expect("the frame at a point");
+            let live: Vec<&FrameOut> = f.outs.iter().filter(|o| v[map[o.guard as usize] as usize] == Val::Bool(Some(true))).collect();
             assert_eq!(live.len(), 1, "exactly one outcome claims a lane");
-            super::super::eval::eval(&g, map[live[0].error as usize], &env).expect("error") == Conc::Bool(false)
+            v[map[live[0].error as usize] as usize] == Val::Bool(Some(false))
         };
 
         assert!(ok_at(&f.iface.init), "the key it was compiled for is accepted");
@@ -1768,22 +1770,10 @@ end
         // 100 is past the unroll bound on purpose: after `break` it is moot.
 
         for a in [0i16, 1, 2, 3, 5, 8, 100] {
-            let cells = [Conc::Num(crate::pico8_num::Pico8Num::from_i16(a))];
-            let env = super::super::eval::Env {
-                cells: &cells,
-                cart: None,
-                cache: None,
-            };
-            let got = super::super::eval::eval(&it.d.graph, node, &env).expect("eval result");
+            let v = it.d.graph.eval(&exact(&[Conc::Num(crate::pico8_num::Pico8Num::from_i16(a))])).expect("the graph at a point");
             let want = (a + 1).min(2);
-            assert_eq!(
-                got,
-                Conc::Num(crate::pico8_num::Pico8Num::from_i16(want)),
-                "amount = {}",
-                a
-            );
-            let beyond = super::super::eval::eval(&it.d.graph, st.ended, &env).expect("eval ended");
-            assert_eq!(beyond, Conc::Bool(false), "amount = {}: the trace declined", a);
+            assert_eq!(v[node as usize], Val::exact_num(crate::pico8_num::Pico8Num::from_i16(want)), "amount = {a}");
+            assert_eq!(v[st.ended as usize], Val::Bool(Some(false)), "amount = {a}: the trace declined");
         }
     }
 }
