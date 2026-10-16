@@ -70,7 +70,7 @@ Unit tests are kept only for the basics:
 - the data structures: key packing (`exact`), the visited set and its
   packed tables, region sets, bundles, edge, hull, frame and out files;
 - the arcs' set operations and the backward and reach DP against their
-  definitions (`arcs`, `arc_edges`, `arc_dp`, `hull`, `rem_f64`);
+  definitions (`arcs`, `arc_edges`, `backward`, `reach`, `hull`, `rem_f64`);
 - what no pin reaches. These cover the tracer's and the codegen's edge
   cases (overflow declines, error ownership, folding exactness), the
   console's corpora (`probe`), the CLI and the scripts.

@@ -39,6 +39,12 @@ impl Pool {
         self.map_with(n, || Ok(()), |_, i| f(i))
     }
 
+    /// `f(lo, hi)` over `0..n` in chunks of `chunk`, results in chunk order.
+    pub fn chunks<T: Send>(&self, n: usize, chunk: usize, f: impl Fn(usize, usize) -> T + Sync) -> Vec<T> {
+        let chunk = chunk.max(1);
+        self.map(n.div_ceil(chunk), |c| Ok(f(c * chunk, ((c + 1) * chunk).min(n)))).expect("an infallible map")
+    }
+
     /// `f(&mut state, i)` for every `i < n`, each worker's `state` from
     /// `init` (built in the worker), results by index.
     pub fn map_with<S, T: Send>(&self, n: usize, init: impl Fn() -> Result<S> + Sync, f: impl Fn(&mut S, usize) -> Result<T> + Sync) -> Result<Vec<T>> {

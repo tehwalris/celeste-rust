@@ -12,7 +12,7 @@ use std::fmt::Debug;
 use std::hash::Hash;
 
 use anyhow::Result;
-use celeste_core::arith::EngineNum;
+use celeste_core::arith::{Arithmetic, EngineNum};
 use celeste_core::lua_f64::LuaF64;
 use celeste_core::pico8_num::Pico8Num as P8;
 
@@ -57,7 +57,7 @@ pub trait Rem: EngineNum {
     /// Bytes a pair takes on disk.
     const PAIR_BYTES: usize;
 
-    /// The start's hull: its exact remainder (`arc_dp::start_point`).
+    /// The start's hull: its exact remainder (`start_point`).
     fn start_hull(s: &crate::settings::Settings) -> Result<Self::Hull>;
     /// THE DECODE of a frame's captures (x, y) into its transfer pair;
     /// `Err` is a refusal (fatal in the forward).
@@ -108,6 +108,18 @@ pub type Xfer<N> = (<<N as Rem>::C as Circle>::Act, <<N as Rem>::C as Circle>::A
 /// A point of `N`'s circle.
 pub type Point<N> = <<N as Rem>::C as Circle>::P;
 
+/// The start state's remainder as a point of the torus: the room's load has
+/// no player yet, so any point stands for it - the point of 0.
+pub fn start_point<N: Rem>(_s: &crate::settings::Settings) -> anyhow::Result<(Point<N>, Point<N>)> {
+    let p = zero_point::<N>();
+    Ok((p, p))
+}
+
+/// The point of the remainder 0 (a state with no player stands there).
+fn zero_point<N: Rem>() -> Point<N> {
+    N::point(<N::A as Arithmetic>::from_i16(0)).expect("0 is a remainder")
+}
+
 /// A 16.16 remainder's point of the circle.
 fn point(v: P8) -> u32 {
     super::arcs::point(v.as_raw_u32() as i32)
@@ -127,7 +139,7 @@ impl Rem for P8 {
         if super::hull::WIDEN.load(std::sync::atomic::Ordering::Relaxed) {
             return Ok(Hull::full());
         }
-        let (x, y) = super::arc_dp::start_point::<P8>(s)?;
+        let (x, y) = start_point::<P8>(s)?;
         Ok(Hull::point(x, y))
     }
     fn transfer(x: &Capture<P8>, y: &Capture<P8>) -> Result<Pair, String> {

@@ -1,43 +1,250 @@
-//! EXACT-REMAINDER FORWARD REACHABILITY over a finished tree's recorded
-//! edges - the arc phase's `reach` with W = everything: what the hull
-//! forward's soundness is checked against (`frame`'s and this module's
-//! slow tests).
-//! From the start state at its exact remainder, frame by frame, every
-//! reached state's remainder set is pushed along its out-edges through
-//! their transfers (`RegionRef::push`) and the pushes into a target united:
-//! `R_0 = {start: point}`, `R_{t+1}(m) = U_e push_e(R_t(p))` over the edges
-//! `p -> m` recorded at frame `t + 1`. A win state is not left.
+//! FORWARD REACHABILITY over a finished tree's recorded edges: from the
+//! start at its exact remainder, frame by frame, every reached state's
+//! remainder set pushed along its out-edges through their transfers
+//! (`RegionRef::push`), the pushes into a target united. A win state is not
+//! left. A state's out-edges are recorded once, at the frame after its
+//! layer, in their TARGETS' regions (`out_edges`); they are read the first
+//! frame the state is reached and kept as `(target, transfer)` numbers (8 B
+//! an edge): decoding them again every frame made a frame cost grow with the
+//! reach (219 s a frame on a 13B-state tree). Two of them:
 //!
-//! The forward's tree over-approximates the game (a row's remainder is
-//! widened to the whole circle at the boundary); `R` is exact in the
-//! remainder: a state with an empty `R_t` is reached at `t` by no path of
-//! the level's game from the start (the level's other widenings stand; at
-//! an exact-objects level, none). Bounded by the tree: what its forward did
-//! not keep (a level -1 drop, a filter) `R` cannot hold.
-//!
-//! Streamed like the backward: per frame only the reached states are held,
-//! with their sets. A state's out-edges are decoded once, the first frame
-//! it is reached (in batches of `BATCH` sources from its layer's target
-//! blocks, `arc_dp::out_edges`), and kept as `(target, transfer)` numbers
-//! (8 B an edge): decoding them again every frame made a frame cost grow
-//! with the reach (219 s a frame on a 13B-state tree). The pushes are merged
-//! per target.
-//!
-//! A target's set past `MAX_SEGS` x segments (a cloud of the remainders
-//! many paths leave) is COARSENED: its pieces snapped outward to the
-//! coarsest-needed grid of `2^k` points per axis (`k` the smallest that
-//! fits). From then on that state's set, and what it reaches, OVER-
-//! approximate - still sound for "unreachable", an upper bound on the
-//! rest - and are reported as inexact with the largest `k` behind them.
-//!
-//! A frame's pushes and unions run in parallel over its targets (the
-//! frame's edges grouped by target with a counting sort).
+//!   * `inside_w` - the arc phase's (`driver::solve`): inside the winning
+//!     sets, between `W`'s nodes; per node the last frame it is reached,
+//!     the next level's filter.
+//!   * `exact` - with W = everything, over the tree's states: what the hull
+//!     forward's soundness is checked against (`frame`'s and this module's
+//!     slow tests).
 
 use anyhow::Result;
 use rustc_hash::FxHashMap;
 
-use super::arcs::{Piece, Region, Seg, Transfer, CIRCLE};
-use crate::storage::Sk;
+use super::arcs::{Circle, Piece, Region, RegionRef, Seg, Transfer, CIRCLE};
+use super::backward::Winning;
+use super::rem::{Point, Rem, Xfer};
+use crate::storage::edges::EdgeStore;
+use crate::storage::{Sk, GEOMETRY};
+use celeste_core::pico8_num::Pico8Num as P8;
+
+/// The out-edges recorded at frame `frame` of the states `sources` (their
+/// layer is `frame - 1`): `(k, target, transfer)` for `sources[k]`. A
+/// source's edges are stored in their TARGETS' regions: the frame's index
+/// names the target regions each source region reaches; those regions'
+/// segments are decoded (on `threads` workers) and their bundles from the
+/// sources' keys kept where a source cell is one asked for.
+fn out_edges<N: Rem>(store: &EdgeStore<N>, frame: u32, sources: &[Sk], threads: usize) -> anyhow::Result<Vec<(usize, Sk, u32)>> {
+    let geo = GEOMETRY;
+    let mut wanted: rustc_hash2::FxHashMap<(u32, (u64, u64)), Vec<(u32, usize)>> = Default::default();
+    let mut regions: Vec<u32> = Vec::new();
+    for (k, s) in sources.iter().enumerate() {
+        wanted.entry((s.shape(&geo), s.key)).or_default().push((s.cell(&geo), k));
+        regions.push(s.region);
+    }
+    regions.sort_unstable();
+    regions.dedup();
+    let mut targets: Vec<u32> = regions.iter().flat_map(|&r| store.targets_of(frame, r)).collect();
+    targets.sort_unstable();
+    targets.dedup();
+    let parts = crate::storage::wave::par_map(&targets, threads, |&region| -> anyhow::Result<Vec<(usize, Sk, u32)>> {
+        let mut dec = crate::storage::edges::Decoder::default();
+        let mut out = Vec::new();
+        for seg in store.segments(frame, region) {
+            dec.bundles(&seg, |b| {
+                let Some(cands) = wanted.get(&(b.s_shape, b.s_key)) else { return };
+                crate::storage::edges::expand(&geo, region, &b, |src, dst| {
+                    let c = src.cell(&geo);
+                    for &(wc, k) in cands {
+                        if wc == c {
+                            out.push((k, dst, b.x));
+                        }
+                    }
+                });
+            })?;
+        }
+        Ok(out)
+    });
+    let mut out = Vec::new();
+    for p in parts {
+        out.extend(p?);
+    }
+    Ok(out)
+}
+
+/// The out-edges `inside_w` follows - between W's nodes, from a non-win
+/// source to a target with a set at or past the edge's frame (the others
+/// carry nothing) - loaded as `inside_w` first reaches their source, a frame's
+/// sources at a time (`out_edges`): what is held is the reached nodes'
+/// edges, 8 B each, not the graph between W's nodes.
+pub struct ReachEdges<'a, N: Rem = P8> {
+    store: &'a EdgeStore<N>,
+    w: &'a Winning<N::C>,
+    /// The win states, sorted: never expanded, so never left.
+    wins: Vec<Sk>,
+    threads: usize,
+    loaded: FxHashMap<u32, Box<[(u32, u32)]>>,
+    edges: usize,
+}
+
+impl<'a, N: Rem> ReachEdges<'a, N> {
+    pub fn new(store: &'a EdgeStore<N>, w: &'a Winning<N::C>, wins: Vec<Sk>, threads: usize) -> Self {
+        ReachEdges { store, w, wins, threads, loaded: FxHashMap::default(), edges: 0 }
+    }
+    /// Load the out-edges of those of `nodes` not loaded yet, frame by frame
+    /// (a node's are recorded at its layer + 1).
+    fn load(&mut self, nodes: impl Iterator<Item = u32>) -> anyhow::Result<()> {
+        let mut todo: Vec<(u32, Sk, u32)> = nodes.filter(|i| !self.loaded.contains_key(i)).map(|i| {
+            let n = self.w.node(i);
+            (n.layer + 1, n.id, i)
+        }).collect();
+        todo.sort_unstable();
+        todo.dedup();
+        let mut a = 0;
+        while a < todo.len() {
+            let f = todo[a].0;
+            let b = a + todo[a..].partition_point(|x| x.0 == f);
+            let ids: Vec<Sk> = todo[a..b].iter().map(|x| x.1).collect();
+            let mut lists: Vec<Vec<(u32, u32)>> = vec![Vec::new(); ids.len()];
+            for (k, dst, x) in out_edges(self.store, f, &ids, self.threads)? {
+                if self.wins.binary_search(&ids[k]).is_ok() {
+                    continue;
+                }
+                if let Some(m) = self.w.index(dst).filter(|&m| self.w.node(m).last() >= f) {
+                    lists[k].push((m, x));
+                }
+            }
+            for (&(_, _, i), mut l) in todo[a..b].iter().zip(lists) {
+                l.sort_unstable();
+                l.dedup();
+                self.edges += l.len();
+                self.loaded.insert(i, l.into_boxed_slice());
+            }
+            a = b;
+        }
+        Ok(())
+    }
+    fn of(&self, i: u32) -> &[(u32, u32)] {
+        &self.loaded[&i]
+    }
+    /// The nodes and edges loaded.
+    pub fn sizes(&self) -> (usize, usize) {
+        (self.loaded.len(), self.edges)
+    }
+}
+
+/// FORWARD inside W: `R_t(i)`, the remainders with which node `i` is reached
+/// at frame `t` from the start (at `point`) along the graph's edges and
+/// still wins - `R_0 = {point}` at the start, `R_{t+1}(m) = U push_e(R_t(p))
+/// ∩ W_{t+1}(m)` over the edges `p -> m` (a win node is not left: it has no
+/// out-edges). Per node the LAST frame its `R` is non-empty (`u32::MAX`:
+/// never), for the next level's filter. Each frame SCATTERS: every reached
+/// node's set pushed along its out-edges, the pushes into a target united.
+///
+/// Sound as a filter where `W`'s deadline is: a concrete winning path's
+/// remainder at frame `t` is in `W_t` of its node (W holds every winner)
+/// and is the image of its remainder at `t - 1` along the recorded edge (the
+/// arc model `check arcs` probes), so by induction it is in `R_t`. Tighter:
+/// a node `W` lets win from some remainder no path from the start brings is
+/// not marked.
+///
+/// A set more fragmented than `REACH_SEGS` segments is replaced by `W_t`
+/// itself (a superset: the filter only loosens), which bounds the memory -
+/// W's sets are shared, a node's reached set is its own.
+#[allow(clippy::too_many_arguments)]
+pub fn inside_w<N: Rem>(w: &Winning<N::C>, g: &mut ReachEdges<N>, pairs: &[Xfer<N>], start: Option<u32>, point: (Point<N>, Point<N>), horizon: u32, threads: usize) -> anyhow::Result<Vec<u32>> {
+    let n = w.len();
+    let pool = crate::par::Pool::new(threads);
+    let mut last = vec![u32::MAX; n];
+    const REACH_SEGS: usize = 32;
+    // The current frame's sets, by node (`None`: W_t of the node).
+    let mut cur: Vec<(u32, Option<Region<N::C>>)> = Vec::new();
+    if let Some(s) = start {
+        if w.at(0, s).is_some_and(|r| r.contains(point.0, point.1)) {
+            let p = Piece { y: Seg { lo: point.1, hi: N::C::next(point.1) }, x: Seg { lo: point.0, hi: N::C::next(point.0) } };
+            cur.push((s, Some(Region::from_pieces(&mut [p], &mut Vec::new()))));
+            last[s as usize] = 0;
+        }
+    }
+    let (mut active_max, mut in_w) = (0usize, 0u64);
+    for t in 0..horizon {
+        if cur.is_empty() {
+            break;
+        }
+        active_max = active_max.max(cur.len());
+        if t % 16 == 0 {
+            let own = cur.iter().filter(|c| c.1.is_some()).count();
+            let segs: usize = cur.iter().filter_map(|c| c.1.as_ref()).map(|r| r.n_segs()).sum();
+            eprintln!("[arc] reach f{t:03}: {} nodes ({own} own sets, {segs} segments; the rest W's)", cur.len());
+        }
+        // Each reached node's set pushed along its out-edges (loaded as the
+        // node is first reached) into the targets with a set at t + 1,
+        // tagged by target.
+        g.load(cur.iter().map(|c| c.0))?;
+        let (cur_ref, g) = (&cur, &*g);
+        let mut pushed: Vec<(u32, Piece<Point<N>>)> = pool.chunks(cur.len(), 64, |lo, hi| {
+            let (mut out, mut tmp) = (Vec::new(), Vec::new());
+            for (p, r) in &cur_ref[lo..hi] {
+                let r: RegionRef<N::C> = match r {
+                    Some(r) => r.as_ref(),
+                    None => w.at(t, *p).expect("a node reached in W has a set"),
+                };
+                for &(m, x) in g.of(*p) {
+                    if w.at(t + 1, m).is_some() {
+                        let (x, y) = pairs[x as usize];
+                        tmp.clear();
+                        r.push(x, y, &mut tmp);
+                        out.extend(tmp.iter().map(|&pc| (m, pc)));
+                    }
+                }
+            }
+            out
+        })
+        .into_iter()
+        .flatten()
+        .collect();
+        pushed.sort_unstable_by_key(|e| e.0);
+        // The targets, each with its pushes: clipped into W_{t+1}, united.
+        let mut groups: Vec<(usize, usize)> = Vec::new();
+        let mut a = 0;
+        while a < pushed.len() {
+            let b = a + pushed[a..].partition_point(|e| e.0 == pushed[a].0);
+            groups.push((a, b));
+            a = b;
+        }
+        let pushed_ref = &pushed;
+        let next: Vec<(u32, Option<Region<N::C>>)> = pool.chunks(groups.len(), 256, |lo, hi| {
+            let (mut clipped, mut scratch) = (Vec::new(), Vec::new());
+            groups[lo..hi]
+                .iter()
+                .filter_map(|&(a, b)| {
+                    let m = pushed_ref[a].0;
+                    let wm = w.at(t + 1, m).expect("a target has a winning set");
+                    clipped.clear();
+                    for &(_, pc) in &pushed_ref[a..b] {
+                        wm.clip_into(pc, &mut clipped);
+                    }
+                    let r = Region::from_pieces(&mut clipped, &mut scratch);
+                    if r.is_empty() {
+                        None
+                    } else if r.n_segs() > REACH_SEGS {
+                        Some((m, None))
+                    } else {
+                        Some((m, Some(r)))
+                    }
+                })
+                .collect::<Vec<_>>()
+        })
+        .into_iter()
+        .flatten()
+        .collect();
+        for (m, r) in &next {
+            in_w += r.is_none() as u64;
+            last[*m as usize] = t + 1;
+        }
+        cur = next;
+    }
+    let marked = last.iter().filter(|&&l| l != u32::MAX).count();
+    eprintln!("[arc] reach: {marked} of {n} nodes reached inside W from the start (at most {active_max} a frame; {in_w} sets widened to W)");
+    Ok(last)
+}
 
 /// Sources per batch of out-edges read.
 const BATCH: usize = 1 << 20;
@@ -85,11 +292,33 @@ fn union(v: &mut Vec<Piece>, scratch: &mut Vec<Seg>, k0: u8, max: usize) -> (Reg
 }
 
 /// EXACT REACH over the tree in `dir` up to `horizon` (search steps) from
-/// its start at `point` (`arc_dp::rem_of`'s encoding). `visit(t, states,
-/// inexact)` sees every frame's reached states and sets, and the inexact
-/// ones with their coarsest grid. Per state the LAST frame it is reached at.
-pub fn reach(dir: &std::path::Path, horizon: u32, point: (u32, u32), threads: usize, mut visit: impl FnMut(u32, &[(Sk, Region)], &FxHashMap<Sk, u8>) -> Result<()>) -> Result<FxHashMap<Sk, u32>> {
-    let seeds = super::arc_dp::Seeds::<celeste_core::pico8_num::Pico8Num>::load(dir, horizon)?;
+/// its start at `point` (`concrete::rem_of`'s encoding): `R_0 = {start:
+/// point}`, `R_{t+1}(m) = U_e push_e(R_t(p))` over the edges `p -> m`
+/// recorded at frame `t + 1`. `visit(t, states, inexact)` sees every
+/// frame's reached states and sets, and the inexact ones with their
+/// coarsest grid. Per state the LAST frame it is reached at.
+///
+/// The forward's tree over-approximates the game (a row's remainder is
+/// widened to the whole circle at the boundary); `R` is exact in the
+/// remainder: a state with an empty `R_t` is reached at `t` by no path of
+/// the level's game from the start (the level's other widenings stand; at
+/// an exact-objects level, none). Bounded by the tree: what its forward did
+/// not keep (a level -1 drop, a filter) `R` cannot hold.
+///
+/// Streamed like the backward: per frame only the reached states are held,
+/// with their sets; a state's out-edges are read in batches of `BATCH`
+/// sources from its layer's target blocks. A frame's pushes and unions run
+/// in parallel over its targets (the frame's edges grouped by target with a
+/// counting sort).
+///
+/// A target's set past `MAX_SEGS` x segments (a cloud of the remainders
+/// many paths leave) is COARSENED: its pieces snapped outward to the
+/// coarsest-needed grid of `2^k` points per axis (`k` the smallest that
+/// fits). From then on that state's set, and what it reaches, OVER-
+/// approximate - still sound for "unreachable", an upper bound on the
+/// rest - and are reported as inexact with the largest `k` behind them.
+pub fn exact(dir: &std::path::Path, horizon: u32, point: (u32, u32), threads: usize, mut visit: impl FnMut(u32, &[(Sk, Region)], &FxHashMap<Sk, u8>) -> Result<()>) -> Result<FxHashMap<Sk, u32>> {
+    let seeds = super::backward::Seeds::<P8>::load(dir, horizon)?;
     let tree = crate::storage::layer::Tree::open(dir, horizon)?;
     let wins = seeds.win_ids();
     let pairs: &[(Transfer, Transfer)] = &seeds.pairs;
@@ -145,7 +374,7 @@ pub fn reach(dir: &std::path::Path, horizon: u32, point: (u32, u32), threads: us
         for (f, ids) in by_layer.iter().enumerate() {
             for batch in ids.chunks(BATCH) {
                 let mut lists: Vec<Vec<(u32, u32)>> = vec![Vec::new(); batch.len()];
-                for (k, dst, x) in super::arc_dp::out_edges(&seeds.store, f as u32 + 1, batch, threads)? {
+                for (k, dst, x) in out_edges(&seeds.store, f as u32 + 1, batch, threads)? {
                     let n = names.len() as u32;
                     let d = *index.entry(dst).or_insert_with(|| {
                         names.push(dst);
@@ -265,6 +494,12 @@ pub fn reach(dir: &std::path::Path, horizon: u32, point: (u32, u32), threads: us
 
 #[cfg(test)]
 mod tests {
+    use super::super::backward::backward;
+    use super::ReachEdges;
+    use super::super::backward::tests::{apply, random_graph, sid, TestTree};
+    use super::super::arcs::CIRCLE;
+    use rustc_hash::FxHashSet;
+
     /// A cloud of isolated points past `MAX_SEGS` segments is coarsened to
     /// a superset that fits, on the finest grid that does; a small one is
     /// united exactly.
@@ -303,7 +538,7 @@ mod tests {
         let tree = crate::storage::layer::Tree::open(&dir, 35).expect("tree");
         let mut per_frame: Vec<Vec<crate::storage::Sk>> = Vec::new();
         let mut sets: Vec<Vec<(crate::storage::Sk, super::Region)>> = Vec::new();
-        let last = super::reach(&dir, 35, p0, 4, |_, cur, inexact| {
+        let last = super::exact(&dir, 35, p0, 4, |_, cur, inexact| {
             assert!(inexact.is_empty(), "room (1,0) to h35 needs no coarsening");
             per_frame.push(cur.iter().map(|c| c.0).collect());
             sets.push(cur.to_vec());
@@ -341,5 +576,61 @@ mod tests {
         let tree_states: u64 = (0..=35).map(|f| tree.states(f)).sum();
         assert!((last.len() as u64) < tree_states, "{} states reached exactly of the tree's {tree_states}", last.len());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `inside_w` against the points themselves: from one start point every
+    /// frame's reached set is finite, so walk every (node, point) through the
+    /// edges whose guards take it, keeping those inside W.
+    #[test]
+    fn reach_is_the_forward_of_the_start_point_inside_w() {
+        let mut s = 23u64;
+        let mut r = move |m: u32| {
+            s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            ((s >> 33) as u32) % m
+        };
+        let mut nonempty = 0;
+        for _ in 0..80 {
+            let n = 3 + r(14);
+            let (layers, edges, wins) = random_graph(&mut r, n, true);
+            if edges.is_empty() {
+                continue;
+            }
+            let horizon = 7;
+            let tree = TestTree::new("reach", layers, &edges, wins.clone());
+            let (store, pairs, seeds) = tree.open(horizon);
+            let w = backward(&store, &pairs, &seeds, horizon, 2, None).expect("backward");
+            let mut g = ReachEdges::new(&store, &w, tree.win_ids(), 2);
+            let start = w.index(sid(0));
+            let p0 = (r(CIRCLE), r(CIRCLE));
+            let got = super::inside_w(&w, &mut g, &pairs, start, p0, horizon, 2).expect("reach");
+            let mut want = vec![u32::MAX; w.len()];
+            let inside = |t: u32, i: u32, p: (u32, u32)| w.index(sid(i)).and_then(|k| w.at(t, k)).is_some_and(|reg| reg.contains(p.0, p.1));
+            let mut cur: FxHashSet<(u32, (u32, u32))> = FxHashSet::default();
+            if inside(0, 0, p0) {
+                cur.insert((0, p0));
+                want[start.expect("a node") as usize] = 0;
+            }
+            for t in 0..horizon {
+                let mut next = FxHashSet::default();
+                for &(i, p) in &cur {
+                    if wins.contains(&i) {
+                        continue;
+                    }
+                    for e in edges.iter().filter(|e| e.0 == i) {
+                        if e.2.takes(p.0) && e.3.takes(p.1) {
+                            let q = (apply(e.2.action, p.0), apply(e.3.action, p.1));
+                            if inside(t + 1, e.1, q) {
+                                next.insert((e.1, q));
+                                want[w.index(sid(e.1)).expect("inside W") as usize] = t + 1;
+                            }
+                        }
+                    }
+                }
+                cur = next;
+            }
+            nonempty += want.iter().filter(|&&l| l != u32::MAX).count();
+            assert_eq!(got, want);
+        }
+        assert!(nonempty > 50, "only {nonempty} reached nodes over the cases");
     }
 }

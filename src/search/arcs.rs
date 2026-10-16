@@ -69,7 +69,7 @@ pub trait Circle: Copy + std::fmt::Debug + Default + PartialEq + Eq + std::hash:
     /// The PREIMAGE of `s` under a non-constant action: the points of the
     /// guard it maps into `s`, EXACTLY.
     fn preimage(a: &Self::Act, s: Seg<Self::P>, f: impl FnMut(Seg<Self::P>));
-    /// A segment as one word of the gate's fingerprints (`arc_dp::gate_w_hash`).
+    /// A segment as one word of the gate's fingerprints (`backward::gate_w_hash`).
     fn seg_word(s: Seg<Self::P>) -> u64;
     /// A point in the middle of `s` (a probe).
     fn mid(s: Seg<Self::P>) -> Self::P;

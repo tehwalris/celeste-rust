@@ -265,7 +265,7 @@ impl Settings {
     /// route's check, `l1-check`, the dual witness's replay): the balloons'
     /// phases fixed - `--concrete-balloon-seeds`, else `--balloon-seeds`,
     /// else, for a float tool (which always seeds), every seed 0 - and
-    /// whether a concrete state keys through `arc_dp::lookup_view` (its
+    /// whether a concrete state keys through `concrete::lookup_view` (its
     /// balloons are seeded where the tree's hold the phase an interval).
     pub fn concrete(&self) -> (Settings, bool) {
         let float = matches!(self.arith, Arith::Float(_));

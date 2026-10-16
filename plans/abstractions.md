@@ -127,7 +127,7 @@ side. Two things a slot cannot say are HOOKS:
 Not in the table: `rnd` (the cart's own draw, below); the region key (a
 dispatch); the bounds a kernel assumes (`Restrict`, pins: assumptions on an
 input, never a stored value); the concrete search's seeded-balloon view
-(`arc_dp::lookup_view`, part of the `rnd` caveat).
+(`concrete::lookup_view`, part of the `rnd` caveat).
 
 ## The remainder: arcs, at every level
 

@@ -121,7 +121,7 @@ pub struct BoundaryIds {
     pub g_big_chest: u32,
     /// The moving platforms (a frame test).
     pub g_platform: u32,
-    /// The balloon's phase and bob (`arc_dp::lookup_view`, a seeded state).
+    /// The balloon's phase and bob (`concrete::lookup_view`, a seeded state).
     pub g_balloon: u32,
     pub f_offset: u32,
     pub f_start: u32,

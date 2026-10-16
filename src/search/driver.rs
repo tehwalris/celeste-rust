@@ -2,7 +2,7 @@
 //! check known`; plans/architecture.md "The search"): per level of
 //! `--level`, coarsest first, the forward (`frame::grow_tree`; a finer
 //! level filtered by the coarser one's arc-marked nodes) and its arc phase
-//! (`arc_dp::solve`), then at the last level the concrete search - or, for
+//! (`solve`), then at the last level the concrete search - or, for
 //! the dual search, both arithmetics' levels and `dual::search` over pairs.
 //! The outcome is recorded (`result.json`, `search::result`) before it is
 //! returned; the binary prints it and maps it to the exit code.
@@ -13,8 +13,10 @@ use anyhow::Result;
 use celeste_core::lua_f64::LuaF64;
 use celeste_core::pico8_num::Pico8Num as P8;
 
-use super::arc_dp::{solve, Solved};
-use super::concrete::Witness;
+use super::backward::{backward, gate_w_hash, optimum, Seeds, Winning, BLOCK};
+use super::concrete::{concrete_search, NodeKeys, Side, Witness};
+use super::reach::{inside_w, ReachEdges};
+use super::rem::{start_point, Rem};
 use super::result::{DualResult, LevelResult, SearchResult, Verdict};
 use crate::abstraction::Level;
 use crate::compiled::KernelLanes;
@@ -280,6 +282,188 @@ fn run_levels<N: KernelLanes>(
     anyhow::bail!("no level given")
 }
 
+/// What the arc phase of a search found (`solve`).
+pub struct Solved<N: Rem = P8> {
+    /// The optimum over the rotation graph, a lower bound on the game's, in
+    /// FRAMES (`horizon` and the marks' deadlines are in search steps).
+    /// `None`: the horizon is REFUTED.
+    pub arc: Option<u32>,
+    /// The concrete optimum and its witness, when asked for and found.
+    pub concrete: Option<Witness>,
+    /// The ARC-MARKED nodes with their deadlines (the last frame their
+    /// winning set is non-empty): the next level's `frame::MarkFilter`.
+    pub arc_marks: Option<crate::frame::Visited<N>>,
+    /// The known route's exit frame when it was checked (`search::known`):
+    /// it wins by the horizon and survives every pruning step.
+    pub known: Option<u32>,
+    /// The winning sets and what keys their nodes, when kept (`solve`'s
+    /// `keep_arcs`): the dual search's half (`search::dual`).
+    pub arcs: Option<Arcs<N>>,
+}
+
+/// A level's arc phase as the concrete searches read it: W, the tree's
+/// shapes (W's nodes' regions) and its key space.
+pub struct Arcs<N: Rem = P8> {
+    pub w: Winning<N::C>,
+    pub shapes: Vec<u64>,
+    pub space: celeste_engine::exact::KeySpace<N>,
+    /// The level its nodes key at, and the horizon in search steps.
+    pub level: crate::abstraction::Level,
+    pub horizon: u32,
+}
+
+/// THE ARC PHASE over a finished tree in `dir`: `backward`, `optimum`, and
+/// as much of `concrete_search` as `concrete` says. Prints the `[gate]`
+/// fingerprints (over (shape, key, cell), independent of scheduling): W's
+/// support, W at every frame, the optimum. With `save`, writes the UI's arc
+/// pass: `level0.marks.bin` (W's support, each node to its last frame),
+/// `arc.marks.bin` (the nodes `reach::inside_w` reaches) and the witness (the bound
+/// and the first win are the search's `result.json`).
+/// With `known`, checks a known solution against every pruning step before
+/// the concrete search (`search::known`): an error if one drops it.
+#[allow(clippy::too_many_arguments)]
+pub fn solve<N: crate::compiled::KernelLanes>(
+    dir: &std::path::Path,
+    level: crate::abstraction::Level,
+    horizon: u32,
+    concrete: bool,
+    keep_arcs: bool,
+    want_marks: bool,
+    save: Option<&std::path::Path>,
+    prefer: Option<&[u8]>,
+    known: Option<&super::known::Route<N>>,
+    s: &crate::settings::Settings,
+) -> anyhow::Result<Solved<N>> {
+    use crate::frame::{mark_row, save_marks, MarkRow, Visited};
+    s.check(dir, level)?;
+    crate::metrics::mem_phase("arc: start");
+    let threads = s.threads();
+    let seeds = Seeds::<N>::load(dir, horizon)?;
+    crate::metrics::mem_phase("arc: edge files opened");
+    let tb = std::time::Instant::now();
+    // The closed spans and W's nodes go to scratch files beside the tree
+    // (mapped, unlinked).
+    let scratch = dir.join("arc-scratch");
+    if scratch.exists() {
+        std::fs::remove_dir_all(&scratch)?;
+    }
+    let w = backward(&seeds.store, &seeds.pairs, &seeds.wins, horizon, threads, Some(&scratch))?;
+    crate::metrics::mem_phase("arc: backward");
+    let tb = tb.elapsed().as_secs_f64();
+    let start = w.index(seeds.start);
+    let p0 = start_point::<N>(s)?;
+    let arc_steps = optimum(&w, start, p0, horizon);
+    // In frames: a win at step s is during frame ceil(s / spf) (a lower
+    // bound still: a frame's win is a win at its last step at the latest).
+    let arc = arc_steps.map(|k| k.div_ceil(s.steps_per_frame()));
+    eprintln!("[arc] backward {tb:.2} s; optimum {arc_steps:?} (steps)");
+    // Fingerprints over CONTENT (`exact::ContentHash`): independent of the
+    // order the tree's dictionaries grew in (a raise). A node is its state:
+    // (shape, key, cell) without a lookup.
+    let content = seeds.space.content_hash();
+    // Per frame, the nodes with a set and the sum of their (node, set)
+    // hashes: each span added at its first frame and taken off past its
+    // last (`delta`), then summed frame by frame; W's nodes in parallel
+    // block ranges, the sums commutative.
+    type Part = (u64, Vec<(i64, u64)>, Vec<MarkRow>);
+    let blocks = w.len().div_ceil(BLOCK);
+    let parts: Vec<anyhow::Result<Part>> = crate::par::Pool::new(threads).chunks(blocks, 4096, |lo, hi| {
+        let (mut fp, mut delta, mut rows) = (0u64, vec![(0i64, 0u64); horizon as usize + 2], Vec::new());
+        for x in w.nodes_from(lo * BLOCK, hi * BLOCK) {
+            let (shape, key, cell) = seeds.state(x.id);
+            // `Visited::fingerprint`: the nodes are distinct states.
+            let h = content.state(shape, key, cell);
+            fp = fp.wrapping_add(h);
+            for (lo, hi, r) in x.spans() {
+                let g = gate_w_hash(h, r);
+                delta[lo as usize] = (delta[lo as usize].0 + 1, delta[lo as usize].1.wrapping_add(g));
+                delta[hi as usize + 1] = (delta[hi as usize + 1].0 - 1, delta[hi as usize + 1].1.wrapping_sub(g));
+            }
+            if save.is_some() {
+                rows.push(mark_row(shape, key, cell, x.last() as u16, horizon));
+            }
+        }
+        Ok((fp, delta, rows))
+    });
+    let (mut fp, mut delta, mut rows) = (0u64, vec![(0i64, 0u64); horizon as usize + 2], Vec::<MarkRow>::new());
+    for part in parts {
+        let (f, d, r) = part?;
+        fp = fp.wrapping_add(f);
+        for (a, b) in delta.iter_mut().zip(d) {
+            *a = (a.0 + b.0, a.1.wrapping_add(b.1));
+        }
+        rows.extend(r);
+    }
+    println!("[gate] h{horizon} support {} {fp:016x}", w.len());
+    if let Some(out) = save {
+        std::fs::create_dir_all(out)?;
+        save_marks(&out.join("level0.marks.bin"), std::mem::take(&mut rows), horizon, &seeds.space)?;
+    }
+    let (mut n, mut acc) = (0i64, 0u64);
+    for (t, d) in delta[..=horizon as usize].iter().enumerate() {
+        (n, acc) = (n + d.0, acc.wrapping_add(d.1));
+        println!("[gate] h{horizon} W f{t:03} {n} {acc:016x}");
+    }
+    println!("[gate] h{horizon} arc optimum {}", arc_steps.map_or("none".to_string(), |f| f.to_string()));
+    crate::metrics::mem_phase("arc: fingerprints");
+    // Per node the LAST frame it is reached inside W from the start (`reach::inside_w`;
+    // at most its W deadline): the next level's filter, and the UI's arc marks.
+    let mut arc_marks = want_marks.then(|| Visited::new(seeds.space.clone()));
+    if want_marks || save.is_some() {
+        let tr = std::time::Instant::now();
+        let mut g = ReachEdges::new(&seeds.store, &w, seeds.win_ids(), threads);
+        let last = inside_w(&w, &mut g, &seeds.pairs, start, p0, horizon, threads)?;
+        eprintln!("[arc] reach {:.2} s ({} reached nodes' {} out-edges loaded)", tr.elapsed().as_secs_f64(), g.sizes().0, g.sizes().1);
+        drop(g);
+        crate::metrics::mem_phase("arc: reach");
+        for i in (0..w.len() as u32).filter(|&i| last[i as usize] != u32::MAX) {
+            let (shape, key, cell) = seeds.state(w.id(i));
+            let d = last[i as usize] as u16;
+            if let Some(am) = &mut arc_marks {
+                am.insert_until(shape, key, cell, d);
+            }
+            if save.is_some() {
+                rows.push(mark_row(shape, key, cell, d, horizon));
+            }
+        }
+    }
+    if let Some(out) = save {
+        save_marks(&out.join("arc.marks.bin"), rows, horizon, &seeds.space)?;
+    }
+    // The concrete search reads W and the node keys, not the edge files.
+    let Seeds { shapes, space, store, .. } = seeds;
+    drop(store);
+    let keyed = (concrete && arc.is_some()) || known.is_some();
+    let side = if keyed { Some(Side { w: &w, node: NodeKeys::new(&w, &shapes)?, keys: &space, level, s, seeded: s.concrete().1 }) } else { None };
+    let known = match (known, &side) {
+        (Some(route), Some(side)) => {
+            let minus_one = crate::frame::TreeFilter::of_tree(dir, s)?;
+            // The hull forward's claim keys every step's state: whole frames only.
+            if route.hulls && s.steps_per_frame() != 1 {
+                eprintln!("[known] the hull forward's claim is checked on whole frames only: not under --split-frame");
+            }
+            let hulls = (route.hulls && s.steps_per_frame() == 1).then(|| super::known::Hulls::open(dir, horizon, s)).transpose()?;
+            let p = super::known::Pruning { side, horizon, start, reached: arc_marks.as_ref(), minus_one, dir, hulls: hulls.as_ref() };
+            super::known::check(route, &p)?
+        }
+        _ => None,
+    };
+    crate::metrics::mem_phase("arc: marks for the next level, edge files closed");
+    let found = match (concrete, arc, &side) {
+        (true, Some(f), Some(side)) => concrete_search(side, horizon, f, prefer)?,
+        _ => None,
+    };
+    if let Some(wt) = &found {
+        println!("[gate] h{horizon} concrete optimum {} inputs {}", wt.inputs.len(), wt.inputs_text());
+        if let Some(out) = save {
+            wt.save(&out.join("witness.txt"))?;
+        }
+    }
+    drop(side);
+    let arcs = keep_arcs.then(|| Arcs { w, shapes, space, level, horizon });
+    Ok(Solved { arc, concrete: found, arc_marks, known, arcs })
+}
+
 /// `rewrite check known`: a KNOWN route (`inputs`) against the pruning of
 /// the finished search in `dir`: per level the arc phase rerun as the
 /// search ran it, without the concrete search, and the route checked at
@@ -335,7 +519,7 @@ mod tests {
 
     /// THE BREADTH-FIRST LAYERS of the concrete and the dual searches: the
     /// gates' witnesses all come from the depth-first try at the bound, so
-    /// here it is skipped (`arc_dp::NO_DFS`). Room (1,0)'s arc gate (the
+    /// here it is skipped (`concrete::NO_DFS`). Room (1,0)'s arc gate (the
     /// synthetic win (9,101), h35; `r0sx`), in 16.16 and in Celia's floats,
     /// and the dual search: each optimum and witness pinned
     /// (gates/bfs_room10_win9-101_h35.txt; `CELESTE_REGENERATE=1` rewrites

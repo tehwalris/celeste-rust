@@ -23,7 +23,7 @@ use celeste_engine::exact::{ExactRow, KeySpace};
 use celeste_engine::runtime2::Rt2;
 use rustc_hash::FxHashSet;
 
-use super::arc_dp::Winning;
+use super::backward::Winning;
 use super::arcs::Circle;
 use super::rem::{Point, Rem};
 use crate::abstraction::Level;

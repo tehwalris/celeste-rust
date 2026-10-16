@@ -1627,7 +1627,7 @@ pub fn par_map<T: Sync, R: Send>(items: &[T], threads: usize, f: impl Fn(&T) -> 
 ///
 /// The start is the state the kernels' lattice walk starts from (its
 /// constants are the start shape's pins, `trace::kernel`), and nothing
-/// looks it up by its projection (`arc_dp::Seeds::load` takes frame 0's
+/// looks it up by its projection (`backward::Seeds::load` takes frame 0's
 /// one state, `known::Pruning::start`). Its view differs from it where a
 /// `Flag::Always` entry moves it - a strawberry's bob, and under the
 /// loading jank a key's sprite and a balloon's phase - and a row keyed by

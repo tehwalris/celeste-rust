@@ -1,15 +1,18 @@
 //! The search around the forward (`frame::ForwardState`, `storage`):
 //!
-//!   * `arc_edges`   - per recorded edge, the remainder transfer
+//!   * `driver`      - THE SEARCH's driver: its levels, each level's arc phase
+//!                     (`solve`), the outcome (`run`)
+//!   * `backward`    - the winning sets W over the recorded edges, the optimum
+//!   * `reach`       - remainders pushed forward: inside W (the next level's
+//!                     filter), and exact (a check of the hull forward)
+//!   * `concrete`    - the concrete search inside W, for one engine or a pair
+//!   * `dual`        - the dual search: a run valid in both arithmetics
+//!   * `known`       - a known solution checked against every pruning step
 //!   * `arcs`        - sets of remainders as arcs of the circle
+//!   * `arc_edges`   - per recorded edge, the remainder transfer
 //!   * `hull`        - a state's remainder hull (the forward's): one arc per axis
 //!   * `rem`         - the remainder model of an arithmetic: hulls and transfers
 //!                     (`rem_f64`: the doubles')
-//!   * `driver`      - THE SEARCH's driver: its levels, the outcome (`run`)
-//!   * `arc_dp`      - the arc phase: winning sets, optimum, reach
-//!   * `concrete`    - the concrete search, for one engine or a pair (`dual`)
-//!   * `dual`        - the dual search: a run valid in both arithmetics
-//!   * `known`       - a known solution checked against every pruning step
 //!   * `checkpoint`  - the tree's format version and small files (marks, pos graph)
 //!   * `pos_graph`   - player-position cells and the position graph
 //!   * `result`      - `result.json`: what a search decided, as a record
@@ -17,13 +20,13 @@
 //!   * `inspect`     - rows read by named fields, for the diagnostics
 //!   * `tree`        - a finished tree as the commands that read it open it
 //!   * `ui_export`   - `rewrite export-ui`: a finished run -> the web UI's data
-//!   * `arc_check`, `hull_replay`, `reach` - checks of a tree: its transfers
-//!                     against the reference engine, its states replayed from
-//!                     its recorded edges, the exact reach its hulls hold
+//!   * `arc_check`, `hull_replay` - checks of a tree: its transfers against
+//!                     the reference engine, its states replayed from its
+//!                     recorded edges
 pub mod arc_check;
-pub mod arc_dp;
 pub mod arc_edges;
 pub mod arcs;
+pub mod backward;
 pub mod checkpoint;
 pub mod concrete;
 pub mod driver;

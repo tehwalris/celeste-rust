@@ -45,11 +45,13 @@ celeste-rust (src/)
                         trees (grow_tree, TreeFilter), wins, MarkFilter
   storage/              the visited set, the wave, the region phase, the
                         frame/hull/edge/out files, decode, bench
-  search/               driver (the search's levels), arcs, hull, rem (+
-                        rem_f64), arc_edges, arc_dp (the backward, reach,
-                        optimum, concrete search), dual, known, arc_check,
-                        reach, hull_replay, tree (a finished tree opened),
-                        pos_graph, result, ui_export, inspect, checkpoint
+  search/               driver (the search's levels, each level's arc
+                        phase), backward (W, the optimum), reach (inside W;
+                        exact), concrete (the concrete search; dual: over
+                        pairs), known, arcs, hull, rem (+ rem_f64),
+                        arc_edges, arc_check, hull_replay, tree (a finished
+                        tree opened), pos_graph, result, ui_export, inspect,
+                        checkpoint
   trace/                the tracer (interp, state, heap, domain, verify, widen,
                         error, kernel = the lattice walk), the reference engine
                         (refengine, refdomain, refdriver, refbridge, block),
@@ -352,12 +354,12 @@ act" distributes over unions, so the union over all paths is exact.
      push into a cell that cannot exit by H is dropped.
    - **A finer level is filtered** (`frame::MarkFilter`): a state at frame
      t is kept only if its projection onto the previous level is REACHED
-     there with a deadline >= t. REACHED (`arc_dp::reach`): the start's
+     there with a deadline >= t. REACHED (`reach::inside_w`): the start's
      remainder pushed forward inside W, `R_{t+1}(m) = U push_e(R_t(p)) ∩
      W_{t+1}(m)`. A concrete winner is in R at every frame by induction. A
      set past 32 segments is replaced by W_t (a superset). This is the
      OBJECTS LADDER, the only ladder.
-2. **The backward** (`arc_dp::backward`): `W_t(n)` only grows as t falls
+2. **The backward** (`backward::backward`): `W_t(n)` only grows as t falls
    (more time never hurts), so `W_t(p) = W_{t+1}(p) ∪ U pull_e(W_{t+1}(m))`
    over the edges whose target CHANGED at t + 1. Frame by frame, the
    changed nodes' in-edges are read from their target regions' blocks, from
@@ -366,9 +368,9 @@ act" distributes over unions, so the union over all paths is exact.
    sources in parallel. No graph is loaded and no node is marked first: a
    node no winning set reaches is never touched. W is kept as varints in a
    scratch file beside the tree over an arena of distinct sets mapped from
-   disk. `arc_dp::optimum` reads the optimum off the start's sets: a lower
+   disk. `backward::optimum` reads the optimum off the start's sets: a lower
    bound, and no win refutes H.
-3. **The concrete search** (`arc_dp::concrete_search`, last level only):
+3. **The concrete search** (`concrete::concrete_search`, last level only):
    from the room's start, every input (one per class of the buttons the
    frame reads), every `rnd` leaf; a successor is admitted only if its
    projection is a node whose W holds its exact remainder; each exact

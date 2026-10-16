@@ -848,7 +848,7 @@ impl<N: Rem> ForwardState<N> {
         let filter = TreeFilter::of(minus_one, s);
         filter.write(dir)?;
         s.write(dir, level)?;
-        // The start has no player yet (`arc_dp::start_point`'s premise):
+        // The start has no player yet (`rem::start_point`'s premise):
         // `seed` keys it as it is, so a player's remainder would be stored
         // exact where every other state holds it widened, beside its hull.
         let ids = crate::compiled::ids();
@@ -1719,9 +1719,9 @@ mod tests {
         let st = ForwardState::<P8>::at(&hull, to, false, level, &s).expect("at");
         let tree = crate::storage::layer::Tree::<P8>::open(&hull, to).expect("tree");
         let layers: Vec<Layer> = (0..=to).map(|f| tree.layer(f, None, 4).expect("layer").0).collect();
-        let p0 = crate::search::arc_dp::start_point::<P8>(&s).expect("start");
+        let p0 = crate::search::rem::start_point::<P8>(&s).expect("start");
         let mut checked = 0u64;
-        crate::search::reach::reach(&hull, to, p0, 4, |t, cur, inexact| {
+        crate::search::reach::exact(&hull, to, p0, 4, |t, cur, inexact| {
             assert!(inexact.is_empty(), "room (1,0) to f{to} needs no coarsening");
             for (sk, r) in cur {
                 let layer = (0..=t).find(|&f| layers[f as usize].contains(*sk)).unwrap_or_else(|| panic!("f{t}: an exactly reached state no layer holds"));

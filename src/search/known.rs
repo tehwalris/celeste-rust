@@ -21,7 +21,7 @@
 //!   projection is a node of `W`'s support (in the tree AND with a winning
 //!   set at some frame), whose `W_s` holds its exact remainder - the concrete
 //!   search's own admission test - and, at a level that filters the next one,
-//!   the node is REACHED (`arc_dp::reach`) with a deadline >= s. The start
+//!   the node is REACHED (`reach::inside_w`) with a deadline >= s. The start
 //!   is the tree's frame-0 row (stored unwidened), its W the arc optimum's.
 //!
 //! `rewrite check known` also checks THE HULL FORWARD'S CLAIM (`Hulls`;
@@ -76,7 +76,7 @@ impl<N: Rem> Hulls<N> {
     }
 }
 
-/// What the arc phase holds for the check (`arc_dp::solve`).
+/// What the arc phase holds for the check (`driver::solve`).
 pub(super) struct Pruning<'a, N: Rem = P8> {
     /// The level's winning sets, as the concrete search admits states:
     /// its settings (the room, category, split frame), level, W, its nodes'
@@ -436,11 +436,11 @@ fn verdict<N: Rem>(b: &Block<N>, s: u32, from: Option<Held<N>>, seeded: bool, l1
         Some(r) if !r.contains(x, y) => return Ok((backward(format!("its remainder ({x:?}, {y:?}) is OUTSIDE W_{s} of its node, {r:?} ({node})")), held)),
         Some(_) => {}
     }
-    // The start is reached whenever its W holds it (`arc_dp::reach`).
+    // The start is reached whenever its W holds it (`reach::inside_w`).
     if let Some(m) = p.reached.filter(|_| s > 0) {
         let d = key.and_then(|key| m.deadline(shape, key, cell));
         if !d.is_some_and(|d| u32::from(d) >= s) {
-            return Ok((backward(format!("NOT REACHED inside W (`arc_dp::reach`): deadline {d:?}, step {s} needs one >= {s} - the next level's filter drops it ({node})")), held));
+            return Ok((backward(format!("NOT REACHED inside W (`reach::inside_w`): deadline {d:?}, step {s} needs one >= {s} - the next level's filter drops it ({node})")), held));
         }
     }
     Ok((None, held))

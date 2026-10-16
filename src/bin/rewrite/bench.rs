@@ -34,8 +34,8 @@ pub enum Command {
     /// at every `--threads`.
     Frame(FrameArgs),
     /// ONE BACKWARD FRAME of the arc phase, repeatably: a finished search
-    /// tree's edge files to `--horizon` opened (`arc_dp::Seeds`; timed), the
-    /// winning sets pushed down to `W_{F+1}` (`arc_dp::Backward`), then `W_F`
+    /// tree's edge files to `--horizon` opened (`backward::Seeds`; timed), the
+    /// winning sets pushed down to `W_{F+1}` (`backward::Backward`), then `W_F`
     /// from them `--reps` times from a copy. Prints (stdout) `W_F`'s
     /// fingerprint as the arc gate's line (`[gate] hH W fF count hash`, over
     /// each node's (shape, key, cell) and its set), the same every rep; per
@@ -241,7 +241,7 @@ fn bench_backward<N: Rem>(tree: &TreeDir, horizon: u32, frame: u32, reps: usize)
     let cfg = &tree.settings;
     anyhow::ensure!(frame < horizon, "--frame {frame}: below the horizon {horizon}");
     let t = std::time::Instant::now();
-    let seeds = celeste_rust::search::arc_dp::Seeds::<N>::load(&tree.dir, horizon)?;
+    let seeds = celeste_rust::search::backward::Seeds::<N>::load(&tree.dir, horizon)?;
     let content = seeds.space.content_hash();
     eprintln!("[bench backward] h{horizon}'s edge files opened in {:.2} s: {} win rows, {} edges; {} threads", t.elapsed().as_secs_f64(), seeds.wins.len(), seeds.store.edges, cfg.threads());
     let mut first: Option<String> = None;
@@ -249,7 +249,7 @@ fn bench_backward<N: Rem>(tree: &TreeDir, horizon: u32, frame: u32, reps: usize)
         // Each rep pushes W down to F+1 afresh (untimed but the
         // first), then times the step to W_F.
         let t = std::time::Instant::now();
-        let mut c = celeste_rust::search::arc_dp::Backward::new(&seeds.store, &seeds.pairs, &seeds.wins, horizon, cfg.threads());
+        let mut c = celeste_rust::search::backward::Backward::new(&seeds.store, &seeds.pairs, &seeds.wins, horizon, cfg.threads());
         for f in (frame + 1..horizon).rev() {
             c.step(f)?;
         }
@@ -267,7 +267,7 @@ fn bench_backward<N: Rem>(tree: &TreeDir, horizon: u32, frame: u32, reps: usize)
         for (id, r) in c.current() {
             let (shape, key, cell) = seeds.state(id);
             n += 1;
-            acc = acc.wrapping_add(celeste_rust::search::arc_dp::gate_w_hash(content.state(shape, key, cell), r));
+            acc = acc.wrapping_add(celeste_rust::search::backward::gate_w_hash(content.state(shape, key, cell), r));
         }
         let ms = |k: usize| (after[k] - before[k]).as_secs_f64() * 1e3;
         eprintln!("[bench backward] rep {rep}: W f{frame} in {:.1} ms (read {:.1}, pull {:.1}, merge {:.1} ms)", wall.as_secs_f64() * 1e3, ms(0), ms(1), ms(2));

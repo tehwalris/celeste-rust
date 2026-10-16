@@ -50,7 +50,7 @@ golden meets it. The balloons: a float tree holds a balloon's phase as the
 `rnd` interval unless `--balloon-seeds` fixes it; the tools' seeds (every
 seed 0 without a list) are the CONCRETE runs' (`Settings::concrete`: the
 concrete and dual searches, the known-route check, `l1-check`, replays),
-keyed through `arc_dp::lookup_view`, as fixed does under
+keyed through `concrete::lookup_view`, as fixed does under
 `--concrete-balloon-seeds`.
 
 ## The parameter

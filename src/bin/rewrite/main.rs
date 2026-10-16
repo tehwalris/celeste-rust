@@ -88,7 +88,7 @@ enum Command {
     /// first): the forward to the horizon recording every edge with its
     /// remainder transfer, filtered by the previous level's arc-marked
     /// nodes; the rotation graph's winning sets backward from the wins
-    /// (`arc_dp::solve`), whose optimum is a LOWER BOUND on the game's (no
+    /// (`search::driver::solve`), whose optimum is a LOWER BOUND on the game's (no
     /// win refutes the horizon); then, at the LAST level only, the concrete
     /// search inside the winning sets (a try at the bound, then breadth-first).
     /// The first concrete win is the optimum, its inputs written to
