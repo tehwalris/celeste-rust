@@ -281,6 +281,30 @@ memory in the kernel walk). plans/lessons.md has the measurements.
   overlapped floor stores the cart's invariant (hidden), owed per lane
   (`09505c7`); in the split frame a floor the player's `is_solid` can reach
   keeps its computed `collideable` mid-frame (`widen::PLAYER_PROBE`).
+- **The balloon, whole** (`cb2d72f9`, 2026-10-16): its countdown `timer`
+  (the unknown number), `spr` ([0, 22]), the bob `y` (`start +- 2`) AND its
+  phase `offset` (one period [0, 1), `Stored::Phase`) are widened together
+  (Philippe's call: the countdown and the phase go together). Before, a
+  SEEDED `offset` (a point: `--balloon-seeds`, and always under the float
+  tools, which seed every balloon) stayed exact and split on every
+  undecided `spr == 22`, one value more per balloon per frame: room (4,2)'s
+  six balloons made f^6 states before the player exists (4,096 at f5,
+  531,441 at f9). An unseeded phase is the `rnd` interval, already the
+  canonical [0, 1) (the "balloon offset" entry), so unseeded trees are
+  unchanged.
+  - *Why it is sound*: `offset` is read only as `sin(offset)` into `y`,
+    which the same entry stores as the bob band; every real phase's `y`
+    lies in the band (`|sin| <= 1`), so one period covers every `y` the
+    bob makes. In doubles `sin` is not bit-periodic, but the argument
+    needs only the band, not periodicity. Nothing is owed (`Phase`).
+  - *What refutes it*: the CONCRETE SEARCH, which runs the real seed
+    (`--balloon-seeds`, `--concrete-balloon-seeds`, the float tool's), and
+    the ladder's exact-object level `r0sxh`.
+  - *Measured*: room (4,2) one state a frame until the player, as unseeded
+    fixed; float room (7,0) `r0sxhn` 2.9M traced lanes to f40 before, 77k
+    after, the same position graph. Fixed without seeds: trees, keys and
+    edges identical; `r42n`'s kernels lose the dead phase arithmetic
+    (dynamic instructions -4.3%, re-pinned).
 - **Soundness**: `diag-project` checked every row of a room (7,0) `t` tree
   (7.88M, steps 1-96) projects onto a row of the `n` tree. The results were computed before the
   interval-wrap fix (`549ecf5`, `b47b118`); two rooms re-run after it
