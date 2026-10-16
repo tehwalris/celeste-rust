@@ -388,52 +388,6 @@ enum Command {
         #[arg(long)]
         path_cap: Option<usize>,
     },
-    /// DIAGNOSTIC: how coarse a level could be. Per frame, the distinct
-    /// states of a tree with the named cells (`inspect::cell_names`) whose
-    /// names start with any `--erase` prefix left out (comma-separated, e.g.
-    /// `spd.,rem.,player[3].dash`), and cumulatively through that frame.
-    CoarseCensus {
-        /// The level's tree (the dir holding `frames/` and `edges/`; a search's
-        /// `<checkpoint-dir>/levelNN`).
-        #[arg(long)]
-        level_dir: String,
-        /// The first frame counted.
-        #[arg(long)]
-        from: u32,
-        /// The last frame counted.
-        #[arg(long)]
-        to: u32,
-        /// Named-cell prefixes left out, comma-separated (e.g. `spd.,rem.`).
-        #[arg(long, default_value = "")]
-        erase: String,
-    },
-    /// DIAGNOSTIC: does a cell's visited set saturate? (A frame's rows are the
-    /// states NEW at it.) From the cell indexes only: the `top` cells by
-    /// visited count (and `--at x,y`) with their new states per frame, and
-    /// every cell's new states at `to` as a share of its visited set.
-    CellGrowth {
-        /// The level's tree (the dir holding `frames/` and `edges/`; a search's
-        /// `<checkpoint-dir>/levelNN`).
-        #[arg(long)]
-        level_dir: String,
-        /// The first frame read.
-        #[arg(long, default_value_t = 0)]
-        from: u32,
-        /// The last frame read (the shares are taken there).
-        #[arg(long)]
-        to: u32,
-        /// How many of the most visited cells to list.
-        #[arg(long, default_value_t = 8)]
-        top: usize,
-        /// Also list the cell at player position "x,y".
-        #[arg(long, value_parser = parse_xy)]
-        at: Option<(i32, i32)>,
-        /// Also the growth by AGE (frames since a cell's first state, in
-        /// steps of this): the median, p90 and mean of the states a cell had
-        /// visited by that age. Comparable across rooms.
-        #[arg(long)]
-        by_age: Option<usize>,
-    },
     /// THE WIDENING TABLE'S TWO SIDES AGREE (`celeste_engine::widening`):
     /// every row stored at step `frame` - widened in the kernels' graph - is
     /// a fixed point of the block side's widening at `--level`
@@ -557,36 +511,42 @@ enum Command {
         #[arg(long)]
         chain_out: Option<String>,
     },
-    /// DIAGNOSTIC: per-column cardinalities of one frame, streamed. Per
-    /// shape: rows, every varying column's distinct value count (capped at
-    /// `cap`), named, and the distinct (spd.x, spd.y) pairs.
-    ///
-    /// With `--cell x,y`, only that position's rows (values listed), and
-    /// whether it SATURATES: every `every` steps up to `frame`, its cumulative
-    /// distinct states (without the `--erase` prefixes), speed pairs, and
-    /// states without speed.
-    ColCensus {
+    /// DIAGNOSTIC: a tree's states, counted (cells named by
+    /// `inspect::cell_names`). Per shape at `--frame`: its rows, every
+    /// varying column's distinct values (capped at `--cap`) with the rows
+    /// holding an interval or an unknown bool, and its distinct (spd.x,
+    /// spd.y) pairs; with `--cell x,y` that player position's rows only, and
+    /// the values of a column with few. With `--erase` or `--cell`, whether
+    /// they SATURATE: from frame 0, every `--every` frames, the new states,
+    /// and the distinct ones (new, and so far) with the named cells under
+    /// an `--erase` prefix left out. With `--cells K`, the K player
+    /// positions with the most states through `--frame` (their new states
+    /// in its last 12 frames), and every position's new states at `--frame`
+    /// as a share of its states.
+    Census {
         /// The level's tree (the dir holding `frames/` and `edges/`; a search's
         /// `<checkpoint-dir>/levelNN`).
         #[arg(long)]
         level_dir: String,
-        /// The frame (step) whose rows are counted.
+        /// The frame (step) counted.
         #[arg(long)]
         frame: u32,
         /// Stop counting a column's distinct values past this many.
         #[arg(long, default_value_t = 1 << 24)]
         cap: usize,
-        /// Only the rows at player position "x,y", and its saturation over the
-        /// steps.
+        /// Only the states at player position "x,y".
         #[arg(long, value_parser = parse_xy)]
         cell: Option<(i32, i32)>,
-        /// With `--cell`: named-cell prefixes left out of a state, comma-
-        /// separated.
-        #[arg(long, default_value = "")]
-        erase: String,
-        /// With `--cell`: report the saturation every this many steps.
+        /// Named-cell prefixes left out of a state, comma-separated (e.g.
+        /// `spd.,rem.,player[3].dash`).
+        #[arg(long)]
+        erase: Option<String>,
+        /// The saturation every this many frames.
         #[arg(long, default_value_t = 4)]
         every: u32,
+        /// The player positions with the most states, this many.
+        #[arg(long)]
+        cells: Option<usize>,
     },
     /// Export a finished search for the web UI (`ui/`) from its record
     /// (`result.json`), the trees' checkpoint HEADERS and forward records
@@ -694,41 +654,6 @@ enum Command {
 /// its frames' states, their rows decoded on demand.
 fn tree_of(dir: &std::path::Path) -> Result<Tree> {
     Tree::open_all(dir)
-}
-
-/// `coarse-census`: one frame's states EXACTLY (each row's named value
-/// cells and their codes, by name), the named value cells under an `erase`
-/// prefix left out (pointers count as structure); and the frame's row count.
-fn erased_states(dir: &std::path::Path, frame: u32, erase: &[String], room: (i16, i16), threads: usize) -> Result<(u64, rustc_hash::FxHashSet<Box<[u8]>>)> {
-    use celeste_engine::exact::Code;
-    use celeste_engine::runtime2::{Cell2, AV};
-    let ids = celeste_rust::compiled::ids();
-    let code = |v: AV| -> Code { Code::of(if let AV::Ptr(_) = v { AV::Ptr(0) } else { v }) };
-    let (mut rows, mut states) = (0u64, rustc_hash::FxHashSet::default());
-    let tree = Tree::<P8>::open(dir, frame)?;
-    for (_, rt2) in tree.rows(frame, room, 1 << 20, &|_| true, threads)? {
-        rows += rt2.width as u64;
-        let names = cell_names(&rt2, ids);
-        let mut cells: Vec<(String, usize)> = (0..rt2.cols.len())
-            .filter(|&c| matches!(rt2.structure[c], Cell2::Val))
-            .map(|c| (names.get(&c).cloned().unwrap_or_else(|| format!("cell{c}")), c))
-            .filter(|(nm, _)| !erase.iter().any(|p| nm.starts_with(p.as_str())))
-            .collect();
-        cells.sort();
-        for r in 0..rt2.width {
-            let mut b: Vec<u8> = Vec::new();
-            for (nm, c) in &cells {
-                let k = code(rt2.cols[*c].at(r));
-                b.extend_from_slice(nm.as_bytes());
-                b.push(0);
-                b.push(k.kind);
-                b.extend_from_slice(&k.a.to_le_bytes());
-                b.extend_from_slice(&k.b.to_le_bytes());
-            }
-            states.insert(b.into_boxed_slice());
-        }
-    }
-    Ok((rows, states))
 }
 
 /// A comma-separated list of name prefixes (`--erase`).
@@ -879,6 +804,176 @@ where
             celeste_rust::compiled::dispatch::print_kernel_hits();
             anyhow::ensure!(sound_gaps == 0, "ref-check: {sound_gaps} reference successors the kernels miss (a SOUNDNESS gap)");
             Ok(())
+}
+
+/// `census`'s arguments (`Command::Census`).
+struct CensusArgs {
+    level_dir: String,
+    frame: u32,
+    cap: usize,
+    cell: Option<(i32, i32)>,
+    erase: Option<String>,
+    every: u32,
+    cells: Option<usize>,
+}
+
+/// `census` (`Command::Census`).
+fn census(cfg: &celeste_rust::settings::Settings, a: CensusArgs) -> Result<()> {
+    use celeste_engine::exact::Code;
+    use celeste_engine::runtime2::{Cell2, Col, AV};
+    let dir = std::path::Path::new(&a.level_dir);
+    let tree = Tree::<P8>::open(dir, a.frame)?;
+    let ids = celeste_rust::compiled::ids();
+    let geo = celeste_rust::storage::GEOMETRY;
+    let only = a.cell.map(cell_at).transpose()?;
+    let keep = |s: Sk| only.is_none_or(|c| s.cell(&geo) == c);
+    // Per shape: its rows, per column its distinct codes (capped), whether
+    // it varies, the rows holding an interval or an unknown bool, the named
+    // cells and the distinct (spd.x, spd.y) pairs.
+    struct S {
+        rows: u64,
+        cols: Vec<rustc_hash::FxHashSet<Code>>,
+        varying: Vec<bool>,
+        ivals: Vec<u64>,
+        ubools: Vec<u64>,
+        names: std::collections::HashMap<usize, String>,
+        spd: rustc_hash::FxHashSet<(Code, Code)>,
+    }
+    let mut by_shape: std::collections::BTreeMap<u64, S> = Default::default();
+    for (_, rt2) in tree.rows(a.frame, cfg.room, 1 << 20, &keep, cfg.threads())? {
+        let n = rt2.cols.len();
+        let st = by_shape.entry(rt2.shape_hash).or_insert_with(|| S { rows: 0, cols: vec![Default::default(); n], varying: vec![false; n], ivals: vec![0; n], ubools: vec![0; n], names: cell_names(&rt2, ids), spd: Default::default() });
+        st.rows += rt2.width as u64;
+        for (c, col) in rt2.cols.iter().enumerate() {
+            if !matches!(rt2.structure[c], Cell2::Val) {
+                continue;
+            }
+            if let Col::U(v) = col {
+                if st.cols[c].len() < a.cap {
+                    st.cols[c].insert(Code::of(*v));
+                }
+                continue;
+            }
+            st.varying[c] = true;
+            for r in 0..rt2.width {
+                let v = col.at(r);
+                match v {
+                    AV::Ival(lo, hi) if lo != hi => st.ivals[c] += 1,
+                    AV::UBool => st.ubools[c] += 1,
+                    _ => {}
+                }
+                if st.cols[c].len() < a.cap {
+                    st.cols[c].insert(Code::of(v));
+                }
+            }
+        }
+        let named = |want: &str| st.names.iter().find(|(_, n)| n.as_str() == want).map(|(c, _)| *c);
+        if let (Some(sx), Some(sy)) = (named("spd.x"), named("spd.y")) {
+            for r in 0..rt2.width {
+                if st.spd.len() >= a.cap {
+                    break;
+                }
+                st.spd.insert((Code::of(rt2.cols[sx].at(r)), Code::of(rt2.cols[sy].at(r))));
+            }
+        }
+    }
+    for (shape, st) in &by_shape {
+        let mut cards: Vec<(usize, usize)> = (0..st.cols.len()).filter(|&c| st.cols[c].len() > 1 || st.varying[c]).map(|c| (st.cols[c].len(), c)).collect();
+        cards.sort_unstable_by(|a, b| b.cmp(a));
+        let product: f64 = cards.iter().map(|&(n, _)| n as f64).product();
+        println!("shape {shape:#x}: {} rows, {} varying columns, cardinality product {:.2e}, spd pairs {}", st.rows, cards.len(), product, st.spd.len());
+        for &(n, c) in cards.iter().take(24) {
+            println!("  c{c:<4} {n:>10} {:<18} intervals {:>10} unknown-bools {:>10}", st.names.get(&c).map_or("", |s| s.as_str()), st.ivals[c], st.ubools[c]);
+            // One position's census lists the numbers themselves.
+            if only.is_some() && n <= 64 {
+                let mut vals: Vec<f64> = st.cols[c].iter().filter(|v| v.kind == 0 && v.a == v.b).map(|v| v.a as i32 as f64 / 65536.0).collect();
+                vals.sort_by(|a, b| a.total_cmp(b));
+                if !vals.is_empty() {
+                    println!("        {}", vals.iter().map(|v| format!("{v:.4}")).collect::<Vec<_>>().join(" "));
+                }
+            }
+        }
+    }
+    // SATURATION: the distinct states with the erased cells left out, frame
+    // by frame (pointers count as structure).
+    if a.erase.is_some() || only.is_some() {
+        let erase = prefixes(a.erase.as_deref().unwrap_or(""));
+        let code = |v: AV| -> Code { Code::of(if let AV::Ptr(_) = v { AV::Ptr(0) } else { v }) };
+        let mut through: rustc_hash::FxHashSet<Box<[u8]>> = Default::default();
+        println!("frame | new | distinct new | distinct through");
+        for f in 0..=a.frame {
+            let (mut new, mut here) = (0u64, rustc_hash::FxHashSet::<Box<[u8]>>::default());
+            for (_, rt2) in tree.rows(f, cfg.room, 1 << 20, &keep, cfg.threads())? {
+                new += rt2.width as u64;
+                let names = cell_names(&rt2, ids);
+                let mut cells: Vec<(String, usize)> = (0..rt2.cols.len())
+                    .filter(|&c| matches!(rt2.structure[c], Cell2::Val))
+                    .map(|c| (names.get(&c).cloned().unwrap_or_else(|| format!("cell{c}")), c))
+                    .filter(|(nm, _)| !erase.iter().any(|p| nm.starts_with(p.as_str())))
+                    .collect();
+                cells.sort();
+                for r in 0..rt2.width {
+                    let mut b: Vec<u8> = Vec::new();
+                    for (nm, c) in &cells {
+                        let k = code(rt2.cols[*c].at(r));
+                        b.extend_from_slice(nm.as_bytes());
+                        b.push(0);
+                        b.push(k.kind);
+                        b.extend_from_slice(&k.a.to_le_bytes());
+                        b.extend_from_slice(&k.b.to_le_bytes());
+                    }
+                    here.insert(b.into_boxed_slice());
+                }
+            }
+            let distinct = here.len();
+            through.extend(here);
+            if !through.is_empty() && (f % a.every.max(1) == 0 || f == a.frame) {
+                println!("f{f:03} | {new:>9} | {distinct:>9} | {:>9}", through.len());
+            }
+        }
+    }
+    // THE POSITIONS: per player cell, its new states per frame.
+    if let Some(top) = a.cells {
+        let n_frames = a.frame as usize + 1;
+        let mut per: rustc_hash::FxHashMap<u32, Vec<u64>> = Default::default();
+        for f in 0..=a.frame {
+            for s in tree.layer(f, None, cfg.threads())?.0.states_iter() {
+                per.entry(s.cell(&geo)).or_insert_with(|| vec![0; n_frames])[f as usize] += 1;
+            }
+        }
+        let total = |v: &[u64]| v.iter().sum::<u64>();
+        let mut by_total: Vec<(u32, u64)> = per.iter().map(|(c, v)| (*c, total(v))).collect();
+        by_total.sort_by_key(|&(c, n)| (std::cmp::Reverse(n), c));
+        let shown = n_frames.min(12);
+        println!("position: states through f{:03} | new per frame, f{:03}..f{:03}", a.frame, n_frames - shown, a.frame);
+        for &(c, n) in by_total.iter().take(top) {
+            let tail: Vec<String> = per[&c][n_frames - shown..].iter().map(|n| n.to_string()).collect();
+            println!("{}: {n} | {}", where_(c), tail.join(" "));
+        }
+        // Every position's new states at the frame as a share of its states.
+        let edges = [0.01, 0.05, 0.20];
+        let (mut cells_in, mut states_in) = ([0usize; 4], [0u64; 4]);
+        for v in per.values() {
+            let share = v[n_frames - 1] as f64 / total(v).max(1) as f64;
+            let b = edges.iter().filter(|&&e| share >= e).count();
+            cells_in[b] += 1;
+            states_in[b] += total(v);
+        }
+        println!(
+            "{} positions; new at f{:03} as a share of their states: under 1%: {} positions ({} states), 1-5%: {} ({}), 5-20%: {} ({}), 20% or more: {} ({})",
+            per.len(),
+            a.frame,
+            cells_in[0],
+            states_in[0],
+            cells_in[1],
+            states_in[1],
+            cells_in[2],
+            states_in[2],
+            cells_in[3],
+            states_in[3]
+        );
+    }
+    Ok(())
 }
 
 /// The kernels of a level (`compiled::Kernels::new`), for the commands
@@ -1815,100 +1910,12 @@ fn main() -> Result<()> {
                 reps,
             })?;
         }
-        Command::CellGrowth { level_dir, from, to, top, at, by_age } => {
-            let dir = std::path::Path::new(&level_dir);
-            let n_frames = (to - from + 1) as usize;
-            // Per cell, its new states per frame.
-            let mut per: std::collections::HashMap<u32, Vec<u64>> = Default::default();
-            let tree = Tree::<P8>::open(dir, to)?;
-            let geo = celeste_rust::storage::GEOMETRY;
-            for f in from..=to {
-                for s in tree.layer(f, None, cfg.threads())?.0.states_iter() {
-                    per.entry(s.cell(&geo)).or_insert_with(|| vec![0; n_frames])[(f - from) as usize] += 1;
-                }
-            }
-            let visited = |v: &[u64]| v.iter().sum::<u64>();
-            if let Some(stepw) = by_age {
-                // Per cell: its states visited by each age since its first.
-                let series: Vec<Vec<u64>> = per
-                    .values()
-                    .filter_map(|v| {
-                        let first = v.iter().position(|&n| n > 0)?;
-                        Some(v[first..].iter().scan(0u64, |acc, &n| {
-                            *acc += n;
-                            Some(*acc)
-                        }).collect())
-                    })
-                    .collect();
-                println!("age | cells | median p90 mean (states visited by that age)");
-                for a in (0..n_frames).step_by(stepw.max(1)) {
-                    let mut at_a: Vec<u64> = series.iter().filter(|s| s.len() > a).map(|s| s[a]).collect();
-                    if at_a.is_empty() {
-                        break;
-                    }
-                    at_a.sort_unstable();
-                    let mean = at_a.iter().sum::<u64>() as f64 / at_a.len() as f64;
-                    println!("{a:>3} | {:>6} | {} {} {:.0}", at_a.len(), at_a[at_a.len() / 2], at_a[at_a.len() * 9 / 10], mean);
-                }
-            }
-            let mut by_visited: Vec<(u32, u64)> = per.iter().map(|(c, v)| (*c, visited(v))).collect();
-            by_visited.sort_by_key(|&(c, n)| (std::cmp::Reverse(n), c));
-            let mut chosen: Vec<u32> = by_visited.iter().take(top).map(|&(c, _)| c).collect();
-            if let Some(c) = at.map(cell_at).transpose()? {
-                if !chosen.contains(&c) {
-                    chosen.push(c);
-                }
-            }
-            let shown = n_frames.min(12);
-            println!("cell: visited through f{to:03} | new per frame, f{:03}..f{to:03}", to - shown as u32 + 1);
-            for c in &chosen {
-                match per.get(c) {
-                    Some(v) => {
-                        let tail: Vec<String> = v[n_frames - shown..].iter().map(|n| n.to_string()).collect();
-                        println!("{}: {} | {}", where_(*c), visited(v), tail.join(" "));
-                    }
-                    None => println!("{}: never visited", where_(*c)),
-                }
-            }
-            // Every cell's new states at `to` as a share of its visited set.
-            let edges = [0.01, 0.05, 0.20];
-            let mut cells_in = [0usize; 4];
-            let mut states_in = [0u64; 4];
-            for v in per.values() {
-                let share = v[n_frames - 1] as f64 / visited(v).max(1) as f64;
-                let b = edges.iter().filter(|&&e| share >= e).count();
-                cells_in[b] += 1;
-                states_in[b] += visited(v);
-            }
-            println!(
-                "{} cells visited; new at f{to:03} as a share of visited: under 1%: {} cells ({} states), 1-5%: {} ({}), 5-20%: {} ({}), 20% or more: {} ({})",
-                per.len(),
-                cells_in[0],
-                states_in[0],
-                cells_in[1],
-                states_in[1],
-                cells_in[2],
-                states_in[2],
-                cells_in[3],
-                states_in[3]
-            );
-        }
         Command::ArcCheck { level_dir, from, to, samples, level, fault, path_cap } => {
             use celeste_rust::search::arc_check::{run, Opts};
             let o = Opts { dir: std::path::Path::new(&level_dir), from, to, samples, level, fault: fault.as_deref(), path_cap, settings: &cfg };
             match cfg.arith {
                 Arith::Fixed => run::<P8>(&o)?,
                 Arith::Float(_) => run::<LuaF64>(&o)?,
-            }
-        }
-        Command::CoarseCensus { level_dir, from, to, erase } => {
-            let erase = prefixes(&erase);
-            let mut through: rustc_hash::FxHashSet<Box<[u8]>> = Default::default();
-            for frame in from..=to {
-                let (rows, states) = erased_states(std::path::Path::new(&level_dir), frame, &erase, cfg.room, cfg.threads())?;
-                let n = states.len();
-                through.extend(states);
-                println!("f{frame:03}: {rows} rows -> {n} states ({:.2}x fewer); {} states through f{frame:03}", rows as f64 / n.max(1) as f64, through.len());
             }
         }
         Command::WidenCheck { level_dir, frame, level, emitted } => match cfg.arith {
@@ -2120,117 +2127,7 @@ fn main() -> Result<()> {
                 }
             }
         }
-        Command::ColCensus { level_dir, frame, cap, cell, erase, every } => {
-            use celeste_engine::exact::Code;
-            use celeste_engine::runtime2::{Cell2, Col, AV};
-            let only_cell = cell.map(cell_at).transpose()?;
-            let dir = std::path::Path::new(&level_dir);
-            let tree = tree_of(dir)?;
-            let ids = celeste_rust::compiled::ids();
-            // shape -> (rows, per-column sets, player field names, spd pairs)
-            struct S {
-                rows: u64,
-                cols: Vec<rustc_hash::FxHashSet<Code>>,
-                varying: Vec<bool>,
-                names: std::collections::HashMap<usize, String>,
-                spd: rustc_hash::FxHashSet<(Code, Code)>,
-                /// Per column: rows holding an interval, rows holding an unknown bool.
-                ivals: Vec<u64>,
-                ubools: Vec<u64>,
-            }
-            let mut by_shape: std::collections::BTreeMap<u64, S> = Default::default();
-            let geo = celeste_rust::storage::GEOMETRY;
-            // The frame in 1M-row pieces, or one cell's rows.
-            for (_, rt2) in tree.rows(frame, cfg.room, 1 << 20, &|x| only_cell.is_none_or(|c| x.cell(&geo) == c), cfg.threads())? {
-                {
-                    let st = by_shape.entry(rt2.shape_hash).or_insert_with(|| {
-                        let names = cell_names(&rt2, ids);
-                        S { rows: 0, cols: vec![Default::default(); rt2.cols.len()], varying: vec![false; rt2.cols.len()], names, spd: Default::default(), ivals: vec![0; rt2.cols.len()], ubools: vec![0; rt2.cols.len()] }
-                    });
-                    st.rows += rt2.width as u64;
-                    for (c, col) in rt2.cols.iter().enumerate() {
-                        if !matches!(rt2.structure[c], Cell2::Val) {
-                            continue;
-                        }
-                        match col {
-                            Col::U(v) => {
-                                if st.cols[c].len() < cap {
-                                    st.cols[c].insert(Code::of(*v));
-                                }
-                            }
-                            _ => {
-                                st.varying[c] = true;
-                                let set = &mut st.cols[c];
-                                for r in 0..rt2.width {
-                                    let v = col.at(r);
-                                    match v {
-                                        AV::Ival(a, b) if a != b => st.ivals[c] += 1,
-                                        AV::UBool => st.ubools[c] += 1,
-                                        _ => {}
-                                    }
-                                    if set.len() < cap {
-                                        set.insert(Code::of(v));
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    let named = |want: &str| st.names.iter().find(|(_, n)| n.as_str() == want).map(|(c, _)| *c);
-                    if let (Some(sx), Some(sy)) = (named("spd.x"), named("spd.y")) {
-                        for r in 0..rt2.width {
-                            if st.spd.len() >= cap {
-                                break;
-                            }
-                            st.spd.insert((Code::of(rt2.cols[sx].at(r)), Code::of(rt2.cols[sy].at(r))));
-                        }
-                    }
-                }
-            }
-            for (shape, st) in &by_shape {
-                let mut cards: Vec<(usize, usize)> = (0..st.cols.len()).filter(|&c| st.cols[c].len() > 1 || st.varying[c]).map(|c| (st.cols[c].len(), c)).collect();
-                cards.sort_unstable_by(|a, b| b.cmp(a));
-                let product: f64 = cards.iter().map(|&(n, _)| n as f64).product();
-                println!("shape {shape:#x}: {} rows, {} varying columns, cardinality product {:.2e}, spd pairs {}", st.rows, cards.len(), product, st.spd.len());
-                for &(n, c) in cards.iter().take(24) {
-                    println!("  c{c:<4} {n:>10} {:<18} intervals {:>10} unknown-bools {:>10}", st.names.get(&c).map(|s| s.as_str()).unwrap_or(""), st.ivals[c], st.ubools[c]);
-                    // One cell's census lists the numbers themselves.
-                    if only_cell.is_some() && n <= 64 {
-                        let mut vals: Vec<f64> = st.cols[c].iter().filter(|v| v.kind == 0 && v.a == v.b).map(|v| v.a as i32 as f64 / 65536.0).collect();
-                        vals.sort_by(|a, b| a.total_cmp(b));
-                        if !vals.is_empty() {
-                            println!("        {}", vals.iter().map(|v| format!("{v:.4}")).collect::<Vec<_>>().join(" "));
-                        }
-                    }
-                }
-            }
-            // Does the position saturate?
-            if let Some(want) = only_cell {
-                let erase = prefixes(&erase);
-                let (mut all, mut spd, mut inner) = (rustc_hash::FxHashSet::<Proj>::default(), rustc_hash::FxHashSet::<Proj>::default(), rustc_hash::FxHashSet::<Proj>::default());
-                let mut first: Option<u32> = None;
-                println!("step | new | distinct states | speed pairs | inner (no speed)");
-                for s in 0..=frame {
-                    let mut new = 0u64;
-                    for (_, rt2) in tree.rows(s, cfg.room, 1 << 20, &|x| x.cell(&geo) == want, cfg.threads())? {
-                        let names = cell_names(&rt2, ids);
-                        for r in 0..rt2.width {
-                            let mut p = project_row(&rt2, &names, r as u32, &erase);
-                            new += 1;
-                            all.insert(p.clone());
-                            let sp: Proj = ["spd.x", "spd.y"].iter().map(|k| (k.to_string(), p.remove(*k).unwrap_or_default())).collect();
-                            spd.insert(sp);
-                            inner.insert(p);
-                        }
-                    }
-                    if new > 0 && first.is_none() {
-                        first = Some(s);
-                    }
-                    if first.is_some() && (s % every == 0 || s == frame) {
-                        println!("{s:>4} | {new:>8} | {:>10} | {:>6} | {:>8}", all.len(), spd.len(), inner.len());
-                    }
-                }
-            }
-        }
+        Command::Census { level_dir, frame, cap, cell, erase, every, cells } => census(&cfg, CensusArgs { level_dir, frame, cap, cell, erase, every, cells })?,
         Command::ExportUi { checkpoint_dir, out, arc, witness, reference, download } => {
             celeste_rust::search::ui_export::export(
                 std::path::Path::new(&checkpoint_dir),

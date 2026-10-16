@@ -16,6 +16,7 @@ Measured on `docs-refresh` after merging develop `0765e7c5`. Lines are
 | slice | what went | lines |
 |---|---|---|
 | C1 | `reach`, `hull-stats`, `census` (src/census.rs), `diag-project`, `edge-census`; `hull-route` folded into `check-known` (the hull forward's claim at every step, `known::Hulls`); `hull-replay` keeps the replay check, the sliver study went; `search::reach` keeps what its slow tests read; `export-ui --reach` | -1,380 Rust |
+| C2 | `col-census`, `cell-growth`, `coarse-census` are one `census`: the columns at a frame (`--cell`), the saturation (`--erase`, `--cell`, `--every`), the most visited positions (`--cells K`); dropped: cell-growth's `--by-age` and col-census's speed-pair columns (`--erase spd.` gives the second) | -103 Rust |
 
 ## SIZE
 
@@ -191,7 +192,7 @@ Concrete simplification candidates, ordered by lines saved x safety
 | # | candidate | where | saves | risk |
 |---|---|---|---|---|
 | C1 (done) | the finished studies: `reach` (subcommand), `hull-stats`, `hull-replay` + `hull-route` (`search::hull_replay`), `census` (`src/census.rs`), `diag-project`, `edge-census` | rewrite.rs arms and helpers (`reach_command`, `rem_shapes`, `hull_stats`), hull_replay.rs, census.rs | ~1,400 | none (no pin reads them) |
-| C2 | one census command for `col-census`, `cell-growth`, `coarse-census` (`ckhash --cells`), or cut them | rewrite.rs (+ `erased_states`) | ~250 | none |
+| C2 (done) | one census command for `col-census`, `cell-growth`, `coarse-census` (`ckhash --cells`), or cut them | rewrite.rs (+ `erased_states`) | ~250 | none |
 | C3 | `follow` and `rerun-row` folded into `check-known`'s miss report and `ref-check` | rewrite.rs | ~170 | none |
 | C4 | `bench-storage` + `--emit-capture` + the capture writers, if `bench-frame --checkpoint` covers the storage | storage/bench.rs (~450 of 731), unit.rs's capture, fixtures `cap-*` | ~550 | none (t1/big steps go) |
 | C5 | the kernel mix report (`--kernel-mix`, the per-instruction provenance, kernel_mix.py), keeping the counts the `--metrics` pins need (or none, if the pins move to `perf stat` instruction counts) | compiled/mix.rs, codegen's `prov`, tools/kernel_mix.py | ~500-900 | low |
