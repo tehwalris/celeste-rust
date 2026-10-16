@@ -78,6 +78,10 @@ transcripts since 2026-10-12 ("runs"; approximate). Marks: **core**,
 
 ### `rewrite` subcommands (30)
 
+As they were before R1 (its Progress table says what went; the checks and
+benchmarks are now `check ref|arcs|widen|known|replay` and `bench
+frame|backward`, `concrete_run` is `rewrite run`).
+
 | command | purpose | evidence | mark |
 |---|---|---|---|
 | `search` | the pipeline: levels, backward, concrete search, `result.json` | t2 gates, runner; ~200 runs | core |

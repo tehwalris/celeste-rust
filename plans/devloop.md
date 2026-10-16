@@ -91,7 +91,9 @@ So t0's "N skipped" is these, not a pass.
 ### t1: single frames (the refactor gate)
 
 The steps run in five lanes, one per fixture family: r10, r62h, r42 (r42n,
-r42x), f10 and f42 (f42n, f42x).
+r42x), f10 and f42 (f42n, f42x). A step names the fixture's tree (`--tree`)
+and the frame, never its settings: the commands that read a tree take
+them from its records (and refuse them as flags).
 
 | steps | what |
 |---|---|
