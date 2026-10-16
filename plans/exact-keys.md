@@ -158,6 +158,8 @@ Differences from the design above:
   across a raise only the content is.
 - **The seed** keys frame 0's rows as the forward keys a reference row
   (held buttons widened), as develop did; the row is stored as it is.
+  (2026-10-14: keyed by its own codes since keys-only made a row its key's
+  decode - plans/architecture.md "The room's start".)
 - **Emission speed**: each dictionary slot holds its index already placed
   (the multi-run u128 shifts were the hot spot); fields of at most 4
   numbers are matched lane-parallel.

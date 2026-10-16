@@ -845,8 +845,13 @@ impl ForwardState {
         let filter = TreeFilter::of(minus_one, s);
         filter.write(dir)?;
         s.write(dir, level)?;
+        // The start has no player yet (`arc_dp::start_point`'s premise):
+        // `seed` keys it as it is, so a player's remainder would be stored
+        // exact where every other state holds it widened, beside its hull.
+        let ids = crate::compiled::ids();
+        anyhow::ensure!(initial.iter().all(|b| b.rt2().player_objects(ids).is_empty()), "frame 0: an initial row holds a player, whose remainder the start's hull does not describe");
         let mut visited = crate::storage::visited::VisitedSet::new(crate::storage::GEOMETRY);
-        let seeded = crate::storage::wave::seed(&mut visited, &initial, level, start_hull(s)?, s)?;
+        let seeded = crate::storage::wave::seed(&mut visited, &initial, start_hull(s)?, s)?;
         let won = checkpoint(dir, 0, &seeded, &[], s)?.won;
         let observer = record.then(crate::search::pos_graph::PosObserver::default);
         // An (empty) graph from the start: every tree with frames has one.

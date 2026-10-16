@@ -1,7 +1,7 @@
 """The tasdatabase categories and what each means to the search and the tools."""
 
 # The category's name on the UI.
-LABEL = {"nodiag": "No Diagonal Dashes", "gemskipany": "Gemskip any%", "gemskipnodiag": "Gemskip No Diagonal Dashes", "100": "100%", "onlydiag": "Only Diagonal Dashes"}
+LABEL = {"nodiag": "No Diagonal Dashes", "gemskipany": "Gemskip any%", "gemskipnodiag": "Gemskip No Diagonal Dashes", "100": "100%", "gemskip100": "Gemskip 100%", "onlydiag": "Only Diagonal Dashes"}
 
 # The files a category's full run plays where the category has none: the
 # 100% categories play any% where a room has no berry; the gemskip ones play

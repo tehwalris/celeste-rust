@@ -495,8 +495,8 @@ fn tile_flag_ice_map_matches_the_scan() {
     let cache = CollisionCache::new(&cart, 3, 1).expect("cache");
     let p = |v: i16| crate::pico8_num::Pico8Num::from_i16(v);
     let scan = |x: i16, y: i16, w: i16, h: i16| -> bool {
-        (y.max(0) / 8..=((y + h - 1) / 8).min(15)).any(|ty| {
-            (x.max(0) / 8..=((x + w - 1) / 8).min(15)).any(|tx| {
+        (y.max(0) / 8..=((y + h - 1).div_euclid(8)).min(15)).any(|ty| {
+            (x.max(0) / 8..=((x + w - 1).div_euclid(8)).min(15)).any(|tx| {
                 let t = cart.mget(p(3 * 16 + tx), p(16 + ty)).expect("mget");
                 cart.fget(p(t as i16), p(4)).expect("fget")
             })

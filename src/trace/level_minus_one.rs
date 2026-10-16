@@ -427,6 +427,7 @@ impl<'a> Table<'a> {
             &ival,
             true,
             &bound_list,
+            &[],
         )
         .map_err(|e| anyhow!("level -1 trace of shape {id}: {e:#}"));
         tr.it.d.uncapped_ways = false;

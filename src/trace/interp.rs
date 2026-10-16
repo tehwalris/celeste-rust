@@ -588,9 +588,17 @@ impl<'a, D: Domain> Interp<'a, D> {
 
     /// Can two values be joined on `cond` without a select some lane cannot
     /// take? On a condition reading an unknown atom, only an independent join
-    /// can; otherwise they stay two successors, as `state::merge` does.
+    /// can; on one reading an input the trace refuses merges on
+    /// (`Domain::reads_merge_refused`), none; otherwise they stay two
+    /// successors, as `state::merge` does.
     fn joins_independent(&mut self, cond: &D::Bool, a: &Value<D>, b: &Value<D>) -> bool {
-        if a == b || !self.d.reads_unknown_atom(cond) {
+        if a == b {
+            return true;
+        }
+        if self.d.reads_merge_refused(cond) {
+            return false;
+        }
+        if !self.d.reads_unknown_atom(cond) {
             return true;
         }
         match (a, b) {

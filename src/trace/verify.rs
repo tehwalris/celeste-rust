@@ -170,6 +170,10 @@ pub fn trace_frame<'a>(
     // them through `Op::Restrict`, specialized on the range; outside it is
     // the restriction's own error (`trace::error`), like a pin.
     bounds: &[(Path, (i32, i32))],
+    // Input slots NO MERGE SELECTS ON: a condition that reads one makes two
+    // successors, each with its own values (`Domain::reads_merge_refused`;
+    // a respawn's exploration, `kernel::explore_respawn`).
+    merge_refused_on: &[Path],
 ) -> Result<Frame> {
     it.trace_start_nodes = it.d.node_count();
     let mut st = st;
@@ -186,6 +190,11 @@ pub fn trace_frame<'a>(
     it.d.fork_origins.clear();
     it.d.evaluated.clear();
     let iface = iface::symbolize(&mut it.d, &mut st, roots, pin, ival)?;
+    let refused = merge_refused_on
+        .iter()
+        .map(|p| iface.slots.iter().position(|q| q == p).map(|i| i as u32).ok_or_else(|| anyhow!("merge-refused {} is not an input slot", iface::show(p))))
+        .collect::<Result<Vec<u32>>>()?;
+    it.d.set_merge_refused(refused);
     // The lattice's pins (`symbolize` made their slots read the constants;
     // the raw cells feed only these checks).
     for (i, c) in &iface.pins {
@@ -1661,7 +1670,7 @@ mod tests {
         }
         let key = pm1_key(&player, &st, &it.d).expect("pm1 key");
         assert_eq!(key.len(), 6, "the pm1 key is six cells");
-        let f = trace_frame(&mut it, &reset, &frame, st, &roots, &key, &[], false, &[]).expect("trace");
+        let f = trace_frame(&mut it, &reset, &frame, st, &roots, &key, &[], false, &[], &[]).expect("trace");
         assert_eq!(f.iface.pins.len(), 6, "all six pinned");
 
         // No error in whichever outcome claims this assignment.
@@ -1727,8 +1736,8 @@ mod tests {
         let st = run_one(&mut it, &init, st).expect("_init");
         let scan = |rx: i16, ry: i16, x: i16, y: i16, w: i16, h: i16| -> bool {
             let p = |v: i16| crate::pico8_num::Pico8Num::from_i16(v);
-            (y.max(0) / 8..=((y + h - 1) / 8).min(15)).any(|ty| {
-                (x.max(0) / 8..=((x + w - 1) / 8).min(15)).any(|tx| {
+            (y.max(0) / 8..=((y + h - 1).div_euclid(8)).min(15)).any(|ty| {
+                (x.max(0) / 8..=((x + w - 1).div_euclid(8)).min(15)).any(|tx| {
                     let t = cd.mget(p(rx * 16 + tx), p(ry * 16 + ty)).expect("mget");
                     cd.fget(p(t as i16), p(4)).expect("fget")
                 })
@@ -1786,6 +1795,118 @@ mod tests {
         let dry = icy_rooms.len() - icy;
         eprintln!("[ice] {icy} rooms with ice, {dry} without");
         assert!(icy > 0 && dry > 0, "the map has rooms with and without ice");
+    }
+
+    /// The native `tile_flag_at` (the cached maps and the scan, which the
+    /// tracer, the kernels and the reference engine all call) answers what
+    /// the CART'S OWN Lua `tile_flag_at` answers - its loop with a
+    /// fractional limit - at every box near the room's edges, outside it
+    /// included, in every room. Until 2026-10-15 the scan truncated the
+    /// limit toward zero and found column 0 (row 0) under a box wholly left
+    /// of (above) the room, where the cart's loop runs no iteration.
+    #[test]
+    fn native_tile_flag_at_answers_the_carts_lua_loop() {
+        let src = cart::sources(&crate::settings::Settings::default()).expect("sources");
+        let top = full_moon::parse(&src).expect("parse");
+        let keep = full_moon::parse("lua_tile_flag_at = tile_flag_at").expect("parse");
+        let init = full_moon::parse("_init()").expect("parse _init");
+        // Positions -24..8 and 120..152 on each axis (both edges of the
+        // room and well past them), five boxes: the cached sizes, an odd
+        // one, and the ice map's. Every disagreement is counted, the first
+        // one named.
+        let probe = full_moon::parse(
+            "
+boxes = { {1, 1, 0}, {6, 5, 0}, {8, 8, 0}, {3, 10, 0}, {6, 5, 4} }
+tfa_bad = 0
+tfa_hits = 0
+tfa_x = 0
+tfa_y = 0
+tfa_k = 0
+for xi=0,65 do
+  local x = xi - 24
+  if xi > 32 then x = xi + 87 end
+  for yi=0,65 do
+    local y = yi - 24
+    if yi > 32 then y = yi + 87 end
+    for k=1,5 do
+      local b = boxes[k]
+      local lua = lua_tile_flag_at(x, y, b[1], b[2], b[3])
+      local native = tile_flag_at(x, y, b[1], b[2], b[3])
+      if lua then tfa_hits = tfa_hits + 1 end
+      if (lua and not native) or (native and not lua) then
+        if tfa_bad == 0 then
+          tfa_x = x
+          tfa_y = y
+          tfa_k = k
+        end
+        tfa_bad = tfa_bad + 1
+      end
+    end
+  end
+end
+",
+        )
+        .expect("parse probe");
+        let cd = std::sync::Arc::new(celeste_core::cart_data::CartData::load("cart").expect("cart"));
+        let mut it: Interp<Symbolic> = Interp::new(Symbolic::default());
+        let (rx0, ry0) = crate::settings::Settings::default().room;
+        it.cache = Some(std::sync::Arc::new(celeste_core::collision_cache::CollisionCache::new(&cd, rx0, ry0).expect("cache")));
+        it.cart = Some(cd.clone());
+        let st = cart::fresh_state::<Symbolic>(&mut it.d);
+        let st = run_one(&mut it, &top, st).expect("toplevel");
+        let mut st = run_one(&mut it, &keep, st).expect("keep the Lua tile_flag_at");
+        cart::inject_tile_flag_at(&mut st);
+        let st = run_one(&mut it, &init, st).expect("_init");
+        struct Worker<'a> {
+            it: Interp<'a, Symbolic>,
+            st: State<Symbolic>,
+        }
+        // SAFETY: the interpreter's raw pointers point into this test's
+        // ASTs, which outlive the scope and are only read.
+        unsafe impl Send for Worker<'_> {}
+        let rooms: Vec<(i16, i16)> = (0..8i16).flat_map(|rx| (0..4i16).map(move |ry| (rx, ry))).collect();
+        let next = std::sync::atomic::AtomicUsize::new(0);
+        let workers = std::thread::available_parallelism().map_or(4, |n| n.get()).min(16);
+        let hits: u64 = std::thread::scope(|sc| {
+            let hs: Vec<_> = (0..workers)
+                .map(|_| {
+                    let mut w = Worker { it: it.clone(), st: st.clone() };
+                    let (rooms, next, cd, probe) = (&rooms, &next, &cd, &probe);
+                    std::thread::Builder::new()
+                        .stack_size(64 << 20)
+                        .spawn_scoped(sc, move || {
+                            let w = &mut w;
+                            let mut hits = 0u64;
+                            while let Some(&(rx, ry)) = rooms.get(next.fetch_add(1, std::sync::atomic::Ordering::Relaxed)) {
+                                w.it.cache = Some(std::sync::Arc::new(celeste_core::collision_cache::CollisionCache::new(cd, rx, ry).expect("cache")));
+                                let mut o = w.st.clone();
+                                for (k, v) in [("x", rx), ("y", ry)] {
+                                    let n = w.it.d.num(crate::pico8_num::Pico8Num::from_i16(v));
+                                    iface::set(&mut o, &[iface::key("room"), iface::key(k)], Value::Num(n)).expect("set room");
+                                }
+                                let s = run_one(&mut w.it, probe, o).expect("the probe runs");
+                                let num = |name: &str| -> i32 {
+                                    let Some(Value::Num(n)) = iface::get(&s, &[iface::key(name)]) else { panic!("{name} is not a number") };
+                                    w.it.d.as_const(&n).and_then(|v| v.as_i16()).unwrap_or_else(|| panic!("{name} is not a constant integer")) as i32
+                                };
+                                assert_eq!(
+                                    num("tfa_bad"),
+                                    0,
+                                    "room ({rx},{ry}): the native tile_flag_at disagrees with the cart's loop, first at box {} at ({}, {})",
+                                    num("tfa_k"),
+                                    num("tfa_x"),
+                                    num("tfa_y")
+                                );
+                                hits += num("tfa_hits") as u64;
+                            }
+                            hits
+                        })
+                        .expect("spawn a worker")
+                })
+                .collect();
+            hs.into_iter().map(|h| h.join().expect("a worker panicked")).sum()
+        });
+        assert!(hits > 0, "some box finds a flagged tile");
     }
 
     /// `break` in a loop with a symbolic bound (unreachable from the cart):
@@ -1892,7 +2013,7 @@ end
         }
 
         let before = it.d.graph.len();
-        let f = trace_frame(&mut it, &reset, &frame, st.clone(), &roots, &[], &[], false, &[])
+        let f = trace_frame(&mut it, &reset, &frame, st.clone(), &roots, &[], &[], false, &[], &[])
             .unwrap_or_else(|e| panic!("[verify] symbolic frame stopped at: {e:#}"));
         eprintln!(
             "[verify] {} input cells, {} outcome(s), {} nodes ({} new)",
