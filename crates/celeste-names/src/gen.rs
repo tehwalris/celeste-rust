@@ -102,7 +102,7 @@ pub static GLOBAL_NAMES: &[&str] = &[
     "start_game",
     "start_game_flash",
     "rnd",
-    // The split-frame prototype's phase marker (lua/celeste-minimal-split.lua).
+    // The split frame's phase marker (lua/split-frame.lua).
     "__phase",
     "__frozen",
 ];

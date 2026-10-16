@@ -67,9 +67,11 @@ pub fn sources_in(root: &std::path::Path, s: &crate::settings::Settings) -> Resu
     let read = |p: &str| std::fs::read_to_string(root.join(p));
     let b3 = read("lua/builtin_level_3.lua")?;
     let b4 = read("lua/builtin_level_4.lua")?;
-    // `--split-frame`: the split-frame prototype, one frame as two steps.
-    let lua = if s.split_frame { "lua/celeste-minimal-split.lua" } else { "lua/celeste-minimal.lua" };
-    let mut game = crate::game_runner::apply_start_room(&read(lua)?, s)?;
+    let mut cart = read("lua/celeste-minimal.lua")?;
+    if s.split_frame {
+        cart = split_frame(&cart, &read("lua/split-frame.lua")?)?;
+    }
+    let mut game = crate::game_runner::apply_start_room(&cart, s)?;
     anyhow::ensure!(!(s.nodiag && s.onlydiag), "--nodiag and --onlydiag exclude each other");
     static SAID: std::sync::Once = std::sync::Once::new();
     SAID.call_once(|| match s.loading_jank {
@@ -99,6 +101,20 @@ pub fn sources_in(root: &std::path::Path, s: &crate::settings::Settings) -> Resu
         game = tool_seeds(&game, s.balloon_seeds.as_deref(), tool, root, s.room, s.loading_jank.is_some())?;
     }
     Ok(format!("{}\n{}\n{}\n", b3, b4, game))
+}
+
+/// `--split-frame` (plans/architecture.md "The split frame"): one frame as
+/// two steps around the player's move - the cart's `_update` replaced by
+/// `update`'s (`lua/split-frame.lua`), and `_draw` skipped between the two.
+fn split_frame(game: &str, update: &str) -> Result<String> {
+    const UPDATE: &str = "function _update()\n";
+    const DRAW: &str = "function _draw()\n";
+    anyhow::ensure!(game.matches(UPDATE).count() == 1 && game.matches(DRAW).count() == 1, "--split-frame: the cart's `_update` or `_draw` not found exactly once");
+    anyhow::ensure!(update.starts_with(UPDATE) && update.ends_with("\nend\n"), "--split-frame: lua/split-frame.lua is not one `_update`");
+    let a = game.find(UPDATE).expect("found");
+    let b = a + game[a..].find("\nend\n").ok_or_else(|| anyhow!("--split-frame: the cart's `_update` has no end"))? + "\nend\n".len();
+    let game = format!("{}{}{}", &game[..a], update, &game[b..]);
+    Ok(game.replacen(DRAW, &format!("{DRAW}\t-- mid-frame (SPLIT FRAME): drawn after part b\n\tif __phase ~= nil then return end\n"), 1))
 }
 
 /// `--balloon-seeds "s1,s2,.."`: the start room's balloons' phases

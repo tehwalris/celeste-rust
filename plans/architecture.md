@@ -73,7 +73,8 @@ celeste-rust (src/)
 ```
 
 The traced program is `lua/builtin_level_3.lua` + `lua/builtin_level_4.lua`
-+ `lua/celeste-minimal.lua` (`--split-frame`: `celeste-minimal-split.lua`).
++ `lua/celeste-minimal.lua` (`--split-frame`: its `_update` replaced by
+`lua/split-frame.lua`'s, `trace::cart::split_frame`).
 Count things there, not in the OCaml project's `celeste.lua`, which is the
 reference for semantics only.
 
