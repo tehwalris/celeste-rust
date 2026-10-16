@@ -12,7 +12,7 @@ if [ ! -x "$P8" ]; then
     exit 1
 fi
 tmp="$(mktemp -d)"
-trap 'rm -rf "$tmp"' EXIT
+trap 'rm -rf "$tmp" "${new:-}"' EXIT
 for lua in lua/probe/*.lua; do
     name="$(basename "$lua" .lua)"
     # `__hex`: the exact print the tracer has natively (src/trace/probe.rs).
@@ -21,7 +21,12 @@ for lua in lua/probe/*.lua; do
       cat "$lua"; } > "$tmp/$name.p8"
     # PICO-8 wants to be run from the cart's directory, and prints a
     # RUNNING: banner that is not part of the program's output.
+    # Written beside the golden, then renamed over it where it changed: the
+    # tests read these files while one of them runs this script
+    # (`trace::probe`), and a truncated file read mid-write is no golden.
+    new="$(mktemp "lua/probe/.$name.XXXXXX")"
     ( cd "$tmp" && SDL_VIDEODRIVER=dummy "$P8" -x "$name.p8" ) \
-        | grep -v '^RUNNING:' > "lua/probe/$name.expected"
+        | grep -v '^RUNNING:' > "$new"
+    if cmp -s "$new" "lua/probe/$name.expected"; then rm "$new"; else mv "$new" "lua/probe/$name.expected"; fi
     echo "$name: $(wc -l < "lua/probe/$name.expected") lines"
 done
