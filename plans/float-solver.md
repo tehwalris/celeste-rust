@@ -1247,12 +1247,13 @@ The checks, room (1,0) to f44 and (1,3) to f46:
 | `--key-check` | clean | clean |
 | `ref-check` (rows sampled at f30/f40/f44, f40/f46) | 0 differ | 0 differ |
 | `arc-check` | 18.2M records, 0 without a transfer, 0 disagree | 17.1M, 0, 0 |
-| float forward wall, kernels (reference engine, M3/M4) | 2.6 s (44.5 min) | 17.5 s with `--key-check` (66 min) |
+| float forward wall, kernels (reference engine) | 2.6 s (48 min) | 17.5 s with `--key-check` (66 min) |
 
 The kernel trees ARE the reference engine's: `ckhash --edges --hulls`
-of room (1,0) to f44 is equal frame by frame (states, edges and hulls)
-between `forward --arith float` and `forward --arith float --reference`,
-and so is the posgraph line. The state counts are M3/M4's reference-engine
+of room (1,0) to f44 and of room (1,3) to f46 is equal frame by frame
+(states, edges and hulls) between `forward --arith float` and `forward
+--arith float --reference` (48 min and 66 min), and so are the posgraph
+lines. The state counts are M3/M4's reference-engine
 float numbers exactly. The
 float arc gate's search (`--to 35 --win-at 9,101`) finds the optimum 33 in
 3.1 s, its concrete witness the fixed gate's known route, which survives
