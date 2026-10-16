@@ -12,7 +12,10 @@ use super::interp::{Flow, Interp};
 use super::state::State;
 
 /// The builtins that are native rather than written in Lua (`add`,
-/// `foreach`, ... come from the builtin chunks).
+/// `foreach`, ... come from the builtin chunks). FROZEN: these are
+/// `GLOBAL_NAMES` entries, so every block carries their cells (`Bi`) and
+/// the shape hashes depend on them. `__widen_rem`, `__new_vector` and
+/// `__split_at` have no implementation but stay.
 pub const NATIVE: &[&str] = &[
     "__print",
     "__new_unknown_boolean",

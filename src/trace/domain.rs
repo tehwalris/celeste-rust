@@ -476,11 +476,9 @@ pub struct Symbolic<A: GraphArith = Fixed> {
     /// Input cells holding an INTERVAL (`rem.x`/`rem.y`); a value is an
     /// interval exactly when computed from one.
     pub ival_cells: std::collections::BTreeSet<u32>,
-    /// `is_interval`'s memo. This and the four below depend on `ival_cells`
+    /// `is_interval`'s memo. This and the three below depend on `ival_cells`
     /// (dropped by `forget_intervals`).
     ival_memo: std::cell::RefCell<rustc_hash::FxHashMap<NodeId, bool>>,
-    /// `abstractness`'s memo.
-    abstract_memo: std::cell::RefCell<rustc_hash::FxHashMap<NodeId, bool>>,
     /// `lane_undecidable`'s memo.
     undecidable_memo: std::cell::RefCell<rustc_hash::FxHashMap<NodeId, bool>>,
     /// `abstract_beneath_lane_ops`'s memo.
@@ -495,8 +493,6 @@ pub struct Symbolic<A: GraphArith = Fixed> {
     pub assumptions: Vec<NodeId>,
     /// `range_of`'s memo; a comparison the ranges decide folds.
     range_memo: std::collections::HashMap<NodeId, Option<A::Pieces>>,
-    /// Comparisons decided from ranges this frame (a probe stat).
-    pub range_folds: u64,
 }
 
 pub use crate::transpile::garith::Pieces;
@@ -514,20 +510,19 @@ impl<A: GraphArith> Symbolic<A> {
     pub fn clear_ranges(&mut self) {
         self.assumptions.clear();
         self.range_memo.clear();
-        self.range_folds = 0;
     }
 
     /// `ival_cells` changed: `is_interval`'s memo no longer holds.
     pub fn forget_intervals(&mut self) {
         self.ival_memo.get_mut().clear();
-        self.abstract_memo.get_mut().clear();
         self.undecidable_memo.get_mut().clear();
         self.beneath_memo.get_mut().clear();
         self.may_memo.get_mut().clear();
     }
 
     /// THE FORK TRIGGER: can ONE LANE hold this condition both ways? Not
-    /// `abstractness`: a set-valued quantity may still be one value per lane.
+    /// whether it denotes a set: a set-valued quantity may still be one value
+    /// per lane.
     /// `TileFlagAt`/`Mget` are lane-decidable by instruction; `Flr` by
     /// assertion (`zi_flr_ok`, its own error, not a type fact, so
     /// `Known(Flr(..))` must not fold away). Exhaustive over `Op`: no
@@ -567,9 +562,9 @@ impl<A: GraphArith> Symbolic<A> {
         go(self, &mut self.undecidable_memo.borrow_mut(), b)
     }
 
-    /// `abstractness`, STOPPING at operators a lane decides itself (`Flr`,
-    /// `TileFlagAt`, `Mget`): how comparison operands are judged, without
-    /// spurious forks.
+    /// Does `n` denote a SET of values, judged STOPPING at operators a lane
+    /// decides itself (`Flr`, `TileFlagAt`, `Mget`)? How comparison operands
+    /// are judged, without spurious forks.
     pub fn abstract_beneath_lane_ops(&self, n: NodeId) -> bool {
         fn go<A: GraphArith>(d: &Symbolic<A>, memo: &mut rustc_hash::FxHashMap<NodeId, bool>, n: NodeId) -> bool {
             if let Some(x) = memo.get(&n) {
@@ -597,58 +592,6 @@ impl<A: GraphArith> Symbolic<A> {
             r
         }
         go(self, &mut self.beneath_memo.borrow_mut(), n)
-    }
-
-    /// TYPE PROPAGATION: does this node denote a SET of concrete values? Not
-    /// `is_interval` (ZI/ZN typing): here a `Sel` counts its CONDITION (what
-    /// makes it unevaluable), and `Flr` FOLLOWS ITS OPERAND (a singleton only
-    /// on pain of its own error; reading that in would fold `Known(Flr(..))`
-    /// away unsoundly). Every `Op` listed, no catch-all.
-    pub fn abstractness(&self, n: NodeId) -> bool {
-        fn go<A: GraphArith>(g: &Graph<A>, ival: &std::collections::BTreeSet<u32>, memo: &mut rustc_hash::FxHashMap<NodeId, bool>, n: NodeId) -> bool {
-            if let Some(b) = memo.get(&n) {
-                return *b;
-            }
-            let node = g.get(n);
-            let any = |memo: &mut rustc_hash::FxHashMap<NodeId, bool>, xs: &[NodeId]| xs.iter().any(|x| go(g, ival, memo, *x));
-            let args = node.args.clone();
-            let r = match node.op {
-                // Singletons by construction.
-                Op::ConstBool(_) => false,
-                Op::Const(lo, hi) => lo != hi,
-                Op::Cell(c) => ival.contains(&c),
-                // The genuinely unknown atoms.
-                Op::UnknownNum | Op::UnknownBool(_) => true,
-                // A span exists because its bounds are different nodes.
-                Op::Span => true,
-                // A fragment is a narrower interval; validity/coverage masks
-                // follow the operand.
-                Op::Split(_) | Op::Frag(_) | Op::RSplit(_) | Op::RFrag(_) => true,
-                Op::SplitInt(_) | Op::IntFrag(_) => false,
-                Op::SplitValid(_) | Op::SplitOk(_) | Op::FragOk(_) => any(memo, &args),
-                Op::RSplitValid(_) | Op::RSplitOk(_) | Op::RFragOk(_) => any(memo, &args),
-                // The ends of an interval are exact numbers.
-                Op::Lo | Op::Hi => false,
-                // A premise is a mask query: every lane decides it.
-                Op::Known | Op::NoWrap => false,
-                // PARTIAL: a singleton only on pain of error.
-                Op::Flr => any(memo, &args),
-                Op::Add | Op::Sub | Op::Mul | Op::Div | Op::Rem | Op::Neg | Op::Abs | Op::Min | Op::Max | Op::Sin => any(memo, &args),
-                // The operand's, narrowed.
-                Op::Restrict(..) => any(memo, &args),
-                // No data output (its uses read the constant).
-                Op::Pin(_) => false,
-                Op::Lt | Op::Le | Op::Gt | Op::Ge | Op::Eq | Op::Same => any(memo, &args),
-                Op::Not | Op::And | Op::Or => any(memo, &args),
-                // The condition counts.
-                Op::Sel => any(memo, &args),
-                // Data, addressed by coordinates that may be sets.
-                Op::Mget | Op::TileFlagAt => any(memo, &args),
-            };
-            memo.insert(n, r);
-            r
-        }
-        go(&self.graph, &self.ival_cells, &mut self.abstract_memo.borrow_mut(), n)
     }
 
     /// The static range of `n` (`GraphArith::pieces_of`: from the restrictions).
@@ -736,25 +679,6 @@ impl<A: GraphArith> Symbolic<A> {
         }
         let zero = A::lit(A::from_i16(0));
         (n, (zero, zero))
-    }
-
-    /// Does boolean `n` read a comparison with an INTERVAL operand (one a lane
-    /// can hold undecided)?
-    pub fn reads_interval_cmp(&self, n: NodeId, memo: &mut std::collections::HashMap<NodeId, bool>) -> bool {
-        if let Some(b) = memo.get(&n) {
-            return *b;
-        }
-        let node = self.graph.get(n);
-        let r = match node.op {
-            Op::Lt | Op::Le | Op::Gt | Op::Ge | Op::Eq => node.args.iter().any(|a| self.is_interval(a)),
-            Op::Not | Op::And | Op::Or | Op::Sel => {
-                let args = node.args.clone();
-                args.iter().any(|a| self.reads_interval_cmp(*a, memo))
-            }
-            _ => false,
-        };
-        memo.insert(n, r);
-        r
     }
 
     /// For boolean `n`: where a lane CAN answer true, and where false (a
@@ -1271,7 +1195,6 @@ impl<A: GraphArith> Domain for Symbolic<A> {
         if self.has_ranges() {
             if let (Some(xs), Some(ys)) = (self.range_of(*a), self.range_of(*b)) {
                 if let Some(r) = A::decide_cmp(&lit, &xs, &ys) {
-                    self.range_folds += 1;
                     return Ok(self.graph.leaf(Op::ConstBool(r)));
                 }
             }
@@ -1851,21 +1774,6 @@ mod tests {
         let node = d.graph.get(done).clone();
         assert!(crate::trace::verify::cone(&d.graph, &[done]).iter().all(|n| d.graph.get(*n).op != Op::UnknownNum), "{node:?}");
         assert!(crate::trace::verify::cone(&d.graph, &[done]).iter().any(|n| matches!(d.graph.get(*n).op, Op::UnknownBool(_))), "the unknown lanes: an atom");
-    }
-
-    /// `abstractness` and `lane_undecidable` answer different questions.
-    #[test]
-    fn abstractness_is_not_the_fork_trigger() {
-        let mut d = Symbolic::<celeste_core::arith::Fixed>::default();
-        let ival = d.graph.leaf(Op::Cell(0));
-        d.ival_cells.insert(0);
-        d.forget_intervals();
-        let flr = d.graph.fold(Op::Flr, vec![ival]);
-        assert!(d.abstractness(flr), "Flr of an interval denotes a set (partial: singleton on pain of error)");
-        let zero = d.graph.leaf(Op::Const(0, 0));
-        let cmp = d.graph.fold(Op::Gt, vec![flr, zero]);
-        assert!(d.abstractness(cmp), "so a comparison on it is abstract too");
-        assert!(!d.lane_undecidable(cmp), "yet a lane decides it, so it must not fork");
     }
 
     /// `x == k` on an interval `x` may be true where `k` is in `x` and false

@@ -1528,32 +1528,6 @@ pub fn pm1_key<A: GraphArith>(player: &Path, st: &State<Symbolic<A>>, d: &Symbol
     Ok(out)
 }
 
-/// Write a concrete button assignment, for the oracle side.
-#[cfg(test)]
-pub fn set_buttons<A: GraphArith>(d: &mut Symbolic<A>, st: &mut State<Symbolic<A>>, bits: &[bool; 6]) -> Result<()> {
-    for (i, b) in bits.iter().enumerate() {
-        let v = d.boolean(*b);
-        iface::set(st, &[iface::key("__button_states"), Step::Idx(i)], Value::Bool(v))?;
-    }
-    Ok(())
-}
-
-/// The input vector for one PERTURBATION of the traced state (checking only
-/// the traced values would pass a graph that folded its inputs away).
-#[cfg(test)]
-pub fn cells_with<A: GraphArith>(iface: &Iface<A>, over: &[(Path, Conc<A>)]) -> Result<Vec<Conc<A>>> {
-    let mut v = iface.init.clone();
-    for (p, c) in over {
-        let i = iface
-            .slots
-            .iter()
-            .position(|q| q == p)
-            .ok_or_else(|| anyhow!("{} is not an input cell", iface::show(p)))?;
-        v[i] = *c;
-    }
-    Ok(v)
-}
-
 /// A traced frame's graph with its six buttons RESOLVED to `bits` (in
 /// `__button_states` order) for the concrete evaluator: the outcomes' cone
 /// specialized into a fresh graph, and the map. Other forks stay standing.
@@ -1572,66 +1546,6 @@ pub fn at_buttons<A: GraphArith>(g: &Graph<A>, f: &Frame<A>, bits: &[bool; 6]) -
     let mut out = g.like();
     let map = g.specialize_subset_into(&cfg, Some(&need), &mut out);
     Ok((out, map))
-}
-
-/// Check one traced frame against the oracle at one (inputs, buttons)
-/// point. Returns `(claiming outcome, fields compared)`.
-#[cfg(test)]
-pub fn check_at<A: GraphArith>(
-    it: &Interp<'_, Symbolic<A>>,
-    f: &Frame<A>,
-    at: &(Graph<A>, Vec<NodeId>),
-    cells: &[Conc<A>],
-    bits: &[bool; 6],
-    oracle: &[(Path, Conc<A>)],
-) -> Result<(usize, usize)> {
-    let env = super::eval::Env {
-        cells,
-        cart: it.cart.clone(),
-        cache: it.cache.clone(),
-    };
-    let (g, map) = (&at.0, &at.1);
-    let mut live: Vec<usize> = Vec::new();
-    for (i, o) in f.outs.iter().enumerate() {
-        if super::eval::eval(g, map[o.guard as usize], &env)? == Conc::Bool(true) {
-            live.push(i);
-        }
-    }
-    // Guards are disjoint and covering: exactly one outcome claims the lane.
-    if live.len() != 1 {
-        bail!("{:?}: {} outcomes claim this assignment, not 1", bits, live.len());
-    }
-    let o = &f.outs[live[0]];
-    if super::eval::eval(g, map[o.error as usize], &env)? != Conc::Bool(false) {
-        bail!("{:?}: the trace declined this assignment (its error holds)", bits);
-    }
-    let mut n = 0;
-    for (p, want) in oracle {
-    // Dead cells are not computed: skipped but counted (deadness unchecked).
-        if o.ubool.contains(p) {
-            continue;
-        }
-        let got = o
-            .fields
-            .iter()
-            .find(|(q, _, _)| q == p)
-            .ok_or_else(|| anyhow!("{:?}: traced state has no {}", bits, iface::show(p)))?;
-        let got = super::eval::eval(g, map[got.1 as usize], &env)?;
-        if got != *want {
-            bail!("{:?}: {} is {:?}, oracle says {:?}", bits, iface::show(p), got, want);
-        }
-        n += 1;
-    }
-    if o.fields.len() + o.ubool.len() != oracle.len() {
-        bail!(
-            "{:?}: traced state has {} scalars + {} dead, oracle has {}",
-            bits,
-            o.fields.len(),
-            o.ubool.len(),
-            oracle.len()
-        );
-    }
-    Ok((live[0], n))
 }
 
 #[cfg(test)]

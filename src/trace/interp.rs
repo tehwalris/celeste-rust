@@ -76,12 +76,8 @@ pub struct Interp<'a, D: Domain> {
     pub trace_start_nodes: usize,
     /// What `printh` printed, compared against real PICO-8 (`lua/probe/`).
     pub prints: Vec<String>,
-    /// Loop bodies traced (`for_body` calls); a probe statistic.
-    pub for_iterations: u64,
     /// Memoized `(room x, room y, flag bit) -> any tile carries it`.
     room_flags: std::collections::HashMap<(i16, i16, i16), bool>,
-    /// Merges that selected on the full guard (`state::Merged::fell_back`).
-    pub merge_fallbacks: usize,
     /// Literal splits handed out: the ids in `State::frag`.
     next_split: usize,
     /// THE ARC CAPTURE (`search::arc_edges`), set per level-0 trace: every
@@ -119,9 +115,7 @@ impl<'a, D: Domain> Interp<'a, D> {
             max_nodes: 2_000_000,
             trace_start_nodes: 0,
             prints: Vec::new(),
-            for_iterations: 0,
             room_flags: std::collections::HashMap::new(),
-            merge_fallbacks: 0,
             next_split: 0,
             arc_capture: false,
             split_site: None,
@@ -281,22 +275,12 @@ impl<'a, D: Domain> Interp<'a, D> {
             }
             live = self.collapse(next)?;
             if live.len() > self.max_states {
-                let mut hist: std::collections::BTreeMap<&str, usize> = Default::default();
-                for (st, f) in &live {
-                    let k = match f {
-                        Flow::Normal => "normal",
-                        Flow::Break => "break",
-                        Flow::Return(_) => "return",
-                    };
-                    let _ = st;
-                    *hist.entry(k).or_default() += 1;
-                }
-                eprintln!("[trace] frontier by flow: {:?}", hist);
                 bail!(
-                    "frontier grew to {} states (limit {}) - something is fanning out \
+                    "frontier grew to {} states (limit {}, {} of them returned) - something is fanning out \
                      without merging back",
                     live.len(),
-                    self.max_states
+                    self.max_states,
+                    live.iter().filter(|(_, f)| matches!(f, Flow::Return(_))).count()
                 );
             }
             if self.d.node_count().saturating_sub(self.trace_start_nodes) > self.max_nodes {
@@ -521,7 +505,6 @@ impl<'a, D: Domain> Interp<'a, D> {
                         continue;
                     }
                 }
-                self.merge_fallbacks += m.fell_back as usize;
                 let fl = self.join_flow(&m.cond, &outs[i].1, &outs[j].1);
                 let state = m.state;
                 outs.remove(j);
@@ -557,7 +540,6 @@ impl<'a, D: Domain> Interp<'a, D> {
                     pairing.refuse(i, j);
                     continue;
                 }
-                self.merge_fallbacks += m.fell_back as usize;
                 let v = self.join_value(&m.cond, &outs[i].1.clone(), &outs[j].1.clone());
                 let state = m.state;
                 outs.remove(j);
@@ -743,7 +725,6 @@ impl<'a, D: Domain> Interp<'a, D> {
         iv: &D::Num,
         mut cur: State<D>,
     ) -> Result<Outcome<D>> {
-        self.for_iterations += 1;
         let body_scope = cur.heap.new_scope(Some(cur.scope));
         cur.heap.declare(body_scope, name, Value::Num(iv.clone()));
         let outer = cur.scope;
@@ -1735,9 +1716,9 @@ impl<'a, D: Domain> Interp<'a, D> {
                 (st, Value::Nil)
             }
             // The forks (`split_floor`; `__split_by_round` below).
-            "__split_by_flr" | "__split_at" | "__split_by_round" => {
+            "__split_by_flr" | "__split_by_round" => {
                 let x = num(0)?;
-                let site = match (self.arc_capture && name != "__split_at", self.split_site.take()) {
+                let site = match (self.arc_capture, self.split_site.take()) {
                     (false, _) => None,
                     (true, Some(site)) => Some(site),
                     (true, None) => bail!("arc capture: a `{name}` call the tracer did not see the argument of"),

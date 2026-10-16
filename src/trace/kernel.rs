@@ -599,9 +599,7 @@ pub fn room_constant_lattice<A: GraphArith>(
 
     let mut lattice: std::collections::BTreeMap<String, std::collections::BTreeMap<super::iface::Path, super::iface::Conc<A>>> = Default::default();
     let mut reps: std::collections::BTreeMap<String, super::state::State<Symbolic<A>>> = Default::default();
-    let mut forks: std::collections::BTreeMap<String, usize> = Default::default();
     let mut frames: std::collections::BTreeMap<WalkNode, WalkFrame<A>> = Default::default();
-    let mut forkops: std::collections::BTreeMap<String, Vec<String>> = Default::default();
     let mut refused: std::collections::BTreeMap<WalkNode, String> = Default::default();
     // Poisoned paths by reason, summed over jobs.
     let mut illegal: std::collections::BTreeMap<String, usize> = Default::default();
@@ -746,7 +744,7 @@ pub fn room_constant_lattice<A: GraphArith>(
                     refused.insert(job.node.clone(), e);
                     frames.remove(&job.node);
                 }
-                WalkTraced::Traced { frame, bound, forks: live_forks, forkops: ops, nodes_added, arena, outs, skipped, illegal: poisoned, can_raise } => {
+                WalkTraced::Traced { frame, bound, nodes_added, arena, outs, skipped, illegal: poisoned, can_raise } => {
                     for (why, n) in poisoned {
                         *illegal.entry(why).or_default() += n;
                     }
@@ -754,10 +752,6 @@ pub fn room_constant_lattice<A: GraphArith>(
                         raising.insert(job.node.clone());
                     }
                     refused.remove(&job.node);
-                    forks.insert(k.clone(), live_forks);
-                    if live_forks > 2 {
-                        forkops.insert(k.clone(), ops);
-                    }
                     if lattice_trace {
                         eprintln!(
                             "[lattice] trace shape #{} region {:?} ({} pinned): {} outcomes, {} nodes added ({} in the worker's arena)",
@@ -913,12 +907,11 @@ pub fn room_constant_lattice<A: GraphArith>(
             nodes.len()
         );
     }
-    let graph = it.d.graph.clone();
     let mut by_hash = std::collections::HashMap::new();
     for ((k, _), wf) in &frames {
         by_hash.insert(wf.frame.in_rt2.shape_hash_of(), k.clone());
     }
-    Ok(LatticeWalk { lattice, reps, forks, frames, graph, cart: cart_data, cache, forkops, tracer: Tracer { it, reset, fr }, by_hash, opts, start_key, ival_extra, start_ivals })
+    Ok(LatticeWalk { lattice, reps, frames, cart: cart_data, cache, tracer: Tracer { it, reset, fr }, by_hash, start_key, ival_extra, start_ivals })
 }
 
 /// The interval inputs the level's widenings make (`widen::interval_input`:
@@ -972,8 +965,6 @@ enum WalkTraced<A: GraphArith = Fixed> {
     Traced {
         frame: super::verify::Frame<A>,
         bound: std::result::Result<Bound<A>, String>,
-        forks: usize,
-        forkops: Vec<String>,
         nodes_added: usize,
         arena: usize,
         outs: Vec<WalkOutcome<A>>,
@@ -1003,7 +994,6 @@ fn walk_trace<A: GraphArith>(
 ) -> Result<WalkTraced<A>> {
     use super::domain::Domain;
     use super::{shapes, verify};
-    use crate::transpile::graph::Op;
     // `illegal` accumulates per worker, so both `WalkTraced` exits DRAIN it.
     debug_assert!(tr.it.illegal.is_empty(), "a previous job left {} poison reasons behind", tr.it.illegal.len());
     tr.it.illegal.clear();
@@ -1017,28 +1007,6 @@ fn walk_trace<A: GraphArith>(
         Err(e) => return Ok(WalkTraced::Refused(format!("{:#}", e), std::mem::take(&mut tr.it.illegal))),
     };
     let nodes_added = tr.it.d.node_count().saturating_sub(tr.it.trace_start_nodes);
-    // Live forks of THIS trace.
-    let (live_forks, forkops) = {
-        let g = &tr.it.d.graph;
-        let mut rn: Vec<crate::transpile::graph::NodeId> = Vec::new();
-        for o in &f.outs {
-            for (_, nd, _) in &o.fields {
-                rn.push(*nd);
-            }
-            rn.push(o.guard);
-            rn.push(o.error);
-        }
-        let reach = crate::transpile::bdd::reachable(g, &rn);
-        let splits: Vec<u32> = (0..g.len()).filter(|&id| reach[id] && matches!(g.get(id as u32).op, Op::Split(_))).map(|id| id as u32).collect();
-        let mut live = std::collections::BTreeSet::new();
-        for &id in &splits {
-            if let Op::Split(d) = g.get(id).op {
-                live.insert(d);
-            }
-        }
-        let ops: Vec<String> = if live.len() > 2 { splits.iter().map(|&id| super::emit::show_tree(g, g.get(id).args[0], 5)).collect() } else { Vec::new() };
-        (live.len(), ops)
-    };
     let mut outs = Vec::new();
     let mut skipped = Vec::new();
     for o in &f.outs {
@@ -1081,7 +1049,7 @@ fn walk_trace<A: GraphArith>(
     let illegal = std::mem::take(&mut tr.it.illegal);
     // Decided HERE: `f.raise` names a node of this worker's arena.
     let can_raise = tr.it.d.decide(&f.raise) != Some(false);
-    Ok(WalkTraced::Traced { frame: f, bound, forks: live_forks, forkops, nodes_added, arena: tr.it.d.node_count(), outs, skipped, illegal, can_raise })
+    Ok(WalkTraced::Traced { frame: f, bound, nodes_added, arena: tr.it.d.node_count(), outs, skipped, illegal, can_raise })
 }
 
 /// The tracer a walk ran in, kept to re-trace a shape in the same arena.
@@ -1109,18 +1077,14 @@ pub struct LatticeWalk<A: GraphArith = Fixed> {
     pub tracer: Tracer<A>,
     /// Shape hash (of the input structure) -> the walk's shape key.
     pub by_hash: std::collections::HashMap<u64, String>,
-    pub opts: crate::abstraction::Level,
     /// The start state's shape key.
     pub start_key: String,
     pub lattice: std::collections::BTreeMap<String, std::collections::BTreeMap<super::iface::Path, super::iface::Conc<A>>>,
     pub reps: std::collections::BTreeMap<String, super::state::State<super::domain::Symbolic<A>>>,
-    pub forks: std::collections::BTreeMap<String, usize>,
     /// Per (shape, region), its converged frame, bounds and binding.
     pub frames: std::collections::BTreeMap<WalkNode, WalkFrame<A>>,
-    pub graph: crate::transpile::graph::Graph<A>,
     pub cart: std::sync::Arc<celeste_core::cart_data::CartData>,
     pub cache: std::sync::Arc<celeste_core::collision_cache::CollisionCache>,
-    pub forkops: std::collections::BTreeMap<String, Vec<String>>,
     /// Per shape, input slots a reachable frame wrote an `rnd`-derived
     /// interval to, typed as interval inputs. Monotone.
     pub ival_extra: std::collections::BTreeMap<String, std::collections::BTreeSet<super::iface::Path>>,

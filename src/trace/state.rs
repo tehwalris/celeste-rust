@@ -125,9 +125,6 @@ pub struct Merged<D: Domain> {
     pub state: State<D>,
     /// The condition every merged value selects on - true on `t`'s lanes.
     pub cond: D::Bool,
-    /// The paths did not diverge at one shared decision (not siblings), so
-    /// `cond` is `t.guard`, which is always correct.
-    pub fell_back: bool,
     /// A select survived the merge in a heap value, so the kernel reads
     /// `cond`'s value bit on this state's lanes.
     pub selects: bool,
@@ -284,12 +281,14 @@ fn merge_inner<D: Domain>(
     // The separating decision (`State::path`).
     let l = common_prefix(&t, &f);
     let rejoin = over.is_some();
-    let (cond, fell_back) = match (over,t.path.get(l), f.path.get(l)) {
-        (Some(c), _, _) => (c, false),
+    // Paths not diverging at one shared decision (not siblings) select on
+    // `t.guard`, which is always correct.
+    let cond = match (over, t.path.get(l), f.path.get(l)) {
+        (Some(c), _, _) => c,
         (None, Some((ct, pt)), Some((cf, pf))) if ct == cf && pt != pf => {
-            (if *pt { ct.clone() } else { d.not(ct) }, false)
+            if *pt { ct.clone() } else { d.not(ct) }
         }
-        _ => (t.guard.clone(), true),
+        _ => t.guard.clone(),
     };
     let cond = &cond;
     let path: Vec<(D::Bool, bool)> = t.path[..l].to_vec();
@@ -403,7 +402,7 @@ fn merge_inner<D: Domain>(
         frag: t.frag.clone(),
         arc,
     };
-    Ok(Some(Merged { state, cond: cond.clone(), fell_back, selects, first_select }))
+    Ok(Some(Merged { state, cond: cond.clone(), selects, first_select }))
 }
 
 /// A slot of a merge, in `t`'s numbering.
@@ -609,8 +608,7 @@ mod tests {
         let (tg, fg) = (t.guard, f.guard);
 
         let m = merge(&mut d, &t, &f).unwrap().expect("same shape merges");
-        assert!(!m.fell_back, "siblings share a split, so no fallback");
-        assert_eq!(m.cond, c, "the select condition is the branch condition");
+        assert_eq!(m.cond, c, "siblings share a split: the select condition is the branch condition");
         let x = match m.state.heap.tables[&m.state.globals].hash["x"] {
             Value::Num(n) => n,
             ref v => panic!("expected a number, got {:?}", v),
@@ -627,7 +625,6 @@ mod tests {
         q.guard = c;
         q.path = vec![(c, false)];
         let m = merge(&mut d, &p, &q).unwrap().expect("same shape merges");
-        assert!(m.fell_back);
         assert_eq!(m.cond, g);
     }
 
