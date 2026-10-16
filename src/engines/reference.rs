@@ -1,28 +1,31 @@
-//! `RefEngine`: the reference interpreter (`Interp<RefDomain>`) as a frame
-//! step on blocks. One lane in, every fork leaf out as a keyed one-row block,
-//! so a reference successor keys like a kernel row. Slow by design (one lane,
-//! one path at a time).
+//! THE REFERENCE ENGINE: the tracer's interpreter over `RefDomain`
+//! (`trace::refdomain`) as a frame step on blocks. One lane in, every fork
+//! leaf out as a keyed one-row block, so a reference successor keys like a
+//! kernel row. Slow by design (one lane, one path at a time).
+//!
+//! `Interp<RefDomain>` runs ONE scalar path of a frame; `run_frame_all`
+//! enumerates the fork tree depth-first by re-execution (run to a leaf,
+//! record the output, `cursor.advance()`, re-run). The cursor is the only
+//! state carried across reruns: the input is cloned per path, so nothing is
+//! snapshotted or backtracked. A lane of a block becomes a state, and a leaf
+//! a block, through the one converter (`trace::block`).
 
-use anyhow::{ensure, Result};
-
-use celeste_engine::runtime2::Rt2;
+use anyhow::{bail, ensure, Result};
+use celeste_core::arith::{Arithmetic, EngineNum, Fixed, Float};
+use celeste_core::pico8_num::Pico8Num;
+use celeste_engine::runtime2::{Rt2, AV};
 use full_moon::ast;
 
-use crate::frame::Block;
 use crate::abstraction::Level;
-use crate::trace::interp::Interp;
-use crate::trace::block::{fn_info_of, FnInfo};
-use crate::trace::refbridge::{from_block, set_buttons, to_block};
-use crate::trace::refdomain::RefDomain;
-use crate::trace::refdriver::run_frame_all;
-use celeste_core::arith::{Arithmetic, EngineNum, Fixed, Float};
-use crate::trace::heap::Value;
-use crate::trace::iface;
-use crate::trace::state::State;
-use crate::trace::widen::{field, objects_of_type};
-use crate::trace::state::ArcAxis;
+use crate::frame::Block;
 use crate::search::rem::{Capture, Rem};
-use celeste_core::pico8_num::Pico8Num;
+use crate::trace::block::{self, fn_info_of, FnInfo, BUTTON_GLOBAL};
+use crate::trace::heap::{TableId, Value};
+use crate::trace::iface;
+use crate::trace::interp::Interp;
+use crate::trace::refdomain::{Cursor, RefDomain};
+use crate::trace::state::{ArcAxis, State};
+use crate::trace::widen::{field, objects_of_type};
 
 /// The reference engine of arithmetic `A`: `RefEngine` is the real game's
 /// (16.16), the oracle of the kernels; `FloatRefEngine` the float tools'
@@ -36,7 +39,7 @@ pub struct ReferenceEngine<A: Arithmetic> {
     /// The post-`_init` state: the room's start, and what a block does not carry.
     base: State<RefDomain<A>>,
     fn_info: FnInfo,
-    /// The most fork paths one frame may take (`refdriver::TooManyPaths`).
+    /// The most fork paths one frame may take (`TooManyPaths`).
     path_cap: usize,
     /// The level `run_lane` (the engine as a `FrameStep`) forks a row's
     /// unknowns at: `Level::EXACT` unless `at_level`.
@@ -70,7 +73,7 @@ impl<A: Arithmetic> ReferenceEngine<A> {
         self
     }
 
-    /// At most `cap` fork paths a frame, else `refdriver::TooManyPaths`
+    /// At most `cap` fork paths a frame, else `TooManyPaths`
     /// (default 1M): a sampled check's bound on one step's time and memory.
     pub fn set_path_cap(&mut self, cap: usize) {
         self.path_cap = cap;
@@ -79,15 +82,6 @@ impl<A: Arithmetic> ReferenceEngine<A> {
     /// The room's start (post-`_init`) as a state.
     pub fn start_state(&self) -> &State<RefDomain<A>> {
         &self.base
-    }
-
-    /// One whole GAME frame of a state under EVERY input: the buttons are
-    /// forks (the cursor takes each value a read needs), as are the state's
-    /// intervals where a branch reads them (`move`'s remainder fragments).
-    /// Every leaf (`rewrite census`). Not under the split frame.
-    pub fn frame_all_inputs(&mut self, st: &State<RefDomain<A>>) -> Result<Vec<State<RefDomain<A>>>> {
-        anyhow::ensure!(self.settings.steps_per_frame() == 1, "frame_all_inputs: not under the split frame");
-        run_frame_all(&mut self.it, self.body, st, &[], Level::EXACT, self.path_cap)
     }
 
     /// One whole GAME frame of a CONCRETE state under input `byte` (bit 0
@@ -268,7 +262,7 @@ impl<A: crate::transpile::garith::GraphArith> ReferenceEngine<A> {
     /// The one converter agrees across the two sides on every lane of `row`
     /// (`block::check_agreement`, from this engine's base state).
     pub fn check_agreement(&self, row: &Rt2<A::Num>) -> Result<()> {
-        crate::trace::block::check_agreement::<A>(row, &self.fn_info, &self.base, self.settings.room)
+        check_agreement::<A>(row, &self.fn_info, &self.base, self.settings.room)
     }
 }
 
@@ -533,6 +527,208 @@ impl<N: Rem> crate::frame::FrameStep<N> for RefFrameStep<N> {
     fn settings(&self) -> std::sync::Arc<crate::settings::Settings> {
         self.settings.clone()
     }
+}
+
+// ------------------------------------------------ one frame, every path
+
+/// Run one frame of `body` from `input` along every fork path; one output state
+/// per leaf. For a game frame `body` is
+/// `__reset_button_states()\n_update()\n_draw()`, so the buttons are forks too.
+///
+/// `it` must have the cart's functions registered; its `d.cursor` is the DFS
+/// state. A path that REFUSES (e.g. a fork premise a lane cannot satisfy) is
+/// an error; a path that RAISES has no successor.
+///
+/// `unknown` names the input's unknown-boolean fields (`block::from_block`):
+/// each is a cursor choice made before the frame runs, as the kernels fork them.
+///
+/// More than `cap` paths is an error, `TooManyPaths` (every path's output is
+/// held: the cap bounds the memory).
+pub fn run_frame_all<'a, A: Arithmetic>(
+    it: &mut Interp<'a, RefDomain<A>>,
+    body: &'a ast::Ast,
+    input: &State<RefDomain<A>>,
+    unknown: &[(crate::trace::heap::TableId, String)],
+    level: crate::abstraction::Level,
+    cap: usize,
+) -> Result<Vec<State<RefDomain<A>>>> {
+    it.d.cursor = Cursor::new();
+    let mut outputs = Vec::new();
+    let mut paths = 0usize;
+    // An unknown fly fruit needs nothing here: its `fly` is an unknown
+    // boolean (forked below), `step`/`y` the unknown number and `spd.y`/
+    // `rem.y` intervals, whose comparisons the domain forks
+    // (`RefDomain::compare`) as the kernels' undecided atoms do. Unknown
+    // platforms have no reference form yet.
+    if level.platforms {
+        anyhow::bail!("the reference engine does not run platforms-unknown levels (`p`, plans/abstractions.md)");
+    }
+    loop {
+        it.d.cursor.reset();
+        it.prints.clear();
+        let mut st = input.clone();
+        for (t, k) in unknown {
+            let b = it.d.cursor.choose(2) == 1;
+            st.heap.tables.get_mut(t).expect("an unknown field's table").hash.insert(k.clone(), crate::trace::heap::Value::Bool(b));
+        }
+        if level.floors_near {
+            concretize_near_floors(&mut st, &mut it.d)?;
+        }
+        // A path that RAISES (`Interp::poison`) ends in no state, and only then.
+        it.raised.clear();
+        let ended = it.exec_block(body.nodes(), st).map_err(|e| e.context(format!("fork path {}", paths + 1)))?;
+        match ended.len() {
+            0 => anyhow::ensure!(!it.raised.is_empty(), "a frame path ended in no state without a raise"),
+            1 => {
+                let (mut out, flow) = ended.into_iter().next().expect("one state");
+                anyhow::ensure!(!matches!(flow, crate::trace::interp::Flow::Break), "break at chunk toplevel");
+                // The absent-as-zero fields, as the tracer's `trace_frame` writes them.
+                crate::trace::widen::materialize_absent_fields(&mut out, &mut it.d)?;
+                outputs.push(out);
+            }
+            n => bail!("a frame path ended in {n} states (expected one, or none after a raise)"),
+        }
+        paths += 1;
+        if paths > cap {
+            return Err(TooManyPaths(cap).into());
+        }
+        if !it.d.cursor.advance() {
+            break;
+        }
+    }
+    Ok(outputs)
+}
+
+/// `run_frame_all` stopped at its path cap.
+#[derive(Debug)]
+pub struct TooManyPaths(pub usize);
+
+impl std::fmt::Display for TooManyPaths {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(f, "run_frame_all: more than {} fork paths in one frame", self.0)
+    }
+}
+
+impl std::error::Error for TooManyPaths {}
+
+/// A near level's floors, concretized per path as the kernels read them
+/// (`Hook::NearFloor`'s input, `widen::read_near_floors`): a widened `state` (an interval) is each
+/// whole number in it, by the cursor, and `collideable` is `state ~= 2` - the
+/// cart keeps the two in step, so a stored unknown `collideable` is not a
+/// separate choice.
+fn concretize_near_floors<A: Arithmetic>(st: &mut State<RefDomain<A>>, d: &mut RefDomain<A>) -> Result<()> {
+    use crate::trace::heap::Value;
+    use crate::trace::iface;
+    use crate::trace::widen::{field, objects_of_type};
+    for obj in objects_of_type(st, "fall_floor") {
+        let (ps, pc) = (field(&obj, &["state"]), field(&obj, &["collideable"]));
+        let Some(Value::Num(v)) = iface::get(st, &ps) else { bail!("{}: not a number", iface::show(&ps)) };
+        let int = |n| A::as_i16(n).ok_or_else(|| anyhow::anyhow!("{}: {} is not an integer", iface::show(&ps), A::show(n)));
+        let (lo, hi) = A::bounds(v);
+        let (lo, hi) = (int(lo)?, int(hi)?);
+        let k = lo + d.cursor.choose((hi - lo + 1) as u32) as i16;
+        iface::set(st, &ps, Value::Num(A::point(A::from_i16(k))))?;
+        iface::set(st, &pc, Value::Bool(k != 2))?;
+    }
+    Ok(())
+}
+
+// ------------------------------------- a lane of a block <-> a state
+
+/// Lane `lane` of a block as a reference state of the block's arithmetic
+/// (plus the base state's builtins), and its unknown-boolean fields except
+/// the buttons, for the driver to fork (`block::from_block`).
+pub fn from_block<N: EngineNum>(
+    rt2: &Rt2<N>,
+    lane: usize,
+    fn_info: &FnInfo,
+    base: &State<RefDomain<N::A>>,
+) -> Result<(State<RefDomain<N::A>>, Vec<(TableId, String)>)> {
+    block::from_block(&mut RefDomain::<N::A>::new(), rt2, lane, fn_info, base)
+}
+
+/// Set the six buttons of a reference state from an input byte (bit 0 left,
+/// 1 right, 2 up, 3 down, 4 jump, 5 dash). Returns the button table.
+pub fn set_buttons<A: celeste_core::arith::Arithmetic>(st: &mut State<RefDomain<A>>, byte: u8) -> Result<TableId> {
+    let Some(Value::Table(t)) = st.heap.tables[&st.globals].hash.get(BUTTON_GLOBAL).cloned() else {
+        bail!("no {BUTTON_GLOBAL} table")
+    };
+    let arr = &mut st.heap.tables.get_mut(&t).expect("a live table").arr;
+    for (i, b) in arr.iter_mut().enumerate() {
+        *b = Value::Bool(byte >> i & 1 == 1);
+    }
+    Ok(t)
+}
+
+/// A reference state as a one-lane block (`block::to_rt2`, no row keys:
+/// `frame::Block::canonical` makes them canonical; a tree keys them).
+/// `room`: the search's start room (the block's cart and collision cache).
+pub fn to_block<N: EngineNum>(st: &State<RefDomain<N::A>>, room: (i16, i16)) -> Result<Rt2<N>> {
+    let (cart, cache) = crate::compiled::room_context(room)?;
+    block::to_rt2(
+        st,
+        cart,
+        cache,
+        |iv| {
+            Ok(match <N::A as Arithmetic>::as_point(*iv) {
+                Some(n) => AV::Num(n),
+                None => {
+                    let (lo, hi) = <N::A as Arithmetic>::bounds(*iv);
+                    AV::Ival(lo, hi)
+                }
+            })
+        },
+        |b| Ok(AV::Bool(*b)),
+    )
+}
+
+/// THE TWO SIDES AGREE on a block: every lane of `rt2`, read into the
+/// reference's domain and into the tracer's (`from_block`), converts back
+/// to ONE block - the same structure, shape, values and exact key - and the
+/// tracer's skeleton of it (what its kernels bind) has that shape. The
+/// tracer's numbers and booleans are a block's values here, so constants,
+/// read off its graph. `base` and `fn_info`: the reference engine's.
+fn check_agreement<A: crate::transpile::garith::GraphArith>(rt2: &Rt2<A::Num>, fn_info: &FnInfo, base: &State<RefDomain<A>>, room: (i16, i16)) -> Result<()> {
+    use crate::trace::block::{skeleton, to_rt2};
+    use crate::trace::domain::Symbolic;
+    use crate::transpile::graph::{NodeId, Op};
+    use celeste_engine::exact::exact_rows;
+    use celeste_engine::runtime2::Col;
+    let (cart, cache) = crate::compiled::room_context(room)?;
+    let ids = crate::compiled::ids();
+    for lane in 0..rt2.width {
+        let (reference, _) = from_block(rt2, lane, fn_info, base)?;
+        let mut a: Rt2<A::Num> = to_block(&reference, room)?;
+        let mut d = Symbolic::<A>::default();
+        let (traced, _) = block::from_block(&mut d, rt2, lane, fn_info, base)?;
+        let g = &d.graph;
+        let num = |n: &NodeId| match g.get(*n).op {
+            Op::Const(lo, hi) if lo == hi => Ok(AV::Num(A::from_lit(lo))),
+            Op::Const(lo, hi) => Ok(AV::Ival(A::from_lit(lo), A::from_lit(hi))),
+            ref other => bail!("lane {lane}: a traced number {other:?}, not a constant"),
+        };
+        let boolean = |b: &NodeId| match g.get(*b).op {
+            Op::ConstBool(v) => Ok(AV::Bool(v)),
+            ref other => bail!("lane {lane}: a traced boolean {other:?}, not a constant"),
+        };
+        let mut b = to_rt2(&traced, cart.clone(), cache.clone(), num, boolean)?;
+        let s = skeleton::<_, A::Num>(&traced, cart.clone(), cache.clone())?;
+        let first = |x: &Rt2<A::Num>, y: &Rt2<A::Num>| (0..x.structure.len().max(y.structure.len())).find(|&c| x.structure.get(c) != y.structure.get(c) || x.cols.get(c) != y.cols.get(c));
+        ensure!(
+            a.structure == b.structure && a.cols == b.cols && a.globals == b.globals && a.strings == b.strings,
+            "lane {lane}: the reference's block and the tracer's differ, first at cell {:?}",
+            first(&a, &b)
+        );
+        let pointers = |x: &Rt2<A::Num>| -> Vec<Option<AV<A::Num>>> { x.cols.iter().map(|c| matches!(c, Col::U(AV::Ptr(_))).then(|| c.at(0))).collect() };
+        ensure!(
+            s.structure == a.structure && s.globals == a.globals && pointers(&s) == pointers(&a) && s.shape_hash == a.shape_hash,
+            "lane {lane}: the tracer's skeleton is not the reference block's shape"
+        );
+        a.canonical();
+        b.canonical();
+        ensure!(exact_rows(&a, ids) == exact_rows(&b, ids), "lane {lane}: the reference's block and the tracer's key differently");
+    }
+    Ok(())
 }
 
 #[cfg(test)]

@@ -46,7 +46,7 @@ checks that they agree. The table below is GENERATED
 - **Fork after the frame, never eagerly** (Philippe, 2026-09-21): the
   eager point split made every outcome's `live` read every comparison
   (room (6,0) `r0sxhp`: 2^70 bodies an outcome). Forks happen only where an
-  undecided select survives folding (`verify::split_undecided_selects`).
+  undecided select survives folding (`split::split_undecided_selects`).
 - **The reference engine as a frame step refuses `p`** (no reference form
   for the worlds); `h`, `f` and `n` it forks per path. The concrete
   search's own steps are exact whatever the level.
@@ -104,7 +104,7 @@ checks that they agree. The table below is GENERATED
 - **spring phase** (over-approximation). The spring's sprite (0 hidden, 18 ready, 19 compressed) its range, so `spr == 18` splits like a floor's state; its countdowns the unknown number. Its update becomes "maybe bounce". Refuted by the CONCRETE SEARCH.
 - **balloon phase** (over-approximation). The balloon's sprite (0 popped, 22 present) its range and its `y` the bob band `start +- 2` (the bob runs only when `spr == 22`, and an exact `y` would give every state a twin). Its update becomes "maybe refill the dash". The phase `offset` is read only as `sin(offset)` into `y`, so one period [0, 1) covers every `y` the bob makes (an unseeded `rnd` phase is that period already; a SEEDED one, which the float tools always set, would otherwise split on every undecided `spr == 22`: room (4,2)'s six balloons made f^6 states before the player). Refuted by the CONCRETE SEARCH.
 - **near fall floor** (over-approximation). Each fall floor's `state` [0, 2] and `collideable` unknown, EXCEPT where a player certainly overlaps the floor at the frame's end (there the cart's invariant, hidden, owed; with `p` the computed value). The input derives `collideable` as `state ~= 2` (the cart keeps them in step). Refuted by the CONCRETE SEARCH or the ladder `r0sxhn,r0sxh`.
-- **platform path** (over-approximation). Every moving platform's `x` the interval of its whole path [-16, 128] (the wrap keeps it inside, proved on the traced select or owed), `last` the same node (`last == x` at every frame boundary, checked). The worlds (`concrete::platform_worlds`) keep the platforms mutually consistent (`verify::Points`). Refuted by the CONCRETE SEARCH (the reference engine refuses `p`).
+- **platform path** (over-approximation). Every moving platform's `x` the interval of its whole path [-16, 128] (the wrap keeps it inside, proved on the traced select or owed), `last` the same node (`last == x` at every frame boundary, checked). The worlds (`concrete::platform_worlds`) keep the platforms mutually consistent (`split::Points`). Refuted by the CONCRETE SEARCH (the reference engine refuses `p`).
 - **platform remainder** (over-approximation). A platform's `rem.x` the whole remainder, read as the literal (owed per lane): a pixel of slack at this level. Refuted by the CONCRETE SEARCH.
 - **balloon offset** (EXACT). The balloon's `rnd` phase is read only through `sin(offset)`, and `sin` of a full period is [-1, 1] whatever the interval's ends, so a full-period interval is stored as the canonical [0, 1) (a point, a seeded phase, is left). Room (5,0) reaches the same balloon-free states with it.
 - **absent fall floor delay** (EXACT). A fall floor gains `delay` only when it first breaks, which made "which floors ever broke" heap shape. A missing `delay` is written as 0: the cart can tell nil from 0 only by raising (`delay - 1`, `delay <= 0` halt PICO-8 on nil), and `cart::check_absent_fields` refuses a cart that reads it any other way. Exact on every execution that does not raise.
@@ -122,7 +122,7 @@ side. Two things a slot cannot say are HOOKS:
   (`widen::PLAYER_PROBE`); the input derives `collideable` from `state`.
 - **`PlatformInputs`** (`p`): the input is per WORLD (which world platform
   an object is, `x` restricted to the path and recorded for
-  `verify::Points`, `spd.x` bound by the worlds).
+  `split::Points`, `spd.x` bound by the worlds).
 
 Not in the table: `rnd` (the cart's own draw, below); the region key (a
 dispatch); the bounds a kernel assumes (`Restrict`, pins: assumptions on an

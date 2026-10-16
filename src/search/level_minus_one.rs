@@ -1,7 +1,8 @@
 //! LEVEL -1 (plans/level-minus-one.md): a POSITION-ONLY cost-to-go table for
-//! the start room, from the traced frame graphs; the search uses it as a
-//! filter (`--level-minus-one H,S`), `transpile --probe`
-//! checks it (`probe`).
+//! the start room, from the traced frame graphs, built by `table` (once per
+//! process and key, cached on disk); the search uses it as a filter
+//! (`--level-minus-one H,S`), `rewrite l1 probe` checks it against a tree
+//! (`probe`).
 //!
 //! A node is (heap shape, cell of the player or player spawn); every other
 //! input is a range or unknown per shape (`rem` [-0.5, 0.5), speed [-S, S],
@@ -25,18 +26,19 @@
 //! DEATH (a dead end), cells outside `WINDOW` (clipped). A level-0 tree's
 //! recorded transitions check that none dropped a real move.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path as FsPath, PathBuf};
 
 use anyhow::{anyhow, bail, ensure, Result};
 
 use celeste_core::arith::{Arithmetic, EngineNum, Fixed, Float};
 
-use super::domain::{Domain, Symbolic};
-use super::heap::Value;
-use super::iface::{self, Conc, Path, Step};
-use super::kernel::{LatticeWalk, Tracer};
-use super::state::State;
+use crate::trace::domain::{Domain, Symbolic};
+use crate::trace::heap::Value;
+use crate::trace::iface::{self, Conc, Path, Step};
+use crate::trace::walk::{LatticeWalk, Tracer};
+use crate::trace::state::State;
+use crate::trace::widen::field;
 use crate::transpile::garith::{value_box, GraphArith};
 use crate::transpile::graph::{Graph, NodeId, Op, Room, Val};
 
@@ -183,24 +185,7 @@ fn berry_left_behind<A: GraphArith>(st: &State<Symbolic<A>>, d: &Symbolic<A>, ro
 
 /// The player, else the player spawn (`pos_graph::player_object`'s rule).
 fn located_object<A: GraphArith>(st: &State<Symbolic<A>>) -> Option<Path> {
-    if let Some(p) = super::shapes::player_path(st) {
-        return Some(p);
-    }
-    let Some(Value::Table(want)) = iface::get(st, &[iface::key("player_spawn")]) else { return None };
-    let Some(Value::Table(objects)) = iface::get(st, &[iface::key("objects")]) else { return None };
-    (0..st.heap.tables[&objects].arr.len()).map(|i| vec![iface::key("objects"), Step::Idx(i)]).find(|base| {
-        let mut ty = base.clone();
-        ty.push(iface::key("type"));
-        iface::get(st, &ty) == Some(Value::Table(want))
-    })
-}
-
-fn with(base: &Path, names: &[&str]) -> Path {
-    let mut p = base.clone();
-    for n in names {
-        p.push(iface::key(n));
-    }
-    p
+    crate::trace::shapes::player_path(st).or_else(|| crate::trace::widen::objects_of_type(st, "player_spawn").into_iter().next())
 }
 
 /// Is `p` an object's `rem.x/y`?
@@ -216,7 +201,7 @@ fn motion_paths<A: GraphArith>(st: &State<Symbolic<A>>) -> Vec<Path> {
         let base = vec![iface::key("objects"), Step::Idx(i)];
         for sub in ["rem", "spd"] {
             for ax in ["x", "y"] {
-                let p = with(&base, &[sub, ax]);
+                let p = field(&base, &[sub, ax]);
                 if matches!(iface::get(st, &p), Some(Value::Num(_))) {
                     out.push(p);
                 }
@@ -386,16 +371,16 @@ impl<A: GraphArith> Table<'_, A> {
         let t0 = std::time::Instant::now();
         let key = self.shapes[id].key.clone();
         let st = self.lw.reps[&key].clone();
-        let roots = super::shapes::state_paths(&st)?;
+        let roots = crate::trace::shapes::state_paths(&st)?;
         let pins: BTreeMap<Path, Conc<A>> = self.lw.lattice[&key]
             .iter()
             .filter(|(p, _)| roots.iter().any(|r| r == *p) && !self.shapes[id].demoted.contains(*p))
             .map(|(p, c)| (p.clone(), *c))
             .collect();
-        let player = super::shapes::player_path(&st);
+        let player = crate::trace::shapes::player_path(&st);
         let located = located_object(&st);
         let (xp, yp) = match &located {
-            Some(o) => (Some(with(o, &["x"])), Some(with(o, &["y"]))),
+            Some(o) => (Some(field(o, &["x"])), Some(field(o, &["y"]))),
             None => (None, None),
         };
         // Seed unpinned numeric slots: an earlier pass's range, else the
@@ -405,7 +390,7 @@ impl<A: GraphArith> Table<'_, A> {
                 continue;
             }
             let Some(Value::Num(n)) = iface::get(&st, p) else { continue };
-            let is_player = |f: &str| player.as_ref().is_some_and(|pl| *p == with(pl, &[f, "x"]) || *p == with(pl, &[f, "y"]));
+            let is_player = |f: &str| player.as_ref().is_some_and(|pl| *p == field(pl, &[f, "x"]) || *p == field(pl, &[f, "y"]));
             // The start state's OWN interval (its representative holds a
             // blank there). A slot only a later frame writes an interval to
             // (`ival_extra`: a balloon's bob) holds its start value.
@@ -441,7 +426,7 @@ impl<A: GraphArith> Table<'_, A> {
         }
         // Every level's interval inputs (the player's `rem`, a live fruit's
         // `y`/`off`), so a kernel expecting `num` binds.
-        let always = super::widen::slots_where(&st, crate::abstraction::Level::EXACT, super::widen::interval_input);
+        let always = crate::trace::widen::slots_where(&st, crate::abstraction::Level::EXACT, crate::trace::widen::interval_input);
         for p in always.into_iter().chain(self.lw.ival_extra.get(&key).into_iter().flatten().cloned()) {
             if !pins.contains_key(&p) && !ival.contains(&p) {
                 ival.push(p);
@@ -458,10 +443,10 @@ impl<A: GraphArith> Table<'_, A> {
         // concrete chain. Move forks take the ranges' full width, and
         // undecided selects stay selects (joined here, no extra
         // configurations): `level_minus_one`.
-        let fruit = player.is_some() && !super::widen::objects_of_type(&st, "fly_fruit").is_empty();
+        let fruit = player.is_some() && !crate::trace::widen::objects_of_type(&st, "fly_fruit").is_empty();
         let level = crate::abstraction::Level { held: false, fruit, ..tr.it.d.level };
-        let spec = super::verify::TraceSpec { roots: &roots, pin: &pin_list, ival: &ival, bounds: &bound_list, level: Some(level), level_minus_one: true, ..Default::default() };
-        let f = super::verify::trace_frame(&mut tr.it, tr.chunks, st.clone(), &spec).map_err(|e| anyhow!("level -1 trace of shape {id}: {e:#}"))?;
+        let spec = crate::trace::frame::TraceSpec { roots: &roots, pin: &pin_list, ival: &ival, bounds: &bound_list, level: Some(level), level_minus_one: true, ..Default::default() };
+        let f = crate::trace::frame::trace_frame(&mut tr.it, tr.chunks, st.clone(), &spec).map_err(|e| anyhow!("level -1 trace of shape {id}: {e:#}"))?;
         let t_trace = t0.elapsed();
         let n_slots = f.iface.slots.len();
         let seeds: Vec<Seed<A>> = f
@@ -495,7 +480,7 @@ impl<A: GraphArith> Table<'_, A> {
         let mut outs: Vec<OutSpec> = Vec::new();
         let mut roots_old: Vec<Roots> = Vec::new();
         for o in &f.outs {
-            let room = super::shapes::room_of(&o.st, d);
+            let room = crate::trace::shapes::room_of(&o.st, d);
             ensure!(room.0 >= 0 && room.1 >= 0, "shape {id}: an outcome whose room is not a constant");
             if room != self.room0 {
                 // 100%: an exit that certainly leaves the berry behind wins
@@ -513,8 +498,8 @@ impl<A: GraphArith> Table<'_, A> {
             let node_of = |p: &Path| o.fields.iter().find(|(q, _, _)| q == p).map(|(_, n, _)| *n);
             let xy = match &tloc {
                 Some(ob) => Some((
-                    node_of(&with(ob, &["x"])).ok_or_else(|| anyhow!("shape {id}: an outcome's located object has no x"))?,
-                    node_of(&with(ob, &["y"])).ok_or_else(|| anyhow!("shape {id}: an outcome's located object has no y"))?,
+                    node_of(&field(ob, &["x"])).ok_or_else(|| anyhow!("shape {id}: an outcome's located object has no x"))?,
+                    node_of(&field(ob, &["y"])).ok_or_else(|| anyhow!("shape {id}: an outcome's located object has no y"))?,
                 )),
                 None => None,
             };
@@ -610,7 +595,7 @@ impl<A: GraphArith> Table<'_, A> {
         let roots: Vec<Roots> = roots_old.iter().map(|r| Roots { live: m(&r.live), error: m(&r.error), xy: r.xy.map(|(x, y)| (m(&x), m(&y))), fields: r.fields.iter().map(m).collect() }).collect();
         let cone = Cone { graph: cone, roots, forks, arities, n_forks: f.forks };
         let plain = cone.specialize();
-        let operands: Vec<String> = cone.forks.iter().map(|(k, (at, op))| format!("fork {k} ({at:?}): {}", super::emit::show_tree(&cone.graph, *op, 3))).collect();
+        let operands: Vec<String> = cone.forks.iter().map(|(k, (at, op))| format!("fork {k} ({at:?}): {}", crate::trace::lower::show_tree(&cone.graph, *op, 3))).collect();
         let stats = format!(
             "{} slots ({} pinned, {} interval), {} outcomes, forks {:?}, {} configurations ({} distinct), cone {} nodes, specialized {} nodes, trace {:.1} s, specialize {:.1} s",
             n_slots,
@@ -945,7 +930,7 @@ fn culprit<A: GraphArith>(g: &Graph<A>, vals: &[Val<A>], mut n: NodeId) -> Strin
             },
             _ => {}
         }
-        return format!("{} = {:?}, operands {:?}", super::emit::show_tree(g, n, 4), vals[n as usize], nd.args.iter().map(|a| vals[*a as usize]).collect::<Vec<_>>());
+        return format!("{} = {:?}, operands {:?}", crate::trace::lower::show_tree(g, n, 4), vals[n as usize], nd.args.iter().map(|a| vals[*a as usize]).collect::<Vec<_>>());
     }
 }
 
@@ -1079,8 +1064,46 @@ impl CostToGo {
     }
 }
 
-/// The start room's level -1 table at speed bound `spd_px`, built or cached.
-pub fn cost_to_go(root: &FsPath, spd_px: i32, threads: usize, s: &crate::settings::Settings) -> Result<CostToGo> {
+/// THE LEVEL -1 TABLE of the start room at speed bound `speed` under
+/// settings `s`: the one builder, for the search (`frame::MinusOne`) and
+/// `rewrite l1`. Built (or read from its cache file, `cache_file`) once per
+/// process and key (what the table is a function of: `Settings::cart_key`,
+/// the pinned file, the speed), on a thread with the tracer's stack.
+/// Leaked: a process holds one or two.
+pub fn table(speed: i32, s: &crate::settings::Settings) -> Result<&'static CostToGo> {
+    type Key = (String, Option<PathBuf>, i32);
+    static TABLES: std::sync::Mutex<Vec<(Key, &'static CostToGo)>> = std::sync::Mutex::new(Vec::new());
+    let key: Key = (s.cart_key(), s.l1_table.clone(), speed);
+    let mut tables = TABLES.lock().unwrap();
+    if let Some((_, t)) = tables.iter().find(|(k, _)| *k == key) {
+        return Ok(t);
+    }
+    measures_the_exit(s)?;
+    let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
+    let t = std::time::Instant::now();
+    let owned = s.clone();
+    let table = std::thread::Builder::new()
+        .stack_size(256 * 1024 * 1024)
+        .spawn(move || cost_to_go(FsPath::new("."), speed, threads, &owned))
+        .expect("spawn the level -1 builder")
+        .join()
+        .map_err(|p| anyhow!("the level -1 builder panicked: {}", p.downcast_ref::<String>().map(String::as_str).or_else(|| p.downcast_ref::<&str>().copied()).unwrap_or("?")))??;
+    eprintln!("[level -1] table ready in {:.1} s (S = {speed}): the start state's d = {}", t.elapsed().as_secs_f64(), table.start_d);
+    let table: &'static _ = Box::leak(Box::new(table));
+    tables.push((key, table));
+    Ok(table)
+}
+
+/// The table measures the room's EXIT: refused where the win is a position
+/// (the summit's flag), where it would be unsound.
+fn measures_the_exit(s: &crate::settings::Settings) -> Result<()> {
+    ensure!(crate::frame::win_rect(s).is_none(), "level -1: the table measures the room exit; this room's win is a position");
+    Ok(())
+}
+
+/// The start room's level -1 table at speed bound `spd_px`, built or cached
+/// (`table`'s builder).
+fn cost_to_go(root: &FsPath, spd_px: i32, threads: usize, s: &crate::settings::Settings) -> Result<CostToGo> {
     let (path, key) = cache_file(root, spd_px, s)?;
     match CostToGo::load(&path) {
         Ok(Some(t)) => {
@@ -1128,7 +1151,7 @@ fn cache_file(root: &FsPath, spd_px: i32, s: &crate::settings::Settings) -> Resu
     let dir = PathBuf::from("/var/tmp/celeste-l1-cache");
     let exe = std::env::current_exe()?;
     let exe_bytes = std::fs::read(&exe).map_err(|e| anyhow!("reading this binary {}: {e}", exe.display()))?;
-    let lua = super::cart::sources_in(root, s)?;
+    let lua = crate::trace::cart::sources_in(root, s)?;
     let mut cart: Vec<(String, Vec<u8>)> = Vec::new();
     for e in std::fs::read_dir(root.join("cart"))? {
         let e = e?;
@@ -1668,8 +1691,8 @@ fn build<A: GraphArith>(root: &FsPath, spd_px: i32, threads: usize, rep: &mut St
     let t_all = std::time::Instant::now();
     let room0 = s.room;
     let spd_px = i16::try_from(spd_px).map_err(|_| anyhow!("the speed bound {spd_px} px is out of range"))?;
-    let walk = super::kernel::Walk { settings: s, only: None };
-    let lw = super::kernel::room_constant_lattice::<A>(root, crate::abstraction::Level { held: true, ..crate::abstraction::Level::EXACT }, &walk)?;
+    let walk = crate::trace::walk::Walk { settings: s, only: None };
+    let lw = crate::trace::walk::room_constant_lattice::<A>(root, crate::abstraction::Level { held: true, ..crate::abstraction::Level::EXACT }, &walk)?;
     say!(rep, "room {room0:?}: lattice walk {} shapes, {:.1} s", lw.lattice.len(), t_all.elapsed().as_secs_f64())?;
     let mut tr = lw.tracer.clone();
     let mut table = Table {
@@ -1688,7 +1711,7 @@ fn build<A: GraphArith>(root: &FsPath, spd_px: i32, threads: usize, rep: &mut St
         let st = &lw.reps[&lw.start_key];
         let o = located_object(st).ok_or_else(|| anyhow!("the start state has no player or spawn"))?;
         let at = |f: &str| -> Result<i16> {
-            let Some(Value::Num(n)) = iface::get(st, &with(&o, &[f])) else { bail!("start object {f} is not a number") };
+            let Some(Value::Num(n)) = iface::get(st, &field(&o, &[f])) else { bail!("start object {f} is not a number") };
             let v = lw.tracer.it.d.as_const(&n).ok_or_else(|| anyhow!("start object {f} is not a constant"))?;
             A::as_i16(v).ok_or_else(|| anyhow!("start object {f} is not a whole pixel"))
         };
@@ -1736,11 +1759,11 @@ fn build<A: GraphArith>(root: &FsPath, spd_px: i32, threads: usize, rep: &mut St
         }
         table.shapes[tid].lits = lits;
         chain.push((tid, (xl, yl)));
-        if let Some(pl) = super::shapes::player_path(&lw.reps[&table.shapes[tid].key]) {
+        if let Some(pl) = crate::trace::shapes::player_path(&lw.reps[&table.shapes[tid].key]) {
             // The player's speed range joins the successor's own speed.
             let (sp, zero) = (A::from_i16(spd_px), A::from_i16(0));
             for ax in ["x", "y"] {
-                let q = with(&pl, &["spd", ax]);
+                let q = field(&pl, &["spd", ax]);
                 let r = ranges.get(&q).copied().unwrap_or((zero, zero));
                 ranges.insert(q, (least(r.0, A::from_i16(-spd_px)), most(r.1, sp)));
             }
@@ -1962,38 +1985,14 @@ fn build<A: GraphArith>(root: &FsPath, spd_px: i32, threads: usize, rep: &mut St
             rev[e as usize].push(s as u32);
         }
     }
-    let mut dist = vec![u32::MAX; n];
-    let mut q: VecDeque<u32> = VecDeque::new();
-    for i in 0..n {
-        if g1.exits[i] {
-            dist[i] = 1;
-            q.push_back(i as u32);
-        }
-    }
-    while let Some(i) = q.pop_front() {
-        let dn = dist[i as usize] + 1;
-        for &s in &rev[i as usize] {
-            if dist[s as usize] == u32::MAX {
-                dist[s as usize] = dn;
-                q.push_back(s);
-            }
-        }
-    }
     let end_node = g1.index[&(end_id, end_xy.0, end_xy.1)];
-    say!(
-        rep,
-        "\nd: {} of {n} nodes reach an exit; the prefix's end d = {}, so the start state's d = {}; max finite d = {}",
-        dist.iter().filter(|d| **d != u32::MAX).count(),
-        dist[end_node as usize],
-        dist[end_node as usize].saturating_add(chain.len() as u32 - 1),
-        dist.iter().filter(|d| **d != u32::MAX).max().copied().unwrap_or(0)
-    )?;
     let sound = sound_d(&g1, &rev, chain.len() as u32 - 1, end_node);
     let start_d = sound[end_node as usize].saturating_add(chain.len() as u32 - 1);
     say!(
         rep,
-        "sound d (a death costs a respawn; clipped parts dropped, the window checked on every filtered row): {} of {n} nodes finite; the start state's d = {start_d}; {} clipped and {} death nodes",
+        "\nsound d (a death costs a respawn; clipped parts dropped, the window checked on every filtered row): {} of {n} nodes finite, the largest {}; the start state's d = {start_d}; {} clipped and {} death nodes",
         sound.iter().filter(|d| **d != u32::MAX).count(),
+        sound.iter().filter(|d| **d != u32::MAX).max().copied().unwrap_or(0),
         g1.clipped.iter().filter(|c| **c).count(),
         g1.deaths.iter().filter(|c| **c).count()
     )?;
@@ -2007,6 +2006,7 @@ fn build<A: GraphArith>(root: &FsPath, spd_px: i32, threads: usize, rep: &mut St
 }
 
 pub fn probe(root: &FsPath, opts: &Opts, s: &crate::settings::Settings) -> Result<String> {
+    measures_the_exit(s)?;
     let mut rep = String::new();
     let t_all = std::time::Instant::now();
     let Built { by_hash, g1, sound, chain, .. } = build_in(root, opts.spd_px, opts.threads, &mut rep, s)?;
@@ -2282,13 +2282,7 @@ mod room_tests {
             return;
         }
         let s = crate::settings::Settings { room: (7, 1), ..Default::default() };
-        let t = std::thread::Builder::new()
-            .stack_size(256 * 1024 * 1024)
-            .spawn(move || super::cost_to_go(std::path::Path::new("."), 5, 8, &s))
-            .unwrap()
-            .join()
-            .unwrap()
-            .unwrap_or_else(|e| panic!("{e:#}"));
+        let t = super::table(5, &s).unwrap_or_else(|e| panic!("{e:#}"));
         assert_eq!(t.start_d, 45);
     }
 
@@ -2301,13 +2295,7 @@ mod room_tests {
             return;
         }
         let s = crate::settings::Settings { room: (1, 0), arith: crate::settings::Arith::Float(crate::settings::FloatTool::Celia), loading_jank: crate::starts::celia_jank((1, 0)).expect("Celia's J"), ..Default::default() };
-        let t = std::thread::Builder::new()
-            .stack_size(256 * 1024 * 1024)
-            .spawn(move || super::cost_to_go(std::path::Path::new("."), 5, 8, &s))
-            .unwrap()
-            .join()
-            .unwrap()
-            .unwrap_or_else(|e| panic!("{e:#}"));
+        let t = super::table(5, &s).unwrap_or_else(|e| panic!("{e:#}"));
         assert_eq!(t.start_d, 44);
     }
 }

@@ -51,11 +51,15 @@ celeste-rust (src/)
                         exact), concrete (the concrete search; dual: over
                         pairs), known, arcs, hull, rem (+ rem_f64),
                         arc_edges, arc_check, hull_replay, tree (a finished
-                        tree opened), pos_graph, result, ui_export, inspect
-  trace/                the tracer (interp, state, heap, domain, verify, widen,
-                        error, kernel = the lattice walk), the reference engine
-                        (refengine, refdomain, refdriver, refbridge, block),
-                        level_minus_one, cart patches, oracle, probe
+                        tree opened), pos_graph, result, ui_export, inspect,
+                        level_minus_one (the cost-to-go table, its one builder)
+  trace/                the tracer: interp, state, heap, domain (Symbolic) and
+                        refdomain (RefDomain), frame (one frame traced), split
+                        (the split pass), widen, error, walk (the lattice
+                        walk), lower, bind, block (states <-> blocks), cart;
+                        oracle and probe (test-only)
+  engines/              the reference engine (`reference`: the interpreter
+                        over RefDomain as a frame step)
   transpile/            graph IR, garith, ival, bdd, lowering, asm (codegen,
                         float codegen, call-outs, jit)
   compiled/             FrameEngine, the kernel registry, emission, mix
@@ -64,8 +68,8 @@ celeste-rust (src/)
   par.rs, metrics.rs, concrete.rs, game_runner.rs
   bin/rewrite/          the search and its commands (main), the checks of a
                         tree (check), benches (bench), diagnostics (diag),
-                        one concrete run (run), level -1 (l1)
-  bin/transpile.rs      the level -1 table
+                        one concrete run (run), level -1 (l1: table, probe,
+                        check)
 ```
 
 The traced program is `lua/builtin_level_3.lua` + `lua/builtin_level_4.lua`
@@ -78,7 +82,7 @@ reference for semantics only.
 1. **The frame step** (`frame::FrameStep`): a range of input lanes of one
    block in; every output row out through the storage's `UnitSink`, keyed,
    with its cell (player position), widened for the level. Two impls: the
-   compiled `compiled::FrameEngine` and the reference `trace::refengine`
+   compiled `compiled::FrameEngine` and the reference `engines::reference`
    (`RefEngine`: the tracer's interpreter over `RefDomain`, one lane and
    one fork path at a time). Both convert states to blocks through one
    converter (`trace::block`), so their rows key alike.
@@ -128,11 +132,11 @@ unknown split apart admit combinations no value gives).
 
 **One fork concept**: choose a node, partition its set, duplicate the
 downstream cone per part, fold. Buttons, held trails and escaped atoms are
-2-way forks every lane takes both ways. `verify::split_undecided_selects`
+2-way forks every lane takes both ways. `split::split_undecided_selects`
 runs after tracing: split a select driven by something lane-undecidable at
 its most upstream place, refold, dedupe outcomes. For the platforms it
 carries per path the (world, player pixel) POINTS its answers hold at
-(`verify::Points`). `lower::specialize_frame` enumerates per outcome only
+(`split::Points`). `lower::specialize_frame` enumerates per outcome only
 the forks in its own cone.
 
 **Error is derived, never carried** (`trace::error`): `error(n) =
@@ -160,7 +164,7 @@ Unknown `live` reads as live (over-approximate); unknown `error` reads as
 error: a declined lane is a FATAL `KERNEL COVERAGE GAP`. There is no
 fallback to the interpreter.
 
-**The lattice walk** (`trace::kernel::room_constant_lattice`) walks (shape,
+**The lattice walk** (`trace::walk::room_constant_lattice`) walks (shape,
 region) nodes from the start in parallel rounds, traced against the
 round's lattice snapshot. A region (`--region px,S`, default 16 px, S <= 7
 because `move`'s loop is unrolled for `|amount| <= 8`) bounds the player's
@@ -222,7 +226,7 @@ ground truth (`pico8_diff/chain.py --boot`, `--check-start`).
 **Frame 0 is the start as the engine made it**, keyed by its own codes
 (not its boundary view), and nothing looks it up by projection.
 
-**The no-player phase is explored** (`trace::kernel`: `explore_no_player`).
+**The no-player phase is explored** (`trace::walk`: `explore_no_player`).
 Before the player exists no input matters, so the walk traces the spawn
 phase under the hulls its concrete states take. A death reloads the room,
 so the walk explores every respawn entry it reaches, and the start, at the

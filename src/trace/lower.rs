@@ -1,4 +1,5 @@
-//! Binding a TRACED frame to the engine's numbering and lowering it.
+//! Binding a TRACED frame to the engine's numbering and lowering it: the walk's
+//! frames as the kernel registry takes them (`lattice_kernel_refs`).
 //!
 //! `bind` resolves the tracer's paths to the engine's canonical cell ids
 //! (`trace::bind`), so everything downstream names cells an `Rt2` has.
@@ -15,7 +16,10 @@ use celeste_core::arith::Fixed;
 use crate::transpile::garith::GraphArith;
 use crate::transpile::graph::{Graph, NodeId};
 use crate::transpile::asm::CellRepr;
-use crate::transpile::kernel::{Emit, OutField, OutFields};
+use crate::transpile::kernel::{ColTy, Emit, OutField, OutFields};
+
+use super::frame::Frame;
+use super::walk::{room_constant_lattice, Region, Walk};
 
 /// What a lowered frame hands the kernel builder.
 pub struct Lowered<A: GraphArith = Fixed> {
@@ -47,14 +51,14 @@ pub fn show_tree<A: GraphArith>(g: &Graph<A>, root: NodeId, depth: usize) -> Str
 /// One output shape of a traced frame: the cells it writes, and the two
 /// booleans that say which lanes reach it and on which its row is undefined.
 pub struct FrameOutcome<A: GraphArith = Fixed> {
-    pub outputs: Vec<(u32, NodeId, &'static str)>,
+    pub outputs: Vec<(u32, NodeId, ColTy)>,
     pub live: NodeId,
     pub error: NodeId,
     /// Fields stored as the UNKNOWN NUMBER (uniform, but no graph constant
     /// `konst_av` could find), with that value: off the key's per-lane fold
     /// (`OutField::widen_uniform`).
     pub widen: Vec<(u32, celeste_engine::runtime2::AV<A::Num>)>,
-    /// The transfer roots (`verify::FrameOut::arc`; empty but at level 0),
+    /// The transfer roots (`frame::FrameOut::arc`; empty but at level 0),
     /// after `live` in a body's roots, and whether the outcome has a player
     /// at its end.
     pub arc: Vec<NodeId>,
@@ -75,7 +79,7 @@ pub struct Bound<A: GraphArith = Fixed> {
 
 /// What each root index passed to `renumber_cells` is (every outcome's
 /// fields then its `live` and `error`, flattened), for error messages.
-fn root_legend<A: GraphArith>(f: &crate::trace::verify::Frame<A>) -> String {
+fn root_legend<A: GraphArith>(f: &crate::trace::frame::Frame<A>) -> String {
     let mut out = Vec::new();
     let mut k = 0usize;
     for (i, o) in f.outs.iter().enumerate() {
@@ -99,7 +103,7 @@ fn root_legend<A: GraphArith>(f: &crate::trace::verify::Frame<A>) -> String {
 /// Hitbox cells are declared UNIFORM: `tile_flag_at` needs a block-uniform
 /// width and height, and a hitbox is fixed per object type and never
 /// written during a frame.
-pub fn bind<A: GraphArith>(f: &crate::trace::verify::Frame<A>, g: &Graph<A>) -> Result<Bound<A>> {
+pub fn bind<A: GraphArith>(f: &crate::trace::frame::Frame<A>, g: &Graph<A>) -> Result<Bound<A>> {
     let roots: Vec<NodeId> = f.outs.iter().flat_map(|o| o.roots(true)).collect();
     let (mut graph, mut roots) = crate::trace::bind::renumber_cells(g, &f.in_cells, &roots)
         .map_err(|e| anyhow::anyhow!("{:#}\nwhere the roots are\n{}", e, root_legend(f)))?;
@@ -197,7 +201,7 @@ pub fn bind<A: GraphArith>(f: &crate::trace::verify::Frame<A>, g: &Graph<A>) -> 
             })
             .collect();
         // The unknown numbers, uniform, off the per-lane key fold. (Unknown
-        // BOOLEANS are not fields at all: `verify::out_fields` stores them
+        // BOOLEANS are not fields at all: `frame::out_fields` stores them
         // uniform. A widening that stores a constant - the remainder's
         // interval, a dead timer's 0 - is a constant node in every body,
         // which `lower::lower_outcomes` finds as the field's `konst_av`.)
@@ -273,16 +277,16 @@ pub fn lower_frame<A: GraphArith>(
                 fields: o
                     .outputs
                     .iter()
-                    .map(|(cell, node, ty)| OutField {
-                        cell: *cell,
+                    .map(|&(cell, node, ty)| OutField {
+                        cell,
                         ty,
-                        node: *node,
+                        node,
                         konst_av: None,
                         // Excluded from the per-lane key fold.
                         widen_uniform: o
                             .widen
                             .iter()
-                            .find(|(c, _)| *c == *cell)
+                            .find(|(c, _)| *c == cell)
                             .map(|(_, av)| *av),
                     })
                     .collect(),
@@ -295,4 +299,70 @@ pub fn lower_frame<A: GraphArith>(
     let spec = crate::transpile::lower::lower_outcomes(&e, &mut outs, build_trace);
     let bodies = spec.1.len();
     Ok(Lowered { outs: outs.into_iter().map(|o| o.of).collect(), bodies, spec })
+}
+
+/// One traced frame, bound and lowered, everything owned: what the kernel
+/// registry assembles.
+pub struct LoweredFrame<A: GraphArith = Fixed> {
+    pub frame: Frame<A>,
+    pub bound: Bound<A>,
+    pub lowered: Lowered<A>,
+    pub cart: std::sync::Arc<celeste_core::cart_data::CartData>,
+    pub cache: std::sync::Arc<celeste_core::collision_cache::CollisionCache>,
+}
+
+/// Restate a lowering failure with its `Cell(n)`s named by interface path.
+fn name_cells<A: GraphArith>(f: &super::frame::Frame<A>, e: anyhow::Error) -> anyhow::Error {
+    let msg = format!("{:#}", e);
+    let mut seen: std::collections::BTreeSet<u32> = Default::default();
+    let mut at = msg.as_str();
+    while let Some(i) = at.find("Cell(") {
+        at = &at[i + 5..];
+        let end = at.find(')').unwrap_or(0);
+        if let Ok(n) = at[..end].parse::<u32>() {
+            seen.insert(n);
+        }
+    }
+    let mut lines = Vec::new();
+    for c in seen {
+        let name = f
+            .in_cells
+            .iter()
+            .position(|x| *x == c)
+            .map(|i| super::iface::show(&f.iface.slots[i]))
+            .unwrap_or_else(|| "not an input of this frame".to_string());
+        lines.push(format!("  Cell({}) = {}", c, name));
+    }
+    anyhow::anyhow!("{}\nwhere\n{}", msg, lines.join("\n"))
+}
+
+
+/// The constant-lattice walk's frames for the start room, lowered, in walk
+/// order. A
+/// frame that fails to bind or lower is FATAL (a coverage gap otherwise).
+pub(crate) fn lattice_kernel_refs<A: GraphArith>(
+    root: &std::path::Path,
+    opts: crate::abstraction::Level,
+    s: &crate::settings::Settings,
+) -> Result<Vec<(Option<Region>, LoweredFrame<A>)>> {
+    let mut lw = room_constant_lattice(root, opts, &Walk { settings: s, only: None })?;
+    let room = crate::transpile::graph::Room { cart: lw.cart.clone(), cache: lw.cache.clone() };
+    // Each frame was bound by the walk in the worker arena it was traced in.
+    let frames: Vec<(Option<Region>, super::frame::Frame<A>, Bound<A>)> = std::mem::take(&mut lw.frames)
+        .into_iter()
+        .map(|((shape, region), wf)| -> Result<_> {
+            let bound = wf.bound.map_err(|e| anyhow::anyhow!("the walk's frame of shape {shape} region {region:?} did not bind: {e}"))?;
+            Ok((region, wf.frame, bound))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    // Lower (the expensive half of a build), in parallel. Each frame is
+    // taken by exactly one worker (a `Frame` is not cloned).
+    let (cart, cache) = (lw.cart.clone(), lw.cache.clone());
+    let slots: Vec<std::sync::Mutex<Option<(Option<Region>, super::frame::Frame<A>, Bound<A>)>>> = frames.into_iter().map(|x| std::sync::Mutex::new(Some(x))).collect();
+    let refs = crate::par::Pool::per_core().stack(128 << 20).map(slots.len(), |i| {
+        let (key, f, bound) = slots[i].lock().expect("a frame's slot").take().expect("each frame is lowered once");
+        let lowered = super::lower::lower_frame(&bound, Some(room.clone()), s.diag.build_trace).map_err(|e| anyhow::anyhow!("lattice frame {} ({:?}) lower: {:#}", i, key, name_cells(&f, e)))?;
+        Ok((key, LoweredFrame { frame: f, bound, lowered, cart: cart.clone(), cache: cache.clone() }))
+    })?;
+    Ok(refs)
 }

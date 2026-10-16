@@ -459,7 +459,7 @@ impl<N: KernelLanes> AsmKernel<N> {
                             if !matches!(nd.op, Op::Sel) {
                                 let args: Vec<String> = nd.args.iter().map(|&a| format!("{}={:?}<{:?}>", a, self.fused.get(a).op, vals[a as usize])).collect();
                                 eprintln!("[kernel]     undecided at {} {:?} = {:?}; args {}", cur, nd.op, vals[cur as usize], args.join(", "));
-                                eprintln!("[kernel]       = {}", crate::trace::emit::show_tree(&self.fused, cur, 6));
+                                eprintln!("[kernel]       = {}", crate::trace::lower::show_tree(&self.fused, cur, 6));
                             }
                             break;
                         }
@@ -895,7 +895,7 @@ pub struct Registry<N: KernelLanes = P8> {
     /// One kernel per reached (shape, region); a missing key is a coverage gap.
     kernels: HashMap<(u64, Option<Region>), AsmKernel<N>>,
     /// The region grid the set was built on.
-    grid: Option<crate::trace::kernel::RegionGrid>,
+    grid: Option<crate::trace::walk::RegionGrid>,
 }
 
 /// What a kernel set is built with besides its level and the settings that
@@ -907,7 +907,7 @@ struct BuildOptions {
     keep_graphs: bool,
 }
 
-use crate::trace::kernel::Region;
+use crate::trace::walk::Region;
 
 impl<N: KernelLanes> Registry<N> {
     pub fn len(&self) -> usize {
@@ -994,7 +994,7 @@ impl<N: KernelLanes> Registry<N> {
         };
         let build = &build;
         let t_trace = std::time::Instant::now();
-        let refs = crate::trace::kernel::lattice_kernel_refs::<N::Arith>(root, opts, s)
+        let refs = crate::trace::lower::lattice_kernel_refs::<N::Arith>(root, opts, s)
             .context("retracing the start room for ASM kernels")?;
         let trace_s = t_trace.elapsed().as_secs_f64();
         let t_asm = std::time::Instant::now();
@@ -1148,12 +1148,12 @@ fn apply_union<N: KernelLanes>(kernel: &mut AsmKernel<N>, unions: &HashMap<u64, 
 
 /// Assemble ONE frame (gcc + dlopen) and map its bodies onto output slots;
 /// `tag` distinguishes a shape's region kernels.
-fn build_one_shape<N: KernelLanes>(r: &crate::trace::kernel::Reference<N::Arith>, si: usize, tag: &str, build: &BuildOptions) -> Result<(u64, AsmKernel<N>)> {
+fn build_one_shape<N: KernelLanes>(r: &crate::trace::lower::LoweredFrame<N::Arith>, si: usize, tag: &str, build: &BuildOptions) -> Result<(u64, AsmKernel<N>)> {
     let shape = r.frame.in_rt2.shape_hash_of();
     let room = Room { cart: r.cart.clone(), cache: r.cache.clone() };
     let t_fuse = std::time::Instant::now();
     let (fused, bodies, flat_roots, reprs) =
-        crate::trace::emit::asm_fused_from(&r.bound, &r.lowered.spec)
+        crate::trace::lower::asm_fused_from(&r.bound, &r.lowered.spec)
             .with_context(|| format!("fusing shape {si} (hash {shape:#x})"))?;
     // Row keys are folded per EMITTED row, not per lane in the kernel.
     // One output SLOT per DISTINCT root node; `slot_of[k]` for root k.
@@ -1235,7 +1235,7 @@ fn build_one_shape<N: KernelLanes>(r: &crate::trace::kernel::Reference<N::Arith>
             })
             .collect::<Result<Vec<_>>>()?;
         // Every body computes its transfer (the rotation graph needs it).
-        anyhow::ensure!(narc == 2 * crate::trace::verify::ARC_AXIS_ROOTS, "shape {si} outcome {}: {narc} transfer roots", b.outcome);
+        anyhow::ensure!(narc == 2 * crate::trace::frame::ARC_AXIS_ROOTS, "shape {si} outcome {}: {narc} transfer roots", b.outcome);
         let at = off + nfields + 2;
         let roots = std::array::from_fn(|k| (compiled.root_offsets[slot_of[at + k]] as usize, compiled.root_kinds[slot_of[at + k]]));
         let arc = ArcSlots { roots, fin: r.bound.outcomes[b.outcome].arc_fin };
@@ -1350,7 +1350,7 @@ fn dup_refs(bodies: &mut [AsmBody], reads: &[emit::BodyReads]) -> DupPairs {
                 }
             }
             for k in 0..aa.roots.len() {
-                if !aa.fin && k % crate::trace::verify::ARC_AXIS_ROOTS == 4 {
+                if !aa.fin && k % crate::trace::frame::ARC_AXIS_ROOTS == 4 {
                     continue;
                 }
                 let ((oa, ka), (ob, kb)) = (aa.roots[k], ab.roots[k]);
@@ -1418,7 +1418,7 @@ fn pos_sources<N: EngineNum>(template: &Rt2<N>, fields: &[AsmField]) -> Result<O
 
 /// The accumulator recipe for one outcome, with `shape_hash` and its key's
 /// uniform fields.
-fn acc_template<N: KernelLanes>(r: &crate::trace::kernel::Reference<N::Arith>, oi: usize) -> Result<AccTemplate<N>> {
+fn acc_template<N: KernelLanes>(r: &crate::trace::lower::LoweredFrame<N::Arith>, oi: usize) -> Result<AccTemplate<N>> {
     // Canonical: `block::skeleton` ends in `Rt2::canonicalize_ids`.
     let skeleton = reshape(&r.frame.outs[oi].rt2, 0);
     let shape_hash = skeleton.shape_hash_of();
@@ -1432,10 +1432,9 @@ fn acc_template<N: KernelLanes>(r: &crate::trace::kernel::Reference<N::Arith>, o
             inits.push((
                 cell,
                 match f.ty {
-                    "ZN" => ColInit::EmptyNum,
-                    "ZB" => ColInit::EmptyBool,
-                    "ZI" => ColInit::EmptyIval,
-                    other => anyhow::bail!("outcome {oi} field {cell}: output type {other}"),
+                    crate::transpile::kernel::ColTy::Num => ColInit::EmptyNum,
+                    crate::transpile::kernel::ColTy::Bool => ColInit::EmptyBool,
+                    crate::transpile::kernel::ColTy::Ival => ColInit::EmptyIval,
                 },
             ));
         }

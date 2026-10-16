@@ -423,9 +423,9 @@ pub fn run_wave<N: Rem>(engine: &dyn FrameStep<N>, front: Frontier<N>, cx: WaveC
     let (level, s) = (engine.level(), &engine.settings());
     let game_frame = frame.div_ceil(s.steps_per_frame());
     ensure!(
-        !level.platforms || game_frame as usize <= crate::trace::kernel::PLATFORM_WORLD_FRAMES,
+        !level.platforms || game_frame as usize <= crate::trace::walk::PLATFORM_WORLD_FRAMES,
         "frame {frame} at {level}: the platform worlds cover {} frames",
-        crate::trace::kernel::PLATFORM_WORLD_FRAMES
+        crate::trace::walk::PLATFORM_WORLD_FRAMES
     );
     ensure!(frame > 0, "a wave makes frame 1 on");
     ensure!(front.hulls.len() as u64 == front.new.states(), "frame {frame}: {} hulls for the frontier's {} new states", front.hulls.len(), front.new.states());
@@ -1626,7 +1626,7 @@ pub fn par_map<T: Sync, R: Send>(items: &[T], threads: usize, f: impl Fn(&T) -> 
 /// numbered and the key space's codes.
 ///
 /// The start is the state the kernels' lattice walk starts from (its
-/// constants are the start shape's pins, `trace::kernel`), and nothing
+/// constants are the start shape's pins, `trace::walk`), and nothing
 /// looks it up by its projection (`backward::Seeds::load` takes frame 0's
 /// one state, `known::Pruning::start`). Its view differs from it where a
 /// `Flag::Always` entry moves it - a strawberry's bob, and under the
@@ -1761,7 +1761,7 @@ mod tests {
             Settings { room: (7, 0), loading_jank: Some(1), ..Default::default() },
         ];
         for s in cases {
-            let start = Block::canonical(crate::trace::refengine::RefEngine::new(&s).expect("engine").initial().expect("start")).expect("block");
+            let start = Block::canonical(crate::engines::reference::RefEngine::new(&s).expect("engine").initial().expect("start")).expect("block");
             let mut view = start.rt2().clone_block();
             crate::frame::widen_rt2_to(&mut view, crate::abstraction::Level::EXACT);
             view.canonical();

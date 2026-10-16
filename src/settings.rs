@@ -262,7 +262,7 @@ impl Settings {
     }
 
     /// The settings a CONCRETE run uses (the concrete searches, the known
-    /// route's check, `l1-check`, the dual witness's replay): the balloons'
+    /// route's check, `l1 check`, the dual witness's replay): the balloons'
     /// phases fixed - `--concrete-balloon-seeds`, else `--balloon-seeds`,
     /// else, for a float tool (which always seeds), every seed 0 - and
     /// whether a concrete state keys through `concrete::lookup_view` (its
@@ -317,8 +317,8 @@ impl Settings {
     }
 
     /// The kernels' region grid (`--region`; `None`: off).
-    pub fn region_grid(&self) -> Option<crate::trace::kernel::RegionGrid> {
-        self.region.map(|(px, speed)| crate::trace::kernel::RegionGrid { px, speed })
+    pub fn region_grid(&self) -> Option<crate::trace::walk::RegionGrid> {
+        self.region.map(|(px, speed)| crate::trace::walk::RegionGrid { px, speed })
     }
 
     /// The run's level -1 filter (`--level-minus-one H,S`), if given.

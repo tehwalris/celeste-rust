@@ -489,7 +489,7 @@ pub static TABLE: &[Entry] = &[
         why: "Every moving platform's `x` the interval of its whole path [-16, 128] (the wrap keeps \
               it inside, proved on the traced select or owed), `last` the same node (`last == x` at \
               every frame boundary, checked). The worlds (`concrete::platform_worlds`) keep the \
-              platforms mutually consistent (`verify::Points`). Refuted by the CONCRETE SEARCH (the \
+              platforms mutually consistent (`split::Points`). Refuted by the CONCRETE SEARCH (the \
               reference engine refuses `p`).",
     },
     Entry {

@@ -19,7 +19,7 @@
 //! it, so reachability cannot see the use. It reads only the raw input,
 //! which nothing seeds, so no fold removes it. A PIN has no data output
 //! (every use of its input reads the constant): its check is the frame's own
-//! (`pins_hold`), ORed into every outcome's error by `verify::trace_frame`.
+//! (`pins_hold`), ORed into every outcome's error by `frame::trace_frame`.
 //! A fork's VALIDITY (`SplitValid*`) owns nothing: a row that does not read
 //! a fragment's value is the right row for an unenumerated part too.
 

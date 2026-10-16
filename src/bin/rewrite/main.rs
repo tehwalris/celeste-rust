@@ -15,7 +15,7 @@ use celeste_rust::search::tree::TreeDir;
 use celeste_rust::settings::{Arith, Settings};
 use celeste_rust::storage::layer::Tree;
 use celeste_rust::storage::Sk;
-use celeste_rust::trace::refengine::{FloatRefEngine, RefEngine};
+use celeste_rust::engines::reference::{FloatRefEngine, RefEngine};
 use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
 
 mod bench;
@@ -154,12 +154,10 @@ enum Command {
     /// each first wins on. A variant that differs from glibc's is reported
     /// FRAGILE (flagged, not rejected); the exit code is 0 either way.
     Robust(diag::RobustArgs),
-    /// The level -1 table (`--room`) against a known solution: its concrete
-    /// states (reference engine) at every frame f before the exit, each with
-    /// the table's d. One that is too late for `--horizon` (f + d > H, H the
-    /// solution's exit frame) is a SOUNDNESS violation of the table: exits
-    /// non-zero. An `rnd` fork checks every leaf.
-    L1Check(l1::Args),
+    /// THE LEVEL -1 TABLE (`--level-minus-one`): built alone, probed against
+    /// a tree, checked against a known solution.
+    #[command(subcommand)]
+    L1(l1::Command),
     /// Export a finished search for the web UI (`ui/`) from its record
     /// (`result.json`), the trees' checkpoint HEADERS and forward records
     /// (`forward.tsv`) and the marks files (`search::ui_export`); its room
@@ -460,7 +458,7 @@ fn main() -> Result<()> {
         anyhow::ensure!(given.is_empty(), "{}: this command reads a finished tree and takes its settings from the tree's records (settings.txt, level_minus_one.txt); give only the run's own (--threads, --l1-table, the diagnostics)", given.join(" "));
     }
     // The commands that run in float (a tree's arithmetic is its record's).
-    let float = cli.command.reads_trees() || matches!(cli.command, Command::Search(_) | Command::Forward(_) | Command::Robust(_) | Command::L1Check(_));
+    let float = cli.command.reads_trees() || matches!(cli.command, Command::Search(_) | Command::Forward(_) | Command::Robust(_) | Command::L1(_));
     let cfg = celeste_rust::settings::startup(&cli.settings, float, |s| {
         // `bench frame` times the workers' phases; `--metrics` counts the
         // kernels' census and slices (read when the kernels are built).
@@ -486,12 +484,12 @@ fn main() -> Result<()> {
             let what = if reference { ", REFERENCE engine" } else { "" };
             match cfg.arith {
                 Arith::Fixed => {
-                    let engine: Box<dyn FrameStep> = if reference { Box::new(celeste_rust::trace::refengine::RefFrameStep::<P8>::new(&cfg, level)?) } else { Box::new(celeste_rust::compiled::FrameEngine::new(&cfg, level)?) };
+                    let engine: Box<dyn FrameStep> = if reference { Box::new(celeste_rust::engines::reference::RefFrameStep::<P8>::new(&cfg, level)?) } else { Box::new(celeste_rust::compiled::FrameEngine::new(&cfg, level)?) };
                     eprintln!("[fwd] engine up in {:.2} s ({level}{what})", t.elapsed().as_secs_f64());
                     forward(dir, a.to, level, &cfg, engine, || Ok(vec![Block::canonical(RefEngine::new(&cfg)?.initial()?)?]))
                 }
                 Arith::Float(_) => {
-                    let engine: Box<dyn FrameStep<LuaF64>> = if reference { Box::new(celeste_rust::trace::refengine::RefFrameStep::<LuaF64>::new(&cfg, level)?) } else { Box::new(celeste_rust::compiled::FloatKernels::new(&cfg, level)?) };
+                    let engine: Box<dyn FrameStep<LuaF64>> = if reference { Box::new(celeste_rust::engines::reference::RefFrameStep::<LuaF64>::new(&cfg, level)?) } else { Box::new(celeste_rust::compiled::FloatKernels::new(&cfg, level)?) };
                     eprintln!("[fwd] engine up in {:.2} s ({level}{what}, {})", t.elapsed().as_secs_f64(), cfg.arith);
                     forward(dir, a.to, level, &cfg, engine, || Ok(vec![Block::canonical(FloatRefEngine::new(&cfg)?.initial()?)?]))
                 }
@@ -504,7 +502,7 @@ fn main() -> Result<()> {
         Command::Census(a) => diag::census(&cfg, a),
         Command::Trajectory(a) => diag::trajectory(&cfg, a),
         Command::Robust(a) => diag::robust(&cfg, a),
-        Command::L1Check(a) => l1::run(&cfg, a),
+        Command::L1(c) => l1::run(&cfg, c),
         Command::ExportUi(a) => celeste_rust::search::ui_export::export(
             std::path::Path::new(&a.checkpoint_dir),
             std::path::Path::new(&a.out),

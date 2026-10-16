@@ -455,7 +455,7 @@ pub fn boot<'a, D: Domain>(it: &mut Interp<'a, D>, chunks: &'a Chunks, root: &st
 
 #[cfg(test)]
 mod tests {
-    use crate::trace::refengine::RefEngine;
+    use crate::engines::reference::RefEngine;
 
     /// The dash starts each category allows, through the reference engine
     /// (the kernels trace the same patched source): room (1,0), the player

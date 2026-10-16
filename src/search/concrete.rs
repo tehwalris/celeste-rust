@@ -30,7 +30,7 @@ use crate::abstraction::Level;
 use crate::frame::{wins_of, Block};
 use crate::settings::Settings;
 use crate::storage::{Sk, GEOMETRY};
-use crate::trace::refengine::ReferenceEngine;
+use crate::engines::reference::ReferenceEngine;
 
 /// What the concrete search steps: its engine (one a worker), its states,
 /// their identity (dedup and the depth-first try's memo), and what an edge

@@ -4,7 +4,7 @@
 //! ACTION (a rotation, or a collision's constant).
 //!
 //! Every traced frame captures per body the transfer roots
-//! (`trace::verify::FrameOut::arc`); the kernel computes them beside the row
+//! (`trace::frame::FrameOut::arc`); the kernel computes them beside the row
 //! (no key, column, dedup or checkpoint sees them) and each producer's
 //! transfer is decoded here. The forward interns the (x, y) pair per worker
 //! (`storage::unit::UnitSink::xfer_id`); each frame merges the workers' ids

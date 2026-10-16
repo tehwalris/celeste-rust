@@ -59,7 +59,7 @@ pub struct Interp<'a, D: Domain> {
     /// modelling gap stays visible.
     pub illegal: std::collections::BTreeMap<String, usize>,
     /// Each poisoned path's guard and reason; their OR is the raise row's
-    /// liveness. Reset per trace by `verify::trace_frame`.
+    /// liveness. Reset per trace by `frame::trace_frame`.
     pub raised: Vec<(D::Bool, String)>,
     /// The cart and the room's collision cache (optional for unit tests).
     pub cart: Option<std::sync::Arc<celeste_core::cart_data::CartData>>,

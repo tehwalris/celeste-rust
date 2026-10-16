@@ -268,7 +268,7 @@ pub struct UnitSink<'a, N: Rem = P8> {
     /// `--phases`: the wave's phase timers (`frame::phases`).
     pub phases: bool,
     /// The level -1 table of `filters.minus_one`, resolved once.
-    l1: Option<&'static crate::trace::level_minus_one::CostToGo>,
+    l1: Option<&'static crate::search::level_minus_one::CostToGo>,
     drop_last: Option<((u64, u32), bool)>,
     /// TRANSFER IDS: a pair the tree's table holds (`base`, read only
     /// during the wave, shared by the workers) is its global id; a pair new

@@ -373,7 +373,7 @@ pub fn near_floor_states<A: GraphArith>(st: &State<Symbolic<A>>, level: Level) -
 }
 
 /// `Hook::NearFloor`, INPUT: a floor's `state` as stored (split by
-/// `verify::split_undecided_selects`), `collideable` DERIVED as `state ~= 2`
+/// `split::split_undecided_selects`), `collideable` DERIVED as `state ~= 2`
 /// (the cart keeps them in step; an independent unknown `collideable` would
 /// admit players inside solid floors). Mid split frame a lane may hold an
 /// unknown `collideable`, but a boolean slot binds as a decided cell that
@@ -745,7 +745,7 @@ mod tests {
     use celeste_core::pico8_num::Pico8Num as P8;
     use crate::trace::cart;
     use crate::trace::interp::Interp;
-    use crate::trace::verify::trace_frame;
+    use crate::trace::frame::trace_frame;
     use crate::transpile::graph::Val;
     use std::collections::HashMap;
 
@@ -796,7 +796,7 @@ mod tests {
             let roots = slots_where(&st, Level::EXACT, dead);
             with_key += roots.iter().any(|p| p.last() == Some(&iface::key("spr"))) as usize;
             with_player += !objects_of_type(&st, "player").is_empty() as usize;
-            let f = trace_frame(&mut it, &chunks, st.clone(), &crate::trace::verify::TraceSpec { roots: &roots, concrete: true, ..Default::default() }).expect("trace");
+            let f = trace_frame(&mut it, &chunks, st.clone(), &crate::trace::frame::TraceSpec { roots: &roots, concrete: true, ..Default::default() }).expect("trace");
             // Everything a successor depends on, its booleans decided as far as a
             // BDD over independent atoms can (a guard re-merged after a branch on
             // `frames` is `c or not c`, true).

@@ -372,7 +372,7 @@ fn hull_claim<N: Rem>(b: &Block<N>, s: u32, sk: Option<Sk>, from: Option<Held<N>
 /// The first check state `b` at step `s` (its parent held at `from`) fails,
 /// and where the tree holds it (with `hulls`).
 #[allow(clippy::too_many_arguments)]
-fn verdict<N: Rem>(b: &Block<N>, s: u32, from: Option<Held<N>>, seeded: bool, l1: Option<(u32, &crate::trace::level_minus_one::CostToGo)>, route: &Route<N>, p: &Pruning<N>) -> anyhow::Result<(Option<Miss>, Option<Held<N>>)> {
+fn verdict<N: Rem>(b: &Block<N>, s: u32, from: Option<Held<N>>, seeded: bool, l1: Option<(u32, &crate::search::level_minus_one::CostToGo)>, route: &Route<N>, p: &Pruning<N>) -> anyhow::Result<(Option<Miss>, Option<Held<N>>)> {
     let (shape, keys, cells) = lookup_keys(b, p.side.level, seeded, p.side.keys)?;
     let (key, cell) = (keys[0], cells[0]);
     let node = match key {

@@ -21,7 +21,7 @@ use celeste_core::lua_f64::LuaF64;
 use crate::trace::heap::Value;
 use crate::trace::iface::{self, Step};
 use crate::trace::refdomain::RefDomain;
-use crate::trace::refengine::FloatRefEngine;
+use crate::engines::reference::FloatRefEngine;
 use crate::trace::state::State;
 
 /// A scalar of a trace: a double's bits, or a boolean. OURS may also be a
@@ -356,7 +356,7 @@ mod tests {
     /// chest's shake, which no file seeds in 16.16) forks the frame, and
     /// none before the last input.
     fn exits_in_fixed_point(path: &std::path::Path, cat: &str, level: i16) -> Result<()> {
-        use crate::trace::refengine::RefEngine;
+        use crate::engines::reference::RefEngine;
         let (gemskip, rest) = cat.strip_prefix("gemskip").map_or((false, cat), |r| (true, r));
         let (hundred, nodiag) = match rest {
             "any" => (false, false),

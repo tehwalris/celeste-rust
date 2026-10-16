@@ -36,11 +36,20 @@ impl<A: GraphArith> Emit<A> {
     }
 }
 
+/// An output column's engine type: a number (`ZN`), an interval (`ZI`) or
+/// a boolean (`ZB`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ColTy {
+    Num,
+    Ival,
+    Bool,
+}
+
 /// One boundary output of a frame.
 pub(crate) struct OutField<A: GraphArith = Fixed> {
     /// Cell id this value lands in.
     pub(crate) cell: u32,
-    pub(crate) ty: &'static str,
+    pub(crate) ty: ColTy,
     /// The graph node this cell ends the frame holding.
     pub(crate) node: NodeId,
     /// Set for a field stored as a uniform value no graph constant names (the
