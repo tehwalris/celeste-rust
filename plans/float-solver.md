@@ -685,12 +685,12 @@ tests, my own fixture and scratch dirs) and small commits.
 - **Q3**: bit-exact on this machine's glibc (2.42) is the definition.
   Every float or dual witness also gets a robustness report (a correctly
   rounded `sin`, and ±1 ulp on every `sin` call); a witness that fails it
-  is flagged loudly, not rejected. AS BUILT (`rewrite robust`, milestone
-  6): glibc's `sin`, every call one ulp up, every call one ulp down, and 8
-  runs moving each call by -1, 0 or +1 ulp at random. No correctly rounded
-  `sin` is built: it lies within an ulp of glibc's, which the random runs
-  sample but do not cover. Run so far only on the four witnesses of the
-  validation table (milestone 6), not on the earlier float witnesses.
+  is flagged loudly, not rejected. AS BUILT (`rewrite robust`,
+  `search::robust`): glibc's `sin`, a correctly rounded `sin` (MPFR's at 53
+  bits, `libmpfr.so.6` loaded at run time), every call one ulp up, every
+  call one ulp down, and 8 runs moving each call by -1, 0 or +1 ulp at
+  random. Run so far only on the four witnesses of the validation table
+  (milestone 6), not on the earlier float witnesses.
 - **Q4**: ONE cart form for both arithmetics, the original's expressions
   (below). Fixed unchanged, shown (commit `e764d83c`).
 - **Q5**: the compile-time parameter (`celeste_core::arith::Arithmetic`,
@@ -1458,9 +1458,10 @@ the horizon) survived every pruning step. `rewrite robust` ran on four
 files: the 2500m dual witness (141), the 1800m dual witness (113; the J4
 run's, the same inputs as J3's), and the 2600m dual (151) and float-only
 (149) witnesses with their prologue zeroed (the upload form, which exits
-on the same frames in both engines). Each is ROBUST: glibc's `sin`, every
-call one ulp up, one ulp down, and 8 random runs give the same exit frame.
-Nothing else was run through it. The witnesses
+on the same frames in both engines). Each is ROBUST: glibc's `sin`, MPFR's
+correctly rounded `sin`, every call one ulp up, one ulp down, and 8 random
+runs give the same exit frame (the correctly rounded variant added after
+the table, item 4). Nothing else was run through it. The witnesses
 are unsubmitted routes: under /var/tmp/float-check/m6/val, never
 committed.
 
@@ -1479,3 +1480,16 @@ committed.
   unchanged). The dual's fixed half exports byte-identical to the fixed
   gate's tree (`l00.frames.bin`) and its float half to the float gate's:
   the halves ARE the single searches.
+
+### The local goldens of the dual witnesses (item 4)
+
+The three dual witnesses of the validation table are LOCAL witnesses
+(/var/tmp/float-goldens/witnesses/witnesses.txt, never committed: they
+are unsubmitted routes), with their UCT and Celia traces
+(`tools/uct/golden.py local all`, `tools/celia/golden.py local all`).
+`trace::oracle::tests::the_local_goldens` replays them bit for bit: UCT 4
+goldens, 476 updates; Celia 4 goldens, 492 updates (the earlier local
+gemskip any% witness included); and every local witness leaves its room
+in the fixed engine. That check now follows every `rnd` lineage (some
+lineage exits on the last input, none before): the 2500m dual witness
+forks at frame 65 (a chest's unseeded shake in 16.16).

@@ -162,12 +162,13 @@ enum Command {
         save_marks: Option<String>,
     },
     /// A float witness's ROBUSTNESS to the host libm (plans/float-solver.md,
-    /// section 15, Q3): `--inputs` replayed in float (the run's float tool,
-    /// its seeds) under glibc's `sin`, then with every `sin` call one ulp
-    /// up, every call one ulp down, and `--random` runs moving each call by
-    /// -1, 0 or +1 ulp at random; the frame each first wins on. A variant
-    /// that differs from glibc's is reported FRAGILE (flagged, not
-    /// rejected); the exit code is 0 either way.
+    /// section 15, Q3; `search::robust`): `--inputs` replayed in float (the
+    /// run's float tool, its seeds) under glibc's `sin`, a correctly rounded
+    /// `sin` (MPFR), every `sin` call one ulp up, every call one ulp down,
+    /// and `--random` runs moving each call by -1, 0 or +1 ulp at random;
+    /// the frame each first wins on. A variant that differs from glibc's is
+    /// reported FRAGILE (flagged, not rejected); the exit code is 0 either
+    /// way.
     Robust {
         #[arg(long)]
         inputs: String,
@@ -1660,24 +1661,18 @@ fn main() -> Result<()> {
             dual(&cfg, &float, to, ceiling, level, checkpoint_dir, no_witness, prefer, save_marks)?;
         }
         Command::Robust { inputs, random } => {
-            use celeste_core::lua_f64::{with_sin_nudge, SinNudge};
             anyhow::ensure!(matches!(cfg.arith, Arith::Float(_)), "rewrite robust: a float witness (--arith float)");
             let bytes = celeste_rust::concrete::read_inputs(&inputs)?;
-            let run = |n: SinNudge| with_sin_nudge(n, || celeste_rust::search::dual::first_win::<LuaF64>(&bytes, &cfg));
-            let base = run(SinNudge::Off)?;
-            println!("[robust] glibc's sin: first win {base:?}");
-            let mut fragile = Vec::new();
-            for n in [SinNudge::Up, SinNudge::Down].into_iter().chain((1..=random).map(SinNudge::Random)) {
-                let w = run(n)?;
-                println!("[robust] {n:?}: first win {w:?}{}", if w == base { "" } else { "  <- DIFFERS" });
-                if w != base {
-                    fragile.push(format!("{n:?}"));
-                }
+            let rows = celeste_rust::search::robust::report(&bytes, &cfg, random)?;
+            let base = rows[0].1;
+            let fragile: Vec<&str> = rows.iter().filter(|r| r.1 != base).map(|r| r.0.as_str()).collect();
+            for (name, w) in &rows {
+                println!("[robust] {name}: first win {w:?}{}", if *w == base { "" } else { "  <- DIFFERS" });
             }
             if fragile.is_empty() {
-                println!("[robust] ROBUST: every nudged sin wins on the same frame ({} variants)", random + 2);
+                println!("[robust] ROBUST: every variant wins on glibc's frame ({} variants)", rows.len() - 1);
             } else {
-                println!("[robust] FRAGILE: {} of {} variants differ ({})", fragile.len(), random + 2, fragile.join(", "));
+                println!("[robust] FRAGILE: {} of {} variants differ ({})", fragile.len(), rows.len() - 1, fragile.join(", "));
             }
         }
         Command::HullStats { checkpoint_dir, to } => {

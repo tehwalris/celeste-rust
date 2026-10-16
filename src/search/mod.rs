@@ -11,6 +11,7 @@
 //!   * `known`      - a known solution checked against every pruning step
 //!   * `pos_graph`  - player-position cells and the position graph
 //!   * `result`     - `result.json`: what a search decided, as a record
+//!   * `robust`     - a float witness against the host libm's `sin` (Q3)
 //!   * `inspect`    - rows read by named fields, for the diagnostics
 //!   * `ui_export`  - `rewrite export-ui`: a finished run -> the web UI's data
 pub mod arc_check;
@@ -28,4 +29,5 @@ pub mod reach;
 pub mod rem;
 pub mod rem_f64;
 pub mod result;
+pub mod robust;
 pub mod ui_export;
