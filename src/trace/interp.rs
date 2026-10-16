@@ -2009,7 +2009,7 @@ mod tests {
             result = hyp2(t) + acc
             "#,
         );
-        let (it, v) = run(Symbolic::default(), &ast);
+        let (it, v) = run(Symbolic::<celeste_core::arith::Fixed>::default(), &ast);
         let Value::Num(n) = v else { panic!("expected a number, got {:?}", v) };
         assert_eq!(it.d.as_const(&n), Some(P8::from_i16(31)));
     }
@@ -2026,7 +2026,7 @@ mod tests {
             end
             "#,
         );
-        let mut d = Symbolic::default();
+        let mut d = Symbolic::<celeste_core::arith::Fixed>::default();
         let sym = d.graph.leaf(Op::Cell(1));
         let mut it = Interp::new(d);
         let mut st = fresh::<Symbolic>(&mut it.d);
@@ -2061,7 +2061,7 @@ mod tests {
             result = f()
             "#,
         );
-        let mut d = Symbolic::default();
+        let mut d = Symbolic::<celeste_core::arith::Fixed>::default();
         // An interval input: a lane can hold `input > 0` both ways.
         d.ival_cells.insert(1);
         d.forget_intervals();
@@ -2099,7 +2099,7 @@ mod tests {
             end
             "#,
         );
-        let mut d = Symbolic::default();
+        let mut d = Symbolic::<celeste_core::arith::Fixed>::default();
         let sym = d.graph.leaf(Op::Cell(1));
         let mut it = Interp::new(d);
         let mut st = fresh::<Symbolic>(&mut it.d);
@@ -2135,7 +2135,7 @@ mod tests {
             result = mv(input)
             "#,
         );
-        let mut d = Symbolic::default();
+        let mut d = Symbolic::<celeste_core::arith::Fixed>::default();
         d.level.fruit = true;
         // The literal [-4, 1): the fruit's `rem.y + spd.y`.
         let input = d.graph.leaf(Op::Const(-4 << 16, (1 << 16) - 1));
@@ -2185,7 +2185,7 @@ mod tests {
             ("local m = -32767 - 1\n x = -m", "-(-32768)"),
             ("local m = -32767 - 1\n x = abs(m)", "abs(-32768)"),
         ] {
-            for err in [refused(Symbolic::default(), src).err(), refused(Concrete::<celeste_core::arith::Fixed>::default(), src).err()] {
+            for err in [refused(Symbolic::<celeste_core::arith::Fixed>::default(), src).err(), refused(Concrete::<celeste_core::arith::Fixed>::default(), src).err()] {
                 let e = format!("{:#}", err.unwrap_or_else(|| panic!("{src}: refused")));
                 assert!(e.contains("arithmetic overflow") && e.contains("leaves the 16.16 range"), "{src}: {e}");
                 let shown = what.replace("-(-32768)", "--32768");
@@ -2199,7 +2199,7 @@ mod tests {
         }
         // One step inside: exact.
         let ast = parse("x = 32766.99998 + 1\n y = -32767 - 1\n z = 181 * 181");
-        let mut it = Interp::new(Symbolic::default());
+        let mut it = Interp::new(Symbolic::<celeste_core::arith::Fixed>::default());
         let st = fresh::<Symbolic>(&mut it.d);
         let out = it.exec_block(ast.nodes(), st).expect("in range");
         let s = &out[0].0;
@@ -2214,7 +2214,7 @@ mod tests {
     #[test]
     fn a_literal_split_past_max_ways_is_refused() {
         let ast = parse("result = __split_by_flr(input)");
-        let mut d = Symbolic::default();
+        let mut d = Symbolic::<celeste_core::arith::Fixed>::default();
         d.level.fruit = true;
         let input = d.graph.leaf(Op::Const(0, (300 << 16) - 1));
         let mut it = Interp::new(d);

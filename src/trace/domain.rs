@@ -10,8 +10,8 @@ use std::fmt::Debug;
 
 use anyhow::{bail, Result};
 
-use crate::pico8_num::Pico8Num as P8;
 use celeste_core::arith::{Arithmetic, Fixed};
+use crate::transpile::garith::GraphArith;
 use crate::transpile::graph::{Graph, NodeId, Op};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -408,10 +408,11 @@ impl<A: Arithmetic> Domain for Concrete<A> {
 
 // ---------------------------------------------------------------- symbolic
 
-/// The tracing domain. Owns the graph it is building.
+/// The tracing domain. Owns the graph it is building, in the arithmetic `A`
+/// (16.16 by default).
 #[derive(Default, Clone)]
-pub struct Symbolic {
-    pub graph: Graph,
+pub struct Symbolic<A: GraphArith = Fixed> {
+    pub graph: Graph<A>,
     /// `--build-trace`: the tracer's progress lines (`trace::verify`).
     pub build_trace: bool,
     /// FORK choices handed out this frame (the fork ids), buttons included.
@@ -475,14 +476,14 @@ pub struct Symbolic {
     /// Per frame.
     pub assumptions: Vec<NodeId>,
     /// `range_of`'s memo; a comparison the ranges decide folds.
-    range_memo: std::collections::HashMap<NodeId, Option<Pieces>>,
+    range_memo: std::collections::HashMap<NodeId, Option<A::Pieces>>,
     /// Comparisons decided from ranges this frame (a probe stat).
     pub range_folds: u64,
 }
 
-pub use crate::transpile::graph::Pieces;
+pub use crate::transpile::garith::Pieces;
 
-impl Symbolic {
+impl<A: GraphArith> Symbolic<A> {
     /// The input cells this trace refuses merges on (`reads_merge_refused`).
     pub fn set_merge_refused(&mut self, mut cells: Vec<u32>) {
         cells.sort_unstable();
@@ -514,7 +515,7 @@ impl Symbolic {
     /// `Known(Flr(..))` must not fold away). Exhaustive over `Op`: no
     /// catch-all to hide the next undecidable op.
     pub fn lane_undecidable(&self, b: NodeId) -> bool {
-        fn go(d: &Symbolic, memo: &mut rustc_hash::FxHashMap<NodeId, bool>, n: NodeId) -> bool {
+        fn go<A: GraphArith>(d: &Symbolic<A>, memo: &mut rustc_hash::FxHashMap<NodeId, bool>, n: NodeId) -> bool {
             if let Some(x) = memo.get(&n) {
                 return *x;
             }
@@ -549,7 +550,7 @@ impl Symbolic {
     /// `TileFlagAt`, `Mget`): how comparison operands are judged, without
     /// spurious forks.
     pub fn abstract_beneath_lane_ops(&self, n: NodeId) -> bool {
-        fn go(d: &Symbolic, memo: &mut rustc_hash::FxHashMap<NodeId, bool>, n: NodeId) -> bool {
+        fn go<A: GraphArith>(d: &Symbolic<A>, memo: &mut rustc_hash::FxHashMap<NodeId, bool>, n: NodeId) -> bool {
             if let Some(x) = memo.get(&n) {
                 return *x;
             }
@@ -583,7 +584,7 @@ impl Symbolic {
     /// on pain of its own error; reading that in would fold `Known(Flr(..))`
     /// away unsoundly). Every `Op` listed, no catch-all.
     pub fn abstractness(&self, n: NodeId) -> bool {
-        fn go(g: &Graph, ival: &std::collections::BTreeSet<u32>, memo: &mut rustc_hash::FxHashMap<NodeId, bool>, n: NodeId) -> bool {
+        fn go<A: GraphArith>(g: &Graph<A>, ival: &std::collections::BTreeSet<u32>, memo: &mut rustc_hash::FxHashMap<NodeId, bool>, n: NodeId) -> bool {
             if let Some(b) = memo.get(&n) {
                 return *b;
             }
@@ -628,9 +629,9 @@ impl Symbolic {
         go(&self.graph, &self.ival_cells, &mut self.abstract_memo.borrow_mut(), n)
     }
 
-    /// The static range of `n` (`graph::pieces_of`: from the restrictions).
-    pub fn range_of(&mut self, n: NodeId) -> Option<Pieces> {
-        crate::transpile::graph::pieces_of(&self.graph, &mut self.range_memo, n)
+    /// The static range of `n` (`GraphArith::pieces_of`: from the restrictions).
+    pub fn range_of(&mut self, n: NodeId) -> Option<A::Pieces> {
+        A::pieces_of(&self.graph, &mut self.range_memo, n)
     }
 
     /// Do the static ranges put every value of `n`'s EXACT result inside
@@ -638,7 +639,7 @@ impl Symbolic {
     /// (`graph::pieces_of`), so a result past it is unknown, not wrapped:
     /// false. Where true, `n` cannot overflow (`trace::error`).
     pub fn bounded(&mut self, n: NodeId) -> bool {
-        self.range_of(n).is_some_and(|pieces| pieces.iter().all(|&(lo, hi)| lo >= i32::MIN as i64 && hi <= i32::MAX as i64))
+        self.range_of(n).is_some_and(|pieces| A::bounded(&pieces))
     }
 
     /// Does anything give this frame a static range (a restriction)?
@@ -650,7 +651,7 @@ impl Symbolic {
     /// THE RANGE ASSUMPTION: `x` restricted to `[lo, hi]` (`Op::Restrict`),
     /// recorded so its own error is charged to every outcome. Its value is
     /// `x`'s, passed through with the range attached: read it in `x`'s place.
-    pub fn restrict(&mut self, x: NodeId, lo: i32, hi: i32) -> NodeId {
+    pub fn restrict(&mut self, x: NodeId, lo: A::Lit, hi: A::Lit) -> NodeId {
         let r = self.graph.add(Op::Restrict(lo, hi), vec![x]);
         if !self.assumptions.contains(&r) {
             self.assumptions.push(r);
@@ -662,7 +663,7 @@ impl Symbolic {
     /// so its check is charged to the frame. It has no data output: the
     /// caller makes every use of the input read the constant instead, so `x`
     /// feeds this check alone.
-    pub fn pin(&mut self, x: NodeId, c: crate::transpile::graph::Pinned) {
+    pub fn pin(&mut self, x: NodeId, c: crate::transpile::graph::Pinned<A>) {
         let p = self.graph.add(Op::Pin(c), vec![x]);
         if !self.assumptions.contains(&p) {
             self.assumptions.push(p);
@@ -683,7 +684,7 @@ impl Symbolic {
     /// never a graph arithmetic operand (no kernel computes that). EXACT:
     /// `op(Sel(c, t, f)) = Sel(c, op(t), op(f))`, same error.
     fn unknown_select(&self, n: NodeId) -> Option<(NodeId, NodeId, NodeId)> {
-        fn holds(g: &Graph, n: NodeId) -> bool {
+        fn holds<A: GraphArith>(g: &Graph<A>, n: NodeId) -> bool {
             let node = g.get(n);
             match node.op {
                 Op::UnknownNum => true,
@@ -702,7 +703,7 @@ impl Symbolic {
     }
 
     /// `n` as `base + literal` (either side), else `n + 0`.
-    fn base_plus_literal(&self, n: NodeId) -> (NodeId, (i32, i32)) {
+    fn base_plus_literal(&self, n: NodeId) -> (NodeId, (A::Lit, A::Lit)) {
         let node = self.graph.get(n);
         if let Op::Add = node.op {
             for (b, k) in [(node.args[0], node.args[1]), (node.args[1], node.args[0])] {
@@ -711,7 +712,8 @@ impl Symbolic {
                 }
             }
         }
-        (n, (0, 0))
+        let zero = A::lit(A::from_i16(0));
+        (n, (zero, zero))
     }
 
     /// Does boolean `n` read a comparison with an INTERVAL operand (one a lane
@@ -811,14 +813,16 @@ impl Symbolic {
     /// overflows is an error, which the cancelled form would no longer read.
     /// `None` where nothing cancels.
     fn cancel_sub(&mut self, a: NodeId, r: NodeId) -> Result<Option<NodeId>> {
+        // `x - x` is 0 exactly in either arithmetic (a double's is `+0`).
         if a == r {
-            return Ok(Some(self.konst(P8::from_raw(0))));
+            return Ok(Some(self.konst(A::from_i16(0))));
         }
         let op = self.graph.get(a).op.clone();
         let args = self.graph.get(a).args.clone();
         match op {
-            Op::Add if args[0] == r && self.bounded(a) => Ok(Some(args[1])),
-            Op::Add if args[1] == r && self.bounded(a) => Ok(Some(args[0])),
+            // `(r + c) - r` is `c` only where addition is exact (16.16).
+            Op::Add if A::EXACT_ADDITION && args[0] == r && self.bounded(a) => Ok(Some(args[1])),
+            Op::Add if A::EXACT_ADDITION && args[1] == r && self.bounded(a) => Ok(Some(args[0])),
             Op::Sel => {
                 let (c, t, f) = (args[0], args[1], args[2]);
                 let (tc, fc) = (self.cancel_sub(t, r)?, self.cancel_sub(f, r)?);
@@ -839,12 +843,15 @@ impl Symbolic {
         }
     }
 
-    /// `a + r` where `a` is `x - r`: `x` EXACTLY (16.16 addition is exact;
-    /// this tracer is 16.16's, `Domain::A = Fixed`), where the static ranges
-    /// bound `x - r`, so the cancelled sum overflowed nowhere (`x - r` keeps
-    /// its own check wherever else it is read). `move` reads `flr(rem +
-    /// 0.5)` of `__split_by_round`'s fragment, itself `x - 0.5`.
+    /// `a + r` where `a` is `x - r`: `x` EXACTLY, where addition is exact
+    /// (16.16; a double's `(x - r) + r` rounds) and the static ranges bound
+    /// `x - r`, so the cancelled sum overflowed nowhere (`x - r` keeps its
+    /// own check wherever else it is read). `move` reads `flr(rem + 0.5)` of
+    /// `__split_by_round`'s fragment, itself `x - 0.5` in 16.16.
     fn cancel_add(&mut self, a: NodeId, r: NodeId) -> Option<NodeId> {
+        if !A::EXACT_ADDITION {
+            return None;
+        }
         let (op, x, k) = {
             let node = self.graph.get(a);
             (node.op.clone(), node.args.first().copied(), node.args.get(1).copied())
@@ -859,9 +866,10 @@ impl Symbolic {
     /// escaped atoms): an unmemoized `Ints` fork of `[0, 1]` with no validity,
     /// so `SplitOk(2)` folds true and the fragments to `0` and `1`.
     pub fn both_values(&mut self, origin: &str) -> NodeId {
-        let choices = self.graph.leaf(Op::Const(0, 1 << 16));
+        let (zero, one) = (A::lit(A::from_i16(0)), A::lit(A::from_i16(1)));
+        let choices = self.graph.leaf(Op::Const(zero, one));
         let f = self.fork(&choices, Partition::Ints { ways: 2, memo: false }, origin);
-        let zero = self.graph.leaf(Op::Const(0, 0));
+        let zero = self.graph.leaf(Op::Const(zero, zero));
         self.graph.fold(Op::Gt, vec![f.value, zero])
     }
 
@@ -999,11 +1007,11 @@ impl Symbolic {
 
     /// `op` over LITERAL operands (one an interval) in `Graph::eval`'s
     /// semantics (one definition); `None` where eval does not model it.
-    fn eval_literal(&self, op: &Op, args: &[NodeId]) -> Option<crate::transpile::graph::Val> {
+    fn eval_literal(&self, op: &Op<A>, args: &[NodeId]) -> Option<crate::transpile::graph::Val<A>> {
         if !self.unknowns() {
             return None;
         }
-        let lits: Vec<(i32, i32)> = args
+        let lits: Vec<(A::Lit, A::Lit)> = args
             .iter()
             .map(|a| match self.graph.get(*a).op {
                 Op::Const(lo, hi) => Some((lo, hi)),
@@ -1013,41 +1021,42 @@ impl Symbolic {
         if lits.iter().all(|(lo, hi)| lo == hi) {
             return None;
         }
-        let mut g = Graph::new();
+        let mut g = Graph::<A>::default();
         let leaves: Vec<NodeId> = lits.iter().map(|(lo, hi)| g.leaf(Op::Const(*lo, *hi))).collect();
         let n = g.add(op.clone(), leaves);
         g.eval(&std::collections::HashMap::new()).ok().map(|v| v[n as usize])
     }
 
     /// `eval_literal`'s number as a literal node.
-    fn literal_num(&mut self, op: Op, args: &[NodeId]) -> Option<NodeId> {
+    fn literal_num(&mut self, op: Op<A>, args: &[NodeId]) -> Option<NodeId> {
         match self.eval_literal(&op, args)? {
             crate::transpile::graph::Val::Num(iv) => {
-                Some(self.graph.leaf(Op::Const(iv.low.as_raw_u32() as i32, iv.high.as_raw_u32() as i32)))
+                let (lo, hi) = A::bounds(iv);
+                Some(self.graph.leaf(Op::Const(A::lit(lo), A::lit(hi))))
             }
             crate::transpile::graph::Val::Bool(_) => None,
         }
     }
 
-    fn konst(&mut self, v: P8) -> NodeId {
-        let raw = v.as_raw_u32() as i32;
-        self.graph.leaf(Op::Const(raw, raw))
+    fn konst(&mut self, v: A::Num) -> NodeId {
+        let l = A::lit(v);
+        self.graph.leaf(Op::Const(l, l))
     }
     /// The constant a node is, if it is one.
-    fn as_p8(&self, n: NodeId) -> Option<P8> {
+    fn as_point(&self, n: NodeId) -> Option<A::Num> {
         match self.graph.get(n).op {
-            Op::Const(lo, hi) if lo == hi => Some(P8::from_raw(lo)),
+            Op::Const(lo, hi) if lo == hi => Some(A::from_lit(lo)),
             _ => None,
         }
     }
 }
 
-impl Domain for Symbolic {
-    type A = Fixed;
+impl<A: GraphArith> Domain for Symbolic<A> {
+    type A = A;
     type Num = NodeId;
     type Bool = NodeId;
 
-    fn num(&mut self, v: P8) -> NodeId {
+    fn num(&mut self, v: A::Num) -> NodeId {
         self.konst(v)
     }
     fn boolean(&mut self, b: bool) -> NodeId {
@@ -1055,8 +1064,8 @@ impl Domain for Symbolic {
     }
     fn arith(&mut self, op: Arith, a: &NodeId, b: &NodeId) -> Result<NodeId> {
         // Fold known operands, so what the heap depends on stays concrete.
-        if let (Some(x), Some(y)) = (self.as_p8(*a), self.as_p8(*b)) {
-            let mut c = Concrete::<Fixed>::default();
+        if let (Some(x), Some(y)) = (self.as_point(*a), self.as_point(*b)) {
+            let mut c = Concrete::<A>::default();
             return Ok(self.konst(c.arith(op, &x, &y)?));
         }
         if self.is_unknown_num(*a) || self.is_unknown_num(*b) {
@@ -1093,14 +1102,14 @@ impl Domain for Symbolic {
         Ok(self.graph.fold(g, vec![*a, *b]))
     }
     fn fun1(&mut self, f: Fun1, a: &NodeId) -> Result<NodeId> {
-        if let Some(x) = self.as_p8(*a) {
-            let mut c = Concrete::<Fixed>::default();
+        if let Some(x) = self.as_point(*a) {
+            let mut c = Concrete::<A>::default();
             return Ok(self.konst(c.fun1(f, &x)?));
         }
         // `sin` of anything is in [-1, 1]; other builtins of unknown: unknown.
         if self.is_unknown_num(*a) {
             return Ok(match f {
-                Fun1::Sin => self.graph.leaf(Op::Const(-0x1_0000, 0x1_0000)),
+                Fun1::Sin => self.graph.leaf(Op::Const(A::lit(A::from_i16(-1)), A::lit(A::from_i16(1)))),
                 _ => self.unknown_num(),
             });
         }
@@ -1111,8 +1120,8 @@ impl Domain for Symbolic {
         // `sin` of an interval is [-1, 1]: the emitter cannot lower `Sin`
         // over a ZI.
         if matches!(f, Fun1::Sin) && self.is_interval(a) {
-            let lo = self.konst(P8::from_i16(-1));
-            let hi = self.konst(P8::from_i16(1));
+            let lo = self.konst(A::from_i16(-1));
+            let hi = self.konst(A::from_i16(1));
             return Ok(self.graph.fold(Op::Span, vec![lo, hi]));
         }
         let g = match f {
@@ -1127,8 +1136,8 @@ impl Domain for Symbolic {
         Ok(self.graph.fold(g, vec![*a]))
     }
     fn fun2(&mut self, f: Fun2, a: &NodeId, b: &NodeId) -> Result<NodeId> {
-        if let (Some(x), Some(y)) = (self.as_p8(*a), self.as_p8(*b)) {
-            let mut c = Concrete::<Fixed>::default();
+        if let (Some(x), Some(y)) = (self.as_point(*a), self.as_point(*b)) {
+            let mut c = Concrete::<A>::default();
             return Ok(self.konst(c.fun2(f, &x, &y)?));
         }
         if self.is_unknown_num(*a) || self.is_unknown_num(*b) {
@@ -1152,8 +1161,8 @@ impl Domain for Symbolic {
         Ok(self.graph.fold(g, vec![*a, *b]))
     }
     fn compare(&mut self, op: Cmp, a: &NodeId, b: &NodeId) -> Result<NodeId> {
-        if let (Some(x), Some(y)) = (self.as_p8(*a), self.as_p8(*b)) {
-            let mut c = Concrete::<Fixed>::default();
+        if let (Some(x), Some(y)) = (self.as_point(*a), self.as_point(*b)) {
+            let mut c = Concrete::<A>::default();
             let r = c.compare(op, &x, &y)?;
             return Ok(self.graph.leaf(Op::ConstBool(r)));
         }
@@ -1185,30 +1194,7 @@ impl Domain for Symbolic {
         // Decided by static ranges iff every pair of pieces agrees.
         if self.has_ranges() {
             if let (Some(xs), Some(ys)) = (self.range_of(*a), self.range_of(*b)) {
-                let one = |x: (i64, i64), y: (i64, i64)| -> Option<bool> {
-                    match op {
-                        Cmp::Lt => if x.1 < y.0 { Some(true) } else if x.0 >= y.1 { Some(false) } else { None },
-                        Cmp::Le => if x.1 <= y.0 { Some(true) } else if x.0 > y.1 { Some(false) } else { None },
-                        Cmp::Gt => if x.0 > y.1 { Some(true) } else if x.1 <= y.0 { Some(false) } else { None },
-                        Cmp::Ge => if x.0 >= y.1 { Some(true) } else if x.1 < y.0 { Some(false) } else { None },
-                        Cmp::Eq => if x.0 == x.1 && y.0 == y.1 && x.0 == y.0 { Some(true) } else if x.1 < y.0 || y.1 < x.0 { Some(false) } else { None },
-                    }
-                };
-                let mut decided: Option<Option<bool>> = None;
-                'pairs: for x in &xs {
-                    for y in &ys {
-                        let r = one(*x, *y);
-                        match (decided, r) {
-                            (None, r) => decided = Some(r),
-                            (Some(p), r) if p == r => {}
-                            _ => {
-                                decided = Some(None);
-                                break 'pairs;
-                            }
-                        }
-                    }
-                }
-                if let Some(Some(r)) = decided {
+                if let Some(r) = A::decide_cmp(&lit, &xs, &ys) {
                     self.range_folds += 1;
                     return Ok(self.graph.leaf(Op::ConstBool(r)));
                 }
@@ -1257,8 +1243,8 @@ impl Domain for Symbolic {
     ) -> Result<NodeId> {
         Ok(self.graph.fold(Op::TileFlagAt, vec![*x, *y, *w, *h, *flag]))
     }
-    fn range_num(&mut self, lo: P8, hi: P8) -> Result<NodeId> {
-        Ok(self.graph.leaf(Op::Const(lo.as_raw_u32() as i32, hi.as_raw_u32() as i32)))
+    fn range_num(&mut self, lo: A::Num, hi: A::Num) -> Result<NodeId> {
+        Ok(self.graph.leaf(Op::Const(A::lit(lo), A::lit(hi))))
     }
     /// A button: a fork both of whose configurations every lane takes.
     fn unknown_bool(&mut self) -> Result<NodeId> {
@@ -1272,7 +1258,7 @@ impl Domain for Symbolic {
     /// and cart lookups never are), or lowering fails ("wants a ZN but the
     /// graph computes a ZI").
     fn is_interval(&self, v: &NodeId) -> bool {
-        fn go(g: &Graph, ival: &std::collections::BTreeSet<u32>, memo: &mut rustc_hash::FxHashMap<NodeId, bool>, n: NodeId) -> bool {
+        fn go<A: GraphArith>(g: &Graph<A>, ival: &std::collections::BTreeSet<u32>, memo: &mut rustc_hash::FxHashMap<NodeId, bool>, n: NodeId) -> bool {
             if let Some(b) = memo.get(&n) {
                 return *b;
             }
@@ -1323,15 +1309,8 @@ impl Domain for Symbolic {
         // are ranges.
         match self.range_of(*v) {
             Some(ps) => {
-                let sh = 16;
-                let w = if self.uncapped_ways {
-                    let lo = ps.iter().map(|p| p.0 >> sh).min().unwrap_or(0);
-                    let hi = ps.iter().map(|p| p.1 >> sh).max().unwrap_or(0);
-                    (hi - lo + 1).min(i64::from(u8::MAX))
-                } else {
-                    ps.iter().map(|p| (p.1 >> sh) - (p.0 >> sh) + 1).max().unwrap_or(1).min(MOVE_WAYS as i64)
-                };
-                w.max(1) as u8
+                let w = A::floors_spanned(&ps, self.uncapped_ways);
+                (if self.uncapped_ways { w } else { w.min(MOVE_WAYS as i64) }) as u8
             }
             None => MOVE_WAYS,
         }
@@ -1366,7 +1345,7 @@ impl Domain for Symbolic {
             return Some(self.unknown_num());
         }
         match (self.graph.get(*t).op.clone(), self.graph.get(*f).op.clone()) {
-            (Op::Const(a0, a1), Op::Const(b0, b1)) => Some(self.graph.leaf(Op::Const(a0.min(b0), a1.max(b1)))),
+            (Op::Const(a0, a1), Op::Const(b0, b1)) => Some(self.graph.leaf(Op::Const(lit_min::<A>(a0, b0), lit_max::<A>(a1, b1)))),
             // One value plus a literal on each side: that value plus the
             // literals' hull, so `x - last` still cancels.
             _ => {
@@ -1375,7 +1354,7 @@ impl Domain for Symbolic {
                 if tb != fb || matches!(self.graph.get(tb).op, Op::Const(..)) {
                     return None;
                 }
-                let k = self.graph.leaf(Op::Const(tk.0.min(fk.0), tk.1.max(fk.1)));
+                let k = self.graph.leaf(Op::Const(lit_min::<A>(tk.0, fk.0), lit_max::<A>(tk.1, fk.1)));
                 Some(self.graph.fold(Op::Add, vec![tb, k]))
             }
         }
@@ -1468,8 +1447,8 @@ impl Domain for Symbolic {
 
     fn describe_num(&self, n: &NodeId) -> String {
         match self.graph.get(*n).op {
-            Op::Const(lo, hi) if lo == hi => format!("{}", lo as f64 / 65536.0),
-            Op::Const(lo, hi) => format!("{}..{}", lo as f64 / 65536.0, hi as f64 / 65536.0),
+            Op::Const(lo, hi) if lo == hi => A::show(A::from_lit(lo)),
+            Op::Const(lo, hi) => format!("{}..{}", A::show(A::from_lit(lo)), A::show(A::from_lit(hi))),
             _ => "?".to_string(),
         }
     }
@@ -1529,6 +1508,9 @@ impl Domain for Symbolic {
             return Ok(None);
         }
         let Op::Const(lo, hi) = self.graph.get(*v).op else { return Ok(None) };
+        let Some((lo, hi)) = A::lit_raw_fixed(lo, hi) else {
+            anyhow::bail!("__split_by_flr of a literal interval: 16.16 only so far (the levels with unknowns)")
+        };
         if lo == hi {
             return Ok(None);
         }
@@ -1551,7 +1533,7 @@ impl Domain for Symbolic {
         let mut base = fl;
         while base <= fh {
             let (a, b) = (lo.max(base), hi.min(base + step - 1));
-            out.push(self.graph.leaf(Op::Const(a as i32, b as i32)));
+            out.push(self.graph.leaf(Op::Const(A::lit(A::from_fixed_raw(a as i32)), A::lit(A::from_fixed_raw(b as i32)))));
             base += step;
         }
         Ok(Some(out))
@@ -1561,8 +1543,8 @@ impl Domain for Symbolic {
         Ok(self.unknown_bool_atom())
     }
 
-    fn as_const(&self, v: &NodeId) -> Option<P8> {
-        self.as_p8(*v)
+    fn as_const(&self, v: &NodeId) -> Option<A::Num> {
+        self.as_point(*v)
     }
 
     fn describe(&self, v: &NodeId) -> String {
@@ -1581,6 +1563,14 @@ impl Domain for Symbolic {
 /// spans at most two floors.
 pub const MOVE_WAYS: u8 = 2;
 
+/// The lesser and the greater of two literals, by value.
+fn lit_min<A: Arithmetic>(a: A::Lit, b: A::Lit) -> A::Lit {
+    if A::lt(A::from_lit(b), A::from_lit(a)) { b } else { a }
+}
+fn lit_max<A: Arithmetic>(a: A::Lit, b: A::Lit) -> A::Lit {
+    if A::lt(A::from_lit(a), A::from_lit(b)) { b } else { a }
+}
+
 /// A refusal instead of a guess: where the heap would have become symbolic.
 pub fn refuse_unknown(what: &str) -> anyhow::Error {
     anyhow::anyhow!(
@@ -1592,6 +1582,7 @@ pub fn refuse_unknown(what: &str) -> anyhow::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::pico8_num::Pico8Num as P8;
 
     fn p(v: i16) -> P8 {
         P8::from_i16(v)
@@ -1602,7 +1593,7 @@ mod tests {
     /// HULL (five floors).
     #[test]
     fn level_minus_one_sizes_a_move_fork_by_the_hull_of_its_pieces() {
-        let mut d = Symbolic::default();
+        let mut d = Symbolic::<celeste_core::arith::Fixed>::default();
         let (rem, spd) = (d.graph.leaf(Op::Cell(0)), d.graph.leaf(Op::Cell(1)));
         let (rem, spd) = (d.restrict(rem, -0x8000, 0x7fff), d.restrict(spd, -5 << 16, 5 << 16));
         let zero = d.graph.leaf(Op::Const(0, 0));
@@ -1623,7 +1614,7 @@ mod tests {
     /// The FORK TRIGGER's contract on hand-built graphs.
     #[test]
     fn the_fork_trigger_excludes_what_a_lane_decides_for_itself() {
-        let mut d = Symbolic::default();
+        let mut d = Symbolic::<celeste_core::arith::Fixed>::default();
         let ival = d.graph.leaf(Op::Cell(0));
         let exact = d.graph.leaf(Op::Cell(1));
         d.ival_cells.insert(0);
@@ -1670,7 +1661,7 @@ mod tests {
     /// `delay - 1 <= 0` distribute over the select, so set lanes stay exact.
     #[test]
     fn an_operation_on_a_select_of_the_unknown_number_is_distributed() {
-        let mut d = Symbolic::default();
+        let mut d = Symbolic::<celeste_core::arith::Fixed>::default();
         let c = d.graph.leaf(Op::Cell(0));
         let (sixty, one, zero) = (d.num(p(60)), d.num(p(1)), d.num(p(0)));
         let u = d.unknown_num();
@@ -1687,7 +1678,7 @@ mod tests {
     /// `abstractness` and `lane_undecidable` answer different questions.
     #[test]
     fn abstractness_is_not_the_fork_trigger() {
-        let mut d = Symbolic::default();
+        let mut d = Symbolic::<celeste_core::arith::Fixed>::default();
         let ival = d.graph.leaf(Op::Cell(0));
         d.ival_cells.insert(0);
         d.forget_intervals();
@@ -1709,7 +1700,7 @@ mod tests {
         let one = 1 << 16;
         for fruit_unknown in [false, true] {
             let answers = |lo: i32, hi: i32| {
-                let mut d = Symbolic { level: celeste_engine::widening::Level { fruit: fruit_unknown, ..Default::default() }, ..Default::default() };
+                let mut d = Symbolic::<celeste_core::arith::Fixed> { level: celeste_engine::widening::Level { fruit: fruit_unknown, ..Default::default() }, ..Default::default() };
                 let x = d.graph.leaf(Op::Const(lo, hi));
                 let k = d.graph.leaf(Op::Const(one, one));
                 let eq = d.graph.fold(Op::Eq, vec![x, k]);
@@ -1726,7 +1717,7 @@ mod tests {
             assert_eq!(answers(0, 0), (Some(false), Some(true)), "[0, 0] only unequal");
         }
         // An operand reading an unknown: no ends to read, both ways.
-        let mut d = Symbolic { level: celeste_engine::widening::Level { fruit: true, ..Default::default() }, ..Default::default() };
+        let mut d = Symbolic::<celeste_core::arith::Fixed> { level: celeste_engine::widening::Level { fruit: true, ..Default::default() }, ..Default::default() };
         let u = d.unknown_bool_atom();
         let (a, b) = (d.graph.leaf(Op::Const(0, 2 * one)), d.graph.leaf(Op::Const(one, one)));
         let x = d.graph.fold(Op::Sel, vec![u, a, b]);

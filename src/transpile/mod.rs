@@ -7,6 +7,7 @@
 //! analysis CLI is `src/bin/transpile.rs`.
 
 pub mod bdd;
+pub mod garith;
 pub mod graph;
 pub mod ival;
 pub mod kernel;

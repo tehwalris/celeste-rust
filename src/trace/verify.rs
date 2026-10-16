@@ -1349,7 +1349,7 @@ fn arms(
 }
 
 /// The nodes `roots` reach, ascending (operands precede their node).
-pub(crate) fn cone(g: &crate::transpile::graph::Graph, roots: &[NodeId]) -> Vec<NodeId> {
+pub(crate) fn cone<A: crate::transpile::garith::GraphArith>(g: &crate::transpile::graph::Graph<A>, roots: &[NodeId]) -> Vec<NodeId> {
     let mut seen: rustc_hash::FxHashSet<NodeId> = Default::default();
     let mut stack: Vec<NodeId> = roots.to_vec();
     while let Some(n) = stack.pop() {

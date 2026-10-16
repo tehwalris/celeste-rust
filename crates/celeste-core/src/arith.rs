@@ -26,6 +26,9 @@ pub trait Arithmetic: 'static + Copy + Default + Debug + Send + Sync + PartialEq
     type Num: Copy + Debug + PartialEq + Eq + Hash + Send + Sync + 'static;
     /// A closed interval of numbers (the reference domain's value).
     type Ival: Copy + Debug + PartialEq + Eq + Hash + Send + Sync + 'static;
+    /// A number as the kernels' graph IR stores a literal
+    /// (`transpile::graph::Op::Const`): 16.16's raw `i32`, a double's bits.
+    type Lit: Copy + Debug + PartialEq + Eq + Hash + Send + Sync + 'static;
 
     /// `fixed` or `float`: the setting's value.
     const NAME: &'static str;
@@ -36,6 +39,9 @@ pub trait Arithmetic: 'static + Copy + Default + Debug + Send + Sync + PartialEq
     const ROUND_BY_SHIFTED_FLOOR: bool;
 
     fn from_i16(v: i16) -> Self::Num;
+    /// A number as a graph literal, and back (`Lit`).
+    fn lit(v: Self::Num) -> Self::Lit;
+    fn from_lit(l: Self::Lit) -> Self::Num;
     /// The value as an `i16`, where it is an integer in range.
     fn as_i16(v: Self::Num) -> Option<i16>;
     /// A cart literal, as the arithmetic's console or tool reads it.
@@ -115,10 +121,17 @@ type Iv = Pico8NumInterval;
 impl Arithmetic for Fixed {
     type Num = P8;
     type Ival = Iv;
+    type Lit = i32;
     const NAME: &'static str = "fixed";
     const RANGE_NOTE: &'static str = "the 16.16 range (PICO-8 would wrap or saturate; overflow is an error)";
     const ROUND_BY_SHIFTED_FLOOR: bool = true;
 
+    fn lit(v: P8) -> i32 {
+        v.as_raw_u32() as i32
+    }
+    fn from_lit(l: i32) -> P8 {
+        P8::from_raw(l)
+    }
     fn from_i16(v: i16) -> P8 {
         P8::from_i16(v)
     }
@@ -270,10 +283,18 @@ type FI = LuaF64Interval;
 impl Arithmetic for Float {
     type Num = F;
     type Ival = FI;
+    type Lit = u64;
     const NAME: &'static str = "float";
     const RANGE_NOTE: &'static str = "the finite doubles (an infinity or NaN; a non-finite result is an error)";
     const ROUND_BY_SHIFTED_FLOOR: bool = false;
 
+    fn lit(v: F) -> u64 {
+        v.to_bits()
+    }
+    /// A graph literal is a finite double (`lit` made it).
+    fn from_lit(l: u64) -> F {
+        F::new(f64::from_bits(l)).expect("a graph literal is a finite double")
+    }
     fn from_i16(v: i16) -> F {
         F::from_i16(v)
     }
