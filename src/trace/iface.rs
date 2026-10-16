@@ -251,24 +251,3 @@ pub fn symbolize<A: GraphArith>(
     d.forget_intervals();
     Ok(Iface { slots, init, pins, ival })
 }
-
-/// Read every scalar under `root` as a CONCRETE value (the oracle side of the
-/// differential check). A slot that stayed symbolic is an error, never skipped.
-pub fn read_concrete<A: GraphArith>(d: &Symbolic<A>, st: &State<Symbolic<A>>, root: &[Step]) -> Result<Vec<(Path, Conc<A>)>> {
-    let mut out = Vec::new();
-    for p in scalars(st, root)? {
-        let c = match get(st, &p).unwrap() {
-            Value::Num(n) => Conc::Num(
-                d.as_const(&n)
-                    .ok_or_else(|| anyhow!("{} did not stay concrete", show(&p)))?,
-            ),
-            Value::Bool(b) => Conc::Bool(
-                d.decide(&b)
-                    .ok_or_else(|| anyhow!("{} did not stay concrete", show(&p)))?,
-            ),
-            _ => unreachable!("scalars only yields scalars"),
-        };
-        out.push((p, c));
-    }
-    Ok(out)
-}

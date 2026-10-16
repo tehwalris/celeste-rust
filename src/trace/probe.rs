@@ -31,7 +31,7 @@
 
 use anyhow::{bail, Result};
 
-use super::cart::{fresh_state, run_chunk};
+use super::cart::{fresh_state, run_one};
 use super::domain::Symbolic;
 use super::heap::Value;
 use super::interp::Interp;
@@ -53,7 +53,7 @@ fn run_corpus_source(corpus: &str) -> Result<Vec<String>> {
     let mut it: Interp<Symbolic> = Interp::new(Symbolic::default());
     let mut st = fresh_state::<Symbolic>(&mut it.d);
     st.heap.tables.get_mut(&st.globals).expect("the globals table").hash.insert("__hex".to_string(), Value::Builtin("__hex"));
-    run_chunk(&mut it, &ast, st)?;
+    run_one(&mut it, &ast, st)?;
     Ok(std::mem::take(&mut it.prints))
 }
 

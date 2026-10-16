@@ -161,15 +161,6 @@ pub fn renumber_cells<A: GraphArith>(
     Ok((out, roots.iter().map(|r| map[*r as usize]).collect()))
 }
 
-/// Resolve a traced frame's INPUT interface against a block: the canonical
-/// cell for each `Op::Cell(i)`.
-///
-/// Inputs only: an outcome that allocates names cells the input block does
-/// not have, so outputs bind against their own shape (`block::skeleton`).
-pub fn bind_inputs<N: EngineNum, A: GraphArith>(rt2: &Rt2<N>, iface: &super::iface::Iface<A>) -> Result<Vec<u32>> {
-    resolve_all(rt2, &iface.slots)
-}
-
 /// Resolve a whole interface, naming the path that failed - and REFUSE
 /// if two paths land on one cell.
 ///
@@ -319,29 +310,15 @@ mod tests {
     /// the structure the tracer builds (a merge would be silent corruption).
     #[test]
     fn a_traced_state_becomes_a_structure_every_path_can_walk() {
-        use crate::trace::{cart, domain::Symbolic, interp::Interp, verify::run_one};
-
-        let src = cart::sources(&crate::settings::Settings::default()).expect("sources");
-        let top = full_moon::parse(&src).expect("parse");
-        let init = full_moon::parse("_init()").expect("parse _init");
-        let frame = full_moon::parse(cart::FRAME_CODE).expect("parse frame");
+        use crate::trace::{cart, domain::Symbolic, interp::Interp};
+        let (root, s) = (std::path::Path::new("."), crate::settings::Settings::default());
+        let chunks = cart::Chunks::parse(root, &s).expect("chunks");
         let mut it: Interp<Symbolic> = Interp::new(Symbolic::default());
-        let cd = std::sync::Arc::new(
-            celeste_core::cart_data::CartData::load("cart").expect("cart"),
-        );
-        let (rx, ry) = crate::settings::Settings::default().room;
-        let cache = std::sync::Arc::new(
-            celeste_core::collision_cache::CollisionCache::new(&cd, rx, ry).expect("cache"),
-        );
-        it.cache = Some(cache.clone());
-        it.cart = Some(cd.clone());
-        let st = cart::fresh_state::<Symbolic>(&mut it.d);
-        let mut st = run_one(&mut it, &top, st).expect("toplevel");
-        cart::inject_tile_flag_at(&mut st);
-        let mut st = run_one(&mut it, &init, st).expect("_init");
+        let mut st = cart::boot(&mut it, &chunks, root, s.room).expect("boot");
         for _ in 0..12 {
-            st = run_one(&mut it, &frame, st).expect("warm-up");
+            st = cart::run_one(&mut it, &chunks.frame, st).expect("warm-up");
         }
+        let (cd, cache) = (it.cart.clone().expect("cart"), it.cache.clone().expect("cache"));
 
         let rt2: Rt2 = crate::trace::block::skeleton(&st, cd, cache).expect("structure");
         let mut seen: std::collections::HashMap<u32, Path> = Default::default();

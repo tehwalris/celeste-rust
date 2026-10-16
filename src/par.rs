@@ -5,6 +5,7 @@
 
 use anyhow::Result;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Mutex;
 
 /// A pool of `threads` workers (at most one per item, at least one).
 pub struct Pool {
@@ -42,16 +43,19 @@ impl Pool {
     /// `init` (built in the worker), results by index.
     pub fn map_with<S, T: Send>(&self, n: usize, init: impl Fn() -> Result<S> + Sync, f: impl Fn(&mut S, usize) -> Result<T> + Sync) -> Result<Vec<T>> {
         let next = AtomicUsize::new(0);
-        let work = || -> Result<Vec<(usize, T)>> {
+        // One slot per item, allocated HERE, before any worker runs: a worker
+        // keeps nothing live between items (a result vector growing in its
+        // glibc arena pins the memory earlier items freed: +6 GB, 16 workers).
+        let slots: Vec<Mutex<Option<T>>> = (0..n).map(|_| Mutex::new(None)).collect();
+        let work = || -> Result<()> {
             let mut state = init()?;
-            let mut mine = Vec::new();
             loop {
                 let i = next.fetch_add(1, Ordering::Relaxed);
                 if i >= n {
-                    return Ok(mine);
+                    return Ok(());
                 }
                 match f(&mut state, i) {
-                    Ok(v) => mine.push((i, v)),
+                    Ok(v) => *slots[i].lock().expect("a result slot") = Some(v),
                     Err(e) => {
                         next.store(n, Ordering::Relaxed);
                         return Err(e);
@@ -59,7 +63,7 @@ impl Pool {
                 }
             }
         };
-        let parts = std::thread::scope(|s| {
+        std::thread::scope(|s| {
             let handles: Vec<_> = (0..self.workers(n))
                 .map(|_| {
                     let mut b = std::thread::Builder::new();
@@ -69,12 +73,9 @@ impl Pool {
                     b.spawn_scoped(s, &work).expect("spawn a pool worker")
                 })
                 .collect();
-            handles.into_iter().map(|h| h.join().unwrap_or_else(|p| std::panic::resume_unwind(p))).collect::<Result<Vec<_>>>()
+            handles.into_iter().map(|h| h.join().unwrap_or_else(|p| std::panic::resume_unwind(p))).collect::<Result<Vec<()>>>()
         })?;
-        let mut all: Vec<(usize, T)> = parts.into_iter().flatten().collect();
-        all.sort_unstable_by_key(|p| p.0);
-        debug_assert!(all.iter().enumerate().all(|(k, p)| p.0 == k));
-        Ok(all.into_iter().map(|p| p.1).collect())
+        Ok(slots.into_iter().map(|m| m.into_inner().expect("a result slot").expect("every item ran")).collect())
     }
 }
 

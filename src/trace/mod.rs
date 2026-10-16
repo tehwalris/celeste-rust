@@ -10,10 +10,9 @@
 //! scopes are facts at trace time, so `count(objects)`, `#t` and loop bounds
 //! resolve concretely. Only game DATA is symbolic.
 //!
-//! One interpreter, several domains: `domain::Concrete` (the oracle, builds
-//! the initial heap), `domain::Symbolic` (the tracer) and
-//! `refdomain::RefDomain` (the reference engine) share the code, so they
-//! cannot drift.
+//! One interpreter, two domains: `domain::Symbolic` (the tracer) and
+//! `refdomain::RefDomain` (the reference engine, the independent oracle)
+//! share the code, so they cannot drift.
 //!
 //! Values own nothing: `Symbolic` owns the `Graph` and a `Num`/`Bool` is a
 //! `NodeId`, so cloning a state to run the other arm clones only the heap,
@@ -25,22 +24,22 @@ pub mod refdomain;
 pub mod refdriver;
 pub mod refengine;
 pub mod refbridge;
-pub mod oracle;
+#[cfg(test)]
+mod oracle;
 pub mod bind;
 pub mod block;
 pub mod cart;
 pub mod domain;
 pub mod emit;
 pub mod error;
-#[cfg(test)]
-pub mod eval;
 pub mod heap;
 pub mod iface;
 pub mod kernel;
 pub mod interp;
 pub mod level_minus_one;
 pub mod shapes;
-pub mod probe;
+#[cfg(test)]
+mod probe;
 pub mod state;
 pub mod verify;
 pub mod widen;

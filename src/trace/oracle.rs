@@ -288,26 +288,12 @@ mod tests {
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("gates").join(tool_dir(tool));
         let manifest = std::fs::read_to_string(dir.join("manifest.txt")).unwrap_or_else(|e| panic!("{}: {e}", dir.join("manifest.txt").display()));
         let lines: Vec<&str> = manifest.lines().filter(|l| !l.trim().is_empty()).collect();
-        let next = std::sync::atomic::AtomicUsize::new(0);
-        let workers = std::thread::available_parallelism().map_or(4, |n| n.get()).min(16);
-        let compared: usize = std::thread::scope(|sc| {
-            let hs: Vec<_> = (0..workers)
-                .map(|_| {
-                    let (lines, next, dir) = (&lines, &next, &dir);
-                    std::thread::Builder::new()
-                        .stack_size(64 << 20)
-                        .spawn_scoped(sc, move || {
-                            let mut n = 0;
-                            while let Some(line) = lines.get(next.fetch_add(1, std::sync::atomic::Ordering::Relaxed)) {
-                                n += replay_golden(dir, line, tool).unwrap_or_else(|e| panic!("{line}: {e:#}"));
-                            }
-                            n
-                        })
-                        .expect("spawn")
-                })
-                .collect();
-            hs.into_iter().map(|h| h.join().expect("a golden failed")).sum()
-        });
+        let compared: usize = crate::par::Pool::new(16)
+            .stack(64 << 20)
+            .map(lines.len(), |i| replay_golden(&dir, lines[i], tool).map_err(|e| e.context(lines[i].to_string())))
+            .unwrap_or_else(|e| panic!("{e:#}"))
+            .into_iter()
+            .sum();
         eprintln!("[{}] {} goldens, {compared} updates compared", tool_dir(tool), lines.len());
         assert!(compared > 0, "no golden compared anything");
     }

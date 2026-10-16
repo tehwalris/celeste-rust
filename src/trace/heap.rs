@@ -23,6 +23,7 @@ pub type ClosureId = u32;
 /// the heap, so the heap stores an index rather than a reference).
 pub type BodyId = u32;
 
+#[derive(Clone)]
 pub enum Value<D: Domain> {
     Nil,
     Num(D::Num),
@@ -39,20 +40,6 @@ pub enum Value<D: Domain> {
     /// on two closures is refused rather than answered (`Interp::eval_binop`).
     Func(ClosureId),
     Builtin(&'static str),
-}
-
-impl<D: Domain> Clone for Value<D> {
-    fn clone(&self) -> Self {
-        match self {
-            Value::Nil => Value::Nil,
-            Value::Num(n) => Value::Num(n.clone()),
-            Value::Bool(b) => Value::Bool(b.clone()),
-            Value::Str(s) => Value::Str(s.clone()),
-            Value::Table(t) => Value::Table(*t),
-            Value::Func(c) => Value::Func(*c),
-            Value::Builtin(n) => Value::Builtin(n),
-        }
-    }
 }
 
 impl<D: Domain> PartialEq for Value<D> {
@@ -91,6 +78,7 @@ impl<D: Domain> std::fmt::Debug for Value<D> {
 /// on a real PICO-8 (`lua/probe/tables.lua`), `t={} t[3]="c"` has `#t == 0`
 /// (dense-with-nils would say 3), and `t[1]="a" t[2]="b"` then gives 3 once
 /// the array part absorbs the gap.
+#[derive(Clone, Default)]
 pub struct Table<D: Domain> {
     pub hash: BTreeMap<String, Value<D>>,
     /// The array part. May contain explicit `Nil`s (Lua does not shrink it).
@@ -180,27 +168,10 @@ impl<D: Domain> Table<D> {
     }
 }
 
-impl<D: Domain> Clone for Table<D> {
-    fn clone(&self) -> Self {
-        Table { hash: self.hash.clone(), arr: self.arr.clone(), ints: self.ints.clone() }
-    }
-}
-
-impl<D: Domain> Default for Table<D> {
-    fn default() -> Self {
-        Table { hash: BTreeMap::new(), arr: Vec::new(), ints: BTreeMap::new() }
-    }
-}
-
+#[derive(Clone)]
 pub struct Scope<D: Domain> {
     pub vars: BTreeMap<String, Value<D>>,
     pub parent: Option<ScopeId>,
-}
-
-impl<D: Domain> Clone for Scope<D> {
-    fn clone(&self) -> Self {
-        Scope { vars: self.vars.clone(), parent: self.parent }
-    }
 }
 
 impl<D: Domain> PartialEq for Table<D> {
@@ -243,33 +214,12 @@ pub struct Closure {
     pub captures: Vec<String>,
 }
 
+#[derive(Clone, Default)]
 pub struct Heap<D: Domain> {
     pub tables: BTreeMap<TableId, Table<D>>,
     pub scopes: BTreeMap<ScopeId, Scope<D>>,
     pub closures: BTreeMap<ClosureId, Closure>,
     next: u32,
-}
-
-impl<D: Domain> Clone for Heap<D> {
-    fn clone(&self) -> Self {
-        Heap {
-            tables: self.tables.clone(),
-            scopes: self.scopes.clone(),
-            closures: self.closures.clone(),
-            next: self.next,
-        }
-    }
-}
-
-impl<D: Domain> Default for Heap<D> {
-    fn default() -> Self {
-        Heap {
-            tables: BTreeMap::new(),
-            scopes: BTreeMap::new(),
-            closures: BTreeMap::new(),
-            next: 0,
-        }
-    }
 }
 
 impl<D: Domain> Heap<D> {
@@ -350,46 +300,45 @@ impl<D: Domain> Heap<D> {
 
     /// The tables, scopes and closures reachable from `roots`.
     pub fn reachable(&self, roots: &[Root]) -> (BTreeSet<TableId>, BTreeSet<ScopeId>, BTreeSet<ClosureId>) {
-        let mut live_t: BTreeSet<TableId> = BTreeSet::new();
-        let mut live_s: BTreeSet<ScopeId> = BTreeSet::new();
-        let mut live_c: BTreeSet<ClosureId> = BTreeSet::new();
-        let mut stack: Vec<Root> = roots.to_vec();
-        while let Some(r) = stack.pop() {
+        let mut live: (BTreeSet<TableId>, BTreeSet<ScopeId>, BTreeSet<ClosureId>) = Default::default();
+        self.visit(roots, |r| match r {
+            Root::Table(t) => live.0.insert(t),
+            Root::Scope(s) => live.1.insert(s),
+            Root::Closure(c) => live.2.insert(c),
+        });
+        live
+    }
+
+    /// Every object reachable from `roots`, BREADTH-FIRST (the canonical
+    /// order `shape_and_order` numbers objects by): `first` is told of each
+    /// and says whether it is new (an object seen before is not entered).
+    /// The ONE place that knows what an object refers to (with `push_value`).
+    fn visit(&self, roots: &[Root], mut first: impl FnMut(Root) -> bool) {
+        let mut queue: Vec<Root> = roots.to_vec();
+        let mut i = 0;
+        while i < queue.len() {
+            let r = queue[i];
+            i += 1;
+            if !first(r) {
+                continue;
+            }
             match r {
-                Root::Closure(c) => {
-                    if !live_c.insert(c) {
-                        continue;
-                    }
-                    if let Some(cl) = self.closures.get(&c) {
-                        stack.push(Root::Scope(cl.env));
-                    }
-                }
+                Root::Closure(c) => queue.extend(self.closures.get(&c).map(|cl| Root::Scope(cl.env))),
                 Root::Table(t) => {
-                    if !live_t.insert(t) {
-                        continue;
-                    }
-                    if let Some(tab) = self.tables.get(&t) {
-                        for v in tab.values() {
-                            push_value(v, &mut stack);
-                        }
+                    for v in self.tables.get(&t).into_iter().flat_map(|tab| tab.values()) {
+                        push_value(v, &mut queue);
                     }
                 }
                 Root::Scope(s) => {
-                    if !live_s.insert(s) {
-                        continue;
-                    }
                     if let Some(sc) = self.scopes.get(&s) {
                         for v in sc.vars.values() {
-                            push_value(v, &mut stack);
+                            push_value(v, &mut queue);
                         }
-                        if let Some(p) = sc.parent {
-                            stack.push(Root::Scope(p));
-                        }
+                        queue.extend(sc.parent.map(Root::Scope));
                     }
                 }
             }
         }
-        (live_t, live_s, live_c)
     }
 }
 
@@ -452,52 +401,29 @@ impl<D: Domain> Heap<D> {
         let mut t_num: BTreeMap<TableId, u32> = BTreeMap::new();
         let mut s_num: BTreeMap<ScopeId, u32> = BTreeMap::new();
         let mut c_num: BTreeMap<ClosureId, u32> = BTreeMap::new();
-        let mut queue: Vec<Root> = roots.to_vec();
         let mut order: Vec<Root> = Vec::new();
-        let mut i = 0;
-        while i < queue.len() {
-            let r = queue[i];
-            i += 1;
-            match r {
-                Root::Closure(c) => {
-                    if c_num.contains_key(&c) {
-                        continue;
+        self.visit(roots, |r| {
+            // The next number, on first sight.
+            let number = |m: &mut BTreeMap<u32, u32>, id: u32| {
+                let k = m.len() as u32;
+                match m.entry(id) {
+                    std::collections::btree_map::Entry::Vacant(e) => {
+                        e.insert(k);
+                        true
                     }
-                    c_num.insert(c, c_num.len() as u32);
-                    order.push(r);
-                    if let Some(cl) = self.closures.get(&c) {
-                        queue.push(Root::Scope(cl.env));
-                    }
+                    std::collections::btree_map::Entry::Occupied(_) => false,
                 }
-                Root::Table(t) => {
-                    if t_num.contains_key(&t) {
-                        continue;
-                    }
-                    t_num.insert(t, t_num.len() as u32);
-                    order.push(r);
-                    if let Some(tab) = self.tables.get(&t) {
-                        for v in tab.values() {
-                            push_value(v, &mut queue);
-                        }
-                    }
-                }
-                Root::Scope(s) => {
-                    if s_num.contains_key(&s) {
-                        continue;
-                    }
-                    s_num.insert(s, s_num.len() as u32);
-                    order.push(r);
-                    if let Some(sc) = self.scopes.get(&s) {
-                        for v in sc.vars.values() {
-                            push_value(v, &mut queue);
-                        }
-                        if let Some(p) = sc.parent {
-                            queue.push(Root::Scope(p));
-                        }
-                    }
-                }
+            };
+            let new = match r {
+                Root::Table(t) => number(&mut t_num, t),
+                Root::Scope(s) => number(&mut s_num, s),
+                Root::Closure(c) => number(&mut c_num, c),
+            };
+            if new {
+                order.push(r);
             }
-        }
+            new
+        });
         let slot = |v: &Value<D>| -> Slot {
             match v {
                 Value::Nil => Slot::Nil,

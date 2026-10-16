@@ -4,10 +4,7 @@
 //! one path at a time).
 
 use anyhow::{ensure, Result};
-use std::sync::Arc;
 
-use celeste_core::cart_data::CartData;
-use celeste_core::collision_cache::CollisionCache;
 use celeste_engine::runtime2::Rt2;
 use full_moon::ast;
 
@@ -17,13 +14,12 @@ use crate::trace::interp::Interp;
 use crate::trace::block::{fn_info_of, FnInfo};
 use crate::trace::refbridge::{from_block, set_buttons, to_block};
 use crate::trace::refdomain::RefDomain;
-use crate::trace::refdriver::{fresh_interp, run_frame_all};
+use crate::trace::refdriver::run_frame_all;
 use celeste_core::arith::{Arithmetic, EngineNum, Fixed, Float};
 use crate::trace::heap::Value;
 use crate::trace::iface;
 use crate::trace::state::State;
 use crate::trace::widen::{field, objects_of_type};
-use crate::trace::verify::run_one;
 use crate::trace::state::ArcAxis;
 use crate::search::rem::{Capture, Rem};
 use celeste_core::pico8_num::Pico8Num;
@@ -54,33 +50,18 @@ pub type RefEngine = ReferenceEngine<Fixed>;
 /// The float tools' reference engine (Lua doubles).
 pub type FloatRefEngine = ReferenceEngine<Float>;
 
-// The raw pointers inside (`Interp`'s AST references) point into the
-// `'static` ASTs leaked in `new`, immutable and never freed, so moving the
-// engine to another thread is sound.
-unsafe impl<A: Arithmetic> Send for ReferenceEngine<A> {}
 
 impl<A: Arithmetic> ReferenceEngine<A> {
     /// Parse the cart, run its toplevel and `_init` for the start room of
     /// settings `s`, the engine's settings from then on.
     pub fn new(s: &crate::settings::Settings) -> Result<Self> {
-        let leak = |src: &str| -> Result<&'static ast::Ast> { Ok(Box::leak(Box::new(full_moon::parse(src)?))) };
-        let top = leak(&crate::trace::cart::sources(s)?)?;
-        crate::trace::cart::check_absent_fields(top)?;
-        let init = leak("_init()")?;
-        let body = leak("__reset_button_states()\n_update()\n_draw()")?;
-        let body_concrete = leak("_update()\n_draw()")?;
-
-        let cart = Arc::new(CartData::load("cart")?);
-        let (rx, ry) = s.room;
-        let cache = Arc::new(CollisionCache::new(&cart, rx, ry)?);
-
-        let mut it = fresh_interp(cart, cache);
-        let st0 = crate::trace::cart::fresh_state::<RefDomain<A>>(&mut it.d);
-        let mut st0 = run_one(&mut it, top, st0)?;
-        crate::trace::cart::inject_tile_flag_at(&mut st0);
-        let base = run_one(&mut it, init, st0)?;
+        let root = std::path::Path::new(".");
+        let chunks = crate::trace::cart::Chunks::parse(root, s)?.leak();
+        let body: &'static ast::Ast = Box::leak(Box::new(full_moon::parse(&format!("__reset_button_states()\n{}", crate::trace::cart::FRAME_CODE))?));
+        let mut it = Interp::new(RefDomain::new());
+        let base = crate::trace::cart::boot(&mut it, chunks, root, s.room)?;
         let fn_info = fn_info_of(&base)?;
-        Ok(ReferenceEngine { it, body, body_concrete, base, fn_info, path_cap: 1_000_000, level: Level::EXACT, settings: std::sync::Arc::new(s.clone()) })
+        Ok(ReferenceEngine { it, body, body_concrete: &chunks.frame, base, fn_info, path_cap: 1_000_000, level: Level::EXACT, settings: std::sync::Arc::new(s.clone()) })
     }
 
     /// The engine with `run_lane` at `level`.
@@ -150,12 +131,23 @@ where
     /// the same successors.
     fn step_reads(&mut self, row: &Rt2<A::Num>, byte: u8) -> Result<(Vec<Block<A::Num>>, u8)> {
         let (mut st, _) = from_block(row, 0, &self.fn_info, &self.base)?;
-        let buttons = set_buttons(&mut st, byte)?;
+        let (leaves, mask) = self.under_buttons(&mut st, byte, &[], Level::EXACT)?;
+        Ok((self.blocks(&leaves)?, mask))
+    }
+
+    /// One frame of `st` under input `byte`, its `unknown` fields forked
+    /// at `level`: every leaf, and the buttons the frame read.
+    fn under_buttons(&mut self, st: &mut State<RefDomain<A>>, byte: u8, unknown: &[(crate::trace::heap::TableId, String)], level: Level) -> Result<(Vec<State<RefDomain<A>>>, u8)> {
+        let buttons = set_buttons(st, byte)?;
         self.it.button_reads = Some((buttons, 0));
-        let leaves = run_frame_all(&mut self.it, self.body_concrete, &st, &[], Level::EXACT, self.path_cap);
+        let leaves = run_frame_all(&mut self.it, self.body_concrete, st, unknown, level, self.path_cap);
         let (_, mask) = self.it.button_reads.take().expect("set above");
-        let out = leaves.map_err(|e| e.context(ran_from(&st, Some(byte))))?.iter().map(|l| Block::canonical(to_block(l, self.settings.room)?)).collect::<Result<_>>()?;
-        Ok((out, mask))
+        Ok((leaves.map_err(|e| e.context(ran_from(st, Some(byte))))?, mask))
+    }
+
+    /// Leaves as keyed one-row blocks.
+    fn blocks(&self, leaves: &[State<RefDomain<A>>]) -> Result<Vec<Block<A::Num>>> {
+        leaves.iter().map(|l| Block::canonical(to_block(l, self.settings.room)?)).collect()
     }
 
     /// One whole GAME frame: `step` once, or under the split frame
@@ -181,12 +173,7 @@ where
         }
         Ok((out, mask))
     }
-}
 
-impl<A: Arithmetic> ReferenceEngine<A>
-where
-    A::Num: EngineNum<A = A>,
-{
     /// `step` at an abstract `level` (`rewrite arc-check`): the row's
     /// unknowns are forked as the level's kernels fork them (each unknown
     /// boolean both ways, a near floor's `state` per value, a comparison
@@ -223,11 +210,7 @@ where
         if pin && level.fruit {
             pin_fly_fruit_motion(&mut st)?;
         }
-        let buttons = set_buttons(&mut st, byte)?;
-        self.it.button_reads = Some((buttons, 0));
-        let leaves = run_frame_all(&mut self.it, self.body_concrete, &st, &unknown, level, self.path_cap);
-        let (_, mask) = self.it.button_reads.take().expect("set above");
-        let leaves = leaves.map_err(|e| e.context(ran_from(&st, Some(byte))))?;
+        let (leaves, mask) = self.under_buttons(&mut st, byte, &unknown, level)?;
         if pinned_floors {
             // What the floors' pin assumes: no player went far this frame.
             let before = players(&st)?;
@@ -240,8 +223,7 @@ where
                 }
             }
         }
-        let out = leaves.iter().map(|l| Block::canonical(to_block(l, self.settings.room)?)).collect::<Result<_>>()?;
-        Ok((out, mask))
+        Ok((self.blocks(&leaves)?, mask))
     }
 
     /// `step` where the frame must not fork: the one successor.
@@ -672,34 +654,31 @@ mod tests {
             }
             row = eng.step_one(&row, byte).expect("frame").into_rt2();
         }
-        let next = std::sync::atomic::AtomicUsize::new(0);
-        let workers = std::thread::available_parallelism().map_or(4, |n| n.get()).min(16).min(sampled.len()).max(1);
-        let (leaves_pinned, leaves_full) = std::thread::scope(|sc| {
-            let hs: Vec<_> = (0..workers)
-                .map(|_| {
-                    sc.spawn(|| {
-                        let mut eng = RefEngine::new(&settings).expect("ref engine");
-                        let (mut pinned_n, mut full_n) = (0, 0);
-                        while let Some((f, abs)) = sampled.get(next.fetch_add(1, std::sync::atomic::Ordering::Relaxed)) {
-                            let mut ran: Vec<(u8, u8)> = Vec::new();
-                            for b in if all_inputs { 0..64u8 } else { inputs[*f]..inputs[*f] + 1 } {
-                                if ran.iter().any(|(r, m)| (r ^ b) & m == 0) {
-                                    continue;
-                                }
-                                let (pinned, read) = eng.step_at_pinned(abs, b, level, true).expect("pinned step");
-                                let (full, read_full) = eng.step_at_pinned(abs, b, level, false).expect("full step");
-                                assert_eq!(projected(&pinned), projected(&full), "f{f} input {b}: the pins changed the projected successors");
-                                ran.push((b, read | read_full));
-                                pinned_n += pinned.len();
-                                full_n += full.len();
-                            }
+        let (leaves_pinned, leaves_full) = crate::par::Pool::new(16)
+            .map_with(
+                sampled.len(),
+                || RefEngine::new(&settings),
+                |eng, k| {
+                    let (f, abs) = &sampled[k];
+                    let (mut pinned_n, mut full_n) = (0, 0);
+                    let mut ran: Vec<(u8, u8)> = Vec::new();
+                    for b in if all_inputs { 0..64u8 } else { inputs[*f]..inputs[*f] + 1 } {
+                        if ran.iter().any(|(r, m)| (r ^ b) & m == 0) {
+                            continue;
                         }
-                        (pinned_n, full_n)
-                    })
-                })
-                .collect();
-            hs.into_iter().map(|h| h.join().expect("a pin worker panicked")).fold((0, 0), |a, b| (a.0 + b.0, a.1 + b.1))
-        });
+                        let (pinned, read) = eng.step_at_pinned(abs, b, level, true)?;
+                        let (full, read_full) = eng.step_at_pinned(abs, b, level, false)?;
+                        assert_eq!(projected(&pinned), projected(&full), "f{f} input {b}: the pins changed the projected successors");
+                        ran.push((b, read | read_full));
+                        pinned_n += pinned.len();
+                        full_n += full.len();
+                    }
+                    Ok((pinned_n, full_n))
+                },
+            )
+            .expect("every sampled state")
+            .into_iter()
+            .fold((0, 0), |a, b| (a.0 + b.0, a.1 + b.1));
         eprintln!("{with} sampled states with a {what}; {leaves_pinned} leaves pinned, {leaves_full} without");
         (with, leaves_pinned, leaves_full)
     }
