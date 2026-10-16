@@ -1603,14 +1603,14 @@ pub(super) fn concrete_engines<N: Rem>(n: usize, run: &crate::settings::Settings
 /// order, which the search's exact dedup would drop: skipping it changes
 /// nothing but the step count.
 #[derive(Default)]
-struct Covered(Vec<(u8, u8)>);
+pub(super) struct Covered(Vec<(u8, u8)>);
 
 impl Covered {
-    fn covers(&self, byte: u8) -> bool {
+    pub(super) fn covers(&self, byte: u8) -> bool {
         self.0.iter().any(|&(b, read)| (b ^ byte) & read == 0)
     }
 
-    fn push(&mut self, byte: u8, read: u8) {
+    pub(super) fn push(&mut self, byte: u8, read: u8) {
         self.0.push((byte, read));
     }
 }
@@ -1619,7 +1619,7 @@ impl Covered {
 /// after `k`: `prefer[k]` first (`rewrite search --prefer`: a known TAS, so
 /// the witness follows it wherever an optimal route allows), then the rest.
 /// Every input is still tried: the order only picks WHICH optimal witness.
-fn input_order(prefer: Option<&[u8]>, k: u32) -> impl Iterator<Item = u8> {
+pub(super) fn input_order(prefer: Option<&[u8]>, k: u32) -> impl Iterator<Item = u8> {
     let first = prefer.and_then(|p| p.get(k as usize).copied()).filter(|&b| b < 64);
     first.into_iter().chain((0u8..64).filter(move |&b| Some(b) != first))
 }
@@ -1913,6 +1913,20 @@ pub struct Solved<N: Rem = P8> {
     /// The known route's exit frame when it was checked (`search::known`):
     /// it wins by the horizon and survives every pruning step.
     pub known: Option<u32>,
+    /// The winning sets and what keys their nodes, when kept (`solve`'s
+    /// `keep_arcs`): the dual search's half (`search::dual`).
+    pub arcs: Option<Arcs<N>>,
+}
+
+/// A level's arc phase as the concrete searches read it: W, the tree's
+/// shapes (W's nodes' regions) and its key space.
+pub struct Arcs<N: Rem = P8> {
+    pub w: Winning<N::C>,
+    pub shapes: Vec<u64>,
+    pub space: celeste_engine::exact::KeySpace<N>,
+    /// The level its nodes key at, and the horizon in search steps.
+    pub level: crate::abstraction::Level,
+    pub horizon: u32,
 }
 
 /// One node's term of the gate's `W f{t}` line: the node's content hash
@@ -1940,11 +1954,13 @@ pub fn gate_w_hash<C: Circle>(node: u64, r: RegionRef<C>) -> u64 {
 /// With `known`, checks a known solution against every pruning step before
 /// the concrete search (`search::known`): an error if one drops it.
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 pub fn solve<N: Rem>(
     dir: &std::path::Path,
     level: crate::abstraction::Level,
     horizon: u32,
     concrete: bool,
+    keep_arcs: bool,
     want_marks: bool,
     save: Option<&std::path::Path>,
     prefer: Option<&[u8]>,
@@ -2071,7 +2087,9 @@ pub fn solve<N: Rem>(
             wt.save(&out.join("witness.txt"))?;
         }
     }
-    Ok(Solved { arc, concrete: found, arc_marks, known })
+    drop(node);
+    let arcs = keep_arcs.then(|| Arcs { w, shapes, space, level, horizon });
+    Ok(Solved { arc, concrete: found, arc_marks, known, arcs })
 }
 
 #[cfg(test)]
@@ -2426,12 +2444,12 @@ mod tests {
         let dir = base.join("fixed");
         grow_tree::<P8>(&dir, 30, None, None, level, || Ok(Box::new(crate::compiled::FrameEngine::new(&fixed, level)?) as Box<dyn FrameStep>), || Ok(vec![Block::canonical(RefEngine::new(&fixed)?.initial()?)?]), &fixed).expect("the fixed forward");
         let route = super::super::known::Route { inputs: &known, filter: None };
-        let sf = solve::<P8>(&dir, level, 30, true, false, None, None, Some(&route), &fixed).expect("the fixed arc phase");
+        let sf = solve::<P8>(&dir, level, 30, true, false, false, None, None, Some(&route), &fixed).expect("the fixed arc phase");
         // Doubles.
         let dir = base.join("float");
         grow_tree::<LuaF64>(&dir, 30, None, None, level, || Ok(Box::new(RefFrameStep::<LuaF64>::new(&float, level)?) as Box<dyn FrameStep<LuaF64>>), || Ok(vec![Block::canonical(FloatRefEngine::new(&float)?.initial()?)?]), &float).expect("the float forward");
         let route = super::super::known::Route { inputs: &known, filter: None };
-        let sd = solve::<LuaF64>(&dir, level, 30, true, false, None, None, Some(&route), &float).expect("the float arc phase");
+        let sd = solve::<LuaF64>(&dir, level, 30, true, false, false, None, None, Some(&route), &float).expect("the float arc phase");
         for (what, arc, wt, k) in [("16.16", sf.arc, sf.concrete.as_ref(), sf.known), ("doubles", sd.arc, sd.concrete.as_ref(), sd.known)] {
             assert_eq!(arc, Some(28), "{what}: the arc bound");
             assert_eq!(wt.map(|w| w.inputs.len()), Some(28), "{what}: the concrete optimum");

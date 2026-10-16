@@ -1,0 +1,2 @@
+DUAL BOUND: no dual win before f33 (the fixed half's arc bound f33, the float half's f33)
+[gate] h35 dual optimum 33 fixed exit 33 inputs 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,17,0,0,2,32,0,0,0,0

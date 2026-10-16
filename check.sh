@@ -162,6 +162,7 @@ t2() {
     step gate10-arc gate10_arc
     step gate10f-forward gate10f_forward
     step gate10f-arc gate10f_arc
+    step gate10d-dual gate10d_dual
     step search42-objects search42
     step export-ui export_ui
     step forward60-platforms forward60
@@ -196,6 +197,14 @@ gate10f_forward() {
 gate10f_arc() {
     ./safe-run.sh -- "$B" search --arith float --to 35 --win-at 9,101 --checkpoint-dir "$C/t2/arc10f" --prefer gates/known_room10_win9-101.txt > "$C/t2/arc10f.out" || return 1
     grep '^\[gate\]' "$C/t2/arc10f.out" | diff gates/float_arc_room10_win9-101_h35.txt - >&2
+}
+# The dual search (`rewrite dual`, plans/float-solver.md milestone 6) at the
+# same synthetic win: fixed (the IL load) and Celia float, the known route
+# valid in both; its bound and its witness pinned (each half's [gate] lines
+# are the two gates above).
+gate10d_dual() {
+    ./safe-run.sh -- "$B" dual --to 35 --win-at 9,101 --checkpoint-dir "$C/t2/dual10" --prefer gates/known_room10_win9-101.txt > "$C/t2/dual10.out" || return 1
+    grep -E '^DUAL BOUND|^\[gate\] h35 dual' "$C/t2/dual10.out" | diff gates/dual_room10_win9-101_h35.txt - >&2
 }
 # The objects ladder (r0sxhn filtering r0sxh) at a synthetic win, its
 # witness as the known route: every level's [gate] lines pinned.

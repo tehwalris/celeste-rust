@@ -122,6 +122,40 @@ enum Command {
         #[arg(long)]
         prefer: Option<String>,
     },
+    /// THE DUAL SEARCH (`search::dual`): the shortest file valid in BOTH
+    /// arithmetics under rule (b) - the float tool's exit is the count, and
+    /// real play (16.16, from `--loading-jank`) must have left by then. Each
+    /// half runs its levels (forward and arc phase) to the same horizon,
+    /// under `<checkpoint-dir>/fixed` and `/float`; then the concrete search
+    /// over pairs of states, each half inside its own winning sets, from the
+    /// larger arc bound. The global settings are the fixed half's (no
+    /// `--arith float`); `--float-half` picks the float tool, which starts
+    /// from its own IL load (Celia's jank unless `--float-loading-jank`).
+    /// The witness is replayed in both arithmetics and goes to
+    /// `<checkpoint-dir>/witness_frame_F.txt`, the outcome to `result.json`.
+    Dual {
+        #[arg(long)]
+        to: Option<u32>,
+        /// A KNOWN dual run's frame: a refutation, or no dual witness by it, is an error.
+        #[arg(long)]
+        ceiling: Option<u32>,
+        #[arg(long, default_value = "r0sx")]
+        level: String,
+        #[arg(long, default_value = DEFAULT_CHECKPOINT_DIR)]
+        checkpoint_dir: String,
+        /// Stop at the dual bound (no concrete search).
+        #[arg(long)]
+        no_witness: bool,
+        /// A known run, tried first and checked against each half's pruning (as `search --prefer`).
+        #[arg(long)]
+        prefer: Option<String>,
+        /// The float half's tool: `celia` (default) or `uct`.
+        #[arg(long, default_value = "celia")]
+        float_half: String,
+        /// The float half's loading jank J (Celia only; default: its IL load's).
+        #[arg(long)]
+        float_loading_jank: Option<usize>,
+    },
     /// A KNOWN solution against the pruning of finished search trees
     /// (`search::known`): stepped through the reference engine, at every
     /// step it must pass level -1 (the filter the tree recorded) and the
@@ -996,76 +1030,46 @@ fn win_at_text(cfg: &celeste_rust::settings::Settings) -> Option<String> {
     cfg.win_at.map(|(x0, x1, y0, y1)| format!("{},{}", r(x0, x1), r(y0, y1)))
 }
 
-/// `rewrite search` in arithmetic `N`: the levels' forwards (`engine` makes
-/// a level's frame step, `initial` the start), each level's arc phase, and
-/// the concrete search at the last; the result recorded beside the trees.
+/// How a search's LAST level ends (`run_levels`).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Finish {
+    /// The concrete search inside its W: the witness.
+    Concrete,
+    /// The arc bound only (`--no-witness`).
+    Bound,
+    /// Its arcs kept for the dual search (`search::dual`).
+    Arcs,
+}
+
+/// How a search's levels ended.
+enum Levels<N: Rem> {
+    /// No win by the horizon at level `li`'s arc phase.
+    Refuted { li: usize, lvl: Level },
+    /// The last level's arc phase (its bound is `Some`).
+    Last { li: usize, lvl: Level, solved: celeste_rust::search::arc_dp::Solved<N> },
+}
+
+/// The LEVELS of a search in arithmetic `N`, coarsest first, under `base`:
+/// each a forward (`engine` makes a level's frame step, `initial` the
+/// start; a finer level filtered by the coarser one's arc marks) and its arc
+/// phase, recorded in `res.levels` (their dirs named under `prefix`). The
+/// last level ends as `finish` says.
 #[allow(clippy::too_many_arguments)]
-fn search<N: celeste_rust::search::rem::Rem>(
+fn run_levels<N: Rem>(
     cfg: &celeste_rust::settings::Settings,
-    to: Option<u32>,
-    ceiling: Option<u32>,
-    level: String,
-    checkpoint_dir: String,
-    no_witness: bool,
-    save_marks: Option<String>,
-    prefer: Option<String>,
+    steps: u32,
+    levels: &[Level],
+    base: &std::path::Path,
+    prefix: &str,
+    finish: Finish,
+    save_marks: Option<&str>,
+    prefer: Option<&[u8]>,
+    res: &mut celeste_rust::search::result::SearchResult,
     engine: impl Fn(Level) -> Result<Box<dyn FrameStep<N>>>,
     initial: impl Fn() -> Result<Vec<Block<N>>>,
-) -> Result<()> {
-    use celeste_rust::search::result::{LevelResult, SearchResult, Verdict};
-    let prefer: Option<Vec<u8>> = prefer.as_deref().map(celeste_rust::concrete::read_inputs).transpose()?;
+) -> Result<Levels<N>> {
     use celeste_rust::search::arc_dp::solve;
-    let cfg = cfg.clone();
-    let horizon = match (ceiling, to) {
-        (Some(h), None) | (None, Some(h)) => h,
-        _ => anyhow::bail!("give the horizon: --to H, or --ceiling H for a known solution"),
-    };
-    // The horizon is in FRAMES; the tree, the arcs and the marks
-    // count search steps (two a frame under the split frame).
-    let steps = horizon * cfg.steps_per_frame();
-    let levels: Vec<Level> = level.split(',').map(Level::parse).collect::<std::result::Result<_, _>>().map_err(|e| anyhow::anyhow!(e))?;
-    let room = room_text(&cfg);
-    eprintln!("[search] room {room}, levels {level}, horizon {horizon}");
-    let t0 = std::time::Instant::now();
-    let base = std::path::Path::new(&checkpoint_dir);
-    // The record of THIS run: none until it decides.
-    std::fs::create_dir_all(base)?;
-    match std::fs::remove_file(celeste_rust::search::result::path(base)) {
-        Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e.into()),
-        _ => {}
-    }
-    let mut res = SearchResult {
-        format: celeste_rust::search::result::FORMAT,
-        room: cfg.room,
-        level: level.clone(),
-        horizon,
-        ceiling: ceiling.is_some(),
-        steps_per_frame: cfg.steps_per_frame(),
-        levels: Vec::new(),
-        verdict: Verdict::BoundOnly,
-        optimal: None,
-        witness: None,
-        witness_file: None,
-        wall_s: 0.0,
-        peak_gb: 0.0,
-        error: None,
-    };
-    let record = |res: &mut SearchResult, verdict: Verdict| -> Result<()> {
-        res.verdict = verdict;
-        res.wall_s = t0.elapsed().as_secs_f64();
-        res.peak_gb = celeste_rust::metrics::peak_rss_gb();
-        res.write(base)
-    };
-    // The level -1 table first: a room whose table cannot be built
-    // is a recorded refusal (rerun without the filter), not a panic
-    // somewhere in the forward.
-    if let Some(m) = cfg.minus_one() {
-        if let Err(e) = m.try_table(&cfg) {
-            res.error = Some(format!("{e:#}"));
-            record(&mut res, Verdict::LevelMinusOneRefused)?;
-            return Err(e.context("--level-minus-one: building the level -1 table"));
-        }
-    }
+    use celeste_rust::search::result::LevelResult;
     // The previous level's arc-marked nodes: the next forward's filter.
     let mut prev: Option<(Visited<N>, Level)> = None;
     for (li, &lvl) in levels.iter().enumerate() {
@@ -1092,17 +1096,7 @@ fn search<N: celeste_rust::search::rem::Rem>(
                 std::fs::write(&key_path, key)?;
             }
         }
-        let first_win = celeste_rust::frame::grow_tree(
-            &dir,
-            steps,
-            want,
-            filter.as_ref(),
-            lvl,
-            || engine(lvl),
-            &initial,
-            &cfg,
-        )?
-        .win_frame;
+        let first_win = celeste_rust::frame::grow_tree(&dir, steps, want, filter.as_ref(), lvl, || engine(lvl), &initial, cfg)?.win_frame;
         let forward_s = t.elapsed().as_secs_f64();
         // `f` counts search steps.
         eprintln!("[search] level {li} ({lvl}): forward to f{steps} in {forward_s:.1} s; first win {first_win:?}");
@@ -1112,50 +1106,264 @@ fn search<N: celeste_rust::search::rem::Rem>(
         // (gemskip-nodiag 2800m h192: 379 s of a 450 s search went to a
         // fruitless try at level 0's bound f186; the optimum was 191),
         // and the finer level decides the optimum anyway.
-        let concrete = last && !no_witness;
+        let concrete = last && finish == Finish::Concrete;
+        let keep = last && finish == Finish::Arcs;
         // Every level saves its marks (the next overwrites).
-        let known = prefer.as_deref().map(|inputs| celeste_rust::search::known::Route { inputs, filter: filter.as_ref() });
-        let s = solve::<N>(&dir, lvl, steps, concrete, !last, save_marks.as_deref().map(std::path::Path::new), prefer.as_deref(), known.as_ref(), &cfg)?;
-        let wall = t0.elapsed().as_secs_f64();
-        res.levels.push(LevelResult { spec: lvl.to_string(), dir: format!("level{li:02}"), forward_s, first_win, arc_bound: s.arc });
-        let Some(bound) = s.arc else {
+        let known = prefer.map(|inputs| celeste_rust::search::known::Route { inputs, filter: filter.as_ref() });
+        let s = solve::<N>(&dir, lvl, steps, concrete, keep, !last, save_marks.map(std::path::Path::new), prefer, known.as_ref(), cfg)?;
+        res.levels.push(LevelResult { spec: lvl.to_string(), dir: format!("{prefix}level{li:02}"), forward_s, first_win, arc_bound: s.arc });
+        let Some(bound) = s.arc else { return Ok(Levels::Refuted { li, lvl }) };
+        println!("ARC BOUND: no win before f{bound} (level {li}, {lvl}: remainder-exact, the level's objects over-approximated)");
+        if last {
+            return Ok(Levels::Last { li, lvl, solved: s });
+        }
+        prev = Some((s.arc_marks.expect("asked for"), lvl));
+    }
+    anyhow::bail!("no level given")
+}
+
+/// A search's record (`result.json`), before it decides.
+fn search_record(cfg: &celeste_rust::settings::Settings, level: &str, horizon: u32, ceiling: bool) -> celeste_rust::search::result::SearchResult {
+    use celeste_rust::search::result::{SearchResult, Verdict};
+    SearchResult {
+        format: celeste_rust::search::result::FORMAT,
+        room: cfg.room,
+        level: level.to_string(),
+        horizon,
+        ceiling,
+        steps_per_frame: cfg.steps_per_frame(),
+        levels: Vec::new(),
+        verdict: Verdict::BoundOnly,
+        optimal: None,
+        witness: None,
+        witness_file: None,
+        wall_s: 0.0,
+        peak_gb: 0.0,
+        error: None,
+        dual: None,
+    }
+}
+
+/// A search's horizon in frames (`--to H` or `--ceiling H`).
+fn horizon_of(to: Option<u32>, ceiling: Option<u32>) -> Result<u32> {
+    match (ceiling, to) {
+        (Some(h), None) | (None, Some(h)) => Ok(h),
+        _ => anyhow::bail!("give the horizon: --to H, or --ceiling H for a known solution"),
+    }
+}
+
+/// A fresh checkpoint dir's record: the previous run's removed.
+fn clear_record(base: &std::path::Path) -> Result<()> {
+    std::fs::create_dir_all(base)?;
+    match std::fs::remove_file(celeste_rust::search::result::path(base)) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e.into()),
+        _ => Ok(()),
+    }
+}
+
+/// `rewrite search` in arithmetic `N`: the levels' forwards (`engine` makes
+/// a level's frame step, `initial` the start), each level's arc phase, and
+/// the concrete search at the last; the result recorded beside the trees.
+#[allow(clippy::too_many_arguments)]
+fn search<N: celeste_rust::search::rem::Rem>(
+    cfg: &celeste_rust::settings::Settings,
+    to: Option<u32>,
+    ceiling: Option<u32>,
+    level: String,
+    checkpoint_dir: String,
+    no_witness: bool,
+    save_marks: Option<String>,
+    prefer: Option<String>,
+    engine: impl Fn(Level) -> Result<Box<dyn FrameStep<N>>>,
+    initial: impl Fn() -> Result<Vec<Block<N>>>,
+) -> Result<()> {
+    use celeste_rust::search::result::Verdict;
+    let prefer: Option<Vec<u8>> = prefer.as_deref().map(celeste_rust::concrete::read_inputs).transpose()?;
+    let cfg = cfg.clone();
+    let horizon = horizon_of(to, ceiling)?;
+    // The horizon is in FRAMES; the tree, the arcs and the marks
+    // count search steps (two a frame under the split frame).
+    let steps = horizon * cfg.steps_per_frame();
+    let levels: Vec<Level> = level.split(',').map(Level::parse).collect::<std::result::Result<_, _>>().map_err(|e| anyhow::anyhow!(e))?;
+    let room = room_text(&cfg);
+    eprintln!("[search] room {room}, levels {level}, horizon {horizon}");
+    let t0 = std::time::Instant::now();
+    let base = std::path::Path::new(&checkpoint_dir);
+    // The record of THIS run: none until it decides.
+    clear_record(base)?;
+    let mut res = search_record(&cfg, &level, horizon, ceiling.is_some());
+    let record = |res: &mut celeste_rust::search::result::SearchResult, verdict: Verdict| -> Result<()> {
+        res.verdict = verdict;
+        res.wall_s = t0.elapsed().as_secs_f64();
+        res.peak_gb = celeste_rust::metrics::peak_rss_gb();
+        res.write(base)
+    };
+    // The level -1 table first: a room whose table cannot be built
+    // is a recorded refusal (rerun without the filter), not a panic
+    // somewhere in the forward.
+    if let Some(m) = cfg.minus_one() {
+        if let Err(e) = m.try_table(&cfg) {
+            res.error = Some(format!("{e:#}"));
+            record(&mut res, Verdict::LevelMinusOneRefused)?;
+            return Err(e.context("--level-minus-one: building the level -1 table"));
+        }
+    }
+    let finish = if no_witness { Finish::Bound } else { Finish::Concrete };
+    let (li, lvl, s) = match run_levels::<N>(&cfg, steps, &levels, base, "", finish, save_marks.as_deref(), prefer.as_deref(), &mut res, engine, initial)? {
+        Levels::Refuted { li, lvl } => {
+            let wall = t0.elapsed().as_secs_f64();
             record(&mut res, Verdict::Refuted)?;
             anyhow::ensure!(ceiling.is_none(), "ceiling {horizon} REFUTED by the arc search at level {li} ({lvl}): a known solution the model cannot reproduce");
             println!("REFUTED: no win by f{horizon} (level {li}, {lvl}; {wall:.1} s)");
             return Ok(());
-        };
-        println!("ARC BOUND: no win before f{bound} (level {li}, {lvl}: remainder-exact, the level's objects over-approximated)");
-        if let Some(w) = &s.concrete {
-            let f = w.inputs.len();
-            let path = base.join(format!("witness_frame_{f}.txt"));
-            std::fs::write(
-                &path,
-                format!(
-                    "# Room ({room}): the concrete witness of `rewrite search --level {level} --to {horizon}`{}.\n\
-                     # Arc bound f{bound} (level {li}, {lvl}); no concrete win before f{f} inside the winning sets (exhaustive).\n\
-                     # A balloon room's win may hold for some `rnd` draws only: replay with seeds.\n{}\n",
-                    win_at_text(&cfg).map_or(String::new(), |w| format!(" --win-at {w}")),
-                    w.inputs_text()
-                ),
-            )?;
-            res.optimal = Some(f as u32);
-            res.witness = Some(w.inputs.clone());
-            res.witness_file = Some(path.file_name().expect("a file").to_string_lossy().into_owned());
-            record(&mut res, Verdict::Optimal)?;
-            println!("OPTIMAL win frame: {f} ({wall:.1} s); witness {}", path.display());
-            return Ok(());
         }
-        if no_witness && last {
-            return record(&mut res, Verdict::BoundOnly);
-        }
-        if last {
-            record(&mut res, Verdict::NoConcreteWin)?;
-            anyhow::ensure!(ceiling.is_none(), "ceiling {horizon}: no concrete witness by it - a known solution the model cannot reproduce");
-            println!("no concrete win by f{horizon} (arc bound f{bound}; {wall:.1} s)");
-            return Ok(());
-        }
-        prev = Some((s.arc_marks.expect("asked for"), lvl));
+        Levels::Last { li, lvl, solved } => (li, lvl, solved),
+    };
+    let bound = s.arc.expect("the last level's bound");
+    let wall = t0.elapsed().as_secs_f64();
+    if let Some(w) = &s.concrete {
+        let f = w.inputs.len();
+        let path = base.join(format!("witness_frame_{f}.txt"));
+        std::fs::write(
+            &path,
+            format!(
+                "# Room ({room}): the concrete witness of `rewrite search --level {level} --to {horizon}`{}.\n\
+                 # Arc bound f{bound} (level {li}, {lvl}); no concrete win before f{f} inside the winning sets (exhaustive).\n\
+                 # A balloon room's win may hold for some `rnd` draws only: replay with seeds.\n{}\n",
+                win_at_text(&cfg).map_or(String::new(), |w| format!(" --win-at {w}")),
+                w.inputs_text()
+            ),
+        )?;
+        res.optimal = Some(f as u32);
+        res.witness = Some(w.inputs.clone());
+        res.witness_file = Some(path.file_name().expect("a file").to_string_lossy().into_owned());
+        record(&mut res, Verdict::Optimal)?;
+        println!("OPTIMAL win frame: {f} ({wall:.1} s); witness {}", path.display());
+        return Ok(());
     }
+    if no_witness {
+        return record(&mut res, Verdict::BoundOnly);
+    }
+    record(&mut res, Verdict::NoConcreteWin)?;
+    anyhow::ensure!(ceiling.is_none(), "ceiling {horizon}: no concrete witness by it - a known solution the model cannot reproduce");
+    println!("no concrete win by f{horizon} (arc bound f{bound}; {wall:.1} s)");
+    Ok(())
+}
+
+/// `rewrite dual`: THE DUAL SEARCH (`search::dual`). The fixed half under
+/// `cfg` (real play), the float half under `float`, each its levels to the
+/// same horizon under `<dir>/fixed` and `<dir>/float`, then the dual
+/// concrete search between the larger arc bound and the horizon; its
+/// witness replayed in both arithmetics and recorded.
+#[allow(clippy::too_many_arguments)]
+fn dual(cfg: &celeste_rust::settings::Settings, float: &celeste_rust::settings::Settings, to: Option<u32>, ceiling: Option<u32>, level: String, checkpoint_dir: String, no_witness: bool, prefer: Option<String>) -> Result<()> {
+    use celeste_rust::search::result::{DualResult, Verdict};
+    let prefer: Option<Vec<u8>> = prefer.as_deref().map(celeste_rust::concrete::read_inputs).transpose()?;
+    let horizon = horizon_of(to, ceiling)?;
+    let steps = horizon * cfg.steps_per_frame();
+    let levels: Vec<Level> = level.split(',').map(Level::parse).collect::<std::result::Result<_, _>>().map_err(|e| anyhow::anyhow!(e))?;
+    let room = room_text(cfg);
+    eprintln!("[dual] room {room}, levels {level}, horizon {horizon}; the fixed half real play, the float half {}", float.arith);
+    let t0 = std::time::Instant::now();
+    let base = std::path::Path::new(&checkpoint_dir);
+    clear_record(base)?;
+    let mut res = search_record(cfg, &level, horizon, ceiling.is_some());
+    res.dual = Some(DualResult { float: float.arith.to_string(), float_loading_jank: float.loading_jank, fixed_exit: None });
+    let record = |res: &mut celeste_rust::search::result::SearchResult, verdict: Verdict| -> Result<()> {
+        res.verdict = verdict;
+        res.wall_s = t0.elapsed().as_secs_f64();
+        res.peak_gb = celeste_rust::metrics::peak_rss_gb();
+        res.write(base)
+    };
+    // Both halves' level -1 tables first (each its arithmetic's).
+    for s in [cfg, float] {
+        if let Some(m) = s.minus_one() {
+            if let Err(e) = m.try_table(s) {
+                res.error = Some(format!("{}: {e:#}", s.arith));
+                record(&mut res, Verdict::LevelMinusOneRefused)?;
+                return Err(e.context(format!("--level-minus-one: building the {} half's level -1 table", s.arith)));
+            }
+        }
+    }
+    let refuted = |res: &mut celeste_rust::search::result::SearchResult, half: &str, li: usize, lvl: Level| -> Result<()> {
+        let wall = t0.elapsed().as_secs_f64();
+        record(res, Verdict::Refuted)?;
+        anyhow::ensure!(ceiling.is_none(), "ceiling {horizon} REFUTED by the {half} half's arc search at level {li} ({lvl}): a known solution the model cannot reproduce");
+        println!("REFUTED: no {half} win by f{horizon} (level {li}, {lvl}; {wall:.1} s), so no dual one");
+        Ok(())
+    };
+    let fixed_half = run_levels::<P8>(
+        cfg,
+        steps,
+        &levels,
+        &base.join("fixed"),
+        "fixed/",
+        Finish::Arcs,
+        None,
+        prefer.as_deref(),
+        &mut res,
+        |lvl| Ok(Box::new(celeste_rust::compiled::FrameEngine::new(cfg, lvl)?)),
+        || Ok(vec![Block::canonical(RefEngine::new(cfg)?.initial()?)?]),
+    )?;
+    let sx = match fixed_half {
+        Levels::Refuted { li, lvl } => return refuted(&mut res, "fixed", li, lvl),
+        Levels::Last { solved, .. } => solved,
+    };
+    let float_half = run_levels::<LuaF64>(
+        float,
+        steps,
+        &levels,
+        &base.join("float"),
+        "float/",
+        Finish::Arcs,
+        None,
+        prefer.as_deref(),
+        &mut res,
+        |lvl| Ok(Box::new(celeste_rust::compiled::FloatKernels::new(float, lvl)?)),
+        || Ok(vec![Block::canonical(FloatRefEngine::new(float)?.initial()?)?]),
+    )?;
+    let sf = match float_half {
+        Levels::Refuted { li, lvl } => return refuted(&mut res, "float", li, lvl),
+        Levels::Last { solved, .. } => solved,
+    };
+    let (bx, bf) = (sx.arc.expect("a bound"), sf.arc.expect("a bound"));
+    let bound = bx.max(bf);
+    println!("DUAL BOUND: no dual win before f{bound} (the fixed half's arc bound f{bx}, the float half's f{bf})");
+    if no_witness {
+        return record(&mut res, Verdict::BoundOnly);
+    }
+    let (ax, af) = (sx.arcs.expect("kept"), sf.arcs.expect("kept"));
+    let found = celeste_rust::search::dual::search(&celeste_rust::search::dual::Half { arcs: &ax, settings: cfg }, &celeste_rust::search::dual::Half { arcs: &af, settings: float }, bound, prefer.as_deref())?;
+    let wall = t0.elapsed().as_secs_f64();
+    let Some(w) = found else {
+        record(&mut res, Verdict::NoConcreteWin)?;
+        anyhow::ensure!(ceiling.is_none(), "ceiling {horizon}: no dual witness by it - a known solution the model cannot reproduce");
+        println!("no dual win by f{horizon} (dual bound f{bound}; {wall:.1} s)");
+        return Ok(());
+    };
+    celeste_rust::search::dual::replay::<P8, LuaF64>(&w, cfg, float)?;
+    let f = w.inputs.len();
+    let path = base.join(format!("witness_frame_{f}.txt"));
+    std::fs::write(
+        &path,
+        format!(
+            "# Room ({room}): the DUAL witness of `rewrite dual --level {level} --to {horizon}`: {} exits on frame {f} (the count, Philippe's rule (b)), real play (16.16) on frame {}.\n\
+             # Dual bound f{bound} (fixed f{bx}, float f{bf}); no dual win before f{f} inside both halves' winning sets (exhaustive).\n\
+             # A balloon room's real-play exit may hold for some `rnd` draws only.\n{}\n",
+            float.arith,
+            w.fixed_exit,
+            w.inputs_text()
+        ),
+    )?;
+    res.optimal = Some(f as u32);
+    res.witness = Some(w.inputs.clone());
+    res.witness_file = Some(path.file_name().expect("a file").to_string_lossy().into_owned());
+    if let Some(d) = &mut res.dual {
+        d.fixed_exit = Some(w.fixed_exit);
+    }
+    record(&mut res, Verdict::Optimal)?;
+    println!("[gate] h{horizon} dual optimum {f} fixed exit {} inputs {}", w.fixed_exit, w.inputs_text());
+    println!("OPTIMAL dual win frame: {f}, real play leaving on frame {} ({wall:.1} s); witness {}", w.fixed_exit, path.display());
     Ok(())
 }
 
@@ -1204,7 +1412,7 @@ fn check_known<N: Rem>(checkpoint_dir: &str, level: &str, inputs: &str, horizon:
         );
         let filter = prev.as_ref().map(|(m, l)| celeste_rust::frame::MarkFilter::new(m, *l, cfg.steps_per_frame()));
         let route = celeste_rust::search::known::Route { inputs: &inputs, filter: filter.as_ref() };
-        let s = solve::<N>(&dir, lvl, steps, false, !last, None, None, Some(&route), cfg)?;
+        let s = solve::<N>(&dir, lvl, steps, false, false, !last, None, None, Some(&route), cfg)?;
         let f = s.known.ok_or_else(|| anyhow::anyhow!("the known route does not exit by f{horizon}: nothing to check"))?;
         println!("[check-known] level {li} ({lvl}): the known route (exit f{f}) survives (arc bound {:?})", s.arc);
         if last {
@@ -1407,6 +1615,15 @@ fn main() -> Result<()> {
                 )?
             }
         },
+        Command::Dual { to, ceiling, level, checkpoint_dir, no_witness, prefer, float_half, float_loading_jank } => {
+            let tool = match float_half.as_str() {
+                "celia" => celeste_rust::settings::FloatTool::Celia,
+                "uct" => celeste_rust::settings::FloatTool::Uct,
+                t => anyhow::bail!("--float-half: `celia` or `uct`, not {t:?}"),
+            };
+            let float = cfg.float_half(tool, float_loading_jank)?;
+            dual(&cfg, &float, to, ceiling, level, checkpoint_dir, no_witness, prefer)?;
+        }
         Command::HullStats { checkpoint_dir, to } => {
             hull_stats(std::path::Path::new(&checkpoint_dir), to, cfg.threads())?;
         }

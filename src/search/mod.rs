@@ -7,6 +7,7 @@
 //!   * `hull`       - a state's remainder hull (the forward's): one arc per axis
 //!   * `rem`        - the remainder model of an arithmetic: hulls and transfers
 //!   * `arc_dp`     - THE SEARCH: winning sets, optimum, concrete search
+//!   * `dual`       - the dual search: a run valid in both arithmetics
 //!   * `known`      - a known solution checked against every pruning step
 //!   * `pos_graph`  - player-position cells and the position graph
 //!   * `result`     - `result.json`: what a search decided, as a record
@@ -17,6 +18,7 @@ pub mod arc_dp;
 pub mod arc_edges;
 pub mod arcs;
 pub mod checkpoint;
+pub mod dual;
 pub mod hull;
 pub mod hull_replay;
 pub mod inspect;

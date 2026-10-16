@@ -172,7 +172,7 @@ until-loop, do not poll.
 |---|---|
 | `t0` | the unit tests (nextest, quick profile): the pre-commit run |
 | `t1` | single frames from the fixtures, exact: the forward, `--key-check`, the widening table, a backward frame, the storage, the kernels and transfers against the reference engine |
-| `t2` | end to end: the three pinned room (1,0) oracles and the known route, their float twins (`--arith float`: the doubles' kernels; `gates/float_*`), an objects-ladder search, a platform room. Every change to the loop, the kernels or the tracer must pass it |
+| `t2` | end to end: the three pinned room (1,0) oracles and the known route, their float twins (`--arith float`: the doubles' kernels; `gates/float_*`) and the dual search (`gates/dual_*`), an objects-ladder search, a platform room. Every change to the loop, the kernels or the tracer must pass it |
 | `big` | the reference frame (6,2) 100% f56 -> f57 (and its storage replay), the one kernel and storage measurements use |
 
 - **Run tests with NEXTEST, never bare `cargo test`.** Several tests mutate

@@ -74,6 +74,21 @@ pub struct SearchResult {
     pub peak_gb: f64,
     /// Why the search stopped short (the level -1 refusal's error).
     pub error: Option<String>,
+    /// A DUAL search's (`rewrite dual`): `optimal` is the float half's exit
+    /// (the count, rule (b)), the levels' dirs are under `fixed/` and
+    /// `float/`. Absent from a single search's record.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dual: Option<DualResult>,
+}
+
+/// What a dual search records beyond a search's.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct DualResult {
+    /// The float half's arithmetic and tool (`float-celia`), and its start.
+    pub float: String,
+    pub float_loading_jank: Option<usize>,
+    /// The frame real play (the fixed half) leaves on, with the witness.
+    pub fixed_exit: Option<u32>,
 }
 
 impl SearchResult {
@@ -119,10 +134,15 @@ mod tests {
             wall_s: 2.0,
             peak_gb: 0.5,
             error: Some("x".into()),
+            dual: None,
         };
         r.write(&dir).unwrap();
         assert_eq!(SearchResult::read(&dir).unwrap(), r);
         assert!(std::fs::read_to_string(path(&dir)).unwrap().contains("\"level_minus_one_refused\""));
+        assert!(!std::fs::read_to_string(path(&dir)).unwrap().contains("dual"), "a single search's record is as before");
+        let d = SearchResult { dual: Some(DualResult { float: "float-celia".into(), float_loading_jank: Some(1), fixed_exit: Some(115) }), ..r };
+        d.write(&dir).unwrap();
+        assert_eq!(SearchResult::read(&dir).unwrap(), d);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

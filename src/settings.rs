@@ -153,6 +153,26 @@ impl Default for Settings {
 }
 
 impl Settings {
+    /// The FLOAT half of a dual search (`rewrite dual`, `search::dual`):
+    /// these settings - the fixed half's, real play from its
+    /// `--loading-jank` - under the float tool `tool`, from the tool's own
+    /// start: Celia's IL load's jank (`starts::celia_jank`) unless `jank`
+    /// gives one, UCT's IL load (no jank).
+    pub fn float_half(&self, tool: FloatTool, jank: Option<usize>) -> Result<Settings> {
+        anyhow::ensure!(self.arith == Arith::Fixed, "the dual search's settings are the fixed half's (no --arith float)");
+        let loading_jank = match tool {
+            FloatTool::Celia => match jank {
+                Some(j) => Some(j),
+                None => crate::starts::celia_jank(self.room)?,
+            },
+            FloatTool::Uct => {
+                anyhow::ensure!(jank.is_none(), "UCT loads a room alone: no float loading jank");
+                None
+            }
+        };
+        Ok(Settings { arith: Arith::Float(tool), loading_jank, ..self.clone() })
+    }
+
     /// Worker threads: `--threads`, else one per physical core (AVX-512
     /// units are shared by SMT siblings).
     pub fn threads(&self) -> usize {
