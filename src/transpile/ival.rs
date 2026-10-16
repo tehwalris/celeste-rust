@@ -91,7 +91,9 @@ pub fn fold_into<A: GraphArith>(
                 st.bools += 1;
                 out.leaf(Op::ConstBool(b))
             }
-            Val::Num(i) if A::as_point(i).is_some() && !matches!(node.op, Op::Const(..)) => {
+            // A point whose bits its value fixes (not a double's zero: a
+            // lane may hold the other one, `GraphArith::alone_in_its_value`).
+            Val::Num(i) if A::as_point(i).is_some_and(A::alone_in_its_value) && !matches!(node.op, Op::Const(..)) => {
                 st.nums += 1;
                 let raw = A::lit(A::as_point(i).expect("guarded above"));
                 out.leaf(Op::Const(raw, raw))
@@ -111,6 +113,27 @@ pub fn fold_into<A: GraphArith>(
 mod tests {
     use super::*;
     use crate::pico8_num::Pico8Num;
+
+    /// A box with both ends zero holds lanes of either zero: `min(0, x)`
+    /// for `x` restricted to `[0, 5]` is `0` by value, but a lane of `x =
+    /// -0` gives `-0` (the tie goes to the second argument). 16.16 folds it
+    /// to the constant; the doubles keep the node.
+    #[test]
+    fn a_zero_box_folds_to_a_constant_only_where_zero_has_one_sign() {
+        use celeste_core::arith::{Arithmetic, Float};
+        fn min_of_zero_and<A: GraphArith>(lo: A::Num, hi: A::Num) -> bool {
+            let mut g = Graph::<A>::default();
+            let x = g.leaf(Op::Cell(0));
+            let x = g.add(Op::Restrict(A::lit(lo), A::lit(hi)), vec![x]);
+            let z = A::lit(A::from_i16(0));
+            let zero = g.leaf(Op::Const(z, z));
+            let m = g.fold(Op::Min, vec![zero, x]);
+            let (out, map, _) = fold(&g, &[m], None).expect("fold");
+            matches!(out.get(map[m as usize]).op, Op::Const(..))
+        }
+        assert!(min_of_zero_and::<celeste_core::arith::Fixed>(Pico8Num::from_i16(0), Pico8Num::from_i16(5)), "16.16 folds it");
+        assert!(!min_of_zero_and::<Float>(Float::from_i16(0), Float::from_i16(5)), "the doubles keep it");
+    }
 
     /// `abs` is non-negative, so a comparison of it against zero is not a free
     /// variable however opaque its operand is.

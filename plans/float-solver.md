@@ -1170,6 +1170,11 @@ What the doubles needed beyond the moves:
   unchanged; an interval with zero corners of both signs is `[-0, 0]`.
 - **`AtLeast`.** The block side's `max(v, k)` is the cart's `max` (the
   tracer bakes `Op::Max(v, k)`): a double's tie gives `k`.
+- **Point folds.** The lowering's interval fold (`ival`) replaces a node
+  whose box is one point by that constant. A double's zero is not alone in
+  its value (`min(0, x)` for `x` in `[0, 5]` is `-0` on a lane of `x = -0`),
+  so the doubles fold only nonzero points
+  (`GraphArith::alone_in_its_value`).
 
 The check, `a_traced_float_frame_agrees_with_the_reference_engine`: room
 (0,0)'s frame traced with the player and the globals symbolic, against the

@@ -75,6 +75,10 @@ pub trait GraphArith: Arithmetic<Num: celeste_core::arith::EngineNum<A = Self>> 
     /// A literal interval as raw 16.16, where the arithmetic is 16.16's
     /// (the literal splits of the levels with unknowns are so far).
     fn lit_raw_fixed(lo: Self::Lit, hi: Self::Lit) -> Option<(i32, i32)>;
+    /// Is `v` the only number of its VALUE, so a box whose ends are `v`
+    /// holds `v`'s bits on every lane (`ival`'s point fold)? A double's
+    /// zero is not: `-0 == 0`, and a lane of `-0` lies in `[0, 0]`.
+    fn alone_in_its_value(v: Self::Num) -> bool;
     /// Can `op` leave the arithmetic's range (`NoWrap`, its own error,
     /// `trace::error`)? 16.16: `+ - * /`, negation and `abs` wrap or
     /// saturate. Doubles: `+ - * /` and `%` can leave the finite doubles
@@ -390,6 +394,9 @@ impl GraphArith for Fixed {
     fn lit_raw_fixed(lo: i32, hi: i32) -> Option<(i32, i32)> {
         Some((lo, hi))
     }
+    fn alone_in_its_value(_v: Pico8Num) -> bool {
+        true
+    }
     fn range_error(op: &Op<Fixed>) -> bool {
         matches!(op, Op::Add | Op::Sub | Op::Neg | Op::Abs | Op::Mul | Op::Div)
     }
@@ -666,6 +673,9 @@ impl GraphArith for Float {
 
     fn lit_raw_fixed(_lo: u64, _hi: u64) -> Option<(i32, i32)> {
         None
+    }
+    fn alone_in_its_value(v: LuaF64) -> bool {
+        v.value() != 0.0
     }
     fn range_error(op: &Op<Float>) -> bool {
         matches!(op, Op::Add | Op::Sub | Op::Mul | Op::Div | Op::Rem)
