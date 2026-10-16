@@ -149,19 +149,31 @@ wrapper took the whole session down).
 
 ## Checking a change
 
-`./check.sh t0|t1|t2|big`; what each tier runs and protects, the fixtures,
-the pins and re-pinning: plans/devloop.md. No check runs longer than ~2
-minutes.
+`./check.sh TIER`. What each tier runs and pins, the fixtures, the
+instruction budget and re-pinning: plans/devloop.md. The contract is the
+black-box pins (the fixture frames, the room (1,0) gates, the objects
+ladder, float and dual, the reference-engine checks, the instruction
+budget): a change keeps them byte-identical, or re-pins them on evidence.
+
+| tier | when | wall |
+|---|---|---|
+| inner loop | while editing: `./one-cargo.sh cargo check --all-targets`, `./one-cargo.sh cargo nextest run <filter>` | 1 s, ~7 s |
+| `t0` | before every commit: the unit tests | ~3 s (+ the test build) |
+| `t1` | after any change to the forward, kernels, tracer or storage: single frames, fixed and float | ~35 s |
+| `t2` | before handing a change over: end to end, and the slow tests | ~55 s |
+| `big`, `perf` | the reference and platform frames; the instruction budget (2% over a pin fails) | ~40 s, ~30 s |
+| `all` | before a merge: every tier, the local goldens, every fixture rebuilt, the pre-merge tests | ~7 min |
 
 - **Run tests with NEXTEST, never bare `cargo test`** (tests mutate
   process-global state; under cargo test the suite once took 70-85 minutes
-  on one core). One test after an edit: `cargo nextest run <filter>`.
+  on one core).
 - **Never use `--release` for tests or tools** (`lto = "fat"`: ~100 s
   relink after any edit). Tests and diagnostics use the `quick` profile;
   `--release` is for the gate and benchmarks. Never make
   `[profile.release]` cheaper: it silently reprices every recorded result.
-- **Do not read past the "N skipped" line** and call the suite green when
-  you touched what the `#[ignore]`d tests cover (plans/devloop.md, t3).
+- **Every `#[ignore]` names the tier that runs it** (`slow, ` t2;
+  `pre-merge, ` `all`; `local, ` `./check.sh local`): t0's "N skipped" are
+  those, not a pass.
 - **Re-pin only on evidence that the SETS did not move**, and say so in the
   commit.
 - `kernel lanes: missed 0` in every log.
