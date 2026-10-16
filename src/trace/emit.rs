@@ -14,6 +14,7 @@ use celeste_core::arith::Fixed;
 
 use crate::transpile::garith::GraphArith;
 use crate::transpile::graph::{Graph, NodeId};
+use crate::transpile::asm::CellRepr;
 use crate::transpile::kernel::{Emit, OutField, OutFields};
 
 /// What a lowered frame hands the kernel builder.
@@ -66,8 +67,8 @@ pub struct Bound<A: GraphArith = Fixed> {
     pub graph: Graph<A>,
     /// See `Frame::forks`.
     pub forks: u8,
-    pub inputs: Vec<(u32, &'static str)>,
-    pub uni: Vec<(u32, &'static str)>,
+    pub inputs: Vec<(u32, CellRepr)>,
+    pub uni: Vec<(u32, CellRepr)>,
     pub outcomes: Vec<FrameOutcome<A>>,
 }
 
@@ -99,13 +100,7 @@ fn root_legend<A: GraphArith>(f: &crate::trace::verify::Frame<A>) -> String {
 /// width and height, and a hitbox is fixed per object type and never
 /// written during a frame.
 pub fn bind<A: GraphArith>(f: &crate::trace::verify::Frame<A>, g: &Graph<A>) -> Result<Bound<A>> {
-    let mut roots: Vec<NodeId> = Vec::new();
-    for o in &f.outs {
-        roots.extend(o.fields.iter().map(|(_, nd, _)| *nd));
-        roots.push(o.guard);
-        roots.push(o.error);
-        roots.extend(o.arc.iter().copied());
-    }
+    let roots: Vec<NodeId> = f.outs.iter().flat_map(|o| o.roots(true)).collect();
     let (mut graph, mut roots) = crate::trace::bind::renumber_cells(g, &f.in_cells, &roots)
         .map_err(|e| anyhow::anyhow!("{:#}\nwhere the roots are\n{}", e, root_legend(f)))?;
     // The frame's own fork arities (`Frame::fork_ways`).
@@ -155,7 +150,7 @@ pub fn bind<A: GraphArith>(f: &crate::trace::verify::Frame<A>, g: &Graph<A>) -> 
             }
             crate::transpile::graph::Op::UnknownNum => {
                 // Name the roots that read it: the field, the guard or the error.
-                let reaches = |r: NodeId| crate::trace::verify::cone(&graph, &[r]).contains(&n);
+                let reaches = |r: NodeId| graph.cone(&[r]).contains(&n);
                 let which: Vec<String> = roots.iter().enumerate().filter(|(_, r)| reaches(**r)).map(|(i, r)| format!("#{i} {}", show_tree(&graph, *r, 4))).collect();
                 anyhow::bail!("an unknown number reaches the kernel: node {n} is read by root(s)\n{}\nwhere the roots are\n{}", which.join("\n"), root_legend(f))
             }
@@ -164,25 +159,27 @@ pub fn bind<A: GraphArith>(f: &crate::trace::verify::Frame<A>, g: &Graph<A>) -> 
         stack.extend(graph.get(n).args.iter().copied());
     }
 
-    let mut inputs: Vec<(u32, &'static str)> = Vec::new();
-    let mut uni: Vec<(u32, &'static str)> = Vec::new();
+    let mut inputs: Vec<(u32, CellRepr)> = Vec::new();
+    let mut uni: Vec<(u32, CellRepr)> = Vec::new();
+    let hitbox = crate::trace::iface::key("hitbox");
     for (i, c) in f.iface.init.iter().enumerate() {
-        let kind = match c {
+        let repr = match c {
             // `Iface::ival` marks an interval slot (a `ZI` lane, not `ZN`);
             // on a boolean slot, one a lane may hold unknown.
-            crate::trace::iface::Conc::Bool(_) if f.iface.ival[i] => "ubool",
-            _ if f.iface.ival[i] => "ival",
-            crate::trace::iface::Conc::Num(_) => "num",
-            crate::trace::iface::Conc::Bool(_) => "bool",
+            crate::trace::iface::Conc::Bool(_) if f.iface.ival[i] => CellRepr::UBool,
+            _ if f.iface.ival[i] => CellRepr::Ival,
+            crate::trace::iface::Conc::Num(_) => CellRepr::Num,
+            crate::trace::iface::Conc::Bool(_) => CellRepr::Bool,
         };
         let cell = f.in_cells[i];
         if !reads.contains(&cell) {
             continue;
         }
-        if crate::trace::iface::show(&f.iface.slots[i]).contains(".hitbox.") {
-            uni.push((cell, kind));
+        // A field of an object's `hitbox` (`obj.hitbox.w`).
+        if f.iface.slots[i].windows(2).skip(1).any(|w| w[0] == hitbox && matches!(w[1], crate::trace::iface::Step::Key(_))) {
+            uni.push((cell, repr));
         } else {
-            inputs.push((cell, kind));
+            inputs.push((cell, repr));
         }
     }
 
@@ -224,27 +221,6 @@ pub fn bind<A: GraphArith>(f: &crate::trace::verify::Frame<A>, g: &Graph<A>) -> 
     Ok(Bound { graph, forks: f.forks, inputs, uni, outcomes })
 }
 
-/// The per-cell ASM input reprs for a bound frame (`bool`/`num`/`ival` from
-/// the bound cell kinds). Input cells survive specialization unchanged, so
-/// this is valid for both the raw and the fused graph.
-pub fn asm_input_reprs<A: GraphArith>(
-    bound: &Bound<A>,
-) -> Result<std::collections::HashMap<u32, crate::transpile::asm::CellRepr>> {
-    use crate::transpile::asm::CellRepr;
-    let mut reprs = std::collections::HashMap::new();
-    for (cell, kind) in bound.inputs.iter().chain(bound.uni.iter()) {
-        let repr = match *kind {
-            "bool" => CellRepr::Bool,
-            "ubool" => CellRepr::UBool,
-            "num" => CellRepr::Num,
-            "ival" => CellRepr::Ival,
-            other => anyhow::bail!("cell {} has unexpected input kind {:?}", cell, other),
-        };
-        reprs.insert(*cell, repr);
-    }
-    Ok(reprs)
-}
-
 /// One fused (specialized) body: its outcome, the fork configuration it
 /// resolved (buttons included), and its roots in the FUSED graph.
 pub struct AsmBody {
@@ -255,7 +231,9 @@ pub struct AsmBody {
     pub roots: Vec<NodeId>,
 }
 
-/// `asm_fused` on a specialization already computed (`Lowered::spec`).
+/// A lowered frame's specialization (`Lowered::spec`) as the assembler
+/// takes it: the fused graph, its bodies, their roots in one list, and the
+/// input cells' reprs.
 pub fn asm_fused_from<A: GraphArith>(
     bound: &Bound<A>,
     spec: &(Graph<A>, Vec<crate::transpile::lower::SpecializedBody>),
@@ -265,27 +243,15 @@ pub fn asm_fused_from<A: GraphArith>(
     Vec<NodeId>,
     std::collections::HashMap<u32, crate::transpile::asm::CellRepr>,
 )> {
-    asm_fused_of(bound, spec.0.clone(), spec.1.clone())
-}
-
-fn asm_fused_of<A: GraphArith>(
-    bound: &Bound<A>,
-    fused: Graph<A>,
-    raw_bodies: Vec<crate::transpile::lower::SpecializedBody>,
-) -> Result<(
-    Graph<A>,
-    Vec<AsmBody>,
-    Vec<NodeId>,
-    std::collections::HashMap<u32, crate::transpile::asm::CellRepr>,
-)> {
     let mut flat_roots = Vec::new();
-    let mut bodies = Vec::with_capacity(raw_bodies.len());
-    for (outcome, splits, roots) in raw_bodies {
+    let mut bodies = Vec::with_capacity(spec.1.len());
+    for (outcome, splits, roots) in spec.1.iter().cloned() {
         flat_roots.extend(roots.iter().copied());
         bodies.push(AsmBody { outcome, splits, roots });
     }
-    let reprs = asm_input_reprs(bound)?;
-    Ok((fused, bodies, flat_roots, reprs))
+    // Input cells survive specialization unchanged.
+    let reprs = bound.inputs.iter().chain(&bound.uni).copied().collect();
+    Ok((spec.0.clone(), bodies, flat_roots, reprs))
 }
 
 /// Lower a traced frame - ALL of its output shapes together, so the part

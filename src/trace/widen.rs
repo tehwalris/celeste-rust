@@ -28,7 +28,7 @@ pub fn materialize_absent_fields<D: Domain>(st: &mut State<D>, d: &mut D) -> Res
             let Some(Value::Table(t)) = iface::get(st, &obj) else { bail!("{}: not a table", iface::show(&obj)) };
             match st.heap.tables[&t].hash.get(f) {
                 None | Some(Value::Nil) => {
-                    let zero = Value::Num(d.num(<D::A as celeste_core::arith::Arithmetic>::from_i16(0)));
+                    let zero = Value::Num(d.int(0));
                     st.heap.tables.get_mut(&t).unwrap().hash.insert(f.to_string(), zero);
                 }
                 Some(Value::Num(_)) => {}
@@ -381,7 +381,7 @@ pub fn near_floor_states<A: GraphArith>(st: &State<Symbolic<A>>, level: Level) -
 /// both values.
 fn read_near_floors<A: GraphArith>(st: &mut State<Symbolic<A>>, d: &mut Symbolic<A>, e: &Entry, mid: bool) -> Result<()> {
     use super::domain::Cmp;
-    let two = if mid { None } else { Some(d.num(A::from_i16(2))) };
+    let two = if mid { None } else { Some(d.int(2)) };
     for paths in entry_paths(st, e) {
         let [ps, pc] = &paths[..] else { bail!("the near floors' entry has two slots") };
         match two {
@@ -413,9 +413,8 @@ pub const PLAYER_PROBE: [(i16, i16); 2] = [(-3, 3), (-1, 0)];
 /// floor stores the CART'S INVARIANT (hidden: `state` 2, `collideable`
 /// false, the player cannot be inside a solid floor), with the computed
 /// value owed; storing the computed value makes the split resolve every
-/// floor the player MIGHT overlap (room (6,1): 3,638 outcomes vs 108) -
-/// except with the platforms unknown, where it stores the computed value
-/// (below). Mid split frame (`mid`), `collideable` also stays computed in the
+/// floor the player MIGHT overlap (30x the outcomes) - except with the
+/// platforms unknown, where it stores the computed value (below). Mid split frame (`mid`), `collideable` also stays computed in the
 /// `PLAYER_PROBE` window: widening there would let the second step reach
 /// states the unsplit frame does not. `Rt2::widen_to` agrees.
 fn widen_near_floors<A: GraphArith>(st: &mut State<Symbolic<A>>, d: &mut Symbolic<A>, e: &Entry, errs: &mut SlotErrors, mid: bool) -> Result<()> {
@@ -486,15 +485,14 @@ fn widen_near_floors<A: GraphArith>(st: &mut State<Symbolic<A>>, d: &mut Symboli
         // `state` 2 too. Do not owe `state == 2` separately: a shaking floor's
         // `sel(delay - 1 <= 0, 2, 1)` is undecided and would decline the lane.
         let apart = d.not(&overlap);
-        let two = d.num(A::from_i16(2));
+        let two = d.int(2);
         let range = ival(d, slo, shi);
         // With the platforms unknown, the overlapped floor stores what the
         // frame COMPUTED instead (exact, nothing owed): there the hidden
-        // invariant failed on every lane of the spawn's first player frame in
-        // room (2,1) `r0sxhnp` (a KERNEL COVERAGE GAP at f26: some outcome
-        // computes the overlapped floor solid), which the near level alone
-        // never meets. A stored computed `state`/`collideable` agrees with
-        // `Rt2::widen_to` (it keeps an overlapped floor's values as they are).
+        // invariant failed on every lane of the spawn's first player frame
+        // (room (2,1), a coverage gap; plans/architecture.md "Open issues").
+        // A stored computed `state`/`collideable` agrees with `Rt2::widen_to`
+        // (it keeps an overlapped floor's values as they are).
         let computed = d.level.platforms;
         let state = d.sel_num(&overlap, if computed { &state } else { &two }, &range);
         iface::set(st, ps, Value::Num(state))?;
@@ -617,12 +615,12 @@ pub fn platform_inputs<A: GraphArith>(st: &mut State<Symbolic<A>>, d: &mut Symbo
 /// round nowhere near its range) and is the doubles' own rounding for
 /// `Arith::Float`: `fl` is monotone, so `fl(a + b)` over ranges lies between
 /// the rounded sums of the ends.
-type Bounds = (f64, f64);
+type RangeF64 = (f64, f64);
 
 /// Does `v` provably lie in `[lo, hi]`? Through select arms and under
 /// point-split branches with what they say about the compared value (so a
 /// wrap `x < -16 ? 128 : ...` is bounded). Static; `false` if unsure.
-fn within<A: GraphArith>(d: &Symbolic<A>, v: NodeId, (lo, hi): Bounds, facts: &mut Vec<(NodeId, f64, f64)>) -> bool {
+fn within<A: GraphArith>(d: &Symbolic<A>, v: NodeId, (lo, hi): RangeF64, facts: &mut Vec<(NodeId, f64, f64)>) -> bool {
     // Its own bounds first: the enclosing branch may bound a select whole.
     if let Some((a, b)) = bounds(d, v, facts) {
         if lo <= a && b <= hi {
@@ -653,7 +651,7 @@ fn within<A: GraphArith>(d: &Symbolic<A>, v: NodeId, (lo, hi): Bounds, facts: &m
 /// `c` as `x op k` (`k` a literal point, either side): `x` and its range
 /// `(when true, when false)`; `k`'s neighbours are the arithmetic's
 /// (`Arithmetic::below`, and above as `-below(-k)`).
-fn comparison_facts<A: GraphArith>(d: &Symbolic<A>, c: NodeId) -> Option<(NodeId, Bounds, Bounds)> {
+fn comparison_facts<A: GraphArith>(d: &Symbolic<A>, c: NodeId) -> Option<(NodeId, RangeF64, RangeF64)> {
     let node = d.graph.get(c);
     let point = |n: NodeId| match d.graph.get(n).op {
         Op::Const(a, b) if a == b => Some(A::from_lit(a)),
@@ -691,10 +689,10 @@ fn comparison_facts<A: GraphArith>(d: &Symbolic<A>, c: NodeId) -> Option<(NodeId
 
 /// A static range of `n` (literals, a bounded input - a platform's
 /// `x` among them -, sums and differences), narrowed by the enclosing branches; `None` otherwise.
-fn bounds<A: GraphArith>(d: &Symbolic<A>, n: NodeId, facts: &[(NodeId, f64, f64)]) -> Option<Bounds> {
+fn bounds<A: GraphArith>(d: &Symbolic<A>, n: NodeId, facts: &[(NodeId, f64, f64)]) -> Option<RangeF64> {
     let node = d.graph.get(n);
     let num = |l: A::Lit| A::from_lit(l).to_f64();
-    let structural = || -> Option<Bounds> {
+    let structural = || -> Option<RangeF64> {
         Some(match node.op {
             Op::Const(a, b) => (num(a), num(b)),
             Op::Sel => {
@@ -747,7 +745,7 @@ mod tests {
     use celeste_core::pico8_num::Pico8Num as P8;
     use crate::trace::cart;
     use crate::trace::interp::Interp;
-    use crate::trace::verify::{run_one, trace_frame};
+    use crate::trace::verify::trace_frame;
     use crate::transpile::graph::Val;
     use std::collections::HashMap;
 
@@ -783,21 +781,11 @@ mod tests {
         if !std::path::Path::new("lua/celeste-minimal.lua").exists() {
             return;
         }
-        let s = crate::settings::Settings { room: (4, 0), ..Default::default() };
-        let src = cart::sources(&s).expect("sources");
-        let top = full_moon::parse(&src).expect("parse");
-        let init = full_moon::parse("_init()").expect("parse _init");
-        let reset = full_moon::parse("__reset_button_states()").expect("parse reset");
-        let frame = full_moon::parse(cart::FRAME_CODE).expect("parse frame");
+        let (root, s) = (std::path::Path::new("."), crate::settings::Settings { room: (4, 0), ..Default::default() });
+        let chunks = cart::Chunks::parse(root, &s).expect("chunks");
+        let frame = &chunks.frame;
         let mut it: Interp<Symbolic> = Interp::new(Symbolic::default());
-        let cd = std::sync::Arc::new(celeste_core::cart_data::CartData::load("cart").expect("cart"));
-        let (rx, ry) = s.room;
-        it.cache = Some(std::sync::Arc::new(celeste_core::collision_cache::CollisionCache::new(&cd, rx, ry).expect("cache")));
-        it.cart = Some(cd);
-        let st = cart::fresh_state::<Symbolic>(&mut it.d);
-        let mut st = run_one(&mut it, &top, st).expect("toplevel");
-        cart::inject_tile_flag_at(&mut st);
-        let mut st = run_one(&mut it, &init, st).expect("_init");
+        let mut st = cart::boot(&mut it, &chunks, root, s.room).expect("boot");
         let dead = |s: &Slot| matches!(s.stored, Stored::Num(_) | Stored::Bool(_));
         // The 100% route: the player runs, dashes, takes the key and opens
         // the chest with it.
@@ -808,7 +796,7 @@ mod tests {
             let roots = slots_where(&st, Level::EXACT, dead);
             with_key += roots.iter().any(|p| p.last() == Some(&iface::key("spr"))) as usize;
             with_player += !objects_of_type(&st, "player").is_empty() as usize;
-            let f = trace_frame(&mut it, &reset, &frame, st.clone(), &roots, &[], &[], false, &[], &[]).expect("trace");
+            let f = trace_frame(&mut it, &chunks, st.clone(), &crate::trace::verify::TraceSpec { roots: &roots, concrete: true, ..Default::default() }).expect("trace");
             // Everything a successor depends on, its booleans decided as far as a
             // BDD over independent atoms can (a guard re-merged after a branch on
             // `frames` is `c or not c`, true).
@@ -863,7 +851,7 @@ mod tests {
             }
             // Until the chest's `rnd` makes the concrete frame two (the key
             // is taken and the chest opened by then).
-            let Ok(next) = run_one(&mut it, &frame, st) else { break };
+            let Ok(next) = cart::run_one(&mut it, frame, st) else { break };
             st = next;
             has_key |= matches!(iface::get(&st, &[iface::key("has_key")]), Some(Value::Bool(b)) if it.d.decide(&b) == Some(true));
         }

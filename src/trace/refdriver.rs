@@ -8,10 +8,7 @@
 //! snapshotted or backtracked.
 
 use anyhow::{bail, Result};
-use std::sync::Arc;
 
-use celeste_core::cart_data::CartData;
-use celeste_core::collision_cache::CollisionCache;
 use full_moon::ast;
 
 use celeste_core::arith::Arithmetic;
@@ -20,15 +17,6 @@ use crate::trace::interp::Interp;
 use crate::trace::refdomain::{Cursor, RefDomain};
 use crate::trace::state::State;
 
-/// An `Interp<RefDomain>` with the room's cart and collision cache. The caller
-/// runs the cart toplevel and `_init` on it once, then reuses it every frame.
-pub fn fresh_interp<'a, A: Arithmetic>(cart: Arc<CartData>, cache: Arc<CollisionCache>) -> Interp<'a, RefDomain<A>> {
-    let mut it = Interp::new(RefDomain::new());
-    it.cart = Some(cart);
-    it.cache = Some(cache);
-    it
-}
-
 /// Run one frame of `body` from `input` along every fork path; one output state
 /// per leaf. For a game frame `body` is
 /// `__reset_button_states()\n_update()\n_draw()`, so the buttons are forks too.
@@ -36,9 +24,6 @@ pub fn fresh_interp<'a, A: Arithmetic>(cart: Arc<CartData>, cache: Arc<Collision
 /// `it` must have the cart's functions registered; its `d.cursor` is the DFS
 /// state. A path that REFUSES (e.g. a fork premise a lane cannot satisfy) is
 /// an error; a path that RAISES has no successor.
-///
-/// `level` is passed in, not read from the process-global level: a concrete
-/// step (`RefEngine::step`) is exact whatever the search has set.
 ///
 /// `unknown` names the input's unknown-boolean fields (`block::from_block`):
 /// each is a cursor choice made before the frame runs, as the kernels fork them.
@@ -62,7 +47,7 @@ pub fn run_frame_all<'a, A: Arithmetic>(
     // (`RefDomain::compare`) as the kernels' undecided atoms do. Unknown
     // platforms have no reference form yet.
     if level.platforms {
-        anyhow::bail!("the reference engine does not run platforms-unknown levels (plans/platforms-unknown.md)");
+        anyhow::bail!("the reference engine does not run platforms-unknown levels (`p`, plans/abstractions.md)");
     }
     loop {
         it.d.cursor.reset();

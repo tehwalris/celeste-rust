@@ -70,7 +70,7 @@ pub fn fold_into<A: GraphArith>(
     room: Option<&Room>,
     out: &mut Graph<A>,
 ) -> Result<(Vec<NodeId>, Stats)> {
-    let need = super::bdd::reachable(g, roots);
+    let need = g.reachable(roots);
     let cells = seed_cells(g);
     let vals = match room {
         Some(r) => g.eval_fold_in(&cells, r)?,
