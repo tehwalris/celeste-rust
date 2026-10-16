@@ -10,12 +10,12 @@ pub(crate) fn miss_report() -> String {
     format!("  {} lanes missed the ASM kernels", missed_lanes())
 }
 
-pub(crate) fn run_chunk_kernel(
-    reg: &super::asm_kernel::Registry,
-    chunk: &runtime2::Rt2,
+pub(crate) fn run_chunk_kernel<N: super::KernelLanes>(
+    reg: &super::asm_kernel::Registry<N>,
+    chunk: &runtime2::Rt2<N>,
     cell_in: &[u32],
     lanes: &[usize],
-    sink: &mut crate::storage::unit::UnitSink,
+    sink: &mut crate::storage::unit::UnitSink<N>,
 ) -> bool {
     // A miss is counted here and is fatal in the caller.
     let n = lanes.len() as u64;

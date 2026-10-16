@@ -1733,23 +1733,25 @@ pub fn seed<N: Rem>(visited: &mut VisitedSet<N>, blocks: &[Block<N>], start: N::
 
 /// What `one_frame` makes: the successors (rows with their keys) and the
 /// key space their keys are in.
-pub struct OneFrame {
-    pub next: Vec<Block>,
-    pub keys: celeste_engine::exact::KeySpace,
+pub struct OneFrame<N: Rem = P8> {
+    pub next: Vec<Block<N>>,
+    pub keys: celeste_engine::exact::KeySpace<N>,
 }
 
 /// ONE FRAME of the rows `rows` against an EMPTY tree, no edges: every
-/// successor is new (the diagnostics' `rerun`, the tests). The rows are
-/// seeded as a tree's start is (`seed`: each keyed as it is - the callers
-/// pass rows widened to the engine's level), with the whole circle as their
-/// hulls (a row's remainder is widened: every successor of every
+/// successor is new (the diagnostics' `rerun`, the tests), a row's own too
+/// (a player standing still: the seeds are forgotten once keyed). The rows
+/// are seeded as a tree's start is (`seed`: each keyed as it is - the
+/// callers pass rows widened to the engine's level), with the whole circle
+/// as their hulls (a row's remainder is widened: every successor of every
 /// remainder).
-pub fn one_frame(engine: &dyn FrameStep, rows: Vec<Block>, frame: u32) -> Result<OneFrame> {
-    let mut visited = VisitedSet::new(super::GEOMETRY);
-    let mut xfers = XferTable::default();
-    let skeletons = Skeletons::default();
+pub fn one_frame<N: Rem>(engine: &dyn FrameStep<N>, rows: Vec<Block<N>>, frame: u32) -> Result<OneFrame<N>> {
+    let mut visited = VisitedSet::<N>::new(super::GEOMETRY);
+    let mut xfers = XferTable::<N>::default();
+    let skeletons = Skeletons::<N>::default();
     let s = engine.settings();
-    let start = seed(&mut visited, &rows, <P8 as Rem>::full(), &s)?.frontier();
+    let start = seed(&mut visited, &rows, N::full(), &s)?.frontier();
+    visited.forget_states();
     let cx = WaveCtx { visited: &mut visited, xfers: &mut xfers, pos: None, filters: Filters::default(), frame, edges_dir: None, outs: None, skeletons: &skeletons, ceiling: None };
     let wave = run_wave(engine, start, cx)?;
     let next = super::layer::decode_states(&wave.next, &visited.keys, visited.shapes(), usize::MAX, &|_| true)?.into_iter().map(|(_, rt2)| Block::from_rt2(rt2)).collect();

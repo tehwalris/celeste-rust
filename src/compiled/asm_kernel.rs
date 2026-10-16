@@ -11,6 +11,7 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 
+use celeste_core::arith::{Arithmetic, EngineNum};
 use celeste_core::pico8_num::Pico8Num as P8;
 use celeste_engine::exact::{Code, KeySpace, Provisional, ShapeRecord};
 use celeste_engine::runtime2::{Col, Rt2, AV};
@@ -20,8 +21,10 @@ use crate::transpile::asm::{AsmCtx, CellRepr, CollisionEnv, Compiled, Loaded, Ro
 use crate::transpile::graph::Room;
 
 mod emit;
+mod lanes;
 use emit::{ArcSlots, KeyField, PartKey, PosSrc};
 pub(crate) use emit::{RawWords, RAW_WORDS};
+pub use lanes::KernelLanes;
 
 /// One output field of a body: its output cell, slot and kind.
 struct AsmField {
@@ -101,21 +104,20 @@ impl DupMemo {
         }
     }
 
-    /// The lanes where pair `p` of `pairs` is equal.
+    /// The lanes where pair `p` of `pairs` is equal (`half`: the output
+    /// buffer's halves' distance).
     #[inline]
-    fn eq(&mut self, pairs: &DupPairs, p: u32, buf: &[u8]) -> u16 {
+    fn eq<N: KernelLanes>(&mut self, pairs: &DupPairs, p: u32, buf: &[u8], half: usize) -> u16 {
         let p = p as usize;
         if self.stamp[p] == self.slice {
             return self.mask[p];
         }
-        let eq16 = |a: usize, b: usize| -> u16 { emit::eq16(&buf[a..a + 64], &buf[b..b + 64]) };
         let (a, b, kind) = pairs.pairs[p];
         let m = match kind {
-            RootKind::Num => eq16(a, b),
-            RootKind::Ival => eq16(a, b) & eq16(a + 64, b + 64),
+            RootKind::Num => N::eq_slots(buf, half, a, b),
+            RootKind::Ival => N::eq_slots(buf, half, a, b) & N::eq_slots(buf, half, a + 64, b + 64),
             RootKind::Bool => {
-                let w = |o: usize| (u16::from_le_bytes([buf[o], buf[o + 1]]), u16::from_le_bytes([buf[o + 2], buf[o + 3]]));
-                let ((va, ka), (vb, kb)) = (w(a), w(b));
+                let ((va, ka), (vb, kb)) = (N::masks(buf, half, a), N::masks(buf, half, b));
                 !((va ^ vb) | (ka ^ kb))
             }
         };
@@ -128,10 +130,10 @@ impl DupMemo {
 impl DupRef {
     /// The lanes of `cand` on which every pair is equal.
     #[inline]
-    fn eq_mask(&self, pairs: &DupPairs, memo: &mut DupMemo, buf: &[u8], cand: u16) -> u16 {
+    fn eq_mask<N: KernelLanes>(&self, pairs: &DupPairs, memo: &mut DupMemo, buf: &[u8], half: usize, cand: u16) -> u16 {
         let mut m = cand;
         for &p in &self.pairs {
-            m &= memo.eq(pairs, p, buf);
+            m &= memo.eq::<N>(pairs, p, buf, half);
             if m == 0 {
                 break;
             }
@@ -141,8 +143,8 @@ impl DupRef {
 }
 
 /// An accumulator column: a uniform constant or an empty typed vector.
-enum ColInit {
-    Uniform(AV),
+enum ColInit<N: EngineNum = P8> {
+    Uniform(AV<N>),
     EmptyNum,
     EmptyBool,
     EmptyIval,
@@ -150,24 +152,24 @@ enum ColInit {
 
 /// A per-outcome accumulator recipe (skeleton, column inits, the boundary's
 /// constants), so the append emits rows already at the boundary.
-struct AccTemplate {
-    skeleton: Rt2,
-    inits: Vec<(usize, ColInit)>,
+struct AccTemplate<N: EngineNum = P8> {
+    skeleton: Rt2<N>,
+    inits: Vec<(usize, ColInit<N>)>,
     shape_hash: u64,
     /// The key's uniform fields: every value cell uniform at the boundary,
     /// at its WIDENED value, as `(cell, code)` by cell.
-    uniform: Vec<(u32, Code)>,
+    uniform: Vec<(u32, Code<N>)>,
     /// The shape as a key space records it (checked against its record).
     record: ShapeRecord,
     /// This outcome's own skeleton, for cells the union makes typed.
-    own: Rt2,
+    own: Rt2<N>,
     /// The SHAPE's skeleton, typed wherever any outcome varies a cell: every
     /// queue and piece of the shape has these columns. Set by `unify`.
-    union: std::sync::Arc<Rt2>,
+    union: std::sync::Arc<Rt2<N>>,
 }
 
-impl AccTemplate {
-    fn build(&self) -> Rt2 {
+impl<N: EngineNum> AccTemplate<N> {
+    fn build(&self) -> Rt2<N> {
         let mut b = reshape(&self.skeleton, 0);
         for (c, init) in &self.inits {
             b.cols[*c] = match init {
@@ -200,8 +202,9 @@ fn thread_stack() -> usize {
     THREAD_STACK.with(|s| s.get())
 }
 
-/// One shape's assembled kernel and the metadata the append needs.
-struct AsmKernel {
+/// One shape's assembled kernel and the metadata the append needs, in the
+/// lanes of `N` (`KernelLanes`).
+struct AsmKernel<N: KernelLanes = P8> {
     loaded: Loaded,
     compiled: Compiled,
     bodies: Vec<AsmBody>,
@@ -209,13 +212,13 @@ struct AsmKernel {
     dup_pairs: DupPairs,
     /// What the bodies read at emission (`emit`).
     plan: emit::Plan,
-    acc_templates: Vec<AccTemplate>,
+    acc_templates: Vec<AccTemplate<N>>,
     forks: u8,
     /// Per body: where its roots go in the shape's union columns (`unify`).
-    body_cols: Vec<BodyCols>,
+    body_cols: Vec<BodyCols<N>>,
     /// The fused graph, roots and room for `explain_error`; empty unless
     /// `--kernel-explain` (`BuildOptions::keep_graphs`; gigabytes per set).
-    fused: crate::transpile::graph::Graph,
+    fused: crate::transpile::graph::Graph<N::Arith>,
     flat_roots: Vec<crate::transpile::graph::NodeId>,
     room: Room,
     fused_nodes: usize,
@@ -225,11 +228,22 @@ struct AsmKernel {
     mix_slices: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
 }
 
-impl AsmKernel {
+impl<N: KernelLanes> AsmKernel<N> {
+    /// The input and output buffers' halves' distances (`Compiled::halves`;
+    /// 0 for one half), and the buffers' sizes.
+    fn halves(&self) -> ((usize, usize), (usize, usize)) {
+        let (i, o) = (self.compiled.input_bytes as usize, self.compiled.out_bytes as usize);
+        if self.compiled.halves {
+            ((i, o), (2 * i, 2 * o))
+        } else {
+            ((0, 0), (i, o))
+        }
+    }
+
     /// Run `lanes` of one block in 16-lane slices, emitting each body's
     /// `live & !error` lanes into the sink with their edges. Any `live &
     /// error` (declined) fails the call: a coverage gap.
-    fn run(&self, chunk: &Rt2, lanes: &[usize], sink: &mut crate::storage::unit::UnitSink) -> bool {
+    fn run(&self, chunk: &Rt2<N>, lanes: &[usize], sink: &mut crate::storage::unit::UnitSink<N>) -> bool {
         stats([1, 0, 0, 0, 0, 0, 0]);
         // Slices of 16 lanes (`lanes`: the unit's expanded ones).
         for part in lanes.chunks(16) {
@@ -243,7 +257,7 @@ impl AsmKernel {
     /// Run ONE slice of up to 16 lanes (of any id groups), keeping lanes in
     /// `only`: the kernel, each body's lanes (`live & !error`, less those
     /// an earlier body emits identically), then their EMISSION (`emit`).
-    fn run_slice(&self, chunk: &Rt2, lanes: &[usize], only: u16, sink: &mut crate::storage::unit::UnitSink) -> bool {
+    fn run_slice(&self, chunk: &Rt2<N>, lanes: &[usize], only: u16, sink: &mut crate::storage::unit::UnitSink<N>) -> bool {
         let t_setup = crate::frame::phases::start(sink.phases);
         let n = lanes.len();
         debug_assert!((1..=16).contains(&n));
@@ -261,7 +275,8 @@ impl AsmKernel {
         // Utilization tallies, folded into `CALL_STATS[3..]` at the end.
         let (mut n_bodies, mut n_bodies_taken, mut n_lanes) = (0u64, 0u64, 0u64);
         let t_ph = crate::frame::phases::add(crate::frame::phases::SETUP, t_setup);
-        self.pack_input(&views, lanes, inbuf);
+        let ((ihalf, ohalf), _) = self.halves();
+        self.pack_input(&views, lanes, inbuf, ihalf);
         let t_ph = crate::frame::phases::add(crate::frame::phases::PACK, t_ph);
         // The spill frame is on THIS thread's stack: refuse rather than overrun.
         let (frame, stack) = (self.compiled.frame_bytes as usize, thread_stack());
@@ -272,6 +287,7 @@ impl AsmKernel {
             frame as f64 / 1048576.0,
             stack as f64 / 1048576.0
         );
+        N::before_call();
         unsafe {
             (self.loaded.func)(
                 inbuf.as_ptr(),
@@ -283,8 +299,8 @@ impl AsmKernel {
         let valid = (((1u32 << n) - 1) as u16) & only;
         for (bi, body) in self.bodies.iter().enumerate() {
             // Tri-state masks, each read where it MAY hold.
-            let error = read_zb_may(outbuf, body.error_off);
-            let live = read_zb_may(outbuf, body.live_off);
+            let error = read_zb_may::<N>(outbuf, ohalf, body.error_off);
+            let live = read_zb_may::<N>(outbuf, ohalf, body.live_off);
             // A row the forward does not expand (an exit, a lost berry)
             // never reaches a slice (the unit passes its expanded lanes
             // only): its error would be no decline. Room (6,2) 100% at
@@ -337,7 +353,7 @@ impl AsmKernel {
                 for r in &body.dup_refs {
                     let cand = take & took[r.body];
                     if cand != 0 {
-                        take &= !(cand & r.eq_mask(&self.dup_pairs, dups, outbuf, cand));
+                        take &= !(cand & r.eq_mask::<N>(&self.dup_pairs, dups, outbuf, ohalf, cand));
                         if take == 0 {
                             break;
                         }
@@ -351,7 +367,7 @@ impl AsmKernel {
                 n_lanes += take.count_ones() as u64;
             }
         }
-        let n_unique = self.emit(emit::Slice { chunk, lanes, buf: outbuf, takes, parts }, sink);
+        let n_unique = self.emit(emit::Slice { chunk, lanes, buf: outbuf, half: ohalf, takes, parts }, sink);
         if t_emit != 0 {
             crate::frame::phases::add(crate::frame::phases::EMIT, t_emit);
         }
@@ -361,13 +377,13 @@ impl AsmKernel {
     }
 
     /// On a decline: print the `error` disjuncts not false for `lane`.
-    fn explain_error(&self, chunk: &Rt2, lane: usize, error_node: crate::transpile::graph::NodeId) {
+    fn explain_error(&self, chunk: &Rt2<N>, lane: usize, error_node: crate::transpile::graph::NodeId) {
         use crate::transpile::graph::{Op, Val};
-        let mut cells: std::collections::HashMap<u32, Val> = Default::default();
+        let mut cells: std::collections::HashMap<u32, Val<N::Arith>> = Default::default();
         for &cell in &self.compiled.input_cells {
             let v = match chunk.cols[cell as usize].at(lane) {
-                AV::Num(p) => Val::Num(crate::pico8_num::Pico8NumInterval::new(p, p)),
-                AV::Ival(a, b) => Val::Num(crate::pico8_num::Pico8NumInterval::new(a, b)),
+                AV::Num(p) => Val::Num(<N::Arith as Arithmetic>::point(p)),
+                AV::Ival(a, b) => Val::Num(<N::Arith as Arithmetic>::ival(a, b)),
                 AV::Bool(b) => Val::Bool(Some(b)),
                 AV::UBool => Val::Bool(None),
                 _ => continue,
@@ -482,7 +498,7 @@ impl AsmKernel {
     }
 
     /// The input columns of `chunk` as slices, resolved once per call.
-    fn input_views<'c>(&self, chunk: &'c Rt2) -> Vec<InputView<'c>> {
+    fn input_views<'c>(&self, chunk: &'c Rt2<N>) -> Vec<InputView<'c, N>> {
         self.compiled
             .input_cells
             .iter()
@@ -495,9 +511,10 @@ impl AsmKernel {
             .collect()
     }
 
-    /// Pack `lanes` into `buf`; tail lanes repeat the last valid one so
-    /// call-outs never see garbage (the `take` mask discards them).
-    fn pack_input(&self, views: &[InputView], lanes: &[usize], buf: &mut [u8]) {
+    /// Pack `lanes` into `buf` (`half`: its halves' distance); tail lanes
+    /// repeat the last valid one so call-outs never see garbage (the
+    /// `take` mask discards them).
+    fn pack_input(&self, views: &[InputView<N>], lanes: &[usize], buf: &mut [u8], half: usize) {
         let n = lanes.len();
         for (view, &off) in views.iter().zip(&self.compiled.input_offsets) {
             let off = off as usize;
@@ -505,39 +522,35 @@ impl AsmKernel {
             match view {
                 InputView::Num(col) => {
                     for l in 0..16 {
-                        let raw = col[lane(l)].as_raw_u32();
-                        buf[off + l * 4..off + l * 4 + 4].copy_from_slice(&raw.to_le_bytes());
+                        N::put(buf, half, off, l, col[lane(l)].raw());
                     }
                 }
                 InputView::NumU(raw) => {
                     for l in 0..16 {
-                        buf[off + l * 4..off + l * 4 + 4].copy_from_slice(&raw.to_le_bytes());
+                        N::put(buf, half, off, l, *raw);
                     }
                 }
                 InputView::Ival(col) => {
                     for l in 0..16 {
                         let (a, b) = col[lane(l)];
-                        buf[off + l * 4..off + l * 4 + 4].copy_from_slice(&a.as_raw_u32().to_le_bytes());
-                        buf[off + 64 + l * 4..off + 64 + l * 4 + 4]
-                            .copy_from_slice(&b.as_raw_u32().to_le_bytes());
+                        N::put(buf, half, off, l, a.raw());
+                        N::put(buf, half, off + 64, l, b.raw());
                     }
                 }
                 InputView::IvalOfNum(col) => {
                     for l in 0..16 {
-                        let raw = col[lane(l)].as_raw_u32().to_le_bytes();
-                        buf[off + l * 4..off + l * 4 + 4].copy_from_slice(&raw);
-                        buf[off + 64 + l * 4..off + 64 + l * 4 + 4].copy_from_slice(&raw);
+                        let raw = col[lane(l)].raw();
+                        N::put(buf, half, off, l, raw);
+                        N::put(buf, half, off + 64, l, raw);
                     }
                 }
                 InputView::IvalU(a, b) => {
                     for l in 0..16 {
-                        buf[off + l * 4..off + l * 4 + 4].copy_from_slice(&a.to_le_bytes());
-                        buf[off + 64 + l * 4..off + 64 + l * 4 + 4].copy_from_slice(&b.to_le_bytes());
+                        N::put(buf, half, off, l, *a);
+                        N::put(buf, half, off + 64, l, *b);
                     }
                 }
-                InputView::BoolU(mask) => {
-                    buf[off..off + 2].copy_from_slice(&mask.to_le_bytes());
-                }
+                InputView::BoolU(mask) => N::put_masks(buf, half, off, *mask, None),
                 InputView::Bool(col) => {
                     let mut mask = 0u16;
                     for l in 0..16 {
@@ -548,7 +561,7 @@ impl AsmKernel {
                             other => panic!("ASM bool input lane holds {other:?}: a kernel reads a boolean the block does not decide"),
                         }
                     }
-                    buf[off..off + 2].copy_from_slice(&mask.to_le_bytes());
+                    N::put_masks(buf, half, off, mask, None);
                 }
                 InputView::UBool(col) => {
                     let (mut val, mut known) = (0u16, 0u16);
@@ -562,27 +575,19 @@ impl AsmKernel {
                             other => panic!("ASM maybe-unknown bool input lane holds {other:?}"),
                         }
                     }
-                    buf[off..off + 2].copy_from_slice(&val.to_le_bytes());
-                    buf[off + 2..off + 4].copy_from_slice(&known.to_le_bytes());
+                    N::put_masks(buf, half, off, val, Some(known));
                 }
-                InputView::UBoolU(val, known) => {
-                    buf[off..off + 2].copy_from_slice(&val.to_le_bytes());
-                    buf[off + 2..off + 4].copy_from_slice(&known.to_le_bytes());
-                }
+                InputView::UBoolU(val, known) => N::put_masks(buf, half, off, *val, Some(*known)),
                 InputView::Any(col, repr) => {
                     // The general case: a materialized `AV` column, per value.
                     for l in 0..16 {
                         let v = col.at(lane(l));
                         match repr {
-                            CellRepr::Num => {
-                                let raw = num_raw(v);
-                                buf[off + l * 4..off + l * 4 + 4].copy_from_slice(&raw.to_le_bytes());
-                            }
+                            CellRepr::Num => N::put(buf, half, off, l, num_raw(v)),
                             CellRepr::Ival => {
                                 let (a, b) = ival_raw(v);
-                                buf[off + l * 4..off + l * 4 + 4].copy_from_slice(&a.to_le_bytes());
-                                buf[off + 64 + l * 4..off + 64 + l * 4 + 4]
-                                    .copy_from_slice(&b.to_le_bytes());
+                                N::put(buf, half, off, l, a);
+                                N::put(buf, half, off + 64, l, b);
                             }
                             CellRepr::Bool | CellRepr::UBool => unreachable!("bool inputs are Bool/BoolU/UBool/UBoolU views"),
                         }
@@ -594,7 +599,7 @@ impl AsmKernel {
 }
 
 /// Per (thread, kernel) reusable input and output buffers.
-struct Scratch {
+pub struct Scratch<N: KernelLanes = P8> {
     kernel: usize,
     inbuf: Vec<u8>,
     outbuf: Vec<u8>,
@@ -605,25 +610,22 @@ struct Scratch {
     dups: DupMemo,
     /// Per outcome, its uniform fields keyed in the key space of generation
     /// `.0` (`PartKey`).
-    parts: Vec<(u64, PartKey)>,
+    parts: Vec<(u64, PartKey<N>)>,
 }
 
-thread_local! {
-    static SCRATCH: std::cell::RefCell<Vec<Scratch>> = const { std::cell::RefCell::new(Vec::new()) };
-}
-
-impl Scratch {
+impl<N: KernelLanes> Scratch<N> {
     /// This thread's scratch for `k`, taken out until `put_back`.
-    fn take(k: &AsmKernel) -> Scratch {
-        let id = k as *const AsmKernel as usize;
-        SCRATCH.with(|c| {
+    fn take(k: &AsmKernel<N>) -> Scratch<N> {
+        let id = k as *const AsmKernel<N> as usize;
+        let (_, (ib, ob)) = k.halves();
+        N::scratch().with(|c| {
             let mut c = c.borrow_mut();
             match c.iter().position(|s| s.kernel == id) {
                 Some(i) => c.swap_remove(i),
                 None => Scratch {
                     kernel: id,
-                    inbuf: vec![0u8; k.compiled.input_bytes as usize],
-                    outbuf: vec![0u8; k.compiled.out_bytes as usize],
+                    inbuf: vec![0u8; ib],
+                    outbuf: vec![0u8; ob],
                     took: vec![0u16; k.bodies.len()],
                     takes: vec![0u16; k.bodies.len()],
                     dups: DupMemo::default(),
@@ -634,25 +636,25 @@ impl Scratch {
     }
 
     fn put_back(self) {
-        SCRATCH.with(|c| c.borrow_mut().push(self));
+        N::scratch().with(|c| c.borrow_mut().push(self));
     }
 }
 
 /// A body's roots by kind with their union columns, plus its uniform cells.
-struct BodyCols {
+struct BodyCols<N: EngineNum = P8> {
     num: Vec<(usize, usize)>,
     ival: Vec<(usize, usize)>,
     /// A NUMBER root into a union `Ival` column, stored `[v, v]`.
     num_as_ival: Vec<(usize, usize)>,
     /// `(column, root, may the root be unknown)` (`AsmField::may_unknown`).
     bool_: Vec<(usize, usize, bool)>,
-    uniform_num: Vec<(usize, u32)>,
-    uniform_ival: Vec<(usize, (u32, u32))>,
+    uniform_num: Vec<(usize, N::Raw)>,
+    uniform_ival: Vec<(usize, (N::Raw, N::Raw))>,
     uniform_bool: Vec<(usize, u8)>,
 }
 
-impl BodyCols {
-    fn of(body: &AsmBody, proto: &crate::storage::unit::RowBuf, own: &Rt2) -> Result<Self> {
+impl<N: KernelLanes> BodyCols<N> {
+    fn of(body: &AsmBody, proto: &crate::storage::unit::RowBuf<N>, own: &Rt2<N>) -> Result<Self> {
         use crate::storage::unit::TCol;
         let (mut num, mut ival, mut num_as_ival, mut bool_) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
         let mut written = vec![false; proto.cols.len()];
@@ -679,9 +681,9 @@ impl BodyCols {
                 anyhow::bail!("union column at cell {cell} is neither a body root nor uniform in its outcome");
             };
             match (col, av) {
-                (TCol::Num(_), AV::Num(n)) => uniform_num.push((ci, n.as_raw_u32())),
-                (TCol::Ival(_), AV::Ival(a, b)) => uniform_ival.push((ci, (a.as_raw_u32(), b.as_raw_u32()))),
-                (TCol::Ival(_), AV::Num(n)) => uniform_ival.push((ci, (n.as_raw_u32(), n.as_raw_u32()))),
+                (TCol::Num(_), AV::Num(n)) => uniform_num.push((ci, n.raw())),
+                (TCol::Ival(_), AV::Ival(a, b)) => uniform_ival.push((ci, (a.raw(), b.raw()))),
+                (TCol::Ival(_), AV::Num(n)) => uniform_ival.push((ci, (n.raw(), n.raw()))),
                 (TCol::Bool(_), AV::Bool(x)) => uniform_bool.push((ci, *x as u8)),
                 // An output widening's canonical unknown (`TCol::Bool`'s 2).
                 (TCol::Bool(_), AV::UBool) => uniform_bool.push((ci, 2)),
@@ -691,31 +693,31 @@ impl BodyCols {
         Ok(BodyCols { num, ival, num_as_ival, bool_, uniform_num, uniform_ival, uniform_bool })
     }
 
-    /// Append lane `i` of the output buffer to `slot` as one row.
+    /// Append lane `i` of the output buffer (halves `half` apart) to `slot`
+    /// as one row.
     #[inline]
-    fn push_row(&self, slot: &mut crate::storage::unit::RowBuf, buf: &[u8], i: usize, key: (u64, u64), cell: u32) {
+    fn push_row(&self, slot: &mut crate::storage::unit::RowBuf<N>, buf: &[u8], half: usize, i: usize, key: (u64, u64), cell: u32) {
         use crate::storage::unit::TCol;
-        let word = |base: usize| u32::from_le_bytes(buf[base..base + 4].try_into().unwrap());
+        let word = |base: usize| N::lane(buf, half, base, i);
         for &(ci, root) in &self.num {
             if let TCol::Num(v) = &mut slot.cols[ci].1 {
-                v.push(word(root + i * 4));
+                v.push(word(root));
             }
         }
         for &(ci, root) in &self.ival {
             if let TCol::Ival(v) = &mut slot.cols[ci].1 {
-                v.push((word(root + i * 4), word(root + 64 + i * 4)));
+                v.push((word(root), word(root + 64)));
             }
         }
         for &(ci, root) in &self.num_as_ival {
             if let TCol::Ival(v) = &mut slot.cols[ci].1 {
-                let n = word(root + i * 4);
+                let n = word(root);
                 v.push((n, n));
             }
         }
         for &(ci, root, may_unknown) in &self.bool_ {
             if let TCol::Bool(v) = &mut slot.cols[ci].1 {
-                let val = u16::from_le_bytes([buf[root], buf[root + 1]]);
-                let known = u16::from_le_bytes([buf[root + 2], buf[root + 3]]);
+                let (val, known) = N::masks(buf, half, root);
                 if known >> i & 1 == 0 {
                     // FATAL unless an output widening wrote it (`may_unknown`).
                     assert!(may_unknown, "emitted row holds an undecided boolean (column {ci}, cell {}, root {root}): no premise declined it", slot.cols[ci].0);
@@ -746,29 +748,29 @@ impl BodyCols {
 }
 
 /// One input column of a call, resolved to what the packer copies from.
-enum InputView<'c> {
-    Num(&'c [P8]),
-    NumU(u32),
-    Ival(&'c [(P8, P8)]),
-    IvalOfNum(&'c [P8]),
-    IvalU(u32, u32),
-    Bool(&'c [AV]),
+enum InputView<'c, N: EngineNum = P8> {
+    Num(&'c [N]),
+    NumU(N::Raw),
+    Ival(&'c [(N, N)]),
+    IvalOfNum(&'c [N]),
+    IvalU(N::Raw, N::Raw),
+    Bool(&'c [AV<N>]),
     BoolU(u16),
     /// A maybe-unknown bool (`CellRepr::UBool`), per lane or uniform.
-    UBool(&'c [AV]),
+    UBool(&'c [AV<N>]),
     UBoolU(u16, u16),
-    Any(&'c Col, CellRepr),
+    Any(&'c Col<N>, CellRepr),
 }
 
-impl<'c> InputView<'c> {
-    fn of(col: &'c Col, repr: CellRepr) -> Result<Self, String> {
+impl<'c, N: EngineNum> InputView<'c, N> {
+    fn of(col: &'c Col<N>, repr: CellRepr) -> Result<Self, String> {
         Ok(match (repr, col) {
             (CellRepr::Num, Col::N(v)) => InputView::Num(v),
-            (CellRepr::Num, Col::U(AV::Num(n))) => InputView::NumU(n.as_raw_u32()),
+            (CellRepr::Num, Col::U(AV::Num(n))) => InputView::NumU(n.raw()),
             (CellRepr::Ival, Col::I(v)) => InputView::Ival(v),
             (CellRepr::Ival, Col::N(v)) => InputView::IvalOfNum(v),
-            (CellRepr::Ival, Col::U(AV::Ival(a, b))) => InputView::IvalU(a.as_raw_u32(), b.as_raw_u32()),
-            (CellRepr::Ival, Col::U(AV::Num(n))) => InputView::IvalU(n.as_raw_u32(), n.as_raw_u32()),
+            (CellRepr::Ival, Col::U(AV::Ival(a, b))) => InputView::IvalU(a.raw(), b.raw()),
+            (CellRepr::Ival, Col::U(AV::Num(n))) => InputView::IvalU(n.raw(), n.raw()),
             (CellRepr::Bool, Col::V(v)) => InputView::Bool(v),
             (CellRepr::Bool, Col::U(v)) => match v {
                 AV::Bool(b) => InputView::BoolU(if *b { 0xffff } else { 0 }),
@@ -851,17 +853,17 @@ pub(crate) fn key_check_block<N: celeste_core::arith::EngineNum>(blk: &Rt2<N>, k
     );
 }
 
-fn num_raw(av: AV) -> i32 {
+fn num_raw<N: EngineNum>(av: AV<N>) -> N::Raw {
     match av {
-        AV::Num(p) => p.as_raw_u32() as i32,
+        AV::Num(p) => p.raw(),
         other => panic!("ASM num input got {other:?}"),
     }
 }
 
-fn ival_raw(av: AV) -> (i32, i32) {
+fn ival_raw<N: EngineNum>(av: AV<N>) -> (N::Raw, N::Raw) {
     match av {
-        AV::Ival(a, b) => (a.as_raw_u32() as i32, b.as_raw_u32() as i32),
-        AV::Num(p) => (p.as_raw_u32() as i32, p.as_raw_u32() as i32),
+        AV::Ival(a, b) => (a.raw(), b.raw()),
+        AV::Num(p) => (p.raw(), p.raw()),
         other => panic!("ASM ival input got {other:?}"),
     }
 }
@@ -870,9 +872,8 @@ fn ival_raw(av: AV) -> (i32, i32) {
 /// `known` at +2). An unknown `live` reads live: emitting over-approximates
 /// (sound, the concrete search refutes) where dropping loses successors. An
 /// unknown `error` is a decline: strict.
-fn read_zb_may(buf: &[u8], off: usize) -> u16 {
-    let val = u16::from_le_bytes([buf[off], buf[off + 1]]);
-    let known = u16::from_le_bytes([buf[off + 2], buf[off + 3]]);
+fn read_zb_may<N: KernelLanes>(buf: &[u8], half: usize, off: usize) -> u16 {
+    let (val, known) = N::masks(buf, half, off);
     val | !known
 }
 
@@ -880,9 +881,9 @@ fn read_zb_may(buf: &[u8], off: usize) -> u16 {
 
 
 /// The start room's assembled kernels for one level.
-pub(crate) struct Registry {
+pub struct Registry<N: KernelLanes = P8> {
     /// One kernel per reached (shape, region); a missing key is a coverage gap.
-    kernels: HashMap<(u64, Option<Region>), AsmKernel>,
+    kernels: HashMap<(u64, Option<Region>), AsmKernel<N>>,
     /// The region grid the set was built on.
     grid: Option<crate::trace::kernel::RegionGrid>,
 }
@@ -901,7 +902,7 @@ struct BuildOptions {
 
 use crate::trace::kernel::Region;
 
-impl Registry {
+impl<N: KernelLanes> Registry<N> {
     pub fn len(&self) -> usize {
         self.kernels.len()
     }
@@ -910,10 +911,10 @@ impl Registry {
     /// miss or a decline.
     pub fn run_chunk(
         &self,
-        chunk: &Rt2,
+        chunk: &Rt2<N>,
         cell_in: &[u32],
         lanes: &[usize],
-        sink: &mut crate::storage::unit::UnitSink,
+        sink: &mut crate::storage::unit::UnitSink<N>,
     ) -> bool {
         if self.grid.is_none() {
             return self.run_key(chunk, None, lanes, sink);
@@ -949,7 +950,7 @@ impl Registry {
         true
     }
 
-    fn run_key(&self, chunk: &Rt2, key: Option<Region>, lanes: &[usize], sink: &mut crate::storage::unit::UnitSink) -> bool {
+    fn run_key(&self, chunk: &Rt2<N>, key: Option<Region>, lanes: &[usize], sink: &mut crate::storage::unit::UnitSink<N>) -> bool {
         match self.kernels.get(&(chunk.shape_hash, key)) {
             Some(k) => k.run(chunk, lanes, sink),
             None => {
@@ -974,7 +975,7 @@ impl Registry {
     /// Retrace the start room and assemble every shape for `opts` (`root`:
     /// repo) under settings `s` (the cart, the room, the region grid, the
     /// build's diagnostics).
-    pub fn build_for_start_room(root: &Path, opts: crate::abstraction::Level, s: &crate::settings::Settings) -> Result<Registry> {
+    pub fn build_for_start_room(root: &Path, opts: crate::abstraction::Level, s: &crate::settings::Settings) -> Result<Registry<N>> {
         let grid = s.region_grid();
         match grid {
             Some(g) => eprintln!("[region] kernels keyed on a {} px grid, player speed asserted within [-{}, {}] px", g.px, g.speed, g.speed),
@@ -988,7 +989,7 @@ impl Registry {
         };
         let build = &build;
         let t_trace = std::time::Instant::now();
-        let refs = crate::trace::kernel::lattice_kernel_refs(root, opts, s)
+        let refs = crate::trace::kernel::lattice_kernel_refs::<N::Arith>(root, opts, s)
             .context("retracing the start room for ASM kernels")?;
         let trace_s = t_trace.elapsed().as_secs_f64();
         let t_asm = std::time::Instant::now();
@@ -997,7 +998,7 @@ impl Registry {
         let n_workers = pool.workers(refs.len());
         let built = pool.map(refs.len(), |si| {
             let (key, r) = &refs[si];
-            build_one_shape(r, si, &format!("_{si}"), build).map(|(shape, kernel)| (shape, *key, kernel))
+            build_one_shape::<N>(r, si, &format!("_{si}"), build).map(|(shape, kernel)| (shape, *key, kernel))
         })?;
         let mut kernels = HashMap::new();
         let mut first: HashMap<(u64, Option<Region>), usize> = HashMap::new();
@@ -1034,7 +1035,7 @@ enum Kind {
     Bool,
 }
 
-fn kind_of(col: &Col) -> Option<Kind> {
+fn kind_of<N: EngineNum>(col: &Col<N>) -> Option<Kind> {
     match col {
         Col::N(_) | Col::U(AV::Num(_)) => Some(Kind::Num),
         Col::I(_) | Col::U(AV::Ival(..)) => Some(Kind::Ival),
@@ -1043,7 +1044,7 @@ fn kind_of(col: &Col) -> Option<Kind> {
     }
 }
 
-fn typed(kind: Kind) -> Col {
+fn typed<N: EngineNum>(kind: Kind) -> Col<N> {
     match kind {
         Kind::Num => Col::N(Vec::new()),
         Kind::Ival => Col::I(Vec::new()),
@@ -1054,8 +1055,8 @@ fn typed(kind: Kind) -> Col {
 /// Give every outcome template of a SHAPE the union skeleton (a cell is
 /// typed if any outcome varies it or two disagree; Num + Ival -> Ival) and
 /// map every body onto its columns (`BodyCols`).
-fn unify(by_shape: &mut HashMap<(u64, Option<Region>), AsmKernel>) -> Result<()> {
-    let mut unions: HashMap<u64, Rt2> = HashMap::new();
+fn unify<N: KernelLanes>(by_shape: &mut HashMap<(u64, Option<Region>), AsmKernel<N>>) -> Result<()> {
+    let mut unions: HashMap<u64, Rt2<N>> = HashMap::new();
     for kernel in by_shape.values() {
         for t in &kernel.acc_templates {
             let own = &t.own;
@@ -1089,7 +1090,7 @@ fn unify(by_shape: &mut HashMap<(u64, Option<Region>), AsmKernel>) -> Result<()>
             }
         }
     }
-    let unions: HashMap<u64, std::sync::Arc<Rt2>> = unions.into_iter().map(|(k, v)| (k, std::sync::Arc::new(v))).collect();
+    let unions: HashMap<u64, std::sync::Arc<Rt2<N>>> = unions.into_iter().map(|(k, v)| (k, std::sync::Arc::new(v))).collect();
     let mut widened = 0usize;
     for kernel in by_shape.values_mut() {
         apply_union(kernel, &unions)?;
@@ -1123,7 +1124,7 @@ fn unify(by_shape: &mut HashMap<(u64, Option<Region>), AsmKernel>) -> Result<()>
 }
 
 /// Apply the shape unions to one kernel's templates and bodies.
-fn apply_union(kernel: &mut AsmKernel, unions: &HashMap<u64, std::sync::Arc<Rt2>>) -> Result<()> {
+fn apply_union<N: KernelLanes>(kernel: &mut AsmKernel<N>, unions: &HashMap<u64, std::sync::Arc<Rt2<N>>>) -> Result<()> {
     for t in &mut kernel.acc_templates {
         t.union = unions
             .get(&t.shape_hash)
@@ -1142,7 +1143,7 @@ fn apply_union(kernel: &mut AsmKernel, unions: &HashMap<u64, std::sync::Arc<Rt2>
 
 /// Assemble ONE frame (gcc + dlopen) and map its bodies onto output slots;
 /// `tag` distinguishes a shape's region kernels.
-fn build_one_shape(r: &crate::trace::kernel::Reference, si: usize, tag: &str, build: &BuildOptions) -> Result<(u64, AsmKernel)> {
+fn build_one_shape<N: KernelLanes>(r: &crate::trace::kernel::Reference<N::Arith>, si: usize, tag: &str, build: &BuildOptions) -> Result<(u64, AsmKernel<N>)> {
     let shape = r.frame.in_rt2.shape_hash_of();
     let room = Room { cart: r.cart.clone(), cache: r.cache.clone() };
     let t_fuse = std::time::Instant::now();
@@ -1283,7 +1284,7 @@ fn build_one_shape(r: &crate::trace::kernel::Reference, si: usize, tag: &str, bu
             off += b.roots.len();
         }
         let names: HashMap<u32, String> = compiled.input_cells.iter().copied().zip(input_names.iter().cloned()).collect();
-        let census = crate::compiled::mix::report(&crate::compiled::mix::Input {
+        let census = N::mix_report(&crate::compiled::mix::Input {
             traced: &r.bound.graph,
             fused: &fused,
             roots: &flat_roots,
@@ -1315,7 +1316,7 @@ fn build_one_shape(r: &crate::trace::kernel::Reference, si: usize, tag: &str, bu
             body_cols: Vec::new(),
             fused_nodes: fused.len(),
             mix_slices,
-            fused: if build.keep_graphs { fused } else { crate::transpile::graph::Graph::new() },
+            fused: if build.keep_graphs { fused } else { crate::transpile::graph::Graph::default() },
             flat_roots: if build.keep_graphs { flat_roots } else { Vec::new() },
             room,
             input_names,
@@ -1382,7 +1383,7 @@ fn dup_refs(bodies: &mut [AsmBody], reads: &[emit::BodyReads]) -> DupPairs {
 
 /// Where a body's rows get player and room `x`/`y`; `None` (`NO_CELL`)
 /// without a numeric player position, as `pos_graph::block_cells`.
-fn pos_sources(template: &Rt2, fields: &[AsmField]) -> Result<Option<[PosSrc; 4]>> {
+fn pos_sources<N: EngineNum>(template: &Rt2<N>, fields: &[AsmField]) -> Result<Option<[PosSrc; 4]>> {
     let ids = crate::compiled::ids();
     let Some(obj) = crate::search::pos_graph::player_object(template) else {
         return Ok(None);
@@ -1400,7 +1401,7 @@ fn pos_sources(template: &Rt2, fields: &[AsmField]) -> Result<Option<[PosSrc; 4]
             });
         }
         match template.cols[cell as usize] {
-            Col::U(AV::Num(n)) => Ok(Some(PosSrc::Konst(n.whole_part_as_i16()))),
+            Col::U(AV::Num(n)) => Ok(Some(PosSrc::Konst(n.whole_i16().ok_or_else(|| anyhow::anyhow!("a constant position {n:?} past the i16 pixels"))?))),
             Col::U(_) => Ok(None),
             _ => anyhow::bail!("position cell {cell} is neither an output field nor a constant"),
         }
@@ -1425,11 +1426,11 @@ fn pos_sources(template: &Rt2, fields: &[AsmField]) -> Result<Option<[PosSrc; 4]
 
 /// The accumulator recipe for one outcome, with `shape_hash` and its key's
 /// uniform fields.
-fn acc_template(r: &crate::trace::kernel::Reference, oi: usize) -> Result<AccTemplate> {
+fn acc_template<N: KernelLanes>(r: &crate::trace::kernel::Reference<N::Arith>, oi: usize) -> Result<AccTemplate<N>> {
     // Canonical: `block::skeleton` ends in `Rt2::canonicalize_ids`.
     let skeleton = reshape(&r.frame.outs[oi].rt2, 0);
     let shape_hash = skeleton.shape_hash_of();
-    let mut inits: Vec<(usize, ColInit)> = Vec::new();
+    let mut inits: Vec<(usize, ColInit<N>)> = Vec::new();
     for f in &r.lowered.outs[oi].fields {
         let cell = f.cell as usize;
         // A widened-to-uniform cell holds its widened value (as `uniform` codes it).
@@ -1529,18 +1530,19 @@ pub(crate) fn take_call_stats() -> [u64; 7] {
     std::array::from_fn(|i| CALL_STATS[i].swap(0, std::sync::atomic::Ordering::Relaxed))
 }
 
-/// `level`'s kernel set under settings `s`, built on first use. ONE set is
-/// resident (GBs), keyed on the level AND the settings it was built under:
-/// another key replaces it; callers hold theirs by `Arc`.
-pub(crate) fn registry(level: crate::abstraction::Level, s: &crate::settings::Settings) -> std::sync::Arc<Registry> {
-    type Resident = Option<(crate::abstraction::Level, crate::settings::Settings, std::sync::Arc<Registry>)>;
-    static SET: std::sync::Mutex<Resident> = std::sync::Mutex::new(None);
-    let mut set = SET.lock().unwrap();
+/// An arithmetic's resident kernel set and what it was built under.
+pub type Resident<N> = Option<(crate::abstraction::Level, crate::settings::Settings, std::sync::Arc<Registry<N>>)>;
+
+/// `level`'s kernel set under settings `s`, built on first use. ONE set an
+/// arithmetic is resident (GBs), keyed on the level AND the settings it was
+/// built under: another key replaces it; callers hold theirs by `Arc`.
+pub(crate) fn registry<N: KernelLanes>(level: crate::abstraction::Level, s: &crate::settings::Settings) -> std::sync::Arc<Registry<N>> {
+    let mut set = N::resident().lock().unwrap();
     match &*set {
         Some((l, k, r)) if *l == level && k == s => r.clone(),
         _ => {
             *set = None;
-            let built = std::sync::Arc::new(build_registry_for_level(level, s));
+            let built = std::sync::Arc::new(build_registry_for_level::<N>(level, s));
             *set = Some((level, s.clone(), built.clone()));
             built
         }
@@ -1589,18 +1591,18 @@ impl Drop for BuildPurgeDelay {
     }
 }
 
-fn build_registry_for_level(level: crate::abstraction::Level, s: &crate::settings::Settings) -> Registry {
+fn build_registry_for_level<N: KernelLanes>(level: crate::abstraction::Level, s: &crate::settings::Settings) -> Registry<N> {
     let _purge = BuildPurgeDelay::start();
     let s = s.clone();
     let built = std::thread::Builder::new()
         .stack_size(256 * 1024 * 1024)
-        .spawn(move || Registry::build_for_start_room(Path::new("."), level, &s))
+        .spawn(move || Registry::<N>::build_for_start_room(Path::new("."), level, &s))
         .expect("spawn asm-kernel builder")
         .join()
         .expect("asm-kernel builder panicked");
     match built {
         Ok(reg) => {
-            eprintln!("ASM kernels ENABLED ({level}): {} start-room shapes assembled", reg.len());
+            eprintln!("ASM kernels ENABLED ({level}, {}): {} start-room shapes assembled", <N::Arith as Arithmetic>::NAME, reg.len());
             reg
         }
         Err(e) => panic!("building ASM kernels for {level}: {e:#}"),

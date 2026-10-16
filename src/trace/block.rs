@@ -32,7 +32,6 @@ use anyhow::{anyhow, bail, ensure, Result};
 use celeste_core::cart_data::CartData;
 use celeste_core::collision_cache::CollisionCache;
 use celeste_core::arith::{Arithmetic, EngineNum};
-use celeste_core::pico8_num::Pico8Num as P8;
 use celeste_engine::runtime2::{Cell2, Col, Rt2, AV, NONE};
 use celeste_names as gen;
 
@@ -393,18 +392,18 @@ impl<N: EngineNum, D: Domain<A = N::A>> FromBlock<'_, N, D> {
 /// tracer's skeleton of it (what its kernels bind) has that shape. The
 /// tracer's numbers and booleans are a block's values here, so constants,
 /// read off its graph. `base` and `fn_info`: the reference engine's.
-pub fn check_agreement(rt2: &Rt2, fn_info: &FnInfo, base: &State<RefDomain>, room: (i16, i16)) -> Result<()> {
+pub fn check_agreement<A: crate::transpile::garith::GraphArith>(rt2: &Rt2<A::Num>, fn_info: &FnInfo, base: &State<RefDomain<A>>, room: (i16, i16)) -> Result<()> {
     let (cart, cache) = crate::compiled::room_context(room)?;
     let ids = crate::compiled::ids();
     for lane in 0..rt2.width {
         let (reference, _) = refbridge::from_block(rt2, lane, fn_info, base)?;
-        let mut a = refbridge::to_block(&reference, room)?;
-        let mut d = Symbolic::default();
+        let mut a: Rt2<A::Num> = refbridge::to_block(&reference, room)?;
+        let mut d = Symbolic::<A>::default();
         let (traced, _) = from_block(&mut d, rt2, lane, fn_info, base)?;
         let g = &d.graph;
         let num = |n: &NodeId| match g.get(*n).op {
-            Op::Const(lo, hi) if lo == hi => Ok(AV::Num(P8::from_raw(lo))),
-            Op::Const(lo, hi) => Ok(AV::Ival(P8::from_raw(lo), P8::from_raw(hi))),
+            Op::Const(lo, hi) if lo == hi => Ok(AV::Num(A::from_lit(lo))),
+            Op::Const(lo, hi) => Ok(AV::Ival(A::from_lit(lo), A::from_lit(hi))),
             ref other => bail!("lane {lane}: a traced number {other:?}, not a constant"),
         };
         let boolean = |b: &NodeId| match g.get(*b).op {
@@ -412,14 +411,14 @@ pub fn check_agreement(rt2: &Rt2, fn_info: &FnInfo, base: &State<RefDomain>, roo
             ref other => bail!("lane {lane}: a traced boolean {other:?}, not a constant"),
         };
         let mut b = to_rt2(&traced, cart.clone(), cache.clone(), num, boolean)?;
-        let s = skeleton::<_, P8>(&traced, cart.clone(), cache.clone())?;
-        let first = |x: &Rt2, y: &Rt2| (0..x.structure.len().max(y.structure.len())).find(|&c| x.structure.get(c) != y.structure.get(c) || x.cols.get(c) != y.cols.get(c));
+        let s = skeleton::<_, A::Num>(&traced, cart.clone(), cache.clone())?;
+        let first = |x: &Rt2<A::Num>, y: &Rt2<A::Num>| (0..x.structure.len().max(y.structure.len())).find(|&c| x.structure.get(c) != y.structure.get(c) || x.cols.get(c) != y.cols.get(c));
         ensure!(
             a.structure == b.structure && a.cols == b.cols && a.globals == b.globals && a.strings == b.strings,
             "lane {lane}: the reference's block and the tracer's differ, first at cell {:?}",
             first(&a, &b)
         );
-        let pointers = |x: &Rt2| -> Vec<Option<AV>> { x.cols.iter().map(|c| matches!(c, Col::U(AV::Ptr(_))).then(|| c.at(0))).collect() };
+        let pointers = |x: &Rt2<A::Num>| -> Vec<Option<AV<A::Num>>> { x.cols.iter().map(|c| matches!(c, Col::U(AV::Ptr(_))).then(|| c.at(0))).collect() };
         ensure!(
             s.structure == a.structure && s.globals == a.globals && pointers(&s) == pointers(&a) && s.shape_hash == a.shape_hash,
             "lane {lane}: the tracer's skeleton is not the reference block's shape"

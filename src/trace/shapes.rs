@@ -21,6 +21,7 @@
 use anyhow::Result;
 
 use super::domain::{Domain, Symbolic};
+use crate::transpile::garith::GraphArith;
 use super::heap::Value;
 use super::iface::{self, Path, Step};
 use super::state::State;
@@ -29,7 +30,7 @@ use super::state::State;
 /// prototypes in `types`, everything reachable from them, and `room`.
 ///
 /// Identified structurally, from `types`, rather than by listing names.
-pub fn frozen_tables(st: &State<Symbolic>) -> std::collections::BTreeSet<u32> {
+pub fn frozen_tables<A: GraphArith>(st: &State<Symbolic<A>>) -> std::collections::BTreeSet<u32> {
     let mut out = std::collections::BTreeSet::new();
     let mut stack: Vec<u32> = Vec::new();
     for name in ["types", "room"] {
@@ -56,8 +57,8 @@ pub fn frozen_tables(st: &State<Symbolic>) -> std::collections::BTreeSet<u32> {
 pub const FROZEN_GLOBALS: &[&str] =
     &["k_left", "k_right", "k_up", "k_down", "k_jump", "k_dash"];
 
-fn under_frozen(
-    st: &State<Symbolic>,
+fn under_frozen<A: GraphArith>(
+    st: &State<Symbolic<A>>,
     p: &Path,
     frozen: &std::collections::BTreeSet<u32>,
 ) -> bool {
@@ -78,7 +79,7 @@ fn under_frozen(
 
 /// Every scalar that is STATE: what a kernel for this shape takes as
 /// input, and what the tracer symbolizes.
-pub fn state_paths(st: &State<Symbolic>) -> Result<Vec<Path>> {
+pub fn state_paths<A: GraphArith>(st: &State<Symbolic<A>>) -> Result<Vec<Path>> {
     let frozen = frozen_tables(st);
     Ok(iface::scalars(st, &[])?
         .into_iter()
@@ -87,11 +88,11 @@ pub fn state_paths(st: &State<Symbolic>) -> Result<Vec<Path>> {
 }
 
 /// Erase every non-frozen scalar (they are about to be symbolized anyway).
-pub fn blank(st: &mut State<Symbolic>, d: &mut Symbolic) -> Result<()> {
+pub fn blank<A: GraphArith>(st: &mut State<Symbolic<A>>, d: &mut Symbolic<A>) -> Result<()> {
     for p in state_paths(st)? {
         let v = match iface::get(st, &p) {
             Some(Value::Bool(_)) => Value::Bool(d.boolean(false)),
-            _ => Value::Num(d.num(celeste_core::pico8_num::Pico8Num::from_i16(0))),
+            _ => Value::Num(d.num(A::from_i16(0))),
         };
         iface::set(st, &p, v)?;
     }
@@ -106,10 +107,10 @@ pub fn blank(st: &mut State<Symbolic>, d: &mut Symbolic) -> Result<()> {
 
 /// Every number and boolean in the heap - its tables' and its closure scopes'
 /// - that is a constant, by node: what `rebase` re-makes in another arena.
-pub fn heap_constants(st: &State<Symbolic>, d: &Symbolic) -> std::collections::HashMap<u32, iface::Conc> {
+pub fn heap_constants<A: GraphArith>(st: &State<Symbolic<A>>, d: &Symbolic<A>) -> std::collections::HashMap<u32, iface::Conc<A>> {
     use super::domain::Domain;
     let mut out = std::collections::HashMap::new();
-    let mut note = |v: &Value<Symbolic>| match v {
+    let mut note = |v: &Value<Symbolic<A>>| match v {
         Value::Num(n) => {
             if let Some(c) = d.as_const(n) {
                 out.insert(*n, iface::Conc::Num(c));
@@ -140,7 +141,7 @@ pub fn heap_constants(st: &State<Symbolic>, d: &Symbolic) -> std::collections::H
 /// slots `blank` rewrites are blanked; every other scalar is re-made from
 /// `constants` (`heap_constants` in the source arena); a table scalar that
 /// is neither refuses, a closure scope's is blanked.
-pub fn rebase(st: &mut State<Symbolic>, d: &mut Symbolic, constants: &std::collections::HashMap<u32, iface::Conc>) -> Result<()> {
+pub fn rebase<A: GraphArith>(st: &mut State<Symbolic<A>>, d: &mut Symbolic<A>, constants: &std::collections::HashMap<u32, iface::Conc<A>>) -> Result<()> {
     // Where `blank` writes: each state path's (table, last step).
     let mut blanked: std::collections::BTreeSet<(u32, Step)> = Default::default();
     for p in state_paths(st)? {
@@ -149,7 +150,7 @@ pub fn rebase(st: &mut State<Symbolic>, d: &mut Symbolic, constants: &std::colle
             blanked.insert((t, last.clone()));
         }
     }
-    let remake = |d: &mut Symbolic, at: &dyn Fn() -> String, v: &mut Value<Symbolic>| -> Result<()> {
+    let remake = |d: &mut Symbolic<A>, at: &dyn Fn() -> String, v: &mut Value<Symbolic<A>>| -> Result<()> {
         let (n, is_num) = match v {
             Value::Num(n) => (*n, true),
             Value::Bool(b) => (*b, false),
@@ -192,7 +193,7 @@ pub fn rebase(st: &mut State<Symbolic>, d: &mut Symbolic, constants: &std::colle
             *v = match (constants.get(&n), is_num) {
                 (Some(iface::Conc::Num(c)), true) => Value::Num(d.num(*c)),
                 (Some(iface::Conc::Bool(c)), false) => Value::Bool(d.boolean(*c)),
-                (_, true) => Value::Num(d.num(celeste_core::pico8_num::Pico8Num::from_i16(0))),
+                (_, true) => Value::Num(d.num(A::from_i16(0))),
                 (_, false) => Value::Bool(d.boolean(false)),
             };
         }
@@ -204,11 +205,11 @@ pub fn rebase(st: &mut State<Symbolic>, d: &mut Symbolic, constants: &std::colle
 
 /// Which room a state is in. Concrete: `room` is frozen as an input and
 /// `load_room` only ever writes it a constant.
-pub fn room_of(st: &State<Symbolic>, d: &Symbolic) -> (i16, i16) {
+pub fn room_of<A: GraphArith>(st: &State<Symbolic<A>>, d: &Symbolic<A>) -> (i16, i16) {
     let at = |k: &str| -> i16 {
         match iface::get(st, &[iface::key("room"), iface::key(k)]) {
             Some(Value::Num(n)) => {
-                d.as_const(&n).and_then(|v| v.as_i16_or_err().ok()).unwrap_or(-1)
+                d.as_const(&n).and_then(A::as_i16).unwrap_or(-1)
             }
             _ => -1,
         }
@@ -221,13 +222,13 @@ pub fn room_of(st: &State<Symbolic>, d: &Symbolic) -> (i16, i16) {
 /// fruit's `off`/`y`, the level's object fields, the held trails), so never
 /// compile-time constants whatever a trace computes. The lattice must not
 /// bake these, or a widened block will not bind.
-pub fn boundary_widened_paths(st: &State<Symbolic>, opts: &crate::abstraction::Level) -> std::collections::BTreeSet<Path> {
+pub fn boundary_widened_paths<A: GraphArith>(st: &State<Symbolic<A>>, opts: &crate::abstraction::Level) -> std::collections::BTreeSet<Path> {
     super::widen::slots_where(st, *opts, super::widen::stores_widened).into_iter().collect()
 }
 
 /// The scalar fields of `st` that are compile-time constants (exact
 /// `Const(v,v)` or `ConstBool`): what the per-shape constant lattice bakes in.
-pub fn field_constants(st: &State<Symbolic>, d: &Symbolic, opts: &crate::abstraction::Level) -> Result<std::collections::BTreeMap<Path, super::iface::Conc>> {
+pub fn field_constants<A: GraphArith>(st: &State<Symbolic<A>>, d: &Symbolic<A>, opts: &crate::abstraction::Level) -> Result<std::collections::BTreeMap<Path, super::iface::Conc<A>>> {
     use super::domain::Domain;
     use super::iface::Conc;
     let widened = boundary_widened_paths(st, opts);
@@ -275,6 +276,6 @@ pub fn player_path<D: Domain>(st: &State<D>) -> Option<Path> {
 /// `rem.x` and `rem.y`, a live fruit's `y`/`off`), so a kernel expecting
 /// `num` binds. Found by `type`, not by index: which object is the player
 /// changes within a room.
-pub fn ival_paths(st: &State<Symbolic>) -> Vec<Path> {
+pub fn ival_paths<A: GraphArith>(st: &State<Symbolic<A>>) -> Vec<Path> {
     super::widen::slots_where(st, crate::abstraction::Level::EXACT, super::widen::interval_input)
 }

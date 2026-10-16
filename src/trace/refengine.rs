@@ -272,11 +272,13 @@ impl RefEngine {
         ensure!(out.len() == 1, "concrete frame produced {} leaves (expected exactly 1)", out.len());
         Ok(out.remove(0))
     }
+}
 
+impl<A: crate::transpile::garith::GraphArith> ReferenceEngine<A> {
     /// The one converter agrees across the two sides on every lane of `row`
     /// (`block::check_agreement`, from this engine's base state).
-    pub fn check_agreement(&self, row: &Rt2) -> Result<()> {
-        crate::trace::block::check_agreement(row, &self.fn_info, &self.base, self.settings.room)
+    pub fn check_agreement(&self, row: &Rt2<A::Num>) -> Result<()> {
+        crate::trace::block::check_agreement::<A>(row, &self.fn_info, &self.base, self.settings.room)
     }
 }
 

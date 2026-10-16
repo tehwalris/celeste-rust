@@ -14,6 +14,8 @@ pub(crate) mod asm_kernel;
 pub mod dispatch;
 pub mod mix;
 
+pub use asm_kernel::{KernelLanes, Registry, Resident, Scratch};
+
 pub(crate) fn boundary_ids() -> runtime2::BoundaryIds {
     let g = |name: &str| gen::global_id(name).unwrap_or_else(|| panic!("no global {}", name));
     let f = |name: &str| gen::field_id(name).unwrap_or_else(|| panic!("no field {}", name));
@@ -66,23 +68,29 @@ pub fn room_context((room_x, room_y): (i16, i16)) -> Result<(Arc<CartData>, Arc<
 }
 
 /// The kernels of one LEVEL under the run's settings
-/// (`asm_kernel::registry`, built on first use).
-pub struct FrameEngine {
+/// (`asm_kernel::registry`, built on first use), in the arithmetic of `N`.
+pub struct Kernels<N: KernelLanes = celeste_core::pico8_num::Pico8Num> {
     level: crate::abstraction::Level,
     settings: Arc<crate::settings::Settings>,
-    registry: std::sync::OnceLock<Arc<asm_kernel::Registry>>,
+    registry: std::sync::OnceLock<Arc<asm_kernel::Registry<N>>>,
 }
 
-impl FrameEngine {
+/// 16.16's kernels: the real game's.
+pub type FrameEngine = Kernels<celeste_core::pico8_num::Pico8Num>;
+
+/// The doubles' kernels (plans/float-solver.md, milestone 5).
+pub type FloatKernels = Kernels<celeste_core::lua_f64::LuaF64>;
+
+impl<N: KernelLanes> Kernels<N> {
     /// The engine for the start room of `settings` (its cart loads here),
     /// its frames at `level`.
     pub fn new(settings: &crate::settings::Settings, level: crate::abstraction::Level) -> Result<Self> {
         room_context(settings.room)?;
-        Ok(FrameEngine { level, settings: Arc::new(settings.clone()), registry: std::sync::OnceLock::new() })
+        Ok(Kernels { level, settings: Arc::new(settings.clone()), registry: std::sync::OnceLock::new() })
     }
 
-    fn registry(&self) -> &asm_kernel::Registry {
-        self.registry.get_or_init(|| asm_kernel::registry(self.level, &self.settings))
+    fn registry(&self) -> &asm_kernel::Registry<N> {
+        self.registry.get_or_init(|| asm_kernel::registry::<N>(self.level, &self.settings))
     }
 
     /// One frame of one BUCKET (one shape's block of the frontier), emitted
@@ -91,10 +99,10 @@ impl FrameEngine {
     /// the next frame's buckets.
     pub fn run_bucket(
         &self,
-        bucket: &runtime2::Rt2,
+        bucket: &runtime2::Rt2<N>,
         cell_in: &[u32],
         lanes: &[usize],
-        sink: &mut crate::storage::unit::UnitSink,
+        sink: &mut crate::storage::unit::UnitSink<N>,
     ) {
         if !dispatch::run_chunk_kernel(self.registry(), bucket, cell_in, lanes, sink) {
             // A COVERAGE GAP, not a degraded mode: there is no fallback.
@@ -112,13 +120,13 @@ impl FrameEngine {
 
 /// The compiled kernels as the `FrameStep` implementation, the counterpart
 /// to `RefEngine`: just `run_bucket`.
-impl crate::frame::FrameStep for FrameEngine {
+impl<N: KernelLanes> crate::frame::FrameStep<N> for Kernels<N> {
     fn run(
         &self,
-        block: &crate::frame::Block,
+        block: &crate::frame::Block<N>,
         cell_in: &[u32],
         lanes: &[usize],
-        sink: &mut crate::storage::unit::UnitSink,
+        sink: &mut crate::storage::unit::UnitSink<N>,
     ) -> anyhow::Result<()> {
         self.run_bucket(block.rt2(), cell_in, lanes, sink);
         Ok(())

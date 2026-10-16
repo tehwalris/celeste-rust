@@ -72,6 +72,10 @@ pub trait GraphArith: Arithmetic<Num: celeste_core::arith::EngineNum<A = Self>> 
     /// `floors_spanned`'s twin for the values of `flr(x + 1/2)` (the round
     /// fork's arity).
     fn rounds_spanned(p: &Self::Pieces, uncapped: bool) -> i64;
+    /// The whole numbers the pieces' hull spans: `(flr(min), flr(max))`.
+    fn floor_hull(p: &Self::Pieces) -> Option<(i64, i64)>;
+    /// The pieces' hull as literals (`None`: outside the arithmetic).
+    fn lit_hull(p: &Self::Pieces) -> Option<(Self::Lit, Self::Lit)>;
     /// A literal interval as raw 16.16, where the arithmetic is 16.16's
     /// (the literal splits of the levels with unknowns are so far).
     fn lit_raw_fixed(lo: Self::Lit, hi: Self::Lit) -> Option<(i32, i32)>;
@@ -378,6 +382,17 @@ impl GraphArith for Fixed {
         w.max(1)
     }
 
+    fn floor_hull(ps: &Pieces) -> Option<(i64, i64)> {
+        let lo = ps.iter().map(|q| q.0).min()?.div_euclid(1 << 16);
+        let hi = ps.iter().map(|q| q.1).max()?.div_euclid(1 << 16);
+        Some((lo, hi))
+    }
+
+    fn lit_hull(ps: &Pieces) -> Option<(i32, i32)> {
+        let (lo, hi) = (ps.iter().map(|p| p.0).min()?, ps.iter().map(|p| p.1).max()?);
+        Some((i32::try_from(lo).ok()?, i32::try_from(hi).ok()?))
+    }
+
     /// `flr(x + 1/2)` is `(raw + 1/2) >> 16`, exactly.
     fn rounds_spanned(ps: &Pieces, uncapped: bool) -> i64 {
         let r = |v: i64| (v + 0x8000) >> 16;
@@ -653,6 +668,18 @@ impl GraphArith for Float {
             ps.iter().map(|p| p.1.floor() - p.0.floor() + 1.0).fold(1.0, f64::max)
         };
         (w as i64).max(1)
+    }
+
+    fn floor_hull(ps: &FloatPieces) -> Option<(i64, i64)> {
+        let lo = ps.iter().map(|q| q.0).reduce(f64::min)?.floor();
+        let hi = ps.iter().map(|q| q.1).reduce(f64::max)?.floor();
+        Some((lo as i64, hi as i64))
+    }
+
+    fn lit_hull(ps: &FloatPieces) -> Option<(u64, u64)> {
+        let lo = LuaF64::new(ps.iter().map(|q| q.0).reduce(f64::min)?)?;
+        let hi = LuaF64::new(ps.iter().map(|q| q.1).reduce(f64::max)?)?;
+        Some((Float::lit(lo), Float::lit(hi)))
     }
 
     /// `flr(fl(x + 1/2))`, monotone in `x` (`LuaF64Interval::rounds`).

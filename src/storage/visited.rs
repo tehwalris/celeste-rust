@@ -45,6 +45,12 @@ impl<N: Rem> VisitedSet<N> {
         VisitedSet { geo, keys: KeySpace::new(), shapes: Vec::new(), shape_idx: FxHashMap::default(), set: RegionSet::default() }
     }
 
+    /// Forget every state, keeping the key space and the shapes
+    /// (`wave::one_frame`: a seed's successor equal to the seed is new).
+    pub fn forget_states(&mut self) {
+        self.set = RegionSet::default();
+    }
+
     pub fn shape_index(&self, shape: u64) -> Option<u32> {
         self.shape_idx.get(&shape).copied()
     }

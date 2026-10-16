@@ -3,21 +3,24 @@
 
 use anyhow::Result;
 
+use celeste_core::arith::{Arithmetic, Fixed};
+
 use super::emit::{Bound, Lowered};
 use super::verify::Frame;
+use crate::transpile::garith::GraphArith;
 
 
 /// One traced frame, bound and lowered, everything owned.
-pub struct Reference {
-    pub frame: Frame,
-    pub bound: Bound,
-    pub lowered: Lowered,
+pub struct Reference<A: GraphArith = Fixed> {
+    pub frame: Frame<A>,
+    pub bound: Bound<A>,
+    pub lowered: Lowered<A>,
     pub cart: std::sync::Arc<celeste_core::cart_data::CartData>,
     pub cache: std::sync::Arc<celeste_core::collision_cache::CollisionCache>,
 }
 
 /// Restate a lowering failure with its `Cell(n)`s named by interface path.
-fn name_cells(f: &super::verify::Frame, e: anyhow::Error) -> anyhow::Error {
+fn name_cells<A: GraphArith>(f: &super::verify::Frame<A>, e: anyhow::Error) -> anyhow::Error {
     let msg = format!("{:#}", e);
     let mut seen: std::collections::BTreeSet<u32> = Default::default();
     let mut at = msg.as_str();
@@ -44,15 +47,15 @@ fn name_cells(f: &super::verify::Frame, e: anyhow::Error) -> anyhow::Error {
 
 /// The constant-lattice `Reference`s for the start room, in walk order. A
 /// frame that fails to bind or lower is FATAL (a coverage gap otherwise).
-pub(crate) fn lattice_kernel_refs(
+pub(crate) fn lattice_kernel_refs<A: GraphArith>(
     root: &std::path::Path,
     opts: crate::abstraction::Level,
     s: &crate::settings::Settings,
-) -> Result<Vec<(Option<Region>, Reference)>> {
+) -> Result<Vec<(Option<Region>, Reference<A>)>> {
     let mut lw = room_constant_lattice(root, opts, &Walk { settings: s, only: None })?;
     let room = crate::transpile::graph::Room { cart: lw.cart.clone(), cache: lw.cache.clone() };
     // Each frame was bound by the walk in the worker arena it was traced in.
-    let frames: Vec<(Option<Region>, super::verify::Frame, Bound)> = std::mem::take(&mut lw.frames)
+    let frames: Vec<(Option<Region>, super::verify::Frame<A>, Bound<A>)> = std::mem::take(&mut lw.frames)
         .into_iter()
         .map(|((shape, region), wf)| -> Result<_> {
             let bound = wf.bound.map_err(|e| anyhow::anyhow!("the walk's frame of shape {shape} region {region:?} did not bind: {e}"))?;
@@ -65,10 +68,10 @@ pub(crate) fn lattice_kernel_refs(
     let n_workers = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).min(frames.len().max(1));
     let next = std::sync::atomic::AtomicUsize::new(0);
     // Each frame is taken by exactly one worker (a `Frame` is not cloned).
-    let slots: Vec<std::sync::Mutex<Option<(Option<Region>, super::verify::Frame, Bound)>>> =
+    let slots: Vec<std::sync::Mutex<Option<(Option<Region>, super::verify::Frame<A>, Bound<A>)>>> =
         frames.into_iter().map(|x| std::sync::Mutex::new(Some(x))).collect();
     let slots = &slots;
-    let mut built: Vec<(usize, Result<(Option<Region>, Reference)>)> = std::thread::scope(|scope| {
+    let mut built: Vec<(usize, Result<(Option<Region>, Reference<A>)>)> = std::thread::scope(|scope| {
         let handles: Vec<_> = (0..n_workers)
             .map(|_| {
                 let (cart, cache, next) = (cart.clone(), cache.clone(), &next);
@@ -79,7 +82,7 @@ pub(crate) fn lattice_kernel_refs(
                         loop {
                             let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                             let Some((key, f, bound)) = slots.get(i).and_then(|m| m.lock().unwrap().take()) else { break };
-                            let r = (|| -> Result<(Option<Region>, Reference)> {
+                            let r = (|| -> Result<(Option<Region>, Reference<A>)> {
                                 let lowered = super::emit::lower_frame(&bound, Some(room.clone()), s.diag.build_trace)
                                     .map_err(|e| anyhow::anyhow!("lattice frame {} ({:?}) lower: {:#}", i, key, name_cells(&f, e)))?;
                                 Ok((key, Reference { frame: f, bound, lowered, cart: cart.clone(), cache: cache.clone() }))
@@ -133,9 +136,14 @@ impl RegionGrid {
         crate::search::pos_graph::cell_xy(cell).map(|(x, y)| self.of(x, y))
     }
 
-    /// The bounds a region's kernel is traced under, by path under `pl`.
-    fn bounds(&self, pl: &super::iface::Path, r: Region) -> Bounds {
+    /// The bounds a region's kernel is traced under, by path under `pl`
+    /// (16.16 constants, exact in every arithmetic; the remainder's range
+    /// the table's, `widening::range`).
+    fn bounds<A: GraphArith>(&self, pl: &super::iface::Path, r: Region) -> Bounds<A> {
         const ONE: i32 = 1 << 16;
+        let lit = |raw: i32| A::lit(A::from_fixed_raw(raw));
+        let (rlo, rhi) = celeste_engine::widening::range::<A::Num>(celeste_engine::widening::REM.0, celeste_engine::widening::REM.1);
+        let rem = (A::lit(rlo), A::lit(rhi));
         let field = |fs: &[&str]| -> super::iface::Path {
             let mut q = pl.clone();
             for f in fs {
@@ -145,19 +153,19 @@ impl RegionGrid {
         };
         let (x0, y0) = (r.ix as i32 * self.px, r.iy as i32 * self.px);
         vec![
-            (field(&["x"]), (x0 * ONE, (x0 + self.px - 1) * ONE)),
-            (field(&["y"]), (y0 * ONE, (y0 + self.px - 1) * ONE)),
-            (field(&["spd", "x"]), (-self.speed * ONE, self.speed * ONE)),
-            (field(&["spd", "y"]), (-self.speed * ONE, self.speed * ONE)),
+            (field(&["x"]), (lit(x0 * ONE), lit((x0 + self.px - 1) * ONE))),
+            (field(&["y"]), (lit(y0 * ONE), lit((y0 + self.px - 1) * ONE))),
+            (field(&["spd", "x"]), (lit(-self.speed * ONE), lit(self.speed * ONE))),
+            (field(&["spd", "y"]), (lit(-self.speed * ONE), lit(self.speed * ONE))),
             // `move` leaves `rem` in `[-0.5, 0.5)`; bounding it bounds the move.
-            (field(&["rem", "x"]), (-0x8000, 0x7fff)),
-            (field(&["rem", "y"]), (-0x8000, 0x7fff)),
+            (field(&["rem", "x"]), rem),
+            (field(&["rem", "y"]), rem),
         ]
     }
 }
 
 /// The input bounds a frame is traced under (`verify::trace_frame`).
-pub type Bounds = Vec<(super::iface::Path, (i32, i32))>;
+pub type Bounds<A = Fixed> = Vec<(super::iface::Path, (<A as Arithmetic>::Lit, <A as Arithmetic>::Lit))>;
 
 /// Frames of platform motion the platform worlds cover: a platforms-unknown
 /// level is sound only up to this horizon and refuses a longer search.
@@ -169,9 +177,9 @@ pub type WalkNode = (String, Option<Region>);
 /// The regions a state's rows can be in (`None` without a grid or player):
 /// every region the hull of the player's `x`/`y` touches, clamped to the
 /// screen plus one region. Over-covering only adds kernels.
-fn successor_regions(
-    st: &super::state::State<super::domain::Symbolic>,
-    d: &mut super::domain::Symbolic,
+fn successor_regions<A: GraphArith>(
+    st: &super::state::State<super::domain::Symbolic<A>>,
+    d: &mut super::domain::Symbolic<A>,
     grid: Option<RegionGrid>,
     only: Option<&[Region]>,
 ) -> Result<Vec<Option<Region>>> {
@@ -183,13 +191,9 @@ fn successor_regions(
         let mut p = pl.clone();
         p.push(iface::key(name));
         let Some(super::heap::Value::Num(n)) = iface::get(st, &p) else { anyhow::bail!("{}: not a number", iface::show(&p)) };
-        hull[axis] = match d.range_of(n) {
-            Some(pieces) if !pieces.is_empty() => {
-                let lo = pieces.iter().map(|q| q.0).min().unwrap_or(0).div_euclid(1 << 16);
-                let hi = pieces.iter().map(|q| q.1).max().unwrap_or(0).div_euclid(1 << 16);
-                (lo.max(window.0), hi.min(window.1))
-            }
-            _ => window,
+        hull[axis] = match d.range_of(n).as_ref().and_then(A::floor_hull) {
+            Some((lo, hi)) => (lo.max(window.0), hi.min(window.1)),
+            None => window,
         };
         anyhow::ensure!(hull[axis].0 <= hull[axis].1, "{}: its range lies outside the screen window {window:?}", iface::show(&p));
     }
@@ -215,13 +219,13 @@ fn successor_regions(
 /// RESPAWN the walk reaches (the room reloaded after a death, every object
 /// updated once). A shape no explored state has gets the spawn object's hull
 /// by type (`NoPlayer::bounds`). A lane outside declines.
-fn no_player_ranges(
-    it: &mut super::interp::Interp<'static, super::domain::Symbolic>,
+fn no_player_ranges<A: GraphArith>(
+    it: &mut super::interp::Interp<'static, super::domain::Symbolic<A>>,
     reset: &'static full_moon::ast::Ast,
     fr: &'static full_moon::ast::Ast,
-    start: &super::state::State<super::domain::Symbolic>,
+    start: &super::state::State<super::domain::Symbolic<A>>,
     opts: crate::abstraction::Level,
-) -> Result<NoPlayer> {
+) -> Result<NoPlayer<A>> {
     use super::iface::Conc;
     use super::shapes;
     if shapes::player_path(start).is_some() {
@@ -243,7 +247,7 @@ fn no_player_ranges(
         for _ in 0..NO_PLAYER_FRAMES {
             np.note(&st, &consts, fruit)?;
             let roots = shapes::state_paths(&st)?;
-            let pin: Vec<(super::iface::Path, Conc)> = consts.iter().filter(|(p, _)| roots.contains(p)).map(|(p, c)| (p.clone(), *c)).collect();
+            let pin: Vec<(super::iface::Path, Conc<A>)> = consts.iter().filter(|(p, _)| roots.contains(p)).map(|(p, c)| (p.clone(), *c)).collect();
             let Ok(f) = super::verify::trace_frame(it, reset, fr, st.clone(), &roots, &pin, &[], true, &[], &[]) else { return Ok(()) };
             let [o] = f.outs.as_slice() else { return Ok(()) };
             if shapes::player_path(&o.st).is_some() {
@@ -291,14 +295,14 @@ const NO_PLAYER_FRAMES: usize = 240;
 /// player after `NO_PLAYER_FRAMES` frames, a state that does not trace.
 /// Returns the states explored, the outcomes followed and those where the
 /// player appears.
-fn explore_no_player(
-    it: &mut super::interp::Interp<'static, super::domain::Symbolic>,
+fn explore_no_player<A: GraphArith>(
+    it: &mut super::interp::Interp<'static, super::domain::Symbolic<A>>,
     reset: &'static full_moon::ast::Ast,
     fr: &'static full_moon::ast::Ast,
-    entry: super::state::State<super::domain::Symbolic>,
-    consts: std::collections::BTreeMap<super::iface::Path, super::iface::Conc>,
+    entry: super::state::State<super::domain::Symbolic<A>>,
+    consts: std::collections::BTreeMap<super::iface::Path, super::iface::Conc<A>>,
     opts: crate::abstraction::Level,
-    np: &mut NoPlayer,
+    np: &mut NoPlayer<A>,
     what: &str,
 ) -> Result<(usize, usize, usize)> {
     use super::shapes;
@@ -315,7 +319,7 @@ fn explore_no_player(
         np.note(&st, &consts, fruit)?;
         anyhow::ensure!(depth < NO_PLAYER_FRAMES, "{what} no-player phase did not reach the player within {NO_PLAYER_FRAMES} frames");
         let roots = shapes::state_paths(&st)?;
-        let pin: Vec<(super::iface::Path, super::iface::Conc)> = consts.iter().filter(|(p, _)| roots.contains(p)).map(|(p, c)| (p.clone(), *c)).collect();
+        let pin: Vec<(super::iface::Path, super::iface::Conc<A>)> = consts.iter().filter(|(p, _)| roots.contains(p)).map(|(p, c)| (p.clone(), *c)).collect();
         // The state's own unknowns (not the level's widened fields, not
         // the buttons the frame resets): no merge selects on them, so
         // each branch keeps its own constants.
@@ -340,43 +344,43 @@ fn explore_no_player(
 }
 
 /// A numeric field's hull per path (raw 16.16, inclusive).
-type Hull = std::collections::BTreeMap<super::iface::Path, (i32, i32)>;
+type Hull<A> = std::collections::BTreeMap<super::iface::Path, (<A as Arithmetic>::Num, <A as Arithmetic>::Num)>;
 
 /// The no-player phase's hulls over every state explored: the start's chain
 /// and each respawn's exploration, per shape and the spawn object's by the
 /// path below it. A field bounds its shape where its hull is not one value
 /// and every explored state of the shape holds it a constant (`bounds`).
 #[derive(Default)]
-struct NoPlayer {
+struct NoPlayer<A: GraphArith = Fixed> {
     /// The start's chain reached the player: the hulls bound.
     on: bool,
     /// Per shape: each numeric field's hull over the states where it was a
     /// constant, and the fields some state held unknown.
-    shapes: Vec<(super::heap::Shape, Hull, std::collections::BTreeSet<super::iface::Path>)>,
+    shapes: Vec<(super::heap::Shape, Hull<A>, std::collections::BTreeSet<super::iface::Path>)>,
     /// The spawn object's fields (by the path below it), likewise.
-    spawn: Hull,
+    spawn: Hull<A>,
     spawn_unknown: std::collections::BTreeSet<super::iface::Path>,
     /// The respawn entries explored, by shape and constants.
     entries: std::collections::BTreeSet<String>,
 }
 
-impl NoPlayer {
+impl<A: GraphArith> NoPlayer<A> {
     /// An explored state `st` with its constants `consts` into the hulls
     /// (`fruit`: the level widens the fly fruit, whose fields bound nothing).
-    fn note(&mut self, st: &super::state::State<super::domain::Symbolic>, consts: &std::collections::BTreeMap<super::iface::Path, super::iface::Conc>, fruit: bool) -> Result<()> {
+    fn note(&mut self, st: &super::state::State<super::domain::Symbolic<A>>, consts: &std::collections::BTreeMap<super::iface::Path, super::iface::Conc<A>>, fruit: bool) -> Result<()> {
         let shape = st.shape()?;
         let at = match self.shapes.iter().position(|(s, ..)| *s == shape) {
             Some(i) => i,
             None => {
-                self.shapes.push((shape, Hull::new(), Default::default()));
+                self.shapes.push((shape, Hull::<A>::new(), Default::default()));
                 self.shapes.len() - 1
             }
         };
         let fruit_objs = if fruit { super::widen::objects_of_type(st, "fly_fruit") } else { Vec::new() };
         let spawn_objs = super::widen::objects_of_type(st, "player_spawn");
-        let join = |h: &mut Hull, p: super::iface::Path, r: i32| {
+        let join = |h: &mut Hull<A>, p: super::iface::Path, r: A::Num| {
             let e = h.entry(p).or_insert((r, r));
-            *e = (e.0.min(r), e.1.max(r));
+            *e = (if A::lt(r, e.0) { r } else { e.0 }, if A::lt(e.1, r) { r } else { e.1 });
         };
         for p in super::shapes::state_paths(st)? {
             if !matches!(super::iface::get(st, &p), Some(super::heap::Value::Num(_))) || fruit_objs.iter().any(|o| p.starts_with(o)) {
@@ -385,7 +389,7 @@ impl NoPlayer {
             let below = spawn_objs.iter().find(|o| p.starts_with(o)).map(|o| p[o.len()..].to_vec());
             match consts.get(&p) {
                 Some(super::iface::Conc::Num(v)) => {
-                    let r = v.as_raw_u32() as i32;
+                    let r = *v;
                     if let Some(b) = below {
                         join(&mut self.spawn, b, r);
                     }
@@ -407,14 +411,14 @@ impl NoPlayer {
     /// but some explored state of the shape holds unknown has no hull: it
     /// bounds nothing (an unbounded input, as every unhulled field) - FATAL
     /// for a field of the spawn, the phase the bounds are for.
-    fn bounds(&self, st: &super::state::State<super::domain::Symbolic>) -> Result<Bounds> {
+    fn bounds(&self, st: &super::state::State<super::domain::Symbolic<A>>) -> Result<Bounds<A>> {
         let shape = st.shape()?;
         let spawn_objs = super::widen::objects_of_type(st, "player_spawn");
-        let varying = |h: &Hull, unknown: &std::collections::BTreeSet<super::iface::Path>, spawn: &dyn Fn(&super::iface::Path) -> bool, what: &str| -> Result<Bounds> {
-            let mut b = Bounds::new();
-            for (p, &(lo, hi)) in h.iter().filter(|(_, (lo, hi))| lo < hi) {
+        let varying = |h: &Hull<A>, unknown: &std::collections::BTreeSet<super::iface::Path>, spawn: &dyn Fn(&super::iface::Path) -> bool, what: &str| -> Result<Bounds<A>> {
+            let mut b = Bounds::<A>::new();
+            for (p, &(lo, hi)) in h.iter().filter(|(_, (lo, hi))| A::lt(*lo, *hi)) {
                 if !unknown.contains(p) {
-                    b.push((p.clone(), (lo, hi)));
+                    b.push((p.clone(), (A::lit(lo), A::lit(hi))));
                 } else if spawn(p) {
                     anyhow::bail!("THE NO-PLAYER BOUNDS: the spawn's {} varies over {what} but an explored state holds it unknown: no hull bounds it", super::iface::show(p));
                 }
@@ -425,7 +429,7 @@ impl NoPlayer {
             return varying(h, unknown, &|p| spawn_objs.iter().any(|o| p.starts_with(o)), "the explored states of its shape");
         }
         let spawn = varying(&self.spawn, &self.spawn_unknown, &|_| true, "the explored spawn objects")?;
-        let mut out = Bounds::new();
+        let mut out = Bounds::<A>::new();
         for o in spawn_objs {
             for (suffix, r) in &spawn {
                 let mut p = o.clone();
@@ -439,7 +443,7 @@ impl NoPlayer {
     /// Each shape's bounds and the spawn object's, for the log (a field
     /// some explored state holds unknown, which bounds nothing, unshown).
     fn show(&self) -> Vec<String> {
-        let show = |h: &Hull, unknown: &std::collections::BTreeSet<super::iface::Path>| h.iter().filter(|(p, (lo, hi))| lo < hi && !unknown.contains(*p)).map(|(p, (a, b))| format!("{} [{:.2}, {:.2}]", super::iface::show(p), *a as f64 / 65536.0, *b as f64 / 65536.0)).collect::<Vec<_>>();
+        let show = |h: &Hull<A>, unknown: &std::collections::BTreeSet<super::iface::Path>| h.iter().filter(|(p, (lo, hi))| A::lt(*lo, *hi) && !unknown.contains(*p)).map(|(p, (a, b))| format!("{} [{:.2}, {:.2}]", super::iface::show(p), celeste_core::arith::EngineNum::to_f64(*a), celeste_core::arith::EngineNum::to_f64(*b))).collect::<Vec<_>>();
         let mut out: Vec<String> = self.shapes.iter().enumerate().map(|(i, (_, h, unknown))| format!("[walk] no-player shape {i} ranges: {:?}", show(h, unknown))).collect();
         out.push(format!("[walk] the spawn object's ranges: {:?}", show(&self.spawn, &self.spawn_unknown)));
         out
@@ -457,7 +461,7 @@ mod tests {
         let s = crate::settings::Settings { room: (6, 1), ..Default::default() };
         let opts = crate::abstraction::Level { held: true, floors_near: true, ..crate::abstraction::Level::EXACT };
         let only = [super::Region { ix: 3, iy: 6 }, super::Region { ix: 4, iy: 6 }];
-        let lw = super::room_constant_lattice(std::path::Path::new("."), opts, &super::Walk { settings: &s, only: Some(&only) }).unwrap_or_else(|e| panic!("{e:#}"));
+        let lw: super::LatticeWalk = super::room_constant_lattice(std::path::Path::new("."), opts, &super::Walk { settings: &s, only: Some(&only) }).unwrap_or_else(|e| panic!("{e:#}"));
         let mut traced = 0;
         for ((shape, region), f) in &lw.frames {
             let Some(r) = region else { continue };
@@ -485,7 +489,7 @@ mod tests {
         let opts = crate::abstraction::Level::parse("r0sxhf").expect("level");
         // The spawn's region: its player dies there too, and its respawns are explored.
         let only = [super::Region { ix: 1, iy: 7 }];
-        let lw = super::room_constant_lattice(std::path::Path::new("."), opts, &super::Walk { settings: &s, only: Some(&only) }).unwrap_or_else(|e| panic!("{e:#}"));
+        let lw: super::LatticeWalk = super::room_constant_lattice(std::path::Path::new("."), opts, &super::Walk { settings: &s, only: Some(&only) }).unwrap_or_else(|e| panic!("{e:#}"));
         // The start one frame in, concrete: its spawn's field at a path below it.
         let mut eng = crate::trace::refengine::RefEngine::new(&s).expect("engine");
         let row = eng.step_one(&eng.initial().expect("start"), 0).expect("one frame").into_rt2();
@@ -536,7 +540,7 @@ mod tests {
         let s = crate::settings::Settings { room: (0, 3), hundred: true, gemskip: true, loading_jank: Some(1), ..Default::default() };
         let opts = crate::abstraction::Level::parse("r0sxh").expect("level");
         let only: Vec<super::Region> = (0..8).flat_map(|ix| (5..8).map(move |iy| super::Region { ix, iy })).collect();
-        let lw = super::room_constant_lattice(std::path::Path::new("."), opts, &super::Walk { settings: &s, only: Some(&only) }).unwrap_or_else(|e| panic!("{e:#}"));
+        let lw: super::LatticeWalk = super::room_constant_lattice(std::path::Path::new("."), opts, &super::Walk { settings: &s, only: Some(&only) }).unwrap_or_else(|e| panic!("{e:#}"));
         let mut bounded = 0;
         for ((shape, region), f) in &lw.frames {
             let rep = &lw.reps[shape];
@@ -561,17 +565,16 @@ mod tests {
 /// INTERSECT each outcome's constants into its shape's lattice, re-trace a
 /// shape that shrinks. Monotone (constant -> abstract only), so it
 /// terminates. Every frame is traced under `opts`, the kernels' level.
-pub fn room_constant_lattice(
+pub fn room_constant_lattice<A: GraphArith>(
     root: &std::path::Path,
     opts: crate::abstraction::Level,
     walk: &Walk,
-) -> Result<LatticeWalk> {
+) -> Result<LatticeWalk<A>> {
     use super::domain::Symbolic;
     use super::interp::Interp;
     use super::verify::run_one;
     use super::{cart, shapes};
     use anyhow::{anyhow, bail};
-    type Cmap = std::collections::BTreeMap<super::iface::Path, super::iface::Conc>;
 
     let (s, only) = (walk.settings, walk.only);
     let src = cart::sources_in(root, s)?;
@@ -583,7 +586,7 @@ pub fn room_constant_lattice(
     let reset = leak(full_moon::parse("__reset_button_states()").map_err(|e| anyhow!("reset: {:?}", e))?);
     let fr = leak(full_moon::parse(cart::FRAME_CODE).map_err(|e| anyhow!("frame: {:?}", e))?);
 
-    let mut it: Interp<'static, Symbolic> = Interp::new(Symbolic::default());
+    let mut it: Interp<'static, Symbolic<A>> = Interp::new(Symbolic::<A>::default());
     let cart_data = std::sync::Arc::new(celeste_core::cart_data::CartData::load(root.join("cart"))?);
     let (rx, ry) = s.room;
     let cache = std::sync::Arc::new(celeste_core::collision_cache::CollisionCache::new(&cart_data, rx, ry)?);
@@ -596,18 +599,18 @@ pub fn room_constant_lattice(
         it.d.worlds = Some(std::sync::Arc::new(crate::concrete::platform_worlds(PLATFORM_WORLD_FRAMES, s)?));
     }
 
-    let st = cart::fresh_state::<Symbolic>(&mut it.d);
+    let st = cart::fresh_state::<Symbolic<A>>(&mut it.d);
     let st = run_one(&mut it, top, st)?;
     let mut st = st;
     cart::inject_tile_flag_at(&mut st);
     let start = run_one(&mut it, init, st)?;
 
-    let key = |st: &super::state::State<Symbolic>| -> Result<String> { Ok(format!("{:?}", st.shape()?)) };
+    let key = |st: &super::state::State<Symbolic<A>>| -> Result<String> { Ok(format!("{:?}", st.shape()?)) };
 
-    let mut lattice: std::collections::BTreeMap<String, Cmap> = Default::default();
-    let mut reps: std::collections::BTreeMap<String, super::state::State<Symbolic>> = Default::default();
+    let mut lattice: std::collections::BTreeMap<String, std::collections::BTreeMap<super::iface::Path, super::iface::Conc<A>>> = Default::default();
+    let mut reps: std::collections::BTreeMap<String, super::state::State<Symbolic<A>>> = Default::default();
     let mut forks: std::collections::BTreeMap<String, usize> = Default::default();
-    let mut frames: std::collections::BTreeMap<WalkNode, WalkFrame> = Default::default();
+    let mut frames: std::collections::BTreeMap<WalkNode, WalkFrame<A>> = Default::default();
     let mut forkops: std::collections::BTreeMap<String, Vec<String>> = Default::default();
     let mut refused: std::collections::BTreeMap<WalkNode, String> = Default::default();
     // Poisoned paths by reason, summed over jobs.
@@ -632,7 +635,7 @@ pub fn room_constant_lattice(
     // The START state's own intervals (an `rnd` draw in `_init`) are interval
     // inputs at every level: no traced frame wrote them, so write discovery
     // would miss them.
-    let mut start_ivals: std::collections::BTreeMap<super::iface::Path, Option<(i32, i32)>> = Default::default();
+    let mut start_ivals: std::collections::BTreeMap<super::iface::Path, Option<(A::Lit, A::Lit)>> = Default::default();
     {
         use super::domain::Domain as _;
         for r in shapes::state_paths(&start)? {
@@ -649,13 +652,10 @@ pub fn room_constant_lattice(
                 // widens the start; the correlation between slots is dropped).
                 let lit = match it.d.graph.get(n).op {
                     crate::transpile::graph::Op::Const(lo, hi) => Some((lo, hi)),
-                    _ => it.d.range_of(n).and_then(|ps| {
-                        let (lo, hi) = (ps.iter().map(|p| p.0).min()?, ps.iter().map(|p| p.1).max()?);
-                        Some((i32::try_from(lo).ok()?, i32::try_from(hi).ok()?))
-                    }),
+                    _ => it.d.range_of(n).as_ref().and_then(A::lit_hull),
                 };
                 start_ivals.insert(p.clone(), lit);
-                let zero = it.d.num(celeste_core::pico8_num::Pico8Num::from_i16(0));
+                let zero = it.d.num(A::from_i16(0));
                 super::iface::set(reps.get_mut(&sk).expect("inserted above"), &p, super::heap::Value::Num(zero))?;
                 ival_extra.entry(sk.clone()).or_default().insert(p);
             }
@@ -672,9 +672,9 @@ pub fn room_constant_lattice(
     // THE ROUNDS: each traces its frontier in parallel against a lattice
     // snapshot; results apply in node order between rounds. Each frame is
     // bound in the worker arena it was traced in.
-    let mut rep_constants: std::collections::BTreeMap<String, std::collections::HashMap<u32, super::iface::Conc>> = Default::default();
+    let mut rep_constants: std::collections::BTreeMap<String, std::collections::HashMap<u32, super::iface::Conc<A>>> = Default::default();
     let n_workers = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
-    let mut tracers: Vec<Tracer> = (0..n_workers).map(|_| Tracer { it: it.clone(), reset, fr }).collect();
+    let mut tracers: Vec<Tracer<A>> = (0..n_workers).map(|_| Tracer { it: it.clone(), reset, fr }).collect();
     let mut frontier: Vec<WalkNode> = start_regions.into_iter().map(|r| (sk.clone(), r)).collect();
     // Shapes waiting for the deferred re-trace.
     let mut dirty: std::collections::BTreeSet<String> = Default::default();
@@ -687,18 +687,18 @@ pub fn room_constant_lattice(
             bail!("constant-lattice fixpoint did not converge");
         }
         let t_round = std::time::Instant::now();
-        let jobs: Vec<WalkJob> = frontier
+        let jobs: Vec<WalkJob<A>> = frontier
             .iter()
-            .map(|(k, region)| -> Result<WalkJob> {
+            .map(|(k, region)| -> Result<WalkJob<A>> {
                 let st = reps[k].clone();
                 let roots = shapes::state_paths(&st)?;
                 let ival = with_extra(boundary_ival(&st, opts), ival_extra.get(k));
                 // Pin the shape's known constants that are inputs here.
-                let pin: Vec<(super::iface::Path, super::iface::Conc)> =
+                let pin: Vec<(super::iface::Path, super::iface::Conc<A>)> =
                     lattice[k].iter().filter(|(p, _)| roots.iter().any(|r| r == *p)).map(|(p, c)| (p.clone(), *c)).collect();
-                let bounds: Bounds = match (grid, *region, shapes::player_path(&st)) {
+                let bounds: Bounds<A> = match (grid, *region, shapes::player_path(&st)) {
                     (Some(g), Some(r), Some(pl)) => {
-                        g.bounds(&pl, r).into_iter().filter(|(p, _)| roots.iter().any(|q| q == p)).collect()
+                        g.bounds::<A>(&pl, r).into_iter().filter(|(p, _)| roots.iter().any(|q| q == p)).collect()
                     }
                     (None, None, _) => Vec::new(),
                     // The no-player phase's hull (bounds are by path).
@@ -711,14 +711,14 @@ pub fn room_constant_lattice(
             .collect::<Result<_>>()?;
         let next = std::sync::atomic::AtomicUsize::new(0);
         let (jobs_ref, next_ref) = (&jobs, &next);
-        let results: Vec<Result<Vec<(usize, WalkTraced)>>> = std::thread::scope(|scope| {
+        let results: Vec<Result<Vec<(usize, WalkTraced<A>)>>> = std::thread::scope(|scope| {
             // Each worker owns its copy (`Tracer` is `Send`, not `Sync`).
             let handles: Vec<_> = tracers
                 .iter_mut()
                 .map(|tr| {
                     std::thread::Builder::new()
                         .stack_size(128 * 1024 * 1024)
-                        .spawn_scoped(scope, move || -> Result<Vec<(usize, WalkTraced)>> {
+                        .spawn_scoped(scope, move || -> Result<Vec<(usize, WalkTraced<A>)>> {
                             let mut done = Vec::new();
                             loop {
                                 let i = next_ref.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -735,7 +735,7 @@ pub fn room_constant_lattice(
                 .collect();
             handles.into_iter().map(|h| h.join().expect("walk worker panicked")).collect()
         });
-        let mut traced: Vec<(usize, WalkTraced)> = Vec::new();
+        let mut traced: Vec<(usize, WalkTraced<A>)> = Vec::new();
         for r in results {
             traced.extend(r?);
         }
@@ -858,7 +858,7 @@ pub fn room_constant_lattice(
             for ((k, region), wf) in &frames {
                 if region.is_none() && shapes::player_path(&reps[k]).is_none() {
                     let roots = shapes::state_paths(&reps[k])?;
-                    let now: Bounds = no_player.bounds(&reps[k])?.into_iter().filter(|(p, _)| roots.iter().any(|q| q == p)).collect();
+                    let now: Bounds<A> = no_player.bounds(&reps[k])?.into_iter().filter(|(p, _)| roots.iter().any(|q| q == p)).collect();
                     if now != wf.bounds {
                         dirty.insert(k.clone());
                     }
@@ -934,7 +934,7 @@ pub fn room_constant_lattice(
 /// The interval inputs the level's widenings make (`widen::interval_input`:
 /// `rem`, the level's widened objects); `rnd`-derived ones come on top
 /// (`with_extra`).
-fn boundary_ival(st: &super::state::State<super::domain::Symbolic>, opts: crate::abstraction::Level) -> Vec<super::iface::Path> {
+fn boundary_ival<A: GraphArith>(st: &super::state::State<super::domain::Symbolic<A>>, opts: crate::abstraction::Level) -> Vec<super::iface::Path> {
     super::widen::slots_where(st, opts, super::widen::interval_input)
 }
 
@@ -949,44 +949,44 @@ fn with_extra(mut ival: Vec<super::iface::Path>, extra: Option<&std::collections
 }
 
 /// What one walk node is traced under.
-struct WalkJob {
+struct WalkJob<A: GraphArith = Fixed> {
     node: WalkNode,
-    st: super::state::State<super::domain::Symbolic>,
+    st: super::state::State<super::domain::Symbolic<A>>,
     roots: Vec<super::iface::Path>,
-    pin: Vec<(super::iface::Path, super::iface::Conc)>,
+    pin: Vec<(super::iface::Path, super::iface::Conc<A>)>,
     ival: Vec<super::iface::Path>,
-    bounds: Bounds,
+    bounds: Bounds<A>,
     /// A non-start representative's heap constants, to rebase it.
-    rebase: Option<std::collections::HashMap<u32, super::iface::Conc>>,
+    rebase: Option<std::collections::HashMap<u32, super::iface::Conc<A>>>,
 }
 
 /// A live outcome of a traced walk node, as the walk reads it.
-struct WalkOutcome {
+struct WalkOutcome<A: GraphArith = Fixed> {
     key: String,
-    constants: std::collections::BTreeMap<super::iface::Path, super::iface::Conc>,
+    constants: std::collections::BTreeMap<super::iface::Path, super::iface::Conc<A>>,
     ival: Vec<super::iface::Path>,
     regions: Vec<Option<Region>>,
-    st: super::state::State<super::domain::Symbolic>,
+    st: super::state::State<super::domain::Symbolic<A>>,
     /// `shapes::heap_constants` of `st`, in the worker's arena.
-    heap_constants: std::collections::HashMap<u32, super::iface::Conc>,
+    heap_constants: std::collections::HashMap<u32, super::iface::Conc<A>>,
     /// A RESPAWN entry (a state of the no-player phase from a node outside
     /// it: the room reloaded after a death), its constants at the level
     /// (`explore_no_player` pins them).
-    respawn: Option<std::collections::BTreeMap<super::iface::Path, super::iface::Conc>>,
+    respawn: Option<std::collections::BTreeMap<super::iface::Path, super::iface::Conc<A>>>,
 }
 
 /// One traced walk node, or why its trace refused.
-enum WalkTraced {
+enum WalkTraced<A: GraphArith = Fixed> {
     /// Why the trace did not compile, and what it poisoned before refusing.
     Refused(String, std::collections::BTreeMap<String, usize>),
     Traced {
-        frame: super::verify::Frame,
-        bound: std::result::Result<Bound, String>,
+        frame: super::verify::Frame<A>,
+        bound: std::result::Result<Bound<A>, String>,
         forks: usize,
         forkops: Vec<String>,
         nodes_added: usize,
         arena: usize,
-        outs: Vec<WalkOutcome>,
+        outs: Vec<WalkOutcome<A>>,
         skipped: Vec<&'static str>,
         /// Paths this trace POISONED, by reason (drained per job).
         illegal: std::collections::BTreeMap<String, usize>,
@@ -996,21 +996,21 @@ enum WalkTraced {
 }
 
 /// A walk node's converged frame, its bounds, and its binding (or why not).
-pub struct WalkFrame {
-    pub frame: super::verify::Frame,
-    pub bounds: Bounds,
-    pub bound: std::result::Result<Bound, String>,
+pub struct WalkFrame<A: GraphArith = Fixed> {
+    pub frame: super::verify::Frame<A>,
+    pub bounds: Bounds<A>,
+    pub bound: std::result::Result<Bound<A>, String>,
 }
 
 /// Trace one walk node on a worker's tracer, in that worker's arena.
-fn walk_trace(
-    tr: &mut Tracer,
-    job: &WalkJob,
+fn walk_trace<A: GraphArith>(
+    tr: &mut Tracer<A>,
+    job: &WalkJob<A>,
     opts: crate::abstraction::Level,
     grid: Option<RegionGrid>,
     only: Option<&[Region]>,
     room0: (i16, i16),
-) -> Result<WalkTraced> {
+) -> Result<WalkTraced<A>> {
     use super::domain::Domain;
     use super::{shapes, verify};
     use crate::transpile::graph::Op;
@@ -1079,7 +1079,7 @@ fn walk_trace(
         }
         let regions = successor_regions(&o.st, &mut tr.it.d, grid, only)?;
         let heap_constants = shapes::heap_constants(&o.st, &tr.it.d);
-        let spawn_phase = |st: &super::state::State<super::domain::Symbolic>| shapes::player_path(st).is_none() && !super::widen::objects_of_type(st, "player_spawn").is_empty();
+        let spawn_phase = |st: &super::state::State<super::domain::Symbolic<A>>| shapes::player_path(st).is_none() && !super::widen::objects_of_type(st, "player_spawn").is_empty();
         let respawn = if grid.is_some() && spawn_phase(&o.st) && super::widen::objects_of_type(&job.st, "player_spawn").is_empty() {
             Some(shapes::field_constants(&o.st, &tr.it.d, &opts)?)
         } else {
@@ -1096,15 +1096,15 @@ fn walk_trace(
 
 /// The tracer a walk ran in, kept to re-trace a shape in the same arena.
 #[derive(Clone)]
-pub struct Tracer {
-    pub it: super::interp::Interp<'static, super::domain::Symbolic>,
+pub struct Tracer<A: GraphArith = Fixed> {
+    pub it: super::interp::Interp<'static, super::domain::Symbolic<A>>,
     pub reset: &'static full_moon::ast::Ast,
     pub fr: &'static full_moon::ast::Ast,
 }
 
 // SAFETY: the raw pointers inside point into the leaked `'static` ASTs,
 // immutable and never freed, so a copy can move to a worker.
-unsafe impl Send for Tracer {}
+unsafe impl<A: GraphArith> Send for Tracer<A> {}
 
 /// What a lattice walk runs under: the run's settings (the cart, the room,
 /// the region grid, `--build-trace`) and, for a test, `only` the player
@@ -1115,19 +1115,19 @@ pub struct Walk<'a> {
 }
 
 /// The output of `room_constant_lattice`.
-pub struct LatticeWalk {
-    pub tracer: Tracer,
+pub struct LatticeWalk<A: GraphArith = Fixed> {
+    pub tracer: Tracer<A>,
     /// Shape hash (of the input structure) -> the walk's shape key.
     pub by_hash: std::collections::HashMap<u64, String>,
     pub opts: crate::abstraction::Level,
     /// The start state's shape key.
     pub start_key: String,
-    pub lattice: std::collections::BTreeMap<String, std::collections::BTreeMap<super::iface::Path, super::iface::Conc>>,
-    pub reps: std::collections::BTreeMap<String, super::state::State<super::domain::Symbolic>>,
+    pub lattice: std::collections::BTreeMap<String, std::collections::BTreeMap<super::iface::Path, super::iface::Conc<A>>>,
+    pub reps: std::collections::BTreeMap<String, super::state::State<super::domain::Symbolic<A>>>,
     pub forks: std::collections::BTreeMap<String, usize>,
     /// Per (shape, region), its converged frame, bounds and binding.
-    pub frames: std::collections::BTreeMap<WalkNode, WalkFrame>,
-    pub graph: crate::transpile::graph::Graph,
+    pub frames: std::collections::BTreeMap<WalkNode, WalkFrame<A>>,
+    pub graph: crate::transpile::graph::Graph<A>,
     pub cart: std::sync::Arc<celeste_core::cart_data::CartData>,
     pub cache: std::sync::Arc<celeste_core::collision_cache::CollisionCache>,
     pub forkops: std::collections::BTreeMap<String, Vec<String>>,
@@ -1138,5 +1138,5 @@ pub struct LatticeWalk {
     /// representative holds a blanked point there; level -1 seeds from this).
     /// A path absent here holds its start value in the representative, even
     /// where a later frame writes an interval to it (`ival_extra`).
-    pub start_ivals: std::collections::BTreeMap<super::iface::Path, Option<(i32, i32)>>,
+    pub start_ivals: std::collections::BTreeMap<super::iface::Path, Option<(A::Lit, A::Lit)>>,
 }

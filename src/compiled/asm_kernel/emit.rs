@@ -25,12 +25,13 @@ use std::collections::HashMap;
 
 use anyhow::Result;
 
+use celeste_core::arith::EngineNum;
 use celeste_engine::exact::{Code, FieldDict, MissKey, ShapeKeys};
-use celeste_engine::runtime2::{Rt2, POS_WHOLE};
+use celeste_engine::runtime2::{Rt2, P8};
 
-use super::{AsmKernel, RootKind};
+use super::{AsmKernel, KernelLanes, RootKind};
+use crate::search::rem::Capture;
 use crate::storage::unit::lanes_of;
-use crate::search::arc_edges::{decode_axis, RawAxis};
 
 /// One per-row field of a key: its cell (the shape's dictionary), output
 /// slot and how the slot reads as a code.
@@ -99,38 +100,6 @@ impl Placed {
     }
 }
 
-/// The 16 lanes of the 32-bit column at byte `o`.
-#[inline]
-fn col(buf: &[u8], o: usize) -> [u32; 16] {
-    let b = &buf[o..o + 64];
-    // SAFETY: 64 readable bytes (the slice above), read as 16 words.
-    unsafe { std::ptr::read_unaligned(b.as_ptr().cast::<[u32; 16]>()) }.map(u32::from_le)
-}
-
-/// The lanes where `c` holds `v` (one AVX-512 compare: every build has
-/// it, `celeste_engine::kernel`).
-#[inline]
-fn eq_mask(c: &[u32; 16], v: u32) -> u16 {
-    use core::arch::x86_64::{_mm512_cmpeq_epi32_mask, _mm512_loadu_si512, _mm512_set1_epi32};
-    // SAFETY: `c` is 64 readable bytes; AVX-512F is enabled in every build.
-    unsafe { _mm512_cmpeq_epi32_mask(_mm512_loadu_si512(c.as_ptr().cast()), _mm512_set1_epi32(v as i32)) }
-}
-
-/// The lanes where two columns of 16 words (64 bytes each) are equal.
-#[inline]
-pub(super) fn eq16(a: &[u8], b: &[u8]) -> u16 {
-    use core::arch::x86_64::{_mm512_cmpeq_epi32_mask, _mm512_loadu_si512};
-    assert!(a.len() >= 64 && b.len() >= 64, "a column of 16 words");
-    // SAFETY: both hold 64 readable bytes (checked); AVX-512F is enabled in
-    // every build.
-    unsafe { _mm512_cmpeq_epi32_mask(_mm512_loadu_si512(a.as_ptr().cast()), _mm512_loadu_si512(b.as_ptr().cast())) }
-}
-
-/// A boolean root's `(value, known)` lane masks.
-#[inline]
-fn bool_masks(buf: &[u8], o: usize) -> (u16, u16) {
-    (u16::from_le_bytes([buf[o], buf[o + 1]]), u16::from_le_bytes([buf[o + 2], buf[o + 3]]))
-}
 
 /// The lanes of `of` whose boolean `(v, k)` equals lane `r`'s.
 #[inline]
@@ -157,21 +126,22 @@ impl KeyField {
     /// The `(lo, hi)` code words of every lane of a number field (a
     /// position less its low end's whole pixels).
     #[inline]
-    fn num_words(&self, buf: &[u8]) -> ([u32; 16], [u32; 16]) {
+    fn num_words<N: KernelLanes>(&self, buf: &[u8], half: usize) -> ([N::Raw; 16], [N::Raw; 16]) {
         let base = self.root;
         match self.read {
             KeyRead::Num => {
-                let w = col(buf, base);
+                let w = N::col(buf, half, base);
                 (w, w)
             }
-            KeyRead::Ival => (col(buf, base), col(buf, base + 64)),
+            KeyRead::Ival => (N::col(buf, half, base), N::col(buf, half, base + 64)),
             KeyRead::PosNum => {
-                let w = col(buf, base).map(|x| x & !POS_WHOLE);
+                let w = N::col(buf, half, base).map(|x| N::pos_words(x, x).0);
                 (w, w)
             }
             KeyRead::PosIval => {
-                let (lo, hi) = (col(buf, base), col(buf, base + 64));
-                (std::array::from_fn(|i| lo[i] & !POS_WHOLE), std::array::from_fn(|i| hi[i].wrapping_sub(lo[i] & POS_WHOLE)))
+                let (lo, hi) = (N::col(buf, half, base), N::col(buf, half, base + 64));
+                let p: [(N::Raw, N::Raw); 16] = std::array::from_fn(|i| N::pos_words(lo[i], hi[i]));
+                (p.map(|w| w.0), p.map(|w| w.1))
             }
             KeyRead::Bool => unreachable!("a boolean field has no number words"),
         }
@@ -184,9 +154,9 @@ impl KeyField {
     /// small dictionary is matched lane-parallel code by code, a big one
     /// probed once per distinct value among the lanes.
     #[inline]
-    fn eval(&self, buf: &[u8], d: &FieldDict, need: u16, placed: &mut Placed) -> u16 {
+    fn eval<N: KernelLanes>(&self, buf: &[u8], half: usize, d: &FieldDict<N>, need: u16, placed: &mut Placed) -> u16 {
         if self.read == KeyRead::Bool {
-            let (v, k) = bool_masks(buf, self.root);
+            let (v, k) = N::masks(buf, half, self.root);
             let mut miss = 0u16;
             for (tri, lanes) in [(0, need & k & !v), (1, need & k & v), (2, need & !k)] {
                 if lanes != 0 {
@@ -199,11 +169,11 @@ impl KeyField {
             }
             return miss;
         }
-        let (lo, hi) = self.num_words(buf);
+        let (lo, hi) = self.num_words::<N>(buf, half);
         if let Some(small) = d.small_nums() {
             let mut hit = 0u16;
             for &(word, p) in small {
-                let eq = eq_mask(&lo, (word >> 32) as u32) & eq_mask(&hi, word as u32) & need;
+                let eq = N::eq_word(&lo, &hi, word) & need;
                 hit |= eq;
                 placed.fill(eq, p);
             }
@@ -214,9 +184,9 @@ impl KeyField {
         let mut left = need;
         while left != 0 {
             let r = left.trailing_zeros() as usize;
-            let same = eq_mask(&lo, lo[r]) & eq_mask(&hi, hi[r]) & left;
+            let same = N::eq_lanes(&lo, lo[r]) & N::eq_lanes(&hi, hi[r]) & left;
             left &= !same;
-            let p = d.find_num_placed(Code::<celeste_engine::runtime2::P8>::num(lo[r], hi[r]).word());
+            let p = d.find_num_placed(Code::<N>::num(lo[r], hi[r]).word());
             placed.fill(same, p.unwrap_or(0));
             if p.is_none() {
                 miss |= same;
@@ -226,18 +196,22 @@ impl KeyField {
     }
 
     /// Lane `i`'s code.
-    fn code(&self, buf: &[u8], i: usize) -> Code {
-        let w = |o: usize| u32::from_le_bytes(buf[o + 4 * i..o + 4 * i + 4].try_into().unwrap());
+    fn code<N: KernelLanes>(&self, buf: &[u8], half: usize, i: usize) -> Code<N> {
+        let w = |o: usize| N::lane(buf, half, o, i);
         let base = self.root;
+        let pos = |lo: N::Raw, hi: N::Raw| {
+            let (a, b) = N::pos_words(lo, hi);
+            Code::num(a, b)
+        };
         match self.read {
             KeyRead::Num => Code::num(w(base), w(base)),
             KeyRead::Ival => Code::num(w(base), w(base + 64)),
             KeyRead::Bool => {
-                let (v, k) = bool_masks(buf, base);
+                let (v, k) = N::masks(buf, half, base);
                 Code::boolean((k >> i & 1 == 1).then_some(v >> i & 1 == 1))
             }
-            KeyRead::PosNum => Code::pos(w(base), w(base)),
-            KeyRead::PosIval => Code::pos(w(base), w(base + 64)),
+            KeyRead::PosNum => pos(w(base), w(base)),
+            KeyRead::PosIval => pos(w(base), w(base + 64)),
         }
     }
 }
@@ -251,7 +225,7 @@ impl KeyField {
 /// whichever body's transfer was interned first (a scheduling-dependent edge,
 /// room (1,0) f61, 2026-10-09).
 pub(crate) const RAW_WORDS: usize = 4 * crate::trace::verify::ARC_AXIS_ROOTS + 1;
-pub(crate) type RawWords = [u32; RAW_WORDS];
+pub(crate) type RawWords<N = P8> = [<N as EngineNum>::Raw; RAW_WORDS];
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub(super) struct ArcSlots {
@@ -268,44 +242,44 @@ impl ArcSlots {
     }
 
     /// Lane `i`'s transfer as plain words off the output slots: per root
-    /// its (low, high) 16.16 words, a boolean root's (value, known) bits,
-    /// the fin roots 0 where the outcome has none, and the `fin` flag last.
-    fn words(&self, buf: &[u8], i: usize) -> RawWords {
-        let w = |o: usize| u32::from_le_bytes(buf[o..o + 4].try_into().unwrap());
-        let mut out = [0u32; RAW_WORDS];
+    /// its (low, high) raws, a boolean root's (value, known) bits, the fin
+    /// roots 0 where the outcome has none, and the `fin` flag last.
+    fn words<N: KernelLanes>(&self, buf: &[u8], half: usize, i: usize) -> RawWords<N> {
+        let w = |o: usize| N::lane(buf, half, o, i);
+        let mut out = [N::Raw::default(); RAW_WORDS];
         for (k, (off, kind)) in self.read_roots() {
             let (lo, hi) = match kind {
-                RootKind::Num => (w(off + i * 4), w(off + i * 4)),
-                RootKind::Ival => (w(off + i * 4), w(off + 64 + i * 4)),
+                RootKind::Num => (w(off), w(off)),
+                RootKind::Ival => (w(off), w(off + 64)),
                 RootKind::Bool => {
-                    let (v, known) = bool_masks(buf, off);
-                    ((v >> i & 1) as u32, (known >> i & 1) as u32)
+                    let (v, known) = N::masks(buf, half, off);
+                    (N::Raw::from((v >> i & 1) as u32), N::Raw::from((known >> i & 1) as u32))
                 }
             };
             out[2 * k] = lo;
             out[2 * k + 1] = hi;
         }
-        out[RAW_WORDS - 1] = self.fin as u32;
+        out[RAW_WORDS - 1] = N::Raw::from(self.fin as u32);
         out
     }
 
     /// The lanes of `of` whose transfer is lane `r`'s: every root it reads
     /// equal (what `words` reads of it).
     #[inline]
-    fn same_as(&self, buf: &[u8], r: usize, of: u16) -> u16 {
+    fn same_as<N: KernelLanes>(&self, buf: &[u8], half: usize, r: usize, of: u16) -> u16 {
         let mut m = of;
         for (_, (off, kind)) in self.read_roots() {
             m = match kind {
                 RootKind::Num => {
-                    let c = col(buf, off);
-                    m & eq_mask(&c, c[r])
+                    let c = N::col(buf, half, off);
+                    m & N::eq_lanes(&c, c[r])
                 }
                 RootKind::Ival => {
-                    let (lo, hi) = (col(buf, off), col(buf, off + 64));
-                    m & eq_mask(&lo, lo[r]) & eq_mask(&hi, hi[r])
+                    let (lo, hi) = (N::col(buf, half, off), N::col(buf, half, off + 64));
+                    m & N::eq_lanes(&lo, lo[r]) & N::eq_lanes(&hi, hi[r])
                 }
                 RootKind::Bool => {
-                    let (v, k) = bool_masks(buf, off);
+                    let (v, k) = N::masks(buf, half, off);
                     bool_same(v, k, r, m)
                 }
             };
@@ -316,28 +290,24 @@ impl ArcSlots {
         m
     }
 
-    /// The raw transfer of `words`. An undecided `took` is FATAL: the
-    /// record would be an unchecked claim about the remainder.
-    fn raw(&self, words: &RawWords, chunk: &Rt2, lane: usize, outcome: usize) -> (RawAxis, RawAxis) {
-        let axis = |a: usize| -> RawAxis {
+    /// The record's pair of the transfer `words` (`Rem::transfer`: 16.16's
+    /// is `arc_edges::decode_axis`). An undecided `took` is FATAL: the
+    /// record would be an unchecked claim about the remainder; so is a
+    /// refused transfer.
+    fn decode<N: KernelLanes>(&self, words: &RawWords<N>, chunk: &Rt2<N>, lane: usize, outcome: usize) -> N::Pair {
+        let one = N::Raw::from(1u32);
+        let num = |r: N::Raw| N::from_raw(r).unwrap_or_else(|| panic!("arc edges: shape {:#x} outcome {outcome} lane {lane}: a transfer root {r:?} is no number", chunk.shape_hash));
+        let axis = |a: usize| -> Capture<N> {
             let base = a * crate::trace::verify::ARC_AXIS_ROOTS;
-            let pair = |k: usize| (words[2 * (base + k)] as i32, words[2 * (base + k) + 1] as i32);
+            let pair = |k: usize| (num(words[2 * (base + k)]), num(words[2 * (base + k) + 1]));
             assert!(
-                self.roots[base].1 == RootKind::Bool && words[2 * base + 1] == 1,
+                self.roots[base].1 == RootKind::Bool && words[2 * base + 1] == one,
                 "arc edges: shape {:#x} outcome {outcome} lane {lane}: axis {a}'s `took` is not a decided boolean",
                 chunk.shape_hash
             );
-            RawAxis { took: words[2 * base] == 1, pre: pair(1), frag: pair(2), ox: pair(3), fin: self.fin.then(|| pair(4)) }
+            Capture { took: words[2 * base] == one, pre: pair(1), frag: pair(2), ox: pair(3), fin: self.fin.then(|| pair(4)) }
         };
-        (axis(0), axis(1))
-    }
-
-    /// The record's pair of a raw transfer (`raw`).
-    fn decode(raw: &(RawAxis, RawAxis), chunk: &Rt2, lane: usize, outcome: usize) -> crate::search::arc_edges::Pair {
-        let axis = |a: usize, r: &RawAxis| {
-            decode_axis(r).unwrap_or_else(|e| panic!("arc edges: shape {:#x} outcome {outcome} lane {lane}: axis {a}: {e} (raw {r:?})", chunk.shape_hash))
-        };
-        (axis(0, &raw.0), axis(1, &raw.1))
+        N::transfer(&axis(0), &axis(1)).unwrap_or_else(|e| panic!("arc edges: shape {:#x} outcome {outcome} lane {lane}: {e}", chunk.shape_hash))
     }
 }
 
@@ -354,7 +324,7 @@ pub(super) type PosSet = Option<[PosSrc; 4]>;
 
 /// The cells of the lanes `need` of a position set (`start`: the kernel's
 /// room), as `pos_graph::block_cells` labels them (`room_offset`).
-fn cells_of(set: &PosSet, buf: &[u8], need: u16, start: (i16, i16), out: &mut [u32; 16]) {
+fn cells_of<N: KernelLanes>(set: &PosSet, buf: &[u8], half: usize, need: u16, start: (i16, i16), out: &mut [u32; 16]) {
     use crate::search::pos_graph::{cell_of, room_offset, NO_CELL};
     let Some(srcs) = set else {
         *out = [NO_CELL; 16];
@@ -362,7 +332,7 @@ fn cells_of(set: &PosSet, buf: &[u8], need: u16, start: (i16, i16), out: &mut [u
     };
     let read = |s: PosSrc| -> [i16; 16] {
         match s {
-            PosSrc::Root(base) => col(buf, base).map(|w| (w as i32 >> 16) as i16),
+            PosSrc::Root(base) => N::col(buf, half, base).map(N::whole),
             PosSrc::Konst(v) => [v; 16],
         }
     };
@@ -383,16 +353,21 @@ fn cells_of(set: &PosSet, buf: &[u8], need: u16, start: (i16, i16), out: &mut [u
 
 /// An outcome's uniform fields in a key space: the packed codes that hit,
 /// the `(cell, code)` of those that miss.
-#[derive(Default)]
-pub(super) struct PartKey {
+pub(super) struct PartKey<N: EngineNum = P8> {
     pub key: u128,
-    pub missing: Vec<(u32, Code)>,
+    pub missing: Vec<(u32, Code<N>)>,
 }
 
-impl PartKey {
+impl<N: EngineNum> Default for PartKey<N> {
+    fn default() -> Self {
+        PartKey { key: 0, missing: Vec::new() }
+    }
+}
+
+impl<N: EngineNum> PartKey<N> {
     /// `t`'s uniform fields in `sk` (`None`: a shape the key space lacks),
     /// the template's signature checked against the key space's.
-    pub(super) fn of(t: &super::AccTemplate, sk: Option<&ShapeKeys>) -> PartKey {
+    pub(super) fn of(t: &super::AccTemplate<N>, sk: Option<&ShapeKeys<N>>) -> PartKey<N> {
         use celeste_engine::exact::NONE;
         let Some(sk) = sk else { return PartKey { key: 0, missing: t.uniform.clone() } };
         assert!(sk.record == t.record, "exact keys: two shapes under the hash {:#x} (a shape-hash collision)", t.shape_hash);
@@ -543,31 +518,33 @@ thread_local! {
 }
 
 /// What a slice's emission reads besides the kernel's outputs.
-pub(super) struct Slice<'a> {
-    pub chunk: &'a Rt2,
+pub(super) struct Slice<'a, N: EngineNum = P8> {
+    pub chunk: &'a Rt2<N>,
     pub lanes: &'a [usize],
     pub buf: &'a [u8],
+    /// The output buffer's halves' distance (`KernelLanes`).
+    pub half: usize,
     /// Per body, the lanes it emits (`live & !error`, the dup masks applied).
     pub takes: &'a [u16],
     /// Per outcome, its uniform fields keyed (`PartKey`, by key space
     /// generation).
-    pub parts: &'a mut [(u64, PartKey)],
+    pub parts: &'a mut [(u64, PartKey<N>)],
 }
 
-impl AsmKernel {
+impl<N: KernelLanes> AsmKernel<N> {
     /// THE EMISSION of one slice (module doc): the cells, level -1, the
     /// keys and transfers, column-wise; then each body's lanes into the
     /// sink. Returns the lanes emitted (past level -1).
-    pub(super) fn emit(&self, s: Slice, sink: &mut crate::storage::unit::UnitSink) -> u64 {
+    pub(super) fn emit(&self, s: Slice<N>, sink: &mut crate::storage::unit::UnitSink<N>) -> u64 {
         let mut cols = COLS.with(|c| std::mem::take(&mut *c.borrow_mut()));
         let n = self.emit_with(&mut cols, s, sink);
         COLS.with(|c| *c.borrow_mut() = cols);
         n
     }
 
-    fn emit_with(&self, c: &mut Cols, s: Slice, sink: &mut crate::storage::unit::UnitSink) -> u64 {
+    fn emit_with(&self, c: &mut Cols, s: Slice<N>, sink: &mut crate::storage::unit::UnitSink<N>) -> u64 {
         let plan = &self.plan;
-        let Slice { chunk, lanes, buf, takes, parts } = s;
+        let Slice { chunk, lanes, buf, half, takes, parts } = s;
         c.reset(plan);
         c.take[..takes.len()].copy_from_slice(takes);
         let bodies = || (0..plan.bodies.len()).filter(|&bi| takes[bi] != 0);
@@ -578,7 +555,7 @@ impl AsmKernel {
         let start = (self.room.cache.room_x, self.room.cache.room_y);
         for (k, set) in plan.pos.iter().enumerate() {
             if c.pos_need[k] != 0 {
-                cells_of(set, buf, c.pos_need[k], start, &mut c.cells[k]);
+                cells_of::<N>(set, buf, half, c.pos_need[k], start, &mut c.cells[k]);
                 sink.pos_edges(&c.cells[k], c.pos_need[k], lanes);
             }
         }
@@ -609,7 +586,7 @@ impl AsmKernel {
         }
         // THE KEYS' READS, each over the lanes of every body naming it.
         let keys = sink.keys();
-        let sks: Vec<Option<&ShapeKeys>> = plan.shapes.iter().map(|&h| keys.shape(h)).collect();
+        let sks: Vec<Option<&ShapeKeys<N>>> = plan.shapes.iter().map(|&h| keys.shape(h)).collect();
         let mut any = false;
         for (bi, b) in plan.bodies.iter().enumerate() {
             let t = c.take[bi];
@@ -633,7 +610,7 @@ impl AsmKernel {
             c.read_miss[r] = match sks[shape as usize] {
                 Some(sk) => {
                     let d = sk.field(f.cell as usize).unwrap_or_else(|| panic!("key field cell {} is not a value cell of shape {:#x}", f.cell, sk.record.hash));
-                    f.eval(buf, d, need, &mut c.read_placed[r])
+                    f.eval::<N>(buf, half, d, need, &mut c.read_placed[r])
                 }
                 // A shape the key space lacks: every lane new, its partial
                 // key empty.
@@ -650,10 +627,10 @@ impl AsmKernel {
             let mut left = c.arc_need[k];
             while left != 0 {
                 let r = left.trailing_zeros() as usize;
-                let same = set.same_as(buf, r, left);
+                let same = set.same_as::<N>(buf, half, r, left);
                 left &= !same;
-                let words = set.words(buf, r);
-                let id = sink.xfer_id_raw(&words, |w| ArcSlots::decode(&set.raw(w, chunk, lanes[r], *outcome), chunk, lanes[r], *outcome));
+                let words = set.words::<N>(buf, half, r);
+                let id = sink.xfer_id_raw(&words, |w| set.decode(w, chunk, lanes[r], *outcome));
                 for i in lanes_of(same) {
                     c.arc_ids[k][i] = id;
                 }
@@ -692,14 +669,14 @@ impl AsmKernel {
                 out_keys[i] = if miss >> i & 1 == 0 && part.missing.is_empty() {
                     (packed.0[1][i], packed.0[0][i])
                 } else {
-                    sink.provisional().intern(self.miss_key(bi, buf, i, &c.read_miss, shape, packed.get(i), &part.missing))
+                    sink.provisional().intern(self.miss_key(bi, buf, half, i, &c.read_miss, shape, packed.get(i), &part.missing))
                 };
             }
             emitted += take.count_ones() as u64;
             let targets = &c.targets[b.column as usize];
             let e = crate::storage::unit::BodyEmits { shape, take, keys: &out_keys, targets, xfers: &c.arc_ids[b.arc as usize], lanes };
             let cols = &self.body_cols[bi];
-            if let Err(e) = sink.emit_body(&e, || (*template.union).clone_block(), |row, i| cols.push_row(row, buf, i, out_keys[i], targets.cells[i])) {
+            if let Err(e) = sink.emit_body(&e, || (*template.union).clone_block(), |row, i| cols.push_row(row, buf, half, i, out_keys[i], targets.cells[i])) {
                 panic!("frame step: {e:#}");
             }
         }
@@ -712,13 +689,13 @@ impl AsmKernel {
     /// lane (`read_miss`: the read's dictionary lacks the lane's code, or
     /// the key space its shape).
     #[allow(clippy::too_many_arguments)]
-    fn miss_key(&self, bi: usize, buf: &[u8], i: usize, read_miss: &[u16], shape: u64, partial: u128, part_missing: &[(u32, Code)]) -> MissKey {
-        let mut missing: Vec<(u32, Code)> = part_missing.to_vec();
+    fn miss_key(&self, bi: usize, buf: &[u8], half: usize, i: usize, read_miss: &[u16], shape: u64, partial: u128, part_missing: &[(u32, Code<N>)]) -> MissKey<N> {
+        let mut missing: Vec<(u32, Code<N>)> = part_missing.to_vec();
         let r = &self.plan.bodies[bi].reads;
         for &k in &self.plan.body_reads[r.start as usize..r.end as usize] {
             if read_miss[k as usize] >> i & 1 == 1 {
                 let f = &self.plan.reads[k as usize].1;
-                missing.push((f.cell, f.code(buf, i)));
+                missing.push((f.cell, f.code::<N>(buf, half, i)));
             }
         }
         missing.sort_unstable_by_key(|m| m.0);

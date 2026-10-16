@@ -7,6 +7,9 @@
 
 use std::collections::BTreeMap;
 
+use celeste_core::arith::Fixed;
+
+use super::garith::GraphArith;
 use super::graph::{Graph, NodeId, Op};
 use super::kernel::{Emit, OutFields};
 
@@ -48,7 +51,7 @@ pub(crate) fn build_profile() -> String {
 }
 
 /// Nodes reachable from `roots`, walking operands.
-fn reachable(g: &Graph, roots: &[NodeId]) -> Vec<bool> {
+fn reachable<A: GraphArith>(g: &Graph<A>, roots: &[NodeId]) -> Vec<bool> {
     let mut live = vec![false; g.len()];
     let mut stack: Vec<NodeId> = roots.to_vec();
     while let Some(n) = stack.pop() {
@@ -64,8 +67,8 @@ fn reachable(g: &Graph, roots: &[NodeId]) -> Vec<bool> {
 /// One output shape: the cells it writes, and the two booleans that say
 /// which lanes reach it (`live`) and on which of those its row is undefined
 /// (`error`, `trace::error`).
-pub(crate) struct Outcome {
-    pub(crate) of: OutFields,
+pub(crate) struct Outcome<A: GraphArith = Fixed> {
+    pub(crate) of: OutFields<A>,
     pub(crate) error: NodeId,
     pub(crate) live: NodeId,
     /// The transfer roots (`trace::emit::FrameOutcome::arc`), after `error`
@@ -79,7 +82,7 @@ pub(crate) struct Outcome {
 pub(crate) type SpecializedBody = (usize, Vec<u8>, Vec<NodeId>);
 
 /// `want`'s images under the configuration `cfg`, specialized into `out`.
-fn roots_under(graph: &Graph, cfg: &[u8], need: &[bool], want: &[NodeId], out: &mut Graph) -> Vec<NodeId> {
+fn roots_under<A: GraphArith>(graph: &Graph<A>, cfg: &[u8], need: &[bool], want: &[NodeId], out: &mut Graph<A>) -> Vec<NodeId> {
     let map = graph.specialize_subset_into(cfg, Some(need), out);
     want.iter().map(|r| map[*r as usize]).collect()
 }
@@ -87,8 +90,8 @@ fn roots_under(graph: &Graph, cfg: &[u8], need: &[bool], want: &[NodeId], out: &
 /// The roots of each configuration of `cfgs` DECIDED (the interval fold with
 /// the restrictions' ranges and the map), in one fresh arena so equal results are
 /// one node (before the fold, e.g. each platform world is a different node).
-fn decided_roots(
-    graph: &Graph,
+fn decided_roots<A: GraphArith>(
+    graph: &Graph<A>,
     cfgs: &[Vec<u8>],
     (need, want): (&[bool], &[NodeId]),
     room: Option<&crate::transpile::graph::Room>,
@@ -113,14 +116,14 @@ fn decided_roots(
 /// in order, then `error`, then `live`, then the transfer roots
 /// (`Outcome::arc`). This is the single source of the specialized compute:
 /// the ASM backend and `lower_outcomes` both read it.
-pub(crate) fn specialize_frame(
-    graph: &Graph,
+pub(crate) fn specialize_frame<A: GraphArith>(
+    graph: &Graph<A>,
     outs: &[(Vec<NodeId>, NodeId, NodeId, Vec<NodeId>)],
     forks: u8,
     decide: bool,
     room: Option<&crate::transpile::graph::Room>,
     trace: bool,
-) -> (Graph, Vec<SpecializedBody>) {
+) -> (Graph<A>, Vec<SpecializedBody>) {
     let t0 = std::time::Instant::now();
     // --- 1. the forks each outcome depends on: those in its cone (read off
     // the reachable set, so no limit on a frame's fork count) ---
@@ -333,7 +336,8 @@ pub(crate) fn specialize_frame(
                         leaves.push(format!("{n}={:?}({})", nd.op, nd.args.iter().map(|a| format!("{a}={:?}={:?}", sp.get(*a).op, vals[*a as usize])).collect::<Vec<_>>().join(", ")));
                         // Where an unbounded value came from: down the first full-range
                         // operand to the node that made it.
-                        let is_top = |v: &crate::transpile::graph::Val| matches!(v, crate::transpile::graph::Val::Num(iv) if iv.low.as_raw_u32() == 0x8000_0000 || iv.high.as_raw_u32() == 0x7fff_ffff);
+                        let (top_lo, top_hi) = A::bounds(A::unknown());
+                        let is_top = |v: &crate::transpile::graph::Val<A>| matches!(v, crate::transpile::graph::Val::Num(iv) if A::bounds(*iv).0 == top_lo || A::bounds(*iv).1 == top_hi);
                         for a in nd.args.iter().copied() {
                             let mut cur = a;
                             let mut chain = Vec::new();
@@ -458,7 +462,7 @@ pub(crate) fn specialize_frame(
 /// outcome computes the same node for it and that node is a compile-time
 /// constant. Returns the fused graph and its bodies (`specialize_frame`;
 /// `trace`: `--build-trace`).
-pub(crate) fn lower_outcomes(e: &Emit, outs: &mut [Outcome], trace: bool) -> (Graph, Vec<SpecializedBody>) {
+pub(crate) fn lower_outcomes<A: GraphArith>(e: &Emit<A>, outs: &mut [Outcome<A>], trace: bool) -> (Graph<A>, Vec<SpecializedBody>) {
     let outs_spec: Vec<(Vec<NodeId>, NodeId, NodeId, Vec<NodeId>)> = outs
         .iter()
         .map(|o| (o.of.fields.iter().map(|f| f.node).collect(), o.error, o.live, o.arc.clone()))
@@ -477,16 +481,13 @@ pub(crate) fn lower_outcomes(e: &Emit, outs: &mut [Outcome], trace: bool) -> (Gr
             f.konst_av = if !agreed {
                 None
             } else {
-                use celeste_core::pico8_num::Pico8Num;
                 use celeste_engine::runtime2::AV;
                 match sp.get(node).op {
                     // A point in an INTERVAL field is the interval `[v, v]`: an interval
                     // column keys a point as one (`asm_kernel::KeyRead::NumAsIval`).
-                    Op::Const(lo, hi) if lo == hi && f.ty == "ZI" => Some(AV::Ival(Pico8Num::from_raw(lo), Pico8Num::from_raw(lo))),
-                    Op::Const(lo, hi) if lo == hi => Some(AV::Num(Pico8Num::from_raw(lo))),
-                    Op::Const(lo, hi) => {
-                        Some(AV::Ival(Pico8Num::from_raw(lo), Pico8Num::from_raw(hi)))
-                    }
+                    Op::Const(lo, hi) if lo == hi && f.ty == "ZI" => Some(AV::Ival(A::from_lit(lo), A::from_lit(lo))),
+                    Op::Const(lo, hi) if lo == hi => Some(AV::Num(A::from_lit(lo))),
+                    Op::Const(lo, hi) => Some(AV::Ival(A::from_lit(lo), A::from_lit(hi))),
                     Op::ConstBool(b) => Some(AV::Bool(b)),
                     _ => None,
                 }

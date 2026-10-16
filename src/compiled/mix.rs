@@ -128,10 +128,10 @@ pub(crate) fn write_calls() {
 }
 
 /// One kernel's inputs to the report.
-pub(crate) struct Input<'a> {
+pub struct Input<'a, A: crate::transpile::garith::GraphArith = celeste_core::arith::Fixed> {
     /// The traced frame's graph, before specialization and fusion.
-    pub traced: &'a Graph,
-    pub fused: &'a Graph,
+    pub traced: &'a Graph<A>,
+    pub fused: &'a Graph<A>,
     /// The distinct root slots and each one's roles (bits).
     pub roots: &'a [NodeId],
     pub roles: &'a [u8],

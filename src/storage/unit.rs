@@ -284,7 +284,7 @@ pub struct UnitSink<'a, N: Rem = P8> {
     /// Per local transfer id, the edges this worker recorded with it (the
     /// frame's new transfers are numbered by their count: `wave`).
     xfer_counts: Vec<u64>,
-    xfer_cache: Vec<(crate::compiled::asm_kernel::RawWords, u32)>,
+    xfer_cache: Vec<(crate::compiled::asm_kernel::RawWords<N>, u32)>,
     /// The worker's table of local transfers (the wave's gather reads it),
     /// and its length.
     xfer_tab: &'a std::sync::RwLock<Vec<N::Pair>>,
@@ -429,7 +429,7 @@ impl<'a, N: Rem> UnitSink<'a, N> {
                 + 8 * self.xfer_counts.capacity()
                 + size_of::<N::Pair>() * self.xfer_tab.read().expect("a transfer table").capacity()
                 + 8 * self.x_rank.capacity()
-                + size_of::<(crate::compiled::asm_kernel::RawWords, u32)>() * self.xfer_cache.capacity(),
+                + size_of::<(crate::compiled::asm_kernel::RawWords<N>, u32)>() * self.xfer_cache.capacity(),
             24 * (self.srcs.capacity() + self.unit_sources.capacity())
                 + 4 * self.src_local.capacity()
                 + 8 * self.lanes.capacity()
@@ -658,14 +658,15 @@ impl<'a, N: Rem> UnitSink<'a, N> {
     /// 17k) against one lookup per emitted lane, and the decode plus the
     /// hash-map intern was ~17% of a forward.
     #[inline]
-    pub fn xfer_id_raw(&mut self, words: &crate::compiled::asm_kernel::RawWords, decode: impl FnOnce(&crate::compiled::asm_kernel::RawWords) -> N::Pair) -> u32 {
+    pub fn xfer_id_raw(&mut self, words: &crate::compiled::asm_kernel::RawWords<N>, decode: impl FnOnce(&crate::compiled::asm_kernel::RawWords<N>) -> N::Pair) -> u32 {
         let mut h = 0u64;
         for pair in words.chunks_exact(2) {
-            h = (h ^ ((pair[0] as u64) << 32 | pair[1] as u64)).wrapping_mul(0x9e37_79b9_7f4a_7c15).rotate_left(29);
+            // 16.16's word is `lo << 32 | hi` (`EngineNum::word`, `fold`).
+            h = (h ^ N::fold(N::word(pair[0], pair[1]))).wrapping_mul(0x9e37_79b9_7f4a_7c15).rotate_left(29);
         }
         let slot = (h as usize) & (XFER_CACHE - 1);
         if self.xfer_cache.is_empty() {
-            self.xfer_cache = vec![([0; crate::compiled::asm_kernel::RAW_WORDS], u32::MAX); XFER_CACHE];
+            self.xfer_cache = vec![([N::Raw::default(); crate::compiled::asm_kernel::RAW_WORDS], u32::MAX); XFER_CACHE];
         }
         let (w, id) = &self.xfer_cache[slot];
         if *id != u32::MAX && w == words {

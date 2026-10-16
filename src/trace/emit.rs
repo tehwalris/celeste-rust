@@ -10,25 +10,28 @@
 
 use anyhow::Result;
 
+use celeste_core::arith::Fixed;
+
+use crate::transpile::garith::GraphArith;
 use crate::transpile::graph::{Graph, NodeId};
 use crate::transpile::kernel::{Emit, OutField, OutFields};
 
 /// What a lowered frame hands the kernel builder.
-pub struct Lowered {
+pub struct Lowered<A: GraphArith = Fixed> {
     /// One per output shape, with each field's `konst_av` filled in by
     /// `lower::lower_outcomes`.
-    pub(crate) outs: Vec<OutFields>,
+    pub(crate) outs: Vec<OutFields<A>>,
     /// Number of distinct (outcome, roots) bodies the fused graph has - a
     /// size measure for the probes.
     pub bodies: usize,
     /// THE specialization (`lower::specialize_frame`): the fused graph and
     /// its bodies, computed once here and consumed by `asm_fused_from`.
-    pub(crate) spec: (Graph, Vec<crate::transpile::lower::SpecializedBody>),
+    pub(crate) spec: (Graph<A>, Vec<crate::transpile::lower::SpecializedBody>),
 }
 
 /// A node's subtree, to a bounded depth, as text (for diagnostics). Nodes
 /// past the depth limit print as `Op#id`.
-pub fn show_tree(g: &Graph, root: NodeId, depth: usize) -> String {
+pub fn show_tree<A: GraphArith>(g: &Graph<A>, root: NodeId, depth: usize) -> String {
     let nd = g.get(root);
     if depth == 0 {
         return format!("{:?}#{}", nd.op, root);
@@ -42,14 +45,14 @@ pub fn show_tree(g: &Graph, root: NodeId, depth: usize) -> String {
 
 /// One output shape of a traced frame: the cells it writes, and the two
 /// booleans that say which lanes reach it and on which its row is undefined.
-pub struct FrameOutcome {
+pub struct FrameOutcome<A: GraphArith = Fixed> {
     pub outputs: Vec<(u32, NodeId, &'static str)>,
     pub live: NodeId,
     pub error: NodeId,
     /// Fields stored as the UNKNOWN NUMBER (uniform, but no graph constant
     /// `konst_av` could find), with that value: off the key's per-lane fold
     /// (`OutField::widen_uniform`).
-    pub widen: Vec<(u32, celeste_engine::runtime2::AV)>,
+    pub widen: Vec<(u32, celeste_engine::runtime2::AV<A::Num>)>,
     /// The transfer roots (`verify::FrameOut::arc`; empty but at level 0),
     /// after `live` in a body's roots, and whether the outcome has a player
     /// at its end.
@@ -59,19 +62,19 @@ pub struct FrameOutcome {
 
 /// A traced frame in the ENGINE's numbering: everything `lower_frame`
 /// needs, with cell ids an `Rt2` has.
-pub struct Bound {
-    pub graph: Graph,
+pub struct Bound<A: GraphArith = Fixed> {
+    pub graph: Graph<A>,
     /// See `Frame::forks`.
     pub forks: u8,
     pub inputs: Vec<(u32, &'static str)>,
     pub uni: Vec<(u32, &'static str)>,
-    pub outcomes: Vec<FrameOutcome>,
+    pub outcomes: Vec<FrameOutcome<A>>,
 }
 
 
 /// What each root index passed to `renumber_cells` is (every outcome's
 /// fields then its `live` and `error`, flattened), for error messages.
-fn root_legend(f: &crate::trace::verify::Frame) -> String {
+fn root_legend<A: GraphArith>(f: &crate::trace::verify::Frame<A>) -> String {
     let mut out = Vec::new();
     let mut k = 0usize;
     for (i, o) in f.outs.iter().enumerate() {
@@ -95,7 +98,7 @@ fn root_legend(f: &crate::trace::verify::Frame) -> String {
 /// Hitbox cells are declared UNIFORM: `tile_flag_at` needs a block-uniform
 /// width and height, and a hitbox is fixed per object type and never
 /// written during a frame.
-pub fn bind(f: &crate::trace::verify::Frame, g: &Graph) -> Result<Bound> {
+pub fn bind<A: GraphArith>(f: &crate::trace::verify::Frame<A>, g: &Graph<A>) -> Result<Bound<A>> {
     let mut roots: Vec<NodeId> = Vec::new();
     for o in &f.outs {
         roots.extend(o.fields.iter().map(|(_, nd, _)| *nd));
@@ -121,7 +124,8 @@ pub fn bind(f: &crate::trace::verify::Frame, g: &Graph) -> Result<Bound> {
     // THE UNKNOWN NUMBER never reaches a kernel: a field holding it is
     // stored as the uniform `AV::UNum` (below), so its root gets a literal
     // placeholder, and any other root that reads one is refused.
-    let placeholder = graph.leaf(crate::transpile::graph::Op::Const(0, 0));
+    let zero = A::lit(A::from_i16(0));
+    let placeholder = graph.leaf(crate::transpile::graph::Op::Const(zero, zero));
     let mut unknown_fields: Vec<Vec<bool>> = Vec::with_capacity(f.outs.len());
     {
         let mut at = 0usize;
@@ -200,7 +204,7 @@ pub fn bind(f: &crate::trace::verify::Frame, g: &Graph) -> Result<Bound> {
         // uniform. A widening that stores a constant - the remainder's
         // interval, a dead timer's 0 - is a constant node in every body,
         // which `lower::lower_outcomes` finds as the field's `konst_av`.)
-        let mut widen: Vec<(u32, AV)> = Vec::new();
+        let mut widen: Vec<(u32, AV<A::Num>)> = Vec::new();
         for (i, u) in unknown_fields[oi].iter().enumerate() {
             if *u {
                 widen.push((o.cells[i], AV::UNum));
@@ -223,8 +227,8 @@ pub fn bind(f: &crate::trace::verify::Frame, g: &Graph) -> Result<Bound> {
 /// The per-cell ASM input reprs for a bound frame (`bool`/`num`/`ival` from
 /// the bound cell kinds). Input cells survive specialization unchanged, so
 /// this is valid for both the raw and the fused graph.
-pub fn asm_input_reprs(
-    bound: &Bound,
+pub fn asm_input_reprs<A: GraphArith>(
+    bound: &Bound<A>,
 ) -> Result<std::collections::HashMap<u32, crate::transpile::asm::CellRepr>> {
     use crate::transpile::asm::CellRepr;
     let mut reprs = std::collections::HashMap::new();
@@ -252,11 +256,11 @@ pub struct AsmBody {
 }
 
 /// `asm_fused` on a specialization already computed (`Lowered::spec`).
-pub fn asm_fused_from(
-    bound: &Bound,
-    spec: &(Graph, Vec<crate::transpile::lower::SpecializedBody>),
+pub fn asm_fused_from<A: GraphArith>(
+    bound: &Bound<A>,
+    spec: &(Graph<A>, Vec<crate::transpile::lower::SpecializedBody>),
 ) -> Result<(
-    Graph,
+    Graph<A>,
     Vec<AsmBody>,
     Vec<NodeId>,
     std::collections::HashMap<u32, crate::transpile::asm::CellRepr>,
@@ -264,12 +268,12 @@ pub fn asm_fused_from(
     asm_fused_of(bound, spec.0.clone(), spec.1.clone())
 }
 
-fn asm_fused_of(
-    bound: &Bound,
-    fused: Graph,
+fn asm_fused_of<A: GraphArith>(
+    bound: &Bound<A>,
+    fused: Graph<A>,
     raw_bodies: Vec<crate::transpile::lower::SpecializedBody>,
 ) -> Result<(
-    Graph,
+    Graph<A>,
     Vec<AsmBody>,
     Vec<NodeId>,
     std::collections::HashMap<u32, crate::transpile::asm::CellRepr>,
@@ -287,16 +291,16 @@ fn asm_fused_of(
 /// Lower a traced frame - ALL of its output shapes together, so the part
 /// of the frame before outcomes diverge is emitted once (one graph, each
 /// node bound once). `build_trace`: `--build-trace`.
-pub fn lower_frame(
-    bound: &Bound,
+pub fn lower_frame<A: GraphArith>(
+    bound: &Bound<A>,
     room: Option<crate::transpile::graph::Room>,
     build_trace: bool,
-) -> Result<Lowered> {
+) -> Result<Lowered<A>> {
     let (graph, outcomes, forks) = (&bound.graph, &bound.outcomes, bound.forks);
     let mut e = Emit::bare(graph.clone());
     e.room = room;
     e.fork_depth = forks as usize;
-    let mut outs: Vec<crate::transpile::lower::Outcome> = outcomes
+    let mut outs: Vec<crate::transpile::lower::Outcome<A>> = outcomes
         .iter()
         .map(|o| crate::transpile::lower::Outcome {
             of: OutFields {

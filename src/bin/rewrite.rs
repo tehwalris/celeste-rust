@@ -203,8 +203,7 @@ enum Command {
         #[arg(long, default_value = DEFAULT_CHECKPOINT_DIR)]
         checkpoint_dir: String,
         /// Run the REFERENCE engine instead of the kernels: `ckhash` of the
-        /// two trees must agree. Slow. Not at held-unknown levels. Under
-        /// `--arith float` always (there are no float kernels).
+        /// two trees must agree. Slow. Not at held-unknown levels.
         #[arg(long)]
         reference: bool,
     },
@@ -534,6 +533,10 @@ enum Command {
         /// more is SKIPPED (counted and reported), as in `arc-check`.
         #[arg(long)]
         path_cap: Option<usize>,
+        /// A differing row's successors in full (every named field, both
+        /// sides, the row itself), not the player's fields alone.
+        #[arg(long)]
+        full: bool,
     },
     /// DIAGNOSTIC: re-run ONE stored state through the kernels of `--level`
     /// and print every successor (projected without `--erase`), next to the
@@ -841,13 +844,142 @@ fn preds_of(edges: &celeste_rust::storage::edges::EdgeStore, s: Sk, layer: u32) 
 /// Every row of `rt2` (of layer `layer`) through ONE forward frame of
 /// `engine` (an empty visited set, no filter): the successors and whether
 /// one wins.
-fn rerun(engine: &dyn FrameStep, rt2: Rt2, layer: u32) -> Result<(Vec<Block>, bool)> {
+fn rerun<N: celeste_rust::search::rem::Rem>(engine: &dyn FrameStep<N>, rt2: Rt2<N>, layer: u32) -> Result<(Vec<Block<N>>, bool)> {
     let wave = celeste_rust::storage::wave::one_frame(engine, vec![Block::from_rt2(rt2)], layer + 1)?;
     let mut won = false;
     for b in &wave.next {
         won |= wins_of(b.rt2(), &engine.settings())?.contains(&true);
     }
     Ok((wave.next, won))
+}
+
+/// `ref-check`'s arguments (`Command::RefCheck`).
+struct RefCheckArgs {
+    level_dir: String,
+    frame: u32,
+    level: Level,
+    samples: usize,
+    cell: Option<(i32, i32)>,
+    show: usize,
+    path_cap: Option<usize>,
+    full: bool,
+}
+
+/// `ref-check` in arithmetic `A`, its kernels `K`.
+fn ref_check<K, A>(cfg: &celeste_rust::settings::Settings, o: RefCheckArgs) -> Result<()>
+where
+    K: celeste_rust::frame::FrameStep<A::Num> + KernelsNew,
+    A: celeste_rust::transpile::garith::GraphArith,
+    A::Num: celeste_rust::search::rem::Rem,
+{
+            let RefCheckArgs { level_dir, frame, level, samples, cell, show, path_cap, full } = o;
+            let dir = std::path::Path::new(&level_dir);
+            cfg.check(dir, level)?;
+            let kernels = K::new(cfg, level)?;
+            kernels.warm();
+            let only = cell.map(cell_at).transpose()?;
+            // Every candidate state, then `samples` evenly spaced.
+            let tree = Tree::<A::Num>::open(dir, frame)?;
+            let geo = celeste_rust::storage::GEOMETRY;
+            let all: Vec<Sk> = tree.layer(frame, None, cfg.threads())?.0.states_iter().filter(|s| only.is_none_or(|c| s.cell(&geo) == c)).collect();
+            anyhow::ensure!(!all.is_empty(), "no rows at step {frame}");
+            let n = samples.min(all.len());
+            let picked: Vec<Sk> = (0..n).map(|k| all[k * all.len() / n]).collect();
+            // One row: (its report, reference-only successors, kernel-only,
+            // skipped over the path cap, lanes converted alike).
+            let one = |reference: &mut celeste_rust::trace::refengine::ReferenceEngine<A>, sk: Sk| -> Result<(String, usize, usize, usize, usize)> {
+                let rt2 = tree.row(frame, sk, cfg.room)?;
+                let at = where_(sk.cell(&geo));
+                let id = sk.show();
+                // The row, its kernel successors and its reference leaves
+                // convert alike on the tracer's side and the reference's
+                // (`block::check_agreement`).
+                let mut alike = 0;
+                let mut agree = |reference: &celeste_rust::trace::refengine::ReferenceEngine<A>, b: &Rt2<A::Num>| -> Result<()> {
+                    reference.check_agreement(b).map_err(|e| e.context(format!("state {id} at {at}: the one converter")))?;
+                    alike += b.width;
+                    Ok(())
+                };
+                agree(reference, &rt2)?;
+                // The kernels' successors.
+                let (next, _) = rerun(&kernels, rt2.clone_block(), frame)?;
+                let mut kset: std::collections::BTreeSet<Proj> = Default::default();
+                for b in next {
+                    agree(reference, b.rt2())?;
+                    kset.extend(project_onto(&mut b.into_rt2(), level));
+                }
+                // The reference engine's, from the row projected onto the level.
+                let mut input = rt2.clone_block();
+                widen_rt2_to(&mut input, level);
+                let mut rset: std::collections::BTreeSet<Proj> = Default::default();
+                let leaves = match reference.run_lane(&input, 0) {
+                    Err(e) if e.downcast_ref::<celeste_rust::trace::refdriver::TooManyPaths>().is_some() => {
+                        return Ok((format!("[ref-check] state {id} at {at}: SKIPPED ({e})\n"), 0, 0, 1, alike));
+                    }
+                    other => other?,
+                };
+                for (leaf, _) in leaves {
+                    agree(reference, leaf.rt2())?;
+                    rset.extend(project_onto(&mut leaf.into_rt2(), level));
+                }
+                let missing: Vec<&Proj> = rset.difference(&kset).collect();
+                let extra: Vec<&Proj> = kset.difference(&rset).collect();
+                let verdict = if missing.is_empty() && extra.is_empty() { "ok" } else { "DIFFERS" };
+                let mut out = format!("[ref-check] state {id} at {at}: kernels {} successors, reference {}: {verdict} ({} only in the reference, {} only in the kernels)\n", kset.len(), rset.len(), missing.len(), extra.len());
+                let says = |p: &Proj| if full { format!("{p:?}") } else { brief(p) };
+                for p in missing.iter().take(show) {
+                    out += &format!("    only in the REFERENCE (soundness gap): {}\n", says(p));
+                }
+                for p in extra.iter().take(show) {
+                    out += &format!("    only in the KERNELS (precision gap): {}\n", says(p));
+                }
+                if full && verdict != "ok" {
+                    out += &format!("    the row: {:?}\n", project_all(&rt2));
+                    for p in kset.iter().take(show) {
+                        out += &format!("    a kernel successor: {p:?}\n");
+                    }
+                }
+                Ok((out, missing.len(), extra.len(), 0, alike))
+            };
+            // The rows in parallel (the kernels' engine shared, a reference
+            // engine per worker), reported in row order.
+            let done = celeste_rust::par::Pool::new(cfg.threads()).map_with(
+                n,
+                || {
+                    let mut reference = celeste_rust::trace::refengine::ReferenceEngine::<A>::new(cfg)?.at_level(level);
+                    if let Some(cap) = path_cap {
+                        reference.set_path_cap(cap);
+                    }
+                    Ok(reference)
+                },
+                |reference, k| one(reference, picked[k]),
+            )?;
+            let (mut sound_gaps, mut precision_gaps, mut rows_bad, mut skipped, mut alike) = (0usize, 0usize, 0usize, 0usize, 0usize);
+            for (text, missing, extra, skip, lanes) in done {
+                print!("{text}");
+                sound_gaps += missing;
+                precision_gaps += extra;
+                rows_bad += (missing + extra > 0) as usize;
+                skipped += skip;
+                alike += lanes;
+            }
+            println!("[ref-check] {n} rows ({skipped} SKIPPED over the path cap): {rows_bad} differ; {sound_gaps} successors only in the reference, {precision_gaps} only in the kernels");
+            println!("[ref-check] the one converter: {alike} lanes (the rows, their kernel successors and reference leaves) convert alike on both sides");
+            celeste_rust::compiled::dispatch::print_kernel_hits();
+            anyhow::ensure!(sound_gaps == 0, "ref-check: {sound_gaps} reference successors the kernels miss (a SOUNDNESS gap)");
+            Ok(())
+}
+
+/// The kernels of a level (`compiled::Kernels::new`), for the commands
+/// generic over the arithmetic.
+trait KernelsNew: Sized {
+    fn new(cfg: &celeste_rust::settings::Settings, level: Level) -> Result<Self>;
+}
+
+impl<N: celeste_rust::compiled::KernelLanes> KernelsNew for celeste_rust::compiled::Kernels<N> {
+    fn new(cfg: &celeste_rust::settings::Settings, level: Level) -> Result<Self> {
+        celeste_rust::compiled::Kernels::<N>::new(cfg, level)
+    }
 }
 
 /// The run's room, "x,y" (`--room`).
@@ -1057,7 +1189,7 @@ fn main() -> Result<()> {
     // `bench-frame` times the workers' phases; `--metrics` counts the
     // kernels' census and slices (read when the kernels are built).
     // Only these run in float so far.
-    let float = matches!(cli.command, Command::Census { .. } | Command::Search { .. } | Command::ArcCheck { .. } | Command::Forward { .. } | Command::Ckhash { .. } | Command::HullReplay { .. } | Command::HullRoute { .. });
+    let float = matches!(cli.command, Command::Census { .. } | Command::Search { .. } | Command::ArcCheck { .. } | Command::Forward { .. } | Command::Ckhash { .. } | Command::HullReplay { .. } | Command::HullRoute { .. } | Command::RefCheck { .. });
     let cfg = celeste_rust::settings::startup(&cli.settings, float, |s| {
         if let Command::BenchFrame { metrics, .. } = &cli.command {
             s.diag.phases = true;
@@ -1093,7 +1225,7 @@ fn main() -> Result<()> {
                     no_witness,
                     save_marks,
                     prefer,
-                    |lvl| Ok(Box::new(celeste_rust::trace::refengine::RefFrameStep::<LuaF64>::new(&cfg, lvl)?)),
+                    |lvl| Ok(Box::new(celeste_rust::compiled::FloatKernels::new(&cfg, lvl)?)),
                     || Ok(vec![Block::canonical(FloatRefEngine::new(&cfg)?.initial()?)?]),
                 )?
             }
@@ -1150,8 +1282,12 @@ fn main() -> Result<()> {
                     forward(dir, to, level, &cfg, engine, || Ok(vec![Block::canonical(RefEngine::new(&cfg)?.initial()?)?]))?;
                 }
                 Arith::Float(_) => {
-                    let engine: Box<dyn FrameStep<LuaF64>> = Box::new(celeste_rust::trace::refengine::RefFrameStep::<LuaF64>::new(&cfg, level)?);
-                    eprintln!("[fwd] engine up in {:.2} s ({level}, REFERENCE engine, {})", t.elapsed().as_secs_f64(), cfg.arith);
+                    let engine: Box<dyn FrameStep<LuaF64>> = if reference {
+                        Box::new(celeste_rust::trace::refengine::RefFrameStep::<LuaF64>::new(&cfg, level)?)
+                    } else {
+                        Box::new(celeste_rust::compiled::FloatKernels::new(&cfg, level)?)
+                    };
+                    eprintln!("[fwd] engine up in {:.2} s ({level}{}, {})", t.elapsed().as_secs_f64(), if reference { ", REFERENCE engine" } else { "" }, cfg.arith);
                     forward(dir, to, level, &cfg, engine, || Ok(vec![Block::canonical(FloatRefEngine::new(&cfg)?.initial()?)?]))?;
                 }
             }
@@ -1621,94 +1757,12 @@ fn main() -> Result<()> {
             println!("[widen-check] step {frame} at {level}: {stored} stored rows, {emitted_rows} emitted from {emitted}; {moved} moved by the block side's widening");
             anyhow::ensure!(moved == 0, "widen-check: {moved} rows the block side's widening changes (the table's two sides disagree)");
         }
-        Command::RefCheck { level_dir, frame, level, samples, cell, show, path_cap } => {
-            let dir = std::path::Path::new(&level_dir);
-            cfg.check(dir, level)?;
-            let kernels = celeste_rust::compiled::FrameEngine::new(&cfg, level)?;
-            kernels.warm();
-            let only = cell.map(cell_at).transpose()?;
-            // Every candidate state, then `samples` evenly spaced.
-            let tree = Tree::<P8>::open(dir, frame)?;
-            let geo = celeste_rust::storage::GEOMETRY;
-            let all: Vec<Sk> = tree.layer(frame, None, cfg.threads())?.0.states_iter().filter(|s| only.is_none_or(|c| s.cell(&geo) == c)).collect();
-            anyhow::ensure!(!all.is_empty(), "no rows at step {frame}");
-            let n = samples.min(all.len());
-            let picked: Vec<Sk> = (0..n).map(|k| all[k * all.len() / n]).collect();
-            // One row: (its report, reference-only successors, kernel-only,
-            // skipped over the path cap, lanes converted alike).
-            let one = |reference: &mut RefEngine, sk: Sk| -> Result<(String, usize, usize, usize, usize)> {
-                let rt2 = tree.row(frame, sk, cfg.room)?;
-                let at = where_(sk.cell(&geo));
-                let id = sk.show();
-                // The row, its kernel successors and its reference leaves
-                // convert alike on the tracer's side and the reference's
-                // (`block::check_agreement`).
-                let mut alike = 0;
-                let mut agree = |reference: &RefEngine, b: &Rt2| -> Result<()> {
-                    reference.check_agreement(b).map_err(|e| e.context(format!("state {id} at {at}: the one converter")))?;
-                    alike += b.width;
-                    Ok(())
-                };
-                agree(reference, &rt2)?;
-                // The kernels' successors.
-                let (next, _) = rerun(&kernels, rt2.clone_block(), frame)?;
-                let mut kset: std::collections::BTreeSet<Proj> = Default::default();
-                for b in next {
-                    agree(reference, b.rt2())?;
-                    kset.extend(project_onto(&mut b.into_rt2(), level));
-                }
-                // The reference engine's, from the row projected onto the level.
-                let mut input = rt2.clone_block();
-                widen_rt2_to(&mut input, level);
-                let mut rset: std::collections::BTreeSet<Proj> = Default::default();
-                let leaves = match reference.run_lane(&input, 0) {
-                    Err(e) if e.downcast_ref::<celeste_rust::trace::refdriver::TooManyPaths>().is_some() => {
-                        return Ok((format!("[ref-check] state {id} at {at}: SKIPPED ({e})\n"), 0, 0, 1, alike));
-                    }
-                    other => other?,
-                };
-                for (leaf, _) in leaves {
-                    agree(reference, leaf.rt2())?;
-                    rset.extend(project_onto(&mut leaf.into_rt2(), level));
-                }
-                let missing: Vec<&Proj> = rset.difference(&kset).collect();
-                let extra: Vec<&Proj> = kset.difference(&rset).collect();
-                let verdict = if missing.is_empty() && extra.is_empty() { "ok" } else { "DIFFERS" };
-                let mut out = format!("[ref-check] state {id} at {at}: kernels {} successors, reference {}: {verdict} ({} only in the reference, {} only in the kernels)\n", kset.len(), rset.len(), missing.len(), extra.len());
-                for p in missing.iter().take(show) {
-                    out += &format!("    only in the REFERENCE (soundness gap): {}\n", brief(p));
-                }
-                for p in extra.iter().take(show) {
-                    out += &format!("    only in the KERNELS (precision gap): {}\n", brief(p));
-                }
-                Ok((out, missing.len(), extra.len(), 0, alike))
-            };
-            // The rows in parallel (the kernels' engine shared, a reference
-            // engine per worker), reported in row order.
-            let done = celeste_rust::par::Pool::new(cfg.threads()).map_with(
-                n,
-                || {
-                    let mut reference = RefEngine::new(&cfg)?.at_level(level);
-                    if let Some(cap) = path_cap {
-                        reference.set_path_cap(cap);
-                    }
-                    Ok(reference)
-                },
-                |reference, k| one(reference, picked[k]),
-            )?;
-            let (mut sound_gaps, mut precision_gaps, mut rows_bad, mut skipped, mut alike) = (0usize, 0usize, 0usize, 0usize, 0usize);
-            for (text, missing, extra, skip, lanes) in done {
-                print!("{text}");
-                sound_gaps += missing;
-                precision_gaps += extra;
-                rows_bad += (missing + extra > 0) as usize;
-                skipped += skip;
-                alike += lanes;
+        Command::RefCheck { level_dir, frame, level, samples, cell, show, path_cap, full } => {
+            let o = RefCheckArgs { level_dir, frame, level, samples, cell, show, path_cap, full };
+            match cfg.arith {
+                Arith::Fixed => ref_check::<celeste_rust::compiled::FrameEngine, celeste_core::arith::Fixed>(&cfg, o)?,
+                Arith::Float(_) => ref_check::<celeste_rust::compiled::FloatKernels, celeste_core::arith::Float>(&cfg, o)?,
             }
-            println!("[ref-check] {n} rows ({skipped} SKIPPED over the path cap): {rows_bad} differ; {sound_gaps} successors only in the reference, {precision_gaps} only in the kernels");
-            println!("[ref-check] the one converter: {alike} lanes (the rows, their kernel successors and reference leaves) convert alike on both sides");
-            celeste_rust::compiled::dispatch::print_kernel_hits();
-            anyhow::ensure!(sound_gaps == 0, "ref-check: {sound_gaps} reference successors the kernels miss (a SOUNDNESS gap)");
         }
         Command::RerunRow { level_dir, row, level, erase } => {
             let ids = celeste_rust::compiled::ids();
