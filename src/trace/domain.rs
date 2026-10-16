@@ -427,7 +427,7 @@ pub struct Symbolic<A: GraphArith = Fixed> {
     countdown_hint: bool,
     /// `escaped_atom`'s memo, cleared with `unknown_atoms` (ids restart).
     pub escaped: rustc_hash::FxHashMap<NodeId, NodeId>,
-    /// What each `both_values` fork was made for, for the kernel dump.
+    /// What each `both_values` fork was made for (`--build-trace`).
     pub fork_origins: Vec<(u8, String)>,
     /// WHERE each node with an own error was evaluated (the OR of its path
     /// guards). Per trace.
@@ -705,10 +705,9 @@ impl<A: GraphArith> Symbolic<A> {
             // `a == b` may hold iff the ranges meet, and fail iff they are not
             // one single number. Only where neither operand reads an unknown
             // (`Op::UnknownNum`/`UnknownBool`), so `Lo`/`Hi` are an interval
-            // number's ends. Per node, not per frame: with the fly fruit
-            // unknown a near floor's `state == 2` on an exact hidden floor
-            // gave both sides live, the solid one with the player inside
-            // (room (3,0) `r0sxhfn` f42, a coverage gap).
+            // number's ends: judged per node, not per frame (with the fly
+            // fruit unknown, an exact hidden floor's `state == 2` went both
+            // ways, a coverage gap).
             Op::Eq if !self.reads_unknown(&args) => {
                 let (alo, ahi) = (self.graph.fold(Op::Lo, vec![args[0]]), self.graph.fold(Op::Hi, vec![args[0]]));
                 let (blo, bhi) = (self.graph.fold(Op::Lo, vec![args[1]]), self.graph.fold(Op::Hi, vec![args[1]]));
@@ -943,17 +942,13 @@ impl<A: GraphArith> Symbolic<A> {
     /// A COUNTDOWN's atom: a comparison of the unknown number where it is a
     /// countdown (a near level's floor `delay`, balloon `timer`, spring
     /// timers): every comparison of it without the fly fruit unknown, one
-    /// the interpreter hints at (`set_countdown_hint`) with it. It stays THREE-VALUED wherever the set has other unknowns too (the
-    /// platforms): decided per lane where it is read and split by the
-    /// split pass, as at a near level alone - never a merge refusal
-    /// (`reads_unknown_atom`) or an escape fork (`escaped_atom`). Treated
-    /// as the platforms' atoms, every fall floor's `delay <= 0` made two
-    /// successors that never merged: room (2,1) `r0sxhnp` traced 354 states
-    /// at the spawn against 5 at `r0sxhn` (over the 256 limit) since
-    /// `b47b118` made the countdowns the unknown number. With the fruit
-    /// unknown, room (3,0) `r0sxhfn`'s 12 floors' `delay <= 0` as fruit atoms
-    /// kept every floor's two paths apart (2^13 trace states after the spawn
-    /// frame's `foreach`).
+    /// the interpreter hints at (`set_countdown_hint`) with it. It stays
+    /// THREE-VALUED wherever the set has other unknowns too (the platforms):
+    /// decided per lane where it is read and split by the split pass, as at
+    /// a near level alone - never a merge refusal (`reads_unknown_atom`) or
+    /// an escape fork (`escaped_atom`), under which every fall floor's
+    /// `delay <= 0` made two successors that never merged (12 floors: 2^13
+    /// trace states).
     fn countdown_atom(&mut self) -> NodeId {
         let k = self.unknown_atoms;
         self.unknown_atoms += 1;

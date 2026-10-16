@@ -76,10 +76,10 @@ pub struct Interp<'a, D: Domain> {
     /// Literal splits handed out: the ids in `State::frag`.
     next_split: usize,
     /// THE ARC CAPTURE (`search::arc_edges`), set per level-0 trace: every
-    /// `__split_by_flr` must name its site and the player's record what they
-    /// did (`State::arc`).
+    /// split of a remainder (`__split_by_round`, `__split_by_flr`) must name
+    /// its site and the player's record what they did (`State::arc`).
     pub arc_capture: bool,
-    /// The site of the `__split_by_flr` call being made, taken by the builtin.
+    /// The site of the split call being made, taken by the builtin.
     split_site: Option<SplitSite>,
     /// THE BUTTON READS (`RefEngine::frame_reads`): the button table and a
     /// mask of the buttons the frame read from it (bit `i - 1` for
@@ -87,8 +87,8 @@ pub struct Interp<'a, D: Domain> {
     pub button_reads: Option<(TableId, u8)>,
 }
 
-/// What a `__split_by_flr(obj.rem.x|y)` splits: the PLAYER's remainder on an
-/// axis, or another object's.
+/// What a split of `obj.rem.x|y` splits: the PLAYER's remainder on an axis,
+/// or another object's.
 #[derive(Clone, Copy, Debug)]
 enum SplitSite {
     Player(usize),
@@ -1429,7 +1429,7 @@ impl<'a, D: Domain> Interp<'a, D> {
         Ok(rest)
     }
 
-    /// THE ARC CAPTURE: what `__split_by_flr(obj.rem.x)` splits. The argument
+    /// THE ARC CAPTURE: what a split of `obj.rem.x` splits. The argument
     /// must be spelled `<name>.rem.<x|y>` (the cart's `move`), and `<name>` is
     /// compared BY IDENTITY with `player`; any other spelling is refused.
     fn split_site_of(&mut self, arguments: &'a full_moon::ast::punctuated::Punctuated<ast::Expression>, st: &State<D>) -> Result<SplitSite> {
@@ -1441,9 +1441,9 @@ impl<'a, D: Domain> Interp<'a, D> {
         let parts: Vec<String> = spelled.as_deref().unwrap_or("").split('.').map(str::to_string).collect();
         let (obj, axis) = match parts.as_slice() {
             [obj, rem, axis] if rem == "rem" && (axis == "x" || axis == "y") => (obj.clone(), if axis == "x" { 0 } else { 1 }),
-            _ => bail!("arc capture: a `__split_by_flr` whose argument is not `<obj>.rem.<x|y>` ({spelled:?}): no way to tell whose remainder it splits"),
+            _ => bail!("arc capture: a split whose argument is not `<obj>.rem.<x|y>` ({spelled:?}): no way to tell whose remainder it splits"),
         };
-        let Value::Table(t) = self.read_name(&obj, st) else { bail!("arc capture: `{obj}` in `__split_by_flr({obj}.rem..)` is not a table") };
+        let Value::Table(t) = self.read_name(&obj, st) else { bail!("arc capture: `{obj}` in a split of `{obj}.rem..` is not a table") };
         let players = super::widen::objects_of_type(st, "player");
         anyhow::ensure!(players.len() <= 1, "arc capture: {} player objects", players.len());
         let is_player = players.first().is_some_and(|p| super::iface::get(st, p) == Some(Value::Table(t)));

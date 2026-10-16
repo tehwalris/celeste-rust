@@ -1,32 +1,10 @@
-//! ERROR, derived from the operators.
-//!
-//! Error is a property of a value: an operator whose input has error has
-//! error, and an operator may add an own error as a function of its inputs.
-//! An outcome's error is the error of what it stores and of its live guard;
-//! nothing carries error while the frame is traced, so an obligation of a
-//! value nothing reads contributes nothing.
-//!
-//! The operators with an own error are the ones the kernel computes only
-//! partially:
-//!
-//! | operator | own error | why the kernel needs it |
-//! |---|---|---|
-//! | `Flr(x)`, `x` a set not within one integer | `not Known(Flr(x))` | the kernel floors the low end (`zi_flr_ok` is the test) |
-//! | a fork's fragment (`Split`, `SplitInt`) of a set | not covered: `not SplitOk(ways)` | a lane spanning more parts than are enumerated has none to go to |
-//! | a round fork's fragment (`RSplit`, doubles) of a set | not covered: `not RSplitOk(ways)` | as `Split` |
-//! | `Sel(c, t, f)`, `c` lane-undecidable | `not Known(c)` | the kernel picks an arm by `c`'s value bit |
-//! | an operation that can leave the arithmetic's range (`GraphArith::range_error`: 16.16's `Add`, `Sub`, `Neg`, `Abs`, `Mul`, `Div`; the doubles' `Add`, `Sub`, `Mul`, `Div`, `Rem`) of a point or an interval whose exact result the static ranges do not put inside it | `not NoWrap(op)` | 16.16: the kernel computes the console's operation in i32 (an endpoint at a time): `+ - *` and negation wrap, `/` saturates, `abs` of MIN stays MIN. Doubles: a result that is not finite (`%` by zero is NaN). Overflow is never expected in this game, so it is an ERROR, as the reference engine's (`refdomain`) |
-//! | `Restrict(lo, hi)(x)` | `Lo(x) < lo or Hi(x) > hi`, on the raw `x` | the body was specialized on the range: the static ranges folded comparisons with it |
-//!
-//! A RESTRICTION's own error is charged to EVERY outcome of the frame, not
-//! only to those that reach the node: a comparison its range decided folded
-//! to a constant that no longer reads it (in the tracer, `Points` and the
-//! lowering's interval fold alike), so reachability cannot see the use. It
-//! reads only the raw input, which nothing seeds, so no fold removes it.
-//!
-//! A fork's VALIDITY (`SplitValid*`) owns nothing: it is defined on every
-//! lane, and a row that does not read a fragment's value is the right row
-//! for an unenumerated part too.
+//! ERROR, derived from the operators (plans/architecture.md, "Error is
+//! derived, never carried", has the table of own errors). An operator whose
+//! input has error has error, and an operator the kernel computes only
+//! partially adds an own error (`own_error`). An outcome's error is that of
+//! what it stores, of its guard and of its transfer roots; nothing carries
+//! error while the frame is traced, so an obligation of a value nothing
+//! reads contributes nothing.
 //!
 //! AN OWN ERROR HOLDS WHERE ITS OPERATOR IS EVALUATED. The kernel computes
 //! every node on every lane, but off the tracer's path a node's operands are
@@ -34,21 +12,16 @@
 //! on a lane that dashed the other way). So a source's error is `own and
 //! at`, `at` the OR of the path guards it was evaluated under
 //! (`Symbolic::evaluated`); without a recorded site `at` is true, so it
-//! declines rather than drops. This is cheaper than an exact Kleene-lazy
-//! derivation, which would copy the guard and value DAG above every source.
+//! declines rather than drops.
 //!
-//! A PIN (`Pin(c)(x)`, the point assumption) has no data output: every use
-//! of its input reads the constant `c`, so nothing reaches the node and its
-//! check, `x` is `c` on the raw input (`==`, or `Same` where `==` is not
-//! bit identity: a double's `-0 == 0`), is the frame's own (`pins_hold`), ORed
-//! into every outcome's error by `verify::trace_frame`. Charged once there
-//! rather than per outcome as a restriction is: the same lanes decline, and
-//! the kernels are smaller (the per-outcome form cost up to +0.3% dynamic
-//! instructions, plans/abstractions.md).
-//!
-//! Not here: what no graph operator carries (an output widening's
-//! containment, an unfinished unrolled loop). The tracer states those and ORs them into the outcome's error
-//! (`verify::trace_frame`).
+//! A RESTRICTION's own error is charged to EVERY outcome of the frame: a
+//! comparison its range decided folded to a constant that no longer reads
+//! it, so reachability cannot see the use. It reads only the raw input,
+//! which nothing seeds, so no fold removes it. A PIN has no data output
+//! (every use of its input reads the constant): its check is the frame's own
+//! (`pins_hold`), ORed into every outcome's error by `verify::trace_frame`.
+//! A fork's VALIDITY (`SplitValid*`) owns nothing: a row that does not read
+//! a fragment's value is the right row for an unenumerated part too.
 
 use crate::transpile::graph::{NodeId, Op};
 

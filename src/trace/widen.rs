@@ -413,9 +413,8 @@ pub const PLAYER_PROBE: [(i16, i16); 2] = [(-3, 3), (-1, 0)];
 /// floor stores the CART'S INVARIANT (hidden: `state` 2, `collideable`
 /// false, the player cannot be inside a solid floor), with the computed
 /// value owed; storing the computed value makes the split resolve every
-/// floor the player MIGHT overlap (room (6,1): 3,638 outcomes vs 108) -
-/// except with the platforms unknown, where it stores the computed value
-/// (below). Mid split frame (`mid`), `collideable` also stays computed in the
+/// floor the player MIGHT overlap (30x the outcomes) - except with the
+/// platforms unknown, where it stores the computed value (below). Mid split frame (`mid`), `collideable` also stays computed in the
 /// `PLAYER_PROBE` window: widening there would let the second step reach
 /// states the unsplit frame does not. `Rt2::widen_to` agrees.
 fn widen_near_floors<A: GraphArith>(st: &mut State<Symbolic<A>>, d: &mut Symbolic<A>, e: &Entry, errs: &mut SlotErrors, mid: bool) -> Result<()> {
@@ -490,11 +489,10 @@ fn widen_near_floors<A: GraphArith>(st: &mut State<Symbolic<A>>, d: &mut Symboli
         let range = ival(d, slo, shi);
         // With the platforms unknown, the overlapped floor stores what the
         // frame COMPUTED instead (exact, nothing owed): there the hidden
-        // invariant failed on every lane of the spawn's first player frame in
-        // room (2,1) `r0sxhnp` (a KERNEL COVERAGE GAP at f26: some outcome
-        // computes the overlapped floor solid), which the near level alone
-        // never meets. A stored computed `state`/`collideable` agrees with
-        // `Rt2::widen_to` (it keeps an overlapped floor's values as they are).
+        // invariant failed on every lane of the spawn's first player frame
+        // (room (2,1), a coverage gap; plans/architecture.md "Open issues").
+        // A stored computed `state`/`collideable` agrees with `Rt2::widen_to`
+        // (it keeps an overlapped floor's values as they are).
         let computed = d.level.platforms;
         let state = d.sel_num(&overlap, if computed { &state } else { &two }, &range);
         iface::set(st, ps, Value::Num(state))?;
@@ -617,12 +615,12 @@ pub fn platform_inputs<A: GraphArith>(st: &mut State<Symbolic<A>>, d: &mut Symbo
 /// round nowhere near its range) and is the doubles' own rounding for
 /// `Arith::Float`: `fl` is monotone, so `fl(a + b)` over ranges lies between
 /// the rounded sums of the ends.
-type Bounds = (f64, f64);
+type RangeF64 = (f64, f64);
 
 /// Does `v` provably lie in `[lo, hi]`? Through select arms and under
 /// point-split branches with what they say about the compared value (so a
 /// wrap `x < -16 ? 128 : ...` is bounded). Static; `false` if unsure.
-fn within<A: GraphArith>(d: &Symbolic<A>, v: NodeId, (lo, hi): Bounds, facts: &mut Vec<(NodeId, f64, f64)>) -> bool {
+fn within<A: GraphArith>(d: &Symbolic<A>, v: NodeId, (lo, hi): RangeF64, facts: &mut Vec<(NodeId, f64, f64)>) -> bool {
     // Its own bounds first: the enclosing branch may bound a select whole.
     if let Some((a, b)) = bounds(d, v, facts) {
         if lo <= a && b <= hi {
@@ -653,7 +651,7 @@ fn within<A: GraphArith>(d: &Symbolic<A>, v: NodeId, (lo, hi): Bounds, facts: &m
 /// `c` as `x op k` (`k` a literal point, either side): `x` and its range
 /// `(when true, when false)`; `k`'s neighbours are the arithmetic's
 /// (`Arithmetic::below`, and above as `-below(-k)`).
-fn comparison_facts<A: GraphArith>(d: &Symbolic<A>, c: NodeId) -> Option<(NodeId, Bounds, Bounds)> {
+fn comparison_facts<A: GraphArith>(d: &Symbolic<A>, c: NodeId) -> Option<(NodeId, RangeF64, RangeF64)> {
     let node = d.graph.get(c);
     let point = |n: NodeId| match d.graph.get(n).op {
         Op::Const(a, b) if a == b => Some(A::from_lit(a)),
@@ -691,10 +689,10 @@ fn comparison_facts<A: GraphArith>(d: &Symbolic<A>, c: NodeId) -> Option<(NodeId
 
 /// A static range of `n` (literals, a bounded input - a platform's
 /// `x` among them -, sums and differences), narrowed by the enclosing branches; `None` otherwise.
-fn bounds<A: GraphArith>(d: &Symbolic<A>, n: NodeId, facts: &[(NodeId, f64, f64)]) -> Option<Bounds> {
+fn bounds<A: GraphArith>(d: &Symbolic<A>, n: NodeId, facts: &[(NodeId, f64, f64)]) -> Option<RangeF64> {
     let node = d.graph.get(n);
     let num = |l: A::Lit| A::from_lit(l).to_f64();
-    let structural = || -> Option<Bounds> {
+    let structural = || -> Option<RangeF64> {
         Some(match node.op {
             Op::Const(a, b) => (num(a), num(b)),
             Op::Sel => {

@@ -1,10 +1,8 @@
-//! Every heap shape a room reaches: a fixpoint over SHAPES (start at the
-//! spawn shape, trace, collect the outcomes' shapes, repeat), since a
-//! kernel is specialized to one input shape.
-//!
-//! The values do not matter: every non-frozen scalar is symbolized at the
-//! start of each frame, so two states with the same shape trace
-//! identically, and `blank` erases the values.
+//! A state as the walk (`kernel::room_constant_lattice`) sees it: which
+//! scalars are STATE (`state_paths`, what a trace symbolizes), its
+//! constants, and `blank`/`rebase` (the values do not matter: every
+//! non-frozen scalar is symbolized at a frame's start, so two states of one
+//! shape trace identically).
 //!
 //! FROZEN (program constants, not symbolized): `types` and the prototypes
 //! it holds (a symbolic `type.tile` would make `load_room` try every type
@@ -13,10 +11,6 @@
 //! writes it", not "set at toplevel" (`freeze`, `has_key` etc. are state).
 //! Over-freezing would miss a shape, hence a kernel, which is a loud fatal
 //! coverage gap - the safe direction.
-//!
-//! The room exit is a TERMINAL: recorded, not stepped, since the next
-//! room's objects belong to another room's kernel set (stepping it never
-//! closes the walk).
 
 use anyhow::Result;
 

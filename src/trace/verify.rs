@@ -1,9 +1,8 @@
-//! Tracing ONE frame as a kernel, and checking it against the oracle. A
+//! Tracing ONE frame as a kernel (`trace_frame`), and making it executable
+//! under abstract inputs (the split pass, `split_undecided_selects`). A
 //! trace is a FUNCTION: input cells in, output cells out, plus per outcome a
 //! `guard` (when it applies) and a derived `error` (where its row is
-//! undefined). The check runs the frame symbolically and concretely through
-//! the SAME interpreter and domain, so a disagreement can only be the
-//! compilation (a bad merge, a wrong guard, a select on the wrong condition).
+//! undefined).
 
 use anyhow::{anyhow, bail, Result};
 
@@ -87,7 +86,7 @@ impl<A: GraphArith> Clone for FrameOut<A> {
 
 pub struct Frame<A: GraphArith = Fixed> {
     pub iface: Iface<A>,
-    /// What each both-values fork was minted for, for the kernel dump.
+    /// What each both-values fork was minted for (`--build-trace`).
     pub fork_origins: Vec<(u8, String)>,
     /// How many FORK choices this frame made; the emitter enumerates them.
     pub forks: u8,

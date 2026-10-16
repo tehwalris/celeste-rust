@@ -300,46 +300,55 @@ impl<D: Domain> Heap<D> {
 
     /// The tables, scopes and closures reachable from `roots`.
     pub fn reachable(&self, roots: &[Root]) -> (BTreeSet<TableId>, BTreeSet<ScopeId>, BTreeSet<ClosureId>) {
-        let mut live_t: BTreeSet<TableId> = BTreeSet::new();
-        let mut live_s: BTreeSet<ScopeId> = BTreeSet::new();
-        let mut live_c: BTreeSet<ClosureId> = BTreeSet::new();
-        let mut stack: Vec<Root> = roots.to_vec();
-        while let Some(r) = stack.pop() {
+        let mut live: (BTreeSet<TableId>, BTreeSet<ScopeId>, BTreeSet<ClosureId>) = Default::default();
+        for r in self.visit(roots) {
             match r {
-                Root::Closure(c) => {
-                    if !live_c.insert(c) {
-                        continue;
-                    }
-                    if let Some(cl) = self.closures.get(&c) {
-                        stack.push(Root::Scope(cl.env));
-                    }
-                }
+                Root::Table(t) => live.0.insert(t),
+                Root::Scope(s) => live.1.insert(s),
+                Root::Closure(c) => live.2.insert(c),
+            };
+        }
+        live
+    }
+
+    /// Every object reachable from `roots`, each once, BREADTH-FIRST: the
+    /// canonical order `shape_and_order` numbers objects by. The ONE place
+    /// that knows what an object refers to (with `push_value`).
+    fn visit(&self, roots: &[Root]) -> Vec<Root> {
+        let mut seen: (BTreeSet<TableId>, BTreeSet<ScopeId>, BTreeSet<ClosureId>) = Default::default();
+        let mut queue: Vec<Root> = roots.to_vec();
+        let mut order: Vec<Root> = Vec::new();
+        let mut i = 0;
+        while i < queue.len() {
+            let r = queue[i];
+            i += 1;
+            let fresh = match r {
+                Root::Table(t) => seen.0.insert(t),
+                Root::Scope(s) => seen.1.insert(s),
+                Root::Closure(c) => seen.2.insert(c),
+            };
+            if !fresh {
+                continue;
+            }
+            order.push(r);
+            match r {
+                Root::Closure(c) => queue.extend(self.closures.get(&c).map(|cl| Root::Scope(cl.env))),
                 Root::Table(t) => {
-                    if !live_t.insert(t) {
-                        continue;
-                    }
-                    if let Some(tab) = self.tables.get(&t) {
-                        for v in tab.values() {
-                            push_value(v, &mut stack);
-                        }
+                    for v in self.tables.get(&t).into_iter().flat_map(|tab| tab.values()) {
+                        push_value(v, &mut queue);
                     }
                 }
                 Root::Scope(s) => {
-                    if !live_s.insert(s) {
-                        continue;
-                    }
                     if let Some(sc) = self.scopes.get(&s) {
                         for v in sc.vars.values() {
-                            push_value(v, &mut stack);
+                            push_value(v, &mut queue);
                         }
-                        if let Some(p) = sc.parent {
-                            stack.push(Root::Scope(p));
-                        }
+                        queue.extend(sc.parent.map(Root::Scope));
                     }
                 }
             }
         }
-        (live_t, live_s, live_c)
+        order
     }
 }
 
@@ -399,54 +408,16 @@ impl<D: Domain> Heap<D> {
     /// `shape`, and the canonical BFS order of the reachable objects it was
     /// numbered by - the order a merge pairs the two sides' objects in.
     pub fn shape_and_order(&self, roots: &[Root]) -> Result<(Shape, Vec<Root>)> {
+        let order = self.visit(roots);
         let mut t_num: BTreeMap<TableId, u32> = BTreeMap::new();
         let mut s_num: BTreeMap<ScopeId, u32> = BTreeMap::new();
         let mut c_num: BTreeMap<ClosureId, u32> = BTreeMap::new();
-        let mut queue: Vec<Root> = roots.to_vec();
-        let mut order: Vec<Root> = Vec::new();
-        let mut i = 0;
-        while i < queue.len() {
-            let r = queue[i];
-            i += 1;
-            match r {
-                Root::Closure(c) => {
-                    if c_num.contains_key(&c) {
-                        continue;
-                    }
-                    c_num.insert(c, c_num.len() as u32);
-                    order.push(r);
-                    if let Some(cl) = self.closures.get(&c) {
-                        queue.push(Root::Scope(cl.env));
-                    }
-                }
-                Root::Table(t) => {
-                    if t_num.contains_key(&t) {
-                        continue;
-                    }
-                    t_num.insert(t, t_num.len() as u32);
-                    order.push(r);
-                    if let Some(tab) = self.tables.get(&t) {
-                        for v in tab.values() {
-                            push_value(v, &mut queue);
-                        }
-                    }
-                }
-                Root::Scope(s) => {
-                    if s_num.contains_key(&s) {
-                        continue;
-                    }
-                    s_num.insert(s, s_num.len() as u32);
-                    order.push(r);
-                    if let Some(sc) = self.scopes.get(&s) {
-                        for v in sc.vars.values() {
-                            push_value(v, &mut queue);
-                        }
-                        if let Some(p) = sc.parent {
-                            queue.push(Root::Scope(p));
-                        }
-                    }
-                }
-            }
+        for r in &order {
+            match *r {
+                Root::Table(t) => t_num.insert(t, t_num.len() as u32),
+                Root::Scope(s) => s_num.insert(s, s_num.len() as u32),
+                Root::Closure(c) => c_num.insert(c, c_num.len() as u32),
+            };
         }
         let slot = |v: &Value<D>| -> Slot {
             match v {

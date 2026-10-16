@@ -112,7 +112,7 @@ impl RegionGrid {
     /// The bounds a region's kernel is traced under, by path under `pl`
     /// (16.16 constants, exact in every arithmetic; the remainder's range
     /// the table's, `widening::range`).
-    fn bounds<A: GraphArith>(&self, pl: &super::iface::Path, r: Region) -> Bounds<A> {
+    fn bounds<A: GraphArith>(&self, pl: &super::iface::Path, r: Region) -> InputRanges<A> {
         const ONE: i32 = 1 << 16;
         let lit = |raw: i32| A::lit(A::from_fixed_raw(raw));
         let (rlo, rhi) = celeste_engine::widening::range::<A::Num>(celeste_engine::widening::REM.0, celeste_engine::widening::REM.1);
@@ -132,7 +132,7 @@ impl RegionGrid {
 }
 
 /// The input bounds a frame is traced under (`verify::trace_frame`).
-pub type Bounds<A = Fixed> = Vec<(super::iface::Path, (<A as Arithmetic>::Lit, <A as Arithmetic>::Lit))>;
+pub type InputRanges<A = Fixed> = Vec<(super::iface::Path, (<A as Arithmetic>::Lit, <A as Arithmetic>::Lit))>;
 
 /// Frames of platform motion the platform worlds cover: a platforms-unknown
 /// level is sound only up to this horizon and refuses a longer search.
@@ -176,12 +176,11 @@ fn successor_regions<A: GraphArith>(
 /// spawn, so a field varying over it would be an unbounded input. No input
 /// matters before the player exists, so run the phase fully pinned and bound
 /// each numeric field to the hull it took, PER SHAPE: the phase may change
-/// shape before the player appears (room (3,0): the start's shape lasts one
-/// frame, and a later spawn shape traced unbounded made every fall floor
-/// "near", 2^12 outcomes). The chain runs the fly fruit exact; the walk and
-/// the forward run the level's widenings, under which the phase reaches
-/// shapes the chain never takes (a widened fly fruit gone at any frame:
-/// room (6,0) at `r0sxhfp`), so the start is also EXPLORED at the level's
+/// shape before the player appears (a later spawn shape traced unbounded
+/// makes every fall floor "near"). The chain runs the fly fruit exact; the
+/// walk and the forward run the level's widenings, under which the phase
+/// reaches shapes the chain never takes (a widened fly fruit gone at any
+/// frame), so the start is also EXPLORED at the level's
 /// own widenings (`explore_no_player`) into the same hulls, and so is every
 /// RESPAWN the walk reaches (the room reloaded after a death, every object
 /// updated once). A shape no explored state has gets the spawn object's hull
@@ -408,11 +407,11 @@ impl<A: GraphArith> NoPlayer<A> {
     /// but some explored state of the shape holds unknown has no hull: it
     /// bounds nothing (an unbounded input, as every unhulled field) - FATAL
     /// for a field of the spawn, the phase the bounds are for.
-    fn bounds(&self, st: &super::state::State<super::domain::Symbolic<A>>) -> Result<Bounds<A>> {
+    fn bounds(&self, st: &super::state::State<super::domain::Symbolic<A>>) -> Result<InputRanges<A>> {
         let shape = st.shape()?;
         let spawn_objs = super::widen::objects_of_type(st, "player_spawn");
-        let varying = |h: &Hull<A>, unknown: &std::collections::BTreeSet<super::iface::Path>, spawn: &dyn Fn(&super::iface::Path) -> bool, what: &str| -> Result<Bounds<A>> {
-            let mut b = Bounds::<A>::new();
+        let varying = |h: &Hull<A>, unknown: &std::collections::BTreeSet<super::iface::Path>, spawn: &dyn Fn(&super::iface::Path) -> bool, what: &str| -> Result<InputRanges<A>> {
+            let mut b = InputRanges::<A>::new();
             for (p, &(lo, hi)) in h.iter().filter(|(_, (lo, hi))| A::lt(*lo, *hi)) {
                 if !unknown.contains(p) {
                     b.push((p.clone(), (A::lit(lo), A::lit(hi))));
@@ -426,7 +425,7 @@ impl<A: GraphArith> NoPlayer<A> {
             return varying(h, unknown, &|p| spawn_objs.iter().any(|o| p.starts_with(o)), "the explored states of its shape");
         }
         let spawn = varying(&self.spawn, &self.spawn_unknown, &|_| true, "the explored spawn objects")?;
-        let mut out = Bounds::<A>::new();
+        let mut out = InputRanges::<A>::new();
         for o in spawn_objs {
             for (suffix, r) in &spawn {
                 let mut p = o.clone();
@@ -643,7 +642,7 @@ pub fn room_constant_lattice<A: GraphArith>(
                 let ival = with_extra(super::widen::slots_where(&st, opts, super::widen::interval_input), ival_extra.get(k));
                 // Pin the shape's known constants that are inputs here.
                 let pin = pins_of(&lattice[k], &roots);
-                let bounds: Bounds<A> = match (grid, *region, shapes::player_path(&st)) {
+                let bounds: InputRanges<A> = match (grid, *region, shapes::player_path(&st)) {
                     (Some(g), Some(r), Some(pl)) => {
                         g.bounds::<A>(&pl, r).into_iter().filter(|(p, _)| roots.iter().any(|q| q == p)).collect()
                     }
@@ -778,7 +777,7 @@ pub fn room_constant_lattice<A: GraphArith>(
             for ((k, region), wf) in &frames {
                 if region.is_none() && shapes::player_path(&reps[k]).is_none() {
                     let roots = shapes::state_paths(&reps[k])?;
-                    let now: Bounds<A> = no_player.bounds(&reps[k])?.into_iter().filter(|(p, _)| roots.iter().any(|q| q == p)).collect();
+                    let now: InputRanges<A> = no_player.bounds(&reps[k])?.into_iter().filter(|(p, _)| roots.iter().any(|q| q == p)).collect();
                     if now != wf.bounds {
                         dirty.insert(k.clone());
                     }
@@ -869,7 +868,7 @@ struct WalkJob<A: GraphArith = Fixed> {
     roots: Vec<super::iface::Path>,
     pin: Vec<(super::iface::Path, super::iface::Conc<A>)>,
     ival: Vec<super::iface::Path>,
-    bounds: Bounds<A>,
+    bounds: InputRanges<A>,
     /// A non-start representative's heap constants, to rebase it.
     rebase: Option<std::collections::HashMap<u32, super::iface::Conc<A>>>,
 }
@@ -910,7 +909,7 @@ enum WalkTraced<A: GraphArith = Fixed> {
 /// A walk node's converged frame, its bounds, and its binding (or why not).
 pub struct WalkFrame<A: GraphArith = Fixed> {
     pub frame: super::verify::Frame<A>,
-    pub bounds: Bounds<A>,
+    pub bounds: InputRanges<A>,
     pub bound: std::result::Result<Bound<A>, String>,
 }
 
@@ -946,6 +945,8 @@ fn walk_trace<A: GraphArith>(
         // not skipped.
         let room = shapes::room_of(&o.st, &tr.it.d);
         anyhow::ensure!(room.0 >= 0 && room.1 >= 0, "an outcome whose room is not a constant: {room:?}");
+        // The room exit is a TERMINAL, recorded and not stepped: the next
+        // room's objects belong to its own kernel set.
         if room != room0 {
             skipped.push("another room");
             continue;

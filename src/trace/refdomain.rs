@@ -238,13 +238,13 @@ impl<A: Arithmetic> Domain for RefDomain<A> {
     }
 
     fn mget(&mut self, _x: &A::Ival, _y: &A::Ival) -> Result<A::Ival> {
-        // Concrete coords are folded by the caller; the cart splits interval
-        // coords before collision.
-        bail!("RefDomain::mget with non-const coords - TODO (should be split first)");
+        // The caller folds constant coordinates; the cart splits an interval
+        // one before any map read.
+        bail!("the reference domain's mget of coordinates that are not points is not modelled");
     }
 
     fn tile_flag_at(&mut self, _x: &A::Ival, _y: &A::Ival, _w: &A::Ival, _h: &A::Ival, _flag: &A::Ival) -> Result<bool> {
-        bail!("RefDomain::tile_flag_at with non-const coords - TODO (collision wiring)");
+        bail!("the reference domain's tile_flag_at of coordinates that are not points is not modelled");
     }
 
     fn unknown_bool(&mut self) -> Result<bool> {
