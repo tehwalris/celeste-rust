@@ -697,7 +697,7 @@ impl AsmKernel {
             }
             emitted += take.count_ones() as u64;
             let targets = &c.targets[b.column as usize];
-            let e = crate::storage::unit::BodyEmits { shape, take, keys: &out_keys, targets, xfers: Some(&c.arc_ids[b.arc as usize]), lanes };
+            let e = crate::storage::unit::BodyEmits { shape, take, keys: &out_keys, targets, xfers: &c.arc_ids[b.arc as usize], lanes };
             let cols = &self.body_cols[bi];
             if let Err(e) = sink.emit_body(&e, || (*template.union).clone_block(), |row, i| cols.push_row(row, buf, i, out_keys[i], targets.cells[i])) {
                 panic!("frame step: {e:#}");

@@ -73,7 +73,7 @@ impl CaptureWriter {
     }
 
     #[inline]
-    pub fn emit(&mut self, shape: u64, cell: u32, key: Key, lane: u32, xfer: Option<u32>, miss: Option<celeste_engine::exact::MissKey>) {
+    pub fn emit(&mut self, shape: u64, cell: u32, key: Key, lane: u32, xfer: u32, miss: Option<celeste_engine::exact::MissKey>) {
         if let Some(m) = miss {
             self.blob(4, &m);
         }
@@ -84,7 +84,7 @@ impl CaptureWriter {
         b[17..25].copy_from_slice(&key.1.to_le_bytes());
         b[25..29].copy_from_slice(&cell.to_le_bytes());
         b[29..33].copy_from_slice(&lane.to_le_bytes());
-        b[33..37].copy_from_slice(&xfer.unwrap_or(u32::MAX).to_le_bytes());
+        b[33..37].copy_from_slice(&xfer.to_le_bytes());
         self.out.write_all(&b).expect("a capture write");
     }
 
@@ -216,7 +216,8 @@ impl crate::frame::FrameStep for Replay<'_> {
             let (shape, key, cell, lane, x) = (u64_at(pos + 1), (u64_at(pos + 9), u64_at(pos + 17)), u32_at(pos + 25), u32_at(pos + 29), u32_at(pos + 33));
             let key = miss.take().unwrap_or(key);
             pos += 37;
-            let xfer = (x != u32::MAX).then(|| sink.xfer_id(self.cap.xfers[u.stream][x as usize]));
+            let pair = *self.cap.xfers[u.stream].get(x as usize).with_context(|| format!("a captured emission's transfer {x} is not in its stream's table"))?;
+            let xfer = sink.xfer_id(pair);
             let skel = self.skeletons.get(&shape).with_context(|| format!("the captured shape {shape:016x} is in no frame of the tree: the replay has no skeleton for it"))?;
             sink.emit(shape, cell, key, lane as usize, xfer, || skel.clone_block(), |_| {})?;
         }

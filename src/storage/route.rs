@@ -5,8 +5,7 @@
 //! into its BUNDLE (`bundle::Bundle`: source key, transfer, offset, target
 //! key -> target cells) in a unit-local table (`UnitBundles`: one probe and
 //! an OR, in cache), keyed also by the target's ROUTE - its (shape, region
-//! slot): a storage region. An emission without an edge (the reference
-//! engine's) is a bundle of its target alone (`NO_XFER`). At the unit's end
+//! slot): a storage region. At the unit's end
 //! its bundles are the CHUNKS of their routes: per route the unit's
 //! distinct targets, its sources, the bundles naming both by index, and the
 //! PUSHES - per target cell the hulls of its sources pushed along the
@@ -32,9 +31,6 @@ use super::visited::{Key, StateInfo, VisitedSet};
 use super::Sk;
 use crate::search::hull::{Hull, HullAcc};
 use celeste_engine::exact::is_provisional;
-
-/// A unit bundle's transfer when it holds no edge (its target alone).
-pub const NO_XFER: u32 = u32::MAX;
 
 /// `Scratch::e_of`'s mark of a provisional target.
 const PROV: u32 = u32::MAX;
@@ -252,7 +248,7 @@ pub struct Chunk {
 }
 
 /// A unit bundle (24 B): its target's and its source's index in its chunk,
-/// its transfer (the worker's local id; `NO_XFER`: no edge), its offset,
+/// its transfer (the worker's local id), its offset,
 /// its target cells.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Ub {
@@ -648,9 +644,6 @@ pub fn run_route(st: &mut RouteState, slice: u32, chunks: &[&Chunk], cx: &Region
         sc.s_of.clear();
         sc.s_of.resize(c.sources.len(), u32::MAX);
         for b in &c.bundles {
-            if b.x == NO_XFER {
-                continue;
-            }
             // A pair the tree's table held is its global id; a new one the
             // worker's local id, past them (`UnitSink::xfer_id`).
             let x = match b.x.checked_sub(cx.new_xfers) {

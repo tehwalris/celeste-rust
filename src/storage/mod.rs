@@ -46,6 +46,50 @@ pub mod wave;
 
 use crate::search::pos_graph::{GRID, NO_CELL};
 
+/// THE TREE'S FINGERPRINT (`rewrite ckhash`), over CONTENT
+/// (`exact::ContentHash`: whatever order its dictionaries grew in): per
+/// frame its states' count and an order-free hash (`fNNN n hash`); with
+/// `edges` each frame's recorded edges by what they join - (shape, key,
+/// cell) of target and source - and their transfers, not their ids
+/// (`eNNN`); with `hulls` each frame's hull file, its states with their
+/// layers and hulls (`hNNN`). Two trees with the same lines hold the same
+/// states, edges and hulls.
+pub fn fingerprint(dir: &std::path::Path, to: u32, edges: bool, hulls: bool, threads: usize) -> anyhow::Result<Vec<String>> {
+    let tree = layer::Tree::open(dir, to)?;
+    let content = tree.space.content_hash();
+    let mut out = Vec::new();
+    for frame in 0..=to {
+        // A forward whose frontier died has no frames past the empty one:
+        // their layers are empty.
+        let (layer, _) = tree.layer(frame, None, threads)?;
+        let (n, acc) = layer.content_fingerprint(&tree.space, &tree.shapes)?;
+        out.push(format!("f{frame:03} {n} {acc:016x}"));
+    }
+    if edges {
+        let eg = edges::EdgeStore::open(&dir.join("edges"), to)?;
+        // STREAMED: one frame at a time, its blocks on every thread (each
+        // key hashed once a block, each pair once).
+        let hashes = bench::EdgeHashes::new(eg.pairs());
+        for frame in 1..=to {
+            let (n, acc) = hashes.frame(&eg, frame, &content, &tree.shapes, threads)?;
+            out.push(format!("e{frame:03} {n} {acc:016x}"));
+        }
+    }
+    if hulls {
+        for frame in 0..=to {
+            // A forward whose frontier died has no frames past it.
+            if !layer::frame_exists(dir, frame) {
+                break;
+            }
+            let hf = hulls::read(&hulls::path(dir, frame), threads)?;
+            let (new, _) = tree.layer(frame, None, threads)?;
+            let (n, acc) = hulls::fingerprint(hf.states(&new)?.into_iter(), &tree.space, &tree.shapes)?;
+            out.push(format!("h{frame:03} {n} {acc:016x}"));
+        }
+    }
+    Ok(out)
+}
+
 /// The storage regions: `side` x `side` cells (`GEOMETRY`: 8; the tests
 /// also check 16), aligned at 0 as the kernels' `RegionGrid::of` (`div_euclid`; the
 /// grid's origin -64 is a multiple of both), each nested in one kernel

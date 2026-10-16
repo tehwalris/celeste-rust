@@ -1633,7 +1633,7 @@ mod tests {
     use crate::trace::refengine::RefEngine;
     use celeste_core::pico8_num::Pico8Num as P8;
     use celeste_engine::runtime2::{Col, AV};
-    use std::sync::Mutex;
+    use crate::trace::refengine::RefFrameStep;
 
     /// A fresh forward keeps none of a killed run's files.
     #[test]
@@ -1829,7 +1829,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         let e = RefEngine::new(&s).expect("engine");
         let init = vec![Block::canonical(e.initial().expect("init")).expect("block")];
-        let e = Mutex::new(e);
+        let e = RefFrameStep::new(&s, crate::abstraction::Level::EXACT).expect("engines");
         let frontier = |st: &ForwardState| -> (Vec<(u32, (u64, u64), u64)>, Vec<Hull>, crate::storage::wave::ByLayer) { (st.frontier.new.iter().collect(), st.frontier.hulls.clone(), st.frontier.old.clone()) };
         let mut st = ForwardState::start(init, &dir, true, None, crate::abstraction::Level::EXACT, &s).expect("start");
         for b in crate::storage::layer::decode_states(&st.frontier.new, &st.visited.keys, st.visited.shapes(), usize::MAX, &|_| true).expect("decode") {
@@ -1907,7 +1907,7 @@ mod tests {
         {
             let e = RefEngine::new(&s).expect("engine");
             let init = vec![Block::canonical(e.initial().expect("init")).expect("block")];
-            forward_run(&Mutex::new(e), init, dir, 4, true).expect("fresh");
+            forward_run(&RefFrameStep::new(&s, crate::abstraction::Level::EXACT).expect("engines"), init, dir, 4, true).expect("fresh");
         }
         let fresh4 = keyset(4);
         assert!(fresh4.0 > 0, "fresh frame 4 empty");
@@ -1916,7 +1916,7 @@ mod tests {
         {
             let e = RefEngine::new(&s).expect("engine");
             let init = vec![Block::canonical(e.initial().expect("init")).expect("block")];
-            let e = Mutex::new(e);
+            let e = RefFrameStep::new(&s, crate::abstraction::Level::EXACT).expect("engines");
             let mut st = ForwardState::start(init, dir, true, None, crate::abstraction::Level::EXACT, &s).expect("start");
             assert!(pos_graph_path(dir).exists(), "start must leave a graph beside f0");
             for to in 1..=4 {
@@ -1937,10 +1937,10 @@ mod tests {
         {
             let e = RefEngine::new(&s).expect("engine");
             let init = vec![Block::canonical(e.initial().expect("init")).expect("block")];
-            forward_run(&Mutex::new(e), init, fresh_dir, 6, true).expect("fresh 6");
+            forward_run(&RefFrameStep::new(&s, crate::abstraction::Level::EXACT).expect("engines"), init, fresh_dir, 6, true).expect("fresh 6");
         }
         {
-            let e = Mutex::new(RefEngine::new(&s).expect("engine"));
+            let e = RefFrameStep::new(&s, crate::abstraction::Level::EXACT).expect("engines");
             let mut st = ForwardState::resume(dir, true, crate::abstraction::Level::EXACT, &s).expect("resume").expect("a tree to resume");
             assert_eq!(st.frames, 4);
             let visited_before = st.visited_len();
@@ -1954,6 +1954,26 @@ mod tests {
         let _ = std::fs::remove_dir_all(fresh_dir);
     }
 
+    /// THE REFERENCE FORWARD'S TREE IS THE KERNELS': room (1,0) at the
+    /// exact level to f27 (~2k states past the spawn), frames, edges and
+    /// hulls alike (`storage::fingerprint`) - the reference's transfers
+    /// (its arc capture, decoded by the one decoder) are the kernels'.
+    #[test]
+    fn the_reference_forwards_tree_is_the_kernels() {
+        use crate::abstraction::Level;
+        let s = crate::settings::Settings::default();
+        let base = std::env::temp_dir().join(format!("celeste-ref-forward-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let init = || vec![Block::canonical(RefEngine::new(&s).expect("engine").initial().expect("init")).expect("block")];
+        let (k, r) = (base.join("kernels"), base.join("reference"));
+        forward_run(&crate::compiled::FrameEngine::new(&s, Level::EXACT).expect("kernels"), init(), &k, 27, true).expect("the kernels' forward");
+        forward_run(&RefFrameStep::new(&s, Level::EXACT).expect("engines"), init(), &r, 27, true).expect("the reference forward");
+        let (fk, fr) = (crate::storage::fingerprint(&k, 27, true, true, 4).expect("kernels"), crate::storage::fingerprint(&r, 27, true, true, 4).expect("reference"));
+        assert_eq!(fk, fr, "the reference forward's tree is not the kernels'");
+        assert!(fk.iter().any(|l| l.starts_with("f027 ") && !l.starts_with("f027 0 ")), "f27 holds states");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     /// Room (0,2)'s SPAWN FRAME: kernels and reference make the same
     /// successors. Guards `Graph::tile_flag_over` reading every row a span covers.
     #[test]
@@ -1961,7 +1981,7 @@ mod tests {
         use crate::abstraction::Level;
         let s = crate::settings::Settings { room: (0, 2), ..Default::default() };
         let kernels = crate::compiled::FrameEngine::new(&s, Level::EXACT).expect("kernels");
-        let reference = Mutex::new(RefEngine::new(&s).expect("ref engine"));
+        let reference = RefFrameStep::new(&s, Level::EXACT).expect("ref engines");
         // 25 frames of no input: the spawn's last frame is the 26th.
         let mut concrete = RefEngine::new(&s).expect("ref engine");
         let mut row = concrete.initial().expect("initial state");

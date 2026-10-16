@@ -15,7 +15,7 @@ use celeste_engine::runtime2::{Col, Rt2, AV};
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use super::decode::Skeletons;
-use super::route::{Chunk, Routes, UnitBundles, NO_XFER};
+use super::route::{Chunk, Routes, UnitBundles};
 use super::visited::{Key, VisitedSet};
 use crate::frame::Filters;
 use crate::search::arcs::Transfer;
@@ -186,14 +186,13 @@ impl Default for Targets {
 /// ONE BODY's emissions of a kernel slice (`compiled::asm_kernel`'s
 /// emission, column-wise): the lanes `take`, lane `i` the state `(shape,
 /// keys[i], targets.cells[i])` reached from unit lane `lanes[i]` with
-/// transfer `xfers[i]` (`None`: the engine knows none - the reference's
-/// rows - and the target is pushed the whole circle).
+/// transfer `xfers[i]`.
 pub struct BodyEmits<'e> {
     pub shape: u64,
     pub take: u16,
     pub keys: &'e [Key; 16],
     pub targets: &'e Targets,
-    pub xfers: Option<&'e [u32; 16]>,
+    pub xfers: &'e [u32; 16],
     pub lanes: &'e [usize],
 }
 
@@ -679,7 +678,7 @@ impl<'a> UnitSink<'a> {
         if let Some(&id) = self.xfer_ids.get(&t) {
             return id;
         }
-        let id = self.first_new.checked_add(self.xfer_len).filter(|&id| id < NO_XFER).unwrap_or_else(|| panic!("worker {}: {} transfers past the table's {}", self.worker, self.xfer_len, self.first_new));
+        let id = self.first_new.checked_add(self.xfer_len).unwrap_or_else(|| panic!("worker {}: {} transfers past the table's {}", self.worker, self.xfer_len, self.first_new));
         self.xfer_tab.write().expect("a transfer table").push(t);
         self.xfer_len += 1;
         self.xfer_ids.insert(t, id);
@@ -764,11 +763,10 @@ impl<'a> UnitSink<'a> {
     /// row to a buffer, when the row is looked at (a verdict, the key check,
     /// the decode guard).
     #[allow(clippy::too_many_arguments)]
-    pub fn emit(&mut self, shape: u64, cell: u32, key: Key, lane: usize, xfer: Option<u32>, init: impl Fn() -> Rt2, mut push: impl FnMut(&mut RowBuf)) -> Result<()> {
+    pub fn emit(&mut self, shape: u64, cell: u32, key: Key, lane: usize, xfer: u32, init: impl Fn() -> Rt2, mut push: impl FnMut(&mut RowBuf)) -> Result<()> {
         let mut targets = Targets::default();
         self.targets(shape, &[cell; 16], 1, &[lane], &mut targets);
-        let xfers = xfer.map(|x| [x; 16]);
-        let e = BodyEmits { shape, take: 1, keys: &[key; 16], targets: &targets, xfers: xfers.as_ref(), lanes: &[lane] };
+        let e = BodyEmits { shape, take: 1, keys: &[key; 16], targets: &targets, xfers: &[xfer; 16], lanes: &[lane] };
         self.emit_body(&e, init, |b, _| push(b))
     }
 
@@ -788,7 +786,7 @@ impl<'a> UnitSink<'a> {
             let tab = self.xfer_tab.read().expect("a transfer table");
             for i in lanes_of(take) {
                 let key = e.keys[i];
-                let x = e.xfers.map(|x| c.xfer(x[i], || pair_of(self.base, &tab, self.first_new, x[i])));
+                let x = c.xfer(e.xfers[i], || pair_of(self.base, &tab, self.first_new, e.xfers[i]));
                 c.emit(shape, t.cells[i], key, e.lanes[i] as u32, x, is_provisional(key).then(|| self.prov.content(key)));
             }
         }
@@ -846,14 +844,8 @@ impl<'a> UnitSink<'a> {
             }
         }
         // THE BUNDLES: lanes into one bundle (one source entry's cells
-        // reaching one target key alike) ORed together first. Without a
-        // transfer (the reference's rows) a bundle is its target alone.
-        let Some(xfers) = e.xfers else {
-            for i in lanes_of(take) {
-                self.bundles.insert(t.route[i], e.keys[i], 0, NO_XFER, 0, 1u64 << t.local[i]);
-            }
-            return Ok(());
-        };
+        // reaching one target key alike) ORed together first.
+        let xfers = e.xfers;
         let mut pending: Option<(u32, Key, u32, u32, u32, u64)> = None;
         for i in lanes_of(take) {
             let route = t.route[i];
@@ -887,7 +879,6 @@ impl<'a> UnitSink<'a> {
     /// transfer.
     #[inline]
     fn bundle(&mut self, route: u32, t_key: Key, s: u32, x: u32, o: u32, m: u64) {
-        debug_assert!(x != NO_XFER, "a bundle without a transfer is counted for none");
         if let Some(l) = x.checked_sub(self.first_new) {
             self.xfer_counts[l as usize] += m.count_ones() as u64;
         }
@@ -952,11 +943,12 @@ impl<'a> UnitSink<'a> {
     }
 
     /// The reference engine's emission: one materialized row from unit lane
-    /// `lane` (stored widened: `row_key`), its pos-graph edge, no transfer.
+    /// `lane` (stored widened: `row_key`) with its transfer `pair`, and its
+    /// pos-graph edge.
     /// Its shape's skeleton is the row's structure with every value cell
     /// left to the decode (`decode::Repr::Other`): a reference row's
     /// columns follow its values, not a kernel's template.
-    pub fn emit_row(&mut self, row: &Rt2, lane: usize, cell: u32) -> Result<()> {
+    pub fn emit_row(&mut self, row: &Rt2, lane: usize, cell: u32, pair: crate::search::arc_edges::Pair) -> Result<()> {
         debug_assert_eq!(row.width, 1);
         if self.edges_on {
             self.pos_edge(lane, cell);
@@ -986,8 +978,9 @@ impl<'a> UnitSink<'a> {
             b.shape_hash = w.shape_hash;
             b
         };
+        let xfer = self.xfer_id(pair);
         self.reference = true;
-        let r = self.emit(w.shape_hash, cell, key, 0, None, init, |b| b.push_row(&w, key, cell));
+        let r = self.emit(w.shape_hash, cell, key, lane, xfer, init, |b| b.push_row(&w, key, cell));
         self.reference = false;
         r
     }
@@ -1034,12 +1027,6 @@ impl<'a> UnitSink<'a> {
             let (off, tm) = (offs[b.t as usize], targets[b.t as usize].1);
             debug_assert_eq!(b.mask & !tm, 0, "a bundle's cells outside its target's");
             let at = |c: u32| (off + (tm & ((1u64 << c) - 1)).count_ones()) as usize;
-            if b.x == NO_XFER {
-                for c in super::layer::bits(b.mask) {
-                    slots[at(c)].add_hull(&Hull::full());
-                }
-                continue;
-            }
             edges.clear();
             self.by_entry(slot, b, |e, part, k| {
                 let (_, _, lanes, lane) = self.entry_next[e as usize];
@@ -1178,11 +1165,9 @@ impl<'a> UnitSink<'a> {
         self.x_rank.clear();
         let mut by_pair: Vec<(crate::search::arc_edges::Pair, u32)> = Vec::new();
         for u in buckets.iter().flat_map(|b| &b.2) {
-            if u.x != NO_XFER {
-                if let std::collections::hash_map::Entry::Vacant(v) = self.x_rank.entry(u.x) {
-                    v.insert(0);
-                    by_pair.push((pair_of(self.base, &tab, self.first_new, u.x), u.x));
-                }
+            if let std::collections::hash_map::Entry::Vacant(v) = self.x_rank.entry(u.x) {
+                v.insert(0);
+                by_pair.push((pair_of(self.base, &tab, self.first_new, u.x), u.x));
             }
         }
         drop(tab);
@@ -1207,9 +1192,6 @@ impl<'a> UnitSink<'a> {
         for (bi, b) in buckets.iter().enumerate() {
             let slot = keys[bi].1;
             for u in &b.2 {
-                if u.x == NO_XFER {
-                    continue;
-                }
                 let (t, x) = (t_rank[bi][u.t as usize], self.x_rank[&u.x]);
                 // The cells by source entry (one, mostly).
                 let mut parts: [(u32, u64); 4] = [(u32::MAX, 0); 4];

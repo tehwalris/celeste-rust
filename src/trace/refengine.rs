@@ -25,6 +25,8 @@ use crate::trace::iface;
 use crate::trace::state::State;
 use crate::trace::widen::{field, objects_of_type};
 use crate::trace::verify::run_one;
+use crate::trace::state::ArcAxis;
+use crate::search::arc_edges::{decode_axis, AxisXfer, Pair, RawAxis};
 
 /// The reference engine of arithmetic `A`: `RefEngine` is the real game's
 /// (16.16), the oracle of the kernels; `FloatRefEngine` the float tools'
@@ -249,12 +251,50 @@ impl RefEngine {
 
     /// One frame of lane `lane` at the engine's level (`at_level`): every
     /// fork leaf (the buttons, and each unknown boolean of the row, are
-    /// forked per path).
-    pub fn run_lane(&mut self, block: &Rt2, lane: usize) -> Result<Vec<Block>> {
-        let (st, unknown) = from_block(block, lane, &self.fn_info, &self.base)?;
-        let leaves = run_frame_all(&mut self.it, self.body, &st, &unknown, self.level, self.path_cap).map_err(|e| e.context(ran_from(&st, None)))?;
-        leaves.iter().map(|l| Block::canonical(to_block(l, self.settings.room)?)).collect()
+    /// forked per path), each with its remainder TRANSFER - the
+    /// interpreter's arc capture (`Interp::arc_capture`: the player's split
+    /// per axis, as the tracer captures it for the kernels) read as the
+    /// kernels' `RawAxis` and decoded by the one decoder
+    /// (`search::arc_edges::decode_axis`; a refusal is fatal, as theirs).
+    pub fn run_lane(&mut self, block: &Rt2, lane: usize) -> Result<Vec<(Block, Pair)>> {
+        let (mut st, unknown) = from_block(block, lane, &self.fn_info, &self.base)?;
+        let none = || ArcAxis { took: false, pre: Iv::from_number(P8::from_i16(0)), frag: Iv::from_number(P8::from_i16(0)), ox: Iv::from_number(P8::from_i16(0)) };
+        st.arc = Some(Box::new([none(), none()]));
+        self.it.arc_capture = true;
+        let leaves = run_frame_all(&mut self.it, self.body, &st, &unknown, self.level, self.path_cap);
+        self.it.arc_capture = false;
+        let leaves = leaves.map_err(|e| e.context(ran_from(&st, None)))?;
+        leaves
+            .iter()
+            .map(|l| {
+                let pair = transfer_of(l).map_err(|e| e.context(ran_from(&st, None)))?;
+                Ok((Block::canonical(to_block(l, self.settings.room)?)?, pair))
+            })
+            .collect()
     }
+}
+
+/// A leaf's remainder transfer: its arc capture and the player's remainder
+/// at the frame's end (before any widening: the leaf is the interpreter's),
+/// per axis the kernels' `RawAxis`, decoded.
+fn transfer_of(leaf: &State<RefDomain>) -> Result<Pair> {
+    let axes = leaf.arc.as_deref().ok_or_else(|| anyhow::anyhow!("arc capture: a leaf without one"))?;
+    let players = objects_of_type(leaf, "player");
+    ensure!(players.len() <= 1, "arc capture: {} player objects at the frame's end", players.len());
+    let raw = |v: &Iv| (v.low.as_raw_u32() as i32, v.high.as_raw_u32() as i32);
+    let axis = |k: usize| -> Result<AxisXfer> {
+        let a = &axes[k];
+        let fin = match players.first() {
+            Some(pl) => match iface::get(leaf, &field(pl, &["rem", ["x", "y"][k]])) {
+                Some(Value::Num(n)) => Some(raw(&n)),
+                other => anyhow::bail!("arc capture: the player's rem.{} is {other:?}", ["x", "y"][k]),
+            },
+            None => None,
+        };
+        let r = RawAxis { took: a.took, pre: raw(&a.pre), frag: raw(&a.frag), ox: raw(&a.ox), fin };
+        decode_axis(&r).map_err(|e| anyhow::anyhow!("the reference's transfer on axis {} ({r:?}) is refused: {e}", ["x", "y"][k]))
+    };
+    Ok((axis(0)?, axis(1)?))
 }
 
 /// A fly fruit's `spd.y` and `rem.y` (at a fruit level the ranges
@@ -402,9 +442,41 @@ fn pin_isolated_floors(st: &mut State<RefDomain>) -> Result<bool> {
     Ok(any)
 }
 
-/// The interpreter as the trusted `FrameStep`, behind a lock (the `Interp` is
-/// reused). Each fork leaf is one row, emitted with its source lane's cell.
-impl crate::frame::FrameStep for std::sync::Mutex<RefEngine> {
+/// THE REFERENCE ENGINE AS THE FORWARD'S `FrameStep` (`rewrite forward
+/// --reference`, the tests): one engine a worker (an `Interp` is not
+/// shared), every fork leaf one row with its source lane's cell and its
+/// transfer - so its tree is the kernels': frames, edges and hulls
+/// (`ckhash --edges --hulls`).
+pub struct RefFrameStep {
+    engines: Vec<std::sync::Mutex<RefEngine>>,
+    level: Level,
+    settings: std::sync::Arc<crate::settings::Settings>,
+}
+
+impl RefFrameStep {
+    /// `s.threads()` engines at `level`.
+    pub fn new(s: &crate::settings::Settings, level: Level) -> Result<Self> {
+        let engines = (0..s.threads().max(1)).map(|_| Ok(std::sync::Mutex::new(RefEngine::new(s)?.at_level(level)))).collect::<Result<_>>()?;
+        Ok(RefFrameStep { engines, level, settings: std::sync::Arc::new(s.clone()) })
+    }
+
+    /// An engine no other worker holds (there are as many as workers; a
+    /// caller past them waits on one).
+    fn engine(&self) -> std::sync::MutexGuard<'_, RefEngine> {
+        let start = {
+            use std::hash::{Hash, Hasher};
+            let mut h = rustc_hash::FxHasher::default();
+            std::thread::current().id().hash(&mut h);
+            h.finish() as usize
+        };
+        let n = self.engines.len();
+        (0..n)
+            .find_map(|i| self.engines[(start + i) % n].try_lock().ok())
+            .unwrap_or_else(|| self.engines[start % n].lock().expect("reference engine lock"))
+    }
+}
+
+impl crate::frame::FrameStep for RefFrameStep {
     fn run(
         &self,
         block: &Block,
@@ -412,21 +484,21 @@ impl crate::frame::FrameStep for std::sync::Mutex<RefEngine> {
         lanes: &[usize],
         sink: &mut crate::storage::unit::UnitSink,
     ) -> Result<()> {
-        let mut engine = self.lock().expect("reference engine lock");
+        let mut engine = self.engine();
         for &lane in lanes {
-            for b in engine.run_lane(block.rt2(), lane)? {
-                sink.emit_row(b.rt2(), lane, b.positions()?[0])?;
+            for (b, pair) in engine.run_lane(block.rt2(), lane)? {
+                sink.emit_row(b.rt2(), lane, b.positions()?[0], pair)?;
             }
         }
         Ok(())
     }
 
     fn level(&self) -> Level {
-        self.lock().expect("reference engine lock").level
+        self.level
     }
 
     fn settings(&self) -> std::sync::Arc<crate::settings::Settings> {
-        self.lock().expect("reference engine lock").settings.clone()
+        self.settings.clone()
     }
 }
 

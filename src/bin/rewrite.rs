@@ -1025,7 +1025,7 @@ fn main() -> Result<()> {
         } => {
             let t = std::time::Instant::now();
             let engine: Box<dyn FrameStep> = if reference {
-                Box::new(std::sync::Mutex::new(celeste_rust::trace::refengine::RefEngine::new(&cfg)?.at_level(level)))
+                Box::new(celeste_rust::trace::refengine::RefFrameStep::new(&cfg, level)?)
             } else {
                 Box::new(celeste_rust::compiled::FrameEngine::new(&cfg, level)?)
             };
@@ -1112,60 +1112,25 @@ fn main() -> Result<()> {
             dump_edges,
         } => {
             let dir = std::path::Path::new(&checkpoint_dir);
-            // Fingerprints over CONTENT (`exact::ContentHash`): whatever order
-            // the tree's dictionaries grew in.
-            let tree = Tree::open(dir, to)?;
-            let content = tree.space.content_hash();
+            for line in celeste_rust::storage::fingerprint(dir, to, edges, hulls, cfg.threads())? {
+                println!("{line}");
+            }
             let geo = celeste_rust::storage::GEOMETRY;
-            let mut by_cell: rustc_hash::FxHashMap<u32, usize> = Default::default();
-            for frame in 0..=to {
-                // A forward whose frontier died has no frames past the empty
-                // one: their layers are empty.
-                let (layer, _) = tree.layer(frame, None, cfg.threads())?;
-                let (n, acc) = layer.content_fingerprint(&tree.space, &tree.shapes)?;
-                if frame == to && top_cells.is_some() {
-                    for s in layer.states_iter() {
-                        *by_cell.entry(s.cell(&geo)).or_default() += 1;
-                    }
-                }
-                println!("f{frame:03} {n} {acc:016x}");
-            }
-            // The recorded edges per frame, by what they join: (shape, key,
-            // cell) of target and source, and the transfer - not its id in
-            // the table. A state by what it is
-            // (`ContentHash::state`: `mix64(key hash ^ cell << 1)`).
-            if edges {
+            if let Some(frame) = dump_edges {
+                let tree = Tree::open(dir, to)?;
+                let content = tree.space.content_hash();
                 let eg = celeste_rust::storage::edges::EdgeStore::open(&dir.join("edges"), to)?;
-                // STREAMED: one frame at a time, its blocks on every thread
-                // (each key hashed once a block, each pair once).
-                let hashes = celeste_rust::storage::bench::EdgeHashes::new(eg.pairs());
-                let shapes = &tree.shapes;
-                for frame in 1..=to {
-                    let (n, acc) = hashes.frame(&eg, frame, &content, shapes, cfg.threads())?;
-                    println!("e{frame:03} {n} {acc:016x}");
-                    if dump_edges == Some(frame) {
-                        let node = |s: Sk| content.state(shapes[s.shape(&geo) as usize], s.key, s.cell(&geo));
-                        for e in eg.edges_at(frame, cfg.threads())? {
-                            eprintln!("edge {:016x} {:016x} {:?}", node(e.dst), node(e.src), eg.pair(e.xfer));
-                        }
-                    }
-                }
-            }
-            // The frontier per frame: each state whose hull grew, with its
-            // layer and hull.
-            if hulls {
-                for frame in 0..=to {
-                    // A forward whose frontier died has no frames past it.
-                    if !celeste_rust::storage::layer::frame_exists(dir, frame) {
-                        break;
-                    }
-                    let hf = celeste_rust::storage::hulls::read(&celeste_rust::storage::hulls::path(dir, frame), cfg.threads())?;
-                    let (new, _) = tree.layer(frame, None, cfg.threads())?;
-                    let (n, acc) = celeste_rust::storage::hulls::fingerprint(hf.states(&new)?.into_iter(), &tree.space, &tree.shapes)?;
-                    println!("h{frame:03} {n} {acc:016x}");
+                let node = |s: Sk| content.state(tree.shapes[s.shape(&geo) as usize], s.key, s.cell(&geo));
+                for e in eg.edges_at(frame, cfg.threads())? {
+                    eprintln!("edge {:016x} {:016x} {:?}", node(e.dst), node(e.src), eg.pair(e.xfer));
                 }
             }
             if let Some(top) = top_cells {
+                let tree = Tree::open(dir, to)?;
+                let mut by_cell: rustc_hash::FxHashMap<u32, usize> = Default::default();
+                for s in tree.layer(to, None, cfg.threads())?.0.states_iter() {
+                    *by_cell.entry(s.cell(&geo)).or_default() += 1;
+                }
                 let mut v: Vec<(u32, usize)> = by_cell.into_iter().collect();
                 v.sort_by_key(|&(c, n)| (std::cmp::Reverse(n), c));
                 for (c, n) in v.into_iter().take(top) {
@@ -1806,7 +1771,7 @@ fn main() -> Result<()> {
                     }
                     other => other?,
                 };
-                for leaf in leaves {
+                for (leaf, _) in leaves {
                     agree(reference, leaf.rt2())?;
                     rset.extend(project_onto(&mut leaf.into_rt2(), level));
                 }
