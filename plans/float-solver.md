@@ -1061,19 +1061,67 @@ the float/fixed ratio peaks and then falls; it does not run away.
 - 66 min to f46 on 32 threads (the ladder ran beside part of it), peak
   12.6 GB.
 
-### Next
+### Milestone 5: float kernels (the plan)
 
-Milestone 5: float kernels. The reference engine is the whole of a float
-search's time: (1,0) to f44 takes 45 min against seconds. Real rooms
-(exits at f70-f160) need the kernels. Not covered in float yet:
+The reference engine is the whole of a float search's time: (1,0) to f44
+takes 45 min against seconds. Real rooms (exits at f70-f160) need the
+kernels. The pipeline is generic over the arithmetic, as the storage and
+the arcs already are. Fixed stays byte-identical (kernel metrics included)
+at every step. The steps, each a milestone with its own report:
 
-- the level flags (`h`, `n`, `f`, `p`): the reference engine's
-  `step_at` and its pins are 16.16's;
+1. **The graph IR and the tracer, generic.**
+   - `Graph<A>`, `Op<A>` (literals as `Arithmetic::Lit`: 16.16's raw `i32`,
+     a double's bits), `Val<A>`.
+   - The arithmetic's own rules sit behind one trait, whose 16.16 impl is
+     the current code moved verbatim: the literal folds, the evaluator's
+     interval semantics, the fork grids, the static ranges (`pieces_of`).
+   - Float folds only what is bit-identical. `+` commutes. `min`/`max`
+     do not: LuaJIT returns the second argument on a tie, which tells
+     `-0` from `+0`. No algebraic identity that rounds: `(x - r) + r`,
+     `x + 0`.
+   - Float's own errors: a result that is not finite (`NoWrap` reads
+     "representable"). `__split_by_round` is its own fork, at the exact cut
+     points (`LuaF64Interval::round_cut`).
+   - The check: the float trace of a frame, evaluated per lane, equals the
+     float reference engine on a sweep of states and every input (the
+     float twin of `a_traced_frame_agrees_with_the_oracle`).
+2. **The float codegen.** Eight `f64` lanes a zmm.
+   - Every operation in the cart's evaluation order, and nothing else:
+     - IEEE `vaddpd`/`vsubpd`/`vmulpd`/`vdivpd`;
+     - `flr` as `vrndscalepd` round-down (exact);
+     - `%` as LuaJIT's `a - flr(a/b)*b`, three separate rounded ops;
+     - `min`/`max` as compare-and-blend with LuaJIT's tie rule, never
+       `vminpd`;
+     - `abs`/`neg` on the sign bit.
+   - No FMA: the generated text is checked to hold no fused mnemonic, and
+     gcc only assembles it. Contraction is impossible, not just off.
+   - `sin` is a per-lane call-out to the reference's own `LuaF64::lua_sin`
+     (glibc's `sin`), or specialized away where its argument is a constant
+     per lane.
+   - MXCSR is checked at every float kernel call: round-to-nearest, FTZ
+     and DAZ off.
+   - Per operation bit-exact tests against `LuaF64`, `-0`, ties and
+     subnormals included.
+3. **The float kernels in the forward.** The registry, the dispatch and the
+   emission take the arithmetic.
+   - Checks: the float `ref-check` (lane by lane against the float
+     reference engine), `--key-check`, `kernel lanes: missed 0`, and the
+     float `arc-check` on kernel-built trees.
+   - The float trees the kernels build must equal the reference engine's
+     byte for byte (`ckhash --edges --hulls`) on (1,0) to f44 and (1,3) to
+     f40.
+4. **Pins**: float gates beside the fixed ones.
+
+Not covered in float yet:
+
+- the level flags (`h`, `n`, `f`, `p`): the reference engine's `step_at`
+  and its pins are 16.16's;
 - level -1;
 - the objects ladder;
 - the UI's marks.
 
-The UCT goldens stay the secondary report.
+The kernels start at `r0sx`, as the float searches do. The UCT goldens
+stay the secondary report.
 
 **What a committed golden may be.** Community database files, and our
 routes that are already submitted. Philippe's rule is that our unsubmitted
