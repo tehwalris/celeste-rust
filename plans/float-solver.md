@@ -685,7 +685,12 @@ tests, my own fixture and scratch dirs) and small commits.
 - **Q3**: bit-exact on this machine's glibc (2.42) is the definition.
   Every float or dual witness also gets a robustness report (a correctly
   rounded `sin`, and ±1 ulp on every `sin` call); a witness that fails it
-  is flagged loudly, not rejected.
+  is flagged loudly, not rejected. AS BUILT (`rewrite robust`, milestone
+  6): glibc's `sin`, every call one ulp up, every call one ulp down, and 8
+  runs moving each call by -1, 0 or +1 ulp at random. No correctly rounded
+  `sin` is built: it lies within an ulp of glibc's, which the random runs
+  sample but do not cover. Run so far only on the four witnesses of the
+  validation table (milestone 6), not on the earlier float witnesses.
 - **Q4**: ONE cart form for both arithmetics, the original's expressions
   (below). Fixed unchanged, shown (commit `e764d83c`).
 - **Q5**: the compile-time parameter (`celeste_core::arith::Arithmetic`,
@@ -1449,8 +1454,12 @@ one is valid in every tool); 2600m's float optimum is the community's 123
 (proven: float bound 149 at `r0sxh`) and its dual optimum is the fixed
 optimum, 125; nodiag 1800m's dual optimum is the 85 already uploaded.
 Every float half's known route (Celia's tasdatabase run, where it exits by
-the horizon) survived every pruning step. `rewrite robust`: every dual
-witness and the float 123 are ROBUST (glibc's `sin`, every call one ulp
-up, one ulp down, and 8 random runs: the same exit frame). The witnesses
+the horizon) survived every pruning step. `rewrite robust` ran on four
+files: the 2500m dual witness (141), the 1800m dual witness (113; the J4
+run's, the same inputs as J3's), and the 2600m dual (151) and float-only
+(149) witnesses with their prologue zeroed (the upload form, which exits
+on the same frames in both engines). Each is ROBUST: glibc's `sin`, every
+call one ulp up, one ulp down, and 8 random runs give the same exit frame.
+Nothing else was run through it. The witnesses
 are unsubmitted routes: under /var/tmp/float-check/m6/val, never
 committed.
