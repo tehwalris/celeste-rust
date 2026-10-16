@@ -67,7 +67,3 @@ debug = 1
 # lives here.
 [profile.release.package.celeste-engine]
 debug = false
-
-[[bin]]
-name = "transpile"
-path = "src/bin/transpile.rs"

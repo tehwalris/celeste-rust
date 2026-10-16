@@ -34,7 +34,6 @@ pub mod lower;
 pub mod split;
 pub mod walk;
 pub mod interp;
-pub mod level_minus_one;
 pub mod shapes;
 #[cfg(test)]
 mod probe;

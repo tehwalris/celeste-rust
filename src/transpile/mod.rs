@@ -3,8 +3,7 @@
 //! `graph` is the value graph the tracer (`src/trace`) builds, `bdd` and
 //! `ival` decide its boolean and interval layers, `lower` specializes it
 //! into the fused fork-free frame, `kernel` holds the lowering's inputs and
-//! outputs, and `asm` assembles the result into AVX-512 kernels. The
-//! analysis CLI is `src/bin/transpile.rs`.
+//! outputs, and `asm` assembles the result into AVX-512 kernels.
 
 pub mod bdd;
 pub mod garith;

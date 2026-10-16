@@ -3,18 +3,18 @@
 A sound LOWER BOUND `d` on the frames to the exit from every (heap shape,
 player cell), built from the same traced frames the kernels come from, used
 as a FILTER on the forward under a horizon H: a push into a cell at frame
-t is dropped when `t + d > H`. Code: `src/trace/level_minus_one.rs`,
-`frame::TreeFilter`, `UnitSink`'s level -1 drop.
+t is dropped when `t + d > H`. Code: `src/search/level_minus_one.rs` (its
+one builder, `table`), `frame::TreeFilter`, `UnitSink`'s level -1 drop.
 
 ```bash
 # as a filter inside a search (H the horizon, S the speed bound in px/frame)
 ./safe-run.sh -- ./target/release/rewrite search --room 2,0 --ceiling 95 --level-minus-one 95,5
 # the table alone, with its fingerprint (cached in /var/tmp/celeste-l1-cache)
-./safe-run.sh -- ./target/quick/transpile --room 2,0 --level-minus-one-table 5
+./safe-run.sh -- ./target/quick/rewrite l1 table --room 2,0 --spd 5
 # as a probe: the table against a tree's recorded transitions
-./safe-run.sh -- ./target/quick/transpile --room 2,0 --probe S LEVEL_DIR CEILING FROM TO [MARKS]
+./safe-run.sh -- ./target/quick/rewrite l1 probe --room 2,0 --spd S --level-dir DIR --ceiling H --from F --to T [--marks MARKS]
 # a known solution against the table (fails if a state of it is too late)
-./safe-run.sh -- ./target/quick/rewrite l1-check --room X,Y --inputs tas/FILE --horizon EXIT
+./safe-run.sh -- ./target/quick/rewrite l1 check --room X,Y --inputs tas/FILE --horizon EXIT
 ```
 
 It replaced the time band (`CELESTE_BAND`, 8 px a frame), a measurement,
@@ -72,7 +72,7 @@ The table is horizon-independent: one per room and settings.
   (463,567 pairs and 162 exit crossings at S = 5 and 6), (1,0) (383,247),
   (0,2) (288,366).
 - Marked states too late: 0 (room (2,0) h95, 19.2M; room (1,0) f50-f99).
-- `l1-check` of known solutions, 0 too late: (1,0) 99, (5,0) 77, (2,3) 106,
+- `l1 check` of known solutions, 0 too late: (1,0) 99, (5,0) 77, (2,3) 106,
   (6,2) 75, (3,0) 89, (6,2) nodiag 80, (6,2) gemskip 120; in float, 94
   Celia goldens (8,054 states).
 

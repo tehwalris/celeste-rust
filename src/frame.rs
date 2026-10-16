@@ -389,45 +389,16 @@ pub struct MinusOne {
 
 impl MinusOne {
     /// The start room's table at this speed bound, under settings `s`
-    /// (`minus_one_table`).
-    pub fn table(&self, s: &crate::settings::Settings) -> &'static crate::trace::level_minus_one::CostToGo {
-        minus_one_table(self.speed, s).unwrap_or_else(|e| panic!("building the level -1 table: {e:#}"))
+    /// (`search::level_minus_one::table`).
+    pub fn table(&self, s: &crate::settings::Settings) -> &'static crate::search::level_minus_one::CostToGo {
+        self.try_table(s).unwrap_or_else(|e| panic!("building the level -1 table: {e:#}"))
     }
 
     /// The same, an error where the table cannot be built (the search
     /// records the refusal before anything else needs the table).
-    pub fn try_table(&self, s: &crate::settings::Settings) -> Result<&'static crate::trace::level_minus_one::CostToGo> {
-        minus_one_table(self.speed, s)
+    pub fn try_table(&self, s: &crate::settings::Settings) -> Result<&'static crate::search::level_minus_one::CostToGo> {
+        crate::search::level_minus_one::table(self.speed, s)
     }
-}
-
-/// The level -1 table at speed bound `speed` under settings `s`, built (or
-/// read from its cache file) once per process and KEY (what the table is a
-/// function of: `Settings::cart_key`, the pinned file, the speed), on a
-/// thread with the tracer's stack. Leaked: a process holds one or two.
-fn minus_one_table(speed: i32, s: &crate::settings::Settings) -> Result<&'static crate::trace::level_minus_one::CostToGo> {
-    type Key = (String, Option<std::path::PathBuf>, i32);
-    static TABLES: std::sync::Mutex<Vec<(Key, &'static crate::trace::level_minus_one::CostToGo)>> = std::sync::Mutex::new(Vec::new());
-    let key: Key = (s.cart_key(), s.l1_table.clone(), speed);
-    let mut tables = TABLES.lock().unwrap();
-    if let Some((_, t)) = tables.iter().find(|(k, _)| *k == key) {
-        return Ok(t);
-    }
-    // The table measures the EXIT: unsound for a position win.
-    anyhow::ensure!(win_rect(s).is_none(), "--level-minus-one: the table measures the room exit; this room's win is a position");
-    let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
-    let t = std::time::Instant::now();
-    let owned = s.clone();
-    let table = std::thread::Builder::new()
-        .stack_size(256 * 1024 * 1024)
-        .spawn(move || crate::trace::level_minus_one::cost_to_go(std::path::Path::new("."), speed, threads, &owned))
-        .expect("spawn the level -1 builder")
-        .join()
-        .map_err(|p| anyhow::anyhow!("the level -1 builder panicked: {}", p.downcast_ref::<String>().map(String::as_str).or_else(|| p.downcast_ref::<&str>().copied()).unwrap_or("?")))??;
-    eprintln!("[level -1] table ready in {:.1} s (S = {speed}): the start state's d = {}", t.elapsed().as_secs_f64(), table.start_d);
-    let table: &'static _ = Box::leak(Box::new(table));
-    tables.push((key, table));
-    Ok(table)
 }
 
 /// What a forward's flush filters by.

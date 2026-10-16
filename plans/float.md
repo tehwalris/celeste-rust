@@ -49,7 +49,7 @@ speed 0 inside a solid; a `-0` remainder the original turns `+0`), no
 golden meets it. The balloons: a float tree holds a balloon's phase as the
 `rnd` interval unless `--balloon-seeds` fixes it; the tools' seeds (every
 seed 0 without a list) are the CONCRETE runs' (`Settings::concrete`: the
-concrete and dual searches, the known-route check, `l1-check`, replays),
+concrete and dual searches, the known-route check, `l1 check`, replays),
 keyed through `arc_dp::lookup_view`, as fixed does under
 `--concrete-balloon-seeds`.
 
@@ -208,7 +208,7 @@ tool file starts on the player's first frame.
 
 - The kernel mix census (`--metrics`) is 16.16's: no float metrics pins.
 - Level -1 tables do not build for the platform rooms (6,0), (2,1), (1,2),
-  in fixed either; `l1-check` ran over the 94 Celia goldens outside them,
+  in fixed either; `l1 check` ran over the 94 Celia goldens outside them,
   and over one UCT golden only.
 - At `n`, `check ref` and `check arcs` skip most rows over the path cap (the
   reference forks a widened object per path), in both arithmetics; object

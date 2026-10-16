@@ -262,7 +262,7 @@ impl Settings {
     }
 
     /// The settings a CONCRETE run uses (the concrete searches, the known
-    /// route's check, `l1-check`, the dual witness's replay): the balloons'
+    /// route's check, `l1 check`, the dual witness's replay): the balloons'
     /// phases fixed - `--concrete-balloon-seeds`, else `--balloon-seeds`,
     /// else, for a float tool (which always seeds), every seed 0 - and
     /// whether a concrete state keys through `arc_dp::lookup_view` (its

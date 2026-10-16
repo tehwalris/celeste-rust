@@ -49,12 +49,13 @@ celeste-rust (src/)
                         rem_f64), arc_edges, arc_dp (the backward, reach,
                         optimum, concrete search), dual, known, arc_check,
                         reach, hull_replay, tree (a finished tree opened),
-                        pos_graph, result, ui_export, inspect, checkpoint
+                        pos_graph, result, ui_export, inspect, checkpoint,
+                        level_minus_one (the cost-to-go table, its one builder)
   trace/                the tracer: interp, state, heap, domain (Symbolic) and
                         refdomain (RefDomain), frame (one frame traced), split
                         (the split pass), widen, error, walk (the lattice
                         walk), lower, bind, block (states <-> blocks), cart;
-                        level_minus_one; oracle and probe (test-only)
+                        oracle and probe (test-only)
   engines/              the reference engine (`reference`: the interpreter
                         over RefDomain as a frame step)
   transpile/            graph IR, garith, ival, bdd, lowering, asm (codegen,
@@ -65,8 +66,8 @@ celeste-rust (src/)
   par.rs, metrics.rs, concrete.rs, game_runner.rs
   bin/rewrite/          the search and its commands (main), the checks of a
                         tree (check), benches (bench), diagnostics (diag),
-                        one concrete run (run), level -1 (l1)
-  bin/transpile.rs      the level -1 table
+                        one concrete run (run), level -1 (l1: table, probe,
+                        check)
 ```
 
 The traced program is `lua/builtin_level_3.lua` + `lua/builtin_level_4.lua`
