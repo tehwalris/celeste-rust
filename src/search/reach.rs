@@ -329,7 +329,7 @@ mod tests {
             let (shape, keys, cells) = crate::frame::widened_keys(&row, level, &tree.space).expect("keys");
             let si = tree.shapes.iter().position(|&h| h == shape).expect("a tree shape") as u32;
             let sk = crate::storage::Sk::at(&geo, si, keys[0].expect("a tree key"), cells[0]);
-            let q = super::super::arc_dp::rem_of(row.rt2()).expect("rem");
+            let q = super::super::concrete::rem_of(row.rt2()).expect("rem");
             let hit = sets[t].iter().find(|c| c.0 == sk).map(|c| c.1.contains(q.0, q.1));
             assert_eq!(hit, Some(true), "f{t}: the known route's state is not reached with its exact remainder");
         }

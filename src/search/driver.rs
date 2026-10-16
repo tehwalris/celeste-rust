@@ -13,7 +13,8 @@ use anyhow::Result;
 use celeste_core::lua_f64::LuaF64;
 use celeste_core::pico8_num::Pico8Num as P8;
 
-use super::arc_dp::{solve, Solved, Witness};
+use super::arc_dp::{solve, Solved};
+use super::concrete::Witness;
 use super::result::{DualResult, LevelResult, SearchResult, Verdict};
 use crate::abstraction::Level;
 use crate::compiled::KernelLanes;
@@ -343,7 +344,7 @@ mod tests {
     #[test]
     #[ignore = "slow, ./check.sh t2 runs it: room (1,0)'s kernels in both arithmetics, three searches at two thread counts, ~60 CPU-s"]
     fn the_breadth_first_searches_are_pinned() {
-        super::super::arc_dp::NO_DFS.store(true, std::sync::atomic::Ordering::Relaxed);
+        super::super::concrete::NO_DFS.store(true, std::sync::atomic::Ordering::Relaxed);
         let base = std::env::temp_dir().join(format!("celeste-bfs-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
         let mut runs: Vec<String> = Vec::new();

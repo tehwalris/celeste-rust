@@ -6,7 +6,8 @@
 //!   * `rem`         - the remainder model of an arithmetic: hulls and transfers
 //!                     (`rem_f64`: the doubles')
 //!   * `driver`      - THE SEARCH's driver: its levels, the outcome (`run`)
-//!   * `arc_dp`      - the arc phase: winning sets, optimum, reach, concrete search
+//!   * `arc_dp`      - the arc phase: winning sets, optimum, reach
+//!   * `concrete`    - the concrete search, for one engine or a pair (`dual`)
 //!   * `dual`        - the dual search: a run valid in both arithmetics
 //!   * `known`       - a known solution checked against every pruning step
 //!   * `checkpoint`  - the tree's format version and small files (marks, pos graph)
@@ -24,6 +25,7 @@ pub mod arc_dp;
 pub mod arc_edges;
 pub mod arcs;
 pub mod checkpoint;
+pub mod concrete;
 pub mod driver;
 pub mod dual;
 pub mod hull;
