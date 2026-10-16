@@ -68,6 +68,40 @@ pub struct OutBundle {
     pub mask: u64,
 }
 
+/// An entry's bundles, decoded as they are read (`Block::entries`). A
+/// named type, not a `dyn Iterator`: the re-push's loop over them is
+/// statically dispatched whatever the inliner decides (a trait object here
+/// cost the release build 0.6-0.75% of a frame's instructions once an
+/// unrelated edit stopped LLVM devirtualizing it, 2026-10-16).
+pub struct OutBundles<'a> {
+    eb: &'a [u8],
+    q: usize,
+    t: u32,
+    left: usize,
+}
+
+impl Iterator for OutBundles<'_> {
+    type Item = OutBundle;
+
+    #[inline]
+    fn next(&mut self) -> Option<OutBundle> {
+        if self.left == 0 {
+            return None;
+        }
+        self.left -= 1;
+        self.t += get_varint(self.eb, &mut self.q) as u32;
+        let x = get_varint(self.eb, &mut self.q) as u32;
+        let o = super::bundle::get_off(self.eb, &mut self.q);
+        let mask = u64::from_le_bytes(self.eb[self.q..self.q + 8].try_into().unwrap());
+        self.q += 8;
+        Some(OutBundle { t: self.t, x, o, mask })
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (self.left, Some(self.left))
+    }
+}
+
 /// A block's content by index (what `encode_parts` writes): its routes,
 /// pairs, targets `(route, key)` and entries `(region, key)`, each sorted
 /// and distinct, and its rows `(entry, target, pair, offset) -> cells`
@@ -367,7 +401,7 @@ impl<'a, N: Rem> Block<'a, N> {
 
     /// Every entry `(region, key)` in order: `want(region, key)` says
     /// whether its bundles are read (`f(region, key, bundles)`) or skipped.
-    pub fn entries(&self, mut want: impl FnMut(u32, Key) -> bool, mut f: impl FnMut(u32, Key, &mut dyn Iterator<Item = OutBundle>)) -> Result<()> {
+    pub fn entries(&self, mut want: impl FnMut(u32, Key) -> bool, mut f: impl FnMut(u32, Key, &mut OutBundles<'_>)) -> Result<()> {
         let b = self.body;
         let mut pos = 0usize;
         let (mut region, mut key) = (0u32, 0u128);
@@ -391,17 +425,8 @@ impl<'a, N: Rem> Block<'a, N> {
             }
             let eb = &b[start..end];
             let mut q = 0usize;
-            let n = get_varint(eb, &mut q) as usize;
-            let mut t = 0u32;
-            let mut it = (0..n).map(|_| {
-                t += get_varint(eb, &mut q) as u32;
-                let x = get_varint(eb, &mut q) as u32;
-                let o = super::bundle::get_off(eb, &mut q);
-                let mask = u64::from_le_bytes(eb[q..q + 8].try_into().unwrap());
-                q += 8;
-                OutBundle { t, x, o, mask }
-            });
-            f(region, narrow(key), &mut it);
+            let left = get_varint(eb, &mut q) as usize;
+            f(region, narrow(key), &mut OutBundles { eb, q, t: 0, left });
             // The bundles not read are skipped with the entry.
         }
         ensure!(pos == b.len(), "an out block did not decode to its end ({pos} of {} bytes)", b.len());
