@@ -567,12 +567,6 @@ impl<N: EngineNum> Tree<N> {
         Ok(Tree { dir: dir.to_path_buf(), last, frames, shapes: shapes.into_iter().map(|s| s.1).collect(), space })
     }
 
-    /// The tree in `dir` through its last frame (`last_frame`).
-    pub fn open_all(dir: &Path) -> Result<Tree<N>> {
-        let last = last_frame(dir).ok_or_else(|| anyhow!("{}: no frames", dir.display()))?;
-        Tree::open(dir, last)
-    }
-
     /// Frame `f`'s states, skeletons in a search from `room` if given, and
     /// its wins.
     pub fn layer(&self, f: u32, room: Option<(i16, i16)>, threads: usize) -> Result<(Layer<N>, Vec<Sk>)> {

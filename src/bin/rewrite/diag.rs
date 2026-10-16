@@ -1,14 +1,13 @@
 //! THE DIAGNOSTICS of a finished tree and of concrete runs: a tree's
-//! fingerprints (`ckhash`), its states counted (`census`) and walked back
-//! (`spurious`), a concrete route that follows given positions
-//! (`trajectory`), a float witness against the host libm (`robust`).
+//! fingerprints (`ckhash`) and its states counted (`census`), a concrete
+//! route that follows given positions (`trajectory`), a float witness
+//! against the host libm (`robust`).
 
 use anyhow::Result;
 use celeste_engine::runtime2::{Rt2, P8};
 use celeste_core::lua_f64::LuaF64;
-use celeste_rust::abstraction::Level;
-use celeste_rust::frame::{widen_rt2_to, widened_keys, wins_of};
-use celeste_rust::search::inspect::{cell_names, player_summary, project_row, Proj};
+use celeste_rust::frame::wins_of;
+use celeste_rust::search::inspect::cell_names;
 use celeste_rust::search::tree::TreeDir;
 use celeste_rust::settings::{Arith, Settings};
 use celeste_rust::storage::layer::Tree;
@@ -16,7 +15,7 @@ use celeste_rust::storage::Sk;
 use celeste_rust::trace::refengine::RefEngine;
 use std::path::PathBuf;
 
-use crate::{cell_at, prefixes, where_, Rows};
+use crate::{prefixes, where_, Rows};
 
 /// `ckhash`'s arguments.
 #[derive(clap::Args)]
@@ -71,56 +70,15 @@ pub struct CensusArgs {
     cells: Option<usize>,
 }
 
-/// `spurious`'s arguments.
-#[derive(clap::Args)]
-pub struct SpuriousArgs {
-    /// The (coarse) tree whose states are walked back.
-    #[arg(long)]
-    tree: PathBuf,
-    /// A finer level's tree (the real states the coarse ones should project
-    /// from).
-    #[arg(long)]
-    real: Option<PathBuf>,
-    /// The step at which the sampled states were first reached.
-    #[arg(long)]
-    step: u32,
-    /// The player cell `x,y`, or a rect `x0,x1,y0,y1` of cells (inclusive).
-    #[arg(long)]
-    cell: String,
-    /// Named-cell prefixes left out of what changed, comma-separated.
-    #[arg(long, default_value = "fall_floor")]
-    erase: String,
-    /// States sampled.
-    #[arg(long, default_value_t = 8)]
-    samples: usize,
-    /// Steps walked back per sample.
-    #[arg(long, default_value_t = 40)]
-    depth: u32,
-    /// Write sample 0's chain, frame 1 to `step`, as a keyed trajectory
-    /// (`trajectory --trajectory FILE --spec LEVEL --tree TREE` realizes
-    /// it: the keys are the tree's). Not with `--real`.
-    #[arg(long)]
-    chain_out: Option<String>,
-}
-
 /// `trajectory`'s arguments.
 #[derive(clap::Args)]
 pub struct TrajectoryArgs {
-    /// One line per frame: `x,y`, `-`, or `x,y K0 K1` - a position AND
-    /// the row key (hex) its state must have projected onto `--spec`: an
-    /// abstract chain to realize (`spurious --chain-out` writes one).
+    /// One line per frame: `x,y`, or `-` (any).
     #[arg(long)]
     trajectory: String,
     /// Stop once a win is reached (default), else follow to the end.
     #[arg(long, default_value_t = true)]
     stop_at_win: bool,
-    /// The level the keyed lines are projections onto (e.g. `r0sxhn`).
-    #[arg(long, value_parser = Level::parse)]
-    spec: Option<Level>,
-    /// The tree whose key space the keyed lines' keys are in (exact keys are
-    /// a tree's dictionaries' indices).
-    #[arg(long)]
-    tree: Option<PathBuf>,
 }
 
 /// `robust`'s arguments.
@@ -336,218 +294,21 @@ pub fn census(run: &Settings, a: CensusArgs) -> Result<()> {
     Ok(())
 }
 
-/// The predecessors of state `s`, first reached at `layer`, recorded at
-/// that frame (states of layer `layer - 1`).
-fn preds_of(edges: &celeste_rust::storage::edges::EdgeStore, s: Sk, layer: u32) -> Result<Vec<Sk>> {
-    Ok(edges.preds_at(s, layer)?.into_iter().map(|(p, _)| p).collect())
-}
-
-/// `spurious`.
-pub fn spurious(run: &Settings, a: SpuriousArgs) -> Result<()> {
-    use std::collections::{BTreeMap, HashMap};
-    type Dist = BTreeMap<String, BTreeMap<String, u64>>;
-    let ids = celeste_rust::compiled::ids();
-    let t = TreeDir::open(&a.tree, run)?;
-    anyhow::ensure!(!t.float(), "spurious: a 16.16 tree only so far");
-    let (cfg, coarse) = (&t.settings, t.dir.as_path());
-    let real = a.real.as_deref();
-    let SpuriousArgs { step, cell, erase, samples, depth, chain_out, .. } = a;
-    anyhow::ensure!(real.is_none() || chain_out.is_none(), "--chain-out writes a whole chain: not with --real");
-    let coarse_tree = Tree::open_all(coarse)?;
-    let real_tree = real.map(Tree::open_all).transpose()?;
-    let erase = prefixes(&erase);
-    let v: Vec<i32> = cell.split(',').map(|t| t.trim().parse()).collect::<std::result::Result<_, _>>()?;
-    let (x0, x1, y0, y1) = match v[..] {
-        [x, y] => (x, x, y, y),
-        [x0, x1, y0, y1] => (x0, x1, y0, y1),
-        _ => anyhow::bail!("--cell x,y or x0,x1,y0,y1"),
-    };
-    let wants: Vec<u32> = (x0..=x1).flat_map(|x| (y0..=y1).map(move |y| (x, y))).map(cell_at).collect::<Result<_>>()?;
-    let project = |rt2: &Rt2, r: u32| project_row(rt2, &cell_names(rt2, ids), r, &erase);
-    let tally = |d: &mut Dist, p: &Proj| {
-        for (n, v) in p {
-            *d.entry(n.clone()).or_default().entry(v.clone()).or_default() += 1;
-        }
-    };
-    // The real tree's projections per cell with their first step.
-    // Projections compared EXACTLY (the projection itself as the key).
-    let mut real_cells: HashMap<u32, HashMap<Proj, u32>> = Default::default();
-    let mut real_vals = Dist::new();
-    let geo = celeste_rust::storage::GEOMETRY;
-    let mut real_of = |c: u32, vals: Option<&mut Dist>| -> Result<HashMap<Proj, u32>> {
-        if let Some(m) = real_cells.get(&c) {
-            return Ok(m.clone());
-        }
-        let (Some(real_tree), mut vals) = (real_tree.as_ref(), vals) else { return Ok(HashMap::new()) };
-        let mut m: HashMap<Proj, u32> = Default::default();
-        for s in 0..=step {
-            for (_, rt2) in real_tree.rows(s, cfg.room, 1 << 20, &|x| x.cell(&geo) == c, 1)? {
-                for r in 0..rt2.width {
-                    let p = project(&rt2, r as u32);
-                    if let (Some(vals), true) = (vals.as_deref_mut(), s == step) {
-                        tally(vals, &p);
-                    }
-                    m.entry(p).or_insert(s);
-                }
-            }
-        }
-        real_cells.insert(c, m.clone());
-        Ok(m)
-    };
-    // The samples: the coarse tree's new states at `step` in the cells.
-    let (mut total, mut sp_vals, mut co_vals) = (0u64, Dist::new(), Dist::new());
-    let mut chosen: Vec<Sk> = Vec::new();
-    for &want in &wants {
-        let here_real = real_of(want, Some(&mut real_vals))?;
-        for (sks, rt2) in coarse_tree.rows(step, cfg.room, 1 << 20, &|x| x.cell(&geo) == want, 1)? {
-            for r in 0..rt2.width {
-                total += 1;
-                let p = project(&rt2, r as u32);
-                let is_real = real.is_some() && here_real.get(&p).is_some_and(|&s| s <= step);
-                tally(if is_real { &mut co_vals } else { &mut sp_vals }, &p);
-                if !is_real {
-                    chosen.push(sks[r]);
-                }
-            }
-        }
-    }
-    if real.is_none() {
-        println!("[spurious] {total} states first reached at f{step:03} in x {x0}..={x1}, y {y0}..={y1}");
-    } else {
-        println!("[spurious] x {x0}..={x1}, y {y0}..={y1}, step {step}: coarse {total} new states, {} spurious (projection never reached by the real tree)", chosen.len());
-        // Per-field distributions: real, coarse-and-real, spurious.
-        let fmt_dist = |m: Option<&BTreeMap<String, u64>>| -> String {
-            let Some(m) = m else { return "-".into() };
-            let mut v: Vec<(&String, &u64)> = m.iter().collect();
-            v.sort_by(|a, b| b.1.cmp(a.1));
-            let top: Vec<String> = v.iter().take(8).map(|(k, c)| format!("{k}:{c}")).collect();
-            format!("{} values; {}", v.len(), top.join(" "))
-        };
-        let mut fields: Vec<&String> = sp_vals.keys().chain(real_vals.keys()).collect();
-        fields.sort();
-        fields.dedup();
-        for nm in fields {
-            let distinct = |m: &Dist| m.get(nm).map_or(0, |x| x.len());
-            if distinct(&sp_vals).max(distinct(&real_vals)).max(distinct(&co_vals)) <= 1 {
-                continue;
-            }
-            println!("  {nm}\n    real     {}\n    coarse-ok {}\n    spurious {}", fmt_dist(real_vals.get(nm)), fmt_dist(co_vals.get(nm)), fmt_dist(sp_vals.get(nm)));
-        }
-    }
-    // Walk the samples back.
-    let edges = celeste_rust::storage::edges::EdgeStore::<P8>::open(&coarse.join("edges"), step)?;
-    let n = samples.min(chosen.len());
-    for k in 0..n {
-        let (mut id, mut layer) = (chosen[k * chosen.len() / n], step);
-        let rt2 = coarse_tree.row(layer, id, cfg.room)?;
-        let (shape, _, c) = coarse_tree.state(id)?;
-        let mut cur = project(&rt2, 0);
-        println!("\n[spurious] sample {k}: f{layer} {} shape {shape:016x} {}", id.show(), where_(c));
-        if real.is_none() {
-            for (name, v) in &cur {
-                println!("    {name} = {v}");
-            }
-        }
-        // (frame, cell, key) along the chain, for `--chain-out`.
-        let mut chain: Vec<(u32, u32, (u64, u64))> = vec![(layer, c, rt2.row_keys[0])];
-        let mut found = false;
-        for _ in 0..depth {
-            if layer == 0 {
-                break;
-            }
-            let preds = preds_of(&edges, id, layer)?;
-            // Prefer a REAL predecessor: then this step is the first
-            // spurious one.
-            let mut pick: Option<(Sk, Rt2, Proj, u32, bool)> = None;
-            for &p in &preds {
-                let rt = coarse_tree.row(layer - 1, p, cfg.room)?;
-                let pc = p.cell(&geo);
-                let pp = project(&rt, 0);
-                let is_real = real.is_some() && real_of(pc, None)?.get(&pp).is_some_and(|&s| s < layer);
-                if is_real || pick.is_none() {
-                    pick = Some((p, rt, pp, pc, is_real));
-                }
-                if is_real || real.is_none() {
-                    break;
-                }
-            }
-            let Some((p, rt, pp, pc, is_real)) = pick else {
-                println!("  <- no recorded predecessor at f{layer:03}");
-                break;
-            };
-            let changed: Vec<String> = cur
-                .iter()
-                .filter(|(nm, v)| pp.get(*nm) != Some(*v))
-                .map(|(nm, v)| format!("{nm}: {} -> {v}", pp.get(nm).map(|s| s.as_str()).unwrap_or("absent")))
-                .collect();
-            if is_real {
-                println!("  FIRST SPURIOUS STEP f{} {} -> f{layer}: {} ({} preds): {}", layer - 1, p.show(), where_(pc), preds.len(), changed.join(", "));
-                // The whole real predecessor, unprojected: the floors too.
-                let full = project_row(&rt, &cell_names(&rt, ids), 0, &[]);
-                println!("    predecessor (full): {}", full.iter().filter(|(n, _)| !n.contains("hitbox") && !n.contains(".type.") && !n.ends_with(".solids") && !n.contains(".flip.y") && !n.ends_with(".spr") || n.starts_with("spring") || n.starts_with("balloon")).map(|(n, v)| format!("{n}={v}")).collect::<Vec<_>>().join(" "));
-                found = true;
-                break;
-            }
-            println!("  <- f{:03} {} [{}] ({} preds){}: {}", layer - 1, where_(pc), p.show(), preds.len(), if real.is_some() { " still spurious" } else { "" }, changed.join(", "));
-            chain.push((layer - 1, pc, rt.row_keys[0]));
-            id = p;
-            layer -= 1;
-            cur = pp;
-        }
-        if real.is_some() && !found {
-            println!("  (no real predecessor within {depth} steps)");
-        }
-        if let (0, Some(path)) = (k, &chain_out) {
-            chain.sort_by_key(|(f, ..)| *f);
-            anyhow::ensure!(chain.first().map(|(f, ..)| *f) == Some(0), "--chain-out needs the chain back to frame 0: raise --depth");
-            let mut out = String::new();
-            for (_, c, key) in chain.iter().skip(1) {
-                match celeste_rust::search::pos_graph::cell_xy(*c) {
-                    Some((x, y)) => out.push_str(&format!("{x},{y} {:016x} {:016x}\n", key.0, key.1)),
-                    None => out.push_str("-\n"),
-                }
-            }
-            std::fs::write(path, out)?;
-            println!("[spurious] wrote the chain (frames 1..={step}) to {path}");
-        }
-    }
-    Ok(())
-}
-
 /// `trajectory`, under the run's settings `cfg`.
 pub fn trajectory(cfg: &Settings, a: TrajectoryArgs) -> Result<()> {
-    let TrajectoryArgs { trajectory, stop_at_win, spec, tree } = a;
-    let lines: Vec<(Option<(i32, i32)>, Option<(u64, u64)>)> = std::fs::read_to_string(&trajectory)?
+    let TrajectoryArgs { trajectory, stop_at_win } = a;
+    let traj: Vec<Option<(i32, i32)>> = std::fs::read_to_string(&trajectory)?
         .lines()
         .map(|l| l.trim())
         .filter(|l| !l.is_empty() && !l.starts_with('#'))
-        .map(|l| {
-            let mut it = l.split_whitespace();
-            let p = it.next().expect("a position");
-            let pos = if p == "-" {
-                None
-            } else {
-                let (x, y) = p.split_once(',').expect("x,y");
-                Some((x.trim().parse().expect("x"), y.trim().parse().expect("y")))
-            };
-            let key = match (it.next(), it.next()) {
-                (Some(a), Some(b)) => Some((u64::from_str_radix(a, 16).expect("key hex"), u64::from_str_radix(b, 16).expect("key hex"))),
-                _ => None,
-            };
-            (pos, key)
+        .map(|l| -> Result<Option<(i32, i32)>> {
+            if l == "-" {
+                return Ok(None);
+            }
+            let (x, y) = l.split_once(',').ok_or_else(|| anyhow::anyhow!("{trajectory}: {l:?} is not \"x,y\" or \"-\""))?;
+            Ok(Some((x.trim().parse()?, y.trim().parse()?)))
         })
-        .collect();
-    let traj: Vec<Option<(i32, i32)>> = lines.iter().map(|(p, _)| *p).collect();
-    let keyed: Vec<Option<(u64, u64)>> = lines.iter().map(|(_, k)| *k).collect();
-    let level = spec;
-    anyhow::ensure!(level.is_some() || keyed.iter().all(|k| k.is_none()), "keyed trajectory lines need --spec");
-    let space = match &tree {
-        Some(t) => Tree::<P8>::open_all(t)?.space,
-        None => {
-            anyhow::ensure!(keyed.iter().all(|k| k.is_none()), "keyed trajectory lines need --tree (the tree their keys are in)");
-            Default::default()
-        }
-    };
+        .collect::<Result<_>>()?;
     let mut eng = RefEngine::new(&cfg)?;
     // (state, the inputs that led to it)
     let mut layer: Vec<(Rt2, Vec<u8>)> = vec![(eng.initial()?, Vec::new())];
@@ -558,9 +319,6 @@ pub fn trajectory(cfg: &Settings, a: TrajectoryArgs) -> Result<()> {
         let mut tried = 0usize;
         // Where the successors went: reported when none is at `want`.
         let mut reached: std::collections::BTreeMap<Option<(i32, i32)>, usize> = Default::default();
-        // At the right position but projected onto another row.
-        let mut off_chain = 0usize;
-        let mut off_chain_sample: Option<celeste_engine::runtime2::Rt2> = None;
         // A `-` frame (the spawn) takes only the idle input: inputs
         // before the player exists cannot matter.
         let inputs: std::ops::Range<u8> = if want.is_some() { 0..64 } else { 0..1 };
@@ -575,14 +333,6 @@ pub fn trajectory(cfg: &Settings, a: TrajectoryArgs) -> Result<()> {
                     if let Some(w) = want {
                         if pos != Some(*w) {
                             *reached.entry(pos).or_default() += 1;
-                            continue;
-                        }
-                    }
-                    if let (Some(k), Some(l)) = (keyed[i], level) {
-                        let (_, keys, _) = widened_keys(&block, l, &space)?;
-                        if keys[0] != Some(k) {
-                            off_chain += 1;
-                            off_chain_sample.get_or_insert_with(|| block.rt2().clone_block());
                             continue;
                         }
                     }
@@ -609,11 +359,6 @@ pub fn trajectory(cfg: &Settings, a: TrajectoryArgs) -> Result<()> {
             next.len()
         );
         if next.is_empty() {
-            if let (Some(sample), Some(l)) = (&off_chain_sample, level) {
-                let mut w = sample.clone_block();
-                widen_rt2_to(&mut w, l);
-                eprintln!("[trajectory] f{f}: {off_chain} successors at the position but on another row; one, projected: {}", player_summary(&w, 0));
-            }
             eprintln!("[trajectory] f{f}: the successors reached {} positions instead:", reached.len());
             for (pos, n) in &reached {
                 eprintln!("[trajectory]   {pos:?}: {n}");

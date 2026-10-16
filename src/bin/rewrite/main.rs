@@ -45,7 +45,7 @@ the optimum; the witness goes to <checkpoint-dir>/witness_frame_F.txt.
 THE SETTINGS are the flags below (Options), given anywhere on the line. A
 tree records the ones that change it (<level dir>/settings.txt) and refuses a
 run under others; flags never default to the record. A command that reads a
-finished tree (ckhash, census, spurious, export-ui, check, bench) takes them
+finished tree (ckhash, census, export-ui, check, bench) takes them
 from the tree's record instead, and refuses them on its command line.
 --override-settings proceeds past a different --region only. CELESTE_*
 environment variables are refused. Run everything under ./safe-run.sh (a
@@ -140,16 +140,6 @@ enum Command {
     /// `--frame` (their new states in its last 12 frames), and every
     /// position's new states at `--frame` as a share of its states.
     Census(diag::CensusArgs),
-    /// DIAGNOSTIC: WHERE A TREE'S STATES COME FROM. `--samples` states of `--tree` first
-    /// reached at `--step` in `--cell` are walked back through the recorded
-    /// edges, `--depth` steps, printing each predecessor's cell and what
-    /// changed (named value cells but the `--erase` prefixes).
-    ///
-    /// With `--real` (a finer tree): a state whose projection the real tree
-    /// never reached in its cell by `--step` is SPURIOUS; field distributions
-    /// are compared, and each walk stops at the first predecessor the real tree
-    /// did reach - the first spurious transition.
-    Spurious(diag::SpuriousArgs),
     /// A concrete input sequence that follows a given TRAJECTORY of player
     /// positions (one "x,y" per line from frame 1; `-` accepts any), found
     /// breadth-first over the reference engine's concrete step, deduplicated
@@ -192,7 +182,7 @@ enum Command {
 impl Command {
     /// A command that reads finished trees: their records give the settings.
     fn reads_trees(&self) -> bool {
-        matches!(self, Command::Ckhash(_) | Command::Check(_) | Command::Bench(_) | Command::Census(_) | Command::Spurious(_) | Command::ExportUi(_))
+        matches!(self, Command::Ckhash(_) | Command::Check(_) | Command::Bench(_) | Command::Census(_) | Command::ExportUi(_))
     }
 }
 
@@ -512,7 +502,6 @@ fn main() -> Result<()> {
         Command::Check(c) => check::run(&cfg, c),
         Command::Bench(c) => bench::run(&cfg, c),
         Command::Census(a) => diag::census(&cfg, a),
-        Command::Spurious(a) => diag::spurious(&cfg, a),
         Command::Trajectory(a) => diag::trajectory(&cfg, a),
         Command::Robust(a) => diag::robust(&cfg, a),
         Command::L1Check(a) => l1::run(&cfg, a),
