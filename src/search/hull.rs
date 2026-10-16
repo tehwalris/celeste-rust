@@ -109,12 +109,24 @@ impl<C: Circle> Arc<C> {
 
 /// A state's HULL: one arc per axis, the box of the remainders it is
 /// reached with. Never empty.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Default)]
+#[derive(Clone, Copy, Debug, Hash, PartialOrd, Ord, Default)]
 #[repr(C)]
 pub struct Hull<C: Circle = Fixed16> {
     pub x: Arc<C>,
     pub y: Arc<C>,
 }
+
+/// Equal as its four words at once (16.16's: one 8-byte compare; the
+/// fields one by one cost the push cache's lookup, `PushCache::get`, 2.6%
+/// of room (6,2)'s f56 in release instructions).
+impl<C: Circle> PartialEq for Hull<C> {
+    #[inline]
+    fn eq(&self, o: &Self) -> bool {
+        self.words() == o.words()
+    }
+}
+
+impl<C: Circle> Eq for Hull<C> {}
 
 /// A hull of arithmetic `N`'s circle.
 pub type HullOf<N> = Hull<<N as Rem>::C>;
@@ -198,15 +210,21 @@ impl<C: Circle> Hull<C> {
         self.push(t, acc)
     }
 
+    /// `x.start, x.last, y.start, y.last`.
+    #[inline]
+    fn words(&self) -> [C::W; 4] {
+        [self.x.start, self.x.last, self.y.start, self.y.last]
+    }
+
     /// Its hash (`Circle::hash4`: 16.16's is the four words in one).
     #[inline]
     pub fn hash(&self) -> u64 {
-        C::hash4([self.x.start, self.x.last, self.y.start, self.y.last])
+        C::hash4(self.words())
     }
 
-    /// Append its `BYTES`: `x.start, x.last, y.start, y.last`, little-endian.
+    /// Append its `BYTES`: its words, little-endian.
     pub fn to_bytes(&self, out: &mut Vec<u8>) {
-        for w in [self.x.start, self.x.last, self.y.start, self.y.last] {
+        for w in self.words() {
             C::put_word(w, out);
         }
     }
