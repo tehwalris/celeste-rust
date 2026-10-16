@@ -1,5 +1,5 @@
 //! What the graph IR needs of an arithmetic beyond `Arithmetic`
-//! (plans/float-solver.md, milestone 5): the rules that are the
+//! (plans/float.md, "The kernels' safety"): the rules that are the
 //! arithmetic's own. 16.16's are the graph's code as it always was, moved
 //! here verbatim (the kernels' raw `i32` grid, wraps included); the
 //! doubles' follow `LuaF64` and the reference engine (`refdomain`) exactly.

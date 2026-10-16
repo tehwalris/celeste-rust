@@ -1,5 +1,5 @@
-//! THE GAME'S ARITHMETIC, a compile-time choice (plans/float-solver.md,
-//! section 5): `Fixed`, PICO-8's 16.16 (`Pico8Num`, the real game), or
+//! THE GAME'S ARITHMETIC, a compile-time choice (plans/float.md,
+//! "The parameter"): `Fixed`, PICO-8's 16.16 (`Pico8Num`, the real game), or
 //! `Float`, the Lua doubles of the community's TAS tools (`LuaF64`). Code
 //! generic over `A: Arithmetic` monomorphizes to one copy per arithmetic, so
 //! values of the two can never meet, and `Fixed`'s copy is the fixed-point

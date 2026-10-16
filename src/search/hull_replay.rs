@@ -168,7 +168,7 @@ fn sliver_from() -> u64 {
     super::rem_f64::index(0.5 - (2f64).powi(-40)).expect("a remainder")
 }
 
-/// Option (c) of plans/float-solver.md, section 15, simulated on a float
+/// Option (c) of the float design (an exact sliver bit; rejected), simulated on a float
 /// tree's graph: per state a hull and per axis one EXACT bit, "a remainder
 /// in the top sliver `[1/2 - 2^-40, 1/2)` reaches it" - a push takes the
 /// sliver's points of a hull only where its bit is set, and sets the

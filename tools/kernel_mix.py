@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Aggregate a --kernel-mix directory (src/compiled/mix.rs) into the
-static and dynamic instruction mix of the kernels (plans/kernel-mix.md).
+static and dynamic instruction mix of the kernels.
 
   tools/kernel_mix.py DIR                 # static + dynamic (slices x static)
   tools/kernel_mix.py DIR --perf PERFDATA # + cycles per category from a profile

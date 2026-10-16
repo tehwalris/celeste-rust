@@ -1,4 +1,4 @@
-//! EDGE BUNDLES (plans/edges-target.md): the recorded edges as they are
+//! EDGE BUNDLES (plans/architecture.md, "The recorded graph"): the recorded edges as they are
 //! stored, ID-free. An edge is (source state, target state, transfer), a
 //! state its shape, exact key and cell (`storage::Sk`). A BUNDLE is the
 //! edges of one source STATE KEY (shape and key: every cell of it) into one

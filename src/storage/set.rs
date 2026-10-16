@@ -1,4 +1,4 @@
-//! THE ONE STATE SET (plans/keys-only.md, plans/visited-packed.md): per
+//! THE ONE STATE SET (plans/architecture.md, "The forward"): per
 //! storage region a TABLE of entries - an exact key (the state without its
 //! position) and the mask of its cells in the region - SORTED by key. It is
 //! the visited set, the frontier and the next layer, in one of two forms:

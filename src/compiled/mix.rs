@@ -1,5 +1,5 @@
 //! `--kernel-mix DIR`: what the assembled kernels spend their
-//! instructions on (plans/kernel-mix.md). A diagnostic only: nothing in the
+//! instructions on (plans/lessons.md has its findings). A diagnostic only: nothing in the
 //! search reads it.
 //!
 //! Per kernel, at build time (`report`), into `DIR`:

@@ -1,6 +1,6 @@
 // Lua's numbers as the community's TAS tools run the cart: IEEE-754
 // binary64, round to nearest even, as LuaJIT 2.1 computes them on x86-64
-// (plans/float-solver.md, section 1). UniversalClassicTas and Celia's float
+// (plans/float.md, "The semantics and their authority"). UniversalClassicTas and Celia's float
 // mode both run the cart in LÖVE 11.5's LuaJIT; their `api.lua` maps the
 // cart's builtins to the expressions reproduced here, in the same order:
 //
@@ -70,8 +70,8 @@ impl fmt::Debug for LuaF64 {
     }
 }
 
-/// A witness's ROBUSTNESS to the host libm (plans/float-solver.md, section
-/// 15, Q3): `sin`'s result moved by one ulp - up on every call, down on
+/// A witness's ROBUSTNESS to the host libm (plans/float.md, "The
+/// robustness report"): `sin`'s result moved by one ulp - up on every call, down on
 /// every call, or each call by a pseudo-random choice of -1, 0 or +1 from
 /// the seed - or glibc's `sin` REPLACED (a correctly rounded one), on THIS
 /// thread, while `with_sin_nudge` runs.
@@ -297,7 +297,7 @@ impl LuaF64 {
 /// A closed interval `[lo, hi]` of `LuaF64`s (`lo <= hi` by value): the
 /// float reference domain's number. Its operations bound the IEEE result
 /// over the whole box, with the same rounding at the ends (monotone
-/// operations; plans/float-solver.md, section 4).
+/// operations; plans/float.md, "Intervals, folds and the levels").
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct LuaF64Interval {
     pub lo: LuaF64,

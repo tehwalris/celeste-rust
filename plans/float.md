@@ -7,8 +7,8 @@ pipeline has a float counterpart: the oracle, the tracer, the graph, the
 kernels, the keys and trees, the arcs, level -1, the concrete search. A
 DUAL search finds the best file valid in both. Fixed stays byte-identical
 (its pins, gates and trees); a tree records its arithmetic and is never
-read under another. The full design history is `plans/float-solver.md`
-in git (deleted 2026-10-16; up to `fafb3bf7`).
+read under another. The full design history is the float design doc in
+git (deleted 2026-10-16; last at `fafb3bf7`).
 
 ## The semantics and their authority
 
@@ -102,8 +102,7 @@ One axis, one frame: `r1 = fl(r + ox)`, `k = floor(fl(r1 + 0.5))`,
 - The level flags `h f n p` work in float. Their hooks (near floors,
   platforms and their worlds, literal pins) are generic; the containment
   proof (`widen::within`) runs on exact doubles. At `n` a balloon is
-  widened whole (timer, sprite, bob and phase: plans/abstractions.md);
-  the map mod's `e` is not in float.
+  widened whole (timer, sprite, bob and phase: plans/abstractions.md).
 - Level -1 is built in the run's arithmetic: ranges in the total order, a
   range grown twice jumping to `±f64::MAX`, fork spans in the arithmetic's
   own count (rounds for `RSplit`), whole-pixel hulls by `as_i16`. Float
@@ -180,7 +179,7 @@ float) and Celia `--fixp` (`CELIA_FIXP=1 tools/celia/validate.sh`); the
 tool file starts on the player's first frame.
 
 - **nodiag 1800m** (room (1,2), real play J3, Celia J4): the dual optimum
-  is the 85 of plans/nodiag.md (113 frames from the load), valid in real
+  is the 85 of plans/results.md (113 frames from the load), valid in real
   play, Celia float and Celia `--fixp`; UCT, which has no loading jank,
   kills it at keypress 70. Its float optimum is the same 85.
 - **gemskip any% 2600m** (room (1,3), J8): the community's 123 is the
@@ -217,7 +216,7 @@ tool file starts on the player's first frame.
 - The robustness report has not been run on the earlier float witnesses.
 - `-0`/`+0` are different codes (exact); a canonicalization is deferred
   until a proof that no read tells them apart.
-- The map mod's `e` flag; the diagnostics `reach`, `follow`, `rerun-row`,
+- The diagnostics `reach`, `follow`, `rerun-row`,
   `col-census` and others are fixed-only.
 - Speed buckets (T3) and exact platform remainders (T2) were planned in
   case float trees ran away; they have not (where compared, float holds

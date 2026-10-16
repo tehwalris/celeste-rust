@@ -1,5 +1,5 @@
-//! A float witness's ROBUSTNESS to the host libm (plans/float-solver.md,
-//! section 15, Q3; `rewrite robust`): the witness replayed in float under
+//! A float witness's ROBUSTNESS to the host libm (plans/float.md,
+//! "The robustness report"; `rewrite robust`): the witness replayed in float under
 //! glibc's `sin` (the definition), under a CORRECTLY ROUNDED `sin` (MPFR's,
 //! the library gcc depends on, loaded at run time), with every call one ulp
 //! up, every call one ulp down, and runs moving each call by -1, 0 or +1

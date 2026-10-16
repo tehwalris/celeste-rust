@@ -1,5 +1,5 @@
 -- EXACT state traces from UniversalClassicTas (UCT_EXACT=FILE), the float
--- oracle's ground truth (plans/float-solver.md, section 3).
+-- oracle's ground truth (plans/float.md).
 --
 -- Replaces love.run with a deterministic loop (one update and one draw per
 -- iteration, as tools/uct/capture.lua: UCT's own loop is paced by the wall

@@ -1,4 +1,4 @@
-//! THE DUAL SEARCH (plans/float-solver.md sections 10 and 15): the shortest
+//! THE DUAL SEARCH (plans/float.md, "The dual search and rule (b)"): the shortest
 //! input file valid in BOTH arithmetics, under Philippe's rule (b): the
 //! file's length is the FLOAT exit (Celia's float mode, the count), and real
 //! play (16.16, PICO-8) must have left the room by then. Two halves, each a

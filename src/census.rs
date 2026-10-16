@@ -1,4 +1,4 @@
-//! THE CENSUS (plans/float-solver.md, section 12): how many states a forward
+//! THE CENSUS (plans/float.md, "The remainder model and the round fork"): how many states a forward
 //! meets in one arithmetic, and how many distinct speeds, against the other
 //! - the measurement that decides how much of the float state must be
 //! abstracted (section 7).
@@ -62,7 +62,7 @@ pub struct Frame {
     pub spd_x_all: usize,
     pub spd_y_all: usize,
     /// Distinct new nodes with the player's `spd.x` left out (the speed
-    /// bundles of plans/speed-bundles.md).
+    /// bundles, branch `speed-bundles`).
     pub bundles: usize,
     /// Distinct player `rem.x` / `rem.y` values among every node so far
     /// (`exact` censuses; a widened one holds the one interval).

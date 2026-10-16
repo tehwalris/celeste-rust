@@ -1,4 +1,4 @@
-//! THE EMISSION of a kernel slice (plans/emit-batch.md): what a body's
+//! THE EMISSION of a kernel slice (plans/architecture.md, "The forward"): what a body's
 //! `live & !error` lanes become - per lane its state's cell, key and
 //! transfer - computed COLUMN-WISE, then handed to the sink a body at a time
 //! (`unit::BodyEmits`).
@@ -6,7 +6,7 @@
 //! Bodies share output slots (one per distinct root node, `build_one_shape`),
 //! so the bodies of a slice repeat each other's work: the reference frame
 //! averaged 4.5-5.6 key-field lookups per distinct (field, value) and 8-12
-//! transfer decodes per distinct transfer (plans/fwd-perf.md, `[keydiag]`).
+//! transfer decodes per distinct transfer (branch `fwd-perf`, `[keydiag]`).
 //! A kernel's EMISSION PLAN (`Plan`, built with it) lists the distinct
 //! READS - a key field of an output shape (`KeyField`), a transfer's root
 //! set (`ArcSlots`), a cell's position sources (`PosSrc`), level -1's

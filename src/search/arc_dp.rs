@@ -1,5 +1,5 @@
 //! The rotation graph's dynamic programme (plans/architecture.md "Arcs",
-//! plans/arc-memory.md): over the remainder-free transition graph the
+//! plans/architecture.md "The search"): over the remainder-free transition graph the
 //! forward recorded (`storage::edges`), whose edges carry per axis a guard
 //! and an action (`search::arcs`), the WINNING SETS `W_t(n)`: the remainders
 //! from which node `n`, occupied at frame `t`, wins by the horizon -

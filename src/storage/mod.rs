@@ -1,4 +1,4 @@
-//! STORAGE (plans/storage-v2.md, plans/edges-target.md, plans/keys-only.md): the forward's
+//! STORAGE (plans/architecture.md, "The forward" and "The recorded graph"): the forward's
 //! visited set, the states of its layers, and the recorded edges.
 //!
 //!   * `visited` - per (shape, region) a table of ENTRIES: a state's
@@ -152,7 +152,7 @@ impl Geometry {
 }
 
 /// THE storage geometry: 8-cell regions (storage v2 measured 8 against 16;
-/// plans/storage-v2.md). The kernels' regions (`--region`, a multiple of 8
+/// plans/architecture.md). The kernels' regions (`--region`, a multiple of 8
 /// px) each hold whole storage regions.
 pub const GEOMETRY: Geometry = Geometry::new(8);
 

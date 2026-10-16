@@ -56,7 +56,7 @@ spec() {
         r10arc) ROOM=1,0; CMD="search --room 1,0 --level r0sxh --to 56 --win-at 40,64"; TREE=level00; LAST=56 ;;
         # The storage replay's capture: r10's f56 emissions (bench-storage).
         cap-r10) DEP=r10; ROOM=1,0; CMD="capture 56"; LAST=56 ;;
-        # FLOAT twins (`--arith float`, Celia's start: plans/float-solver.md):
+        # FLOAT twins (`--arith float`, Celia's start: plans/float.md):
         # r10's, r42n's and r42x's frames in the doubles' kernels.
         f10) FLAGS="--arith float"; ROOM=1,0; CMD="forward --room 1,0 --level r0sxh --to 56"; LAST=56 ;;
         f42n) FLAGS="--arith float --level-minus-one 71,5"; ROOM=4,2; CMD="forward --room 4,2 --level r0sxhn --to 61"; LAST=61 ;;

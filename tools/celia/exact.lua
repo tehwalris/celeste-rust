@@ -1,5 +1,5 @@
 -- EXACT state traces from Celia (CELIA_EXACT=FILE), the float oracle's second
--- ground truth (plans/float-solver.md, section 3), in tools/uct/exact.lua's
+-- ground truth (plans/float.md), in tools/uct/exact.lua's
 -- format: after every cctas step of the playback (driver.lua's "wait"
 -- phase), before the clean save's seek rewinds the exit away,
 --   u N kf K in I        the step's index, Celia's frame count + 1 before it,

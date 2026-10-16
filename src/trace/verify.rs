@@ -1973,7 +1973,7 @@ end
         traced_frame_agrees::<Fixed>(false);
     }
 
-    /// The float twin (plans/float-solver.md, milestone 5): the doubles'
+    /// The float twin (plans/float.md, "The kernels' safety"): the doubles'
     /// trace of the same frame against the float REFERENCE ENGINE
     /// (`RefDomain<Float>`, run as `ReferenceEngine::frame_states` runs a
     /// concrete state), over the same sweep and every input, bit for bit.

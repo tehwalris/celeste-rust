@@ -1,5 +1,5 @@
 //! THE ROUTING of a wave's emissions to their TARGET regions, and the
-//! REGION PHASE there (plans/edges-target.md "The forward").
+//! REGION PHASE there (plans/architecture.md "The forward").
 //!
 //! A unit (a run of frontier rows through the kernels) ORs each emission
 //! into its BUNDLE (`bundle::Bundle`: source key, transfer, offset, target

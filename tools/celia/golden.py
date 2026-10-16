@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """The float oracle's second goldens: Celia's exact traces of the
 tasdatabase's files (cctas: the ORIGINAL cart in Lua doubles, with its
-loading jank and its own seeds; plans/float-solver.md, section 3).
+loading jank and its own seeds; plans/float.md).
 
     tools/celia/golden.py CAT LEVEL [LEVEL...]     one category's levels
     tools/celia/golden.py CAT all                  every level the category has

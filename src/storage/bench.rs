@@ -505,7 +505,7 @@ struct Line {
     counts: Option<Vec<[u64; 4]>>,
 }
 
-/// THE COST REPORT of a frame's reps (`bench-frame`; plans/fwd-bench.md):
+/// THE COST REPORT of a frame's reps (`bench-frame`; plans/devloop.md):
 /// the frame's wall split into the wave, the frame end and the
 /// checkpoint; the wave's WORKER-SECONDS by phase (`frame::phases`) with
 /// the idle share; the frame end's and the checkpoint's steps (walls, on

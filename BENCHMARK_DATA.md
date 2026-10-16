@@ -59,7 +59,7 @@ frame instead, every frame's merge touched rows all over the marks file:
 A kernel slice's cells, level -1, keys, transfers and sink targets
 computed column-wise over a per-kernel plan of distinct reads; a frame's
 new transfers numbered canonically at its end; safe-run's
-`MIMALLOC_PURGE_DELAY` 0 -> 100 ms (plans/emit-batch.md). Against develop
+`MIMALLOC_PURGE_DELAY` 0 -> 100 ms (plans/lessons.md). Against develop
 8e1ca54 (`/var/tmp/emit-bin/base`; the mod fixture: map-mod 9d6320c
 against a local merge). Release; interleaved, 3 rounds of 3 reps (the
 reference frame) and 2 rounds of 1 rep (the mod fixture), load 16-24
@@ -81,7 +81,7 @@ and the bench's fingerprints). Every run's f/e lines are the pins.
 | anonymous RSS start / wave / end | 3.63 / 5.68-5.71 / 4.96-4.99 GB | 3.73-3.74 / 6.21 / 5.32-5.35 GB (3.59-3.60 / 5.69-5.71 / 4.96-5.00) |
 
 The wave's breakdown before and after (perf, the reference frame,
-plans/emit-batch.md sections 1 and 6): 34.5 -> 15.0 worker-s a rep;
+branch `emit-batch`): 34.5 -> 15.0 worker-s a rep;
 transfers 7.4 -> 0.7, keys 6.3 -> 2.6, level -1 and cells 4.8 -> 0.8,
 the sink with the pos graph 6.1 -> 3.9; now the region phase (2.6) and
 the sink's bundle table (1.8) lead.
@@ -104,7 +104,7 @@ The visited set, the frontier and the next layer as one type
 (`storage::set`: keys in the bytes they need, a tagged u32 index at load
 0.5-0.85, chunks of 32768 entries), job-local target names in the region
 phase, 256k-lane slices and the backward's galloping read
-(c2325d2..ef93c48, plans/keys-only.md "The one state set"), against
+(c2325d2..ef93c48, plans/architecture.md "The forward"), against
 2ef9213 (the first keys-only build, then develop). Release; interleaved, 2 rounds, at load 21-33 (another agent's 14-thread
 mod search beside it, 50 GB): walls good to ~5%. Every pair has identical
 f/e lines, `[gate]` lines, optima and witnesses.
@@ -122,7 +122,7 @@ f/e lines, `[gate]` lines, optima and witnesses.
 
 A state is its key in memory and on disk: the frontier and the frame files
 are per-region (key, cell mask) entries, rows decoded per unit right
-before the kernels, no state ids (plans/keys-only.md). Against develop
+before the kernels, no state ids (plans/architecture.md). Against develop
 a4c3dfc (`/var/tmp/keys-base`; the mod room: map-mod f32df10 against
 keys-only + map-mod, a local merge). Release; a shared machine at load
 5-17 for the interleaved A/B; the develop mod runs date from 2026-10-11
@@ -163,13 +163,13 @@ keyed on the binary.
 Decode: 49 ns a row in a unit (the mod frame; `not_expanded` included), 2%
 of the units' worker time. The visited set at fmp's f77: 17.3 GB
 allocated for 6.33B states (2.73 B a state); the frame's other buffers 6.7
-GB at its peak. The mod room's exit, projected (plans/keys-only.md): RAM
+GB at its peak. The mod room's exit, projected (branch `keys-only`): RAM
 fits to H ~222-225 on this machine (develop: ~203); time binds first.
 
 # Edges target, 2026-10-11 (16 threads, branch `edges-target`)
 
 ID-free edge bundles stored in their target regions, the routed forward
-(plans/edges-target.md), against develop e7e9f78 (`/var/tmp/tgt-base`). A
+(plans/architecture.md, "The recorded graph"), against develop e7e9f78 (`/var/tmp/tgt-base`). A
 shared machine at load 9-45 (other agents' runs) throughout: whole-search
 walls moved 1.5-2x within one run as the load did; the per-frame A/B
 (interleaved) is the comparison to trust. Every pair below has the same
@@ -231,7 +231,7 @@ for the next unit took the frame's 6.8M to 4.3M.
 # Storage v2, 2026-10-10 (release, 16 threads, branch `storage-v2`)
 
 Posmask regions, region ids, source-side edge files; no door, no inversion
-(plans/storage-v2.md). Against fg-2300 cc83334 (`/var/tmp/sv2-base`), a
+(plans/lessons.md). Against fg-2300 cc83334 (`/var/tmp/sv2-base`), a
 shared machine (load 6-24 throughout, other agents' runs): A and B
 interleaved, each pair back to back. Every run below has the same answer,
 witness and `[gate]` counts as its pair.
@@ -296,7 +296,7 @@ Reference frame: room (6,2) 100% (`CELESTE_HUNDRED=1 CELESTE_LOADING_JANK=2
 CELESTE_LEVEL_MINUS_ONE=94,5`), `r0sxhf`, f56 -> f57 of
 `/var/tmp/canon-h62-f56` (366,133 slices, 86 kernels run). Each step on top
 of the previous; outputs byte-identical to fg-2300 at every step
-(plans/kernel-opt-decisions.md). Instruction counts from
+(plans/architecture.md, "The codegen"). Instruction counts from
 `CELESTE_KERNEL_MIX` (exact: slices x static), the kernel phase from
 `CELESTE_PHASES` (worker-seconds, call-out callees included), waves from
 `tools/bench_step.sh`, binaries interleaved in rounds (load 2-4 unless
@@ -340,7 +340,7 @@ r0sxh f62 and (6,2) 100% f50 `ckhash --edges` equal):
 | (1,0) f0-f62, 8 px | 326 | 2.2 + 1.7 + 0.5 s | 10.4 s | 3620-3688 ms (sum) | 1.6-1.7 s |
 
 Rows per call are the same (calls are per dispatch); slice padding 0.0% ->
-0.2-0.3%. Analysis and recommendation: plans/kernel-mix.md.
+0.2-0.3%. Analysis and recommendation: plans/lessons.md.
 
 # The edges inverted once, 2026-10-09 (release, 16 threads, branch `edge-inversion`)
 

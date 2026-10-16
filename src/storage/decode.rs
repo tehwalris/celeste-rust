@@ -1,4 +1,4 @@
-//! ROWS FROM KEYS (plans/rows-from-keys.md, plans/keys-only.md): a state's
+//! ROWS FROM KEYS (plans/architecture.md, "The forward"): a state's
 //! row is a function of its shape's SKELETON (structure with closure
 //! captures, globals, strings, the non-value cells), its exact key and its
 //! cell, so the storage holds keys and cells only (`layer`) and rows are
@@ -402,7 +402,7 @@ mod tests {
     use super::*;
     use celeste_engine::runtime2::collapse_uniform;
 
-    /// The first version of `decode_rows` (plans/rows-from-keys.md: every
+    /// The first version of `decode_rows` (when it was written: every
     /// stored row of seven fixtures decoded exactly), kept as the reference
     /// the run-wise decoder must reproduce.
 fn reference_decode(keys: &KeySpace, skel: &Rt2, rows: &[(Key, u32)]) -> Result<Rt2> {

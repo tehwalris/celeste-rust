@@ -30,7 +30,7 @@ use celeste_core::pico8_num::Pico8Num;
 
 /// The reference engine of arithmetic `A`: `RefEngine` is the real game's
 /// (16.16), the oracle of the kernels; `FloatRefEngine` the float tools'
-/// (UniversalClassicTas, Celia), the float oracle (plans/float-solver.md).
+/// (UniversalClassicTas, Celia), the float oracle (plans/float.md).
 pub struct ReferenceEngine<A: Arithmetic> {
     it: Interp<'static, RefDomain<A>>,
     /// `__reset_button_states();_update();_draw()`: the buttons are forks.

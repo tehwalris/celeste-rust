@@ -1,4 +1,4 @@
-//! THE REMAINDER MODEL IN DOUBLES (plans/float-solver.md, section 6): the
+//! THE REMAINDER MODEL IN DOUBLES (plans/float.md, "The remainder model and the round fork"): the
 //! float tools' sub-pixel remainder, its hulls and its transfers, as
 //! `hull` and `arc_edges` are 16.16's.
 //!

@@ -1,4 +1,4 @@
-//! THE RECORDED GRAPH, target-side and ID-free (plans/edges-target.md).
+//! THE RECORDED GRAPH, target-side and ID-free (plans/architecture.md, "The recorded graph").
 //!
 //! Every edge of frame `f` leaves a state of layer `f - 1` and is stored in
 //! its TARGET's region: per (target region, frame) its bundles

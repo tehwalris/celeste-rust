@@ -1,4 +1,4 @@
-//! THE REMAINDER MODEL of an arithmetic (plans/float-solver.md, section 6):
+//! THE REMAINDER MODEL of an arithmetic (plans/float.md, "The remainder model and the round fork"):
 //! what the hull forward keeps of a state's sub-pixel remainder (its HULL,
 //! accumulated order-free in an `Acc`), and what a recorded edge does to it
 //! (its transfer PAIR, one per axis, as the tree's table stores it, and as

@@ -1,5 +1,5 @@
 #!/bin/bash
-# THE FORWARD FRAME BENCHMARK (plans/fwd-bench.md): one forward frame F ->
+# THE FORWARD FRAME BENCHMARK (plans/devloop.md): one forward frame F ->
 # F+1 of a fixture tree, run as the forward runs it - the wave (units and
 # region jobs), the frame's end and the checkpoint (`rewrite bench-frame
 # --edges --checkpoint --reps N`) - its output checked against the

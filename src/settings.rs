@@ -37,7 +37,7 @@ use std::path::{Path, PathBuf};
 /// on a change).
 pub const VERSION: u32 = 1;
 
-/// The game's arithmetic (`--arith`, plans/float-solver.md): the real
+/// The game's arithmetic (`--arith`, plans/float.md): the real
 /// game's 16.16, or the float tools' Lua doubles - with the tool, which
 /// decides the room's start and the seeds' meaning.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -51,7 +51,7 @@ pub enum Arith {
 pub enum FloatTool {
     /// UniversalClassicTas: the room loaded alone (the IL load), the file's
     /// seeds set on its balloons and chests (`set_seeds`). A secondary
-    /// report (Philippe, plans/float-solver.md section 15).
+    /// report (Philippe; plans/float.md).
     Uct,
     /// Celia, THE float tool (the community's): the room entered with its
     /// loading jank (`--loading-jank J`, by default its IL load's:
@@ -375,7 +375,7 @@ fn parse_win_at(s: &str) -> std::result::Result<(i16, i16, i16, i16), String> {
 #[derive(clap::Args, Clone, Debug)]
 pub struct SettingsArgs {
     /// The game's arithmetic: `fixed` (PICO-8's 16.16, the real game) or
-    /// `float` (the Lua doubles of the TAS tools; plans/float-solver.md).
+    /// `float` (the Lua doubles of the TAS tools; plans/float.md).
     #[arg(long, global = true, default_value = "fixed")]
     pub arith: String,
     /// With `--arith float`: the tool modelled, `celia` (the default: Celia's
@@ -587,7 +587,7 @@ pub fn refuse_env() -> Result<()> {
         ("CELESTE_BALLOON_SEEDS", "--balloon-seeds"),
         ("CELESTE_CONCRETE_BALLOON_SEEDS", "--concrete-balloon-seeds"),
         ("CELESTE_LEVEL_MINUS_ONE", "--level-minus-one H,S"),
-        ("CELESTE_TRIM_ROWS", "nothing: frame files hold ids, never rows (plans/rows-from-keys.md)"),
+        ("CELESTE_TRIM_ROWS", "nothing: frame files hold keys, never rows (plans/architecture.md)"),
         ("CELESTE_THREADS", "--threads"),
         ("CELESTE_L1_TABLE", "--l1-table"),
         ("CELESTE_KERNEL_KEY_CHECK", "--key-check"),
@@ -616,12 +616,12 @@ pub fn refuse_env() -> Result<()> {
 /// passes them to everything that reads them; nothing reads a global.
 /// `float`: whether the command runs in float (`--arith float`); every
 /// other one REFUSES it (the float pipeline is built a milestone at a time,
-/// plans/float-solver.md: a command that would run fixed under a float
+/// plans/float.md: a command that would run fixed under a float
 /// flag is the footgun).
 pub fn startup(args: &SettingsArgs, float: bool, adjust: impl FnOnce(&mut Settings)) -> Result<Settings> {
     refuse_env()?;
     let mut s = args.settings()?;
-    anyhow::ensure!(float || s.arith == Arith::Fixed, "--arith {}: this command runs in fixed only so far (plans/float-solver.md, section 13)", s.arith);
+    anyhow::ensure!(float || s.arith == Arith::Fixed, "--arith {}: this command runs in fixed only so far (plans/float.md, Open gaps)", s.arith);
     adjust(&mut s);
     let d = Settings::default();
     let mut set: Vec<String> = Vec::new();

@@ -44,7 +44,7 @@
 //! into every outcome's error by `verify::trace_frame`. Charged once there
 //! rather than per outcome as a restriction is: the same lanes decline, and
 //! the kernels are smaller (the per-outcome form cost up to +0.3% dynamic
-//! instructions, plans/widen-table.md).
+//! instructions, plans/abstractions.md).
 //!
 //! Not here: what no graph operator carries (an output widening's
 //! containment, an unfinished unrolled loop). The tracer states those and ORs them into the outcome's error

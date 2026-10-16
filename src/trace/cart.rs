@@ -133,8 +133,8 @@ fn fix_balloon_seeds(game: &str, seeds: &str, root: &std::path::Path, (rx, ry): 
 
 /// A float tool's seeds (`--arith float`): what the tool does with a file's
 /// `[seeds]` beyond the balloons' phases at their creation
-/// (`fix_balloon_seeds`), in its own expressions (plans/float-solver.md,
-/// section 1).
+/// (`fix_balloon_seeds`), in its own expressions (plans/float.md,
+/// "The semantics and their authority").
 /// - A CHEST's last shake: its `rnd(3)` (where its berry appears) returns
 ///   UCT's `offset + 1` (`TAS.lua`: the chest's update under a patched
 ///   `rnd` when `timer - 1 <= 0`), Celia's `seed + 1 + 0x0.0001`

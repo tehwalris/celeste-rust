@@ -1,4 +1,4 @@
-//! ONE UNIT of a wave (plans/edges-target.md "The forward"): a run of
+//! ONE UNIT of a wave (plans/architecture.md "The forward"): a run of
 //! frontier rows through the kernels. The sink (`UnitSink`, one per worker,
 //! reset per unit) ORs each emission into its BUNDLE of its target's route
 //! (`route::UnitBundles`: source key, transfer, offset, target key ->
@@ -930,7 +930,7 @@ impl<'a, N: Rem> UnitSink<'a, N> {
     /// level's widenings: `Rt2::widen_to`), in the tree's dictionaries -
     /// provisional where a code is new. The row is the WIDENED one: a
     /// tree's state is `(shape, key, cell)`, and its stored row is what the
-    /// key decodes to (plans/rows-from-keys.md), not whichever concrete row
+    /// key decodes to (plans/architecture.md, "Keys"), not whichever concrete row
     /// of the class came first.
     pub fn row_key(&mut self, row: &Rt2<N>) -> (Rt2<N>, Key) {
         let level = crate::abstraction::Level { held: self.level.held, ..crate::abstraction::Level::EXACT };

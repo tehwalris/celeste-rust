@@ -161,8 +161,8 @@ enum Command {
         #[arg(long)]
         save_marks: Option<String>,
     },
-    /// A float witness's ROBUSTNESS to the host libm (plans/float-solver.md,
-    /// section 15, Q3; `search::robust`): `--inputs` replayed in float (the
+    /// A float witness's ROBUSTNESS to the host libm (plans/float.md,
+    /// "The robustness report"; `search::robust`): `--inputs` replayed in float (the
     /// run's float tool, its seeds) under glibc's `sin`, a correctly rounded
     /// `sin` (MPFR), every `sin` call one ulp up, every call one ulp down,
     /// and `--random` runs moving each call by -1, 0 or +1 ulp at random;
@@ -670,7 +670,7 @@ enum Command {
         #[arg(long)]
         horizon: u32,
     },
-    /// THE CENSUS (plans/float-solver.md, section 12): a reference-engine
+    /// THE CENSUS (float against fixed state counts): a reference-engine
     /// forward over the level r0sx's nodes (every object exact, the
     /// remainder widened) in the run's arithmetic (`--arith`), every input,
     /// deduplicated exactly, to frame `--to` or past `--max-nodes` nodes.

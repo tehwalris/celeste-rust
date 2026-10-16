@@ -1,5 +1,5 @@
 //! THE FRAME of the hull forward (plans/architecture.md "The forward
-//! frame"; plans/edges-target.md, plans/keys-only.md): its frontier is the
+//! frame"): its frontier is the
 //! states whose remainder HULL grew at the frame before - the NEW ones
 //! (first reached then) and OLD ones (expanded before).
 //!
@@ -1373,7 +1373,7 @@ fn run_repush<N: Rem>(u: u32, layer: &OldLayer<N>, entries: std::ops::Range<usiz
 
 /// The freed pages of the frame's (exited) worker threads back to the OS
 /// now: mimalloc reclaims an exited thread's segments lazily otherwise (the
-/// arc phase's ~3 GB on a big room, plans/arc-memory.md).
+/// arc phase's ~3 GB on a big room).
 fn collect_freed() {
     // SAFETY: mimalloc's documented API, callable from any thread.
     unsafe { libmimalloc_sys::mi_collect(true) };
@@ -1579,7 +1579,7 @@ impl<N: Rem> Pipe<'_, N> {
     }
 }
 
-/// The frame's PROVISIONAL keys made final (plans/exact-keys.md): the new
+/// The frame's PROVISIONAL keys made final (plans/architecture.md, "Keys"): the new
 /// states' codes the key space lacks, per (shape, field) SORTED and
 /// appended (new shapes first, by hash); returns each provisional key's
 /// packed key. The dictionaries then are a function of the frame's new

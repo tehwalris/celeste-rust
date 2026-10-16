@@ -12,12 +12,12 @@ use std::path::Path;
 const MAGIC: &[u8; 4] = b"C8TB";
 /// Bump whenever the meaning or layout of ANY tree content changes (older
 /// trees are refused; history in git). 13: exact packed keys, the key space
-/// and the storage region side in the metadata (plans/exact-keys.md). 14:
+/// and the storage region side in the metadata (exact keys). 14:
 /// frame files hold ids and the skeleton only, rows decoded from keys
-/// (plans/rows-from-keys.md). 15: NO IDS - a frame file is its new states'
+/// (rows from keys). 15: NO IDS - a frame file is its new states'
 /// keys and cell masks per region with the frame's codebook additions and
 /// skeletons, the drop notes masks per (region, key, horizon)
-/// (plans/keys-only.md). 16: THE HULL FORWARD - a frame's states are
+/// (keys only). 16: THE HULL FORWARD - a frame's states are
 /// those its remainder hulls first reach, its hull file the frontier with
 /// every state's layer and hull; no drop notes (plans/architecture.md "The
 /// forward frame"). 17: a hull file holds its frame's new states by their

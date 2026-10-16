@@ -1,4 +1,4 @@
-//! THE DOUBLES' LOWERING (plans/float-solver.md, milestone 5): a graph in
+//! THE DOUBLES' LOWERING (plans/float.md, "The kernels' safety"): a graph in
 //! `Float` to 8 `f64` lanes a zmm, each operation the reference engine's
 //! (`refdomain` over `LuaF64`/`LuaF64Interval`), bit for bit:
 //!

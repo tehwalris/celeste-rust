@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """The float oracle's goldens: UniversalClassicTas's exact traces of the
-tasdatabase's files (plans/float-solver.md, section 3).
+tasdatabase's files (plans/float.md).
 
     tools/uct/golden.py CAT LEVEL [LEVEL...]     one category's levels
     tools/uct/golden.py CAT all                  every level the category has

@@ -1,4 +1,4 @@
-//! EXACT KEYS (plans/exact-keys.md): a state's identity within its shape is
+//! EXACT KEYS (plans/architecture.md, "Keys"): a state's identity within its shape is
 //! the PACKED tuple of its fields' dictionary indices, not a hash.
 //!
 //!   * `Code`       - a value's exact code (a number and `[n, n]` alike; a

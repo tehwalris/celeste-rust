@@ -1,4 +1,4 @@
-//! LAYERS (plans/keys-only.md): a set of states as the storage holds them -
+//! LAYERS (plans/architecture.md, "The forward"): a set of states as the storage holds them -
 //! per storage region (ascending) its ENTRIES, each a position-free exact
 //! key (ascending in the region) with the mask of its cells. A state is
 //! `(shape, key, cell)` and nothing else: a layer names no state by a
@@ -127,7 +127,7 @@ pub fn bits(mut m: u64) -> impl Iterator<Item = u32> {
 }
 
 /// A SHAPE'S SKELETON as the storage keeps it: everything of a shape's rows
-/// their keys do not say (plans/rows-from-keys.md) - structure with closure
+/// their keys do not say - structure with closure
 /// captures, globals, strings, prints, the non-value cells' uniform
 /// columns, and per value cell how its column holds numbers (`Repr`: the
 /// code merges `Num(n)` and `Ival(n, n)`). Two skeletons of one shape are

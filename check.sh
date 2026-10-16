@@ -218,7 +218,7 @@ gate10_arc() {
     grep '^\[gate\]' "$C/t2/arc10.out" | diff gates/arc_room10_win9-101_h35.txt - >&2
 }
 # The same oracles in float (`--arith float`, the doubles' kernels; plans/
-# float-solver.md, milestone 5): the forward's posgraph and fingerprint,
+# float.md "The kernels' safety"): the forward's posgraph and fingerprint,
 # and the arc gate's search with its concrete witness.
 gate10f_forward() {
     ./safe-run.sh -- "$B" forward --arith float --to 44 --room 1,0 --checkpoint-dir "$C/t2/g10f" > "$C/t2/g10f.out" || return 1
@@ -229,7 +229,7 @@ gate10f_arc() {
     ./safe-run.sh -- "$B" search --arith float --to 35 --win-at 9,101 --checkpoint-dir "$C/t2/arc10f" --prefer gates/known_room10_win9-101.txt --save-marks "$C/t2/arc10f-marks" > "$C/t2/arc10f.out" || return 1
     grep '^\[gate\]' "$C/t2/arc10f.out" | diff gates/float_arc_room10_win9-101_h35.txt - >&2
 }
-# The dual search (`rewrite dual`, plans/float-solver.md milestone 6) at the
+# The dual search (`rewrite dual`, plans/float.md "The dual search and rule (b)") at the
 # same synthetic win: fixed (the IL load) and Celia float, the known route
 # valid in both; its bound and its witness pinned (each half's [gate] lines
 # are the two gates above).
