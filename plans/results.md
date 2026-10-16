@@ -264,8 +264,8 @@ room alone and misses it; Celia models it.
 - Balloon rooms: replay the witness with the file's seeds and with 0 / 0.5
   / PICO-8's rnd (`pico8_diff/replay.py --balloon-seeds a,b`).
 - When a level grows, look at the states before reasoning about counts
-  (`cell-growth`, `col-census --cell`, `coarse-census --erase`, `spurious`,
-  `rerun-row`, `ref-check`, `follow`): that chain found the floor-collision
+  (`census --cells`, `census --cell`, `census --erase`, `spurious`,
+  `ref-check --row`, `check-known`): that chain found the floor-collision
   join bug and room (1,3)'s keying bug.
 - Finding the reference: scan prologue offsets (23-37), replay in the
   original cart (`replay.py --lua ~/src/github.com/tehwalris/celeste_ocaml/

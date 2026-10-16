@@ -216,8 +216,7 @@ tool file starts on the player's first frame.
 - The robustness report has not been run on the earlier float witnesses.
 - `-0`/`+0` are different codes (exact); a canonicalization is deferred
   until a proof that no read tells them apart.
-- The diagnostics `reach`, `follow`, `rerun-row`,
-  `col-census` and others are fixed-only.
+- The diagnostics `census`, `spurious` and `trajectory` are fixed-only.
 - Speed buckets (T3) and exact platform remainders (T2) were planned in
   case float trees ran away; they have not (where compared, float holds
   1.0-1.4x fixed's states).

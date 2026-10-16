@@ -34,9 +34,13 @@
 //! lineage passes everywhere (the concrete search is exhaustive over leaves).
 //! Otherwise the first failing step of each winning lineage is reported with
 //! the check that failed, the node and the state, and the search FAILS.
+//! Where the tree does not hold the state, the report also steps its state
+//! at the frame boundary before through the level's kernels (`explain`):
+//! the route's state among their successors, or a SOUNDNESS gap.
 
 use super::arc_dp::{concrete_engines, exact_state, lookup_keys, lookup_view, rem_of, NodeKeys, Winning};
 use super::rem::Rem;
+use crate::compiled::KernelLanes;
 use crate::frame::{wins_of, Block, MarkFilter, Visited};
 use crate::storage::Sk;
 use celeste_core::arith::EngineNum;
@@ -137,7 +141,7 @@ fn run<N: Rem>(inputs: &[u8], horizon: u32, settings: &crate::settings::Settings
 /// Check the route against one level's pruning. `Ok(None)`: it does not win
 /// by the horizon (nothing to check); `Ok(Some(f))`: it wins during frame
 /// `f` and survives everything; an error: it is PRUNED (the report printed).
-pub fn check<N: Rem>(route: &Route<N>, p: &Pruning<N>) -> anyhow::Result<Option<u32>> {
+pub fn check<N: KernelLanes>(route: &Route<N>, p: &Pruning<N>) -> anyhow::Result<Option<u32>> {
     let t0 = std::time::Instant::now();
     let spf = p.settings.steps_per_frame();
     let (run, seeded) = run::<N>(route.inputs, p.horizon, p.settings)?;
@@ -225,12 +229,64 @@ pub fn check<N: Rem>(route: &Route<N>, p: &Pruning<N>) -> anyhow::Result<Option<
                 crate::search::inspect::player_summary(b.rt2(), 0)
             );
         }
+        if miss(s).is_some_and(|m| m.lost) {
+            match explain(&run, idx, s, seeded, p) {
+                Ok(lines) => lines.iter().for_each(|l| eprintln!("[known]   {l}")),
+                Err(e) => eprintln!("[known]   (the kernels' successors could not be shown: {e:#})"),
+            }
+        }
     }
     anyhow::bail!(
         "the known route (exit f{frame}) is PRUNED at level {} by step {first} ({}): a real winner the search drops - the [known] report above names the check",
         p.level,
         at_frame(first, spf)
     )
+}
+
+/// Why the forward lost the route's state at step `s` (a frame boundary,
+/// on lineage `idx`): its state at the frame boundary before, as the tree
+/// holds it, stepped to `s` by the level's kernels; the route's state
+/// projected onto the level among their successors (the forward made it
+/// and did not keep it: a win, level -1, a filter) or not (a SOUNDNESS gap
+/// in the kernels), and the successors closest to it.
+fn explain<N: KernelLanes>(run: &Run<N>, idx: &[usize], s: usize, seeded: bool, p: &Pruning<N>) -> anyhow::Result<Vec<String>> {
+    use crate::search::inspect::{brief, project_onto, Proj};
+    let spf = p.settings.steps_per_frame() as usize;
+    let s0 = s.checked_sub(spf).ok_or_else(|| anyhow::anyhow!("the start is the tree's"))?;
+    let tree = crate::storage::layer::Tree::<N>::open(p.dir, s as u32)?;
+    let (sk, layer) = if s0 == 0 {
+        (tree.layer(0, None, 1)?.0.states_iter().next().ok_or_else(|| anyhow::anyhow!("no frame-0 state"))?, 0)
+    } else {
+        let (shape, keys, cells) = lookup_keys(&run.layers[s0][idx[s0]].1, p.level, seeded, p.keys)?;
+        let sk = keys[0].and_then(|k| tree.sk(shape, k, cells[0])).ok_or_else(|| anyhow::anyhow!("its state at step {s0} is not in the tree either"))?;
+        (sk, tree.layer_of(sk, s0 as u32)?.ok_or_else(|| anyhow::anyhow!("its state at step {s0} is not in the tree by then"))?)
+    };
+    let kernels = crate::compiled::Kernels::<N>::new(p.settings, p.level)?;
+    let mut blocks = vec![Block::from_rt2(tree.row(layer, sk, p.settings.room)?)];
+    for k in 0..spf {
+        blocks = crate::storage::wave::one_frame(&kernels, blocks, layer + 1 + k as u32)?.next;
+    }
+    let kset: std::collections::BTreeSet<Proj> = blocks.into_iter().flat_map(|b| project_onto(&mut b.into_rt2(), p.level)).collect();
+    let want = project_onto(&mut lookup_view(run.layers[s][idx[s]].1.rt2(), seeded)?, p.level).remove(0);
+    let made = kset.contains(&want);
+    let mut out = vec![format!(
+        "the kernels from its state at step {s0} (the tree's row, layer {layer}, state {}): {} successors at step {s}; the route's state is {}",
+        sk.show(),
+        kset.len(),
+        if made { "ONE OF THEM (the forward made it and did not keep it: a win, level -1 or a filter)" } else { "NOT one of them: a SOUNDNESS gap in the kernels" }
+    )];
+    out.push(format!("  the route's state: {}", brief(&want)));
+    if made {
+        return Ok(out);
+    }
+    let dist = |k: &Proj| k.iter().filter(|(n, v)| want.get(*n) != Some(*v)).count() + want.keys().filter(|n| !k.contains_key(*n)).count();
+    let mut near: Vec<&Proj> = kset.iter().collect();
+    near.sort_by_key(|k| dist(k));
+    for k in near.iter().take(5) {
+        let diff: Vec<String> = k.iter().filter(|(n, v)| want.get(*n) != Some(*v)).map(|(n, v)| format!("{n}: kernel {v}, route {}", want.get(n).map_or("-", String::as_str))).collect();
+        out.push(format!("  a kernel successor at distance {}: {}", dist(k), diff.join("; ")));
+    }
+    Ok(out)
 }
 
 /// A step as the frame it belongs to.
@@ -247,15 +303,21 @@ fn at_frame(s: u32, spf: u32) -> String {
 /// arc phase (no winning set, outside W, not reached).
 struct Miss {
     forward: bool,
+    /// The tree does not hold it: the report explains (`explain`).
+    lost: bool,
     what: String,
 }
 
 fn forward(what: String) -> Option<Miss> {
-    Some(Miss { forward: true, what })
+    Some(Miss { forward: true, lost: false, what })
+}
+
+fn lost(what: String) -> Option<Miss> {
+    Some(Miss { forward: true, lost: true, what })
 }
 
 fn backward(what: String) -> Option<Miss> {
-    Some(Miss { forward: false, what })
+    Some(Miss { forward: false, lost: false, what })
 }
 
 /// A route state as the tree holds it: its state, and its exact remainder
@@ -279,12 +341,12 @@ fn rem_raw<N: Rem>(b: &Block<N>) -> anyhow::Result<Option<(N, N)>> {
 /// recorded edge from its parent mapping the parent's remainder to its
 /// own. Where the tree holds it, or the first part that fails.
 fn hull_claim<N: Rem>(b: &Block<N>, s: u32, sk: Option<Sk>, from: Option<Held<N>>, h: &Hulls<N>, node: &str) -> anyhow::Result<Result<Held<N>, Miss>> {
-    let miss = |what: String| Ok(Err(Miss { forward: true, what }));
+    let miss = |what: String| Ok(Err(Miss { forward: true, lost: false, what }));
     let Some((sk, layer)) = (match sk {
         Some(sk) => h.tree.layer_of(sk, s)?.map(|l| (sk, l)),
         None => None,
     }) else {
-        return miss(format!("NOT IN THE TREE by step {s} ({node})"));
+        return Ok(Err(Miss { forward: true, lost: true, what: format!("NOT IN THE TREE by step {s} ({node})") }));
     };
     let r = rem_raw(b)?;
     let zero = <N::A as celeste_core::arith::Arithmetic>::from_i16(0);
@@ -367,7 +429,7 @@ fn verdict<N: Rem>(b: &Block<N>, s: u32, from: Option<Held<N>>, seeded: bool, l1
                 sk.show(),
                 p.horizon
             )),
-            None => forward(format!("NOT IN THE TREE by step {s}: the forward lost it since the step before (the kernels, the visited set, or a filter on a mid-frame step; `rewrite follow` shows its parent's kernel successors) ({node})")),
+            None => lost(format!("NOT IN THE TREE by step {s}: the forward lost it since the step before (the kernels, the visited set, or a filter on a mid-frame step) ({node})")),
         };
         return Ok((miss, held));
     };

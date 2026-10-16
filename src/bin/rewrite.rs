@@ -414,13 +414,16 @@ enum Command {
         emitted: usize,
     },
     /// THE KERNELS AGAINST THE REFERENCE ENGINE, row by row: `samples` stored
-    /// rows first reached at step `frame` (in `--cell x,y` if given) each run
-    /// one step through the kernels of `--level` and through `RefEngine`, both
-    /// sides projected onto the level and compared by named fields. A
-    /// reference successor the kernels miss is a SOUNDNESS gap; a kernel
-    /// successor the reference never makes is a PRECISION gap. Every row,
-    /// kernel successor and reference leaf must also convert alike on the
-    /// tracer's side and the reference's (`block::check_agreement`).
+    /// rows first reached at step `frame` (in `--cell x,y` if given; `--row
+    /// N` the N-th alone) each run one step through the kernels of
+    /// `--level` and through `RefEngine`, both sides projected onto the
+    /// level and compared by named fields. A reference successor the
+    /// kernels miss is a SOUNDNESS gap; a kernel successor the reference
+    /// never makes is a PRECISION gap. Every row, kernel successor and
+    /// reference leaf must also convert alike on the tracer's side and the
+    /// reference's (`block::check_agreement`). With `--row`, the row's named
+    /// fields and every kernel successor (its position and the fields that
+    /// differ from the row) are printed too.
     RefCheck {
         /// The level's tree (the dir holding `frames/` and `edges/`; a search's
         /// `<checkpoint-dir>/levelNN`).
@@ -450,27 +453,10 @@ enum Command {
         /// sides, the row itself), not the player's fields alone.
         #[arg(long)]
         full: bool,
-    },
-    /// DIAGNOSTIC: re-run ONE stored state through the kernels of `--level`
-    /// and print every successor (projected without `--erase`), next to the
-    /// state itself: what the kernel makes of a single row. `--row L:S:R` is
-    /// the row's (layer, seq, row) in the tree's frame files.
-    RerunRow {
-        /// The level's tree (the dir holding `frames/` and `edges/`; a search's
-        /// `<checkpoint-dir>/levelNN`).
+        /// Only the N-th state of the frame (in the tree's order: by region,
+        /// key, cell; of `--cell`'s if given), its kernel successors printed.
         #[arg(long)]
-        level_dir: String,
-        /// The row, `LAYER:N`: the N-th state of frame LAYER in the tree's
-        /// order (by region, key, cell).
-        #[arg(long)]
-        row: String,
-        /// The level whose kernels run it (the tree's).
-        #[arg(long, value_parser = Level::parse)]
-        level: Level,
-        /// Named-cell prefixes left out of the printed projections, comma-
-        /// separated.
-        #[arg(long, default_value = "fall_floor")]
-        erase: String,
+        row: Option<usize>,
     },
     /// DIAGNOSTIC: where a tree's states come from. `samples` states of
     /// `--coarse` first reached at `step` in `--cell` are walked back through
@@ -610,27 +596,6 @@ enum Command {
         #[arg(long)]
         tree: Option<String>,
     },
-    /// DIAGNOSTIC: follow a CONCRETE input sequence through one level's tree:
-    /// per frame, whether the projected concrete state is a row of the tree.
-    /// At the first frame it is not, or at the win (never stored), the parent
-    /// row goes through the kernels and the concrete successor is printed
-    /// next to the closest kernel successors: no equal one is a SOUNDNESS
-    /// gap; an equal one was not stored (a win, or the level -1 filter).
-    Follow {
-        /// The level's tree (the dir holding `frames/` and `edges/`; a search's
-        /// `<checkpoint-dir>/levelNN`).
-        #[arg(long)]
-        level_dir: String,
-        /// The tree's level (the concrete states are projected onto it).
-        #[arg(long, value_parser = Level::parse)]
-        level: Level,
-        /// The input bytes: a file in the `tas/` format, or a comma list.
-        #[arg(long)]
-        inputs: String,
-        /// How many of the closest kernel successors to print.
-        #[arg(long, default_value_t = 5)]
-        show: usize,
-    },
     /// The level -1 table (`--room`) against a known solution:
     /// its concrete states (reference engine) at every frame f before the
     /// exit, each with the table's d. One that is too late for `--horizon`
@@ -699,6 +664,7 @@ struct RefCheckArgs {
     show: usize,
     path_cap: Option<usize>,
     full: bool,
+    row: Option<usize>,
 }
 
 /// `ref-check` in arithmetic `A`, its kernels `K`.
@@ -708,7 +674,7 @@ where
     A: celeste_rust::transpile::garith::GraphArith,
     A::Num: celeste_rust::search::rem::Rem,
 {
-            let RefCheckArgs { level_dir, frame, level, samples, cell, show, path_cap, full } = o;
+            let RefCheckArgs { level_dir, frame, level, samples, cell, show, path_cap, full, row } = o;
             let dir = std::path::Path::new(&level_dir);
             cfg.check(dir, level)?;
             let kernels = K::new(cfg, level)?;
@@ -719,8 +685,15 @@ where
             let geo = celeste_rust::storage::GEOMETRY;
             let all: Vec<Sk> = tree.layer(frame, None, cfg.threads())?.0.states_iter().filter(|s| only.is_none_or(|c| s.cell(&geo) == c)).collect();
             anyhow::ensure!(!all.is_empty(), "no rows at step {frame}");
-            let n = samples.min(all.len());
-            let picked: Vec<Sk> = (0..n).map(|k| all[k * all.len() / n]).collect();
+            let picked: Vec<Sk> = match row {
+                Some(r) => vec![*all.get(r).ok_or_else(|| anyhow::anyhow!("--row {r}: step {frame} has {} states", all.len()))?],
+                None => {
+                    let n = samples.min(all.len());
+                    (0..n).map(|k| all[k * all.len() / n]).collect()
+                }
+            };
+            let n = picked.len();
+            let ids = celeste_rust::compiled::ids();
             // One row: (its report, reference-only successors, kernel-only,
             // skipped over the path cap, lanes converted alike).
             let one = |reference: &mut celeste_rust::trace::refengine::ReferenceEngine<A>, sk: Sk| -> Result<(String, usize, usize, usize, usize)> {
@@ -737,11 +710,25 @@ where
                     Ok(())
                 };
                 agree(reference, &rt2)?;
-                // The kernels' successors.
+                // The kernels' successors (with `--row`, each printed: its
+                // position and the fields that differ from the row).
                 let (next, _) = rerun(&kernels, rt2.clone_block(), frame)?;
                 let mut kset: std::collections::BTreeSet<Proj> = Default::default();
+                let mut shown = String::new();
+                let me = project_row(&rt2, &cell_names(&rt2, ids), 0, &[]);
+                if row.is_some() {
+                    shown += &format!("    the row: {}\n", me.iter().map(|(k, v)| format!("{k}={v}")).collect::<Vec<_>>().join(" "));
+                }
                 for b in next {
                     agree(reference, b.rt2())?;
+                    if row.is_some() {
+                        let (cells, names) = (celeste_rust::search::pos_graph::block_cells(b.rt2())?, cell_names(b.rt2(), ids));
+                        for i in 0..b.rt2().width {
+                            let p = project_row(b.rt2(), &names, i as u32, &[]);
+                            let changed: Vec<String> = p.iter().filter(|(k, v)| me.get(*k) != Some(*v)).map(|(k, v)| format!("{k}={v}")).collect();
+                            shown += &format!("    -> {} {}\n", where_(cells[i]), changed.join(" "));
+                        }
+                    }
                     kset.extend(project_onto(&mut b.into_rt2(), level));
                 }
                 // The reference engine's, from the row projected onto the level.
@@ -761,7 +748,7 @@ where
                 let missing: Vec<&Proj> = rset.difference(&kset).collect();
                 let extra: Vec<&Proj> = kset.difference(&rset).collect();
                 let verdict = if missing.is_empty() && extra.is_empty() { "ok" } else { "DIFFERS" };
-                let mut out = format!("[ref-check] state {id} at {at}: kernels {} successors, reference {}: {verdict} ({} only in the reference, {} only in the kernels)\n", kset.len(), rset.len(), missing.len(), extra.len());
+                let mut out = format!("[ref-check] state {id} at {at}: kernels {} successors, reference {}: {verdict} ({} only in the reference, {} only in the kernels)\n{shown}", kset.len(), rset.len(), missing.len(), extra.len());
                 let says = |p: &Proj| if full { format!("{p:?}") } else { brief(p) };
                 for p in missing.iter().take(show) {
                     out += &format!("    only in the REFERENCE (soundness gap): {}\n", says(p));
@@ -1025,7 +1012,7 @@ enum Levels<N: Rem> {
 /// phase, recorded in `res.levels` (their dirs named under `prefix`). The
 /// last level ends as `finish` says.
 #[allow(clippy::too_many_arguments)]
-fn run_levels<N: Rem>(
+fn run_levels<N: celeste_rust::compiled::KernelLanes>(
     cfg: &celeste_rust::settings::Settings,
     steps: u32,
     levels: &[Level],
@@ -1135,7 +1122,7 @@ fn clear_record(base: &std::path::Path) -> Result<()> {
 /// a level's frame step, `initial` the start), each level's arc phase, and
 /// the concrete search at the last; the result recorded beside the trees.
 #[allow(clippy::too_many_arguments)]
-fn search<N: celeste_rust::search::rem::Rem>(
+fn search<N: celeste_rust::compiled::KernelLanes>(
     cfg: &celeste_rust::settings::Settings,
     to: Option<u32>,
     ceiling: Option<u32>,
@@ -1383,7 +1370,7 @@ fn forward<N: celeste_rust::search::rem::Rem>(
 }
 
 /// `check-known` (`Command::CheckKnown`) in the arithmetic of `N`.
-fn check_known<N: Rem>(checkpoint_dir: &str, level: &str, inputs: &str, horizon: u32, cfg: &celeste_rust::settings::Settings) -> Result<()> {
+fn check_known<N: celeste_rust::compiled::KernelLanes>(checkpoint_dir: &str, level: &str, inputs: &str, horizon: u32, cfg: &celeste_rust::settings::Settings) -> Result<()> {
     use celeste_rust::search::arc_dp::solve;
     let inputs = celeste_rust::concrete::read_inputs(inputs)?;
     let steps = horizon * cfg.steps_per_frame();
@@ -1922,44 +1909,12 @@ fn main() -> Result<()> {
             Arith::Fixed => widen_check::<celeste_rust::compiled::FrameEngine, P8>(&cfg, &level_dir, frame, level, emitted)?,
             Arith::Float(_) => widen_check::<celeste_rust::compiled::FloatKernels, LuaF64>(&cfg, &level_dir, frame, level, emitted)?,
         },
-        Command::RefCheck { level_dir, frame, level, samples, cell, show, path_cap, full } => {
-            let o = RefCheckArgs { level_dir, frame, level, samples, cell, show, path_cap, full };
+        Command::RefCheck { level_dir, frame, level, samples, cell, show, path_cap, full, row } => {
+            let o = RefCheckArgs { level_dir, frame, level, samples, cell, show, path_cap, full, row };
             match cfg.arith {
                 Arith::Fixed => ref_check::<celeste_rust::compiled::FrameEngine, celeste_core::arith::Fixed>(&cfg, o)?,
                 Arith::Float(_) => ref_check::<celeste_rust::compiled::FloatKernels, celeste_core::arith::Float>(&cfg, o)?,
             }
-        }
-        Command::RerunRow { level_dir, row, level, erase } => {
-            let ids = celeste_rust::compiled::ids();
-            let dir = std::path::Path::new(&level_dir);
-            let erase = prefixes(&erase);
-            let parts: Vec<u64> = row.split(':').map(|s| s.trim().parse()).collect::<Result<_, _>>()?;
-            let [layer, r] = parts[..] else { anyhow::bail!("--row L:N") };
-            let layer = layer as u32;
-            cfg.check(dir, level)?;
-            let engine = celeste_rust::compiled::FrameEngine::new(&cfg, level)?;
-            let tree = Tree::<P8>::open(dir, layer)?;
-            let (states, _) = tree.layer(layer, None, cfg.threads())?;
-            let sk = states.states_iter().nth(r as usize).ok_or_else(|| anyhow::anyhow!("state {r} past frame {layer}'s {}", states.states()))?;
-            let rt2 = tree.row(layer, sk, cfg.room)?;
-            let me = project_row(&rt2, &cell_names(&rt2, ids), 0, &erase);
-            println!("[rerun] l{layer} n{r} (state {}) at {}:", sk.show(), where_(sk.cell(&celeste_rust::storage::GEOMETRY)));
-            for (n, v) in &me {
-                println!("    {n} = {v}");
-            }
-            let (next, won) = rerun(&engine, rt2, layer)?;
-            let mut n = 0;
-            for b in &next {
-                let cells = celeste_rust::search::pos_graph::block_cells(b.rt2())?;
-                let names = cell_names(b.rt2(), ids);
-                for i in 0..b.rt2().width {
-                    let p = project_row(b.rt2(), &names, i as u32, &erase);
-                    let changed: Vec<String> = p.iter().filter(|(k, v)| me.get(*k) != Some(*v)).map(|(k, v)| format!("{k}={v}")).collect();
-                    println!("  -> {} {}", where_(cells[i]), changed.join(" "));
-                    n += 1;
-                }
-            }
-            println!("[rerun] {n} successors, win {won}");
         }
         Command::Spurious { coarse, real, step, cell, erase, samples, depth, chain_out } => {
             use std::collections::{BTreeMap, HashMap};
@@ -2263,89 +2218,6 @@ fn main() -> Result<()> {
             }
             println!("[trajectory] followed to the end: {} states; one input sequence:", layer.len());
             println!("{}", layer[0].1.iter().map(|b| b.to_string()).collect::<Vec<_>>().join(","));
-        }
-        Command::Follow { level_dir, level, inputs, show } => {
-            let dir = std::path::Path::new(&level_dir);
-            let tree = tree_of(dir)?;
-            let lvl = level;
-            cfg.check(dir, lvl)?;
-            let bytes = celeste_rust::concrete::read_inputs(&inputs)?;
-            // (key, cell) -> (layer, state): where the tree first has it.
-            let mut at: rustc_hash::FxHashMap<(u64, u64, u32), (u32, Sk)> = Default::default();
-            let geo = celeste_rust::storage::GEOMETRY;
-            let layers = tree.last + 1;
-            for f in 0..layers {
-                for sk in tree.layer(f, None, cfg.threads())?.0.states_iter() {
-                    at.entry((sk.key.0, sk.key.1, sk.cell(&geo))).or_insert((f, sk));
-                }
-            }
-            let space = &tree.space;
-            eprintln!("[follow] {} rows in {layers} layers, {} inputs", at.len(), bytes.len());
-            let mut eng = RefEngine::new(&cfg)?;
-            let mut states = vec![eng.initial()?];
-            let mut parent: Option<(u32, Sk)> = None;
-            for (f, &byte) in bytes.iter().enumerate() {
-                let f = f as u32 + 1;
-                let mut next = Vec::new();
-                for s0 in &states {
-                    next.extend(eng.step(s0, byte)?);
-                }
-                // Where the tree has one of the concrete leaves (an `rnd` fork
-                // makes several).
-                let mut found = None;
-                let mut won = false;
-                for block in &next {
-                    if wins_of(block.rt2(), &cfg)?.iter().any(|&w| w) {
-                        won = true;
-                    }
-                    let (_, keys, cells) = widened_keys(block, lvl, space)?;
-                    if let Some(&loc) = keys[0].and_then(|k| at.get(&(k.0, k.1, cells[0]))) {
-                        found = Some(loc);
-                    }
-                }
-                // A win is not stored in the tree: check the kernels make it.
-                let Some(loc) = found.filter(|_| !won) else {
-                    println!("[follow] f{f} input {byte}: {} ({} concrete leaves)", if won { "WIN" } else { "NOT IN THE TREE" }, next.len());
-                    let (layer, sk) = parent.ok_or_else(|| anyhow::anyhow!("the first step is already missing"))?;
-                    let rt2 = tree.row(layer, sk, cfg.room)?;
-                    println!("    parent row (layer {layer}, state {}): {}", sk.show(), brief(&project_onto(&mut rt2.clone_block(), lvl)[0]));
-                    for s in &states {
-                        println!("    concrete parent: {}", brief(&project_all(s)[0]));
-                    }
-                    let kernels = celeste_rust::compiled::FrameEngine::new(&cfg, lvl)?;
-                    let (out, _) = rerun(&kernels, rt2, layer)?;
-                    let mut kset: std::collections::BTreeSet<Proj> = Default::default();
-                    let mut kwins = 0;
-                    for b in out {
-                        let mut w = b.into_rt2();
-                        let wins = wins_of(&w, &cfg)?;
-                        kwins += wins.iter().filter(|&&x| x).count();
-                        kset.extend(project_onto(&mut w, lvl));
-                    }
-                    println!("    {} kernel successors, {kwins} of them wins", kset.len());
-                    for succ in &next {
-                        let p = project_onto(&mut succ.rt2().clone_block(), lvl).remove(0);
-                        let verdict = if kset.contains(&p) { "a kernel successor (not stored: a win, or dropped by level -1)" } else { "NOT a kernel successor" };
-                        println!("    concrete successor, {verdict}: {}", brief(&p));
-                        let dist = |k: &Proj| k.iter().filter(|(n, v)| p.get(*n) != Some(*v)).count() + p.keys().filter(|n| !k.contains_key(*n)).count();
-                        let mut near: Vec<&Proj> = kset.iter().collect();
-                        near.sort_by_key(|k| dist(k));
-                        for k in near.iter().take(show) {
-                            let diff: Vec<String> = k
-                                .iter()
-                                .filter(|(n, v)| p.get(*n) != Some(*v))
-                                .map(|(n, v)| format!("{n}: kernel {v}, concrete {}", p.get(n).map(String::as_str).unwrap_or("-")))
-                                .collect();
-                            println!("      kernel successor at distance {}: {}", dist(k), diff.join("; "));
-                        }
-                    }
-                    return Ok(());
-                };
-                println!("[follow] f{f} input {byte}: in the tree at layer {} (state {})", loc.0, loc.1.show());
-                parent = Some(loc);
-                states = next.into_iter().map(Block::into_rt2).collect();
-            }
-            println!("[follow] every frame is in the tree");
         }
         Command::L1Check { inputs, horizon, spd } => match cfg.arith {
             Arith::Fixed => l1_check::<Fixed>(&inputs, horizon, spd, &cfg)?,

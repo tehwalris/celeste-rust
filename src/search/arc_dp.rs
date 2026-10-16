@@ -1955,7 +1955,7 @@ pub fn gate_w_hash<C: Circle>(node: u64, r: RegionRef<C>) -> u64 {
 /// the concrete search (`search::known`): an error if one drops it.
 #[allow(clippy::too_many_arguments)]
 #[allow(clippy::too_many_arguments)]
-pub fn solve<N: Rem>(
+pub fn solve<N: crate::compiled::KernelLanes>(
     dir: &std::path::Path,
     level: crate::abstraction::Level,
     horizon: u32,
