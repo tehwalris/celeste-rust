@@ -1,7 +1,7 @@
 //! The REFERENCE domain: a scalar abstract interpreter over the Lua AST, the
 //! oracle the kernels are checked against.
 //!
-//! It plugs into `Interp<D>` like `Concrete` and `Symbolic`, but runs one
+//! It plugs into `Interp<D>` like `Symbolic`, but runs one
 //! ABSTRACT scalar path and enumerates the fork tree by RE-EXECUTION
 //! (`refdriver`). `Num` is an interval (a point is `[n,n]`); `Bool` is a
 //! plain `bool`: every fork (a straddling comparison, an unknown button, a

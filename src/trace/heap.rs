@@ -23,6 +23,7 @@ pub type ClosureId = u32;
 /// the heap, so the heap stores an index rather than a reference).
 pub type BodyId = u32;
 
+#[derive(Clone)]
 pub enum Value<D: Domain> {
     Nil,
     Num(D::Num),
@@ -39,20 +40,6 @@ pub enum Value<D: Domain> {
     /// on two closures is refused rather than answered (`Interp::eval_binop`).
     Func(ClosureId),
     Builtin(&'static str),
-}
-
-impl<D: Domain> Clone for Value<D> {
-    fn clone(&self) -> Self {
-        match self {
-            Value::Nil => Value::Nil,
-            Value::Num(n) => Value::Num(n.clone()),
-            Value::Bool(b) => Value::Bool(b.clone()),
-            Value::Str(s) => Value::Str(s.clone()),
-            Value::Table(t) => Value::Table(*t),
-            Value::Func(c) => Value::Func(*c),
-            Value::Builtin(n) => Value::Builtin(n),
-        }
-    }
 }
 
 impl<D: Domain> PartialEq for Value<D> {
@@ -91,6 +78,7 @@ impl<D: Domain> std::fmt::Debug for Value<D> {
 /// on a real PICO-8 (`lua/probe/tables.lua`), `t={} t[3]="c"` has `#t == 0`
 /// (dense-with-nils would say 3), and `t[1]="a" t[2]="b"` then gives 3 once
 /// the array part absorbs the gap.
+#[derive(Clone, Default)]
 pub struct Table<D: Domain> {
     pub hash: BTreeMap<String, Value<D>>,
     /// The array part. May contain explicit `Nil`s (Lua does not shrink it).
@@ -180,27 +168,10 @@ impl<D: Domain> Table<D> {
     }
 }
 
-impl<D: Domain> Clone for Table<D> {
-    fn clone(&self) -> Self {
-        Table { hash: self.hash.clone(), arr: self.arr.clone(), ints: self.ints.clone() }
-    }
-}
-
-impl<D: Domain> Default for Table<D> {
-    fn default() -> Self {
-        Table { hash: BTreeMap::new(), arr: Vec::new(), ints: BTreeMap::new() }
-    }
-}
-
+#[derive(Clone)]
 pub struct Scope<D: Domain> {
     pub vars: BTreeMap<String, Value<D>>,
     pub parent: Option<ScopeId>,
-}
-
-impl<D: Domain> Clone for Scope<D> {
-    fn clone(&self) -> Self {
-        Scope { vars: self.vars.clone(), parent: self.parent }
-    }
 }
 
 impl<D: Domain> PartialEq for Table<D> {
@@ -243,33 +214,12 @@ pub struct Closure {
     pub captures: Vec<String>,
 }
 
+#[derive(Clone, Default)]
 pub struct Heap<D: Domain> {
     pub tables: BTreeMap<TableId, Table<D>>,
     pub scopes: BTreeMap<ScopeId, Scope<D>>,
     pub closures: BTreeMap<ClosureId, Closure>,
     next: u32,
-}
-
-impl<D: Domain> Clone for Heap<D> {
-    fn clone(&self) -> Self {
-        Heap {
-            tables: self.tables.clone(),
-            scopes: self.scopes.clone(),
-            closures: self.closures.clone(),
-            next: self.next,
-        }
-    }
-}
-
-impl<D: Domain> Default for Heap<D> {
-    fn default() -> Self {
-        Heap {
-            tables: BTreeMap::new(),
-            scopes: BTreeMap::new(),
-            closures: BTreeMap::new(),
-            next: 0,
-        }
-    }
 }
 
 impl<D: Domain> Heap<D> {

@@ -92,7 +92,7 @@ pub fn blank<A: GraphArith>(st: &mut State<Symbolic<A>>, d: &mut Symbolic<A>) ->
     for p in state_paths(st)? {
         let v = match iface::get(st, &p) {
             Some(Value::Bool(_)) => Value::Bool(d.boolean(false)),
-            _ => Value::Num(d.num(A::from_i16(0))),
+            _ => Value::Num(d.int(0)),
         };
         iface::set(st, &p, v)?;
     }
@@ -193,7 +193,7 @@ pub fn rebase<A: GraphArith>(st: &mut State<Symbolic<A>>, d: &mut Symbolic<A>, c
             *v = match (constants.get(&n), is_num) {
                 (Some(iface::Conc::Num(c)), true) => Value::Num(d.num(*c)),
                 (Some(iface::Conc::Bool(c)), false) => Value::Bool(d.boolean(*c)),
-                (_, true) => Value::Num(d.num(A::from_i16(0))),
+                (_, true) => Value::Num(d.int(0)),
                 (_, false) => Value::Bool(d.boolean(false)),
             };
         }

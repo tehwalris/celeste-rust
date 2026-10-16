@@ -28,7 +28,7 @@ pub fn materialize_absent_fields<D: Domain>(st: &mut State<D>, d: &mut D) -> Res
             let Some(Value::Table(t)) = iface::get(st, &obj) else { bail!("{}: not a table", iface::show(&obj)) };
             match st.heap.tables[&t].hash.get(f) {
                 None | Some(Value::Nil) => {
-                    let zero = Value::Num(d.num(<D::A as celeste_core::arith::Arithmetic>::from_i16(0)));
+                    let zero = Value::Num(d.int(0));
                     st.heap.tables.get_mut(&t).unwrap().hash.insert(f.to_string(), zero);
                 }
                 Some(Value::Num(_)) => {}
@@ -381,7 +381,7 @@ pub fn near_floor_states<A: GraphArith>(st: &State<Symbolic<A>>, level: Level) -
 /// both values.
 fn read_near_floors<A: GraphArith>(st: &mut State<Symbolic<A>>, d: &mut Symbolic<A>, e: &Entry, mid: bool) -> Result<()> {
     use super::domain::Cmp;
-    let two = if mid { None } else { Some(d.num(A::from_i16(2))) };
+    let two = if mid { None } else { Some(d.int(2)) };
     for paths in entry_paths(st, e) {
         let [ps, pc] = &paths[..] else { bail!("the near floors' entry has two slots") };
         match two {
@@ -486,7 +486,7 @@ fn widen_near_floors<A: GraphArith>(st: &mut State<Symbolic<A>>, d: &mut Symboli
         // `state` 2 too. Do not owe `state == 2` separately: a shaking floor's
         // `sel(delay - 1 <= 0, 2, 1)` is undecided and would decline the lane.
         let apart = d.not(&overlap);
-        let two = d.num(A::from_i16(2));
+        let two = d.int(2);
         let range = ival(d, slo, shi);
         // With the platforms unknown, the overlapped floor stores what the
         // frame COMPUTED instead (exact, nothing owed): there the hidden

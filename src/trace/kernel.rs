@@ -597,7 +597,7 @@ pub fn room_constant_lattice<A: GraphArith>(
                     _ => it.d.range_of(n).as_ref().and_then(A::lit_hull),
                 };
                 start_ivals.insert(p.clone(), lit);
-                let zero = it.d.num(A::from_i16(0));
+                let zero = it.d.int(0);
                 super::iface::set(reps.get_mut(&sk).expect("inserted above"), &p, super::heap::Value::Num(zero))?;
                 ival_extra.entry(sk.clone()).or_default().insert(p);
             }

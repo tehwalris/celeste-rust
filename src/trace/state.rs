@@ -11,6 +11,7 @@ use anyhow::{bail, Result};
 use super::domain::Domain;
 use super::heap::{Heap, Root, ScopeId, Shape, TableId, Value};
 
+#[derive(Clone)]
 pub struct State<D: Domain> {
     pub heap: Heap<D>,
     /// The globals table: always root 0, so canonical numbering agrees.
@@ -68,6 +69,7 @@ pub struct State<D: Domain> {
 /// One axis of the arc capture: whether the path took the player's split on
 /// it, and if so the split's argument (`rem + ox + 1/2`), the fragment it
 /// took, and the move's `ox` (`search::arc_edges::RawAxis`).
+#[derive(Clone)]
 pub struct ArcAxis<D: Domain> {
     pub took: D::Bool,
     pub pre: D::Num,
@@ -78,14 +80,8 @@ pub struct ArcAxis<D: Domain> {
 impl<D: Domain> ArcAxis<D> {
     /// No split taken (the values are placeholders).
     pub fn none(d: &mut D) -> Self {
-        let zero = d.num(<D::A as celeste_core::arith::Arithmetic>::from_i16(0));
+        let zero = d.int(0);
         ArcAxis { took: d.boolean(false), pre: zero.clone(), frag: zero.clone(), ox: zero }
-    }
-}
-
-impl<D: Domain> Clone for ArcAxis<D> {
-    fn clone(&self) -> Self {
-        ArcAxis { took: self.took.clone(), pre: self.pre.clone(), frag: self.frag.clone(), ox: self.ox.clone() }
     }
 }
 
@@ -131,22 +127,6 @@ pub struct Merged<D: Domain> {
     /// The first slot whose join left a select, with its two values: what a
     /// refused rejoin names (`Interp::rejoin_fragments`).
     pub first_select: Option<String>,
-}
-
-impl<D: Domain> Clone for State<D> {
-    fn clone(&self) -> Self {
-        State {
-            heap: self.heap.clone(),
-            globals: self.globals,
-            scope: self.scope,
-            stack: self.stack.clone(),
-            guard: self.guard.clone(),
-            ended: self.ended.clone(),
-            path: self.path.clone(),
-            frag: self.frag.clone(),
-            arc: self.arc.clone(),
-        }
-    }
 }
 
 impl<D: Domain> State<D> {
