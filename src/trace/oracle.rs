@@ -364,7 +364,9 @@ mod tests {
 
     /// A witness file (`[seeds]inputs`, the tools' format) of category `cat`
     /// at `level` leaves its room on its last input in the FIXED reference
-    /// engine, from the IL load.
+    /// engine, from the IL load: some lineage, where an unseeded `rnd` (a
+    /// chest's shake, which no file seeds in 16.16) forks the frame, and
+    /// none before the last input.
     fn exits_in_fixed_point(path: &std::path::Path, cat: &str, level: i16) -> Result<()> {
         use crate::trace::refengine::RefEngine;
         let (gemskip, rest) = cat.strip_prefix("gemskip").map_or((false, cat), |r| (true, r));
@@ -380,23 +382,29 @@ mod tests {
         let room = ((level - 1) % 8, (level - 1) / 8);
         let s = crate::settings::Settings { room, gemskip, hundred, nodiag, balloon_seeds: Some(seeds.to_string()), ..Default::default() };
         let mut eng = RefEngine::new(&s)?;
-        let mut st = eng.start_state().clone();
+        let mut sts = vec![eng.start_state().clone()];
         let at = |st: &State<RefDomain>| (iface::get(st, &[iface::key("room"), iface::key("x")]), iface::get(st, &[iface::key("room"), iface::key("y")]));
-        let start = at(&st);
+        let start = at(&sts[0]);
         let (mut k, mut frames) = (0usize, 0u32);
         let exited = loop {
-            let player = !crate::trace::widen::objects_of_type(&st, "player").is_empty();
+            // The spawn's timing is every lineage's (no `rnd` before it).
+            let player = !crate::trace::widen::objects_of_type(&sts[0], "player").is_empty();
             let input = if player { inputs.get(k).copied() } else { Some(0) };
             let Some(input) = input else { break false };
             k += usize::from(player);
             frames += 1;
-            let mut leaves = eng.frame_states(&st, input)?;
-            ensure!(leaves.len() == 1, "{}: frame {frames}: a concrete frame forked", path.display());
-            st = leaves.remove(0);
-            st.gc();
-            if at(&st) != start {
+            let mut next = Vec::new();
+            for st in &sts {
+                next.extend(eng.frame_states(st, input)?);
+            }
+            ensure!(next.len() <= 64, "{}: frame {frames}: {} lineages", path.display(), next.len());
+            for st in &mut next {
+                st.gc();
+            }
+            if next.iter().any(|st| at(st) != start) {
                 break true;
             }
+            sts = next;
         };
         ensure!(exited && k == inputs.len(), "{}: the fixed engine {} after {k} of {} inputs (frame {frames})", path.display(), if exited { "exited" } else { "did not exit" }, inputs.len());
         Ok(())

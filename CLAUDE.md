@@ -237,7 +237,9 @@ pico8_diff/replay.py --room 1,0 tas/room_1_0_exit_frame_99.txt
 ### The UI (`ui/`)
 
 A phone-first web view of one finished search (`search --save-marks DIR`,
-then `rewrite export-ui --help`); building and serving: `ui/README.md` and
+in either arithmetic, or `dual --save-marks DIR`: the float half's arc pass
+and the dual witness; then `rewrite export-ui --help`, which reads each tree
+in its recorded arithmetic); building and serving: `ui/README.md` and
 UI-HOSTING.md. Served under `/celeste/` on port 3011 only, never uncapped
 (`systemd-run --user --scope -p MemoryMax=2G`); nothing generated is
 committed.

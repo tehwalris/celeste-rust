@@ -89,6 +89,10 @@ The two `#[ignore]`d tests (resume, level -1 balloon) are t3.
 | refcheck-r42x | same, room (4,2) objects exact f55 | the same in an object room | 4.9 s |
 | arccheck-r10 | `arc-check` 32 records of r10 f56, `--path-cap 4096` | the recorded transfers against the reference | 3.0 s |
 | arccheck-r42x | same, (4,2) objects exact f56 | the same in an object room | 2.6 s |
+| frame-f10, -f42n | `bench-frame --arith float` of f10 f55, f42n f60 (no `--metrics`: the kernel mix census is 16.16's) | the float twins' f/h/e lines: the doubles' kernels, exactly (each equals its fixture's own frame) | 1.7 s, 2.8 s |
+| keycheck-f42n | `bench-frame --arith float --key-check` f42n f60 | the float object level's keys | 4.1 s |
+| backward-f10arc | `bench-backward --arith float` over f10arc (W f45 of h56; its search's W line) | a float arc backward step | 0.3 s |
+| refcheck-f10, -f42x; arccheck-f10, -f42x; widen-f10, -f42n | as the fixed ones, `--arith float` | kernels, transfers and widening against the float reference | 3.7 s, 8.6 s; 1.8 s, 2.5 s; 2.1 s, 3.2 s |
 
 (Times of the run at load 26; at load 10-47 over the day the steps moved by
 up to 2x.)
@@ -186,6 +190,7 @@ tree recorded.
 | r10arc | room (1,0) `search --level r0sxh --to 56 --win-at 40,64` | the level-0 tree to h56 | 4-15 s | 22 MB (61) |
 | cap-r10 | r10's f56 emissions (`--emit-capture`) | f56 | 1-3 s | 515 MB |
 | r60s | room (6,0) 700m `r0sxhfp`, split frame | steps 0-71; 70 -> 71 | 26-33 s | 8 MB (25) |
+| f10, f42n, f42x, f10arc | the float twins (`--arith float`, Celia's start) of r10, r42n, r42x, r10arc | as theirs | 4 s, 15 s, 14 s, 4 s | 49, 23, 12, 49 MB |
 | r62h57 (big) | room (6,2) 100%, as r62h | f0-f57; the reference frame 56 -> 57 | 60-151 s | 181 MB (0.9 GB) |
 | cap-r62h57 (big) | its f57 capture | f57 | 12-14 s | 12 GB |
 

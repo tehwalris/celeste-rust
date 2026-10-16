@@ -332,6 +332,20 @@ pub fn path(dir: &Path) -> PathBuf {
     dir.join("settings.txt")
 }
 
+/// The arithmetic the tree in `dir` was built in (its record's `arith`
+/// line; none: fixed point), for a reader that is not a search's run (the
+/// UI export, which reads a dual search's halves both).
+pub fn recorded_arith(dir: &Path) -> Result<Arith> {
+    let p = path(dir);
+    let text = std::fs::read_to_string(&p).with_context(|| p.display().to_string())?;
+    match text.lines().find_map(|l| l.strip_prefix("arith ")) {
+        None => Ok(Arith::Fixed),
+        Some("float-celia") => Ok(Arith::Float(FloatTool::Celia)),
+        Some("float-uct") => Ok(Arith::Float(FloatTool::Uct)),
+        Some(a) => anyhow::bail!("{}: arith {a:?}", p.display()),
+    }
+}
+
 fn pair<T: std::str::FromStr>(s: &str, what: &str) -> std::result::Result<(T, T), String> {
     let (a, b) = s.split_once(',').ok_or_else(|| format!("{what}: \"a,b\", not {s:?}"))?;
     let p = |t: &str| t.trim().parse::<T>().map_err(|_| format!("{what}: {t:?} is not a number"));
@@ -719,7 +733,10 @@ mod tests {
         std::fs::write(path(&dir), float.text("r0sxhf")).expect("write");
         let e = sample.check(&dir, lvl("r0sxhf")).expect_err("a fixed run on a float tree").to_string();
         assert!(e.contains("arith: in the tree's record"), "{e}");
+        // A reader that is not the run (the UI export) reads it back.
+        assert_eq!(recorded_arith(&dir).expect("a record"), Arith::Float(FloatTool::Uct));
         std::fs::write(path(&dir), sample.text("r0sxhf")).expect("write");
+        assert_eq!(recorded_arith(&dir).expect("a record"), Arith::Fixed);
         // `--override-settings`: only the region grid, and only with the flag.
         let grid = Settings { region: None, ..sample.clone() };
         let e = grid.check(&dir, lvl("r0sxhf")).expect_err("another grid, no override").to_string();

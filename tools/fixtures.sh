@@ -56,6 +56,12 @@ spec() {
         r10arc) ROOM=1,0; CMD="search --room 1,0 --level r0sxh --to 56 --win-at 40,64"; TREE=level00; LAST=56 ;;
         # The storage replay's capture: r10's f56 emissions (bench-storage).
         cap-r10) DEP=r10; ROOM=1,0; CMD="capture 56"; LAST=56 ;;
+        # FLOAT twins (`--arith float`, Celia's start: plans/float-solver.md):
+        # r10's, r42n's and r42x's frames in the doubles' kernels.
+        f10) FLAGS="--arith float"; ROOM=1,0; CMD="forward --room 1,0 --level r0sxh --to 56"; LAST=56 ;;
+        f42n) FLAGS="--arith float --level-minus-one 71,5"; ROOM=4,2; CMD="forward --room 4,2 --level r0sxhn --to 61"; LAST=61 ;;
+        f42x) FLAGS="--arith float --level-minus-one 71,5"; ROOM=4,2; CMD="forward --room 4,2 --level r0sxh --to 56"; LAST=56 ;;
+        f10arc) FLAGS="--arith float"; ROOM=1,0; CMD="search --room 1,0 --level r0sxh --to 56 --win-at 40,64"; TREE=level00; LAST=56 ;;
         # BIG (minutes, ~10 GB): the reference frame (6,2) 100% f56 -> f57,
         # and its 12 GB capture.
         r62h57) FLAGS=$L1_62; ROOM=6,2; CMD="forward --room 6,2 --level r0sxhf --to 57"; LAST=57 ;;
@@ -63,7 +69,7 @@ spec() {
         *) echo "fixtures: no fixture $1 (tools/fixtures.sh list)" >&2; exit 2 ;;
     esac
 }
-ALL="r10 r62h r42n r42x r60s r10arc cap-r10"
+ALL="r10 r62h r42n r42x r60s r10arc cap-r10 f10 f42n f42x f10arc"
 BIG="r62h57 cap-r62h57"
 
 # What the fixture's frames are a function of, besides its spec: the file
@@ -85,8 +91,9 @@ sources() {
 
 # The tree's fingerprint (as pinned).
 fingerprint() {
-    local dir=$1/$TREE
-    ./safe-run.sh -- "$B" ckhash --room "$ROOM" --to "$LAST" --edges --hulls --checkpoint-dir "$dir" 2>/dev/null
+    local dir=$1/$TREE arith
+    arith=$(grep -o -- '--arith [a-z]*' <<< "$FLAGS" || true)
+    ./safe-run.sh -- "$B" ckhash --room "$ROOM" $arith --to "$LAST" --edges --hulls --checkpoint-dir "$dir" 2>/dev/null
 }
 
 build() {

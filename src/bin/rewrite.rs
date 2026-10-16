@@ -155,14 +155,20 @@ enum Command {
         /// The float half's loading jank J (Celia only; default: its IL load's).
         #[arg(long)]
         float_loading_jank: Option<usize>,
+        /// The web UI's arc pass of the FLOAT half (the count) into this
+        /// directory, as `search --save-marks` writes it, with the dual
+        /// witness's path (`export-ui --arc DIR`).
+        #[arg(long)]
+        save_marks: Option<String>,
     },
     /// A float witness's ROBUSTNESS to the host libm (plans/float-solver.md,
-    /// section 15, Q3): `--inputs` replayed in float (the run's float tool,
-    /// its seeds) under glibc's `sin`, then with every `sin` call one ulp
-    /// up, every call one ulp down, and `--random` runs moving each call by
-    /// -1, 0 or +1 ulp at random; the frame each first wins on. A variant
-    /// that differs from glibc's is reported FRAGILE (flagged, not
-    /// rejected); the exit code is 0 either way.
+    /// section 15, Q3; `search::robust`): `--inputs` replayed in float (the
+    /// run's float tool, its seeds) under glibc's `sin`, a correctly rounded
+    /// `sin` (MPFR), every `sin` call one ulp up, every call one ulp down,
+    /// and `--random` runs moving each call by -1, 0 or +1 ulp at random;
+    /// the frame each first wins on. A variant that differs from glibc's is
+    /// reported FRAGILE (flagged, not rejected); the exit code is 0 either
+    /// way.
     Robust {
         #[arg(long)]
         inputs: String,
@@ -1269,7 +1275,17 @@ fn search<N: celeste_rust::search::rem::Rem>(
 /// concrete search between the larger arc bound and the horizon; its
 /// witness replayed in both arithmetics and recorded.
 #[allow(clippy::too_many_arguments)]
-fn dual(cfg: &celeste_rust::settings::Settings, float: &celeste_rust::settings::Settings, to: Option<u32>, ceiling: Option<u32>, level: String, checkpoint_dir: String, no_witness: bool, prefer: Option<String>) -> Result<()> {
+fn dual(
+    cfg: &celeste_rust::settings::Settings,
+    float: &celeste_rust::settings::Settings,
+    to: Option<u32>,
+    ceiling: Option<u32>,
+    level: String,
+    checkpoint_dir: String,
+    no_witness: bool,
+    prefer: Option<String>,
+    save_marks: Option<String>,
+) -> Result<()> {
     use celeste_rust::search::result::{DualResult, Verdict};
     let prefer: Option<Vec<u8>> = prefer.as_deref().map(celeste_rust::concrete::read_inputs).transpose()?;
     let horizon = horizon_of(to, ceiling)?;
@@ -1329,7 +1345,7 @@ fn dual(cfg: &celeste_rust::settings::Settings, float: &celeste_rust::settings::
         &base.join("float"),
         "float/",
         Finish::Arcs,
-        None,
+        save_marks.as_deref(),
         prefer.as_deref(),
         &mut res,
         |lvl| Ok(Box::new(celeste_rust::compiled::FloatKernels::new(float, lvl)?)),
@@ -1373,6 +1389,14 @@ fn dual(cfg: &celeste_rust::settings::Settings, float: &celeste_rust::settings::
     res.witness_file = Some(path.file_name().expect("a file").to_string_lossy().into_owned());
     if let Some(d) = &mut res.dual {
         d.fixed_exit = Some(w.fixed_exit);
+    }
+    // The UI's path: the float half's cells along the witness.
+    if let Some(out) = &save_marks {
+        let cells = celeste_rust::search::dual::path_cells::<LuaF64>(&w.inputs, float)?;
+        let path = std::path::Path::new(out).join("witness.txt");
+        celeste_rust::search::arc_dp::Witness { inputs: w.inputs.clone(), cells }.save(&path)?;
+        let label = format!("label dual witness, valid in both arithmetics: {} exits on frame {f}, real play on frame {} (the float half's path)\n", float.arith, w.fixed_exit);
+        std::fs::write(&path, label + &std::fs::read_to_string(&path)?)?;
     }
     record(&mut res, Verdict::Optimal)?;
     println!("[gate] h{horizon} dual optimum {f} fixed exit {} inputs {}", w.fixed_exit, w.inputs_text());
@@ -1572,6 +1596,178 @@ where
     Ok(())
 }
 
+/// `bench-frame` (`Command::BenchFrame`) in the arithmetic of `N`, its
+/// kernels `K` (`--metrics`, the kernel mix census, is 16.16's).
+#[allow(clippy::too_many_arguments)]
+fn bench_frame<K, N>(cfg: &celeste_rust::settings::Settings, level_dir: &str, frame: Option<u32>, reps: usize, level: Level, edges: bool, metrics: Option<String>, checkpoint: bool) -> Result<()>
+where
+    K: FrameStep<N> + KernelsNew,
+    N: Rem,
+{
+    use celeste_rust::compiled::dispatch::{print_stats, take_kernel_stats};
+    anyhow::ensure!(!checkpoint || edges, "--checkpoint needs --edges (the frame's files as the forward writes them)");
+    let dir = std::path::PathBuf::from(&level_dir);
+    let frame = match frame {
+        Some(f) => f,
+        None => celeste_rust::storage::edges::done_frame(&dir.join("edges")).ok_or_else(|| anyhow::anyhow!("{level_dir}: no finished frame"))?,
+    };
+    let engine = K::new(cfg, level)?;
+    let t = std::time::Instant::now();
+    engine.warm();
+    let t_kernels = t.elapsed().as_secs_f64();
+    eprintln!("[bench] kernels built: rss {:.2} GB", celeste_rust::metrics::current_rss_gb());
+    let t = std::time::Instant::now();
+    let mut st = celeste_rust::frame::ForwardState::<N>::at(&dir, frame, true, level, cfg)?;
+    eprintln!(
+        "[bench] kernels built in {t_kernels:.2} s; f{frame} loaded in {:.2} s: {} lanes in {} entries ({:.3} GB, {:.2} B a state) and {} old states, visited {} states in {} entries ({:.3} GB, {:.2} B a state); {} threads; rss {:.2} GB",
+        t.elapsed().as_secs_f64(),
+        st.frontier().new.states(),
+        st.frontier().new.entries(),
+        st.frontier().new.alloc_bytes() as f64 / 1e9,
+        st.frontier().new.alloc_bytes() as f64 / st.frontier().new.states().max(1) as f64,
+        st.frontier().old_states(),
+        st.visited_len(),
+        st.visited().entries(),
+        st.visited().alloc_bytes() as f64 / 1e9,
+        st.visited().alloc_bytes() as f64 / st.visited_len().max(1) as f64,
+        cfg.threads(),
+        celeste_rust::metrics::current_rss_gb()
+    );
+    {
+        let (fr, (outs, xfers)) = (st.frontier(), st.outs_and_xfers());
+        celeste_rust::storage::bench::print_memory(&format!("f{frame} loaded"), st.visited(), &fr.new, &fr.hulls, &fr.old, outs, xfers);
+    }
+    let scratch = dir.join("bench-edges");
+    let ms = |d: std::time::Duration| d.as_secs_f64() * 1e3;
+    let mut lines: Option<String> = None;
+    let mut costs: Vec<celeste_rust::storage::bench::Rep> = Vec::new();
+    let counters = celeste_rust::storage::bench::Counters::open().map(celeste_rust::storage::bench::count_steps);
+    for rep in 0..reps {
+        let _ = std::fs::remove_dir_all(&scratch);
+        let load = celeste_rust::storage::bench::load_average();
+        let at = counters.as_ref().map(|c| c.start());
+        let t = std::time::Instant::now();
+        // The last rep runs on the state's own visited set (no copy beside it).
+        let (wave, visited, xfers) = st.bench_wave(&engine, &dir, edges.then_some(scratch.as_path()), rep + 1 < reps)?;
+        let ckpt = if checkpoint { Some(st.bench_checkpoint(&wave, &scratch.join("ckpt"), cfg)?) } else { None };
+        let t_all = t.elapsed();
+        let counts = counters.as_ref().zip(at).map(|(c, at)| c.stop(at));
+        let w = &wave.stats;
+        eprintln!(
+            "[bench] rep {rep}: wave {:.0} ms (idle {:.0}%, regions {:.0} worker-ms) end {:.0}{} total {:.0} ms | in {} old {} emitted {} re-pushed {} pushes {} kept {} grown {} | units {} slices {} routes {} | edges {} bundles {} ({:.3} B; out {:.3} B) | rss start {:.2} wave {:.2} end {:.2} peak {:.2} GB",
+            ms(w.t_wave),
+            w.wave_idle * 100.0,
+            ms(w.t_regions),
+            ms(w.t_layer),
+            ckpt.map_or(String::new(), |(c, pos)| format!(" checkpoint {:.0}", ms(c.t.iter().sum::<std::time::Duration>() + pos))),
+            ms(t_all),
+            w.lanes_in,
+            w.old_in,
+            w.lanes_raw,
+            w.repush_edges,
+            w.pushes,
+            w.lanes_kept,
+            w.grown,
+            w.units,
+            w.slices,
+            w.routes,
+            w.edge_records,
+            w.edge_bundles,
+            w.edge_bytes as f64 / w.edge_records.max(1) as f64,
+            w.out_bytes as f64 / w.edge_records.max(1) as f64,
+            w.rss_start,
+            w.rss_wave,
+            w.rss_end,
+            celeste_rust::metrics::peak_rss_gb(),
+        );
+        costs.push(celeste_rust::storage::bench::Rep { stats: *w, ckpt, workers: cfg.threads(), wall: t_all, load, counts });
+        if rep + 1 == reps {
+            celeste_rust::storage::bench::print_memory(&format!("f{} made (the out store as loaded)", frame + 1), &visited, &wave.next, &wave.hulls, &wave.grown, st.outs_and_xfers().0, &xfers);
+        }
+        let (n, acc) = wave.next.content_fingerprint(&visited.keys, visited.shapes())?;
+        let mut out = format!("f{:03} {n} {acc:016x}\n", frame + 1);
+        let (nh, ah) = celeste_rust::storage::hulls::fingerprint(wave.frontier_states(frame + 1), &visited.keys, visited.shapes())?;
+        out += &format!("h{:03} {nh} {ah:016x}\n", frame + 1);
+        if edges {
+            let (n, acc) = celeste_rust::storage::bench::edge_fingerprint(&scratch, frame + 1, &xfers, &visited, cfg.threads())?;
+            out += &format!("e{:03} {n} {acc:016x}\n", frame + 1);
+        }
+        if checkpoint {
+            let (files, bytes, acc) = celeste_rust::storage::bench::dir_fingerprint(&scratch)?;
+            out += &format!("b{:03} {files} {bytes} {acc:016x}\n", frame + 1);
+        }
+        match &lines {
+            None => print!("{out}"),
+            Some(first) => anyhow::ensure!(*first == out, "rep {rep} differs from rep 0:\n{out}against\n{first}"),
+        }
+        if rep == 0 {
+            let ks = take_kernel_stats();
+            print_stats(&ks);
+            anyhow::ensure!(ks.missed == 0, "KERNEL COVERAGE GAP: {} lanes missed", ks.missed);
+            if let Some(path) = &metrics {
+                let kernels = celeste_rust::compiled::mix::kernel_metrics();
+                let slices: u64 = kernels.iter().map(|k| k.1).sum();
+                let insts: u64 = kernels.iter().map(|(_, n, c)| n * c.get("insts").copied().unwrap_or(0)).sum();
+                eprintln!("[bench] kernels: {insts} dynamic instructions over {slices} slices ({} a slice; call-outs' callees aside)", insts.checked_div(slices).unwrap_or(0));
+                let text = frame_metrics(&room_text(cfg), level, frame, w, &ks);
+                std::fs::write(path, text).with_context(|| path.clone())?;
+            }
+            celeste_rust::compiled::mix::reset_slices();
+        }
+        lines = Some(out);
+    }
+    let _ = std::fs::remove_dir_all(&scratch);
+    let ks = take_kernel_stats();
+    anyhow::ensure!(ks.missed == 0, "KERNEL COVERAGE GAP: {} lanes missed", ks.missed);
+    celeste_rust::storage::bench::print_cost(frame + 1, &costs);
+    Ok(())
+}
+
+/// `bench-backward` (`Command::BenchBackward`) in the arithmetic of `N`.
+fn bench_backward<N: Rem>(cfg: &celeste_rust::settings::Settings, level_dir: &str, horizon: u32, frame: u32, reps: usize) -> Result<()> {
+    anyhow::ensure!(frame < horizon, "--frame {frame}: below the horizon {horizon}");
+    let dir = std::path::Path::new(level_dir);
+    let t = std::time::Instant::now();
+    let seeds = celeste_rust::search::arc_dp::Seeds::<N>::load(dir, horizon)?;
+    let content = seeds.space.content_hash();
+    eprintln!("[bench-backward] h{horizon}'s edge files opened in {:.2} s: {} win rows, {} edges; {} threads", t.elapsed().as_secs_f64(), seeds.wins.len(), seeds.store.edges, cfg.threads());
+    let mut first: Option<String> = None;
+    for rep in 0..reps {
+        // Each rep pushes W down to F+1 afresh (untimed but the
+        // first), then times the step to W_F.
+        let t = std::time::Instant::now();
+        let mut c = celeste_rust::search::arc_dp::Backward::new(&seeds.store, &seeds.pairs, &seeds.wins, horizon, cfg.threads());
+        for f in (frame + 1..horizon).rev() {
+            c.step(f)?;
+        }
+        if rep == 0 {
+            eprintln!("[bench-backward] W from f{horizon} down to f{} in {:.2} s", frame + 1, t.elapsed().as_secs_f64());
+        }
+        let before = c.walls();
+        let t = std::time::Instant::now();
+        c.step(frame)?;
+        let wall = t.elapsed();
+        let after = c.walls();
+        // The gate's W line: per node with a set, its (shape, key,
+        // cell) and its set's rectangles, summed.
+        let (mut n, mut acc) = (0usize, 0u64);
+        for (id, r) in c.current() {
+            let (shape, key, cell) = seeds.state(id);
+            n += 1;
+            acc = acc.wrapping_add(celeste_rust::search::arc_dp::gate_w_hash(content.state(shape, key, cell), r));
+        }
+        let ms = |k: usize| (after[k] - before[k]).as_secs_f64() * 1e3;
+        eprintln!("[bench-backward] rep {rep}: W f{frame} in {:.1} ms (read {:.1}, pull {:.1}, merge {:.1} ms)", wall.as_secs_f64() * 1e3, ms(0), ms(1), ms(2));
+        let line = format!("[gate] h{horizon} W f{frame:03} {n} {acc:016x}");
+        match &first {
+            None => println!("{line}"),
+            Some(l) => anyhow::ensure!(*l == line, "rep {rep} differs from rep 0: {line} against {l}"),
+        }
+        first = Some(line);
+    }
+    Ok(())
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     // `bench-frame` times the workers' phases; `--metrics` counts the
@@ -1591,6 +1787,9 @@ fn main() -> Result<()> {
             | Command::CheckKnown { .. }
             | Command::L1Check { .. }
             | Command::Robust { .. }
+            | Command::ExportUi { .. }
+            | Command::BenchFrame { .. }
+            | Command::BenchBackward { .. }
     );
     let cfg = celeste_rust::settings::startup(&cli.settings, float, |s| {
         if let Command::BenchFrame { metrics, .. } = &cli.command {
@@ -1613,51 +1812,41 @@ fn main() -> Result<()> {
                 |lvl| Ok(Box::new(celeste_rust::compiled::FrameEngine::new(&cfg, lvl)?)),
                 || Ok(vec![Block::canonical(RefEngine::new(&cfg)?.initial()?)?]),
             )?,
-            Arith::Float(_) => {
-                // What the float search has not met yet is refused, not run.
-                anyhow::ensure!(save_marks.is_none(), "--arith float: --save-marks (the UI's arc pass) is fixed only so far");
-                search::<LuaF64>(
-                    &cfg,
-                    to,
-                    ceiling,
-                    level,
-                    checkpoint_dir,
-                    no_witness,
-                    save_marks,
-                    prefer,
-                    |lvl| Ok(Box::new(celeste_rust::compiled::FloatKernels::new(&cfg, lvl)?)),
-                    || Ok(vec![Block::canonical(FloatRefEngine::new(&cfg)?.initial()?)?]),
-                )?
-            }
+            Arith::Float(_) => search::<LuaF64>(
+                &cfg,
+                to,
+                ceiling,
+                level,
+                checkpoint_dir,
+                no_witness,
+                save_marks,
+                prefer,
+                |lvl| Ok(Box::new(celeste_rust::compiled::FloatKernels::new(&cfg, lvl)?)),
+                || Ok(vec![Block::canonical(FloatRefEngine::new(&cfg)?.initial()?)?]),
+            )?,
         },
-        Command::Dual { to, ceiling, level, checkpoint_dir, no_witness, prefer, float_half, float_loading_jank } => {
+        Command::Dual { to, ceiling, level, checkpoint_dir, no_witness, prefer, float_half, float_loading_jank, save_marks } => {
             let tool = match float_half.as_str() {
                 "celia" => celeste_rust::settings::FloatTool::Celia,
                 "uct" => celeste_rust::settings::FloatTool::Uct,
                 t => anyhow::bail!("--float-half: `celia` or `uct`, not {t:?}"),
             };
             let float = cfg.float_half(tool, float_loading_jank)?;
-            dual(&cfg, &float, to, ceiling, level, checkpoint_dir, no_witness, prefer)?;
+            dual(&cfg, &float, to, ceiling, level, checkpoint_dir, no_witness, prefer, save_marks)?;
         }
         Command::Robust { inputs, random } => {
-            use celeste_core::lua_f64::{with_sin_nudge, SinNudge};
             anyhow::ensure!(matches!(cfg.arith, Arith::Float(_)), "rewrite robust: a float witness (--arith float)");
             let bytes = celeste_rust::concrete::read_inputs(&inputs)?;
-            let run = |n: SinNudge| with_sin_nudge(n, || celeste_rust::search::dual::first_win::<LuaF64>(&bytes, &cfg));
-            let base = run(SinNudge::Off)?;
-            println!("[robust] glibc's sin: first win {base:?}");
-            let mut fragile = Vec::new();
-            for n in [SinNudge::Up, SinNudge::Down].into_iter().chain((1..=random).map(SinNudge::Random)) {
-                let w = run(n)?;
-                println!("[robust] {n:?}: first win {w:?}{}", if w == base { "" } else { "  <- DIFFERS" });
-                if w != base {
-                    fragile.push(format!("{n:?}"));
-                }
+            let rows = celeste_rust::search::robust::report(&bytes, &cfg, random)?;
+            let base = rows[0].1;
+            let fragile: Vec<&str> = rows.iter().filter(|r| r.1 != base).map(|r| r.0.as_str()).collect();
+            for (name, w) in &rows {
+                println!("[robust] {name}: first win {w:?}{}", if *w == base { "" } else { "  <- DIFFERS" });
             }
             if fragile.is_empty() {
-                println!("[robust] ROBUST: every nudged sin wins on the same frame ({} variants)", random + 2);
+                println!("[robust] ROBUST: every variant wins on glibc's frame ({} variants)", rows.len() - 1);
             } else {
-                println!("[robust] FRAGILE: {} of {} variants differ ({})", fragile.len(), random + 2, fragile.join(", "));
+                println!("[robust] FRAGILE: {} of {} variants differ ({})", fragile.len(), rows.len() - 1, fragile.join(", "));
             }
         }
         Command::HullStats { checkpoint_dir, to } => {
@@ -1837,166 +2026,17 @@ fn main() -> Result<()> {
                 }
             }
         }
-        Command::BenchFrame { level_dir, frame, reps, level, edges, metrics, checkpoint } => {
-            use celeste_rust::compiled::dispatch::{print_stats, take_kernel_stats};
-            anyhow::ensure!(!checkpoint || edges, "--checkpoint needs --edges (the frame's files as the forward writes them)");
-            let dir = std::path::PathBuf::from(&level_dir);
-            let frame = match frame {
-                Some(f) => f,
-                None => celeste_rust::storage::edges::done_frame(&dir.join("edges")).ok_or_else(|| anyhow::anyhow!("{level_dir}: no finished frame"))?,
-            };
-            let engine = celeste_rust::compiled::FrameEngine::new(&cfg, level)?;
-            let t = std::time::Instant::now();
-            engine.warm();
-            let t_kernels = t.elapsed().as_secs_f64();
-            eprintln!("[bench] kernels built: rss {:.2} GB", celeste_rust::metrics::current_rss_gb());
-            let t = std::time::Instant::now();
-            let mut st = celeste_rust::frame::ForwardState::<P8>::at(&dir, frame, true, level, &cfg)?;
-            eprintln!(
-                "[bench] kernels built in {t_kernels:.2} s; f{frame} loaded in {:.2} s: {} lanes in {} entries ({:.3} GB, {:.2} B a state) and {} old states, visited {} states in {} entries ({:.3} GB, {:.2} B a state); {} threads; rss {:.2} GB",
-                t.elapsed().as_secs_f64(),
-                st.frontier().new.states(),
-                st.frontier().new.entries(),
-                st.frontier().new.alloc_bytes() as f64 / 1e9,
-                st.frontier().new.alloc_bytes() as f64 / st.frontier().new.states().max(1) as f64,
-                st.frontier().old_states(),
-                st.visited_len(),
-                st.visited().entries(),
-                st.visited().alloc_bytes() as f64 / 1e9,
-                st.visited().alloc_bytes() as f64 / st.visited_len().max(1) as f64,
-                cfg.threads(),
-                celeste_rust::metrics::current_rss_gb()
-            );
-            {
-                let (fr, (outs, xfers)) = (st.frontier(), st.outs_and_xfers());
-                celeste_rust::storage::bench::print_memory(&format!("f{frame} loaded"), st.visited(), &fr.new, &fr.hulls, &fr.old, outs, xfers);
+        Command::BenchFrame { level_dir, frame, reps, level, edges, metrics, checkpoint } => match cfg.arith {
+            Arith::Fixed => bench_frame::<celeste_rust::compiled::FrameEngine, P8>(&cfg, &level_dir, frame, reps, level, edges, metrics, checkpoint)?,
+            Arith::Float(_) => {
+                anyhow::ensure!(metrics.is_none(), "--arith float: bench-frame --metrics (the kernel mix census) is 16.16's");
+                bench_frame::<celeste_rust::compiled::FloatKernels, LuaF64>(&cfg, &level_dir, frame, reps, level, edges, None, checkpoint)?
             }
-            let scratch = dir.join("bench-edges");
-            let ms = |d: std::time::Duration| d.as_secs_f64() * 1e3;
-            let mut lines: Option<String> = None;
-            let mut costs: Vec<celeste_rust::storage::bench::Rep> = Vec::new();
-            let counters = celeste_rust::storage::bench::Counters::open().map(celeste_rust::storage::bench::count_steps);
-            for rep in 0..reps {
-                let _ = std::fs::remove_dir_all(&scratch);
-                let load = celeste_rust::storage::bench::load_average();
-                let at = counters.as_ref().map(|c| c.start());
-                let t = std::time::Instant::now();
-                // The last rep runs on the state's own visited set (no copy beside it).
-                let (wave, visited, xfers) = st.bench_wave(&engine, &dir, edges.then_some(scratch.as_path()), rep + 1 < reps)?;
-                let ckpt = if checkpoint { Some(st.bench_checkpoint(&wave, &scratch.join("ckpt"), &cfg)?) } else { None };
-                let t_all = t.elapsed();
-                let counts = counters.as_ref().zip(at).map(|(c, at)| c.stop(at));
-                let w = &wave.stats;
-                eprintln!(
-                    "[bench] rep {rep}: wave {:.0} ms (idle {:.0}%, regions {:.0} worker-ms) end {:.0}{} total {:.0} ms | in {} old {} emitted {} re-pushed {} pushes {} kept {} grown {} | units {} slices {} routes {} | edges {} bundles {} ({:.3} B; out {:.3} B) | rss start {:.2} wave {:.2} end {:.2} peak {:.2} GB",
-                    ms(w.t_wave),
-                    w.wave_idle * 100.0,
-                    ms(w.t_regions),
-                    ms(w.t_layer),
-                    ckpt.map_or(String::new(), |(c, pos)| format!(" checkpoint {:.0}", ms(c.t.iter().sum::<std::time::Duration>() + pos))),
-                    ms(t_all),
-                    w.lanes_in,
-                    w.old_in,
-                    w.lanes_raw,
-                    w.repush_edges,
-                    w.pushes,
-                    w.lanes_kept,
-                    w.grown,
-                    w.units,
-                    w.slices,
-                    w.routes,
-                    w.edge_records,
-                    w.edge_bundles,
-                    w.edge_bytes as f64 / w.edge_records.max(1) as f64,
-                    w.out_bytes as f64 / w.edge_records.max(1) as f64,
-                    w.rss_start,
-                    w.rss_wave,
-                    w.rss_end,
-                    celeste_rust::metrics::peak_rss_gb(),
-                );
-                costs.push(celeste_rust::storage::bench::Rep { stats: *w, ckpt, workers: cfg.threads(), wall: t_all, load, counts });
-                if rep + 1 == reps {
-                    celeste_rust::storage::bench::print_memory(&format!("f{} made (the out store as loaded)", frame + 1), &visited, &wave.next, &wave.hulls, &wave.grown, st.outs_and_xfers().0, &xfers);
-                }
-                let (n, acc) = wave.next.content_fingerprint(&visited.keys, visited.shapes())?;
-                let mut out = format!("f{:03} {n} {acc:016x}\n", frame + 1);
-                let (nh, ah) = celeste_rust::storage::hulls::fingerprint(wave.frontier_states(frame + 1), &visited.keys, visited.shapes())?;
-                out += &format!("h{:03} {nh} {ah:016x}\n", frame + 1);
-                if edges {
-                    let (n, acc) = celeste_rust::storage::bench::edge_fingerprint(&scratch, frame + 1, &xfers, &visited, cfg.threads())?;
-                    out += &format!("e{:03} {n} {acc:016x}\n", frame + 1);
-                }
-                if checkpoint {
-                    let (files, bytes, acc) = celeste_rust::storage::bench::dir_fingerprint(&scratch)?;
-                    out += &format!("b{:03} {files} {bytes} {acc:016x}\n", frame + 1);
-                }
-                match &lines {
-                    None => print!("{out}"),
-                    Some(first) => anyhow::ensure!(*first == out, "rep {rep} differs from rep 0:\n{out}against\n{first}"),
-                }
-                if rep == 0 {
-                    let ks = take_kernel_stats();
-                    print_stats(&ks);
-                    anyhow::ensure!(ks.missed == 0, "KERNEL COVERAGE GAP: {} lanes missed", ks.missed);
-                    if let Some(path) = &metrics {
-                        let kernels = celeste_rust::compiled::mix::kernel_metrics();
-                        let slices: u64 = kernels.iter().map(|k| k.1).sum();
-                        let insts: u64 = kernels.iter().map(|(_, n, c)| n * c.get("insts").copied().unwrap_or(0)).sum();
-                        eprintln!("[bench] kernels: {insts} dynamic instructions over {slices} slices ({} a slice; call-outs' callees aside)", insts.checked_div(slices).unwrap_or(0));
-                        let text = frame_metrics(&room_text(&cfg), level, frame, w, &ks);
-                        std::fs::write(path, text).with_context(|| path.clone())?;
-                    }
-                    celeste_rust::compiled::mix::reset_slices();
-                }
-                lines = Some(out);
-            }
-            let _ = std::fs::remove_dir_all(&scratch);
-            let ks = take_kernel_stats();
-            anyhow::ensure!(ks.missed == 0, "KERNEL COVERAGE GAP: {} lanes missed", ks.missed);
-            celeste_rust::storage::bench::print_cost(frame + 1, &costs);
-        }
-        Command::BenchBackward { level_dir, horizon, frame, reps } => {
-            anyhow::ensure!(frame < horizon, "--frame {frame}: below the horizon {horizon}");
-            let dir = std::path::Path::new(&level_dir);
-            let t = std::time::Instant::now();
-            let seeds = celeste_rust::search::arc_dp::Seeds::<P8>::load(dir, horizon)?;
-            let content = seeds.space.content_hash();
-            eprintln!("[bench-backward] h{horizon}'s edge files opened in {:.2} s: {} win rows, {} edges; {} threads", t.elapsed().as_secs_f64(), seeds.wins.len(), seeds.store.edges, cfg.threads());
-            let mut first: Option<String> = None;
-            for rep in 0..reps {
-                // Each rep pushes W down to F+1 afresh (untimed but the
-                // first), then times the step to W_F.
-                let t = std::time::Instant::now();
-                let mut c = celeste_rust::search::arc_dp::Backward::new(&seeds.store, &seeds.pairs, &seeds.wins, horizon, cfg.threads());
-                for f in (frame + 1..horizon).rev() {
-                    c.step(f)?;
-                }
-                if rep == 0 {
-                    eprintln!("[bench-backward] W from f{horizon} down to f{} in {:.2} s", frame + 1, t.elapsed().as_secs_f64());
-                }
-                let before = c.walls();
-                let t = std::time::Instant::now();
-                c.step(frame)?;
-                let wall = t.elapsed();
-                let after = c.walls();
-                // The gate's W line: per node with a set, its (shape, key,
-                // cell) and its set's rectangles, summed.
-                let (mut n, mut acc) = (0usize, 0u64);
-                for (id, r) in c.current() {
-                    let (shape, key, cell) = seeds.state(id);
-                    n += 1;
-                    acc = acc.wrapping_add(celeste_rust::search::arc_dp::gate_w_hash(content.state(shape, key, cell), r));
-                }
-                let ms = |k: usize| (after[k] - before[k]).as_secs_f64() * 1e3;
-                eprintln!("[bench-backward] rep {rep}: W f{frame} in {:.1} ms (read {:.1}, pull {:.1}, merge {:.1} ms)", wall.as_secs_f64() * 1e3, ms(0), ms(1), ms(2));
-                let line = format!("[gate] h{horizon} W f{frame:03} {n} {acc:016x}");
-                match &first {
-                    None => println!("{line}"),
-                    Some(l) => anyhow::ensure!(*l == line, "rep {rep} differs from rep 0: {line} against {l}"),
-                }
-                first = Some(line);
-            }
-        }
+        },
+        Command::BenchBackward { level_dir, horizon, frame, reps } => match cfg.arith {
+            Arith::Fixed => bench_backward::<P8>(&cfg, &level_dir, horizon, frame, reps)?,
+            Arith::Float(_) => bench_backward::<LuaF64>(&cfg, &level_dir, horizon, frame, reps)?,
+        },
         Command::BenchStorage { capture, tree, level, reps } => {
             cfg.check(std::path::Path::new(&tree), level)?;
             celeste_rust::storage::bench::bench_storage(&celeste_rust::storage::bench::BenchArgs {

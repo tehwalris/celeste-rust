@@ -114,10 +114,36 @@ t1() {
     grep -h '^\[widen-check\] step' "$C"/widen-r*.out | sed 's/^/    /'
     for s in refcheck-r10 refcheck-r42x; do grep -h '^\[ref-check\] [0-9]' "$C/$s.out" | sed "s/^/    /"; done
     for s in arccheck-r10 arccheck-r42x; do grep -h '^agreement' "$C/$s.out" | sed "s/^/    /" | cut -c1-200; done
+    # The same in FLOAT (`--arith float`, the doubles' kernels, Celia's
+    # start): the frames exact (their f/h/e lines; no metrics), the keys, the
+    # kernels and the transfers against the float reference, the widening.
+    local FL="--arith float"
+    step fixtures-float tools/fixtures.sh ensure f10 f42n f42x f10arc
+    grep -h '^\[fixtures\]' "$C/fixtures-float.err"
+    step frame-f10 framef f10 55 1,0 r0sxh $FL
+    step frame-f42n framef f42n 60 4,2 r0sxhn $FL --level-minus-one 71,5
+    step keycheck-f42n keycheck f42n 60 4,2 r0sxhn $FL --level-minus-one 71,5
+    step backward-f10arc backwardf
+    step refcheck-f10 ./safe-run.sh -- "$B" ref-check $FL --level-dir "$F/f10" --frame 55 --level r0sxh --room 1,0 --samples 32 --threads "$TH"
+    step refcheck-f42x ./safe-run.sh -- "$B" ref-check $FL --level-dir "$F/f42x" --frame 55 --level r0sxh --room 4,2 --samples 32 --threads "$TH" --level-minus-one 71,5
+    step arccheck-f10 ./safe-run.sh -- "$B" arc-check $FL --level-dir "$F/f10" --room 1,0 --from 56 --to 56 --samples 32 --level r0sxh --threads "$TH" --path-cap 4096
+    step arccheck-f42x ./safe-run.sh -- "$B" arc-check $FL --level-dir "$F/f42x" --room 4,2 --from 56 --to 56 --samples 32 --level r0sxh --threads "$TH" --path-cap 4096
+    step widen-f10 widencheck f10 55 1,0 r0sxh $FL
+    step widen-f42n widencheck f42n 60 4,2 r0sxhn $FL --level-minus-one 71,5
+    grep -h '^\[widen-check\] step' "$C"/widen-f*.out | sed 's/^/    /'
+    for s in refcheck-f10 refcheck-f42x; do grep -h '^\[ref-check\] [0-9]' "$C/$s.out" | sed "s/^/    /"; done
+    for s in arccheck-f10 arccheck-f42x; do grep -h '^agreement' "$C/$s.out" | sed "s/^/    /" | cut -c1-200; done
 }
 
 # keycheck NAME FRAME ROOM LEVEL FLAGS...: frame's rows' keys recomputed
 # (--key-check), and the same f/e lines.
+# framef NAME FRAME ROOM LEVEL FLAGS...: `frame` without the metrics (a
+# float fixture's: the kernel mix census is 16.16's).
+framef() {
+    local name=$1 f=$2 room=$3 level=$4; shift 4
+    ./safe-run.sh -- "$B" bench-frame --level-dir "$F/$name" --frame "$f" --room "$room" --level "$level" --edges --threads "$TH" --l1-table "$F/$name/l1-table.bin" "$@" > "$C/$name.frame" || return 1
+    same "$C/$name.frame" "$G/$name.frame"
+}
 keycheck() {
     local name=$1 f=$2 room=$3 level=$4; shift 4
     ./safe-run.sh -- "$B" bench-frame --level-dir "$F/$name" --frame "$f" --room "$room" --level "$level" --edges --threads "$TH" --key-check --l1-table "$F/$name/l1-table.bin" "$@" > "$C/keycheck-$name.frame" || return 1
@@ -134,6 +160,11 @@ widencheck() {
 backward() {
     ./safe-run.sh -- "$B" bench-backward --level-dir "$F/r10arc/level00" --horizon 56 --frame 45 --win-at 40,64 --threads "$TH" --reps 3 > "$C/backward.txt" || return 1
     same "$C/backward.txt" "$G/r10arc.backward"
+}
+# The same backward frame over the float twin's tree (`f10arc`).
+backwardf() {
+    ./safe-run.sh -- "$B" bench-backward --arith float --level-dir "$F/f10arc/level00" --horizon 56 --frame 45 --win-at 40,64 --threads "$TH" --reps 3 > "$C/backward-f.txt" || return 1
+    same "$C/backward-f.txt" "$G/f10arc.backward"
 }
 
 # storage TREE FRAME ROOM LEVEL FLAGS...: the capture of TREE's frame FRAME
@@ -195,7 +226,7 @@ gate10f_forward() {
     ./safe-run.sh -- "$B" ckhash --arith float --to 44 --room 1,0 --hulls --checkpoint-dir "$C/t2/g10f" | diff gates/float_ckhash_room10_f000-044.txt - >&2
 }
 gate10f_arc() {
-    ./safe-run.sh -- "$B" search --arith float --to 35 --win-at 9,101 --checkpoint-dir "$C/t2/arc10f" --prefer gates/known_room10_win9-101.txt > "$C/t2/arc10f.out" || return 1
+    ./safe-run.sh -- "$B" search --arith float --to 35 --win-at 9,101 --checkpoint-dir "$C/t2/arc10f" --prefer gates/known_room10_win9-101.txt --save-marks "$C/t2/arc10f-marks" > "$C/t2/arc10f.out" || return 1
     grep '^\[gate\]' "$C/t2/arc10f.out" | diff gates/float_arc_room10_win9-101_h35.txt - >&2
 }
 # The dual search (`rewrite dual`, plans/float-solver.md milestone 6) at the
@@ -203,7 +234,7 @@ gate10f_arc() {
 # valid in both; its bound and its witness pinned (each half's [gate] lines
 # are the two gates above).
 gate10d_dual() {
-    ./safe-run.sh -- "$B" dual --to 35 --win-at 9,101 --checkpoint-dir "$C/t2/dual10" --prefer gates/known_room10_win9-101.txt > "$C/t2/dual10.out" || return 1
+    ./safe-run.sh -- "$B" dual --to 35 --win-at 9,101 --checkpoint-dir "$C/t2/dual10" --prefer gates/known_room10_win9-101.txt --save-marks "$C/t2/dual10-marks" > "$C/t2/dual10.out" || return 1
     grep -E '^DUAL BOUND|^\[gate\] h35 dual' "$C/t2/dual10.out" | diff gates/dual_room10_win9-101_h35.txt - >&2
 }
 # The objects ladder (r0sxhn filtering r0sxh) at a synthetic win, its
@@ -217,7 +248,9 @@ search42() {
 # marks: every binary file, and run.json without its timings (the search's
 # wall, the forward's per-frame walls and memory), pinned by digest.
 export_ui() {
-    for s in arc10:1,0 s42:4,2; do
+    # The float gate's run and the dual's too (each tree read in its own
+    # arithmetic; the dual's arc pass the float half's).
+    for s in arc10:1,0 s42:4,2 arc10f:1,0 dual10:1,0; do
         local d=${s%%:*} room=${s##*:}
         ./safe-run.sh -- "$B" export-ui --room "$room" --checkpoint-dir "$C/t2/$d" --arc "$C/t2/$d-marks" --out "$C/t2/ui-$d" > /dev/null || return 1
         (cd "$C/t2" && sha256sum ui-$d/*.bin)

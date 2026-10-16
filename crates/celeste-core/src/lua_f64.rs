@@ -73,14 +73,15 @@ impl fmt::Debug for LuaF64 {
 /// A witness's ROBUSTNESS to the host libm (plans/float-solver.md, section
 /// 15, Q3): `sin`'s result moved by one ulp - up on every call, down on
 /// every call, or each call by a pseudo-random choice of -1, 0 or +1 from
-/// the seed - on THIS thread, while `with_sin_nudge` runs (a correctly
-/// rounded or another faithful `sin` is within an ulp of glibc's).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// the seed - or glibc's `sin` REPLACED (a correctly rounded one), on THIS
+/// thread, while `with_sin_nudge` runs.
+#[derive(Clone, Copy, Debug)]
 pub enum SinNudge {
     Off,
     Up,
     Down,
     Random(u64),
+    Replaced(fn(f64) -> f64),
 }
 
 thread_local! {
@@ -100,10 +101,23 @@ pub fn with_sin_nudge<R>(nudge: SinNudge, f: impl FnOnce() -> R) -> R {
     f()
 }
 
-/// glibc's `sin` result `s`, nudged as this thread says (`SinNudge`).
-fn nudged(s: f64) -> f64 {
+/// `sin(x)`: glibc's, nudged or replaced as this thread says (`SinNudge`).
+fn host_sin(x: f64) -> f64 {
+    // `black_box`: the argument is a run-time value, never folded by the
+    // compiler with another libm.
+    let glibc = || unsafe { libm_sin(std::hint::black_box(x)) };
     SIN_NUDGE.with(|c| match c.get() {
-        SinNudge::Off => s,
+        SinNudge::Off => glibc(),
+        SinNudge::Replaced(f) => f(x),
+        n => nudged(glibc(), n, c),
+    })
+}
+
+/// glibc's `sin` result `s` moved as `n` says (a random nudge's next state
+/// into `c`).
+fn nudged(s: f64, n: SinNudge, c: &std::cell::Cell<SinNudge>) -> f64 {
+    match n {
+        SinNudge::Off | SinNudge::Replaced(_) => s,
         SinNudge::Up => s.next_up(),
         SinNudge::Down => s.next_down(),
         SinNudge::Random(state) => {
@@ -119,7 +133,7 @@ fn nudged(s: f64) -> f64 {
                 _ => s.next_up(),
             }
         }
-    })
+    }
 }
 
 #[link(name = "m")]
@@ -227,10 +241,7 @@ impl LuaF64 {
     pub fn lua_sin(self) -> Option<Self> {
         let turns = Self::fin(self.0 * std::f64::consts::PI)?;
         let radians = Self::fin(turns.0 * 2.0)?;
-        // `black_box`: the argument is a run-time value, never folded by the
-        // compiler with another libm.
-        let s = nudged(unsafe { libm_sin(std::hint::black_box(radians.0)) });
-        Self::fin(-s)
+        Self::fin(-host_sin(radians.0))
     }
 
     /// The tools' `min(a, b)`: `a` if `a < b`, else `b` (on equal values,
