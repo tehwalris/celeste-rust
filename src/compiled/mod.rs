@@ -93,10 +93,8 @@ impl<N: KernelLanes> Kernels<N> {
         self.registry.get_or_init(|| asm_kernel::registry::<N>(self.level, &self.settings))
     }
 
-    /// One frame of one BUCKET (one shape's block of the frontier), emitted
-    /// into `sink`: kept rows at the boundary, keyed, with their pos-graph
-    /// edges. The kernel slices by 16 itself; the caller routes rows into
-    /// the next frame's buckets.
+    /// One frame of one BUCKET (one shape's block), emitted into `sink`:
+    /// kept rows at the boundary, keyed, with their pos-graph edges.
     pub fn run_bucket(
         &self,
         bucket: &runtime2::Rt2<N>,
@@ -118,8 +116,7 @@ impl<N: KernelLanes> Kernels<N> {
     }
 }
 
-/// The compiled kernels as the `FrameStep` implementation, the counterpart
-/// to `RefEngine`: just `run_bucket`.
+/// The compiled `FrameStep` (the reference's: `RefEngine`).
 impl<N: KernelLanes> crate::frame::FrameStep<N> for Kernels<N> {
     fn run(
         &self,

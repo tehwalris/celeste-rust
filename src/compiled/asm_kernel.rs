@@ -2,8 +2,7 @@
 //! assemble each (shape, region)'s fused fork-free graph, and dispatch
 //! chunks to it. The APPEND step emits each `live & !error` lane at the
 //! boundary: canonical structure, its row key exactly as
-//! `Rt2::boundary_finish` (`--key-check`), its pos-graph edge
-//! and its transfer.
+//! `Rt2::boundary_finish` (`--key-check`), its pos-graph edge and transfer.
 
 use std::collections::HashMap;
 use std::os::raw::c_void;
@@ -208,7 +207,6 @@ struct AsmKernel<N: KernelLanes = P8> {
     loaded: Loaded,
     compiled: Compiled,
     bodies: Vec<AsmBody>,
-    /// The bodies' dup-ref slot pairs.
     dup_pairs: DupPairs,
     /// What the bodies read at emission (`emit`).
     plan: emit::Plan,
@@ -245,7 +243,6 @@ impl<N: KernelLanes> AsmKernel<N> {
     /// error` (declined) fails the call: a coverage gap.
     fn run(&self, chunk: &Rt2<N>, lanes: &[usize], sink: &mut crate::storage::unit::UnitSink<N>) -> bool {
         stats([1, 0, 0, 0, 0, 0, 0]);
-        // Slices of 16 lanes (`lanes`: the unit's expanded ones).
         for part in lanes.chunks(16) {
             if !self.run_slice(chunk, part, ((1u32 << part.len()) - 1) as u16, sink) {
                 return false;
@@ -301,11 +298,8 @@ impl<N: KernelLanes> AsmKernel<N> {
             // Tri-state masks, each read where it MAY hold.
             let error = read_zb_may::<N>(outbuf, ohalf, body.error_off);
             let live = read_zb_may::<N>(outbuf, ohalf, body.live_off);
-            // A row the forward does not expand (an exit, a lost berry)
-            // never reaches a slice (the unit passes its expanded lanes
-            // only): its error would be no decline. Room (6,2) 100% at
-            // f84: an exited row (room (7,2), a restart pending) shared
-            // a slice with a live respawn and its error was fatal.
+            // Only expanded lanes reach a slice: an unexpanded row's (an
+            // exit, a lost berry) error would be no decline.
             if live & error & valid != 0 {
                 // Declined (fatal in the caller): report the lanes.
                 let declined = live & error & valid;
@@ -345,9 +339,8 @@ impl<N: KernelLanes> AsmKernel<N> {
                 return false;
             }
             let mut take = live & !error & valid;
-            // A lane whose emission equals an earlier body's (same
-            // outcome, every stored root and transfer root equal) is
-            // that body's emission again: skip it (`DupRef`).
+            // A lane whose emission equals an earlier body's is that
+            // body's emission again: skip it (`DupRef`).
             took[bi] = take;
             if take != 0 {
                 for r in &body.dup_refs {
@@ -797,11 +790,10 @@ impl<'c, N: EngineNum> InputView<'c, N> {
     }
 }
 
-/// `--key-check`: the real boundary
-/// (`Rt2::boundary_canonicalize`) over a copy of an emitted block must
-/// change nothing (structure, shape hash), and every row's key must be what
-/// the key space makes of the boundary's row - packed, or for a provisional
-/// key the same exact content: the gate that the append's keys are exact.
+/// `--key-check`: the boundary (`Rt2::boundary_canonicalize`) over a copy of
+/// an emitted block changes nothing (structure, shape hash), and every row's
+/// key is what the key space makes of the boundary's row (packed, or a
+/// provisional key of the same exact content).
 pub(crate) fn key_check<N: crate::search::rem::Rem>(slot: &crate::storage::unit::RowBuf<N>, keys: &KeySpace<N>, prov: &Provisional<N>) {
     use celeste_engine::exact::{is_provisional, RowKey};
     let acc = slot.to_rt2();
@@ -843,10 +835,9 @@ pub(crate) fn key_check<N: crate::search::rem::Rem>(slot: &crate::storage::unit:
     );
 }
 
-/// `--key-check` on a block the forward STORES (a layer's
-/// piece, `storage::wave::gather_layer`, keys final): the boundary over a
-/// copy must keep its shape and structure, and the key space key its rows
-/// as stored - its gather moved rows, not values.
+/// `--key-check` on a block the forward STORES (a layer's piece,
+/// `storage::wave::gather_layer`): the boundary over a copy keeps its shape
+/// and structure, and the key space keys its rows as stored.
 pub(crate) fn key_check_block<N: celeste_core::arith::EngineNum>(blk: &Rt2<N>, keys: &KeySpace<N>) {
     let mut b = blk.clone_block();
     b.boundary_canonicalize(super::ids());
@@ -886,9 +877,6 @@ fn read_zb_may<N: KernelLanes>(buf: &[u8], half: usize, off: usize) -> u16 {
     let (val, known) = N::masks(buf, half, off);
     val | !known
 }
-
-
-
 
 /// The start room's assembled kernels for one level.
 pub struct Registry<N: KernelLanes = P8> {
@@ -931,11 +919,9 @@ impl<N: KernelLanes> Registry<N> {
             return self.run_key(chunk, None, lanes, sink);
         };
         // The unit's live lanes bucketed by region, each bucket cut into
-        // slices of 16 (a slice may span id groups: `run_slice` keys each
-        // lane's predecessor records by its own group). Slicing in lane
-        // order ran every slice once per region it held (a unit's cell order
-        // changes region every ~12 rows); bucketing per 64-lane group still
-        // left room (6,2) 100% f57 36% padding and room (3,0) at 8 px 53%.
+        // slices of 16 (a slice may span id groups): a unit's cell order
+        // changes region every ~12 rows, so slices in lane order would run
+        // once per region they hold.
         stats([1, 0, 0, 0, 0, 0, 0]);
         let mut by_region: Vec<(Option<Region>, usize)> =
             lanes.iter().map(|&l| (grid.of_cell(cell_in[l]), l)).collect();
@@ -979,9 +965,8 @@ impl<N: KernelLanes> Registry<N> {
         }
     }
 
-    /// Retrace the start room and assemble every shape for `opts` (`root`:
-    /// repo) under settings `s` (the cart, the room, the region grid, the
-    /// build's diagnostics).
+    /// Retrace the start room and assemble every shape for level `opts`
+    /// under settings `s` (`root`: the repo).
     pub fn build_for_start_room(root: &Path, opts: crate::abstraction::Level, s: &crate::settings::Settings) -> Result<Registry<N>> {
         let grid = s.region_grid();
         match grid {
@@ -1489,7 +1474,7 @@ static CALL_STATS: [std::sync::atomic::AtomicU64; 7] =
 thread_local! {
     /// This thread's share of `CALL_STATS`, folded in by `fold_call_stats`:
     /// six shared atomic adds per slice from every worker cost more than the
-    /// slice's kernel (room (6,2) f57: ~60 worker-seconds of 260).
+    /// slice's kernel.
     static LOCAL_STATS: std::cell::Cell<[u64; 7]> = const { std::cell::Cell::new([0; 7]) };
 }
 

@@ -4,8 +4,7 @@
 
 use celeste_engine::runtime2;
 
-/// A one-line miss summary for the abort: lanes the kernels could not serve
-/// (a shape with no kernel, or a declined lane).
+/// The abort's miss summary: lanes with no kernel or declined.
 pub(crate) fn miss_report() -> String {
     format!("  {} lanes missed the ASM kernels", missed_lanes())
 }
@@ -17,7 +16,6 @@ pub(crate) fn run_chunk_kernel<N: super::KernelLanes>(
     lanes: &[usize],
     sink: &mut crate::storage::unit::UnitSink<N>,
 ) -> bool {
-    // A miss is counted here and is fatal in the caller.
     let n = lanes.len() as u64;
     let hit = reg.run_chunk(chunk, cell_in, lanes, sink);
     if hit {
@@ -47,7 +45,6 @@ static KERNEL_HITS: [std::sync::atomic::AtomicU64; 2] = [
 ];
 
 /// Lanes the kernels have MISSED so far, without resetting the counter.
-/// Kernels-against-reference tests assert this is zero.
 pub fn missed_lanes() -> u64 {
     KERNEL_HITS[1].load(std::sync::atomic::Ordering::Relaxed)
 }

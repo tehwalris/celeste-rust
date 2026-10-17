@@ -1,25 +1,18 @@
-//! THE EMISSION of a kernel slice (plans/architecture.md, "The forward"): what a body's
-//! `live & !error` lanes become - per lane its state's cell, key and
+//! THE EMISSION of a kernel slice (plans/architecture.md, "The forward"): what
+//! a body's `live & !error` lanes become - per lane its state's cell, key and
 //! transfer - computed COLUMN-WISE, then handed to the sink a body at a time
 //! (`unit::BodyEmits`).
 //!
-//! Bodies share output slots (one per distinct root node, `build_one_shape`),
-//! so the bodies of a slice repeat each other's work: the reference frame
-//! averaged 4.5-5.6 key-field lookups per distinct (field, value) and 8-12
-//! transfer decodes per distinct transfer (branch `fwd-perf`, `[keydiag]`).
-//! A kernel's EMISSION PLAN (`Plan`, built with it) lists the distinct
-//! READS - a key field of an output shape (`KeyField`), a transfer's root
-//! set (`ArcSlots`), a cell's position sources (`PosSrc`), level -1's
-//! (shape, cell column) - once, each body naming its own by index. A slice
-//! evaluates each read ONCE over the union of the lanes the bodies that
-//! name it take (`Cols`), lanes of equal values in one probe; each body
-//! then ORs its fields' placed bits into its lanes' keys.
-//!
-//! The order of the sink's work is a body's, lane by lane, as before; what
-//! moved is only where the cells, keys and transfers are computed. The
-//! results are the same values, so the frame's states, edges and transfer
-//! ids are byte-identical (the worker-local ids' first-use order is not,
-//! but a slice's new transfers get their global ids by content).
+//! Bodies share output slots (one per distinct root node), so a slice's
+//! bodies repeat each other's reads. A kernel's EMISSION PLAN (`Plan`) lists
+//! the distinct READS - a key field of an output shape (`KeyField`), a
+//! transfer's root set (`ArcSlots`), a cell's position sources (`PosSrc`),
+//! level -1's (shape, cell column) - once, each body naming its own by
+//! index. A slice evaluates each read ONCE over the union of the lanes the
+//! bodies that name it take (`Cols`), lanes of equal values in one probe;
+//! each body then ORs its fields' placed bits into its lanes' keys. The sink
+//! still sees body by body, lane by lane, and new transfers get their
+//! global ids by content, so the frame's bytes do not depend on the plan.
 
 use std::collections::HashMap;
 
@@ -55,8 +48,7 @@ enum KeyRead {
 
 /// 16 lanes of 128-bit keys (or a field's placed bits in them) as two
 /// planes of 64-bit words, low then high: ORed plane by plane, a body's key
-/// assembly is vector code (as `[u128; 16]` it was scalar, 13% of the
-/// reference frame's wave).
+/// assembly is vector code (as `[u128; 16]` it is scalar).
 #[derive(Clone, Copy, Default)]
 pub(super) struct Placed([[u64; 16]; 2]);
 
@@ -99,7 +91,6 @@ impl Placed {
         self.0[1].iter().fold(0, |a, &x| a | x) != 0
     }
 }
-
 
 /// The lanes of `of` whose boolean `(v, k)` equals lane `r`'s.
 #[inline]
@@ -216,17 +207,15 @@ impl KeyField {
     }
 }
 
-/// A body's transfer roots (`FrameOut::arc`): per axis took, pre, frag, ox,
-/// fin as (offset, kind); `fin` whether the outcome ends with a player.
-/// `ArcSlots::words`: two words per transfer root, then the outcome's
-/// `fin` flag - the words alone do not decode: without a fin root its words
-/// are 0 and the axis has no `fin`, with one they are `fin = Some((0, 0))`.
-/// Keyed on the words alone, `UnitSink::xfer_id_raw`'s cache gave a lane
-/// whichever body's transfer was interned first (a scheduling-dependent edge,
-/// room (1,0) f61, 2026-10-09).
+/// `ArcSlots::words`: two words per transfer root, then the outcome's `fin`
+/// flag. The words alone do not decode (zero fin words are no `fin` without
+/// a fin root, `fin = Some((0, 0))` with one), and `UnitSink::xfer_id_raw`'s
+/// cache is keyed on them.
 pub(crate) const RAW_WORDS: usize = 4 * crate::trace::frame::ARC_AXIS_ROOTS + 1;
 pub(crate) type RawWords<N = P8> = [<N as EngineNum>::Raw; RAW_WORDS];
 
+/// A body's transfer roots (`FrameOut::arc`): per axis took, pre, frag, ox,
+/// fin as (offset, kind); `fin`: the outcome ends with a player.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub(super) struct ArcSlots {
     pub roots: [(usize, RootKind); 2 * crate::trace::frame::ARC_AXIS_ROOTS],
@@ -455,7 +444,6 @@ impl Plan {
         }
         p
     }
-
 }
 
 /// A slice's columns (module doc), one per entry of the kernel's plan: the
