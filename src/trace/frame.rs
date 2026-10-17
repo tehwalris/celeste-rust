@@ -121,16 +121,16 @@ fn out_fields<A: GraphArith>(
             ubool.push(p);
             continue;
         }
-    // The canonical output unknown: the same uniform `AV::UBool` in every
-    // body, so no root.
+        // The canonical output unknown: the same uniform `AV::UBool` in every
+        // body, so no root.
         if let Some(Value::Bool(b)) = iface::get(st, &p) {
             if d.is_unknown_output(b) {
                 ubool.push(p);
                 continue;
             }
         }
-    // The column's engine TYPE, asked of the graph: writing an interval as a
-    // number would be an unchecked narrowing.
+        // The column's engine TYPE, asked of the graph: writing an interval as
+        // a number would be an unchecked narrowing.
         let (n, ty) = match iface::get(st, &p).unwrap() {
             Value::Num(n) => {
                 let ty = if d.is_interval(&n) || ival_always.contains(&p) { ColTy::Ival } else { ColTy::Num };
@@ -440,7 +440,7 @@ mod tests {
         })).collect()
     }
 
-    /// Test fixture: the six "pm1 key" paths (`has_dashed`, `freeze`, and the
+    /// The six "pm1 key" paths (`has_dashed`, `freeze`, and the
     /// player's `dash_time`, `djump`, `p_dash`, `p_jump`).
     fn pm1_paths(player: &Path) -> Vec<Path> {
         let mut v: Vec<Path> = vec![vec![iface::key("has_dashed")], vec![iface::key("freeze")]];
@@ -614,9 +614,8 @@ mod tests {
     /// tracer, the kernels and the reference engine all call) answers what
     /// the CART'S OWN Lua `tile_flag_at` answers - its loop with a
     /// fractional limit - at every box near the room's edges, outside it
-    /// included, in every room. Until 2026-10-15 the scan truncated the
-    /// limit toward zero and found column 0 (row 0) under a box wholly left
-    /// of (above) the room, where the cart's loop runs no iteration.
+    /// included, in every room (a box wholly left of or above the room scans
+    /// nothing, not column or row 0).
     #[test]
     #[ignore = "slow, ./check.sh t2 runs it: every room's map through the Lua, ~20 CPU-s"]
     fn native_tile_flag_at_answers_the_carts_lua_loop() {

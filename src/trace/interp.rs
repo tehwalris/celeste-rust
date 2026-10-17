@@ -233,8 +233,6 @@ impl<'a, D: Domain> Interp<'a, D> {
         id
     }
 
-    // ------------------------------------------------------------ blocks
-
     /// Run a block. A BLOCK IS A SCOPE, as in Lua: a leaked `local` is part
     /// of `Shape::scopes` and would keep arms from merging. A scope is
     /// allocated only when the block declares something.
@@ -323,8 +321,6 @@ impl<'a, D: Domain> Interp<'a, D> {
             other => bail!("unsupported last statement {:?}", other),
         })
     }
-
-    // -------------------------------------------------------- statements
 
     fn exec_stmt(&mut self, stmt: &'a ast::Stmt, st: State<D>) -> Result<Outcome<D>> {
         match stmt {
@@ -731,8 +727,6 @@ impl<'a, D: Domain> Interp<'a, D> {
         done.extend(running);
         Ok(done)
     }
-
-    // ------------------------------------------------------- expressions
 
 
 

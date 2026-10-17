@@ -265,13 +265,12 @@ pub fn room_objects(cart: &celeste_core::cart_data::CartData, (rx, ry): (i16, i1
 }
 
 /// The start room's LOADING FRAME as a real transition runs it
-/// (`--loading-jank J`): the leaving
-/// player's `_update` loads the room, and the frame's `foreach` goes on over
-/// the NEW room's objects from the player's index J - one update each
-/// (move, then update) - then the frame draws. J counts the ORIGINAL cart's
-/// objects (pico8_diff/chain.py reports it); it is translated to the minimal
-/// cart's list, which lacks `message` and `flag`. Measured against a real
-/// PICO-8 chain field by field (`pico8_diff/chain.py --modes`).
+/// (`--loading-jank J`): the leaving player's `_update` loads the room, and
+/// the frame's `foreach` goes on over the NEW room's objects from the
+/// player's index J - one update each (move, then update) - then the frame
+/// draws. J counts the ORIGINAL cart's objects (pico8_diff/chain.py reports
+/// it), translated to the minimal cart's list (no `message`, no `flag`).
+/// Measured against a real PICO-8 chain field by field (`chain.py --modes`).
 fn apply_loading_frame(game: &str, j: usize, root: &std::path::Path, (rx, ry): (i16, i16)) -> Result<String> {
     let cart = celeste_core::cart_data::CartData::load(root.join("cart"))?;
     let first = minimal_index(&cart, (rx, ry), j);

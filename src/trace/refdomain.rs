@@ -1,12 +1,11 @@
 //! The REFERENCE domain: a scalar abstract interpreter over the Lua AST, the
-//! oracle the kernels are checked against.
-//!
-//! It plugs into `Interp<D>` like `Symbolic`, but runs one
-//! ABSTRACT scalar path and enumerates the fork tree by RE-EXECUTION
-//! (`engines::reference::run_frame_all`). `Num` is an interval (a point is `[n,n]`); `Bool` is a
-//! plain `bool`: every fork (a straddling comparison, an unknown button, a
-//! `__split_by_flr` fragment) is resolved by a DECISION CURSOR, so `decide`
-//! never returns `None` and `Interp` never merges.
+//! oracle the kernels are checked against. It plugs into `Interp<D>` like
+//! `Symbolic`, but runs one ABSTRACT scalar path and enumerates the fork
+//! tree by RE-EXECUTION (`engines::reference::run_frame_all`). `Num` is an
+//! interval (a point is `[n,n]`); `Bool` is a plain `bool`: every fork (a
+//! straddling comparison, an unknown button, a `__split_by_flr` fragment) is
+//! resolved by a DECISION CURSOR, so `decide` never returns `None` and
+//! `Interp` never merges.
 //!
 //! OVERFLOW IS AN ERROR, for a point as for an interval: an operation whose
 //! exact result can leave the 16.16 range (where PICO-8 wraps `+ - *` and
@@ -368,7 +367,7 @@ mod tests {
 
     /// Every operation that can leave the 16.16 range RAISES, for a point
     /// and for an interval: `+ - * /`, negation and `abs`, an interval times
-    /// a positive scalar (which panicked) and a division by zero; nothing
+    /// a positive scalar and a division by zero; nothing
     /// wraps or saturates. Off the edge a point is `Pico8Num`'s result.
     #[test]
     fn every_overflow_raises_for_points_and_intervals() {
@@ -409,7 +408,7 @@ mod tests {
         let (a, b) = (P8::from_i16(181), P8::from_i16(181));
         assert_eq!(d.arith(Arith::Mul, &Iv::from_number(a), &Iv::from_number(b)).unwrap(), Iv::from_number(a.wrapping_mul(b)));
         assert_eq!(d.arith(Arith::Div, &min, &one).unwrap(), min, "MIN / 1 fits");
-        // An interval by a positive scalar, and by zero (which panicked).
+        // An interval by a positive scalar, and by zero.
         assert_eq!(d.arith(Arith::Mul, &two, &Iv::new(P8::from_i16(-3), P8::from_i16(4))).unwrap(), Iv::new(P8::from_i16(-6), P8::from_i16(8)));
         let zero = Iv::from_number(P8::from_i16(0));
         assert_eq!(d.arith(Arith::Mul, &near_top, &zero).unwrap(), zero);
@@ -417,8 +416,8 @@ mod tests {
     }
 
     /// A range of more than 32767 floors: `flr` refuses it (it is no
-    /// point), and `__split_by_flr` forks every floor - the unknown number
-    /// spans 65536, which an `i16` difference wrapped to one.
+    /// point), and `__split_by_flr` forks every floor: the unknown number
+    /// spans 65536 (an `i16` difference would wrap).
     #[test]
     fn a_range_of_many_floors_is_not_one_floor() {
         let mut d = RefDomain::<Fixed>::new();

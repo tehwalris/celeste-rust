@@ -21,9 +21,8 @@ use super::iface::{self, Path, Step};
 use super::state::State;
 
 /// Tables holding PROGRAM CONSTANTS rather than state: the object
-/// prototypes in `types`, everything reachable from them, and `room`.
-///
-/// Identified structurally, from `types`, rather than by listing names.
+/// prototypes in `types`, everything reachable from them, and `room`
+/// (structurally, from `types`, not by listing names).
 pub fn frozen_tables<A: GraphArith>(st: &State<Symbolic<A>>) -> std::collections::BTreeSet<u32> {
     let mut out = std::collections::BTreeSet::new();
     let mut stack: Vec<u32> = Vec::new();

@@ -507,7 +507,7 @@ impl<N: Rem> crate::frame::FrameStep<N> for RefFrameStep<N> {
         // The lanes in parallel, each on an engine of the pool (a frame of
         // one lane is milliseconds, and a unit is often a whole frontier),
         // emitted in order a chunk at a time (a lane's leaves are hundreds
-        // of rows: a whole unit's held at once was gigabytes).
+        // of rows: a whole unit's at once would be gigabytes).
         let n = self.engines.len();
         for chunk in lanes.chunks(4 * n) {
             let rows = crate::storage::wave::par_map(chunk, n, |&lane| self.engine().run_lane(block.rt2(), lane));
@@ -529,21 +529,14 @@ impl<N: Rem> crate::frame::FrameStep<N> for RefFrameStep<N> {
     }
 }
 
-// ------------------------------------------------ one frame, every path
-
-/// Run one frame of `body` from `input` along every fork path; one output state
-/// per leaf. For a game frame `body` is
-/// `__reset_button_states()\n_update()\n_draw()`, so the buttons are forks too.
-///
+/// One frame of `body` from `input` along every fork path, one output state
+/// per leaf (a game frame's `body` resets the buttons: they are forks too).
 /// `it` must have the cart's functions registered; its `d.cursor` is the DFS
-/// state. A path that REFUSES (e.g. a fork premise a lane cannot satisfy) is
-/// an error; a path that RAISES has no successor.
-///
-/// `unknown` names the input's unknown-boolean fields (`block::from_block`):
-/// each is a cursor choice made before the frame runs, as the kernels fork them.
-///
-/// More than `cap` paths is an error, `TooManyPaths` (every path's output is
-/// held: the cap bounds the memory).
+/// state. A path that REFUSES (a fork premise a lane cannot satisfy) is an
+/// error; a path that RAISES has no successor. `unknown`: the input's
+/// unknown-boolean fields (`block::from_block`), each a cursor choice made
+/// before the frame runs, as the kernels fork them. More than `cap` paths is
+/// `TooManyPaths` (every path's output is held: the cap bounds the memory).
 pub fn run_frame_all<'a, A: Arithmetic>(
     it: &mut Interp<'a, RefDomain<A>>,
     body: &'a ast::Ast,
@@ -632,8 +625,6 @@ fn concretize_near_floors<A: Arithmetic>(st: &mut State<RefDomain<A>>, d: &mut R
     }
     Ok(())
 }
-
-// ------------------------------------- a lane of a block <-> a state
 
 /// Lane `lane` of a block as a reference state of the block's arithmetic
 /// (plus the base state's builtins), and its unknown-boolean fields except
@@ -749,7 +740,7 @@ mod tests {
         assert_eq!(x.value() - y.value(), 2f64.powi(53), "the rounded difference");
         assert!(super::within::<Float>(x, y, 2f64.powi(53)) && !super::far::<Float>(x, y, 2f64.powi(53)));
         assert!(super::within::<Float>(y, x, 2f64.powi(53)), "symmetric");
-        // 16.16: the raw comparison it replaced.
+        // 16.16: the raw comparison.
         let (p, q) = (P8::from_raw(8 << 16), P8::from_raw(-1));
         assert!(!super::within::<Fixed>(p, q, 8.0) && super::far::<Fixed>(p, q, 8.0));
         assert!(super::within::<Fixed>(p, P8::from_raw(0), 8.0) && super::far::<Fixed>(p, P8::from_raw(0), 8.0));
@@ -758,10 +749,8 @@ mod tests {
     use super::*;
 
     /// A BUILTIN HELD IN SEVERAL SLOTS is a `Bi` cell at each, on both
-    /// sides. The two converters disagreed here: the reference's made the
-    /// first slot in traversal order the builtin's cell and pointed the
-    /// others at it, the tracer's wrote it in place at every slot, so such a
-    /// state keyed differently as a kernel row and as a reference row.
+    /// sides, or such a state keys differently as a kernel row and as a
+    /// reference row.
     #[test]
     fn a_builtin_in_several_slots_converts_alike_on_both_sides() {
         use celeste_engine::runtime2::{Cell2, Col, AV};

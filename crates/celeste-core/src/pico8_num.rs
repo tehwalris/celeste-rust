@@ -3,15 +3,13 @@
 // parsing, `+ - * / %`, the range edges (negation wraps, `abs` and `/`
 // saturate) and `sin` (a table dumped from the console).
 //
-// OVERFLOW IS AN ERROR (Philippe's decision, 2026-10-11): the game never
-// leaves the 16.16 range, so where the console would wrap (`+ - *`, unary
-// minus, a literal's integer part) or saturate (`/`, `abs`) the exact result
-// does not exist. So there are no `+ - * /` OPERATORS here, nothing that
-// wraps where an expression does not say so: `checked_*` give the exact
-// result or `None`, and the console's own `wrapping_*` / `saturating_*` are
-// spelled out for the kernels (which compute them and decline the lane where
-// the checked operation fails, `Op::NoWrap`) and the tests that pin them.
-// `%` never overflows and keeps its operator.
+// OVERFLOW IS AN ERROR: the game never leaves the 16.16 range, so where the
+// console would wrap (`+ - *`, unary minus, a literal's integer part) or
+// saturate (`/`, `abs`) the exact result does not exist. No `+ - * /`
+// OPERATORS: `checked_*` give the exact result or `None`; the console's own
+// `wrapping_*` / `saturating_*` are spelled out for the kernels (which
+// decline the lane where the checked operation fails, `Op::NoWrap`) and the
+// tests that pin them. `%` never overflows and keeps its operator.
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
@@ -72,7 +70,6 @@ impl Pico8Num {
     }
 
     pub fn as_i16_or_err(&self) -> Result<i16> {
-        // `ok_or_else`: the error message is built lazily.
         self.as_i16()
             .ok_or_else(|| anyhow!("got {:?}, expected integer", self))
     }
@@ -187,12 +184,12 @@ impl Pico8Num {
         Self(self.0.wrapping_add(rhs.0))
     }
 
-    /// The console's `-`, which WRAPS (as `wrapping_add`).
+    /// The console's `-`, which WRAPS.
     pub const fn wrapping_sub(self, rhs: Self) -> Self {
         Self(self.0.wrapping_sub(rhs.0))
     }
 
-    /// The console's `*`, which WRAPS (as `wrapping_add`).
+    /// The console's `*`, which WRAPS.
     pub const fn wrapping_mul(self, rhs: Self) -> Self {
         let high = (self.0 as i64).wrapping_mul(rhs.0 as i64);
         let low = high >> 16;
@@ -214,8 +211,7 @@ impl Pico8Num {
     /// +/-0x7fff.ffff if the exact quotient does not fit - including
     /// division by zero (`1/0 = 0x7fff.ffff`, `-1/0 = 0x8000.0001`, `0/0 =
     /// 0x7fff.ffff`). The clamp is for overflow only: `min/1 = 0x8000.0000`
-    /// fits and is returned as is. The kernels' scalar `/` (as
-    /// `wrapping_add`).
+    /// fits and is returned as is.
     pub fn saturating_div(self, rhs: Self) -> Self {
         const LIMIT: i32 = 0x7fff_ffff;
         if rhs.0 == 0 {

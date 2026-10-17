@@ -352,8 +352,6 @@ fn is_countdown_atom(k: u32) -> bool {
 /// unrestricted (the restriction enumerates their assignments).
 const ESCAPE_ATOMS: usize = 6;
 
-// ------------------------------------------------------- constant folding
-
 /// THE overflow error of the tracer's constant folding (`Symbolic::arith`):
 /// the operation that left the arithmetic's range. The game never
 /// overflows, so one is a modelling surprise, never a wrapped value (the
@@ -402,8 +400,6 @@ fn fold_compare<A: Arithmetic>(op: Cmp, a: A::Num, b: A::Num) -> bool {
         Cmp::Eq => A::num_eq(a, b),
     }
 }
-
-// ---------------------------------------------------------------- symbolic
 
 /// The tracing domain. Owns the graph it is building, in the arithmetic `A`
 /// (16.16 by default).
@@ -1321,8 +1317,7 @@ impl<A: GraphArith> Domain for Symbolic<A> {
     }
 
     fn join_bool_independent(&mut self, c: &NodeId, t: &NodeId, f: &NodeId) -> Option<NodeId> {
-        // A condition that reads no atom but a countdown's (`countdown_atom`)
-        // is a select, as at a near level alone.
+        // As `join_num_independent`.
         if !self.reads_unknown_atom(c) || !self.lane_independent(*c) {
             return None;
         }

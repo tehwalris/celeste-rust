@@ -5,29 +5,23 @@
 //! a hole depends on how the table was BUILT, not on what it holds).
 //!
 //! Each `lua/probe/*.lua` runs unchanged in the tracer (after the game's
-//! Lua builtins, `lua/builtin_level_3.lua` and `_4`, as the cart does) and
-//! in PICO-8; its real stdout is checked in beside it
-//! (`./regen-pico8-golden.sh` needs a PICO-8 install, the tests do not).
-//! A corpus prints one value per call: `printh` for strings, booleans and
-//! integers (the tracer has no `tostr` or `..`), and `__hex(x)` for any
-//! number, its exact 16.16 bits as `tostr(x, true)` prints them
-//! (`0x0000.5555`): native here, `printh(tostr(x, true))` in the cart the
-//! regen script builds. Printing the raw bits runs the value through no
-//! arithmetic; decomposing it with `flr`, `*` and `-` inside the corpus
-//! would put the operations under test into the print.
+//! Lua builtins, as the cart does) and in PICO-8; its real stdout is checked
+//! in beside it (`./regen-pico8-golden.sh` needs a PICO-8 install, the tests
+//! do not). A corpus prints one value per call: `printh` for strings,
+//! booleans and integers (the tracer has no `tostr` or `..`), and `__hex(x)`
+//! for any number, its exact 16.16 bits as `tostr(x, true)` prints them
+//! (`0x0000.5555`; `printh(tostr(x, true))` in the regen script's cart):
+//! printing the raw bits puts no arithmetic under test into the print.
 //!
 //! A corpus uses only what the tracer has (`cart::NATIVE`, the Lua
 //! builtins; no `sqrt`, `cos`, `sgn`, `mid`, `..`), runs concretely (it must
-//! end in exactly one state), and keeps one divergence per
-//! file, so a known-bad line cannot hide the good ones after it.
+//! end in exactly one state), and keeps one divergence per file, so a
+//! known-bad line cannot hide the good ones after it.
 //!
-//! OVERFLOW RAISES (plans/architecture.md, "Every overflow is an error"):
-//! where PICO-8 wraps or saturates, the interpreter refuses. The cases that
-//! pin the console there are the `*_overflow` corpora (`OVERFLOW`), split
-//! off the numerics corpora: every `__hex` in them must raise, and their
-//! golden values pin `Pico8Num`'s explicit `wrapping_*` / `saturating_*`
-//! (the console's semantics, which the kernels compute on the lanes they
-//! then decline).
+//! OVERFLOW RAISES (plans/architecture.md, "match PICO-8 exactly, or
+//! raise"): the `*_overflow` corpora (`OVERFLOW`) pin the console where it
+//! wraps or saturates: every `__hex` in them must raise, and their golden
+//! values pin `Pico8Num`'s explicit `wrapping_*` / `saturating_*`.
 
 use anyhow::{bail, Result};
 
@@ -325,11 +319,9 @@ mod tests {
         }
     }
 
-    /// Is the checked-in golden file still what PICO-8 says?
-    ///
-    /// Compares bytes either side of a regeneration (not the VCS status: a
-    /// staged or unadded file is not stale). Without PICO-8 it skips,
-    /// loudly.
+    /// Is the checked-in golden file still what PICO-8 says? Compares bytes
+    /// either side of a regeneration (not the VCS status: a staged or
+    /// unadded file is not stale). Without PICO-8 it skips, loudly.
     #[test]
     fn the_golden_files_are_current() {
         let p8 = std::env::var("PICO8").unwrap_or_else(|_| {

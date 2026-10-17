@@ -223,7 +223,7 @@ enum Inst {
     Store { off: u32, src: Src },
     /// Store a vector mask as a 16-bit lane mask (boolean roots).
     StoreMask { off: u32, src: Vreg },
-    // ---- the doubles' (8 `f64` lanes) ----
+    // The doubles' (8 `f64` lanes).
     /// Broadcast a 64-bit constant (`vpbroadcastq`).
     BcastQ { dst: Vreg, val: u64 },
     /// Load an 8-bit lane mask and expand it to a 64-bit vector mask.
@@ -281,16 +281,12 @@ pub struct Compiled {
     pub input_offsets: Vec<u32>,
     /// Repr of each input cell (parallel to `input_cells`).
     pub input_reprs: Vec<CellRepr>,
-    /// Total bytes the input buffer must be.
     pub input_bytes: u32,
-    /// Number of roots.
     pub n_roots: usize,
     /// Root byte offsets: bools first (4 B: `val` u16, `known` at +2), then
     /// numbers (64 B) and intervals (128 B: `lo`, `hi` at +64), 64-aligned.
     pub root_offsets: Vec<u32>,
-    /// Bytes the output buffer must be.
     pub out_bytes: u32,
-    /// Each root's type.
     pub root_kinds: Vec<RootKind>,
     pub sym: String,
     /// Spill slots used (0 = everything fit).
@@ -307,8 +303,6 @@ pub struct Compiled {
     /// 8-bit mask per half (`val` at +0, `known` at +2).
     pub halves: bool,
 }
-
-// ---- constant pool ----
 
 #[derive(Default)]
 struct Pool {
@@ -332,8 +326,7 @@ impl Pool {
     }
 }
 
-// ---- lowering: graph -> Inst stream ----
-
+/// The lowering: graph -> `Inst` stream.
 struct Lower<'a, A: GraphArith> {
     g: &'a Graph<A>,
     vals: Vec<Option<Value>>,
@@ -381,8 +374,8 @@ impl<A: GraphArith> Lower<'_, A> {
         }
     }
 
-    // ---- mask planes (shared: a vector mask is all-ones or zero per
-    // lane, whatever the lane width) ----
+    // Mask planes are shared: a vector mask is all-ones or zero per lane,
+    // whatever the lane width.
 
     /// A mask plane in a register (constants broadcast).
     fn mask_reg(&mut self, m: MaskVal) -> Vreg {
@@ -432,16 +425,13 @@ impl<A: GraphArith> Lower<'_, A> {
         self.ternlog(c, t, f, 0xca)
     }
 
-    // ---- mask planes with the bit identities folded ----
-    //
-    // A plane that is a compile-time constant (`MaskVal::Const`: all-ones or
+    // A mask plane that is a compile-time constant (`MaskVal::Const`: all-ones or
     // zero in every lane) or the same register on both sides is folded by an
     // identity that holds BIT FOR BIT in every lane (`x & -1 = x`, `x | -1 =
     // -1`, `x & 0 = 0`, `x & x = x`, `c ? t : t = t`, ...), so the folded
     // kernel computes exactly what the unfolded one did; nothing is decided
     // that was not already a constant.
 
-    /// `p & q`.
     fn m_and(&mut self, p: MaskVal, q: MaskVal) -> MaskVal {
         match (p, q) {
             (MaskVal::Const(false), _) | (_, MaskVal::Const(false)) => MaskVal::Const(false),
@@ -451,7 +441,6 @@ impl<A: GraphArith> Lower<'_, A> {
         }
     }
 
-    /// `p | q`.
     fn m_or(&mut self, p: MaskVal, q: MaskVal) -> MaskVal {
         match (p, q) {
             (MaskVal::Const(true), _) | (_, MaskVal::Const(true)) => MaskVal::Const(true),
@@ -472,7 +461,6 @@ impl<A: GraphArith> Lower<'_, A> {
         }
     }
 
-    /// `p ^ q`.
     fn m_xor(&mut self, p: MaskVal, q: MaskVal) -> MaskVal {
         match (p, q) {
             (MaskVal::Const(a), MaskVal::Const(b)) => MaskVal::Const(a != b),
@@ -483,7 +471,6 @@ impl<A: GraphArith> Lower<'_, A> {
         }
     }
 
-    /// `~p`.
     fn m_not(&mut self, p: MaskVal) -> MaskVal {
         match p {
             MaskVal::Const(b) => MaskVal::Const(!b),
@@ -781,7 +768,7 @@ impl Lower<'_, Fixed> {
         self.pure(Key::Cmp(imm, a, b.key()), move |d| Inst::Cmp { dst: d, imm, a, b })
     }
 
-    // ---- interval layer (ZI as two i32 planes) ----
+    // The interval layer: a ZI is two i32 planes.
 
     /// A 32-bit-lane binary op with a broadcast CONSTANT second operand.
     fn dbin_c(&mut self, op: ROp, a: Vreg, c: i32) -> Vreg {
@@ -1413,8 +1400,6 @@ fn schedule<A: GraphArith>(g: &Graph<A>, live: &[bool], roots: &[NodeId], batch:
     order
 }
 
-// ---- register allocation: linear scan ----
-
 #[derive(Clone, Copy)]
 enum Loc {
     Reg(u8),
@@ -1677,7 +1662,6 @@ fn allocate(insts: &[Inst], n_vregs: Vreg, remat: &[bool]) -> (Vec<Loc>, usize) 
 
     for cur in 0..ivs.len() {
         let (vreg, start, _end) = ivs[cur];
-        // Expire.
         active.retain(|&ai| {
             if ivs[ai].2 < start {
                 if let Loc::Reg(r) = home[ivs[ai].0 as usize] {
@@ -1703,7 +1687,6 @@ fn allocate(insts: &[Inst], n_vregs: Vreg, remat: &[bool]) -> (Vec<Loc>, usize) 
             // Spill the interval that ends latest (current or an active).
             let spill_ai = *active.last().unwrap();
             if ivs[spill_ai].2 > ivs[cur].2 {
-                // Steal its register.
                 let stolen = match home[ivs[spill_ai].0 as usize] {
                     Loc::Reg(r) => r,
                     _ => unreachable!(),
@@ -1777,8 +1760,7 @@ fn call_saves(insts: &[Inst], n_vregs: Vreg, home: &[Loc]) -> HashMap<usize, (u3
         .collect()
 }
 
-// ---- emission ----
-
+/// The emission: the `Inst` stream as GAS text.
 struct Emitter<'a> {
     home: &'a [Loc],
     insts: &'a [Inst],
@@ -2553,7 +2535,6 @@ fn compile_with<A: GraphArith>(
     writeln!(asm, "    vzeroupper").unwrap();
     writeln!(asm, "    ret").unwrap();
 
-    // Constant pool.
     writeln!(asm, ".section .rodata").unwrap();
     writeln!(asm, ".align 64").unwrap();
     for (i, v) in em.pool.d.iter().enumerate() {

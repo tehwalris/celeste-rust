@@ -111,16 +111,13 @@ fn successor_regions<A: GraphArith>(
 /// THE NO-PLAYER PHASE'S RANGES. One trace covers a whole stretch of the
 /// spawn, so a field varying over it would be an unbounded input. No input
 /// matters before the player exists, so run the phase fully pinned and bound
-/// each numeric field to the hull it took, PER SHAPE: the phase may change
-/// shape before the player appears (a later spawn shape traced unbounded
-/// makes every fall floor "near"). The chain runs the fly fruit exact; the
-/// walk and the forward run the level's widenings, under which the phase
-/// reaches shapes the chain never takes (a widened fly fruit gone at any
-/// frame), so the start is also EXPLORED at the level's
-/// own widenings (`explore_no_player`) into the same hulls, and so is every
-/// RESPAWN the walk reaches (the room reloaded after a death, every object
-/// updated once). A shape no explored state has gets the spawn object's hull
-/// by type (`NoPlayer::bounds`). A lane outside declines.
+/// each numeric field to the hull it took, PER SHAPE (a later spawn shape
+/// traced unbounded makes every fall floor "near"). The chain runs the fly
+/// fruit exact; at the level's widenings the phase reaches shapes the chain
+/// never takes, so the start and every respawn the walk reaches are also
+/// explored (`explore_no_player`) into the same hulls. A shape no explored
+/// state has gets the spawn object's hull by type (`NoPlayer::bounds`). A
+/// lane outside declines.
 fn no_player_ranges<A: GraphArith>(
     it: &mut super::interp::Interp<'static, super::domain::Symbolic<A>>,
     chunks: &'static super::cart::Chunks,
@@ -193,20 +190,16 @@ fn no_player_ranges<A: GraphArith>(
 /// one that has not reached the player by then is FATAL.
 const NO_PLAYER_FRAMES: usize = 240;
 
-/// THE NO-PLAYER EXPLORATION: from an entry of the no-player phase
-/// (`entry`, its constants `consts`: the start, or a respawn entry the walk
-/// reached - the room reloaded after a death), every outcome of every frame
-/// up to the player's appearance, AT THE LEVEL'S OWN WIDENINGS (`opts`, the
-/// fly fruit as the level has it: what the walk and the forward reach), into
-/// `np`'s hulls. Fields the entry holds unknown (a respawn's: the dead
-/// phase's `freeze` and `delay_restart`; the level's widened fields) stay
-/// unknown inputs. No merge selects on the state's OWN unknowns (not the
-/// level's widened fields): `_update`'s `if freeze>0 then ... return end`
-/// would merge the frozen branch into the spawn's fields (`y = Sel(freeze >
-/// 0, 124, 120)`), after which none is a constant; refused, each branch
-/// keeps its constants (the frozen one repeats its parent). A state is its
-/// shape and its constants (the trace pins exactly those), so a repeated one
-/// is explored once. FATAL (`what`: whose phase): a state still without the
+/// THE NO-PLAYER EXPLORATION: from an entry of the no-player phase (the
+/// start, or a respawn: the room reloaded after a death), every outcome of
+/// every frame up to the player's appearance, AT THE LEVEL'S OWN WIDENINGS
+/// (`opts`), into `np`'s hulls. Fields the entry holds unknown (a respawn's
+/// `freeze` and `delay_restart`, the level's widened fields) stay unknown
+/// inputs. No merge selects on the state's OWN unknowns: `if freeze>0 then
+/// ... return end` would merge the frozen branch into the spawn's fields
+/// (`y = Sel(freeze > 0, 124, 120)`), and none would be a constant. A state
+/// is its shape and its constants (what the trace pins), so a repeated one is
+/// explored once. FATAL (`what`: whose phase): a state still without the
 /// player after `NO_PLAYER_FRAMES` frames, a state that does not trace.
 /// Returns the states explored, the outcomes followed and those where the
 /// player appears.
@@ -387,8 +380,7 @@ mod tests {
     /// THE NO-PLAYER CHAIN ENDS QUIETLY ONLY WHERE IT CANNOT RUN CONCRETELY.
     /// Room (5,0)'s balloon draws its `offset` from `rnd` in `_init`: the
     /// chain bounds nothing, and says so. Any other refusal of a chain frame
-    /// (here the graph budget) is an error, never "no bounds": until
-    /// 2026-10-16 every trace error ended the chain silently.
+    /// (here the graph budget) is an error, never "no bounds".
     #[test]
     fn the_no_player_chain_refuses_loudly_but_for_an_rnd_draw() {
         use crate::settings::Settings;
@@ -429,8 +421,7 @@ mod tests {
     /// shape of its own: the springs gain `delay` at the first boundary), so
     /// the start's chain bounds the next shape's `y` to [98, 120]. A death
     /// reloads the room and updates every object once: the spawn at y 124 in
-    /// that shape (the 2500m run's KERNEL COVERAGE GAP, 2026-10-14). Every
-    /// no-player node's bound on a spawn's `y` covers 124.
+    /// that shape. Every no-player node's bound on a spawn's `y` covers 124.
     #[test]
     #[ignore = "slow, ./check.sh t2 runs it: room (0,3)'s lattice walk, ~40 CPU-s"]
     fn a_respawn_after_the_loading_jank_is_inside_its_shapes_bounds() {

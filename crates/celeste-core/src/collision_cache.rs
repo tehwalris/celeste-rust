@@ -80,7 +80,6 @@ impl BoolMap {
 
 /// Precomputed collision cache for a specific room
 pub struct CollisionCache {
-    /// Room coordinates.
     pub room_x: i16,
     pub room_y: i16,
 
@@ -220,10 +219,9 @@ impl CollisionCache {
     /// The tile scan: does any tile of the room under the box have `flag`.
     /// The cart's loop, `for i=max(0,flr(x/8)),min(15,(x+w-1)/8)` (and
     /// `j` likewise): its limit is a FRACTION, so the last column is the
-    /// FLOOR of `(x+w-1)/8`. Truncating toward zero instead (as this did
-    /// until 2026-10-15) scanned column 0 for a box wholly left of the room
-    /// (`x+w-1` in [-7, -1]), where the cart scans nothing (row 0 likewise
-    /// above it). The first column truncates or floors alike under the `max`.
+    /// FLOOR of `(x+w-1)/8`: a box wholly left of the room (`x+w-1` in
+    /// [-7, -1]) scans nothing, not column 0 (rows likewise). The first
+    /// column truncates or floors alike under the `max`.
     fn tile_flag_at_impl(
         cart_data: &CartData,
         room_x: i16,

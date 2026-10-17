@@ -95,8 +95,6 @@ pub fn zn_splat(v: P8) -> ZN {
     ZN(m512(v.as_raw_u32() as i32))
 }
 
-// ---- 16-lane PICO-8 arithmetic ----
-//
 // A `Pico8Num` is its raw `i32` in 16.16 fixed point, so add, sub, min
 // and max are the plain integer ops: the scale cancels. `+ - *` and negation
 // wrap as the console's do, `abs` of MIN does not saturate as the console's
@@ -191,9 +189,8 @@ pub fn zn_mul(a: ZN, b: ZN) -> ZN {
 }
 
 /// Divide and remainder go out to scalar (x86 has no integer vector
-/// divide). A vector version through `f64` plus a rounding correction is
-/// possible; the sites are rare enough that it has not been worth it. `/`
-/// saturates as the console's does, on the lanes `zn_div_wraps` declines.
+/// divide; the sites are rare). `/` saturates as the console's does, on the
+/// lanes `zn_div_wraps` declines.
 #[inline(always)]
 pub fn zn_div(a: ZN, b: ZN) -> ZN {
     let (x, y) = (a.to_array(), b.to_array());
@@ -211,9 +208,7 @@ pub fn zn_sin(a: ZN) -> ZN {
     ZN::from_array(std::array::from_fn(|i| x[i].pico8_sin()))
 }
 
-// ---- interval ops ----
-//
-// Componentwise on the two planes: the interval rules are selections
+// Interval ops: componentwise on the two planes: the interval rules are selections
 // between endpoints, never a per-lane branch.
 //
 // An endpoint must never wrap silently (a widened interval is exactly what
@@ -380,8 +375,6 @@ pub fn zi_span_ok(a: ZI, ways: u8) -> ZB {
 /// One fork-grid step (the integers) in raw 16.16 units.
 const STEP: i32 = 1 << 16;
 
-// ---- comparisons ----
-//
 // `Pico8Num` orders by its raw `i32`, so a comparison is one signed
 // `vpcmpd`, which yields exactly the 16-bit mask `ZB` wants.
 
@@ -445,8 +438,6 @@ pub fn zi_eq(a: ZI, b: ZI) -> ZB {
 }
 
 
-// ---- bool ops ----
-
 #[inline(always)]
 pub fn zb_not(a: ZB) -> ZB {
     ZB { val: !a.val, known: a.known }
@@ -474,8 +465,6 @@ pub fn zb_eq(a: ZB, b: ZB) -> ZB {
     ZB { val: !(a.val ^ b.val), known: a.known & b.known }
 }
 
-// ---- select ----
-
 /// Per-lane blend, one `vpblendmd`. That the condition is decided is a
 /// premise (`Known(c)`), so an undecided lane blends as if false and is
 /// filtered out downstream.
@@ -495,8 +484,6 @@ pub fn zsel_b(c: ZB, t: ZB, f: ZB) -> ZB {
     }
 }
 
-// ---- refinement splits ----
-
 /// `__split_by_flr` as an n-way fork. Fragment `c` is the `c`-th floor
 /// from the low end's, clipped to the lane; fragment 0 is never empty.
 /// Returns (fragment `c` per lane, valid mask); a lane with an empty
@@ -512,8 +499,6 @@ pub fn zi_fork_flr(a: ZI, c: usize) -> (ZI, u16) {
     let valid = if c == 0 { ALL } else { mask_le(base, fh) };
     (ZI { lo: zn_max(a.lo, base), hi: zn_min(a.hi, top) }, valid)
 }
-
-// ---- cart / collision builtins (per-lane; x/y vary, w/h/flag uniform) ----
 
 /// mget, per lane: 0 outside the map (as PICO-8; a branch-free kernel reads
 /// there on lanes that do not take the iteration); a fractional coordinate
@@ -564,8 +549,6 @@ pub fn zn_tile_flag_at(
     }
     ZB { val, known: ALL }
 }
-
-// ---- per-lane box ----
 
 #[inline(always)]
 /// `tile_flag_at` with a per-lane box: in the frame an object is created

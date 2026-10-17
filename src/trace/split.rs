@@ -1,9 +1,7 @@
-//! THE SPLIT PASS: making a traced frame executable under abstract inputs
-//! (`split_undecided_selects`). A select a lane can hold both ways cannot be
-//! evaluated, so a select the row stores is split; errors are settled by
-//! case analysis (`MayErr`), guards rewritten three-valued (`three_valued`),
-//! and with the platforms unknown, comparisons decided per platform world
-//! (`Points`).
+//! THE SPLIT PASS (`split_undecided_selects`): a traced frame made
+//! executable under abstract inputs. Errors are settled by case analysis
+//! (`MayErr`), guards rewritten three-valued (`three_valued`), and with the
+//! platforms unknown, comparisons decided per platform world (`Points`).
 
 use anyhow::{anyhow, Result};
 
@@ -506,8 +504,8 @@ pub(super) fn split_undecided_selects<A: GraphArith>(d: &mut Symbolic<A>, outs: 
             t,
             guard: o.guard,
             error: o.error,
-    // The transfer roots ride with the fields: same substitutions, and part
-    // of what makes two outcomes one.
+            // The transfer roots ride with the fields: same substitutions, and
+            // part of what makes two outcomes one.
             fields: o.fields.iter().map(|f| f.1).chain(o.arc.iter().copied()).collect(),
             rests: Vec::new(),
         };

@@ -1,8 +1,6 @@
-//! Binding a TRACED frame to the engine's numbering and lowering it: the walk's
-//! frames as the kernel registry takes them (`lattice_kernel_refs`).
-//!
-//! `bind` resolves the tracer's paths to the engine's canonical cell ids
-//! (`trace::bind`), so everything downstream names cells an `Rt2` has.
+//! Binding a TRACED frame to the engine's numbering (`bind`: paths to the
+//! canonical cell ids an `Rt2` has) and lowering it: the walk's frames as
+//! the kernel registry takes them (`lattice_kernel_refs`).
 //!
 //! Inputs and outputs are two numbering spaces: an outcome that allocates
 //! or frees an object shifts every canonical id after the change, so its
@@ -69,7 +67,6 @@ pub struct FrameOutcome<A: GraphArith = Fixed> {
 /// needs, with cell ids an `Rt2` has.
 pub struct Bound<A: GraphArith = Fixed> {
     pub graph: Graph<A>,
-    /// See `Frame::forks`.
     pub forks: u8,
     pub inputs: Vec<(u32, CellRepr)>,
     pub uni: Vec<(u32, CellRepr)>,
@@ -94,15 +91,11 @@ fn root_legend<A: GraphArith>(f: &crate::trace::frame::Frame<A>) -> String {
     out.join("\n")
 }
 
-/// Resolve a traced frame against the engine's numbering.
-///
-/// `g` is passed separately: frames traced through one interpreter share
-/// its graph (and so subexpressions), and a frame only holds node ids into
-/// it. This renumbers the whole arena and remaps the frame's roots.
-///
-/// Hitbox cells are declared UNIFORM: `tile_flag_at` needs a block-uniform
-/// width and height, and a hitbox is fixed per object type and never
-/// written during a frame.
+/// Resolve a traced frame against the engine's numbering: the whole arena
+/// `g` (frames traced through one interpreter share it) renumbered and the
+/// frame's roots remapped. Hitbox cells are declared UNIFORM: `tile_flag_at`
+/// needs a block-uniform width and height, and a hitbox is fixed per object
+/// type and never written during a frame.
 pub fn bind<A: GraphArith>(f: &crate::trace::frame::Frame<A>, g: &Graph<A>) -> Result<Bound<A>> {
     let roots: Vec<NodeId> = f.outs.iter().flat_map(|o| o.roots(true)).collect();
     let (mut graph, mut roots) = crate::trace::bind::renumber_cells(g, &f.in_cells, &roots)
@@ -338,8 +331,8 @@ fn name_cells<A: GraphArith>(f: &super::frame::Frame<A>, e: anyhow::Error) -> an
 
 
 /// The constant-lattice walk's frames for the start room, lowered, in walk
-/// order. A
-/// frame that fails to bind or lower is FATAL (a coverage gap otherwise).
+/// order. A frame that fails to bind or lower is FATAL (a coverage gap
+/// otherwise).
 pub(crate) fn lattice_kernel_refs<A: GraphArith>(
     root: &std::path::Path,
     opts: crate::abstraction::Level,

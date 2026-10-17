@@ -1,8 +1,8 @@
 // Lua's numbers as the community's TAS tools run the cart: IEEE-754
 // binary64, round to nearest even, as LuaJIT 2.1 computes them on x86-64
-// (plans/float.md, "The semantics and their authority"). UniversalClassicTas and Celia's float
-// mode both run the cart in LÖVE 11.5's LuaJIT; their `api.lua` maps the
-// cart's builtins to the expressions reproduced here, in the same order:
+// (plans/float.md, "The semantics and their authority"). UniversalClassicTas
+// and Celia's float mode both run the cart in LÖVE 11.5's LuaJIT; their
+// `api.lua` maps the cart's builtins to these expressions, in this order:
 //
 //   flr = math.floor, abs = math.abs,
 //   min(a, b) = a < b and a or b, max(a, b) = a > b and a or b,
@@ -15,15 +15,14 @@
 // JIT agree on every value, and this file computes each operation once, in
 // the cart's order, with no contraction (Rust never fuses `a * b + c`).
 //
-// MATCH EXACTLY OR RAISE: a result that is not finite (an overflow, a
-// division by zero, NaN) has no counterpart we model, so the checked
-// operations return `None` and the callers raise. Celeste's values stay far
-// from any of them.
+// MATCH EXACTLY OR RAISE: a non-finite result (an overflow, a division by
+// zero, NaN) has no counterpart we model: the checked operations return
+// `None` and the callers raise.
 //
 // `sin` is the one operation that is not basic IEEE: it calls this machine's
-// glibc `sin`, the same symbol LuaJIT calls in the tools (the LÖVE AppImage
-// links the system libm). Bit-exactness is relative to that libm; a witness's
-// portability to other libms is checked separately (section 11).
+// glibc `sin`, the symbol LuaJIT calls in the tools (the LÖVE AppImage links
+// the system libm). Bit-exactness is relative to that libm; a witness's
+// portability to others is `SinNudge`'s report.
 
 use anyhow::{bail, Result};
 use std::fmt;

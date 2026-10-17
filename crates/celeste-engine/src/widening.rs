@@ -625,8 +625,6 @@ pub fn render_markdown() -> String {
     out
 }
 
-// ------------------------------------------------------------ on blocks
-
 /// An entry's names resolved to the engine's ids (`celeste_names`).
 struct Resolved {
     /// The type global (`Target::Objects`).

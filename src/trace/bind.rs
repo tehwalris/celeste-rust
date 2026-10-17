@@ -1,15 +1,10 @@
-//! Bind a traced kernel to a block, BY PATH.
-//!
-//! The tracer names a heap slot by its path from the globals
-//! (`objects[0].spd.x`); the engine by a canonical cell id (a breadth-first
-//! walk from the globals in `GLOBAL_NAMES` order). Rather than make the two
-//! numberings agree, the kernel names its slots by path and the binder
-//! resolves them against the block it is handed, once, at bind time. A path
-//! that does not resolve is a shape mismatch: a refusal.
-//!
-//! A pointer is a cell of its own (a `Cell2::Val` holding `AV::Ptr(t)`), so
-//! a path dereferences between steps but NOT at the end: the last step lands
-//! on the `Val` cell holding the scalar, which the kernel reads and writes.
+//! Bind a traced kernel to a block, BY PATH. The tracer names a heap slot by
+//! its path from the globals (`objects[0].spd.x`); the engine by a canonical
+//! cell id (a breadth-first walk from the globals in `GLOBAL_NAMES` order).
+//! Rather than make the two numberings agree, the binder resolves the
+//! kernel's paths against the block it is handed, once, at bind time
+//! (`celeste_engine::slots`). A path that does not resolve is a shape
+//! mismatch: a refusal.
 
 use anyhow::{anyhow, bail, Result};
 
@@ -92,12 +87,10 @@ fn why_reached<A: GraphArith>(
 }
 
 
-/// Rebuild a traced graph with the ENGINE's cell ids.
-///
-/// The tracer numbers input cells densely, `Op::Cell(0..n)` in `Iface`
-/// order (its evaluator indexes them so); the emitter needs the engine's
-/// sparse canonical ids. `canon` must be INJECTIVE (checked), or two input
-/// slots silently become one cell.
+/// Rebuild a traced graph with the ENGINE's cell ids: the tracer numbers
+/// input cells densely, `Op::Cell(0..n)` in `Iface` order; the emitter needs
+/// the engine's sparse canonical ids. `canon` must be INJECTIVE (checked), or
+/// two input slots silently become one cell.
 pub fn renumber_cells<A: GraphArith>(
     g: &crate::transpile::graph::Graph<A>,
     canon: &[u32],
@@ -161,12 +154,9 @@ pub fn renumber_cells<A: GraphArith>(
     Ok((out, roots.iter().map(|r| map[*r as usize]).collect()))
 }
 
-/// Resolve a whole interface, naming the path that failed - and REFUSE
-/// if two paths land on one cell.
-///
-/// Two paths sharing a cell would mean two outputs written to one column,
-/// a silently well-formed wrong block. `iface::scalars` yields one path per
-/// distinct slot, so a collision is a bug in the structure.
+/// Resolve a whole interface, naming the path that failed - and REFUSE if
+/// two paths land on one cell (two outputs in one column: a silently
+/// well-formed wrong block; `iface::scalars` yields one path per slot).
 pub fn resolve_all<N: EngineNum>(rt2: &Rt2<N>, paths: &[Path]) -> Result<Vec<u32>> {
     let cells: Vec<u32> = paths
         .iter()

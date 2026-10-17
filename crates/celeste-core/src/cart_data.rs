@@ -75,7 +75,6 @@ impl CartData {
     }
 
     fn as_usize_below(v: Pico8Num, name: &str, high_exclusive: usize) -> Result<usize> {
-        // `ok_or_else`: the error message is built lazily (hot path).
         let v = v.as_i16().ok_or_else(|| anyhow!("{} is not an integer", name))?;
         if v >= 0 && (v as usize) < high_exclusive {
             Ok(v as usize)

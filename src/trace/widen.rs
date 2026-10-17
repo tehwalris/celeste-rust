@@ -412,11 +412,12 @@ pub const PLAYER_PROBE: [(i16, i16); 2] = [(-3, 3), (-1, 0)];
 /// countdowns are widened regardless (unread while inside). An overlapped
 /// floor stores the CART'S INVARIANT (hidden: `state` 2, `collideable`
 /// false, the player cannot be inside a solid floor), with the computed
-/// value owed; storing the computed value makes the split resolve every
-/// floor the player MIGHT overlap (30x the outcomes) - except with the
-/// platforms unknown, where it stores the computed value (below). Mid split frame (`mid`), `collideable` also stays computed in the
-/// `PLAYER_PROBE` window: widening there would let the second step reach
-/// states the unsplit frame does not. `Rt2::widen_to` agrees.
+/// value owed (storing the computed value makes the split resolve every
+/// floor the player MIGHT overlap: 30x the outcomes); with the platforms
+/// unknown, the computed value (below). Mid split frame (`mid`),
+/// `collideable` also stays computed in the `PLAYER_PROBE` window: widening
+/// there would let the second step reach states the unsplit frame does not.
+/// `Rt2::widen_to` agrees.
 fn widen_near_floors<A: GraphArith>(st: &mut State<Symbolic<A>>, d: &mut Symbolic<A>, e: &Entry, errs: &mut SlotErrors, mid: bool) -> Result<()> {
     use super::domain::Cmp;
     // The hitboxes `floor_player_window` assumes, checked on the state.
@@ -687,8 +688,8 @@ fn comparison_facts<A: GraphArith>(d: &Symbolic<A>, c: NodeId) -> Option<(NodeId
     Some((x, yes, no))
 }
 
-/// A static range of `n` (literals, a bounded input - a platform's
-/// `x` among them -, sums and differences), narrowed by the enclosing branches; `None` otherwise.
+/// A static range of `n` (literals, a bounded input such as a platform's
+/// `x`, sums and differences), narrowed by the enclosing branches.
 fn bounds<A: GraphArith>(d: &Symbolic<A>, n: NodeId, facts: &[(NodeId, f64, f64)]) -> Option<RangeF64> {
     let node = d.graph.get(n);
     let num = |l: A::Lit| A::from_lit(l).to_f64();
@@ -774,7 +775,7 @@ mod tests {
     /// is an error's OVERFLOW check of their own arithmetic (`minutes + 1`:
     /// a free cell may be MAX): it holds at the stored constants, which are
     /// all the search ever holds there. Every frame of room (4,0)'s 100%
-    /// route (the player runs and dashes, takes the key and opens the chest
+    /// route (the player runs, dashes, takes the key and opens the chest
     /// with it).
     #[test]
     fn dead_fields_are_unread() {
@@ -787,8 +788,6 @@ mod tests {
         let mut it: Interp<Symbolic> = Interp::new(Symbolic::default());
         let mut st = cart::boot(&mut it, &chunks, root, s.room).expect("boot");
         let dead = |s: &Slot| matches!(s.stored, Stored::Num(_) | Stored::Bool(_));
-        // The 100% route: the player runs, dashes, takes the key and opens
-        // the chest with it.
         let route = crate::concrete::read_inputs("tas/room_4_0_hundred_frame_152.txt").expect("the route");
         let (mut traced, mut with_key, mut with_player, mut has_key) = (0, 0, 0, false);
         let mut overflow_checks = 0;

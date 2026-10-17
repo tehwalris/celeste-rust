@@ -31,9 +31,8 @@ pub enum Value<D: Domain> {
     Str(Arc<str>),
     Table(TableId),
     /// A closure: a HEAP OBJECT with identity, referred to by id, so GC
-    /// collects it and `shape`'s canonical BFS renumbers it.
-    ///
-    /// PICO-8 (Lua 5.2, measured on a real PICO-8) CACHES closures: identity
+    /// collects it and `shape`'s canonical BFS renumbers it. PICO-8 (Lua
+    /// 5.2, measured on a real PICO-8) CACHES closures: identity
     /// is (prototype, upvalue cells), so e.g. two calls of a body with no
     /// upvalues return the SAME closure. This model has the prototype
     /// (`BodyId`) but approximates the cells by the enclosing scope, so `==`
@@ -125,8 +124,7 @@ impl<D: Domain> Table<D> {
     ///
     /// Globals only: an object FIELD assigned nil keeps its slot (the cart
     /// does it to every object of a type alike, in `init_object`); removing it
-    /// would renumber every state's key and invalidate the pinned gates and
-    /// every checkpoint tree for no merge.
+    /// would move every key, gates and trees included, for no merge.
     pub fn set_global(&mut self, name: String, v: Value<D>) {
         if matches!(v, Value::Nil) {
             self.hash.remove(&name);
@@ -359,11 +357,9 @@ pub fn push_value<D: Domain>(v: &Value<D>, stack: &mut Vec<Root>) {
     }
 }
 
-/// The part of a state that decides whether two states can MERGE.
-///
-/// Structure, not data: which objects exist, their keys, array lengths and
-/// closure bodies. Same-shape states merge with a `Sel` per differing slot;
-/// different shapes are different successors and both survive.
+/// The part of a state that decides whether two states can MERGE: structure,
+/// not data (which objects exist, their keys, array lengths and closure
+/// bodies).
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub enum Slot {
     Nil,
