@@ -8,7 +8,7 @@
 # The file format is UniversalClassicTas's ("[seeds]i1,i2,...", the first
 # input on the player's first frame): Celia reads and writes the same files.
 # A playback that DIES before the exit is a failure (driver.lua).
-# Output, one line per file (tools/category_runner.py parses "STATUS, N"):
+# Output, one line per file (tools/celeste/love.py parses "STATUS, N"):
 #   level L FILE: finished, Nf -> SAVED     or    level L FILE: DID NOT FINISH (...), 0f
 # Env: CELIA_DASHES (max_djump: the gemskip categories 1); CELIA_JANK_OFFSET
 #      (Celia's key-A offset, default 0); CELIA_FIXP=1 (Celia's --fixp: 16.16

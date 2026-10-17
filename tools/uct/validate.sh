@@ -15,8 +15,8 @@
 # ...)"), whatever UCT saved afterwards (driver.lua). UCT_TRACE=1: print the
 # driver's per-update "[trace]" lines (player, balloons); UCT_LOG=1: all of LOVE's output.
 # Each run has its own LOVE save identity (no clash with a concurrent run);
-# the saved file is printed after "->" and also copied to the old shared
-# place, ~/.local/share/love/CelesteTAS/TAS<level>.tas.
+# the saved file is printed after "->" and also copied to the shared
+# ~/.local/share/love/CelesteTAS/TAS<level>.tas.
 # Env: UCT_DASHES (dash count key, gemskip: 1); UCT (clone, default ~/src/github.com/gonengazit/UniversalClassicTas),
 #      LOVE (default /var/tmp/love/squashfs-root/AppRun).
 set -e

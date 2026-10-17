@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Per-line cycle attribution through INLINED frames (branch `fwd-perf`).
+"""Per-line cycle attribution through INLINED frames.
 
 The release build has line tables (`debug = 1`) but no frame pointers, so
 `perf record -g` call chains are unusable and `perf report` lumps every

@@ -58,8 +58,8 @@ UI = "/var/tmp/celeste-ui/data"
 
 
 def job_flags(job):
-    """The job's own search flags. A job's "env" (CELESTE_* variables, before
-    2026-10-10) is refused, as the binaries refuse the environment."""
+    """The job's own search flags; an "env" (CELESTE_* variables) is
+    refused, as the binaries refuse the environment."""
     if "env" in job:
         raise SystemExit(f"job {job}: \"env\" is gone (the binaries refuse CELESTE_* variables): give its settings in \"flags\"")
     return list(job.get("flags", []))
@@ -89,9 +89,8 @@ def canon_jumps(room, inputs, seeds, cat, jank=None):
     so a press that does nothing in the minimal cart - one copied from a
     community TAS by --prefer - can fire later there. With every press firing
     at once, the buffer never holds one: the same route in both carts. The
-    minimal cart is replayed under the file's balloon seeds (the reference
-    engine's concrete run has none: a balloon room's run diverged there and
-    kept a press, gemskip 2800m 2026-10-07)."""
+    minimal cart is replayed under the file's balloon seeds (without them a
+    balloon room's run diverges and keeps a press)."""
     spd_y = {fr.f: fr.spd_y for fr in pico8.replay(rooms.parse(room), inputs, len(inputs) + 1, seeds, cat, jank, original=False)}
     canon, prev = [], 0
     for i, b in enumerate(inputs):
@@ -174,8 +173,8 @@ def run(job, outdir, binary):
         t = time.time()
         with open(log, "w") as f:
             rc = subprocess.run(cmd, stdout=f, stderr=subprocess.STDOUT, cwd=M, timeout=job.get("timeout", 4 * 3600)).returncode
-        # The search's record (rewrite.rs `search::result`): none when it
-        # stopped on an error before deciding.
+        # The search's record (`search::result`): none when it stopped on an
+        # error before deciding.
         rec = os.path.join(tree, "result.json")
         return rc, (json.load(open(rec)) if os.path.exists(rec) else None), time.time() - t
     horizon = job.get("to", ref)
@@ -263,24 +262,20 @@ def run(job, outdir, binary):
     # 4. The upload, chosen by REAL PLAY. It starts at the room's first
     # controllable frame: usually the community file's earliest exiting
     # offset, but a witness may press on the frame before (the player exists
-    # and updates on the frame it is created: room (2,1) nodiag, 2026-10-08),
-    # so that cut is tried too; a cut never drops a press. Each candidate
-    # (cut, seeds) goes through tools/uct/check_uploads.py - the boot chain
-    # on a real PICO-8 and Celia - and the first VALID one is the upload,
-    # written by us (the witness ends at the exit: no trailing input).
-    # UniversalClassicTas is run on it for information only: it has no
-    # loading frame and computes in doubles. Until 2026-10-08 UCT chose the
-    # cut, and nodiag 1800m's upload was cut a frame early so that UCT
-    # finished (86): that file dies in real play, the PICO-8 alignment (85)
-    # is valid. When the file's seeds die, the balloons' phases are nudged
+    # and updates on the frame it is created), so that cut is tried too; a
+    # cut never drops a press. Each candidate (cut, seeds) goes through
+    # tools/uct/check_uploads.py - the boot chain on a real PICO-8 and Celia
+    # - and the first VALID one is the upload, written by us (the witness
+    # ends at the exit: no trailing input). UniversalClassicTas is run on it
+    # for information only: it has no loading frame and computes in doubles.
+    # When the file's seeds die, the balloons' phases are nudged
     # (nudged_seeds; still optimal: the bound holds for every seed).
     if level:
         ok_db, _, n_db = love.uct(level, dbpath, cat)
         res["uct_db"] = f"{'finished' if ok_db else 'NOT finished'} {n_db} inputs"
         cuts = [c for c in [prologue] + ([lead] if lead < prologue else []) + [prologue - 1] if not any(ours[:c])]
         tries = [(seeds, c) for c in cuts] + [(sd, c) for sd in love.nudged_seeds(seeds, rooms.seed_slots(rooms.parse(room), binary)) for c in cuts]
-        # Each candidate once: a room without balloons nudges nothing (room
-        # (0,3) gemskip100 checked its two cuts 22 times, 2026-10-14).
+        # Each candidate once: a room without balloons nudges nothing.
         tries = [t for i, t in enumerate(tries) if t not in tries[:i]]
         # Every candidate's row; without a VALID one the record shows the
         # first (the file's seeds at the reference's cut), not the last tried.
@@ -341,8 +336,7 @@ def run(job, outdir, binary):
 def ui_label(room, label, opt, tasn, ref, res):
     r"""The web UI's label of a run that beats the reference: an unverified
     one (`res["verified"]` false) says so and why, never only "exit at ...
-    against ..." (room (0,3) gemskip100's 141 was listed so, 2026-10-14,
-    with UCT and Celia dying at frame 80).
+    against ...".
 
     >>> ui_label("0,3", "gemskip100", 141, "TAS25", 142, {"verified": True})
     "Room (0,3) · gemskip100: exit at frame 141 against TAS25's 142 (community TAS drawn as the reference path)"
@@ -428,8 +422,8 @@ def main():
             res = run(job, outdir, binary)
         except (Exception, SystemExit) as ex:
             # SystemExit too: chain.py and replay.py exit on what they cannot
-            # run, and it passed `except Exception` and ended the runner with
-            # no results line (gemskip100 2900m, 2026-10-09).
+            # run, and `except Exception` would end the runner with no
+            # results line.
             res = {"key": f"{job['cat']}/{job['name']}{job.get('tag', '')}", "status": f"runner error: {type(ex).__name__}: {ex}"[:300]}
         res["end"] = time.strftime("%H:%M")
         with open(results, "a") as f:

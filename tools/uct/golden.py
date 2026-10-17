@@ -34,7 +34,7 @@ trace, the draw-only objects dropped, goes to gates/uct/CAT_LEVEL.trace.zst
 
     CAT LEVEL room=X,Y seeds=S1,S2|- gemskip=0|1 updates=N uct=STATUS retimed=K
 
-The test (`trace::uct::tests`) replays every manifest line through the
+The test (`trace::oracle::tests`) replays every manifest line through the
 float reference engine (the tools' seeds: `cart::tool_seeds`). A file UCT
 errors on is skipped.
 READ THE DIFF before committing: a golden that moved means UCT's run did.

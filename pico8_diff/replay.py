@@ -81,14 +81,10 @@ def build_cart(inputs, frames, out, lua_path=None, begin_game=False, room=None, 
     if balloon_seeds is not None:
         # A balloon's phase is `offset=rnd(1)` at load, which PICO-8 seeds
         # itself, so a route past a balloon replays only under some draws.
-        # The TAS tool (gonengazit/UniversalClassicTas) fixes each balloon's
-        # offset instead - the `[s1,s2,]` header of a tasdatabase file, in
-        # object creation order - and so does this. The same seed is the same
-        # phase at the room load in both, but NOT the same run: UCT adds 0.01
-        # a frame in Lua doubles, PICO-8 0x0.028f, so a balloon whose y meets
-        # an integer can be touched here and missed there (seed 0 puts y at
-        # exactly `start` at offset 0.5 in UCT). Check uploads in UCT too
-        # (tools/uct/validate.sh; tools/celeste/love.py nudged_seeds).
+        # The TAS tools fix each balloon's offset instead - the `[s1,s2,]`
+        # header of a tasdatabase file, in object creation order - and so
+        # does this: the same phase at the room load, but NOT the same run
+        # (tools/celeste/love.py nudged_seeds).
         pat = "this.offset=rnd(1)"
         assert lua.count(pat) == 1, f"expected exactly one {pat!r} in the Lua"
         lua = lua.replace(pat, "this.offset=__balloon_seed()")
@@ -109,13 +105,13 @@ def build_cart(inputs, frames, out, lua_path=None, begin_game=False, room=None, 
     lua = lua.replace(pat, pat + " __dash_start={input,v_input,this.flip.x}")
     if room is not None:
         # The minimal cart's _init loads room (1,0); the search patches the
-        # same call (celeste-interp game_runner) to start elsewhere. The
+        # same call (src/game_runner.rs) to start elsewhere. The
         # ORIGINAL cart's start is begin_game's `load_room(0,0)` - patched the
         # same way, so a community TAS of any level replays from its room.
         pat = "load_room(0,0)" if begin_game else "load_room(1, 0)"
         assert lua.count(pat) == 1, f"expected exactly one {pat!r} in the Lua"
         # Past the orb (room (5,2)'s big chest, level 21) a play-through has
-        # the second dash: max_djump=2 (celeste-interp game_runner, the same).
+        # the second dash: max_djump=2 (src/game_runner.rs, the same).
         # --one-dash: the gemskip categories skip the orb, one dash throughout.
         orb = "max_djump=2 " if room[0] % 8 + room[1] * 8 > 21 and not one_dash else ""
         lua = lua.replace(pat, f"{orb}load_room({room[0]}, {room[1]})")
@@ -317,8 +313,7 @@ def build_cart(inputs, frames, out, lua_path=None, begin_game=False, room=None, 
     # __map__: rows 0..31 as 32 lines of 128 bytes. Rows 32..63 live in the
     # sprite sheet's lower half (__gfx__ lines 64..127): a sprite-sheet line
     # is 64 bytes (128 pixels, one hex char each, low nibble first), so each
-    # map row is TWO of them. (Until 2026-10-01 one 256-char line per row,
-    # which PICO-8 truncated: rooms of map rows 2 and 3 were garbage here.)
+    # map row is TWO of them (PICO-8 truncates a 256-char line).
     map_lines = [map_data[r * 128:(r + 1) * 128].hex() for r in range(32)]
     gfx_lines = ["0" * 128 for _ in range(64)]
     for r in range(32, 64):
@@ -359,8 +354,7 @@ def run(inputs, frames, keep=False, **kw):
         # The driver always prints its `end` line: none means the cart did not
         # run to its end (a runtime error, a halt). Raised, not exited, so a
         # caller in the same process (category_runner, check_uploads) can
-        # report it: a SystemExit passes `except Exception` and killed the
-        # runner silently (gemskip100 2900m, 2026-10-09).
+        # report it: a SystemExit passes `except Exception`.
         raise NoCartOutput(f"no cart output ({cart}); pico8 said: {(proc.stdout[-500:] + proc.stderr[-500:]).strip()!r}")
     if not keep:
         os.remove(cart)

@@ -58,9 +58,9 @@ def file_of_level(level):
 
 # Rooms whose database file is not PICO-8 valid (made in a tool computing in
 # doubles, it never exits on a real PICO-8), played in a category's chain with
-# OUR file instead, so the chain runs on unbroken (it used to restart after
-# such a room by an IL load): (category, level) -> a file, relative to the
-# repo. Only files verified like any submission (check_uploads: VALID).
+# OUR file instead, so the chain runs on unbroken: (category, level) -> a
+# file, relative to the repo. Only files verified like any submission
+# (check_uploads: VALID).
 OVERRIDES = {
     # The database's 164 finishes in Celia only; ours exits on PICO-8.
     ("gemskip100", 28): "tas/tasdatabase/gemskip100/upload/TAS28.tas",

@@ -7,7 +7,7 @@ counter and the margin when the new run exits.
     tools/compare_video.py LEVEL OLD.tas NEW.tas OUT_PREFIX [--title 2800M]
         [--category "NO DIAGONAL DASHES"] [--old-label "TASDATABASE (GHOST)"] [--new-label OURS]
         [--slow 4] [--captures DIR] [--stills DIR] [--tool uct|celia]
-Gemskip categories: UCT_DASHES=1 / CELIA_DASHES=1 in the environment (as tools/category_runner.py).
+Gemskip categories: UCT_DASHES=1 / CELIA_DASHES=1 in the environment (as tools/celeste/love.py sets them).
 
 Writes OUT_PREFIX.mp4 (real time, 30 fps) and OUT_PREFIX_slow.mp4 (the room
 entry at real time, then 1/SLOW speed). Both runs are played headlessly in
@@ -43,8 +43,6 @@ GX, GY = 28, 298           # the game's top left (even: aligns with yuv420p's 2x
 FPS = 30
 GHOST_ALPHA, SMOKE_ALPHA = 0.7, 0.35
 
-
-# ---- capture -------------------------------------------------------------
 
 def capture(tool, level, tas, outdir):
     os.makedirs(outdir, exist_ok=True)
@@ -85,8 +83,6 @@ def load(outdir, tas):
     return {"meta": meta, "screen": idx[:, 0], "player": (idx[:, 1], alpha[:, 1]), "smoke": (idx[:, 2], alpha[:, 2]), "objects": (idx[:, 3], alpha[:, 3]),
             "frames": frames, "spawn": spawn}
 
-
-# ---- drawing -------------------------------------------------------------
 
 def load_font():
     im = np.array(Image.open(f"{UCT}/CelesteTAS/font.png").convert("RGBA"))

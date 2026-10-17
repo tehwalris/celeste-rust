@@ -7,8 +7,7 @@ community's tasdatabase files for those rooms.
 
 Start modes (all on the original cart, all counting a room's frames from
 the frame its player is created, as UniversalClassicTas and Celia do):
- 1. IL: the room loaded directly (UCT's IL load; our search before
-    2026-10-08);
+ 1. IL: the room loaded directly (UCT's IL load);
  2. jank: the room loaded directly, then its LOADING FRAME as a real
     transition runs it - `_update`'s `foreach` goes on over the new room's
     objects from the leaving player's index J (PICO-8's `all` resumes

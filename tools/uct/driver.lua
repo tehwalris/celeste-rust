@@ -6,8 +6,7 @@
 -- quit at once. UCT itself does not stop on a death: the cart restarts the
 -- room (its balloons re-drawn with rnd(1), NOT the file's seeds) and the
 -- clean save keeps recording, so a later attempt that happens to exit is
--- saved as if the file had finished (gemskip-nodiag TAS30, 2026-10-08: two
--- deaths at keypress frame 29, the third attempt exited).
+-- saved as if the file had finished.
 -- UCT_TRACE=1: one "[trace]" line per cart update of the playback (the
 -- player, the balloons' offset and y), to compare with pico8_diff/replay.py.
 local D = {t = 0, phase = "start", n = tonumber(os.getenv("UCT_LEVEL")), pressed = 0, waited = 0}

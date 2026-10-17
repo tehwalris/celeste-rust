@@ -33,13 +33,10 @@ def nudged_seeds(seeds, slots, steps=10):
     """The `[seeds]` list with every BALLOON's phase moved by k * 0.0001,
     k = -1, +1, -2, +2, .. (`slots`: `rooms.seed_slots`). A seed does not
     mean exactly the same in UCT and PICO-8: the phase advances 0.01 a frame
-    in UCT's doubles and 0x0.028f (0.0099945) in 16.16, so UCT runs ahead by
-    5.5e-6 a frame, and where a balloon's y meets an integer (seed 0: y =
-    start EXACTLY at offset 0.5) the touch can differ (gemskip-nodiag 3000m:
-    PICO-8 refills at f54 at y 111.997, UCT's balloon is at 112.000 and
-    misses). A nudge of -0.0003 is UCT's phase at PICO-8's around frame 55.
-    Every candidate must be checked in BOTH; chests (a berry position) are
-    kept."""
+    in UCT's doubles and 0x0.028f (0.0099945) in 16.16, so where a balloon's
+    y meets an integer (seed 0: y = start EXACTLY at offset 0.5) the touch
+    can differ. Every candidate must be checked in BOTH; chests (a berry
+    position) are kept."""
     vals = list(seeds) + ["0"] * (len(slots) - len(seeds))
     for k in range(1, steps + 1):
         for sign in (-1, 1):
