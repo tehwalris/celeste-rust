@@ -1,29 +1,22 @@
-//! A STATE'S REMAINDER HULL (the hull forward, plans/architecture.md "The
-//! forward"): the sub-pixel remainders a state has been reached
-//! with so far, over-approximated by ONE ARC of the circle per axis (their
-//! box). The forward keeps a hull per state and pushes it along the
-//! recorded edges through their transfers (`push`: per axis the arc's
-//! points inside the guard, moved by the action); a target's hull grows to
-//! cover what it is pushed (`HullAcc`). Sound: every remainder a concrete
-//! path reaches a state with is in its hull (the push of a superset is a
-//! superset of the push, and the hull of a union a superset of it).
+//! A STATE'S REMAINDER HULL (plans/architecture.md "The forward: hulls and
+//! storage"): the remainders a state has been reached with, over-
+//! approximated by ONE ARC of the circle per axis (their box), pushed along
+//! the recorded edges (`Hull::push`: per axis the arc's points inside the
+//! guard, moved by the action) and grown to cover what a target is pushed
+//! (`HullAcc`). Sound: every remainder a concrete path reaches a state with
+//! is in its hull (the push of a superset is a superset of the push, the
+//! hull of a union a superset of it). Generic over the `Circle`: a hull is
+//! 8 B in 16.16, 32 B in doubles.
 //!
-//! Generic over the CIRCLE (`arcs::Circle`): 16.16's 65536 points (a
-//! remainder `r` is the point `r + 32768`; a hull 8 bytes), or the doubles
-//! of `[-1/2, 1/2)` (`rem_f64::Doubles`; 32 bytes). An arc may wrap past
-//! the end of the circle; its bounds are the circle's stored words, its
-//! arithmetic the points as numbers (`Circle::wide`).
-//!
-//! THE MERGE IS ORDER-FREE: the pushes into one target within a frame
-//! come from region jobs that run in any order, and "the smallest arc
-//! holding two arcs" is not associative on a circle. So a target
-//! accumulates per axis two CHARTS - the circle cut at its first point and
-//! at its middle, each a linear interval `[lo, hi]` of its own coordinates
-//! - merged by min and max (commutative and associative); the arc is then
-//! the shorter chart's (`HullAcc::hull`). That is the smallest arc holding
-//! the union whenever the union fits in half the circle (its largest gap
-//! is then longer than half, so it holds a cut), and a superset of it
-//! otherwise.
+//! THE MERGE IS ORDER-FREE: the pushes into one target within a frame come
+//! from region jobs in any order, and "the smallest arc holding two arcs"
+//! is not associative on a circle. So a target accumulates per axis two
+//! CHARTS - the circle cut at its first point and at its middle, each a
+//! linear interval `[lo, hi]` of its own coordinates - merged by min and
+//! max (commutative and associative); the arc is the shorter chart's
+//! (`HullAcc::hull`). That is the smallest arc holding the union whenever
+//! the union fits in half the circle (its largest gap is then longer than
+//! half, so it holds a cut), and a superset of it otherwise.
 
 use super::arcs::{Circle, Fixed16, Piece, Region, Seg};
 use super::rem::Rem;
@@ -41,7 +34,6 @@ fn word<C: Circle>(v: u64) -> C::W {
     C::store(C::narrow(v))
 }
 
-/// A stored word as a number.
 #[inline]
 fn num<C: Circle>(w: C::W) -> u64 {
     C::wide(C::load(w))
@@ -64,12 +56,11 @@ impl<C: Circle> Arc<C> {
         Arc { start: C::store(p), last: word::<C>(0) }
     }
 
-    /// The whole circle.
     pub fn full() -> Self {
         Arc { start: word::<C>(0), last: word::<C>(size::<C>() - 1) }
     }
 
-    /// Its points.
+    /// Its number of points.
     #[inline]
     pub fn len(self) -> u64 {
         num::<C>(self.last) + 1
@@ -116,9 +107,8 @@ pub struct Hull<C: Circle = Fixed16> {
     pub y: Arc<C>,
 }
 
-/// Equal as the circle compares four words (`Circle::same4`: 16.16's at
-/// once, one 8-byte compare - field by field cost the push cache's lookup
-/// 2.6% of r62h57's f56 in release instructions; the doubles' word by word).
+/// Equal by `Circle::same4` (16.16's one 8-byte compare: field by field
+/// cost the push cache's lookup 2.6% of a big room's frame).
 impl<C: Circle> PartialEq for Hull<C> {
     #[inline]
     fn eq(&self, o: &Self) -> bool {
@@ -128,10 +118,8 @@ impl<C: Circle> PartialEq for Hull<C> {
 
 impl<C: Circle> Eq for Hull<C> {}
 
-/// A hull of arithmetic `N`'s circle.
 pub type HullOf<N> = Hull<<N as Rem>::C>;
 
-/// A hull accumulated in arithmetic `N`'s circle.
 pub type AccOf<N> = HullAcc<<N as Rem>::C>;
 
 impl<C: Circle> Hull<C> {
@@ -190,12 +178,11 @@ impl<C: Circle> Hull<C> {
 
     /// THE PUSH of a GROWN hull (`self`; `was`, the hull it last pushed,
     /// inside it): `push`, but only where the edge's image grows past
-    /// `was`'s - every image of `was` was pushed then (an image dropped
-    /// then, by level -1 or the ladder's filter, is dropped at every later
-    /// frame too). The image grows when the box was empty and is not, or
-    /// when an axis it moves (not to a constant) meets more of the guard
-    /// than before (a constant's image is its point either way). Returns
-    /// whether it pushed.
+    /// `was`'s - every image of `was` was pushed then (one dropped then, by
+    /// level -1 or the ladder's filter, is dropped at every later frame too).
+    /// The image grows when the box was empty and is not, or when an axis
+    /// not sent to a constant meets more of the guard than before (a
+    /// constant's image is its point either way). Returns whether it pushed.
     #[inline]
     pub fn push_grown(&self, was: &Hull<C>, t: &(C::Act, C::Act), acc: &mut HullAcc<C>) -> bool {
         let (nx, ny) = (meet(self.x, &t.0), meet(self.y, &t.1));
@@ -235,7 +222,6 @@ impl<C: Circle> Hull<C> {
     }
 }
 
-/// `s` clipped to `g`.
 #[inline]
 fn clip<P: Ord + Copy>(s: Seg<P>, g: Seg<P>) -> Option<Seg<P>> {
     let (lo, hi) = (s.lo.max(g.lo), s.hi.min(g.hi));
@@ -269,11 +255,10 @@ fn image<C: Circle>(a: Arc<C>, t: &C::Act, out: &mut [Seg<C::P>; 4]) -> usize {
 }
 
 /// A small direct-mapped cache of pushes, `(hull, the hull it last pushed,
-/// transfer) -> the push` (`None`: nothing): a source's cells and a unit's
-/// sources share hulls (a full one most of all) and transfers, and a push
-/// depends on nothing else. The transfer is the caller's id; start a new
-/// `epoch` when the ids change meaning (an entry of an older one never
-/// matches).
+/// transfer) -> the push` (`None`: nothing): sources share hulls (a full
+/// one most of all) and transfers, and a push depends on nothing else. The
+/// transfer is the caller's id; start a new `epoch` when the ids change
+/// meaning (an entry of an older one never matches).
 pub struct PushCache<N: Rem = P8> {
     slots: Vec<Slot<N::C>>,
     epoch: u32,
@@ -319,9 +304,9 @@ impl<N: Rem> PushCache<N> {
 }
 
 /// TESTS ONLY: every hull the forward accumulates (and the start's) WIDENED
-/// to the whole circle - the forward before hulls, every state's remainder
-/// widened, which the hull forward must stay inside (`frame::tests`).
-/// Process-global: nextest runs each test in its own process.
+/// to the whole circle: the remainder-free forward, which the hull forward
+/// must stay inside (`frame::tests`). Process-global: nextest runs each
+/// test in its own process.
 #[cfg(test)]
 pub static WIDEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
@@ -332,10 +317,9 @@ fn cut<C: Circle>(c: usize) -> u64 {
     c as u64 * (size::<C>() / 2)
 }
 
-/// A HULL BEING ACCUMULATED (module doc): per axis, per chart, the linear
+/// A HULL BEING ACCUMULATED (module doc): per axis and chart the linear
 /// hull `[lo, hi]` in the chart's coordinates of every point added (`lo >
-/// hi`: none) - `lo` and `hi` by `axis * 2 + chart`. Merging is min and
-/// max: the result does not depend on the order things are added in.
+/// hi`: none), indexed `axis * 2 + chart`; merged by min and max.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct HullAcc<C: Circle = Fixed16> {
     lo: [C::W; 4],

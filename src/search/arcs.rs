@@ -1,20 +1,15 @@
-//! Sets of sub-pixel remainders as ARCS (the rotation graph). A frame moves
-//! a remainder by `rem := (rem + v) mod 1` into [-1/2, 1/2), a ROTATION of
-//! the circle, and the side of the wrap it lands on decides the pixel step.
-//! Along an edge a set maps by "intersect with the guard arc, then rotate"
-//! (or, on a collision, to a point), which distributes over unions: pushing
-//! sets through a graph tests every path at once.
+//! Sets of sub-pixel remainders as ARCS (plans/architecture.md "Arcs: the
+//! rotation graph"). Along an edge a set maps by "intersect with the guard
+//! arc, then act" (rotate, or on a collision go to a point), which
+//! distributes over unions: pushing sets through a graph tests every path
+//! at once.
 //!
-//! Coordinates: a remainder `r` (raw 16.16, in [-32768, 32767]) is the
-//! point `r + 32768` of `0..CIRCLE`. A set is sorted, disjoint, non-adjacent
-//! half-open segments (an arc across the wrap is two). Two axes: `Rects`
-//! (unions of rectangles) and the canonical `Region`.
-//!
-//! The two-axis sets (`Region`, `RegionArena`, `Piece`) are generic over the
-//! CIRCLE of points (`Circle`): 16.16's 65536 (`Fixed16`, this module's
-//! rotations), or the doubles of `[-1/2, 1/2)` (`rem_f64::Doubles`, whose
-//! transfers are monotone maps, not rotations). A transfer is the circle's
-//! `Act`; the pull through it is exact on both.
+//! A remainder `r` (raw 16.16, in [-32768, 32767]) is the point `r + 32768`
+//! of `0..CIRCLE`. A set is sorted, disjoint, non-adjacent half-open
+//! segments (an arc across the wrap is two). Two axes: `Rects` and the
+//! canonical `Region`, generic over the `Circle` (16.16's `Fixed16`, or the
+//! doubles' `rem_f64::Doubles`, whose transfers are monotone maps, not
+//! rotations); the pull is exact on both.
 
 /// Points on the circle: 1 px in raw 16.16 units.
 pub const CIRCLE: u32 = 1 << 16;
@@ -40,7 +35,6 @@ pub struct Seg<P = u32> {
 /// bounds are, how a record stores them, and an axis's transfer (`Act`) with
 /// its image and preimage.
 pub trait Circle: Copy + std::fmt::Debug + Default + PartialEq + Eq + PartialOrd + Ord + std::hash::Hash + Send + Sync + 'static {
-    /// A point.
     type P: Copy + Ord + std::hash::Hash + std::fmt::Debug + Default + Send + Sync + 'static;
     /// A stored point or count (a `RegionArena` record's word, a hull's
     /// bound), ordered as the points are.
@@ -80,7 +74,7 @@ pub trait Circle: Copy + std::fmt::Debug + Default + PartialEq + Eq + PartialOrd
     fn const_point(a: &Self::Act) -> Option<Self::P>;
     /// The IMAGE of `s`'s points inside the guard: exact for 16.16; for a
     /// monotone action the interval between its ends' images (a superset:
-    /// sound where it is used, the push of `reach`).
+    /// sound where it is used, the pushes of `hull` and `reach`).
     fn image(a: &Self::Act, s: Seg<Self::P>, f: impl FnMut(Seg<Self::P>));
     /// The PREIMAGE of `s` under a non-constant action: the points of the
     /// guard it maps into `s`, EXACTLY.
@@ -477,7 +471,6 @@ impl<C: Circle> Region<C> {
         let all = Stored::of::<C>(Seg { lo: C::P::default(), hi: C::SIZE });
         Region { slabs: vec![Slab { y: all, end: C::count(1) }], xs: vec![all] }
     }
-    /// The set as a borrowed view (what every query takes).
     pub fn as_ref(&self) -> RegionRef<'_, C> {
         RegionRef { slabs: &self.slabs, xs: &self.xs }
     }
@@ -589,7 +582,6 @@ impl<'a, C: Circle> RegionRef<'a, C> {
     pub fn slabs(self) -> impl Iterator<Item = (Seg<C::P>, impl Iterator<Item = Seg<C::P>> + 'a)> + 'a {
         self.stored().map(|(y, xs)| (y, xs.iter().map(|s| s.seg::<C>())))
     }
-    /// The slabs as stored.
     fn stored(self) -> impl Iterator<Item = (Seg<C::P>, &'a [Stored<C::W>])> + 'a {
         let mut start = 0;
         self.slabs.iter().map(move |s| {
@@ -694,16 +686,14 @@ const _: () = assert!(std::mem::size_of::<Stored<u64>>() == 16 && std::mem::size
 /// chunks.
 const CHUNK_WORDS: usize = 1 << 25;
 
-/// Many sets as RECORDS of words - the set's slab and segment counts, then
-/// its slabs (3 words each) and its segments (2 words) - in CHUNKS, and per
-/// set its record's place (8 B): the backward's arena of distinct winning
-/// sets, without a `Region`'s two allocations each. The open chunk grows; a
-/// full one is SEALED - kept as it is, or (`spill_to`) written to a scratch
-/// file and mapped back (page cache, which the kernel can reclaim, not
-/// anonymous memory; the file unlinked once mapped). Records never move, so
-/// the arena grows without copying itself (one flat list each for slabs and
-/// segments, doubling, held both copies at its growth: a backward of 75M
-/// sets, 49.6 GB, peaked at 89.9 GB).
+/// Many sets as RECORDS of words - the slab and segment counts, then the
+/// slabs (3 words each) and segments (2 words) - in CHUNKS, and per set its
+/// record's place (8 B): the backward's arena of distinct winning sets,
+/// without a `Region`'s two allocations each. The open chunk grows; a full
+/// one is SEALED, kept or (`spill_to`) written to a scratch file and mapped
+/// back (page cache, as `backward::Spill`). Records never move, so the
+/// arena grows without copying itself (a doubling flat list holds both
+/// copies as it grows: 90 GB at peak for 50 GB of sets).
 pub struct RegionArena<C: Circle = Fixed16> {
     /// Set `i`'s record: its chunk (high 32 bits; `sealed.len()` is the open
     /// one) and its first word there.
@@ -891,7 +881,6 @@ mod tests {
         assert_eq!(pieces(65536).len(), 1, "a whole pixel cuts nothing");
     }
 
-    /// A tiny deterministic generator for the property tests.
     fn lcg(s: &mut u64) -> u32 {
         *s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
         (*s >> 33) as u32

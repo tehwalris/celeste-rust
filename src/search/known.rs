@@ -1,42 +1,30 @@
-//! A KNOWN solution against the search's pruning (`rewrite check known`, and
-//! `rewrite search --prefer` when the file wins by the horizon).
-//!
-//! The search prunes by several things - level -1, the objects ladder's
-//! filter (the coarser level's REACHED nodes), the winning sets `W_t` the
-//! concrete search looks states up in -
-//! and each of them over a tree the kernels and the visited set built. If any is
-//! wrong it silently removes real winners: a wrong "optimal" or a tie, never
-//! a fake improvement (witnesses are replayed). A known route that wins by
-//! the horizon must survive every one of them, so it is stepped through the
-//! reference engine and checked at every search step `s`:
+//! A KNOWN solution against the search's pruning (plans/architecture.md
+//! "Checks"; `rewrite check known`, and `search --prefer` when it wins by
+//! the horizon): a wrong pruning step drops real winners silently, so the
+//! route is stepped through the reference engine and checked at every
+//! search step `s`:
 //!
 //! * level -1 (the filter the TREE recorded, `TreeFilter::of_tree`, not the
-//!   environment's) does not call its cell too late (every step past the start);
+//!   environment's) does not call its cell too late (every step past the
+//!   start);
 //! * the ladder's filter admits it (`MarkFilter::allowed`, every step past
-//!   the start: mid-frame steps pass by construction, the boundaries are
-//!   filtered);
-//! * at a frame boundary (`Clock::boundary`: where a
-//!   concrete state keys exactly as the tree's rows; mid-frame rows carry the
-//!   split frame's cut widening, which `Rt2::widen_to` does not): its
-//!   projection is a node of `W`'s support (in the tree AND with a winning
-//!   set at some frame), whose `W_s` holds its exact remainder - the concrete
-//!   search's own admission test - and, at a level that filters the next one,
-//!   the node is REACHED (`reach::inside_w`) with a deadline >= s. The start
-//!   is the tree's frame-0 row (stored unwidened), its W the arc optimum's.
+//!   the start; mid-frame steps pass by construction);
+//! * at a frame boundary (`Clock::boundary`: mid-frame rows carry the split
+//!   frame's cut widening, which `Rt2::widen_to` does not): its projection
+//!   is a node of W's support whose `W_s` holds its exact remainder (the
+//!   concrete search's admission test) and, at a level that filters the
+//!   next, the node is REACHED (`reach::inside_w`) with a deadline >= s. The
+//!   start is the tree's frame-0 row (stored unwidened).
 //!
-//! `rewrite check known` also checks THE HULL FORWARD'S CLAIM (`Hulls`;
-//! whole frames only): at every step the route's state is in the tree by
-//! then, its exact remainder inside its state's hull, and the step from its
-//! parent a recorded edge whose transfer takes the parent's remainder to its
-//! own - every concrete path the filters keep is in the tree, recorded.
+//! `check known` also checks THE HULL FORWARD'S CLAIM at every step
+//! (`hull_claim`; whole frames only): every concrete path the filters keep
+//! is in the tree, recorded.
 //!
 //! An `rnd` fork makes several leaves: the route survives when ONE winning
-//! lineage passes everywhere (the concrete search is exhaustive over leaves).
-//! Otherwise the first failing step of each winning lineage is reported with
-//! the check that failed, the node and the state, and the search FAILS.
-//! Where the tree does not hold the state, the report also steps its state
-//! at the frame boundary before through the level's kernels (`explain`):
-//! the route's state among their successors, or a SOUNDNESS gap.
+//! lineage passes everywhere (the concrete search is exhaustive over
+//! leaves). Else each lineage's first failing step is reported and the
+//! search FAILS; where the tree lost the state, `explain` steps the state a
+//! frame before through the kernels (made and dropped, or a SOUNDNESS gap).
 
 use super::concrete::{concrete_engines, exact_state, lookup_keys, lookup_view, rem_of, Side};
 use super::rem::Rem;
@@ -78,22 +66,19 @@ impl<N: Rem> Hulls<N> {
 
 /// What the arc phase holds for the check (`driver::solve`).
 pub(super) struct Pruning<'a, N: Rem = P8> {
-    /// The level's winning sets, as the concrete search admits states:
-    /// its settings (the room, category, split frame), level, W, its nodes'
-    /// keys and the tree's key space (concrete states keyed as its rows).
+    /// The level's W as the concrete search admits states (settings, level,
+    /// W, its nodes' keys, the tree's key space).
     pub side: &'a Side<'a, N>,
     /// In search steps.
     pub horizon: u32,
-    /// The start's node (`None`: no winning set at any frame): the tree
-    /// holds the start as the engine made it, unwidened, so it is not looked
-    /// up by its projection.
+    /// The start's node (`None`: no winning set at any frame); not looked up
+    /// by its projection: the tree holds the start unwidened.
     pub start: Option<u32>,
     /// This level's reached nodes (the next level's filter), if it has one.
     pub reached: Option<&'a Visited<N>>,
     /// The level -1 filter the tree was built under (`TreeFilter::of_tree`).
     pub minus_one: Option<crate::frame::MinusOne>,
-    /// The tree's directory, for the report (its frame files read on a
-    /// miss).
+    /// The tree's directory, for the report (read on a miss).
     pub dir: &'a std::path::Path,
     /// The hull forward's claim, checked at every step (`Route::hulls`).
     pub hulls: Option<&'a Hulls<N>>,
@@ -243,10 +228,9 @@ pub(super) fn check<N: KernelLanes>(route: &Route<N>, p: &Pruning<N>) -> anyhow:
 }
 
 /// Why the forward lost the route's state at step `s` (a frame boundary,
-/// on lineage `idx`): its state at the frame boundary before, as the tree
-/// holds it, stepped to `s` by the level's kernels; the route's state
-/// projected onto the level among their successors (the forward made it
-/// and did not keep it: a win, level -1, a filter) or not (a SOUNDNESS gap
+/// on lineage `idx`): the tree's row of its state a frame before, stepped
+/// to `s` by the level's kernels; the route's state among the successors
+/// (made and not kept: a win, level -1, a filter) or not (a SOUNDNESS gap
 /// in the kernels), and the successors closest to it.
 fn explain<N: KernelLanes>(run: &Run<N>, idx: &[usize], s: usize, seeded: bool, p: &Pruning<N>) -> anyhow::Result<Vec<String>> {
     use crate::search::inspect::{brief, project_onto, Proj};

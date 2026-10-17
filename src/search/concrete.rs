@@ -1,21 +1,17 @@
 //! THE CONCRETE SEARCH (plans/architecture.md "The search", step 3): from
 //! the room's start, every input (one per class of the buttons a frame
 //! reads: `Covered`) and every `rnd` leaf, a successor admitted only where
-//! the level's winning sets hold its exact remainder, each exact state
-//! once. First a depth-first try for a win AT the bound (at most
-//! `dfs_budget` steps; a win there is optimal, the bound being a lower
-//! bound), then breadth-first layers: the first layer with a win is the
+//! the level's W holds its exact remainder, each exact state once. First a
+//! depth-first try at the bound (a win there is optimal, the bound being a
+//! lower bound), then breadth-first layers: the first with a win is the
 //! optimum, its path the witness.
 //!
 //! Sound: every concrete path that wins by the horizon stays inside W, so
 //! the search is EXHAUSTIVE inside W and prunes by nothing else. States are
 //! told apart by their EXACT identity, never the level's widened key
-//! (`exact_state`, `522de36`).
-//!
-//! One search (`search`) for what it steps (`Concrete`): one arithmetic's
-//! reference engine (`Single`), or a pair of them (`dual::Pairs`, the dual
-//! search). Layers run in parallel, chunks of parents merged in order, so
-//! the witness is the same at any thread count.
+//! (`exact_state`). It steps one arithmetic's reference engine (`Single`) or
+//! a pair (`dual::Pairs`); chunks of parents merge in order, so the witness
+//! is the same at any thread count.
 
 use anyhow::{ensure, Result};
 use celeste_core::arith::{Arithmetic, EngineNum};
@@ -74,10 +70,9 @@ pub(super) struct Path<L> {
 
 /// THE CONCRETE SEARCH of `c` from its start: a depth-first try at `bound`
 /// (frames), then breadth-first to `frames`; W at frame `k` is step
-/// `clock.steps(k)` (a frame boundary: there a state keys exactly as a
-/// whole frame's).
-/// `prefer` orders the inputs (a known route first: only WHICH optimum is
-/// found). `None`: no win by `frames`.
+/// `clock.steps(k)` (a frame boundary, where a state keys exactly as a whole
+/// frame's). `prefer` orders the inputs (only WHICH optimum is found).
+/// `None`: no win by `frames`.
 pub(super) fn search<C: Concrete>(c: &C, frames: u32, bound: u32, clock: Clock, prefer: Option<&[u8]>, workers: usize) -> Result<Option<Path<C::Label>>> {
     let name = C::NAME;
     ensure!(bound <= frames, "the bound f{bound} is past the horizon f{frames}");
@@ -183,8 +178,8 @@ pub(super) fn search<C: Concrete>(c: &C, frames: u32, bound: u32, clock: Clock, 
     for k in 0..frames {
         let t = std::time::Instant::now();
         let t_w = clock.steps(k + 1);
-        // In chunks of 16 parents, an engine a worker (each takes a free
-        // one: as many as workers), successors in chunk order.
+        // Chunks of 16 parents, a free engine a worker, successors in chunk
+        // order.
         const CHUNK: usize = 16;
         let parts: Vec<(Vec<Succ<C>>, u64)> = crate::par::Pool::new(engines.len()).map_with(
             cur.len().div_ceil(CHUNK),
@@ -206,9 +201,8 @@ pub(super) fn search<C: Concrete>(c: &C, frames: u32, bound: u32, clock: Clock, 
                             match n {
                                 // A win keeps no state, and the chunk ends at
                                 // its first: the earliest win (chunks merge in
-                                // order) ends the search. Every successor of
-                                // the last layer can win - kept whole, room
-                                // (4,3) 100% reached 100 GB there.
+                                // order) ends the search. (Kept whole, the
+                                // last layer reached 100 GB in room (4,3) 100%.)
                                 Next::Win(label) => {
                                     got.push(Succ { parent: p as u32, byte, label, next: None });
                                     break 'chunk;
@@ -256,7 +250,6 @@ pub(super) fn search<C: Concrete>(c: &C, frames: u32, bound: u32, clock: Clock, 
         );
         if let Some((parent, byte, label)) = won {
             ensure!(k + 1 >= bound, "a {name} win at f{} before the bound f{bound}: a backward lost a path", k + 1);
-            // The path, back through the layers.
             let (mut inputs, mut labels) = (vec![byte], vec![label]);
             let mut p = parent;
             for layer in back.iter().rev() {
@@ -392,9 +385,8 @@ pub(super) fn concrete_search<N: Rem>(side: &Side<'_, N>, horizon: u32, bound: u
 }
 
 /// W's nodes by `(shape, key, cell)`, for the concrete search and the known
-/// route: a node IS its state - its region (the shape's index and the
-/// cell's slot), its key and its cell - so only the tree's shapes are
-/// listed.
+/// route: a node IS its state (`Sk`: shape index and cell slot, key, cell),
+/// so only the tree's shapes are listed.
 pub struct NodeKeys<'w, C: Circle = super::arcs::Fixed16> {
     w: &'w Winning<C>,
     geo: crate::storage::Geometry,
@@ -428,7 +420,7 @@ pub(super) fn lookup_keys<N: EngineNum>(b: &Block<N>, level: Level, seeded: bool
 
 /// A concrete state's EXACT identity, UNWIDENED: its canonical bytes
 /// (`exact::exact_rows`) and its cell. Never the level's widened key:
-/// states sharing it need not share their fate (`522de36`).
+/// states sharing it need not share their fate.
 pub(super) fn exact_state<N: EngineNum>(b: &Block<N>, cell: u32) -> ExactRow {
     let mut v = celeste_engine::exact::exact_rows(b.rt2(), crate::compiled::ids()).swap_remove(0).into_vec();
     v.extend_from_slice(&cell.to_le_bytes());
@@ -436,12 +428,11 @@ pub(super) fn exact_state<N: EngineNum>(b: &Block<N>, cell: u32) -> ExactRow {
 }
 
 /// A concrete state as the tree holds it before the level's widening. With
-/// seeded balloons (`concrete_search`), the state holds each balloon's
-/// phase as one number and its `y` as one point, where the tree - built
-/// with the phase an interval - holds the canonical phase `[0, 1)` and the
-/// bob `y` `[start - 2, start + 2]` (the forward recomputes `y` from the
-/// interval phase every frame); the view maps them there, so its key is the
-/// node that over-approximates the state.
+/// seeded balloons a state holds each balloon's phase as one number and its
+/// `y` as one point, where the tree (the phase an interval) holds the phase
+/// `[0, 1)` and the bob `y` `[start - 2, start + 2]` (recomputed from the
+/// phase every frame); the view maps them there, so its key is the node
+/// that over-approximates the state.
 pub(super) fn lookup_view<N: EngineNum>(row: &Rt2<N>, seeded: bool) -> Result<Rt2<N>> {
     use celeste_engine::runtime2::{Col, AV};
     use celeste_engine::widening::{BALLOON_BOB_RAW, BALLOON_PERIOD_RAW};
@@ -477,12 +468,11 @@ pub fn rem_of<N: Rem>(rt2: &Rt2<N>) -> Result<(Point<N>, Point<N>)> {
 }
 
 /// `n` reference engines for concrete steps, and whether they run seeded
-/// (`Settings::concrete`): `--concrete-balloon-seeds` (a tasdatabase file's
-/// seeds), or a float tool's own seeds, fix the balloons' phases, so a
-/// concrete run is one real run under them - the tree and W keep the phase
-/// an interval (sound for every seed), and a concrete state's key maps its
-/// phase to that interval (`lookup_view`). Built under the run's settings
-/// `run`: `_init` runs under them.
+/// (`Settings::concrete`: `--concrete-balloon-seeds`, or a float tool's own
+/// seeds, fix the balloons' phases, so a concrete run is one real run; the
+/// tree and W keep the phase an interval, sound for every seed, and
+/// `lookup_view` maps a state's phase there). Built under `run`: `_init`
+/// runs under it.
 pub(super) fn concrete_engines<N: Rem>(n: usize, run: &Settings) -> Result<(Vec<ReferenceEngine<N::A>>, bool)> {
     let (s, seeded) = run.concrete();
     let engines = (0..n).map(|_| ReferenceEngine::<N::A>::new(&s)).collect::<Result<Vec<_>>>()?;
@@ -495,9 +485,8 @@ pub(super) fn concrete_engines<N: Rem>(n: usize, run: &Settings) -> Result<(Vec<
 const DFS_BUDGET: u64 = 200_000;
 
 /// TESTS ONLY: no depth-first try (a budget of 0), so the breadth-first
-/// layers find the witness - the gates' witnesses all come from the try at
-/// the bound (`driver`'s breadth-first test). Process-global: nextest runs
-/// each test in its own process.
+/// layers find the witness (the gates' all come from the try at the bound).
+/// Process-global: nextest runs each test in its own process.
 #[cfg(test)]
 pub(super) static NO_DFS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
@@ -512,11 +501,10 @@ pub(super) fn dfs_budget() -> u64 {
 
 /// The inputs a state has been stepped under, each with the buttons its
 /// frame read (`RefEngine::frame_reads`). An input that agrees with one of
-/// them on every button that one read runs the same frame - the same reads,
-/// the same values, the same successors (the output writes no button) - so
-/// its successors are repeats of states already emitted in (parent, input)
-/// order, which the search's exact dedup would drop: skipping it changes
-/// nothing but the step count.
+/// them on every button that one read runs the same frame (the same reads,
+/// values and successors; the output writes no button), so its successors
+/// are repeats the exact dedup would drop: skipping it changes nothing but
+/// the step count.
 #[derive(Default)]
 pub(super) struct Covered(Vec<(u8, u8)>);
 
@@ -531,9 +519,9 @@ impl Covered {
 }
 
 /// The 64 inputs in the order the concrete search tries them at the frame
-/// after `k`: `prefer[k]` first (`rewrite search --prefer`: a known TAS, so
-/// the witness follows it wherever an optimal route allows), then the rest.
-/// Every input is still tried: the order only picks WHICH optimal witness.
+/// after `k`: `prefer[k]` first (`search --prefer`: the witness follows a
+/// known TAS wherever an optimal route allows), then the rest. Every input
+/// is still tried: the order only picks WHICH optimal witness.
 pub(super) fn input_order(prefer: Option<&[u8]>, k: u32) -> impl Iterator<Item = u8> {
     let first = prefer.and_then(|p| p.get(k as usize).copied()).filter(|&b| b < 64);
     first.into_iter().chain((0u8..64).filter(move |&b| Some(b) != first))

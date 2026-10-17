@@ -1,14 +1,9 @@
-//! THE REMAINDER MODEL of an arithmetic (plans/float.md, "The remainder model and the round fork"):
-//! the CIRCLE its remainders are points of (`Rem::C`; a state's HULL is
-//! `hull::Hull` over it, accumulated order-free in a `HullAcc`), and what a
-//! recorded edge does to a remainder (its transfer PAIR, one per axis, as
-//! the tree's table stores it, and as the pushes read it: an `Xfer`). The
-//! forward and the storage are generic over it, so a tree's hulls and
-//! transfers are its arithmetic's.
-//!
-//! 16.16's model is the circle of 65536 points (`arcs::Fixed16`,
-//! `arc_edges`); the doubles' the circle of the doubles of `[-1/2, 1/2)`
-//! (`rem_f64`).
+//! THE REMAINDER MODEL of an arithmetic (plans/float.md "The remainder
+//! model and the round fork"): the CIRCLE its remainders are points of
+//! (`Rem::C`: 16.16's `arcs::Fixed16`, the doubles' `rem_f64::Doubles`) and
+//! an edge's transfer PAIR, per axis, as the tree's table stores it and as
+//! the pushes read it (`Xfer`). The forward and the storage are generic
+//! over it, so a tree's hulls and transfers are its arithmetic's.
 
 use std::fmt::Debug;
 use std::hash::Hash;
@@ -23,14 +18,14 @@ use super::arcs::{Circle, Fixed16, Seg, Transfer};
 use super::hull::{Hull, HullOf};
 use super::rem_f64;
 
-/// One axis of what a frame did to the player's remainder, as the
-/// reference engine's arc capture holds it (`trace::state::ArcAxis`, read
-/// off a leaf), in the arithmetic's numbers: whether this path took the
-/// player's split (`took`), the split's argument `pre` and the fragment
-/// `frag` it took (16.16: the floor split of `rem + ox + 1/2`; doubles:
-/// the round split of `rem + ox`), the move's speed `ox`, and the player's
-/// remainder at the frame's end `fin` (`None`: no player). The kernels'
-/// `arc_edges::RawAxis` is 16.16's raw form of it.
+/// One axis of what a frame did to the player's remainder, captured at the
+/// player's own split (the kernels' transfer roots; the reference engine's
+/// `trace::state::ArcAxis`): whether this path took the split (`took`), its
+/// argument `pre` and the fragment `frag` taken (16.16: the floor split of
+/// `rem + ox + 1/2`; doubles: the round split of `rem + ox`), the speed
+/// APPLIED `ox` (not always the stored one), and the remainder at the
+/// frame's end `fin`, before the boundary widening (`None`: no player).
+/// 16.16's decode reads it raw (`arc_edges::RawAxis`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Capture<N> {
     pub took: bool,
@@ -43,9 +38,8 @@ pub struct Capture<N> {
 pub trait Rem: EngineNum {
     /// An edge's transfer pair as the tree's table records it.
     type Pair: Copy + Debug + PartialEq + Eq + Hash + PartialOrd + Ord + Send + Sync + 'static;
-    /// The circle of points the remainders are (`arcs::Circle`): the
-    /// hulls' (`hull::Hull<C>`) and the arcs' sets, and a pair as the
-    /// pushes and pulls read it (`Xfer`).
+    /// The circle the remainders are points of: the hulls' and the arcs'
+    /// sets, and a pair as the pushes and pulls read it (`Xfer`).
     type C: Circle;
     /// Bytes a pair takes on disk.
     const PAIR_BYTES: usize;

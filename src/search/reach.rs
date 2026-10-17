@@ -1,19 +1,16 @@
 //! FORWARD REACHABILITY over a finished tree's recorded edges: from the
 //! start at its exact remainder, frame by frame, every reached state's
-//! remainder set pushed along its out-edges through their transfers
-//! (`RegionRef::push`), the pushes into a target united. A win state is not
-//! left. A state's out-edges are recorded once, at the frame after its
-//! layer, in their TARGETS' regions (`out_edges`); they are read the first
-//! frame the state is reached and kept as `(target, transfer)` numbers (8 B
-//! an edge): decoding them again every frame made a frame cost grow with the
-//! reach (219 s a frame on a 13B-state tree). Two of them:
+//! remainder set pushed along its out-edges (`RegionRef::push`), the pushes
+//! into a target united; a win state is not left. A state's out-edges
+//! (recorded once, at its layer + 1, in their TARGETS' regions:
+//! `out_edges`) are read the first frame it is reached and kept as
+//! `(target, transfer)` numbers, 8 B an edge (decoding them every frame
+//! made a frame's cost grow with the reach). Two of them:
 //!
-//!   * `inside_w` - the arc phase's (`driver::solve`): inside the winning
-//!     sets, between `W`'s nodes; per node the last frame it is reached,
-//!     the next level's filter.
+//!   * `inside_w` - inside W (the arc phase, `driver::solve`); per node the
+//!     last frame it is reached, the next level's filter.
 //!   * `exact` - with W = everything, over the tree's states: what the hull
-//!     forward's soundness is checked against (`frame`'s and this module's
-//!     slow tests).
+//!     forward's soundness is checked against (slow tests).
 
 use anyhow::Result;
 use rustc_hash::FxHashMap;
@@ -25,12 +22,10 @@ use crate::storage::edges::EdgeStore;
 use crate::storage::{Sk, GEOMETRY};
 use celeste_core::pico8_num::Pico8Num as P8;
 
-/// The out-edges recorded at frame `frame` of the states `sources` (their
-/// layer is `frame - 1`): `(k, target, transfer)` for `sources[k]`. A
-/// source's edges are stored in their TARGETS' regions: the frame's index
-/// names the target regions each source region reaches; those regions'
-/// segments are decoded (on `threads` workers) and their bundles from the
-/// sources' keys kept where a source cell is one asked for.
+/// The out-edges recorded at frame `frame` of the states `sources` (of layer
+/// `frame - 1`): `(k, target, transfer)` for `sources[k]`. The frame's index
+/// names the target regions each source region reaches; their segments are
+/// decoded and the bundles from the sources' keys and cells kept.
 fn out_edges<N: Rem>(store: &EdgeStore<N>, frame: u32, sources: &[Sk], threads: usize) -> anyhow::Result<Vec<(usize, Sk, u32)>> {
     let geo = GEOMETRY;
     let mut wanted: rustc_hash2::FxHashMap<(u32, (u64, u64)), Vec<(u32, usize)>> = Default::default();
@@ -69,11 +64,10 @@ fn out_edges<N: Rem>(store: &EdgeStore<N>, frame: u32, sources: &[Sk], threads: 
     Ok(out)
 }
 
-/// The out-edges `inside_w` follows - between W's nodes, from a non-win
-/// source to a target with a set at or past the edge's frame (the others
-/// carry nothing) - loaded as `inside_w` first reaches their source, a frame's
-/// sources at a time (`out_edges`): what is held is the reached nodes'
-/// edges, 8 B each, not the graph between W's nodes.
+/// The out-edges `inside_w` follows (from a non-win source to a node with a
+/// set at or past the edge's frame; the others carry nothing), loaded as
+/// their source is first reached: the reached nodes' edges, 8 B each, not
+/// the graph between W's nodes.
 pub struct ReachEdges<'a, N: Rem = P8> {
     store: &'a EdgeStore<N>,
     w: &'a Winning<N::C>,
@@ -131,23 +125,20 @@ impl<'a, N: Rem> ReachEdges<'a, N> {
 }
 
 /// FORWARD inside W: `R_t(i)`, the remainders with which node `i` is reached
-/// at frame `t` from the start (at `point`) along the graph's edges and
-/// still wins - `R_0 = {point}` at the start, `R_{t+1}(m) = U push_e(R_t(p))
-/// ∩ W_{t+1}(m)` over the edges `p -> m` (a win node is not left: it has no
-/// out-edges). Per node the LAST frame its `R` is non-empty (`u32::MAX`:
-/// never), for the next level's filter. Each frame SCATTERS: every reached
-/// node's set pushed along its out-edges, the pushes into a target united.
+/// at frame `t` from the start (at `point`) and still wins: `R_0 = {point}`,
+/// `R_{t+1}(m) = U push_e(R_t(p)) ∩ W_{t+1}(m)` over the edges `p -> m` (a
+/// win node has no out-edges). Per node the LAST frame its `R` is non-empty
+/// (`u32::MAX`: never), the next level's filter.
 ///
-/// Sound as a filter where `W`'s deadline is: a concrete winning path's
-/// remainder at frame `t` is in `W_t` of its node (W holds every winner)
-/// and is the image of its remainder at `t - 1` along the recorded edge (the
-/// arc model `check arcs` probes), so by induction it is in `R_t`. Tighter:
-/// a node `W` lets win from some remainder no path from the start brings is
-/// not marked.
+/// Sound as a filter where `W`'s deadline is: a concrete winner's remainder
+/// at frame `t` is in `W_t` of its node and is the image of its remainder at
+/// `t - 1` along the recorded edge (the arc model `check arcs` probes), so
+/// by induction it is in `R_t`. Tighter: a node W lets win only from
+/// remainders no path from the start brings is not marked.
 ///
-/// A set more fragmented than `REACH_SEGS` segments is replaced by `W_t`
-/// itself (a superset: the filter only loosens), which bounds the memory -
-/// W's sets are shared, a node's reached set is its own.
+/// A set past `REACH_SEGS` segments is replaced by `W_t` itself (a superset:
+/// the filter only loosens), which bounds the memory: W's sets are shared,
+/// a reached set is the node's own.
 #[allow(clippy::too_many_arguments)]
 pub fn inside_w<N: Rem>(w: &Winning<N::C>, g: &mut ReachEdges<N>, pairs: &[Xfer<N>], start: Option<u32>, point: (Point<N>, Point<N>), horizon: u32, threads: usize) -> anyhow::Result<Vec<u32>> {
     let n = w.len();
@@ -254,9 +245,8 @@ const BATCH: usize = 1 << 20;
 const TARGET_CHUNK: usize = 16;
 
 /// The most x segments a reached set keeps exactly (far below a `Region`'s
-/// 65535: the sets are clouds of the remainders many paths leave, ~10 B a
-/// segment, and a big tree's frames hold millions of states - 16384 took
-/// 53 GB by f164 of a 13B-state tree).
+/// 65535: a big tree's frames hold millions of states, ~10 B a segment;
+/// 16384 took 53 GB).
 const MAX_SEGS: usize = 1 << 10;
 
 /// `s` widened outward to the grid of `2^k` points.
@@ -266,10 +256,10 @@ fn snap(s: Seg, k: u32) -> Seg {
 }
 
 /// The union of `v` (deduplicated, left as the union's input), and its
-/// coarsening: 0 exact, else the `k` its pieces were snapped to (outward,
-/// to the grid of `2^k` points per axis) to fit `max` segments - the
-/// smallest from `k0` (a target already coarsened to `k0` within the frame
-/// starts there: no ladder of failed sweeps on every union).
+/// coarsening: 0 exact, else the smallest `k` from `k0` its pieces were
+/// snapped to (outward, to the grid of `2^k` points per axis) to fit `max`
+/// segments (a target already coarsened within the frame starts at its `k`:
+/// no ladder of failed sweeps on every union).
 fn union(v: &mut Vec<Piece>, scratch: &mut Vec<Seg>, k0: u8, max: usize) -> (Region, u8) {
     v.sort_unstable_by_key(|p| (p.y, p.x));
     v.dedup();
@@ -298,25 +288,16 @@ fn union(v: &mut Vec<Piece>, scratch: &mut Vec<Seg>, k0: u8, max: usize) -> (Reg
 /// frame's reached states and sets, and the inexact ones with their
 /// coarsest grid. Per state the LAST frame it is reached at.
 ///
-/// The forward's tree over-approximates the game (a row's remainder is
-/// widened to the whole circle at the boundary); `R` is exact in the
-/// remainder: a state with an empty `R_t` is reached at `t` by no path of
-/// the level's game from the start (the level's other widenings stand; at
-/// an exact-objects level, none). Bounded by the tree: what its forward did
-/// not keep (a level -1 drop, a filter) `R` cannot hold.
+/// The tree's rows have the remainder widened at the boundary; `R` is
+/// exact in it: a state with an empty `R_t` is reached at `t` by no path of
+/// the level's game from the start (the level's other widenings stand).
+/// Bounded by the tree: what its forward did not keep (a level -1 drop, a
+/// filter) `R` cannot hold. Streamed like the backward: per frame only the
+/// reached states and their sets are held.
 ///
-/// Streamed like the backward: per frame only the reached states are held,
-/// with their sets; a state's out-edges are read in batches of `BATCH`
-/// sources from its layer's target blocks. A frame's pushes and unions run
-/// in parallel over its targets (the frame's edges grouped by target with a
-/// counting sort).
-///
-/// A target's set past `MAX_SEGS` x segments (a cloud of the remainders
-/// many paths leave) is COARSENED: its pieces snapped outward to the
-/// coarsest-needed grid of `2^k` points per axis (`k` the smallest that
-/// fits). From then on that state's set, and what it reaches, OVER-
-/// approximate - still sound for "unreachable", an upper bound on the
-/// rest - and are reported as inexact with the largest `k` behind them.
+/// A target's set past `MAX_SEGS` x segments is COARSENED (`union`): from
+/// then on it and what it reaches OVER-approximate (still sound for
+/// "unreachable") and are reported inexact with the largest `k` behind them.
 pub fn exact(dir: &std::path::Path, horizon: u32, point: (u32, u32), threads: usize, mut visit: impl FnMut(u32, &[(Sk, Region)], &FxHashMap<Sk, u8>) -> Result<()>) -> Result<FxHashMap<Sk, u32>> {
     let seeds = super::backward::Seeds::<P8>::load(dir, horizon)?;
     let tree = crate::storage::layer::Tree::open(dir, horizon)?;
@@ -344,11 +325,9 @@ pub fn exact(dir: &std::path::Path, horizon: u32, point: (u32, u32), threads: us
             break;
         }
         let tt = std::time::Instant::now();
-        // A state's out-edges are recorded once, at the frame after its
-        // LAYER (the forward expands a state when it first reaches it; a
-        // later visit has the same successors). They are read the first
-        // time a state is reached (grouped by its layer) and kept: a state
-        // reached again costs no decoding.
+        // Out-edges are recorded once, at the frame after a state's LAYER
+        // (a later visit has the same successors): read at its first reach,
+        // grouped by layer.
         while layers.len() <= t as usize {
             layers.push(tree.layer(layers.len() as u32, None, threads)?.0);
         }

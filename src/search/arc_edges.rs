@@ -1,62 +1,47 @@
-//! THE TRANSFERS (plans/architecture.md, "Arcs"): per recorded edge of a
-//! forward, what the frame did to the player's sub-pixel remainder on each
-//! axis, as a GUARD (the piece of the circle the edge is taken from) and an
-//! ACTION (a rotation, or a collision's constant).
-//!
-//! Every traced frame captures per body the transfer roots
-//! (`trace::frame::FrameOut::arc`); the kernel computes them beside the row
-//! (no key, column, dedup or checkpoint sees them) and each producer's
-//! transfer is decoded here. The forward interns the (x, y) pair per worker
-//! (`storage::unit::UnitSink::xfer_id`); each frame merges the workers' ids
-//! into the tree's one table, content-canonical (`storage::edges::XferTable`).
-//!
-//! ## What the kernel computes per axis (`RawAxis`)
+//! THE TRANSFERS (plans/architecture.md "Arcs: the rotation graph"): per
+//! recorded edge, what the frame did to the player's sub-pixel remainder on
+//! each axis, as a GUARD (the piece of the circle the edge is taken from)
+//! and an ACTION (a rotation, or a collision's constant). The kernels
+//! compute the transfer roots (`trace::frame::FrameOut::arc`) beside the
+//! row (no key, column, dedup or checkpoint sees them); each is decoded
+//! here, interned per worker (`storage::unit::UnitSink::xfer_id`) and
+//! merged per frame into the tree's one content-canonical table
+//! (`storage::edges::XferTable`).
 //!
 //! `move` does `rem := rem + ox + 1/2; rem := __split_by_flr(rem); amount :=
-//! flr(rem); rem := rem - 1/2 - amount`, then steps (a blocked step sets `rem
-//! := 0`). Captured at the PLAYER's own split (`Interp::split_site`):
+//! flr(rem); rem := rem - 1/2 - amount`, then steps (a blocked step sets
+//! `rem := 0`); the capture at the player's split is `rem::Capture` (raw:
+//! `RawAxis`). The image (the remainder right after `rem -= 1/2 + amount`)
+//! is `frag - 1/2 - flr(frag)`, with one floor per fragment checked, not
+//! assumed.
 //!
-//! * `took` - this path took the player's split on this axis;
-//! * `pre` - the split's argument `rem + ox + 1/2` (raw, an interval);
-//! * `frag` - the fragment the body's fork configuration took (one floor);
-//! * `ox` - the move's argument, the speed APPLIED (not always the stored one);
-//! * `fin` - the player's remainder at the frame's end BEFORE the boundary
-//!   widening (`None`: no player at the end).
-//!
-//! The "image" (the remainder right after `rem -= 1/2 + amount`) is
-//! `frag - 1/2 - flr(frag)`, with one floor per fragment checked, not assumed.
-//!
-//! ## The decoded transfer (`decode_axis`), every case
+//! ## The decode (`decode_axis`), every case
 //!
 //! Circle points are `rem + 1/2` in raw units (`arcs::point`).
 //!
-//! * No split (`took` false: a freeze, the spawn before the player exists):
-//!   the guard is the whole circle, and
-//!   - no player at the end, or `fin` the whole input circle `[-1/2, 1/2)`
-//!     (the remainder untouched): `Rotate(0)`;
-//!   - `fin` a point (a player created this frame, `rem = 0`): `Const(fin)`;
-//!   - anything else: REFUSED.
-//! * A split of ONE point `pre` (`ox` a point): the remainder was SET this
-//!   frame before the move (a platform's carry blocked by a wall, `rem.x =
-//!   0`; nothing else reads the input remainder): the whole circle, and
-//!   `Const(fin)` (`fin` a point; no player at the end: `Rotate(0)`).
-//!   `pre - ox - 1/2` must be a remainder and `frag` that point, else REFUSED.
-//! * A split: `ox` must be a point and `pre` exactly `[ox, ox + 1)` (the
-//!   remainder at the move the whole circle, the speed exact; else REFUSED).
-//!   `frag` must lie in `pre` within one floor `f` (else REFUSED). Then
-//!   - guard: `[frag.lo - ox, frag.hi - ox + 1)` - the input remainders whose
-//!     `rem + ox + 1/2` lands in the fragment. It must be the whole circle or
-//!     touch one of its ends, with the image touching the OTHER end (the piece
-//!     below the cut rotates onto an image ending at +1/2, the piece above
-//!     onto one starting at -1/2); a piece touching neither end is REFUSED.
-//!     A point guard (a fragment one raw unit wide) is a piece like any other.
-//!   - rotation: `(ox - f) mod 1` - the image of `rem` is `rem + ox - f`.
-//!   - action: `fin == image`: `Rotate(rotation)`; `fin` a point other than
-//!     the image (a blocked step reset the remainder): `Const(fin)` (if the
-//!     image is that same point, the two agree); no player at the end (a
-//!     death): `Rotate(rotation)` into a dummy coordinate (every transfer out
-//!     of a player-less node has a whole-circle guard, so its winning set is
-//!     all or nothing and any action into it is exact); anything else: REFUSED.
+//! * No split (`took` false: a freeze, the spawn): the whole circle;
+//!   `Rotate(0)` with no player at the end or `fin` the whole input circle
+//!   (untouched), `Const(fin)` with `fin` a point (a player created this
+//!   frame); else REFUSED.
+//! * A split of ONE point `pre`: the remainder was SET before the move
+//!   (`set_before_the_move`): the whole circle, `Const(fin)` (no player at
+//!   the end: `Rotate(0)`).
+//! * A split: `ox` a point and `pre` exactly `[ox, ox + 1)` (the remainder
+//!   at the move the whole circle), `frag` inside `pre` within one floor
+//!   `f`, else REFUSED. Then
+//!   - guard: `[frag.lo - ox, frag.hi - ox + 1)`, the input remainders whose
+//!     `rem + ox + 1/2` lands in the fragment: the whole circle, or a piece
+//!     touching one end with its image touching the OTHER (below the cut
+//!     onto an image ending at +1/2, above onto one starting at -1/2); a
+//!     piece touching neither is REFUSED. A point guard is a piece like any
+//!     other.
+//!   - action: `Rotate((ox - f) mod 1)` (the image of `rem` is
+//!     `rem + ox - f`) when `fin` is the image (a point image: the two
+//!     agree); `Const(fin)` when `fin` is another point (a blocked step
+//!     reset it); with no player at the end (a death) `Rotate` into a dummy
+//!     coordinate: every transfer out of a player-less node has a
+//!     whole-circle guard, so its winning set is all or nothing and any
+//!     action into it is exact; anything else: REFUSED.
 //!
 //! A refusal is FATAL in the forward: the record would be an unchecked claim
 //! about the remainder.
@@ -66,8 +51,7 @@ use super::arcs::{self, Action, Seg, Set, Transfer, CIRCLE};
 const HALF: i64 = 32768;
 const ONE: i64 = 65536;
 
-/// One axis of a frame's remainder transfer, as the kernel computed it on
-/// one lane (raw 16.16, inclusive intervals). See the module doc.
+/// A `rem::Capture` in raw 16.16 (inclusive intervals).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct RawAxis {
     pub took: bool,
@@ -188,13 +172,12 @@ pub fn decode_axis(r: &RawAxis) -> std::result::Result<AxisXfer, String> {
     }
 }
 
-/// A split whose argument is ONE point: the remainder at the move does not
-/// depend on the frame's input remainder - it was SET earlier in the frame
-/// (a moving platform's carry blocked by a wall: `move_x` sets `rem.x = 0`
-/// before the player's own `move`; `move_x` steps whole pixels and never
-/// reads `rem`). Nothing else in the frame reads the input remainder (only
-/// `move` does, at its split), so every input remainder takes this edge: the
-/// guard is the whole circle and the action the constant `fin`.
+/// A split whose argument is ONE point: the remainder at the move was SET
+/// earlier in the frame (a platform's carry blocked by a wall: `move_x`
+/// sets `rem.x = 0` before the player's own `move`, stepping whole pixels
+/// and never reading `rem`). Nothing else reads the input remainder (only
+/// `move`, at its split), so every input remainder takes this edge: the
+/// guard is the whole circle, the action the constant `fin`.
 fn set_before_the_move(pre: i64, ox: i64, frag: (i64, i64), fin: Option<(i64, i64)>) -> std::result::Result<AxisXfer, String> {
     let rem = pre - ox - HALF;
     if !(-HALF..HALF).contains(&rem) {

@@ -1,49 +1,38 @@
-//! THE REMAINDER MODEL IN DOUBLES (plans/float.md, "The remainder model and the round fork"): the
-//! float tools' sub-pixel remainder: its points and its transfers, as
-//! `arcs` and `arc_edges` are 16.16's (the hulls are `hull`'s, over
+//! THE REMAINDER MODEL IN DOUBLES (plans/float.md "The remainder model and
+//! the round fork"): the float tools' remainder points and transfers, as
+//! `arcs` and `arc_edges` are 16.16's (the hulls are `hull`'s over
 //! `Doubles`).
 //!
-//! ## Points
+//! A POINT is a remainder's INDEX in value order among the doubles of
+//! `[-1/2, 1/2)`: `0` is `-1/2`, `ZERO` is `0` (`-0.0` too: no read of a
+//! remainder tells the two zeros apart), `POINTS - 1` is `1/2 - 2^-54`.
 //!
-//! A remainder is a double of `[-1/2, 1/2)`, a POINT its INDEX in value
-//! order: `0` is `-1/2`, `ZERO` is `0` (`-0.0` too: the two zeros are one
-//! value, and no read of a remainder tells them apart, section 15), and
-//! `POINTS - 1` is `1/2 - 2^-54`. The points form a circle as 16.16's do
-//! (`Doubles`): a hull is an ARC of it per axis (`hull::Hull<Doubles>`),
-//! accumulated order-free in two charts, cut at `-1/2` and at `0`.
+//! `move` is `rem += ox; amount = flr(rem + 0.5); rem -= amount`. Over a
+//! node's whole `[-1/2, 1/2)` (the boundary widening) the frame forks
+//! `__split_by_round(rem)` at the exact cut points; the capture
+//! (`rem::Capture`) decodes (`decode_axis`) into:
 //!
-//! ## The move, and a transfer
-//!
-//! `move` is the original's `rem += ox; amount = flr(rem + 0.5); rem -=
-//! amount`. Over the remainder `r` of a node (the whole `[-1/2, 1/2)`, the
-//! level-0 widening) the reference engine forks `__split_by_round(rem)` at
-//! the exact cut points, and its arc capture holds, per axis, the split's
-//! argument `pre = fl(r + ox)` (an interval), the fragment `frag` the path
-//! took (where `flr(fl(x + 1/2))` is one integer `k`), the speed `ox` and
-//! the remainder `fin` at the frame's end. Decoded (`decode_axis`):
-//!
-//! * the GUARD: the remainders `r` with `fl(r + ox)` in `frag` - an
-//!   order-interval (`fl(r + ox)` is monotone in `r`), found EXACTLY by
-//!   bisection over the indices with the operation itself;
-//! * the ACTION: `Mono(ox, k)`, `r -> fl(fl(r + ox) - k)` (the cart's two
-//!   operations; monotone, not injective), where `fin` is the fragment's
-//!   image `[fl(frag.lo - k), fl(frag.hi - k)]`; `Const(fin)` where a
-//!   blocked step reset the remainder to the point `fin`; `Mono` also into
-//!   a frame with no player at its end (a death: every transfer out of a
-//!   player-less node has the whole guard, so any action is exact).
-//! * No split (a freeze, the spawn): the whole guard, and the identity
-//!   `Mono(0, 0)` (`fin` the whole input, or no player) or `Const(fin)`
-//!   (a player made this frame).
-//! * A split of ONE point: the remainder was SET before the move (a
-//!   platform's carry blocked by a wall): the whole guard, `Const(fin)`.
+//! * the GUARD: the `r` with `fl(r + ox)` in `frag`, an order-interval
+//!   (`fl(r + ox)` is monotone in `r`) found EXACTLY by bisection with the
+//!   operation itself;
+//! * the ACTION: `Mono(ox, k)`, `r -> fl(fl(r + ox) - k)` (monotone, not
+//!   injective), where `fin` is the fragment's image `[fl(frag.lo - k),
+//!   fl(frag.hi - k)]` or no player ends the frame (a death: any action is
+//!   exact, as in `arc_edges`); `Const(fin)` where a blocked step reset the
+//!   remainder to the point `fin`;
+//! * no split (a freeze, the spawn): the whole guard, the identity
+//!   `Mono(0, 0)` (`fin` the whole input, or no player) or `Const(fin)` (a
+//!   player made this frame);
+//! * a split of ONE point (the remainder SET before the move,
+//!   `set_before_the_move`): the whole guard, `Const(fin)` (no player at
+//!   the end: the identity).
 //!
 //! Anything else is REFUSED (fatal in the forward, as 16.16's).
 //!
-//! THE TOP SLIVER: with an integer speed `s`, the few doubles just below
-//! `1/2` round onto the cut (`fl(r - 2) = -3/2` for `r` in `{1/2 - 2^-54,
-//! 1/2 - 2^-53}`), a piece of its own that no 16.16 remainder takes
-//! (`fixed_points`: section 15's census found it doubling the widened
-//! forward). The hull forward pushes it only where a hull reaches it.
+//! THE TOP SLIVER: at an integer speed the few doubles just below `1/2`
+//! round onto the cut (`fl(r - 2) = -3/2` for `r` in `{1/2 - 2^-54,
+//! 1/2 - 2^-53}`), a piece of its own that no 16.16 remainder takes; the
+//! hull forward pushes it only where a hull reaches it.
 
 use celeste_core::lua_f64::LuaF64;
 use celeste_engine::runtime2::mix64;
@@ -176,10 +165,10 @@ fn first_in(mut lo: u64, mut hi: u64, p: impl Fn(u64) -> bool) -> u64 {
     lo
 }
 
-/// The doubles' circle (`arcs::Circle`): the `POINTS` points, stored as
-/// `u64` words, the transfers `Axis` - monotone maps, so the PULL of a
-/// segment is the guard's points between two bisections, exactly; the
-/// image of a segment is the interval between its ends' images.
+/// The doubles' circle (`arcs::Circle`): `POINTS` points as `u64` words,
+/// the transfers `Axis` - monotone maps, so the PULL of a segment is the
+/// guard's points between two bisections, exactly; the image of a segment
+/// is the interval between its ends' images.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Doubles;
 
@@ -352,9 +341,8 @@ pub fn decode_axis(c: &Capture<LuaF64>) -> Result<Axis, String> {
     }
 }
 
-/// A split of ONE point (`arc_edges`' `set_before_the_move`): the
-/// remainder was set before the move, so every input remainder takes the
-/// edge, to the constant `fin`.
+/// A split of ONE point (as `arc_edges::set_before_the_move`): every input
+/// remainder takes the edge, to the constant `fin`.
 fn set_before_the_move(pre: f64, frag: (f64, f64), fin: Option<(f64, f64)>) -> Result<Axis, String> {
     if frag != (pre, pre) {
         return Err(format!("the fragment {frag:?} is not the split's one-point argument {pre:?}"));

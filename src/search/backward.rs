@@ -1,30 +1,17 @@
-//! THE BACKWARD over the rotation graph (plans/architecture.md "The
-//! search"): over the remainder-free transition graph the forward recorded
-//! (`storage::edges`), whose edges carry per axis a guard and an action
-//! (`search::arcs`), the WINNING SETS `W_t(n)`: the remainders from which
-//! node `n`, occupied at frame `t`, wins by the horizon -
-//! `W_t(n) = U_e guard_e ∩ action_e^-1(W_{t+1}(dst_e))` for `t >= layer(n)`,
-//! a win node's set the whole torus from its layer on.
+//! THE BACKWARD (plans/architecture.md "The search", step 2): over the
+//! edges the forward recorded (`storage::edges`), each with a guard and an
+//! action per axis (`search::arcs`), the WINNING SETS `W_t(n)`: the
+//! remainders from which node `n`, occupied at frame `t`, wins by the
+//! horizon - `W_t(n) = U_e guard_e ∩ action_e^-1(W_{t+1}(dst_e))` for
+//! `t >= layer(n)`, a win node's set the whole torus from its layer on.
 //!
-//! ONE BACKWARD PUSH over the recorded IN-edges (`backward`). `W_t(n)` only
-//! grows as `t` falls - more time never hurts. An edge recorded at frame
-//! `f` leaves a state of layer `f - 1`; it may enter a state first reached
-//! later, or never (the hull forward records it whatever its push), and
-//! `W_t(p)` reads `W_{t+1}(m)` only where `m` has one. Hence `W_t(p) =
-//! W_{t+1}(p) ∪ U pull_e(W_{t+1}(m))` over the edges `p -> m` whose target
-//! CHANGED at `t + 1`: frame by frame, the changed nodes' in-edges are read
-//! from their TARGET regions' blocks in the edge files, from the region's
-//! first frame with edges (`Backward::read_round`; edges are stored there),
-//! and their sets pulled into the sources. No graph is held and nothing
-//! marks nodes first: a node no winning set reaches is never touched. Nodes
-//! are states by what they are (`Sk`: region, key, cell), as the edge files
-//! name them. Exact because "intersect with the guard, then act"
-//! distributes over unions.
-//!
-//! It starts from a tree's `Seeds` and ends with `Winning`, from which the
-//! optimum is read (`optimum`). The arc phase around it is `driver::solve`:
-//! the start's remainder pushed forward inside `W` (`reach::inside_w`), and
-//! the concrete search inside `W` (`concrete`).
+//! ONE PUSH over the recorded IN-edges: `W_t` only grows as `t` falls (more
+//! time never hurts), so `W_t(p) = W_{t+1}(p) ∪ U pull_e(W_{t+1}(m))` over
+//! the edges `p -> m` whose target CHANGED at `t + 1`, read from the target
+//! regions' edge blocks (`Backward::read_items`). No graph is held and no
+//! node is marked first: a node no winning set reaches is never touched.
+//! Exact because "intersect with the guard, then act" distributes over
+//! unions. Nodes are states (`Sk`), as the edge files name them.
 
 use super::arcs::{Circle, Fixed16, Region, RegionArena, RegionRef};
 use super::rem::{Rem, Xfer};
@@ -34,7 +21,6 @@ use crate::storage::edges::EdgeStore;
 use crate::storage::{Sk, GEOMETRY};
 use rustc_hash::FxHashMap;
 
-/// Past every state (a sorted stream's end).
 const SK_MAX: Sk = Sk { region: u32::MAX, key: (u64::MAX, u64::MAX), local: u8::MAX };
 
 #[inline]
@@ -63,9 +49,8 @@ fn get_sk(b: &[u8], pos: &mut usize, prev: Sk) -> Sk {
     Sk { region: prev.region + dr, key: ((k >> 64) as u64, k as u64), local }
 }
 
-/// What a backward's reads decoded: segments (zstd blocks) and their
-/// bytes (stored, raw), bundles parsed, in-edges found, (region, frame)
-/// pairs opened.
+/// A backward's reads: segments (zstd blocks), their bytes (stored, raw),
+/// bundles, in-edges, (region, frame) opens.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ReadStats {
     pub segments: u64,
@@ -91,15 +76,13 @@ impl ReadStats {
 /// this many.
 pub(super) const BLOCK: usize = 16;
 
-/// The winning sets, `t` in `0..=horizon`, of the nodes that have one (W's
-/// SUPPORT, sorted by state: `Sk`). A node's set is non-empty from its
-/// layer to its last frame and only grows as `t` falls, so it is a few SPANS
-/// - a set and the frames it holds over - and is stored as varints: per
-/// node its state (a delta, `put_sk`), its layer, its spans' count, and per
-/// span its length and its set (the arena's sets numbered by use, the most
-/// used first); per block of `BLOCK` nodes its first state and byte offset,
-/// in a scratch file mapped back when the backward has a directory for it
-/// (`Spill`).
+/// The winning sets, `t` in `0..=horizon`, of W's SUPPORT (the nodes with
+/// one), sorted by state. A node's set is non-empty from its layer to its
+/// last frame and only grows as `t` falls: a few SPANS (a set and its
+/// frames), stored as varints - per node its state (`put_sk`), layer and
+/// span count, per span its length and set (numbered by use, the most used
+/// first); per `BLOCK` nodes the first state and byte offset. In a scratch
+/// file when the backward has a directory (`Spill`).
 pub struct Winning<C: Circle = Fixed16> {
     n: usize,
     blocks: Vec<(Sk, u64)>,
@@ -153,7 +136,6 @@ impl Spill {
     }
 }
 
-/// `Spill::done`'s bytes.
 enum Bytes {
     Mem(Vec<u8>),
     Map(memmap2::Mmap),
@@ -169,9 +151,8 @@ impl std::ops::Deref for Bytes {
     }
 }
 
-/// W's distinct sets: the backward's arena, numbered by use (`order[k]`:
-/// the arena's index of set `k`, the most used first - smaller varints)
-/// without copying the arena.
+/// W's distinct sets: the backward's arena, numbered by use without
+/// copying it (`order[k]`: the arena's index of set `k`, the most used first).
 struct Sets<C: Circle> {
     arena: RegionArena<C>,
     order: Vec<u32>,
@@ -275,7 +256,6 @@ impl<C: Circle> Winning<C> {
         }
         Node { id: *id, layer, count, bytes: &self.data[start..*pos], sets: &self.sets }
     }
-    /// Node `i`.
     pub fn node(&self, i: u32) -> Node<'_, C> {
         let (b, k) = (i as usize / BLOCK, i as usize % BLOCK);
         let (mut id, mut pos) = (self.blocks[b].0, self.blocks[b].1 as usize);
@@ -284,7 +264,6 @@ impl<C: Circle> Winning<C> {
         }
         self.decode_at(&mut pos, &mut id)
     }
-    /// Every node, in id order.
     pub fn nodes(&self) -> Nodes<'_, C> {
         self.nodes_from(0, self.n)
     }
@@ -325,10 +304,9 @@ impl<C: Circle> Winning<C> {
     }
 }
 
-/// The spans one backward step closed - each node whose set changed or
-/// ended below the step's frame, its span from `lo` (the step's frame + 1)
-/// to its last frame - by state, as varints (the state's delta, `hi - lo`,
-/// the set) at `at..at + len` of the backward's spilled runs.
+/// The spans one step closed (a node whose set changed or ended below the
+/// step's frame: from `lo`, the step's frame + 1, to its last), by state,
+/// as varints (state delta, `hi - lo`, set) at `at..at + len` of the runs.
 #[derive(Clone, Copy)]
 struct Run {
     lo: u16,
@@ -338,7 +316,6 @@ struct Run {
 }
 
 impl Run {
-    /// Encode `closed` (by state) into `out`.
     fn new(lo: u16, closed: impl IntoIterator<Item = (Sk, u16, u32)>, out: &mut Spill) -> Self {
         let mut bytes = Vec::new();
         let (mut last, mut n) = (Sk::default(), 0);
@@ -414,7 +391,7 @@ const MADE: u32 = 1 << 30;
 
 /// The in-edges a step reads at once: a step whose changed nodes have more
 /// reads them in ROUNDS, each folded into the step's sets so far (an
-/// `Emit` is 40 B: 0.8 GB a round, as with 24-B id emissions of 32M).
+/// `Emit` is 40 B: 0.8 GB a round).
 const ROUND_EMITS: usize = 20 << 20;
 const _: () = assert!(std::mem::size_of::<Emit>() == 40, "ROUND_EMITS is sized for 40-B emissions");
 
@@ -461,9 +438,8 @@ fn id_ranges(mut sample: Vec<Sk>, total: usize, parts: usize) -> Vec<Sk> {
 
 /// The first index at or past `j` whose key is not below `k`, in `v` sorted
 /// by key with every key before `j` below `k`: GALLOPING from `j`. A read
-/// walks each of a region's segments' sorted targets against the group's;
-/// stepping one by one cost every segment the whole group (26% of a big
-/// room's backward; 256k-lane slices cut its frames into 2.3x the segments).
+/// walks each segment's sorted targets against the group's; stepping one by
+/// one costs every segment the whole group (26% of a big room's backward).
 fn seek<A, B>(v: &[((u64, u64), A, B)], j: usize, k: (u64, u64)) -> usize {
     let mut lo = j;
     let mut step = 1;
@@ -510,17 +486,14 @@ pub struct Backward<'a, N: Rem = P8> {
     cur: Vec<Cur>,
     /// Their indices whose set changed there (or appeared).
     changed: Vec<u32>,
-    /// Per step, the spans it closed, in `run_bytes`; with `spill`, that
-    /// and W's nodes are scratch files there.
+    /// Per step, the spans it closed, in `run_bytes` (with `spill`, a
+    /// scratch file there, as W's nodes).
     runs: Vec<Run>,
     run_bytes: Spill,
     spill: Option<std::path::PathBuf>,
     /// Per target region, the steps that read its in-edges.
     opens: FxHashMap<u32, u32>,
-    /// A round's in-edges (`ROUND_EMITS`; tests shrink it to exercise the
-    /// rounds), and the step's own sets' bytes past which they are
-    /// compacted between rounds (`LOCAL_COMPACT`; the tests' rounds compact
-    /// always).
+    /// `ROUND_EMITS` and `LOCAL_COMPACT` (tests shrink both: `with_rounds`).
     round_emits: usize,
     local_compact: usize,
     read: ReadStats,
@@ -606,16 +579,13 @@ impl<'a, N: Rem> Backward<'a, N> {
         [self.d_read, self.d_pull, self.d_merge]
     }
 
-    /// The work of a step's reads: the changed nodes (in state order, so
-    /// region by region) grouped by REGION - a region's in-edges are its
-    /// segments at a frame, decoded whole - each group read frame by frame
-    /// from the region's first frame with in-edges to `t + 1`: one ITEM a
-    /// (region, frame), numbered group-major. Per group its first item, its
-    /// first frame and its range of `changed`; then the total. Not from the
-    /// group's least LAYER: the hull forward records an edge at its source's
-    /// layer + 1 whatever its push then, so its target may be first reached
-    /// LATER than the edge's frame (when the source's hull grew into the
-    /// edge's guard).
+    /// A step's reads: the changed nodes grouped by REGION (its in-edges at
+    /// a frame are its segments, decoded whole), each read from the region's
+    /// first frame with in-edges to `t + 1`: one ITEM a (region, frame),
+    /// group-major. Per group its first item, first frame and range of
+    /// `changed`; then the total. Not from the least LAYER: an edge is
+    /// recorded at its source's layer + 1 whatever its push, so its target
+    /// may be first reached LATER (once the source's hull grew into its guard).
     fn read_items(&self, t: u32) -> Vec<(usize, u32, usize, usize)> {
         let mut items = Vec::new();
         let (mut at, mut a) = (0usize, 0usize);
@@ -631,13 +601,12 @@ impl<'a, N: Rem> Backward<'a, N> {
         items
     }
 
-    /// One ROUND of a step's reads: from item `start` on (`read_items`), on
-    /// `threads` workers, until the round holds `round_emits` in-edges -
-    /// the in-edges recorded at an item's frame into its region's changed
-    /// targets (frames <= t + 1 at step t: their sources have layers <= t).
-    /// Per worker its in-edges sorted and distinct; and where the round
-    /// stopped. A round stops between items, so one heavy region bounds it
-    /// by its in-edges at one frame.
+    /// One ROUND of a step's reads, from item `start` on (`read_items`)
+    /// until it holds `round_emits` in-edges: those recorded at an item's
+    /// frame into its region's changed targets (frames <= t + 1 at step t:
+    /// their sources have layers <= t). Per worker its in-edges sorted and
+    /// distinct; and where the round stopped (between items, so one heavy
+    /// region bounds it by its in-edges at one frame).
     fn read_round(&self, items: &[(usize, u32, usize, usize)], start: usize) -> anyhow::Result<(Vec<(Vec<Emit>, ReadStats)>, usize)> {
         use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
         let (cur, changed, store, budget) = (&self.cur, &self.changed, self.store, self.round_emits);
@@ -841,10 +810,9 @@ impl<'a, N: Rem> Backward<'a, N> {
         acc
     }
 
-    /// `W_t` from `W_{t+1}` (the frame done last; `t` counts down from
-    /// `horizon - 1`): the in-edges of the nodes whose set changed at `t + 1`,
-    /// read target by target in id order (`read_round`, in rounds), folded
-    /// source by source into their sets at `t + 1` (`fold_round`); then the
+    /// `W_t` from `W_{t+1}` (`t` counts down from `horizon - 1`): the
+    /// in-edges of the nodes whose set changed at `t + 1` (`read_round`),
+    /// folded into their sources' sets at `t + 1` (`fold_round`); then the
     /// sets that grew replace their spans and the nodes of layer `t + 1`
     /// close theirs.
     pub fn step(&mut self, t: u32) -> anyhow::Result<()> {
@@ -1151,20 +1119,19 @@ fn fragmentation<'a, C: Circle>(sets: impl Iterator<Item = RegionRef<'a, C>>) ->
 
 /// The OPTIMUM from `start` at remainder `point`, read off ONE backward:
 /// `horizon - max{t : point in W_t(start)}` (`None`: the horizon is
-/// refuted). Valid because the graph is the same at every frame but for
-/// the layers, and k steps from the start reach only layers <= k, so a
-/// layer never binds.
+/// refuted). A lower bound: a concrete winner at frame `h` is at each frame
+/// `k` in a node of layer <= k (the hull forward's induction), so `point`
+/// is in `W_{horizon - h}(start)` (its layers <= k <= horizon - h + k).
 pub fn optimum<C: Circle>(w: &Winning<C>, start: Option<u32>, point: (C::P, C::P), horizon: u32) -> Option<u32> {
     let s = start?;
     (0..=horizon).rev().find(|&t| w.at(t, s).is_some_and(|r| r.contains(point.0, point.1))).map(|t| horizon - t)
 }
 
 /// What the backward starts from in the tree in `dir` up to `horizon`: the
-/// start (frame 0's one row), the win rows of frames `1..=horizon` with
-/// their layers, as states (their keys through the tree's metadata), the
-/// edge store - every frame that kept rows has its edges (one that kept
-/// none, under level -1, may have none) - and the tree's shapes and key
-/// space.
+/// start (frame 0's one row), the win states of frames `1..=horizon` with
+/// their layers, the edge store (every frame that kept rows has its edges;
+/// one that kept none, under level -1, may have none), the tree's shapes
+/// and key space.
 pub struct Seeds<N: Rem = P8> {
     pub start: Sk,
     pub wins: Vec<(Sk, u32)>,
