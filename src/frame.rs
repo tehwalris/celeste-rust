@@ -65,7 +65,6 @@ pub mod phases {
         TICKS[p].fetch_add(t - t0, Ordering::Relaxed);
         t
     }
-    /// The TSC's ticks per second, measured once against the wall clock.
     fn hz() -> f64 {
         static HZ: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
         *HZ.get_or_init(|| {
@@ -95,7 +94,6 @@ pub struct Block<N: EngineNum = P8> {
 }
 
 impl<N: EngineNum> Block<N> {
-    /// Decoded rows with their key column, or rows with none.
     pub fn from_rt2(rt2: Rt2<N>) -> Self {
         assert!(
             rt2.row_keys.is_empty() || rt2.row_keys.len() == rt2.width,
@@ -106,8 +104,7 @@ impl<N: EngineNum> Block<N> {
         Block { rt2 }
     }
 
-    /// A reference-engine block, made CANONICAL (ids, shape hash), without
-    /// keys.
+    /// A reference-engine block made CANONICAL (ids, shape hash), no keys.
     pub fn canonical(mut rt2: Rt2<N>) -> Result<Self> {
         rt2.canonical();
         Ok(Block { rt2 })
@@ -146,8 +143,7 @@ impl<N: EngineNum> Block<N> {
     }
 }
 
-/// The summit (6,3)'s level index: it has no exit, it ends at the flag
-/// (`summit_flag`).
+/// The summit's level index: no exit, it ends at the flag (`summit_flag`).
 pub const SUMMIT_LEVEL: i16 = 30;
 
 /// The winning positions (x_lo, x_hi, y_lo, y_hi, inclusive): `--win-at` or
@@ -266,10 +262,9 @@ fn reaches_win<N: EngineNum>(rt2: &Rt2<N>, s: &crate::settings::Settings) -> Res
     Ok(exits.iter().zip(&has_orb).map(|(e, o)| *e && *o).collect())
 }
 
-/// Per lane: has start room `(x, y)`'s berry been taken (`got_fruit[1 +
-/// level_index()]`, an array the cart pads with nils up to that index)? An
-/// unknown value (a coarse level) counts as taken: a win there is only an
-/// over-approximation, and the exact level decides.
+/// Per lane: is start room `(x, y)`'s berry taken (`got_fruit[1 +
+/// level_index()]`, nil-padded)? An unknown (a coarse level) counts as
+/// taken: a win there over-approximates, and the exact level decides.
 pub fn got_fruit<N: EngineNum>(rt2: &Rt2<N>, (x, y): (i16, i16)) -> Result<Vec<bool>> {
     use celeste_engine::runtime2::{Cell2, Col, AV};
     let lanes = rt2.width;
@@ -367,7 +362,6 @@ pub struct MinusOne {
 }
 
 impl MinusOne {
-    /// The start room's table at this speed bound, under settings `s`.
     pub fn table(&self, s: &crate::settings::Settings) -> &'static crate::search::level_minus_one::CostToGo {
         self.try_table(s).unwrap_or_else(|e| panic!("building the level -1 table: {e:#}"))
     }
@@ -421,7 +415,6 @@ pub(crate) fn cell_too_late(cell: u32, frame: u32, h: u32, px: i32) -> bool {
 pub struct MarkFilter<'a, N: EngineNum = P8> {
     marked: &'a Visited<N>,
     coarser: crate::abstraction::Level,
-    /// Frames and steps (`settings::Clock`).
     clock: crate::settings::Clock,
 }
 
@@ -500,12 +493,10 @@ pub trait FrameStep<N: Rem = P8>: Sync {
     /// build's lock, and a one-frame bench would time the build.
     fn warm(&self) {}
 
-    /// The level its frames widen to (its rows' key view, the platform
-    /// worlds' range).
+    /// The level its rows widen and key to.
     fn level(&self) -> crate::abstraction::Level;
 
-    /// The settings it runs under: the wave's (threads, the diagnostics,
-    /// the win and the category its rows are judged by).
+    /// The settings it runs under (the wave's: threads, the win, the category).
     fn settings(&self) -> std::sync::Arc<crate::settings::Settings>;
 }
 
@@ -516,8 +507,7 @@ pub const END_STEPS: [&str; 8] = ["keys", "seal", "filter", "absorb", "layer", "
 /// One forward frame's timings and sizes, for the `[fwd]` log line.
 #[derive(Default, Clone, Copy)]
 pub struct FrameStats {
-    /// The frontier's new entries and states (the kernels'), and its old
-    /// states (re-pushed).
+    /// The frontier: new entries and states (the kernels'), old states.
     pub entries_in: usize,
     pub lanes_in: usize,
     pub old_in: usize,
@@ -537,25 +527,21 @@ pub struct FrameStats {
     /// The units' wall time (every slice's) and its barrier idle fraction.
     pub t_wave: std::time::Duration,
     pub wave_idle: f64,
-    /// The region phase: its jobs' time summed over the workers (they run
-    /// inside the wave, overlapping the units).
+    /// The region jobs' time summed over the workers (inside the wave).
     pub t_regions: std::time::Duration,
-    /// The frame's end (keys, the next layer, its wins decoded, the edge
-    /// file), wall, and its steps' (`END_STEPS`).
+    /// The frame's end, wall, and per step (`END_STEPS`).
     pub t_layer: std::time::Duration,
     pub t_end: [std::time::Duration; END_STEPS.len()],
     /// Per step its counts (user instructions and cycles, kernel cycles,
     /// page faults: `storage::bench::step_counts`; zeros outside a bench).
     pub end_counts: [[u64; 4]; END_STEPS.len()],
-    /// `--phases`: the wave's phases, seconds summed over the workers
-    /// (`phases::take`; zeros without).
+    /// `--phases`: seconds summed over the workers (zeros without).
     pub phase_s: [f64; phases::N],
     pub units: usize,
     /// The slices, and the routes (target regions) with new states or edges.
     pub slices: usize,
     pub routes: u64,
-    /// Edges recorded, their bundles, and the frame's edge file bytes and
-    /// out file bytes.
+    /// Edges recorded, their bundles, the edge and out files' bytes.
     pub edge_records: u64,
     pub edge_bundles: u64,
     pub edge_bytes: u64,
@@ -578,9 +564,8 @@ pub struct FrameStats {
 }
 
 /// The level -1 filter a tree's frames were built under
-/// (`<dir>/level_minus_one.txt`). A forward extends a tree under ITS
-/// filter, never the environment's, so every frame of a tree is filtered
-/// alike.
+/// (`<dir>/level_minus_one.txt`). A forward extends a tree under ITS filter,
+/// never the environment's: every frame of a tree is filtered alike.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TreeFilter {
     /// None (`off`): the frames do not depend on the horizon.
@@ -660,9 +645,8 @@ impl TreeFilter {
     }
 
     /// The level -1 filter the tree in `dir` was built under, its table
-    /// checked against the recorded fingerprint: what a check of the tree
-    /// (`search::known`) must apply, whatever the environment says. Refused
-    /// without a record (its table is unknown).
+    /// checked: what a check of the tree (`search::known`) must apply,
+    /// whatever the environment says. Refused without a record.
     pub fn of_tree(dir: &std::path::Path, s: &crate::settings::Settings) -> Result<Option<MinusOne>> {
         match TreeFilter::read(dir)? {
             None => anyhow::bail!("{}: no level -1 record (a tree from before records): its filter is unknown", dir.display()),
@@ -691,13 +675,13 @@ impl TreeFilter {
 
 /// The forward's in-memory state, EXTENDED frame by frame (each checkpointed).
 pub struct ForwardState<N: Rem = P8> {
-    /// The last frame's frontier: its new states (as keys, with their
-    /// hulls) and the older states whose hull grew there.
+    /// The last frame's frontier: its new states, and the old ones whose
+    /// hull grew there.
     frontier: Frontier<N>,
     /// Every state reached so far, with its layer and hull.
     visited: crate::storage::visited::VisitedSet<N>,
     xfers: crate::storage::edges::XferTable<N>,
-    /// The tree's out-edge files (the re-push reads an old state's edges).
+    /// The out-edge files (the re-pushes read them).
     outs: crate::storage::out::OutStore,
     /// The shapes' skeletons the emissions register (the next layers'),
     /// and the shapes whose skeleton a frame file holds.
@@ -715,11 +699,9 @@ pub struct ForwardState<N: Rem = P8> {
     spent: bool,
 }
 
-/// What a forward run reports.
 pub struct ForwardResult {
-    /// The frame a lane first won, if any.
     pub win_frame: Option<u32>,
-    /// The number of frames actually run (the last checkpointed frame).
+    /// The last checkpointed frame.
     pub frames: u32,
     /// The position graph, when recording was on (the posgraph gate).
     pub pos_graph: Option<crate::search::pos_graph::PosGraph>,
@@ -860,22 +842,18 @@ impl<N: Rem> ForwardState<N> {
         Ok(ForwardState { frontier, visited, xfers, outs, skeletons, persisted, observer, frames: last, win_frame, filter, spent: false })
     }
 
-    /// The visited set's size: every distinct state reached so far.
     pub fn visited_len(&self) -> usize {
         self.visited.len()
     }
 
-    /// The visited set (`bench frame`).
     pub fn visited(&self) -> &crate::storage::visited::VisitedSet<N> {
         &self.visited
     }
 
-    /// The frontier: the last frame's states whose hull grew (`bench frame`).
     pub fn frontier(&self) -> &Frontier<N> {
         &self.frontier
     }
 
-    /// The out store and the transfer table (`bench frame`'s `[memory]`).
     pub fn outs_and_xfers(&self) -> (&crate::storage::out::OutStore, &crate::storage::edges::XferTable<N>) {
         (&self.outs, &self.xfers)
     }
