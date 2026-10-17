@@ -155,7 +155,6 @@ impl LuaF64 {
         Self(v as f64)
     }
 
-    /// The double itself.
     pub const fn value(self) -> f64 {
         self.0
     }

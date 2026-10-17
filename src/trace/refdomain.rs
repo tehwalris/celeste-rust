@@ -36,7 +36,6 @@ impl Cursor {
         Cursor::default()
     }
 
-    /// Rewind for the next run.
     pub fn reset(&mut self) {
         self.pos = 0;
     }
@@ -101,7 +100,6 @@ fn floor_span<A: Arithmetic>(v: &A::Ival) -> Result<u32> {
     A::floors(*v).ok_or_else(|| anyhow::anyhow!("{} spans more than 65536 floors", show::<A>(v)))
 }
 
-/// A number for an error message.
 pub fn show<A: Arithmetic>(v: &A::Ival) -> String {
     match A::as_point(*v) {
         Some(n) => A::show(n),

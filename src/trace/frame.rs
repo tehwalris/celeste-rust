@@ -86,7 +86,6 @@ impl<A: GraphArith> Clone for FrameOut<A> {
 pub struct Frame<A: GraphArith = Fixed> {
     pub iface: Iface<A>,
     pub fork_origins: Vec<(u8, String)>,
-    /// How many FORK choices this frame made.
     pub forks: u8,
     /// The forks' arities AS TRACED (a later frame overwrites the arena's;
     /// `lower::bind` installs these).

@@ -70,7 +70,6 @@ pub trait Arithmetic: 'static + Copy + Default + Debug + Send + Sync + PartialEq
     fn bits(v: Self::Num) -> u64;
     /// The number of these bits (`bits`' inverse), if they are one.
     fn from_bits(b: u64) -> Option<Self::Num>;
-    /// A number for a message.
     fn show(v: Self::Num) -> String;
     /// A number as the console's `printh` prints it.
     fn printh(v: Self::Num) -> Result<String>;

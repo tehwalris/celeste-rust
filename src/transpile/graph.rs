@@ -263,7 +263,6 @@ impl<A: GraphArith> Graph<A> {
         self.fork_ways.clear();
     }
 
-    /// Fork `d`'s arity.
     pub fn fork_ways(&self, d: u8) -> u8 {
         self.fork_ways.get(d as usize).copied().unwrap_or(2)
     }

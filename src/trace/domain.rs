@@ -89,7 +89,6 @@ impl<A: GraphArith> From<Fun2> for Op<A> {
 }
 
 impl Cmp {
-    /// The comparison `op` is, if it is one.
     pub fn of<A: GraphArith>(op: &Op<A>) -> Option<Cmp> {
         Some(match op {
             Op::Lt => Cmp::Lt,
@@ -139,7 +138,6 @@ impl Partition {
         }
     }
 
-    /// The fork's arity.
     fn ways(&self) -> u8 {
         match self {
             Partition::Floors { ways } | Partition::Ints { ways, .. } | Partition::Rounds { ways } => *ways,
@@ -429,7 +427,6 @@ pub struct Symbolic<A: GraphArith = Fixed> {
     /// The input cells THIS trace refuses merges on, sorted
     /// (`frame::trace_frame`'s `merge_refused_on`; set by every trace).
     merge_refused: Vec<u32>,
-    /// `reads_merge_refused`'s memo.
     merge_refused_memo: rustc_hash::FxHashMap<NodeId, bool>,
     /// Fork choices handed out THIS FRAME by `(value, kind)`: a second fork
     /// of one value reuses the first's choice instead of an empty dimension.
@@ -441,9 +438,7 @@ pub struct Symbolic<A: GraphArith = Fixed> {
     /// `is_interval`'s memo. This and the three below depend on `ival_cells`
     /// (dropped by `forget_intervals`).
     ival_memo: std::cell::RefCell<rustc_hash::FxHashMap<NodeId, bool>>,
-    /// `lane_undecidable`'s memo.
     undecidable_memo: std::cell::RefCell<rustc_hash::FxHashMap<NodeId, bool>>,
-    /// `abstract_beneath_lane_ops`'s memo.
     beneath_memo: std::cell::RefCell<rustc_hash::FxHashMap<NodeId, bool>>,
     /// `may_answers`'s memo: `(may_true, may_false)`.
     may_memo: std::cell::RefCell<rustc_hash::FxHashMap<NodeId, (NodeId, NodeId)>>,
@@ -451,7 +446,6 @@ pub struct Symbolic<A: GraphArith = Fixed> {
     /// bounded input, the only source of a static range) and `Op::Pin` (an input
     /// the body reads as a constant), each charged to every outcome.
     pub assumptions: Vec<NodeId>,
-    /// `range_of`'s memo.
     range_memo: std::collections::HashMap<NodeId, Option<A::Pieces>>,
 }
 
@@ -805,7 +799,6 @@ impl<A: GraphArith> Symbolic<A> {
         self.graph.fold(Op::Gt, vec![f.value, zero])
     }
 
-    /// Forget this frame's fork choices.
     pub fn clear_fork_memo(&mut self) {
         self.fork_memo.clear();
     }

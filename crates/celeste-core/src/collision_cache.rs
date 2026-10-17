@@ -101,7 +101,6 @@ pub struct CollisionCache {
 pub const ICE_FLAG: i16 = 4;
 
 impl CollisionCache {
-    /// The collision cache for one room.
     pub fn new(cart_data: &CartData, room_x: i16, room_y: i16) -> Result<Self> {
         // The room plus a margin.
         let range = PosMapRange {

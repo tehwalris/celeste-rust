@@ -12,7 +12,6 @@ use super::graph::{Graph, NodeId};
 pub(crate) struct Emit<A: GraphArith = Fixed> {
     /// The forks in the graph, every one resolved at compile time.
     pub(crate) fork_depth: usize,
-    /// The traced graph.
     pub(crate) graph: Graph<A>,
     /// Decide the boolean layer of the specialized arena before emitting:
     /// interval fold, `bdd::simplify_local`, interval fold again.
@@ -39,7 +38,6 @@ pub enum ColTy {
 }
 
 pub(crate) struct OutField<A: GraphArith = Fixed> {
-    /// The cell this value lands in.
     pub(crate) cell: u32,
     pub(crate) ty: ColTy,
     /// The graph node this cell ends the frame holding.
