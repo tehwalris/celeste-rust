@@ -6,8 +6,8 @@ and verify every result end to end.
 
 JOBS.json: a list of {"cat": "nodiag", "room": "0,0", "name": "100m",
 "offset": 27, "levels": "r0sxhn,r0sxh", "l1": true, "mem": "60G"} (optional:
-"flags": more flags for the search, e.g. ["--split-frame"] (a job's old "env"
-of CELESTE_* variables is refused, as the binaries refuse them); "tag";
+"flags": more flags for the search, e.g. ["--split-frame"] (an "env" of
+CELESTE_* variables is refused, as the binaries refuse them); "tag";
 "timeout"; "reuse": a level-0 tree directory, moved in when it exists and moved back
 there when the job ends - so jobs can count horizons up on one kept tree;
 "to": a horizon H instead of the reference - `--to H`, level -1 at H, and a
