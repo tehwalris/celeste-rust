@@ -1,8 +1,8 @@
 //! What the graph IR needs of an arithmetic beyond `Arithmetic`
 //! (plans/float.md, "The kernels' safety"): the rules that are the
-//! arithmetic's own. 16.16's are the graph's code as it always was, moved
-//! here verbatim (the kernels' raw `i32` grid, wraps included); the
-//! doubles' follow `LuaF64` and the reference engine (`refdomain`) exactly.
+//! arithmetic's own. 16.16's are the kernels' raw `i32` grid, wraps
+//! included; the doubles' follow `LuaF64` and the reference engine
+//! (`refdomain`) exactly.
 //!
 //! - the FORK GRID: the integer floors a `move` fork's fragments are cut
 //!   at (`Split`, `Frag`, `FragOk`, `SplitOk`, `IntFrag`);
@@ -23,7 +23,6 @@ use celeste_core::pico8_num::{Pico8Num, Pico8NumInterval};
 use super::graph::{one_operand, Graph, NodeId, Op};
 
 pub trait GraphArith: Arithmetic<Num: celeste_core::arith::EngineNum<A = Self>> {
-    /// Do `min` and `max` commute (bit for bit)?
     const MINMAX_COMMUTE: bool;
     /// Is addition exact, so `(x - r) + r` is `x` and `(r + c) - r` is `c`
     /// wherever the ranges bound them (16.16: yes; doubles round)?
@@ -31,20 +30,17 @@ pub trait GraphArith: Arithmetic<Num: celeste_core::arith::EngineNum<A = Self>> 
     /// Is the cart's `==` on numbers bit identity (16.16: yes; a double's
     /// `-0 == 0`)? Where not, a pin checks `Op::Same`.
     const EQ_IS_IDENTITY: bool;
-    /// A static range, as pieces (`pieces_of`).
     type Pieces: Clone + Debug + PartialEq + Default + Send;
 
     /// `SplitOk(n)` of the literal interval `[lo, hi]`, in the kernel's own
     /// arithmetic.
     fn lit_split_ok(lo: Self::Lit, hi: Self::Lit, n: u8) -> bool;
-    /// `IntFrag(c)` of a literal whose low end is `lo`.
     fn lit_int_frag(lo: Self::Lit, c: u8) -> Self::Lit;
     /// `IntFrag(c)` over `iv`: fragment `c`'s low end, exact (`lenient`: its
     /// hull over the lanes `iv` covers).
     fn ev_int_frag(iv: Self::Ival, c: u8, lenient: bool) -> Self::Ival;
     /// `SplitOk(ways)` over `iv`: does it span at most `ways` floors?
     fn ev_split_ok(iv: Self::Ival, ways: u8) -> bool;
-    /// The floors `iv` spans, minus one.
     fn ev_frag_cells(iv: Self::Ival) -> i64;
     /// Fragment `c` of `iv`: its part in the `c`-th floor from its low end's
     /// (`c` at most `ev_frag_cells`).
@@ -72,12 +68,11 @@ pub trait GraphArith: Arithmetic<Num: celeste_core::arith::EngineNum<A = Self>> 
     /// `floors_spanned`'s twin for the values of `flr(x + 1/2)` (the round
     /// fork's arity).
     fn rounds_spanned(p: &Self::Pieces, uncapped: bool) -> i64;
-    /// The whole numbers the pieces' hull spans: `(flr(min), flr(max))`.
+    /// The whole numbers the pieces' hull spans.
     fn floor_hull(p: &Self::Pieces) -> Option<(i64, i64)>;
     /// The pieces' hull as literals (`None`: outside the arithmetic).
     fn lit_hull(p: &Self::Pieces) -> Option<(Self::Lit, Self::Lit)>;
-    /// A literal interval as raw 16.16, where the arithmetic is 16.16's
-    /// (the literal splits of the levels with unknowns are so far).
+    /// A literal interval as raw 16.16, where the arithmetic is 16.16's.
     fn lit_raw_fixed(lo: Self::Lit, hi: Self::Lit) -> Option<(i32, i32)>;
     /// Is `v` the only number of its VALUE, so a box whose ends are `v`
     /// holds `v`'s bits on every lane (`ival`'s point fold)? A double's
@@ -91,10 +86,9 @@ pub trait GraphArith: Arithmetic<Num: celeste_core::arith::EngineNum<A = Self>> 
 }
 
 /// Every number of `v`'s VALUE, as an interval: `v` alone wherever it is
-/// alone in its value (16.16: always), a double's zero both zeros. An input
-/// a compile-time decision pins to a value (a pixel, a platform's `x`) is
-/// pinned to this: a comparison cannot tell `-0` from `0`, a quotient can,
-/// and the decision must hold for every lane of that value.
+/// alone in its value, a double's zero both zeros. An input a compile-time
+/// decision pins to a value (a pixel, a platform's `x`) is pinned to this: a
+/// comparison cannot tell `-0` from `0`, a quotient can.
 pub fn value_box<A: GraphArith>(v: A::Num) -> A::Ival {
     use celeste_core::arith::EngineNum;
     if A::alone_in_its_value(v) {
@@ -123,7 +117,7 @@ mod value_box_tests {
     }
 }
 
-// ---- 16.16 ----
+// 16.16.
 
 /// One fork-grid step (the integers) in raw 16.16 units.
 const GRID_STEP: i32 = 1 << 16;
@@ -220,11 +214,9 @@ impl GraphArith for Fixed {
     }
 
     // No-wrap of anything but `+ - * /`, negation and `abs` holds (as in
-    // `eval`). Of one with a single operand that is no literal point
-    // (`one_operand`) it is decided where that operand's range is: every
-    // value fits (`x + 0`, `x * 0.5`, `x / 2`), none does (`x / 0`), or the
-    // operand is a literal. One with no literal operand YET stays: a
-    // specialization may make it one.
+    // `eval`). Of one with a single operand that is no literal point it is
+    // decided where every value fits (`x + 0`, `x * 0.5`), none does (`x / 0`),
+    // or the operand is a literal; one with no literal operand YET stays.
     fn fold_no_wrap(g: &Graph<Fixed>, x: NodeId) -> Option<bool> {
         match g.get(x).op {
             Op::Add | Op::Sub | Op::Neg | Op::Abs | Op::Mul | Op::Div => {
@@ -329,10 +321,9 @@ impl GraphArith for Fixed {
                     return None;
                 }
                 let a = rec(memo, k_of)?;
-                // In i64, unwrapped and unsaturated: a product or quotient
-                // that leaves the 16.16 range makes the range unknown
-                // (`normalize_pieces`), where PICO-8's wrapped or saturated
-                // endpoints would bound nothing (and a lane there is in error).
+                // In i64, unwrapped and unsaturated: a product or quotient that leaves
+                // the 16.16 range makes the range unknown (PICO-8's wrapped endpoints would
+                // bound nothing).
                 let f = |x: i64| -> i64 {
                     if is_div {
                         (x << 16) / raw(k)
@@ -450,7 +441,6 @@ impl GraphArith for Fixed {
     }
 }
 
-/// One answer for every pair of pieces, or `None`.
 fn decide_pairs<P: Copy>(xs: &[P], ys: &[P], one: impl Fn(P, P) -> Option<bool>) -> Option<bool> {
     let mut decided: Option<Option<bool>> = None;
     for x in xs {
@@ -466,7 +456,7 @@ fn decide_pairs<P: Copy>(xs: &[P], ys: &[P], one: impl Fn(P, P) -> Option<bool>)
     decided.flatten()
 }
 
-// ---- doubles ----
+// Doubles.
 
 /// A static range of doubles as sorted, disjoint closed pieces.
 pub type FloatPieces = Vec<(f64, f64)>;
@@ -493,9 +483,8 @@ fn normalize_float(mut v: FloatPieces) -> Option<FloatPieces> {
     Some(out)
 }
 
-/// `IntFrag(c)` of a value: fragment `c`'s low end, the floor `c`
-/// integers above `v`'s, at least `v`, as the reference's
-/// `floor_fragment` takes it (the cart's `max`, its tie to the floor).
+/// `IntFrag(c)` of a value: fragment `c`'s low end, the floor `c` integers
+/// above `v`'s, at least `v` (the cart's `max`, as the reference takes it).
 fn int_frag_low(v: LuaF64, c: u8) -> LuaF64 {
     let base = LuaF64::new(v.value().floor() + c as f64).expect("a floor near a finite double is finite");
     v.lua_max(base)
@@ -545,8 +534,9 @@ impl GraphArith for Float {
         iv.floor_fragment(c as u32)
     }
 
-    /// A double's `NoWrap` is "finite". Undecided exactly where the operation can leave the finite doubles
-    /// (`range_error`: `%` by zero included); anything else is finite.
+    /// A double's `NoWrap` is "finite": undecided exactly where the
+    /// operation can leave the finite doubles (`range_error`: `%` by zero
+    /// included).
     fn fold_no_wrap(g: &Graph<Float>, x: NodeId) -> Option<bool> {
         if Self::range_error(&g.get(x).op) {
             None
@@ -578,9 +568,9 @@ impl GraphArith for Float {
             }
         };
         let rec = |memo: &mut HashMap<NodeId, Option<FloatPieces>>, k: usize| Self::pieces_of(g, memo, args[k]);
-        // Every operation below is monotone in each operand (or `abs`,
-        // in its magnitude) and rounded to nearest at both ends, which is
-        // monotone too: the ends' results bound every lane's (section 4).
+        // Every operation below is monotone in each operand (`abs`: in its
+        // magnitude) and rounded to nearest at both ends, monotone too: the ends'
+        // results bound every lane's.
         let r: Option<FloatPieces> = match op {
             Op::Const(lo, hi) => Some(vec![(v(lo), v(hi))]),
             Op::Restrict(lo, hi) => {

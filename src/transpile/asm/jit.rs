@@ -25,13 +25,10 @@ pub type KernelFn = unsafe extern "C" fn(*const u8, *mut u8, *const std::os::raw
 static COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// This process's scratch directory for the `.s` / `.so` pairs,
-/// `target/asm-scratch/<pid>/`.
-///
-/// A loaded `.so` stays on disk while the process runs (profiles attribute
-/// samples to its path), and nothing unlinks it on a kill or an OOM, so the
-/// scratch grows without bound across runs. The first call therefore
-/// removes the directory of every pid no longer running and empties this
-/// pid's own.
+/// `target/asm-scratch/<pid>/`. A loaded `.so` stays on disk while the
+/// process runs (profiles attribute samples to its path), and nothing
+/// unlinks it on a kill or an OOM, so the first call removes the directory
+/// of every pid no longer running and empties this pid's own.
 fn scratch_dir() -> &'static Path {
     static DIR: OnceLock<PathBuf> = OnceLock::new();
     DIR.get_or_init(|| {

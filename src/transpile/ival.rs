@@ -1,18 +1,16 @@
 //! INTERVAL folding: decide what the graph computes without knowing its
-//! inputs.
-//!
-//! `transpile::bdd` treats every comparison as an independent variable, so
-//! it cannot see that `0 > abs(x)` is always false. This pass runs the
-//! interval evaluator (`Graph::eval`) with every input at TOP, and every node
-//! it pins down is a constant, unconditionally.
+//! inputs. `transpile::bdd` treats every comparison as an independent
+//! variable, so it cannot see that `0 > abs(x)` is always false; this pass
+//! runs the interval evaluator (`Graph::eval`) with every input at TOP, and
+//! every node it pins down is a constant, unconditionally.
 //!
 //! **Exact, not merely sound.** The interval domain over-approximates, so a
 //! node evaluated to `Bool(Some(b))` under TOP inputs is `b` under every
-//! assignment - every assignment the body is defined on: an
-//! `Op::Restrict` narrows its operand, and a lane outside its range is in
-//! error (the restriction's own, charged to every outcome). Replacing it changes nothing the graph computes and can only
-//! improve precision downstream (unlike a general equality substitution,
-//! see `bdd`'s "proved and deliberately not acted on").
+//! assignment the body is defined on (an `Op::Restrict` narrows its operand,
+//! and a lane outside its range is in error, charged to every outcome).
+//! Replacing it changes nothing the graph computes and can only improve
+//! precision downstream (unlike a general equality substitution:
+//! `bdd::simplify_local`, "Why only constants and atoms").
 
 use std::collections::HashMap;
 
@@ -21,7 +19,7 @@ use anyhow::Result;
 use super::garith::GraphArith;
 use super::graph::{Graph, NodeId, Op, Room, Val};
 
-/// The sentinel `simplify` uses for "this node was not reachable".
+/// The image of a node `fold` did not reach.
 pub use super::bdd::UNREACHABLE;
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -35,10 +33,9 @@ pub struct Stats {
 }
 
 /// Every node the interval evaluator can pin down, replaced by that
-/// constant, and the graph rebuilt over the nodes `roots` reach.
-///
-/// Returns the new graph, a FULL-length node map (`UNREACHABLE` where a
-/// node was not reached), and what it found.
+/// constant, and the graph rebuilt over the nodes `roots` reach. Returns the
+/// new graph, a FULL-length node map (`UNREACHABLE` where a node was not
+/// reached), and what it found.
 pub fn fold<A: GraphArith>(g: &Graph<A>, roots: &[NodeId], room: Option<&Room>) -> Result<(Graph<A>, Vec<NodeId>, Stats)> {
     let mut out = g.like();
     let (map, st) = fold_into(g, roots, room, &mut out)?;
@@ -47,7 +44,6 @@ pub fn fold<A: GraphArith>(g: &Graph<A>, roots: &[NodeId], room: Option<&Room>) 
 
 /// Every input cell at its weakest value - a bool cell unknown, a number
 /// cell the full range (a bounded input's range is its `Op::Restrict`'s).
-/// The kind is the graph's (`Graph::cell_kind`, recorded at `symbolize`).
 pub(crate) fn seed_cells<A: GraphArith>(g: &Graph<A>) -> HashMap<u32, Val<A>> {
     let full = Val::Num(A::unknown());
     let mut cells: HashMap<u32, Val<A>> = HashMap::new();
@@ -60,10 +56,9 @@ pub(crate) fn seed_cells<A: GraphArith>(g: &Graph<A>) -> HashMap<u32, Val<A>> {
     cells
 }
 
-/// `fold`, writing into `out`: what several graphs fold to lands in one
-/// hash-consed arena, so equal results are the same node. A bounded input's
-/// range comes from its `Op::Restrict`, never from a seed: a fact assumed
-/// here would be checked nowhere.
+/// `fold`, into `out`: what several graphs fold to lands in one hash-consed
+/// arena. A bounded input's range comes from its `Op::Restrict`, never from
+/// a seed (a fact assumed here would be checked nowhere).
 pub fn fold_into<A: GraphArith>(
     g: &Graph<A>,
     roots: &[NodeId],
@@ -154,8 +149,7 @@ mod tests {
     }
 
     /// The map is a constant, so a collision test at a known position is
-    /// decidable; at an unknown position it genuinely is not (the player could
-    /// be anywhere). Deciding those needs bounds on the position inputs.
+    /// decidable; at an unknown position it genuinely is not.
     #[test]
     fn a_collision_test_is_decided_at_a_known_position_and_not_at_an_unknown_one() {
         let cart = std::sync::Arc::new(
@@ -212,9 +206,7 @@ mod tests {
     }
 
     /// A collision test with ONE coordinate at TOP is decided false only where
-    /// no position along that axis is solid, in every level room. (Capping the
-    /// derived rectangle's corner and size apart once read TOP as tile row 0
-    /// only and put a spawning player in the air on the ground.)
+    /// no position along that axis is solid, in every level room.
     #[test]
     fn a_collision_test_at_a_top_coordinate_folds_only_to_what_every_position_gives() {
         let cart = std::sync::Arc::new(celeste_core::cart_data::CartData::load("cart").expect("cart"));
@@ -266,11 +258,10 @@ mod tests {
     }
 
     /// `mget == k` over a RESTRICTED rectangle of tiles (as `spikes_at` reads
-    /// the map) folds to false exactly where no tile of the rectangle is `k`,
-    /// to true where every one is, and is otherwise left standing; at every
-    /// lane inside the rectangle the folded graph computes what the unfolded
-    /// one does. Every level room, rectangles up to 3x3 tiles, the spike tiles
-    /// and a tile of the room.
+    /// the map) folds to false exactly where no tile is `k`, to true where every
+    /// one is, and is otherwise left standing; lane by lane inside the rectangle
+    /// the folded graph computes what the unfolded one does. Every level room,
+    /// rectangles up to 3x3 tiles.
     #[test]
     fn a_tile_test_over_a_restricted_rectangle_folds_exactly_by_the_set_of_tiles() {
         let cart = std::sync::Arc::new(celeste_core::cart_data::CartData::load("cart").expect("cart"));
@@ -347,9 +338,9 @@ mod tests {
     }
 
     /// Fork validity is a per-LANE fact, and the interval pass sees a hull over
-    /// every lane. A hull spanning many floors contains lanes that span exactly
-    /// two, so `FragOk(1)` must stay undecided there (deciding it false loses
-    /// rows). A hull inside ONE floor decides it: no lane can straddle.
+    /// every lane: a hull spanning many floors contains lanes that span exactly
+    /// two, so `FragOk(1)` must stay undecided there. A hull inside ONE floor
+    /// decides it.
     #[test]
     fn fragment_validity_is_not_decided_from_a_wide_hull() {
         let mut g = Graph::new();

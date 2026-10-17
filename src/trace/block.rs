@@ -1,29 +1,23 @@
 //! An interpreter state and a block: ONE converter each way, for every
-//! domain.
-//!
-//! `to_rt2` makes the engine's block of a state: the tracer's output
-//! skeletons (`skeleton`, over `Symbolic`: its numbers and booleans are graph
-//! nodes, which the kernels compute) and the reference engine's rows
-//! (`engines::reference`, over `RefDomain`), so a kernel row and a
-//! reference row of one state have one structure and one key. The domain
-//! supplies only what a number and a boolean become; `from_block` is the
-//! inverse, one lane of a block as a state.
+//! domain. `to_rt2` makes the engine's block of a state - the tracer's output
+//! skeletons (over `Symbolic`) and the reference engine's rows (over
+//! `RefDomain`) - so a kernel row and a reference row of one state have one
+//! structure and one key; the domain supplies only what a number and a
+//! boolean become. `from_block` is the inverse, one lane as a state.
 //!
 //! A block BOXES every slot: each global, field and array element is a `Val`
-//! cell. A table or a closure is ONE cell (a heap object: every slot holding
-//! it points at it, `AV::Ptr`); a builtin is a `Bi` cell AT its slot, at
-//! every slot holding it (a builtin is its name, with nothing to share). The
-//! cells are made in any order, then numbered by `Rt2::canonicalize_ids`;
-//! the row key walks the whole structure.
+//! cell. A table or a closure is ONE cell (every slot holding it points at
+//! it, `AV::Ptr`); a builtin is a `Bi` cell AT every slot holding it (it is
+//! its name, with nothing to share). The cells are numbered by
+//! `Rt2::canonicalize_ids`.
 //!
 //! What a block keeps of a state: the `GLOBAL_NAMES` globals and the
-//! `FIELD_NAMES` fields (the rest, the tracer's hint builtins among them,
-//! are dropped; `from_block` restores the builtins from its base state);
-//! integer keys past an array part as a dense array with explicit nils; a
-//! closure's captures, tables only. `__button_states`: the kernels write the
-//! buttons as `UBool`, so `to_rt2` does too; `from_block` reads a `UBool` as
-//! a placeholder `false` (buttons are overwritten before they are read; any
-//! other unknown boolean is returned for the driver to fork).
+//! `FIELD_NAMES` fields (`from_block` restores the dropped builtins from its
+//! base state); integer keys past an array part as a dense array with
+//! explicit nils; a closure's captures, tables only. The buttons are
+//! written `UBool`, as the kernels write them; `from_block` reads a `UBool`
+//! button as a placeholder `false` (overwritten before it is read) and
+//! returns any other unknown boolean for the driver to fork.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -43,9 +37,8 @@ use crate::trace::state::State;
 pub const BUTTON_GLOBAL: &str = "__button_states";
 
 /// The block of `st`, one lane: its structure, and its values by `num` and
-/// `boolean` (the domain's part, in the block's numbers `N`), strings and
-/// the buttons' `UBool` by the converter. Canonical cell order, its shape
-/// hash set, no row keys (`frame::Block::canonical` makes them).
+/// `boolean` (the domain's part). Canonical cell order, its shape hash set,
+/// no row keys (`frame::Block::canonical` makes them).
 pub fn to_rt2<D: Domain, N: EngineNum>(
     st: &State<D>,
     cart: Arc<CartData>,
@@ -90,8 +83,8 @@ pub fn to_rt2<D: Domain, N: EngineNum>(
 }
 
 /// The tracer's block of `st`: its shape, every number and boolean `Nil`
-/// (graph nodes: the kernels compute them). What a traced frame's input and
-/// outcomes bind against (`bind::resolve_all`).
+/// (the kernels compute them). What a traced frame's input and outcomes bind
+/// against.
 pub fn skeleton<D: Domain, N: EngineNum>(st: &State<D>, cart: Arc<CartData>, cache: Arc<CollisionCache>) -> Result<Rt2<N>> {
     to_rt2(st, cart, cache, |_| Ok(AV::Nil), |_| Ok(AV::Nil))
 }
@@ -99,7 +92,6 @@ pub fn skeleton<D: Domain, N: EngineNum>(st: &State<D>, cart: Arc<CartData>, cac
 struct ToRt2<'a, D: Domain, E: EngineNum, N, B> {
     st: &'a State<D>,
     rt2: Rt2<E>,
-    /// Each heap object's one cell.
     tables: HashMap<TableId, u32>,
     closures: HashMap<ClosureId, u32>,
     /// The table `__button_states` holds: its booleans are written `UBool`.
@@ -174,7 +166,6 @@ where
         let shape = if !table.hash.is_empty() {
             let mut fields = Vec::new();
             for (name, v) in &table.hash {
-                // Fields the boundary does not name are dropped.
                 if let Some(f) = gen::field_id(name) {
                     fields.push((f, self.slot(v, button)?));
                 }
@@ -238,8 +229,7 @@ pub fn fn_info_of<D: Domain>(base: &State<D>) -> Result<FnInfo> {
 
 /// Lane `lane` of a block as a state in domain `d` (plus the builtins of
 /// `base`'s globals, which a block drops), and its unknown-boolean fields
-/// except the buttons, for the driver to fork. The block's numbers are the
-/// domain's arithmetic's.
+/// except the buttons, for the driver to fork.
 pub fn from_block<N: EngineNum, D: Domain<A = N::A>, E: Domain>(
     d: &mut D,
     rt2: &Rt2<N>,

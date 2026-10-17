@@ -235,8 +235,6 @@ fn eval_nodes(
     vals
 }
 
-// ---- typed-root coverage (value + bool + interval layers) ----
-
 use crate::transpile::asm::RootKind;
 
 /// Read the raw output buffer, `out_bytes` long (`Compiled::out_bytes`).
@@ -529,10 +527,9 @@ fn asm_value_and_bool_layer_matches_primitives() {
     }
 }
 
-/// A bool INPUT cell (`CellRepr::Bool`): the input buffer carries a 16-bit
-/// `val` mask (known implicitly all-ones), the codegen expands it to a
-/// per-lane vector mask, and it flows through `Not`/`Sel` to Num and Bool
-/// roots. Bit-exact against the `ZB`/`ZN` primitives.
+/// A bool INPUT cell (`CellRepr::Bool`, a 16-bit `val` mask, known all-ones)
+/// expands to a per-lane vector mask and flows through `Not`/`Sel` to Num
+/// and Bool roots, bit-exact.
 #[test]
 fn asm_bool_input_matches_primitives() {
     use crate::transpile::asm::{compile_and_load_reprs, CellRepr, RootKind};
@@ -604,10 +601,9 @@ fn asm_bool_input_matches_primitives() {
     }
 }
 
-/// A maybe-unknown bool INPUT cell (`CellRepr::UBool`, a near level's floor
-/// `collideable`): `val` at +0 and `known` at +2 of its slot, both loaded, so
-/// `Known` reads the lanes' own known mask and the cell passes through to a
-/// bool root with it.
+/// A maybe-unknown bool INPUT cell (`CellRepr::UBool`): `val` at +0 and
+/// `known` at +2 of its slot, both loaded, so `Known` reads the lanes' own
+/// known mask.
 #[test]
 fn asm_ubool_input_carries_its_known_mask() {
     use crate::transpile::asm::{compile_and_load_reprs, CellRepr, RootKind};
@@ -633,10 +629,8 @@ fn asm_ubool_input_carries_its_known_mask() {
     }
 }
 
-/// An interval (`ZI`) INPUT cell (`CellRepr::Ival`): two `ZN` planes (lo at
-/// +0, hi at +64 of a 128-byte slot) flowing through `Add`/`Flr` to Ival
-/// and Num roots, packed via `input_offsets` and compared bit-exact against
-/// `zi_add`/`zi_flr`.
+/// An interval INPUT cell (`CellRepr::Ival`: lo at +0, hi at +64 of a
+/// 128-byte slot) through `Add`/`Flr` to Ival and Num roots, bit-exact.
 #[test]
 fn asm_ival_input_matches_primitives() {
     use crate::transpile::asm::{compile_and_load_reprs, CellRepr, RootKind};
@@ -696,11 +690,9 @@ fn asm_ival_input_matches_primitives() {
 }
 
 /// Interval `+`, `-` and negation whose endpoints OVERFLOW the 16.16 range
-/// are an ERROR in that lane, never a value: the kernel's `NoWrap` premise
-/// is false exactly where the primitives' wrap guards (`zi_add_wraps`,
-/// `zi_sub_wraps`, `zi_neg_wraps`) fire, so a body reading such an
-/// operation declines there (`trace::error`). Every other lane is bit-exact.
-/// A silently wrapped endpoint inverts the interval.
+/// are an ERROR in that lane, never a value (a silently wrapped endpoint
+/// inverts the interval): `NoWrap` is false exactly where `zi_*_wraps` fire,
+/// and every other lane is bit-exact.
 #[test]
 fn asm_interval_overflow_declines() {
     use crate::transpile::asm::{compile_and_load_reprs, CellRepr};
@@ -781,14 +773,12 @@ fn asm_interval_overflow_declines() {
     }
 }
 
-/// Interval `*` and `/` by a positive literal whose endpoints leave the
-/// 16.16 range are an ERROR in that lane, as `+`/`-`/negation
-/// (`asm_interval_overflow_declines`): `NoWrap` is false exactly where
-/// `zi_scale_wraps` / `zi_div_wraps` (`Pico8NumInterval`'s checked
-/// operations) fire, one ulp either side of each literal's edges, and every
-/// other lane is bit-exact with `zi_scale` / `zi_div`. A literal that cannot
-/// carry an endpoint out (a factor at most 1, a divisor at least 1: the
-/// inline `div_pow2`) has a constant-true `NoWrap`, so no compare.
+/// Interval `*` and `/` by a positive literal, as
+/// `asm_interval_overflow_declines`: `NoWrap` is false exactly where
+/// `zi_scale_wraps` / `zi_div_wraps` fire, one ulp either side of each
+/// literal's edges, and every other lane is bit-exact. A literal that cannot
+/// carry an endpoint out (a factor at most 1, a divisor at least 1) has a
+/// constant-true `NoWrap`: no compare.
 #[test]
 fn asm_interval_scale_and_divide_overflow_declines() {
     use crate::transpile::asm::{compile_and_load_reprs, CellRepr};
@@ -888,15 +878,12 @@ fn asm_interval_scale_and_divide_overflow_declines() {
     }
 }
 
-/// SCALAR (point) arithmetic that leaves the 16.16 range is an ERROR in
-/// that lane, as an interval's is (`asm_interval_overflow_declines`):
-/// `NoWrap` of `+ - * /`, negation and `abs` is false exactly where the
-/// primitives' masks (`zn_*_wraps`: `Pico8Num`'s checked operation has no
-/// answer) fire, one step either side of every edge, and every other lane
-/// is bit-exact with the primitive - the exact result. With a literal
-/// operand the check is at most two compares of the other one
+/// SCALAR arithmetic, as `asm_interval_overflow_declines`: `NoWrap` of
+/// `+ - * /`, negation and `abs` is false exactly where `zn_*_wraps` fire,
+/// one step either side of every edge, and every other lane is the exact
+/// result. With a literal operand the check is at most two compares
 /// (`graph::one_operand`), none where every value fits; two cells' `+`/`-`
-/// is the sign test of the interval form on one plane.
+/// is one sign test.
 #[test]
 fn asm_scalar_overflow_declines() {
     use crate::transpile::graph::one_operand;
@@ -997,12 +984,11 @@ fn asm_scalar_overflow_declines() {
     }
 }
 
-/// The tri-state layer with DECIDED planes: a maybe-unknown input, a bool
-/// input, a comparison (known everywhere), the two literals and an undecided
-/// constant, combined pairwise by `And`/`Or`/`Eq`/`Not` and as `Sel`
-/// conditions and arms. The codegen folds the decided planes by bit identities
-/// (`codegen::Lower::m_and` ...); every root must still equal the `zb_*`
-/// primitives on EVERY bit of both planes, not only on the known lanes.
+/// The tri-state layer with DECIDED planes (a maybe-unknown input, a bool
+/// input, a comparison, the literals, an undecided constant) combined by
+/// `And`/`Or`/`Eq`/`Not` and `Sel`: with the decided planes folded by bit
+/// identities, every root equals the `zb_*` primitives on EVERY bit of both
+/// planes, not only on the known lanes.
 #[test]
 fn asm_bool_layer_with_decided_planes_is_bit_exact() {
     use crate::transpile::asm::{compile_and_load_reprs, CellRepr};
@@ -1087,12 +1073,10 @@ fn asm_bool_layer_with_decided_planes_is_bit_exact() {
     }
 }
 
-/// `/ 2^s` and `% 2^m` by a literal are INLINE shifts and masks
-/// (`codegen::Lower::div_pow2`, `pow2_modulus_mask`), not call-outs, and are
-/// bit-exact against `Pico8Num`'s `/` (truncating, saturating) and `%`
-/// (`rem_euclid`) over the whole i32 range: the edges (MIN, MAX, 0, +-1,
-/// every +-2^k and its neighbours) and random raws, negatives included; for
-/// the interval `/`, both endpoints.
+/// `/ 2^s` and `% 2^m` by a literal are INLINE shifts and masks, not
+/// call-outs, and bit-exact against `Pico8Num`'s `/` and `%` over the whole
+/// i32 range: the edges (MIN, MAX, 0, +-1, every +-2^k and its neighbours)
+/// and random raws; for the interval `/`, both endpoints.
 #[test]
 fn inline_div_rem_by_a_power_of_two_is_pico8s() {
     let mut g = Graph::new();
@@ -1153,10 +1137,9 @@ fn inline_div_rem_by_a_power_of_two_is_pico8s() {
     }
 }
 
-/// Only the registers live across a call-out are saved and restored: a
-/// value computed before a call and read after it survives it, the kernel
-/// saves fewer than all 32, and `ZERO` (read by a `Neg` after the call) is
-/// zero again.
+/// Only the registers live across a call-out are saved and restored: a value
+/// computed before a call and read after it survives it, fewer than all 32
+/// are saved, and `ZERO` is zero again after the call.
 #[test]
 fn a_call_out_preserves_what_is_live_across_it() {
     let mut g = Graph::new();
@@ -1193,10 +1176,8 @@ fn a_call_out_preserves_what_is_live_across_it() {
 }
 
 /// Values live across a RUN of call-outs and read only after it stay in the
-/// save area between the calls (`codegen::call_saves`): the kernel restores
-/// fewer registers than it would around each call alone, and every value
-/// survives. Eight call-outs on independent operands, four values held
-/// across all of them.
+/// save area between the calls: fewer restores than around each call alone,
+/// and every value survives (eight call-outs, four values held across).
 #[test]
 fn values_held_across_a_run_of_calls_survive_it() {
     let mut g = Graph::new();
@@ -1229,10 +1210,9 @@ fn values_held_across_a_run_of_calls_survive_it() {
     }
 }
 
-/// Constants under register pressure: 48 select chains whose arms are
-/// broadcast constants (all-ones, zero and others) still live at the end,
-/// so the allocator spills some and REMATERIALIZES them at their uses
-/// (`Emitter::constant`). Bit-exact against the primitives.
+/// Constants under register pressure: 48 select chains over broadcast
+/// constants, still live at the end, are spilled and REMATERIALIZED at their
+/// uses, bit-exact.
 #[test]
 fn rematerialized_constants_under_pressure_are_bit_exact() {
     let mut g = Graph::new();

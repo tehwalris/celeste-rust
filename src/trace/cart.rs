@@ -1,8 +1,6 @@
 //! The game's sources and chunks for the tracer: the builtin Lua, then the
-//! cart, then `_init()`.
-//!
-//! The initial heap is built by the same interpreter under the symbolic
-//! domain; nothing in `_init()` is unknown, so it folds to a concrete heap.
+//! cart, then `_init()` (by the same interpreter under the symbolic domain:
+//! nothing in `_init()` is unknown, so it folds to a concrete heap).
 
 use anyhow::{anyhow, Context, Result};
 
@@ -11,11 +9,10 @@ use super::heap::Value;
 use super::interp::{Flow, Interp};
 use super::state::State;
 
-/// The builtins that are native rather than written in Lua (`add`,
-/// `foreach`, ... come from the builtin chunks). FROZEN: these are
-/// `GLOBAL_NAMES` entries, so every block carries their cells (`Bi`) and
-/// the shape hashes depend on them. `__widen_rem`, `__new_vector` and
-/// `__split_at` have no implementation but stay.
+/// The builtins that are native rather than written in Lua. FROZEN: these
+/// are `GLOBAL_NAMES` entries, so every block carries their cells (`Bi`)
+/// and the shape hashes depend on them (`__widen_rem`, `__new_vector` and
+/// `__split_at` have no implementation but stay).
 pub const NATIVE: &[&str] = &[
     "__print",
     "__new_unknown_boolean",
@@ -55,10 +52,8 @@ pub fn inject_tile_flag_at<D: Domain>(st: &mut State<D>) {
 
 
 /// What ONE FRAME is, for the tracer (`trace_frame` runs the button reset
-/// itself, before it).
-///
-/// `_draw()` is NOT cosmetic: the player's screen clamp (`x` to [-1, 121],
-/// `spd.x = 0`) lives in the player's `draw`.
+/// before it). `_draw()` is NOT cosmetic: the player's screen clamp (`x` to
+/// [-1, 121], `spd.x = 0`) lives in the player's `draw`.
 pub const FRAME_CODE: &str = "_update()\n_draw()";
 
 /// The cart's Lua under settings `s` (the room, the category's patches, the
@@ -117,14 +112,12 @@ fn split_frame(game: &str, update: &str) -> Result<String> {
     Ok(game.replacen(DRAW, &format!("{DRAW}\t-- mid-frame (SPLIT FRAME): drawn after part b\n\tif __phase ~= nil then return end\n"), 1))
 }
 
-/// `--balloon-seeds "s1,s2,.."`: the start room's balloons' phases
-/// FIXED, in creation order, as the TAS tool (UniversalClassicTas) and a
-/// tasdatabase file's `[seeds]` fix them - instead of `rnd(1)`, an interval
-/// at every level, under which a witness may mix branches no single seed
-/// takes. With them the search is exact for those seeds (missing ones: 0).
-/// No new global (the name table is frozen): each balloon's seed is inlined,
-/// chosen by its position; creation order is `load_room`'s tile loop
-/// (x outer, y inner).
+/// `--balloon-seeds "s1,s2,.."`: the start room's balloons' phases FIXED,
+/// in creation order, as UniversalClassicTas and a tasdatabase file's
+/// `[seeds]` fix them, instead of `rnd(1)` (an interval, under which a
+/// witness may mix branches no single seed takes); missing ones 0. No new
+/// global (the name table is frozen): each balloon's seed is inlined, chosen
+/// by its position.
 fn fix_balloon_seeds(game: &str, seeds: &str, root: &std::path::Path, (rx, ry): (i16, i16)) -> Result<String> {
     const PAT: &str = "this.offset=rnd(1)";
     anyhow::ensure!(game.matches(PAT).count() == 1, "--balloon-seeds: the balloon's `{PAT}` was not found exactly once");
@@ -146,20 +139,15 @@ fn fix_balloon_seeds(game: &str, seeds: &str, root: &std::path::Path, (rx, ry): 
     Ok(game.replacen(PAT, &format!("this.offset={expr}"), 1))
 }
 
-/// A float tool's seeds (`--arith float`): what the tool does with a file's
-/// `[seeds]` beyond the balloons' phases at their creation
-/// (`fix_balloon_seeds`), in its own expressions (plans/float.md,
-/// "The semantics and their authority").
+/// A float tool's seeds (`--arith float`) beyond the balloons' phases at
+/// their creation, in the tool's own expressions (plans/float.md):
 /// - A CHEST's last shake: its `rnd(3)` (where its berry appears) returns
-///   UCT's `offset + 1` (`TAS.lua`: the chest's update under a patched
-///   `rnd` when `timer - 1 <= 0`), Celia's `seed + 1 + 0x0.0001`
-///   (`vanilla_seeds.lua`, when `timer <= 1` before the update); its
-///   earlier shakes only move it until then, and stay `rnd(3)`.
-/// - Celia's BALLOONS: after the load (and its jank) `init_seed_objs` and
-///   `set_seed` make each balloon's `offset` its seed (`0 - 0 + seed`) and
-///   its `y` `start + sin(offset) * 2`, undoing the loading frame's bob.
-///   Only where the balloons are seeded (`seeds`; a tree without seeds
-///   holds every phase).
+///   UCT's `offset + 1` (`TAS.lua`, when `timer - 1 <= 0`), Celia's `seed +
+///   1 + 0x0.0001` (`vanilla_seeds.lua`, when `timer <= 1` before the
+///   update); its earlier shakes stay `rnd(3)`.
+/// - Celia's BALLOONS: after the load (and its jank) each balloon's `offset`
+///   is its seed and its `y` `start + sin(offset) * 2`, undoing the loading
+///   frame's bob; only where the balloons are seeded.
 /// Chests take their seeds from `seeds` (every seed 0 without).
 fn tool_seeds(game: &str, seeds: Option<&str>, tool: crate::settings::FloatTool, root: &std::path::Path, (rx, ry): (i16, i16), jank: bool) -> Result<String> {
     use crate::settings::FloatTool;
@@ -209,10 +197,8 @@ fn tool_seeds(game: &str, seeds: Option<&str>, tool: crate::settings::FloatTool,
 }
 
 /// The tiles `load_room` makes an object of, in the ORIGINAL cart, with the
-/// object's type and whether the minimal cart makes it too: platforms (11,
-/// 12) and the types with a `tile`. The minimal cart has no `message` (86,
-/// room (3,1)) nor `flag` (118, the summit); `room_title` is the original's
-/// last object.
+/// object's type and whether the minimal cart makes it too (it has no
+/// `message`, 86, nor `flag`, 118); `room_title` is the original's last.
 const OBJECT_TILES: &[(u8, &str, bool)] = &[
     (1, "player_spawn", true),
     (8, "key", true),
@@ -234,9 +220,8 @@ const BALLOON: u8 = 22;
 const CHEST: u8 = 20;
 
 /// One object `load_room` makes in a room, in the ORIGINAL cart: its tile,
-/// tile position in the room, type, whether the minimal cart makes it, and
-/// whether a seed of the TAS tools' `[seeds]` list is its (balloons and
-/// chests, in creation order: UniversalClassicTas `set_seeds`).
+/// tile position, type, whether the minimal cart makes it, and whether a
+/// seed of the TAS tools' `[seeds]` list is its (balloons and chests).
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
 pub struct RoomObject {
     pub tile: u8,
@@ -247,10 +232,9 @@ pub struct RoomObject {
     pub seeded: bool,
 }
 
-/// Room `(rx, ry)`'s objects in creation order (`load_room`'s tile loop: x
-/// outer, y inner), the original cart's (`room_title`, made last, left
-/// out). The one scan of the map for objects: the loading frame's J, the
-/// seeds, the tools (`rewrite room`, `rewrite starts`).
+/// Room `(rx, ry)`'s objects in creation order (x outer, y inner), the
+/// original cart's (`room_title` left out): the one scan of the map for
+/// objects.
 pub fn room_objects(cart: &celeste_core::cart_data::CartData, (rx, ry): (i16, i16)) -> Vec<RoomObject> {
     let mut out = Vec::new();
     for tx in 0..16i16 {
@@ -265,13 +249,12 @@ pub fn room_objects(cart: &celeste_core::cart_data::CartData, (rx, ry): (i16, i1
 }
 
 /// The start room's LOADING FRAME as a real transition runs it
-/// (`--loading-jank J`): the leaving
-/// player's `_update` loads the room, and the frame's `foreach` goes on over
-/// the NEW room's objects from the player's index J - one update each
-/// (move, then update) - then the frame draws. J counts the ORIGINAL cart's
-/// objects (pico8_diff/chain.py reports it); it is translated to the minimal
-/// cart's list, which lacks `message` and `flag`. Measured against a real
-/// PICO-8 chain field by field (`pico8_diff/chain.py --modes`).
+/// (`--loading-jank J`): the leaving player's `_update` loads the room, and
+/// the frame's `foreach` goes on over the NEW room's objects from the
+/// player's index J - one update each (move, then update) - then the frame
+/// draws. J counts the ORIGINAL cart's objects (pico8_diff/chain.py reports
+/// it), translated to the minimal cart's list (no `message`, no `flag`).
+/// Measured against a real PICO-8 chain field by field (`chain.py --modes`).
 fn apply_loading_frame(game: &str, j: usize, root: &std::path::Path, (rx, ry): (i16, i16)) -> Result<String> {
     let cart = celeste_core::cart_data::CartData::load(root.join("cart"))?;
     let first = minimal_index(&cart, (rx, ry), j);
@@ -306,10 +289,9 @@ mod loading_frame_tests {
     }
 }
 
-/// Make the diagonal arm of the player's dash start RAISE (`nil > 0`): a raise
-/// has no successor (`Interp::poison`), so a diagonal dash leaves the search
-/// exactly, at every level and in the reference engine alike. A dash with no
-/// direction held (horizontal, facing direction) stays legal.
+/// Make the diagonal arm of the player's dash start RAISE (`nil > 0`): a
+/// raise has no successor, so a diagonal dash leaves the search exactly, at
+/// every level and in the reference engine alike.
 fn forbid_diagonal_dashes(game: &str) -> Result<String> {
     const ARM: &str = "if input~=0 then\n\t\t  \tif v_input~=0 then\n";
     anyhow::ensure!(game.matches(ARM).count() == 1, "--nodiag: the cart's diagonal dash arm was not found exactly once");
@@ -317,8 +299,7 @@ fn forbid_diagonal_dashes(game: &str) -> Result<String> {
 }
 
 /// Make the three non-diagonal arms of the player's dash start (horizontal
-/// only, vertical only, no direction) RAISE, as `forbid_diagonal_dashes`
-/// does the diagonal one: exact at every level and in the reference engine.
+/// only, vertical only, no direction) RAISE, as `forbid_diagonal_dashes`.
 fn forbid_straight_dashes(game: &str) -> Result<String> {
     const ARMS: [&str; 3] = [
         "\t\t  \telse\n\t\t   \tthis.spd.x=input*d_full\n",
@@ -334,14 +315,11 @@ fn forbid_straight_dashes(game: &str) -> Result<String> {
     Ok(game)
 }
 
-/// Refuse a program that could tell an absent-as-zero field's missing
-/// value (nil) from the 0 every frame writes there
-/// (`widen::materialize_absent_fields`). Every `.field` must be an assignment
-/// target or a DIRECT operand of arithmetic or an ordering comparison: on nil
-/// those are runtime errors, so reading the missing value halts the real
-/// game. Checked by counting: all `.field` indexes must equal the targets
-/// plus such operands. A bracketed `t["field"]` is refused at trace time
-/// (`Interp::index_key`).
+/// Refuse a program that could tell an absent-as-zero field's missing value
+/// (nil) from the 0 every frame writes there: every `.field` must be an
+/// assignment target or a DIRECT operand of arithmetic or an ordering
+/// comparison, runtime errors on nil (checked by counting). A bracketed
+/// `t["field"]` is refused at trace time (`Interp::index_key`).
 pub fn check_absent_fields(ast: &full_moon::ast::Ast) -> Result<()> {
     use full_moon::ast;
     use full_moon::visitors::Visitor;
@@ -411,7 +389,6 @@ pub fn check_absent_fields(ast: &full_moon::ast::Ast) -> Result<()> {
     Ok(())
 }
 
-/// An empty program with the native builtins (`NATIVE`) as globals.
 pub fn fresh_state<D: Domain>(d: &mut D) -> State<D> {
     let mut st = State::new(d);
     let globals = &mut st.heap.tables.get_mut(&st.globals).expect("the globals table").hash;
@@ -421,8 +398,7 @@ pub fn fresh_state<D: Domain>(d: &mut D) -> State<D> {
     st
 }
 
-/// Run one chunk and require exactly one end state (a `break` at its
-/// toplevel is an error).
+/// Run one chunk and require exactly one end state.
 pub fn run_one<'a, D: Domain>(it: &mut Interp<'a, D>, ast: &'a full_moon::ast::Ast, st: State<D>) -> Result<State<D>> {
     let out = it.exec_block(ast.nodes(), st)?;
     anyhow::ensure!(out.len() == 1, "expected one state, got {}", out.len());
@@ -449,16 +425,15 @@ impl Chunks {
         Ok(Chunks { top, init: parse("_init", "_init()")?, reset: parse("the reset", "__reset_button_states()")?, frame: parse("the frame", FRAME_CODE)? })
     }
 
-    /// For an interpreter kept past its caller (the walk's tracer, a
-    /// reference engine), which borrows its chunks.
+    /// For an interpreter kept past its caller, which borrows its chunks.
     pub fn leak(self) -> &'static Chunks {
         Box::leak(Box::new(self))
     }
 }
 
-/// Room `room`'s START in `it`: the cart's data (read relative to `root`)
-/// and the room's collision cache loaded into it, the toplevel run, the
-/// native `tile_flag_at` in place of the Lua one, `_init()` run.
+/// Room `room`'s START in `it`: the cart's data and the room's collision
+/// cache loaded, the toplevel run, the native `tile_flag_at` in place of the
+/// Lua one, `_init()` run.
 pub fn boot<'a, D: Domain>(it: &mut Interp<'a, D>, chunks: &'a Chunks, root: &std::path::Path, (rx, ry): (i16, i16)) -> Result<State<D>> {
     let cart = std::sync::Arc::new(celeste_core::cart_data::CartData::load(root.join("cart"))?);
     it.cache = Some(std::sync::Arc::new(celeste_core::collision_cache::CollisionCache::new(&cart, rx, ry)?));

@@ -1,12 +1,11 @@
 //! The REFERENCE domain: a scalar abstract interpreter over the Lua AST, the
-//! oracle the kernels are checked against.
-//!
-//! It plugs into `Interp<D>` like `Symbolic`, but runs one
-//! ABSTRACT scalar path and enumerates the fork tree by RE-EXECUTION
-//! (`engines::reference::run_frame_all`). `Num` is an interval (a point is `[n,n]`); `Bool` is a
-//! plain `bool`: every fork (a straddling comparison, an unknown button, a
-//! `__split_by_flr` fragment) is resolved by a DECISION CURSOR, so `decide`
-//! never returns `None` and `Interp` never merges.
+//! oracle the kernels are checked against. It plugs into `Interp<D>` like
+//! `Symbolic`, but runs one ABSTRACT scalar path and enumerates the fork
+//! tree by RE-EXECUTION (`engines::reference::run_frame_all`). `Num` is an
+//! interval (a point is `[n,n]`); `Bool` is a plain `bool`: every fork (a
+//! straddling comparison, an unknown button, a `__split_by_flr` fragment) is
+//! resolved by a DECISION CURSOR, so `decide` never returns `None` and
+//! `Interp` never merges.
 //!
 //! OVERFLOW IS AN ERROR, for a point as for an interval: an operation whose
 //! exact result can leave the 16.16 range (where PICO-8 wraps `+ - *` and
@@ -20,18 +19,15 @@ use celeste_core::arith::{Arithmetic, Fixed};
 
 use crate::trace::domain::{Arith, Cmp, Domain, Fun1, Fun2};
 
-/// A depth-first cursor over a decision tree, enumerated by re-execution.
-///
-/// During a run, `choose(n)` is called at each fork (in a stable order): it
-/// returns the recorded choice if this fork is already on the path, else it
-/// appends `(0, n)` and returns 0. After a run reaches a leaf, `advance()`
-/// bumps the deepest choice (popping exhausted ones) and returns whether any
-/// path remains. `reset()` rewinds the position for the next run.
+/// A depth-first cursor over a decision tree, enumerated by re-execution:
+/// during a run `choose(n)` returns the recorded choice if this fork is on
+/// the path, else appends `(0, n)` and returns 0; after a leaf, `advance()`
+/// bumps the deepest choice (popping exhausted ones) and says whether any
+/// path remains.
 #[derive(Debug, Default, Clone)]
 pub struct Cursor {
     /// The path: `(choice, count)` per fork, in encounter order.
     decisions: Vec<(u32, u32)>,
-    /// Position within `decisions` during the current run.
     pos: usize,
 }
 
@@ -40,13 +36,12 @@ impl Cursor {
         Cursor::default()
     }
 
-    /// Rewind for the next run (`advance` drops the stale tail).
     pub fn reset(&mut self) {
         self.pos = 0;
     }
 
-    /// A fork with `n` options. `n <= 1` is not a choice (identity fork), so it
-    /// is not recorded. Returns the choice index in `0..n`.
+    /// A fork with `n` options (`n <= 1` is no choice, not recorded): the
+    /// choice in `0..n`.
     pub fn choose(&mut self, n: u32) -> u32 {
         if n <= 1 {
             return 0;
@@ -63,8 +58,8 @@ impl Cursor {
         c
     }
 
-    /// Advance to the next path DFS-style. Returns false when the tree is
-    /// exhausted. Call after a run, before `reset()`.
+    /// Advance to the next path, DFS; false when the tree is exhausted. Call
+    /// after a run, before `reset()`.
     pub fn advance(&mut self) -> bool {
         // Drop forks the just-finished run did not reach (shorter path).
         self.decisions.truncate(self.pos);
@@ -84,7 +79,6 @@ impl Cursor {
 }
 
 /// The reference domain of arithmetic `A`: the cursor is its only state.
-/// `RefDomain` is 16.16's.
 #[derive(Debug, Default, Clone)]
 pub struct RefDomain<A: Arithmetic = Fixed> {
     pub cursor: Cursor,
@@ -106,8 +100,6 @@ fn floor_span<A: Arithmetic>(v: &A::Ival) -> Result<u32> {
     A::floors(*v).ok_or_else(|| anyhow::anyhow!("{} spans more than 65536 floors", show::<A>(v)))
 }
 
-/// A number for an error message: a point as its decimal value, an
-/// interval as `[lo, hi]`.
 pub fn show<A: Arithmetic>(v: &A::Ival) -> String {
     match A::as_point(*v) {
         Some(n) => A::show(n),
@@ -366,10 +358,10 @@ mod tests {
         assert!(e.contains("reference arithmetic overflow"), "{what}: {e}");
     }
 
-    /// Every operation that can leave the 16.16 range RAISES, for a point
-    /// and for an interval: `+ - * /`, negation and `abs`, an interval times
-    /// a positive scalar (which panicked) and a division by zero; nothing
-    /// wraps or saturates. Off the edge a point is `Pico8Num`'s result.
+    /// Every operation that can leave the 16.16 range RAISES, for a point and
+    /// for an interval (`+ - * /`, negation, `abs`, an interval times a
+    /// positive scalar, a division by zero); off the edge a point is
+    /// `Pico8Num`'s result.
     #[test]
     fn every_overflow_raises_for_points_and_intervals() {
         let mut d = RefDomain::<Fixed>::new();
@@ -409,7 +401,7 @@ mod tests {
         let (a, b) = (P8::from_i16(181), P8::from_i16(181));
         assert_eq!(d.arith(Arith::Mul, &Iv::from_number(a), &Iv::from_number(b)).unwrap(), Iv::from_number(a.wrapping_mul(b)));
         assert_eq!(d.arith(Arith::Div, &min, &one).unwrap(), min, "MIN / 1 fits");
-        // An interval by a positive scalar, and by zero (which panicked).
+        // An interval by a positive scalar, and by zero.
         assert_eq!(d.arith(Arith::Mul, &two, &Iv::new(P8::from_i16(-3), P8::from_i16(4))).unwrap(), Iv::new(P8::from_i16(-6), P8::from_i16(8)));
         let zero = Iv::from_number(P8::from_i16(0));
         assert_eq!(d.arith(Arith::Mul, &near_top, &zero).unwrap(), zero);
@@ -417,8 +409,8 @@ mod tests {
     }
 
     /// A range of more than 32767 floors: `flr` refuses it (it is no
-    /// point), and `__split_by_flr` forks every floor - the unknown number
-    /// spans 65536, which an `i16` difference wrapped to one.
+    /// point), and `__split_by_flr` forks every floor: the unknown number
+    /// spans 65536 (an `i16` difference would wrap).
     #[test]
     fn a_range_of_many_floors_is_not_one_floor() {
         let mut d = RefDomain::<Fixed>::new();

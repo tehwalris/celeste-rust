@@ -16,7 +16,6 @@ use super::iface::{self, Conc, Iface, Path};
 use super::interp::{Flow, Interp};
 use super::state::State;
 
-/// One traced outcome of a frame.
 pub struct FrameOut<A: GraphArith = Fixed> {
     pub guard: NodeId,
     /// Where this outcome's row is undefined (`trace::error`); live lanes on
@@ -34,16 +33,16 @@ pub struct FrameOut<A: GraphArith = Fixed> {
     /// What kept this outcome from merging with its siblings (only shape can).
     pub shape: super::heap::Shape,
     /// The ENGINE structure of this outcome's end state, and the cell each of
-    /// `fields`/`ubool` lands on. Per outcome: NOT comparable with
-    /// `Frame::in_cells` unless the shape was kept.
+    /// `fields`/`ubool` lands on: NOT comparable with `Frame::in_cells` unless
+    /// the shape was kept.
     pub rt2: celeste_engine::runtime2::Rt2<A::Num>,
     pub cells: Vec<u32>,
     pub ubool_cells: Vec<u32>,
     /// The state itself, so a shape walk can step forward from it.
     pub st: State<Symbolic<A>>,
     /// THE TRANSFER ROOTS (`search::arc_edges`, level-0 traces only): per axis
-    /// `took`, `pre`, `frag`, `ox` (the player's split) and `fin` (the
-    /// remainder before widening; 0 without a player). Never stored in the row.
+    /// `ARC_AXIS_ROOTS` (`fin`: the remainder before widening, 0 without a
+    /// player). Never stored in the row.
     pub arc: Vec<NodeId>,
     /// Does this outcome have a player at its end (`fin` is real)?
     pub arc_fin: bool,
@@ -86,9 +85,7 @@ impl<A: GraphArith> Clone for FrameOut<A> {
 
 pub struct Frame<A: GraphArith = Fixed> {
     pub iface: Iface<A>,
-    /// What each both-values fork was minted for (`--build-trace`).
     pub fork_origins: Vec<(u8, String)>,
-    /// How many FORK choices this frame made; the emitter enumerates them.
     pub forks: u8,
     /// The forks' arities AS TRACED (a later frame overwrites the arena's;
     /// `lower::bind` installs these).
@@ -113,24 +110,23 @@ fn out_fields<A: GraphArith>(
 ) -> Result<(Vec<(Path, NodeId, ColTy)>, Vec<Path>)> {
     let mut out = Vec::new();
     let mut ubool = Vec::new();
-    // A near level's floor `state`s are an interval column in every outcome
-    // (the column type is per shape).
+    // A near level's floor `state`s are an interval column in every outcome.
     let ival_always: Vec<Path> = super::widen::near_floor_states(st, d.level);
     for p in iface::scalars(st, &[])? {
         if p.first() == Some(&iface::key("__button_states")) {
             ubool.push(p);
             continue;
         }
-    // The canonical output unknown: the same uniform `AV::UBool` in every
-    // body, so no root.
+        // The canonical output unknown: the same uniform `AV::UBool` in every
+        // body, so no root.
         if let Some(Value::Bool(b)) = iface::get(st, &p) {
             if d.is_unknown_output(b) {
                 ubool.push(p);
                 continue;
             }
         }
-    // The column's engine TYPE, asked of the graph: writing an interval as a
-    // number would be an unchecked narrowing.
+        // The column's engine TYPE, asked of the graph: writing an interval as
+        // a number would be an unchecked narrowing.
         let (n, ty) = match iface::get(st, &p).unwrap() {
             Value::Num(n) => {
                 let ty = if d.is_interval(&n) || ival_always.contains(&p) { ColTy::Ival } else { ColTy::Num };
@@ -144,26 +140,23 @@ fn out_fields<A: GraphArith>(
     Ok((out, ubool))
 }
 
-/// What one frame is traced under (`trace_frame`).
 pub struct TraceSpec<'s, A: GraphArith = Fixed> {
     /// The input slots: every scalar under them is a cell.
     pub roots: &'s [Path],
-    /// Slots the body reads as a constant (`Op::Pin`): the lattice's.
+    /// Slots the body reads as a constant (`Op::Pin`).
     pub pin: &'s [(Path, Conc<A>)],
     /// Slots the boundary WIDENS to an interval (`rem`).
     pub ival: &'s [Path],
-    /// Input slots BOUNDED to a range (literals, inclusive): the body reads
-    /// them through `Op::Restrict`, specialized on the range; outside it is
-    /// the restriction's own error (`trace::error`), like a pin.
+    /// Input slots BOUNDED to a range (literals, inclusive), read through
+    /// `Op::Restrict`; outside it is the restriction's own error.
     pub bounds: &'s [(Path, (A::Lit, A::Lit))],
     /// Input slots NO MERGE SELECTS ON: a condition that reads one makes two
-    /// successors, each with its own values (`Domain::reads_merge_refused`;
-    /// a respawn's exploration, `walk::explore_no_player`).
+    /// successors (a respawn's exploration, `walk::explore_no_player`).
     pub merge_refused_on: &'s [Path],
     /// A concrete check's trace: no boundary widening inside the frame (a
     /// row hashes on what it stores) and no arc capture.
     pub concrete: bool,
-    /// The level traced, where not the tracer's own (`Symbolic::level`).
+    /// The level traced, where not the tracer's own.
     pub level: Option<crate::abstraction::Level>,
     /// Level -1's trace: `move`'s fork takes the static range's full width
     /// (`Symbolic::uncapped_ways`) and undecided selects stay selects
@@ -198,7 +191,6 @@ fn trace<'a, A: GraphArith>(it: &mut Interp<'a, Symbolic<A>>, chunks: &'a super:
     let widen = !spec.concrete;
     it.trace_start_nodes = it.d.node_count();
     let mut st = st;
-    // Fork choices are per FRAME, buttons included.
     it.d.forks = 0;
     it.d.graph.reset_forks();
     it.d.clear_ranges();
@@ -216,8 +208,8 @@ fn trace<'a, A: GraphArith>(it: &mut Interp<'a, Symbolic<A>>, chunks: &'a super:
         .map(|p| iface.slots.iter().position(|q| q == p).map(|i| i as u32).ok_or_else(|| anyhow!("merge-refused {} is not an input slot", iface::show(p))))
         .collect::<Result<Vec<u32>>>()?;
     it.d.set_merge_refused(refused);
-    // The lattice's pins (`symbolize` made their slots read the constants;
-    // the raw cells feed only these checks).
+    // The lattice's pins (their slots read the constants; the raw cells feed
+    // only these checks).
     for (i, c) in &iface.pins {
         let cell = it.d.graph.leaf(crate::transpile::graph::Op::Cell(*i as u32));
         let c = match *c {
@@ -227,9 +219,8 @@ fn trace<'a, A: GraphArith>(it: &mut Interp<'a, Symbolic<A>>, chunks: &'a super:
         it.d.pin(cell, c);
     }
     // The BOUNDED inputs (the region's square, speed and remainder; the
-    // no-player phase's hulls): the body reads each through its restriction,
-    // whose own error is the bound's check. Nothing seeds the raw cell, so
-    // nothing folds that check away.
+    // no-player phase's hulls), each read through its restriction. Nothing
+    // seeds the raw cell, so nothing folds the check away.
     let player = super::shapes::player_path(&st);
     // The player's raw input position and region, for `Points`.
     let mut position: [Option<(NodeId, (A::Lit, A::Lit))>; 2] = [None, None];
@@ -257,23 +248,18 @@ fn trace<'a, A: GraphArith>(it: &mut Interp<'a, Symbolic<A>>, chunks: &'a super:
             }
         }
     }
-    // The engine numbering for the INPUT shape (`symbolize` changed values,
-    // not the shape).
+    // The engine numbering for the INPUT shape.
     let (cart, cache) = match (it.cart.clone(), it.cache.clone()) {
         (Some(a), Some(b)) => (a, b),
         _ => bail!("tracing a frame needs the cart and the room's collision cache"),
     };
     let in_rt2 = super::block::skeleton(&st, cart.clone(), cache.clone())?;
-    // The canonical cell of each `Op::Cell(i)`. Inputs only: an outcome that
-    // allocates names cells the input block does not have, so outputs bind
+    // The canonical cell of each `Op::Cell(i)`. Inputs only: outputs bind
     // against their own shape.
     let in_cells = super::bind::resolve_all(&in_rt2, &iface.slots)?;
     let mut st = st;
-    // The level's widened slots read as the table says (held trails forked
-    // both ways, the fly fruit's replaced, near floors' `collideable`
-    // derived, countdowns unknown, platform cells decided per world by the
-    // split pass), after the input shape, before any read; an input read as
-    // a literal range is pinned to it.
+    // The level's widened slots read as the table says, after the input
+    // shape, before any read.
     let owed = super::widen::read_inputs(&mut st, &mut it.d)?;
     // THE KERNEL'S ADMISSIBLE INPUTS: every pin holds, and what the inputs'
     // hooks owe; a lane outside is an error of the whole frame.
@@ -307,8 +293,7 @@ fn trace<'a, A: GraphArith>(it: &mut Interp<'a, Symbolic<A>>, chunks: &'a super:
         let room = crate::transpile::graph::Room { cart: cart.clone(), cache: cache.clone() };
         outs = super::split::split_undecided_selects(&mut it.d, outs, points, Some(&room))?;
         // The conditions operators were EVALUATED under are read by the error
-        // derivation; an undecided select there would read a garbage bit.
-        // Three-valued, like the guards (unknown reads as error).
+        // derivation: three-valued, like the guards (unknown reads as error).
         super::split::three_valued_evaluated(&mut it.d, &outs);
     }
     // ERROR, DERIVED once the graph is final (`trace::error`), of everything
@@ -356,10 +341,10 @@ fn trace<'a, A: GraphArith>(it: &mut Interp<'a, Symbolic<A>>, chunks: &'a super:
     Ok(Frame { iface, fork_origins: it.d.fork_origins.clone(), forks: it.d.forks, fork_ways, outs, raise, in_cells, in_rt2 })
 }
 
-/// A finished path of the frame as an outcome: collected, its absent-as-
-/// zero fields written, its transfer roots read, widened (`widen`), its
-/// fields typed and bound to its own engine numbering; its error the
-/// frame's (`global`), where its model ended, and what its widenings owe.
+/// A finished path of the frame as an outcome: its absent-as-zero fields
+/// written, its transfer roots read, widened, its fields typed and bound;
+/// its error the frame's (`global`), where its model ended, and what its
+/// widenings owe.
 fn finish_outcome<A: GraphArith>(
     it: &mut Interp<'_, Symbolic<A>>,
     mut s: State<Symbolic<A>>,
@@ -396,14 +381,12 @@ fn finish_outcome<A: GraphArith>(
     // THE WIDENINGS: before `out_fields` (reads the state), after `gc`.
     let owed = if widen { super::widen::widen(&mut s, &mut it.d)? } else { Vec::new() };
     let (fields, ubool) = out_fields(&s, &it.d)?;
-    // Owed beyond its operators: the frame's, where the model ended
-    // (`State::ended`), and the widenings' of the slots it stores.
+    // Owed beyond its operators: the frame's, where the model ended, and the
+    // widenings'.
     let error = owed
         .iter()
         .filter(|(p, _)| fields.iter().any(|(q, _, _)| q == p))
         .fold(it.d.graph.fold(crate::transpile::graph::Op::Or, vec![global, s.ended]), |e, (_, w)| it.d.graph.fold(crate::transpile::graph::Op::Or, vec![e, *w]));
-    // This outcome's engine numbering; fields and dead cells share one
-    // cell space.
     let rt2 = super::block::skeleton(&s, cart.clone(), cache.clone())?;
     let paths: Vec<Path> =
         fields.iter().map(|(p, _, _)| p.clone()).chain(ubool.iter().cloned()).collect();
@@ -431,8 +414,7 @@ mod tests {
     use crate::trace::cart;
     use crate::transpile::graph::{Graph, Val};
 
-    /// Input cells `cells` (in `Iface` order) as exact values, for
-    /// `Graph::eval`.
+    /// Input cells `cells` (in `Iface` order) as exact values.
     fn exact(cells: &[Conc]) -> std::collections::HashMap<u32, Val> {
         cells.iter().enumerate().map(|(i, c)| (i as u32, match c {
             Conc::Num(n) => Val::exact_num(*n),
@@ -440,7 +422,7 @@ mod tests {
         })).collect()
     }
 
-    /// Test fixture: the six "pm1 key" paths (`has_dashed`, `freeze`, and the
+    /// The six "pm1 key" paths (`has_dashed`, `freeze`, and the
     /// player's `dash_time`, `djump`, `p_dash`, `p_jump`).
     fn pm1_paths(player: &Path) -> Vec<Path> {
         let mut v: Vec<Path> = vec![vec![iface::key("has_dashed")], vec![iface::key("freeze")]];
@@ -492,8 +474,8 @@ mod tests {
     }
 
 
-    /// A body compiled for one pm1 key must REFUSE a state in another: perturb
-    /// one pinned cell and its `Op::Pin` check (`error::pins_hold`) must decline the lane.
+    /// A body compiled for one pm1 key must REFUSE a state in another: a
+    /// perturbed pinned cell's `Op::Pin` check declines the lane.
     #[test]
     fn a_body_pinned_to_a_pm1_key_refuses_any_other_key() {
         let (root, s) = (std::path::Path::new("."), crate::settings::Settings::default());
@@ -610,23 +592,18 @@ mod tests {
         assert!(icy > 0 && dry > 0, "the map has rooms with and without ice");
     }
 
-    /// The native `tile_flag_at` (the cached maps and the scan, which the
-    /// tracer, the kernels and the reference engine all call) answers what
-    /// the CART'S OWN Lua `tile_flag_at` answers - its loop with a
-    /// fractional limit - at every box near the room's edges, outside it
-    /// included, in every room. Until 2026-10-15 the scan truncated the
-    /// limit toward zero and found column 0 (row 0) under a box wholly left
-    /// of (above) the room, where the cart's loop runs no iteration.
+    /// The native `tile_flag_at` (the cached maps and the scan) answers what
+    /// the CART'S OWN Lua `tile_flag_at` answers - its loop with a fractional
+    /// limit - at every box near the room's edges, outside it included, in every
+    /// room (a box wholly left of or above the room scans nothing).
     #[test]
     #[ignore = "slow, ./check.sh t2 runs it: every room's map through the Lua, ~20 CPU-s"]
     fn native_tile_flag_at_answers_the_carts_lua_loop() {
         let (root, s) = (std::path::Path::new("."), crate::settings::Settings::default());
         let chunks = cart::Chunks::parse(root, &s).expect("chunks");
         let keep = full_moon::parse("lua_tile_flag_at = tile_flag_at").expect("parse");
-        // Positions -24..8 and 120..152 on each axis (both edges of the
-        // room and well past them), five boxes: the cached sizes, an odd
-        // one, and the ice map's. Every disagreement is counted, the first
-        // one named.
+        // Positions -24..8 and 120..152 on each axis, five boxes: the cached
+        // sizes, an odd one, and the ice map's.
         let probe = full_moon::parse(
             "
 boxes = { {1, 1, 0}, {6, 5, 0}, {8, 8, 0}, {3, 10, 0}, {6, 5, 4} }

@@ -1,12 +1,10 @@
 //! `transpile::graph::Graph` -> AVX-512 GAS assembly: numeric, interval and
 //! tri-state boolean ops, bit-for-bit `celeste_engine::kernel` (checked by
 //! `super::tests`). Lower to SSA over vregs (GVN), list-schedule,
-//! linear-scan allocate, emit.
-//!
-//! Per arithmetic (`AsmArith`): 16.16 lowers to 16 `i32` lanes a zmm
-//! (this file); the doubles to 8 `f64` lanes (`float`), whose body runs
-//! twice per 16-lane call (`Compiled::halves`). The boolean layer (vector
-//! masks), the scheduler, the allocator and the emitter are shared.
+//! linear-scan allocate, emit. Per arithmetic (`AsmArith`): 16.16 lowers to
+//! 16 `i32` lanes a zmm (this file), the doubles to 8 `f64` lanes (`float`),
+//! whose body runs twice per 16-lane call; the boolean layer, scheduler,
+//! allocator and emitter are shared.
 
 use std::collections::HashMap;
 use std::fmt::Write;
@@ -58,10 +56,10 @@ const _: () = {
     assert!(offset_of!(AsmCtx, ftile_flag) == CTX_FTILE as usize);
     assert!(offset_of!(AsmCtx, ftile_flag_lanes) == CTX_FTILE_LANES as usize);
 };
-const SAVE_BYTES: u32 = 32 * 64; // save all 32 zmm across a call
+const SAVE_BYTES: u32 = 32 * 64; // the save area: a slot per zmm
 const ARGBUF_BYTES: u32 = 8 * 64; // up to 6 SIMD args + a result buffer
 
-/// A call-out op (emitted as a `call` through `AsmCtx`).
+/// A call-out op (a `call` through `AsmCtx`).
 #[derive(Clone, Copy)]
 enum CallOp {
     Div,
@@ -111,7 +109,6 @@ enum Value {
     Ival([NumVal; 2]),
 }
 
-/// A source operand for an emitted instruction.
 #[derive(Clone, Copy)]
 enum Src {
     Reg(Vreg),
@@ -133,7 +130,7 @@ enum ROp {
     AndnD,
 }
 
-/// A source operand's value identity, for GVN.
+/// A source operand's identity, for GVN.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 enum SrcKey {
     Reg(Vreg),
@@ -223,7 +220,7 @@ enum Inst {
     Store { off: u32, src: Src },
     /// Store a vector mask as a 16-bit lane mask (boolean roots).
     StoreMask { off: u32, src: Vreg },
-    // ---- the doubles' (8 `f64` lanes) ----
+    // The doubles' (8 `f64` lanes).
     /// Broadcast a 64-bit constant (`vpbroadcastq`).
     BcastQ { dst: Vreg, val: u64 },
     /// Load an 8-bit lane mask and expand it to a 64-bit vector mask.
@@ -263,7 +260,6 @@ pub enum CellRepr {
 }
 
 impl CellRepr {
-    /// Bytes this input cell occupies in the input buffer.
     fn size(self) -> u32 {
         match self {
             CellRepr::Num | CellRepr::Bool | CellRepr::UBool => 64,
@@ -279,36 +275,27 @@ pub struct Compiled {
     pub input_cells: Vec<u32>,
     /// Byte offset of each input cell (parallel to `input_cells`).
     pub input_offsets: Vec<u32>,
-    /// Repr of each input cell (parallel to `input_cells`).
     pub input_reprs: Vec<CellRepr>,
-    /// Total bytes the input buffer must be.
     pub input_bytes: u32,
-    /// Number of roots.
     pub n_roots: usize,
     /// Root byte offsets: bools first (4 B: `val` u16, `known` at +2), then
     /// numbers (64 B) and intervals (128 B: `lo`, `hi` at +64), 64-aligned.
     pub root_offsets: Vec<u32>,
-    /// Bytes the output buffer must be.
     pub out_bytes: u32,
-    /// Each root's type.
     pub root_kinds: Vec<RootKind>,
     pub sym: String,
     /// Spill slots used (0 = everything fit).
     pub spill_slots: usize,
     /// The stack frame in bytes, for the caller's stack check.
     pub frame_bytes: u32,
-    /// `bench-frame --metrics` only (else empty): per SSA instruction `k`, the
-    /// graph node it was lowered from (a root store: the root) and its kind;
-    /// the text then marks each instruction's lines with a `#@k` line.
+    /// `bench-frame --metrics` only: per SSA instruction `k`, the graph node it
+    /// was lowered from and its kind (the text marks its lines with `#@k`).
     pub prov: Vec<(NodeId, &'static str)>,
-    /// The doubles' kernels: the body computes 8 lanes and runs TWICE per
-    /// call, lanes 8..16 reading `input_bytes` and writing `out_bytes`
-    /// past lanes 0..8 (so the buffers are twice those). A boolean is an
-    /// 8-bit mask per half (`val` at +0, `known` at +2).
+    /// The doubles' kernels: the body computes 8 lanes and runs TWICE per call,
+    /// lanes 8..16 reading and writing past lanes 0..8 (the buffers are twice
+    /// `input_bytes`/`out_bytes`). A boolean is an 8-bit mask per half.
     pub halves: bool,
 }
-
-// ---- constant pool ----
 
 #[derive(Default)]
 struct Pool {
@@ -332,8 +319,7 @@ impl Pool {
     }
 }
 
-// ---- lowering: graph -> Inst stream ----
-
+/// The lowering: graph -> `Inst` stream.
 struct Lower<'a, A: GraphArith> {
     g: &'a Graph<A>,
     vals: Vec<Option<Value>>,
@@ -341,7 +327,7 @@ struct Lower<'a, A: GraphArith> {
     next_vreg: Vreg,
     input_cells: Vec<u32>,
     cell_off: HashMap<u32, u32>,
-    /// Per-cell input repr (absent = `Num`); decides how `Op::Cell` loads.
+    /// Per-cell input repr (absent = `Num`).
     cell_reprs: &'a HashMap<u32, CellRepr>,
     /// GVN: a pure op's `Key` -> the vreg holding its result.
     memo: HashMap<Key, Vreg>,
@@ -354,7 +340,6 @@ impl<A: GraphArith> Lower<'_, A> {
         v
     }
 
-    /// Emit a pure instruction unless a vreg already computes `key`.
     fn pure(&mut self, key: Key, mk: impl FnOnce(Vreg) -> Inst) -> Vreg {
         if let Some(v) = self.memo.get(&key) {
             return *v;
@@ -365,7 +350,6 @@ impl<A: GraphArith> Lower<'_, A> {
         d
     }
 
-    /// A numeric value as a register operand, materializing a constant.
     fn num_reg(&mut self, nv: NumVal) -> Vreg {
         match nv {
             NumVal::Reg(v) => v,
@@ -381,10 +365,9 @@ impl<A: GraphArith> Lower<'_, A> {
         }
     }
 
-    // ---- mask planes (shared: a vector mask is all-ones or zero per
-    // lane, whatever the lane width) ----
+    // Mask planes are shared: a vector mask is all-ones or zero per lane,
+    // whatever the lane width.
 
-    /// A mask plane in a register (constants broadcast).
     fn mask_reg(&mut self, m: MaskVal) -> Vreg {
         match m {
             MaskVal::Reg(v) => v,
@@ -416,13 +399,11 @@ impl<A: GraphArith> Lower<'_, A> {
         self.pure(key, move |d| Inst::RBin { dst: d, op, a, b: Src::Reg(b) })
     }
 
-    /// Bitwise NOT of a mask (`x ^ all-ones`).
     fn not_mask(&mut self, a: Vreg) -> Vreg {
         let key = Key::RBin(6, a, SrcKey::I32(-1));
         self.pure(key, move |d| Inst::RBin { dst: d, op: ROp::XorD, a, b: Src::BI32(-1) })
     }
 
-    /// `dst = LUT_imm(a, b, c)` (`vpternlogd`).
     fn ternlog(&mut self, a: Vreg, b: Vreg, c: Vreg, imm: u8) -> Vreg {
         self.pure(Key::Ternlog(a, b, c, imm), move |d| Inst::Ternlog { dst: d, a, b, c, imm })
     }
@@ -432,16 +413,11 @@ impl<A: GraphArith> Lower<'_, A> {
         self.ternlog(c, t, f, 0xca)
     }
 
-    // ---- mask planes with the bit identities folded ----
-    //
-    // A plane that is a compile-time constant (`MaskVal::Const`: all-ones or
-    // zero in every lane) or the same register on both sides is folded by an
-    // identity that holds BIT FOR BIT in every lane (`x & -1 = x`, `x | -1 =
-    // -1`, `x & 0 = 0`, `x & x = x`, `c ? t : t = t`, ...), so the folded
-    // kernel computes exactly what the unfolded one did; nothing is decided
-    // that was not already a constant.
+    // A mask plane that is a compile-time constant (`MaskVal::Const`) or the
+    // same register on both sides is folded by an identity that holds BIT FOR
+    // BIT in every lane (`x & -1 = x`, `x & x = x`, `c ? t : t = t`, ...), so
+    // the folded kernel computes exactly what the unfolded one did.
 
-    /// `p & q`.
     fn m_and(&mut self, p: MaskVal, q: MaskVal) -> MaskVal {
         match (p, q) {
             (MaskVal::Const(false), _) | (_, MaskVal::Const(false)) => MaskVal::Const(false),
@@ -451,7 +427,6 @@ impl<A: GraphArith> Lower<'_, A> {
         }
     }
 
-    /// `p | q`.
     fn m_or(&mut self, p: MaskVal, q: MaskVal) -> MaskVal {
         match (p, q) {
             (MaskVal::Const(true), _) | (_, MaskVal::Const(true)) => MaskVal::Const(true),
@@ -472,7 +447,6 @@ impl<A: GraphArith> Lower<'_, A> {
         }
     }
 
-    /// `p ^ q`.
     fn m_xor(&mut self, p: MaskVal, q: MaskVal) -> MaskVal {
         match (p, q) {
             (MaskVal::Const(a), MaskVal::Const(b)) => MaskVal::Const(a != b),
@@ -483,7 +457,6 @@ impl<A: GraphArith> Lower<'_, A> {
         }
     }
 
-    /// `~p`.
     fn m_not(&mut self, p: MaskVal) -> MaskVal {
         match p {
             MaskVal::Const(b) => MaskVal::Const(!b),
@@ -618,8 +591,7 @@ impl<A: GraphArith> Lower<'_, A> {
     }
 
     /// The ops every arithmetic lowers alike (the boolean layer, selects,
-    /// interval ends, pass-throughs): their value, or `None` for the
-    /// arithmetic's own lowering.
+    /// interval ends, pass-throughs); `None` for the arithmetic's own.
     fn lower_common(&mut self, id: NodeId) -> Result<Option<Value>> {
         let node = self.g.get(id);
         let a = node.args.clone();
@@ -627,7 +599,7 @@ impl<A: GraphArith> Lower<'_, A> {
             Op::ConstBool(b) => Value::Bool([MaskVal::Const(*b), MaskVal::Const(true)]),
             // Undecided in every lane: the known plane is all zeros.
             Op::UnknownBool(_) => Value::Bool([MaskVal::Const(false), MaskVal::Const(false)]),
-            // `emit::bind` keeps it out of every root's cone.
+            // `trace::lower::bind` keeps it out of every root's cone.
             Op::UnknownNum => bail!("node {}: an unknown number reached the kernel", id),
             Op::Not => {
                 let b = self.as_bool(a[0])?;
@@ -693,8 +665,7 @@ impl<A: GraphArith> Lower<'_, A> {
                 let a1 = self.as_ival(a[1])?;
                 Value::Ival([a0[0], a1[1]])
             }
-            // The operand unchanged: the range is the node's own error
-            // (`trace::error`), checked on the raw operand.
+            // The operand unchanged: the range is the node's own error.
             Op::Restrict(..) => match self.vals[a[0] as usize] {
                 Some(v) => v,
                 None => bail!("node {}: its operand was not lowered", id),
@@ -723,11 +694,8 @@ impl Lower<'_, Fixed> {
 
     /// PICO-8 `x / 2^s` (raw divisor `2^(16+s)`, `0 <= s <= 14`), inline:
     /// `Pico8Num`'s division TRUNCATES toward zero and never saturates for
-    /// these divisors, so it is the arithmetic shift of `x` biased by
-    /// `2^s - 1` where `x` is negative (`(x + ((x >> 31) >>> (32 - s))) >> s`;
-    /// no overflow: the bias is added to negatives only).
-    /// `asm::tests::inline_div_rem_by_a_power_of_two_is_pico8s` checks it
-    /// bit-exact against `Pico8Num` over the whole i32 range.
+    /// these divisors, so it is the arithmetic shift of `x` biased by `2^s - 1`
+    /// where `x` is negative (`(x + ((x >> 31) >>> (32 - s))) >> s`).
     fn div_pow2(&mut self, x: Vreg, s: u8) -> Vreg {
         if s == 0 {
             return x;
@@ -738,8 +706,7 @@ impl Lower<'_, Fixed> {
         self.shrd(biased, s, true)
     }
 
-    /// `s` if `id` is the literal `2^(16+s)` with `0 <= s <= 14` (a divisor
-    /// `div_pow2` takes).
+    /// `s` if `id` is the literal `2^(16+s)`, `0 <= s <= 14` (`div_pow2`'s).
     fn pow2_divisor(&self, id: NodeId) -> Option<u8> {
         match self.g.get(id).op {
             Op::Const(lo, hi) if lo == hi && lo > 0 && (lo as u32).is_power_of_two() => {
@@ -776,12 +743,11 @@ impl Lower<'_, Fixed> {
         self.blend_imm(0xaaaa, ev, od)
     }
 
-    /// Signed 32-bit compare to a vector mask.
     fn cmp(&mut self, imm: u8, a: Vreg, b: Src) -> Vreg {
         self.pure(Key::Cmp(imm, a, b.key()), move |d| Inst::Cmp { dst: d, imm, a, b })
     }
 
-    // ---- interval layer (ZI as two i32 planes) ----
+    // The interval layer: a ZI is two i32 planes.
 
     /// A 32-bit-lane binary op with a broadcast CONSTANT second operand.
     fn dbin_c(&mut self, op: ROp, a: Vreg, c: i32) -> Vreg {
@@ -818,8 +784,8 @@ impl Lower<'_, Fixed> {
         self.cmp(0, a, Src::Reg(b))
     }
 
-    /// Interval `+`. An overflowing endpoint WRAPS to garbage, so the op has
-    /// its own error (`Op::NoWrap`): the lane declines where it is read.
+    /// Interval `+`. An overflowing endpoint WRAPS to garbage: the op's own
+    /// error (`Op::NoWrap`).
     fn zi_add(&mut self, a: [Vreg; 2], b: [Vreg; 2]) -> [Vreg; 2] {
         [self.dbin(ROp::AddD, a[0], b[0]), self.dbin(ROp::AddD, a[1], b[1])]
     }
@@ -851,17 +817,15 @@ impl Lower<'_, Fixed> {
     fn zi_max(&mut self, a: [Vreg; 2], b: [Vreg; 2]) -> [Vreg; 2] {
         [self.dbin(ROp::MaxSD, a[0], b[0]), self.dbin(ROp::MaxSD, a[1], b[1])]
     }
-    /// Interval negation; `-MIN` wraps (checked by `zi_neg_no_wrap`).
+    /// Interval negation; `-MIN` wraps (its `NoWrap`: `one_operand_no_wrap`).
     fn zi_neg(&mut self, a: [Vreg; 2]) -> [Vreg; 2] {
         let lo = self.neg(a[1]);
         let hi = self.neg(a[0]);
         [lo, hi]
     }
     /// `Op::NoWrap` of an operation with ONE operand not a literal point
-    /// (`graph::one_operand`), whose low and high ends are `a` (a point's
-    /// twice): it fits iff `lo >= fits.0` and `hi <= fits.1` (the
-    /// `kernel::*_wraps` masks). A side every value fits is no compare (a
-    /// negation's high end, `x + k`'s low end for `k >= 0`, ...).
+    /// (`graph::one_operand`), whose ends are `a`: it fits iff `lo >= fits.0`
+    /// and `hi <= fits.1`. A side every value fits is no compare.
     fn one_operand_no_wrap(&mut self, a: [Vreg; 2], fits: (i32, i32)) -> MaskVal {
         let lo = if fits.0 == i32::MIN {
             MaskVal::Const(true)
@@ -899,11 +863,9 @@ impl Lower<'_, Fixed> {
         self.mask_eq(fl, fh)
     }
     /// `zi_span_ok(a, ways)`: does it span at most `ways` floors? The grid
-    /// arithmetic here and in `zi_fork_flr` wraps only for a lane whose low
-    /// end lies in the top `ways - 1` floors, where `fl + (ways - 1) * step`
-    /// wraps to the bottom and this is false: the fork's own error
-    /// (`trace::error`, charged where a fork's operand is an interval, as
-    /// every fork's is), so no such lane emits.
+    /// arithmetic here and in `zi_fork_flr` wraps only for a lane whose low end
+    /// lies in the top `ways - 1` floors, where this is false: the fork's own
+    /// error, so no such lane emits.
     fn zi_span_ok(&mut self, a: [Vreg; 2], ways: u8) -> Vreg {
         let step = 1i32 << 16;
         let fl = self.flr(a[0]);
@@ -1028,7 +990,6 @@ impl Lower<'_, Fixed> {
                     _ => unreachable!(),
                 };
                 let commutes = matches!(op, Op::Add | Op::Min | Op::Max);
-                // Ensure the first operand is a register.
                 let (areg, bsrc) = match (x, commutes) {
                     (NumVal::Reg(_), _) => (self.num_reg(x), self.num_src(y)),
                     (NumVal::ConstI32(_), true) if matches!(y, NumVal::Reg(_)) => {
@@ -1041,9 +1002,8 @@ impl Lower<'_, Fixed> {
                 Value::Num(NumVal::Reg(dst))
             }
             Op::Mul => {
-                // Interval * positive constant: scale each endpoint. An
-                // overflow wraps; it is the op's own error (`Op::NoWrap`,
-                // `zi_scaled_no_wrap`), so the lane declines where it is read.
+                // Interval * positive constant: scale each endpoint; an overflow wraps,
+                // the op's own error (`Op::NoWrap`).
                 if self.dom(a[0]) == 2 || self.dom(a[1]) == 2 {
                     let (ivn, scn) = if self.dom(a[0]) == 2 { (a[0], a[1]) } else { (a[1], a[0]) };
                     if self.dom(scn) == 2 {
@@ -1070,11 +1030,10 @@ impl Lower<'_, Fixed> {
                     Value::Num(NumVal::Reg(self.zn_mul(xr, yr)))
                 }
             }
-            // Interval / positive constant: divide each endpoint (before the
-            // scalar `Op::Div` arm, which reads `as_num`). The scalar `/`
-            // saturates where the interval one has no answer: the op's own
-            // error, as `Mul`. A power-of-two divisor (`div_pow2`) is at
-            // least 1, so it never does: its `NoWrap` folds to true.
+            // Interval / positive constant: each endpoint (before the scalar `Div`
+            // arm, which reads `as_num`). The scalar `/` saturates where the interval
+            // one has no answer: the op's own error, as `Mul`. A power-of-two divisor
+            // is at least 1, so its `NoWrap` folds to true.
             Op::Div if self.dom(a[0]) == 2 => {
                 if self.pos_const_scalar(a[1]).is_none() {
                     bail!(
@@ -1258,16 +1217,13 @@ impl Lower<'_, Fixed> {
                 Value::Bool([MaskVal::Reg(ok), MaskVal::Const(true)])
             }
             // The own error of `+ - * /`, negation and `abs`, on points and
-            // intervals (`trace::error`): did the exact result leave the
-            // 16.16 range on this lane? Anything else fits (as
-            // `Graph::fold`).
+            // intervals: did the exact result leave the 16.16 range on this lane?
             Op::NoWrap => {
                 let x = a[0];
                 let xn = self.g.get(x);
                 let ok = match (graph::one_operand(self.g, x), &xn.op) {
                     (_, op) if !matches!(op, Op::Add | Op::Sub | Op::Neg | Op::Abs | Op::Mul | Op::Div) => MaskVal::Const(true),
-                    // Nothing fits (`x / 0`): `Graph::fold` decides it, and
-                    // this is the same constant.
+                    // Nothing fits (`x / 0`): `Graph::fold` decides it alike.
                     (Some(graph::OneOperand { fits: None, .. }), _) => MaskVal::Const(false),
                     (Some(graph::OneOperand { operand, fits: Some(fits) }), _) => {
                         let ends = self.as_ival(xn.args[operand])?;
@@ -1413,15 +1369,12 @@ fn schedule<A: GraphArith>(g: &Graph<A>, live: &[bool], roots: &[NodeId], batch:
     order
 }
 
-// ---- register allocation: linear scan ----
-
 #[derive(Clone, Copy)]
 enum Loc {
     Reg(u8),
     Spill(u32),
 }
 
-/// Operand vregs used by an instruction (for liveness).
 fn inst_uses(inst: &Inst, out: &mut Vec<Vreg>) {
     let push_src = |s: &Src, out: &mut Vec<Vreg>| {
         if let Src::Reg(v) = s {
@@ -1677,7 +1630,6 @@ fn allocate(insts: &[Inst], n_vregs: Vreg, remat: &[bool]) -> (Vec<Loc>, usize) 
 
     for cur in 0..ivs.len() {
         let (vreg, start, _end) = ivs[cur];
-        // Expire.
         active.retain(|&ai| {
             if ivs[ai].2 < start {
                 if let Loc::Reg(r) = home[ivs[ai].0 as usize] {
@@ -1703,7 +1655,6 @@ fn allocate(insts: &[Inst], n_vregs: Vreg, remat: &[bool]) -> (Vec<Loc>, usize) 
             // Spill the interval that ends latest (current or an active).
             let spill_ai = *active.last().unwrap();
             if ivs[spill_ai].2 > ivs[cur].2 {
-                // Steal its register.
                 let stolen = match home[ivs[spill_ai].0 as usize] {
                     Loc::Reg(r) => r,
                     _ => unreachable!(),
@@ -1722,15 +1673,11 @@ fn allocate(insts: &[Inst], n_vregs: Vreg, remat: &[bool]) -> (Vec<Loc>, usize) 
 }
 
 /// Per call (by instruction index), which registers to SAVE before it and
-/// RESTORE after it. Live across a call: a register holding a value defined
-/// before it and read after it (a vreg keeps one home for its whole interval,
-/// `allocate` never splits; a call's operands are marshalled before it, its
-/// result written after). A value live across two CONSECUTIVE calls and not
-/// read between them (nor as the second's operand) stays in the save area:
-/// not restored after the first, not saved again before the second. Its
+/// RESTORE after it: those holding a value defined before it and read after
+/// it (a vreg keeps one home for its whole interval). A value live across two
+/// CONSECUTIVE calls and not read between them stays in the save area: its
 /// register holds nothing anyone reads in between (no other vreg has it
-/// while this one is live), and its save slot (one per register) is written
-/// by no other save meanwhile.
+/// while this one is live), and its save slot is written by no other save.
 fn call_saves(insts: &[Inst], n_vregs: Vreg, home: &[Loc]) -> HashMap<usize, (u32, u32)> {
     let calls: Vec<u32> = (0..insts.len() as u32).filter(|&i| matches!(insts[i as usize], Inst::Call { .. })).collect();
     let mut live = vec![0u32; calls.len()];
@@ -1777,14 +1724,13 @@ fn call_saves(insts: &[Inst], n_vregs: Vreg, home: &[Loc]) -> HashMap<usize, (u3
         .collect()
 }
 
-// ---- emission ----
-
+/// The emission: the `Inst` stream as GAS text.
 struct Emitter<'a> {
     home: &'a [Loc],
     insts: &'a [Inst],
     remat: &'a [bool],
     def_of: &'a [u32],
-    /// rsp offset of the 32-zmm save area used around a call.
+    /// rsp offset of the save area used around a call.
     save_off: u32,
     /// Per instruction index of a call: the registers (bit r for zmm r) to
     /// save before it and to restore after it (`call_saves`).
@@ -2015,10 +1961,8 @@ impl<'a> Emitter<'a> {
                     writeln!(self.out, "    vmovdqu64 %zmm{}, {}(%rsp)", r, off).unwrap();
                 }
                 let resbuf = self.argbuf_off + 7 * 64;
-                // 2. save the registers live across the call and not still
-                // saved from the call before (it clobbers every vector
-                // register; the scratches hold nothing across an
-                // instruction, `ZERO` is re-zeroed below).
+                // 2. save the registers live across the call and not still saved from
+                // the call before (it clobbers every vector register).
                 let (saves, restores) = self.call_saves[&k];
                 for r in (0..32u32).filter(|r| saves & (1 << r) != 0) {
                     writeln!(self.out, "    vmovdqu64 %zmm{}, {}(%rsp)", r, self.save_off + r * 64)
@@ -2203,10 +2147,9 @@ impl<'a> Emitter<'a> {
 }
 
 /// Drop stack reloads into a register that already holds that slot, and
-/// constant materializations (`Emitter::constant`) into a register that
-/// already holds that constant. A register holds a slot from its
-/// reload/spill, a constant from its materialization, until written (last
-/// AT&T operand); a spill stales other holders of its slot; any other stack
+/// constant materializations into a register that already holds that
+/// constant. A register holds a slot or constant until written (last AT&T
+/// operand); a spill stales other holders of its slot; any other stack
 /// access, label, jump, call, ret or `vzeroupper` forgets everything.
 fn drop_redundant_reloads(body: &str) -> String {
     let reg = |s: &str| -> Option<usize> {
@@ -2300,7 +2243,6 @@ impl AsmArith for Float {
     }
 }
 
-/// Compile `roots` of `g` into AVX-512 assembly, with the buffer layouts.
 pub fn compile<A: AsmArith>(
     g: &Graph<A>,
     roots: &[NodeId],
@@ -2312,7 +2254,7 @@ pub fn compile<A: AsmArith>(
 }
 
 /// `compile` with the arithmetic's lowering (`lower`, one node) and lane
-/// layout (`halves`: 8 lanes a body, run twice; `Compiled::halves`).
+/// layout (`halves`).
 fn compile_with<A: GraphArith>(
     g: &Graph<A>,
     roots: &[NodeId],
@@ -2324,7 +2266,6 @@ fn compile_with<A: GraphArith>(
 ) -> Result<Compiled> {
     let live = g.reachable(roots);
 
-    // Assign input offsets to reachable cells, ascending by cell id.
     let mut cells: Vec<u32> = (0..g.len() as NodeId)
         .filter(|id| live[*id as usize])
         .filter_map(|id| match g.get(id).op {
@@ -2457,8 +2398,7 @@ fn compile_with<A: GraphArith>(
     for (i, inst) in lo.insts.iter().enumerate() {
         if let Some(d) = inst_def(inst) {
             def_of[d as usize] = i as u32;
-            // A load (reads `%r13`) and a constant are rematerializable;
-            // nothing else is.
+            // A load and a constant are rematerializable.
             remat[d as usize] = matches!(inst, Inst::Load { .. } | Inst::BcastD { .. } | Inst::BcastQ { .. });
         }
     }
@@ -2553,7 +2493,6 @@ fn compile_with<A: GraphArith>(
     writeln!(asm, "    vzeroupper").unwrap();
     writeln!(asm, "    ret").unwrap();
 
-    // Constant pool.
     writeln!(asm, ".section .rodata").unwrap();
     writeln!(asm, ".align 64").unwrap();
     for (i, v) in em.pool.d.iter().enumerate() {

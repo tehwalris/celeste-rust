@@ -1,20 +1,19 @@
-//! EXACT KEYS (plans/architecture.md, "Keys"): a state's identity within its shape is
-//! the PACKED tuple of its fields' dictionary indices, not a hash.
+//! EXACT KEYS (plans/architecture.md, "Keys"): a state's identity within its
+//! shape is the PACKED tuple of its fields' dictionary indices, not a hash.
 //!
 //!   * `Code`       - a value's exact code (a number and `[n, n]` alike; a
 //!                    position coordinate less its low end's whole pixels)
 //!   * `FieldDict`  - per (shape, cell): code <-> index, append-only, and the
 //!                    field's BIT RUNS in the shape's 127-bit key
-//!   * `KeySpace`   - a tree's dictionaries: keys rows, grows only through
-//!                    recorded `KeyAdditions` (sorted per frame: canonical)
+//!   * `KeySpace`   - a tree's dictionaries, grown only through recorded
+//!                    `KeyAdditions` (sorted per frame: canonical)
 //!   * `Provisional`- a wave's interned keys of states holding a code no
-//!                    dictionary has yet (they are new by construction)
+//!                    dictionary has yet (new by construction)
 //!   * `ExactRow`   - a whole state's canonical bytes (the concrete search's
 //!                    dedup, independent of any tree)
 //!
 //! Bits once given to a field never move and an old index is zero in a
 //! field's later bits, so a key never changes as the dictionaries grow.
-//! Hashing remains only as a slot function (`slot_hash`), equality exact.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
@@ -28,10 +27,8 @@ use crate::runtime2::{mix64, BoundaryIds, Cell2, Rt2, AV, P8, POS_WHOLE};
 /// A packed key: (bits 64..127, bits 0..63). Bit 127 tags a PROVISIONAL key.
 pub type Key = (u64, u64);
 
-/// Bits a shape's packed key may use (bit 127 is the provisional tag).
 pub const KEY_BITS: u32 = 127;
 
-/// The provisional tag, in `Key::0`.
 pub const PROVISIONAL: u64 = 1 << 63;
 
 /// No index (a code not in the dictionary).
@@ -100,13 +97,11 @@ fn small<N: EngineNum>(r: N::Raw) -> u32 {
 }
 
 impl<N: EngineNum> Code<N> {
-    /// The number or interval with raw bounds `lo`, `hi`.
     #[inline]
     pub const fn num(lo: N::Raw, hi: N::Raw) -> Code<N> {
         Code { kind: K_NUM, a: lo, b: hi }
     }
 
-    /// A kind and its `u32`.
     #[inline]
     fn other(kind: u8, a: u32) -> Code<N> {
         Code { kind, a: a.into(), b: 0.into() }
@@ -121,7 +116,6 @@ impl<N: EngineNum> Code<N> {
         }
     }
 
-    /// A value's code.
     pub fn of(v: AV<N>) -> Code<N> {
         match v {
             AV::Num(n) => Code::num(n.raw(), n.raw()),
@@ -155,7 +149,7 @@ impl<N: EngineNum> Code<N> {
         N::word(self.a, self.b)
     }
 
-    /// The value (position codes decode to their fraction).
+    /// The value (a position code decodes to its fraction).
     pub fn value(self) -> AV<N> {
         let num = |r: N::Raw| N::from_raw(r).expect("a number code's raw is a number");
         match self.kind {
@@ -194,17 +188,14 @@ fn bits_for(n: usize) -> u32 {
 /// One field's dictionary and its bits in the shape's key.
 #[derive(Clone, Debug)]
 pub struct FieldDict<N: EngineNum = P8> {
-    /// Index -> code.
     codes: Vec<Code<N>>,
     /// Numbers: an open-addressing table, each slot holding its index's
     /// PLACED bits (`place`, kept current as runs are added).
     num_slots: Vec<NumSlot<N>>,
-    /// Numbers held.
     nums: usize,
     /// While `nums <= SMALL`: the numbers' words and placed bits, searched
     /// linearly (most fields hold a handful of codes).
     small: [(N::Word, u128); SMALL],
-    /// Every other code, by search.
     others: Vec<(Code<N>, u32)>,
     /// `Bool(false)`, `Bool(true)`, `UBool`'s indices (`NONE`: absent) and
     /// placed bits.
@@ -279,7 +270,6 @@ impl<N: EngineNum> FieldDict<N> {
         }
     }
 
-    /// A number's index (`NONE`: absent).
     #[inline]
     pub fn find_num(&self, word: N::Word) -> u32 {
         self.num_slot(word).map_or(NONE, |s| s.idx1 - 1)
@@ -307,7 +297,6 @@ impl<N: EngineNum> FieldDict<N> {
         (self.bools[tri] != NONE).then_some(self.bool_placed[tri])
     }
 
-    /// Any code's index (`NONE`: absent).
     pub fn find(&self, c: Code<N>) -> u32 {
         match c.kind {
             K_NUM => self.find_num(c.word()),
@@ -323,7 +312,6 @@ impl<N: EngineNum> FieldDict<N> {
         self.bits
     }
 
-    /// The index key `k` holds in this field (`place` inverted).
     #[inline]
     pub fn index_in(&self, k: Key) -> u32 {
         if let [(pos, len)] = self.runs[..] {
@@ -338,7 +326,6 @@ impl<N: EngineNum> FieldDict<N> {
         idx as u32
     }
 
-    /// Index `idx` placed in the key's bits.
     #[inline]
     pub fn place(&self, idx: u32) -> u128 {
         match self.runs.len() {
@@ -355,7 +342,6 @@ impl<N: EngineNum> FieldDict<N> {
         }
     }
 
-    /// Append `c` as the next index (absent: checked by the caller).
     fn push(&mut self, c: Code<N>) {
         let idx = self.codes.len() as u32;
         self.codes.push(c);
@@ -465,7 +451,6 @@ pub struct ShapeRecord {
 }
 
 impl ShapeRecord {
-    /// The record of a CANONICAL block's shape.
     pub fn of<N: EngineNum>(rt2: &Rt2<N>, ids: &BoundaryIds) -> ShapeRecord {
         ShapeRecord { hash: rt2.shape_hash, sig: shape_sig(rt2), pos: rt2.position_cells(ids) }
     }
@@ -500,29 +485,24 @@ impl<N: EngineNum> ShapeKeys<N> {
         ShapeKeys { record, fields, next_bit: 0 }
     }
 
-    /// Cell `cell`'s dictionary (a value cell).
     #[inline]
     pub fn field(&self, cell: usize) -> Option<&FieldDict<N>> {
         self.fields.get(cell).and_then(|f| f.as_ref())
     }
 
-    /// Is `cell` a position coordinate?
     #[inline]
     pub fn is_pos(&self, cell: u32) -> bool {
         self.record.pos.is_some_and(|(x, y)| cell == x || cell == y)
     }
 
-    /// The key bits used.
     pub fn bits(&self) -> u32 {
         self.next_bit
     }
 
-    /// The value cells, in order.
     pub fn value_cells(&self) -> impl Iterator<Item = u32> + '_ {
         self.fields.iter().enumerate().filter(|(_, f)| f.is_some()).map(|(c, _)| c as u32)
     }
 
-    /// The code of cell `cell` at `lane` of a block of this shape.
     #[inline]
     fn code_at(&self, rt2: &Rt2<N>, cell: u32, lane: usize) -> Code<N> {
         let v = rt2.cols[cell as usize].at(lane);
@@ -547,7 +527,7 @@ impl<N: EngineNum> ShapeKeys<N> {
         Some(to_key(k))
     }
 
-    /// The fields' codes of a key (the inverse of the packing).
+    /// The fields' codes of a key (the packing inverted).
     pub fn decode(&self, k: Key) -> Vec<(u32, Code<N>)> {
         let mut out = Vec::new();
         for (c, f) in self.fields.iter().enumerate() {
@@ -558,11 +538,9 @@ impl<N: EngineNum> ShapeKeys<N> {
     }
 }
 
-/// FINGERPRINTS over exact CONTENT: a key's decoded codes, hashed - so
-/// two trees whose dictionaries grew in different orders (a raise appends
-/// its codes after later frames') fingerprint the same states alike. Per
-/// shape the fields without bits hashed once, and per field with bits a
-/// hash per index.
+/// FINGERPRINTS over exact CONTENT: a key's decoded codes, hashed - so two
+/// trees whose dictionaries grew in different orders (a raise appends its
+/// codes after later frames') fingerprint the same states alike.
 pub struct ContentHash {
     shapes: FxHashMap<u64, (u64, Vec<(Vec<(u8, u8)>, Vec<u64>)>)>,
 }
@@ -573,7 +551,6 @@ impl ContentHash {
         mix64(mix64((cell as u64) << 8 | c.kind as u64) ^ N::fold(c.word()))
     }
 
-    /// The content hash of `shape`'s key `k` (a key the space holds).
     pub fn key(&self, shape: u64, k: Key) -> u64 {
         let (fixed, fields) = self.shapes.get(&shape).unwrap_or_else(|| panic!("exact keys: fingerprinting a key of the unknown shape {shape:#x}"));
         let k = of_key(k);
@@ -589,7 +566,6 @@ impl ContentHash {
         mix64(shape ^ acc)
     }
 
-    /// The content hash of a state `(shape, key, cell)`.
     #[inline]
     pub fn state(&self, shape: u64, k: Key, cell: u32) -> u64 {
         mix64(self.key(shape, k) ^ (cell as u64) << 1)
@@ -647,11 +623,9 @@ impl<N: EngineNum> KeyAdditions<N> {
 /// Unique generations across every key space of the process.
 static GEN: AtomicU64 = AtomicU64::new(1);
 
-/// A tree's dictionaries (module doc).
 #[derive(Clone, Debug)]
 pub struct KeySpace<N: EngineNum = P8> {
     shapes: FxHashMap<u64, ShapeKeys<N>>,
-    /// Per field its run count (the next run's number), for the records.
     run_counts: FxHashMap<(u64, u32), u32>,
     gen: u64,
 }
@@ -692,12 +666,10 @@ impl<N: EngineNum> KeySpace<N> {
         self.shapes.values()
     }
 
-    /// The widest shape's key bits.
     pub fn max_bits(&self) -> u32 {
         self.shapes.values().map(|s| s.next_bit).max().unwrap_or(0)
     }
 
-    /// Codes held, over every field.
     pub fn codes(&self) -> usize {
         self.shapes.values().flat_map(|s| s.fields.iter().flatten()).map(|f| f.len()).sum()
     }
@@ -793,7 +765,6 @@ impl<N: EngineNum> KeySpace<N> {
         Ok(())
     }
 
-    /// The content hasher of the space as it is.
     pub fn content_hash(&self) -> ContentHash {
         let shapes = self
             .shapes
@@ -839,16 +810,15 @@ impl<N: EngineNum> KeySpace<N> {
         out
     }
 
-    /// A key space from additions.
     pub fn from_additions(adds: KeyAdditions<N>) -> anyhow::Result<KeySpace<N>> {
         let mut k = KeySpace::new();
         k.apply(adds)?;
         Ok(k)
     }
 
-    /// Every row's key of a CANONICAL block (ids canonical, `shape_hash`
-    /// set): packed where every code is in the dictionaries, else its exact
-    /// content. A block whose shape is known must have its signature.
+    /// Every row's key of a CANONICAL block: packed where every code is in the
+    /// dictionaries, else its exact content. A block whose shape is known must
+    /// have its signature.
     pub fn row_keys(&self, rt2: &Rt2<N>, ids: &BoundaryIds) -> Vec<RowKey<N>> {
         let Some(s) = self.shapes.get(&rt2.shape_hash) else {
             // An unknown shape: every field is missing.
@@ -917,7 +887,6 @@ impl<N: EngineNum> KeySpace<N> {
         adds
     }
 
-    /// The final key of a miss, once its codes are in.
     pub fn complete(&self, m: &MissKey<N>) -> Key {
         let s = self.shapes.get(&m.shape).unwrap_or_else(|| panic!("exact keys: completing a key of the unknown shape {:#x}", m.shape));
         let rest = s.key_of_codes(&m.missing).unwrap_or_else(|| panic!("exact keys: completing a key whose codes are not all in"));
@@ -925,7 +894,6 @@ impl<N: EngineNum> KeySpace<N> {
     }
 }
 
-/// Shards of `Provisional`.
 const PROV_SHARDS: usize = 256;
 
 /// A wave's PROVISIONAL keys: each distinct miss content interned to
@@ -933,7 +901,6 @@ const PROV_SHARDS: usize = 256;
 /// depend on scheduling; the translation turns them into final keys.
 pub struct Provisional<N: EngineNum = P8> {
     shards: Vec<Mutex<(FxHashMap<MissKey<N>, u32>, Vec<MissKey<N>>)>>,
-    /// The shapes the key space lacks that misses were made of.
     shapes: Mutex<FxHashMap<u64, ShapeRecord>>,
 }
 
@@ -955,12 +922,10 @@ impl<N: EngineNum> Provisional<N> {
         }
     }
 
-    /// A noted shape's record.
     pub fn shape_record(&self, hash: u64) -> Option<ShapeRecord> {
         self.shapes.lock().expect("the provisional shapes").get(&hash).cloned()
     }
 
-    /// The provisional key of `m`.
     pub fn intern(&self, m: MissKey<N>) -> Key {
         use std::hash::{BuildHasher, Hash, Hasher};
         let mut h = rustc_hash::FxBuildHasher.build_hasher();
@@ -980,7 +945,6 @@ impl<N: EngineNum> Provisional<N> {
         (PROVISIONAL | shard as u64, n as u64)
     }
 
-    /// A provisional key's content.
     pub fn content(&self, k: Key) -> MissKey<N> {
         debug_assert!(is_provisional(k));
         let g = self.shards[(k.0 & !PROVISIONAL) as usize].lock().expect("a provisional shard");
@@ -997,7 +961,6 @@ pub type ExactRow = Box<[u8]>;
 /// one name is FATAL).
 static SIGS: std::sync::OnceLock<Mutex<FxHashMap<u64, std::sync::Arc<Vec<u32>>>>> = std::sync::OnceLock::new();
 
-/// Every row's `ExactRow` of a CANONICAL block.
 pub fn exact_rows<N: EngineNum>(rt2: &Rt2<N>, ids: &BoundaryIds) -> Vec<ExactRow> {
     let sig = shape_sig(rt2);
     {
@@ -1108,8 +1071,7 @@ mod tests {
         assert_ne!(Code::<P8>::of(AV::Bool(false)), Code::of(AV::UBool));
     }
 
-    /// A number and its point interval are one code; a wider interval is
-    /// neither end.
+    /// A wider interval is neither end's code.
     #[test]
     fn a_point_interval_codes_as_its_number() {
         use celeste_core::pico8_num::Pico8Num as P8;

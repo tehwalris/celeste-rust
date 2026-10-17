@@ -1,11 +1,10 @@
 //! The WIDENING TABLE (`celeste_engine::widening::TABLE`) in the traced
 //! graph: at the frame's end every entry of the tracer's level becomes graph
-//! ops writing what the entry stores, with the containment it owes as the
-//! widening's own per-lane error (`SlotErrors`); at the frame's start
-//! (`read_inputs`) every entry's slots are read as its `Input` says. The
-//! block side (`Rt2::widen_to`) interprets the same table; nothing here may
-//! widen what the table does not name. The two hooks (`Hook::NearFloor`,
-//! `Hook::PlatformInputs`) are implemented below.
+//! ops writing what it stores, the containment it owes being the widening's
+//! own per-lane error (`SlotErrors`); at the frame's start (`read_inputs`)
+//! every entry's slots are read as its `Input` says. The block side
+//! (`Rt2::widen_to`) interprets the same table; nothing here may widen what
+//! the table does not name.
 
 use anyhow::{anyhow, bail, Result};
 
@@ -69,8 +68,8 @@ pub(crate) fn field(base: &Path, names: &[&str]) -> Path {
     p
 }
 
-/// Entry `e`'s slots in `st`: per instance (one for `Target::Globals`), the
-/// path of each slot, in the entry's slot order.
+/// Entry `e`'s slots in `st`: per instance, the path of each slot in the
+/// entry's slot order.
 pub fn entry_paths<D: Domain>(st: &State<D>, e: &Entry) -> Vec<Vec<Path>> {
     let bases = match e.target {
         Target::Objects(ty) => objects_of_type(st, ty),
@@ -133,7 +132,6 @@ fn ival<A: GraphArith>(d: &mut Symbolic<A>, lo: i32, hi: i32) -> NodeId {
     d.graph.leaf(Op::Const(A::lit(lo), A::lit(hi)))
 }
 
-/// The interval between two table constants (raw 16.16), ends included.
 fn ival_of<A: GraphArith>(d: &mut Symbolic<A>, lo: i32, hi: i32) -> NodeId {
     let (lo, hi) = (A::lit(constant::<A::Num>(lo)), A::lit(constant::<A::Num>(hi)));
     d.graph.leaf(Op::Const(lo, hi))
@@ -143,7 +141,6 @@ fn ival_of<A: GraphArith>(d: &mut Symbolic<A>, lo: i32, hi: i32) -> NodeId {
 /// replaced value was inside what it wrote; a lane where one fails declines.
 pub type SlotErrors = Vec<(Path, NodeId)>;
 
-/// The widening of `p` is defined only where `holds`.
 fn owe<A: GraphArith>(errs: &mut SlotErrors, d: &mut Symbolic<A>, p: &Path, holds: NodeId) {
     let e = d.not(&holds);
     errs.push((p.clone(), e));
@@ -169,7 +166,6 @@ pub fn widen<A: GraphArith>(st: &mut State<Symbolic<A>>, d: &mut Symbolic<A>) ->
     Ok(errs)
 }
 
-/// One entry's slots, per instance, as stored (`Stored`).
 fn widen_entry<A: GraphArith>(st: &mut State<Symbolic<A>>, d: &mut Symbolic<A>, e: &Entry, errs: &mut SlotErrors) -> Result<()> {
     for paths in entry_paths(st, e) {
         // Per slot so far: its value before the widening, and what it owed.
@@ -264,7 +260,6 @@ fn widen_entry<A: GraphArith>(st: &mut State<Symbolic<A>>, d: &mut Symbolic<A>, 
     Ok(())
 }
 
-/// `lo <= Lo(v) and Hi(v) <= hi`, per lane.
 fn bounds_inside<A: GraphArith>(d: &mut Symbolic<A>, v: NodeId, lo: A::Num, hi: A::Num) -> NodeId {
     let (lo, hi) = (A::lit(lo), A::lit(hi));
     let (klo, khi) = (d.graph.leaf(Op::Const(lo, lo)), d.graph.leaf(Op::Const(hi, hi)));
@@ -284,10 +279,9 @@ fn contain<A: GraphArith>(d: &mut Symbolic<A>, v: NodeId, (lo, hi): (A::Num, A::
 }
 
 /// The INPUT side: every entry of the tracer's level read as its slots'
-/// `Input` says, in table order, before the frame reads anything; a
-/// `Literal` is pinned to its range (`Op::Pin`). Returned: what the
-/// platforms' hook owes per lane beyond its pins (the no-player speed), which
-/// the caller makes an error of the whole frame.
+/// `Input` says, in table order, before the frame reads anything. Returned:
+/// what the platforms' hook owes per lane beyond its pins (the no-player
+/// speed), which the caller makes an error of the whole frame.
 pub fn read_inputs<A: GraphArith>(st: &mut State<Symbolic<A>>, d: &mut Symbolic<A>) -> Result<Vec<NodeId>> {
     let mut obligations = Vec::new();
     let mid = mid_frame(st);
@@ -303,7 +297,6 @@ pub fn read_inputs<A: GraphArith>(st: &mut State<Symbolic<A>>, d: &mut Symbolic<
     for e in d.level.entries() {
         match e.hook {
             Some(Hook::NearFloor) => read_near_floors(st, d, e, mid)?,
-            // One hook for both platform entries: once.
             Some(Hook::PlatformInputs) => {
                 if !std::mem::replace(&mut platforms_read, true) {
                     obligations.extend(platform_inputs(st, d)?);
@@ -331,7 +324,6 @@ fn pin_literal<A: GraphArith>(d: &mut Symbolic<A>, v: NodeId, lo: i32, hi: i32) 
     }
 }
 
-/// One slot's input (`Input`).
 fn read_slot<A: GraphArith>(st: &mut State<Symbolic<A>>, d: &mut Symbolic<A>, e: &Entry, s: &Slot, p: &Path) -> Result<()> {
     let what = |kind: &str| anyhow::anyhow!("{}: not a {kind} (widening {:?})", iface::show(p), e.name);
     let new = match (s.input, iface::get(st, p)) {
@@ -366,8 +358,7 @@ fn position<A: GraphArith>(st: &State<Symbolic<A>>, d: &Symbolic<A>, obj: &Path)
 }
 
 /// The slots a hook stores as an interval on some lanes and exact on others
-/// (a near floor's `state`): an interval column in every outcome (the
-/// column type is per shape).
+/// (a near floor's `state`): an interval column in every outcome.
 pub fn near_floor_states<A: GraphArith>(st: &State<Symbolic<A>>, level: Level) -> Vec<Path> {
     level.entries().filter(|e| e.hook == Some(Hook::NearFloor)).flat_map(|e| entry_paths(st, e)).map(|paths| paths[0].clone()).collect()
 }
@@ -412,11 +403,12 @@ pub const PLAYER_PROBE: [(i16, i16); 2] = [(-3, 3), (-1, 0)];
 /// countdowns are widened regardless (unread while inside). An overlapped
 /// floor stores the CART'S INVARIANT (hidden: `state` 2, `collideable`
 /// false, the player cannot be inside a solid floor), with the computed
-/// value owed; storing the computed value makes the split resolve every
-/// floor the player MIGHT overlap (30x the outcomes) - except with the
-/// platforms unknown, where it stores the computed value (below). Mid split frame (`mid`), `collideable` also stays computed in the
-/// `PLAYER_PROBE` window: widening there would let the second step reach
-/// states the unsplit frame does not. `Rt2::widen_to` agrees.
+/// value owed (storing the computed value makes the split resolve every
+/// floor the player MIGHT overlap: 30x the outcomes); with the platforms
+/// unknown, the computed value (below). Mid split frame (`mid`),
+/// `collideable` also stays computed in the `PLAYER_PROBE` window: widening
+/// there would let the second step reach states the unsplit frame does not.
+/// `Rt2::widen_to` agrees.
 fn widen_near_floors<A: GraphArith>(st: &mut State<Symbolic<A>>, d: &mut Symbolic<A>, e: &Entry, errs: &mut SlotErrors, mid: bool) -> Result<()> {
     use super::domain::Cmp;
     // The hitboxes `floor_player_window` assumes, checked on the state.
@@ -487,12 +479,11 @@ fn widen_near_floors<A: GraphArith>(st: &mut State<Symbolic<A>>, d: &mut Symboli
         let apart = d.not(&overlap);
         let two = d.int(2);
         let range = ival(d, slo, shi);
-        // With the platforms unknown, the overlapped floor stores what the
-        // frame COMPUTED instead (exact, nothing owed): there the hidden
-        // invariant failed on every lane of the spawn's first player frame
-        // (room (2,1), a coverage gap; plans/architecture.md "Open issues").
-        // A stored computed `state`/`collideable` agrees with `Rt2::widen_to`
-        // (it keeps an overlapped floor's values as they are).
+        // With the platforms unknown, the overlapped floor stores what the frame
+        // COMPUTED instead (exact, nothing owed): there the hidden invariant failed
+        // on every lane of the spawn's first player frame (room (2,1);
+        // plans/architecture.md "Open issues"). `Rt2::widen_to` agrees (it keeps
+        // an overlapped floor's values as they are).
         let computed = d.level.platforms;
         let state = d.sel_num(&overlap, if computed { &state } else { &two }, &range);
         iface::set(st, ps, Value::Num(state))?;
@@ -514,20 +505,17 @@ fn widen_near_floors<A: GraphArith>(st: &mut State<Symbolic<A>>, d: &mut Symboli
 }
 
 /// `Hook::PlatformInputs`: the platforms' INPUT side at a platforms-unknown
-/// level. Which world platform each is, by constant `y` and `dir` (rows are
-/// in canonical order; platforms alike in both are interchangeable); `x` an
+/// level. Which world platform each is, by constant `y` and `dir`; `x` an
 /// input cell restricted to the path (`Op::Restrict`) and recorded as the
 /// world's cell, so the split decides player-vs-platform comparisons per
 /// PLATFORM WORLD, keeping platforms mutually consistent; `last` read as `x`
 /// (checked at the output, `Stored::SameAs`); `rem.x` the literal whole
-/// remainder (pinned to it as `Input::Literal`: a literal's floor rejoins as
-/// fragments; the price is a pixel of slack at this level); each unpinned `spd.x`
-/// through its range over the worlds - with no player, as the literal of its
-/// one moving speed. Not table slots: all of it is per WORLD (which world
-/// platform an object is, and what its inputs may be there), which a slot
-/// cannot say. Returned: the per-lane obligation of each no-player speed
-/// (`0` or its one moving speed, read as the latter: a two-point set no
-/// single `Pin` states).
+/// remainder (`Input::Literal`: a literal's floor rejoins as fragments, at a
+/// pixel of slack); each unpinned `spd.x` through its range over the worlds,
+/// with no player as the literal of its one moving speed. Not table slots:
+/// all of it is per WORLD, which a slot cannot say. Returned: the per-lane
+/// obligation of each no-player speed (`0` or its one moving speed: a
+/// two-point set no single `Pin` states).
 pub fn platform_inputs<A: GraphArith>(st: &mut State<Symbolic<A>>, d: &mut Symbolic<A>) -> Result<Vec<NodeId>> {
     let table = d.worlds.clone().ok_or_else(|| anyhow::anyhow!("the platforms are unknown but there is no world table"))?;
     let worlds = &table.0;
@@ -610,11 +598,9 @@ pub fn platform_inputs<A: GraphArith>(st: &mut State<Symbolic<A>>, d: &mut Symbo
 }
 
 /// A static range of a value, as exact doubles (16.16's values and a
-/// double's both are; infinite ends unbounded), compared by value.
-/// Computing it with `f64` arithmetic is EXACT for 16.16 (sums of its values
-/// round nowhere near its range) and is the doubles' own rounding for
-/// `Arith::Float`: `fl` is monotone, so `fl(a + b)` over ranges lies between
-/// the rounded sums of the ends.
+/// double's both are; infinite ends unbounded). `f64` arithmetic on it is
+/// EXACT for 16.16 and the doubles' own rounding for `Float` (`fl` is
+/// monotone, so `fl(a + b)` over ranges lies between the ends' sums).
 type RangeF64 = (f64, f64);
 
 /// Does `v` provably lie in `[lo, hi]`? Through select arms and under
@@ -687,8 +673,8 @@ fn comparison_facts<A: GraphArith>(d: &Symbolic<A>, c: NodeId) -> Option<(NodeId
     Some((x, yes, no))
 }
 
-/// A static range of `n` (literals, a bounded input - a platform's
-/// `x` among them -, sums and differences), narrowed by the enclosing branches; `None` otherwise.
+/// A static range of `n` (literals, a bounded input such as a platform's
+/// `x`, sums and differences), narrowed by the enclosing branches.
 fn bounds<A: GraphArith>(d: &Symbolic<A>, n: NodeId, facts: &[(NodeId, f64, f64)]) -> Option<RangeF64> {
     let node = d.graph.get(n);
     let num = |l: A::Lit| A::from_lit(l).to_f64();
@@ -713,7 +699,7 @@ fn bounds<A: GraphArith>(d: &Symbolic<A>, n: NodeId, facts: &[(NodeId, f64, f64)
                 let (a, b) = (bounds(d, node.args[0], facts)?, bounds(d, node.args[1], facts)?);
                 (a.0 - b.1, a.1 - b.0)
             }
-            // A bounded input (`Op::Restrict`; as `graph::pieces_of`).
+            // A bounded input (`Op::Restrict`; as `GraphArith::pieces_of`).
             Op::Restrict(lo, hi) => {
                 let (lo, hi) = (num(lo), num(hi));
                 match bounds(d, node.args[0], facts) {
@@ -749,7 +735,6 @@ mod tests {
     use crate::transpile::graph::Val;
     use std::collections::HashMap;
 
-    /// The constant the table stores in `p` of `st`, if it stores one.
     fn canonical(st: &State<Symbolic>, p: &Path) -> Option<Val> {
         for e in Level::EXACT.entries() {
             for paths in entry_paths(st, e) {
@@ -766,16 +751,13 @@ mod tests {
     }
 
     /// THE DEAD FIELDS are unread: the slots the table stores as a constant
-    /// (`Stored::Num`/`Bool`: the timers, the key's sprite) are traced as
-    /// free input cells, every other slot concrete, and no stored field
-    /// outside them, no guard, error or raise reads one of those cells - so
-    /// every value of them makes the same successors, and the constant the
-    /// table stores loses nothing (an EXACT canonicalization). The one read
-    /// is an error's OVERFLOW check of their own arithmetic (`minutes + 1`:
-    /// a free cell may be MAX): it holds at the stored constants, which are
-    /// all the search ever holds there. Every frame of room (4,0)'s 100%
-    /// route (the player runs and dashes, takes the key and opens the chest
-    /// with it).
+    /// (`Stored::Num`/`Bool`: the timers, the key's sprite) traced as free input
+    /// cells, every other slot concrete, are read by no stored field outside
+    /// them, no guard, error or raise - so the stored constant loses nothing (an
+    /// EXACT canonicalization). The one read is an error's OVERFLOW check of
+    /// their own arithmetic (`minutes + 1`), which holds at the stored
+    /// constants. Every frame of room (4,0)'s 100% route (the player runs,
+    /// dashes, takes the key and opens the chest with it).
     #[test]
     fn dead_fields_are_unread() {
         if !std::path::Path::new("lua/celeste-minimal.lua").exists() {
@@ -787,8 +769,6 @@ mod tests {
         let mut it: Interp<Symbolic> = Interp::new(Symbolic::default());
         let mut st = cart::boot(&mut it, &chunks, root, s.room).expect("boot");
         let dead = |s: &Slot| matches!(s.stored, Stored::Num(_) | Stored::Bool(_));
-        // The 100% route: the player runs, dashes, takes the key and opens
-        // the chest with it.
         let route = crate::concrete::read_inputs("tas/room_4_0_hundred_frame_152.txt").expect("the route");
         let (mut traced, mut with_key, mut with_player, mut has_key) = (0, 0, 0, false);
         let mut overflow_checks = 0;

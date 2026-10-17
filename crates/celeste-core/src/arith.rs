@@ -1,17 +1,13 @@
-//! THE GAME'S ARITHMETIC, a compile-time choice (plans/float.md,
-//! "The parameter"): `Fixed`, PICO-8's 16.16 (`Pico8Num`, the real game), or
-//! `Float`, the Lua doubles of the community's TAS tools (`LuaF64`). Code
-//! generic over `A: Arithmetic` monomorphizes to one copy per arithmetic, so
-//! values of the two can never meet, and `Fixed`'s copy is the fixed-point
-//! code as it always was.
+//! THE GAME'S ARITHMETIC, a compile-time choice (plans/float.md): `Fixed`,
+//! PICO-8's 16.16 (`Pico8Num`, the real game), or `Float`, the Lua doubles
+//! of the community's TAS tools (`LuaF64`). Generic code monomorphizes to
+//! one copy per arithmetic, so values of the two can never meet.
 //!
-//! Points and intervals: a point operation is CHECKED (the exact result of
-//! the arithmetic, or `None` where the real one wraps, saturates or leaves
-//! the finite doubles: the callers raise). An interval is the reference
-//! domain's abstract number; its operations are the point operation on the
-//! ends. For `Float` that needs NO outward rounding: each operation is
-//! monotone and rounding is monotone, so the ends computed with the same
-//! rounding bound the IEEE result over the whole box exactly (section 4).
+//! A point operation is CHECKED: the exact result, or `None` where the real
+//! one wraps, saturates or leaves the finite doubles (the callers raise). An
+//! interval's operations are the point operation on the ends; for `Float`
+//! that needs NO outward rounding: each operation and rounding are
+//! monotone, so the ends bound the IEEE result over the whole box exactly.
 
 use std::fmt::Debug;
 use std::hash::Hash;
@@ -74,7 +70,6 @@ pub trait Arithmetic: 'static + Copy + Default + Debug + Send + Sync + PartialEq
     fn bits(v: Self::Num) -> u64;
     /// The number of these bits (`bits`' inverse), if they are one.
     fn from_bits(b: u64) -> Option<Self::Num>;
-    /// A number for a message.
     fn show(v: Self::Num) -> String;
     /// A number as the console's `printh` prints it.
     fn printh(v: Self::Num) -> Result<String>;
@@ -432,9 +427,8 @@ pub trait EngineNum: Copy + Debug + PartialEq + Eq + Hash + Send + Sync + serde:
     type Raw: Copy + Debug + PartialEq + Eq + PartialOrd + Ord + Hash + Default + Send + Sync + From<u32> + TryInto<u32> + serde::Serialize + serde::de::DeserializeOwned + 'static;
     /// A number interval's dictionary word: its two raws, packed.
     type Word: Copy + Debug + PartialEq + Eq + Hash + Default + Send + Sync + 'static;
-    /// The last byte of a tree file's magic: 16.16's files keep theirs
-    /// (0: unchanged), the doubles' end in `f` - a tree of one arithmetic
-    /// is never read as the other's.
+    /// The last byte of a tree file's magic (16.16: 0, doubles: `f`): a
+    /// tree of one arithmetic is never read as the other's.
     const FILE_TAG: u8;
     fn raw(self) -> Self::Raw;
     /// `raw`'s inverse; `None` for bits no number of the arithmetic has.

@@ -1,9 +1,7 @@
-//! THE SPLIT PASS: making a traced frame executable under abstract inputs
-//! (`split_undecided_selects`). A select a lane can hold both ways cannot be
-//! evaluated, so a select the row stores is split; errors are settled by
-//! case analysis (`MayErr`), guards rewritten three-valued (`three_valued`),
-//! and with the platforms unknown, comparisons decided per platform world
-//! (`Points`).
+//! THE SPLIT PASS (`split_undecided_selects`): a traced frame made
+//! executable under abstract inputs. Errors are settled by case analysis
+//! (`MayErr`), guards rewritten three-valued (`three_valued`), and with the
+//! platforms unknown, comparisons decided per platform world (`Points`).
 
 use anyhow::{anyhow, Result};
 
@@ -16,8 +14,7 @@ use celeste_core::arith::Fixed;
 /// An outcome's row as `Waiting` indexes it: its shape class and its fields.
 type RowKey = (usize, Vec<NodeId>);
 
-/// `split_undecided_selects`' queue: largest cone first, deduped on arrival
-/// (an equal outcome merges in).
+/// `split_undecided_selects`' queue: largest cone first, deduped on arrival.
 #[derive(Default)]
 struct Waiting {
     slots: Vec<Option<(Lite, Option<PointSet>)>>,
@@ -39,7 +36,6 @@ struct Lite {
 }
 
 impl Lite {
-    /// What the row stores.
     fn row(&self) -> Vec<NodeId> {
         self.fields.clone()
     }
@@ -67,7 +63,6 @@ impl Lite {
 }
 
 impl Waiting {
-    /// Same shape class and row: one outcome.
     fn key(class: &[usize], o: &Lite) -> RowKey {
         (class[o.t], o.fields.clone())
     }
@@ -101,9 +96,9 @@ impl Waiting {
 }
 
 /// An outcome's error once its row is resolved: WHERE A LANE MAY ERR, with no
-/// undecided select left. By case analysis on the error alone (not the
-/// outcome, whose split sides would double per round) and not three-valued
-/// (a hull loses what a select's condition says, e.g. the platform wrap).
+/// undecided select left. By case analysis on the error alone (an outcome's
+/// split sides would double per round), not three-valued (a hull loses what
+/// a select's condition says, e.g. the platform wrap).
 fn settle_error<A: GraphArith>(d: &mut Symbolic<A>, points: Option<&mut Points<A>>, pts: Option<&PointSet>, room: Option<&crate::transpile::graph::Room>, mut o: Lite) -> Lite {
     let mut m = MayErr { points, room, memo: Default::default(), cases: 0 };
     let here = pts.cloned();
@@ -122,9 +117,8 @@ fn split_atom<A: GraphArith>(d: &Symbolic<A>, c: NodeId) -> NodeId {
         .unwrap_or(c)
 }
 
-/// The answers a split of `atom` takes at the points `pts` (`Points`), each
-/// with its points: an answer no point gives is no side, and one side left
-/// means the points DECIDE it. Without points, both answers.
+/// The answers a split of `atom` takes at the points `pts`, each with its
+/// points: one side left means the points DECIDE it. Without points, both.
 fn sides<A: GraphArith>(d: &Symbolic<A>, points: Option<&mut Points<A>>, room: Option<&crate::transpile::graph::Room>, pts: Option<&PointSet>, atom: NodeId) -> Vec<(bool, Option<PointSet>)> {
     match (points, pts) {
         (Some(p), Some(here)) => {
@@ -142,7 +136,7 @@ const MAY_CASES: usize = 4096;
 /// connectives through operands (`and` over-approximates, safe for an
 /// error); a node reading an undecided select is split on its lowest
 /// undecidable comparison, each case under that answer's `may` guard and
-/// narrowed points; others as they are. Past `MAY_CASES`, three-valued.
+/// narrowed points. Past `MAY_CASES`, three-valued.
 struct MayErr<'a, 'r, A: GraphArith> {
     points: Option<&'a mut Points<A>>,
     room: Option<&'r crate::transpile::graph::Room>,
@@ -217,8 +211,7 @@ impl<A: GraphArith> MayErr<'_, '_, A> {
     }
 }
 
-/// `Symbolic::evaluated`'s conditions for every reached node, rewritten by
-/// `three_valued`.
+/// `Symbolic::evaluated`'s conditions, rewritten by `three_valued`.
 pub(super) fn three_valued_evaluated<A: GraphArith>(d: &mut Symbolic<A>, outs: &[FrameOut<A>]) {
     let roots: Vec<NodeId> = outs.iter().flat_map(|o| o.roots(false)).collect();
     let mut done: rustc_hash::FxHashSet<NodeId> = Default::default();
@@ -277,10 +270,9 @@ impl PointSet {
 
 /// THE POINTS a platforms-unknown frame's comparisons are decided over: every
 /// PLATFORM WORLD at every pixel of the player's region. A path carries the
-/// points consistent with its answers (dropped at none), so its answers come
-/// from ONE platform arrangement. A point's comparison is decided by
-/// `eval_lenient_in` with cells pinned; undecided goes both ways. Compile time
-/// only: the kernel sees each outcome's pixels (`position_guard`).
+/// points consistent with its answers, so its answers come from ONE platform
+/// arrangement; undecided goes both ways. Compile time only: the kernel sees
+/// each outcome's pixels (`position_guard`).
 pub struct Points<A: GraphArith = Fixed> {
     /// Per world, the value of each platform cell: `(cell, x)`.
     worlds: Vec<Vec<(u32, A::Num)>>,
@@ -329,13 +321,11 @@ impl<A: GraphArith> Points<A> {
         self.worlds.len() * self.per_world()
     }
 
-    /// The point of world `w` at pixel offsets `(i, j)` into the region.
     fn index(&self, w: usize, i: usize, j: usize) -> usize {
         let ny = self.pos[1].map_or(1, |p| p.3);
         (w * self.per_world()) + i * ny + j
     }
 
-    /// Where `c` can come out true, and where false.
     fn answers(&mut self, d: &Symbolic<A>, room: Option<&crate::transpile::graph::Room>, c: NodeId) -> (PointSet, PointSet) {
         use crate::transpile::graph::Val;
         if let Some(hit) = self.memo.get(&c) {
@@ -371,7 +361,6 @@ impl<A: GraphArith> Points<A> {
         let n = self.len();
         let (mut yes, mut no) = (PointSet::empty(n), PointSet::empty(n));
         let (nx, ny) = (self.pos[0].map_or(1, |p| p.3), self.pos[1].map_or(1, |p| p.3));
-        // Mark worlds `ws` at pixels `is` x `js` with answer `r`.
         let mut mark = |ws: &[usize], is: &[usize], js: &[usize], r: Option<bool>| {
             for &w in ws {
                 for &i in is {
@@ -485,12 +474,12 @@ impl<A: GraphArith> Points<A> {
 }
 
 /// MAKING THE FRAME EXECUTABLE UNDER ABSTRACT INPUTS: a select whose
-/// condition a lane holds both ways cannot be evaluated. A select the row
-/// STORES is split, one at a time, the first in program order (the outcome
-/// in two, readers refolded, guards narrowed by `may_answers`), until none
-/// is left; equal outcomes fuse. The error is settled (`settle_error`) and
-/// the guard rewritten three-valued, neither split. With `Points`, a
-/// comparison with one answer at a path's points is decided without a split.
+/// condition a lane holds both ways cannot be evaluated, so a select the row
+/// STORES is split, the first in program order (the outcome in two, readers
+/// refolded, guards narrowed by `may_answers`), until none is left; equal
+/// outcomes fuse. The error is settled and the guard rewritten three-valued,
+/// neither split. With `Points`, a comparison with one answer at a path's
+/// points is decided without a split.
 pub(super) fn split_undecided_selects<A: GraphArith>(d: &mut Symbolic<A>, outs: Vec<FrameOut<A>>, mut points: Option<Points<A>>, room: Option<&crate::transpile::graph::Room>) -> Result<Vec<FrameOut<A>>> {
     use crate::transpile::graph::Op;
     const MAX_OUTCOMES: usize = 4096;
@@ -506,8 +495,8 @@ pub(super) fn split_undecided_selects<A: GraphArith>(d: &mut Symbolic<A>, outs: 
             t,
             guard: o.guard,
             error: o.error,
-    // The transfer roots ride with the fields: same substitutions, and part
-    // of what makes two outcomes one.
+            // The transfer roots ride with the fields: same substitutions, and
+            // part of what makes two outcomes one.
             fields: o.fields.iter().map(|f| f.1).chain(o.arc.iter().copied()).collect(),
             rests: Vec::new(),
         };
@@ -674,7 +663,6 @@ pub(super) fn split_undecided_selects<A: GraphArith>(d: &mut Symbolic<A>, outs: 
         // Settle the error again: merges copied guards into it.
         let lite = settle_error(d, points.as_mut(), pts.as_ref(), room, lite);
         let mut o = outs[lite.t].clone();
-        // The guard, three-valued.
         o.guard = three_valued(d, lite.guard);
         o.error = lite.error;
         let nf = o.fields.len();
@@ -692,11 +680,10 @@ pub(super) fn split_undecided_selects<A: GraphArith>(d: &mut Symbolic<A>, outs: 
 }
 
 /// `root` (a guard or error) with no select on an undecided condition left
-/// for the kernel to read by a garbage bit. A boolean select becomes
-/// `(c and a) or (not c and b)` (exact in Kleene); a NUMBER becomes
-/// `Sel(Known(c), Sel(c, x, y), hull)`, a sound "may be live". Ops the kernel
-/// computes on exact operands only (`exact_only`) are pushed into the arms,
-/// up to `ARMS` combinations (pushing everything is exact but exponential).
+/// for the kernel to read by a garbage bit: a boolean select becomes `(c and
+/// a) or (not c and b)` (exact in Kleene), a NUMBER `Sel(Known(c), Sel(c, x,
+/// y), hull)`, a sound "may be live". Ops the kernel computes on exact
+/// operands only are pushed into the arms, up to `ARMS` combinations.
 fn three_valued<A: GraphArith>(d: &mut Symbolic<A>, root: NodeId) -> NodeId {
     use crate::transpile::graph::Op;
     let nodes = d.graph.cone(&[root]);
@@ -826,9 +813,8 @@ fn three_valued<A: GraphArith>(d: &mut Symbolic<A>, root: NodeId) -> NodeId {
     map[&root]
 }
 
-/// Each of `combos` (a condition and the operands so far) with each of
-/// `alts` (where the next operand takes which value): the conditions AND-ed,
-/// the value appended. `None` past `ARMS` (or where either is).
+/// Each of `combos` (a condition and the operands so far) with each of `alts`
+/// (where the next operand takes which value). `None` past `ARMS`.
 fn arm_product<A: GraphArith>(d: &mut Symbolic<A>, combos: Option<Vec<(NodeId, Vec<NodeId>)>>, alts: Option<Vec<(NodeId, NodeId)>>) -> Option<Vec<(NodeId, Vec<NodeId>)>> {
     use crate::transpile::graph::Op;
     let (cs, alts) = (combos?, alts?);
@@ -846,7 +832,6 @@ fn arm_product<A: GraphArith>(d: &mut Symbolic<A>, combos: Option<Vec<(NodeId, V
     Some(next)
 }
 
-/// `three_valued`'s bound on the arms an exact-only op is distributed over.
 const ARMS: usize = 64;
 
 /// Ops the kernel computes on exact operands only (`asm::codegen`'s
@@ -862,7 +847,6 @@ fn exact_only<A: GraphArith>(d: &Symbolic<A>, op: &crate::transpile::graph::Op<A
     }
 }
 
-/// Ops whose value is a boolean.
 fn is_bool_op<A: GraphArith>(op: &crate::transpile::graph::Op<A>) -> bool {
     use crate::transpile::graph::Op;
     matches!(
@@ -873,7 +857,6 @@ fn is_bool_op<A: GraphArith>(op: &crate::transpile::graph::Op<A>) -> bool {
     )
 }
 
-/// The hull `[min lo, max hi]` of numbers.
 fn hull_of<A: GraphArith>(d: &mut Symbolic<A>, vals: &[NodeId]) -> NodeId {
     use crate::transpile::graph::Op;
     let (mut lo, mut hi) = (d.graph.fold(Op::Lo, vec![vals[0]]), d.graph.fold(Op::Hi, vec![vals[0]]));
@@ -943,9 +926,8 @@ const MAX_RESTS: usize = 32;
 /// both existing outcomes: the halves to merge, or `None`. With an atom
 /// substituted, the rest of a condition may be lane-decided (a fall floor's
 /// `delay <= 0 and not check(player, 0, 0)`); left in the row it is a third
-/// variant beside "solid" and "hidden", 3x outcomes per floor instead of 2.
-/// EXACT: a lane takes the half its own answer gives. Taken only where BOTH
-/// halves merge, so it never adds an outcome.
+/// variant, 3x outcomes per floor instead of 2. EXACT: a lane takes the half
+/// its own answer gives; taken only where BOTH halves merge.
 fn absorbed<A: GraphArith>(
     d: &mut Symbolic<A>,
     class: &[usize],
@@ -990,11 +972,10 @@ fn absorbed<A: GraphArith>(
     None
 }
 
-/// Every node of `cone` rebuilt with `subst` applied, in node order:
-/// comparisons refolded against the static ranges, the rest by `fold`; only
-/// changed nodes are mapped. Where a node was EVALUATED moves with it (the
-/// cone is widened to those conditions first), else the rebuild's own error
-/// would hold on every lane.
+/// Every node of `cone` rebuilt with `subst` applied, in node order
+/// (comparisons refolded against the static ranges); only changed nodes are
+/// mapped. Where a node was EVALUATED moves with it, else the rebuild's own
+/// error would hold on every lane.
 fn rebuild_all<A: GraphArith>(d: &mut Symbolic<A>, cone: &[NodeId], subst: &rustc_hash::FxHashMap<NodeId, NodeId>) -> rustc_hash::FxHashMap<NodeId, NodeId> {
     use super::domain::{Cmp, Domain};
     use crate::transpile::graph::Op;

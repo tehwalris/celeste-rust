@@ -11,13 +11,10 @@ use crate::transpile::garith::GraphArith;
 
 
 /// THE REGION KEY: a kernel is specialized on the player's whole-pixel
-/// position in one `px`-pixel grid square and speed in `[-speed, speed]`,
-/// so the range analysis folds away far-off collision tests; a lane outside
-/// declines loudly. Each bound is an `Op::Restrict` on its input cell
-/// (`frame::trace_frame`): the range analyses read the range off that node,
-/// and its own error, on the raw cell, is the per-lane check (`trace::error`).
-/// The dispatch picks the kernel by the lane's region, so `x`/`y` hold by
-/// construction; speed and remainder hold only by that check.
+/// position in one `px`-pixel grid square and speed in `[-speed, speed]`, so
+/// the range analysis folds away far-off collision tests. Each bound is an
+/// `Op::Restrict` on its input cell, whose own error is the per-lane check:
+/// `x`/`y` hold by the dispatch, speed and remainder only by that check.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub struct Region {
     pub ix: i16,
@@ -25,9 +22,8 @@ pub struct Region {
 }
 
 /// The grid a region key is taken on (`--region "px,S"`, `off` for none,
-/// default 16 px / speed 6: `Settings::region_grid`). `S <= 7` because the
-/// move loop unrolls for `abs(amount) <= 8` and `amount = flr(rem + spd +
-/// 0.5)`.
+/// default 16 px / speed 6). `S <= 7` because the move loop unrolls for
+/// `abs(amount) <= 8` and `amount = flr(rem + spd + 0.5)`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct RegionGrid {
     pub px: i32,
@@ -35,7 +31,6 @@ pub struct RegionGrid {
 }
 
 impl RegionGrid {
-    /// The region of a whole-pixel position.
     pub fn of(&self, x: i32, y: i32) -> Region {
         Region { ix: x.div_euclid(self.px) as i16, iy: y.div_euclid(self.px) as i16 }
     }
@@ -45,9 +40,8 @@ impl RegionGrid {
         crate::search::pos_graph::cell_xy(cell).map(|(x, y)| self.of(x, y))
     }
 
-    /// The bounds a region's kernel is traced under, by path under `pl`
-    /// (16.16 constants, exact in every arithmetic; the remainder's range
-    /// the table's, `widening::range`).
+    /// The bounds a region's kernel is traced under, by path under `pl` (16.16
+    /// constants, exact in every arithmetic).
     fn bounds<A: GraphArith>(&self, pl: &super::iface::Path, r: Region) -> InputRanges<A> {
         const ONE: i32 = 1 << 16;
         let lit = |raw: i32| A::lit(A::from_fixed_raw(raw));
@@ -67,14 +61,12 @@ impl RegionGrid {
     }
 }
 
-/// The input bounds a frame is traced under (`frame::trace_frame`).
 pub type InputRanges<A = Fixed> = Vec<(super::iface::Path, (<A as Arithmetic>::Lit, <A as Arithmetic>::Lit))>;
 
 /// Frames of platform motion the platform worlds cover: a platforms-unknown
 /// level is sound only up to this horizon and refuses a longer search.
 pub const PLATFORM_WORLD_FRAMES: usize = 127;
 
-/// A node of the constant-lattice walk: a shape key and a region.
 pub type WalkNode = (String, Option<Region>);
 
 /// The regions a state's rows can be in (`None` without a grid or player):
@@ -111,16 +103,13 @@ fn successor_regions<A: GraphArith>(
 /// THE NO-PLAYER PHASE'S RANGES. One trace covers a whole stretch of the
 /// spawn, so a field varying over it would be an unbounded input. No input
 /// matters before the player exists, so run the phase fully pinned and bound
-/// each numeric field to the hull it took, PER SHAPE: the phase may change
-/// shape before the player appears (a later spawn shape traced unbounded
-/// makes every fall floor "near"). The chain runs the fly fruit exact; the
-/// walk and the forward run the level's widenings, under which the phase
-/// reaches shapes the chain never takes (a widened fly fruit gone at any
-/// frame), so the start is also EXPLORED at the level's
-/// own widenings (`explore_no_player`) into the same hulls, and so is every
-/// RESPAWN the walk reaches (the room reloaded after a death, every object
-/// updated once). A shape no explored state has gets the spawn object's hull
-/// by type (`NoPlayer::bounds`). A lane outside declines.
+/// each numeric field to the hull it took, PER SHAPE (a later spawn shape
+/// traced unbounded makes every fall floor "near"). The chain runs the fly
+/// fruit exact; at the level's widenings the phase reaches shapes the chain
+/// never takes, so the start and every respawn the walk reaches are also
+/// explored (`explore_no_player`) into the same hulls. A shape no explored
+/// state has gets the spawn object's hull by type (`NoPlayer::bounds`). A
+/// lane outside declines.
 fn no_player_ranges<A: GraphArith>(
     it: &mut super::interp::Interp<'static, super::domain::Symbolic<A>>,
     chunks: &'static super::cart::Chunks,
@@ -133,18 +122,16 @@ fn no_player_ranges<A: GraphArith>(
         return Ok(NoPlayer::default());
     }
     let mut np = NoPlayer::default();
-    // The chain runs with the fly fruit EXACT (unknown, its `fly` and `y`
-    // fork every frame into outcomes, and the chain needs one), and the
-    // fruit's fields, unknown at a fruit level, bound nothing there.
+    // The chain runs with the fly fruit EXACT (unknown, its `fly` and `y` fork
+    // every frame into outcomes); the fruit's fields bound nothing then.
     let fruit = it.d.level.fruit;
     let chain_opts = crate::abstraction::Level { fruit: false, ..opts };
     let chain_level = crate::abstraction::Level { fruit: false, ..it.d.level };
-    // Only a phase run to its END bounds anything, and only one that runs
-    // concretely. Two things stop that, and end the chain bounding nothing
-    // (said in the log): a start holding an `rnd` draw (a balloon's `offset`
-    // without `--balloon-seeds`), which no pin can hold, and a frame whose
-    // unpinned fields (the level's widened ones) fork it into several
-    // outcomes. Every other refusal is an error.
+    // Only a phase run to its END, concretely, bounds anything. Two things
+    // stop that and end the chain bounding nothing (said in the log): a start
+    // holding an `rnd` draw (a balloon's `offset` without `--balloon-seeds`)
+    // and a frame whose unpinned fields (the level's widened ones) fork it.
+    // Every other refusal is an error.
     let run = (|| -> Result<bool> {
         let drawn = shapes::state_paths(start)?.into_iter().find(|p| match super::iface::get(start, p) {
             Some(super::heap::Value::Num(n)) => it.d.as_const(&n).is_none(),
@@ -189,24 +176,19 @@ fn no_player_ranges<A: GraphArith>(
     Ok(np)
 }
 
-/// Frames a no-player phase may last (the start's chain, an exploration):
-/// one that has not reached the player by then is FATAL.
+/// Frames a no-player phase may last; past them it is FATAL.
 const NO_PLAYER_FRAMES: usize = 240;
 
-/// THE NO-PLAYER EXPLORATION: from an entry of the no-player phase
-/// (`entry`, its constants `consts`: the start, or a respawn entry the walk
-/// reached - the room reloaded after a death), every outcome of every frame
-/// up to the player's appearance, AT THE LEVEL'S OWN WIDENINGS (`opts`, the
-/// fly fruit as the level has it: what the walk and the forward reach), into
-/// `np`'s hulls. Fields the entry holds unknown (a respawn's: the dead
-/// phase's `freeze` and `delay_restart`; the level's widened fields) stay
-/// unknown inputs. No merge selects on the state's OWN unknowns (not the
-/// level's widened fields): `_update`'s `if freeze>0 then ... return end`
-/// would merge the frozen branch into the spawn's fields (`y = Sel(freeze >
-/// 0, 124, 120)`), after which none is a constant; refused, each branch
-/// keeps its constants (the frozen one repeats its parent). A state is its
-/// shape and its constants (the trace pins exactly those), so a repeated one
-/// is explored once. FATAL (`what`: whose phase): a state still without the
+/// THE NO-PLAYER EXPLORATION: from an entry of the no-player phase (the
+/// start, or a respawn: the room reloaded after a death), every outcome of
+/// every frame up to the player's appearance, AT THE LEVEL'S OWN WIDENINGS
+/// (`opts`), into `np`'s hulls. Fields the entry holds unknown (a respawn's
+/// `freeze` and `delay_restart`, the level's widened fields) stay unknown
+/// inputs. No merge selects on the state's OWN unknowns: `if freeze>0 then
+/// ... return end` would merge the frozen branch into the spawn's fields
+/// (`y = Sel(freeze > 0, 124, 120)`), and none would be a constant. A state
+/// is its shape and its constants (what the trace pins), so a repeated one is
+/// explored once. FATAL (`what`: whose phase): a state still without the
 /// player after `NO_PLAYER_FRAMES` frames, a state that does not trace.
 /// Returns the states explored, the outcomes followed and those where the
 /// player appears.
@@ -220,7 +202,6 @@ fn explore_no_player<A: GraphArith>(
     what: &str,
 ) -> Result<(usize, usize, usize)> {
     use super::shapes;
-    // The level's fly fruit (`note`: a widened one's fields bound nothing).
     let fruit = it.d.level.fruit;
     let mut seen: std::collections::BTreeSet<String> = Default::default();
     let mut todo = vec![(entry, consts, 0usize)];
@@ -234,9 +215,8 @@ fn explore_no_player<A: GraphArith>(
         anyhow::ensure!(depth < NO_PLAYER_FRAMES, "{what} no-player phase did not reach the player within {NO_PLAYER_FRAMES} frames");
         let roots = shapes::state_paths(&st)?;
         let pin = pins_of(&consts, &roots);
-        // The state's own unknowns (not the level's widened fields, not
-        // the buttons the frame resets): no merge selects on them, so
-        // each branch keeps its own constants.
+        // The state's own unknowns (not the level's widened fields, not the
+        // buttons the frame resets): no merge selects on them.
         let widened = super::widen::slots_where(&st, opts, super::widen::stores_widened);
         let buttons = super::iface::key("__button_states");
         let unknown: Vec<super::iface::Path> = roots.iter().filter(|p| !consts.contains_key(*p) && !widened.contains(*p) && p.first() != Some(&buttons)).cloned().collect();
@@ -261,8 +241,7 @@ fn pins_of<A: GraphArith>(consts: &std::collections::BTreeMap<super::iface::Path
 }
 
 /// The next frame's entry from outcome `st`: its constants at `opts` (read
-/// before `rebase` blanks them; the next trace pins them back), and the
-/// state rebased into `d`'s arena.
+/// before `rebase` blanks them) and the state rebased into `d`'s arena.
 fn next_entry<A: GraphArith>(
     d: &mut super::domain::Symbolic<A>,
     st: &super::state::State<super::domain::Symbolic<A>>,
@@ -278,10 +257,10 @@ fn next_entry<A: GraphArith>(
 /// A numeric field's hull per path (raw 16.16, inclusive).
 type Hull<A> = std::collections::BTreeMap<super::iface::Path, (<A as Arithmetic>::Num, <A as Arithmetic>::Num)>;
 
-/// The no-player phase's hulls over every state explored: the start's chain
-/// and each respawn's exploration, per shape and the spawn object's by the
-/// path below it. A field bounds its shape where its hull is not one value
-/// and every explored state of the shape holds it a constant (`bounds`).
+/// The no-player phase's hulls over every state explored (the start's chain
+/// and each respawn's exploration), per shape and the spawn object's. A
+/// field bounds its shape where its hull is not one value and every
+/// explored state of the shape holds it a constant.
 #[derive(Default)]
 struct NoPlayer<A: GraphArith = Fixed> {
     /// The start's chain reached the player: the hulls bound.
@@ -292,13 +271,12 @@ struct NoPlayer<A: GraphArith = Fixed> {
     /// The spawn object's fields (by the path below it), likewise.
     spawn: Hull<A>,
     spawn_unknown: std::collections::BTreeSet<super::iface::Path>,
-    /// The respawn entries explored, by shape and constants.
     entries: std::collections::BTreeSet<String>,
 }
 
 impl<A: GraphArith> NoPlayer<A> {
-    /// An explored state `st` with its constants `consts` into the hulls
-    /// (`fruit`: the level widens the fly fruit, whose fields bound nothing).
+    /// An explored state into the hulls (`fruit`: the level widens the fly
+    /// fruit, whose fields bound nothing).
     fn note(&mut self, st: &super::state::State<super::domain::Symbolic<A>>, consts: &std::collections::BTreeMap<super::iface::Path, super::iface::Conc<A>>, fruit: bool) -> Result<()> {
         let shape = st.shape()?;
         let at = match self.shapes.iter().position(|(s, ..)| *s == shape) {
@@ -338,11 +316,9 @@ impl<A: GraphArith> NoPlayer<A> {
         Ok(())
     }
 
-    /// A no-player state's bounds, by path: its shape's hulls, or for a
-    /// shape no explored state has, the spawn object's. A field that varies
-    /// but some explored state of the shape holds unknown has no hull: it
-    /// bounds nothing (an unbounded input, as every unhulled field) - FATAL
-    /// for a field of the spawn, the phase the bounds are for.
+    /// A no-player state's bounds, by path: its shape's hulls, else the spawn
+    /// object's. A varying field some explored state holds unknown bounds
+    /// nothing - FATAL for a field of the spawn, the phase the bounds are for.
     fn bounds(&self, st: &super::state::State<super::domain::Symbolic<A>>) -> Result<InputRanges<A>> {
         let shape = st.shape()?;
         let spawn_objs = super::widen::objects_of_type(st, "player_spawn");
@@ -372,8 +348,7 @@ impl<A: GraphArith> NoPlayer<A> {
         Ok(out)
     }
 
-    /// Each shape's bounds and the spawn object's, for the log (a field
-    /// some explored state holds unknown, which bounds nothing, unshown).
+    /// Each shape's bounds and the spawn object's, for the log.
     fn show(&self) -> Vec<String> {
         let show = |h: &Hull<A>, unknown: &std::collections::BTreeSet<super::iface::Path>| h.iter().filter(|(p, (lo, hi))| A::lt(*lo, *hi) && !unknown.contains(*p)).map(|(p, (a, b))| format!("{} [{:.2}, {:.2}]", super::iface::show(p), celeste_core::arith::EngineNum::to_f64(*a), celeste_core::arith::EngineNum::to_f64(*b))).collect::<Vec<_>>();
         let mut out: Vec<String> = self.shapes.iter().enumerate().map(|(i, (_, h, unknown))| format!("[walk] no-player shape {i} ranges: {:?}", show(h, unknown))).collect();
@@ -387,8 +362,7 @@ mod tests {
     /// THE NO-PLAYER CHAIN ENDS QUIETLY ONLY WHERE IT CANNOT RUN CONCRETELY.
     /// Room (5,0)'s balloon draws its `offset` from `rnd` in `_init`: the
     /// chain bounds nothing, and says so. Any other refusal of a chain frame
-    /// (here the graph budget) is an error, never "no bounds": until
-    /// 2026-10-16 every trace error ended the chain silently.
+    /// (here the graph budget) is an error, never "no bounds".
     #[test]
     fn the_no_player_chain_refuses_loudly_but_for_an_rnd_draw() {
         use crate::settings::Settings;
@@ -429,8 +403,7 @@ mod tests {
     /// shape of its own: the springs gain `delay` at the first boundary), so
     /// the start's chain bounds the next shape's `y` to [98, 120]. A death
     /// reloads the room and updates every object once: the spawn at y 124 in
-    /// that shape (the 2500m run's KERNEL COVERAGE GAP, 2026-10-14). Every
-    /// no-player node's bound on a spawn's `y` covers 124.
+    /// that shape. Every no-player node's bound on a spawn's `y` covers 124.
     #[test]
     #[ignore = "slow, ./check.sh t2 runs it: room (0,3)'s lattice walk, ~40 CPU-s"]
     fn a_respawn_after_the_loading_jank_is_inside_its_shapes_bounds() {
@@ -458,8 +431,7 @@ mod tests {
     }
 }
 
-/// The walk's tracer at room `s.room`'s start (`cart::boot`), every frame
-/// it traces at `opts`.
+/// The walk's tracer at room `s.room`'s start, every frame traced at `opts`.
 fn boot<A: GraphArith>(root: &std::path::Path, s: &crate::settings::Settings, opts: crate::abstraction::Level) -> Result<(Tracer<A>, super::state::State<super::domain::Symbolic<A>>)> {
     let chunks = super::cart::Chunks::parse(root, s)?.leak();
     let mut it = super::interp::Interp::new(super::domain::Symbolic::<A>::default());
@@ -516,8 +488,7 @@ pub fn room_constant_lattice<A: GraphArith>(
     lattice.insert(sk.clone(), shapes::field_constants(&start, &it.d, &opts)?);
     reps.insert(sk.clone(), start.clone());
     // The START state's own intervals (an `rnd` draw in `_init`) are interval
-    // inputs at every level: no traced frame wrote them, so write discovery
-    // would miss them.
+    // inputs at every level: no traced frame wrote them.
     let mut start_ivals: std::collections::BTreeMap<super::iface::Path, Option<(A::Lit, A::Lit)>> = Default::default();
     {
         use super::domain::Domain as _;
@@ -527,12 +498,10 @@ pub fn room_constant_lattice<A: GraphArith>(
                 if it.d.as_const(&n).is_some() {
                     continue;
                 }
-                // Under the loading jank (--loading-jank) the start's
-                // `rnd` draw has had one update (a balloon's `offset += 0.01`,
-                // its `y` from `sin(offset)`): not a literal but a function of
-                // one. Its static range's hull stands for it - a superset of
-                // the start's values, sound for level -1's lower bound (it only
-                // widens the start; the correlation between slots is dropped).
+                // Under the loading jank the start's `rnd` draw has had one update (a
+                // balloon's `offset += 0.01`, its `y` from `sin(offset)`): a function of a
+                // literal. Its static range's hull stands for it, a superset of the
+                // start's values, sound for level -1's lower bound.
                 let lit = match it.d.graph.get(n).op {
                     crate::transpile::graph::Op::Const(lo, hi) => Some((lo, hi)),
                     _ => it.d.range_of(n).as_ref().and_then(A::lit_hull),
@@ -544,7 +513,6 @@ pub fn room_constant_lattice<A: GraphArith>(
             }
         }
     }
-    // A node is (shape, region); the lattice stays per shape.
     let grid = s.region_grid();
     let start_regions = successor_regions(&start, &mut it.d, grid, only)?;
     let mut regions: std::collections::BTreeMap<String, std::collections::BTreeSet<Option<Region>>> = Default::default();
@@ -576,7 +544,6 @@ pub fn room_constant_lattice<A: GraphArith>(
                 let st = reps[k].clone();
                 let roots = shapes::state_paths(&st)?;
                 let ival = with_extra(super::widen::slots_where(&st, opts, super::widen::interval_input), ival_extra.get(k));
-                // Pin the shape's known constants that are inputs here.
                 let pin = pins_of(&lattice[k], &roots);
                 let bounds: InputRanges<A> = match (grid, *region, shapes::player_path(&st)) {
                     (Some(g), Some(r), Some(pl)) => {
@@ -591,9 +558,9 @@ pub fn room_constant_lattice<A: GraphArith>(
                 Ok(WalkJob { node: (k.clone(), *region), st, roots, pin, ival, bounds, rebase })
             })
             .collect::<Result<_>>()?;
-        // Each worker clones its own copy (a `Tracer` is `Send`, not `Sync`),
-        // and per job a FRESH arena from it, so a graph depends on the job,
-        // not on scheduling (`renumber_cells`).
+        // Each worker clones its own copy (a `Tracer` is `Send`, not `Sync`), and
+        // per job a FRESH arena from it, so a graph depends on the job, not on
+        // scheduling.
         let free = std::sync::Mutex::new(tracers.iter_mut().collect::<Vec<_>>());
         let traced: Vec<WalkTraced<A>> = crate::par::Pool::new(n_workers).stack(128 << 20).map_with(
             jobs.len(),
@@ -703,7 +670,6 @@ pub fn room_constant_lattice<A: GraphArith>(
                             }
                         }
                     }
-                    // The last trace wins.
                     frames.insert(job.node.clone(), WalkFrame { frame, bounds: job.bounds.clone(), bound });
                 }
             }
@@ -785,9 +751,8 @@ pub fn room_constant_lattice<A: GraphArith>(
     Ok(LatticeWalk { lattice, reps, frames, cart: cart_data, cache, tracer: Tracer { it, chunks }, by_hash, start_key, ival_extra, start_ivals })
 }
 
-/// `ival` (the interval inputs the level's widenings make: `rem`, the
-/// level's widened objects) plus a shape's discovered `rnd`-derived
-/// interval slots, each once.
+/// `ival` (the level's interval inputs) plus a shape's discovered
+/// `rnd`-derived interval slots, each once.
 fn with_extra(mut ival: Vec<super::iface::Path>, extra: Option<&std::collections::BTreeSet<super::iface::Path>>) -> Vec<super::iface::Path> {
     for p in extra.into_iter().flatten() {
         if !ival.contains(p) {
@@ -797,7 +762,6 @@ fn with_extra(mut ival: Vec<super::iface::Path>, extra: Option<&std::collections
     ival
 }
 
-/// What one walk node is traced under.
 struct WalkJob<A: GraphArith = Fixed> {
     node: WalkNode,
     st: super::state::State<super::domain::Symbolic<A>>,
@@ -824,9 +788,8 @@ struct WalkOutcome<A: GraphArith = Fixed> {
     respawn: Option<std::collections::BTreeMap<super::iface::Path, super::iface::Conc<A>>>,
 }
 
-/// One traced walk node, or why its trace refused.
 enum WalkTraced<A: GraphArith = Fixed> {
-    /// Why the trace did not compile, and what it poisoned before refusing.
+    /// The refusal, and what the trace poisoned before it.
     Refused(String, std::collections::BTreeMap<String, usize>),
     Traced {
         frame: super::frame::Frame<A>,
@@ -842,14 +805,13 @@ enum WalkTraced<A: GraphArith = Fixed> {
     },
 }
 
-/// A walk node's converged frame, its bounds, and its binding (or why not).
+/// A walk node's converged frame, its bounds, and its binding.
 pub struct WalkFrame<A: GraphArith = Fixed> {
     pub frame: super::frame::Frame<A>,
     pub bounds: InputRanges<A>,
     pub bound: std::result::Result<Bound<A>, String>,
 }
 
-/// Trace one walk node on a worker's tracer, in that worker's arena.
 fn walk_trace<A: GraphArith>(
     tr: &mut Tracer<A>,
     job: &WalkJob<A>,
@@ -929,20 +891,17 @@ pub struct Tracer<A: GraphArith = Fixed> {
 }
 
 
-/// What a lattice walk runs under: the run's settings (the cart, the room,
-/// the region grid, `--build-trace`) and, for a test, `only` the player
-/// regions it traces (`None`: every region a state can be in).
+/// What a lattice walk runs under: the run's settings and, for a test,
+/// `only` the player regions it traces (`None`: every region).
 pub struct Walk<'a> {
     pub settings: &'a crate::settings::Settings,
     pub only: Option<&'a [Region]>,
 }
 
-/// The output of `room_constant_lattice`.
 pub struct LatticeWalk<A: GraphArith = Fixed> {
     pub tracer: Tracer<A>,
     /// Shape hash (of the input structure) -> the walk's shape key.
     pub by_hash: std::collections::HashMap<u64, String>,
-    /// The start state's shape key.
     pub start_key: String,
     pub lattice: std::collections::BTreeMap<String, std::collections::BTreeMap<super::iface::Path, super::iface::Conc<A>>>,
     pub reps: std::collections::BTreeMap<String, super::state::State<super::domain::Symbolic<A>>>,
@@ -950,12 +909,11 @@ pub struct LatticeWalk<A: GraphArith = Fixed> {
     pub frames: std::collections::BTreeMap<WalkNode, WalkFrame<A>>,
     pub cart: std::sync::Arc<celeste_core::cart_data::CartData>,
     pub cache: std::sync::Arc<celeste_core::collision_cache::CollisionCache>,
-    /// Per shape, input slots a reachable frame wrote an `rnd`-derived
-    /// interval to, typed as interval inputs. Monotone.
+    /// Per shape, input slots a reachable frame wrote an `rnd`-derived interval
+    /// to, typed as interval inputs.
     pub ival_extra: std::collections::BTreeMap<String, std::collections::BTreeSet<super::iface::Path>>,
     /// The start state's own intervals by path, the literal or `None` (the
-    /// representative holds a blanked point there; level -1 seeds from this).
-    /// A path absent here holds its start value in the representative, even
-    /// where a later frame writes an interval to it (`ival_extra`).
+    /// representative holds a blanked point there; level -1 seeds from this). A
+    /// path absent here holds its start value in the representative.
     pub start_ivals: std::collections::BTreeMap<super::iface::Path, Option<(A::Lit, A::Lit)>>,
 }

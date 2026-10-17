@@ -1,7 +1,5 @@
 //! The tracer's BOUNDARY: which heap slots are a frame's INPUTS (in order),
-//! and how to read the same slots back out afterwards. This numbering is the
-//! tracer's own, not `celeste_names::FIELD_NAMES`.
-//!
+//! and how to read them back out afterwards (the tracer's own numbering).
 //! A slot is named by its PATH from the globals (`objects[0].spd.x`), not a
 //! table id: a frame can replace an object (death allocates a new player),
 //! and a path that no longer resolves is a shape difference.
@@ -101,10 +99,8 @@ pub fn set<D: Domain>(st: &mut State<D>, p: &[Step], v: Value<D>) -> Result<()> 
 
 /// Every scalar slot reachable from `root`, in an order that depends only on
 /// the content (the hash part is a `BTreeMap`), not the allocation history.
-///
-/// A slot gets the FIRST path that reaches it (the heap is a graph: aliases
-/// are found through `objects` first), so a path names a slot only RELATIVE
-/// TO A SHAPE: comparing two states of the same shape by path is exact.
+/// A slot gets the FIRST path that reaches it (aliases are found through
+/// `objects` first), so a path names a slot only RELATIVE TO A SHAPE.
 pub fn scalars<D: Domain>(st: &State<D>, root: &[Step]) -> Result<Vec<Path>> {
     let v = get(st, root).ok_or_else(|| anyhow!("{}: no such slot", show(&root.to_vec())))?;
     let mut out = Vec::new();
@@ -149,31 +145,25 @@ fn collect<D: Domain>(
 }
 
 /// The input cells of one traced frame: cell `i` lives at `slots[i]` and
-/// held `init[i]` before it was replaced by a graph leaf.
-///
-/// `pins`: `(cell index, value)` for inputs BAKED INTO the body. The cell is
-/// still an input, read only by its `Op::Pin` check (`error::pins_hold`).
+/// held `init[i]` before it was replaced by a graph leaf. `pins`: `(cell
+/// index, value)` for inputs BAKED INTO the body, read only by their `Op::Pin`
+/// check (`error::pins_hold`).
 pub struct Iface<A: GraphArith = Fixed> {
     pub slots: Vec<Path>,
     pub init: Vec<Conc<A>>,
     pub pins: Vec<(usize, Conc<A>)>,
-    /// Parallel to `slots`: a number slot holds an INTERVAL (the widened
-    /// fields; `init` still records a point), which the emitter makes an
-    /// `ival` input. A boolean slot may be unknown in a lane (a near level's
-    /// floor `collideable`), which the emitter makes a `ubool` input.
+    /// Parallel to `slots`: a number slot holds an INTERVAL (`init` still
+    /// records a point), a boolean slot may be unknown in a lane (an `ival` /
+    /// `ubool` input).
     pub ival: Vec<bool>,
 }
 
 /// Replace every scalar under `roots` with a fresh `Op::Cell` leaf, and
-/// remember what it held.
-///
-/// Only under the roots, never the whole heap: the tracer's leverage is the
+/// remember what it held. Only under the roots: the tracer's leverage is the
 /// heap staying concrete (`btn(k_left)` indexes with a global). A slot
-/// reached twice gets one cell; cells are numbered in root order.
-///
-/// `pin` holds slots at the CALLER's value instead of reading a cell, so the
-/// trace folds through the constant. A pinned slot is still an input cell,
-/// read only by its `Op::Pin` (`trace_frame`), whose check is the assumption.
+/// reached twice gets one cell; cells are numbered in root order. `pin`
+/// holds slots at the CALLER's value, so the trace folds through the
+/// constant; the cell is read only by its `Op::Pin` check.
 pub fn symbolize<A: GraphArith>(
     d: &mut Symbolic<A>,
     st: &mut State<Symbolic<A>>,
