@@ -139,11 +139,9 @@ impl KeyField {
     }
 
     /// THE KEY READ of the lanes `need`: each one's code's placed bits in
-    /// `d` into `placed`; returns the lanes whose code `d` lacks (their
-    /// `placed` 0: a provisional key's partial key holds the fields that
-    /// hit, `MissKey`). Lanes of equal codes are one lookup: a
-    /// small dictionary is matched lane-parallel code by code, a big one
-    /// probed once per distinct value among the lanes.
+    /// `d` into `placed`; returns the lanes whose code `d` lacks (`placed`
+    /// 0, `MissKey`). A small dictionary is matched lane-parallel code by
+    /// code, a big one probed once per distinct value among the lanes.
     #[inline]
     fn eval<N: KernelLanes>(&self, buf: &[u8], half: usize, d: &FieldDict<N>, need: u16, placed: &mut Placed) -> u16 {
         if self.read == KeyRead::Bool {
@@ -672,10 +670,8 @@ impl<N: KernelLanes> AsmKernel<N> {
     }
 
     /// Body `bi`'s lane `i`'s exact content where a code is missing: its
-    /// fields that hit packed (`partial`), the outcome's and the body's
-    /// missing codes - a body's field is missing where its read missed the
-    /// lane (`read_miss`: the read's dictionary lacks the lane's code, or
-    /// the key space its shape).
+    /// fields that hit packed (`partial`), and the outcome's and the body's
+    /// missing codes (a field whose read missed the lane, `read_miss`).
     #[allow(clippy::too_many_arguments)]
     fn miss_key(&self, bi: usize, buf: &[u8], half: usize, i: usize, read_miss: &[u16], shape: u64, partial: u128, part_missing: &[(u32, Code<N>)]) -> MissKey<N> {
         let mut missing: Vec<(u32, Code<N>)> = part_missing.to_vec();

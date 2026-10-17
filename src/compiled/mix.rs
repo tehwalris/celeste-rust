@@ -96,7 +96,6 @@ pub struct Input<'a, A: crate::transpile::garith::GraphArith = celeste_core::ari
     pub compiled: &'a Compiled,
 }
 
-/// A node's role class.
 fn class(m: u8) -> &'static str {
     let guard = m & (ROLE_ERROR | ROLE_LIVE);
     let value = m & (ROLE_FIELD | ROLE_ARC);
@@ -123,7 +122,6 @@ fn spread(g: &Graph, root: NodeId, op: &Op, out: &mut Vec<NodeId>) {
     }
 }
 
-/// A machine instruction's category.
 fn category(mn: &str, ops: &str, kind: &str, node_op: &Op, store_role: &str) -> String {
     let reload = mn == "vmovdqu64" && ops.contains("(%rsp), %zmm");
     let spill = mn == "vmovdqu64" && ops.starts_with("%zmm") && ops.ends_with("(%rsp)");
@@ -173,7 +171,6 @@ fn category(mn: &str, ops: &str, kind: &str, node_op: &Op, store_role: &str) -> 
     c.to_string()
 }
 
-/// One kernel's census.
 pub(crate) fn report(inp: &Input) -> Result<Census> {
     let (g, comp) = (inp.fused, inp.compiled);
     let n = g.len();

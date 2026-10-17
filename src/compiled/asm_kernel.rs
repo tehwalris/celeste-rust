@@ -52,11 +52,9 @@ struct AsmBody {
     dup_refs: Vec<DupRef>,
 }
 
-/// An earlier body `body` and the (its slot, my slot, kind) pairs that
-/// differ in slot: every root the emission reads (stored fields, key
-/// fields, position sources, transfer roots). Equal on a lane in all of
-/// them, the two bodies emit the identical row, edge and transfer. The
-/// pairs are indices into the kernel's `DupPairs` (refs share them ~4x).
+/// An earlier body `body` and the `(its slot, my slot, kind)` pairs, as
+/// `DupPairs` ids, that differ among the roots the emission reads: equal on
+/// a lane in all of them, the two bodies emit the same row, edge and transfer.
 struct DupRef {
     body: usize,
     pairs: Vec<u32>,
@@ -790,10 +788,9 @@ impl<'c, N: EngineNum> InputView<'c, N> {
     }
 }
 
-/// `--key-check`: the boundary (`Rt2::boundary_canonicalize`) over a copy of
-/// an emitted block changes nothing (structure, shape hash), and every row's
-/// key is what the key space makes of the boundary's row (packed, or a
-/// provisional key of the same exact content).
+/// `--key-check`: the boundary over a copy of an emitted block changes
+/// nothing (structure, shape hash), and every row's key is what the key
+/// space makes of the boundary's row (packed, or provisional of equal content).
 pub(crate) fn key_check<N: crate::search::rem::Rem>(slot: &crate::storage::unit::RowBuf<N>, keys: &KeySpace<N>, prov: &Provisional<N>) {
     use celeste_engine::exact::{is_provisional, RowKey};
     let acc = slot.to_rt2();
@@ -1113,7 +1110,6 @@ fn unify<N: KernelLanes>(by_shape: &mut HashMap<(u64, Option<Region>), AsmKernel
     Ok(())
 }
 
-/// Apply the shape unions to one kernel's templates and bodies.
 fn apply_union<N: KernelLanes>(kernel: &mut AsmKernel<N>, unions: &HashMap<u64, std::sync::Arc<Rt2<N>>>) -> Result<()> {
     for t in &mut kernel.acc_templates {
         t.union = unions
@@ -1140,7 +1136,6 @@ fn build_one_shape<N: KernelLanes>(r: &crate::trace::lower::LoweredFrame<N::Arit
     let (fused, bodies, flat_roots, reprs) =
         crate::trace::lower::asm_fused_from(&r.bound, &r.lowered.spec)
             .with_context(|| format!("fusing shape {si} (hash {shape:#x})"))?;
-    // Row keys are folded per EMITTED row, not per lane in the kernel.
     // One output SLOT per DISTINCT root node; `slot_of[k]` for root k.
     let mut slot_of: Vec<usize> = Vec::with_capacity(flat_roots.len());
     let mut distinct: Vec<crate::transpile::graph::NodeId> = Vec::new();
@@ -1301,10 +1296,9 @@ fn build_one_shape<N: KernelLanes>(r: &crate::trace::lower::LoweredFrame<N::Arit
     ))
 }
 
-/// Every body's `dup_refs`: the earlier bodies of its outcome whose fork
-/// configuration differs from its own in exactly one fork. Every root slot
-/// is compared (fields, so whatever the union stores; key fields and
-/// position sources are fields); a pair of kinds that differ is no ref.
+/// Every body's `dup_refs`: the earlier bodies of its outcome one fork away.
+/// Every root slot is compared (key fields and position sources are
+/// fields); differing kinds are no ref.
 fn dup_refs(bodies: &mut [AsmBody], reads: &[emit::BodyReads]) -> DupPairs {
     let mut ids = DupPairs::default();
     let n = bodies.len();

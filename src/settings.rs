@@ -1,24 +1,19 @@
 //! THE RUN'S SETTINGS: every setting of a run, from its COMMAND LINE
-//! (`Settings` is the flags' struct, flattened into the binary's
-//! arguments), in ONE value (made by `startup`) that the binary PASSES to
-//! what reads it: no global. The kernel registry and the level -1 table,
-//! cached per process, are keyed on them. A `CELESTE_*` variable is refused
-//! at startup (`refuse_env`, with the flag that replaced it).
+//! (`Settings`, the flags' struct), in ONE value (made by `startup`) that the
+//! binary PASSES to what reads it: no global, no environment (`refuse_env`).
+//! The kernel registry and the level -1 table, cached per process, are keyed
+//! on them.
 //!
-//! ONE TABLE: the struct's fields are the flags, and `rows` is every setting
-//! as text, from which come the tree's record (`recorded`), the startup
-//! log, the level -1 table's cache key (`cart_key`) and a record read back
-//! (`of_tree`: the record's values are the flags' texts).
+//! ONE TABLE: the fields are the flags, and `rows` is every setting as text:
+//! the tree's record (`recorded`), the startup log, the level -1 table's
+//! cache key (`cart_key`), a record read back (`of_tree`).
 //!
-//! The settings that change what a level's tree holds, and its level, are
-//! RECORDED in the tree (`<level dir>/settings.txt`) when its frame 0 is
-//! written, and compared with the run's on every resume or reuse (`check`):
-//! a difference is an error, never a silently mixed tree. A resume does NOT
-//! default the flags to the recorded ones: the same command line would then
-//! mean another search depending on what is on disk. Only a command that
-//! reads a finished tree takes its settings from the record (`of_tree`).
-//! The level -1 filter is recorded apart (`frame::TreeFilter`,
-//! `level_minus_one.txt`); threads and the diagnostics never change a tree.
+//! A tree RECORDS the settings that change it, its level included
+//! (plans/architecture.md "Per-tree records"), and refuses a run under
+//! others (`check`). A resume does NOT default the flags to the record: the
+//! same command line would then mean another search depending on what is on
+//! disk. Only a command that reads a finished tree takes its settings from
+//! the record (`of_tree`).
 
 use anyhow::{Context, Result};
 use clap::Parser;

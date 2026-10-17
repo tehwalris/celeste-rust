@@ -24,15 +24,12 @@ pub trait KernelLanes: crate::search::rem::Rem {
     /// The 16 lanes of the value slot at byte `off` (`half`: the halves'
     /// distance in this buffer; 16.16 has none).
     fn col(buf: &[u8], half: usize, off: usize) -> [Self::Raw; 16];
-    /// Lane `l`'s raw at slot `off`.
     fn lane(buf: &[u8], half: usize, off: usize, l: usize) -> Self::Raw;
-    /// Write lane `l`'s raw at slot `off`.
     fn put(buf: &mut [u8], half: usize, off: usize, l: usize, r: Self::Raw);
     /// A boolean slot's 16-lane `(val, known)` masks.
     fn masks(buf: &[u8], half: usize, off: usize) -> (u16, u16);
     /// Write a boolean slot's masks (`known` only where `ubool`).
     fn put_masks(buf: &mut [u8], half: usize, off: usize, val: u16, known: Option<u16>);
-    /// The lanes where `c` holds `v`.
     fn eq_lanes(c: &[Self::Raw; 16], v: Self::Raw) -> u16;
     /// The lanes where the value slots `a` and `b` are equal.
     fn eq_slots(buf: &[u8], half: usize, a: usize, b: usize) -> u16;
