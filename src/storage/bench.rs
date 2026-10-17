@@ -1,8 +1,6 @@
 //! THE FRAME BENCHMARK's measures (`rewrite bench frame`, plans/devloop.md
-//! "The forward frame benchmark"): the fingerprints of a frame's output
-//! (its edge file as `ckhash --edges` counts it; the bytes of every file
-//! it wrote), the hardware counters over a rep and the frame's steps, the
-//! cost report and the memory report.
+//! "The forward frame benchmark"): fingerprints of a frame's output,
+//! hardware counters, the cost report and the memory report.
 
 use crate::search::hull::HullOf;
 use anyhow::{ensure, Context, Result};
@@ -19,8 +17,7 @@ pub fn edge_fingerprint<N: crate::search::rem::Rem>(edges_dir: &Path, frame: u32
 /// `ckhash --edges`'s per-edge term: `mix64(node(dst) ^ node(src) <<< 21 ^
 /// pair <<< 42)`, a node `ContentHash::state` of its (shape, key, cell)
 /// (`mix64(key hash ^ cell << 1)`), a pair the hash of its bytes - summed
-/// over a frame's edges, with their count. Each pair hashed once, each key
-/// once a block (its dictionaries').
+/// over a frame's edges, with their count.
 pub struct EdgeHashes {
     pairs: Vec<u64>,
 }
@@ -75,11 +72,9 @@ impl EdgeHashes {
     }
 }
 
-/// One `bench frame` rep for its COST REPORT (`print_cost`): the frame's
-/// stats (`--phases` on: `FrameStats::phase_s`), its checkpoint's steps
-/// and the pos graph's wall (`--checkpoint`), the wave's workers, the
-/// whole rep's wall, the machine's load average at its start and the
-/// rep's hardware counts (`Counters`).
+/// One `bench frame` rep for the COST REPORT (`print_cost`): the frame's
+/// stats, its checkpoint's steps and the pos graph's wall (`--checkpoint`),
+/// the rep's wall, the load average at its start, its hardware counts.
 pub struct Rep {
     pub stats: crate::frame::FrameStats,
     pub ckpt: Option<(crate::frame::Checkpointed, std::time::Duration)>,
@@ -92,16 +87,15 @@ pub struct Rep {
 /// HARDWARE COUNTERS over a rep, every thread it starts included (Linux
 /// `perf_event_open`, `inherit`: a thread's counts join its parent's when
 /// it exits, and a frame's threads are all joined by its end): user-mode
-/// instructions, user-mode cycles, kernel-mode cycles, page faults. Instructions do
-/// not move with the machine's load as walls do (a shared machine's other
-/// jobs slow a rep, they do not add to its instructions). `None` where the
-/// kernel refuses (`perf_event_paranoid`).
+/// instructions, user-mode cycles, kernel-mode cycles, page faults.
+/// Instructions do not move with the machine's load as walls do.
 pub struct Counters {
     fds: [i32; 4],
 }
 
 impl Counters {
-    /// The counters, disabled (open them before the threads they count start).
+    /// The counters, disabled (open them before the threads they count
+    /// start); `None` where the kernel refuses (`perf_event_paranoid`).
     pub fn open() -> Option<Counters> {
         // `perf_event_attr` (PERF_ATTR_SIZE_VER0, 64 bytes): type, size,
         // config, sample_period, sample_type, read_format, the flag bits
@@ -217,14 +211,11 @@ struct Line {
     counts: Option<Vec<[u64; 4]>>,
 }
 
-/// THE COST REPORT of a frame's reps (`bench frame`; plans/devloop.md):
-/// the frame's wall split into the wave, the frame end and the
-/// checkpoint; the wave's WORKER-SECONDS by phase (`frame::phases`) with
-/// the idle share; the frame end's and the checkpoint's steps (walls, on
-/// one thread or all); each with its cost per element (ns a lane in, an
-/// emission, a re-pushed edge, a push, a new state, ...); the bytes
-/// written and the memory. Min and max over the reps (a shared machine:
-/// quote the min, with the load).
+/// THE COST REPORT of a frame's reps: the frame's wall split into the
+/// wave, the frame end and the checkpoint; the wave's WORKER-SECONDS by
+/// phase (`frame::phases`) with the idle share; the end's and checkpoint's
+/// steps; each with its cost per element; the bytes written and the
+/// memory. Min and max over the reps (quote the min, with the load).
 pub fn print_cost(frame: u32, reps: &[Rep]) {
     use crate::frame::phases as ph;
     let Some(r0) = reps.first() else { return };
@@ -406,10 +397,8 @@ pub fn dir_fingerprint(dir: &Path) -> Result<(u64, u64, u64)> {
 }
 
 /// THE MEMORY CENSUS of a forward between frames (`bench frame`'s
-/// `[memory]`): what its structures allocate, by part, against the visited
-/// set's states and entries, beside the process's resident set (the rest:
-/// the kernels, the allocator's retained and fragmented pages, what no
-/// part counts).
+/// `[memory]`): what its structures allocate, by part, per visited state
+/// and entry, beside the process's resident set.
 pub fn print_memory<N: crate::search::rem::Rem>(when: &str, visited: &super::visited::VisitedSet<N>, new: &super::layer::Layer<N>, hulls: &[HullOf<N>], old: &super::wave::ByLayer<N>, outs: &super::out::OutStore, xfers: &super::edges::XferTable<N>) {
     let mut parts: Vec<(&str, usize)> = visited.census();
     let f = new.set.bytes();

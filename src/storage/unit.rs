@@ -1,13 +1,9 @@
-//! ONE UNIT of a wave (plans/architecture.md "The forward"): a run of
-//! frontier rows through the kernels. The sink (`UnitSink`, one per worker,
-//! reset per unit) ORs each emission into its BUNDLE of its target's route
-//! (`route::UnitBundles`: source key, transfer, offset, target key ->
-//! target cells) - nothing is looked up and no row is copied here: the
-//! target region's worker merges the pushes and records the edges
-//! (`route::run_route`), and the new layer is decoded from the keys
-//! (`wave`). At the unit's end its bundles are the chunks of their routes,
-//! each with its PUSHES: per target cell the hulls of the unit's sources
-//! pushed along the bundles' transfers (`search::hull`).
+//! THE UNIT SINK (`UnitSink`, one per worker, reset per unit): a unit's
+//! emissions ORed into BUNDLES by their target's route - nothing is looked
+//! up and no row is copied here (plans/architecture.md "The forward: hulls
+//! and storage"). At the unit's end its bundles are the chunks of their
+//! routes, each with its PUSHES: per target cell the hulls of the unit's
+//! sources pushed along the bundles' transfers.
 
 use crate::search::hull::{AccOf, HullOf};
 use anyhow::Result;
@@ -23,19 +19,17 @@ use crate::frame::Filters;
 use crate::search::rem::Rem;
 use celeste_engine::exact::{is_provisional, KeySpace, Provisional, RowKey};
 
-/// A typed varying column of buffered rows: raw words (16.16's by
-/// default), (low, high) pairs, or a byte per bool (0 false, 1 true, 2
-/// unknown).
+/// A typed varying column of buffered rows: raw words, (low, high) pairs,
+/// or a byte per bool (0 false, 1 true, 2 unknown).
 pub enum TCol<N: EngineNum = P8> {
     Num(Vec<N::Raw>),
     Ival(Vec<(N::Raw, N::Raw)>),
     Bool(Vec<u8>),
 }
 
-/// Rows of one shape, columnar: the shape's skeleton (the union of its
-/// outcome templates' varying cells), a `TCol` per varying cell, key and
-/// cell per row. A unit buffers rows here only to look at them: the
-/// coarser level's verdicts, the key check, the decode guard.
+/// Rows of one shape, columnar over its skeleton (the union of its outcome
+/// templates' varying cells), buffered only to look at them: the coarser
+/// level's verdicts, the key check, the decode guard.
 pub struct RowBuf<N: EngineNum = P8> {
     pub shape: u64,
     skeleton: Rt2<N>,
@@ -46,7 +40,6 @@ pub struct RowBuf<N: EngineNum = P8> {
 }
 
 impl<N: EngineNum> RowBuf<N> {
-    /// An empty buffer over `skeleton`.
     pub fn new(skeleton: Rt2<N>) -> Self {
         let cols = skeleton
             .cols
@@ -66,7 +59,6 @@ impl<N: EngineNum> RowBuf<N> {
         self.keys.len()
     }
 
-    /// The buffer's skeleton (its shape's).
     pub fn skeleton(&self) -> &Rt2<N> {
         &self.skeleton
     }
@@ -84,7 +76,6 @@ impl<N: EngineNum> RowBuf<N> {
         self.cells.clear();
     }
 
-    /// The whole buffer as a block.
     pub fn to_rt2(&self) -> Rt2<N> {
         let mut b = celeste_engine::slots::reshape(&self.skeleton, 0);
         b.cols = self
@@ -119,8 +110,7 @@ impl<N: EngineNum> RowBuf<N> {
         b
     }
 
-    /// Push one materialized row (the reference engine's path): each typed
-    /// cell's value, of its column's kind.
+    /// Push one materialized row (the reference engine's path).
     pub fn push_row(&mut self, row: &Rt2<N>, key: Key, cell: u32) {
         debug_assert_eq!(row.width, 1);
         for (c, col) in self.cols.iter_mut() {
@@ -171,10 +161,9 @@ pub(crate) fn lanes_of(mut m: u16) -> impl Iterator<Item = usize> {
     })
 }
 
-/// A slice's TARGETS in one cell column of one output shape
-/// (`UnitSink::targets`, once per column, not per body): per lane its cell,
-/// route and bit in the route's region, its source (the unit's source
-/// index and region) and the offset between the two cells.
+/// A slice's TARGETS in one cell column of one output shape (made once per
+/// column, not per body): per lane its cell, route, bit in the route's
+/// region, source (index and region) and the offset between the cells.
 #[derive(Clone, Copy)]
 pub struct Targets {
     pub cells: [u32; 16],
@@ -191,10 +180,9 @@ impl Default for Targets {
     }
 }
 
-/// ONE BODY's emissions of a kernel slice (`compiled::asm_kernel`'s
-/// emission, column-wise): the lanes `take`, lane `i` the state `(shape,
-/// keys[i], targets.cells[i])` reached from unit lane `lanes[i]` with
-/// transfer `xfers[i]`.
+/// ONE BODY's emissions of a kernel slice, column-wise: the lanes `take`,
+/// lane `i` the state `(shape, keys[i], targets.cells[i])` reached from
+/// unit lane `lanes[i]` with transfer `xfers[i]`.
 pub struct BodyEmits<'e> {
     pub shape: u64,
     pub take: u16,
@@ -220,7 +208,6 @@ pub struct UnitSink<'a, N: Rem = P8> {
     /// The level the wave runs at (a reference row's key view).
     level: crate::abstraction::Level,
     pub worker: u32,
-    /// The unit's index in the wave.
     pub unit: u32,
     /// The unit's sources: its entries `(region, key)`, each one's index
     /// among the unit's distinct `(shape, key)`s (`unit_sources`, the
@@ -241,8 +228,7 @@ pub struct UnitSink<'a, N: Rem = P8> {
     /// slot (the targets' cells in order), and each target's first slot.
     push_slots: Vec<AccOf<N>>,
     push_offs: Vec<u32>,
-    /// Pushes by (hull, local transfer id): ids are this worker's for the
-    /// frame.
+    /// Pushes by (hull, this worker's transfer id).
     push_cache: crate::search::hull::PushCache<N>,
     /// This worker's routes (and their slots), and the last one asked.
     route_ids: FxHashMap<(u64, u32), u32>,
@@ -259,24 +245,20 @@ pub struct UnitSink<'a, N: Rem = P8> {
     /// The rows awaiting a verdict, per shape, and their targets.
     scratch: Vec<RowBuf<N>>,
     scratch_at: Vec<Vec<Target>>,
-    /// Some target of the unit was disallowed: its records go at the
-    /// unit's end.
+    /// A target of the unit was disallowed: `end` drops its records.
     disallowed: bool,
     /// `--key-check`: every emission's row, checked in batches (its key,
     /// and that its key and cell decode to it).
     key_check: bool,
     check: Vec<RowBuf<N>>,
-    /// `--phases`: the wave's phase timers (`frame::phases`).
     pub phases: bool,
     /// The level -1 table of `filters.minus_one`, resolved once.
     l1: Option<&'static crate::search::level_minus_one::CostToGo>,
     drop_last: Option<((u64, u32), bool)>,
     /// TRANSFER IDS: a pair the tree's table holds (`base`, read only
-    /// during the wave, shared by the workers) is its global id; a pair new
-    /// this frame is this worker's LOCAL id `l`, named `first_new + l` (the
-    /// gather gives it its global id: the region phase's remaps). Only the
-    /// new pairs cost the worker anything (each worker held every pair it
-    /// met: ~170 B a pair a worker).
+    /// during the wave) is its global id; a pair new this frame is this
+    /// worker's LOCAL id `l`, named `first_new + l` (the gather gives it its
+    /// global id: the region phase's remaps). Only new pairs cost memory.
     base: &'a super::edges::XferTable<N>,
     first_new: u32,
     xfer_ids: FxHashMap<N::Pair, u32>,
@@ -286,22 +268,19 @@ pub struct UnitSink<'a, N: Rem = P8> {
     /// frame's new transfers are numbered by their count: `wave`).
     xfer_counts: Vec<u64>,
     xfer_cache: Vec<(crate::compiled::asm_kernel::RawWords<N>, u32)>,
-    /// The worker's table of local transfers (the wave's gather reads it),
-    /// and its length.
+    /// The worker's table of local transfers (the gather reads it), its length.
     xfer_tab: &'a std::sync::RwLock<Vec<N::Pair>>,
     xfer_len: u32,
     /// The units' chunks.
     pub outbox: Vec<Chunk<N>>,
-    /// Record the units' OUT-EDGES (`storage::out`): its last unit's blocks
-    /// (raw, and whether a target key is provisional), and the parts they
-    /// are built from.
+    /// Record OUT-EDGES (`storage::out`): the last unit's blocks (raw, and
+    /// whether a target key is provisional) and the parts they are made of.
     record_out: bool,
     pub out_blocks: Vec<(Vec<u8>, bool)>,
     out_parts: super::out::Parts<N>,
-    /// The unit's transfers, each one's rank among them by pair
-    /// (`out_parts_of`).
+    /// The unit's transfers' ranks by pair (`out_parts_of`).
     x_rank: FxHashMap<u32, u32>,
-    /// Record `edges` (the pos graph) at all.
+    /// Record the pos graph's edges.
     pub edges_on: bool,
     /// The distinct pos-graph edges this worker produced, and the ones met
     /// recently (direct-mapped: a slice's lanes repeat their edges).
@@ -310,19 +289,17 @@ pub struct UnitSink<'a, N: Rem = P8> {
     /// Emissions past level -1 (each one a record).
     pub emitted: u64,
     /// The shapes this worker noted (`note_shape`), registered
-    /// (`Skeletons`) and checked this frame (`guard`).
+    /// (`Skeletons`) and checked this frame (the decode guard).
     noted: FxHashSet<u64>,
     registered: FxHashSet<u64>,
     guarded: FxHashSet<u64>,
-    /// Inside `emit_row` (the reference engine's rows: no guard, no key
-    /// check).
+    /// Inside `emit_row` (reference rows: no guard, no key check).
     reference: bool,
     /// The last emission's shape, once registered and guarded (0: none).
     last_shape: u64,
 }
 
-/// Transfer `x`'s pair: a global id's in the tree's table `base`, a local
-/// one's (`first_new` on) in the worker's table `tab`.
+/// Transfer `x`'s pair (`UnitSink::base`: local ids from `first_new` on).
 #[inline]
 fn pair_of<N: Rem>(base: &super::edges::XferTable<N>, tab: &[N::Pair], first_new: u32, x: u32) -> N::Pair {
     match x.checked_sub(first_new) {
@@ -410,10 +387,8 @@ impl<'a, N: Rem> UnitSink<'a, N> {
         }
     }
 
-    /// Bytes this worker's buffers hold (`--phases`' `[wavemem]`): its
-    /// bundles, its lanes' hulls, its pos-graph pairs, its transfers (by
-    /// pair, decoded, counted, its table, its ranks), the rest (the unit's
-    /// sources and lanes, chunks not yet handed over).
+    /// Bytes this worker's buffers hold (`--phases`' `[wavemem]`): bundles,
+    /// lanes' hulls, pos-graph pairs, transfers, the rest.
     pub fn alloc_bytes(&self) -> [usize; 5] {
         use std::mem::size_of;
         [
@@ -440,7 +415,6 @@ impl<'a, N: Rem> UnitSink<'a, N> {
         self.keys
     }
 
-    /// The wave's provisional keys.
     #[inline]
     pub fn provisional(&self) -> &'a Provisional<N> {
         self.prov
@@ -486,16 +460,14 @@ impl<'a, N: Rem> UnitSink<'a, N> {
         self.srcs.len() as u32 - 1
     }
 
-    /// The unit's next lane: a state of source entry `entry` at `cell`,
-    /// with its hull.
+    /// The unit's next lane: source entry `entry`'s state at `cell`, its hull.
     #[inline]
     pub fn push_lane(&mut self, entry: u32, cell: u32, hull: HullOf<N>) {
         self.lanes.push((entry, cell));
         self.hulls.push(hull);
     }
 
-    /// The unit's sources and lanes are in: their hulls by source and
-    /// cell.
+    /// The unit's sources and lanes are in: their hulls by source and cell.
     pub fn sources_done(&mut self) {
         let geo = super::GEOMETRY;
         self.src_first.clear();
@@ -533,12 +505,10 @@ impl<'a, N: Rem> UnitSink<'a, N> {
         panic!("unit {}: a bundle's source cell {cell} of source {s} is no lane of the unit", self.unit)
     }
 
-    /// The EDGES of bundle `b` (target slot `slot`; not `NO_XFER`'s) by
-    /// the unit's ENTRY they leave (a source key's cells in several regions
-    /// are several entries): `f(entry, its target cells, the shift to
-    /// their source cells)` - one shift of the grid between two cells'
-    /// regions (`bundle::shift_into`), else (into or out of `NO_CELL`) one
-    /// cell at a time and no shift: its source is `src_lane`'s.
+    /// The EDGES of bundle `b` (target slot `slot`) by the unit's ENTRY
+    /// they leave (a source key's cells in several regions are several
+    /// entries): `f(entry, target cells, shift to their source cells)`; into
+    /// or out of `NO_CELL`, one cell at a time and no shift (`src_lane`).
     #[inline]
     fn by_entry(&self, slot: u32, b: &super::route::Ub, mut f: impl FnMut(u32, u64, Option<i32>)) {
         use super::bundle::{shift_into, source_cell, TO_NONE};
@@ -582,9 +552,8 @@ impl<'a, N: Rem> UnitSink<'a, N> {
         self.filters.minus_one.is_some()
     }
 
-    /// The level -1 filter at EMISSION: does it drop every row of
-    /// (`shape`, `cell`) at this frame? Then the row is never keyed or
-    /// looked up. Half the emissions of room (6,2) 100% f57.
+    /// The level -1 filter at EMISSION: does it drop every row of (`shape`,
+    /// `cell`) at this frame? Then the row is never keyed or looked up.
     #[inline]
     pub(crate) fn minus_one_drop(&mut self, shape: u64, cell: u32) -> bool {
         let Some(m) = self.filters.minus_one else { return false };
@@ -611,10 +580,9 @@ impl<'a, N: Rem> UnitSink<'a, N> {
         dropped
     }
 
-    /// The pos-graph edges (when edges are on) from the unit lanes `lanes`
-    /// of a slice's lanes `need` into their `cells`: every lane a body
-    /// takes, emitted or dropped, records its edge (the pos graph is a set:
-    /// once per cell column of a slice, not per body).
+    /// The pos-graph edges from the unit lanes `lanes` of a slice's lanes
+    /// `need` into their `cells`: every lane taken, emitted or dropped (the
+    /// pos graph is a set: once per cell column of a slice, not per body).
     #[inline]
     pub fn pos_edges(&mut self, cells: &[u32; 16], need: u16, lanes: &[usize]) {
         if self.edges_on {
@@ -644,9 +612,8 @@ impl<'a, N: Rem> UnitSink<'a, N> {
     }
 
     /// `xfer_id` of a raw transfer, through a small direct-mapped cache of
-    /// raw -> id: a frame has few distinct transfers (room (1,0) to f99:
-    /// 17k) against one lookup per emitted lane, and the decode plus the
-    /// hash-map intern was ~17% of a forward.
+    /// raw -> id: a frame has few distinct transfers against one lookup per
+    /// emitted lane.
     #[inline]
     pub fn xfer_id_raw(&mut self, words: &crate::compiled::asm_kernel::RawWords<N>, decode: impl FnOnce(&crate::compiled::asm_kernel::RawWords<N>) -> N::Pair) -> u32 {
         let mut h = 0u64;
@@ -694,7 +661,6 @@ impl<'a, N: Rem> UnitSink<'a, N> {
         }
     }
 
-    /// Per local transfer id, the edges this worker recorded with it.
     pub fn xfer_counts(&self) -> &[u64] {
         &self.xfer_counts
     }
@@ -704,7 +670,6 @@ impl<'a, N: Rem> UnitSink<'a, N> {
         self.xfer_len as usize
     }
 
-    /// The route of `(shape, slot)`.
     #[inline]
     pub(crate) fn route(&mut self, shape: u64, slot: u32) -> u32 {
         if (self.last_route.0, self.last_route.1) == (shape, slot) {
@@ -751,12 +716,8 @@ impl<'a, N: Rem> UnitSink<'a, N> {
         }
     }
 
-    /// ONE EMISSION: the state `(shape, key, cell)` reached from lane `lane`
-    /// with transfer `xfer` (`None`: the reference engine's path, no edge):
-    /// `emit_body` of one lane. `init` is the shape's skeleton (the new
-    /// layer's rows are decoded with it: `Skeletons`); `push` appends the
-    /// row to a buffer, when the row is looked at (a verdict, the key check,
-    /// the decode guard).
+    /// ONE EMISSION: `emit_body` of one lane, the state `(shape, key, cell)`
+    /// reached from unit lane `lane` with transfer `xfer`.
     #[allow(clippy::too_many_arguments)]
     pub fn emit(&mut self, shape: u64, cell: u32, key: Key, lane: usize, xfer: u32, init: impl Fn() -> Rt2<N>, mut push: impl FnMut(&mut RowBuf<N>)) -> Result<()> {
         let mut targets = Targets::default();
@@ -765,11 +726,10 @@ impl<'a, N: Rem> UnitSink<'a, N> {
         self.emit_body(&e, init, |b, _| push(b))
     }
 
-    /// A BODY'S EMISSIONS (`BodyEmits`): per lane its state into its
-    /// route's bundle (source key, transfer, offset, target key -> cells).
-    /// `init` is the shape's skeleton (the new layer's rows are decoded with
-    /// it: `Skeletons`); `push(buf, i)` appends lane `i`'s row to a buffer,
-    /// when a row is looked at (a verdict, the key check, the decode guard).
+    /// A BODY'S EMISSIONS: per lane its state into its route's bundle.
+    /// `init` is the shape's skeleton (the new layer's rows decode with it:
+    /// `Skeletons`); `push(buf, i)` appends lane `i`'s row to a buffer when
+    /// a row is looked at (a verdict, the key check, the decode guard).
     pub fn emit_body(&mut self, e: &BodyEmits, init: impl Fn() -> Rt2<N>, mut push: impl FnMut(&mut RowBuf<N>, usize)) -> Result<()> {
         let (shape, t) = (e.shape, e.targets);
         let mut take = e.take;
@@ -779,8 +739,7 @@ impl<'a, N: Rem> UnitSink<'a, N> {
         self.emitted += take.count_ones() as u64;
         // A shape's first emission (this worker, this wave): its skeleton
         // registered, and THE DECODE GUARD - its row is what its key and
-        // cell decode to (the new layer is decoded). Looked at only when the
-        // shape is not the last emission's.
+        // cell decode to. Looked at only when the shape is not the last's.
         if shape != self.last_shape {
             if !self.registered.contains(&shape) {
                 self.skeletons.register(&init())?;
@@ -861,9 +820,8 @@ impl<'a, N: Rem> UnitSink<'a, N> {
         Ok(())
     }
 
-    /// The edges `m` (target cells) of bundle `(route, t_key; source s,
-    /// transfer x, offset o)` into the unit's bundles, counted for their
-    /// transfer.
+    /// The edges `m` (target cells) of bundle `(route, t_key; s, x, o)` into
+    /// the unit's bundles, counted for their transfer.
     #[inline]
     fn bundle(&mut self, route: u32, t_key: Key, s: u32, x: u32, o: u32, m: u64) {
         if let Some(l) = x.checked_sub(self.first_new) {
@@ -907,13 +865,11 @@ impl<'a, N: Rem> UnitSink<'a, N> {
         Ok(())
     }
 
-    /// A reference row (a CANONICAL row) as the tree holds it, and its key:
-    /// the level's held buttons widened, as its kernels key it (with every
-    /// level's widenings: `Rt2::widen_to`), in the tree's dictionaries -
-    /// provisional where a code is new. The row is the WIDENED one: a
-    /// tree's state is `(shape, key, cell)`, and its stored row is what the
-    /// key decodes to (plans/architecture.md, "Keys"), not whichever concrete row
-    /// of the class came first.
+    /// A reference row (CANONICAL) as the tree holds it, and its key: widened
+    /// as its kernels key it (the level's held buttons, every level's
+    /// widenings: `Rt2::widen_to`), provisional where a code is new. The row
+    /// is the WIDENED one: a state's stored row is what its key decodes to
+    /// (plans/architecture.md "Keys"), not the class's first concrete row.
     pub fn row_key(&mut self, row: &Rt2<N>) -> (Rt2<N>, Key) {
         let level = crate::abstraction::Level { held: self.level.held, ..crate::abstraction::Level::EXACT };
         let mut w = row.clone_block();
@@ -931,10 +887,9 @@ impl<'a, N: Rem> UnitSink<'a, N> {
 
     /// The reference engine's emission: one materialized row from unit lane
     /// `lane` (stored widened: `row_key`) with its transfer `pair`, and its
-    /// pos-graph edge.
-    /// Its shape's skeleton is the row's structure with every value cell
-    /// left to the decode (`decode::Repr::Other`): a reference row's
-    /// columns follow its values, not a kernel's template.
+    /// pos-graph edge. Its shape's skeleton leaves every value cell to the
+    /// decode (`decode::reference_skeleton`): a reference row's columns
+    /// follow its values, not a kernel's template.
     pub fn emit_row(&mut self, row: &Rt2<N>, lane: usize, cell: u32, pair: N::Pair) -> Result<()> {
         debug_assert_eq!(row.width, 1);
         if self.edges_on {
@@ -979,11 +934,10 @@ impl<'a, N: Rem> UnitSink<'a, N> {
         self.last_shape = 0;
     }
 
-    /// The PUSHES of a route's bundles (`bundles` naming `targets` by
-    /// index, the route at `slot`): per target cell, the hulls of the
-    /// bundles' source cells pushed along their transfers (`Hull::push`;
-    /// a bundle without a transfer pushes the whole circle), merged -
-    /// `(target, cell, hull so far)`, the cells nothing reached left out.
+    /// The PUSHES of a route's bundles (naming `targets` by index, the route
+    /// at `slot`): per target cell the hulls of the bundles' source cells
+    /// pushed along their transfers (`Hull::push`), merged - `(target, cell,
+    /// hull so far)`, the cells nothing reached left out.
     #[inline(never)]
     fn pushes(&mut self, slot: u32, targets: &[(Key, u64)], bundles: &[super::route::Ub]) -> Vec<(u32, u8, AccOf<N>)> {
         let geo = super::GEOMETRY;
@@ -1124,9 +1078,8 @@ impl<'a, N: Rem> UnitSink<'a, N> {
     }
 
     /// The unit's bundles (`buckets`: route, targets, bundles) as its
-    /// OUT-EDGE block's parts (`storage::out`): each bundle's cells split
-    /// by the source ENTRY they leave (a source key's cells in two regions
-    /// are two entries, `by_entry`).
+    /// OUT-EDGE block's parts (`storage::out`): each bundle's cells split by
+    /// the source ENTRY they leave (`by_entry`).
     #[inline(never)]
     fn out_parts_of(&mut self, buckets: &[(u32, Vec<(Key, u64)>, Vec<super::route::Ub>)]) {
         let mut p = std::mem::take(&mut self.out_parts);

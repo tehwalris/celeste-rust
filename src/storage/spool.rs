@@ -1,11 +1,9 @@
-//! A frame's SPOOL: compressed blocks the wave makes long before the
-//! frame's end writes them - the out file's per kernel unit, the edge
-//! file's segments per region job - appended to a scratch file as they are
-//! made and copied into their files by the writers. Page cache the kernel
-//! can write back and reclaim, not the anonymous memory they held to the
-//! frame's end (the fixture room's f279: 1.44 GB of out blocks and 0.86 GB
-//! of segments). The file is unlinked once created: nothing is left behind,
-//! whatever ends the process.
+//! A frame's SPOOL: the compressed blocks the wave makes long before the
+//! frame's end writes them (out blocks, edge segments), appended to a
+//! scratch file and copied into their files by the writers - page cache
+//! the kernel can reclaim, not anonymous memory held to the frame's end.
+//! The file is unlinked once created: nothing is left behind, whatever
+//! ends the process.
 
 use anyhow::{Context, Result};
 use std::os::unix::fs::FileExt;
@@ -46,7 +44,6 @@ impl Spool {
         self.file.read_exact_at(buf, s.at).context("reading the frame's spool")
     }
 
-    /// Bytes spooled.
     pub fn bytes(&self) -> u64 {
         self.end.load(Ordering::Relaxed)
     }
