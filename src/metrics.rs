@@ -42,7 +42,6 @@ pub fn current_file_rss_gb() -> f64 {
 }
 
 /// This process's peak resident set (`VmHWM`, anonymous + file), in GB.
-
 pub fn peak_rss_gb() -> f64 {
     status_gb("VmHWM:")
 }

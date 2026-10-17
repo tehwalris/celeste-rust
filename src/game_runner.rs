@@ -1,5 +1,5 @@
 //! Game setup: the start-room configuration the whole search agrees on (the
-//! cart substitution, the collision cache's room, the win room).
+//! cart substitution, the win room, the level index).
 
 use anyhow::{anyhow, Result};
 
@@ -46,14 +46,12 @@ pub fn apply_start_room(game_lua: &str, s: &crate::settings::Settings) -> Result
 mod tests {
     use super::apply_start_room;
 
-    // Room (1,0) exits to (2,0); a row's last room wraps to the next row.
     #[test]
     fn win_room_of_the_default_room() {
         assert_eq!(super::win_room((1, 0)), (2, 0));
         assert_eq!(super::win_room((7, 1)), (0, 2));
     }
 
-    // In the default room the substitution is the identity.
     #[test]
     fn apply_start_room_is_identity_for_default_room() {
         let src = "function _init()\n\tload_room(1, 0)\nend\n";

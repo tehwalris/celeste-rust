@@ -1,8 +1,7 @@
 //! Every script runs the project's binaries and cargo under `safe-run.sh`
-//! (CLAUDE.md "Running safely"). On 2026-10-11 an unwrapped `ckhash` in
-//! tools/fixtures.sh reached 70 GB beside a capped 100 GB search and took
-//! the machine down. This test reads the checked-in scripts and fails on a
-//! line that runs one without `safe-run` on the same line. And check.sh
+//! (CLAUDE.md "Running safely": an unwrapped run beside a capped one once
+//! took the machine down): this test reads the checked-in scripts and fails
+//! on a line that runs one without `safe-run` on the same line. And check.sh
 //! finds its tiers' ignored tests: every `#[ignore]` names its tier.
 
 /// The checked-in scripts: `*.sh` and `*.py` outside `ui/` and `target/`.

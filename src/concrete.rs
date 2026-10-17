@@ -1,6 +1,6 @@
-//! Concrete inputs and states: input bytes, the start states, reading a
-//! concrete row's fields, and the room's platform worlds. The concrete step
-//! itself is `RefEngine::step`.
+//! Concrete inputs and states: input bytes, reading a concrete row's
+//! fields, and the room's platform worlds. The concrete step itself is
+//! `RefEngine::step`.
 
 use anyhow::{anyhow, Result};
 use celeste_core::arith::{Arithmetic, EngineNum};

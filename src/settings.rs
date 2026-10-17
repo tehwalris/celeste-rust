@@ -1,39 +1,24 @@
 //! THE RUN'S SETTINGS: every setting of a run, from its COMMAND LINE
-//! (`Settings` is the flags' struct, flattened into every binary's
+//! (`Settings` is the flags' struct, flattened into the binary's
 //! arguments), in ONE value (made by `startup`) that the binary PASSES to
-//! what reads it. There is no global: an engine (`FrameEngine`,
-//! `RefEngine`) owns its settings, and the wave, the storage and the search
-//! take them from it or as a parameter; the kernel registry and the level -1
-//! table, cached per process, are keyed on them.
-//! Nothing reads the environment: a `CELESTE_*` variable is refused at
-//! startup (`refuse_env`, with the flag that replaced it).
+//! what reads it: no global. The kernel registry and the level -1 table,
+//! cached per process, are keyed on them. A `CELESTE_*` variable is refused
+//! at startup (`refuse_env`, with the flag that replaced it).
 //!
-//! ONE TABLE: the struct's fields are the flags (their docs, defaults and
-//! parsers), and `rows` is every setting as text, from which come the
-//! tree's record (`recorded`), the startup log, the level -1 table's cache
-//! key (`cart_key`) and a tree's record read back (`of_tree`: the record's
-//! values are the flags' texts).
+//! ONE TABLE: the struct's fields are the flags, and `rows` is every setting
+//! as text, from which come the tree's record (`recorded`), the startup
+//! log, the level -1 table's cache key (`cart_key`) and a record read back
+//! (`of_tree`: the record's values are the flags' texts).
 //!
-//! The settings that change what a level's tree holds are RECORDED in the
-//! tree (`<level dir>/settings.txt`) when its frame 0 is written, and
-//! compared with the run's on every resume or reuse (`check`): a difference
-//! is an error, never a silently mixed tree. A resume does NOT default the
-//! flags to the recorded ones: the same command line would then mean another
-//! search depending on what is on disk (a deleted tree rerun by "the same"
-//! command would silently change category). Only a command that reads a
-//! finished tree takes its settings from the record (`of_tree`).
-//!
+//! The settings that change what a level's tree holds, and its level, are
+//! RECORDED in the tree (`<level dir>/settings.txt`) when its frame 0 is
+//! written, and compared with the run's on every resume or reuse (`check`):
+//! a difference is an error, never a silently mixed tree. A resume does NOT
+//! default the flags to the recorded ones: the same command line would then
+//! mean another search depending on what is on disk. Only a command that
+//! reads a finished tree takes its settings from the record (`of_tree`).
 //! The level -1 filter is recorded apart (`frame::TreeFilter`,
-//! `level_minus_one.txt`): a tree serves every horizon up to it, and is
-//! never raised past it (`frame::grow_tree`). Threads and the diagnostics never change a
-//! tree. The level the tree's rows are widened at (the engine's `Level`) is
-//! a line of the record: a tree used at another level is refused like any
-//! other difference.
-//!
-//! The deep diagnostics have owners: `--key-check` and `--phases` the
-//! wave's sinks (`storage::unit::UnitSink`), `--build-trace`,
-//! `--kernel-explain` and the metrics the kernel build's options
-//! (`compiled::asm_kernel::BuildOptions`).
+//! `level_minus_one.txt`); threads and the diagnostics never change a tree.
 
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -58,7 +43,7 @@ pub enum Arith {
 pub enum FloatTool {
     /// UniversalClassicTas: the room loaded alone (the IL load), the file's
     /// seeds set on its balloons and chests (`set_seeds`). A secondary
-    /// report (Philippe; plans/float.md).
+    /// report (plans/float.md).
     Uct,
     /// Celia, THE float tool (the community's): the room entered with its
     /// loading jank (`--loading-jank J`, by default its IL load's:
@@ -174,7 +159,6 @@ pub struct Diagnostics {
     pub phases: bool,
 }
 
-/// `transpile`'s name for the flags.
 pub type SettingsArgs = Settings;
 
 /// The flags alone, parsed (the defaults; a record read back).
@@ -276,11 +260,9 @@ impl Settings {
         (Settings { balloon_seeds: seeds, ..self.clone() }, seeded)
     }
 
-    /// The FLOAT half of a dual search (`rewrite dual`, `search::dual`):
-    /// these settings - the fixed half's, real play from its
-    /// `--loading-jank` - under the float tool `tool`, from the tool's own
-    /// start: Celia's IL load's jank (`starts::celia_jank`) unless `jank`
-    /// gives one, UCT's IL load (no jank).
+    /// The FLOAT half of a dual search (`search::dual`): these settings (the
+    /// fixed half's) under the float tool `tool`, from the tool's own start:
+    /// Celia's IL load's jank unless `jank` gives one, UCT's IL load.
     pub fn float_half(&self, tool: FloatTool, jank: Option<usize>) -> Result<Settings> {
         anyhow::ensure!(self.arith == Arith::Fixed, "the dual search's settings are the fixed half's (no --arith float)");
         let loading_jank = match tool {
@@ -331,7 +313,7 @@ impl Settings {
         if self.arith != Arith::Fixed {
             lines.push(("arith", self.arith.to_string()));
             // A float tree's balloons: the phase an interval unless seeded
-            // (`trace::cart::sources_in`; trees before 2026-10-16 always seeded).
+            // (`trace::cart::sources_in`).
             lines.push(("float_balloon_phase", (if self.balloon_seeds.is_some() { "seeded" } else { "interval" }).to_string()));
         }
         lines
@@ -410,8 +392,8 @@ impl Settings {
             .filter(|(k, v)| rec.get(k) != Some(&v.as_str()))
             .map(|(k, v)| (*k, format!("{k}: the tree's {}, this run's {v}", rec.get(k).copied().unwrap_or("(missing)"))))
             .collect();
-        // `storage_region 8`: a line of the records written before the side
-        // was fixed at 8 (`storage::GEOMETRY`); any other side is refused.
+        // `storage_region 8`: an old record's line for the fixed side
+        // (`storage::GEOMETRY`); any other side is refused.
         let legacy = |k: &str| k == "storage_region" && rec.get(k) == Some(&"8");
         diffs.extend(rec.keys().filter(|k| !mine.iter().any(|(m, _)| m == *k) && !legacy(k)).map(|k| (*k, format!("{k}: in the tree's record, not a setting"))));
         if diffs.is_empty() {
@@ -463,10 +445,9 @@ fn read_record(dir: &Path) -> Result<std::collections::BTreeMap<String, String>>
 /// The recorded settings `--override-settings` may override: those that do
 /// not change what a tree holds. The kernels' region grid (`--region`) only
 /// specializes the kernels: they are exact on every grid, and a lane outside
-/// a grid's bounds is a fatal coverage gap, never another successor (room
-/// (1,0) r0sxh to f44 under `16,6` and `off`: `ckhash --edges` identical,
-/// 2026-10-10). Every other line - the room, the win, the split frame, the
-/// category, the loading jank, the balloons, the level - is the search.
+/// a grid's bounds is a fatal coverage gap, never another successor. Every
+/// other line - the room, the win, the split frame, the category, the
+/// loading jank, the balloons, the level - is the search.
 pub const OVERRIDABLE: &[&str] = &["region"];
 
 /// The record's file in a level's tree.
@@ -568,9 +549,8 @@ fn parse_minus_one(s: &str) -> std::result::Result<(u32, i32), String> {
 
 /// The long flags a command line defines twice, per (sub)command, the
 /// shared settings' global ones included: a binary's own flag must not
-/// shadow a setting (`transpile --level-minus-one` once did). Checked by
-/// each binary's test, in every profile (`clap`'s own assertion of it runs
-/// only with debug assertions).
+/// shadow a setting. Checked by the binary's test in every profile
+/// (`clap`'s own assertion of it runs only with debug assertions).
 pub fn duplicate_flags(cmd: &clap::Command) -> Vec<String> {
     fn walk(cmd: &clap::Command, inherited: &[String], out: &mut Vec<String>) {
         let mut seen: Vec<String> = inherited.to_vec();
@@ -598,9 +578,9 @@ pub fn duplicate_flags(cmd: &clap::Command) -> Vec<String> {
 }
 
 /// A binary's first step: refuse every `CELESTE_*` variable in the
-/// environment (the knobs are flags now; a stale script must not run with
-/// its knobs silently ignored), naming the flag that replaced each.
-/// `CELESTE_FIXTURES` (read by tools/fixtures.sh only) is allowed.
+/// environment, naming the flag that replaced each (a stale script must not
+/// run with its knobs silently ignored). `CELESTE_FIXTURES` (read by
+/// tools/fixtures.sh only) is allowed.
 pub fn refuse_env() -> Result<()> {
     const MOVED: &[(&str, &str)] = &[
         ("CELESTE_START_ROOM", "--room X,Y"),
@@ -638,12 +618,9 @@ pub fn refuse_env() -> Result<()> {
 }
 
 /// A binary's settings from its flags (the environment refused), logged:
-/// one `[settings]` line with every setting not at its default. The binary
-/// passes them to everything that reads them; nothing reads a global.
-/// `float`: whether the command runs in float (`--arith float`); every
-/// other one REFUSES it (the float pipeline is built a milestone at a time,
-/// plans/float.md: a command that would run fixed under a float
-/// flag is the footgun).
+/// one `[settings]` line with every setting not at its default. `float`:
+/// whether the command runs in float; one that does not REFUSES `--arith
+/// float` (it would run fixed under a float flag).
 pub fn startup(args: &Settings, float: bool, adjust: impl FnOnce(&mut Settings)) -> Result<Settings> {
     refuse_env()?;
     let mut s = args.clone().resolved()?;
@@ -767,8 +744,8 @@ mod tests {
             assert!(e.contains(k), "{k} not in {e}");
         }
         assert!(!e.contains("room:"), "{e}");
-        // The arithmetic: a fixed record has no line for it (what it always
-        // was); either way across is refused.
+        // The arithmetic: a fixed record has no line for it; either way
+        // across is refused.
         assert!(!sample.text("r0sxhf").contains("arith"));
         let float = Settings { arith: Arith::Float(FloatTool::Uct), ..sample.clone() };
         let e = float.check(&dir, lvl("r0sxhf")).expect_err("a float run on a fixed tree").to_string();
