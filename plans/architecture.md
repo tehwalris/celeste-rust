@@ -448,6 +448,12 @@ verification surface behind it:
 
 ## Open issues
 
+- **`Graph::fold`'s two-term re-merge** (`(g and c) or (g and not c) -> g`,
+  `transpile/graph.rs`) is a refinement in Kleene logic, not exact: with g
+  true and c unknown it gives true where the unfolded node evaluates to
+  unknown. Exact for every concretization (excluded middle); open: whether
+  folding `c` away can drop a raise `c` owes (an overflow), i.e. whether
+  errors are derived from the folded or the unfolded graph.
 - **The no-player platform's `spd.x`** (`trace/widen.rs`, the platform
   input hook's no-player branch): read as its one moving speed v and owed
   "0 or v" per lane (0 on the creation frame). The only input assumption
