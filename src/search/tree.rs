@@ -1,8 +1,7 @@
-//! A FINISHED TREE as the commands that read one open it (`rewrite ckhash`,
-//! `census`, `check ...`, `bench ...`): its directory, the settings it was
-//! built under and its level (its record, `Settings::of_tree`: they are not
-//! restated on the command line), and its last finished frame (`done.txt`,
-//! the forward's trust marker).
+//! A FINISHED TREE as the commands that read one open it (`ckhash`,
+//! `census`, `check ...`, `bench ...`): its directory, its settings and
+//! level from its record (`Settings::of_tree`, never the command line), and
+//! its last finished frame (`done.txt`, the forward's trust marker).
 
 use std::path::{Path, PathBuf};
 
@@ -36,7 +35,6 @@ impl TreeDir {
         Ok(f)
     }
 
-    /// Whether the tree is in the doubles (`--arith float`).
     pub fn float(&self) -> bool {
         self.settings.arith != crate::settings::Arith::Fixed
     }

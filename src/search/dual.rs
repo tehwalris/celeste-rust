@@ -1,29 +1,26 @@
-//! THE DUAL SEARCH (plans/float.md, "The dual search and rule (b)"): the shortest
-//! input file valid in BOTH arithmetics, under Philippe's rule (b): the
-//! file's length is the FLOAT exit (Celia's float mode, the count), and real
-//! play (16.16, PICO-8) must have left the room by then. Two halves, each a
-//! finished arc phase of its own arithmetic to the same horizon (`Arcs`),
-//! each with its own start (real play's loading jank; the float tool's).
+//! THE DUAL SEARCH (plans/float.md, "The dual search and rule (b)"): the
+//! shortest input file valid in BOTH arithmetics. Rule (b): the file's
+//! length is the FLOAT exit (the count), and real play (16.16) must have
+//! left the room by then. Two halves, each a finished arc phase of its own
+//! arithmetic to the same horizon (`Arcs`), each from its own start (real
+//! play's loading jank; the float tool's).
 //!
 //! A DUAL STATE is (the fixed half's exact state, or EXITED; the float
-//! half's exact state). Under an input both halves step through their
-//! reference engines (every `rnd` leaf of each, paired), and a successor is
-//! admitted iff every live half lies in ITS OWN winning sets at that frame.
-//! A fixed half that wins is EXITED from then on (only the float half
-//! steps); a float half that wins is the dual win if the fixed half has
-//! exited by then, and is pruned otherwise (the file would end before real
-//! play leaves).
+//! half's). Under an input both halves step through their reference engines
+//! (`rnd` leaves paired); a successor is admitted iff every live half lies
+//! in ITS OWN W at that frame. A fixed half that wins is EXITED from then
+//! on; a float half that wins is the dual win if the fixed half has exited,
+//! else pruned (the file would end before real play leaves).
 //!
 //! Sound: a both-valid run is valid in each arithmetic, so each half stays
 //! inside its W, and nothing else prunes - the search is exhaustive inside
 //! both W. Dedup and the depth-first try's memo are on the FULL dual state
-//! (both exact rows and the exit flag), never a projection (`522de36`). An
-//! input is skipped as equivalent only where it agrees with one already run
-//! on the buttons BOTH halves read. The bound is the larger of the two arc
-//! bounds (the float exit is at least the float's, and at least the fixed
-//! exit, itself at least the fixed's), so the breadth-first layers' first
-//! win is the optimal dual run, and none by the horizon refutes every count
-//! up to it.
+//! (both exact rows and the exit flag), never a projection. An input is
+//! skipped as equivalent only where it agrees with one already run on the
+//! buttons BOTH halves read. The bound is the larger arc bound (the float
+//! exit is at least the float's, and at least the fixed exit, itself at
+//! least the fixed's), so the first breadth-first win is the optimal dual
+//! run, and none by the horizon refutes every count up to it.
 
 use anyhow::{anyhow, ensure, Result};
 use rustc_hash::FxHashSet;
@@ -65,20 +62,18 @@ fn fate<N: Rem>(side: &Side<N>, b: &Block<N>, t: u32) -> Result<Fate> {
     })
 }
 
-/// A dual state: the fixed half's row (`None`: it has exited) and the
-/// float half's.
+/// A dual state: the fixed half's row (`None`: exited) and the float half's.
 pub(super) struct Pair<X: Rem, F: Rem> {
     fixed: Option<Rt2<X>>,
     float: Rt2<F>,
 }
 
-/// A dual state's identity: both halves' exact rows (the fixed half's
-/// `None` once it has exited) and cells.
+/// A dual state's identity: both exact rows (the fixed half's `None` once
+/// exited).
 type Key = (Option<ExactRow>, ExactRow);
 
-/// The dual search's states for `concrete::search`: a state a `Pair`, its
-/// identity both halves' exact rows, an edge's label whether real play
-/// exits at it.
+/// The dual search for `concrete::search`: a state a `Pair`, an edge's
+/// label whether real play exits at it.
 struct Pairs<'a, X: Rem, F: Rem> {
     sx: Side<'a, X>,
     sf: Side<'a, F>,
@@ -101,10 +96,7 @@ impl<X: Rem, F: Rem> Concrete for Pairs<'_, X, F> {
         Ok((Pair { fixed: Some(Block::canonical(ex.initial()?)?.into_rt2()), float: Block::canonical(ef.initial()?)?.into_rt2() }, false))
     }
 
-    /// Both halves step under `byte` (every `rnd` leaf of each, paired); a
-    /// successor is admitted iff every live half lies in its own W at `t`.
-    /// A fixed half that wins is EXITED from then on; a float half that wins
-    /// is the dual win if the fixed half has exited by then (rule (b)).
+    /// One dual step at `t` (the module doc).
     fn successors(&self, (ex, ef): &mut Self::Engine, p: &Pair<X, F>, byte: u8, t: u32, _: &dyn Fn(&Key) -> bool, steps: &mut u64) -> Result<(Vec<Next<Self>>, u8)> {
         let (fl, read_f) = ef.frame_reads(&p.float, byte)?;
         // The fixed half's admitted outcomes: `None` exited (now: `true`).
@@ -183,16 +175,14 @@ pub struct DualWitness {
 }
 
 impl DualWitness {
-    /// The inputs as a comma list.
     pub fn inputs_text(&self) -> String {
         self.inputs.iter().map(|b| b.to_string()).collect::<Vec<_>>().join(",")
     }
 }
 
-/// THE DUAL SEARCH between `bound` (the larger arc bound, frames) and the
-/// halves' common horizon (`concrete::search` over pairs; the module doc).
-/// `prefer` orders the inputs (a known file first). `None`: no dual run by
-/// the horizon.
+/// THE DUAL SEARCH from `bound` (the larger arc bound, frames) to the
+/// halves' common horizon (`concrete::search` over pairs). `prefer` orders
+/// the inputs (a known file first). `None`: no dual run by the horizon.
 pub fn search<X: Rem, F: Rem>(fixed: &Half<X>, float: &Half<F>, bound: u32, prefer: Option<&[u8]>) -> Result<Option<DualWitness>> {
     let horizon = fixed.arcs.horizon;
     ensure!(float.arcs.horizon == horizon, "the halves' horizons differ ({horizon} and {} steps)", float.arcs.horizon);
@@ -235,10 +225,9 @@ pub fn first_win<N: Rem>(inputs: &[u8], s: &Settings) -> Result<Option<u32>> {
     Ok(None)
 }
 
-/// The player's cell at every frame of `inputs` (the start's first, a
-/// player-less frame `pos_graph::NO_CELL`), as a concrete run of `s`
-/// (`Settings::concrete`) - the UI's path of a dual witness, its float
-/// half's. A frame that forks (`rnd`) follows its first leaf.
+/// The player's cell at every frame of `inputs` (the start's first;
+/// `pos_graph::NO_CELL` without a player) as a concrete run of `s`, its
+/// first `rnd` leaf: the UI's path of a dual witness's float half.
 pub fn path_cells<N: Rem>(inputs: &[u8], s: &Settings) -> Result<Vec<u32>> {
     let mut eng = ReferenceEngine::<N::A>::new(&s.concrete().0)?;
     let start = Block::canonical(eng.initial()?)?;
@@ -252,12 +241,10 @@ pub fn path_cells<N: Rem>(inputs: &[u8], s: &Settings) -> Result<Vec<u32>> {
     Ok(cells)
 }
 
-/// THE WITNESS, REPLAYED (a guard, not trusted): `inputs` from each half's
-/// start through its reference engine, every `rnd` leaf followed. The float
-/// half must first win on the last frame (the file's length); the fixed half
-/// must win by `fixed_exit` (some leaf: real play's `rnd` is the player's
-/// luck, the stated best case). Each half is one run of its own tool, so
-/// each is checked on its own.
+/// THE WITNESS, REPLAYED (a guard, not trusted), each half on its own
+/// through its reference engine, every `rnd` leaf followed: the float half
+/// must first win on the last frame (the file's length), the fixed half by
+/// `fixed_exit` (some leaf: real play's `rnd` is the stated best case).
 pub fn replay<X: Rem, F: Rem>(w: &DualWitness, fixed: &Settings, float: &Settings) -> Result<()> {
     let c = w.inputs.len() as u32;
     let f = first_win::<F>(&w.inputs, float)?;

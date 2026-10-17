@@ -1,32 +1,23 @@
 //! `rewrite export-ui`: a finished search's record (`result.json`), its
-//! checkpoint trees and marks -> the compact static data the web UI (`ui/`)
-//! renders.
+//! trees and marks -> the compact static data the web UI (`ui/`) renders.
 //!
 //! Per (level, frame): states and wins per player-position cell; per marked
-//! set (`search --save-marks`: W's support, arc-marked nodes): the
-//! marked states per cell by distance to the win. All of it comes from the
-//! frame files' region blocks (keys, cell masks, win masks) and the marks
-//! files: no row is decoded, no engine built. The forward's per-frame stats
-//! are each tree's own record (`frame::FORWARD_STATS`).
+//! set (`search --save-marks`: W's support, arc-marked nodes): the marked
+//! states per cell by distance to the win. All from the frame files' region
+//! blocks (keys, cell masks, win masks) and the marks files: no row is
+//! decoded, no engine built. Per-frame stats: `frame::FORWARD_STATS`.
 //!
-//! STREAMED: a tree is read storage region by storage region on every
-//! thread (`read_tree`), each region's blocks frame after frame, and a
-//! marks file is mapped and read in place, never loaded - it is sorted by
-//! state, so a region's marked states are a merge of its keys with the
-//! file's rows at its cells (`count_marked`), rows no other region reads.
-//! What a region has read is unmapped when it is done. The heap holds the
-//! per-cell counts and one decoded block per thread; the mapped pages, the
-//! marks rows of the regions in flight. Region by region rather than frame
-//! by frame: every frame holds marked states all over a marks file, so a
-//! frame-by-frame merge mapped the whole file (13.5 GB below). Loading
-//! everything (every marked state in a hash table, every frame's layer
-//! decoded at once) took a big balloon run (82 GB tree, 13.3B
-//! states, 431M marks) to 96 GB; streamed it peaks at 1.6 GB of heap
-//! (7.2 GB with the mapped rows).
+//! STREAMED, storage region by region on every thread (`read_tree`): a
+//! marks file is mapped, never loaded; sorted by state, so a region's marked
+//! states are a merge of its keys with the rows at its cells
+//! (`count_marked`), rows no other region reads, unmapped when done. Frame
+//! by frame would map the whole file (every frame has marks all over it).
+//! The heap holds the per-cell counts and a block per thread: an 82 GB tree
+//! with 431M marks peaks at 1.6 GB, where loading it all took 96 GB.
 //!
 //! The run is one horizon whose levels are the search's, plus with `--arc` a
 //! last level carrying the arc backward over the last forward tree
-//! (`forward_of`). Some JSON fields (`bwd`, `reruns`, several horizons) are
+//! (`forward_of`). JSON fields `bwd`, `reruns` and the horizons list are
 //! kept only because the UI reads them.
 //!
 //! Output layout (`--out DIR`):
@@ -44,10 +35,8 @@
 //! * `hHHH_lLL.marks.bin` - a marked set: `"CUM1" | u32 n | n x u32 idx |
 //!   n x u32 dist | n x u32 count`, sorted by (dist, idx). `dist` is the
 //!   horizon minus the last frame the state still wins from.
-//! * `hHHH_lLL.mlayers.bin` - the same marked set split by the FRAME each
-//!   state was first reached at (its BFS layer): the frames format (magic
-//!   `"CUL1"`, empty win records), from intersecting the marks with each
-//!   frame file's states.
+//! * `hHHH_lLL.mlayers.bin` - the same set by the FRAME each state was
+//!   first reached at: the frames format (magic `"CUL1"`, no wins).
 //!
 //! Everything is little-endian u32 at 4-byte alignment, so the UI reads
 //! it as `Uint32Array` views without a parser.
@@ -63,8 +52,7 @@ use celeste_engine::exact::Key;
 use crate::search::pos_graph::cell_xy;
 use crate::storage::layer::{bits, last_frame, Tree};
 
-/// One forward frame's stats (a row of the tree's `forward.tsv`, under the
-/// UI's names).
+/// One forward frame's stats: a `forward.tsv` row under the UI's names.
 #[derive(Serialize, Clone, Debug)]
 pub struct FwdLine {
     pub f: u32,
@@ -85,24 +73,22 @@ pub struct FwdLine {
     pub rss_gb: f64,
 }
 
-/// One level of the run.
 #[derive(Serialize, Clone, Debug)]
 pub struct LevelRun {
     pub level: usize,
     /// The level's spec (`r0sxhn`), or the arc pass's name.
     pub precision: String,
     pub fwd: Vec<FwdLine>,
-    /// Always empty (kept for the UI).
     pub bwd: [u32; 0],
     pub first_win: Option<u32>,
     pub marked: Option<u64>,
     pub reruns: Option<u64>,
     pub refuted: bool,
-    /// Frames present in the checkpoint tree (f0..frames-1).
+    /// Frames in the tree (f0..frames-1).
     pub frames: u32,
     pub frames_file: String,
     pub marks_file: Option<String>,
-    /// Per frame, the states and the win count, from the checkpoint files.
+    /// Per frame, the states and the wins.
     pub frame_states: Vec<u64>,
     pub frame_wins: Vec<u64>,
     pub marks_have_dist: bool,
@@ -134,8 +120,7 @@ pub struct Box2 {
 
 #[derive(Serialize, Clone, Debug)]
 pub struct Tiles {
-    /// Tile-space origin in start-room pixels is (0, 0); `w x h` tiles of
-    /// 8 px, row-major.
+    /// `w x h` tiles of 8 px from the start room's origin, row-major.
     pub w: u32,
     pub h: u32,
     pub ids: Vec<u8>,
@@ -152,27 +137,25 @@ pub struct Run {
     pub prebuild_s: Option<f64>,
     pub optimal: Option<u32>,
     pub horizons: Vec<HorizonRun>,
-    /// A concrete run drawn over the room (`export-ui --arc`, `witness.txt`;
-    /// `--witness FILE` replaces it).
+    /// A concrete run drawn over the room (`--arc`'s `witness.txt`, or
+    /// `--witness FILE`).
     pub witness: Option<Witness>,
-    /// Another concrete run to compare it with (`--reference FILE`: e.g. the
-    /// community TAS replayed in the original cart).
+    /// Another to compare it with (`--reference FILE`: e.g. the community
+    /// TAS replayed in the original cart).
     pub reference: Option<Witness>,
     /// The file the UI offers for download (`--download FILE`), verbatim.
     pub download: Option<Download>,
 }
 
-/// A file offered for download: its name and its bytes (text).
 #[derive(Serialize, Debug)]
 pub struct Download {
     pub file: String,
     pub text: String,
 }
 
-/// A concrete witness: its inputs and the player's (x, y) per frame (frame 0
-/// the start; `None` without a player), in the cells' pixel coordinates, and
-/// the frames a dash starts at with its direction (`R`, `U`, ...; only when
-/// the file lists them).
+/// A concrete run: its inputs, the player's (x, y) per frame from the start
+/// (`None` without a player) in the cells' pixels, and the frames a dash
+/// starts at with its direction (`R`, `U`, ...; when the file lists them).
 #[derive(Serialize, Debug)]
 pub struct Witness {
     pub label: String,
@@ -181,7 +164,6 @@ pub struct Witness {
     pub dashes: Vec<(u32, String)>,
 }
 
-/// A level of the run.
 fn level_run(level: usize, precision: String, fwd: Vec<FwdLine>, first_win: Option<u32>) -> LevelRun {
     LevelRun {
         level,
@@ -205,8 +187,8 @@ fn level_run(level: usize, precision: String, fwd: Vec<FwdLine>, first_win: Opti
     }
 }
 
-/// A tree's forward record (`frame::FORWARD_STATS`), a frame's last row
-/// winning, by frame; empty for a tree from before the record.
+/// A tree's forward record (`frame::FORWARD_STATS`) by frame, a frame's
+/// last row winning; empty without one.
 fn read_forward_stats(dir: &Path) -> Result<Vec<FwdLine>> {
     let path = dir.join(crate::frame::FORWARD_STATS);
     let text = match std::fs::read_to_string(&path) {
@@ -263,14 +245,12 @@ struct LevelData {
     frames: Vec<(Sparse, Sparse)>,
 }
 
-/// One marked state: `(shape, cell, key)`, as the frame rows are keyed.
+/// One marked state `(shape, cell, key)`, as the frame rows are keyed.
 type MarkId = (u64, u32, Key);
 
 /// A marks file, mapped: `save_marks`' rows `(shape, cell, k0, k1, dist)`
-/// (32 bytes each), SORTED by state `(shape, cell, key)` (checked by
-/// `scan_marks`), then the horizon. Read in place and never loaded:
-/// a big balloon run's 431M rows (13.8 GB) held as a hash table
-/// took the export to 96 GB.
+/// (32 B each), SORTED by state (checked by `scan_marks`), then the
+/// horizon. Read in place, never loaded (the module doc).
 struct MarksMap {
     map: crate::storage::file::Mapped,
     rows: usize,
@@ -286,8 +266,7 @@ impl MarksMap {
         anyhow::ensure!(payload.len() >= 8, "{}: too short for a marks file", path.display());
         let n = u64::from_le_bytes(payload[0..8].try_into().unwrap());
         let body = payload.len() as u64 - 8;
-        // The rows, the horizon, then the tree's key space (the keys are the
-        // tree's, as its frame rows').
+        // The rows, the horizon, then the tree's key space.
         anyhow::ensure!(n.checked_mul(32).and_then(|b| b.checked_add(4)).is_some_and(|b| b <= body), "{}: {n} rows do not fit {body} payload bytes", path.display());
         Ok(MarksMap { map, rows: n as usize })
     }
@@ -302,30 +281,25 @@ impl MarksMap {
         u32::from_le_bytes(self.map.header_bytes()[a..a + 4].try_into().unwrap())
     }
 
-    /// Row `i`'s `(shape, cell)`.
     fn at(&self, i: usize) -> (u64, u32) {
         (self.u64_at(i, 0), self.u32_at(i, 8))
     }
 
-    /// Row `i`'s key.
     fn key(&self, i: usize) -> Key {
         (self.u64_at(i, 12), self.u64_at(i, 20))
     }
 
-    /// Row `i`'s state.
     fn id(&self, i: usize) -> MarkId {
         let (shape, cell) = self.at(i);
         (shape, cell, self.key(i))
     }
 
-    /// Row `i`'s distance to the win.
     fn dist(&self, i: usize) -> u32 {
         self.u32_at(i, 28)
     }
 
-    /// Unmap the resident pages of rows `a..b` (the page cache keeps them:
-    /// a later read faults them back in), so a scan does not hold what it
-    /// has read.
+    /// Unmap the resident pages of rows `a..b` (the page cache keeps them),
+    /// so a scan does not hold what it has read.
     fn release(&self, a: usize, b: usize) -> Result<()> {
         self.map.release(&self.map.header_bytes()[MARKS_ROWS_AT + a * 32..MARKS_ROWS_AT + b * 32])
     }
@@ -335,9 +309,7 @@ impl MarksMap {
 /// are cut every few rows).
 const MARKS_CHUNK: usize = if cfg!(test) { 3 } else { 1 << 20 };
 
-/// A marked set, SCANNED: its marks file and the rows of each `(shape,
-/// cell)` holding any (a hash lookup per region and cell, where a search of
-/// the file touched other regions' rows).
+/// A marked set, SCANNED: its marks file and each `(shape, cell)`'s rows.
 struct MarkedSet {
     m: MarksMap,
     cells: FxHashMap<(u64, u32), (usize, usize)>,
@@ -384,8 +356,7 @@ fn scan_marks(m: MarksMap, path: &Path, threads: usize) -> Result<(MarkedSet, Ve
 
 /// The first `i` in `lo..hi` with `!before(i)` (`hi` if none), `before`
 /// true on a prefix: probes `lo`, `lo + 1`, `lo + 3`, `lo + 7`, ... then
-/// halves, so a cursor moving forward pays the log of its step, not of the
-/// range.
+/// halves, so a forward cursor pays the log of its step, not of the range.
 fn gallop(lo: usize, hi: usize, before: impl Fn(usize) -> bool) -> usize {
     let (mut a, mut step) = (lo, 1usize);
     let mut b = loop {
@@ -432,8 +403,8 @@ impl CellRows {
         out
     }
 
-    /// Unmap the rows' resident pages (a region's cells are its own: no
-    /// other region reads these rows).
+    /// Unmap the rows' pages (a region's cells are its own: no other region
+    /// reads them).
     fn release(&self, m: &MarksMap) -> Result<()> {
         for l in bits(self.live) {
             m.release(self.lo[l as usize], self.hi[l as usize])?;
@@ -442,10 +413,9 @@ impl CellRows {
     }
 }
 
-/// The states of one block of a storage region (`keys` ascending, `masks`
-/// their local cells) that a marked set holds, per local cell: per cell a
-/// MERGE of its entries with the set's rows there (`rows`), both ascending
-/// by key, galloping in the rows.
+/// Per local cell, the states of one region block (`keys` ascending,
+/// `masks` their cells) a marked set holds: a MERGE of the entries with the
+/// set's rows there (`rows`), both ascending by key, galloping in the rows.
 fn count_marked(m: &MarksMap, rows: &CellRows, keys: &[Key], masks: &[u64]) -> [u32; 64] {
     let mut out = [0u32; 64];
     let (mut lo, hi, mut live) = (rows.lo, &rows.hi, rows.live);
@@ -471,26 +441,22 @@ fn count_marked(m: &MarksMap, rows: &CellRows, keys: &[Key], masks: &[u64]) -> [
     out
 }
 
-/// One frame's sums per cell: its states, its wins and, per marked set, its
-/// marked states.
+/// One frame's per-cell sums: states, wins, per marked set its marked states.
 struct FrameSums {
     cells: FxHashMap<u32, u64>,
     wins: FxHashMap<u32, u64>,
     marked: Vec<FxHashMap<u32, u64>>,
 }
 
-/// A storage region of a tree: its states over all frames, and per frame
-/// holding it its block `(frame, block)`.
+/// A storage region: its states over all frames, its blocks `(frame, block)`.
 struct RegionBlocks {
     region: u32,
     states: u64,
     blocks: Vec<(usize, usize)>,
 }
 
-/// One storage region counted in every frame holding it: each block
-/// decoded, counted, merged with the marked sets' rows at the region's
-/// cells (found once for all frames) and unmapped; the counts added to the
-/// frames' `sums`; the region's marks rows unmapped at the end.
+/// One storage region counted into `sums`, frame by frame: each block
+/// decoded, merged with the marked sets' rows at its cells, and unmapped.
 fn count_region<N: celeste_core::arith::EngineNum>(tree: &Tree<N>, rb: &RegionBlocks, sets: &[MarkedSet], sums: &[std::sync::Mutex<FrameSums>]) -> Result<()> {
     let geo = crate::storage::GEOMETRY;
     let (shape, slot) = (tree.shape_of(rb.region)?, rb.region % geo.slots);
@@ -532,21 +498,16 @@ fn count_region<N: celeste_core::arith::EngineNum>(tree: &Tree<N>, rb: &RegionBl
     Ok(())
 }
 
-/// Per-cell sums `(cell, n)` ascending; a count past the format's u32 is
-/// an error.
+/// Per-cell sums `(cell, n)` ascending; a count past u32 is an error.
 fn sparse(m: FxHashMap<u32, u64>) -> Result<Sparse> {
     let mut v: Sparse = m.into_iter().map(|(c, n)| Ok((c, u32::try_from(n).with_context(|| format!("{n} states at one cell of one frame"))?))).collect::<Result<_>>()?;
     v.sort_unstable();
     Ok(v)
 }
 
-/// Read one level directory STREAMED, storage region by storage region on
-/// `threads` threads (the largest first): its frames' states and wins per
-/// cell and, in the same pass, the sets of `sets` split by layer (`[k]`:
-/// per frame, set `k`'s marked states per cell). A region's blocks (one
-/// per frame) are read in turn and its cells' marks rows found once, and
-/// both are unmapped when read: what it holds is the per-cell counts and,
-/// per thread, one block and one region's rows, whatever the tree's size.
+/// One level directory read STREAMED (the module doc), the largest region
+/// first: per frame its states and wins per cell, and `sets` by layer
+/// (`[k]`: per frame, set `k`'s marked states per cell).
 fn read_tree<N: celeste_core::arith::EngineNum>(dir: &Path, sets: &[MarkedSet], threads: usize) -> Result<(LevelData, Vec<Vec<Sparse>>)> {
     let n = last_frame(dir).map_or(0, |l| l as usize + 1);
     // The pos graph, to draw wins where the player left from (below). An
@@ -713,11 +674,10 @@ fn room_tiles(room: (i16, i16)) -> Result<Tiles> {
     Ok(Tiles { w, h, ids, solid })
 }
 
-/// `witness.txt` (`search --save-marks`): `inputs a,b,..`, then
-/// `f x y` per frame from 0 (`f - -` without a player). A file for
-/// `--witness` / `--reference` (`tools/align_tas.py`) may also carry, before
-/// the frames and in any order, `label TEXT` and `dashes F:DIR ...`; the
-/// frames may end early (at the exit).
+/// `witness.txt` (`search --save-marks`): `inputs a,b,..`, then `f x y`
+/// per frame from 0 (`f - -` without a player). A `--witness` /
+/// `--reference` file (`tools/align_tas.py`) may also carry `label TEXT` and
+/// `dashes F:DIR ...` before the frames, and end early (at the exit).
 fn read_witness(path: &Path) -> Result<Witness> {
     let text = std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
     let name = path.display();
@@ -764,12 +724,11 @@ fn level_label(l: &super::result::LevelResult) -> String {
     }
 }
 
-/// `--arc DIR` (`search --save-marks DIR`, which holds the LAST level's
-/// sets): the last forward level gets the winning sets' support, and a level
-/// after it the ARC backward over the same tree; the optimum is the arc
-/// search's (`last`: the record's last level) unless `keep_optimal` (a dual
-/// search's, whose optimum is the pair's, not the float half's bound).
-/// Returns the witness if present.
+/// `--arc DIR` (`search --save-marks DIR`: the LAST level's sets): the last
+/// forward level gets the winning sets' support, a level after it the ARC
+/// backward over the same tree; the optimum is the arc search's (`last`'s)
+/// unless `keep_optimal` (a dual search's: the pair's, not the float half's
+/// bound). Returns the witness if present.
 fn attach_arc(hr: &mut HorizonRun, optimal: &mut Option<u32>, dir: &Path, last: &super::result::LevelResult, keep_optimal: bool) -> Result<Option<Witness>> {
     let rows = |name: &str| -> Result<u64> { Ok(MarksMap::open(&dir.join(name))?.rows as u64) };
     let found = last.arc_bound;
@@ -792,18 +751,16 @@ fn attach_arc(hr: &mut HorizonRun, optimal: &mut Option<u32>, dir: &Path, last: 
     w.exists().then(|| read_witness(&w)).transpose()
 }
 
-/// The concrete runs drawn over the room: `witness` (replacing the arc
-/// directory's) and `reference`, files in `read_witness`'s format; and the
-/// file the UI offers for download.
+/// The concrete runs drawn over the room (`read_witness`'s format;
+/// `witness` replaces the arc directory's) and the download.
 pub struct Paths<'a> {
     pub witness: Option<&'a Path>,
     pub reference: Option<&'a Path>,
     pub download: Option<&'a Path>,
 }
 
-/// The export. `checkpoint_dir` is a search's (`result.json`, `levelNN/`:
-/// its room the record's); `threads` the workers; `arc` its `search
-/// --save-marks` directory.
+/// The export of a search's `checkpoint_dir` (`result.json`, `levelNN/`;
+/// the room is the record's); `arc` its `search --save-marks` directory.
 pub fn export(checkpoint_dir: &Path, out: &Path, threads: usize, arc: Option<&Path>, paths: Paths) -> Result<()> {
     let res = super::result::SearchResult::read(checkpoint_dir)?;
     let room = res.room;
@@ -837,8 +794,7 @@ pub fn export(checkpoint_dir: &Path, out: &Path, threads: usize, arc: Option<&Pa
     eprintln!("[export-ui] {}: {} levels to f{h}, optimal {optimal:?}", checkpoint_dir.display(), hr.levels.len());
     std::fs::create_dir_all(out)?;
 
-    // One streamed pass per forward level's tree, reading its frames and
-    // its marked sets by layer together.
+    // One streamed pass per forward tree: its frames and marked sets.
     struct MarksOut {
         level: usize,
         by_cell_dist: Vec<(u32, u32, u32)>,
@@ -872,8 +828,7 @@ pub fn export(checkpoint_dir: &Path, out: &Path, threads: usize, arc: Option<&Pa
             crate::settings::Arith::Float(_) => read_tree::<celeste_core::lua_f64::LuaF64>(&dir, &maps, threads),
         }
         .with_context(|| format!("frames of {}", dir.display()))?;
-        // Every marked state is a state of the tree: each set's layers
-        // hold all its rows.
+        // Every marked state is a state of the tree.
         for ((m, l), layer) in maps.iter().zip(&set_levels).zip(&layers) {
             let held: u64 = layer.iter().flatten().map(|&(_, n)| n as u64).sum();
             anyhow::ensure!(held == m.m.rows as u64, "{}: level {l}'s marked set has {} states, {held} of them in the tree", dir.display(), m.m.rows);
@@ -993,10 +948,9 @@ mod tests {
         }
     }
 
-    /// A marks file read in place: its rows by (dist, cell), and a region's
-    /// marked states per cell, merged from its keys and the rows at each of
-    /// its cells (a key marked at one cell or shape is not at another);
-    /// against a set on many random regions; an unsorted file is refused.
+    /// A marks file read in place: its rows by (dist, cell), a region's
+    /// marked states per cell (a key marked at one cell or shape is not at
+    /// another), against a set on random regions; an unsorted file refused.
     #[test]
     fn marks_files_merge_with_a_regions_keys() {
         let geo = crate::storage::GEOMETRY;
@@ -1071,8 +1025,7 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
-    /// The forward's record as the forward writes it: a rerun frame's last
-    /// row wins, the frames in order.
+    /// The forward's record reads back: a rerun frame's last row wins.
     #[test]
     fn a_trees_forward_record_reads_back() {
         let dir = std::env::temp_dir().join(format!("celeste-ui-fwd-{}", std::process::id()));

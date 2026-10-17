@@ -1,11 +1,7 @@
 //! The player-position cells, and the position graph: the successor
-//! relation PROJECTED ONTO THE PLAYER'S POSITION, "which positions can step
-//! into this one?". Recorded by the forward (`PosObserver`), read by the
-//! level -1 probe and the UI, pinned as a gate
-//! (`gates/posgraph_room10_f044.txt`).
-//!
-//! It has one node per position cell, never one per row: never a set of
-//! predecessor states. It is horizon-independent and RECORDED, never guessed.
+//! relation PROJECTED ONTO THE PLAYER'S CELL ("which cells step into this
+//! one?"), one node per cell, RECORDED by the forward (`PosObserver`); read
+//! by the level -1 probe and the UI, pinned as a gate.
 //!
 //! Positions are relative to the START room (cart coordinates are
 //! room-local, so a crossing would look like a 128 px teleport). The next
@@ -19,16 +15,14 @@ use celeste_engine::runtime2::{Col, Rt2, AV};
 /// Side of the position grid, in pixels: the start room plus a room's width
 /// past it in each axis (room (0,0) exits upward, landing at x ~238).
 pub const GRID: i32 = 512;
-/// Pixel coordinate mapped to grid index 0.
 pub const ORIGIN: i32 = -64;
-/// Side of a room in pixels - the stride between rooms in the grid.
 const ROOM_PX: i32 = 128;
 
 /// The cell of a row with no player object (e.g. after a death): a normal
 /// node, past the end of the grid so no position aliases it.
 pub const NO_CELL: u32 = (GRID * GRID) as u32;
 
-/// Number of nodes, including `NO_CELL`.
+/// Nodes, including `NO_CELL`.
 pub const CELL_COUNT: usize = (GRID * GRID) as usize + 1;
 /// Grid cell of a whole-pixel start-room-relative position; an error
 /// outside the grid, never a clamp.
@@ -46,7 +40,7 @@ pub fn cell_of(x: i32, y: i32) -> Result<u32> {
     Ok((gy * GRID + gx) as u32)
 }
 
-/// Human-readable start-room-relative pixels of a cell.
+/// A cell's start-room-relative pixels; `None` for `NO_CELL`.
 pub fn cell_xy(cell: u32) -> Option<(i32, i32)> {
     (cell != NO_CELL).then(|| (cell as i32 % GRID + ORIGIN, cell as i32 / GRID + ORIGIN))
 }
@@ -90,16 +84,15 @@ pub fn whole_range_col<N: EngineNum>(rt2: &Rt2<N>, cell: u32) -> Option<Vec<(i16
     }
 }
 
-/// The block's player object (`player`, else `player_spawn`), if any. Per
-/// block: lanes share structure.
+/// The block's player object (`player`, else `player_spawn`): one per
+/// block, its lanes share structure.
 pub fn player_object<N: EngineNum>(rt2: &Rt2<N>) -> Option<u32> {
     rt2.position_object(crate::compiled::ids())
 }
 
-/// Per-lane cell of a block. `room.x`/`room.y` must be numbers; no player
-/// object, or a position that is not numeric, is `NO_CELL`. The start room
-/// is the block's own (its collision cache's room: every block of a search
-/// carries the start room's).
+/// Per-lane cell of a block (`room.x`/`room.y` must be numbers); no player
+/// object, or a non-numeric position, is `NO_CELL`. The start room is the
+/// block's collision cache's (every block of a search carries it).
 pub fn block_cells<N: EngineNum>(rt2: &Rt2<N>) -> Result<Vec<u32>> {
     let ids = crate::compiled::ids();
     let start = (rt2.cache.room_x, rt2.cache.room_y);
@@ -140,8 +133,7 @@ pub fn room_offset(start: (i16, i16), rx: i16, ry: i16) -> Result<(i32, i32)> {
     }
 }
 
-/// The finished graph, by destination: each cell's predecessor cells, a
-/// sorted CSR.
+/// The finished graph: each cell's predecessor cells, a sorted CSR.
 #[derive(Default, serde::Serialize, serde::Deserialize)]
 pub struct PosGraph {
     /// `srcs[offsets[d] .. offsets[d + 1]]` for destination cell `d`.
@@ -150,7 +142,6 @@ pub struct PosGraph {
 }
 
 impl PosGraph {
-    /// Persist (`frame::save_pos_graph`).
     pub fn save(&self, path: &std::path::Path) -> anyhow::Result<()> {
         crate::storage::file::save_value(path, self)
     }
@@ -163,7 +154,7 @@ impl PosGraph {
         self.srcs.len()
     }
 
-    /// The recorded source cells of destination cell `dst`, sorted.
+    /// The source cells of `dst`, sorted; empty past the end.
     pub fn sources(&self, dst: u32) -> &[u32] {
         let d = dst as usize;
         if d + 1 >= self.offsets.len() {
@@ -172,7 +163,7 @@ impl PosGraph {
         &self.srcs[self.offsets[d] as usize..self.offsets[d + 1] as usize]
     }
 
-    /// Destination cells with at least one recorded predecessor.
+    /// Cells with a predecessor.
     pub fn live_cells(&self) -> usize {
         self.offsets.windows(2).filter(|w| w[1] > w[0]).count()
     }
@@ -202,7 +193,6 @@ impl PosGraph {
 /// sources (tens each), not a dense bitmap or a hash set of pairs.
 #[derive(Default, Clone)]
 pub struct PosGraphBuilder {
-    /// Destination cell -> its (small) sorted set of source cells.
     by_dst: rustc_hash::FxHashMap<u32, Vec<u32>>,
 }
 
@@ -234,12 +224,11 @@ impl PosGraphBuilder {
 }
 
 
-/// Collects the graph while the forward steps frames. Attribution is AT
-/// EMISSION: the frame step records `(input row's cell, output row's cell)`
-/// as it produces each row, before any dedup; nothing is stored on a row.
+/// Collects the graph while the forward steps frames, AT EMISSION: the
+/// frame step records `(input row's cell, output row's cell)` per row,
+/// before any dedup; nothing is stored on a row.
 pub struct PosObserver {
-    /// `(src cell, dst cell)` pairs pushed by the workers, folded into the
-    /// graph in `flush`.
+    /// `(src, dst)` pairs from the workers, folded in by `flush`.
     pending: std::sync::Mutex<Vec<(u32, u32)>>,
     graph: std::sync::Mutex<PosGraphBuilder>,
 }
@@ -263,12 +252,10 @@ impl PosObserver {
         Self { pending: std::sync::Mutex::new(Vec::new()), graph: std::sync::Mutex::new(b) }
     }
 
-    /// Record `(src cell, dst cell)` edges observed at emission.
     pub fn record_pairs(&self, pairs: impl Iterator<Item = (u32, u32)>) {
         self.pending.lock().expect("pos observer").extend(pairs);
     }
 
-    /// Fold the pending observations into the graph.
     pub fn flush(&self) {
         let pending = std::mem::take(&mut *self.pending.lock().expect("pos observer"));
         let mut graph = self.graph.lock().expect("pos observer");
@@ -316,7 +303,7 @@ mod tests {
         let mut b = PosGraphBuilder::default();
         b.record(7, 3);
         b.record(5, 3);
-        b.record(7, 3); // duplicate
+        b.record(7, 3);
         b.record(9, NO_CELL);
         assert_eq!(b.pairs(), 3);
         let g = b.build();

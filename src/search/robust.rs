@@ -1,10 +1,8 @@
-//! A float witness's ROBUSTNESS to the host libm (plans/float.md,
-//! "The robustness report"; `rewrite robust`): the witness replayed in float under
-//! glibc's `sin` (the definition), under a CORRECTLY ROUNDED `sin` (MPFR's,
-//! the library gcc depends on, loaded at run time), with every call one ulp
-//! up, every call one ulp down, and runs moving each call by -1, 0 or +1
-//! ulp at random (`lua_f64::SinNudge`). A variant whose first win differs
-//! from glibc's is FRAGILE: flagged, not rejected.
+//! A float witness's ROBUSTNESS to the host libm (`rewrite robust`;
+//! plans/float.md "The robustness report"): its first win under glibc's
+//! `sin` (the definition) against MPFR's correctly rounded one and ulp
+//! nudges (`lua_f64::SinNudge`). A variant whose first win differs is
+//! FRAGILE: flagged, not rejected.
 
 use std::os::raw::{c_char, c_int, c_long, c_void};
 use std::sync::OnceLock;

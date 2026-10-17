@@ -1,10 +1,9 @@
-//! THE HULL FORWARD REPLAYED over a tree's recorded graph (`rewrite
-//! check replay`): from the start's hull, every hull pushed along the
-//! recorded edges through their transfers, frame by frame, re-pushed where
-//! it grows - what the forward did, without the engine (a node's successors
-//! do not depend on its hull: it is expanded with its remainder widened;
-//! the hull only decides which pushes land). It reaches exactly the tree's
-//! states at the tree's frames, else an edge was not recorded (an error).
+//! THE HULL FORWARD REPLAYED over a tree's recorded graph (`rewrite check
+//! replay`): the start's hull pushed along the recorded edges through their
+//! transfers, re-pushed where it grows - the forward without the engine (a
+//! node is expanded with its remainder widened, so its successors do not
+//! depend on its hull; the hull only decides which pushes land). It must
+//! reach exactly the tree's states at the tree's frames (else an error).
 
 use crate::search::hull::{AccOf, HullOf};
 use anyhow::{ensure, Result};
@@ -23,9 +22,8 @@ pub struct Frame {
     pub edges: u64,
 }
 
-/// Replay the tree at `dir` through frame `to` from the start's hull
-/// (`rem::start_hull`) on its layer-0 states; per frame its counts (index 0
-/// the start).
+/// Replay the tree at `dir` through frame `to` from the start's hull on its
+/// layer-0 states; per frame its counts (index 0 the start).
 pub fn replay<N: Rem>(dir: &std::path::Path, to: u32, threads: usize) -> Result<Vec<Frame>> {
     let start = crate::search::rem::start_hull::<N>();
     // The recorded graph: out-edges by source (target, transfer).
@@ -43,8 +41,7 @@ pub fn replay<N: Rem>(dir: &std::path::Path, to: u32, threads: usize) -> Result<
         }
     }
     // THE PROPAGATION: every state that grew pushes along its out-edges, the
-    // targets merge; each state with its hull and the frame it was first
-    // reached at.
+    // targets merge; per state its hull and the frame it was first reached.
     let starts: Vec<Sk> = tree.layer(0, None, threads)?.0.states_iter().collect();
     let mut hull: FxHashMap<Sk, (HullOf<N>, u32)> = starts.iter().map(|&s| (s, (start, 0))).collect();
     let mut grown = starts;

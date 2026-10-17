@@ -1,18 +1,14 @@
 //! THE TRANSFERS AGAINST THE REFERENCE ENGINE (`rewrite check arcs`), in
 //! either arithmetic: every record of frames `from..=to` has a transfer
-//! (completeness), and a sample of them, per frame, is probed. From the
-//! record's source row at a remainder INSIDE its guards (their corners and
-//! middle: the cut points themselves), every successor over the 64 inputs
-//! must include the record's target at the remainder its action predicts,
-//! and every successor on that target must be one some record of the pair
-//! (source, target) predicts; at a remainder just OUTSIDE every guard of the
-//! pair (one point past a guard's end: in doubles one ulp, across the cut),
-//! the target must not be reached. A disagreement fails the check.
-//!
-//! The reference engine steps the source row with its remainder set to the
-//! probe (`step`: 16.16 forks the level's unknowns as its kernels do,
-//! `RefEngine::step_at`; doubles need the row concrete, so the level is
-//! `r0sx`).
+//! (completeness), and a sample per frame is probed. From the record's
+//! source row at a remainder INSIDE its guards (their corners and middle:
+//! the cut points themselves), every successor over the 64 inputs must
+//! include the record's target at the remainder its action predicts, and
+//! every successor on that target must be one some record of the pair
+//! (source, target) predicts; just OUTSIDE every guard of the pair (one
+//! point past a guard's end: in doubles one ulp), the target must not be
+//! reached. The probe steps the source row with its remainder set, at the
+//! level (`ReferenceEngine::step_at`: unknowns forked as the kernels do).
 
 use anyhow::{anyhow, Result};
 use celeste_engine::runtime2::{Col, Rt2, AV};
@@ -26,16 +22,14 @@ use crate::storage::layer::Tree;
 use crate::storage::Sk;
 use crate::engines::reference::ReferenceEngine;
 
-/// What to check (the command line's).
 pub struct Opts<'a> {
     pub dir: &'a std::path::Path,
     pub from: u32,
     pub to: u32,
     pub samples: usize,
     pub level: Level,
-    /// Check the CHECK: corrupt every decoded x transfer first (`action`:
-    /// its image moved; `guard`: its lowest point dropped), which must make
-    /// it fail.
+    /// Check the CHECK: corrupt every decoded x transfer (`action`: its
+    /// image moved; `guard`: its lowest point dropped), which must fail.
     pub fault: Option<&'a str>,
     /// At most this many reference fork paths a step (a sample past it is
     /// SKIPPED and counted).
@@ -88,9 +82,6 @@ fn predicts<C: Circle>(t: &(C::Act, C::Act), p: (C::P, C::P), q: Option<(C::P, C
     }
 }
 
-/// Run the check: each probe steps the reference engine at the level
-/// (`ReferenceEngine::step_at`: the row's unknowns forked as the kernels
-/// fork them; its successors and the buttons it read).
 pub fn run<N: Rem>(o: &Opts) -> Result<()> {
     let (dir, to, level, cfg) = (o.dir, o.to, o.level, o.settings);
     cfg.check(dir, level)?;
@@ -106,8 +97,8 @@ pub fn run<N: Rem>(o: &Opts) -> Result<()> {
     // The tree's key space: projections keyed as its rows (`None`: a code
     // it never stored).
     let space = &tree.space;
-    // Every successor of `row` at remainder point `rem` over all 64 inputs;
-    // and the reference steps it took.
+    // Every successor of `row` at remainder `rem` over all 64 inputs, and
+    // the reference steps taken.
     let successors = |eng: &mut ReferenceEngine<N::A>, row: &Block<N>, rem: (Point<N>, Point<N>)| -> Result<(Vec<Succ<N>>, u64)> {
         // As the kernels read it: projected onto the level (the start row is
         // stored exact), then the probe's remainder.
