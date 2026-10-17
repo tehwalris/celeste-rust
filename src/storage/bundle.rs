@@ -1,29 +1,23 @@
-//! EDGE BUNDLES (plans/architecture.md, "The recorded graph"): the recorded edges as they are
-//! stored, ID-free. An edge is (source state, target state, transfer), a
-//! state its shape, exact key and cell (`storage::Sk`). A BUNDLE is the
-//! edges of one source STATE KEY (shape and key: every cell of it) into one
-//! TARGET KEY at one transfer and one cell offset, inside one target
-//! region: `(source shape and key, transfer, offset, target key) -> mask`,
-//! the mask over the TARGET region's cells (an edge into target cell `c`
-//! leaves source cell `c - offset`).
+//! EDGE BUNDLES (plans/architecture.md, "The recorded graph"): the
+//! recorded edges as stored, ID-free. A BUNDLE is the edges of one source
+//! STATE KEY (shape and key: every cell of it) into one TARGET KEY at one
+//! transfer and one cell offset, inside one target region: `(source shape
+//! and key, transfer, offset, target key) -> mask` over the TARGET region's
+//! cells (an edge into target cell `c` leaves source cell `c - offset`).
 //!
-//! A BLOCK holds a target region's bundles (a frame's, or a segment of
-//! it): the block's distinct target keys and source (shape, key)s sorted
-//! and delta-coded (its dictionaries; ranks, not ids), then the bundles as
-//! a sorted trie in `ORDER` - per bundle a level byte (the first field that
-//! changed), that field's delta, the later fields raw - and zstd -1 over
-//! it at rest. `ORDER` is mask first (bundles with equal masks together),
-//! then offset, transfer, source, target: measured smallest of the 48
-//! orders with absolute masks (bench/dedup DESIGNS O3: 0.079 B an edge on
-//! room (6,2) 100% f57, against 3.15 for the storage-v2 unit blocks).
+//! A BLOCK holds a target region's bundles (a frame's, or a segment): its
+//! distinct target keys and source (shape, key)s sorted and delta-coded
+//! (its dictionaries; ranks, not ids), then the bundles as a sorted trie in
+//! `ORDER` (`put_record`), zstd -1 at rest. `ORDER` is mask first (equal
+//! masks together), then offset, transfer, source, target: measured
+//! smallest of the 48 orders with absolute masks (~0.08 B an edge).
 
 use anyhow::{anyhow, ensure, Result};
 
 use super::visited::Key;
 use crate::search::pos_graph::{GRID, NO_CELL};
 
-/// One bundle (module doc). `mask`: the target cells, over the region's
-/// 64 (storage regions are 8 x 8 cells: `GEOMETRY.words == 1`).
+/// One bundle; `mask` over the target region's 64 cells.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Bundle {
     pub s_shape: u32,
@@ -77,10 +71,9 @@ pub fn source_cell(t: u32, o: u32) -> u32 {
 }
 
 /// A cell-to-cell offset code `o` (below `TO_NONE`) from target slot
-/// `t_slot` back to source slot `s_slot` (neither `NO_CELL`'s) as ONE
-/// SHIFT `k` of the regions' 8 x 8 grids (a source cell's index is its
-/// target's plus `k`): the target cells whose source is in the source
-/// region, and `k`. `None` when there is none.
+/// `t_slot` back to source slot `s_slot` (neither `NO_CELL`'s) as ONE SHIFT
+/// `k` of the regions' 8 x 8 grids (source index = target index + `k`): the
+/// target cells whose source is in the source region, and `k`; `None`: none.
 #[inline]
 pub fn shift_into(t_slot: u32, s_slot: u32, o: u32) -> Option<(u64, i32)> {
     let geo = super::GEOMETRY;
@@ -114,10 +107,9 @@ pub fn shift(m: u64, k: i32) -> u64 {
     }
 }
 
-/// The SOURCE cells of target cells `mask` (not empty) of slot `t_slot`
-/// at offset code `o`, all in source slot `s_slot`'s region
-/// (`shift_into`): the shifted mask and the shift. `None` when a cell of
-/// `mask` leaves the region: no bundle of a source in it holds that cell.
+/// The SOURCE cells of target cells `mask` (not empty) of slot `t_slot` at
+/// offset code `o`, all in slot `s_slot`'s region: the shifted mask and the
+/// shift. `None` when one leaves it: no bundle of a source there holds it.
 #[inline]
 pub fn source_cells(t_slot: u32, s_slot: u32, o: u32, mask: u64) -> Option<(u64, i32)> {
     let (inside, k) = shift_into(t_slot, s_slot, o)?;
@@ -216,15 +208,11 @@ pub enum F {
     S,
     /// The target key (its rank in the target dictionary).
     T,
-    /// The transfer.
     X,
-    /// The offset.
     O,
-    /// The mask.
     M,
 }
 
-/// THE ORDER of a stored block (module doc).
 pub const ORDER: [F; 5] = [F::M, F::O, F::X, F::S, F::T];
 
 /// A bundle as a block's record holds it: source and target as ranks into
@@ -354,12 +342,10 @@ pub struct Tb {
     pub mask: u64,
 }
 
-/// The block encoder of the region phase (`ORDER`, the format `encode`
-/// writes), its scratch reused block to block: targets and sources ranked
-/// through dense arrays over their ids; the records GROUPED by (mask,
-/// offset, transfer) - a block has few (room (6,2) f57: 21k-135k for 1-2.6M
-/// bundles) - the groups sorted, each group's (source, target) pairs
-/// sorted apart: no sort of the whole block.
+/// The block encoder of the region phase (writes `encode`'s format), its
+/// scratch reused block to block: targets and sources ranked through dense
+/// arrays over their ids, the records GROUPED by (mask, offset, transfer) -
+/// a block has few, ~1 per 20-50 bundles - so no sort of the whole block.
 #[derive(Default)]
 pub struct Encoder {
     t_rank: Vec<u32>,
@@ -373,8 +359,7 @@ pub struct Encoder {
 }
 
 impl Encoder {
-    /// Its buffers back to their default size if any holds room for more
-    /// than `keep` items (`route::Scratch::bound`).
+    /// Buffers back to default if any has room for more than `keep` items.
     pub fn bound(&mut self, keep: usize) {
         let big = [self.t_rank.capacity(), self.tids.capacity(), self.s_perm.capacity(), self.item_g.capacity(), self.at.capacity(), self.st.capacity(), self.groups.capacity(), self.gid.capacity()].into_iter().any(|c| c > keep);
         if big {
@@ -392,10 +377,8 @@ const _: () = assert!(matches!(ORDER, [F::M, F::O, F::X, F::S, F::T]), "Encoder 
 
 impl Encoder {
     /// `bundles` (distinct, any order) as a raw block in `ORDER` into `out`
-    /// (cleared) - what `encode` writes - through `encode` below, the
-    /// targets and sources numbered as met: the bundles that wait for the
-    /// frame's end, encoded in the region phase and again at `route::seal`
-    /// (the generic sort of every record was most of a big route's seal).
+    /// (cleared), targets and sources numbered as met: the waiting bundles,
+    /// in the region phase and again at the frame's end (`route::reencode`).
     pub fn encode_bundles(&mut self, bundles: &[Bundle], out: &mut Vec<u8>) {
         let mut t_id: rustc_hash2::FxHashMap<Key, u32> = Default::default();
         let mut s_id: rustc_hash2::FxHashMap<(u32, Key), u32> = Default::default();
@@ -427,7 +410,6 @@ impl Encoder {
         if self.t_rank.len() < n_ids {
             self.t_rank.resize(n_ids, u32::MAX);
         }
-        // The targets: distinct ids, sorted by key.
         self.tids.clear();
         for it in items {
             if self.t_rank[it.t as usize] == u32::MAX {
@@ -440,7 +422,6 @@ impl Encoder {
         for (r, &(_, t)) in tk.iter().enumerate() {
             self.t_rank[t as usize] = r as u32;
         }
-        // The sources, by key.
         let mut order: Vec<u32> = (0..sources.len() as u32).collect();
         order.sort_unstable_by_key(|&i| sources[i as usize]);
         self.s_perm.clear();
@@ -561,7 +542,6 @@ impl<'a> Block<'a> {
         Ok(Block { t_keys, sources, body: &raw[pos..], n, order: *order })
     }
 
-    /// Bundles in the block.
     pub fn len(&self) -> usize {
         self.n
     }

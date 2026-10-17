@@ -1,14 +1,7 @@
-//! THE REMAINDER MODEL of an arithmetic (plans/float.md, "The remainder model and the round fork"):
-//! the CIRCLE its remainders are points of (`Rem::C`; a state's HULL is
-//! `hull::Hull` over it, accumulated order-free in a `HullAcc`), and what a
-//! recorded edge does to a remainder (its transfer PAIR, one per axis, as
-//! the tree's table stores it, and as the pushes read it: an `Xfer`). The
-//! forward and the storage are generic over it, so a tree's hulls and
-//! transfers are its arithmetic's.
-//!
-//! 16.16's model is the circle of 65536 points (`arcs::Fixed16`,
-//! `arc_edges`); the doubles' the circle of the doubles of `[-1/2, 1/2)`
-//! (`rem_f64`).
+//! THE REMAINDER MODEL of an arithmetic (plans/float.md "The remainder
+//! model and the round fork"): the CIRCLE its remainders are points of
+//! (`Rem::C`) and an edge's transfer PAIR as the tree's table stores it. The
+//! forward and the storage are generic over it.
 
 use std::fmt::Debug;
 use std::hash::Hash;
@@ -23,14 +16,12 @@ use super::arcs::{Circle, Fixed16, Seg, Transfer};
 use super::hull::{Hull, HullOf};
 use super::rem_f64;
 
-/// One axis of what a frame did to the player's remainder, as the
-/// reference engine's arc capture holds it (`trace::state::ArcAxis`, read
-/// off a leaf), in the arithmetic's numbers: whether this path took the
-/// player's split (`took`), the split's argument `pre` and the fragment
-/// `frag` it took (16.16: the floor split of `rem + ox + 1/2`; doubles:
-/// the round split of `rem + ox`), the move's speed `ox`, and the player's
-/// remainder at the frame's end `fin` (`None`: no player). The kernels'
-/// `arc_edges::RawAxis` is 16.16's raw form of it.
+/// One axis of what a frame did to the player's remainder, captured at its
+/// split (kernels and reference engine): whether this path took it, its
+/// argument `pre` and fragment `frag` (16.16: the floor split of `rem + ox +
+/// 1/2`; doubles: the round split of `rem + ox`), the speed APPLIED `ox`
+/// (not always the stored one), the remainder at the frame's end `fin`
+/// before the boundary widening (`None`: no player).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Capture<N> {
     pub took: bool,
@@ -43,23 +34,20 @@ pub struct Capture<N> {
 pub trait Rem: EngineNum {
     /// An edge's transfer pair as the tree's table records it.
     type Pair: Copy + Debug + PartialEq + Eq + Hash + PartialOrd + Ord + Send + Sync + 'static;
-    /// The circle of points the remainders are (`arcs::Circle`): the
-    /// hulls' (`hull::Hull<C>`) and the arcs' sets, and a pair as the
-    /// pushes and pulls read it (`Xfer`).
+    /// The circle the remainders are points of (hulls, the arcs' sets).
     type C: Circle;
     /// Bytes a pair takes on disk.
     const PAIR_BYTES: usize;
 
-    /// THE DECODE of a frame's captures (x, y) into its transfer pair;
-    /// `Err` is a refusal (fatal in the forward).
+    /// THE DECODE of a frame's captures (x, y); `Err` is a refusal (fatal in
+    /// the forward).
     fn transfer(x: &Capture<Self>, y: &Capture<Self>) -> Result<Self::Pair, String>;
-    /// A pair as the pushes and pulls read it.
     fn xfer(p: &Self::Pair) -> Xfer<Self>;
     /// A remainder as a point of the circle (`None`: not in `[-1/2, 1/2)`).
     fn point(v: Self) -> Option<Point<Self>>;
     /// The remainder at point `p` (`point`'s inverse).
     fn at_point(p: Point<Self>) -> Self;
-    /// Append `p`'s `PAIR_BYTES` bytes.
+    /// Append `p`'s `PAIR_BYTES`.
     fn encode_pair(out: &mut Vec<u8>, p: &Self::Pair);
     fn decode_pair(b: &[u8]) -> Self::Pair;
     /// A hash of a pair (the transfer table's index).
@@ -72,8 +60,8 @@ pub type Xfer<N> = (<<N as Rem>::C as Circle>::Act, <<N as Rem>::C as Circle>::A
 /// A point of `N`'s circle.
 pub type Point<N> = <<N as Rem>::C as Circle>::P;
 
-/// The start state's remainder as a point of the torus: the room's load has
-/// no player yet, so any point stands for it - the point of 0.
+/// The start's remainder point: the room's load has no player yet, so any
+/// point stands for it - the point of 0.
 pub fn start_point<N: Rem>() -> (Point<N>, Point<N>) {
     let p = N::point(<N::A as Arithmetic>::from_i16(0)).expect("0 is a remainder");
     (p, p)

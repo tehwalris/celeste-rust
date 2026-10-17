@@ -1,28 +1,22 @@
-//! THE OUT-EDGES (`edges/out/f{F}.bin`): frame F's recorded edges once more,
-//! by SOURCE - what the hull forward's RE-PUSH reads (`wave`): a state
-//! expanded at its layer, whose hull grows later, pushes its new hull along
-//! its edges again without a kernel run. The edge files proper (`edges`)
-//! hold every edge in its TARGET's region (the backward's read); read by
-//! source they cost a target region's whole blocks per lookup (room (1,0)
-//! f80: 438M bundles decoded for 133M edges pushed). Here a source's edges
-//! are one contiguous run, found by key.
+//! THE OUT-EDGES (`edges/out/f{F}.bin`): frame F's edges once more, by
+//! SOURCE, for the hull forward's RE-PUSH (`wave`: a grown hull pushed along
+//! a state's edges without a kernel run). By target (`edges`) a lookup
+//! decodes a region's whole blocks (~3 bundles an edge pushed); here a
+//! source's edges are one run, found by key.
 //!
-//! A file (`storage::file`) is per kernel UNIT of the frame (a run of entries
-//! of one shape, in (region, key) order: the units are, so the file is too)
-//! a BLOCK, and a header listing each block's first and last entry. A block,
-//! raw:
+//! A file (`storage::file`): the frame's kernel units' BLOCKS (whole
+//! entries, ~`BLOCK_ROWS` rows each; in (region, key) order, as the units
+//! are) and a header of each block's first and last entry. A block, raw:
 //!
-//!   * its ROUTES (target shape hash, slot) and its PAIRS (the transfers,
-//!     `arc_edges::encode_pair`): a block names no global id, so it is final
-//!     when its unit ends;
-//!   * its TARGETS: (route, key), sorted, keys delta-coded within a route;
-//!   * its ENTRIES (region, key), each with its bundles' byte length (a
-//!     reader skips the entries it does not want) and its bundles: (target,
-//!     transfer, offset, target cells), sorted - the edges from the entry's
-//!     cells (a bundle's cells less its offset) only.
+//!   * its ROUTES (target shape hash, slot) and PAIRS (`Rem::encode_pair`):
+//!     no global id, so a block is final when its unit ends;
+//!   * its TARGETS (route, key), sorted, keys delta-coded within a route;
+//!   * its ENTRIES (region, key), each with its bundles' byte length (to skip
+//!     it) and its bundles (target, transfer, offset, target cells), sorted:
+//!     only edges from the entry's cells (a bundle's cells less its offset).
 //!
 //! A unit's targets may hold PROVISIONAL keys (codes new this frame): its
-//! block is encoded again at the frame's end with the final keys (`fixup`).
+//! blocks are encoded again at the frame's end (`fixup`).
 
 use anyhow::{ensure, Result};
 use std::path::{Path, PathBuf};
@@ -46,9 +40,7 @@ fn narrow(w: u128) -> Key {
     ((w >> 64) as u64, w as u64)
 }
 
-/// One out-edge row as a unit makes it: the source entry `(region, key)`,
-/// the target's route `(shape, slot)` and key, the transfer, the offset
-/// (`bundle::offset`), the target cells.
+/// One out-edge row as a unit makes it (`o`: `bundle::offset`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Row<N: Rem = P8> {
     pub s_region: u32,
@@ -60,8 +52,7 @@ pub struct Row<N: Rem = P8> {
     pub mask: u64,
 }
 
-/// One bundle of an entry, as a block holds it: its target and transfer by
-/// their index in the block.
+/// One bundle of an entry as a block holds it: target, transfer by index.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct OutBundle {
     pub t: u32,
@@ -70,11 +61,9 @@ pub struct OutBundle {
     pub mask: u64,
 }
 
-/// An entry's bundles, decoded as they are read (`Block::entries`). A
-/// named type, not a `dyn Iterator`: the re-push's loop over them is
-/// statically dispatched whatever the inliner decides (a trait object here
-/// cost the release build 0.6-0.75% of a frame's instructions once an
-/// unrelated edit stopped LLVM devirtualizing it, 2026-10-16).
+/// An entry's bundles, decoded as read (`Block::entries`). A named type,
+/// not a `dyn Iterator`, so the re-push's loop is statically dispatched (a
+/// trait object cost ~0.7% of a frame's instructions undevirtualized).
 pub struct OutBundles<'a> {
     eb: &'a [u8],
     q: usize,
@@ -104,10 +93,9 @@ impl Iterator for OutBundles<'_> {
     }
 }
 
-/// A block's content by index (what `encode_parts` writes): its routes,
-/// pairs, targets `(route, key)` and entries `(region, key)`, each sorted
-/// and distinct, and its rows `(entry, target, pair, offset) -> cells`
-/// (any order; equal ones merged).
+/// A block's content by index (`encode_parts`): its routes, pairs, targets
+/// `(route, key)` and entries `(region, key)`, each sorted and distinct;
+/// its rows `(entry, target, pair, offset) -> cells`, any order, merged.
 pub struct Parts<N: Rem = P8> {
     pub routes: Vec<(u64, u32)>,
     pub pairs: Vec<N::Pair>,
@@ -139,8 +127,7 @@ impl<N: Rem> Parts<N> {
 }
 
 /// ENCODE `p` as a raw block into `out` (cleared). Returns whether a
-/// target key is provisional (the block waits for the frame's end:
-/// `fixup`).
+/// target key is provisional (the block waits for `fixup`).
 pub fn encode_parts<N: Rem>(p: &mut Parts<N>, out: &mut Vec<u8>) -> bool {
     out.clear();
     debug_assert!(p.routes.windows(2).all(|w| w[0] < w[1]) && p.pairs.windows(2).all(|w| w[0] < w[1]) && p.targets.windows(2).all(|w| w[0] < w[1]) && p.entries.windows(2).all(|w| w[0] < w[1]));
@@ -172,7 +159,6 @@ pub fn encode_parts<N: Rem>(p: &mut Parts<N>, out: &mut Vec<u8>) -> bool {
         }
         prev = Some((r, w));
     }
-    // The entries with rows, each with its bundles (merged, in order).
     let mut n_entries = 0u64;
     let mut body: Vec<u8> = Vec::new();
     let mut eb: Vec<u8> = Vec::new();
@@ -227,8 +213,8 @@ pub fn encode_parts<N: Rem>(p: &mut Parts<N>, out: &mut Vec<u8>) -> bool {
 }
 
 /// Rows per block (`encode_blocks`): a re-push decompresses whole blocks
-/// for the entries it wants, so blocks are small (room (1,0) f80 with one
-/// block a kernel unit decompressed 5.3 GB for 2.6M re-pushed states).
+/// for the entries it wants, so blocks are small (one block a unit
+/// decompressed ~2 KB a re-pushed state).
 pub const BLOCK_ROWS: usize = 1 << 11;
 
 /// `p` as raw blocks of whole entries, about `BLOCK_ROWS` rows each, each
@@ -258,13 +244,11 @@ pub fn encode_blocks<N: Rem>(p: &mut Parts<N>) -> Vec<(Vec<u8>, bool)> {
     let mut out = Vec::new();
     let mut i = 0usize;
     let (mut t_new, mut x_new) = (vec![u32::MAX; p.targets.len()], vec![u32::MAX; p.pairs.len()]);
-    // Per target and pair, the last block holding it (distinct ones listed
-    // once, then sorted: a block's rows are ~2000, its targets and pairs
-    // far fewer).
+    // Per target and pair, the last block holding it (each listed once a
+    // block, then sorted: far fewer than its ~2000 rows).
     let (mut t_in, mut x_in) = (vec![u32::MAX; p.targets.len()], vec![u32::MAX; p.pairs.len()]);
     let mut block = 0u32;
     while i < p.rows.len() {
-        // Whole entries, up to the block's rows.
         let mut j = i;
         while j < p.rows.len() && (j - i < BLOCK_ROWS || (p.rows[j].0 >> 96) == (p.rows[j - 1].0 >> 96)) {
             j += 1;
@@ -315,9 +299,8 @@ pub fn encode_blocks<N: Rem>(p: &mut Parts<N>) -> Vec<(Vec<u8>, bool)> {
     out
 }
 
-/// ENCODE `rows` (any order; equal (entry, target, transfer, offset) rows
-/// merged) as a raw block into `out` (cleared): `encode_parts` of their
-/// indices. Returns whether a target key is provisional.
+/// ENCODE `rows` (any order; equal but for their cells: merged) as a raw
+/// block into `out` (cleared). Returns whether a target key is provisional.
 pub fn encode<N: Rem>(rows: &[Row<N>], out: &mut Vec<u8>) -> bool {
     let mut p = Parts::<N>::default();
     p.routes = rows.iter().map(|r| r.route).collect();
@@ -345,8 +328,7 @@ pub fn encode<N: Rem>(rows: &[Row<N>], out: &mut Vec<u8>) -> bool {
     encode_parts(&mut p, out)
 }
 
-/// A raw block, its header read: routes, pairs, targets; `entries` walks
-/// its entries.
+/// A raw block, its header read; `entries` walks its entries.
 pub struct Block<'a, N: Rem = P8> {
     pub routes: Vec<(u64, u32)>,
     pub pairs: Vec<N::Pair>,
@@ -392,7 +374,6 @@ impl<'a, N: Rem> Block<'a, N> {
         Ok(Block { routes, pairs, targets, body: &raw[pos..], n })
     }
 
-    /// Entries in the block.
     pub fn len(&self) -> usize {
         self.n
     }
@@ -456,8 +437,7 @@ impl<'a, N: Rem> Block<'a, N> {
     }
 }
 
-/// A raw block with PROVISIONAL target keys encoded again with their final
-/// keys (`finals`, the frame's end's).
+/// A raw block with PROVISIONAL target keys encoded again with `finals`.
 pub fn fixup<N: Rem>(raw: &[u8], finals: &rustc_hash::FxHashMap<Key, Key>, out: &mut Vec<u8>) -> Result<()> {
     let mut rows = Block::<N>::open(raw)?.rows()?;
     for r in &mut rows {
@@ -478,8 +458,7 @@ struct BlockHead {
     at: At,
 }
 
-/// A block as the frame's end writes it: zstd, its raw length, its first
-/// and last entry.
+/// A block as the frame's end writes it (zstd) with its entry range.
 pub struct Sealed {
     /// In memory, or in the frame's spool.
     pub z: super::spool::Body,
@@ -515,14 +494,12 @@ impl Sealed {
     }
 }
 
-/// Frame `frame`'s out file.
 pub fn path(edges_dir: &Path, frame: u32) -> PathBuf {
     edges_dir.join("out").join(format!("f{frame:03}.bin"))
 }
 
-/// WRITE frame `frame`'s out file from its units' blocks in unit order
-/// (their entries ascending across blocks: checked). Atomic. Returns its
-/// bytes.
+/// WRITE frame `frame`'s out file from its units' blocks in order (entries
+/// ascending across blocks: checked). Atomic. Returns its bytes.
 pub fn write(path: &Path, frame: u32, blocks: &[Sealed], spool: Option<&super::spool::Spool>) -> Result<u64> {
     ensure!(blocks.windows(2).all(|w| w[0].last < w[1].first), "{}: the out blocks' entries are not ascending", path.display());
     let ats = At::place(blocks.iter().map(|b| (b.z.len(), b.raw as usize)));
@@ -538,12 +515,10 @@ pub fn write(path: &Path, frame: u32, blocks: &[Sealed], spool: Option<&super::s
     })
 }
 
-/// One out file, mapped.
 pub struct OutFile {
     file: Mapped,
-    /// Its blocks (their heads are read where they are in the header, not
-    /// deserialized: an index of every frame's blocks held in memory was
-    /// 64 B a block, 1.9 GB at the fixtures' room's f303).
+    /// Its blocks (their heads read in place in the header: an index of
+    /// every frame's blocks in memory takes 64 B a block).
     blocks: usize,
 }
 
@@ -567,7 +542,6 @@ impl OutFile {
         Ok(out)
     }
 
-    /// Block `i`'s head, read from the header.
     #[inline]
     fn head(&self, i: usize) -> BlockHead {
         let b = &self.file.header_bytes()[12 + i * HEAD_BYTES..12 + (i + 1) * HEAD_BYTES];
@@ -600,12 +574,10 @@ impl OutFile {
         (h.first, h.last)
     }
 
-    /// Block `i`'s raw bytes into `out`.
     pub fn block(&self, i: usize, z: &mut zstd::bulk::Decompressor<'static>, out: &mut Vec<u8>) -> Result<()> {
         self.file.block(self.head(i).at, z, out)
     }
 
-    /// Its blocks.
     pub fn len(&self) -> usize {
         self.blocks
     }
@@ -623,8 +595,7 @@ pub struct OutStore {
 }
 
 impl OutStore {
-    /// Bytes its block indices hold in memory: none (the files' headers
-    /// are read where they are mapped); the list of files.
+    /// Bytes its indices hold: only the file list (headers are read in place).
     pub fn index_bytes(&self) -> usize {
         self.frames.capacity() * std::mem::size_of::<Option<OutFile>>()
     }
@@ -650,7 +621,6 @@ impl OutStore {
         Ok(())
     }
 
-    /// Frame `frame`'s out file.
     pub fn file(&self, frame: u32) -> Option<&OutFile> {
         self.frames.get(frame as usize).and_then(|f| f.as_ref())
     }

@@ -1,13 +1,8 @@
-//! THE VISITED SET: every state the forward has reached - a `set::RegionSet`
-//! of PACKED tables (per (shape, region) its entries - a position-free key
-//! and a mask over the region's cells - sorted, in compressed blocks, each
-//! state with its LAYER and remainder HULL: `set::StateInfo`, none for a
-//! state whose hull is the whole torus - it never grows, nor is it pushed
-//! again), with the shapes it numbered and the key space its keys are in.
-//! READ-ONLY during a wave: a frame's seal walks a region with the sorted
-//! keys it touched (`set::Cursor`), and the frame's end merges its new
-//! states and the hulls that grew in (`absorb`: `set::RegionTable::upsert`,
-//! a big region's runs of blocks apart).
+//! THE VISITED SET: every state the forward has reached, PACKED tables
+//! (`set::RegionSet`; a state's layer and hull, none for a full hull: it
+//! never grows nor is pushed again) with the shapes it numbered and its key
+//! space. READ-ONLY during a wave (the seal walks it: `set::Cursor`); the
+//! frame's end merges in its new states and grown hulls (`absorb`).
 
 use crate::search::hull::HullOf;
 use anyhow::Result;
@@ -23,15 +18,12 @@ pub use super::set::StateInfo;
 pub use celeste_engine::exact::Key;
 use celeste_engine::exact::KeySpace;
 
-/// Blocks a region's run of an `upsert_all` takes (a big region's runs are
-/// upserted apart, on every thread: a big room's biggest region holds
-/// ~2000 blocks).
+/// Blocks a run of an `upsert_all` takes (a big region's runs go apart, on
+/// every thread: a big room's biggest region holds ~2000 blocks).
 const RUN_BLOCKS: usize = 64;
 
-/// The visited set: the shapes (index -> hash, in the order the tree
-/// numbered them), the states (`RegionSet` of packed tables, by
-/// `storage::region_of`), the key space their keys are in (read-only during
-/// a wave).
+/// The shapes (index -> hash, in the order the tree numbered them), the
+/// states (by `storage::region_of`), the key space.
 #[derive(Clone)]
 pub struct VisitedSet<N: Rem = P8> {
     pub geo: Geometry,
@@ -99,17 +91,14 @@ impl<N: Rem> VisitedSet<N> {
         self.set.table(region)
     }
 
-    /// The layer and hull of state `(region, key, local)` (`None`: full,
-    /// or no state; a reader's single lookup).
+    /// State `(region, key, local)`'s layer and hull (`None`: full, or absent).
     pub fn state(&self, region: u32, key: Key, local: u32) -> Option<StateInfo<N>> {
         self.table(region)?.lookup_info(key, local)?.1
     }
 
-    /// UPSERT per region its changes (`set::Change`, sorted by key and
-    /// cell, distinct): regions made where absent (of numbered shapes); a
-    /// big region's runs of `RUN_BLOCKS` blocks apart, with the changes
-    /// between their first keys; every run on `threads` threads, the
-    /// biggest first.
+    /// UPSERT per region its changes (`set::Change`, sorted by key and cell,
+    /// distinct; regions of numbered shapes made where absent), a big
+    /// region's runs of `RUN_BLOCKS` blocks apart, the biggest first.
     pub fn upsert_all(&mut self, changes: Vec<(u32, Vec<Change<N>>)>, threads: usize) -> Result<Upserted> {
         let regions: Vec<u32> = changes.iter().map(|c| c.0).collect();
         let range = |i: usize, lo: Option<Key>, hi: Option<Key>| {
@@ -119,10 +108,9 @@ impl<N: Rem> VisitedSet<N> {
         self.upsert_with(&regions, threads, |i, lo, hi| range(i, lo, hi).len(), |i, lo, hi| Ok(std::borrow::Cow::Borrowed(&changes[i].1[range(i, lo, hi)])))
     }
 
-    /// `upsert_all` with each run's changes MADE by the run (`make(i, lo,
-    /// hi)`: region `regions[i]`'s changes with keys in `[lo, hi)`, `None`
-    /// unbounded - borrowed where they are held already; `count` their
-    /// number, the runs' order) - not all held at once.
+    /// `upsert_all` with each run's changes MADE by the run, not all held at
+    /// once: `make(i, lo, hi)` is region `regions[i]`'s with keys in `[lo,
+    /// hi)` (`None`: unbounded), `count` their number (the runs' order).
     pub fn upsert_with<'c>(
         &mut self,
         regions: &[u32],
@@ -187,12 +175,10 @@ impl<N: Rem> VisitedSet<N> {
         self.set.tables().iter().map(|t| t.1.infos()).sum()
     }
 
-    /// A FRAME's states in, on `threads` threads: per region (each once)
-    /// its NEW entries (a plain table, of a numbered shape) with their
-    /// hulls in its state order - in at layer `layer` - and the states
-    /// whose hull grew (held already; sorted by state) with their new
-    /// hulls. Returns what it did (`held_new`: the new states held
-    /// already - 0, the frame's new states are new).
+    /// A FRAME's states in: per region (each once) its NEW entries (a plain
+    /// table, of a numbered shape) with their hulls in its state order, at
+    /// layer `layer`, and its grown states (held already; sorted) with their
+    /// new hulls. Returns what it did (`held_new`: 0, the new are new).
     #[allow(clippy::type_complexity)]
     pub fn absorb(&mut self, parts: &[(u32, &RegionTable, &[HullOf<N>], &[super::wave::Old<N>])], layer: u16, threads: usize) -> Result<Upserted> {
         // Per region its new entries' first states (their hulls' places).
@@ -218,7 +204,7 @@ impl<N: Rem> VisitedSet<N> {
         };
         let regions: Vec<u32> = parts.iter().map(|p| p.0).collect();
         // The new states and the grown ones, merged by key and cell (each
-        // run makes its own: they were all held at once, 32 B a state).
+        // run makes its own: all held at once they take 32 B a state).
         self.upsert_with(
             &regions,
             threads,
@@ -254,7 +240,6 @@ impl<N: Rem> VisitedSet<N> {
         )
     }
 
-    /// States held.
     pub fn len(&self) -> usize {
         self.set.states() as usize
     }
@@ -263,21 +248,16 @@ impl<N: Rem> VisitedSet<N> {
         self.len() == 0
     }
 
-    /// Entries held.
     pub fn entries(&self) -> usize {
         self.set.entries()
     }
 
-    /// Bytes allocated.
     pub fn alloc_bytes(&self) -> usize {
         self.set.alloc_bytes()
     }
 
-    /// The stored hulls' and layers' statistics (`[memory]`, a diagnostic):
-    /// states with a stored hull, distinct hulls (counted up to `cap`), the
-    /// states the most common 256, 4096 and 65536 hulls cover, distinct
-    /// layers, and the entries whose stored states share one layer (of the
-    /// entries with any).
+    /// The stored hulls' and layers' statistics (`[memory]`, a diagnostic;
+    /// distinct hulls counted up to `cap`).
     pub fn hull_stats(&self, cap: usize) -> Result<String> {
         let mut by: FxHashMap<u64, u64> = FxHashMap::default();
         let (mut states, mut over, mut one_layer, mut entries) = (0u64, false, 0u64, 0u64);
@@ -368,9 +348,8 @@ mod tests {
         }
     }
 
-    /// `absorb` (each run making its own changes from the frame's new
-    /// table and grown states) leaves the visited set as the changes made
-    /// all at once and upserted do: a region of several runs, new keys and
+    /// `absorb` (each run making its own changes) leaves the visited set as
+    /// the changes made at once and upserted do: several runs, new keys and
     /// grown states in every run, before the first key and past the last.
     #[test]
     fn absorb_is_the_upsert_of_the_frames_changes() {

@@ -1,19 +1,12 @@
-//! THE RECORDED GRAPH, target-side and ID-free (plans/architecture.md, "The recorded graph").
-//!
-//! Every edge of frame `f` leaves a state of layer `f - 1` and is stored in
-//! its TARGET's region: per (target region, frame) its bundles
-//! (`storage::bundle`: source key, transfer, offset, target key -> target
-//! cells) in one or more SEGMENTS - a wave's slices - each a zstd block.
-//! Per frame ONE file `edges/f{frame}.bin` (`storage::file`): a header - the
-//! segments, by region, and per target region the SOURCE regions its edges
-//! leave (the out-edge lookup) - and the blocks. Transfers are global ids into `edges/xfer.bin`,
-//! CANONICAL: a frame's new pairs are numbered at its end by their edges
-//! in the frame and their content (`XferTable::canonical`; a bundle
-//! holding one waits for it, as one into
-//! a provisional target does: `route::seal`), so the table and every id in
-//! the edge files are a function of the search, not of the order the
-//! wave's slices met them. Nothing names a state by a number: a state is its region, key
-//! and cell (`Sk`).
+//! THE RECORDED GRAPH, target-side and ID-free (plans/architecture.md,
+//! "The recorded graph"): per frame ONE file `edges/f{frame}.bin`
+//! (`storage::file`) of its edges (each leaving a state of layer `f - 1`):
+//! a header (the segments by region; per target region the SOURCE regions
+//! its edges leave), then per TARGET region its bundles (`storage::bundle`)
+//! in SEGMENTS, a wave's slices, each a zstd block. Transfers are global
+//! ids into `edges/xfer.bin`, CANONICAL (`XferTable::canonical`; a bundle
+//! holding a new one waits for it, as for a provisional target:
+//! `route::reencode`): a function of the search, not of slice order.
 
 use anyhow::{ensure, Context, Result};
 use rustc_hash::FxHashMap;
@@ -27,14 +20,13 @@ use crate::search::rem::Rem;
 use celeste_core::pico8_num::Pico8Num as P8;
 
 /// The global transfer table: every distinct pair the tree's edges carry,
-/// a pair's id its position. `edges/xfer.bin` (`encode_pair` each), its
-/// trusted length in the done marker (`done.txt`: pairs past it are a
-/// killed wave's).
+/// its id its position; `edges/xfer.bin` (`Rem::encode_pair` each), its
+/// trusted length in `done.txt` (pairs past it are a killed wave's).
 #[derive(Clone)]
 pub struct XferTable<N: Rem = P8> {
     pub pairs: Vec<N::Pair>,
     index: PairIndex,
-    /// Pairs written to `xfer.bin` (`flush`).
+    /// Pairs written to `xfer.bin`.
     flushed: usize,
 }
 
@@ -52,9 +44,8 @@ impl<N: Rem> XferTable<N> {
 }
 
 /// A pair's id by content: open addressing over `u32` slots (`id + 1`; 0
-/// empty) of ids into the table's pairs, linear probing, at most 3/4 full
-/// - ~6 B a pair, where a hash map of pairs took ~37 (a big room's f230:
-/// 0.27 GB for 4.1M pairs).
+/// empty) of ids into the table's pairs, linear probing, at most 3/4 full:
+/// ~6 B a pair (a hash map of pairs: ~37).
 #[derive(Default, Clone)]
 struct PairIndex {
     slots: Vec<u32>,
@@ -62,7 +53,6 @@ struct PairIndex {
 }
 
 impl PairIndex {
-    /// `p`'s id among `pairs`, if indexed.
     #[inline]
     fn find<N: Rem>(&self, pairs: &[N::Pair], p: &N::Pair) -> Option<u32> {
         if self.slots.is_empty() {
@@ -103,9 +93,8 @@ impl PairIndex {
         self.n += 1;
     }
 
-    /// The ids from `first` on renumbered (`perm`: per id less `first`,
-    /// its new id less `first`; `pairs` as before): each one's slot found
-    /// by its pair and set, the rest of the index as it is.
+    /// The ids from `first` on renumbered (`perm`: per id less `first`, its
+    /// new id less `first`): each one's slot found by its pair, the rest kept.
     fn renumber<N: Rem>(&mut self, pairs: &[N::Pair], first: usize, perm: &[u32]) {
         let m = self.slots.len() - 1;
         let at: Vec<usize> = (first..pairs.len())
@@ -139,8 +128,7 @@ impl<N: Rem> XferTable<N> {
         Ok(XferTable { flushed: pairs.len(), pairs, index })
     }
 
-    /// The table's pairs alone, as `load` reads them (the readers need no
-    /// index: a big room's tree has 4.0M pairs).
+    /// The pairs alone, as `load` reads them (no index: a big tree has ~4M).
     pub fn load_pairs(dir: &Path) -> Result<Vec<N::Pair>> {
         let n = match read_done(dir)? {
             Some(d) => d.xfers,
@@ -151,7 +139,6 @@ impl<N: Rem> XferTable<N> {
         Ok(b[..n * N::PAIR_BYTES].chunks_exact(N::PAIR_BYTES).map(N::decode_pair).collect())
     }
 
-    /// `p`'s id, if the table holds it.
     #[inline]
     pub fn find(&self, p: &N::Pair) -> Option<u32> {
         self.index.find::<N>(&self.pairs, p)
@@ -171,15 +158,13 @@ impl<N: Rem> XferTable<N> {
     }
 
     /// The workers' NEW pairs (`tails`: what each worker's table gained
-    /// since its last merge) into the table: the ones it lacks appended (in
-    /// value order); per tail its pairs' global ids. A wave merges per
-    /// slice, so these ids are PROVISIONAL until its end (`canonical`).
+    /// since its last merge) merged in, in value order; per tail its pairs'
+    /// ids, PROVISIONAL until the wave's end (`canonical`).
     pub fn merge(&mut self, tails: &[&[N::Pair]]) -> Vec<Vec<u32>> {
         let mut new: Vec<N::Pair> = tails.iter().flat_map(|t| t.iter()).filter(|p| self.index.find::<N>(&self.pairs, p).is_none()).copied().collect();
         new.sort_unstable();
         new.dedup();
-        // Room by an eighth at least (doubling held up to a whole table's
-        // worth of spare pairs: 0.13 GB at a big room's f230).
+        // Room by an eighth at least: doubling can hold a whole table spare.
         if self.pairs.len() + new.len() > self.pairs.capacity() {
             self.pairs.reserve_exact(new.len().max(self.pairs.len() / 8));
         }
@@ -190,14 +175,11 @@ impl<N: Rem> XferTable<N> {
         tails.iter().map(|t| t.iter().map(|p| self.index.find::<N>(&self.pairs, p).expect("a merged pair")).collect()).collect()
     }
 
-    /// The pairs from `first` on (a wave's: merged slice by slice, in the
-    /// slices' order) put in CANONICAL order - by the edges the frame
-    /// recorded with each (`counts[id - first]`), most first, then by
-    /// content: a function of the frame alone, and the frequent transfers
-    /// get the short ids (their varints; content order alone made the
-    /// reference frame's edge file 3% larger). Returns each one's new id
-    /// less `first`, by its old id less `first` (`None`: already in order).
-    /// The ids below `first` stay.
+    /// The pairs from `first` on (a wave's) in CANONICAL order: by the edges
+    /// the frame recorded with each (`counts[id - first]`), most first, then
+    /// by content - a function of the frame alone, the frequent transfers
+    /// with the short varints (~3% smaller edge files). Returns per old id
+    /// less `first` its new one (`None`: in order already); ids below stay.
     pub fn canonical(&mut self, first: usize, counts: &[u64]) -> Option<Vec<u32>> {
         let new = &self.pairs[first..];
         assert_eq!(counts.len(), new.len(), "a count per new transfer");
@@ -260,8 +242,7 @@ impl Flush {
 }
 
 const MAGIC: &[u8; 4] = b"CSE2";
-/// 6: target-region bundle blocks (5: source-side unit blocks with lids
-/// and an owner index; trees before are rebuilt, not converted).
+/// The edge files' own format version (older trees are rebuilt).
 const VERSION: u32 = 6;
 
 /// One segment's place in an edge file.
@@ -285,8 +266,7 @@ struct FileHead {
 /// One target region's encoded segment, as a wave hands it to the file.
 pub struct Segment {
     pub region: u32,
-    /// The zstd block (in memory, or in the frame's spool) and its raw
-    /// length.
+    /// The zstd block, in memory or in the frame's spool.
     pub bytes: super::spool::Body,
     pub raw: u32,
     pub bundles: u32,
@@ -294,8 +274,6 @@ pub struct Segment {
 }
 
 impl Segment {
-    /// A raw block of `bundles` bundles and `edges` edges as a segment of
-    /// `region`.
     pub fn of_raw(region: u32, raw: &[u8], bundles: u32, edges: u64, z: &mut zstd::bulk::Compressor<'static>) -> Result<Segment> {
         Ok(Segment { region, bytes: super::spool::Body::Mem(file::compress(raw, z)?), raw: raw.len() as u32, bundles, edges })
     }
@@ -307,14 +285,13 @@ impl Segment {
     }
 }
 
-/// The edge file of frame `frame`.
 pub fn file_path(dir: &Path, frame: u32) -> PathBuf {
     dir.join(format!("f{frame:03}.bin"))
 }
 
-/// Write frame `frame`'s edge file from its segments (any order) and its
-/// source-region index (`sources`: per target region the source regions,
-/// any order). Atomic (renamed into place). Returns its bytes.
+/// Write frame `frame`'s edge file from its segments and its source-region
+/// index (`sources`, per target region; both any order). Atomic. Returns
+/// its bytes.
 pub fn write_file(path: &Path, frame: u32, mut segs: Vec<Segment>, mut sources: Vec<(u32, Vec<u32>)>, spool: Option<&super::spool::Spool>) -> Result<u64> {
     segs.sort_by_key(|s| s.region);
     sources.sort_unstable_by_key(|s| s.0);
@@ -333,7 +310,6 @@ pub fn write_file(path: &Path, frame: u32, mut segs: Vec<Segment>, mut sources: 
     })
 }
 
-/// One edge file, mapped.
 struct EdgeFile {
     file: Mapped,
     head: FileHead,
@@ -352,7 +328,6 @@ impl EdgeFile {
         Ok(EdgeFile { file, head, targets: std::sync::OnceLock::new() })
     }
 
-    /// The segments of `region`.
     fn segs_of(&self, region: u32) -> &[SegHead] {
         let s = &self.head.segs;
         let lo = s.partition_point(|x| x.region < region);
@@ -377,7 +352,6 @@ impl EdgeFile {
     }
 }
 
-/// One stored segment: its target region, zstd block and raw length.
 #[derive(Clone, Copy)]
 pub struct SegRef<'a> {
     pub region: u32,
@@ -387,7 +361,6 @@ pub struct SegRef<'a> {
     pub edges: u64,
 }
 
-/// One edge: source, target, global transfer id.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Edge {
     pub src: Sk,
@@ -395,8 +368,7 @@ pub struct Edge {
     pub xfer: u32,
 }
 
-/// The edges of bundle `b` of target region `region`: `f(source, target)`
-/// per target cell.
+/// The edges of bundle `b` of target region `region`: `f(source, target)` each.
 #[inline]
 pub fn expand(geo: &Geometry, region: u32, b: &Bundle, mut f: impl FnMut(Sk, Sk)) {
     let slot = region % geo.slots;
@@ -409,7 +381,6 @@ pub fn expand(geo: &Geometry, region: u32, b: &Bundle, mut f: impl FnMut(Sk, Sk)
     }
 }
 
-/// A worker's decoder: a zstd context and the raw block's buffer.
 pub struct Decoder {
     z: zstd::bulk::Decompressor<'static>,
     raw: Vec<u8>,
@@ -428,7 +399,6 @@ impl Decoder {
         bundle::Block::open(&self.raw, &bundle::ORDER)
     }
 
-    /// Every bundle of segment `s`.
     pub fn bundles(&mut self, s: &SegRef, f: impl FnMut(Bundle)) -> Result<()> {
         self.open(s)?.bundles(f)
     }
@@ -461,27 +431,22 @@ impl<N: Rem> EdgeStore<N> {
         Ok(EdgeStore { frames, xfers, edges, bytes })
     }
 
-    /// Frame `frame`'s edge file.
     fn file(&self, frame: u32) -> Option<&EdgeFile> {
         self.frames.get(frame as usize).and_then(|x| x.as_ref())
     }
 
-    /// The transfer of global id `xfer`.
     pub fn pair(&self, xfer: u32) -> Option<N::Pair> {
         self.xfers.get(xfer as usize).copied()
     }
 
-    /// The whole transfer table.
     pub fn pairs(&self) -> &[N::Pair] {
         &self.xfers
     }
 
-    /// Does frame `frame` have recorded edges?
     pub fn has_frame(&self, frame: u32) -> bool {
         self.file(frame).is_some()
     }
 
-    /// The last frame of the store.
     pub fn horizon(&self) -> u32 {
         self.frames.len() as u32 - 1
     }
@@ -505,7 +470,6 @@ impl<N: Rem> EdgeStore<N> {
         v
     }
 
-    /// The segments of target region `region` at frame `frame`.
     pub fn segments(&self, frame: u32, region: u32) -> Vec<SegRef<'_>> {
         self.file(frame).into_iter().flat_map(|f| f.segs_of(region).iter().map(move |h| f.seg(h))).collect()
     }
@@ -526,17 +490,15 @@ impl<N: Rem> EdgeStore<N> {
         v
     }
 
-    /// Every edge of frame `frame` on `threads` workers (`par::Pool`): the
-    /// edges of each segment folded into an accumulator of its own
-    /// (`init()`); the accumulators, by segment (fold them commutatively).
+    /// Every edge of frame `frame`, each segment's folded into an
+    /// accumulator of its own (`init()`); the accumulators, by segment.
     pub fn par_scan<A: Send>(&self, frame: u32, threads: usize, init: impl Fn() -> A + Sync, f: impl Fn(&mut A, Edge) + Sync) -> Result<Vec<A>> {
         let geo = GEOMETRY;
         self.par_blocks(frame, threads, init, |acc, region, blk| blk.bundles(|b| expand(&geo, region, &b, |src, dst| f(acc, Edge { src, dst, xfer: b.x }))))
     }
 
-    /// Every segment of frame `frame` opened, on `threads` workers
-    /// (`par::Pool`): its blocks folded (`f(acc, target region, block)`)
-    /// into an accumulator of its own; the accumulators, by segment.
+    /// Every segment of frame `frame` opened and folded (`f(acc, target
+    /// region, block)`) into an accumulator of its own; by segment.
     pub fn par_blocks<A: Send>(&self, frame: u32, threads: usize, init: impl Fn() -> A + Sync, f: impl Fn(&mut A, u32, &bundle::Block) -> Result<()> + Sync) -> Result<Vec<A>> {
         let segs = self.all_segments(frame);
         crate::par::Pool::new(threads).map_with(
@@ -577,10 +539,9 @@ impl<N: Rem> EdgeStore<N> {
 }
 
 /// THE TREE'S ONE TRUST MARKER (`<level>/edges/done.txt`): the last frame
-/// whose files are all complete - its frame files, metadata, drop notes,
-/// edge files and the pos graph, all written before it - and the transfer
-/// table's trusted length. A frame past it is a killed run's (`resume`
-/// discards it).
+/// whose files are all complete - its frame, hull, edge and out files and
+/// the pos graph, all written before it - and the transfer table's trusted
+/// length. A frame past it is a killed run's (`resume` discards it).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Done {
     pub frame: u32,
@@ -607,8 +568,7 @@ pub fn done_frame(dir: &Path) -> Option<u32> {
     read_done(dir).ok().flatten().map(|d| d.frame)
 }
 
-/// Trust frame `frame` and the first `xfers` transfers: the frame's LAST
-/// write.
+/// Trust frame `frame` and the first `xfers` transfers: the frame's LAST write.
 pub fn set_done(dir: &Path, frame: u32, xfers: usize) -> Result<()> {
     std::fs::create_dir_all(dir)?;
     let tmp = dir.join("done.tmp");
@@ -630,7 +590,7 @@ pub fn frame_of_name(name: &str) -> Option<u32> {
 
 /// Drop what a run past `last` (the last complete frame) left: every edge
 /// file of a later frame and temporary files. Transfers past the trusted
-/// length are overwritten by the next merge.
+/// length are overwritten by the next flush.
 pub fn discard_after(dir: &Path, last: u32) -> Result<()> {
     for e in std::fs::read_dir(dir).into_iter().flatten().flatten() {
         let p = e.path();
@@ -666,8 +626,7 @@ pub(crate) fn segments_of(edges: &[(Sk, Sk, u32)]) -> Result<(Vec<Segment>, Vec<
 }
 
 /// A tree's edge files from edges `(source, target, global transfer)` per
-/// frame and its transfer table `pairs`: the backward's tests write their
-/// graphs with it.
+/// frame and its transfer table `pairs` (the backward's tests).
 #[cfg(test)]
 pub(crate) fn write_test_edges(dir: &Path, frames: &[(u32, Vec<(Sk, Sk, u32)>)], pairs: &[crate::search::arc_edges::Pair]) -> Result<()> {
     let mut xt = XferTable::<P8>::default();
@@ -688,10 +647,9 @@ mod tests {
     use super::*;
     use crate::search::arc_edges::Pair;
 
-    /// A wave's new transfers, merged slice by slice, get their CANONICAL
-    /// ids - by their edges' count, then content: the permutation, the
-    /// table and its index agree, the older ids stay, and a table in order
-    /// is left alone.
+    /// A wave's new transfers get their CANONICAL ids (by edge count, then
+    /// content): the permutation, the table and its index agree, the older
+    /// ids stay, and a table in order is left alone.
     #[test]
     fn a_waves_new_transfers_are_numbered_by_count_and_content() {
         let pair = |v: i32| {
@@ -740,8 +698,7 @@ mod tests {
     }
 
     /// A frame's edges come back from its file: every edge by a scan, a
-    /// target's in-edges by `preds_at`, the out-edge index by source region;
-    /// a raise's file beside the frame's adds its edges.
+    /// target's in-edges by `preds_at`, the out-edge index by source region.
     #[test]
     fn a_frames_edges_come_back() {
         let dir = std::env::temp_dir().join(format!("celeste-storage-edges-{}", std::process::id()));

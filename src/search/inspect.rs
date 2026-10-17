@@ -18,8 +18,8 @@ pub fn av_show<N: EngineNum>(v: AV<N>) -> String {
 }
 
 /// A block's value cells by NAME: the player's (`player.x`, `spd.x`,
-/// `rem.y`, `dash_effect_time`) and every object's as `type[i].field[.sub]`.
-/// Globals are left out.
+/// `rem.y`, `dash_effect_time`), every object's as `type[i].field[.sub]`,
+/// then the globals'.
 pub fn cell_names<N: EngineNum>(rt2: &Rt2<N>, ids: &BoundaryIds) -> HashMap<usize, String> {
     let mut names = HashMap::new();
     if let Some(obj) = crate::search::pos_graph::player_object(rt2) {
@@ -40,7 +40,6 @@ pub fn cell_names<N: EngineNum>(rt2: &Rt2<N>, ids: &BoundaryIds) -> HashMap<usiz
             }
         }
     }
-    // Every other object's fields.
     if let Some(arr) = rt2.global_target(ids.g_objects) {
         if let Cell2::Arr(items) = &rt2.structure[arr as usize] {
             let type_name = |t: u32| -> String {

@@ -1,11 +1,8 @@
-//! THE SEARCH'S DRIVER (`rewrite search`, `rewrite dual`, `rewrite
-//! check known`; plans/architecture.md "The search"): per level of
-//! `--level`, coarsest first, the forward (`frame::grow_tree`; a finer
-//! level filtered by the coarser one's arc-marked nodes) and its arc phase
-//! (`solve`), then at the last level the concrete search - or, for
-//! the dual search, both arithmetics' levels and `dual::search` over pairs.
-//! The outcome is recorded (`result.json`, `search::result`) before it is
-//! returned; the binary prints it and maps it to the exit code.
+//! THE SEARCH'S DRIVER (`rewrite search`, `rewrite dual`, `rewrite check
+//! known`; plans/architecture.md "The search"): per level, coarsest first,
+//! the forward (`frame::grow_tree`) and its arc phase (`solve`), then the
+//! concrete search at the last level (the dual search: `dual::search` over
+//! pairs). The outcome is recorded (`result.json`) before it is returned.
 
 use std::path::Path;
 
@@ -23,7 +20,6 @@ use crate::compiled::KernelLanes;
 use crate::frame::{Block, MarkFilter, Visited};
 use crate::settings::{Arith, Settings};
 
-/// A search to run.
 pub struct SearchSpec<'a> {
     /// The run's settings (a dual search's fixed half: real play).
     pub settings: &'a Settings,
@@ -38,11 +34,10 @@ pub struct SearchSpec<'a> {
     pub dir: &'a Path,
     /// Stop at the arc bound (`--no-witness`).
     pub bound_only: bool,
-    /// The web UI's arc pass into this directory (`--save-marks`; a dual
-    /// search's: the float half's, with the dual witness).
+    /// The UI's arc pass (`--save-marks`; dual: the float half's).
     pub save_marks: Option<&'a Path>,
-    /// A known route: tried first, and checked against every pruning step
-    /// (`--prefer`, `search::known`).
+    /// A known route (`--prefer`): tried first, checked against every
+    /// pruning step (`search::known`).
     pub prefer: Option<&'a [u8]>,
     /// THE DUAL SEARCH: the float half's settings (`Settings::float_half`).
     pub dual: Option<&'a Settings>,
@@ -91,14 +86,12 @@ pub fn run(spec: &SearchSpec) -> Result<SearchResult> {
     Ok(res)
 }
 
-/// The level -1 table of each of `halves` first: a room whose table cannot
-/// be built is a recorded refusal (rerun without the filter), not a panic
-/// somewhere in the forward.
+/// The level -1 table of each of `halves` first: one that cannot be built
+/// is a recorded refusal, not a panic somewhere in the forward.
 fn tables(halves: &[&Settings], res: &mut SearchResult) -> bool {
     for s in halves {
         if let Some(m) = s.minus_one() {
             if let Err(e) = m.try_table(s) {
-                // A dual search's names the half.
                 let half = if halves.len() > 1 { format!("{}: ", s.arith) } else { String::new() };
                 res.error = Some(format!("{half}{e:#}"));
                 return false;
@@ -108,7 +101,6 @@ fn tables(halves: &[&Settings], res: &mut SearchResult) -> bool {
     true
 }
 
-/// A single search in arithmetic `N`.
 fn single<N: KernelLanes>(spec: &SearchSpec, levels: &[Level], res: &mut SearchResult) -> Result<Verdict> {
     let s = spec.settings;
     let room = format!("{},{}", s.room.0, s.room.1);
@@ -140,8 +132,7 @@ fn single<N: KernelLanes>(spec: &SearchSpec, levels: &[Level], res: &mut SearchR
     Ok(Verdict::Optimal)
 }
 
-/// The witness file `witness_frame_F.txt` (`header`, then the inputs),
-/// recorded.
+/// The witness file `witness_frame_F.txt` (`header`, the inputs), recorded.
 fn witness(dir: &Path, res: &mut SearchResult, w: &Witness, header: &str) -> Result<()> {
     let f = w.inputs.len();
     let path = dir.join(format!("witness_frame_{f}.txt"));
@@ -152,11 +143,9 @@ fn witness(dir: &Path, res: &mut SearchResult, w: &Witness, header: &str) -> Res
     Ok(())
 }
 
-/// THE DUAL SEARCH (`search::dual`): the fixed half under the spec's
-/// settings (real play), the float half under `float`, each its levels to
-/// the same horizon under `<dir>/fixed` and `<dir>/float`, then the dual
-/// concrete search between the larger arc bound and the horizon; its
-/// witness replayed in both arithmetics.
+/// THE DUAL SEARCH (`search::dual`): each half's levels to one horizon
+/// (`<dir>/fixed`, real play; `<dir>/float`), the dual concrete search from
+/// the larger arc bound, its witness replayed in both arithmetics.
 fn dual(spec: &SearchSpec, float: &Settings, levels: &[Level], res: &mut SearchResult) -> Result<Verdict> {
     let cfg = spec.settings;
     let room = format!("{},{}", cfg.room.0, cfg.room.1);
@@ -211,12 +200,9 @@ enum Finish {
     Arcs,
 }
 
-/// The LEVELS of a search in arithmetic `N`, coarsest first, under `base`:
-/// each a forward (the level's kernels from the reference engine's start; a
-/// finer level filtered by the coarser one's arc marks) and its arc phase,
-/// recorded in `res.levels` (their dirs named under `prefix`). The last
-/// level ends as `finish` says. `None`: a level's arc phase REFUTED the
-/// horizon.
+/// The LEVELS of a search under `base`, each a forward and its arc phase,
+/// recorded in `res.levels` (dirs under `prefix`); the last ends as `finish`
+/// says. `None`: a level's arc phase REFUTED the horizon.
 #[allow(clippy::too_many_arguments)]
 fn run_levels<N: KernelLanes>(
     cfg: &Settings,
@@ -234,11 +220,10 @@ fn run_levels<N: KernelLanes>(
     for (li, &lvl) in levels.iter().enumerate() {
         let last = li + 1 == levels.len();
         let dir = base.join(format!("level{li:02}"));
-        // THE FORWARD. Level 0's tree is reused or extended (`grow_tree`:
-        // one filtered by level -1 below this horizon is refused, a hull
-        // tree cannot be raised). A finer level's tree is filtered by the
-        // coarser marks for one horizon: kept only for the same marks,
-        // horizon and level -1, else built again (it is the cheap one).
+        // THE FORWARD. Level 0's tree is reused or extended (`grow_tree`
+        // refuses one filtered by level -1 below this horizon); a finer
+        // level's is kept only for the same marks, horizon and level -1, else
+        // rebuilt (it is the cheap one).
         let t = std::time::Instant::now();
         let want = cfg.minus_one();
         let filter = prev.as_ref().map(|(m, l)| MarkFilter::new(m, *l, cfg.clock()));
@@ -262,10 +247,8 @@ fn run_levels<N: KernelLanes>(
         eprintln!("[search] level {li} ({lvl}): forward to f{steps} in {forward_s:.1} s; first win {first_win:?}");
         crate::metrics::mem_phase("forward");
         // THE ARC PHASE, and the concrete search at the LAST level only: a
-        // coarser level's bound is loose wherever its objects are
-        // (gemskip-nodiag 2800m h192: 379 s of a 450 s search went to a
-        // fruitless try at level 0's bound f186; the optimum was 191), and
-        // the finer level decides the optimum anyway.
+        // coarser level's bound is loose wherever its objects are (a try at
+        // it can cost most of a search), and the finer level decides anyway.
         let concrete = last && finish == Finish::Concrete;
         let keep = last && finish == Finish::Arcs;
         // Every level saves its marks (the next overwrites).
@@ -282,11 +265,9 @@ fn run_levels<N: KernelLanes>(
     anyhow::bail!("no level given")
 }
 
-/// What the arc phase of a search found (`solve`).
 pub struct Solved<N: Rem = P8> {
-    /// The optimum over the rotation graph, a lower bound on the game's, in
-    /// FRAMES (`horizon` and the marks' deadlines are in search steps).
-    /// `None`: the horizon is REFUTED.
+    /// The rotation graph's optimum, a lower bound on the game's, in FRAMES
+    /// (the marks' deadlines count steps); `None`: the horizon is REFUTED.
     pub arc: Option<u32>,
     /// The concrete optimum and its witness, when asked for and found.
     pub concrete: Option<Witness>,
@@ -296,8 +277,7 @@ pub struct Solved<N: Rem = P8> {
     /// The known route's exit frame when it was checked (`search::known`):
     /// it wins by the horizon and survives every pruning step.
     pub known: Option<u32>,
-    /// The winning sets and what keys their nodes, when kept (`solve`'s
-    /// `keep_arcs`): the dual search's half (`search::dual`).
+    /// W and its node keys, with `keep_arcs`: a dual search's half.
     pub arcs: Option<Arcs<N>>,
 }
 
@@ -312,15 +292,12 @@ pub struct Arcs<N: Rem = P8> {
     pub horizon: u32,
 }
 
-/// THE ARC PHASE over a finished tree in `dir`: `backward`, `optimum`, and
-/// as much of `concrete_search` as `concrete` says. Prints the `[gate]`
-/// fingerprints (over (shape, key, cell), independent of scheduling): W's
-/// support, W at every frame, the optimum. With `save`, writes the UI's arc
-/// pass: `level0.marks.bin` (W's support, each node to its last frame),
-/// `arc.marks.bin` (the nodes `reach::inside_w` reaches) and the witness (the bound
-/// and the first win are the search's `result.json`).
-/// With `known`, checks a known solution against every pruning step before
-/// the concrete search (`search::known`): an error if one drops it.
+/// THE ARC PHASE over a finished tree: `backward`, `optimum`, and with
+/// `concrete` the concrete search. Prints the `[gate]` fingerprints (W's
+/// support, W per frame, the optimum; independent of scheduling). `save`:
+/// the UI's `level0.marks.bin` (W's support), `arc.marks.bin` (what
+/// `reach::inside_w` reaches) and the witness. `known`: a known solution
+/// checked against every pruning step first, an error if one drops it.
 #[allow(clippy::too_many_arguments)]
 pub fn solve<N: crate::compiled::KernelLanes>(
     dir: &std::path::Path,
@@ -358,13 +335,11 @@ pub fn solve<N: crate::compiled::KernelLanes>(
     let arc = arc_steps.map(|k| s.clock().frame_of(k));
     eprintln!("[arc] backward {tb:.2} s; optimum {arc_steps:?} (steps)");
     // Fingerprints over CONTENT (`exact::ContentHash`): independent of the
-    // order the tree's dictionaries grew in (a raise). A node is its state:
-    // (shape, key, cell) without a lookup.
+    // order the tree's dictionaries grew in.
     let content = seeds.space.content_hash();
     // Per frame, the nodes with a set and the sum of their (node, set)
-    // hashes: each span added at its first frame and taken off past its
-    // last (`delta`), then summed frame by frame; W's nodes in parallel
-    // block ranges, the sums commutative.
+    // hashes: each span added at its first frame, taken off past its last
+    // (`delta`); the sums commute, so the nodes go in parallel.
     type Part = (u64, Vec<(i64, u64)>, Vec<MarkRow>);
     let blocks = w.len().div_ceil(BLOCK);
     let parts: Vec<anyhow::Result<Part>> = crate::par::Pool::new(threads).chunks(blocks, 4096, |lo, hi| {
@@ -464,15 +439,11 @@ pub fn solve<N: crate::compiled::KernelLanes>(
     Ok(Solved { arc, concrete: found, arc_marks, known, arcs })
 }
 
-/// `rewrite check known`: a KNOWN route (`inputs`) against the pruning of
-/// the finished search in `dir`: per level the arc phase rerun as the
-/// search ran it, without the concrete search, and the route checked at
-/// every step (`search::known`, the hull forward's claim too). The levels
-/// and the horizon are the search's record's (`result.json`; a dual
-/// search's half, `DIR/fixed` or `DIR/float`, reads `DIR`'s), the horizon
-/// unless `horizon` gives one; each tree's settings its own record's, the
-/// run's own (threads, the concrete phase's seeds) from `run`. An error at
-/// the first check that drops the route.
+/// `rewrite check known`: a KNOWN route against the finished search in
+/// `dir`: per level the arc phase rerun, the route checked at every pruning
+/// step (the hull forward's claim too). Levels and horizon from
+/// `result.json` (a dual half: its parent's) unless `horizon`, settings from
+/// each tree's record. An error at the first check that drops the route.
 pub fn check_known(dir: &Path, inputs: &[u8], horizon: Option<u32>, run: &Settings) -> Result<()> {
     let res = SearchResult::read(dir).or_else(|e| match dir.parent() {
         Some(p) if super::result::path(p).exists() => SearchResult::read(p),
@@ -517,14 +488,10 @@ fn check_known_in<N: KernelLanes>(trees: &[(std::path::PathBuf, Settings, Level)
 mod tests {
     use super::*;
 
-    /// THE BREADTH-FIRST LAYERS of the concrete and the dual searches: the
-    /// gates' witnesses all come from the depth-first try at the bound, so
-    /// here it is skipped (`concrete::NO_DFS`). Room (1,0)'s arc gate (the
-    /// synthetic win (9,101), h35; `r0sx`), in 16.16 and in Celia's floats,
-    /// and the dual search: each optimum and witness pinned
-    /// (gates/bfs_room10_win9-101_h35.txt; `CELESTE_REGENERATE=1` rewrites
-    /// it), the same at 3 and 32 threads (the layers merge their chunks in
-    /// order).
+    /// THE BREADTH-FIRST LAYERS (the gates' witnesses come from the
+    /// depth-first try, skipped here): room (1,0)'s arc gate in 16.16, Celia's
+    /// floats and dual, each optimum and witness pinned, the same at 3 and 32
+    /// threads (the layers merge their chunks in order).
     #[test]
     #[ignore = "slow, ./check.sh t2 runs it: room (1,0)'s kernels in both arithmetics, three searches at two thread counts, ~60 CPU-s"]
     fn the_breadth_first_searches_are_pinned() {

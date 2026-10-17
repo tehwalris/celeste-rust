@@ -10,12 +10,10 @@ use std::path::{Path, PathBuf};
 /// The record's format; a reader refuses another.
 pub const FORMAT: u32 = 1;
 
-/// The file in a search's checkpoint dir.
 pub fn path(checkpoint_dir: &Path) -> PathBuf {
     checkpoint_dir.join("result.json")
 }
 
-/// How the search ended.
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum Verdict {
@@ -37,7 +35,6 @@ pub enum Verdict {
 /// One level of `--level`, in order.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct LevelResult {
-    /// Its spec (`r0sxhn`).
     pub spec: String,
     /// Its tree, under the checkpoint dir (`level00`).
     pub dir: String,
@@ -74,14 +71,12 @@ pub struct SearchResult {
     pub peak_gb: f64,
     /// Why the search stopped short (the level -1 refusal's error).
     pub error: Option<String>,
-    /// A DUAL search's (`rewrite dual`): `optimal` is the float half's exit
-    /// (the count, rule (b)), the levels' dirs are under `fixed/` and
-    /// `float/`. Absent from a single search's record.
+    /// A DUAL search's (`rewrite dual`; absent otherwise): `optimal` is the
+    /// float half's exit (rule (b)), the levels' dirs under `fixed/`, `float/`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dual: Option<DualResult>,
 }
 
-/// What a dual search records beyond a search's.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct DualResult {
     /// The float half's arithmetic and tool (`float-celia`), and its start.

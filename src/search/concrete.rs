@@ -1,21 +1,12 @@
 //! THE CONCRETE SEARCH (plans/architecture.md "The search", step 3): from
 //! the room's start, every input (one per class of the buttons a frame
 //! reads: `Covered`) and every `rnd` leaf, a successor admitted only where
-//! the level's winning sets hold its exact remainder, each exact state
-//! once. First a depth-first try for a win AT the bound (at most
-//! `dfs_budget` steps; a win there is optimal, the bound being a lower
-//! bound), then breadth-first layers: the first layer with a win is the
-//! optimum, its path the witness.
-//!
-//! Sound: every concrete path that wins by the horizon stays inside W, so
-//! the search is EXHAUSTIVE inside W and prunes by nothing else. States are
-//! told apart by their EXACT identity, never the level's widened key
-//! (`exact_state`, `522de36`).
-//!
-//! One search (`search`) for what it steps (`Concrete`): one arithmetic's
-//! reference engine (`Single`), or a pair of them (`dual::Pairs`, the dual
-//! search). Layers run in parallel, chunks of parents merged in order, so
-//! the witness is the same at any thread count.
+//! W holds its exact remainder, each EXACT state once (`exact_state`, never
+//! the widened key). Sound: every concrete path that wins by the horizon
+//! stays inside W, so the search is EXHAUSTIVE inside W and prunes by
+//! nothing else. First a depth-first try at the (lower) bound, then
+//! breadth-first layers: the first with a win is the optimum, its path the
+//! witness, the same at any thread count (chunks merge in order).
 
 use anyhow::{ensure, Result};
 use celeste_core::arith::{Arithmetic, EngineNum};
@@ -32,9 +23,8 @@ use crate::settings::{Clock, Settings};
 use crate::storage::{Sk, GEOMETRY};
 use crate::engines::reference::ReferenceEngine;
 
-/// What the concrete search steps: its engine (one a worker), its states,
-/// their identity (dedup and the depth-first try's memo), and what an edge
-/// records for the witness (`Label`).
+/// What the concrete search steps (`Single`, `dual::Pairs`): engines (one a
+/// worker), states, their identity (dedup, the depth-first memo), `Label`s.
 pub(super) trait Concrete: Sync {
     type Engine: Send;
     type State: Send + Sync;
@@ -42,14 +32,12 @@ pub(super) trait Concrete: Sync {
     type Label: Copy + Send;
     /// The logs' name (`concrete`, `dual`).
     const NAME: &'static str;
-    /// `n` engines, one a worker.
     fn engines(&self, n: usize) -> Result<Vec<Self::Engine>>;
     /// The start, and its label (the witness's first).
     fn start(&self, eng: &mut Self::Engine) -> Result<(Self::State, Self::Label)>;
-    /// `st`'s successors under `byte`, admitted at W step `t`, in leaf
-    /// order: a win (its label), or a state inside W (its key and label);
-    /// and the buttons the frame read. A state `known` already may be left
-    /// out before its W lookup. `steps` counts the engines' leaves.
+    /// `st`'s successors under `byte` at W step `t`, in leaf order (a win,
+    /// or a state inside W), and the buttons the frame read. A state `known`
+    /// may be left out before its W lookup; `steps` counts leaves.
     #[allow(clippy::too_many_arguments)]
     fn successors(&self, eng: &mut Self::Engine, st: &Self::State, byte: u8, t: u32, known: &dyn Fn(&Self::Key) -> bool, steps: &mut u64) -> Result<(Vec<Next<Self>>, u8)>;
     /// The depth-first try's budget, in steps.
@@ -60,7 +48,6 @@ pub(super) trait Concrete: Sync {
     }
 }
 
-/// A successor (`Concrete::successors`).
 pub(super) enum Next<C: Concrete + ?Sized> {
     Win(C::Label),
     State(C::State, C::Key, C::Label),
@@ -72,12 +59,9 @@ pub(super) struct Path<L> {
     pub labels: Vec<L>,
 }
 
-/// THE CONCRETE SEARCH of `c` from its start: a depth-first try at `bound`
-/// (frames), then breadth-first to `frames`; W at frame `k` is step
-/// `clock.steps(k)` (a frame boundary: there a state keys exactly as a
-/// whole frame's).
-/// `prefer` orders the inputs (a known route first: only WHICH optimum is
-/// found). `None`: no win by `frames`.
+/// THE CONCRETE SEARCH of `c`: a depth-first try at `bound`, then
+/// breadth-first to `frames` (both frames; W at frame `k` is step
+/// `clock.steps(k)`, a boundary, where a state keys exactly). `None`: no win.
 pub(super) fn search<C: Concrete>(c: &C, frames: u32, bound: u32, clock: Clock, prefer: Option<&[u8]>, workers: usize) -> Result<Option<Path<C::Label>>> {
     let name = C::NAME;
     ensure!(bound <= frames, "the bound f{bound} is past the horizon f{frames}");
@@ -87,9 +71,8 @@ pub(super) fn search<C: Concrete>(c: &C, frames: u32, bound: u32, clock: Clock, 
     crate::metrics::mem_phase(&format!("{name}: engines up"));
 
     // THE FAST PATH: depth-first for a win AT the bound, inside `W_{H -
-    // bound + k}`, on one engine. Sound: a win here is at the lower bound,
-    // hence optimal; an exhausted or abandoned try proves nothing and the
-    // breadth-first search runs.
+    // bound + k}`. A win here is at the lower bound, hence optimal; an
+    // exhausted or abandoned try proves nothing.
     {
         struct Dfs<'a, C: Concrete> {
             c: &'a C,
@@ -167,13 +150,11 @@ pub(super) fn search<C: Concrete>(c: &C, frames: u32, bound: u32, clock: Clock, 
         }
     }
 
-    // THE BREADTH-FIRST LAYERS. Per layer k >= 1, each state's (parent index
-    // in layer k-1, input, label).
+    // BREADTH-FIRST: per layer k >= 1, each state's (parent, input, label).
     let mut back: Vec<Vec<(u32, u8, C::Label)>> = Vec::new();
     let mut cur: Vec<C::State> = vec![start];
     let mut steps = 0u64;
-    /// A successor in (parent, input, leaf) order within its chunk;
-    /// `next: None` the win.
+    /// A successor in (parent, input, leaf) order; `next: None`: the win.
     struct Succ<C: Concrete> {
         parent: u32,
         byte: u8,
@@ -183,8 +164,7 @@ pub(super) fn search<C: Concrete>(c: &C, frames: u32, bound: u32, clock: Clock, 
     for k in 0..frames {
         let t = std::time::Instant::now();
         let t_w = clock.steps(k + 1);
-        // In chunks of 16 parents, an engine a worker (each takes a free
-        // one: as many as workers), successors in chunk order.
+        // Chunks of 16 parents, a free engine a worker.
         const CHUNK: usize = 16;
         let parts: Vec<(Vec<Succ<C>>, u64)> = crate::par::Pool::new(engines.len()).map_with(
             cur.len().div_ceil(CHUNK),
@@ -204,11 +184,9 @@ pub(super) fn search<C: Concrete>(c: &C, frames: u32, bound: u32, clock: Clock, 
                         ran.push(byte, read);
                         for n in next {
                             match n {
-                                // A win keeps no state, and the chunk ends at
-                                // its first: the earliest win (chunks merge in
-                                // order) ends the search. Every successor of
-                                // the last layer can win - kept whole, room
-                                // (4,3) 100% reached 100 GB there.
+                                // A win keeps no state and ends its chunk:
+                                // the earliest (chunks merge in order) ends the
+                                // search (keeping the last layer took 100 GB).
                                 Next::Win(label) => {
                                     got.push(Succ { parent: p as u32, byte, label, next: None });
                                     break 'chunk;
@@ -256,7 +234,6 @@ pub(super) fn search<C: Concrete>(c: &C, frames: u32, bound: u32, clock: Clock, 
         );
         if let Some((parent, byte, label)) = won {
             ensure!(k + 1 >= bound, "a {name} win at f{} before the bound f{bound}: a backward lost a path", k + 1);
-            // The path, back through the layers.
             let (mut inputs, mut labels) = (vec![byte], vec![label]);
             let mut p = parent;
             for layer in back.iter().rev() {
@@ -282,9 +259,8 @@ pub(super) fn search<C: Concrete>(c: &C, frames: u32, bound: u32, clock: Clock, 
     Ok(None)
 }
 
-/// One arithmetic's level as the concrete searches admit its states: its
-/// winning sets, what keys their nodes, its settings, and whether its
-/// concrete states key through `lookup_view` (seeded balloons).
+/// One arithmetic's level as the concrete searches admit states: W, its
+/// nodes' keys, settings, and whether states key through `lookup_view`.
 pub(super) struct Side<'a, N: Rem> {
     pub w: &'a Winning<N::C>,
     pub node: NodeKeys<'a, N::C>,
@@ -309,9 +285,8 @@ impl<N: Rem> Side<'_, N> {
     }
 }
 
-/// The concrete search of one arithmetic's reference engine: a state is
-/// its row, its identity its exact state, an edge's label the player's
-/// cell after it (the witness's path).
+/// One arithmetic's reference engine: a state is its row, its identity its
+/// exact state, an edge's label the player's cell after it.
 pub(super) struct Single<'s, 'a, N: Rem>(pub &'s Side<'a, N>);
 
 impl<N: Rem> Concrete for Single<'_, '_, N> {
@@ -355,8 +330,7 @@ impl<N: Rem> Concrete for Single<'_, '_, N> {
     }
 }
 
-/// A concrete witness: the inputs, and the player's cell after each (the
-/// start's first).
+/// The inputs, and the player's cell at each frame (frame 0 the start).
 pub struct Witness {
     pub inputs: Vec<u8>,
     pub cells: Vec<u32>,
@@ -391,10 +365,8 @@ pub(super) fn concrete_search<N: Rem>(side: &Side<'_, N>, horizon: u32, bound: u
     Ok(path.map(|p| Witness { inputs: p.inputs, cells: p.labels }))
 }
 
-/// W's nodes by `(shape, key, cell)`, for the concrete search and the known
-/// route: a node IS its state - its region (the shape's index and the
-/// cell's slot), its key and its cell - so only the tree's shapes are
-/// listed.
+/// W's nodes by `(shape, key, cell)`: a node IS its state (`Sk`), so only
+/// the tree's shapes are listed.
 pub struct NodeKeys<'w, C: Circle = super::arcs::Fixed16> {
     w: &'w Winning<C>,
     geo: crate::storage::Geometry,
@@ -426,22 +398,18 @@ pub(super) fn lookup_keys<N: EngineNum>(b: &Block<N>, level: Level, seeded: bool
     crate::frame::widened_keys_rt2(&lookup_view(b.rt2(), seeded)?, level, keys)
 }
 
-/// A concrete state's EXACT identity, UNWIDENED: its canonical bytes
-/// (`exact::exact_rows`) and its cell. Never the level's widened key:
-/// states sharing it need not share their fate (`522de36`).
+/// A concrete state's EXACT identity: canonical bytes (`exact::exact_rows`)
+/// and cell, never the widened key (sharing it need not share a fate).
 pub(super) fn exact_state<N: EngineNum>(b: &Block<N>, cell: u32) -> ExactRow {
     let mut v = celeste_engine::exact::exact_rows(b.rt2(), crate::compiled::ids()).swap_remove(0).into_vec();
     v.extend_from_slice(&cell.to_le_bytes());
     v.into_boxed_slice()
 }
 
-/// A concrete state as the tree holds it before the level's widening. With
-/// seeded balloons (`concrete_search`), the state holds each balloon's
-/// phase as one number and its `y` as one point, where the tree - built
-/// with the phase an interval - holds the canonical phase `[0, 1)` and the
-/// bob `y` `[start - 2, start + 2]` (the forward recomputes `y` from the
-/// interval phase every frame); the view maps them there, so its key is the
-/// node that over-approximates the state.
+/// A concrete state as the tree holds it before the level's widening: with
+/// seeded balloons, each balloon's phase (a number) and `y` (a point) mapped
+/// to the tree's phase `[0, 1)` and bob `y` `[start - 2, start + 2]`, so its
+/// key is the node that over-approximates the state.
 pub(super) fn lookup_view<N: EngineNum>(row: &Rt2<N>, seeded: bool) -> Result<Rt2<N>> {
     use celeste_engine::runtime2::{Col, AV};
     use celeste_engine::widening::{BALLOON_BOB_RAW, BALLOON_PERIOD_RAW};
@@ -461,8 +429,7 @@ pub(super) fn lookup_view<N: EngineNum>(row: &Rt2<N>, seeded: bool) -> Result<Rt
     Ok(rt2)
 }
 
-/// A concrete state's remainder as a point of the torus (no player: the
-/// start's, the point of 0 on both axes).
+/// A concrete state's remainder as a torus point (no player: the start's).
 pub fn rem_of<N: Rem>(rt2: &Rt2<N>) -> Result<(Point<N>, Point<N>)> {
     use celeste_engine::runtime2::AV;
     let ids = crate::compiled::ids();
@@ -476,28 +443,22 @@ pub fn rem_of<N: Rem>(rt2: &Rt2<N>) -> Result<(Point<N>, Point<N>)> {
     Ok((at(cx)?, at(cy)?))
 }
 
-/// `n` reference engines for concrete steps, and whether they run seeded
-/// (`Settings::concrete`): `--concrete-balloon-seeds` (a tasdatabase file's
-/// seeds), or a float tool's own seeds, fix the balloons' phases, so a
-/// concrete run is one real run under them - the tree and W keep the phase
-/// an interval (sound for every seed), and a concrete state's key maps its
-/// phase to that interval (`lookup_view`). Built under the run's settings
-/// `run`: `_init` runs under them.
+/// `n` reference engines built under `run` (`_init` runs under it), and
+/// whether they run seeded (`Settings::concrete`): seeds fix the balloons'
+/// phases, so a run is one real run, while the tree and W keep the phase an
+/// interval, sound for every seed (`lookup_view`).
 pub(super) fn concrete_engines<N: Rem>(n: usize, run: &Settings) -> Result<(Vec<ReferenceEngine<N::A>>, bool)> {
     let (s, seeded) = run.concrete();
     let engines = (0..n).map(|_| ReferenceEngine::<N::A>::new(&s)).collect::<Result<Vec<_>>>()?;
     Ok((engines, seeded))
 }
 
-/// The concrete steps (reference-engine successors) the depth-first try at
-/// the bound may take before it gives up (`concrete_search`; the dual
-/// search's pairs count both halves' leaves: twice this).
+/// Successors the depth-first try may take before it gives up (the dual
+/// search's pairs count both halves: twice this).
 const DFS_BUDGET: u64 = 200_000;
 
-/// TESTS ONLY: no depth-first try (a budget of 0), so the breadth-first
-/// layers find the witness - the gates' witnesses all come from the try at
-/// the bound (`driver`'s breadth-first test). Process-global: nextest runs
-/// each test in its own process.
+/// TESTS ONLY: no depth-first try, so the breadth-first layers find the
+/// witness. Process-global: nextest runs each test in its own process.
 #[cfg(test)]
 pub(super) static NO_DFS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
@@ -510,13 +471,10 @@ pub(super) fn dfs_budget() -> u64 {
     DFS_BUDGET
 }
 
-/// The inputs a state has been stepped under, each with the buttons its
-/// frame read (`RefEngine::frame_reads`). An input that agrees with one of
-/// them on every button that one read runs the same frame - the same reads,
-/// the same values, the same successors (the output writes no button) - so
-/// its successors are repeats of states already emitted in (parent, input)
-/// order, which the search's exact dedup would drop: skipping it changes
-/// nothing but the step count.
+/// The inputs a state was stepped under, with the buttons each frame read
+/// (`RefEngine::frame_reads`). An input agreeing with one on every button
+/// that one read runs the same frame (the output writes no button), so
+/// skipping it changes only the step count: its successors are repeats.
 #[derive(Default)]
 pub(super) struct Covered(Vec<(u8, u8)>);
 
@@ -530,10 +488,9 @@ impl Covered {
     }
 }
 
-/// The 64 inputs in the order the concrete search tries them at the frame
-/// after `k`: `prefer[k]` first (`rewrite search --prefer`: a known TAS, so
-/// the witness follows it wherever an optimal route allows), then the rest.
-/// Every input is still tried: the order only picks WHICH optimal witness.
+/// The 64 inputs in the order tried at the frame after `k`: `prefer[k]`
+/// first (`search --prefer`: the witness follows a known TAS where it can),
+/// then the rest; the order only picks WHICH optimal witness.
 pub(super) fn input_order(prefer: Option<&[u8]>, k: u32) -> impl Iterator<Item = u8> {
     let first = prefer.and_then(|p| p.get(k as usize).copied()).filter(|&b| b < 64);
     first.into_iter().chain((0u8..64).filter(move |&b| Some(b) != first))
