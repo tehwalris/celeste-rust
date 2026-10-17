@@ -16,7 +16,7 @@ use crate::search::hull::HullOf;
 use anyhow::{ensure, Context, Result};
 use std::path::{Path, PathBuf};
 
-use super::bundle::{get_varint, get_varint128, put_varint, put_varint128};
+use super::codec::{get_varint, get_varint128, narrow, put_varint, put_varint128, wide};
 use super::file::{self, At, Mapped, FORMAT_VERSION};
 use super::Sk;
 use crate::search::rem::Rem;
@@ -68,10 +68,6 @@ impl<N: Rem> Runs<N> for [super::wave::OldLayer<N>] {
 
 pub fn path(dir: &Path, frame: u32) -> PathBuf {
     dir.join("hulls").join(format!("f{frame:03}.bin"))
-}
-
-fn wide(k: (u64, u64)) -> u128 {
-    (k.0 as u128) << 64 | k.1 as u128
 }
 
 /// One block of a hull file: of the new states (`grown` false) or grown ones.
@@ -173,7 +169,7 @@ fn decode_grown<N: Rem>(raw: &[u8], want: usize) -> Result<Vec<Grown<N>>> {
         let local = raw[pos];
         let h = HullOf::<N>::from_bytes(&raw[pos + 1..pos + 1 + HullOf::<N>::BYTES]);
         pos += 1 + HullOf::<N>::BYTES;
-        out.push((Sk { region, key: ((key >> 64) as u64, key as u64), local }, layer, h));
+        out.push((Sk { region, key: narrow(key), local }, layer, h));
         prev = Some((layer, region, key));
     }
     ensure!(pos == raw.len(), "bytes past its states");

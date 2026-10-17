@@ -9,6 +9,7 @@
 
 pub mod bench;
 pub mod bundle;
+pub mod codec;
 pub mod decode;
 pub mod edges;
 pub mod file;

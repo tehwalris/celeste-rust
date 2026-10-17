@@ -14,6 +14,7 @@
 
 use anyhow::{anyhow, ensure, Result};
 
+use super::codec::{get_varint, get_varint128, narrow, put_varint, put_varint128, wide};
 use super::visited::Key;
 use crate::search::pos_graph::{GRID, NO_CELL};
 
@@ -141,64 +142,6 @@ pub(crate) fn get_off(b: &[u8], pos: &mut usize) -> u32 {
     } else {
         get_varint(b, pos) as u32
     }
-}
-
-#[inline]
-pub(crate) fn put_varint(out: &mut Vec<u8>, mut v: u64) {
-    while v >= 0x80 {
-        out.push((v as u8) | 0x80);
-        v >>= 7;
-    }
-    out.push(v as u8);
-}
-
-#[inline]
-pub(crate) fn get_varint(b: &[u8], pos: &mut usize) -> u64 {
-    let mut v = 0u64;
-    let mut shift = 0;
-    loop {
-        let x = b[*pos];
-        *pos += 1;
-        v |= ((x & 0x7f) as u64) << shift;
-        if x & 0x80 == 0 {
-            return v;
-        }
-        shift += 7;
-    }
-}
-
-#[inline]
-pub(crate) fn put_varint128(out: &mut Vec<u8>, mut v: u128) {
-    while v >= 0x80 {
-        out.push((v as u8) | 0x80);
-        v >>= 7;
-    }
-    out.push(v as u8);
-}
-
-#[inline]
-pub(crate) fn get_varint128(b: &[u8], pos: &mut usize) -> u128 {
-    let mut v = 0u128;
-    let mut shift = 0;
-    loop {
-        let x = b[*pos];
-        *pos += 1;
-        v |= ((x & 0x7f) as u128) << shift;
-        if x & 0x80 == 0 {
-            return v;
-        }
-        shift += 7;
-    }
-}
-
-#[inline]
-fn wide(k: Key) -> u128 {
-    (k.0 as u128) << 64 | k.1 as u128
-}
-
-#[inline]
-fn narrow(v: u128) -> Key {
-    ((v >> 64) as u64, v as u64)
 }
 
 /// A field of a block's sort order.

@@ -12,17 +12,12 @@
 use super::arcs::{Circle, Fixed16, Region, RegionArena, RegionRef};
 use super::rem::{Rem, Xfer};
 use celeste_core::pico8_num::Pico8Num as P8;
-use crate::storage::bundle::{get_varint, get_varint128, put_varint, put_varint128};
+use crate::storage::codec::{get_varint, get_varint128, put_varint, put_varint128, wide};
 use crate::storage::edges::EdgeStore;
 use crate::storage::{Sk, GEOMETRY};
 use rustc_hash::FxHashMap;
 
 const SK_MAX: Sk = Sk { region: u32::MAX, key: (u64::MAX, u64::MAX), local: u8::MAX };
-
-#[inline]
-fn wide(k: (u64, u64)) -> u128 {
-    (k.0 as u128) << 64 | k.1 as u128
-}
 
 /// State `s` after `prev` in a sorted stream (`prev <= s`): its region's
 /// delta, its key (a delta within the region, raw past it), its cell.
