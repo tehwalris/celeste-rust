@@ -29,9 +29,8 @@ use std::path::{Path, PathBuf};
 /// on a change).
 pub const VERSION: u32 = 1;
 
-/// The game's arithmetic (`--arith`, plans/float.md): the real
-/// game's 16.16, or the float tools' Lua doubles - with the tool, which
-/// decides the room's start and the seeds' meaning.
+/// The game's arithmetic (`--arith`): 16.16, or the float tools' doubles
+/// with the tool (which decides the room's start and the seeds' meaning).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Arith {
     Fixed,
@@ -251,8 +250,8 @@ impl Settings {
     /// route's check, `l1 check`, the dual witness's replay): the balloons'
     /// phases fixed - `--concrete-balloon-seeds`, else `--balloon-seeds`,
     /// else, for a float tool (which always seeds), every seed 0 - and
-    /// whether a concrete state keys through `concrete::lookup_view` (its
-    /// balloons are seeded where the tree's hold the phase an interval).
+    /// whether a concrete state keys through `search::concrete::lookup_view`
+    /// (its balloons are seeded where the tree's hold the phase an interval).
     pub fn concrete(&self) -> (Settings, bool) {
         let float = matches!(self.arith, Arith::Float(_));
         let seeds = self.concrete_balloon_seeds.clone().or_else(|| self.balloon_seeds.clone()).or_else(|| float.then(String::new));

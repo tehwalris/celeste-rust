@@ -33,7 +33,6 @@ static GLOBAL: celeste_rust::metrics::Counting<mimalloc::MiMalloc> = celeste_rus
 /// On DISK, not the tmpfs at `/tmp`: a full-room tree is gigabytes.
 const DEFAULT_CHECKPOINT_DIR: &str = "/var/tmp/celeste-checkpoints";
 
-/// `rewrite --help`'s overview: the pipeline, the settings, the checks.
 const LONG_ABOUT: &str = "The abstract TAS search for PICO-8 Celeste, and its diagnostics.
 
 `search` runs the whole pipeline per level of `--level`: the level-0 forward
@@ -58,7 +57,6 @@ commands' --to and --frame (`settings::Clock`).
 
 Checking a change: ./check.sh t0|t1|t2|big (plans/devloop.md).";
 
-/// `rewrite --help`'s examples.
 const EXAMPLES: &str = "Examples:
   # A room's optimum, a known solution's length as the horizon:
   ./safe-run.sh -- target/release/rewrite search --room 1,0 --ceiling 99 --checkpoint-dir DIR
@@ -275,7 +273,7 @@ pub struct ForwardArgs {
     #[arg(long, default_value = DEFAULT_CHECKPOINT_DIR)]
     checkpoint_dir: String,
     /// Run the REFERENCE engine instead of the kernels: `ckhash` of the
-    /// two trees must agree. Slow. Not at held-unknown levels.
+    /// two trees must agree. Slow. Not at platforms-unknown (`p`) levels.
     #[arg(long)]
     reference: bool,
 }
