@@ -539,8 +539,8 @@ impl<N: EngineNum> ShapeKeys<N> {
 }
 
 /// FINGERPRINTS over exact CONTENT: a key's decoded codes, hashed - so two
-/// trees whose dictionaries grew in different orders (a raise appends its
-/// codes after later frames') fingerprint the same states alike.
+/// trees whose dictionaries grew in different orders fingerprint the same
+/// states alike.
 pub struct ContentHash {
     shapes: FxHashMap<u64, (u64, Vec<(Vec<(u8, u8)>, Vec<u64>)>)>,
 }
