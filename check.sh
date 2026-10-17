@@ -18,7 +18,7 @@
 #   ./check.sh perf [--pin] user-space instructions of three bench frames
 #                           against gates/perf.txt, the RELEASE binary (built
 #                           here): more than 2% over FAILS; milestones and
-#                           `all`, not every slice
+#                           `all`
 #   ./check.sh local        the local goldens (/var/tmp/float-goldens; loud
 #                           SKIPPED where the store is absent)
 #   ./check.sh fixtures     every fixture rebuilt from scratch against its
@@ -32,9 +32,9 @@
 # writes the outputs as the new pins (gates/) instead of comparing: only on
 # evidence, and say why in the commit. Timings are reported, never pinned.
 # Builds the quick binary first (perf: the release one too). Env:
-# CARGO_TARGET_DIR, CELESTE_FIXTURES,
-# CHECK_DIR (the scratch, default /var/tmp/celeste-check), THREADS (default
-# 16; the metrics are the same at every thread count; perf always runs 16).
+# CARGO_TARGET_DIR, CELESTE_FIXTURES, CHECK_DIR (the scratch, default
+# /var/tmp/celeste-check), THREADS (default 16; the metrics are the same at
+# every thread count; perf always runs 16).
 set -uo pipefail
 cd "$(dirname "$0")"
 TIER=${1:-}
@@ -43,8 +43,8 @@ T=${CARGO_TARGET_DIR:-$PWD/target}
 B=$T/quick/rewrite
 export BIN=$B
 # The instruction budget's binary (perf): release, fat LTO and one codegen
-# unit. The quick profile's 16 units re-partition on unrelated edits and
-# moved a frame's instructions by 2-3% (2026-10-16).
+# unit (the quick profile's 16 units re-partition on unrelated edits, which
+# moves a frame's instructions by 2-3%).
 RB=$T/release/rewrite
 F=${CELESTE_FIXTURES:-/var/tmp/celeste-fixtures}
 G=gates/fixtures
@@ -52,8 +52,7 @@ C=${CHECK_DIR:-/var/tmp/celeste-check}
 TH=${THREADS:-16}
 # Every step's memory cap (safe-run.sh): the steps peak under 6 GB, and a
 # step that outgrows its cap fails instead of taking the machine's memory.
-# A lane runs one step at a time, so a tier's caps add up to 10G a lane;
-# the test runs (nextest) get 20G.
+# A lane runs one step at a time: 10G a lane; the test runs get 20G.
 MEM=10G
 mkdir -p "$C"
 # The failed and skipped steps, by name (lanes are subshells: a file).
@@ -217,12 +216,6 @@ t1() {
     for s in refcheck-r10 refcheck-r42x refcheck-f10 refcheck-f42x; do grep -h '^\[check ref\] [0-9]' "$C/$s.out" | sed "s/^/    /"; done
     for s in arccheck-r10 arccheck-r42x arccheck-f10 arccheck-f42x; do grep -h '^agreement' "$C/$s.out" | sed "s/^/    /" | cut -c1-200; done
 }
-# The forward, one frame each, exact, its files' bytes (and the run's
-# timings); every emitted row's key recomputed from its fields; the kernels
-# and the recorded transfers against the reference engine, sampled, and a
-# corrupted transfer refused; the widening table's two sides (every stored
-# row, and the rows the kernels emit from 64 of them, kept as they are by
-# the block side); one backward frame (W f45 of h56).
 t1_r10() {
     step frame-r10 frame r10 55
     step keycheck-r10 keycheck r10 55
@@ -243,9 +236,7 @@ t1_r42() {
     step refcheck-r42x refcheck r42x 55
     step arccheck-r42x arccheck r42x
 }
-# The same in FLOAT (`--arith float`, the doubles' kernels, Celia's start):
-# the frames exact (their f/h/e/b lines; no metrics), the keys, the kernels
-# and the transfers against the float reference, the widening.
+# The same in FLOAT (`--arith float`, Celia's start), without the metrics.
 t1_f10() {
     step frame-f10 framef f10 55
     step refcheck-f10 refcheck f10 55
@@ -358,10 +349,9 @@ print(json.dumps(r, sort_keys=True))' "$C/t2/ui-$d/run.json" | sha256sum | sed "
 }
 
 # THE REFERENCE FORWARD'S TREE IS THE KERNELS' [ARITH]: room (1,0) at the
-# exact level r0sx to f27 (~2.9k states past the spawn), frames, edges and
-# hulls alike (`ckhash --edges --hulls`) - the reference engine's
-# successors and transfers (its arc capture) are the kernels'. Each tree
-# goes to $C/t2/{kernels,reference}10[-float].
+# exact level r0sx to f27, frames, edges and hulls alike (`ckhash --edges
+# --hulls`): the reference engine's successors and transfers are the
+# kernels'. Each tree goes to $C/t2/{kernels,reference}10[-float].
 reference10() {
     local d=$C/t2/reference10${1:+-float}
     ./safe-run.sh --memory "$MEM" -- "$B" forward "$@" --to 36 --room 1,0 --checkpoint-dir "$d-kernels" > /dev/null || return 1
@@ -408,9 +398,8 @@ big() {
 # 3-rep and a 1-rep run of the RELEASE binary's `bench frame` (their
 # difference over 2: the kernel build, the tree's load and the process
 # start cancel; the rep's fingerprints are in it). Instructions do not move
-# with the machine's load as walls do: run to run within ~0.2% at load
-# 30-190. 16 threads always (the pin's). The quick binary is not measured:
-# its codegen units re-partition on unrelated edits (2-3%).
+# with the machine's load as walls do (run to run within ~0.2%). 16 threads
+# always (the pin's).
 PERF_PINS=gates/perf.txt
 perftier() {
     build
@@ -421,10 +410,10 @@ perftier() {
     step perf-f42n perfcount f42n 60
     cat "$C"/perf-*.line 2> /dev/null | sed 's/^/    /'
 }
-# perfcount NAME FRAME: one rep of the fixture's frame
-# (its f/h/e lines the pinned ones: the work measured is the pinned work)
-# against its line in gates/perf.txt: more than 2% over FAILS; more than 2%
-# under passes, and says to re-pin.
+# perfcount NAME FRAME: one rep of the fixture's frame (its f/h/e lines the
+# pinned ones: the work measured is the pinned work) against its line in
+# gates/perf.txt: more than 2% over FAILS; more than 2% under passes, and
+# says to re-pin.
 perfcount() {
     local name=$1 f=$2
     local n i1 i3 rep pin

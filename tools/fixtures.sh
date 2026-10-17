@@ -35,8 +35,8 @@ PINS=gates/fixtures
 MEM=20G
 
 L1_62="--hundred --loading-jank 2 --level-minus-one 94,5"
-# NAME -> FLAGS (the settings) | ROOM | COMMAND | TREE (the level dir under the fixture) | LAST
-# frame (the tree's).
+# NAME -> FLAGS (the settings) | ROOM | COMMAND | TREE (the level dir under
+# the fixture) | LAST (the tree's last frame).
 spec() {
     TREE=.; FLAGS=""
     case $1 in
@@ -76,12 +76,8 @@ BIG="r62h57"
 # formats and the order of its transfer table (a mismatch is STALE), and
 # the sources (reported only). A frame check encodes the fixture's
 # transfers by their ids in `xfer.bin`, so its edge bytes follow the
-# table's order: since 2026-10-12 (branch emit-batch) a frame's new
-# transfers are numbered CANONICALLY (by their edges in the frame, then
-# content: `edges::XferTable::canonical`), the table a function of the
-# search; before, in their discovery order, which the wave's slices set (a
-# fixture cut by another slice size passed its fingerprint and failed the
-# metrics).
+# table's order: a frame's new transfers are numbered CANONICALLY (by their
+# edges in the frame, then content: `edges::XferTable::canonical`).
 formats() {
     echo "checkpoint $(grep -o 'FORMAT_VERSION: u32 = [0-9]*' src/storage/file.rs | grep -o '[0-9]*$') edges $(grep -o '^const VERSION: u32 = [0-9]*' src/storage/edges.rs | grep -o '[0-9]*$') settings $(grep -o '^pub const VERSION: u32 = [0-9]*' src/settings.rs | grep -o '[0-9]*$') xfers canonical"
 }

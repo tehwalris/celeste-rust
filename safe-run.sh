@@ -4,10 +4,9 @@
 # Usage: ./safe-run.sh [--memory LIMIT] -- COMMAND...
 
 # The cap is checked against what the machine has NOW: an explicit --memory
-# above MemAvailable less HEADROOM is REFUSED (two capped jobs whose caps
-# together exceed the machine took it down on 2026-10-11: a 100G search
-# beside an unwrapped 70 GB ckhash); the default is lowered to fit, saying
-# so. MemAvailable already counts /tmp (a tmpfs) as used.
+# above MemAvailable less HEADROOM is REFUSED (two jobs whose caps together
+# exceeded the machine once took it down); the default is lowered to fit,
+# saying so. MemAvailable already counts /tmp (a tmpfs) as used.
 MEMORY_LIMIT=""
 DEFAULT_LIMIT="60G"
 HEADROOM_GB=10
@@ -72,14 +71,10 @@ echo "[safe-run] memory limit $MEMORY_LIMIT (MemAvailable $(( avail_mib / 1024 )
 # mimalloc: freed pages go back to the OS after 100 ms (mimalloc v2's own
 # default is 10). A wave unit takes ~12 ms and frees its buffers (the
 # chunks it hands to the region jobs, its decoded rows) on whatever thread
-# finishes them; at 0 every unit faulted them in again: a big frame
-# (89M lanes in) 12.0M faults, kernel mode 156 G cycles. At 100 ms: 1.3M
-# faults, 39 G cycles, the wave 6-10% faster, its anonymous peak +10%
-# (5.70 -> 6.25 GB; the reference frame 1.70 -> 1.94); at 10 ms half of
-# both (2026-10-12, branch emit-batch). 0 was set for the door (its
-# per-frame shard rebuild kept 2 GB of freed copies resident, 2026-09-14),
-# which storage v2 removed. Read by mimalloc at process start, so it has to
-# come from the environment, not from `main`.
+# finishes them; at 0 every unit faulted them in again (9x the faults): at
+# 100 ms the wave is 6-10% faster for a 10% higher anonymous peak, at 10 ms
+# half of both. Read by mimalloc at process start, so it has to come from
+# the environment, not from `main`.
 export MIMALLOC_PURGE_DELAY="${MIMALLOC_PURGE_DELAY:-100}"
 systemd-run --user --scope --quiet -p MemoryMax="$MEMORY_LIMIT" -p MemorySwapMax=0 -- "$@"
 EXIT_CODE=$?

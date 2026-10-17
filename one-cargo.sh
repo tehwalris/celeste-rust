@@ -1,16 +1,10 @@
 #!/usr/bin/env bash
-# Run ONE cargo at a time, by waiting rather than by remembering.
+# Run ONE cargo at a time, by waiting rather than by remembering: a second
+# cargo on the same build directory prints `Blocking waiting for file lock
+# on build directory` once, into a log nobody tails, and then appears to
+# take as long as the first one has left.
 #
-# CLAUDE.md says "one cargo at a time", and the failure mode when you
-# forget is not an error - it is `Blocking waiting for file lock on
-# build directory`, printed once, into a log nobody is tailing. The
-# second build then appears to take as long as the first one has left.
-#
-# On 2026-08-23 that cost hours: builds "taking 25 minutes" were a
-# 70-second build queued behind another of mine, and it also produced a
-# false alarm about a hung test.
-#
-#   ./one-cargo.sh cargo test --release --test room
+#   ./one-cargo.sh cargo check --all-targets
 #   ./one-cargo.sh cargo nextest run --cargo-profile quick
 #
 # The lock is per BUILD DIRECTORY, because that is what cargo contends
