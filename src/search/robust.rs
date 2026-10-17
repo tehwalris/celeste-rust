@@ -32,7 +32,6 @@ struct Mpfr {
 /// `MPFR_RNDN`: round to nearest, ties to even.
 const RNDN: c_int = 0;
 
-/// The MPFR entry points `cr_sin` uses.
 struct Lib {
     init2: unsafe extern "C" fn(*mut Mpfr, c_long),
     clear: unsafe extern "C" fn(*mut Mpfr),

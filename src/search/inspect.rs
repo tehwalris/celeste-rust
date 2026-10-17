@@ -40,7 +40,6 @@ pub fn cell_names<N: EngineNum>(rt2: &Rt2<N>, ids: &BoundaryIds) -> HashMap<usiz
             }
         }
     }
-    // Every other object's fields.
     if let Some(arr) = rt2.global_target(ids.g_objects) {
         if let Cell2::Arr(items) = &rt2.structure[arr as usize] {
             let type_name = |t: u32| -> String {

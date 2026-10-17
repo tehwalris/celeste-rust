@@ -1,15 +1,10 @@
 //! Sets of sub-pixel remainders as ARCS (plans/architecture.md "Arcs: the
-//! rotation graph"). Along an edge a set maps by "intersect with the guard
-//! arc, then act" (rotate, or on a collision go to a point), which
-//! distributes over unions: pushing sets through a graph tests every path
-//! at once.
-//!
-//! A remainder `r` (raw 16.16, in [-32768, 32767]) is the point `r + 32768`
-//! of `0..CIRCLE`. A set is sorted, disjoint, non-adjacent half-open
-//! segments (an arc across the wrap is two). Two axes: `Rects` and the
-//! canonical `Region`, generic over the `Circle` (16.16's `Fixed16`, or the
-//! doubles' `rem_f64::Doubles`, whose transfers are monotone maps, not
-//! rotations); the pull is exact on both.
+//! rotation graph"): along an edge a set maps by "intersect with the guard,
+//! then act", which distributes over unions. A remainder `r` (raw 16.16) is
+//! the point `r + 32768` of `0..CIRCLE`; a set is sorted, disjoint,
+//! non-adjacent half-open segments (an arc across the wrap is two). The
+//! two-axis `Region` is generic over the `Circle` (16.16's `Fixed16`, the
+//! doubles' `rem_f64::Doubles`); the pull is exact on both.
 
 /// Points on the circle: 1 px in raw 16.16 units.
 pub const CIRCLE: u32 = 1 << 16;
@@ -23,27 +18,22 @@ pub fn point(rem: i32) -> u32 {
     (rem + 32768) as u32
 }
 
-/// A half-open segment `[lo, hi)` of a circle's points, `lo < hi`
-/// (`P`: 16.16's `u32` points, or `Circle::P`).
+/// A half-open segment `[lo, hi)` of a circle's points, `lo < hi`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
 pub struct Seg<P = u32> {
     pub lo: P,
     pub hi: P,
 }
 
-/// A CIRCLE of remainder points (`search::rem::Rem::C`): what a `Region`'s
-/// bounds are, how a record stores them, and an axis's transfer (`Act`) with
-/// its image and preimage.
+/// A CIRCLE of remainder points (`Rem::C`): points, stored words, transfers.
 pub trait Circle: Copy + std::fmt::Debug + Default + PartialEq + Eq + PartialOrd + Ord + std::hash::Hash + Send + Sync + 'static {
     type P: Copy + Ord + std::hash::Hash + std::fmt::Debug + Default + Send + Sync + 'static;
-    /// A stored point or count (a `RegionArena` record's word, a hull's
-    /// bound), ordered as the points are.
+    /// A stored point or count (arena words, hull bounds), in point order.
     type W: Copy + Ord + std::hash::Hash + std::fmt::Debug + Default + Send + Sync + 'static;
     /// One axis's transfer: a guard and an action.
     type Act: Copy + std::fmt::Debug + PartialEq + Send + Sync + 'static;
     /// The points are `0..SIZE`.
     const SIZE: Self::P;
-    /// The most x segments a `Region` holds.
     const MAX_SEGS: usize;
     /// `p + 1` and `p - 1`.
     fn next(p: Self::P) -> Self::P;
@@ -53,20 +43,17 @@ pub trait Circle: Copy + std::fmt::Debug + Default + PartialEq + Eq + PartialOrd
     fn load(w: Self::W) -> Self::P;
     fn count(n: usize) -> Self::W;
     fn len(w: Self::W) -> usize;
-    /// A point (or `SIZE`) as a number, and back: the hull's arithmetic
-    /// (`hull`).
+    /// A point (or `SIZE`) as a number and back (the hull's arithmetic).
     fn wide(p: Self::P) -> u64;
     fn narrow(v: u64) -> Self::P;
-    /// A word's bytes on disk (little-endian), and its hash of a hull's
-    /// four (`x.start, x.last, y.start, y.last`: the hull statistics and
-    /// fingerprints, the push cache's slot).
+    /// A word's little-endian bytes on disk, and the hash of a hull's four
+    /// words (statistics, fingerprints, the push cache's slot).
     const W_BYTES: usize;
     fn put_word(w: Self::W, out: &mut Vec<u8>);
     fn get_word(b: &[u8]) -> Self::W;
     fn hash4(w: [Self::W; 4]) -> u64;
-    /// Are a hull's four words `a` and `b` equal (the push cache's lookup,
-    /// `hull::PushCache::get`)? 16.16's at once (one 8-byte compare); the
-    /// doubles' word by word (a miss most often differs in the first).
+    /// Are a hull's four words equal (`PushCache::get`)? 16.16's in one
+    /// 8-byte compare; the doubles' word by word (a miss differs early).
     fn same4(a: [Self::W; 4], b: [Self::W; 4]) -> bool;
     /// The points an edge's axis takes.
     fn guard(a: &Self::Act) -> Seg<Self::P>;
@@ -83,7 +70,6 @@ pub trait Circle: Copy + std::fmt::Debug + Default + PartialEq + Eq + PartialOrd
     fn seg_word(s: Seg<Self::P>) -> u64;
     /// A point in the middle of `s` (a probe).
     fn mid(s: Seg<Self::P>) -> Self::P;
-    /// The action's kind, for a report.
     fn kind(a: &Self::Act) -> &'static str;
     /// `a` CORRUPTED, to check a check (`rewrite check arcs --fault`): its
     /// guard's lowest point dropped (`guard`), or its image moved.
@@ -348,9 +334,8 @@ impl Transfer {
     }
 }
 
-/// The two pieces of the circle a speed `v` (raw) cuts it into: the points
-/// whose `rem + v + 1/2` stays below the next integer, and the rest (one
-/// piece when `v` is a whole number of pixels).
+/// The pieces a speed `v` (raw) cuts the circle into: `rem + v + 1/2` below
+/// the next integer, and the rest (one piece for whole pixels).
 pub fn pieces(v: i32) -> Vec<Set> {
     // u = p - 32768 + v + 32768 = p + v; the amount steps where p + v is a
     // multiple of CIRCLE, at p = (-v) mod CIRCLE.
@@ -362,7 +347,6 @@ pub fn pieces(v: i32) -> Vec<Set> {
     }
 }
 
-/// A rectangle of the torus: an x set times a y set.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Rect {
     pub x: Set,
@@ -407,9 +391,8 @@ pub struct Piece<P = u32> {
     pub x: Seg<P>,
 }
 
-/// A segment as a `Region` stores it: `[lo, last]`, `last` its last point
-/// (so 16.16's whole circle, `[0, CIRCLE)`, fits 16 bits a bound). Two
-/// words (`repr(C)`: a `RegionArena` record's words are viewed as these).
+/// A segment as a `Region` stores it, `[lo, last]` (16.16's whole circle
+/// fits 16 bits a bound); `repr(C)`: arena records are viewed as these.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[repr(C)]
 struct Stored<W> {
@@ -427,9 +410,8 @@ impl<W: Copy> Stored<W> {
     }
 }
 
-/// A slab of a `Region`: its y segment, its x set `xs[start..end]` (the
-/// start is the previous slab's end). Three words (`repr(C)`, as `Stored`;
-/// 6 B in 16.16).
+/// A `Region`'s slab: its y segment and its x set's end in `xs` (the start
+/// is the previous slab's end); `repr(C)`, three words.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[repr(C)]
 struct Slab<W> {
@@ -438,10 +420,8 @@ struct Slab<W> {
 }
 
 /// A set of the torus in CANONICAL form: sorted disjoint y slabs, each with
-/// a non-empty x set, touching slabs never with the same x set. Equal sets
-/// are equal values; a union of many contributions is one sweep. Bounds
-/// are stored as the circle's words (16 bits in 16.16: `Stored`), a region
-/// holds at most `Circle::MAX_SEGS` segments.
+/// a non-empty x set, touching slabs never with the same one, so equal sets
+/// are equal values; at most `Circle::MAX_SEGS` segments.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub struct Region<C: Circle = Fixed16> {
     slabs: Vec<Slab<C::W>>,
@@ -504,8 +484,7 @@ impl<C: Circle> Region<C> {
         Self::try_from_pieces(pieces, scratch, C::MAX_SEGS).unwrap_or_else(|| panic!("a region past {} segments", C::MAX_SEGS))
     }
 
-    /// `from_pieces`, `None` where the union holds more than `max` x
-    /// segments (at most `Circle::MAX_SEGS`, what a region's index holds).
+    /// `from_pieces`, `None` past `max` x segments (capped at `MAX_SEGS`).
     pub fn try_from_pieces(pieces: &mut [Piece<C::P>], scratch: &mut Vec<Seg<C::P>>, max: usize) -> Option<Self> {
         let max = max.min(C::MAX_SEGS);
         let mut out = Region::default();
@@ -591,8 +570,7 @@ impl<'a, C: Circle> RegionRef<'a, C> {
             (s.y.seg::<C>(), xs)
         })
     }
-    /// The set as pieces (a slab's y times each of its x segments),
-    /// appended to `out`.
+    /// The set as pieces (a slab's y times each x segment), into `out`.
     pub fn pieces(self, out: &mut Vec<Piece<C::P>>) {
         for (y, xs) in self.slabs() {
             out.extend(xs.map(|x| Piece { y, x }));
@@ -604,7 +582,6 @@ impl<'a, C: Circle> RegionRef<'a, C> {
         let start = if i == 0 { 0 } else { C::len(self.slabs[i - 1].end) };
         Some(&self.xs[start..C::len(s.end)])
     }
-    /// Is point `p` in the stored x set `xs`?
     fn holds(xs: &[Stored<C::W>], p: C::P) -> bool {
         let i = xs.partition_point(|s| C::load(s.last) < p);
         xs.get(i).is_some_and(|s| C::load(s.lo) <= p)
@@ -612,9 +589,8 @@ impl<'a, C: Circle> RegionRef<'a, C> {
     pub fn contains(self, x: C::P, y: C::P) -> bool {
         self.slab_at(y).is_some_and(|xs| Self::holds(xs, x))
     }
-    /// The IMAGE of `self` under one edge, as pieces appended to `out`: the
-    /// points of `self` inside the edge's guards, moved by its actions
-    /// (`Circle::image`).
+    /// The IMAGE under one edge, into `out`: the points inside its guards,
+    /// moved by its actions (`Circle::image`).
     pub fn push(self, x: C::Act, y: C::Act, out: &mut Vec<Piece<C::P>>) {
         let mut ximg: Vec<Seg<C::P>> = Vec::new();
         for (ys, xs) in self.slabs() {
@@ -639,10 +615,9 @@ impl<'a, C: Circle> RegionRef<'a, C> {
             }
         }
     }
-    /// The preimage of `self` under one edge, inside the edge's guards, as
-    /// pieces appended to `out`: the remainders the edge takes into `self`
-    /// (`Circle::preimage`; a constant axis takes its whole guard where
-    /// `self` holds its point).
+    /// The PREIMAGE under one edge, into `out`: the points inside its guards
+    /// it takes into `self` (`Circle::preimage`; a constant axis takes its
+    /// whole guard where `self` holds its point).
     pub fn pull(self, x: C::Act, y: C::Act, out: &mut Vec<Piece<C::P>>) {
         let emit_x = |ys: Seg<C::P>, xs: &[Stored<C::W>], out: &mut Vec<Piece<C::P>>| match C::const_point(&x) {
             None => {
@@ -681,19 +656,15 @@ const _: () = assert!(std::mem::size_of::<Stored<u16>>() == 4 && std::mem::align
 const _: () = assert!(std::mem::size_of::<Slab<u16>>() == 6 && std::mem::align_of::<Slab<u16>>() == 2, "Slab is three u16s");
 const _: () = assert!(std::mem::size_of::<Stored<u64>>() == 16 && std::mem::size_of::<Slab<u64>>() == 24, "Stored and Slab of u64 words");
 
-/// Words a CHUNK of a `RegionArena` holds at most (64 MB of 16.16's). A
-/// record is at most `2 + 5 * MAX_SEGS` words: it never straddles two
-/// chunks.
+/// Words a CHUNK of a `RegionArena` holds at most (64 MB of 16.16's); a
+/// record, at most `2 + 5 * MAX_SEGS` words, never straddles two.
 const CHUNK_WORDS: usize = 1 << 25;
 
-/// Many sets as RECORDS of words - the slab and segment counts, then the
-/// slabs (3 words each) and segments (2 words) - in CHUNKS, and per set its
-/// record's place (8 B): the backward's arena of distinct winning sets,
-/// without a `Region`'s two allocations each. The open chunk grows; a full
-/// one is SEALED, kept or (`spill_to`) written to a scratch file and mapped
-/// back (page cache, as `backward::Spill`). Records never move, so the
-/// arena grows without copying itself (a doubling flat list holds both
-/// copies as it grows: 90 GB at peak for 50 GB of sets).
+/// The backward's arena of distinct sets: per set a RECORD of words (slab
+/// and segment counts, then 3 words a slab, 2 a segment) in CHUNKS, and its
+/// place (8 B). A full chunk is SEALED: kept, or (`spill_to`) mapped from a
+/// scratch file (as `backward::Spill`). Records never move, so it grows
+/// without copying itself (a doubling list peaks at 90 GB for 50 GB of sets).
 pub struct RegionArena<C: Circle = Fixed16> {
     /// Set `i`'s record: its chunk (high 32 bits; `sealed.len()` is the open
     /// one) and its first word there.
@@ -708,7 +679,6 @@ pub struct RegionArena<C: Circle = Fixed16> {
     spill: Option<std::path::PathBuf>,
 }
 
-/// A sealed chunk's words.
 enum Words<W> {
     Mem(Vec<W>),
     Map(memmap2::Mmap),
@@ -719,8 +689,7 @@ impl<W> Words<W> {
         match self {
             Words::Mem(v) => v,
             // SAFETY: a map starts on a page (aligned for any word) and holds
-            // whole words (`RegionArena::seal` writes them); a word is plain
-            // data (`u16`, `u64`), every bit pattern one.
+            // whole words (`seal` writes them); words are plain data.
             Words::Map(m) => unsafe { std::slice::from_raw_parts(m.as_ptr().cast::<W>(), m.len() / std::mem::size_of::<W>()) },
         }
     }
@@ -731,9 +700,8 @@ fn record<C: Circle>(w: &[C::W]) -> RegionRef<'_, C> {
     let (ns, nx) = (C::len(w[0]), C::len(w[1]));
     let (s, x) = (&w[2..2 + 3 * ns], &w[2 + 3 * ns..2 + 3 * ns + 2 * nx]);
     const { assert!(std::mem::size_of::<Slab<C::W>>() == 3 * std::mem::size_of::<C::W>() && std::mem::size_of::<Stored<C::W>>() == 2 * std::mem::size_of::<C::W>()) };
-    // SAFETY: `Slab` and `Stored` are `repr(C)` structs of three and two
-    // words (asserted: no padding, a word's alignment), and every bit
-    // pattern is one of them; the slices are in bounds (indexed above).
+    // SAFETY: `Slab` and `Stored` are `repr(C)` structs of 3 and 2 words
+    // (asserted: no padding), any bit pattern valid; the slices are in bounds.
     unsafe { RegionRef { slabs: std::slice::from_raw_parts(s.as_ptr().cast::<Slab<C::W>>(), ns), xs: std::slice::from_raw_parts(x.as_ptr().cast::<Stored<C::W>>(), nx) } }
 }
 
@@ -771,7 +739,6 @@ impl<C: Circle> RegionArena<C> {
         }
         i
     }
-    /// The open chunk sealed (`Words`), a new one opened.
     fn seal(&mut self) {
         let open = std::mem::take(&mut self.open);
         self.sealed_words += open.len() as u64;

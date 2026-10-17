@@ -1,17 +1,13 @@
 //! THE BACKWARD (plans/architecture.md "The search", step 2): over the
-//! edges the forward recorded (`storage::edges`), each with a guard and an
-//! action per axis (`search::arcs`), the WINNING SETS `W_t(n)`: the
-//! remainders from which node `n`, occupied at frame `t`, wins by the
-//! horizon - `W_t(n) = U_e guard_e ∩ action_e^-1(W_{t+1}(dst_e))` for
-//! `t >= layer(n)`, a win node's set the whole torus from its layer on.
-//!
-//! ONE PUSH over the recorded IN-edges: `W_t` only grows as `t` falls (more
-//! time never hurts), so `W_t(p) = W_{t+1}(p) ∪ U pull_e(W_{t+1}(m))` over
-//! the edges `p -> m` whose target CHANGED at `t + 1`, read from the target
-//! regions' edge blocks (`Backward::read_items`). No graph is held and no
-//! node is marked first: a node no winning set reaches is never touched.
-//! Exact because "intersect with the guard, then act" distributes over
-//! unions. Nodes are states (`Sk`), as the edge files name them.
+//! recorded edges (a guard and an action per axis, `search::arcs`), the
+//! WINNING SETS `W_t(n)`, the remainders from which node `n` at frame `t`
+//! wins by the horizon: `W_t(n) = U_e guard_e ∩ action_e^-1(W_{t+1}(dst_e))`
+//! for `t >= layer(n)`, a win node's the whole torus from its layer on.
+//! `W_t` only grows as `t` falls (more time never hurts), so ONE PUSH over
+//! the in-edges of the nodes that CHANGED at `t + 1` gives `W_t(p) =
+//! W_{t+1}(p) ∪ U pull_e(W_{t+1}(m))`: no graph is held, and a node no
+//! winning set reaches is never touched. Exact: "intersect with the guard,
+//! then act" distributes over unions.
 
 use super::arcs::{Circle, Fixed16, Region, RegionArena, RegionRef};
 use super::rem::{Rem, Xfer};
@@ -49,8 +45,7 @@ fn get_sk(b: &[u8], pos: &mut usize, prev: Sk) -> Sk {
     Sk { region: prev.region + dr, key: ((k >> 64) as u64, k as u64), local }
 }
 
-/// A backward's reads: segments (zstd blocks), their bytes (stored, raw),
-/// bundles, in-edges, (region, frame) opens.
+/// A backward's reads (`stored`, `raw`: the segments' bytes).
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ReadStats {
     pub segments: u64,
@@ -72,17 +67,14 @@ impl ReadStats {
     }
 }
 
-/// Nodes a block of `Winning` holds: a node is found by decoding at most
-/// this many.
+/// Nodes per block of `Winning` (a lookup decodes at most this many).
 pub(super) const BLOCK: usize = 16;
 
-/// The winning sets, `t` in `0..=horizon`, of W's SUPPORT (the nodes with
-/// one), sorted by state. A node's set is non-empty from its layer to its
-/// last frame and only grows as `t` falls: a few SPANS (a set and its
-/// frames), stored as varints - per node its state (`put_sk`), layer and
-/// span count, per span its length and set (numbered by use, the most used
-/// first); per `BLOCK` nodes the first state and byte offset. In a scratch
-/// file when the backward has a directory (`Spill`).
+/// The winning sets, `t` in `0..=horizon`, of W's SUPPORT, by state. A
+/// node's set is non-empty from its layer to its last frame and only grows
+/// as `t` falls: a few SPANS, as varints - per node its state (`put_sk`),
+/// layer and span count, per span its length and set (numbered by use); per
+/// `BLOCK` nodes the first state and byte offset.
 pub struct Winning<C: Circle = Fixed16> {
     n: usize,
     blocks: Vec<(Sk, u64)>,
@@ -91,9 +83,8 @@ pub struct Winning<C: Circle = Fixed16> {
     spans: usize,
 }
 
-/// Bytes appended in order, then read back: in memory, or in a scratch file
-/// mapped once written (`Spill::file`: page cache, which the kernel can
-/// reclaim, not anonymous memory; the file is unlinked once mapped).
+/// Bytes appended, then read back: in memory, or a scratch file mapped once
+/// written and unlinked (page cache, reclaimable, not anonymous memory).
 enum Spill {
     Mem(Vec<u8>),
     File { out: std::io::BufWriter<std::fs::File>, path: std::path::PathBuf, len: u64 },
@@ -151,8 +142,7 @@ impl std::ops::Deref for Bytes {
     }
 }
 
-/// W's distinct sets: the backward's arena, numbered by use without
-/// copying it (`order[k]`: the arena's index of set `k`, the most used first).
+/// W's sets by use (`order[k]`: set `k`'s arena index, the most used first).
 struct Sets<C: Circle> {
     arena: RegionArena<C>,
     order: Vec<u32>,
@@ -170,7 +160,6 @@ impl<C: Circle> Sets<C> {
     }
 }
 
-/// One node of `Winning`: its state, its layer and its spans.
 pub struct Node<'a, C: Circle = Fixed16> {
     pub id: Sk,
     pub layer: u32,
@@ -220,7 +209,6 @@ impl<'a, C: Circle> Node<'a, C> {
     }
 }
 
-/// `Winning::nodes`: every node, decoded in order.
 pub struct Nodes<'a, C: Circle = Fixed16> {
     w: &'a Winning<C>,
     k: usize,
@@ -267,8 +255,7 @@ impl<C: Circle> Winning<C> {
     pub fn nodes(&self) -> Nodes<'_, C> {
         self.nodes_from(0, self.n)
     }
-    /// Nodes `lo..hi` in id order (`lo` a multiple of `BLOCK`: a block's
-    /// first node).
+    /// Nodes `lo..hi` in id order (`lo` a block's first).
     pub(super) fn nodes_from(&self, lo: usize, hi: usize) -> Nodes<'_, C> {
         assert!(lo % BLOCK == 0, "nodes from a block's first");
         Nodes { w: self, k: lo, end: hi.min(self.n), pos: 0, id: Sk::default() }
@@ -304,9 +291,8 @@ impl<C: Circle> Winning<C> {
     }
 }
 
-/// The spans one step closed (a node whose set changed or ended below the
-/// step's frame: from `lo`, the step's frame + 1, to its last), by state,
-/// as varints (state delta, `hi - lo`, set) at `at..at + len` of the runs.
+/// The spans a step closed (from `lo`, the step's frame + 1), by state, as
+/// varints (state delta, `hi - lo`, set) at `at..at + len` of the runs.
 #[derive(Clone, Copy)]
 struct Run {
     lo: u16,
@@ -344,8 +330,8 @@ impl Run {
     }
 }
 
-/// A node with a set at the frame done last: the set, the last frame of its
-/// current span, its layer (with `WIN`: a win node).
+/// A node with a set at the frame done last: its set, its current span's
+/// last frame, its layer (`| WIN`: a win node).
 #[derive(Clone, Copy, Debug)]
 struct Cur {
     id: Sk,
@@ -354,7 +340,6 @@ struct Cur {
     layer: u16,
 }
 
-/// `Cur::layer`'s flag of a win node.
 const WIN: u16 = 1 << 15;
 
 impl Cur {
@@ -363,8 +348,7 @@ impl Cur {
     }
 }
 
-/// An in-edge of a changed node, read at a step: its source and the
-/// source's layer, the target's set, the edge's transfer.
+/// An in-edge of a changed node: source and its layer, target's set, transfer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 struct Emit {
     p: Sk,
@@ -373,9 +357,7 @@ struct Emit {
     layer: u16,
 }
 
-/// A source's set so far at a step (its set at the next frame united with
-/// the pulls read so far): a set code (`LOCAL`: the step's own) and its
-/// layer.
+/// A source's set so far at a step (at `t + 1` and the pulls), its layer.
 #[derive(Clone, Copy, Debug)]
 struct Acc {
     p: Sk,
@@ -389,19 +371,16 @@ struct Acc {
 const LOCAL: u32 = 1 << 31;
 const MADE: u32 = 1 << 30;
 
-/// The in-edges a step reads at once: a step whose changed nodes have more
-/// reads them in ROUNDS, each folded into the step's sets so far (an
-/// `Emit` is 40 B: 0.8 GB a round).
+/// The in-edges a step reads at once; more are read in ROUNDS, each folded
+/// into the step's sets so far (an `Emit` is 40 B: 0.8 GB a round).
 const ROUND_EMITS: usize = 20 << 20;
 const _: () = assert!(std::mem::size_of::<Emit>() == 40, "ROUND_EMITS is sized for 40-B emissions");
 
-/// A step's own sets past this many bytes are compacted between its
-/// rounds (`compact_local`).
+/// A step's own sets past this many bytes are compacted between rounds.
 const LOCAL_COMPACT: usize = 1 << 30;
 
-/// A step's own sets cut to those its sets so far (`acc`) name - a round
-/// replaces the sets of the sources it reached, and the replaced ones are
-/// named by nothing - `acc`'s codes renumbered; the sets and their index.
+/// A step's own sets cut to those `acc` names (a round replaces its
+/// sources' sets, so the old ones are named by nothing), `acc` renumbered.
 fn compact_local<C: Circle>(acc: &mut [Acc], local: &RegionArena<C>) -> (RegionArena<C>, FxHashMap<u64, u32>) {
     let (mut kept, mut index, mut to) = (RegionArena::default(), FxHashMap::default(), vec![u32::MAX; local.len()]);
     for a in acc.iter_mut().filter(|a| a.set & LOCAL != 0) {
@@ -423,9 +402,8 @@ fn region_hash<C: Circle>(r: RegionRef<C>) -> u64 {
     hs.finish()
 }
 
-/// State ranges `[bounds[k], bounds[k + 1])` cutting `total` states into
-/// about `parts` pieces of equal weight, from a `sample` of them (one range
-/// when they are few).
+/// State ranges `[bounds[k], bounds[k + 1])`: about `parts` of equal
+/// weight, from a `sample` of the `total` (one range when they are few).
 fn id_ranges(mut sample: Vec<Sk>, total: usize, parts: usize) -> Vec<Sk> {
     sample.sort_unstable();
     let n = if total < 1 << 16 || sample.is_empty() { 1 } else { parts };
@@ -436,10 +414,9 @@ fn id_ranges(mut sample: Vec<Sk>, total: usize, parts: usize) -> Vec<Sk> {
     bounds
 }
 
-/// The first index at or past `j` whose key is not below `k`, in `v` sorted
-/// by key with every key before `j` below `k`: GALLOPING from `j`. A read
-/// walks each segment's sorted targets against the group's; stepping one by
-/// one costs every segment the whole group (26% of a big room's backward).
+/// The first index at or past `j` whose key is not below `k` (`v` sorted,
+/// every key before `j` below `k`), GALLOPING: stepping one by one costs
+/// every segment read the whole group (26% of a big room's backward).
 fn seek<A, B>(v: &[((u64, u64), A, B)], j: usize, k: (u64, u64)) -> usize {
     let mut lo = j;
     let mut step = 1;
@@ -454,9 +431,8 @@ fn seek<A, B>(v: &[((u64, u64), A, B)], j: usize, k: (u64, u64)) -> usize {
     lo
 }
 
-/// BACKWARD: `W_t` for `t = horizon` down to 0 (`Backward::step`, a frame at
-/// a time), from the win states `wins` (id, layer); with `spill`, the
-/// closed spans and W's nodes go to scratch files there (`Spill`).
+/// BACKWARD: `W_t` for `t = horizon` down to 0 from the win states `wins`
+/// (id, layer); with `spill`, scratch files go there.
 pub fn backward<N: Rem>(store: &EdgeStore<N>, pairs: &[Xfer<N>], wins: &[(Sk, u32)], horizon: u32, threads: usize, spill: Option<&std::path::Path>) -> anyhow::Result<Winning<N::C>> {
     let mut b = Backward::new(store, pairs, wins, horizon, threads);
     if let Some(dir) = spill {
@@ -468,9 +444,7 @@ pub fn backward<N: Rem>(store: &EdgeStore<N>, pairs: &[Xfer<N>], wins: &[(Sk, u3
     b.finish()
 }
 
-/// The backward between two frames: `W_{t+1}` (the frame done last), which
-/// of its sets changed there, and the spans closed so far. `rewrite
-/// bench backward` times one `step`.
+/// The backward between frames: `W_{t+1}`, its changed sets, closed spans.
 pub struct Backward<'a, N: Rem = P8> {
     store: &'a EdgeStore<N>,
     /// Per target region the first frame with edges into it.
@@ -486,8 +460,7 @@ pub struct Backward<'a, N: Rem = P8> {
     cur: Vec<Cur>,
     /// Their indices whose set changed there (or appeared).
     changed: Vec<u32>,
-    /// Per step, the spans it closed, in `run_bytes` (with `spill`, a
-    /// scratch file there, as W's nodes).
+    /// Per step, the spans it closed, in `run_bytes`.
     runs: Vec<Run>,
     run_bytes: Spill,
     spill: Option<std::path::PathBuf>,
@@ -509,8 +482,7 @@ pub struct Backward<'a, N: Rem = P8> {
 }
 
 impl<'a, N: Rem> Backward<'a, N> {
-    /// `W_horizon`: the win nodes present by the horizon (each step on
-    /// `threads` workers).
+    /// `W_horizon`: the win nodes present by the horizon.
     pub fn new(store: &'a EdgeStore<N>, pairs: &'a [Xfer<N>], wins: &[(Sk, u32)], horizon: u32, threads: usize) -> Self {
         assert!(horizon < WIN as u32, "a horizon past {WIN}");
         let mut sets = RegionArena::default();
@@ -551,8 +523,7 @@ impl<'a, N: Rem> Backward<'a, N> {
         }
     }
 
-    /// The closed spans, W's nodes and the arena's sealed chunks in
-    /// scratch files in `dir` (created).
+    /// Scratch files (closed spans, W's nodes, sealed set chunks) in `dir`.
     pub fn spill_to(mut self, dir: &std::path::Path) -> anyhow::Result<Self> {
         std::fs::create_dir_all(dir)?;
         self.run_bytes = Spill::file(dir.join("runs.bin"))?;
@@ -579,13 +550,11 @@ impl<'a, N: Rem> Backward<'a, N> {
         [self.d_read, self.d_pull, self.d_merge]
     }
 
-    /// A step's reads: the changed nodes grouped by REGION (its in-edges at
-    /// a frame are its segments, decoded whole), each read from the region's
-    /// first frame with in-edges to `t + 1`: one ITEM a (region, frame),
-    /// group-major. Per group its first item, first frame and range of
-    /// `changed`; then the total. Not from the least LAYER: an edge is
-    /// recorded at its source's layer + 1 whatever its push, so its target
-    /// may be first reached LATER (once the source's hull grew into its guard).
+    /// A step's reads: the changed nodes by REGION, each read from the
+    /// region's first frame with in-edges to `t + 1`, one ITEM a (region,
+    /// frame); per group (first item, first frame, range of `changed`), then
+    /// the total. Not from the least LAYER: an edge is recorded at its
+    /// source's layer + 1 whatever its push, so its target may come LATER.
     fn read_items(&self, t: u32) -> Vec<(usize, u32, usize, usize)> {
         let mut items = Vec::new();
         let (mut at, mut a) = (0usize, 0usize);
@@ -601,12 +570,10 @@ impl<'a, N: Rem> Backward<'a, N> {
         items
     }
 
-    /// One ROUND of a step's reads, from item `start` on (`read_items`)
-    /// until it holds `round_emits` in-edges: those recorded at an item's
-    /// frame into its region's changed targets (frames <= t + 1 at step t:
-    /// their sources have layers <= t). Per worker its in-edges sorted and
-    /// distinct; and where the round stopped (between items, so one heavy
-    /// region bounds it by its in-edges at one frame).
+    /// One ROUND of reads from item `start` until it holds `round_emits`
+    /// in-edges (at step t, frames <= t + 1: sources of layer <= t). Per
+    /// worker its in-edges sorted and distinct; and the item it stopped at
+    /// (between items: one region bounds it by its in-edges at one frame).
     fn read_round(&self, items: &[(usize, u32, usize, usize)], start: usize) -> anyhow::Result<(Vec<(Vec<Emit>, ReadStats)>, usize)> {
         use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
         let (cur, changed, store, budget) = (&self.cur, &self.changed, self.store, self.round_emits);
@@ -619,9 +586,8 @@ impl<'a, N: Rem> Backward<'a, N> {
                     sc.spawn(|| -> anyhow::Result<(Vec<Emit>, ReadStats)> {
                         let (mut emits, mut stats) = (Vec::new(), ReadStats::default());
                         let mut dec = crate::storage::edges::Decoder::default();
-                        // The group's targets, by (key, cell): their sets;
-                        // per block target rank, its changed cells and its
-                        // first target.
+                        // The group's targets by (key, cell); per block
+                        // target rank, its changed cells and first target.
                         let mut targets: Vec<((u64, u64), u8, u32)> = Vec::new();
                         let mut ranks: Vec<(u64, u32)> = Vec::new();
                         while held.load(Relaxed) < budget {
@@ -698,14 +664,12 @@ impl<'a, N: Rem> Backward<'a, N> {
         }
     }
 
-    /// The arena's code of `r`, if it holds it.
     fn arena_code(&self, r: &Region<N::C>, h: u64) -> Option<u32> {
         self.interned.get(&h).copied().filter(|&s| self.sets.get(s) == *r)
     }
 
-    /// Fold one round's in-edges into the step's sets so far (`acc`, by
-    /// id): per source in parallel id ranges, its set so far (or at `t + 1`)
-    /// united with the round's pulls. New sets go into `local`.
+    /// Fold a round's in-edges into the step's sets so far (`acc`): per
+    /// source its set so far (or at `t + 1`) united with the round's pulls.
     fn fold_round(&self, acc: Vec<Acc>, parts: &[(Vec<Emit>, ReadStats)], local: &mut RegionArena<N::C>, local_interned: &mut FxHashMap<u64, u32>) -> Vec<Acc> {
         let n_emits: usize = parts.iter().map(|p| p.0.len()).sum();
         let bounds = id_ranges(parts.iter().flat_map(|p| p.0.iter().step_by(64).map(|e| e.p)).collect(), n_emits, self.threads * 4);
@@ -777,7 +741,6 @@ impl<'a, N: Rem> Backward<'a, N> {
             }
             (out, made)
         });
-        // The old sets so far are in the ranges' outputs now.
         drop(acc);
         // The ranges' new sets become the step's own, once each.
         let mut acc = Vec::with_capacity(outs.iter().map(|o| o.0.len()).sum());
@@ -810,11 +773,8 @@ impl<'a, N: Rem> Backward<'a, N> {
         acc
     }
 
-    /// `W_t` from `W_{t+1}` (`t` counts down from `horizon - 1`): the
-    /// in-edges of the nodes whose set changed at `t + 1` (`read_round`),
-    /// folded into their sources' sets at `t + 1` (`fold_round`); then the
-    /// sets that grew replace their spans and the nodes of layer `t + 1`
-    /// close theirs.
+    /// `W_t` from `W_{t+1}`: fold the changed nodes' in-edges; sets that grew
+    /// replace their spans, nodes of layer `t + 1` close theirs.
     pub fn step(&mut self, t: u32) -> anyhow::Result<()> {
         assert!(t < self.horizon, "a step below the horizon");
         let mut last_region = u32::MAX;
@@ -855,9 +815,8 @@ impl<'a, N: Rem> Backward<'a, N> {
         self.rounds += rounds as u64;
         self.d_read += d_read;
         self.d_pull += d_pull;
-        // MERGE: per id range in parallel, the step's sets against those at
-        // t + 1 - a node whose set grew closes its span and opens one, a
-        // node of layer t + 1 closes its span, the others carry on.
+        // MERGE, the step's sets against those at t + 1: a set that grew
+        // closes its span and opens one, a node of layer t + 1 closes its.
         let t0 = std::time::Instant::now();
         let close_at = t as u16 + 1;
         let bounds = id_ranges(acc.iter().step_by(64).map(|x| x.p).chain(self.cur.iter().step_by(64).map(|x| x.id)).collect(), acc.len() + self.cur.len(), self.threads * 4);
@@ -909,8 +868,7 @@ impl<'a, N: Rem> Backward<'a, N> {
         // they are joined (two copies of a frame at most, not three).
         self.cur = Vec::new();
         self.changed = Vec::new();
-        // In range order: the step's sets that a node keeps go into the
-        // arena (once each), the ranges are joined.
+        // In range order: the sets a node keeps go into the arena, once.
         let mut to_arena: Vec<u32> = vec![u32::MAX; local.len()];
         let mut new_cur = Vec::with_capacity(outs.iter().map(|o| o.cur.len()).sum());
         let mut changed = Vec::new();
@@ -950,9 +908,8 @@ impl<'a, N: Rem> Backward<'a, N> {
         self.cur = new_cur;
         self.changed = changed;
         self.max_cur = self.max_cur.max(self.cur.len());
-        // The step's workers are gone: their heaps' freed pages go back now
-        // (mimalloc reclaims an exited thread's segments lazily otherwise -
-        // ~3 GB held on a big room).
+        // The step's workers are gone: return their freed pages now
+        // (mimalloc reclaims them lazily: ~3 GB held on a big room).
         // SAFETY: mimalloc's documented API, callable from any thread.
         unsafe { libmimalloc_sys::mi_collect(true) };
         let d_merge = t0.elapsed();
@@ -981,9 +938,7 @@ impl<'a, N: Rem> Backward<'a, N> {
         Ok(())
     }
 
-    /// The winning sets, once every frame down to 0 is done: the runs merged
-    /// node by node (a heap over the runs) into `Winning`'s varints, the
-    /// sets renumbered by use.
+    /// The winning sets once frame 0 is done, renumbered by use.
     pub fn finish(mut self) -> anyhow::Result<Winning<N::C>> {
         use std::cmp::Reverse;
         assert_eq!(self.runs.len(), self.horizon as usize, "finish before frame 0");
@@ -1010,7 +965,6 @@ impl<'a, N: Rem> Backward<'a, N> {
         // resident; shrinking would copy the arena.)
         let sets = Sets { arena: std::mem::take(&mut self.sets), order };
         crate::metrics::mem_phase("arc: backward swept");
-        // The runs merged by (id, frame).
         let spans: usize = runs.iter().map(|r| r.n).sum();
         let mut iters: Vec<_> = runs.iter().map(|r| r.iter(&all)).collect();
         let mut heap: std::collections::BinaryHeap<Reverse<(Sk, u16, u16, u32, usize)>> = std::collections::BinaryHeap::new();
@@ -1105,8 +1059,7 @@ impl<'a, N: Rem> Backward<'a, N> {
     }
 }
 
-/// Fragmentation of winning sets (x segments per node, over all slabs) as
-/// (nodes, median, p90, max).
+/// x segments per set: (sets, median, p90, max).
 fn fragmentation<'a, C: Circle>(sets: impl Iterator<Item = RegionRef<'a, C>>) -> (usize, usize, usize, usize) {
     let mut v: Vec<usize> = sets.map(|r| r.n_segs()).collect();
     if v.is_empty() {
@@ -1127,11 +1080,9 @@ pub fn optimum<C: Circle>(w: &Winning<C>, start: Option<u32>, point: (C::P, C::P
     (0..=horizon).rev().find(|&t| w.at(t, s).is_some_and(|r| r.contains(point.0, point.1))).map(|t| horizon - t)
 }
 
-/// What the backward starts from in the tree in `dir` up to `horizon`: the
-/// start (frame 0's one row), the win states of frames `1..=horizon` with
-/// their layers, the edge store (every frame that kept rows has its edges;
-/// one that kept none, under level -1, may have none), the tree's shapes
-/// and key space.
+/// What the backward starts from, the tree in `dir` up to `horizon`: the
+/// start, the win states with their layers, the edge store (every frame
+/// that kept rows has edges; one that kept none, under level -1, may not).
 pub struct Seeds<N: Rem = P8> {
     pub start: Sk,
     pub wins: Vec<(Sk, u32)>,
@@ -1179,9 +1130,8 @@ impl<N: Rem> Seeds<N> {
     }
 }
 
-/// One node's term of the gate's `W f{t}` line: the node's content hash
-/// (`exact::ContentHash::state`) folded with its set's rectangles
-/// (`rewrite bench backward` prints the same line for one frame).
+/// One node's term of the gate's `W f{t}` line: its content hash
+/// (`exact::ContentHash::state`) folded with its set's rectangles.
 pub fn gate_w_hash<C: Circle>(node: u64, r: RegionRef<C>) -> u64 {
     use celeste_engine::runtime2::mix64;
     let mut h = node;

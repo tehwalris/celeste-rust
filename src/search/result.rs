@@ -77,7 +77,6 @@ pub struct SearchResult {
     pub dual: Option<DualResult>,
 }
 
-/// What a dual search records beyond a search's.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct DualResult {
     /// The float half's arithmetic and tool (`float-celia`), and its start.

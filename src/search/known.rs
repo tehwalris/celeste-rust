@@ -1,30 +1,20 @@
 //! A KNOWN solution against the search's pruning (plans/architecture.md
-//! "Checks"; `rewrite check known`, and `search --prefer` when it wins by
-//! the horizon): a wrong pruning step drops real winners silently, so the
-//! route is stepped through the reference engine and checked at every
-//! search step `s`:
+//! "Checks"; `check known`, and `search --prefer` when it wins by the
+//! horizon): a wrong pruning step drops real winners silently, so the route
+//! is stepped through the reference engine and checked at every step `s`:
+//! * level -1 (the filter the TREE recorded, `TreeFilter::of_tree`) and the
+//!   ladder's filter (`MarkFilter::allowed`; mid-frame steps pass by
+//!   construction) keep it, at every step past the start;
+//! * at a frame boundary (mid-frame rows carry the split frame's cut
+//!   widening, which `Rt2::widen_to` does not): its projection is a node of
+//!   W's support whose `W_s` holds its exact remainder (the concrete
+//!   search's admission test) and, where the level filters the next, it is
+//!   REACHED (`reach::inside_w`) with a deadline >= s;
+//! * with `Route::hulls` (whole frames only), THE HULL FORWARD'S CLAIM.
 //!
-//! * level -1 (the filter the TREE recorded, `TreeFilter::of_tree`, not the
-//!   environment's) does not call its cell too late (every step past the
-//!   start);
-//! * the ladder's filter admits it (`MarkFilter::allowed`, every step past
-//!   the start; mid-frame steps pass by construction);
-//! * at a frame boundary (`Clock::boundary`: mid-frame rows carry the split
-//!   frame's cut widening, which `Rt2::widen_to` does not): its projection
-//!   is a node of W's support whose `W_s` holds its exact remainder (the
-//!   concrete search's admission test) and, at a level that filters the
-//!   next, the node is REACHED (`reach::inside_w`) with a deadline >= s. The
-//!   start is the tree's frame-0 row (stored unwidened).
-//!
-//! `check known` also checks THE HULL FORWARD'S CLAIM at every step
-//! (`hull_claim`; whole frames only): every concrete path the filters keep
-//! is in the tree, recorded.
-//!
-//! An `rnd` fork makes several leaves: the route survives when ONE winning
-//! lineage passes everywhere (the concrete search is exhaustive over
-//! leaves). Else each lineage's first failing step is reported and the
-//! search FAILS; where the tree lost the state, `explain` steps the state a
-//! frame before through the kernels (made and dropped, or a SOUNDNESS gap).
+//! The route survives when ONE winning `rnd` lineage passes everywhere (the
+//! concrete search is exhaustive over leaves); else each lineage's first
+//! failing step is reported (`explain`) and the search FAILS.
 
 use super::concrete::{concrete_engines, exact_state, lookup_keys, lookup_view, rem_of, Side};
 use super::rem::Rem;
@@ -42,8 +32,7 @@ pub struct Route<'a, N: Rem = P8> {
     pub hulls: bool,
 }
 
-/// What the hull forward's claim is checked against: the tree, its visited
-/// set (each state's hull) and its recorded edges.
+/// What the hull forward's claim is checked against: tree, hulls, edges.
 pub struct Hulls<N: Rem = P8> {
     tree: crate::storage::layer::Tree<N>,
     visited: crate::storage::visited::VisitedSet<N>,
@@ -66,8 +55,7 @@ impl<N: Rem> Hulls<N> {
 
 /// What the arc phase holds for the check (`driver::solve`).
 pub(super) struct Pruning<'a, N: Rem = P8> {
-    /// The level's W as the concrete search admits states (settings, level,
-    /// W, its nodes' keys, the tree's key space).
+    /// The level's W as the concrete search admits states.
     pub side: &'a Side<'a, N>,
     /// In search steps.
     pub horizon: u32,
@@ -84,9 +72,8 @@ pub(super) struct Pruning<'a, N: Rem = P8> {
     pub hulls: Option<&'a Hulls<N>>,
 }
 
-/// The route's concrete states per search step, each with its parent's
-/// index at the step before, up to the step before the exit; the exit step
-/// and the indices of its winning leaves' parents.
+/// The route's states per step (each with its parent's index) up to the
+/// step before the exit; the exit step and its winning leaves' parents.
 struct Run<N: EngineNum> {
     layers: Vec<Vec<(u32, Block<N>)>>,
     exit: Option<(u32, Vec<u32>)>,
@@ -121,9 +108,8 @@ fn run<N: Rem>(inputs: &[u8], horizon: u32, settings: &crate::settings::Settings
     Ok((Run { layers, exit: None }, seeded))
 }
 
-/// Check the route against one level's pruning. `Ok(None)`: it does not win
-/// by the horizon (nothing to check); `Ok(Some(f))`: it wins during frame
-/// `f` and survives everything; an error: it is PRUNED (the report printed).
+/// The route against one level's pruning. `Ok(None)`: no win by the
+/// horizon; `Ok(Some(f))`: it wins in frame `f` and survives; an error: PRUNED.
 pub(super) fn check<N: KernelLanes>(route: &Route<N>, p: &Pruning<N>) -> anyhow::Result<Option<u32>> {
     let t0 = std::time::Instant::now();
     let clock = p.side.s.clock();
@@ -178,10 +164,8 @@ pub(super) fn check<N: KernelLanes>(route: &Route<N>, p: &Pruning<N>) -> anyhow:
         );
         return Ok(Some(frame));
     }
-    // The report, per winning lineage (at most 3): where the FORWARD loses
-    // the route (a filter, the tree, a hull, an edge: what the arc phase
-    // misses after it is a consequence), else its first failing step (the
-    // backward's loss).
+    // Per winning lineage (at most 3): where the FORWARD lost the route (the
+    // arc phase's misses after it follow from it), else its first failure.
     let mut lineages: Vec<Vec<usize>> = Vec::new();
     for &w in winners.iter().take(3) {
         let mut idx = vec![0usize; run.layers.len()];
@@ -227,11 +211,10 @@ pub(super) fn check<N: KernelLanes>(route: &Route<N>, p: &Pruning<N>) -> anyhow:
     )
 }
 
-/// Why the forward lost the route's state at step `s` (a frame boundary,
-/// on lineage `idx`): the tree's row of its state a frame before, stepped
-/// to `s` by the level's kernels; the route's state among the successors
-/// (made and not kept: a win, level -1, a filter) or not (a SOUNDNESS gap
-/// in the kernels), and the successors closest to it.
+/// Why the forward lost the route's state at step `s`: the tree's row a
+/// frame before, stepped by the level's kernels; the state among the
+/// successors (made, not kept: a win, level -1, a filter) or not (a
+/// SOUNDNESS gap in the kernels), and the nearest ones.
 fn explain<N: KernelLanes>(run: &Run<N>, idx: &[usize], s: usize, seeded: bool, p: &Pruning<N>) -> anyhow::Result<Vec<String>> {
     use crate::search::inspect::{brief, project_onto, Proj};
     let per_frame = p.side.s.clock().per_frame as usize;
@@ -272,9 +255,8 @@ fn explain<N: KernelLanes>(run: &Run<N>, idx: &[usize], s: usize, seeded: bool, 
     Ok(out)
 }
 
-/// A failed check: the report's line, and whether the FORWARD lost the
-/// state (level -1, the ladder's filter, not in the tree) rather than the
-/// arc phase (no winning set, outside W, not reached).
+/// A failed check: its report line, and whether the FORWARD lost the state
+/// (level -1, the ladder's filter, not in the tree), not the arc phase.
 struct Miss {
     forward: bool,
     /// The tree does not hold it: the report explains (`explain`).
@@ -294,8 +276,7 @@ fn backward(what: String) -> Option<Miss> {
     Some(Miss { forward: false, lost: false, what })
 }
 
-/// A route state as the tree holds it: its state, and its exact remainder
-/// (`None`: no player).
+/// A route state in the tree, with its exact remainder (`None`: no player).
 type Held<N> = (Sk, Option<(N, N)>);
 
 /// The player's exact remainder in `b` (`None`: no player).
@@ -310,10 +291,9 @@ fn rem_raw<N: Rem>(b: &Block<N>) -> anyhow::Result<Option<(N, N)>> {
     Ok(Some((num(cx)?, num(cy)?)))
 }
 
-/// THE HULL FORWARD'S CLAIM for state `b` at step `s` (its parent `from`):
-/// in the tree by `s`, its remainder inside its state's hull, and a
-/// recorded edge from its parent mapping the parent's remainder to its
-/// own. Where the tree holds it, or the first part that fails.
+/// THE HULL FORWARD'S CLAIM for `b` at step `s`: in the tree by `s`, its
+/// remainder inside its hull, and a recorded edge mapping its parent's
+/// (`from`) remainder to its own. Where the tree holds it, or the miss.
 fn hull_claim<N: Rem>(b: &Block<N>, s: u32, sk: Option<Sk>, from: Option<Held<N>>, h: &Hulls<N>, node: &str) -> anyhow::Result<Result<Held<N>, Miss>> {
     let miss = |what: String| Ok(Err(Miss { forward: true, lost: false, what }));
     let Some((sk, layer)) = (match sk {

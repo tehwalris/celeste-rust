@@ -1,38 +1,29 @@
 //! THE REMAINDER MODEL IN DOUBLES (plans/float.md "The remainder model and
-//! the round fork"): the float tools' remainder points and transfers, as
-//! `arcs` and `arc_edges` are 16.16's (the hulls are `hull`'s over
-//! `Doubles`).
+//! the round fork"), as `arcs` and `arc_edges` are 16.16's. A POINT is a
+//! remainder's INDEX in value order among the doubles of `[-1/2, 1/2)`: `0`
+//! is `-1/2`, `ZERO` is `0` (`-0.0` too: no read of a remainder tells the
+//! zeros apart), `POINTS - 1` is `1/2 - 2^-54`.
 //!
-//! A POINT is a remainder's INDEX in value order among the doubles of
-//! `[-1/2, 1/2)`: `0` is `-1/2`, `ZERO` is `0` (`-0.0` too: no read of a
-//! remainder tells the two zeros apart), `POINTS - 1` is `1/2 - 2^-54`.
-//!
-//! `move` is `rem += ox; amount = flr(rem + 0.5); rem -= amount`. Over a
-//! node's whole `[-1/2, 1/2)` (the boundary widening) the frame forks
-//! `__split_by_round(rem)` at the exact cut points; the capture
-//! (`rem::Capture`) decodes (`decode_axis`) into:
-//!
+//! `move` is `rem += ox; amount = flr(rem + 0.5); rem -= amount`, forked by
+//! `__split_by_round(rem)` at the exact cuts over the node's whole
+//! `[-1/2, 1/2)`; `decode_axis` turns a capture (`rem::Capture`) into:
 //! * the GUARD: the `r` with `fl(r + ox)` in `frag`, an order-interval
-//!   (`fl(r + ox)` is monotone in `r`) found EXACTLY by bisection with the
+//!   (`fl(r + ox)` is monotone) found EXACTLY by bisection with the
 //!   operation itself;
-//! * the ACTION: `Mono(ox, k)`, `r -> fl(fl(r + ox) - k)` (monotone, not
-//!   injective), where `fin` is the fragment's image `[fl(frag.lo - k),
-//!   fl(frag.hi - k)]` or no player ends the frame (a death: any action is
-//!   exact, as in `arc_edges`); `Const(fin)` where a blocked step reset the
-//!   remainder to the point `fin`;
+//! * the ACTION `Mono(ox, k)`, `r -> fl(fl(r + ox) - k)` (monotone, not
+//!   injective), where `fin` is the fragment's image `fl(frag - k)` or no
+//!   player ends the frame (a death: any action is exact, as in
+//!   `arc_edges`); `Const(fin)` where a blocked step reset the remainder;
 //! * no split (a freeze, the spawn): the whole guard, the identity
 //!   `Mono(0, 0)` (`fin` the whole input, or no player) or `Const(fin)` (a
 //!   player made this frame);
-//! * a split of ONE point (the remainder SET before the move,
-//!   `set_before_the_move`): the whole guard, `Const(fin)` (no player at
-//!   the end: the identity).
+//! * a split of ONE point (`set_before_the_move`): the whole guard,
+//!   `Const(fin)` (no player at the end: the identity).
+//! Anything else is REFUSED (fatal in the forward).
 //!
-//! Anything else is REFUSED (fatal in the forward, as 16.16's).
-//!
-//! THE TOP SLIVER: at an integer speed the few doubles just below `1/2`
-//! round onto the cut (`fl(r - 2) = -3/2` for `r` in `{1/2 - 2^-54,
-//! 1/2 - 2^-53}`), a piece of its own that no 16.16 remainder takes; the
-//! hull forward pushes it only where a hull reaches it.
+//! THE TOP SLIVER: at an integer speed the doubles `{1/2 - 2^-54,
+//! 1/2 - 2^-53}` round onto the cut (`fl(r - 2) = -3/2`), a piece no 16.16
+//! remainder takes; the hull forward pushes it only where a hull reaches it.
 
 use celeste_core::lua_f64::LuaF64;
 use celeste_engine::runtime2::mix64;
@@ -145,14 +136,13 @@ fn round(x: f64) -> f64 {
     (x + 0.5).floor()
 }
 
-/// The first point from which `p` holds (`p` false then true over the
-/// points: monotone), by bisection.
+/// The first point from which `p` (false, then true) holds, by bisection.
 fn first(p: impl Fn(u64) -> bool) -> u64 {
     first_in(0, POINTS, p)
 }
 
-/// The first point of `lo..hi` from which `p` holds (`hi`: none), `p` false
-/// then true there.
+/// The first point of `lo..hi` from which `p` (false, then true) holds
+/// (`hi`: none).
 fn first_in(mut lo: u64, mut hi: u64, p: impl Fn(u64) -> bool) -> u64 {
     while lo < hi {
         let mid = lo + (hi - lo) / 2;
@@ -165,10 +155,9 @@ fn first_in(mut lo: u64, mut hi: u64, p: impl Fn(u64) -> bool) -> u64 {
     lo
 }
 
-/// The doubles' circle (`arcs::Circle`): `POINTS` points as `u64` words,
-/// the transfers `Axis` - monotone maps, so the PULL of a segment is the
-/// guard's points between two bisections, exactly; the image of a segment
-/// is the interval between its ends' images.
+/// The doubles' circle: `POINTS` points as `u64` words, transfers `Axis`,
+/// monotone maps: the PULL of a segment is the guard's points between two
+/// bisections, exactly; the image the interval between its ends' images.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Doubles;
 
@@ -268,9 +257,8 @@ impl Circle for Doubles {
             "const"
         }
     }
-    /// The guard's lowest point dropped, or a `Mono` collapsed onto its
-    /// lowest point's image (wrong wherever the image moves), a constant
-    /// moved by one point.
+    /// The guard's lowest point dropped; or a `Mono` collapsed onto its
+    /// lowest point's image, a constant moved by one point.
     fn faulty(a: &Axis, guard: bool) -> Axis {
         let mut t = *a;
         if guard {

@@ -1,11 +1,9 @@
-//! The player-position cells, and the position graph: the successor
-//! relation PROJECTED ONTO THE PLAYER'S CELL ("which cells step into this
-//! one?"), one node per cell, RECORDED by the forward (`PosObserver`); read
-//! by the level -1 probe and the UI, pinned as a gate.
-//!
-//! Positions are relative to the START room (cart coordinates are
-//! room-local, so a crossing would look like a 128 px teleport). The next
-//! room is labelled one ROOM_PX to the right whichever edge it was left by.
+//! The player-position cells and the position graph: the successor relation
+//! PROJECTED ONTO THE PLAYER'S CELL, RECORDED by the forward (`PosObserver`),
+//! read by the level -1 probe and the UI, pinned as a gate. Positions are
+//! relative to the START room (cart coordinates are room-local: a crossing
+//! would look like a 128 px teleport); the next room is one ROOM_PX to the
+//! right whichever edge it was left by.
 
 use anyhow::{anyhow, Result};
 
@@ -90,9 +88,8 @@ pub fn player_object<N: EngineNum>(rt2: &Rt2<N>) -> Option<u32> {
     rt2.position_object(crate::compiled::ids())
 }
 
-/// Per-lane cell of a block (`room.x`/`room.y` must be numbers); no player
-/// object, or a non-numeric position, is `NO_CELL`. The start room is the
-/// block's collision cache's (every block of a search carries it).
+/// Per-lane cell of a block (`room.x`/`room.y` must be numbers; no player or
+/// a non-numeric position: `NO_CELL`); the start room is its cache's.
 pub fn block_cells<N: EngineNum>(rt2: &Rt2<N>) -> Result<Vec<u32>> {
     let ids = crate::compiled::ids();
     let start = (rt2.cache.room_x, rt2.cache.room_y);
@@ -118,10 +115,9 @@ pub fn block_cells<N: EngineNum>(rt2: &Rt2<N>) -> Result<Vec<u32>> {
         .collect()
 }
 
-/// The labelling offset of a row in room `(rx, ry)` of a search from room
-/// `start`: the start room at 0, `game_runner::win_room` one ROOM_PX to the
-/// right (also across the wrap (7,y) -> (0,y+1)). No other room occurs: a
-/// death reloads the start room.
+/// The labelling offset of room `(rx, ry)` in a search from `start`: 0, or
+/// `game_runner::win_room` one ROOM_PX right (the wrap (7,y) -> (0,y+1) too).
+/// No other room occurs: a death reloads the start room.
 pub fn room_offset(start: (i16, i16), rx: i16, ry: i16) -> Result<(i32, i32)> {
     let win = crate::game_runner::win_room(start);
     if (rx, ry) == start {

@@ -1,50 +1,38 @@
 //! THE TRANSFERS (plans/architecture.md "Arcs: the rotation graph"): per
-//! recorded edge, what the frame did to the player's sub-pixel remainder on
-//! each axis, as a GUARD (the piece of the circle the edge is taken from)
-//! and an ACTION (a rotation, or a collision's constant). The kernels
-//! compute the transfer roots (`trace::frame::FrameOut::arc`) beside the
-//! row (no key, column, dedup or checkpoint sees them); each is decoded
-//! here, interned per worker (`storage::unit::UnitSink::xfer_id`) and
-//! merged per frame into the tree's one content-canonical table
-//! (`storage::edges::XferTable`).
+//! recorded edge and axis, what the frame did to the player's remainder, as
+//! a GUARD (the piece of the circle the edge is taken from) and an ACTION (a
+//! rotation, or a collision's constant). The transfer roots
+//! (`trace::frame::FrameOut::arc`) are computed beside the row (no key,
+//! column, dedup or checkpoint sees them), decoded here, and interned into
+//! the tree's one content-canonical table (`storage::edges::XferTable`).
 //!
 //! `move` does `rem := rem + ox + 1/2; rem := __split_by_flr(rem); amount :=
 //! flr(rem); rem := rem - 1/2 - amount`, then steps (a blocked step sets
-//! `rem := 0`); the capture at the player's split is `rem::Capture` (raw:
-//! `RawAxis`). The image (the remainder right after `rem -= 1/2 + amount`)
-//! is `frag - 1/2 - flr(frag)`, with one floor per fragment checked, not
-//! assumed.
+//! `rem := 0`). The image is `frag - 1/2 - flr(frag)`, one floor per
+//! fragment checked, not assumed. Circle points are `rem + 1/2` (raw). The
+//! decode (`decode_axis`) of a capture (`rem::Capture`; raw: `RawAxis`):
 //!
-//! ## The decode (`decode_axis`), every case
-//!
-//! Circle points are `rem + 1/2` in raw units (`arcs::point`).
-//!
-//! * No split (`took` false: a freeze, the spawn): the whole circle;
-//!   `Rotate(0)` with no player at the end or `fin` the whole input circle
-//!   (untouched), `Const(fin)` with `fin` a point (a player created this
-//!   frame); else REFUSED.
-//! * A split of ONE point `pre`: the remainder was SET before the move
+//! * No split (a freeze, the spawn): the whole circle; `Rotate(0)` with no
+//!   player at the end or `fin` the whole input circle, `Const(fin)` with
+//!   `fin` a point (a player created this frame).
+//! * A split of ONE point: the remainder was SET before the move
 //!   (`set_before_the_move`): the whole circle, `Const(fin)` (no player at
 //!   the end: `Rotate(0)`).
-//! * A split: `ox` a point and `pre` exactly `[ox, ox + 1)` (the remainder
-//!   at the move the whole circle), `frag` inside `pre` within one floor
-//!   `f`, else REFUSED. Then
-//!   - guard: `[frag.lo - ox, frag.hi - ox + 1)`, the input remainders whose
-//!     `rem + ox + 1/2` lands in the fragment: the whole circle, or a piece
-//!     touching one end with its image touching the OTHER (below the cut
-//!     onto an image ending at +1/2, above onto one starting at -1/2); a
-//!     piece touching neither is REFUSED. A point guard is a piece like any
-//!     other.
-//!   - action: `Rotate((ox - f) mod 1)` (the image of `rem` is
-//!     `rem + ox - f`) when `fin` is the image (a point image: the two
-//!     agree); `Const(fin)` when `fin` is another point (a blocked step
-//!     reset it); with no player at the end (a death) `Rotate` into a dummy
-//!     coordinate: every transfer out of a player-less node has a
-//!     whole-circle guard, so its winning set is all or nothing and any
-//!     action into it is exact; anything else: REFUSED.
+//! * A split: `ox` a point, `pre` exactly `[ox, ox + 1)` (the remainder at
+//!   the move the whole circle), `frag` inside `pre` within one floor `f`.
+//!   The guard `[frag.lo - ox, frag.hi - ox + 1)` is the whole circle, or a
+//!   piece touching one end with its image touching the OTHER (below the
+//!   cut onto an image ending at +1/2, above onto one starting at -1/2;
+//!   one touching neither is refused); a point guard is a piece like any
+//!   other. The action: `Rotate((ox - f) mod 1)` when `fin` is the image (a
+//!   point image: the two agree);
+//!   `Const(fin)` when `fin` is another point (a blocked step reset it);
+//!   with no player at the end (a death) `Rotate` into a dummy coordinate:
+//!   every transfer out of a player-less node has a whole-circle guard, so
+//!   its winning set is all or nothing and any action into it is exact.
 //!
-//! A refusal is FATAL in the forward: the record would be an unchecked claim
-//! about the remainder.
+//! Anything else is REFUSED, FATAL in the forward: the record would be an
+//! unchecked claim about the remainder.
 
 use super::arcs::{self, Action, Seg, Set, Transfer, CIRCLE};
 
@@ -61,9 +49,8 @@ pub struct RawAxis {
     pub fin: Option<(i32, i32)>,
 }
 
-/// One axis's decoded transfer, compact (what a record stores): the guard
-/// `[lo, hi)` of the circle and the action (`tag` 0: `Rotate(val)`, `val` in
-/// `0..CIRCLE`; 1: `Const(val)`, a circle point).
+/// One axis's decoded transfer as a record stores it: the guard `[lo, hi)`
+/// and the action (`tag` 0: `Rotate(val)`, `val` in `0..CIRCLE`; 1: `Const`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct AxisXfer {
     pub lo: u32,
@@ -172,12 +159,10 @@ pub fn decode_axis(r: &RawAxis) -> std::result::Result<AxisXfer, String> {
     }
 }
 
-/// A split whose argument is ONE point: the remainder at the move was SET
-/// earlier in the frame (a platform's carry blocked by a wall: `move_x`
-/// sets `rem.x = 0` before the player's own `move`, stepping whole pixels
-/// and never reading `rem`). Nothing else reads the input remainder (only
-/// `move`, at its split), so every input remainder takes this edge: the
-/// guard is the whole circle, the action the constant `fin`.
+/// A split of ONE point: the remainder at the move was SET earlier in the
+/// frame (a platform's carry blocked by a wall: `move_x`, stepping whole
+/// pixels and never reading `rem`, sets `rem.x = 0`). Only `move` reads the
+/// input remainder, so every one takes this edge, to the constant `fin`.
 fn set_before_the_move(pre: i64, ox: i64, frag: (i64, i64), fin: Option<(i64, i64)>) -> std::result::Result<AxisXfer, String> {
     let rem = pre - ox - HALF;
     if !(-HALF..HALF).contains(&rem) {

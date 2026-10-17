@@ -1,9 +1,8 @@
 //! THE HULL FORWARD REPLAYED over a tree's recorded graph (`rewrite check
-//! replay`): the start's hull pushed along the recorded edges through their
-//! transfers, re-pushed where it grows - the forward without the engine (a
-//! node is expanded with its remainder widened, so its successors do not
-//! depend on its hull; the hull only decides which pushes land). It must
-//! reach exactly the tree's states at the tree's frames (else an error).
+//! replay`): the start's hull pushed through the recorded transfers,
+//! re-pushed where it grows - the forward without the engine (a node is
+//! expanded with its remainder widened, so its hull only decides which
+//! pushes land). It must reach exactly the tree's states at its frames.
 
 use crate::search::hull::{AccOf, HullOf};
 use anyhow::{ensure, Result};
@@ -14,8 +13,8 @@ use crate::storage::edges::EdgeStore;
 use crate::storage::layer::Tree;
 use crate::storage::Sk;
 
-/// One frame of a replay: the states first reached there (the tree's and
-/// the replay's, equal) and the edges recorded into it.
+/// One frame of a replay: the states first reached there (equal to the
+/// tree's) and the edges recorded into it.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Frame {
     pub states: u64,

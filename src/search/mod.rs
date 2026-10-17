@@ -1,13 +1,5 @@
-//! The search around the forward (`frame::ForwardState`, `storage`):
-//! `driver` (its levels, each level's arc phase `solve`, the outcome),
-//! `backward` (W over the recorded edges, the optimum), `reach` (remainders
-//! pushed forward inside W, and exact), `concrete` (the concrete search, one
-//! engine or a pair), `dual`, `known` (a known solution against every
-//! pruning step), `arcs` (remainder sets as arcs of the circle), `arc_edges`
-//! (the transfers), `hull`, `rem` (+ `rem_f64`), `level_minus_one` (the
-//! cost-to-go filter), `pos_graph`, `result` (`result.json`), `robust`,
-//! `inspect`, `tree`, `ui_export`; checks of a tree: `arc_check`,
-//! `hull_replay`.
+//! The search around the forward (`frame::ForwardState`, `storage`); the
+//! modules: plans/architecture.md "Code layout".
 pub mod arc_check;
 pub mod arc_edges;
 pub mod arcs;

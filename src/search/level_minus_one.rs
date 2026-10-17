@@ -2,13 +2,13 @@
 //! the start room from the traced frames (`table`, cached on disk): the
 //! search's filter (`--level-minus-one H,S`), checked by `probe`.
 //!
-//! A node is (heap shape, cell of the player or player spawn); every other
-//! input is a range or unknown per shape (`rem` [-0.5, 0.5), speed [-S, S],
-//! the rest discovered). A frame is the shape's traced frame with every
-//! `move` fork resolved per configuration, evaluated over the ranges
-//! (undecided selects JOIN, buttons unknown); every outcome not definitely
-//! dead is a successor at the cells its position hull covers, another room
-//! is the EXIT, and `d(node)` is the fewest frames to an exit.
+//! A node is (heap shape, cell of the player or spawn); every other input is
+//! a range or unknown per shape (`rem` [-0.5, 0.5), speed [-S, S], the rest
+//! discovered). A frame: the shape's traced frame, `move` forks resolved per
+//! configuration, evaluated over the ranges (undecided selects JOIN, buttons
+//! unknown); an outcome not definitely dead is a successor at the cells its
+//! position hull covers, another room the EXIT; `d(node)` is the fewest
+//! frames to an exit.
 //!
 //! It over-approximates the game only under three CHECKED premises:
 //! * INDUCTIVE RANGES: successors lie in their shape's ranges and pins; a
@@ -127,7 +127,6 @@ impl<A: GraphArith> Obs<A> {
             Val::Bool(None) => Obs::Bool { f: false, t: false, u: true },
         }
     }
-    /// What flowed in as a hull of the lanes' values: a literal is one.
     fn hull(self) -> Obs<A> {
         match self {
             Obs::Lit(a, b) => Obs::Num(a, b),
@@ -204,7 +203,6 @@ enum Seed<A: GraphArith> {
     /// (the bits every lane holds; a pixel's value box holds `-0` too).
     X(Option<A::Num>),
     Y(Option<A::Num>),
-    /// A numeric range, by path into the shape's `ranges`.
     Range(Path),
     Unknown,
 }
@@ -235,19 +233,17 @@ enum ForkAt {
     Round,
 }
 
-/// One configuration's per-outcome roots and fork operands (with arities).
 struct Config {
     outs: Vec<Roots>,
     operands: Vec<(u8, ForkAt, NodeId)>,
 }
 
-/// Every fork configuration of a cone, specialized into one shared graph.
 struct Spec<A: GraphArith> {
     graph: Graph<A>,
     configs: Vec<Config>,
 }
 
-/// A shape's frame before specialization: the cone, its roots and forks.
+/// A shape's frame before specialization.
 struct Cone<A: GraphArith> {
     graph: Graph<A>,
     roots: Vec<Roots>,
@@ -260,7 +256,7 @@ struct Cone<A: GraphArith> {
 struct Traced<A: GraphArith> {
     seeds: Vec<Seed<A>>,
     outs: Vec<OutSpec>,
-    /// The frame specialized as traced: what every node is evaluated with.
+    /// The frame as traced, specialized: every node's first evaluation.
     plain: Spec<A>,
     /// The frame with every select LIFTED (~25x larger), built lazily for
     /// nodes whose plain evaluation is in violation (`eval_node`).
@@ -294,7 +290,6 @@ struct NodeOut {
     clipped: bool,
 }
 
-/// A worker's accumulated observations and violations.
 struct Acc<A: GraphArith> {
     obs: Vec<Option<Obs<A>>>,
     /// Successors clipped to `WINDOW`, per target shape.
@@ -346,8 +341,7 @@ impl<A: GraphArith> Table<'_, A> {
         i
     }
 
-    /// Trace shape `id` under its ranges and pins and specialize every fork
-    /// configuration into one shared graph.
+    /// Trace shape `id` under its ranges and pins, specialized.
     fn trace(&mut self, tr: &mut Tracer<A>, id: usize) -> Result<()> {
         let t0 = std::time::Instant::now();
         let key = self.shapes[id].key.clone();
@@ -415,11 +409,10 @@ impl<A: GraphArith> Table<'_, A> {
         let pin_list: Vec<(Path, Conc<A>)> = pins.iter().map(|(p, c)| (p.clone(), *c)).collect();
         let bound_list: Vec<(Path, (A::Lit, A::Lit))> = bounds.iter().map(|(p, r)| (p.clone(), (A::lit(r.0), A::lit(r.1)))).collect();
         // Held trails are unknown booleans, not forks. A fly fruit as the `f`
-        // level widens it (exact, its flight outgrows every inductive range
-        // and fork arity): only the player is measured, so a forgotten fruit
-        // only weakens d. The spawn prefix (no player) stays exact, one
-        // concrete chain. `level_minus_one`: move forks take the ranges' full
-        // width; undecided selects stay selects (joined here).
+        // level widens it (exact, it outgrows every range and fork arity):
+        // only the player is measured, so that only weakens d; the spawn
+        // prefix (no player) stays exact. `level_minus_one`: move forks take
+        // the ranges' full width, undecided selects stay selects (joined).
         let fruit = player.is_some() && !crate::trace::widen::objects_of_type(&st, "fly_fruit").is_empty();
         let level = crate::abstraction::Level { held: false, fruit, ..tr.it.d.level };
         let spec = crate::trace::frame::TraceSpec { roots: &roots, pin: &pin_list, ival: &ival, bounds: &bound_list, level: Some(level), level_minus_one: true, ..Default::default() };
@@ -452,7 +445,6 @@ impl<A: GraphArith> Table<'_, A> {
             .collect();
         ensure!(located.is_none() || seeds.iter().filter(|s| matches!(s, Seed::X(_) | Seed::Y(_))).count() == 2, "shape {id}: the located object's x/y are not input slots");
 
-        // The outcomes and every root read from them.
         let d = &tr.it.d;
         let mut outs: Vec<OutSpec> = Vec::new();
         let mut roots_old: Vec<Roots> = Vec::new();
@@ -490,10 +482,9 @@ impl<A: GraphArith> Table<'_, A> {
             roots_old.push(Roots { live: o.guard, error: o.error, xy, fields: fnodes });
         }
 
-        // The cone: literal forks (buttons) whole, the kernels' premises true.
-        // `NoWrap` too: an overflowing lane is in error in the kernels and the
-        // reference (FATAL there), so it has no successor to bound; the cone's
-        // own arithmetic is checked (an overflow is TOP, never wrapped).
+        // The cone: literal forks (buttons) whole, the kernels' premises true,
+        // `NoWrap` too: an overflowing lane is a FATAL error in the kernels and
+        // the reference, so no successor; the cone's own overflow is TOP.
         let arena = &d.graph;
         let mut rs: Vec<NodeId> = Vec::new();
         for r in &roots_old {
@@ -664,9 +655,8 @@ impl<A: GraphArith> Cone<A> {
 /// Traces made so far (`Traced::generation`).
 static TRACES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// A literal interval plus/minus a point, as the shifted literal: what the
-/// arithmetic's interval op makes of it (its ends are the lanes' ends: the
-/// operation is monotone and rounds monotonically), where in range.
+/// A literal interval plus/minus a point as the shifted literal, where in
+/// range (exact: the op is monotone and rounds monotonically).
 fn lit_shift<A: GraphArith>(g: &Graph<A>, op: &Op<A>, args: &[NodeId]) -> Option<(A::Lit, A::Lit)> {
     let c = |n: NodeId| match g.get(n).op {
         Op::Const(lo, hi) => Some((lo != hi, A::ival(A::from_lit(lo), A::from_lit(hi)))),
@@ -683,7 +673,6 @@ fn lit_shift<A: GraphArith>(g: &Graph<A>, op: &Op<A>, args: &[NodeId]) -> Option
     Some((A::lit(lo), A::lit(hi)))
 }
 
-/// Which ops `lift` lifts selects out of.
 #[derive(Clone, Copy)]
 enum Lift {
     /// `Lo`, `Hi`, `Sub` only: cheap (`Traced::plain`).
@@ -692,10 +681,9 @@ enum Lift {
     All,
 }
 
-/// `op(args)` with selects on ONE shared condition lifted out, `op(sel(c, a,
-/// b)) = sel(c, op(a), op(b))` (exact per lane), so a joined select keeps
-/// that its operands moved together. Selects on different conditions stay
-/// joined; never across a fork op. A shifted literal is `lit_shift`'s.
+/// `op(args)` with selects on ONE shared condition lifted out (`op(sel(c,
+/// a, b)) = sel(c, op(a), op(b))`, exact per lane), so a joined select keeps
+/// its operands' correlation; never across a fork op.
 fn lift<A: GraphArith>(g: &mut Graph<A>, op: Op<A>, args: Vec<NodeId>, what: Lift, memo: &mut HashMap<(Op<A>, Vec<NodeId>), NodeId>) -> NodeId {
     let liftable = match what {
         Lift::Ends => matches!(op, Op::Sub | Op::Lo | Op::Hi),
@@ -844,8 +832,7 @@ fn eval_node<A: GraphArith>(shapes: &[Shape<A>], room: &Room, id: usize, xy: (i1
     Ok(out)
 }
 
-/// How many fragments a fork at `at` takes over `i` (`Arithmetic::floors`,
-/// `rounds`); `None` past 65536.
+/// The fragments a fork at `at` takes over `i`; `None` past 65536.
 fn spans<A: GraphArith>(i: A::Ival, at: ForkAt) -> Option<i64> {
     match at {
         ForkAt::Floor => A::floors(i),
@@ -920,7 +907,6 @@ struct Graph1 {
     clipped: Vec<bool>,
 }
 
-/// `build`'s result: shapes by block hash, the graph, `sound_d`, the spawn chain.
 struct Built {
     by_hash: HashMap<u64, usize>,
     g1: Graph1,
@@ -1035,10 +1021,9 @@ impl CostToGo {
     }
 }
 
-/// THE LEVEL -1 TABLE of the start room at speed bound `speed` under `s`:
-/// the one builder (`frame::MinusOne`, `rewrite l1`). Built or read from
-/// `cache_file` once per process and key (`Settings::cart_key`, the pinned
-/// file, the speed), on a big-stack thread; leaked (a process holds 1-2).
+/// THE LEVEL -1 TABLE of the start room at speed bound `speed`, the one
+/// builder: built or read from `cache_file` once per process and key, on a
+/// big-stack thread; leaked (a process holds 1-2).
 pub fn table(speed: i32, s: &crate::settings::Settings) -> Result<&'static CostToGo> {
     type Key = (String, Option<PathBuf>, i32);
     static TABLES: std::sync::Mutex<Vec<(Key, &'static CostToGo)>> = std::sync::Mutex::new(Vec::new());
@@ -1070,7 +1055,6 @@ fn measures_the_exit(s: &crate::settings::Settings) -> Result<()> {
     Ok(())
 }
 
-/// `table`'s builder: the cache file, else `build`.
 fn cost_to_go(root: &FsPath, spd_px: i32, threads: usize, s: &crate::settings::Settings) -> Result<CostToGo> {
     let (path, key) = cache_file(root, spd_px, s)?;
     match CostToGo::load(&path) {
@@ -1102,11 +1086,9 @@ fn cost_to_go(root: &FsPath, spd_px: i32, threads: usize, s: &crate::settings::S
 /// The table cache's format; bump it when what a file holds changes.
 const CACHE_FORMAT: u32 = 1;
 
-/// The cache file under /var/tmp/celeste-l1-cache and its key: the binary,
-/// the cart, `spd_px` and `Settings::cart_key`. With `--l1-table FILE`,
-/// THAT file (read if it exists, else built there, whatever the binary): a
-/// fixture's table, pinned by its file and by fingerprint in its tree
-/// (tools/fixtures.sh); never a search's.
+/// The cache file under /var/tmp/celeste-l1-cache, keyed on the binary, the
+/// cart, `spd_px` and `Settings::cart_key`. `--l1-table FILE`: THAT file,
+/// whatever the binary (a fixture's pinned table; never a search's).
 fn cache_file(root: &FsPath, spd_px: i32, s: &crate::settings::Settings) -> Result<(PathBuf, String)> {
     use std::hash::{Hash, Hasher};
     if let Some(f) = &s.l1_table {
@@ -1309,7 +1291,6 @@ fn join_obs<A: GraphArith>(into: &mut [Option<Obs<A>>], from: &[Option<Obs<A>>])
     Ok(())
 }
 
-/// One node in the pass's graph: its successors' ids and its flags.
 struct Rec {
     edges: Vec<u32>,
     exit: bool,
@@ -1401,7 +1382,6 @@ struct Explore<A: GraphArith> {
     fresh: Vec<(u64, NodeEval)>,
     /// Observations of this pass's evaluations, per shape.
     fresh_obs: Vec<Option<Vec<Option<Obs<A>>>>>,
-    /// Memo hits per shape.
     hits: Vec<usize>,
     n_violations: usize,
     n_precise: usize,

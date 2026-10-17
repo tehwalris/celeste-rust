@@ -1,16 +1,13 @@
 //! THE DUAL SEARCH (plans/float.md, "The dual search and rule (b)"): the
-//! shortest input file valid in BOTH arithmetics. Rule (b): the file's
-//! length is the FLOAT exit (the count), and real play (16.16) must have
-//! left the room by then. Two halves, each a finished arc phase of its own
-//! arithmetic to the same horizon (`Arcs`), each from its own start (real
-//! play's loading jank; the float tool's).
+//! shortest input file valid in BOTH arithmetics. Rule (b): its length is
+//! the FLOAT exit, and real play (16.16) must have left by then. Two halves,
+//! finished arc phases to one horizon (`Arcs`), each from its own start.
 //!
 //! A DUAL STATE is (the fixed half's exact state, or EXITED; the float
-//! half's). Under an input both halves step through their reference engines
-//! (`rnd` leaves paired); a successor is admitted iff every live half lies
-//! in ITS OWN W at that frame. A fixed half that wins is EXITED from then
-//! on; a float half that wins is the dual win if the fixed half has exited,
-//! else pruned (the file would end before real play leaves).
+//! half's). Both halves step through their reference engines (`rnd` leaves
+//! paired); a successor is admitted iff every live half lies in ITS OWN W.
+//! A fixed half that wins is EXITED from then on; a float win is the dual
+//! win if the fixed half has exited, else pruned (the file would end early).
 //!
 //! Sound: a both-valid run is valid in each arithmetic, so each half stays
 //! inside its W, and nothing else prunes - the search is exhaustive inside
@@ -35,7 +32,6 @@ use crate::frame::{wins_of, Block};
 use crate::settings::Settings;
 use crate::engines::reference::ReferenceEngine;
 
-/// One half: its arcs, and the settings its engines run under.
 pub struct Half<'a, N: Rem> {
     pub arcs: &'a Arcs<N>,
     pub settings: &'a Settings,
@@ -68,8 +64,7 @@ pub(super) struct Pair<X: Rem, F: Rem> {
     float: Rt2<F>,
 }
 
-/// A dual state's identity: both exact rows (the fixed half's `None` once
-/// exited).
+/// A dual state's identity (the fixed half's `None` once exited).
 type Key = (Option<ExactRow>, ExactRow);
 
 /// The dual search for `concrete::search`: a state a `Pair`, an edge's
@@ -96,7 +91,6 @@ impl<X: Rem, F: Rem> Concrete for Pairs<'_, X, F> {
         Ok((Pair { fixed: Some(Block::canonical(ex.initial()?)?.into_rt2()), float: Block::canonical(ef.initial()?)?.into_rt2() }, false))
     }
 
-    /// One dual step at `t` (the module doc).
     fn successors(&self, (ex, ef): &mut Self::Engine, p: &Pair<X, F>, byte: u8, t: u32, _: &dyn Fn(&Key) -> bool, steps: &mut u64) -> Result<(Vec<Next<Self>>, u8)> {
         let (fl, read_f) = ef.frame_reads(&p.float, byte)?;
         // The fixed half's admitted outcomes: `None` exited (now: `true`).
@@ -166,7 +160,6 @@ impl<X: Rem, F: Rem> Concrete for Pairs<'_, X, F> {
     }
 }
 
-/// The optimal dual run's inputs and the frame the fixed half exits.
 pub struct DualWitness {
     /// The file: one input a frame, the float half exiting on the last.
     pub inputs: Vec<u8>,
@@ -200,9 +193,8 @@ pub fn search<X: Rem, F: Rem>(fixed: &Half<X>, float: &Half<F>, bound: u32, pref
     Ok(Some(DualWitness { inputs: path.inputs, fixed_exit }))
 }
 
-/// The first frame some lineage of `inputs` wins on, from `s`'s start, as
-/// a concrete run (`Settings::concrete`: a float tool's seeds), every `rnd`
-/// leaf followed; `None`: none by the inputs' end.
+/// The first frame some lineage of `inputs` wins on from `s`'s start, a
+/// concrete run (`Settings::concrete`), every `rnd` leaf followed.
 pub fn first_win<N: Rem>(inputs: &[u8], s: &Settings) -> Result<Option<u32>> {
     let mut eng = ReferenceEngine::<N::A>::new(&s.concrete().0)?;
     let mut cur: Vec<Rt2<N>> = vec![eng.initial()?];

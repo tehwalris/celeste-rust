@@ -1,14 +1,11 @@
-//! THE TRANSFERS AGAINST THE REFERENCE ENGINE (`rewrite check arcs`), in
-//! either arithmetic: every record of frames `from..=to` has a transfer
-//! (completeness), and a sample per frame is probed. From the record's
-//! source row at a remainder INSIDE its guards (their corners and middle:
-//! the cut points themselves), every successor over the 64 inputs must
-//! include the record's target at the remainder its action predicts, and
-//! every successor on that target must be one some record of the pair
-//! (source, target) predicts; just OUTSIDE every guard of the pair (one
-//! point past a guard's end: in doubles one ulp), the target must not be
-//! reached. The probe steps the source row with its remainder set, at the
-//! level (`ReferenceEngine::step_at`: unknowns forked as the kernels do).
+//! THE TRANSFERS AGAINST THE REFERENCE ENGINE (`rewrite check arcs`): every
+//! record of frames `from..=to` has a transfer, and a sample per frame is
+//! probed. From the source row at a remainder INSIDE its guards (corners and
+//! middle: the cut points), the 64 inputs must reach the target at the
+//! remainder the action predicts, and only at remainders some record of the
+//! pair predicts; one point past a guard's end (doubles: one ulp), OUTSIDE
+//! every guard of the pair, not at all. The probe steps the row at the level
+//! (`ReferenceEngine::step_at`: unknowns forked as the kernels do).
 
 use anyhow::{anyhow, Result};
 use celeste_engine::runtime2::{Col, Rt2, AV};
@@ -37,7 +34,6 @@ pub struct Opts<'a> {
     pub settings: &'a crate::settings::Settings,
 }
 
-/// A record with its transfer decoded.
 struct Rec<N: Rem> {
     target: Sk,
     src: Sk,
@@ -97,8 +93,7 @@ pub fn run<N: Rem>(o: &Opts) -> Result<()> {
     // The tree's key space: projections keyed as its rows (`None`: a code
     // it never stored).
     let space = &tree.space;
-    // Every successor of `row` at remainder `rem` over all 64 inputs, and
-    // the reference steps taken.
+    // Every successor of `row` at remainder `rem` over all 64 inputs.
     let successors = |eng: &mut ReferenceEngine<N::A>, row: &Block<N>, rem: (Point<N>, Point<N>)| -> Result<(Vec<Succ<N>>, u64)> {
         // As the kernels read it: projected onto the level (the start row is
         // stored exact), then the probe's remainder.
@@ -138,7 +133,6 @@ pub fn run<N: Rem>(o: &Opts) -> Result<()> {
         }
         Ok((out, steps))
     };
-    // The injected fault (`fault`), on one decoded x transfer.
     let corrupt = |t: Xfer<N>| -> Result<Xfer<N>> {
         Ok(match o.fault {
             None => t,
@@ -146,7 +140,6 @@ pub fn run<N: Rem>(o: &Opts) -> Result<()> {
             Some(other) => anyhow::bail!("--fault {other}: `action` or `guard`"),
         })
     };
-    // One sampled record against the reference engine.
     let check = |eng: &mut ReferenceEngine<N::A>, frame: u32, r: &Rec<N>, recs: &[Rec<N>]| -> Result<Sampled> {
         let mut o = Sampled::default();
         let src = r.src;
@@ -155,7 +148,6 @@ pub fn run<N: Rem>(o: &Opts) -> Result<()> {
         // it reaches later or never: not every target has a frame).
         let target = (tree.shape_of(r.target.region)?, Some(r.target.key), r.target.cell(&crate::storage::GEOMETRY));
         let (gx, gy) = (N::C::guard(&r.t.0), N::C::guard(&r.t.1));
-        // Every record of this (pred, target).
         let pair: Vec<&Rec<N>> = recs.iter().filter(|q| q.target == r.target && q.src == src).collect();
         let in_union = |x: Point<N>, y: Point<N>| pair.iter().any(|q| image_of::<N::C>(&q.t.0, x).is_some() && image_of::<N::C>(&q.t.1, y).is_some());
         let has_player = rem_cells(src_row.rt2()).is_some();

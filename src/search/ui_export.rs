@@ -1,24 +1,20 @@
 //! `rewrite export-ui`: a finished search's record (`result.json`), its
 //! trees and marks -> the compact static data the web UI (`ui/`) renders.
 //!
-//! Per (level, frame): states and wins per player-position cell; per marked
-//! set (`search --save-marks`: W's support, arc-marked nodes): the marked
-//! states per cell by distance to the win. All from the frame files' region
-//! blocks (keys, cell masks, win masks) and the marks files: no row is
-//! decoded, no engine built. Per-frame stats: `frame::FORWARD_STATS`.
+//! Per (level, frame) the states and wins per player cell; per marked set
+//! (`search --save-marks`: W's support, arc-marked nodes) the marked states
+//! per cell by distance to the win. All from the frame files' region blocks
+//! and the marks files: no row is decoded, no engine built.
 //!
-//! STREAMED, storage region by region on every thread (`read_tree`): a
-//! marks file is mapped, never loaded; sorted by state, so a region's marked
-//! states are a merge of its keys with the rows at its cells
-//! (`count_marked`), rows no other region reads, unmapped when done. Frame
-//! by frame would map the whole file (every frame has marks all over it).
-//! The heap holds the per-cell counts and a block per thread: an 82 GB tree
-//! with 431M marks peaks at 1.6 GB, where loading it all took 96 GB.
+//! STREAMED region by region (`read_tree`): a marks file is mapped, never
+//! loaded; sorted by state, so a region's marked states are a merge of its
+//! keys with the rows at its cells (`count_marked`), which no other region
+//! reads (frame by frame would map the whole file). An 82 GB tree with 431M
+//! marks peaks at 1.6 GB of heap, where loading it all took 96 GB.
 //!
-//! The run is one horizon whose levels are the search's, plus with `--arc` a
-//! last level carrying the arc backward over the last forward tree
-//! (`forward_of`). JSON fields `bwd`, `reruns` and the horizons list are
-//! kept only because the UI reads them.
+//! One horizon whose levels are the search's, plus with `--arc` a level for
+//! the arc backward over the last tree (`forward_of`). JSON fields `bwd`,
+//! `reruns` and the horizons list are kept only because the UI reads them.
 //!
 //! Output layout (`--out DIR`):
 //!
@@ -88,13 +84,11 @@ pub struct LevelRun {
     pub frames: u32,
     pub frames_file: String,
     pub marks_file: Option<String>,
-    /// Per frame, the states and the wins.
     pub frame_states: Vec<u64>,
     pub frame_wins: Vec<u64>,
     pub marks_have_dist: bool,
     pub marks_by_dist: Vec<u64>,
     pub mlayers_file: Option<String>,
-    /// Per frame, the marked states of that layer.
     pub marks_by_layer: Vec<u64>,
     /// A backward over ANOTHER level's forward (`--arc`): that level's
     /// index, whose frames it shares; no forward pass of its own.
@@ -137,11 +131,9 @@ pub struct Run {
     pub prebuild_s: Option<f64>,
     pub optimal: Option<u32>,
     pub horizons: Vec<HorizonRun>,
-    /// A concrete run drawn over the room (`--arc`'s `witness.txt`, or
-    /// `--witness FILE`).
+    /// Drawn over the room: `--arc`'s `witness.txt`, or `--witness FILE`.
     pub witness: Option<Witness>,
-    /// Another to compare it with (`--reference FILE`: e.g. the community
-    /// TAS replayed in the original cart).
+    /// `--reference FILE`: e.g. the community TAS in the original cart.
     pub reference: Option<Witness>,
     /// The file the UI offers for download (`--download FILE`), verbatim.
     pub download: Option<Download>,
@@ -248,9 +240,8 @@ struct LevelData {
 /// One marked state `(shape, cell, key)`, as the frame rows are keyed.
 type MarkId = (u64, u32, Key);
 
-/// A marks file, mapped: `save_marks`' rows `(shape, cell, k0, k1, dist)`
-/// (32 B each), SORTED by state (checked by `scan_marks`), then the
-/// horizon. Read in place, never loaded (the module doc).
+/// A marks file, mapped, read in place: `save_marks`' rows `(shape, cell,
+/// k0, k1, dist)` (32 B each, SORTED by state), then the horizon.
 struct MarksMap {
     map: crate::storage::file::Mapped,
     rows: usize,
@@ -315,9 +306,9 @@ struct MarkedSet {
     cells: FxHashMap<(u64, u32), (usize, usize)>,
 }
 
-/// A marks file scanned in parallel chunks: the set, and its `(cell, dist,
-/// count)` sorted by (dist, cell). Checks the rows strictly ascending by
-/// state - each state once, in the order `count_marked`'s merge reads them.
+/// A marks file scanned in parallel chunks: the set and its `(cell, dist,
+/// count)` by (dist, cell). Refuses rows not strictly ascending by state
+/// (the order `count_marked`'s merge needs).
 fn scan_marks(m: MarksMap, path: &Path, threads: usize) -> Result<(MarkedSet, Vec<(u32, u32, u32)>)> {
     let parts = crate::par::Pool::new(threads).map(m.rows.div_ceil(MARKS_CHUNK), |c| {
         let (a, b) = (c * MARKS_CHUNK, ((c + 1) * MARKS_CHUNK).min(m.rows));
@@ -354,9 +345,9 @@ fn scan_marks(m: MarksMap, path: &Path, threads: usize) -> Result<(MarkedSet, Ve
     Ok((MarkedSet { m, cells }, v))
 }
 
-/// The first `i` in `lo..hi` with `!before(i)` (`hi` if none), `before`
-/// true on a prefix: probes `lo`, `lo + 1`, `lo + 3`, `lo + 7`, ... then
-/// halves, so a forward cursor pays the log of its step, not of the range.
+/// The first `i` in `lo..hi` with `!before(i)`, else `hi` (`before` true on
+/// a prefix): probes `lo`, `lo + 1`, `lo + 3`, ... then halves, so a
+/// forward cursor pays the log of its step, not of the range.
 fn gallop(lo: usize, hi: usize, before: impl Fn(usize) -> bool) -> usize {
     let (mut a, mut step) = (lo, 1usize);
     let mut b = loop {
@@ -413,9 +404,8 @@ impl CellRows {
     }
 }
 
-/// Per local cell, the states of one region block (`keys` ascending,
-/// `masks` their cells) a marked set holds: a MERGE of the entries with the
-/// set's rows there (`rows`), both ascending by key, galloping in the rows.
+/// Per local cell, the states of one region block a marked set holds: a
+/// MERGE of the entries with `rows`, both ascending by key, galloping.
 fn count_marked(m: &MarksMap, rows: &CellRows, keys: &[Key], masks: &[u64]) -> [u32; 64] {
     let mut out = [0u32; 64];
     let (mut lo, hi, mut live) = (rows.lo, &rows.hi, rows.live);
@@ -505,9 +495,8 @@ fn sparse(m: FxHashMap<u32, u64>) -> Result<Sparse> {
     Ok(v)
 }
 
-/// One level directory read STREAMED (the module doc), the largest region
-/// first: per frame its states and wins per cell, and `sets` by layer
-/// (`[k]`: per frame, set `k`'s marked states per cell).
+/// One level directory, the largest region first: per frame its states and
+/// wins per cell, and `[k]`: per frame, set `k`'s marked states per cell.
 fn read_tree<N: celeste_core::arith::EngineNum>(dir: &Path, sets: &[MarkedSet], threads: usize) -> Result<(LevelData, Vec<Vec<Sparse>>)> {
     let n = last_frame(dir).map_or(0, |l| l as usize + 1);
     // The pos graph, to draw wins where the player left from (below). An
@@ -538,10 +527,9 @@ fn read_tree<N: celeste_core::arith::EngineNum>(dir: &Path, sets: &[MarkedSet], 
     let mut layers: Vec<Vec<Sparse>> = vec![Vec::with_capacity(n); sets.len()];
     for s in sums {
         let FrameSums { mut cells, mut wins, marked } = s.into_inner().unwrap();
-        // A won state's cell is in the NEXT room (one room to the right).
-        // Draw it where its player LEFT from: of the pos-graph sources, the
-        // one with the most states at the previous frame. The count moves
-        // whole (states and wins), so totals are unchanged.
+        // A won state's cell is in the NEXT room: draw it where its player
+        // LEFT from, the pos-graph source with the most states at the
+        // previous frame. States and wins move whole: totals are unchanged.
         if let (Some(g), Some((prev, _))) = (graph.as_ref(), frames.last()) {
             let prev: &Sparse = prev;
             let busiest = |win: u32| -> Option<u32> {
@@ -724,11 +712,10 @@ fn level_label(l: &super::result::LevelResult) -> String {
     }
 }
 
-/// `--arc DIR` (`search --save-marks DIR`: the LAST level's sets): the last
-/// forward level gets the winning sets' support, a level after it the ARC
-/// backward over the same tree; the optimum is the arc search's (`last`'s)
-/// unless `keep_optimal` (a dual search's: the pair's, not the float half's
-/// bound). Returns the witness if present.
+/// `--arc DIR` (`search --save-marks DIR`): the last forward level gets W's
+/// support, a level after it the ARC backward over the same tree; the
+/// optimum is `last`'s arc bound unless `keep_optimal` (a dual search's is
+/// the pair's). Returns the witness if present.
 fn attach_arc(hr: &mut HorizonRun, optimal: &mut Option<u32>, dir: &Path, last: &super::result::LevelResult, keep_optimal: bool) -> Result<Option<Witness>> {
     let rows = |name: &str| -> Result<u64> { Ok(MarksMap::open(&dir.join(name))?.rows as u64) };
     let found = last.arc_bound;
@@ -794,7 +781,6 @@ pub fn export(checkpoint_dir: &Path, out: &Path, threads: usize, arc: Option<&Pa
     eprintln!("[export-ui] {}: {} levels to f{h}, optimal {optimal:?}", checkpoint_dir.display(), hr.levels.len());
     std::fs::create_dir_all(out)?;
 
-    // One streamed pass per forward tree: its frames and marked sets.
     struct MarksOut {
         level: usize,
         by_cell_dist: Vec<(u32, u32, u32)>,
