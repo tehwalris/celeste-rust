@@ -1,18 +1,16 @@
 //! INTERVAL folding: decide what the graph computes without knowing its
-//! inputs.
-//!
-//! `transpile::bdd` treats every comparison as an independent variable, so
-//! it cannot see that `0 > abs(x)` is always false. This pass runs the
-//! interval evaluator (`Graph::eval`) with every input at TOP, and every node
-//! it pins down is a constant, unconditionally.
+//! inputs. `transpile::bdd` treats every comparison as an independent
+//! variable, so it cannot see that `0 > abs(x)` is always false; this pass
+//! runs the interval evaluator (`Graph::eval`) with every input at TOP, and
+//! every node it pins down is a constant, unconditionally.
 //!
 //! **Exact, not merely sound.** The interval domain over-approximates, so a
 //! node evaluated to `Bool(Some(b))` under TOP inputs is `b` under every
-//! assignment - every assignment the body is defined on: an
-//! `Op::Restrict` narrows its operand, and a lane outside its range is in
-//! error (the restriction's own, charged to every outcome). Replacing it changes nothing the graph computes and can only
-//! improve precision downstream (unlike a general equality substitution,
-//! see `bdd`'s "proved and deliberately not acted on").
+//! assignment the body is defined on (an `Op::Restrict` narrows its operand,
+//! and a lane outside its range is in error, charged to every outcome).
+//! Replacing it changes nothing the graph computes and can only improve
+//! precision downstream (unlike a general equality substitution:
+//! `bdd::simplify_local`, "Why only constants and atoms").
 
 use std::collections::HashMap;
 
@@ -35,10 +33,9 @@ pub struct Stats {
 }
 
 /// Every node the interval evaluator can pin down, replaced by that
-/// constant, and the graph rebuilt over the nodes `roots` reach.
-///
-/// Returns the new graph, a FULL-length node map (`UNREACHABLE` where a
-/// node was not reached), and what it found.
+/// constant, and the graph rebuilt over the nodes `roots` reach. Returns the
+/// new graph, a FULL-length node map (`UNREACHABLE` where a node was not
+/// reached), and what it found.
 pub fn fold<A: GraphArith>(g: &Graph<A>, roots: &[NodeId], room: Option<&Room>) -> Result<(Graph<A>, Vec<NodeId>, Stats)> {
     let mut out = g.like();
     let (map, st) = fold_into(g, roots, room, &mut out)?;
@@ -212,9 +209,7 @@ mod tests {
     }
 
     /// A collision test with ONE coordinate at TOP is decided false only where
-    /// no position along that axis is solid, in every level room. (Capping the
-    /// derived rectangle's corner and size apart once read TOP as tile row 0
-    /// only and put a spawning player in the air on the ground.)
+    /// no position along that axis is solid, in every level room.
     #[test]
     fn a_collision_test_at_a_top_coordinate_folds_only_to_what_every_position_gives() {
         let cart = std::sync::Arc::new(celeste_core::cart_data::CartData::load("cart").expect("cart"));

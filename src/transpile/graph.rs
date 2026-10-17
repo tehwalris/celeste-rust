@@ -81,7 +81,7 @@ pub enum Pinned<A: Arithmetic = Fixed> {
 /// arithmetic `A` (16.16 by default): its literals are `A::Lit`.
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub enum Op<A: Arithmetic = Fixed> {
-    // ---- leaves ----
+    // Leaves.
     /// A literal: low and high bounds as `A::Lit` (raw 16.16, a double's
     /// bits: raw so `Op` is `Hash`); an exact literal is `Const(x, x)`.
     Const(A::Lit, A::Lit),
@@ -92,7 +92,7 @@ pub enum Op<A: Arithmetic = Fixed> {
     /// specialization.
     Split(u8),
 
-    // ---- number -> number ----
+    // number -> number
     Add,
     Sub,
     Mul,
@@ -133,14 +133,14 @@ pub enum Op<A: Arithmetic = Fixed> {
     /// is stored only as `AV::UNum`, and `bind` refuses a root reading it.
     UnknownNum,
 
-    // ---- number -> bool ----
+    // number -> bool
     Lt,
     Le,
     Gt,
     Ge,
     Eq,
 
-    // ---- bool -> bool ----
+    // bool -> bool
     Not,
     /// Tri-state AND: a decided `false` wins over an unknown.
     And,
@@ -183,11 +183,11 @@ pub enum Op<A: Arithmetic = Fixed> {
     /// a fork at a TABLE of cuts is ordinary arithmetic once specialized.
     Lo,
     Hi,
-    // ---- cart lookups ----
+    // Cart lookups.
     Mget,
     TileFlagAt,
 
-    // ---- the round fork, where `x + 1/2` rounds (doubles) ----
+    // The round fork, where `x + 1/2` rounds (doubles).
     /// `RSplit(d)`: the operand RESTRICTED to fork d's outcome in the ROUND
     /// partition: fragment `c` is where `flr(x + 1/2)` takes the `c`-th
     /// value from the low end's, cut at the arithmetic's exact points
@@ -462,15 +462,13 @@ impl<A: GraphArith> Graph<A> {
                     return self.leaf(Op::ConstBool(b));
                 }
             }
-            // Arithmetic on literal POINTS folds, so a select on it folds
-            // instead of being split both ways. EXACTLY - the arithmetic's own
-            // operation, bit for bit - and a result past the arithmetic (where
-            // PICO-8 wraps or saturates, or a double is not finite) is an
-            // error, and `fold` has no error to return, so it panics with the
-            // operands. The traced Lua's constant arithmetic is the domain's
-            // (`Symbolic::arith`, an error with the source text); this is what
-            // a specialization or a substitution folds, and the program
-            // overflows nowhere (`checked`).
+            // Arithmetic on literal POINTS folds EXACTLY (the arithmetic's own
+            // operation, bit for bit), so a select on it folds instead of being
+            // split both ways. A result past the arithmetic panics with the
+            // operands (`checked`): `fold` has no error to return, the traced
+            // Lua's constant arithmetic errs in the domain (`Symbolic::arith`),
+            // and what a specialization or a substitution folds overflows
+            // nowhere.
             Op::Add | Op::Sub | Op::Mul | Op::Div | Op::Min | Op::Max => {
                 let point = |g: &Graph<A>, i: usize| match g.nodes[args[i] as usize].op {
                     Op::Const(lo, hi) if lo == hi => Some(A::from_lit(lo)),
@@ -683,8 +681,7 @@ impl<A: GraphArith> Graph<A> {
     /// the SET of tiles the rectangle holds (`tiles_over`), so `Eq(k, mget)`
     /// decides where no tile there is `k`, and evaluates `DEFINED` (below).
     /// The interval fold's evaluator (`transpile::ival`); the tracer's
-    /// (`verify::Points`) keeps `eval_lenient_in`, so the trace does not
-    /// move.
+    /// (`split::Points`) is `eval_lenient_in`.
     pub fn eval_fold_in(&self, cells: &HashMap<u32, Val<A>>, room: &Room) -> Result<Vec<Val<A>>> {
         self.eval_full(cells, true, false, Some(room), true, DEFINED)
     }
@@ -1440,7 +1437,6 @@ mod tests {
                 }
             }
         }
-        // Guard against the test silently checking nothing.
         assert!(pairs.len() > 1_000, "pool collapsed to {} pairs", pairs.len());
         let fired = pairs.iter().filter(|(f, p)| f != p).count();
         assert!(fired > 500, "only {} of {} pairs were folded", fired, pairs.len());

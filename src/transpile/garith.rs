@@ -1,8 +1,8 @@
 //! What the graph IR needs of an arithmetic beyond `Arithmetic`
 //! (plans/float.md, "The kernels' safety"): the rules that are the
-//! arithmetic's own. 16.16's are the graph's code as it always was, moved
-//! here verbatim (the kernels' raw `i32` grid, wraps included); the
-//! doubles' follow `LuaF64` and the reference engine (`refdomain`) exactly.
+//! arithmetic's own. 16.16's are the kernels' raw `i32` grid, wraps
+//! included; the doubles' follow `LuaF64` and the reference engine
+//! (`refdomain`) exactly.
 //!
 //! - the FORK GRID: the integer floors a `move` fork's fragments are cut
 //!   at (`Split`, `Frag`, `FragOk`, `SplitOk`, `IntFrag`);
@@ -123,7 +123,7 @@ mod value_box_tests {
     }
 }
 
-// ---- 16.16 ----
+// 16.16.
 
 /// One fork-grid step (the integers) in raw 16.16 units.
 const GRID_STEP: i32 = 1 << 16;
@@ -466,7 +466,7 @@ fn decide_pairs<P: Copy>(xs: &[P], ys: &[P], one: impl Fn(P, P) -> Option<bool>)
     decided.flatten()
 }
 
-// ---- doubles ----
+// Doubles.
 
 /// A static range of doubles as sorted, disjoint closed pieces.
 pub type FloatPieces = Vec<(f64, f64)>;
@@ -545,8 +545,9 @@ impl GraphArith for Float {
         iv.floor_fragment(c as u32)
     }
 
-    /// A double's `NoWrap` is "finite". Undecided exactly where the operation can leave the finite doubles
-    /// (`range_error`: `%` by zero included); anything else is finite.
+    /// A double's `NoWrap` is "finite": undecided exactly where the
+    /// operation can leave the finite doubles (`range_error`: `%` by zero
+    /// included).
     fn fold_no_wrap(g: &Graph<Float>, x: NodeId) -> Option<bool> {
         if Self::range_error(&g.get(x).op) {
             None
@@ -580,7 +581,7 @@ impl GraphArith for Float {
         let rec = |memo: &mut HashMap<NodeId, Option<FloatPieces>>, k: usize| Self::pieces_of(g, memo, args[k]);
         // Every operation below is monotone in each operand (or `abs`,
         // in its magnitude) and rounded to nearest at both ends, which is
-        // monotone too: the ends' results bound every lane's (section 4).
+        // monotone too: the ends' results bound every lane's.
         let r: Option<FloatPieces> = match op {
             Op::Const(lo, hi) => Some(vec![(v(lo), v(hi))]),
             Op::Restrict(lo, hi) => {

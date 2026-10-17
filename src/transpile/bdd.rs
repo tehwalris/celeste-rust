@@ -255,16 +255,12 @@ fn syntactic_complements<A: GraphArith>(g: &Graph<A>, x: NodeId, y: NodeId) -> b
     }
 }
 
-// ---------------------------------------------------------------------------
-// THE LOCAL PASS
-//
-// Each rewrite is proved on a small BDD of the node's OWN bounded cone: past
+// THE LOCAL PASS: each rewrite is proved on a small BDD of the node's OWN bounded cone: past
 // the expansion budget a compound node is an opaque variable, which proves
 // less and never anything false (a tautology over independent variables
 // holds for the realizable assignments too). It runs once, in topological
 // order over the REWRITTEN graph, so a collapse that exposes another is
 // seen in the same pass.
-// ---------------------------------------------------------------------------
 
 /// A variable of a local analysis: a comparison in canonical form - `Lt`
 /// over its operands in order: `Ge(a, b)` is its negation, `Gt(a, b)` is

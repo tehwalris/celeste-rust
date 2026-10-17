@@ -3,8 +3,8 @@
 //! `call` through a function pointer in `AsmCtx`, the kernel's third
 //! argument. Operands are marshalled through a stack buffer and the wrappers
 //! invoke the exact `celeste_engine::kernel` primitive, so the result is
-//! bit-identical by construction. The emitted code saves and restores all
-//! 32 zmm around the call.
+//! bit-identical by construction. The emitted code saves and restores the
+//! registers live across the call (`codegen::call_saves`).
 //!
 //! The doubles' kernels (8 `f64` lanes) call their own: the tools' `sin`
 //! (`LuaF64::lua_sin`, glibc's `sin`, lane by lane) and the collision

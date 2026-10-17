@@ -1,9 +1,7 @@
-//! Graph -> the fused, fork-free frame.
-//!
-//! `specialize_frame` resolves every fork configuration of the traced graph
-//! into ONE hash-consed arena, and `lower_outcomes` reads the per-outcome
-//! constants the kernel needs off the result. The ASM backend
-//! (`trace::lower::asm_fused`) assembles the same arena.
+//! Graph -> the fused, fork-free frame: `specialize_frame` resolves every
+//! fork configuration of the traced graph into ONE hash-consed arena, and
+//! `lower_outcomes` reads the per-outcome constants the kernel needs off the
+//! result. The ASM backend (`trace::lower::asm_fused_from`) assembles it.
 
 use std::collections::BTreeMap;
 
@@ -93,15 +91,12 @@ fn decided_roots<A: GraphArith>(
         .collect()
 }
 
-/// Specialize a traced frame's graph into ONE fused, hash-consed arena.
-///
-/// Every fork configuration is resolved (`Split`/`SplitValid`/`SplitInt`
-/// become `Frag`/`FragOk`/`IntFrag`), so no fork node survives and
-/// configurations that agree share nodes. Returns the fused graph and one
-/// body per distinct (outcome, row), whose roots are the outcome's fields
-/// in order, then `error`, then `live`, then the transfer roots
-/// (`Outcome::arc`). This is the single source of the specialized compute:
-/// the ASM backend and `lower_outcomes` both read it.
+/// Specialize a traced frame's graph into ONE fused, hash-consed arena:
+/// every fork configuration resolved (`Split`/`SplitValid`/`SplitInt` become
+/// `Frag`/`FragOk`/`IntFrag`), so no fork node survives and configurations
+/// that agree share nodes. Returns the fused graph and one body per distinct
+/// (outcome, row), whose roots are the outcome's fields in order, then
+/// `error`, then `live`, then the transfer roots (`Outcome::arc`).
 pub(crate) fn specialize_frame<A: GraphArith>(
     graph: &Graph<A>,
     outs: &[(Vec<NodeId>, NodeId, NodeId, Vec<NodeId>)],
@@ -111,8 +106,8 @@ pub(crate) fn specialize_frame<A: GraphArith>(
     trace: bool,
 ) -> (Graph<A>, Vec<SpecializedBody>) {
     let t0 = std::time::Instant::now();
-    // --- 1. the forks each outcome depends on: those in its cone (read off
-    // the reachable set, so no limit on a frame's fork count) ---
+    // 1. The forks each outcome depends on: those in its cone (read off the
+    // reachable set, so no limit on a frame's fork count).
     let bits_of = |need: &[bool]| -> Vec<u8> {
         let mut forks: std::collections::BTreeSet<u8> = Default::default();
         for (i, n) in need.iter().enumerate() {
@@ -125,9 +120,7 @@ pub(crate) fn specialize_frame<A: GraphArith>(
         forks.into_iter().collect()
     };
 
-    // --- 2. per outcome, its configurations ---
-    //
-    // Two kinds of fork, by what a configuration of it MEANS:
+    // 2. Per outcome, its configurations. Two kinds of fork, by what a configuration of it MEANS:
     //
     // * A fork every lane takes both ways (`Symbolic::both_values`: buttons,
     //   held trails, escaped atoms; the outcome reads no validity of it). A
@@ -284,7 +277,7 @@ pub(crate) fn specialize_frame<A: GraphArith>(
     build_add_duration(3, t_spec);
     let n_cands = cands.len();
     let t1 = std::time::Instant::now();
-    // --- 3. decide the boolean layer, on the RESOLVED graph ---
+    // 3. Decide the boolean layer, on the RESOLVED graph.
     if decide {
         let all: Vec<NodeId> = cands.iter().flat_map(|c| c.2.iter().copied()).collect();
         let t_phase = std::time::Instant::now();
@@ -392,13 +385,11 @@ pub(crate) fn specialize_frame<A: GraphArith>(
             sp.len()
         );
     }
-    // --- 4. candidates that write the same row are ONE body; a body live
-    // nowhere is no body ---
-    //
-    // Candidates of one outcome with the same fields write the same row
-    // wherever they are live, so they fuse: `live` the OR of theirs, `error`
-    // the members' shared node when they share one (fusion never touches
-    // error), else `OR_i (live_i & error_i)`. Either way a lane declines
+    // 4. Candidates that write the same row are ONE body; a body live
+    // nowhere is no body. Candidates of one outcome with the same fields
+    // write the same row wherever they are live, so they fuse: `live` the OR
+    // of theirs, `error` the members' shared node when they share one (fusion
+    // never touches error), else `OR_i (live_i & error_i)`. Either way a lane declines
     // exactly where some candidate declined (also in the three-valued masks,
     // both read where they MAY hold) and is kept where some candidate kept it.
     let bodies: Vec<SpecializedBody> = {

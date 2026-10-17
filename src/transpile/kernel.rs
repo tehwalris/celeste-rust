@@ -7,7 +7,6 @@
 //! per-lane facts in the graph (a body's `error` mask, `trace::error`),
 //! never Rust errors.
 
-
 use celeste_core::arith::Fixed;
 
 use super::garith::GraphArith;
@@ -18,7 +17,7 @@ pub(crate) struct Emit<A: GraphArith = Fixed> {
     /// Number of forks in the graph. Every one is resolved at compile time
     /// (`transpile::lower` enumerates each outcome over its own forks).
     pub(crate) fork_depth: usize,
-    /// The member's value graph.
+    /// The traced graph.
     pub(crate) graph: Graph<A>,
     /// Decide the boolean layer of the specialized arena before emitting:
     /// interval fold, `bdd::simplify_local`, interval fold again.
@@ -47,7 +46,7 @@ pub enum ColTy {
 
 /// One boundary output of a frame.
 pub(crate) struct OutField<A: GraphArith = Fixed> {
-    /// Cell id this value lands in.
+    /// The cell this value lands in.
     pub(crate) cell: u32,
     pub(crate) ty: ColTy,
     /// The graph node this cell ends the frame holding.

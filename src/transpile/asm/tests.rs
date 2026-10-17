@@ -235,8 +235,6 @@ fn eval_nodes(
     vals
 }
 
-// ---- typed-root coverage (value + bool + interval layers) ----
-
 use crate::transpile::asm::RootKind;
 
 /// Read the raw output buffer, `out_bytes` long (`Compiled::out_bytes`).
@@ -781,14 +779,12 @@ fn asm_interval_overflow_declines() {
     }
 }
 
-/// Interval `*` and `/` by a positive literal whose endpoints leave the
-/// 16.16 range are an ERROR in that lane, as `+`/`-`/negation
-/// (`asm_interval_overflow_declines`): `NoWrap` is false exactly where
-/// `zi_scale_wraps` / `zi_div_wraps` (`Pico8NumInterval`'s checked
-/// operations) fire, one ulp either side of each literal's edges, and every
-/// other lane is bit-exact with `zi_scale` / `zi_div`. A literal that cannot
-/// carry an endpoint out (a factor at most 1, a divisor at least 1: the
-/// inline `div_pow2`) has a constant-true `NoWrap`, so no compare.
+/// Interval `*` and `/` by a positive literal, as
+/// `asm_interval_overflow_declines`: `NoWrap` is false exactly where
+/// `zi_scale_wraps` / `zi_div_wraps` fire, one ulp either side of each
+/// literal's edges, and every other lane is bit-exact. A literal that cannot
+/// carry an endpoint out (a factor at most 1, a divisor at least 1) has a
+/// constant-true `NoWrap`: no compare.
 #[test]
 fn asm_interval_scale_and_divide_overflow_declines() {
     use crate::transpile::asm::{compile_and_load_reprs, CellRepr};
@@ -888,15 +884,12 @@ fn asm_interval_scale_and_divide_overflow_declines() {
     }
 }
 
-/// SCALAR (point) arithmetic that leaves the 16.16 range is an ERROR in
-/// that lane, as an interval's is (`asm_interval_overflow_declines`):
-/// `NoWrap` of `+ - * /`, negation and `abs` is false exactly where the
-/// primitives' masks (`zn_*_wraps`: `Pico8Num`'s checked operation has no
-/// answer) fire, one step either side of every edge, and every other lane
-/// is bit-exact with the primitive - the exact result. With a literal
-/// operand the check is at most two compares of the other one
+/// SCALAR arithmetic, as `asm_interval_overflow_declines`: `NoWrap` of
+/// `+ - * /`, negation and `abs` is false exactly where `zn_*_wraps` fire,
+/// one step either side of every edge, and every other lane is the exact
+/// result. With a literal operand the check is at most two compares
 /// (`graph::one_operand`), none where every value fits; two cells' `+`/`-`
-/// is the sign test of the interval form on one plane.
+/// is one sign test.
 #[test]
 fn asm_scalar_overflow_declines() {
     use crate::transpile::graph::one_operand;
