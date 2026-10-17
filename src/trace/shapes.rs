@@ -1,16 +1,14 @@
-//! A state as the walk (`walk::room_constant_lattice`) sees it: which
-//! scalars are STATE (`state_paths`, what a trace symbolizes), its
-//! constants, and `blank`/`rebase` (the values do not matter: every
+//! A state as the walk sees it: which scalars are STATE (`state_paths`, what
+//! a trace symbolizes), its constants, and `blank`/`rebase` (every
 //! non-frozen scalar is symbolized at a frame's start, so two states of one
 //! shape trace identically).
 //!
-//! FROZEN (program constants, not symbolized): `types` and the prototypes
-//! it holds (a symbolic `type.tile` would make `load_room` try every type
-//! for every tile), `room` (a kernel is per room anyway), and the button
-//! indices (`btn(k)` asserts `k` is one of six). The rule is "no frame
-//! writes it", not "set at toplevel" (`freeze`, `has_key` etc. are state).
-//! Over-freezing would miss a shape, hence a kernel, which is a loud fatal
-//! coverage gap - the safe direction.
+//! FROZEN (program constants, not symbolized): `types` and the prototypes it
+//! holds (a symbolic `type.tile` would make `load_room` try every type for
+//! every tile), `room`, and the button indices. The rule is "no frame writes
+//! it", not "set at toplevel" (`freeze`, `has_key` are state). Over-freezing
+//! would miss a shape, hence a kernel: a loud fatal coverage gap, the safe
+//! direction.
 
 use anyhow::Result;
 
@@ -70,8 +68,7 @@ fn under_frozen<A: GraphArith>(
     false
 }
 
-/// Every scalar that is STATE: what a kernel for this shape takes as
-/// input, and what the tracer symbolizes.
+/// Every scalar that is STATE: a kernel's input, what the tracer symbolizes.
 pub fn state_paths<A: GraphArith>(st: &State<Symbolic<A>>) -> Result<Vec<Path>> {
     let frozen = frozen_tables(st);
     Ok(iface::scalars(st, &[])?
@@ -89,9 +86,8 @@ pub fn blank<A: GraphArith>(st: &mut State<Symbolic<A>>, d: &mut Symbolic<A>) ->
         };
         iface::set(st, &p, v)?;
     }
-    // The path condition and the obligation belong to the frame that
-    // produced this state. A stale `guard` (what a merge selects on) would
-    // put the previous frame's input cells, in its numbering, into this
+    // The path condition belongs to the frame that produced this state: a
+    // stale `guard` would put the previous frame's input cells into this
     // frame's outputs.
     st.guard = d.boolean(true);
     st.ended = d.boolean(false);
@@ -129,11 +125,10 @@ pub fn heap_constants<A: GraphArith>(st: &State<Symbolic<A>>, d: &Symbolic<A>) -
     out
 }
 
-/// Move a walk's representative state into another tracer's arena (every
-/// number and boolean names a node of the arena it was produced in). The
-/// slots `blank` rewrites are blanked; every other scalar is re-made from
-/// `constants` (`heap_constants` in the source arena); a table scalar that
-/// is neither refuses, a closure scope's is blanked.
+/// Move a walk's representative state into another tracer's arena: the
+/// slots `blank` rewrites blanked, every other scalar re-made from
+/// `constants` (`heap_constants` in the source arena); a table scalar that is
+/// neither refuses, a closure scope's is blanked.
 pub fn rebase<A: GraphArith>(st: &mut State<Symbolic<A>>, d: &mut Symbolic<A>, constants: &std::collections::HashMap<u32, iface::Conc<A>>) -> Result<()> {
     // Where `blank` writes: each state path's (table, last step).
     let mut blanked: std::collections::BTreeSet<(u32, Step)> = Default::default();
@@ -215,14 +210,12 @@ pub fn room_of<A: GraphArith>(st: &State<Symbolic<A>>, d: &Symbolic<A>) -> (i16,
 pub fn field_constants<A: GraphArith>(st: &State<Symbolic<A>>, d: &Symbolic<A>, opts: &crate::abstraction::Level) -> Result<std::collections::BTreeMap<Path, super::iface::Conc<A>>> {
     use super::domain::Domain;
     use super::iface::Conc;
-    // The fields the level's widenings store as something other than one
-    // value per state (the player's `rem`, a live fruit's `off`/`y`, the
-    // level's object fields, the held trails) are never constants, whatever
-    // a trace computes: baked, a widened block would not bind.
+    // The fields the level's widenings store as other than one value per
+    // state are never constants, whatever a trace computes: baked, a widened
+    // block would not bind.
     let widened: std::collections::BTreeSet<Path> = super::widen::slots_where(st, *opts, super::widen::stores_widened).into_iter().collect();
-    // The buttons are dead at the boundary (blocks hold them unknown; every
-    // frame resets them before reading), so the start state's concrete
-    // `false` is not a constant of the shape and must not be baked.
+    // The buttons are dead at the boundary (every frame resets them before
+    // reading): the start state's `false` is no constant of the shape.
     let buttons = iface::key("__button_states");
     let mut out = std::collections::BTreeMap::new();
     for p in state_paths(st)? {
@@ -244,8 +237,7 @@ pub fn field_constants<A: GraphArith>(st: &State<Symbolic<A>>, d: &Symbolic<A>, 
     Ok(out)
 }
 
-/// The path of the player INSTANCE in `objects` (the entry whose `type`
-/// is the `player` global), if the state has one.
+/// The path of the player INSTANCE in `objects`, if the state has one.
 pub fn player_path<D: Domain>(st: &State<D>) -> Option<Path> {
     super::widen::objects_of_type(st, "player").into_iter().next()
 }

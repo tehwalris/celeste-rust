@@ -19,18 +19,15 @@ use celeste_core::arith::{Arithmetic, Fixed};
 
 use crate::trace::domain::{Arith, Cmp, Domain, Fun1, Fun2};
 
-/// A depth-first cursor over a decision tree, enumerated by re-execution.
-///
-/// During a run, `choose(n)` is called at each fork (in a stable order): it
-/// returns the recorded choice if this fork is already on the path, else it
-/// appends `(0, n)` and returns 0. After a run reaches a leaf, `advance()`
-/// bumps the deepest choice (popping exhausted ones) and returns whether any
-/// path remains. `reset()` rewinds the position for the next run.
+/// A depth-first cursor over a decision tree, enumerated by re-execution:
+/// during a run `choose(n)` returns the recorded choice if this fork is on
+/// the path, else appends `(0, n)` and returns 0; after a leaf, `advance()`
+/// bumps the deepest choice (popping exhausted ones) and says whether any
+/// path remains.
 #[derive(Debug, Default, Clone)]
 pub struct Cursor {
     /// The path: `(choice, count)` per fork, in encounter order.
     decisions: Vec<(u32, u32)>,
-    /// Position within `decisions` during the current run.
     pos: usize,
 }
 
@@ -39,13 +36,13 @@ impl Cursor {
         Cursor::default()
     }
 
-    /// Rewind for the next run (`advance` drops the stale tail).
+    /// Rewind for the next run.
     pub fn reset(&mut self) {
         self.pos = 0;
     }
 
-    /// A fork with `n` options. `n <= 1` is not a choice (identity fork), so it
-    /// is not recorded. Returns the choice index in `0..n`.
+    /// A fork with `n` options (`n <= 1` is no choice, not recorded): the
+    /// choice in `0..n`.
     pub fn choose(&mut self, n: u32) -> u32 {
         if n <= 1 {
             return 0;
@@ -62,8 +59,8 @@ impl Cursor {
         c
     }
 
-    /// Advance to the next path DFS-style. Returns false when the tree is
-    /// exhausted. Call after a run, before `reset()`.
+    /// Advance to the next path, DFS; false when the tree is exhausted. Call
+    /// after a run, before `reset()`.
     pub fn advance(&mut self) -> bool {
         // Drop forks the just-finished run did not reach (shorter path).
         self.decisions.truncate(self.pos);
@@ -83,7 +80,6 @@ impl Cursor {
 }
 
 /// The reference domain of arithmetic `A`: the cursor is its only state.
-/// `RefDomain` is 16.16's.
 #[derive(Debug, Default, Clone)]
 pub struct RefDomain<A: Arithmetic = Fixed> {
     pub cursor: Cursor,
@@ -105,8 +101,7 @@ fn floor_span<A: Arithmetic>(v: &A::Ival) -> Result<u32> {
     A::floors(*v).ok_or_else(|| anyhow::anyhow!("{} spans more than 65536 floors", show::<A>(v)))
 }
 
-/// A number for an error message: a point as its decimal value, an
-/// interval as `[lo, hi]`.
+/// A number for an error message.
 pub fn show<A: Arithmetic>(v: &A::Ival) -> String {
     match A::as_point(*v) {
         Some(n) => A::show(n),
@@ -365,10 +360,10 @@ mod tests {
         assert!(e.contains("reference arithmetic overflow"), "{what}: {e}");
     }
 
-    /// Every operation that can leave the 16.16 range RAISES, for a point
-    /// and for an interval: `+ - * /`, negation and `abs`, an interval times
-    /// a positive scalar and a division by zero; nothing
-    /// wraps or saturates. Off the edge a point is `Pico8Num`'s result.
+    /// Every operation that can leave the 16.16 range RAISES, for a point and
+    /// for an interval (`+ - * /`, negation, `abs`, an interval times a
+    /// positive scalar, a division by zero); off the edge a point is
+    /// `Pico8Num`'s result.
     #[test]
     fn every_overflow_raises_for_points_and_intervals() {
         let mut d = RefDomain::<Fixed>::new();

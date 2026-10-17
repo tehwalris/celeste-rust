@@ -47,13 +47,10 @@ pub type Outcome<D> = Multi<D, Flow<D>>;
 #[derive(Clone)]
 pub struct Interp<'a, D: Domain> {
     pub d: D,
-    /// Function bodies, by `BodyId`.
     bodies: Vec<&'a ast::FunctionBody>,
     /// AST node (by address) -> its id, so one `function ... end` evaluated
-    /// twice is the SAME body: the body is part of the SHAPE, so states must
-    /// agree on it.
+    /// twice is the SAME body (the body is part of the SHAPE).
     body_ids: std::collections::HashMap<usize, BodyId>,
-    /// See `hint_name`.
     hint: Vec<String>,
     /// Paths poisoned by `poison` (a Lua error), counted by reason so a
     /// modelling gap stays visible.
@@ -61,7 +58,7 @@ pub struct Interp<'a, D: Domain> {
     /// Each poisoned path's guard and reason; their OR is the raise row's
     /// liveness. Reset per trace by `frame::trace_frame`.
     pub raised: Vec<(D::Bool, String)>,
-    /// The cart and the room's collision cache (optional for unit tests).
+    /// The cart (optional for unit tests).
     pub cart: Option<std::sync::Arc<celeste_core::cart_data::CartData>>,
     pub cache: Option<std::sync::Arc<celeste_core::collision_cache::CollisionCache>>,
     /// Budgets, so a blow-up is a DIAGNOSIS naming the construct, not a hang.
@@ -71,7 +68,6 @@ pub struct Interp<'a, D: Domain> {
     pub trace_start_nodes: usize,
     /// What `printh` printed, compared against real PICO-8 (`lua/probe/`).
     pub prints: Vec<String>,
-    /// Memoized `(room x, room y, flag bit) -> any tile carries it`.
     room_flags: std::collections::HashMap<(i16, i16, i16), bool>,
     /// Literal splits handed out: the ids in `State::frag`.
     next_split: usize,
@@ -79,7 +75,7 @@ pub struct Interp<'a, D: Domain> {
     /// split of a remainder (`__split_by_round`, `__split_by_flr`) must name
     /// its site and the player's record what they did (`State::arc`).
     pub arc_capture: bool,
-    /// The site of the split call being made, taken by the builtin.
+    /// The site of the split call being made.
     split_site: Option<SplitSite>,
     /// THE BUTTON READS (`RefEngine::frame_reads`): the button table and a
     /// mask of the buttons the frame read from it (bit `i - 1` for
@@ -118,8 +114,8 @@ impl<'a, D: Domain> Interp<'a, D> {
         }
     }
 
-    /// The engine's index for function `name`: `FN_NAMES` spells `base_N`;
-    /// this matches a unique BASE (`anonymous` is refused).
+    /// The engine's index for function `name` (`FN_NAMES` spells `base_N`):
+    /// a unique BASE; `anonymous` is refused.
     fn fn_id_of(name: &str) -> Option<u32> {
         let mut found = None;
         for (i, n) in celeste_names::gen::FN_NAMES.iter().enumerate() {
@@ -138,8 +134,7 @@ impl<'a, D: Domain> Interp<'a, D> {
     }
 
     /// The name a function expression is stored under, as `FN_NAMES` spells
-    /// it (`player = { init = function ... }` is `player.init`). A syntactic
-    /// stack pushed around the sub-evaluation.
+    /// it (`player = { init = function ... }` is `player.init`).
     fn hint_name(&self) -> Option<String> {
         if self.hint.is_empty() {
             return None;
@@ -233,9 +228,8 @@ impl<'a, D: Domain> Interp<'a, D> {
         id
     }
 
-    /// Run a block. A BLOCK IS A SCOPE, as in Lua: a leaked `local` is part
-    /// of `Shape::scopes` and would keep arms from merging. A scope is
-    /// allocated only when the block declares something.
+    /// Run a block. A BLOCK IS A SCOPE, as in Lua: a leaked `local` is part of
+    /// `Shape::scopes` and would keep arms from merging.
     pub fn exec_block(&mut self, block: &'a ast::Block, st: State<D>) -> Result<Outcome<D>> {
         if !declares_local(block) {
             return self.exec_block_flat(block, st);
@@ -412,8 +406,7 @@ impl<'a, D: Domain> Interp<'a, D> {
         }
     }
 
-    /// `if`: a decided condition takes its arm; an undecided one runs BOTH
-    /// arms and merges.
+    /// `if`: a decided condition takes its arm; an undecided one runs BOTH.
     fn exec_if(&mut self, iff: &'a ast::If, st: State<D>) -> Result<Outcome<D>> {
         // `elseif` chains are nested arms: recurse over the tail.
         let mut arms: Vec<(&'a ast::Expression, &'a ast::Block)> =
@@ -471,10 +464,9 @@ impl<'a, D: Domain> Interp<'a, D> {
         Ok(out)
     }
 
-    /// Merge every mergeable pair of outcomes to a fixpoint, not only
-    /// siblings (an `elseif` ladder in a loop leaves one `return` per rung).
-    /// Run after every statement, so the frontier is the number of genuinely
-    /// different futures.
+    /// Merge every mergeable pair of outcomes to a fixpoint, not only siblings
+    /// (an `elseif` ladder in a loop leaves one `return` per rung). Run after
+    /// every statement.
     pub fn collapse(&mut self, outs: Outcome<D>) -> Result<Outcome<D>> {
         let independent = |it: &mut Self, c: &D::Bool, a: &Flow<D>, b: &Flow<D>| match (a, b) {
             (Flow::Return(x), Flow::Return(y)) => it.joins_independent(c, x, y),
@@ -489,9 +481,8 @@ impl<'a, D: Domain> Interp<'a, D> {
     }
 
     /// `collapse` of outcomes carrying a `T` (a flow, a value): pairs whose
-    /// `T`s are `joinable` (no node built) merge, siblings first
-    /// (`merge_order`), where `independent` allows a join on the merge's
-    /// condition; `join` joins them.
+    /// `T`s are `joinable` merge, siblings first, `independent` allowing a join
+    /// on the merge's condition; `join` joins them.
     fn collapse_by<T>(
         &mut self,
         mut outs: Multi<D, T>,
@@ -543,9 +534,7 @@ impl<'a, D: Domain> Interp<'a, D> {
 
     /// Can two values be joined on `cond` without a select some lane cannot
     /// take? On a condition reading an unknown atom, only an independent join
-    /// can; on one reading an input the trace refuses merges on
-    /// (`Domain::reads_merge_refused`), none; otherwise they stay two
-    /// successors, as `state::merge` does.
+    /// can; on one reading an input the trace refuses merges on, none.
     fn joins_independent(&mut self, cond: &D::Bool, a: &Value<D>, b: &Value<D>) -> bool {
         if a == b {
             return true;
@@ -570,7 +559,6 @@ impl<'a, D: Domain> Interp<'a, D> {
         }
     }
 
-    /// Join two `joinable` values.
     fn join_value(&mut self, cond: &D::Bool, a: &Value<D>, b: &Value<D>) -> Value<D> {
         match (a, b) {
             // As `state::join`.
@@ -587,8 +575,7 @@ impl<'a, D: Domain> Interp<'a, D> {
     }
 
 
-    /// Numeric `for`. Bounds are almost always concrete; a symbolic one is
-    /// unrolled to `unroll_bound` by `run_for_symbolic`.
+    /// Numeric `for`; a symbolic bound is unrolled (`run_for_symbolic`).
     fn exec_for(&mut self, f: &'a ast::NumericFor, st: State<D>) -> Result<Outcome<D>> {
         if f.step().is_some() {
             bail!("numeric for with an explicit step is not supported");
@@ -640,8 +627,8 @@ impl<'a, D: Domain> Interp<'a, D> {
         s: State<D>,
         bound: u32,
     ) -> Result<Outcome<D>> {
-    // A state LEAVES the loop and never re-enters: the guard is opaque, so a
-    // re-tested `i <= limit` would split under `g and c and not c`.
+    // A state LEAVES the loop and never re-enters: the guard is opaque,
+    // so a re-tested `i <= limit` would split under `g and c and not c`.
         let mut running: Outcome<D> = vec![(s, Flow::Normal)];
         let mut done: Outcome<D> = Vec::new();
         for k in 0..bound {
@@ -681,7 +668,6 @@ impl<'a, D: Domain> Interp<'a, D> {
         self.collapse(done)
     }
 
-    /// One iteration of a numeric `for`, in its own scope.
     fn for_body(
         &mut self,
         f: &'a ast::NumericFor,
@@ -805,7 +791,6 @@ impl<'a, D: Domain> Interp<'a, D> {
                 Ok(out)
             }
             ast::Expression::BinaryOperator { lhs, binop, rhs } => {
-                // Carry the SOURCE TEXT into the error.
                 self.eval_binop(lhs, binop, rhs, st).map_err(|err| anyhow!("in `{}`: {:#}", source_text(e), err))
             }
             ast::Expression::Var(v) => match v {
@@ -944,11 +929,10 @@ impl<'a, D: Domain> Interp<'a, D> {
         Ok(out)
     }
 
-    /// A LUA RAISE on this path (e.g. `nil > 0`): the game ends, so these
-    /// lanes have NO successor and `guard` is cleared. Not a silent drop: the
-    /// guard goes to `raised`, whose OR is the raise row's liveness, so every
-    /// lane ends in exactly one row (exact even where a merge's lost
-    /// correlation reaches the raise). Counted in `illegal`.
+    /// A LUA RAISE on this path (e.g. `nil > 0`): these lanes have NO
+    /// successor and `guard` is cleared. Not a silent drop: the guard goes to
+    /// `raised`, whose OR is the raise row's liveness, so every lane ends in
+    /// exactly one row. Counted in `illegal`.
     fn poison(&mut self, st: &mut State<D>, why: String) {
         self.raised.push((st.guard.clone(), why.clone()));
         st.guard = self.d.boolean(false);
@@ -1028,7 +1012,6 @@ impl<'a, D: Domain> Interp<'a, D> {
 
 
 
-    /// Read a name: scopes first, then globals, else `nil`.
     fn read_name(&mut self, name: &str, st: &State<D>) -> Value<D> {
         if let Some(v) = st.heap.lookup(st.scope, name) {
             return v.clone();
@@ -1182,8 +1165,8 @@ impl<'a, D: Domain> Interp<'a, D> {
         Ok(cur.into_iter().map(|(s, (v, _))| (s, v)).collect())
     }
 
-    /// Work out WHERE an assignment stores, so the left-hand side evaluates
-    /// before the right, as in Lua.
+    /// WHERE an assignment stores, so the left-hand side evaluates before the
+    /// right, as in Lua.
     fn resolve_target(
         &mut self,
         var: &'a ast::Var,
@@ -1217,7 +1200,6 @@ impl<'a, D: Domain> Interp<'a, D> {
         }
     }
 
-    /// Does any tile in the loaded room carry this flag bit?
     fn room_has_flag(&mut self, st: &State<D>, flag: i16) -> Result<bool> {
         let Some(Value::Table(rt)) = st.heap.tables[&st.globals].hash.get("room").cloned() else {
             bail!("tile_flag_at: no `room` global to check the flag against");
@@ -1374,10 +1356,9 @@ impl<'a, D: Domain> Interp<'a, D> {
     }
 
     /// Rejoin the fragments of literal splits made inside a call that just
-    /// returned. No lane picks a fragment (every lane holds the value alike),
-    /// so the states of one split merge on an undecided atom and everything
-    /// else must JOIN (a hull or the unknown number). A surviving select, an
-    /// unjoinable return or two shapes refuse the trace.
+    /// returned: no lane picks a fragment, so the states of one split merge on
+    /// an undecided atom and everything else must JOIN (a hull or the unknown
+    /// number). A surviving select, an unjoinable return or two shapes refuse.
     fn rejoin_fragments(&mut self, out: Multi<D, Value<D>>) -> Result<Multi<D, Value<D>>> {
         let mut rest: Multi<D, Value<D>> = Vec::new();
         type Tags = Vec<(usize, usize, u16)>;
@@ -1445,9 +1426,9 @@ impl<'a, D: Domain> Interp<'a, D> {
     }
 
     /// THE ARC CAPTURE: the player's split on `axis` took fragment `v` of `x`;
-    /// record it with the move's `ox`/`oy`. A second on one axis in one path
-    /// (a platform carrying the player) is refused: an arc edge describes
-    /// one rotation per axis per frame.
+    /// record it with the move's `ox`/`oy`. A second on one axis in one path (a
+    /// platform carrying the player) is refused: an arc edge is one rotation per
+    /// axis per frame.
     fn capture_player_split(&mut self, st: &mut State<D>, axis: usize, x: &D::Num, v: &D::Num) -> Result<()> {
         let name = if axis == 0 { "ox" } else { "oy" };
         let Value::Num(ox) = self.read_name(name, st) else { bail!("arc capture: the player's split on axis {axis} has no number `{name}` in scope") };
@@ -1465,8 +1446,7 @@ impl<'a, D: Domain> Interp<'a, D> {
     }
 
     /// A split of a value every lane holds alike (`Domain::literal_fragments`):
-    /// each fragment runs as its own trace state, rejoined when the call
-    /// returns.
+    /// each fragment its own trace state, rejoined when the call returns.
     fn literal_split(&mut self, st: State<D>, frags: Vec<D::Num>, player_axis: Option<usize>) -> Result<Multi<D, Value<D>>> {
         // Its fragments rejoin into one hull: no body keeps the piece.
         anyhow::ensure!(player_axis.is_none(), "arc capture: the player's remainder split on axis {player_axis:?} is a literal split");
@@ -1486,13 +1466,10 @@ impl<'a, D: Domain> Interp<'a, D> {
             .collect())
     }
 
-    /// `__split_by_flr(x)` (`round`: `__split_by_round(x)` where the domain
-    /// forks at the round's own cut points): the fork at `flr` (`flr(x +
-    /// 1/2)`). The fork is a CHOICE, not a state fan-out: one node whose
-    /// value depends on the fragment (one fragment on an exact value).
-    /// Validity goes in the GUARD (fragments partition the lane); coverage
-    /// is the fork's own error (a lane spanning more values than fragments
-    /// cannot run in this body).
+    /// `__split_by_flr(x)` (`round`: `__split_by_round(x)` at the round's own
+    /// cut points): the fork at `flr`, a CHOICE, not a state fan-out (one node
+    /// whose value depends on the fragment). Validity goes in the GUARD
+    /// (fragments partition the lane); coverage is the fork's own error.
     fn split_floor(&mut self, st: State<D>, x: D::Num, player_axis: Option<usize>, round: bool) -> Result<Multi<D, Value<D>>> {
         if let Some(frags) = self.d.literal_fragments(&x, round)? {
             return self.literal_split(st, frags, player_axis);
@@ -1631,9 +1608,8 @@ impl<'a, D: Domain> Interp<'a, D> {
                 self.prints.push(text);
                 (st, Value::Nil)
             }
-            // A number's exact 16.16 bits, as PICO-8's `tostr(x, true)`
-            // prints them (`0x0000.5555`): the probe corpora's exact print
-            // (`trace::probe` registers it; the game has no such global).
+            // A number's exact 16.16 bits, as PICO-8's `tostr(x, true)` prints them
+            // (`0x0000.5555`): the probe corpora's print; the game has no such global.
             "__hex" => {
                 let Some(Value::Num(n)) = args.first() else { bail!("__hex of a non-number: {:?}", args.first()) };
                 let Some(v) = self.d.as_const(n) else { bail!("__hex of a symbolic number") };
@@ -1672,13 +1648,10 @@ impl<'a, D: Domain> Interp<'a, D> {
                     Some(SplitSite::Player(axis)) => Some(axis),
                     _ => None,
                 };
-                // `__split_by_round(v)`: the fragments of `v` on which
-                // `flr(v + 1/2)` is one integer (`move`'s pixel amount, the
-                // original cart's expression). In 16.16 `v + 1/2 - 1/2` is
-                // exact, so they are the floor fork's of `v + 1/2` shifted
-                // back, and the arc capture records the split of `v + 1/2`;
-                // elsewhere (doubles: `+ 1/2` rounds) the domain forks at the
-                // exact cut points.
+                // `__split_by_round(v)`: the fragments of `v` on which `flr(v + 1/2)` is
+                // one integer (`move`'s pixel amount). In 16.16 `v + 1/2 - 1/2` is exact,
+                // so they are the floor fork's of `v + 1/2` shifted back, and the arc
+                // capture records the split of `v + 1/2`; doubles fork at the exact cuts.
                 let round = name == "__split_by_round";
                 if !round || !D::A::ROUND_BY_SHIFTED_FLOOR {
                     return self.split_floor(st, x, player_axis, round);
@@ -1695,9 +1668,8 @@ impl<'a, D: Domain> Interp<'a, D> {
                     .collect();
             }
             "__new_unknown_boolean" => (st, Value::Bool(self.d.unknown_bool()?)),
-            // `rnd(x)`: the whole range [0, x), a sound over-approximation of
-            // an unmodelled seed; a bound that is not a positive constant is
-            // refused.
+            // `rnd(x)`: the whole range [0, x), a sound over-approximation of an
+            // unmodelled seed; a bound that is not a positive constant is refused.
             "rnd" => {
                 let x = match args.first() {
                     None => D::A::from_i16(1),
@@ -1721,9 +1693,8 @@ impl<'a, D: Domain> Interp<'a, D> {
     }
 }
 
-/// A loop body's outcomes: a `break` ends the LOOP for its state, which
-/// carries on after it, and a `return` the function (both `done`); the
-/// rest loop again (`running`).
+/// A loop body's outcomes: a `break` ends the LOOP (its state carries on
+/// after it) and a `return` the function, both `done`; the rest loop again.
 fn leave_loop<D: Domain>(outs: Outcome<D>, done: &mut Outcome<D>, running: &mut Outcome<D>) {
     for (s, fl) in outs {
         match fl {
@@ -1753,7 +1724,6 @@ enum Target<D: Domain> {
     Field(Value<D>, Key),
 }
 
-/// Does this block bind a name in its OWN statements?
 fn declares_local(block: &ast::Block) -> bool {
     block.stmts().any(|s| matches!(s, ast::Stmt::LocalAssignment(_)))
 }
@@ -1795,7 +1765,6 @@ fn unroll_bound(limit_src: &str) -> Option<u32> {
     }
 }
 
-/// An expression's source text for an error, its first 60 characters.
 fn source_text(e: &ast::Expression) -> String {
     let t = e.to_string();
     t.trim().chars().take(60).collect()
@@ -1827,7 +1796,6 @@ impl Pairing {
         Pairing { keys: (0..n).map(|i| (i, None)).collect(), same: false, same_possible: true, next: n, refused: Default::default() }
     }
 
-    /// Decide how `states` pair and compute the canons that needs.
     fn prepare<D: Domain>(&mut self, states: &[&State<D>]) -> Result<()> {
         use std::hash::{Hash, Hasher};
         self.same = self.same_possible && states.iter().skip(1).all(|s| super::state::same_heap(states[0], s));
@@ -1888,7 +1856,6 @@ mod tests {
     }
 
 
-    /// Run `src` and read back the global `result`.
     fn run<'a, D: Domain>(d: D, ast: &'a full_moon::ast::Ast) -> (Interp<'a, D>, Value<D>) {
         let mut it = Interp::new(d);
         let st = State::new(&mut it.d);

@@ -1,13 +1,9 @@
-//! The CONCRETE heap the tracer keeps while the values go symbolic.
-//!
-//! Tables, fields, lengths, closure identity and scope structure are facts
-//! at trace time; only game DATA (positions, speeds, timers, buttons) is
-//! symbolic, and nothing indexes the heap with it. Where something does,
-//! the tracer REFUSES (`domain::refuse_unknown`) rather than widening.
-//!
+//! The CONCRETE heap the tracer keeps while the values go symbolic: tables,
+//! fields, lengths, closure identity and scope structure are facts at trace
+//! time; only game DATA is symbolic, and nothing indexes the heap with it
+//! (where something does, the tracer REFUSES: `domain::refuse_unknown`).
 //! Every lexical scope is a heap object and a closure captures it by id, so
-//! writing through an upvalue needs no capture analysis: the most general
-//! model, chosen over the cheapest because the tracer runs once per shape.
+//! writing through an upvalue needs no capture analysis.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -19,8 +15,7 @@ use super::domain::Domain;
 pub type TableId = u32;
 pub type ScopeId = u32;
 pub type ClosureId = u32;
-/// Index into the interpreter's list of function bodies (the AST outlives
-/// the heap, so the heap stores an index rather than a reference).
+/// Index into the interpreter's list of function bodies.
 pub type BodyId = u32;
 
 #[derive(Clone)]
@@ -30,13 +25,11 @@ pub enum Value<D: Domain> {
     Bool(D::Bool),
     Str(Arc<str>),
     Table(TableId),
-    /// A closure: a HEAP OBJECT with identity, referred to by id, so GC
-    /// collects it and `shape`'s canonical BFS renumbers it. PICO-8 (Lua
-    /// 5.2, measured on a real PICO-8) CACHES closures: identity
-    /// is (prototype, upvalue cells), so e.g. two calls of a body with no
-    /// upvalues return the SAME closure. This model has the prototype
-    /// (`BodyId`) but approximates the cells by the enclosing scope, so `==`
-    /// on two closures is refused rather than answered (`Interp::eval_binop`).
+    /// A closure: a HEAP OBJECT with identity, referred to by id. PICO-8 (Lua
+    /// 5.2, measured) CACHES closures: identity is (prototype, upvalue cells),
+    /// so two calls of a body with no upvalues return the SAME closure. This
+    /// model approximates the cells by the enclosing scope, so `==` on two
+    /// closures is refused rather than answered.
     Func(ClosureId),
     Builtin(&'static str),
 }
@@ -73,17 +66,16 @@ impl<D: Domain> std::fmt::Debug for Value<D> {
 }
 
 /// A Lua table: a string part, an ARRAY part and an integer part, the split
-/// Lua itself has. The integer part must exist because `#` depends on it:
-/// on a real PICO-8 (`lua/probe/tables.lua`), `t={} t[3]="c"` has `#t == 0`
-/// (dense-with-nils would say 3), and `t[1]="a" t[2]="b"` then gives 3 once
-/// the array part absorbs the gap.
+/// Lua itself has. The integer part must exist because `#` depends on it: on
+/// a real PICO-8 (`lua/probe/tables.lua`), `t={} t[3]="c"` has `#t == 0`,
+/// and `t[1]="a" t[2]="b"` then gives 3 once the array part absorbs the gap.
 #[derive(Clone, Default)]
 pub struct Table<D: Domain> {
     pub hash: BTreeMap<String, Value<D>>,
     /// The array part. May contain explicit `Nil`s (Lua does not shrink it).
     pub arr: Vec<Value<D>>,
-    /// Integer keys OUTSIDE the array part - too large, or zero, or
-    /// negative. Absorbed into `arr` when an append closes the gap.
+    /// Integer keys OUTSIDE the array part, absorbed into `arr` when an append
+    /// closes the gap.
     pub ints: BTreeMap<i16, Value<D>>,
 }
 
@@ -94,14 +86,11 @@ impl<D: Domain> Table<D> {
         self.hash.values().chain(self.arr.iter()).chain(self.ints.values())
     }
 
-    /// `#t`, when this model can answer it exactly; `None` means raise.
-    ///
-    /// Lua's `luaH_getn` depends on the array part's CAPACITY (the table's
-    /// history), which this model does not track and the cart never needs.
-    /// The answer is exact when the integer part is empty and the array part
-    /// has no INTERIOR hole: the border is then the last non-nil index for
-    /// any capacity. Trailing holes are fine (`__array_table_drop_last`
-    /// leaves them, and `del` takes `#` next).
+    /// `#t`, when this model can answer it exactly; `None` means raise. Lua's
+    /// `luaH_getn` depends on the array part's CAPACITY (the table's history),
+    /// which this model does not track; the answer is exact when the integer
+    /// part is empty and the array part has no INTERIOR hole. Trailing holes are
+    /// fine (`__array_table_drop_last` leaves them, and `del` takes `#` next).
     pub fn len(&self) -> Option<usize> {
         if !self.ints.is_empty() {
             return None;
@@ -117,14 +106,11 @@ impl<D: Domain> Table<D> {
         Some(last)
     }
 
-    /// `name = v` for a GLOBAL, Lua's way: assigning nil removes the key. An
-    /// explicit `Nil` global is a structural slot to the boundary, so a
-    /// cleared global would otherwise be a different SHAPE from a never-set
-    /// one (equal game states that never dedupe).
-    ///
-    /// Globals only: an object FIELD assigned nil keeps its slot (the cart
-    /// does it to every object of a type alike, in `init_object`); removing it
-    /// would move every key, gates and trees included, for no merge.
+    /// `name = v` for a GLOBAL, Lua's way: assigning nil removes the key (an
+    /// explicit `Nil` global is a structural slot: a cleared global would be a
+    /// different SHAPE from a never-set one). Globals only: an object FIELD
+    /// assigned nil keeps its slot (the cart does it to every object of a type
+    /// alike); removing it would move every key for no merge.
     pub fn set_global(&mut self, name: String, v: Value<D>) {
         if matches!(v, Value::Nil) {
             self.hash.remove(&name);
@@ -192,23 +178,19 @@ impl<D: Domain> Heap<D> {
     }
 }
 
-/// A closure object: its function body and captured scope, both immutable;
-/// it is in the heap for its IDENTITY.
+/// A closure object: its function body and captured scope, both immutable.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Closure {
     pub body: BodyId,
     pub env: ScopeId,
     /// This function's index in `celeste_names::gen::FN_NAMES` (what
-    /// `Cell2::Clo` carries), resolved AT CREATION where the naming
-    /// declaration is in hand; nothing downstream can recover it.
-    ///
-    /// `None` is an anonymous function (the cart's are `foreach` callbacks
-    /// that never outlive their frame); one reaching a block is refused.
+    /// `Cell2::Clo` carries), resolved AT CREATION, where the naming declaration
+    /// is in hand. `None`: an anonymous function (the cart's `foreach`
+    /// callbacks), refused in a block.
     pub fn_id: Option<u32>,
     /// The names this closure CAPTURES: the free variables of its body that
-    /// resolve to a local of the defining scope. Names, not values, so the
-    /// state stays the single source of what a capture holds. The block
-    /// carries captures as key columns (`block::to_rt2`).
+    /// resolve to a local of the defining scope (names, not values: the state
+    /// holds what a capture holds).
     pub captures: Vec<String>,
 }
 
@@ -251,7 +233,6 @@ impl<D: Domain> Heap<D> {
         id
     }
 
-    /// Read a variable by walking the scope chain outward.
     pub fn lookup(&self, scope: ScopeId, name: &str) -> Option<&Value<D>> {
         let mut cur = Some(scope);
         while let Some(s) = cur {
@@ -279,7 +260,6 @@ impl<D: Domain> Heap<D> {
         false
     }
 
-    /// Declare in the innermost scope (`local x = ..`).
     pub fn declare(&mut self, scope: ScopeId, name: &str, v: Value<D>) {
         if let Some(sc) = self.scopes.get_mut(&scope) {
             sc.vars.insert(name.to_string(), v);
@@ -296,7 +276,6 @@ impl<D: Domain> Heap<D> {
         self.closures.retain(|k, _| live_c.contains(k));
     }
 
-    /// The tables, scopes and closures reachable from `roots`.
     pub fn reachable(&self, roots: &[Root]) -> (BTreeSet<TableId>, BTreeSet<ScopeId>, BTreeSet<ClosureId>) {
         let mut live: (BTreeSet<TableId>, BTreeSet<ScopeId>, BTreeSet<ClosureId>) = Default::default();
         self.visit(roots, |r| match r {
@@ -367,8 +346,7 @@ pub enum Slot {
     Bool,
     Str(String),
     Table(u32),
-    /// The CANONICAL closure number, as `Table`; its body and scope are in
-    /// `Shape::closures`.
+    /// The CANONICAL closure number, as `Table`.
     Func(u32),
     Builtin(&'static str),
 }
@@ -385,8 +363,8 @@ pub struct Shape {
 }
 
 impl<D: Domain> Heap<D> {
-    /// Canonicalize from `roots` in BFS order, so two heaps that allocated
-    /// the same structure in a different ORDER compare equal.
+    /// Canonicalize from `roots` in BFS order, so two heaps that allocated the
+    /// same structure in a different ORDER compare equal.
     pub fn shape(&self, roots: &[Root]) -> Result<Shape> {
         Ok(self.shape_and_order(roots)?.0)
     }

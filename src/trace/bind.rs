@@ -44,8 +44,7 @@ fn kind<N: EngineNum>(c: &Cell2<N>) -> &'static str {
     }
 }
 
-/// How the first root that reaches `target` does so, as a chain of ops:
-/// so an error names a path instead of a node id.
+/// How the first root that reaches `target` does so, as a chain of ops.
 fn why_reached<A: GraphArith>(
     g: &crate::transpile::graph::Graph<A>,
     roots: &[crate::transpile::graph::NodeId],
@@ -188,9 +187,8 @@ mod tests {
     use celeste_names::gen;
     use crate::trace::iface::key;
 
-    /// Rebuild a shape witness (a real boundary shape with its canonical
-    /// cell ids) as a block. Structure only: the resolver never reads a
-    /// scalar.
+    /// Rebuild a shape witness (a real boundary shape with its canonical cell
+    /// ids) as a block, structure only.
     fn block_from_witness(path: &str) -> Rt2 {
         let text = std::fs::read_to_string(path).expect("witness");
         let w: serde_json::Value = serde_json::from_str(&text).expect("json");

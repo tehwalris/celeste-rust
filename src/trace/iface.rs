@@ -1,7 +1,5 @@
 //! The tracer's BOUNDARY: which heap slots are a frame's INPUTS (in order),
-//! and how to read the same slots back out afterwards. This numbering is the
-//! tracer's own, not `celeste_names::FIELD_NAMES`.
-//!
+//! and how to read them back out afterwards (the tracer's own numbering).
 //! A slot is named by its PATH from the globals (`objects[0].spd.x`), not a
 //! table id: a frame can replace an object (death allocates a new player),
 //! and a path that no longer resolves is a shape difference.
@@ -154,10 +152,9 @@ pub struct Iface<A: GraphArith = Fixed> {
     pub slots: Vec<Path>,
     pub init: Vec<Conc<A>>,
     pub pins: Vec<(usize, Conc<A>)>,
-    /// Parallel to `slots`: a number slot holds an INTERVAL (the widened
-    /// fields; `init` still records a point), which the emitter makes an
-    /// `ival` input. A boolean slot may be unknown in a lane (a near level's
-    /// floor `collideable`), which the emitter makes a `ubool` input.
+    /// Parallel to `slots`: a number slot holds an INTERVAL (`init` still
+    /// records a point), a boolean slot may be unknown in a lane (an `ival` /
+    /// `ubool` input).
     pub ival: Vec<bool>,
 }
 

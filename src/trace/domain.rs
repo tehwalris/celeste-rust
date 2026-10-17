@@ -1,9 +1,7 @@
-//! The value domain the interpreter is generic over: `Symbolic` (`NodeId`s
-//! into a `transpile::graph::Graph`, the TRACER) here, `RefDomain`
-//! (intervals and a fork cursor, the reference engine) in `refdomain`.
-//! `decide` answers a condition NOW; on `None` the interpreter traces both
-//! arms and merges with `sel_*`. The HEAP stays concrete (`count(objects)`,
-//! `#t`, field presence are facts); only game data is symbolic.
+//! The value domain the interpreter is generic over: `Symbolic` (the
+//! TRACER: `NodeId`s into a `transpile::graph::Graph`) here, `RefDomain`
+//! (the reference engine) in `refdomain`. `decide` answers a condition NOW;
+//! on `None` the interpreter traces both arms and merges with `sel_*`.
 
 use std::fmt::Debug;
 
@@ -114,7 +112,7 @@ pub enum ForkKind {
 }
 
 /// The origin of the forks `Domain::unknown_bool` mints: the six buttons, in
-/// `__reset_button_states`' order (how `verify`'s tests find them).
+/// `__reset_button_states`' order.
 pub const UNKNOWN_BOOL_ORIGIN: &str = "__new_unknown_boolean";
 
 /// HOW a fork partitions its value's set into configurations.
@@ -165,14 +163,12 @@ pub struct Fork {
 }
 
 pub trait Domain: Clone + Default {
-    /// The game's arithmetic (`celeste_core::arith`): what a literal, a
-    /// constant and every operation on numbers mean.
+    /// The game's arithmetic (`celeste_core::arith`).
     type A: Arithmetic;
     type Num: Clone + Debug + PartialEq;
     type Bool: Clone + Debug + PartialEq;
 
     fn num(&mut self, v: <Self::A as Arithmetic>::Num) -> Self::Num;
-    /// The whole number `k`.
     fn int(&mut self, k: i16) -> Self::Num {
         self.num(Self::A::from_i16(k))
     }
@@ -221,7 +217,6 @@ pub trait Domain: Clone + Default {
     /// A number known only to lie in `[lo, hi]` (`rnd`).
     fn range_num(&mut self, lo: <Self::A as Arithmetic>::Num, hi: <Self::A as Arithmetic>::Num) -> Result<Self::Num>;
 
-    /// How much graph there is, for the tracer's budget check.
     fn node_count(&self) -> usize {
         0
     }
@@ -233,8 +228,7 @@ pub trait Domain: Clone + Default {
     /// What this number IS, for a message: its value where known.
     fn describe(&self, v: &Self::Num) -> String;
 
-    /// Is this value an INTERVAL (a set of numbers)? Forking a single number
-    /// buys nothing.
+    /// Is this value an INTERVAL (a set of numbers)?
     fn is_interval(&self, _v: &Self::Num) -> bool {
         false
     }
@@ -247,19 +241,16 @@ pub trait Domain: Clone + Default {
     }
 
     /// Fork at `flr` (`__split_by_flr`): `flr` of an interval is not a
-    /// function, so the fragment is a choice of arity `ways`, enumerated by
-    /// specialization. Returns the restricted value and which lanes fall in
-    /// it; the identity on exact values.
+    /// function, so the fragment is a choice of arity `ways`. Returns the
+    /// restricted value and which lanes fall in it; the identity on exact values.
     fn fork_flr(&mut self, v: &Self::Num, _ways: u8) -> (Self::Num, Self::Bool) {
         (v.clone(), self.boolean(true))
     }
 
-    /// Fork at `flr(x + 1/2)` (`__split_by_round`) in an arithmetic where
-    /// the fragments are NOT the floor fork's of `x + 1/2` shifted back
-    /// (`Float`: `x + 1/2 - 1/2` rounds): `fork_flr`'s twin, at the exact
-    /// cut points (`Arithmetic::round_fragment`). The restricted value and
-    /// which lanes fall in it; called on intervals only (`is_interval`).
-    /// 16.16 shifts instead (`Interp`), exactly.
+    /// Fork at `flr(x + 1/2)` (`__split_by_round`) where the fragments are NOT
+    /// the floor fork's of `x + 1/2` shifted back (doubles: `x + 1/2 - 1/2`
+    /// rounds; 16.16 shifts instead, in `Interp`): `fork_flr`'s twin, at the
+    /// exact cut points. Called on intervals only.
     fn fork_round(&mut self, v: &Self::Num, _ways: u8) -> Result<(Self::Num, Self::Bool)> {
         bail!("__split_by_round of {v:?}: this domain has no exact round fork")
     }
@@ -305,10 +296,9 @@ pub trait Domain: Clone + Default {
         false
     }
 
-    /// The next comparisons read a COUNTDOWN (the interpreter's hint, from
-    /// the field read: `widen::countdown_fields`): an unknown number there mints a
-    /// countdown atom (`Symbolic::countdown_atom`) also with the fly fruit
-    /// unknown, where an unknown number may be the fruit's.
+    /// The next comparisons read a COUNTDOWN (the interpreter's hint,
+    /// `widen::countdown_fields`): an unknown number there mints a countdown
+    /// atom also with the fly fruit unknown, where it may be the fruit's.
     fn set_countdown_hint(&mut self, _on: bool) {}
 
     /// `__split_by_flr` of a literal interval: its integer fragments, run as
@@ -353,16 +343,13 @@ fn is_countdown_atom(k: u32) -> bool {
 const ESCAPE_ATOMS: usize = 6;
 
 /// THE overflow error of the tracer's constant folding (`Symbolic::arith`):
-/// the operation that left the arithmetic's range. The game never
-/// overflows, so one is a modelling surprise, never a wrapped value (the
-/// reference engine's is `refdomain`'s).
+/// the game never overflows, so one is a modelling surprise, never a
+/// wrapped value.
 fn overflow<A: Arithmetic>(what: String) -> anyhow::Error {
     anyhow::anyhow!("arithmetic overflow: {what} leaves {}", A::RANGE_NOTE)
 }
 
-/// `op` of two constants: the exact result; one past the arithmetic's
-/// range (where PICO-8 wraps or saturates, or a double is not finite) is
-/// an error (`overflow`).
+/// `op` of two constants: the exact result, or `overflow`.
 fn fold_arith<A: Arithmetic>(op: Arith, a: A::Num, b: A::Num) -> Result<A::Num> {
     let (r, sym) = match op {
         Arith::Add => (A::add(a, b), "+"),
@@ -401,25 +388,21 @@ fn fold_compare<A: Arithmetic>(op: Cmp, a: A::Num, b: A::Num) -> bool {
     }
 }
 
-/// The tracing domain. Owns the graph it is building, in the arithmetic `A`
-/// (16.16 by default).
+/// The tracing domain. Owns the graph it is building.
 #[derive(Default, Clone)]
 pub struct Symbolic<A: GraphArith = Fixed> {
     pub graph: Graph<A>,
-    /// `--build-trace`: the tracer's progress lines (`trace::frame`, `trace::split`).
+    /// `--build-trace`: the tracer's progress lines.
     pub build_trace: bool,
     /// FORK choices handed out this frame (the fork ids), buttons included.
     pub forks: u8,
     /// `flr_ways` takes a static range's full width (level -1, whose speed
     /// is a range at every node).
     pub uncapped_ways: bool,
-    /// The level traced (`widening::TABLE`'s entries it applies, in and
-    /// out). With the fly fruit unknown, literal arithmetic folds and
-    /// undecidable merges join literal arms.
+    /// The level traced (`widening::TABLE`'s entries it applies, in and out).
     pub level: celeste_engine::widening::Level,
     /// How many `Op::UnknownBool` atoms this frame handed out.
     pub unknown_atoms: u32,
-    /// `Domain::set_countdown_hint`.
     countdown_hint: bool,
     /// `escaped_atom`'s memo, cleared with `unknown_atoms` (ids restart).
     pub escaped: rustc_hash::FxHashMap<NodeId, NodeId>,
@@ -435,9 +418,8 @@ pub struct Symbolic<A: GraphArith = Fixed> {
     pub worlds: Option<std::sync::Arc<crate::concrete::PlatformWorlds<A>>>,
     /// This frame's platforms' `x` input cells, in the worlds' order.
     pub platform_cells: Vec<NodeId>,
-    /// This frame's inputs the hooks declare INTEGER-valued on every lane
-    /// (a platform's `x`: an integer in every world, `concrete::platform_worlds`
-    /// checks), for `cancel_sub` in an arithmetic whose addition rounds.
+    /// This frame's inputs the hooks declare INTEGER-valued on every lane (a
+    /// platform's `x`), for `cancel_sub` where addition rounds.
     pub integral_inputs: rustc_hash::FxHashSet<NodeId>,
     /// `lane_independent`'s memo (whether a lane's data reaches a node);
     /// structural, so it outlives a frame.
@@ -447,7 +429,7 @@ pub struct Symbolic<A: GraphArith = Fixed> {
     /// The input cells THIS trace refuses merges on, sorted
     /// (`frame::trace_frame`'s `merge_refused_on`; set by every trace).
     merge_refused: Vec<u32>,
-    /// `reads_merge_refused`'s memo, for `merge_refused`.
+    /// `reads_merge_refused`'s memo.
     merge_refused_memo: rustc_hash::FxHashMap<NodeId, bool>,
     /// Fork choices handed out THIS FRAME by `(value, kind)`: a second fork
     /// of one value reuses the first's choice instead of an empty dimension.
@@ -465,20 +447,17 @@ pub struct Symbolic<A: GraphArith = Fixed> {
     beneath_memo: std::cell::RefCell<rustc_hash::FxHashMap<NodeId, bool>>,
     /// `may_answers`'s memo: `(may_true, may_false)`.
     may_memo: std::cell::RefCell<rustc_hash::FxHashMap<NodeId, (NodeId, NodeId)>>,
-    /// The frame's INPUT ASSUMPTIONS, in the order made: `Op::Restrict`
-    /// (`restrict`: a bounded input, the only source of a static range - no
-    /// cell is seeded with one) and `Op::Pin` (`pin`: an input the body reads
-    /// as a constant). Each is charged to every outcome (`trace::error`).
-    /// Per frame.
+    /// The frame's INPUT ASSUMPTIONS, in the order made: `Op::Restrict` (a
+    /// bounded input, the only source of a static range) and `Op::Pin` (an input
+    /// the body reads as a constant), each charged to every outcome.
     pub assumptions: Vec<NodeId>,
-    /// `range_of`'s memo; a comparison the ranges decide folds.
+    /// `range_of`'s memo.
     range_memo: std::collections::HashMap<NodeId, Option<A::Pieces>>,
 }
 
 pub use crate::transpile::garith::Pieces;
 
 impl<A: GraphArith> Symbolic<A> {
-    /// The input cells this trace refuses merges on (`reads_merge_refused`).
     pub fn set_merge_refused(&mut self, mut cells: Vec<u32>) {
         cells.sort_unstable();
         cells.dedup();
@@ -486,7 +465,6 @@ impl<A: GraphArith> Symbolic<A> {
         self.merge_refused_memo.clear();
     }
 
-    /// Forget the static ranges (a new frame, new cells).
     pub fn clear_ranges(&mut self) {
         self.assumptions.clear();
         self.range_memo.clear();
@@ -500,13 +478,10 @@ impl<A: GraphArith> Symbolic<A> {
         self.may_memo.get_mut().clear();
     }
 
-    /// THE FORK TRIGGER: can ONE LANE hold this condition both ways? Not
-    /// whether it denotes a set: a set-valued quantity may still be one value
-    /// per lane.
-    /// `TileFlagAt`/`Mget` are lane-decidable by instruction; `Flr` by
-    /// assertion (`zi_flr_ok`, its own error, not a type fact, so
-    /// `Known(Flr(..))` must not fold away). Exhaustive over `Op`: no
-    /// catch-all to hide the next undecidable op.
+    /// THE FORK TRIGGER: can ONE LANE hold this condition both ways? (Not
+    /// whether it denotes a set: a set may still be one value per lane.)
+    /// `TileFlagAt`/`Mget` are lane-decidable by instruction; `Flr` by assertion
+    /// (`zi_flr_ok`, its own error, so `Known(Flr(..))` must not fold away).
     pub fn lane_undecidable(&self, b: NodeId) -> bool {
         fn go<A: GraphArith>(d: &Symbolic<A>, memo: &mut rustc_hash::FxHashMap<NodeId, bool>, n: NodeId) -> bool {
             if let Some(x) = memo.get(&n) {
@@ -525,7 +500,6 @@ impl<A: GraphArith> Symbolic<A> {
                 Op::TileFlagAt | Op::Mget => false,
                 // Lane-decidable by assertion (`own_error`, not a type fact).
                 Op::Flr => false,
-                // A mask query.
                 Op::Known => false,
                 // Validity/coverage masks: per-lane comparisons.
                 Op::SplitValid(_) | Op::SplitOk(_) | Op::FragOk(_) | Op::NoWrap => false,
@@ -533,7 +507,6 @@ impl<A: GraphArith> Symbolic<A> {
                 // A pin's check on the raw input.
                 Op::Same => false,
                 Op::ConstBool(_) => false,
-                // Not a condition.
                 _ => false,
             };
             memo.insert(n, r);
@@ -543,8 +516,8 @@ impl<A: GraphArith> Symbolic<A> {
     }
 
     /// Does `n` denote a SET of values, judged STOPPING at operators a lane
-    /// decides itself (`Flr`, `TileFlagAt`, `Mget`)? How comparison operands
-    /// are judged, without spurious forks.
+    /// decides itself (`Flr`, `TileFlagAt`, `Mget`)? How comparison operands are
+    /// judged, without spurious forks.
     pub fn abstract_beneath_lane_ops(&self, n: NodeId) -> bool {
         fn go<A: GraphArith>(d: &Symbolic<A>, memo: &mut rustc_hash::FxHashMap<NodeId, bool>, n: NodeId) -> bool {
             if let Some(x) = memo.get(&n) {
@@ -574,28 +547,25 @@ impl<A: GraphArith> Symbolic<A> {
         go(self, &mut self.beneath_memo.borrow_mut(), n)
     }
 
-    /// The static range of `n` (`GraphArith::pieces_of`: from the restrictions).
+    /// The static range of `n`, from the restrictions.
     pub fn range_of(&mut self, n: NodeId) -> Option<A::Pieces> {
         A::pieces_of(&self.graph, &mut self.range_memo, n)
     }
 
-    /// Do the static ranges put every value of `n`'s EXACT result inside
-    /// the 16.16 range? Computed in i64, unwrapped and unsaturated
-    /// (`graph::pieces_of`), so a result past it is unknown, not wrapped:
-    /// false. Where true, `n` cannot overflow (`trace::error`).
+    /// Do the static ranges put every value of `n`'s EXACT result inside the
+    /// arithmetic's range (computed unwrapped: a result past it is unknown)?
+    /// Where true, `n` cannot overflow.
     pub fn bounded(&mut self, n: NodeId) -> bool {
         self.range_of(n).is_some_and(|pieces| A::bounded(&pieces))
     }
 
     /// Does anything give this frame a static range (a restriction)?
-    /// Without, no comparison is decided by one.
     fn has_ranges(&self) -> bool {
         self.assumptions.iter().any(|a| matches!(self.graph.get(*a).op, Op::Restrict(..)))
     }
 
     /// THE RANGE ASSUMPTION: `x` restricted to `[lo, hi]` (`Op::Restrict`),
-    /// recorded so its own error is charged to every outcome. Its value is
-    /// `x`'s, passed through with the range attached: read it in `x`'s place.
+    /// its own error charged to every outcome. Read it in `x`'s place.
     pub fn restrict(&mut self, x: NodeId, lo: A::Lit, hi: A::Lit) -> NodeId {
         let r = self.graph.add(Op::Restrict(lo, hi), vec![x]);
         if !self.assumptions.contains(&r) {
@@ -604,10 +574,9 @@ impl<A: GraphArith> Symbolic<A> {
         r
     }
 
-    /// THE PIN: the input `x` lies in the constant `c` (`Op::Pin`), recorded
-    /// so its check is charged to the frame. It has no data output: the
-    /// caller makes every use of the input read the constant instead, so `x`
-    /// feeds this check alone.
+    /// THE PIN: the input `x` lies in the constant `c` (`Op::Pin`), its check
+    /// charged to the frame. No data output: the caller makes every use of the
+    /// input read the constant.
     pub fn pin(&mut self, x: NodeId, c: crate::transpile::graph::Pinned<A>) {
         let p = self.graph.add(Op::Pin(c), vec![x]);
         if !self.assumptions.contains(&p) {
@@ -615,7 +584,6 @@ impl<A: GraphArith> Symbolic<A> {
         }
     }
 
-    /// The unknown number (`Op::UnknownNum`).
     pub fn unknown_num(&mut self) -> NodeId {
         self.graph.leaf(Op::UnknownNum)
     }
@@ -625,9 +593,9 @@ impl<A: GraphArith> Symbolic<A> {
     }
 
     /// `n` as `Sel(c, t, f)` with an arm the unknown number (a countdown reset
-    /// on some lanes). Operations distribute over the arms, so the unknown is
-    /// never a graph arithmetic operand (no kernel computes that). EXACT:
-    /// `op(Sel(c, t, f)) = Sel(c, op(t), op(f))`, same error.
+    /// on some lanes), so operations distribute over the arms and the unknown is
+    /// never an arithmetic operand. EXACT: `op(Sel(c, t, f)) = Sel(c, op(t),
+    /// op(f))`, same error.
     fn unknown_select(&self, n: NodeId) -> Option<(NodeId, NodeId, NodeId)> {
         fn holds<A: GraphArith>(g: &Graph<A>, n: NodeId) -> bool {
             let node = g.get(n);
@@ -662,12 +630,9 @@ impl<A: GraphArith> Symbolic<A> {
     }
 
     /// For boolean `n`: where a lane CAN answer true, and where false (a
-    /// cover). Comparisons read operand ends (`a < b` may hold iff `lo(a) <
-    /// hi(b)`), lane-decided nodes give `(n, not n)`, connectives combine.
-    /// Judged by `lane_undecidable`, THE SAME PREDICATE THAT DECIDES WHAT TO
-    /// FORK: this is a fork's validity, so the two must agree.
+    /// cover). Judged by `lane_undecidable`, THE SAME PREDICATE THAT DECIDES WHAT
+    /// TO FORK: this is a fork's validity, so the two must agree.
     pub fn may_answers(&mut self, n: NodeId) -> (NodeId, NodeId) {
-        // Memoised: a DAG, re-walked per path otherwise.
         if let Some(hit) = self.may_memo.borrow().get(&n) {
             return *hit;
         }
@@ -698,12 +663,10 @@ impl<A: GraphArith> Symbolic<A> {
                 };
                 (self.graph.fold(t, vec![ta, tb]), self.graph.fold(f, vec![fa, fb]))
             }
-            // `a == b` may hold iff the ranges meet, and fail iff they are not
-            // one single number. Only where neither operand reads an unknown
-            // (`Op::UnknownNum`/`UnknownBool`), so `Lo`/`Hi` are an interval
-            // number's ends: judged per node, not per frame (with the fly
-            // fruit unknown, an exact hidden floor's `state == 2` went both
-            // ways, a coverage gap).
+            // `a == b` may hold iff the ranges meet, and fail iff they are not one
+            // number. Only where neither operand reads an unknown, so `Lo`/`Hi` are an
+            // interval's ends: judged per node, not per frame (else, with the fly
+            // fruit unknown, an exact hidden floor's `state == 2` goes both ways).
             Op::Eq if !self.reads_unknown(&args) => {
                 let (alo, ahi) = (self.graph.fold(Op::Lo, vec![args[0]]), self.graph.fold(Op::Hi, vec![args[0]]));
                 let (blo, bhi) = (self.graph.fold(Op::Lo, vec![args[1]]), self.graph.fold(Op::Hi, vec![args[1]]));
@@ -731,12 +694,11 @@ impl<A: GraphArith> Symbolic<A> {
         self.graph.cone(ns).into_iter().any(|n| matches!(self.graph.get(n).op, Op::UnknownNum | Op::UnknownBool(_)))
     }
 
-    /// `a - r` where `a` is `r + c`: `c` EXACTLY, also under a select's
-    /// arms (a platform's `x - last`). Here, not in `Graph::fold`: over
-    /// ranges `(r + c) - r` evaluates wider, and `fold` must agree with the
-    /// evaluator. Only where the static ranges bound the sum: `r + c` that
-    /// overflows is an error, which the cancelled form would no longer read.
-    /// `None` where nothing cancels.
+    /// `a - r` where `a` is `r + c`: `c` EXACTLY, also under a select's arms
+    /// (a platform's `x - last`). Not in `Graph::fold`: over ranges `(r + c) -
+    /// r` evaluates wider, and `fold` must agree with the evaluator. Only where
+    /// the static ranges bound the sum (an overflowing `r + c` is an error the
+    /// cancelled form would no longer read).
     fn cancel_sub(&mut self, a: NodeId, r: NodeId) -> Result<Option<NodeId>> {
         // `x - x` is 0 exactly in either arithmetic (a double's is `+0`).
         if a == r {
@@ -768,15 +730,12 @@ impl<A: GraphArith> Symbolic<A> {
         }
     }
 
-    /// Does `sum - r` lie in `c` on every lane, `sum` being `r + c`? Where
-    /// the static ranges bound the sum, and the arithmetic's addition is
-    /// exact (16.16); or `r` is an integer (`integral`), the sum's magnitude
-    /// is below 2^53 (where every integer is a double), and `c` is an
-    /// integer too (the sum is exact, so the difference is `c`) or a literal
-    /// whose ends are integers (a move's rejoined fragments, `[0, 1]`: `fl`
+    /// Does `sum - r` lie in `c` on every lane, `sum` being `r + c`? Where the
+    /// ranges bound the sum and addition is exact (16.16); or `r` is an integer,
+    /// the sum is below 2^53 in magnitude, and `c` is an integer (the sum is
+    /// exact) or a literal with integer ends (a move's rejoined fragments: `fl`
     /// is monotone and exact at the ends, so the difference lies in the
-    /// literal, which stands for every value in it). A platform's `x -
-    /// last`: its `x` plus its move.
+    /// literal).
     fn exact_sum(&mut self, sum: NodeId, r: NodeId, c: NodeId) -> bool {
         if !self.bounded(sum) {
             return false;
@@ -795,10 +754,9 @@ impl<A: GraphArith> Symbolic<A> {
     }
 
     /// Is `n` an integer on every lane? A whole literal, a floor, an integer
-    /// fork's fragment, an input a hook declares integral
-    /// (`integral_inputs`), and sums, differences, negations, `abs`, `min`,
-    /// `max` and selects of those (a double past 2^52 is an integer, so a
-    /// rounded sum of integers is one too). Structural; `false` if unsure.
+    /// fork's fragment, an input a hook declares integral, and sums,
+    /// differences, negations, `abs`, `min`, `max` and selects of those (a
+    /// rounded sum of integers is an integer). Structural; `false` if unsure.
     fn integral(&self, n: NodeId, depth: u32) -> bool {
         if depth > 32 {
             return false;
@@ -819,10 +777,9 @@ impl<A: GraphArith> Symbolic<A> {
     }
 
     /// `a + r` where `a` is `x - r`: `x` EXACTLY, where addition is exact
-    /// (16.16; a double's `(x - r) + r` rounds) and the static ranges bound
-    /// `x - r`, so the cancelled sum overflowed nowhere (`x - r` keeps its
-    /// own check wherever else it is read). `move` reads `flr(rem + 0.5)` of
-    /// `__split_by_round`'s fragment, itself `x - 0.5` in 16.16.
+    /// (16.16) and the ranges bound `x - r`, so the cancelled sum overflowed
+    /// nowhere. `move` reads `flr(rem + 0.5)` of `__split_by_round`'s fragment,
+    /// itself `x - 0.5` in 16.16.
     fn cancel_add(&mut self, a: NodeId, r: NodeId) -> Option<NodeId> {
         if !A::EXACT_ADDITION {
             return None;
@@ -848,16 +805,13 @@ impl<A: GraphArith> Symbolic<A> {
         self.graph.fold(Op::Gt, vec![f.value, zero])
     }
 
-    /// Forget this frame's fork choices (beside `forks = 0` and
-    /// `Graph::reset_forks`).
+    /// Forget this frame's fork choices.
     pub fn clear_fork_memo(&mut self) {
         self.fork_memo.clear();
     }
 
     /// THE fork: partition `v`'s set, mint a choice dimension, and hand back
     /// this configuration's piece and its lanes. Every fork comes through here.
-    /// Partition op families must stay distinct: `specialize` resolves
-    /// `Split` to `Frag` and `SplitInt` to `IntFrag`.
     fn fork(&mut self, v: &NodeId, p: Partition, origin: &str) -> Fork {
         let kind = p.kind();
         // Already forked this value this frame (hash-consed)? Reuse the choice.
@@ -936,15 +890,11 @@ impl<A: GraphArith> Symbolic<A> {
     }
 
     /// A COUNTDOWN's atom: a comparison of the unknown number where it is a
-    /// countdown (a near level's floor `delay`, balloon `timer`, spring
-    /// timers): every comparison of it without the fly fruit unknown, one
-    /// the interpreter hints at (`set_countdown_hint`) with it. It stays
-    /// THREE-VALUED wherever the set has other unknowns too (the platforms):
-    /// decided per lane where it is read and split by the split pass, as at
-    /// a near level alone - never a merge refusal (`reads_unknown_atom`) or
-    /// an escape fork (`escaped_atom`), under which every fall floor's
-    /// `delay <= 0` made two successors that never merged (12 floors: 2^13
-    /// trace states).
+    /// countdown (a near level's floor `delay`, balloon `timer`, spring timers).
+    /// It stays THREE-VALUED wherever the set has other unknowns too: decided
+    /// per lane where read and split by the split pass - never a merge refusal
+    /// or an escape fork, under which every fall floor's `delay <= 0` made two
+    /// successors that never merged (12 floors: 2^13 trace states).
     fn countdown_atom(&mut self) -> NodeId {
         let k = self.unknown_atoms;
         self.unknown_atoms += 1;
@@ -992,11 +942,10 @@ impl<A: GraphArith> Symbolic<A> {
     }
 
     /// The steps every operation on `args` takes first, in order: constants
-    /// fold (`point`), so what the heap depends on stays concrete; the
-    /// unknown number makes `unknown`; and an operand selecting the unknown
-    /// number on some lanes (`unknown_select`, the first operand first)
-    /// distributes the operation (`again`) over its arms, exactly: `op(Sel(c,
-    /// t, f)) = Sel(c, op(t), op(f))`, same error. `None` where none applies.
+    /// fold, so what the heap depends on stays concrete; the unknown number
+    /// makes `unknown`; an operand selecting the unknown number on some lanes
+    /// distributes the operation over its arms (`unknown_select`). `None` where
+    /// none applies.
     fn prologue(
         &mut self,
         args: &[NodeId],
@@ -1027,7 +976,6 @@ impl<A: GraphArith> Symbolic<A> {
         let l = A::lit(v);
         self.graph.leaf(Op::Const(l, l))
     }
-    /// The constant a node is, if it is one.
     fn as_point(&self, n: NodeId) -> Option<A::Num> {
         match self.graph.get(n).op {
             Op::Const(lo, hi) if lo == hi => Some(A::from_lit(lo)),
@@ -1075,8 +1023,7 @@ impl<A: GraphArith> Domain for Symbolic<A> {
         if let Some(n) = self.prologue(&[*a], |d, x| Ok(d.konst(fold_fun1::<A>(f, x[0])?)), unknown, |d, x| d.fun1(f, &x[0]))? {
             return Ok(n);
         }
-        // `sin` of an interval is [-1, 1]: the emitter cannot lower `Sin`
-        // over a ZI.
+        // `sin` of an interval is [-1, 1]: the emitter cannot lower `Sin` over a ZI.
         if matches!(f, Fun1::Sin) && self.is_interval(a) {
             let lo = self.konst(A::from_i16(-1));
             let hi = self.konst(A::from_i16(1));
@@ -1164,10 +1111,9 @@ impl<A: GraphArith> Domain for Symbolic<A> {
     fn node_count(&self) -> usize {
         self.graph.len()
     }
-    /// Is this value an interval? A type rule, not a cone query, and the same
-    /// rule as `lower`'s `Repr::wide` (a select is one when an ARM is; `flr`
-    /// and cart lookups never are), or lowering fails ("wants a ZN but the
-    /// graph computes a ZI").
+    /// Is this value an interval? A type rule, the same as `lower`'s
+    /// `Repr::wide` (a select is one when an ARM is; `flr` and cart lookups
+    /// never are), or lowering fails.
     fn is_interval(&self, v: &NodeId) -> bool {
         fn go<A: GraphArith>(g: &Graph<A>, ival: &std::collections::BTreeSet<u32>, memo: &mut rustc_hash::FxHashMap<NodeId, bool>, n: NodeId) -> bool {
             if let Some(b) = memo.get(&n) {
@@ -1233,15 +1179,13 @@ impl<A: GraphArith> Domain for Symbolic<A> {
     }
 
     fn flr_ways(&mut self, v: &NodeId) -> u8 {
-        // Only restrictions know a static range; otherwise
-        // the fixed arity.
+        // Only restrictions know a static range.
         if !self.has_ranges() {
             return MOVE_WAYS;
         }
-        // At most `MOVE_WAYS`: the static range covers ALL lanes, but one
-        // lane spans at most that many floors (too small declines via
-        // `SplitOk`). Level -1 (`uncapped_ways`) takes the HULL: its lanes
-        // are ranges.
+        // At most `MOVE_WAYS`: the static range covers ALL lanes, but one lane
+        // spans at most that many floors (too small declines via `SplitOk`). Level
+        // -1 takes the HULL: its lanes are ranges.
         match self.range_of(*v) {
             Some(ps) => {
                 let w = A::floors_spanned(&ps, self.uncapped_ways);
@@ -1400,9 +1344,8 @@ impl<A: GraphArith> Domain for Symbolic<A> {
             return Ok(None);
         }
         // On the INTEGERS: a fragment need only make `flr` (`flr(v + 1/2)`)
-        // exact, and they rejoin into one hull (`move` reads it only via its
-        // floor and a linear `rem - 0.5 - amount`). The arithmetic's own
-        // fragments, the fork's (`Arithmetic::floor_fragment`, `round_fragment`).
+        // exact, and they rejoin into one hull (`move` reads it only via its floor
+        // and a linear `rem - 0.5 - amount`).
         let iv = A::ival(A::from_lit(lo), A::from_lit(hi));
         let what = if round { "__split_by_round" } else { "__split_by_flr" };
         let show = || format!("[{}, {}]", A::show(A::from_lit(lo)), A::show(A::from_lit(hi)));
@@ -1444,9 +1387,8 @@ impl<A: GraphArith> Domain for Symbolic<A> {
 }
 
 /// Does a node of `n`'s cone satisfy `leaf`? `leaf` decides a node it
-/// answers for (not looked beneath); every other node is its operands' OR,
-/// an operand-free one `false`. Post-order and memoized in `memo`: a
-/// frame's conditions share their cones.
+/// answers for; every other node is its operands' OR (an operand-free one
+/// `false`). Memoized in `memo`: a frame's conditions share their cones.
 fn cone_any<A: GraphArith>(g: &Graph<A>, memo: &mut rustc_hash::FxHashMap<NodeId, bool>, n: NodeId, leaf: impl Fn(&Op<A>) -> Option<bool>) -> bool {
     let mut stack: Vec<(NodeId, bool)> = vec![(n, false)];
     while let Some((x, expanded)) = stack.pop() {
@@ -1497,11 +1439,10 @@ mod tests {
     }
 
     /// THE ROUND FORK (doubles): `rem + ox` of an interval remainder, forked
-    /// at `flr(x + 1/2)`, resolves per configuration to the reference
-    /// engine's fragment (`LuaF64Interval::round_fragment`) bit for bit,
-    /// valid exactly where the reference has that many, and its own
-    /// coverage (`RSplitOk`) says whether a lane takes at most `ways`
-    /// values. Around the cut below 1, where `0.5 - 2^-54 + 0.5` rounds up.
+    /// at `flr(x + 1/2)`, resolves per configuration to the reference engine's
+    /// fragment bit for bit, valid exactly where the reference has that many,
+    /// and `RSplitOk` says whether a lane takes at most `ways` values. Around
+    /// the cut below 1, where `0.5 - 2^-54 + 0.5` rounds up.
     #[test]
     fn a_round_fork_resolves_to_the_reference_fragments() {
         use crate::transpile::graph::{CellKind, Val, OPEN};
@@ -1666,8 +1607,8 @@ mod tests {
 
     /// `x == k` on an interval `x` may be true where `k` is in `x` and false
     /// where `x` is not exactly `k` (`[0, 2]`, `[1, 1]`, `[0, 0]` vs `k = 1`),
-    /// also with the fly fruit unknown elsewhere in the frame (a hidden near
-    /// floor's exact `state == 2` was "both ways" there: room (3,0) `r0sxhfn`).
+    /// also with the fly fruit unknown elsewhere in the frame (room (3,0)
+    /// `r0sxhfn`'s hidden near floor).
     #[test]
     fn an_equality_on_an_interval_may_answer_as_its_ends_allow() {
         use crate::transpile::graph::Val;

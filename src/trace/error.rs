@@ -1,37 +1,33 @@
 //! ERROR, derived from the operators (plans/architecture.md, "Error is
-//! derived, never carried", has the table of own errors). An operator whose
+//! derived, never carried", has the table of own errors): an operator whose
 //! input has error has error, and an operator the kernel computes only
 //! partially adds an own error (`own_error`). An outcome's error is that of
-//! what it stores, of its guard and of its transfer roots; nothing carries
-//! error while the frame is traced, so an obligation of a value nothing
-//! reads contributes nothing.
+//! what it stores, of its guard and of its transfer roots, so an obligation
+//! of a value nothing reads contributes nothing.
 //!
 //! AN OWN ERROR HOLDS WHERE ITS OPERATOR IS EVALUATED. The kernel computes
 //! every node on every lane, but off the tracer's path a node's operands are
 //! whatever the other path left (a `move` fork's operand spans three floors
 //! on a lane that dashed the other way). So a source's error is `own and
-//! at`, `at` the OR of the path guards it was evaluated under
-//! (`Symbolic::evaluated`); without a recorded site `at` is true, so it
-//! declines rather than drops.
+//! at`, `at` the OR of the path guards it was evaluated under; without a
+//! recorded site `at` is true, so it declines rather than drops.
 //!
 //! A RESTRICTION's own error is charged to EVERY outcome of the frame: a
 //! comparison its range decided folded to a constant that no longer reads
-//! it, so reachability cannot see the use. It reads only the raw input,
-//! which nothing seeds, so no fold removes it. A PIN has no data output
-//! (every use of its input reads the constant): its check is the frame's own
-//! (`pins_hold`), ORed into every outcome's error by `frame::trace_frame`.
-//! A fork's VALIDITY (`SplitValid*`) owns nothing: a row that does not read
-//! a fragment's value is the right row for an unenumerated part too.
+//! it, so reachability cannot see the use (it reads only the raw input,
+//! which nothing seeds, so no fold removes it). A PIN has no data output:
+//! its check is the frame's own (`pins_hold`), ORed into every outcome's
+//! error. A fork's VALIDITY owns nothing: a row that does not read a
+//! fragment's value is the right row for an unenumerated part too.
 
 use crate::transpile::graph::{NodeId, Op};
 
 use super::domain::Symbolic;
 use crate::transpile::garith::GraphArith;
 
-/// Every PIN of the frame holds (`Symbolic::pin`, in the order made): the
-/// conjunction of `x` inside `c` on the raw inputs; `true` without pins. Its
-/// negation is an error of the whole frame, never a guard: a disagreeing lane
-/// is real and must decline loudly.
+/// Every PIN of the frame holds: the conjunction of `x` inside `c` on the
+/// raw inputs. Its negation is an error of the whole frame, never a guard: a
+/// disagreeing lane is real and must decline loudly.
 pub fn pins_hold<A: GraphArith>(d: &mut Symbolic<A>) -> NodeId {
     use crate::transpile::graph::Pinned;
     let pins: Vec<(NodeId, Pinned<A>)> = d
@@ -49,9 +45,8 @@ pub fn pins_hold<A: GraphArith>(d: &mut Symbolic<A>) -> NodeId {
                 let k = d.graph.leaf(Op::Const(v, v));
                 d.graph.fold(if A::EQ_IS_IDENTITY { Op::Eq } else { Op::Same }, vec![x, k])
             }
-            // Inside a literal interval (`widen::pin_literal`: the body reads
-            // the literal, the input disconnected): both ends, on the raw
-            // input, by value (a double's `-0` lies in a range from `-1/2`).
+            // Inside a literal interval: both ends, on the raw input, by value (a
+            // double's `-0` lies in a range from `-1/2`).
             Pinned::Num(lo, hi) => {
                 let (klo, khi) = (d.graph.leaf(Op::Const(lo, lo)), d.graph.leaf(Op::Const(hi, hi)));
                 let (xlo, xhi) = (d.graph.fold(Op::Lo, vec![x]), d.graph.fold(Op::Hi, vec![x]));
@@ -73,21 +68,17 @@ pub fn of<A: GraphArith>(d: &mut Symbolic<A>, roots: &[NodeId]) -> NodeId {
 }
 
 /// The error of each outcome's values: the OR, over every operator with an
-/// own error that they reach, of `own and at` (the module doc). The
-/// conditions those operators were evaluated under are read too, so a
-/// source THEY reach counts as well.
-///
-/// One bottom-up pass for all outcomes: each node's set of sources below it,
-/// interned (most nodes share their operands' set). A cone walk per outcome
-/// would be outcomes x graph.
+/// own error that they reach, of `own and at`; the conditions those
+/// operators were evaluated under are read too. One bottom-up pass for all
+/// outcomes: each node's set of sources below it, interned (a cone walk per
+/// outcome would be outcomes x graph).
 pub fn for_outcomes<A: GraphArith>(d: &mut Symbolic<A>, outcomes: &[Vec<NodeId>]) -> Vec<NodeId> {
     let sites: Vec<NodeId> = d.evaluated.values().copied().collect();
-    // Every outcome reads every restriction (the module doc); the pins are
-    // charged once for the frame (`pins_hold`).
+    // Every outcome reads every restriction; the pins are charged once for the
+    // frame.
     let assumed: Vec<NodeId> = d.assumptions.iter().copied().filter(|a| matches!(d.graph.get(*a).op, Op::Restrict(..))).collect();
     let all: Vec<NodeId> = outcomes.iter().flatten().copied().chain(sites).chain(assumed.iter().copied()).collect();
     let reach = d.graph.reachable(&all);
-    // The sources and their own errors, in node order.
     let mut sources: Vec<(NodeId, NodeId)> = Vec::new();
     let mut index: rustc_hash::FxHashMap<NodeId, usize> = Default::default();
     for n in 0..reach.len() as NodeId {
@@ -168,15 +159,13 @@ pub fn for_outcomes<A: GraphArith>(d: &mut Symbolic<A>, outcomes: &[Vec<NodeId>]
         .collect()
 }
 
-/// `n`'s own error, where it has one.
 fn own_error<A: GraphArith>(d: &mut Symbolic<A>, n: NodeId) -> Option<NodeId> {
     let node = d.graph.get(n);
     let (op, a) = (node.op.clone(), node.args.first().copied());
     // "Can a lane's value here be a SET?" assumes every other operator's own
-    // error holds (`abstract_beneath_lane_ops` takes an inner `Flr` as a
-    // singleton): where one does not, that operator is itself a source in
-    // the same cone and is counted. Plain abstractness would make every
-    // floor of the player's position after a `move` a runtime check.
+    // error holds (an inner `Flr` is a singleton): where one does not, that
+    // operator is itself a source in the same cone. Plain abstractness would
+    // make every floor of the player's position after a `move` a runtime check.
     let own = match op {
         Op::Flr if d.abstract_beneath_lane_ops(a?) && !within_one_integer(d, a?) => undecided(d, n),
         Op::Split(k) | Op::SplitInt(k) if d.abstract_beneath_lane_ops(a?) => {
@@ -192,13 +181,12 @@ fn own_error<A: GraphArith>(d: &mut Symbolic<A>, n: NodeId) -> Option<NodeId> {
         // Only where a LANE can hold `c` both ways (`Symbolic::lane_undecidable`):
         // a condition the kernel decides per lane owns nothing.
         Op::Sel if d.lane_undecidable(a?) => undecided(d, a?),
-        // Overflow is an assertion: a wrapped or saturated result (or
-        // interval endpoint) is not the result, so the lane declines, never
-        // wraps or widens silently - a point as an interval, as the
-        // reference engine raises. Not where the static ranges put the exact
-        // result inside the 16.16 range; `NoWrap` folds to true where the
-        // literal operand cannot overflow (`x * 0.5`, `x / 2`: `one_operand`)
-        // and the lowering's interval fold decides it where the hulls do.
+        // Overflow is an assertion: a wrapped or saturated result (or endpoint)
+        // is not the result, so the lane declines, never wraps or widens silently.
+        // Not where the static ranges put the exact result inside the range;
+        // `NoWrap` folds to true where the literal operand cannot overflow
+        // (`one_operand`) and the lowering's interval fold decides it where the
+        // hulls do.
         ref op if A::range_error(op) && !d.bounded(n) => {
             let fits = d.graph.fold(Op::NoWrap, vec![n]);
             d.graph.fold(Op::Not, vec![fits])
@@ -219,9 +207,8 @@ fn own_error<A: GraphArith>(d: &mut Symbolic<A>, n: NodeId) -> Option<NodeId> {
 }
 
 /// Does every lane's value of `n` lie within one integer, so that its floor
-/// is exact by construction? True for a floor fork's fragment, a literal
-/// whose ends share a floor, a select of such values, and a value that is
-/// one number on the lane. Anything else is checked per lane.
+/// is exact by construction (a floor fork's fragment, a literal whose ends
+/// share a floor, a select of such values, a point)?
 fn within_one_integer<A: GraphArith>(d: &Symbolic<A>, n: NodeId) -> bool {
     let node = d.graph.get(n);
     match node.op {
