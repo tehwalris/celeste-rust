@@ -221,8 +221,11 @@ are never committed.
   check's edge bytes are a function of the search.
 - Level -1 fixtures keep their table (`NAME/l1-table.bin`; `bench frame`
   refuses another).
-- `bench frame` writes its scratch into the fixture, so a fixture's steps
-  share one lane.
+- Fixtures are shared by every checkout and READ-ONLY (`ensure` makes them
+  so): a step that writes into one fails. Scratch is the run's own:
+  `bench frame`'s `/var/tmp/celeste-bench-frame-PID` (removed after), and
+  check.sh's `CHECK_DIR`, by default per checkout
+  (`/var/tmp/celeste-check-NAME-HASH`), so concurrent runs never share it.
 - A fixture's frames are the tree's: SEARCH STEPS (two a game frame under
   `--split-frame`, as r60s's "to step 71"; `settings::Clock`, plans/
   architecture.md "The split frame"). So are `forward --to`, the tree

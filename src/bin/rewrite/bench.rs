@@ -55,8 +55,8 @@ pub struct FrameArgs {
     /// agree).
     #[arg(long, default_value_t = 1)]
     reps: usize,
-    /// Record the frame's edges (into a scratch dir under the tree,
-    /// deleted per rep), as the search's forward does.
+    /// Record the frame's edges (into the run's scratch dir, `Scratch`,
+    /// cleared per rep), as the search's forward does.
     #[arg(long)]
     edges: bool,
     /// Write the first rep's exact metrics to this file (`compiled::mix`).
@@ -149,18 +149,19 @@ where
         let (fr, (outs, xfers)) = (st.frontier(), st.outs_and_xfers());
         celeste_rust::storage::bench::print_memory(&format!("f{frame} loaded"), st.visited(), &fr.new, &fr.hulls, &fr.old, outs, xfers);
     }
-    let scratch = dir.join("bench-edges");
+    let scratch_dir = Scratch::new("bench-frame")?;
+    let scratch = scratch_dir.path();
     let ms = |d: std::time::Duration| d.as_secs_f64() * 1e3;
     let mut lines: Option<String> = None;
     let mut costs: Vec<celeste_rust::storage::bench::Rep> = Vec::new();
     let counters = celeste_rust::storage::bench::Counters::open().map(celeste_rust::storage::bench::count_steps);
     for rep in 0..reps {
-        let _ = std::fs::remove_dir_all(&scratch);
+        let _ = std::fs::remove_dir_all(scratch);
         let load = celeste_rust::storage::bench::load_average();
         let at = counters.as_ref().map(|c| c.start());
         let t = std::time::Instant::now();
         // The last rep runs on the state's own visited set (no copy beside it).
-        let (wave, visited, xfers) = st.bench_wave(&engine, dir, edges.then_some(scratch.as_path()), rep + 1 < reps)?;
+        let (wave, visited, xfers) = st.bench_wave(&engine, dir, edges.then_some(scratch), rep + 1 < reps)?;
         let ckpt = if checkpoint { Some(st.bench_checkpoint(&wave, &scratch.join("ckpt"), cfg)?) } else { None };
         let t_all = t.elapsed();
         let counts = counters.as_ref().zip(at).map(|(c, at)| c.stop(at));
@@ -201,11 +202,11 @@ where
         let (nh, ah) = celeste_rust::storage::hulls::fingerprint(wave.frontier_states(frame + 1), &visited.keys, visited.shapes())?;
         out += &format!("h{:03} {nh} {ah:016x}\n", frame + 1);
         if edges {
-            let (n, acc) = celeste_rust::storage::bench::edge_fingerprint(&scratch, frame + 1, &xfers, &visited, cfg.threads())?;
+            let (n, acc) = celeste_rust::storage::bench::edge_fingerprint(scratch, frame + 1, &xfers, &visited, cfg.threads())?;
             out += &format!("e{:03} {n} {acc:016x}\n", frame + 1);
         }
         if checkpoint {
-            let (files, bytes, acc) = celeste_rust::storage::bench::dir_fingerprint(&scratch)?;
+            let (files, bytes, acc) = celeste_rust::storage::bench::dir_fingerprint(scratch)?;
             out += &format!("b{:03} {files} {bytes} {acc:016x}\n", frame + 1);
         }
         match &lines {
@@ -228,11 +229,34 @@ where
         }
         lines = Some(out);
     }
-    let _ = std::fs::remove_dir_all(&scratch);
     let ks = take_kernel_stats();
     anyhow::ensure!(ks.missed == 0, "KERNEL COVERAGE GAP: {} lanes missed", ks.missed);
     celeste_rust::storage::bench::print_cost(frame + 1, &costs);
     Ok(())
+}
+
+/// A run's own scratch dir, `/var/tmp/celeste-NAME-PID` (on disk: a frame's
+/// files can be GBs), removed when dropped. Never inside the tree: a check
+/// only reads its tree (the shared fixtures are read-only).
+struct Scratch(PathBuf);
+
+impl Scratch {
+    fn new(name: &str) -> Result<Self> {
+        let p = PathBuf::from(format!("/var/tmp/celeste-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&p);
+        std::fs::create_dir_all(&p).with_context(|| p.display().to_string())?;
+        Ok(Scratch(p))
+    }
+
+    fn path(&self) -> &std::path::Path {
+        &self.0
+    }
+}
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
 }
 
 /// `bench backward` of `frame` in the arithmetic of `N`, the winning sets
