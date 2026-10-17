@@ -219,7 +219,6 @@ impl PosGraphBuilder {
     }
 }
 
-
 /// Collects the graph while the forward steps frames, AT EMISSION: the
 /// frame step records `(input row's cell, output row's cell)` per row,
 /// before any dedup; nothing is stored on a row.

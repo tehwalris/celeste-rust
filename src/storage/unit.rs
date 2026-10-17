@@ -56,10 +56,6 @@ impl<N: EngineNum> RowBuf<N> {
         self.keys.len()
     }
 
-    pub fn skeleton(&self) -> &Rt2<N> {
-        &self.skeleton
-    }
-
     /// Drop the rows, keeping the skeleton and the columns' capacity.
     pub fn clear(&mut self) {
         for (_, c) in &mut self.cols {
@@ -978,7 +974,6 @@ impl<'a, N: Rem> UnitSink<'a, N> {
         out
     }
 
-
     /// The unit is over: its rows checked, its last verdicts decided (refused
     /// targets' records go), its buckets the chunks of their routes.
     pub fn end(&mut self) -> Result<()> {
@@ -1012,7 +1007,7 @@ impl<'a, N: Rem> UnitSink<'a, N> {
                 }
                 at += 1;
             }
-                let (_, slot) = *self.route_slot.get(&route).expect("a route this worker made");
+            let (_, slot) = *self.route_slot.get(&route).expect("a route this worker made");
             let pushes = self.pushes(slot, &targets, &bundles);
             self.outbox.push(Chunk { route, unit: self.unit, worker: self.worker, targets, pushes, sources: sources.clone(), bundles, src_regions });
         }

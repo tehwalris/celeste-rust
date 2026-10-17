@@ -879,7 +879,7 @@ pub fn run_wave<N: Rem>(engine: &dyn FrameStep<N>, front: Frontier<N>, cx: WaveC
         );
     }
     if let Some(f) = filters.marks {
-        mark_filter(&mut new, f, visited, skeletons, frame, s)?;
+        mark_filter(&mut new, f, visited, skeletons, frame)?;
     }
     mark("filter", &mut st);
     // Into the visited set: the new states (new: none held) with their
@@ -950,10 +950,6 @@ pub fn run_wave<N: Rem>(engine: &dyn FrameStep<N>, front: Frontier<N>, cx: WaveC
     if s.diag.phases {
         crate::metrics::mem_phase(&format!("f{frame} the next layer's wins decoded"));
     }
-
-    if s.diag.phases {
-        crate::metrics::mem_phase(&format!("f{frame} the next layer merged into the visited set"));
-    }
     st.lanes_kept = next.states() as usize;
     st.grown = by_layer_states(&grown);
     // The writers joined: the files are whole when the wave returns.
@@ -989,7 +985,7 @@ pub fn run_wave<N: Rem>(engine: &dyn FrameStep<N>, front: Frontier<N>, cx: WaveC
 /// THE OBJECTS LADDER's filter (`frame::MarkFilter`) on the new and grown
 /// states: a re-push reaches a state along an edge recorded earlier, whose
 /// verdict does not hold now; every state kept is checked at this frame.
-fn mark_filter<N: Rem>(sealed: &mut [super::route::Sealed<N>], f: &crate::frame::MarkFilter<N>, visited: &VisitedSet<N>, skeletons: &Skeletons<N>, frame: u32, _s: &crate::settings::Settings) -> Result<()> {
+fn mark_filter<N: Rem>(sealed: &mut [super::route::Sealed<N>], f: &crate::frame::MarkFilter<N>, visited: &VisitedSet<N>, skeletons: &Skeletons<N>, frame: u32) -> Result<()> {
     let geo = GEOMETRY;
     for sl in sealed.iter_mut() {
         let shape = visited.shape_hash(sl.region / geo.slots);
@@ -1007,7 +1003,7 @@ fn mark_filter<N: Rem>(sealed: &mut [super::route::Sealed<N>], f: &crate::frame:
         let rt2 = super::decode::decode_rows(&visited.keys, &skel, &rows)?;
         let ok = f.allowed(&rt2, frame)?;
         let n_new = sl.table.states() as usize;
-        if ok[..n_new].iter().all(|&x| x) && ok[n_new..].iter().all(|&x| x) {
+        if ok.iter().all(|&x| x) {
             continue;
         }
         let (mut keys, mut masks, mut hulls) = (Vec::new(), Vec::new(), Vec::new());
@@ -1033,7 +1029,6 @@ fn mark_filter<N: Rem>(sealed: &mut [super::route::Sealed<N>], f: &crate::frame:
             k += 1;
             ok[k - 1]
         });
-
     }
     Ok(())
 }

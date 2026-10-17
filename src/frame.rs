@@ -1089,7 +1089,6 @@ const MIN_FREE_GB: u64 = 20;
 /// across another level's phases would count other writers' bytes).
 fn ensure_disk_space(dir: &std::path::Path, last_free: &mut Option<u64>) -> Result<()> {
     use std::os::unix::ffi::OsStrExt;
-    let min_gb = MIN_FREE_GB;
     let path = std::ffi::CString::new(dir.as_os_str().as_bytes())?;
     // SAFETY: `path` is NUL-terminated; `st` is a valid out-parameter that
     // statvfs fills on success.
@@ -1097,10 +1096,10 @@ fn ensure_disk_space(dir: &std::path::Path, last_free: &mut Option<u64>) -> Resu
     anyhow::ensure!(unsafe { libc::statvfs(path.as_ptr(), &mut st) } == 0, "statvfs {}: {}", dir.display(), std::io::Error::last_os_error());
     let free = st.f_bavail as u64 * st.f_frsize as u64;
     let frame_bytes = last_free.replace(free).map_or(0, |last| last.saturating_sub(free));
-    let need = (min_gb << 30) + 3 * frame_bytes;
+    let need = (MIN_FREE_GB << 30) + 3 * frame_bytes;
     anyhow::ensure!(
         free >= need,
-        "only {} GB free on {}'s filesystem, the last frame used {} GB (the floor {min_gb} GB, plus 3 frames): stopping the forward before the disk fills",
+        "only {} GB free on {}'s filesystem, the last frame used {} GB (the floor {MIN_FREE_GB} GB, plus 3 frames): stopping the forward before the disk fills",
         free >> 30,
         dir.display(),
         frame_bytes >> 30

@@ -149,10 +149,6 @@ impl<N: Rem> Touched<N> {
         self.states
     }
 
-    pub fn keys(&self) -> impl Iterator<Item = Key> + '_ {
-        self.keys.iter().map(|k| k.key)
-    }
-
     /// The keys, each `key(k)` (made final: distinct keys stay distinct),
     /// sorted, and the hulls (each key's run by cell).
     pub fn into_sorted(self, key: impl Fn(Key) -> Result<Key>) -> Result<(Vec<TouchedKey>, Vec<AccOf<N>>)> {
