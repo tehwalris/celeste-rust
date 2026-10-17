@@ -477,10 +477,11 @@ fn factor_local<A: GraphArith>(g: &Graph<A>, local: &mut Local, id: NodeId, expa
 /// (decided) while `A = ⊥`. `false ∧ ⊥ = false` MANUFACTURES decidedness,
 /// so an ancestor is not always at-least-as-decided.
 ///
-/// Deliberately NOT a `Graph::fold` rule: `fold`'s contract
+/// Not a `Graph::fold` rule in general: `fold`'s contract
 /// (`folding_is_exact_not_merely_sound`) is exactness in Kleene, and this
-/// rewrite is a refinement (at `A = true`, `p = ⊥` the merged form is `⊥`).
-/// Dropping a duplicate leaf, by contrast, IS exact in Kleene.
+/// rewrite is a refinement (at `A = true`, `p = ⊥` the re-merge is `⊥`).
+/// `fold` takes only the two-term syntactic case, the one exception to its
+/// contract. Dropping a duplicate leaf, by contrast, IS exact in Kleene.
 pub fn simplify_local<A: GraphArith>(g: &Graph<A>, roots: &[NodeId], cap: usize, expand: usize) -> (Graph<A>, Vec<NodeId>, Stats) {
     let need = g.reachable(roots);
     let mut out = g.like();

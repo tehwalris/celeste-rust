@@ -383,7 +383,11 @@ impl<A: GraphArith> Graph<A> {
     /// Add `op(args)`, normalizing and folding. Every rule is EXACT w.r.t.
     /// `eval`, not merely sound: a refining rule (`x and not x` -> false)
     /// would change which lanes are in error
-    /// (`folding_is_exact_not_merely_sound`).
+    /// (`folding_is_exact_not_merely_sound`). One exception: the two-term
+    /// re-merge `(g and c) or (g and not c)` -> `g` is exact concretely but
+    /// refines in Kleene (at `g` true, `c` unknown: true, not unknown), the
+    /// case `bdd::simplify_local`'s collapse argument covers; that test's pool
+    /// does not reach it.
     pub fn fold(&mut self, op: Op<A>, mut args: Vec<NodeId>) -> NodeId {
         if args.len() == 2 {
             if Self::commutes(&op) {
@@ -600,8 +604,9 @@ impl<A: GraphArith> Graph<A> {
                     (None, Some(_)) => return args[0],
                     _ => {}
                 }
-                // `(g and c) or (g and not c)` is `g`, exactly; otherwise `live`
-                // would pull every split fork into the configuration product.
+                // `(g and c) or (g and not c)` is `g` (a refinement, `fold`'s
+                // doc); otherwise `live` would pull every split fork into the
+                // configuration product.
                 let and_args = |g: &Graph<A>, n: NodeId| -> Option<[NodeId; 2]> {
                     let node = &g.nodes[n as usize];
                     (node.op == Op::And).then(|| [node.args[0], node.args[1]])
