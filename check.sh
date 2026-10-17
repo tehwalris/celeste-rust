@@ -482,7 +482,7 @@ case $TIER in
              case $TIER in perf) perftier ;; local) localgoldens ;; *) $TIER ;; esac
              echo "[$TIER] $((SECONDS - t)) s"
          done; TIER=all ;;
-    *) sed -n '2,30p' "$0"; exit 2 ;;
+    *) sed -n '2,/^[^#]/{/^#/p}' "$0"; exit 2 ;;
 esac
 FAILED=$(paste -sd' ' "$C/failed")
 SKIPPED=$(paste -sd' ' "$C/skipped")

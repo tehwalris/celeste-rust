@@ -158,8 +158,6 @@ pub struct Diagnostics {
     pub phases: bool,
 }
 
-pub type SettingsArgs = Settings;
-
 /// The flags alone, parsed (the defaults; a record read back).
 #[derive(Parser)]
 struct Flags {

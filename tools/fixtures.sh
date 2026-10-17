@@ -179,5 +179,5 @@ case ${1:-} in
             printf '%-11s %s\n' "$n" "$( [[ -f $ROOT/$n/manifest.txt ]] && grep ^built "$ROOT/$n/manifest.txt" || echo missing)"
         done
         ;;
-    *) sed -n '2,24p' "$0"; exit 2 ;;
+    *) sed -n '2,/^[^#]/{/^#/p}' "$0"; exit 2 ;;
 esac
