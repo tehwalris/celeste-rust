@@ -444,7 +444,7 @@ pub fn exact(dir: &std::path::Path, horizon: u32, point: (u32, u32), threads: us
 mod tests {
     use super::super::backward::backward;
     use super::ReachEdges;
-    use super::super::backward::tests::{apply, random_graph, sid, TestTree};
+    use super::super::backward::tests::{apply, random_graph, rng, sid, TestTree};
     use super::super::arcs::CIRCLE;
     use rustc_hash::FxHashSet;
 
@@ -530,11 +530,7 @@ mod tests {
     /// edges whose guards take it, keeping those inside W.
     #[test]
     fn reach_is_the_forward_of_the_start_point_inside_w() {
-        let mut s = 23u64;
-        let mut r = move |m: u32| {
-            s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-            ((s >> 33) as u32) % m
-        };
+        let mut r = rng(23);
         let mut nonempty = 0;
         for _ in 0..80 {
             let n = 3 + r(14);

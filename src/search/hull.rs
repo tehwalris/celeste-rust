@@ -14,7 +14,7 @@
 //! holding the union when the union fits in half the circle (its largest
 //! gap, longer than half, holds a cut), and a superset otherwise.
 
-use super::arcs::{Circle, Fixed16, Piece, Region, Seg};
+use super::arcs::{clip, Circle, Fixed16, Piece, Region, Seg};
 use super::rem::Rem;
 use celeste_core::pico8_num::Pico8Num as P8;
 
@@ -211,12 +211,6 @@ impl<C: Circle> Hull<C> {
         let w = |i: usize| C::get_word(&b[i * C::W_BYTES..]);
         Hull { x: Arc { start: w(0), last: w(1) }, y: Arc { start: w(2), last: w(3) } }
     }
-}
-
-#[inline]
-fn clip<P: Ord + Copy>(s: Seg<P>, g: Seg<P>) -> Option<Seg<P>> {
-    let (lo, hi) = (s.lo.max(g.lo), s.hi.min(g.hi));
-    (lo < hi).then_some(Seg { lo, hi })
 }
 
 /// The points of arc `a` inside the guard of `t`.

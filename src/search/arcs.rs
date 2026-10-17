@@ -441,7 +441,8 @@ fn rot_seg(s: Seg, d: u32, mut f: impl FnMut(Seg)) {
     }
 }
 
-fn clip<P: Ord + Copy>(s: Seg<P>, g: Seg<P>) -> Option<Seg<P>> {
+#[inline]
+pub(super) fn clip<P: Ord + Copy>(s: Seg<P>, g: Seg<P>) -> Option<Seg<P>> {
     let (lo, hi) = (s.lo.max(g.lo), s.hi.min(g.hi));
     (lo < hi).then_some(Seg { lo, hi })
 }
@@ -782,6 +783,7 @@ impl<C: Circle> RegionArena<C> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::search::backward::tests::apply;
 
     #[test]
     fn an_arena_returns_its_sets_across_sealed_and_spilled_chunks() {
@@ -888,10 +890,6 @@ mod tests {
             let mut out = Vec::new();
             r.pull(tx, ty, &mut out);
             let pr = Region::<Fixed16>::from_pieces(&mut out, &mut Vec::new());
-            let ap = |a: Action, p: u32| match a {
-                Action::Rotate(v) => (p as i64 + v as i64).rem_euclid(CIRCLE as i64) as u32,
-                Action::Const(c) => c,
-            };
             let mut pp: Vec<u32> = probes.iter().flat_map(|&v| {
                 let back = |a: Action| match a {
                     Action::Rotate(d) => (v as i64 - d as i64).rem_euclid(CIRCLE as i64) as u32,
@@ -903,7 +901,7 @@ mod tests {
             pp.dedup();
             for &x in &pp {
                 for &y in &pp {
-                    let want = tx.takes(x) && ty.takes(y) && r.contains(ap(tx.action, x), ap(ty.action, y));
+                    let want = tx.takes(x) && ty.takes(y) && r.contains(apply(tx.action, x), apply(ty.action, y));
                     assert_eq!(pr.contains(x, y), want, "pull at ({x}, {y})");
                 }
             }
@@ -916,7 +914,7 @@ mod tests {
             for &x in &pp {
                 for &y in &pp {
                     if tx.takes(x) && ty.takes(y) && r.contains(x, y) {
-                        assert!(img.contains(ap(tx.action, x), ap(ty.action, y)), "push misses the image of ({x}, {y})");
+                        assert!(img.contains(apply(tx.action, x), apply(ty.action, y)), "push misses the image of ({x}, {y})");
                     }
                 }
             }

@@ -1174,6 +1174,14 @@ pub(crate) mod tests {
         }
     }
 
+    /// A deterministic `r(m)` in `0..m` from `seed`.
+    pub(crate) fn rng(mut s: u64) -> impl FnMut(u32) -> u32 {
+        move |m| {
+            s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            ((s >> 33) as u32) % m
+        }
+    }
+
     /// An action on one point of the circle.
     pub(crate) fn apply(a: Action, p: u32) -> u32 {
         match a {
@@ -1344,11 +1352,7 @@ pub(crate) mod tests {
     /// support is exactly the nodes with a set somewhere.
     #[test]
     fn the_push_backward_is_the_definition() {
-        let mut s = 11u64;
-        let mut r = move |m: u32| {
-            s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-            ((s >> 33) as u32) % m
-        };
+        let mut r = rng(11);
         let mut sets = 0;
         for _ in 0..60 {
             let n = 4 + r(20);
@@ -1384,11 +1388,7 @@ pub(crate) mod tests {
     /// smallest `h` whose own backward holds the start.
     #[test]
     fn one_backward_gives_the_optimum() {
-        let mut s = 5u64;
-        let mut r = move |m: u32| {
-            s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-            ((s >> 33) as u32) % m
-        };
+        let mut r = rng(5);
         let mut checked = 0;
         for _ in 0..80 {
             let n = 3 + r(12);
