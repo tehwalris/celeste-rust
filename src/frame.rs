@@ -1522,13 +1522,58 @@ pub fn tree_first_win_through<N: EngineNum>(dir: &std::path::Path, horizon: u32)
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use crate::abstraction::Level;
+    use crate::compiled::asm_kernel::Registry;
+    use crate::engines::reference::{RefEngine, RefFrameStep};
+    use crate::search::hull::Hull;
+    use crate::settings::Settings;
+    use crate::storage::layer::Layer;
+    use celeste_core::pico8_num::Pico8Num as P8;
+    use celeste_engine::runtime2::{Col, AV};
+
+    /// The start room's initial block.
+    fn start_blocks(s: &Settings) -> Vec<Block> {
+        vec![Block::canonical(RefEngine::new(s).expect("ref engine").initial().expect("initial state")).expect("block")]
+    }
+
+    /// The start's row a few frames after the player appears (standing, at
+    /// rest), widened to `level`.
+    fn standing_row(s: &Settings, level: Level) -> Rt2 {
+        let mut reference = RefEngine::new(s).expect("ref engine");
+        let mut row = reference.initial().expect("initial state");
+        let ids = crate::compiled::ids();
+        let mut after = 0;
+        while after < 3 {
+            row = reference.step_one(&row, 0).expect("frame").into_rt2();
+            if !row.player_objects(ids).is_empty() {
+                after += 1;
+            }
+        }
+        widen_rt2_to(&mut row, level);
+        row
+    }
+
+    /// Does `registry` run `r`'s one lane (else its kernel declines)?
+    fn kernel_runs(registry: &Registry<P8>, r: &Rt2, level: Level, s: &Settings) -> bool {
+        let cells = crate::search::pos_graph::block_cells(r).expect("cells");
+        let visited = crate::storage::visited::VisitedSet::new(crate::storage::GEOMETRY);
+        let (routes, skeletons) = (crate::storage::route::Routes::default(), crate::storage::decode::Skeletons::default());
+        let prov = celeste_engine::exact::Provisional::default();
+        let (base, xtab) = (crate::storage::edges::XferTable::default(), Default::default());
+        let mut sink = crate::storage::unit::UnitSink::new(&visited, &routes, &skeletons, &prov, Filters::default(), 1, level, 0, &base, &xtab, false, false, s);
+        sink.begin(0);
+        let si = sink.push_source(0, (0, 0));
+        sink.push_lane(si, cells[0], Hull::full());
+        sink.sources_done();
+        crate::compiled::dispatch::run_chunk_kernel(registry, r, &cells, &[0], &mut sink)
+    }
+
     /// The mark filter admits a marked node's rows up to its deadline only.
     #[test]
     fn the_mark_filter_admits_up_to_the_deadline() {
-        let s = crate::settings::Settings::default();
-        use crate::abstraction::Level;
-        let engine = RefEngine::new(&s).expect("ref engine");
-        let block = Block::canonical(engine.initial().expect("initial state")).expect("block");
+        let s = Settings::default();
+        let block = start_blocks(&s).pop().expect("a block");
         let coarse = Level::parse("r0sxh").expect("level");
         // The coarse key space holds the projection's codes.
         let mut w = block.rt2().clone_block();
@@ -1547,21 +1592,11 @@ mod tests {
         assert_eq!(MarkFilter::new(&empty, coarse, crate::settings::Clock { per_frame: 1 }).allowed(block.rt2(), 0).expect("filter"), vec![false], "not marked");
     }
 
-
-    use super::*;
-    use crate::storage::layer::Layer;
-    use crate::engines::reference::RefEngine;
-    use celeste_core::pico8_num::Pico8Num as P8;
-    use celeste_engine::runtime2::{Col, AV};
-    use crate::engines::reference::RefFrameStep;
-    use crate::search::hull::Hull;
-
     /// A fresh forward keeps none of a killed run's files.
     #[test]
     fn a_fresh_forward_clears_what_a_killed_run_left() {
-        let s = crate::settings::Settings::default();
-        let engine = RefEngine::new(&s).expect("ref engine");
-        let init = vec![Block::canonical(engine.initial().expect("initial state")).expect("block")];
+        let s = Settings::default();
+        let init = start_blocks(&s);
         let dir = &std::path::PathBuf::from(format!("/var/tmp/celeste-frame-fresh-start-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(dir);
         let stale = [dir.join("edges/f009.bin"), dir.join("edges/xfer.bin"), dir.join("frames/f009.bin")];
@@ -1569,7 +1604,7 @@ mod tests {
             std::fs::create_dir_all(f.parent().unwrap()).expect("mkdir");
             std::fs::write(f, b"stale").expect("write");
         }
-        ForwardState::start(init, dir, true, None, crate::abstraction::Level::EXACT, &s).expect("start");
+        ForwardState::start(init, dir, true, None, Level::EXACT, &s).expect("start");
         for f in &stale {
             assert!(!f.exists(), "{} survived a fresh start", f.display());
         }
@@ -1590,12 +1625,12 @@ mod tests {
     fn the_hull_forward_lies_between_the_exact_reach_and_the_widened_forward() {
         use crate::search::hull::WIDEN;
         use std::sync::atomic::Ordering;
-        let s = crate::settings::Settings { threads: Some(8), ..Default::default() };
+        let s = Settings { threads: Some(8), ..Default::default() };
         let base = std::env::temp_dir().join(format!("celeste-hull-between-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
-        let level = crate::abstraction::Level::parse("r0sx").expect("level");
+        let level = Level::parse("r0sx").expect("level");
         let e = crate::compiled::FrameEngine::new(&s, level).expect("kernels");
-        let init = || vec![Block::canonical(RefEngine::new(&s).expect("engine").initial().expect("init")).expect("block")];
+        let init = || start_blocks(&s);
         let to = 34;
         // Per frame, its states by content.
         let states = |d: &std::path::Path| -> Vec<rustc_hash::FxHashSet<u64>> {
@@ -1704,20 +1739,19 @@ mod tests {
     /// berry: every row's berry is lost from frame 0 on.
     #[test]
     fn a_resume_expands_what_the_uninterrupted_forward_expands() {
-        let s = crate::settings::Settings { hundred: true, ..Default::default() };
+        let s = Settings { hundred: true, ..Default::default() };
         let dir = std::env::temp_dir().join(format!("celeste-resume-frontier-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        let e = RefEngine::new(&s).expect("engine");
-        let init = vec![Block::canonical(e.initial().expect("init")).expect("block")];
-        let e = RefFrameStep::<P8>::new(&s, crate::abstraction::Level::EXACT).expect("engines");
+        let init = start_blocks(&s);
+        let e = RefFrameStep::<P8>::new(&s, Level::EXACT).expect("engines");
         let frontier = |st: &ForwardState| -> (Vec<(u32, (u64, u64), u64)>, Vec<Hull>, crate::storage::wave::ByLayer) { (st.frontier.new.iter().collect(), st.frontier.hulls.clone(), st.frontier.old.clone()) };
-        let mut st = ForwardState::start(init, &dir, true, None, crate::abstraction::Level::EXACT, &s).expect("start");
+        let mut st = ForwardState::start(init, &dir, true, None, Level::EXACT, &s).expect("start");
         for b in crate::storage::layer::decode_states(&st.frontier.new, &st.visited.keys, st.visited.shapes(), usize::MAX, &|_| true).expect("decode") {
             assert!(not_expanded(&Block::from_rt2(b.1), 0, None, &s).expect("not expanded").iter().all(|&x| x), "frame 0: the berry is lost");
         }
         for to in 0..=3 {
             st.extend(&e, &dir, to, None).expect("extend");
-            let resumed = ForwardState::at(&dir, st.frames, true, crate::abstraction::Level::EXACT, &s).expect("at");
+            let resumed = ForwardState::at(&dir, st.frames, true, Level::EXACT, &s).expect("at");
             assert_eq!(frontier(&st), frontier(&resumed), "f{}: the resume's frontier is not the forward's", st.frames);
             assert_eq!(st.win_frame, resumed.win_frame, "f{}: the first win", st.frames);
         }
@@ -1733,12 +1767,12 @@ mod tests {
     #[test]
     #[ignore = "slow, ./check.sh t2 runs it: room (1,0)'s kernels and three forwards, ~25 CPU-s"]
     fn a_frame_killed_before_its_done_marker_is_rerun() {
-        let s = crate::settings::Settings::default();
+        let s = Settings::default();
         let base = std::env::temp_dir().join(format!("celeste-done-marker-{}", std::process::id()));
         let (a, b) = (base.join("uninterrupted"), base.join("killed"));
         let _ = std::fs::remove_dir_all(&base);
         // The kernels (they record transfers), past the spawn.
-        let level = crate::abstraction::Level::parse("r0sxh").expect("level");
+        let level = Level::parse("r0sxh").expect("level");
         let e = crate::compiled::FrameEngine::new(&s, level).expect("kernels");
         let start = RefEngine::new(&s).expect("engine").initial().expect("init");
         let init = || vec![Block::canonical(start.clone_block()).expect("block")];
@@ -1773,7 +1807,7 @@ mod tests {
     /// Extending frame by frame and resuming reproduce a fresh run's key sets.
     #[test]
     fn forward_extended_frame_by_frame_matches_fresh() {
-        let s = crate::settings::Settings::default();
+        let s = Settings::default();
         let dir = &std::path::PathBuf::from(format!("/var/tmp/celeste-frame-rebuild-resume-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(dir);
         std::fs::create_dir_all(dir).expect("mkdir");
@@ -1784,20 +1818,14 @@ mod tests {
         };
         let keyset = |frame: u32| content(dir, frame);
 
-        {
-            let e = RefEngine::new(&s).expect("engine");
-            let init = vec![Block::canonical(e.initial().expect("init")).expect("block")];
-            forward_run(&RefFrameStep::<P8>::new(&s, crate::abstraction::Level::EXACT).expect("engines"), init, dir, 4, true).expect("fresh");
-        }
+        forward_run(&RefFrameStep::<P8>::new(&s, Level::EXACT).expect("engines"), start_blocks(&s), dir, 4, true).expect("fresh");
         let fresh4 = keyset(4);
         assert!(fresh4.0 > 0, "fresh frame 4 empty");
 
         // The same run extended one frame at a time.
         {
-            let e = RefEngine::new(&s).expect("engine");
-            let init = vec![Block::canonical(e.initial().expect("init")).expect("block")];
-            let e = RefFrameStep::<P8>::new(&s, crate::abstraction::Level::EXACT).expect("engines");
-            let mut st = ForwardState::start(init, dir, true, None, crate::abstraction::Level::EXACT, &s).expect("start");
+            let e = RefFrameStep::<P8>::new(&s, Level::EXACT).expect("engines");
+            let mut st = ForwardState::start(start_blocks(&s), dir, true, None, Level::EXACT, &s).expect("start");
             assert!(pos_graph_path(dir).exists(), "start must leave a graph beside f0");
             for to in 1..=4 {
                 st.extend(&e, dir, to, None).expect("extend");
@@ -1814,14 +1842,10 @@ mod tests {
         let fresh_dir = &std::path::PathBuf::from(format!("/var/tmp/celeste-frame-rebuild-resume-test-fresh6-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(fresh_dir);
         std::fs::create_dir_all(fresh_dir).expect("mkdir");
+        forward_run(&RefFrameStep::<P8>::new(&s, Level::EXACT).expect("engines"), start_blocks(&s), fresh_dir, 6, true).expect("fresh 6");
         {
-            let e = RefEngine::new(&s).expect("engine");
-            let init = vec![Block::canonical(e.initial().expect("init")).expect("block")];
-            forward_run(&RefFrameStep::<P8>::new(&s, crate::abstraction::Level::EXACT).expect("engines"), init, fresh_dir, 6, true).expect("fresh 6");
-        }
-        {
-            let e = RefFrameStep::<P8>::new(&s, crate::abstraction::Level::EXACT).expect("engines");
-            let mut st = ForwardState::resume(dir, true, crate::abstraction::Level::EXACT, &s).expect("resume").expect("a tree to resume");
+            let e = RefFrameStep::<P8>::new(&s, Level::EXACT).expect("engines");
+            let mut st = ForwardState::resume(dir, true, Level::EXACT, &s).expect("resume").expect("a tree to resume");
             assert_eq!(st.frames, 4);
             let visited_before = st.visited_len();
             st.extend(&e, dir, 6, None).expect("extend resumed");
@@ -1841,23 +1865,12 @@ mod tests {
     #[test]
     #[ignore = "slow, ./check.sh t2 runs it: room (1,0)'s kernels, ~20 CPU-s"]
     fn a_lane_outside_its_kernels_bounds_declines() {
-        use crate::abstraction::Level;
-        let s = crate::settings::Settings::default();
+        let s = Settings::default();
         let level = Level::parse("r0sxh").expect("level");
         let grid = s.region_grid().expect("the default region grid");
         let registry = crate::compiled::asm_kernel::registry(level, &s);
-        // The first frame with a player, a few frames in: standing, at rest.
-        let mut reference = RefEngine::new(&s).expect("ref engine");
-        let mut row = reference.initial().expect("initial state");
+        let row = standing_row(&s, level);
         let ids = crate::compiled::ids();
-        let mut after = 0;
-        while after < 3 {
-            row = reference.step_one(&row, 0).expect("frame").into_rt2();
-            if !row.player_objects(ids).is_empty() {
-                after += 1;
-            }
-        }
-        widen_rt2_to(&mut row, level);
         let player = row.player_objects(ids)[0];
         let cell_of = |rt2: &Rt2, f: u32, axis: u32| -> usize {
             let pc = rt2.obj_field_cell(player, f).expect("the player's table field");
@@ -1877,16 +1890,7 @@ mod tests {
         let runs = |r: &Rt2| -> bool {
             let cells = crate::search::pos_graph::block_cells(r).expect("cells");
             assert!(grid.of_cell(cells[0]).is_some(), "the lane has a region");
-            let visited = crate::storage::visited::VisitedSet::new(crate::storage::GEOMETRY);
-            let (routes, skeletons) = (crate::storage::route::Routes::default(), crate::storage::decode::Skeletons::default());
-            let prov = celeste_engine::exact::Provisional::default();
-            let (base, xtab) = (crate::storage::edges::XferTable::default(), Default::default());
-            let mut sink = crate::storage::unit::UnitSink::new(&visited, &routes, &skeletons, &prov, Filters::default(), 1, level, 0, &base, &xtab, false, false, &s);
-            sink.begin(0);
-            let si = sink.push_source(0, (0, 0));
-            sink.push_lane(si, cells[0], Hull::full());
-            sink.sources_done();
-            crate::compiled::dispatch::run_chunk_kernel(&registry, r, &cells, &[0], &mut sink)
+            kernel_runs(&registry, r, level, &s)
         };
         let px = |n: i16| P8::from_i16(n);
         let half = P8::from_parts(0, 0x8000);
@@ -1906,21 +1910,11 @@ mod tests {
     #[test]
     #[ignore = "slow, ./check.sh t2 runs it: room (2,1)'s platform kernels, ~100 CPU-s"]
     fn a_lane_outside_its_platform_bounds_declines() {
-        use crate::abstraction::Level;
-        let s = crate::settings::Settings { room: (2, 1), ..Default::default() };
+        let s = Settings { room: (2, 1), ..Default::default() };
         let level = Level::parse("r0sxhnp").expect("level");
         let registry = crate::compiled::asm_kernel::registry(level, &s);
-        let mut reference = RefEngine::new(&s).expect("ref engine");
-        let mut row = reference.initial().expect("initial state");
+        let row = standing_row(&s, level);
         let ids = crate::compiled::ids();
-        let mut after = 0;
-        while after < 3 {
-            row = reference.step_one(&row, 0).expect("frame").into_rt2();
-            if !row.player_objects(ids).is_empty() {
-                after += 1;
-            }
-        }
-        widen_rt2_to(&mut row, level);
         let platform = *row.objects_of_type(ids, ids.g_platform).first().expect("a moving platform");
         let sub = |rt2: &Rt2, f: u32, axis: u32| -> usize {
             let pc = rt2.obj_field_cell(platform, f).expect("the platform's table field");
@@ -1941,19 +1935,7 @@ mod tests {
             };
             r
         };
-        let runs = |r: &Rt2| -> bool {
-            let cells = crate::search::pos_graph::block_cells(r).expect("cells");
-            let visited = crate::storage::visited::VisitedSet::new(crate::storage::GEOMETRY);
-            let (routes, skeletons) = (crate::storage::route::Routes::default(), crate::storage::decode::Skeletons::default());
-            let prov = celeste_engine::exact::Provisional::default();
-            let (base, xtab) = (crate::storage::edges::XferTable::default(), Default::default());
-            let mut sink = crate::storage::unit::UnitSink::new(&visited, &routes, &skeletons, &prov, Filters::default(), 1, level, 0, &base, &xtab, false, false, &s);
-            sink.begin(0);
-            let si = sink.push_source(0, (0, 0));
-            sink.push_lane(si, cells[0], Hull::full());
-            sink.sources_done();
-            crate::compiled::dispatch::run_chunk_kernel(&registry, r, &cells, &[0], &mut sink)
-        };
+        let runs = |r: &Rt2| kernel_runs(&registry, r, level, &s);
         let px = |n: i16| P8::from_i16(n);
         let (path_lo, path_hi) = (px(celeste_engine::widening::PLATFORM_PATH.0), px(celeste_engine::widening::PLATFORM_PATH.1));
         let half = P8::from_parts(0, 0x8000);
@@ -1970,7 +1952,7 @@ mod tests {
     /// The summit wins at the flag: the TAS31 reference wins at frame 55, not before.
     #[test]
     fn the_summit_reference_wins_at_the_flag() {
-        let s = crate::settings::Settings { room: (6, 3), ..Default::default() };
+        let s = Settings { room: (6, 3), ..Default::default() };
         assert_eq!(win_rect(&s), Some((55, 67, 41, 52)), "the flag at (61, 48)");
         let text = std::fs::read_to_string("tas/room_6_3_reference_frame_55.txt").expect("the reference");
         let inputs: Vec<u8> = text
@@ -1997,14 +1979,13 @@ mod tests {
     #[test]
     #[ignore = "slow, ./check.sh t2 runs it: room (2,1)'s split kernels and a forward, ~55 CPU-s"]
     fn split_frame_reaches_the_unsplit_frontier_at_a_near_level() {
-        use crate::abstraction::Level;
-        let s = crate::settings::Settings { room: (2, 1), split_frame: true, ..Default::default() };
+        let s = Settings { room: (2, 1), split_frame: true, ..Default::default() };
         let level = Level::parse("r0sxhn").expect("level");
         let dir = &std::path::PathBuf::from(format!("/var/tmp/celeste-frame-split-near-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(dir);
         std::fs::create_dir_all(dir).expect("checkpoint dir");
         let engine = crate::compiled::FrameEngine::new(&s, level).expect("engine");
-        let init = vec![Block::canonical(RefEngine::new(&s).expect("ref").initial().expect("init")).expect("block")];
+        let init = start_blocks(&s);
         // Unsplit, frame by frame: 1 state a frame through the spawn, then these.
         let unsplit: Vec<(u32, usize)> = (0..24).map(|f| (f, 1)).chain([(24, 27), (25, 191), (26, 676), (27, 1883), (28, 4514)]).collect();
         let last = unsplit.last().unwrap().0;
