@@ -605,7 +605,10 @@ impl<A: GraphArith> Graph<A> {
                 }
                 // `(g and c) or (g and not c)` is `g` (a refinement, `fold`'s
                 // doc); otherwise `live` would pull every split fork into the
-                // configuration product.
+                // configuration product. It drops no owed raise: errors are
+                // derived from the folded graph (`trace::error`), and a `c`
+                // nothing else reads owes nothing, as any unread value - the
+                // result is `g` for every value of `c`, a wrapped one included.
                 let and_args = |g: &Graph<A>, n: NodeId| -> Option<[NodeId; 2]> {
                     let node = &g.nodes[n as usize];
                     (node.op == Op::And).then(|| [node.args[0], node.args[1]])
