@@ -169,19 +169,11 @@ impl PosGraph {
         use celeste_engine::runtime2::mix64;
         let mut acc = 0u64;
         for d in 0..self.offsets.len().saturating_sub(1) {
-            for &s in self.srcs_of(d as u32) {
+            for &s in self.sources(d as u32) {
                 acc = acc.wrapping_add(mix64((d as u64) << 32 ^ mix64(s as u64 + 1)));
             }
         }
         (self.pairs(), acc)
-    }
-
-    pub fn srcs_of(&self, dst: u32) -> &[u32] {
-        if self.offsets.is_empty() {
-            return &[];
-        }
-        let (lo, hi) = (self.offsets[dst as usize] as usize, self.offsets[dst as usize + 1] as usize);
-        &self.srcs[lo..hi]
     }
 }
 
@@ -238,10 +230,10 @@ impl PosObserver {
     /// An observer already holding `graph`'s pairs (a resumed forward).
     pub fn from_graph(graph: &PosGraph) -> Self {
         let mut b = PosGraphBuilder::default();
-        for d in 0..CELL_COUNT {
-            let (lo, hi) = (graph.offsets[d] as usize, graph.offsets[d + 1] as usize);
-            if lo < hi {
-                b.by_dst.insert(d as u32, graph.srcs[lo..hi].to_vec());
+        for d in 0..CELL_COUNT as u32 {
+            let srcs = graph.sources(d);
+            if !srcs.is_empty() {
+                b.by_dst.insert(d, srcs.to_vec());
             }
         }
         Self { pending: std::sync::Mutex::new(Vec::new()), graph: std::sync::Mutex::new(b) }
@@ -302,9 +294,9 @@ mod tests {
         b.record(9, NO_CELL);
         assert_eq!(b.pairs(), 3);
         let g = b.build();
-        assert_eq!(g.srcs_of(3), &[5, 7], "sorted and deduped");
-        assert_eq!(g.srcs_of(NO_CELL), &[9], "the no-position node participates");
-        assert_eq!(g.srcs_of(4), &[] as &[u32]);
+        assert_eq!(g.sources(3), &[5, 7], "sorted and deduped");
+        assert_eq!(g.sources(NO_CELL), &[9], "the no-position node participates");
+        assert_eq!(g.sources(4), &[] as &[u32]);
         assert_eq!(g.pairs(), 3);
         assert_eq!(g.live_cells(), 2);
     }

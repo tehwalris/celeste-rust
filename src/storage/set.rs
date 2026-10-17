@@ -11,23 +11,13 @@
 use crate::search::hull::HullOf;
 use anyhow::{anyhow, ensure, Result};
 
-use super::bundle::{get_varint, get_varint128, put_varint, put_varint128};
+use super::codec::{get_varint, get_varint128, narrow, put_varint, put_varint128, wide};
 use super::visited::Key;
 use super::{Sk, GEOMETRY};
 use crate::search::rem::Rem;
 use celeste_core::pico8_num::Pico8Num as P8;
 
 const _: () = assert!(GEOMETRY.words == 1, "a set holds a u64 mask an entry: 8 x 8 storage regions");
-
-#[inline]
-fn wide(k: Key) -> u128 {
-    (k.0 as u128) << 64 | k.1 as u128
-}
-
-#[inline]
-fn narrow(w: u128) -> Key {
-    ((w >> 64) as u64, w as u64)
-}
 
 /// The bytes key `w` needs (at least 1).
 #[inline]

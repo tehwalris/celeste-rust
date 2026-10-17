@@ -15,7 +15,7 @@ use celeste_core::arith::EngineNum;
 use celeste_engine::exact::{Key, KeyAdditions, KeySpace};
 use celeste_engine::runtime2::{mix64, Cell2, Col, Rt2, P8};
 
-use super::bundle::{get_varint, get_varint128, put_varint, put_varint128};
+use super::codec::{get_varint, get_varint128, narrow, put_varint, put_varint128, wide};
 use super::file::{self, At, Mapped, FORMAT_VERSION};
 use super::decode::Repr;
 use super::set::{RegionSet, RegionTable};
@@ -249,7 +249,7 @@ fn encode_region(keys: &[Key], masks: &[u64], wins: &[(u32, u64)], out: &mut Vec
     put_varint(out, keys.len() as u64);
     let mut prev = 0u128;
     for (i, k) in keys.iter().enumerate() {
-        let w = (k.0 as u128) << 64 | k.1 as u128;
+        let w = wide(*k);
         put_varint128(out, if i == 0 { w } else { w - prev });
         prev = w;
     }
@@ -281,7 +281,7 @@ fn decode_region(raw: &[u8]) -> Result<RegionEntries> {
     for i in 0..n {
         let d = get_varint128(raw, &mut pos);
         let w = if i == 0 { d } else { prev + d };
-        keys.push(((w >> 64) as u64, w as u64));
+        keys.push(narrow(w));
         prev = w;
     }
     ensure!(pos + 8 * n <= raw.len(), "a region block cut short");

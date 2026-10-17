@@ -5,6 +5,8 @@
 # command and checked against its pinned fingerprint
 # (gates/fixtures/NAME.ckhash: `ckhash --edges --hulls` through its last
 # frame). A fixture is an INPUT: the frame checks run one frame from it.
+# Fixtures are shared by every checkout and READ-ONLY once installed
+# (`ensure` makes them so): a check that writes into one fails loudly.
 #
 #   tools/fixtures.sh ensure NAME...   build what is missing or STALE (another
 #                                      spec or file format; rebuilt, loudly)
@@ -95,7 +97,10 @@ build() {
     [[ $mode == verify ]] && tmp=$ROOT/$name.verify
     echo "[fixtures] building $name${mode:+ ($mode)}: $CMD $FLAGS" >&2
     rm -rf "$tmp"
-    [[ $mode == verify ]] || rm -rf "$dir"
+    if [[ $mode != verify && -d $dir ]]; then
+        chmod -R u+w "$dir"
+        rm -rf "$dir"
+    fi
     mkdir -p "$tmp"
     local t0=$SECONDS
     ./safe-run.sh --memory "$MEM" -- "$B" $CMD $FLAGS --l1-table "$tmp/l1-table.bin" --checkpoint-dir "$tmp" > "$tmp/build.out" 2> "$tmp/build.log" \
@@ -128,6 +133,7 @@ build() {
         echo "built $(date -Is) in $((SECONDS - t0)) s"
     } > "$tmp/manifest.txt"
     mv "$tmp" "$dir"
+    chmod -R a-w "$dir"
     echo "[fixtures] $name: built in $((SECONDS - t0)) s ($(du -sh "$dir" | cut -f1))" >&2
 }
 
@@ -151,6 +157,7 @@ ensure() {
     if ! grep -qxF "sources $(sources)" "$m"; then
         echo "[fixtures] note: $name was built from other sources ($(grep ^commit "$m" | cut -d' ' -f2)); an input pinned by its fingerprint, not rebuilt (tools/fixtures.sh build $name)" >&2
     fi
+    chmod -R a-w "$ROOT/$name"
 }
 
 case ${1:-} in

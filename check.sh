@@ -19,8 +19,10 @@
 # writes the outputs as the new pins (gates/) instead of comparing: only on
 # evidence, and say why in the commit. Builds the quick binary first (perf:
 # the release one too). Env: CARGO_TARGET_DIR, CELESTE_FIXTURES, CHECK_DIR
-# (the scratch, default /var/tmp/celeste-check), THREADS (default 16; the
-# metrics are the same at every thread count).
+# (the scratch, default per checkout: /var/tmp/celeste-check-NAME-HASH, so
+# two worktrees' runs never share it), THREADS (default 16; the metrics
+# are the same at every thread count). The fixtures are shared and
+# READ-ONLY (tools/fixtures.sh): a step that writes into one fails.
 set -uo pipefail
 cd "$(dirname "$0")"
 TIER=${1:-}
@@ -34,7 +36,7 @@ export BIN=$B
 RB=$T/release/rewrite
 F=${CELESTE_FIXTURES:-/var/tmp/celeste-fixtures}
 G=gates/fixtures
-C=${CHECK_DIR:-/var/tmp/celeste-check}
+C=${CHECK_DIR:-/var/tmp/celeste-check-${PWD##*/}-$(printf %s "$PWD" | sha1sum | cut -c1-8)}
 TH=${THREADS:-16}
 # Every step's memory cap (safe-run.sh): the steps peak under 6 GB, and a
 # step that outgrows its cap fails instead of taking the machine's memory.
@@ -188,8 +190,7 @@ t1() {
     build
     step fixtures tools/fixtures.sh ensure r10 r62h r42n r42x r10arc f10 f42n f42x f10arc
     grep -h '^\[fixtures\]' "$C/fixtures.err"
-    # One lane a fixture family (a fixture's steps in order: `bench frame`
-    # writes its scratch into the fixture).
+    # One lane a fixture family.
     lane r10 t1_r10
     lane r62h t1_r62h
     lane r42 t1_r42

@@ -44,15 +44,16 @@ celeste-rust (src/)
   frame.rs              the forward (ForwardState: start, resume, extend),
                         trees (grow_tree, TreeFilter), wins, MarkFilter
   storage/              the visited set, the wave, the region phase, the
-                        frame/hull/edge/out files (one container: file),
-                        decode, bench
+                        frame/hull/edge/out files (one container: file;
+                        their varints and keys: codec), decode, bench
   search/               driver (the search's levels, each level's arc
                         phase), backward (W, the optimum), reach (inside W;
                         exact), concrete (the concrete search; dual: over
                         pairs), known, arcs, hull, rem (+ rem_f64),
                         arc_edges, arc_check, hull_replay, tree (a finished
                         tree opened), pos_graph, result, ui_export, inspect,
-                        level_minus_one (the cost-to-go table, its one builder)
+                        level_minus_one (the cost-to-go table, its one
+                        builder), robust (a float witness against the libm)
   trace/                the tracer: interp, state, heap, domain (Symbolic) and
                         refdomain (RefDomain), frame (one frame traced), split
                         (the split pass), widen, error, walk (the lattice

@@ -21,7 +21,7 @@
 use anyhow::{ensure, Result};
 use std::path::{Path, PathBuf};
 
-use super::bundle::{get_varint, get_varint128, put_varint, put_varint128};
+use super::codec::{get_varint, get_varint128, narrow, put_varint, put_varint128, wide};
 use super::file::{self, At, Mapped, FORMAT_VERSION};
 use super::visited::Key;
 use crate::search::rem::Rem;
@@ -29,16 +29,6 @@ use celeste_core::pico8_num::Pico8Num as P8;
 use celeste_engine::exact::is_provisional;
 
 const MAGIC: &[u8; 4] = b"CSO1";
-
-#[inline]
-fn wide(k: Key) -> u128 {
-    (k.0 as u128) << 64 | k.1 as u128
-}
-
-#[inline]
-fn narrow(w: u128) -> Key {
-    ((w >> 64) as u64, w as u64)
-}
 
 /// One out-edge row as a unit makes it (`o`: `bundle::offset`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]

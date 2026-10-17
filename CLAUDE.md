@@ -179,6 +179,8 @@ budget): a change keeps them byte-identical, or re-pins them on evidence.
 - **Re-pin only on evidence that the SETS did not move**, and say so in the
   commit.
 - `kernel lanes: missed 0` in every log.
+- **Concurrent checks are safe**: the fixtures are shared and READ-ONLY (a
+  write into one fails), each run's scratch its own (`CHECK_DIR` per checkout).
 
 ## Verifying a result: REAL PLAY, not the IL load
 

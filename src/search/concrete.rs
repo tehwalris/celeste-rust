@@ -336,15 +336,15 @@ pub struct Witness {
     pub cells: Vec<u32>,
 }
 
-impl Witness {
-    /// The inputs as a comma list (`rewrite run -i`, `pico8_diff/replay.py`).
-    pub fn inputs_text(&self) -> String {
-        self.inputs.iter().map(|b| b.to_string()).collect::<Vec<_>>().join(",")
-    }
+/// Inputs as a comma list (`rewrite run -i`, `pico8_diff/replay.py`).
+pub fn inputs_text(inputs: &[u8]) -> String {
+    inputs.iter().map(|b| b.to_string()).collect::<Vec<_>>().join(",")
+}
 
+impl Witness {
     /// `witness.txt`: `inputs ...`, then `f x y` per frame (frame 0 the start).
     pub fn save(&self, path: &std::path::Path) -> Result<()> {
-        let mut text = format!("inputs {}\n", self.inputs_text());
+        let mut text = format!("inputs {}\n", inputs_text(&self.inputs));
         for (f, &c) in self.cells.iter().enumerate() {
             match super::pos_graph::cell_xy(c) {
                 Some((x, y)) => text += &format!("{f} {x} {y}\n"),
@@ -429,18 +429,23 @@ pub(super) fn lookup_view<N: EngineNum>(row: &Rt2<N>, seeded: bool) -> Result<Rt
     Ok(rt2)
 }
 
-/// A concrete state's remainder as a torus point (no player: the start's).
-pub fn rem_of<N: Rem>(rt2: &Rt2<N>) -> Result<(Point<N>, Point<N>)> {
+/// A concrete state's exact remainder per axis (`None`: no player).
+pub fn rem_raw<N: Rem>(rt2: &Rt2<N>) -> Result<Option<(N, N)>> {
     use celeste_engine::runtime2::AV;
     let ids = crate::compiled::ids();
-    let Some((cx, cy)) = rt2.player_xy_cells(ids, ids.f_rem) else { return Ok(super::rem::start_point::<N>()) };
-    let at = |c: usize| -> Result<Point<N>> {
-        match rt2.cols[c].at(0) {
-            AV::Num(n) => N::point(n).ok_or_else(|| anyhow::anyhow!("a remainder {n:?} outside [-1/2, 1/2)")),
-            other => anyhow::bail!("a concrete remainder expected, got {other:?}"),
-        }
+    let Some((cx, cy)) = rt2.player_xy_cells(ids, ids.f_rem) else { return Ok(None) };
+    let num = |c: usize| match rt2.cols[c].at(0) {
+        AV::Num(n) => Ok(n),
+        other => Err(anyhow::anyhow!("a concrete remainder expected, got {other:?}")),
     };
-    Ok((at(cx)?, at(cy)?))
+    Ok(Some((num(cx)?, num(cy)?)))
+}
+
+/// A concrete state's remainder as a torus point (no player: the start's).
+pub fn rem_of<N: Rem>(rt2: &Rt2<N>) -> Result<(Point<N>, Point<N>)> {
+    let Some((x, y)) = rem_raw(rt2)? else { return Ok(super::rem::start_point::<N>()) };
+    let at = |n: N| N::point(n).ok_or_else(|| anyhow::anyhow!("a remainder {n:?} outside [-1/2, 1/2)"));
+    Ok((at(x)?, at(y)?))
 }
 
 /// `n` reference engines built under `run` (`_init` runs under it), and
