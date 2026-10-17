@@ -1,14 +1,10 @@
-//! THE REFERENCE ENGINE: the tracer's interpreter over `RefDomain`
-//! (`trace::refdomain`) as a frame step on blocks. One lane in, every fork
-//! leaf out as a keyed one-row block, so a reference successor keys like a
-//! kernel row. Slow by design (one lane, one path at a time).
-//!
-//! `Interp<RefDomain>` runs ONE scalar path of a frame; `run_frame_all`
-//! enumerates the fork tree depth-first by re-execution (run to a leaf,
-//! record the output, `cursor.advance()`, re-run). The cursor is the only
-//! state carried across reruns: the input is cloned per path, so nothing is
-//! snapshotted or backtracked. A lane of a block becomes a state, and a leaf
-//! a block, through the one converter (`trace::block`).
+//! THE REFERENCE ENGINE: the tracer's interpreter over `RefDomain` as a
+//! frame step on blocks. One lane in, every fork leaf out as a keyed one-row
+//! block, so a reference successor keys like a kernel row. Slow by design.
+//! `run_frame_all` enumerates the fork tree depth-first by re-execution (run
+//! to a leaf, record it, `cursor.advance()`, re-run): the cursor is the only
+//! state carried across reruns, the input cloned per path. A lane becomes a
+//! state, and a leaf a block, through the one converter (`trace::block`).
 
 use anyhow::{bail, ensure, Result};
 use celeste_core::arith::{Arithmetic, EngineNum, Fixed, Float};
@@ -39,12 +35,10 @@ pub struct ReferenceEngine<A: Arithmetic> {
     /// The post-`_init` state: the room's start, and what a block does not carry.
     base: State<RefDomain<A>>,
     fn_info: FnInfo,
-    /// The most fork paths one frame may take (`TooManyPaths`).
     path_cap: usize,
     /// The level `run_lane` (the engine as a `FrameStep`) forks a row's
     /// unknowns at: `Level::EXACT` unless `at_level`.
     level: Level,
-    /// The settings it was made under (its room, category, split frame).
     settings: std::sync::Arc<crate::settings::Settings>,
 }
 
@@ -56,7 +50,7 @@ pub type FloatRefEngine = ReferenceEngine<Float>;
 
 impl<A: Arithmetic> ReferenceEngine<A> {
     /// Parse the cart, run its toplevel and `_init` for the start room of
-    /// settings `s`, the engine's settings from then on.
+    /// settings `s`.
     pub fn new(s: &crate::settings::Settings) -> Result<Self> {
         let root = std::path::Path::new(".");
         let chunks = crate::trace::cart::Chunks::parse(root, s)?.leak();
@@ -67,7 +61,6 @@ impl<A: Arithmetic> ReferenceEngine<A> {
         Ok(ReferenceEngine { it, body, body_concrete: &chunks.frame, base, fn_info, path_cap: 1_000_000, level: Level::EXACT, settings: std::sync::Arc::new(s.clone()) })
     }
 
-    /// The engine with `run_lane` at `level`.
     pub fn at_level(mut self, level: Level) -> Self {
         self.level = level;
         self
@@ -79,7 +72,6 @@ impl<A: Arithmetic> ReferenceEngine<A> {
         self.path_cap = cap;
     }
 
-    /// The room's start (post-`_init`) as a state.
     pub fn start_state(&self) -> &State<RefDomain<A>> {
         &self.base
     }
@@ -106,7 +98,7 @@ impl<A: Arithmetic> ReferenceEngine<A>
 where
     A::Num: EngineNum<A = A>,
 {
-    /// The room's start (post-`_init`) as a one-row block, without keys.
+    /// The room's start as a one-row block, without keys.
     pub fn initial(&self) -> Result<Rt2<A::Num>> {
         to_block(&self.base, self.settings.room)
     }
@@ -139,7 +131,6 @@ where
         Ok((leaves.map_err(|e| e.context(ran_from(st, Some(byte))))?, mask))
     }
 
-    /// Leaves as keyed one-row blocks.
     fn blocks(&self, leaves: &[State<RefDomain<A>>]) -> Result<Vec<Block<A::Num>>> {
         leaves.iter().map(|l| Block::canonical(to_block(l, self.settings.room)?)).collect()
     }
@@ -220,7 +211,7 @@ where
         Ok((self.blocks(&leaves)?, mask))
     }
 
-    /// `step` where the frame must not fork: the one successor.
+    /// `step` where the frame must not fork.
     pub fn step_one(&mut self, row: &Rt2<A::Num>, byte: u8) -> Result<Block<A::Num>> {
         let mut out = self.step(row, byte)?;
         ensure!(out.len() == 1, "concrete frame produced {} leaves (expected exactly 1)", out.len());
@@ -232,13 +223,11 @@ impl<A: Arithmetic> ReferenceEngine<A>
 where
     A::Num: Rem<A = A>,
 {
-    /// One frame of lane `lane` at the engine's level (`at_level`): every
-    /// fork leaf (the buttons, and each unknown boolean of the row, are
-    /// forked per path), each with its remainder TRANSFER - the
-    /// interpreter's arc capture (`Interp::arc_capture`: the player's split
-    /// per axis, as the tracer captures it for the kernels), decoded by the
-    /// arithmetic's decoder (`Rem::transfer`: 16.16's is the kernels'
-    /// `search::arc_edges::decode_axis`; a refusal is fatal, as theirs).
+    /// One frame of lane `lane` at the engine's level: every fork leaf (the
+    /// buttons and each unknown boolean of the row forked per path), each with
+    /// its remainder TRANSFER - the interpreter's arc capture, as the tracer
+    /// captures it for the kernels, decoded by the arithmetic's decoder
+    /// (`Rem::transfer`; a refusal is fatal, as theirs).
     pub fn run_lane(&mut self, block: &Rt2<A::Num>, lane: usize) -> Result<Vec<(Block<A::Num>, <A::Num as Rem>::Pair)>> {
         let (mut st, unknown) = from_block(block, lane, &self.fn_info, &self.base)?;
         let zero = A::point(A::from_i16(0));
@@ -259,16 +248,14 @@ where
 }
 
 impl<A: crate::transpile::garith::GraphArith> ReferenceEngine<A> {
-    /// The one converter agrees across the two sides on every lane of `row`
-    /// (`block::check_agreement`, from this engine's base state).
+    /// The one converter agrees across the two sides on every lane of `row`.
     pub fn check_agreement(&self, row: &Rt2<A::Num>) -> Result<()> {
         check_agreement::<A>(row, &self.fn_info, &self.base, self.settings.room)
     }
 }
 
 /// A leaf's remainder transfer: its arc capture and the player's remainder
-/// at the frame's end (before any widening: the leaf is the interpreter's),
-/// per axis a `Capture`, decoded (`Rem::transfer`).
+/// at the frame's end (before any widening), decoded (`Rem::transfer`).
 fn transfer_of<N: Rem>(leaf: &State<RefDomain<N::A>>) -> Result<N::Pair> {
     let axes = leaf.arc.as_deref().ok_or_else(|| anyhow::anyhow!("arc capture: a leaf without one"))?;
     let players = objects_of_type(leaf, "player");
@@ -371,8 +358,8 @@ where
     distance_cmp::<A>(a, b, d) != std::cmp::Ordering::Greater
 }
 
-/// What a reference frame ran from, for its error: the input (`None`: the
-/// buttons forked) and where every player and player spawn was.
+/// What a reference frame ran from, for its error: the input and where every
+/// player and player spawn was.
 fn ran_from<A: Arithmetic>(st: &State<RefDomain<A>>, byte: Option<u8>) -> String {
     let at: Vec<String> = ["player", "player_spawn"]
         .iter()
@@ -463,10 +450,8 @@ where
 }
 
 /// THE REFERENCE ENGINE AS THE FORWARD'S `FrameStep` (`rewrite forward
-/// --reference`, the tests): one engine a worker (an `Interp` is not
-/// shared), every fork leaf one row with its source lane's cell and its
-/// transfer - so its tree is the kernels': frames, edges and hulls
-/// (`ckhash --edges --hulls`).
+/// --reference`): one engine a worker, every fork leaf one row with its
+/// source lane's cell and its transfer - so its tree is the kernels'.
 pub struct RefFrameStep<N: Rem = Pico8Num> {
     engines: Vec<std::sync::Mutex<ReferenceEngine<N::A>>>,
     level: Level,
@@ -504,10 +489,9 @@ impl<N: Rem> crate::frame::FrameStep<N> for RefFrameStep<N> {
         lanes: &[usize],
         sink: &mut crate::storage::unit::UnitSink<N>,
     ) -> Result<()> {
-        // The lanes in parallel, each on an engine of the pool (a frame of
-        // one lane is milliseconds, and a unit is often a whole frontier),
-        // emitted in order a chunk at a time (a lane's leaves are hundreds
-        // of rows: a whole unit's at once would be gigabytes).
+        // The lanes in parallel, each on an engine of the pool, emitted in order a
+        // chunk at a time (a lane's leaves are hundreds of rows: a whole unit's at
+        // once would be gigabytes).
         let n = self.engines.len();
         for chunk in lanes.chunks(4 * n) {
             let rows = crate::storage::wave::par_map(chunk, n, |&lane| self.engine().run_lane(block.rt2(), lane));
@@ -548,11 +532,10 @@ pub fn run_frame_all<'a, A: Arithmetic>(
     it.d.cursor = Cursor::new();
     let mut outputs = Vec::new();
     let mut paths = 0usize;
-    // An unknown fly fruit needs nothing here: its `fly` is an unknown
-    // boolean (forked below), `step`/`y` the unknown number and `spd.y`/
-    // `rem.y` intervals, whose comparisons the domain forks
-    // (`RefDomain::compare`) as the kernels' undecided atoms do. Unknown
-    // platforms have no reference form yet.
+    // An unknown fly fruit needs nothing here: its `fly` is an unknown boolean
+    // (forked below), `step`/`y` the unknown number and `spd.y`/`rem.y`
+    // intervals, whose comparisons the domain forks as the kernels' undecided
+    // atoms do. Unknown platforms have no reference form yet.
     if level.platforms {
         anyhow::bail!("the reference engine does not run platforms-unknown levels (`p`, plans/abstractions.md)");
     }
@@ -575,7 +558,7 @@ pub fn run_frame_all<'a, A: Arithmetic>(
             1 => {
                 let (mut out, flow) = ended.into_iter().next().expect("one state");
                 anyhow::ensure!(!matches!(flow, crate::trace::interp::Flow::Break), "break at chunk toplevel");
-                // The absent-as-zero fields, as the tracer's `trace_frame` writes them.
+                // The absent-as-zero fields, as `trace_frame` writes them.
                 crate::trace::widen::materialize_absent_fields(&mut out, &mut it.d)?;
                 outputs.push(out);
             }
@@ -605,10 +588,9 @@ impl std::fmt::Display for TooManyPaths {
 impl std::error::Error for TooManyPaths {}
 
 /// A near level's floors, concretized per path as the kernels read them
-/// (`Hook::NearFloor`'s input, `widen::read_near_floors`): a widened `state` (an interval) is each
-/// whole number in it, by the cursor, and `collideable` is `state ~= 2` - the
-/// cart keeps the two in step, so a stored unknown `collideable` is not a
-/// separate choice.
+/// (`widen::read_near_floors`): a widened `state` is each whole number in it,
+/// by the cursor, and `collideable` is `state ~= 2` (the cart keeps the two
+/// in step, so a stored unknown `collideable` is no separate choice).
 fn concretize_near_floors<A: Arithmetic>(st: &mut State<RefDomain<A>>, d: &mut RefDomain<A>) -> Result<()> {
     use crate::trace::heap::Value;
     use crate::trace::iface;
@@ -651,9 +633,8 @@ pub fn set_buttons<A: celeste_core::arith::Arithmetic>(st: &mut State<RefDomain<
     Ok(t)
 }
 
-/// A reference state as a one-lane block (`block::to_rt2`, no row keys:
-/// `frame::Block::canonical` makes them canonical; a tree keys them).
-/// `room`: the search's start room (the block's cart and collision cache).
+/// A reference state as a one-lane block (no row keys); `room`: the search's
+/// start room (the block's cart and collision cache).
 pub fn to_block<N: EngineNum>(st: &State<RefDomain<N::A>>, room: (i16, i16)) -> Result<Rt2<N>> {
     let (cart, cache) = crate::compiled::room_context(room)?;
     block::to_rt2(
@@ -674,11 +655,9 @@ pub fn to_block<N: EngineNum>(st: &State<RefDomain<N::A>>, room: (i16, i16)) -> 
 }
 
 /// THE TWO SIDES AGREE on a block: every lane of `rt2`, read into the
-/// reference's domain and into the tracer's (`from_block`), converts back
-/// to ONE block - the same structure, shape, values and exact key - and the
-/// tracer's skeleton of it (what its kernels bind) has that shape. The
-/// tracer's numbers and booleans are a block's values here, so constants,
-/// read off its graph. `base` and `fn_info`: the reference engine's.
+/// reference's domain and into the tracer's, converts back to ONE block -
+/// the same structure, shape, values and exact key - and the tracer's
+/// skeleton of it (what its kernels bind) has that shape.
 fn check_agreement<A: crate::transpile::garith::GraphArith>(rt2: &Rt2<A::Num>, fn_info: &FnInfo, base: &State<RefDomain<A>>, room: (i16, i16)) -> Result<()> {
     use crate::trace::block::{skeleton, to_rt2};
     use crate::trace::domain::Symbolic;
@@ -805,10 +784,10 @@ mod tests {
         assert!(checked > 2 * runs, "{checked} inputs covered, {runs} run");
     }
 
-    /// Along a route, every `stride`-th state projected onto `level` makes
-    /// the same successors projected onto it, for every input (`all_inputs`,
-    /// else the route's own), with `step_at`'s pins as without them. Returns
-    /// (states with a `what`, leaves pinned, leaves without).
+    /// Along a route, every `stride`-th state projected onto `level` makes the
+    /// same successors projected onto it, for every input (`all_inputs`, else
+    /// the route's own), with `step_at`'s pins as without them. Returns (states
+    /// with a `what`, leaves pinned, leaves without).
     fn pins_keep_the_projected_successors(settings: crate::settings::Settings, route: &str, stride: usize, all_inputs: bool, level: &str, what: &str) -> (usize, usize, usize) {
         let level = Level::parse(level).expect("level");
         let inputs = crate::concrete::read_inputs(route).expect("the route's inputs");

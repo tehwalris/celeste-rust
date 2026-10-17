@@ -1,10 +1,8 @@
 //! The leaf types every other crate needs: the game's arithmetic (`arith`:
-//! PICO-8's 16.16 `Pico8Num`/`Pico8NumInterval`, the tools' Lua doubles
-//! `LuaF64`), the cart's map and flag tables
-//! (`CartData`) and the per-room tile lookup (`CollisionCache`).
-//!
-//! The bottom of the workspace: nothing here knows the IR, the interpreter or
-//! the engine. `celeste-rust` re-exports these modules at its own root.
+//! PICO-8's 16.16 `Pico8Num`, the tools' Lua doubles `LuaF64`), the cart's
+//! map and flag tables (`CartData`) and the per-room tile lookup
+//! (`CollisionCache`). Nothing here knows the IR, the interpreter or the
+//! engine.
 
 #[macro_use(anyhow)]
 extern crate anyhow;

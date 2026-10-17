@@ -1,14 +1,9 @@
 //! The block engine: the `(shape, rows)` data model and the lane runtime.
-//!
-//! `runtime2` is the block itself - `Rt2`'s structure and columns, the
-//! boundary abstraction, dedup, merge, retain, row keys and the shape hash.
-//! `kernel` holds the typed 16-lane primitives: the reference semantics the
-//! ASM codegen is tested against, and the call-outs the assembled kernels make.
-//!
-//! This crate does not know about the interpreter: it depends only on
-//! `celeste-core` (numbers, cart, collision cache) and `celeste-names`
-//! (`FIELD_NAMES`). Translating interpreter states into blocks is
-//! `trace::block` in `celeste-rust`.
+//! `runtime2` is the block itself (structure and columns, the boundary,
+//! dedup, row keys, the shape hash); `kernel` the typed 16-lane primitives
+//! (the reference semantics the ASM codegen is tested against, and its
+//! call-outs). The crate does not know the interpreter: translating states
+//! into blocks is `trace::block` in `celeste-rust`.
 
 pub mod exact;
 pub mod kernel;

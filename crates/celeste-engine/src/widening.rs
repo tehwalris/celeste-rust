@@ -2,12 +2,11 @@
 //! its exact value, what it stores, what that owes, and why it is sound.
 //!
 //! One declarative table (`TABLE`), interpreted twice: the tracer turns each
-//! entry into graph ops and owed errors at the frame's end
-//! (`trace::widen`), and the block side evaluates the same entry over
-//! columns (`Rt2::widen_to`: the concrete search's node lookup, the objects
-//! ladder's projection, the boundary). Neither side has a widening the table
-//! does not name. A LEVEL (`Level`) is the set of entries whose `Flag` it
-//! has; `Flag::Always` entries apply at every level.
+//! entry into graph ops and owed errors at the frame's end (`trace::widen`),
+//! and the block side evaluates the same entry over columns
+//! (`Rt2::widen_to`: the concrete search's node lookup, the objects ladder's
+//! projection, the boundary). Neither side has a widening the table does not
+//! name. A LEVEL is the set of entries whose `Flag` it has.
 //!
 //! Two kinds (`Kind`): an EXACT canonicalization loses nothing the search
 //! observes (each says why in `why`); an OVER-APPROXIMATION is refuted by
@@ -16,9 +15,7 @@
 //! it").
 //!
 //! What a table entry cannot say is a HOOK (`Hook`), named in its entry and
-//! documented where it is implemented: the near floors (the stored value
-//! depends on the player's position per lane) and the platforms' input
-//! (bound to the platform worlds).
+//! documented where it is implemented.
 
 use celeste_core::arith::{Arithmetic, EngineNum};
 
@@ -71,7 +68,6 @@ impl Level {
         Ok(level)
     }
 
-    /// Does this level apply the entries of `flag`?
     pub fn has(&self, flag: Flag) -> bool {
         match flag {
             Flag::Always => true,
@@ -195,20 +191,19 @@ pub enum Kind {
 /// What a table entry cannot say, implemented by name on both sides.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Hook {
-    /// The near floors (`n`): `state`/`collideable` stored as their slots
-    /// say EXCEPT where a player certainly overlaps the floor at the frame's
-    /// end (a per-lane condition on ANOTHER object's fields); there the
-    /// cart's invariant (hidden: `state` 2, `collideable` false) is stored,
-    /// owed (with `p`: the computed value); mid split frame the computed
-    /// `collideable` is kept in the player's probe window; and the input
-    /// derives `collideable` from `state` (`state ~= 2`). Both sides:
-    /// `Rt2::widen_near_floors`, `trace::widen::widen_near_floors`.
+    /// The near floors (`n`): `state`/`collideable` stored as their slots say
+    /// EXCEPT where a player certainly overlaps the floor at the frame's end (a
+    /// per-lane condition on ANOTHER object's fields); there the cart's
+    /// invariant (hidden: `state` 2, `collideable` false) is stored, owed (with
+    /// `p`: the computed value); mid split frame the computed `collideable` is
+    /// kept in the player's probe window; the input derives `collideable` from
+    /// `state`. Both sides: `Rt2::widen_near_floors`,
+    /// `trace::widen::widen_near_floors`.
     NearFloor,
-    /// The moving platforms' INPUT (`p`): which world platform each is
-    /// (matched by its constant `y` and `dir`), `x` restricted to the path
-    /// and recorded as the world's cell, `spd.x` bound by the worlds, `rem.x`
-    /// the owed literal: `trace::widen::platform_inputs`. Their stored
-    /// values are plain entries.
+    /// The moving platforms' INPUT (`p`): which world platform each is, `x`
+    /// restricted to the path and recorded as the world's cell, `spd.x` bound by
+    /// the worlds, `rem.x` the owed literal (`trace::widen::platform_inputs`).
+    /// Their stored values are plain entries.
     PlatformInputs,
 }
 
@@ -274,8 +269,7 @@ pub const FLOOR_HITBOX: [i16; 4] = [0, 0, 8, 8];
 
 /// The cart's `floor.collide(player, 0, 0)` solved for the player: OPEN
 /// windows `(lo, hi)` for `x` and `y`; `None` where one leaves the 16.16
-/// range (a floor's position is its map tile's, so never: an error, not a
-/// wrapped window).
+/// range (never: a floor's position is its map tile's).
 pub fn floor_player_window<N: EngineNum>(floor: (N, N)) -> Option<[(N, N); 2]> {
     let [px, py, pw, ph] = PLAYER_HITBOX;
     let [fx, fy, fw, fh] = FLOOR_HITBOX;
@@ -754,8 +748,8 @@ impl<N: EngineNum> Rt2<N> {
         }
     }
 
-    /// The cell of a slot: `field` below the object `base`, or from the
-    /// globals (`base` `None`).
+    /// The cell of a slot: `field` below the object `base`, else from the
+    /// globals.
     fn slot_cell(&self, base: Option<u32>, field: &[u32]) -> Option<u32> {
         let (mut cell, rest) = match base {
             Some(obj) => (self.obj_field_cell(obj, field[0])?, &field[1..]),
@@ -865,12 +859,10 @@ impl<N: EngineNum> Rt2<N> {
         self.cols[c as usize] = new;
     }
 
-    /// `Hook::NearFloor` on blocks (`trace::widen::widen_near_floors`):
-    /// `state` and `collideable` widened except where a player certainly
-    /// overlaps the floor (kept as they are: the kernels store the cart's
-    /// invariant there, or with `p` the computed value - either is what a
-    /// concrete row holds). `state` is an interval column, as the kernels
-    /// store it.
+    /// `Hook::NearFloor` on blocks (`trace::widen::widen_near_floors`): `state`
+    /// and `collideable` widened except where a player certainly overlaps the
+    /// floor (kept as they are: the kernels store the cart's invariant there, or
+    /// with `p` the computed value - either is what a concrete row holds).
     fn widen_near_floors(&mut self, ids: &BoundaryIds, r: &Resolved) {
         let le = <N::A as Arithmetic>::le;
         let (slo, shi) = range::<N>(FLOOR_STATE_RANGE.0, FLOOR_STATE_RANGE.1);

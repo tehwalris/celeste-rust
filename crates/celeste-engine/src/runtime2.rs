@@ -1,8 +1,8 @@
 //! The columnar block, the kernels' input/output: heap structure shared by
 //! every lane (the shape premise), values in per-lane columns. Owns the lane
 //! primitives and the BOUNDARY: a level's widenings (`widen_to`, the
-//! `widening` table on blocks), canonical renumbering and the shape hash. Row keys are the storage's
-//! (`exact::KeySpace`): a stored piece carries them.
+//! `widening` table on blocks), canonical renumbering and the shape hash.
+//! Row keys are the storage's (`exact::KeySpace`).
 
 use std::sync::Arc;
 
@@ -23,7 +23,6 @@ pub fn mix64(mut x: u64) -> u64 {
     x ^ (x >> 31)
 }
 
-/// `mix64`'s two multipliers.
 const MIX_C1: u64 = 0xbf58_476d_1ce4_e5b9;
 const MIX_C2: u64 = 0x94d0_49bb_1331_11eb;
 
@@ -32,12 +31,11 @@ const MIX_C2: u64 = 0x94d0_49bb_1331_11eb;
 /// (`exact::Code::pos`).
 pub const POS_WHOLE: u32 = 0xffff_0000;
 
-/// One lane's abstract value, its numbers of type `N` (the arithmetic's:
-/// 16.16 by default). `Copy`, 12 bytes + tag in 16.16.
+/// One lane's abstract value, its numbers of type `N` (the arithmetic's).
+/// `Copy`, 12 bytes + tag in 16.16.
 #[derive(Clone, Copy, PartialEq, Debug, Serialize, Deserialize)]
 pub enum AV<N = P8> {
     Num(N),
-    /// Closed interval [low, high].
     Ival(N, N),
     Bool(bool),
     UBool,
@@ -62,7 +60,6 @@ pub enum Col<N = P8> {
 }
 
 impl<N: Copy + PartialEq> Col<N> {
-    /// The lane's value, independent of the column's representation.
     #[inline]
     pub fn at(&self, lane: usize) -> AV<N> {
         match self {
@@ -130,7 +127,7 @@ pub struct BoundaryIds {
 pub struct Rt2<N = P8> {
     pub width: usize,
     pub structure: Vec<Cell2<N>>,
-    /// Per-cell value columns, parallel to `structure` (for `Cell2::Val`).
+    /// Per-cell value columns, parallel to `structure`.
     pub cols: Vec<Col<N>>,
     pub globals: Vec<u32>,
     pub strings: Vec<String>,
@@ -242,7 +239,6 @@ pub fn collapse_uniform<N: Copy + PartialEq>(c: Col<N>) -> Col<N> {
 }
 
 impl<N: EngineNum> Rt2<N> {
-    /// An empty block shell.
     pub fn empty(
         width: usize,
         globals_len: usize,
@@ -332,7 +328,7 @@ impl<N: EngineNum> Rt2<N> {
         found
     }
 
-    /// The `x`/`y` cells of the table at `obj`'s field `f` (rem, spd).
+    /// The `x`/`y` cells of the table at `obj`'s field `f`.
     fn xy_cells_of(&self, obj: u32, f: u32, ids: &BoundaryIds) -> Vec<u32> {
         let mut out = Vec::new();
         if let Some(ptr_cell) = self.obj_field_cell(obj, f) {
@@ -354,7 +350,6 @@ impl<N: EngineNum> Rt2<N> {
         self.player_objects(ids).first().copied().or_else(|| self.objects_of_type(ids, ids.g_player_spawn).first().copied())
     }
 
-    /// The position object's `x` and `y` cells (`position_object`).
     pub fn position_cells(&self, ids: &BoundaryIds) -> Option<(u32, u32)> {
         let obj = self.position_object(ids)?;
         Some((self.obj_field_cell(obj, ids.f_x)?, self.obj_field_cell(obj, ids.f_y)?))
@@ -410,10 +405,9 @@ impl<N: EngineNum> Rt2<N> {
         h.finish()
     }
 
-    /// Renumber every cell into CANONICAL order (BFS discovery from the
-    /// globals, children in stored order) and compact, so isomorphic heaps
-    /// are identical and row keys block-independent. Public: the heap's
-    /// converter (`trace::block::to_rt2`) ends in it.
+    /// Renumber every cell into CANONICAL order (BFS discovery from the globals,
+    /// children in stored order) and compact, so isomorphic heaps are identical
+    /// and row keys block-independent.
     pub fn canonicalize_ids(&mut self) {
         // Fields sorted by name, or creation order changes the shape.
         for cell in self.structure.iter_mut() {
@@ -421,7 +415,6 @@ impl<N: EngineNum> Rt2<N> {
                 fields.sort_by_key(|(k, _)| celeste_names::FIELD_NAMES[*k as usize]);
             }
         }
-        // The canonical reachability BFS.
         let mut order: Vec<u32> = Vec::new();
         let mut new_id = vec![u32::MAX; self.structure.len()];
         {
@@ -546,7 +539,7 @@ impl<N: EngineNum> Rt2<N> {
         self.boundary_finish();
     }
 
-    /// Shared boundary head: check every column is at block width.
+    /// Shared boundary head: every column at block width.
     fn boundary_prepare(&mut self) {
         let full = |c: &Col<N>| match c {
             Col::U(_) => true,
@@ -564,8 +557,8 @@ impl<N: EngineNum> Rt2<N> {
         );
     }
 
-    /// Shared boundary tail: canonical ids and the shape hash. Row keys are
-    /// the storage's (`exact::KeySpace`): a boundary clears them.
+    /// Shared boundary tail: canonical ids and the shape hash; row keys
+    /// cleared.
     fn boundary_finish(&mut self) {
         assert!(self.prints.is_empty(), "prints at a frame boundary: {:?}", self.prints);
         self.canonicalize_ids();

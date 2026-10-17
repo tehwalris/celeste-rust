@@ -1,30 +1,25 @@
-//! The 16-lane primitives: the reference semantics the ASM codegen's ops
-//! are checked against (`transpile::asm::tests`), the call-outs the
-//! assembled kernels make (collisions, map reads).
-//!
-//! Types are static; lanes are rows (W = 16 x i32 = one zmm). Each op
-//! agrees bit-exactly with the console's operation (`Pico8Num`'s
-//! `wrapping_*` / `saturating_*`; the tests check it). Where that is not the
-//! EXACT result (it wrapped or saturated), the lane is in error: an
-//! overflow is never a value. The `*_wraps` masks are those lanes, the
-//! reference for the assembled kernels' `Op::NoWrap` (`trace::error`).
+//! The 16-lane primitives: the reference semantics the ASM codegen's ops are
+//! checked against (`transpile::asm::tests`), and the call-outs the
+//! assembled kernels make. Lanes are rows (16 x i32 = one zmm). Each op
+//! agrees bit-exactly with the console's (`Pico8Num`'s `wrapping_*` /
+//! `saturating_*`); where that is not the EXACT result the lane is in error:
+//! the `*_wraps` masks are those lanes, the reference for the kernels'
+//! `Op::NoWrap`.
 
 use celeste_core::cart_data::CartData;
 use celeste_core::collision_cache::CollisionCache;
 use celeste_core::pico8_num::Pico8Num as P8;
 
-// The whole lane layer is AVX-512.
 use std::arch::x86_64::*;
 
 pub const W: usize = 16;
 
 pub use crate::runtime2::mix64;
 
-/// One num column: 16 `Pico8Num`s = 16 raw `i32`s = one zmm register.
-///
-/// A register, not `[Pico8Num; 16]`: an array forces the column to be
-/// assembled and taken apart around every vector op. A primitive that drops
-/// to `to_array` punches that hole, so it needs a reason and a measurement.
+/// One num column: 16 `Pico8Num`s = one zmm register. A register, not
+/// `[Pico8Num; 16]`: an array forces the column to be assembled and taken
+/// apart around every vector op, so a primitive that drops to `to_array`
+/// needs a reason and a measurement.
 #[derive(Clone, Copy)]
 #[repr(transparent)]
 pub struct ZN(pub __m512i);
@@ -48,8 +43,7 @@ impl ZN {
     pub fn to_array(self) -> [P8; W] {
         unsafe { std::mem::transmute(self.0) }
     }
-    /// One lane, for code that really works one row at a time. Not for
-    /// arithmetic.
+    /// One lane, for code that works one row at a time; not for arithmetic.
     #[inline(always)]
     pub fn lane(self, i: usize) -> P8 {
         self.to_array()[i]
@@ -74,9 +68,8 @@ pub struct ZI {
     pub lo: ZN,
     pub hi: ZN,
 }
-/// One tri-state bool column slice. `val` is meaningful where `known` is
-/// set. A pair of `u16` because 16 bits is an AVX-512 mask register: Kleene
-/// ops are `kandw`s and `zsel_n` is one `vpblendmd`.
+/// One tri-state bool column slice: `val` meaningful where `known` is set.
+/// `u16`s, as an AVX-512 mask register: Kleene ops are `kandw`s.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ZB {
     pub val: u16,
@@ -95,11 +88,10 @@ pub fn zn_splat(v: P8) -> ZN {
     ZN(m512(v.as_raw_u32() as i32))
 }
 
-// A `Pico8Num` is its raw `i32` in 16.16 fixed point, so add, sub, min
-// and max are the plain integer ops: the scale cancels. `+ - *` and negation
-// wrap as the console's do, `abs` of MIN does not saturate as the console's
-// does, and `/` saturates as it does: in each case on exactly the lanes the
-// op's `*_wraps` mask declines.
+// A `Pico8Num` is its raw `i32` in 16.16, so add, sub, min and max are the
+// plain integer ops. `+ - *` and negation wrap as the console's do, `abs`
+// of MIN does not saturate as the console's does, and `/` saturates as it
+// does: in each case on exactly the lanes the op's `*_wraps` mask declines.
 
 #[inline(always)]
 pub fn zn_add(a: ZN, b: ZN) -> ZN {
@@ -158,7 +150,6 @@ pub fn zn_mul_wraps(a: ZN, b: ZN) -> u16 {
 pub fn zn_div_wraps(a: ZN, b: ZN) -> u16 {
     lanes_where(a, b, |x, y| x.checked_div(y).is_none())
 }
-/// The mask of the lanes where `f` holds.
 fn lanes_where(a: ZN, b: ZN, f: impl Fn(P8, P8) -> bool) -> u16 {
     (0..W).fold(0u16, |m, i| m | (f(a.lane(i), b.lane(i)) as u16) << i)
 }
@@ -170,12 +161,10 @@ pub fn zn_flr(a: ZN) -> ZN {
     ZN(unsafe { _mm512_and_si512(a.0, m512(0xffff_0000u32 as i32)) })
 }
 
-/// 16.16 multiply: `(a as i64 * b as i64) >> 16`, truncated to i32.
-///
-/// The even/odd split: `vpmuldq` multiplies the sign-extended low i32 of
-/// each 64-bit element (the even lanes); an ARITHMETIC `>> 32` brings the
-/// odd lanes down for the second multiply. Both products are shifted by 16
-/// and the odd ones blended back into the odd slots.
+/// 16.16 multiply: `(a as i64 * b as i64) >> 16`, truncated to i32. The
+/// even/odd split: `vpmuldq` multiplies the sign-extended low i32 of each
+/// 64-bit element (the even lanes); an ARITHMETIC `>> 32` brings the odd
+/// lanes down for the second multiply.
 #[inline(always)]
 pub fn zn_mul(a: ZN, b: ZN) -> ZN {
     unsafe {
@@ -208,13 +197,11 @@ pub fn zn_sin(a: ZN) -> ZN {
     ZN::from_array(std::array::from_fn(|i| x[i].pico8_sin()))
 }
 
-// Interval ops: componentwise on the two planes: the interval rules are selections
-// between endpoints, never a per-lane branch.
-//
+// Interval ops: componentwise on the two planes, never a per-lane branch.
 // An endpoint must never wrap silently (a widened interval is exactly what
-// can run away). Each arm computes the signed-overflow predicate and panics
-// if any lane trips it (`Pico8NumInterval`'s checked operation has no
-// answer); the assembled kernel declines such a lane instead (`Op::NoWrap`).
+// can run away): each arm panics if any lane trips the signed-overflow
+// predicate; the assembled kernel declines such a lane instead
+// (`Op::NoWrap`).
 
 /// Signed 32-bit add-overflow, per lane: the sign of both operands
 /// differs from the sign of the result. `((a^r) & (b^r)) < 0`.
@@ -234,7 +221,6 @@ fn sub_overflows(a: __m512i, b: __m512i, r: __m512i) -> u16 {
     }
 }
 
-/// The panic of an interval arm whose `wraps` lanes are not empty.
 #[inline(always)]
 fn no_wrap(op: &str, wraps: u16) {
     if wraps != 0 {
@@ -271,10 +257,9 @@ pub fn zi_neg_wraps(a: ZI) -> u16 {
 }
 
 /// The lanes where interval `a` times the POSITIVE `k` (`zi_scale`) leaves
-/// the 16.16 range: the assembled kernel's error for it (`Op::NoWrap`).
-/// Per lane `Pico8Num::checked_mul` of each endpoint (the product is
-/// monotone in it, so the interval wraps iff an endpoint's image does), so
-/// the codegen's compares are checked against the operation they replace.
+/// the 16.16 range (`Op::NoWrap`): per lane `Pico8Num::checked_mul` of each
+/// endpoint (the product is monotone), so the codegen's compares are checked
+/// against the operation they replace.
 #[inline(always)]
 pub fn zi_scale_wraps(a: ZI, k: ZN) -> u16 {
     lanes_where(a.lo, k, |e, k| e.checked_mul(k).is_none()) | lanes_where(a.hi, k, |e, k| e.checked_mul(k).is_none())
@@ -332,9 +317,8 @@ pub fn zi_neg(a: ZI) -> ZI {
 }
 
 /// `abs` of an interval, branch-free: unchanged if non-negative, reflected
-/// if non-positive, else `[0, max(|lo|, |hi|)]`. The cases partition the
-/// lanes, so each is a mask and the result is blends. A low end at MIN
-/// stays MIN (`zn_abs`): the lanes `zi_abs_wraps` declines.
+/// if non-positive, else `[0, max(|lo|, |hi|)]`. A low end at MIN stays MIN
+/// (`zn_abs`): the lanes `zi_abs_wraps` declines.
 #[inline(always)]
 pub fn zi_abs(a: ZI) -> ZI {
     unsafe {
@@ -400,7 +384,6 @@ zn_cmp!(zn_gt, mask_gt, 6);
 zn_cmp!(zn_ge, mask_ge, 5);
 zn_cmp!(zn_eq, mask_eq, 0);
 
-/// The comparison the tri-state interval judge is performing.
 #[derive(Clone, Copy)]
 pub enum Cmp {
     Lt,
@@ -409,12 +392,9 @@ pub enum Cmp {
     Ge,
 }
 
-/// The tri-state interval comparison, per lane (degenerate intervals answer
-/// as plain numbers).
-///
-/// `t` is "definitely true", `f` "definitely false", neither is unknown.
-/// They are disjoint (for `Lt`, both would give `bh <= al <= ah < bl <=
-/// bh`), so `val = t` needs no masking.
+/// The tri-state interval comparison, per lane: `t` "definitely true", `f`
+/// "definitely false", neither unknown. They are disjoint, so `val = t`
+/// needs no masking.
 #[inline(always)]
 pub fn zi_cmp(op: Cmp, a: ZI, b: ZI) -> ZB {
     let (t, f) = match op {
@@ -484,12 +464,11 @@ pub fn zsel_b(c: ZB, t: ZB, f: ZB) -> ZB {
     }
 }
 
-/// `__split_by_flr` as an n-way fork. Fragment `c` is the `c`-th floor
-/// from the low end's, clipped to the lane; fragment 0 is never empty.
-/// Returns (fragment `c` per lane, valid mask); a lane with an empty
-/// fragment produces no row in this fork configuration. The fragments of a
-/// fork of arity `n` partition every lane spanning at most `n` floors; a
-/// wider lane is what `zi_span_ok` (the premise) takes off the kernel.
+/// `__split_by_flr` as an n-way fork: fragment `c` is the `c`-th floor from
+/// the low end's, clipped to the lane (fragment 0 is never empty); returns
+/// it and the valid mask. The fragments of a fork of arity `n` partition
+/// every lane spanning at most `n` floors; a wider lane is what `zi_span_ok`
+/// (the premise) takes off the kernel.
 #[inline(always)]
 pub fn zi_fork_flr(a: ZI, c: usize) -> (ZI, u16) {
     let (fl, fh) = (zn_flr(a.lo), zn_flr(a.hi));
@@ -551,10 +530,9 @@ pub fn zn_tile_flag_at(
 }
 
 #[inline(always)]
-/// `tile_flag_at` with a per-lane box: in the frame an object is created
-/// its hitbox depends on whether `type.init` replaced the default 8x8.
-/// Always takes the scan (the precomputed maps are keyed by the box); use
-/// `zn_tile_flag_at` when the box is uniform.
+/// `tile_flag_at` with a per-lane box (in the frame an object is created its
+/// hitbox depends on whether `type.init` replaced the default 8x8): always
+/// the scan, the precomputed maps being keyed by the box.
 pub fn zn_tile_flag_at_lanes(
     cache: &CollisionCache,
     cart: &CartData,
