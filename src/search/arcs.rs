@@ -255,16 +255,8 @@ impl Set {
     pub fn rotate(&self, v: i32) -> Set {
         let d = v.rem_euclid(CIRCLE as i32) as u32;
         let mut out = Vec::new();
-        for s in &self.0 {
-            let (lo, hi) = (s.lo + d, s.hi + d);
-            if hi <= CIRCLE {
-                out.push(Seg { lo, hi });
-            } else if lo >= CIRCLE {
-                out.push(Seg { lo: lo - CIRCLE, hi: hi - CIRCLE });
-            } else {
-                out.push(Seg { lo, hi: CIRCLE });
-                out.push(Seg { lo: 0, hi: hi - CIRCLE });
-            }
+        for &s in &self.0 {
+            rot_seg(s, d, |r| out.push(r));
         }
         Set::norm(out)
     }

@@ -16,7 +16,7 @@
 //! concrete search is exhaustive over leaves); else each lineage's first
 //! failing step is reported (`explain`) and the search FAILS.
 
-use super::concrete::{concrete_engines, exact_state, lookup_keys, lookup_view, rem_of, Side};
+use super::concrete::{concrete_engines, exact_state, lookup_keys, lookup_view, rem_of, rem_raw, Side};
 use super::rem::Rem;
 use crate::compiled::KernelLanes;
 use crate::frame::{wins_of, Block, MarkFilter, Visited};
@@ -279,18 +279,6 @@ fn backward(what: String) -> Option<Miss> {
 /// A route state in the tree, with its exact remainder (`None`: no player).
 type Held<N> = (Sk, Option<(N, N)>);
 
-/// The player's exact remainder in `b` (`None`: no player).
-fn rem_raw<N: Rem>(b: &Block<N>) -> anyhow::Result<Option<(N, N)>> {
-    use celeste_engine::runtime2::AV;
-    let ids = crate::compiled::ids();
-    let Some((cx, cy)) = b.rt2().player_xy_cells(ids, ids.f_rem) else { return Ok(None) };
-    let num = |c: usize| match b.rt2().cols[c].at(0) {
-        AV::Num(n) => Ok(n),
-        other => Err(anyhow::anyhow!("a concrete remainder expected, got {other:?}")),
-    };
-    Ok(Some((num(cx)?, num(cy)?)))
-}
-
 /// THE HULL FORWARD'S CLAIM for `b` at step `s`: in the tree by `s`, its
 /// remainder inside its hull, and a recorded edge mapping its parent's
 /// (`from`) remainder to its own. Where the tree holds it, or the miss.
@@ -302,7 +290,7 @@ fn hull_claim<N: Rem>(b: &Block<N>, s: u32, sk: Option<Sk>, from: Option<Held<N>
     }) else {
         return Ok(Err(Miss { forward: true, lost: true, what: format!("NOT IN THE TREE by step {s} ({node})") }));
     };
-    let r = rem_raw(b)?;
+    let r = rem_raw(b.rt2())?;
     let zero = <N::A as celeste_core::arith::Arithmetic>::from_i16(0);
     let (x, y) = r.unwrap_or((zero, zero));
     // (A full hull is not stored: it holds every remainder.)

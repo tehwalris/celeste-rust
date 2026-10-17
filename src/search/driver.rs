@@ -11,7 +11,7 @@ use celeste_core::lua_f64::LuaF64;
 use celeste_core::pico8_num::Pico8Num as P8;
 
 use super::backward::{backward, gate_w_hash, optimum, Seeds, Winning, BLOCK};
-use super::concrete::{concrete_search, NodeKeys, Side, Witness};
+use super::concrete::{concrete_search, inputs_text, NodeKeys, Side, Witness};
 use super::reach::{inside_w, ReachEdges};
 use super::rem::{start_point, Rem};
 use super::result::{DualResult, LevelResult, SearchResult, Verdict};
@@ -136,7 +136,7 @@ fn single<N: KernelLanes>(spec: &SearchSpec, levels: &[Level], res: &mut SearchR
 fn witness(dir: &Path, res: &mut SearchResult, w: &Witness, header: &str) -> Result<()> {
     let f = w.inputs.len();
     let path = dir.join(format!("witness_frame_{f}.txt"));
-    std::fs::write(&path, format!("{header}{}\n", w.inputs_text()))?;
+    std::fs::write(&path, format!("{header}{}\n", inputs_text(&w.inputs)))?;
     res.optimal = Some(f as u32);
     res.witness = Some(w.inputs.clone());
     res.witness_file = Some(path.file_name().expect("a file").to_string_lossy().into_owned());
@@ -185,7 +185,7 @@ fn dual(spec: &SearchSpec, float: &Settings, levels: &[Level], res: &mut SearchR
         let label = format!("label dual witness, valid in both arithmetics: {} exits on frame {f}, real play on frame {} (the float half's path)\n", float.arith, w.fixed_exit);
         std::fs::write(&path, label + &std::fs::read_to_string(&path)?)?;
     }
-    println!("[gate] h{horizon} dual optimum {f} fixed exit {} inputs {}", w.fixed_exit, w.inputs_text());
+    println!("[gate] h{horizon} dual optimum {f} fixed exit {} inputs {}", w.fixed_exit, inputs_text(&w.inputs));
     Ok(Verdict::Optimal)
 }
 
@@ -429,7 +429,7 @@ pub fn solve<N: crate::compiled::KernelLanes>(
         _ => None,
     };
     if let Some(wt) = &found {
-        println!("[gate] h{horizon} concrete optimum {} inputs {}", wt.inputs.len(), wt.inputs_text());
+        println!("[gate] h{horizon} concrete optimum {} inputs {}", wt.inputs.len(), inputs_text(&wt.inputs));
         if let Some(out) = save {
             wt.save(&out.join("witness.txt"))?;
         }

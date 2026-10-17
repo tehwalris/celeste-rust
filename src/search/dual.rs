@@ -167,12 +167,6 @@ pub struct DualWitness {
     pub fixed_exit: u32,
 }
 
-impl DualWitness {
-    pub fn inputs_text(&self) -> String {
-        self.inputs.iter().map(|b| b.to_string()).collect::<Vec<_>>().join(",")
-    }
-}
-
 /// THE DUAL SEARCH from `bound` (the larger arc bound, frames) to the
 /// halves' common horizon (`concrete::search` over pairs). `prefer` orders
 /// the inputs (a known file first). `None`: no dual run by the horizon.

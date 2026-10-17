@@ -87,6 +87,9 @@ const MAX_CONFIGS: usize = 1 << 14;
 /// A successor box larger than this (cells) is refused as a finding.
 const MAX_BOX: i64 = 4096;
 
+/// Violations kept as messages (and reported); the rest are only counted.
+const VIOLATIONS_KEPT: usize = 12;
+
 /// The window successor cells are kept in (the room +/- 16 px; a real player
 /// stays in x [-1, 121], y [-4, 128]); beyond it is CLIPPED and counted.
 const WINDOW: (i64, i64) = (-16, 143);
@@ -762,7 +765,7 @@ fn eval_node<A: GraphArith>(shapes: &[Shape<A>], room: &Room, id: usize, xy: (i1
     let mut out = NodeOut::default();
     let violation = |acc: &mut Acc<A>, msg: String| {
         acc.n_violations += 1;
-        if acc.violations.len() < 12 {
+        if acc.violations.len() < VIOLATIONS_KEPT {
             acc.violations.push(msg);
         }
     };
@@ -780,7 +783,7 @@ fn eval_node<A: GraphArith>(shapes: &[Shape<A>], room: &Room, id: usize, xy: (i1
                 continue;
             }
             if vals[r.error as usize] != Val::Bool(Some(false)) {
-                let why = if acc.violations.len() < 12 { culprit(&sp.graph, &vals, r.error) } else { String::new() };
+                let why = if acc.violations.len() < VIOLATIONS_KEPT { culprit(&sp.graph, &vals, r.error) } else { String::new() };
                 violation(acc, format!("shape {id} cell {xy:?} configuration {ci} outcome {oi}: a live outcome's error is {:?}: {why}", vals[r.error as usize]));
             }
             for (slot, n) in spec.fields.iter().zip(&r.fields) {
@@ -1494,7 +1497,7 @@ impl<A: GraphArith> Explore<A> {
                                 d.clipped[t as usize] += c;
                             }
                             if let Some(v) = &e.violation {
-                                if d.violations.len() < 12 {
+                                if d.violations.len() < VIOLATIONS_KEPT {
                                     d.violations.push(v.clone());
                                 }
                             }
@@ -1579,7 +1582,7 @@ impl<A: GraphArith> Explore<A> {
                 *c += x;
             }
             for v in d.violations {
-                if self.violations.len() < 12 {
+                if self.violations.len() < VIOLATIONS_KEPT {
                     self.violations.push(v);
                 }
             }
@@ -1796,7 +1799,7 @@ fn build<A: GraphArith>(root: &FsPath, spd_px: i32, threads: usize, rep: &mut St
         if clipped.iter().any(|c| *c > 0) {
             say!(rep, "  successors clipped to the window, per target shape: {:?}", clipped.iter().enumerate().filter(|(_, c)| **c > 0).collect::<Vec<_>>())?;
         }
-        for v in violations.iter().take(12) {
+        for v in violations.iter().take(VIOLATIONS_KEPT) {
             say!(rep, "  VIOLATION {v}")?;
         }
         // The inductive check.
@@ -1990,7 +1993,7 @@ pub fn probe(root: &FsPath, opts: &Opts, s: &crate::settings::Settings) -> Resul
     let (mut checked, mut crossings, mut deaths, mut bad) = (0u64, 0u64, 0u64, Vec::new());
     for d in 0..CELL_COUNT as u32 {
         let (dx, dy) = xy_of(d);
-        for &s in pg.srcs_of(d) {
+        for &s in pg.sources(d) {
             let (sx, sy) = xy_of(s);
             if sx != NONE && sx >= 128 {
                 continue;
