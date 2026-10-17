@@ -259,17 +259,15 @@ def run(job, outdir, binary):
         res["straight_dashes"] = [fr.f for fr in started if fr.dash not in pico8.DIAGONAL]
     lead = next((i for i, b in enumerate(ours) if b), len(ours))
     res["first_input"] = lead
-    # 4. The upload, chosen by REAL PLAY. It starts at the room's first
-    # controllable frame: usually the community file's earliest exiting
-    # offset, but a witness may press on the frame before (the player exists
-    # and updates on the frame it is created), so that cut is tried too; a
-    # cut never drops a press. Each candidate (cut, seeds) goes through
-    # tools/uct/check_uploads.py - the boot chain on a real PICO-8 and Celia
-    # - and the first VALID one is the upload, written by us (the witness
-    # ends at the exit: no trailing input). UniversalClassicTas is run on it
-    # for information only: it has no loading frame and computes in doubles.
-    # When the file's seeds die, the balloons' phases are nudged
-    # (nudged_seeds; still optimal: the bound holds for every seed).
+    # 4. The upload, chosen by REAL PLAY (the module doc). It starts at the
+    # room's first controllable frame: usually the community file's earliest
+    # exiting offset, but a witness may press on the frame before (the player
+    # exists and updates on the frame it is created), so that cut is tried
+    # too; a cut never drops a press, and the witness ends at the exit (no
+    # trailing input). UniversalClassicTas has no loading frame and computes
+    # in doubles: information only. When the file's seeds die, the balloons'
+    # phases are nudged (nudged_seeds; still optimal: the bound holds for
+    # every seed).
     if level:
         ok_db, _, n_db = love.uct(level, dbpath, cat)
         res["uct_db"] = f"{'finished' if ok_db else 'NOT finished'} {n_db} inputs"
