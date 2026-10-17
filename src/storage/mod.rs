@@ -1,37 +1,13 @@
-//! STORAGE (plans/architecture.md, "The forward" and "The recorded graph"): the forward's
-//! visited set, the states of its layers, and the recorded edges.
+//! STORAGE (plans/architecture.md, "The forward: hulls and storage" and "The
+//! recorded graph"): the state set (`set`, `visited`, `layer`), the wave
+//! (`unit`, `route`, `wave`, `spool`), the tree's files in one container
+//! (`file`: the frame files `layer`, the hull files `hulls`, the edge files
+//! `bundle` and `edges`, the out-edge files `out`), rows from keys
+//! (`decode`), and `rewrite bench frame` (`bench`).
 //!
-//!   * `visited` - per (shape, region) a table of ENTRIES: a state's
-//!                 position-free key and a mask over the region's cells
-//!   * `unit`    - one unit of the wave: the kernels' emissions into its
-//!                 bundles, by target route
-//!   * `route`   - the region phase: a route's dedup against its region's
-//!                 table and its edge segments
-//!   * `wave`    - the frame: units and region jobs in one pipeline, the
-//!                 frame's end (keys made final, the next layer frozen and
-//!                 merged into the visited set)
-//!   * `file`    - THE ONE CONTAINER of the tree's files: a magic, a
-//!                 version, a header, zstd blocks; written atomically, read
-//!                 mapped
-//!   * `bundle`  - the edges' format: bundles in zstd blocks
-//!   * `edges`   - the edge files (per target region and frame), the global
-//!                 transfer table, the reader (`EdgeStore`)
-//!   * `out`     - the out-edge files (per source, the re-push's read)
-//!   * `spool`   - a frame's scratch file of the blocks its files get at
-//!                 its end
-//!   * `set`     - THE ONE STATE SET: per region (key -> cell mask), indexed
-//!                 (the visited set, the next layer while a wave builds it)
-//!                 or frozen (the frontier, a frame read back)
-//!   * `layer`   - a frozen set with its skeletons (the frontier, the next
-//!                 layer), the frame files, the tree reader
-//!   * `hulls`   - the hull files: each frame's frontier with its states'
-//!                 layers and remainder hulls
-//!   * `decode`  - rows from (shape skeleton, key, cell)
-//!   * `bench`   - `rewrite bench frame`'s fingerprints, counters and reports
-//!
-//! A state is `(shape, key, cell)` (the key holds no position:
-//! `runtime2::pos_code`) and is named so everywhere (`Sk`): the edges, the
-//! frame files, the hull files, the backward. No state has a number.
+//! A state is `(shape, key, cell)` (`Sk`; the key holds no position:
+//! `exact::Code::pos`) everywhere: the edges, the frame and hull files, the
+//! backward. No state has a number.
 
 pub mod bench;
 pub mod bundle;
@@ -53,26 +29,23 @@ use crate::search::pos_graph::{GRID, NO_CELL};
 /// THE TREE'S FINGERPRINT (`rewrite ckhash`), over CONTENT
 /// (`exact::ContentHash`: whatever order its dictionaries grew in): per
 /// frame its states' count and an order-free hash (`fNNN n hash`); with
-/// `edges` each frame's recorded edges by what they join - (shape, key,
-/// cell) of target and source - and their transfers, not their ids
-/// (`eNNN`); with `hulls` each frame's hull file, its states with their
-/// layers and hulls (`hNNN`). Two trees with the same lines hold the same
-/// states, edges and hulls.
+/// `edges` each frame's edges by what they join and their transfers, not
+/// their ids (`eNNN`); with `hulls` each frame's states with their layers
+/// and hulls (`hNNN`). Two trees with the same lines hold the same states,
+/// edges and hulls.
 pub fn fingerprint<N: crate::search::rem::Rem>(dir: &std::path::Path, to: u32, edges: bool, hulls: bool, threads: usize) -> anyhow::Result<Vec<String>> {
     let tree = layer::Tree::<N>::open(dir, to)?;
     let content = tree.space.content_hash();
     let mut out = Vec::new();
     for frame in 0..=to {
-        // A forward whose frontier died has no frames past the empty one:
-        // their layers are empty.
+        // Past a dead frontier: empty layers.
         let (layer, _) = tree.layer(frame, None, threads)?;
         let (n, acc) = layer.content_fingerprint(&tree.space, &tree.shapes)?;
         out.push(format!("f{frame:03} {n} {acc:016x}"));
     }
     if edges {
         let eg = edges::EdgeStore::<N>::open(&dir.join("edges"), to)?;
-        // STREAMED: one frame at a time, its blocks on every thread (each
-        // key hashed once a block, each pair once).
+        // Streamed: one frame at a time, its blocks on every thread.
         let hashes = bench::EdgeHashes::new::<N>(eg.pairs());
         for frame in 1..=to {
             let (n, acc) = hashes.frame(&eg, frame, &content, &tree.shapes, threads)?;
@@ -81,7 +54,7 @@ pub fn fingerprint<N: crate::search::rem::Rem>(dir: &std::path::Path, to: u32, e
     }
     if hulls {
         for frame in 0..=to {
-            // A forward whose frontier died has no frames past it.
+            // Past a dead frontier: no files.
             if !layer::frame_exists(dir, frame) {
                 break;
             }
@@ -95,10 +68,10 @@ pub fn fingerprint<N: crate::search::rem::Rem>(dir: &std::path::Path, to: u32, e
 }
 
 /// The storage regions: `side` x `side` cells (`GEOMETRY`: 8; the tests
-/// also check 16), aligned at 0 as the kernels' `RegionGrid::of` (`div_euclid`; the
-/// grid's origin -64 is a multiple of both), each nested in one kernel
-/// region. A region's SLOT is its place on the grid, row-major, `NO_CELL`
-/// the last (one cell).
+/// also check 16), aligned at 0 as the kernels' `RegionGrid::of`
+/// (`div_euclid`; the grid's origin -64 is a multiple of both), each nested
+/// in one kernel region. A region's SLOT is its place on the grid,
+/// row-major, `NO_CELL` the last (one cell).
 #[derive(Clone, Copy, Debug)]
 pub struct Geometry {
     pub side: u32,
@@ -117,7 +90,6 @@ impl Geometry {
         Geometry { side, per_row, slots: per_row * per_row + 1, words: (side * side / 64) as usize }
     }
 
-    /// The slot of `NO_CELL`'s region.
     #[inline]
     pub fn no_cell_slot(&self) -> u32 {
         self.slots - 1
@@ -146,9 +118,8 @@ impl Geometry {
     }
 }
 
-/// THE storage geometry: 8-cell regions (storage v2 measured 8 against 16;
-/// plans/architecture.md). The kernels' regions (`--region`, a multiple of 8
-/// px) each hold whole storage regions.
+/// THE storage geometry: 8-cell regions. The kernels' regions (`--region`,
+/// a multiple of 8 px) each hold whole storage regions.
 pub const GEOMETRY: Geometry = Geometry::new(8);
 
 /// A region's index from its shape's index and its slot.
@@ -171,7 +142,6 @@ pub struct Sk {
 }
 
 impl Sk {
-    /// The state of shape index `shape` with `key` at `cell`.
     #[inline]
     pub fn at(geo: &Geometry, shape: u32, key: visited::Key, cell: u32) -> Sk {
         let (slot, local) = geo.slot_local(cell);
@@ -188,7 +158,7 @@ impl Sk {
         geo.cell(self.region % geo.slots, self.local as u32)
     }
 
-    /// As text (`r{region}.{key}.c{local}`).
+    /// As text (`r{region}.{key hi}:{key lo}.c{local}`).
     pub fn show(&self) -> String {
         format!("r{}.{:x}:{:x}.c{}", self.region, self.key.0, self.key.1, self.local)
     }
@@ -199,7 +169,7 @@ mod tests {
     use super::*;
 
     /// Slots and cells round-trip at both sides; regions nest in 16 px
-    /// kernel regions (`div_euclid` on the room's pixels).
+    /// kernel regions.
     #[test]
     fn cells_round_trip_through_regions() {
         for side in [8, 16] {
@@ -211,7 +181,6 @@ mod tests {
                 assert_eq!(g.cell(slot, local), cell);
                 let (rx, ry) = (slot % g.per_row, slot / g.per_row);
                 assert_eq!((rx as i32 * side as i32 - 64, ry as i32 * side as i32 - 64), (x.div_euclid(side as i32) * side as i32, y.div_euclid(side as i32) * side as i32));
-                // The 16 px kernel region holding the cell holds the whole storage region.
                 let k = |v: i32| v.div_euclid(16);
                 let (x0, y0) = (rx as i32 * side as i32 - 64, ry as i32 * side as i32 - 64);
                 assert_eq!((k(x0), k(y0)), (k(x0 + side as i32 - 1), k(y0 + side as i32 - 1)));

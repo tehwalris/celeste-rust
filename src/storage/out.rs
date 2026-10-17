@@ -1,20 +1,18 @@
-//! THE OUT-EDGES (`edges/out/f{F}.bin`): frame F's recorded edges once more,
-//! by SOURCE - what the hull forward's RE-PUSH reads (`wave`): a state
-//! expanded at its layer, whose hull grows later, pushes its new hull along
-//! its edges again without a kernel run. The edge files proper (`edges`)
-//! hold every edge in its TARGET's region (the backward's read); read by
-//! source they cost a target region's whole blocks per lookup (room (1,0)
-//! f80: 438M bundles decoded for 133M edges pushed). Here a source's edges
-//! are one contiguous run, found by key.
+//! THE OUT-EDGES (`edges/out/f{F}.bin`): frame F's recorded edges once
+//! more, by SOURCE, for the hull forward's RE-PUSH (`wave`): a state whose
+//! hull grows after its layer pushes the new hull along its edges again
+//! without a kernel run. By target (`edges`) that would decode a target
+//! region's whole blocks per lookup (~3 bundles an edge pushed); here a
+//! source's edges are one contiguous run, found by key.
 //!
-//! A file (`storage::file`) is per kernel UNIT of the frame (a run of entries
-//! of one shape, in (region, key) order: the units are, so the file is too)
-//! a BLOCK, and a header listing each block's first and last entry. A block,
-//! raw:
+//! A file (`storage::file`) is the frame's kernel UNITS' BLOCKS (whole
+//! entries, about `BLOCK_ROWS` rows each; a unit is a run of entries of one
+//! shape in (region, key) order, so the file is too), and a header listing
+//! each block's first and last entry. A block, raw:
 //!
 //!   * its ROUTES (target shape hash, slot) and its PAIRS (the transfers,
-//!     `arc_edges::encode_pair`): a block names no global id, so it is final
-//!     when its unit ends;
+//!     `Rem::encode_pair`): a block names no global id, so it is final when
+//!     its unit ends;
 //!   * its TARGETS: (route, key), sorted, keys delta-coded within a route;
 //!   * its ENTRIES (region, key), each with its bundles' byte length (a
 //!     reader skips the entries it does not want) and its bundles: (target,
@@ -22,7 +20,7 @@
 //!     cells (a bundle's cells less its offset) only.
 //!
 //! A unit's targets may hold PROVISIONAL keys (codes new this frame): its
-//! block is encoded again at the frame's end with the final keys (`fixup`).
+//! blocks are encoded again at the frame's end (`fixup`).
 
 use anyhow::{ensure, Result};
 use std::path::{Path, PathBuf};
@@ -72,9 +70,8 @@ pub struct OutBundle {
 
 /// An entry's bundles, decoded as they are read (`Block::entries`). A
 /// named type, not a `dyn Iterator`: the re-push's loop over them is
-/// statically dispatched whatever the inliner decides (a trait object here
-/// cost the release build 0.6-0.75% of a frame's instructions once an
-/// unrelated edit stopped LLVM devirtualizing it, 2026-10-16).
+/// statically dispatched whatever the inliner decides (a trait object cost
+/// ~0.7% of a frame's instructions where LLVM did not devirtualize it).
 pub struct OutBundles<'a> {
     eb: &'a [u8],
     q: usize,
@@ -227,8 +224,8 @@ pub fn encode_parts<N: Rem>(p: &mut Parts<N>, out: &mut Vec<u8>) -> bool {
 }
 
 /// Rows per block (`encode_blocks`): a re-push decompresses whole blocks
-/// for the entries it wants, so blocks are small (room (1,0) f80 with one
-/// block a kernel unit decompressed 5.3 GB for 2.6M re-pushed states).
+/// for the entries it wants, so blocks are small (one block a unit
+/// decompressed ~2 KB a re-pushed state).
 pub const BLOCK_ROWS: usize = 1 << 11;
 
 /// `p` as raw blocks of whole entries, about `BLOCK_ROWS` rows each, each
@@ -258,9 +255,8 @@ pub fn encode_blocks<N: Rem>(p: &mut Parts<N>) -> Vec<(Vec<u8>, bool)> {
     let mut out = Vec::new();
     let mut i = 0usize;
     let (mut t_new, mut x_new) = (vec![u32::MAX; p.targets.len()], vec![u32::MAX; p.pairs.len()]);
-    // Per target and pair, the last block holding it (distinct ones listed
-    // once, then sorted: a block's rows are ~2000, its targets and pairs
-    // far fewer).
+    // Per target and pair, the last block holding it (each listed once a
+    // block, then sorted: far fewer than its ~2000 rows).
     let (mut t_in, mut x_in) = (vec![u32::MAX; p.targets.len()], vec![u32::MAX; p.pairs.len()]);
     let mut block = 0u32;
     while i < p.rows.len() {
@@ -392,7 +388,6 @@ impl<'a, N: Rem> Block<'a, N> {
         Ok(Block { routes, pairs, targets, body: &raw[pos..], n })
     }
 
-    /// Entries in the block.
     pub fn len(&self) -> usize {
         self.n
     }
@@ -515,7 +510,6 @@ impl Sealed {
     }
 }
 
-/// Frame `frame`'s out file.
 pub fn path(edges_dir: &Path, frame: u32) -> PathBuf {
     edges_dir.join("out").join(format!("f{frame:03}.bin"))
 }
@@ -538,12 +532,11 @@ pub fn write(path: &Path, frame: u32, blocks: &[Sealed], spool: Option<&super::s
     })
 }
 
-/// One out file, mapped.
 pub struct OutFile {
     file: Mapped,
-    /// Its blocks (their heads are read where they are in the header, not
-    /// deserialized: an index of every frame's blocks held in memory was
-    /// 64 B a block, 1.9 GB at the fixtures' room's f303).
+    /// Its blocks (their heads are read in place in the header, not
+    /// deserialized: an index of every frame's blocks in memory takes 64 B
+    /// a block).
     blocks: usize,
 }
 
@@ -605,7 +598,6 @@ impl OutFile {
         self.file.block(self.head(i).at, z, out)
     }
 
-    /// Its blocks.
     pub fn len(&self) -> usize {
         self.blocks
     }
@@ -650,7 +642,6 @@ impl OutStore {
         Ok(())
     }
 
-    /// Frame `frame`'s out file.
     pub fn file(&self, frame: u32) -> Option<&OutFile> {
         self.frames.get(frame as usize).and_then(|f| f.as_ref())
     }

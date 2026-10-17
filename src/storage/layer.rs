@@ -1,19 +1,9 @@
-//! LAYERS (plans/architecture.md, "The forward"): a set of states as the storage holds them -
-//! per storage region (ascending) its ENTRIES, each a position-free exact
-//! key (ascending in the region) with the mask of its cells. A state is
-//! `(shape, key, cell)` and nothing else: a layer names no state by a
-//! number. It is the one form a frame's states take
-//!
-//!   * in memory: the frontier a wave expands (its units decoded to rows
-//!     right before the kernels: `wave`), the next layer a wave builds;
-//!   * on disk: the FRAME FILES (`frames/f{frame}.bin`, `storage::file`): per
-//!     region a block of its new entries' keys, masks and win masks, and a header
-//!     with what the frame added to the tree's codebooks - the shapes it
-//!     numbered, the key space's new codes and bit runs - and the
-//!     skeletons its shapes' rows decode with (`SkelRecord`).
-//!
-//! `Tree` reads a tree's frame files: the key space, the shapes, a frame's
-//! layer, its rows decoded (the diagnostics), a state's layer.
+//! LAYERS (plans/architecture.md, "The forward"): a plain set of states
+//! with the skeletons its rows decode with (the frontier's new states, the
+//! next layer), and the FRAME FILES (`frames/f{frame}.bin`, `storage::file`):
+//! per region a block of the frame's new entries (`encode_region`), and a
+//! header (`FrameHeader`) with what the frame added to the tree's codebooks
+//! and its skeletons. `Tree` reads a tree's frame files.
 
 use anyhow::{anyhow, ensure, Context, Result};
 use rustc_hash::FxHashMap;
@@ -31,9 +21,8 @@ use super::decode::Repr;
 use super::set::{RegionSet, RegionTable};
 use super::{Sk, GEOMETRY};
 
-/// A LAYER: a frozen set of states (`set::RegionSet`: per region
-/// (ascending) its entries, key (ascending) and cells) and the skeletons its
-/// shapes' rows decode with.
+/// A LAYER: a frozen set of states (`set::RegionSet`) and the skeletons
+/// its shapes' rows decode with.
 #[derive(Clone)]
 pub struct Layer<N: EngineNum = P8> {
     pub set: RegionSet,
@@ -56,12 +45,10 @@ impl<N: EngineNum> Layer<N> {
         self.set.push(region, RegionTable::from_sorted(keys, masks)?)
     }
 
-    /// Entries held.
     pub fn entries(&self) -> usize {
         self.set.entries()
     }
 
-    /// States held.
     pub fn states(&self) -> u64 {
         self.set.states()
     }
@@ -80,20 +67,17 @@ impl<N: EngineNum> Layer<N> {
         self.set.states_iter()
     }
 
-    /// The cells of `(region, key)` held (0: none).
     pub fn mask_of(&self, region: u32, key: Key) -> u64 {
         self.set.mask_of(region, key)
     }
 
-    /// Does the layer hold state `s`?
     pub fn contains(&self, s: Sk) -> bool {
         self.set.contains(s)
     }
 
-    /// `rewrite ckhash`'s `f` line over the layer: its states' count and the
-    /// sum of their CONTENT hashes (`ContentHash::state` of (shape, key,
-    /// cell)), each key hashed once - independent of the order the tree's
-    /// dictionaries grew in (a raise). `shapes`: the tree's by index.
+    /// `rewrite ckhash`'s `f` line: the states' count and the sum of their
+    /// CONTENT hashes of (shape, key, cell) - independent of the order the
+    /// tree's dictionaries grew in. `shapes`: the tree's by index.
     pub fn content_fingerprint(&self, space: &KeySpace<N>, shapes: &[u64]) -> Result<(u64, u64)> {
         let content = space.content_hash();
         let geo = GEOMETRY;
@@ -109,7 +93,6 @@ impl<N: EngineNum> Layer<N> {
         Ok((n, acc))
     }
 
-    /// Bytes allocated.
     pub fn alloc_bytes(&self) -> usize {
         self.set.alloc_bytes()
     }
@@ -128,11 +111,10 @@ pub fn bits(mut m: u64) -> impl Iterator<Item = u32> {
 }
 
 /// A SHAPE'S SKELETON as the storage keeps it: everything of a shape's rows
-/// their keys do not say - structure with closure
-/// captures, globals, strings, prints, the non-value cells' uniform
-/// columns, and per value cell how its column holds numbers (`Repr`: the
-/// code merges `Num(n)` and `Ival(n, n)`). Two skeletons of one shape are
-/// one iff their records are equal: they decode every key alike.
+/// their keys do not say - structure with closure captures, globals,
+/// strings, prints, the non-value cells' uniform columns, and per value
+/// cell how its column holds numbers (`Repr`: the code merges `Num(n)` and
+/// `Ival(n, n)`). Equal records decode every key alike.
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
 pub struct SkelRecord<N = P8> {
     pub shape_hash: u64,
@@ -199,12 +181,10 @@ impl<N: EngineNum> SkelRecord<N> {
 /// The frame files' magic.
 const MAGIC: &[u8; 4] = b"CSL1";
 
-/// Frame `frame`'s file.
 pub fn frame_path(dir: &Path, frame: u32) -> PathBuf {
     dir.join("frames").join(format!("f{frame:03}.bin"))
 }
 
-/// Is frame `frame` in the tree?
 pub fn frame_exists(dir: &Path, frame: u32) -> bool {
     frame_path(dir, frame).is_file()
 }
@@ -226,11 +206,9 @@ pub struct RegionIndex {
     pub entries: u32,
     pub states: u32,
     pub wins: u32,
-    /// Its block.
     pub at: At,
 }
 
-/// A frame file's header.
 #[derive(Serialize, Deserialize, Debug)]
 #[serde(bound = "")]
 pub struct FrameHeader<N: EngineNum = P8> {
@@ -333,8 +311,8 @@ fn decode_region(raw: &[u8]) -> Result<RegionEntries> {
 
 /// WRITE a frame file (`frame_path`): `layer`'s states with their win
 /// masks (`wins`: sorted entry indices of `layer` with a win, and the win
-/// cells), its skeletons, what the frame added to the codebooks. Regions
-/// compressed in parallel. Returns its bytes.
+/// cells), its skeletons, what the frame added to the codebooks. Returns
+/// its bytes.
 pub fn write_frame<N: EngineNum>(path: &Path, meta: &FrameMeta<N>, layer: &Layer<N>, wins: &[(u32, u64)], threads: usize) -> Result<u64> {
     ensure!(wins.windows(2).all(|w| w[0].0 < w[1].0), "write_frame: wins not by entry");
     let tables = layer.set.tables();
@@ -409,16 +387,14 @@ impl<N: EngineNum> FrameFile<N> {
         Ok(e)
     }
 
-    /// Unmap the resident pages of region `i`'s block (the page cache keeps
-    /// them; a later read faults them back in): a reader streaming a tree
-    /// does not hold the blocks it has read.
+    /// Drop the resident pages of region `i`'s block (`Mapped::release`): a
+    /// reader streaming a tree does not hold the blocks it has read.
     pub fn release_region(&self, i: usize) -> Result<()> {
         self.file.release(self.file.stored(self.header.regions[i].at))
     }
 
-    /// The file's states as a layer, its skeletons in a search from `room`
-    /// (`None`: none - a reader of keys and cells only). Regions decoded on
-    /// `threads` threads.
+    /// The file's states as a layer and its wins, its skeletons in a search
+    /// from `room` (`None`: none - a reader of keys and cells only).
     pub fn layer(&self, room: Option<(i16, i16)>, threads: usize) -> Result<(Layer<N>, Vec<(u32, u64)>)> {
         let n = self.header.regions.len();
         let parts: Vec<Result<RegionEntries>> = super::wave::par_map(&(0..n).collect::<Vec<_>>(), threads, |&i| self.region(i));
@@ -439,7 +415,6 @@ impl<N: EngineNum> FrameFile<N> {
         Ok((layer, wins))
     }
 
-    /// The win states.
     pub fn wins(&self) -> Result<Vec<Sk>> {
         let mut out = Vec::new();
         for (i, r) in self.header.regions.iter().enumerate() {
@@ -455,11 +430,10 @@ impl<N: EngineNum> FrameFile<N> {
     }
 }
 
-/// THE COMPLETE STORAGE CHECK of a frame file just written: read back from
-/// disk, region by region (in parallel, no copy of the whole frame), its
-/// states are exactly `layer`'s - its regions, every entry's key and cells
-/// - and its wins `wins`. FATAL otherwise: the frame would resume as
-/// another set than the forward expands.
+/// THE COMPLETE STORAGE CHECK of a frame file just written: read back,
+/// region by region, its states are exactly `layer`'s (its regions, every
+/// entry's key and cells) and its wins `wins`. FATAL otherwise: the frame
+/// would resume as another set than the forward expands.
 pub fn check_frame_file<N: EngineNum>(path: &Path, layer: &Layer<N>, wins: &[(u32, u64)], threads: usize) -> Result<()> {
     let f = FrameFile::<N>::open(path)?;
     let tables = layer.set.tables();
@@ -485,12 +459,10 @@ pub fn check_frame_file<N: EngineNum>(path: &Path, layer: &Layer<N>, wins: &[(u3
 
 /// A TREE's frame files through a frame: its codebooks (the shapes by
 /// index, the key space: every file's additions, any order) and each
-/// frame's file. A forward whose frontier died has no files past the
-/// empty frame: those frames are empty.
+/// frame's file (none past a dead frontier: those frames are empty).
 pub struct Tree<N: EngineNum = P8> {
     pub dir: PathBuf,
     pub last: u32,
-    /// Per frame `0..=last` its file (none past a dead frontier).
     pub frames: Vec<Option<FrameFile<N>>>,
     pub shapes: Vec<u64>,
     pub space: KeySpace<N>,
@@ -543,7 +515,7 @@ impl<N: EngineNum> Tree<N> {
         self.frames.get(f as usize).and_then(|x| x.as_ref())
     }
 
-    /// Frame `f`'s states.
+    /// Frame `f`'s state count.
     pub fn states(&self, f: u32) -> u64 {
         self.file(f).map_or(0, |x| x.header.states())
     }
@@ -553,7 +525,6 @@ impl<N: EngineNum> Tree<N> {
         self.frames.iter().position(|x| x.as_ref().is_some_and(|x| x.header.wins() > 0)).map(|f| f as u32)
     }
 
-    /// The shape of region `region`.
     pub fn shape_of(&self, region: u32) -> Result<u64> {
         self.shapes.get((region / GEOMETRY.slots) as usize).copied().ok_or_else(|| anyhow!("{}: region {region} of no shape", self.dir.display()))
     }
