@@ -11,7 +11,6 @@ use super::garith::GraphArith;
 use super::graph::{Graph, NodeId, Op};
 use super::kernel::{Emit, OutFields};
 
-/// The kernel build's phases, for the accounting below.
 pub(crate) const BUILD_PHASES: [&str; 9] = [
     "fixpoint trace",
     "fixpoint successors",
@@ -28,12 +27,10 @@ pub(crate) const BUILD_PHASES: [&str; 9] = [
 /// over workers and builds since the last `build_profile`.
 static BUILD_NS: [std::sync::atomic::AtomicU64; 9] = [const { std::sync::atomic::AtomicU64::new(0) }; 9];
 
-/// Add the time since `t` to phase `phase`.
 pub(crate) fn build_add(phase: usize, t: std::time::Instant) {
     BUILD_NS[phase].fetch_add(t.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
 }
 
-/// Add `d` to phase `phase`.
 pub(crate) fn build_add_duration(phase: usize, d: std::time::Duration) {
     BUILD_NS[phase].fetch_add(d.as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
 }
@@ -48,9 +45,8 @@ pub(crate) fn build_profile() -> String {
         .join(", ")
 }
 
-/// One output shape: the cells it writes, and the two booleans that say
-/// which lanes reach it (`live`) and on which of those its row is undefined
-/// (`error`, `trace::error`).
+/// One output shape: the cells it writes, which lanes reach it (`live`) and
+/// on which of those its row is undefined (`error`).
 pub(crate) struct Outcome<A: GraphArith = Fixed> {
     pub(crate) of: OutFields<A>,
     pub(crate) error: NodeId,
@@ -72,8 +68,8 @@ fn roots_under<A: GraphArith>(graph: &Graph<A>, cfg: &[u8], need: &[bool], want:
 }
 
 /// The roots of each configuration of `cfgs` DECIDED (the interval fold with
-/// the restrictions' ranges and the map), in one fresh arena so equal results are
-/// one node (before the fold, e.g. each platform world is a different node).
+/// the restrictions' ranges and the map), in one fresh arena so equal results
+/// are one node.
 fn decided_roots<A: GraphArith>(
     graph: &Graph<A>,
     cfgs: &[Vec<u8>],
@@ -120,20 +116,19 @@ pub(crate) fn specialize_frame<A: GraphArith>(
         forks.into_iter().collect()
     };
 
-    // 2. Per outcome, its configurations. Two kinds of fork, by what a configuration of it MEANS:
-    //
-    // * A fork every lane takes both ways (`Symbolic::both_values`: buttons,
-    //   held trails, escaped atoms; the outcome reads no validity of it). A
-    //   configuration of these is a set of INPUTS. They are resolved one at a
-    //   time with the rest standing (`graph::OPEN`), keeping a configuration
-    //   only where its roots differ from every one kept before. Sound because
-    //   substitution preserves equality: two that agree with the rest standing
-    //   agree in every completion.
+    // 2. Per outcome, its configurations. Two kinds of fork, by what a
+    // configuration of it MEANS:
+    // * A fork every lane takes both ways (buttons, held trails, escaped atoms;
+    //   the outcome reads no validity of it): a configuration of these is a set
+    //   of INPUTS. They are resolved one at a time with the rest standing
+    //   (`graph::OPEN`), keeping a configuration only where its roots differ
+    //   from every one kept before. Sound because substitution preserves
+    //   equality: two that agree with the rest standing agree in every
+    //   completion.
     // * A fork that PARTITIONS the lanes (its validity is read). Per fork, with
     //   every other fork standing, its dead-ness and its agreeing values are
     //   decided (per outcome and per class of the first kind); the
-    //   configurations are the product. A fork whose validity the outcome does
-    //   not read is of the first kind.
+    //   configurations are the product.
     let mut sp = graph.like();
     let mut cands: Vec<SpecializedBody> = Vec::new();
     for (oi, (fields, error, live, extra)) in outs.iter().enumerate() {
@@ -141,7 +136,6 @@ pub(crate) fn specialize_frame<A: GraphArith>(
         want.push(*error);
         want.push(*live);
         want.extend(extra.iter().copied());
-        // An outcome reaches a fraction of the graph; map only that.
         let need = graph.reachable(&want);
         let bits = bits_of(&need);
         let validity_read: std::collections::BTreeSet<u8> = (0..graph.len())
@@ -178,11 +172,10 @@ pub(crate) fn specialize_frame<A: GraphArith>(
         let n_classes = classes.len();
         // A DEAD fork (every fragment gives the same fields and error, and the
         // same `live` once its own validity is set aside) is taken once, validity
-        // true (`graph::ANY_VALID`): the OR of its fragments' validities is the
-        // lane covered. Decided here once with every other fork standing, and
-        // compared decided: dead so, it is dead in every class. A fork this misses
-        // is checked per class below; one both miss is enumerated, which costs
-        // candidates and never a row.
+        // true (`graph::ANY_VALID`): the OR of its fragments' validities is the lane
+        // covered. Decided here once, compared decided: dead so, it is dead in every
+        // class. A fork this misses is checked per class below; one both miss is
+        // enumerated, which costs candidates and never a row.
         let dead_everywhere: std::collections::BTreeSet<u8> = parts
             .iter()
             .copied()
@@ -204,10 +197,10 @@ pub(crate) fn specialize_frame<A: GraphArith>(
             })
             .collect();
         let mut total_cfgs = 0u64;
-        // The most fragments one class enumerates per partitioning fork (trace only).
+        // The most fragments one class enumerates per partitioning fork (trace).
         let mut ways_max = vec![0u8; parts.len()];
         for m in classes {
-            // A class's own arena: one shared across classes grew with each.
+            // A class's own arena (one shared across classes grew with each).
             let mut probe = graph.like();
             // Move forks keep their traced arity, which their `SplitOk` premise checks.
             let valid: Vec<u8> = parts.iter().map(|&d| graph.fork_ways(d)).collect();
@@ -224,8 +217,7 @@ pub(crate) fn specialize_frame<A: GraphArith>(
                         c[d as usize] = v;
                         c
                     };
-                    // Dead for the whole outcome (above), or for this class (compared as
-                    // built: decided-only dead-ness is read once, above).
+                    // Dead for the whole outcome (above), or for this class.
                     if dead_everywhere.contains(&d) {
                         return vec![crate::transpile::graph::ANY_VALID];
                     }
@@ -238,8 +230,8 @@ pub(crate) fn specialize_frame<A: GraphArith>(
                     if valid[i] <= 2 {
                         return (0..valid[i]).collect();
                     }
-                    // Per fork, its values that agree, compared decided when the body is:
-                    // a test against one platform world folds only with the restrictions' ranges.
+                    // Per fork, its values that agree, compared decided when the body is (a
+                    // test against one platform world folds only with the ranges).
                     let plain: Vec<Vec<u8>> = (0..valid[i]).map(with).collect();
                     let sigs = if decide {
                         decided_roots(graph, &plain, this, room)
@@ -285,9 +277,9 @@ pub(crate) fn specialize_frame<A: GraphArith>(
             crate::transpile::ival::fold(&sp, &all, room).expect("interval fold");
         build_add(4, t_phase);
         let r1: Vec<NodeId> = all.iter().map(|x| m1[*x as usize]).collect();
-        // DIAGNOSTIC (--build-trace): a body whose `error` folded to true
-        // while live somewhere declines every lane it takes. Show the leaves of
-        // its `error` Or-tree the interval evaluator decided true.
+        // DIAGNOSTIC (--build-trace): a body whose `error` folded to true while
+        // live somewhere declines every lane it takes: the leaves of its `error`
+        // Or-tree the interval evaluator decided true.
         if trace {
             let cells = crate::transpile::ival::seed_cells(&sp);
             let vals = match room {
@@ -385,13 +377,12 @@ pub(crate) fn specialize_frame<A: GraphArith>(
             sp.len()
         );
     }
-    // 4. Candidates that write the same row are ONE body; a body live
-    // nowhere is no body. Candidates of one outcome with the same fields
-    // write the same row wherever they are live, so they fuse: `live` the OR
-    // of theirs, `error` the members' shared node when they share one (fusion
-    // never touches error), else `OR_i (live_i & error_i)`. Either way a lane declines
-    // exactly where some candidate declined (also in the three-valued masks,
-    // both read where they MAY hold) and is kept where some candidate kept it.
+    // 4. Candidates that write the same row are ONE body; a body live nowhere
+    // is no body. Candidates of one outcome with the same fields fuse: `live`
+    // the OR of theirs, `error` the members' shared node when they share one,
+    // else `OR_i (live_i & error_i)`. Either way a lane declines exactly where
+    // some candidate declined (also in the three-valued masks, both read where
+    // they MAY hold) and is kept where some candidate kept it.
     let bodies: Vec<SpecializedBody> = {
         let mut groups: Vec<Vec<SpecializedBody>> = Vec::new();
         let mut index: BTreeMap<(usize, Vec<NodeId>), usize> = BTreeMap::new();
@@ -434,11 +425,10 @@ pub(crate) fn specialize_frame<A: GraphArith>(
     (sp, bodies)
 }
 
-/// The fused bodies' constant-output analysis. Sets each outcome field's
-/// `konst_av` to the `AV` it holds in EVERY row: when every body of the
-/// outcome computes the same node for it and that node is a compile-time
-/// constant. Returns the fused graph and its bodies (`specialize_frame`;
-/// `trace`: `--build-trace`).
+/// The fused bodies' constant-output analysis: each outcome field's
+/// `konst_av` is the `AV` it holds in EVERY row, where every body of the
+/// outcome computes the same compile-time constant node for it. Returns the
+/// fused graph and its bodies.
 pub(crate) fn lower_outcomes<A: GraphArith>(e: &Emit<A>, outs: &mut [Outcome<A>], trace: bool) -> (Graph<A>, Vec<SpecializedBody>) {
     let outs_spec: Vec<(Vec<NodeId>, NodeId, NodeId, Vec<NodeId>)> = outs
         .iter()

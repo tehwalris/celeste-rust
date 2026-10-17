@@ -19,7 +19,7 @@ use anyhow::Result;
 use super::garith::GraphArith;
 use super::graph::{Graph, NodeId, Op, Room, Val};
 
-/// The sentinel `simplify` uses for "this node was not reachable".
+/// The image of a node `fold` did not reach.
 pub use super::bdd::UNREACHABLE;
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -44,7 +44,6 @@ pub fn fold<A: GraphArith>(g: &Graph<A>, roots: &[NodeId], room: Option<&Room>) 
 
 /// Every input cell at its weakest value - a bool cell unknown, a number
 /// cell the full range (a bounded input's range is its `Op::Restrict`'s).
-/// The kind is the graph's (`Graph::cell_kind`, recorded at `symbolize`).
 pub(crate) fn seed_cells<A: GraphArith>(g: &Graph<A>) -> HashMap<u32, Val<A>> {
     let full = Val::Num(A::unknown());
     let mut cells: HashMap<u32, Val<A>> = HashMap::new();
@@ -57,10 +56,9 @@ pub(crate) fn seed_cells<A: GraphArith>(g: &Graph<A>) -> HashMap<u32, Val<A>> {
     cells
 }
 
-/// `fold`, writing into `out`: what several graphs fold to lands in one
-/// hash-consed arena, so equal results are the same node. A bounded input's
-/// range comes from its `Op::Restrict`, never from a seed: a fact assumed
-/// here would be checked nowhere.
+/// `fold`, into `out`: what several graphs fold to lands in one hash-consed
+/// arena. A bounded input's range comes from its `Op::Restrict`, never from
+/// a seed (a fact assumed here would be checked nowhere).
 pub fn fold_into<A: GraphArith>(
     g: &Graph<A>,
     roots: &[NodeId],
@@ -151,8 +149,7 @@ mod tests {
     }
 
     /// The map is a constant, so a collision test at a known position is
-    /// decidable; at an unknown position it genuinely is not (the player could
-    /// be anywhere). Deciding those needs bounds on the position inputs.
+    /// decidable; at an unknown position it genuinely is not.
     #[test]
     fn a_collision_test_is_decided_at_a_known_position_and_not_at_an_unknown_one() {
         let cart = std::sync::Arc::new(
@@ -261,11 +258,10 @@ mod tests {
     }
 
     /// `mget == k` over a RESTRICTED rectangle of tiles (as `spikes_at` reads
-    /// the map) folds to false exactly where no tile of the rectangle is `k`,
-    /// to true where every one is, and is otherwise left standing; at every
-    /// lane inside the rectangle the folded graph computes what the unfolded
-    /// one does. Every level room, rectangles up to 3x3 tiles, the spike tiles
-    /// and a tile of the room.
+    /// the map) folds to false exactly where no tile is `k`, to true where every
+    /// one is, and is otherwise left standing; lane by lane inside the rectangle
+    /// the folded graph computes what the unfolded one does. Every level room,
+    /// rectangles up to 3x3 tiles.
     #[test]
     fn a_tile_test_over_a_restricted_rectangle_folds_exactly_by_the_set_of_tiles() {
         let cart = std::sync::Arc::new(celeste_core::cart_data::CartData::load("cart").expect("cart"));
@@ -342,9 +338,9 @@ mod tests {
     }
 
     /// Fork validity is a per-LANE fact, and the interval pass sees a hull over
-    /// every lane. A hull spanning many floors contains lanes that span exactly
-    /// two, so `FragOk(1)` must stay undecided there (deciding it false loses
-    /// rows). A hull inside ONE floor decides it: no lane can straddle.
+    /// every lane: a hull spanning many floors contains lanes that span exactly
+    /// two, so `FragOk(1)` must stay undecided there. A hull inside ONE floor
+    /// decides it.
     #[test]
     fn fragment_validity_is_not_decided_from_a_wide_hull() {
         let mut g = Graph::new();

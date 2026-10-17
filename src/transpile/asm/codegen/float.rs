@@ -1,7 +1,6 @@
 //! THE DOUBLES' LOWERING (plans/float.md, "The kernels' safety"): a graph in
 //! `Float` to 8 `f64` lanes a zmm, each operation the reference engine's
 //! (`refdomain` over `LuaF64`/`LuaF64Interval`), bit for bit:
-//!
 //! - IEEE `vaddpd`/`vsubpd`/`vmulpd`/`vdivpd`, one rounding each, in the
 //!   cart's order. No fused multiply-add: none is emitted, and
 //!   `jit::assemble` refuses a text holding one;
@@ -13,14 +12,11 @@
 //! - `sin` a per-lane call-out to `LuaF64::lua_sin` (glibc's `sin`);
 //! - an interval's ends as the reference takes them: sums and differences
 //!   end by end, products and quotients the least and most corner in the
-//!   total order (`-0` below `0`), the forks' fragments
-//!   `LuaF64Interval::floor_fragment`'s and `round_fragment`'s formulas
-//!   operation by operation.
-//!
-//! An operation's own error (`NoWrap`, `trace::error`) is "the result is
-//! finite", and a quotient's divisor must exclude zero, as
-//! `LuaF64Interval::checked_div` requires. `asm::tests` checks every
-//! operation against `LuaF64`, `-0`, ties and subnormals included.
+//!   total order (`-0` below `0`), the forks' fragments operation by
+//!   operation.
+//! An operation's own error (`NoWrap`) is "the result is finite", and a
+//! quotient's divisor must exclude zero. `asm::tests` checks every operation
+//! against `LuaF64`, `-0`, ties and subnormals included.
 
 use super::*;
 
@@ -37,7 +33,6 @@ const FLOOR: u8 = 0x09;
 const SIGN: u64 = 0x8000_0000_0000_0000;
 const MAGNITUDE: u64 = 0x7fff_ffff_ffff_ffff;
 
-/// A double as a broadcast operand.
 fn k(v: f64) -> Src {
     Src::BQ(v.to_bits())
 }
@@ -53,7 +48,6 @@ impl Lower<'_, Float> {
         self.pure(Key::FBin(op, a, b.key()), move |d| Inst::FBin { dst: d, op, a, b })
     }
 
-    /// `fbin` of two values (a constant first operand materialized).
     fn fval(&mut self, op: FOp, a: NumVal, b: NumVal) -> Vreg {
         let ar = self.num_reg(a);
         let bs = self.num_src(b);
@@ -64,7 +58,6 @@ impl Lower<'_, Float> {
         self.pure(Key::FRnd(a, FLOOR), move |d| Inst::FRnd { dst: d, a, imm: FLOOR })
     }
 
-    /// `a pred b` as a vector mask.
     fn fcmp(&mut self, imm: u8, a: Vreg, b: Src) -> Vreg {
         self.pure(Key::FCmp(imm, a, b.key()), move |d| Inst::FCmp { dst: d, imm, a, b })
     }
@@ -78,7 +71,6 @@ impl Lower<'_, Float> {
         self.pure(Key::QBin(op, a, b.key()), move |d| Inst::QBin { dst: d, op, a, b })
     }
 
-    /// The same bits (a vector mask).
     fn same_bits(&mut self, a: Vreg, b: Vreg) -> Vreg {
         let (a, b) = if b < a { (b, a) } else { (a, b) };
         self.pure(Key::QCmp(0, a, SrcKey::Reg(b)), move |d| Inst::QCmp { dst: d, imm: 0, a, b: Src::Reg(b) })
@@ -127,12 +119,10 @@ impl Lower<'_, Float> {
         self.vsel(gt, a, inner)
     }
 
-    /// Unary minus: the sign bit flipped (`-0` for `0`).
     fn neg(&mut self, a: Vreg) -> Vreg {
         self.qbin(QOp::Xor, a, Src::BQ(SIGN))
     }
 
-    /// `math.abs`: the sign bit cleared.
     fn abs(&mut self, a: Vreg) -> Vreg {
         self.qbin(QOp::And, a, Src::BQ(MAGNITUDE))
     }

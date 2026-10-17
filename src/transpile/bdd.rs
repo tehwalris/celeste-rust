@@ -1,27 +1,16 @@
 //! Deciding boolean equality on the graph with ROBDDs, instead of
-//! pattern-matching it.
-//!
-//! `Graph::fold` only rewrites shapes someone wrote down; most constant
-//! `And`/`Or` nodes share no shape. A BDD decides it: two nodes are equal
-//! exactly when their BDDs are the same reference, constant when that
-//! reference is a terminal.
-//!
+//! pattern-matching it: two nodes are equal exactly when their BDDs are the
+//! same reference, constant when that reference is a terminal.
 //! `simplify_local` does this PER NODE, on a small BDD of the node's own
-//! bounded cone, once, in topological order over the rewritten graph. (One
-//! global table for the whole graph overflows its cap on a fused kernel's
-//! first formulas and leaves the rest unanalysed.)
+//! bounded cone (one global table overflows its cap on a fused kernel's
+//! first formulas and leaves the rest unanalysed).
 //!
-//! ## What counts as an atom
-//!
-//! Everything that is not `And`, `Or`, `Not`, `ConstBool` or a `Sel`
-//! between booleans: comparisons, `TileFlagAt`, `Known`, boolean input
-//! cells. Atoms are INDEPENDENT free variables. That makes the analysis
-//! incomplete (`x < 3 and x > 5` is not folded) and sound: a function
-//! constant over ALL assignments of its atoms is constant over the
-//! realizable ones, a subset.
-//!
-//! The numeric layer is left alone, but a numeric `Sel` whose condition
-//! this proves constant folds through `Graph::fold` when the graph is
+//! An ATOM is everything but `And`, `Or`, `Not`, `ConstBool` and a boolean
+//! `Sel`: comparisons, `TileFlagAt`, `Known`, boolean input cells. Atoms
+//! are INDEPENDENT free variables, which makes the analysis incomplete (`x
+//! < 3 and x > 5` is not folded) and sound: a function constant over ALL
+//! assignments of its atoms is constant over the realizable ones. A numeric
+//! `Sel` whose condition this proves constant folds when the graph is
 //! rebuilt.
 
 use rustc_hash::FxHashMap;
@@ -48,8 +37,7 @@ pub const UNREACHABLE: NodeId = NodeId::MAX;
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 struct Triple {
-    /// Index into the variable order. Terminals compare as `u32::MAX`, so
-    /// the ordering test needs no special case.
+    /// Index into the variable order; terminals compare as `u32::MAX`.
     var: u32,
     lo: Ref,
     hi: Ref,
@@ -61,8 +49,7 @@ pub struct Bdd {
     intern: FxHashMap<Triple, Ref>,
     memo: FxHashMap<(Ref, Ref, Ref), Ref>,
     /// The budget: an ROBDD can be exponential in its variable count. Hitting
-    /// it makes the operation return `None`, which the caller counts
-    /// (`Stats::unanalysed`).
+    /// it makes the operation return `None` (`Stats::unanalysed`).
     cap: usize,
 }
 
@@ -90,8 +77,8 @@ impl Bdd {
     }
 
     /// The reduce step: a node whose branches agree is not a node, and an
-    /// identical triple is the same node. Together these make equality of
-    /// functions equality of references.
+    /// identical triple is the same node, so equality of functions is equality
+    /// of references.
     fn mk(&mut self, var: u32, lo: Ref, hi: Ref) -> Option<Ref> {
         if lo == hi {
             return Some(lo);
@@ -109,7 +96,6 @@ impl Bdd {
         Some(r)
     }
 
-    /// The one operation everything else is written in terms of.
     pub fn ite(&mut self, f: Ref, g: Ref, h: Ref) -> Option<Ref> {
         if f == TRUE {
             return Some(g);
@@ -162,8 +148,7 @@ impl Bdd {
         self.mk(index, FALSE, TRUE)
     }
 
-    /// Empty again, keeping the tables' capacity (`simplify_local` reuses
-    /// one table for every node it analyses).
+    /// Empty again, keeping the tables' capacity.
     fn reset(&mut self) {
         self.nodes.truncate(2);
         self.intern.clear();
@@ -171,8 +156,7 @@ impl Bdd {
     }
 }
 
-/// Does this op PRODUCE a boolean, whatever its operands are? Used only to
-/// decide whether a `Sel` is a boolean select.
+/// Does this op PRODUCE a boolean, whatever its operands are?
 fn inherently_bool<A: GraphArith>(op: &Op<A>) -> bool {
     matches!(
         op,
@@ -196,8 +180,8 @@ fn inherently_bool<A: GraphArith>(op: &Op<A>) -> bool {
     )
 }
 
-/// What `simplify_local` did, for reporting (so a simplifier that gave up
-/// can be told from one that found nothing).
+/// What `simplify_local` did (a simplifier that gave up told from one that
+/// found nothing).
 #[derive(Debug, Default, Clone, Copy)]
 pub struct Stats {
     pub before: usize,
@@ -206,15 +190,12 @@ pub struct Stats {
     pub constants: usize,
     /// Boolean nodes proved equal to an ATOM and replaced by it.
     pub to_atom: usize,
-    /// Branch re-merges collapsed to their common factor (the
-    /// `(A & p) | (A & not p) -> A` family, see `simplify_local`).
+    /// Branch re-merges collapsed to their common factor.
     pub merged: usize,
-    /// Of `merged`, those with SYNTACTIC complements (two terms, one residual
-    /// each, `p` and `Not(p)` or complementary comparisons): the ones no BDD is
-    /// needed to prove.
+    /// Of `merged`, those with SYNTACTIC complements: the ones no BDD is needed
+    /// to prove.
     pub merged_simple: usize,
-    /// `And`/`Or`/`Not` nodes the analysis gave no function (the cap ran
-    /// out before them, or an operand had none): not simplified at all.
+    /// `And`/`Or`/`Not` nodes the analysis gave no function: not simplified.
     pub unanalysed: usize,
     /// Duplicate leaves dropped from `And`/`Or` trees.
     pub deduped: usize,
@@ -222,9 +203,8 @@ pub struct Stats {
     pub bdd_nodes: usize,
 }
 
-/// Flatten a same-op tree (`Or`-of-`Or`s or `And`-of-`And`s) in `g` into
-/// its non-`op` leaves. `None` when the tree is bigger than `cap`, which
-/// bounds the work per candidate rather than trusting the input.
+/// Flatten a same-op tree in `g` into its non-`op` leaves; `None` past `cap`
+/// leaves.
 fn flatten<A: GraphArith>(g: &Graph<A>, root: NodeId, want_and: bool, cap: usize) -> Option<Vec<NodeId>> {
     let mut leaves = Vec::new();
     let mut stack = vec![root];
@@ -255,12 +235,11 @@ fn syntactic_complements<A: GraphArith>(g: &Graph<A>, x: NodeId, y: NodeId) -> b
     }
 }
 
-// THE LOCAL PASS: each rewrite is proved on a small BDD of the node's OWN bounded cone: past
-// the expansion budget a compound node is an opaque variable, which proves
-// less and never anything false (a tautology over independent variables
-// holds for the realizable assignments too). It runs once, in topological
-// order over the REWRITTEN graph, so a collapse that exposes another is
-// seen in the same pass.
+// THE LOCAL PASS: each rewrite is proved on a small BDD of the node's OWN
+// bounded cone: past the expansion budget a compound node is an opaque
+// variable, which proves less and never anything false. It runs once, in
+// topological order over the REWRITTEN graph, so a collapse that exposes
+// another is seen in the same pass.
 
 /// A variable of a local analysis: a comparison in canonical form - `Lt`
 /// over its operands in order: `Ge(a, b)` is its negation, `Gt(a, b)` is
@@ -277,7 +256,6 @@ fn is_bool_sel<A: GraphArith>(g: &Graph<A>, n: NodeId) -> bool {
     matches!(node.op, Op::Sel) && (inherently_bool(&g.get(node.args[1]).op) || inherently_bool(&g.get(node.args[2]).op))
 }
 
-/// One node's function over its bounded cone (`simplify_local`).
 struct Local {
     b: Bdd,
     vars: FxHashMap<LocalVar, u32>,
@@ -315,7 +293,6 @@ impl Local {
         self.b.var(v)
     }
 
-    /// `n`'s function, `None` if the local table overflowed.
     fn func<A: GraphArith>(&mut self, g: &Graph<A>, n: NodeId) -> Option<Ref> {
         if let Some(r) = self.memo.get(&n) {
             return Some(*r);
