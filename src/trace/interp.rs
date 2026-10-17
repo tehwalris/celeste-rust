@@ -1908,6 +1908,38 @@ mod tests {
         assert_eq!(it.d.as_const(&n), Some(P8::from_i16(31)));
     }
 
+    /// A branch condition's checks are owed exactly where an outcome reads
+    /// the condition: an overflow in it (`input * 2`) is owed when the arms
+    /// differ (the merge selects on it) and by nothing when they agree (the
+    /// re-merged guard folds to the outer one, `Graph::fold`): no outcome
+    /// root reads `input` then, so every value of the condition, a wrapped
+    /// one included, gives the same outcome.
+    #[test]
+    fn a_condition_owes_its_checks_only_where_an_outcome_reads_it() {
+        let traced = |inner_else: i16| {
+            let ast = parse(&format!("result = 0\nif other > 0 then\n if input * 2 > 0 then\n  result = 1\n else\n  result = {inner_else}\n end\nend"));
+            let mut d = Symbolic::<celeste_core::arith::Fixed>::default();
+            let (input, other) = (d.graph.leaf(Op::Cell(1)), d.graph.leaf(Op::Cell(2)));
+            let mut it = Interp::new(d);
+            let mut st = State::new(&mut it.d);
+            let g = st.globals;
+            let globals = &mut st.heap.tables.get_mut(&g).unwrap().hash;
+            globals.insert("input".into(), Value::Num(input));
+            globals.insert("other".into(), Value::Num(other));
+            let out = it.exec_block(ast.nodes(), st).expect("exec");
+            assert_eq!(out.len(), 1, "the arms merged");
+            let s = &out[0].0;
+            let Value::Num(r) = s.heap.tables[&s.globals].hash["result"].clone() else { panic!("expected a number") };
+            let roots = [r, s.guard];
+            let error = super::super::error::of(&mut it.d, &roots);
+            let reads_input = it.d.graph.cone(&roots).contains(&input);
+            let owes_overflow = it.d.graph.cone(&[error]).iter().any(|n| it.d.graph.get(*n).op == Op::NoWrap);
+            (reads_input, owes_overflow)
+        };
+        assert_eq!(traced(2), (true, true), "arms that differ select on the condition and owe its overflow");
+        assert_eq!(traced(1), (false, false), "arms that agree: nothing reads the condition, nothing is owed");
+    }
+
     /// An unknown branch runs BOTH arms and merges them into one select.
     #[test]
     fn an_unknown_branch_becomes_a_select() {
