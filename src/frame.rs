@@ -1,13 +1,8 @@
-//! The block, the frame-step interface (`FrameStep`, emitting into the
-//! storage's `UnitSink`) and the HULL FORWARD (`ForwardState`, extended
-//! frame by frame by `storage::wave::run_wave`, checkpointed, resumable):
-//! per state a remainder HULL (`search::hull`), pushed along the recorded
-//! edges; a state is expanded by the kernels once, when first reached, and
-//! its edges pushed again whenever its hull grows. The forward holds its
-//! frontier as KEYS (`storage::wave::Frontier`); a block - rows - exists
-//! only inside a unit of a wave (decoded right before the kernels) and in
-//! the readers. A block is OPAQUE to the loop except for its KEYS and
-//! POSITIONS.
+//! The block, the frame-step interface (`FrameStep`) and the HULL FORWARD
+//! (`ForwardState`: started, resumed, extended a frame at a time by
+//! `storage::wave::run_wave`, each frame checkpointed); trees (`grow_tree`,
+//! `TreeFilter`), wins, `MarkFilter`. plans/architecture.md "The forward:
+//! hulls and storage".
 
 use anyhow::{Context, Result};
 
@@ -17,9 +12,8 @@ use celeste_engine::runtime2::{Rt2, P8};
 use crate::search::rem::Rem;
 use crate::storage::wave::Frontier;
 
-/// Wave phase timers (`--phases`, which the wave's sinks carry): TSC ticks
-/// summed over workers, taken per frame (`take`) into `FrameStats::phase_s`
-/// and printed (`print`). Off, `start` is a branch.
+/// Wave phase timers (`--phases`): TSC ticks summed over workers, taken per
+/// frame into `FrameStats::phase_s`. Off, `start` is a branch.
 pub mod phases {
     use std::sync::atomic::{AtomicU64, Ordering};
     /// The phases. `UNIT` (a kernel unit's `engine.run`) holds `SETUP`,
@@ -81,8 +75,7 @@ pub mod phases {
             (unsafe { core::arch::x86_64::_rdtsc() } - c0) as f64 / t0.elapsed().as_secs_f64()
         })
     }
-    /// The phases' seconds since the last `take` (summed over workers),
-    /// the counters reset.
+    /// The phases' seconds since the last `take`; the counters reset.
     pub fn take() -> [f64; N] {
         let hz = hz();
         std::array::from_fn(|p| TICKS[p].swap(0, Ordering::Relaxed) as f64 / hz)
@@ -95,16 +88,14 @@ pub mod phases {
     }
 }
 
-/// A columnar batch of lanes of one shape: the kernels' own `Rt2`, with its
-/// key column where it was decoded from keys. Only the per-lane key and
-/// position are exposed.
+/// A columnar batch of lanes of one shape (the kernels' `Rt2`), with its
+/// key column where it was decoded from keys.
 pub struct Block<N: EngineNum = P8> {
     rt2: Rt2<N>,
 }
 
 impl<N: EngineNum> Block<N> {
-    /// Wrap an engine block: decoded rows with their key column, or rows
-    /// with none (keys are a key space's: `exact::KeySpace`).
+    /// Decoded rows with their key column, or rows with none.
     pub fn from_rt2(rt2: Rt2<N>) -> Self {
         assert!(
             rt2.row_keys.is_empty() || rt2.row_keys.len() == rt2.width,
@@ -115,9 +106,8 @@ impl<N: EngineNum> Block<N> {
         Block { rt2 }
     }
 
-    /// A reference-engine block, CANONICAL (ids, shape hash), without keys:
-    /// a tree keys its rows (`UnitSink::row_key`), the concrete search
-    /// compares them whole (`exact::exact_rows`).
+    /// A reference-engine block, made CANONICAL (ids, shape hash), without
+    /// keys.
     pub fn canonical(mut rt2: Rt2<N>) -> Result<Self> {
         rt2.canonical();
         Ok(Block { rt2 })
@@ -142,31 +132,28 @@ impl<N: EngineNum> Block<N> {
         crate::search::pos_graph::block_cells(&self.rt2)
     }
 
-    /// Per lane: does it sit on the room's win target (`wins_of`)?
     pub fn wins(&self, s: &crate::settings::Settings) -> Result<Vec<bool>> {
         wins_of(&self.rt2, s)
     }
 
-    /// Per lane: has it left the start room (`exits_of`, a superset of wins)?
+    /// `exits_of`: a superset of the wins.
     pub fn exits(&self, s: &crate::settings::Settings) -> Result<Vec<bool>> {
         exits_of(&self.rt2, s)
     }
 
-    /// Number of lanes in this block.
     pub fn lanes(&self) -> usize {
         self.rt2.width
     }
 }
 
-/// The summit (6,3) has no exit: it ends when the player touches the
-/// original cart's FLAG (tile 118 at (fx, fy)): fx-6 <= x <= fx+6, fy-7 <= y <= fy+4.
+/// The summit (6,3)'s level index: it has no exit, it ends at the flag
+/// (`summit_flag`).
 pub const SUMMIT_LEVEL: i16 = 30;
 
 /// The winning positions (x_lo, x_hi, y_lo, y_hi, inclusive): `--win-at` or
 /// the summit's flag; a lane wins where it MEETS it. None: the room exit.
 pub fn win_rect(s: &crate::settings::Settings) -> Option<(i16, i16, i16, i16)> {
     if let Some((xl, xh, yl, yh)) = s.win_at {
-        // Said once per process, where a win is first judged.
         static SAID: std::sync::Once = std::sync::Once::new();
         SAID.call_once(|| {
             println!(
@@ -179,8 +166,8 @@ pub fn win_rect(s: &crate::settings::Settings) -> Option<(i16, i16, i16, i16)> {
     summit_flag(s.room)
 }
 
-/// The summit's win rectangle around its flag, if `room` is the summit (read
-/// off the cart once per room: a cache keyed on the room).
+/// The summit's win rectangle around the original cart's flag (tile 118),
+/// if `room` is the summit; read off the cart once.
 fn summit_flag((rx, ry): (i16, i16)) -> Option<(i16, i16, i16, i16)> {
     type Cache = std::sync::Mutex<std::collections::HashMap<(i16, i16), Option<(i16, i16, i16, i16)>>>;
     static RECTS: std::sync::OnceLock<Cache> = std::sync::OnceLock::new();
@@ -210,7 +197,7 @@ pub fn exits_of<N: EngineNum>(rt2: &Rt2<N>, s: &crate::settings::Settings) -> Re
         let Some(obj) = crate::search::pos_graph::player_object(rt2) else {
             return Ok(vec![false; lanes]);
         };
-        // An interval position wins where it meets the target (as `any_win`).
+        // An interval position wins where it meets the target.
         let axis = |f: u32| {
             rt2.obj_field_cell(obj, f)
                 .and_then(|c| crate::search::pos_graph::whole_range_col(rt2, c))
@@ -255,7 +242,6 @@ fn room_is<N: EngineNum>(rt2: &Rt2<N>, (wx, wy): (i16, i16)) -> Result<Vec<bool>
 pub fn wins_of<N: EngineNum>(rt2: &Rt2<N>, s: &crate::settings::Settings) -> Result<Vec<bool>> {
     let mut wins = reaches_win(rt2, s)?;
     if s.hundred {
-        // 100%: the exit counts only with this room's berry taken.
         for (e, b) in wins.iter_mut().zip(got_fruit(rt2, s.room)?) {
             *e &= b;
         }
@@ -263,8 +249,7 @@ pub fn wins_of<N: EngineNum>(rt2: &Rt2<N>, s: &crate::settings::Settings) -> Res
     Ok(wins)
 }
 
-/// Per lane: the win target met, the berry aside (`wins_of` without its
-/// 100% condition).
+/// `wins_of` without its 100% condition.
 fn reaches_win<N: EngineNum>(rt2: &Rt2<N>, s: &crate::settings::Settings) -> Result<Vec<bool>> {
     use celeste_engine::runtime2::AV;
     let exits = exits_of(rt2, s)?;
@@ -336,22 +321,18 @@ pub fn berry_lost<N: EngineNum>(rt2: &Rt2<N>, s: &crate::settings::Settings) -> 
     Ok(got_fruit(rt2, s.room)?.into_iter().map(|taken| !taken).collect())
 }
 
-/// Per lane of a frame's rows: NOT expanded further. An exited row (no kernels
-/// for the next room; a win or a `--win-at` exit), a 100% row whose berry is
-/// lost (`berry_lost`), and in the orb room a row whose chest is still closed
-/// too late for the ceiling (`orb_deadline_skip`). THE one place the decision
-/// is made: every wave's unit decides it on its decoded rows
-/// (`wave::run_unit`), whether its frontier is the forward's own or a
-/// resume's - so a resumed run expands exactly the rows an uninterrupted
-/// one does. `frame`: the rows' layer; `ceiling`: the tree's level -1
-/// horizon, the orb deadline's. (A state not expanded at its layer is never
-/// re-pushed: it has no edges. One expanded is re-pushed whatever the orb's
-/// deadline says at the later frame: sound, only less pruned.)
+/// Per lane of a frame's rows: NOT expanded further (an exited row: no
+/// kernels for the next room; a 100% row whose berry is lost; an orb-room
+/// row whose chest is still closed too late for the ceiling). The one place
+/// it is decided, on every unit's decoded rows (`wave::run_unit`), so a
+/// resume expands exactly what an uninterrupted run does. `frame`: the
+/// rows' layer; `ceiling`: the tree's level -1 horizon. A state not
+/// expanded has no edges, so it is never re-pushed; one expanded is
+/// re-pushed whatever the orb's deadline says later: sound, less pruned.
 pub fn not_expanded<N: EngineNum>(b: &Block<N>, frame: u32, ceiling: Option<u32>, s: &crate::settings::Settings) -> Result<Vec<bool>> {
     let mut skip = b.exits(s)?;
-    // Under a win rectangle (`--win-at`, the summit's flag) a row that LEFT
-    // the room is no win, but it is not this room's search either (its
-    // shape has no kernel: a coverage gap at room (0,3) f93).
+    // Under a win rectangle a row that LEFT the room is no win, and its
+    // shape has no kernel.
     if win_rect(s).is_some() {
         for (w, here) in skip.iter_mut().zip(room_is(b.rt2(), s.room)?) {
             *w |= !here;
@@ -375,11 +356,9 @@ pub fn orb_required(s: &crate::settings::Settings) -> bool {
     crate::game_runner::level_index(x, y) == crate::game_runner::ORB_LEVEL && !s.gemskip
 }
 
-/// THE LEVEL -1 FILTER at a horizon (`--level-minus-one H,S`, H in search
-/// steps): drop a queue when the table proves its cell cannot exit
-/// by `h` (sound: inductive ranges, clipped successors and deaths
-/// accounted). A tree records the filter its frames were built under
-/// (`TreeFilter`); a forward runs under its tree's, not the run's flag.
+/// THE LEVEL -1 FILTER (`--level-minus-one H,S`, `h` in steps): a row is
+/// dropped at emission where the table proves its cell cannot exit by `h`
+/// (sound: inductive ranges, clipped successors and deaths accounted).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MinusOne {
     pub h: u32,
@@ -388,8 +367,7 @@ pub struct MinusOne {
 }
 
 impl MinusOne {
-    /// The start room's table at this speed bound, under settings `s`
-    /// (`search::level_minus_one::table`).
+    /// The start room's table at this speed bound, under settings `s`.
     pub fn table(&self, s: &crate::settings::Settings) -> &'static crate::search::level_minus_one::CostToGo {
         self.try_table(s).unwrap_or_else(|e| panic!("building the level -1 table: {e:#}"))
     }
@@ -401,11 +379,10 @@ impl MinusOne {
     }
 }
 
-/// What a forward's flush filters by.
+/// What a forward filters by.
 pub struct Filters<'a, N: EngineNum = P8> {
     /// The coarser level's arc marks (the objects ladder).
     pub marks: Option<&'a MarkFilter<'a, N>>,
-    /// Level -1.
     pub minus_one: Option<MinusOne>,
 }
 
@@ -453,14 +430,12 @@ impl<'a, N: EngineNum> MarkFilter<'a, N> {
         MarkFilter { marked, coarser, clock }
     }
 
-    /// Per lane of `rt2` (rows of frame `frame`): admitted? Under the split
-    /// frame only at frame boundaries (even steps): a mid-frame row's
-    /// projection does not key as the coarser tree's mid-frame rows
-    /// (`widen::widen_near_floors` keeps a near floor's computed
-    /// `collideable` in the player's probe window there, `Rt2::widen_to`
-    /// does not), so filtering it would drop marked paths - room (6,1)
-    /// nodiag `r0sxhn,r0sxh` REFUTED 93, which the community TAS reaches.
-    /// The next boundary filters its successors.
+    /// Per lane of `rt2` (rows of step `frame`): admitted? Under the split
+    /// frame only at frame boundaries: a mid-frame row's projection does not
+    /// key as the coarser tree's mid-frame rows (`widen::widen_near_floors`
+    /// keeps a near floor's computed `collideable` in the player's probe
+    /// window there, `Rt2::widen_to` does not), so filtering it would drop
+    /// marked paths. The next boundary filters its successors.
     pub fn allowed(&self, rt2: &Rt2<N>, frame: u32) -> Result<Vec<bool>> {
         if !self.clock.boundary(frame) {
             return Ok(vec![true; rt2.width]);
@@ -475,7 +450,6 @@ impl<'a, N: EngineNum> MarkFilter<'a, N> {
         Ok(keys.iter().zip(&cells).map(|(k, &c)| k.and_then(|k| self.marked.deadline(shape, k, c))).collect())
     }
 
-    /// The coarser level.
     pub fn coarser(&self) -> crate::abstraction::Level {
         self.coarser
     }
@@ -496,8 +470,7 @@ pub fn widen_rt2_to<N: EngineNum>(rt2: &mut Rt2<N>, level: crate::abstraction::L
     rt2.widen_to(crate::compiled::ids(), level);
 }
 
-/// `(shape, keys, cells)` of the widened rows (the widened block's shape),
-/// keyed in `keys`.
+/// `widened_keys` of an `Rt2`.
 pub fn widened_keys_rt2<N: EngineNum>(
     rt2: &Rt2<N>,
     coarser: crate::abstraction::Level,
@@ -523,9 +496,8 @@ pub trait FrameStep<N: Rem = P8>: Sync {
     fn run(&self, block: &Block<N>, cell_in: &[u32], lanes: &[usize], sink: &mut crate::storage::unit::UnitSink<N>) -> Result<()>;
 
     /// Build what the engine builds on first use (the kernels) before a
-    /// wave's clock starts: built inside the wave, the first frame's workers
-    /// all waited on the build's lock (room (6,2) 100% f57: 61 of 152
-    /// worker-s, so a one-frame bench timed the build).
+    /// wave's clock starts: inside the wave every worker would wait on the
+    /// build's lock, and a one-frame bench would time the build.
     fn warm(&self) {}
 
     /// The level its frames widen to (its rows' key view, the platform
@@ -537,10 +509,8 @@ pub trait FrameStep<N: Rem = P8>: Sync {
     fn settings(&self) -> std::sync::Arc<crate::settings::Settings>;
 }
 
-/// The frame end's steps (`FrameStats::t_end`): provisional keys made
-/// final, the routes sealed, the ladder's filter, the visited set's merge,
-/// the next layer and the grown states built, their wins decoded, the edge
-/// file and the out file written.
+/// The frame end's steps (`FrameStats::t_end`; plans/architecture.md "The
+/// frame's end").
 pub const END_STEPS: [&str; 8] = ["keys", "seal", "filter", "absorb", "layer", "wins", "edge file", "out file"];
 
 /// One forward frame's timings and sizes, for the `[fwd]` log line.
@@ -632,8 +602,7 @@ impl TreeFilter {
         dir.join("level_minus_one.txt")
     }
 
-    /// The tree's record; `None` without one (a tree from before records,
-    /// filtered or not: unknown).
+    /// The tree's record; `None` without one (its filter unknown).
     pub fn read(dir: &std::path::Path) -> Result<Option<TreeFilter>> {
         let path = Self::path(dir);
         let s = match std::fs::read_to_string(&path) {
@@ -674,10 +643,9 @@ impl TreeFilter {
         }
     }
 
-    /// The filter a forward extending the tree runs under, its table checked
-    /// against the one the tree recorded: a table built under other
-    /// settings (`--override-settings`) or by another binary would filter
-    /// the new frames otherwise than the tree's.
+    /// `minus_one`, its table checked against the tree's record: a table
+    /// built under other settings or by another binary would filter the new
+    /// frames otherwise.
     fn checked_minus_one(&self, dir: &std::path::Path, s: &crate::settings::Settings) -> Result<Option<MinusOne>> {
         let m = self.minus_one();
         if let (TreeFilter::MinusOne { table, .. }, Some(m)) = (self, m) {
@@ -726,9 +694,8 @@ pub struct ForwardState<N: Rem = P8> {
     /// The last frame's frontier: its new states (as keys, with their
     /// hulls) and the older states whose hull grew there.
     frontier: Frontier<N>,
-    /// Every state reached so far, with its layer and hull (`storage::visited`).
+    /// Every state reached so far, with its layer and hull.
     visited: crate::storage::visited::VisitedSet<N>,
-    /// The tree's transfers (`storage::edges::XferTable`).
     xfers: crate::storage::edges::XferTable<N>,
     /// The tree's out-edge files (the re-push reads an old state's edges).
     outs: crate::storage::out::OutStore,
@@ -741,8 +708,8 @@ pub struct ForwardState<N: Rem = P8> {
     pub frames: u32,
     /// The first frame a lane won, if any so far.
     pub win_frame: Option<u32>,
-    /// The filter the tree's frames were built under (`None`: a tree from
-    /// before records, which is not extended).
+    /// The filter the tree's frames were built under (`None`: no record;
+    /// such a tree is not extended).
     pub filter: Option<TreeFilter>,
     /// A bench wave took the visited set (`bench_wave` without `copy`).
     spent: bool,
@@ -754,7 +721,7 @@ pub struct ForwardResult {
     pub win_frame: Option<u32>,
     /// The number of frames actually run (the last checkpointed frame).
     pub frames: u32,
-    /// The position graph, when recording was on - backward's input.
+    /// The position graph, when recording was on (the posgraph gate).
     pub pos_graph: Option<crate::search::pos_graph::PosGraph>,
 }
 
@@ -773,11 +740,9 @@ pub struct Checkpointed {
 /// A checkpoint's steps (`Checkpointed::t`).
 pub const CKPT_STEPS: [&str; 4] = ["frame file", "frame check", "hull file", "hull check"];
 
-/// CHECKPOINT a wave: frame `frame`'s file - its new states and wins - and
-/// its hull file - its frontier, every state whose hull grew, with its
-/// layer and hull - each read back and checked to hold exactly the wave's
-/// (`layer::check_frame_file`, `hulls::check`: the complete storage
-/// check).
+/// CHECKPOINT a wave: frame `frame`'s file (its new states and wins) and its
+/// hull file (every state whose hull grew, with its layer and hull), each
+/// read back and checked to hold exactly the wave's.
 fn checkpoint<N: Rem>(dir: &std::path::Path, frame: u32, wave: &crate::storage::wave::Wave<N>, emitted: &[crate::storage::layer::SkelRecord<N>], s: &crate::settings::Settings) -> Result<Checkpointed> {
     use crate::storage::{hulls, layer};
     let mut c = Checkpointed { won: !wave.wins.is_empty(), ..Default::default() };
@@ -873,11 +838,9 @@ impl<N: Rem> ForwardState<N> {
     }
 
     /// The forward as it stood after frame `last` of the tree in `dir`,
-    /// READ-ONLY: frames after `last` are ignored, not discarded (`resume`
-    /// discards them first). What `extend` runs its next wave from, so
-    /// `bench_wave` from here is frame `last + 1` of the real forward.
-    /// Refused under other settings or at another `level` than the tree's
-    /// (`settings::Settings::check`).
+    /// READ-ONLY: later frames are ignored, not discarded (`resume` discards
+    /// them first), so `bench_wave` from here is the real forward's frame
+    /// `last + 1`. Refused under other settings or at another `level`.
     pub fn at(dir: &std::path::Path, last: u32, record: bool, level: crate::abstraction::Level, s: &crate::settings::Settings) -> Result<Self> {
         s.check(dir, level)?;
         let edges_dir = dir.join("edges");
@@ -926,15 +889,12 @@ impl<N: Rem> ForwardState<N> {
         }
     }
 
-    /// ONE WAVE of `extend` - frame `frames + 1`, under the tree's level -1
-    /// filter, its pos graph fed when recording - without the checkpoint (`bench_checkpoint`): the
-    /// frontier is read; with `copy` the state is left as it was (the
-    /// visited set and the transfer table are copied: another wave may
-    /// follow), else they are MOVED in (no copy held beside the wave's: the
-    /// state is spent, and refuses another wave). The edges go to
-    /// `edges_dir` (a scratch dir; `None`: not recorded). Returns the wave
-    /// with the visited set and transfer table it ran against, which hold
-    /// its new states and pairs (`bench frame`, run per rep).
+    /// ONE WAVE of `extend` (frame `frames + 1`, the tree's level -1 filter)
+    /// without the checkpoint (`bench_checkpoint`). With `copy` the state is
+    /// left as it was (the visited set and transfer table copied); else they
+    /// are MOVED in and the state refuses another wave. Edges go to
+    /// `edges_dir` (`None`: not recorded). Returns the wave with the visited
+    /// set and transfer table it ran against.
     pub fn bench_wave(
         &mut self,
         engine: &dyn FrameStep<N>,
@@ -970,10 +930,8 @@ impl<N: Rem> ForwardState<N> {
         Ok((wave, visited, xfers))
     }
 
-    /// `extend`'s CHECKPOINT of a `bench_wave`'s `wave` (frame `frames +
-    /// 1`) into `dir` (a scratch dir): the frame file and the hull file,
-    /// each read back and checked, then the pos graph saved. Returns the
-    /// checkpoint's steps and the pos graph's wall.
+    /// `extend`'s checkpoint of a `bench_wave`'s `wave` into `dir`, then the
+    /// pos graph saved: the checkpoint's steps and the pos graph's wall.
     pub fn bench_checkpoint(&self, wave: &crate::storage::wave::Wave<N>, dir: &std::path::Path, s: &crate::settings::Settings) -> Result<(Checkpointed, std::time::Duration)> {
         let emitted = self.skeletons.records(|h| self.persisted.contains(&h) || wave.next.skeletons.contains_key(&h));
         let c = checkpoint(dir, self.frames + 1, wave, &emitted, s)?;
@@ -1054,16 +1012,14 @@ impl<N: Rem> ForwardState<N> {
     }
 }
 
-/// A level's tree through step `to` under the run's level -1 filter `want`
-/// (`--level-minus-one`): used as it is when it reaches `to` under a
-/// filter that serves it (none, or one at a horizon >= `to`); else resumed
-/// and extended under its filter, or started under `want`. A tree filtered
-/// below `to` is REFUSED: a hull tree's frames depend on its horizon through
-/// level -1's dropped pushes (a push not made leaves a hull smaller and a
-/// state later or unreached), so it cannot be raised exactly - delete it.
-/// `marks`: the coarser level's filter (the caller rebuilds such a tree for
-/// another horizon). `engine` is built only when frames are computed, at
-/// `level`, the tree's, under the run's settings `s` (the tree's, checked).
+/// A level's tree through step `to` under the run's level -1 filter `want`:
+/// used as it is when it reaches `to` under a filter that serves it (none,
+/// or one at a horizon >= `to`); else resumed and extended under its own
+/// filter, or started under `want`. A tree filtered below `to` is REFUSED:
+/// its frames depend on the horizon through level -1's dropped pushes, so
+/// it cannot be raised exactly. `marks`: the coarser level's filter.
+/// `engine` is built only when frames are computed, at `level` under `s`
+/// (the tree's, checked).
 #[allow(clippy::too_many_arguments)]
 pub fn grow_tree<N: Rem>(
     dir: &std::path::Path,
@@ -1148,15 +1104,11 @@ pub fn forward_run<N: Rem>(
 /// The free disk the forward keeps, GB (`ensure_disk_space`).
 const MIN_FREE_GB: u64 = 20;
 
-/// Stop the forward before the checkpoint disk fills: below
-/// `MIN_FREE_GB` plus three times what the last frame
-/// wrote, free on `dir`'s filesystem, an error -
-/// a full disk otherwise fails a worker mid-write (room (5,1) nodiag,
-/// 2026-10-06) and starves everything else on the machine. `last_free`: the
-/// free bytes after the previous frame of THIS forward (`None` at its first:
-/// a delta across the arc phase between two levels counted everything the
-/// other processes wrote meanwhile as the frame's, and stopped room (2,3)'s
-/// second level at its first frame, 2026-10-07).
+/// Stop the forward before the checkpoint disk fills (a full disk fails a
+/// worker mid-write and starves the machine): an error below `MIN_FREE_GB`
+/// plus three times what the last frame wrote. `last_free`: the free bytes
+/// after the previous frame of THIS forward (`None` at its first: a delta
+/// across another level's phases would count other writers' bytes).
 fn ensure_disk_space(dir: &std::path::Path, last_free: &mut Option<u64>) -> Result<()> {
     use std::os::unix::ffi::OsStrExt;
     let min_gb = MIN_FREE_GB;
@@ -1166,8 +1118,6 @@ fn ensure_disk_space(dir: &std::path::Path, last_free: &mut Option<u64>) -> Resu
     let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
     anyhow::ensure!(unsafe { libc::statvfs(path.as_ptr(), &mut st) } == 0, "statvfs {}: {}", dir.display(), std::io::Error::last_os_error());
     let free = st.f_bavail as u64 * st.f_frsize as u64;
-    // A frame can write tens of GB (a room whose frontier explodes): keep room
-    // for three more frames like the last one, not just the fixed floor.
     let frame_bytes = last_free.replace(free).map_or(0, |last| last.saturating_sub(free));
     let need = (min_gb << 30) + 3 * frame_bytes;
     anyhow::ensure!(
@@ -1314,16 +1264,12 @@ pub(crate) fn append_forward_stats(dir: &std::path::Path, row: &[(&str, String)]
 const RESUME_CHANGES: usize = 1 << 25;
 
 /// The VISITED SET of a tree's frames `0..=last`, rebuilt from its frame
-/// files (each frame's states, its codebooks' additions applied; a state
-/// stored twice is an error) and its hull files (replayed in order: a
-/// state's layer and hull are its last file's), its first win, and frame
-/// `last`'s FRONTIER - the states whose hull grew there, its new states with
-/// their skeletons - and the skeletons registry as the emissions left it
-/// (every frame file's skeletons, in a search from `room`). The frames'
-/// states and hulls are gathered per region as CHANGES and upserted into
-/// the packed tables a batch of frames at a time (`RESUME_CHANGES`), every
-/// region on every thread; the last frame's grown states read what they
-/// held before it (their `was`) between its new states and its growth.
+/// files (a state stored twice is an error) and its hull files replayed in
+/// order (a state's layer and hull are its last file's); its first win;
+/// frame `last`'s FRONTIER (its new states, and the states whose hull grew
+/// there with the hull they held before: their `was`); and the skeletons
+/// registry as the emissions left it. Changes are upserted per region a
+/// batch of frames at a time (`RESUME_CHANGES`).
 #[allow(clippy::type_complexity)]
 pub fn restore_visited<N: Rem>(dir: &std::path::Path, last: u32, room: (i16, i16), threads: usize) -> Result<(crate::storage::visited::VisitedSet<N>, Option<u32>, Frontier<N>, crate::storage::decode::Skeletons<N>)> {
     use crate::storage::hulls;
@@ -1479,7 +1425,6 @@ impl<N: EngineNum> Visited<N> {
     pub fn new(keys: celeste_engine::exact::KeySpace<N>) -> Self {
         Visited { shards: Default::default(), keys }
     }
-    /// The key space the keys are in.
     pub fn keys(&self) -> &celeste_engine::exact::KeySpace<N> {
         &self.keys
     }
@@ -1543,8 +1488,9 @@ impl<N: EngineNum> Visited<N> {
 }
 
 impl Visited {
-    /// THE MARKS FILE (also read by the UI export): bincode `(rows, horizon)`,
-    /// `dist` = horizon - deadline; no deadline saves as 0 (filters alike).
+    /// THE MARKS FILE (also read by the UI export): `(rows, horizon, key
+    /// space)`, `dist` = horizon - deadline; no deadline saves as 0 (filters
+    /// alike).
     pub fn save(&self, path: &std::path::Path, horizon: u32) -> Result<()> {
         let mut rows: Vec<MarkRow> = Vec::with_capacity(self.len());
         for ((shape, cell), keys) in &self.shards {
@@ -1632,16 +1578,13 @@ mod tests {
     }
 
     /// THE HULL FORWARD LIES BETWEEN THE EXACT REACH AND THE WIDENED FORWARD,
-    /// room (1,0) to f34 (the gate's forward, its first 35 frames: to f44
-    /// it took 160 CPU-s): with every hull widened to
-    /// the whole circle (`hull::WIDEN`: every state's remainder widened, the
-    /// forward before hulls) the frames are exactly the forward gate's
-    /// before hulls (gates/ckhash_room10_f000-044_widened.txt); the hull
-    /// forward keeps a SUBSET of those states, each in a layer no earlier
-    /// than the widened one's; and
-    /// it holds every state the exact-remainder reach (`search::reach`)
-    /// reaches, in a layer no later than the frame it is reached at, with
-    /// every remainder the reach brings it in its hull.
+    /// room (1,0) to f34: with every hull widened to the whole circle
+    /// (`hull::WIDEN`) the frames are the pinned widened ones
+    /// (gates/ckhash_room10_f000-044_widened.txt); the hull forward keeps a
+    /// SUBSET of those states, each in a layer no earlier than the widened
+    /// one's; and it holds every state the exact-remainder reach
+    /// (`search::reach`) reaches, in a layer no later than the frame it is
+    /// reached at, with every remainder the reach brings it in its hull.
     #[test]
     #[ignore = "slow, ./check.sh t2 runs it: room (1,0)'s kernels and two forwards, ~30 CPU-s"]
     fn the_hull_forward_lies_between_the_exact_reach_and_the_widened_forward() {
@@ -1758,9 +1701,7 @@ mod tests {
 
     /// A resume (`ForwardState::at`) takes the frontier the uninterrupted
     /// forward expands, at every frame. 100% in room (1,0), which has no
-    /// berry: every row's berry is lost from frame 0 on. The forward used to
-    /// skip `not_expanded` rows only on a frame with a win (and never at frame
-    /// 0), a resume always: a resumed 100% run expanded fewer rows.
+    /// berry: every row's berry is lost from frame 0 on.
     #[test]
     fn a_resume_expands_what_the_uninterrupted_forward_expands() {
         let s = crate::settings::Settings { hundred: true, ..Default::default() };
@@ -1896,9 +1837,7 @@ mod tests {
     /// A REGION KERNEL CHECKS ITS BOUNDS: a lane whose speed or remainder lies
     /// outside the ranges its kernel was specialized on DECLINES (the
     /// restrictions' own error, `Op::Restrict`), and the same lane inside them
-    /// runs. Before the restriction, the lowering's interval fold seeded the
-    /// input cells with those ranges and folded the check away: such a lane
-    /// was computed silently wrong.
+    /// runs.
     #[test]
     #[ignore = "slow, ./check.sh t2 runs it: room (1,0)'s kernels, ~20 CPU-s"]
     fn a_lane_outside_its_kernels_bounds_declines() {
@@ -1963,9 +1902,7 @@ mod tests {
     /// A PLATFORMS-UNKNOWN KERNEL CHECKS ITS PLATFORMS: a lane whose platform
     /// `x` reaches past the path, whose `rem.x` lies outside the literal the
     /// kernel reads in its place, or whose `spd.x` lies outside its range over
-    /// the worlds DECLINES. Before `x` was a restriction it was a seeded range
-    /// (`Symbolic::ranges`, gone), checked nowhere, and `rem.x` was not read:
-    /// such a lane was computed silently wrong.
+    /// the worlds DECLINES.
     #[test]
     #[ignore = "slow, ./check.sh t2 runs it: room (2,1)'s platform kernels, ~100 CPU-s"]
     fn a_lane_outside_its_platform_bounds_declines() {
@@ -2055,10 +1992,8 @@ mod tests {
     /// THE SPLIT FRAME at a near level reaches the unsplit (pinned) state
     /// counts at every boundary, room (2,1) `r0sxhn`. Guards nil-global
     /// removal and the mid-frame cut not widening floors the player reads.
-    /// (The hull forward's counts: the widened forward reached 308, 1576,
-    /// 5559 and 15348 at f25-f28, split and unsplit alike; a mid-frame
-    /// state's hull merges its sources' and part b moves no remainder, so
-    /// the boundaries' hulls are the unsplit frame's.)
+    /// (A mid-frame state's hull merges its sources' and part b moves no
+    /// remainder, so the boundaries' hulls are the unsplit frame's.)
     #[test]
     #[ignore = "slow, ./check.sh t2 runs it: room (2,1)'s split kernels and a forward, ~55 CPU-s"]
     fn split_frame_reaches_the_unsplit_frontier_at_a_near_level() {

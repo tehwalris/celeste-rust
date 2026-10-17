@@ -95,7 +95,7 @@ mod tests {
     fn a_pool_maps_in_order_with_per_worker_state() {
         let out = Pool::new(4).map(1000, |i| Ok(i * 2)).unwrap();
         assert_eq!(out, (0..1000).map(|i| i * 2).collect::<Vec<_>>());
-        // Each worker counts its own items: the counts sum to n.
+        // Each worker counts its own items.
         let seen = Pool::new(3)
             .map_with(
                 100,
