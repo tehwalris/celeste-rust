@@ -1,40 +1,26 @@
 #!/bin/bash
-# THE CHECK LADDER (plans/devloop.md): what to run, from cheapest.
+# THE CHECK LADDER (plans/devloop.md: what each tier runs and pins).
 #
-#   ./check.sh t0           the unit tests (nextest, quick profile; the
-#                           #[ignore]d ones aside): the pre-commit run
-#   ./check.sh t1 [--pin]   single frames from the fixtures (tools/fixtures.sh),
-#                           16.16 and float: the forward's exact output, its
-#                           files' bytes and metrics, the keys, the widening
-#                           table, a backward frame, the kernels and transfers
-#                           against the reference engine. THE REFACTOR GATE
-#   ./check.sh t2 [--pin]   end to end: the room (1,0) gates, float and dual,
-#                           the objects ladder, the UI export, a platform
-#                           room; the reference's tree against the kernels',
-#                           the hull replay; and the slow tests
-#                           (#[ignore = "slow, ..."])
+#   ./check.sh t0           the unit tests (the #[ignore]d aside): the
+#                           pre-commit run
+#   ./check.sh t1 [--pin]   single frames from the fixtures, 16.16 and float:
+#                           THE REFACTOR GATE
+#   ./check.sh t2 [--pin]   end to end, and the slow tests
 #   ./check.sh big [--pin]  the reference frame (6,2) 100% f56 -> f57 and the
-#                           platform frame, with their files' bytes and metrics
-#   ./check.sh perf [--pin] user-space instructions of three bench frames
-#                           against gates/perf.txt, the RELEASE binary (built
-#                           here): more than 2% over FAILS; milestones and
-#                           `all`
-#   ./check.sh local        the local goldens (/var/tmp/float-goldens; loud
-#                           SKIPPED where the store is absent)
-#   ./check.sh fixtures     every fixture rebuilt from scratch against its
-#                           pinned fingerprint (minutes)
-#   ./check.sh all          the pre-merge run: all of the above, and the
-#                           pre-merge tests (#[ignore = "pre-merge, ..."])
+#                           platform frame
+#   ./check.sh perf [--pin] the RELEASE binary's instruction budget
+#                           (gates/perf.txt; more than 2% over FAILS)
+#   ./check.sh local        the local goldens (SKIPPED where the store is absent)
+#   ./check.sh fixtures     every fixture rebuilt against its pinned fingerprint
+#   ./check.sh all          every tier, and the pre-merge tests
 #
 # Every step prints ok/FAIL and its wall time; the run exits non-zero if any
-# step failed. t1 and t2 run their steps in LANES side by side (each lane's
-# steps in order; the reports print when every lane is done). `--pin`
+# step failed. t1 and t2 run their steps in LANES side by side. `--pin`
 # writes the outputs as the new pins (gates/) instead of comparing: only on
-# evidence, and say why in the commit. Timings are reported, never pinned.
-# Builds the quick binary first (perf: the release one too). Env:
-# CARGO_TARGET_DIR, CELESTE_FIXTURES, CHECK_DIR (the scratch, default
-# /var/tmp/celeste-check), THREADS (default 16; the metrics are the same at
-# every thread count; perf always runs 16).
+# evidence, and say why in the commit. Builds the quick binary first (perf:
+# the release one too). Env: CARGO_TARGET_DIR, CELESTE_FIXTURES, CHECK_DIR
+# (the scratch, default /var/tmp/celeste-check), THREADS (default 16; the
+# metrics are the same at every thread count).
 set -uo pipefail
 cd "$(dirname "$0")"
 TIER=${1:-}
@@ -298,9 +284,7 @@ gate10_arc() {
     ./safe-run.sh --memory "$MEM" -- "$B" search --to 35 --win-at 9,101 --checkpoint-dir "$C/t2/arc10" --prefer gates/known_room10_win9-101.txt --save-marks "$C/t2/arc10-marks" > "$C/t2/arc10.out" || return 1
     grep '^\[gate\]' "$C/t2/arc10.out" | diff gates/arc_room10_win9-101_h35.txt - >&2
 }
-# The same oracles in float (`--arith float`, the doubles' kernels;
-# plans/float.md): the forward's posgraph and fingerprint, and the arc
-# gate's search with its concrete witness.
+# The same oracles in float (`--arith float`, plans/float.md).
 gate10f_forward() {
     ./safe-run.sh --memory "$MEM" -- "$B" forward --arith float --to 44 --room 1,0 --checkpoint-dir "$C/t2/g10f" > "$C/t2/g10f.out" || return 1
     grep '^posgraph' "$C/t2/g10f.out" | diff gates/float_posgraph_room10_f044.txt - >&2 || return 1
@@ -310,10 +294,9 @@ gate10f_arc() {
     ./safe-run.sh --memory "$MEM" -- "$B" search --arith float --to 35 --win-at 9,101 --checkpoint-dir "$C/t2/arc10f" --prefer gates/known_room10_win9-101.txt --save-marks "$C/t2/arc10f-marks" > "$C/t2/arc10f.out" || return 1
     grep '^\[gate\]' "$C/t2/arc10f.out" | diff gates/float_arc_room10_win9-101_h35.txt - >&2
 }
-# The dual search (`rewrite dual`, plans/float.md) at the same synthetic
-# win: fixed (the IL load) and Celia float, the known route valid in both;
-# its bound and its witness pinned (each half's [gate] lines are the two
-# gates above).
+# The dual search (`rewrite dual`) at the same synthetic win, the known
+# route valid in both: its bound and witness pinned (each half's [gate]
+# lines are the two gates above).
 gate10d_dual() {
     ./safe-run.sh --memory "$MEM" -- "$B" dual --to 35 --win-at 9,101 --checkpoint-dir "$C/t2/dual10" --prefer gates/known_room10_win9-101.txt --save-marks "$C/t2/dual10-marks" > "$C/t2/dual10.out" || return 1
     grep -E '^DUAL BOUND|^\[gate\] h35 dual' "$C/t2/dual10.out" | diff gates/dual_room10_win9-101_h35.txt - >&2
@@ -326,10 +309,8 @@ search42() {
     same "$C/t2/s42.gate" "$G/search42.gate"
 }
 # The UI export (`rewrite export-ui`) of the searches above with their
-# marks: every binary file, and run.json without its timings (the search's
-# wall, the forward's per-frame walls and memory), pinned by digest. The
-# float gate's run and the dual's too (each tree read in its own
-# arithmetic; the dual's arc pass the float half's).
+# marks, pinned by digest: every binary file, and run.json without its
+# timings.
 export_ui() {
     for d in arc10 s42 arc10f dual10; do
         ./safe-run.sh --memory "$MEM" -- "$B" export-ui --checkpoint-dir "$C/t2/$d" --arc "$C/t2/$d-marks" --out "$C/t2/ui-$d" > /dev/null || return 1
@@ -363,8 +344,7 @@ reference10() {
 # THE HULL FORWARD'S TREE REPLAYS FROM ITS RECORDED GRAPH [ARITH]:
 # reference10's kernels' tree (to f36), its hulls pushed along its recorded
 # edges and transfers from the start, reaches exactly its states at every
-# frame (`check replay` checks each): every edge was recorded. (That a
-# known route holds in the tree is the gates' `--prefer`, search::known.)
+# frame (`check replay`): every edge was recorded.
 hull10() {
     ./safe-run.sh --memory "$MEM" -- "$B" check replay --tree "$C/t2/reference10${1:+-float}-kernels" --to 36
 }
@@ -441,9 +421,8 @@ perfcount() {
     }' | tee "$C/perf-$name.line" >&2
 }
 
-# The local goldens (trace::oracle): our unsubmitted witnesses' goldens,
-# from the machine-local store; where it is absent the test passes and says
-# SKIPPED, repeated here and in the run's last line.
+# The local goldens (trace::oracle), from the machine-local store; where it
+# is absent the test passes and says SKIPPED, repeated in the run's last line.
 localgoldens() {
     step local-goldens ignoredtests local
     grep -h '\[local goldens\]' "$C/local-goldens.out" "$C/local-goldens.err" | sed 's/^/    /'

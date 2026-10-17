@@ -1,16 +1,9 @@
--- Frame capture for the headless Celia driver (CELIA_CAPTURE=DIR), the
--- counterpart of tools/uct/capture.lua with the same output format, so
--- tools/compare_video.py (--tool celia) renders either:
---   frames.bin  per frame 4 x 128x128 RGBA8 layers: the screen (the palette
---               INDEX is in red, index = round(r * 15 / 255)), the player
---               layer (player or player_spawn with its hair, alpha 0
---               elsewhere), the smoke layer, the objects layer (fruit,
---               fly_fruit with its wings, the lifeup "1000", balloons);
---   frames.jsonl per frame: the input the step consumed (-1 before the
---               player is active), its index in the file (keypress_frame),
---               Celia's frame count after it (practice_time: the clean
---               save's count),
---               the player, the deaths, and whether the room changed (`exit`).
+-- Frame capture for the headless Celia driver (CELIA_CAPTURE=DIR), in
+-- tools/uct/capture.lua's output format, so tools/compare_video.py (--tool
+-- celia) renders either. A frames.jsonl record's input is the one the step
+-- consumed (-1 before the player is active), its keypress_frame the input's
+-- index in the file, its practice_time Celia's frame count after it (the
+-- clean save's count).
 -- One record per cctas step of the playback (driver.lua's "wait" phase),
 -- taken right after the step, before the clean save's seek rewinds the
 -- exit frame away.

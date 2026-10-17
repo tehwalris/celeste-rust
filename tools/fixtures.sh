@@ -1,11 +1,10 @@
 #!/bin/bash
-# THE FIXTURES of the fast check ladder (plans/devloop.md): small trees at
-# known frames under $CELESTE_FIXTURES (default /var/tmp/celeste-fixtures,
-# never committed), each built once by a pinned command and checked against
-# its pinned fingerprint (gates/fixtures/NAME.ckhash: `ckhash --edges
-# --hulls` through its last frame: its frames, edges and hulls). A fixture is an
-# INPUT: the single-frame checks run one frame from it with the code being
-# tested and compare that frame's output with gates/fixtures/NAME.frame.
+# THE FIXTURES of the check ladder (plans/devloop.md "The fixtures"): small
+# trees at known frames under $CELESTE_FIXTURES (default
+# /var/tmp/celeste-fixtures, never committed), each built by a pinned
+# command and checked against its pinned fingerprint
+# (gates/fixtures/NAME.ckhash: `ckhash --edges --hulls` through its last
+# frame). A fixture is an INPUT: the frame checks run one frame from it.
 #
 #   tools/fixtures.sh ensure NAME...   build what is missing or STALE (another
 #                                      spec or file format; rebuilt, loudly)
@@ -16,15 +15,11 @@
 #                                      (./check.sh fixtures: all big)
 #   tools/fixtures.sh list
 #
-# A fixture under level -1 keeps the table it was built under
-# (NAME/l1-table.bin, --l1-table): the table cache is keyed on the
-# binary, so without it every rebuild of the binary would rebuild the table
-# (12-60 s) before the frame; the tree records the table's fingerprint and
-# `bench frame` refuses another.
-#
-# A fixture built from other sources than the checkout's is reported, not
-# rebuilt: its content is pinned by its fingerprint, and a code change that
-# moves a frame shows in the frame checks (and in t2's full-room gates).
+# A level -1 fixture keeps the table it was built under (NAME/l1-table.bin,
+# --l1-table): the table cache is keyed on the binary, so every rebuild of
+# the binary would rebuild the table (`bench frame` refuses another). One
+# built from other sources than the checkout's is reported, not rebuilt: its
+# content is pinned.
 # Env: BIN (default $CARGO_TARGET_DIR/quick/rewrite), CELESTE_FIXTURES.
 set -euo pipefail
 cd "$(dirname "$0")/.."

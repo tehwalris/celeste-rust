@@ -1,13 +1,8 @@
 #!/bin/bash
 # THE FORWARD FRAME BENCHMARK (plans/devloop.md): one forward frame F ->
-# F+1 of a fixture tree, run as the forward runs it - the wave (units and
-# region jobs), the frame's end and the checkpoint (`rewrite bench frame
-# --edges --checkpoint --reps N`) - its output checked against the
-# fixture's PIN (`f`/`h`/`e`/`b` lines: the new states, the frontier's
-# hulls, the edges by content, every file's bytes) and its COST REPORT
-# (`[cost]` lines: the walls, the wave's worker-seconds by phase with the
-# idle share, the frame end's and the checkpoint's steps, the cost per
-# element, the bytes written and the memory; min and max over the reps).
+# F+1 of a fixture tree as the forward runs it (`rewrite bench frame
+# --edges --checkpoint --reps N`), its lines checked against the fixture's
+# PIN and its `[cost]` report printed.
 #
 #   tools/fwd_bench.sh make NAME F -- FLAGS...  build the fixture: `rewrite
 #                                    forward --to F FLAGS` into $FWD_BENCH/NAME
@@ -17,11 +12,8 @@
 #                                    a later one that differs FAILS
 #   tools/fwd_bench.sh list
 #
-# A fixture's dir holds the tree, `fixture.txt` (its frame and flags) and
-# `frame.pin`; never committed (a fixture may be of a private cart). Each
-# run's whole log goes to NAME/runs/. Wall times are only comparable on a
-# quiet machine: the report gives the load; quote the min of several reps,
-# and prefer worker-seconds and the costs per element.
+# A fixture is never committed (it may be of a private cart); each run's log
+# goes to NAME/runs/. Wall times need a quiet machine (devloop.md).
 # Env: FWD_BENCH (default /var/tmp/fwd-bench), BIN (default
 # $CARGO_TARGET_DIR/release/rewrite: benchmarks are release builds),
 # THREADS (16), MEMORY (safe-run's --memory, default 15G).
