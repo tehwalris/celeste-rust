@@ -9,7 +9,6 @@ use celeste_rust::frame::wins_of;
 use celeste_rust::search::level_minus_one;
 use celeste_rust::settings::{Arith, Settings};
 
-/// `rewrite l1`'s commands.
 #[derive(clap::Subcommand)]
 pub enum Command {
     /// The table as the search builds it (`--level-minus-one H,S`): its
@@ -19,15 +18,15 @@ pub enum Command {
     /// The table against a tree's recorded transitions, frames FROM..=TO
     /// under CEILING (and the backward's MARKS at that horizon).
     Probe(ProbeArgs),
-    /// The table against a known solution: its concrete states (reference
-    /// engine) at every frame f before the exit, each with the table's d. One
-    /// that is too late for `--horizon` (f + d > H, H the solution's exit
-    /// frame) is a SOUNDNESS violation of the table: exits non-zero. An `rnd`
-    /// fork checks every leaf.
+    /// The table against a known solution: none of its states may be too late.
+    ///
+    /// Its concrete states (reference engine) at every frame f before the
+    /// exit, each with the table's d. One too late for `--horizon` (f + d >
+    /// H, H the solution's exit frame) is a SOUNDNESS violation of the
+    /// table: exits non-zero. An `rnd` fork checks every leaf.
     Check(CheckArgs),
 }
 
-/// `l1 table`'s arguments.
 #[derive(clap::Args)]
 pub struct TableArgs {
     /// The table's speed bound S (px per frame).
@@ -35,7 +34,6 @@ pub struct TableArgs {
     spd: i32,
 }
 
-/// `l1 probe`'s arguments.
 #[derive(clap::Args)]
 pub struct ProbeArgs {
     /// The table's speed bound S (px per frame).
@@ -58,7 +56,6 @@ pub struct ProbeArgs {
     marks: Option<std::path::PathBuf>,
 }
 
-/// `l1 check`'s arguments.
 #[derive(clap::Args)]
 pub struct CheckArgs {
     /// The input bytes: a file in the `tas/` format, or a comma list.

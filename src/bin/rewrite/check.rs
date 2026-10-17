@@ -2,8 +2,7 @@
 //! something independent: the kernels against the reference engine row by
 //! row (`ref`), the recorded transfers against it (`arcs`), the widening
 //! table's two sides (`widen`), a known route against the search's pruning
-//! (`known`), and the tree against its own recorded graph (`replay`). A
-//! tree's settings and level are its record's (`search::tree::TreeDir`).
+//! (`known`), and the tree against its own recorded graph (`replay`).
 
 use anyhow::Result;
 use celeste_engine::runtime2::Rt2;
@@ -23,56 +22,60 @@ use crate::{where_, KernelsNew, Rows};
 
 #[derive(clap::Subcommand)]
 pub enum Command {
-    /// THE KERNELS AGAINST THE REFERENCE ENGINE, row by row: `--samples`
-    /// stored rows of `--frame` (`--row N` the N-th alone) each run one step
-    /// through the tree level's kernels and through `RefEngine`, both sides
-    /// projected onto the level and compared by named fields. A reference
-    /// successor the kernels miss is a SOUNDNESS gap; a kernel successor the
-    /// reference never makes is a PRECISION gap. Every row, kernel successor
-    /// and reference leaf must also convert alike on the tracer's side and
-    /// the reference's (`block::check_agreement`). With `--row`, the row's
-    /// named fields and every kernel successor (its position and the fields
-    /// that differ from the row) are printed too.
+    /// THE KERNELS AGAINST THE REFERENCE ENGINE, row by row.
+    ///
+    /// `--samples` stored rows of `--frame` (`--row N`: the N-th alone),
+    /// each one step through the tree level's kernels and through
+    /// `RefEngine`, both projected onto the level and compared by named
+    /// fields. A reference successor the kernels miss is a SOUNDNESS gap; a
+    /// kernel successor the reference never makes is a PRECISION gap. Every
+    /// row, kernel successor and reference leaf must also convert alike on
+    /// the tracer's side and the reference's (`block::check_agreement`).
+    /// With `--row`, the row's named fields and every kernel successor (its
+    /// position and the fields that differ from the row) are printed too.
     Ref(RefArgs),
-    /// THE TRANSFERS of a tree's edges, against the reference engine. Every
-    /// recorded edge carries a transfer; then `--samples` records per frame,
-    /// the source row stepped by the REFERENCE engine at the tree's level
-    /// (all 64 inputs, the row's unknowns forked as the kernels fork them:
-    /// `RefEngine::step_at`): at remainders INSIDE the guard some input must
-    /// reach the target with the predicted remainder and every one that
-    /// reaches it must land where some record of that (pred, target) taking
-    /// the point predicts, and at points no record of the pair covers none
-    /// may. Fails (exit != 0) on any disagreement.
+    /// THE TRANSFERS of a tree's edges, against the reference engine.
+    ///
+    /// Every recorded edge carries a transfer; then `--samples` records per
+    /// frame, the source row stepped by the REFERENCE engine at the tree's
+    /// level (all 64 inputs, the row's unknowns forked as the kernels fork
+    /// them: `RefEngine::step_at`): at remainders INSIDE the guard some
+    /// input must reach the target with the predicted remainder and every
+    /// one that reaches it must land where some record of that (pred,
+    /// target) taking the point predicts, and at points no record of the
+    /// pair covers none may. Fails (exit != 0) on any disagreement.
     Arcs(ArcsArgs),
-    /// THE WIDENING TABLE'S TWO SIDES AGREE (`celeste_engine::widening`):
-    /// every row stored at `--frame` - widened in the kernels' graph - is a
+    /// THE WIDENING TABLE'S TWO SIDES AGREE (`celeste_engine::widening`).
+    ///
+    /// Every row stored at `--frame` (widened in the kernels' graph) is a
     /// fixed point of the block side's widening at the tree's level
-    /// (`Rt2::widen_to`), compared exactly (canonical bytes), and so is every
-    /// row the kernels emit from `--emitted` of them (evenly spaced). A row
-    /// the block side changes is printed with the fields that moved; the run
-    /// exits non-zero. (Not mid split frame at a near level: there the
-    /// graph side keeps a floor's computed `collideable` in the player's
-    /// probe window, which a frame boundary's widening does not.)
+    /// (`Rt2::widen_to`), compared exactly, and so is every row the kernels
+    /// emit from `--emitted` of them (evenly spaced). A row the block side
+    /// changes is printed with the fields that moved; the run exits
+    /// non-zero. Not mid split frame at a near level: there the graph side
+    /// keeps a floor's computed `collideable` in the player's probe window,
+    /// which a frame boundary's widening does not.
     Widen(WidenArgs),
-    /// A KNOWN solution against the pruning of a finished search
-    /// (`search::known`): stepped through the reference engine, at every
-    /// step it must pass level -1 (the filter the tree recorded) and the
-    /// objects ladder's filter, be in the tree with its exact remainder
-    /// inside its state's hull, reached from its parent by a recorded edge
-    /// that maps the remainder (the hull forward's claim; whole frames
-    /// only), and at every frame boundary project onto an arc-graph node
-    /// whose W holds its exact remainder, reached (at a level that filters
-    /// the next) - per level, the arc phase rerun over
+    /// A KNOWN solution against the pruning of a finished search (`search::known`).
+    ///
+    /// Stepped through the reference engine, at every step it must pass
+    /// level -1 (the filter the tree recorded) and the objects ladder's
+    /// filter, be in the tree with its exact remainder inside its state's
+    /// hull, reached from its parent by a recorded edge that maps the
+    /// remainder (whole frames only), and at every frame boundary project
+    /// onto an arc-graph node whose W holds its exact remainder, reached (at
+    /// a level that filters the next) - per level, the arc phase rerun over
     /// `<checkpoint-dir>/level{i:02}` as `search` ran it, without the
     /// concrete search. Exits non-zero on the first check that drops it,
     /// with the step, the node and the state (and, where the tree lost it,
     /// the kernels' successors of its state a frame before).
     Known(KnownArgs),
-    /// THE TREE REPLAYS FROM ITS RECORDED GRAPH (`search::hull_replay`): the
-    /// start's hull pushed along the recorded edges through their transfers,
-    /// frame by frame, must reach exactly the tree's states first at each
-    /// frame (else an error: an edge was not recorded). Prints per frame
-    /// the states first reached and the edges recorded into it.
+    /// THE TREE REPLAYS FROM ITS RECORDED GRAPH (`search::hull_replay`).
+    ///
+    /// The start's hull pushed along the recorded edges through their
+    /// transfers, frame by frame, must reach exactly the tree's states first
+    /// at each frame (else an error: an edge was not recorded). Prints per
+    /// frame the states first reached and the edges recorded into it.
     Replay(ReplayArgs),
 }
 
@@ -258,9 +261,6 @@ where
         let rt2 = tree.row(frame, sk, cfg.room)?;
         let at = where_(sk.cell(&geo));
         let id = sk.show();
-        // The row, its kernel successors and its reference leaves
-        // convert alike on the tracer's side and the reference's
-        // (`block::check_agreement`).
         let mut alike = 0;
         let mut agree = |reference: &celeste_rust::engines::reference::ReferenceEngine<A>, b: &Rt2<A::Num>| -> Result<()> {
             reference.check_agreement(b).map_err(|e| e.context(format!("state {id} at {at}: the one converter")))?;
@@ -268,8 +268,7 @@ where
             Ok(())
         };
         agree(reference, &rt2)?;
-        // The kernels' successors (with `--row`, each printed: its
-        // position and the fields that differ from the row).
+        // The kernels' successors (with `--row`, printed).
         let (next, _) = rerun(&kernels, rt2.clone_block(), frame)?;
         let mut kset: std::collections::BTreeSet<Proj> = Default::default();
         let mut shown = String::new();

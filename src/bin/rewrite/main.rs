@@ -89,43 +89,42 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// THE SEARCH (the arc pipeline), per level of `--level` (coarsest
-    /// first): the forward to the horizon recording every edge with its
-    /// remainder transfer, filtered by the previous level's arc-marked
-    /// nodes; the rotation graph's winning sets backward from the wins
-    /// (`search::driver::solve`), whose optimum is a LOWER BOUND on the game's (no
-    /// win refutes the horizon); then, at the LAST level only, the concrete
-    /// search inside the winning sets (a try at the bound, then breadth-first).
-    /// The first concrete win is the optimum, its inputs written to
-    /// `<checkpoint-dir>/witness_frame_F.txt`. The outcome, per level and
-    /// the verdict, goes to `<checkpoint-dir>/result.json`
-    /// (`search::result`) before the exit code says it.
+    /// THE SEARCH: the forward, the backward and the concrete search.
+    ///
+    /// Per level of `--level` (coarsest first): the forward to the horizon,
+    /// every edge recorded with its remainder transfer, filtered by the
+    /// previous level's arc-marked nodes; then the winning sets backward
+    /// from the wins, whose optimum is a LOWER BOUND on the game's (no win
+    /// refutes the horizon). At the LAST level, the concrete search inside
+    /// the winning sets: its first win is the optimum, its inputs written to
+    /// `<checkpoint-dir>/witness_frame_F.txt`. The verdict goes to
+    /// `<checkpoint-dir>/result.json` before the exit code says it.
     Search(SearchArgs),
-    /// THE DUAL SEARCH (`search::dual`): the shortest file valid in BOTH
-    /// arithmetics under rule (b) - the float tool's exit is the count, and
-    /// real play (16.16, from `--loading-jank`) must have left by then. Each
-    /// half runs its levels (forward and arc phase) to the same horizon,
-    /// under `<checkpoint-dir>/fixed` and `/float`; then the concrete search
-    /// over pairs of states, each half inside its own winning sets, from the
-    /// larger arc bound. The global settings are the fixed half's (no
-    /// `--arith float`); `--float-half` picks the float tool, which starts
-    /// from its own IL load (Celia's jank unless `--float-loading-jank`).
-    /// The witness is replayed in both arithmetics and goes to
-    /// `<checkpoint-dir>/witness_frame_F.txt`, the outcome to `result.json`.
+    /// THE DUAL SEARCH (`search::dual`): the shortest file valid in BOTH arithmetics.
+    ///
+    /// Rule (b): the float tool's exit is the count, and real play (16.16,
+    /// from `--loading-jank`) must have left by then. Each half runs its
+    /// levels to the same horizon, under `<checkpoint-dir>/fixed` and
+    /// `/float`; then the concrete search over pairs of states, each half
+    /// inside its own winning sets, from the larger arc bound. The global
+    /// settings are the fixed half's (no `--arith float`); `--float-half`
+    /// picks the float tool, which starts from its own IL load (Celia's jank
+    /// unless `--float-loading-jank`). The witness, replayed in both
+    /// arithmetics, goes to `<checkpoint-dir>/witness_frame_F.txt`, the
+    /// outcome to `result.json`.
     Dual(DualArgs),
-    /// ONE forward pass at ONE level, exactly as the search runs it, with the
-    /// per-frame timing line. The profiling entry point for the forward.
+    /// ONE forward at ONE level, as the search runs it, with the per-frame
+    /// timing line: the forward's profiling entry point.
     Forward(ForwardArgs),
-    /// ONE CONCRETE RUN: the reference engine (the interpreter on the
-    /// traced cart) runs an input sequence from the room's entry and prints
-    /// the player each frame (whole frames under `--split-frame`): the
-    /// basis for checking a witness against a real PICO-8
-    /// (`pico8_diff/replay.py`, the same frame convention). A frame that
-    /// forks (`rnd`) is an error: give the balloons' seeds.
+    /// ONE CONCRETE RUN: the reference engine plays inputs from the room's entry.
+    ///
+    /// Prints the player each frame (whole frames under `--split-frame`), in
+    /// `pico8_diff/replay.py`'s frame convention: the basis for checking a
+    /// witness against a real PICO-8. A frame that forks (`rnd`) is an
+    /// error: give the balloons' seeds.
     Run(run::Args),
-    /// FINGERPRINT a tree: per frame the states first reached there, counted,
-    /// and an order-independent hash of their (shape, key, cell) by content,
-    /// independent of the storage format (`f{frame} count hash`).
+    /// FINGERPRINT a tree: per frame (`f{frame} count hash`) its new states
+    /// counted, and an order-independent hash of their (shape, key, cell).
     Ckhash(diag::CkhashArgs),
     /// THE CHECKS of a finished tree, each against something independent.
     #[command(subcommand)]
@@ -133,52 +132,58 @@ enum Command {
     /// THE BENCHMARKS of a finished tree: one forward or backward frame.
     #[command(subcommand)]
     Bench(bench::Command),
-    /// DIAGNOSTIC: a tree's states, COUNTED (cells named by `inspect::cell_names`). Per
-    /// shape at `--frame`: its rows, every varying column's distinct values
-    /// (capped at `--cap`) with the rows holding an interval or an unknown
-    /// bool, and its distinct (spd.x, spd.y) pairs; with `--cell x,y` that
-    /// player position's rows only, and the values of a column with few. With
-    /// `--erase` or `--cell`, whether they SATURATE: from frame 0, every
-    /// `--every` frames, the new states, and the distinct ones (new, and so
-    /// far) with the named cells under an `--erase` prefix left out. With
-    /// `--cells K`, the K player positions with the most states through
-    /// `--frame` (their new states in its last 12 frames), and every
-    /// position's new states at `--frame` as a share of its states.
+    /// DIAGNOSTIC: a tree's states at `--frame`, COUNTED per shape.
+    ///
+    /// Per shape: its rows, every varying column's distinct values (capped
+    /// at `--cap`) with the rows holding an interval or an unknown bool,
+    /// and its distinct (spd.x, spd.y) pairs; with `--cell x,y` that player
+    /// position's rows only, and the values of a column with few. With
+    /// `--erase` or `--cell`, whether they SATURATE: every `--every` frames
+    /// from 0, the new states, and the distinct ones (new, and so far) with
+    /// the cells under an `--erase` prefix left out. With `--cells K`, the K
+    /// positions with the most states through `--frame` (their new states
+    /// in its last 12 frames), and every position's new states at `--frame`
+    /// as a share of its states.
     Census(diag::CensusArgs),
-    /// A concrete input sequence that follows a given TRAJECTORY of player
-    /// positions (one "x,y" per line from frame 1; `-` accepts any), found
+    /// A concrete input sequence that follows a TRAJECTORY of player positions.
+    ///
+    /// One "x,y" per line from frame 1 (`-` accepts any), followed
     /// breadth-first over the reference engine's concrete step, deduplicated
     /// exactly. Prints the input bytes for `rewrite run -i` /
     /// `pico8_diff/replay.py`, or the first frame it could not follow.
     Trajectory(diag::TrajectoryArgs),
-    /// A float witness's ROBUSTNESS to the host libm (plans/float.md, "The
-    /// robustness report"; `search::robust`): `--inputs` replayed in float (the
-    /// run's float tool, its seeds) under glibc's `sin`, a correctly rounded
-    /// `sin` (MPFR), every `sin` call one ulp up, every call one ulp down, and
-    /// `--random` runs moving each call by -1, 0 or +1 ulp at random; the frame
-    /// each first wins on. A variant that differs from glibc's is reported
-    /// FRAGILE (flagged, not rejected); the exit code is 0 either way.
+    /// A float witness's ROBUSTNESS to the host libm (plans/float.md, `search::robust`).
+    ///
+    /// `--inputs` replayed in float (the run's float tool, its seeds) under
+    /// glibc's `sin`, a correctly rounded `sin` (MPFR), every `sin` call one
+    /// ulp up, every call one ulp down, and `--random` runs moving each call
+    /// by -1, 0 or +1 ulp at random: the frame each first wins on. A variant
+    /// that differs from glibc's is reported FRAGILE (flagged, not
+    /// rejected); the exit code is 0 either way.
     Robust(diag::RobustArgs),
     /// THE LEVEL -1 TABLE (`--level-minus-one`): built alone, probed against
     /// a tree, checked against a known solution.
     #[command(subcommand)]
     L1(l1::Command),
-    /// Export a finished search for the web UI (`ui/`) from its record
-    /// (`result.json`), the trees' checkpoint HEADERS and forward records
-    /// (`forward.tsv`) and the marks files (`search::ui_export`); its room
-    /// the search's record's.
+    /// Export a finished search for the web UI (`ui/`, `search::ui_export`).
+    ///
+    /// Reads its record (`result.json`), the trees' checkpoint headers and
+    /// forward records (`forward.tsv`) and the marks files; its room is the
+    /// search's record's.
     ExportUi(ExportUiArgs),
-    /// The room (`--room`) as the tools need it, as JSON on stdout: its
-    /// level and its objects in creation order (the original cart's: tile,
-    /// tile position, type, whether the minimal cart has it, whether a TAS
-    /// file's `[seeds]` list runs over it - in this order).
+    /// The room (`--room`) as the tools need it, as JSON on stdout.
+    ///
+    /// Its level and its objects in creation order (the original cart's:
+    /// tile, tile position, type, whether the minimal cart has it, whether a
+    /// TAS file's `[seeds]` list runs over it).
     Room,
-    /// The start states real play can enter the room (`--room`) with
-    /// (`starts`), as JSON on stdout: every loading-frame J a play of the
-    /// previous room can give, the J's grouped by the exact start state they
-    /// make (one search per class), and the J of Celia's IL load. Give the
-    /// search's settings (the category; `--balloon-seeds` for a room with
-    /// balloons); not `--loading-jank`.
+    /// The start states real play can enter the room with, as JSON on stdout.
+    ///
+    /// Every loading-frame J a play of the previous room can give, the J's
+    /// grouped by the exact start state they make (one search per class),
+    /// and the J of Celia's IL load (`starts`). Give the search's settings
+    /// (the category; `--balloon-seeds` for a room with balloons), not
+    /// `--loading-jank`.
     Starts,
 }
 
@@ -210,21 +215,18 @@ pub struct SearchArgs {
     /// Stop at the arc bound (no concrete search).
     #[arg(long)]
     no_witness: bool,
-    /// Write the web UI's arc pass into this directory (`export-ui
-    /// --arc DIR`): the winning sets' support, each node to its last
-    /// frame (`level0.marks.bin`), and the ARC-MARKED nodes (`arc.marks.bin`),
-    /// both as `(shape, cell, key, dist)` rows with `dist` the horizon
-    /// minus the last frame the node still wins from;
+    /// Write the web UI's arc pass into this directory (`export-ui --arc
+    /// DIR`): the winning sets' support (`level0.marks.bin`) and the
+    /// ARC-MARKED nodes (`arc.marks.bin`) as `(shape, cell, key, dist)` rows,
+    /// `dist` the horizon less the last frame the node still wins from; and
     /// `witness.txt` (inputs and player position per frame).
     #[arg(long)]
     save_marks: Option<String>,
-    /// A known solution (a `tas/` file or a comma list of input bytes,
-    /// the spawn prologue included): the concrete search tries its input
-    /// first at every frame, so among the optimal routes the witness
-    /// follows it wherever it can - the smallest change to an existing
-    /// TAS. Every input is still tried; only WHICH optimum is found.
-    /// When it exits by the horizon it is also CHECKED against every
-    /// pruning step at every level (`search::known`, as `check known`):
+    /// A known solution (a `tas/` file or a comma list of input bytes, the
+    /// spawn prologue included): the concrete search tries its input first
+    /// at every frame, so the witness is the optimum closest to it (every
+    /// input is still tried). When it exits by the horizon it is also
+    /// CHECKED against every pruning step at every level (as `check known`):
     /// the search fails if one drops it.
     #[arg(long)]
     prefer: Option<String>,
@@ -254,9 +256,8 @@ pub struct DualArgs {
     /// The float half's loading jank J (Celia only; default: its IL load's).
     #[arg(long)]
     float_loading_jank: Option<usize>,
-    /// The web UI's arc pass of the FLOAT half (the count) into this
-    /// directory, as `search --save-marks` writes it, with the dual
-    /// witness's path (`export-ui --arc DIR`).
+    /// The FLOAT half's arc pass (the count) and the dual witness, as
+    /// `search --save-marks`.
     #[arg(long)]
     save_marks: Option<String>,
 }

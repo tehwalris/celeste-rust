@@ -1,7 +1,6 @@
 //! THE BENCHMARKS of a finished tree (`rewrite bench ...`): one forward
 //! frame (`frame`: its fingerprints, its files' bytes, its exact metrics
 //! and its costs) and one backward frame (`backward`), each repeatable.
-//! A tree's settings and level are its record's (`search::tree::TreeDir`).
 
 use anyhow::{Context, Result};
 use celeste_core::lua_f64::LuaF64;
@@ -17,29 +16,30 @@ use crate::KernelsNew;
 
 #[derive(clap::Subcommand)]
 pub enum Command {
-    /// ONE FORWARD FRAME of a tree, repeatably: the forward as it stood
-    /// after `--frame` F (`ForwardState::at`: the tree's visited set,
-    /// transfers, level -1 filter and pos graph at F; later frames ignored)
-    /// runs the wave of F+1 `--reps` times, the edges into a scratch dir.
-    /// Prints (stdout, the same every rep, else an error) `ckhash`'s lines
-    /// for F+1 - `f{F+1}` of the new states, `h{F+1}` of the frontier, with
-    /// `--edges` `e{F+1}` of the edges, with `--checkpoint` `b{F+1}` over
-    /// the bytes of the frame's files - so a tree extended past F checks
-    /// it; per rep (stderr) the wave (the region phase's worker time inside
-    /// it), the frame's end walls and the workers' phases (pack, kernel,
-    /// emit, unit end, regions, frame end); `kernel lanes: ... missed 0`.
-    /// With `--metrics FILE`, the EXACT metrics of the first rep (kernel
+    /// ONE FORWARD FRAME of a tree, F -> F+1, repeatably.
+    ///
+    /// The forward as it stood after `--frame` F (`ForwardState::at`: the
+    /// tree's visited set, transfers, level -1 filter and pos graph at F;
+    /// later frames ignored) runs the wave of F+1 `--reps` times, the edges
+    /// into a scratch dir. Prints (stdout, the same every rep, else an
+    /// error) `ckhash`'s lines for F+1 - `f{F+1}` of the new states,
+    /// `h{F+1}` of the frontier, with `--edges` `e{F+1}` of the edges, with
+    /// `--checkpoint` `b{F+1}` over the bytes of the frame's files - so a
+    /// tree extended past F checks it; per rep (stderr) the wave, the
+    /// frame's end walls and the workers' phases; `kernel lanes: ... missed
+    /// 0`. With `--metrics FILE`, the EXACT metrics of the first rep (kernel
     /// census and dynamic instructions, lanes, emissions, states, edges:
     /// `tools/metrics_diff.py` compares them with a pinned file); the same
     /// at every `--threads`.
     Frame(FrameArgs),
-    /// ONE BACKWARD FRAME of the arc phase, repeatably: a finished search
-    /// tree's edge files to `--horizon` opened (`backward::Seeds`; timed), the
-    /// winning sets pushed down to `W_{F+1}` (`backward::Backward`), then `W_F`
-    /// from them `--reps` times from a copy. Prints (stdout) `W_F`'s
-    /// fingerprint as the arc gate's line (`[gate] hH W fF count hash`, over
-    /// each node's (shape, key, cell) and its set), the same every rep; per
-    /// rep the read, pull and merge walls.
+    /// ONE BACKWARD FRAME of the arc phase, W_F from W_{F+1}, repeatably.
+    ///
+    /// A finished search tree's edge files to `--horizon` opened (timed),
+    /// the winning sets pushed down to `W_{F+1}`, then `W_F` from them
+    /// `--reps` times from a copy. Prints (stdout) `W_F`'s fingerprint as
+    /// the arc gate's line (`[gate] hH W fF count hash`, over each node's
+    /// (shape, key, cell) and its set), the same every rep; per rep the
+    /// read, pull and merge walls.
     Backward(BackwardArgs),
 }
 
@@ -246,8 +246,7 @@ fn bench_backward<N: Rem>(tree: &TreeDir, horizon: u32, frame: u32, reps: usize)
     eprintln!("[bench backward] h{horizon}'s edge files opened in {:.2} s: {} win rows, {} edges; {} threads", t.elapsed().as_secs_f64(), seeds.wins.len(), seeds.store.edges, cfg.threads());
     let mut first: Option<String> = None;
     for rep in 0..reps {
-        // Each rep pushes W down to F+1 afresh (untimed but the
-        // first), then times the step to W_F.
+        // Each rep pushes W down to F+1 afresh, then times the step to W_F.
         let t = std::time::Instant::now();
         let mut c = celeste_rust::search::backward::Backward::new(&seeds.store, &seeds.pairs, &seeds.wins, horizon, cfg.threads());
         for f in (frame + 1..horizon).rev() {
@@ -261,8 +260,7 @@ fn bench_backward<N: Rem>(tree: &TreeDir, horizon: u32, frame: u32, reps: usize)
         c.step(frame)?;
         let wall = t.elapsed();
         let after = c.walls();
-        // The gate's W line: per node with a set, its (shape, key,
-        // cell) and its set's rectangles, summed.
+        // The gate's W line: per node, its (shape, key, cell) and set, summed.
         let (mut n, mut acc) = (0usize, 0u64);
         for (id, r) in c.current() {
             let (shape, key, cell) = seeds.state(id);
@@ -281,14 +279,10 @@ fn bench_backward<N: Rem>(tree: &TreeDir, horizon: u32, frame: u32, reps: usize)
     Ok(())
 }
 
-/// `bench frame --metrics`: one frame's EXACT metrics, `key value` lines
-/// (the same at every thread count; no timings). Kernels: every
-/// built kernel's census summed (`all.*`: the traced and fused graphs'
-/// nodes by kind, guard roots, static instructions by category, spill
-/// slots), the frame's dynamic instructions (slices x static count, by
-/// category: `dyn.*`), and per kernel that ran its own line set
-/// (`k.<sym>.*`); the frame: lanes, emissions, states kept, units,
-/// slices, routes, edges, bundles, the edge file's bytes.
+/// `bench frame --metrics`: one frame's EXACT metrics as `key value` lines
+/// (no timings: the same at every thread count): the frame's, the calls',
+/// every built kernel's census summed (`all.*`), the dynamic instructions
+/// (`dyn.*`: slices x static count) and per kernel that ran (`k.<sym>.*`).
 fn frame_metrics((rx, ry): (i16, i16), level: Level, frame: u32, w: &celeste_rust::frame::FrameStats, ks: &celeste_rust::compiled::dispatch::KernelStats) -> String {
     use std::collections::BTreeMap;
     use std::fmt::Write as _;

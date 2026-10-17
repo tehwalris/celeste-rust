@@ -17,7 +17,6 @@ use std::path::PathBuf;
 
 use crate::{prefixes, where_, Rows};
 
-/// `ckhash`'s arguments.
 #[derive(clap::Args)]
 pub struct CkhashArgs {
     /// The tree (a forward's checkpoint dir, or a search's `levelNN`).
@@ -47,7 +46,6 @@ pub struct CkhashArgs {
     dump_edges: Option<u32>,
 }
 
-/// `census`'s arguments.
 #[derive(clap::Args)]
 pub struct CensusArgs {
     /// The tree (a forward's checkpoint dir, or a search's `levelNN`).
@@ -70,7 +68,6 @@ pub struct CensusArgs {
     cells: Option<usize>,
 }
 
-/// `trajectory`'s arguments.
 #[derive(clap::Args)]
 pub struct TrajectoryArgs {
     /// One line per frame: `x,y`, or `-` (any).
@@ -81,7 +78,6 @@ pub struct TrajectoryArgs {
     stop_at_win: bool,
 }
 
-/// `robust`'s arguments.
 #[derive(clap::Args)]
 pub struct RobustArgs {
     #[arg(long)]
@@ -90,7 +86,6 @@ pub struct RobustArgs {
     random: u64,
 }
 
-/// `ckhash`.
 pub fn ckhash(run: &Settings, a: CkhashArgs) -> Result<()> {
     let t = TreeDir::open(&a.tree, run)?;
     let (dir, to, cfg) = (&t.dir, t.frame(a.to)?, &t.settings);
@@ -133,7 +128,6 @@ pub fn ckhash(run: &Settings, a: CkhashArgs) -> Result<()> {
     Ok(())
 }
 
-/// `census` (`Command::Census`).
 pub fn census(run: &Settings, a: CensusArgs) -> Result<()> {
     use celeste_engine::exact::Code;
     use celeste_engine::runtime2::{Cell2, Col, AV};

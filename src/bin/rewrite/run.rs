@@ -8,7 +8,6 @@ use celeste_rust::concrete::{format_input, num_at, objects_of_type};
 use celeste_rust::settings::Settings;
 use celeste_rust::engines::reference::RefEngine;
 
-/// `run`'s arguments.
 #[derive(clap::Args)]
 pub struct Args {
     /// Comma-separated input bytes (e.g. "52,0,0,0,0,0"), or a `tas/`
