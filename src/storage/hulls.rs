@@ -1,17 +1,16 @@
 //! THE HULL FILES (`hulls/f{F}.bin`): frame F's FRONTIER - every state
-//! whose remainder hull GREW at F: the NEW states (frame F's file's
-//! states, in its order) by their hulls alone, and the older ones (GROWN,
-//! sorted by layer and state) with their layers and hulls. A resume replays
-//! them in order (`frame::restore_visited`): a state's hull is its last
-//! file's, and the last file is the frontier the next wave expands. Read
-//! back before the frame is trusted (`check`).
+//! whose hull GREW at F: the NEW ones (frame F's file's states, in its
+//! order) by their hulls alone, the older ones (GROWN, sorted by layer and
+//! state) with their layers and hulls. A resume replays them in order
+//! (`frame::restore_visited`): a state's hull is its last file's; the last
+//! file is the frontier the next wave expands. Read back before the frame
+//! is trusted (`check`).
 //!
-//! Format (`storage::file`): `CSH2`, the header (the frame, and per block
-//! its part, place and states), then the blocks - the new states' hulls in
-//! runs of `NEW_BLOCK` (`HullOf::BYTES` each: 8 in 16.16), then the grown
-//! states in runs of `GROWN_BLOCK`, each its layer, region, key (deltas
-//! from the state before it in the block where they share the fields
-//! before) and cell, and its hull.
+//! Format (`storage::file`): `CSH2`, the header (the frame; per block its
+//! part, place and states), then the blocks: the new states' hulls in runs
+//! of `NEW_BLOCK` (`HullOf::BYTES` each: 8 in 16.16), then the grown states
+//! in runs of `GROWN_BLOCK`, each its layer, region, key (deltas from the
+//! previous state where they share the fields before), cell and hull.
 
 use crate::search::hull::HullOf;
 use anyhow::{ensure, Context, Result};
@@ -75,8 +74,7 @@ fn wide(k: (u64, u64)) -> u128 {
     (k.0 as u128) << 64 | k.1 as u128
 }
 
-/// One block of a hull file: of the new states (`grown` false) or of the
-/// grown ones.
+/// One block of a hull file: of the new states (`grown` false) or grown ones.
 #[derive(serde::Serialize, serde::Deserialize, Clone, Copy, Debug)]
 struct Block {
     grown: bool,
@@ -183,8 +181,7 @@ fn decode_grown<N: Rem>(raw: &[u8], want: usize) -> Result<Vec<Grown<N>>> {
 }
 
 /// A hull file's blocks: per block whether it holds grown states, its run
-/// and its range there (`write`'s runs; the new states' hulls are run 0 of
-/// their own).
+/// (the new hulls: run 0 of their own) and its range there.
 fn cuts<N: Rem, R: Runs<N> + ?Sized>(hulls: &[HullOf<N>], runs: &R) -> Vec<(bool, usize, std::ops::Range<usize>)> {
     let mut cuts: Vec<(bool, usize, std::ops::Range<usize>)> = (0..hulls.len()).step_by(NEW_BLOCK).map(|a| (false, 0, a..(a + NEW_BLOCK).min(hulls.len()))).collect();
     for i in 0..runs.count() {
@@ -241,8 +238,7 @@ pub fn write<N: Rem, R: Runs<N> + ?Sized>(path: &Path, frame: u32, hulls: &[Hull
     })
 }
 
-/// A block of a hull file decoded: its hulls (a new states' block) or its
-/// grown states.
+/// A hull file's block decoded: its hulls (new states) or its grown states.
 fn decode<N: Rem>(file: &Mapped, x: &Block) -> Result<(Vec<HullOf<N>>, Vec<Grown<N>>)> {
     let path = file.path();
     let mut raw = Vec::new();
@@ -264,7 +260,6 @@ fn open<N: Rem>(path: &Path) -> Result<(Mapped, Header)> {
     Ok((file, header))
 }
 
-/// Read a hull file (`write`), its blocks on `threads` threads.
 pub fn read<N: Rem>(path: &Path, threads: usize) -> Result<Frontier<N>> {
     let (file, header) = open::<N>(path)?;
     let parts = super::wave::par_map(&header.blocks, threads, |x| decode::<N>(&file, x));
@@ -278,9 +273,8 @@ pub fn read<N: Rem>(path: &Path, threads: usize) -> Result<Frontier<N>> {
     Ok(out)
 }
 
-/// `rewrite ckhash --hulls`'s `h{frame}` line over a frontier: its states'
-/// count and the sum of their CONTENT hashes of (shape, key, cell) mixed
-/// with layer and hull; `shapes`: the tree's by index. Any order.
+/// `rewrite ckhash --hulls`'s `h{frame}` line: the states' count and the
+/// sum of their CONTENT hashes mixed with layer and hull; any order.
 pub fn fingerprint<N: Rem>(states: impl Iterator<Item = Grown<N>>, space: &celeste_engine::exact::KeySpace<N>, shapes: &[u64]) -> Result<(u64, u64)> {
     use celeste_engine::runtime2::mix64;
     let content = space.content_hash();

@@ -1,7 +1,6 @@
 //! THE ONE STATE SET (plans/architecture.md, "The forward"): per storage
-//! region a TABLE of entries - an exact key (the state without its
-//! position) and the mask of its cells in the region - SORTED by key, in
-//! one of two forms:
+//! region a TABLE of entries (exact key, cell mask) SORTED by key, in one
+//! of two forms:
 //!
 //!   * PLAIN: keys (in the bytes the largest needs, `kw`) and masks in
 //!     arrays: the frontier, a frame read back, the next layer;
@@ -36,8 +35,7 @@ fn bytes_of(w: u128) -> usize {
     (16 - (w.leading_zeros() / 8) as usize).max(1)
 }
 
-/// A state's LAYER (the frame the forward first reached it, whose wave
-/// expanded it) and its remainder HULL so far.
+/// A state's LAYER (the frame that first reached and expanded it), HULL so far.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct StateInfo<N: Rem = P8> {
     pub hull: HullOf<N>,
@@ -59,7 +57,6 @@ const CH: usize = 1 << CH_BITS;
 /// Entries a packed block holds, at most.
 pub const PACK_ENTRIES: usize = 1024;
 
-/// ONE REGION'S ENTRIES (module doc).
 #[derive(Clone)]
 pub struct RegionTable {
     len: usize,
@@ -75,8 +72,7 @@ enum Form {
     Packed { blocks: Vec<Block>, states: u64, infos: u64 },
 }
 
-/// A packed table's BLOCK: its first and last key and counts (what a
-/// lookup searches), its raw length and its zstd bytes.
+/// A packed BLOCK: key range and counts (what a lookup searches), raw, zstd.
 #[derive(Clone)]
 pub struct Block {
     first: u128,
@@ -141,7 +137,6 @@ impl<N: Rem> Rows<N> {
         &self.infos[self.at[i] as usize..self.at[i + 1] as usize]
     }
 
-    /// Entries `a..b` as a block.
     fn encode(&self, a: usize, b: usize, raw: &mut Vec<u8>) -> Result<Block> {
         raw.clear();
         let (ia, ib) = (self.at[a] as usize, self.at[b] as usize);
@@ -169,7 +164,6 @@ impl<N: Rem> Rows<N> {
         Ok(Block { first: self.keys[a], last: self.keys[b - 1], entries: (b - a) as u32, states, infos: (ib - ia) as u32, raw: raw.len() as u32, bytes: zstd_pack(raw)? })
     }
 
-    /// `block` decoded into these rows (cleared first).
     fn decode(&mut self, block: &Block, raw: &mut Vec<u8>) -> Result<()> {
         let pos = self.decode_cells(block, raw)?;
         let ni = block.infos as usize;
@@ -215,7 +209,6 @@ thread_local! {
     static ZSTD: std::cell::RefCell<Option<(zstd::bulk::Compressor<'static>, zstd::bulk::Decompressor<'static>)>> = const { std::cell::RefCell::new(None) };
 }
 
-/// `raw` compressed (zstd level 1, the thread's context).
 fn zstd_pack(raw: &[u8]) -> Result<Box<[u8]>> {
     ZSTD.with(|z| {
         let mut z = z.borrow_mut();
@@ -243,9 +236,9 @@ fn zstd_unpack(bytes: &[u8], raw: usize, out: &mut Vec<u8>) -> Result<()> {
     })
 }
 
-/// One change of a packed table (`upsert`): state `(key, cell)` with its
-/// info (`None`: a full hull - no info, a bare cell), and whether it is
-/// NEW (then held already is an error the caller counts: `Upserted`).
+/// One change of a packed table (`upsert`): state `(key, cell)`, its info
+/// (`None`: a full hull, bare), and whether it is NEW (held already: an
+/// error the caller counts, `Upserted::held_new`).
 #[derive(Clone, Copy, Debug)]
 pub struct Change<N: Rem = P8> {
     pub key: Key,
@@ -291,8 +284,7 @@ impl<N: Rem> Entry<'_, N> {
     }
 }
 
-/// A packed table WALKED by keys in ascending order (a frame's seal): each
-/// block decoded once, when a key falls in it.
+/// A packed table WALKED by ascending keys: each block decoded once, if hit.
 pub struct Cursor<'a, N: Rem = P8> {
     blocks: &'a [Block],
     b: usize,
@@ -337,8 +329,7 @@ impl RegionTable {
         RegionTable { len: 0, form: Form::Packed { blocks: Vec::new(), states: 0, infos: 0 } }
     }
 
-    /// A packed table of `blocks` (by key, distinct: an `upsert_blocks`'
-    /// parts in order; checked).
+    /// A packed table of `blocks` (by key, distinct: checked).
     pub fn of_blocks(blocks: Vec<Block>) -> Result<Self> {
         ensure!(blocks.windows(2).all(|w| w[0].last < w[1].first), "packed blocks out of order");
         let (len, states, infos) = blocks.iter().fold((0usize, 0u64, 0u64), |a, b| (a.0 + b.entries as usize, a.1 + b.states as u64, a.2 + b.infos as u64));
@@ -487,8 +478,7 @@ impl RegionTable {
         if w < block.first {
             return None;
         }
-        // The cells and bare cells alone: no info is read, so the rows'
-        // model is any one.
+        // No info is read: any model's rows do.
         let (mut rows, mut raw) = (Rows::<P8>::default(), Vec::new());
         rows.decode_cells(block, &mut raw).expect("a packed block decodes");
         let i = rows.keys.binary_search(&w).ok()?;
@@ -500,8 +490,7 @@ impl RegionTable {
         Cursor { blocks: self.blocks(), b: 0, loaded: usize::MAX, i: 0, rows: Rows::default(), raw: Vec::new() }
     }
 
-    /// Every entry of a packed table, decoded block by block: `f(key,
-    /// cells, bare cells, infos)`.
+    /// Every entry of a packed table: `f(key, cells, bare cells, infos)`.
     pub fn for_each_packed<N: Rem>(&self, mut f: impl FnMut(Key, u64, u64, &[StateInfo<N>])) -> Result<()> {
         let (mut rows, mut raw) = (Rows::<N>::default(), Vec::new());
         for b in self.blocks() {
@@ -551,8 +540,7 @@ impl RegionTable {
         out
     }
 
-    /// A plain table from `(key, cells)` sorted by key (a frame file's
-    /// region; checked).
+    /// A plain table from `(key, cells)` sorted by key (checked).
     pub fn from_sorted(keys: &[Key], masks: &[u64]) -> Result<RegionTable> {
         ensure!(keys.len() == masks.len(), "a region with {} keys and {} masks", keys.len(), masks.len());
         ensure!(keys.windows(2).all(|w| w[0] < w[1]), "a region's keys not ascending");
@@ -585,11 +573,10 @@ impl RegionTable {
 }
 
 /// UPSERT `changes` (sorted by key and cell, distinct) into the packed
-/// `blocks` (by key): the blocks after, and what it did. A block no change
-/// falls in is kept as it is, unless the entries made before it are fewer
-/// than half a block (then it joins them); the others are decoded, merged
-/// and cut again at `PACK_ENTRIES`. Blocks are independent: a big table's
-/// runs of blocks are upserted apart and put back in order.
+/// `blocks` (by key). A block no change falls in is kept, unless fewer than
+/// half a block's entries were made before it (then it joins them); the
+/// others are decoded, merged and cut again at `PACK_ENTRIES`. Blocks are
+/// independent: a big table's runs are upserted apart, put back in order.
 pub fn upsert_blocks<N: Rem>(blocks: Vec<Block>, changes: &[Change<N>]) -> Result<(Vec<Block>, Upserted)> {
     debug_assert!(changes.windows(2).all(|w| (wide(w[0].key), w[0].cell) < (wide(w[1].key), w[1].cell)), "changes not by key and cell");
     let mut w = Writer::<N>::default();
@@ -663,9 +650,8 @@ impl<N: Rem> Writer<N> {
     }
 }
 
-/// Entries `rows` merged with `changes` (by key and cell; their keys at
-/// most the rows' last, or any past it where `rows` is empty) into the
-/// writer, in key order.
+/// Entries `rows` merged with `changes` (by key and cell; keys at most the
+/// rows' last unless `rows` is empty) into the writer, in key order.
 fn merge_rows<N: Rem>(rows: &Rows<N>, changes: &[Change<N>], w: &mut Writer<N>) -> Result<Upserted> {
     if w.rows.at.is_empty() {
         w.rows.clear();
@@ -734,7 +720,7 @@ fn merge_rows<N: Rem>(rows: &Rows<N>, changes: &[Change<N>], w: &mut Writer<N>) 
     Ok(n)
 }
 
-/// A SET OF STATES: per region (ascending) its table (module doc).
+/// A SET OF STATES: per region (ascending) its table.
 #[derive(Clone, Default)]
 pub struct RegionSet {
     tables: Vec<(u32, RegionTable)>,
@@ -797,7 +783,6 @@ impl RegionSet {
         self.iter().flat_map(|(region, key, mask)| super::layer::bits(mask).map(move |local| Sk { region, key, local: local as u8 }))
     }
 
-    /// The cells of `(region, key)` held (0: none).
     pub fn mask_of(&self, region: u32, key: Key) -> u64 {
         self.table(region).map_or(0, |t| t.mask_of(key))
     }
@@ -821,9 +806,8 @@ impl RegionSet {
         b
     }
 
-    /// The `(region, table)` holding entry `e` of the whole set (its
-    /// entries numbered in order), with the entry's place in the table:
-    /// `starts` from `entry_starts`.
+    /// Entry `e` of the whole set (numbered in order) as its table's index
+    /// and its place there; `starts` from `entry_starts`.
     pub fn locate(&self, starts: &[usize], e: usize) -> Result<(usize, u32)> {
         let i = starts.partition_point(|&s| s <= e).checked_sub(1).ok_or_else(|| anyhow!("entry {e} before the set"))?;
         ensure!(i < self.tables.len() && e - starts[i] < self.tables[i].1.len(), "entry {e} past the set");
@@ -880,7 +864,6 @@ mod tests {
             assert_eq!(t.mask_of(narrow(w ^ 1 << 100)), want.get(&(w ^ 1 << 100)).copied().unwrap_or(0));
         }
         assert!(RegionTable::from_sorted(&[(0, 2), (0, 1)], &[1, 1]).is_err(), "keys out of order");
-        // Narrow keys stay narrow.
         let n = RegionTable::from_sorted(&(0..1000u64).map(|k| (0, k * 3)).collect::<Vec<_>>(), &[1; 1000]).unwrap();
         assert!(n.bytes()[0] < 1000 * 3 + 64, "more than 3 B of keys a two-byte key");
     }
@@ -954,8 +937,7 @@ mod tests {
         assert!(!kept.contains(&t.blocks()[0].bytes.as_ptr()), "the changed block kept");
     }
 
-    /// Sets: plain tables pushed in region order, membership, entries by
-    /// index.
+    /// Sets: plain tables pushed in region order, membership, entries by index.
     #[test]
     fn a_region_set_finds() {
         let mut a = RegionSet::default();

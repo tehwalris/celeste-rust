@@ -1,13 +1,10 @@
-//! THE ROUTES: a wave's emissions by their target's ROUTE (its shape and
-//! region slot: a storage region), and the REGION PHASE there
-//! (plans/architecture.md "The forward: hulls and storage"). A unit's
-//! bundles are the CHUNKS of their routes; a JOB (`run_route`) is one
-//! route's chunks of one slice: every push (the re-pushes' too) merged into
-//! the route's TOUCHED table (order-free: `HullAcc`), the bundles encoded
-//! into a SEGMENT of the frame's edge file (bundles of one key from two
-//! units stay two). At the frame's end each route's touched states are
-//! compared with the visited set (`seal_sort`, `seal_part`, `sealed`): NEW,
-//! GROWN, or nothing.
+//! THE ROUTES (a target's shape and region slot) and the REGION PHASE
+//! (plans/architecture.md "The forward: hulls and storage"): a JOB
+//! (`run_route`) merges one route's chunks of one slice - every push, the
+//! re-pushes' too, into its TOUCHED table (order-free: `HullAcc`), its
+//! bundles into a SEGMENT of the edge file (one key's from two units stay
+//! two). At the frame's end the touched states are sealed: NEW, GROWN, or
+//! nothing.
 
 use crate::search::hull::{AccOf, HullOf};
 use anyhow::{ensure, Result};
@@ -26,12 +23,10 @@ use celeste_engine::exact::is_provisional;
 /// `Scratch::e_of`'s mark of a provisional target.
 const PROV: u32 = u32::MAX;
 
-/// A route's TOUCHED states this frame: per key pushed into (open
-/// addressing in `index`, at most 3/4 full) its cells and the RUN of their
-/// hulls so far in `slots`, by cell (a run moves to the end when its key
-/// gains a cell; compacted once the dead slots pass half the live; arrays
-/// grow by an eighth): ~30 B a touched state. Compared with the visited
-/// set at the frame's end (`seal_part`).
+/// A route's TOUCHED states this frame: per key (open addressing in
+/// `index`, at most 3/4 full) its cells and the RUN of their hulls in
+/// `slots`, by cell (moved to the end when the key gains a cell; compacted
+/// once the dead pass half the live; arrays grow by an eighth): ~30 B a state.
 pub struct Touched<N: Rem = P8> {
     index: Vec<u32>,
     keys: Vec<TouchedKey>,
@@ -46,7 +41,6 @@ impl<N: Rem> Default for Touched<N> {
     }
 }
 
-/// A touched key: its cells and its run's start.
 #[derive(Clone, Copy, Debug)]
 pub struct TouchedKey {
     pub key: Key,
@@ -100,7 +94,7 @@ impl<N: Rem> Touched<N> {
         }
     }
 
-    /// Merge `cells` (by cell, ascending: `(cell, hull)`) into key `key`'s.
+    /// Merge `cells` (`(cell, hull)`, ascending) into key `key`'s.
     #[inline]
     pub fn push(&mut self, key: Key, cells: &[(u8, AccOf<N>)]) {
         let e = self.place(key);
@@ -113,7 +107,6 @@ impl<N: Rem> Touched<N> {
             }
             return;
         }
-        // The key's run with the new cells, at the end.
         let next = mask | add;
         let at = self.slots.len();
         grow(&mut self.slots, next.count_ones() as usize);
@@ -160,9 +153,8 @@ impl<N: Rem> Touched<N> {
         self.keys.iter().map(|k| k.key)
     }
 
-    /// The keys pushed into, each `key(k)` (a provisional key made final:
-    /// distinct keys stay distinct), sorted, and the hulls so far (each
-    /// key's run by cell).
+    /// The keys, each `key(k)` (made final: distinct keys stay distinct),
+    /// sorted, and the hulls (each key's run by cell).
     pub fn into_sorted(self, key: impl Fn(Key) -> Result<Key>) -> Result<(Vec<TouchedKey>, Vec<AccOf<N>>)> {
         let mut keys = self.keys;
         for k in &mut keys {
@@ -177,8 +169,7 @@ impl<N: Rem> Touched<N> {
         self.bytes().iter().sum()
     }
 
-    /// Bytes held by part (`[wavemem]`): the index, the keys, the slots
-    /// live, the slots dead or spare.
+    /// Bytes held (`[wavemem]`): index, keys, live slots, dead or spare.
     pub fn bytes(&self) -> [usize; 4] {
         let slot = std::mem::size_of::<AccOf<N>>();
         [self.index.capacity() * 4, self.keys.capacity() * std::mem::size_of::<TouchedKey>(), self.states * slot, (self.slots.capacity() - self.states) * slot]
@@ -189,8 +180,8 @@ impl<N: Rem> Touched<N> {
     }
 }
 
-/// The wave's routes: a target's (shape, region slot) -> a dense id, made
-/// by the units as they emit (read-mostly: a worker caches its own).
+/// The wave's routes: (shape, region slot) -> a dense id, made as the units
+/// emit (read-mostly: a worker caches its own).
 #[derive(Default)]
 pub struct Routes {
     map: RwLock<FxHashMap<(u64, u32), u32>>,
@@ -198,7 +189,6 @@ pub struct Routes {
 }
 
 impl Routes {
-    /// The id of `(shape, slot)`, made on first use.
     pub fn id(&self, shape: u64, slot: u32) -> u32 {
         if let Some(&r) = self.map.read().expect("routes").get(&(shape, slot)) {
             return r;
@@ -220,10 +210,9 @@ impl Routes {
     }
 }
 
-/// A unit's bundles of one route: its distinct TARGETS (key, cells
-/// reached), its PUSHES (target, cell, hull; none where no push reached),
-/// the unit's sources (shared by its chunks), the bundles naming both by
-/// index, and the source regions their edges leave.
+/// A unit's bundles of one route: its TARGETS (key, cells), PUSHES (target,
+/// cell, hull), the unit's sources (shared), the bundles naming both by
+/// index, the source regions their edges leave.
 pub struct Chunk<N: Rem = P8> {
     pub route: u32,
     pub unit: u32,
@@ -246,27 +235,22 @@ pub struct Ub {
     pub mask: u64,
 }
 
-/// A route through a frame: its touched states, its edges' segments.
 pub struct RouteState<N: Rem = P8> {
     pub shape: u64,
     pub slot: u32,
     /// The visited set's region, once the shape is numbered.
     pub region: Option<u32>,
-    /// The states pushed into this frame, with their pushed hulls.
     pub touched: Touched<N>,
-    /// The provisional keys it was pushed into or its bundles name (keys
-    /// made final at the frame's end: a target pushed nothing still has
-    /// its edges).
+    /// The provisional keys pushed into or named by its bundles (a target
+    /// nothing was pushed into still has its edges).
     pub prov_keys: FxHashSet<Key>,
-    /// The bundles that WAIT for the frame's end: into a provisional target
-    /// (no final key yet) or with a transfer new this frame (no canonical id
-    /// yet), per job (slice) a segment with the provisional keys and ids,
-    /// encoded again with the final ones (`reencode`). Compressed, not as
-    /// structs: a big room's frame holds ~100M of them.
+    /// The bundles that WAIT for the frame's end (a provisional target, or a
+    /// new transfer: no canonical id yet), per job (slice) a segment,
+    /// re-encoded with the final keys and ids (`reencode`). Compressed: a
+    /// frame can hold ~100M.
     pub prov: Vec<(u32, Segment)>,
-    /// Its segments with their kind (0: a job's, 1: a job's bundles that
-    /// waited, made final) and slice: jobs of a route may run out of slice
-    /// order; the edge file sorts them by this.
+    /// Its segments by (kind (0: a job's, 1: waited, made final), slice):
+    /// jobs run out of slice order; the edge file sorts them by this.
     pub segs: Vec<((u8, u32), Segment)>,
     /// The source regions its edges leave.
     pub sources: FxHashSet<u32>,
@@ -286,36 +270,32 @@ impl<N: Rem> RouteState<N> {
     }
 }
 
-/// What the region phase reads besides its route.
 pub struct RegionCtx<'a> {
     pub frame: u32,
-    /// Are edges recorded?
     pub record: bool,
     /// Per worker, its local transfer ids' global ones.
     pub remaps: &'a [Vec<u32>],
-    /// The global ids from here on are this frame's new transfers', in the
-    /// order the slices met them: provisional until the frame's end.
+    /// Ids from here on are the frame's new transfers', in slice order:
+    /// provisional until the frame's end.
     pub new_xfers: u32,
-    /// The frame's spool: a job's segment goes there (`spool`).
     pub spool: Option<&'a super::spool::Spool>,
 }
 
 /// A unit's bundles, by route: an emission is APPENDED to its route's
-/// bucket (ORed into the last bundle when it is the same, as a body's lanes
-/// mostly are); `drain` merges each bucket in place, in a table the
-/// bucket's size (cache-resident, where one table over the unit missed the
-/// cache on most appends), and names its distinct targets by index.
+/// bucket (ORed into the last bundle if the same); `drain` merges each
+/// bucket in a table its size (cache-resident, where one table over the
+/// unit missed the cache on most appends).
 #[derive(Default)]
 pub struct UnitBundles {
     buckets: Vec<(u32, Vec<(Key, Ub)>)>,
     bucket_of: FxHashMap<u32, u32>,
     last_route: Option<(u32, u32)>,
-    /// `drain`'s merge table (`index + 1` into the bucket; 0 empty) and
+    /// `drain`'s merge table (`index + 1` into the bucket; 0 empty), and
     /// its target index.
     slots: Vec<u32>,
     t_idx: rustc_hash2::FxHashMap<Key, u32>,
-    /// Emptied buckets kept for the next units, at most `SPARE_KEEP` bundles'
-    /// room in all (unbounded, every bucket grows to the largest route's).
+    /// Emptied buckets kept, at most `SPARE_KEEP` bundles' room (unbounded,
+    /// every bucket grows to the largest route's).
     spare: Vec<Vec<(Key, Ub)>>,
 }
 
@@ -329,7 +309,6 @@ fn ub_hash(t_key: Key, b: &Ub) -> u64 {
 }
 
 impl UnitBundles {
-    /// Bytes its tables hold (`--phases`' `[wavemem]`).
     pub fn alloc_bytes(&self) -> usize {
         let b = 16 + std::mem::size_of::<Ub>();
         self.buckets.iter().map(|x| x.1.capacity() * b).sum::<usize>() + self.spare.iter().map(|v| v.capacity() * b).sum::<usize>() + 4 * self.slots.capacity() + 24 * self.t_idx.capacity()
@@ -348,8 +327,7 @@ impl UnitBundles {
         self.last_route = None;
     }
 
-    /// OR `bit` into the bundle `(route, t_key; source s, x, o)`: appended
-    /// to the route's bucket (merged at `drain`).
+    /// OR `bit` into bundle `(route, t_key; s, x, o)` (merged at `drain`).
     #[inline]
     pub fn insert(&mut self, route: u32, t_key: Key, s: u32, x: u32, o: u32, bit: u64) {
         let k = match self.last_route {
@@ -379,9 +357,8 @@ impl UnitBundles {
         v.push((t_key, Ub { t: 0, s, x, o, mask: bit }));
     }
 
-    /// `v`'s bundles MERGED in place: each distinct (target key, source,
-    /// transfer, offset) once, at its first place (the first `n` returned),
-    /// its cells the union of its appends'.
+    /// `v`'s bundles MERGED in place: each (target key, s, x, o) once, at
+    /// its first place (the first `n` returned), its cells ORed.
     fn merge(slots: &mut Vec<u32>, v: &mut [(Key, Ub)]) -> usize {
         let cap = (2 * v.len()).next_power_of_two().max(16);
         slots.clear();
@@ -410,10 +387,9 @@ impl UnitBundles {
         n
     }
 
-    /// The buckets as `(route, targets, bundles)`: each merged, its distinct
-    /// targets (key, cells reached) named by index, the cells `drop(route,
-    /// key, cell)` says cleared first (the coarser level's disallowed
-    /// targets; a bundle left without cells goes); the table cleared.
+    /// The buckets as `(route, targets, bundles)`, merged, targets named by
+    /// index, the cells `drop(route, key, cell)` says cleared first (refused
+    /// targets; a bundle left without cells goes).
     #[allow(clippy::type_complexity)]
     pub fn drain(&mut self, drop: Option<&dyn Fn(u32, Key, u32) -> bool>) -> Vec<(u32, Vec<(Key, u64)>, Vec<Ub>)> {
         let mut buckets = std::mem::take(&mut self.buckets);
@@ -470,13 +446,11 @@ impl UnitBundles {
     }
 }
 
-/// A worker's scratch for the region phase.
 pub struct Scratch {
     /// The job's bundles into provisional targets.
     prov: Vec<Bundle>,
-    /// The job's targets: their names in the job (dense, as met) by key,
-    /// and their keys - so the encoder's arrays are the job's size, not its
-    /// region's (a region can hold 24M entries).
+    /// The job's targets named densely, as met (and their keys): the
+    /// encoder's arrays the job's size, not its region's (up to 24M).
     t_loc: rustc_hash2::FxHashMap<Key, u32>,
     t_keys: Vec<Key>,
     e_of: Vec<u32>,
@@ -489,13 +463,11 @@ pub struct Scratch {
     z: zstd::bulk::Compressor<'static>,
 }
 
-/// Bundles a worker's region scratch keeps room for between jobs (~25 MB a
-/// worker): a heavy route's job is millions of bundles, and with much less
-/// room the big jobs' buffers are made again job after job.
+/// Bundles a worker's region scratch keeps room for between jobs (~25 MB):
+/// heavy jobs are millions of bundles; with less, their buffers are remade.
 const SCRATCH_KEEP: usize = 1 << 20;
 
 impl Scratch {
-    /// Its buffers back to `SCRATCH_KEEP` bundles' room after a job grew them.
     fn bound(&mut self) {
         if self.prov.capacity() > SCRATCH_KEEP {
             self.prov = Vec::new();
@@ -515,8 +487,7 @@ impl Scratch {
         }
     }
 
-    /// Bytes its buffers hold (`--phases`' `[wavemem]`): the job's
-    /// bundles, the encoder's, the raw block, the rest.
+    /// Bytes held (`[wavemem]`): the job's bundles, encoder, raw block, rest.
     pub fn alloc_bytes(&self) -> [usize; 4] {
         [std::mem::size_of::<bundle::Tb>() * self.tbs.capacity() + std::mem::size_of::<Bundle>() * self.prov.capacity(), self.enc.alloc_bytes(), self.raw.capacity(), 4 * (self.e_of.capacity() + self.s_of.capacity()) + 32 * self.s_idx.capacity() + 24 * self.s_list.capacity() + 9 * self.t_loc.capacity() + 16 * self.t_keys.capacity()]
     }
@@ -530,7 +501,7 @@ impl<N: Rem> Chunk<N> {
 }
 
 impl<N: Rem> RouteState<N> {
-    /// Bytes its touched table, provisional bundles and segments hold.
+    /// Bytes held: touched table, waiting bundles, segments.
     pub fn alloc_bytes(&self) -> [usize; 3] {
         [self.touched.alloc_bytes() + 24 * self.prov_keys.capacity(), self.prov.iter().map(|s| s.1.bytes.held()).sum::<usize>(), self.segs.iter().map(|s| s.1.bytes.held()).sum::<usize>()]
     }
@@ -554,10 +525,9 @@ impl Default for Scratch {
     }
 }
 
-/// THE REGION PHASE of one route over one slice's `chunks`: every push
-/// merged into the route's touched states; with `cx.record`, the slice's
-/// segment encoded, its bundles as the units made them (those into a
-/// provisional target or with a new transfer wait: `RouteState::prov`).
+/// THE REGION PHASE of one route over one slice's `chunks`: the pushes into
+/// its touched states; with `cx.record`, the slice's segment (some bundles
+/// wait: `RouteState::prov`).
 #[inline(never)]
 pub fn run_route<N: Rem>(st: &mut RouteState<N>, slice: u32, chunks: &[&Chunk<N>], cx: &RegionCtx, sc: &mut Scratch) -> Result<()> {
     let n: usize = chunks.iter().map(|c| c.bundles.len()).sum();
@@ -569,7 +539,6 @@ pub fn run_route<N: Rem>(st: &mut RouteState<N>, slice: u32, chunks: &[&Chunk<N>
     sc.t_loc.clear();
     sc.t_keys.clear();
     for c in chunks {
-        // THE PUSHES.
         let mut i = 0usize;
         let mut cells: Vec<(u8, AccOf<N>)> = Vec::new();
         while i < c.pushes.len() {
@@ -606,7 +575,6 @@ pub fn run_route<N: Rem>(st: &mut RouteState<N>, slice: u32, chunks: &[&Chunk<N>
                 l
             });
         }
-        // THE EDGES (some wait: `RouteState::prov`).
         sc.s_of.clear();
         sc.s_of.resize(c.sources.len(), u32::MAX);
         for b in &c.bundles {
@@ -653,23 +621,20 @@ pub fn run_route<N: Rem>(st: &mut RouteState<N>, slice: u32, chunks: &[&Chunk<N>
     Ok(())
 }
 
-/// What a route's frame end gives the wave: its region, its NEW states
-/// (frozen, by key) with their hulls in the table's state order, and the
-/// states whose hull GREW (with their layers and new hulls).
+/// A route's frame end: its NEW states (by key) with their hulls in the
+/// table's order, and the states whose hull GREW.
 pub struct Sealed<N: Rem = P8> {
     pub region: u32,
     pub table: RegionTable,
     pub hulls: Vec<HullOf<N>>,
     pub grown: Vec<super::wave::Old<N>>,
-    /// The states it compared, and its steps' times (sort, compare summed
-    /// over the parts, table: `--phases`' `[seal]`).
+    /// The states compared; times to sort, compare (summed), make the table.
     pub touched: usize,
     pub t: [std::time::Duration; 3],
     /// The bundles that waited (their segments, bundles: `reencode`).
     pub waited: (usize, u64),
-    /// The held states it compared: full (no hull stored) and by AGE (frame
-    /// less layer: 1, 2-3, 4-7, 8-15, 16-31, 32+), and the grown ones by age
-    /// (`--phases`' `[seal]`).
+    /// The held states compared: full (no hull stored) and by AGE (frame less
+    /// layer: 1, 2-3, 4-7, 8-15, 16-31, 32+); the grown ones by age.
     pub held_by_age: [[u64; 7]; 2],
 }
 
@@ -691,11 +656,8 @@ impl Renumber<'_> {
     }
 }
 
-/// THE FRAME'S END of a route, its first step (its shape numbered:
-/// `region`): provisional keys made final (`finals`), the touched keys
-/// sorted with their hulls. Then `seal_part` compares them with the visited
-/// set in parts and `sealed` puts the parts together; the waiting bundles
-/// stay in `st.prov` for `reencode`.
+/// A route's FRAME END, first step (its shape numbered: `region`): keys made
+/// final (`finals`), the touched keys sorted; then `seal_part` and `sealed`.
 pub fn seal_sort<N: Rem>(st: &mut RouteState<N>, region: u32, finals: &FxHashMap<Key, Key>) -> Result<Touch<N>> {
     st.region = Some(region);
     for seg in &mut st.segs {
@@ -709,7 +671,6 @@ pub fn seal_sort<N: Rem>(st: &mut RouteState<N>, region: u32, finals: &FxHashMap
     Ok(Touch { region, touched, accs, n_touched, waited, t_sort: t.elapsed() })
 }
 
-/// A route's touched keys sorted, with their pushes' hulls (`seal_sort`).
 pub struct Touch<N: Rem = P8> {
     pub region: u32,
     pub touched: Vec<TouchedKey>,
@@ -722,8 +683,7 @@ pub struct Touch<N: Rem = P8> {
 /// Touched keys a seal part takes.
 pub const SEAL_PART: usize = 1 << 15;
 
-/// A part of a route's touched keys compared (`seal_part`): its new
-/// states (keys, cells, hulls), its grown states, the held states by age.
+/// A `seal_part`: its new states (keys, cells, hulls), grown, held by age.
 pub struct SealPart<N: Rem = P8> {
     keys: Vec<Key>,
     masks: Vec<u64>,
@@ -733,9 +693,8 @@ pub struct SealPart<N: Rem = P8> {
     t: std::time::Duration,
 }
 
-/// The touched keys `part` of `touch` COMPARED with the visited set's
-/// region table (read only: a `Cursor`, each block decoded once): a state
-/// it lacks is NEW, one whose hull grew GREW.
+/// The touched keys `part` COMPARED with the visited set's region (a
+/// `Cursor`, each block decoded once): a state it lacks NEW, a hull grown GREW.
 pub fn seal_part<N: Rem>(touch: &Touch<N>, part: std::ops::Range<usize>, frame: u32, visited: &VisitedSet<N>) -> Result<SealPart<N>> {
     let t = std::time::Instant::now();
     let (region, accs) = (touch.region, &touch.accs);
@@ -786,8 +745,8 @@ pub fn seal_part<N: Rem>(touch: &Touch<N>, part: std::ops::Range<usize>, frame: 
     Ok(SealPart { keys, masks, hulls, grown, held_by_age, t: t.elapsed() })
 }
 
-/// A route's SEALED states from its parts, in order: the new ones frozen
-/// (sorted by key: canonical) with their hulls, the grown ones.
+/// A route's SEALED states from its parts (in order): the new ones by key
+/// (canonical).
 pub fn sealed<N: Rem>(touch: Touch<N>, parts: Vec<SealPart<N>>) -> Result<Sealed<N>> {
     let t = std::time::Instant::now();
     let n = |f: fn(&SealPart<N>) -> usize| parts.iter().map(f).sum::<usize>();
@@ -808,8 +767,7 @@ pub fn sealed<N: Rem>(touch: Touch<N>, parts: Vec<SealPart<N>>) -> Result<Sealed
     Ok(Sealed { region: touch.region, table, hulls, grown, touched: touch.n_touched, t: [touch.t_sort, t_compare, t.elapsed()], waited: touch.waited, held_by_age })
 }
 
-/// A job's bundles that WAITED (`RouteState::prov`) encoded again as a
-/// segment of `region` with their final keys (`finals`) and transfer ids
+/// A WAITED segment re-encoded for `region` with final keys and transfer ids
 /// (`renumber`: `None` where the new transfers are in order already).
 pub fn reencode(seg: &Segment, region: u32, finals: &FxHashMap<Key, Key>, renumber: Option<&Renumber>, enc: &mut bundle::Encoder, z: &mut zstd::bulk::Compressor<'static>) -> Result<Segment> {
     let (mut dz, mut raw) = (zstd::bulk::Decompressor::new()?, Vec::new());

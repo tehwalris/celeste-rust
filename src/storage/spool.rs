@@ -1,9 +1,7 @@
-//! A frame's SPOOL: the compressed blocks the wave makes long before the
-//! frame's end writes them (out blocks, edge segments), appended to a
-//! scratch file and copied into their files by the writers - page cache
-//! the kernel can reclaim, not anonymous memory held to the frame's end.
-//! The file is unlinked once created: nothing is left behind, whatever
-//! ends the process.
+//! A frame's SPOOL: the compressed blocks (out blocks, edge segments) the
+//! wave makes long before the frame's end writes them, in a scratch file -
+//! page cache the kernel can reclaim, not anonymous memory. Unlinked once
+//! created: nothing is left behind, whatever ends the process.
 
 use anyhow::{Context, Result};
 use std::os::unix::fs::FileExt;
@@ -15,7 +13,6 @@ pub struct Spool {
     end: AtomicU64,
 }
 
-/// A block's place in the spool.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Spooled {
     at: u64,
@@ -38,7 +35,6 @@ impl Spool {
         Ok(Spooled { at, len })
     }
 
-    /// The block at `s` into `buf`.
     pub fn read(&self, s: Spooled, buf: &mut Vec<u8>) -> Result<()> {
         buf.resize(s.len as usize, 0);
         self.file.read_exact_at(buf, s.at).context("reading the frame's spool")

@@ -6,9 +6,8 @@ use crate::search::hull::HullOf;
 use anyhow::{ensure, Context, Result};
 use std::path::{Path, PathBuf};
 
-/// `rewrite ckhash --edges`'s `e{frame}` line over the frame's edge file in
-/// `edges_dir` (`EdgeHashes::frame`; `xfers`: the merged table in memory,
-/// the dir's file may hold only the frame's new pairs).
+/// `ckhash --edges`'s `e{frame}` line over the frame's edge file (`xfers`:
+/// the merged table; the dir's file may hold only the frame's new pairs).
 pub fn edge_fingerprint<N: crate::search::rem::Rem>(edges_dir: &Path, frame: u32, xfers: &super::edges::XferTable<N>, visited: &super::visited::VisitedSet<N>, threads: usize) -> Result<(u64, u64)> {
     let store = super::edges::EdgeStore::<N>::open(edges_dir, frame)?;
     EdgeHashes::new::<N>(&xfers.pairs).frame(&store, frame, &visited.keys.content_hash(), visited.shapes(), threads)
@@ -37,8 +36,7 @@ impl EdgeHashes {
         }
     }
 
-    /// Frame `frame`'s edges of `store`: `(count, sum of terms)` (`shapes`:
-    /// the tree's by index).
+    /// Frame `frame`'s `(count, sum of terms)` (`shapes`: the tree's by index).
     pub fn frame<N: crate::search::rem::Rem>(&self, store: &super::edges::EdgeStore<N>, frame: u32, content: &celeste_engine::exact::ContentHash, shapes: &[u64], threads: usize) -> Result<(u64, u64)> {
         let mix = celeste_engine::runtime2::mix64;
         let geo = super::GEOMETRY;
@@ -72,9 +70,8 @@ impl EdgeHashes {
     }
 }
 
-/// One `bench frame` rep for the COST REPORT (`print_cost`): the frame's
-/// stats, its checkpoint's steps and the pos graph's wall (`--checkpoint`),
-/// the rep's wall, the load average at its start, its hardware counts.
+/// One `bench frame` rep for `print_cost` (`ckpt`: the checkpoint's steps
+/// and the pos graph's wall, with `--checkpoint`; `load`: at its start).
 pub struct Rep {
     pub stats: crate::frame::FrameStats,
     pub ckpt: Option<(crate::frame::Checkpointed, std::time::Duration)>,
@@ -84,10 +81,10 @@ pub struct Rep {
     pub counts: Option<[u64; 4]>,
 }
 
-/// HARDWARE COUNTERS over a rep, every thread it starts included (Linux
-/// `perf_event_open`, `inherit`: a thread's counts join its parent's when
-/// it exits, and a frame's threads are all joined by its end): user-mode
-/// instructions, user-mode cycles, kernel-mode cycles, page faults.
+/// HARDWARE COUNTERS over a rep, every thread it starts included
+/// (`perf_event_open`, `inherit`: an exited thread's counts join its
+/// parent's, and a frame joins its threads): user instructions, user
+/// cycles, kernel cycles, page faults.
 /// Instructions do not move with the machine's load as walls do.
 pub struct Counters {
     fds: [i32; 4],
@@ -134,9 +131,8 @@ impl Counters {
         Some(Counters { fds })
     }
 
-    /// Counting; the counts so far (`stop` takes the difference: a reset
-    /// would not reset the exited threads' counts, which `inherit` keeps
-    /// apart).
+    /// Counting; the counts so far (`stop` subtracts: a reset would miss the
+    /// exited threads' counts, which `inherit` keeps apart).
     pub fn start(&self) -> [u64; 4] {
         for &fd in &self.fds {
             // SAFETY: an open perf event fd; ENABLE 0x2400.
@@ -162,8 +158,7 @@ impl Counters {
     }
 }
 
-/// The counters a bench installed for the frame's STEPS (`step_counts`):
-/// the frame end's and the checkpoint's steps read them at their marks.
+/// The counters a bench installed for the frame end's and checkpoint's STEPS.
 static STEPS: std::sync::OnceLock<Counters> = std::sync::OnceLock::new();
 
 /// Install `c` as the step counters (once a process); the installed ones.
@@ -171,9 +166,8 @@ pub fn count_steps(c: Counters) -> &'static Counters {
     STEPS.get_or_init(|| c)
 }
 
-/// The step counters' counts now (`None`: no bench installed them). Read
-/// on the thread that opened them, between steps (each step's threads
-/// joined: their counts are in).
+/// The step counters' counts now (`None`: none installed). Read on the
+/// opening thread between steps, each step's threads joined.
 pub fn step_counts() -> Option<[u64; 4]> {
     STEPS.get().map(Counters::read)
 }
@@ -202,8 +196,8 @@ pub fn load_average() -> f64 {
     std::fs::read_to_string("/proc/loadavg").ok().and_then(|s| s.split_whitespace().next()?.parse().ok()).unwrap_or(0.0)
 }
 
-/// A report line: its label, per rep its seconds, the element its cost is
-/// per (name, count per rep), and per rep its counts (`Counters`; a step's).
+/// A report line: label, seconds per rep, the element its cost is per (name,
+/// count per rep), and a step's counts per rep.
 struct Line {
     label: String,
     secs: Vec<f64>,
@@ -211,11 +205,10 @@ struct Line {
     counts: Option<Vec<[u64; 4]>>,
 }
 
-/// THE COST REPORT of a frame's reps: the frame's wall split into the
-/// wave, the frame end and the checkpoint; the wave's WORKER-SECONDS by
-/// phase (`frame::phases`) with the idle share; the end's and checkpoint's
-/// steps; each with its cost per element; the bytes written and the
-/// memory. Min and max over the reps (quote the min, with the load).
+/// THE COST REPORT of a frame's reps: walls (wave, frame end, checkpoint),
+/// the wave's WORKER-SECONDS by phase with the idle share, the end's and
+/// checkpoint's steps, each with its cost per element; bytes and memory.
+/// Min and max over the reps (quote the min, with the load).
 pub fn print_cost(frame: u32, reps: &[Rep]) {
     use crate::frame::phases as ph;
     let Some(r0) = reps.first() else { return };
@@ -363,9 +356,8 @@ pub fn print_cost(frame: u32, reps: &[Rep]) {
     );
 }
 
-/// The bytes of every file under `dir` (recursively, by relative path):
-/// `(files, bytes, hash)` - `bench frame`'s `b` line, so a change to how a
-/// frame's files are written proves them byte-identical.
+/// `(files, bytes, hash)` of every file under `dir`, by relative path:
+/// `bench frame`'s `b` line, proving a frame's files byte-identical.
 pub fn dir_fingerprint(dir: &Path) -> Result<(u64, u64, u64)> {
     use celeste_engine::runtime2::mix64;
     let mut files: Vec<(PathBuf, PathBuf)> = Vec::new();
@@ -396,9 +388,8 @@ pub fn dir_fingerprint(dir: &Path) -> Result<(u64, u64, u64)> {
     Ok((files.len() as u64, bytes, acc))
 }
 
-/// THE MEMORY CENSUS of a forward between frames (`bench frame`'s
-/// `[memory]`): what its structures allocate, by part, per visited state
-/// and entry, beside the process's resident set.
+/// THE MEMORY CENSUS between frames (`[memory]`): what the structures
+/// allocate, by part, per visited state and entry, beside the resident set.
 pub fn print_memory<N: crate::search::rem::Rem>(when: &str, visited: &super::visited::VisitedSet<N>, new: &super::layer::Layer<N>, hulls: &[HullOf<N>], old: &super::wave::ByLayer<N>, outs: &super::out::OutStore, xfers: &super::edges::XferTable<N>) {
     let mut parts: Vec<(&str, usize)> = visited.census();
     let f = new.set.bytes();

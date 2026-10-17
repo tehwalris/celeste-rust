@@ -1,21 +1,18 @@
 //! ROWS FROM KEYS: a state's row is a function of its shape's SKELETON
-//! (structure with closure captures, globals, strings, the non-value
-//! cells), its exact key and its cell (plans/architecture.md "Keys"), so
-//! the storage holds keys and cells only and rows are decoded on demand:
+//! (structure, closure captures, globals, strings, non-value cells), its
+//! exact key and its cell (plans/architecture.md "Keys"), so the storage
+//! holds keys and cells only:
 //!
-//!   * every value cell is a key field (`exact::ShapeKeys::value_cells`):
-//!     its code is the dictionary's at the index the key holds;
+//!   * every value cell is a key field (`exact::ShapeKeys::value_cells`);
 //!   * the position's `x`/`y` keep only their fraction in the key
-//!     (`exact::Code::pos`); the whole pixels are the cell's, less the room
-//!     offset (`pos_graph::room_offset` of the row's own `room.x/y`);
+//!     (`Code::pos`); the whole pixels are the cell's, less the room offset
+//!     (`pos_graph::room_offset` of the row's own `room.x/y`);
 //!   * the code merges `Num(n)` and `Ival(n, n)` (producers disagree), so
-//!     the skeleton keeps per value cell whether its column holds numbers,
-//!     intervals or anything (`Repr`).
+//!     the skeleton keeps each value column's `Repr`.
 //!
-//! A row its key does not determine is FATAL, never stored lossy: a shape's
-//! first emission per worker and wave is checked against its decode
-//! (`Skeletons::check_decodes`; `--key-check`: every emission), the start's
-//! rows likewise (`check_piece`).
+//! A row its key does not determine is FATAL, never stored lossy: checked
+//! on a shape's first emission per worker and wave (`--key-check`: every
+//! one; `Skeletons::check_decodes`) and on the start (`check_piece`).
 
 use anyhow::{anyhow, ensure, Context, Result};
 use celeste_core::arith::EngineNum;
@@ -26,17 +23,15 @@ use celeste_engine::runtime2::{Cell2, Col, Rt2, AV};
 
 use crate::search::pos_graph::{cell_xy, room_offset, NO_CELL};
 
-/// The rows `(key, cell)` of `skel`'s shape as a block (`skel`'s values are
-/// not read). Rows of one key in a run (an entry's cells) share all but the
-/// position: a field's code is looked up once a run, and a column stays
-/// uniform until a run differs.
+/// The rows `(key, cell)` of `skel`'s shape as a block (`skel`'s values
+/// unread). A run of one key's rows differs only in position: codes are
+/// looked up once a run, a column stays uniform until a run differs.
 pub fn decode_rows<N: EngineNum>(keys: &KeySpace<N>, skel: &Rt2<N>, rows: &[(Key, u32)]) -> Result<Rt2<N>> {
     let s = keys.shape(skel.shape_hash).ok_or_else(|| anyhow!("decode: shape {:016x} is not in the key space", skel.shape_hash))?;
     let n = rows.len();
     ensure!(n > 0, "decode: no rows");
     let pos = s.record.pos;
     let is_pos = |c: u32| pos.is_some_and(|(x, y)| c == x || c == y);
-    // The runs of one key.
     let mut runs: Vec<(Key, usize, usize)> = Vec::new();
     for (i, r) in rows.iter().enumerate() {
         match runs.last_mut() {
@@ -88,8 +83,7 @@ pub fn decode_rows<N: EngineNum>(keys: &KeySpace<N>, skel: &Rt2<N>, rows: &[(Key
         ensure!(rows.iter().all(|r| r.1 == NO_CELL), "decode: shape {shape:016x} has no position object, a row has a cell");
         return Ok(out);
     };
-    // The position: the cell's whole pixels less the room offset, plus the
-    // key's fraction.
+    // Position: the cell's pixels less the room offset, plus the fraction.
     let ids = crate::compiled::ids();
     let start = (skel.cache.room_x, skel.cache.room_y);
     let room = out.global_target(ids.g_room).ok_or_else(|| anyhow!("decode: no `room` global"))?;
@@ -219,9 +213,8 @@ impl<N: EngineNum> Builder<N> {
     }
 }
 
-/// How a value cell's column holds its numbers - the one thing the code
-/// does not say. Per piece, from the stored block's column (a frame file's
-/// header keeps it).
+/// How a value column holds its numbers, which the code does not say; per
+/// piece, from the stored block's column (a frame file's header keeps it).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Repr {
     /// `N`, or uniform `Num`.
@@ -251,11 +244,10 @@ impl Repr {
     }
 }
 
-/// THE SHAPES' SKELETONS a wave decodes its layers with: per shape the
-/// first registered (a kernel's union template, `asm_kernel::unify`, or a
-/// `reference_skeleton`), kept as its `layer::SkelRecord` (what decodes)
-/// and that record's block. Another record under one shape (one that would
-/// decode otherwise) is FATAL.
+/// THE SHAPES' SKELETONS: per shape the first registered (a kernel's union
+/// template, `asm_kernel::unify`, or a `reference_skeleton`), as its
+/// `layer::SkelRecord` and that record's block. Another record under one
+/// shape (it would decode otherwise) is FATAL.
 pub struct Skeletons<N: EngineNum = P8>(std::sync::RwLock<rustc_hash::FxHashMap<u64, (super::layer::SkelRecord<N>, std::sync::Arc<Rt2<N>>)>>);
 
 impl<N: EngineNum> Default for Skeletons<N> {
@@ -292,9 +284,8 @@ impl<N: EngineNum> Skeletons<N> {
         self.0.read().expect("skeletons").get(&shape).map(|x| x.1.clone()).ok_or_else(|| anyhow!("ROWS FROM KEYS: no skeleton of shape {shape:016x} (it was never emitted)"))
     }
 
-    /// THE GUARD: `rows` (their keys, `cells`) decode with their shape's
-    /// skeleton to exactly themselves, row by row, representation included
-    /// (`Col::at`: a number column's `Num`, an interval column's `Ival`).
+    /// THE GUARD: `rows` (keys, `cells`) decode to exactly themselves, row
+    /// by row, representation included (`Col::at`: `Num` vs `Ival`).
     pub fn check_decodes(&self, keys: &KeySpace<N>, rows: &Rt2<N>, cells: &[u32]) -> Result<()> {
         let skel = self.get(rows.shape_hash)?;
         let keyed: Vec<(Key, u32)> = rows.row_keys.iter().copied().zip(cells.iter().copied()).collect();
@@ -316,8 +307,7 @@ impl<N: EngineNum> Skeletons<N> {
     }
 }
 
-/// A reference row's skeleton: every value cell left to the decode
-/// (`Repr::Other`: the column follows its values).
+/// A reference row's skeleton: every value cell left to the decode (`Other`).
 pub fn reference_skeleton<N: EngineNum>(row: &Rt2<N>) -> Rt2<N> {
     let mut b = celeste_engine::slots::reshape(row, 0);
     b.cols = row.structure.iter().zip(&row.cols).map(|(cell, c)| if matches!(cell, Cell2::Val) { Col::V(Vec::new()) } else { Col::U(c.at(0)) }).collect();
@@ -325,10 +315,9 @@ pub fn reference_skeleton<N: EngineNum>(row: &Rt2<N>) -> Rt2<N> {
     b
 }
 
-/// THE GUARD on the start's rows (`wave::seed`): they decode from their
-/// keys and `cells` to exactly themselves, representation included, and no
-/// per-row column holds one value throughout (a load collapses it:
-/// `collapse_uniform`). Chunks of rows decoded in parallel.
+/// THE GUARD on the start's rows (`wave::seed`): they decode to exactly
+/// themselves, representation included, and no per-row column holds one
+/// value throughout (a load collapses it: `collapse_uniform`).
 pub fn check_piece<N: EngineNum>(keys: &KeySpace<N>, rt2: &Rt2<N>, cells: &[u32]) -> Result<()> {
     const CHUNK: usize = 1 << 15;
     ensure!(rt2.row_keys.len() == rt2.width && cells.len() == rt2.width, "check_piece: a block without its keys or cells");

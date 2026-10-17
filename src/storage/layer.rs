@@ -21,8 +21,6 @@ use super::decode::Repr;
 use super::set::{RegionSet, RegionTable};
 use super::{Sk, GEOMETRY};
 
-/// A LAYER: a frozen set of states (`set::RegionSet`) and the skeletons
-/// its shapes' rows decode with.
 #[derive(Clone)]
 pub struct Layer<N: EngineNum = P8> {
     pub set: RegionSet,
@@ -76,8 +74,7 @@ impl<N: EngineNum> Layer<N> {
     }
 
     /// `rewrite ckhash`'s `f` line: the states' count and the sum of their
-    /// CONTENT hashes of (shape, key, cell) - independent of the order the
-    /// tree's dictionaries grew in. `shapes`: the tree's by index.
+    /// CONTENT hashes (any dictionary order). `shapes`: the tree's by index.
     pub fn content_fingerprint(&self, space: &KeySpace<N>, shapes: &[u64]) -> Result<(u64, u64)> {
         let content = space.content_hash();
         let geo = GEOMETRY;
@@ -178,7 +175,6 @@ impl<N: EngineNum> SkelRecord<N> {
     }
 }
 
-/// The frame files' magic.
 const MAGIC: &[u8; 4] = b"CSL1";
 
 pub fn frame_path(dir: &Path, frame: u32) -> PathBuf {
@@ -189,8 +185,7 @@ pub fn frame_exists(dir: &Path, frame: u32) -> bool {
     frame_path(dir, frame).is_file()
 }
 
-/// The last frame of the tree in `dir` with a file (frames from 0 on,
-/// consecutive); `None`: none.
+/// The tree's last frame with a file (frames from 0 on, consecutive).
 pub fn last_frame(dir: &Path) -> Option<u32> {
     let mut last = None;
     while frame_exists(dir, last.map_or(0, |f: u32| f + 1)) {
@@ -217,14 +212,12 @@ pub struct FrameHeader<N: EngineNum = P8> {
     pub side: u32,
     /// `(index, hash)` of the shapes numbered here.
     pub shapes: Vec<(u32, u64)>,
-    /// What the key space gained here.
     pub keys: KeyAdditions<N>,
     /// The skeletons of the shapes the file holds states of.
     pub skeletons: Vec<SkelRecord<N>>,
-    /// The skeletons first EMITTED at the frame of the shapes it holds no
-    /// state of: a hull tree reaches a state of such a shape later by a
-    /// re-push, with no emission of the shape that frame - a resume
-    /// registers every file's (`frame::restore_visited`).
+    /// The skeletons first EMITTED at the frame of shapes it holds no state
+    /// of: a re-push reaches such a shape's state later without emitting
+    /// it - a resume registers every file's (`frame::restore_visited`).
     pub emitted: Vec<SkelRecord<N>>,
     /// Per region held (ascending) its block.
     pub regions: Vec<RegionIndex>,
@@ -309,10 +302,9 @@ fn decode_region(raw: &[u8]) -> Result<RegionEntries> {
     Ok(RegionEntries { keys, masks, wins })
 }
 
-/// WRITE a frame file (`frame_path`): `layer`'s states with their win
-/// masks (`wins`: sorted entry indices of `layer` with a win, and the win
-/// cells), its skeletons, what the frame added to the codebooks. Returns
-/// its bytes.
+/// WRITE a frame file: `layer`'s states with their win masks (`wins`:
+/// sorted entry indices of `layer` with a win, and the win cells), its
+/// skeletons, what the frame added to the codebooks. Returns its bytes.
 pub fn write_frame<N: EngineNum>(path: &Path, meta: &FrameMeta<N>, layer: &Layer<N>, wins: &[(u32, u64)], threads: usize) -> Result<u64> {
     ensure!(wins.windows(2).all(|w| w[0].0 < w[1].0), "write_frame: wins not by entry");
     let tables = layer.set.tables();
@@ -358,7 +350,6 @@ pub fn write_frame<N: EngineNum>(path: &Path, meta: &FrameMeta<N>, layer: &Layer
     })
 }
 
-/// A frame file, mapped, its header decoded.
 pub struct FrameFile<N: EngineNum = P8> {
     file: Mapped,
     pub header: FrameHeader<N>,
@@ -387,8 +378,7 @@ impl<N: EngineNum> FrameFile<N> {
         Ok(e)
     }
 
-    /// Drop the resident pages of region `i`'s block (`Mapped::release`): a
-    /// reader streaming a tree does not hold the blocks it has read.
+    /// Drop the resident pages of region `i`'s block (`Mapped::release`).
     pub fn release_region(&self, i: usize) -> Result<()> {
         self.file.release(self.file.stored(self.header.regions[i].at))
     }
@@ -493,8 +483,7 @@ impl<N: EngineNum> Tree<N> {
         Ok(Tree { dir: dir.to_path_buf(), last, frames, shapes: shapes.into_iter().map(|s| s.1).collect(), space })
     }
 
-    /// Frame `f`'s states, skeletons in a search from `room` if given, and
-    /// its wins.
+    /// Frame `f`'s states and wins, skeletons in a search from `room` if given.
     pub fn layer(&self, f: u32, room: Option<(i16, i16)>, threads: usize) -> Result<(Layer<N>, Vec<Sk>)> {
         let file = self.frames.get(f as usize).ok_or_else(|| anyhow!("{}: no frame {f} (the tree is open to {})", self.dir.display(), self.last))?;
         let Some(file) = file else { return Ok((Layer::default(), Vec::new())) };
@@ -540,8 +529,7 @@ impl<N: EngineNum> Tree<N> {
         Some(Sk::at(&GEOMETRY, i as u32, key, cell))
     }
 
-    /// The cells of `(region, key)` frame `f` holds (0: none), reading
-    /// that region's blocks only.
+    /// The cells of `(region, key)` frame `f` holds, reading that region only.
     pub fn mask_at(&self, f: u32, region: u32, key: Key) -> Result<u64> {
         let Some(file) = self.file(f) else { return Ok(0) };
         let Ok(i) = file.header.regions.binary_search_by_key(&region, |r| r.region) else { return Ok(0) };
@@ -549,8 +537,7 @@ impl<N: EngineNum> Tree<N> {
         Ok(e.keys.binary_search(&key).map_or(0, |k| e.masks[k]))
     }
 
-    /// The frame (layer) holding state `s` among frames `0..=upto`, by a
-    /// search of their files (diagnostics).
+    /// The frame holding state `s` among `0..=upto`, by searching their files.
     pub fn layer_of(&self, s: Sk, upto: u32) -> Result<Option<u32>> {
         for f in 0..=upto.min(self.last) {
             if self.mask_at(f, s.region, s.key)? >> s.local & 1 == 1 {
@@ -566,9 +553,7 @@ impl<N: EngineNum> Tree<N> {
         r.rt2_in(room)
     }
 
-    /// Frame `f`'s ROWS decoded in a search from `room`: per shape, chunks
-    /// of at most `chunk` states, each the states (in order) and their rows
-    /// (row keys set); only the states `keep` admits.
+    /// Frame `f`'s ROWS in a search from `room` (`decode_states`; keys set).
     pub fn rows(&self, f: u32, room: (i16, i16), chunk: usize, keep: &dyn Fn(Sk) -> bool, threads: usize) -> Result<Vec<(Vec<Sk>, Rt2<N>)>> {
         let (layer, _) = self.layer(f, Some(room), threads)?;
         decode_states(&layer, &self.space, &self.shapes, chunk, keep)
@@ -632,8 +617,7 @@ mod tests {
         l
     }
 
-    /// A frame file round-trips its states and wins exactly (the storage
-    /// check passes).
+    /// A frame file round-trips its states and wins (the storage check passes).
     #[test]
     fn frame_files_round_trip() {
         let dir = std::env::temp_dir().join(format!("celeste-layer-test-{}", std::process::id()));

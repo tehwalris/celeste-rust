@@ -1,13 +1,11 @@
-//! THE TREE FILES' ONE CONTAINER - the frame, hull, edge and out files and
-//! the small values (the marks, the pos graph): a 4-byte magic (the file's
-//! kind; `magic`: in its arithmetic), a u32 version (`FORMAT_VERSION`; the
-//! edge files' their own), the header's length (u64; both little-endian)
-//! and the header (bincode 1), then the BLOCKS back to back, each zstd -1
-//! and placed by the header (`At`). A value file is a header and no block.
-//!
-//! Written once, to a `NAME.tmp` sibling renamed into place (a crash never
-//! leaves a loadable-looking half file); read mapped (`Mapped`), its magic,
-//! version and length checked.
+//! THE TREE FILES' ONE CONTAINER (frame, hull, edge and out files; value
+//! files: the marks, the pos graph): a 4-byte magic (the file's kind, in
+//! its arithmetic: `magic`), a u32 version (`FORMAT_VERSION`; the edge
+//! files' their own), the header's length (u64; both little-endian), the
+//! header (bincode 1), then the BLOCKS back to back, zstd -1, placed by the
+//! header (`At`). A value file is a header and no block. Written once, to a
+//! `NAME.tmp` renamed into place (a crash never leaves a loadable-looking
+//! half file); read mapped (`Mapped`), magic, version and length checked.
 
 use anyhow::{ensure, Context, Result};
 use serde::{de::DeserializeOwned, Serialize};
@@ -59,8 +57,7 @@ impl At {
 }
 
 /// zstd -1 of a raw block, shrunk to its size (the compressor's buffer is
-/// the raw block's bound: a frame's segments, held to its end, took 5x
-/// their bytes).
+/// the raw bound: held to the frame's end, segments took 5x their bytes).
 pub fn compress(raw: &[u8], z: &mut zstd::bulk::Compressor<'static>) -> Result<Vec<u8>> {
     ensure!(raw.len() < u32::MAX as usize, "a block of {} bytes", raw.len());
     let mut v = z.compress(raw)?;
@@ -77,9 +74,8 @@ pub fn decompress(stored: &[u8], raw_len: usize, z: &mut zstd::bulk::Decompresso
     Ok(())
 }
 
-/// WRITE a file: `magic`, `version`, `header`, then the blocks `blocks`
-/// writes, in the order and at the places (`At`) the header gives them.
-/// Atomic. Returns its bytes.
+/// WRITE a file: `magic`, `version`, `header`, then what `blocks` writes,
+/// in the order and places (`At`) the header gives. Atomic. Returns its bytes.
 pub fn write(path: &Path, magic: [u8; 4], version: u32, header: &impl Serialize, blocks: impl FnOnce(&mut dyn Write) -> Result<()>) -> Result<u64> {
     let hb = bincode::serialize(header).with_context(|| format!("{}: its header", path.display()))?;
     if let Some(parent) = path.parent() {
@@ -110,8 +106,7 @@ pub struct Mapped {
 }
 
 impl Mapped {
-    /// Map the file at `path`, a `what` (for the errors) of `magic` and
-    /// `version`.
+    /// Map the file at `path`: a `what` (for the errors) of `magic`, `version`.
     pub fn open(path: &Path, magic: [u8; 4], version: u32, what: &str) -> Result<Self> {
         let file = std::fs::File::open(path).with_context(|| path.display().to_string())?;
         // SAFETY: a tree file is written once (renamed into place) and never
@@ -144,12 +139,10 @@ impl Mapped {
         Ok(())
     }
 
-    /// Block `at`'s stored bytes.
     pub fn stored(&self, at: At) -> &[u8] {
         &self.map[self.data + at.offset as usize..self.data + at.end() as usize]
     }
 
-    /// Block `at`'s raw bytes into `out`.
     pub fn block(&self, at: At, z: &mut zstd::bulk::Decompressor<'static>, out: &mut Vec<u8>) -> Result<()> {
         decompress(self.stored(at), at.raw as usize, z, out).with_context(|| self.path.display().to_string())
     }

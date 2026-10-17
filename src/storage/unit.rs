@@ -1,9 +1,7 @@
-//! THE UNIT SINK (`UnitSink`, one per worker, reset per unit): a unit's
-//! emissions ORed into BUNDLES by their target's route - nothing is looked
-//! up and no row is copied here (plans/architecture.md "The forward: hulls
-//! and storage"). At the unit's end its bundles are the chunks of their
-//! routes, each with its PUSHES: per target cell the hulls of the unit's
-//! sources pushed along the bundles' transfers.
+//! THE UNIT SINK (`UnitSink`, one per worker, reset per unit): emissions
+//! ORed into BUNDLES by their target's route, nothing looked up or copied;
+//! at the unit's end the chunks of their routes, each with its PUSHES
+//! (plans/architecture.md "The forward: hulls and storage").
 
 use crate::search::hull::{AccOf, HullOf};
 use anyhow::Result;
@@ -27,9 +25,8 @@ pub enum TCol<N: EngineNum = P8> {
     Bool(Vec<u8>),
 }
 
-/// Rows of one shape, columnar over its skeleton (the union of its outcome
-/// templates' varying cells), buffered only to look at them: the coarser
-/// level's verdicts, the key check, the decode guard.
+/// Rows of one shape, columnar over its skeleton, buffered only to be looked
+/// at: the coarser level's verdicts, the key check, the decode guard.
 pub struct RowBuf<N: EngineNum = P8> {
     pub shape: u64,
     skeleton: Rt2<N>,
@@ -161,9 +158,8 @@ pub(crate) fn lanes_of(mut m: u16) -> impl Iterator<Item = usize> {
     })
 }
 
-/// A slice's TARGETS in one cell column of one output shape (made once per
-/// column, not per body): per lane its cell, route, bit in the route's
-/// region, source (index and region) and the offset between the cells.
+/// A slice's TARGETS in one cell column of one shape (once per column, not
+/// per body): per lane cell, route, bit, source (index, region), offset.
 #[derive(Clone, Copy)]
 pub struct Targets {
     pub cells: [u32; 16],
@@ -180,9 +176,8 @@ impl Default for Targets {
     }
 }
 
-/// ONE BODY's emissions of a kernel slice, column-wise: the lanes `take`,
-/// lane `i` the state `(shape, keys[i], targets.cells[i])` reached from
-/// unit lane `lanes[i]` with transfer `xfers[i]`.
+/// ONE BODY's emissions of a kernel slice: lane `i` of `take` is `(shape,
+/// keys[i], targets.cells[i])`, from unit lane `lanes[i]` by `xfers[i]`.
 pub struct BodyEmits<'e> {
     pub shape: u64,
     pub take: u16,
@@ -195,13 +190,11 @@ pub struct BodyEmits<'e> {
 /// A (route, key, cell) target as the coarser level's verdicts name it.
 type Target = (u32, Key, u8);
 
-/// One worker's sink for a frame's units (module doc).
 pub struct UnitSink<'a, N: Rem = P8> {
     keys: &'a KeySpace<N>,
     routes: &'a Routes,
     skeletons: &'a Skeletons<N>,
-    /// The wave's provisional keys (states holding a code the key space
-    /// lacks: new by construction).
+    /// The wave's provisional keys (a code the key space lacks: a new state).
     prov: &'a Provisional<N>,
     filters: Filters<'a, N>,
     frame: u32,
@@ -209,19 +202,17 @@ pub struct UnitSink<'a, N: Rem = P8> {
     level: crate::abstraction::Level,
     pub worker: u32,
     pub unit: u32,
-    /// The unit's sources: its entries `(region, key)`, each one's index
-    /// among the unit's distinct `(shape, key)`s (`unit_sources`, the
-    /// chunks' source list), and per lane its entry, cell and hull.
+    /// The unit's entries `(region, key)`, each one's index among its distinct
+    /// `(shape, key)`s (`unit_sources`), per lane its entry, cell and hull.
     srcs: Vec<(u32, Key)>,
     src_local: Vec<u32>,
     lanes: Vec<(u32, u32)>,
     hulls: Vec<HullOf<N>>,
     unit_sources: Vec<(u32, Key)>,
     src_idx: rustc_hash2::FxHashMap<(u32, Key), u32>,
-    /// The unit's lanes' hulls by source: per unit source its first entry,
-    /// per entry its next of the same source (`u32::MAX`: none), its slot,
-    /// cells and first lane - a bundle's source cell (its target cell less
-    /// its offset) is a lane's by its rank in its entry's cells.
+    /// The lanes by source: per source its first entry, per entry its next
+    /// of the same source (`u32::MAX`: none), slot, cells and first lane - a
+    /// bundle's source cell is a lane by its rank in its entry's cells.
     src_first: Vec<u32>,
     entry_next: Vec<(u32, u32, u64, u32)>,
     /// A route's pushes being merged (`pushes`): per target cell reached a
@@ -247,18 +238,17 @@ pub struct UnitSink<'a, N: Rem = P8> {
     scratch_at: Vec<Vec<Target>>,
     /// A target of the unit was disallowed: `end` drops its records.
     disallowed: bool,
-    /// `--key-check`: every emission's row, checked in batches (its key,
-    /// and that its key and cell decode to it).
+    /// `--key-check`: every emission's row, checked in batches (`check_rows`).
     key_check: bool,
     check: Vec<RowBuf<N>>,
     pub phases: bool,
     /// The level -1 table of `filters.minus_one`, resolved once.
     l1: Option<&'static crate::search::level_minus_one::CostToGo>,
     drop_last: Option<((u64, u32), bool)>,
-    /// TRANSFER IDS: a pair the tree's table holds (`base`, read only
-    /// during the wave) is its global id; a pair new this frame is this
-    /// worker's LOCAL id `l`, named `first_new + l` (the gather gives it its
-    /// global id: the region phase's remaps). Only new pairs cost memory.
+    /// TRANSFER IDS: a pair in the tree's table (`base`, read only) is its
+    /// global id; a new pair is this worker's LOCAL id `l`, named
+    /// `first_new + l`, made global by the gather's remaps. Only new pairs
+    /// cost memory.
     base: &'a super::edges::XferTable<N>,
     first_new: u32,
     xfer_ids: FxHashMap<N::Pair, u32>,
@@ -271,7 +261,6 @@ pub struct UnitSink<'a, N: Rem = P8> {
     /// The worker's table of local transfers (the gather reads it), its length.
     xfer_tab: &'a std::sync::RwLock<Vec<N::Pair>>,
     xfer_len: u32,
-    /// The units' chunks.
     pub outbox: Vec<Chunk<N>>,
     /// Record OUT-EDGES (`storage::out`): the last unit's blocks (raw, and
     /// whether a target key is provisional) and the parts they are made of.
@@ -387,8 +376,7 @@ impl<'a, N: Rem> UnitSink<'a, N> {
         }
     }
 
-    /// Bytes this worker's buffers hold (`--phases`' `[wavemem]`): bundles,
-    /// lanes' hulls, pos-graph pairs, transfers, the rest.
+    /// Bytes held (`[wavemem]`): bundles, hulls, pos pairs, transfers, rest.
     pub fn alloc_bytes(&self) -> [usize; 5] {
         use std::mem::size_of;
         [
@@ -428,8 +416,7 @@ impl<'a, N: Rem> UnitSink<'a, N> {
         }
     }
 
-    /// Start unit `unit` of the wave; its sources and lanes follow
-    /// (`push_source`, `push_lane`).
+    /// Start unit `unit`; then `push_source`, `push_lane`, `sources_done`.
     pub fn begin(&mut self, unit: u32) {
         self.unit = unit;
         self.bundles.clear();
@@ -505,10 +492,9 @@ impl<'a, N: Rem> UnitSink<'a, N> {
         panic!("unit {}: a bundle's source cell {cell} of source {s} is no lane of the unit", self.unit)
     }
 
-    /// The EDGES of bundle `b` (target slot `slot`) by the unit's ENTRY
-    /// they leave (a source key's cells in several regions are several
-    /// entries): `f(entry, target cells, shift to their source cells)`; into
-    /// or out of `NO_CELL`, one cell at a time and no shift (`src_lane`).
+    /// The EDGES of bundle `b` (target slot `slot`) by the unit ENTRY they
+    /// leave: `f(entry, target cells, shift to their sources)`; into or out
+    /// of `NO_CELL`, one cell at a time and no shift (`src_lane`).
     #[inline]
     fn by_entry(&self, slot: u32, b: &super::route::Ub, mut f: impl FnMut(u32, u64, Option<i32>)) {
         use super::bundle::{shift_into, source_cell, TO_NONE};
@@ -531,7 +517,6 @@ impl<'a, N: Rem> UnitSink<'a, N> {
             assert!(left == 0, "unit {}: a bundle's source cells in no entry of the unit", self.unit);
             return;
         }
-        // Into or out of NO_CELL: cell by cell.
         let mut m = b.mask;
         while m != 0 {
             let c = m.trailing_zeros();
@@ -567,8 +552,7 @@ impl<'a, N: Rem> UnitSink<'a, N> {
         r
     }
 
-    /// `minus_one_drop` of the lanes `need` of a slice, rows of `shape` at
-    /// `cells`: the lanes it drops.
+    /// `minus_one_drop` over a slice's lanes `need`: the lanes it drops.
     #[inline]
     pub fn minus_one_drops(&mut self, shape: u64, cells: &[u32; 16], need: u16) -> u16 {
         let mut dropped = 0u16;
@@ -580,9 +564,8 @@ impl<'a, N: Rem> UnitSink<'a, N> {
         dropped
     }
 
-    /// The pos-graph edges from the unit lanes `lanes` of a slice's lanes
-    /// `need` into their `cells`: every lane taken, emitted or dropped (the
-    /// pos graph is a set: once per cell column of a slice, not per body).
+    /// The pos-graph edges of a slice's lanes `need` (unit lanes `lanes`),
+    /// emitted or dropped: a set, so once per cell column, not per body.
     #[inline]
     pub fn pos_edges(&mut self, cells: &[u32; 16], need: u16, lanes: &[usize]) {
         if self.edges_on {
@@ -606,14 +589,12 @@ impl<'a, N: Rem> UnitSink<'a, N> {
         }
     }
 
-    /// The distinct pos-graph edges this worker produced.
     pub fn pos_pairs(&self) -> impl Iterator<Item = (u32, u32)> + '_ {
         self.pos_edges.iter().copied()
     }
 
-    /// `xfer_id` of a raw transfer, through a small direct-mapped cache of
-    /// raw -> id: a frame has few distinct transfers against one lookup per
-    /// emitted lane.
+    /// `xfer_id` through a direct-mapped raw -> id cache: few distinct
+    /// transfers a frame, one lookup an emitted lane.
     #[inline]
     pub fn xfer_id_raw(&mut self, words: &crate::compiled::asm_kernel::RawWords<N>, decode: impl FnOnce(&crate::compiled::asm_kernel::RawWords<N>) -> N::Pair) -> u32 {
         let mut h = 0u64;
@@ -700,8 +681,7 @@ impl<'a, N: Rem> UnitSink<'a, N> {
         }
     }
 
-    /// The TARGETS of the lanes `need` of a slice (`lanes`: their unit
-    /// lanes), rows of `shape` at `cells` (`Targets`).
+    /// The TARGETS of a slice's lanes `need` (unit lanes `lanes`) at `cells`.
     pub fn targets(&mut self, shape: u64, cells: &[u32; 16], need: u16, lanes: &[usize], t: &mut Targets) {
         t.cells = *cells;
         for i in lanes_of(need) {
@@ -726,10 +706,9 @@ impl<'a, N: Rem> UnitSink<'a, N> {
         self.emit_body(&e, init, |b, _| push(b))
     }
 
-    /// A BODY'S EMISSIONS: per lane its state into its route's bundle.
-    /// `init` is the shape's skeleton (the new layer's rows decode with it:
-    /// `Skeletons`); `push(buf, i)` appends lane `i`'s row to a buffer when
-    /// a row is looked at (a verdict, the key check, the decode guard).
+    /// A BODY'S EMISSIONS into their routes' bundles. `init`: the shape's
+    /// skeleton (`Skeletons`); `push(buf, i)` appends lane `i`'s row to a
+    /// buffer when one is looked at (a verdict, the key check, the guard).
     pub fn emit_body(&mut self, e: &BodyEmits, init: impl Fn() -> Rt2<N>, mut push: impl FnMut(&mut RowBuf<N>, usize)) -> Result<()> {
         let (shape, t) = (e.shape, e.targets);
         let mut take = e.take;
@@ -765,9 +744,8 @@ impl<'a, N: Rem> UnitSink<'a, N> {
                 }
             }
         }
-        // The coarser level's filter (the objects ladder): once per target,
-        // in batches - a target awaiting its verdict is taken as allowed, and
-        // its records go at the unit's end if it is not.
+        // The objects ladder's filter, once per target, in batches: a target
+        // awaiting its verdict is allowed; if refused, `end` drops its records.
         if self.filters.marks.is_some() {
             for i in lanes_of(take) {
                 let at: Target = (t.route[i], e.keys[i], t.local[i]);
@@ -820,8 +798,7 @@ impl<'a, N: Rem> UnitSink<'a, N> {
         Ok(())
     }
 
-    /// The edges `m` (target cells) of bundle `(route, t_key; s, x, o)` into
-    /// the unit's bundles, counted for their transfer.
+    /// OR `m` (target cells) into bundle `(route, t_key; s, x, o)`; count `x`.
     #[inline]
     fn bundle(&mut self, route: u32, t_key: Key, s: u32, x: u32, o: u32, m: u64) {
         if let Some(l) = x.checked_sub(self.first_new) {
@@ -847,8 +824,7 @@ impl<'a, N: Rem> UnitSink<'a, N> {
         Ok(())
     }
 
-    /// The verdicts of the rows awaiting one (`MarkFilter::allowed` over
-    /// each shape's batch).
+    /// The verdicts of the rows awaiting one (`MarkFilter::allowed` per shape).
     fn decide(&mut self) -> Result<()> {
         let Some(f) = self.filters.marks else { return Ok(()) };
         for (buf, ats) in self.scratch.iter_mut().zip(self.scratch_at.iter_mut()) {
@@ -865,11 +841,10 @@ impl<'a, N: Rem> UnitSink<'a, N> {
         Ok(())
     }
 
-    /// A reference row (CANONICAL) as the tree holds it, and its key: widened
-    /// as its kernels key it (the level's held buttons, every level's
-    /// widenings: `Rt2::widen_to`), provisional where a code is new. The row
-    /// is the WIDENED one: a state's stored row is what its key decodes to
-    /// (plans/architecture.md "Keys"), not the class's first concrete row.
+    /// A reference row (CANONICAL) as the tree holds it, and its key
+    /// (provisional where a code is new): widened as its kernels key it (held
+    /// buttons, every level's widenings: `Rt2::widen_to`). The WIDENED row: a
+    /// stored row is what its key decodes to (plans/architecture.md "Keys").
     pub fn row_key(&mut self, row: &Rt2<N>) -> (Rt2<N>, Key) {
         let level = crate::abstraction::Level { held: self.level.held, ..crate::abstraction::Level::EXACT };
         let mut w = row.clone_block();
@@ -885,11 +860,10 @@ impl<'a, N: Rem> UnitSink<'a, N> {
         (w, key)
     }
 
-    /// The reference engine's emission: one materialized row from unit lane
-    /// `lane` (stored widened: `row_key`) with its transfer `pair`, and its
-    /// pos-graph edge. Its shape's skeleton leaves every value cell to the
-    /// decode (`decode::reference_skeleton`): a reference row's columns
-    /// follow its values, not a kernel's template.
+    /// The reference engine's emission: one row from unit lane `lane`
+    /// (stored widened: `row_key`) by transfer `pair`, and its pos-graph edge.
+    /// Its skeleton is `decode::reference_skeleton`: a reference row's
+    /// columns follow its values, not a kernel's template.
     pub fn emit_row(&mut self, row: &Rt2<N>, lane: usize, cell: u32, pair: N::Pair) -> Result<()> {
         debug_assert_eq!(row.width, 1);
         if self.edges_on {
@@ -934,10 +908,9 @@ impl<'a, N: Rem> UnitSink<'a, N> {
         self.last_shape = 0;
     }
 
-    /// The PUSHES of a route's bundles (naming `targets` by index, the route
-    /// at `slot`): per target cell the hulls of the bundles' source cells
-    /// pushed along their transfers (`Hull::push`), merged - `(target, cell,
-    /// hull so far)`, the cells nothing reached left out.
+    /// The PUSHES of a route's bundles (the route at `slot`): per target cell
+    /// the merged `Hull::push`es of its source cells, `(target, cell, hull)`,
+    /// the cells nothing reached left out.
     #[inline(never)]
     fn pushes(&mut self, slot: u32, targets: &[(Key, u64)], bundles: &[super::route::Ub]) -> Vec<(u32, u8, AccOf<N>)> {
         let geo = super::GEOMETRY;
@@ -1006,9 +979,8 @@ impl<'a, N: Rem> UnitSink<'a, N> {
     }
 
 
-    /// The unit is over: its rows checked, its last verdicts decided (a
-    /// disallowed target's records go), its buckets the chunks of their
-    /// routes, each with its pushes.
+    /// The unit is over: its rows checked, its last verdicts decided (refused
+    /// targets' records go), its buckets the chunks of their routes.
     pub fn end(&mut self) -> Result<()> {
         let t = crate::frame::phases::start(self.phases);
         for i in 0..self.check.len() {
@@ -1054,9 +1026,8 @@ impl<'a, N: Rem> UnitSink<'a, N> {
         Ok(())
     }
 
-    /// A RE-PUSH unit's pushes (`wave::run_repush`) as the chunks of their
-    /// routes: `targets` (route, key, cells), each one's cells' hulls a run
-    /// of `slots` (`runs`: its start) - no bundle: the edges are recorded.
+    /// A RE-PUSH unit's pushes as route chunks: `targets` (route, key, cells),
+    /// each one's hulls a run of `slots` (`runs`); no bundles (edges recorded).
     #[inline(never)]
     pub(crate) fn repush_chunks(&mut self, targets: &[(u32, Key, u64)], runs: &[(u32, u32)], slots: &[AccOf<N>]) {
         let mut order: Vec<u32> = (0..targets.len() as u32).collect();
@@ -1077,9 +1048,8 @@ impl<'a, N: Rem> UnitSink<'a, N> {
         self.outbox.append(&mut chunks);
     }
 
-    /// The unit's bundles (`buckets`: route, targets, bundles) as its
-    /// OUT-EDGE block's parts (`storage::out`): each bundle's cells split by
-    /// the source ENTRY they leave (`by_entry`).
+    /// The unit's bundles as its OUT-EDGE block's parts (`storage::out`),
+    /// each bundle's cells split by the source ENTRY they leave.
     #[inline(never)]
     fn out_parts_of(&mut self, buckets: &[(u32, Vec<(Key, u64)>, Vec<super::route::Ub>)]) {
         let mut p = std::mem::take(&mut self.out_parts);

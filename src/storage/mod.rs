@@ -1,9 +1,7 @@
 //! STORAGE (plans/architecture.md, "The forward: hulls and storage" and "The
-//! recorded graph"): the state set (`set`, `visited`, `layer`), the wave
-//! (`unit`, `route`, `wave`, `spool`), the tree's files in one container
-//! (`file`: the frame files `layer`, the hull files `hulls`, the edge files
-//! `bundle` and `edges`, the out-edge files `out`), rows from keys
-//! (`decode`), and `rewrite bench frame` (`bench`).
+//! recorded graph"): the state set, the wave, and the tree's files in one
+//! container (`file`): frame (`layer`), hull (`hulls`), edge (`bundle`,
+//! `edges`) and out-edge (`out`) files.
 //!
 //! A state is `(shape, key, cell)` (`Sk`; the key holds no position:
 //! `exact::Code::pos`) everywhere: the edges, the frame and hull files, the
@@ -27,12 +25,11 @@ pub mod wave;
 use crate::search::pos_graph::{GRID, NO_CELL};
 
 /// THE TREE'S FINGERPRINT (`rewrite ckhash`), over CONTENT
-/// (`exact::ContentHash`: whatever order its dictionaries grew in): per
-/// frame its states' count and an order-free hash (`fNNN n hash`); with
-/// `edges` each frame's edges by what they join and their transfers, not
-/// their ids (`eNNN`); with `hulls` each frame's states with their layers
-/// and hulls (`hNNN`). Two trees with the same lines hold the same states,
-/// edges and hulls.
+/// (`exact::ContentHash`: any dictionary order): per frame its states'
+/// count and an order-free hash (`fNNN n hash`); with `edges` its edges by
+/// what they join and their transfers, not ids (`eNNN`); with `hulls` its
+/// states' layers and hulls (`hNNN`). Equal lines: the same states, edges
+/// and hulls.
 pub fn fingerprint<N: crate::search::rem::Rem>(dir: &std::path::Path, to: u32, edges: bool, hulls: bool, threads: usize) -> anyhow::Result<Vec<String>> {
     let tree = layer::Tree::<N>::open(dir, to)?;
     let content = tree.space.content_hash();
@@ -45,7 +42,6 @@ pub fn fingerprint<N: crate::search::rem::Rem>(dir: &std::path::Path, to: u32, e
     }
     if edges {
         let eg = edges::EdgeStore::<N>::open(&dir.join("edges"), to)?;
-        // Streamed: one frame at a time, its blocks on every thread.
         let hashes = bench::EdgeHashes::new::<N>(eg.pairs());
         for frame in 1..=to {
             let (n, acc) = hashes.frame(&eg, frame, &content, &tree.shapes, threads)?;
@@ -68,14 +64,12 @@ pub fn fingerprint<N: crate::search::rem::Rem>(dir: &std::path::Path, to: u32, e
 }
 
 /// The storage regions: `side` x `side` cells (`GEOMETRY`: 8; the tests
-/// also check 16), aligned at 0 as the kernels' `RegionGrid::of`
-/// (`div_euclid`; the grid's origin -64 is a multiple of both), each nested
-/// in one kernel region. A region's SLOT is its place on the grid,
-/// row-major, `NO_CELL` the last (one cell).
+/// also check 16), aligned at 0 as the kernels' `RegionGrid::of` (the
+/// grid's origin -64 is a multiple of both), each inside one kernel region.
+/// A SLOT is a region's place on the grid, row-major, `NO_CELL`'s last.
 #[derive(Clone, Copy, Debug)]
 pub struct Geometry {
     pub side: u32,
-    /// Regions per grid row.
     pub per_row: u32,
     /// Slots per shape: the grid's regions and `NO_CELL`'s.
     pub slots: u32,
@@ -130,10 +124,9 @@ pub fn region_of(geo: &Geometry, shape_idx: u32, slot: u32) -> u32 {
     r as u32
 }
 
-/// A STATE by what it is: its region (shape index and slot), its exact key
-/// and its cell's index in the region - what the edge files name
-/// (`bundle`) and the backward keys its winning sets by. Sorts by region,
-/// key, cell: region-major, as the edge files are read.
+/// A STATE by what it is: region (shape index and slot), exact key, cell's
+/// index in the region - what the edge files name and the backward keys its
+/// winning sets by. Sorts region-major, as the edge files are read.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
 pub struct Sk {
     pub region: u32,
@@ -168,8 +161,7 @@ impl Sk {
 mod tests {
     use super::*;
 
-    /// Slots and cells round-trip at both sides; regions nest in 16 px
-    /// kernel regions.
+    /// Slots and cells round-trip at both sides, inside 16 px kernel regions.
     #[test]
     fn cells_round_trip_through_regions() {
         for side in [8, 16] {

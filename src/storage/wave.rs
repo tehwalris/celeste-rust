@@ -1,9 +1,7 @@
 //! THE WAVE: one frame of the hull forward (plans/architecture.md "The
-//! forward: hulls and storage"): the frontier's NEW states through the
-//! kernels (`unit`), its OLD ones re-pushed along their out-edges, the
-//! region jobs (`route`) overlapping the next slices' units, the frame's
-//! end. A function of the frame, not of the scheduling (the pushes merge
-//! order-free).
+//! forward: hulls and storage"): NEW states through the kernels (`unit`),
+//! OLD ones re-pushed, region jobs (`route`) overlapping the units, the
+//! frame's end. A function of the frame (pushes merge order-free).
 
 use crate::search::hull::{AccOf, HullOf};
 use anyhow::{anyhow, ensure, Result};
@@ -24,8 +22,7 @@ use crate::search::rem::Rem;
 use celeste_core::pico8_num::Pico8Num as P8;
 use celeste_engine::exact::{Code, KeyAdditions, MissKey, Provisional};
 
-/// An OLD frontier state: expanded at its layer, its hull grown since its
-/// last push (`was`: the hull it last pushed).
+/// An OLD frontier state: its hull grown since its last push (`was`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Old<N: Rem = P8> {
     pub sk: Sk,
@@ -42,8 +39,7 @@ pub fn by_layer_states<N: Rem>(by: &ByLayer<N>) -> usize {
 }
 
 /// The OLD states of one LAYER, sorted: per ENTRY (region, key) its cells
-/// and first state, per state its hull and the hull it last pushed (32 B
-/// an entry and 16 a state; an `Old` is 48).
+/// and first state, per state its hull and `was` (32 B an entry, 16 a state).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct OldLayer<N: Rem = P8> {
     pub layer: u16,
@@ -162,25 +158,23 @@ impl<N: Rem> Wave<N> {
         Frontier { new: self.next, hulls: self.hulls, old: self.grown }
     }
 
-    /// The next frontier's states with their layers and hulls (`frame`:
-    /// the wave's): the new ones in order, then the grown ones.
+    /// The next frontier's states, layers, hulls: the new, then the grown.
     pub fn frontier_states(&self, frame: u32) -> impl Iterator<Item = Grown<N>> + '_ {
         let layer = u16::try_from(frame).expect("a frame past u16");
         self.next.states_iter().zip(&self.hulls).map(move |(s, &h)| (s, layer, h)).chain(self.grown.iter().flat_map(OldLayer::<N>::iter).map(|o| (o.sk, o.layer, o.hull)))
     }
 }
 
-/// Lanes per unit (one kernel call): a 256th of the frame's `lanes`, in
-/// 1024..=4096 (less kernel padding; enough units to balance). A function
-/// of the frame, not of the threads: the units cut the bundles.
+/// Lanes per unit (one kernel call): a 256th of the frame, in 1024..=4096
+/// (less padding; enough units to balance). A function of the frame, not of
+/// the threads: the units cut the bundles.
 fn unit_lanes(lanes: u64) -> usize {
     ((lanes / 256) as usize).clamp(1024, 4096) & !63
 }
 
-/// A KERNEL unit: a run of whole entries of one shape of the new layer (at
-/// most `unit_lanes` + 63 states) and its first state's place in the
-/// layer's state order; or a RE-PUSH unit: a run of whole entries of the
-/// frontier's `layer`th list of old states.
+/// A KERNEL unit: whole entries of one shape of the new layer (at most
+/// `unit_lanes` + 63 states) and its first state's place; a RE-PUSH unit:
+/// whole entries of the `layer`th list of old states.
 enum UnitSpec {
     Kernel { entries: std::ops::Range<usize>, state: usize, lanes: u32 },
     Repush { layer: usize, entries: std::ops::Range<usize>, states: usize },
@@ -196,8 +190,7 @@ impl UnitSpec {
     }
 }
 
-/// Cut the layer's entries into units of about `unit` lanes, never across a
-/// shape (`entries`: numbered over the layer's set, `RegionSet::entry_starts`).
+/// Units of about `unit` lanes, never across a shape (entries set-wide).
 fn units_of<N: Rem>(layer: &Layer<N>, unit: usize) -> Vec<UnitSpec> {
     let slots = GEOMETRY.slots;
     let mut out = Vec::new();
@@ -225,11 +218,9 @@ fn units_of<N: Rem>(layer: &Layer<N>, unit: usize) -> Vec<UnitSpec> {
     out
 }
 
-/// States per RE-PUSH unit (whole entries: at most 63 more): a re-push runs
-/// no kernel, so a unit takes more states than a kernel unit.
+/// States per RE-PUSH unit (whole entries: up to 63 more); it runs no kernel.
 const REPUSH_UNIT: usize = 1 << 14;
 
-/// Cut the old states into re-push units of one layer and whole entries.
 fn repush_units_of<N: Rem>(by: &ByLayer<N>) -> Vec<UnitSpec> {
     let mut out = Vec::new();
     for (layer, old) in by.iter().enumerate() {
@@ -248,9 +239,9 @@ fn repush_units_of<N: Rem>(by: &ByLayer<N>) -> Vec<UnitSpec> {
     out
 }
 
-/// Input lanes per SLICE (they cut the edge file's segments): the units run
-/// at most two slices past the gathered ones, so a frame holds a few
-/// slices' records. 256k against 1M: a quarter of them, the same wall.
+/// Input lanes per SLICE (slices cut the segments): units run at most two
+/// slices past the gathered. 256k against 1M: a quarter of the records
+/// held, the same wall.
 const SLICE_LANES: usize = 1 << 18;
 
 fn slices_of(units: &[UnitSpec]) -> Vec<std::ops::Range<usize>> {
@@ -281,7 +272,6 @@ fn idle_fraction(wall: std::time::Duration, workers: usize, busy: std::time::Dur
     (1.0 - busy.as_secs_f64() / (workers as f64 * wall.as_secs_f64())).max(0.0)
 }
 
-/// What a wave reads and writes beyond its frontier.
 pub struct WaveCtx<'a, N: Rem = P8> {
     pub visited: &'a mut VisitedSet<N>,
     pub xfers: &'a mut XferTable<N>,
@@ -290,17 +280,14 @@ pub struct WaveCtx<'a, N: Rem = P8> {
     pub frame: u32,
     /// The level's `edges/` dir: edges are recorded only with one.
     pub edges_dir: Option<&'a std::path::Path>,
-    /// The tree's out-edges so far (the old states' re-push reads them;
-    /// `None`: a frontier without old states).
+    /// The tree's out-edges (`None`: a frontier without old states).
     pub outs: Option<&'a super::out::OutStore>,
     /// The forward's skeletons, registered by the emissions: the next layer's.
     pub skeletons: &'a Skeletons<N>,
-    /// The tree's ceiling (its level -1 horizon): which frontier states
-    /// are expanded (`frame::not_expanded`, the orb's deadline).
+    /// The tree's ceiling (its level -1 horizon), for `frame::not_expanded`.
     pub ceiling: Option<u32>,
 }
 
-/// A worker's buffers for its kernel units.
 #[derive(Default)]
 struct UnitScratch {
     rows: Vec<(Key, u32)>,
@@ -308,9 +295,8 @@ struct UnitScratch {
     live: Vec<usize>,
 }
 
-/// ONE KERNEL UNIT: its states DECODED to rows, those `frame::not_expanded`
-/// sets aside (decided here for every frontier, fresh or resumed) left out,
-/// the rest through the engine into the sink, each lane with its hull.
+/// ONE KERNEL UNIT: its states DECODED, `frame::not_expanded` (decided here,
+/// fresh or resumed) left out, the rest through the engine with their hulls.
 #[allow(clippy::too_many_arguments)]
 fn run_unit<N: Rem>(engine: &dyn FrameStep<N>, u: u32, entries: std::ops::Range<usize>, state: usize, layer: &Layer<N>, hulls: &[HullOf<N>], starts: &[usize], shapes: &[u64], sink: &mut UnitSink<'_, N>, sc: &mut UnitScratch, layer_frame: u32, ceiling: Option<u32>, s: &crate::settings::Settings) -> Result<()> {
     let geo = GEOMETRY;
@@ -358,8 +344,7 @@ fn run_unit<N: Rem>(engine: &dyn FrameStep<N>, u: u32, entries: std::ops::Range<
     sink.end()
 }
 
-/// ONE FORWARD FRAME (module doc): the wave of frame `cx.frame` from the
-/// frontier `front` (the states whose hull grew at `cx.frame - 1`).
+/// ONE FORWARD FRAME: frame `cx.frame` from `front` (grown the frame before).
 pub fn run_wave<N: Rem>(engine: &dyn FrameStep<N>, front: Frontier<N>, cx: WaveCtx<N>) -> Result<Wave<N>> {
     use std::time::Instant;
     let WaveCtx { visited, xfers, pos, filters, frame, edges_dir, outs, skeletons, ceiling } = cx;
@@ -396,8 +381,7 @@ pub fn run_wave<N: Rem>(engine: &dyn FrameStep<N>, front: Frontier<N>, cx: WaveC
     st.frontier_bytes = layer.alloc_bytes() + std::mem::size_of_val(front.hulls.as_slice()) + front.old.iter().map(OldLayer::bytes).sum::<usize>();
     st.rss_start = crate::metrics::current_rss_gb();
     let record = edges_dir.is_some();
-    // The frame's SPOOL (`storage::spool`): the out blocks and the jobs'
-    // segments wait there for the frame's end, not in memory.
+    // The out blocks and segments wait in the SPOOL, not in memory.
     let spool: Option<std::sync::Arc<super::spool::Spool>> = match edges_dir {
         Some(dir) => {
             std::fs::create_dir_all(dir)?;
@@ -413,14 +397,12 @@ pub fn run_wave<N: Rem>(engine: &dyn FrameStep<N>, front: Frontier<N>, cx: WaveC
     let routes = Routes::default();
     let prov = Provisional::default();
     // The visited set and the tree's transfer table are read only until the
-    // frame's end; the gather numbers the new pairs of the workers' tables
-    // after the tree's (`Gather::fresh`; canonical at the end).
+    // frame's end; the gather numbers the workers' new pairs (`Gather::fresh`).
     let xtabs: Vec<std::sync::RwLock<Vec<N::Pair>>> = (0..workers).map(|_| Default::default()).collect();
     let xfers_before = xfers.pairs.len();
     let base: &XferTable<N> = xfers;
     let mut sinks: Vec<UnitSink<N>> = (0..workers).map(|w| UnitSink::new(visited, &routes, skeletons, &prov, filters, frame, level, w as u32, base, &xtabs[w], pos.is_some(), record, s)).collect();
-    // Per kernel unit its out-edge block (`storage::out`): compressed, or
-    // raw where a target key is provisional (encoded again at the end).
+    // Per kernel unit its out block (raw while a target key is provisional).
     let mut out_blocks: Vec<std::sync::Mutex<Vec<OutBlock>>> = (0..n_kernel).map(|_| Default::default()).collect();
     let repushed = std::sync::atomic::AtomicU64::new(0);
     let mut scratch: Vec<super::route::Scratch> = (0..workers).map(|_| super::route::Scratch::default()).collect();
@@ -448,10 +430,9 @@ pub fn run_wave<N: Rem>(engine: &dyn FrameStep<N>, front: Frontier<N>, cx: WaveC
         crate::metrics::mem_phase(&format!("f{frame} start"));
     }
     let t_pipeline = Instant::now();
-    // THE PIPELINE: a worker takes a region job first (the oldest slice's,
-    // heaviest first), else the next unit of the two slices past the
-    // gathered ones; the one that ends a slice's last unit GATHERS the
-    // complete slices (`Pipe::gather_ready`). No barrier but the frame's end.
+    // THE PIPELINE: a region job first (the oldest slice's, heaviest first),
+    // else a unit of the two slices past the gathered; a slice's last unit's
+    // worker GATHERS (`Pipe::gather_ready`). No barrier but the frame's end.
     let spent: Vec<(std::time::Duration, std::time::Duration, [u64; 4])> = std::thread::scope(|scope| {
         let handles: Vec<_> = sinks
             .iter_mut()
@@ -688,7 +669,6 @@ pub fn run_wave<N: Rem>(engine: &dyn FrameStep<N>, front: Frontier<N>, cx: WaveC
             crate::metrics::current_rss_gb()
         );
     }
-    // Per new transfer, the edges the frame recorded with it.
     let mut xfer_counts = vec![0u64; fresh.pairs.len()];
     for (sink, remap) in sinks.iter().zip(&remaps) {
         for (&n, &g) in sink.xfer_counts().iter().zip(remap) {
@@ -710,7 +690,6 @@ pub fn run_wave<N: Rem>(engine: &dyn FrameStep<N>, front: Frontier<N>, cx: WaveC
     // The exited workers' buffers back before the frame's end allocates.
     collect_freed();
 
-    // THE FRAME'S END.
     let t = Instant::now();
     let tl = phases::start(s.diag.phases);
     let mut adds = KeyAdditions::default();
@@ -728,8 +707,7 @@ pub fn run_wave<N: Rem>(engine: &dyn FrameStep<N>, front: Frontier<N>, cx: WaveC
     };
     let finals = std::sync::Arc::new(finalize_keys(visited, &states, &prov, &mut adds));
     mark("keys", &mut st);
-    // THE OUT FILE, written beside the rest of the frame's end: the kernel
-    // units' blocks in unit order, the provisional ones with final keys.
+    // THE OUT FILE beside the frame's end (provisional blocks with final keys).
     let out_file = match edges_dir {
         Some(dir) => {
             let (path, finals, threads, out_blocks, spool) = (super::out::path(dir, frame), finals.clone(), s.threads(), std::mem::take(&mut out_blocks), spool.clone());
@@ -778,9 +756,8 @@ pub fn run_wave<N: Rem>(engine: &dyn FrameStep<N>, front: Frontier<N>, cx: WaveC
 
     type Sealed<N> = super::route::Sealed<N>;
     let sealed: Vec<Result<Option<Sealed<N>>>> = {
-        // SEALED: the routes' touched keys sorted (a route a thread, the
-        // biggest first), compared with the visited set in parts (a big
-        // route's on every thread), each route's parts put together.
+        // SEALED: touched keys sorted (a route a thread, biggest first),
+        // compared in parts (a big route's on every thread), put together.
         let cells: Vec<std::sync::Mutex<(usize, &mut RouteState<N>)>> = states.iter_mut().enumerate().map(std::sync::Mutex::new).collect();
         let mut order: Vec<&std::sync::Mutex<(usize, &mut RouteState<N>)>> = cells.iter().collect();
         order.sort_by_cached_key(|c| std::cmp::Reverse(c.lock().expect("a route").1.touched.len()));
@@ -789,17 +766,15 @@ pub fn run_wave<N: Rem>(engine: &dyn FrameStep<N>, front: Frontier<N>, cx: WaveC
             let k = g.0;
             match regions[k] {
                 Some(region) => Ok((k, Some(super::route::seal_sort(&mut g.1, region, &finals)?))),
-                // A route of a new shape whose records the coarser level
-                // all dropped.
+                // A new shape's route whose records the coarser level dropped.
                 None if !g.1.is_used() => Ok((k, None)),
                 None => Err(anyhow::anyhow!("frame {frame}: a used route of an unnumbered shape")),
             }
         });
         let mut touches: Vec<(usize, Option<super::route::Touch<N>>)> = touches.into_iter().collect::<Result<_>>()?;
         touches.sort_by_key(|x| x.0);
-        // The parts route by route (the biggest first), in order: a
-        // route's last part puts it together on the worker that ends it,
-        // so its touched keys and its parts go as soon as it is sealed.
+        // The parts by route, biggest first: a route's last part puts it
+        // together, so its touched keys and parts go as soon as it is sealed.
         let mut by_size: Vec<usize> = (0..touches.len()).filter(|&i| touches[i].1.is_some()).collect();
         by_size.sort_by_key(|&i| std::cmp::Reverse(touches[i].1.as_ref().map_or(0, |t| t.touched.len())));
         let mut parts: Vec<(usize, std::ops::Range<usize>)> = Vec::new();
@@ -833,13 +808,11 @@ pub fn run_wave<N: Rem>(engine: &dyn FrameStep<N>, front: Frontier<N>, cx: WaveC
         }
         out.into_iter().map(|o| Ok(o.into_inner().expect("a sealed route"))).collect::<Vec<Result<Option<Sealed<N>>>>>()
     };
-    // The routes' touched tables, freed off the (exited) threads that made
-    // them: their pages back now.
+    // The routes' touched tables, freed off their (exited) threads: back now.
     collect_freed();
     if s.diag.phases {
         crate::metrics::mem_phase(&format!("f{frame} the routes sealed (keys final, new and grown states)"));
     }
-    // The routes' new and grown states, by region.
     let mut new: Vec<Sealed<N>> = Vec::new();
     for x in sealed {
         if let Some(sl) = x? {
@@ -848,9 +821,8 @@ pub fn run_wave<N: Rem>(engine: &dyn FrameStep<N>, front: Frontier<N>, cx: WaveC
     }
     new.sort_unstable_by_key(|x| x.region);
     mark("seal", &mut st);
-    // THE EDGE FILE (and the new transfers), written beside the rest of the
-    // frame's end: per route its jobs' segments by slice (final once
-    // sealed), then the waited ones, re-encoded (`route::reencode`).
+    // THE EDGE FILE beside the frame's end: per route the jobs' segments
+    // (final once sealed), then the waited ones (`route::reencode`).
     type RouteSegs = (u32, Vec<((u8, u32), super::edges::Segment)>, Vec<(u32, super::edges::Segment)>);
     let mut routes_segs: Vec<RouteSegs> = Vec::new();
     let mut src_index: Vec<(u32, Vec<u32>)> = Vec::new();
@@ -922,9 +894,8 @@ pub fn run_wave<N: Rem>(engine: &dyn FrameStep<N>, front: Frontier<N>, cx: WaveC
     }
     collect_freed();
     mark("absorb", &mut st);
-    // The grown states by layer, each layer's by state: each route's sorted
-    // (in parallel), then appended to their layers' lists and freed a group
-    // of routes at a time - the runs and the lists are never both whole.
+    // The grown states by layer, then state: each route's sorted, appended
+    // and freed a group at a time (the runs and lists are never both whole).
     let mut runs: Vec<Vec<Old<N>>> = Vec::with_capacity(new.len());
     let mut next = Layer::<N>::default();
     let mut hulls: Vec<HullOf<N>> = Vec::with_capacity(new.iter().map(|sl| sl.hulls.len()).sum());
@@ -936,8 +907,7 @@ pub fn run_wave<N: Rem>(engine: &dyn FrameStep<N>, front: Frontier<N>, cx: WaveC
         }
     }
     let runs: Vec<std::sync::Mutex<Vec<Old<N>>>> = runs.into_iter().map(std::sync::Mutex::new).collect();
-    // By layer, then state (a route's are by state: the stable sort by layer,
-    // without its buffer).
+    // (layer, state): a route's are by state, so a stable sort by layer.
     par_map(&runs, s.threads(), |r| r.lock().expect("a route's grown states").sort_unstable_by_key(|o| (o.layer, o.sk)));
     let runs: Vec<Vec<Old<N>>> = runs.into_iter().map(|r| r.into_inner().expect("a route's grown states")).collect();
     let mut count = vec![0usize; frame as usize + 1];
@@ -1016,10 +986,9 @@ pub fn run_wave<N: Rem>(engine: &dyn FrameStep<N>, front: Frontier<N>, cx: WaveC
     Ok(Wave { next, hulls, grown, wins, stats: st, shapes: shapes_numbered, keys: adds })
 }
 
-/// THE OBJECTS LADDER's filter (`frame::MarkFilter`) on the frame's new and
-/// grown states: a re-push reaches a state through an edge recorded at an
-/// earlier frame, so the units' verdict at that emission does not hold for
-/// this frame; every state the frame keeps is checked at it.
+/// THE OBJECTS LADDER's filter (`frame::MarkFilter`) on the new and grown
+/// states: a re-push reaches a state along an edge recorded earlier, whose
+/// verdict does not hold now; every state kept is checked at this frame.
 fn mark_filter<N: Rem>(sealed: &mut [super::route::Sealed<N>], f: &crate::frame::MarkFilter<N>, visited: &VisitedSet<N>, skeletons: &Skeletons<N>, frame: u32, _s: &crate::settings::Settings) -> Result<()> {
     let geo = GEOMETRY;
     for sl in sealed.iter_mut() {
@@ -1069,9 +1038,8 @@ fn mark_filter<N: Rem>(sealed: &mut [super::route::Sealed<N>], f: &crate::frame:
     Ok(())
 }
 
-/// A re-push unit's pushes by target (route, key): per target its cells
-/// and their merged hulls, a run of `slots` in cell order (moved to the
-/// end, its capacity doubled, when a cell joins a full one).
+/// A re-push unit's pushes by target (route, key): its cells' merged hulls,
+/// a run of `slots` by cell (moved to the end, capacity doubled, when full).
 struct CellAccs<N: Rem> {
     idx: rustc_hash2::FxHashMap<(u32, Key), u32>,
     /// Per target: (route, key, cells), (its run's start, its capacity).
@@ -1132,7 +1100,6 @@ impl<N: Rem> CellAccs<N> {
     }
 }
 
-/// A worker's buffers for its re-push units.
 struct RepushScratch<N: Rem> {
     dec: Option<zstd::bulk::Decompressor<'static>>,
     raw: Vec<u8>,
@@ -1154,10 +1121,10 @@ impl<N: Rem> Default for RepushScratch<N> {
     }
 }
 
-/// ONE RE-PUSH UNIT: the old states `entries` of `layer`, each pushing its
-/// grown hull along its OUT-EDGES (its layer + 1's out file) where an
-/// edge's image grows (`Hull::push_grown`); level -1 drops a target too
-/// late at this frame, as at an emission. Returns the edges looked at.
+/// ONE RE-PUSH UNIT: old states `entries` of `layer` push their grown hulls
+/// along their OUT-EDGES (layer + 1's out file) where an image grows
+/// (`Hull::push_grown`), level -1 dropping as at an emission. Returns the
+/// edges looked at.
 #[inline(never)]
 fn run_repush<N: Rem>(u: u32, layer: &OldLayer<N>, entries: std::ops::Range<usize>, outs: &super::out::OutStore, sink: &mut UnitSink<'_, N>, sc: &mut RepushScratch<N>) -> Result<u64> {
     use super::bundle::{source_cell, source_cells, TO_NONE};
@@ -1229,8 +1196,7 @@ fn run_repush<N: Rem>(u: u32, layer: &OldLayer<N>, entries: std::ops::Range<usiz
                     if m == 0 {
                         continue;
                     }
-                    // The edges out of old cells: the target cells shifted
-                    // to their sources (the common case), else cell by cell.
+                    // Target cells shifted to their sources, else cell by cell.
                     let mut n = 0usize;
                     if ob.o < TO_NONE && t_slot != none_slot && s_slot != none_slot {
                         let Some((src, k)) = source_cells(t_slot, s_slot, ob.o, m) else {
@@ -1300,9 +1266,8 @@ fn collect_freed() {
 /// States decoded at a time at the frame's end (a chunk of a region's).
 const WIN_CHUNK: u32 = 1 << 12;
 
-/// The new layer's WINS (`frame::wins_of`), decoded in chunks on every
-/// thread: per entry of `next` (ascending) its win cells. `--key-check`:
-/// each decoded row's key is the boundary's and its position its cell.
+/// The new layer's WINS: per entry of `next` (ascending) its win cells.
+/// `--key-check`: each decoded row's key is the boundary's, position its cell.
 fn layer_wins<N: Rem>(visited: &VisitedSet<N>, next: &Layer<N>, frame: u32, s: &crate::settings::Settings) -> Result<Vec<(u32, u64)>> {
     let geo = GEOMETRY;
     let tables = next.set.tables();
@@ -1361,15 +1326,13 @@ fn layer_wins<N: Rem>(visited: &VisitedSet<N>, next: &Layer<N>, frame: u32, s: &
     Ok(out)
 }
 
-/// A kernel unit's out-edge block: compressed, or raw until its
-/// provisional target keys are final.
+/// A kernel unit's out block: compressed, or raw until its keys are final.
 enum OutBlock {
     Sealed(Option<super::out::Sealed>),
     Raw(Vec<u8>),
 }
 
-/// A region job: one route's chunks of one slice (in unit order), and the
-/// slice's transfer remaps.
+/// A region job: one route's chunks of one slice (in unit order), its remaps.
 struct Job<N: Rem> {
     state: std::sync::Arc<std::sync::Mutex<RouteState<N>>>,
     slice: u32,
@@ -1377,9 +1340,8 @@ struct Job<N: Rem> {
     remaps: std::sync::Arc<Vec<Vec<u32>>>,
 }
 
-/// What the gather owns: the frame's new transfers (`fresh`: their global
-/// ids are `first` on), per worker its merged length and its local ids'
-/// global ones, the routes made so far.
+/// The gather's: the new transfers (global ids `first` on), per worker its
+/// merged length and local -> global ids, the routes made so far.
 struct Gather<N: Rem> {
     fresh: XferTable<N>,
     first: u32,
@@ -1388,9 +1350,8 @@ struct Gather<N: Rem> {
     routes: usize,
 }
 
-/// The wave's pipeline (`run_wave`): units by index, per slice its units
-/// left and its chunks, the slices gathered, the routes, the jobs (by
-/// slice, heaviest first within one).
+/// The wave's pipeline: per slice its units left and chunks, the slices
+/// gathered, the routes, the jobs (by slice, heaviest first within one).
 struct Pipe<'a, N: Rem> {
     xtabs: &'a [std::sync::RwLock<Vec<N::Pair>>],
     next_unit: AtomicUsize,
@@ -1407,8 +1368,7 @@ struct Pipe<'a, N: Rem> {
     /// A worker failed (an error or a panic): the others stop, so the
     /// frame's error comes back instead of a wait that never ends.
     failed: std::sync::atomic::AtomicBool,
-    /// The chunks' bytes in flight (handed over, their job not done) and
-    /// their most (`--phases`' `[wavemem]`).
+    /// The chunks' bytes in flight and their most (`--phases`' `[wavemem]`).
     inflight: AtomicUsize,
     inflight_max: AtomicUsize,
 }
@@ -1430,10 +1390,9 @@ impl<N: Rem> Pipe<'_, N> {
         }
     }
 
-    /// GATHER every complete slice past the gathered ones, in order (one
-    /// thread at a time): global ids for the pairs its workers first met in
-    /// it (each worker's table up to `upto`: a function of the slice), the
-    /// new routes with their regions, its chunks by route as jobs.
+    /// GATHER the complete slices in order, one thread at a time: global ids
+    /// for the pairs first met in each (tables up to `upto`: a function of
+    /// the slice), the new routes, its chunks by route as jobs.
     fn gather_ready(&self, n_slices: usize, routes: &Routes, visited: &VisitedSet<N>) -> Result<()> {
         let mut g = self.gather.lock().expect("the gather");
         loop {
@@ -1492,10 +1451,9 @@ impl<N: Rem> Pipe<'_, N> {
     }
 }
 
-/// The frame's PROVISIONAL keys made final (plans/architecture.md "Keys"):
-/// the codes the key space lacks, per (shape, field) SORTED and appended
-/// (new shapes first, by hash), so the dictionaries are a function of the
-/// frame's new states. Returns each provisional key's final key.
+/// PROVISIONAL keys made final (plans/architecture.md "Keys"): the missing
+/// codes per (shape, field) SORTED and appended (new shapes first, by hash),
+/// so the dictionaries are a function of the frame's new states.
 fn finalize_keys<N: Rem>(visited: &mut VisitedSet<N>, states: &[RouteState<N>], prov: &Provisional<N>, adds: &mut KeyAdditions<N>) -> FxHashMap<Key, Key> {
     let mut keys: Vec<Key> = states.iter().flat_map(|r| r.prov_keys.iter().copied()).collect();
     keys.sort_unstable();
@@ -1528,14 +1486,13 @@ pub fn par_map<T: Sync, R: Send>(items: &[T], threads: usize, f: impl Fn(&T) -> 
     crate::par::Pool::new(threads).map(items.len(), |i| Ok(f(&items[i]))).expect("an infallible map")
 }
 
-/// Frame 0: the initial states into an empty visited set with the hull
-/// `start`, each KEYED AS IT IS, not by its boundary view (`Rt2::widen_to`):
-/// where a `Flag::Always` entry moves the view, a row keyed by it decodes
-/// to the view - the start stored lossy, declined by the kernels' pins
-/// (their constants are the start's, `trace::walk`). Nothing looks the
-/// start up by its projection (`backward::Seeds::load`,
-/// `known::Pruning::start`). Each row must decode to exactly itself
-/// (`decode::check_piece`).
+/// Frame 0: the initial states with the hull `start`, each KEYED AS IT IS,
+/// not by its boundary view (`Rt2::widen_to`): where a `Flag::Always` entry
+/// moves the view, a row keyed by it decodes to the view - the start stored
+/// lossy, declined by the kernels' pins (the start's constants,
+/// `trace::walk`) - and nothing looks the start up by projection
+/// (`backward::Seeds::load`, `known::Pruning::start`). Each row must decode
+/// to itself (`check_piece`).
 pub fn seed<N: Rem>(visited: &mut VisitedSet<N>, blocks: &[Block<N>], start: HullOf<N>, s: &crate::settings::Settings) -> Result<Wave<N>> {
     let geo = visited.geo;
     let ids = crate::compiled::ids();
@@ -1622,10 +1579,9 @@ pub struct OneFrame<N: Rem = P8> {
     pub keys: celeste_engine::exact::KeySpace<N>,
 }
 
-/// ONE FRAME of `rows` against an EMPTY tree, no edges: every successor is
-/// new, a row's own too (the seeds are forgotten once keyed). The rows are
-/// seeded as a start (`seed`: the callers pass rows widened to the engine's
-/// level), with the whole circle as their hulls.
+/// ONE FRAME of `rows` (widened to the engine's level) against an EMPTY
+/// tree: every successor new, a row's own too (the seeds are forgotten once
+/// keyed); the whole circle as their hulls.
 pub fn one_frame<N: Rem>(engine: &dyn FrameStep<N>, rows: Vec<Block<N>>, frame: u32) -> Result<OneFrame<N>> {
     let mut visited = VisitedSet::<N>::new(super::GEOMETRY);
     let mut xfers = XferTable::<N>::default();
@@ -1645,10 +1601,9 @@ mod tests {
     use crate::search::hull::Hull;
     use crate::settings::Settings;
 
-    /// FRAME 0 IS THE ENGINE'S START, exactly, also where its boundary view
-    /// is another row (`seed`): a strawberry's bob (room (2,0) 100%), a
-    /// key's sprite (room (0,3) gemskip 100%, J 1: `spr` 9.5, the view's 8)
-    /// and a balloon's phase (room (7,0), J 1).
+    /// FRAME 0 IS THE ENGINE'S START, also where its view is another row: a
+    /// strawberry's bob (room (2,0) 100%), a key's sprite (room (0,3) gemskip
+    /// 100%, J 1), a balloon's phase (room (7,0), J 1).
     #[test]
     fn frame_zero_is_the_start_where_its_view_is_not() {
         let ids = crate::compiled::ids();
@@ -1677,9 +1632,8 @@ mod tests {
         }
     }
 
-    /// An `OldLayer` gives back its old states, whole and by any range, and
-    /// its re-push units are whole entries of `REPUSH_UNIT` states or more
-    /// (the last aside).
+    /// An `OldLayer` gives back its states, whole and by range; its re-push
+    /// units are whole entries of `REPUSH_UNIT` states or more (but the last).
     #[test]
     fn an_old_layer_gives_back_its_states() {
         let mut v = 7u64;
