@@ -361,7 +361,6 @@ where
         !(level.floors_near && !cfg.clock().boundary(frame)),
         "step {frame} is mid split frame at a near level: the graph side keeps a floor's computed `collideable` there, the block side does not"
     );
-    let ids = celeste_rust::compiled::ids();
     // Every lane of `rt2` against its block-side widening, exactly:
     // the lanes it moved (the first few printed, `shown` so far).
     let check = |rt2: &Rt2<N>, what: &str, shown: usize| -> usize {
@@ -371,7 +370,7 @@ where
         let mut b = rt2.clone_block();
         widen_rt2_to(&mut b, level);
         b.canonical();
-        let (ea, eb) = (celeste_engine::exact::exact_rows(&a, ids), celeste_engine::exact::exact_rows(&b, ids));
+        let (ea, eb) = (celeste_engine::exact::exact_rows(&a), celeste_engine::exact::exact_rows(&b));
         for l in 0..rt2.width {
             if a.shape_hash == b.shape_hash && ea[l] == eb[l] {
                 continue;

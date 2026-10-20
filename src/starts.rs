@@ -97,7 +97,7 @@ pub fn starts(s: &crate::settings::Settings) -> Result<Starts> {
     for &j in &feasible {
         let sj = crate::settings::Settings { loading_jank: Some(j), ..s.clone() };
         let b = crate::frame::Block::canonical(RefEngine::new(&sj)?.initial()?)?;
-        let row = celeste_engine::exact::exact_rows(b.rt2(), crate::compiled::ids()).swap_remove(0);
+        let row = celeste_engine::exact::exact_rows(b.rt2()).swap_remove(0);
         let cell = b.positions()?[0];
         match classes.iter_mut().find(|(r, c, _)| *r == row && *c == cell) {
             Some((_, _, js)) => js.push(j),

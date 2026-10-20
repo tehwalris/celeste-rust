@@ -34,7 +34,7 @@ pub fn read_inputs(spec: &str) -> Result<Vec<u8>> {
 /// order, as cells of a one-row block.
 pub fn objects_of_type<N: EngineNum>(rt2: &Rt2<N>, name: &str) -> Vec<u32> {
     match celeste_names::global_id(name) {
-        Some(g) => rt2.objects_of_type(crate::compiled::ids(), g),
+        Some(g) => rt2.objects_of_type(g),
         None => Vec::new(),
     }
 }
@@ -117,7 +117,7 @@ mod tests {
         let fingerprint = |r: &Rt2| {
             let mut c = r.clone_block();
             c.canonical();
-            (r.shape_hash_of(), celeste_engine::exact::exact_rows(&c, crate::compiled::ids()), crate::search::pos_graph::block_cells(r).expect("cells"))
+            (r.shape_hash_of(), celeste_engine::exact::exact_rows(&c), crate::search::pos_graph::block_cells(r).expect("cells"))
         };
         // The cart is read when an engine is built, under its settings.
         let mut whole = RefEngine::new(&Default::default()).expect("engine");

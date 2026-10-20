@@ -15,20 +15,52 @@ pub mod mix;
 
 pub use asm_kernel::{KernelLanes, Registry, Resident, Scratch};
 
-pub(crate) fn boundary_ids() -> runtime2::BoundaryIds {
+/// THE GAME'S NAMES the search reads off a block, as ids (`celeste_names`).
+/// The position object's are the engine's own (`runtime2::names`), shared.
+pub struct BoundaryIds {
+    pub g_objects: u32,
+    /// `room` (`x`/`y`): positions are start-room-relative; wins test `room.x`.
+    pub g_room: u32,
+    /// `max_djump`: 2 once the orb is taken (`frame::wins_of`).
+    pub g_max_djump: u32,
+    pub f_type: u32,
+    pub f_rem: u32,
+    pub f_spd: u32,
+    pub f_x: u32,
+    pub f_y: u32,
+    pub f_dash_effect_time: u32,
+    /// The berry's sources (`frame::berry_lost`): the strawberry, the fly
+    /// fruit, the key, the chest the key opens (its `state`), and the fake
+    /// wall that drops one when broken.
+    pub g_fruit: u32,
+    pub g_fly_fruit: u32,
+    pub g_key: u32,
+    pub g_chest: u32,
+    pub g_fake_wall: u32,
+    pub f_state: u32,
+    /// The orb room's big chest (`frame::orb_deadline_skip`).
+    pub g_big_chest: u32,
+    /// The moving platforms (a frame test).
+    pub g_platform: u32,
+    /// The balloon's phase and bob (`concrete::lookup_view`, a seeded state).
+    pub g_balloon: u32,
+    pub f_offset: u32,
+    pub f_start: u32,
+}
+
+fn boundary_ids() -> BoundaryIds {
     let g = |name: &str| gen::global_id(name).unwrap_or_else(|| panic!("no global {}", name));
     let f = |name: &str| gen::field_id(name).unwrap_or_else(|| panic!("no field {}", name));
-    runtime2::BoundaryIds {
-        g_objects: g("objects"),
-        g_player: g("player"),
-        g_player_spawn: g("player_spawn"),
+    let engine = runtime2::names();
+    BoundaryIds {
+        g_objects: engine.objects,
         g_room: g("room"),
         g_max_djump: g("max_djump"),
-        f_type: f("type"),
+        f_type: engine.type_,
         f_rem: f("rem"),
         f_spd: f("spd"),
-        f_x: f("x"),
-        f_y: f("y"),
+        f_x: engine.x,
+        f_y: engine.y,
         f_dash_effect_time: f("dash_effect_time"),
         g_fruit: g("fruit"),
         g_fly_fruit: g("fly_fruit"),
@@ -44,8 +76,8 @@ pub(crate) fn boundary_ids() -> runtime2::BoundaryIds {
     }
 }
 
-pub fn ids() -> &'static runtime2::BoundaryIds {
-    static IDS: std::sync::OnceLock<runtime2::BoundaryIds> = std::sync::OnceLock::new();
+pub fn ids() -> &'static BoundaryIds {
+    static IDS: std::sync::OnceLock<BoundaryIds> = std::sync::OnceLock::new();
     IDS.get_or_init(boundary_ids)
 }
 

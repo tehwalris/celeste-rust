@@ -83,7 +83,7 @@ pub fn run<N: Rem>(o: &Opts) -> Result<()> {
     cfg.check(dir, level)?;
     let ids = crate::compiled::ids();
     let graph = EdgeStore::<N>::open(&dir.join("edges"), to)?;
-    let rem_cells = |rt2: &Rt2<N>| rt2.player_xy_cells(ids, ids.f_rem);
+    let rem_cells = |rt2: &Rt2<N>| rt2.player_xy_cells(ids.f_rem);
     // One stored state's row, as a one-lane block.
     let tree = Tree::<N>::open(dir, to)?;
     let row_of = |s: Sk| -> Result<Block<N>> {

@@ -401,7 +401,7 @@ pub(super) fn lookup_keys<N: EngineNum>(b: &Block<N>, level: Level, seeded: bool
 /// A concrete state's EXACT identity: canonical bytes (`exact::exact_rows`)
 /// and cell, never the widened key (sharing it need not share a fate).
 pub(super) fn exact_state<N: EngineNum>(b: &Block<N>, cell: u32) -> ExactRow {
-    let mut v = celeste_engine::exact::exact_rows(b.rt2(), crate::compiled::ids()).swap_remove(0).into_vec();
+    let mut v = celeste_engine::exact::exact_rows(b.rt2()).swap_remove(0).into_vec();
     v.extend_from_slice(&cell.to_le_bytes());
     v.into_boxed_slice()
 }
@@ -419,7 +419,7 @@ pub(super) fn lookup_view<N: EngineNum>(row: &Rt2<N>, seeded: bool) -> Result<Rt
     }
     let ids = crate::compiled::ids();
     let num = <N::A as Arithmetic>::from_fixed_raw;
-    for obj in rt2.objects_of_type(ids, ids.g_balloon) {
+    for obj in rt2.objects_of_type(ids.g_balloon) {
         let (Some(oc), Some(yc), Some(sc)) = (rt2.obj_field_cell(obj, ids.f_offset), rt2.obj_field_cell(obj, ids.f_y), rt2.obj_field_cell(obj, ids.f_start)) else { continue };
         let AV::Num(start) = rt2.cols[sc as usize].at(0) else { anyhow::bail!("a balloon's `start` is not a number") };
         let bob = |f: fn(N, N) -> Option<N>| f(start, num(BALLOON_BOB_RAW)).ok_or_else(|| anyhow::anyhow!("a balloon's bob out of range"));
@@ -433,7 +433,7 @@ pub(super) fn lookup_view<N: EngineNum>(row: &Rt2<N>, seeded: bool) -> Result<Rt
 pub(crate) fn rem_raw<N: Rem>(rt2: &Rt2<N>) -> Result<Option<(N, N)>> {
     use celeste_engine::runtime2::AV;
     let ids = crate::compiled::ids();
-    let Some((cx, cy)) = rt2.player_xy_cells(ids, ids.f_rem) else { return Ok(None) };
+    let Some((cx, cy)) = rt2.player_xy_cells(ids.f_rem) else { return Ok(None) };
     let num = |c: usize| match rt2.cols[c].at(0) {
         AV::Num(n) => Ok(n),
         other => Err(anyhow::anyhow!("a concrete remainder expected, got {other:?}")),

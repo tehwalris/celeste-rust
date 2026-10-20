@@ -88,39 +88,26 @@ pub enum Cell2<N = P8> {
     Bi(u32),
 }
 
-/// Global and field ids the boundary walk needs, resolved by the caller.
-pub struct BoundaryIds {
-    pub g_objects: u32,
-    pub g_player: u32,
-    /// The position column reads `player_spawn` before the player exists.
-    pub g_player_spawn: u32,
-    /// `room` (`x`/`y`): positions are start-room-relative; wins test `room.x`.
-    pub g_room: u32,
-    /// `max_djump`: 2 once the orb is taken (`frame::wins_of`).
-    pub g_max_djump: u32,
-    pub f_type: u32,
-    pub f_rem: u32,
-    pub f_spd: u32,
-    pub f_x: u32,
-    pub f_y: u32,
-    pub f_dash_effect_time: u32,
-    /// The berry's sources (`frame::berry_lost`): the strawberry, the fly
-    /// fruit, the key, the chest the key opens (its `state`), and the fake
-    /// wall that drops one when broken.
-    pub g_fruit: u32,
-    pub g_fly_fruit: u32,
-    pub g_key: u32,
-    pub g_chest: u32,
-    pub g_fake_wall: u32,
-    pub f_state: u32,
-    /// The orb room's big chest (`frame::orb_deadline_skip`).
-    pub g_big_chest: u32,
-    /// The moving platforms (a frame test).
-    pub g_platform: u32,
-    /// The balloon's phase and bob (`concrete::lookup_view`, a seeded state).
-    pub g_balloon: u32,
-    pub f_offset: u32,
-    pub f_start: u32,
+/// The names the engine reads itself, as their ids (`celeste_names`): the
+/// POSITION OBJECT (the player, else the player spawn, in `objects` by its
+/// `type`) and its fields. The game's other names are its caller's.
+pub struct Names {
+    pub objects: u32,
+    pub player: u32,
+    pub player_spawn: u32,
+    pub type_: u32,
+    pub x: u32,
+    pub y: u32,
+}
+
+/// The engine's `Names`, resolved once.
+pub fn names() -> &'static Names {
+    static N: std::sync::OnceLock<Names> = std::sync::OnceLock::new();
+    N.get_or_init(|| {
+        let g = |n: &str| celeste_names::global_id(n).unwrap_or_else(|| panic!("no global {n}"));
+        let f = |n: &str| celeste_names::field_id(n).unwrap_or_else(|| panic!("no field {n}"));
+        Names { objects: g("objects"), player: g("player"), player_spawn: g("player_spawn"), type_: f("type"), x: f("x"), y: f("y") }
+    })
 }
 
 pub struct Rt2<N = P8> {
@@ -286,15 +273,16 @@ impl<N: EngineNum> Rt2<N> {
         }
     }
 
-    /// The player INSTANCES in `objects` (`g_player` is the type table).
-    pub fn player_objects(&self, ids: &BoundaryIds) -> Vec<u32> {
-        self.objects_of_type(ids, ids.g_player)
+    /// The player INSTANCES in `objects` (the global `player` is the type
+    /// table).
+    pub fn player_objects(&self) -> Vec<u32> {
+        self.objects_of_type(names().player)
     }
 
     /// Instances in `objects` whose `type` is global `type_global`'s table.
-    pub fn objects_of_type(&self, ids: &BoundaryIds, type_global: u32) -> Vec<u32> {
+    pub fn objects_of_type(&self, type_global: u32) -> Vec<u32> {
         let mut found = Vec::new();
-        let Some(arr) = self.global_target(ids.g_objects) else {
+        let Some(arr) = self.global_target(names().objects) else {
             return found;
         };
         let Cell2::Arr(items) = &self.structure[arr as usize] else {
@@ -310,7 +298,7 @@ impl<N: EngineNum> Rt2<N> {
                 },
                 _ => *item,
             };
-            let Some(type_cell) = self.obj_field_cell(obj, ids.f_type) else {
+            let Some(type_cell) = self.obj_field_cell(obj, names().type_) else {
                 continue;
             };
             let matches = match self.cols[type_cell as usize] {
@@ -325,11 +313,11 @@ impl<N: EngineNum> Rt2<N> {
     }
 
     /// The `x`/`y` cells of the table at `obj`'s field `f`.
-    fn xy_cells_of(&self, obj: u32, f: u32, ids: &BoundaryIds) -> Vec<u32> {
+    fn xy_cells_of(&self, obj: u32, f: u32) -> Vec<u32> {
         let mut out = Vec::new();
         if let Some(ptr_cell) = self.obj_field_cell(obj, f) {
             if let Col::U(AV::Ptr(sub)) = self.cols[ptr_cell as usize] {
-                for g in [ids.f_x, ids.f_y] {
+                for g in [names().x, names().y] {
                     if let Some(c) = self.obj_field_cell(sub, g) {
                         out.push(c);
                     }
@@ -342,20 +330,20 @@ impl<N: EngineNum> Rt2<N> {
     /// The POSITION object: the first player instance, else the first
     /// `player_spawn` (`search::pos_graph::player_object`'s rule: its
     /// whole-pixel `x`/`y` make the row's cell).
-    pub fn position_object(&self, ids: &BoundaryIds) -> Option<u32> {
-        self.player_objects(ids).first().copied().or_else(|| self.objects_of_type(ids, ids.g_player_spawn).first().copied())
+    pub fn position_object(&self) -> Option<u32> {
+        self.player_objects().first().copied().or_else(|| self.objects_of_type(names().player_spawn).first().copied())
     }
 
-    pub fn position_cells(&self, ids: &BoundaryIds) -> Option<(u32, u32)> {
-        let obj = self.position_object(ids)?;
-        Some((self.obj_field_cell(obj, ids.f_x)?, self.obj_field_cell(obj, ids.f_y)?))
+    pub fn position_cells(&self) -> Option<(u32, u32)> {
+        let obj = self.position_object()?;
+        Some((self.obj_field_cell(obj, names().x)?, self.obj_field_cell(obj, names().y)?))
     }
 
     /// The first player INSTANCE's `x`/`y` cells of its table field `f`
     /// (`rem`, `spd`) - not `player_spawn`'s, whose remainder is real state.
-    pub fn player_xy_cells(&self, ids: &BoundaryIds, f: u32) -> Option<(usize, usize)> {
-        let obj = *self.player_objects(ids).first()?;
-        match self.xy_cells_of(obj, f, ids)[..] {
+    pub fn player_xy_cells(&self, f: u32) -> Option<(usize, usize)> {
+        let obj = *self.player_objects().first()?;
+        match self.xy_cells_of(obj, f)[..] {
             [x, y] => Some((x as usize, y as usize)),
             _ => None,
         }
@@ -623,9 +611,9 @@ impl<N: EngineNum> Rt2<N> {
 impl<N: EngineNum> Rt2<N> {
     /// The BOUNDARY: level-0 widenings, canonical renumbering (the GC) and
     /// the shape hash, lanes kept.
-    pub fn boundary_canonicalize(&mut self, ids: &BoundaryIds) {
+    pub fn boundary_canonicalize(&mut self) {
         self.boundary_prepare();
-        self.widen_to(ids, crate::widening::Level::EXACT);
+        self.widen_to(crate::widening::Level::EXACT);
         self.boundary_finish();
     }
 }

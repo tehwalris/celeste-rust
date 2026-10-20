@@ -1417,14 +1417,13 @@ pub(crate) fn par_map<T: Sync, R: Send>(items: &[T], threads: usize, f: impl Fn(
 /// to itself (`check_piece`).
 pub(crate) fn seed<N: Rem>(visited: &mut VisitedSet<N>, blocks: &[Block<N>], start: HullOf<N>, s: &crate::settings::Settings) -> Result<Wave<N>> {
     let geo = visited.geo;
-    let ids = crate::compiled::ids();
     let mut canon: Vec<celeste_engine::runtime2::Rt2<N>> = Vec::with_capacity(blocks.len());
     for b in blocks {
         let mut r = b.rt2().clone_block();
         r.canonical();
         canon.push(r);
     }
-    let keys_added = visited.keys.absorb(&canon.iter().collect::<Vec<_>>(), ids);
+    let keys_added = visited.keys.absorb(&canon.iter().collect::<Vec<_>>());
     let mut shapes: Vec<u64> = canon.iter().map(|r| r.shape_hash).filter(|s| visited.shape_index(*s).is_none()).collect();
     shapes.sort_unstable();
     shapes.dedup();
@@ -1437,7 +1436,7 @@ pub(crate) fn seed<N: Rem>(visited: &mut VisitedSet<N>, blocks: &[Block<N>], sta
     let mut states: Vec<(Sk, bool)> = Vec::new();
     let mut skels: FxHashMap<u64, super::layer::SkelRecord<N>> = FxHashMap::default();
     for r in canon.iter_mut() {
-        let keys: Vec<Key> = visited.keys.lookup_keys(r, ids).into_iter().map(|k| k.expect("seeded codes")).collect();
+        let keys: Vec<Key> = visited.keys.lookup_keys(r).into_iter().map(|k| k.expect("seeded codes")).collect();
         let cells = crate::search::pos_graph::block_cells(r)?;
         r.row_keys = keys.clone();
         super::decode::check_piece(&visited.keys, r, &cells).map_err(|e| e.context("frame 0"))?;
@@ -1523,7 +1522,6 @@ mod tests {
     /// 100%, J 1), a balloon's phase (room (7,0), J 1).
     #[test]
     fn frame_zero_is_the_start_where_its_view_is_not() {
-        let ids = crate::compiled::ids();
         let cases = [
             Settings { room: (2, 0), hundred: true, ..Default::default() },
             Settings { room: (0, 3), hundred: true, gemskip: true, loading_jank: Some(1), ..Default::default() },
@@ -1534,15 +1532,15 @@ mod tests {
             let mut view = start.rt2().clone_block();
             crate::frame::widen_rt2_to(&mut view, crate::abstraction::Level::EXACT);
             view.canonical();
-            assert_ne!(celeste_engine::exact::exact_rows(&view, ids), celeste_engine::exact::exact_rows(start.rt2(), ids), "room {:?}: the start is its own view", s.room);
+            assert_ne!(celeste_engine::exact::exact_rows(&view), celeste_engine::exact::exact_rows(start.rt2()), "room {:?}: the start is its own view", s.room);
             let mut visited = VisitedSet::new(GEOMETRY);
             let wave = seed(&mut visited, std::slice::from_ref(&start), Hull::full(), &s).unwrap_or_else(|e| panic!("room {:?}: frame 0: {e:#}", s.room));
             let decoded = super::super::layer::decode_states(&wave.next, &visited.keys, visited.shapes(), usize::MAX, &|_| true).expect("decode");
             let [(sks, row)] = &decoded[..] else { panic!("room {:?}: frame 0 is {} blocks", s.room, decoded.len()) };
             assert_eq!(sks.len(), 1, "room {:?}: frame 0 is one state", s.room);
             assert_eq!(
-                (celeste_engine::exact::exact_rows(row, ids), sks[0].cell(&GEOMETRY)),
-                (celeste_engine::exact::exact_rows(start.rt2(), ids), start.positions().expect("cell")[0]),
+                (celeste_engine::exact::exact_rows(row), sks[0].cell(&GEOMETRY)),
+                (celeste_engine::exact::exact_rows(start.rt2()), start.positions().expect("cell")[0]),
                 "room {:?}: frame 0 is not the start",
                 s.room
             );

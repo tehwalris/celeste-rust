@@ -2,7 +2,8 @@
 //! shapes and levels (shapes number their cells differently).
 
 use celeste_core::arith::EngineNum;
-use celeste_engine::runtime2::{BoundaryIds, Cell2, Col, Rt2, AV};
+use crate::compiled::BoundaryIds;
+use celeste_engine::runtime2::{Cell2, Col, Rt2, AV};
 use std::collections::{BTreeMap, HashMap};
 
 /// A row's named value cells, each shown (`av_show`).

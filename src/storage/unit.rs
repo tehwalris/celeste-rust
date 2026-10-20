@@ -941,9 +941,9 @@ impl<'a, N: Rem> UnitSink<'a, N> {
         crate::frame::widen_rt2_to(&mut w, level);
         w.canonical();
         if self.keys.shape(w.shape_hash).is_none() {
-            self.note_shape(&celeste_engine::exact::ShapeRecord::of(&w, crate::compiled::ids()));
+            self.note_shape(&celeste_engine::exact::ShapeRecord::of(&w));
         }
-        let key = match self.keys.row_keys(&w, crate::compiled::ids()).swap_remove(0) {
+        let key = match self.keys.row_keys(&w).swap_remove(0) {
             RowKey::Hit(k) => k,
             RowKey::Miss(m) => self.prov.intern(m),
         };

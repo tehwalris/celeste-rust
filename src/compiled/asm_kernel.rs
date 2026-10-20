@@ -309,7 +309,7 @@ impl<N: KernelLanes> AsmKernel<N> {
                     m &= m - 1;
                     let lane = lanes[i];
                     let mut desc = format!("lane {lane}:");
-                    for obj in chunk.player_objects(ids) {
+                    for obj in chunk.player_objects() {
                         for (name, f) in [("rem", ids.f_rem), ("spd", ids.f_spd)] {
                             if let Some(pc) = chunk.obj_field_cell(obj, f) {
                                 if let Col::U(AV::Ptr(sub)) = chunk.cols[pc as usize] {
@@ -795,8 +795,8 @@ pub(crate) fn key_check<N: crate::search::rem::Rem>(slot: &crate::storage::unit:
     use celeste_engine::exact::{is_provisional, RowKey};
     let acc = slot.to_rt2();
     let mut b = acc.clone_block();
-    b.boundary_canonicalize(super::ids());
-    let want = keys.row_keys(&b, super::ids());
+    b.boundary_canonicalize();
+    let want = keys.row_keys(&b);
     let bad: Vec<usize> = (0..acc.width)
         .filter(|&i| match &want[i] {
             RowKey::Hit(k) => acc.row_keys[i] != *k,
@@ -837,8 +837,8 @@ pub(crate) fn key_check<N: crate::search::rem::Rem>(slot: &crate::storage::unit:
 /// and structure, and the key space keys its rows as stored.
 pub(crate) fn key_check_block<N: celeste_core::arith::EngineNum>(blk: &Rt2<N>, keys: &KeySpace<N>) {
     let mut b = blk.clone_block();
-    b.boundary_canonicalize(super::ids());
-    let got: Vec<Option<(u64, u64)>> = keys.lookup_keys(&b, super::ids());
+    b.boundary_canonicalize();
+    let got: Vec<Option<(u64, u64)>> = keys.lookup_keys(&b);
     let same = got.iter().zip(&blk.row_keys).all(|(g, w)| *g == Some(*w));
     assert!(
         b.shape_hash == blk.shape_hash && b.structure == blk.structure && same,
@@ -912,7 +912,7 @@ impl<N: KernelLanes> Registry<N> {
             return self.run_key(chunk, None, lanes, sink);
         }
         // Regions only for shapes with a PLAYER (not `player_spawn`).
-        let Some(grid) = self.grid.filter(|_| !chunk.player_objects(crate::compiled::ids()).is_empty()) else {
+        let Some(grid) = self.grid.filter(|_| !chunk.player_objects().is_empty()) else {
             return self.run_key(chunk, None, lanes, sink);
         };
         // The unit's live lanes bucketed by region, each bucket cut into
@@ -1157,7 +1157,7 @@ fn build_one_shape<N: KernelLanes>(r: &crate::trace::lower::LoweredFrame<N::Arit
         .map(|oi| acc_template(r, oi))
         .collect::<Result<Vec<_>>>()?;
     // Per outcome, its position coordinates' cells (keyed without their whole pixels).
-    let pos_cells: Vec<Option<(u32, u32)>> = acc_templates.iter().map(|t| t.build().position_cells(crate::compiled::ids())).collect();
+    let pos_cells: Vec<Option<(u32, u32)>> = acc_templates.iter().map(|t| t.build().position_cells()).collect();
     // Each body's roots onto their slots.
     let off = |n: crate::transpile::graph::NodeId| compiled.root_offsets[slot(n)] as usize;
     let kind = |n: crate::transpile::graph::NodeId| compiled.root_kinds[slot(n)];
@@ -1410,7 +1410,7 @@ fn acc_template<N: KernelLanes>(r: &crate::trace::lower::LoweredFrame<N::Arith>,
     // The key's uniform fields, at their widened values.
     let widen = &r.bound.outcomes[oi].widen;
     let empty = t.build();
-    let pos = empty.position_cells(crate::compiled::ids());
+    let pos = empty.position_cells();
     for (c, cell) in empty.structure.iter().enumerate() {
         if !matches!(cell, celeste_engine::runtime2::Cell2::Val) {
             continue;
@@ -1429,7 +1429,7 @@ fn acc_template<N: KernelLanes>(r: &crate::trace::lower::LoweredFrame<N::Arith>,
     }
     let mut canon = empty.clone_block();
     canon.shape_hash = shape_hash;
-    t.record = ShapeRecord::of(&canon, crate::compiled::ids());
+    t.record = ShapeRecord::of(&canon);
     Ok(t)
 }
 

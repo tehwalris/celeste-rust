@@ -210,7 +210,7 @@ pub(crate) fn orb_deadline_skip<N: EngineNum>(rt2: &Rt2<N>, frame: u32, horizon:
         return vec![false; lanes];
     }
     let ids = crate::compiled::ids();
-    let Some(&chest) = rt2.objects_of_type(ids, ids.g_big_chest).first() else {
+    let Some(&chest) = rt2.objects_of_type(ids.g_big_chest).first() else {
         return vec![false; lanes];
     };
     let Some(c) = rt2.obj_field_cell(chest, ids.f_state) else { return vec![false; lanes] };
@@ -226,7 +226,7 @@ pub(crate) fn berry_lost<N: EngineNum>(rt2: &Rt2<N>, s: &crate::settings::Settin
     let lanes = rt2.width;
     let ids = crate::compiled::ids();
     let sources = [ids.g_fruit, ids.g_fly_fruit, ids.g_key, ids.g_chest, ids.g_fake_wall];
-    if !s.hundred || sources.iter().any(|&g| !rt2.objects_of_type(ids, g).is_empty()) {
+    if !s.hundred || sources.iter().any(|&g| !rt2.objects_of_type(g).is_empty()) {
         return Ok(vec![false; lanes]);
     }
     Ok(got_fruit(rt2, s.room)?.into_iter().map(|taken| !taken).collect())
@@ -376,7 +376,7 @@ pub(crate) fn widened_keys<N: EngineNum>(
 
 /// `rt2` projected IN PLACE onto `level`, as its kernels would store it.
 pub fn widen_rt2_to<N: EngineNum>(rt2: &mut Rt2<N>, level: crate::abstraction::Level) {
-    rt2.widen_to(crate::compiled::ids(), level);
+    rt2.widen_to(level);
 }
 
 /// `widened_keys` of an `Rt2`.
@@ -388,7 +388,7 @@ pub(crate) fn widened_keys_rt2<N: EngineNum>(
     let mut w = rt2.clone_block();
     widen_rt2_to(&mut w, coarser);
     w.canonical();
-    let keys = keys.lookup_keys(&w, crate::compiled::ids());
+    let keys = keys.lookup_keys(&w);
     let cells = crate::search::pos_graph::block_cells(&w)?;
     anyhow::ensure!(
         keys.len() == rt2.width && cells.len() == rt2.width,
@@ -594,8 +594,7 @@ impl<N: Rem> ForwardState<N> {
         // The start has no player yet (`rem::start_point`'s premise):
         // `seed` keys it as it is, so a player's remainder would be stored
         // exact where every other state holds it widened, beside its hull.
-        let ids = crate::compiled::ids();
-        anyhow::ensure!(initial.iter().all(|b| b.rt2().player_objects(ids).is_empty()), "frame 0: an initial row holds a player, whose remainder the start's hull does not describe");
+        anyhow::ensure!(initial.iter().all(|b| b.rt2().player_objects().is_empty()), "frame 0: an initial row holds a player, whose remainder the start's hull does not describe");
         let mut visited = crate::storage::visited::VisitedSet::<N>::new(crate::storage::GEOMETRY);
         let seeded = crate::storage::wave::seed(&mut visited, &initial, crate::search::rem::start_hull::<N>(), s)?;
         checkpoint(dir, 0, &seeded, &[], s, &mut Stats::default())?;
@@ -1177,11 +1176,10 @@ mod tests {
     fn standing_row(s: &Settings, level: Level) -> Rt2 {
         let mut reference = RefEngine::new(s).expect("ref engine");
         let mut row = reference.initial().expect("initial state");
-        let ids = crate::compiled::ids();
         let mut after = 0;
         while after < 3 {
             row = reference.step_one(&row, 0).expect("frame").into_rt2();
-            if !row.player_objects(ids).is_empty() {
+            if !row.player_objects().is_empty() {
                 after += 1;
             }
         }
@@ -1215,7 +1213,7 @@ mod tests {
         widen_rt2_to(&mut w, coarse);
         w.canonical();
         let mut space = celeste_engine::exact::KeySpace::new();
-        space.absorb(&[&w], crate::compiled::ids());
+        space.absorb(&[&w]);
         let (shape, keys, cells) = widened_keys(&block, coarse, &space).expect("keys");
         let mut marked = Visited::new(space.clone());
         marked.insert_until(shape, keys[0].expect("keyed"), cells[0], 5);
@@ -1500,7 +1498,7 @@ mod tests {
         let registry = crate::compiled::asm_kernel::registry(level, &s);
         let row = standing_row(&s, level);
         let ids = crate::compiled::ids();
-        let player = row.player_objects(ids)[0];
+        let player = row.player_objects()[0];
         let cell_of = |rt2: &Rt2, f: u32, axis: u32| -> usize {
             let pc = rt2.obj_field_cell(player, f).expect("the player's table field");
             let Col::U(AV::Ptr(t)) = rt2.cols[pc as usize] else { panic!("the player's field is not a table") };
@@ -1544,7 +1542,7 @@ mod tests {
         let registry = crate::compiled::asm_kernel::registry(level, &s);
         let row = standing_row(&s, level);
         let ids = crate::compiled::ids();
-        let platform = *row.objects_of_type(ids, ids.g_platform).first().expect("a moving platform");
+        let platform = *row.objects_of_type(ids.g_platform).first().expect("a moving platform");
         let sub = |rt2: &Rt2, f: u32, axis: u32| -> usize {
             let pc = rt2.obj_field_cell(platform, f).expect("the platform's table field");
             let Col::U(AV::Ptr(t)) = rt2.cols[pc as usize] else { panic!("the platform's field is not a table") };

@@ -19,7 +19,7 @@
 
 use celeste_core::arith::{Arithmetic, EngineNum};
 
-use crate::runtime2::{collapse_uniform, BoundaryIds, Col, Rt2, AV, NONE};
+use crate::runtime2::{collapse_uniform, names, Col, Rt2, AV, NONE};
 
 /// A LEVEL: which objects the forward widens (plans/abstractions.md). Each
 /// widening over-approximates; the concrete search refutes it.
@@ -697,17 +697,17 @@ impl<N: EngineNum> Rt2<N> {
     /// A level's widenings (`TABLE`), as its kernels bake them
     /// (`trace::widen`), so a finer row can be looked up as the level's
     /// node. Each asserts what its entry owes.
-    pub fn widen_to(&mut self, ids: &BoundaryIds, level: Level) {
+    pub fn widen_to(&mut self, level: Level) {
         for (e, r) in TABLE.iter().zip(resolved()) {
             if !level.has(e.flag) {
                 continue;
             }
             if e.hook == Some(Hook::NearFloor) {
-                self.widen_near_floors(ids, r);
+                self.widen_near_floors(r);
                 continue;
             }
             let bases: Vec<Option<u32>> = match r.ty {
-                Some(ty) => self.objects_of_type(ids, ty).into_iter().map(Some).collect(),
+                Some(ty) => self.objects_of_type(ty).into_iter().map(Some).collect(),
                 None => vec![None],
             };
             for base in bases {
@@ -863,26 +863,26 @@ impl<N: EngineNum> Rt2<N> {
     /// and `collideable` widened except where a player certainly overlaps the
     /// floor (kept as they are: the kernels store the cart's invariant there, or
     /// with `p` the computed value - either is what a concrete row holds).
-    fn widen_near_floors(&mut self, ids: &BoundaryIds, r: &Resolved) {
+    fn widen_near_floors(&mut self, r: &Resolved) {
         let le = <N::A as Arithmetic>::le;
         let (slo, shi) = range::<N>(FLOOR_STATE_RANGE.0, FLOOR_STATE_RANGE.1);
         let span_of = |v: AV<N>, what: &str| span(v).unwrap_or_else(|| panic!("near floor widening: {what} is {v:?}"));
         let players: Vec<(u32, u32)> = self
-            .player_objects(ids)
+            .player_objects()
             .into_iter()
             .map(|o| {
                 let cell = |f: u32, what: &str| self.obj_field_cell(o, f).unwrap_or_else(|| panic!("near floor widening: the player has no `{what}`"));
-                (cell(ids.f_x, "x"), cell(ids.f_y, "y"))
+                (cell(names().x, "x"), cell(names().y, "y"))
             })
             .collect();
         let ty = r.ty.expect("the near floors are objects");
-        for obj in self.objects_of_type(ids, ty) {
+        for obj in self.objects_of_type(ty) {
             // Floors never move: one position in every lane.
             let at = |f: u32| {
                 let col = self.obj_field_cell(obj, f).map(|c| &self.cols[c as usize]);
                 col.and_then(|c| c.uniform_num(self.width)).unwrap_or_else(|| panic!("near floor widening: a fall floor's position is {col:?}, not one number"))
             };
-            let (fx, fy) = (at(ids.f_x), at(ids.f_y));
+            let (fx, fy) = (at(names().x), at(names().y));
             let window = floor_player_window((fx, fy)).unwrap_or_else(|| panic!("near floor widening: a fall floor at ({fx:?}, {fy:?}): its window leaves the arithmetic's range"));
             let overlap: Vec<bool> = (0..self.width)
                 .map(|lane| {
