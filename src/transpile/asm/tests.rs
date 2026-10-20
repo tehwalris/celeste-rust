@@ -21,7 +21,8 @@ use celeste_core::lua_f64::LuaF64;
 use celeste_core::pico8_num::Pico8Num as P8;
 
 use crate::compiled::asm_kernel::KernelLanes;
-use crate::transpile::asm::{compile, compile_and_load, AsmArith, AsmCtx, AsmOptions, CollisionEnv, Compiled, Loaded};
+use crate::transpile::garith::GraphArith;
+use crate::transpile::asm::{compile, compile_and_load, AsmCtx, AsmOptions, CollisionEnv, Compiled, Loaded};
 use crate::transpile::graph::{one_operand, Cut, Graph, NodeId, Op, Ty, Unknown};
 
 /// A tiny deterministic PRNG (splitmix64), so the tests need no `rand`.
@@ -47,7 +48,7 @@ impl Lcg {
 /// answer is not an operation of the arithmetic. 16.16's grid is the raw
 /// `i32`, which wraps past the top floor; there the fork's premise
 /// (`ForkOk`) is false, so the lane declines.
-trait TestArith: AsmArith<Num: KernelLanes<Arith = Self>> {
+trait TestArith: GraphArith<Num: KernelLanes<Arith = Self>> {
     /// Numbers every operation is tried on: zeros, both signs, the range's
     /// ends and the operations' thresholds, cut points, random values.
     fn specials() -> Vec<Self::Num>;

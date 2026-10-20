@@ -15,12 +15,12 @@ use celeste_core::lua_f64::LuaF64;
 use celeste_core::pico8_num::Pico8Num as P8;
 use celeste_engine::runtime2::POS_WHOLE;
 
-use crate::transpile::asm::AsmArith;
+use crate::transpile::garith::GraphArith;
 
-pub trait KernelLanes: crate::search::rem::Rem {
-    /// The arithmetic the kernels compute in (`EngineNum::A`, as one the
-    /// assembler compiles).
-    type Arith: AsmArith<Num = Self>;
+/// The lanes of an arithmetic the kernels compute in (`EngineNum::A`, one
+/// the assembler compiles).
+pub trait KernelLanes: crate::search::rem::Rem<A = <Self as KernelLanes>::Arith> {
+    type Arith: GraphArith<Num = Self>;
     /// The 16 lanes of the value slot at byte `off` (`half`: the halves'
     /// distance in this buffer; 16.16 has none).
     fn col(buf: &[u8], half: usize, off: usize) -> [Self::Raw; 16];
@@ -49,7 +49,7 @@ pub trait KernelLanes: crate::search::rem::Rem {
     fn before_call();
     /// The kernel census (`compiled::mix`: `bench frame --metrics`),
     /// 16.16's diagnostic; another arithmetic refuses it.
-    fn mix_report(inp: &crate::compiled::mix::Input<'_, Self::Arith>) -> anyhow::Result<crate::compiled::mix::Census>;
+    fn mix_report(inp: &crate::compiled::mix::Input<'_, Self::A>) -> anyhow::Result<crate::compiled::mix::Census>;
 }
 
 thread_local! {

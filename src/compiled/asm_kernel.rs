@@ -214,7 +214,7 @@ struct AsmKernel<N: KernelLanes = P8> {
     body_cols: Vec<BodyCols<N>>,
     /// The fused graph, roots and room for `explain_error`; empty unless
     /// `--kernel-explain` (`BuildOptions::keep_graphs`; gigabytes per set).
-    fused: crate::transpile::graph::Graph<N::Arith>,
+    fused: crate::transpile::graph::Graph<N::A>,
     flat_roots: Vec<crate::transpile::graph::NodeId>,
     room: Room,
     fused_nodes: usize,
@@ -370,11 +370,11 @@ impl<N: KernelLanes> AsmKernel<N> {
     /// On a decline: print the `error` disjuncts not false for `lane`.
     fn explain_error(&self, chunk: &Rt2<N>, lane: usize, error_node: crate::transpile::graph::NodeId) {
         use crate::transpile::graph::{Op, Val};
-        let mut cells: std::collections::HashMap<u32, Val<N::Arith>> = Default::default();
+        let mut cells: std::collections::HashMap<u32, Val<N::A>> = Default::default();
         for &cell in &self.compiled.input_cells {
             let v = match chunk.cols[cell as usize].at(lane) {
-                AV::Num(p) => Val::Num(<N::Arith as Arithmetic>::point(p)),
-                AV::Ival(a, b) => Val::Num(<N::Arith as Arithmetic>::ival(a, b)),
+                AV::Num(p) => Val::Num(<N::A as Arithmetic>::point(p)),
+                AV::Ival(a, b) => Val::Num(<N::A as Arithmetic>::ival(a, b)),
                 AV::Bool(b) => Val::Bool(Some(b)),
                 AV::UBool => Val::Bool(None),
                 _ => continue,
@@ -976,7 +976,7 @@ impl<N: KernelLanes> Registry<N> {
         };
         let build = &build;
         let t_trace = std::time::Instant::now();
-        let refs = crate::trace::lower::lattice_kernel_refs::<N::Arith>(opts, s)
+        let refs = crate::trace::lower::lattice_kernel_refs::<N::A>(opts, s)
             .context("retracing the start room for ASM kernels")?;
         let trace_s = t_trace.elapsed().as_secs_f64();
         let t_asm = std::time::Instant::now();
@@ -1122,7 +1122,7 @@ fn apply_union<N: KernelLanes>(kernel: &mut AsmKernel<N>, unions: &HashMap<u64, 
 
 /// Assemble ONE frame (gcc + dlopen) and map its bodies onto output slots;
 /// `tag` distinguishes a shape's region kernels.
-fn build_one_shape<N: KernelLanes>(r: &crate::trace::lower::LoweredFrame<N::Arith>, si: usize, tag: &str, build: &BuildOptions) -> Result<(u64, AsmKernel<N>)> {
+fn build_one_shape<N: KernelLanes>(r: &crate::trace::lower::LoweredFrame<N::A>, si: usize, tag: &str, build: &BuildOptions) -> Result<(u64, AsmKernel<N>)> {
     let shape = r.frame.in_rt2.shape_hash_of();
     let room = Room { cache: r.cache.clone() };
     let t_fuse = std::time::Instant::now();
@@ -1371,7 +1371,7 @@ fn pos_sources<N: EngineNum>(template: &Rt2<N>, fields: &[AsmField]) -> Result<O
 
 /// The accumulator recipe for one outcome, with `shape_hash` and its key's
 /// uniform fields.
-fn acc_template<N: KernelLanes>(r: &crate::trace::lower::LoweredFrame<N::Arith>, oi: usize) -> Result<AccTemplate<N>> {
+fn acc_template<N: KernelLanes>(r: &crate::trace::lower::LoweredFrame<N::A>, oi: usize) -> Result<AccTemplate<N>> {
     // Canonical: `block::skeleton` ends in `Rt2::canonicalize_ids`.
     let skeleton = reshape(&r.frame.outs[oi].rt2, 0);
     let shape_hash = skeleton.shape_hash_of();
@@ -1546,7 +1546,7 @@ fn build_registry_for_level<N: KernelLanes>(level: crate::abstraction::Level, s:
         .expect("asm-kernel builder panicked");
     match built {
         Ok(reg) => {
-            eprintln!("ASM kernels ENABLED ({level}, {}): {} start-room shapes assembled", <N::Arith as Arithmetic>::NAME, reg.len());
+            eprintln!("ASM kernels ENABLED ({level}, {}): {} start-room shapes assembled", <N::A as Arithmetic>::NAME, reg.len());
             reg
         }
         Err(e) => panic!("building ASM kernels for {level}: {e:#}"),

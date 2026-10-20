@@ -1,7 +1,7 @@
 //! `transpile::graph::Graph` -> AVX-512 GAS assembly: numeric, interval and
 //! tri-state boolean ops, bit for bit the arithmetic's own (checked by
 //! `super::tests`). Lower to SSA over vregs (GVN), list-schedule,
-//! linear-scan allocate, emit. Per arithmetic (`AsmArith`): 16.16 lowers to
+//! linear-scan allocate, emit. Per arithmetic (`GraphArith::compile_kernel`): 16.16 lowers to
 //! 16 `i32` lanes a zmm (this file), the doubles to 8 `f64` lanes (`float`),
 //! whose body runs twice per 16-lane call; the boolean layer, scheduler,
 //! allocator and emitter are shared.
@@ -2195,25 +2195,17 @@ fn constant_key(mn: &str, ops: &str, a: &str) -> Option<String> {
     }
 }
 
-/// An arithmetic the kernels compile: its lowering of a graph to the shared
-/// instruction stream (`compile_with`).
-pub trait AsmArith: GraphArith {
-    fn compile_kernel(g: &Graph<Self>, roots: &[NodeId], sym: &str, opts: super::AsmOptions) -> Result<Compiled>;
+/// 16.16's kernel (`GraphArith::compile_kernel`).
+pub(crate) fn compile_fixed(g: &Graph<Fixed>, roots: &[NodeId], sym: &str, opts: super::AsmOptions) -> Result<Compiled> {
+    compile_with(g, roots, sym, opts, false, |lo, id| lo.lower_node(id))
 }
 
-impl AsmArith for Fixed {
-    fn compile_kernel(g: &Graph<Fixed>, roots: &[NodeId], sym: &str, opts: super::AsmOptions) -> Result<Compiled> {
-        compile_with(g, roots, sym, opts, false, |lo, id| lo.lower_node(id))
-    }
+/// The doubles' kernel, in two halves of eight lanes.
+pub(crate) fn compile_float(g: &Graph<Float>, roots: &[NodeId], sym: &str, opts: super::AsmOptions) -> Result<Compiled> {
+    compile_with(g, roots, sym, opts, true, |lo, id| lo.lower_node_f64(id))
 }
 
-impl AsmArith for Float {
-    fn compile_kernel(g: &Graph<Float>, roots: &[NodeId], sym: &str, opts: super::AsmOptions) -> Result<Compiled> {
-        compile_with(g, roots, sym, opts, true, |lo, id| lo.lower_node_f64(id))
-    }
-}
-
-pub fn compile<A: AsmArith>(
+pub fn compile<A: GraphArith>(
     g: &Graph<A>,
     roots: &[NodeId],
     sym: &str,

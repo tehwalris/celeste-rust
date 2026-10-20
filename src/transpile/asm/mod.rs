@@ -9,7 +9,8 @@ mod codegen;
 mod jit;
 
 pub use callout::{AsmCtx, CollisionEnv};
-pub use codegen::{compile, AsmArith, Compiled};
+pub use codegen::{compile, Compiled};
+pub(crate) use codegen::{compile_fixed, compile_float};
 pub use jit::{assemble, check_mxcsr, KernelFn, Loaded};
 
 use anyhow::Result;
@@ -27,7 +28,7 @@ pub struct AsmOptions {
 /// Compile `roots` of `g` to assembly, assemble it, and load it. Returns
 /// the layout metadata (each input cell's by its type in `g`) and the
 /// loaded function.
-pub fn compile_and_load<A: AsmArith>(
+pub fn compile_and_load<A: crate::transpile::garith::GraphArith>(
     g: &crate::transpile::graph::Graph<A>,
     roots: &[crate::transpile::graph::NodeId],
     tag: &str,
