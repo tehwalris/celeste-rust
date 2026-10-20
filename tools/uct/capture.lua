@@ -1,4 +1,4 @@
--- Frame capture for the headless UniversalClassicTas driver (UCT_CAPTURE=DIR).
+-- Frame capture for the headless UniversalClassicTas driver (validate.sh --capture DIR).
 --
 -- Replaces love.run with a deterministic loop: exactly one update and one
 -- draw per iteration (UCT's own loop is paced by the wall clock, so it may
@@ -33,7 +33,7 @@ end
 function C.setup(drv)
   local cart = pico8.cart
   C.drv = drv
-  C.dir = os.getenv("UCT_CAPTURE")
+  C.dir = require("driver_opts").capture
   C.bin = assert(io.open(C.dir .. "/frames.bin", "wb"))
   C.meta = assert(io.open(C.dir .. "/frames.jsonl", "w"))
   C.P = love.graphics.newCanvas(128, 128)

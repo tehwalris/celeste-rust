@@ -10,7 +10,7 @@ f-th `_update();_draw()` after `_init()`, and the input byte for frame f is
 
     pico8_diff/replay.py tas/room_1_0_exit_frame_100.txt
     pico8_diff/replay.py --inputs 0,0,...,42 [--frames N]
-    PICO8=~/pico-8/pico8 pico8_diff/replay.py ...
+    pico8_diff/replay.py --pico8 ~/pico-8/pico8 ...
 """
 import argparse
 import os
@@ -336,10 +336,14 @@ class NoCartOutput(RuntimeError):
     """PICO-8 ran the cart and it printed nothing (`run`)."""
 
 
-def run(inputs, frames, keep=False, **kw):
-    """Build the cart (`build_cart`'s keywords), run it on PICO-8 headless,
-    return its `@P8@` lines."""
-    pico8 = os.environ.get("PICO8", os.path.expanduser("~/pico-8/pico8"))
+PICO8 = os.path.expanduser("~/pico-8/pico8")
+
+
+def run(inputs, frames, keep=False, pico8=PICO8, **kw):
+    """Build the cart (`build_cart`'s keywords), run it on PICO-8 headless
+    (the binary `pico8`), return its `@P8@` lines."""
+    if "PICO8" in os.environ:
+        sys.exit("[replay] PICO8 in the environment: the binary is --pico8 (or run's `pico8`)")
     work = tempfile.mkdtemp(prefix="celeste-replay-")
     cart = os.path.join(work, "replay.p8")
     build_cart(inputs, frames, cart, **kw)
@@ -376,6 +380,7 @@ def main():
     ap.add_argument("--jank", type=int, help="the start room's loading frame from object J on (the jank model: a real transition's, Celia's IL load)")
     ap.add_argument("--dump", action="store_true", help="dump the start state (globals, every object's fields) before frame 1")
     ap.add_argument("--trace-objects", action="store_true", help="every object's position, remainder and phase on each frame line")
+    ap.add_argument("--pico8", default=PICO8, help=f"the PICO-8 binary (default {PICO8})")
     args = ap.parse_args()
     if args.inputs:
         inputs = [int(x) for x in args.inputs.split(",")]
@@ -386,7 +391,7 @@ def main():
     room = tuple(int(v) for v in args.room.split(",")) if args.room else None
     seeds = [float(v) for v in args.balloon_seeds.split(",") if v] if args.balloon_seeds is not None else None
     try:
-        lines = run(inputs, args.frames or len(inputs), args.keep, lua_path=args.lua, begin_game=args.begin_game, room=room, balloon_seeds=seeds,
+        lines = run(inputs, args.frames or len(inputs), args.keep, args.pico8, lua_path=args.lua, begin_game=args.begin_game, room=room, balloon_seeds=seeds,
                      one_dash=args.one_dash, jank=args.jank, dump=args.dump, trace_objects=args.trace_objects)
     except NoCartOutput as e:
         sys.exit(f"[replay] {e}")

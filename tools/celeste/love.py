@@ -1,6 +1,5 @@
 """UniversalClassicTas and Celia, headless (tools/uct/validate.sh,
 tools/celia/validate.sh), and the balloon seed nudges a file may need there."""
-import os
 import re
 import subprocess
 
@@ -8,24 +7,22 @@ from . import ROOT
 from .categories import one_dash
 
 
-def _run(script, dashes_env, level, path, cat):
-    env = dict(os.environ)
-    if one_dash(cat):
-        env[dashes_env] = "1"
-    return subprocess.run([f"{ROOT}/safe-run.sh", "--memory", "8G", "--", f"{ROOT}/tools/{script}", str(level), path], capture_output=True, text=True, env=env, timeout=1800).stdout
+def _run(script, level, path, cat):
+    dashes = ["--dashes", "1"] if one_dash(cat) else []
+    return subprocess.run([f"{ROOT}/safe-run.sh", "--memory", "8G", "--", f"{ROOT}/tools/{script}"] + dashes + [str(level), path], capture_output=True, text=True, timeout=1800).stdout
 
 
 def uct(level, path, cat):
     """UniversalClassicTas plays `path` (a death is a failure): (finished,
     its status, its input count; None without a result)."""
-    m = re.search(r"(finished, clean save|DID NOT FINISH[^,]*), (\d+) inputs", _run("uct/validate.sh", "UCT_DASHES", level, path, cat))
+    m = re.search(r"(finished, clean save|DID NOT FINISH[^,]*), (\d+) inputs", _run("uct/validate.sh", level, path, cat))
     return (bool(m) and m.group(1).startswith("finished")), (m.group(1) if m else "no result"), (int(m.group(2)) if m else None)
 
 
 def celia(level, path, cat):
     """Celia's IL load (with its loading jank) plays `path`: (finished, its
     status, its frame count; None without a result)."""
-    m = re.search(r"(finished|DID NOT FINISH[^,]*), (\d+)f", _run("celia/validate.sh", "CELIA_DASHES", level, path, cat))
+    m = re.search(r"(finished|DID NOT FINISH[^,]*), (\d+)f", _run("celia/validate.sh", level, path, cat))
     return (bool(m) and m.group(1).startswith("finished")), (m.group(1) if m else "no result"), (int(m.group(2)) if m else None)
 
 

@@ -161,9 +161,9 @@ ahead). Withdrawn (`tas/invalid`); 67f is the real-play optimum.
 ## Gemskip (2026-10-08 .. 10-16)
 
 `--category gemskipany`: the orb room (5,2) is won by its bare exit and
-every later room starts with ONE dash (the replay's `--one-dash`, UCT's
-`UCT_DASHES=1`). `gemskipnodiag` adds nodiag's rule, `gemskip100` 100%'s.
-Levels `r0sxhn,r0sxh` unless said; "OPTIMAL" = the last level's arc bound equals
+every later room starts with ONE dash (the replay's `--one-dash`, the
+tools' `validate.sh --dashes 1`). `gemskipnodiag` adds nodiag's rule,
+`gemskip100` 100%'s. Levels `r0sxhn,r0sxh` unless said; "OPTIMAL" = the last level's arc bound equals
 the witness's frame. Witnesses `tas/room_X_Y_gemskip*_frame_N.txt`,
 uploads `tas/tasdatabase/gemskip*/upload/`.
 

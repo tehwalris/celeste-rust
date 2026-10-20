@@ -193,7 +193,7 @@ runner sets it and searches the other feasible J's too).
 
 ```bash
 tools/uct/check_uploads.py [--cat CAT] FILE.tas...   # IL, UCT, Celia, chain, BOOT chain -> VALID/INVALID
-tools/celia/validate.sh LEVEL FILE.tas               # Celia headless (CELIA_DASHES=1 gemskip, CELIA_FIXP=1 fixed point)
+tools/celia/validate.sh [--dashes 1] [--fixp] LEVEL FILE.tas   # Celia headless (gemskip: one dash; 16.16)
 pico8_diff/chain.py CAT LEVEL FILE --boot            # real PICO-8 from 100m with the database's files
 pico8_diff/chain.py CAT LEVEL FILE --modes           # IL / jank / chain entry states diffed field by field
 pico8_diff/chain.py CAT LEVEL x --check-start target/quick/rewrite   # the search's start vs the boot chain

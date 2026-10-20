@@ -9,18 +9,21 @@ cart (lexaloffle cart 15133, a .p8.png: 2 bits per channel per pixel) and
 writes it into __gfx__, after checking that the lower half - which is map
 rows 32-63 and so part of the game - is identical to what is there already.
 
-    tools/uct/add_gfx.py [CELESTE.p8.png]   (default: download it)
+    tools/uct/add_gfx.py [CELESTE.p8.png] [--uct DIR]   (default: download it)
 """
-import io, os, sys, urllib.request
+import argparse, io, os, sys, urllib.request
 from PIL import Image
 
-UCT = os.environ.get("UCT", os.path.expanduser("~/src/github.com/gonengazit/UniversalClassicTas"))
-CART = f"{UCT}/CelesteTAS/carts/celeste.p8"
 URL = "https://www.lexaloffle.com/bbs/cposts/1/15133.p8.png"
 
 
 def main():
-    data = open(sys.argv[1], "rb").read() if len(sys.argv) > 1 else urllib.request.urlopen(URL).read()
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("png", nargs="?", help="the original cart's .p8.png (default: download it)")
+    ap.add_argument("--uct", default=os.path.expanduser("~/src/github.com/gonengazit/UniversalClassicTas"), help="the UCT clone")
+    a = ap.parse_args()
+    CART = f"{a.uct}/CelesteTAS/carts/celeste.p8"
+    data = open(a.png, "rb").read() if a.png else urllib.request.urlopen(URL).read()
     px = Image.open(io.BytesIO(data)).convert("RGBA").tobytes()
     rom = bytes(((px[i + 3] & 3) << 6) | ((px[i] & 3) << 4) | ((px[i + 1] & 3) << 2) | (px[i + 2] & 3) for i in range(0, len(px), 4))
     gfx = ["".join(f"{v & 15:x}{v >> 4:x}" for v in rom[row * 64:(row + 1) * 64]) for row in range(128)]

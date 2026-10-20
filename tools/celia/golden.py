@@ -10,7 +10,7 @@ loading jank and its own seeds; plans/float.md).
     tools/celia/golden.py local all                our LOCAL witnesses (tools/uct/golden.py)
 
 Per file: played in Celia with the exact trace (exact.lua via validate.sh:
-CELIA_EXACT), its buffered jumps re-timed from Celia's own run and checked
+--exact), its buffered jumps re-timed from Celia's own run and checked
 as tools/uct/golden.py does (its `canonical`; Celia's start is not UCT's,
 so neither is the run). The trace, the draw-only objects dropped, goes to
 gates/celia/CAT_LEVEL.trace.zst and a line to gates/celia/manifest.txt:
@@ -42,10 +42,8 @@ REWRITE = os.path.join(ROOT, "target", "quick", "rewrite")
 
 
 def celia(level, path, cat, trace):
-    env = dict(os.environ, CELIA_EXACT=trace)
-    if categories.one_dash(cat):
-        env["CELIA_DASHES"] = "1"
-    out = subprocess.run([f"{ROOT}/safe-run.sh", "--memory", "4G", "--", f"{HERE}/validate.sh", str(level), path], capture_output=True, text=True, env=env, cwd=ROOT)
+    dashes = ["--dashes", "1"] if categories.one_dash(cat) else []
+    out = subprocess.run([f"{ROOT}/safe-run.sh", "--memory", "4G", "--", f"{HERE}/validate.sh", "--exact", trace] + dashes + [str(level), path], capture_output=True, text=True, cwd=ROOT)
     line = [l for l in out.stdout.splitlines() if l.startswith(f"level {level} ")]
     return line[-1].split(": ", 1)[1].split(",")[0] if line else f"no result ({out.returncode})"
 

@@ -1,4 +1,4 @@
--- Headless driver for UniversalClassicTas: go to level UCT_LEVEL, load
+-- Headless driver for UniversalClassicTas: go to level `opts.level`, load
 -- TAS/TAS<level>.tas from the save dir (W), restart (D), clean-save (U),
 -- wait for the playback to finish, report, quit.
 --
@@ -7,9 +7,12 @@
 -- room (its balloons re-drawn with rnd(1), NOT the file's seeds) and the
 -- clean save keeps recording, so a later attempt that happens to exit is
 -- saved as if the file had finished.
--- UCT_TRACE=1: one "[trace]" line per cart update of the playback (the
--- player, the balloons' offset and y), to compare with pico8_diff/replay.py.
-local D = {t = 0, phase = "start", n = tonumber(os.getenv("UCT_LEVEL")), pressed = 0, waited = 0}
+-- `opts` (driver_opts.lua, written by validate.sh from its flags): the
+-- level, `dashes` (the dash count key), `trace` (one "[trace]" line per
+-- cart update of the playback: the player, the balloons' offset and y, to
+-- compare with pico8_diff/replay.py).
+local opts = require("driver_opts")
+local D = {t = 0, phase = "start", n = opts.level, pressed = 0, waited = 0}
 local function press(k) love.keypressed(k) end
 local function player()
   for _, o in pairs(pico8.cart.objects) do
@@ -40,8 +43,8 @@ function D.tick()
       D.phase = "load"; D.mark = D.t
     end
   elseif D.phase == "load" and D.t > D.mark + 10 then
-    -- UCT_DASHES: the dash count key (0-3; the gemskip categories: 1).
-    if os.getenv("UCT_DASHES") then press(os.getenv("UCT_DASHES")) end
+    -- The dash count key (0-3; the gemskip categories: 1).
+    if opts.dashes then press(tostring(opts.dashes)) end
     print("[driver] at level index " .. tostring(pico8.cart.level_index() + 1) .. ", loading TAS")
     press("w"); D.phase = "restart"; D.mark = D.t
   elseif D.phase == "restart" and D.t > D.mark + 5 then
@@ -50,7 +53,7 @@ function D.tick()
     D.deaths = pico8.cart.deaths
     press("u"); D.phase = "wait"; D.mark = D.t
   elseif D.phase == "wait" then
-    if os.getenv("UCT_TRACE") and D.TAS.cart_update then trace() end
+    if opts.trace and D.TAS.cart_update then trace() end
     if pico8.cart.deaths ~= D.deaths then
       local p = player()
       print("[driver] DIED at keypress frame " .. D.TAS.keypress_frame .. (p and (", player " .. p.x .. "," .. p.y) or "") .. "; room " .. pico8.cart.room.x .. "," .. pico8.cart.room.y)

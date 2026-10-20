@@ -25,7 +25,7 @@ outside the repo (the test `trace::oracle::tests::the_local_goldens` replays
 them, and says SKIPPED where they are absent).
 
 Per file (the database's `classic/CAT/TAS<level>.tas`): run it in UCT with
-the exact trace (tools/uct/exact.lua via validate.sh: UCT_EXACT), re-time
+the exact trace (tools/uct/exact.lua via validate.sh --exact), re-time
 its buffered jumps (canonical_jumps.py) and, if any moved, run the re-timed
 file too, checking it makes the same run (the player's position, remainder
 and speed after every update, bit for bit) and leaves no buffered jump. The
@@ -55,10 +55,8 @@ DRAW_ONLY = {"smoke", "room_title", "lifeup", "message", "flag"}
 
 
 def uct(level, path, cat, trace):
-    env = dict(os.environ, UCT_EXACT=trace)
-    if categories.one_dash(cat):
-        env["UCT_DASHES"] = "1"
-    out = subprocess.run([f"{ROOT}/safe-run.sh", "--memory", "4G", "--", f"{HERE}/validate.sh", str(level), path], capture_output=True, text=True, env=env, cwd=ROOT)
+    dashes = ["--dashes", "1"] if categories.one_dash(cat) else []
+    out = subprocess.run([f"{ROOT}/safe-run.sh", "--memory", "4G", "--", f"{HERE}/validate.sh", "--exact", trace] + dashes + [str(level), path], capture_output=True, text=True, cwd=ROOT)
     line = [l for l in out.stdout.splitlines() if l.startswith(f"level {level} ")]
     return line[-1].split(": ", 1)[1].split(",")[0] if line else f"no result ({out.returncode})"
 
