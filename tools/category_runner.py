@@ -6,17 +6,17 @@ and verify every result end to end.
 
 JOBS.json: a list of {"cat": "nodiag", "room": "0,0", "name": "100m",
 "offset": 27, "levels": "r0sxhn,r0sxh", "l1": true, "mem": "60G"} (optional:
-"flags": more flags for the search, e.g. ["--split-frame"] (an "env" of
-CELESTE_* variables is refused, as the binaries refuse them); "tag";
+"flags": more flags for the search, e.g. ["--split-frame"]; "tag";
 "timeout"; "reuse": a level-0 tree directory, moved in when it exists and moved back
 there when the job ends - so jobs can count horizons up on one kept tree;
 "to": a horizon H instead of the reference - `--frames H` without
 `--ceiling`, level -1 at H, and a refutation is a result (the optimum is
 above H); "keep_tree": leave the tree
 in OUTDIR for a later job's "reuse"; "witness": a file of our inputs to verify,
-no search); re-read
+no search; "jank": J or "none" instead of the boot chain's); re-read
 before every job, so jobs can be appended while it runs; a job whose key is
-already in OUTDIR/results.jsonl is skipped.
+already in OUTDIR/results.jsonl is skipped. A job with a key not listed here
+is refused (`check_job`).
 
 Per job:
  0. the room's start as real play enters it: its loading frame from object
@@ -58,18 +58,39 @@ import check_uploads  # noqa: E402
 UI = "/var/tmp/celeste-ui/data"
 
 
-def job_flags(job):
-    """The job's own search flags; an "env" (CELESTE_* variables) is
-    refused, as the binaries refuse the environment."""
-    if "env" in job:
-        raise SystemExit(f"job {job}: \"env\" is gone (the binaries refuse CELESTE_* variables): give its settings in \"flags\"")
-    return list(job.get("flags", []))
+# A job's keys: what a jobs file gives, and what `expand` adds.
+JOB_KEYS = {"cat", "room", "name", "offset", "levels", "l1", "mem", "flags", "tag", "timeout", "reuse", "to", "keep_tree", "witness", "jank"}
+EXPANDED_KEYS = {"jank_classes", "celia_jank", "search_only"}
+
+
+def check_job(job):
+    """A job from the jobs file, refused with a key it does not know (a
+    typo is not silently ignored).
+
+    >>> check_job({"cat": "100", "room": "4,0", "name": "500m", "offset": 25, "levels": "r0sxh", "flgs": []})
+    Traceback (most recent call last):
+    ...
+    SystemExit: job 100/500m: unknown keys ['flgs'] (the module's doc lists them)
+    """
+    bad = sorted(set(job) - JOB_KEYS)
+    if bad:
+        raise SystemExit(f"job {job.get('cat')}/{job.get('name')}: unknown keys {bad} (the module's doc lists them)")
+    return job
 
 
 def replay_exit(room, inputs, seeds, cat, jank=None):
     """Replay `inputs` in the ORIGINAL cart, the room started as the search
     starts it (its loading frame from object `jank`): the frame the room
-    changes during (None: never), and the frames."""
+    changes during (None: never), and the frames. A replay that fails
+    raises (`pico8.replay`): a crash is never a run that does not exit.
+
+    >>> real, pico8.REPLAY = pico8.REPLAY, "/bin/false"
+    >>> replay_exit("1,0", [0], [], "any")
+    Traceback (most recent call last):
+    ...
+    RuntimeError: the PICO-8 replay failed (exit 1): ''
+    >>> pico8.REPLAY = real
+    """
     fs = pico8.replay(rooms.parse(room), inputs, len(inputs) + 3, seeds, cat, jank)
     return pico8.exit_frame(fs, rooms.parse(room)), fs
 
@@ -124,7 +145,7 @@ def run(job, outdir, binary):
     open(prefer, "w").write(",".join(map(str, [0] * prologue + dbin)))
     # 2. the search
     def search(l1):
-        flags = ["--category", cat] + job_flags(job)
+        flags = ["--category", cat] + list(job.get("flags", []))
         flags += ["--loading-jank", str(jank) if jank else "none"]
         # The concrete steps under the community file's balloon seeds ([]: 0):
         # the witness is then one real run under them.
@@ -258,12 +279,8 @@ def run(job, outdir, binary):
                 continue
             mine = os.path.join(jd, f"ours-{entry['file']}")
             open(mine, "w").write(tasdb.text(sd, ours[cut:]))
-            # A replay that fails (PICO-8 printed nothing; a chain.py
-            # SystemExit) is this candidate's result, not the runner's end.
-            try:
-                row = check_uploads.check(mine, False, cat, binary)
-            except (Exception, SystemExit) as ex:
-                row = f"check failed: {type(ex).__name__}: {ex}"[:300]
+            # A replay or tool run that fails fails the job (`run_job`).
+            row = check_uploads.check(mine, False, cat, binary)
             tried.append((cut, sd, row))
             if row.endswith("\tVALID"):
                 res["real_play"], res["upload_cut"] = row, cut
@@ -304,6 +321,23 @@ def run(job, outdir, binary):
             res["ui_error"] = str(ex)[:200]
     drop_tree()
     return res
+
+
+def run_job(job, outdir, binary, run=run):
+    """`run`, where any failure - a replay that crashed or printed nothing,
+    a tool without a result, a chain that cannot run (SystemExit too) -
+    FAILS the job: a `runner error` status, never a result built on a
+    missing one.
+
+    >>> def crashing(job, outdir, binary):
+    ...     raise RuntimeError("the PICO-8 replay failed (exit 1): 'runtime error line 663'")
+    >>> run_job({"cat": "100", "name": "500m"}, "/tmp", "rewrite", crashing)
+    {'key': '100/500m', 'status': "runner error: RuntimeError: the PICO-8 replay failed (exit 1): 'runtime error line 663'"}
+    """
+    try:
+        return run(job, outdir, binary)
+    except (Exception, SystemExit) as ex:
+        return {"key": f"{job['cat']}/{job['name']}{job.get('tag', '')}", "status": f"runner error: {type(ex).__name__}: {ex}"[:300]}
 
 
 def ui_label(room, label, opt, tasn, ref, res):
@@ -367,9 +401,6 @@ def main():
     ap.add_argument("outdir")
     ap.add_argument("--bin", help="the rewrite binary (default OUTDIR/rewrite: a copy, so a rebuild cannot swap it mid-queue)")
     a = ap.parse_args()
-    for var in ("RUNNER_BIN", "CONCRETE_RUN"):
-        if var in os.environ:
-            raise SystemExit(f"category_runner: {var} is gone: --bin PATH (rewrite search, room and starts)")
     outdir = a.outdir
     binary = a.bin or f"{outdir}/rewrite"
     os.makedirs(outdir, exist_ok=True)
@@ -379,7 +410,7 @@ def main():
         done = set()
         if os.path.exists(results):
             done = {json.loads(l)["key"] for l in open(results) if l.strip()}
-        todo = [j for job in json.load(open(a.jobs)) for j in expand(job, cache, binary) if f"{j['cat']}/{j['name']}{j.get('tag', '')}" not in done]
+        todo = [j for job in json.load(open(a.jobs)) for j in expand(check_job(job), cache, binary) if f"{j['cat']}/{j['name']}{j.get('tag', '')}" not in done]
         if not todo:
             print("all jobs done", flush=True)
             return
@@ -391,13 +422,7 @@ def main():
             return
         job = todo[0]
         print(f"[{time.strftime('%H:%M')}] {job['cat']} {job['name']} {job['room']}", flush=True)
-        try:
-            res = run(job, outdir, binary)
-        except (Exception, SystemExit) as ex:
-            # SystemExit too: chain.py and replay.py exit on what they cannot
-            # run, and `except Exception` would end the runner with no
-            # results line.
-            res = {"key": f"{job['cat']}/{job['name']}{job.get('tag', '')}", "status": f"runner error: {type(ex).__name__}: {ex}"[:300]}
+        res = run_job(job, outdir, binary)
         res["end"] = time.strftime("%H:%M")
         with open(results, "a") as f:
             f.write(json.dumps(res) + "\n")

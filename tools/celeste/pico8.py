@@ -59,8 +59,21 @@ def replay(room, inputs, nframes, seeds, cat, jank=None, original=True):
     """Replay `inputs` on a real PICO-8 from `room`'s load, as the search
     starts it (its loading frame from object `jank`), under the `[seeds]`
     list `seeds` (`[]`: every balloon 0, as UniversalClassicTas): the
-    ORIGINAL cart, or the minimal one (the search's Lua). Its frames."""
+    ORIGINAL cart, or the minimal one (the search's Lua). Its frames. A
+    replay that fails (the cart crashed, PICO-8 printed nothing) raises: its
+    frames would read as a run that never leaves the room.
+
+    >>> import celeste.pico8 as p
+    >>> real, p.REPLAY = p.REPLAY, "/bin/false"
+    >>> p.replay((1, 0), [0], 1, [], "any")
+    Traceback (most recent call last):
+    ...
+    RuntimeError: the PICO-8 replay failed (exit 1): ''
+    >>> p.REPLAY = real
+    """
     cmd = [REPLAY, "--room", f"{room[0]},{room[1]}", "--inputs", ",".join(map(str, inputs)), "--frames", str(nframes), "--balloon-seeds", ",".join(seeds) or "0"]
     cmd += (["--lua", ORIG, "--begin-game"] if original else []) + replay_flags(cat) + (["--jank", str(jank)] if jank else [])
-    out = subprocess.run(cmd, capture_output=True, text=True, cwd=ROOT, timeout=900).stdout
-    return frames(out.splitlines())
+    out = subprocess.run(cmd, capture_output=True, text=True, cwd=ROOT, timeout=900)
+    if out.returncode != 0:
+        raise RuntimeError(f"the PICO-8 replay failed (exit {out.returncode}): {out.stderr.strip()[-500:]!r}")
+    return frames(out.stdout.splitlines())

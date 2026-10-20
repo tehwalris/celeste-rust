@@ -331,7 +331,27 @@ def build_cart(inputs, frames, out, lua_path=None, begin_game=False, room=None, 
 
 
 class NoCartOutput(RuntimeError):
-    """PICO-8 ran the cart and it printed nothing (`run`)."""
+    """PICO-8 ran the cart and it did not run to its end (`cart_lines`)."""
+
+
+def cart_lines(stdout, stderr, cart):
+    r"""The `@P8@` lines of a run, its `end` line dropped. The driver prints
+    `end` last, always: without it the cart did not run to its end (a
+    runtime error, a halt) and its partial output is no result - raised,
+    not exited, so a caller in the same process (category_runner,
+    check_uploads) fails with it (a SystemExit passes `except Exception`).
+
+    >>> cart_lines("RUNNING: c.p8\n@P8@ f1 room 1,0\n@P8@ end\n", "", "c.p8")
+    ['f1 room 1,0']
+    >>> cart_lines("@P8@ f1 room 1,0\nruntime error line 663\n", "", "c.p8")
+    Traceback (most recent call last):
+    ...
+    replay.NoCartOutput: the cart did not run to its end (c.p8); pico8 said: '@P8@ f1 room 1,0\nruntime error line 663'
+    """
+    lines = [l[len("@P8@ "):] for l in stdout.splitlines() if l.startswith("@P8@ ")]
+    if lines[-1:] != ["end"]:
+        raise NoCartOutput(f"the cart did not run to its end ({cart}); pico8 said: {(stdout[-500:] + stderr[-500:]).strip()!r}")
+    return lines[:-1]
 
 
 PICO8 = os.path.expanduser("~/pico-8/pico8")
@@ -351,13 +371,7 @@ def run(inputs, frames, keep=False, pico8=PICO8, **kw):
     except subprocess.TimeoutExpired as e:
         # PICO-8 halts on a cart it refuses ("program too large") and waits.
         sys.exit(f"[replay] pico8 timed out; it said: {(e.stdout or b'')[-500:]!r}")
-    lines = [l[len("@P8@ "):] for l in proc.stdout.splitlines() if l.startswith("@P8@ ")]
-    if not lines:
-        # The driver always prints its `end` line: none means the cart did not
-        # run to its end (a runtime error, a halt). Raised, not exited, so a
-        # caller in the same process (category_runner, check_uploads) can
-        # report it: a SystemExit passes `except Exception`.
-        raise NoCartOutput(f"no cart output ({cart}); pico8 said: {(proc.stdout[-500:] + proc.stderr[-500:]).strip()!r}")
+    lines = cart_lines(proc.stdout, proc.stderr, cart)
     if not keep:
         os.remove(cart)
         os.rmdir(work)
@@ -394,8 +408,7 @@ def main():
     except NoCartOutput as e:
         sys.exit(f"[replay] {e}")
     for l in lines:
-        if l != "end":
-            print(l)
+        print(l)
 
 
 if __name__ == "__main__":
