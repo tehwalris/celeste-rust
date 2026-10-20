@@ -3,8 +3,6 @@
 //! and its costs) and one backward frame (`backward`), each repeatable.
 
 use anyhow::{Context, Result};
-use celeste_core::lua_f64::LuaF64;
-use celeste_engine::runtime2::P8;
 use celeste_rust::abstraction::Level;
 use celeste_rust::frame::FrameStep;
 use celeste_rust::search::rem::Rem;
@@ -102,21 +100,15 @@ pub fn run(run: &Settings, c: Command) -> Result<()> {
     match c {
         Command::Frame(a) => {
             let t = TreeDir::open(&a.tree, run)?;
-            match t.settings.arith {
-                Arith::Fixed => bench_frame::<celeste_rust::compiled::FrameEngine, P8>(&t, &a),
-                Arith::Float(_) => {
-                    anyhow::ensure!(a.metrics.is_none(), "a float tree: bench frame --metrics (the kernel census) is 16.16's");
-                    bench_frame::<celeste_rust::compiled::FloatKernels, LuaF64>(&t, &a)
-                }
+            if t.settings.arith != Arith::Fixed {
+                anyhow::ensure!(a.metrics.is_none(), "a float tree: bench frame --metrics (the kernel census) is 16.16's");
             }
+            celeste_rust::with_arith!(t.settings.arith, N => bench_frame::<celeste_rust::compiled::Kernels<N>, N>(&t, &a))
         }
         Command::Backward(a) => {
             let t = TreeDir::open(&a.tree, run)?;
             let horizon = t.frame(a.steps)?;
-            match t.settings.arith {
-                Arith::Fixed => bench_backward::<P8>(&t, horizon, a.step, a.reps),
-                Arith::Float(_) => bench_backward::<LuaF64>(&t, horizon, a.step, a.reps),
-            }
+            celeste_rust::with_arith!(t.settings.arith, N => bench_backward::<N>(&t, horizon, a.step, a.reps))
         }
     }
 }

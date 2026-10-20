@@ -855,10 +855,7 @@ pub fn export(checkpoint_dir: &Path, out: &Path, threads: usize, arc: Option<&Pa
             crate::metrics::mem_phase(&format!("export-ui {}: marks scanned", dir.display()));
         }
         // In the tree's own arithmetic (a dual search's halves differ).
-        let (data, layers) = match crate::settings::recorded_arith(&dir)? {
-            crate::settings::Arith::Fixed => read_tree::<celeste_engine::runtime2::P8>(&dir, &maps, threads),
-            crate::settings::Arith::Float(_) => read_tree::<celeste_core::lua_f64::LuaF64>(&dir, &maps, threads),
-        }
+        let (data, layers) = crate::with_arith!(crate::settings::recorded_arith(&dir)?, N => read_tree::<N>(&dir, &maps, threads))
         .with_context(|| format!("frames of {}", dir.display()))?;
         // Every marked state is a state of the tree.
         for ((m, l), layer) in maps.iter().zip(&set_levels).zip(&layers) {

@@ -29,7 +29,7 @@ use std::path::{Path as FsPath, PathBuf};
 
 use anyhow::{anyhow, bail, ensure, Result};
 
-use celeste_core::arith::{Arithmetic, Fixed, Float};
+use celeste_core::arith::Arithmetic;
 
 use crate::trace::domain::{Domain, Symbolic};
 use crate::trace::heap::Value;
@@ -1625,10 +1625,7 @@ impl Graph1 {
 }
 
 fn build_in(spd_px: i32, threads: usize, rep: &mut String, s: &crate::settings::Settings) -> Result<Built> {
-    match s.arith {
-        crate::settings::Arith::Fixed => build::<Fixed>(spd_px, threads, rep, s),
-        crate::settings::Arith::Float(_) => build::<Float>(spd_px, threads, rep, s),
-    }
+    crate::with_arith!(s.arith, N => build::<N>(spd_px, threads, rep, s))
 }
 
 /// The table in the arithmetic `A`: lattice walk, spawn chain, passes to
@@ -2017,10 +2014,7 @@ pub fn probe(opts: &Opts, s: &crate::settings::Settings) -> Result<String> {
     // The soundness check against the recorded transitions: every edge of
     // the tree, as (source cell, target cell).
     use crate::search::pos_graph::{cell_xy, NO_CELL};
-    let pairs = match s.arith {
-        crate::settings::Arith::Fixed => recorded_cell_pairs::<celeste_engine::runtime2::P8>(&opts.level_dir, opts.threads)?,
-        crate::settings::Arith::Float(_) => recorded_cell_pairs::<celeste_core::lua_f64::LuaF64>(&opts.level_dir, opts.threads)?,
-    };
+    let pairs = crate::with_arith!(s.arith, N => recorded_cell_pairs::<N>(&opts.level_dir, opts.threads)?);
     let mut pos_edges: HashSet<(i16, i16, i16, i16)> = HashSet::new();
     let mut exit_src: HashSet<(i16, i16)> = HashSet::new();
     for w in chain.windows(2) {
@@ -2066,10 +2060,7 @@ pub fn probe(opts: &Opts, s: &crate::settings::Settings) -> Result<String> {
         say!(rep, "  not allowed: {b}")?;
     }
 
-    match s.arith {
-        crate::settings::Arith::Fixed => compare_with_tree::<celeste_engine::runtime2::P8>(opts, &by_hash, &g1, &sound, &mut rep)?,
-        crate::settings::Arith::Float(_) => compare_with_tree::<celeste_core::lua_f64::LuaF64>(opts, &by_hash, &g1, &sound, &mut rep)?,
-    }
+    crate::with_arith!(s.arith, N => compare_with_tree::<N>(opts, &by_hash, &g1, &sound, &mut rep)?);
     say!(rep, "\ntotal {:.1} s", t_all.elapsed().as_secs_f64())?;
     Ok(rep)
 }

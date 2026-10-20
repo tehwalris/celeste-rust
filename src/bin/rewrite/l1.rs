@@ -4,7 +4,7 @@
 
 use anyhow::{anyhow, Context, Result};
 use celeste_rust::search::level_minus_one;
-use celeste_rust::settings::{Arith, Settings};
+use celeste_rust::settings::Settings;
 
 #[derive(clap::Subcommand)]
 pub enum Command {
@@ -91,10 +91,7 @@ pub fn run(cfg: &Settings, c: Command) -> Result<()> {
         }
         Command::Check(a) => {
             let bytes = celeste_rust::concrete::read_inputs(&a.inputs)?;
-            let rep = match cfg.arith {
-                Arith::Fixed => level_minus_one::check_route::<celeste_engine::runtime2::P8>(&bytes, a.frames, a.spd, cfg)?,
-                Arith::Float(_) => level_minus_one::check_route::<celeste_core::lua_f64::LuaF64>(&bytes, a.frames, a.spd, cfg)?,
-            };
+            let rep = celeste_rust::with_arith!(cfg.arith, N => level_minus_one::check_route::<N>(&bytes, a.frames, a.spd, cfg)?);
             print!("{rep}");
             Ok(())
         }

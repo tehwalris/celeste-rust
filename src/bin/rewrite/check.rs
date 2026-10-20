@@ -11,11 +11,9 @@ use celeste_rust::frame::{widen_rt2_to, wins_of, FrameStep};
 use celeste_rust::search::inspect::{brief, cell_names, project_all, project_onto, project_row, Proj};
 use celeste_rust::search::rem::Rem;
 use celeste_rust::search::tree::TreeDir;
-use celeste_rust::settings::{Arith, Settings};
+use celeste_rust::settings::Settings;
 use celeste_rust::storage::layer::Tree;
 use celeste_rust::storage::Sk;
-use celeste_core::lua_f64::LuaF64;
-use celeste_engine::runtime2::P8;
 use std::path::PathBuf;
 
 use crate::{where_, KernelsNew, Rows};
@@ -177,26 +175,17 @@ pub fn run(run: &Settings, c: Command) -> Result<()> {
     match c {
         Command::Ref(a) => {
             let t = TreeDir::open(&a.tree, run)?;
-            match t.settings.arith {
-                Arith::Fixed => ref_check::<celeste_rust::compiled::FrameEngine, celeste_core::arith::Fixed>(&t, &a),
-                Arith::Float(_) => ref_check::<celeste_rust::compiled::FloatKernels, celeste_core::arith::Float>(&t, &a),
-            }
+            celeste_rust::with_arith!(t.settings.arith, N => ref_check::<celeste_rust::compiled::Kernels<N>, N>(&t, &a))
         }
         Command::Arcs(a) => {
             let t = TreeDir::open(&a.tree, run)?;
             let o = celeste_rust::search::arc_check::Opts { dir: &t.dir, from: a.from_step, to: t.frame(a.to_step)?, samples: a.samples, level: t.level, fault: a.fault.as_deref(), path_cap: a.path_cap, settings: &t.settings };
-            match t.settings.arith {
-                Arith::Fixed => celeste_rust::search::arc_check::run::<P8>(&o),
-                Arith::Float(_) => celeste_rust::search::arc_check::run::<LuaF64>(&o),
-            }
+            celeste_rust::with_arith!(t.settings.arith, N => celeste_rust::search::arc_check::run::<N>(&o))
         }
         Command::Widen(a) => {
             let t = TreeDir::open(&a.tree, run)?;
             let frame = t.frame(a.step)?;
-            match t.settings.arith {
-                Arith::Fixed => widen_check::<celeste_rust::compiled::FrameEngine, P8>(&t, frame, a.emitted),
-                Arith::Float(_) => widen_check::<celeste_rust::compiled::FloatKernels, LuaF64>(&t, frame, a.emitted),
-            }
+            celeste_rust::with_arith!(t.settings.arith, N => widen_check::<celeste_rust::compiled::Kernels<N>, N>(&t, frame, a.emitted))
         }
         Command::Known(a) => {
             let inputs = celeste_rust::concrete::read_inputs(&a.inputs)?;
@@ -207,10 +196,7 @@ pub fn run(run: &Settings, c: Command) -> Result<()> {
             let t = TreeDir::open(&a.tree, run)?;
             let to = t.frame(a.steps)?;
             let tm = std::time::Instant::now();
-            let frames = match t.settings.arith {
-                Arith::Fixed => replay::<P8>(&t.dir, to, t.settings.threads())?,
-                Arith::Float(_) => replay::<LuaF64>(&t.dir, to, t.settings.threads())?,
-            };
+            let frames = celeste_rust::with_arith!(t.settings.arith, N => replay::<N>(&t.dir, to, t.settings.threads())?);
             println!("frame states edges");
             for (f, x) in frames.iter().enumerate() {
                 println!("f{f:03} {} {}", x.states, x.edges);

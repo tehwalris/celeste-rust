@@ -19,7 +19,7 @@ use super::result::{DualResult, LevelResult, SearchResult, Verdict};
 use crate::abstraction::Level;
 use crate::compiled::KernelLanes;
 use crate::frame::{MarkFilter, Visited};
-use crate::settings::{Arith, Settings};
+use crate::settings::Settings;
 
 pub struct SearchSpec<'a> {
     /// The run's settings (a dual search's fixed half: real play).
@@ -74,10 +74,7 @@ pub fn run(spec: &SearchSpec) -> Result<SearchResult> {
         dual: spec.dual.map(|f| DualResult { float: f.arith.to_string(), float_loading_jank: f.loading_jank, fixed_exit: None }),
     };
     let verdict = match spec.dual {
-        None => match s.arith {
-            Arith::Fixed => single::<P8>(spec, &levels, &mut res)?,
-            Arith::Float(_) => single::<LuaF64>(spec, &levels, &mut res)?,
-        },
+        None => crate::with_arith!(s.arith, N => single::<N>(spec, &levels, &mut res)?),
         Some(float) => dual(spec, float, &levels, &mut res)?,
     };
     res.verdict = verdict;
@@ -458,10 +455,7 @@ pub fn check_known(dir: &Path, inputs: &[u8], horizon: Option<u32>, run: &Settin
         anyhow::ensure!(lvl.to_string() == Level::parse(spec).map_err(|e| anyhow::anyhow!(e))?.to_string(), "{}: level {lvl}, the search's record says {spec}", d.display());
         trees.push((d, s, lvl));
     }
-    match trees[0].1.arith {
-        Arith::Fixed => check_known_in::<P8>(&trees, inputs, horizon),
-        Arith::Float(_) => check_known_in::<LuaF64>(&trees, inputs, horizon),
-    }
+    crate::with_arith!(trees[0].1.arith, N => check_known_in::<N>(&trees, inputs, horizon))
 }
 
 fn check_known_in<N: KernelLanes>(trees: &[(std::path::PathBuf, Settings, Level)], inputs: &[u8], horizon: u32) -> Result<()> {
@@ -502,7 +496,7 @@ mod tests {
         let mut runs: Vec<String> = Vec::new();
         for threads in [3, 32] {
             let fixed = Settings { win_at: Some((9, 9, 101, 101)), threads: Some(threads), ..Settings::default() };
-            let float = Settings { arith: Arith::Float(crate::settings::FloatTool::Celia), ..fixed.clone() }.resolved().expect("float settings");
+            let float = Settings { arith: crate::settings::Arith::Float(crate::settings::FloatTool::Celia), ..fixed.clone() }.resolved().expect("float settings");
             let dual = fixed.float_half(crate::settings::FloatTool::Celia, None).expect("the float half");
             let mut lines = Vec::new();
             for (name, s, half) in [("search fixed", &fixed, None), ("search float", &float, None), ("dual", &fixed, Some(&dual))] {

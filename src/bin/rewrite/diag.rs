@@ -5,7 +5,6 @@
 
 use anyhow::Result;
 use celeste_engine::runtime2::{Rt2, P8};
-use celeste_core::lua_f64::LuaF64;
 use celeste_rust::frame::wins_of;
 use celeste_rust::search::inspect::cell_names;
 use celeste_rust::search::tree::TreeDir;
@@ -90,13 +89,10 @@ pub fn ckhash(run: &Settings, a: CkhashArgs) -> Result<()> {
     let t = TreeDir::open(&a.tree, run)?;
     let (dir, to, cfg) = (&t.dir, t.frame(a.steps)?, &t.settings);
     let (top_cells, edges, hulls, dump_edges) = (a.cells, a.edges, a.hulls, a.dump_edges);
-    let lines = match cfg.arith {
-        Arith::Fixed => celeste_rust::storage::fingerprint::<P8>(dir, to, edges, hulls, cfg.threads())?,
-        Arith::Float(_) => {
-            anyhow::ensure!(dump_edges.is_none() && top_cells.is_none(), "--dump-edges, --cells: fixed trees only so far");
-            celeste_rust::storage::fingerprint::<LuaF64>(dir, to, edges, hulls, cfg.threads())?
-        }
-    };
+    if cfg.arith != Arith::Fixed {
+        anyhow::ensure!(dump_edges.is_none() && top_cells.is_none(), "--dump-edges, --cells: fixed trees only so far");
+    }
+    let lines = celeste_rust::with_arith!(cfg.arith, N => celeste_rust::storage::fingerprint::<N>(dir, to, edges, hulls, cfg.threads())?);
     for line in lines {
         println!("{line}");
     }

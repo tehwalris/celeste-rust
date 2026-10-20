@@ -32,6 +32,25 @@ pub enum Arith {
     Float(FloatTool),
 }
 
+/// `$body` with `$N` the type of `$arith`'s numbers (`Fixed`: `Pico8Num`,
+/// `Float`: `LuaF64`): THE dispatch from a run's setting to the code
+/// monomorphized for it.
+#[macro_export]
+macro_rules! with_arith {
+    ($arith:expr, $N:ident => $body:expr) => {
+        match $arith {
+            $crate::settings::Arith::Fixed => {
+                type $N = $crate::arith::Fixed;
+                $body
+            }
+            $crate::settings::Arith::Float(_) => {
+                type $N = $crate::arith::Float;
+                $body
+            }
+        }
+    };
+}
+
 /// The float tool a float run models (`--arith float-celia|float-uct`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FloatTool {

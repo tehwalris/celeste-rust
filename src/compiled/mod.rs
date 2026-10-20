@@ -107,9 +107,6 @@ pub struct Kernels<N: KernelLanes = celeste_core::pico8_num::Pico8Num> {
 /// 16.16's kernels: the real game's.
 pub type FrameEngine = Kernels<celeste_core::pico8_num::Pico8Num>;
 
-/// The doubles' kernels (plans/float.md, "The kernels' safety").
-pub type FloatKernels = Kernels<celeste_core::lua_f64::LuaF64>;
-
 impl<N: KernelLanes> Kernels<N> {
     /// The engine for the start room of `settings`, its frames at `level`.
     pub fn new(settings: &crate::settings::Settings, level: crate::abstraction::Level) -> Result<Self> {
