@@ -152,14 +152,9 @@ mod tests {
     /// decidable; at an unknown position it genuinely is not.
     #[test]
     fn a_collision_test_is_decided_at_a_known_position_and_not_at_an_unknown_one() {
-        let cart = std::sync::Arc::new(
-            celeste_core::cart_data::CartData::load("cart").expect("cart"),
-        );
         let (rx, ry) = crate::settings::Settings::default().room;
-        let cache = std::sync::Arc::new(
-            celeste_core::collision_cache::CollisionCache::new(&cart, rx, ry).expect("cache"),
-        );
-        let room = Room { cart: cart.clone(), cache: cache.clone() };
+        let cache = std::sync::Arc::new(celeste_core::collision_cache::CollisionCache::new(rx, ry));
+        let room = Room { cache: cache.clone() };
 
         let at = |x: i16, y: i16| -> Option<bool> {
             let mut g = Graph::new();
@@ -183,7 +178,7 @@ mod tests {
         let mut open_seen = false;
         for y in (0..128).step_by(8) {
             for x in (0..128).step_by(8) {
-                let want = cache.solid_at(&cart, x, y, 8, 8).expect("solid_at");
+                let want = cache.solid_at(x, y, 8, 8).expect("solid_at");
                 assert_eq!(at(x, y), Some(want), "at ({}, {})", x, y);
                 solid_seen |= want;
                 open_seen |= !want;
@@ -209,7 +204,6 @@ mod tests {
     /// no position along that axis is solid, in every level room.
     #[test]
     fn a_collision_test_at_a_top_coordinate_folds_only_to_what_every_position_gives() {
-        let cart = std::sync::Arc::new(celeste_core::cart_data::CartData::load("cart").expect("cart"));
         let raw = |v: i16| Pico8Num::from_i16(v).as_raw_u32() as i32;
         let (mut checked, mut decided) = (0usize, 0usize);
         for ry in 0..4i16 {
@@ -217,8 +211,8 @@ mod tests {
                 if (rx, ry) == (7, 3) {
                     continue; // the summit: no level room
                 }
-                let cache = std::sync::Arc::new(celeste_core::collision_cache::CollisionCache::new(&cart, rx, ry).expect("cache"));
-                let room = Room { cart: cart.clone(), cache: cache.clone() };
+                let cache = std::sync::Arc::new(celeste_core::collision_cache::CollisionCache::new(rx, ry));
+                let room = Room { cache: cache.clone() };
                 // The player's hitbox (6x5) and a whole tile.
                 for (w, h) in [(6i16, 5i16), (8, 8)] {
                     for at in -8..136i16 {
@@ -238,7 +232,7 @@ mod tests {
                             // (beyond [-16, 144] every rectangle misses the room).
                             let any_solid = (-16..=144i16).any(|v| {
                                 let (x, y) = if top_is_y { (at, v) } else { (v, at) };
-                                cache.solid_at(&cart, x, y, w, h).expect("solid_at")
+                                cache.solid_at(x, y, w, h).expect("solid_at")
                             });
                             checked += 1;
                             decided += got.is_some() as usize;
@@ -264,13 +258,13 @@ mod tests {
     /// rectangles up to 3x3 tiles.
     #[test]
     fn a_tile_test_over_a_restricted_rectangle_folds_exactly_by_the_set_of_tiles() {
-        let cart = std::sync::Arc::new(celeste_core::cart_data::CartData::load("cart").expect("cart"));
+        let cart = &celeste_core::cart_data::CART;
         let raw = |v: i16| Pico8Num::from_i16(v).as_raw_u32() as i32;
         let (mut decided_false, mut kept) = (0usize, 0usize);
         for ry in 0..4i16 {
             for rx in 0..8i16 {
-                let cache = std::sync::Arc::new(celeste_core::collision_cache::CollisionCache::new(&cart, rx, ry).expect("cache"));
-                let room = Room { cart: cart.clone(), cache };
+                let cache = std::sync::Arc::new(celeste_core::collision_cache::CollisionCache::new(rx, ry));
+                let room = Room { cache };
                 let tile = |i: i16, j: i16| cart.mget_whole(rx * 16 + i, ry * 16 + j) as i16;
                 for (i0, j0) in [(0i16, 0i16), (3, 1), (7, 12), (13, 13), (-1, 14), (14, -1)] {
                     for (w, h) in [(1i16, 1i16), (2, 2), (3, 2), (3, 3)] {

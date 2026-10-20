@@ -23,7 +23,6 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use anyhow::{anyhow, bail, ensure, Result};
-use celeste_core::cart_data::CartData;
 use celeste_core::collision_cache::CollisionCache;
 use celeste_core::arith::{Arithmetic, EngineNum};
 use celeste_engine::runtime2::{Cell2, Col, Rt2, AV, NONE};
@@ -41,7 +40,6 @@ pub const BUTTON_GLOBAL: &str = "__button_states";
 /// no row keys (`frame::Block::canonical` makes them).
 pub fn to_rt2<D: Domain, N: EngineNum>(
     st: &State<D>,
-    cart: Arc<CartData>,
     cache: Arc<CollisionCache>,
     num: impl Fn(&D::Num) -> Result<AV<N>>,
     boolean: impl Fn(&D::Bool) -> Result<AV<N>>,
@@ -51,7 +49,7 @@ pub fn to_rt2<D: Domain, N: EngineNum>(
         Some(Value::Table(t)) => Some(*t),
         _ => None,
     };
-    let rt2 = Rt2::empty(1, gen::GLOBAL_NAMES.len(), gen::STRINGS, cart, cache);
+    let rt2 = Rt2::empty(1, gen::GLOBAL_NAMES.len(), gen::STRINGS, cache);
     let mut cx = ToRt2 { st, rt2, tables: HashMap::new(), closures: HashMap::new(), buttons, num, boolean };
     for (g, name) in gen::GLOBAL_NAMES.iter().enumerate() {
         if let Some(v) = globals.get(*name) {
@@ -85,8 +83,8 @@ pub fn to_rt2<D: Domain, N: EngineNum>(
 /// The tracer's block of `st`: its shape, every number and boolean `Nil`
 /// (the kernels compute them). What a traced frame's input and outcomes bind
 /// against.
-pub fn skeleton<D: Domain, N: EngineNum>(st: &State<D>, cart: Arc<CartData>, cache: Arc<CollisionCache>) -> Result<Rt2<N>> {
-    to_rt2(st, cart, cache, |_| Ok(AV::Nil), |_| Ok(AV::Nil))
+pub fn skeleton<D: Domain, N: EngineNum>(st: &State<D>, cache: Arc<CollisionCache>) -> Result<Rt2<N>> {
+    to_rt2(st, cache, |_| Ok(AV::Nil), |_| Ok(AV::Nil))
 }
 
 struct ToRt2<'a, D: Domain, E: EngineNum, N, B> {

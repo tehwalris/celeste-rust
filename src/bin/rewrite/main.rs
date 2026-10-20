@@ -522,8 +522,7 @@ fn main() -> Result<()> {
             },
         ),
         Command::Room => {
-            let cart = celeste_core::cart_data::CartData::load("cart")?;
-            let objects = celeste_rust::trace::cart::room_objects(&cart, cfg.room);
+            let objects = celeste_rust::trace::cart::room_objects(cfg.room);
             let level = celeste_rust::game_runner::level_index(cfg.room.0, cfg.room.1) + 1;
             println!("{}", serde_json::json!({ "room": cfg.room, "level": level, "objects": objects }));
             Ok(())

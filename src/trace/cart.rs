@@ -56,15 +56,20 @@ pub fn inject_tile_flag_at<D: Domain>(st: &mut State<D>) {
 /// [-1, 121], `spd.x = 0`) lives in the player's `draw`.
 pub const FRAME_CODE: &str = "_update()\n_draw()";
 
+/// THE TRACED PROGRAM, part of the binary (as the cart's data,
+/// `celeste_core::cart_data::CART`): the builtins written in Lua, the
+/// minimal cart, and `--split-frame`'s `_update`.
+pub const BUILTIN_LEVEL_3: &str = include_str!("../../lua/builtin_level_3.lua");
+pub const BUILTIN_LEVEL_4: &str = include_str!("../../lua/builtin_level_4.lua");
+const MINIMAL_CART: &str = include_str!("../../lua/celeste-minimal.lua");
+const SPLIT_FRAME_UPDATE: &str = include_str!("../../lua/split-frame.lua");
+
 /// The cart's Lua under settings `s` (the room, the category's patches, the
-/// loading frame, the balloon seeds, the split cart), read relative to `root`.
-pub fn sources_in(root: &std::path::Path, s: &crate::settings::Settings) -> Result<String> {
-    let read = |p: &str| std::fs::read_to_string(root.join(p));
-    let b3 = read("lua/builtin_level_3.lua")?;
-    let b4 = read("lua/builtin_level_4.lua")?;
-    let mut cart = read("lua/celeste-minimal.lua")?;
+/// loading frame, the balloon seeds, the split cart).
+pub fn sources(s: &crate::settings::Settings) -> Result<String> {
+    let mut cart = MINIMAL_CART.to_string();
     if s.split_frame {
-        cart = split_frame(&cart, &read("lua/split-frame.lua")?)?;
+        cart = split_frame(&cart, SPLIT_FRAME_UPDATE)?;
     }
     let mut game = crate::game_runner::apply_start_room(&cart, s)?;
     anyhow::ensure!(!(s.nodiag && s.onlydiag), "--nodiag and --onlydiag exclude each other");
@@ -74,7 +79,7 @@ pub fn sources_in(root: &std::path::Path, s: &crate::settings::Settings) -> Resu
         None => eprintln!("[start] IL load: no loading frame (no --loading-jank) - not real play where the room's objects move on it"),
     });
     if let Some(j) = s.loading_jank {
-        game = apply_loading_frame(&game, j, root, s.room)?;
+        game = apply_loading_frame(&game, j, s.room)?;
     }
     if s.nodiag {
         game = forbid_diagonal_dashes(&game)?;
@@ -90,12 +95,12 @@ pub fn sources_in(root: &std::path::Path, s: &crate::settings::Settings) -> Resu
     // `--balloon-seeds` holds the phase an interval (as fixed under
     // `--concrete-balloon-seeds`), so its states do not count frames.
     if let Some(seeds) = &s.balloon_seeds {
-        game = fix_balloon_seeds(&game, seeds, root, s.room)?;
+        game = fix_balloon_seeds(&game, seeds, s.room)?;
     }
     if let crate::settings::Arith::Float(tool) = s.arith {
-        game = tool_seeds(&game, s.balloon_seeds.as_deref(), tool, root, s.room, s.loading_jank.is_some())?;
+        game = tool_seeds(&game, s.balloon_seeds.as_deref(), tool, s.room, s.loading_jank.is_some())?;
     }
-    Ok(format!("{}\n{}\n{}\n", b3, b4, game))
+    Ok(format!("{BUILTIN_LEVEL_3}\n{BUILTIN_LEVEL_4}\n{game}\n"))
 }
 
 /// `--split-frame` (plans/architecture.md "The split frame"): one frame as
@@ -118,15 +123,14 @@ fn split_frame(game: &str, update: &str) -> Result<String> {
 /// witness may mix branches no single seed takes); missing ones 0. No new
 /// global (the name table is frozen): each balloon's seed is inlined, chosen
 /// by its position.
-fn fix_balloon_seeds(game: &str, seeds: &str, root: &std::path::Path, (rx, ry): (i16, i16)) -> Result<String> {
+fn fix_balloon_seeds(game: &str, seeds: &str, (rx, ry): (i16, i16)) -> Result<String> {
     const PAT: &str = "this.offset=rnd(1)";
     anyhow::ensure!(game.matches(PAT).count() == 1, "--balloon-seeds: the balloon's `{PAT}` was not found exactly once");
     let seeds: Vec<f64> = seeds.split(',').map(str::trim).filter(|s| !s.is_empty()).map(|s| s.parse::<f64>().with_context(|| format!("--balloon-seeds: {s:?}"))).collect::<Result<_>>()?;
-    let cart = celeste_core::cart_data::CartData::load(root.join("cart"))?;
     // The tool's seed list runs over balloons AND chests in creation order
     // (`RoomObject::seeded`); only the balloons' phases are fixed here (a
     // chest's shake decides only where its berry appears).
-    let seeded: Vec<RoomObject> = room_objects(&cart, (rx, ry)).into_iter().filter(|o| o.seeded).collect();
+    let seeded: Vec<RoomObject> = room_objects((rx, ry)).into_iter().filter(|o| o.seeded).collect();
     // More seeds than objects: the tool (UniversalClassicTas `set_seeds`)
     // applies one per balloon/chest present and ignores the rest.
     let mut expr = "0".to_string();
@@ -149,7 +153,7 @@ fn fix_balloon_seeds(game: &str, seeds: &str, root: &std::path::Path, (rx, ry): 
 ///   is its seed and its `y` `start + sin(offset) * 2`, undoing the loading
 ///   frame's bob; only where the balloons are seeded.
 /// Chests take their seeds from `seeds` (every seed 0 without).
-fn tool_seeds(game: &str, seeds: Option<&str>, tool: crate::settings::FloatTool, root: &std::path::Path, (rx, ry): (i16, i16), jank: bool) -> Result<String> {
+fn tool_seeds(game: &str, seeds: Option<&str>, tool: crate::settings::FloatTool, (rx, ry): (i16, i16), jank: bool) -> Result<String> {
     use crate::settings::FloatTool;
     let texts: Vec<&str> = seeds.unwrap_or("").split(',').map(str::trim).filter(|s| !s.is_empty()).collect();
     // A seed as the tool reads it (`tonumber`), written back exactly.
@@ -159,8 +163,7 @@ fn tool_seeds(game: &str, seeds: Option<&str>, tool: crate::settings::FloatTool,
             None => "0".to_string(),
         })
     };
-    let cart = celeste_core::cart_data::CartData::load(root.join("cart"))?;
-    let seeded: Vec<RoomObject> = room_objects(&cart, (rx, ry)).into_iter().filter(|o| o.seeded).collect();
+    let seeded: Vec<RoomObject> = room_objects((rx, ry)).into_iter().filter(|o| o.seeded).collect();
     let mut game = game.to_string();
     // The chests: by their tile position (`start` is `x - 4`).
     let mut expr = "rnd(3)".to_string();
@@ -235,11 +238,11 @@ pub struct RoomObject {
 /// Room `(rx, ry)`'s objects in creation order (x outer, y inner), the
 /// original cart's (`room_title` left out): the one scan of the map for
 /// objects.
-pub fn room_objects(cart: &celeste_core::cart_data::CartData, (rx, ry): (i16, i16)) -> Vec<RoomObject> {
+pub fn room_objects((rx, ry): (i16, i16)) -> Vec<RoomObject> {
     let mut out = Vec::new();
     for tx in 0..16i16 {
         for ty in 0..16i16 {
-            let tile = cart.mget_whole(rx * 16 + tx, ry * 16 + ty);
+            let tile = celeste_core::cart_data::CART.mget_whole(rx * 16 + tx, ry * 16 + ty);
             if let Some(&(_, kind, minimal)) = OBJECT_TILES.iter().find(|(t, _, _)| *t == tile) {
                 out.push(RoomObject { tile, tx, ty, kind, minimal, seeded: tile == BALLOON || tile == CHEST });
             }
@@ -255,9 +258,8 @@ pub fn room_objects(cart: &celeste_core::cart_data::CartData, (rx, ry): (i16, i1
 /// draws. J counts the ORIGINAL cart's objects (pico8_diff/chain.py reports
 /// it), translated to the minimal cart's list (no `message`, no `flag`).
 /// Measured against a real PICO-8 chain field by field (`chain.py --modes`).
-fn apply_loading_frame(game: &str, j: usize, root: &std::path::Path, (rx, ry): (i16, i16)) -> Result<String> {
-    let cart = celeste_core::cart_data::CartData::load(root.join("cart"))?;
-    let first = minimal_index(&cart, (rx, ry), j);
+fn apply_loading_frame(game: &str, j: usize, (rx, ry): (i16, i16)) -> Result<String> {
+    let first = minimal_index((rx, ry), j);
     let call = format!("load_room({}, {})", rx, ry);
     anyhow::ensure!(game.matches(&call).count() == 1, "--loading-jank: the start room's `{call}` was not found exactly once");
     let frame = format!(
@@ -269,8 +271,8 @@ fn apply_loading_frame(game: &str, j: usize, root: &std::path::Path, (rx, ry): (
 /// The minimal cart's index of room `(rx, ry)`'s first object updated by the
 /// loading frame, the original's J-th: one past the minimal cart's objects
 /// the original creates before it.
-fn minimal_index(cart: &celeste_core::cart_data::CartData, room: (i16, i16), j: usize) -> usize {
-    1 + room_objects(cart, room).iter().take(j.saturating_sub(1)).filter(|o| o.minimal).count()
+fn minimal_index(room: (i16, i16), j: usize) -> usize {
+    1 + room_objects(room).iter().take(j.saturating_sub(1)).filter(|o| o.minimal).count()
 }
 
 #[cfg(test)]
@@ -281,11 +283,10 @@ mod loading_frame_tests {
     /// Room (6,2) (spawn, fly fruit) needs no translation.
     #[test]
     fn the_original_cart_index_maps_past_the_missing_message() {
-        let cart = celeste_core::cart_data::CartData::load(std::path::Path::new("cart")).unwrap();
-        assert_eq!(super::minimal_index(&cart, (3, 1), 3), 2);
-        assert_eq!(super::minimal_index(&cart, (3, 1), 2), 2);
-        assert_eq!(super::minimal_index(&cart, (3, 1), 1), 1);
-        assert_eq!(super::minimal_index(&cart, (6, 2), 2), 2);
+        assert_eq!(super::minimal_index((3, 1), 3), 2);
+        assert_eq!(super::minimal_index((3, 1), 2), 2);
+        assert_eq!(super::minimal_index((3, 1), 1), 1);
+        assert_eq!(super::minimal_index((6, 2), 2), 2);
     }
 }
 
@@ -418,9 +419,9 @@ pub struct Chunks {
 }
 
 impl Chunks {
-    pub fn parse(root: &std::path::Path, s: &crate::settings::Settings) -> Result<Chunks> {
+    pub fn parse(s: &crate::settings::Settings) -> Result<Chunks> {
         let parse = |what: &str, src: &str| full_moon::parse(src).map_err(|e| anyhow!("parse {what}: {e:?}"));
-        let top = parse("the cart", &sources_in(root, s)?)?;
+        let top = parse("the cart", &sources(s)?)?;
         check_absent_fields(&top)?;
         Ok(Chunks { top, init: parse("_init", "_init()")?, reset: parse("the reset", "__reset_button_states()")?, frame: parse("the frame", FRAME_CODE)? })
     }
@@ -431,13 +432,11 @@ impl Chunks {
     }
 }
 
-/// Room `room`'s START in `it`: the cart's data and the room's collision
-/// cache loaded, the toplevel run, the native `tile_flag_at` in place of the
-/// Lua one, `_init()` run.
-pub fn boot<'a, D: Domain>(it: &mut Interp<'a, D>, chunks: &'a Chunks, root: &std::path::Path, (rx, ry): (i16, i16)) -> Result<State<D>> {
-    let cart = std::sync::Arc::new(celeste_core::cart_data::CartData::load(root.join("cart"))?);
-    it.cache = Some(std::sync::Arc::new(celeste_core::collision_cache::CollisionCache::new(&cart, rx, ry)?));
-    it.cart = Some(cart);
+/// Room `room`'s START in `it`: the room's collision cache in place, the
+/// toplevel run, the native `tile_flag_at` in place of the Lua one,
+/// `_init()` run.
+pub fn boot<'a, D: Domain>(it: &mut Interp<'a, D>, chunks: &'a Chunks, room: (i16, i16)) -> Result<State<D>> {
+    it.cache = Some(crate::compiled::collision_cache(room));
     let st = fresh_state(&mut it.d);
     let mut st = run_one(it, &chunks.top, st)?;
     inject_tile_flag_at(&mut st);

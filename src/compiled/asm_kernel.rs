@@ -6,7 +6,6 @@
 
 use std::collections::HashMap;
 use std::os::raw::c_void;
-use std::path::Path;
 
 use anyhow::{Context, Result};
 
@@ -260,7 +259,7 @@ impl<N: KernelLanes> AsmKernel<N> {
             c.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
         let views = self.input_views(chunk);
-        let env = CollisionEnv { cart: &chunk.cart, cache: &chunk.cache };
+        let env = CollisionEnv { cache: &chunk.cache };
         let ctx = AsmCtx::new(&env as *const CollisionEnv as *const c_void);
         // Per-thread reused buffers: a fresh allocation faults every page.
         let mut sc = Scratch::take(self);
@@ -963,8 +962,8 @@ impl<N: KernelLanes> Registry<N> {
     }
 
     /// Retrace the start room and assemble every shape for level `opts`
-    /// under settings `s` (`root`: the repo).
-    pub fn build_for_start_room(root: &Path, opts: crate::abstraction::Level, s: &crate::settings::Settings) -> Result<Registry<N>> {
+    /// under settings `s`.
+    pub fn build_for_start_room(opts: crate::abstraction::Level, s: &crate::settings::Settings) -> Result<Registry<N>> {
         let grid = s.region_grid();
         match grid {
             Some(g) => eprintln!("[region] kernels keyed on a {} px grid, player speed asserted within [-{}, {}] px", g.px, g.speed, g.speed),
@@ -976,7 +975,7 @@ impl<N: KernelLanes> Registry<N> {
         };
         let build = &build;
         let t_trace = std::time::Instant::now();
-        let refs = crate::trace::lower::lattice_kernel_refs::<N::Arith>(root, opts, s)
+        let refs = crate::trace::lower::lattice_kernel_refs::<N::Arith>(opts, s)
             .context("retracing the start room for ASM kernels")?;
         let trace_s = t_trace.elapsed().as_secs_f64();
         let t_asm = std::time::Instant::now();
@@ -1131,7 +1130,7 @@ fn apply_union<N: KernelLanes>(kernel: &mut AsmKernel<N>, unions: &HashMap<u64, 
 /// `tag` distinguishes a shape's region kernels.
 fn build_one_shape<N: KernelLanes>(r: &crate::trace::lower::LoweredFrame<N::Arith>, si: usize, tag: &str, build: &BuildOptions) -> Result<(u64, AsmKernel<N>)> {
     let shape = r.frame.in_rt2.shape_hash_of();
-    let room = Room { cart: r.cart.clone(), cache: r.cache.clone() };
+    let room = Room { cache: r.cache.clone() };
     let t_fuse = std::time::Instant::now();
     let (fused, bodies, flat_roots, reprs) =
         crate::trace::lower::asm_fused_from(&r.bound, &r.lowered.spec)
@@ -1566,7 +1565,7 @@ fn build_registry_for_level<N: KernelLanes>(level: crate::abstraction::Level, s:
     let s = s.clone();
     let built = std::thread::Builder::new()
         .stack_size(256 * 1024 * 1024)
-        .spawn(move || Registry::<N>::build_for_start_room(Path::new("."), level, &s))
+        .spawn(move || Registry::<N>::build_for_start_room(level, &s))
         .expect("spawn asm-kernel builder")
         .join()
         .expect("asm-kernel builder panicked");

@@ -13,7 +13,7 @@ use celeste_engine::kernel::{
 };
 
 use crate::pico8_num::Pico8Num as P8;
-use celeste_core::cart_data::CartData;
+use celeste_core::cart_data::CART;
 use celeste_core::collision_cache::CollisionCache;
 use crate::transpile::asm::compile_and_load;
 use crate::transpile::graph::{Graph, NodeId, Op};
@@ -66,7 +66,7 @@ enum V {
 fn eval_nodes(
     g: &Graph,
     cols: &HashMap<u32, [i32; 16]>,
-    room: Option<(&CartData, &CollisionCache)>,
+    room: Option<&CollisionCache>,
 ) -> Vec<V> {
     let zn_of = |col: &[i32; 16]| ZN::from_array(std::array::from_fn(|i| P8::from_raw(col[i])));
     let mut vals: Vec<V> = Vec::with_capacity(g.len());
@@ -216,15 +216,15 @@ fn eval_nodes(
                 V::B(ZB { val: !wraps, known: ALL })
             }
             Op::Mget => {
-                let (cart, _) = room.expect("Mget needs a room");
-                V::N(zn_mget(cart, n(0), n(1)))
+                room.expect("Mget needs a room");
+                V::N(zn_mget(n(0), n(1)))
             }
             Op::TileFlagAt => {
-                let (cart, cache) = room.expect("TileFlagAt needs a room");
+                let cache = room.expect("TileFlagAt needs a room");
                 let w = n(2).lane(0);
                 let h = n(3).lane(0);
                 let flag = n(4).lane(0);
-                V::B(zn_tile_flag_at(cache, cart, n(0), n(1), w, h, flag))
+                V::B(zn_tile_flag_at(cache, n(0), n(1), w, h, flag))
             }
             // The operand unchanged, as the codegen.
             Op::Restrict(..) => vals[node.args[0] as usize],
@@ -268,7 +268,7 @@ fn check(
     rng: &mut Lcg,
     cols: fn(&[u32], &mut Lcg) -> HashMap<u32, [i32; 16]>,
     ctx: *const std::os::raw::c_void,
-    room: Option<(&CartData, &CollisionCache)>,
+    room: Option<&CollisionCache>,
 ) {
     let (compiled, loaded) = compile_and_load(g, roots, tag).expect("compile+load");
     for _ in 0..8 {
@@ -449,9 +449,8 @@ fn asm_callout_div_rem_sin_matches_primitives() {
 /// so `zn_mget` / `zn_tile_flag_at` are defined on every lane.
 #[test]
 fn asm_callout_collision_matches_primitives() {
-    let cart = CartData::load("cart").expect("cart");
-    let cache = CollisionCache::new(&cart, 1, 0).expect("cache");
-    let env = crate::transpile::asm::CollisionEnv { cart: &cart, cache: &cache };
+    let cache = CollisionCache::new(1, 0);
+    let env = crate::transpile::asm::CollisionEnv { cache: &cache };
     let ctx = crate::transpile::asm::AsmCtx::new(&env as *const _ as *const std::os::raw::c_void);
 
     let mut g = Graph::new();
@@ -481,7 +480,7 @@ fn asm_callout_collision_matches_primitives() {
     }
 
     let mut rng = Lcg(0xc0111_5107);
-    check(&g, &roots, "collision", &mut rng, random_columns, &ctx as *const _ as *const std::os::raw::c_void, Some((&cart, &cache)));
+    check(&g, &roots, "collision", &mut rng, random_columns, &ctx as *const _ as *const std::os::raw::c_void, Some(&cache));
 }
 
 /// Ice (flag 4): the lane primitive's answer through the precomputed
@@ -489,8 +488,8 @@ fn asm_callout_collision_matches_primitives() {
 /// room ((3,1)), and true somewhere.
 #[test]
 fn tile_flag_ice_map_matches_the_scan() {
-    let cart = CartData::load("cart").expect("cart");
-    let cache = CollisionCache::new(&cart, 3, 1).expect("cache");
+    let cart = &CART;
+    let cache = CollisionCache::new(3, 1);
     let p = |v: i16| crate::pico8_num::Pico8Num::from_i16(v);
     let scan = |x: i16, y: i16, w: i16, h: i16| -> bool {
         (y.max(0) / 8..=((y + h - 1).div_euclid(8)).min(15)).any(|ty| {
@@ -506,7 +505,7 @@ fn tile_flag_ice_map_matches_the_scan() {
             let xv: Vec<_> = (0..16).map(|i| p(*xs.get(i).unwrap_or(&xs[0]) + 1)).collect();
             let x = ZN::from_array(xv.try_into().unwrap());
             let yz = ZN::from_array([p(y + 3); 16]);
-            let zb = zn_tile_flag_at(&cache, &cart, x, yz, p(6), p(5), p(4));
+            let zb = zn_tile_flag_at(&cache, x, yz, p(6), p(5), p(4));
             for (i, &xi) in xs.iter().enumerate() {
                 let want = scan(xi + 1, y + 3, 6, 5);
                 assert_eq!(zb.val >> i & 1 == 1, want, "ice at ({}, {})", xi + 1, y + 3);

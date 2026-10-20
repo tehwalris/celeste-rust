@@ -61,20 +61,18 @@ fn previous((x, y): (i16, i16)) -> Option<(i16, i16)> {
 /// `None` for the first room (no previous room, no jank).
 pub fn celia_jank(room: (i16, i16)) -> Result<Option<usize>> {
     let Some(prev) = previous(room) else { return Ok(None) };
-    let cart = celeste_core::cart_data::CartData::load("cart")?;
-    Ok(Some(room_objects(&cart, prev).len()))
+    Ok(Some(room_objects(prev).len()))
 }
 
 /// The starts of `s.room` under settings `s` (the category, the balloon
 /// seeds; `--loading-jank` is what this enumerates, so refused).
 pub fn starts(s: &crate::settings::Settings) -> Result<Starts> {
     anyhow::ensure!(s.loading_jank.is_none(), "rewrite starts enumerates the loading jank: no --loading-jank");
-    let cart = celeste_core::cart_data::CartData::load("cart")?;
     let level = crate::game_runner::level_index(s.room.0, s.room.1) + 1;
     let Some(prev) = previous(s.room) else {
         return Ok(Starts { room: s.room, level, previous: None, previous_objects: Vec::new(), spawn_frame: None, feasible: Vec::new(), classes: Vec::new(), celia: None });
     };
-    let objs = room_objects(&cart, prev);
+    let objs = room_objects(prev);
     let celia = celia_jank(s.room)?;
     // J = 1 + the objects before the player when it leaves: the previous
     // room's objects but the spawn, less any subset of the destroyable ones,

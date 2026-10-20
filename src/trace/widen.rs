@@ -760,14 +760,11 @@ mod tests {
     /// dashes, takes the key and opens the chest with it).
     #[test]
     fn dead_fields_are_unread() {
-        if !std::path::Path::new("lua/celeste-minimal.lua").exists() {
-            return;
-        }
-        let (root, s) = (std::path::Path::new("."), crate::settings::Settings { room: (4, 0), ..Default::default() });
-        let chunks = cart::Chunks::parse(root, &s).expect("chunks");
+        let s = crate::settings::Settings { room: (4, 0), ..Default::default() };
+        let chunks = cart::Chunks::parse(&s).expect("chunks");
         let frame = &chunks.frame;
         let mut it: Interp<Symbolic> = Interp::new(Symbolic::default());
-        let mut st = cart::boot(&mut it, &chunks, root, s.room).expect("boot");
+        let mut st = cart::boot(&mut it, &chunks, s.room).expect("boot");
         let dead = |s: &Slot| matches!(s.stored, Stored::Num(_) | Stored::Bool(_));
         let route = crate::concrete::read_inputs("tas/room_4_0_hundred_frame_152.txt").expect("the route");
         let (mut traced, mut with_key, mut with_player, mut has_key) = (0, 0, 0, false);

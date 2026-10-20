@@ -249,11 +249,8 @@ fn trace<'a, A: GraphArith>(it: &mut Interp<'a, Symbolic<A>>, chunks: &'a super:
         }
     }
     // The engine numbering for the INPUT shape.
-    let (cart, cache) = match (it.cart.clone(), it.cache.clone()) {
-        (Some(a), Some(b)) => (a, b),
-        _ => bail!("tracing a frame needs the cart and the room's collision cache"),
-    };
-    let in_rt2 = super::block::skeleton(&st, cart.clone(), cache.clone())?;
+    let Some(cache) = it.cache.clone() else { bail!("tracing a frame needs the room's collision cache") };
+    let in_rt2 = super::block::skeleton(&st, cache.clone())?;
     // The canonical cell of each `Op::Cell(i)`. Inputs only: outputs bind
     // against their own shape.
     let in_cells = super::bind::resolve_all(&in_rt2, &iface.slots)?;
@@ -285,12 +282,12 @@ fn trace<'a, A: GraphArith>(it: &mut Interp<'a, Symbolic<A>>, chunks: &'a super:
     let mut outs = Vec::new();
     for (s, f) in finished {
         anyhow::ensure!(!matches!(f, Flow::Break), "break at frame toplevel");
-        outs.push(finish_outcome(it, s, widen, global, (&cart, &cache))?);
+        outs.push(finish_outcome(it, s, widen, global, &cache)?);
     }
     // Split selects on conditions a lane can hold undecided, until none is.
     if !it.d.no_known_forks {
         let points = if it.d.level.platforms { Some(super::split::Points::new(&it.d, position)?) } else { None };
-        let room = crate::transpile::graph::Room { cart: cart.clone(), cache: cache.clone() };
+        let room = crate::transpile::graph::Room { cache: cache.clone() };
         outs = super::split::split_undecided_selects(&mut it.d, outs, points, Some(&room))?;
         // The conditions operators were EVALUATED under are read by the error
         // derivation: three-valued, like the guards (unknown reads as error).
@@ -350,7 +347,7 @@ fn finish_outcome<A: GraphArith>(
     mut s: State<Symbolic<A>>,
     widen: bool,
     global: NodeId,
-    (cart, cache): (&std::sync::Arc<celeste_core::cart_data::CartData>, &std::sync::Arc<celeste_core::collision_cache::CollisionCache>),
+    cache: &std::sync::Arc<celeste_core::collision_cache::CollisionCache>,
 ) -> Result<FrameOut<A>> {
     s.gc();
     // Absent-as-zero fields: shape, not precision, so every level.
@@ -387,7 +384,7 @@ fn finish_outcome<A: GraphArith>(
         .iter()
         .filter(|(p, _)| fields.iter().any(|(q, _, _)| q == p))
         .fold(it.d.graph.fold(crate::transpile::graph::Op::Or, vec![global, s.ended]), |e, (_, w)| it.d.graph.fold(crate::transpile::graph::Op::Or, vec![e, *w]));
-    let rt2 = super::block::skeleton(&s, cart.clone(), cache.clone())?;
+    let rt2 = super::block::skeleton(&s, cache.clone())?;
     let paths: Vec<Path> =
         fields.iter().map(|(p, _, _)| p.clone()).chain(ubool.iter().cloned()).collect();
     let all = super::bind::resolve_all(&rt2, &paths)?;
@@ -478,11 +475,11 @@ mod tests {
     /// perturbed pinned cell's `Op::Pin` check declines the lane.
     #[test]
     fn a_body_pinned_to_a_pm1_key_refuses_any_other_key() {
-        let (root, s) = (std::path::Path::new("."), crate::settings::Settings::default());
-        let chunks = cart::Chunks::parse(root, &s).expect("chunks");
+        let s = crate::settings::Settings::default();
+        let chunks = cart::Chunks::parse(&s).expect("chunks");
         let frame = &chunks.frame;
         let mut it: Interp<Symbolic> = Interp::new(Symbolic::default());
-        let mut st = cart::boot(&mut it, &chunks, root, s.room).expect("boot");
+        let mut st = cart::boot(&mut it, &chunks, s.room).expect("boot");
         let mut player = None;
         for _ in 0..40 {
             if let Some(p) = super::super::shapes::player_path(&st) {
@@ -503,7 +500,7 @@ mod tests {
 
         // No error in whichever outcome claims this assignment.
         let (g, map) = at_buttons(&it.d.graph, &f, &[false; 6]).expect("the six buttons");
-        let room = crate::transpile::graph::Room { cart: it.cart.clone().expect("cart"), cache: it.cache.clone().expect("cache") };
+        let room = crate::transpile::graph::Room { cache: it.cache.clone().expect("cache") };
         let ok_at = |cells: &[Conc]| -> bool {
             let v = g.eval_in(&exact(cells), &room).expect("the frame at a point");
             let live: Vec<&FrameOut> = f.outs.iter().filter(|o| v[map[o.guard as usize] as usize] == Val::Bool(Some(true))).collect();
@@ -532,8 +529,8 @@ mod tests {
     #[test]
     #[ignore = "slow, ./check.sh t2 runs it: every room's map, ~20 CPU-s"]
     fn ice_at_answers_the_tile_scan_in_every_room() {
-        let (root, s) = (std::path::Path::new("."), crate::settings::Settings::default());
-        let chunks = cart::Chunks::parse(root, &s).expect("chunks");
+        let s = crate::settings::Settings::default();
+        let chunks = cart::Chunks::parse(&s).expect("chunks");
         // Parsed before the interpreter, which borrows the ASTs it runs.
         let rects: Vec<(i16, i16, i16, i16)> = (0..16i16)
             .flat_map(|i| (0..16i16).map(move |j| (i * 8, j * 8)))
@@ -544,8 +541,8 @@ mod tests {
             .map(|(x, y, w, h)| full_moon::parse(&format!("ice_probe = ice_at({x},{y},{w},{h})")).expect("parse probe"))
             .collect();
         let mut it: Interp<Symbolic> = Interp::new(Symbolic::default());
-        let st = cart::boot(&mut it, &chunks, root, s.room).expect("boot");
-        let cd = it.cart.clone().expect("cart");
+        let st = cart::boot(&mut it, &chunks, s.room).expect("boot");
+        let cd = &celeste_core::cart_data::CART;
         let scan = |rx: i16, ry: i16, x: i16, y: i16, w: i16, h: i16| -> bool {
             let p = |v: i16| crate::pico8_num::Pico8Num::from_i16(v);
             (y.max(0) / 8..=((y + h - 1).div_euclid(8)).min(15)).any(|ty| {
@@ -568,7 +565,7 @@ mod tests {
                 },
                 |(it, st), r| {
                     let (rx, ry) = rooms[r];
-                    it.cache = Some(std::sync::Arc::new(celeste_core::collision_cache::CollisionCache::new(&cd, rx, ry)?));
+                    it.cache = Some(crate::compiled::collision_cache((rx, ry)));
                     let mut o = st.clone();
                     for (k, v) in [("x", rx), ("y", ry)] {
                         let n = it.d.num(crate::pico8_num::Pico8Num::from_i16(v));
@@ -599,8 +596,8 @@ mod tests {
     #[test]
     #[ignore = "slow, ./check.sh t2 runs it: every room's map through the Lua, ~20 CPU-s"]
     fn native_tile_flag_at_answers_the_carts_lua_loop() {
-        let (root, s) = (std::path::Path::new("."), crate::settings::Settings::default());
-        let chunks = cart::Chunks::parse(root, &s).expect("chunks");
+        let s = crate::settings::Settings::default();
+        let chunks = cart::Chunks::parse(&s).expect("chunks");
         let keep = full_moon::parse("lua_tile_flag_at = tile_flag_at").expect("parse");
         // Positions -24..8 and 120..152 on each axis, five boxes: the cached
         // sizes, an odd one, and the ice map's.
@@ -637,10 +634,8 @@ end
 ",
         )
         .expect("parse probe");
-        let cd = std::sync::Arc::new(celeste_core::cart_data::CartData::load("cart").expect("cart"));
         let mut it: Interp<Symbolic> = Interp::new(Symbolic::default());
-        it.cache = Some(std::sync::Arc::new(celeste_core::collision_cache::CollisionCache::new(&cd, s.room.0, s.room.1).expect("cache")));
-        it.cart = Some(cd.clone());
+        it.cache = Some(crate::compiled::collision_cache(s.room));
         // `cart::boot`, with the Lua `tile_flag_at` kept under another name.
         let st = cart::fresh_state::<Symbolic>(&mut it.d);
         let st = cart::run_one(&mut it, &chunks.top, st).expect("toplevel");
@@ -659,7 +654,7 @@ end
                 },
                 |(it, st), r| {
                     let (rx, ry) = rooms[r];
-                    it.cache = Some(std::sync::Arc::new(celeste_core::collision_cache::CollisionCache::new(&cd, rx, ry)?));
+                    it.cache = Some(crate::compiled::collision_cache((rx, ry)));
                     let mut o = st.clone();
                     for (k, v) in [("x", rx), ("y", ry)] {
                         let n = it.d.num(crate::pico8_num::Pico8Num::from_i16(v));

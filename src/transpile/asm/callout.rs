@@ -12,7 +12,7 @@
 
 use std::os::raw::c_void;
 
-use celeste_core::cart_data::CartData;
+use celeste_core::cart_data::CART;
 use celeste_core::collision_cache::CollisionCache;
 use celeste_core::lua_f64::LuaF64;
 use celeste_core::pico8_num::Pico8Num as P8;
@@ -32,10 +32,10 @@ unsafe fn store_zn(p: *mut i32, z: ZN) {
     }
 }
 
-/// The cart/cache the collision wrappers query. Held behind `AsmCtx::env`.
+/// The room's collision cache the collision wrappers query (the map is
+/// `CART`'s). Held behind `AsmCtx::env`.
 #[repr(C)]
 pub struct CollisionEnv<'a> {
-    pub cart: &'a CartData,
     pub cache: &'a CollisionCache,
 }
 
@@ -48,9 +48,8 @@ pub unsafe extern "C" fn co_rem(out: *mut i32, a: *const i32, b: *const i32) {
 pub unsafe extern "C" fn co_sin(out: *mut i32, a: *const i32) {
     store_zn(out, zn_sin(load_zn(a)));
 }
-pub unsafe extern "C" fn co_mget(env: *const c_void, out: *mut i32, x: *const i32, y: *const i32) {
-    let env = &*(env as *const CollisionEnv);
-    store_zn(out, zn_mget(env.cart, load_zn(x), load_zn(y)));
+pub unsafe extern "C" fn co_mget(_env: *const c_void, out: *mut i32, x: *const i32, y: *const i32) {
+    store_zn(out, zn_mget(load_zn(x), load_zn(y)));
 }
 /// `tile_flag_at` with a UNIFORM box (`w`/`h`/`flag` scalars). Writes the
 /// 16-bit `val` mask to `*out_mask` (known is all-ones).
@@ -66,7 +65,6 @@ pub unsafe extern "C" fn co_tile_flag(
     let env = &*(env as *const CollisionEnv);
     let zb = zn_tile_flag_at(
         env.cache,
-        env.cart,
         load_zn(x),
         load_zn(y),
         P8::from_raw(w),
@@ -88,7 +86,6 @@ pub unsafe extern "C" fn co_tile_flag_lanes(
     let env = &*(env as *const CollisionEnv);
     let zb = zn_tile_flag_at_lanes(
         env.cache,
-        env.cart,
         load_zn(x),
         load_zn(y),
         load_zn(w),
@@ -117,10 +114,9 @@ pub unsafe extern "C" fn co_fsin(out: *mut f64, a: *const f64) {
         *out.add(i) = r.map_or(f64::NAN, LuaF64::value);
     }
 }
-pub unsafe extern "C" fn co_fmget(env: *const c_void, out: *mut f64, x: *const f64, y: *const f64) {
-    let env = &*(env as *const CollisionEnv);
+pub unsafe extern "C" fn co_fmget(_env: *const c_void, out: *mut f64, x: *const f64, y: *const f64) {
     for i in 0..F_LANES {
-        *out.add(i) = env.cart.mget_whole(whole(x, i, "mget x"), whole(y, i, "mget y")) as f64;
+        *out.add(i) = CART.mget_whole(whole(x, i, "mget x"), whole(y, i, "mget y")) as f64;
     }
 }
 /// `tile_flag_at` with a UNIFORM box (`w`/`h`/`flag` whole numbers):
@@ -129,7 +125,7 @@ pub unsafe extern "C" fn co_ftile_flag(env: *const c_void, out_mask: *mut u8, x:
     let env = &*(env as *const CollisionEnv);
     let (xs, ys): ([i16; 16], [i16; 16]) = (std::array::from_fn(|i| if i < F_LANES { whole(x, i, "tile_flag_at x") } else { 0 }), std::array::from_fn(|i| if i < F_LANES { whole(y, i, "tile_flag_at y") } else { 0 }));
     let (xz, yz) = (ZN::from_array(xs.map(P8::from_i16)), ZN::from_array(ys.map(P8::from_i16)));
-    let zb = zn_tile_flag_at(env.cache, env.cart, xz, yz, P8::from_i16(w as i16), P8::from_i16(h as i16), P8::from_i16(flag as i16));
+    let zb = zn_tile_flag_at(env.cache, xz, yz, P8::from_i16(w as i16), P8::from_i16(h as i16), P8::from_i16(flag as i16));
     *out_mask = (zb.val & 0xff) as u8;
 }
 /// `tile_flag_at` with a PER-LANE box.
@@ -139,7 +135,7 @@ pub unsafe extern "C" fn co_ftile_flag_lanes(env: *const c_void, out_mask: *mut 
     for i in 0..F_LANES {
         let (xi, yi) = (whole(x, i, "tile_flag_at x"), whole(y, i, "tile_flag_at y"));
         let (wi, hi) = (whole(w, i, "tile_flag_at w"), whole(h, i, "tile_flag_at h"));
-        if env.cache.flag_at(env.cart, xi, yi, wi, hi, flag as i16).expect("tile_flag_at") {
+        if env.cache.flag_at(xi, yi, wi, hi, flag as i16).expect("tile_flag_at") {
             m |= 1 << i;
         }
     }

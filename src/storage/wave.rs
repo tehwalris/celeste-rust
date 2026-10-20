@@ -1560,8 +1560,7 @@ pub fn seed<N: Rem>(visited: &mut VisitedSet<N>, blocks: &[Block<N>], start: Hul
     drop(parts);
     ensure!(held == 0, "frame 0 into a visited set that held {held} of its states");
     for (h, rec) in skels {
-        let (cart, cache) = (canon[0].cart.clone(), canon[0].cache.clone());
-        next.skeletons.insert(h, std::sync::Arc::new(rec.rt2(cart, cache)));
+        next.skeletons.insert(h, std::sync::Arc::new(rec.rt2(canon[0].cache.clone())));
     }
     let n = next.states() as usize;
     let stats = FrameStats { lanes_kept: n, lanes_out: n, entries_out: next.entries(), ..Default::default() };

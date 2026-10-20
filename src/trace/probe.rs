@@ -42,7 +42,7 @@ fn read(p: &str) -> Result<String> {
 
 /// `run_probe` of a corpus's source text.
 fn run_corpus_source(corpus: &str) -> Result<Vec<String>> {
-    let src = format!("{}\n{}\n{}", read("lua/builtin_level_3.lua")?, read("lua/builtin_level_4.lua")?, corpus);
+    let src = format!("{}\n{}\n{corpus}", super::cart::BUILTIN_LEVEL_3, super::cart::BUILTIN_LEVEL_4);
     let ast = full_moon::parse(&src).map_err(|e| anyhow::anyhow!("parse: {}", e))?;
     let mut it: Interp<Symbolic> = Interp::new(Symbolic::default());
     let mut st = fresh_state::<Symbolic>(&mut it.d);

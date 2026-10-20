@@ -1041,7 +1041,7 @@ pub fn table(speed: i32, s: &crate::settings::Settings) -> Result<&'static CostT
     let owned = s.clone();
     let table = std::thread::Builder::new()
         .stack_size(256 * 1024 * 1024)
-        .spawn(move || cost_to_go(FsPath::new("."), speed, threads, &owned))
+        .spawn(move || cost_to_go(speed, threads, &owned))
         .expect("spawn the level -1 builder")
         .join()
         .map_err(|p| anyhow!("the level -1 builder panicked: {}", p.downcast_ref::<String>().map(String::as_str).or_else(|| p.downcast_ref::<&str>().copied()).unwrap_or("?")))??;
@@ -1058,8 +1058,8 @@ fn measures_the_exit(s: &crate::settings::Settings) -> Result<()> {
     Ok(())
 }
 
-fn cost_to_go(root: &FsPath, spd_px: i32, threads: usize, s: &crate::settings::Settings) -> Result<CostToGo> {
-    let (path, key) = cache_file(root, spd_px, s)?;
+fn cost_to_go(spd_px: i32, threads: usize, s: &crate::settings::Settings) -> Result<CostToGo> {
+    let (path, key) = cache_file(spd_px, s)?;
     match CostToGo::load(&path) {
         Ok(Some(t)) => {
             eprintln!("[level -1] table read from {} ({} entries)", path.display(), t.d.len());
@@ -1069,7 +1069,7 @@ fn cost_to_go(root: &FsPath, spd_px: i32, threads: usize, s: &crate::settings::S
         Err(e) => eprintln!("[level -1] the cached table {} is unreadable ({e:#}): building it", path.display()),
     }
     let mut rep = String::new();
-    let b = build_in(root, spd_px, threads, &mut rep, s)?;
+    let b = build_in(spd_px, threads, &mut rep, s)?;
     let mut d = rustc_hash::FxHashMap::default();
     for (&h, &id) in &b.by_hash {
         for (i, &(sid, x, y)) in b.g1.nodes.iter().enumerate() {
@@ -1089,10 +1089,12 @@ fn cost_to_go(root: &FsPath, spd_px: i32, threads: usize, s: &crate::settings::S
 /// The table cache's format; bump it when what a file holds changes.
 const CACHE_FORMAT: u32 = 1;
 
-/// The cache file under /var/tmp/celeste-l1-cache, keyed on the binary, the
-/// cart, `spd_px` and `Settings::cart_key`. `--l1-table FILE`: THAT file,
-/// whatever the binary (a fixture's pinned table; never a search's).
-fn cache_file(root: &FsPath, spd_px: i32, s: &crate::settings::Settings) -> Result<(PathBuf, String)> {
+/// The cache file under /var/tmp/celeste-l1-cache, keyed on what the table
+/// is a function of: the binary (its code and the game it embeds), the
+/// cart's sources under the settings (`trace::cart::sources`), `spd_px`
+/// and `Settings::cart_key`. `--l1-table FILE`: THAT file, whatever the
+/// binary (a fixture's pinned table; never a search's).
+fn cache_file(spd_px: i32, s: &crate::settings::Settings) -> Result<(PathBuf, String)> {
     use std::hash::{Hash, Hasher};
     if let Some(f) = &s.l1_table {
         return Ok((f.clone(), format!("level -1 table pinned by --l1-table, format {CACHE_FORMAT}, S = {spd_px}\n")));
@@ -1100,30 +1102,21 @@ fn cache_file(root: &FsPath, spd_px: i32, s: &crate::settings::Settings) -> Resu
     let dir = PathBuf::from("/var/tmp/celeste-l1-cache");
     let exe = std::env::current_exe()?;
     let exe_bytes = std::fs::read(&exe).map_err(|e| anyhow!("reading this binary {}: {e}", exe.display()))?;
-    let lua = crate::trace::cart::sources_in(root, s)?;
-    let mut cart: Vec<(String, Vec<u8>)> = Vec::new();
-    for e in std::fs::read_dir(root.join("cart"))? {
-        let e = e?;
-        if e.file_type()?.is_file() {
-            cart.push((e.file_name().to_string_lossy().into_owned(), std::fs::read(e.path())?));
-        }
-    }
-    cart.sort();
+    let lua = crate::trace::cart::sources(s)?;
     // Not threads, the filter's horizon or diagnostics.
     let env = s.cart_key();
     let room = s.room;
     // Two 64-bit SipHashes under different prefixes: a 128-bit name.
     let half = |salt: u8| {
         let mut h = std::collections::hash_map::DefaultHasher::new();
-        (salt, CACHE_FORMAT, &exe_bytes, &lua, &cart, &env, room, spd_px).hash(&mut h);
+        (salt, CACHE_FORMAT, &exe_bytes, &lua, &env, room, spd_px).hash(&mut h);
         h.finish()
     };
     let name = format!("{:016x}{:016x}", half(1), half(2));
     let key = format!(
-        "level -1 table cache, format {CACHE_FORMAT}\nroom {room:?}, S = {spd_px}\nbinary {} ({} bytes)\nsettings {env}\ncart files {:?}\n",
+        "level -1 table cache, format {CACHE_FORMAT}\nroom {room:?}, S = {spd_px}\nbinary {} ({} bytes)\nsettings {env}\n",
         exe.display(),
-        exe_bytes.len(),
-        cart.iter().map(|c| &c.0).collect::<Vec<_>>()
+        exe_bytes.len()
     );
     Ok((dir.join(format!("room{}_{}_s{spd_px}_{name}.bin", room.0, room.1)), key))
 }
@@ -1620,26 +1613,26 @@ impl Graph1 {
     }
 }
 
-fn build_in(root: &FsPath, spd_px: i32, threads: usize, rep: &mut String, s: &crate::settings::Settings) -> Result<Built> {
+fn build_in(spd_px: i32, threads: usize, rep: &mut String, s: &crate::settings::Settings) -> Result<Built> {
     match s.arith {
-        crate::settings::Arith::Fixed => build::<Fixed>(root, spd_px, threads, rep, s),
-        crate::settings::Arith::Float(_) => build::<Float>(root, spd_px, threads, rep, s),
+        crate::settings::Arith::Fixed => build::<Fixed>(spd_px, threads, rep, s),
+        crate::settings::Arith::Float(_) => build::<Float>(spd_px, threads, rep, s),
     }
 }
 
 /// The table in the arithmetic `A`: lattice walk, spawn chain, passes to
 /// inductive ranges, d.
-fn build<A: GraphArith>(root: &FsPath, spd_px: i32, threads: usize, rep: &mut String, s: &crate::settings::Settings) -> Result<Built> {
+fn build<A: GraphArith>(spd_px: i32, threads: usize, rep: &mut String, s: &crate::settings::Settings) -> Result<Built> {
     let t_all = std::time::Instant::now();
     let room0 = s.room;
     let spd_px = i16::try_from(spd_px).map_err(|_| anyhow!("the speed bound {spd_px} px is out of range"))?;
     let walk = crate::trace::walk::Walk { settings: s, only: None };
-    let lw = crate::trace::walk::room_constant_lattice::<A>(root, crate::abstraction::Level { held: true, ..crate::abstraction::Level::EXACT }, &walk)?;
+    let lw = crate::trace::walk::room_constant_lattice::<A>(crate::abstraction::Level { held: true, ..crate::abstraction::Level::EXACT }, &walk)?;
     say!(rep, "room {room0:?}: lattice walk {} shapes, {:.1} s", lw.lattice.len(), t_all.elapsed().as_secs_f64())?;
     let mut tr = lw.tracer.clone();
     let mut table = Table {
         lw: &lw,
-        room: Room { cart: lw.cart.clone(), cache: lw.cache.clone() },
+        room: Room { cache: lw.cache.clone() },
         room0,
         hundred: s.hundred,
         spd_px,
@@ -1945,11 +1938,11 @@ fn build<A: GraphArith>(root: &FsPath, spd_px: i32, threads: usize, rep: &mut St
     Ok(Built { by_hash, g1, sound, chain, start_d })
 }
 
-pub fn probe(root: &FsPath, opts: &Opts, s: &crate::settings::Settings) -> Result<String> {
+pub fn probe(opts: &Opts, s: &crate::settings::Settings) -> Result<String> {
     measures_the_exit(s)?;
     let mut rep = String::new();
     let t_all = std::time::Instant::now();
-    let Built { by_hash, g1, sound, chain, .. } = build_in(root, opts.spd_px, opts.threads, &mut rep, s)?;
+    let Built { by_hash, g1, sound, chain, .. } = build_in(opts.spd_px, opts.threads, &mut rep, s)?;
 
     // Min sound d per 8 px tile (0-9, a-z, '+' above, '*' no path, '.' no node).
     say!(rep, "\nsound d per 8 px tile, the smallest over the table's shapes:")?;
@@ -2212,9 +2205,6 @@ mod room_tests {
     #[test]
     #[ignore = "pre-merge, ./check.sh all runs it: a lattice walk and five passes, ~250 CPU-s"]
     fn room_71_table_builds_with_its_balloon() {
-        if !std::path::Path::new("lua/celeste-minimal.lua").exists() {
-            return;
-        }
         let s = crate::settings::Settings { room: (7, 1), ..Default::default() };
         let t = super::table(5, &s).unwrap_or_else(|e| panic!("{e:#}"));
         assert_eq!(t.start_d, 45);
@@ -2224,9 +2214,6 @@ mod room_tests {
     #[test]
     #[ignore = "pre-merge, ./check.sh all runs it: a float lattice walk and its passes, ~110 CPU-s"]
     fn room_10_float_table_builds() {
-        if !std::path::Path::new("lua/celeste-minimal.lua").exists() {
-            return;
-        }
         let s = crate::settings::Settings { room: (1, 0), arith: crate::settings::Arith::Float(crate::settings::FloatTool::Celia), loading_jank: crate::starts::celia_jank((1, 0)).expect("Celia's J"), ..Default::default() };
         let t = super::table(5, &s).unwrap_or_else(|e| panic!("{e:#}"));
         assert_eq!(t.start_d, 44);

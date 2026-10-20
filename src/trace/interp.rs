@@ -58,8 +58,7 @@ pub struct Interp<'a, D: Domain> {
     /// Each poisoned path's guard and reason; their OR is the raise row's
     /// liveness. Reset per trace by `frame::trace_frame`.
     pub raised: Vec<(D::Bool, String)>,
-    /// The cart (optional for unit tests).
-    pub cart: Option<std::sync::Arc<celeste_core::cart_data::CartData>>,
+    /// The room's collision cache (`cart::boot`; none in unit tests).
     pub cache: Option<std::sync::Arc<celeste_core::collision_cache::CollisionCache>>,
     /// Budgets, so a blow-up is a DIAGNOSIS naming the construct, not a hang.
     pub max_states: usize,
@@ -100,7 +99,6 @@ impl<'a, D: Domain> Interp<'a, D> {
             hint: Vec::new(),
             illegal: Default::default(),
             raised: Vec::new(),
-            cart: None,
             cache: None,
             max_states: 256,
             max_nodes: 2_000_000,
@@ -1218,7 +1216,7 @@ impl<'a, D: Domain> Interp<'a, D> {
         if let Some(v) = self.room_flags.get(&(rx, ry, flag)) {
             return Ok(*v);
         }
-        let cart = self.cart.clone().ok_or_else(|| anyhow!("tile_flag_at: no cart"))?;
+        let cart = &celeste_core::cart_data::CART;
         let mut found = false;
         'scan: for i in 0..16i16 {
             for j in 0..16i16 {
@@ -1529,10 +1527,7 @@ impl<'a, D: Domain> Interp<'a, D> {
             }
             // The map is concrete data: concrete coordinates fold.
             "mget" | "fget" => {
-                let cart = self
-                    .cart
-                    .clone()
-                    .ok_or_else(|| anyhow!("{}: no cart loaded", name))?;
+                let cart = &celeste_core::cart_data::CART;
                 let (a, b) = (num(0)?, num(1)?);
                 let int = |v, what| D::A::as_i16(v).ok_or_else(|| anyhow!("{name}: {what} is not an integer"));
                 match (self.d.as_const(&a), self.d.as_const(&b)) {
@@ -1575,11 +1570,7 @@ impl<'a, D: Domain> Interp<'a, D> {
                                 .cache
                                 .clone()
                                 .ok_or_else(|| anyhow!("tile_flag_at: no collision cache"))?;
-                            let cart = self
-                                .cart
-                                .clone()
-                                .ok_or_else(|| anyhow!("tile_flag_at: no cart"))?;
-                            let r = cache.flag_at(&cart, gi(x)?, gi(y)?, gi(w)?, gi(h)?, fi)?;
+                            let r = cache.flag_at(gi(x)?, gi(y)?, gi(w)?, gi(h)?, fi)?;
                             (st, Value::Bool(self.d.boolean(r)))
                         }
                         _ => {
