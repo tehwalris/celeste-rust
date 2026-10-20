@@ -52,7 +52,6 @@ pub fn decode_rows<N: EngineNum>(keys: &KeySpace<N>, skel: &Rt2<N>, rows: &[(Key
         globals: skel.globals.clone(),
         strings: skel.strings.clone(),
         cache: skel.cache.clone(),
-        prints: skel.prints.clone(),
         shape_hash: skel.shape_hash,
         row_keys: rows.iter().map(|r| r.0).collect(),
     };
@@ -290,8 +289,8 @@ impl<N: EngineNum> Skeletons<N> {
         let keyed: Vec<(Key, u32)> = rows.row_keys.iter().copied().zip(cells.iter().copied()).collect();
         let d = decode_rows(keys, &skel, &keyed)?;
         let lossy = |what: String| anyhow!("ROWS FROM KEYS: an emitted row of shape {:016x} is not what its key and cell decode to ({what}): the new layer would hold another state", rows.shape_hash);
-        if d.structure != rows.structure || d.globals != rows.globals || d.strings != rows.strings || d.prints != rows.prints {
-            return Err(lossy("structure, globals, strings or prints".into()));
+        if d.structure != rows.structure || d.globals != rows.globals || d.strings != rows.strings {
+            return Err(lossy("structure, globals or strings".into()));
         }
         for (c, (a, b)) in rows.cols.iter().zip(&d.cols).enumerate() {
             for r in 0..rows.width {

@@ -131,7 +131,6 @@ pub struct Rt2<N = P8> {
     pub globals: Vec<u32>,
     pub strings: Vec<String>,
     pub cache: Arc<CollisionCache>,
-    pub prints: Vec<String>,
     /// Set by `boundary`: the canonical structure hash (the shape key).
     pub shape_hash: u64,
     /// A stored piece's per-lane EXACT keys (its tree's `exact::KeySpace`);
@@ -250,7 +249,6 @@ impl<N: EngineNum> Rt2<N> {
             globals: vec![NONE; globals_len],
             strings: static_strings.iter().map(|s| s.to_string()).collect(),
             cache,
-            prints: Vec::new(),
             shape_hash: 0,
             row_keys: Vec::new(),
         }
@@ -535,6 +533,12 @@ impl<N: EngineNum> Rt2<N> {
         self.boundary_finish();
     }
 
+    /// `canonical`, by value.
+    pub fn canonicalized(mut self) -> Self {
+        self.canonical();
+        self
+    }
+
     /// Shared boundary head: every column at block width.
     fn boundary_prepare(&mut self) {
         let full = |c: &Col<N>| match c {
@@ -556,7 +560,6 @@ impl<N: EngineNum> Rt2<N> {
     /// Shared boundary tail: canonical ids and the shape hash; row keys
     /// cleared.
     fn boundary_finish(&mut self) {
-        assert!(self.prints.is_empty(), "prints at a frame boundary: {:?}", self.prints);
         self.canonicalize_ids();
         self.shape_hash = self.shape_hash_of();
         self.row_keys.clear();
@@ -612,7 +615,6 @@ impl<N: EngineNum> Rt2<N> {
             globals: self.globals.clone(),
             strings: self.strings.clone(),
             cache: self.cache.clone(),
-            prints: self.prints.clone(),
             shape_hash: self.shape_hash,
             row_keys: self.row_keys.clone(),
         }

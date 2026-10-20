@@ -144,10 +144,10 @@ where
         let mut wins = Vec::new();
         for (s, late) in &states {
             for b in eng.step(s, byte)? {
-                if wins_of(b.rt2(), cfg)?.iter().any(|&x| x) {
+                if wins_of(&b, cfg)?.iter().any(|&x| x) {
                     wins.push(late.clone());
                 } else {
-                    next.push((b.into_rt2(), late.clone()));
+                    next.push((b, late.clone()));
                 }
             }
         }

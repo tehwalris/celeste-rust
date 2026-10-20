@@ -96,7 +96,7 @@ where
         if seen.insert(world.clone()) {
             worlds.push(world);
         }
-        state = eng.step_one(&state, 0)?.into_rt2();
+        state = eng.step_one(&state, 0)?;
     }
     Ok(PlatformWorlds(worlds))
 }
@@ -127,9 +127,9 @@ mod tests {
         let mut b = split.initial().expect("split init");
         assert_eq!(fingerprint(&a), fingerprint(&b), "the initial states differ");
         for (f, &byte) in bytes.iter().enumerate() {
-            a = whole.step_one(&a, byte).expect("frame").into_rt2();
-            b = split.step_one(&b, byte).expect("part a").into_rt2();
-            b = split.step_one(&b, byte).expect("part b").into_rt2();
+            a = whole.step_one(&a, byte).expect("frame");
+            b = split.step_one(&b, byte).expect("part a");
+            b = split.step_one(&b, byte).expect("part b");
             assert_eq!(fingerprint(&a), fingerprint(&b), "frame {}: after the split frame's two steps the state is not the unsplit frame's", f + 1);
         }
     }

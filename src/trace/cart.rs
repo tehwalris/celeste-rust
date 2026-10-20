@@ -462,7 +462,7 @@ mod tests {
             let mut eng = RefEngine::new(&s).expect("engine");
             let mut row = eng.initial().expect("initial");
             for _ in 0..40 {
-                row = eng.step_one(&row, 0).expect("idle frame").into_rt2();
+                row = eng.step_one(&row, 0).expect("idle frame");
             }
             starts.iter().map(|&b| eng.step(&row, b).expect("dash frame").len()).collect()
         };

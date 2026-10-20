@@ -16,10 +16,11 @@
 //! concrete search is exhaustive over leaves); else each lineage's first
 //! failing step is reported (`explain`) and the search FAILS.
 
+use celeste_engine::runtime2::Rt2;
 use super::concrete::{concrete_engines, exact_state, lookup_keys, lookup_view, rem_of, rem_raw, Side};
 use super::rem::Rem;
 use crate::compiled::KernelLanes;
-use crate::frame::{wins_of, Block, MarkFilter, Visited};
+use crate::frame::{wins_of, MarkFilter, Visited};
 use crate::storage::Sk;
 use celeste_core::arith::EngineNum;
 use celeste_core::pico8_num::Pico8Num as P8;
@@ -75,7 +76,7 @@ pub(super) struct Pruning<'a, N: Rem = P8> {
 /// The route's states per step (each with its parent's index) up to the
 /// step before the exit; the exit step and its winning leaves' parents.
 struct Run<N: EngineNum> {
-    layers: Vec<Vec<(u32, Block<N>)>>,
+    layers: Vec<Vec<(u32, Rt2<N>)>>,
     exit: Option<(u32, Vec<u32>)>,
 }
 
@@ -83,16 +84,16 @@ fn run<N: Rem>(inputs: &[u8], horizon: u32, settings: &crate::settings::Settings
     let clock = settings.clock();
     let (mut engines, seeded) = concrete_engines::<N>(1, settings)?;
     let eng = &mut engines[0];
-    let mut layers: Vec<Vec<(u32, Block<N>)>> = vec![vec![(0, Block::canonical(eng.initial()?)?)]];
+    let mut layers: Vec<Vec<(u32, Rt2<N>)>> = vec![vec![(0, eng.initial()?.canonicalized())]];
     for s in 0..horizon {
         // The step to `s + 1` is in frame `frame_of(s + 1)`: its input.
         let Some(&byte) = inputs.get(clock.frame_of(s + 1) as usize - 1) else { break };
         let (mut next, mut seen, mut won) = (Vec::new(), rustc_hash::FxHashSet::default(), Vec::new());
         for (p, (_, b)) in layers.last().expect("the start").iter().enumerate() {
-            for c in eng.step(b.rt2(), byte)? {
-                if wins_of(c.rt2(), settings)?.iter().any(|&x| x) {
+            for c in eng.step(b, byte)? {
+                if wins_of(&c, settings)?.iter().any(|&x| x) {
                     won.push(p as u32);
-                } else if seen.insert(exact_state(&c, c.positions()?[0])) {
+                } else if seen.insert(exact_state(&c, crate::search::pos_graph::block_cells(&c)?[0])) {
                     next.push((p as u32, c));
                 }
             }
@@ -189,12 +190,12 @@ pub(super) fn check<N: KernelLanes>(route: &Route<N>, p: &Pruning<N>) -> anyhow:
         let per_frame = clock.per_frame as usize;
         for t in s.saturating_sub(per_frame)..=(s + per_frame).min(last) {
             let (_, b) = &run.layers[t][idx[t]];
-            let (x, y) = rem_of::<N>(b.rt2())?;
+            let (x, y) = rem_of::<N>(b)?;
             eprintln!(
                 "[known]   step {t} ({}): {}\n[known]     state {} (remainder point ({x:?}, {y:?}))",
                 clock.show(t as u32),
                 miss(t).map_or("passes", |m| m.what.as_str()),
-                crate::search::inspect::player_summary(b.rt2(), 0)
+                crate::search::inspect::player_summary(b, 0)
             );
         }
         if miss(s).is_some_and(|m| m.lost) {
@@ -228,12 +229,12 @@ fn explain<N: KernelLanes>(run: &Run<N>, idx: &[usize], s: usize, seeded: bool, 
         (sk, tree.layer_of(sk, s0 as u32)?.ok_or_else(|| anyhow::anyhow!("its state at step {s0} is not in the tree by then"))?)
     };
     let kernels = crate::compiled::Kernels::<N>::new(p.side.s, p.side.level)?;
-    let mut blocks = vec![Block::from_rt2(tree.row(layer, sk, p.side.s.room)?)];
+    let mut blocks = vec![tree.row(layer, sk, p.side.s.room)?];
     for k in 0..per_frame {
         blocks = crate::storage::wave::one_frame(&kernels, blocks, layer + 1 + k as u32)?.next;
     }
-    let kset: std::collections::BTreeSet<Proj> = blocks.into_iter().flat_map(|b| project_onto(&mut b.into_rt2(), p.side.level)).collect();
-    let want = project_onto(&mut lookup_view(run.layers[s][idx[s]].1.rt2(), seeded)?, p.side.level).remove(0);
+    let kset: std::collections::BTreeSet<Proj> = blocks.into_iter().flat_map(|mut b| project_onto(&mut b, p.side.level)).collect();
+    let want = project_onto(&mut lookup_view(&run.layers[s][idx[s]].1, seeded)?, p.side.level).remove(0);
     let made = kset.contains(&want);
     let mut out = vec![format!(
         "the kernels from its state at step {s0} (the tree's row, layer {layer}, state {}): {} successors at step {s}; the route's state is {}",
@@ -282,7 +283,7 @@ type Held<N> = (Sk, Option<(N, N)>);
 /// THE HULL FORWARD'S CLAIM for `b` at step `s`: in the tree by `s`, its
 /// remainder inside its hull, and a recorded edge mapping its parent's
 /// (`from`) remainder to its own. Where the tree holds it, or the miss.
-fn hull_claim<N: Rem>(b: &Block<N>, s: u32, sk: Option<Sk>, from: Option<Held<N>>, h: &Hulls<N>, node: &str) -> anyhow::Result<Result<Held<N>, Miss>> {
+fn hull_claim<N: Rem>(b: &Rt2<N>, s: u32, sk: Option<Sk>, from: Option<Held<N>>, h: &Hulls<N>, node: &str) -> anyhow::Result<Result<Held<N>, Miss>> {
     let miss = |what: String| Ok(Err(Miss { forward: true, lost: false, what }));
     let Some((sk, layer)) = (match sk {
         Some(sk) => h.tree.layer_of(sk, s)?.map(|l| (sk, l)),
@@ -290,7 +291,7 @@ fn hull_claim<N: Rem>(b: &Block<N>, s: u32, sk: Option<Sk>, from: Option<Held<N>
     }) else {
         return Ok(Err(Miss { forward: true, lost: true, what: format!("NOT IN THE TREE by step {s} ({node})") }));
     };
-    let r = rem_raw(b.rt2())?;
+    let r = rem_raw(b)?;
     let zero = <N::A as celeste_core::arith::Arithmetic>::from_i16(0);
     let (x, y) = r.unwrap_or((zero, zero));
     // (A full hull is not stored: it holds every remainder.)
@@ -317,7 +318,7 @@ fn hull_claim<N: Rem>(b: &Block<N>, s: u32, sk: Option<Sk>, from: Option<Held<N>
 /// The first check state `b` at step `s` (its parent held at `from`) fails,
 /// and where the tree holds it (with `hulls`).
 #[allow(clippy::too_many_arguments)]
-fn verdict<N: Rem>(b: &Block<N>, s: u32, from: Option<Held<N>>, seeded: bool, l1: Option<(u32, &crate::search::level_minus_one::CostToGo)>, route: &Route<N>, p: &Pruning<N>) -> anyhow::Result<(Option<Miss>, Option<Held<N>>)> {
+fn verdict<N: Rem>(b: &Rt2<N>, s: u32, from: Option<Held<N>>, seeded: bool, l1: Option<(u32, &crate::search::level_minus_one::CostToGo)>, route: &Route<N>, p: &Pruning<N>) -> anyhow::Result<(Option<Miss>, Option<Held<N>>)> {
     let (shape, keys, cells) = lookup_keys(b, p.side.level, seeded, p.side.keys)?;
     let (key, cell) = (keys[0], cells[0]);
     let node = match key {
@@ -333,7 +334,7 @@ fn verdict<N: Rem>(b: &Block<N>, s: u32, from: Option<Held<N>>, seeded: bool, l1
             }
         }
         if let Some(f) = route.filter {
-            let mut row = lookup_view(b.rt2(), seeded)?;
+            let mut row = lookup_view(b, seeded)?;
             crate::frame::widen_rt2_to(&mut row, p.side.level);
             if !f.allowed(&row, s)?[0] {
                 return Ok((
@@ -375,7 +376,7 @@ fn verdict<N: Rem>(b: &Block<N>, s: u32, from: Option<Held<N>>, seeded: bool, l1
         };
         return Ok((miss, held));
     };
-    let (x, y) = rem_of::<N>(b.rt2())?;
+    let (x, y) = rem_of::<N>(b)?;
     match p.side.w.at(s, i) {
         None => return Ok((backward(format!("W_{s} of its node is EMPTY ({node})")), held)),
         Some(r) if !r.contains(x, y) => return Ok((backward(format!("its remainder ({x:?}, {y:?}) is OUTSIDE W_{s} of its node, {r:?} ({node})")), held)),

@@ -52,7 +52,7 @@ pub fn run(cfg: &Settings, a: Args) -> Result<()> {
         let byte = inputs.get(f as usize - 1).copied().unwrap_or(0);
         let mut out = eng.frame(&state, byte)?;
         anyhow::ensure!(out.len() == 1, "frame {f}: {} leaves (an `rnd` fork: give the balloons' seeds)", out.len());
-        state = out.remove(0).into_rt2();
+        state = out.remove(0);
         print_frame(&state, f, byte);
         if let Some(t) = &object {
             print_object(&state, t);

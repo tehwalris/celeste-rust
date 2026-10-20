@@ -7,9 +7,9 @@
 
 use anyhow::Result;
 use celeste_core::lua_f64::LuaF64;
-use celeste_engine::runtime2::P8;
+use celeste_engine::runtime2::{Rt2, P8};
 use celeste_rust::abstraction::Level;
-use celeste_rust::frame::{Block, FrameStep};
+use celeste_rust::frame::FrameStep;
 use celeste_rust::search::inspect::parse_xy;
 use celeste_rust::search::tree::TreeDir;
 use celeste_rust::settings::{Arith, Settings};
@@ -421,7 +421,7 @@ fn forward<N: celeste_rust::search::rem::Rem>(
     level: Level,
     cfg: &celeste_rust::settings::Settings,
     engine: Box<dyn FrameStep<N>>,
-    initial: impl FnOnce() -> Result<Vec<Block<N>>>,
+    initial: impl FnOnce() -> Result<Vec<Rt2<N>>>,
 ) -> Result<()> {
     let t = std::time::Instant::now();
     // Resumed or started (`grow_tree`).
@@ -493,12 +493,12 @@ fn main() -> Result<()> {
                 Arith::Fixed => {
                     let engine: Box<dyn FrameStep> = if reference { Box::new(celeste_rust::engines::reference::RefFrameStep::<P8>::new(&cfg, level)?) } else { Box::new(celeste_rust::compiled::FrameEngine::new(&cfg, level)?) };
                     eprintln!("[fwd] engine up in {:.2} s ({level}{what})", t.elapsed().as_secs_f64());
-                    forward(dir, a.to, level, &cfg, engine, || Ok(vec![Block::canonical(RefEngine::new(&cfg)?.initial()?)?]))
+                    forward(dir, a.to, level, &cfg, engine, || Ok(vec![RefEngine::new(&cfg)?.initial()?.canonicalized()]))
                 }
                 Arith::Float(_) => {
                     let engine: Box<dyn FrameStep<LuaF64>> = if reference { Box::new(celeste_rust::engines::reference::RefFrameStep::<LuaF64>::new(&cfg, level)?) } else { Box::new(celeste_rust::compiled::FloatKernels::new(&cfg, level)?) };
                     eprintln!("[fwd] engine up in {:.2} s ({level}{what}, {})", t.elapsed().as_secs_f64(), cfg.arith);
-                    forward(dir, a.to, level, &cfg, engine, || Ok(vec![Block::canonical(FloatRefEngine::new(&cfg)?.initial()?)?]))
+                    forward(dir, a.to, level, &cfg, engine, || Ok(vec![FloatRefEngine::new(&cfg)?.initial()?.canonicalized()]))
                 }
             }
         }

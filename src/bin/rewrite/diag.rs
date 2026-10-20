@@ -322,7 +322,7 @@ pub fn trajectory(cfg: &Settings, a: TrajectoryArgs) -> Result<()> {
                 // the real-PICO-8 replay settles it.
                 for block in eng.step(st, byte)? {
                     tried += 1;
-                    let cell = block.positions()?[0];
+                    let cell = celeste_rust::search::pos_graph::block_cells(&block)?[0];
                     let pos = celeste_rust::search::pos_graph::cell_xy(cell);
                     if let Some(w) = want {
                         if pos != Some(*w) {
@@ -331,19 +331,19 @@ pub fn trajectory(cfg: &Settings, a: TrajectoryArgs) -> Result<()> {
                         }
                     }
                     // Deduplicated on the EXACT state.
-                    let mut exact = celeste_engine::exact::exact_rows(block.rt2(), celeste_rust::compiled::ids()).swap_remove(0).into_vec();
+                    let mut exact = celeste_engine::exact::exact_rows(&block, celeste_rust::compiled::ids()).swap_remove(0).into_vec();
                     exact.extend_from_slice(&cell.to_le_bytes());
                     if !seen.insert(exact.into_boxed_slice()) {
                         continue;
                     }
                     let mut p = path.clone();
                     p.push(byte);
-                    if stop_at_win && wins_of(block.rt2(), &cfg)?.iter().any(|&w| w) {
+                    if stop_at_win && wins_of(&block, &cfg)?.iter().any(|&w| w) {
                         println!("[trajectory] WIN at f{f} after {} frames; inputs:", p.len());
                         println!("{}", p.iter().map(|b| b.to_string()).collect::<Vec<_>>().join(","));
                         return Ok(());
                     }
-                    next.push((block.into_rt2(), p));
+                    next.push((block, p));
                 }
             }
         }

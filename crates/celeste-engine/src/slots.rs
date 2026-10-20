@@ -14,16 +14,18 @@ use celeste_core::arith::EngineNum;
 
 use crate::runtime2::{Cell2, Col, Rt2, AV, NONE};
 
-/// One step of a path. Mirrors the tracer's `iface::Step`, which
-/// converts into this rather than duplicating the walk below.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum PathStep {
+/// One step of a path, the tracer's and the engine's (`trace::iface`'s
+/// paths are these; `resolve_steps` is the one walk).
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Step {
     Key(String),
     /// A slot of the ARRAY part, zero-based.
     Idx(usize),
-    /// An integer key by its Lua key (1-based), written `[#n]`. Integer
-    /// keys live in the array part (`t[3] = v` on an empty table is a dense
-    /// array with explicit nils), so `[#3]` and `[2]` name the same cell.
+    /// An integer key by its Lua key (1-based), written `[#n]`: in the
+    /// tracer's heap a key outside the array part (`Table::ints`, not
+    /// measured by `#`); in a block, integer keys live in the array part
+    /// (`t[3] = v` on an empty table is a dense array with explicit nils),
+    /// so `[#3]` and `[2]` name the same cell.
     Int(i16),
 }
 
@@ -53,11 +55,11 @@ pub fn deref<N: EngineNum>(rt2: &Rt2<N>, cell: u32) -> Result<u32, String> {
 }
 
 /// The canonical cell id a path names in this block.
-pub fn resolve_steps<N: EngineNum>(rt2: &Rt2<N>, p: &[PathStep]) -> Result<u32, String> {
+pub fn resolve_steps<N: EngineNum>(rt2: &Rt2<N>, p: &[Step]) -> Result<u32, String> {
     let mut cur: Option<u32> = None;
     for step in p {
         cur = Some(match (cur, step) {
-            (None, PathStep::Key(k)) => {
+            (None, Step::Key(k)) => {
                 let gi = celeste_names::GLOBAL_NAMES
                     .iter()
                     .position(|n| n == k)
@@ -72,7 +74,7 @@ pub fn resolve_steps<N: EngineNum>(rt2: &Rt2<N>, p: &[PathStep]) -> Result<u32, 
             (Some(c), step) => {
                 let t = deref(rt2, c)?;
                 match (&rt2.structure[t as usize], step) {
-                    (Cell2::Obj(fields), PathStep::Key(k)) => {
+                    (Cell2::Obj(fields), Step::Key(k)) => {
                         // Fields outside `FIELD_NAMES` were dropped on
                         // import, so a kernel cannot be asking for one.
                         let f = celeste_names::FIELD_NAMES
@@ -86,11 +88,11 @@ pub fn resolve_steps<N: EngineNum>(rt2: &Rt2<N>, p: &[PathStep]) -> Result<u32, 
                             .ok_or_else(|| format!("{}: absent from this object", k))?
                             .1
                     }
-                    (Cell2::Arr(items), PathStep::Idx(i)) => *items
+                    (Cell2::Arr(items), Step::Idx(i)) => *items
                         .get(*i)
                         .ok_or_else(|| format!("[{}]: past the end of a {}-item array", i, items.len()))?,
                     // A Lua integer key is array slot k-1.
-                    (Cell2::Arr(items), PathStep::Int(k)) => {
+                    (Cell2::Arr(items), Step::Int(k)) => {
                         if *k < 1 {
                             return Err(format!("[#{}]: not a Lua array key", k));
                         }

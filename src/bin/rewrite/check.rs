@@ -7,7 +7,7 @@
 use anyhow::Result;
 use celeste_engine::runtime2::Rt2;
 use celeste_rust::abstraction::Level;
-use celeste_rust::frame::{widen_rt2_to, wins_of, Block, FrameStep};
+use celeste_rust::frame::{widen_rt2_to, wins_of, FrameStep};
 use celeste_rust::search::inspect::{brief, cell_names, project_all, project_onto, project_row, Proj};
 use celeste_rust::search::rem::Rem;
 use celeste_rust::search::tree::TreeDir;
@@ -224,11 +224,11 @@ pub fn run(run: &Settings, c: Command) -> Result<()> {
 /// Every row of `rt2` (of layer `layer`) through ONE forward frame of
 /// `engine` (an empty visited set, no filter): the successors and whether
 /// one wins.
-pub(crate) fn rerun<N: celeste_rust::search::rem::Rem>(engine: &dyn FrameStep<N>, rt2: Rt2<N>, layer: u32) -> Result<(Vec<Block<N>>, bool)> {
-    let wave = celeste_rust::storage::wave::one_frame(engine, vec![Block::from_rt2(rt2)], layer + 1)?;
+pub(crate) fn rerun<N: celeste_rust::search::rem::Rem>(engine: &dyn FrameStep<N>, rt2: Rt2<N>, layer: u32) -> Result<(Vec<Rt2<N>>, bool)> {
+    let wave = celeste_rust::storage::wave::one_frame(engine, vec![rt2], layer + 1)?;
     let mut won = false;
     for b in &wave.next {
-        won |= wins_of(b.rt2(), &engine.settings())?.contains(&true);
+        won |= wins_of(b, &engine.settings())?.contains(&true);
     }
     Ok((wave.next, won))
 }
@@ -276,17 +276,17 @@ where
         if a.row.is_some() {
             shown += &format!("    the row: {}\n", me.iter().map(|(k, v)| format!("{k}={v}")).collect::<Vec<_>>().join(" "));
         }
-        for b in next {
-            agree(reference, b.rt2())?;
+        for mut b in next {
+            agree(reference, &b)?;
             if a.row.is_some() {
-                let (cells, names) = (celeste_rust::search::pos_graph::block_cells(b.rt2())?, cell_names(b.rt2(), ids));
-                for i in 0..b.rt2().width {
-                    let p = project_row(b.rt2(), &names, i as u32, &[]);
+                let (cells, names) = (celeste_rust::search::pos_graph::block_cells(&b)?, cell_names(&b, ids));
+                for i in 0..b.width {
+                    let p = project_row(&b, &names, i as u32, &[]);
                     let changed: Vec<String> = p.iter().filter(|(k, v)| me.get(*k) != Some(*v)).map(|(k, v)| format!("{k}={v}")).collect();
                     shown += &format!("    -> {} {}\n", where_(cells[i]), changed.join(" "));
                 }
             }
-            kset.extend(project_onto(&mut b.into_rt2(), level));
+            kset.extend(project_onto(&mut b, level));
         }
         // The reference engine's, from the row projected onto the level.
         let mut input = rt2.clone_block();
@@ -298,9 +298,9 @@ where
             }
             other => other?,
         };
-        for (leaf, _) in leaves {
-            agree(reference, leaf.rt2())?;
-            rset.extend(project_onto(&mut leaf.into_rt2(), level));
+        for (mut leaf, _) in leaves {
+            agree(reference, &leaf)?;
+            rset.extend(project_onto(&mut leaf, level));
         }
         let missing: Vec<&Proj> = rset.difference(&kset).collect();
         let extra: Vec<&Proj> = kset.difference(&rset).collect();
@@ -402,8 +402,8 @@ where
             let mut rt2 = blocks[bi].1.clone_block();
             rt2.retain_lanes(&[r]);
             for b in rerun(&kernels, rt2, frame)?.0 {
-                emitted_rows += b.lanes();
-                moved += check(b.rt2(), "emitted", moved);
+                emitted_rows += b.width;
+                moved += check(&b, "emitted", moved);
             }
         }
     }

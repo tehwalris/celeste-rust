@@ -96,9 +96,9 @@ pub fn starts(s: &crate::settings::Settings) -> Result<Starts> {
     let mut classes: Vec<(celeste_engine::exact::ExactRow, u32, Vec<usize>)> = Vec::new();
     for &j in &feasible {
         let sj = crate::settings::Settings { loading_jank: Some(j), ..s.clone() };
-        let b = crate::frame::Block::canonical(RefEngine::new(&sj)?.initial()?)?;
-        let row = celeste_engine::exact::exact_rows(b.rt2(), crate::compiled::ids()).swap_remove(0);
-        let cell = b.positions()?[0];
+        let b = RefEngine::new(&sj)?.initial()?.canonicalized();
+        let row = celeste_engine::exact::exact_rows(&b, crate::compiled::ids()).swap_remove(0);
+        let cell = crate::search::pos_graph::block_cells(&b)?[0];
         match classes.iter_mut().find(|(r, c, _)| *r == row && *c == cell) {
             Some((_, _, js)) => js.push(j),
             None => classes.push((row, cell, vec![j])),
@@ -125,7 +125,7 @@ fn spawn_frame(s: &crate::settings::Settings, room: (i16, i16)) -> Result<u32> {
     for f in 1..=120 {
         let mut next = eng.frame(&state, 0)?;
         anyhow::ensure!(next.len() == 1, "room {room:?} frame {f}: {} leaves without input (seed its balloons: --balloon-seeds)", next.len());
-        state = next.remove(0).into_rt2();
+        state = next.remove(0);
         if !crate::concrete::objects_of_type(&state, "player").is_empty() {
             return Ok(f);
         }
