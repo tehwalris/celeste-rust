@@ -426,7 +426,7 @@ own W, for the shortest run valid in both (plans/float.md).
 
 ## Checks
 
-The check ladder is `./check.sh t0|t1|t2|big` (plans/devloop.md). The
+The check ladder is `./check.sh t0 t1 t2 big` (plans/devloop.md). The
 verification surface behind it:
 
 - **The pinned room (1,0) gates** (`gates/`): each frame's states and

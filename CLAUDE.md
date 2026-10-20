@@ -125,8 +125,9 @@ is reading material only.
 
 Use `./safe-run.sh` for EVERYTHING that builds or runs - cargo, nextest,
 the binaries, benches, the search - including commands issued by
-subagents and by scripts (the `scripts_wrapped` test fails on a script
-line that is not wrapped). It runs the command in a systemd scope with a
+subagents and by scripts (the `rewrite` binary and one-cargo.sh refuse to
+run without a memory cap: `settings::refuse_uncapped`). It runs the
+command in a systemd scope with a
 memory cap (default 60G, `--memory 85G` to raise it for one run), so a
 blowup kills the process, not the machine (2026-08-24: 120 GB outside the
 wrapper took the whole session down).
@@ -150,7 +151,7 @@ wrapper took the whole session down).
 
 ## Checking a change
 
-`./check.sh TIER`. What each tier runs and pins, the fixtures, the
+`./check.sh TIER...` (e.g. `./check.sh t0 t1 t2 big`). What each tier runs and pins, the fixtures, the
 instruction budget and re-pinning: plans/devloop.md. The contract is the
 black-box pins (the fixture frames, the room (1,0) gates, the objects
 ladder, float and dual, the reference-engine checks, the instruction
@@ -158,7 +159,7 @@ budget): a change keeps them byte-identical, or re-pins them on evidence.
 
 | tier | when | wall |
 |---|---|---|
-| inner loop | while editing: `./one-cargo.sh cargo check --all-targets`, `./one-cargo.sh cargo nextest run <filter>` | 1 s, ~7 s |
+| inner loop | while editing: `./safe-run.sh -- ./one-cargo.sh cargo check --all-targets`, `... cargo nextest run <filter>` | 1 s, ~7 s |
 | `t0` | before every commit: the unit tests | ~3 s (+ the test build) |
 | `t1` | after any change to the forward, kernels, tracer or storage: single frames, fixed and float | ~35 s |
 | `t2` | before handing a change over: end to end, and the slow tests | ~55 s |

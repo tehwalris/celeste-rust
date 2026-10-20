@@ -1,8 +1,8 @@
 // The exported runs (`rewrite export-ui`, src/search/ui_export.rs): the
 // data directory holds `runs.json` - the runs to offer, in order, the
 // first one the default - and one subdirectory per run with its
-// run.json plus one binary per (horizon, level) for frames, marks and
-// marks-by-layer. Every binary is little-endian u32 at 4-byte alignment,
+// run.json, its timings.json (the wall times, merged in by `loadRun`) plus
+// one binary per (horizon, level) for frames, marks and marks-by-layer. Every binary is little-endian u32 at 4-byte alignment,
 // read as Uint32Array views; nothing is parsed.
 
 export interface FwdLine {
@@ -208,12 +208,27 @@ export async function loadRuns(): Promise<RunInfo[]> {
   return runs;
 }
 
+/** A run's wall times (`timings.json`), apart from run.json so that the
+ *  latter is a function of the search alone: the whole run's, and each
+ *  forward line's, in run.json's nesting. */
+interface Timings {
+  wall_s: number | null;
+  horizons: { levels: { fwd: Pick<FwdLine, "emit_ms" | "emit_idle" | "own_ms" | "own_idle" | "ckpt_ms" | "pos_ms" | "total_ms" | "rss_gb">[] }[] }[];
+}
+
 export async function loadRun(id: string): Promise<Run> {
   const r = await fetch(dataUrl(`${id}/run.json`));
   if (!r.ok) throw new Error(`${id}/run.json: HTTP ${r.status}`);
   const run = (await r.json()) as Run;
   if (run.format !== 1) throw new Error(`${id}/run.json format ${run.format}, expected 1`);
   run.id = id;
+  // Older exports hold their timings in run.json and have no timings.json.
+  const t = await fetch(dataUrl(`${id}/timings.json`));
+  if (t.ok) {
+    const tm = (await t.json()) as Timings;
+    run.wall_s = tm.wall_s;
+    run.horizons.forEach((h, i) => h.levels.forEach((l, j) => l.fwd.forEach((f, k) => Object.assign(f, tm.horizons[i].levels[j].fwd[k]))));
+  }
   return run;
 }
 

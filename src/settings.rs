@@ -666,12 +666,38 @@ pub fn refuse_env() -> Result<()> {
     Ok(())
 }
 
+/// A binary's second step: refuse to run without a MEMORY CAP - a finite
+/// `memory.max` on the process's cgroup or an ancestor's (cgroup v2), what
+/// `./safe-run.sh` gives it (CLAUDE.md "Running safely": an uncapped run
+/// once took the machine down). Checked at run time, so no script can
+/// forget the wrapper.
+pub fn refuse_uncapped() -> Result<()> {
+    let own = std::fs::read_to_string("/proc/self/cgroup").context("reading /proc/self/cgroup (the memory cap's cgroup)")?;
+    capped(&own, Path::new("/sys/fs/cgroup"))
+}
+
+/// `refuse_uncapped` of a `/proc/self/cgroup` text over the cgroup tree at
+/// `root`.
+fn capped(own: &str, root: &Path) -> Result<()> {
+    let path = own.lines().find_map(|l| l.strip_prefix("0::")).with_context(|| format!("no cgroup v2 line in /proc/self/cgroup ({own:?}): the memory cap cannot be checked"))?;
+    let mut dir = Some(Path::new(path));
+    while let Some(d) = dir {
+        let max = std::fs::read_to_string(root.join(d.strip_prefix("/").unwrap_or(d)).join("memory.max")).unwrap_or_default();
+        if max.trim().parse::<u64>().is_ok() {
+            return Ok(());
+        }
+        dir = d.parent();
+    }
+    anyhow::bail!("no memory cap: cgroup {path} and every ancestor have memory.max `max`. Run it under ./safe-run.sh (CLAUDE.md \"Running safely\")")
+}
+
 /// A binary's settings from its flags (the environment refused), logged:
 /// one `[settings]` line with every setting not at its default. `float`:
 /// whether the command runs in float; one that does not REFUSES `--arith
 /// float` (it would run fixed under a float flag).
 pub fn startup(args: &Settings, float: bool, adjust: impl FnOnce(&mut Settings)) -> Result<Settings> {
     refuse_env()?;
+    refuse_uncapped()?;
     let mut s = args.clone().resolved()?;
     anyhow::ensure!(float || s.arith == Arith::Fixed, "--arith {}: this command runs in fixed only so far (plans/float.md, Open gaps)", s.arith);
     adjust(&mut s);
@@ -801,6 +827,23 @@ mod tests {
             }
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A process runs only under a memory cap: its cgroup's, or an
+    /// ancestor's, finite `memory.max`.
+    #[test]
+    fn a_run_without_a_memory_cap_is_refused() {
+        let root = std::env::temp_dir().join(format!("celeste-cgroup-{}", std::process::id()));
+        let scope = root.join("user.slice/run.scope");
+        std::fs::create_dir_all(&scope).expect("mkdir");
+        let own = "0::/user.slice/run.scope\n";
+        for (slice, run, ok) in [("max", "max", false), ("max", "2147483648", true), ("8589934592", "max", true)] {
+            std::fs::write(root.join("user.slice/memory.max"), format!("{slice}\n")).expect("write");
+            std::fs::write(scope.join("memory.max"), format!("{run}\n")).expect("write");
+            assert_eq!(capped(own, &root).is_ok(), ok, "slice {slice}, scope {run}");
+        }
+        assert!(capped("1:name=systemd:/x\n", &root).is_err(), "no cgroup v2 line");
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// The record round-trips; every differing setting is named; a tree

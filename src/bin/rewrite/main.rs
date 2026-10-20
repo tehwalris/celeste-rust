@@ -56,7 +56,7 @@ search steps (two a frame under --split-frame: `settings::Clock`). A tree
 is --tree DIR, a search's directory (its levels' trees under it)
 --search-dir DIR.
 
-Checking a change: ./check.sh t0|t1|t2|big (plans/devloop.md).";
+Checking a change: ./check.sh t0 t1 t2 big (plans/devloop.md).";
 
 const EXAMPLES: &str = "Examples:
   # A room's optimum, a known solution's length as the horizon:

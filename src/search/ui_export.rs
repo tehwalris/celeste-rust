@@ -20,7 +20,11 @@
 //!
 //! * `run.json` - the run: room, the cell box every binary indexes into,
 //!   the room's tiles, per level the per-frame forward stats and the names of
-//!   the level's binary files, the concrete paths and the download.
+//!   the level's binary files, the concrete paths and the download. A
+//!   function of the search alone: its wall times are in
+//! * `timings.json` - the run's wall time and, per forward line, its walls,
+//!   idle shares and memory (`Timings`, in run.json's nesting; the UI merges
+//!   them back).
 //! * `l00.frames.bin` - level 0's frames; `hHHH_lLL.frames.bin` for every
 //!   finer level. Format: `"CUF1" | u32 nframes | nframes x (u32 cells_off,
 //!   u32 ncells, u32 wins_off, u32 nwins) | data`, where a cells record at
@@ -48,7 +52,8 @@ use celeste_engine::exact::Key;
 use crate::search::pos_graph::cell_xy;
 use crate::storage::layer::{bits, last_frame, Tree};
 
-/// One forward frame's stats: a `forward.tsv` row under the UI's names.
+/// One forward frame's stats: a `forward.tsv` row under the UI's names;
+/// its wall times go to `timings.json`.
 #[derive(Serialize, Clone, Debug)]
 pub struct FwdLine {
     pub f: u32,
@@ -59,6 +64,13 @@ pub struct FwdLine {
     pub out_entries: u64,
     pub out_lanes: u64,
     pub visited: u64,
+    #[serde(skip)]
+    pub times: FwdTimes,
+}
+
+/// A forward line's wall times and memory (`timings.json`).
+#[derive(Serialize, Clone, Debug, Default)]
+pub struct FwdTimes {
     pub emit_ms: u64,
     pub emit_idle: u32,
     pub own_ms: u64,
@@ -127,7 +139,6 @@ pub struct Run {
     pub room: (i16, i16),
     pub cell_box: Box2,
     pub tiles: Tiles,
-    pub wall_s: Option<f64>,
     pub prebuild_s: Option<f64>,
     pub optimal: Option<u32>,
     pub horizons: Vec<HorizonRun>,
@@ -213,16 +224,18 @@ fn read_forward_stats(dir: &Path) -> Result<Vec<FwdLine>> {
                 out_entries: n(5)?,
                 out_lanes: n(6)?,
                 visited: n(7)?,
-                emit_ms: n(8)?,
-                emit_idle: n(9)? as u32,
-                // The storage's own wall time: the frame's end (its region
-                // phase runs inside the wave).
-                own_ms: n(10)?,
-                own_idle: 0,
-                ckpt_ms: n(11)?,
-                pos_ms: n(12)?,
-                total_ms: n(13)?,
-                rss_gb: x(14)?,
+                times: FwdTimes {
+                    emit_ms: n(8)?,
+                    emit_idle: n(9)? as u32,
+                    // The storage's own wall time: the frame's end (its
+                    // region phase runs inside the wave).
+                    own_ms: n(10)?,
+                    own_idle: 0,
+                    ckpt_ms: n(11)?,
+                    pos_ms: n(12)?,
+                    total_ms: n(13)?,
+                    rss_gb: x(14)?,
+                },
             },
         );
     }
@@ -901,7 +914,6 @@ pub fn export(checkpoint_dir: &Path, out: &Path, threads: usize, arc: Option<&Pa
         room,
         cell_box,
         tiles: room_tiles(room)?,
-        wall_s,
         prebuild_s: None,
         optimal,
         horizons: vec![hr],
@@ -909,9 +921,14 @@ pub fn export(checkpoint_dir: &Path, out: &Path, threads: usize, arc: Option<&Pa
         reference,
         download,
     };
+    let timings = serde_json::json!({
+        "wall_s": wall_s,
+        "horizons": run.horizons.iter().map(|h| serde_json::json!({ "levels": h.levels.iter().map(|l| serde_json::json!({ "fwd": l.fwd.iter().map(|f| &f.times).collect::<Vec<_>>() })).collect::<Vec<_>>() })).collect::<Vec<_>>(),
+    });
     let mut f = std::io::BufWriter::new(std::fs::File::create(out.join("run.json"))?);
     serde_json::to_writer(&mut f, &run)?;
     f.flush()?;
+    std::fs::write(out.join("timings.json"), serde_json::to_vec(&timings)?)?;
     let total: u64 = std::fs::read_dir(out)?.filter_map(|e| e.ok()).filter_map(|e| e.metadata().ok()).map(|m| m.len()).sum();
     eprintln!("[export-ui] wrote {} ({:.1} MB) in {:.1} s", out.display(), total as f64 / 1e6, t.elapsed().as_secs_f64());
     Ok(())
@@ -1028,7 +1045,8 @@ mod tests {
         }
         let got = read_forward_stats(&dir).unwrap();
         assert_eq!(got.iter().map(|l| (l.f, l.kept)).collect::<Vec<_>>(), vec![(1, 10), (2, 21), (3, 30)]);
-        assert_eq!((got[0].emit_ms, got[0].emit_idle, got[0].ckpt_ms, got[0].total_ms, got[0].visited, got[0].rss_gb), (7, 94, 1, 11, 4, 1.28));
+        let t = &got[0].times;
+        assert_eq!((t.emit_ms, t.emit_idle, t.ckpt_ms, t.total_ms, got[0].visited, t.rss_gb), (7, 94, 1, 11, 4, 1.28));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

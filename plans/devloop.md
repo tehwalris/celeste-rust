@@ -1,6 +1,6 @@
 # The check ladder
 
-One entry point: `./check.sh TIER`. Each step runs under `safe-run.sh` with
+One entry point: `./check.sh TIER...` (several tiers run in order: `./check.sh t0 t1 t2 big`). Each step runs under `safe-run.sh` with
 a 10G cap (the nextest runs 20G) and prints `ok`/`FAIL` with its wall time.
 The run exits non-zero on any failure. `--pin` writes the outputs as the new
 pins (see Re-pinning). The times below are from the quick profile at 16
@@ -42,7 +42,7 @@ counts as the evidence.
 
 | tier | runs | wall |
 |---|---|---|
-| inner loop | `./one-cargo.sh cargo check --all-targets`; `./one-cargo.sh cargo nextest run <filter>` (debug) | 1 s; 7 s after an edit |
+| inner loop | `./safe-run.sh -- ./one-cargo.sh cargo check --all-targets`; `... cargo nextest run <filter>` (debug) | 1 s; 7 s after an edit |
 | `t0` | the unit tests (nextest, quick; the `#[ignore]`d aside): the pre-commit run | 2-3 s (+15-40 s test build after an edit) |
 | `t1` | single frames from the fixtures, fixed and float, in 5 lanes: THE REFACTOR GATE | 35 s |
 | `t2` | end to end and the slow tests, in 4 lanes | 55 s |
@@ -79,7 +79,7 @@ A test that builds a room's kernels or runs a forward does not belong in
 t0. 2026-10-16: tests the pins cover were deleted. Each deletion's evidence
 is a bug injected by hand that the pins caught; see the commit. The slow
 ones moved out. Every `#[ignore]` reason starts with the tier that runs it
-(`scripts_wrapped` checks this):
+(`conventions` checks this):
 
 - `slow, `: t2 runs it (nextest `--run-ignored only`, 8 at a time);
 - `pre-merge, `: `all` runs it, one at a time (a level -1 table build,
@@ -97,7 +97,7 @@ them from its records (and refuse them as flags).
 
 | steps | what |
 |---|---|
-| frame-r10, -r62h, -r42n | `bench frame --edges --checkpoint --metrics` of r10 f55, r62h f50, r42n f60: the f/h/e/b lines and the exact metrics |
+| frame-r10, -r62h, -r42n | `bench frame --edges --checkpoint --expect --metrics` of r10 f55, r62h f50, r42n f60: the f/h/e/b lines and the exact metrics against their pins |
 | frame-f10, -f42n | the same in float (no metrics) |
 | keycheck-r10, -r42n, -f42n | `--key-check`: every emitted row's key recomputed from its fields, and decoded back |
 | refcheck-r10, -r42x, -f10, -f42x | `check ref`: 32 rows through the kernels and the reference engine; the converters agree |
@@ -164,16 +164,16 @@ The steps run in four lanes:
   check of a fixture's early frames under the current code. The other tiers
   run one frame from it.
 
-### The forward frame benchmark (`tools/fwd_bench.sh`)
+### The forward frame benchmark (`rewrite bench frame`)
 
 perf is the regression check. This is the profiling workflow, for speed
 work on the forward outside the kernels: emission, unit ends, re-pushes, the
 region phase, the frame end, the checkpoint.
 
-`rewrite bench frame --edges --checkpoint --reps N` runs frame F -> F+1 of a
-fixture tree (`ForwardState::at`). It prints the pins: the `f`, `h` and `e`
-lines and `b` (the bytes of every file the frame wrote). Every rep must
-agree. Its stderr `[cost]` lines give:
+`rewrite bench frame --tree DIR --step F --edges --checkpoint --reps N`
+runs step F -> F+1 of a tree (`ForwardState::at`). It prints the pins: the
+`f`, `h` and `e` lines and `b` (the bytes of every file the frame wrote).
+Every rep must agree. Its stderr `[cost]` lines give:
 
 - the wall split (wave, frame end, checkpoint);
 - the wave's worker-seconds by phase, with per-element costs;
@@ -181,16 +181,18 @@ agree. Its stderr `[cost]` lines give:
 
 `--phases`' `[mem]` and `[wavemem]` lines break memory down.
 
-```bash
-tools/fwd_bench.sh make NAME F -- --room X,Y --level LEVEL [--level-minus-one H,S --l1-table T] ...  # a forward to F in $FWD_BENCH/NAME
-BIN=target/release/rewrite tools/fwd_bench.sh run NAME [REPS]  # the first run pins NAME/frame.pin; a later one that differs FAILS
-tools/fwd_bench.sh list
-```
+The tree is a fixture (`tools/fixtures.sh ensure NAME`; a new one is a
+`spec` case there) or any forward's (`rewrite forward --steps F --tree
+DIR ...`): a tree serves any step up to its last. The run checks itself
+against pins of its own: `--expect FILE` (the lines) and `--metrics FILE`
+(the exact metrics), each written by a first run with `--pin`; a later
+run that differs FAILS and shows every difference.
 
-The defaults: `FWD_BENCH` /var/tmp/fwd-bench, `BIN` the release binary,
-`THREADS` 16, `MEMORY` 15G. A tree serves any frame up to its last, so a
-hard-linked copy with another `frame` line in `fixture.txt` is a second
-fixture. The develop fixtures (r62h57) run the same way.
+```bash
+./safe-run.sh -- target/release/rewrite forward --room X,Y --level LEVEL [--level-minus-one H,S] --steps F --tree DIR
+./safe-run.sh -- target/release/rewrite bench frame --tree DIR --step F --edges --checkpoint --reps 3 --threads 16 \
+    --expect DIR.lines --metrics DIR.metrics [--pin]
+```
 
 Wall times need a quiet machine:
 

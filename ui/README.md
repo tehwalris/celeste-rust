@@ -243,7 +243,7 @@ Room (3,3) at h172:
 Runs exported by the deleted precision ladder (several horizons, `[ladder]`
 logs) still render; the exporter no longer reads their layout.
 
-A run's layout (`run.json` + one binary per horizon/level) is documented
+A run's layout (`run.json`, `timings.json` + one binary per horizon/level) is documented
 at the top of `src/search/ui_export.rs`; `ui/src/data.ts` is its reader,
 with every file fetched as `data/<run>/<file>`. A run that fails to load
 shows an error card with the export command to rerun; a run whose

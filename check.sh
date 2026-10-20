@@ -1,23 +1,24 @@
 #!/bin/bash
 # THE CHECK LADDER (plans/devloop.md: what each tier runs and pins).
 #
-#   ./check.sh t0           the unit tests (the #[ignore]d aside): the
-#                           pre-commit run
-#   ./check.sh t1 [--pin]   single frames from the fixtures, 16.16 and float:
-#                           THE REFACTOR GATE
-#   ./check.sh t2 [--pin]   end to end, and the slow tests
-#   ./check.sh big [--pin]  the reference frame (6,2) 100% f56 -> f57 and the
-#                           platform frame
-#   ./check.sh perf [--pin] the RELEASE binary's instruction budget
-#                           (gates/perf.txt; more than 2% over FAILS)
-#   ./check.sh local        the local goldens (SKIPPED where the store is absent)
-#   ./check.sh fixtures     every fixture rebuilt against its pinned fingerprint
-#   ./check.sh all          every tier, and the pre-merge tests
+#   ./check.sh TIER... [--pin], the tiers run in order:
+#     t0         the unit tests (the #[ignore]d aside): the pre-commit run
+#     t1         single frames from the fixtures, 16.16 and float: THE
+#                REFACTOR GATE
+#     t2         end to end, and the slow tests
+#     big        the reference frame (6,2) 100% f56 -> f57 and the platform
+#                frame
+#     perf       the RELEASE binary's instruction budget (gates/perf.txt;
+#                more than 2% over FAILS)
+#     local      the local goldens (SKIPPED where the store is absent)
+#     fixtures   every fixture rebuilt against its pinned fingerprint
+#     premerge   the pre-merge tests
+#     all        every tier above
 #
 # Every step prints ok/FAIL and its wall time; the run exits non-zero if any
 # step failed. t1 and t2 run their steps in LANES side by side. `--pin`
-# writes the outputs as the new pins (gates/) instead of comparing: only on
-# evidence, and say why in the commit. Builds the quick binary first (perf:
+# writes the outputs as the new pins (gates/) instead of comparing (t1, t2,
+# big, perf): only on evidence, and say why in the commit. Builds the quick binary first (perf:
 # the release one too). Env: CARGO_TARGET_DIR, CELESTE_FIXTURES, CHECK_DIR
 # (the scratch, default per checkout: /var/tmp/celeste-check-NAME-HASH, so
 # two worktrees' runs never share it), THREADS (default 16; the metrics
@@ -25,8 +26,22 @@
 # READ-ONLY (tools/fixtures.sh): a step that writes into one fails.
 set -uo pipefail
 cd "$(dirname "$0")"
-TIER=${1:-}
-PIN=${2:-}
+usage() {
+    sed -n '2,/^[^#]/{/^#/p}' "$0"
+    exit 2
+}
+TIERS=()
+PIN=
+for a in "$@"; do
+    case $a in
+        --pin) PIN=--pin ;;
+        t0 | t1 | t2 | big | perf | local | fixtures | premerge) TIERS+=("$a") ;;
+        all) TIERS+=(t0 t1 t2 big perf local fixtures premerge) ;;
+        *) usage ;;
+    esac
+done
+[[ ${#TIERS[@]} -gt 0 ]] || usage
+TIER=${TIERS[0]}
 T=${CARGO_TARGET_DIR:-$PWD/target}
 B=$T/quick/rewrite
 export BIN=$B
@@ -88,7 +103,7 @@ same() {
 }
 
 # ignored TIER: a nextest filter of the #[ignore]d tests whose reason starts
-# with TIER ("slow", "pre-merge", "local"; `scripts_wrapped` checks that
+# with TIER ("slow", "pre-merge", "local"; `conventions` checks that
 # every #[ignore] names one).
 ignored() {
     grep -rh -A1 --include='*.rs' "#\[ignore = \"$1, " src crates | grep -oP '^\s*fn \K\w+' | sed 's|.*|test(/::&$/)|' | paste -sd'|'
@@ -116,39 +131,21 @@ t0() {
 # records (`search::tree::TreeDir`): only the frame and the run's own flags
 # are given.
 
-# frame NAME FRAME FLAGS...: one forward frame from a fixture, checkpointed
-# as the forward does: its f/h/e lines, the b line over the bytes of every
-# file it wrote, and the exact metrics against the pins; timings shown.
+# frame NAME STEP [--metrics]: one forward step from a fixture, checkpointed
+# as the forward does, against its pins (`bench frame --expect`: the f/h/e
+# lines, the b line over the bytes of every file it wrote; with --metrics
+# the exact metrics, 16.16's kernel census); timings shown.
 frame() {
-    local name=$1 f=$2; shift 2
-    ./safe-run.sh --memory "$MEM" -- "$B" bench frame --tree "$F/$name" --step "$f" --edges --checkpoint --threads "$TH" --metrics "$C/$name.metrics" --l1-table "$F/$name/l1-table.bin" "$@" > "$C/$name.frame" || return 1
-    same "$C/$name.frame" "$G/$name.frame" || return 1
-    if [[ $PIN == --pin ]]; then
-        same "$C/$name.metrics" "$G/$name.metrics"
-    else
-        tools/metrics_diff.py "$G/$name.metrics" "$C/$name.metrics" >&2
-    fi
+    local name=$1 f=$2 m=()
+    [[ ${3:-} == --metrics ]] && m=(--metrics "$G/$name.metrics")
+    ./safe-run.sh --memory "$MEM" -- "$B" bench frame --tree "$F/$name" --step "$f" --edges --checkpoint --threads "$TH" --expect "$G/$name.frame" "${m[@]}" $PIN --l1-table "$F/$name/l1-table.bin" > "$C/$name.frame"
 }
 
-# framef NAME FRAME: `frame` without the metrics (a float fixture's: the
-# kernel census is 16.16's).
-framef() {
-    local name=$1 f=$2
-    ./safe-run.sh --memory "$MEM" -- "$B" bench frame --tree "$F/$name" --step "$f" --edges --checkpoint --threads "$TH" --l1-table "$F/$name/l1-table.bin" > "$C/$name.frame" || return 1
-    same "$C/$name.frame" "$G/$name.frame"
-}
-
-# fhe NAME: the pinned frame's f/h/e lines (a step without `--checkpoint`).
-fhe() {
-    grep -v '^b' "$G/$1.frame"
-}
-
-# keycheck NAME FRAME: frame's rows' keys recomputed (--key-check), and
-# the same f/h/e lines.
+# keycheck NAME STEP: the step's rows' keys recomputed (--key-check), and
+# the pinned f/h/e lines.
 keycheck() {
     local name=$1 f=$2
-    ./safe-run.sh --memory "$MEM" -- "$B" bench frame --tree "$F/$name" --step "$f" --edges --threads "$TH" --key-check --l1-table "$F/$name/l1-table.bin" > "$C/keycheck-$name.frame" || return 1
-    diff <(fhe "$name") "$C/keycheck-$name.frame" >&2
+    ./safe-run.sh --memory "$MEM" -- "$B" bench frame --tree "$F/$name" --step "$f" --edges --threads "$TH" --key-check --expect "$G/$name.frame" --l1-table "$F/$name/l1-table.bin" > "$C/keycheck-$name.frame"
 }
 
 # widencheck NAME FRAME: `rewrite check widen` of a fixture's frame (the
@@ -204,7 +201,7 @@ t1() {
     for s in arccheck-r10 arccheck-r42x arccheck-f10 arccheck-f42x; do grep -h '^agreement' "$C/$s.out" | sed "s/^/    /" | cut -c1-200; done
 }
 t1_r10() {
-    step frame-r10 frame r10 55
+    step frame-r10 frame r10 55 --metrics
     step keycheck-r10 keycheck r10 55
     step refcheck-r10 refcheck r10 55
     step arccheck-r10 arccheck r10
@@ -213,11 +210,11 @@ t1_r10() {
     step backward-r10arc backward r10arc
 }
 t1_r62h() {
-    step frame-r62h frame r62h 50
+    step frame-r62h frame r62h 50 --metrics
     step widen-r62h widencheck r62h 50
 }
 t1_r42() {
-    step frame-r42n frame r42n 60
+    step frame-r42n frame r42n 60 --metrics
     step keycheck-r42n keycheck r42n 60
     step widen-r42n widencheck r42n 60
     step refcheck-r42x refcheck r42x 55
@@ -225,7 +222,7 @@ t1_r42() {
 }
 # The same in FLOAT (`--arith float`, Celia's start), without the metrics.
 t1_f10() {
-    step frame-f10 framef f10 55
+    step frame-f10 frame f10 55
     step refcheck-f10 refcheck f10 55
     step arccheck-f10 arccheck f10
     step arcfault-f10 faultcheck f10
@@ -233,7 +230,7 @@ t1_f10() {
     step backward-f10arc backward f10arc
 }
 t1_f42() {
-    step frame-f42n framef f42n 60
+    step frame-f42n frame f42n 60
     step keycheck-f42n keycheck f42n 60
     step widen-f42n widencheck f42n 60
     step refcheck-f42x refcheck f42x 55
@@ -310,22 +307,12 @@ search42() {
     same "$C/t2/s42.gate" "$G/search42.gate"
 }
 # The UI export (`rewrite export-ui`) of the searches above with their
-# marks, pinned by digest: every binary file, and run.json without its
-# timings.
+# marks, pinned by digest: every binary file and run.json (its timings are
+# timings.json's).
 export_ui() {
     for d in arc10 s42 arc10f dual10; do
         ./safe-run.sh --memory "$MEM" -- "$B" export-ui --search-dir "$C/t2/$d" --arc "$C/t2/$d-marks" --out "$C/t2/ui-$d" > /dev/null || return 1
-        (cd "$C/t2" && sha256sum ui-$d/*.bin)
-        python3 -c '
-import json, sys
-r = json.load(open(sys.argv[1]))
-del r["wall_s"]
-for h in r["horizons"]:
-    for l in h["levels"]:
-        for f in l["fwd"]:
-            for k in ["emit_ms", "emit_idle", "own_ms", "own_idle", "ckpt_ms", "pos_ms", "total_ms", "rss_gb"]:
-                del f[k]
-print(json.dumps(r, sort_keys=True))' "$C/t2/ui-$d/run.json" | sha256sum | sed "s|-\$|ui-$d/run.json (no timings)|"
+        (cd "$C/t2" && sha256sum ui-$d/*.bin ui-$d/run.json)
     done > "$C/t2/export-ui.sha256"
     same "$C/t2/export-ui.sha256" "$G/export-ui.sha256"
 }
@@ -366,11 +353,11 @@ widen60() {
 big() {
     build
     step fixtures-big tools/fixtures.sh ensure r62h57 r60s
-    step frame-r62h57 frame r62h57 56
+    step frame-r62h57 frame r62h57 56 --metrics
     grep -hE '^\[bench\] (kernels|rep)|^\[phases\]' "$C/frame-r62h57.err" | sed 's/^/    /' | cut -c1-220
     # The platform kernels' frame (step 70 -> 71) and exact metrics: its
     # lines are t2's forward60's too; their build is ~20-40 s of tracing.
-    step frame-r60s frame r60s 70
+    step frame-r60s frame r60s 70 --metrics
     grep -hE '^\[bench\] (kernels|rep)' "$C/frame-r60s.err" | sed 's/^/    /' | cut -c1-200
 }
 
@@ -400,8 +387,7 @@ perfcount() {
     local n i1 i3 rep pin
     rm -f "$C/perf-$name.line"
     for n in 1 3; do
-        ./safe-run.sh --memory "$MEM" -- perf stat -x, -e instructions:u -o "$C/perf-$name-$n.stat" -- "$RB" bench frame --tree "$F/$name" --step "$f" --edges --threads 16 --l1-table "$F/$name/l1-table.bin" --reps "$n" > "$C/perf-$name-$n.frame" || return 1
-        diff <(fhe "$name") "$C/perf-$name-$n.frame" >&2 || return 1
+        ./safe-run.sh --memory "$MEM" -- perf stat -x, -e instructions:u -o "$C/perf-$name-$n.stat" -- "$RB" bench frame --tree "$F/$name" --step "$f" --edges --threads 16 --expect "$G/$name.frame" --l1-table "$F/$name/l1-table.bin" --reps "$n" > "$C/perf-$name-$n.frame" || return 1
     done
     i1=$(awk -F, '$3 ~ /^instructions/ {print $1}' "$C/perf-$name-1.stat")
     i3=$(awk -F, '$3 ~ /^instructions/ {print $1}' "$C/perf-$name-3.stat")
@@ -447,24 +433,14 @@ premerge() {
     grep -E 'Summary' "$C/premerge-tests.err" | tail -1
 }
 
-echo "[$TIER] $(uptime | sed 's/.*load/load/')"
 T_START=$SECONDS
-case $TIER in
-    t0) t0 ;;
-    t1) t1 ;;
-    t2) t2 ;;
-    big) big ;;
-    perf) perftier ;;
-    local) localgoldens ;;
-    fixtures) fixtures ;;
-    all) for TIER in t0 t1 t2 big perf local fixtures premerge; do
-             t=$SECONDS
-             case $TIER in perf) perftier ;; local) localgoldens ;; *) $TIER ;; esac
-             echo "[$TIER] $((SECONDS - t)) s"
-         done; TIER=all ;;
-    *) sed -n '2,/^[^#]/{/^#/p}' "$0"; exit 2 ;;
-esac
+for TIER in "${TIERS[@]}"; do
+    echo "[$TIER] $(uptime | sed 's/.*load/load/')"
+    t=$SECONDS
+    case $TIER in perf) perftier ;; local) localgoldens ;; *) $TIER ;; esac
+    echo "[$TIER] $((SECONDS - t)) s"
+done
 FAILED=$(paste -sd' ' "$C/failed")
 SKIPPED=$(paste -sd' ' "$C/skipped")
-echo "[$TIER] $((SECONDS - T_START)) s; $([[ -n $FAILED ]] && echo "FAILED: $FAILED" || echo "all ok")${SKIPPED:+ (SKIPPED: $SKIPPED)}"
+echo "[$(IFS=+; echo "${TIERS[*]}")] $((SECONDS - T_START)) s; $([[ -n $FAILED ]] && echo "FAILED: $FAILED" || echo "all ok")${SKIPPED:+ (SKIPPED: $SKIPPED)}"
 [[ -z $FAILED ]]
