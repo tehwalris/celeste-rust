@@ -340,11 +340,15 @@ Per axis one frame does `rem += ox + 1/2; amount = flr(rem); rem -= 1/2 +
 amount`, then steps `|amount| + 1` pixels (a blocked step sets `rem = 0`).
 Mod 1 that is a ROTATION by `ox`, cut at one point. So for a remainder-free
 node and an input, the circle splits into two pieces; in each the frame
-does one discrete thing and maps the remainder by a rotation, or to a
-constant on a collision. The transfer is captured where the tracer forks
-`__split_by_flr` on the player's own `rem` (`arc_edges`): guard = the
-piece, action = rotation or `Const(fin)`; identity on an axis without a
-split. A second player split on an axis in one path is refused (and cannot
+does one discrete thing and TRANSLATES the remainder (the piece is one
+floor's: its image never wraps), or maps it to a constant on a collision.
+The transfer is captured where the tracer forks `__split_by_flr` on the
+player's own `rem` (`arc_edges`): guard = the piece, action = the
+translation or `Const(fin)`; identity on an axis without a split. One
+model for both arithmetics (`arcs::Transfer`): a guard and a MONOTONE
+action (16.16's translation, the doubles' `Mono(ox, k)`) or a constant;
+the tree's table keeps 16.16's as the rotation it is mod 1
+(`arc_edges::AxisXfer`, converted at load and checked not to wrap). A second player split on an axis in one path is refused (and cannot
 happen: `move` is the only splitter). A platform carry blocked by a wall
 sets `rem.x = 0` before the move: a split of one point, decoded as a
 constant. A body without transfer roots is refused at the kernel build.

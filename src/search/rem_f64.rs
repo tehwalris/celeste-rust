@@ -28,7 +28,7 @@
 use celeste_core::lua_f64::LuaF64;
 use celeste_engine::runtime2::mix64;
 
-use super::arcs::{Circle, Seg};
+use super::arcs::{Act, Circle, Seg, Transfer};
 use super::rem::Capture;
 
 /// The index of `0` (and the count of doubles in `[-1/2, 0)`): `1/2`'s bits.
@@ -95,16 +95,21 @@ impl Axis {
     }
 
     /// The image of point `i` (inside the guard).
-    #[inline]
+    #[cfg(test)]
     pub(crate) fn apply(&self, i: u64) -> u64 {
-        debug_assert!(self.lo <= i && i < self.hi);
-        match self.tag {
-            MONO => {
-                let v = mono(value(i), f64::from_bits(self.a), self.k as f64);
-                index(v).unwrap_or_else(|| panic!("transfer {self:?}: the image {v:?} of {:?} is not a remainder", value(i)))
-            }
-            _ => self.a,
+        match self.transfer().act {
+            Act::Mono(m) => Doubles::apply(&m, i),
+            Act::Const(c) => c,
         }
+    }
+
+    /// As the pushes and pulls read it (`Rem::xfer`).
+    pub(crate) fn transfer(&self) -> Transfer<Doubles> {
+        let act = match self.tag {
+            MONO => Act::Mono(Shift { ox: self.a, k: self.k }),
+            _ => Act::Const(self.a),
+        };
+        Transfer { guard: Seg { lo: self.lo, hi: self.hi }, act }
     }
 
     pub(crate) fn encode(&self, out: &mut Vec<u8>) {
@@ -123,6 +128,13 @@ impl Axis {
     pub(crate) fn mixed(&self) -> u64 {
         mix64(self.lo ^ self.hi.rotate_left(21) ^ mix64(self.a ^ ((self.k as u32 as u64) << 8 | self.tag as u64)))
     }
+}
+
+/// The doubles' monotone action `r -> fl(fl(r + ox) - k)` (`ox` its bits).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct Shift {
+    ox: u64,
+    k: i32,
 }
 
 /// `move` on one axis after the round split: `fl(fl(r + ox) - k)`.
@@ -164,7 +176,7 @@ pub struct Doubles;
 impl Circle for Doubles {
     type P = u64;
     type W = u64;
-    type Act = Axis;
+    type Mono = Shift;
     const SIZE: u64 = POINTS;
     const MAX_SEGS: usize = 1 << 20;
     #[inline]
@@ -215,32 +227,23 @@ impl Circle for Doubles {
         a[0] == b[0] && a[1] == b[1] && a[2] == b[2] && a[3] == b[3]
     }
     #[inline]
-    fn guard(a: &Axis) -> Seg<u64> {
-        Seg { lo: a.lo, hi: a.hi }
+    fn apply(m: &Shift, i: u64) -> u64 {
+        let v = mono(value(i), f64::from_bits(m.ox), m.k as f64);
+        index(v).unwrap_or_else(|| panic!("transfer {m:?}: the image {v:?} of {:?} is not a remainder", value(i)))
     }
-    #[inline]
-    fn const_point(a: &Axis) -> Option<u64> {
-        (a.tag == CONST).then_some(a.a)
+    /// The guard's points whose image is in `s`: past every point whose
+    /// image is below `s.lo`, before the first whose image reaches `s.hi`.
+    fn pull_mono(m: &Shift, g: Seg<u64>, s: Seg<u64>) -> Option<Seg<u64>> {
+        let lo = first_in(g.lo, g.hi, |r| Self::apply(m, r) >= s.lo);
+        let hi = first_in(lo, g.hi, |r| Self::apply(m, r) >= s.hi);
+        (lo < hi).then_some(Seg { lo, hi })
     }
-    fn image(a: &Axis, s: Seg<u64>, mut f: impl FnMut(Seg<u64>)) {
-        let (lo, hi) = (s.lo.max(a.lo), s.hi.min(a.hi));
-        if lo < hi {
-            f(if a.tag == MONO { Seg { lo: a.apply(lo), hi: a.apply(hi - 1) + 1 } } else { Seg { lo: a.a, hi: a.a + 1 } });
-        }
-    }
-    fn preimage(a: &Axis, s: Seg<u64>, mut f: impl FnMut(Seg<u64>)) {
-        if a.tag != MONO {
-            if s.lo <= a.a && a.a < s.hi {
-                f(Seg { lo: a.lo, hi: a.hi });
-            }
-            return;
-        }
-        // The guard's points whose image is in `s`: past every point whose
-        // image is below `s.lo`, before the first whose image reaches `s.hi`.
-        let lo = first_in(a.lo, a.hi, |r| a.apply(r) >= s.lo);
-        let hi = first_in(lo, a.hi, |r| a.apply(r) >= s.hi);
-        if lo < hi {
-            f(Seg { lo, hi });
+    /// A `Mono` collapsed onto its lowest point's image, a constant moved
+    /// by one point.
+    fn fault(a: &Act<Doubles>, g: Seg<u64>) -> Act<Doubles> {
+        match a {
+            Act::Mono(m) => Act::Const(Self::apply(m, g.lo)),
+            Act::Const(c) => Act::Const((c + 1) % POINTS),
         }
     }
     #[inline]
@@ -249,26 +252,6 @@ impl Circle for Doubles {
     }
     fn mid(s: Seg<u64>) -> u64 {
         s.lo + (s.hi - s.lo) / 2
-    }
-    fn kind(a: &Axis) -> &'static str {
-        if a.tag == MONO {
-            "mono"
-        } else {
-            "const"
-        }
-    }
-    /// The guard's lowest point dropped; or a `Mono` collapsed onto its
-    /// lowest point's image, a constant moved by one point.
-    fn faulty(a: &Axis, guard: bool) -> Axis {
-        let mut t = *a;
-        if guard {
-            t.lo = (t.lo + 1).min(t.hi - 1);
-        } else if t.tag == MONO {
-            t = Axis { tag: CONST, a: a.apply(a.lo), k: 0, ..t };
-        } else {
-            t.a = (t.a + 1) % POINTS;
-        }
-        t
     }
 }
 
@@ -467,7 +450,7 @@ mod tests {
         assert_eq!((pieces[1].apply(POINTS - 2), pieces[1].apply(POINTS - 1)), (0, 0));
         assert_eq!(fixed_points(pieces[0].lo, pieces[0].hi), 65536);
         // A point hull at the top reaches only the sliver; one below it, only the rest.
-        let t = |a: &Axis| (*a, Axis::identity());
+        let t = |a: &Axis| (a.transfer(), Axis::identity().transfer());
         let mut acc = HullAcc::default();
         assert!(!Hull::point(POINTS - 3, ZERO).push(&t(&pieces[1]), &mut acc));
         assert!(Hull::point(POINTS - 2, ZERO).push(&t(&pieces[1]), &mut acc));
@@ -528,7 +511,8 @@ mod tests {
             let h = Hull { x: arc(&mut s), y: arc(&mut s) };
             let t = (pieces[(lcg(&mut s) % pieces.len() as u64) as usize], pieces[(lcg(&mut s) % pieces.len() as u64) as usize]);
             let mut acc = HullAcc::default();
-            let pushed = h.push(&t, &mut acc);
+            let tt = (t.0.transfer(), t.1.transfer());
+            let pushed = h.push(&tt, &mut acc);
             assert_eq!(pushed, meet(h.x, &t.0) > 0 && meet(h.y, &t.1) > 0);
             if !pushed {
                 assert!(acc.is_empty());
@@ -556,9 +540,9 @@ mod tests {
             let shrink = |a: Arc, s: &mut u64| if a.last == 0 { a } else { Arc { start: a.start, last: lcg(s) % a.last } };
             let was = Hull { x: shrink(h.x, &mut s), y: shrink(h.y, &mut s) };
             let mut grown = HullAcc::default();
-            if !h.push_grown(&was, &t, &mut grown) {
+            if !h.push_grown(&was, &tt, &mut grown) {
                 let mut old = HullAcc::default();
-                assert!(was.push(&t, &mut old), "{h:?} from {was:?}: skipped, but the smaller one never pushed");
+                assert!(was.push(&tt, &mut old), "{h:?} from {was:?}: skipped, but the smaller one never pushed");
                 assert_eq!(old.hull(), acc.hull(), "{h:?} from {was:?}: skipped a push that grows");
             }
         }
@@ -593,7 +577,7 @@ mod tests {
             let r = Region::<Doubles>::from_pieces(&mut ps, &mut Vec::new());
             let (tx, ty) = (pieces[(lcg(&mut s) % pieces.len() as u64) as usize], pieces[(lcg(&mut s) % pieces.len() as u64) as usize]);
             let mut out = Vec::new();
-            r.pull(tx, ty, &mut out);
+            r.pull(tx.transfer(), ty.transfer(), &mut out);
             let pr = Region::<Doubles>::from_pieces(&mut out, &mut Vec::new());
             let around = |v: u64| [v.wrapping_sub(1), v, v + 1].into_iter().filter(|&p| p < POINTS);
             let mut px: Vec<u64> = vec![tx.lo, tx.hi - 1, near(&mut s), near(&mut s)];

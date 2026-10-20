@@ -1135,7 +1135,7 @@ pub fn gate_w_hash<C: Circle>(node: u64, r: RegionRef<C>) -> u64 {
 pub(crate) mod tests {
     use super::*;
     use crate::search::arc_edges::AxisXfer;
-    use crate::search::arcs::{pieces, point, Action, Seg, Set, Transfer, CIRCLE};
+    use crate::search::arcs::{point, Act, Seg, Transfer, CIRCLE};
 
     /// `seek` is the linear walk: from every start and for every key, over
     /// groups with repeated keys, gaps and runs.
@@ -1169,11 +1169,11 @@ pub(crate) mod tests {
         }
     }
 
-    /// An action on one point of the circle.
-    pub(crate) fn apply(a: Action, p: u32) -> u32 {
-        match a {
-            Action::Rotate(v) => (p as i64 + v as i64).rem_euclid(CIRCLE as i64) as u32,
-            Action::Const(c) => c,
+    /// A transfer's image of a point of its guard.
+    pub(crate) fn apply(t: Transfer, p: u32) -> u32 {
+        match t.act {
+            Act::Mono(d) => (p as i64 + d as i64) as u32,
+            Act::Const(c) => c,
         }
     }
 
@@ -1182,10 +1182,12 @@ pub(crate) mod tests {
         Sk { region: 1 + (k >> 6), key: (0, ((k >> 3) & 7) as u64), local: (k & 7) as u8 }
     }
 
+    /// A transfer as the tree's table stores it (a translation as the
+    /// rotation it is mod 1).
     pub(crate) fn axis(t: Transfer) -> AxisXfer {
-        match t.action {
-            Action::Rotate(v) => AxisXfer { lo: t.guard.lo, hi: t.guard.hi, tag: 0, val: v },
-            Action::Const(c) => AxisXfer { lo: t.guard.lo, hi: t.guard.hi, tag: 1, val: c as i32 },
+        match t.act {
+            Act::Mono(d) => AxisXfer { lo: t.guard.lo, hi: t.guard.hi, tag: 0, val: d.rem_euclid(CIRCLE as i32) },
+            Act::Const(c) => AxisXfer { lo: t.guard.lo, hi: t.guard.hi, tag: 1, val: c as i32 },
         }
     }
 
@@ -1251,15 +1253,16 @@ pub(crate) mod tests {
             1 => Seg { lo: 0, hi: cut },
             _ => Seg { lo: cut, hi: CIRCLE },
         };
-        let action = if r(5) == 0 { Action::Const(r(CIRCLE)) } else { Action::Rotate(r(CIRCLE) as i32 - 32768) };
-        Transfer { guard, action }
+        // A translation keeping the guard inside the circle.
+        let act = if r(5) == 0 { Act::Const(r(CIRCLE)) } else { Act::Mono(r(CIRCLE - guard.hi + guard.lo + 1) as i32 - guard.lo as i32) };
+        Transfer { guard, act }
     }
 
     /// A random graph from node 0: `n` nodes, `3n` edges, layers the BFS
     /// distances (unreachable nodes' edges dropped), wins a third of the
     /// others reached. `y_too`: random y transfers (else the identity).
     pub(crate) fn random_graph(r: &mut dyn FnMut(u32) -> u32, n: u32, y_too: bool) -> (Vec<u32>, Vec<(u32, u32, Transfer, Transfer)>, Vec<u32>) {
-        let still = Transfer { guard: Seg { lo: 0, hi: CIRCLE }, action: Action::Rotate(0) };
+        let still = Transfer { guard: Seg { lo: 0, hi: CIRCLE }, act: Act::Mono(0) };
         let mut edges = Vec::new();
         for _ in 0..n * 3 {
             let (a, b) = (r(n), r(n));
@@ -1316,10 +1319,11 @@ pub(crate) mod tests {
     #[test]
     fn the_start_remainder_decides_the_frame() {
         let v = 39322; // 0.6 px
-        let p = pieces(v);
-        let both = |g: &Set| Transfer { guard: g.0[0], action: Action::Rotate(v) };
-        let still = Transfer { guard: Seg { lo: 0, hi: 1 << 16 }, action: Action::Rotate(0) };
-        let tree = TestTree::new("corridor", vec![0, 1], &[(0, 0, both(&p[0]), still), (0, 1, both(&p[1]), still)], vec![1]);
+        // Below the cut the remainder moves on by v; from it, by v less a pixel.
+        let cut = CIRCLE - v as u32;
+        let (below, above) = (Transfer { guard: Seg { lo: 0, hi: cut }, act: Act::Mono(v) }, Transfer { guard: Seg { lo: cut, hi: CIRCLE }, act: Act::Mono(v - CIRCLE as i32) });
+        let still = Transfer { guard: Seg { lo: 0, hi: 1 << 16 }, act: Act::Mono(0) };
+        let tree = TestTree::new("corridor", vec![0, 1], &[(0, 0, below, still), (0, 1, above, still)], vec![1]);
         let opt = |h: u32, rem: i32| {
             let (store, pairs, wins) = tree.open(h);
             let w = backward(&store, &pairs, &wins, h, 2, None).expect("backward");

@@ -10,7 +10,7 @@
 use anyhow::{anyhow, Result};
 use celeste_engine::runtime2::{Col, Rt2, AV};
 
-use super::arcs::{Circle, Seg};
+use super::arcs::{Circle, Seg, Transfer};
 use super::rem::{Point, Rem, Xfer};
 use crate::abstraction::Level;
 use crate::frame::{widen_rt2_to, widened_keys, Block};
@@ -60,18 +60,12 @@ struct Sampled {
 type Succ<N> = ((u64, Option<(u64, u64)>, u32), Option<(Point<N>, Point<N>)>);
 
 /// The image of point `p` under one axis's transfer, if its guard takes it.
-fn image_of<C: Circle>(a: &C::Act, p: C::P) -> Option<C::P> {
-    let g = C::guard(a);
-    if !(g.lo <= p && p < g.hi) {
-        return None;
-    }
-    let mut out = None;
-    C::image(a, Seg { lo: p, hi: C::next(p) }, |s| out = Some(s.lo));
-    out
+fn image_of<C: Circle>(a: &Transfer<C>, p: C::P) -> Option<C::P> {
+    a.image(Seg { lo: p, hi: C::next(p) }).map(|s| s.lo)
 }
 
 /// Does `t` take `(x, y)` to `q` (`None`: no player at the end, so any)?
-fn predicts<C: Circle>(t: &(C::Act, C::Act), p: (C::P, C::P), q: Option<(C::P, C::P)>) -> bool {
+fn predicts<C: Circle>(t: &(Transfer<C>, Transfer<C>), p: (C::P, C::P), q: Option<(C::P, C::P)>) -> bool {
     match (image_of::<C>(&t.0, p.0), image_of::<C>(&t.1, p.1)) {
         (Some(x), Some(y)) => q.is_none_or(|q| q == (x, y)),
         _ => false,
@@ -136,7 +130,7 @@ pub fn run<N: Rem>(o: &Opts) -> Result<()> {
     let corrupt = |t: Xfer<N>| -> Result<Xfer<N>> {
         Ok(match o.fault {
             None => t,
-            Some(k @ ("action" | "guard")) => (N::C::faulty(&t.0, k == "guard"), t.1),
+            Some(k @ ("action" | "guard")) => (t.0.faulty(k == "guard"), t.1),
             Some(other) => anyhow::bail!("--fault {other}: `action` or `guard`"),
         })
     };
@@ -147,7 +141,7 @@ pub fn run<N: Rem>(o: &Opts) -> Result<()> {
         // The target by what it is (a hull tree records edges into states
         // it reaches later or never: not every target has a frame).
         let target = (tree.shape_of(r.target.region)?, Some(r.target.key), r.target.cell(&crate::storage::GEOMETRY));
-        let (gx, gy) = (N::C::guard(&r.t.0), N::C::guard(&r.t.1));
+        let (gx, gy) = (r.t.0.guard, r.t.1.guard);
         let pair: Vec<&Rec<N>> = recs.iter().filter(|q| q.target == r.target && q.src == src).collect();
         let in_union = |x: Point<N>, y: Point<N>| pair.iter().any(|q| image_of::<N::C>(&q.t.0, x).is_some() && image_of::<N::C>(&q.t.1, y).is_some());
         let has_player = rem_cells(src_row.rt2()).is_some();
@@ -229,8 +223,8 @@ pub fn run<N: Rem>(o: &Opts) -> Result<()> {
         records_total += recs.len() as u64;
         for r in &recs {
             for (axis, t) in [("x", &r.t.0), ("y", &r.t.1)] {
-                let whole = N::C::guard(t) == Seg { lo: Point::<N>::default(), hi: N::C::SIZE };
-                let k = format!("{axis} {} {}", if whole { "whole" } else { "piece" }, N::C::kind(t));
+                let whole = t.guard == Seg { lo: Point::<N>::default(), hi: N::C::SIZE };
+                let k = format!("{axis} {} {}", if whole { "whole" } else { "piece" }, t.kind());
                 *kinds.entry(k).or_default() += 1;
             }
         }
