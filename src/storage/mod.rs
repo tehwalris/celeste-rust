@@ -19,7 +19,7 @@ pub mod layer;
 pub(crate) mod out;
 pub(crate) mod route;
 pub(crate) mod set;
-pub(crate) mod spool;
+pub(crate) mod scratch;
 pub mod stats;
 pub(crate) mod unit;
 pub(crate) mod visited;

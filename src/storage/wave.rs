@@ -370,7 +370,7 @@ struct Shared<'a, N: Rem> {
     shapes: &'a [u64],
     out_blocks: &'a [std::sync::Mutex<Vec<OutBlock>>],
     outs: Option<&'a super::out::OutStore>,
-    spool: Option<&'a super::spool::Spool>,
+    spool: Option<&'a super::scratch::Scratch>,
     record: bool,
     /// The tree's transfers before the frame (new ones from here).
     xfers_before: u32,
@@ -381,7 +381,7 @@ struct Shared<'a, N: Rem> {
 /// heaviest first), else a unit of the two slices past the gathered; a
 /// slice's last unit's worker GATHERS (`Pipe::gather_ready`). Any way out
 /// but the end of the frame - an error, a panic - stops the others.
-fn worker<N: Rem>(sh: &Shared<N>, sink: &mut UnitSink<N>, sc: &mut super::route::Scratch) -> Result<()> {
+fn worker<N: Rem>(sh: &Shared<N>, sink: &mut UnitSink<N>, sc: &mut super::route::JobScratch) -> Result<()> {
     use std::time::Instant;
     struct Stop<'p>(&'p std::sync::atomic::AtomicBool, bool);
     impl Drop for Stop<'_> {
@@ -495,7 +495,7 @@ struct Piped<N: Rem> {
 /// one sink each (`UnitSink`), no barrier but its end; then the workers'
 /// transfers and stats collected.
 #[allow(clippy::too_many_arguments)]
-fn pipeline<N: Rem>(engine: &dyn FrameStep<N>, front: &Frontier<N>, plan: &Plan, visited: &VisitedSet<N>, base: &XferTable<N>, skeletons: &Skeletons<N>, prov: &Provisional<N>, filters: Filters<N>, frame: u32, outs: Option<&super::out::OutStore>, spool: Option<&super::spool::Spool>, record: bool, ceiling: Option<u32>) -> Result<Piped<N>> {
+fn pipeline<N: Rem>(engine: &dyn FrameStep<N>, front: &Frontier<N>, plan: &Plan, visited: &VisitedSet<N>, base: &XferTable<N>, skeletons: &Skeletons<N>, prov: &Provisional<N>, filters: Filters<N>, frame: u32, outs: Option<&super::out::OutStore>, spool: Option<&super::scratch::Scratch>, record: bool, ceiling: Option<u32>) -> Result<Piped<N>> {
     let (level, s) = (engine.level(), &engine.settings());
     let workers = s.threads();
     let routes = Routes::default();
@@ -506,7 +506,7 @@ fn pipeline<N: Rem>(engine: &dyn FrameStep<N>, front: &Frontier<N>, plan: &Plan,
     let mut sinks: Vec<UnitSink<N>> = (0..workers).map(|w| UnitSink::new(visited, &routes, skeletons, prov, filters, frame, level, w as u32, base, &xtabs[w], record, s)).collect();
     // Per kernel unit its out block (raw while a target key is provisional).
     let out_blocks: Vec<std::sync::Mutex<Vec<OutBlock>>> = (0..plan.n_kernel).map(|_| Default::default()).collect();
-    let mut scratch: Vec<super::route::Scratch> = (0..workers).map(|_| super::route::Scratch::default()).collect();
+    let mut scratch: Vec<super::route::JobScratch> = (0..workers).map(|_| super::route::JobScratch::default()).collect();
     let pipe: Pipe<N> = Pipe {
         xtabs: &xtabs,
         next_unit: AtomicUsize::new(0),
@@ -640,7 +640,7 @@ fn seal<N: Rem>(states: &mut [RouteState<N>], regions: &[Option<u32>], finals: &
 
 /// THE OUT FILE, on a thread of its own beside the frame's end
 /// (provisional blocks with final keys): its bytes.
-fn out_file_writer<N: Rem>(path: std::path::PathBuf, frame: u32, out_blocks: Vec<std::sync::Mutex<Vec<OutBlock>>>, finals: std::sync::Arc<FxHashMap<Key, Key>>, spool: Option<std::sync::Arc<super::spool::Spool>>, threads: usize) -> Result<std::thread::JoinHandle<Result<u64>>> {
+fn out_file_writer<N: Rem>(path: std::path::PathBuf, frame: u32, out_blocks: Vec<std::sync::Mutex<Vec<OutBlock>>>, finals: std::sync::Arc<FxHashMap<Key, Key>>, spool: Option<std::sync::Arc<super::scratch::Scratch>>, threads: usize) -> Result<std::thread::JoinHandle<Result<u64>>> {
     Ok(std::thread::Builder::new().name("out file".into()).spawn(move || -> Result<u64> {
         let blocks = par_map(&out_blocks, threads, |b| -> Result<Vec<super::out::Sealed>> {
             let mut out = Vec::new();
@@ -672,7 +672,7 @@ type RouteSegs = (u32, Vec<((u8, u32), super::edges::Segment)>, Vec<(u32, super:
 /// transfers flushed, the waited segments made final (`route::reencode`,
 /// one job each), every route's in slice order; its bytes.
 #[allow(clippy::too_many_arguments)]
-fn edge_file_writer<N: Rem>(dir: std::path::PathBuf, frame: u32, flush: super::edges::Flush, routes_segs: Vec<RouteSegs>, src_index: Vec<(u32, Vec<u32>)>, renumber: Option<(u32, Vec<u32>)>, finals: std::sync::Arc<FxHashMap<Key, Key>>, spool: Option<std::sync::Arc<super::spool::Spool>>, threads: usize) -> Result<std::thread::JoinHandle<Result<u64>>> {
+fn edge_file_writer<N: Rem>(dir: std::path::PathBuf, frame: u32, flush: super::edges::Flush, routes_segs: Vec<RouteSegs>, src_index: Vec<(u32, Vec<u32>)>, renumber: Option<(u32, Vec<u32>)>, finals: std::sync::Arc<FxHashMap<Key, Key>>, spool: Option<std::sync::Arc<super::scratch::Scratch>>, threads: usize) -> Result<std::thread::JoinHandle<Result<u64>>> {
     Ok(std::thread::Builder::new().name("edge file".into()).spawn(move || -> Result<u64> {
         flush.write(&dir)?;
         let renumber = renumber.as_ref().map(|(first, perm)| super::route::Renumber { first: *first, perm });
@@ -779,10 +779,10 @@ pub(crate) fn run_wave<N: Rem>(engine: &dyn FrameStep<N>, front: Frontier<N>, cx
     st.set_gb(S::RssStart, crate::metrics::current_rss_gb());
     let record = edges_dir.is_some();
     // The out blocks and segments wait in the SPOOL, not in memory.
-    let spool: Option<std::sync::Arc<super::spool::Spool>> = match edges_dir {
+    let spool: Option<std::sync::Arc<super::scratch::Scratch>> = match edges_dir {
         Some(dir) => {
             std::fs::create_dir_all(dir)?;
-            Some(std::sync::Arc::new(super::spool::Spool::create(&dir.join(format!("f{frame:03}.spool")))?))
+            Some(std::sync::Arc::new(super::scratch::Scratch::create(&dir.join(format!("f{frame:03}.spool")))?))
         }
         None => None,
     };

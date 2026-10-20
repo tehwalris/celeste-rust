@@ -623,7 +623,7 @@ const CHUNK_WORDS: usize = 1 << 25;
 /// The backward's arena of distinct sets: per set a RECORD of words (slab
 /// and segment counts, then 3 words a slab, 2 a segment) in CHUNKS, and its
 /// place (8 B). A full chunk is SEALED: kept, or (`spill_to`) mapped from a
-/// scratch file (as `backward::Spill`). Records never move, so it grows
+/// scratch file (`storage::scratch`). Records never move, so it grows
 /// without copying itself (a doubling list peaks at 90 GB for 50 GB of sets).
 pub(crate) struct RegionArena<C: Circle = Fixed16> {
     /// Set `i`'s record: its chunk (high 32 bits; `sealed.len()` is the open
@@ -703,17 +703,13 @@ impl<C: Circle> RegionArena<C> {
             None => Words::Mem(open),
             Some(dir) => {
                 let path = dir.join(format!("sets-{:05}.bin", self.sealed.len()));
-                let map = || -> std::io::Result<memmap2::Mmap> {
+                let map = || -> anyhow::Result<memmap2::Mmap> {
+                    let f = crate::storage::scratch::Scratch::create(&path)?;
                     // SAFETY: plain words as their bytes.
-                    std::fs::write(&path, unsafe { std::slice::from_raw_parts(open.as_ptr().cast::<u8>(), std::mem::size_of_val(&open[..])) })?;
-                    let f = std::fs::File::open(&path)?;
-                    // SAFETY: the file is this process's own, complete, and
-                    // unlinked right after: nothing else writes it.
-                    let m = unsafe { memmap2::Mmap::map(&f)? };
-                    std::fs::remove_file(&path)?;
-                    Ok(m)
+                    f.put(unsafe { std::slice::from_raw_parts(open.as_ptr().cast::<u8>(), std::mem::size_of_val(&open[..])) })?;
+                    f.map()
                 };
-                let m = map().unwrap_or_else(|e| panic!("FATAL: the arc phase's set chunk {}: {e}", path.display()));
+                let m = map().unwrap_or_else(|e| panic!("FATAL: the arc phase's set chunk {}: {e:#}", path.display()));
                 self.mapped_words += open.len() as u64;
                 Words::Map(m)
             }

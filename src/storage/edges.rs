@@ -261,7 +261,7 @@ struct FileHead {
 pub(crate) struct Segment {
     pub(crate) region: u32,
     /// The zstd block, in memory or in the frame's spool.
-    pub(crate) bytes: super::spool::Body,
+    pub(crate) bytes: super::scratch::Body,
     pub(crate) raw: u32,
     pub(crate) bundles: u32,
     pub(crate) edges: u64,
@@ -269,7 +269,7 @@ pub(crate) struct Segment {
 
 impl Segment {
     pub(crate) fn of_raw(region: u32, raw: &[u8], bundles: u32, edges: u64, z: &mut zstd::bulk::Compressor<'static>) -> Result<Segment> {
-        Ok(Segment { region, bytes: super::spool::Body::Mem(file::compress(raw, z)?), raw: raw.len() as u32, bundles, edges })
+        Ok(Segment { region, bytes: super::scratch::Body::Mem(file::compress(raw, z)?), raw: raw.len() as u32, bundles, edges })
     }
 
     /// `bundles` (distinct) as a segment of `region` (`enc`: a scratch encoder).
@@ -286,7 +286,7 @@ pub(crate) fn file_path(dir: &Path, frame: u32) -> PathBuf {
 /// Write frame `frame`'s edge file from its segments and its source-region
 /// index (`sources`, per target region; both any order). Atomic. Returns
 /// its bytes.
-pub(crate) fn write_file(path: &Path, frame: u32, mut segs: Vec<Segment>, mut sources: Vec<(u32, Vec<u32>)>, spool: Option<&super::spool::Spool>) -> Result<u64> {
+pub(crate) fn write_file(path: &Path, frame: u32, mut segs: Vec<Segment>, mut sources: Vec<(u32, Vec<u32>)>, spool: Option<&super::scratch::Scratch>) -> Result<u64> {
     segs.sort_by_key(|s| s.region);
     sources.sort_unstable_by_key(|s| s.0);
     for s in &mut sources {

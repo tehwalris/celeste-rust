@@ -447,7 +447,7 @@ struct BlockHead {
 /// A block as the frame's end writes it (zstd) with its entry range.
 pub(crate) struct Sealed {
     /// In memory, or in the frame's spool.
-    pub(crate) z: super::spool::Body,
+    pub(crate) z: super::scratch::Body,
     pub(crate) raw: u32,
     pub(crate) first: (u32, Key),
     pub(crate) last: (u32, Key),
@@ -469,13 +469,13 @@ impl Sealed {
             |_, _, _| {},
         )?;
         let (Some(first), Some(last)) = (first, last) else { return Ok(None) };
-        Ok(Some(Sealed { z: super::spool::Body::Mem(file::compress(raw, z)?), raw: raw.len() as u32, first, last }))
+        Ok(Some(Sealed { z: super::scratch::Body::Mem(file::compress(raw, z)?), raw: raw.len() as u32, first, last }))
     }
 }
 
 impl Sealed {
     /// Its bytes into `spool`, if there is one.
-    pub(crate) fn spill(self, spool: Option<&super::spool::Spool>) -> Result<Sealed> {
+    pub(crate) fn spill(self, spool: Option<&super::scratch::Scratch>) -> Result<Sealed> {
         Ok(Sealed { z: self.z.spill(spool)?, ..self })
     }
 }
@@ -486,7 +486,7 @@ pub(crate) fn path(edges_dir: &Path, frame: u32) -> PathBuf {
 
 /// WRITE frame `frame`'s out file from its units' blocks in order (entries
 /// ascending across blocks: checked). Atomic. Returns its bytes.
-pub(crate) fn write(path: &Path, frame: u32, blocks: &[Sealed], spool: Option<&super::spool::Spool>) -> Result<u64> {
+pub(crate) fn write(path: &Path, frame: u32, blocks: &[Sealed], spool: Option<&super::scratch::Scratch>) -> Result<u64> {
     ensure!(blocks.windows(2).all(|w| w[0].last < w[1].first), "{}: the out blocks' entries are not ascending", path.display());
     let ats = At::place(blocks.iter().map(|b| (b.z.len(), b.raw as usize)));
     let heads: Vec<BlockHead> = blocks.iter().zip(ats).map(|(b, at)| BlockHead { first: b.first, last: b.last, at }).collect();
@@ -661,8 +661,8 @@ mod tests {
     impl Sealed {
         fn clone_for_test(&self) -> Sealed {
             let z = match &self.z {
-                crate::storage::spool::Body::Mem(v) => crate::storage::spool::Body::Mem(v.clone()),
-                crate::storage::spool::Body::Spool(s) => crate::storage::spool::Body::Spool(*s),
+                crate::storage::scratch::Body::Mem(v) => crate::storage::scratch::Body::Mem(v.clone()),
+                crate::storage::scratch::Body::Scratch(s) => crate::storage::scratch::Body::Scratch(*s),
             };
             Sealed { z, raw: self.raw, first: self.first, last: self.last }
         }

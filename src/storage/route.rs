@@ -20,7 +20,7 @@ use crate::search::rem::Rem;
 use celeste_core::pico8_num::Pico8Num as P8;
 use celeste_engine::exact::is_provisional;
 
-/// `Scratch::e_of`'s mark of a provisional target.
+/// `JobScratch::e_of`'s mark of a provisional target.
 const PROV: u32 = u32::MAX;
 
 /// A route's TOUCHED states this frame: per key (open addressing in
@@ -261,7 +261,7 @@ pub(crate) struct RegionCtx<'a> {
     /// Ids from here on are the frame's new transfers', in slice order:
     /// provisional until the frame's end.
     pub(crate) new_xfers: u32,
-    pub(crate) spool: Option<&'a super::spool::Spool>,
+    pub(crate) spool: Option<&'a super::scratch::Scratch>,
 }
 
 /// A unit's bundles, by route: an emission is APPENDED to its route's
@@ -425,7 +425,7 @@ impl UnitBundles {
     }
 }
 
-pub(crate) struct Scratch {
+pub(crate) struct JobScratch {
     /// The job's bundles into provisional targets.
     prov: Vec<Bundle>,
     /// The job's targets named densely, as met (and their keys): the
@@ -446,7 +446,7 @@ pub(crate) struct Scratch {
 /// heavy jobs are millions of bundles; with less, their buffers are remade.
 const SCRATCH_KEEP: usize = 1 << 20;
 
-impl Scratch {
+impl JobScratch {
     fn bound(&mut self) {
         if self.prov.capacity() > SCRATCH_KEEP {
             self.prov = Vec::new();
@@ -468,9 +468,9 @@ impl Scratch {
 
 }
 
-impl Default for Scratch {
+impl Default for JobScratch {
     fn default() -> Self {
-        Scratch {
+        JobScratch {
             prov: Vec::new(),
             t_loc: Default::default(),
             t_keys: Vec::new(),
@@ -490,7 +490,7 @@ impl Default for Scratch {
 /// its touched states; with `cx.record`, the slice's segment (some bundles
 /// wait: `RouteState::prov`).
 #[inline(never)]
-pub(crate) fn run_route<N: Rem>(st: &mut RouteState<N>, slice: u32, chunks: &[&Chunk<N>], cx: &RegionCtx, sc: &mut Scratch) -> Result<()> {
+pub(crate) fn run_route<N: Rem>(st: &mut RouteState<N>, slice: u32, chunks: &[&Chunk<N>], cx: &RegionCtx, sc: &mut JobScratch) -> Result<()> {
     let n: usize = chunks.iter().map(|c| c.bundles.len()).sum();
     st.recs += n as u64;
     let record = cx.record;
@@ -707,7 +707,7 @@ pub(crate) fn sealed<N: Rem>(touch: Touch<N>, parts: Vec<SealPart<N>>) -> Result
 /// (`renumber`: `None` where the new transfers are in order already).
 pub(crate) fn reencode(seg: &Segment, region: u32, finals: &FxHashMap<Key, Key>, renumber: Option<&Renumber>, enc: &mut bundle::Encoder, z: &mut zstd::bulk::Compressor<'static>) -> Result<Segment> {
     let (mut dz, mut raw) = (zstd::bulk::Decompressor::new()?, Vec::new());
-    let super::spool::Body::Mem(bytes) = &seg.bytes else { anyhow::bail!("a waiting segment spooled") };
+    let super::scratch::Body::Mem(bytes) = &seg.bytes else { anyhow::bail!("a waiting segment spooled") };
     super::file::decompress(bytes, seg.raw as usize, &mut dz, &mut raw)?;
     let mut v: Vec<Bundle> = Vec::with_capacity(seg.bundles as usize);
     let mut missing = false;

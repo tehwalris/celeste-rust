@@ -78,45 +78,43 @@ pub(crate) struct Winning<C: Circle = Fixed16> {
     spans: usize,
 }
 
-/// Bytes appended, then read back: in memory, or a scratch file mapped once
-/// written and unlinked (page cache, reclaimable, not anonymous memory).
-enum Spill {
-    Mem(Vec<u8>),
-    File { out: std::io::BufWriter<std::fs::File>, path: std::path::PathBuf, len: u64 },
+/// Bytes appended, then read back: in memory, or a scratch file
+/// (`storage::scratch`, written a buffer at a time) mapped once written.
+struct Spill {
+    buf: Vec<u8>,
+    file: Option<crate::storage::scratch::Scratch>,
+    len: u64,
 }
 
+/// The bytes a spill to a file buffers.
+const SPILL_BUF: usize = 1 << 20;
+
 impl Spill {
+    fn mem() -> Self {
+        Spill { buf: Vec::new(), file: None, len: 0 }
+    }
     fn file(path: std::path::PathBuf) -> anyhow::Result<Self> {
-        let f = std::fs::File::create(&path).map_err(|e| anyhow::anyhow!("{}: {e}", path.display()))?;
-        Ok(Spill::File { out: std::io::BufWriter::with_capacity(1 << 20, f), path, len: 0 })
+        Ok(Spill { buf: Vec::with_capacity(SPILL_BUF), file: Some(crate::storage::scratch::Scratch::create(&path)?), len: 0 })
     }
     fn len(&self) -> u64 {
-        match self {
-            Spill::Mem(v) => v.len() as u64,
-            Spill::File { len, .. } => *len,
-        }
+        self.len
     }
     fn put(&mut self, b: &[u8]) {
-        match self {
-            Spill::Mem(v) => v.extend_from_slice(b),
-            Spill::File { out, path, len } => {
-                use std::io::Write;
-                out.write_all(b).unwrap_or_else(|e| panic!("FATAL: writing the arc phase's scratch file {}: {e}", path.display()));
-                *len += b.len() as u64;
+        self.buf.extend_from_slice(b);
+        self.len += b.len() as u64;
+        if let Some(f) = &self.file {
+            if self.buf.len() >= SPILL_BUF {
+                f.put(&self.buf).unwrap_or_else(|e| panic!("FATAL: the arc phase's scratch file: {e:#}"));
+                self.buf.clear();
             }
         }
     }
     fn done(self) -> anyhow::Result<Bytes> {
-        match self {
-            Spill::Mem(v) => Ok(Bytes::Mem(v)),
-            Spill::File { out, path, .. } => {
-                out.into_inner().map_err(|e| anyhow::anyhow!("{}: {e}", path.display()))?.sync_data()?;
-                let f = std::fs::File::open(&path)?;
-                // SAFETY: the file is this process's own, complete, and
-                // unlinked right after: nothing else writes it.
-                let m = unsafe { memmap2::Mmap::map(&f)? };
-                std::fs::remove_file(&path)?;
-                Ok(Bytes::Map(m))
+        match self.file {
+            None => Ok(Bytes::Mem(self.buf)),
+            Some(f) => {
+                f.put(&self.buf)?;
+                Ok(Bytes::Map(f.map()?))
             }
         }
     }
@@ -495,7 +493,7 @@ impl<'a, N: Rem> Backward<'a, N> {
             cur,
             changed,
             runs: Vec::new(),
-            run_bytes: Spill::Mem(Vec::new()),
+            run_bytes: Spill::mem(),
             spill: None,
             opens: FxHashMap::default(),
             round_emits: ROUND_EMITS,
@@ -933,7 +931,7 @@ impl<'a, N: Rem> Backward<'a, N> {
         assert_eq!(self.runs.len(), self.horizon as usize, "finish before frame 0");
         let last = std::mem::take(&mut self.cur);
         let mut runs = std::mem::take(&mut self.runs);
-        let mut run_bytes = std::mem::replace(&mut self.run_bytes, Spill::Mem(Vec::new()));
+        let mut run_bytes = std::mem::replace(&mut self.run_bytes, Spill::mem());
         runs.push(Run::new(0, last.into_iter().map(|c| (c.id, c.hi, c.set)), &mut run_bytes));
         let all = run_bytes.done()?;
         // The sets by use, the most used first (smaller varints).
@@ -964,7 +962,7 @@ impl<'a, N: Rem> Backward<'a, N> {
         }
         let mut data = match &self.spill {
             Some(dir) => Spill::file(dir.join("w.bin"))?,
-            None => Spill::Mem(Vec::new()),
+            None => Spill::mem(),
         };
         let (mut n, mut blocks) = (0usize, Vec::new());
         let mut node: Vec<(u16, u16, u32)> = Vec::new();
