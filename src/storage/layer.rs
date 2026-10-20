@@ -18,7 +18,7 @@ use celeste_engine::runtime2::{mix64, Cell2, Col, Rt2, P8};
 use super::codec::{get_varint, get_varint128, narrow, put_varint, put_varint128, wide};
 use super::file::{self, At, Mapped, FORMAT_VERSION};
 use super::decode::Repr;
-use super::set::{RegionSet, RegionTable};
+use super::set::{PlainTable, RegionSet};
 use super::{Sk, GEOMETRY};
 
 #[derive(Clone)]
@@ -40,7 +40,7 @@ impl<N: EngineNum> Layer<N> {
     pub(crate) fn push_region(&mut self, region: u32, keys: &[Key], masks: &[u64]) -> Result<()> {
         ensure!(masks.iter().all(|&m| m != 0), "region {region}: an entry without cells");
         ensure!(region % GEOMETRY.slots != GEOMETRY.no_cell_slot() || masks.iter().all(|&m| m == 1), "region {region} (no player): a cell past 0");
-        self.set.push(region, RegionTable::from_sorted(keys, masks)?)
+        self.set.push(region, PlainTable::from_sorted(keys, masks)?)
     }
 
     pub fn entries(&self) -> usize {

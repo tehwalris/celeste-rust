@@ -865,7 +865,7 @@ pub(crate) fn run_wave<N: Rem>(engine: &dyn FrameStep<N>, front: Frontier<N>, cx
     // Into the visited set: the new states (new: none held) with their
     // layer and hull, the grown states' hulls.
     let layer16 = u16::try_from(frame).map_err(|_| anyhow!("frame {frame}: past a u16 layer"))?;
-    let parts: Vec<(u32, &super::set::RegionTable, &[HullOf<N>], &[Old<N>])> = new.iter().map(|sl| (sl.region, &sl.table, sl.hulls.as_slice(), sl.grown.as_slice())).collect();
+    let parts: Vec<(u32, &super::set::PlainTable, &[HullOf<N>], &[Old<N>])> = new.iter().map(|sl| (sl.region, &sl.table, sl.hulls.as_slice(), sl.grown.as_slice())).collect();
     let up = visited.absorb(&parts, layer16, s.threads())?;
     drop(parts);
     ensure!(up.held_new == 0, "frame {frame}: {} of the next layer's states the visited set held already", up.held_new);
@@ -952,7 +952,7 @@ fn mark_filter<N: Rem>(sealed: &mut [super::route::Sealed<N>], f: &crate::frame:
                 masks.push(kept);
             }
         }
-        sl.table = super::set::RegionTable::from_sorted(&keys, &masks)?;
+        sl.table = super::set::PlainTable::from_sorted(&keys, &masks)?;
         sl.hulls = hulls;
         let mut k = n_new;
         sl.grown.retain(|_| {
@@ -1476,7 +1476,7 @@ pub(crate) fn seed<N: Rem>(visited: &mut VisitedSet<N>, blocks: &[Block<N>], sta
         i = j;
     }
     let hulls = vec![start; next.states() as usize];
-    let mut parts: Vec<(u32, &super::set::RegionTable, &[HullOf<N>], &[Old<N>])> = Vec::new();
+    let mut parts: Vec<(u32, &super::set::PlainTable, &[HullOf<N>], &[Old<N>])> = Vec::new();
     let mut at = 0usize;
     for (region, t) in next.set.tables() {
         let n = t.states() as usize;

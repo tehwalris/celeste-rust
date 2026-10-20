@@ -13,7 +13,7 @@ use std::sync::RwLock;
 
 use super::bundle::{self, Bundle};
 use super::edges::Segment;
-use super::set::RegionTable;
+use super::set::{PackedTable, PlainTable};
 use super::visited::{Key, StateInfo, VisitedSet};
 use super::Sk;
 use crate::search::rem::Rem;
@@ -586,7 +586,7 @@ pub(crate) fn run_route<N: Rem>(st: &mut RouteState<N>, slice: u32, chunks: &[&C
 /// table's order, and the states whose hull GREW.
 pub(crate) struct Sealed<N: Rem = P8> {
     pub(crate) region: u32,
-    pub(crate) table: RegionTable,
+    pub(crate) table: PlainTable,
     pub(crate) hulls: Vec<HullOf<N>>,
     pub(crate) grown: Vec<super::wave::Old<N>>,
     /// Times to sort, compare (summed), make the table.
@@ -654,7 +654,7 @@ pub(crate) fn seal_part<N: Rem>(touch: &Touch<N>, part: std::ops::Range<usize>, 
     let (region, accs) = (touch.region, &touch.accs);
     let (mut keys, mut masks, mut hulls): (Vec<Key>, Vec<u64>, Vec<HullOf<N>>) = (Vec::new(), Vec::new(), Vec::new());
     let mut grown: Vec<super::wave::Old<N>> = Vec::new();
-    let mut cursor = visited.table(region).map(RegionTable::cursor::<N>);
+    let mut cursor = visited.table(region).map(PackedTable::cursor::<N>);
     for &TouchedKey { key, cells, start } in &touch.touched[part] {
         let entry = match cursor.as_mut() {
             Some(c) => c.seek(key)?,
@@ -699,7 +699,7 @@ pub(crate) fn sealed<N: Rem>(touch: Touch<N>, parts: Vec<SealPart<N>>) -> Result
         grown.extend(p.grown);
         t_compare += p.t;
     }
-    let table = RegionTable::from_sorted(&keys, &masks)?;
+    let table = PlainTable::from_sorted(&keys, &masks)?;
     Ok(Sealed { region: touch.region, table, hulls, grown, t: [touch.t_sort, t_compare, t.elapsed()], waited: touch.waited })
 }
 
