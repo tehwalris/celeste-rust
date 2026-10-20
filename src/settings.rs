@@ -305,7 +305,7 @@ impl Settings {
         if self.arith != Arith::Fixed {
             lines.push(("arith", self.arith.to_string()));
             // A float tree's balloons: the phase an interval unless seeded
-            // (`trace::cart::sources_in`).
+            // (`trace::cart::sources`).
             lines.push(("float_balloon_phase", (if self.balloon_seeds.is_some() { "seeded" } else { "interval" }).to_string()));
         }
         lines

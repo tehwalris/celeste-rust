@@ -672,7 +672,7 @@ fn write_marks_bin(path: &Path, marks: &[(u32, u32, u32)], b: &Box2) -> Result<(
 }
 
 fn room_tiles(room: (i16, i16)) -> Result<Tiles> {
-    let cart = celeste_core::cart_data::CartData::load("cart").context("loading cart/ (run from the repo root)")?;
+    let cart = &celeste_core::cart_data::CART;
     let grid = cart.map_grid();
     // The start room and the one to its right (where the exit lands).
     let (w, h) = (32u32, 16u32);

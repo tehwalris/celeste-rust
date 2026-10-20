@@ -1,42 +1,49 @@
-use std::{fs, path::Path};
-
 use anyhow::Result;
 
 use crate::pico8_num::Pico8Num;
 
+/// The cart's map and tile flags: one table per process, part of the
+/// binary (`CART`).
 pub struct CartData {
-    map_data: Vec<u8>,
-    flag_data: Vec<u8>,
+    map_data: [u8; 8192],
+    flag_data: [u8; 256],
+}
+
+/// THE CART'S DATA, decoded from `cart/` when the binary is built (as the
+/// `sin` table is): what the binary runs is what it was built from, from
+/// any directory.
+pub static CART: CartData = CartData {
+    map_data: hex_bytes(include_str!("../../../cart/map-data.txt")),
+    flag_data: hex_bytes(include_str!("../../../cart/flag-data.txt")),
+};
+
+/// `text`'s hex digits (whitespace skipped) as exactly `N` bytes; anything
+/// else fails the build.
+const fn hex_bytes<const N: usize>(text: &str) -> [u8; N] {
+    const fn digit(c: u8) -> u8 {
+        match c {
+            b'0'..=b'9' => c - b'0',
+            b'a'..=b'f' => c - b'a' + 10,
+            b'A'..=b'F' => c - b'A' + 10,
+            _ => panic!("cart data: not a hex digit"),
+        }
+    }
+    let b = text.as_bytes();
+    let mut out = [0u8; N];
+    let (mut i, mut n) = (0, 0);
+    while i < b.len() {
+        if !b[i].is_ascii_whitespace() {
+            assert!(n < 2 * N, "cart data: too many bytes");
+            out[n / 2] = out[n / 2] << 4 | digit(b[i]);
+            n += 1;
+        }
+        i += 1;
+    }
+    assert!(n == 2 * N, "cart data: too few bytes");
+    out
 }
 
 impl CartData {
-    pub fn load<P>(base_path: P) -> Result<Self>
-    where
-        P: AsRef<Path>,
-    {
-        let base_path = base_path.as_ref();
-        let cart = CartData {
-            map_data: Self::load_vec(&base_path.join("map-data.txt"), 8192)?,
-            flag_data: Self::load_vec(&base_path.join("flag-data.txt"), 256)?,
-        };
-        Ok(cart)
-    }
-
-    fn load_vec(path: &Path, expected_len: usize) -> Result<Vec<u8>> {
-        let mut raw = fs::read_to_string(path)?;
-        raw.retain(|c| !c.is_whitespace());
-        let decoded = hex::decode(raw)?;
-        if decoded.len() == expected_len {
-            Ok(decoded)
-        } else {
-            Err(anyhow!(
-                "Wrong length: got {}, expected {}",
-                decoded.len(),
-                expected_len
-            ))
-        }
-    }
-
     /// The raw 128x64 map grid (row-major), for hot paths that index it
     /// directly with their own bounds handling.
     pub fn map_grid(&self) -> &[u8] {
@@ -93,7 +100,7 @@ mod tests {
     /// the sprite sheet and are stored nibble-swapped in `__gfx__`.
     #[test]
     fn every_level_room_has_one_player_spawn() {
-        let cart = CartData::load(concat!(env!("CARGO_MANIFEST_DIR"), "/../../cart")).expect("cart");
+        let cart = &CART;
         for ry in 0..4i16 {
             for rx in 0..8i16 {
                 if (rx, ry) == (7, 3) {

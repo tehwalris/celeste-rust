@@ -4,7 +4,6 @@
 use std::sync::Arc;
 
 use anyhow::Result;
-use celeste_core::cart_data::CartData;
 use celeste_core::collision_cache::CollisionCache;
 use celeste_engine::runtime2;
 
@@ -50,21 +49,19 @@ pub fn ids() -> &'static runtime2::BoundaryIds {
     IDS.get_or_init(boundary_ids)
 }
 
-/// Room `(room_x, room_y)`'s cart and collision cache, loaded once per room
-/// (a cache keyed on the room). Every block carries these two `Arc`s (the
-/// kernels read tiles through them); anything that builds a block outside
-/// an engine attaches the same pair.
-pub fn room_context((room_x, room_y): (i16, i16)) -> Result<(Arc<CartData>, Arc<CollisionCache>)> {
-    type Ctx = (Arc<CartData>, Arc<CollisionCache>);
-    static CTX: std::sync::Mutex<Vec<((i16, i16), Ctx)>> = std::sync::Mutex::new(Vec::new());
-    let mut all = CTX.lock().unwrap();
+/// Room `(room_x, room_y)`'s collision cache, built once per room (a cache
+/// keyed on the room). Every block carries it (the kernels read tiles
+/// through it; the map itself is `cart_data::CART`); anything that builds a
+/// block outside an engine attaches the same one.
+pub fn collision_cache((room_x, room_y): (i16, i16)) -> Arc<CollisionCache> {
+    static CACHES: std::sync::Mutex<Vec<((i16, i16), Arc<CollisionCache>)>> = std::sync::Mutex::new(Vec::new());
+    let mut all = CACHES.lock().unwrap();
     if let Some((_, c)) = all.iter().find(|(r, _)| *r == (room_x, room_y)) {
-        return Ok(c.clone());
+        return c.clone();
     }
-    let cart = Arc::new(CartData::load("cart")?);
-    let cache = Arc::new(CollisionCache::new(&cart, room_x, room_y)?);
-    all.push(((room_x, room_y), (cart.clone(), cache.clone())));
-    Ok((cart, cache))
+    let cache = Arc::new(CollisionCache::new(room_x, room_y));
+    all.push(((room_x, room_y), cache.clone()));
+    cache
 }
 
 /// The kernels of one LEVEL under the run's settings
@@ -82,10 +79,8 @@ pub type FrameEngine = Kernels<celeste_core::pico8_num::Pico8Num>;
 pub type FloatKernels = Kernels<celeste_core::lua_f64::LuaF64>;
 
 impl<N: KernelLanes> Kernels<N> {
-    /// The engine for the start room of `settings` (its cart loads here),
-    /// its frames at `level`.
+    /// The engine for the start room of `settings`, its frames at `level`.
     pub fn new(settings: &crate::settings::Settings, level: crate::abstraction::Level) -> Result<Self> {
-        room_context(settings.room)?;
         Ok(Kernels { level, settings: Arc::new(settings.clone()), registry: std::sync::OnceLock::new() })
     }
 

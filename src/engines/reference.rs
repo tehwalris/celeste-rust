@@ -52,11 +52,10 @@ impl<A: Arithmetic> ReferenceEngine<A> {
     /// Parse the cart, run its toplevel and `_init` for the start room of
     /// settings `s`.
     pub fn new(s: &crate::settings::Settings) -> Result<Self> {
-        let root = std::path::Path::new(".");
-        let chunks = crate::trace::cart::Chunks::parse(root, s)?.leak();
+        let chunks = crate::trace::cart::Chunks::parse(s)?.leak();
         let body: &'static ast::Ast = Box::leak(Box::new(full_moon::parse(&format!("__reset_button_states()\n{}", crate::trace::cart::FRAME_CODE))?));
         let mut it = Interp::new(RefDomain::new());
-        let base = crate::trace::cart::boot(&mut it, chunks, root, s.room)?;
+        let base = crate::trace::cart::boot(&mut it, chunks, s.room)?;
         let fn_info = fn_info_of(&base)?;
         Ok(ReferenceEngine { it, body, body_concrete: &chunks.frame, base, fn_info, path_cap: 1_000_000, level: Level::EXACT, settings: std::sync::Arc::new(s.clone()) })
     }
@@ -634,13 +633,11 @@ pub fn set_buttons<A: celeste_core::arith::Arithmetic>(st: &mut State<RefDomain<
 }
 
 /// A reference state as a one-lane block (no row keys); `room`: the search's
-/// start room (the block's cart and collision cache).
+/// start room (the block's collision cache).
 pub fn to_block<N: EngineNum>(st: &State<RefDomain<N::A>>, room: (i16, i16)) -> Result<Rt2<N>> {
-    let (cart, cache) = crate::compiled::room_context(room)?;
     block::to_rt2(
         st,
-        cart,
-        cache,
+        crate::compiled::collision_cache(room),
         |iv| {
             Ok(match <N::A as Arithmetic>::as_point(*iv) {
                 Some(n) => AV::Num(n),
@@ -664,7 +661,7 @@ fn check_agreement<A: crate::transpile::garith::GraphArith>(rt2: &Rt2<A::Num>, f
     use crate::transpile::graph::{NodeId, Op};
     use celeste_engine::exact::exact_rows;
     use celeste_engine::runtime2::Col;
-    let (cart, cache) = crate::compiled::room_context(room)?;
+    let cache = crate::compiled::collision_cache(room);
     let ids = crate::compiled::ids();
     for lane in 0..rt2.width {
         let (reference, _) = from_block(rt2, lane, fn_info, base)?;
@@ -681,8 +678,8 @@ fn check_agreement<A: crate::transpile::garith::GraphArith>(rt2: &Rt2<A::Num>, f
             Op::ConstBool(v) => Ok(AV::Bool(v)),
             ref other => bail!("lane {lane}: a traced boolean {other:?}, not a constant"),
         };
-        let mut b = to_rt2(&traced, cart.clone(), cache.clone(), num, boolean)?;
-        let s = skeleton::<_, A::Num>(&traced, cart.clone(), cache.clone())?;
+        let mut b = to_rt2(&traced, cache.clone(), num, boolean)?;
+        let s = skeleton::<_, A::Num>(&traced, cache.clone())?;
         let first = |x: &Rt2<A::Num>, y: &Rt2<A::Num>| (0..x.structure.len().max(y.structure.len())).find(|&c| x.structure.get(c) != y.structure.get(c) || x.cols.get(c) != y.cols.get(c));
         ensure!(
             a.structure == b.structure && a.cols == b.cols && a.globals == b.globals && a.strings == b.strings,

@@ -7,7 +7,7 @@
 use std::collections::HashMap;
 
 use celeste_core::arith::{Arithmetic, Float};
-use celeste_core::cart_data::CartData;
+use celeste_core::cart_data::CART;
 use celeste_core::collision_cache::CollisionCache;
 use celeste_core::lua_f64::{LuaF64, LuaF64Interval};
 
@@ -464,9 +464,8 @@ fn float_literals_and_rounding_are_the_carts() {
 /// answers.
 #[test]
 fn float_collision_lookups_are_the_16_16_ones() {
-    let cart = CartData::load("cart").expect("cart");
-    let cache = CollisionCache::new(&cart, 1, 0).expect("cache");
-    let env = CollisionEnv { cart: &cart, cache: &cache };
+    let cache = CollisionCache::new(1, 0);
+    let env = CollisionEnv { cache: &cache };
     let mut g = Graph::<Float>::default();
     let (x, y) = (g.leaf(Op::Cell(0)), g.leaf(Op::Cell(1)));
     let m = g.add(Op::Mget, vec![x, y]);
@@ -478,8 +477,8 @@ fn float_collision_lookups_are_the_16_16_ones() {
     for (row, got) in rows.iter().zip(&got) {
         let (In::N(xv), In::N(yv)) = (row[0], row[1]) else { unreachable!() };
         let (xi, yi) = (xv as i16, yv as i16);
-        let tile = cart.mget_whole(xi, yi) as f64;
-        let hit = cache.flag_at(&cart, xi, yi, 8, 6, 0).expect("flag_at");
+        let tile = CART.mget_whole(xi, yi) as f64;
+        let hit = cache.flag_at(xi, yi, 8, 6, 0).expect("flag_at");
         assert_eq!(got[0], Out::N(tile.to_bits()), "mget at {row:?}");
         assert_eq!(got[1], Out::B(hit, true), "tile_flag_at at {row:?}");
     }

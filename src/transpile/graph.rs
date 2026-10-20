@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use anyhow::{anyhow, bail, Result};
 
-use celeste_core::cart_data::CartData;
+use celeste_core::cart_data::CART;
 use celeste_core::collision_cache::CollisionCache;
 
 use celeste_core::arith::{Arithmetic, Fixed};
@@ -61,10 +61,9 @@ pub const OPEN: u8 = u8::MAX;
 /// validities is the lane covered).
 pub const ANY_VALID: u8 = 0x80;
 
-/// The map, for the evaluator.
+/// The room's collision cache, for the evaluator (the map is `CART`'s).
 #[derive(Clone)]
 pub struct Room {
-    pub cart: Arc<CartData>,
     pub cache: Arc<CollisionCache>,
 }
 
@@ -972,12 +971,12 @@ impl<A: GraphArith> Graph<A> {
                         if !mget_sets {
                             bail!("node {}: mget over an interval coordinate", i);
                         }
-                        let set = TileSet::over::<A>(room.unwrap(), x, y);
+                        let set = TileSet::over::<A>(x, y);
                         tiles.insert(i as NodeId, set);
                         return Ok(set.hull());
                     };
                     let whole = |v: A::Num, what: &str| A::as_i16(v).ok_or_else(|| anyhow!("mget: {what} is not an integer"));
-                    let t = room.unwrap().cart.mget_whole(whole(xp, "x")?, whole(yp, "y")?);
+                    let t = CART.mget_whole(whole(xp, "x")?, whole(yp, "y")?);
                     Val::exact_num(A::from_i16(t as i16))
                 }
                 Op::Mget | Op::TileFlagAt => {
@@ -1064,7 +1063,7 @@ impl<A: GraphArith> Graph<A> {
         let (dx, dy) = (xhi - xlo, yhi - ylo);
         let solid = |px: i32, py: i32, pw: i32, ph: i32| -> Result<bool> {
             let ((px, pw), (py, ph)) = (edges(px, pw), edges(py, ph));
-            room.cache.flag_at(&room.cart, px, py, pw, ph, flag)
+            room.cache.flag_at(px, py, pw, ph, flag)
         };
         if !solid(xlo, ylo, w + dx, h + dy)? {
             return Ok(Val::Bool(Some(false)));
@@ -1169,12 +1168,12 @@ impl TileSet {
     /// coordinate is an integer inside its hull (`mget` of a fraction raises),
     /// and outside the map `mget` is 0, so the rectangle is clipped to the map
     /// plus one row of "outside" on each side.
-    fn over<A: GraphArith>(room: &Room, xs: A::Ival, ys: A::Ival) -> TileSet {
+    fn over<A: GraphArith>(xs: A::Ival, ys: A::Ival) -> TileSet {
         let ((x0, x1), (y0, y1)) = (A::tile_span(xs, 128), A::tile_span(ys, 64));
         let mut set = TileSet([0; 4]);
         for x in x0..=x1 {
             for y in y0..=y1 {
-                let t = room.cart.mget_whole(x as i16, y as i16) as usize;
+                let t = CART.mget_whole(x as i16, y as i16) as usize;
                 set.0[t / 64] |= 1 << (t % 64);
             }
         }

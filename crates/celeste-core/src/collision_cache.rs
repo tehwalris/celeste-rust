@@ -1,7 +1,7 @@
 //! Precomputed per-room `tile_flag_at` tables for the common boxes, with the
 //! tile scan as the fallback.
 
-use crate::cart_data::CartData;
+use crate::cart_data::CART;
 use crate::pico8_num::Pico8Num;
 use anyhow::Result;
 use std::cmp;
@@ -101,7 +101,7 @@ pub struct CollisionCache {
 pub const ICE_FLAG: i16 = 4;
 
 impl CollisionCache {
-    pub fn new(cart_data: &CartData, room_x: i16, room_y: i16) -> Result<Self> {
+    pub fn new(room_x: i16, room_y: i16) -> Self {
         // The room plus a margin.
         let range = PosMapRange {
             min_x: -32,
@@ -116,33 +116,33 @@ impl CollisionCache {
         let mut ice_player_hitbox = BoolMap::new(range.clone());
 
         solid_player_hitbox.fill(|x, y| {
-            Self::tile_flag_at_impl(cart_data, room_x, room_y, x + 1, y + 3, 6, 5, 0)
+            Self::tile_flag_at_impl(room_x, room_y, x + 1, y + 3, 6, 5, 0)
                 .unwrap_or(false)
         });
 
         solid_1x1.fill(|x, y| {
-            Self::tile_flag_at_impl(cart_data, room_x, room_y, x, y, 1, 1, 0)
+            Self::tile_flag_at_impl(room_x, room_y, x, y, 1, 1, 0)
                 .unwrap_or(false)
         });
 
         solid_8x8.fill(|x, y| {
-            Self::tile_flag_at_impl(cart_data, room_x, room_y, x, y, 8, 8, 0)
+            Self::tile_flag_at_impl(room_x, room_y, x, y, 8, 8, 0)
                 .unwrap_or(false)
         });
 
         ice_player_hitbox.fill(|x, y| {
-            Self::tile_flag_at_impl(cart_data, room_x, room_y, x + 1, y + 3, 6, 5, ICE_FLAG)
+            Self::tile_flag_at_impl(room_x, room_y, x + 1, y + 3, 6, 5, ICE_FLAG)
                 .unwrap_or(false)
         });
 
-        Ok(Self {
+        Self {
             room_x,
             room_y,
             solid_player_hitbox,
             solid_1x1,
             solid_8x8,
             ice_player_hitbox,
-        })
+        }
     }
 
     /// Cached `solid_at` for a 1x1 box.
@@ -186,20 +186,20 @@ impl CollisionCache {
 
     /// `tile_flag_at(x, y, w, h, flag)` for any flag: the cached maps where
     /// they cover the query, else the tile scan.
-    pub fn flag_at(&self, cart_data: &CartData, x: i16, y: i16, w: i16, h: i16, flag: i16) -> Result<bool> {
+    pub fn flag_at(&self, x: i16, y: i16, w: i16, h: i16, flag: i16) -> Result<bool> {
         if flag == 0 {
-            return self.solid_at(cart_data, x, y, w, h);
+            return self.solid_at(x, y, w, h);
         }
         if let Some((map, dx, dy)) = self.flag_map(w, h, flag) {
             if let Some(v) = map.get(x + dx, y + dy) {
                 return Ok(v);
             }
         }
-        Self::tile_flag_at_impl(cart_data, self.room_x, self.room_y, x, y, w, h, flag)
+        Self::tile_flag_at_impl(self.room_x, self.room_y, x, y, w, h, flag)
     }
 
     /// `solid_at`: the cached maps where they cover the query, else the scan.
-    pub fn solid_at(&self, cart_data: &CartData, x: i16, y: i16, w: i16, h: i16) -> Result<bool> {
+    pub fn solid_at(&self, x: i16, y: i16, w: i16, h: i16) -> Result<bool> {
         if w == 1 && h == 1 {
             if let Some(v) = self.solid_1x1(x, y) {
                 return Ok(v);
@@ -212,7 +212,7 @@ impl CollisionCache {
             }
         }
 
-        Self::tile_flag_at_impl(cart_data, self.room_x, self.room_y, x, y, w, h, 0)
+        Self::tile_flag_at_impl(self.room_x, self.room_y, x, y, w, h, 0)
     }
 
     /// The tile scan: does any tile of the room under the box have `flag`.
@@ -222,7 +222,6 @@ impl CollisionCache {
     /// [-7, -1]) scans nothing, not column 0 (rows likewise). The first
     /// column truncates or floors alike under the `max`.
     fn tile_flag_at_impl(
-        cart_data: &CartData,
         room_x: i16,
         room_y: i16,
         x: i16,
@@ -241,12 +240,12 @@ impl CollisionCache {
                 let world_tx = room_x * 16 + tx;
                 let world_ty = room_y * 16 + ty;
 
-                let tile = cart_data.mget(
+                let tile = CART.mget(
                     Pico8Num::from_i16(world_tx),
                     Pico8Num::from_i16(world_ty),
                 )?;
 
-                if cart_data.fget(
+                if CART.fget(
                     Pico8Num::from_i16(tile as i16),
                     Pico8Num::from_i16(flag),
                 )? {

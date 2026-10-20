@@ -147,9 +147,9 @@ impl<N: EngineNum> SkelRecord<N> {
         Ok(SkelRecord { shape_hash: rt2.shape_hash, structure: rt2.structure.clone(), globals: rt2.globals.clone(), strings: rt2.strings.clone(), prints: rt2.prints.clone(), others, numeric })
     }
 
-    /// The skeleton as an empty block over `cart` and `cache` (a room's).
-    pub(crate) fn rt2(&self, cart: Arc<celeste_core::cart_data::CartData>, cache: Arc<celeste_core::collision_cache::CollisionCache>) -> Rt2<N> {
-        let mut rt2 = Rt2::empty(0, self.globals.len(), &[], cart, cache);
+    /// The skeleton as an empty block over `cache` (a room's).
+    pub(crate) fn rt2(&self, cache: Arc<celeste_core::collision_cache::CollisionCache>) -> Rt2<N> {
+        let mut rt2 = Rt2::empty(0, self.globals.len(), &[], cache);
         rt2.structure = self.structure.clone();
         rt2.globals = self.globals.clone();
         rt2.strings = self.strings.clone();
@@ -165,10 +165,9 @@ impl<N: EngineNum> SkelRecord<N> {
         rt2
     }
 
-    /// The skeleton in a search from `room` (its cart and collision cache).
-    pub(crate) fn rt2_in(&self, room: (i16, i16)) -> Result<Rt2<N>> {
-        let (cart, cache) = crate::compiled::room_context(room)?;
-        Ok(self.rt2(cart, cache))
+    /// The skeleton in a search from `room` (its collision cache).
+    pub(crate) fn rt2_in(&self, room: (i16, i16)) -> Rt2<N> {
+        self.rt2(crate::compiled::collision_cache(room))
     }
 }
 
@@ -396,7 +395,7 @@ impl<N: EngineNum> FrameFile<N> {
         ensure!(layer.set.tables().len() == n, "{}: an empty region", self.path().display());
         if let Some(room) = room {
             for s in &self.header.skeletons {
-                layer.skeletons.insert(s.shape_hash, Arc::new(s.rt2_in(room)?));
+                layer.skeletons.insert(s.shape_hash, Arc::new(s.rt2_in(room)));
             }
         }
         Ok((layer, wins))
@@ -548,7 +547,7 @@ impl<N: EngineNum> Tree<N> {
     /// The skeleton of `shape` in frame `f`'s files, in a search from `room`.
     pub(crate) fn skeleton(&self, f: u32, shape: u64, room: (i16, i16)) -> Result<Rt2<N>> {
         let r = self.file(f).into_iter().flat_map(|x| x.header.skeletons.iter()).find(|r| r.shape_hash == shape).ok_or_else(|| anyhow!("{}: frame {f} has no skeleton of shape {shape:016x}", self.dir.display()))?;
-        r.rt2_in(room)
+        Ok(r.rt2_in(room))
     }
 
     /// Frame `f`'s ROWS in a search from `room` (`decode_states`; keys set).

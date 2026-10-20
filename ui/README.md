@@ -229,8 +229,7 @@ frames after each dash start are hatched and labelled `frozen`: the cart's
 `freeze=2` skips `_update`, so their input does nothing. They come from
 the `dashes` list; the orb's `freeze=10` (room (5,2)) is not marked.
 
-Room (3,3) at h172 (from the repo root: it loads cart/ for the
-tiles):
+Room (3,3) at h172:
 
 ```bash
 ./safe-run.sh -- ./target/quick/rewrite search --level-minus-one 172,5 \

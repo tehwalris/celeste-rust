@@ -284,7 +284,6 @@ pub struct LoweredFrame<A: GraphArith = Fixed> {
     pub frame: Frame<A>,
     pub bound: Bound<A>,
     pub lowered: Lowered<A>,
-    pub cart: std::sync::Arc<celeste_core::cart_data::CartData>,
     pub cache: std::sync::Arc<celeste_core::collision_cache::CollisionCache>,
 }
 
@@ -317,12 +316,11 @@ fn name_cells<A: GraphArith>(f: &super::frame::Frame<A>, e: anyhow::Error) -> an
 /// The constant-lattice walk's frames for the start room, lowered, in walk
 /// order. A frame that fails to bind or lower is FATAL.
 pub(crate) fn lattice_kernel_refs<A: GraphArith>(
-    root: &std::path::Path,
     opts: crate::abstraction::Level,
     s: &crate::settings::Settings,
 ) -> Result<Vec<(Option<Region>, LoweredFrame<A>)>> {
-    let mut lw = room_constant_lattice(root, opts, &Walk { settings: s, only: None })?;
-    let room = crate::transpile::graph::Room { cart: lw.cart.clone(), cache: lw.cache.clone() };
+    let mut lw = room_constant_lattice(opts, &Walk { settings: s, only: None })?;
+    let room = crate::transpile::graph::Room { cache: lw.cache.clone() };
     // Each frame was bound by the walk in the worker arena it was traced in.
     let frames: Vec<(Option<Region>, super::frame::Frame<A>, Bound<A>)> = std::mem::take(&mut lw.frames)
         .into_iter()
@@ -333,12 +331,12 @@ pub(crate) fn lattice_kernel_refs<A: GraphArith>(
         .collect::<Result<Vec<_>>>()?;
     // Lower (the expensive half of a build), in parallel. Each frame is
     // taken by exactly one worker (a `Frame` is not cloned).
-    let (cart, cache) = (lw.cart.clone(), lw.cache.clone());
+    let cache = lw.cache.clone();
     let slots: Vec<std::sync::Mutex<Option<(Option<Region>, super::frame::Frame<A>, Bound<A>)>>> = frames.into_iter().map(|x| std::sync::Mutex::new(Some(x))).collect();
     let refs = crate::par::Pool::per_core().stack(128 << 20).map(slots.len(), |i| {
         let (key, f, bound) = slots[i].lock().expect("a frame's slot").take().expect("each frame is lowered once");
         let lowered = super::lower::lower_frame(&bound, Some(room.clone()), s.diag.build_trace).map_err(|e| anyhow::anyhow!("lattice frame {} ({:?}) lower: {:#}", i, key, name_cells(&f, e)))?;
-        Ok((key, LoweredFrame { frame: f, bound, lowered, cart: cart.clone(), cache: cache.clone() }))
+        Ok((key, LoweredFrame { frame: f, bound, lowered, cache: cache.clone() }))
     })?;
     Ok(refs)
 }

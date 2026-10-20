@@ -129,7 +129,6 @@ pub fn reshape<N: EngineNum>(src: &Rt2<N>, width: usize) -> Rt2<N> {
         width,
         src.globals.len(),
         celeste_names::STRINGS,
-        src.cart.clone(),
         src.cache.clone(),
     );
     b.globals = src.globals.clone();

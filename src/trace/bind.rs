@@ -193,14 +193,8 @@ mod tests {
         let text = std::fs::read_to_string(path).expect("witness");
         let w: serde_json::Value = serde_json::from_str(&text).expect("json");
         let cells = w["cells"].as_array().expect("cells");
-        let cart = std::sync::Arc::new(
-            celeste_core::cart_data::CartData::load("cart").expect("cart"),
-        );
-        let (rx, ry) = crate::settings::Settings::default().room;
-        let cache = std::sync::Arc::new(
-            celeste_core::collision_cache::CollisionCache::new(&cart, rx, ry).expect("cache"),
-        );
-        let mut rt2 = Rt2::empty(1, gen::GLOBAL_NAMES.len(), gen::STRINGS, cart, cache);
+        let cache = crate::compiled::collision_cache(crate::settings::Settings::default().room);
+        let mut rt2 = Rt2::empty(1, gen::GLOBAL_NAMES.len(), gen::STRINGS, cache);
         rt2.structure = Vec::with_capacity(cells.len());
         rt2.cols = Vec::with_capacity(cells.len());
         for c in cells {
@@ -299,16 +293,16 @@ mod tests {
     #[test]
     fn a_traced_state_becomes_a_structure_every_path_can_walk() {
         use crate::trace::{cart, domain::Symbolic, interp::Interp};
-        let (root, s) = (std::path::Path::new("."), crate::settings::Settings::default());
-        let chunks = cart::Chunks::parse(root, &s).expect("chunks");
+        let s = crate::settings::Settings::default();
+        let chunks = cart::Chunks::parse(&s).expect("chunks");
         let mut it: Interp<Symbolic> = Interp::new(Symbolic::default());
-        let mut st = cart::boot(&mut it, &chunks, root, s.room).expect("boot");
+        let mut st = cart::boot(&mut it, &chunks, s.room).expect("boot");
         for _ in 0..12 {
             st = cart::run_one(&mut it, &chunks.frame, st).expect("warm-up");
         }
-        let (cd, cache) = (it.cart.clone().expect("cart"), it.cache.clone().expect("cache"));
+        let cache = it.cache.clone().expect("cache");
 
-        let rt2: Rt2 = crate::trace::block::skeleton(&st, cd, cache).expect("structure");
+        let rt2: Rt2 = crate::trace::block::skeleton(&st, cache).expect("structure");
         let mut seen: std::collections::HashMap<u32, Path> = Default::default();
         let (mut ok, mut unnameable) = (0usize, 0usize);
         for p in crate::trace::iface::scalars(&st, &[]).expect("scalars") {

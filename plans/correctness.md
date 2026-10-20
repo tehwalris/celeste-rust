@@ -32,17 +32,29 @@ settled here. Evidence is file:line at develop 19869c5d.
   it (a legitimate projection difference, or a bug). Blocks any further split-
   frame refactor (audit M6).
 
-## C4. Rust and Python loading-frame patches differ
-- Rust, trace/cart.rs:264: `if o.spd.x ~= 0 or o.spd.y ~= 0 then o.move(...)`
-  (the minimal cart's own `foreach`, celeste-minimal.lua:788).
-- Python, pico8_diff/replay.py:229: `o.move(o.spd.x, o.spd.y)`, unguarded,
-  also on the minimal cart.
-- `move(0,0)` is not a no-op: `move_x`/`move_y` (celeste-minimal.lua:664-696)
-  run their loop once at amount 0 and zero `rem` inside a solid. So the
-  search and the PICO-8 validation can disagree on a jank start.
-- To do: settle which matches the ORIGINAL cart's loading frame, then make
-  one source (audit foundations #1: patches written once in Rust, the PICO-8
-  carts generated) and re-check every witness, upload and boot chain.
+## C4. The minimal cart guards every object move; the original does not
+- The original cart's update loop moves every object unconditionally
+  (celeste.lua:1195: `obj.move(obj.spd.x,obj.spd.y)`); the minimal cart we
+  trace guards it (celeste-minimal.lua:787: `if obj.spd.x ~= 0 or obj.spd.y
+  ~= 0 then`). `move` calls `move_x(amount,0)`, whose loop starts at 0: at
+  amount 0 it runs once with `sign(0)=0`, i.e. `is_solid(0,0)`, and inside a
+  solid sets `spd.x=0, rem.x=0`. So the search keeps a remainder the real
+  game zeroes, for an object with solids, both speeds 0, overlapping a solid,
+  on EVERY frame (not only the loading frame).
+- Origin: celeste_ocaml commit 07ba38a (2022-02-04, "Replace tile_flag_at
+  with a builtin"), no equivalence argument; copied here in b176c4fe.
+- The loading-frame patches inherit it: Rust (trace/cart.rs:264) guarded,
+  Python (pico8_diff/replay.py:229) unguarded.
+- Direction: the search could MISS a real route (validation on PICO-8 only
+  catches fake ones). Reachability unknown (an object at rest inside a solid).
+- In progress: a full classification of every original-vs-minimal difference
+  (/var/tmp/c4-quick/cart-differences.md; 21 functions identical, 33
+  changed, 23 removed, plus the native builtins and the Rust cart patches).
+- To do after: a standing DIFFERENTIAL CHECK that runs the original cart's Lua
+  and the minimal cart side by side on many inputs in every room and compares
+  game state each frame (modulo the handled differences: removed smoke and
+  lifeup objects, the jump buffer), so the minimal cart and every native
+  builtin are checked, not trusted.
 
 ## C5. Verification gaps at the object and platform levels
 - At `p` the reference engine refuses to run (engines/reference.rs:539): the

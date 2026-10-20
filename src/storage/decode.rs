@@ -51,7 +51,6 @@ pub(crate) fn decode_rows<N: EngineNum>(keys: &KeySpace<N>, skel: &Rt2<N>, rows:
         cols: Vec::with_capacity(skel.cols.len()),
         globals: skel.globals.clone(),
         strings: skel.strings.clone(),
-        cart: skel.cart.clone(),
         cache: skel.cache.clone(),
         prints: skel.prints.clone(),
         shape_hash: skel.shape_hash,
@@ -264,7 +263,7 @@ impl<N: EngineNum> Skeletons<N> {
             ensure!(a.0 == rec, "ROWS FROM KEYS: two skeletons of shape {:016x} (another structure, non-value cell or column kind): its rows would decode as the first's", skel.shape_hash);
             return Ok(());
         }
-        let rt2 = std::sync::Arc::new(rec.rt2(skel.cart.clone(), skel.cache.clone()));
+        let rt2 = std::sync::Arc::new(rec.rt2(skel.cache.clone()));
         self.0.write().expect("skeletons").entry(skel.shape_hash).or_insert((rec, rt2));
         Ok(())
     }

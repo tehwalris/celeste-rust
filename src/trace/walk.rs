@@ -368,7 +368,7 @@ mod tests {
         use crate::settings::Settings;
         let level = crate::abstraction::Level::parse("r0sxh").expect("level");
         let chain = |s: Settings, max_nodes: Option<usize>| {
-            let (mut tr, start) = super::boot::<celeste_core::arith::Fixed>(std::path::Path::new("."), &s, level).expect("boot");
+            let (mut tr, start) = super::boot::<celeste_core::arith::Fixed>(&s, level).expect("boot");
             tr.it.max_nodes = max_nodes.unwrap_or(tr.it.max_nodes);
             super::no_player_ranges(&mut tr.it, tr.chunks, &start, level)
         };
@@ -382,13 +382,10 @@ mod tests {
     #[test]
     #[ignore = "slow, ./check.sh t2 runs it: room (6,1)'s lattice walk, ~15 s"]
     fn near_floors_side_by_side_split_only_what_collisions_read() {
-        if !std::path::Path::new("lua/celeste-minimal.lua").exists() {
-            return;
-        }
         let s = crate::settings::Settings { room: (6, 1), ..Default::default() };
         let opts = crate::abstraction::Level { held: true, floors_near: true, ..crate::abstraction::Level::EXACT };
         let only = [super::Region { ix: 3, iy: 6 }, super::Region { ix: 4, iy: 6 }];
-        let lw: super::LatticeWalk = super::room_constant_lattice(std::path::Path::new("."), opts, &super::Walk { settings: &s, only: Some(&only) }).unwrap_or_else(|e| panic!("{e:#}"));
+        let lw: super::LatticeWalk = super::room_constant_lattice(opts, &super::Walk { settings: &s, only: Some(&only) }).unwrap_or_else(|e| panic!("{e:#}"));
         let mut traced = 0;
         for ((shape, region), f) in &lw.frames {
             let Some(r) = region else { continue };
@@ -411,7 +408,7 @@ mod tests {
         let s = crate::settings::Settings { room: (0, 3), hundred: true, gemskip: true, loading_jank: Some(1), ..Default::default() };
         let opts = crate::abstraction::Level::parse("r0sxh").expect("level");
         let only: Vec<super::Region> = (0..8).flat_map(|ix| (5..8).map(move |iy| super::Region { ix, iy })).collect();
-        let lw: super::LatticeWalk = super::room_constant_lattice(std::path::Path::new("."), opts, &super::Walk { settings: &s, only: Some(&only) }).unwrap_or_else(|e| panic!("{e:#}"));
+        let lw: super::LatticeWalk = super::room_constant_lattice(opts, &super::Walk { settings: &s, only: Some(&only) }).unwrap_or_else(|e| panic!("{e:#}"));
         let mut bounded = 0;
         for ((shape, region), f) in &lw.frames {
             let rep = &lw.reps[shape];
@@ -432,15 +429,15 @@ mod tests {
 }
 
 /// The walk's tracer at room `s.room`'s start, every frame traced at `opts`.
-fn boot<A: GraphArith>(root: &std::path::Path, s: &crate::settings::Settings, opts: crate::abstraction::Level) -> Result<(Tracer<A>, super::state::State<super::domain::Symbolic<A>>)> {
-    let chunks = super::cart::Chunks::parse(root, s)?.leak();
+fn boot<A: GraphArith>(s: &crate::settings::Settings, opts: crate::abstraction::Level) -> Result<(Tracer<A>, super::state::State<super::domain::Symbolic<A>>)> {
+    let chunks = super::cart::Chunks::parse(s)?.leak();
     let mut it = super::interp::Interp::new(super::domain::Symbolic::<A>::default());
     it.d.build_trace = s.diag.build_trace;
     it.d.level = opts;
     if opts.platforms {
         it.d.worlds = Some(std::sync::Arc::new(crate::concrete::platform_worlds::<A>(PLATFORM_WORLD_FRAMES, s)?));
     }
-    let start = super::cart::boot(&mut it, chunks, root, s.room)?;
+    let start = super::cart::boot(&mut it, chunks, s.room)?;
     Ok((Tracer { it, chunks }, start))
 }
 
@@ -450,7 +447,6 @@ fn boot<A: GraphArith>(root: &std::path::Path, s: &crate::settings::Settings, op
 /// shape that shrinks. Monotone (constant -> abstract only), so it
 /// terminates. Every frame is traced under `opts`, the kernels' level.
 pub fn room_constant_lattice<A: GraphArith>(
-    root: &std::path::Path,
     opts: crate::abstraction::Level,
     walk: &Walk,
 ) -> Result<LatticeWalk<A>> {
@@ -459,8 +455,8 @@ pub fn room_constant_lattice<A: GraphArith>(
     use anyhow::bail;
 
     let (s, only) = (walk.settings, walk.only);
-    let (Tracer { mut it, chunks }, start) = boot::<A>(root, s, opts)?;
-    let (cart_data, cache) = (it.cart.clone().expect("boot loads the cart"), it.cache.clone().expect("boot loads the collision cache"));
+    let (Tracer { mut it, chunks }, start) = boot::<A>(s, opts)?;
+    let cache = it.cache.clone().expect("boot loads the collision cache");
 
     let key = |st: &super::state::State<Symbolic<A>>| -> Result<String> { Ok(format!("{:?}", st.shape()?)) };
 
@@ -748,7 +744,7 @@ pub fn room_constant_lattice<A: GraphArith>(
     for ((k, _), wf) in &frames {
         by_hash.insert(wf.frame.in_rt2.shape_hash_of(), k.clone());
     }
-    Ok(LatticeWalk { lattice, reps, frames, cart: cart_data, cache, tracer: Tracer { it, chunks }, by_hash, start_key, ival_extra, start_ivals })
+    Ok(LatticeWalk { lattice, reps, frames, cache, tracer: Tracer { it, chunks }, by_hash, start_key, ival_extra, start_ivals })
 }
 
 /// `ival` (the level's interval inputs) plus a shape's discovered
@@ -907,7 +903,6 @@ pub struct LatticeWalk<A: GraphArith = Fixed> {
     pub reps: std::collections::BTreeMap<String, super::state::State<super::domain::Symbolic<A>>>,
     /// Per (shape, region), its converged frame, bounds and binding.
     pub frames: std::collections::BTreeMap<WalkNode, WalkFrame<A>>,
-    pub cart: std::sync::Arc<celeste_core::cart_data::CartData>,
     pub cache: std::sync::Arc<celeste_core::collision_cache::CollisionCache>,
     /// Per shape, input slots a reachable frame wrote an `rnd`-derived interval
     /// to, typed as interval inputs.

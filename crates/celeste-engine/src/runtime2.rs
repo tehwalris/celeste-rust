@@ -7,7 +7,6 @@
 use std::sync::Arc;
 
 use celeste_core::arith::EngineNum;
-use celeste_core::cart_data::CartData;
 use celeste_core::collision_cache::CollisionCache;
 use celeste_core::pico8_num::Pico8Num;
 use serde::{Deserialize, Serialize};
@@ -131,7 +130,6 @@ pub struct Rt2<N = P8> {
     pub cols: Vec<Col<N>>,
     pub globals: Vec<u32>,
     pub strings: Vec<String>,
-    pub cart: Arc<CartData>,
     pub cache: Arc<CollisionCache>,
     pub prints: Vec<String>,
     /// Set by `boundary`: the canonical structure hash (the shape key).
@@ -243,7 +241,6 @@ impl<N: EngineNum> Rt2<N> {
         width: usize,
         globals_len: usize,
         static_strings: &[&str],
-        cart: Arc<CartData>,
         cache: Arc<CollisionCache>,
     ) -> Rt2<N> {
         Rt2 {
@@ -252,7 +249,6 @@ impl<N: EngineNum> Rt2<N> {
             cols: Vec::new(),
             globals: vec![NONE; globals_len],
             strings: static_strings.iter().map(|s| s.to_string()).collect(),
-            cart,
             cache,
             prints: Vec::new(),
             shape_hash: 0,
@@ -607,7 +603,7 @@ impl<N: EngineNum> Rt2<N> {
         self.width = keep.len();
     }
 
-    /// A clone that shares the immutable context (cart/cache Arcs).
+    /// A clone that shares the immutable context (the collision cache's `Arc`).
     pub fn clone_block(&self) -> Rt2<N> {
         Rt2 {
             width: self.width,
@@ -615,7 +611,6 @@ impl<N: EngineNum> Rt2<N> {
             cols: self.cols.clone(),
             globals: self.globals.clone(),
             strings: self.strings.clone(),
-            cart: self.cart.clone(),
             cache: self.cache.clone(),
             prints: self.prints.clone(),
             shape_hash: self.shape_hash,

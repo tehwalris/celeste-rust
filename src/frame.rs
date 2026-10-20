@@ -88,8 +88,7 @@ fn summit_flag((rx, ry): (i16, i16)) -> Option<(i16, i16, i16, i16)> {
         return None;
     }
     *RECTS.get_or_init(Default::default).lock().unwrap().entry((rx, ry)).or_insert_with(|| {
-        let cart = celeste_core::cart_data::CartData::load(std::path::Path::new("cart"))
-            .expect("summit win: load the cart");
+        let cart = &celeste_core::cart_data::CART;
         let flags: Vec<(i16, i16)> = (0..16i16)
             .flat_map(|ty| (0..16i16).map(move |tx| (tx, ty)))
             .filter(|&(tx, ty)| cart.mget_whole(rx * 16 + tx, ry * 16 + ty) == 118)
@@ -953,7 +952,7 @@ pub(crate) fn restore_visited<N: Rem>(dir: &std::path::Path, last: u32, room: (i
     };
     for f in 0..=last {
         for r in tree.file(f).filter(|_| f > 0).iter().flat_map(|x| x.header.skeletons.iter().chain(&x.header.emitted)) {
-            skeletons.register(&r.rt2_in(room)?)?;
+            skeletons.register(&r.rt2_in(room))?;
         }
         let (layer, _) = tree.layer(f, (f == last).then_some(room), threads)?;
         let p = hulls::path(dir, f);

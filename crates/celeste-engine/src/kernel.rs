@@ -6,7 +6,7 @@
 //! the `*_wraps` masks are those lanes, the reference for the kernels'
 //! `Op::NoWrap`.
 
-use celeste_core::cart_data::CartData;
+use celeste_core::cart_data::CART;
 use celeste_core::collision_cache::CollisionCache;
 use celeste_core::pico8_num::Pico8Num as P8;
 
@@ -483,13 +483,13 @@ pub fn zi_fork_flr(a: ZI, c: usize) -> (ZI, u16) {
 /// there on lanes that do not take the iteration); a fractional coordinate
 /// panics (the traced cart never makes one).
 #[inline(always)]
-pub fn zn_mget(cart: &CartData, x: ZN, y: ZN) -> ZN {
+pub fn zn_mget(x: ZN, y: ZN) -> ZN {
     let (x, y) = (x.to_array(), y.to_array());
     let mut o = [P8::from_i16(0); W];
     for i in 0..W {
         let xi = x[i].as_i16().expect("mget: x is not an integer");
         let yi = y[i].as_i16().expect("mget: y is not an integer");
-        o[i] = P8::from_i16(cart.mget_whole(xi, yi) as i16);
+        o[i] = P8::from_i16(CART.mget_whole(xi, yi) as i16);
     }
     ZN::from_array(o)
 }
@@ -499,7 +499,6 @@ pub fn zn_mget(cart: &CartData, x: ZN, y: ZN) -> ZN {
 #[inline(always)]
 pub fn zn_tile_flag_at(
     cache: &CollisionCache,
-    cart: &CartData,
     x: ZN,
     y: ZN,
     w: P8,
@@ -518,9 +517,9 @@ pub fn zn_tile_flag_at(
         let b = match &map {
             Some((map, dx, dy)) => match map.get(xi + dx, yi + dy) {
                 Some(v) => v,
-                None => cache.flag_at(cart, xi, yi, wi, hi, f).expect("tile_flag_at"),
+                None => cache.flag_at(xi, yi, wi, hi, f).expect("tile_flag_at"),
             },
-            None => cache.flag_at(cart, xi, yi, wi, hi, f).expect("tile_flag_at"),
+            None => cache.flag_at(xi, yi, wi, hi, f).expect("tile_flag_at"),
         };
         if b {
             val |= 1 << i;
@@ -535,7 +534,6 @@ pub fn zn_tile_flag_at(
 /// the scan, the precomputed maps being keyed by the box.
 pub fn zn_tile_flag_at_lanes(
     cache: &CollisionCache,
-    cart: &CartData,
     x: ZN,
     y: ZN,
     w: ZN,
@@ -550,7 +548,7 @@ pub fn zn_tile_flag_at_lanes(
         let yi = y[i].as_i16().expect("tile_flag_at: y must be an integer");
         let wi = w[i].as_i16().expect("tile_flag_at: w must be an integer");
         let hi = h[i].as_i16().expect("tile_flag_at: h must be an integer");
-        if cache.flag_at(cart, xi, yi, wi, hi, f).expect("tile_flag_at") {
+        if cache.flag_at(xi, yi, wi, hi, f).expect("tile_flag_at") {
             val |= 1 << i;
         }
     }
