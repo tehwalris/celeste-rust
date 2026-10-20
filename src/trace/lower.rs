@@ -103,7 +103,7 @@ pub fn bind<A: GraphArith>(f: &crate::trace::frame::Frame<A>, g: &Graph<A>) -> R
         let mut roots = o.roots().map(|n| map[n as usize]);
         let mut widen: Vec<(u32, AV<A::Num>)> = Vec::new();
         for (i, r) in roots.fields.iter_mut().enumerate() {
-            if graph.get(*r).op == crate::transpile::graph::Op::UnknownNum {
+            if matches!(graph.get(*r).op, crate::transpile::graph::Op::UnknownNum { .. }) {
                 *r = placeholder;
                 // Uniform, off the per-lane key fold (unknown BOOLEANS are stored
                 // uniform by `frame::out_fields`; a widening that stores a
@@ -116,7 +116,7 @@ pub fn bind<A: GraphArith>(f: &crate::trace::frame::Frame<A>, g: &Graph<A>) -> R
     }
     let roots: Vec<NodeId> = outcomes.iter().flat_map(|o| o.roots.flat()).collect();
     let reach = graph.reachable(&roots);
-    if let Some(n) = (0..graph.len() as NodeId).find(|n| reach[*n as usize] && graph.get(*n).op == crate::transpile::graph::Op::UnknownNum) {
+    if let Some(n) = (0..graph.len() as NodeId).find(|n| reach[*n as usize] && matches!(graph.get(*n).op, crate::transpile::graph::Op::UnknownNum { .. })) {
         // Name the roots that read it: the field, the guard or the error.
         let reaches = |r: NodeId| graph.cone(&[r]).contains(&n);
         let which: Vec<String> = roots.iter().enumerate().filter(|(_, r)| reaches(**r)).map(|(i, r)| format!("#{i} {}", show_tree(&graph, *r, 4))).collect();

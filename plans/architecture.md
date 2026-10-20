@@ -458,8 +458,6 @@ verification surface behind it:
 - **Absent-as-zero** fields (a fall floor's or spring's missing `delay`):
   exact modulo raises, guarded syntactically (`cart::check_absent_fields`);
   the clean form, a nil-or-number column, would re-pin everything.
-- **Countdowns are recognized by field name** in the interpreter (the
-  list comes from the widening table).
 - **With `p`, an overlapped floor stores its computed value** because an
   owe failed for unproven reasons; spurious states the concrete search
   refutes.

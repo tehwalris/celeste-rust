@@ -10,7 +10,7 @@ use anyhow::{anyhow, bail, Result};
 
 use celeste_core::arith::EngineNum;
 use celeste_engine::widening::{constant, range};
-use celeste_engine::widening::{floor_player_window, Entry, Flag, Hook, Input, Level, Slot, Stored, Target, FLOOR_HITBOX, PLATFORM_PATH, PLAYER_HITBOX, REM, TABLE};
+use celeste_engine::widening::{floor_player_window, Entry, Flag, Hook, Input, Level, Slot, Stored, Target, FLOOR_HITBOX, PLATFORM_PATH, PLAYER_HITBOX, REM};
 
 use super::domain::{Domain, Symbolic};
 use super::heap::Value;
@@ -107,22 +107,10 @@ pub fn interval_input(s: &Slot) -> bool {
         && matches!(s.stored, Stored::Range { .. } | Stored::Band { .. } | Stored::Phase { .. } | Stored::UnknownBool | Stored::SameAs(_))
 }
 
-/// The countdown FIELD NAMES a near level stores as the unknown number (the
-/// interpreter's hint, `Domain::set_countdown_hint`).
-pub fn countdown_fields() -> &'static [&'static str] {
-    static F: std::sync::OnceLock<Vec<&'static str>> = std::sync::OnceLock::new();
-    F.get_or_init(|| {
-        let mut out: Vec<&'static str> = TABLE
-            .iter()
-            .filter(|e| e.flag == Flag::Near)
-            .flat_map(|e| e.slots.iter())
-            .filter(|s| s.stored == Stored::UnknownNum)
-            .map(|s| *s.field.last().expect("a field"))
-            .collect();
-        out.sort_unstable();
-        out.dedup();
-        out
-    })
+/// Is a slot a COUNTDOWN a near level stores as the unknown number (its
+/// unknown number a countdown's, `Op::UnknownNum`)?
+fn countdown(e: &Entry, s: &Slot) -> bool {
+    e.flag == Flag::Near && s.stored == Stored::UnknownNum
 }
 
 /// A table RANGE `[lo, hi]` (raw 16.16) as one graph literal, as the block
@@ -214,7 +202,7 @@ fn widen_entry<A: GraphArith>(st: &mut State<Symbolic<A>>, d: &mut Symbolic<A>, 
                 }
                 Stored::UnknownNum => {
                     num()?;
-                    Value::Num(d.unknown_num())
+                    Value::Num(d.unknown_num(countdown(e, s)))
                 }
                 Stored::UnknownBool => {
                     let Value::Bool(_) = old_v else { bail!("{}: not a boolean (widening {:?})", iface::show(p), e.name) };
@@ -333,7 +321,7 @@ fn read_slot<A: GraphArith>(st: &mut State<Symbolic<A>>, d: &mut Symbolic<A>, e:
         (Input::BothWays, Some(Value::Bool(_))) => Value::Bool(d.both_values(s.field.last().expect("a field"))),
         (Input::Atom, Some(Value::Bool(_))) => Value::Bool(d.unknown_bool_atom()),
         (Input::BothWays | Input::Atom, _) => return Err(what("boolean")),
-        (Input::Unknown, Some(Value::Num(_))) => Value::Num(d.unknown_num()),
+        (Input::Unknown, Some(Value::Num(_))) => Value::Num(d.unknown_num(countdown(e, s))),
         (Input::Literal, Some(Value::Num(v))) => {
             let Stored::Range { lo, hi, .. } = s.stored else { bail!("{}: a literal input reads a range", iface::show(p)) };
             pin_literal(d, v, lo, hi);

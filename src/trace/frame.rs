@@ -682,11 +682,11 @@ end
     /// trace once, evaluate at each concrete limit against the hand answer.
     #[test]
     fn break_leaves_a_loop_whose_bound_is_symbolic() {
-        // `unroll_bound` keys on SOURCE TEXT: the cart's `abs(amount)`.
+        // The loop's unroll bound is its annotation, as in the cart.
         let src = "
 function f(amount)
   local n = 0
-  for i=0,abs(amount) do
+  for i=0,abs(amount) do --@unroll 8
     if i >= 2 then break end
     n = n + 1
   end

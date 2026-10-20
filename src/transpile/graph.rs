@@ -118,8 +118,11 @@ pub enum Op<A: Arithmetic = Fixed> {
     /// THE UNKNOWN NUMBER. Not the full-range interval (interval arithmetic at
     /// the extremes raises): it stays unknown under every operation, a
     /// comparison with it is an `UnknownBool`, and it never reaches a kernel
-    /// (stored only as `AV::UNum`).
-    UnknownNum,
+    /// (stored only as `AV::UNum`). `countdown`: read from a countdown (a near
+    /// level's floor `delay`, balloon `timer`, spring timers: `widening`'s
+    /// near entries), or computed from one; a comparison of it is a
+    /// countdown's atom (`Symbolic::countdown_atom`).
+    UnknownNum { countdown: bool },
 
     // number -> bool
     Lt,
@@ -352,7 +355,7 @@ impl<A: GraphArith> Graph<A> {
             | Op::ForkOk(..) => Ty::Bool,
             Op::Fork(Cut::Ints, _) | Op::Frag(Cut::Ints, _) => Ty::Num,
             Op::Fork(..) | Op::Frag(..) | Op::Span => Ty::Ival,
-            Op::Lo | Op::Hi | Op::Flr | Op::Mget | Op::UnknownNum | Op::Pin(_) => Ty::Num,
+            Op::Lo | Op::Hi | Op::Flr | Op::Mget | Op::UnknownNum { .. } | Op::Pin(_) => Ty::Num,
             Op::Add | Op::Sub | Op::Mul | Op::Div | Op::Rem | Op::Neg | Op::Abs | Op::Min | Op::Max | Op::Sin | Op::Restrict(..) => wide(args),
             Op::Sel if self.tys[args[1] as usize].is_bool() || self.tys[args[2] as usize].is_bool() => Ty::Bool,
             Op::Sel => wide(&args[1..]),
@@ -847,7 +850,7 @@ impl<A: GraphArith> Graph<A> {
                 Op::ConstBool(b) => Val::Bool(Some(*b)),
                 Op::UnknownBool(_) => Val::Bool(None),
                 // No interval holds it: unmodelled (TOP when lenient).
-                Op::UnknownNum => bail!("node {}: an unknown number has no interval", i),
+                Op::UnknownNum { .. } => bail!("node {}: an unknown number has no interval", i),
                 // No data output: its uses read the constant.
                 Op::Pin(_) => bail!("node {}: a pin has no value (its uses read the constant)", i),
                 // The hull (`fold`'s two-constant rule agrees). Tolerant of `lo > hi`.

@@ -577,7 +577,7 @@ impl<A: GraphArith> Lower<'_, A> {
             // Undecided in every lane: the known plane is all zeros.
             Op::UnknownBool(_) => Value::Bool([MaskVal::Const(false), MaskVal::Const(false)]),
             // `trace::lower::bind` keeps it out of every root's cone.
-            Op::UnknownNum => bail!("node {}: an unknown number reached the kernel", id),
+            Op::UnknownNum { .. } => bail!("node {}: an unknown number reached the kernel", id),
             Op::Not => {
                 let b = self.as_bool(a[0])?;
                 let nv = self.m_not(b[0]);

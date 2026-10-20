@@ -246,10 +246,6 @@ pub trait Domain: Clone + Default {
         false
     }
 
-    /// The next comparisons read a COUNTDOWN (the interpreter's hint,
-    /// `widen::countdown_fields`): an unknown number there mints a countdown
-    /// atom also with the fly fruit unknown, where it may be the fruit's.
-    fn set_countdown_hint(&mut self, _on: bool) {}
 
     /// `__split_by_flr` of a literal interval: its integer fragments, run as
     /// separate trace states and rejoined when the call returns; with
@@ -344,7 +340,6 @@ pub struct Symbolic<A: GraphArith = Fixed> {
     pub level: celeste_engine::widening::Level,
     /// How many `Op::UnknownBool` atoms this frame handed out.
     pub unknown_atoms: u32,
-    countdown_hint: bool,
     /// `escaped_atom`'s memo, cleared with `unknown_atoms` (ids restart).
     pub escaped: rustc_hash::FxHashMap<NodeId, NodeId>,
     /// What each `both_values` fork was made for (`--build-trace`).
@@ -462,7 +457,7 @@ impl<A: GraphArith> Symbolic<A> {
                 Op::Cell(_) => d.graph.ty(n) == Ty::Ival,
                 Op::Const(lo, hi) => lo != hi,
                 Op::Span => true,
-                Op::UnknownNum | Op::UnknownBool(_) => true,
+                Op::UnknownNum { .. } | Op::UnknownBool(_) => true,
                 // An `Ints` fragment is one exact number.
                 Op::Fork(Cut::Ints, _) | Op::Frag(Cut::Ints, _) | Op::Lo | Op::Hi => false,
                 Op::Fork(..) | Op::Frag(..) => true,
@@ -516,12 +511,18 @@ impl<A: GraphArith> Symbolic<A> {
         }
     }
 
-    pub fn unknown_num(&mut self) -> NodeId {
-        self.graph.leaf(Op::UnknownNum)
+    /// THE unknown number (`countdown`: a countdown's, `Op::UnknownNum`).
+    pub fn unknown_num(&mut self, countdown: bool) -> NodeId {
+        self.graph.leaf(Op::UnknownNum { countdown })
     }
 
     fn is_unknown_num(&self, n: NodeId) -> bool {
-        matches!(self.graph.get(n).op, Op::UnknownNum)
+        matches!(self.graph.get(n).op, Op::UnknownNum { .. })
+    }
+
+    /// Is any of `ns` a countdown's unknown number?
+    fn countdown_unknown(&self, ns: &[NodeId]) -> bool {
+        ns.iter().any(|n| matches!(self.graph.get(*n).op, Op::UnknownNum { countdown: true }))
     }
 
     /// `n` as `Sel(c, t, f)` with an arm the unknown number (a countdown reset
@@ -532,7 +533,7 @@ impl<A: GraphArith> Symbolic<A> {
         fn holds<A: GraphArith>(g: &Graph<A>, n: NodeId) -> bool {
             let node = g.get(n);
             match node.op {
-                Op::UnknownNum => true,
+                Op::UnknownNum { .. } => true,
                 Op::Sel => holds(g, node.args[1]) || holds(g, node.args[2]),
                 _ => false,
             }
@@ -623,7 +624,7 @@ impl<A: GraphArith> Symbolic<A> {
 
     /// Does any of `ns` read an unknown number or boolean atom?
     fn reads_unknown(&self, ns: &[NodeId]) -> bool {
-        self.graph.cone(ns).into_iter().any(|n| matches!(self.graph.get(n).op, Op::UnknownNum | Op::UnknownBool(_)))
+        self.graph.cone(ns).into_iter().any(|n| matches!(self.graph.get(n).op, Op::UnknownNum { .. } | Op::UnknownBool(_)))
     }
 
     /// `a - r` where `a` is `r + c`: `c` EXACTLY, also under a select's arms
@@ -860,21 +861,22 @@ impl<A: GraphArith> Symbolic<A> {
 
     /// The steps every operation on `args` takes first, in order: constants
     /// fold, so what the heap depends on stays concrete; the unknown number
-    /// makes `unknown`; an operand selecting the unknown number on some lanes
-    /// distributes the operation over its arms (`unknown_select`). `None` where
-    /// none applies.
+    /// makes `unknown` (told whether an operand is a countdown's); an operand
+    /// selecting the unknown number on some lanes distributes the operation
+    /// over its arms (`unknown_select`). `None` where none applies.
     fn prologue(
         &mut self,
         args: &[NodeId],
         point: impl FnOnce(&mut Self, &[A::Num]) -> Result<NodeId>,
-        unknown: impl FnOnce(&mut Self) -> NodeId,
+        unknown: impl FnOnce(&mut Self, bool) -> NodeId,
         again: impl Fn(&mut Self, &[NodeId]) -> Result<NodeId>,
     ) -> Result<Option<NodeId>> {
         if let Some(xs) = args.iter().map(|a| self.as_point(*a)).collect::<Option<Vec<_>>>() {
             return point(self, &xs).map(Some);
         }
         if args.iter().any(|a| self.is_unknown_num(*a)) {
-            return Ok(Some(unknown(self)));
+            let countdown = self.countdown_unknown(args);
+            return Ok(Some(unknown(self, countdown)));
         }
         for (k, a) in args.iter().enumerate() {
             if let Some((c, t, f)) = self.unknown_select(*a) {
@@ -933,9 +935,9 @@ impl<A: GraphArith> Domain for Symbolic<A> {
     }
     fn fun1(&mut self, f: Fun1, a: &NodeId) -> Result<NodeId> {
         // `sin` of anything is in [-1, 1]; other builtins of unknown: unknown.
-        let unknown = |d: &mut Self| match f {
+        let unknown = |d: &mut Self, countdown: bool| match f {
             Fun1::Sin => d.graph.leaf(Op::Const(A::lit(A::from_i16(-1)), A::lit(A::from_i16(1)))),
-            _ => d.unknown_num(),
+            _ => d.unknown_num(countdown),
         };
         if let Some(n) = self.prologue(&[*a], |d, x| Ok(d.konst(fold_fun1::<A>(f, x[0])?)), unknown, |d, x| d.fun1(f, &x[0]))? {
             return Ok(n);
@@ -961,8 +963,9 @@ impl<A: GraphArith> Domain for Symbolic<A> {
         Ok(self.graph.fold(f.into(), vec![*a, *b]))
     }
     fn compare(&mut self, op: Cmp, a: &NodeId, b: &NodeId) -> Result<NodeId> {
-        // With an unknown number nothing is decided.
-        let unknown = |d: &mut Self| if d.countdown_hint || !d.level.fruit { d.countdown_atom() } else { d.unknown_bool_atom() };
+        // With an unknown number nothing is decided: a countdown's atom where
+        // the number is a countdown's, or nothing else is unknown.
+        let unknown = |d: &mut Self, countdown: bool| if countdown || !d.level.fruit { d.countdown_atom() } else { d.unknown_bool_atom() };
         let point = |d: &mut Self, x: &[A::Num]| Ok(d.graph.leaf(Op::ConstBool(fold_compare::<A>(op, x[0], x[1]))));
         if let Some(n) = self.prologue(&[*a, *b], point, unknown, |d, x| d.compare(op, &x[0], &x[1]))? {
             return Ok(n);
@@ -1091,7 +1094,8 @@ impl<A: GraphArith> Domain for Symbolic<A> {
             return Some(*t);
         }
         if self.is_unknown_num(*t) || self.is_unknown_num(*f) {
-            return Some(self.unknown_num());
+            let countdown = self.countdown_unknown(&[*t, *f]);
+            return Some(self.unknown_num(countdown));
         }
         match (self.graph.get(*t).op.clone(), self.graph.get(*f).op.clone()) {
             (Op::Const(a0, a1), Op::Const(b0, b1)) => Some(self.graph.leaf(Op::Const(lit_min::<A>(a0, b0), lit_max::<A>(a1, b1)))),
@@ -1117,10 +1121,6 @@ impl<A: GraphArith> Domain for Symbolic<A> {
             Op::UnknownBool(k) => Some(!matches!(k, Unknown::Countdown(_))),
             _ => None,
         })
-    }
-
-    fn set_countdown_hint(&mut self, on: bool) {
-        self.countdown_hint = on;
     }
 
     fn reads_merge_refused(&mut self, c: &NodeId) -> bool {
@@ -1467,14 +1467,14 @@ mod tests {
         let mut d = Symbolic::<celeste_core::arith::Fixed>::default();
         let c = d.graph.leaf(Op::Cell(0));
         let (sixty, one, zero) = (d.num(p(60)), d.num(p(1)), d.num(p(0)));
-        let u = d.unknown_num();
+        let u = d.unknown_num(false);
         let delay = d.sel_num(&c, &sixty, &u);
         let less = d.arith(Arith::Sub, &delay, &one).unwrap();
         let fifty_nine = d.num(p(59));
         assert_eq!(less, d.sel_num(&c, &fifty_nine, &u));
         let done = d.compare(Cmp::Le, &less, &zero).unwrap();
         let node = d.graph.get(done).clone();
-        assert!(d.graph.cone(&[done]).iter().all(|n| d.graph.get(*n).op != Op::UnknownNum), "{node:?}");
+        assert!(d.graph.cone(&[done]).iter().all(|n| !matches!(d.graph.get(*n).op, Op::UnknownNum { .. })), "{node:?}");
         assert!(d.graph.cone(&[done]).iter().any(|n| matches!(d.graph.get(*n).op, Op::UnknownBool(_))), "the unknown lanes: an atom");
     }
 

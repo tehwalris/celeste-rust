@@ -599,12 +599,11 @@ impl<'a, D: Domain> Interp<'a, D> {
             all.extend(match b {
                 Bound::Concrete(from, to) => self.run_for(f, &name, from, to, s)?,
                 Bound::Symbolic(start, limit) => {
-                    let limit_src = f.end().to_string().trim().to_string();
-                    let n = unroll_bound(&limit_src).ok_or_else(|| {
+                    let n = unroll_bound(f).ok_or_else(|| {
                         anyhow!(
                             "numeric for with symbolic limit `{}` has no unroll bound - \
-                             add one to `unroll_bound`",
-                            limit_src
+                             annotate the loop in the cart (`do --@unroll N`)",
+                            f.end().to_string().trim()
                         )
                     })?;
                     self.run_for_symbolic(f, &name, start, limit, s, n)?
@@ -902,21 +901,9 @@ impl<'a, D: Domain> Interp<'a, D> {
             return Ok(out);
         }
         let mut out = Vec::new();
-        // An operand that reads a countdown field (`widen::countdown_fields`)
-        // as `<name>.<field>`.
-        let countdown = |e: &ast::Expression| match e {
-            ast::Expression::Var(v) => target_hint(v).is_some_and(|t| {
-                t.rsplit_once('.').is_some_and(|(_, f)| crate::trace::widen::countdown_fields().contains(&f))
-            }),
-            _ => false,
-        };
-        let hint = countdown(lhs) || countdown(rhs);
         for (st, a) in self.eval(lhs, st)? {
             for (mut st, b) in self.eval(rhs, st)? {
-                self.d.set_countdown_hint(hint);
-                let r = self.binop_values(binop, &a, &b);
-                self.d.set_countdown_hint(false);
-                let (v, illegal) = r?;
+                let (v, illegal) = self.binop_values(binop, &a, &b)?;
                 if let Some(why) = illegal {
                     let t = format!("{}{}{}", lhs, binop, rhs);
                     let t = t.trim();
@@ -1740,17 +1727,15 @@ fn target_hint(var: &ast::Var) -> Option<String> {
     }
 }
 
-/// How far to unroll a loop with an unknown limit, keyed by the limit's
-/// SOURCE TEXT. Performance only: a lane looping past it is an error, and an
-/// unknown key is refused.
-fn unroll_bound(limit_src: &str) -> Option<u32> {
-    match limit_src {
-        // `move_x` / `move_y` pixel steppers.
-        "abs(amount)" => Some(8),
-        // `spikes_at` / `solid_at` tile scans.
-        "min(15,(x+w-1)/8)" | "min(15,(y+h-1)/8)" => Some(3),
+/// How far to unroll a loop with an unknown limit: the cart's annotation on
+/// the loop, a comment after its `do` (`do --@unroll N`: `move_x`/`move_y`'s
+/// pixel steppers 8, the tile scans 3). Performance only: a lane looping
+/// past it is an error, and an unannotated loop is refused.
+fn unroll_bound(f: &ast::NumericFor) -> Option<u32> {
+    f.do_token().trailing_trivia().find_map(|t| match t.token_type() {
+        TokenType::SingleLineComment { comment } => comment.trim().strip_prefix("@unroll ")?.trim().parse().ok(),
         _ => None,
-    }
+    })
 }
 
 fn source_text(e: &ast::Expression) -> String {

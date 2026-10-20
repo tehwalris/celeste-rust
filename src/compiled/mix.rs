@@ -71,7 +71,7 @@ pub fn reset_slices() {
 /// `sel`, `restrict`, `call` (a cart lookup: a call-out in the kernel).
 pub(crate) fn op_kind(op: &Op) -> &'static str {
     match op {
-        Op::Const(..) | Op::ConstBool(_) | Op::Cell(_) | Op::UnknownNum | Op::UnknownBool(_) => "leaf",
+        Op::Const(..) | Op::ConstBool(_) | Op::Cell(_) | Op::UnknownNum { .. } | Op::UnknownBool(_) => "leaf",
         Op::Lt | Op::Le | Op::Gt | Op::Ge | Op::Eq | Op::Same => "cmp",
         Op::Not | Op::And | Op::Or | Op::Known | Op::ForkValid(..) | Op::FragOk(..) | Op::ForkOk(..) | Op::NoWrap => "bool",
         Op::Sel => "sel",

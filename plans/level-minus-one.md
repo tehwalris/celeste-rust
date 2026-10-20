@@ -132,7 +132,7 @@ fingerprints).
 
 ## Limits
 
-- `unroll_bound("abs(amount)") = 8` caps S at 7.
+- `move`'s loops are unrolled 8 times (`--@unroll 8` in the cart), which caps S at 7.
 - Deaths are modelled only through the respawn's d.
 - No condition refinement: counters (`freeze`, `djump`, `dash_time`,
   `grace`, the springs' `delay`) go to the full range.
