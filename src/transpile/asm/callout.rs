@@ -31,7 +31,20 @@ unsafe fn num(p: *const i32, i: usize) -> P8 {
 /// where one is read: a coordinate, a box, a flag).
 #[inline]
 fn whole16(v: P8, what: &str) -> i16 {
-    v.as_i16().unwrap_or_else(|| panic!("{what}: {v:?} is not an integer"))
+    match v.as_i16() {
+        Some(n) => n,
+        None => not_whole16(v, what),
+    }
+}
+
+/// `whole16`'s panic, out of line and by value: a panic closure capturing
+/// the message's arguments made every lane store them on the hot path
+/// (`co_tile_flag`: 0.4% of the r62h bench frame's instructions, 2.3% of
+/// f42n's with `whole`'s).
+#[cold]
+#[inline(never)]
+fn not_whole16(v: P8, what: &str) -> ! {
+    panic!("{what}: {v:?} is not an integer")
 }
 
 /// The room's collision cache the collision wrappers query (the map is
@@ -129,7 +142,18 @@ const F_LANES: usize = 8;
 /// 16.16 call-outs require of theirs.
 #[inline]
 unsafe fn whole(p: *const f64, i: usize, what: &str) -> i16 {
-    LuaF64::new(*p.add(i)).and_then(LuaF64::as_i16).unwrap_or_else(|| panic!("{what}: lane {i} holds {}, not a whole number", *p.add(i)))
+    let v = *p.add(i);
+    match LuaF64::new(v).and_then(LuaF64::as_i16) {
+        Some(n) => n,
+        None => not_whole(v, i, what),
+    }
+}
+
+/// `whole`'s panic, out of line (`not_whole16`).
+#[cold]
+#[inline(never)]
+fn not_whole(v: f64, i: usize, what: &str) -> ! {
+    panic!("{what}: lane {i} holds {v}, not a whole number")
 }
 
 /// The tools' `sin`, lane by lane (`LuaF64::lua_sin`). A lane whose
