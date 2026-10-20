@@ -219,8 +219,9 @@ are never committed.
   so: `STALE ... REBUILDING`.
 - One built from other sources is only reported. A fixture is an INPUT,
   pinned by its fingerprint.
-- Transfer ids are canonical (`edges::XferTable::canonical`), so a frame
-  check's edge bytes are a function of the search.
+- Transfer ids are final at each slice's gather (`XferTable::merge`: a
+  function of the frame), so a frame check's edge bytes are a function of
+  the search.
 - Level -1 fixtures keep their table (`NAME/l1-table.bin`; `bench frame`
   refuses another).
 - Fixtures are shared by every checkout and READ-ONLY (`ensure` makes them
@@ -269,5 +270,5 @@ then the tiers' `--pin`.
   split ~20-40 s). That is most of t1's and t2's time. A kernel cache keyed
   on the binary would cut both.
 - **A frame check meets no new transfer** (`ForwardState::at` loads the
-  whole table). The canonical numbering of a frame's new transfers is
-  checked by the full forwards (t2, `fixtures`).
+  whole table). The numbering of a frame's new transfers is checked by
+  the full forwards (t2, `fixtures`).

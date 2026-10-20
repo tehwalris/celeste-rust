@@ -285,14 +285,15 @@ wave.
   it into a BUNDLE (source key, transfer, offset, target key -> target
   cells) keyed by the target's ROUTE (shape, region slot);
 - a unit ends as per-route CHUNKS with their pushes, and an OUT block,
-  spooled (`storage::spool`). Re-push units make pushes only;
-- a finished slice's chunks become REGION JOBS (`route::run_route`): the
-  pushes merged into the route's touched states, the bundles encoded into
-  a zstd segment of the frame's edge file. The region phase overlaps the
-  kernels.
+  spooled (`storage::scratch`). Re-push units make pushes only;
+- a finished slice is GATHERED: the transfers first met in it get their
+  final ids (by content, after every earlier slice's: a function of the
+  frame); its chunks become REGION JOBS (`route::run_route`): the pushes
+  merged into the route's touched states, the bundles encoded into a zstd
+  segment of the frame's edge file (one with a provisional target key
+  waits for the frame's end). The region phase overlaps the kernels.
 
 **The frame's end**: provisional keys made final, new shapes numbered,
-transfers numbered canonically (by the frame's edge count, then content),
 each route SEALED against the visited set (new, grown, or nothing), the
 ladder's filter applied, everything merged into the visited set
 (`absorb`). Then the FRAME FILE (`frames/f{F}.bin`, one a frame: per

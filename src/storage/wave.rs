@@ -481,10 +481,8 @@ fn worker<N: Rem>(sh: &Shared<N>, sink: &mut UnitSink<N>, sc: &mut super::route:
 struct Piped<N: Rem> {
     /// Per route its state (touched states, segments).
     states: Vec<RouteState<N>>,
-    /// The frame's new transfers (global ids from the table's length on),
-    /// and the edges recorded with each.
+    /// The frame's new transfers (global ids from the table's length on).
     fresh: XferTable<N>,
-    xfer_counts: Vec<u64>,
     /// The kernel units' out blocks.
     out_blocks: Vec<std::sync::Mutex<Vec<OutBlock>>>,
     /// The workers' stats, merged.
@@ -551,25 +549,19 @@ fn pipeline<N: Rem>(engine: &dyn FrameStep<N>, front: &Frontier<N>, plan: &Plan,
         crate::metrics::mem_phase(&format!("f{frame} units and region jobs"));
     }
     let Pipe { gather, states, .. } = pipe;
-    let Gather { fresh, remaps, .. } = gather.into_inner().expect("the gather");
+    let Gather { fresh, .. } = gather.into_inner().expect("the gather");
     let states: Vec<RouteState<N>> = states
         .into_inner()
         .expect("the routes")
         .into_iter()
         .map(|a| std::sync::Arc::try_unwrap(a).map_err(|_| anyhow::anyhow!("a route still shared")).and_then(|m| m.into_inner().map_err(|_| anyhow::anyhow!("a route lock poisoned"))))
         .collect::<Result<_>>()?;
-    let mut xfer_counts = vec![0u64; fresh.pairs.len()];
     let mut stats = Stats::default();
-    for (sink, remap) in sinks.iter_mut().zip(&remaps) {
-        for (&n, &g) in sink.xfer_counts().iter().zip(remap) {
-            if g as usize >= xfers_before {
-                xfer_counts[g as usize - xfers_before] += n;
-            }
-        }
+    for sink in &mut sinks {
         sink.finish();
         stats.merge(&sink.stats);
     }
-    Ok(Piped { states, fresh, xfer_counts, out_blocks, stats })
+    Ok(Piped { states, fresh, out_blocks, stats })
 }
 
 /// The new shapes of `states` numbered (in hash order): a route's with
@@ -672,12 +664,11 @@ type RouteSegs = (u32, Vec<((u8, u32), super::edges::Segment)>, Vec<(u32, super:
 /// transfers flushed, the waited segments made final (`route::reencode`,
 /// one job each), every route's in slice order; its bytes.
 #[allow(clippy::too_many_arguments)]
-fn edge_file_writer<N: Rem>(dir: std::path::PathBuf, frame: u32, flush: super::edges::Flush, routes_segs: Vec<RouteSegs>, src_index: Vec<(u32, Vec<u32>)>, renumber: Option<(u32, Vec<u32>)>, finals: std::sync::Arc<FxHashMap<Key, Key>>, spool: Option<std::sync::Arc<super::scratch::Scratch>>, threads: usize) -> Result<std::thread::JoinHandle<Result<u64>>> {
+fn edge_file_writer<N: Rem>(dir: std::path::PathBuf, frame: u32, flush: super::edges::Flush, routes_segs: Vec<RouteSegs>, src_index: Vec<(u32, Vec<u32>)>, finals: std::sync::Arc<FxHashMap<Key, Key>>, spool: Option<std::sync::Arc<super::scratch::Scratch>>, threads: usize) -> Result<std::thread::JoinHandle<Result<u64>>> {
     Ok(std::thread::Builder::new().name("edge file".into()).spawn(move || -> Result<u64> {
         flush.write(&dir)?;
-        let renumber = renumber.as_ref().map(|(first, perm)| super::route::Renumber { first: *first, perm });
         let waited: Vec<(usize, u32, &super::edges::Segment)> = routes_segs.iter().enumerate().flat_map(|(k, r)| r.2.iter().map(move |(slice, seg)| (k, *slice, seg))).collect();
-        let again = par_map(&waited, threads, |&(k, _, seg)| super::route::reencode(seg, routes_segs[k].0, &finals, renumber.as_ref(), &mut super::bundle::Encoder::default(), &mut zstd::bulk::Compressor::new(1)?));
+        let again = par_map(&waited, threads, |&(k, _, seg)| super::route::reencode(seg, routes_segs[k].0, &finals, &mut super::bundle::Encoder::default(), &mut zstd::bulk::Compressor::new(1)?));
         let mut per: Vec<Vec<((u8, u32), super::edges::Segment)>> = (0..routes_segs.len()).map(|_| Vec::new()).collect();
         for (&(k, slice, _), seg) in waited.iter().zip(again) {
             per[k].push(((1, slice), seg?));
@@ -743,7 +734,7 @@ fn next_layer<N: Rem>(new: Vec<super::route::Sealed<N>>, frame: u32, threads: us
 
 /// ONE FORWARD FRAME: frame `cx.frame` from `front` (grown the frame before):
 /// the pipeline (`pipeline`), then the frame's end - keys made final, new
-/// shapes numbered, transfers numbered canonically, the routes sealed, the
+/// shapes numbered, the routes sealed, the
 /// edge and out files written beside, the ladder's filter, the visited set
 /// absorbing, the next layer and its wins.
 pub(crate) fn run_wave<N: Rem>(engine: &dyn FrameStep<N>, front: Frontier<N>, cx: WaveCtx<N>) -> Result<Wave<N>> {
@@ -792,8 +783,7 @@ pub(crate) fn run_wave<N: Rem>(engine: &dyn FrameStep<N>, front: Frontier<N>, cx
         crate::metrics::mem_phase(&format!("f{frame} start"));
     }
     let t_pipeline = Instant::now();
-    let xfers_before = xfers.pairs.len();
-    let Piped { mut states, fresh, xfer_counts, out_blocks, stats } = pipeline(engine, &front, &plan, visited, xfers, skeletons, &prov, filters, frame, outs, spool.as_deref(), record, ceiling)?;
+    let Piped { mut states, fresh, out_blocks, stats } = pipeline(engine, &front, &plan, visited, xfers, skeletons, &prov, filters, frame, outs, spool.as_deref(), record, ceiling)?;
     st.add_time(S::Wave, t_pipeline.elapsed());
     st.merge(&stats);
     st.set_idle(workers);
@@ -825,9 +815,6 @@ pub(crate) fn run_wave<N: Rem>(engine: &dyn FrameStep<N>, front: Frontier<N>, cx
     let regions: Vec<Option<u32>> = states.iter().map(|r| visited.region(r.shape, r.slot)).collect();
     st.set(S::Pushes, states.iter().map(|r| r.pushes).sum());
     st.set(S::Touched, states.iter().map(|r| r.touched.len() as u64).sum());
-    // The frame's new transfers in canonical order (by their edges, then
-    // content), whatever the slices that met them first.
-    let perm = xfers.canonical(xfers_before, &xfer_counts);
     let mut new = seal(&mut states, &regions, &finals, visited, frame, workers)?;
     // The routes' touched tables, freed off their (exited) threads: back now.
     collect_freed();
@@ -855,7 +842,7 @@ pub(crate) fn run_wave<N: Rem>(engine: &dyn FrameStep<N>, front: Frontier<N>, cx
         routes_segs.push((region, r.segs, r.prov));
     }
     let edge_file = match edges_dir {
-        Some(dir) => Some(edge_file_writer::<N>(dir.to_path_buf(), frame, xfers.take_flush(), routes_segs, src_index, perm.map(|p| (xfers_before as u32, p)), finals.clone(), spool.clone(), s.threads())?),
+        Some(dir) => Some(edge_file_writer::<N>(dir.to_path_buf(), frame, xfers.take_flush(), routes_segs, src_index, finals.clone(), spool.clone(), s.threads())?),
         None => None,
     };
     if let Some(f) = filters.marks {

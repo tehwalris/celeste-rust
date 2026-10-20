@@ -85,24 +85,6 @@ impl PairIndex {
         self.slots[i] = id + 1;
         self.n += 1;
     }
-
-    /// The ids from `first` on renumbered (`perm`: per id less `first`, its
-    /// new id less `first`): each one's slot found by its pair, the rest kept.
-    fn renumber<N: Rem>(&mut self, pairs: &[N::Pair], first: usize, perm: &[u32]) {
-        let m = self.slots.len() - 1;
-        let at: Vec<usize> = (first..pairs.len())
-            .map(|id| {
-                let mut i = N::pair_hash(&pairs[id]) as usize & m;
-                while self.slots[i] != id as u32 + 1 {
-                    i = (i + 1) & m;
-                }
-                i
-            })
-            .collect();
-        for (k, i) in at.into_iter().enumerate() {
-            self.slots[i] = first as u32 + perm[k] + 1;
-        }
-    }
 }
 
 fn xfer_path(dir: &Path) -> PathBuf {
@@ -151,8 +133,9 @@ impl<N: Rem> XferTable<N> {
     }
 
     /// The workers' NEW pairs (`tails`: what each worker's table gained
-    /// since its last merge) merged in, in value order; per tail its pairs'
-    /// ids, PROVISIONAL until the wave's end (`canonical`).
+    /// since its last merge: a slice's) merged in, in value order; per tail
+    /// its pairs' ids. Final: the pairs first met in a slice are a function
+    /// of the frame, so their ids are.
     pub(crate) fn merge(&mut self, tails: &[&[N::Pair]]) -> Vec<Vec<u32>> {
         let mut new: Vec<N::Pair> = tails.iter().flat_map(|t| t.iter()).filter(|p| self.index.find::<N>(&self.pairs, p).is_none()).copied().collect();
         new.sort_unstable();
@@ -166,30 +149,6 @@ impl<N: Rem> XferTable<N> {
             self.index.insert::<N>(&self.pairs, self.pairs.len() as u32 - 1);
         }
         tails.iter().map(|t| t.iter().map(|p| self.index.find::<N>(&self.pairs, p).expect("a merged pair")).collect()).collect()
-    }
-
-    /// The pairs from `first` on (a wave's) in CANONICAL order: by the edges
-    /// the frame recorded with each (`counts[id - first]`), most first, then
-    /// by content - a function of the frame alone, the frequent transfers
-    /// with the short varints (~3% smaller edge files). Returns per old id
-    /// less `first` its new one (`None`: in order already); ids below stay.
-    pub(crate) fn canonical(&mut self, first: usize, counts: &[u64]) -> Option<Vec<u32>> {
-        let new = &self.pairs[first..];
-        assert_eq!(counts.len(), new.len(), "a count per new transfer");
-        let mut order: Vec<u32> = (0..new.len() as u32).collect();
-        order.sort_unstable_by(|&a, &b| counts[b as usize].cmp(&counts[a as usize]).then_with(|| new[a as usize].cmp(&new[b as usize])));
-        if order.iter().enumerate().all(|(i, &o)| i as u32 == o) {
-            return None;
-        }
-        let mut perm = vec![0u32; new.len()];
-        for (to, &from) in order.iter().enumerate() {
-            perm[from as usize] = to as u32;
-        }
-        let sorted: Vec<N::Pair> = order.iter().map(|&i| new[i as usize]).collect();
-        self.index.renumber::<N>(&self.pairs, first, &perm);
-        self.pairs.truncate(first);
-        self.pairs.extend(sorted);
-        Some(perm)
     }
 
     /// Write the pairs merged since the last flush past the trusted length
@@ -650,31 +609,25 @@ mod tests {
     use super::*;
     use crate::search::arc_edges::Pair;
 
-    /// A wave's new transfers get their CANONICAL ids (by edge count, then
-    /// content): the permutation, the table and its index agree, the older
-    /// ids stay, and a table in order is left alone.
+    /// A slice's new transfers get their final ids at its merge, in value
+    /// order after every pair before; a pair held keeps its id; the ids
+    /// returned name the pairs, and the index finds them.
     #[test]
-    fn a_waves_new_transfers_are_numbered_by_count_and_content() {
+    fn a_slices_new_transfers_get_final_ids_in_value_order() {
         let pair = |v: i32| {
             let ax = crate::search::arc_edges::AxisXfer { lo: 0, hi: 1 << 16, tag: 0, val: v };
             (ax, ax)
         };
         let mut t = XferTable::<P8>::default();
         t.merge(&[&[pair(5), pair(1)]]);
-        assert_eq!(t.canonical(0, &[2, 2]), None, "one merge is in order");
-        let first = t.pairs.len();
         // Two slices: the second meets smaller pairs (and one already held).
         let ids_a = t.merge(&[&[pair(9), pair(7)], &[pair(8)]]);
         let ids_b = t.merge(&[&[pair(3), pair(5)]]);
-        // Met as 7, 8, 9, 3; 9 the most edges, 7 and 3 tied.
-        let perm = t.canonical(first, &[1, 0, 5, 1]).expect("out of order");
-        assert_eq!(t.pairs, [1, 5, 9, 3, 7, 8].map(pair));
-        let id = |x: u32| if (x as usize) < first { x } else { first as u32 + perm[x as usize - first] };
+        assert_eq!(t.pairs, [1, 5, 7, 8, 9, 3].map(pair));
         for (p, x) in [pair(9), pair(7), pair(8), pair(3), pair(5)].iter().zip(ids_a.concat().into_iter().chain(ids_b.concat())) {
-            assert_eq!(t.pairs[id(x) as usize], *p);
-            assert_eq!(t.index.find::<P8>(&t.pairs, p), Some(id(x)));
+            assert_eq!(t.pairs[x as usize], *p);
+            assert_eq!(t.index.find::<P8>(&t.pairs, p), Some(x));
         }
-        assert_eq!(t.canonical(first, &[5, 1, 1, 0]), None, "in order already");
     }
 
     /// Edge file names past frame 999 (split frame: step 1000 is frame 500).

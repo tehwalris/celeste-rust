@@ -321,9 +321,6 @@ struct Xfers<'a, N: Rem> {
     ids: FxHashMap<N::Pair, u32>,
     /// Per local id its decoded transfers (the pushes').
     pairs: Vec<crate::search::rem::Xfer<N>>,
-    /// Per local id, the edges this worker recorded with it (the frame's
-    /// new transfers are numbered by their count: `wave`).
-    counts: Vec<u64>,
     cache: Vec<(crate::compiled::asm_kernel::RawWords<N>, u32)>,
     /// The worker's table of local transfers (the gather reads it), its length.
     tab: &'a std::sync::RwLock<Vec<N::Pair>>,
@@ -332,7 +329,7 @@ struct Xfers<'a, N: Rem> {
 
 impl<'a, N: Rem> Xfers<'a, N> {
     fn new(base: &'a super::edges::XferTable<N>, tab: &'a std::sync::RwLock<Vec<N::Pair>>) -> Self {
-        Xfers { base, first_new: u32::try_from(base.pairs.len()).expect("transfers past u32"), ids: Default::default(), pairs: Vec::new(), counts: Vec::new(), cache: Vec::new(), tab, len: 0 }
+        Xfers { base, first_new: u32::try_from(base.pairs.len()).expect("transfers past u32"), ids: Default::default(), pairs: Vec::new(), cache: Vec::new(), tab, len: 0 }
     }
 
     /// `id` through a direct-mapped raw -> id cache: few distinct transfers
@@ -371,7 +368,6 @@ impl<'a, N: Rem> Xfers<'a, N> {
         self.len += 1;
         self.ids.insert(t, id);
         self.pairs.push(N::xfer(&t));
-        self.counts.push(0);
         id
     }
 
@@ -381,14 +377,6 @@ impl<'a, N: Rem> Xfers<'a, N> {
         match x.checked_sub(self.first_new) {
             Some(l) => self.pairs[l as usize],
             None => N::xfer(&self.base.pairs[x as usize]),
-        }
-    }
-
-    /// `n` edges recorded with transfer `x`.
-    #[inline]
-    fn count(&mut self, x: u32, n: u64) {
-        if let Some(l) = x.checked_sub(self.first_new) {
-            self.counts[l as usize] += n;
         }
     }
 
@@ -756,11 +744,6 @@ impl<'a, N: Rem> UnitSink<'a, N> {
         self.xfers.id_raw(self.worker, words, decode)
     }
 
-    /// Per local transfer id, the edges this worker recorded with it.
-    pub(crate) fn xfer_counts(&self) -> &[u64] {
-        &self.xfers.counts
-    }
-
     /// The transfers this worker has met (its table's length).
     pub(crate) fn xfers_met(&self) -> usize {
         self.xfers.len as usize
@@ -907,10 +890,9 @@ impl<'a, N: Rem> UnitSink<'a, N> {
         Ok(())
     }
 
-    /// OR `m` (target cells) into bundle `(route, t_key; s, x, o)`; count `x`.
+    /// OR `m` (target cells) into bundle `(route, t_key; s, x, o)`.
     #[inline]
     fn bundle(&mut self, route: u32, t_key: Key, s: u32, x: u32, o: u32, m: u64) {
-        self.xfers.count(x, m.count_ones() as u64);
         self.bundles.insert(route, t_key, s, x, o, m);
     }
 

@@ -227,10 +227,9 @@ pub(crate) struct RouteState<N: Rem = P8> {
     /// The provisional keys pushed into or named by its bundles (a target
     /// nothing was pushed into still has its edges).
     pub(crate) prov_keys: FxHashSet<Key>,
-    /// The bundles that WAIT for the frame's end (a provisional target, or a
-    /// new transfer: no canonical id yet), per job (slice) a segment,
-    /// re-encoded with the final keys and ids (`reencode`). Compressed: a
-    /// frame can hold ~100M.
+    /// The bundles that WAIT for the frame's end (a provisional target), per
+    /// job (slice) a segment, re-encoded with the final keys (`reencode`).
+    /// Compressed: a frame can hold ~100M.
     pub(crate) prov: Vec<(u32, Segment)>,
     /// Its segments by (kind (0: a job's, 1: waited, made final), slice):
     /// jobs run out of slice order; the edge file sorts them by this.
@@ -258,8 +257,8 @@ pub(crate) struct RegionCtx<'a> {
     pub(crate) record: bool,
     /// Per worker, its local transfer ids' global ones.
     pub(crate) remaps: &'a [Vec<u32>],
-    /// Ids from here on are the frame's new transfers', in slice order:
-    /// provisional until the frame's end.
+    /// Ids from here on are a worker's local ones (the frame's new
+    /// transfers: `remaps` names their global ids, final at the gather).
     pub(crate) new_xfers: u32,
     pub(crate) spool: Option<&'a super::scratch::Scratch>,
 }
@@ -545,7 +544,7 @@ pub(crate) fn run_route<N: Rem>(st: &mut RouteState<N>, slice: u32, chunks: &[&C
                 Some(l) => *remap.get(l as usize).ok_or_else(|| anyhow::anyhow!("frame {}: a bundle's transfer {} of worker {} has no global id", cx.frame, b.x, c.worker))?,
             };
             let e = sc.e_of[b.t as usize];
-            if e == PROV || x >= cx.new_xfers {
+            if e == PROV {
                 let (s_shape, s_key) = c.sources[b.s as usize];
                 sc.prov.push(Bundle { s_shape, s_key, x, o: b.o, t_key: c.targets[b.t as usize].0, mask: b.mask });
                 continue;
@@ -593,24 +592,6 @@ pub(crate) struct Sealed<N: Rem = P8> {
     pub(crate) t: [std::time::Duration; 3],
     /// The bundles that waited (their segments, bundles: `reencode`).
     pub(crate) waited: (usize, u64),
-}
-
-/// The frame's new transfers' canonical ids (`edges::XferTable::
-/// canonical`): an id from `first` on is `first + perm[id - first]`.
-pub(crate) struct Renumber<'a> {
-    pub(crate) first: u32,
-    pub(crate) perm: &'a [u32],
-}
-
-impl Renumber<'_> {
-    #[inline]
-    fn id(&self, x: u32) -> u32 {
-        if x < self.first {
-            x
-        } else {
-            self.first + self.perm[(x - self.first) as usize]
-        }
-    }
 }
 
 /// A route's FRAME END, first step (its shape numbered: `region`): keys made
@@ -703,9 +684,8 @@ pub(crate) fn sealed<N: Rem>(touch: Touch<N>, parts: Vec<SealPart<N>>) -> Result
     Ok(Sealed { region: touch.region, table, hulls, grown, t: [touch.t_sort, t_compare, t.elapsed()], waited: touch.waited })
 }
 
-/// A WAITED segment re-encoded for `region` with final keys and transfer ids
-/// (`renumber`: `None` where the new transfers are in order already).
-pub(crate) fn reencode(seg: &Segment, region: u32, finals: &FxHashMap<Key, Key>, renumber: Option<&Renumber>, enc: &mut bundle::Encoder, z: &mut zstd::bulk::Compressor<'static>) -> Result<Segment> {
+/// A WAITED segment re-encoded for `region` with final keys.
+pub(crate) fn reencode(seg: &Segment, region: u32, finals: &FxHashMap<Key, Key>, enc: &mut bundle::Encoder, z: &mut zstd::bulk::Compressor<'static>) -> Result<Segment> {
     let (mut dz, mut raw) = (zstd::bulk::Decompressor::new()?, Vec::new());
     let super::scratch::Body::Mem(bytes) = &seg.bytes else { anyhow::bail!("a waiting segment spooled") };
     super::file::decompress(bytes, seg.raw as usize, &mut dz, &mut raw)?;
@@ -717,9 +697,6 @@ pub(crate) fn reencode(seg: &Segment, region: u32, finals: &FxHashMap<Key, Key>,
                 Some(&k) => b.t_key = k,
                 None => missing = true,
             }
-        }
-        if let Some(rn) = renumber {
-            b.x = rn.id(b.x);
         }
         v.push(b);
     })?;

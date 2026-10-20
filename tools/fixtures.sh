@@ -73,10 +73,10 @@ BIG="r62h57"
 # formats and the order of its transfer table (a mismatch is STALE), and
 # the sources (reported only). A frame check encodes the fixture's
 # transfers by their ids in `xfer.bin`, so its edge bytes follow the
-# table's order: a frame's new transfers are numbered CANONICALLY (by their
-# edges in the frame, then content: `edges::XferTable::canonical`).
+# table's order: a frame's new transfers are numbered at each slice's
+# GATHER (the pairs first met in the slice, by content: `XferTable::merge`).
 formats() {
-    echo "checkpoint $(grep -o 'FORMAT_VERSION: u32 = [0-9]*' src/storage/file.rs | grep -o '[0-9]*$') edges $(grep -o '^const VERSION: u32 = [0-9]*' src/storage/edges.rs | grep -o '[0-9]*$') settings $(grep -o '^pub const VERSION: u32 = [0-9]*' src/settings.rs | grep -o '[0-9]*$') xfers canonical"
+    echo "checkpoint $(grep -o 'FORMAT_VERSION: u32 = [0-9]*' src/storage/file.rs | grep -o '[0-9]*$') edges $(grep -o '^const VERSION: u32 = [0-9]*' src/storage/edges.rs | grep -o '[0-9]*$') settings $(grep -o '^pub const VERSION: u32 = [0-9]*' src/settings.rs | grep -o '[0-9]*$') xfers gather"
 }
 sources() {
     { git ls-files -s src crates lua cart Cargo.lock; git diff HEAD -- src crates lua cart Cargo.lock; } | sha1sum | cut -c1-16
