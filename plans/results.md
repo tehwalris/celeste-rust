@@ -243,21 +243,20 @@ room alone and misses it; Celia models it.
 
 ```bash
 ./safe-run.sh -- ./target/release/rewrite search --room X,Y --level r0sxhn,r0sxh \
-    --level-minus-one C,5 --ceiling C --checkpoint-dir DIR --prefer tas/FILE.txt \
+    --level-minus-one C,5 --frames C --ceiling --search-dir DIR --prefer tas/FILE.txt \
     [--category CAT] [--loading-jank J] [--concrete-balloon-seeds S]
 ```
 
 - The level: `r0sx` without objects; `r0sxhn` with springs, fall floors,
   balloons, key and chest; `f` for a fly fruit, `p` for platforms
   (`r0sxhnp`; level -1 refuses `p`). `--split-frame` where the kernels are
-  too big ((6,0), (6,1)): `--ceiling` stays in frames, level -1's H is in
-  steps (2 x C).
+  too big ((6,0), (6,1)): `--frames` and level -1's H stay in frames.
 - **The ladder** where the level-0 bound is well below the reference; down
   to `r0sxh` (and `r0sx`) the arc bound is the answer, so a lower horizon
   is refuted by the arcs and a higher one finds the witness at the bound.
   Count up from the bound on the kept level-0 tree.
-- `--ceiling C` is a known solution: a refutation or no witness is an
-  error. Without one, `--to H` with H generous.
+- `--frames C --ceiling`: C is a known solution's, so a refutation or no
+  witness is an error. Without one, `--frames H` with H generous.
 - `tools/category_runner.py` runs a category end to end: the real-play
   start classes, the search with `--prefer` the community file, the
   original-cart replay, UCT and Celia, one upload file.

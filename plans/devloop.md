@@ -228,9 +228,9 @@ are never committed.
   (`/var/tmp/celeste-check-NAME-HASH`), so concurrent runs never share it.
 - A fixture's frames are the tree's: SEARCH STEPS (two a game frame under
   `--split-frame`, as r60s's "to step 71"; `settings::Clock`, plans/
-  architecture.md "The split frame"). So are `forward --to`, the tree
-  commands' `--to`/`--frame` and level -1's H; `search --to`/`--ceiling`
-  count frames.
+  architecture.md "The split frame"), as the flags named so count them
+  (`forward --steps`, the tree commands' `--steps`/`--step`); `search
+  --frames` and `--level-minus-one`'s H count frames.
 
 | fixture | what | build |
 |---|---|---|
@@ -238,7 +238,7 @@ are never committed.
 | r62h | room (6,2) 100% `r0sxhf`, level -1 (94,5), to f51; frame 50 -> 51 | 50-110 s (the table) |
 | r42n, f42n | room (4,2) 2100m `r0sxhn`, level -1 (71,5), to f61; frame 60 -> 61 | 15-25 s |
 | r42x, f42x | room (4,2) `r0sxh` (objects exact) to f56: the reference checks' object room | 14-18 s |
-| r10arc, f10arc | `search --level r0sxh --to 56 --win-at 40,64`: the backward's tree | 4-5 s |
+| r10arc, f10arc | `search --level r0sxh --frames 56 --win-at 40,64`: the backward's tree | 4-5 s |
 | r60s | room (6,0) 700m `r0sxhfp`, split frame, to step 71 | 26-40 s |
 | r62h57 (big) | room (6,2) 100% to f57, the reference frame | 57 s |
 

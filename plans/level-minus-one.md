@@ -8,13 +8,13 @@ one builder, `table`), `frame::TreeFilter`, `UnitSink`'s level -1 drop.
 
 ```bash
 # as a filter inside a search (H the horizon, S the speed bound in px/frame)
-./safe-run.sh -- ./target/release/rewrite search --room 2,0 --ceiling 95 --level-minus-one 95,5
+./safe-run.sh -- ./target/release/rewrite search --room 2,0 --frames 95 --ceiling --level-minus-one 95,5
 # the table alone, with its fingerprint (cached in /var/tmp/celeste-l1-cache)
 ./safe-run.sh -- ./target/quick/rewrite l1 table --room 2,0 --spd 5
 # as a probe: the table against a tree's recorded transitions
-./safe-run.sh -- ./target/quick/rewrite l1 probe --room 2,0 --spd S --level-dir DIR --ceiling H --from F --to T [--marks MARKS]
+./safe-run.sh -- ./target/quick/rewrite l1 probe --room 2,0 --spd S --tree DIR --steps H --from-step F --to-step T [--marks MARKS]
 # a known solution against the table (fails if a state of it is too late)
-./safe-run.sh -- ./target/quick/rewrite l1 check --room X,Y --inputs tas/FILE --horizon EXIT
+./safe-run.sh -- ./target/quick/rewrite l1 check --room X,Y --inputs tas/FILE --frames EXIT
 ```
 
 It replaced the time band (`CELESTE_BAND`, 8 px a frame), a measurement,

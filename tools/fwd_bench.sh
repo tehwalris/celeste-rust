@@ -5,7 +5,7 @@
 # PIN and its `[cost]` report printed.
 #
 #   tools/fwd_bench.sh make NAME F -- FLAGS...  build the fixture: `rewrite
-#                                    forward --to F FLAGS` into $FWD_BENCH/NAME
+#                                    forward --steps F FLAGS` into $FWD_BENCH/NAME
 #                                    (FLAGS: the tree's settings and --level)
 #   tools/fwd_bench.sh run NAME [REPS]  F -> F+1, REPS times (default 3); the
 #                                    first run pins its lines (NAME/frame.pin),
@@ -37,9 +37,9 @@ make_one() {
     local dir=$ROOT/$name
     [[ -e $dir ]] && { echo "[fwd_bench] $name: $dir exists (delete it to rebuild)" >&2; exit 1; }
     mkdir -p "$dir.tmp"
-    echo "[fwd_bench] building $name: forward --to $f $*" >&2
+    echo "[fwd_bench] building $name: forward --steps $f $*" >&2
     local t0=$SECONDS
-    ./safe-run.sh --memory "$MEM" -- "$B" forward --to "$f" --threads "$TH" --checkpoint-dir "$dir.tmp" "$@" > "$dir.tmp/build.log" 2>&1 \
+    ./safe-run.sh --memory "$MEM" -- "$B" forward --steps "$f" --threads "$TH" --tree "$dir.tmp" "$@" > "$dir.tmp/build.log" 2>&1 \
         || { tail -5 "$dir.tmp/build.log" >&2; echo "[fwd_bench] $name: FAILED (left in $dir.tmp)" >&2; exit 1; }
     {
         echo "frame $f"
@@ -64,7 +64,7 @@ run_one() {
     log=$dir/runs/$(date +%Y%m%d-%H%M%S).log
     echo "[fwd_bench] $name: f$f -> f$((f + 1)), $reps reps, $TH threads, $B; load $(cut -d' ' -f1-3 /proc/loadavg); log $log" >&2
     # shellcheck disable=SC2086
-    ./safe-run.sh --memory "$MEM" -- "$B" bench frame --tree "$dir" --frame "$f" --edges --checkpoint --reps "$reps" --threads "$TH" $l1 \
+    ./safe-run.sh --memory "$MEM" -- "$B" bench frame --tree "$dir" --step "$f" --edges --checkpoint --reps "$reps" --threads "$TH" $l1 \
         > "$log.out" 2> "$log" || { tail -5 "$log" >&2; echo "[fwd_bench] $name: FAILED" >&2; exit 1; }
     grep -E '^[fheb][0-9]{3} ' "$log.out" > "$log.lines" || true
     local pin

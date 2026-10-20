@@ -352,7 +352,7 @@ act" distributes over unions, so the union over all paths is exact.
 
 ## The search
 
-`rewrite search --to H | --ceiling H [--level SPEC[,SPEC...]]`; per level:
+`rewrite search --frames H [--ceiling] [--level SPEC[,SPEC...]]`; per level:
 
 1. **The forward** to H into `<dir>/level{i:02}` (resumed, or reused when
    it reaches H). Won rows are stored and not expanded.
@@ -411,10 +411,10 @@ steps around the player's move; kernels shrink ~10-20x with identical
 states at frame boundaries. UNITS (`settings::Clock`, where every
 conversion is): STEPS are the internal unit, since a mid-frame state is a
 node of its own (the backward pulls W through it). The tree and its
-files, the edges, W, the marks, level -1's H (`--level-minus-one H,S`:
-`2C` for a horizon of C frames) and the tree commands' `--to`/`--frame`
-(`forward`, `ckhash`, `check`, `bench`, `census`) count steps. The search's
-`--to`/`--ceiling`, its bounds, witnesses and `result.json` count FRAMES;
+files, the edges, W, the marks, level -1's recorded H (`2C` for a horizon
+of C frames) and the flags named so (`forward --steps`, the tree
+commands' `--steps`/`--step`) count steps. The search's `--frames`,
+`--level-minus-one`'s H, its bounds, witnesses and `result.json` count FRAMES;
 the concrete search steps whole frames and looks states up at frame
 boundaries. The ladder filters
 at frame boundaries only (mid-frame rows do not key as the coarser tree's:
@@ -489,9 +489,6 @@ plans/refactor.md: `git show c4dd3241:plans/refactor.md`).
     under `tools/`.
   - The engine crate knows the game (`runtime2::BoundaryIds`,
     `Rt2::player_objects`).
-  - A horizon is spelt `--to` (frames for the search, steps for the tree
-    commands) and `--horizon`; a tree `--checkpoint-dir` (the search,
-    `forward`) and `--tree` (the commands that read one).
   - The tracer beyond its audit: one trace for every level (today each
     level re-traces), the split pass replaced. These change behaviour.
   - `--category onlydiag` has no run yet (kept by Philippe); `--override-settings`

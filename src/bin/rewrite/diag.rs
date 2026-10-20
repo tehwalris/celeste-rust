@@ -19,13 +19,13 @@ use crate::{prefixes, where_, Rows};
 
 #[derive(clap::Args)]
 pub struct CkhashArgs {
-    /// The tree (a forward's checkpoint dir, or a search's `levelNN`).
+    /// The tree (a forward's `--tree`, or a search's `levelNN`).
     #[arg(long)]
     tree: PathBuf,
-    /// The last frame fingerprinted (default: the tree's last).
+    /// The last step fingerprinted (default: the tree's last).
     #[arg(long)]
-    to: Option<u32>,
-    /// Also list the N most populated player positions at frame `to`
+    steps: Option<u32>,
+    /// Also list the N most populated player positions at step `steps`
     /// (to pick a synthetic `--win-at` target with real fan-out).
     #[arg(long)]
     cells: Option<usize>,
@@ -40,15 +40,15 @@ pub struct CkhashArgs {
     /// its (shape, key, cell), layer and hull.
     #[arg(long)]
     hulls: bool,
-    /// With `--edges`: print frame F's edges (target, source, transfer)
-    /// on stderr, to diff two trees' edges at the frame whose line differs.
+    /// With `--edges`: print step S's edges (target, source, transfer) on
+    /// stderr, to diff two trees' edges at the step whose line differs.
     #[arg(long)]
     dump_edges: Option<u32>,
 }
 
 #[derive(clap::Args)]
 pub struct CensusArgs {
-    /// The tree (a forward's checkpoint dir, or a search's `levelNN`).
+    /// The tree (a forward's `--tree`, or a search's `levelNN`).
     #[arg(long)]
     tree: PathBuf,
     #[command(flatten)]
@@ -60,7 +60,7 @@ pub struct CensusArgs {
     /// `spd.,rem.,player[3].dash`).
     #[arg(long)]
     erase: Option<String>,
-    /// The saturation every this many frames.
+    /// The saturation every this many steps.
     #[arg(long, default_value_t = 4)]
     every: u32,
     /// The player positions with the most states, this many.
@@ -88,7 +88,7 @@ pub struct RobustArgs {
 
 pub fn ckhash(run: &Settings, a: CkhashArgs) -> Result<()> {
     let t = TreeDir::open(&a.tree, run)?;
-    let (dir, to, cfg) = (&t.dir, t.frame(a.to)?, &t.settings);
+    let (dir, to, cfg) = (&t.dir, t.frame(a.steps)?, &t.settings);
     let (top_cells, edges, hulls, dump_edges) = (a.cells, a.edges, a.hulls, a.dump_edges);
     let lines = match cfg.arith {
         Arith::Fixed => celeste_rust::storage::fingerprint::<P8>(dir, to, edges, hulls, cfg.threads())?,

@@ -18,7 +18,7 @@ use crate::KernelsNew;
 pub enum Command {
     /// ONE FORWARD FRAME of a tree, F -> F+1, repeatably.
     ///
-    /// The forward as it stood after `--frame` F (`ForwardState::at`: the
+    /// The forward as it stood after `--step` F (`ForwardState::at`: the
     /// tree's visited set, transfers, level -1 filter and pos graph at F;
     /// later frames ignored) runs the wave of F+1 `--reps` times, the edges
     /// into a scratch dir. Prints (stdout, the same every rep, else an
@@ -34,7 +34,7 @@ pub enum Command {
     Frame(FrameArgs),
     /// ONE BACKWARD FRAME of the arc phase, W_F from W_{F+1}, repeatably.
     ///
-    /// A finished search tree's edge files to `--horizon` opened (timed),
+    /// A finished search tree's edge files to `--steps` opened (timed),
     /// the winning sets pushed down to `W_{F+1}`, then `W_F` from them
     /// `--reps` times from a copy. Prints (stdout) `W_F`'s fingerprint as
     /// the arc gate's line (`[gate] hH W fF count hash`, over each node's
@@ -45,12 +45,12 @@ pub enum Command {
 
 #[derive(clap::Args)]
 pub struct FrameArgs {
-    /// The tree (a forward's checkpoint dir, or a search's `levelNN`).
+    /// The tree (a forward's `--tree`, or a search's `levelNN`).
     #[arg(long)]
     tree: PathBuf,
-    /// The frame F to run F -> F+1 from (default: the tree's last).
+    /// The step F to run F -> F+1 from (default: the tree's last).
     #[arg(long)]
-    frame: Option<u32>,
+    step: Option<u32>,
     /// Run the wave this many times, each from a copy (every rep's lines must
     /// agree).
     #[arg(long, default_value_t = 1)]
@@ -75,13 +75,13 @@ pub struct BackwardArgs {
     /// A search's tree (its `levelNN`: `frames/`, `edges/` under it).
     #[arg(long)]
     tree: PathBuf,
-    /// The search's horizon, in steps (default: the tree's last frame); the
-    /// graph and the winning sets are built for it.
+    /// The search's horizon, in steps (default: the tree's last); the graph
+    /// and the winning sets are built for it.
     #[arg(long)]
-    horizon: Option<u32>,
-    /// The frame F whose winning sets are computed (from F+1's).
+    steps: Option<u32>,
+    /// The step F whose winning sets are computed (from F+1's).
     #[arg(long)]
-    frame: u32,
+    step: u32,
     /// Compute W_F this many times, each from a copy.
     #[arg(long, default_value_t = 1)]
     reps: usize,
@@ -102,10 +102,10 @@ pub fn run(run: &Settings, c: Command) -> Result<()> {
         }
         Command::Backward(a) => {
             let t = TreeDir::open(&a.tree, run)?;
-            let horizon = t.frame(a.horizon)?;
+            let horizon = t.frame(a.steps)?;
             match t.settings.arith {
-                Arith::Fixed => bench_backward::<P8>(&t, horizon, a.frame, a.reps),
-                Arith::Float(_) => bench_backward::<LuaF64>(&t, horizon, a.frame, a.reps),
+                Arith::Fixed => bench_backward::<P8>(&t, horizon, a.step, a.reps),
+                Arith::Float(_) => bench_backward::<LuaF64>(&t, horizon, a.step, a.reps),
             }
         }
     }
@@ -122,7 +122,7 @@ where
     let (cfg, level, dir) = (&t.settings, t.level, &t.dir);
     let (edges, checkpoint, reps) = (a.edges, a.checkpoint, a.reps);
     anyhow::ensure!(!checkpoint || edges, "--checkpoint needs --edges (the frame's files as the forward writes them)");
-    let frame = t.frame(a.frame)?;
+    let frame = t.frame(a.step)?;
     let engine = K::new(cfg, level)?;
     let t = std::time::Instant::now();
     engine.warm();
@@ -263,7 +263,7 @@ impl Drop for Scratch {
 /// for `horizon`.
 fn bench_backward<N: Rem>(tree: &TreeDir, horizon: u32, frame: u32, reps: usize) -> Result<()> {
     let cfg = &tree.settings;
-    anyhow::ensure!(frame < horizon, "--frame {frame}: below the horizon {horizon}");
+    anyhow::ensure!(frame < horizon, "--step {frame}: below the horizon {horizon}");
     let t = std::time::Instant::now();
     let seeds = celeste_rust::search::backward::Seeds::<N>::load(&tree.dir, horizon)?;
     let content = seeds.space.content_hash();

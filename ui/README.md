@@ -233,10 +233,10 @@ Room (3,3) at h172:
 
 ```bash
 ./safe-run.sh -- ./target/quick/rewrite search --level-minus-one 172,5 \
-    --checkpoint-dir /var/tmp/arc33-172 --to 172 --room 3,3 --level r0sxhn \
+    --search-dir /var/tmp/arc33-172 --frames 172 --room 3,3 --level r0sxhn \
     --save-marks /var/tmp/arc33-172-ui
-./safe-run.sh -- ./target/quick/rewrite export-ui --checkpoint-dir /var/tmp/arc33-172 \
-    --arc /var/tmp/arc33-172-ui --out /var/tmp/celeste-ui/data/room33arc172 --room 3,3
+./safe-run.sh -- ./target/quick/rewrite export-ui --search-dir /var/tmp/arc33-172 \
+    --arc /var/tmp/arc33-172-ui --out /var/tmp/celeste-ui/data/room33arc172
 # then list it in /var/tmp/celeste-ui/data/runs.json (above)
 ```
 

@@ -15,13 +15,13 @@ pub enum Command {
     /// entries, the start state's d and its fingerprint (the A/B check of a
     /// change to the build).
     Table(TableArgs),
-    /// The table against a tree's recorded transitions, frames FROM..=TO
-    /// under CEILING (and the backward's MARKS at that horizon).
+    /// The table against a tree's recorded transitions, steps FROM..=TO
+    /// under the horizon STEPS (and the backward's MARKS at that horizon).
     Probe(ProbeArgs),
     /// The table against a known solution: none of its states may be too late.
     ///
     /// Its concrete states (reference engine) at every frame f before the
-    /// exit, each with the table's d. One too late for `--horizon` (f + d >
+    /// exit, each with the table's d. One too late for `--frames` H (f + d >
     /// H, H the solution's exit frame) is a SOUNDNESS violation of the
     /// table: exits non-zero. An `rnd` fork checks every leaf.
     Check(CheckArgs),
@@ -41,16 +41,16 @@ pub struct ProbeArgs {
     spd: i32,
     /// The tree (a level directory) whose recorded transitions are checked.
     #[arg(long)]
-    level_dir: std::path::PathBuf,
-    /// The horizon the tree's states are judged against.
+    tree: std::path::PathBuf,
+    /// The horizon the tree's states are judged against, in steps.
     #[arg(long)]
-    ceiling: u32,
-    /// The first frame checked.
+    steps: u32,
+    /// The first step checked.
     #[arg(long)]
-    from: u32,
-    /// The last frame checked.
+    from_step: u32,
+    /// The last step checked.
     #[arg(long)]
-    to: u32,
+    to_step: u32,
     /// The backward's marks at that horizon (`search --save-marks`).
     #[arg(long)]
     marks: Option<std::path::PathBuf>,
@@ -64,7 +64,7 @@ pub struct CheckArgs {
     /// H: the frame the solution exits at (a state with f + d > H is too
     /// late).
     #[arg(long)]
-    horizon: u32,
+    frames: u32,
     /// The table's speed bound S (px per frame).
     #[arg(long, default_value_t = 5)]
     spd: i32,
@@ -80,7 +80,7 @@ pub fn run(cfg: &Settings, c: Command) -> Result<()> {
             Ok(())
         }
         Command::Probe(a) => {
-            let opts = level_minus_one::Opts { spd_px: a.spd, level_dir: a.level_dir, ceiling: a.ceiling, from: a.from, to: a.to, marks: a.marks, threads: cfg.threads() };
+            let opts = level_minus_one::Opts { spd_px: a.spd, level_dir: a.tree, ceiling: a.steps, from: a.from_step, to: a.to_step, marks: a.marks, threads: cfg.threads() };
             let cfg = cfg.clone();
             // The tracer recurses through the cart's AST: a big stack.
             let report = std::thread::Builder::new()
@@ -93,8 +93,8 @@ pub fn run(cfg: &Settings, c: Command) -> Result<()> {
             Ok(())
         }
         Command::Check(a) => match cfg.arith {
-            Arith::Fixed => l1_check::<Fixed>(&a.inputs, a.horizon, a.spd, cfg),
-            Arith::Float(_) => l1_check::<celeste_core::arith::Float>(&a.inputs, a.horizon, a.spd, cfg),
+            Arith::Fixed => l1_check::<Fixed>(&a.inputs, a.frames, a.spd, cfg),
+            Arith::Float(_) => l1_check::<celeste_core::arith::Float>(&a.inputs, a.frames, a.spd, cfg),
         },
     }
 }

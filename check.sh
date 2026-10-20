@@ -121,7 +121,7 @@ t0() {
 # file it wrote, and the exact metrics against the pins; timings shown.
 frame() {
     local name=$1 f=$2; shift 2
-    ./safe-run.sh --memory "$MEM" -- "$B" bench frame --tree "$F/$name" --frame "$f" --edges --checkpoint --threads "$TH" --metrics "$C/$name.metrics" --l1-table "$F/$name/l1-table.bin" "$@" > "$C/$name.frame" || return 1
+    ./safe-run.sh --memory "$MEM" -- "$B" bench frame --tree "$F/$name" --step "$f" --edges --checkpoint --threads "$TH" --metrics "$C/$name.metrics" --l1-table "$F/$name/l1-table.bin" "$@" > "$C/$name.frame" || return 1
     same "$C/$name.frame" "$G/$name.frame" || return 1
     if [[ $PIN == --pin ]]; then
         same "$C/$name.metrics" "$G/$name.metrics"
@@ -134,7 +134,7 @@ frame() {
 # kernel census is 16.16's).
 framef() {
     local name=$1 f=$2
-    ./safe-run.sh --memory "$MEM" -- "$B" bench frame --tree "$F/$name" --frame "$f" --edges --checkpoint --threads "$TH" --l1-table "$F/$name/l1-table.bin" > "$C/$name.frame" || return 1
+    ./safe-run.sh --memory "$MEM" -- "$B" bench frame --tree "$F/$name" --step "$f" --edges --checkpoint --threads "$TH" --l1-table "$F/$name/l1-table.bin" > "$C/$name.frame" || return 1
     same "$C/$name.frame" "$G/$name.frame"
 }
 
@@ -147,27 +147,27 @@ fhe() {
 # the same f/h/e lines.
 keycheck() {
     local name=$1 f=$2
-    ./safe-run.sh --memory "$MEM" -- "$B" bench frame --tree "$F/$name" --frame "$f" --edges --threads "$TH" --key-check --l1-table "$F/$name/l1-table.bin" > "$C/keycheck-$name.frame" || return 1
+    ./safe-run.sh --memory "$MEM" -- "$B" bench frame --tree "$F/$name" --step "$f" --edges --threads "$TH" --key-check --l1-table "$F/$name/l1-table.bin" > "$C/keycheck-$name.frame" || return 1
     diff <(fhe "$name") "$C/keycheck-$name.frame" >&2
 }
 
 # widencheck NAME FRAME: `rewrite check widen` of a fixture's frame (the
 # stored rows, and 64 rows' emissions).
 widencheck() {
-    ./safe-run.sh --memory "$MEM" -- "$B" check widen --tree "$F/$1" --frame "$2" --emitted 64 --l1-table "$F/$1/l1-table.bin"
+    ./safe-run.sh --memory "$MEM" -- "$B" check widen --tree "$F/$1" --step "$2" --emitted 64 --l1-table "$F/$1/l1-table.bin"
 }
 
 # refcheck NAME FRAME: the kernels against the reference engine, 32
 # sampled rows of a fixture's frame (an r0sxh fixture's).
 refcheck() {
-    ./safe-run.sh --memory "$MEM" -- "$B" check ref --tree "$F/$1" --frame "$2" --samples 32 --threads "$TH"
+    ./safe-run.sh --memory "$MEM" -- "$B" check ref --tree "$F/$1" --step "$2" --samples 32 --threads "$TH"
 }
 
 # arccheck NAME FLAGS...: the recorded transfers of a fixture's f56
 # against the reference engine, 32 sampled records (an r0sxh fixture's).
 arccheck() {
     local name=$1; shift
-    ./safe-run.sh --memory "$MEM" -- "$B" check arcs --tree "$F/$name" --from 56 --to 56 --samples 32 --threads "$TH" --path-cap 4096 "$@"
+    ./safe-run.sh --memory "$MEM" -- "$B" check arcs --tree "$F/$name" --from-step 56 --to-step 56 --samples 32 --threads "$TH" --path-cap 4096 "$@"
 }
 
 # faultcheck NAME: `arccheck` with a corrupted transfer (`--fault action`)
@@ -182,7 +182,7 @@ faultcheck() {
 
 # backward NAME: one backward frame of a search fixture (W f45 of h56).
 backward() {
-    ./safe-run.sh --memory "$MEM" -- "$B" bench backward --tree "$F/$1/level00" --horizon 56 --frame 45 --threads "$TH" --reps 3 > "$C/backward-$1.txt" || return 1
+    ./safe-run.sh --memory "$MEM" -- "$B" bench backward --tree "$F/$1/level00" --steps 56 --step 45 --threads "$TH" --reps 3 > "$C/backward-$1.txt" || return 1
     same "$C/backward-$1.txt" "$G/$1.backward"
 }
 
@@ -277,35 +277,35 @@ t2_platforms() {
 
 # The three pinned room (1,0) oracles (CLAUDE.md "Gates").
 gate10_forward() {
-    ./safe-run.sh --memory "$MEM" -- "$B" forward --to 44 --room 1,0 --checkpoint-dir "$C/t2/g10" > "$C/t2/g10.out" || return 1
+    ./safe-run.sh --memory "$MEM" -- "$B" forward --steps 44 --room 1,0 --tree "$C/t2/g10" > "$C/t2/g10.out" || return 1
     grep '^posgraph' "$C/t2/g10.out" | diff gates/posgraph_room10_f044.txt - >&2 || return 1
-    ./safe-run.sh --memory "$MEM" -- "$B" ckhash --tree "$C/t2/g10" --to 44 --hulls | diff gates/ckhash_room10_f000-044.txt - >&2
+    ./safe-run.sh --memory "$MEM" -- "$B" ckhash --tree "$C/t2/g10" --steps 44 --hulls | diff gates/ckhash_room10_f000-044.txt - >&2
 }
 gate10_arc() {
-    ./safe-run.sh --memory "$MEM" -- "$B" search --to 35 --win-at 9,101 --checkpoint-dir "$C/t2/arc10" --prefer gates/known_room10_win9-101.txt --save-marks "$C/t2/arc10-marks" > "$C/t2/arc10.out" || return 1
+    ./safe-run.sh --memory "$MEM" -- "$B" search --frames 35 --win-at 9,101 --search-dir "$C/t2/arc10" --prefer gates/known_room10_win9-101.txt --save-marks "$C/t2/arc10-marks" > "$C/t2/arc10.out" || return 1
     grep '^\[gate\]' "$C/t2/arc10.out" | diff gates/arc_room10_win9-101_h35.txt - >&2
 }
 # The same oracles in float (`--arith float`, plans/float.md).
 gate10f_forward() {
-    ./safe-run.sh --memory "$MEM" -- "$B" forward --arith float --to 44 --room 1,0 --checkpoint-dir "$C/t2/g10f" > "$C/t2/g10f.out" || return 1
+    ./safe-run.sh --memory "$MEM" -- "$B" forward --arith float --steps 44 --room 1,0 --tree "$C/t2/g10f" > "$C/t2/g10f.out" || return 1
     grep '^posgraph' "$C/t2/g10f.out" | diff gates/float_posgraph_room10_f044.txt - >&2 || return 1
-    ./safe-run.sh --memory "$MEM" -- "$B" ckhash --tree "$C/t2/g10f" --to 44 --hulls | diff gates/float_ckhash_room10_f000-044.txt - >&2
+    ./safe-run.sh --memory "$MEM" -- "$B" ckhash --tree "$C/t2/g10f" --steps 44 --hulls | diff gates/float_ckhash_room10_f000-044.txt - >&2
 }
 gate10f_arc() {
-    ./safe-run.sh --memory "$MEM" -- "$B" search --arith float --to 35 --win-at 9,101 --checkpoint-dir "$C/t2/arc10f" --prefer gates/known_room10_win9-101.txt --save-marks "$C/t2/arc10f-marks" > "$C/t2/arc10f.out" || return 1
+    ./safe-run.sh --memory "$MEM" -- "$B" search --arith float --frames 35 --win-at 9,101 --search-dir "$C/t2/arc10f" --prefer gates/known_room10_win9-101.txt --save-marks "$C/t2/arc10f-marks" > "$C/t2/arc10f.out" || return 1
     grep '^\[gate\]' "$C/t2/arc10f.out" | diff gates/float_arc_room10_win9-101_h35.txt - >&2
 }
 # The dual search (`rewrite dual`) at the same synthetic win, the known
 # route valid in both: its bound and witness pinned (each half's [gate]
 # lines are the two gates above).
 gate10d_dual() {
-    ./safe-run.sh --memory "$MEM" -- "$B" dual --to 35 --win-at 9,101 --checkpoint-dir "$C/t2/dual10" --prefer gates/known_room10_win9-101.txt --save-marks "$C/t2/dual10-marks" > "$C/t2/dual10.out" || return 1
+    ./safe-run.sh --memory "$MEM" -- "$B" dual --frames 35 --win-at 9,101 --search-dir "$C/t2/dual10" --prefer gates/known_room10_win9-101.txt --save-marks "$C/t2/dual10-marks" > "$C/t2/dual10.out" || return 1
     grep -E '^DUAL BOUND|^\[gate\] h35 dual' "$C/t2/dual10.out" | diff gates/dual_room10_win9-101_h35.txt - >&2
 }
 # The objects ladder (r0sxhn filtering r0sxh) at a synthetic win, its
 # witness as the known route: every level's [gate] lines pinned.
 search42() {
-    ./safe-run.sh --memory "$MEM" -- "$B" search --room 4,2 --level r0sxhn,r0sxh --to 50 --win-at 32,56 --checkpoint-dir "$C/t2/s42" --prefer "$G/known_room42_win32-56.txt" --save-marks "$C/t2/s42-marks" > "$C/t2/s42.out" || return 1
+    ./safe-run.sh --memory "$MEM" -- "$B" search --room 4,2 --level r0sxhn,r0sxh --frames 50 --win-at 32,56 --search-dir "$C/t2/s42" --prefer "$G/known_room42_win32-56.txt" --save-marks "$C/t2/s42-marks" > "$C/t2/s42.out" || return 1
     grep '^\[gate\]' "$C/t2/s42.out" > "$C/t2/s42.gate"
     same "$C/t2/s42.gate" "$G/search42.gate"
 }
@@ -314,7 +314,7 @@ search42() {
 # timings.
 export_ui() {
     for d in arc10 s42 arc10f dual10; do
-        ./safe-run.sh --memory "$MEM" -- "$B" export-ui --checkpoint-dir "$C/t2/$d" --arc "$C/t2/$d-marks" --out "$C/t2/ui-$d" > /dev/null || return 1
+        ./safe-run.sh --memory "$MEM" -- "$B" export-ui --search-dir "$C/t2/$d" --arc "$C/t2/$d-marks" --out "$C/t2/ui-$d" > /dev/null || return 1
         (cd "$C/t2" && sha256sum ui-$d/*.bin)
         python3 -c '
 import json, sys
@@ -336,10 +336,10 @@ print(json.dumps(r, sort_keys=True))' "$C/t2/ui-$d/run.json" | sha256sum | sed "
 # kernels'. Each tree goes to $C/t2/{kernels,reference}10[-float].
 reference10() {
     local d=$C/t2/reference10${1:+-float}
-    ./safe-run.sh --memory "$MEM" -- "$B" forward "$@" --to 36 --room 1,0 --checkpoint-dir "$d-kernels" > /dev/null || return 1
-    ./safe-run.sh --memory "$MEM" -- "$B" forward "$@" --reference --to 27 --room 1,0 --checkpoint-dir "$d-reference" > /dev/null || return 1
-    ./safe-run.sh --memory "$MEM" -- "$B" ckhash --tree "$d-kernels" --to 27 --edges --hulls > "$d-kernels.ckhash" || return 1
-    ./safe-run.sh --memory "$MEM" -- "$B" ckhash --tree "$d-reference" --to 27 --edges --hulls > "$d-reference.ckhash" || return 1
+    ./safe-run.sh --memory "$MEM" -- "$B" forward "$@" --steps 36 --room 1,0 --tree "$d-kernels" > /dev/null || return 1
+    ./safe-run.sh --memory "$MEM" -- "$B" forward "$@" --reference --steps 27 --room 1,0 --tree "$d-reference" > /dev/null || return 1
+    ./safe-run.sh --memory "$MEM" -- "$B" ckhash --tree "$d-kernels" --steps 27 --edges --hulls > "$d-kernels.ckhash" || return 1
+    ./safe-run.sh --memory "$MEM" -- "$B" ckhash --tree "$d-reference" --steps 27 --edges --hulls > "$d-reference.ckhash" || return 1
     diff "$d-kernels.ckhash" "$d-reference.ckhash" >&2
 }
 # THE HULL FORWARD'S TREE REPLAYS FROM ITS RECORDED GRAPH [ARITH]:
@@ -347,19 +347,19 @@ reference10() {
 # edges and transfers from the start, reaches exactly its states at every
 # frame (`check replay`): every edge was recorded.
 hull10() {
-    ./safe-run.sh --memory "$MEM" -- "$B" check replay --tree "$C/t2/reference10${1:+-float}-kernels" --to 36
+    ./safe-run.sh --memory "$MEM" -- "$B" check replay --tree "$C/t2/reference10${1:+-float}-kernels" --steps 36
 }
 
 # A platform room (platforms unknown, split frame) to step 71: the tree's
 # fingerprint is the r60s fixture's pin.
 forward60() {
-    ./safe-run.sh --memory "$MEM" -- "$B" forward --room 6,0 --level r0sxhfp --to 71 --split-frame --checkpoint-dir "$C/t2/p60" > /dev/null || return 1
-    ./safe-run.sh --memory "$MEM" -- "$B" ckhash --tree "$C/t2/p60" --to 71 --edges --hulls 2> /dev/null | diff "$G/r60s.ckhash" - >&2
+    ./safe-run.sh --memory "$MEM" -- "$B" forward --room 6,0 --level r0sxhfp --steps 71 --split-frame --tree "$C/t2/p60" > /dev/null || return 1
+    ./safe-run.sh --memory "$MEM" -- "$B" ckhash --tree "$C/t2/p60" --steps 71 --edges --hulls 2> /dev/null | diff "$G/r60s.ckhash" - >&2
 }
 
 widen60() {
     for f in 70 71; do
-        ./safe-run.sh --memory "$MEM" -- "$B" check widen --tree "$F/r60s" --frame $f || return 1
+        ./safe-run.sh --memory "$MEM" -- "$B" check widen --tree "$F/r60s" --step $f || return 1
     done
 }
 
@@ -400,7 +400,7 @@ perfcount() {
     local n i1 i3 rep pin
     rm -f "$C/perf-$name.line"
     for n in 1 3; do
-        ./safe-run.sh --memory "$MEM" -- perf stat -x, -e instructions:u -o "$C/perf-$name-$n.stat" -- "$RB" bench frame --tree "$F/$name" --frame "$f" --edges --threads 16 --l1-table "$F/$name/l1-table.bin" --reps "$n" > "$C/perf-$name-$n.frame" || return 1
+        ./safe-run.sh --memory "$MEM" -- perf stat -x, -e instructions:u -o "$C/perf-$name-$n.stat" -- "$RB" bench frame --tree "$F/$name" --step "$f" --edges --threads 16 --l1-table "$F/$name/l1-table.bin" --reps "$n" > "$C/perf-$name-$n.frame" || return 1
         diff <(fhe "$name") "$C/perf-$name-$n.frame" >&2 || return 1
     done
     i1=$(awk -F, '$3 ~ /^instructions/ {print $1}' "$C/perf-$name-1.stat")

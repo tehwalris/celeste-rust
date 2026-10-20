@@ -10,8 +10,9 @@ JOBS.json: a list of {"cat": "nodiag", "room": "0,0", "name": "100m",
 CELESTE_* variables is refused, as the binaries refuse them); "tag";
 "timeout"; "reuse": a level-0 tree directory, moved in when it exists and moved back
 there when the job ends - so jobs can count horizons up on one kept tree;
-"to": a horizon H instead of the reference - `--to H`, level -1 at H, and a
-refutation is a result (the optimum is above H); "keep_tree": leave the tree
+"to": a horizon H instead of the reference - `--frames H` without
+`--ceiling`, level -1 at H, and a refutation is a result (the optimum is
+above H); "keep_tree": leave the tree
 in OUTDIR for a later job's "reuse"; "witness": a file of our inputs to verify,
 no search); re-read
 before every job, so jobs can be appended while it runs; a job whose key is
@@ -24,10 +25,11 @@ Per job:
     every other start class (`rewrite starts`) a search-only job;
  1. the reference: the community TAS replayed in the ORIGINAL cart behind the
     room's prologue (the earliest offset around `offset` that exits);
- 2. `rewrite search --ceiling REF --prefer <the community TAS>` with the
+ 2. `rewrite search --frames REF --ceiling --prefer <the community TAS>` with the
     category (`--category`, the database's name) and
     the level -1 filter if `l1` (retried without it if its table refuses);
-    `--to H` instead with a job's "to"; its outcome is its `result.json`;
+    `--frames H` without `--ceiling` with a job's "to"; its outcome is its
+    `result.json`;
  3. our witness replayed in the original cart (must exit at the optimum; no
     diagonal dash in a nodiag category, every dash diagonal in an onlydiag
     one, as the cart's own dash branch reports them);
@@ -156,9 +158,7 @@ def run(job, outdir, binary):
         # the witness is then one real run under them.
         flags += [f"--concrete-balloon-seeds={','.join(seeds)}"]
         if l1:
-            # Level -1 counts search steps: two a frame under the split frame.
-            steps = horizon * (2 if "--split-frame" in flags else 1)
-            flags += ["--level-minus-one", f"{steps},5"]
+            flags += ["--level-minus-one", f"{horizon},5"]
         log = os.path.join(jd, "search.log")
         tree = os.path.join(jd, "tree")
         release_tree()
@@ -169,7 +169,7 @@ def run(job, outdir, binary):
         if job.get("reuse") and os.path.isdir(job["reuse"]):
             os.makedirs(tree)
             shutil.move(job["reuse"], os.path.join(tree, "level00"))
-        cmd = [f"{M}/safe-run.sh", "--memory", job.get("mem", "60G"), "--", binary, "search", "--room", room, "--to" if "to" in job else "--ceiling", str(horizon), "--level", job["levels"], "--prefer", prefer, "--save-marks", os.path.join(jd, "marks"), "--checkpoint-dir", tree] + flags
+        cmd = [f"{M}/safe-run.sh", "--memory", job.get("mem", "60G"), "--", binary, "search", "--room", room, "--frames", str(horizon)] + ([] if "to" in job else ["--ceiling"]) + ["--level", job["levels"], "--prefer", prefer, "--save-marks", os.path.join(jd, "marks"), "--search-dir", tree] + flags
         t = time.time()
         with open(log, "w") as f:
             rc = subprocess.run(cmd, stdout=f, stderr=subprocess.STDOUT, cwd=M, timeout=job.get("timeout", 4 * 3600)).returncode
@@ -207,7 +207,7 @@ def run(job, outdir, binary):
         res["search_s"] = round(secs)
         res["peak_gb"] = round(rec["peak_gb"], 2) if rec else None
         res["arc_bounds"] = [l["arc_bound"] for l in rec["levels"] if l["arc_bound"] is not None] if rec else []
-        # Under `--to H` a refutation is a result: no win by H at all.
+        # Without `--ceiling` a refutation is a result: no win by H at all.
         if rc == 0 and rec and rec["verdict"] in ("refuted", "no_concrete_win") and "to" in job:
             drop_tree()
             return {**res, "status": f"refuted at {horizon}", "detail": rec["verdict"]}
@@ -316,7 +316,7 @@ def run(job, outdir, binary):
             rid = f"room{room.replace(',', '')}{cat}"
             # The UI's download IS the upload file.
             dl = ["--download", res["upload"]] if res.get("upload") else []
-            ex = subprocess.run([f"{M}/safe-run.sh", "--", binary, "export-ui", "--checkpoint-dir", os.path.join(jd, "tree"), "--out", f"{UI}/{rid}", "--room", room, "--arc", os.path.join(jd, "marks"), "--witness", f"{paths}/ours.txt", "--reference", f"{paths}/reference.txt"] + dl, cwd=M, capture_output=True, text=True, timeout=3600)
+            ex = subprocess.run([f"{M}/safe-run.sh", "--", binary, "export-ui", "--search-dir", os.path.join(jd, "tree"), "--out", f"{UI}/{rid}", "--arc", os.path.join(jd, "marks"), "--witness", f"{paths}/ours.txt", "--reference", f"{paths}/reference.txt"] + dl, cwd=M, capture_output=True, text=True, timeout=3600)
             if ex.returncode != 0:
                 raise RuntimeError("export-ui: " + ex.stderr.strip().splitlines()[-1] if ex.stderr.strip() else "export-ui failed")
             runs = json.load(open(f"{UI}/runs.json"))

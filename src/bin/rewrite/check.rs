@@ -24,7 +24,7 @@ use crate::{where_, KernelsNew, Rows};
 pub enum Command {
     /// THE KERNELS AGAINST THE REFERENCE ENGINE, row by row.
     ///
-    /// `--samples` stored rows of `--frame` (`--row N`: the N-th alone),
+    /// `--samples` stored rows of `--step` (`--row N`: the N-th alone),
     /// each one step through the tree level's kernels and through
     /// `RefEngine`, both projected onto the level and compared by named
     /// fields. A reference successor the kernels miss is a SOUNDNESS gap; a
@@ -47,7 +47,7 @@ pub enum Command {
     Arcs(ArcsArgs),
     /// THE WIDENING TABLE'S TWO SIDES AGREE (`celeste_engine::widening`).
     ///
-    /// Every row stored at `--frame` (widened in the kernels' graph) is a
+    /// Every row stored at `--step` (widened in the kernels' graph) is a
     /// fixed point of the block side's widening at the tree's level
     /// (`Rt2::widen_to`), compared exactly, and so is every row the kernels
     /// emit from `--emitted` of them (evenly spaced). A row the block side
@@ -65,7 +65,7 @@ pub enum Command {
     /// remainder (whole frames only), and at every frame boundary project
     /// onto an arc-graph node whose W holds its exact remainder, reached (at
     /// a level that filters the next) - per level, the arc phase rerun over
-    /// `<checkpoint-dir>/level{i:02}` as `search` ran it, without the
+    /// `<search-dir>/level{i:02}` as `search` ran it, without the
     /// concrete search. Exits non-zero on the first check that drops it,
     /// with the step, the node and the state (and, where the tree lost it,
     /// the kernels' successors of its state a frame before).
@@ -81,7 +81,7 @@ pub enum Command {
 
 #[derive(clap::Args)]
 pub struct RefArgs {
-    /// The tree (a forward's checkpoint dir, or a search's `levelNN`).
+    /// The tree (a forward's `--tree`, or a search's `levelNN`).
     #[arg(long)]
     tree: PathBuf,
     #[command(flatten)]
@@ -108,15 +108,15 @@ pub struct RefArgs {
 
 #[derive(clap::Args)]
 pub struct ArcsArgs {
-    /// The tree (a forward's checkpoint dir, or a search's `levelNN`).
+    /// The tree (a forward's `--tree`, or a search's `levelNN`).
     #[arg(long)]
     tree: PathBuf,
-    /// The first frame whose records are checked.
+    /// The first step whose records are checked.
     #[arg(long, default_value_t = 1)]
-    from: u32,
-    /// The last frame whose records are checked (default: the tree's last).
+    from_step: u32,
+    /// The last step whose records are checked (default: the tree's last).
     #[arg(long)]
-    to: Option<u32>,
+    to_step: Option<u32>,
     /// Records sampled per frame.
     #[arg(long, default_value_t = 20)]
     samples: usize,
@@ -135,12 +135,12 @@ pub struct ArcsArgs {
 
 #[derive(clap::Args)]
 pub struct WidenArgs {
-    /// The tree (a forward's checkpoint dir, or a search's `levelNN`).
+    /// The tree (a forward's `--tree`, or a search's `levelNN`).
     #[arg(long)]
     tree: PathBuf,
     /// The step whose stored rows are checked (default: the tree's last).
     #[arg(long)]
-    frame: Option<u32>,
+    step: Option<u32>,
     /// Also run this many of the rows (evenly spaced) through the kernels and
     /// check what they emit.
     #[arg(long, default_value_t = 0)]
@@ -149,27 +149,27 @@ pub struct WidenArgs {
 
 #[derive(clap::Args)]
 pub struct KnownArgs {
-    /// The search's checkpoint dir (its `result.json` and `level{i:02}`
-    /// trees; a dual search's half: `DIR/fixed` or `DIR/float`).
+    /// The search's directory (its `result.json` and `level{i:02}` trees;
+    /// a dual search's half: `DIR/fixed` or `DIR/float`).
     #[arg(long)]
-    checkpoint_dir: PathBuf,
+    search_dir: PathBuf,
     /// The known solution: a `tas/` file or a comma list of input bytes,
     /// the spawn prologue included.
     #[arg(long)]
     inputs: String,
-    /// The search's horizon in frames (default: its `result.json`'s).
+    /// The search's horizon in game frames (default: its `result.json`'s).
     #[arg(long)]
-    horizon: Option<u32>,
+    frames: Option<u32>,
 }
 
 #[derive(clap::Args)]
 pub struct ReplayArgs {
-    /// The tree (a forward's checkpoint dir, or a search's `levelNN`).
+    /// The tree (a forward's `--tree`, or a search's `levelNN`).
     #[arg(long)]
     tree: PathBuf,
-    /// The last frame replayed (default: the tree's last).
+    /// The last step replayed (default: the tree's last).
     #[arg(long)]
-    to: Option<u32>,
+    steps: Option<u32>,
 }
 
 /// `check ...` under the run's settings `run`.
@@ -184,7 +184,7 @@ pub fn run(run: &Settings, c: Command) -> Result<()> {
         }
         Command::Arcs(a) => {
             let t = TreeDir::open(&a.tree, run)?;
-            let o = celeste_rust::search::arc_check::Opts { dir: &t.dir, from: a.from, to: t.frame(a.to)?, samples: a.samples, level: t.level, fault: a.fault.as_deref(), path_cap: a.path_cap, settings: &t.settings };
+            let o = celeste_rust::search::arc_check::Opts { dir: &t.dir, from: a.from_step, to: t.frame(a.to_step)?, samples: a.samples, level: t.level, fault: a.fault.as_deref(), path_cap: a.path_cap, settings: &t.settings };
             match t.settings.arith {
                 Arith::Fixed => celeste_rust::search::arc_check::run::<P8>(&o),
                 Arith::Float(_) => celeste_rust::search::arc_check::run::<LuaF64>(&o),
@@ -192,7 +192,7 @@ pub fn run(run: &Settings, c: Command) -> Result<()> {
         }
         Command::Widen(a) => {
             let t = TreeDir::open(&a.tree, run)?;
-            let frame = t.frame(a.frame)?;
+            let frame = t.frame(a.step)?;
             match t.settings.arith {
                 Arith::Fixed => widen_check::<celeste_rust::compiled::FrameEngine, P8>(&t, frame, a.emitted),
                 Arith::Float(_) => widen_check::<celeste_rust::compiled::FloatKernels, LuaF64>(&t, frame, a.emitted),
@@ -200,12 +200,12 @@ pub fn run(run: &Settings, c: Command) -> Result<()> {
         }
         Command::Known(a) => {
             let inputs = celeste_rust::concrete::read_inputs(&a.inputs)?;
-            celeste_rust::search::check_known(&a.checkpoint_dir, &inputs, a.horizon, run)
+            celeste_rust::search::check_known(&a.search_dir, &inputs, a.frames, run)
         }
         Command::Replay(a) => {
             use celeste_rust::search::hull_replay::replay;
             let t = TreeDir::open(&a.tree, run)?;
-            let to = t.frame(a.to)?;
+            let to = t.frame(a.steps)?;
             let tm = std::time::Instant::now();
             let frames = match t.settings.arith {
                 Arith::Fixed => replay::<P8>(&t.dir, to, t.settings.threads())?,

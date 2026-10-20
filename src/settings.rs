@@ -154,10 +154,9 @@ pub struct Settings {
     #[arg(long, global = true, default_value = "none", value_parser = parse_seeds)]
     pub balloon_seeds: std::option::Option<String>,
     // NOT recorded.
-    /// The level -1 filter "H,S": H in SEARCH STEPS (2 a game frame under
-    /// --split-frame, where the search's --to/--ceiling count frames;
-    /// `Clock`), S the table's speed bound (the tree records it as
-    /// `frame::TreeFilter`).
+    /// The level -1 filter "H,S": H in game frames (the search's horizon),
+    /// S the table's speed bound (the tree records it, H in steps, as
+    /// `frame::TreeFilter`: `minus_one`).
     #[arg(long, global = true, value_parser = parse_minus_one)]
     pub level_minus_one: Option<(u32, i32)>,
     /// The balloons' phases of the concrete phase only (a tasdatabase file's
@@ -337,9 +336,10 @@ impl Settings {
         self.region.map(|(px, speed)| crate::trace::walk::RegionGrid { px, speed })
     }
 
-    /// The run's level -1 filter (`--level-minus-one H,S`), if given.
+    /// The run's level -1 filter (`--level-minus-one H,S`), if given: H in
+    /// search steps (`Clock`).
     pub fn minus_one(&self) -> Option<crate::frame::MinusOne> {
-        self.level_minus_one.map(|(h, speed)| crate::frame::MinusOne { h, speed })
+        self.level_minus_one.map(|(h, speed)| crate::frame::MinusOne { h: self.clock().steps(h), speed })
     }
 
     /// The record's lines, `(key, value)`, in a fixed order: what changes a
@@ -400,8 +400,14 @@ impl Settings {
         }
         let flags = Flags::try_parse_from(&args).map_err(|e| anyhow::anyhow!("{}: the record does not read back: {e}", path(dir).display()))?;
         let level = crate::abstraction::Level::parse(rec.get("level").with_context(|| format!("{}: the record names no level", path(dir).display()))?).map_err(|e| anyhow::anyhow!(e))?;
+        // The filter's H, recorded in steps, as `--level-minus-one` takes it
+        // (frames).
+        let per_frame = flags.s.clock().per_frame;
         let minus_one = match crate::frame::TreeFilter::read(dir)? {
-            Some(crate::frame::TreeFilter::MinusOne { m, .. }) => Some((m.h, m.speed)),
+            Some(crate::frame::TreeFilter::MinusOne { m, .. }) => {
+                anyhow::ensure!(m.h % per_frame == 0, "{}: the level -1 horizon {} steps is no whole frame", dir.display(), m.h);
+                Some((m.h / per_frame, m.speed))
+            }
             Some(crate::frame::TreeFilter::Off) => None,
             None => anyhow::bail!("{}: no level -1 record (a tree from before records)", dir.display()),
         };
@@ -672,9 +678,10 @@ pub fn startup(args: &Settings, float: bool, adjust: impl FnOnce(&mut Settings))
 /// game frame is `per_frame` search steps - 2 under `--split-frame` (part a
 /// up to and including the player's move, part b the rest; step `2k` ends
 /// frame `k`), else 1. Steps are the internal unit: the tree and its
-/// files, the edges, W, the marks, level -1's `H` and the tree commands'
-/// `--to`/`--frame` count them (a mid-frame state is a node of its own).
-/// The search's horizon (`--to`, `--ceiling`), its bounds, witnesses and
+/// files, the edges, W, the marks and level -1's recorded `H` count them
+/// (a mid-frame state is a node of its own), as the flags named so do
+/// (`--steps`, `--step`, `--from-step`, `--to-step`). The search's horizon
+/// (`--frames`), `--level-minus-one`'s `H`, its bounds, witnesses and
 /// `result.json` count frames. Every conversion is here.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Clock {
@@ -770,6 +777,20 @@ mod tests {
             std::fs::write(dir.join("level_minus_one.txt"), "off\n").expect("the filter's record");
             let (back, level) = Settings::of_tree(&dir, &run).expect("read back");
             assert_eq!((back, level), (s, lvl));
+        }
+        // Level -1's H: frames on the command line, steps in the record (two
+        // a frame under the split frame).
+        let split = Settings { split_frame: true, level_minus_one: Some((84, 5)), ..run.clone() };
+        assert_eq!(split.minus_one().map(|m| (m.h, m.speed)), Some((168, 5)));
+        let _ = std::fs::remove_dir_all(&dir);
+        split.write(&dir, lvl).expect("write");
+        for (record, back) in [("h 168 speed 5 table 0\n", Ok(Some((84, 5)))), ("h 167 speed 5 table 0\n", Err("no whole frame"))] {
+            std::fs::write(dir.join("level_minus_one.txt"), record).expect("the filter's record");
+            match (Settings::of_tree(&dir, &run), back) {
+                (Ok((s, _)), Ok(want)) => assert_eq!(s.level_minus_one, want),
+                (Err(e), Err(why)) => assert!(e.to_string().contains(why), "{e}"),
+                (got, want) => panic!("{record:?}: {:?}, wanted {want:?}", got.map(|(s, _)| s.level_minus_one)),
+            }
         }
         let _ = std::fs::remove_dir_all(&dir);
     }

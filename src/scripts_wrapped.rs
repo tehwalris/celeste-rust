@@ -67,11 +67,11 @@ fn every_script_runs_our_binaries_under_safe_run() {
 
 #[test]
 fn the_scan_sees_an_unwrapped_run() {
-    assert!(runs_ours("    \"$B\" ckhash --room 1,0 --to 44", false));
+    assert!(runs_ours("    \"$B\" ckhash --room 1,0 --steps 44", false));
     assert!(runs_ours("        $B ckhash --room \"$ROOM\"", false));
     assert!(runs_ours("    if ! cargo build --profile quick --bins >&2; then", false));
     assert!(runs_ours("            ex = subprocess.run([binary, \"export-ui\"], cwd=M)", true));
-    assert!(runs_ours("./target/quick/rewrite ckhash --to 44", false));
+    assert!(runs_ours("./target/quick/rewrite ckhash --steps 44", false));
     assert!(!runs_ours("B=$T/quick/rewrite", false));
     assert!(!runs_ours("B=\"$repo_root/target/quick/rewrite\"", false));
     assert!(!runs_ours("if [ ! -x \"$B\" ]; then", false));
