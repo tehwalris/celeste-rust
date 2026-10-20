@@ -15,7 +15,7 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::{fmt, ops::Rem, str::FromStr};
 
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct Pico8Num(i32);
 
 /// The console's `sin`, tabulated: little-endian `i32` in 16.16, one entry

@@ -103,12 +103,10 @@ pub trait Arithmetic: 'static + Copy + Default + Debug + Send + Sync + PartialEq
 }
 
 /// PICO-8's 16.16 fixed point: the real game.
-#[derive(Clone, Copy, Default, Debug, PartialEq, Eq, Hash)]
-pub struct Fixed;
+pub type Fixed = Pico8Num;
 
 /// The Lua doubles of UniversalClassicTas and Celia's float mode.
-#[derive(Clone, Copy, Default, Debug, PartialEq, Eq, Hash)]
-pub struct Float;
+pub type Float = LuaF64;
 
 type P8 = Pico8Num;
 type Iv = Pico8NumInterval;

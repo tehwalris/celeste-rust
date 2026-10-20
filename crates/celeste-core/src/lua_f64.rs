@@ -31,7 +31,7 @@ use std::hash::{Hash, Hasher};
 /// A Lua number of the float tools: a FINITE `f64`. Equality and hashing are
 /// BIT identity (`-0.0` and `0.0` are different values to a key or a dedup,
 /// as their bits differ); the game's comparisons are `lt`, `le`, `eq_value`.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Default)]
 pub struct LuaF64(f64);
 
 impl PartialEq for LuaF64 {
