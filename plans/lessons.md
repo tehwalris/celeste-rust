@@ -24,6 +24,15 @@ sounds like one of these. The full write-ups are in git history.
   comparison, 2^70 bodies an outcome in room (6,0). Forks after the frame.
 - **Platform worlds as a compile-time fork**: 2.3M bodies, 35 GB of
   kernels, a coverage gap at f36. POINTS in the split pass instead.
+- **One case enumerator for the split pass and the lowering's forks**
+  (audit K1, measured 2026-10-20, not built): stored selects as both-ways
+  forks enumerated per outcome by `specialize_frame`. Per walk (templates,
+  splits, outcomes out, sum of 2^atoms split a template): r10 767/0/767,
+  r62h 3,374/0/3,238, r42n 480/204/574 (826), f42n 656/306/797 (1,175),
+  platforms r60s 8,495/50,127/18,162 (2.7e11, up to 34 atoms a template).
+  Idle without near floors or platforms; with them the split pass's
+  ADAPTIVE order (refold after each split, `Points` per world) is what keeps
+  34 atoms at 18k outcomes, which no per-outcome product of forks can.
 - **Guarded regions in the fused kernels** (2026-09-14, reverted): 1.5x,
   not the promised 5-8x (a lane takes ~4-5 of 16 configurations). Kernels
   stay branch-free; the static split frame bought 10-20x in size instead.
