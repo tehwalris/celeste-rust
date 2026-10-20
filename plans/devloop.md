@@ -225,8 +225,9 @@ are never committed.
 - Transfer ids are final at each slice's gather (`XferTable::merge`: a
   function of the frame), so a frame check's edge bytes are a function of
   the search.
-- Level -1 fixtures keep their table (`NAME/l1-table.bin`; `bench frame`
-  refuses another).
+- Level -1 fixtures hold their table, as every filtered tree does
+  (`NAME/l1-table.bin`, its fingerprint in the record): a frame check uses
+  it, whatever binary.
 - Fixtures are shared by every checkout and READ-ONLY (`ensure` makes them
   so): a step that writes into one fails. Scratch is the run's own:
   `bench frame`'s `/var/tmp/celeste-bench-frame-PID` (removed after), and

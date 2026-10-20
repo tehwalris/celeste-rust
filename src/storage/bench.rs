@@ -5,10 +5,11 @@
 use anyhow::{ensure, Context, Result};
 use std::path::{Path, PathBuf};
 
-/// `ckhash --edges`'s `e{frame}` line over the frame's edge file (`xfers`:
-/// the merged table; the dir's file may hold only the frame's new pairs).
-pub fn edge_fingerprint<N: crate::search::rem::Rem>(edges_dir: &Path, frame: u32, xfers: &super::edges::XferTable<N>, visited: &super::visited::VisitedSet<N>, threads: usize) -> Result<(u64, u64)> {
-    let store = super::edges::EdgeStore::<N>::open(edges_dir, frame)?;
+/// `ckhash --edges`'s `e{frame}` line over the frame's edge file in `dir`'s
+/// `edges/` (`xfers`: the merged table; the dir holds the frame's file
+/// alone, and no trusted transfer).
+pub fn edge_fingerprint<N: crate::search::rem::Rem>(dir: &Path, frame: u32, xfers: &super::edges::XferTable<N>, visited: &super::visited::VisitedSet<N>, threads: usize) -> Result<(u64, u64)> {
+    let store = super::edges::EdgeStore::<N>::open(dir, frame)?;
     EdgeHashes::new::<N>(&xfers.pairs).frame(&store, frame, &visited.keys.content_hash(), visited.shapes(), threads)
 }
 

@@ -232,22 +232,27 @@ pub struct MinusOne {
 }
 
 impl MinusOne {
-    pub(crate) fn table(&self, s: &crate::settings::Settings) -> &'static crate::search::level_minus_one::CostToGo {
-        self.try_table(s).unwrap_or_else(|e| panic!("building the level -1 table: {e:#}"))
-    }
-
-    /// The same, an error where the table cannot be built (the search
-    /// records the refusal before anything else needs the table).
-    pub(crate) fn try_table(&self, s: &crate::settings::Settings) -> Result<&'static crate::search::level_minus_one::CostToGo> {
+    /// Its table as this binary builds it under `s` (a new tree's; a tree's
+    /// own is `TreeFilter::l1`): an error where the table cannot be built
+    /// (the search records the refusal before anything else needs it).
+    pub(crate) fn table(&self, s: &crate::settings::Settings) -> Result<&'static crate::search::level_minus_one::CostToGo> {
         crate::search::level_minus_one::table(self.speed, s)
     }
+}
+
+/// The level -1 filter as a forward or a check applies it: the horizon (in
+/// steps) and the table the tree holds.
+#[derive(Clone, Copy)]
+pub(crate) struct L1 {
+    pub(crate) h: u32,
+    pub(crate) table: &'static crate::search::level_minus_one::CostToGo,
 }
 
 /// What a forward filters by.
 pub(crate) struct Filters<'a, N: EngineNum = P8> {
     /// The coarser level's arc marks (the objects ladder).
     pub(crate) marks: Option<&'a MarkFilter<'a, N>>,
-    pub(crate) minus_one: Option<MinusOne>,
+    pub(crate) minus_one: Option<L1>,
 }
 
 impl<N: EngineNum> Clone for Filters<'_, N> {
@@ -362,9 +367,11 @@ pub trait FrameStep<N: Rem = P8>: Sync {
     fn settings(&self) -> std::sync::Arc<crate::settings::Settings>;
 }
 
-/// The level -1 filter a tree's frames were built under
-/// (`<dir>/level_minus_one.txt`). A forward extends a tree under ITS filter,
-/// never the environment's: every frame of a tree is filtered alike.
+/// The level -1 filter a tree's frames were built under (its record's
+/// `level_minus_one` line; the table itself beside the record,
+/// `level_minus_one::TABLE_FILE`). A forward extends a tree under ITS
+/// filter and table, never the environment's: every frame of a tree is
+/// filtered alike, whatever binary extends it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum TreeFilter {
     /// None (`off`): the frames do not depend on the horizon.
@@ -375,26 +382,28 @@ pub(crate) enum TreeFilter {
 }
 
 impl TreeFilter {
-    fn of(m: Option<MinusOne>, s: &crate::settings::Settings) -> TreeFilter {
-        match m {
-            None => TreeFilter::Off,
-            Some(m) => TreeFilter::MinusOne { m, table: m.table(s).fingerprint() },
-        }
-    }
+    /// The record's key.
+    const KEY: &'static str = "level_minus_one";
 
-    fn path(dir: &std::path::Path) -> std::path::PathBuf {
-        dir.join("level_minus_one.txt")
-    }
-
-    /// The tree's record; `None` without one (its filter unknown).
-    pub(crate) fn read(dir: &std::path::Path) -> Result<Option<TreeFilter>> {
-        let path = Self::path(dir);
-        let s = match std::fs::read_to_string(&path) {
-            Ok(s) => s,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(e) => return Err(e).with_context(|| path.display().to_string()),
+    /// A new tree's filter: `m`'s table built under `s` and saved in the
+    /// tree `dir`; the record's line written.
+    fn start(m: Option<MinusOne>, dir: &std::path::Path, s: &crate::settings::Settings) -> Result<(TreeFilter, Option<L1>)> {
+        let (filter, l1) = match m {
+            None => (TreeFilter::Off, None),
+            Some(m) => {
+                let table = m.table(s)?;
+                table.save_in(dir)?;
+                (TreeFilter::MinusOne { m, table: table.fingerprint() }, Some(L1 { h: m.h, table }))
+            }
         };
-        let s = s.trim();
+        crate::storage::record::update(dir, Self::KEY, filter.text())?;
+        Ok((filter, l1))
+    }
+
+    /// The tree's filter; `None` without a record line (its filter unknown).
+    pub(crate) fn read(dir: &std::path::Path) -> Result<Option<TreeFilter>> {
+        let Some(rec) = crate::storage::record::Record::read(dir)? else { return Ok(None) };
+        let Some(s) = rec.get(Self::KEY) else { return Ok(None) };
         if s == "off" {
             return Ok(Some(TreeFilter::Off));
         }
@@ -403,59 +412,34 @@ impl TreeFilter {
             ["h", h, "speed", sp, "table", fp] => (|| Some((h.parse().ok()?, sp.parse().ok()?, u64::from_str_radix(fp, 16).ok()?)))(),
             _ => None,
         };
-        let (h, speed, table) = parsed.ok_or_else(|| anyhow::anyhow!("{}: not a level -1 record: {s:?}", path.display()))?;
+        let (h, speed, table) = parsed.ok_or_else(|| anyhow::anyhow!("{}: not a level -1 line: {s:?}", crate::storage::record::path(dir).display()))?;
         Ok(Some(TreeFilter::MinusOne { m: MinusOne { h, speed }, table }))
     }
 
-    fn write(&self, dir: &std::path::Path) -> Result<()> {
-        let s = match self {
+    /// The record line's value.
+    fn text(&self) -> String {
+        match self {
             TreeFilter::Off => "off".to_string(),
             TreeFilter::MinusOne { m, table } => format!("h {} speed {} table {table:016x}", m.h, m.speed),
-        };
-        std::fs::create_dir_all(dir)?;
-        let tmp = dir.join("level_minus_one.tmp");
-        std::fs::write(&tmp, format!("{s}\n"))?;
-        std::fs::rename(&tmp, Self::path(dir))?;
-        Ok(())
+        }
     }
 
-    /// The filter a forward extending the tree runs under.
-    fn minus_one(&self) -> Option<MinusOne> {
+    /// The filter with the TREE's table (read from the tree `dir`, checked
+    /// against the record's fingerprint).
+    fn l1(&self, dir: &std::path::Path) -> Result<Option<L1>> {
         match *self {
-            TreeFilter::Off => None,
-            TreeFilter::MinusOne { m, .. } => Some(m),
+            TreeFilter::Off => Ok(None),
+            TreeFilter::MinusOne { m, table } => Ok(Some(L1 { h: m.h, table: crate::search::level_minus_one::tree_table(dir, table)? })),
         }
     }
 
-    /// `minus_one`, its table checked against the tree's record: a table
-    /// built under other settings or by another binary would filter the new
-    /// frames otherwise.
-    fn checked_minus_one(&self, s: &crate::settings::Settings) -> Result<Option<MinusOne>> {
-        let m = self.minus_one();
-        if let (TreeFilter::MinusOne { table, .. }, Some(m)) = (self, m) {
-            let got = m.table(s).fingerprint();
-            anyhow::ensure!(got == *table, "the level -1 table is not the one the tree was built under (fingerprint {got:016x}, the tree's {table:016x}; a fixture pins its table: --l1-table)");
-        }
-        Ok(m)
-    }
-
-    /// The level -1 filter the tree in `dir` was built under, its table
-    /// checked: what a check of the tree (`search::known`) must apply,
+    /// The level -1 filter the tree in `dir` was built under, with its
+    /// table: what a check of the tree (`search::known`) must apply,
     /// whatever the environment says. Refused without a record.
-    pub(crate) fn of_tree(dir: &std::path::Path, s: &crate::settings::Settings) -> Result<Option<MinusOne>> {
+    pub(crate) fn of_tree(dir: &std::path::Path) -> Result<Option<L1>> {
         match TreeFilter::read(dir)? {
-            None => anyhow::bail!("{}: no level -1 record (a tree from before records): its filter is unknown", dir.display()),
-            Some(TreeFilter::Off) => Ok(None),
-            Some(TreeFilter::MinusOne { m, table }) => {
-                anyhow::ensure!(
-                    m.table(s).fingerprint() == table,
-                    "{}: the level -1 table (S = {}) is not the one the tree was built under (fingerprint {:016x}, the tree's {table:016x})",
-                    dir.display(),
-                    m.speed,
-                    m.table(s).fingerprint()
-                );
-                Ok(Some(m))
-            }
+            None => anyhow::bail!("{}: no level -1 record: its filter is unknown", dir.display()),
+            Some(f) => f.l1(dir),
         }
     }
 
@@ -488,8 +472,9 @@ pub struct ForwardState<N: Rem = P8> {
     /// The first frame a lane won, if any so far.
     pub(crate) win_frame: Option<u32>,
     /// The filter the tree's frames were built under (`None`: no record;
-    /// such a tree is not extended).
+    /// such a tree is not extended), and its table (the tree's).
     pub(crate) filter: Option<TreeFilter>,
+    l1: Option<L1>,
 }
 
 pub struct ForwardResult {
@@ -521,16 +506,24 @@ impl<N: Rem> ForwardState<N> {
     /// with the start's hull; the tree is filtered by `minus_one` and
     /// widened at `level` (both recorded, with the settings `s`).
     pub(crate) fn start(initial: Vec<Rt2<N>>, dir: &std::path::Path, minus_one: Option<MinusOne>, level: crate::abstraction::Level, s: &crate::settings::Settings) -> Result<Self> {
-        // A fresh tree keeps nothing a killed run left (stale edge files).
+        // A fresh tree keeps nothing a killed run left (stale edge files, a
+        // table, a trust marker); of its record, only a ladder level's
+        // `filtered_for` (the driver's, written before).
         for sub in ["frames", "edges"] {
             let p = dir.join(sub);
             if p.exists() {
                 std::fs::remove_dir_all(&p).with_context(|| p.display().to_string())?;
             }
         }
-        let filter = TreeFilter::of(minus_one, s);
-        filter.write(dir)?;
+        let table = dir.join(crate::search::level_minus_one::TABLE_FILE);
+        if table.exists() {
+            std::fs::remove_file(&table).with_context(|| table.display().to_string())?;
+        }
+        let mut rec = crate::storage::record::Record::read(dir)?.unwrap_or_default();
+        rec.retain(|k| k == "filtered_for");
+        rec.write(dir)?;
         s.write(dir, level)?;
+        let (filter, l1) = TreeFilter::start(minus_one, dir, s)?;
         // The start has no player yet (`rem::start_point`'s premise):
         // `seed` keys it as it is, so a player's remainder would be stored
         // exact where every other state holds it widened, beside its hull.
@@ -540,9 +533,8 @@ impl<N: Rem> ForwardState<N> {
         let seeded = crate::storage::wave::seed(&mut visited, &initial, crate::search::rem::start_hull::<N>(), s)?;
         checkpoint(dir, 0, &seeded, &[], s, &mut Stats::default())?;
         let won = !seeded.wins.is_empty();
-        let edges_dir = dir.join("edges");
-        crate::storage::edges::set_done(&edges_dir, 0, 0)?;
-        Ok(ForwardState { frontier: seeded.frontier(), visited, xfers: Default::default(), edges: Default::default(), skeletons: Default::default(), persisted: Default::default(), frames: 0, win_frame: won.then_some(0), filter: Some(filter) })
+        crate::storage::record::set_done(dir, 0, 0)?;
+        Ok(ForwardState { frontier: seeded.frontier(), visited, xfers: Default::default(), edges: Default::default(), skeletons: Default::default(), persisted: Default::default(), frames: 0, win_frame: won.then_some(0), filter: Some(filter), l1 })
     }
 
     /// The forward as its checkpoint tree left it (`None`: no tree); extending
@@ -553,7 +545,7 @@ impl<N: Rem> ForwardState<N> {
         let t = std::time::Instant::now();
         // Trust only frames whose files are complete (at most one lost).
         let edges_dir = dir.join("edges");
-        let done = crate::storage::edges::done_frame(&edges_dir).unwrap_or(last);
+        let done = crate::storage::record::done_frame(dir).unwrap_or(last);
         if done < last {
             for f in done + 1..=last {
                 std::fs::remove_file(crate::storage::layer::frame_path(dir, f))?;
@@ -586,11 +578,15 @@ impl<N: Rem> ForwardState<N> {
         s.check(dir, level)?;
         let edges_dir = dir.join("edges");
         let filter = TreeFilter::read(dir)?;
+        let l1 = match filter {
+            Some(f) => f.l1(dir)?,
+            None => None,
+        };
         let (visited, win_frame, frontier, skeletons) = restore_visited::<N>(dir, last, s.room, s.threads())?;
         let persisted = skeletons.shapes().into_iter().collect();
-        let xfers = crate::storage::edges::XferTable::<N>::load(&edges_dir)?;
+        let xfers = crate::storage::edges::XferTable::<N>::load(dir)?;
         let edges = std::sync::Arc::new(crate::storage::edges::EdgeFiles::open(&edges_dir, last)?);
-        Ok(ForwardState { frontier, visited, xfers, edges, skeletons: std::sync::Arc::new(skeletons), persisted, frames: last, win_frame, filter })
+        Ok(ForwardState { frontier, visited, xfers, edges, skeletons: std::sync::Arc::new(skeletons), persisted, frames: last, win_frame, filter, l1 })
     }
 
     pub fn visited_len(&self) -> usize {
@@ -625,10 +621,8 @@ impl<N: Rem> ForwardState<N> {
     /// on a copy); the frame's stats.
     pub fn step(&mut self, engine: &dyn FrameStep<N>, edges_dir: Option<&std::path::Path>, ckpt: Option<&std::path::Path>, marks: Option<&MarkFilter<N>>) -> Result<Stats> {
         let (s, t) = (&engine.settings(), std::time::Instant::now());
-        let minus_one = match self.filter {
-            Some(f) => f.checked_minus_one(s)?,
-            None => anyhow::bail!("no level -1 record (a tree from before records): it cannot be extended (delete it)"),
-        };
+        anyhow::ensure!(self.filter.is_some(), "no level -1 record: the tree cannot be extended (delete it)");
+        let minus_one = self.l1;
         let (frame, ceiling) = (self.frames + 1, self.ceiling(s));
         let cx = crate::storage::wave::WaveCtx {
             visited: &mut self.visited,
@@ -672,7 +666,7 @@ impl<N: Rem> ForwardState<N> {
             let stats = self.step(engine, Some(&edges_dir), Some(dir), marks)?;
             let frame = self.frames;
             // The frame's LAST write: every file above is trusted from here.
-            crate::storage::edges::set_done(&edges_dir, frame, self.xfers.pairs.len())?;
+            crate::storage::record::set_done(dir, frame, self.xfers.pairs.len())?;
             std::sync::Arc::get_mut(&mut self.edges).ok_or_else(|| anyhow::anyhow!("the forward's edge files are shared"))?.add_frame(&edges_dir, frame)?;
             log_frame(dir, frame, &stats)?;
             ensure_disk_space(dir, &mut last_free)?;
@@ -712,7 +706,7 @@ pub fn grow_tree<N: Rem>(
     let complete = tree_first_win_through::<N>(dir, to)?;
     if crate::storage::layer::frame_exists(dir, 0) {
         match TreeFilter::read(dir)? {
-            None => anyhow::bail!("{}: the tree has no level -1 record (built before records): delete it", dir.display()),
+            None => anyhow::bail!("{}: the tree records no level -1 filter: delete it", dir.display()),
             Some(TreeFilter::Off) => {
                 if want.is_some() {
                     eprintln!("[forward] {}: the tree is not filtered by level -1; it stays unfiltered", dir.display());
@@ -1080,7 +1074,7 @@ impl Visited {
 
 /// The first win of a tree complete through `horizon`; `None` if it is not.
 pub(crate) fn tree_first_win_through<N: EngineNum>(dir: &std::path::Path, horizon: u32) -> Result<Option<Option<u32>>> {
-    let done = crate::storage::edges::done_frame(&dir.join("edges"));
+    let done = crate::storage::record::done_frame(dir);
     if done.is_none_or(|d| d < horizon) || !crate::storage::layer::frame_exists(dir, horizon) {
         return Ok(None);
     }
@@ -1255,24 +1249,28 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
-    /// A tree's level -1 record round-trips, and is absent (unknown) on an
-    /// old tree; a garbled one is an error.
+    /// A tree's level -1 line round-trips, and is absent (unknown) without
+    /// one; a garbled one is an error; a filtered tree without its table is
+    /// refused.
     #[test]
     fn a_trees_level_minus_one_record_round_trips() {
         let dir = std::env::temp_dir().join(format!("celeste-tree-filter-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
+        let set = |v: &str| crate::storage::record::update(&dir, TreeFilter::KEY, v).expect("write");
         assert_eq!(TreeFilter::read(&dir).expect("read"), None, "no record: unknown");
-        assert!(TreeFilter::of_tree(&dir, &Default::default()).is_err(), "a check refuses an unknown filter");
-        TreeFilter::Off.write(&dir).expect("write");
-        assert_eq!(TreeFilter::of_tree(&dir, &Default::default()).expect("off"), None, "a check of an unfiltered tree applies no level -1");
-        for f in [TreeFilter::Off, TreeFilter::MinusOne { m: MinusOne { h: 186, speed: 5 }, table: 0x0123_4567_89ab_cdef }] {
-            f.write(&dir).expect("write");
+        assert!(TreeFilter::of_tree(&dir).is_err(), "a check refuses an unknown filter");
+        set(&TreeFilter::Off.text());
+        assert!(TreeFilter::of_tree(&dir).expect("off").is_none(), "a check of an unfiltered tree applies no level -1");
+        let filtered = TreeFilter::MinusOne { m: MinusOne { h: 186, speed: 5 }, table: 0x0123_4567_89ab_cdef };
+        for f in [TreeFilter::Off, filtered] {
+            set(&f.text());
             assert_eq!(TreeFilter::read(&dir).expect("read"), Some(f));
         }
-        std::fs::write(dir.join("level_minus_one.txt"), "116\n").expect("write");
-        assert!(TreeFilter::read(&dir).is_err(), "a bare horizon (an old binary's record) is an error");
-        std::fs::write(dir.join("level_minus_one.txt"), "h 3 speed\n").expect("write");
-        assert!(TreeFilter::read(&dir).is_err(), "a garbled record is an error");
+        assert!(TreeFilter::of_tree(&dir).is_err(), "a filtered tree without its table is refused");
+        set("116");
+        assert!(TreeFilter::read(&dir).is_err(), "a bare horizon is an error");
+        set("h 3 speed");
+        assert!(TreeFilter::read(&dir).is_err(), "a garbled line is an error");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1345,11 +1343,12 @@ mod tests {
         ForwardState::start(init(), &a, None, level, &s).expect("start").extend(&e, &a, ends, None).expect("extend");
         let mut st = ForwardState::start(init(), &b, None, level, &s).expect("start");
         st.extend(&e, &b, ends - 1, None).expect("extend");
-        let marker = std::fs::read_to_string(b.join("edges/done.txt")).expect("done");
-        assert_eq!(marker, format!("{} xfers {}\n", ends - 1, st.xfers.pairs.len()));
+        let record = crate::storage::record::path(&b);
+        let marker = std::fs::read_to_string(&record).expect("the record");
+        assert_eq!(crate::storage::record::done(&b).expect("done"), Some(crate::storage::record::Done { frame: ends - 1, xfers: st.xfers.pairs.len() }));
         st.extend(&e, &b, ends, None).expect("extend");
         // Killed just before frame `ends`' marker.
-        std::fs::write(b.join("edges/done.txt"), &marker).expect("rewind the marker");
+        std::fs::write(&record, &marker).expect("rewind the marker");
         for d in [&a, &b] {
             assert!(!d.join("edges/xfer.len").exists(), "a second marker");
         }
@@ -1361,7 +1360,7 @@ mod tests {
             assert_eq!(keys(&a), keys(&b), "f{f}");
         }
         assert!(st.xfers.pairs.len() > 1, "transfers recorded");
-        for file in ["edges/done.txt", "edges/xfer.bin", "settings.txt"] {
+        for file in ["edges/xfer.bin", crate::storage::record::FILE] {
             assert_eq!(std::fs::read(a.join(file)).expect("a"), std::fs::read(b.join(file)).expect("b"), "{file}");
         }
         let _ = std::fs::remove_dir_all(&base);
@@ -1392,7 +1391,7 @@ mod tests {
             for to in 1..=4 {
                 st.extend(&e, dir, to, None).expect("extend");
                 assert_eq!(st.frames, to);
-                assert_eq!(crate::storage::edges::done_frame(&dir.join("edges")), Some(to), "frame {to} trusted");
+                assert_eq!(crate::storage::record::done_frame(dir), Some(to), "frame {to} trusted");
             }
         }
         let extended4 = keyset(4);

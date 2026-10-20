@@ -92,7 +92,7 @@ pub fn run(spec: &SearchSpec) -> Result<SearchResult> {
 fn tables(halves: &[&Settings], res: &mut SearchResult) -> bool {
     for s in halves {
         if let Some(m) = s.minus_one() {
-            if let Err(e) = m.try_table(s) {
+            if let Err(e) = m.table(s) {
                 let half = if halves.len() > 1 { format!("{}: ", s.arith) } else { String::new() };
                 res.error = Some(format!("{half}{e:#}"));
                 return false;
@@ -229,15 +229,15 @@ fn run_levels<N: KernelLanes>(
         let want = cfg.minus_one();
         let filter = prev.as_ref().map(|(m, l)| MarkFilter::new(m, *l, cfg.clock()));
         if let Some((m, _)) = &prev {
-            let key = format!("steps {steps} level-1 {want:?} marks {} {:016x}\n", m.len(), m.filter_fingerprint());
-            let key_path = dir.join("filtered_for.txt");
-            if std::fs::read_to_string(&key_path).ok().as_deref() != Some(key.as_str()) {
+            // The tree's record says what its forward was filtered for.
+            let key = format!("steps {steps} level-1 {want:?} marks {} {:016x}", m.len(), m.filter_fingerprint());
+            let have = crate::storage::record::Record::read(&dir).ok().flatten().and_then(|r| r.get("filtered_for").map(str::to_string));
+            if have.as_deref() != Some(key.as_str()) {
                 if dir.exists() {
                     eprintln!("[search] {}: filtered for other marks or another horizon: built again", dir.display());
                     std::fs::remove_dir_all(&dir)?;
                 }
-                std::fs::create_dir_all(&dir)?;
-                std::fs::write(&key_path, key)?;
+                crate::storage::record::update(&dir, "filtered_for", key)?;
             }
         }
         let engine = || -> Result<Box<dyn crate::frame::FrameStep<N>>> { Ok(Box::new(crate::compiled::Kernels::<N>::new(cfg, lvl)?)) };
@@ -413,7 +413,7 @@ pub(crate) fn solve<N: crate::compiled::KernelLanes>(
     let side = if keyed { Some(Side { w: &w, node: NodeKeys::new(&w, &shapes)?, keys: &space, level, s, seeded: s.concrete().1 }) } else { None };
     let known = match (known, &side) {
         (Some(route), Some(side)) => {
-            let minus_one = crate::frame::TreeFilter::of_tree(dir, s)?;
+            let minus_one = crate::frame::TreeFilter::of_tree(dir)?;
             // The hull forward's claim keys every step's state: whole frames only.
             if route.hulls && s.split_frame {
                 eprintln!("[known] the hull forward's claim is checked on whole frames only: not under --split-frame");

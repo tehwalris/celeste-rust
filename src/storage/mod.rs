@@ -1,7 +1,7 @@
 //! STORAGE (plans/architecture.md, "The forward: hulls and storage" and "The
 //! recorded graph"): the state set, the wave, and the tree's files in one
 //! container (`file`): frame (`layer`, with its frontier: `hulls`) and
-//! edge (`bundle`, `edges`) files.
+//! edge (`bundle`, `edges`) files; and its one text record (`record`).
 //!
 //! A state is `(shape, key, cell)` (`Sk`; the key holds no position:
 //! `exact::Code::pos`) everywhere: the edges, the frame files, the
@@ -16,6 +16,7 @@ pub mod edges;
 pub(crate) mod file;
 pub mod hulls;
 pub mod layer;
+pub(crate) mod record;
 pub(crate) mod route;
 pub(crate) mod set;
 pub(crate) mod scratch;
@@ -43,7 +44,7 @@ pub fn fingerprint<N: crate::search::rem::Rem>(dir: &std::path::Path, to: u32, e
         out.push(format!("f{frame:03} {n} {acc:016x}"));
     }
     if edges {
-        let eg = edges::EdgeStore::<N>::open(&dir.join("edges"), to)?;
+        let eg = edges::EdgeStore::<N>::open(&dir, to)?;
         let hashes = bench::EdgeHashes::new::<N>(eg.pairs());
         for frame in 1..=to {
             let (n, acc) = hashes.frame(&eg, frame, &content, &tree.shapes, threads)?;

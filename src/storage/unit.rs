@@ -634,7 +634,7 @@ impl<'a, N: Rem> UnitSink<'a, N> {
             xfers: Xfers::new(base, xfer_tab),
             routes: RouteIds::new(routes),
             pusher: Pusher::default(),
-            drops: Drops { l1: filters.minus_one.map(|m| (m.table(s), m.h)), last: None },
+            drops: Drops { l1: filters.minus_one.map(|m| (m.table, m.h)), last: None },
             verdicts: Verdicts { marks: filters.marks, of: Default::default(), bufs: Vec::new(), at: Vec::new(), disallowed: false },
             guards: Guards { key_check: s.diag.key_check, check: Vec::new(), noted: Default::default(), registered: Default::default(), guarded: Default::default(), reference: false, last_shape: 0 },
             bundles: UnitBundles::default(),

@@ -507,7 +507,7 @@ fn count_region<N: celeste_core::arith::EngineNum>(tree: &Tree<N>, rb: &RegionBl
 /// through `last`; sorted.
 fn sources_into<N: crate::search::rem::Rem>(dir: &Path, last: u32, regions: &[u32], threads: usize) -> Result<FxHashMap<u32, Vec<u32>>> {
     let geo = crate::storage::GEOMETRY;
-    let store = crate::storage::edges::EdgeStore::<N>::open(&dir.join("edges"), last)?;
+    let store = crate::storage::edges::EdgeStore::<N>::open(&dir, last)?;
     let frames: Vec<u32> = (1..=last).collect();
     let parts = crate::par::Pool::new(threads).map_with(
         frames.len(),

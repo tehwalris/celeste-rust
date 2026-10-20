@@ -21,7 +21,8 @@ use celeste_core::pico8_num::Pico8Num as P8;
 
 /// The global transfer table: every distinct pair the tree's edges carry,
 /// its id its position; `edges/xfer.bin` (`Rem::encode_pair` each), its
-/// trusted length in `done.txt` (pairs past it are a killed wave's).
+/// trusted length the tree record's trust marker's (`record::done`: pairs
+/// past it are a killed wave's).
 #[derive(Clone)]
 pub struct XferTable<N: Rem = P8> {
     pub(crate) pairs: Vec<N::Pair>,
@@ -92,8 +93,8 @@ fn xfer_path(dir: &Path) -> PathBuf {
 }
 
 impl<N: Rem> XferTable<N> {
-    /// The tree's table (`dir` = `<level>/edges`) as its done marker trusts
-    /// it; empty without one.
+    /// The tree's table (`dir`: the level's tree) as its trust marker
+    /// trusts it; empty without one.
     pub(crate) fn load(dir: &Path) -> Result<Self> {
         let pairs = Self::load_pairs(dir)?;
         let mut index = PairIndex::default();
@@ -105,12 +106,13 @@ impl<N: Rem> XferTable<N> {
 
     /// The pairs alone, as `load` reads them (no index: a big tree has ~4M).
     pub(crate) fn load_pairs(dir: &Path) -> Result<Vec<N::Pair>> {
-        let n = match read_done(dir)? {
+        let n = match super::record::done(dir)? {
             Some(d) => d.xfers,
             None => 0,
         };
-        let b = if n > 0 { std::fs::read(xfer_path(dir)).with_context(|| xfer_path(dir).display().to_string())? } else { Vec::new() };
-        ensure!(b.len() >= n * N::PAIR_BYTES, "{}: {} pairs, {} trusted", xfer_path(dir).display(), b.len() / N::PAIR_BYTES, n);
+        let p = xfer_path(&dir.join("edges"));
+        let b = if n > 0 { std::fs::read(&p).with_context(|| p.display().to_string())? } else { Vec::new() };
+        ensure!(b.len() >= n * N::PAIR_BYTES, "{}: {} pairs, {} trusted", p.display(), b.len() / N::PAIR_BYTES, n);
         Ok(b[..n * N::PAIR_BYTES].chunks_exact(N::PAIR_BYTES).map(N::decode_pair).collect())
     }
 
@@ -414,9 +416,10 @@ pub struct EdgeStore<N: Rem = P8> {
 }
 
 impl<N: Rem> EdgeStore<N> {
-    /// Map frames `1..=horizon`'s edge files under `dir` (`<level>/edges`).
+    /// Map frames `1..=horizon`'s edge files of the tree in `dir` (a
+    /// level's), its transfers as its record trusts them.
     pub fn open(dir: &Path, horizon: u32) -> Result<Self> {
-        let files = EdgeFiles::open(dir, horizon)?;
+        let files = EdgeFiles::open(&dir.join("edges"), horizon)?;
         let (mut edges, mut bytes) = (0u64, 0u64);
         for file in files.frames.iter().flatten() {
             edges += file.head.segs.iter().map(|s| s.edges).sum::<u64>();
@@ -540,45 +543,6 @@ impl<N: Rem> EdgeStore<N> {
     }
 }
 
-/// THE TREE'S ONE TRUST MARKER (`<level>/edges/done.txt`): the last frame
-/// whose files are all complete - its frame and edge files, both
-/// written before it - and the transfer table's trusted
-/// length. A frame past it is a killed run's (`resume` discards it).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct Done {
-    pub(crate) frame: u32,
-    pub(crate) xfers: usize,
-}
-
-fn read_done(dir: &Path) -> Result<Option<Done>> {
-    let p = dir.join("done.txt");
-    let s = match std::fs::read_to_string(&p) {
-        Ok(s) => s,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(e).with_context(|| p.display().to_string()),
-    };
-    let w: Vec<&str> = s.split_whitespace().collect();
-    let bad = || anyhow::anyhow!("{}: not a done marker: {s:?}", p.display());
-    match w[..] {
-        [frame, "xfers", n] => Ok(Some(Done { frame: frame.parse().map_err(|_| bad())?, xfers: n.parse().map_err(|_| bad())? })),
-        _ => Err(bad()),
-    }
-}
-
-/// The last frame whose files are complete; `None`: no marker.
-pub(crate) fn done_frame(dir: &Path) -> Option<u32> {
-    read_done(dir).ok().flatten().map(|d| d.frame)
-}
-
-/// Trust frame `frame` and the first `xfers` transfers: the frame's LAST write.
-pub(crate) fn set_done(dir: &Path, frame: u32, xfers: usize) -> Result<()> {
-    std::fs::create_dir_all(dir)?;
-    let tmp = dir.join("done.tmp");
-    std::fs::write(&tmp, format!("{frame} xfers {xfers}\n"))?;
-    std::fs::rename(&tmp, dir.join("done.txt"))?;
-    Ok(())
-}
-
 /// The frame an edge file's name is of (`f{frame}.bin`): the digits after
 /// the `f`, however many (the names pad to 3: `f1000.bin` is frame 1000).
 pub(crate) fn frame_of_name(name: &str) -> Option<u32> {
@@ -628,20 +592,22 @@ pub(crate) fn segments_of(edges: &[(Sk, Sk, u32)]) -> Result<(Vec<Segment>, Vec<
 }
 
 /// A tree's edge files from edges `(source, target, global transfer)` per
-/// frame and its transfer table `pairs` (the backward's tests).
+/// frame and its transfer table `pairs`, under the level's tree `dir`, its
+/// record trusting them (the backward's tests).
 #[cfg(test)]
 pub(crate) fn write_test_edges(dir: &Path, frames: &[(u32, Vec<(Sk, Sk, u32)>)], pairs: &[crate::search::arc_edges::Pair]) -> Result<()> {
+    let edges = dir.join("edges");
     let mut xt = XferTable::<P8>::default();
     xt.merge(&[pairs]);
-    xt.flush(dir)?;
+    xt.flush(&edges)?;
     ensure!(xt.pairs.len() == pairs.len(), "the test's transfer pairs are not distinct");
     let mut last = 0;
-    for (frame, edges) in frames {
-        let (segs, sources) = segments_of(edges)?;
-        write_file(&file_path(dir, *frame), *frame, segs, sources, None)?;
+    for (frame, es) in frames {
+        let (segs, sources) = segments_of(es)?;
+        write_file(&file_path(&edges, *frame), *frame, segs, sources, None)?;
         last = last.max(*frame);
     }
-    set_done(dir, last, pairs.len())
+    super::record::set_done(dir, last, pairs.len())
 }
 
 #[cfg(test)]
@@ -678,19 +644,19 @@ mod tests {
             let name = p.file_name().and_then(|s| s.to_str()).expect("a name");
             assert_eq!(frame_of_name(name), Some(frame), "{name}");
         }
-        for name in ["done.txt", "xfer.bin", "f.bin", "fx12.bin", "f12x.bin"] {
+        for name in ["xfer.bin", "f.bin", "fx12.bin", "f12x.bin"] {
             assert_eq!(frame_of_name(name), None, "{name}");
         }
         let dir = std::env::temp_dir().join(format!("celeste-edge-names-{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("tmp");
-        for f in ["f999.bin", "f1000.bin", "f1000.tmp", "f0998.bin", "done.txt"] {
+        for f in ["f999.bin", "f1000.bin", "f1000.tmp", "f0998.bin", "xfer.bin"] {
             std::fs::write(dir.join(f), b"").expect("write");
         }
         discard_after(&dir, 999).expect("discard");
         let mut left: Vec<String> = std::fs::read_dir(&dir).expect("ls").map(|e| e.expect("e").file_name().to_string_lossy().into_owned()).collect();
         left.sort();
         std::fs::remove_dir_all(&dir).expect("cleanup");
-        assert_eq!(left, ["done.txt", "f0998.bin", "f999.bin"]);
+        assert_eq!(left, ["f0998.bin", "f999.bin", "xfer.bin"]);
     }
 
     /// A frame's edges come back from its file: every edge by a scan, a

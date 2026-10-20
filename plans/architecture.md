@@ -302,7 +302,8 @@ ladder's filter applied, everything merged into the visited set
 (`absorb`). Then the FRAME FILE (`frames/f{F}.bin`, one a frame: per
 region the new entries' keys, masks and win masks; the frame's FRONTIER -
 the new states' hulls, the grown states with their layers and hulls; the
-shapes' skeletons), the edge file, and last `done.txt`. The frame
+shapes' skeletons), the edge file, and last the record's trust marker
+(`done`). The frame
 file is read back and compared with the forward's state (fatal on a
 difference). The DECODE GUARD checks a shape's first emitted row per
 worker and wave against its decode.
@@ -313,13 +314,16 @@ rerunning the same command. The result is a function of the frame, not of
 scheduling: every file is byte-identical at any thread count and over a
 resume.
 
-**Per-tree records**: `settings.txt` (the settings that change the tree,
-the level included; a run under others is refused, `--override-settings`
-passes only `--region`), `level_minus_one.txt` (the filter: `off` or H, S
-and the table's fingerprint; a tree serves horizons up to H and is never
-raised past it), `filtered_for.txt` (a ladder level's marks, horizon and
-filter), `forward.tsv` (per-frame stats), `done.txt` (the one trust
-marker: the frame and the transfer table's trusted length).
+**The tree's record** (`storage::record`, `<level>/tree.txt`, one
+`key value` line each, rewritten whole and atomically): the settings that
+change the tree, the level included (a run under others is refused,
+`--override-settings` passes only `--region`); `level_minus_one` (the
+filter: `off` or H, S and the table's fingerprint; a tree serves horizons
+up to H and is never raised past it; the TABLE itself is `l1-table.bin`
+beside it, which every reader and extension of the tree uses, whatever
+binary); `filtered_for` (a ladder level's marks, horizon and filter);
+`done` (the one trust marker: the frame and the transfer table's trusted
+length). Beside it, `forward.tsv` (per-frame stats).
 
 ## The recorded graph
 

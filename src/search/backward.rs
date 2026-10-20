@@ -1093,7 +1093,7 @@ impl<N: Rem> Seeds<N> {
                 wins.extend(file.wins()?.into_iter().map(|w| (w, f)));
             }
         }
-        let store = EdgeStore::<N>::open(&dir.join("edges"), horizon)?;
+        let store = EdgeStore::<N>::open(&dir, horizon)?;
         for f in 1..=horizon {
             let rows = tree.states(f);
             anyhow::ensure!(rows == 0 || store.has_frame(f), "{}: no edges for f{f}, which kept {rows} states", dir.display());

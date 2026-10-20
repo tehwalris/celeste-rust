@@ -42,7 +42,7 @@ exhaustive concrete search inside its winning sets. Its first concrete win is
 the optimum; the witness goes to <search-dir>/witness_frame_F.txt.
 
 THE SETTINGS are the flags below (Options), given anywhere on the line. A
-tree records the ones that change it (<level dir>/settings.txt) and refuses a
+tree records the ones that change it (<level dir>/tree.txt) and refuses a
 run under others; flags never default to the record. A command that reads a
 finished tree (ckhash, census, export-ui, check, bench) takes them
 from the tree's record instead, and refuses them on its command line.
@@ -461,7 +461,7 @@ fn main() -> Result<()> {
     let cli = Cli::from_arg_matches(&matches).unwrap_or_else(|e| e.exit());
     if cli.command.reads_trees() {
         let given = tree_flags_given(&matches);
-        anyhow::ensure!(given.is_empty(), "{}: this command reads a finished tree and takes its settings from the tree's records (settings.txt, level_minus_one.txt); give only the run's own (--threads, --l1-table, the diagnostics)", given.join(" "));
+        anyhow::ensure!(given.is_empty(), "{}: this command reads a finished tree and takes its settings from the tree's record (tree.txt); give only the run's own (--threads, the diagnostics)", given.join(" "));
     }
     // The commands that run in float (a tree's arithmetic is its record's).
     let float = cli.command.reads_trees() || matches!(cli.command, Command::Search(_) | Command::Forward(_) | Command::Robust(_) | Command::L1(_));

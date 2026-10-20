@@ -19,10 +19,10 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use std::path::{Path, PathBuf};
 
-/// The record's format: a tree without one, or with another, is refused
-/// where its settings are checked (tools/fixtures.sh rebuilds its fixtures
-/// on a change).
-pub const VERSION: u32 = 2;
+/// The tree record's format (`storage::record`): a tree without one, or
+/// with another, is refused where its settings are checked
+/// (tools/fixtures.sh rebuilds its fixtures on a change).
+pub const VERSION: u32 = 3;
 
 /// The game's arithmetic (`--arith`): 16.16, or the float tools' doubles
 /// with the tool (which decides the room's start and the seeds' meaning).
@@ -166,10 +166,6 @@ pub struct Settings {
     /// Worker threads (default: one per physical core).
     #[arg(long, global = true, value_parser = parse_threads)]
     pub threads: Option<usize>,
-    /// The level -1 table pinned by its FILE (read if it exists, else built
-    /// there): the fixtures', never a search's.
-    #[arg(long, global = true)]
-    pub l1_table: Option<PathBuf>,
     /// Use a tree recorded under other settings that do not change what it
     /// holds (only `--region`), under this run's; every difference is logged.
     /// Any other difference (room, win, split frame, category, loading jank,
@@ -265,7 +261,6 @@ impl Settings {
             row("level_minus_one", none(self.level_minus_one.map(|(h, s)| format!("{h},{s}"))), false),
             row("concrete_balloon_seeds", none(self.concrete_balloon_seeds.clone()), false),
             row("threads", none(self.threads.map(|t| t.to_string())), false),
-            row("l1_table", none(self.l1_table.as_ref().map(|p| p.display().to_string())), false),
             switch("override_settings", self.override_settings, false),
             switch("key_check", self.diag.key_check, false),
             switch("kernel_explain", self.diag.kernel_explain, false),
@@ -371,29 +366,29 @@ impl Settings {
         s.join(" ")
     }
 
-    fn text(&self, level: &str) -> String {
-        let mut s = format!("tree settings {VERSION}\n");
-        for (k, v) in self.recorded(level) {
-            s += &format!("{k} {v}\n");
-        }
-        s
-    }
-
-    /// Record these, for a tree widened at `level`, as the tree's (atomic).
+    /// Record these, for a tree widened at `level`, as the tree's: its
+    /// record's settings lines, the forward's lines kept (atomic).
     pub fn write(&self, dir: &Path, level: crate::abstraction::Level) -> Result<()> {
+        use crate::storage::record::{Record, TREE_KEYS};
         anyhow::ensure!(!self.seed_chests, "{}: a tree is never searched with its chests seeded (a witness replay's setting)", dir.display());
-        std::fs::create_dir_all(dir)?;
-        let tmp = dir.join("settings.tmp");
-        std::fs::write(&tmp, self.text(&level.to_string()))?;
-        std::fs::rename(&tmp, path(dir))?;
-        Ok(())
+        let mut rec = Record::read(dir)?.unwrap_or_default();
+        rec.retain(|k| TREE_KEYS.contains(&k));
+        let forward: Vec<(String, String)> = rec.lines().map(|(k, v)| (k.to_string(), v.to_string())).collect();
+        let mut rec = Record::default();
+        for (k, v) in self.recorded(&level.to_string()) {
+            rec.set(k, v);
+        }
+        for (k, v) in forward {
+            rec.set(&k, v);
+        }
+        rec.write(dir)
     }
 
     /// THE SETTINGS OF A FINISHED TREE, for a command that reads it: its
     /// record read back (each line its flag's text) and its level -1 filter
     /// (`frame::TreeFilter`), with the run's own settings from `run` (the
-    /// threads, `--l1-table`, the concrete phase's seeds, the diagnostics).
-    /// The tree's level with them.
+    /// threads, the concrete phase's seeds, the diagnostics). The tree's
+    /// level with them.
     pub fn of_tree(dir: &Path, run: &Settings) -> Result<(Settings, crate::abstraction::Level)> {
         let rec = read_record(dir)?;
         let mut args = vec!["tree".to_string()];
@@ -423,7 +418,6 @@ impl Settings {
             level_minus_one: minus_one,
             concrete_balloon_seeds: run.concrete_balloon_seeds.clone(),
             threads: run.threads,
-            l1_table: run.l1_table.clone(),
             override_settings: false,
             diag: run.diag.clone(),
             ..flags.s
@@ -444,7 +438,8 @@ impl Settings {
             .filter(|(k, v)| rec.get(k) != Some(&v.as_str()))
             .map(|(k, v)| (*k, format!("{k}: the tree's {}, this run's {v}", rec.get(k).copied().unwrap_or("(missing)"))))
             .collect();
-        diffs.extend(rec.keys().filter(|k| !mine.iter().any(|(m, _)| m == *k)).map(|k| (*k, format!("{k}: in the tree's record, not a setting"))));
+        let forward = |k: &str| crate::storage::record::TREE_KEYS.contains(&k);
+        diffs.extend(rec.keys().filter(|k| !forward(k) && !mine.iter().any(|(m, _)| m == *k)).map(|k| (*k, format!("{k}: in the tree's record, not a setting"))));
         if diffs.is_empty() {
             return Ok(());
         }
@@ -473,22 +468,10 @@ pub fn tree_keys() -> Vec<&'static str> {
     Settings::default().rows().into_iter().filter(|r| r.recorded).map(|r| r.key).chain(["level_minus_one"]).collect()
 }
 
-/// A tree's record (`settings.txt`): its lines, `key value`, by key.
+/// A tree's record (`storage::record`): its lines, `key value`, by key.
 fn read_record(dir: &Path) -> Result<std::collections::BTreeMap<String, String>> {
-    let p = path(dir);
-    let recorded = match std::fs::read_to_string(&p) {
-        Ok(s) => s,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => anyhow::bail!(
-            "{}: the tree records no settings (built before {}): its room, category, split frame, regions and level are unknown - delete it",
-            dir.display(),
-            p.display()
-        ),
-        Err(e) => return Err(e).with_context(|| p.display().to_string()),
-    };
-    let mut rec = recorded.lines();
-    let head = rec.next().unwrap_or("");
-    anyhow::ensure!(head == format!("tree settings {VERSION}"), "{}: {head:?} is not a settings record of format {VERSION}", p.display());
-    Ok(rec.filter_map(|l| l.split_once(' ')).map(|(k, v)| (k.to_string(), v.to_string())).collect())
+    let rec = crate::storage::record::Record::of(dir)?;
+    Ok(rec.lines().map(|(k, v)| (k.to_string(), v.to_string())).collect())
 }
 
 /// The recorded settings `--override-settings` may override: those that do
@@ -500,8 +483,8 @@ fn read_record(dir: &Path) -> Result<std::collections::BTreeMap<String, String>>
 pub const OVERRIDABLE: &[&str] = &["region"];
 
 /// The record's file in a level's tree.
-pub fn path(dir: &Path) -> PathBuf {
-    dir.join("settings.txt")
+fn path(dir: &Path) -> PathBuf {
+    crate::storage::record::path(dir)
 }
 
 /// The arithmetic the tree in `dir` was built in (its record's `arith`
@@ -779,7 +762,7 @@ mod tests {
         for s in [Settings { threads: Some(3), ..run.clone() }, all, float] {
             let _ = std::fs::remove_dir_all(&dir);
             s.write(&dir, lvl).expect("write");
-            std::fs::write(dir.join("level_minus_one.txt"), "off\n").expect("the filter's record");
+            crate::storage::record::update(&dir, "level_minus_one", "off").expect("the filter's record");
             let (back, level) = Settings::of_tree(&dir, &run).expect("read back");
             assert_eq!((back, level), (s, lvl));
         }
@@ -789,8 +772,8 @@ mod tests {
         assert_eq!(split.minus_one().map(|m| (m.h, m.speed)), Some((168, 5)));
         let _ = std::fs::remove_dir_all(&dir);
         split.write(&dir, lvl).expect("write");
-        for (record, back) in [("h 168 speed 5 table 0\n", Ok(Some((84, 5)))), ("h 167 speed 5 table 0\n", Err("no whole frame"))] {
-            std::fs::write(dir.join("level_minus_one.txt"), record).expect("the filter's record");
+        for (record, back) in [("h 168 speed 5 table 0", Ok(Some((84, 5)))), ("h 167 speed 5 table 0", Err("no whole frame"))] {
+            crate::storage::record::update(&dir, "level_minus_one", record).expect("the filter's record");
             match (Settings::of_tree(&dir, &run), back) {
                 (Ok((s, _)), Ok(want)) => assert_eq!(s.level_minus_one, want),
                 (Err(e), Err(why)) => assert!(e.to_string().contains(why), "{e}"),
@@ -827,8 +810,8 @@ mod tests {
         let lvl = |l: &str| crate::abstraction::Level::parse(l).expect("a level");
         let sample = Settings { room: (6, 2), category: Category::Hundred, loading_jank: Some(2), ..Settings::default() };
         let e = sample.check(&dir, lvl("r0sxhf")).expect_err("no record");
-        assert!(e.to_string().contains("records no settings"), "{e}");
-        std::fs::write(path(&dir), sample.text("r0sxhf")).expect("write");
+        assert!(e.to_string().contains("has no record"), "{e}");
+        sample.write(&dir, lvl("r0sxhf")).expect("write");
         sample.check(&dir, lvl("r0sxhf")).expect("the same settings");
         let harmless = Settings { threads: Some(3), level_minus_one: Some((94, 5)), diag: Diagnostics { key_check: true, ..Default::default() }, ..sample.clone() };
         harmless.check(&dir, lvl("r0sxhf")).expect("threads, level -1 and diagnostics are not a tree's settings");
@@ -840,16 +823,16 @@ mod tests {
         assert!(!e.contains("room:"), "{e}");
         // The arithmetic: a fixed record has no line for it; either way
         // across is refused.
-        assert!(!sample.text("r0sxhf").contains("arith"));
+        assert!(!sample.recorded("r0sxhf").iter().any(|(k, _)| *k == "arith"));
         let float = Settings { arith: Arith::Float(FloatTool::Uct), ..sample.clone() };
         let e = float.check(&dir, lvl("r0sxhf")).expect_err("a float run on a fixed tree").to_string();
         assert!(e.contains("arith: the tree's (missing), this run's float-uct"), "{e}");
-        std::fs::write(path(&dir), float.text("r0sxhf")).expect("write");
+        float.write(&dir, lvl("r0sxhf")).expect("write");
         let e = sample.check(&dir, lvl("r0sxhf")).expect_err("a fixed run on a float tree").to_string();
         assert!(e.contains("arith: in the tree's record"), "{e}");
         // A reader that is not the run (the UI export) reads it back.
         assert_eq!(recorded_arith(&dir).expect("a record"), Arith::Float(FloatTool::Uct));
-        std::fs::write(path(&dir), sample.text("r0sxhf")).expect("write");
+        sample.write(&dir, lvl("r0sxhf")).expect("write");
         assert_eq!(recorded_arith(&dir).expect("a record"), Arith::Fixed);
         // `--override-settings`: only the region grid, and only with the flag.
         let grid = Settings { region: None, ..sample.clone() };
@@ -859,7 +842,7 @@ mod tests {
         let e = Settings { override_settings: true, category: Category::Any, ..grid }.check(&dir, lvl("r0sxhf")).expect_err("a category is not overridable").to_string();
         assert!(e.contains("category: the tree's 100, this run's any") && e.contains("region:"), "{e}");
         // A line that is no setting is refused.
-        std::fs::write(path(&dir), format!("{}storage_region 8\n", sample.text("r0sxhf"))).expect("write");
+        crate::storage::record::update(&dir, "storage_region", "8").expect("write");
         let e = sample.check(&dir, lvl("r0sxhf")).expect_err("an unknown line").to_string();
         assert!(e.contains("storage_region: in the tree's record, not a setting"), "{e}");
         let _ = std::fs::remove_dir_all(&dir);

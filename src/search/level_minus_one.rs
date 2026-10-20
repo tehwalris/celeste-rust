@@ -978,15 +978,18 @@ impl CostToGo {
         self.d.len()
     }
 
-    /// A hash of every entry and the start's d (equal hashes filter alike).
+    /// A hash of every entry and the start's d (equal hashes filter alike):
+    /// `mix64` folded over the start's d and the entries in order, stable
+    /// across builds and toolchains (a tree records it).
     pub fn fingerprint(&self) -> u64 {
-        use std::hash::{Hash, Hasher};
-        let mut es: Vec<(&(u64, i16, i16), &u32)> = self.d.iter().collect();
+        fingerprint_of(self.start_d, &self.entries())
+    }
+
+    /// Its entries `(shape hash, x, y, d)`, sorted.
+    fn entries(&self) -> Vec<(u64, i16, i16, u32)> {
+        let mut es: Vec<(u64, i16, i16, u32)> = self.d.iter().map(|(&(h, x, y), &v)| (h, x, y, v)).collect();
         es.sort_unstable();
-        let mut h = std::collections::hash_map::DefaultHasher::new();
-        self.start_d.hash(&mut h);
-        es.hash(&mut h);
-        h.finish()
+        es
     }
 
     /// Is a row provably unable to exit by `horizon`? Only table nodes are
@@ -1028,9 +1031,9 @@ impl CostToGo {
 /// builder: built or read from `cache_file` once per process and key, on a
 /// big-stack thread; leaked (a process holds 1-2).
 pub fn table(speed: i32, s: &crate::settings::Settings) -> Result<&'static CostToGo> {
-    type Key = (String, Option<PathBuf>, i32);
+    type Key = (String, i32);
     static TABLES: std::sync::Mutex<Vec<(Key, &'static CostToGo)>> = std::sync::Mutex::new(Vec::new());
-    let key: Key = (s.cart_key(), s.l1_table.clone(), speed);
+    let key: Key = (s.cart_key(), speed);
     let mut tables = TABLES.lock().unwrap();
     if let Some((_, t)) = tables.iter().find(|(k, _)| *k == key) {
         return Ok(t);
@@ -1079,26 +1082,61 @@ fn cost_to_go(spd_px: i32, threads: usize, s: &crate::settings::Settings) -> Res
         }
     }
     let t = CostToGo { d, start_d: b.start_d };
-    match t.save(&path, &key) {
+    match t.save(&path).and_then(|()| Ok(std::fs::write(path.with_extension("txt"), &key)?)) {
         Ok(()) => eprintln!("[level -1] table cached at {}", path.display()),
         Err(e) => eprintln!("[level -1] could not cache the table at {} ({e:#})", path.display()),
     }
     Ok(t)
 }
 
-/// The table cache's format; bump it when what a file holds changes.
-const CACHE_FORMAT: u32 = 1;
+/// The table cache's format (its names' key; a file's own format is the
+/// container's: `storage::file`); bump it when what a file holds changes.
+const CACHE_FORMAT: u32 = 2;
+
+/// A tree's own table, beside its record (`TreeFilter`): the table its
+/// frames were filtered by, whatever binary extends or reads the tree.
+pub(crate) const TABLE_FILE: &str = "l1-table.bin";
+
+/// The table files' magic (`storage::file`).
+const MAGIC: &[u8; 4] = b"C8L1";
+
+/// A table file's header: the start's d, the entries sorted, the
+/// fingerprint (`CostToGo::fingerprint`).
+#[derive(serde::Serialize, serde::Deserialize)]
+struct TableHead {
+    start_d: u32,
+    entries: Vec<(u64, i16, i16, u32)>,
+    fingerprint: u64,
+}
+
+fn fingerprint_of(start_d: u32, entries: &[(u64, i16, i16, u32)]) -> u64 {
+    use celeste_engine::runtime2::mix64;
+    entries.iter().fold(mix64(start_d as u64 ^ (entries.len() as u64) << 32), |h, &(s, x, y, d)| mix64(mix64(h ^ s) ^ (x as u16 as u64) << 48 ^ (y as u16 as u64) << 32 ^ d as u64))
+}
+
+/// The tree `dir`'s own table (`TABLE_FILE`), its fingerprint `fp` (the
+/// tree record's) checked; once per process and table.
+pub(crate) fn tree_table(dir: &FsPath, fp: u64) -> Result<&'static CostToGo> {
+    static TABLES: std::sync::Mutex<Vec<(u64, &'static CostToGo)>> = std::sync::Mutex::new(Vec::new());
+    let mut tables = TABLES.lock().unwrap();
+    if let Some((_, t)) = tables.iter().find(|(f, _)| *f == fp) {
+        return Ok(t);
+    }
+    let path = dir.join(TABLE_FILE);
+    let t = CostToGo::load(&path)?.ok_or_else(|| anyhow!("{}: the tree is filtered by level -1 (table {fp:016x}) but holds no table", path.display()))?;
+    ensure!(t.fingerprint() == fp, "{}: the table's fingerprint {:016x} is not the tree's {fp:016x}", path.display(), t.fingerprint());
+    eprintln!("[level -1] the tree's table: {} ({} entries)", path.display(), t.d.len());
+    let t: &'static CostToGo = Box::leak(Box::new(t));
+    tables.push((fp, t));
+    Ok(t)
+}
 
 /// The cache file under /var/tmp/celeste-l1-cache, keyed on what the table
 /// is a function of: the binary (its code and the game it embeds), the
 /// cart's sources under the settings (`trace::cart::sources`), `spd_px`
-/// and `Settings::cart_key`. `--l1-table FILE`: THAT file, whatever the
-/// binary (a fixture's pinned table; never a search's).
+/// and `Settings::cart_key`.
 fn cache_file(spd_px: i32, s: &crate::settings::Settings) -> Result<(PathBuf, String)> {
     use std::hash::{Hash, Hasher};
-    if let Some(f) = &s.l1_table {
-        return Ok((f.clone(), format!("level -1 table pinned by --l1-table, format {CACHE_FORMAT}, S = {spd_px}\n")));
-    }
     let dir = PathBuf::from("/var/tmp/celeste-l1-cache");
     let exe = std::env::current_exe()?;
     let exe_bytes = std::fs::read(&exe).map_err(|e| anyhow!("reading this binary {}: {e}", exe.display()))?;
@@ -1122,62 +1160,36 @@ fn cache_file(spd_px: i32, s: &crate::settings::Settings) -> Result<(PathBuf, St
 }
 
 impl CostToGo {
-    /// The cached table at `path`, `None` when there is none.
+    /// The table at `path`, `None` when there is none.
     fn load(path: &FsPath) -> Result<Option<CostToGo>> {
-        let b = match std::fs::read(path) {
-            Ok(b) => b,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(e) => return Err(e.into()),
-        };
-        let mut at = 0usize;
-        let mut take = |n: usize| -> Result<&[u8]> {
-            let s = b.get(at..at + n).ok_or_else(|| anyhow!("truncated"))?;
-            at += n;
-            Ok(s)
-        };
-        ensure!(take(4)? == b"CL1T", "not a level -1 table");
-        let u32_of = |s: &[u8]| u32::from_le_bytes(s.try_into().unwrap());
-        let u64_of = |s: &[u8]| u64::from_le_bytes(s.try_into().unwrap());
-        ensure!(u32_of(take(4)?) == CACHE_FORMAT, "another format");
-        let start_d = u32_of(take(4)?);
-        let n = u64_of(take(8)?) as usize;
-        let mut d = rustc_hash::FxHashMap::with_capacity_and_hasher(n, Default::default());
-        for _ in 0..n {
-            let e = take(16)?;
-            let (h, x, y, v) = (u64_of(&e[0..8]), i16::from_le_bytes([e[8], e[9]]), i16::from_le_bytes([e[10], e[11]]), u32_of(&e[12..16]));
-            d.insert((h, x, y), v);
+        if !path.exists() {
+            return Ok(None);
         }
-        let fp = u64_of(take(8)?);
-        ensure!(at == b.len(), "trailing bytes");
-        let t = CostToGo { d, start_d };
-        ensure!(t.fingerprint() == fp, "the fingerprint does not match the entries");
-        Ok(Some(t))
+        let m = crate::storage::file::Mapped::open(path, *MAGIC, crate::storage::file::FORMAT_VERSION, "a level -1 table")?;
+        m.ends_at(0)?;
+        let h: TableHead = m.header()?;
+        ensure!(h.entries.windows(2).all(|w| w[0] < w[1]), "{}: the entries are not sorted", path.display());
+        ensure!(fingerprint_of(h.start_d, &h.entries) == h.fingerprint, "{}: the fingerprint does not match the entries", path.display());
+        let d = h.entries.iter().map(|&(s, x, y, v)| ((s, x, y), v)).collect();
+        Ok(Some(CostToGo { d, start_d: h.start_d }))
     }
 
-    /// Write the table to `path` atomically, with `key` beside it as text.
-    fn save(&self, path: &FsPath, key: &str) -> Result<()> {
-        if let Some(dir) = path.parent() {
-            std::fs::create_dir_all(dir)?;
-        }
-        let mut es: Vec<(&(u64, i16, i16), &u32)> = self.d.iter().collect();
-        es.sort_unstable();
-        let mut b: Vec<u8> = Vec::with_capacity(28 + 16 * es.len());
-        b.extend(b"CL1T");
-        b.extend(CACHE_FORMAT.to_le_bytes());
-        b.extend(self.start_d.to_le_bytes());
-        b.extend((es.len() as u64).to_le_bytes());
-        for ((h, x, y), v) in es {
-            b.extend(h.to_le_bytes());
-            b.extend(x.to_le_bytes());
-            b.extend(y.to_le_bytes());
-            b.extend(v.to_le_bytes());
-        }
-        b.extend(self.fingerprint().to_le_bytes());
-        let tmp = path.with_extension(format!("tmp{}", std::process::id()));
-        std::fs::write(&tmp, &b)?;
-        std::fs::rename(&tmp, path)?;
-        std::fs::write(path.with_extension("txt"), key)?;
+    /// Write the table to `path`, atomically even beside another process
+    /// writing the same cache file (through a name of its own).
+    fn save(&self, path: &FsPath) -> Result<()> {
+        let entries = self.entries();
+        let head = TableHead { start_d: self.start_d, fingerprint: fingerprint_of(self.start_d, &entries), entries };
+        let mut own = path.as_os_str().to_owned();
+        own.push(format!(".{}", std::process::id()));
+        let own = PathBuf::from(own);
+        crate::storage::file::write(&own, *MAGIC, crate::storage::file::FORMAT_VERSION, &head, |_| Ok(()))?;
+        std::fs::rename(&own, path)?;
         Ok(())
+    }
+
+    /// Save it as the tree `dir`'s own (`TABLE_FILE`).
+    pub(crate) fn save_in(&self, dir: &FsPath) -> Result<()> {
+        self.save(&dir.join(TABLE_FILE))
     }
 }
 
@@ -2072,8 +2084,8 @@ pub fn probe(opts: &Opts, s: &crate::settings::Settings) -> Result<String> {
 /// Every recorded edge of the tree in `dir` (through its last trusted
 /// frame) as a `(source cell, target cell)` pair, once.
 fn recorded_cell_pairs<N: crate::search::rem::Rem>(dir: &FsPath, threads: usize) -> Result<Vec<(u32, u32)>> {
-    let last = crate::storage::edges::done_frame(&dir.join("edges")).ok_or_else(|| anyhow!("{}: no finished frame", dir.display()))?;
-    let store = crate::storage::edges::EdgeStore::<N>::open(&dir.join("edges"), last)?;
+    let last = crate::storage::record::done_frame(dir).ok_or_else(|| anyhow!("{}: no finished frame", dir.display()))?;
+    let store = crate::storage::edges::EdgeStore::<N>::open(&dir, last)?;
     let mut all: rustc_hash::FxHashSet<(u32, u32)> = Default::default();
     for f in 1..=last {
         all.extend(store.cell_pairs(f, threads)?);
@@ -2187,6 +2199,26 @@ fn compare_with_tree<N: EngineNum>(opts: &Opts, by_hash: &HashMap<u64, usize>, g
 mod tests {
     use super::*;
     use celeste_core::pico8_num::{Pico8Num as P8, Pico8NumInterval};
+
+    /// A table saved in a tree reads back as the tree's (its fingerprint
+    /// checked against the record's); its fingerprint is a fixed function
+    /// of its entries (pinned: a tree records it, and a toolchain's hasher
+    /// must not move it).
+    #[test]
+    fn a_trees_table_reads_back_under_its_fingerprint() {
+        let dir = std::env::temp_dir().join(format!("celeste-l1-tree-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let d: rustc_hash::FxHashMap<(u64, i16, i16), u32> = [((7, 3, -4), 12), ((7, 3, 5), u32::MAX), ((0x9e37_79b9_7f4a_7c15, -16, 140), 0)].into_iter().collect();
+        let t = CostToGo { d: d.clone(), start_d: 49 };
+        assert_eq!(t.fingerprint(), 0x8475_2014_f2ed_1e20);
+        assert_ne!(CostToGo { d, start_d: 48 }.fingerprint(), t.fingerprint(), "the start's d counts");
+        assert!(tree_table(&dir, t.fingerprint()).is_err(), "no table in the tree");
+        t.save_in(&dir).expect("save");
+        assert!(tree_table(&dir, t.fingerprint() ^ 1).is_err(), "another fingerprint than the record's");
+        let back = tree_table(&dir, t.fingerprint()).expect("the tree's table");
+        assert_eq!((&back.d, back.start_d), (&t.d, t.start_d));
+        std::fs::remove_dir_all(&dir).expect("clean up");
+    }
 
     fn num(lo: i32, hi: i32) -> Val {
         Val::Num(Pico8NumInterval::new(P8::from_raw(lo), P8::from_raw(hi)))

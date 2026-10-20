@@ -751,11 +751,8 @@ pub(crate) fn run_wave<N: Rem>(engine: &dyn FrameStep<N>, front: Frontier<N>, cx
     ensure!(edges.is_some() || front.old.is_empty(), "frame {frame}: old states to re-push without the tree's edge files");
     let t_warm = Instant::now();
     engine.warm();
-    if let Some(m) = filters.minus_one {
-        let _ = m.table(s);
-    }
     if t_warm.elapsed().as_secs_f64() > 0.5 {
-        eprintln!("[warm] f{frame}: engine and level -1 table built in {:.1} s, before the wave", t_warm.elapsed().as_secs_f64());
+        eprintln!("[warm] f{frame}: engine built in {:.1} s, before the wave", t_warm.elapsed().as_secs_f64());
     }
     // What the last frame's end and checkpoint freed back to the OS before
     // the wave's threads (new heaps) allocate: kept, it adds to the peak.

@@ -138,20 +138,20 @@ t0() {
 frame() {
     local name=$1 f=$2 m=()
     [[ ${3:-} == --metrics ]] && m=(--metrics "$G/$name.metrics")
-    ./safe-run.sh --memory "$MEM" -- "$B" bench frame --tree "$F/$name" --step "$f" --edges --checkpoint --threads "$TH" --expect "$G/$name.frame" "${m[@]}" $PIN --l1-table "$F/$name/l1-table.bin" > "$C/$name.frame"
+    ./safe-run.sh --memory "$MEM" -- "$B" bench frame --tree "$F/$name" --step "$f" --edges --checkpoint --threads "$TH" --expect "$G/$name.frame" "${m[@]}" $PIN > "$C/$name.frame"
 }
 
 # keycheck NAME STEP: the step's rows' keys recomputed (--key-check), and
 # the pinned f/h/e lines.
 keycheck() {
     local name=$1 f=$2
-    ./safe-run.sh --memory "$MEM" -- "$B" bench frame --tree "$F/$name" --step "$f" --edges --threads "$TH" --key-check --expect "$G/$name.frame" --l1-table "$F/$name/l1-table.bin" > "$C/keycheck-$name.frame"
+    ./safe-run.sh --memory "$MEM" -- "$B" bench frame --tree "$F/$name" --step "$f" --edges --threads "$TH" --key-check --expect "$G/$name.frame" > "$C/keycheck-$name.frame"
 }
 
 # widencheck NAME FRAME: `rewrite check widen` of a fixture's frame (the
 # stored rows, and 64 rows' emissions).
 widencheck() {
-    ./safe-run.sh --memory "$MEM" -- "$B" check widen --tree "$F/$1" --step "$2" --emitted 64 --l1-table "$F/$1/l1-table.bin"
+    ./safe-run.sh --memory "$MEM" -- "$B" check widen --tree "$F/$1" --step "$2" --emitted 64
 }
 
 # refcheck NAME FRAME: the kernels against the reference engine, 32
@@ -386,7 +386,7 @@ perfcount() {
     local n i1 i3 rep pin
     rm -f "$C/perf-$name.line"
     for n in 1 3; do
-        ./safe-run.sh --memory "$MEM" -- perf stat -x, -e instructions:u -o "$C/perf-$name-$n.stat" -- "$RB" bench frame --tree "$F/$name" --step "$f" --edges --threads 16 --expect "$G/$name.frame" --l1-table "$F/$name/l1-table.bin" --reps "$n" > "$C/perf-$name-$n.frame" || return 1
+        ./safe-run.sh --memory "$MEM" -- perf stat -x, -e instructions:u -o "$C/perf-$name-$n.stat" -- "$RB" bench frame --tree "$F/$name" --step "$f" --edges --threads 16 --expect "$G/$name.frame" --reps "$n" > "$C/perf-$name-$n.frame" || return 1
     done
     i1=$(awk -F, '$3 ~ /^instructions/ {print $1}' "$C/perf-$name-1.stat")
     i3=$(awk -F, '$3 ~ /^instructions/ {print $1}' "$C/perf-$name-3.stat")

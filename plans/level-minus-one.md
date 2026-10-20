@@ -56,11 +56,13 @@ fruit only weakens d).
   on an in-room row outside it.
 - **Only table nodes are refused**: a row without a player cell, outside
   the room, or of a shape or cell the table never reached is kept.
-- **A tree remembers its filter** (`<level>/level_minus_one.txt`: H, S and
-  the table's fingerprint): a search refuses a horizon past H, a tree is
-  extended only under its own filter, and a larger horizon builds the tree
-  again (a dropped push leaves hulls smaller and states later, so the
-  frames depend on H throughout).
+- **A tree remembers its filter** (its record's `level_minus_one` line: H,
+  S and the table's fingerprint) **and holds its table**
+  (`<level>/l1-table.bin`): a search refuses a horizon past H, a tree is
+  extended and checked only under its own filter and table (whatever
+  binary), and a larger horizon builds the tree again (a dropped push
+  leaves hulls smaller and states later, so the frames depend on H
+  throughout).
 - 100% (`--category 100`, `gemskip100`): an exit that certainly leaves
   the berry behind has no successor in the table.
 

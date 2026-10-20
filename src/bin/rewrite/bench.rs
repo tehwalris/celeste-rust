@@ -177,8 +177,8 @@ where
         } else {
             &mut st
         };
-        let ckpt = scratch.join("ckpt");
-        let stats = s.step(&engine, edges.then_some(scratch), checkpoint.then_some(ckpt.as_path()), None)?;
+        let (ckpt, edges_dir) = (scratch.join("ckpt"), scratch.join("edges"));
+        let stats = s.step(&engine, edges.then_some(edges_dir.as_path()), checkpoint.then_some(ckpt.as_path()), None)?;
         let t_all = t.elapsed();
         let counts = counters.as_ref().zip(at).map(|(c, at)| c.stop(at));
         eprintln!("[bench] rep {rep}: {} | rep {:.0} ms", stats.line(), ms(t_all));
