@@ -49,7 +49,7 @@ export BIN=$B
 # unit (the quick profile's 16 units re-partition on unrelated edits, which
 # moves a frame's instructions by 2-3%).
 RB=$T/release/rewrite
-F=${CELESTE_FIXTURES:-/var/tmp/celeste-fixtures}
+F=${CELESTE_FIXTURES:-$(tools/fixtures.sh root)}
 G=gates/fixtures
 C=${CHECK_DIR:-/var/tmp/celeste-check-${PWD##*/}-$(printf %s "$PWD" | sha1sum | cut -c1-8)}
 TH=${THREADS:-16}

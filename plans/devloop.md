@@ -212,8 +212,10 @@ For a profile, `perf record -g -m 8 -- rewrite bench frame ...`:
 ## The fixtures
 
 `tools/fixtures.sh ensure|build|pin|verify|list NAME...` (`all`, `big`).
-The trees live under `/var/tmp/celeste-fixtures` (`CELESTE_FIXTURES`) and
-are never committed.
+The trees live under `/var/tmp/celeste-fixtures/FORMATS` (one directory per
+file-format set, `tools/fixtures.sh root`; `CELESTE_FIXTURES` overrides), so
+checkouts on different formats never rebuild each other's fixtures; they are
+never committed.
 
 - Each is built by a pinned command and checked against its pinned
   fingerprint (`gates/fixtures/NAME.ckhash`: `ckhash --edges --hulls`

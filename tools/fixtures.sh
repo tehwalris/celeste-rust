@@ -1,7 +1,9 @@
 #!/bin/bash
 # THE FIXTURES of the check ladder (plans/devloop.md "The fixtures"): small
 # trees at known frames under $CELESTE_FIXTURES (default
-# /var/tmp/celeste-fixtures, never committed), each built by a pinned
+# /var/tmp/celeste-fixtures/FORMATS, one directory per file-format set, so
+# checkouts on different formats never rebuild each other's; never
+# committed), each built by a pinned
 # command and checked against its pinned fingerprint
 # (gates/fixtures/NAME.ckhash: `ckhash --edges --hulls` through its last
 # frame). A fixture is an INPUT: the frame checks run one frame from it.
@@ -16,6 +18,7 @@
 #   tools/fixtures.sh verify NAME...   rebuild beside it and check the pin
 #                                      (./check.sh fixtures: all big)
 #   tools/fixtures.sh list
+#   tools/fixtures.sh root             the default fixtures directory
 #
 # A level -1 fixture holds the table it was built under, as every filtered
 # tree does (NAME/l1-table.bin, beside its record): a frame check reads the
@@ -24,7 +27,6 @@
 # Env: BIN (default $CARGO_TARGET_DIR/quick/rewrite), CELESTE_FIXTURES.
 set -euo pipefail
 cd "$(dirname "$0")/.."
-ROOT=${CELESTE_FIXTURES:-/var/tmp/celeste-fixtures}
 B=${BIN:-${CARGO_TARGET_DIR:-./target}/quick/rewrite}
 PINS=gates/fixtures
 # Every build's memory cap (safe-run.sh), as check.sh's.
@@ -77,6 +79,10 @@ BIG="r62h57"
 formats() {
     echo "checkpoint $(grep -o 'FORMAT_VERSION: u32 = [0-9]*' src/storage/file.rs | grep -o '[0-9]*$') edges $(grep -o '^const VERSION: u32 = [0-9]*' src/storage/edges.rs | grep -o '[0-9]*$') settings $(grep -o '^pub const VERSION: u32 = [0-9]*' src/settings.rs | grep -o '[0-9]*$') xfers gather"
 }
+# The default root: one directory per file-format set.
+fmt_tag() { formats | awk '{printf "c%s-e%s-s%s", $2, $4, $6}'; }
+ROOT=${CELESTE_FIXTURES:-/var/tmp/celeste-fixtures/$(fmt_tag)}
+
 sources() {
     { git ls-files -s src crates lua cart Cargo.lock; git diff HEAD -- src crates lua cart Cargo.lock; } | sha1sum | cut -c1-16
 }
@@ -177,6 +183,7 @@ case ${1:-} in
             esac
         done
         ;;
+    root) echo "$ROOT" ;;
     list)
         for n in $ALL $BIG; do
             spec "$n"
