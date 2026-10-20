@@ -433,7 +433,7 @@ fn worker<N: Rem>(sh: &Shared<N>, sink: &mut UnitSink<N>, sc: &mut super::route:
                     run_unit(sh.engine, u as u32, entries.clone(), *state, &sh.front.new, &sh.front.hulls, &plan.starts, sh.shapes, sink, &mut us, frame - 1, sh.ceiling, sh.s)?;
                     let to = sink.stats.tick_start();
                     let mut v = Vec::new();
-                    for (raw, prov) in std::mem::take(&mut sink.out_blocks) {
+                    for (raw, prov) in sink.take_out_blocks() {
                         v.push(if prov {
                             OutBlock::Raw(raw)
                         } else {
