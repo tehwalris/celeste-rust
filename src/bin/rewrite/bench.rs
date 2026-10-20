@@ -62,8 +62,8 @@ pub struct FrameArgs {
     /// Write the first rep's exact metrics to this file (`compiled::mix`).
     #[arg(long)]
     pub metrics: Option<PathBuf>,
-    /// Checkpoint each rep's frame as the forward does (the frame file
-    /// and the hull file, each read back and checked),
+    /// Checkpoint each rep's frame as the forward does (the frame file,
+    /// read back and checked),
     /// into the scratch dir, timed; prints the `b{F+1}` line (needs
     /// `--edges`).
     #[arg(long)]

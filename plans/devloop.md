@@ -15,7 +15,7 @@ byte-identical, or re-pins them on evidence.
 - **The fixture frames' fingerprints**: the `f`, `h` and `e` lines (new
   states, frontier hulls, edges, by content) of single frames, 16.16 and
   float (t1, big), and their `b` lines (the bytes of every file the frame
-  wrote: frame, hull, edge and out files). The fixtures themselves are rebuilt from scratch against
+  wrote: frame, edge and out files). The fixtures themselves are rebuilt from scratch against
   their pins by `./check.sh fixtures`.
 - **The room (1,0) gates** (t2): the f0-f44 `ckhash` (states, edges and
   hulls), and the arc gate. The arc gate pins the marks, W at every frame
@@ -68,7 +68,7 @@ Unit tests are kept only for the basics:
 - PICO-8 and doubles arithmetic (`pico8_num`, `lua_f64`, the lane
   primitives in `celeste_engine::kernel`), with overflow raising;
 - the data structures: key packing (`exact`), the visited set and its
-  packed tables, region sets, bundles, edge, hull, frame and out files;
+  packed tables, region sets, bundles, edge, frame and out files;
 - the arcs' set operations and the backward and reach DP against their
   definitions (`arcs`, `arc_edges`, `backward`, `reach`, `hull`, `rem_f64`);
 - what no pin reaches. These cover the tracer's and the codegen's edge

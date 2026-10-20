@@ -295,15 +295,16 @@ wave.
 transfers numbered canonically (by the frame's edge count, then content),
 each route SEALED against the visited set (new, grown, or nothing), the
 ladder's filter applied, everything merged into the visited set
-(`absorb`). Then the FRAME FILE (`frames/f{F}.bin`: per region the new
-entries' keys, masks and win masks; the shapes' skeletons), the HULL FILE
-(`hulls/f{F}.bin`), the edge and out files, and last
-`done.txt`. Frame and hull files are read back and compared with the
-forward's state (fatal on a difference). The DECODE GUARD checks a shape's
-first emitted row per worker and wave against its decode.
+(`absorb`). Then the FRAME FILE (`frames/f{F}.bin`, one a frame: per
+region the new entries' keys, masks and win masks; the frame's FRONTIER -
+the new states' hulls, the grown states with their layers and hulls; the
+shapes' skeletons), the edge and out files, and last `done.txt`. The frame
+file is read back and compared with the forward's state (fatal on a
+difference). The DECODE GUARD checks a shape's first emitted row per
+worker and wave against its decode.
 
-**Resume** rebuilds the visited set from the frame files, replays the hull
-files, and takes the last hull file as the frontier. A search resumes by
+**Resume** rebuilds the visited set from the frame files, replays their
+frontiers, and takes the last one as the frontier. A search resumes by
 rerunning the same command. The result is a function of the frame, not of
 scheduling: every file is byte-identical at any thread count and over a
 resume.

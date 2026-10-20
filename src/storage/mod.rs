@@ -1,10 +1,10 @@
 //! STORAGE (plans/architecture.md, "The forward: hulls and storage" and "The
 //! recorded graph"): the state set, the wave, and the tree's files in one
-//! container (`file`): frame (`layer`), hull (`hulls`), edge (`bundle`,
-//! `edges`) and out-edge (`out`) files.
+//! container (`file`): frame (`layer`, with its frontier: `hulls`), edge
+//! (`bundle`, `edges`) and out-edge (`out`) files.
 //!
 //! A state is `(shape, key, cell)` (`Sk`; the key holds no position:
-//! `exact::Code::pos`) everywhere: the edges, the frame and hull files, the
+//! `exact::Code::pos`) everywhere: the edges, the frame files, the
 //! backward. No state has a number.
 #![warn(unreachable_pub)]
 
@@ -54,12 +54,9 @@ pub fn fingerprint<N: crate::search::rem::Rem>(dir: &std::path::Path, to: u32, e
     if hulls {
         for frame in 0..=to {
             // Past a dead frontier: no files.
-            if !layer::frame_exists(dir, frame) {
-                break;
-            }
-            let hf = hulls::read::<N>(&hulls::path(dir, frame), threads)?;
+            let Some(file) = tree.file(frame) else { break };
             let (new, _) = tree.layer(frame, None, threads)?;
-            let (n, acc) = hulls::fingerprint(hf.states(&new)?.into_iter(), &tree.space, &tree.shapes)?;
+            let (n, acc) = hulls::fingerprint(file.frontier_states(&new, threads)?.into_iter(), &tree.space, &tree.shapes)?;
             out.push(format!("h{frame:03} {n} {acc:016x}"));
         }
     }

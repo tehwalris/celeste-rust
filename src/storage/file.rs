@@ -1,4 +1,4 @@
-//! THE TREE FILES' ONE CONTAINER (frame, hull, edge and out files; value
+//! THE TREE FILES' ONE CONTAINER (frame, edge and out files; value
 //! files: the marks): a 4-byte magic (the file's kind, in
 //! its arithmetic: `magic`), a u32 version (`FORMAT_VERSION`; the edge
 //! files' their own), the header's length (u64; both little-endian), the
@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 
 /// Bump whenever the meaning or layout of ANY tree content changes (older
 /// trees are refused; what each version changed: git history).
-pub(crate) const FORMAT_VERSION: u32 = 18;
+pub(crate) const FORMAT_VERSION: u32 = 20;
 
 /// The value files' magic.
 const VALUE: &[u8; 4] = b"C8TB";

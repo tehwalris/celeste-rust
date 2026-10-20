@@ -36,7 +36,7 @@ pub struct CkhashArgs {
     #[arg(long)]
     edges: bool,
     /// Also fingerprint each frame's FRONTIER (`h{frame} count hash`,
-    /// its hull file): every state whose remainder hull grew there, by
+    /// its frame file's): every state whose remainder hull grew there, by
     /// its (shape, key, cell), layer and hull.
     #[arg(long)]
     hulls: bool,

@@ -82,7 +82,6 @@ registry! {
     EdgeBytes "edge_gb" Bytes EdgeBytes;
     OutBytes "out_gb" Bytes OutBytes;
     FrameBytes "frame_gb" Bytes FrameBytes;
-    HullBytes "hull_gb" Bytes HullBytes;
     // Walls: the wave, the frame's end, the checkpoint, the frame.
     Wave "wave_ms" Wall Emissions;
     WaveIdle "wave_idle_pct" Count WaveIdle;
@@ -98,11 +97,9 @@ registry! {
     EndWins "end_wins_ms" Wall Kept;
     EndEdgeFile "end_edge_file_ms" Wall Edges;
     EndOutFile "end_out_file_ms" Wall Edges;
-    // The checkpoint's steps.
-    CkptFrame "ckpt_frame_file_ms" Wall Kept;
-    CkptFrameCheck "ckpt_frame_check_ms" Wall Kept;
-    CkptHull "ckpt_hull_file_ms" Wall LanesOut;
-    CkptHullCheck "ckpt_hull_check_ms" Wall LanesOut;
+    // The checkpoint's steps: the frame file written, read back.
+    CkptFile "ckpt_file_ms" Wall LanesOut;
+    CkptCheck "ckpt_check_ms" Wall LanesOut;
     // Worker time: busy, in region jobs, the seal's parts.
     Busy "busy_worker_ms" Work Busy;
     Regions "regions_worker_ms" Work Pushes;

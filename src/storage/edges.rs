@@ -542,7 +542,7 @@ impl<N: Rem> EdgeStore<N> {
 }
 
 /// THE TREE'S ONE TRUST MARKER (`<level>/edges/done.txt`): the last frame
-/// whose files are all complete - its frame, hull, edge and out files, all
+/// whose files are all complete - its frame, edge and out files, all
 /// written before it - and the transfer table's trusted
 /// length. A frame past it is a killed run's (`resume` discards it).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
