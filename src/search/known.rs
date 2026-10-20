@@ -16,12 +16,11 @@
 //! concrete search is exhaustive over leaves); else each lineage's first
 //! failing step is reported (`explain`) and the search FAILS.
 
-use super::concrete::{concrete_engines, exact_state, lookup_keys, lookup_view, rem_of, rem_raw, Side};
+use super::concrete::{lookup_keys, lookup_view, rem_of, rem_raw, Side};
 use super::rem::Rem;
 use crate::compiled::KernelLanes;
-use crate::frame::{wins_of, Block, MarkFilter, Visited};
+use crate::frame::{Block, MarkFilter, Visited};
 use crate::storage::Sk;
-use celeste_core::arith::EngineNum;
 use celeste_core::pico8_num::Pico8Num as P8;
 
 /// A known solution to check, and the filter the level's forward ran under.
@@ -72,48 +71,13 @@ pub(super) struct Pruning<'a, N: Rem = P8> {
     pub(crate) hulls: Option<&'a Hulls<N>>,
 }
 
-/// The route's states per step (each with its parent's index) up to the
-/// step before the exit; the exit step and its winning leaves' parents.
-struct Run<N: EngineNum> {
-    layers: Vec<Vec<(u32, Block<N>)>>,
-    exit: Option<(u32, Vec<u32>)>,
-}
-
-fn run<N: Rem>(inputs: &[u8], horizon: u32, settings: &crate::settings::Settings) -> anyhow::Result<(Run<N>, bool)> {
-    let clock = settings.clock();
-    let (mut engines, seeded) = concrete_engines::<N>(1, settings)?;
-    let eng = &mut engines[0];
-    let mut layers: Vec<Vec<(u32, Block<N>)>> = vec![vec![(0, Block::canonical(eng.initial()?)?)]];
-    for s in 0..horizon {
-        // The step to `s + 1` is in frame `frame_of(s + 1)`: its input.
-        let Some(&byte) = inputs.get(clock.frame_of(s + 1) as usize - 1) else { break };
-        let (mut next, mut seen, mut won) = (Vec::new(), rustc_hash::FxHashSet::default(), Vec::new());
-        for (p, (_, b)) in layers.last().expect("the start").iter().enumerate() {
-            for c in eng.step(b.rt2(), byte)? {
-                if wins_of(c.rt2(), settings)?.iter().any(|&x| x) {
-                    won.push(p as u32);
-                } else if seen.insert(exact_state(&c, c.positions()?[0])) {
-                    next.push((p as u32, c));
-                }
-            }
-        }
-        if !won.is_empty() {
-            return Ok((Run { layers, exit: Some((s + 1, won)) }, seeded));
-        }
-        if next.is_empty() {
-            break;
-        }
-        layers.push(next);
-    }
-    Ok((Run { layers, exit: None }, seeded))
-}
-
 /// The route against one level's pruning. `Ok(None)`: no win by the
 /// horizon; `Ok(Some(f))`: it wins in frame `f` and survives; an error: PRUNED.
 pub(super) fn check<N: KernelLanes>(route: &Route<N>, p: &Pruning<N>) -> anyhow::Result<Option<u32>> {
     let t0 = std::time::Instant::now();
     let clock = p.side.s.clock();
-    let (run, seeded) = run::<N>(route.inputs, p.horizon, p.side.s)?;
+    let run = super::replay::Replay::<N>::of(route.inputs, Some(p.horizon), p.side.s)?;
+    let seeded = run.seeded;
     let Some((exit, winners)) = &run.exit else {
         eprintln!("[known] the known route does not exit by f{} ({} inputs): not checked", clock.frame_of(p.horizon), route.inputs.len());
         return Ok(None);
@@ -143,7 +107,7 @@ pub(super) fn check<N: KernelLanes>(route: &Route<N>, p: &Pruning<N>) -> anyhow:
     }
     let last = run.layers.len() - 1;
     let states: usize = run.layers.iter().map(Vec::len).sum();
-    if winners.iter().any(|&w| good[last][w as usize]) {
+    if winners.iter().any(|&(w, _)| good[last][w as usize]) {
         eprintln!(
             "[known] level {}: the known route (exit f{frame}) survives every pruning step at h{}: {states} states over {} steps, {}; {:.2} s",
             p.side.level,
@@ -167,12 +131,8 @@ pub(super) fn check<N: KernelLanes>(route: &Route<N>, p: &Pruning<N>) -> anyhow:
     // Per winning lineage (at most 3): where the FORWARD lost the route (the
     // arc phase's misses after it follow from it), else its first failure.
     let mut lineages: Vec<Vec<usize>> = Vec::new();
-    for &w in winners.iter().take(3) {
-        let mut idx = vec![0usize; run.layers.len()];
-        idx[last] = w as usize;
-        for s in (1..=last).rev() {
-            idx[s - 1] = run.layers[s][idx[s]].0 as usize;
-        }
+    for &(w, _) in winners.iter().take(3) {
+        let idx = run.lineage(last, w as usize);
         if !lineages.contains(&idx) {
             lineages.push(idx);
         }
@@ -215,7 +175,7 @@ pub(super) fn check<N: KernelLanes>(route: &Route<N>, p: &Pruning<N>) -> anyhow:
 /// frame before, stepped by the level's kernels; the state among the
 /// successors (made, not kept: a win, level -1, a filter) or not (a
 /// SOUNDNESS gap in the kernels), and the nearest ones.
-fn explain<N: KernelLanes>(run: &Run<N>, idx: &[usize], s: usize, seeded: bool, p: &Pruning<N>) -> anyhow::Result<Vec<String>> {
+fn explain<N: KernelLanes>(run: &super::replay::Replay<N>, idx: &[usize], s: usize, seeded: bool, p: &Pruning<N>) -> anyhow::Result<Vec<String>> {
     use crate::search::inspect::{brief, project_onto, Proj};
     let per_frame = p.side.s.clock().per_frame as usize;
     let s0 = s.checked_sub(per_frame).ok_or_else(|| anyhow::anyhow!("the start is the tree's"))?;

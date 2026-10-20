@@ -1938,6 +1938,51 @@ fn build<A: GraphArith>(spd_px: i32, threads: usize, rep: &mut String, s: &crate
     Ok(Built { by_hash, g1, sound, chain, start_d })
 }
 
+/// A KNOWN SOLUTION against the table (`rewrite l1 check`): `inputs`
+/// replayed (`search::replay`: every `rnd` leaf, the run's seeds), every
+/// state checked, and one on a lineage that exits that the table calls too
+/// late for the exit `horizon` (a frame) makes the table UNSOUND: an error.
+/// The report, a line per frame.
+pub fn check_route<N: crate::search::rem::Rem>(inputs: &[u8], horizon: u32, spd: i32, s: &crate::settings::Settings) -> Result<String> {
+    use crate::search::pos_graph::{block_cells, cell_xy};
+    use std::fmt::Write as _;
+    let mut rep = String::new();
+    let table = table(spd, s)?;
+    writeln!(rep, "[l1 check] table: {} entries, start d {}, fingerprint {:016x}", table.len(), table.start_d, table.fingerprint())?;
+    let run = crate::search::replay::Replay::<N>::of(inputs, None, s)?;
+    let (exit, won) = run.exit.as_ref().ok_or_else(|| anyhow!("the inputs never exit the room"))?;
+    let on = run.on_a_win();
+    let (mut checked, mut unknown, mut late) = (0usize, 0usize, BTreeSet::new());
+    for (f, layer) in run.layers.iter().enumerate() {
+        let mut line = Vec::new();
+        for ((_, b), &on) in layer.iter().zip(&on[f]) {
+            let shape = b.rt2().shape_hash_of();
+            for cell in block_cells(b.rt2())? {
+                let at = cell_xy(cell);
+                match table.d_of(shape, cell) {
+                    None => {
+                        unknown += 1;
+                        line.push(format!("{at:?} not a table node"));
+                    }
+                    Some(d) => {
+                        checked += 1;
+                        let bad = table.too_late(shape, cell, f as u32, horizon);
+                        if bad && on {
+                            late.insert(f);
+                        }
+                        line.push(format!("{at:?} d {}{}", if d == u32::MAX { "inf".to_string() } else { d.to_string() }, if bad { " too late" } else { "" }));
+                    }
+                }
+            }
+        }
+        writeln!(rep, "[l1 check] f{f}: {}", line.join(", "))?;
+    }
+    writeln!(rep, "[l1 check] exit during frame {exit} ({} winning leaves)", won.len())?;
+    writeln!(rep, "[l1 check] {checked} states checked, {unknown} not table nodes; on the exiting lineages TOO LATE for horizon {horizon} at frames {late:?}")?;
+    ensure!(late.is_empty(), "{rep}the level -1 table calls states of a known solution too late at frames {late:?}: UNSOUND");
+    Ok(rep)
+}
+
 pub fn probe(opts: &Opts, s: &crate::settings::Settings) -> Result<String> {
     measures_the_exit(s)?;
     let mut rep = String::new();

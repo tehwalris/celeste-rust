@@ -15,6 +15,7 @@ pub(crate) mod known;
 pub mod level_minus_one;
 pub mod pos_graph;
 pub(crate) mod reach;
+pub(crate) mod replay;
 pub mod rem;
 pub(crate) mod rem_f64;
 pub mod result;

@@ -20,7 +20,6 @@
 //! run, and none by the horizon refutes every count up to it.
 
 use anyhow::{anyhow, ensure, Result};
-use rustc_hash::FxHashSet;
 
 use celeste_engine::exact::ExactRow;
 use celeste_engine::runtime2::Rt2;
@@ -28,7 +27,7 @@ use celeste_engine::runtime2::Rt2;
 use super::driver::Arcs;
 use super::concrete::{concrete_engines, dfs_budget, exact_state, Concrete, Next, NodeKeys, Side};
 use super::rem::Rem;
-use crate::frame::{wins_of, Block};
+use crate::frame::Block;
 use crate::settings::Settings;
 use crate::engines::reference::ReferenceEngine;
 
@@ -190,40 +189,27 @@ pub(crate) fn search<X: Rem, F: Rem>(fixed: &Half<X>, float: &Half<F>, bound: u3
 /// The first frame some lineage of `inputs` wins on from `s`'s start, a
 /// concrete run (`Settings::concrete`), every `rnd` leaf followed.
 pub(crate) fn first_win<N: Rem>(inputs: &[u8], s: &Settings) -> Result<Option<u32>> {
-    let mut eng = ReferenceEngine::<N::A>::new(&s.concrete().0)?;
-    let mut cur: Vec<Rt2<N>> = vec![eng.initial()?];
-    for (f, &byte) in inputs.iter().enumerate() {
-        let mut next: Vec<Rt2<N>> = Vec::new();
-        let mut seen: FxHashSet<ExactRow> = FxHashSet::default();
-        for row in &cur {
-            for b in eng.frame(row, byte)? {
-                if wins_of(b.rt2(), s)?.iter().any(|&x| x) {
-                    return Ok(Some(f as u32 + 1));
-                }
-                let cell = b.positions()?[0];
-                if seen.insert(exact_state(&b, cell)) {
-                    next.push(b.into_rt2());
-                }
-            }
-        }
-        cur = next;
-    }
-    Ok(None)
+    Ok(super::replay::Replay::<N>::of(inputs, None, s)?.exit_frame(s.clock()))
 }
 
 /// The player's cell at every frame of `inputs` (the start's first;
-/// `pos_graph::NO_CELL` without a player) as a concrete run of `s`, its
-/// first `rnd` leaf: the UI's path of a dual witness's float half.
+/// `pos_graph::NO_CELL` without a player) along its first winning lineage,
+/// a concrete run of `s`: the UI's path of a dual witness's float half.
 pub(crate) fn path_cells<N: Rem>(inputs: &[u8], s: &Settings) -> Result<Vec<u32>> {
-    let mut eng = ReferenceEngine::<N::A>::new(&s.concrete().0)?;
-    let start = Block::canonical(eng.initial()?)?;
-    let mut cells = vec![start.positions()?[0]];
-    let mut row = start.into_rt2();
-    for &byte in inputs {
-        let b = eng.frame(&row, byte)?.into_iter().next().ok_or_else(|| anyhow!("a frame with no successor"))?;
-        cells.push(b.positions()?[0]);
-        row = b.into_rt2();
+    let run = super::replay::Replay::<N>::of(inputs, None, s)?;
+    let (step, won) = run.exit.as_ref().ok_or_else(|| anyhow!("the path never wins"))?;
+    let (parent, leaf) = &won[0];
+    let clock = s.clock();
+    let last = run.layers.len() - 1;
+    let idx = run.lineage(last, *parent as usize);
+    let mut cells = Vec::new();
+    for (t, &i) in idx.iter().enumerate() {
+        if clock.boundary(t as u32) {
+            cells.push(run.layers[t][i].1.positions()?[0]);
+        }
     }
+    ensure!(clock.boundary(*step), "the path wins mid-frame");
+    cells.push(leaf.positions()?[0]);
     Ok(cells)
 }
 
