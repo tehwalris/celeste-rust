@@ -119,9 +119,10 @@ def build_cart(inputs, frames, out, lua_path=None, begin_game=False, room=None, 
     flags = hexbytes(os.path.join(ROOT, "cart", "flag-data.txt"), 256)
     prelude = [
         "__begin_game = " + ("true" if begin_game else "false"),
-        # The interpreter's hooks: the interval splitter (identity on a
+        # The interpreter's hooks: the interval splitters (identity on a
         # concrete value) and the state-normalization hint (a no-op).
         "function __split_by_flr(x) return x end",
+        "function __split_by_round(x) return x end",
         "function _hint_normalize() end",
         "__balloon_seeds = " + lua_list(balloon_seeds or []),
         "function __balloon_seed() return deli(__balloon_seeds, 1) or 0 end",
