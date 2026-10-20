@@ -19,7 +19,7 @@ pub enum Command {
     /// ONE FORWARD FRAME of a tree, F -> F+1, repeatably.
     ///
     /// The forward as it stood after `--step` F (`ForwardState::at`: the
-    /// tree's visited set, transfers, level -1 filter and pos graph at F;
+    /// tree's visited set, transfers and level -1 filter at F;
     /// later frames ignored) runs the wave of F+1 `--reps` times, the edges
     /// into a scratch dir. Prints (stdout, the same every rep, else an
     /// error) `ckhash`'s lines for F+1 - `f{F+1}` of the new states,
@@ -73,7 +73,7 @@ pub struct FrameArgs {
     #[arg(long)]
     pin: bool,
     /// Checkpoint each rep's frame as the forward does (the frame file
-    /// and the hull file, each read back and checked; the pos graph),
+    /// and the hull file, each read back and checked),
     /// into the scratch dir, timed; prints the `b{F+1}` line (needs
     /// `--edges`).
     #[arg(long)]
@@ -141,7 +141,7 @@ where
     let t_kernels = t.elapsed().as_secs_f64();
     eprintln!("[bench] kernels built: rss {:.2} GB", celeste_rust::metrics::current_rss_gb());
     let t = std::time::Instant::now();
-    let mut st = celeste_rust::frame::ForwardState::<N>::at(dir, frame, true, level, cfg)?;
+    let mut st = celeste_rust::frame::ForwardState::<N>::at(dir, frame, level, cfg)?;
     eprintln!(
         "[bench] kernels built in {t_kernels:.2} s; f{frame} loaded in {:.2} s: {} lanes in {} entries ({:.3} GB, {:.2} B a state) and {} old states, visited {} states in {} entries ({:.3} GB, {:.2} B a state); {} threads; rss {:.2} GB",
         t.elapsed().as_secs_f64(),
@@ -157,10 +157,6 @@ where
         cfg.threads(),
         celeste_rust::metrics::current_rss_gb()
     );
-    {
-        let (fr, (outs, xfers)) = (st.frontier(), st.outs_and_xfers());
-        celeste_rust::storage::bench::print_memory(&format!("f{frame} loaded"), st.visited(), &fr.new, &fr.hulls, &fr.old, outs, xfers);
-    }
     let scratch_dir = Scratch::new("bench-frame")?;
     let scratch = scratch_dir.path();
     let ms = |d: std::time::Duration| d.as_secs_f64() * 1e3;
@@ -172,49 +168,28 @@ where
         let load = celeste_rust::storage::bench::load_average();
         let at = counters.as_ref().map(|c| c.start());
         let t = std::time::Instant::now();
-        // The last rep runs on the state's own visited set (no copy beside it).
-        let (wave, visited, xfers) = st.bench_wave(&engine, dir, edges.then_some(scratch), rep + 1 < reps)?;
-        let ckpt = if checkpoint { Some(st.bench_checkpoint(&wave, &scratch.join("ckpt"), cfg)?) } else { None };
+        // A rep runs on a copy of the state; the last on the state itself
+        // (no copy beside it).
+        let mut copy;
+        let s = if rep + 1 < reps {
+            copy = st.clone();
+            &mut copy
+        } else {
+            &mut st
+        };
+        let ckpt = scratch.join("ckpt");
+        let stats = s.step(&engine, edges.then_some(scratch), checkpoint.then_some(ckpt.as_path()), None)?;
         let t_all = t.elapsed();
         let counts = counters.as_ref().zip(at).map(|(c, at)| c.stop(at));
-        let w = &wave.stats;
-        eprintln!(
-            "[bench] rep {rep}: wave {:.0} ms (idle {:.0}%, regions {:.0} worker-ms) end {:.0}{} total {:.0} ms | in {} old {} emitted {} re-pushed {} pushes {} kept {} grown {} | units {} slices {} routes {} | edges {} bundles {} ({:.3} B; out {:.3} B) | rss start {:.2} wave {:.2} end {:.2} peak {:.2} GB",
-            ms(w.t_wave),
-            w.wave_idle * 100.0,
-            ms(w.t_regions),
-            ms(w.t_layer),
-            ckpt.map_or(String::new(), |(c, pos)| format!(" checkpoint {:.0}", ms(c.t.iter().sum::<std::time::Duration>() + pos))),
-            ms(t_all),
-            w.lanes_in,
-            w.old_in,
-            w.lanes_raw,
-            w.repush_edges,
-            w.pushes,
-            w.lanes_kept,
-            w.grown,
-            w.units,
-            w.slices,
-            w.routes,
-            w.edge_records,
-            w.edge_bundles,
-            w.edge_bytes as f64 / w.edge_records.max(1) as f64,
-            w.out_bytes as f64 / w.edge_records.max(1) as f64,
-            w.rss_start,
-            w.rss_wave,
-            w.rss_end,
-            celeste_rust::metrics::peak_rss_gb(),
-        );
-        costs.push(celeste_rust::storage::bench::Rep { stats: *w, ckpt, workers: cfg.threads(), wall: t_all, load, counts });
-        if rep + 1 == reps {
-            celeste_rust::storage::bench::print_memory(&format!("f{} made (the out store as loaded)", frame + 1), &visited, &wave.next, &wave.hulls, &wave.grown, st.outs_and_xfers().0, &xfers);
-        }
-        let (n, acc) = wave.next.content_fingerprint(&visited.keys, visited.shapes())?;
+        eprintln!("[bench] rep {rep}: {} | rep {:.0} ms", stats.line(), ms(t_all));
+        costs.push(celeste_rust::storage::bench::Rep { stats, workers: cfg.threads(), load, counts });
+        let (visited, front) = (s.visited(), s.frontier());
+        let (n, acc) = front.new.content_fingerprint(&visited.keys, visited.shapes())?;
         let mut out = format!("f{:03} {n} {acc:016x}\n", frame + 1);
-        let (nh, ah) = celeste_rust::storage::hulls::fingerprint(wave.frontier_states(frame + 1), &visited.keys, visited.shapes())?;
+        let (nh, ah) = celeste_rust::storage::hulls::fingerprint(front.hull_states(frame + 1), &visited.keys, visited.shapes())?;
         out += &format!("h{:03} {nh} {ah:016x}\n", frame + 1);
         if edges {
-            let (n, acc) = celeste_rust::storage::bench::edge_fingerprint(scratch, frame + 1, &xfers, &visited, cfg.threads())?;
+            let (n, acc) = celeste_rust::storage::bench::edge_fingerprint(scratch, frame + 1, s.xfers(), visited, cfg.threads())?;
             out += &format!("e{:03} {n} {acc:016x}\n", frame + 1);
         }
         if checkpoint {
@@ -234,7 +209,7 @@ where
                 let slices: u64 = kernels.iter().map(|k| k.1).sum();
                 let insts: u64 = kernels.iter().map(|(_, n, c)| n * c.get("insts").copied().unwrap_or(0)).sum();
                 eprintln!("[bench] kernels: {insts} dynamic instructions over {slices} slices ({} a slice; call-outs' callees aside)", insts.checked_div(slices).unwrap_or(0));
-                pinned(path, &frame_metrics(cfg.room, level, frame, w, &ks), a.pin, metrics_moves)?;
+                pinned(path, &frame_metrics(cfg.room, level, frame, &costs[0].stats, &ks), a.pin, metrics_moves)?;
             }
             celeste_rust::compiled::mix::reset_slices();
         }
@@ -401,23 +376,24 @@ fn bench_backward<N: Rem>(tree: &TreeDir, horizon: u32, frame: u32, reps: usize)
 /// (no timings: the same at every thread count): the frame's, the calls',
 /// every built kernel's census summed (`all.*`), the dynamic instructions
 /// (`dyn.*`: slices x static count) and per kernel that ran (`k.<sym>.*`).
-fn frame_metrics((rx, ry): (i16, i16), level: Level, frame: u32, w: &celeste_rust::frame::FrameStats, ks: &celeste_rust::compiled::dispatch::KernelStats) -> String {
+fn frame_metrics((rx, ry): (i16, i16), level: Level, frame: u32, w: &celeste_rust::storage::stats::Stats, ks: &celeste_rust::compiled::dispatch::KernelStats) -> String {
+    use celeste_rust::storage::stats::S;
     use std::collections::BTreeMap;
     use std::fmt::Write as _;
     let mut m: BTreeMap<String, u64> = BTreeMap::new();
     let mut put = |k: &str, v: u64| *m.entry(k.to_string()).or_default() += v;
-    put("frame.lanes_in", w.lanes_in as u64);
-    put("frame.emissions", w.lanes_raw as u64);
-    put("frame.kept", w.lanes_kept as u64);
-    put("frame.units", w.units as u64);
-    put("frame.slices", w.slices as u64);
-    put("frame.routes", w.routes);
-    put("frame.edges", w.edge_records);
-    put("frame.bundles", w.edge_bundles);
+    put("frame.lanes_in", w.get(S::LanesIn));
+    put("frame.emissions", w.get(S::Emissions));
+    put("frame.kept", w.get(S::Kept));
+    put("frame.units", w.get(S::Units));
+    put("frame.slices", w.get(S::Slices));
+    put("frame.routes", w.get(S::Routes));
+    put("frame.edges", w.get(S::Edges));
+    put("frame.bundles", w.get(S::Bundles));
     // Exact: a segment is a function of its route's records (global
     // transfer ids, sorted bundles, zstd -1).
-    put("frame.edge_bytes", w.edge_bytes);
-    put("frame.edge_millibytes_per_edge", (w.edge_bytes * 1000).checked_div(w.edge_records).unwrap_or(0));
+    put("frame.edge_bytes", w.get(S::EdgeBytes));
+    put("frame.edge_millibytes_per_edge", (w.get(S::EdgeBytes) * 1000).checked_div(w.get(S::Edges)).unwrap_or(0));
     put("calls.calls", ks.calls);
     put("calls.rows", ks.rows);
     put("calls.slice_lanes", ks.slice_lanes);

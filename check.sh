@@ -272,11 +272,11 @@ t2_platforms() {
     step widen-r60s widen60
 }
 
-# The three pinned room (1,0) oracles (CLAUDE.md "Gates").
+# The pinned room (1,0) oracles (CLAUDE.md "Gates"): the forward's states,
+# edges (with their transfers) and hulls f0-f44, and the arc gate.
 gate10_forward() {
     ./safe-run.sh --memory "$MEM" -- "$B" forward --steps 44 --room 1,0 --tree "$C/t2/g10" > "$C/t2/g10.out" || return 1
-    grep '^posgraph' "$C/t2/g10.out" | diff gates/posgraph_room10_f044.txt - >&2 || return 1
-    ./safe-run.sh --memory "$MEM" -- "$B" ckhash --tree "$C/t2/g10" --steps 44 --hulls | diff gates/ckhash_room10_f000-044.txt - >&2
+    ./safe-run.sh --memory "$MEM" -- "$B" ckhash --tree "$C/t2/g10" --steps 44 --edges --hulls | diff gates/ckhash_room10_f000-044.txt - >&2
 }
 gate10_arc() {
     ./safe-run.sh --memory "$MEM" -- "$B" search --frames 35 --win-at 9,101 --search-dir "$C/t2/arc10" --prefer gates/known_room10_win9-101.txt --save-marks "$C/t2/arc10-marks" > "$C/t2/arc10.out" || return 1
@@ -285,8 +285,7 @@ gate10_arc() {
 # The same oracles in float (`--arith float`, plans/float.md).
 gate10f_forward() {
     ./safe-run.sh --memory "$MEM" -- "$B" forward --arith float --steps 44 --room 1,0 --tree "$C/t2/g10f" > "$C/t2/g10f.out" || return 1
-    grep '^posgraph' "$C/t2/g10f.out" | diff gates/float_posgraph_room10_f044.txt - >&2 || return 1
-    ./safe-run.sh --memory "$MEM" -- "$B" ckhash --tree "$C/t2/g10f" --steps 44 --hulls | diff gates/float_ckhash_room10_f000-044.txt - >&2
+    ./safe-run.sh --memory "$MEM" -- "$B" ckhash --tree "$C/t2/g10f" --steps 44 --edges --hulls | diff gates/float_ckhash_room10_f000-044.txt - >&2
 }
 gate10f_arc() {
     ./safe-run.sh --memory "$MEM" -- "$B" search --arith float --frames 35 --win-at 9,101 --search-dir "$C/t2/arc10f" --prefer gates/known_room10_win9-101.txt --save-marks "$C/t2/arc10f-marks" > "$C/t2/arc10f.out" || return 1

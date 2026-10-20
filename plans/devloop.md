@@ -15,12 +15,12 @@ byte-identical, or re-pins them on evidence.
 - **The fixture frames' fingerprints**: the `f`, `h` and `e` lines (new
   states, frontier hulls, edges, by content) of single frames, 16.16 and
   float (t1, big), and their `b` lines (the bytes of every file the frame
-  wrote: frame, hull, edge and out files, the pos graph). The fixtures themselves are rebuilt from scratch against
+  wrote: frame, hull, edge and out files). The fixtures themselves are rebuilt from scratch against
   their pins by `./check.sh fixtures`.
-- **The room (1,0) gates** (t2): the f0-f44 posgraph and `ckhash`, and the
-  arc gate. The arc gate pins the marks, W at every frame f0-f35, the
-  optimum, the concrete witness and the known route (`--prefer`,
-  `search::known`).
+- **The room (1,0) gates** (t2): the f0-f44 `ckhash` (states, edges and
+  hulls), and the arc gate. The arc gate pins the marks, W at every frame
+  f0-f35, the optimum, the concrete witness and the known route
+  (`--prefer`, `search::known`).
 - **The objects-ladder search** (t2): room (4,2) `r0sxhn,r0sxh`, every
   `[gate]` line, and its UI export.
 - **The float and dual gates** (t2), and the float twins' frames (t1).
@@ -173,13 +173,16 @@ region phase, the frame end, the checkpoint.
 `rewrite bench frame --tree DIR --step F --edges --checkpoint --reps N`
 runs step F -> F+1 of a tree (`ForwardState::at`). It prints the pins: the
 `f`, `h` and `e` lines and `b` (the bytes of every file the frame wrote).
-Every rep must agree. Its stderr `[cost]` lines give:
+Every rep must agree. Its stderr renders the frame's statistics
+(`storage::stats`, one registry: the `[fwd]` line's and `forward.tsv`'s
+too): per rep a `[bench] rep` line, and the `[cost]` report: per time
+(walls, worker times, and with `--phases` the wave's worker-seconds by
+phase) its min and max over the reps, its share of the wave's budget, its
+hardware counts and its cost per element; the counts, the bytes written
+and the resident sets.
 
-- the wall split (wave, frame end, checkpoint);
-- the wave's worker-seconds by phase, with per-element costs;
-- the bytes written and the anonymous RSS.
-
-`--phases`' `[mem]` and `[wavemem]` lines break memory down.
+`--phases`' `[mem]` lines sample the anonymous resident set and the live
+heap at the phases' boundaries.
 
 The tree is a fixture (`tools/fixtures.sh ensure NAME`; a new one is a
 `spec` case there) or any forward's (`rewrite forward --steps F --tree

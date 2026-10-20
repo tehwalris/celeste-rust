@@ -534,7 +534,7 @@ impl<N: KernelLanes> AsmKernel<N> {
         c.reset(plan);
         c.take[..takes.len()].copy_from_slice(takes);
         let bodies = || (0..plan.bodies.len()).filter(|&bi| takes[bi] != 0);
-        // THE CELLS, per position set, and their pos-graph edges.
+        // THE CELLS, per position set.
         for bi in bodies() {
             c.pos_need[plan.bodies[bi].pos as usize] |= takes[bi];
         }
@@ -542,11 +542,10 @@ impl<N: KernelLanes> AsmKernel<N> {
         for (k, set) in plan.pos.iter().enumerate() {
             if c.pos_need[k] != 0 {
                 cells_of::<N>(set, buf, half, c.pos_need[k], start, &mut c.cells[k]);
-                sink.pos_edges(&c.cells[k], c.pos_need[k], lanes);
             }
         }
         // LEVEL -1 first, per column: a dropped cell's row needs no key,
-        // transfer or lookup (only its pos-graph edge, above).
+        // transfer or lookup.
         if sink.drops_at_emission() {
             for bi in bodies() {
                 c.col_need[plan.bodies[bi].column as usize] |= takes[bi];
@@ -660,7 +659,7 @@ impl<N: KernelLanes> AsmKernel<N> {
             }
             emitted += take.count_ones() as u64;
             let targets = &c.targets[b.column as usize];
-            let e = crate::storage::unit::BodyEmits { shape, take, keys: &out_keys, targets, xfers: &c.arc_ids[b.arc as usize], lanes };
+            let e = crate::storage::unit::BodyEmits { shape, take, keys: &out_keys, targets, xfers: &c.arc_ids[b.arc as usize] };
             let cols = &self.body_cols[bi];
             if let Err(e) = sink.emit_body(&e, || (*template.union).clone_block(), |row, i| cols.push_row(row, buf, half, i, out_keys[i], targets.cells[i])) {
                 panic!("frame step: {e:#}");

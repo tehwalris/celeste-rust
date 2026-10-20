@@ -3,9 +3,6 @@
 //! Every one is the search's table (`level_minus_one::table`).
 
 use anyhow::{anyhow, Context, Result};
-use celeste_core::arith::{Arithmetic, Fixed};
-use celeste_engine::runtime2::Rt2;
-use celeste_rust::frame::wins_of;
 use celeste_rust::search::level_minus_one;
 use celeste_rust::settings::{Arith, Settings};
 
@@ -92,75 +89,14 @@ pub fn run(cfg: &Settings, c: Command) -> Result<()> {
             print!("{report}");
             Ok(())
         }
-        Command::Check(a) => match cfg.arith {
-            Arith::Fixed => l1_check::<Fixed>(&a.inputs, a.frames, a.spd, cfg),
-            Arith::Float(_) => l1_check::<celeste_core::arith::Float>(&a.inputs, a.frames, a.spd, cfg),
-        },
+        Command::Check(a) => {
+            let bytes = celeste_rust::concrete::read_inputs(&a.inputs)?;
+            let rep = match cfg.arith {
+                Arith::Fixed => level_minus_one::check_route::<celeste_engine::runtime2::P8>(&bytes, a.frames, a.spd, cfg)?,
+                Arith::Float(_) => level_minus_one::check_route::<celeste_core::lua_f64::LuaF64>(&bytes, a.frames, a.spd, cfg)?,
+            };
+            print!("{rep}");
+            Ok(())
+        }
     }
-}
-
-/// `l1 check`: a known solution against the level -1 table, in the
-/// arithmetic `A` (its table, its reference engine).
-fn l1_check<A: Arithmetic>(inputs: &str, horizon: u32, spd: i32, cfg: &celeste_rust::settings::Settings) -> Result<()>
-where
-    A::Num: celeste_core::arith::EngineNum<A = A>,
-{
-    let bytes = celeste_rust::concrete::read_inputs(inputs)?;
-    let table = level_minus_one::table(spd, cfg)?;
-    println!("[l1 check] table: {} entries, start d {}, fingerprint {:016x}", table.len(), table.start_d, table.fingerprint());
-    // The known run: under the concrete run's seeds (a float tool's).
-    let mut eng = celeste_rust::engines::reference::ReferenceEngine::<A>::new(&cfg.concrete().0)?;
-    // Each leaf with its lineage's states too late (an `rnd` leaf
-    // that never exits may rightly be too late: only an exiting
-    // lineage is the solution).
-    let mut states: Vec<(Rt2<A::Num>, Vec<u32>)> = vec![(eng.initial()?, Vec::new())];
-    let (mut checked, mut unknown) = (0usize, 0usize);
-    let mut exited: Option<Vec<Vec<u32>>> = None;
-    for f in 0..=bytes.len() as u32 {
-        let mut line = Vec::new();
-        for (s, late) in &mut states {
-            let shape = s.shape_hash_of();
-            for cell in celeste_rust::search::pos_graph::block_cells(s)? {
-                let at = celeste_rust::search::pos_graph::cell_xy(cell);
-                match table.d_of(shape, cell) {
-                    None => {
-                        unknown += 1;
-                        line.push(format!("{at:?} not a table node"));
-                    }
-                    Some(d) => {
-                        checked += 1;
-                        let bad = table.too_late(shape, cell, f, horizon);
-                        if bad {
-                            late.push(f);
-                        }
-                        line.push(format!("{at:?} d {}{}", if d == u32::MAX { "inf".to_string() } else { d.to_string() }, if bad { " too late" } else { "" }));
-                    }
-                }
-            }
-        }
-        println!("[l1 check] f{f}: {}", line.join(", "));
-        let Some(&byte) = bytes.get(f as usize) else { break };
-        let mut next = Vec::new();
-        let mut wins = Vec::new();
-        for (s, late) in &states {
-            for b in eng.step(s, byte)? {
-                if wins_of(&b, cfg)?.iter().any(|&x| x) {
-                    wins.push(late.clone());
-                } else {
-                    next.push((b, late.clone()));
-                }
-            }
-        }
-        if !wins.is_empty() {
-            println!("[l1 check] exit during frame {} ({} of {} leaves)", f + 1, wins.len(), wins.len() + next.len());
-            exited = Some(wins);
-            break;
-        }
-        states = next;
-    }
-    let wins = exited.ok_or_else(|| anyhow::anyhow!("the inputs never exit the room"))?;
-    let late: usize = wins.iter().map(|l| l.len()).sum();
-    println!("[l1 check] {checked} states checked, {unknown} not table nodes; on the exiting lineages {late} TOO LATE for horizon {horizon} (frames {:?})", wins.iter().flatten().collect::<std::collections::BTreeSet<_>>());
-    anyhow::ensure!(late == 0, "the level -1 table calls {late} states of a known solution too late: UNSOUND");
-    Ok(())
 }

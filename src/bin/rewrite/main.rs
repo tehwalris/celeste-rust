@@ -434,10 +434,6 @@ fn forward<N: celeste_rust::search::rem::Rem>(
         Some(h) => println!("win at f{h} ({wall:.2} s)"),
         None => println!("no win by f{} ({wall:.2} s)", fwd.frames),
     }
-    if let Some(pg) = &fwd.pos_graph {
-        let (pairs, fp) = pg.fingerprint();
-        println!("posgraph f{:03} {pairs} {fp:016x}", fwd.frames);
-    }
     celeste_rust::metrics::dump("forward", Some(dir), &[("level", level.to_string())]);
     Ok(())
 }

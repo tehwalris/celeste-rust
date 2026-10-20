@@ -201,7 +201,7 @@ tool file starts on the player's first frame.
 - t1: the float twins of the fixtures (`f10`, `f42n`, `f42x`, `f10arc`):
   one frame each of f10 and f42n exact, f42n's keys, a backward frame,
   check ref, check arcs and check widen.
-- t2: the room (1,0) gates in float (`gates/float_*`: posgraph, ckhash,
+- t2: the room (1,0) gates in float (`gates/float_*`: ckhash with edges and hulls,
   the arc gate with its witness) and the dual gate (`gates/dual_*`), their
   UI exports.
 

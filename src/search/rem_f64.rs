@@ -32,13 +32,13 @@ use super::arcs::{Circle, Seg};
 use super::rem::Capture;
 
 /// The index of `0` (and the count of doubles in `[-1/2, 0)`): `1/2`'s bits.
-pub const ZERO: u64 = 0x3FE0_0000_0000_0000;
+pub(crate) const ZERO: u64 = 0x3FE0_0000_0000_0000;
 /// The points: the doubles of `[-1/2, 1/2)` by value.
-pub const POINTS: u64 = 2 * ZERO;
+pub(crate) const POINTS: u64 = 2 * ZERO;
 
 /// The point of remainder `v`; `None` outside `[-1/2, 1/2)`.
 #[inline]
-pub fn index(v: f64) -> Option<u64> {
+pub(crate) fn index(v: f64) -> Option<u64> {
     if !(-0.5..0.5).contains(&v) {
         return None;
     }
@@ -48,7 +48,7 @@ pub fn index(v: f64) -> Option<u64> {
 
 /// The remainder of point `i` (`+0.0` at `ZERO`).
 #[inline]
-pub fn value(i: u64) -> f64 {
+pub(crate) fn value(i: u64) -> f64 {
     debug_assert!(i < POINTS);
     if i >= ZERO {
         f64::from_bits(i - ZERO)
@@ -58,30 +58,30 @@ pub fn value(i: u64) -> f64 {
 }
 
 /// `Axis::tag` of `r -> fl(fl(r + ox) - k)` (`a` the bits of `ox`).
-pub const MONO: u8 = 0;
+pub(crate) const MONO: u8 = 0;
 /// `Axis::tag` of the constant point `a`.
-pub const CONST: u8 = 1;
+pub(crate) const CONST: u8 = 1;
 
 /// One axis's decoded transfer: the guard `[lo, hi)` of the points, and
 /// the action (`tag`, `a`, `k`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct Axis {
-    pub lo: u64,
-    pub hi: u64,
-    pub tag: u8,
-    pub a: u64,
-    pub k: i32,
+    pub(crate) lo: u64,
+    pub(crate) hi: u64,
+    pub(crate) tag: u8,
+    pub(crate) a: u64,
+    pub(crate) k: i32,
 }
 
 /// A transfer pair (x, y).
-pub type Pair = (Axis, Axis);
+pub(crate) type Pair = (Axis, Axis);
 
 /// Bytes per encoded pair: per axis `lo`, `hi`, `a` (u64), `tag` (u8), `k` (i32).
-pub const PAIR_BYTES: usize = 2 * 29;
+pub(crate) const PAIR_BYTES: usize = 2 * 29;
 
 impl Axis {
     /// The identity over the whole circle.
-    pub fn identity() -> Axis {
+    pub(crate) fn identity() -> Axis {
         Axis::mono(0, POINTS, 0.0, 0)
     }
 
@@ -96,7 +96,7 @@ impl Axis {
 
     /// The image of point `i` (inside the guard).
     #[inline]
-    pub fn apply(&self, i: u64) -> u64 {
+    pub(crate) fn apply(&self, i: u64) -> u64 {
         debug_assert!(self.lo <= i && i < self.hi);
         match self.tag {
             MONO => {
@@ -107,7 +107,7 @@ impl Axis {
         }
     }
 
-    pub fn encode(&self, out: &mut Vec<u8>) {
+    pub(crate) fn encode(&self, out: &mut Vec<u8>) {
         out.extend_from_slice(&self.lo.to_le_bytes());
         out.extend_from_slice(&self.hi.to_le_bytes());
         out.extend_from_slice(&self.a.to_le_bytes());
@@ -115,12 +115,12 @@ impl Axis {
         out.extend_from_slice(&self.k.to_le_bytes());
     }
 
-    pub fn decode(b: &[u8]) -> Axis {
+    pub(crate) fn decode(b: &[u8]) -> Axis {
         let u = |o: usize| u64::from_le_bytes(b[o..o + 8].try_into().expect("8 bytes"));
         Axis { lo: u(0), hi: u(8), a: u(16), tag: b[24], k: i32::from_le_bytes(b[25..29].try_into().expect("4 bytes")) }
     }
 
-    pub fn mixed(&self) -> u64 {
+    pub(crate) fn mixed(&self) -> u64 {
         mix64(self.lo ^ self.hi.rotate_left(21) ^ mix64(self.a ^ ((self.k as u32 as u64) << 8 | self.tag as u64)))
     }
 }
@@ -273,7 +273,7 @@ impl Circle for Doubles {
 }
 
 /// Decode one axis (the module doc's rules). `Err` is a refusal.
-pub fn decode_axis(c: &Capture<LuaF64>) -> Result<Axis, String> {
+pub(crate) fn decode_axis(c: &Capture<LuaF64>) -> Result<Axis, String> {
     let v = |p: (LuaF64, LuaF64)| (p.0.value(), p.1.value());
     let top = value(POINTS - 1);
     let whole = (-0.5, top);

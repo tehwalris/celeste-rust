@@ -19,7 +19,6 @@ export interface FwdLine {
   own_ms: number;
   own_idle: number;
   ckpt_ms: number;
-  pos_ms: number;
   total_ms: number;
   rss_gb: number;
 }
@@ -213,7 +212,7 @@ export async function loadRuns(): Promise<RunInfo[]> {
  *  forward line's, in run.json's nesting. */
 interface Timings {
   wall_s: number | null;
-  horizons: { levels: { fwd: Pick<FwdLine, "emit_ms" | "emit_idle" | "own_ms" | "own_idle" | "ckpt_ms" | "pos_ms" | "total_ms" | "rss_gb">[] }[] }[];
+  horizons: { levels: { fwd: Pick<FwdLine, "emit_ms" | "emit_idle" | "own_ms" | "own_idle" | "ckpt_ms" | "total_ms" | "rss_gb">[] }[] }[];
 }
 
 export async function loadRun(id: string): Promise<Run> {

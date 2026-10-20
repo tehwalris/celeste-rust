@@ -16,7 +16,7 @@ pub struct TreeDir {
     pub settings: Settings,
     pub level: Level,
     /// The last finished frame (search step).
-    pub last: u32,
+    pub(crate) last: u32,
 }
 
 impl TreeDir {

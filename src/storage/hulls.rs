@@ -31,11 +31,11 @@ const NEW_BLOCK: usize = 1 << 18;
 const GROWN_BLOCK: usize = 1 << 16;
 
 /// A frontier state: the state, its layer, its hull.
-pub type Grown<N = P8> = (Sk, u16, HullOf<N>);
+pub(crate) type Grown<N = P8> = (Sk, u16, HullOf<N>);
 
 /// GROWN STATES in runs, sorted by layer and state across them (`write`,
 /// `check`): a frontier's old states by layer, or states as they are.
-pub trait Runs<N: Rem>: Sync {
+pub(crate) trait Runs<N: Rem>: Sync {
     fn count(&self) -> usize;
     fn len(&self, i: usize) -> usize;
     /// Run `i`'s states `r`, in order.
@@ -66,7 +66,7 @@ impl<N: Rem> Runs<N> for [super::wave::OldLayer<N>] {
     }
 }
 
-pub fn path(dir: &Path, frame: u32) -> PathBuf {
+pub(crate) fn path(dir: &Path, frame: u32) -> PathBuf {
     dir.join("hulls").join(format!("f{frame:03}.bin"))
 }
 
@@ -87,10 +87,10 @@ struct Header {
 /// A HULL FILE's content: frame `frame`'s new states' hulls (in the
 /// frame's state order) and its grown states (sorted by layer and state).
 #[derive(Debug, PartialEq, Eq)]
-pub struct Frontier<N: Rem = P8> {
-    pub frame: u32,
+pub(crate) struct Frontier<N: Rem = P8> {
+    pub(crate) frame: u32,
     pub hulls: Vec<HullOf<N>>,
-    pub grown: Vec<Grown<N>>,
+    pub(crate) grown: Vec<Grown<N>>,
 }
 
 impl<N: Rem> Default for Frontier<N> {
@@ -102,7 +102,7 @@ impl<N: Rem> Default for Frontier<N> {
 impl<N: Rem> Frontier<N> {
     /// Every state of the frontier with its layer and hull, the new ones
     /// (frame `frame`'s layer `new`, its states in order) first.
-    pub fn states(&self, new: &super::layer::Layer<N>) -> Result<Vec<Grown<N>>> {
+    pub(crate) fn states(&self, new: &super::layer::Layer<N>) -> Result<Vec<Grown<N>>> {
         ensure!(new.states() == self.hulls.len() as u64, "frame {}: {} new states, its hull file holds {} hulls", self.frame, new.states(), self.hulls.len());
         let layer = u16::try_from(self.frame).context("a frame past u16")?;
         let mut out: Vec<Grown<N>> = new.states_iter().zip(&self.hulls).map(|(s, &h)| (s, layer, h)).collect();
@@ -190,7 +190,7 @@ fn cuts<N: Rem, R: Runs<N> + ?Sized>(hulls: &[HullOf<N>], runs: &R) -> Vec<(bool
 /// Write frame `frame`'s frontier: its new states' `hulls` (in its state
 /// order) and its grown states in `runs` (all of them sorted by layer and
 /// state, distinct: checked). Atomic. Returns the file's bytes.
-pub fn write<N: Rem, R: Runs<N> + ?Sized>(path: &Path, frame: u32, hulls: &[HullOf<N>], runs: &R, threads: usize) -> Result<u64> {
+pub(crate) fn write<N: Rem, R: Runs<N> + ?Sized>(path: &Path, frame: u32, hulls: &[HullOf<N>], runs: &R, threads: usize) -> Result<u64> {
     let key = |g: &Grown<N>| (g.1, g.0);
     let cuts = cuts(hulls, runs);
     // Per block its bytes, and a grown block's sorted states' first and last
@@ -256,7 +256,7 @@ fn open<N: Rem>(path: &Path) -> Result<(Mapped, Header)> {
     Ok((file, header))
 }
 
-pub fn read<N: Rem>(path: &Path, threads: usize) -> Result<Frontier<N>> {
+pub(crate) fn read<N: Rem>(path: &Path, threads: usize) -> Result<Frontier<N>> {
     let (file, header) = open::<N>(path)?;
     let parts = super::wave::par_map(&header.blocks, threads, |x| decode::<N>(&file, x));
     let mut out = Frontier { frame: header.frame, ..Default::default() };
@@ -289,7 +289,7 @@ pub fn fingerprint<N: Rem>(states: impl Iterator<Item = Grown<N>>, space: &celes
 /// The hull file just written, READ BACK and compared with what was
 /// written (`write`'s arguments): FATAL otherwise (a resume would expand
 /// another frontier than the forward's).
-pub fn check<N: Rem, R: Runs<N> + ?Sized>(path: &Path, frame: u32, hulls: &[HullOf<N>], runs: &R, threads: usize) -> Result<()> {
+pub(crate) fn check<N: Rem, R: Runs<N> + ?Sized>(path: &Path, frame: u32, hulls: &[HullOf<N>], runs: &R, threads: usize) -> Result<()> {
     let (file, header) = open::<N>(path)?;
     let cuts = cuts::<N, R>(hulls, runs);
     ensure!(header.frame == frame && header.blocks.len() == cuts.len(), "{}: STORED HULLS DIFFER from the forward's (frame {} in {} blocks read back, frame {frame} in {} blocks written)", path.display(), header.frame, header.blocks.len(), cuts.len());

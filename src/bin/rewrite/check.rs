@@ -225,12 +225,12 @@ pub fn run(run: &Settings, c: Command) -> Result<()> {
 /// `engine` (an empty visited set, no filter): the successors and whether
 /// one wins.
 pub(crate) fn rerun<N: celeste_rust::search::rem::Rem>(engine: &dyn FrameStep<N>, rt2: Rt2<N>, layer: u32) -> Result<(Vec<Rt2<N>>, bool)> {
-    let wave = celeste_rust::storage::wave::one_frame(engine, vec![rt2], layer + 1)?;
+    let next = celeste_rust::storage::wave::one_frame(engine, vec![rt2], layer + 1)?;
     let mut won = false;
-    for b in &wave.next {
+    for b in &next {
         won |= wins_of(b, &engine.settings())?.contains(&true);
     }
-    Ok((wave.next, won))
+    Ok((next, won))
 }
 
 /// `check ref` in arithmetic `A`, its kernels `K`.

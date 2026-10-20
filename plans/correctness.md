@@ -32,29 +32,89 @@ settled here. Evidence is file:line at develop 19869c5d.
   it (a legitimate projection difference, or a bug). Blocks any further split-
   frame refactor (audit M6).
 
-## C4. The minimal cart guards every object move; the original does not
-- The original cart's update loop moves every object unconditionally
-  (celeste.lua:1195: `obj.move(obj.spd.x,obj.spd.y)`); the minimal cart we
-  trace guards it (celeste-minimal.lua:787: `if obj.spd.x ~= 0 or obj.spd.y
-  ~= 0 then`). `move` calls `move_x(amount,0)`, whose loop starts at 0: at
-  amount 0 it runs once with `sign(0)=0`, i.e. `is_solid(0,0)`, and inside a
-  solid sets `spd.x=0, rem.x=0`. So the search keeps a remainder the real
-  game zeroes, for an object with solids, both speeds 0, overlapping a solid,
-  on EVERY frame (not only the loading frame).
-- Origin: celeste_ocaml commit 07ba38a (2022-02-04, "Replace tile_flag_at
-  with a builtin"), no equivalence argument; copied here in b176c4fe.
-- The loading-frame patches inherit it: Rust (trace/cart.rs:264) guarded,
-  Python (pico8_diff/replay.py:229) unguarded.
-- Direction: the search could MISS a real route (validation on PICO-8 only
-  catches fake ones). Reachability unknown (an object at rest inside a solid).
-- In progress: a full classification of every original-vs-minimal difference
-  (/var/tmp/c4-quick/cart-differences.md; 21 functions identical, 33
-  changed, 23 removed, plus the native builtins and the Rust cart patches).
-- To do after: a standing DIFFERENTIAL CHECK that runs the original cart's Lua
-  and the minimal cart side by side on many inputs in every room and compares
-  game state each frame (modulo the handled differences: removed smoke and
-  lifeup objects, the jump buffer), so the minimal cart and every native
-  builtin are checked, not trusted.
+## C4. The minimal cart's move guard: UNREACHABLE (proven); pick a form
+- Original: `obj.move(obj.spd.x,obj.spd.y)` unconditionally (celeste.lua:1195);
+  minimal cart, split-frame.lua and trace/cart.rs:264 guard it on nonzero
+  speed. `move_x(amount,0)` AND `move_y` start their loops at 0 (orig 1042),
+  so `move(0,0)` inside a solid zeroes spd and rem on both axes.
+- Origin: celeste_ocaml 07ba38a (2022-02-04), no stated reason; likely the
+  native `tile_flag_at` refusing non-integer coordinates (66 routes error
+  unguarded). Copied here in b176c4fe.
+- Proven unreachable on the game's maps: only the player can have speed with
+  `solids`, and after any executed move a player inside a solid has rem and
+  spd 0; the only position changes between moves (spring, platform carry,
+  draw clamp, a fall floor reappearing) cannot embed it with speed (0,0) and
+  rem != 0. Empirically 0 divergence: 159 known routes (17,309 per-frame state
+  hashes identical), the original cart instrumented on PICO-8, and 1.56M
+  exploration steps in 16 rooms. The loading frame is identical too (rem 0).
+- To decide: (1) document the proof plus a loud check outside the cart, or
+  (2) unguard the player only (identical hashes on all routes; gates must hold).
+- Evidence: /var/tmp/c4-quick/cart-differences.md; probe worktree
+  /var/tmp/c4-wt (branch c4-probe, uncommitted), /var/tmp/c4-probe-scripts/.
+- Still to do: a standing DIFFERENTIAL CHECK running the original cart's Lua
+  and the minimal cart side by side (every room, many inputs, state per frame
+  modulo the handled differences), so the minimal cart and the native
+  builtins are checked, not trusted.
+
+## C7. HIGH: the jump buffer is removed, so the search MISSES real states
+- The original buffers a jump press for 4 updates (orig 136-142, 211-212);
+  the minimal cart jumps only on a fresh press (min 109-110, 169-170). Its
+  argument "a buffered jump executes identically to an exactly-timed press"
+  (min 102-108) is incomplete: the original can jump on two CONSECUTIVE
+  updates (a buffered jump, then a fresh press), the minimal cart cannot.
+- PROVEN on PICO-8: room (1,0), inputs /var/tmp/c4-probe-scripts/jbuf-inputs.txt:
+  the original is at (49,109) spd (-2,-2) with djump 1 at f42; the minimal
+  cart's exhaustive level-0 tree has that position and speed by f42 only with
+  djump 0. min is a subset of the original, so this only MISSES routes.
+- Open: does any room's optimum need a buffered-then-fresh pair (e.g. a
+  landing jump then an immediate wall kick)? Every result ties the community
+  TAS (made WITH the buffer): weak evidence, not proof.
+- Fix: restore `jbuffer` in the minimal cart (one 0..4 field) and re-run
+  every room (results can only stay or improve).
+
+## C8. Death and exit in the same update counts as a win
+- `kill_player` (orig 121-122) then `next_room()` (orig 305) in one update:
+  the search's win test is the room alone (frame.rs:189-212), so a dying exit
+  is a win (FAKE by the category rules; chain.py reports a death), and the
+  next room's pending-reload start is never searched (MISSES).
+- Rooms with side spikes in row 0 next to the exit: (2,2), (6,2), (0,3),
+  (2,3), (3,3). Not reached by any actual route yet.
+
+## C9. The category runner falls back to the IL start
+- tools/category_runner.py:378-380: when the previous room's database file
+  breaks the boot chain, only the IL start is searched, which may not be a
+  real start (MISSES).
+
+## C11. Balloon seeds: PICO-8 verification hands them out in another order
+- pico8_diff/replay.py assigns a file's `[seeds]` in POP order (balloons at
+  the load, chests when opened); Rust's `--balloon-seeds`
+  (`RoomObject::seeded`) and UCT use CREATION order. Where a chest precedes a
+  balloon in creation order (rooms (3,3), (5,3)), the search's concrete
+  balloons and the PICO-8 verification's get different seeds: 3 of 45
+  chest-variant replays differ (found by agent F, 2026-10-20).
+- To do: settle which order the tasdatabase's tools (Celia, UCT) define, make
+  the replay match, and re-verify the (3,3) and (5,3) uploads.
+
+## C12. Tooling degraded silently (fixed on branch simp-f, landing)
+- Since f3123072 (2026-10-15) replay.py lacked the minimal cart's
+  `__split_by_round` hook: every minimal-cart PICO-8 replay crashed, and the
+  category runner's `canon_jumps` silently dropped every jump press
+  ("original cart exit None -> None"). Re-check any runner result since then.
+- The runner also passed `--room` to export-ui, which refuses it, so its UI
+  step failed on every improvement.
+
+## C10. Smaller items
+- `rnd` is a free interval per call (stated best-case caveat); the original
+  also consumes the stream in removed code (clouds, particles, smoke's
+  `maybe()`, wall-slide `rnd(10)`, camera shake).
+- `rewrite starts` bounds the climb at 6 px a frame (safe today by margin).
+- Latent builtin issues: native `tile_flag_at` reads the boot room's
+  collision cache, not the live room; number literals parsed by decimal
+  truncation (all 15 fractional cart literals match bit for bit today).
+- A frame is always `_update();_draw()` (PICO-8 skips draws over the CPU
+  budget): suspected safe.
+- Tooling: pico8_diff/replay.py cannot run the minimal cart on PICO-8 since
+  f3123072 (no `__split_by_round` stub); fails loudly.
 
 ## C5. Verification gaps at the object and platform levels
 - At `p` the reference engine refuses to run (engines/reference.rs:539): the

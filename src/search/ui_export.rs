@@ -55,116 +55,115 @@ use crate::storage::layer::{bits, last_frame, Tree};
 /// One forward frame's stats: a `forward.tsv` row under the UI's names;
 /// its wall times go to `timings.json`.
 #[derive(Serialize, Clone, Debug)]
-pub struct FwdLine {
-    pub f: u32,
-    pub in_entries: u64,
-    pub in_lanes: u64,
-    pub raw: u64,
-    pub kept: u64,
-    pub out_entries: u64,
-    pub out_lanes: u64,
-    pub visited: u64,
+pub(crate) struct FwdLine {
+    pub(crate) f: u32,
+    pub(crate) in_entries: u64,
+    pub(crate) in_lanes: u64,
+    pub(crate) raw: u64,
+    pub(crate) kept: u64,
+    pub(crate) out_entries: u64,
+    pub(crate) out_lanes: u64,
+    pub(crate) visited: u64,
     #[serde(skip)]
-    pub times: FwdTimes,
+    pub(crate) times: FwdTimes,
 }
 
 /// A forward line's wall times and memory (`timings.json`).
 #[derive(Serialize, Clone, Debug, Default)]
-pub struct FwdTimes {
-    pub emit_ms: u64,
-    pub emit_idle: u32,
-    pub own_ms: u64,
-    pub own_idle: u32,
-    pub ckpt_ms: u64,
-    pub pos_ms: u64,
-    pub total_ms: u64,
-    pub rss_gb: f64,
+pub(crate) struct FwdTimes {
+    pub(crate) emit_ms: u64,
+    pub(crate) emit_idle: u32,
+    pub(crate) own_ms: u64,
+    pub(crate) own_idle: u32,
+    pub(crate) ckpt_ms: u64,
+    pub(crate) total_ms: u64,
+    pub(crate) rss_gb: f64,
 }
 
 #[derive(Serialize, Clone, Debug)]
-pub struct LevelRun {
-    pub level: usize,
+pub(crate) struct LevelRun {
+    pub(crate) level: usize,
     /// The level's spec (`r0sxhn`), or the arc pass's name.
-    pub precision: String,
-    pub fwd: Vec<FwdLine>,
-    pub bwd: [u32; 0],
-    pub first_win: Option<u32>,
-    pub marked: Option<u64>,
-    pub reruns: Option<u64>,
-    pub refuted: bool,
+    pub(crate) precision: String,
+    pub(crate) fwd: Vec<FwdLine>,
+    pub(crate) bwd: [u32; 0],
+    pub(crate) first_win: Option<u32>,
+    pub(crate) marked: Option<u64>,
+    pub(crate) reruns: Option<u64>,
+    pub(crate) refuted: bool,
     /// Frames in the tree (f0..frames-1).
-    pub frames: u32,
-    pub frames_file: String,
-    pub marks_file: Option<String>,
-    pub frame_states: Vec<u64>,
-    pub frame_wins: Vec<u64>,
-    pub marks_have_dist: bool,
-    pub marks_by_dist: Vec<u64>,
-    pub mlayers_file: Option<String>,
-    pub marks_by_layer: Vec<u64>,
+    pub(crate) frames: u32,
+    pub(crate) frames_file: String,
+    pub(crate) marks_file: Option<String>,
+    pub(crate) frame_states: Vec<u64>,
+    pub(crate) frame_wins: Vec<u64>,
+    pub(crate) marks_have_dist: bool,
+    pub(crate) marks_by_dist: Vec<u64>,
+    pub(crate) mlayers_file: Option<String>,
+    pub(crate) marks_by_layer: Vec<u64>,
     /// A backward over ANOTHER level's forward (`--arc`): that level's
     /// index, whose frames it shares; no forward pass of its own.
-    pub forward_of: Option<usize>,
+    pub(crate) forward_of: Option<usize>,
 }
 
 #[derive(Serialize, Clone, Debug)]
-pub struct HorizonRun {
-    pub h: u32,
-    pub levels: Vec<LevelRun>,
-    pub refuted_at: Option<usize>,
+pub(crate) struct HorizonRun {
+    pub(crate) h: u32,
+    pub(crate) levels: Vec<LevelRun>,
+    pub(crate) refuted_at: Option<usize>,
     /// No backward (exported without `--arc`): frames up to `h`, no verdict.
-    pub partial: bool,
+    pub(crate) partial: bool,
 }
 
 #[derive(Serialize, Clone, Debug)]
-pub struct Box2 {
-    pub x0: i32,
-    pub y0: i32,
-    pub w: u32,
-    pub h: u32,
+pub(crate) struct Box2 {
+    pub(crate) x0: i32,
+    pub(crate) y0: i32,
+    pub(crate) w: u32,
+    pub(crate) h: u32,
 }
 
 #[derive(Serialize, Clone, Debug)]
-pub struct Tiles {
+pub(crate) struct Tiles {
     /// `w x h` tiles of 8 px from the start room's origin, row-major.
-    pub w: u32,
-    pub h: u32,
-    pub ids: Vec<u8>,
-    pub solid: Vec<bool>,
+    pub(crate) w: u32,
+    pub(crate) h: u32,
+    pub(crate) ids: Vec<u8>,
+    pub(crate) solid: Vec<bool>,
 }
 
 #[derive(Serialize, Debug)]
-pub struct Run {
-    pub format: u32,
-    pub room: (i16, i16),
-    pub cell_box: Box2,
-    pub tiles: Tiles,
-    pub prebuild_s: Option<f64>,
-    pub optimal: Option<u32>,
-    pub horizons: Vec<HorizonRun>,
+pub(crate) struct Run {
+    pub(crate) format: u32,
+    pub(crate) room: (i16, i16),
+    pub(crate) cell_box: Box2,
+    pub(crate) tiles: Tiles,
+    pub(crate) prebuild_s: Option<f64>,
+    pub(crate) optimal: Option<u32>,
+    pub(crate) horizons: Vec<HorizonRun>,
     /// Drawn over the room: `--arc`'s `witness.txt`, or `--witness FILE`.
-    pub witness: Option<Witness>,
+    pub(crate) witness: Option<Witness>,
     /// `--reference FILE`: e.g. the community TAS in the original cart.
-    pub reference: Option<Witness>,
+    pub(crate) reference: Option<Witness>,
     /// The file the UI offers for download (`--download FILE`), verbatim.
-    pub download: Option<Download>,
+    pub(crate) download: Option<Download>,
 }
 
 #[derive(Serialize, Debug)]
-pub struct Download {
-    pub file: String,
-    pub text: String,
+pub(crate) struct Download {
+    pub(crate) file: String,
+    pub(crate) text: String,
 }
 
 /// A concrete run: its inputs, the player's (x, y) per frame from the start
 /// (`None` without a player) in the cells' pixels, and the frames a dash
 /// starts at with its direction (`R`, `U`, ...; when the file lists them).
 #[derive(Serialize, Debug)]
-pub struct Witness {
-    pub label: String,
-    pub inputs: Vec<u8>,
-    pub path: Vec<Option<(i32, i32)>>,
-    pub dashes: Vec<(u32, String)>,
+pub(crate) struct Witness {
+    pub(crate) label: String,
+    pub(crate) inputs: Vec<u8>,
+    pub(crate) path: Vec<Option<(i32, i32)>>,
+    pub(crate) dashes: Vec<(u32, String)>,
 }
 
 fn level_run(level: usize, precision: String, fwd: Vec<FwdLine>, first_win: Option<u32>) -> LevelRun {
@@ -202,7 +201,7 @@ fn read_forward_stats(dir: &Path) -> Result<Vec<FwdLine>> {
     let mut lines = text.lines();
     let header: Vec<&str> = lines.next().unwrap_or("").split('\t').collect();
     let col = |name: &str| header.iter().position(|h| *h == name).with_context(|| format!("{}: no column {name:?}", path.display()));
-    let c: Vec<usize> = ["frame", "entries_in", "lanes_in", "lanes_raw", "lanes_kept", "entries_out", "lanes_out", "visited", "wave_ms", "wave_idle_pct", "layer_ms", "ckpt_ms", "pos_ms", "total_ms", "rss_end_gb"]
+    let c: Vec<usize> = ["frame", "entries_in", "lanes_in", "lanes_raw", "lanes_kept", "entries_out", "lanes_out", "visited", "wave_ms", "wave_idle_pct", "layer_ms", "ckpt_ms", "total_ms", "rss_end_gb"]
         .iter()
         .map(|n| col(n))
         .collect::<Result<_>>()?;
@@ -232,9 +231,8 @@ fn read_forward_stats(dir: &Path) -> Result<Vec<FwdLine>> {
                     own_ms: n(10)?,
                     own_idle: 0,
                     ckpt_ms: n(11)?,
-                    pos_ms: n(12)?,
-                    total_ms: n(13)?,
-                    rss_gb: x(14)?,
+                    total_ms: n(12)?,
+                    rss_gb: x(13)?,
                 },
             },
         );
@@ -460,16 +458,19 @@ struct RegionBlocks {
 
 /// One storage region counted into `sums`, frame by frame: each block
 /// decoded, merged with the marked sets' rows at its cells, and unmapped.
-fn count_region<N: celeste_core::arith::EngineNum>(tree: &Tree<N>, rb: &RegionBlocks, sets: &[MarkedSet], sums: &[std::sync::Mutex<FrameSums>]) -> Result<()> {
+/// Does the region hold a win?
+fn count_region<N: celeste_core::arith::EngineNum>(tree: &Tree<N>, rb: &RegionBlocks, sets: &[MarkedSet], sums: &[std::sync::Mutex<FrameSums>]) -> Result<bool> {
     let geo = crate::storage::GEOMETRY;
     let (shape, slot) = (tree.shape_of(rb.region)?, rb.region % geo.slots);
     let locals = if slot == geo.no_cell_slot() { 1 } else { u64::MAX };
     let rows: Vec<CellRows> = sets.iter().map(|m| CellRows::of(m, shape, slot, locals)).collect();
+    let mut won = false;
     for &(f, bi) in &rb.blocks {
         let file = tree.frames[f].as_ref().expect("a frame with a region block");
         let e = file.region(bi).with_context(|| format!("{} region {}", file.path().display(), rb.region))?;
         file.release_region(bi)?;
         let (mut states, mut wins, mut held) = ([0u32; 64], [0u32; 64], 0u64);
+        won |= !e.wins.is_empty();
         for &m in &e.masks {
             held |= m;
             for local in bits(m) {
@@ -498,7 +499,38 @@ fn count_region<N: celeste_core::arith::EngineNum>(tree: &Tree<N>, rb: &RegionBl
     for (m, r) in sets.iter().zip(&rows) {
         r.release(&m.m)?;
     }
-    Ok(())
+    Ok(won)
+}
+
+/// Per cell of the regions `regions` (the win states'), the cells its
+/// recorded in-edges leave from, over every frame of the tree in `dir`
+/// through `last`; sorted.
+fn sources_into<N: crate::search::rem::Rem>(dir: &Path, last: u32, regions: &[u32], threads: usize) -> Result<FxHashMap<u32, Vec<u32>>> {
+    let geo = crate::storage::GEOMETRY;
+    let store = crate::storage::edges::EdgeStore::<N>::open(&dir.join("edges"), last)?;
+    let frames: Vec<u32> = (1..=last).collect();
+    let parts = crate::par::Pool::new(threads).map_with(
+        frames.len(),
+        || Ok(crate::storage::edges::Decoder::default()),
+        |dec, k| {
+            let mut pairs: Vec<(u32, u32)> = Vec::new();
+            for &r in regions {
+                for seg in store.segments(frames[k], r) {
+                    dec.bundles(&seg, |b| crate::storage::edges::expand(&geo, r, &b, |src, dst| pairs.push((dst.cell(&geo), src.cell(&geo)))))?;
+                }
+            }
+            Ok(pairs)
+        },
+    )?;
+    let mut by: FxHashMap<u32, Vec<u32>> = FxHashMap::default();
+    for (dst, src) in parts.into_iter().flatten() {
+        by.entry(dst).or_default().push(src);
+    }
+    for v in by.values_mut() {
+        v.sort_unstable();
+        v.dedup();
+    }
+    Ok(by)
 }
 
 /// Per-cell sums `(cell, n)` ascending; a count past u32 is an error.
@@ -510,16 +542,11 @@ fn sparse(m: FxHashMap<u32, u64>) -> Result<Sparse> {
 
 /// One level directory, the largest region first: per frame its states and
 /// wins per cell, and `[k]`: per frame, set `k`'s marked states per cell.
-fn read_tree<N: celeste_core::arith::EngineNum>(dir: &Path, sets: &[MarkedSet], threads: usize) -> Result<(LevelData, Vec<Vec<Sparse>>)> {
+fn read_tree<N: crate::search::rem::Rem>(dir: &Path, sets: &[MarkedSet], threads: usize) -> Result<(LevelData, Vec<Vec<Sparse>>)> {
     let n = last_frame(dir).map_or(0, |l| l as usize + 1);
-    // The pos graph, to draw wins where the player left from (below). An
-    // absent graph draws wins in place; an unloadable one is an error.
-    let graph_path = dir.join("posgraph.bin");
-    let graph = if graph_path.exists() {
-        Some(crate::search::pos_graph::PosGraph::load(&graph_path).with_context(|| format!("loading {}", graph_path.display()))?)
-    } else {
-        None
-    };
+    // Per win cell the cells its in-edges leave from, to draw wins where the
+    // player left from (below).
+    let mut graph: FxHashMap<u32, Vec<u32>> = FxHashMap::default();
     let sums: Vec<std::sync::Mutex<FrameSums>> =
         (0..n).map(|_| std::sync::Mutex::new(FrameSums { cells: Default::default(), wins: Default::default(), marked: vec![Default::default(); sets.len()] })).collect();
     if n > 0 {
@@ -534,20 +561,26 @@ fn read_tree<N: celeste_core::arith::EngineNum>(dir: &Path, sets: &[MarkedSet], 
         }
         let mut regions: Vec<RegionBlocks> = by_region.into_values().collect();
         regions.sort_unstable_by_key(|r| (std::cmp::Reverse(r.states), r.region));
-        crate::par::Pool::new(threads).map(regions.len(), |i| count_region(&tree, &regions[i], sets, &sums))?;
+        let won = crate::par::Pool::new(threads).map(regions.len(), |i| count_region(&tree, &regions[i], sets, &sums))?;
+        let mut win_regions: Vec<u32> = regions.iter().zip(won).filter(|x| x.1).map(|x| x.0.region).collect();
+        win_regions.sort_unstable();
+        graph = sources_into::<N>(dir, n as u32 - 1, &win_regions, threads)?;
     }
     let mut frames: Vec<(Sparse, Sparse)> = Vec::with_capacity(n);
     let mut layers: Vec<Vec<Sparse>> = vec![Vec::with_capacity(n); sets.len()];
     for s in sums {
         let FrameSums { mut cells, mut wins, marked } = s.into_inner().unwrap();
         // A won state's cell is in the NEXT room: draw it where its player
-        // LEFT from, the pos-graph source with the most states at the
-        // previous frame. States and wins move whole: totals are unchanged.
-        if let (Some(g), Some((prev, _))) = (graph.as_ref(), frames.last()) {
+        // LEFT from, the in-edges' source cell (any frame's) with the most
+        // states at the previous frame. States and wins move whole: totals
+        // are unchanged.
+        if let Some((prev, _)) = frames.last() {
             let prev: &Sparse = prev;
             let busiest = |win: u32| -> Option<u32> {
-                g.sources(win)
-                    .iter()
+                graph
+                    .get(&win)
+                    .into_iter()
+                    .flatten()
                     .filter_map(|&s| prev.binary_search_by_key(&s, |&(c, _)| c).ok().map(|i| prev[i]))
                     .max_by_key(|&(c, n)| (n, std::cmp::Reverse(c)))
                     .map(|(c, _)| c)
@@ -592,7 +625,7 @@ impl Writer {
 
 /// A state with no player position (the player object is gone: dead, or
 /// past the room transition) has no cell; the UI counts it off-grid.
-pub const NO_POSITION: u32 = u32::MAX;
+pub(crate) const NO_POSITION: u32 = u32::MAX;
 
 fn cell_idx(cell: u32, b: &Box2) -> Result<u32> {
     let Some((x, y)) = cell_xy(cell) else { return Ok(NO_POSITION) };
@@ -1037,8 +1070,16 @@ mod tests {
         assert!(read_forward_stats(&dir).unwrap().is_empty(), "a tree from before the record");
         let ms = std::time::Duration::from_millis;
         let row = |f: u32, kept: usize| {
-            let st = crate::frame::FrameStats { lanes_kept: kept, wave_idle: 0.94, t_wave: ms(7), rss_end: 1.28, ..Default::default() };
-            crate::frame::forward_stats_row(f, &st, ms(1), ms(2), ms(11), 4)
+            use crate::storage::stats::S;
+            let mut st = crate::storage::stats::Stats::default();
+            st.set(S::Kept, kept as u64);
+            st.set(S::WaveIdle, 94);
+            st.add_time(S::Wave, ms(7));
+            st.set_gb(S::RssEnd, 1.28);
+            st.add_time(S::Ckpt, ms(1));
+            st.add_time(S::Total, ms(11));
+            st.set(S::Visited, 4);
+            crate::frame::forward_stats_row(f, &st)
         };
         for (f, kept) in [(1, 10), (2, 20), (2, 21), (3, 30)] {
             crate::frame::append_forward_stats(&dir, &row(f, kept)).unwrap();

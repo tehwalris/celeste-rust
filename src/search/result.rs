@@ -8,9 +8,9 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
 /// The record's format; a reader refuses another.
-pub const FORMAT: u32 = 1;
+pub(crate) const FORMAT: u32 = 1;
 
-pub fn path(checkpoint_dir: &Path) -> PathBuf {
+pub(crate) fn path(checkpoint_dir: &Path) -> PathBuf {
     checkpoint_dir.join("result.json")
 }
 
@@ -39,36 +39,36 @@ pub struct LevelResult {
     /// Its tree, under the search's directory (`level00`).
     pub dir: String,
     /// The forward's wall time in this run (0 for a reused tree), seconds.
-    pub forward_s: f64,
+    pub(crate) forward_s: f64,
     /// The tree's first win, in search steps.
-    pub first_win: Option<u32>,
+    pub(crate) first_win: Option<u32>,
     /// The arc phase's bound, in frames (`None`: the horizon refuted).
     pub arc_bound: Option<u32>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct SearchResult {
-    pub format: u32,
-    pub room: (i16, i16),
+    pub(crate) format: u32,
+    pub(crate) room: (i16, i16),
     /// `--level`, as given (`r0sxhn,r0sxh`).
-    pub level: String,
+    pub(crate) level: String,
     /// The horizon in frames, and whether it was a `--ceiling`.
     pub horizon: u32,
     pub ceiling: bool,
     /// Search steps per frame (2 under `--split-frame`): the trees, the
     /// first wins and the marks count steps.
-    pub steps_per_frame: u32,
+    pub(crate) steps_per_frame: u32,
     /// The levels the search reached, in order.
     pub levels: Vec<LevelResult>,
     pub verdict: Verdict,
     /// The concrete optimum, frames.
     pub optimal: Option<u32>,
     /// Its inputs (`witness_file` holds them too).
-    pub witness: Option<Vec<u8>>,
+    pub(crate) witness: Option<Vec<u8>>,
     pub witness_file: Option<String>,
     /// The search's wall time and peak resident set (`VmHWM`, GB).
     pub wall_s: f64,
-    pub peak_gb: f64,
+    pub(crate) peak_gb: f64,
     /// Why the search stopped short (the level -1 refusal's error).
     pub error: Option<String>,
     /// A DUAL search's (`rewrite dual`; absent otherwise): `optimal` is the
@@ -80,22 +80,22 @@ pub struct SearchResult {
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct DualResult {
     /// The float half's arithmetic and tool (`float-celia`), and its start.
-    pub float: String,
-    pub float_loading_jank: Option<usize>,
+    pub(crate) float: String,
+    pub(crate) float_loading_jank: Option<usize>,
     /// The frame real play (the fixed half) leaves on, with the witness.
     pub fixed_exit: Option<u32>,
 }
 
 impl SearchResult {
     /// Atomic: a reader never sees a partial record.
-    pub fn write(&self, checkpoint_dir: &Path) -> Result<()> {
+    pub(crate) fn write(&self, checkpoint_dir: &Path) -> Result<()> {
         let p = path(checkpoint_dir);
         let tmp = p.with_extension("json.tmp");
         std::fs::write(&tmp, serde_json::to_string(self)? + "\n").with_context(|| format!("writing {}", tmp.display()))?;
         std::fs::rename(&tmp, &p).with_context(|| format!("writing {}", p.display()))
     }
 
-    pub fn read(checkpoint_dir: &Path) -> Result<Self> {
+    pub(crate) fn read(checkpoint_dir: &Path) -> Result<Self> {
         let p = path(checkpoint_dir);
         let text = std::fs::read_to_string(&p).with_context(|| format!("reading {} (a `rewrite search` directory records its result there)", p.display()))?;
         let r: SearchResult = serde_json::from_str(&text).with_context(|| format!("parsing {}", p.display()))?;

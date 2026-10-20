@@ -17,24 +17,23 @@
 //! failing step is reported (`explain`) and the search FAILS.
 
 use celeste_engine::runtime2::Rt2;
-use super::concrete::{concrete_engines, exact_state, lookup_keys, lookup_view, rem_of, rem_raw, Side};
+use super::concrete::{lookup_keys, lookup_view, rem_of, rem_raw, Side};
 use super::rem::Rem;
 use crate::compiled::KernelLanes;
-use crate::frame::{wins_of, MarkFilter, Visited};
+use crate::frame::{MarkFilter, Visited};
 use crate::storage::Sk;
-use celeste_core::arith::EngineNum;
 use celeste_core::pico8_num::Pico8Num as P8;
 
 /// A known solution to check, and the filter the level's forward ran under.
-pub struct Route<'a, N: Rem = P8> {
-    pub inputs: &'a [u8],
-    pub filter: Option<&'a MarkFilter<'a, N>>,
+pub(crate) struct Route<'a, N: Rem = P8> {
+    pub(crate) inputs: &'a [u8],
+    pub(crate) filter: Option<&'a MarkFilter<'a, N>>,
     /// Also the hull forward's claim (`Hulls`): `rewrite check known`.
-    pub hulls: bool,
+    pub(crate) hulls: bool,
 }
 
 /// What the hull forward's claim is checked against: tree, hulls, edges.
-pub struct Hulls<N: Rem = P8> {
+pub(crate) struct Hulls<N: Rem = P8> {
     tree: crate::storage::layer::Tree<N>,
     visited: crate::storage::visited::VisitedSet<N>,
     edges: crate::storage::edges::EdgeStore<N>,
@@ -44,7 +43,7 @@ pub struct Hulls<N: Rem = P8> {
 
 impl<N: Rem> Hulls<N> {
     /// The tree in `dir` through step `horizon`.
-    pub fn open(dir: &std::path::Path, horizon: u32, s: &crate::settings::Settings) -> anyhow::Result<Self> {
+    pub(crate) fn open(dir: &std::path::Path, horizon: u32, s: &crate::settings::Settings) -> anyhow::Result<Self> {
         let tree = crate::storage::layer::Tree::<N>::open(dir, horizon)?;
         let (visited, ..) = crate::frame::restore_visited::<N>(dir, horizon, s.room, s.threads())?;
         let edges = crate::storage::edges::EdgeStore::<N>::open(&dir.join("edges"), horizon)?;
@@ -57,56 +56,20 @@ impl<N: Rem> Hulls<N> {
 /// What the arc phase holds for the check (`driver::solve`).
 pub(super) struct Pruning<'a, N: Rem = P8> {
     /// The level's W as the concrete search admits states.
-    pub side: &'a Side<'a, N>,
+    pub(crate) side: &'a Side<'a, N>,
     /// In search steps.
-    pub horizon: u32,
+    pub(crate) horizon: u32,
     /// The start's node (`None`: no winning set at any frame); not looked up
     /// by its projection: the tree holds the start unwidened.
-    pub start: Option<u32>,
+    pub(crate) start: Option<u32>,
     /// This level's reached nodes (the next level's filter), if it has one.
-    pub reached: Option<&'a Visited<N>>,
+    pub(crate) reached: Option<&'a Visited<N>>,
     /// The level -1 filter the tree was built under (`TreeFilter::of_tree`).
-    pub minus_one: Option<crate::frame::MinusOne>,
+    pub(crate) minus_one: Option<crate::frame::MinusOne>,
     /// The tree's directory, for the report (read on a miss).
-    pub dir: &'a std::path::Path,
+    pub(crate) dir: &'a std::path::Path,
     /// The hull forward's claim, checked at every step (`Route::hulls`).
-    pub hulls: Option<&'a Hulls<N>>,
-}
-
-/// The route's states per step (each with its parent's index) up to the
-/// step before the exit; the exit step and its winning leaves' parents.
-struct Run<N: EngineNum> {
-    layers: Vec<Vec<(u32, Rt2<N>)>>,
-    exit: Option<(u32, Vec<u32>)>,
-}
-
-fn run<N: Rem>(inputs: &[u8], horizon: u32, settings: &crate::settings::Settings) -> anyhow::Result<(Run<N>, bool)> {
-    let clock = settings.clock();
-    let (mut engines, seeded) = concrete_engines::<N>(1, settings)?;
-    let eng = &mut engines[0];
-    let mut layers: Vec<Vec<(u32, Rt2<N>)>> = vec![vec![(0, eng.initial()?.canonicalized())]];
-    for s in 0..horizon {
-        // The step to `s + 1` is in frame `frame_of(s + 1)`: its input.
-        let Some(&byte) = inputs.get(clock.frame_of(s + 1) as usize - 1) else { break };
-        let (mut next, mut seen, mut won) = (Vec::new(), rustc_hash::FxHashSet::default(), Vec::new());
-        for (p, (_, b)) in layers.last().expect("the start").iter().enumerate() {
-            for c in eng.step(b, byte)? {
-                if wins_of(&c, settings)?.iter().any(|&x| x) {
-                    won.push(p as u32);
-                } else if seen.insert(exact_state(&c, crate::search::pos_graph::block_cells(&c)?[0])) {
-                    next.push((p as u32, c));
-                }
-            }
-        }
-        if !won.is_empty() {
-            return Ok((Run { layers, exit: Some((s + 1, won)) }, seeded));
-        }
-        if next.is_empty() {
-            break;
-        }
-        layers.push(next);
-    }
-    Ok((Run { layers, exit: None }, seeded))
+    pub(crate) hulls: Option<&'a Hulls<N>>,
 }
 
 /// The route against one level's pruning. `Ok(None)`: no win by the
@@ -114,7 +77,8 @@ fn run<N: Rem>(inputs: &[u8], horizon: u32, settings: &crate::settings::Settings
 pub(super) fn check<N: KernelLanes>(route: &Route<N>, p: &Pruning<N>) -> anyhow::Result<Option<u32>> {
     let t0 = std::time::Instant::now();
     let clock = p.side.s.clock();
-    let (run, seeded) = run::<N>(route.inputs, p.horizon, p.side.s)?;
+    let run = super::replay::Replay::<N>::of(route.inputs, Some(p.horizon), p.side.s)?;
+    let seeded = run.seeded;
     let Some((exit, winners)) = &run.exit else {
         eprintln!("[known] the known route does not exit by f{} ({} inputs): not checked", clock.frame_of(p.horizon), route.inputs.len());
         return Ok(None);
@@ -144,7 +108,7 @@ pub(super) fn check<N: KernelLanes>(route: &Route<N>, p: &Pruning<N>) -> anyhow:
     }
     let last = run.layers.len() - 1;
     let states: usize = run.layers.iter().map(Vec::len).sum();
-    if winners.iter().any(|&w| good[last][w as usize]) {
+    if winners.iter().any(|&(w, _)| good[last][w as usize]) {
         eprintln!(
             "[known] level {}: the known route (exit f{frame}) survives every pruning step at h{}: {states} states over {} steps, {}; {:.2} s",
             p.side.level,
@@ -168,12 +132,8 @@ pub(super) fn check<N: KernelLanes>(route: &Route<N>, p: &Pruning<N>) -> anyhow:
     // Per winning lineage (at most 3): where the FORWARD lost the route (the
     // arc phase's misses after it follow from it), else its first failure.
     let mut lineages: Vec<Vec<usize>> = Vec::new();
-    for &w in winners.iter().take(3) {
-        let mut idx = vec![0usize; run.layers.len()];
-        idx[last] = w as usize;
-        for s in (1..=last).rev() {
-            idx[s - 1] = run.layers[s][idx[s]].0 as usize;
-        }
+    for &(w, _) in winners.iter().take(3) {
+        let idx = run.lineage(last, w as usize);
         if !lineages.contains(&idx) {
             lineages.push(idx);
         }
@@ -216,7 +176,7 @@ pub(super) fn check<N: KernelLanes>(route: &Route<N>, p: &Pruning<N>) -> anyhow:
 /// frame before, stepped by the level's kernels; the state among the
 /// successors (made, not kept: a win, level -1, a filter) or not (a
 /// SOUNDNESS gap in the kernels), and the nearest ones.
-fn explain<N: KernelLanes>(run: &Run<N>, idx: &[usize], s: usize, seeded: bool, p: &Pruning<N>) -> anyhow::Result<Vec<String>> {
+fn explain<N: KernelLanes>(run: &super::replay::Replay<N>, idx: &[usize], s: usize, seeded: bool, p: &Pruning<N>) -> anyhow::Result<Vec<String>> {
     use crate::search::inspect::{brief, project_onto, Proj};
     let per_frame = p.side.s.clock().per_frame as usize;
     let s0 = s.checked_sub(per_frame).ok_or_else(|| anyhow::anyhow!("the start is the tree's"))?;
@@ -231,7 +191,7 @@ fn explain<N: KernelLanes>(run: &Run<N>, idx: &[usize], s: usize, seeded: bool, 
     let kernels = crate::compiled::Kernels::<N>::new(p.side.s, p.side.level)?;
     let mut blocks = vec![tree.row(layer, sk, p.side.s.room)?];
     for k in 0..per_frame {
-        blocks = crate::storage::wave::one_frame(&kernels, blocks, layer + 1 + k as u32)?.next;
+        blocks = crate::storage::wave::one_frame(&kernels, blocks, layer + 1 + k as u32)?;
     }
     let kset: std::collections::BTreeSet<Proj> = blocks.into_iter().flat_map(|mut b| project_onto(&mut b, p.side.level)).collect();
     let want = project_onto(&mut lookup_view(&run.layers[s][idx[s]].1, seeded)?, p.side.level).remove(0);
