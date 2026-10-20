@@ -408,7 +408,7 @@ impl<A: GraphArith> Graph<A> {
         match op {
             // Fragment 0 is never empty, so `FragOk(0)` is true (as in `eval`).
             Op::FragOk(0) | Op::RFragOk(0) => return self.leaf(Op::ConstBool(true)),
-            // The span premise over a LITERAL is decided once (`zi_span_ok`).
+            // The span premise over a LITERAL is decided once (the kernel's `zi_span_ok`).
             Op::SplitOk(n) => {
                 if let Op::Const(lo, hi) = self.nodes[args[0] as usize].op {
                     return self.leaf(Op::ConstBool(A::lit_split_ok(lo, hi, n)));
@@ -817,7 +817,7 @@ impl<A: GraphArith> Graph<A> {
                 }
                 // Fragment `c`'s low end, exact (lenient: its hull over lanes).
                 Op::IntFrag(c) => Val::Num(A::ev_int_frag(a!(0).as_num("IntFrag")?, *c, lenient)),
-                // `zi_span_ok`: high end's floor at most `ways - 1` cells above
+                // The kernel's `zi_span_ok`: high end's floor at most `ways - 1` cells above
                 // the low end's. On a hull: fits => every lane fits, else unknown.
                 Op::SplitOk(ways) => {
                     let iv = a!(0).as_num("SplitOk")?;
@@ -852,7 +852,7 @@ impl<A: GraphArith> Graph<A> {
                     };
                     Val::Bool(if fits || !lenient { Some(fits) } else { None })
                 }
-                // The RESOLVED fork: `zi_fork_flr` on one interval.
+                // The RESOLVED fork: the kernel's `zi_fork_flr` on one interval.
                 Op::Frag(c) | Op::FragOk(c) => {
                     let iv = a!(0).as_num("Frag")?;
                     // Cells spanned minus one.
@@ -1296,25 +1296,6 @@ mod tests {
         // false AND unknown is FALSE, not unknown.
         let cells = HashMap::from([(1u32, Val::Bool(Some(false))), (2u32, Val::Bool(None))]);
         assert_eq!(g.eval(&cells).unwrap()[and as usize], Val::Bool(Some(false)));
-    }
-
-    /// `SplitOk(n)` over a literal folds to what `zi_span_ok` computes.
-    #[test]
-    fn split_ok_of_a_literal_is_what_zi_span_ok_says() {
-        use celeste_engine::kernel::{zi_span_ok, zn_splat, ALL, ZI};
-        let raws = [i32::MIN, -0x2_8000, -0x1_0000, -1, 0, 1, 0x8000, 0xffff, 0x1_0000, 0x1_0001, 0x2_0000, 0x3_7fff, i32::MAX - 0x1_0000, i32::MAX];
-        let mut g = Graph::new();
-        for &lo in &raws {
-            for &hi in raws.iter().filter(|h| **h >= lo) {
-                let c = g.leaf(Op::Const(lo, hi));
-                for ways in 1..=4u8 {
-                    let got = g.fold(Op::SplitOk(ways), vec![c]);
-                    let iv = ZI { lo: zn_splat(Pico8Num::from_raw(lo)), hi: zn_splat(Pico8Num::from_raw(hi)) };
-                    let want = zi_span_ok(iv, ways).val == ALL;
-                    assert_eq!(g.get(got).op, Op::ConstBool(want), "ways {ways} [{lo:#x}, {hi:#x}]");
-                }
-            }
-        }
     }
 
     #[test]

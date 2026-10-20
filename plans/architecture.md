@@ -38,8 +38,7 @@ crates/celeste-core     numbers (Pico8Num 16.16, LuaF64, the Arith trait),     d
                         cart data, collision cache, builtins
 crates/celeste-names    FROZEN name tables (FIELD_NAMES order = canonical       deps: -
                         field order; append only)
-crates/celeste-engine   Rt2 blocks, exact keys, lane primitives, the            deps: core, names
-                        widening table
+crates/celeste-engine   Rt2 blocks, exact keys, the widening table          deps: core, names
 celeste-rust (src/)
   frame.rs              the forward (ForwardState: start, resume, extend),
                         trees (grow_tree, TreeFilter), wins, MarkFilter

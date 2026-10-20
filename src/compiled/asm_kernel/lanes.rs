@@ -59,6 +59,14 @@ thread_local! {
 static RESIDENT_FIXED: std::sync::Mutex<super::Resident<P8>> = std::sync::Mutex::new(None);
 static RESIDENT_FLOAT: std::sync::Mutex<super::Resident<LuaF64>> = std::sync::Mutex::new(None);
 
+// The kernels are AVX-512, and so are the lane compares below.
+#[cfg(not(target_feature = "avx512f"))]
+compile_error!(
+    "the kernels need AVX-512F/DQ. The workspace's .cargo/config.toml passes \
+     `-C target-cpu=native`; on an older machine add \
+     `-C target-feature=+avx512f,+avx512dq`."
+);
+
 /// The 16 lanes of the 32-bit column at byte `o`.
 #[inline]
 fn col32(buf: &[u8], o: usize) -> [u32; 16] {
@@ -68,7 +76,7 @@ fn col32(buf: &[u8], o: usize) -> [u32; 16] {
 }
 
 /// The lanes where `c` holds `v` (one AVX-512 compare: every build has it,
-/// `celeste_engine::kernel`).
+/// above).
 #[inline]
 fn eq32(c: &[u32; 16], v: u32) -> u16 {
     use core::arch::x86_64::{_mm512_cmpeq_epi32_mask, _mm512_loadu_si512, _mm512_set1_epi32};

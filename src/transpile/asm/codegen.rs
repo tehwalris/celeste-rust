@@ -1,5 +1,5 @@
 //! `transpile::graph::Graph` -> AVX-512 GAS assembly: numeric, interval and
-//! tri-state boolean ops, bit-for-bit `celeste_engine::kernel` (checked by
+//! tri-state boolean ops, bit for bit the arithmetic's own (checked by
 //! `super::tests`). Lower to SSA over vregs (GVN), list-schedule,
 //! linear-scan allocate, emit. Per arithmetic (`AsmArith`): 16.16 lowers to
 //! 16 `i32` lanes a zmm (this file), the doubles to 8 `f64` lanes (`float`),
@@ -796,7 +796,7 @@ impl Lower<'_, Fixed> {
     }
     /// `Op::NoWrap` of interval `+`/`-` with result `r`, neither operand a
     /// literal point: overflow iff `(x^r)&(y^r)` (add) / `(x^y)&(x^r)` (sub)
-    /// is negative (`kernel::zi_*_wraps`).
+    /// is negative.
     fn zi_arith_no_wrap(&mut self, sub: bool, a: [Vreg; 2], b: [Vreg; 2], r: [Vreg; 2]) -> Vreg {
         let (bl, bh, imm) = if sub { (b[1], b[0], 0x18) } else { (b[0], b[1], 0x42) };
         let ol = self.ternlog(a[0], bl, r[0], imm);
@@ -805,7 +805,7 @@ impl Lower<'_, Fixed> {
         let zero = self.num_reg(NumVal::ConstI32(0));
         self.cmp(5, any, Src::Reg(zero)) // any >= 0  (NLT)
     }
-    /// The same for a POINT `+`/`-` (`kernel::zn_*_wraps`): one plane.
+    /// The same for a POINT `+`/`-`: one plane.
     fn zn_arith_no_wrap(&mut self, sub: bool, a: Vreg, b: Vreg, r: Vreg) -> Vreg {
         let o = self.ternlog(a, b, r, if sub { 0x18 } else { 0x42 });
         let zero = self.num_reg(NumVal::ConstI32(0));

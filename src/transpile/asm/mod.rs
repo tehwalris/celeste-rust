@@ -1,7 +1,8 @@
 //! The AVX-512 assembly backend: a traced kernel graph is compiled to GAS
 //! text (`codegen`), assembled with gcc and loaded with `dlopen` (`jit`).
 //! Ops it does not vectorise inline go through call-outs (`callout`).
-//! `tests` checks every op bit-exact against the Rust lane primitives.
+//! `tests` checks every op, in both arithmetics, bit for bit against the
+//! arithmetic's own scalar operations.
 
 mod callout;
 mod codegen;
@@ -71,5 +72,3 @@ pub fn compile_and_load_reprs<A: AsmArith>(
 
 #[cfg(test)]
 mod tests;
-#[cfg(test)]
-mod tests_float;

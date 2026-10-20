@@ -194,11 +194,11 @@ pub trait Domain: Clone + Default {
     fn sel_num(&mut self, c: &Self::Bool, t: &Self::Num, f: &Self::Num) -> Self::Num;
     fn sel_bool(&mut self, c: &Self::Bool, t: &Self::Bool, f: &Self::Bool) -> Self::Bool;
 
-    /// `mget(x, y)` with coordinates unknown at trace time (`zn_mget`).
+    /// `mget(x, y)` with coordinates unknown at trace time (a call-out).
     fn mget(&mut self, x: &Self::Num, y: &Self::Num) -> Result<Self::Num>;
 
     /// `tile_flag_at(x, y, w, h, flag)` with coordinates unknown at trace
-    /// time: a primitive (`zn_tile_flag_at`), since the Lua's scan bounds
+    /// time: a primitive (a call-out), since the Lua's scan bounds
     /// derive from x and y. The caller folds the known case.
     fn tile_flag_at(
         &mut self,
