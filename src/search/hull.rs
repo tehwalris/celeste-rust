@@ -14,7 +14,9 @@
 //! holding the union when the union fits in half the circle (its largest
 //! gap, longer than half, holds a cut), and a superset otherwise.
 
-use super::arcs::{clip, Circle, Fixed16, Piece, Region, Seg};
+use super::arcs::{clip, Circle, Fixed16, Seg};
+#[cfg(test)]
+use super::arcs::{Piece, Region};
 use super::rem::Rem;
 use celeste_core::pico8_num::Pico8Num as P8;
 
@@ -39,39 +41,40 @@ fn num<C: Circle>(w: C::W) -> u64 {
 /// end (the whole circle starts at the first point).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Default)]
 #[repr(C)]
-pub struct Arc<C: Circle = Fixed16> {
-    pub start: C::W,
-    pub last: C::W,
+pub(crate) struct Arc<C: Circle = Fixed16> {
+    pub(crate) start: C::W,
+    pub(crate) last: C::W,
 }
 
 impl<C: Circle> Arc<C> {
-    pub fn point(p: C::P) -> Self {
+    pub(crate) fn point(p: C::P) -> Self {
         debug_assert!(p < C::SIZE);
         Arc { start: C::store(p), last: word::<C>(0) }
     }
 
-    pub fn full() -> Self {
+    pub(crate) fn full() -> Self {
         Arc { start: word::<C>(0), last: word::<C>(size::<C>() - 1) }
     }
 
     /// Its number of points.
     #[inline]
-    pub fn len(self) -> u64 {
+    pub(crate) fn len(self) -> u64 {
         num::<C>(self.last) + 1
     }
 
     #[inline]
-    pub fn is_full(self) -> bool {
+    pub(crate) fn is_full(self) -> bool {
         self.len() == size::<C>()
     }
 
     #[inline]
-    pub fn contains(self, p: C::P) -> bool {
+    pub(crate) fn contains(self, p: C::P) -> bool {
         (C::wide(p) + size::<C>() - num::<C>(self.start)) % size::<C>() <= num::<C>(self.last)
     }
 
     /// Does it hold every point of segment `s`?
-    pub fn contains_seg(self, s: Seg<C::P>) -> bool {
+    #[cfg(test)]
+    pub(crate) fn contains_seg(self, s: Seg<C::P>) -> bool {
         let at = |p: u64| (p + size::<C>() - num::<C>(self.start)) % size::<C>();
         let (lo, last) = (C::wide(s.lo), C::wide(s.hi) - 1);
         let (a, b) = (at(lo), at(last));
@@ -80,7 +83,7 @@ impl<C: Circle> Arc<C> {
 
     /// The arc as segments of the circle (one, or two across the end).
     #[inline]
-    pub fn segs(self, mut f: impl FnMut(Seg<C::P>)) {
+    pub(crate) fn segs(self, mut f: impl FnMut(Seg<C::P>)) {
         let (a, n, end) = (num::<C>(self.start), self.len(), size::<C>());
         let seg = |lo: u64, hi: u64| Seg { lo: C::narrow(lo), hi: C::narrow(hi) };
         if a + n <= end {
@@ -96,8 +99,8 @@ impl<C: Circle> Arc<C> {
 #[derive(Clone, Copy, Debug, Hash, PartialOrd, Ord, Default)]
 #[repr(C)]
 pub struct Hull<C: Circle = Fixed16> {
-    pub x: Arc<C>,
-    pub y: Arc<C>,
+    pub(crate) x: Arc<C>,
+    pub(crate) y: Arc<C>,
 }
 
 /// Equal by `Circle::same4` (16.16's one 8-byte compare: field by field
@@ -111,34 +114,35 @@ impl<C: Circle> PartialEq for Hull<C> {
 
 impl<C: Circle> Eq for Hull<C> {}
 
-pub type HullOf<N> = Hull<<N as Rem>::C>;
+pub(crate) type HullOf<N> = Hull<<N as Rem>::C>;
 
-pub type AccOf<N> = HullAcc<<N as Rem>::C>;
+pub(crate) type AccOf<N> = HullAcc<<N as Rem>::C>;
 
 impl<C: Circle> Hull<C> {
     /// Bytes a hull takes on disk (`to_bytes`).
-    pub const BYTES: usize = 4 * C::W_BYTES;
+    pub(crate) const BYTES: usize = 4 * C::W_BYTES;
 
     /// The point `(x, y)` (a start's exact remainder).
-    pub fn point(x: C::P, y: C::P) -> Self {
+    pub(crate) fn point(x: C::P, y: C::P) -> Self {
         Hull { x: Arc::point(x), y: Arc::point(y) }
     }
 
-    pub fn full() -> Self {
+    pub(crate) fn full() -> Self {
         Hull { x: Arc::full(), y: Arc::full() }
     }
 
-    pub fn is_full(&self) -> bool {
+    pub(crate) fn is_full(&self) -> bool {
         self.x.is_full() && self.y.is_full()
     }
 
     #[inline]
-    pub fn contains(&self, x: C::P, y: C::P) -> bool {
+    pub(crate) fn contains(&self, x: C::P, y: C::P) -> bool {
         self.x.contains(x) && self.y.contains(y)
     }
 
     /// The hull as a set of the torus (`arcs::Region`).
-    pub fn to_region(&self) -> Region<C> {
+    #[cfg(test)]
+    pub(crate) fn to_region(&self) -> Region<C> {
         let mut pieces = Vec::new();
         self.y.segs(|y| self.x.segs(|x| pieces.push(Piece { y, x })));
         Region::from_pieces(&mut pieces, &mut Vec::new())
@@ -148,7 +152,7 @@ impl<C: Circle> Hull<C> {
     /// points inside the guard, moved by the action. Whether it pushed (not
     /// where either guard misses the arc: a box with an empty side is empty).
     #[inline]
-    pub fn push(&self, t: &(C::Act, C::Act), acc: &mut HullAcc<C>) -> bool {
+    pub(crate) fn push(&self, t: &(C::Act, C::Act), acc: &mut HullAcc<C>) -> bool {
         let mut xs = [Seg::default(); 4];
         let nx = image(self.x, &t.0, &mut xs);
         if nx == 0 {
@@ -175,7 +179,7 @@ impl<C: Circle> Hull<C> {
     /// or an axis not sent to a constant (its point either way) meets more of
     /// the guard.
     #[inline]
-    pub fn push_grown(&self, was: &Hull<C>, t: &(C::Act, C::Act), acc: &mut HullAcc<C>) -> bool {
+    pub(crate) fn push_grown(&self, was: &Hull<C>, t: &(C::Act, C::Act), acc: &mut HullAcc<C>) -> bool {
         let (nx, ny) = (meet(self.x, &t.0), meet(self.y, &t.1));
         if nx == 0 || ny == 0 {
             return false;
@@ -196,18 +200,18 @@ impl<C: Circle> Hull<C> {
 
     /// Its hash (`Circle::hash4`: 16.16's is the four words in one).
     #[inline]
-    pub fn hash(&self) -> u64 {
+    pub(crate) fn hash(&self) -> u64 {
         C::hash4(self.words())
     }
 
     /// Append its `BYTES`: its words, little-endian.
-    pub fn to_bytes(&self, out: &mut Vec<u8>) {
+    pub(crate) fn to_bytes(&self, out: &mut Vec<u8>) {
         for w in self.words() {
             C::put_word(w, out);
         }
     }
 
-    pub fn from_bytes(b: &[u8]) -> Self {
+    pub(crate) fn from_bytes(b: &[u8]) -> Self {
         let w = |i: usize| C::get_word(&b[i * C::W_BYTES..]);
         Hull { x: Arc { start: w(0), last: w(1) }, y: Arc { start: w(2), last: w(3) } }
     }
@@ -241,7 +245,7 @@ fn image<C: Circle>(a: Arc<C>, t: &C::Act, out: &mut [Seg<C::P>; 4]) -> usize {
 /// A direct-mapped cache `(hull, the hull it last pushed, transfer id) ->
 /// the push` (`None`: nothing): sources share hulls and transfers, and a
 /// push depends on nothing else. A new `epoch` when the ids change meaning.
-pub struct PushCache<N: Rem = P8> {
+pub(crate) struct PushCache<N: Rem = P8> {
     slots: Vec<Slot<N::C>>,
     epoch: u32,
 }
@@ -260,7 +264,7 @@ impl<N: Rem> Default for PushCache<N> {
 
 impl<N: Rem> PushCache<N> {
     /// The transfer ids change meaning from here.
-    pub fn next_epoch(&mut self) {
+    pub(crate) fn next_epoch(&mut self) {
         self.epoch = self.epoch.wrapping_add(1);
         if self.epoch == u32::MAX {
             self.slots.fill((Hull::default(), Hull::default(), u32::MAX, u32::MAX, None));
@@ -271,7 +275,7 @@ impl<N: Rem> PushCache<N> {
     /// The push of `h` (`was`: its last pushed hull; itself for a hull
     /// pushed the first time) along transfer `x`, `f()` on a miss.
     #[inline]
-    pub fn get(&mut self, h: &HullOf<N>, was: &HullOf<N>, x: u32, f: impl FnOnce() -> Option<AccOf<N>>) -> Option<AccOf<N>> {
+    pub(crate) fn get(&mut self, h: &HullOf<N>, was: &HullOf<N>, x: u32, f: impl FnOnce() -> Option<AccOf<N>>) -> Option<AccOf<N>> {
         let (a, b) = (h.hash(), was.hash());
         let k = ((a ^ b.rotate_left(29) ^ (x as u64) << 45).wrapping_mul(0x9e37_79b9_7f4a_7c15) >> (64 - PUSH_CACHE.trailing_zeros())) as usize;
         let e = &mut self.slots[k];
@@ -288,7 +292,7 @@ impl<N: Rem> PushCache<N> {
 /// remainder-free forward, which the hull forward must stay inside
 /// (`frame::tests`). Process-global: nextest runs each test in its process.
 #[cfg(test)]
-pub static WIDEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+pub(crate) static WIDEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Chart `c`'s cut (the first point, the middle): `p`'s coordinate in it is
 /// `(p - cut(c)) mod size`.
@@ -300,7 +304,7 @@ fn cut<C: Circle>(c: usize) -> u64 {
 /// A HULL BEING ACCUMULATED: per axis and chart (`axis * 2 + chart`) the
 /// interval `[lo, hi]` of every point added (`lo > hi`: none).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct HullAcc<C: Circle = Fixed16> {
+pub(crate) struct HullAcc<C: Circle = Fixed16> {
     lo: [C::W; 4],
     hi: [C::W; 4],
 }
@@ -315,13 +319,13 @@ impl<C: Circle> Default for HullAcc<C> {
 impl<C: Circle> HullAcc<C> {
     /// Empty (on either axis: a box with an empty side is empty)?
     #[inline]
-    pub fn is_empty(&self) -> bool {
+    pub(crate) fn is_empty(&self) -> bool {
         self.lo[0] > self.hi[0] || self.lo[2] > self.hi[2]
     }
 
     /// Add segment `s` of axis `axis` (0: x, 1: y).
     #[inline]
-    pub fn add_seg(&mut self, axis: usize, s: Seg<C::P>) {
+    pub(crate) fn add_seg(&mut self, axis: usize, s: Seg<C::P>) {
         let n = size::<C>();
         let (lo, last) = (C::wide(s.lo), C::wide(s.hi) - 1);
         debug_assert!(lo <= last && last < n);
@@ -337,14 +341,14 @@ impl<C: Circle> HullAcc<C> {
 
     /// Add every point of `h`.
     #[inline]
-    pub fn add_hull(&mut self, h: &Hull<C>) {
+    pub(crate) fn add_hull(&mut self, h: &Hull<C>) {
         h.x.segs(|s| self.add_seg(0, s));
         h.y.segs(|s| self.add_seg(1, s));
     }
 
     /// Add everything `o` holds.
     #[inline]
-    pub fn merge(&mut self, o: &HullAcc<C>) {
+    pub(crate) fn merge(&mut self, o: &HullAcc<C>) {
         for i in 0..4 {
             self.lo[i] = self.lo[i].min(o.lo[i]);
             self.hi[i] = self.hi[i].max(o.hi[i]);
@@ -352,7 +356,7 @@ impl<C: Circle> HullAcc<C> {
     }
 
     /// Per axis the shorter chart's arc (chart 0 on a tie); `None`: empty.
-    pub fn hull(&self) -> Option<Hull<C>> {
+    pub(crate) fn hull(&self) -> Option<Hull<C>> {
         if self.is_empty() {
             return None;
         }

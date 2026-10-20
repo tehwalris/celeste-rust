@@ -2,7 +2,7 @@
 //! assemble each (shape, region)'s fused fork-free graph, and dispatch
 //! chunks to it. The APPEND step emits each `live & !error` lane at the
 //! boundary: canonical structure, its row key exactly as
-//! `Rt2::boundary_finish` (`--key-check`), its pos-graph edge and transfer.
+//! `Rt2::boundary_finish` (`--key-check`), its cell and transfer.
 
 use std::collections::HashMap;
 use std::os::raw::c_void;
@@ -253,7 +253,7 @@ impl<N: KernelLanes> AsmKernel<N> {
     /// `only`: the kernel, each body's lanes (`live & !error`, less those
     /// an earlier body emits identically), then their EMISSION (`emit`).
     fn run_slice(&self, chunk: &Rt2<N>, lanes: &[usize], only: u16, sink: &mut crate::storage::unit::UnitSink<N>) -> bool {
-        let t_setup = crate::frame::phases::start(sink.phases);
+        let t_setup = sink.stats.tick_start();
         let n = lanes.len();
         debug_assert!((1..=16).contains(&n));
         if let Some(c) = &self.mix_slices {
@@ -269,10 +269,10 @@ impl<N: KernelLanes> AsmKernel<N> {
 
         // Utilization tallies, folded into `CALL_STATS[3..]` at the end.
         let (mut n_bodies, mut n_bodies_taken, mut n_lanes) = (0u64, 0u64, 0u64);
-        let t_ph = crate::frame::phases::add(crate::frame::phases::SETUP, t_setup);
+        let t_ph = sink.stats.tick(crate::storage::stats::S::PhSetup, t_setup);
         let ((ihalf, ohalf), _) = self.halves();
         self.pack_input(&views, lanes, inbuf, ihalf);
-        let t_ph = crate::frame::phases::add(crate::frame::phases::PACK, t_ph);
+        let t_ph = sink.stats.tick(crate::storage::stats::S::PhPack, t_ph);
         // The spill frame is on THIS thread's stack: refuse rather than overrun.
         let (frame, stack) = (self.compiled.frame_bytes as usize, thread_stack());
         assert!(
@@ -290,7 +290,7 @@ impl<N: KernelLanes> AsmKernel<N> {
                 &ctx as *const AsmCtx as *const c_void,
             );
         }
-        let t_emit = crate::frame::phases::add(crate::frame::phases::KERNEL, t_ph);
+        let t_emit = sink.stats.tick(crate::storage::stats::S::PhKernel, t_ph);
         let valid = (((1u32 << n) - 1) as u16) & only;
         for (bi, body) in self.bodies.iter().enumerate() {
             // Tri-state masks, each read where it MAY hold.
@@ -360,7 +360,7 @@ impl<N: KernelLanes> AsmKernel<N> {
         }
         let n_unique = self.emit(emit::Slice { chunk, lanes, buf: outbuf, half: ohalf, takes, parts }, sink);
         if t_emit != 0 {
-            crate::frame::phases::add(crate::frame::phases::EMIT, t_emit);
+            sink.stats.tick(crate::storage::stats::S::PhEmit, t_emit);
         }
         sc.put_back();
         stats([0, only.count_ones().min(n as u32) as u64, 16, n_bodies, n_bodies_taken, n_lanes, n_unique]);

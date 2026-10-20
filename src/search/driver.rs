@@ -265,31 +265,31 @@ fn run_levels<N: KernelLanes>(
     anyhow::bail!("no level given")
 }
 
-pub struct Solved<N: Rem = P8> {
+pub(crate) struct Solved<N: Rem = P8> {
     /// The rotation graph's optimum, a lower bound on the game's, in FRAMES
     /// (the marks' deadlines count steps); `None`: the horizon is REFUTED.
-    pub arc: Option<u32>,
+    pub(crate) arc: Option<u32>,
     /// The concrete optimum and its witness, when asked for and found.
-    pub concrete: Option<Witness>,
+    pub(crate) concrete: Option<Witness>,
     /// The ARC-MARKED nodes with their deadlines (the last frame their
     /// winning set is non-empty): the next level's `frame::MarkFilter`.
-    pub arc_marks: Option<crate::frame::Visited<N>>,
+    pub(crate) arc_marks: Option<crate::frame::Visited<N>>,
     /// The known route's exit frame when it was checked (`search::known`):
     /// it wins by the horizon and survives every pruning step.
-    pub known: Option<u32>,
+    pub(crate) known: Option<u32>,
     /// W and its node keys, with `keep_arcs`: a dual search's half.
-    pub arcs: Option<Arcs<N>>,
+    pub(crate) arcs: Option<Arcs<N>>,
 }
 
 /// A level's arc phase as the concrete searches read it: W, the tree's
 /// shapes (W's nodes' regions) and its key space.
-pub struct Arcs<N: Rem = P8> {
-    pub w: Winning<N::C>,
-    pub shapes: Vec<u64>,
-    pub space: celeste_engine::exact::KeySpace<N>,
+pub(crate) struct Arcs<N: Rem = P8> {
+    pub(crate) w: Winning<N::C>,
+    pub(crate) shapes: Vec<u64>,
+    pub(crate) space: celeste_engine::exact::KeySpace<N>,
     /// The level its nodes key at, and the horizon in search steps.
-    pub level: crate::abstraction::Level,
-    pub horizon: u32,
+    pub(crate) level: crate::abstraction::Level,
+    pub(crate) horizon: u32,
 }
 
 /// THE ARC PHASE over a finished tree: `backward`, `optimum`, and with
@@ -299,7 +299,7 @@ pub struct Arcs<N: Rem = P8> {
 /// `reach::inside_w` reaches) and the witness. `known`: a known solution
 /// checked against every pruning step first, an error if one drops it.
 #[allow(clippy::too_many_arguments)]
-pub fn solve<N: crate::compiled::KernelLanes>(
+pub(crate) fn solve<N: crate::compiled::KernelLanes>(
     dir: &std::path::Path,
     level: crate::abstraction::Level,
     horizon: u32,

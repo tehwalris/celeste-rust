@@ -85,6 +85,24 @@ settled here. Evidence is file:line at develop 19869c5d.
   breaks the boot chain, only the IL start is searched, which may not be a
   real start (MISSES).
 
+## C11. Balloon seeds: PICO-8 verification hands them out in another order
+- pico8_diff/replay.py assigns a file's `[seeds]` in POP order (balloons at
+  the load, chests when opened); Rust's `--balloon-seeds`
+  (`RoomObject::seeded`) and UCT use CREATION order. Where a chest precedes a
+  balloon in creation order (rooms (3,3), (5,3)), the search's concrete
+  balloons and the PICO-8 verification's get different seeds: 3 of 45
+  chest-variant replays differ (found by agent F, 2026-10-20).
+- To do: settle which order the tasdatabase's tools (Celia, UCT) define, make
+  the replay match, and re-verify the (3,3) and (5,3) uploads.
+
+## C12. Tooling degraded silently (fixed on branch simp-f, landing)
+- Since f3123072 (2026-10-15) replay.py lacked the minimal cart's
+  `__split_by_round` hook: every minimal-cart PICO-8 replay crashed, and the
+  category runner's `canon_jumps` silently dropped every jump press
+  ("original cart exit None -> None"). Re-check any runner result since then.
+- The runner also passed `--room` to export-ui, which refuses it, so its UI
+  step failed on every improvement.
+
 ## C10. Smaller items
 - `rnd` is a free interval per call (stated best-case caveat); the original
   also consumes the stream in removed code (clouds, particles, smoke's

@@ -2,8 +2,8 @@
 // per-frame and per-iteration totals laid end to end after the kernel
 // prebuild; the log has no wall clock, so this is the search's own
 // accounting). Rows: horizon, level, phase, then every frame / iteration
-// as a column split into its parts (emit / own / checkpoint / pos-graph
-// for a forward frame, parallel vs serial for a backward iteration).
+// as a column split into its parts (emit / own / checkpoint for a
+// forward frame, parallel vs serial for a backward iteration).
 // Zoom by SELECTING a span: drag across the overview strip or across the
 // waterfall itself, or tap a horizon / level / phase block; "back" pops
 // the previous span, "whole run" resets. Pinch and wheel still zoom.
@@ -55,7 +55,7 @@ export function timelineView(run: Run, chs: Chapter[]): View {
       const parts: Block["parts"] = [];
       if (c.phase === "fwd") {
         const l = c.levelRun.fwd[i];
-        parts.push({ name: "emit (kernel)", ms: l.emit_ms, color: fwdSplit.emit }, { name: "own (filter + door + append)", ms: l.own_ms, color: fwdSplit.own }, { name: "checkpoint", ms: l.ckpt_ms, color: fwdSplit.ckpt }, { name: "pos-graph", ms: l.pos_ms, color: fwdSplit.pos });
+        parts.push({ name: "emit (kernel)", ms: l.emit_ms, color: fwdSplit.emit }, { name: "own (filter + door + append)", ms: l.own_ms, color: fwdSplit.own }, { name: "checkpoint", ms: l.ckpt_ms, color: fwdSplit.ckpt });
         const rest = ms - parts.reduce((a, p) => a + p.ms, 0);
         if (rest > 0) parts.push({ name: "other", ms: rest, color: "#4b5563" });
       } else {
@@ -85,7 +85,7 @@ export function timelineView(run: Run, chs: Chapter[]): View {
   const detail = el("div", { class: "wf-detail" });
   const bars = el("div", { class: "wf-bars" });
   const legend = el("div", { class: "legend" }, [
-    ...Object.entries({ "forward: emit (kernel)": fwdSplit.emit, "own (filter, door, append)": fwdSplit.own, checkpoint: fwdSplit.ckpt, "pos-graph": fwdSplit.pos, "backward: parallel (re-run)": bwdSplit.par, "serial (load, mark)": bwdSplit.load }).map(([k, c]) => el("span", { class: "key" }, [el("i", { style: `background:${c}` }), k])),
+    ...Object.entries({ "forward: emit (kernel)": fwdSplit.emit, "own (filter, door, append)": fwdSplit.own, checkpoint: fwdSplit.ckpt, "backward: parallel (re-run)": bwdSplit.par, "serial (load, mark)": bwdSplit.load }).map(([k, c]) => el("span", { class: "key" }, [el("i", { style: `background:${c}` }), k])),
   ]);
   const accounted = chs.reduce((a, c) => a + c.totalMs, 0);
   const note = el("p", { class: "note" }, [
@@ -438,7 +438,6 @@ export function timelineView(run: Run, chs: Chapter[]): View {
               { name: "emit (kernel)", ms: c.levelRun.fwd.reduce((a, l) => a + l.emit_ms, 0), color: fwdSplit.emit },
               { name: "own", ms: c.levelRun.fwd.reduce((a, l) => a + l.own_ms, 0), color: fwdSplit.own },
               { name: "checkpoint", ms: c.levelRun.fwd.reduce((a, l) => a + l.ckpt_ms, 0), color: fwdSplit.ckpt },
-              { name: "pos-graph", ms: c.levelRun.fwd.reduce((a, l) => a + l.pos_ms, 0), color: fwdSplit.pos },
             ]
           : [
               { name: "parallel (re-run)", ms: c.levelRun.bwd.reduce((a, l) => a + l.par_ms, 0), color: bwdSplit.par },
@@ -464,7 +463,6 @@ export function timelineView(run: Run, chs: Chapter[]): View {
             ["emit", `${l.emit_ms} ms, ${l.emit_idle}% idle`],
             ["own", `${l.own_ms} ms, ${l.own_idle}% idle`],
             ["checkpoint", `${l.ckpt_ms} ms`],
-            ["pos-graph", `${l.pos_ms} ms`],
           ]),
         );
       } else {

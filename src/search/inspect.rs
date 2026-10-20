@@ -9,7 +9,7 @@ use std::collections::{BTreeMap, HashMap};
 pub type Proj = BTreeMap<String, String>;
 
 /// A value cell for a diagnostic: numbers as decimals, intervals as ranges.
-pub fn av_show<N: EngineNum>(v: AV<N>) -> String {
+pub(crate) fn av_show<N: EngineNum>(v: AV<N>) -> String {
     match v {
         AV::Num(n) => format!("{}", n.to_f64()),
         AV::Ival(a, b) => format!("[{}, {}]", a.to_f64(), b.to_f64()),
@@ -148,7 +148,7 @@ pub fn brief(p: &Proj) -> String {
 }
 
 /// `brief` of lane `l`.
-pub fn player_summary<N: EngineNum>(rt2: &Rt2<N>, l: usize) -> String {
+pub(crate) fn player_summary<N: EngineNum>(rt2: &Rt2<N>, l: usize) -> String {
     let names = cell_names(rt2, crate::compiled::ids());
     brief(&project_row(rt2, &names, l as u32, &[]))
 }

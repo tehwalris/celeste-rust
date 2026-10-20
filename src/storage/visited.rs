@@ -8,14 +8,14 @@ use crate::search::hull::HullOf;
 use anyhow::Result;
 use rustc_hash::FxHashMap;
 
-use super::set::{Block, Change, RegionSet, RegionTable, Upserted};
+use super::set::{Block, Change, PackedTable, PlainTable, RegionSet, Upserted};
 use super::{region_of, Geometry};
 use crate::search::rem::Rem;
 use celeste_core::pico8_num::Pico8Num as P8;
 
-pub use super::set::StateInfo;
+pub(crate) use super::set::StateInfo;
 /// A state's EXACT packed key within its shape (`celeste_engine::exact`).
-pub use celeste_engine::exact::Key;
+pub(crate) use celeste_engine::exact::Key;
 use celeste_engine::exact::KeySpace;
 
 /// Blocks a run of an `upsert_all` takes (a big region's runs go apart, on
@@ -26,29 +26,29 @@ const RUN_BLOCKS: usize = 64;
 /// states (by `storage::region_of`), the key space.
 #[derive(Clone)]
 pub struct VisitedSet<N: Rem = P8> {
-    pub geo: Geometry,
+    pub(crate) geo: Geometry,
     pub keys: KeySpace<N>,
     shapes: Vec<u64>,
     shape_idx: FxHashMap<u64, u32>,
-    set: RegionSet,
+    set: RegionSet<PackedTable>,
 }
 
 impl<N: Rem> VisitedSet<N> {
-    pub fn new(geo: Geometry) -> Self {
+    pub(crate) fn new(geo: Geometry) -> Self {
         VisitedSet { geo, keys: KeySpace::new(), shapes: Vec::new(), shape_idx: FxHashMap::default(), set: RegionSet::default() }
     }
 
     /// Forget every state, keeping the key space and the shapes
     /// (`wave::one_frame`: a seed's successor equal to the seed is new).
-    pub fn forget_states(&mut self) {
+    pub(crate) fn forget_states(&mut self) {
         self.set = RegionSet::default();
     }
 
-    pub fn shape_index(&self, shape: u64) -> Option<u32> {
+    pub(crate) fn shape_index(&self, shape: u64) -> Option<u32> {
         self.shape_idx.get(&shape).copied()
     }
 
-    pub fn shape_hash(&self, idx: u32) -> u64 {
+    pub(crate) fn shape_hash(&self, idx: u32) -> u64 {
         self.shapes[idx as usize]
     }
 
@@ -57,7 +57,7 @@ impl<N: Rem> VisitedSet<N> {
     }
 
     /// Number `shape` (the next index) unless it has one; its index.
-    pub fn add_shape(&mut self, shape: u64) -> u32 {
+    pub(crate) fn add_shape(&mut self, shape: u64) -> u32 {
         if let Some(&i) = self.shape_idx.get(&shape) {
             return i;
         }
@@ -68,7 +68,7 @@ impl<N: Rem> VisitedSet<N> {
     }
 
     /// A shape's index from the tree's record (a resume): it must be the next.
-    pub fn restore_shape(&mut self, idx: u32, shape: u64) -> Result<()> {
+    pub(crate) fn restore_shape(&mut self, idx: u32, shape: u64) -> Result<()> {
         match self.shape_idx.get(&shape) {
             Some(&i) => anyhow::ensure!(i == idx, "shape {shape:016x} numbered {i} and {idx}"),
             None => {
@@ -81,25 +81,25 @@ impl<N: Rem> VisitedSet<N> {
 
     /// The region of `(shape, slot)`, if the shape is numbered.
     #[inline]
-    pub fn region(&self, shape: u64, slot: u32) -> Option<u32> {
+    pub(crate) fn region(&self, shape: u64, slot: u32) -> Option<u32> {
         self.shape_index(shape).map(|s| region_of(&self.geo, s, slot))
     }
 
     /// Region `region`'s packed table, if any state is held there.
     #[inline]
-    pub fn table(&self, region: u32) -> Option<&RegionTable> {
+    pub(crate) fn table(&self, region: u32) -> Option<&PackedTable> {
         self.set.table(region)
     }
 
     /// State `(region, key, local)`'s layer and hull (`None`: full, or absent).
-    pub fn state(&self, region: u32, key: Key, local: u32) -> Option<StateInfo<N>> {
+    pub(crate) fn state(&self, region: u32, key: Key, local: u32) -> Option<StateInfo<N>> {
         self.table(region)?.lookup_info(key, local)?.1
     }
 
     /// UPSERT per region its changes (`set::Change`, sorted by key and cell,
     /// distinct; regions of numbered shapes made where absent), a big
     /// region's runs of `RUN_BLOCKS` blocks apart, the biggest first.
-    pub fn upsert_all(&mut self, changes: Vec<(u32, Vec<Change<N>>)>, threads: usize) -> Result<Upserted> {
+    pub(crate) fn upsert_all(&mut self, changes: Vec<(u32, Vec<Change<N>>)>, threads: usize) -> Result<Upserted> {
         let regions: Vec<u32> = changes.iter().map(|c| c.0).collect();
         let range = |i: usize, lo: Option<Key>, hi: Option<Key>| {
             let ch = &changes[i].1;
@@ -111,7 +111,7 @@ impl<N: Rem> VisitedSet<N> {
     /// `upsert_all` with each run's changes MADE by the run, not all held at
     /// once: `make(i, lo, hi)` is region `regions[i]`'s with keys in `[lo,
     /// hi)` (`None`: unbounded), `count` their number (the runs' order).
-    pub fn upsert_with<'c>(
+    pub(crate) fn upsert_with<'c>(
         &mut self,
         regions: &[u32],
         threads: usize,
@@ -124,7 +124,7 @@ impl<N: Rem> VisitedSet<N> {
         let mut runs: Vec<(usize, Run)> = Vec::new();
         for (i, region) in regions.iter().enumerate() {
             anyhow::ensure!(((region / self.geo.slots) as usize) < self.shapes.len(), "an upserted region {region} of no numbered shape");
-            let blocks = self.set.table_mut(*region, RegionTable::packed).take_blocks();
+            let blocks = self.set.table_mut(*region).take_blocks();
             // Runs of blocks, each with the changes from its first key to
             // the next run's (the first from the start, the last to the end).
             let groups: Vec<Vec<Block>> = {
@@ -165,13 +165,13 @@ impl<N: Rem> VisitedSet<N> {
         }
         for (&region, mut p) in regions.iter().zip(parts) {
             p.sort_by_key(|x| x.0);
-            *self.set.table_mut(region, RegionTable::packed) = RegionTable::of_blocks(p.into_iter().flat_map(|x| x.1).collect())?;
+            *self.set.table_mut(region) = PackedTable::of_blocks(p.into_iter().flat_map(|x| x.1).collect())?;
         }
         Ok(total)
     }
 
     /// The states with a layer and hull stored (not full).
-    pub fn infos(&self) -> u64 {
+    pub(crate) fn infos(&self) -> u64 {
         self.set.tables().iter().map(|t| t.1.infos()).sum()
     }
 
@@ -180,7 +180,7 @@ impl<N: Rem> VisitedSet<N> {
     /// layer `layer`, and its grown states (held already; sorted) with their
     /// new hulls. Returns what it did (`held_new`: 0, the new are new).
     #[allow(clippy::type_complexity)]
-    pub fn absorb(&mut self, parts: &[(u32, &RegionTable, &[HullOf<N>], &[super::wave::Old<N>])], layer: u16, threads: usize) -> Result<Upserted> {
+    pub(crate) fn absorb(&mut self, parts: &[(u32, &PlainTable, &[HullOf<N>], &[super::wave::Old<N>])], layer: u16, threads: usize) -> Result<Upserted> {
         // Per region its new entries' first states (their hulls' places).
         let starts: Vec<Vec<u32>> = super::wave::par_map(parts, threads, |&(region, new, hulls, _)| -> Result<Vec<u32>> {
             let mut at = Vec::with_capacity(new.len() + 1);
@@ -240,12 +240,8 @@ impl<N: Rem> VisitedSet<N> {
         )
     }
 
-    pub fn len(&self) -> usize {
+    pub(crate) fn len(&self) -> usize {
         self.set.states() as usize
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
     }
 
     pub fn entries(&self) -> usize {
@@ -256,54 +252,6 @@ impl<N: Rem> VisitedSet<N> {
         self.set.alloc_bytes()
     }
 
-    /// The stored hulls' and layers' statistics (`[memory]`, a diagnostic;
-    /// distinct hulls counted up to `cap`).
-    pub fn hull_stats(&self, cap: usize) -> Result<String> {
-        let mut by: FxHashMap<u64, u64> = FxHashMap::default();
-        let (mut states, mut over, mut one_layer, mut entries) = (0u64, false, 0u64, 0u64);
-        let mut layers = vec![0u64; 1 << 16];
-        for (_, t) in self.set.tables() {
-            t.for_each_packed::<N>(|_, _, _, run| {
-                if run.is_empty() {
-                    return;
-                }
-                entries += 1;
-                one_layer += run.iter().all(|i| i.layer == run[0].layer) as u64;
-                for i in run {
-                    states += 1;
-                    layers[i.layer as usize] += 1;
-                    // Mixed: FxHash leaves a word's high half out of the low
-                    // bits a table indexes by (the y arc). (A float hull's
-                    // hash is not the hull: distinct counted by hash.)
-                    let w = celeste_engine::runtime2::mix64(i.hull.hash());
-                    if by.len() < cap || by.contains_key(&w) {
-                        *by.entry(w).or_default() += 1;
-                    } else {
-                        over = true;
-                    }
-                }
-            })?;
-        }
-        let mut counts: Vec<u64> = by.values().copied().collect();
-        counts.sort_unstable_by(|a, b| b.cmp(a));
-        let top = |k: usize| counts.iter().take(k).sum::<u64>() as f64 / states.max(1) as f64 * 100.0;
-        Ok(format!(
-            "{states} stored hulls: {}{} distinct, the top 256 cover {:.1}%, 4096 {:.1}%, 65536 {:.1}%; {} distinct layers; {one_layer} of {entries} entries hold one layer",
-            if over { ">" } else { "" },
-            by.len(),
-            top(256),
-            top(4096),
-            top(65536),
-            layers.iter().filter(|&&c| c > 0).count()
-        ))
-    }
-
-    /// Its bytes by part (`[memory]`): the packed blocks (keys, masks,
-    /// layers and hulls, zstd), the block and region lists, the key space.
-    pub fn census(&self) -> Vec<(&'static str, usize)> {
-        let s = self.set.bytes();
-        vec![("visited: packed blocks (keys, cells, layers, hulls)", s[0]), ("visited: block and region lists", s[1] + s[2]), ("key space", self.keys.alloc_bytes())]
-    }
 }
 
 #[cfg(test)]
@@ -313,7 +261,7 @@ mod tests {
 
     /// A region big enough for several runs of blocks, upserted twice with
     /// changes in some runs only: every state found again with its info,
-    /// the blocks in key order (`RegionTable::of_blocks` checks it).
+    /// the blocks in key order (`PackedTable::of_blocks` checks it).
     #[test]
     fn a_big_region_upserts_run_by_run() {
         let mut v = VisitedSet::new(super::super::GEOMETRY);
@@ -367,7 +315,7 @@ mod tests {
         // first and past the last; 1-3 cells), and grown held states.
         let new_keys: Vec<(u64, u64)> = std::iter::once((0, 1)).chain((0..n).step_by(97).map(|k| (0, 6 + k * 4))).chain(std::iter::once((0, 8 + n * 4))).collect();
         let masks: Vec<u64> = new_keys.iter().map(|k| 0b101u64 << (k.1 % 60) | (k.1 % 3 == 0) as u64).collect();
-        let table = RegionTable::from_sorted(&new_keys, &masks).unwrap();
+        let table = PlainTable::from_sorted(&new_keys, &masks).unwrap();
         let hulls: Vec<Hull> = (0..table.states()).map(|i| hull(1000 + i)).collect();
         let grown: Vec<super::super::wave::Old> = (0..n)
             .step_by(53)
