@@ -187,7 +187,7 @@ async function main() {
         main.append(
           errorCard(
             `Could not load ${label}`,
-            `${(e as Error).message}\n\nRegenerate it with:\n  rewrite export-ui --checkpoint-dir <search dir> --arc <marks dir> --out <data dir>/${runId} --room ${runId.replace(/^room(\d)(\d)$/, "$1,$2")}`,
+            `${(e as Error).message}\n\nRegenerate it with:\n  rewrite export-ui --search-dir <search dir> --arc <marks dir> --out <data dir>/${runId}`,
             () => {
               current = null;
               void apply(runId, t, params);
