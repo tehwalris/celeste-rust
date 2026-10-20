@@ -147,7 +147,7 @@ own_error(n) or OR(error(args))`, where it was evaluated:
 |---|---|
 | `Flr(x)` | the span covers more than one integer |
 | `Sel(c, t, f)` | `c` lane-undecidable and not known |
-| a fork fragment (`Split`, `SplitInt`; a double's round fork `RSplit`) | the lane spans more parts than enumerated |
+| a fork (`Fork`, of the floors, the whole numbers or a double's rounds) | the lane spans more parts than enumerated (`ForkOk`) |
 | an unrolled loop | its condition still holds after the bound |
 | an operation that can leave the arithmetic's range (`GraphArith::range_error`: 16.16's `+ - * /`, neg, `abs`; the doubles' `+ - * / %`) | `NoWrap`: the exact result left the range (16.16's would wrap or saturate, a double's would not be finite); skipped where static ranges bound it, at most two compares when one operand is a literal |
 | a widening | the slot's containment (`widen::SlotErrors`) |

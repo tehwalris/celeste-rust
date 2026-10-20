@@ -9,7 +9,7 @@ use anyhow::{bail, Result};
 
 use celeste_core::arith::{Arithmetic, Fixed};
 use crate::transpile::garith::GraphArith;
-use crate::transpile::graph::{Graph, NodeId, Op, Ty, Unknown};
+use crate::transpile::graph::{Cut, Graph, NodeId, Op, Ty, Unknown};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Arith {
@@ -101,55 +101,18 @@ impl Cmp {
     }
 }
 
-/// Which op family carries a fork (the memo's second key): `Floors` and
-/// `Ints` over one value resolve differently and may not share a choice.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-pub enum ForkKind {
-    Floors,
-    Ints,
-    Rounds,
-}
-
 /// The origin of the forks `Domain::unknown_bool` mints: the six buttons, in
 /// `__reset_button_states`' order.
 pub const UNKNOWN_BOOL_ORIGIN: &str = "__new_unknown_boolean";
 
-/// HOW a fork partitions its value's set into configurations.
-pub enum Partition {
-    /// Cut an interval at the fork grid's cell edges (`Split` -> `Frag`), so
-    /// `flr` of each is one number.
-    Floors { ways: u8 },
-    /// Cut an interval of whole numbers into the numbers, each EXACT
-    /// (`SplitInt` -> `IntFrag`). `memo` false keeps two forks of one node
-    /// independent (`p_jump`/`p_dash` both fork `[0, 1<<16]`).
-    Ints { ways: u8, memo: bool },
-    /// Cut an interval where `flr(x + 1/2)` changes, at the arithmetic's
-    /// exact cut points (`RSplit` -> `RFrag`): a double's round fork
-    /// (`Domain::fork_round`).
-    Rounds { ways: u8 },
-}
-
-impl Partition {
-    fn kind(&self) -> ForkKind {
-        match self {
-            Partition::Floors { .. } => ForkKind::Floors,
-            Partition::Ints { .. } => ForkKind::Ints,
-            Partition::Rounds { .. } => ForkKind::Rounds,
-        }
-    }
-
-    fn ways(&self) -> u8 {
-        match self {
-            Partition::Floors { ways } | Partition::Ints { ways, .. } | Partition::Rounds { ways } => *ways,
-        }
-    }
-
-    fn memoized(&self) -> bool {
-        match self {
-            Partition::Floors { .. } | Partition::Rounds { .. } => true,
-            Partition::Ints { memo, .. } => *memo,
-        }
-    }
+/// HOW a fork partitions its value's set into configurations: cut as `cut`
+/// says (`Op::Fork` -> `Op::Frag`), into `ways` fragments. `memo` false keeps
+/// two forks of one node independent (`p_jump`/`p_dash` both fork `[0,
+/// 1<<16]` into its whole numbers).
+pub struct Partition {
+    pub cut: Cut,
+    pub ways: u8,
+    pub memo: bool,
 }
 
 /// What a fork hands back: this configuration's fragment, which lanes fall in
@@ -238,23 +201,17 @@ pub trait Domain: Clone + Default {
         false
     }
 
-    /// Fork at `flr` (`__split_by_flr`): `flr` of an interval is not a
+    /// Fork an interval at `cut`'s grid: `__split_by_flr` (`Cut::Floors`), or
+    /// `__split_by_round` (`Cut::Rounds`) where its fragments are NOT the floor
+    /// fork's of `x + 1/2` shifted back (doubles: `x + 1/2 - 1/2` rounds;
+    /// 16.16 shifts instead, in `Interp`). `flr` of an interval is not a
     /// function, so the fragment is a choice of arity `ways`. Returns the
-    /// restricted value and which lanes fall in it; the identity on exact values.
-    fn fork_flr(&mut self, v: &Self::Num, _ways: u8) -> (Self::Num, Self::Bool) {
-        (v.clone(), self.boolean(true))
-    }
+    /// restricted value and which lanes fall in it.
+    fn split(&mut self, cut: Cut, v: &Self::Num, ways: u8) -> Result<(Self::Num, Self::Bool)>;
 
-    /// Fork at `flr(x + 1/2)` (`__split_by_round`) where the fragments are NOT
-    /// the floor fork's of `x + 1/2` shifted back (doubles: `x + 1/2 - 1/2`
-    /// rounds; 16.16 shifts instead, in `Interp`): `fork_flr`'s twin, at the
-    /// exact cut points. Called on intervals only.
-    fn fork_round(&mut self, v: &Self::Num, _ways: u8) -> Result<(Self::Num, Self::Bool)> {
-        bail!("__split_by_round of {v:?}: this domain has no exact round fork")
-    }
-
-    /// The arity of `fork_round` on `v` (`flr_ways`' twin).
-    fn round_ways(&mut self, _v: &Self::Num) -> u8 {
+    /// The arity of `split` on `v`: `MOVE_WAYS`, or with a known static range
+    /// the most grid cells one piece crosses (`ForkOk` checks).
+    fn split_ways(&mut self, _cut: Cut, _v: &Self::Num) -> u8 {
         MOVE_WAYS
     }
 
@@ -262,11 +219,6 @@ pub trait Domain: Clone + Default {
     /// where `at` holds; its error holds only there.
     fn evaluated_at(&mut self, _n: &Self::Num, _at: &Self::Bool) {}
 
-    /// The arity of `__split_by_flr` on `v`: `MOVE_WAYS`, or with a known
-    /// static range the most grid cells one piece crosses (`SplitOk` checks).
-    fn flr_ways(&mut self, _v: &Self::Num) -> u8 {
-        MOVE_WAYS
-    }
 
     /// The join of a merge on a condition NO LANE can decide, with arms every
     /// lane holds alike: the hull of two literals, or the unknown number.
@@ -385,7 +337,7 @@ pub struct Symbolic<A: GraphArith = Fixed> {
     pub build_trace: bool,
     /// FORK choices handed out this frame (the fork ids), buttons included.
     pub forks: u8,
-    /// `flr_ways` takes a static range's full width (level -1, whose speed
+    /// `split_ways` takes a static range's full width (level -1, whose speed
     /// is a range at every node).
     pub uncapped_ways: bool,
     /// The level traced (`widening::TABLE`'s entries it applies, in and out).
@@ -422,7 +374,7 @@ pub struct Symbolic<A: GraphArith = Fixed> {
     /// Fork choices handed out THIS FRAME by `(value, kind)`: a second fork
     /// of one value reuses the first's choice instead of an empty dimension.
     /// Cleared with `forks`.
-    fork_memo: std::collections::HashMap<(NodeId, ForkKind), (u8, (NodeId, NodeId))>,
+    fork_memo: std::collections::HashMap<(NodeId, Cut), (u8, (NodeId, NodeId))>,
     /// These three depend on the input cells' types (the graph's
     /// `cell_kind`; dropped by `forget_intervals`).
     undecidable_memo: std::cell::RefCell<rustc_hash::FxHashMap<NodeId, bool>>,
@@ -482,8 +434,7 @@ impl<A: GraphArith> Symbolic<A> {
                 Op::Flr => false,
                 Op::Known => false,
                 // Validity/coverage masks: per-lane comparisons.
-                Op::SplitValid(_) | Op::SplitOk(_) | Op::FragOk(_) | Op::NoWrap => false,
-                Op::RSplitValid(_) | Op::RSplitOk(_) | Op::RFragOk(_) => false,
+                Op::ForkValid(..) | Op::ForkOk(..) | Op::FragOk(..) | Op::NoWrap => false,
                 // A pin's check on the raw input.
                 Op::Same => false,
                 Op::ConstBool(_) => false,
@@ -512,8 +463,9 @@ impl<A: GraphArith> Symbolic<A> {
                 Op::Const(lo, hi) => lo != hi,
                 Op::Span => true,
                 Op::UnknownNum | Op::UnknownBool(_) => true,
-                Op::Split(_) | Op::Frag(_) | Op::RSplit(_) | Op::RFrag(_) => true,
-                Op::SplitInt(_) | Op::IntFrag(_) | Op::Lo | Op::Hi => false,
+                // An `Ints` fragment is one exact number.
+                Op::Fork(Cut::Ints, _) | Op::Frag(Cut::Ints, _) | Op::Lo | Op::Hi => false,
+                Op::Fork(..) | Op::Frag(..) => true,
                 Op::ConstBool(_) | Op::Known | Op::NoWrap => false,
                 // THE CONDITION DOES NOT MAKE THE RESULT A SET: `Sel(c, 5, 7)`
                 // is one of two numbers, chosen by forking `c` (the opposite of
@@ -748,7 +700,7 @@ impl<A: GraphArith> Symbolic<A> {
                 let v = A::from_lit(lo);
                 A::num_eq(A::flr(v), v)
             }
-            Op::Flr | Op::IntFrag(_) => true,
+            Op::Flr | Op::Frag(Cut::Ints, _) => true,
             Op::Restrict(..) if self.integral_inputs.contains(&n) => true,
             Op::Add | Op::Sub | Op::Neg | Op::Abs | Op::Min | Op::Max => all(&node.args),
             Op::Sel => all(&node.args[1..]),
@@ -776,11 +728,11 @@ impl<A: GraphArith> Symbolic<A> {
 
     /// A boolean every lane holds in BOTH values (buttons, held trails,
     /// escaped atoms): an unmemoized `Ints` fork of `[0, 1]` with no validity,
-    /// so `SplitOk(2)` folds true and the fragments to `0` and `1`.
+    /// so `ForkOk(2)` folds true and the fragments to `0` and `1`.
     pub fn both_values(&mut self, origin: &str) -> NodeId {
         let (zero, one) = (A::lit(A::from_i16(0)), A::lit(A::from_i16(1)));
         let choices = self.graph.leaf(Op::Const(zero, one));
-        let f = self.fork(&choices, Partition::Ints { ways: 2, memo: false }, origin);
+        let f = self.fork(&choices, Partition { cut: Cut::Ints, ways: 2, memo: false }, origin);
         let zero = self.graph.leaf(Op::Const(zero, zero));
         self.graph.fold(Op::Gt, vec![f.value, zero])
     }
@@ -792,35 +744,23 @@ impl<A: GraphArith> Symbolic<A> {
     /// THE fork: partition `v`'s set, mint a choice dimension, and hand back
     /// this configuration's piece and its lanes. Every fork comes through here.
     fn fork(&mut self, v: &NodeId, p: Partition, origin: &str) -> Fork {
-        let kind = p.kind();
         // Already forked this value this frame (hash-consed)? Reuse the choice.
-        if p.memoized() {
-            if let Some(hit) = self.fork_memo.get(&(*v, kind)) {
+        if p.memo {
+            if let Some(hit) = self.fork_memo.get(&(*v, p.cut)) {
                 let (d, out) = *hit;
-                // RAISED, not set: each site's `SplitOk` bounds its own lanes.
-                self.graph.set_fork_ways(d, p.ways());
+                // RAISED, not set: each site's `ForkOk` bounds its own lanes.
+                self.graph.set_fork_ways(d, p.ways);
                 return Fork { value: out.0, valid: out.1, id: d };
             }
         }
         let d = self.forks;
         self.forks += 1;
         self.fork_origins.push((d, origin.to_string()));
-        let (value, valid) = match &p {
-            Partition::Floors { ways } => {
-                self.graph.set_fork_ways(d, *ways);
-                (self.graph.fold(Op::Split(d), vec![*v]), self.graph.fold(Op::SplitValid(d), vec![*v]))
-            }
-            Partition::Ints { ways, .. } => {
-                self.graph.set_fork_ways(d, *ways);
-                (self.graph.fold(Op::SplitInt(d), vec![*v]), self.graph.fold(Op::SplitValid(d), vec![*v]))
-            }
-            Partition::Rounds { ways } => {
-                self.graph.set_fork_ways(d, *ways);
-                (self.graph.fold(Op::RSplit(d), vec![*v]), self.graph.fold(Op::RSplitValid(d), vec![*v]))
-            }
-        };
-        if p.memoized() {
-            self.fork_memo.insert((*v, kind), (d, (value, valid)));
+        self.graph.set_fork_ways(d, p.ways);
+        let value = self.graph.fold(Op::Fork(p.cut, d), vec![*v]);
+        let valid = self.graph.fold(Op::ForkValid(p.cut.grid(), d), vec![*v]);
+        if p.memo {
+            self.fork_memo.insert((*v, p.cut), (d, (value, valid)));
         }
         Fork { value, valid, id: d }
     }
@@ -881,7 +821,7 @@ impl<A: GraphArith> Symbolic<A> {
 
     /// Does no lane's data reach `n` - no input cell or fork?
     pub fn lane_independent(&mut self, n: NodeId) -> bool {
-        let dependent = |op: &Op<A>| matches!(op, Op::Cell(_) | Op::Split(_) | Op::SplitValid(_) | Op::SplitInt(_) | Op::RSplit(_) | Op::RSplitValid(_)).then_some(true);
+        let dependent = |op: &Op<A>| matches!(op, Op::Cell(_) | Op::Fork(..) | Op::ForkValid(..)).then_some(true);
         !cone_any(&self.graph, &mut self.lane_memo, n, dependent)
     }
 
@@ -1094,46 +1034,35 @@ impl<A: GraphArith> Domain for Symbolic<A> {
     }
 
 
-    fn fork_flr(&mut self, v: &NodeId, ways: u8) -> (NodeId, NodeId) {
-        let f = self.fork(v, Partition::Floors { ways }, "a floor fork (`move`)");
-        (f.value, f.valid)
-    }
-
-    /// A literal interval is refused: every lane would take each fragment
-    /// (the interpreter splits a literal first: `literal_fragments`).
-    fn fork_round(&mut self, v: &NodeId, ways: u8) -> Result<(NodeId, NodeId)> {
-        if let Op::Const(lo, hi) = self.graph.get(*v).op {
-            bail!("__split_by_round of the literal [{}, {}] as a per-lane fork", A::show(A::from_lit(lo)), A::show(A::from_lit(hi)));
-        }
-        let f = self.fork(v, Partition::Rounds { ways }, "a round fork (`move`)");
+    /// A literal interval is refused at the rounds: every lane would take
+    /// each fragment (the interpreter splits a literal first:
+    /// `literal_fragments`).
+    fn split(&mut self, cut: Cut, v: &NodeId, ways: u8) -> Result<(NodeId, NodeId)> {
+        let origin = match cut {
+            Cut::Floors => "a floor fork (`move`)",
+            Cut::Rounds => {
+                if let Op::Const(lo, hi) = self.graph.get(*v).op {
+                    bail!("__split_by_round of the literal [{}, {}] as a per-lane fork", A::show(A::from_lit(lo)), A::show(A::from_lit(hi)));
+                }
+                "a round fork (`move`)"
+            }
+            Cut::Ints => bail!("a split cuts at the floors or the rounds, not the whole numbers"),
+        };
+        let f = self.fork(v, Partition { cut, ways, memo: true }, origin);
         Ok((f.value, f.valid))
     }
 
-    /// `flr_ways`, counting the values of `flr(x + 1/2)`.
-    fn round_ways(&mut self, v: &NodeId) -> u8 {
-        if !self.has_ranges() {
-            return MOVE_WAYS;
-        }
-        match self.range_of(*v) {
-            Some(ps) => {
-                let w = A::rounds_spanned(&ps, self.uncapped_ways);
-                (if self.uncapped_ways { w } else { w.min(MOVE_WAYS as i64) }) as u8
-            }
-            None => MOVE_WAYS,
-        }
-    }
-
-    fn flr_ways(&mut self, v: &NodeId) -> u8 {
+    fn split_ways(&mut self, cut: Cut, v: &NodeId) -> u8 {
         // Only restrictions know a static range.
         if !self.has_ranges() {
             return MOVE_WAYS;
         }
         // At most `MOVE_WAYS`: the static range covers ALL lanes, but one lane
-        // spans at most that many floors (too small declines via `SplitOk`). Level
+        // spans at most that many cells (too small declines via `ForkOk`). Level
         // -1 takes the HULL: its lanes are ranges.
         match self.range_of(*v) {
             Some(ps) => {
-                let w = A::floors_spanned(&ps, self.uncapped_ways);
+                let w = A::spanned(cut.grid(), &ps, self.uncapped_ways);
                 (if self.uncapped_ways { w } else { w.min(MOVE_WAYS as i64) }) as u8
             }
             None => MOVE_WAYS,
@@ -1386,7 +1315,7 @@ mod tests {
     /// THE ROUND FORK (doubles): `rem + ox` of an interval remainder, forked
     /// at `flr(x + 1/2)`, resolves per configuration to the reference engine's
     /// fragment bit for bit, valid exactly where the reference has that many,
-    /// and `RSplitOk` says whether a lane takes at most `ways` values. Around
+    /// and `ForkOk(Rounds)` says whether a lane takes at most `ways` values. Around
     /// the cut below 1, where `0.5 - 2^-54 + 0.5` rounds up.
     #[test]
     fn a_round_fork_resolves_to_the_reference_fragments() {
@@ -1402,9 +1331,9 @@ mod tests {
             let x = d.graph.leaf(Op::Cell(0));
             let k = d.num(f(ox));
             let y = d.arith(Arith::Add, &x, &k).expect("add");
-            let (v, valid) = d.fork_round(&y, ways).expect("a round fork");
+            let (v, valid) = d.split(Cut::Rounds, &y, ways).expect("a round fork");
             let fork = d.forks - 1;
-            let covered = d.graph.fold(Op::RSplitOk(ways), vec![y]);
+            let covered = d.graph.fold(Op::ForkOk(Cut::Rounds, ways), vec![y]);
             for (lo, hi) in [(-0.5, 0.5f64.next_down()), (-0.5, -0.5), (0.2, 0.4), (0.5f64.next_down(), 0.5), (-2.25, 1.75), (0.0, 0.0)] {
                 let iv = LuaF64Interval::new(f(lo), f(hi));
                 let cells = std::collections::HashMap::from([(0u32, Val::<Float>::Num(iv))]);
@@ -1416,11 +1345,11 @@ mod tests {
                     let mut g = d.graph.like();
                     let map = d.graph.specialize_subset_into(&splits, None, &mut g);
                     // Strict, a lane spanning more values than the fork's
-                    // arity is an error of the evaluation (as `SplitOk`).
+                    // arity is an error of the evaluation (as `ForkOk`).
                     let vals = match g.eval(&cells) {
                         Ok(vals) => vals,
                         Err(e) => {
-                            assert!(n > ways as u32 && format!("{e}").contains("RSplitOk"), "ox {ox} [{lo}, {hi}] c {c}: {e}");
+                            assert!(n > ways as u32 && format!("{e}").contains("ForkOk"), "ox {ox} [{lo}, {hi}] c {c}: {e}");
                             continue;
                         }
                     };
@@ -1479,10 +1408,10 @@ mod tests {
         let wall = d.graph.fold(Op::Sel, vec![gt, neg, inner]);
         let moved = d.graph.fold(Op::Add, vec![rem, wall]);
         let operand = d.graph.fold(Op::Add, vec![half, moved]);
-        assert_eq!(d.flr_ways(&operand), 2, "a kernel lane takes one piece");
+        assert_eq!(d.split_ways(Cut::Floors, &operand), 2, "a kernel lane takes one piece");
         d.uncapped_ways = true;
         d.range_memo.clear();
-        assert_eq!(d.flr_ways(&operand), 5, "level -1 joins the pieces: floors -2..=2");
+        assert_eq!(d.split_ways(Cut::Floors, &operand), 5, "level -1 joins the pieces: floors -2..=2");
     }
 
     /// The FORK TRIGGER's contract on hand-built graphs.

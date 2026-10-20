@@ -690,7 +690,7 @@ fn bounds<A: GraphArith>(d: &Symbolic<A>, n: NodeId, facts: &[(NodeId, f64, f64)
                 (a.0.floor(), a.1.floor())
             }
             // A fork's fragment lies inside its operand.
-            Op::Split(_) | Op::Frag(_) | Op::IntFrag(_) | Op::RSplit(_) | Op::RFrag(_) => bounds(d, node.args[0], facts)?,
+            Op::Fork(..) | Op::Frag(..) => bounds(d, node.args[0], facts)?,
             Op::Add => {
                 let (a, b) = (bounds(d, node.args[0], facts)?, bounds(d, node.args[1], facts)?);
                 (a.0 + b.0, a.1 + b.1)

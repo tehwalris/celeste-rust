@@ -75,7 +75,7 @@ One axis, one frame: `r1 = fl(r + ox)`, `k = floor(fl(r1 + 0.5))`,
   `v + 1/2` shifted back (exact). In doubles `+ 1/2` rounds, so the fork
   cuts at the exact points: `c_k = k - 1/2` except `c_1 = 1/2 - 2^-54`,
   found by the operation itself (`Arithmetic::round_fragment`; the graph's
-  `RSplit`/`RFrag`/`RSplitOk`, the kernels' `round_cut`). A literal splits
+  `Fork`/`Frag`/`ForkOk` of `Cut::Rounds`, the kernels' `round_cut`). A literal splits
   into trace states (`Domain::literal_fragments`), as a literal floor fork.
 - A transfer is `Mono(ox, k)` (`r -> fl(fl(r + ox) - k)`) or `Const`, on a
   guard (an order-interval of doubles) found exactly by bisection with the
@@ -106,7 +106,7 @@ One axis, one frame: `r1 = fl(r + ox)`, `k = floor(fl(r1 + 0.5))`,
   widened whole (timer, sprite, bob and phase: plans/abstractions.md).
 - Level -1 is built in the run's arithmetic: ranges in the total order, a
   range grown twice jumping to `±f64::MAX`, fork spans in the arithmetic's
-  own count (rounds for `RSplit`), whole-pixel hulls by `as_i16`. Float
+  own count (rounds for a round fork), whole-pixel hulls by `as_i16`. Float
   tables built in every room of the Celia goldens but the platform rooms
   and the summit, which fixed refuses too; room (1,0)'s start d is 44, as
   fixed's.

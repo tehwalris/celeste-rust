@@ -436,7 +436,7 @@ impl<N: KernelLanes> AsmKernel<N> {
                                 None
                             }
                         },
-                        Op::Le | Op::Ge | Op::Lt | Op::Gt | Op::Eq | Op::Same | Op::SplitOk(_) | Op::RSplitOk(_) => {
+                        Op::Le | Op::Ge | Op::Lt | Op::Gt | Op::Eq | Op::Same | Op::ForkOk(..) => {
                             nd.args.iter().copied().find(|&a| matches!(self.fused.get(a).op, Op::Sel))
                         }
                         // An undecided boolean: down its first undecided operand.

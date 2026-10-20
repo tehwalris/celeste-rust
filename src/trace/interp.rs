@@ -10,6 +10,7 @@ use full_moon::tokenizer::{Symbol, TokenType};
 use celeste_core::arith::Arithmetic;
 
 use super::domain::{refuse_unknown, Arith, Cmp, Domain, Fun1, Fun2};
+use crate::transpile::graph::Cut;
 use super::heap::{BodyId, TableId, Value};
 use super::state::{merge_canon, split, Canon, Sides, State};
 
@@ -1474,13 +1475,9 @@ impl<'a, D: Domain> Interp<'a, D> {
         }
         let mut st = st;
         let v = if self.d.is_interval(&x) {
-            let (v, valid) = if round {
-                let ways = self.d.round_ways(&x);
-                self.d.fork_round(&x, ways)?
-            } else {
-                let ways = self.d.flr_ways(&x);
-                self.d.fork_flr(&x, ways)
-            };
+            let cut = if round { Cut::Rounds } else { Cut::Floors };
+            let ways = self.d.split_ways(cut, &x);
+            let (v, valid) = self.d.split(cut, &x, ways)?;
             // The coverage error is derived where evaluated.
             let at = st.decided(&mut self.d);
             self.d.evaluated_at(&v, &at);

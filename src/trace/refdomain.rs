@@ -18,6 +18,7 @@ use anyhow::{bail, Result};
 use celeste_core::arith::{Arithmetic, Fixed};
 
 use crate::trace::domain::{Arith, Cmp, Domain, Fun1, Fun2};
+use crate::transpile::graph::Cut;
 
 /// A depth-first cursor over a decision tree, enumerated by re-execution:
 /// during a run `choose(n)` returns the recorded choice if this fork is on
@@ -259,16 +260,21 @@ impl<A: Arithmetic> Domain for RefDomain<A> {
         show::<A>(v)
     }
 
-    fn fork_flr(&mut self, v: &A::Ival, _ways: u8) -> (A::Ival, bool) {
-        let n = floor_span::<A>(v).expect("a fork of more than 65536 floors");
-        let k = self.cursor.choose(n);
-        (A::floor_fragment(*v, k), true)
-    }
-
-    fn fork_round(&mut self, v: &A::Ival, _ways: u8) -> Result<(A::Ival, bool)> {
-        let n = A::rounds(*v)?.ok_or_else(|| anyhow::anyhow!("__split_by_round of {}: more than 65536 values", show::<A>(v)))?;
-        let k = self.cursor.choose(n);
-        Ok((A::round_fragment(*v, k)?, true))
+    /// The cursor's fragment of the cut, every lane of it valid.
+    fn split(&mut self, cut: Cut, v: &A::Ival, _ways: u8) -> Result<(A::Ival, bool)> {
+        match cut {
+            Cut::Floors => {
+                let n = floor_span::<A>(v).expect("a fork of more than 65536 floors");
+                let k = self.cursor.choose(n);
+                Ok((A::floor_fragment(*v, k), true))
+            }
+            Cut::Rounds => {
+                let n = A::rounds(*v)?.ok_or_else(|| anyhow::anyhow!("__split_by_round of {}: more than 65536 values", show::<A>(v)))?;
+                let k = self.cursor.choose(n);
+                Ok((A::round_fragment(*v, k)?, true))
+            }
+            Cut::Ints => bail!("a split cuts at the floors or the rounds, not the whole numbers"),
+        }
     }
 }
 
@@ -421,7 +427,7 @@ mod tests {
         assert_eq!(Fixed::floor_fragment(Fixed::unknown(), 65535), Iv::new(P8::from_i16(32767), P8::from_raw(i32::MAX)));
         assert_eq!(Fixed::floor_fragment(Iv::new(P8::from_raw(-0x1_8000), P8::from_raw(0x8000)), 1), Iv::new(P8::from_i16(-1), P8::from_raw(-1)));
         d.cursor.reset();
-        let (frag, _) = d.fork_flr(&Iv::new(P8::from_i16(-20000), P8::from_i16(20000)), 0);
+        let (frag, _) = d.split(Cut::Floors, &Iv::new(P8::from_i16(-20000), P8::from_i16(20000)), 0).expect("a split");
         assert_eq!(frag, Iv::new(P8::from_i16(-20000), P8::from_raw((-20000 << 16) | 0xffff)));
         assert_eq!(d.cursor.decisions, vec![(0, 40001)]);
     }

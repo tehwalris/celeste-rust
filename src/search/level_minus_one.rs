@@ -14,7 +14,7 @@
 //! * INDUCTIVE RANGES: successors lie in their shape's ranges and pins; a
 //!   range that does not widens, a pin that fails is dropped, and passes
 //!   repeat to a fixpoint.
-//! * NO `error` on a live outcome (`Known`/`SplitOk` read as true: selects
+//! * NO `error` on a live outcome (`Known`/`ForkOk` read as true: selects
 //!   are joined and fork spans checked directly); anything else is reported.
 //! * Every position hull has whole endpoints.
 //!
@@ -38,7 +38,7 @@ use crate::trace::walk::{LatticeWalk, Tracer};
 use crate::trace::state::State;
 use crate::trace::widen::field;
 use crate::transpile::garith::{value_box, GraphArith};
-use crate::transpile::graph::{Graph, NodeId, Op, Room, Val};
+use crate::transpile::graph::{Cut, Graph, NodeId, Op, Room, Val};
 
 /// A report line, to the report and at once to stderr (a run is minutes).
 macro_rules! say {
@@ -228,8 +228,8 @@ struct Roots {
     fields: Vec<NodeId>,
 }
 
-/// What a fork splits at: `flr` (`Split`, `SplitInt`) or `flr(x + 1/2)`
-/// (`RSplit`, the doubles' `__split_by_round`).
+/// What a fork splits at: `flr` (`Fork` of the floors or the whole numbers)
+/// or `flr(x + 1/2)` (of the rounds, the doubles' `__split_by_round`).
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum ForkAt {
     Floor,
@@ -532,13 +532,13 @@ impl<A: GraphArith> Table<'_, A> {
                     let (lo, hi) = lit_cells[&c];
                     cone.leaf(Op::Const(lo, hi))
                 }
-                Op::Known | Op::SplitOk(_) | Op::RSplitOk(_) | Op::NoWrap => cone.leaf(Op::ConstBool(true)),
+                Op::Known | Op::ForkOk(..) | Op::NoWrap => cone.leaf(Op::ConstBool(true)),
                 _ => {
                     match nd.op {
-                        Op::Split(k) | Op::SplitInt(k) => {
+                        Op::Fork(Cut::Floors | Cut::Ints, k) => {
                             forks.entry(k).or_insert((ForkAt::Floor, args[0]));
                         }
-                        Op::RSplit(k) => {
+                        Op::Fork(Cut::Rounds, k) => {
                             forks.entry(k).or_insert((ForkAt::Round, args[0]));
                         }
                         _ => {}
@@ -547,12 +547,12 @@ impl<A: GraphArith> Table<'_, A> {
                 }
             };
         }
-        // `SplitValid` without its `Split` in the cone still names a fork.
+        // `ForkValid` without its `Fork` in the cone still names a fork.
         for i in 0..arena.len() {
             if need[i] {
                 let at = match arena.get(i as NodeId).op {
-                    Op::SplitValid(k) => (k, ForkAt::Floor),
-                    Op::RSplitValid(k) => (k, ForkAt::Round),
+                    Op::ForkValid(Cut::Floors, k) => (k, ForkAt::Floor),
+                    Op::ForkValid(_, k) => (k, ForkAt::Round),
                     _ => continue,
                 };
                 forks.entry(at.0).or_insert((at.1, cmap[arena.get(i as NodeId).args[0] as usize]));

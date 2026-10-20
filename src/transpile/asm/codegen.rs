@@ -14,7 +14,7 @@ use anyhow::{bail, Result};
 use celeste_core::arith::{Fixed, Float};
 
 use crate::transpile::garith::GraphArith;
-use crate::transpile::graph::{self, Graph, NodeId, Op, Ty};
+use crate::transpile::graph::{self, Cut, Graph, NodeId, Op, Ty};
 
 mod float;
 
@@ -1168,26 +1168,19 @@ impl Lower<'_, Fixed> {
                     Ty::Num => Value::Bool([MaskVal::Const(true), MaskVal::Const(true)]),
                 }
             }
-            Op::Frag(c) => {
+            // The floor fork resolved: fragment `c`, whether the lane reaches it,
+            // an `Ints` fragment's low end as an EXACT number.
+            Op::Frag(Cut::Floors | Cut::Ints, c) | Op::FragOk(Cut::Floors, c) => {
                 let iv = self.as_ival(a[0])?;
                 let ar = self.ival_regs(iv);
-                let (frag, _) = self.zi_fork_flr(ar, *c);
-                Value::Ival([NumVal::Reg(frag[0]), NumVal::Reg(frag[1])])
+                let (frag, ok) = self.zi_fork_flr(ar, *c);
+                match node.op {
+                    Op::FragOk(..) => Value::Bool([MaskVal::Reg(ok), MaskVal::Const(true)]),
+                    Op::Frag(Cut::Ints, _) => Value::Num(NumVal::Reg(frag[0])),
+                    _ => Value::Ival([NumVal::Reg(frag[0]), NumVal::Reg(frag[1])]),
+                }
             }
-            Op::FragOk(c) => {
-                let iv = self.as_ival(a[0])?;
-                let ar = self.ival_regs(iv);
-                let (_, ok) = self.zi_fork_flr(ar, *c);
-                Value::Bool([MaskVal::Reg(ok), MaskVal::Const(true)])
-            }
-            // The low end of fragment `c` as an EXACT number.
-            Op::IntFrag(c) => {
-                let iv = self.as_ival(a[0])?;
-                let ar = self.ival_regs(iv);
-                let (frag, _) = self.zi_fork_flr(ar, *c);
-                Value::Num(NumVal::Reg(frag[0]))
-            }
-            Op::SplitOk(ways) => {
+            Op::ForkOk(Cut::Floors, ways) => {
                 let iv = self.as_ival(a[0])?;
                 let ar = self.ival_regs(iv);
                 let ok = self.zi_span_ok(ar, *ways);

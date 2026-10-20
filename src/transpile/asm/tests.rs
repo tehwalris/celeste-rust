@@ -22,7 +22,7 @@ use celeste_core::pico8_num::Pico8Num as P8;
 
 use crate::compiled::asm_kernel::KernelLanes;
 use crate::transpile::asm::{compile, compile_and_load, AsmArith, AsmCtx, AsmOptions, CollisionEnv, Compiled, Loaded};
-use crate::transpile::graph::{one_operand, Graph, NodeId, Op, Ty, Unknown};
+use crate::transpile::graph::{one_operand, Cut, Graph, NodeId, Op, Ty, Unknown};
 
 /// A tiny deterministic PRNG (splitmix64), so the tests need no `rand`.
 struct Lcg(u64);
@@ -46,7 +46,7 @@ impl Lcg {
 /// values, and the reach of the kernels' fork grid - the one place a lane's
 /// answer is not an operation of the arithmetic. 16.16's grid is the raw
 /// `i32`, which wraps past the top floor; there the fork's premise
-/// (`SplitOk`) is false, so the lane declines.
+/// (`ForkOk`) is false, so the lane declines.
 trait TestArith: AsmArith<Num: KernelLanes<Arith = Self>> {
     /// Numbers every operation is tried on: zeros, both signs, the range's
     /// ends and the operations' thresholds, cut points, random values.
@@ -57,7 +57,7 @@ trait TestArith: AsmArith<Num: KernelLanes<Arith = Self>> {
     fn factors(positive: bool) -> Vec<Self::Num>;
     /// Does the fork grid reach floor `c` above `lo`'s inside the range?
     fn grid_ok(lo: Self::Num, c: u8) -> bool;
-    /// `SplitOk(ways)`: the lane spans at most `ways` floors and the grid
+    /// `ForkOk(Floors, ways)`: the lane spans at most `ways` floors and the grid
     /// reaches them.
     fn split_ok(i: Self::Ival, ways: u8) -> bool;
 }
@@ -380,32 +380,32 @@ fn lane_value<A: TestArith>(g: &Graph<A>, out: &[Option<V<A>>], id: NodeId, row:
             V::I(A::ival(lo, hi))
         }
         // The floor fork's fragment `c`: defined where the lane reaches it.
-        Op::Frag(c) | Op::FragOk(c) | Op::IntFrag(c) => {
+        Op::Frag(Cut::Floors, c) | Op::FragOk(Cut::Floors, c) | Op::Frag(Cut::Ints, c) => {
             let i = as_ival(arg(0)?);
             if !A::grid_ok(A::bounds(i).0, *c) {
                 return None;
             }
             let reached = *c == 0 || A::floors(i).is_none_or(|n| n > *c as u32);
             match node.op {
-                Op::FragOk(_) => V::B(reached, true),
+                Op::FragOk(..) => V::B(reached, true),
                 _ if !reached => return None,
-                Op::Frag(_) => V::I(A::floor_fragment(i, *c as u32)),
+                Op::Frag(Cut::Floors, _) => V::I(A::floor_fragment(i, *c as u32)),
                 _ => V::N(A::bounds(A::floor_fragment(i, *c as u32)).0),
             }
         }
-        Op::SplitOk(ways) => V::B(A::split_ok(as_ival(arg(0)?), *ways), true),
+        Op::ForkOk(Cut::Floors, ways) => V::B(A::split_ok(as_ival(arg(0)?), *ways), true),
         // The round fork (doubles): as the floor fork's, over the values of
         // `flr(x + 1/2)`; its premise also wants every cut it reads settled.
-        Op::RFrag(c) | Op::RFragOk(c) => {
+        Op::Frag(Cut::Rounds, c) | Op::FragOk(Cut::Rounds, c) => {
             let i = as_ival(arg(0)?);
             let reached = A::rounds(i).ok()?.is_none_or(|n| (*c as u32) < n);
             match node.op {
-                Op::RFragOk(_) => V::B(reached, true),
+                Op::FragOk(Cut::Rounds, _) => V::B(reached, true),
                 _ if !reached => return None,
                 _ => V::I(A::round_fragment(i, *c as u32).ok()?),
             }
         }
-        Op::RSplitOk(ways) => {
+        Op::ForkOk(Cut::Rounds, ways) => {
             let i = as_ival(arg(0)?);
             let fits = A::rounds(i).ok()?.is_some_and(|n| n <= *ways as u32);
             V::B(fits && (0..*ways).all(|c| A::round_fragment(i, c as u32).is_ok()), true)
@@ -732,8 +732,8 @@ fn the_boolean_layer_is_bit_exact<A: TestArith>() {
 }
 both!(the_boolean_layer_is_bit_exact, the_boolean_layer_is_bit_exact_fixed, the_boolean_layer_is_bit_exact_float);
 
-/// The forks' fragments per configuration (`Frag`, `FragOk`, `IntFrag`),
-/// their premise at every arity (`SplitOk`), the floor's premise; the
+/// The forks' fragments per configuration (`Frag`, `FragOk`, an `Ints` `Frag`),
+/// their premise at every arity (`ForkOk`), the floor's premise; the
 /// doubles' round fork. Around zeros, the floors' and the rounds' cut
 /// points, and (16.16) the top floors, where the grid wraps.
 fn fork_fragments<A: TestArith>() {
@@ -742,18 +742,18 @@ fn fork_fragments<A: TestArith>() {
     let ways = 3u8;
     let mut roots = Vec::new();
     for c in 0..ways {
-        roots.push(g.add(Op::Frag(c), vec![x]));
-        roots.push(g.add(Op::FragOk(c), vec![x]));
-        roots.push(g.add(Op::IntFrag(c), vec![x]));
+        roots.push(g.add(Op::Frag(Cut::Floors, c), vec![x]));
+        roots.push(g.add(Op::FragOk(Cut::Floors, c), vec![x]));
+        roots.push(g.add(Op::Frag(Cut::Ints, c), vec![x]));
         if !A::ROUND_BY_SHIFTED_FLOOR {
-            roots.push(g.add(Op::RFrag(c), vec![x]));
-            roots.push(g.add(Op::RFragOk(c), vec![x]));
+            roots.push(g.add(Op::Frag(Cut::Rounds, c), vec![x]));
+            roots.push(g.add(Op::FragOk(Cut::Rounds, c), vec![x]));
         }
     }
     for w in 1..=4 {
-        roots.push(g.add(Op::SplitOk(w), vec![x]));
+        roots.push(g.add(Op::ForkOk(Cut::Floors, w), vec![x]));
         if !A::ROUND_BY_SHIFTED_FLOOR {
-            roots.push(g.add(Op::RSplitOk(w), vec![x]));
+            roots.push(g.add(Op::ForkOk(Cut::Rounds, w), vec![x]));
         }
     }
     let flr = g.add(Op::Flr, vec![x]);
@@ -778,12 +778,12 @@ fn fork_fragments<A: TestArith>() {
 }
 both!(fork_fragments, fork_fragments_fixed, fork_fragments_float);
 
-/// A literal's `SplitOk` folds (`Graph::fold`) to what the kernel computes
+/// A literal's `ForkOk` folds (`Graph::fold`) to what the kernel computes
 /// on a lane holding the literal, wraps included.
 fn a_literals_split_ok_folds_to_the_kernels<A: TestArith>() {
     let mut g = Graph::<A>::default();
     let x = cells(&mut g, &[Ty::Ival])[0];
-    let roots: Vec<NodeId> = (1..=4).map(|w| g.add(Op::SplitOk(w), vec![x])).collect();
+    let roots: Vec<NodeId> = (1..=4).map(|w| g.add(Op::ForkOk(Cut::Floors, w), vec![x])).collect();
     let (c, l) = build(&g, &roots, "litsplit");
     let lits = intervals::<A>();
     for chunk in lits.chunks(16) {
@@ -792,8 +792,8 @@ fn a_literals_split_ok_folds_to_the_kernels<A: TestArith>() {
         for ((lo, hi), got) in chunk.iter().zip(&got) {
             let k = g.leaf(Op::Const(A::lit(*lo), A::lit(*hi)));
             for (w, got) in (1..=4u8).zip(got) {
-                let folded = g.fold(Op::SplitOk(w), vec![k]);
-                assert_eq!(Out::B(g.get(folded).op == Op::ConstBool(true), true), *got, "SplitOk({w}) of [{lo:?}, {hi:?}]");
+                let folded = g.fold(Op::ForkOk(Cut::Floors, w), vec![k]);
+                assert_eq!(Out::B(g.get(folded).op == Op::ConstBool(true), true), *got, "ForkOk({w}) of [{lo:?}, {hi:?}]");
             }
         }
     }

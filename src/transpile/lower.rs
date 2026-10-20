@@ -88,8 +88,8 @@ fn decided_roots<A: GraphArith>(
 }
 
 /// Specialize a traced frame's graph into ONE fused, hash-consed arena:
-/// every fork configuration resolved (`Split`/`SplitValid`/`SplitInt` become
-/// `Frag`/`FragOk`/`IntFrag`), so no fork node survives and configurations
+/// every fork configuration resolved (`Fork`/`ForkValid` become
+/// `Frag`/`FragOk`), so no fork node survives and configurations
 /// that agree share nodes. Returns the fused graph and one body per distinct
 /// (outcome, row), whose roots are the outcome's fields in order, then
 /// `error`, then `live`, then the transfer roots (`Outcome::arc`).
@@ -108,7 +108,7 @@ pub(crate) fn specialize_frame<A: GraphArith>(
         let mut forks: std::collections::BTreeSet<u8> = Default::default();
         for (i, n) in need.iter().enumerate() {
             if *n {
-                if let Op::Split(d) | Op::SplitValid(d) | Op::SplitInt(d) | Op::RSplit(d) | Op::RSplitValid(d) = graph.get(i as NodeId).op {
+                if let Op::Fork(_, d) | Op::ForkValid(_, d) = graph.get(i as NodeId).op {
                     forks.insert(d);
                 }
             }
@@ -141,7 +141,7 @@ pub(crate) fn specialize_frame<A: GraphArith>(
         let validity_read: std::collections::BTreeSet<u8> = (0..graph.len())
             .filter(|&n| need[n])
             .filter_map(|n| match graph.get(n as NodeId).op {
-                Op::SplitValid(d) | Op::RSplitValid(d) => Some(d),
+                Op::ForkValid(_, d) => Some(d),
                 _ => None,
             })
             .collect();
@@ -202,7 +202,7 @@ pub(crate) fn specialize_frame<A: GraphArith>(
         for m in classes {
             // A class's own arena (one shared across classes grew with each).
             let mut probe = graph.like();
-            // Move forks keep their traced arity, which their `SplitOk` premise checks.
+            // Move forks keep their traced arity, which their `ForkOk` premise checks.
             let valid: Vec<u8> = parts.iter().map(|&d| graph.fork_ways(d)).collect();
             for (i, n) in valid.iter().enumerate() {
                 ways_max[i] = ways_max[i].max(*n);

@@ -191,7 +191,7 @@ impl Lower<'_, Float> {
 
     /// `LuaF64Interval::floor_fragment(c)` of `a`: `[max(lo, b), min(hi,
     /// pred(b + 1))]` with `b = floor(lo) + c` (the cart's `max`/`min`), and
-    /// whether `a` reaches it: `floor(hi) - floor(lo) >= c` (`ev_frag_cells`).
+    /// whether `a` reaches it: `floor(hi) - floor(lo) >= c` (`GraphArith::cells`).
     fn floor_fragment(&mut self, a: [Vreg; 2], c: u8) -> ([Vreg; 2], Vreg) {
         let fl = self.floor(a[0]);
         let base = self.fbin(FOp::Add, fl, k(c as f64));
@@ -523,51 +523,36 @@ impl Lower<'_, Float> {
                     Ty::Num => Value::Bool([MaskVal::Const(true), MaskVal::Const(true)]),
                 }
             }
-            // The floor fork, resolved.
-            Op::Frag(c) => {
+            // A fork resolved: fragment `c` of the floors or the rounds, whether
+            // the lane reaches it, an `Ints` fragment's low end as an exact number.
+            Op::Frag(cut, c) | Op::FragOk(cut, c) => {
                 let x = self.as_ival(a[0])?;
                 let x = self.ival_regs(x);
-                let ([lo, hi], _) = self.floor_fragment(x, *c);
-                Value::Ival([NumVal::Reg(lo), NumVal::Reg(hi)])
+                let ([lo, hi], valid) = match cut.grid() {
+                    Cut::Rounds => {
+                        let (f, valid, _) = self.round_fragment(x, *c);
+                        (f, valid)
+                    }
+                    _ => self.floor_fragment(x, *c),
+                };
+                match node.op {
+                    Op::FragOk(..) => Value::Bool([MaskVal::Reg(valid), MaskVal::Const(true)]),
+                    Op::Frag(Cut::Ints, _) => Value::Num(NumVal::Reg(lo)),
+                    _ => Value::Ival([NumVal::Reg(lo), NumVal::Reg(hi)]),
+                }
             }
-            Op::FragOk(c) => {
-                let x = self.as_ival(a[0])?;
-                let x = self.ival_regs(x);
-                let (_, valid) = self.floor_fragment(x, *c);
-                Value::Bool([MaskVal::Reg(valid), MaskVal::Const(true)])
-            }
-            // The low end of fragment `c` as an exact number.
-            Op::IntFrag(c) => {
-                let x = self.as_ival(a[0])?;
-                let x = self.ival_regs(x);
-                let ([lo, _], _) = self.floor_fragment(x, *c);
-                Value::Num(NumVal::Reg(lo))
-            }
-            // At most `ways` floors (`ev_split_ok`).
-            Op::SplitOk(ways) => {
+            // At most `ways` floors (`GraphArith::cells`).
+            Op::ForkOk(Cut::Floors, ways) => {
                 let x = self.as_ival(a[0])?;
                 let x = self.ival_regs(x);
                 let cells = self.floor_cells(x);
                 let ok = self.fcmp(LE, cells, k(*ways as f64 - 1.0));
                 Value::Bool([MaskVal::Reg(ok), MaskVal::Const(true)])
             }
-            // The round fork, resolved.
-            Op::RFrag(c) => {
-                let x = self.as_ival(a[0])?;
-                let x = self.ival_regs(x);
-                let ([lo, hi], _, _) = self.round_fragment(x, *c);
-                Value::Ival([NumVal::Reg(lo), NumVal::Reg(hi)])
-            }
-            Op::RFragOk(c) => {
-                let x = self.as_ival(a[0])?;
-                let x = self.ival_regs(x);
-                let (_, valid, _) = self.round_fragment(x, *c);
-                Value::Bool([MaskVal::Reg(valid), MaskVal::Const(true)])
-            }
             // At most `ways` values of `flr(x + 1/2)` (`LuaF64Interval::
             // rounds`), and every cut a fragment reads settled (else the
             // reference raises): the fork's own error.
-            Op::RSplitOk(ways) => {
+            Op::ForkOk(Cut::Rounds, ways) => {
                 let x = self.as_ival(a[0])?;
                 let x = self.ival_regs(x);
                 let cells = self.round_cells(x);

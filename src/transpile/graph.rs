@@ -84,9 +84,6 @@ pub enum Op<A: Arithmetic = Fixed> {
     Const(A::Lit, A::Lit),
     ConstBool(bool),
     Cell(u32),
-    /// `Split(d)`: the operand RESTRICTED to fork d's outcome, eliminated by
-    /// specialization.
-    Split(u8),
 
     // number -> number
     Add,
@@ -146,22 +143,26 @@ pub enum Op<A: Arithmetic = Fixed> {
 
     /// `Known(v)`: is the value DETERMINED? Survives only in derived errors.
     Known,
-    /// `SplitValid(d)`: which lanes fall in the chosen fragment (fragments
-    /// PARTITION the lanes). Dropped for forks every lane takes both ways.
-    SplitValid(u8),
-    /// `Split(d)` specialized: fragment `c` is the `c`-th grid cell from the one
-    /// the low end lies in, clipped. `Frag` narrows to it, `FragOk` says whether
-    /// the interval reaches it; ordinary unary ops, so configurations SHARE every
-    /// node they agree on.
-    Frag(u8),
-    FragOk(u8),
-    /// A fork over WHOLE numbers whose fragments are the numbers, EXACT:
-    /// resolves to `IntFrag(c)`, fragment `c`'s low end.
-    SplitInt(u8),
-    IntFrag(u8),
-    /// `SplitOk(n)`: does this lane's interval span at most `n` floors (the
-    /// arity)? Otherwise the lane declines.
-    SplitOk(u8),
+
+    // THE FORK FAMILY, one op per role, each over its partition (`Cut`); the
+    // three validity ops over the GRID only (`Cut::grid`: the whole numbers
+    // are the floors' cells, so an `Ints` fork shares its floors' masks).
+    /// `Fork(cut, d)`: the operand RESTRICTED to fork `d`'s fragment,
+    /// eliminated by specialization (`Frag`).
+    Fork(Cut, u8),
+    /// `ForkValid(grid, d)`: which lanes fall in fork `d`'s chosen fragment
+    /// (fragments PARTITION the lanes). Dropped for forks every lane takes
+    /// both ways.
+    ForkValid(Cut, u8),
+    /// A fork RESOLVED: fragment `c` is the `c`-th grid cell from the one the
+    /// low end lies in, clipped (`Ints`: that cell's low end, EXACT). An
+    /// ordinary unary op, so configurations SHARE every node they agree on.
+    Frag(Cut, u8),
+    /// Does the lane's operand reach grid cell `c` (`Frag`'s validity)?
+    FragOk(Cut, u8),
+    /// `ForkOk(grid, n)`: does this lane's operand span at most `n` cells of
+    /// the grid (the fork's arity)? Otherwise the lane declines.
+    ForkOk(Cut, u8),
     /// `NoWrap(x)`: did `x`'s exact result stay inside the arithmetic's range on
     /// this lane (`GraphArith::range_error`'s operations, points and intervals)?
     /// The kernel wraps or saturates, so a failure is the operation's OWN ERROR
@@ -175,23 +176,33 @@ pub enum Op<A: Arithmetic = Fixed> {
     Mget,
     TileFlagAt,
 
-    // The round fork, where `x + 1/2` rounds (doubles).
-    /// `RSplit(d)`: the operand RESTRICTED to fork d's outcome in the ROUND
-    /// partition: fragment `c` is where `flr(x + 1/2)` takes the `c`-th value
-    /// from the low end's, cut at the arithmetic's exact points. 16.16 never
-    /// makes one: its round fork is the floor fork of `x + 1/2`, shifted back.
-    RSplit(u8),
-    /// `SplitValid`'s twin.
-    RSplitValid(u8),
-    /// `RSplit(d)` specialized: `Frag`/`FragOk`'s twins.
-    RFrag(u8),
-    RFragOk(u8),
-    /// `SplitOk`'s twin: does this lane's interval take at most `n` values
-    /// of `flr(x + 1/2)` (the arity)? Otherwise the lane declines.
-    RSplitOk(u8),
     /// `Same(x, y)`: are two numbers the same BITS? A pin's check where the
     /// cart's `==` is not identity (a double's `-0 == 0`).
     Same,
+}
+
+/// How a fork partitions its value (`trace::domain::Partition`).
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum Cut {
+    /// At the integer floors: `flr` of each fragment is one number
+    /// (`__split_by_flr`).
+    Floors,
+    /// An interval of whole numbers into the numbers, each EXACT.
+    Ints,
+    /// Where `flr(x + 1/2)` changes, at the arithmetic's exact cut points (a
+    /// double's `__split_by_round`; 16.16's is the floor fork of `x + 1/2`,
+    /// shifted back).
+    Rounds,
+}
+
+impl Cut {
+    /// The grid the cut is on: the whole numbers are the floors' cells.
+    pub fn grid(self) -> Cut {
+        match self {
+            Cut::Ints => Cut::Floors,
+            c => c,
+        }
+    }
 }
 
 /// Which undecided boolean an `Op::UnknownBool` is.
@@ -336,14 +347,12 @@ impl<A: GraphArith> Graph<A> {
             | Op::Known
             | Op::NoWrap
             | Op::TileFlagAt
-            | Op::SplitValid(_)
-            | Op::FragOk(_)
-            | Op::SplitOk(_)
-            | Op::RSplitValid(_)
-            | Op::RFragOk(_)
-            | Op::RSplitOk(_) => Ty::Bool,
-            Op::Split(_) | Op::RSplit(_) | Op::Frag(_) | Op::RFrag(_) | Op::Span => Ty::Ival,
-            Op::SplitInt(_) | Op::IntFrag(_) | Op::Lo | Op::Hi | Op::Flr | Op::Mget | Op::UnknownNum | Op::Pin(_) => Ty::Num,
+            | Op::ForkValid(..)
+            | Op::FragOk(..)
+            | Op::ForkOk(..) => Ty::Bool,
+            Op::Fork(Cut::Ints, _) | Op::Frag(Cut::Ints, _) => Ty::Num,
+            Op::Fork(..) | Op::Frag(..) | Op::Span => Ty::Ival,
+            Op::Lo | Op::Hi | Op::Flr | Op::Mget | Op::UnknownNum | Op::Pin(_) => Ty::Num,
             Op::Add | Op::Sub | Op::Mul | Op::Div | Op::Rem | Op::Neg | Op::Abs | Op::Min | Op::Max | Op::Sin | Op::Restrict(..) => wide(args),
             Op::Sel if self.tys[args[1] as usize].is_bool() || self.tys[args[2] as usize].is_bool() => Ty::Bool,
             Op::Sel => wide(&args[1..]),
@@ -373,7 +382,7 @@ impl<A: GraphArith> Graph<A> {
     }
 
     /// Give fork `d` at least `ways` fragments. Monotone: each site's own
-    /// `SplitOk` bounds the lanes it admits.
+    /// `ForkOk` bounds the lanes it admits.
     pub fn set_fork_ways(&mut self, d: u8, ways: u8) {
         debug_assert!(ways >= 1, "fork arity {ways}");
         if self.fork_ways.len() <= d as usize {
@@ -383,6 +392,9 @@ impl<A: GraphArith> Graph<A> {
     }
 
     pub fn add(&mut self, op: Op<A>, args: Vec<NodeId>) -> NodeId {
+        if let Op::ForkValid(cut, _) | Op::FragOk(cut, _) | Op::ForkOk(cut, _) = op {
+            assert_eq!(cut, cut.grid(), "{op:?}: a validity op is over the grid");
+        }
         let node = Node { op, args };
         if let Some(id) = self.intern.get(&node) {
             return *id;
@@ -440,7 +452,7 @@ impl<A: GraphArith> Graph<A> {
     /// Is `n` a fork over a LITERAL, one every lane takes both ways?
     pub fn is_literal_fork(&self, n: NodeId) -> bool {
         let node = self.get(n);
-        matches!(node.op, Op::Split(_) | Op::SplitInt(_)) && matches!(self.get(node.args[0]).op, Op::Const(lo, hi) if lo != hi)
+        matches!(node.op, Op::Fork(Cut::Floors | Cut::Ints, _)) && matches!(self.get(node.args[0]).op, Op::Const(lo, hi) if lo != hi)
     }
 
     /// Rebuild into `out` with forks RESOLVED per `splits` (`OPEN` leaves one
@@ -461,13 +473,9 @@ impl<A: GraphArith> Graph<A> {
             let arg = |map: &Vec<NodeId>, k: usize| map[node.args[k] as usize];
             let s = splits;
             let id = match node.op.clone() {
-                Op::Split(d) if s[d as usize] != OPEN => out.fold(Op::Frag(s[d as usize] & !ANY_VALID), vec![arg(&map, 0)]),
-                Op::SplitValid(d) if s[d as usize] != OPEN && s[d as usize] & ANY_VALID != 0 => out.leaf(Op::ConstBool(true)),
-                Op::SplitValid(d) if s[d as usize] != OPEN => out.fold(Op::FragOk(s[d as usize]), vec![arg(&map, 0)]),
-                Op::SplitInt(d) if s[d as usize] != OPEN => out.fold(Op::IntFrag(s[d as usize] & !ANY_VALID), vec![arg(&map, 0)]),
-                Op::RSplit(d) if s[d as usize] != OPEN => out.fold(Op::RFrag(s[d as usize] & !ANY_VALID), vec![arg(&map, 0)]),
-                Op::RSplitValid(d) if s[d as usize] != OPEN && s[d as usize] & ANY_VALID != 0 => out.leaf(Op::ConstBool(true)),
-                Op::RSplitValid(d) if s[d as usize] != OPEN => out.fold(Op::RFragOk(s[d as usize]), vec![arg(&map, 0)]),
+                Op::Fork(cut, d) if s[d as usize] != OPEN => out.fold(Op::Frag(cut, s[d as usize] & !ANY_VALID), vec![arg(&map, 0)]),
+                Op::ForkValid(_, d) if s[d as usize] != OPEN && s[d as usize] & ANY_VALID != 0 => out.leaf(Op::ConstBool(true)),
+                Op::ForkValid(grid, d) if s[d as usize] != OPEN => out.fold(Op::FragOk(grid, s[d as usize]), vec![arg(&map, 0)]),
                 _ => {
                     let args: Vec<NodeId> =
                         node.args.iter().map(|a| map[*a as usize]).collect();
@@ -515,17 +523,19 @@ impl<A: GraphArith> Graph<A> {
         };
         match op {
             // Fragment 0 is never empty, so `FragOk(0)` is true (as in `eval`).
-            Op::FragOk(0) | Op::RFragOk(0) => return self.leaf(Op::ConstBool(true)),
-            // The span premise over a LITERAL is decided once (the kernel's `zi_span_ok`).
-            Op::SplitOk(n) => {
+            Op::FragOk(_, 0) => return self.leaf(Op::ConstBool(true)),
+            // The span premise over a LITERAL is decided once (the floors': the
+            // kernel's `zi_span_ok`, wraps included).
+            Op::ForkOk(Cut::Floors, n) => {
                 if let Op::Const(lo, hi) = self.nodes[args[0] as usize].op {
                     return self.leaf(Op::ConstBool(A::lit_split_ok(lo, hi, n)));
                 }
             }
-            Op::RSplitOk(n) => {
+            Op::ForkOk(Cut::Rounds, n) => {
                 if let Op::Const(lo, hi) = self.nodes[args[0] as usize].op {
-                    if let Some(k) = round_count::<A>(A::ival(A::from_lit(lo), A::from_lit(hi))) {
-                        return self.leaf(Op::ConstBool(k <= n as u32));
+                    let cells = A::cells(Cut::Rounds, A::ival(A::from_lit(lo), A::from_lit(hi)));
+                    if cells != i64::MAX {
+                        return self.leaf(Op::ConstBool(cells < n as i64));
                     }
                 }
             }
@@ -539,8 +549,8 @@ impl<A: GraphArith> Graph<A> {
                     return self.leaf(Op::ConstBool(A::bits(x) == A::bits(y)));
                 }
             }
-            // `IntFrag(c)` of a literal is a constant (as in `eval`).
-            Op::IntFrag(c) if matches!(self.nodes[args[0] as usize].op, Op::Const(..)) => {
+            // An `Ints` fragment of a literal is a constant (as in `eval`).
+            Op::Frag(Cut::Ints, c) if matches!(self.nodes[args[0] as usize].op, Op::Const(..)) => {
                 let Op::Const(lo, _) = self.nodes[args[0] as usize].op else { unreachable!("guarded above") };
                 let v = A::lit_int_frag(lo, c);
                 return self.leaf(Op::Const(v, v));
@@ -855,44 +865,50 @@ impl<A: GraphArith> Graph<A> {
                     let (lo, hi) = (if A::lt(xl, rl) { rl } else { xl }, if A::lt(rh, xh) { rh } else { xh });
                     Val::Num(if A::le(lo, hi) { A::ival(lo, hi) } else { x })
                 }
-                // A split RESTRICTS its operand: lenient, the operand covers it.
-                Op::Split(d) if lenient => {
-                    let _ = d;
-                    a!(0)
+                // A fork RESTRICTS its operand: lenient, the operand covers it.
+                Op::Fork(..) if lenient => a!(0),
+                Op::Fork(_, d) | Op::ForkValid(_, d) => {
+                    bail!("node {}: fork {} has no value outside an outcome", i, d)
                 }
-                Op::SplitInt(_) | Op::RSplit(_) if lenient => a!(0),
-                Op::Split(d) | Op::SplitValid(d) | Op::SplitInt(d) | Op::RSplit(d) | Op::RSplitValid(d) => {
-                    bail!("node {}: split {} has no value outside an outcome", i, d)
-                }
-                // `SplitOk`'s twin over the values of `flr(x + 1/2)`.
-                Op::RSplitOk(ways) => {
-                    let iv = a!(0).as_num("RSplitOk")?;
-                    if round_count::<A>(iv).is_some_and(|k| k <= *ways as u32) {
+                // At most `n` cells of the grid (the floors': the kernel's
+                // `zi_span_ok`). On a hull: fits => every lane fits, else unknown.
+                Op::ForkOk(grid, n) => {
+                    let iv = a!(0).as_num("ForkOk")?;
+                    if A::cells(*grid, iv) < *n as i64 {
                         Val::Bool(Some(true))
                     } else if !strict_err {
                         Val::Bool(None)
                     } else {
-                        bail!("node {}: RSplitOk of an interval that may not fit", i)
+                        bail!("node {}: ForkOk of an interval that may not fit", i)
                     }
                 }
-                // The RESOLVED round fork, as `Frag`/`FragOk` (`ev` below).
-                Op::RFrag(c) | Op::RFragOk(c) => {
-                    let iv = a!(0).as_num("RFrag")?;
-                    // Values taken minus one (past 65536: every fragment).
-                    let n = round_count::<A>(iv).map_or(i64::MAX, |k| k as i64 - 1);
+                // An `Ints` fragment: its cell's low end, exact (lenient: its hull
+                // over lanes).
+                Op::Frag(Cut::Ints, c) => Val::Num(A::fragment(Cut::Ints, a!(0).as_num("Frag")?, *c, lenient)?),
+                // The RESOLVED fork (the floors': the kernel's `zi_fork_flr`).
+                Op::Frag(cut, c) | Op::FragOk(cut, c) => {
+                    let iv = a!(0).as_num("Frag")?;
+                    // Cells spanned past the low end's.
+                    let n = A::cells(*cut, iv);
                     let c = *c as i64;
+                    // Lenient, the operand is a HULL over lanes: a lane in a wide hull may
+                    // still span two cells, so `FragOk(c)` is decided only where the hull
+                    // rules it out.
                     if lenient {
                         return Ok(match (&node.op, c) {
-                            (Op::RFrag(_), _) => a!(0),
+                            (Op::Frag(..), _) => a!(0),
                             (_, 0) => Val::Bool(Some(true)),
+                            // Too few cells: no lane reaches fragment `c`.
                             _ if n < c => Val::Bool(Some(false)),
                             _ => Val::Bool(None),
                         });
                     }
+                    // Valid iff the interval reaches cell `c`; an invalid fragment
+                    // keeps the whole value (never taken).
                     let valid = n >= c;
                     match &node.op {
-                        Op::RFrag(_) if valid => Val::Num(A::round_fragment(iv, c as u32)?),
-                        Op::RFrag(_) => a!(0),
+                        Op::Frag(..) if valid => Val::Num(A::fragment(*cut, iv, c as u8, false)?),
+                        Op::Frag(..) => a!(0),
                         _ => Val::Bool(Some(valid)),
                     }
                 }
@@ -923,20 +939,6 @@ impl<A: GraphArith> Graph<A> {
                         _ => Val::Num(a!(0).as_num("Lo/Hi")?),
                     }
                 }
-                // Fragment `c`'s low end, exact (lenient: its hull over lanes).
-                Op::IntFrag(c) => Val::Num(A::ev_int_frag(a!(0).as_num("IntFrag")?, *c, lenient)),
-                // The kernel's `zi_span_ok`: high end's floor at most `ways - 1` cells above
-                // the low end's. On a hull: fits => every lane fits, else unknown.
-                Op::SplitOk(ways) => {
-                    let iv = a!(0).as_num("SplitOk")?;
-                    if A::ev_split_ok(iv, *ways) {
-                        Val::Bool(Some(true))
-                    } else if !strict_err {
-                        Val::Bool(None)
-                    } else {
-                        bail!("node {}: SplitOk of an interval that may not fit", i)
-                    }
-                }
                 // The operation's checked form (points and intervals alike). On a hull:
                 // no wrap is no wrap on any lane (the operations are monotone or
                 // bilinear); a wrap is unknown per lane.
@@ -959,33 +961,6 @@ impl<A: GraphArith> Graph<A> {
                         _ => true,
                     };
                     Val::Bool(if fits || !lenient { Some(fits) } else { None })
-                }
-                // The RESOLVED fork: the kernel's `zi_fork_flr` on one interval.
-                Op::Frag(c) | Op::FragOk(c) => {
-                    let iv = a!(0).as_num("Frag")?;
-                    // Cells spanned minus one.
-                    let n = A::ev_frag_cells(iv);
-                    let c = *c as i64;
-                    // Lenient, the operand is a HULL over lanes: a lane in a wide hull may
-                    // still span two floors, so `FragOk(c)` is decided only where the hull
-                    // rules it out.
-                    if lenient {
-                        return Ok(match (&node.op, c) {
-                            (Op::Frag(_), _) => a!(0),
-                            (_, 0) => Val::Bool(Some(true)),
-                            // Too few cells: no lane reaches fragment `c`.
-                            _ if n < c => Val::Bool(Some(false)),
-                            _ => Val::Bool(None),
-                        });
-                    }
-                    // Valid iff the interval reaches cell `c`; an invalid fragment
-                    // keeps the whole value (never taken).
-                    let valid = n >= c;
-                    match &node.op {
-                        Op::Frag(_) if valid => Val::Num(A::ev_frag(iv, c as u8)),
-                        Op::Frag(_) => a!(0),
-                        _ => Val::Bool(Some(valid)),
-                    }
                 }
                 Op::Cell(c) => match cells.get(c) {
                     Some(v) => *v,
@@ -1112,13 +1087,10 @@ impl<A: GraphArith> Graph<A> {
     fn top_of(op: &Op<A>, args: &[NodeId], out: &[Val<A>], full: Val<A>) -> Val<A> {
         match op {
             Op::ConstBool(_)
-            | Op::SplitValid(_)
-            | Op::SplitOk(_)
+            | Op::ForkValid(..)
+            | Op::ForkOk(..)
             | Op::NoWrap
-            | Op::FragOk(_)
-            | Op::RSplitValid(_)
-            | Op::RSplitOk(_)
-            | Op::RFragOk(_)
+            | Op::FragOk(..)
             | Op::Same
             | Op::Lt
             | Op::Le
@@ -1626,7 +1598,7 @@ mod tests {
         let fork = d.graph.get(left).args[0];
         assert!(d.graph.is_literal_fork(fork), "a button is a fork over a literal");
         let literal = d.graph.get(fork).args[0];
-        let covered = d.graph.fold(Op::SplitOk(2), vec![literal]);
+        let covered = d.graph.fold(Op::ForkOk(Cut::Floors, 2), vec![literal]);
         assert_eq!(d.graph.get(covered).op, Op::ConstBool(true), "the literal fits two ways");
         let g = &mut d.graph;
         let one = g.leaf(Op::Const(n(1).as_raw_u32() as i32, n(1).as_raw_u32() as i32));
@@ -1848,11 +1820,6 @@ mod tests {
         let (out, map, _) = crate::transpile::ival::fold(&g, &[le_r], None).expect("fold");
         assert_eq!(out.get(map[le_r as usize]).op, Op::Le, "the fold leaves it to the lanes");
     }
-}
-
-/// How many values `flr(x + 1/2)` takes over `iv` (`None`: past 65536).
-fn round_count<A: Arithmetic>(iv: A::Ival) -> Option<u32> {
-    A::rounds(iv).ok().flatten()
 }
 
 /// `Graph::fold`'s literal arithmetic: the exact result, or a panic naming
