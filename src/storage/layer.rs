@@ -18,14 +18,14 @@ use celeste_engine::runtime2::{mix64, Cell2, Col, Rt2, P8};
 use super::codec::{get_varint, get_varint128, narrow, put_varint, put_varint128, wide};
 use super::file::{self, At, Mapped, FORMAT_VERSION};
 use super::decode::Repr;
-use super::set::{RegionSet, RegionTable};
+use super::set::{PlainTable, RegionSet};
 use super::{Sk, GEOMETRY};
 
 #[derive(Clone)]
 pub struct Layer<N: EngineNum = P8> {
-    pub set: RegionSet,
+    pub(crate) set: RegionSet,
     /// Per shape (hash) its skeleton (`SkelRecord::rt2`).
-    pub skeletons: FxHashMap<u64, Arc<Rt2<N>>>,
+    pub(crate) skeletons: FxHashMap<u64, Arc<Rt2<N>>>,
 }
 
 impl<N: EngineNum> Default for Layer<N> {
@@ -37,10 +37,10 @@ impl<N: EngineNum> Default for Layer<N> {
 impl<N: EngineNum> Layer<N> {
     /// Append region `region`'s entries (after every region held; keys
     /// ascending, masks non-empty: checked).
-    pub fn push_region(&mut self, region: u32, keys: &[Key], masks: &[u64]) -> Result<()> {
+    pub(crate) fn push_region(&mut self, region: u32, keys: &[Key], masks: &[u64]) -> Result<()> {
         ensure!(masks.iter().all(|&m| m != 0), "region {region}: an entry without cells");
         ensure!(region % GEOMETRY.slots != GEOMETRY.no_cell_slot() || masks.iter().all(|&m| m == 1), "region {region} (no player): a cell past 0");
-        self.set.push(region, RegionTable::from_sorted(keys, masks)?)
+        self.set.push(region, PlainTable::from_sorted(keys, masks)?)
     }
 
     pub fn entries(&self) -> usize {
@@ -51,12 +51,12 @@ impl<N: EngineNum> Layer<N> {
         self.set.states()
     }
 
-    pub fn is_empty(&self) -> bool {
+    pub(crate) fn is_empty(&self) -> bool {
         self.set.is_empty()
     }
 
     /// Every entry `(region, key, mask)`, in order.
-    pub fn iter(&self) -> impl Iterator<Item = (u32, Key, u64)> + '_ {
+    pub(crate) fn iter(&self) -> impl Iterator<Item = (u32, Key, u64)> + '_ {
         self.set.iter()
     }
 
@@ -65,11 +65,8 @@ impl<N: EngineNum> Layer<N> {
         self.set.states_iter()
     }
 
-    pub fn mask_of(&self, region: u32, key: Key) -> u64 {
-        self.set.mask_of(region, key)
-    }
-
-    pub fn contains(&self, s: Sk) -> bool {
+    #[cfg(test)]
+    pub(crate) fn contains(&self, s: Sk) -> bool {
         self.set.contains(s)
     }
 
@@ -97,7 +94,7 @@ impl<N: EngineNum> Layer<N> {
 
 /// The set bits of `m`, ascending.
 #[inline]
-pub fn bits(mut m: u64) -> impl Iterator<Item = u32> {
+pub(crate) fn bits(mut m: u64) -> impl Iterator<Item = u32> {
     std::iter::from_fn(move || {
         (m != 0).then(|| {
             let b = m.trailing_zeros();
@@ -113,22 +110,22 @@ pub fn bits(mut m: u64) -> impl Iterator<Item = u32> {
 /// cell how its column holds numbers (`Repr`: the code merges `Num(n)` and
 /// `Ival(n, n)`). Equal records decode every key alike.
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
-pub struct SkelRecord<N = P8> {
-    pub shape_hash: u64,
-    pub structure: Vec<Cell2<N>>,
-    pub globals: Vec<u32>,
-    pub strings: Vec<String>,
-    pub prints: Vec<String>,
+pub(crate) struct SkelRecord<N = P8> {
+    pub(crate) shape_hash: u64,
+    pub(crate) structure: Vec<Cell2<N>>,
+    pub(crate) globals: Vec<u32>,
+    pub(crate) strings: Vec<String>,
+    pub(crate) prints: Vec<String>,
     /// The cells that are not values, with their (uniform) columns.
-    pub others: Vec<(u32, Col<N>)>,
+    pub(crate) others: Vec<(u32, Col<N>)>,
     /// The value cells whose columns hold numbers (0) or intervals (1); the
     /// others any value (`Repr::Other`).
-    pub numeric: Vec<(u32, u8)>,
+    pub(crate) numeric: Vec<(u32, u8)>,
 }
 
 impl<N: EngineNum> SkelRecord<N> {
     /// The skeleton of `rt2`'s shape (its values are not read).
-    pub fn of(rt2: &Rt2<N>) -> Result<SkelRecord<N>> {
+    pub(crate) fn of(rt2: &Rt2<N>) -> Result<SkelRecord<N>> {
         for cell in &rt2.structure {
             if let Cell2::Clo(_, caps) = cell {
                 ensure!(caps.iter().all(|c| matches!(c, Col::U(_))), "skeleton of {:016x}: a closure capture is not uniform", rt2.shape_hash);
@@ -151,7 +148,7 @@ impl<N: EngineNum> SkelRecord<N> {
     }
 
     /// The skeleton as an empty block over `cache` (a room's).
-    pub fn rt2(&self, cache: Arc<celeste_core::collision_cache::CollisionCache>) -> Rt2<N> {
+    pub(crate) fn rt2(&self, cache: Arc<celeste_core::collision_cache::CollisionCache>) -> Rt2<N> {
         let mut rt2 = Rt2::empty(0, self.globals.len(), &[], cache);
         rt2.structure = self.structure.clone();
         rt2.globals = self.globals.clone();
@@ -169,23 +166,23 @@ impl<N: EngineNum> SkelRecord<N> {
     }
 
     /// The skeleton in a search from `room` (its collision cache).
-    pub fn rt2_in(&self, room: (i16, i16)) -> Rt2<N> {
+    pub(crate) fn rt2_in(&self, room: (i16, i16)) -> Rt2<N> {
         self.rt2(crate::compiled::collision_cache(room))
     }
 }
 
 const MAGIC: &[u8; 4] = b"CSL1";
 
-pub fn frame_path(dir: &Path, frame: u32) -> PathBuf {
+pub(crate) fn frame_path(dir: &Path, frame: u32) -> PathBuf {
     dir.join("frames").join(format!("f{frame:03}.bin"))
 }
 
-pub fn frame_exists(dir: &Path, frame: u32) -> bool {
+pub(crate) fn frame_exists(dir: &Path, frame: u32) -> bool {
     frame_path(dir, frame).is_file()
 }
 
 /// The tree's last frame with a file (frames from 0 on, consecutive).
-pub fn last_frame(dir: &Path) -> Option<u32> {
+pub(crate) fn last_frame(dir: &Path) -> Option<u32> {
     let mut last = None;
     while frame_exists(dir, last.map_or(0, |f: u32| f + 1)) {
         last = Some(last.map_or(0, |f| f + 1));
@@ -195,50 +192,50 @@ pub fn last_frame(dir: &Path) -> Option<u32> {
 
 /// One region's place in a frame file.
 #[derive(Serialize, Deserialize, Clone, Copy, Debug)]
-pub struct RegionIndex {
-    pub region: u32,
-    pub entries: u32,
-    pub states: u32,
-    pub wins: u32,
-    pub at: At,
+pub(crate) struct RegionIndex {
+    pub(crate) region: u32,
+    pub(crate) entries: u32,
+    pub(crate) states: u32,
+    pub(crate) wins: u32,
+    pub(crate) at: At,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
 #[serde(bound = "")]
-pub struct FrameHeader<N: EngineNum = P8> {
-    pub frame: u32,
+pub(crate) struct FrameHeader<N: EngineNum = P8> {
+    pub(crate) frame: u32,
     /// The storage region side the tree is built with.
-    pub side: u32,
+    pub(crate) side: u32,
     /// `(index, hash)` of the shapes numbered here.
-    pub shapes: Vec<(u32, u64)>,
-    pub keys: KeyAdditions<N>,
+    pub(crate) shapes: Vec<(u32, u64)>,
+    pub(crate) keys: KeyAdditions<N>,
     /// The skeletons of the shapes the file holds states of.
-    pub skeletons: Vec<SkelRecord<N>>,
+    pub(crate) skeletons: Vec<SkelRecord<N>>,
     /// The skeletons first EMITTED at the frame of shapes it holds no state
     /// of: a re-push reaches such a shape's state later without emitting
     /// it - a resume registers every file's (`frame::restore_visited`).
-    pub emitted: Vec<SkelRecord<N>>,
+    pub(crate) emitted: Vec<SkelRecord<N>>,
     /// Per region held (ascending) its block.
-    pub regions: Vec<RegionIndex>,
+    pub(crate) regions: Vec<RegionIndex>,
 }
 
 impl<N: EngineNum> FrameHeader<N> {
-    pub fn states(&self) -> u64 {
+    pub(crate) fn states(&self) -> u64 {
         self.regions.iter().map(|r| r.states as u64).sum()
     }
 
-    pub fn wins(&self) -> u64 {
+    pub(crate) fn wins(&self) -> u64 {
         self.regions.iter().map(|r| r.wins as u64).sum()
     }
 }
 
 /// What a frame file holds besides its states.
-pub struct FrameMeta<'a, N: EngineNum = P8> {
-    pub frame: u32,
-    pub shapes: &'a [(u32, u64)],
-    pub keys: &'a KeyAdditions<N>,
+pub(crate) struct FrameMeta<'a, N: EngineNum = P8> {
+    pub(crate) frame: u32,
+    pub(crate) shapes: &'a [(u32, u64)],
+    pub(crate) keys: &'a KeyAdditions<N>,
     /// `FrameHeader::emitted`.
-    pub emitted: &'a [SkelRecord<N>],
+    pub(crate) emitted: &'a [SkelRecord<N>],
 }
 
 /// One region's block: its entries' keys (delta-coded, ascending), masks
@@ -265,10 +262,10 @@ fn encode_region(keys: &[Key], masks: &[u64], wins: &[(u32, u64)], out: &mut Vec
 }
 
 /// A region's entries and win masks (by entry index), decoded.
-pub struct RegionEntries {
-    pub keys: Vec<Key>,
-    pub masks: Vec<u64>,
-    pub wins: Vec<(u32, u64)>,
+pub(crate) struct RegionEntries {
+    pub(crate) keys: Vec<Key>,
+    pub(crate) masks: Vec<u64>,
+    pub(crate) wins: Vec<(u32, u64)>,
 }
 
 fn decode_region(raw: &[u8]) -> Result<RegionEntries> {
@@ -304,7 +301,7 @@ fn decode_region(raw: &[u8]) -> Result<RegionEntries> {
 /// WRITE a frame file: `layer`'s states with their win masks (`wins`:
 /// sorted entry indices of `layer` with a win, and the win cells), its
 /// skeletons, what the frame added to the codebooks. Returns its bytes.
-pub fn write_frame<N: EngineNum>(path: &Path, meta: &FrameMeta<N>, layer: &Layer<N>, wins: &[(u32, u64)], threads: usize) -> Result<u64> {
+pub(crate) fn write_frame<N: EngineNum>(path: &Path, meta: &FrameMeta<N>, layer: &Layer<N>, wins: &[(u32, u64)], threads: usize) -> Result<u64> {
     ensure!(wins.windows(2).all(|w| w[0].0 < w[1].0), "write_frame: wins not by entry");
     let tables = layer.set.tables();
     let starts = layer.set.entry_starts();
@@ -349,13 +346,13 @@ pub fn write_frame<N: EngineNum>(path: &Path, meta: &FrameMeta<N>, layer: &Layer
     })
 }
 
-pub struct FrameFile<N: EngineNum = P8> {
+pub(crate) struct FrameFile<N: EngineNum = P8> {
     file: Mapped,
-    pub header: FrameHeader<N>,
+    pub(crate) header: FrameHeader<N>,
 }
 
 impl<N: EngineNum> FrameFile<N> {
-    pub fn open(path: &Path) -> Result<Self> {
+    pub(crate) fn open(path: &Path) -> Result<Self> {
         let file = Mapped::open(path, file::magic::<N>(MAGIC), FORMAT_VERSION, &format!("a frame file of the {} arithmetic", <N::A as celeste_core::arith::Arithmetic>::NAME))?;
         let header: FrameHeader<N> = file.header()?;
         ensure!(header.side == GEOMETRY.side, "{}: built with storage regions of {} cells, this process uses {}", path.display(), header.side, GEOMETRY.side);
@@ -363,12 +360,12 @@ impl<N: EngineNum> FrameFile<N> {
         Ok(FrameFile { file, header })
     }
 
-    pub fn path(&self) -> &Path {
+    pub(crate) fn path(&self) -> &Path {
         self.file.path()
     }
 
     /// Region `i` (of `header.regions`) decoded.
-    pub fn region(&self, i: usize) -> Result<RegionEntries> {
+    pub(crate) fn region(&self, i: usize) -> Result<RegionEntries> {
         let r = &self.header.regions[i];
         let mut raw = Vec::new();
         self.file.block(r.at, &mut zstd::bulk::Decompressor::new()?, &mut raw).with_context(|| format!("region {}", r.region))?;
@@ -378,13 +375,13 @@ impl<N: EngineNum> FrameFile<N> {
     }
 
     /// Drop the resident pages of region `i`'s block (`Mapped::release`).
-    pub fn release_region(&self, i: usize) -> Result<()> {
+    pub(crate) fn release_region(&self, i: usize) -> Result<()> {
         self.file.release(self.file.stored(self.header.regions[i].at))
     }
 
     /// The file's states as a layer and its wins, its skeletons in a search
     /// from `room` (`None`: none - a reader of keys and cells only).
-    pub fn layer(&self, room: Option<(i16, i16)>, threads: usize) -> Result<(Layer<N>, Vec<(u32, u64)>)> {
+    pub(crate) fn layer(&self, room: Option<(i16, i16)>, threads: usize) -> Result<(Layer<N>, Vec<(u32, u64)>)> {
         let n = self.header.regions.len();
         let parts: Vec<Result<RegionEntries>> = super::wave::par_map(&(0..n).collect::<Vec<_>>(), threads, |&i| self.region(i));
         let mut layer = Layer::<N>::default();
@@ -404,7 +401,7 @@ impl<N: EngineNum> FrameFile<N> {
         Ok((layer, wins))
     }
 
-    pub fn wins(&self) -> Result<Vec<Sk>> {
+    pub(crate) fn wins(&self) -> Result<Vec<Sk>> {
         let mut out = Vec::new();
         for (i, r) in self.header.regions.iter().enumerate() {
             if r.wins == 0 {
@@ -423,7 +420,7 @@ impl<N: EngineNum> FrameFile<N> {
 /// region by region, its states are exactly `layer`'s (its regions, every
 /// entry's key and cells) and its wins `wins`. FATAL otherwise: the frame
 /// would resume as another set than the forward expands.
-pub fn check_frame_file<N: EngineNum>(path: &Path, layer: &Layer<N>, wins: &[(u32, u64)], threads: usize) -> Result<()> {
+pub(crate) fn check_frame_file<N: EngineNum>(path: &Path, layer: &Layer<N>, wins: &[(u32, u64)], threads: usize) -> Result<()> {
     let f = FrameFile::<N>::open(path)?;
     let tables = layer.set.tables();
     let starts = layer.set.entry_starts();
@@ -450,9 +447,9 @@ pub fn check_frame_file<N: EngineNum>(path: &Path, layer: &Layer<N>, wins: &[(u3
 /// index, the key space: every file's additions, any order) and each
 /// frame's file (none past a dead frontier: those frames are empty).
 pub struct Tree<N: EngineNum = P8> {
-    pub dir: PathBuf,
-    pub last: u32,
-    pub frames: Vec<Option<FrameFile<N>>>,
+    pub(crate) dir: PathBuf,
+    pub(crate) last: u32,
+    pub(crate) frames: Vec<Option<FrameFile<N>>>,
     pub shapes: Vec<u64>,
     pub space: KeySpace<N>,
 }
@@ -499,37 +496,38 @@ impl<N: EngineNum> Tree<N> {
     }
 
     /// Frame `f`'s file (`None`: past a dead frontier, or past `last`).
-    pub fn file(&self, f: u32) -> Option<&FrameFile<N>> {
+    pub(crate) fn file(&self, f: u32) -> Option<&FrameFile<N>> {
         self.frames.get(f as usize).and_then(|x| x.as_ref())
     }
 
     /// Frame `f`'s state count.
-    pub fn states(&self, f: u32) -> u64 {
+    pub(crate) fn states(&self, f: u32) -> u64 {
         self.file(f).map_or(0, |x| x.header.states())
     }
 
     /// The first frame with a win (`None`: none through `last`).
-    pub fn first_win(&self) -> Option<u32> {
+    pub(crate) fn first_win(&self) -> Option<u32> {
         self.frames.iter().position(|x| x.as_ref().is_some_and(|x| x.header.wins() > 0)).map(|f| f as u32)
     }
 
-    pub fn shape_of(&self, region: u32) -> Result<u64> {
+    pub(crate) fn shape_of(&self, region: u32) -> Result<u64> {
         self.shapes.get((region / GEOMETRY.slots) as usize).copied().ok_or_else(|| anyhow!("{}: region {region} of no shape", self.dir.display()))
     }
 
     /// A state as `(shape, key, cell)`.
-    pub fn state(&self, s: Sk) -> Result<(u64, Key, u32)> {
+    #[cfg(test)]
+    pub(crate) fn state(&self, s: Sk) -> Result<(u64, Key, u32)> {
         Ok((self.shape_of(s.region)?, s.key, s.cell(&GEOMETRY)))
     }
 
     /// A state of `shape` with `key` at `cell`, if the tree numbers the shape.
-    pub fn sk(&self, shape: u64, key: Key, cell: u32) -> Option<Sk> {
+    pub(crate) fn sk(&self, shape: u64, key: Key, cell: u32) -> Option<Sk> {
         let i = self.shapes.iter().position(|&h| h == shape)?;
         Some(Sk::at(&GEOMETRY, i as u32, key, cell))
     }
 
     /// The cells of `(region, key)` frame `f` holds, reading that region only.
-    pub fn mask_at(&self, f: u32, region: u32, key: Key) -> Result<u64> {
+    pub(crate) fn mask_at(&self, f: u32, region: u32, key: Key) -> Result<u64> {
         let Some(file) = self.file(f) else { return Ok(0) };
         let Ok(i) = file.header.regions.binary_search_by_key(&region, |r| r.region) else { return Ok(0) };
         let e = file.region(i)?;
@@ -537,7 +535,7 @@ impl<N: EngineNum> Tree<N> {
     }
 
     /// The frame holding state `s` among `0..=upto`, by searching their files.
-    pub fn layer_of(&self, s: Sk, upto: u32) -> Result<Option<u32>> {
+    pub(crate) fn layer_of(&self, s: Sk, upto: u32) -> Result<Option<u32>> {
         for f in 0..=upto.min(self.last) {
             if self.mask_at(f, s.region, s.key)? >> s.local & 1 == 1 {
                 return Ok(Some(f));
@@ -547,7 +545,7 @@ impl<N: EngineNum> Tree<N> {
     }
 
     /// The skeleton of `shape` in frame `f`'s files, in a search from `room`.
-    pub fn skeleton(&self, f: u32, shape: u64, room: (i16, i16)) -> Result<Rt2<N>> {
+    pub(crate) fn skeleton(&self, f: u32, shape: u64, room: (i16, i16)) -> Result<Rt2<N>> {
         let r = self.file(f).into_iter().flat_map(|x| x.header.skeletons.iter()).find(|r| r.shape_hash == shape).ok_or_else(|| anyhow!("{}: frame {f} has no skeleton of shape {shape:016x}", self.dir.display()))?;
         Ok(r.rt2_in(room))
     }
@@ -570,7 +568,7 @@ impl<N: EngineNum> Tree<N> {
 
 /// `layer`'s states (those `keep` admits) DECODED: per shape, chunks of at
 /// most `chunk` states and their rows, in the layer's order.
-pub fn decode_states<N: EngineNum>(layer: &Layer<N>, space: &KeySpace<N>, shapes: &[u64], chunk: usize, keep: &dyn Fn(Sk) -> bool) -> Result<Vec<(Vec<Sk>, Rt2<N>)>> {
+pub(crate) fn decode_states<N: EngineNum>(layer: &Layer<N>, space: &KeySpace<N>, shapes: &[u64], chunk: usize, keep: &dyn Fn(Sk) -> bool) -> Result<Vec<(Vec<Sk>, Rt2<N>)>> {
     let geo = GEOMETRY;
     let mut out = Vec::new();
     let mut cur: Vec<Sk> = Vec::new();

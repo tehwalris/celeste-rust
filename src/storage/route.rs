@@ -13,21 +13,21 @@ use std::sync::RwLock;
 
 use super::bundle::{self, Bundle};
 use super::edges::Segment;
-use super::set::RegionTable;
+use super::set::{PackedTable, PlainTable};
 use super::visited::{Key, StateInfo, VisitedSet};
 use super::Sk;
 use crate::search::rem::Rem;
 use celeste_core::pico8_num::Pico8Num as P8;
 use celeste_engine::exact::is_provisional;
 
-/// `Scratch::e_of`'s mark of a provisional target.
+/// `JobScratch::e_of`'s mark of a provisional target.
 const PROV: u32 = u32::MAX;
 
 /// A route's TOUCHED states this frame: per key (open addressing in
 /// `index`, at most 3/4 full) its cells and the RUN of their hulls in
 /// `slots`, by cell (moved to the end when the key gains a cell; compacted
 /// once the dead pass half the live; arrays grow by an eighth): ~30 B a state.
-pub struct Touched<N: Rem = P8> {
+pub(crate) struct Touched<N: Rem = P8> {
     index: Vec<u32>,
     keys: Vec<TouchedKey>,
     slots: Vec<AccOf<N>>,
@@ -42,10 +42,10 @@ impl<N: Rem> Default for Touched<N> {
 }
 
 #[derive(Clone, Copy, Debug)]
-pub struct TouchedKey {
-    pub key: Key,
-    pub cells: u64,
-    pub start: u32,
+pub(crate) struct TouchedKey {
+    pub(crate) key: Key,
+    pub(crate) cells: u64,
+    pub(crate) start: u32,
 }
 
 /// Room in `v` for `more`, grown by an eighth at least (not doubled: a
@@ -96,7 +96,7 @@ impl<N: Rem> Touched<N> {
 
     /// Merge `cells` (`(cell, hull)`, ascending) into key `key`'s.
     #[inline]
-    pub fn push(&mut self, key: Key, cells: &[(u8, AccOf<N>)]) {
+    pub(crate) fn push(&mut self, key: Key, cells: &[(u8, AccOf<N>)]) {
         let e = self.place(key);
         let TouchedKey { cells: mask, start, .. } = self.keys[e as usize];
         let add = cells.iter().fold(0u64, |m, x| m | 1u64 << x.0);
@@ -140,18 +140,18 @@ impl<N: Rem> Touched<N> {
         self.dead = 0;
     }
 
-    pub fn is_empty(&self) -> bool {
+    pub(crate) fn is_empty(&self) -> bool {
         self.keys.is_empty()
     }
 
     /// States pushed into.
-    pub fn len(&self) -> usize {
+    pub(crate) fn len(&self) -> usize {
         self.states
     }
 
     /// The keys, each `key(k)` (made final: distinct keys stay distinct),
     /// sorted, and the hulls (each key's run by cell).
-    pub fn into_sorted(self, key: impl Fn(Key) -> Result<Key>) -> Result<(Vec<TouchedKey>, Vec<AccOf<N>>)> {
+    pub(crate) fn into_sorted(self, key: impl Fn(Key) -> Result<Key>) -> Result<(Vec<TouchedKey>, Vec<AccOf<N>>)> {
         let mut keys = self.keys;
         for k in &mut keys {
             k.key = key(k.key)?;
@@ -161,31 +161,18 @@ impl<N: Rem> Touched<N> {
         Ok((keys, self.slots))
     }
 
-    pub fn alloc_bytes(&self) -> usize {
-        self.bytes().iter().sum()
-    }
-
-    /// Bytes held (`[wavemem]`): index, keys, live slots, dead or spare.
-    pub fn bytes(&self) -> [usize; 4] {
-        let slot = std::mem::size_of::<AccOf<N>>();
-        [self.index.capacity() * 4, self.keys.capacity() * std::mem::size_of::<TouchedKey>(), self.states * slot, (self.slots.capacity() - self.states) * slot]
-    }
-
-    pub fn key_count(&self) -> usize {
-        self.keys.len()
-    }
 }
 
 /// The wave's routes: (shape, region slot) -> a dense id, made as the units
 /// emit (read-mostly: a worker caches its own).
 #[derive(Default)]
-pub struct Routes {
+pub(crate) struct Routes {
     map: RwLock<FxHashMap<(u64, u32), u32>>,
     list: RwLock<Vec<(u64, u32)>>,
 }
 
 impl Routes {
-    pub fn id(&self, shape: u64, slot: u32) -> u32 {
+    pub(crate) fn id(&self, shape: u64, slot: u32) -> u32 {
         if let Some(&r) = self.map.read().expect("routes").get(&(shape, slot)) {
             return r;
         }
@@ -201,7 +188,7 @@ impl Routes {
     }
 
     /// Every route's (shape, slot), by id.
-    pub fn list(&self) -> Vec<(u64, u32)> {
+    pub(crate) fn list(&self) -> Vec<(u64, u32)> {
         self.list.read().expect("routes").clone()
     }
 }
@@ -209,72 +196,72 @@ impl Routes {
 /// A unit's bundles of one route: its TARGETS (key, cells), PUSHES (target,
 /// cell, hull), the unit's sources (shared), the bundles naming both by
 /// index, the source regions their edges leave.
-pub struct Chunk<N: Rem = P8> {
-    pub route: u32,
-    pub unit: u32,
-    pub worker: u32,
-    pub targets: Vec<(Key, u64)>,
-    pub pushes: Vec<(u32, u8, AccOf<N>)>,
-    pub sources: std::sync::Arc<[(u32, Key)]>,
-    pub bundles: Vec<Ub>,
-    pub src_regions: Vec<u32>,
+pub(crate) struct Chunk<N: Rem = P8> {
+    pub(crate) route: u32,
+    pub(crate) unit: u32,
+    pub(crate) worker: u32,
+    pub(crate) targets: Vec<(Key, u64)>,
+    pub(crate) pushes: Vec<(u32, u8, AccOf<N>)>,
+    pub(crate) sources: std::sync::Arc<[(u32, Key)]>,
+    pub(crate) bundles: Vec<Ub>,
+    pub(crate) src_regions: Vec<u32>,
 }
 
 /// A unit bundle (24 B): its target's and source's index in its chunk, its
 /// transfer (the worker's local id), offset and target cells.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Ub {
-    pub t: u32,
-    pub s: u32,
-    pub x: u32,
-    pub o: u32,
-    pub mask: u64,
+pub(crate) struct Ub {
+    pub(crate) t: u32,
+    pub(crate) s: u32,
+    pub(crate) x: u32,
+    pub(crate) o: u32,
+    pub(crate) mask: u64,
 }
 
-pub struct RouteState<N: Rem = P8> {
-    pub shape: u64,
-    pub slot: u32,
+pub(crate) struct RouteState<N: Rem = P8> {
+    pub(crate) shape: u64,
+    pub(crate) slot: u32,
     /// The visited set's region, once the shape is numbered.
-    pub region: Option<u32>,
-    pub touched: Touched<N>,
+    pub(crate) region: Option<u32>,
+    pub(crate) touched: Touched<N>,
     /// The provisional keys pushed into or named by its bundles (a target
     /// nothing was pushed into still has its edges).
-    pub prov_keys: FxHashSet<Key>,
+    pub(crate) prov_keys: FxHashSet<Key>,
     /// The bundles that WAIT for the frame's end (a provisional target, or a
     /// new transfer: no canonical id yet), per job (slice) a segment,
     /// re-encoded with the final keys and ids (`reencode`). Compressed: a
     /// frame can hold ~100M.
-    pub prov: Vec<(u32, Segment)>,
+    pub(crate) prov: Vec<(u32, Segment)>,
     /// Its segments by (kind (0: a job's, 1: waited, made final), slice):
     /// jobs run out of slice order; the edge file sorts them by this.
-    pub segs: Vec<((u8, u32), Segment)>,
+    pub(crate) segs: Vec<((u8, u32), Segment)>,
     /// The source regions its edges leave.
-    pub sources: FxHashSet<u32>,
+    pub(crate) sources: FxHashSet<u32>,
     /// Records taken (emissions) and edge pushes merged.
-    pub recs: u64,
-    pub pushes: u64,
+    pub(crate) recs: u64,
+    pub(crate) pushes: u64,
 }
 
 impl<N: Rem> RouteState<N> {
-    pub fn new(shape: u64, slot: u32, region: Option<u32>) -> Self {
+    pub(crate) fn new(shape: u64, slot: u32, region: Option<u32>) -> Self {
         RouteState { shape, slot, region, touched: Touched::default(), prov_keys: FxHashSet::default(), prov: Vec::new(), segs: Vec::new(), sources: FxHashSet::default(), recs: 0, pushes: 0 }
     }
 
     /// Does the frame's end owe it anything: states pushed into, or edges?
-    pub fn is_used(&self) -> bool {
+    pub(crate) fn is_used(&self) -> bool {
         !self.touched.is_empty() || !self.segs.is_empty() || !self.prov.is_empty()
     }
 }
 
-pub struct RegionCtx<'a> {
-    pub frame: u32,
-    pub record: bool,
+pub(crate) struct RegionCtx<'a> {
+    pub(crate) frame: u32,
+    pub(crate) record: bool,
     /// Per worker, its local transfer ids' global ones.
-    pub remaps: &'a [Vec<u32>],
+    pub(crate) remaps: &'a [Vec<u32>],
     /// Ids from here on are the frame's new transfers', in slice order:
     /// provisional until the frame's end.
-    pub new_xfers: u32,
-    pub spool: Option<&'a super::spool::Spool>,
+    pub(crate) new_xfers: u32,
+    pub(crate) spool: Option<&'a super::scratch::Scratch>,
 }
 
 /// A unit's bundles, by route: an emission is APPENDED to its route's
@@ -282,7 +269,7 @@ pub struct RegionCtx<'a> {
 /// bucket in a table its size (cache-resident, where one table over the
 /// unit missed the cache on most appends).
 #[derive(Default)]
-pub struct UnitBundles {
+pub(crate) struct UnitBundles {
     buckets: Vec<(u32, Vec<(Key, Ub)>)>,
     bucket_of: FxHashMap<u32, u32>,
     last_route: Option<(u32, u32)>,
@@ -305,12 +292,8 @@ fn ub_hash(t_key: Key, b: &Ub) -> u64 {
 }
 
 impl UnitBundles {
-    pub fn alloc_bytes(&self) -> usize {
-        let b = 16 + std::mem::size_of::<Ub>();
-        self.buckets.iter().map(|x| x.1.capacity() * b).sum::<usize>() + self.spare.iter().map(|v| v.capacity() * b).sum::<usize>() + 4 * self.slots.capacity() + 24 * self.t_idx.capacity()
-    }
 
-    pub fn clear(&mut self) {
+    pub(crate) fn clear(&mut self) {
         let mut room: usize = self.spare.iter().map(Vec::capacity).sum();
         for (_, mut v) in self.buckets.drain(..) {
             if room + v.capacity() <= SPARE_KEEP {
@@ -325,7 +308,7 @@ impl UnitBundles {
 
     /// OR `bit` into bundle `(route, t_key; s, x, o)` (merged at `drain`).
     #[inline]
-    pub fn insert(&mut self, route: u32, t_key: Key, s: u32, x: u32, o: u32, bit: u64) {
+    pub(crate) fn insert(&mut self, route: u32, t_key: Key, s: u32, x: u32, o: u32, bit: u64) {
         let k = match self.last_route {
             Some((r, k)) if r == route => k,
             _ => {
@@ -387,7 +370,7 @@ impl UnitBundles {
     /// index, the cells `drop(route, key, cell)` says cleared first (refused
     /// targets; a bundle left without cells goes).
     #[allow(clippy::type_complexity)]
-    pub fn drain(&mut self, drop: Option<&dyn Fn(u32, Key, u32) -> bool>) -> Vec<(u32, Vec<(Key, u64)>, Vec<Ub>)> {
+    pub(crate) fn drain(&mut self, drop: Option<&dyn Fn(u32, Key, u32) -> bool>) -> Vec<(u32, Vec<(Key, u64)>, Vec<Ub>)> {
         let mut buckets = std::mem::take(&mut self.buckets);
         let mut out = Vec::with_capacity(buckets.len());
         for (route, v) in &mut buckets {
@@ -442,7 +425,7 @@ impl UnitBundles {
     }
 }
 
-pub struct Scratch {
+pub(crate) struct JobScratch {
     /// The job's bundles into provisional targets.
     prov: Vec<Bundle>,
     /// The job's targets named densely, as met (and their keys): the
@@ -463,7 +446,7 @@ pub struct Scratch {
 /// heavy jobs are millions of bundles; with less, their buffers are remade.
 const SCRATCH_KEEP: usize = 1 << 20;
 
-impl Scratch {
+impl JobScratch {
     fn bound(&mut self) {
         if self.prov.capacity() > SCRATCH_KEEP {
             self.prov = Vec::new();
@@ -483,29 +466,11 @@ impl Scratch {
         }
     }
 
-    /// Bytes held (`[wavemem]`): the job's bundles, encoder, raw block, rest.
-    pub fn alloc_bytes(&self) -> [usize; 4] {
-        [std::mem::size_of::<bundle::Tb>() * self.tbs.capacity() + std::mem::size_of::<Bundle>() * self.prov.capacity(), self.enc.alloc_bytes(), self.raw.capacity(), 4 * (self.e_of.capacity() + self.s_of.capacity()) + 32 * self.s_idx.capacity() + 24 * self.s_list.capacity() + 9 * self.t_loc.capacity() + 16 * self.t_keys.capacity()]
-    }
 }
 
-impl<N: Rem> Chunk<N> {
-    /// Bytes it holds (its unit's shared sources not counted).
-    pub fn alloc_bytes(&self) -> usize {
-        24 * self.targets.capacity() + std::mem::size_of::<(u32, u8, AccOf<N>)>() * self.pushes.capacity() + std::mem::size_of::<Ub>() * self.bundles.capacity() + 4 * self.src_regions.capacity()
-    }
-}
-
-impl<N: Rem> RouteState<N> {
-    /// Bytes held: touched table, waiting bundles, segments.
-    pub fn alloc_bytes(&self) -> [usize; 3] {
-        [self.touched.alloc_bytes() + 24 * self.prov_keys.capacity(), self.prov.iter().map(|s| s.1.bytes.held()).sum::<usize>(), self.segs.iter().map(|s| s.1.bytes.held()).sum::<usize>()]
-    }
-}
-
-impl Default for Scratch {
+impl Default for JobScratch {
     fn default() -> Self {
-        Scratch {
+        JobScratch {
             prov: Vec::new(),
             t_loc: Default::default(),
             t_keys: Vec::new(),
@@ -525,7 +490,7 @@ impl Default for Scratch {
 /// its touched states; with `cx.record`, the slice's segment (some bundles
 /// wait: `RouteState::prov`).
 #[inline(never)]
-pub fn run_route<N: Rem>(st: &mut RouteState<N>, slice: u32, chunks: &[&Chunk<N>], cx: &RegionCtx, sc: &mut Scratch) -> Result<()> {
+pub(crate) fn run_route<N: Rem>(st: &mut RouteState<N>, slice: u32, chunks: &[&Chunk<N>], cx: &RegionCtx, sc: &mut JobScratch) -> Result<()> {
     let n: usize = chunks.iter().map(|c| c.bundles.len()).sum();
     st.recs += n as u64;
     let record = cx.record;
@@ -619,26 +584,22 @@ pub fn run_route<N: Rem>(st: &mut RouteState<N>, slice: u32, chunks: &[&Chunk<N>
 
 /// A route's frame end: its NEW states (by key) with their hulls in the
 /// table's order, and the states whose hull GREW.
-pub struct Sealed<N: Rem = P8> {
-    pub region: u32,
-    pub table: RegionTable,
-    pub hulls: Vec<HullOf<N>>,
-    pub grown: Vec<super::wave::Old<N>>,
-    /// The states compared; times to sort, compare (summed), make the table.
-    pub touched: usize,
-    pub t: [std::time::Duration; 3],
+pub(crate) struct Sealed<N: Rem = P8> {
+    pub(crate) region: u32,
+    pub(crate) table: PlainTable,
+    pub(crate) hulls: Vec<HullOf<N>>,
+    pub(crate) grown: Vec<super::wave::Old<N>>,
+    /// Times to sort, compare (summed), make the table.
+    pub(crate) t: [std::time::Duration; 3],
     /// The bundles that waited (their segments, bundles: `reencode`).
-    pub waited: (usize, u64),
-    /// The held states compared: full (no hull stored) and by AGE (frame less
-    /// layer: 1, 2-3, 4-7, 8-15, 16-31, 32+); the grown ones by age.
-    pub held_by_age: [[u64; 7]; 2],
+    pub(crate) waited: (usize, u64),
 }
 
 /// The frame's new transfers' canonical ids (`edges::XferTable::
 /// canonical`): an id from `first` on is `first + perm[id - first]`.
-pub struct Renumber<'a> {
-    pub first: u32,
-    pub perm: &'a [u32],
+pub(crate) struct Renumber<'a> {
+    pub(crate) first: u32,
+    pub(crate) perm: &'a [u32],
 }
 
 impl Renumber<'_> {
@@ -654,50 +615,46 @@ impl Renumber<'_> {
 
 /// A route's FRAME END, first step (its shape numbered: `region`): keys made
 /// final (`finals`), the touched keys sorted; then `seal_part` and `sealed`.
-pub fn seal_sort<N: Rem>(st: &mut RouteState<N>, region: u32, finals: &FxHashMap<Key, Key>) -> Result<Touch<N>> {
+pub(crate) fn seal_sort<N: Rem>(st: &mut RouteState<N>, region: u32, finals: &FxHashMap<Key, Key>) -> Result<Touch<N>> {
     st.region = Some(region);
     for seg in &mut st.segs {
         seg.1.region = region;
     }
     let final_key = |k: Key| if is_provisional(k) { finals.get(&k).copied().ok_or_else(|| anyhow::anyhow!("a provisional key without its final key")) } else { Ok(k) };
     let t = std::time::Instant::now();
-    let n_touched = st.touched.len();
     let (touched, accs) = std::mem::take(&mut st.touched).into_sorted(final_key)?;
     let waited = (st.prov.len(), st.prov.iter().map(|x| x.1.bundles as u64).sum());
-    Ok(Touch { region, touched, accs, n_touched, waited, t_sort: t.elapsed() })
+    Ok(Touch { region, touched, accs, waited, t_sort: t.elapsed() })
 }
 
-pub struct Touch<N: Rem = P8> {
-    pub region: u32,
-    pub touched: Vec<TouchedKey>,
-    pub accs: Vec<AccOf<N>>,
-    n_touched: usize,
+pub(crate) struct Touch<N: Rem = P8> {
+    pub(crate) region: u32,
+    pub(crate) touched: Vec<TouchedKey>,
+    pub(crate) accs: Vec<AccOf<N>>,
     waited: (usize, u64),
     t_sort: std::time::Duration,
 }
 
 /// Touched keys a seal part takes.
-pub const SEAL_PART: usize = 1 << 15;
+pub(crate) const SEAL_PART: usize = 1 << 15;
 
-/// A `seal_part`: its new states (keys, cells, hulls), grown, held by age.
-pub struct SealPart<N: Rem = P8> {
+/// A `seal_part`: its new states (keys, cells, hulls), grown.
+pub(crate) struct SealPart<N: Rem = P8> {
     keys: Vec<Key>,
     masks: Vec<u64>,
     hulls: Vec<HullOf<N>>,
     grown: Vec<super::wave::Old<N>>,
-    held_by_age: [[u64; 7]; 2],
     t: std::time::Duration,
 }
 
 /// The touched keys `part` COMPARED with the visited set's region (a
 /// `Cursor`, each block decoded once): a state it lacks NEW, a hull grown GREW.
-pub fn seal_part<N: Rem>(touch: &Touch<N>, part: std::ops::Range<usize>, frame: u32, visited: &VisitedSet<N>) -> Result<SealPart<N>> {
+pub(crate) fn seal_part<N: Rem>(touch: &Touch<N>, part: std::ops::Range<usize>, visited: &VisitedSet<N>) -> Result<SealPart<N>> {
     let t = std::time::Instant::now();
     let (region, accs) = (touch.region, &touch.accs);
     let (mut keys, mut masks, mut hulls): (Vec<Key>, Vec<u64>, Vec<HullOf<N>>) = (Vec::new(), Vec::new(), Vec::new());
     let mut grown: Vec<super::wave::Old<N>> = Vec::new();
-    let mut held_by_age = [[0u64; 7]; 2];
-    let mut cursor = visited.table(region).map(RegionTable::cursor::<N>);
+    let mut cursor = visited.table(region).map(PackedTable::cursor::<N>);
     for &TouchedKey { key, cells, start } in &touch.touched[part] {
         let entry = match cursor.as_mut() {
             Some(c) => c.seek(key)?,
@@ -716,58 +673,41 @@ pub fn seal_part<N: Rem>(touch: &Touch<N>, part: std::ops::Range<usize>, frame: 
                 continue;
             }
             // No hull stored: it is FULL, and grows no more.
-            let Some(StateInfo { hull, layer }) = entry.as_ref().and_then(|e| e.info(c)) else {
-                held_by_age[0][0] += 1;
-                continue;
-            };
-            let age = |l: u16| match frame.saturating_sub(l as u32) {
-                0..=1 => 1,
-                2..=3 => 2,
-                4..=7 => 3,
-                8..=15 => 4,
-                16..=31 => 5,
-                _ => 6,
-            };
-            held_by_age[0][age(layer)] += 1;
+            let Some(StateInfo { hull, layer }) = entry.as_ref().and_then(|e| e.info(c)) else { continue };
             let mut a = acc;
             a.add_hull(&hull);
             let h = a.hull().expect("a hull holds points");
             if h != hull {
                 grown.push(super::wave::Old { sk: Sk { region, key, local: c as u8 }, layer, hull: h, was: hull });
-                held_by_age[1][age(layer)] += 1;
             }
         }
     }
-    Ok(SealPart { keys, masks, hulls, grown, held_by_age, t: t.elapsed() })
+    Ok(SealPart { keys, masks, hulls, grown, t: t.elapsed() })
 }
 
 /// A route's SEALED states from its parts (in order): the new ones by key
 /// (canonical).
-pub fn sealed<N: Rem>(touch: Touch<N>, parts: Vec<SealPart<N>>) -> Result<Sealed<N>> {
+pub(crate) fn sealed<N: Rem>(touch: Touch<N>, parts: Vec<SealPart<N>>) -> Result<Sealed<N>> {
     let t = std::time::Instant::now();
     let n = |f: fn(&SealPart<N>) -> usize| parts.iter().map(f).sum::<usize>();
     let (mut keys, mut masks, mut hulls, mut grown) = (Vec::with_capacity(n(|p| p.keys.len())), Vec::with_capacity(n(|p| p.keys.len())), Vec::with_capacity(n(|p| p.hulls.len())), Vec::with_capacity(n(|p| p.grown.len())));
-    let mut held_by_age = [[0u64; 7]; 2];
     let mut t_compare = std::time::Duration::ZERO;
     for p in parts {
         keys.extend(p.keys);
         masks.extend(p.masks);
         hulls.extend(p.hulls);
         grown.extend(p.grown);
-        for (a, b) in held_by_age.iter_mut().flatten().zip(p.held_by_age.iter().flatten()) {
-            *a += b;
-        }
         t_compare += p.t;
     }
-    let table = RegionTable::from_sorted(&keys, &masks)?;
-    Ok(Sealed { region: touch.region, table, hulls, grown, touched: touch.n_touched, t: [touch.t_sort, t_compare, t.elapsed()], waited: touch.waited, held_by_age })
+    let table = PlainTable::from_sorted(&keys, &masks)?;
+    Ok(Sealed { region: touch.region, table, hulls, grown, t: [touch.t_sort, t_compare, t.elapsed()], waited: touch.waited })
 }
 
 /// A WAITED segment re-encoded for `region` with final keys and transfer ids
 /// (`renumber`: `None` where the new transfers are in order already).
-pub fn reencode(seg: &Segment, region: u32, finals: &FxHashMap<Key, Key>, renumber: Option<&Renumber>, enc: &mut bundle::Encoder, z: &mut zstd::bulk::Compressor<'static>) -> Result<Segment> {
+pub(crate) fn reencode(seg: &Segment, region: u32, finals: &FxHashMap<Key, Key>, renumber: Option<&Renumber>, enc: &mut bundle::Encoder, z: &mut zstd::bulk::Compressor<'static>) -> Result<Segment> {
     let (mut dz, mut raw) = (zstd::bulk::Decompressor::new()?, Vec::new());
-    let super::spool::Body::Mem(bytes) = &seg.bytes else { anyhow::bail!("a waiting segment spooled") };
+    let super::scratch::Body::Mem(bytes) = &seg.bytes else { anyhow::bail!("a waiting segment spooled") };
     super::file::decompress(bytes, seg.raw as usize, &mut dz, &mut raw)?;
     let mut v: Vec<Bundle> = Vec::with_capacity(seg.bundles as usize);
     let mut missing = false;

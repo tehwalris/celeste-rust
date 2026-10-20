@@ -1,9 +1,7 @@
-//! The player-position cells and the position graph: the successor relation
-//! PROJECTED ONTO THE PLAYER'S CELL, RECORDED by the forward (`PosObserver`),
-//! read by the level -1 probe and the UI, pinned as a gate. Positions are
-//! relative to the START room (cart coordinates are room-local: a crossing
-//! would look like a 128 px teleport); the next room is one ROOM_PX to the
-//! right whichever edge it was left by.
+//! The player-position CELLS: a state's player position on a grid relative
+//! to the START room (cart coordinates are room-local: a crossing would look
+//! like a 128 px teleport); the next room is one ROOM_PX to the right
+//! whichever edge it was left by.
 
 use anyhow::{anyhow, Result};
 
@@ -12,16 +10,14 @@ use celeste_engine::runtime2::{Col, Rt2, AV};
 
 /// Side of the position grid, in pixels: the start room plus a room's width
 /// past it in each axis (room (0,0) exits upward, landing at x ~238).
-pub const GRID: i32 = 512;
-pub const ORIGIN: i32 = -64;
+pub(crate) const GRID: i32 = 512;
+pub(crate) const ORIGIN: i32 = -64;
 const ROOM_PX: i32 = 128;
 
 /// The cell of a row with no player object (e.g. after a death): a normal
 /// node, past the end of the grid so no position aliases it.
-pub const NO_CELL: u32 = (GRID * GRID) as u32;
+pub(crate) const NO_CELL: u32 = (GRID * GRID) as u32;
 
-/// Nodes, including `NO_CELL`.
-pub const CELL_COUNT: usize = (GRID * GRID) as usize + 1;
 /// Grid cell of a whole-pixel start-room-relative position; an error
 /// outside the grid, never a clamp.
 pub fn cell_of(x: i32, y: i32) -> Result<u32> {
@@ -66,7 +62,7 @@ pub(crate) fn whole_i16_col<N: EngineNum>(rt2: &Rt2<N>, cell: u32) -> Option<Vec
 
 /// A position column's whole-pixel RANGE per lane (`None` if a lane is
 /// neither number nor interval), for the win tests.
-pub fn whole_range_col<N: EngineNum>(rt2: &Rt2<N>, cell: u32) -> Option<Vec<(i16, i16)>> {
+pub(crate) fn whole_range_col<N: EngineNum>(rt2: &Rt2<N>, cell: u32) -> Option<Vec<(i16, i16)>> {
     let one = |v: AV<N>| -> Option<(i16, i16)> {
         match v {
             AV::Num(n) => Some((n.whole_i16()?, n.whole_i16()?)),
@@ -84,7 +80,7 @@ pub fn whole_range_col<N: EngineNum>(rt2: &Rt2<N>, cell: u32) -> Option<Vec<(i16
 
 /// The block's player object (`player`, else `player_spawn`): one per
 /// block, its lanes share structure.
-pub fn player_object<N: EngineNum>(rt2: &Rt2<N>) -> Option<u32> {
+pub(crate) fn player_object<N: EngineNum>(rt2: &Rt2<N>) -> Option<u32> {
     rt2.position_object(crate::compiled::ids())
 }
 
@@ -118,7 +114,7 @@ pub fn block_cells<N: EngineNum>(rt2: &Rt2<N>) -> Result<Vec<u32>> {
 /// The labelling offset of room `(rx, ry)` in a search from `start`: 0, or
 /// `game_runner::win_room` one ROOM_PX right (the wrap (7,y) -> (0,y+1) too).
 /// No other room occurs: a death reloads the start room.
-pub fn room_offset(start: (i16, i16), rx: i16, ry: i16) -> Result<(i32, i32)> {
+pub(crate) fn room_offset(start: (i16, i16), rx: i16, ry: i16) -> Result<(i32, i32)> {
     let win = crate::game_runner::win_room(start);
     if (rx, ry) == start {
         Ok((0, 0))
@@ -126,144 +122,6 @@ pub fn room_offset(start: (i16, i16), rx: i16, ry: i16) -> Result<(i32, i32)> {
         Ok((ROOM_PX, 0))
     } else {
         Err(anyhow!("a row in room ({rx},{ry}): neither the start room {start:?} nor the one it exits to {win:?}"))
-    }
-}
-
-/// The finished graph: each cell's predecessor cells, a sorted CSR.
-#[derive(Default, serde::Serialize, serde::Deserialize)]
-pub struct PosGraph {
-    /// `srcs[offsets[d] .. offsets[d + 1]]` for destination cell `d`.
-    offsets: Vec<u32>,
-    srcs: Vec<u32>,
-}
-
-impl PosGraph {
-    pub fn save(&self, path: &std::path::Path) -> anyhow::Result<()> {
-        crate::storage::file::save_value(path, self)
-    }
-
-    pub fn load(path: &std::path::Path) -> anyhow::Result<Self> {
-        crate::storage::file::load_value(path)
-    }
-
-    pub fn pairs(&self) -> usize {
-        self.srcs.len()
-    }
-
-    /// The source cells of `dst`, sorted; empty past the end.
-    pub fn sources(&self, dst: u32) -> &[u32] {
-        let d = dst as usize;
-        if d + 1 >= self.offsets.len() {
-            return &[];
-        }
-        &self.srcs[self.offsets[d] as usize..self.offsets[d + 1] as usize]
-    }
-
-    /// Cells with a predecessor.
-    pub fn live_cells(&self) -> usize {
-        self.offsets.windows(2).filter(|w| w[1] > w[0]).count()
-    }
-
-    /// `(pairs, order-independent hash of the edge set)`: the posgraph gate.
-    pub fn fingerprint(&self) -> (usize, u64) {
-        use celeste_engine::runtime2::mix64;
-        let mut acc = 0u64;
-        for d in 0..self.offsets.len().saturating_sub(1) {
-            for &s in self.sources(d as u32) {
-                acc = acc.wrapping_add(mix64((d as u64) << 32 ^ mix64(s as u64 + 1)));
-            }
-        }
-        (self.pairs(), acc)
-    }
-}
-
-/// Accumulates `(dst, src)` pairs: per destination a small sorted set of
-/// sources (tens each), not a dense bitmap or a hash set of pairs.
-#[derive(Default, Clone)]
-pub struct PosGraphBuilder {
-    by_dst: rustc_hash::FxHashMap<u32, Vec<u32>>,
-}
-
-impl PosGraphBuilder {
-    pub fn record(&mut self, src: u32, dst: u32) {
-        let set = self.by_dst.entry(dst).or_default();
-        if let Err(at) = set.binary_search(&src) {
-            set.insert(at, src);
-        }
-    }
-
-    pub fn pairs(&self) -> usize {
-        self.by_dst.values().map(|v| v.len()).sum()
-    }
-
-    pub fn build(self) -> PosGraph {
-        let mut offsets = Vec::with_capacity(CELL_COUNT + 1);
-        let mut srcs = Vec::with_capacity(self.pairs());
-        let mut by_dst = self.by_dst;
-        for d in 0..CELL_COUNT {
-            offsets.push(srcs.len() as u32);
-            if let Some(set) = by_dst.remove(&(d as u32)) {
-                srcs.extend_from_slice(&set);
-            }
-        }
-        offsets.push(srcs.len() as u32);
-        PosGraph { offsets, srcs }
-    }
-}
-
-/// Collects the graph while the forward steps frames, AT EMISSION: the
-/// frame step records `(input row's cell, output row's cell)` per row,
-/// before any dedup; nothing is stored on a row.
-pub struct PosObserver {
-    /// `(src, dst)` pairs from the workers, folded in by `flush`.
-    pending: std::sync::Mutex<Vec<(u32, u32)>>,
-    graph: std::sync::Mutex<PosGraphBuilder>,
-}
-
-impl Default for PosObserver {
-    fn default() -> Self {
-        Self { pending: std::sync::Mutex::new(Vec::new()), graph: Default::default() }
-    }
-}
-
-impl PosObserver {
-    /// An observer already holding `graph`'s pairs (a resumed forward).
-    pub fn from_graph(graph: &PosGraph) -> Self {
-        let mut b = PosGraphBuilder::default();
-        for d in 0..CELL_COUNT as u32 {
-            let srcs = graph.sources(d);
-            if !srcs.is_empty() {
-                b.by_dst.insert(d, srcs.to_vec());
-            }
-        }
-        Self { pending: std::sync::Mutex::new(Vec::new()), graph: std::sync::Mutex::new(b) }
-    }
-
-    pub fn record_pairs(&self, pairs: impl Iterator<Item = (u32, u32)>) {
-        self.pending.lock().expect("pos observer").extend(pairs);
-    }
-
-    pub fn flush(&self) {
-        let pending = std::mem::take(&mut *self.pending.lock().expect("pos observer"));
-        let mut graph = self.graph.lock().expect("pos observer");
-        for (s, d) in pending {
-            graph.record(s, d);
-        }
-    }
-
-    pub fn pairs(&self) -> usize {
-        self.graph.lock().expect("pos observer").pairs()
-    }
-
-    pub fn build(self) -> PosGraph {
-        self.flush();
-        self.graph.into_inner().expect("pos observer").build()
-    }
-
-    /// The graph as recorded so far; the observer keeps recording.
-    pub fn snapshot(&self) -> PosGraph {
-        self.flush();
-        self.graph.lock().expect("pos observer").clone().build()
     }
 }
 
@@ -283,21 +141,5 @@ mod tests {
         // No position can alias the no-position node.
         assert!(cell_of(ORIGIN + GRID - 1, ORIGIN + GRID - 1).unwrap() < NO_CELL);
         assert_eq!(cell_xy(NO_CELL), None);
-    }
-
-    #[test]
-    fn builder_dedups_and_csr_round_trips() {
-        let mut b = PosGraphBuilder::default();
-        b.record(7, 3);
-        b.record(5, 3);
-        b.record(7, 3);
-        b.record(9, NO_CELL);
-        assert_eq!(b.pairs(), 3);
-        let g = b.build();
-        assert_eq!(g.sources(3), &[5, 7], "sorted and deduped");
-        assert_eq!(g.sources(NO_CELL), &[9], "the no-position node participates");
-        assert_eq!(g.sources(4), &[] as &[u32]);
-        assert_eq!(g.pairs(), 3);
-        assert_eq!(g.live_cells(), 2);
     }
 }

@@ -997,7 +997,7 @@ impl CostToGo {
 
     /// The smallest horizon at which a row at `frame` is NOT `too_late`:
     /// `frame + d`; 0 off the table (never refused), `u32::MAX` with no exit.
-    pub fn admitted_from(&self, shape: u64, cell: u32, frame: u32) -> u32 {
+    pub(crate) fn admitted_from(&self, shape: u64, cell: u32, frame: u32) -> u32 {
         let Some((x, y)) = crate::search::pos_graph::cell_xy(cell) else { return 0 };
         if x >= 128 {
             return 0;
@@ -1938,6 +1938,51 @@ fn build<A: GraphArith>(spd_px: i32, threads: usize, rep: &mut String, s: &crate
     Ok(Built { by_hash, g1, sound, chain, start_d })
 }
 
+/// A KNOWN SOLUTION against the table (`rewrite l1 check`): `inputs`
+/// replayed (`search::replay`: every `rnd` leaf, the run's seeds), every
+/// state checked, and one on a lineage that exits that the table calls too
+/// late for the exit `horizon` (a frame) makes the table UNSOUND: an error.
+/// The report, a line per frame.
+pub fn check_route<N: crate::search::rem::Rem>(inputs: &[u8], horizon: u32, spd: i32, s: &crate::settings::Settings) -> Result<String> {
+    use crate::search::pos_graph::{block_cells, cell_xy};
+    use std::fmt::Write as _;
+    let mut rep = String::new();
+    let table = table(spd, s)?;
+    writeln!(rep, "[l1 check] table: {} entries, start d {}, fingerprint {:016x}", table.len(), table.start_d, table.fingerprint())?;
+    let run = crate::search::replay::Replay::<N>::of(inputs, None, s)?;
+    let (exit, won) = run.exit.as_ref().ok_or_else(|| anyhow!("the inputs never exit the room"))?;
+    let on = run.on_a_win();
+    let (mut checked, mut unknown, mut late) = (0usize, 0usize, BTreeSet::new());
+    for (f, layer) in run.layers.iter().enumerate() {
+        let mut line = Vec::new();
+        for ((_, b), &on) in layer.iter().zip(&on[f]) {
+            let shape = b.rt2().shape_hash_of();
+            for cell in block_cells(b.rt2())? {
+                let at = cell_xy(cell);
+                match table.d_of(shape, cell) {
+                    None => {
+                        unknown += 1;
+                        line.push(format!("{at:?} not a table node"));
+                    }
+                    Some(d) => {
+                        checked += 1;
+                        let bad = table.too_late(shape, cell, f as u32, horizon);
+                        if bad && on {
+                            late.insert(f);
+                        }
+                        line.push(format!("{at:?} d {}{}", if d == u32::MAX { "inf".to_string() } else { d.to_string() }, if bad { " too late" } else { "" }));
+                    }
+                }
+            }
+        }
+        writeln!(rep, "[l1 check] f{f}: {}", line.join(", "))?;
+    }
+    writeln!(rep, "[l1 check] exit during frame {exit} ({} winning leaves)", won.len())?;
+    writeln!(rep, "[l1 check] {checked} states checked, {unknown} not table nodes; on the exiting lineages TOO LATE for horizon {horizon} at frames {late:?}")?;
+    ensure!(late.is_empty(), "{rep}the level -1 table calls states of a known solution too late at frames {late:?}: UNSOUND");
+    Ok(rep)
+}
+
 pub fn probe(opts: &Opts, s: &crate::settings::Settings) -> Result<String> {
     measures_the_exit(s)?;
     let mut rep = String::new();
@@ -1964,9 +2009,13 @@ pub fn probe(opts: &Opts, s: &crate::settings::Settings) -> Result<String> {
         say!(rep, "{:4} {line}", ty as i32 * 8)?;
     }
 
-    // The soundness check against the recorded transitions.
-    use crate::search::pos_graph::{cell_xy, PosGraph, CELL_COUNT, NO_CELL};
-    let pg = PosGraph::load(&crate::frame::pos_graph_path(&opts.level_dir))?;
+    // The soundness check against the recorded transitions: every edge of
+    // the tree, as (source cell, target cell).
+    use crate::search::pos_graph::{cell_xy, NO_CELL};
+    let pairs = match s.arith {
+        crate::settings::Arith::Fixed => recorded_cell_pairs::<celeste_engine::runtime2::P8>(&opts.level_dir, opts.threads)?,
+        crate::settings::Arith::Float(_) => recorded_cell_pairs::<celeste_core::lua_f64::LuaF64>(&opts.level_dir, opts.threads)?,
+    };
     let mut pos_edges: HashSet<(i16, i16, i16, i16)> = HashSet::new();
     let mut exit_src: HashSet<(i16, i16)> = HashSet::new();
     for w in chain.windows(2) {
@@ -1984,32 +2033,30 @@ pub fn probe(opts: &Opts, s: &crate::settings::Settings) -> Result<String> {
     }
     let xy_of = |c: u32| -> (i16, i16) { if c == NO_CELL { (NONE, NONE) } else { cell_xy(c).map(|(x, y)| (x as i16, y as i16)).expect("a grid cell") } };
     let (mut checked, mut crossings, mut deaths, mut bad) = (0u64, 0u64, 0u64, Vec::new());
-    for d in 0..CELL_COUNT as u32 {
-        let (dx, dy) = xy_of(d);
-        for &s in pg.sources(d) {
-            let (sx, sy) = xy_of(s);
-            if sx != NONE && sx >= 128 {
-                continue;
+    for &(s, d) in &pairs {
+        let ((sx, sy), (dx, dy)) = (xy_of(s), xy_of(d));
+        if sx != NONE && sx >= 128 {
+            continue;
+        }
+        // A death or a respawn: not modelled (dead ends).
+        if sx == NONE || dx == NONE {
+            deaths += 1;
+            continue;
+        }
+        if dx >= 128 {
+            crossings += 1;
+            if !exit_src.contains(&(sx, sy)) {
+                bad.push(format!("({sx}, {sy}) -> exit"));
             }
-            // A death or a respawn: not modelled (dead ends).
-            if sx == NONE || dx == NONE {
-                deaths += 1;
-                continue;
-            }
-            if dx != NONE && dx >= 128 {
-                crossings += 1;
-                if !exit_src.contains(&(sx, sy)) {
-                    bad.push(format!("({sx}, {sy}) -> exit"));
-                }
-                continue;
-            }
-            checked += 1;
-            if !pos_edges.contains(&(sx, sy, dx, dy)) {
-                bad.push(format!("({sx}, {sy}) -> ({dx}, {dy})"));
-            }
+            continue;
+        }
+        checked += 1;
+        if !pos_edges.contains(&(sx, sy, dx, dy)) {
+            bad.push(format!("({sx}, {sy}) -> ({dx}, {dy})"));
         }
     }
-    say!(rep, "\nsoundness vs {}: {} recorded pairs, {checked} in the room checked, {crossings} crossings checked, {deaths} deaths and respawns not modelled; {} VIOLATIONS", opts.level_dir.display(), pg.pairs(), bad.len())?;
+    bad.sort();
+    say!(rep, "\nsoundness vs {}: {} recorded (source cell, target cell) pairs, {checked} in the room checked, {crossings} crossings checked, {deaths} deaths and respawns not modelled; {} VIOLATIONS", opts.level_dir.display(), pairs.len(), bad.len())?;
     for b in bad.iter().take(20) {
         say!(rep, "  not allowed: {b}")?;
     }
@@ -2020,6 +2067,20 @@ pub fn probe(opts: &Opts, s: &crate::settings::Settings) -> Result<String> {
     }
     say!(rep, "\ntotal {:.1} s", t_all.elapsed().as_secs_f64())?;
     Ok(rep)
+}
+
+/// Every recorded edge of the tree in `dir` (through its last trusted
+/// frame) as a `(source cell, target cell)` pair, once.
+fn recorded_cell_pairs<N: crate::search::rem::Rem>(dir: &FsPath, threads: usize) -> Result<Vec<(u32, u32)>> {
+    let last = crate::storage::edges::done_frame(&dir.join("edges")).ok_or_else(|| anyhow!("{}: no finished frame", dir.display()))?;
+    let store = crate::storage::edges::EdgeStore::<N>::open(&dir.join("edges"), last)?;
+    let mut all: rustc_hash::FxHashSet<(u32, u32)> = Default::default();
+    for f in 1..=last {
+        all.extend(store.cell_pairs(f, threads)?);
+    }
+    let mut v: Vec<(u32, u32)> = all.into_iter().collect();
+    v.sort_unstable();
+    Ok(v)
 }
 
 /// `probe`'s comparison with a level-0 tree: per frame, what the filter

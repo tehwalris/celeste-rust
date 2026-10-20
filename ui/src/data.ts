@@ -19,7 +19,6 @@ export interface FwdLine {
   own_ms: number;
   own_idle: number;
   ckpt_ms: number;
-  pos_ms: number;
   total_ms: number;
   rss_gb: number;
 }

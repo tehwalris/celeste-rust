@@ -89,7 +89,7 @@ impl<N: KernelLanes> Kernels<N> {
     }
 
     /// One frame of one BUCKET (one shape's block), emitted into `sink`:
-    /// kept rows at the boundary, keyed, with their pos-graph edges.
+    /// kept rows at the boundary, keyed, with their cells.
     pub fn run_bucket(
         &self,
         bucket: &runtime2::Rt2<N>,

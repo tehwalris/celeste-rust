@@ -26,7 +26,7 @@ use crate::search::pos_graph::{cell_xy, room_offset, NO_CELL};
 /// The rows `(key, cell)` of `skel`'s shape as a block (`skel`'s values
 /// unread). A run of one key's rows differs only in position: codes are
 /// looked up once a run, a column stays uniform until a run differs.
-pub fn decode_rows<N: EngineNum>(keys: &KeySpace<N>, skel: &Rt2<N>, rows: &[(Key, u32)]) -> Result<Rt2<N>> {
+pub(crate) fn decode_rows<N: EngineNum>(keys: &KeySpace<N>, skel: &Rt2<N>, rows: &[(Key, u32)]) -> Result<Rt2<N>> {
     let s = keys.shape(skel.shape_hash).ok_or_else(|| anyhow!("decode: shape {:016x} is not in the key space", skel.shape_hash))?;
     let n = rows.len();
     ensure!(n > 0, "decode: no rows");
@@ -215,7 +215,7 @@ impl<N: EngineNum> Builder<N> {
 /// How a value column holds its numbers, which the code does not say; per
 /// piece, from the stored block's column (a frame file's header keeps it).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Repr {
+pub(crate) enum Repr {
     /// `N`, or uniform `Num`.
     Num,
     /// `I`, or uniform `Ival`: points as `[n, n]`.
@@ -225,7 +225,7 @@ pub enum Repr {
 }
 
 impl Repr {
-    pub fn of<N>(col: &Col<N>) -> Repr {
+    pub(crate) fn of<N>(col: &Col<N>) -> Repr {
         match col {
             Col::N(_) | Col::U(AV::Num(_)) => Repr::Num,
             Col::I(_) | Col::U(AV::Ival(..)) => Repr::Ival,
@@ -234,7 +234,7 @@ impl Repr {
     }
 
     /// An empty column of the representation (a skeleton's).
-    pub fn empty<N>(self) -> Col<N> {
+    pub(crate) fn empty<N>(self) -> Col<N> {
         match self {
             Repr::Num => Col::N(Vec::new()),
             Repr::Ival => Col::I(Vec::new()),
@@ -247,7 +247,7 @@ impl Repr {
 /// template, `asm_kernel::unify`, or a `reference_skeleton`), as its
 /// `layer::SkelRecord` and that record's block. Another record under one
 /// shape (it would decode otherwise) is FATAL.
-pub struct Skeletons<N: EngineNum = P8>(std::sync::RwLock<rustc_hash::FxHashMap<u64, (super::layer::SkelRecord<N>, std::sync::Arc<Rt2<N>>)>>);
+pub(crate) struct Skeletons<N: EngineNum = P8>(std::sync::RwLock<rustc_hash::FxHashMap<u64, (super::layer::SkelRecord<N>, std::sync::Arc<Rt2<N>>)>>);
 
 impl<N: EngineNum> Default for Skeletons<N> {
     fn default() -> Self {
@@ -257,7 +257,7 @@ impl<N: EngineNum> Default for Skeletons<N> {
 
 impl<N: EngineNum> Skeletons<N> {
     /// Register `skel` for its shape (checked against the shape's).
-    pub fn register(&self, skel: &Rt2<N>) -> Result<()> {
+    pub(crate) fn register(&self, skel: &Rt2<N>) -> Result<()> {
         let rec = super::layer::SkelRecord::of(skel)?;
         if let Some(a) = self.0.read().expect("skeletons").get(&skel.shape_hash) {
             ensure!(a.0 == rec, "ROWS FROM KEYS: two skeletons of shape {:016x} (another structure, non-value cell or column kind): its rows would decode as the first's", skel.shape_hash);
@@ -269,23 +269,23 @@ impl<N: EngineNum> Skeletons<N> {
     }
 
     /// The records of the shapes registered, but not `skip`ped.
-    pub fn records(&self, skip: impl Fn(u64) -> bool) -> Vec<super::layer::SkelRecord<N>> {
+    pub(crate) fn records(&self, skip: impl Fn(u64) -> bool) -> Vec<super::layer::SkelRecord<N>> {
         let mut v: Vec<super::layer::SkelRecord<N>> = self.0.read().expect("skeletons").iter().filter(|(h, _)| !skip(**h)).map(|(_, r)| r.0.clone()).collect();
         v.sort_by_key(|r| r.shape_hash);
         v
     }
 
-    pub fn shapes(&self) -> Vec<u64> {
+    pub(crate) fn shapes(&self) -> Vec<u64> {
         self.0.read().expect("skeletons").keys().copied().collect()
     }
 
-    pub fn get(&self, shape: u64) -> Result<std::sync::Arc<Rt2<N>>> {
+    pub(crate) fn get(&self, shape: u64) -> Result<std::sync::Arc<Rt2<N>>> {
         self.0.read().expect("skeletons").get(&shape).map(|x| x.1.clone()).ok_or_else(|| anyhow!("ROWS FROM KEYS: no skeleton of shape {shape:016x} (it was never emitted)"))
     }
 
     /// THE GUARD: `rows` (keys, `cells`) decode to exactly themselves, row
     /// by row, representation included (`Col::at`: `Num` vs `Ival`).
-    pub fn check_decodes(&self, keys: &KeySpace<N>, rows: &Rt2<N>, cells: &[u32]) -> Result<()> {
+    pub(crate) fn check_decodes(&self, keys: &KeySpace<N>, rows: &Rt2<N>, cells: &[u32]) -> Result<()> {
         let skel = self.get(rows.shape_hash)?;
         let keyed: Vec<(Key, u32)> = rows.row_keys.iter().copied().zip(cells.iter().copied()).collect();
         let d = decode_rows(keys, &skel, &keyed)?;
@@ -307,7 +307,7 @@ impl<N: EngineNum> Skeletons<N> {
 }
 
 /// A reference row's skeleton: every value cell left to the decode (`Other`).
-pub fn reference_skeleton<N: EngineNum>(row: &Rt2<N>) -> Rt2<N> {
+pub(crate) fn reference_skeleton<N: EngineNum>(row: &Rt2<N>) -> Rt2<N> {
     let mut b = celeste_engine::slots::reshape(row, 0);
     b.cols = row.structure.iter().zip(&row.cols).map(|(cell, c)| if matches!(cell, Cell2::Val) { Col::V(Vec::new()) } else { Col::U(c.at(0)) }).collect();
     b.shape_hash = row.shape_hash;
@@ -317,7 +317,7 @@ pub fn reference_skeleton<N: EngineNum>(row: &Rt2<N>) -> Rt2<N> {
 /// THE GUARD on the start's rows (`wave::seed`): they decode to exactly
 /// themselves, representation included, and no per-row column holds one
 /// value throughout (a load collapses it: `collapse_uniform`).
-pub fn check_piece<N: EngineNum>(keys: &KeySpace<N>, rt2: &Rt2<N>, cells: &[u32]) -> Result<()> {
+pub(crate) fn check_piece<N: EngineNum>(keys: &KeySpace<N>, rt2: &Rt2<N>, cells: &[u32]) -> Result<()> {
     const CHUNK: usize = 1 << 15;
     ensure!(rt2.row_keys.len() == rt2.width && cells.len() == rt2.width, "check_piece: a block without its keys or cells");
     let lossy = |what: String| anyhow!("ROWS FROM KEYS: a piece of shape {:016x} does not decode from its keys and cells ({what}); its rows would be stored lossy", rt2.shape_hash);

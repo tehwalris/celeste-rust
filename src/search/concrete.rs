@@ -55,8 +55,8 @@ pub(super) enum Next<C: Concrete + ?Sized> {
 
 /// A concrete path: its inputs, and each state's label (the start's first).
 pub(super) struct Path<L> {
-    pub inputs: Vec<u8>,
-    pub labels: Vec<L>,
+    pub(crate) inputs: Vec<u8>,
+    pub(crate) labels: Vec<L>,
 }
 
 /// THE CONCRETE SEARCH of `c`: a depth-first try at `bound`, then
@@ -262,22 +262,22 @@ pub(super) fn search<C: Concrete>(c: &C, frames: u32, bound: u32, clock: Clock, 
 /// One arithmetic's level as the concrete searches admit states: W, its
 /// nodes' keys, settings, and whether states key through `lookup_view`.
 pub(super) struct Side<'a, N: Rem> {
-    pub w: &'a Winning<N::C>,
-    pub node: NodeKeys<'a, N::C>,
-    pub keys: &'a KeySpace<N>,
-    pub level: Level,
-    pub s: &'a Settings,
-    pub seeded: bool,
+    pub(crate) w: &'a Winning<N::C>,
+    pub(crate) node: NodeKeys<'a, N::C>,
+    pub(crate) keys: &'a KeySpace<N>,
+    pub(crate) level: Level,
+    pub(crate) s: &'a Settings,
+    pub(crate) seeded: bool,
 }
 
 impl<N: Rem> Side<'_, N> {
     /// Does `b` win (the room's win, `wins_of`)?
-    pub fn wins(&self, b: &Block<N>) -> Result<bool> {
+    pub(crate) fn wins(&self, b: &Block<N>) -> Result<bool> {
         Ok(wins_of(b.rt2(), self.s)?.iter().any(|&x| x))
     }
 
     /// Is `b` a node whose W at step `t` holds its exact remainder?
-    pub fn inside(&self, b: &Block<N>, t: u32) -> Result<bool> {
+    pub(crate) fn inside(&self, b: &Block<N>, t: u32) -> Result<bool> {
         let (shape, nk, cells) = lookup_keys(b, self.level, self.seeded, self.keys)?;
         let Some(i) = self.node.get(shape, nk[0], cells[0]) else { return Ok(false) };
         let q = rem_of::<N>(b.rt2())?;
@@ -331,19 +331,19 @@ impl<N: Rem> Concrete for Single<'_, '_, N> {
 }
 
 /// The inputs, and the player's cell at each frame (frame 0 the start).
-pub struct Witness {
-    pub inputs: Vec<u8>,
-    pub cells: Vec<u32>,
+pub(crate) struct Witness {
+    pub(crate) inputs: Vec<u8>,
+    pub(crate) cells: Vec<u32>,
 }
 
 /// Inputs as a comma list (`rewrite run -i`, `pico8_diff/replay.py`).
-pub fn inputs_text(inputs: &[u8]) -> String {
+pub(crate) fn inputs_text(inputs: &[u8]) -> String {
     inputs.iter().map(|b| b.to_string()).collect::<Vec<_>>().join(",")
 }
 
 impl Witness {
     /// `witness.txt`: `inputs ...`, then `f x y` per frame (frame 0 the start).
-    pub fn save(&self, path: &std::path::Path) -> Result<()> {
+    pub(crate) fn save(&self, path: &std::path::Path) -> Result<()> {
         let mut text = format!("inputs {}\n", inputs_text(&self.inputs));
         for (f, &c) in self.cells.iter().enumerate() {
             match super::pos_graph::cell_xy(c) {
@@ -367,7 +367,7 @@ pub(super) fn concrete_search<N: Rem>(side: &Side<'_, N>, horizon: u32, bound: u
 
 /// W's nodes by `(shape, key, cell)`: a node IS its state (`Sk`), so only
 /// the tree's shapes are listed.
-pub struct NodeKeys<'w, C: Circle = super::arcs::Fixed16> {
+pub(crate) struct NodeKeys<'w, C: Circle = super::arcs::Fixed16> {
     w: &'w Winning<C>,
     geo: crate::storage::Geometry,
     /// Shape hash -> shape index, sorted.
@@ -376,7 +376,7 @@ pub struct NodeKeys<'w, C: Circle = super::arcs::Fixed16> {
 
 impl<'w, C: Circle> NodeKeys<'w, C> {
     /// Over `w`, the tree's shapes by index.
-    pub fn new(w: &'w Winning<C>, shapes: &[u64]) -> Result<Self> {
+    pub(crate) fn new(w: &'w Winning<C>, shapes: &[u64]) -> Result<Self> {
         let mut by: Vec<(u64, u32)> = shapes.iter().enumerate().map(|(i, &h)| (h, i as u32)).collect();
         by.sort_unstable();
         ensure!(by.windows(2).all(|p| p[0].0 != p[1].0), "a shape with two indices");
@@ -430,7 +430,7 @@ pub(super) fn lookup_view<N: EngineNum>(row: &Rt2<N>, seeded: bool) -> Result<Rt
 }
 
 /// A concrete state's exact remainder per axis (`None`: no player).
-pub fn rem_raw<N: Rem>(rt2: &Rt2<N>) -> Result<Option<(N, N)>> {
+pub(crate) fn rem_raw<N: Rem>(rt2: &Rt2<N>) -> Result<Option<(N, N)>> {
     use celeste_engine::runtime2::AV;
     let ids = crate::compiled::ids();
     let Some((cx, cy)) = rt2.player_xy_cells(ids, ids.f_rem) else { return Ok(None) };
@@ -442,7 +442,7 @@ pub fn rem_raw<N: Rem>(rt2: &Rt2<N>) -> Result<Option<(N, N)>> {
 }
 
 /// A concrete state's remainder as a torus point (no player: the start's).
-pub fn rem_of<N: Rem>(rt2: &Rt2<N>) -> Result<(Point<N>, Point<N>)> {
+pub(crate) fn rem_of<N: Rem>(rt2: &Rt2<N>) -> Result<(Point<N>, Point<N>)> {
     let Some((x, y)) = rem_raw(rt2)? else { return Ok(super::rem::start_point::<N>()) };
     let at = |n: N| N::point(n).ok_or_else(|| anyhow::anyhow!("a remainder {n:?} outside [-1/2, 1/2)"));
     Ok((at(x)?, at(y)?))
