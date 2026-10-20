@@ -380,10 +380,10 @@ pub struct Symbolic<A: GraphArith = Fixed> {
     /// bounded input, the only source of a static range) and `Op::Pin` (an input
     /// the body reads as a constant), each charged to every outcome.
     pub assumptions: Vec<NodeId>,
-    range_memo: std::collections::HashMap<NodeId, Option<A::Pieces>>,
+    range_memo: std::collections::HashMap<NodeId, Option<Pieces<A>>>,
 }
 
-pub use crate::transpile::garith::Pieces;
+use crate::transpile::garith::Pieces;
 
 impl<A: GraphArith> Symbolic<A> {
     pub fn set_merge_refused(&mut self, mut cells: Vec<u32>) {
@@ -475,7 +475,7 @@ impl<A: GraphArith> Symbolic<A> {
     }
 
     /// The static range of `n`, from the restrictions.
-    pub fn range_of(&mut self, n: NodeId) -> Option<A::Pieces> {
+    pub fn range_of(&mut self, n: NodeId) -> Option<Pieces<A>> {
         A::pieces_of(&self.graph, &mut self.range_memo, n)
     }
 

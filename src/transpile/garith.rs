@@ -30,7 +30,8 @@ pub trait GraphArith: Arithmetic<Num: celeste_core::arith::EngineNum<A = Self>> 
     /// Is the cart's `==` on numbers bit identity (16.16: yes; a double's
     /// `-0 == 0`)? Where not, a pin checks `Op::Same`.
     const EQ_IS_IDENTITY: bool;
-    type Pieces: Clone + Debug + PartialEq + Default + Send;
+    /// A static range's piece end (`End`).
+    type End: End;
 
     /// `ForkOk(Floors, n)` of the literal interval `[lo, hi]`, in the
     /// kernel's own arithmetic.
@@ -69,22 +70,53 @@ pub trait GraphArith: Arithmetic<Num: celeste_core::arith::EngineNum<A = Self>> 
     /// size` (`mget`'s rectangle).
     fn tile_span(iv: Self::Ival, size: i32) -> (i32, i32);
 
+    /// A literal as a piece end.
+    fn end(l: Self::Lit) -> Self::End;
+    /// A piece end as a literal (`None`: outside the arithmetic).
+    fn end_lit(e: Self::End) -> Option<Self::Lit>;
+    /// `x` times or (`div`) over a constant `k` (not zero), as the
+    /// arithmetic rounds it (16.16: in `i64`, unwrapped and unsaturated, so
+    /// a result outside the range makes the range unknown at `normalize`).
+    fn scale(x: Self::End, k: Self::End, div: bool) -> Self::End;
+
     /// The static range of `n` from the restrictions (`None`: unknown, never
     /// wrong). `memo` is valid for one graph.
-    fn pieces_of(g: &Graph<Self>, memo: &mut HashMap<NodeId, Option<Self::Pieces>>, n: NodeId) -> Option<Self::Pieces>;
+    fn pieces_of(g: &Graph<Self>, memo: &mut HashMap<NodeId, Option<Pieces<Self>>>, n: NodeId) -> Option<Pieces<Self>> {
+        pieces_of(g, memo, n)
+    }
     /// Does every pair of pieces of `x` and `y` give comparison `op` (an
     /// `Op::Lt`..`Op::Eq`) one answer?
-    fn decide_cmp(op: &Op<Self>, xs: &Self::Pieces, ys: &Self::Pieces) -> Option<bool>;
+    fn decide_cmp(op: &Op<Self>, xs: &Pieces<Self>, ys: &Pieces<Self>) -> Option<bool> {
+        let one = |x: (Self::End, Self::End), y: (Self::End, Self::End)| -> Option<bool> {
+            match op {
+                Op::Lt => if x.1 < y.0 { Some(true) } else if x.0 >= y.1 { Some(false) } else { None },
+                Op::Le => if x.1 <= y.0 { Some(true) } else if x.0 > y.1 { Some(false) } else { None },
+                Op::Gt => if x.0 > y.1 { Some(true) } else if x.1 <= y.0 { Some(false) } else { None },
+                Op::Ge => if x.0 >= y.1 { Some(true) } else if x.1 < y.0 { Some(false) } else { None },
+                _ => if x.0 == x.1 && y.0 == y.1 && x.0 == y.0 { Some(true) } else if x.1 < y.0 || y.1 < x.0 { Some(false) } else { None },
+            }
+        };
+        decide_pairs(xs, ys, one)
+    }
     /// Does the range keep every value inside the arithmetic (no overflow:
     /// `trace::error`)?
-    fn bounded(p: &Self::Pieces) -> bool;
+    fn bounded(p: &Pieces<Self>) -> bool {
+        p.iter().all(|&(lo, hi)| lo.valid() && hi.valid())
+    }
     /// The most cells of `grid` (the floors, the values of `flr(x + 1/2)`)
     /// a piece spans (`uncapped`: the hull's), at least 1: a fork's arity.
-    fn spanned(grid: Cut, p: &Self::Pieces, uncapped: bool) -> i64;
+    fn spanned(grid: Cut, p: &Pieces<Self>, uncapped: bool) -> i64;
     /// The whole numbers the pieces' hull spans.
-    fn floor_hull(p: &Self::Pieces) -> Option<(i64, i64)>;
+    fn floor_hull(p: &Pieces<Self>) -> Option<(i64, i64)> {
+        let lo = p.iter().map(|q| q.0).reduce(End::least)?.pixel();
+        let hi = p.iter().map(|q| q.1).reduce(End::most)?.pixel();
+        Some((lo, hi))
+    }
     /// The pieces' hull as literals (`None`: outside the arithmetic).
-    fn lit_hull(p: &Self::Pieces) -> Option<(Self::Lit, Self::Lit)>;
+    fn lit_hull(p: &Pieces<Self>) -> Option<(Self::Lit, Self::Lit)> {
+        let (lo, hi) = (p.iter().map(|q| q.0).reduce(End::least)?, p.iter().map(|q| q.1).reduce(End::most)?);
+        Some((Self::end_lit(lo)?, Self::end_lit(hi)?))
+    }
     /// A literal interval as raw 16.16, where the arithmetic is 16.16's.
     fn lit_raw_fixed(lo: Self::Lit, hi: Self::Lit) -> Option<(i32, i32)>;
     /// Is `v` the only number of its VALUE, so a box whose ends are `v`
@@ -130,34 +162,48 @@ mod value_box_tests {
     }
 }
 
-// 16.16.
-
-/// One fork-grid step (the integers) in raw 16.16 units.
-const GRID_STEP: i32 = 1 << 16;
-
-/// The fork grid: one step in raw 16.16 and the mask flooring to it.
-fn grid() -> (i32, i32) {
-    (GRID_STEP, !(GRID_STEP - 1))
-}
-
-/// A static range as sorted, disjoint pieces (raw 16.16, inclusive).
-pub type Pieces = Vec<(i64, i64)>;
+/// A static range as sorted, disjoint pieces (inclusive ends).
+pub type Pieces<A = Fixed> = Vec<(<A as GraphArith>::End, <A as GraphArith>::End)>;
 
 /// The most pieces a range keeps; past that it is one hull.
 pub const MAX_PIECES: usize = 64;
 
-/// Sort, merge overlapping/adjacent, refuse a 16.16 overflow ("unknown"),
-/// and cap the count.
-pub fn normalize_pieces(mut v: Pieces) -> Option<Pieces> {
+/// A static range's piece end: 16.16's raw value in `i64` (exact and
+/// unwrapped: a result past the range is seen, and refused, at
+/// `normalize`), a double's value. Each operation is the arithmetic's own
+/// on the ends: monotone (`abs`: in the magnitude), and a double's rounded
+/// to nearest at both ends, monotone too, so the ends' results bound every
+/// lane's.
+pub trait End: Copy + PartialOrd + Debug + Send + std::ops::Add<Output = Self> + std::ops::Sub<Output = Self> + std::ops::Neg<Output = Self> {
+    const ZERO: Self;
+    /// Inside the arithmetic (16.16's `i32` raws; the finite doubles).
+    fn valid(self) -> bool;
+    /// Does a piece starting at `lo` join one ending at `hi` (16.16: also
+    /// the next raw; doubles: overlapping only, the doubles between two
+    /// pieces are not in the range)?
+    fn joins(lo: Self, hi: Self) -> bool;
+    fn order(a: Self, b: Self) -> std::cmp::Ordering;
+    fn least(self, o: Self) -> Self;
+    fn most(self, o: Self) -> Self;
+    fn magnitude(self) -> Self;
+    /// `flr`.
+    fn flr(self) -> Self;
+    /// The whole number `flr` of the end is.
+    fn pixel(self) -> i64;
+}
+
+/// Sort, merge overlapping (`End::joins`) pieces, refuse an end outside the
+/// arithmetic ("unknown"), and cap the count.
+fn normalize<E: End>(mut v: Vec<(E, E)>) -> Option<Vec<(E, E)>> {
     v.retain(|(lo, hi)| lo <= hi);
-    if v.is_empty() || v.iter().any(|(lo, hi)| *lo < i32::MIN as i64 || *hi > i32::MAX as i64) {
+    if v.is_empty() || v.iter().any(|(lo, hi)| !lo.valid() || !hi.valid()) {
         return None;
     }
-    v.sort_unstable();
-    let mut out: Pieces = Vec::with_capacity(v.len());
+    v.sort_unstable_by(|a, b| E::order(a.0, b.0).then(E::order(a.1, b.1)));
+    let mut out: Vec<(E, E)> = Vec::with_capacity(v.len());
     for (lo, hi) in v {
         match out.last_mut() {
-            Some(last) if lo <= last.1 + 1 => last.1 = last.1.max(hi),
+            Some(last) if E::joins(lo, last.1) => last.1 = last.1.most(hi),
             _ => out.push((lo, hi)),
         }
     }
@@ -167,11 +213,181 @@ pub fn normalize_pieces(mut v: Pieces) -> Option<Pieces> {
     Some(out)
 }
 
+/// `GraphArith::pieces_of`, once for both arithmetics.
+fn pieces_of<A: GraphArith>(g: &Graph<A>, memo: &mut HashMap<NodeId, Option<Pieces<A>>>, n: NodeId) -> Option<Pieces<A>> {
+    if let Some(r) = memo.get(&n) {
+        return r.clone();
+    }
+    let node = g.get(n);
+    let (op, args) = (node.op.clone(), node.args.clone());
+    let konst = |n: NodeId| match g.get(n).op {
+        Op::Const(lo, hi) if lo == hi => Some(A::end(lo)),
+        _ => None,
+    };
+    let rec = |memo: &mut HashMap<NodeId, Option<Pieces<A>>>, k: usize| pieces_of(g, memo, args[k]);
+    let r: Option<Pieces<A>> = match op {
+        Op::Const(lo, hi) => Some(vec![(A::end(lo), A::end(hi))]),
+        // The assumed range (as `eval`): its own error makes it a fact.
+        Op::Restrict(lo, hi) => {
+            let (lo, hi) = (A::end(lo), A::end(hi));
+            match rec(memo, 0) {
+                None => Some(vec![(lo, hi)]),
+                Some(a) => {
+                    let inside: Pieces<A> = a.iter().map(|p| (p.0.most(lo), p.1.least(hi))).filter(|p| p.0 <= p.1).collect();
+                    if inside.is_empty() {
+                        Some(a)
+                    } else {
+                        normalize(inside)
+                    }
+                }
+            }
+        }
+        Op::Add | Op::Sub | Op::Min | Op::Max => {
+            let (a, b) = (rec(memo, 0)?, rec(memo, 1)?);
+            let mut out = Vec::new();
+            for x in &a {
+                for y in &b {
+                    out.push(match op {
+                        Op::Add => (x.0 + y.0, x.1 + y.1),
+                        Op::Sub => (x.0 - y.1, x.1 - y.0),
+                        Op::Min => (x.0.least(y.0), x.1.least(y.1)),
+                        _ => (x.0.most(y.0), x.1.most(y.1)),
+                    });
+                }
+            }
+            normalize(out)
+        }
+        Op::Neg => normalize(rec(memo, 0)?.into_iter().map(|a| (-a.1, -a.0)).collect()),
+        Op::Abs => normalize(
+            rec(memo, 0)?
+                .into_iter()
+                .map(|a| {
+                    let lo = if a.0 <= A::End::ZERO && a.1 >= A::End::ZERO { A::End::ZERO } else { a.0.magnitude().least(a.1.magnitude()) };
+                    (lo, a.0.magnitude().most(a.1.magnitude()))
+                })
+                .collect(),
+        ),
+        // Product/quotient by a CONSTANT is monotone in the other operand.
+        Op::Mul | Op::Div => {
+            let (k_of, k, is_div) = match (konst(args[0]), konst(args[1])) {
+                (_, Some(k)) => (0usize, k, matches!(op, Op::Div)),
+                (Some(k), None) if matches!(op, Op::Mul) => (1, k, false),
+                _ => {
+                    memo.insert(n, None);
+                    return None;
+                }
+            };
+            if is_div && k == A::End::ZERO {
+                memo.insert(n, None);
+                return None;
+            }
+            let a = rec(memo, k_of)?;
+            normalize(
+                a.into_iter()
+                    .map(|a| {
+                        let (x, y) = (A::scale(a.0, k, is_div), A::scale(a.1, k, is_div));
+                        (x.least(y), x.most(y))
+                    })
+                    .collect(),
+            )
+        }
+        Op::Flr => normalize(rec(memo, 0)?.into_iter().map(|a| (a.0.flr(), a.1.flr())).collect()),
+        Op::Sin => {
+            let one = A::end(A::lit(A::from_i16(1)));
+            Some(vec![(-one, one)])
+        }
+        Op::Sel => match g.get(args[0]).op {
+            Op::ConstBool(true) => rec(memo, 1),
+            Op::ConstBool(false) => rec(memo, 2),
+            _ => {
+                let (mut a, b) = (rec(memo, 1)?, rec(memo, 2)?);
+                a.extend(b);
+                normalize(a)
+            }
+        },
+        Op::Span => {
+            let (a, b) = (rec(memo, 0)?, rec(memo, 1)?);
+            Some(vec![(a[0].0, b[b.len() - 1].1)])
+        }
+        // A fragment lies within its operand.
+        Op::Fork(..) | Op::Frag(..) => rec(memo, 0),
+        // A lane's end, over the lanes (see `eval`'s `Lo`).
+        Op::Lo | Op::Hi => {
+            let low = matches!(op, Op::Lo);
+            let arg = g.get(args[0]).clone();
+            match arg.op {
+                Op::Span => pieces_of(g, memo, arg.args[if low { 0 } else { 1 }]),
+                Op::Const(l, h) => {
+                    let v = A::end(if low { l } else { h });
+                    Some(vec![(v, v)])
+                }
+                _ => rec(memo, 0),
+            }
+        }
+        _ => None,
+    };
+    memo.insert(n, r.clone());
+    r
+}
+
+// 16.16.
+
+/// 16.16's raw value, exact and unwrapped.
+impl End for i64 {
+    const ZERO: i64 = 0;
+    fn valid(self) -> bool {
+        (i32::MIN as i64..=i32::MAX as i64).contains(&self)
+    }
+    fn joins(lo: i64, hi: i64) -> bool {
+        lo <= hi + 1
+    }
+    fn order(a: i64, b: i64) -> std::cmp::Ordering {
+        a.cmp(&b)
+    }
+    fn least(self, o: i64) -> i64 {
+        Ord::min(self, o)
+    }
+    fn most(self, o: i64) -> i64 {
+        Ord::max(self, o)
+    }
+    fn magnitude(self) -> i64 {
+        i64::abs(self)
+    }
+    fn flr(self) -> i64 {
+        Pico8Num::from_raw(self as i32).flr().as_raw_u32() as i32 as i64
+    }
+    fn pixel(self) -> i64 {
+        self.div_euclid(1 << 16)
+    }
+}
+
+/// One fork-grid step (the integers) in raw 16.16 units.
+const GRID_STEP: i32 = 1 << 16;
+
+/// The fork grid: one step in raw 16.16 and the mask flooring to it.
+fn grid() -> (i32, i32) {
+    (GRID_STEP, !(GRID_STEP - 1))
+}
+
 impl GraphArith for Fixed {
     const MINMAX_COMMUTE: bool = true;
     const EXACT_ADDITION: bool = true;
     const EQ_IS_IDENTITY: bool = true;
-    type Pieces = Pieces;
+    type End = i64;
+
+    fn end(l: i32) -> i64 {
+        l as i64
+    }
+    fn end_lit(e: i64) -> Option<i32> {
+        i32::try_from(e).ok()
+    }
+    fn scale(x: i64, k: i64, div: bool) -> i64 {
+        if div {
+            (x << 16) / k
+        } else {
+            (x * k) >> 16
+        }
+    }
 
     fn lit_split_ok(lo: i32, hi: i32, n: u8) -> bool {
         // In the kernel's own i32 arithmetic, wrap included.
@@ -238,152 +454,6 @@ impl GraphArith for Fixed {
         (lo.clamp(-1, size), hi.clamp(-1, size))
     }
 
-    fn pieces_of(g: &Graph<Fixed>, memo: &mut HashMap<NodeId, Option<Pieces>>, n: NodeId) -> Option<Pieces> {
-        if let Some(r) = memo.get(&n) {
-            return r.clone();
-        }
-        let node = g.get(n);
-        let (op, args) = (node.op.clone(), node.args.clone());
-        let konst = |g: &Graph<Fixed>, n: NodeId| -> Option<Pico8Num> {
-            match g.get(n).op {
-                Op::Const(lo, hi) if lo == hi => Some(Pico8Num::from_raw(lo)),
-                _ => None,
-            }
-        };
-        let raw = |p: Pico8Num| p.as_raw_u32() as i32 as i64;
-        let p8 = |v: i64| Pico8Num::from_raw(v as i32);
-        let rec = |memo: &mut HashMap<NodeId, Option<Pieces>>, k: usize| Self::pieces_of(g, memo, args[k]);
-        let r: Option<Pieces> = match op {
-            Op::Const(lo, hi) => Some(vec![(lo as i64, hi as i64)]),
-            // The assumed range (as `eval`): its own error makes it a fact.
-            Op::Restrict(lo, hi) => {
-                let (lo, hi) = (lo as i64, hi as i64);
-                match rec(memo, 0) {
-                    None => Some(vec![(lo, hi)]),
-                    Some(a) => {
-                        let inside: Pieces = a.iter().map(|p| (p.0.max(lo), p.1.min(hi))).filter(|p| p.0 <= p.1).collect();
-                        if inside.is_empty() {
-                            Some(a)
-                        } else {
-                            normalize_pieces(inside)
-                        }
-                    }
-                }
-            }
-            Op::Add | Op::Sub | Op::Min | Op::Max => {
-                let (a, b) = (rec(memo, 0)?, rec(memo, 1)?);
-                let mut out = Vec::new();
-                for x in &a {
-                    for y in &b {
-                        out.push(match op {
-                            Op::Add => (x.0 + y.0, x.1 + y.1),
-                            Op::Sub => (x.0 - y.1, x.1 - y.0),
-                            Op::Min => (x.0.min(y.0), x.1.min(y.1)),
-                            _ => (x.0.max(y.0), x.1.max(y.1)),
-                        });
-                    }
-                }
-                normalize_pieces(out)
-            }
-            Op::Neg => normalize_pieces(rec(memo, 0)?.into_iter().map(|a| (-a.1, -a.0)).collect()),
-            Op::Abs => normalize_pieces(
-                rec(memo, 0)?
-                    .into_iter()
-                    .map(|a| {
-                        let lo = if a.0 <= 0 && a.1 >= 0 { 0 } else { a.0.abs().min(a.1.abs()) };
-                        (lo, a.0.abs().max(a.1.abs()))
-                    })
-                    .collect(),
-            ),
-            // Product/quotient by a CONSTANT is monotone in the other operand.
-            Op::Mul | Op::Div => {
-                let (ka, kb) = (konst(g, args[0]), konst(g, args[1]));
-                let (k_of, k, is_div) = match (ka, kb) {
-                    (_, Some(k)) => (0usize, k, matches!(op, Op::Div)),
-                    (Some(k), None) if matches!(op, Op::Mul) => (1, k, false),
-                    _ => {
-                        memo.insert(n, None);
-                        return None;
-                    }
-                };
-                if is_div && k.as_raw_u32() == 0 {
-                    memo.insert(n, None);
-                    return None;
-                }
-                let a = rec(memo, k_of)?;
-                // In i64, unwrapped and unsaturated: a product or quotient that leaves
-                // the 16.16 range makes the range unknown (PICO-8's wrapped endpoints would
-                // bound nothing).
-                let f = |x: i64| -> i64 {
-                    if is_div {
-                        (x << 16) / raw(k)
-                    } else {
-                        (x * raw(k)) >> 16
-                    }
-                };
-                let mut out = Vec::new();
-                for a in a {
-                    let (x, y) = (f(a.0), f(a.1));
-                    out.push((x.min(y), x.max(y)));
-                }
-                normalize_pieces(out)
-            }
-            Op::Flr => {
-                let a = rec(memo, 0)?;
-                normalize_pieces(a.into_iter().map(|a| (raw(p8(a.0).flr()), raw(p8(a.1).flr()))).collect())
-            }
-            Op::Sin => Some(vec![(-(1i64 << 16), 1i64 << 16)]),
-            Op::Sel => match g.get(args[0]).op {
-                Op::ConstBool(true) => rec(memo, 1),
-                Op::ConstBool(false) => rec(memo, 2),
-                _ => {
-                    let (mut a, b) = (rec(memo, 1)?, rec(memo, 2)?);
-                    a.extend(b);
-                    normalize_pieces(a)
-                }
-            },
-            Op::Span => {
-                let (a, b) = (rec(memo, 0)?, rec(memo, 1)?);
-                Some(vec![(a[0].0, b[b.len() - 1].1)])
-            }
-            // A fragment lies within its operand.
-            Op::Fork(..) | Op::Frag(..) => rec(memo, 0),
-            // A lane's end, over the lanes (see `eval`'s `Lo`).
-            Op::Lo | Op::Hi => {
-                let low = matches!(op, Op::Lo);
-                let arg = g.get(args[0]).clone();
-                match arg.op {
-                    Op::Span => Self::pieces_of(g, memo, arg.args[if low { 0 } else { 1 }]),
-                    Op::Const(l, h) => {
-                        let v = if low { l } else { h } as i64;
-                        Some(vec![(v, v)])
-                    }
-                    _ => rec(memo, 0),
-                }
-            }
-            _ => None,
-        };
-        memo.insert(n, r.clone());
-        r
-    }
-
-    fn decide_cmp(op: &Op<Fixed>, xs: &Pieces, ys: &Pieces) -> Option<bool> {
-        let one = |x: (i64, i64), y: (i64, i64)| -> Option<bool> {
-            match op {
-                Op::Lt => if x.1 < y.0 { Some(true) } else if x.0 >= y.1 { Some(false) } else { None },
-                Op::Le => if x.1 <= y.0 { Some(true) } else if x.0 > y.1 { Some(false) } else { None },
-                Op::Gt => if x.0 > y.1 { Some(true) } else if x.1 <= y.0 { Some(false) } else { None },
-                Op::Ge => if x.0 >= y.1 { Some(true) } else if x.1 < y.0 { Some(false) } else { None },
-                _ => if x.0 == x.1 && y.0 == y.1 && x.0 == y.0 { Some(true) } else if x.1 < y.0 || y.1 < x.0 { Some(false) } else { None },
-            }
-        };
-        decide_pairs(xs, ys, one)
-    }
-
-    fn bounded(p: &Pieces) -> bool {
-        p.iter().all(|&(lo, hi)| lo >= i32::MIN as i64 && hi <= i32::MAX as i64)
-    }
-
     /// The floors: `raw >> 16`; the values of `flr(x + 1/2)`: `(raw + 1/2)
     /// >> 16`, exactly.
     fn spanned(grid: Cut, ps: &Pieces, uncapped: bool) -> i64 {
@@ -397,17 +467,6 @@ impl GraphArith for Fixed {
             ps.iter().map(|p| r(p.1) - r(p.0) + 1).max().unwrap_or(1)
         };
         w.max(1)
-    }
-
-    fn floor_hull(ps: &Pieces) -> Option<(i64, i64)> {
-        let lo = ps.iter().map(|q| q.0).min()?.div_euclid(1 << 16);
-        let hi = ps.iter().map(|q| q.1).max()?.div_euclid(1 << 16);
-        Some((lo, hi))
-    }
-
-    fn lit_hull(ps: &Pieces) -> Option<(i32, i32)> {
-        let (lo, hi) = (ps.iter().map(|p| p.0).min()?, ps.iter().map(|p| p.1).max()?);
-        Some((i32::try_from(lo).ok()?, i32::try_from(hi).ok()?))
     }
 
     fn lit_raw_fixed(lo: i32, hi: i32) -> Option<(i32, i32)> {
@@ -438,29 +497,33 @@ fn decide_pairs<P: Copy>(xs: &[P], ys: &[P], one: impl Fn(P, P) -> Option<bool>)
 
 // Doubles.
 
-/// A static range of doubles as sorted, disjoint closed pieces.
-pub type FloatPieces = Vec<(f64, f64)>;
-
-/// Sort, merge overlapping pieces, refuse a non-finite end ("unknown"), and
-/// cap the count. No adjacency merge: the doubles between two pieces are
-/// not in the range.
-fn normalize_float(mut v: FloatPieces) -> Option<FloatPieces> {
-    v.retain(|(lo, hi)| lo <= hi);
-    if v.is_empty() || v.iter().any(|(lo, hi)| !lo.is_finite() || !hi.is_finite()) {
-        return None;
+/// A double's value.
+impl End for f64 {
+    const ZERO: f64 = 0.0;
+    fn valid(self) -> bool {
+        self.is_finite()
     }
-    v.sort_unstable_by(|a, b| a.0.total_cmp(&b.0).then(a.1.total_cmp(&b.1)));
-    let mut out: FloatPieces = Vec::with_capacity(v.len());
-    for (lo, hi) in v {
-        match out.last_mut() {
-            Some(last) if lo <= last.1 => last.1 = last.1.max(hi),
-            _ => out.push((lo, hi)),
-        }
+    fn joins(lo: f64, hi: f64) -> bool {
+        lo <= hi
     }
-    if out.len() > MAX_PIECES {
-        out = vec![(out[0].0, out[out.len() - 1].1)];
+    fn order(a: f64, b: f64) -> std::cmp::Ordering {
+        a.total_cmp(&b)
     }
-    Some(out)
+    fn least(self, o: f64) -> f64 {
+        f64::min(self, o)
+    }
+    fn most(self, o: f64) -> f64 {
+        f64::max(self, o)
+    }
+    fn magnitude(self) -> f64 {
+        f64::abs(self)
+    }
+    fn flr(self) -> f64 {
+        f64::floor(self)
+    }
+    fn pixel(self) -> i64 {
+        self.floor() as i64
+    }
 }
 
 /// An `Ints` fragment `c` of a value: its low end, the floor `c` integers
@@ -474,7 +537,21 @@ impl GraphArith for Float {
     const MINMAX_COMMUTE: bool = false;
     const EXACT_ADDITION: bool = false;
     const EQ_IS_IDENTITY: bool = false;
-    type Pieces = FloatPieces;
+    type End = f64;
+
+    fn end(l: u64) -> f64 {
+        Float::from_lit(l).value()
+    }
+    fn end_lit(e: f64) -> Option<u64> {
+        LuaF64::new(e).map(Float::lit)
+    }
+    fn scale(x: f64, k: f64, div: bool) -> f64 {
+        if div {
+            x / k
+        } else {
+            x * k
+        }
+    }
 
     fn lit_split_ok(lo: u64, hi: u64, n: u8) -> bool {
         Self::cells(Cut::Floors, LuaF64Interval::new(Float::from_lit(lo), Float::from_lit(hi))) < n as i64
@@ -514,137 +591,9 @@ impl GraphArith for Float {
         (w(iv.lo.value()), w(iv.hi.value()))
     }
 
-    fn pieces_of(g: &Graph<Float>, memo: &mut HashMap<NodeId, Option<FloatPieces>>, n: NodeId) -> Option<FloatPieces> {
-        if let Some(r) = memo.get(&n) {
-            return r.clone();
-        }
-        let node = g.get(n);
-        let (op, args) = (node.op.clone(), node.args.clone());
-        let v = |l: u64| Float::from_lit(l).value();
-        let konst = |g: &Graph<Float>, n: NodeId| -> Option<f64> {
-            match g.get(n).op {
-                Op::Const(lo, hi) if lo == hi => Some(v(lo)),
-                _ => None,
-            }
-        };
-        let rec = |memo: &mut HashMap<NodeId, Option<FloatPieces>>, k: usize| Self::pieces_of(g, memo, args[k]);
-        // Every operation below is monotone in each operand (`abs`: in its
-        // magnitude) and rounded to nearest at both ends, monotone too: the ends'
-        // results bound every lane's.
-        let r: Option<FloatPieces> = match op {
-            Op::Const(lo, hi) => Some(vec![(v(lo), v(hi))]),
-            Op::Restrict(lo, hi) => {
-                let (lo, hi) = (v(lo), v(hi));
-                match rec(memo, 0) {
-                    None => Some(vec![(lo, hi)]),
-                    Some(a) => {
-                        let inside: FloatPieces = a.iter().map(|p| (p.0.max(lo), p.1.min(hi))).filter(|p| p.0 <= p.1).collect();
-                        if inside.is_empty() {
-                            Some(a)
-                        } else {
-                            normalize_float(inside)
-                        }
-                    }
-                }
-            }
-            Op::Add | Op::Sub | Op::Min | Op::Max => {
-                let (a, b) = (rec(memo, 0)?, rec(memo, 1)?);
-                let mut out = Vec::new();
-                for x in &a {
-                    for y in &b {
-                        out.push(match op {
-                            Op::Add => (x.0 + y.0, x.1 + y.1),
-                            Op::Sub => (x.0 - y.1, x.1 - y.0),
-                            Op::Min => (x.0.min(y.0), x.1.min(y.1)),
-                            _ => (x.0.max(y.0), x.1.max(y.1)),
-                        });
-                    }
-                }
-                normalize_float(out)
-            }
-            Op::Neg => normalize_float(rec(memo, 0)?.into_iter().map(|a| (-a.1, -a.0)).collect()),
-            Op::Abs => normalize_float(
-                rec(memo, 0)?
-                    .into_iter()
-                    .map(|a| {
-                        let lo = if a.0 <= 0.0 && a.1 >= 0.0 { 0.0 } else { a.0.abs().min(a.1.abs()) };
-                        (lo, a.0.abs().max(a.1.abs()))
-                    })
-                    .collect(),
-            ),
-            Op::Mul | Op::Div => {
-                let (ka, kb) = (konst(g, args[0]), konst(g, args[1]));
-                let (k_of, k, is_div) = match (ka, kb) {
-                    (_, Some(k)) => (0usize, k, matches!(op, Op::Div)),
-                    (Some(k), None) if matches!(op, Op::Mul) => (1, k, false),
-                    _ => {
-                        memo.insert(n, None);
-                        return None;
-                    }
-                };
-                if is_div && k == 0.0 {
-                    memo.insert(n, None);
-                    return None;
-                }
-                let a = rec(memo, k_of)?;
-                let f = |x: f64| if is_div { x / k } else { x * k };
-                normalize_float(a.into_iter().map(|a| (f(a.0).min(f(a.1)), f(a.0).max(f(a.1)))).collect())
-            }
-            Op::Flr => normalize_float(rec(memo, 0)?.into_iter().map(|a| (a.0.floor(), a.1.floor())).collect()),
-            Op::Sin => Some(vec![(-1.0, 1.0)]),
-            Op::Sel => match g.get(args[0]).op {
-                Op::ConstBool(true) => rec(memo, 1),
-                Op::ConstBool(false) => rec(memo, 2),
-                _ => {
-                    let (mut a, b) = (rec(memo, 1)?, rec(memo, 2)?);
-                    a.extend(b);
-                    normalize_float(a)
-                }
-            },
-            Op::Span => {
-                let (a, b) = (rec(memo, 0)?, rec(memo, 1)?);
-                Some(vec![(a[0].0, b[b.len() - 1].1)])
-            }
-            Op::Fork(..) | Op::Frag(..) => rec(memo, 0),
-            Op::Lo | Op::Hi => {
-                let low = matches!(op, Op::Lo);
-                let arg = g.get(args[0]).clone();
-                match arg.op {
-                    Op::Span => Self::pieces_of(g, memo, arg.args[if low { 0 } else { 1 }]),
-                    Op::Const(l, h) => {
-                        let x = v(if low { l } else { h });
-                        Some(vec![(x, x)])
-                    }
-                    _ => rec(memo, 0),
-                }
-            }
-            _ => None,
-        };
-        memo.insert(n, r.clone());
-        r
-    }
-
-    fn decide_cmp(op: &Op<Float>, xs: &FloatPieces, ys: &FloatPieces) -> Option<bool> {
-        let one = |x: (f64, f64), y: (f64, f64)| -> Option<bool> {
-            match op {
-                Op::Lt => if x.1 < y.0 { Some(true) } else if x.0 >= y.1 { Some(false) } else { None },
-                Op::Le => if x.1 <= y.0 { Some(true) } else if x.0 > y.1 { Some(false) } else { None },
-                Op::Gt => if x.0 > y.1 { Some(true) } else if x.1 <= y.0 { Some(false) } else { None },
-                Op::Ge => if x.0 >= y.1 { Some(true) } else if x.1 < y.0 { Some(false) } else { None },
-                _ => if x.0 == x.1 && y.0 == y.1 && x.0 == y.0 { Some(true) } else if x.1 < y.0 || y.1 < x.0 { Some(false) } else { None },
-            }
-        };
-        decide_pairs(xs, ys, one)
-    }
-
-    /// Finite (`normalize_float` refuses the rest).
-    fn bounded(p: &FloatPieces) -> bool {
-        p.iter().all(|&(lo, hi)| lo.is_finite() && hi.is_finite())
-    }
-
     /// The floors; the values of `flr(fl(x + 1/2))`, monotone in `x`
     /// (`LuaF64Interval::rounds`).
-    fn spanned(grid: Cut, ps: &FloatPieces, uncapped: bool) -> i64 {
+    fn spanned(grid: Cut, ps: &Pieces<Float>, uncapped: bool) -> i64 {
         let half = if grid == Cut::Rounds { 0.5 } else { 0.0 };
         let r = |v: f64| (v + half).floor();
         let w = if uncapped {
@@ -655,18 +604,6 @@ impl GraphArith for Float {
             ps.iter().map(|p| r(p.1) - r(p.0) + 1.0).fold(1.0, f64::max)
         };
         (w as i64).max(1)
-    }
-
-    fn floor_hull(ps: &FloatPieces) -> Option<(i64, i64)> {
-        let lo = ps.iter().map(|q| q.0).reduce(f64::min)?.floor();
-        let hi = ps.iter().map(|q| q.1).reduce(f64::max)?.floor();
-        Some((lo as i64, hi as i64))
-    }
-
-    fn lit_hull(ps: &FloatPieces) -> Option<(u64, u64)> {
-        let lo = LuaF64::new(ps.iter().map(|q| q.0).reduce(f64::min)?)?;
-        let hi = LuaF64::new(ps.iter().map(|q| q.1).reduce(f64::max)?)?;
-        Some((Float::lit(lo), Float::lit(hi)))
     }
 
     fn lit_raw_fixed(_lo: u64, _hi: u64) -> Option<(i32, i32)> {
