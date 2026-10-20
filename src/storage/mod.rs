@@ -1,7 +1,7 @@
 //! STORAGE (plans/architecture.md, "The forward: hulls and storage" and "The
 //! recorded graph"): the state set, the wave, and the tree's files in one
-//! container (`file`): frame (`layer`, with its frontier: `hulls`), edge
-//! (`bundle`, `edges`) and out-edge (`out`) files.
+//! container (`file`): frame (`layer`, with its frontier: `hulls`) and
+//! edge (`bundle`, `edges`) files.
 //!
 //! A state is `(shape, key, cell)` (`Sk`; the key holds no position:
 //! `exact::Code::pos`) everywhere: the edges, the frame files, the
@@ -16,7 +16,6 @@ pub mod edges;
 pub(crate) mod file;
 pub mod hulls;
 pub mod layer;
-pub(crate) mod out;
 pub(crate) mod route;
 pub(crate) mod set;
 pub(crate) mod scratch;

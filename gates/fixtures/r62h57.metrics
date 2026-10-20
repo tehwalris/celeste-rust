@@ -82,9 +82,9 @@ frame.edges 18601288
 frame.emissions 18601288
 frame.kept 800821
 frame.lanes_in 704524
-frame.routes 337
-frame.slices 8
-frame.units 360
+frame.routes 231
+frame.slices 7
+frame.units 681
 k.kernel_k25e696c66269be1d_0.dyn_insts 193
 k.kernel_k25e696c66269be1d_0.fused_nodes 78
 k.kernel_k25e696c66269be1d_0.insts 193

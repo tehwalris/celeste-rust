@@ -356,10 +356,58 @@ impl Decoder {
     }
 }
 
-/// A level's recorded graph up to a horizon, mapped: per frame its edge
-/// file (none past a dead frontier), and the global transfer table.
-pub struct EdgeStore<N: Rem = P8> {
+/// A level's edge files, mapped: per frame its file (none past a dead
+/// frontier, and none at frame 0: nothing leads into it). The forward
+/// holds one, a frame added as it is trusted (the re-pushes read it).
+#[derive(Default)]
+pub(crate) struct EdgeFiles {
     frames: Vec<Option<EdgeFile>>,
+}
+
+impl EdgeFiles {
+    /// Frames `1..=last`'s files under `dir` (`<level>/edges`).
+    pub(crate) fn open(dir: &Path, last: u32) -> Result<Self> {
+        let mut files = EdgeFiles { frames: vec![None] };
+        for f in 1..=last {
+            files.add_frame(dir, f)?;
+        }
+        Ok(files)
+    }
+
+    /// Frame `frame`'s file (the next), if it exists.
+    pub(crate) fn add_frame(&mut self, dir: &Path, frame: u32) -> Result<()> {
+        if self.frames.is_empty() {
+            self.frames.push(None);
+        }
+        ensure!(self.frames.len() as u32 == frame, "the edge file of frame {frame} added after {} frames", self.frames.len());
+        let p = file_path(dir, frame);
+        self.frames.push(if p.exists() { Some(EdgeFile::open(&p, frame)?) } else { None });
+        Ok(())
+    }
+
+    fn file(&self, frame: u32) -> Option<&EdgeFile> {
+        self.frames.get(frame as usize).and_then(|x| x.as_ref())
+    }
+
+    /// Target region `region`'s segments at frame `frame`.
+    pub(crate) fn segments(&self, frame: u32, region: u32) -> Vec<SegRef<'_>> {
+        self.file(frame).into_iter().flat_map(|f| f.segs_of(region).iter().map(move |h| f.seg(h))).collect()
+    }
+
+    /// The target regions holding edges that leave source region `source`
+    /// at frame `frame` (the out-edge lookup), sorted, distinct.
+    pub(crate) fn targets_of(&self, frame: u32, source: u32) -> Vec<u32> {
+        let mut v: Vec<u32> = self.file(frame).into_iter().flat_map(|f| f.targets().get(&source).into_iter().flatten().copied()).collect();
+        v.sort_unstable();
+        v.dedup();
+        v
+    }
+}
+
+/// A level's recorded graph up to a horizon, mapped: its edge files and the
+/// global transfer table.
+pub struct EdgeStore<N: Rem = P8> {
+    files: EdgeFiles,
     xfers: Vec<N::Pair>,
     pub edges: u64,
     pub(crate) bytes: u64,
@@ -368,23 +416,18 @@ pub struct EdgeStore<N: Rem = P8> {
 impl<N: Rem> EdgeStore<N> {
     /// Map frames `1..=horizon`'s edge files under `dir` (`<level>/edges`).
     pub fn open(dir: &Path, horizon: u32) -> Result<Self> {
-        let mut frames: Vec<Option<EdgeFile>> = vec![None];
+        let files = EdgeFiles::open(dir, horizon)?;
         let (mut edges, mut bytes) = (0u64, 0u64);
-        for f in 1..=horizon {
-            let p = file_path(dir, f);
-            let file = if p.exists() { Some(EdgeFile::open(&p, f)?) } else { None };
-            if let Some(file) = &file {
-                edges += file.head.segs.iter().map(|s| s.edges).sum::<u64>();
-                bytes += file.file.len();
-            }
-            frames.push(file);
+        for file in files.frames.iter().flatten() {
+            edges += file.head.segs.iter().map(|s| s.edges).sum::<u64>();
+            bytes += file.file.len();
         }
         let xfers = XferTable::<N>::load_pairs(dir)?;
-        Ok(EdgeStore { frames, xfers, edges, bytes })
+        Ok(EdgeStore { files, xfers, edges, bytes })
     }
 
     fn file(&self, frame: u32) -> Option<&EdgeFile> {
-        self.frames.get(frame as usize).and_then(|x| x.as_ref())
+        self.files.file(frame)
     }
 
     pub fn pair(&self, xfer: u32) -> Option<N::Pair> {
@@ -402,7 +445,7 @@ impl<N: Rem> EdgeStore<N> {
     /// Per target region the first frame with edges into it.
     pub(crate) fn first_frames(&self) -> FxHashMap<u32, u32> {
         let mut m: FxHashMap<u32, u32> = FxHashMap::default();
-        for (f, file) in self.frames.iter().enumerate().rev() {
+        for (f, file) in self.files.frames.iter().enumerate().rev() {
             for h in file.iter().flat_map(|x| &x.head.segs) {
                 m.insert(h.region, f as u32);
             }
@@ -420,7 +463,7 @@ impl<N: Rem> EdgeStore<N> {
     }
 
     pub(crate) fn segments(&self, frame: u32, region: u32) -> Vec<SegRef<'_>> {
-        self.file(frame).into_iter().flat_map(|f| f.segs_of(region).iter().map(move |h| f.seg(h))).collect()
+        self.files.segments(frame, region)
     }
 
     /// Every segment of frame `frame`, by region.
@@ -433,10 +476,7 @@ impl<N: Rem> EdgeStore<N> {
     /// The target regions holding edges that leave source region `source`
     /// at frame `frame` (the out-edge lookup), sorted, distinct.
     pub(crate) fn targets_of(&self, frame: u32, source: u32) -> Vec<u32> {
-        let mut v: Vec<u32> = self.file(frame).into_iter().flat_map(|f| f.targets().get(&source).into_iter().flatten().copied()).collect();
-        v.sort_unstable();
-        v.dedup();
-        v
+        self.files.targets_of(frame, source)
     }
 
     /// Every edge of frame `frame`, each segment's folded into an
@@ -501,7 +541,7 @@ impl<N: Rem> EdgeStore<N> {
 }
 
 /// THE TREE'S ONE TRUST MARKER (`<level>/edges/done.txt`): the last frame
-/// whose files are all complete - its frame, edge and out files, all
+/// whose files are all complete - its frame and edge files, both
 /// written before it - and the transfer table's trusted
 /// length. A frame past it is a killed run's (`resume` discards it).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

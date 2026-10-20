@@ -63,6 +63,7 @@ impl AxisXfer {
     /// As the pushes and pulls read it: a ROTATION by `val` as the
     /// translation it is on the guard (the guard is one floor's: its image
     /// never wraps - checked, FATAL otherwise), or the constant point.
+    #[inline]
     pub(crate) fn transfer(&self) -> Transfer {
         let guard = Seg { lo: self.lo, hi: self.hi };
         let act = match self.tag {

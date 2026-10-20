@@ -44,7 +44,7 @@ celeste-rust (src/)
   frame.rs              the forward (ForwardState: start, resume, extend),
                         trees (grow_tree, TreeFilter), wins, MarkFilter
   storage/              the visited set, the wave, the region phase, the
-                        frame/hull/edge/out files (one container: file;
+                        frame/hull/edge files (one container: file;
                         their varints and keys: codec), decode, bench
   search/               driver (the search's levels, each level's arc
                         phase), backward (W, the optimum), reach (inside W;
@@ -251,9 +251,12 @@ pushes into one target accumulate order-free (`HullAcc`: two charts per
 axis, cut at 0 and 1/2, merged by min/max). The frontier of frame t is
 every state whose hull GREW at t: NEW states run the kernels (the only
 expansion a state ever gets; its edges are recorded at its layer + 1);
-GROWN ones re-push their grown hull along their stored out-edges
-(`wave::run_repush`, only where the image grows). Level -1 acts at every
-push. A full hull is not stored and grows no more.
+GROWN ones re-push their grown hull along their recorded edges
+(`wave::run_repush`, only where the image grows), read by TARGET: a re-push
+unit is whole segments of the edge file of the state's layer + 1, their
+records looked up by source (the file's source index names the target
+regions to read).
+Level -1 acts at every push. A full hull is not stored and grows no more.
 
 Sound by induction: a concrete path at state p with remainder r at frame t
 finds p in the tree with layer <= t and r in its hull, and its successor
@@ -284,8 +287,8 @@ wave.
 - per emission the unit's sink drops level -1's rows, keys the row and ORs
   it into a BUNDLE (source key, transfer, offset, target key -> target
   cells) keyed by the target's ROUTE (shape, region slot);
-- a unit ends as per-route CHUNKS with their pushes, and an OUT block,
-  spooled (`storage::scratch`). Re-push units make pushes only;
+- a unit ends as per-route CHUNKS with their pushes. Re-push units make
+  pushes only;
 - a finished slice is GATHERED: the transfers first met in it get their
   final ids (by content, after every earlier slice's: a function of the
   frame); its chunks become REGION JOBS (`route::run_route`): the pushes
@@ -299,7 +302,7 @@ ladder's filter applied, everything merged into the visited set
 (`absorb`). Then the FRAME FILE (`frames/f{F}.bin`, one a frame: per
 region the new entries' keys, masks and win masks; the frame's FRONTIER -
 the new states' hulls, the grown states with their layers and hulls; the
-shapes' skeletons), the edge and out files, and last `done.txt`. The frame
+shapes' skeletons), the edge file, and last `done.txt`. The frame
 file is read back and compared with the forward's state (fatal on a
 difference). The DECODE GUARD checks a shape's first emitted row per
 worker and wave against its decode.

@@ -1,4 +1,4 @@
-//! THE TREE FILES' ONE CONTAINER (frame, edge and out files; value
+//! THE TREE FILES' ONE CONTAINER (frame and edge files; value
 //! files: the marks): a 4-byte magic (the file's kind, in
 //! its arithmetic: `magic`), a u32 version (`FORMAT_VERSION`; the edge
 //! files' their own), the header's length (u64; both little-endian), the

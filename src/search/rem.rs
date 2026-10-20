@@ -110,6 +110,7 @@ impl Rem for P8 {
         };
         Ok((axis(x, "x")?, axis(y, "y")?))
     }
+    #[inline]
     fn xfer(p: &Pair) -> (Transfer, Transfer) {
         (p.0.transfer(), p.1.transfer())
     }
@@ -143,6 +144,7 @@ impl Rem for LuaF64 {
         let axis = |c: &Capture<LuaF64>, name: &str| rem_f64::decode_axis(c).map_err(|e| format!("axis {name} ({c:?}): {e}"));
         Ok((axis(x, "x")?, axis(y, "y")?))
     }
+    #[inline]
     fn xfer(p: &rem_f64::Pair) -> Xfer<LuaF64> {
         (p.0.transfer(), p.1.transfer())
     }

@@ -531,8 +531,8 @@ pub struct ForwardState<N: Rem = P8> {
     /// Every state reached so far, with its layer and hull.
     visited: crate::storage::visited::VisitedSet<N>,
     xfers: crate::storage::edges::XferTable<N>,
-    /// The out-edge files (the re-pushes read them; shared by a copy).
-    outs: std::sync::Arc<crate::storage::out::OutStore>,
+    /// The edge files (the re-pushes read their in-edges; shared by a copy).
+    edges: std::sync::Arc<crate::storage::edges::EdgeFiles>,
     /// The shapes' skeletons the emissions register (the next layers';
     /// shared by a copy), and the shapes whose skeleton a frame file holds.
     skeletons: std::sync::Arc<crate::storage::decode::Skeletons<N>>,
@@ -596,8 +596,7 @@ impl<N: Rem> ForwardState<N> {
         let won = !seeded.wins.is_empty();
         let edges_dir = dir.join("edges");
         crate::storage::edges::set_done(&edges_dir, 0, 0)?;
-        let outs = std::sync::Arc::new(crate::storage::out::OutStore::open(&edges_dir, 0)?);
-        Ok(ForwardState { frontier: seeded.frontier(), visited, xfers: Default::default(), outs, skeletons: Default::default(), persisted: Default::default(), frames: 0, win_frame: won.then_some(0), filter: Some(filter) })
+        Ok(ForwardState { frontier: seeded.frontier(), visited, xfers: Default::default(), edges: Default::default(), skeletons: Default::default(), persisted: Default::default(), frames: 0, win_frame: won.then_some(0), filter: Some(filter) })
     }
 
     /// The forward as its checkpoint tree left it (`None`: no tree); extending
@@ -644,8 +643,8 @@ impl<N: Rem> ForwardState<N> {
         let (visited, win_frame, frontier, skeletons) = restore_visited::<N>(dir, last, s.room, s.threads())?;
         let persisted = skeletons.shapes().into_iter().collect();
         let xfers = crate::storage::edges::XferTable::<N>::load(&edges_dir)?;
-        let outs = std::sync::Arc::new(crate::storage::out::OutStore::open(&edges_dir, last)?);
-        Ok(ForwardState { frontier, visited, xfers, outs, skeletons: std::sync::Arc::new(skeletons), persisted, frames: last, win_frame, filter })
+        let edges = std::sync::Arc::new(crate::storage::edges::EdgeFiles::open(&edges_dir, last)?);
+        Ok(ForwardState { frontier, visited, xfers, edges, skeletons: std::sync::Arc::new(skeletons), persisted, frames: last, win_frame, filter })
     }
 
     pub fn visited_len(&self) -> usize {
@@ -691,7 +690,7 @@ impl<N: Rem> ForwardState<N> {
             filters: Filters { marks, minus_one },
             frame,
             edges_dir,
-            outs: Some(&self.outs),
+            edges: Some(&self.edges),
             skeletons: &self.skeletons,
             ceiling,
         };
@@ -728,7 +727,7 @@ impl<N: Rem> ForwardState<N> {
             let frame = self.frames;
             // The frame's LAST write: every file above is trusted from here.
             crate::storage::edges::set_done(&edges_dir, frame, self.xfers.pairs.len())?;
-            std::sync::Arc::get_mut(&mut self.outs).ok_or_else(|| anyhow::anyhow!("the forward's out store is shared"))?.add_frame(&edges_dir, frame)?;
+            std::sync::Arc::get_mut(&mut self.edges).ok_or_else(|| anyhow::anyhow!("the forward's edge files are shared"))?.add_frame(&edges_dir, frame)?;
             log_frame(dir, frame, &stats)?;
             ensure_disk_space(dir, &mut last_free)?;
             if !won_before && self.win_frame.is_some() {
@@ -1183,7 +1182,7 @@ mod tests {
         let (routes, skeletons) = (crate::storage::route::Routes::default(), crate::storage::decode::Skeletons::default());
         let prov = celeste_engine::exact::Provisional::default();
         let (base, xtab) = (crate::storage::edges::XferTable::default(), Default::default());
-        let mut sink = crate::storage::unit::UnitSink::new(&visited, &routes, &skeletons, &prov, Filters::default(), 1, level, 0, &base, &xtab, false, s);
+        let mut sink = crate::storage::unit::UnitSink::new(&visited, &routes, &skeletons, &prov, Filters::default(), 1, level, 0, &base, &xtab, s);
         sink.begin(0);
         let si = sink.push_source(0, (0, 0));
         sink.push_lane(si, cells[0], Hull::full());

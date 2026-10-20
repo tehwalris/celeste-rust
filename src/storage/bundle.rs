@@ -108,15 +108,6 @@ pub(crate) fn shift(m: u64, k: i32) -> u64 {
     }
 }
 
-/// The SOURCE cells of target cells `mask` (not empty) of slot `t_slot` at
-/// offset code `o`, all in slot `s_slot`'s region: the shifted mask and the
-/// shift. `None` when one leaves it: no bundle of a source there holds it.
-#[inline]
-pub(crate) fn source_cells(t_slot: u32, s_slot: u32, o: u32, mask: u64) -> Option<(u64, i32)> {
-    let (inside, k) = shift_into(t_slot, s_slot, o)?;
-    (mask & !inside == 0).then(|| (shift(mask, k), k))
-}
-
 /// An offset in a block: `(dx + 8) << 4 | (dy + 8)` for |d| <= 7 (never 0),
 /// else 0 and the code as a varint.
 #[inline]
@@ -559,11 +550,11 @@ mod tests {
         assert_eq!(b.len(), 1, "a near offset is one byte");
     }
 
-    /// `source_cells` is `source_cell` cell by cell: every cell of a mask
-    /// shifted to its source when all of them stay in the source region,
-    /// `None` otherwise.
+    /// `shift_into` and `shift` are `source_cell` cell by cell: every cell
+    /// of a mask shifted to its source when all of them stay in the source
+    /// region (the cells `shift_into` names), refused otherwise.
     #[test]
-    fn source_cells_shift_the_grid() {
+    fn shift_into_shifts_the_grid() {
         let geo = super::super::GEOMETRY;
         let mut v = 11u64;
         let (mut some, mut none) = (0, 0);
@@ -585,7 +576,7 @@ mod tests {
                 let (slot, local) = geo.slot_local(source_cell(geo.cell(t_slot, c), o));
                 (slot == s_slot).then_some(m | 1u64 << local)
             });
-            match source_cells(t_slot, s_slot, o, mask) {
+            match shift_into(t_slot, s_slot, o).filter(|&(inside, _)| mask & !inside == 0).map(|(_, k)| (shift(mask, k), k)) {
                 Some((src, k)) => {
                     assert_eq!(Some(src), each, "slots {t_slot} {s_slot} offset ({dx}, {dy}) mask {mask:x}");
                     for c in (0..64u32).filter(|&c| mask >> c & 1 != 0) {

@@ -83,8 +83,8 @@ frame.emissions 2200600
 frame.kept 92821
 frame.lanes_in 85482
 frame.routes 54
-frame.slices 1
-frame.units 117
+frame.slices 2
+frame.units 226
 k.kernel_ke4d3815b187e1430_17.dyn_insts 1426368
 k.kernel_ke4d3815b187e1430_17.fused_nodes 2253
 k.kernel_ke4d3815b187e1430_17.insts 9384

@@ -104,6 +104,7 @@ impl Axis {
     }
 
     /// As the pushes and pulls read it (`Rem::xfer`).
+    #[inline]
     pub(crate) fn transfer(&self) -> Transfer<Doubles> {
         let act = match self.tag {
             MONO => Act::Mono(Shift { ox: self.a, k: self.k }),

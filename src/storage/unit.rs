@@ -379,15 +379,6 @@ impl<'a, N: Rem> Xfers<'a, N> {
             None => N::xfer(&self.base.pairs[x as usize]),
         }
     }
-
-    /// Transfer `x`'s pair (`tab`: the worker's table, read).
-    #[inline]
-    fn pair(&self, tab: &[N::Pair], x: u32) -> N::Pair {
-        match x.checked_sub(self.first_new) {
-            Some(l) => tab[l as usize],
-            None => self.base.pairs[x as usize],
-        }
-    }
 }
 
 /// This worker's ROUTES (and their slots), and the last one asked.
@@ -555,12 +546,13 @@ impl<N: Rem> Pusher<N> {
                     }
                 }
             });
-            let xfer = xfers.get(b.x);
+            // The bundle's transfer, read at the first push the cache misses.
+            let mut xfer = None;
             for &(lane, c) in &edges {
                 let h = src.hulls[lane as usize];
                 let pushed = self.cache.get(&h, &h, b.x, || {
                     let mut a = AccOf::<N>::default();
-                    h.push(&xfer, &mut a).then_some(a)
+                    h.push(xfer.get_or_insert_with(|| xfers.get(b.x)), &mut a).then_some(a)
                 });
                 if let Some(a) = pushed {
                     slots[at(c as u32)].merge(&a);
@@ -588,16 +580,6 @@ impl<N: Rem> Pusher<N> {
     }
 }
 
-/// OUT-EDGES (`storage::out`), recorded with `record`: the last unit's
-/// blocks (raw, and whether a target key is provisional), the parts they
-/// are made of, the unit's transfers' ranks by pair.
-struct Outs<N: Rem> {
-    record: bool,
-    blocks: Vec<(Vec<u8>, bool)>,
-    parts: super::out::Parts<N>,
-    x_rank: FxHashMap<u32, u32>,
-}
-
 pub struct UnitSink<'a, N: Rem = P8> {
     keys: &'a KeySpace<N>,
     skeletons: &'a Skeletons<N>,
@@ -615,7 +597,6 @@ pub struct UnitSink<'a, N: Rem = P8> {
     drops: Drops,
     verdicts: Verdicts<'a, N>,
     guards: Guards<N>,
-    outs: Outs<N>,
     /// The unit's bundles by route, and its (route, source region) pairs
     /// (`src_seen`: the ones met, direct mapped, `pair + 1`).
     bundles: UnitBundles,
@@ -639,7 +620,6 @@ impl<'a, N: Rem> UnitSink<'a, N> {
         worker: u32,
         base: &'a super::edges::XferTable<N>,
         xfer_tab: &'a std::sync::RwLock<Vec<N::Pair>>,
-        record_out: bool,
         s: &crate::settings::Settings,
     ) -> Self {
         UnitSink {
@@ -657,7 +637,6 @@ impl<'a, N: Rem> UnitSink<'a, N> {
             drops: Drops { l1: filters.minus_one.map(|m| (m.table(s), m.h)), last: None },
             verdicts: Verdicts { marks: filters.marks, of: Default::default(), bufs: Vec::new(), at: Vec::new(), disallowed: false },
             guards: Guards { key_check: s.diag.key_check, check: Vec::new(), noted: Default::default(), registered: Default::default(), guarded: Default::default(), reference: false, last_shape: 0 },
-            outs: Outs { record: record_out, blocks: Vec::new(), parts: Default::default(), x_rank: Default::default() },
             bundles: UnitBundles::default(),
             src_regions: Vec::new(),
             src_seen: Vec::new(),
@@ -752,11 +731,6 @@ impl<'a, N: Rem> UnitSink<'a, N> {
     #[inline]
     pub(crate) fn route(&mut self, shape: u64, slot: u32) -> u32 {
         self.routes.id(shape, slot)
-    }
-
-    /// The last unit's out blocks (raw, and whether a target key is provisional).
-    pub(crate) fn take_out_blocks(&mut self) -> Vec<(Vec<u8>, bool)> {
-        std::mem::take(&mut self.outs.blocks)
     }
 
     /// The buffer of `shape` in `bufs` (made over `init()`'s skeleton).
@@ -995,9 +969,6 @@ impl<'a, N: Rem> UnitSink<'a, N> {
         let sources: std::sync::Arc<[(u32, Key)]> = self.src.unit_sources.as_slice().into();
         let mut buckets = buckets;
         buckets.sort_unstable_by_key(|b| b.0);
-        if self.outs.record {
-            self.out_parts_of(&buckets);
-        }
         let mut at = 0usize;
         for (route, targets, bundles) in buckets {
             let mut src_regions = Vec::new();
@@ -1013,12 +984,6 @@ impl<'a, N: Rem> UnitSink<'a, N> {
             let (_, slot) = self.routes.slot(route);
             let pushes = self.pusher.pushes(&self.src, &self.xfers, self.unit, slot, &targets, &bundles);
             self.outbox.push(Chunk { route, unit: self.unit, worker: self.worker, targets, pushes, sources: sources.clone(), bundles, src_regions });
-        }
-        if self.outs.record && !self.outs.parts.rows.is_empty() {
-            self.outs.blocks = super::out::encode_blocks(&mut self.outs.parts);
-            if self.outs.parts.rows.capacity() > 1 << 20 {
-                self.outs.parts = Default::default();
-            }
         }
         self.stats.tick(super::stats::S::PhUnitEnd, t);
         Ok(())
@@ -1044,64 +1009,5 @@ impl<'a, N: Rem> UnitSink<'a, N> {
             c.pushes.extend(super::layer::bits(cells).zip(run).map(|(cell, h)| (lt, cell as u8, *h)));
         }
         self.outbox.append(&mut chunks);
-    }
-
-    /// The unit's bundles as its OUT-EDGE block's parts (`storage::out`),
-    /// each bundle's cells split by the source ENTRY they leave.
-    #[inline(never)]
-    fn out_parts_of(&mut self, buckets: &[(u32, Vec<(Key, u64)>, Vec<super::route::Ub>)]) {
-        let mut p = std::mem::take(&mut self.outs.parts);
-        p.clear();
-        // Routes, pairs, targets: sorted, and each one's rank.
-        let keys: Vec<(u64, u32)> = buckets.iter().map(|b| self.routes.slot(b.0)).collect();
-        p.routes = keys.clone();
-        p.routes.sort_unstable();
-        p.routes.dedup();
-        // The distinct transfers (in `x_rank`), by pair: each one's rank.
-        let tab = self.xfers.tab.read().expect("a transfer table");
-        let x_rank = &mut self.outs.x_rank;
-        x_rank.clear();
-        let mut by_pair: Vec<(N::Pair, u32)> = Vec::new();
-        for u in buckets.iter().flat_map(|b| &b.2) {
-            if let std::collections::hash_map::Entry::Vacant(v) = x_rank.entry(u.x) {
-                v.insert(0);
-                by_pair.push((self.xfers.pair(&tab, u.x), u.x));
-            }
-        }
-        drop(tab);
-        by_pair.sort_unstable();
-        for (rank, &(_, x)) in by_pair.iter().enumerate() {
-            x_rank.insert(x, rank as u32);
-        }
-        p.pairs = by_pair.into_iter().map(|x| x.0).collect();
-        let mut ts: Vec<((u32, Key), u32, u32)> = Vec::new();
-        for (bi, (b, k)) in buckets.iter().zip(&keys).enumerate() {
-            let r = p.routes.binary_search(k).expect("a route of the unit") as u32;
-            ts.extend(b.1.iter().enumerate().map(|(t, x)| ((r, x.0), bi as u32, t as u32)));
-        }
-        ts.sort_unstable();
-        let mut t_rank: Vec<Vec<u32>> = buckets.iter().map(|b| vec![0; b.1.len()]).collect();
-        for (rank, &(target, bi, t)) in ts.iter().enumerate() {
-            p.targets.push(target);
-            t_rank[bi as usize][t as usize] = rank as u32;
-        }
-        // Entries: the unit's, in order (its frontier's: by region and key).
-        p.entries = self.src.srcs.clone();
-        for (bi, b) in buckets.iter().enumerate() {
-            let slot = keys[bi].1;
-            for u in &b.2 {
-                let (t, x) = (t_rank[bi][u.t as usize], x_rank[&u.x]);
-                // The cells by source entry (one, mostly).
-                let mut parts: [(u32, u64); 4] = [(u32::MAX, 0); 4];
-                self.src.by_entry(self.unit, slot, u, |e, part, _| {
-                    let k = parts.iter().position(|q| q.0 == e || q.0 == u32::MAX).expect("a target region's cells leave at most four source regions");
-                    parts[k] = (e, parts[k].1 | part);
-                });
-                for &(e, mask) in parts.iter().take_while(|q| q.0 != u32::MAX) {
-                    p.rows.push((super::out::row_key(e, t, x, u.o), mask));
-                }
-            }
-        }
-        self.outs.parts = p;
     }
 }
