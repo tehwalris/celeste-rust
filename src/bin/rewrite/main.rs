@@ -174,11 +174,18 @@ enum Command {
     ///
     /// Its level, its objects in creation order (the original cart's:
     /// tile, tile position, type, whether the minimal cart has it, whether a
-    /// TAS file's `[seeds]` list runs over it), and what `--category`
-    /// means: whether a win needs the berry (`hundred`), which dash starts
-    /// are forbidden (`nodiag`, `onlydiag`), one dash past the orb
-    /// (`gemskip`).
+    /// TAS file's `[seeds]` list runs over it), what `--category` means:
+    /// whether a win needs the berry (`hundred`), which dash starts are
+    /// forbidden (`nodiag`, `onlydiag`), one dash past the orb (`gemskip`).
     Room,
+    /// A WITNESS as the tools need it (`concrete::witness`), as JSON on
+    /// stdout: `--inputs` replayed on the reference engine (the minimal
+    /// cart) from the room's start, its balloons and chests seeded by
+    /// `--balloon-seeds` as the TAS tools seed them: the frame it leaves
+    /// the room (`exit`), the inputs with the jump bit kept only where a
+    /// jump fires (`canonical`), and in a 100% category the chest seed
+    /// lists to try (`chest_seed_variants`).
+    Witness(run::WitnessArgs),
     /// The start states real play can enter the room with, as JSON on stdout.
     ///
     /// Every loading-frame J a play of the previous room can give, the J's
@@ -501,6 +508,7 @@ fn main() -> Result<()> {
             }
         }
         Command::Run(a) => run::run(&cfg, a),
+        Command::Witness(a) => run::witness(&cfg, a),
         Command::Ckhash(a) => diag::ckhash(&cfg, a),
         Command::Check(c) => check::run(&cfg, c),
         Command::Bench(c) => bench::run(&cfg, c),

@@ -34,7 +34,7 @@ e = tasdb.entry(a.cat, a.name)
 if not e:
     sys.exit(f"align_tas: no {a.cat} database entry {a.name}")
 tas = [0] * a.prologue + tasdb.parse(open(tasdb.path(a.cat, e)).read())[1]
-ours = [int(x) for line in open(os.path.join(ROOT, a.ours)) if not line.startswith("#") for x in line.strip().split(",") if x]
+ours = tasdb.ours(open(os.path.join(ROOT, a.ours)).read(), a.ours)
 
 
 def run(seq):

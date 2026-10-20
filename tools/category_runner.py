@@ -43,7 +43,6 @@ Results: one JSON line per job in OUTDIR/results.jsonl.
 import argparse
 import json
 import os
-import re
 import shutil
 import subprocess
 import sys
@@ -73,33 +72,6 @@ def replay_exit(room, inputs, seeds, cat, jank=None):
     changes during (None: never), and the frames."""
     fs = pico8.replay(rooms.parse(room), inputs, len(inputs) + 3, seeds, cat, jank)
     return pico8.exit_frame(fs, rooms.parse(room)), fs
-
-
-def chest_seed_variants(room, seeds, binary):
-    """The seed list with each chest's entry replaced by every class of
-    draws: a chest's berry appears at x = start + s, s in [-1, 2), and only
-    which side of a pixel it lies on matters to a whole-pixel player
-    (`rooms.seed_slots`: the objects the list runs over)."""
-    slots = rooms.seed_slots(rooms.parse(room), binary)
-    vals = list(seeds) + ["0"] * (len(slots) - len(seeds))
-    return [vals[:i] + [s] + vals[i + 1:] for i, kind in enumerate(slots) if kind == "chest" for s in ["-1", "-0.5", "0", "0.5", "1", "1.5"] if vals[i] != s]
-
-
-def canon_jumps(room, inputs, seeds, cat, jank=None):
-    """Keep the jump bit only where a jump FIRES in the minimal cart (the
-    search's model). The original cart buffers a press for 4 frames (jbuffer),
-    so a press that does nothing in the minimal cart - one copied from a
-    community TAS by --prefer - can fire later there. With every press firing
-    at once, the buffer never holds one: the same route in both carts. The
-    minimal cart is replayed under the file's balloon seeds (without them a
-    balloon room's run diverges and keeps a press)."""
-    spd_y = {fr.f: fr.spd_y for fr in pico8.replay(rooms.parse(room), inputs, len(inputs) + 1, seeds, cat, jank, original=False)}
-    canon, prev = [], 0
-    for i, b in enumerate(inputs):
-        fired = b & 16 and not prev & 16 and spd_y.get(i + 1) == "0xfffe.0000"
-        canon.append((b & ~16) | (16 if fired else 0))
-        prev = b
-    return canon
 
 
 def run(job, outdir, binary):
@@ -190,7 +162,7 @@ def run(job, outdir, binary):
 
     drop_tree = lambda: None if keep else release_tree()
     if job.get("witness"):
-        ours = [int(x) for x in re.findall(r"\d+", "".join(l for l in open(job["witness"]) if not l.startswith("#")))]
+        ours = tasdb.ours(open(job["witness"]).read(), job["witness"])
         opt, res["witness_from"] = len(ours), job["witness"]
     else:
         opt = None
@@ -228,13 +200,15 @@ def run(job, outdir, binary):
     # The search steps a chest's last shake as every draw (`rnd` is an
     # interval; only the balloons are seeded), so its witness may take the
     # berry where the file's chest seed does not put it: then the other
-    # chest seeds are tried, and the upload carries the one that works.
-    for sd in [seeds] + (chest_seed_variants(room, seeds, binary) if hundred else []):
+    # chest seeds are tried (`rewrite witness`'s, in a 100% category), and
+    # the upload carries the one that works.
+    for sd in [seeds] + rooms.witness(rooms.parse(room), ours, seeds, cat, jank, binary)["chest_seed_variants"]:
         mine, (e, fs) = ours, replay_exit(room, ours, sd, cat, jank)
         if e != opt:
             # A jump press that does nothing in the minimal cart can fire later in
-            # the original (its jump buffer): keep only the presses that fire.
-            canon = canon_jumps(room, ours, sd, cat, jank)
+            # the original (its jump buffer): keep only the presses that fire
+            # (`rewrite witness`).
+            canon = rooms.witness(rooms.parse(room), ours, sd, cat, jank, binary)["canonical"]
             e2, fs2 = replay_exit(room, canon, sd, cat, jank)
             res["jump_canonicalized"] = f"original cart exit {e} -> {e2}"
             if e2 == opt:

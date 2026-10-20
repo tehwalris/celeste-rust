@@ -96,8 +96,12 @@ pub fn sources(s: &crate::settings::Settings) -> Result<String> {
     if let Some(seeds) = &s.balloon_seeds {
         game = fix_balloon_seeds(&game, seeds, s.room)?;
     }
-    if let crate::settings::Arith::Float(tool) = s.arith {
-        game = tool_seeds(&game, s.balloon_seeds.as_deref(), tool, s.room, s.loading_jank.is_some())?;
+    match s.arith {
+        crate::settings::Arith::Float(tool) => game = tool_seeds(&game, s.balloon_seeds.as_deref(), tool, s.room, s.loading_jank.is_some())?,
+        // A tool file's chests in 16.16 (`Settings::seed_chests`): UCT's
+        // seeds (the balloons are `fix_balloon_seeds`'s).
+        crate::settings::Arith::Fixed if s.seed_chests => game = tool_seeds(&game, s.balloon_seeds.as_deref(), crate::settings::FloatTool::Uct, s.room, false)?,
+        crate::settings::Arith::Fixed => {}
     }
     Ok(format!("{BUILTIN_LEVEL_3}\n{BUILTIN_LEVEL_4}\n{game}\n"))
 }

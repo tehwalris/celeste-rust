@@ -8,7 +8,8 @@ from . import REWRITE, ROOT
 
 
 def room_of(level):
-    """The cart's level (1-based, `TAS<level>.tas`) -> its room (x, y)."""
+    """The tasdatabase's level (1-based, `TAS<level>.tas`: the cart's
+    `level_index() + 1`, `rewrite room`'s `level`) -> its room (x, y)."""
     return ((level - 1) % 8, (level - 1) // 8)
 
 
@@ -51,6 +52,17 @@ def rules(cat, binary=REWRITE):
 def seed_slots(room, binary=REWRITE):
     """The kinds (`balloon`, `chest`) a `[seeds]` list runs over, in order."""
     return [o["kind"] for o in objects(room, binary) if o["seeded"]]
+
+
+def witness(room, inputs, seeds, cat, jank, binary=REWRITE):
+    """`rewrite witness`: `inputs` (from the room's load) replayed on the
+    minimal cart under the `[seeds]` list `seeds` (balloons and chests, as
+    the tools seed them) from the loading frame of object `jank`: {exit,
+    canonical (the jump bit kept only where a jump fires),
+    chest_seed_variants (the seed lists to try where the berry is the
+    win's)}."""
+    return _ask(["witness", "--room", text(room), "--category", cat, "--loading-jank", str(jank) if jank else "none",
+                 f"--balloon-seeds={','.join(seeds) or '0'}", "--inputs", ",".join(map(str, inputs))], binary)
 
 
 def starts(room, flags, binary=REWRITE):

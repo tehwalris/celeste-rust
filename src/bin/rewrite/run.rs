@@ -61,6 +61,21 @@ pub fn run(cfg: &Settings, a: Args) -> Result<()> {
     Ok(())
 }
 
+#[derive(clap::Args)]
+pub struct WitnessArgs {
+    /// The witness: comma-separated input bytes, or a `tas/` file, from the
+    /// room's load.
+    #[arg(long)]
+    inputs: String,
+}
+
+/// `witness`: `concrete::witness` of the inputs, as JSON on stdout.
+pub fn witness(cfg: &Settings, a: WitnessArgs) -> Result<()> {
+    let inputs = celeste_rust::concrete::read_inputs(&a.inputs)?;
+    println!("{}", serde_json::to_string(&celeste_rust::concrete::witness(&inputs, cfg)?)?);
+    Ok(())
+}
+
 /// The object types `--dump-start` names (pico8_diff/replay.py TYPES).
 const TYPES: &[&str] = &["player", "player_spawn", "spring", "balloon", "fall_floor", "smoke", "fruit", "fly_fruit", "lifeup", "fake_wall", "key", "chest", "platform", "message", "big_chest", "orb", "flag", "room_title"];
 

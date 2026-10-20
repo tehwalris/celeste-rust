@@ -355,10 +355,9 @@ mod tests {
         use crate::engines::reference::RefEngine;
         let category = cat.parse().map_err(|e| anyhow!("{}: {e}", path.display()))?;
         let text = std::fs::read_to_string(path).with_context(|| path.display().to_string())?;
-        let (seeds, body) = text.trim().strip_prefix('[').and_then(|t| t.split_once(']')).ok_or_else(|| anyhow!("{}: not [seeds]inputs", path.display()))?;
-        let inputs: Vec<u8> = body.split(',').map(|v| v.trim().parse()).collect::<Result<_, _>>()?;
-        let room = ((level - 1) % 8, (level - 1) / 8);
-        let s = crate::settings::Settings { room, category, balloon_seeds: Some(seeds.to_string()), ..Default::default() };
+        let (Some(seeds), inputs) = crate::concrete::parse_tas(&text)? else { bail!("{}: not [seeds]inputs", path.display()) };
+        let room = crate::game_runner::room_of_level(level);
+        let s = crate::settings::Settings { room, category, balloon_seeds: Some(seeds.join(",")), ..Default::default() };
         let mut eng = RefEngine::new(&s)?;
         let mut sts = vec![eng.start_state().clone()];
         let at = |st: &State<RefDomain>| (iface::get(st, &[iface::key("room"), iface::key("x")]), iface::get(st, &[iface::key("room"), iface::key("y")]));

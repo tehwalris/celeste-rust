@@ -20,11 +20,8 @@ import sys
 import tempfile
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-
-
-def read_inputs(path):
-    text = "".join(l for l in open(path) if not l.startswith("#"))
-    return [int(x) for x in re.split(r"[,\s]+", text.strip()) if x]
+sys.path.insert(0, os.path.join(ROOT, "tools"))
+from celeste import tasdb  # noqa: E402
 
 
 def hexbytes(path, n):
@@ -386,7 +383,7 @@ def main():
     if args.inputs:
         inputs = [int(x) for x in args.inputs.split(",")]
     elif args.tas:
-        inputs = read_inputs(args.tas)
+        inputs = tasdb.ours(open(args.tas).read(), args.tas)
     else:
         ap.error("a witness file or --inputs is required")
     room = tuple(int(v) for v in args.room.split(",")) if args.room else None

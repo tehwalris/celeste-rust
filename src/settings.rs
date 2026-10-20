@@ -176,6 +176,13 @@ pub struct Settings {
     /// balloons, level) is still refused. A tree without a record is refused.
     #[arg(long, global = true)]
     pub override_settings: bool,
+    /// The start room's CHESTS seeded by `--balloon-seeds` too, in 16.16,
+    /// as the TAS tools seed them (each one's last shake draws its seed + 1:
+    /// `trace::cart::tool_seeds`): a tool file replayed as the tools play it
+    /// (`concrete::witness`). Not a flag, and never a tree's (`write`
+    /// refuses it).
+    #[arg(skip)]
+    pub seed_chests: bool,
     #[command(flatten)]
     pub diag: Diagnostics,
 }
@@ -374,6 +381,7 @@ impl Settings {
 
     /// Record these, for a tree widened at `level`, as the tree's (atomic).
     pub fn write(&self, dir: &Path, level: crate::abstraction::Level) -> Result<()> {
+        anyhow::ensure!(!self.seed_chests, "{}: a tree is never searched with its chests seeded (a witness replay's setting)", dir.display());
         std::fs::create_dir_all(dir)?;
         let tmp = dir.join("settings.tmp");
         std::fs::write(&tmp, self.text(&level.to_string()))?;
