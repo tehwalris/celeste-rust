@@ -213,7 +213,8 @@ impl<A: GraphArith> MayErr<'_, '_, A> {
 
 /// `Symbolic::evaluated`'s conditions, rewritten by `three_valued`.
 pub(super) fn three_valued_evaluated<A: GraphArith>(d: &mut Symbolic<A>, outs: &[FrameOut<A>]) {
-    let roots: Vec<NodeId> = outs.iter().flat_map(|o| o.roots(false)).collect();
+    // The stored fields, guards and errors (not the transfer roots).
+    let roots: Vec<NodeId> = outs.iter().flat_map(|o| o.fields.iter().map(|f| f.1).chain([o.guard, o.error])).collect();
     let mut done: rustc_hash::FxHashSet<NodeId> = Default::default();
     let mut todo = d.graph.cone(&roots);
     while !todo.is_empty() {

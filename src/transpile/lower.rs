@@ -9,7 +9,7 @@ use celeste_core::arith::Fixed;
 
 use super::garith::GraphArith;
 use super::graph::{Graph, NodeId, Op};
-use super::kernel::{Emit, OutFields};
+use super::kernel::{Body, Emit, OutFields, Roots};
 
 pub(crate) const BUILD_PHASES: [&str; 9] = [
     "fixpoint trace",
@@ -45,21 +45,11 @@ pub(crate) fn build_profile() -> String {
         .join(", ")
 }
 
-/// One output shape: the cells it writes, which lanes reach it (`live`) and
-/// on which of those its row is undefined (`error`).
+/// One output shape: the cells it writes, and what it computes.
 pub(crate) struct Outcome<A: GraphArith = Fixed> {
     pub(crate) of: OutFields<A>,
-    pub(crate) error: NodeId,
-    pub(crate) live: NodeId,
-    /// The transfer roots (`trace::lower::FrameOutcome::arc`), after `error`
-    /// and `live`: computed per body, stored in no row.
-    pub(crate) arc: Vec<NodeId>,
+    pub(crate) roots: Roots,
 }
-
-/// One specialized body: `(outcome, splits, roots)` - `splits` the fragment
-/// per fork (`graph::ANY_VALID` for a dead one; 0 for a fork outside the
-/// outcome's cone).
-pub(crate) type SpecializedBody = (usize, Vec<u8>, Vec<NodeId>);
 
 /// `want`'s images under the configuration `cfg`, specialized into `out`.
 fn roots_under<A: GraphArith>(graph: &Graph<A>, cfg: &[u8], need: &[bool], want: &[NodeId], out: &mut Graph<A>) -> Vec<NodeId> {
@@ -91,16 +81,15 @@ fn decided_roots<A: GraphArith>(
 /// every fork configuration resolved (`Fork`/`ForkValid` become
 /// `Frag`/`FragOk`), so no fork node survives and configurations
 /// that agree share nodes. Returns the fused graph and one body per distinct
-/// (outcome, row), whose roots are the outcome's fields in order, then
-/// `error`, then `live`, then the transfer roots (`Outcome::arc`).
+/// (outcome, row).
 pub(crate) fn specialize_frame<A: GraphArith>(
     graph: &Graph<A>,
-    outs: &[(Vec<NodeId>, NodeId, NodeId, Vec<NodeId>)],
+    outs: &[Roots],
     forks: u8,
     decide: bool,
     room: Option<&crate::transpile::graph::Room>,
     trace: bool,
-) -> (Graph<A>, Vec<SpecializedBody>) {
+) -> (Graph<A>, Vec<Body>) {
     let t0 = std::time::Instant::now();
     // 1. The forks each outcome depends on: those in its cone (read off the
     // reachable set, so no limit on a frame's fork count).
@@ -130,12 +119,9 @@ pub(crate) fn specialize_frame<A: GraphArith>(
     //   decided (per outcome and per class of the first kind); the
     //   configurations are the product.
     let mut sp = graph.like();
-    let mut cands: Vec<SpecializedBody> = Vec::new();
-    for (oi, (fields, error, live, extra)) in outs.iter().enumerate() {
-        let mut want: Vec<NodeId> = fields.clone();
-        want.push(*error);
-        want.push(*live);
-        want.extend(extra.iter().copied());
+    let mut cands: Vec<Body> = Vec::new();
+    for (oi, out) in outs.iter().enumerate() {
+        let want = out.flat();
         let need = graph.reachable(&want);
         let bits = bits_of(&need);
         let validity_read: std::collections::BTreeSet<u8> = (0..graph.len())
@@ -251,8 +237,8 @@ pub(crate) fn specialize_frame<A: GraphArith>(
                     cfg[*d as usize] = values[i][(r % n) as usize];
                     r /= n;
                 }
-                let roots = roots_under(graph, &cfg, &need, &want, &mut sp);
-                cands.push((oi, cfg, roots));
+                let map = graph.specialize_subset_into(&cfg, Some(&need), &mut sp);
+                cands.push(Body { outcome: oi, splits: cfg, roots: out.map(|n| map[n as usize]) });
             }
         }
         if trace {
@@ -271,7 +257,7 @@ pub(crate) fn specialize_frame<A: GraphArith>(
     let t1 = std::time::Instant::now();
     // 3. Decide the boolean layer, on the RESOLVED graph.
     if decide {
-        let all: Vec<NodeId> = cands.iter().flat_map(|c| c.2.iter().copied()).collect();
+        let all: Vec<NodeId> = cands.iter().flat_map(|c| c.roots.flat()).collect();
         let t_phase = std::time::Instant::now();
         let (g1, m1, _) =
             crate::transpile::ival::fold(&sp, &all, room).expect("interval fold");
@@ -289,8 +275,7 @@ pub(crate) fn specialize_frame<A: GraphArith>(
             .expect("lenient eval");
             let mut shown = 0;
             for c in &cands {
-                let nfields = outs[c.0].0.len();
-                let (error, live) = (c.2[nfields], c.2[nfields + 1]);
+                let (error, live) = (c.roots.error, c.roots.live);
                 let error_true = matches!(g1.get(m1[error as usize]).op, Op::ConstBool(true));
                 let live_false = matches!(g1.get(m1[live as usize]).op, Op::ConstBool(false));
                 if !error_true || live_false || shown >= 3 {
@@ -329,7 +314,7 @@ pub(crate) fn specialize_frame<A: GraphArith>(
                         }
                     }
                 }
-                eprintln!("[build]   outcome {} cfg {:?}: error folds TRUE while live; true disjuncts: {}", c.0, c.1, leaves.join(" | "));
+                eprintln!("[build]   outcome {} cfg {:?}: error folds TRUE while live; true disjuncts: {}", c.outcome, c.splits, leaves.join(" | "));
             }
         }
         // The boolean layer, simplified locally (`bdd::simplify_local`).
@@ -356,11 +341,8 @@ pub(crate) fn specialize_frame<A: GraphArith>(
         let (g3, m3, _) =
             crate::transpile::ival::fold(&g2, &r2, room).expect("interval fold 2");
         build_add(6, t_phase);
-        let mut it = r2.iter().map(|x| m3[*x as usize]);
         for c in cands.iter_mut() {
-            for r in c.2.iter_mut() {
-                *r = it.next().expect("one decided root per root");
-            }
+            c.roots = c.roots.map(|r| m3[m2[m1[r as usize] as usize] as usize]);
         }
         sp = g3;
     }
@@ -383,19 +365,18 @@ pub(crate) fn specialize_frame<A: GraphArith>(
     // else `OR_i (live_i & error_i)`. Either way a lane declines exactly where
     // some candidate declined (also in the three-valued masks, both read where
     // they MAY hold) and is kept where some candidate kept it.
-    let bodies: Vec<SpecializedBody> = {
-        let mut groups: Vec<Vec<SpecializedBody>> = Vec::new();
+    let bodies: Vec<Body> = {
+        let mut groups: Vec<Vec<Body>> = Vec::new();
         let mut index: BTreeMap<(usize, Vec<NodeId>), usize> = BTreeMap::new();
         for c in cands {
-            let nfields = outs[c.0].0.len();
-            if matches!(sp.get(c.2[nfields + 1]).op, Op::ConstBool(false)) {
+            if matches!(sp.get(c.roots.live).op, Op::ConstBool(false)) {
                 continue;
             }
-            let row: Vec<NodeId> = c.2[..nfields].iter().chain(&c.2[nfields + 2..]).copied().collect();
-            match index.get(&(c.0, row.clone())) {
+            let key = (c.outcome, c.roots.row());
+            match index.get(&key) {
                 Some(&gi) => groups[gi].push(c),
                 None => {
-                    index.insert((c.0, row), groups.len());
+                    index.insert(key, groups.len());
                     groups.push(vec![c]);
                 }
             }
@@ -403,20 +384,19 @@ pub(crate) fn specialize_frame<A: GraphArith>(
         groups
             .into_iter()
             .map(|members| {
-                let nfields = outs[members[0].0].0.len();
-                let shared = members.iter().all(|m| m.2[nfields] == members[0].2[nfields]);
+                let shared = members.iter().all(|m| m.roots.error == members[0].roots.error);
                 let fused_error = if shared {
-                    members[0].2[nfields]
+                    members[0].roots.error
                 } else {
                     members.iter().fold(sp.leaf(Op::ConstBool(false)), |e, m| {
-                        let here = sp.fold(Op::And, vec![m.2[nfields + 1], m.2[nfields]]);
+                        let here = sp.fold(Op::And, vec![m.roots.live, m.roots.error]);
                         sp.fold(Op::Or, vec![e, here])
                     })
                 };
-                let fused_live = members.iter().skip(1).fold(members[0].2[nfields + 1], |l, m| sp.fold(Op::Or, vec![l, m.2[nfields + 1]]));
+                let fused_live = members.iter().skip(1).fold(members[0].roots.live, |l, m| sp.fold(Op::Or, vec![l, m.roots.live]));
                 let mut b = members.into_iter().next().expect("a group has a member");
-                b.2[nfields] = fused_error;
-                b.2[nfields + 1] = fused_live;
+                b.roots.error = fused_error;
+                b.roots.live = fused_live;
                 b
             })
             .collect()
@@ -429,15 +409,11 @@ pub(crate) fn specialize_frame<A: GraphArith>(
 /// `konst_av` is the `AV` it holds in EVERY row, where every body of the
 /// outcome computes the same compile-time constant node for it. Returns the
 /// fused graph and its bodies.
-pub(crate) fn lower_outcomes<A: GraphArith>(e: &Emit<A>, outs: &mut [Outcome<A>], trace: bool) -> (Graph<A>, Vec<SpecializedBody>) {
-    let outs_spec: Vec<(Vec<NodeId>, NodeId, NodeId, Vec<NodeId>)> = outs
-        .iter()
-        .map(|o| (o.of.fields.iter().map(|f| f.node).collect(), o.error, o.live, o.arc.clone()))
-        .collect();
-    let (sp, bodies) =
-        specialize_frame(&e.graph, &outs_spec, e.fork_depth as u8, e.decide, e.room.as_ref(), trace);
+pub(crate) fn lower_outcomes<A: GraphArith>(e: &Emit<A>, outs: &mut [Outcome<A>], trace: bool) -> (Graph<A>, Vec<Body>) {
+    let roots: Vec<Roots> = outs.iter().map(|o| o.roots.clone()).collect();
+    let (sp, bodies) = specialize_frame(&e.graph, &roots, e.fork_depth as u8, e.decide, e.room.as_ref(), trace);
     for (oi, o) in outs.iter_mut().enumerate() {
-        let mine: Vec<&Vec<NodeId>> = bodies.iter().filter(|b| b.0 == oi).map(|b| &b.2).collect();
+        let mine: Vec<&Vec<NodeId>> = bodies.iter().filter(|b| b.outcome == oi).map(|b| &b.roots.fields).collect();
         let Some(first) = mine.first() else {
             continue;
         };

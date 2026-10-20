@@ -89,7 +89,8 @@ fn why_reached<A: GraphArith>(
 /// Rebuild a traced graph with the ENGINE's cell ids: the tracer numbers
 /// input cells densely, `Op::Cell(0..n)` in `Iface` order; the emitter needs
 /// the engine's sparse canonical ids. `canon` must be INJECTIVE (checked), or
-/// two input slots silently become one cell.
+/// two input slots silently become one cell. Returns the graph over what
+/// `roots` reach and the old -> new node map (defined on that cone).
 pub fn renumber_cells<A: GraphArith>(
     g: &crate::transpile::graph::Graph<A>,
     canon: &[u32],
@@ -146,7 +147,7 @@ pub fn renumber_cells<A: GraphArith>(
         };
         map.push(new);
     }
-    Ok((out, roots.iter().map(|r| map[*r as usize]).collect()))
+    Ok((out, map))
 }
 
 /// Resolve a whole interface, naming the path that failed - and REFUSE if

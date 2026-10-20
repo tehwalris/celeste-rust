@@ -1126,25 +1126,21 @@ fn build_one_shape<N: KernelLanes>(r: &crate::trace::lower::LoweredFrame<N::Arit
     let shape = r.frame.in_rt2.shape_hash_of();
     let room = Room { cache: r.cache.clone() };
     let t_fuse = std::time::Instant::now();
-    let (fused, bodies, flat_roots) = crate::trace::lower::asm_fused_from(&r.lowered.spec);
-    // One output SLOT per DISTINCT root node; `slot_of[k]` for root k.
-    let mut slot_of: Vec<usize> = Vec::with_capacity(flat_roots.len());
-    let mut distinct: Vec<crate::transpile::graph::NodeId> = Vec::new();
-    {
-        let mut index: std::collections::HashMap<crate::transpile::graph::NodeId, usize> =
-            std::collections::HashMap::with_capacity(flat_roots.len());
-        for &n in &flat_roots {
-            let slot = *index.entry(n).or_insert_with(|| {
-                distinct.push(n);
-                distinct.len() - 1
-            });
-            slot_of.push(slot);
-        }
+    let (fused, bodies) = (&r.lowered.spec.0, &r.lowered.spec.1);
+    // One output SLOT per DISTINCT root node, numbered by first appearance
+    // in the bodies' roots in the kernel's order (`Roots::flat`).
+    let mut flat_roots: Vec<crate::transpile::graph::NodeId> = Vec::new();
+    let mut slot_of: HashMap<crate::transpile::graph::NodeId, usize> = HashMap::new();
+    for n in bodies.iter().flat_map(|b| b.roots.flat()) {
+        slot_of.entry(n).or_insert_with(|| {
+            flat_roots.push(n);
+            flat_roots.len() - 1
+        });
     }
-    let flat_roots = distinct;
+    let slot = |n: crate::transpile::graph::NodeId| slot_of[&n];
     crate::transpile::lower::build_add(7, t_fuse);
     let t_asm = std::time::Instant::now();
-    let (compiled, loaded) = crate::transpile::asm::compile_and_load(&fused, &flat_roots, &format!("k{shape:016x}{tag}"), build.asm)
+    let (compiled, loaded) = crate::transpile::asm::compile_and_load(fused, &flat_roots, &format!("k{shape:016x}{tag}"), build.asm)
     .with_context(|| format!("assembling shape {si} (hash {shape:#x})"))?;
     crate::transpile::lower::build_add(8, t_asm);
 
@@ -1162,59 +1158,55 @@ fn build_one_shape<N: KernelLanes>(r: &crate::trace::lower::LoweredFrame<N::Arit
         .collect::<Result<Vec<_>>>()?;
     // Per outcome, its position coordinates' cells (keyed without their whole pixels).
     let pos_cells: Vec<Option<(u32, u32)>> = acc_templates.iter().map(|t| t.build().position_cells(crate::compiled::ids())).collect();
-    // Each body's roots onto their slots, through `slot_of`.
-    let mut off = 0usize;
+    // Each body's roots onto their slots.
+    let off = |n: crate::transpile::graph::NodeId| compiled.root_offsets[slot(n)] as usize;
+    let kind = |n: crate::transpile::graph::NodeId| compiled.root_kinds[slot(n)];
     let mut asm_bodies = Vec::with_capacity(bodies.len());
     // What each body reads at emission (`emit::Plan`).
     let mut reads = Vec::with_capacity(bodies.len());
-    for b in &bodies {
-        let narc = r.bound.outcomes[b.outcome].arc.len();
-        let nfields = b.roots.len() - 2 - narc; // roots = [fields.., error, live, arc..]
-        let outputs = &r.bound.outcomes[b.outcome].outputs;
+    for b in bodies {
+        let outcome = &r.bound.outcomes[b.outcome];
         anyhow::ensure!(
-            outputs.len() == nfields,
+            outcome.fields.len() == b.roots.fields.len(),
             "shape {si} outcome {}: {} outputs vs {} field roots",
             b.outcome,
-            outputs.len(),
-            nfields
+            outcome.fields.len(),
+            b.roots.fields.len()
         );
-        let fields = (0..nfields)
-            .map(|j| AsmField {
-                cell: outputs[j].0 as usize,
-                off: compiled.root_offsets[slot_of[off + j]] as usize,
-                kind: compiled.root_kinds[slot_of[off + j]],
-                may_unknown: reads_unknown_output[b.roots[j] as usize],
-            })
+        let fields = outcome
+            .fields
+            .iter()
+            .zip(&b.roots.fields)
+            .map(|(&(cell, _), &n)| AsmField { cell: cell as usize, off: off(n), kind: kind(n), may_unknown: reads_unknown_output[n as usize] })
             .collect();
         let out_fields = &r.lowered.outs[b.outcome].fields;
-        let key_fields = (0..nfields)
-            .filter_map(|j| {
-                if out_fields[j].konst_av.is_some() || out_fields[j].widen_uniform.is_some() {
-                    return None;
-                }
-                let root = slot_of[off + j];
-                let cell = outputs[j].0;
+        let key_fields = outcome
+            .fields
+            .iter()
+            .zip(&b.roots.fields)
+            .zip(out_fields)
+            .filter(|(_, f)| f.konst_av.is_none() && f.widen_uniform.is_none())
+            .map(|((&(cell, _), &n), _)| {
                 let pos = pos_cells[b.outcome].is_some_and(|(x, y)| cell == x || cell == y);
                 // A number stored `[v, v]` keys as the number.
-                Some(KeyField::new(cell, compiled.root_offsets[root] as usize, compiled.root_kinds[root], pos))
+                KeyField::new(cell, off(n), kind(n), pos)
             })
             .collect::<Result<Vec<_>>>()?;
         // Every body computes its transfer (the rotation graph needs it).
+        let narc = b.roots.arc.len();
         anyhow::ensure!(narc == 2 * crate::trace::frame::ARC_AXIS_ROOTS, "shape {si} outcome {}: {narc} transfer roots", b.outcome);
-        let at = off + nfields + 2;
-        let roots = std::array::from_fn(|k| (compiled.root_offsets[slot_of[at + k]] as usize, compiled.root_kinds[slot_of[at + k]]));
-        let arc = ArcSlots { roots, fin: r.bound.outcomes[b.outcome].arc_fin };
+        let roots = std::array::from_fn(|k| (off(b.roots.arc[k]), kind(b.roots.arc[k])));
+        let arc = ArcSlots { roots, fin: outcome.arc_fin };
         asm_bodies.push(AsmBody {
             outcome: b.outcome,
             splits: b.splits.clone(),
             fields,
-            error_root: slot_of[off + nfields],
-            error_off: compiled.root_offsets[slot_of[off + nfields]] as usize,
-            live_off: compiled.root_offsets[slot_of[off + nfields + 1]] as usize,
+            error_root: slot(b.roots.error),
+            error_off: off(b.roots.error),
+            live_off: off(b.roots.live),
             dup_refs: Vec::new(),
         });
         reads.push(emit::BodyReads { outcome: b.outcome, shape: acc_templates[b.outcome].shape_hash, key_fields, arc, pos: None });
-        off += b.roots.len();
     }
 
     for (b, rd) in asm_bodies.iter().zip(reads.iter_mut()) {
@@ -1237,23 +1229,20 @@ fn build_one_shape<N: KernelLanes>(r: &crate::trace::lower::LoweredFrame<N::Arit
         .collect();
     let mut compiled = compiled;
     let mix_slices = if build.asm.mix {
+        use crate::compiled::mix::{ROLE_ARC, ROLE_ERROR, ROLE_FIELD, ROLE_LIVE};
         let mut roles = vec![0u8; flat_roots.len()];
-        let mut guards = Vec::with_capacity(asm_bodies.len());
-        let mut off = 0usize;
-        for b in &bodies {
-            let nfields = b.roots.len() - 2 - r.bound.outcomes[b.outcome].arc.len();
-            for (j, _) in b.roots.iter().enumerate() {
-                roles[slot_of[off + j]] |= match j {
-                    j if j < nfields => crate::compiled::mix::ROLE_FIELD,
-                    j if j == nfields => crate::compiled::mix::ROLE_ERROR,
-                    j if j == nfields + 1 => crate::compiled::mix::ROLE_LIVE,
-                    _ => crate::compiled::mix::ROLE_ARC,
-                };
+        for b in bodies {
+            for &n in &b.roots.fields {
+                roles[slot(n)] |= ROLE_FIELD;
             }
-            guards.push((b.roots[nfields], b.roots[nfields + 1]));
-            off += b.roots.len();
+            roles[slot(b.roots.error)] |= ROLE_ERROR;
+            roles[slot(b.roots.live)] |= ROLE_LIVE;
+            for &n in &b.roots.arc {
+                roles[slot(n)] |= ROLE_ARC;
+            }
         }
-        let census = N::mix_report(&crate::compiled::mix::Input { traced: &r.bound.graph, fused: &fused, roots: &flat_roots, roles: &roles, bodies: &guards, compiled: &compiled })
+        let guards: Vec<_> = bodies.iter().map(|b| (b.roots.error, b.roots.live)).collect();
+        let census = N::mix_report(&crate::compiled::mix::Input { traced: &r.bound.graph, fused, roots: &flat_roots, roles: &roles, bodies: &guards, compiled: &compiled })
             .with_context(|| format!("the census of {}", compiled.sym))?;
         compiled.asm = String::new();
         Some(crate::compiled::mix::counter(&compiled.sym, census))
@@ -1273,7 +1262,7 @@ fn build_one_shape<N: KernelLanes>(r: &crate::trace::lower::LoweredFrame<N::Arit
             body_cols: Vec::new(),
             fused_nodes: fused.len(),
             mix_slices,
-            fused: if build.keep_graphs { fused } else { crate::transpile::graph::Graph::default() },
+            fused: if build.keep_graphs { fused.clone() } else { crate::transpile::graph::Graph::default() },
             flat_roots: if build.keep_graphs { flat_roots } else { Vec::new() },
             room,
             input_names,

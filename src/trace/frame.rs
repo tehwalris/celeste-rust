@@ -6,6 +6,7 @@
 use anyhow::{anyhow, bail, Result};
 
 use crate::transpile::graph::NodeId;
+use crate::transpile::kernel::Roots;
 use crate::transpile::graph::Ty;
 
 use super::domain::{Domain, Symbolic};
@@ -49,15 +50,10 @@ pub struct FrameOut<A: GraphArith = Fixed> {
 }
 
 impl<A: GraphArith> FrameOut<A> {
-    /// What the outcome computes, in a kernel body's order: its stored
-    /// fields, guard and error, then (`with_arc`) its transfer roots.
-    pub fn roots(&self, with_arc: bool) -> Vec<NodeId> {
-        let mut r: Vec<NodeId> = self.fields.iter().map(|f| f.1).collect();
-        r.extend([self.guard, self.error]);
-        if with_arc {
-            r.extend(&self.arc);
-        }
-        r
+    /// What the outcome computes: its stored fields, guard (`live`), error
+    /// and transfer roots.
+    pub fn roots(&self) -> Roots {
+        Roots { fields: self.fields.iter().map(|f| f.1).collect(), live: self.guard, error: self.error, arc: self.arc.clone() }
     }
 }
 
@@ -297,7 +293,7 @@ fn trace<'a, A: GraphArith>(it: &mut Interp<'a, Symbolic<A>>, chunks: &'a super:
     // an outcome computes: its stored fields, guard and transfer roots (the
     // remainder before the widening stores no field, and an overflow there
     // would be a wrong transfer).
-    let roots: Vec<Vec<NodeId>> = outs.iter().map(|o| o.roots(true)).collect();
+    let roots: Vec<Vec<NodeId>> = outs.iter().map(|o| o.roots().flat()).collect();
     let derived = super::error::for_outcomes(&mut it.d, &roots);
     // A PIN DISCONNECTS its input: nothing the outcomes compute - values,
     // guards, transfers, derived errors - may read a pinned input; only the
@@ -463,7 +459,7 @@ mod tests {
         for (d, b) in buttons.iter().zip(bits) {
             cfg[*d as usize] = *b as u8;
         }
-        let roots: Vec<NodeId> = f.outs.iter().flat_map(|o| o.roots(false)).collect();
+        let roots: Vec<NodeId> = f.outs.iter().flat_map(|o| o.fields.iter().map(|x| x.1).chain([o.guard, o.error])).collect();
         let need = g.reachable(&roots);
         let mut out = g.like();
         let map = g.specialize_subset_into(&cfg, Some(&need), &mut out);
