@@ -269,18 +269,6 @@ impl<N: EngineNum> Default for Filters<'_, N> {
     }
 }
 
-/// THE TIME BAND (an estimate, not a bound; for the level -1 probe): can a
-/// player at `cell` not reach y < -4 by `h` at `px` pixels per frame up?
-/// Never true without a player or at x >= 128 (already left the room).
-pub(crate) fn cell_too_late(cell: u32, frame: u32, h: u32, px: i32) -> bool {
-    let Some((x, y)) = crate::search::pos_graph::cell_xy(cell) else { return false };
-    if x >= 128 {
-        return false;
-    }
-    let frames = ((y + 5).max(0) + px - 1) / px;
-    frame + (frames.max(1) - 1) as u32 > h
-}
-
 /// THE OBJECTS LADDER's link: a finer forward keeps a row at frame t only if
 /// its projection (`Rt2::widen_to`) is a coarse node ARC-MARKED with deadline
 /// >= t. Sound: a fine state winning from t with remainder r projects to a

@@ -2110,10 +2110,10 @@ fn compare_with_tree<N: EngineNum>(opts: &Opts, by_hash: &HashMap<u64, usize>, g
     };
     let tree = crate::storage::layer::Tree::<N>::open(&opts.level_dir, opts.to)?;
     let geo = crate::storage::GEOMETRY;
-    say!(rep, "\nframe | states | too late (f + d > {}) | no exit path | band {},8 cut | death (kept) | left the room | other shape | not in the table | marked | MARKED TOO LATE", opts.ceiling, opts.ceiling)?;
+    say!(rep, "\nframe | states | too late (f + d > {}) | no exit path | death (kept) | left the room | other shape | not in the table | marked | MARKED TOO LATE", opts.ceiling)?;
     let mut samples: BTreeSet<String> = BTreeSet::new();
     for f in opts.from..=opts.to {
-        let (mut states, mut late, mut nopath, mut band, mut dead, mut left, mut other, mut missing) = (0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64);
+        let (mut states, mut late, mut nopath, mut dead, mut left, mut other, mut missing) = (0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64);
         let (mut marked, mut marked_late) = (0u64, 0u64);
         let mut by_cell: std::collections::BTreeMap<(u64, u32), Vec<(u64, u64)>> = Default::default();
         let (layer, _) = tree.layer(f, None, 1)?;
@@ -2128,10 +2128,6 @@ fn compare_with_tree<N: EngineNum>(opts: &Opts, by_hash: &HashMap<u64, usize>, g
             for (&(_, cell), keys) in by_cell.range((shape, 0)..=(shape, u32::MAX)) {
                 let rows = keys.len() as u64;
                 states += rows;
-                // What the time band (`frame::cell_too_late`, 8 px) drops.
-                if crate::frame::cell_too_late(cell, f, opts.ceiling, 8) {
-                    band += rows;
-                }
                 if cell == NO_CELL {
                     dead += rows;
                     continue;
@@ -2187,7 +2183,7 @@ fn compare_with_tree<N: EngineNum>(opts: &Opts, by_hash: &HashMap<u64, usize>, g
             }
         }
         let pc = |x: u64| 100.0 * x as f64 / states.max(1) as f64;
-        say!(rep, "f{f:03} | {states} | {late} ({:.1}%) | {nopath} | {band} ({:.1}%) | {dead} | {left} | {other} | {missing} | {marked} | {marked_late}", pc(late), pc(band))?;
+        say!(rep, "f{f:03} | {states} | {late} ({:.1}%) | {nopath} | {dead} | {left} | {other} | {missing} | {marked} | {marked_late}", pc(late))?;
     }
     for x in &samples {
         say!(rep, "  {x}")?;
