@@ -17,12 +17,12 @@ pub fn edge_fingerprint<N: crate::search::rem::Rem>(edges_dir: &Path, frame: u32
 /// pair <<< 42)`, a node `ContentHash::state` of its (shape, key, cell)
 /// (`mix64(key hash ^ cell << 1)`), a pair the hash of its bytes - summed
 /// over a frame's edges, with their count.
-pub struct EdgeHashes {
+pub(crate) struct EdgeHashes {
     pairs: Vec<u64>,
 }
 
 impl EdgeHashes {
-    pub fn new<N: crate::search::rem::Rem>(pairs: &[N::Pair]) -> Self {
+    pub(crate) fn new<N: crate::search::rem::Rem>(pairs: &[N::Pair]) -> Self {
         let mix = celeste_engine::runtime2::mix64;
         EdgeHashes {
             pairs: pairs
@@ -37,7 +37,7 @@ impl EdgeHashes {
     }
 
     /// Frame `frame`'s `(count, sum of terms)` (`shapes`: the tree's by index).
-    pub fn frame<N: crate::search::rem::Rem>(&self, store: &super::edges::EdgeStore<N>, frame: u32, content: &celeste_engine::exact::ContentHash, shapes: &[u64], threads: usize) -> Result<(u64, u64)> {
+    pub(crate) fn frame<N: crate::search::rem::Rem>(&self, store: &super::edges::EdgeStore<N>, frame: u32, content: &celeste_engine::exact::ContentHash, shapes: &[u64], threads: usize) -> Result<(u64, u64)> {
         let mix = celeste_engine::runtime2::mix64;
         let geo = super::GEOMETRY;
         let parts = store.par_blocks(frame, threads, || (0u64, 0u64), |(n, acc), region, blk| {
@@ -148,7 +148,7 @@ impl Counters {
     }
 
     /// The counts so far (every thread joined so far).
-    pub fn read(&self) -> [u64; 4] {
+    pub(crate) fn read(&self) -> [u64; 4] {
         let mut out = [0u64; 4];
         for (o, &fd) in out.iter_mut().zip(&self.fds) {
             // SAFETY: an open perf event fd: a plain read of its u64 count.
@@ -168,12 +168,12 @@ pub fn count_steps(c: Counters) -> &'static Counters {
 
 /// The step counters' counts now (`None`: none installed). Read on the
 /// opening thread between steps, each step's threads joined.
-pub fn step_counts() -> Option<[u64; 4]> {
+pub(crate) fn step_counts() -> Option<[u64; 4]> {
     STEPS.get().map(Counters::read)
 }
 
 /// The counts between two `step_counts`.
-pub fn counts_since(at: Option<[u64; 4]>) -> ([u64; 4], Option<[u64; 4]>) {
+pub(crate) fn counts_since(at: Option<[u64; 4]>) -> ([u64; 4], Option<[u64; 4]>) {
     let now = step_counts();
     let d = match (at, now) {
         (Some(a), Some(b)) => std::array::from_fn(|k| b[k].wrapping_sub(a[k])),

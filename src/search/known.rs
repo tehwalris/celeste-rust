@@ -25,15 +25,15 @@ use celeste_core::arith::EngineNum;
 use celeste_core::pico8_num::Pico8Num as P8;
 
 /// A known solution to check, and the filter the level's forward ran under.
-pub struct Route<'a, N: Rem = P8> {
-    pub inputs: &'a [u8],
-    pub filter: Option<&'a MarkFilter<'a, N>>,
+pub(crate) struct Route<'a, N: Rem = P8> {
+    pub(crate) inputs: &'a [u8],
+    pub(crate) filter: Option<&'a MarkFilter<'a, N>>,
     /// Also the hull forward's claim (`Hulls`): `rewrite check known`.
-    pub hulls: bool,
+    pub(crate) hulls: bool,
 }
 
 /// What the hull forward's claim is checked against: tree, hulls, edges.
-pub struct Hulls<N: Rem = P8> {
+pub(crate) struct Hulls<N: Rem = P8> {
     tree: crate::storage::layer::Tree<N>,
     visited: crate::storage::visited::VisitedSet<N>,
     edges: crate::storage::edges::EdgeStore<N>,
@@ -43,7 +43,7 @@ pub struct Hulls<N: Rem = P8> {
 
 impl<N: Rem> Hulls<N> {
     /// The tree in `dir` through step `horizon`.
-    pub fn open(dir: &std::path::Path, horizon: u32, s: &crate::settings::Settings) -> anyhow::Result<Self> {
+    pub(crate) fn open(dir: &std::path::Path, horizon: u32, s: &crate::settings::Settings) -> anyhow::Result<Self> {
         let tree = crate::storage::layer::Tree::<N>::open(dir, horizon)?;
         let (visited, ..) = crate::frame::restore_visited::<N>(dir, horizon, s.room, s.threads())?;
         let edges = crate::storage::edges::EdgeStore::<N>::open(&dir.join("edges"), horizon)?;
@@ -56,20 +56,20 @@ impl<N: Rem> Hulls<N> {
 /// What the arc phase holds for the check (`driver::solve`).
 pub(super) struct Pruning<'a, N: Rem = P8> {
     /// The level's W as the concrete search admits states.
-    pub side: &'a Side<'a, N>,
+    pub(crate) side: &'a Side<'a, N>,
     /// In search steps.
-    pub horizon: u32,
+    pub(crate) horizon: u32,
     /// The start's node (`None`: no winning set at any frame); not looked up
     /// by its projection: the tree holds the start unwidened.
-    pub start: Option<u32>,
+    pub(crate) start: Option<u32>,
     /// This level's reached nodes (the next level's filter), if it has one.
-    pub reached: Option<&'a Visited<N>>,
+    pub(crate) reached: Option<&'a Visited<N>>,
     /// The level -1 filter the tree was built under (`TreeFilter::of_tree`).
-    pub minus_one: Option<crate::frame::MinusOne>,
+    pub(crate) minus_one: Option<crate::frame::MinusOne>,
     /// The tree's directory, for the report (read on a miss).
-    pub dir: &'a std::path::Path,
+    pub(crate) dir: &'a std::path::Path,
     /// The hull forward's claim, checked at every step (`Route::hulls`).
-    pub hulls: Option<&'a Hulls<N>>,
+    pub(crate) hulls: Option<&'a Hulls<N>>,
 }
 
 /// The route's states per step (each with its parent's index) up to the
@@ -230,7 +230,7 @@ fn explain<N: KernelLanes>(run: &Run<N>, idx: &[usize], s: usize, seeded: bool, 
     let kernels = crate::compiled::Kernels::<N>::new(p.side.s, p.side.level)?;
     let mut blocks = vec![Block::from_rt2(tree.row(layer, sk, p.side.s.room)?)];
     for k in 0..per_frame {
-        blocks = crate::storage::wave::one_frame(&kernels, blocks, layer + 1 + k as u32)?.next;
+        blocks = crate::storage::wave::one_frame(&kernels, blocks, layer + 1 + k as u32)?;
     }
     let kset: std::collections::BTreeSet<Proj> = blocks.into_iter().flat_map(|b| project_onto(&mut b.into_rt2(), p.side.level)).collect();
     let want = project_onto(&mut lookup_view(run.layers[s][idx[s]].1.rt2(), seeded)?, p.side.level).remove(0);

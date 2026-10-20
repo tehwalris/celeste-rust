@@ -6,21 +6,22 @@
 //! A state is `(shape, key, cell)` (`Sk`; the key holds no position:
 //! `exact::Code::pos`) everywhere: the edges, the frame and hull files, the
 //! backward. No state has a number.
+#![warn(unreachable_pub)]
 
 pub mod bench;
-pub mod bundle;
-pub mod codec;
-pub mod decode;
+pub(crate) mod bundle;
+pub(crate) mod codec;
+pub(crate) mod decode;
 pub mod edges;
-pub mod file;
+pub(crate) mod file;
 pub mod hulls;
 pub mod layer;
-pub mod out;
-pub mod route;
-pub mod set;
-pub mod spool;
-pub mod unit;
-pub mod visited;
+pub(crate) mod out;
+pub(crate) mod route;
+pub(crate) mod set;
+pub(crate) mod spool;
+pub(crate) mod unit;
+pub(crate) mod visited;
 pub mod wave;
 
 use crate::search::pos_graph::{GRID, NO_CELL};
@@ -70,29 +71,29 @@ pub fn fingerprint<N: crate::search::rem::Rem>(dir: &std::path::Path, to: u32, e
 /// A SLOT is a region's place on the grid, row-major, `NO_CELL`'s last.
 #[derive(Clone, Copy, Debug)]
 pub struct Geometry {
-    pub side: u32,
-    pub per_row: u32,
+    pub(crate) side: u32,
+    pub(crate) per_row: u32,
     /// Slots per shape: the grid's regions and `NO_CELL`'s.
-    pub slots: u32,
+    pub(crate) slots: u32,
     /// Mask words per entry: `side * side / 64`.
-    pub words: usize,
+    pub(crate) words: usize,
 }
 
 impl Geometry {
-    pub const fn new(side: u32) -> Geometry {
+    pub(crate) const fn new(side: u32) -> Geometry {
         assert!(side == 8 || side == 16, "a storage region is 8 or 16 cells wide");
         let per_row = GRID as u32 / side;
         Geometry { side, per_row, slots: per_row * per_row + 1, words: (side * side / 64) as usize }
     }
 
     #[inline]
-    pub fn no_cell_slot(&self) -> u32 {
+    pub(crate) fn no_cell_slot(&self) -> u32 {
         self.slots - 1
     }
 
     /// A cell's region slot and its index in the region.
     #[inline]
-    pub fn slot_local(&self, cell: u32) -> (u32, u32) {
+    pub(crate) fn slot_local(&self, cell: u32) -> (u32, u32) {
         if cell == NO_CELL {
             return (self.no_cell_slot(), 0);
         }
@@ -102,7 +103,7 @@ impl Geometry {
 
     /// `slot_local` inverted.
     #[inline]
-    pub fn cell(&self, slot: u32, local: u32) -> u32 {
+    pub(crate) fn cell(&self, slot: u32, local: u32) -> u32 {
         if slot == self.no_cell_slot() {
             debug_assert_eq!(local, 0);
             return NO_CELL;
@@ -119,7 +120,7 @@ pub const GEOMETRY: Geometry = Geometry::new(8);
 
 /// A region's index from its shape's index and its slot.
 #[inline]
-pub fn region_of(geo: &Geometry, shape_idx: u32, slot: u32) -> u32 {
+pub(crate) fn region_of(geo: &Geometry, shape_idx: u32, slot: u32) -> u32 {
     let r = shape_idx as u64 * geo.slots as u64 + slot as u64;
     assert!(r <= u32::MAX as u64, "region {r} past u32 ({shape_idx} shapes)");
     r as u32
@@ -130,14 +131,14 @@ pub fn region_of(geo: &Geometry, shape_idx: u32, slot: u32) -> u32 {
 /// winning sets by. Sorts region-major, as the edge files are read.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
 pub struct Sk {
-    pub region: u32,
+    pub(crate) region: u32,
     pub key: visited::Key,
-    pub local: u8,
+    pub(crate) local: u8,
 }
 
 impl Sk {
     #[inline]
-    pub fn at(geo: &Geometry, shape: u32, key: visited::Key, cell: u32) -> Sk {
+    pub(crate) fn at(geo: &Geometry, shape: u32, key: visited::Key, cell: u32) -> Sk {
         let (slot, local) = geo.slot_local(cell);
         Sk { region: region_of(geo, shape, slot), key, local: local as u8 }
     }

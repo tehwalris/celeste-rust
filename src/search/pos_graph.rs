@@ -12,16 +12,16 @@ use celeste_engine::runtime2::{Col, Rt2, AV};
 
 /// Side of the position grid, in pixels: the start room plus a room's width
 /// past it in each axis (room (0,0) exits upward, landing at x ~238).
-pub const GRID: i32 = 512;
-pub const ORIGIN: i32 = -64;
+pub(crate) const GRID: i32 = 512;
+pub(crate) const ORIGIN: i32 = -64;
 const ROOM_PX: i32 = 128;
 
 /// The cell of a row with no player object (e.g. after a death): a normal
 /// node, past the end of the grid so no position aliases it.
-pub const NO_CELL: u32 = (GRID * GRID) as u32;
+pub(crate) const NO_CELL: u32 = (GRID * GRID) as u32;
 
 /// Nodes, including `NO_CELL`.
-pub const CELL_COUNT: usize = (GRID * GRID) as usize + 1;
+pub(crate) const CELL_COUNT: usize = (GRID * GRID) as usize + 1;
 /// Grid cell of a whole-pixel start-room-relative position; an error
 /// outside the grid, never a clamp.
 pub fn cell_of(x: i32, y: i32) -> Result<u32> {
@@ -66,7 +66,7 @@ pub(crate) fn whole_i16_col<N: EngineNum>(rt2: &Rt2<N>, cell: u32) -> Option<Vec
 
 /// A position column's whole-pixel RANGE per lane (`None` if a lane is
 /// neither number nor interval), for the win tests.
-pub fn whole_range_col<N: EngineNum>(rt2: &Rt2<N>, cell: u32) -> Option<Vec<(i16, i16)>> {
+pub(crate) fn whole_range_col<N: EngineNum>(rt2: &Rt2<N>, cell: u32) -> Option<Vec<(i16, i16)>> {
     let one = |v: AV<N>| -> Option<(i16, i16)> {
         match v {
             AV::Num(n) => Some((n.whole_i16()?, n.whole_i16()?)),
@@ -84,7 +84,7 @@ pub fn whole_range_col<N: EngineNum>(rt2: &Rt2<N>, cell: u32) -> Option<Vec<(i16
 
 /// The block's player object (`player`, else `player_spawn`): one per
 /// block, its lanes share structure.
-pub fn player_object<N: EngineNum>(rt2: &Rt2<N>) -> Option<u32> {
+pub(crate) fn player_object<N: EngineNum>(rt2: &Rt2<N>) -> Option<u32> {
     rt2.position_object(crate::compiled::ids())
 }
 
@@ -118,7 +118,7 @@ pub fn block_cells<N: EngineNum>(rt2: &Rt2<N>) -> Result<Vec<u32>> {
 /// The labelling offset of room `(rx, ry)` in a search from `start`: 0, or
 /// `game_runner::win_room` one ROOM_PX right (the wrap (7,y) -> (0,y+1) too).
 /// No other room occurs: a death reloads the start room.
-pub fn room_offset(start: (i16, i16), rx: i16, ry: i16) -> Result<(i32, i32)> {
+pub(crate) fn room_offset(start: (i16, i16), rx: i16, ry: i16) -> Result<(i32, i32)> {
     let win = crate::game_runner::win_room(start);
     if (rx, ry) == start {
         Ok((0, 0))
@@ -138,20 +138,20 @@ pub struct PosGraph {
 }
 
 impl PosGraph {
-    pub fn save(&self, path: &std::path::Path) -> anyhow::Result<()> {
+    pub(crate) fn save(&self, path: &std::path::Path) -> anyhow::Result<()> {
         crate::storage::file::save_value(path, self)
     }
 
-    pub fn load(path: &std::path::Path) -> anyhow::Result<Self> {
+    pub(crate) fn load(path: &std::path::Path) -> anyhow::Result<Self> {
         crate::storage::file::load_value(path)
     }
 
-    pub fn pairs(&self) -> usize {
+    pub(crate) fn pairs(&self) -> usize {
         self.srcs.len()
     }
 
     /// The source cells of `dst`, sorted; empty past the end.
-    pub fn sources(&self, dst: u32) -> &[u32] {
+    pub(crate) fn sources(&self, dst: u32) -> &[u32] {
         let d = dst as usize;
         if d + 1 >= self.offsets.len() {
             return &[];
@@ -160,7 +160,8 @@ impl PosGraph {
     }
 
     /// Cells with a predecessor.
-    pub fn live_cells(&self) -> usize {
+    #[cfg(test)]
+    pub(crate) fn live_cells(&self) -> usize {
         self.offsets.windows(2).filter(|w| w[1] > w[0]).count()
     }
 
@@ -180,23 +181,23 @@ impl PosGraph {
 /// Accumulates `(dst, src)` pairs: per destination a small sorted set of
 /// sources (tens each), not a dense bitmap or a hash set of pairs.
 #[derive(Default, Clone)]
-pub struct PosGraphBuilder {
+pub(crate) struct PosGraphBuilder {
     by_dst: rustc_hash::FxHashMap<u32, Vec<u32>>,
 }
 
 impl PosGraphBuilder {
-    pub fn record(&mut self, src: u32, dst: u32) {
+    pub(crate) fn record(&mut self, src: u32, dst: u32) {
         let set = self.by_dst.entry(dst).or_default();
         if let Err(at) = set.binary_search(&src) {
             set.insert(at, src);
         }
     }
 
-    pub fn pairs(&self) -> usize {
+    pub(crate) fn pairs(&self) -> usize {
         self.by_dst.values().map(|v| v.len()).sum()
     }
 
-    pub fn build(self) -> PosGraph {
+    pub(crate) fn build(self) -> PosGraph {
         let mut offsets = Vec::with_capacity(CELL_COUNT + 1);
         let mut srcs = Vec::with_capacity(self.pairs());
         let mut by_dst = self.by_dst;
@@ -214,7 +215,7 @@ impl PosGraphBuilder {
 /// Collects the graph while the forward steps frames, AT EMISSION: the
 /// frame step records `(input row's cell, output row's cell)` per row,
 /// before any dedup; nothing is stored on a row.
-pub struct PosObserver {
+pub(crate) struct PosObserver {
     /// `(src, dst)` pairs from the workers, folded in by `flush`.
     pending: std::sync::Mutex<Vec<(u32, u32)>>,
     graph: std::sync::Mutex<PosGraphBuilder>,
@@ -228,7 +229,7 @@ impl Default for PosObserver {
 
 impl PosObserver {
     /// An observer already holding `graph`'s pairs (a resumed forward).
-    pub fn from_graph(graph: &PosGraph) -> Self {
+    pub(crate) fn from_graph(graph: &PosGraph) -> Self {
         let mut b = PosGraphBuilder::default();
         for d in 0..CELL_COUNT as u32 {
             let srcs = graph.sources(d);
@@ -239,11 +240,11 @@ impl PosObserver {
         Self { pending: std::sync::Mutex::new(Vec::new()), graph: std::sync::Mutex::new(b) }
     }
 
-    pub fn record_pairs(&self, pairs: impl Iterator<Item = (u32, u32)>) {
+    pub(crate) fn record_pairs(&self, pairs: impl Iterator<Item = (u32, u32)>) {
         self.pending.lock().expect("pos observer").extend(pairs);
     }
 
-    pub fn flush(&self) {
+    pub(crate) fn flush(&self) {
         let pending = std::mem::take(&mut *self.pending.lock().expect("pos observer"));
         let mut graph = self.graph.lock().expect("pos observer");
         for (s, d) in pending {
@@ -251,17 +252,8 @@ impl PosObserver {
         }
     }
 
-    pub fn pairs(&self) -> usize {
-        self.graph.lock().expect("pos observer").pairs()
-    }
-
-    pub fn build(self) -> PosGraph {
-        self.flush();
-        self.graph.into_inner().expect("pos observer").build()
-    }
-
     /// The graph as recorded so far; the observer keeps recording.
-    pub fn snapshot(&self) -> PosGraph {
+    pub(crate) fn snapshot(&self) -> PosGraph {
         self.flush();
         self.graph.lock().expect("pos observer").clone().build()
     }

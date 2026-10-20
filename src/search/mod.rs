@@ -1,21 +1,22 @@
 //! The search around the forward (`frame::ForwardState`, `storage`); the
 //! modules: plans/architecture.md "Code layout".
+#![warn(unreachable_pub)]
 pub mod arc_check;
-pub mod arc_edges;
-pub mod arcs;
+pub(crate) mod arc_edges;
+pub(crate) mod arcs;
 pub mod backward;
-pub mod concrete;
-pub mod driver;
-pub mod dual;
-pub mod hull;
+pub(crate) mod concrete;
+pub(crate) mod driver;
+pub(crate) mod dual;
+pub(crate) mod hull;
 pub mod hull_replay;
 pub mod inspect;
-pub mod known;
+pub(crate) mod known;
 pub mod level_minus_one;
 pub mod pos_graph;
-pub mod reach;
+pub(crate) mod reach;
 pub mod rem;
-pub mod rem_f64;
+pub(crate) mod rem_f64;
 pub mod result;
 pub mod robust;
 pub mod tree;

@@ -7,13 +7,13 @@
 //! doubles' `rem_f64::Doubles`); the pull is exact on both.
 
 /// Points on the circle: 1 px in raw 16.16 units.
-pub const CIRCLE: u32 = 1 << 16;
+pub(crate) const CIRCLE: u32 = 1 << 16;
 
 /// The most x segments a `Region` holds (its slabs' 16-bit end index).
-pub const MAX_SEGS: usize = (1 << 16) - 1;
+pub(crate) const MAX_SEGS: usize = (1 << 16) - 1;
 
 /// A remainder (raw, [-32768, 32767]) as a point of the circle.
-pub fn point(rem: i32) -> u32 {
+pub(crate) fn point(rem: i32) -> u32 {
     debug_assert!((-32768..32768).contains(&rem), "a remainder out of range: {rem}");
     (rem + 32768) as u32
 }
@@ -21,8 +21,8 @@ pub fn point(rem: i32) -> u32 {
 /// A half-open segment `[lo, hi)` of a circle's points, `lo < hi`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
 pub struct Seg<P = u32> {
-    pub lo: P,
-    pub hi: P,
+    pub(crate) lo: P,
+    pub(crate) hi: P,
 }
 
 /// A CIRCLE of remainder points (`Rem::C`): points, stored words, transfers.
@@ -196,31 +196,34 @@ impl Circle for Fixed16 {
     }
 }
 
-/// A union of segments: sorted, disjoint, not touching.
+/// A union of segments: sorted, disjoint, not touching (the tests' model of
+/// the arcs, which `Region` and the actions are checked against).
+#[cfg(test)]
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
-pub struct Set(pub Vec<Seg>);
+pub(crate) struct Set(pub(crate) Vec<Seg>);
 
+#[cfg(test)]
 impl Set {
-    pub fn empty() -> Self {
+    pub(crate) fn empty() -> Self {
         Set(Vec::new())
     }
-    pub fn full() -> Self {
+    pub(crate) fn full() -> Self {
         Set(vec![Seg { lo: 0, hi: CIRCLE }])
     }
-    pub fn point(p: u32) -> Self {
+    pub(crate) fn point(p: u32) -> Self {
         Set(vec![Seg { lo: p, hi: p + 1 }])
     }
-    pub fn seg(lo: u32, hi: u32) -> Self {
+    pub(crate) fn seg(lo: u32, hi: u32) -> Self {
         if lo >= hi {
             Set::empty()
         } else {
             Set(vec![Seg { lo, hi }])
         }
     }
-    pub fn is_empty(&self) -> bool {
+    pub(crate) fn is_empty(&self) -> bool {
         self.0.is_empty()
     }
-    pub fn contains(&self, p: u32) -> bool {
+    pub(crate) fn contains(&self, p: u32) -> bool {
         self.0.iter().any(|s| s.lo <= p && p < s.hi)
     }
     /// Normalize: sort, merge overlapping and touching segments.
@@ -236,10 +239,7 @@ impl Set {
         }
         Set(out)
     }
-    pub fn union(&self, o: &Set) -> Set {
-        Set::norm(self.0.iter().chain(&o.0).copied().collect())
-    }
-    pub fn intersect(&self, o: &Set) -> Set {
+    pub(crate) fn intersect(&self, o: &Set) -> Set {
         let mut out = Vec::new();
         for a in &self.0 {
             for b in &o.0 {
@@ -252,7 +252,7 @@ impl Set {
         Set::norm(out)
     }
     /// The set rotated by `v` raw units (`p -> (p + v) mod CIRCLE`).
-    pub fn rotate(&self, v: i32) -> Set {
+    pub(crate) fn rotate(&self, v: i32) -> Set {
         let d = v.rem_euclid(CIRCLE as i32) as u32;
         let mut out = Vec::new();
         for &s in &self.0 {
@@ -261,7 +261,7 @@ impl Set {
         Set::norm(out)
     }
     /// Arcs: segments, the two touching the wrap counted as one.
-    pub fn arcs(&self) -> usize {
+    pub(crate) fn arcs(&self) -> usize {
         let n = self.0.len();
         if n >= 2 && self.0[0].lo == 0 && self.0[n - 1].hi == CIRCLE {
             n - 1
@@ -273,16 +273,17 @@ impl Set {
 
 /// What a frame does to one axis's remainder along an edge.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum Action {
+pub(crate) enum Action {
     /// `rem := rem + v (mod 1)`, raw `v`.
     Rotate(i32),
     /// `rem := c` (a collision resets it): the point `c` of the circle.
     Const(u32),
 }
 
+#[cfg(test)]
 impl Action {
     /// The image of `s` (already inside the edge's guard).
-    pub fn image(self, s: &Set) -> Set {
+    pub(crate) fn image(self, s: &Set) -> Set {
         match self {
             Action::Rotate(v) => s.rotate(v),
             Action::Const(c) => {
@@ -295,7 +296,7 @@ impl Action {
         }
     }
     /// The preimage of `s`: every point the action takes into `s`.
-    pub fn preimage(self, s: &Set) -> Set {
+    pub(crate) fn preimage(self, s: &Set) -> Set {
         match self {
             Action::Rotate(v) => s.rotate(-v),
             Action::Const(c) => {
@@ -313,22 +314,21 @@ impl Action {
 /// circle, never wrapping) and what it does to them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Transfer {
-    pub guard: Seg,
-    pub action: Action,
+    pub(crate) guard: Seg,
+    pub(crate) action: Action,
 }
 
+#[cfg(test)]
 impl Transfer {
-    pub fn guard_set(&self) -> Set {
-        Set::seg(self.guard.lo, self.guard.hi)
-    }
-    pub fn takes(&self, p: u32) -> bool {
+    pub(crate) fn takes(&self, p: u32) -> bool {
         self.guard.lo <= p && p < self.guard.hi
     }
 }
 
 /// The pieces a speed `v` (raw) cuts the circle into: `rem + v + 1/2` below
 /// the next integer, and the rest (one piece for whole pixels).
-pub fn pieces(v: i32) -> Vec<Set> {
+#[cfg(test)]
+pub(crate) fn pieces(v: i32) -> Vec<Set> {
     // u = p - 32768 + v + 32768 = p + v; the amount steps where p + v is a
     // multiple of CIRCLE, at p = (-v) mod CIRCLE.
     let cut = (-v).rem_euclid(CIRCLE as i32) as u32;
@@ -339,48 +339,12 @@ pub fn pieces(v: i32) -> Vec<Set> {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub struct Rect {
-    pub x: Set,
-    pub y: Set,
-}
-
-/// A union of rectangles (two axes; exact, not a product).
-#[derive(Clone, Debug, Default)]
-pub struct Rects(pub Vec<Rect>);
-
-impl Rects {
-    pub fn empty() -> Self {
-        Rects(Vec::new())
-    }
-    pub fn contains(&self, x: u32, y: u32) -> bool {
-        self.0.iter().any(|r| r.x.contains(x) && r.y.contains(y))
-    }
-    /// Add a rectangle, merging it into one with the same x (or y) set.
-    pub fn add(&mut self, r: Rect) {
-        if r.x.is_empty() || r.y.is_empty() {
-            return;
-        }
-        for q in self.0.iter_mut() {
-            if q.x == r.x {
-                q.y = q.y.union(&r.y);
-                return;
-            }
-            if q.y == r.y {
-                q.x = q.x.union(&r.x);
-                return;
-            }
-        }
-        self.0.push(r);
-    }
-}
-
 /// One axis-aligned piece of the torus: `[y.lo, y.hi) x [x.lo, x.hi)`, no
 /// wrap on either axis (a wrapping arc is two pieces).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Piece<P = u32> {
-    pub y: Seg<P>,
-    pub x: Seg<P>,
+pub(crate) struct Piece<P = u32> {
+    pub(crate) y: Seg<P>,
+    pub(crate) x: Seg<P>,
 }
 
 /// A segment as a `Region` stores it, `[lo, last]` (16.16's whole circle
@@ -415,7 +379,7 @@ struct Slab<W> {
 /// a non-empty x set, touching slabs never with the same one, so equal sets
 /// are equal values; at most `Circle::MAX_SEGS` segments.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
-pub struct Region<C: Circle = Fixed16> {
+pub(crate) struct Region<C: Circle = Fixed16> {
     slabs: Vec<Slab<C::W>>,
     xs: Vec<Stored<C::W>>,
 }
@@ -440,45 +404,51 @@ pub(super) fn clip<P: Ord + Copy>(s: Seg<P>, g: Seg<P>) -> Option<Seg<P>> {
 }
 
 impl<C: Circle> Region<C> {
-    pub fn full() -> Self {
+    pub(crate) fn full() -> Self {
         let all = Stored::of::<C>(Seg { lo: C::P::default(), hi: C::SIZE });
         Region { slabs: vec![Slab { y: all, end: C::count(1) }], xs: vec![all] }
     }
-    pub fn as_ref(&self) -> RegionRef<'_, C> {
+    pub(crate) fn as_ref(&self) -> RegionRef<'_, C> {
         RegionRef { slabs: &self.slabs, xs: &self.xs }
     }
-    pub fn is_empty(&self) -> bool {
+    pub(crate) fn is_empty(&self) -> bool {
         self.slabs.is_empty()
     }
-    pub fn n_segs(&self) -> usize {
+    pub(crate) fn n_segs(&self) -> usize {
         self.xs.len()
     }
-    pub fn slabs(&self) -> impl Iterator<Item = (Seg<C::P>, impl Iterator<Item = Seg<C::P>> + '_)> + '_ {
+    #[cfg(test)]
+    pub(crate) fn slabs(&self) -> impl Iterator<Item = (Seg<C::P>, impl Iterator<Item = Seg<C::P>> + '_)> + '_ {
         self.as_ref().slabs()
     }
-    pub fn contains(&self, x: C::P, y: C::P) -> bool {
+    #[cfg(test)]
+    pub(crate) fn contains(&self, x: C::P, y: C::P) -> bool {
         self.as_ref().contains(x, y)
     }
-    pub fn pieces(&self, out: &mut Vec<Piece<C::P>>) {
+    #[cfg(test)]
+    pub(crate) fn pieces(&self, out: &mut Vec<Piece<C::P>>) {
         self.as_ref().pieces(out)
     }
-    pub fn push(&self, x: C::Act, y: C::Act, out: &mut Vec<Piece<C::P>>) {
+    #[cfg(test)]
+    pub(crate) fn push(&self, x: C::Act, y: C::Act, out: &mut Vec<Piece<C::P>>) {
         self.as_ref().push(x, y, out)
     }
-    pub fn clip_into(&self, p: Piece<C::P>, out: &mut Vec<Piece<C::P>>) {
+    #[cfg(test)]
+    pub(crate) fn clip_into(&self, p: Piece<C::P>, out: &mut Vec<Piece<C::P>>) {
         self.as_ref().clip_into(p, out)
     }
-    pub fn pull(&self, x: C::Act, y: C::Act, out: &mut Vec<Piece<C::P>>) {
+    #[cfg(test)]
+    pub(crate) fn pull(&self, x: C::Act, y: C::Act, out: &mut Vec<Piece<C::P>>) {
         self.as_ref().pull(x, y, out)
     }
     /// The union of `pieces`, canonical (one sweep over y). `pieces` is
     /// left in an unspecified order.
-    pub fn from_pieces(pieces: &mut [Piece<C::P>], scratch: &mut Vec<Seg<C::P>>) -> Self {
+    pub(crate) fn from_pieces(pieces: &mut [Piece<C::P>], scratch: &mut Vec<Seg<C::P>>) -> Self {
         Self::try_from_pieces(pieces, scratch, C::MAX_SEGS).unwrap_or_else(|| panic!("a region past {} segments", C::MAX_SEGS))
     }
 
     /// `from_pieces`, `None` past `max` x segments (capped at `MAX_SEGS`).
-    pub fn try_from_pieces(pieces: &mut [Piece<C::P>], scratch: &mut Vec<Seg<C::P>>, max: usize) -> Option<Self> {
+    pub(crate) fn try_from_pieces(pieces: &mut [Piece<C::P>], scratch: &mut Vec<Seg<C::P>>, max: usize) -> Option<Self> {
         let max = max.min(C::MAX_SEGS);
         let mut out = Region::default();
         if pieces.is_empty() {
@@ -544,14 +514,11 @@ impl<C: Circle> Clone for RegionRef<'_, C> {
 impl<C: Circle> Copy for RegionRef<'_, C> {}
 
 impl<'a, C: Circle> RegionRef<'a, C> {
-    pub fn is_empty(self) -> bool {
-        self.slabs.is_empty()
-    }
-    pub fn n_segs(self) -> usize {
+    pub(crate) fn n_segs(self) -> usize {
         self.xs.len()
     }
     /// Slabs (a y segment and its x set), in y order.
-    pub fn slabs(self) -> impl Iterator<Item = (Seg<C::P>, impl Iterator<Item = Seg<C::P>> + 'a)> + 'a {
+    pub(crate) fn slabs(self) -> impl Iterator<Item = (Seg<C::P>, impl Iterator<Item = Seg<C::P>> + 'a)> + 'a {
         self.stored().map(|(y, xs)| (y, xs.iter().map(|s| s.seg::<C>())))
     }
     fn stored(self) -> impl Iterator<Item = (Seg<C::P>, &'a [Stored<C::W>])> + 'a {
@@ -564,7 +531,7 @@ impl<'a, C: Circle> RegionRef<'a, C> {
         })
     }
     /// The set as pieces (a slab's y times each x segment), into `out`.
-    pub fn pieces(self, out: &mut Vec<Piece<C::P>>) {
+    pub(crate) fn pieces(self, out: &mut Vec<Piece<C::P>>) {
         for (y, xs) in self.slabs() {
             out.extend(xs.map(|x| Piece { y, x }));
         }
@@ -579,12 +546,12 @@ impl<'a, C: Circle> RegionRef<'a, C> {
         let i = xs.partition_point(|s| C::load(s.last) < p);
         xs.get(i).is_some_and(|s| C::load(s.lo) <= p)
     }
-    pub fn contains(self, x: C::P, y: C::P) -> bool {
+    pub(crate) fn contains(self, x: C::P, y: C::P) -> bool {
         self.slab_at(y).is_some_and(|xs| Self::holds(xs, x))
     }
     /// The IMAGE under one edge, into `out`: the points inside its guards,
     /// moved by its actions (`Circle::image`).
-    pub fn push(self, x: C::Act, y: C::Act, out: &mut Vec<Piece<C::P>>) {
+    pub(crate) fn push(self, x: C::Act, y: C::Act, out: &mut Vec<Piece<C::P>>) {
         let mut ximg: Vec<Seg<C::P>> = Vec::new();
         for (ys, xs) in self.slabs() {
             ximg.clear();
@@ -598,7 +565,7 @@ impl<'a, C: Circle> RegionRef<'a, C> {
         }
     }
     /// `p` intersected with `self`, as pieces appended to `out`.
-    pub fn clip_into(self, p: Piece<C::P>, out: &mut Vec<Piece<C::P>>) {
+    pub(crate) fn clip_into(self, p: Piece<C::P>, out: &mut Vec<Piece<C::P>>) {
         for (ys, xs) in self.slabs() {
             let Some(y) = clip(ys, p.y) else { continue };
             for s in xs {
@@ -611,7 +578,7 @@ impl<'a, C: Circle> RegionRef<'a, C> {
     /// The PREIMAGE under one edge, into `out`: the points inside its guards
     /// it takes into `self` (`Circle::preimage`; a constant axis takes its
     /// whole guard where `self` holds its point).
-    pub fn pull(self, x: C::Act, y: C::Act, out: &mut Vec<Piece<C::P>>) {
+    pub(crate) fn pull(self, x: C::Act, y: C::Act, out: &mut Vec<Piece<C::P>>) {
         let emit_x = |ys: Seg<C::P>, xs: &[Stored<C::W>], out: &mut Vec<Piece<C::P>>| match C::const_point(&x) {
             None => {
                 for s in xs {
@@ -658,7 +625,7 @@ const CHUNK_WORDS: usize = 1 << 25;
 /// place (8 B). A full chunk is SEALED: kept, or (`spill_to`) mapped from a
 /// scratch file (as `backward::Spill`). Records never move, so it grows
 /// without copying itself (a doubling list peaks at 90 GB for 50 GB of sets).
-pub struct RegionArena<C: Circle = Fixed16> {
+pub(crate) struct RegionArena<C: Circle = Fixed16> {
     /// Set `i`'s record: its chunk (high 32 bits; `sealed.len()` is the open
     /// one) and its first word there.
     at: Vec<u64>,
@@ -706,17 +673,14 @@ impl<C: Circle> Default for RegionArena<C> {
 
 impl<C: Circle> RegionArena<C> {
     /// Seal its full chunks into scratch files in `dir` (which must exist).
-    pub fn spill_to(&mut self, dir: &std::path::Path) {
+    pub(crate) fn spill_to(&mut self, dir: &std::path::Path) {
         self.spill = Some(dir.to_path_buf());
     }
-    pub fn len(&self) -> usize {
+    pub(crate) fn len(&self) -> usize {
         self.at.len()
     }
-    pub fn is_empty(&self) -> bool {
-        self.at.is_empty()
-    }
     /// Append `r`; its index.
-    pub fn push(&mut self, r: RegionRef<C>) -> u32 {
+    pub(crate) fn push(&mut self, r: RegionRef<C>) -> u32 {
         let i = u32::try_from(self.at.len()).expect("a region arena past u32 sets");
         let need = 2 + 3 * r.slabs.len() + 2 * r.xs.len();
         if self.open.len() + need > self.chunk {
@@ -756,18 +720,18 @@ impl<C: Circle> RegionArena<C> {
         };
         self.sealed.push(w);
     }
-    pub fn get(&self, i: u32) -> RegionRef<'_, C> {
+    pub(crate) fn get(&self, i: u32) -> RegionRef<'_, C> {
         let a = self.at[i as usize];
         let c = (a >> 32) as usize;
         let w = if c == self.sealed.len() { &self.open[..] } else { self.sealed[c].words() };
         record::<C>(&w[a as u32 as usize..])
     }
     /// The bytes its sets take (their records and places).
-    pub fn bytes(&self) -> usize {
+    pub(crate) fn bytes(&self) -> usize {
         (self.sealed_words as usize + self.open.len()) * std::mem::size_of::<C::W>() + self.at.len() * 8
     }
     /// The bytes of its sealed chunks mapped from scratch files.
-    pub fn mapped_bytes(&self) -> usize {
+    pub(crate) fn mapped_bytes(&self) -> usize {
         self.mapped_words as usize * std::mem::size_of::<C::W>()
     }
 }

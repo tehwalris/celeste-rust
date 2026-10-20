@@ -20,15 +20,15 @@ use crate::search::pos_graph::{GRID, NO_CELL};
 
 /// One bundle; `mask` over the target region's 64 cells.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct Bundle {
-    pub s_shape: u32,
-    pub s_key: Key,
+pub(crate) struct Bundle {
+    pub(crate) s_shape: u32,
+    pub(crate) s_key: Key,
     /// The global transfer id (`edges::XferTable`).
-    pub x: u32,
+    pub(crate) x: u32,
     /// The cell offset (`offset`).
-    pub o: u32,
-    pub t_key: Key,
-    pub mask: u64,
+    pub(crate) o: u32,
+    pub(crate) t_key: Key,
+    pub(crate) mask: u64,
 }
 
 const _: () = assert!(super::GEOMETRY.words == 1, "bundles hold a u64 mask: 8 x 8 storage regions");
@@ -37,13 +37,13 @@ const _: () = assert!(super::GEOMETRY.words == 1, "bundles hold a u64 mask: 8 x 
 /// (dy + 1024)`, between two cells (below `TO_NONE`); into `NO_CELL`,
 /// `TO_NONE | source cell` (the target's cell cannot give it back); out of
 /// `NO_CELL` `FROM_NONE`; `NONE_NONE` for neither.
-pub const TO_NONE: u32 = 1 << 22;
-pub const FROM_NONE: u32 = 1 << 23;
-pub const NONE_NONE: u32 = 1 << 24;
+pub(crate) const TO_NONE: u32 = 1 << 22;
+pub(crate) const FROM_NONE: u32 = 1 << 23;
+pub(crate) const NONE_NONE: u32 = 1 << 24;
 
 /// The offset code of an edge from cell `s` into cell `t`.
 #[inline]
-pub fn offset(s: u32, t: u32) -> u32 {
+pub(crate) fn offset(s: u32, t: u32) -> u32 {
     match (s == NO_CELL, t == NO_CELL) {
         (false, false) => {
             let g = GRID as u32;
@@ -59,7 +59,7 @@ pub fn offset(s: u32, t: u32) -> u32 {
 
 /// The source cell of an edge into cell `t` at offset code `o`.
 #[inline]
-pub fn source_cell(t: u32, o: u32) -> u32 {
+pub(crate) fn source_cell(t: u32, o: u32) -> u32 {
     if o < TO_NONE {
         let g = GRID as i32;
         let (dx, dy) = ((o >> 11) as i32 - 1024, (o & 2047) as i32 - 1024);
@@ -76,7 +76,7 @@ pub fn source_cell(t: u32, o: u32) -> u32 {
 /// `k` of the regions' 8 x 8 grids (source index = target index + `k`): the
 /// target cells whose source is in the source region, and `k`; `None`: none.
 #[inline]
-pub fn shift_into(t_slot: u32, s_slot: u32, o: u32) -> Option<(u64, i32)> {
+pub(crate) fn shift_into(t_slot: u32, s_slot: u32, o: u32) -> Option<(u64, i32)> {
     let geo = super::GEOMETRY;
     debug_assert!(o < TO_NONE && t_slot != geo.no_cell_slot() && s_slot != geo.no_cell_slot());
     let (side, pr) = (geo.side as i32, geo.per_row);
@@ -100,7 +100,7 @@ pub fn shift_into(t_slot: u32, s_slot: u32, o: u32) -> Option<(u64, i32)> {
 
 /// Cells `m` moved by `k` (`shift_into`; `m` inside its cells).
 #[inline]
-pub fn shift(m: u64, k: i32) -> u64 {
+pub(crate) fn shift(m: u64, k: i32) -> u64 {
     if k >= 0 {
         m << k
     } else {
@@ -112,7 +112,7 @@ pub fn shift(m: u64, k: i32) -> u64 {
 /// offset code `o`, all in slot `s_slot`'s region: the shifted mask and the
 /// shift. `None` when one leaves it: no bundle of a source there holds it.
 #[inline]
-pub fn source_cells(t_slot: u32, s_slot: u32, o: u32, mask: u64) -> Option<(u64, i32)> {
+pub(crate) fn source_cells(t_slot: u32, s_slot: u32, o: u32, mask: u64) -> Option<(u64, i32)> {
     let (inside, k) = shift_into(t_slot, s_slot, o)?;
     (mask & !inside == 0).then(|| (shift(mask, k), k))
 }
@@ -146,7 +146,7 @@ pub(crate) fn get_off(b: &[u8], pos: &mut usize) -> u32 {
 
 /// A field of a block's sort order.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum F {
+pub(crate) enum F {
     /// The source (its rank in the block's source dictionary).
     S,
     /// The target key (its rank in the target dictionary).
@@ -156,17 +156,17 @@ pub enum F {
     M,
 }
 
-pub const ORDER: [F; 5] = [F::M, F::O, F::X, F::S, F::T];
+pub(crate) const ORDER: [F; 5] = [F::M, F::O, F::X, F::S, F::T];
 
 /// A bundle as a block's record holds it: source and target as ranks into
 /// the block's dictionaries.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Ranked {
-    pub s: u32,
-    pub t: u32,
-    pub x: u32,
-    pub o: u32,
-    pub mask: u64,
+pub(crate) struct Ranked {
+    pub(crate) s: u32,
+    pub(crate) t: u32,
+    pub(crate) x: u32,
+    pub(crate) o: u32,
+    pub(crate) mask: u64,
 }
 
 impl Ranked {
@@ -245,7 +245,7 @@ fn put_record(out: &mut Vec<u8>, order: &[F; 5], prev: Option<&[u64; 5]>, vals: 
 /// Encode `bundles` (distinct, any order) as a raw block in `order` into
 /// `out` (cleared): the reference the grouped `Encoder` is checked against.
 #[cfg(test)]
-pub fn encode(bundles: &[Bundle], order: &[F; 5], out: &mut Vec<u8>) {
+pub(crate) fn encode(bundles: &[Bundle], order: &[F; 5], out: &mut Vec<u8>) {
     out.clear();
     let mut t: Vec<Key> = bundles.iter().map(|b| b.t_key).collect();
     t.sort_unstable();
@@ -277,12 +277,12 @@ pub fn encode(bundles: &[Bundle], order: &[F; 5], out: &mut Vec<u8>) {
 /// region table's entry, whose key the encoder looks up), its source by
 /// its index in the route's source list.
 #[derive(Clone, Copy, Debug)]
-pub struct Tb {
-    pub t: u32,
-    pub s: u32,
-    pub x: u32,
-    pub o: u32,
-    pub mask: u64,
+pub(crate) struct Tb {
+    pub(crate) t: u32,
+    pub(crate) s: u32,
+    pub(crate) x: u32,
+    pub(crate) o: u32,
+    pub(crate) mask: u64,
 }
 
 /// The block encoder of the region phase (writes `encode`'s format), its
@@ -290,7 +290,7 @@ pub struct Tb {
 /// arrays over their ids, the records GROUPED by (mask, offset, transfer) -
 /// a block has few, ~1 per 20-50 bundles - so no sort of the whole block.
 #[derive(Default)]
-pub struct Encoder {
+pub(crate) struct Encoder {
     t_rank: Vec<u32>,
     tids: Vec<u32>,
     s_perm: Vec<u32>,
@@ -303,7 +303,7 @@ pub struct Encoder {
 
 impl Encoder {
     /// Buffers back to default if any has room for more than `keep` items.
-    pub fn bound(&mut self, keep: usize) {
+    pub(crate) fn bound(&mut self, keep: usize) {
         let big = [self.t_rank.capacity(), self.tids.capacity(), self.s_perm.capacity(), self.item_g.capacity(), self.at.capacity(), self.st.capacity(), self.groups.capacity(), self.gid.capacity()].into_iter().any(|c| c > keep);
         if big {
             *self = Encoder::default();
@@ -311,7 +311,7 @@ impl Encoder {
     }
 
     /// Bytes its buffers hold (`--phases`' `[wavemem]`).
-    pub fn alloc_bytes(&self) -> usize {
+    pub(crate) fn alloc_bytes(&self) -> usize {
         4 * (self.t_rank.capacity() + self.tids.capacity() + self.s_perm.capacity() + self.item_g.capacity() + self.at.capacity()) + 8 * self.st.capacity() + 20 * self.groups.capacity() + 24 * self.gid.capacity()
     }
 }
@@ -322,7 +322,7 @@ impl Encoder {
     /// `bundles` (distinct, any order) as a raw block in `ORDER` into `out`
     /// (cleared), targets and sources numbered as met: the waiting bundles,
     /// in the region phase and again at the frame's end (`route::reencode`).
-    pub fn encode_bundles(&mut self, bundles: &[Bundle], out: &mut Vec<u8>) {
+    pub(crate) fn encode_bundles(&mut self, bundles: &[Bundle], out: &mut Vec<u8>) {
         let mut t_id: rustc_hash2::FxHashMap<Key, u32> = Default::default();
         let mut s_id: rustc_hash2::FxHashMap<(u32, Key), u32> = Default::default();
         let (mut t_keys, mut s_list): (Vec<Key>, Vec<(u32, Key)>) = (Vec::new(), Vec::new());
@@ -348,7 +348,7 @@ impl Encoder {
     /// `items` (distinct) as a raw block in `ORDER` into `out` (cleared):
     /// target ids below `n_ids`, their keys `t_key(id)`; source indices into
     /// `sources` (distinct; each one some item's).
-    pub fn encode(&mut self, items: &[Tb], n_ids: usize, t_key: impl Fn(u32) -> Key, sources: &[(u32, Key)], out: &mut Vec<u8>) {
+    pub(crate) fn encode(&mut self, items: &[Tb], n_ids: usize, t_key: impl Fn(u32) -> Key, sources: &[(u32, Key)], out: &mut Vec<u8>) {
         out.clear();
         if self.t_rank.len() < n_ids {
             self.t_rank.resize(n_ids, u32::MAX);
@@ -448,16 +448,16 @@ impl Encoder {
 }
 
 /// A raw block, its dictionaries read; `records` walks its bundles.
-pub struct Block<'a> {
-    pub t_keys: Vec<Key>,
-    pub sources: Vec<(u32, Key)>,
+pub(crate) struct Block<'a> {
+    pub(crate) t_keys: Vec<Key>,
+    pub(crate) sources: Vec<(u32, Key)>,
     body: &'a [u8],
     n: usize,
     order: [F; 5],
 }
 
 impl<'a> Block<'a> {
-    pub fn open(raw: &'a [u8], order: &[F; 5]) -> Result<Self> {
+    pub(crate) fn open(raw: &'a [u8], order: &[F; 5]) -> Result<Self> {
         let mut pos = 0usize;
         let nt = get_varint(raw, &mut pos) as usize;
         let mut t_keys = Vec::with_capacity(nt);
@@ -485,16 +485,13 @@ impl<'a> Block<'a> {
         Ok(Block { t_keys, sources, body: &raw[pos..], n, order: *order })
     }
 
-    pub fn len(&self) -> usize {
-        self.n
-    }
-
-    pub fn is_empty(&self) -> bool {
+    #[cfg(test)]
+    pub(crate) fn is_empty(&self) -> bool {
         self.n == 0
     }
 
     /// Every record, in the block's order.
-    pub fn records(&self, mut f: impl FnMut(&Ranked)) -> Result<()> {
+    pub(crate) fn records(&self, mut f: impl FnMut(&Ranked)) -> Result<()> {
         let b = self.body;
         let mut pos = 0usize;
         let mut r = Ranked { s: 0, t: 0, x: 0, o: 0, mask: 0 };
@@ -524,7 +521,7 @@ impl<'a> Block<'a> {
     }
 
     /// Every bundle, keys resolved.
-    pub fn bundles(&self, mut f: impl FnMut(Bundle)) -> Result<()> {
+    pub(crate) fn bundles(&self, mut f: impl FnMut(Bundle)) -> Result<()> {
         let (t, s) = (&self.t_keys, &self.sources);
         let mut bad = None;
         self.records(|r| match (t.get(r.t as usize), s.get(r.s as usize)) {

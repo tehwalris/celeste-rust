@@ -50,110 +50,110 @@ use crate::storage::layer::{bits, last_frame, Tree};
 
 /// One forward frame's stats: a `forward.tsv` row under the UI's names.
 #[derive(Serialize, Clone, Debug)]
-pub struct FwdLine {
-    pub f: u32,
-    pub in_entries: u64,
-    pub in_lanes: u64,
-    pub raw: u64,
-    pub kept: u64,
-    pub out_entries: u64,
-    pub out_lanes: u64,
-    pub visited: u64,
-    pub emit_ms: u64,
-    pub emit_idle: u32,
-    pub own_ms: u64,
-    pub own_idle: u32,
-    pub ckpt_ms: u64,
-    pub pos_ms: u64,
-    pub total_ms: u64,
-    pub rss_gb: f64,
+pub(crate) struct FwdLine {
+    pub(crate) f: u32,
+    pub(crate) in_entries: u64,
+    pub(crate) in_lanes: u64,
+    pub(crate) raw: u64,
+    pub(crate) kept: u64,
+    pub(crate) out_entries: u64,
+    pub(crate) out_lanes: u64,
+    pub(crate) visited: u64,
+    pub(crate) emit_ms: u64,
+    pub(crate) emit_idle: u32,
+    pub(crate) own_ms: u64,
+    pub(crate) own_idle: u32,
+    pub(crate) ckpt_ms: u64,
+    pub(crate) pos_ms: u64,
+    pub(crate) total_ms: u64,
+    pub(crate) rss_gb: f64,
 }
 
 #[derive(Serialize, Clone, Debug)]
-pub struct LevelRun {
-    pub level: usize,
+pub(crate) struct LevelRun {
+    pub(crate) level: usize,
     /// The level's spec (`r0sxhn`), or the arc pass's name.
-    pub precision: String,
-    pub fwd: Vec<FwdLine>,
-    pub bwd: [u32; 0],
-    pub first_win: Option<u32>,
-    pub marked: Option<u64>,
-    pub reruns: Option<u64>,
-    pub refuted: bool,
+    pub(crate) precision: String,
+    pub(crate) fwd: Vec<FwdLine>,
+    pub(crate) bwd: [u32; 0],
+    pub(crate) first_win: Option<u32>,
+    pub(crate) marked: Option<u64>,
+    pub(crate) reruns: Option<u64>,
+    pub(crate) refuted: bool,
     /// Frames in the tree (f0..frames-1).
-    pub frames: u32,
-    pub frames_file: String,
-    pub marks_file: Option<String>,
-    pub frame_states: Vec<u64>,
-    pub frame_wins: Vec<u64>,
-    pub marks_have_dist: bool,
-    pub marks_by_dist: Vec<u64>,
-    pub mlayers_file: Option<String>,
-    pub marks_by_layer: Vec<u64>,
+    pub(crate) frames: u32,
+    pub(crate) frames_file: String,
+    pub(crate) marks_file: Option<String>,
+    pub(crate) frame_states: Vec<u64>,
+    pub(crate) frame_wins: Vec<u64>,
+    pub(crate) marks_have_dist: bool,
+    pub(crate) marks_by_dist: Vec<u64>,
+    pub(crate) mlayers_file: Option<String>,
+    pub(crate) marks_by_layer: Vec<u64>,
     /// A backward over ANOTHER level's forward (`--arc`): that level's
     /// index, whose frames it shares; no forward pass of its own.
-    pub forward_of: Option<usize>,
+    pub(crate) forward_of: Option<usize>,
 }
 
 #[derive(Serialize, Clone, Debug)]
-pub struct HorizonRun {
-    pub h: u32,
-    pub levels: Vec<LevelRun>,
-    pub refuted_at: Option<usize>,
+pub(crate) struct HorizonRun {
+    pub(crate) h: u32,
+    pub(crate) levels: Vec<LevelRun>,
+    pub(crate) refuted_at: Option<usize>,
     /// No backward (exported without `--arc`): frames up to `h`, no verdict.
-    pub partial: bool,
+    pub(crate) partial: bool,
 }
 
 #[derive(Serialize, Clone, Debug)]
-pub struct Box2 {
-    pub x0: i32,
-    pub y0: i32,
-    pub w: u32,
-    pub h: u32,
+pub(crate) struct Box2 {
+    pub(crate) x0: i32,
+    pub(crate) y0: i32,
+    pub(crate) w: u32,
+    pub(crate) h: u32,
 }
 
 #[derive(Serialize, Clone, Debug)]
-pub struct Tiles {
+pub(crate) struct Tiles {
     /// `w x h` tiles of 8 px from the start room's origin, row-major.
-    pub w: u32,
-    pub h: u32,
-    pub ids: Vec<u8>,
-    pub solid: Vec<bool>,
+    pub(crate) w: u32,
+    pub(crate) h: u32,
+    pub(crate) ids: Vec<u8>,
+    pub(crate) solid: Vec<bool>,
 }
 
 #[derive(Serialize, Debug)]
-pub struct Run {
-    pub format: u32,
-    pub room: (i16, i16),
-    pub cell_box: Box2,
-    pub tiles: Tiles,
-    pub wall_s: Option<f64>,
-    pub prebuild_s: Option<f64>,
-    pub optimal: Option<u32>,
-    pub horizons: Vec<HorizonRun>,
+pub(crate) struct Run {
+    pub(crate) format: u32,
+    pub(crate) room: (i16, i16),
+    pub(crate) cell_box: Box2,
+    pub(crate) tiles: Tiles,
+    pub(crate) wall_s: Option<f64>,
+    pub(crate) prebuild_s: Option<f64>,
+    pub(crate) optimal: Option<u32>,
+    pub(crate) horizons: Vec<HorizonRun>,
     /// Drawn over the room: `--arc`'s `witness.txt`, or `--witness FILE`.
-    pub witness: Option<Witness>,
+    pub(crate) witness: Option<Witness>,
     /// `--reference FILE`: e.g. the community TAS in the original cart.
-    pub reference: Option<Witness>,
+    pub(crate) reference: Option<Witness>,
     /// The file the UI offers for download (`--download FILE`), verbatim.
-    pub download: Option<Download>,
+    pub(crate) download: Option<Download>,
 }
 
 #[derive(Serialize, Debug)]
-pub struct Download {
-    pub file: String,
-    pub text: String,
+pub(crate) struct Download {
+    pub(crate) file: String,
+    pub(crate) text: String,
 }
 
 /// A concrete run: its inputs, the player's (x, y) per frame from the start
 /// (`None` without a player) in the cells' pixels, and the frames a dash
 /// starts at with its direction (`R`, `U`, ...; when the file lists them).
 #[derive(Serialize, Debug)]
-pub struct Witness {
-    pub label: String,
-    pub inputs: Vec<u8>,
-    pub path: Vec<Option<(i32, i32)>>,
-    pub dashes: Vec<(u32, String)>,
+pub(crate) struct Witness {
+    pub(crate) label: String,
+    pub(crate) inputs: Vec<u8>,
+    pub(crate) path: Vec<Option<(i32, i32)>>,
+    pub(crate) dashes: Vec<(u32, String)>,
 }
 
 fn level_run(level: usize, precision: String, fwd: Vec<FwdLine>, first_win: Option<u32>) -> LevelRun {
@@ -579,7 +579,7 @@ impl Writer {
 
 /// A state with no player position (the player object is gone: dead, or
 /// past the room transition) has no cell; the UI counts it off-grid.
-pub const NO_POSITION: u32 = u32::MAX;
+pub(crate) const NO_POSITION: u32 = u32::MAX;
 
 fn cell_idx(cell: u32, b: &Box2) -> Result<u32> {
     let Some((x, y)) = cell_xy(cell) else { return Ok(NO_POSITION) };

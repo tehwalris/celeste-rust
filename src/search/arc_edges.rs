@@ -34,42 +34,45 @@
 //! Anything else is REFUSED, FATAL in the forward: the record would be an
 //! unchecked claim about the remainder.
 
-use super::arcs::{self, Action, Seg, Set, Transfer, CIRCLE};
+use super::arcs::{self, Action, Seg, Transfer, CIRCLE};
+#[cfg(test)]
+use super::arcs::Set;
 
 const HALF: i64 = 32768;
 const ONE: i64 = 65536;
 
 /// A `rem::Capture` in raw 16.16 (inclusive intervals).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct RawAxis {
-    pub took: bool,
-    pub pre: (i32, i32),
-    pub frag: (i32, i32),
-    pub ox: (i32, i32),
-    pub fin: Option<(i32, i32)>,
+pub(crate) struct RawAxis {
+    pub(crate) took: bool,
+    pub(crate) pre: (i32, i32),
+    pub(crate) frag: (i32, i32),
+    pub(crate) ox: (i32, i32),
+    pub(crate) fin: Option<(i32, i32)>,
 }
 
 /// One axis's decoded transfer as a record stores it: the guard `[lo, hi)`
 /// and the action (`tag` 0: `Rotate(val)`, `val` in `0..CIRCLE`; 1: `Const`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct AxisXfer {
-    pub lo: u32,
-    pub hi: u32,
-    pub tag: u8,
-    pub val: i32,
+    pub(crate) lo: u32,
+    pub(crate) hi: u32,
+    pub(crate) tag: u8,
+    pub(crate) val: i32,
 }
 
 impl AxisXfer {
-    pub fn guard(&self) -> Set {
+    #[cfg(test)]
+    pub(crate) fn guard(&self) -> Set {
         Set::seg(self.lo, self.hi)
     }
-    pub fn action(&self) -> Action {
+    pub(crate) fn action(&self) -> Action {
         match self.tag {
             0 => Action::Rotate(self.val),
             _ => Action::Const(self.val as u32),
         }
     }
-    pub fn transfer(&self) -> Transfer {
+    pub(crate) fn transfer(&self) -> Transfer {
         Transfer { guard: Seg { lo: self.lo, hi: self.hi }, action: self.action() }
     }
     fn rotate(lo: u32, hi: u32, v: i64) -> Self {
@@ -84,12 +87,12 @@ impl AxisXfer {
 }
 
 /// A transfer pair (x, y) as one edge record's id refers to it.
-pub type Pair = (AxisXfer, AxisXfer);
+pub(crate) type Pair = (AxisXfer, AxisXfer);
 
 /// Bytes per encoded pair: per axis `lo`, `hi` (u32), `tag` (u8), `val` (i32).
-pub const PAIR_BYTES: usize = 2 * 13;
+pub(crate) const PAIR_BYTES: usize = 2 * 13;
 
-pub fn encode_pair(out: &mut Vec<u8>, p: &Pair) {
+pub(crate) fn encode_pair(out: &mut Vec<u8>, p: &Pair) {
     for a in [p.0, p.1] {
         out.extend_from_slice(&a.lo.to_le_bytes());
         out.extend_from_slice(&a.hi.to_le_bytes());
@@ -98,14 +101,14 @@ pub fn encode_pair(out: &mut Vec<u8>, p: &Pair) {
     }
 }
 
-pub fn decode_pair(b: &[u8]) -> Pair {
+pub(crate) fn decode_pair(b: &[u8]) -> Pair {
     let u32_at = |o: usize| u32::from_le_bytes(b[o..o + 4].try_into().unwrap());
     let axis = |o: usize| AxisXfer { lo: u32_at(o), hi: u32_at(o + 4), tag: b[o + 8], val: u32_at(o + 9) as i32 };
     (axis(0), axis(13))
 }
 
 /// Decode one axis (the module doc's rules). `Err` is a refusal.
-pub fn decode_axis(r: &RawAxis) -> std::result::Result<AxisXfer, String> {
+pub(crate) fn decode_axis(r: &RawAxis) -> std::result::Result<AxisXfer, String> {
     let whole = (-HALF, HALF - 1);
     let wide = |v: (i32, i32)| (v.0 as i64, v.1 as i64);
     if !r.took {

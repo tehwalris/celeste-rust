@@ -997,7 +997,7 @@ impl CostToGo {
 
     /// The smallest horizon at which a row at `frame` is NOT `too_late`:
     /// `frame + d`; 0 off the table (never refused), `u32::MAX` with no exit.
-    pub fn admitted_from(&self, shape: u64, cell: u32, frame: u32) -> u32 {
+    pub(crate) fn admitted_from(&self, shape: u64, cell: u32, frame: u32) -> u32 {
         let Some((x, y)) = crate::search::pos_graph::cell_xy(cell) else { return 0 };
         if x >= 128 {
             return 0;

@@ -24,17 +24,17 @@ use celeste_engine::exact::{Code, KeyAdditions, MissKey, Provisional};
 
 /// An OLD frontier state: its hull grown since its last push (`was`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Old<N: Rem = P8> {
-    pub sk: Sk,
-    pub layer: u16,
-    pub hull: HullOf<N>,
-    pub was: HullOf<N>,
+pub(crate) struct Old<N: Rem = P8> {
+    pub(crate) sk: Sk,
+    pub(crate) layer: u16,
+    pub(crate) hull: HullOf<N>,
+    pub(crate) was: HullOf<N>,
 }
 
 /// OLD states by layer (ascending; no empty layer), each layer's sorted.
-pub type ByLayer<N = P8> = Vec<OldLayer<N>>;
+pub(crate) type ByLayer<N = P8> = Vec<OldLayer<N>>;
 
-pub fn by_layer_states<N: Rem>(by: &ByLayer<N>) -> usize {
+pub(crate) fn by_layer_states<N: Rem>(by: &ByLayer<N>) -> usize {
     by.iter().map(OldLayer::len).sum()
 }
 
@@ -42,7 +42,7 @@ pub fn by_layer_states<N: Rem>(by: &ByLayer<N>) -> usize {
 /// and first state, per state its hull and `was` (32 B an entry, 16 a state).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct OldLayer<N: Rem = P8> {
-    pub layer: u16,
+    pub(crate) layer: u16,
     entries: Vec<OldEntry>,
     hulls: Vec<[HullOf<N>; 2]>,
 }
@@ -56,12 +56,12 @@ struct OldEntry {
 }
 
 impl<N: Rem> OldLayer<N> {
-    pub fn new(layer: u16, states: usize) -> Self {
+    pub(crate) fn new(layer: u16, states: usize) -> Self {
         OldLayer { layer, entries: Vec::new(), hulls: Vec::with_capacity(states) }
     }
 
     /// Append `o` (of this layer, past every state held).
-    pub fn push(&mut self, o: &Old<N>) {
+    pub(crate) fn push(&mut self, o: &Old<N>) {
         debug_assert_eq!(o.layer, self.layer, "an old state of another layer");
         let bit = 1u64 << o.sk.local;
         match self.entries.last_mut() {
@@ -78,15 +78,15 @@ impl<N: Rem> OldLayer<N> {
         self.hulls.push([o.hull, o.was]);
     }
 
-    pub fn len(&self) -> usize {
+    pub(crate) fn len(&self) -> usize {
         self.hulls.len()
     }
 
-    pub fn is_empty(&self) -> bool {
+    pub(crate) fn is_empty(&self) -> bool {
         self.hulls.is_empty()
     }
 
-    pub fn bytes(&self) -> usize {
+    pub(crate) fn bytes(&self) -> usize {
         self.entries.capacity() * std::mem::size_of::<OldEntry>() + self.hulls.capacity() * std::mem::size_of::<[HullOf<N>; 2]>()
     }
 
@@ -98,12 +98,12 @@ impl<N: Rem> OldLayer<N> {
         })
     }
 
-    pub fn iter(&self) -> impl Iterator<Item = Old<N>> + '_ {
+    pub(crate) fn iter(&self) -> impl Iterator<Item = Old<N>> + '_ {
         (0..self.entries.len()).flat_map(move |e| self.entry_olds(e))
     }
 
     /// States `r` (by place), in order.
-    pub fn range(&self, r: std::ops::Range<usize>) -> impl Iterator<Item = Old<N>> + '_ {
+    pub(crate) fn range(&self, r: std::ops::Range<usize>) -> impl Iterator<Item = Old<N>> + '_ {
         let e = self.entries.partition_point(|x| x.first as usize <= r.start).saturating_sub(1);
         let skip = r.start - self.entries.get(e).map_or(0, |x| x.first as usize);
         (e..self.entries.len()).flat_map(move |e| self.entry_olds(e)).skip(skip).take(r.len())
@@ -126,7 +126,7 @@ impl<N: Rem> Default for Frontier<N> {
 }
 
 impl<N: Rem> Frontier<N> {
-    pub fn is_empty(&self) -> bool {
+    pub(crate) fn is_empty(&self) -> bool {
         self.new.is_empty() && self.old.is_empty()
     }
 
@@ -134,9 +134,6 @@ impl<N: Rem> Frontier<N> {
         by_layer_states(&self.old)
     }
 
-    pub fn states(&self) -> u64 {
-        self.new.states() + self.old_states() as u64
-    }
 }
 
 pub struct Wave<N: Rem = P8> {
@@ -146,15 +143,15 @@ pub struct Wave<N: Rem = P8> {
     /// The states expanded before whose hull GREW.
     pub grown: ByLayer<N>,
     /// The new states' wins: per entry of `next` (ascending) its win cells.
-    pub wins: Vec<(u32, u64)>,
+    pub(crate) wins: Vec<(u32, u64)>,
     pub stats: FrameStats,
     /// The shapes the wave numbered and what the key space gained.
-    pub shapes: Vec<(u32, u64)>,
-    pub keys: KeyAdditions<N>,
+    pub(crate) shapes: Vec<(u32, u64)>,
+    pub(crate) keys: KeyAdditions<N>,
 }
 
 impl<N: Rem> Wave<N> {
-    pub fn frontier(self) -> Frontier<N> {
+    pub(crate) fn frontier(self) -> Frontier<N> {
         Frontier { new: self.next, hulls: self.hulls, old: self.grown }
     }
 
@@ -272,20 +269,20 @@ fn idle_fraction(wall: std::time::Duration, workers: usize, busy: std::time::Dur
     (1.0 - busy.as_secs_f64() / (workers as f64 * wall.as_secs_f64())).max(0.0)
 }
 
-pub struct WaveCtx<'a, N: Rem = P8> {
-    pub visited: &'a mut VisitedSet<N>,
-    pub xfers: &'a mut XferTable<N>,
-    pub pos: Option<&'a crate::search::pos_graph::PosObserver>,
-    pub filters: Filters<'a, N>,
-    pub frame: u32,
+pub(crate) struct WaveCtx<'a, N: Rem = P8> {
+    pub(crate) visited: &'a mut VisitedSet<N>,
+    pub(crate) xfers: &'a mut XferTable<N>,
+    pub(crate) pos: Option<&'a crate::search::pos_graph::PosObserver>,
+    pub(crate) filters: Filters<'a, N>,
+    pub(crate) frame: u32,
     /// The level's `edges/` dir: edges are recorded only with one.
-    pub edges_dir: Option<&'a std::path::Path>,
+    pub(crate) edges_dir: Option<&'a std::path::Path>,
     /// The tree's out-edges (`None`: a frontier without old states).
-    pub outs: Option<&'a super::out::OutStore>,
+    pub(crate) outs: Option<&'a super::out::OutStore>,
     /// The forward's skeletons, registered by the emissions: the next layer's.
-    pub skeletons: &'a Skeletons<N>,
+    pub(crate) skeletons: &'a Skeletons<N>,
     /// The tree's ceiling (its level -1 horizon), for `frame::not_expanded`.
-    pub ceiling: Option<u32>,
+    pub(crate) ceiling: Option<u32>,
 }
 
 #[derive(Default)]
@@ -345,7 +342,7 @@ fn run_unit<N: Rem>(engine: &dyn FrameStep<N>, u: u32, entries: std::ops::Range<
 }
 
 /// ONE FORWARD FRAME: frame `cx.frame` from `front` (grown the frame before).
-pub fn run_wave<N: Rem>(engine: &dyn FrameStep<N>, front: Frontier<N>, cx: WaveCtx<N>) -> Result<Wave<N>> {
+pub(crate) fn run_wave<N: Rem>(engine: &dyn FrameStep<N>, front: Frontier<N>, cx: WaveCtx<N>) -> Result<Wave<N>> {
     use std::time::Instant;
     let WaveCtx { visited, xfers, pos, filters, frame, edges_dir, outs, skeletons, ceiling } = cx;
     // A platforms-unknown level knows only `PLATFORM_WORLD_FRAMES` worlds.
@@ -1477,7 +1474,7 @@ fn finalize_keys<N: Rem>(visited: &mut VisitedSet<N>, states: &[RouteState<N>], 
 }
 
 /// `f` over `items` on `threads` threads, in `items`' order.
-pub fn par_map<T: Sync, R: Send>(items: &[T], threads: usize, f: impl Fn(&T) -> R + Sync) -> Vec<R> {
+pub(crate) fn par_map<T: Sync, R: Send>(items: &[T], threads: usize, f: impl Fn(&T) -> R + Sync) -> Vec<R> {
     crate::par::Pool::new(threads).map(items.len(), |i| Ok(f(&items[i]))).expect("an infallible map")
 }
 
@@ -1488,7 +1485,7 @@ pub fn par_map<T: Sync, R: Send>(items: &[T], threads: usize, f: impl Fn(&T) -> 
 /// `trace::walk`) - and nothing looks the start up by projection
 /// (`backward::Seeds::load`, `known::Pruning::start`). Each row must decode
 /// to itself (`check_piece`).
-pub fn seed<N: Rem>(visited: &mut VisitedSet<N>, blocks: &[Block<N>], start: HullOf<N>, s: &crate::settings::Settings) -> Result<Wave<N>> {
+pub(crate) fn seed<N: Rem>(visited: &mut VisitedSet<N>, blocks: &[Block<N>], start: HullOf<N>, s: &crate::settings::Settings) -> Result<Wave<N>> {
     let geo = visited.geo;
     let ids = crate::compiled::ids();
     let mut canon: Vec<celeste_engine::runtime2::Rt2<N>> = Vec::with_capacity(blocks.len());
@@ -1568,16 +1565,10 @@ pub fn seed<N: Rem>(visited: &mut VisitedSet<N>, blocks: &[Block<N>], start: Hul
     Ok(Wave { next, hulls, grown: Vec::new(), wins, stats, shapes: numbered, keys: keys_added })
 }
 
-/// `one_frame`'s successors (rows with their keys) and their key space.
-pub struct OneFrame<N: Rem = P8> {
-    pub next: Vec<Block<N>>,
-    pub keys: celeste_engine::exact::KeySpace<N>,
-}
-
 /// ONE FRAME of `rows` (widened to the engine's level) against an EMPTY
 /// tree: every successor new, a row's own too (the seeds are forgotten once
-/// keyed); the whole circle as their hulls.
-pub fn one_frame<N: Rem>(engine: &dyn FrameStep<N>, rows: Vec<Block<N>>, frame: u32) -> Result<OneFrame<N>> {
+/// keyed); the whole circle as their hulls. The successors, with their keys.
+pub fn one_frame<N: Rem>(engine: &dyn FrameStep<N>, rows: Vec<Block<N>>, frame: u32) -> Result<Vec<Block<N>>> {
     let mut visited = VisitedSet::<N>::new(super::GEOMETRY);
     let mut xfers = XferTable::<N>::default();
     let skeletons = Skeletons::<N>::default();
@@ -1586,8 +1577,7 @@ pub fn one_frame<N: Rem>(engine: &dyn FrameStep<N>, rows: Vec<Block<N>>, frame: 
     visited.forget_states();
     let cx = WaveCtx { visited: &mut visited, xfers: &mut xfers, pos: None, filters: Filters::default(), frame, edges_dir: None, outs: None, skeletons: &skeletons, ceiling: None };
     let wave = run_wave(engine, start, cx)?;
-    let next = super::layer::decode_states(&wave.next, &visited.keys, visited.shapes(), usize::MAX, &|_| true)?.into_iter().map(|(_, rt2)| Block::from_rt2(rt2)).collect();
-    Ok(OneFrame { next, keys: visited.keys })
+    Ok(super::layer::decode_states(&wave.next, &visited.keys, visited.shapes(), usize::MAX, &|_| true)?.into_iter().map(|(_, rt2)| Block::from_rt2(rt2)).collect())
 }
 
 #[cfg(test)]

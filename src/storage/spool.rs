@@ -8,76 +8,73 @@ use std::os::unix::fs::FileExt;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// The scratch file, appended by any thread (each block at its own offset).
-pub struct Spool {
+pub(crate) struct Spool {
     file: std::fs::File,
     end: AtomicU64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Spooled {
+pub(crate) struct Spooled {
     at: u64,
     len: u32,
 }
 
 impl Spool {
     /// A spool at `path` (created, then unlinked).
-    pub fn create(path: &std::path::Path) -> Result<Self> {
+    pub(crate) fn create(path: &std::path::Path) -> Result<Self> {
         let file = std::fs::File::options().read(true).write(true).create(true).truncate(true).open(path).with_context(|| path.display().to_string())?;
         std::fs::remove_file(path).with_context(|| path.display().to_string())?;
         Ok(Spool { file, end: AtomicU64::new(0) })
     }
 
     /// Append `b`; its place.
-    pub fn put(&self, b: &[u8]) -> Result<Spooled> {
+    pub(crate) fn put(&self, b: &[u8]) -> Result<Spooled> {
         let len = u32::try_from(b.len()).context("a spooled block past 4 GB")?;
         let at = self.end.fetch_add(b.len() as u64, Ordering::Relaxed);
         self.file.write_all_at(b, at).context("writing the frame's spool")?;
         Ok(Spooled { at, len })
     }
 
-    pub fn read(&self, s: Spooled, buf: &mut Vec<u8>) -> Result<()> {
+    pub(crate) fn read(&self, s: Spooled, buf: &mut Vec<u8>) -> Result<()> {
         buf.resize(s.len as usize, 0);
         self.file.read_exact_at(buf, s.at).context("reading the frame's spool")
     }
 
-    pub fn bytes(&self) -> u64 {
+    pub(crate) fn bytes(&self) -> u64 {
         self.end.load(Ordering::Relaxed)
     }
 }
 
 /// A block's compressed bytes: in memory, or spooled.
 #[derive(Debug)]
-pub enum Body {
+pub(crate) enum Body {
     Mem(Vec<u8>),
     Spool(Spooled),
 }
 
 impl Body {
-    pub fn len(&self) -> usize {
+    pub(crate) fn len(&self) -> usize {
         match self {
             Body::Mem(v) => v.len(),
             Body::Spool(s) => s.len as usize,
         }
     }
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
-    }
     /// Bytes it holds in memory.
-    pub fn held(&self) -> usize {
+    pub(crate) fn held(&self) -> usize {
         match self {
             Body::Mem(v) => v.capacity(),
             Body::Spool(_) => 0,
         }
     }
     /// Into `spool`, if there is one.
-    pub fn spill(self, spool: Option<&Spool>) -> Result<Body> {
+    pub(crate) fn spill(self, spool: Option<&Spool>) -> Result<Body> {
         match (self, spool) {
             (Body::Mem(v), Some(sp)) => Ok(Body::Spool(sp.put(&v)?)),
             (b, _) => Ok(b),
         }
     }
     /// Its bytes: `f` on them (a spooled block read into `buf` first).
-    pub fn with<R>(&self, spool: Option<&Spool>, buf: &mut Vec<u8>, f: impl FnOnce(&[u8]) -> R) -> Result<R> {
+    pub(crate) fn with<R>(&self, spool: Option<&Spool>, buf: &mut Vec<u8>, f: impl FnOnce(&[u8]) -> R) -> Result<R> {
         match self {
             Body::Mem(v) => Ok(f(v)),
             Body::Spool(s) => {

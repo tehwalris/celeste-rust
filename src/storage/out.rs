@@ -32,29 +32,29 @@ const MAGIC: &[u8; 4] = b"CSO1";
 
 /// One out-edge row as a unit makes it (`o`: `bundle::offset`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub struct Row<N: Rem = P8> {
-    pub s_region: u32,
-    pub s_key: Key,
-    pub route: (u64, u32),
-    pub t_key: Key,
-    pub pair: N::Pair,
-    pub o: u32,
-    pub mask: u64,
+pub(crate) struct Row<N: Rem = P8> {
+    pub(crate) s_region: u32,
+    pub(crate) s_key: Key,
+    pub(crate) route: (u64, u32),
+    pub(crate) t_key: Key,
+    pub(crate) pair: N::Pair,
+    pub(crate) o: u32,
+    pub(crate) mask: u64,
 }
 
 /// One bundle of an entry as a block holds it: target, transfer by index.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct OutBundle {
-    pub t: u32,
-    pub x: u32,
-    pub o: u32,
-    pub mask: u64,
+pub(crate) struct OutBundle {
+    pub(crate) t: u32,
+    pub(crate) x: u32,
+    pub(crate) o: u32,
+    pub(crate) mask: u64,
 }
 
 /// An entry's bundles, decoded as read (`Block::entries`). A named type,
 /// not a `dyn Iterator`, so the re-push's loop is statically dispatched (a
 /// trait object cost ~0.7% of a frame's instructions undevirtualized).
-pub struct OutBundles<'a> {
+pub(crate) struct OutBundles<'a> {
     eb: &'a [u8],
     q: usize,
     t: u32,
@@ -86,17 +86,17 @@ impl Iterator for OutBundles<'_> {
 /// A block's content by index (`encode_parts`): its routes, pairs, targets
 /// `(route, key)` and entries `(region, key)`, each sorted and distinct;
 /// its rows `(entry, target, pair, offset) -> cells`, any order, merged.
-pub struct Parts<N: Rem = P8> {
-    pub routes: Vec<(u64, u32)>,
-    pub pairs: Vec<N::Pair>,
-    pub targets: Vec<(u32, Key)>,
-    pub entries: Vec<(u32, Key)>,
-    pub rows: Vec<(u128, u64)>,
+pub(crate) struct Parts<N: Rem = P8> {
+    pub(crate) routes: Vec<(u64, u32)>,
+    pub(crate) pairs: Vec<N::Pair>,
+    pub(crate) targets: Vec<(u32, Key)>,
+    pub(crate) entries: Vec<(u32, Key)>,
+    pub(crate) rows: Vec<(u128, u64)>,
 }
 
 /// A row's sort key: entry, target, pair, offset.
 #[inline]
-pub fn row_key(entry: u32, t: u32, x: u32, o: u32) -> u128 {
+pub(crate) fn row_key(entry: u32, t: u32, x: u32, o: u32) -> u128 {
     (entry as u128) << 96 | (t as u128) << 64 | (x as u128) << 32 | o as u128
 }
 
@@ -107,7 +107,7 @@ impl<N: Rem> Default for Parts<N> {
 }
 
 impl<N: Rem> Parts<N> {
-    pub fn clear(&mut self) {
+    pub(crate) fn clear(&mut self) {
         self.routes.clear();
         self.pairs.clear();
         self.targets.clear();
@@ -118,7 +118,7 @@ impl<N: Rem> Parts<N> {
 
 /// ENCODE `p` as a raw block into `out` (cleared). Returns whether a
 /// target key is provisional (the block waits for `fixup`).
-pub fn encode_parts<N: Rem>(p: &mut Parts<N>, out: &mut Vec<u8>) -> bool {
+pub(crate) fn encode_parts<N: Rem>(p: &mut Parts<N>, out: &mut Vec<u8>) -> bool {
     out.clear();
     debug_assert!(p.routes.windows(2).all(|w| w[0] < w[1]) && p.pairs.windows(2).all(|w| w[0] < w[1]) && p.targets.windows(2).all(|w| w[0] < w[1]) && p.entries.windows(2).all(|w| w[0] < w[1]));
     p.rows.sort_unstable_by_key(|r| r.0);
@@ -205,12 +205,12 @@ pub fn encode_parts<N: Rem>(p: &mut Parts<N>, out: &mut Vec<u8>) -> bool {
 /// Rows per block (`encode_blocks`): a re-push decompresses whole blocks
 /// for the entries it wants, so blocks are small (one block a unit
 /// decompressed ~2 KB a re-pushed state).
-pub const BLOCK_ROWS: usize = 1 << 11;
+pub(crate) const BLOCK_ROWS: usize = 1 << 11;
 
 /// `p` as raw blocks of whole entries, about `BLOCK_ROWS` rows each, each
 /// with the routes, pairs and targets it uses (`encode_parts` each);
 /// whether a target key is provisional, per block.
-pub fn encode_blocks<N: Rem>(p: &mut Parts<N>) -> Vec<(Vec<u8>, bool)> {
+pub(crate) fn encode_blocks<N: Rem>(p: &mut Parts<N>) -> Vec<(Vec<u8>, bool)> {
     // By entry (a counting sort: a unit's entries are few), then each
     // entry's rows by key.
     let mut at = vec![0usize; p.entries.len() + 1];
@@ -291,7 +291,7 @@ pub fn encode_blocks<N: Rem>(p: &mut Parts<N>) -> Vec<(Vec<u8>, bool)> {
 
 /// ENCODE `rows` (any order; equal but for their cells: merged) as a raw
 /// block into `out` (cleared). Returns whether a target key is provisional.
-pub fn encode<N: Rem>(rows: &[Row<N>], out: &mut Vec<u8>) -> bool {
+pub(crate) fn encode<N: Rem>(rows: &[Row<N>], out: &mut Vec<u8>) -> bool {
     let mut p = Parts::<N>::default();
     p.routes = rows.iter().map(|r| r.route).collect();
     p.routes.sort_unstable();
@@ -319,17 +319,17 @@ pub fn encode<N: Rem>(rows: &[Row<N>], out: &mut Vec<u8>) -> bool {
 }
 
 /// A raw block, its header read; `entries` walks its entries.
-pub struct Block<'a, N: Rem = P8> {
-    pub routes: Vec<(u64, u32)>,
-    pub pairs: Vec<N::Pair>,
+pub(crate) struct Block<'a, N: Rem = P8> {
+    pub(crate) routes: Vec<(u64, u32)>,
+    pub(crate) pairs: Vec<N::Pair>,
     /// (route, key) per target.
-    pub targets: Vec<(u32, Key)>,
+    pub(crate) targets: Vec<(u32, Key)>,
     body: &'a [u8],
     n: usize,
 }
 
 impl<'a, N: Rem> Block<'a, N> {
-    pub fn open(raw: &'a [u8]) -> Result<Self> {
+    pub(crate) fn open(raw: &'a [u8]) -> Result<Self> {
         let mut pos = 0usize;
         let nr = get_varint(raw, &mut pos) as usize;
         ensure!(nr <= raw.len(), "an out block of {nr} routes in {} bytes", raw.len());
@@ -364,17 +364,13 @@ impl<'a, N: Rem> Block<'a, N> {
         Ok(Block { routes, pairs, targets, body: &raw[pos..], n })
     }
 
-    pub fn len(&self) -> usize {
+    pub(crate) fn len(&self) -> usize {
         self.n
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.n == 0
     }
 
     /// Every entry `(region, key)` in order: `want(region, key)` says
     /// whether its bundles are read (`f(region, key, bundles)`) or skipped.
-    pub fn entries(&self, mut want: impl FnMut(u32, Key) -> bool, mut f: impl FnMut(u32, Key, &mut OutBundles<'_>)) -> Result<()> {
+    pub(crate) fn entries(&self, mut want: impl FnMut(u32, Key) -> bool, mut f: impl FnMut(u32, Key, &mut OutBundles<'_>)) -> Result<()> {
         let b = self.body;
         let mut pos = 0usize;
         let (mut region, mut key) = (0u32, 0u128);
@@ -407,7 +403,7 @@ impl<'a, N: Rem> Block<'a, N> {
     }
 
     /// The block's rows (`Row`s, merged bundles), every entry read.
-    pub fn rows(&self) -> Result<Vec<Row<N>>> {
+    pub(crate) fn rows(&self) -> Result<Vec<Row<N>>> {
         let mut out = Vec::new();
         let mut bad = false;
         self.entries(
@@ -428,7 +424,7 @@ impl<'a, N: Rem> Block<'a, N> {
 }
 
 /// A raw block with PROVISIONAL target keys encoded again with `finals`.
-pub fn fixup<N: Rem>(raw: &[u8], finals: &rustc_hash::FxHashMap<Key, Key>, out: &mut Vec<u8>) -> Result<()> {
+pub(crate) fn fixup<N: Rem>(raw: &[u8], finals: &rustc_hash::FxHashMap<Key, Key>, out: &mut Vec<u8>) -> Result<()> {
     let mut rows = Block::<N>::open(raw)?.rows()?;
     for r in &mut rows {
         if is_provisional(r.t_key) {
@@ -449,17 +445,17 @@ struct BlockHead {
 }
 
 /// A block as the frame's end writes it (zstd) with its entry range.
-pub struct Sealed {
+pub(crate) struct Sealed {
     /// In memory, or in the frame's spool.
-    pub z: super::spool::Body,
-    pub raw: u32,
-    pub first: (u32, Key),
-    pub last: (u32, Key),
+    pub(crate) z: super::spool::Body,
+    pub(crate) raw: u32,
+    pub(crate) first: (u32, Key),
+    pub(crate) last: (u32, Key),
 }
 
 impl Sealed {
     /// `raw` compressed, its entry range read off it (`None`: no entry).
-    pub fn of<N: Rem>(raw: &[u8], z: &mut zstd::bulk::Compressor<'static>) -> Result<Option<Sealed>> {
+    pub(crate) fn of<N: Rem>(raw: &[u8], z: &mut zstd::bulk::Compressor<'static>) -> Result<Option<Sealed>> {
         let b = Block::<N>::open(raw)?;
         let (mut first, mut last) = (None, None);
         b.entries(
@@ -479,18 +475,18 @@ impl Sealed {
 
 impl Sealed {
     /// Its bytes into `spool`, if there is one.
-    pub fn spill(self, spool: Option<&super::spool::Spool>) -> Result<Sealed> {
+    pub(crate) fn spill(self, spool: Option<&super::spool::Spool>) -> Result<Sealed> {
         Ok(Sealed { z: self.z.spill(spool)?, ..self })
     }
 }
 
-pub fn path(edges_dir: &Path, frame: u32) -> PathBuf {
+pub(crate) fn path(edges_dir: &Path, frame: u32) -> PathBuf {
     edges_dir.join("out").join(format!("f{frame:03}.bin"))
 }
 
 /// WRITE frame `frame`'s out file from its units' blocks in order (entries
 /// ascending across blocks: checked). Atomic. Returns its bytes.
-pub fn write(path: &Path, frame: u32, blocks: &[Sealed], spool: Option<&super::spool::Spool>) -> Result<u64> {
+pub(crate) fn write(path: &Path, frame: u32, blocks: &[Sealed], spool: Option<&super::spool::Spool>) -> Result<u64> {
     ensure!(blocks.windows(2).all(|w| w[0].last < w[1].first), "{}: the out blocks' entries are not ascending", path.display());
     let ats = At::place(blocks.iter().map(|b| (b.z.len(), b.raw as usize)));
     let heads: Vec<BlockHead> = blocks.iter().zip(ats).map(|(b, at)| BlockHead { first: b.first, last: b.last, at }).collect();
@@ -505,7 +501,7 @@ pub fn write(path: &Path, frame: u32, blocks: &[Sealed], spool: Option<&super::s
     })
 }
 
-pub struct OutFile {
+pub(crate) struct OutFile {
     file: Mapped,
     /// Its blocks (their heads read in place in the header: an index of
     /// every frame's blocks in memory takes 64 B a block).
@@ -518,7 +514,7 @@ pub struct OutFile {
 const HEAD_BYTES: usize = 56;
 
 impl OutFile {
-    pub fn open(path: &Path, frame: u32) -> Result<Self> {
+    pub(crate) fn open(path: &Path, frame: u32) -> Result<Self> {
         let file = Mapped::open(path, *MAGIC, FORMAT_VERSION, "an out file")?;
         let h = file.header_bytes();
         let n = h.len();
@@ -540,7 +536,7 @@ impl OutFile {
     }
 
     /// The blocks that may hold entries in `lo..=hi`.
-    pub fn blocks(&self, lo: (u32, Key), hi: (u32, Key)) -> std::ops::Range<usize> {
+    pub(crate) fn blocks(&self, lo: (u32, Key), hi: (u32, Key)) -> std::ops::Range<usize> {
         let point = |f: &dyn Fn(&BlockHead) -> bool| {
             let (mut a, mut b) = (0usize, self.blocks);
             while a < b {
@@ -559,39 +555,32 @@ impl OutFile {
     }
 
     /// Block `i`'s first and last entry.
-    pub fn range(&self, i: usize) -> ((u32, Key), (u32, Key)) {
+    pub(crate) fn range(&self, i: usize) -> ((u32, Key), (u32, Key)) {
         let h = self.head(i);
         (h.first, h.last)
     }
 
-    pub fn block(&self, i: usize, z: &mut zstd::bulk::Decompressor<'static>, out: &mut Vec<u8>) -> Result<()> {
+    pub(crate) fn block(&self, i: usize, z: &mut zstd::bulk::Decompressor<'static>, out: &mut Vec<u8>) -> Result<()> {
         self.file.block(self.head(i).at, z, out)
     }
 
-    pub fn len(&self) -> usize {
-        self.blocks
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.blocks == 0
-    }
 }
 
 /// A tree's out files, by frame (none at frame 0: nothing leads into it).
 #[derive(Default)]
 pub struct OutStore {
     frames: Vec<Option<OutFile>>,
-    pub bytes: u64,
+    pub(crate) bytes: u64,
 }
 
 impl OutStore {
     /// Bytes its indices hold: only the file list (headers are read in place).
-    pub fn index_bytes(&self) -> usize {
+    pub(crate) fn index_bytes(&self) -> usize {
         self.frames.capacity() * std::mem::size_of::<Option<OutFile>>()
     }
 
     /// Frames `1..=horizon`'s out files under `edges_dir`.
-    pub fn open(edges_dir: &Path, horizon: u32) -> Result<Self> {
+    pub(crate) fn open(edges_dir: &Path, horizon: u32) -> Result<Self> {
         let mut s = OutStore { frames: vec![None], bytes: 0 };
         for f in 1..=horizon {
             s.add_frame(edges_dir, f)?;
@@ -600,7 +589,7 @@ impl OutStore {
     }
 
     /// Frame `frame`'s out file (the next past the store's) mapped in.
-    pub fn add_frame(&mut self, edges_dir: &Path, frame: u32) -> Result<()> {
+    pub(crate) fn add_frame(&mut self, edges_dir: &Path, frame: u32) -> Result<()> {
         if self.frames.is_empty() {
             self.frames.push(None);
         }
@@ -611,7 +600,7 @@ impl OutStore {
         Ok(())
     }
 
-    pub fn file(&self, frame: u32) -> Option<&OutFile> {
+    pub(crate) fn file(&self, frame: u32) -> Option<&OutFile> {
         self.frames.get(frame as usize).and_then(|f| f.as_ref())
     }
 }

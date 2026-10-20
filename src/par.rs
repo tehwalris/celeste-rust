@@ -2,6 +2,7 @@
 //! each worker with its own state (a reference engine, a scratch buffer),
 //! the results in index order. The first error stops the pulling and is
 //! returned; a worker's panic is resumed in the caller with its own message.
+#![warn(unreachable_pub)]
 
 use anyhow::Result;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -19,28 +20,28 @@ impl Pool {
     }
 
     /// One worker per available core.
-    pub fn per_core() -> Self {
+    pub(crate) fn per_core() -> Self {
         Self::new(std::thread::available_parallelism().map_or(8, |p| p.get()))
     }
 
     /// Workers with a `bytes` stack (the tracer recurses deeply).
-    pub fn stack(mut self, bytes: usize) -> Self {
+    pub(crate) fn stack(mut self, bytes: usize) -> Self {
         self.stack = Some(bytes);
         self
     }
 
     /// The workers a map over `n` items runs.
-    pub fn workers(&self, n: usize) -> usize {
+    pub(crate) fn workers(&self, n: usize) -> usize {
         self.threads.min(n.max(1))
     }
 
     /// `f(i)` for every `i < n`, results by index.
-    pub fn map<T: Send>(&self, n: usize, f: impl Fn(usize) -> Result<T> + Sync) -> Result<Vec<T>> {
+    pub(crate) fn map<T: Send>(&self, n: usize, f: impl Fn(usize) -> Result<T> + Sync) -> Result<Vec<T>> {
         self.map_with(n, || Ok(()), |_, i| f(i))
     }
 
     /// `f(lo, hi)` over `0..n` in chunks of `chunk`, results in chunk order.
-    pub fn chunks<T: Send>(&self, n: usize, chunk: usize, f: impl Fn(usize, usize) -> T + Sync) -> Vec<T> {
+    pub(crate) fn chunks<T: Send>(&self, n: usize, chunk: usize, f: impl Fn(usize, usize) -> T + Sync) -> Vec<T> {
         let chunk = chunk.max(1);
         self.map(n.div_ceil(chunk), |c| Ok(f(c * chunk, ((c + 1) * chunk).min(n)))).expect("an infallible map")
     }

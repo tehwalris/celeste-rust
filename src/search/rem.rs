@@ -24,11 +24,11 @@ use super::rem_f64;
 /// before the boundary widening (`None`: no player).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Capture<N> {
-    pub took: bool,
-    pub pre: (N, N),
-    pub frag: (N, N),
-    pub ox: (N, N),
-    pub fin: Option<(N, N)>,
+    pub(crate) took: bool,
+    pub(crate) pre: (N, N),
+    pub(crate) frag: (N, N),
+    pub(crate) ox: (N, N),
+    pub(crate) fin: Option<(N, N)>,
 }
 
 pub trait Rem: EngineNum {
@@ -55,20 +55,20 @@ pub trait Rem: EngineNum {
 }
 
 /// A pair as the pushes and pulls read it: per axis the circle's transfer.
-pub type Xfer<N> = (<<N as Rem>::C as Circle>::Act, <<N as Rem>::C as Circle>::Act);
+pub(crate) type Xfer<N> = (<<N as Rem>::C as Circle>::Act, <<N as Rem>::C as Circle>::Act);
 
 /// A point of `N`'s circle.
-pub type Point<N> = <<N as Rem>::C as Circle>::P;
+pub(crate) type Point<N> = <<N as Rem>::C as Circle>::P;
 
 /// The start's remainder point: the room's load has no player yet, so any
 /// point stands for it - the point of 0.
-pub fn start_point<N: Rem>() -> (Point<N>, Point<N>) {
+pub(crate) fn start_point<N: Rem>() -> (Point<N>, Point<N>) {
     let p = N::point(<N::A as Arithmetic>::from_i16(0)).expect("0 is a remainder");
     (p, p)
 }
 
 /// The start's hull: its exact remainder (`start_point`).
-pub fn start_hull<N: Rem>() -> HullOf<N> {
+pub(crate) fn start_hull<N: Rem>() -> HullOf<N> {
     #[cfg(test)]
     if super::hull::WIDEN.load(std::sync::atomic::Ordering::Relaxed) {
         return Hull::full();
@@ -78,13 +78,13 @@ pub fn start_hull<N: Rem>() -> HullOf<N> {
 }
 
 /// Does hull `h` hold the remainder `(x, y)`?
-pub fn holds<N: Rem>(h: &HullOf<N>, x: N, y: N) -> bool {
+pub(crate) fn holds<N: Rem>(h: &HullOf<N>, x: N, y: N) -> bool {
     N::point(x).zip(N::point(y)).is_some_and(|(x, y)| h.contains(x, y))
 }
 
 /// Does an edge of transfer `p` take the remainder `from` and end at `to`
 /// (`None`: no player at the frame's end; any action)?
-pub fn maps<N: Rem>(p: &N::Pair, from: (N, N), to: Option<(N, N)>) -> bool {
+pub(crate) fn maps<N: Rem>(p: &N::Pair, from: (N, N), to: Option<(N, N)>) -> bool {
     let axis = |a: &<N::C as Circle>::Act, f: N, t: Option<N>| {
         let Some(f) = N::point(f) else { return false };
         let g = N::C::guard(a);

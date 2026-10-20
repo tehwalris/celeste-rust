@@ -14,14 +14,14 @@ use std::path::{Path, PathBuf};
 
 /// Bump whenever the meaning or layout of ANY tree content changes (older
 /// trees are refused; what each version changed: git history).
-pub const FORMAT_VERSION: u32 = 18;
+pub(crate) const FORMAT_VERSION: u32 = 18;
 
 /// The value files' magic.
 const VALUE: &[u8; 4] = b"C8TB";
 
 /// A tree file's magic in arithmetic `N`: 16.16's as it is, the doubles'
 /// last byte `EngineNum::FILE_TAG`.
-pub fn magic<N: celeste_core::arith::EngineNum>(m: &[u8; 4]) -> [u8; 4] {
+pub(crate) fn magic<N: celeste_core::arith::EngineNum>(m: &[u8; 4]) -> [u8; 4] {
     match N::FILE_TAG {
         0 => *m,
         t => [m[0], m[1], m[2], t],
@@ -31,15 +31,15 @@ pub fn magic<N: celeste_core::arith::EngineNum>(m: &[u8; 4]) -> [u8; 4] {
 /// Where a block is: its offset past the header, its stored (zstd) and raw
 /// lengths; a header holds one per block, inline.
 #[derive(serde::Serialize, serde::Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct At {
-    pub offset: u64,
-    pub len: u32,
-    pub raw: u32,
+pub(crate) struct At {
+    pub(crate) offset: u64,
+    pub(crate) len: u32,
+    pub(crate) raw: u32,
 }
 
 impl At {
     /// Blocks of these `(stored, raw)` lengths, back to back.
-    pub fn place(lens: impl IntoIterator<Item = (usize, usize)>) -> Vec<At> {
+    pub(crate) fn place(lens: impl IntoIterator<Item = (usize, usize)>) -> Vec<At> {
         let mut offset = 0u64;
         lens.into_iter()
             .map(|(len, raw)| {
@@ -51,14 +51,14 @@ impl At {
     }
 
     /// Past its last byte.
-    pub fn end(&self) -> u64 {
+    pub(crate) fn end(&self) -> u64 {
         self.offset + self.len as u64
     }
 }
 
 /// zstd -1 of a raw block, shrunk to its size (the compressor's buffer is
 /// the raw bound: held to the frame's end, segments took 5x their bytes).
-pub fn compress(raw: &[u8], z: &mut zstd::bulk::Compressor<'static>) -> Result<Vec<u8>> {
+pub(crate) fn compress(raw: &[u8], z: &mut zstd::bulk::Compressor<'static>) -> Result<Vec<u8>> {
     ensure!(raw.len() < u32::MAX as usize, "a block of {} bytes", raw.len());
     let mut v = z.compress(raw)?;
     v.shrink_to_fit();
@@ -66,7 +66,7 @@ pub fn compress(raw: &[u8], z: &mut zstd::bulk::Compressor<'static>) -> Result<V
 }
 
 /// A stored block's raw bytes (`raw_len` from its header) into `out`.
-pub fn decompress(stored: &[u8], raw_len: usize, z: &mut zstd::bulk::Decompressor<'static>, out: &mut Vec<u8>) -> Result<()> {
+pub(crate) fn decompress(stored: &[u8], raw_len: usize, z: &mut zstd::bulk::Decompressor<'static>, out: &mut Vec<u8>) -> Result<()> {
     out.clear();
     out.reserve(raw_len);
     let n = z.decompress_to_buffer(stored, out)?;
@@ -76,7 +76,7 @@ pub fn decompress(stored: &[u8], raw_len: usize, z: &mut zstd::bulk::Decompresso
 
 /// WRITE a file: `magic`, `version`, `header`, then what `blocks` writes,
 /// in the order and places (`At`) the header gives. Atomic. Returns its bytes.
-pub fn write(path: &Path, magic: [u8; 4], version: u32, header: &impl Serialize, blocks: impl FnOnce(&mut dyn Write) -> Result<()>) -> Result<u64> {
+pub(crate) fn write(path: &Path, magic: [u8; 4], version: u32, header: &impl Serialize, blocks: impl FnOnce(&mut dyn Write) -> Result<()>) -> Result<u64> {
     let hb = bincode::serialize(header).with_context(|| format!("{}: its header", path.display()))?;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -98,7 +98,7 @@ pub fn write(path: &Path, magic: [u8; 4], version: u32, header: &impl Serialize,
 }
 
 /// A file mapped, its magic and version checked.
-pub struct Mapped {
+pub(crate) struct Mapped {
     map: memmap2::Mmap,
     /// Where its blocks start.
     data: usize,
@@ -107,7 +107,7 @@ pub struct Mapped {
 
 impl Mapped {
     /// Map the file at `path`: a `what` (for the errors) of `magic`, `version`.
-    pub fn open(path: &Path, magic: [u8; 4], version: u32, what: &str) -> Result<Self> {
+    pub(crate) fn open(path: &Path, magic: [u8; 4], version: u32, what: &str) -> Result<Self> {
         let file = std::fs::File::open(path).with_context(|| path.display().to_string())?;
         // SAFETY: a tree file is written once (renamed into place) and never
         // modified.
@@ -116,41 +116,41 @@ impl Mapped {
         Ok(Mapped { map, data, path: path.to_path_buf() })
     }
 
-    pub fn path(&self) -> &Path {
+    pub(crate) fn path(&self) -> &Path {
         &self.path
     }
 
-    pub fn len(&self) -> u64 {
+    pub(crate) fn len(&self) -> u64 {
         self.map.len() as u64
     }
 
-    pub fn header_bytes(&self) -> &[u8] {
+    pub(crate) fn header_bytes(&self) -> &[u8] {
         &self.map[16..self.data]
     }
 
-    pub fn header<H: DeserializeOwned>(&self) -> Result<H> {
+    pub(crate) fn header<H: DeserializeOwned>(&self) -> Result<H> {
         bincode::deserialize(self.header_bytes()).with_context(|| format!("{}: its header", self.path.display()))
     }
 
     /// Check that the blocks end at `end` (the last one's `At::end`): the
     /// file holds nothing past them, and all of them.
-    pub fn ends_at(&self, end: u64) -> Result<()> {
+    pub(crate) fn ends_at(&self, end: u64) -> Result<()> {
         ensure!(self.len() == self.data as u64 + end, "{}: {} bytes, its header says {}", self.path.display(), self.len(), self.data as u64 + end);
         Ok(())
     }
 
-    pub fn stored(&self, at: At) -> &[u8] {
+    pub(crate) fn stored(&self, at: At) -> &[u8] {
         &self.map[self.data + at.offset as usize..self.data + at.end() as usize]
     }
 
-    pub fn block(&self, at: At, z: &mut zstd::bulk::Decompressor<'static>, out: &mut Vec<u8>) -> Result<()> {
+    pub(crate) fn block(&self, at: At, z: &mut zstd::bulk::Decompressor<'static>, out: &mut Vec<u8>) -> Result<()> {
         decompress(self.stored(at), at.raw as usize, z, out).with_context(|| self.path.display().to_string())
     }
 
     /// Drop the resident pages of `bytes`, a part of this file (the page
     /// cache keeps them; a later read faults them back in): a reader
     /// streaming a file does not hold what it has read.
-    pub fn release(&self, bytes: &[u8]) -> Result<()> {
+    pub(crate) fn release(&self, bytes: &[u8]) -> Result<()> {
         let at = (bytes.as_ptr() as usize).wrapping_sub(self.map.as_ptr() as usize);
         ensure!(at.checked_add(bytes.len()).is_some_and(|end| end <= self.map.len()), "{}: released bytes outside the file", self.path.display());
         // SAFETY: a read-only shared mapping of a file never modified (see
@@ -171,18 +171,18 @@ fn header_len(b: &[u8], magic: [u8; 4], version: u32, path: &Path, what: &str) -
 }
 
 /// Save a value (the marks, the pos graph): a file of no block.
-pub fn save_value<T: Serialize>(path: &Path, value: &T) -> Result<()> {
+pub(crate) fn save_value<T: Serialize>(path: &Path, value: &T) -> Result<()> {
     write(path, *VALUE, FORMAT_VERSION, value, |_| Ok(())).map(drop)
 }
 
 /// Load a value `save_value` saved.
-pub fn load_value<T: DeserializeOwned>(path: &Path) -> Result<T> {
+pub(crate) fn load_value<T: DeserializeOwned>(path: &Path) -> Result<T> {
     open_value(path)?.header()
 }
 
 /// A value file mapped, for readers that walk a large value in place (its
 /// bincode: `header_bytes`).
-pub fn open_value(path: &Path) -> Result<Mapped> {
+pub(crate) fn open_value(path: &Path) -> Result<Mapped> {
     let m = Mapped::open(path, *VALUE, FORMAT_VERSION, "a value file")?;
     m.ends_at(0)?;
     Ok(m)

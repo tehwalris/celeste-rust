@@ -3,6 +3,7 @@
 //! `storage::wave::run_wave`, each frame checkpointed); trees (`grow_tree`,
 //! `TreeFilter`), wins, `MarkFilter`. plans/architecture.md "The forward:
 //! hulls and storage".
+#![warn(unreachable_pub)]
 
 use anyhow::{Context, Result};
 
@@ -14,11 +15,11 @@ use crate::storage::wave::Frontier;
 
 /// Wave phase timers (`--phases`): TSC ticks summed over workers, taken per
 /// frame into `FrameStats::phase_s`. Off, `start` is a branch.
-pub mod phases {
+pub(crate) mod phases {
     use std::sync::atomic::{AtomicU64, Ordering};
     /// The phases. `UNIT` (a kernel unit's `engine.run`) holds `SETUP`,
     /// `PACK`, `KERNEL` and `EMIT`; the rest are disjoint.
-    pub const NAMES: [&str; N] = [
+    pub(crate) const NAMES: [&str; N] = [
         "pack",
         "kernel",
         "emit",
@@ -32,23 +33,23 @@ pub mod phases {
         "unit out blocks (zstd)",
         "slice gather (transfer ids, jobs)",
     ];
-    pub const N: usize = 12;
-    pub const PACK: usize = 0;
-    pub const KERNEL: usize = 1;
-    pub const EMIT: usize = 2;
-    pub const END_UNIT: usize = 3;
-    pub const REGIONS: usize = 4;
-    pub const LAYER: usize = 5;
-    pub const SETUP: usize = 6;
-    pub const UNIT: usize = 7;
-    pub const DECODE: usize = 8;
-    pub const REPUSH: usize = 9;
-    pub const OUT_BLOCKS: usize = 10;
-    pub const GATHER: usize = 11;
+    pub(crate) const N: usize = 12;
+    pub(crate) const PACK: usize = 0;
+    pub(crate) const KERNEL: usize = 1;
+    pub(crate) const EMIT: usize = 2;
+    pub(crate) const END_UNIT: usize = 3;
+    pub(crate) const REGIONS: usize = 4;
+    pub(crate) const LAYER: usize = 5;
+    pub(crate) const SETUP: usize = 6;
+    pub(crate) const UNIT: usize = 7;
+    pub(crate) const DECODE: usize = 8;
+    pub(crate) const REPUSH: usize = 9;
+    pub(crate) const OUT_BLOCKS: usize = 10;
+    pub(crate) const GATHER: usize = 11;
     static TICKS: [AtomicU64; N] = [const { AtomicU64::new(0) }; N];
     /// A phase's start (`on`: `--phases`; off, 0 and every `add` a no-op).
     #[inline]
-    pub fn start(on: bool) -> u64 {
+    pub(crate) fn start(on: bool) -> u64 {
         if on {
             unsafe { core::arch::x86_64::_rdtsc() }
         } else {
@@ -57,7 +58,7 @@ pub mod phases {
     }
     /// Add the ticks since `t0` (a `start`) to phase `p`; returns now.
     #[inline]
-    pub fn add(p: usize, t0: u64) -> u64 {
+    pub(crate) fn add(p: usize, t0: u64) -> u64 {
         if t0 == 0 {
             return 0;
         }
@@ -75,12 +76,12 @@ pub mod phases {
         })
     }
     /// The phases' seconds since the last `take`; the counters reset.
-    pub fn take() -> [f64; N] {
+    pub(crate) fn take() -> [f64; N] {
         let hz = hz();
         std::array::from_fn(|p| TICKS[p].swap(0, Ordering::Relaxed) as f64 / hz)
     }
     /// `secs` (a `take`) against the budget `workers` x `wall`.
-    pub fn print(secs: &[f64; N], wall: std::time::Duration, workers: usize) {
+    pub(crate) fn print(secs: &[f64; N], wall: std::time::Duration, workers: usize) {
         let budget = wall.as_secs_f64() * workers as f64;
         let line: Vec<String> = NAMES.iter().zip(secs).map(|(n, &t)| format!("{n} {t:.1}s ({:.0}%)", 100.0 * t / budget)).collect();
         eprintln!("[phases] worker-seconds of {:.1} ({} x {:.2} s): {}", budget, workers, wall.as_secs_f64(), line.join(", "));
@@ -118,23 +119,13 @@ impl<N: EngineNum> Block<N> {
         &self.rt2
     }
 
-    /// Decoded rows' EXACT keys per lane (their tree's key space).
-    pub fn keys(&self) -> &[(u64, u64)] {
-        assert_eq!(self.rt2.row_keys.len(), self.rt2.width, "a block without its key column");
-        &self.rt2.row_keys
-    }
-
     /// The player-position cell per lane.
     pub fn positions(&self) -> Result<Vec<u32>> {
         crate::search::pos_graph::block_cells(&self.rt2)
     }
 
-    pub fn wins(&self, s: &crate::settings::Settings) -> Result<Vec<bool>> {
-        wins_of(&self.rt2, s)
-    }
-
     /// `exits_of`: a superset of the wins.
-    pub fn exits(&self, s: &crate::settings::Settings) -> Result<Vec<bool>> {
+    pub(crate) fn exits(&self, s: &crate::settings::Settings) -> Result<Vec<bool>> {
         exits_of(&self.rt2, s)
     }
 
@@ -144,11 +135,11 @@ impl<N: EngineNum> Block<N> {
 }
 
 /// The summit's level index: no exit, it ends at the flag (`summit_flag`).
-pub const SUMMIT_LEVEL: i16 = 30;
+pub(crate) const SUMMIT_LEVEL: i16 = 30;
 
 /// The winning positions (x_lo, x_hi, y_lo, y_hi, inclusive): `--win-at` or
 /// the summit's flag; a lane wins where it MEETS it. None: the room exit.
-pub fn win_rect(s: &crate::settings::Settings) -> Option<(i16, i16, i16, i16)> {
+pub(crate) fn win_rect(s: &crate::settings::Settings) -> Option<(i16, i16, i16, i16)> {
     if let Some((xl, xh, yl, yh)) = s.win_at {
         static SAID: std::sync::Once = std::sync::Once::new();
         SAID.call_once(|| {
@@ -186,7 +177,7 @@ fn summit_flag((rx, ry): (i16, i16)) -> Option<(i16, i16, i16, i16)> {
 }
 
 /// Per lane: has it left the start room, or met the `win_rect`?
-pub fn exits_of<N: EngineNum>(rt2: &Rt2<N>, s: &crate::settings::Settings) -> Result<Vec<bool>> {
+pub(crate) fn exits_of<N: EngineNum>(rt2: &Rt2<N>, s: &crate::settings::Settings) -> Result<Vec<bool>> {
     let ids = crate::compiled::ids();
     let lanes = rt2.width;
     if let Some((txl, txh, tyl, tyh)) = win_rect(s) {
@@ -265,7 +256,7 @@ fn reaches_win<N: EngineNum>(rt2: &Rt2<N>, s: &crate::settings::Settings) -> Res
 /// Per lane: is start room `(x, y)`'s berry taken (`got_fruit[1 +
 /// level_index()]`, nil-padded)? An unknown (a coarse level) counts as
 /// taken: a win there over-approximates, and the exact level decides.
-pub fn got_fruit<N: EngineNum>(rt2: &Rt2<N>, (x, y): (i16, i16)) -> Result<Vec<bool>> {
+pub(crate) fn got_fruit<N: EngineNum>(rt2: &Rt2<N>, (x, y): (i16, i16)) -> Result<Vec<bool>> {
     use celeste_engine::runtime2::{Cell2, Col, AV};
     let lanes = rt2.width;
     let g = celeste_names::gen::global_id("got_fruit").expect("`got_fruit` is a global name");
@@ -283,11 +274,11 @@ pub fn got_fruit<N: EngineNum>(rt2: &Rt2<N>, (x, y): (i16, i16)) -> Result<Vec<b
 
 /// A SOUND LOWER BOUND on frames from the big chest opening to a win: 61
 /// paused + 8 until the orb is collectable + 10 frozen = 79, taken as 70.
-pub const ORB_MIN_FRAMES_AFTER_CHEST: u32 = 70;
+pub(crate) const ORB_MIN_FRAMES_AFTER_CHEST: u32 = 70;
 
 /// Per lane in the orb room: is the chest still CLOSED too late to win by
 /// `horizon` (the ceiling)? Such rows are not expanded.
-pub fn orb_deadline_skip<N: EngineNum>(rt2: &Rt2<N>, frame: u32, horizon: u32) -> Vec<bool> {
+pub(crate) fn orb_deadline_skip<N: EngineNum>(rt2: &Rt2<N>, frame: u32, horizon: u32) -> Vec<bool> {
     use celeste_engine::runtime2::AV;
     let lanes = rt2.width;
     if frame + 1 + ORB_MIN_FRAMES_AFTER_CHEST <= horizon {
@@ -306,7 +297,7 @@ pub fn orb_deadline_skip<N: EngineNum>(rt2: &Rt2<N>, frame: u32, horizon: u32) -
 /// taken (`got_fruit` false, not unknown) and nothing left that holds or
 /// drops it - the fruit, the fly fruit (gone once it flew off), the key and
 /// its chest, a fake wall. Exact: every state the row stands for is lost.
-pub fn berry_lost<N: EngineNum>(rt2: &Rt2<N>, s: &crate::settings::Settings) -> Result<Vec<bool>> {
+pub(crate) fn berry_lost<N: EngineNum>(rt2: &Rt2<N>, s: &crate::settings::Settings) -> Result<Vec<bool>> {
     let lanes = rt2.width;
     let ids = crate::compiled::ids();
     let sources = [ids.g_fruit, ids.g_fly_fruit, ids.g_key, ids.g_chest, ids.g_fake_wall];
@@ -324,7 +315,7 @@ pub fn berry_lost<N: EngineNum>(rt2: &Rt2<N>, s: &crate::settings::Settings) -> 
 /// rows' layer; `ceiling`: the tree's level -1 horizon. A state not
 /// expanded has no edges, so it is never re-pushed; one expanded is
 /// re-pushed whatever the orb's deadline says later: sound, less pruned.
-pub fn not_expanded<N: EngineNum>(b: &Block<N>, frame: u32, ceiling: Option<u32>, s: &crate::settings::Settings) -> Result<Vec<bool>> {
+pub(crate) fn not_expanded<N: EngineNum>(b: &Block<N>, frame: u32, ceiling: Option<u32>, s: &crate::settings::Settings) -> Result<Vec<bool>> {
     let mut skip = b.exits(s)?;
     // Under a win rectangle a row that LEFT the room is no win, and its
     // shape has no kernel.
@@ -346,7 +337,7 @@ pub fn not_expanded<N: EngineNum>(b: &Block<N>, frame: u32, ceiling: Option<u32>
 
 /// Is the start room the orb room (5,2)? A win there also needs the orb
 /// (`max_djump == 2`): later levels are played with the second dash.
-pub fn orb_required(s: &crate::settings::Settings) -> bool {
+pub(crate) fn orb_required(s: &crate::settings::Settings) -> bool {
     let (x, y) = s.room;
     crate::game_runner::level_index(x, y) == crate::game_runner::ORB_LEVEL && !s.gemskip
 }
@@ -356,28 +347,28 @@ pub fn orb_required(s: &crate::settings::Settings) -> bool {
 /// (sound: inductive ranges, clipped successors and deaths accounted).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MinusOne {
-    pub h: u32,
+    pub(crate) h: u32,
     /// The table's speed bound S, px per frame.
-    pub speed: i32,
+    pub(crate) speed: i32,
 }
 
 impl MinusOne {
-    pub fn table(&self, s: &crate::settings::Settings) -> &'static crate::search::level_minus_one::CostToGo {
+    pub(crate) fn table(&self, s: &crate::settings::Settings) -> &'static crate::search::level_minus_one::CostToGo {
         self.try_table(s).unwrap_or_else(|e| panic!("building the level -1 table: {e:#}"))
     }
 
     /// The same, an error where the table cannot be built (the search
     /// records the refusal before anything else needs the table).
-    pub fn try_table(&self, s: &crate::settings::Settings) -> Result<&'static crate::search::level_minus_one::CostToGo> {
+    pub(crate) fn try_table(&self, s: &crate::settings::Settings) -> Result<&'static crate::search::level_minus_one::CostToGo> {
         crate::search::level_minus_one::table(self.speed, s)
     }
 }
 
 /// What a forward filters by.
-pub struct Filters<'a, N: EngineNum = P8> {
+pub(crate) struct Filters<'a, N: EngineNum = P8> {
     /// The coarser level's arc marks (the objects ladder).
-    pub marks: Option<&'a MarkFilter<'a, N>>,
-    pub minus_one: Option<MinusOne>,
+    pub(crate) marks: Option<&'a MarkFilter<'a, N>>,
+    pub(crate) minus_one: Option<MinusOne>,
 }
 
 impl<N: EngineNum> Clone for Filters<'_, N> {
@@ -419,7 +410,7 @@ pub struct MarkFilter<'a, N: EngineNum = P8> {
 }
 
 impl<'a, N: EngineNum> MarkFilter<'a, N> {
-    pub fn new(marked: &'a Visited<N>, coarser: crate::abstraction::Level, clock: crate::settings::Clock) -> Self {
+    pub(crate) fn new(marked: &'a Visited<N>, coarser: crate::abstraction::Level, clock: crate::settings::Clock) -> Self {
         MarkFilter { marked, coarser, clock }
     }
 
@@ -429,7 +420,7 @@ impl<'a, N: EngineNum> MarkFilter<'a, N> {
     /// keeps a near floor's computed `collideable` in the player's probe
     /// window there, `Rt2::widen_to` does not), so filtering it would drop
     /// marked paths. The next boundary filters its successors.
-    pub fn allowed(&self, rt2: &Rt2<N>, frame: u32) -> Result<Vec<bool>> {
+    pub(crate) fn allowed(&self, rt2: &Rt2<N>, frame: u32) -> Result<Vec<bool>> {
         if !self.clock.boundary(frame) {
             return Ok(vec![true; rt2.width]);
         }
@@ -438,19 +429,19 @@ impl<'a, N: EngineNum> MarkFilter<'a, N> {
 
     /// Per lane of `rt2`, its projection's deadline at the coarser level
     /// (`None`: not marked there).
-    pub fn deadlines(&self, rt2: &Rt2<N>) -> Result<Vec<Option<u16>>> {
+    pub(crate) fn deadlines(&self, rt2: &Rt2<N>) -> Result<Vec<Option<u16>>> {
         let (shape, keys, cells) = widened_keys_rt2(rt2, self.coarser, self.marked.keys())?;
         Ok(keys.iter().zip(&cells).map(|(k, &c)| k.and_then(|k| self.marked.deadline(shape, k, c))).collect())
     }
 
-    pub fn coarser(&self) -> crate::abstraction::Level {
+    pub(crate) fn coarser(&self) -> crate::abstraction::Level {
         self.coarser
     }
 }
 
 /// Each lane's `(shape, key, cell)` at the `coarser` level (its node there)
 /// in the key space `keys` (`None`: a code the space lacks - no node).
-pub fn widened_keys<N: EngineNum>(
+pub(crate) fn widened_keys<N: EngineNum>(
     block: &Block<N>,
     coarser: crate::abstraction::Level,
     keys: &celeste_engine::exact::KeySpace<N>,
@@ -464,7 +455,7 @@ pub fn widen_rt2_to<N: EngineNum>(rt2: &mut Rt2<N>, level: crate::abstraction::L
 }
 
 /// `widened_keys` of an `Rt2`.
-pub fn widened_keys_rt2<N: EngineNum>(
+pub(crate) fn widened_keys_rt2<N: EngineNum>(
     rt2: &Rt2<N>,
     coarser: crate::abstraction::Level,
     keys: &celeste_engine::exact::KeySpace<N>,
@@ -502,13 +493,13 @@ pub trait FrameStep<N: Rem = P8>: Sync {
 
 /// The frame end's steps (`FrameStats::t_end`; plans/architecture.md "The
 /// frame's end").
-pub const END_STEPS: [&str; 8] = ["keys", "seal", "filter", "absorb", "layer", "wins", "edge file", "out file"];
+pub(crate) const END_STEPS: [&str; 8] = ["keys", "seal", "filter", "absorb", "layer", "wins", "edge file", "out file"];
 
 /// One forward frame's timings and sizes, for the `[fwd]` log line.
 #[derive(Default, Clone, Copy)]
 pub struct FrameStats {
     /// The frontier: new entries and states (the kernels'), old states.
-    pub entries_in: usize,
+    pub(crate) entries_in: usize,
     pub lanes_in: usize,
     pub old_in: usize,
     /// Emissions past level -1: each a record (a lookup and an edge).
@@ -517,13 +508,13 @@ pub struct FrameStats {
     /// units' and the re-push's); the states pushed into.
     pub repush_edges: u64,
     pub pushes: u64,
-    pub touched: u64,
+    pub(crate) touched: u64,
     /// New states, and old states whose hull grew.
     pub lanes_kept: usize,
     pub grown: usize,
     /// The next layer's entries and states.
-    pub entries_out: usize,
-    pub lanes_out: usize,
+    pub(crate) entries_out: usize,
+    pub(crate) lanes_out: usize,
     /// The units' wall time (every slice's) and its barrier idle fraction.
     pub t_wave: std::time::Duration,
     pub wave_idle: f64,
@@ -531,12 +522,12 @@ pub struct FrameStats {
     pub t_regions: std::time::Duration,
     /// The frame's end, wall, and per step (`END_STEPS`).
     pub t_layer: std::time::Duration,
-    pub t_end: [std::time::Duration; END_STEPS.len()],
+    pub(crate) t_end: [std::time::Duration; END_STEPS.len()],
     /// Per step its counts (user instructions and cycles, kernel cycles,
     /// page faults: `storage::bench::step_counts`; zeros outside a bench).
-    pub end_counts: [[u64; 4]; END_STEPS.len()],
+    pub(crate) end_counts: [[u64; 4]; END_STEPS.len()],
     /// `--phases`: seconds summed over the workers (zeros without).
-    pub phase_s: [f64; phases::N],
+    pub(crate) phase_s: [f64; phases::N],
     pub units: usize,
     /// The slices, and the routes (target regions) with new states or edges.
     pub slices: usize,
@@ -547,27 +538,27 @@ pub struct FrameStats {
     pub edge_bytes: u64,
     pub out_bytes: u64,
     /// The input frontier's bytes (its keys and masks).
-    pub frontier_bytes: usize,
+    pub(crate) frontier_bytes: usize,
     /// Bytes allocated in the visited set.
-    pub visited_bytes: usize,
+    pub(crate) visited_bytes: usize,
     /// Anonymous resident set at the frame's start, after the wave, at the end.
     pub rss_start: f64,
     pub rss_wave: f64,
     pub rss_end: f64,
     /// File-backed resident pages at the end of the frame.
-    pub rss_file: f64,
+    pub(crate) rss_file: f64,
     /// The key space after the frame: its widest shape's key bits, its codes,
     /// and the codes the frame added (`exact::KeySpace`).
-    pub key_bits: u32,
-    pub key_codes: usize,
-    pub new_codes: usize,
+    pub(crate) key_bits: u32,
+    pub(crate) key_codes: usize,
+    pub(crate) new_codes: usize,
 }
 
 /// The level -1 filter a tree's frames were built under
 /// (`<dir>/level_minus_one.txt`). A forward extends a tree under ITS filter,
 /// never the environment's: every frame of a tree is filtered alike.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum TreeFilter {
+pub(crate) enum TreeFilter {
     /// None (`off`): the frames do not depend on the horizon.
     Off,
     /// Level -1 at `m`, with its table's fingerprint: the tree serves
@@ -588,7 +579,7 @@ impl TreeFilter {
     }
 
     /// The tree's record; `None` without one (its filter unknown).
-    pub fn read(dir: &std::path::Path) -> Result<Option<TreeFilter>> {
+    pub(crate) fn read(dir: &std::path::Path) -> Result<Option<TreeFilter>> {
         let path = Self::path(dir);
         let s = match std::fs::read_to_string(&path) {
             Ok(s) => s,
@@ -647,7 +638,7 @@ impl TreeFilter {
     /// The level -1 filter the tree in `dir` was built under, its table
     /// checked: what a check of the tree (`search::known`) must apply,
     /// whatever the environment says. Refused without a record.
-    pub fn of_tree(dir: &std::path::Path, s: &crate::settings::Settings) -> Result<Option<MinusOne>> {
+    pub(crate) fn of_tree(dir: &std::path::Path, s: &crate::settings::Settings) -> Result<Option<MinusOne>> {
         match TreeFilter::read(dir)? {
             None => anyhow::bail!("{}: no level -1 record (a tree from before records): its filter is unknown", dir.display()),
             Some(TreeFilter::Off) => Ok(None),
@@ -689,12 +680,12 @@ pub struct ForwardState<N: Rem = P8> {
     persisted: rustc_hash::FxHashSet<u64>,
     observer: Option<crate::search::pos_graph::PosObserver>,
     /// The last frame computed (and checkpointed).
-    pub frames: u32,
+    pub(crate) frames: u32,
     /// The first frame a lane won, if any so far.
-    pub win_frame: Option<u32>,
+    pub(crate) win_frame: Option<u32>,
     /// The filter the tree's frames were built under (`None`: no record;
     /// such a tree is not extended).
-    pub filter: Option<TreeFilter>,
+    pub(crate) filter: Option<TreeFilter>,
     /// A bench wave took the visited set (`bench_wave` without `copy`).
     spent: bool,
 }
@@ -711,16 +702,16 @@ pub struct ForwardResult {
 #[derive(Clone, Copy, Default)]
 pub struct Checkpointed {
     /// Does a new state win?
-    pub won: bool,
-    pub frame_bytes: u64,
-    pub hull_bytes: u64,
+    pub(crate) won: bool,
+    pub(crate) frame_bytes: u64,
+    pub(crate) hull_bytes: u64,
     pub t: [std::time::Duration; CKPT_STEPS.len()],
     /// Per step its counts (`FrameStats::end_counts`).
-    pub counts: [[u64; 4]; CKPT_STEPS.len()],
+    pub(crate) counts: [[u64; 4]; CKPT_STEPS.len()],
 }
 
 /// A checkpoint's steps (`Checkpointed::t`).
-pub const CKPT_STEPS: [&str; 4] = ["frame file", "frame check", "hull file", "hull check"];
+pub(crate) const CKPT_STEPS: [&str; 4] = ["frame file", "frame check", "hull file", "hull check"];
 
 /// CHECKPOINT a wave: frame `frame`'s file (its new states and wins) and its
 /// hull file (every state whose hull grew, with its layer and hull), each
@@ -755,7 +746,7 @@ impl<N: Rem> ForwardState<N> {
     /// Frame 0: `initial` into an empty visited set and checkpointed, each
     /// with the start's hull; the tree is filtered by `minus_one` and
     /// widened at `level` (both recorded, with the settings `s`).
-    pub fn start(initial: Vec<Block<N>>, dir: &std::path::Path, record: bool, minus_one: Option<MinusOne>, level: crate::abstraction::Level, s: &crate::settings::Settings) -> Result<Self> {
+    pub(crate) fn start(initial: Vec<Block<N>>, dir: &std::path::Path, record: bool, minus_one: Option<MinusOne>, level: crate::abstraction::Level, s: &crate::settings::Settings) -> Result<Self> {
         // A fresh tree keeps nothing a killed run left (stale edge files).
         for sub in ["frames", "edges", "hulls"] {
             let p = dir.join(sub);
@@ -788,7 +779,7 @@ impl<N: Rem> ForwardState<N> {
     /// The forward as its checkpoint tree left it (`None`: no tree); extending
     /// it matches extending the original. Refused at another `level` than
     /// the tree's, or under other settings `s` than its.
-    pub fn resume(dir: &std::path::Path, record: bool, level: crate::abstraction::Level, s: &crate::settings::Settings) -> Result<Option<Self>> {
+    pub(crate) fn resume(dir: &std::path::Path, record: bool, level: crate::abstraction::Level, s: &crate::settings::Settings) -> Result<Option<Self>> {
         let Some(mut last) = crate::storage::layer::last_frame(dir) else { return Ok(None) };
         let t = std::time::Instant::now();
         // Trust only frames whose files are complete (at most one lost).
@@ -923,7 +914,7 @@ impl<N: Rem> ForwardState<N> {
     /// Compute and checkpoint frames `frames+1 ..= to` under the tree's
     /// level -1 filter and the coarser level's `marks`; only an empty
     /// frontier stops it (the backward seeds from wins at every frame).
-    pub fn extend(
+    pub(crate) fn extend(
         &mut self,
         engine: &dyn FrameStep<N>,
         dir: &std::path::Path,
@@ -985,7 +976,7 @@ impl<N: Rem> ForwardState<N> {
     }
 
     /// The position graph recorded so far (None when not recording).
-    pub fn pos_graph(&self) -> Option<crate::search::pos_graph::PosGraph> {
+    pub(crate) fn pos_graph(&self) -> Option<crate::search::pos_graph::PosGraph> {
         self.observer.as_ref().map(|o| o.snapshot())
     }
 }
@@ -1061,13 +1052,13 @@ fn save_pos_graph(dir: &std::path::Path, graph: &crate::search::pos_graph::PosGr
     graph.save(&pos_graph_path(dir))
 }
 
-pub fn pos_graph_path(dir: &std::path::Path) -> std::path::PathBuf {
+pub(crate) fn pos_graph_path(dir: &std::path::Path) -> std::path::PathBuf {
     dir.join("posgraph.bin")
 }
 
 /// A fresh forward from `initial` to `max_frames` (the tests' driver).
 #[cfg(test)]
-pub fn forward_run<N: Rem>(
+pub(crate) fn forward_run<N: Rem>(
     engine: &dyn FrameStep<N>,
     initial: Vec<Block<N>>,
     dir: &std::path::Path,
@@ -1216,7 +1207,7 @@ pub(crate) fn forward_stats_row(
 /// naming the columns, then one row per frame the forward ran, appended as
 /// it runs (a resumed or extended tree appends; a frame rerun after a crash
 /// appears again, and its LAST row is the frame's). `export-ui` reads it.
-pub const FORWARD_STATS: &str = "forward.tsv";
+pub(crate) const FORWARD_STATS: &str = "forward.tsv";
 
 pub(crate) fn append_forward_stats(dir: &std::path::Path, row: &[(&str, String)]) -> Result<()> {
     use std::io::Write;
@@ -1248,7 +1239,7 @@ const RESUME_CHANGES: usize = 1 << 25;
 /// registry as the emissions left it. Changes are upserted per region a
 /// batch of frames at a time (`RESUME_CHANGES`).
 #[allow(clippy::type_complexity)]
-pub fn restore_visited<N: Rem>(dir: &std::path::Path, last: u32, room: (i16, i16), threads: usize) -> Result<(crate::storage::visited::VisitedSet<N>, Option<u32>, Frontier<N>, crate::storage::decode::Skeletons<N>)> {
+pub(crate) fn restore_visited<N: Rem>(dir: &std::path::Path, last: u32, room: (i16, i16), threads: usize) -> Result<(crate::storage::visited::VisitedSet<N>, Option<u32>, Frontier<N>, crate::storage::decode::Skeletons<N>)> {
     use crate::storage::hulls;
     use crate::storage::set::Change;
     let geo = crate::storage::GEOMETRY;
@@ -1360,23 +1351,23 @@ pub fn restore_visited<N: Rem>(dir: &std::path::Path, last: u32, room: (i16, i16
 }
 
 /// One row of a marks file: `(shape, cell, key.0, key.1, dist)`.
-pub type MarkRow = (u64, u32, u64, u64, u32);
+pub(crate) type MarkRow = (u64, u32, u64, u64, u32);
 
 /// The marks-file row of a state with `deadline` (`u16::MAX`: none, saved
 /// as 0).
-pub fn mark_row(shape: u64, key: (u64, u64), cell: u32, deadline: u16, horizon: u32) -> MarkRow {
+pub(crate) fn mark_row(shape: u64, key: (u64, u64), cell: u32, deadline: u16, horizon: u32) -> MarkRow {
     (shape, cell, key.0, key.1, horizon - (deadline as u32).min(horizon))
 }
 
 /// A marks file (`Visited::save`) from its rows, in any order, each state
 /// once, with the key space its keys are in.
-pub fn save_marks<N: EngineNum>(path: &std::path::Path, mut rows: Vec<MarkRow>, horizon: u32, keys: &celeste_engine::exact::KeySpace<N>) -> Result<()> {
+pub(crate) fn save_marks<N: EngineNum>(path: &std::path::Path, mut rows: Vec<MarkRow>, horizon: u32, keys: &celeste_engine::exact::KeySpace<N>) -> Result<()> {
     rows.sort_unstable();
     crate::storage::file::save_value(path, &(rows, horizon, keys.to_additions()))
 }
 
 /// A marks file's rows, horizon and key space.
-pub fn load_marks(path: &std::path::Path) -> Result<(Vec<MarkRow>, u32, celeste_engine::exact::KeySpace)> {
+pub(crate) fn load_marks(path: &std::path::Path) -> Result<(Vec<MarkRow>, u32, celeste_engine::exact::KeySpace)> {
     let (rows, horizon, adds): (Vec<MarkRow>, u32, celeste_engine::exact::KeyAdditions) = crate::storage::file::load_value(path)?;
     Ok((rows, horizon, celeste_engine::exact::KeySpace::from_additions(adds).with_context(|| format!("{}: its key space", path.display()))?))
 }
@@ -1384,7 +1375,7 @@ pub fn load_marks(path: &std::path::Path) -> Result<(Vec<MarkRow>, u32, celeste_
 /// An in-memory set of states `(shape, cell, key)` (a level's MARKED states
 /// or a diagnostic's), saved as a marks file; its keys are in the key space
 /// of the tree it names.
-pub struct Visited<N: EngineNum = P8> {
+pub(crate) struct Visited<N: EngineNum = P8> {
     /// Sharded by (shape, cell); each key maps to its DEADLINE, the last frame
     /// from which it still wins by the horizon (`u16::MAX`: none).
     shards: rustc_hash::FxHashMap<(u64, u32), rustc_hash::FxHashMap<(u64, u64), u16>>,
@@ -1399,15 +1390,16 @@ impl<N: EngineNum> Default for Visited<N> {
 
 impl<N: EngineNum> Visited<N> {
     /// An empty set over the key space `keys`.
-    pub fn new(keys: celeste_engine::exact::KeySpace<N>) -> Self {
+    pub(crate) fn new(keys: celeste_engine::exact::KeySpace<N>) -> Self {
         Visited { shards: Default::default(), keys }
     }
-    pub fn keys(&self) -> &celeste_engine::exact::KeySpace<N> {
+    pub(crate) fn keys(&self) -> &celeste_engine::exact::KeySpace<N> {
         &self.keys
     }
     /// `(entries, order-independent CONTENT hash of the (shape, key, cell)
     /// set)` (`exact::ContentHash`).
-    pub fn fingerprint(&self) -> (usize, u64) {
+    #[cfg(test)]
+    pub(crate) fn fingerprint(&self) -> (usize, u64) {
         let h = self.keys.content_hash();
         let mut acc = 0u64;
         for ((shape, cell), keys) in &self.shards {
@@ -1419,7 +1411,7 @@ impl<N: EngineNum> Visited<N> {
     }
     /// An order-independent content hash of every `(shape, cell, key,
     /// deadline)`: equal values filter alike (`MarkFilter`).
-    pub fn filter_fingerprint(&self) -> u64 {
+    pub(crate) fn filter_fingerprint(&self) -> u64 {
         use celeste_engine::runtime2::mix64;
         let h = self.keys.content_hash();
         let mut acc = 0u64;
@@ -1431,11 +1423,12 @@ impl<N: EngineNum> Visited<N> {
         acc
     }
     /// True if `key` (at `shape`, `cell`) was new. No deadline.
-    pub fn insert(&mut self, shape: u64, key: (u64, u64), cell: u32) -> bool {
+    #[cfg(test)]
+    pub(crate) fn insert(&mut self, shape: u64, key: (u64, u64), cell: u32) -> bool {
         self.insert_until(shape, key, cell, u16::MAX)
     }
     /// `insert` with a deadline; a key inserted twice keeps the later one.
-    pub fn insert_until(&mut self, shape: u64, key: (u64, u64), cell: u32, deadline: u16) -> bool {
+    pub(crate) fn insert_until(&mut self, shape: u64, key: (u64, u64), cell: u32, deadline: u16) -> bool {
         use std::collections::hash_map::Entry;
         match self.shards.entry((shape, cell)).or_default().entry(key) {
             Entry::Occupied(mut e) => {
@@ -1449,18 +1442,15 @@ impl<N: EngineNum> Visited<N> {
             }
         }
     }
-    pub fn contains(&self, shape: u64, key: (u64, u64), cell: u32) -> bool {
+    pub(crate) fn contains(&self, shape: u64, key: (u64, u64), cell: u32) -> bool {
         self.shards.get(&(shape, cell)).is_some_and(|s| s.contains_key(&key))
     }
     /// The key's deadline, `None` if absent.
-    pub fn deadline(&self, shape: u64, key: (u64, u64), cell: u32) -> Option<u16> {
+    pub(crate) fn deadline(&self, shape: u64, key: (u64, u64), cell: u32) -> Option<u16> {
         self.shards.get(&(shape, cell)).and_then(|s| s.get(&key)).copied()
     }
-    pub fn len(&self) -> usize {
+    pub(crate) fn len(&self) -> usize {
         self.shards.values().map(|s| s.len()).sum()
-    }
-    pub fn is_empty(&self) -> bool {
-        self.shards.values().all(|s| s.is_empty())
     }
 }
 
@@ -1468,7 +1458,8 @@ impl Visited {
     /// THE MARKS FILE (also read by the UI export): `(rows, horizon, key
     /// space)`, `dist` = horizon - deadline; no deadline saves as 0 (filters
     /// alike).
-    pub fn save(&self, path: &std::path::Path, horizon: u32) -> Result<()> {
+    #[cfg(test)]
+    pub(crate) fn save(&self, path: &std::path::Path, horizon: u32) -> Result<()> {
         let mut rows: Vec<MarkRow> = Vec::with_capacity(self.len());
         for ((shape, cell), keys) in &self.shards {
             rows.extend(keys.iter().map(|(&key, &d)| mark_row(*shape, key, *cell, d, horizon)));
@@ -1477,7 +1468,7 @@ impl Visited {
     }
 
     /// A marks file (`save`).
-    pub fn load(path: &std::path::Path) -> Result<Self> {
+    pub(crate) fn load(path: &std::path::Path) -> Result<Self> {
         let (rows, horizon, keys) = load_marks(path)?;
         let mut out = Self::new(keys);
         for (shape, cell, k0, k1, dist) in rows {
@@ -1489,7 +1480,7 @@ impl Visited {
 }
 
 /// The first win of a tree complete through `horizon`; `None` if it is not.
-pub fn tree_first_win_through<N: EngineNum>(dir: &std::path::Path, horizon: u32) -> Result<Option<Option<u32>>> {
+pub(crate) fn tree_first_win_through<N: EngineNum>(dir: &std::path::Path, horizon: u32) -> Result<Option<Option<u32>>> {
     let done = crate::storage::edges::done_frame(&dir.join("edges"));
     if done.is_none_or(|d| d < horizon) || !crate::storage::layer::frame_exists(dir, horizon) {
         return Ok(None);
@@ -1642,8 +1633,7 @@ mod tests {
         let layers: Vec<Layer> = (0..=to).map(|f| tree.layer(f, None, 4).expect("layer").0).collect();
         let p0 = crate::search::rem::start_point::<P8>();
         let mut checked = 0u64;
-        crate::search::reach::exact(&hull, to, p0, 4, |t, cur, inexact| {
-            assert!(inexact.is_empty(), "room (1,0) to f{to} needs no coarsening");
+        crate::search::reach::exact::reach(&hull, to, p0, 4, |t, cur| {
             for (sk, r) in cur {
                 let layer = (0..=t).find(|&f| layers[f as usize].contains(*sk)).unwrap_or_else(|| panic!("f{t}: an exactly reached state no layer holds"));
                 // (A full hull is not stored: it holds everything.)
