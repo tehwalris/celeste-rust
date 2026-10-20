@@ -199,7 +199,7 @@ def main():
     ap.add_argument("--modes", action="store_true", help="also the IL and jank modes, their entry states diffed against the chain's")
     ap.add_argument("--trace-objects", action="store_true", help="print the last room's frame lines with every object")
     ap.add_argument("--check-start", metavar="REWRITE", help="(FILE ignored) the search's start state (this rewrite binary's `run --dump-start`) against the boot chain's room entry, field by field")
-    ap.add_argument("--feasible", metavar="REWRITE", help="(FILE ignored) every J a play of the previous room can enter with, grouped by the start state they give (this rewrite binary's `starts`)")
+    ap.add_argument("--feasible", metavar="REWRITE", help="(FILE ignored) every J a play of the previous room can enter with, grouped by the start state they give (this rewrite binary's `room`)")
     ap.add_argument("--entry-jank", action="store_true", help="(FILE ignored) print the J the category's boot chain enters the level with")
     ap.add_argument("--vary", action="store_true", help="(FILE ignored) the room's entry state after every category's boot chain, and the fields that differ")
     a = ap.parse_args()

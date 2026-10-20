@@ -172,11 +172,17 @@ enum Command {
     ExportUi(ExportUiArgs),
     /// The room (`--room`) as the tools need it, as JSON on stdout.
     ///
-    /// Its level, its objects in creation order (the original cart's:
+    /// Its level; its objects in creation order (the original cart's:
     /// tile, tile position, type, whether the minimal cart has it, whether a
-    /// TAS file's `[seeds]` list runs over it), what `--category` means:
+    /// TAS file's `[seeds]` list runs over it); what `--category` means:
     /// whether a win needs the berry (`hundred`), which dash starts are
-    /// forbidden (`nodiag`, `onlydiag`), one dash past the orb (`gemskip`).
+    /// forbidden (`nodiag`, `onlydiag`), one dash past the orb (`gemskip`);
+    /// and the START STATES real play can enter it with (`starts`): every
+    /// loading-frame J a play of the previous room can give (`feasible`),
+    /// the J's grouped by the exact start state they make (`classes`: one
+    /// search per class) and the J of Celia's IL load (`celia`). Give the
+    /// search's settings (the category; `--balloon-seeds` for a room with
+    /// balloons), not `--loading-jank` (what it enumerates).
     Room,
     /// A WITNESS as the tools need it (`concrete::witness`), as JSON on
     /// stdout: `--inputs` replayed on the reference engine (the minimal
@@ -186,14 +192,6 @@ enum Command {
     /// jump fires (`canonical`), and in a 100% category the chest seed
     /// lists to try (`chest_seed_variants`).
     Witness(run::WitnessArgs),
-    /// The start states real play can enter the room with, as JSON on stdout.
-    ///
-    /// Every loading-frame J a play of the previous room can give, the J's
-    /// grouped by the exact start state they make (one search per class),
-    /// and the J of Celia's IL load (`starts`). Give the search's settings
-    /// (the category; `--balloon-seeds` for a room with balloons), not
-    /// `--loading-jank`.
-    Starts,
 }
 
 impl Command {
@@ -528,15 +526,11 @@ fn main() -> Result<()> {
             },
         ),
         Command::Room => {
-            let objects = celeste_rust::trace::cart::room_objects(cfg.room);
-            let level = celeste_rust::game_runner::level_index(cfg.room.0, cfg.room.1) + 1;
+            let mut room = serde_json::to_value(celeste_rust::starts::starts(&cfg)?)?;
             let c = cfg.category;
-            let category = serde_json::json!({ "name": c.to_string(), "hundred": c.hundred(), "nodiag": c.nodiag(), "onlydiag": c.onlydiag(), "gemskip": c.gemskip() });
-            println!("{}", serde_json::json!({ "room": cfg.room, "level": level, "objects": objects, "category": category }));
-            Ok(())
-        }
-        Command::Starts => {
-            println!("{}", serde_json::to_string(&celeste_rust::starts::starts(&cfg)?)?);
+            room["objects"] = serde_json::to_value(celeste_rust::trace::cart::room_objects(cfg.room))?;
+            room["category"] = serde_json::json!({ "name": c.to_string(), "hundred": c.hundred(), "nodiag": c.nodiag(), "onlydiag": c.onlydiag(), "gemskip": c.gemskip() });
+            println!("{room}");
             Ok(())
         }
     }

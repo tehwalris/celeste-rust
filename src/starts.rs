@@ -1,4 +1,4 @@
-//! The start states real play can enter a room with (`rewrite starts`):
+//! The start states real play can enter a room with (`rewrite room`):
 //! the room's LOADING FRAME runs its objects' updates from the leaving
 //! player's index J (`--loading-jank J`, `trace::cart`), and J depends on
 //! how the previous room was played. Every J a play of the previous room can
@@ -67,7 +67,7 @@ pub fn celia_jank(room: (i16, i16)) -> Result<Option<usize>> {
 /// The starts of `s.room` under settings `s` (the category, the balloon
 /// seeds; `--loading-jank` is what this enumerates, so refused).
 pub fn starts(s: &crate::settings::Settings) -> Result<Starts> {
-    anyhow::ensure!(s.loading_jank.is_none(), "rewrite starts enumerates the loading jank: no --loading-jank");
+    anyhow::ensure!(s.loading_jank.is_none(), "rewrite room enumerates the room's starts: no --loading-jank");
     let level = crate::game_runner::level_index(s.room.0, s.room.1) + 1;
     let Some(prev) = previous(s.room) else {
         return Ok(Starts { room: s.room, level, previous: None, previous_objects: Vec::new(), spawn_frame: None, feasible: Vec::new(), classes: Vec::new(), celia: None });
@@ -79,7 +79,7 @@ pub fn starts(s: &crate::settings::Settings) -> Result<Starts> {
     // plus the room title if it is still up and the spawn's smoke if it can
     // be: only when the exit can come that soon, bounded by the spawn's own
     // frames and the climb at the region's speed bound.
-    let speed = s.region_grid().context("rewrite starts: the climb is bounded by the region's speed (--region px,S)")?.speed as u32;
+    let speed = s.region_grid().context("rewrite room: the starts' climb is bounded by the region's speed (--region px,S)")?.speed as u32;
     let k = objs.len();
     let d = objs.iter().filter(|o| DESTROYABLE.contains(&o.tile)).count();
     let spawn_y = objs.iter().find(|o| o.kind == "player_spawn").with_context(|| format!("room {prev:?} has no spawn"))?.ty as u32 * 8;

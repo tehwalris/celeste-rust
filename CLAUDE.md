@@ -198,7 +198,7 @@ tools/celia/validate.sh [--dashes 1] [--fixp] LEVEL FILE.tas   # Celia headless 
 pico8_diff/chain.py CAT LEVEL FILE --boot            # real PICO-8 from 100m with the database's files
 pico8_diff/chain.py CAT LEVEL FILE --modes           # IL / jank / chain entry states diffed field by field
 pico8_diff/chain.py CAT LEVEL x --check-start target/quick/rewrite   # the search's start vs the boot chain
-target/quick/rewrite starts --room X,Y [category] --balloon-seeds 0   # every J and its start class
+target/quick/rewrite room --room X,Y [--category C] --balloon-seeds 0   # every J and its start class
 ```
 
 The boot chain is the verdict; a passing UCT run is not. Our result is the

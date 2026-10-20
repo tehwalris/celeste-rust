@@ -210,7 +210,7 @@ room alone and misses it; Celia models it.
   lowers J. Only J moves objects across the categories' boot chains; no
   held button carries over; `freeze` at entry may be 2 (it freezes every
   object alike).
-- The search takes the start as a set of J classes (`rewrite starts`); the
+- The search takes the start as a set of J classes (`rewrite room`); the
   runner runs the boot chain's J (its witness carries the upload) and one
   search per other class.
 - **Celia's J is not always the boot chain's**: it counts the previous

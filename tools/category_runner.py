@@ -22,7 +22,7 @@ Per job:
  0. the room's start as real play enters it: its loading frame from object
     J (pico8_diff/chain.py entry_jank: the category's boot chain; a job's
     "jank": J or "none"), for the search (--loading-jank) and every replay;
-    every other start class (`rewrite starts`) a search-only job;
+    every other start class (`rewrite room`'s starts) a search-only job;
  1. the reference: the community TAS replayed in the ORIGINAL cart behind the
     room's prologue (the earliest offset around `offset` that exits);
  2. `rewrite search --frames REF --ceiling --prefer <the community TAS>` with the
@@ -374,7 +374,7 @@ def ui_label(room, label, opt, tasn, ref, res):
 def expand(job, cache, binary):
     """A job is run as real play enters its room: its loading frame from the
     J of the category's boot chain (`chain.entry_jank`). Where another play
-    of the previous room gives the room another start (`rewrite starts`:
+    of the previous room gives the room another start (`rewrite room`:
     every feasible J, grouped by the start state), one SEARCH-ONLY job per
     other start, tagged `-J<j>`: the history-WIDENED optimum is the least of
     them all; the main job's witness is valid after the database's previous

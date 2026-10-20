@@ -220,7 +220,7 @@ room differently: the leaving player calls `next_room()` inside `_update`'s
 the new room's objects from index J on get one update on the loading frame
 (the "loading jank"). `--loading-jank J` patches that into the Lua
 (`trace::cart::apply_loading_frame`; J counts the original cart's objects).
-J depends on how the previous room was played: `rewrite starts` computes
+J depends on how the previous room was played: `rewrite room` computes
 the feasible J's grouped by the exact start state they give, and the
 category runner searches each class. The boot chain on a real PICO-8 is the
 ground truth (`pico8_diff/chain.py --boot`, `--check-start`).

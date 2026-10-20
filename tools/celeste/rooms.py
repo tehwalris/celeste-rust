@@ -66,8 +66,8 @@ def witness(room, inputs, seeds, cat, jank, binary=REWRITE):
 
 
 def starts(room, flags, binary=REWRITE):
-    """`rewrite starts`: every loading-frame J a play of the previous room
+    """`rewrite room`'s starts: every loading-frame J a play of the previous room
     can enter `room` with (`feasible`), grouped by the start state they give
     (`classes`), and Celia's IL-load J (`celia`). `flags`: the search's
     settings (the category, `--balloon-seeds`)."""
-    return _ask(["starts", "--room", text(room)] + flags, binary)
+    return _ask(["room", "--room", text(room)] + flags, binary)

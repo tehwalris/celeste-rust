@@ -627,42 +627,13 @@ pub fn duplicate_flags(cmd: &clap::Command) -> Vec<String> {
 }
 
 /// A binary's first step: refuse every `CELESTE_*` variable in the
-/// environment, naming the flag that replaced each (a stale script must not
-/// run with its knobs silently ignored). `CELESTE_FIXTURES` (read by
+/// environment (a stale script must not run with its knobs silently
+/// ignored; settings are flags). `CELESTE_FIXTURES` (read by
 /// tools/fixtures.sh only) is allowed.
 pub fn refuse_env() -> Result<()> {
-    const MOVED: &[(&str, &str)] = &[
-        ("CELESTE_START_ROOM", "--room X,Y"),
-        ("CELESTE_WIN_AT_XY", "--win-at"),
-        ("CELESTE_SPLIT_FRAME", "--split-frame"),
-        ("CELESTE_REGION", "--region"),
-        ("CELESTE_HUNDRED", "--category 100"),
-        ("CELESTE_NODIAG", "--category nodiag"),
-        ("CELESTE_ONLYDIAG", "--category onlydiag"),
-        ("CELESTE_GEMSKIP", "--category gemskipany"),
-        ("CELESTE_LOADING_JANK", "--loading-jank"),
-        ("CELESTE_BALLOON_SEEDS", "--balloon-seeds"),
-        ("CELESTE_CONCRETE_BALLOON_SEEDS", "--concrete-balloon-seeds"),
-        ("CELESTE_LEVEL_MINUS_ONE", "--level-minus-one H,S"),
-        ("CELESTE_TRIM_ROWS", "nothing: frame files hold keys, never rows (plans/architecture.md)"),
-        ("CELESTE_THREADS", "--threads"),
-        ("CELESTE_L1_TABLE", "--l1-table"),
-        ("CELESTE_KERNEL_KEY_CHECK", "--key-check"),
-        ("CELESTE_KERNEL_EXPLAIN", "--kernel-explain"),
-        ("CELESTE_KERNEL_METRICS", "bench frame --metrics"),
-        ("CELESTE_BUILD_TRACE", "--build-trace"),
-        ("CELESTE_PHASES", "--phases"),
-    ];
-    let mut bad: Vec<String> = std::env::vars_os()
-        .filter_map(|(k, _)| k.to_str().map(str::to_string))
-        .filter(|k| k.starts_with("CELESTE_") && k != "CELESTE_FIXTURES")
-        .map(|k| match MOVED.iter().find(|m| m.0 == k) {
-            Some((_, flag)) => format!("{k}: now the flag {flag}"),
-            None => format!("{k}: no such setting (the flags: --help)"),
-        })
-        .collect();
+    let mut bad: Vec<String> = std::env::vars_os().filter_map(|(k, _)| k.to_str().map(str::to_string)).filter(|k| k.starts_with("CELESTE_") && k != "CELESTE_FIXTURES").collect();
     bad.sort();
-    anyhow::ensure!(bad.is_empty(), "the environment sets CELESTE_* variables; settings are flags:\n  {}", bad.join("\n  "));
+    anyhow::ensure!(bad.is_empty(), "the environment sets {}: settings are flags (--help)", bad.join(", "));
     Ok(())
 }
 

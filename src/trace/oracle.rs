@@ -307,7 +307,7 @@ mod tests {
         let (x, y) = field("room")?.split_once(',').ok_or_else(|| anyhow!("room"))?;
         let seeds = field("seeds")?;
         // Celia's start is its IL load's jank, the default (the manifest's
-        // J, from `rewrite starts`, must be it).
+        // J, from `rewrite room`'s starts, must be it).
         let loading_jank = match tool {
             FloatTool::Uct => None,
             FloatTool::Celia => {

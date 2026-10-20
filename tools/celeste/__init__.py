@@ -2,8 +2,8 @@
 
 Python drives the external programs (PICO-8, UniversalClassicTas, Celia,
 LOVE) and the tasdatabase; Rust owns the game (`rewrite room`, `rewrite
-starts`, `rewrite witness`, the search's `result.json`) and this package
-asks it rather than reimplementing it.
+witness`, the search's `result.json`) and this package asks it rather
+than reimplementing it.
 
     categories  the categories: labels, fallbacks, the tools' dash count
     tasdb       the tasdatabase: its file format (parsed and written once),
@@ -18,5 +18,5 @@ import os
 
 # The repo root (this package is tools/celeste/).
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-# The binary the tools ask about the game (`rewrite room`, `rewrite starts`).
+# The binary the tools ask about the game (`rewrite room`, `rewrite witness`).
 REWRITE = os.path.join(ROOT, "target", "quick", "rewrite")
