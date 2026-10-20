@@ -14,7 +14,7 @@
 //! * INDUCTIVE RANGES: successors lie in their shape's ranges and pins; a
 //!   range that does not widens, a pin that fails is dropped, and passes
 //!   repeat to a fixpoint.
-//! * NO `error` on a live outcome (`Known`/`SplitOk` read as true: selects
+//! * NO `error` on a live outcome (`Known`/`ForkOk` read as true: selects
 //!   are joined and fork spans checked directly); anything else is reported.
 //! * Every position hull has whole endpoints.
 //!
@@ -34,11 +34,11 @@ use celeste_core::arith::{Arithmetic, EngineNum, Fixed, Float};
 use crate::trace::domain::{Domain, Symbolic};
 use crate::trace::heap::Value;
 use crate::trace::iface::{self, Conc, Path, Step};
-use crate::trace::walk::{LatticeWalk, Tracer};
+use crate::trace::walk::{LatticeWalk, ShapeKey, Tracer};
 use crate::trace::state::State;
 use crate::trace::widen::field;
 use crate::transpile::garith::{value_box, GraphArith};
-use crate::transpile::graph::{Graph, NodeId, Op, Room, Val};
+use crate::transpile::graph::{Cut, Graph, NodeId, Op, Room, Val};
 
 /// A report line, to the report and at once to stderr (a run is minutes).
 macro_rules! say {
@@ -228,8 +228,8 @@ struct Roots {
     fields: Vec<NodeId>,
 }
 
-/// What a fork splits at: `flr` (`Split`, `SplitInt`) or `flr(x + 1/2)`
-/// (`RSplit`, the doubles' `__split_by_round`).
+/// What a fork splits at: `flr` (`Fork` of the floors or the whole numbers)
+/// or `flr(x + 1/2)` (of the rounds, the doubles' `__split_by_round`).
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum ForkAt {
     Floor,
@@ -274,7 +274,7 @@ struct Traced<A: GraphArith> {
 }
 
 struct Shape<A: GraphArith> {
-    key: String,
+    key: ShapeKey,
     ranges: BTreeMap<Path, Range<A>>,
     /// `rnd`-derived ranges every lane holds as a LITERAL (`Obs::Lit`), read
     /// as that literal so a lane's own ends stay exact.
@@ -311,27 +311,27 @@ struct Table<'a, A: GraphArith> {
     hundred: bool,
     spd_px: i16,
     shapes: Vec<Shape<A>>,
-    by_key: HashMap<String, usize>,
+    by_key: HashMap<ShapeKey, usize>,
     obs_keys: Vec<(usize, Path)>,
     obs_index: BTreeMap<(usize, Path), usize>,
 }
 
 impl<A: GraphArith> Table<'_, A> {
-    fn shape_id(&mut self, key: &str) -> Result<usize> {
-        if let Some(&i) = self.by_key.get(key) {
+    fn shape_id(&mut self, key: ShapeKey) -> Result<usize> {
+        if let Some(&i) = self.by_key.get(&key) {
             return Ok(i);
         }
-        ensure!(self.lw.reps.contains_key(key), "an outcome shape the lattice walk never reached: {key}");
+        ensure!(self.lw.reps.contains_key(&key), "an outcome shape the lattice walk never reached: {key:#x}");
         let i = self.shapes.len();
-        self.shapes.push(Shape { key: key.to_string(), ranges: BTreeMap::new(), lits: BTreeSet::new(), unseeded: BTreeSet::new(), demoted: BTreeSet::new(), traced: None });
-        self.by_key.insert(key.to_string(), i);
+        self.shapes.push(Shape { key, ranges: BTreeMap::new(), lits: BTreeSet::new(), unseeded: BTreeSet::new(), demoted: BTreeSet::new(), traced: None });
+        self.by_key.insert(key, i);
         Ok(i)
     }
 
     /// May slot `p` be a literal (`Shape::lits`)? `rnd`-derived, never motion.
-    fn lit_slot(&self, key: &str, p: &Path) -> bool {
+    fn lit_slot(&self, key: ShapeKey, p: &Path) -> bool {
         let motion = p.len() == 4 && p[0] == iface::key("objects") && (p[2] == iface::key("rem") || p[2] == iface::key("spd"));
-        !motion && self.lw.ival_extra.get(key).is_some_and(|s| s.contains(p))
+        !motion && self.lw.ival_extra.get(&key).is_some_and(|s| s.contains(p))
     }
 
     fn obs_slot(&mut self, shape: usize, p: &Path) -> usize {
@@ -347,7 +347,7 @@ impl<A: GraphArith> Table<'_, A> {
     /// Trace shape `id` under its ranges and pins, specialized.
     fn trace(&mut self, tr: &mut Tracer<A>, id: usize) -> Result<()> {
         let t0 = std::time::Instant::now();
-        let key = self.shapes[id].key.clone();
+        let key = self.shapes[id].key;
         let st = self.lw.reps[&key].clone();
         let roots = crate::trace::shapes::state_paths(&st)?;
         let pins: BTreeMap<Path, Conc<A>> = self.lw.lattice[&key]
@@ -374,8 +374,8 @@ impl<A: GraphArith> Table<'_, A> {
             // (`ival_extra`: a balloon's bob) holds its start value.
             let start_ival = key == self.lw.start_key && self.lw.start_ivals.contains_key(p);
             let r = if start_ival {
-                let (lo, hi) = self.lw.start_ivals[p].ok_or_else(|| anyhow!("{key}: the start state's interval {} is not a literal range", iface::show(p)))?;
-                ensure!(self.lit_slot(&key, p), "{key}: the start state's interval {} is not an `rnd` slot", iface::show(p));
+                let (lo, hi) = self.lw.start_ivals[p].ok_or_else(|| anyhow!("{key:#x}: the start state's interval {} is not a literal range", iface::show(p)))?;
+                ensure!(self.lit_slot(key, p), "{key:#x}: the start state's interval {} is not an `rnd` slot", iface::show(p));
                 self.shapes[id].lits.insert(p.clone());
                 (A::from_lit(lo), A::from_lit(hi))
             } else if is_player("rem") {
@@ -383,7 +383,7 @@ impl<A: GraphArith> Table<'_, A> {
             } else if is_player("spd") {
                 (A::from_i16(-self.spd_px), A::from_i16(self.spd_px))
             } else {
-                let v = tr.it.d.as_const(&n).ok_or_else(|| anyhow!("{key}: {} is not a constant in the representative", iface::show(p)))?;
+                let v = tr.it.d.as_const(&n).ok_or_else(|| anyhow!("{key:#x}: {} is not a constant in the representative", iface::show(p)))?;
                 if key != self.lw.start_key {
                     self.shapes[id].unseeded.insert(p.clone());
                 }
@@ -464,8 +464,7 @@ impl<A: GraphArith> Table<'_, A> {
                 roots_old.push(Roots { live: o.guard, error: o.error, xy: None, fields: Vec::new() });
                 continue;
             }
-            let tkey = format!("{:?}", o.st.shape()?);
-            let tid = self.shape_id(&tkey)?;
+            let tid = self.shape_id(crate::trace::walk::shape_key(&o.st, self.lw.cache.clone())?)?;
             let tloc = located_object(&o.st);
             let node_of = |p: &Path| o.fields.iter().find(|(q, _, _)| q == p).map(|(_, n, _)| *n);
             let xy = match &tloc {
@@ -532,13 +531,13 @@ impl<A: GraphArith> Table<'_, A> {
                     let (lo, hi) = lit_cells[&c];
                     cone.leaf(Op::Const(lo, hi))
                 }
-                Op::Known | Op::SplitOk(_) | Op::RSplitOk(_) | Op::NoWrap => cone.leaf(Op::ConstBool(true)),
+                Op::Known | Op::ForkOk(..) | Op::NoWrap => cone.leaf(Op::ConstBool(true)),
                 _ => {
                     match nd.op {
-                        Op::Split(k) | Op::SplitInt(k) => {
+                        Op::Fork(Cut::Floors | Cut::Ints, k) => {
                             forks.entry(k).or_insert((ForkAt::Floor, args[0]));
                         }
-                        Op::RSplit(k) => {
+                        Op::Fork(Cut::Rounds, k) => {
                             forks.entry(k).or_insert((ForkAt::Round, args[0]));
                         }
                         _ => {}
@@ -547,12 +546,12 @@ impl<A: GraphArith> Table<'_, A> {
                 }
             };
         }
-        // `SplitValid` without its `Split` in the cone still names a fork.
+        // `ForkValid` without its `Fork` in the cone still names a fork.
         for i in 0..arena.len() {
             if need[i] {
                 let at = match arena.get(i as NodeId).op {
-                    Op::SplitValid(k) => (k, ForkAt::Floor),
-                    Op::RSplitValid(k) => (k, ForkAt::Round),
+                    Op::ForkValid(Cut::Floors, k) => (k, ForkAt::Floor),
+                    Op::ForkValid(_, k) => (k, ForkAt::Round),
                     _ => continue,
                 };
                 forks.entry(at.0).or_insert((at.1, cmap[arena.get(i as NodeId).args[0] as usize]));
@@ -1653,7 +1652,7 @@ fn build<A: GraphArith>(spd_px: i32, threads: usize, rep: &mut String, s: &crate
         obs_keys: Vec::new(),
         obs_index: BTreeMap::new(),
     };
-    let start_id = table.shape_id(&lw.start_key)?;
+    let start_id = table.shape_id(lw.start_key)?;
     let start_xy = {
         let st = &lw.reps[&lw.start_key];
         let o = located_object(st).ok_or_else(|| anyhow!("the start state has no player or spawn"))?;
@@ -1687,14 +1686,14 @@ fn build<A: GraphArith>(spd_px: i32, threads: usize, rep: &mut String, s: &crate
         // The successor's values are its seeds.
         let mut ranges: BTreeMap<Path, Range<A>> = BTreeMap::new();
         let mut lits: BTreeSet<Path> = BTreeSet::new();
-        let tkey = table.shapes[tid].key.clone();
+        let tkey = table.shapes[tid].key;
         for (slot, o) in acc.obs.iter().enumerate() {
             let (sid, p) = &table.obs_keys[slot];
             if *sid != tid {
                 continue;
             }
             match o {
-                Some(Obs::Lit(lo, hi)) if table.lit_slot(&tkey, p) => {
+                Some(Obs::Lit(lo, hi)) if table.lit_slot(tkey, p) => {
                     ranges.insert(p.clone(), (*lo, *hi));
                     lits.insert(p.clone());
                 }
@@ -1811,7 +1810,7 @@ fn build<A: GraphArith>(spd_px: i32, threads: usize, rep: &mut String, s: &crate
         let mut changes: Vec<String> = Vec::new();
         for (slot, (id, p)) in table.obs_keys.clone().iter().enumerate() {
             let Some(o) = obs[slot] else { continue };
-            let eligible = table.lit_slot(&table.shapes[*id].key, p);
+            let eligible = table.lit_slot(table.shapes[*id].key, p);
             let sh = &mut table.shapes[*id];
             let Some(t) = sh.traced.as_ref() else {
                 // A shape with no reached node: nothing to check against.
@@ -1902,7 +1901,7 @@ fn build<A: GraphArith>(spd_px: i32, threads: usize, rep: &mut String, s: &crate
     for (id, sh) in table.shapes.iter().enumerate() {
         let Some(t) = &sh.traced else { continue };
         let n = g1.nodes.iter().filter(|k| k.0 == id).count();
-        say!(rep, "shape {id} ({:#x}): {n} nodes; {}", lw.frames.iter().find(|((k, _), _)| *k == sh.key).map(|(_, wf)| wf.frame.in_rt2.shape_hash_of()).unwrap_or(0), t.stats)?;
+        say!(rep, "shape {id} ({:#x}): {n} nodes; {}", sh.key, t.stats)?;
         let rs: Vec<String> = sh
             .ranges
             .iter()
@@ -1941,13 +1940,7 @@ fn build<A: GraphArith>(spd_px: i32, threads: usize, rep: &mut String, s: &crate
         g1.clipped.iter().filter(|c| **c).count(),
         g1.deaths.iter().filter(|c| **c).count()
     )?;
-    let mut by_hash = HashMap::new();
-    for (h, k) in &lw.by_hash {
-        if let Some(&id) = table.by_key.get(k) {
-            by_hash.insert(*h, id);
-        }
-    }
-    Ok(Built { by_hash, g1, sound, chain, start_d })
+    Ok(Built { by_hash: table.by_key, g1, sound, chain, start_d })
 }
 
 /// A KNOWN SOLUTION against the table (`rewrite l1 check`): `inputs`

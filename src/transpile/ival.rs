@@ -49,7 +49,7 @@ pub(crate) fn seed_cells<A: GraphArith>(g: &Graph<A>) -> HashMap<u32, Val<A>> {
     let mut cells: HashMap<u32, Val<A>> = HashMap::new();
     for id in 0..g.len() {
         if let Op::Cell(c) = g.get(id as NodeId).op {
-            let v = if g.cell_kind(c) == super::graph::CellKind::Bool { Val::Bool(None) } else { full };
+            let v = if g.cell_kind(c).is_bool() { Val::Bool(None) } else { full };
             cells.insert(c, v);
         }
     }
@@ -107,6 +107,7 @@ pub fn fold_into<A: GraphArith>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::transpile::graph::Cut;
     use crate::pico8_num::Pico8Num;
 
     /// A box with both ends zero holds lanes of either zero: `min(0, x)`
@@ -339,18 +340,18 @@ mod tests {
     fn fragment_validity_is_not_decided_from_a_wide_hull() {
         let mut g = Graph::new();
         let x = g.leaf(Op::Cell(0));
-        let ok1 = g.fold(Op::FragOk(1), vec![x]);
-        let frag1 = g.fold(Op::Frag(1), vec![x]);
+        let ok1 = g.fold(Op::FragOk(Cut::Floors, 1), vec![x]);
+        let frag1 = g.fold(Op::Frag(Cut::Floors, 1), vec![x]);
         let (out, map, _) = fold(&g, &[ok1, frag1], None).expect("folds");
-        assert_eq!(out.get(map[ok1 as usize]).op, Op::FragOk(1), "wide hull: undecided");
-        assert_eq!(out.get(map[frag1 as usize]).op, Op::Frag(1), "the fragment stays a fragment");
+        assert_eq!(out.get(map[ok1 as usize]).op, Op::FragOk(Cut::Floors, 1), "wide hull: undecided");
+        assert_eq!(out.get(map[frag1 as usize]).op, Op::Frag(Cut::Floors, 1), "the fragment stays a fragment");
 
         // Inside one floor nothing straddles, so fragment 1 is never valid.
         let mut g = Graph::new();
         let lo = g.leaf(Op::Const(65536 * 3 + 1000, 65536 * 3 + 1000));
         let hi = g.leaf(Op::Const(65536 * 3 + 50000, 65536 * 3 + 50000));
         let x = g.fold(Op::Span, vec![lo, hi]);
-        let ok1 = g.fold(Op::FragOk(1), vec![x]);
+        let ok1 = g.fold(Op::FragOk(Cut::Floors, 1), vec![x]);
         let (out, map, _) = fold(&g, &[ok1], None).expect("folds");
         assert_eq!(out.get(map[ok1 as usize]).op, Op::ConstBool(false));
     }

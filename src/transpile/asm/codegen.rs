@@ -1,5 +1,5 @@
 //! `transpile::graph::Graph` -> AVX-512 GAS assembly: numeric, interval and
-//! tri-state boolean ops, bit-for-bit `celeste_engine::kernel` (checked by
+//! tri-state boolean ops, bit for bit the arithmetic's own (checked by
 //! `super::tests`). Lower to SSA over vregs (GVN), list-schedule,
 //! linear-scan allocate, emit. Per arithmetic (`AsmArith`): 16.16 lowers to
 //! 16 `i32` lanes a zmm (this file), the doubles to 8 `f64` lanes (`float`),
@@ -14,7 +14,7 @@ use anyhow::{bail, Result};
 use celeste_core::arith::{Fixed, Float};
 
 use crate::transpile::garith::GraphArith;
-use crate::transpile::graph::{self, Graph, NodeId, Op};
+use crate::transpile::graph::{self, Cut, Graph, NodeId, Op, Ty};
 
 mod float;
 
@@ -239,50 +239,34 @@ enum Inst {
     StoreMask8 { off: u32, src: Vreg },
 }
 
-/// The type of a root value: how to read its output slot.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-pub enum RootKind {
-    Num,
-    Bool,
-    Ival,
-}
-
-/// How an `Op::Cell` input is packed (absent from the map = `Num`):
+/// The bytes an input cell of type `ty` takes (its layout, by type):
 /// `Num` 16 x i32 (64 B; the doubles' 8 x f64 a half); `Bool` a u16 `val`
-/// mask (the doubles' u8 a half) at +0 of 64 B (known);
-/// `UBool` `val` at +0, `known` at +2 of 64 B; `Ival` `lo` at +0, `hi` at +64.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum CellRepr {
-    Num,
-    Bool,
-    UBool,
-    Ival,
-}
-
-impl CellRepr {
-    fn size(self) -> u32 {
-        match self {
-            CellRepr::Num | CellRepr::Bool | CellRepr::UBool => 64,
-            CellRepr::Ival => 128,
-        }
+/// mask (the doubles' u8 a half) at +0 of 64 B (known); `UBool` `val` at
+/// +0, `known` at +2 of 64 B; `Ival` `lo` at +0, `hi` at +64.
+fn input_bytes(ty: Ty) -> u32 {
+    match ty {
+        Ty::Num | Ty::Bool | Ty::UBool => 64,
+        Ty::Ival => 128,
     }
 }
 
 /// The assembly text plus the buffer layouts a caller packs.
 pub struct Compiled {
     pub asm: String,
-    /// Input cells, in ascending order (layout: `CellRepr`).
+    /// Input cells, in ascending order (layout: by type, `input_bytes`).
     pub input_cells: Vec<u32>,
     /// Byte offset of each input cell (parallel to `input_cells`).
     pub input_offsets: Vec<u32>,
-    pub input_reprs: Vec<CellRepr>,
+    /// Each input cell's type (the graph's `cell_kind`).
+    pub input_reprs: Vec<Ty>,
     pub input_bytes: u32,
     pub n_roots: usize,
     /// Root byte offsets: bools first (4 B: `val` u16, `known` at +2), then
     /// numbers (64 B) and intervals (128 B: `lo`, `hi` at +64), 64-aligned.
     pub root_offsets: Vec<u32>,
     pub out_bytes: u32,
-    pub root_kinds: Vec<RootKind>,
+    /// Each root's type (never `UBool`: a boolean root is two planes).
+    pub root_kinds: Vec<Ty>,
     pub sym: String,
     /// Spill slots used (0 = everything fit).
     pub spill_slots: usize,
@@ -327,8 +311,6 @@ struct Lower<'a, A: GraphArith> {
     next_vreg: Vreg,
     input_cells: Vec<u32>,
     cell_off: HashMap<u32, u32>,
-    /// Per-cell input repr (absent = `Num`).
-    cell_reprs: &'a HashMap<u32, CellRepr>,
     /// GVN: a pure op's `Key` -> the vreg holding its result.
     memo: HashMap<Key, Vreg>,
 }
@@ -504,15 +486,15 @@ impl<A: GraphArith> Lower<'_, A> {
         match self.vals[id as usize] {
             Some(Value::Num(n)) => Ok(n),
             _ => bail!(
-                "node {} (op {:?}, domain {}; args {}) is not a numeric value where one was needed; interval source: {}",
+                "node {} (op {:?}, {:?}; args {}) is not a numeric value where one was needed; interval source: {}",
                 id,
                 self.g.get(id).op,
-                self.dom(id),
+                self.g.ty(id),
                 self.g
                     .get(id)
                     .args
                     .iter()
-                    .map(|&a| format!("{a}={:?}/d{}", self.g.get(a).op, self.dom(a)))
+                    .map(|&a| format!("{a}={:?}/{:?}", self.g.get(a).op, self.g.ty(a)))
                     .collect::<Vec<_>>()
                     .join(", "),
                 self.interval_source(id)
@@ -529,12 +511,12 @@ impl<A: GraphArith> Lower<'_, A> {
             _ => "",
         };
         if depth == 0 || node.args.is_empty() {
-            return format!("{id}={:?}/d{}{known}", node.op, self.dom(id));
+            return format!("{id}={:?}/{:?}{known}", node.op, self.g.ty(id));
         }
         format!(
-            "{id}={:?}/d{}{known}({})",
+            "{id}={:?}/{:?}{known}({})",
             node.op,
-            self.dom(id),
+            self.g.ty(id),
             node.args.iter().map(|&a| self.describe(a, depth - 1)).collect::<Vec<_>>().join(", ")
         )
     }
@@ -548,13 +530,13 @@ impl<A: GraphArith> Lower<'_, A> {
             out.push(format!("{cur}={:?}", node.op));
             let next = match node.op {
                 Op::Sel => {
-                    let arm = node.args[1..].iter().copied().find(|&x| self.dom(x) == 2);
+                    let arm = node.args[1..].iter().copied().find(|&x| self.wide(x));
                     if arm.is_none() {
                         out.push(format!("<- condition {}", self.describe(node.args[0], 5)));
                     }
                     arm
                 }
-                _ => node.args.iter().copied().find(|&x| self.dom(x) == 2),
+                _ => node.args.iter().copied().find(|&x| self.wide(x)),
             };
             match next {
                 Some(x) => cur = x,
@@ -580,14 +562,9 @@ impl<A: GraphArith> Lower<'_, A> {
         }
     }
 
-    /// A node's domain: 0 number, 1 boolean, 2 interval.
-    fn dom(&self, id: NodeId) -> u8 {
-        match self.vals[id as usize] {
-            Some(Value::Num(_)) => 0,
-            Some(Value::Bool(_)) => 1,
-            Some(Value::Ival(_)) => 2,
-            None => 0,
-        }
+    /// Is the node an interval (its lane type, `Graph::ty`)?
+    fn wide(&self, id: NodeId) -> bool {
+        self.g.ty(id) == Ty::Ival
     }
 
     /// The ops every arithmetic lowers alike (the boolean layer, selects,
@@ -600,7 +577,7 @@ impl<A: GraphArith> Lower<'_, A> {
             // Undecided in every lane: the known plane is all zeros.
             Op::UnknownBool(_) => Value::Bool([MaskVal::Const(false), MaskVal::Const(false)]),
             // `trace::lower::bind` keeps it out of every root's cone.
-            Op::UnknownNum => bail!("node {}: an unknown number reached the kernel", id),
+            Op::UnknownNum { .. } => bail!("node {}: an unknown number reached the kernel", id),
             Op::Not => {
                 let b = self.as_bool(a[0])?;
                 let nv = self.m_not(b[0]);
@@ -630,7 +607,7 @@ impl<A: GraphArith> Lower<'_, A> {
                 }
             }
             Op::Lo | Op::Hi => {
-                if self.dom(a[0]) == 2 {
+                if self.wide(a[0]) {
                     let iv = self.as_ival(a[0])?;
                     Value::Num(iv[if matches!(node.op, Op::Lo) { 0 } else { 1 }])
                 } else {
@@ -639,21 +616,21 @@ impl<A: GraphArith> Lower<'_, A> {
             }
             Op::Sel => {
                 let cv = self.as_bool(a[0])?[0];
-                // On the JOINED arm domain (a number beside an interval is [n, n]).
-                match self.dom(a[1]).max(self.dom(a[2])) {
-                    1 => {
+                // On the JOINED arm type (a number beside an interval is [n, n]).
+                match self.g.ty(id) {
+                    Ty::Bool | Ty::UBool => {
                         let (t, f) = (self.as_bool(a[1])?, self.as_bool(a[2])?);
                         let val = self.m_sel(cv, t[0], f[0]);
                         let known = self.m_sel(cv, t[1], f[1]);
                         Value::Bool([val, known])
                     }
-                    2 => {
+                    Ty::Ival => {
                         let (t, f) = (self.as_ival(a[1])?, self.as_ival(a[2])?);
                         let lo = self.n_sel(cv, t[0], f[0]);
                         let hi = self.n_sel(cv, t[1], f[1]);
                         Value::Ival([lo, hi])
                     }
-                    _ => {
+                    Ty::Num => {
                         let (t, f) = (self.as_num(a[1])?, self.as_num(a[2])?);
                         Value::Num(self.n_sel(cv, t, f))
                     }
@@ -796,7 +773,7 @@ impl Lower<'_, Fixed> {
     }
     /// `Op::NoWrap` of interval `+`/`-` with result `r`, neither operand a
     /// literal point: overflow iff `(x^r)&(y^r)` (add) / `(x^y)&(x^r)` (sub)
-    /// is negative (`kernel::zi_*_wraps`).
+    /// is negative.
     fn zi_arith_no_wrap(&mut self, sub: bool, a: [Vreg; 2], b: [Vreg; 2], r: [Vreg; 2]) -> Vreg {
         let (bl, bh, imm) = if sub { (b[1], b[0], 0x18) } else { (b[0], b[1], 0x42) };
         let ol = self.ternlog(a[0], bl, r[0], imm);
@@ -805,7 +782,7 @@ impl Lower<'_, Fixed> {
         let zero = self.num_reg(NumVal::ConstI32(0));
         self.cmp(5, any, Src::Reg(zero)) // any >= 0  (NLT)
     }
-    /// The same for a POINT `+`/`-` (`kernel::zn_*_wraps`): one plane.
+    /// The same for a POINT `+`/`-`: one plane.
     fn zn_arith_no_wrap(&mut self, sub: bool, a: Vreg, b: Vreg, r: Vreg) -> Vreg {
         let o = self.ternlog(a, b, r, if sub { 0x18 } else { 0x42 });
         let zero = self.num_reg(NumVal::ConstI32(0));
@@ -941,24 +918,24 @@ impl Lower<'_, Fixed> {
                     .cell_off
                     .get(c)
                     .expect("input cell offset assigned before lowering");
-                match self.cell_reprs.get(c).copied().unwrap_or(CellRepr::Num) {
-                    CellRepr::Num => {
+                match self.g.cell_kind(*c) {
+                    Ty::Num => {
                         let dst =
                             self.pure(Key::Load(off), move |d| Inst::Load { dst: d, off });
                         Value::Num(NumVal::Reg(dst))
                     }
-                    CellRepr::Bool => {
+                    Ty::Bool => {
                         let dst =
                             self.pure(Key::LoadMask(off), move |d| Inst::LoadMask { dst: d, off });
                         Value::Bool([MaskVal::Reg(dst), MaskVal::Const(true)])
                     }
-                    CellRepr::UBool => {
+                    Ty::UBool => {
                         let known_off = off + 2;
                         let val = self.pure(Key::LoadMask(off), move |d| Inst::LoadMask { dst: d, off });
                         let known = self.pure(Key::LoadMask(known_off), move |d| Inst::LoadMask { dst: d, off: known_off });
                         Value::Bool([MaskVal::Reg(val), MaskVal::Reg(known)])
                     }
-                    CellRepr::Ival => {
+                    Ty::Ival => {
                         // Two ZN planes: lo at +0, hi at +64.
                         let hi_off = off + 64;
                         let lo_r = self.pure(Key::Load(off), move |d| Inst::Load { dst: d, off });
@@ -969,7 +946,7 @@ impl Lower<'_, Fixed> {
                 }
             }
             op @ (Op::Add | Op::Sub | Op::Min | Op::Max) => {
-                if self.dom(a[0]) == 2 || self.dom(a[1]) == 2 {
+                if self.wide(a[0]) || self.wide(a[1]) {
                     let (ia, ib) = (self.as_ival(a[0])?, self.as_ival(a[1])?);
                     let (ar, br) = (self.ival_regs(ia), self.ival_regs(ib));
                     let r = match op {
@@ -1004,9 +981,9 @@ impl Lower<'_, Fixed> {
             Op::Mul => {
                 // Interval * positive constant: scale each endpoint; an overflow wraps,
                 // the op's own error (`Op::NoWrap`).
-                if self.dom(a[0]) == 2 || self.dom(a[1]) == 2 {
-                    let (ivn, scn) = if self.dom(a[0]) == 2 { (a[0], a[1]) } else { (a[1], a[0]) };
-                    if self.dom(scn) == 2 {
+                if self.wide(a[0]) || self.wide(a[1]) {
+                    let (ivn, scn) = if self.wide(a[0]) { (a[0], a[1]) } else { (a[1], a[0]) };
+                    if self.wide(scn) {
                         bail!("node {}: Mul of two intervals is not modelled", id);
                     }
                     if self.pos_const_scalar(scn).is_none() {
@@ -1034,7 +1011,7 @@ impl Lower<'_, Fixed> {
             // arm, which reads `as_num`). The scalar `/` saturates where the interval
             // one has no answer: the op's own error, as `Mul`. A power-of-two divisor
             // is at least 1, so its `NoWrap` folds to true.
-            Op::Div if self.dom(a[0]) == 2 => {
+            Op::Div if self.wide(a[0]) => {
                 if self.pos_const_scalar(a[1]).is_none() {
                     bail!(
                         "node {}: interval Div by a non-positive / non-constant scalar \
@@ -1065,7 +1042,7 @@ impl Lower<'_, Fixed> {
                 Value::Ival([NumVal::Reg(ends[0]), NumVal::Reg(ends[1])])
             }
             Op::Neg => {
-                if self.dom(a[0]) == 2 {
+                if self.wide(a[0]) {
                     let iv = self.as_ival(a[0])?;
                     let ar = self.ival_regs(iv);
                     let r = self.zi_neg(ar);
@@ -1078,7 +1055,7 @@ impl Lower<'_, Fixed> {
                 }
             }
             Op::Abs => {
-                if self.dom(a[0]) == 2 {
+                if self.wide(a[0]) {
                     let iv = self.as_ival(a[0])?;
                     let ar = self.ival_regs(iv);
                     let r = self.zi_abs(ar);
@@ -1097,7 +1074,7 @@ impl Lower<'_, Fixed> {
                 Value::Num(NumVal::Reg(self.flr(lo)))
             }
             op @ (Op::Lt | Op::Le | Op::Gt | Op::Ge) => {
-                if self.dom(a[0]) == 2 || self.dom(a[1]) == 2 {
+                if self.wide(a[0]) || self.wide(a[1]) {
                     // Interval comparison -> tri-state ZB (zi_cmp).
                     let kind = match op {
                         Op::Lt => 0u8,
@@ -1125,8 +1102,8 @@ impl Lower<'_, Fixed> {
                 }
             }
             Op::Eq => {
-                match self.dom(a[0]) {
-                    _ if self.dom(a[0]) == 2 || self.dom(a[1]) == 2 => {
+                match self.g.ty(a[0]) {
+                    _ if self.wide(a[0]) || self.wide(a[1]) => {
                         // As `Graph::compare`: decided if disjoint or both points.
                         let (ia, ib) = (self.as_ival(a[0])?, self.as_ival(a[1])?);
                         let (ar, br) = (self.ival_regs(ia), self.ival_regs(ib));
@@ -1142,7 +1119,7 @@ impl Lower<'_, Fixed> {
                         let known = self.dbin(ROp::OrD, both, disjoint);
                         Value::Bool([MaskVal::Reg(val), MaskVal::Reg(known)])
                     }
-                    1 => {
+                    Ty::Bool | Ty::UBool => {
                         let (p, q) = (self.as_bool(a[0])?, self.as_bool(a[1])?);
                         // val = ~(pv ^ qv), known = pk & qk
                         let x = self.m_xor(p[0], q[0]);
@@ -1165,7 +1142,7 @@ impl Lower<'_, Fixed> {
                 let inner = a[0];
                 if let Op::Flr = self.g.get(inner).op {
                     let src = self.g.get(inner).args[0];
-                    if self.dom(src) == 2 {
+                    if self.wide(src) {
                         let iv = self.as_ival(src)?;
                         let ar = self.ival_regs(iv);
                         let val = self.zi_flr_ok(ar);
@@ -1176,41 +1153,34 @@ impl Lower<'_, Fixed> {
                         };
                     }
                 }
-                match self.dom(inner) {
-                    1 => {
+                match self.g.ty(inner) {
+                    Ty::Bool | Ty::UBool => {
                         let b = self.as_bool(inner)?;
                         Value::Bool([b[1], MaskVal::Const(true)])
                     }
-                    2 => {
+                    Ty::Ival => {
                         // A number is decided iff lo == hi.
                         let iv = self.as_ival(inner)?;
                         let ar = self.ival_regs(iv);
                         let val = self.mask_eq(ar[0], ar[1]);
                         Value::Bool([MaskVal::Reg(val), MaskVal::Const(true)])
                     }
-                    _ => Value::Bool([MaskVal::Const(true), MaskVal::Const(true)]),
+                    Ty::Num => Value::Bool([MaskVal::Const(true), MaskVal::Const(true)]),
                 }
             }
-            Op::Frag(c) => {
+            // The floor fork resolved: fragment `c`, whether the lane reaches it,
+            // an `Ints` fragment's low end as an EXACT number.
+            Op::Frag(Cut::Floors | Cut::Ints, c) | Op::FragOk(Cut::Floors, c) => {
                 let iv = self.as_ival(a[0])?;
                 let ar = self.ival_regs(iv);
-                let (frag, _) = self.zi_fork_flr(ar, *c);
-                Value::Ival([NumVal::Reg(frag[0]), NumVal::Reg(frag[1])])
+                let (frag, ok) = self.zi_fork_flr(ar, *c);
+                match node.op {
+                    Op::FragOk(..) => Value::Bool([MaskVal::Reg(ok), MaskVal::Const(true)]),
+                    Op::Frag(Cut::Ints, _) => Value::Num(NumVal::Reg(frag[0])),
+                    _ => Value::Ival([NumVal::Reg(frag[0]), NumVal::Reg(frag[1])]),
+                }
             }
-            Op::FragOk(c) => {
-                let iv = self.as_ival(a[0])?;
-                let ar = self.ival_regs(iv);
-                let (_, ok) = self.zi_fork_flr(ar, *c);
-                Value::Bool([MaskVal::Reg(ok), MaskVal::Const(true)])
-            }
-            // The low end of fragment `c` as an EXACT number.
-            Op::IntFrag(c) => {
-                let iv = self.as_ival(a[0])?;
-                let ar = self.ival_regs(iv);
-                let (frag, _) = self.zi_fork_flr(ar, *c);
-                Value::Num(NumVal::Reg(frag[0]))
-            }
-            Op::SplitOk(ways) => {
+            Op::ForkOk(Cut::Floors, ways) => {
                 let iv = self.as_ival(a[0])?;
                 let ar = self.ival_regs(iv);
                 let ok = self.zi_span_ok(ar, *ways);
@@ -1233,7 +1203,7 @@ impl Lower<'_, Fixed> {
                     (None, op @ (Op::Add | Op::Sub)) => {
                         let (p, q) = (xn.args[0], xn.args[1]);
                         let sub = matches!(op, Op::Sub);
-                        if self.dom(x) == 2 {
+                        if self.wide(x) {
                             let (ip, iq, ir) = (self.as_ival(p)?, self.as_ival(q)?, self.as_ival(x)?);
                             let (pr, qr, rr) = (self.ival_regs(ip), self.ival_regs(iq), self.ival_regs(ir));
                             MaskVal::Reg(self.zi_arith_no_wrap(sub, pr, qr, rr))
@@ -1258,7 +1228,7 @@ impl Lower<'_, Fixed> {
                 let xr = self.num_reg(x);
                 Value::Num(NumVal::Reg(self.div_pow2(xr, sh)))
             }
-            Op::Rem if self.dom(a[0]) != 2 && self.pow2_modulus_mask(a[1]).is_some() => {
+            Op::Rem if !self.wide(a[0]) && self.pow2_modulus_mask(a[1]).is_some() => {
                 let m = self.pow2_modulus_mask(a[1]).expect("guarded");
                 let x = self.as_num(a[0])?;
                 let xr = self.num_reg(x);
@@ -2228,18 +2198,18 @@ fn constant_key(mn: &str, ops: &str, a: &str) -> Option<String> {
 /// An arithmetic the kernels compile: its lowering of a graph to the shared
 /// instruction stream (`compile_with`).
 pub trait AsmArith: GraphArith {
-    fn compile_kernel(g: &Graph<Self>, roots: &[NodeId], sym: &str, cell_reprs: &HashMap<u32, CellRepr>, opts: super::AsmOptions) -> Result<Compiled>;
+    fn compile_kernel(g: &Graph<Self>, roots: &[NodeId], sym: &str, opts: super::AsmOptions) -> Result<Compiled>;
 }
 
 impl AsmArith for Fixed {
-    fn compile_kernel(g: &Graph<Fixed>, roots: &[NodeId], sym: &str, cell_reprs: &HashMap<u32, CellRepr>, opts: super::AsmOptions) -> Result<Compiled> {
-        compile_with(g, roots, sym, cell_reprs, opts, false, |lo, id| lo.lower_node(id))
+    fn compile_kernel(g: &Graph<Fixed>, roots: &[NodeId], sym: &str, opts: super::AsmOptions) -> Result<Compiled> {
+        compile_with(g, roots, sym, opts, false, |lo, id| lo.lower_node(id))
     }
 }
 
 impl AsmArith for Float {
-    fn compile_kernel(g: &Graph<Float>, roots: &[NodeId], sym: &str, cell_reprs: &HashMap<u32, CellRepr>, opts: super::AsmOptions) -> Result<Compiled> {
-        compile_with(g, roots, sym, cell_reprs, opts, true, |lo, id| lo.lower_node_f64(id))
+    fn compile_kernel(g: &Graph<Float>, roots: &[NodeId], sym: &str, opts: super::AsmOptions) -> Result<Compiled> {
+        compile_with(g, roots, sym, opts, true, |lo, id| lo.lower_node_f64(id))
     }
 }
 
@@ -2247,10 +2217,9 @@ pub fn compile<A: AsmArith>(
     g: &Graph<A>,
     roots: &[NodeId],
     sym: &str,
-    cell_reprs: &HashMap<u32, CellRepr>,
     opts: super::AsmOptions,
 ) -> Result<Compiled> {
-    A::compile_kernel(g, roots, sym, cell_reprs, opts)
+    A::compile_kernel(g, roots, sym, opts)
 }
 
 /// `compile` with the arithmetic's lowering (`lower`, one node) and lane
@@ -2259,7 +2228,6 @@ fn compile_with<A: GraphArith>(
     g: &Graph<A>,
     roots: &[NodeId],
     sym: &str,
-    cell_reprs: &HashMap<u32, CellRepr>,
     opts: super::AsmOptions,
     halves: bool,
     mut lower: impl FnMut(&mut Lower<'_, A>, NodeId) -> Result<()>,
@@ -2275,13 +2243,12 @@ fn compile_with<A: GraphArith>(
         .collect();
     cells.sort_unstable();
     cells.dedup();
-    let input_reprs: Vec<CellRepr> =
-        cells.iter().map(|c| cell_reprs.get(c).copied().unwrap_or(CellRepr::Num)).collect();
+    let input_reprs: Vec<Ty> = cells.iter().map(|c| g.cell_kind(*c)).collect();
     let mut input_offsets: Vec<u32> = Vec::with_capacity(cells.len());
     let mut off = 0u32;
     for r in &input_reprs {
         input_offsets.push(off);
-        off += r.size();
+        off += input_bytes(*r);
     }
     let input_bytes = off;
     let cell_off: HashMap<u32, u32> =
@@ -2294,7 +2261,6 @@ fn compile_with<A: GraphArith>(
         next_vreg: 0,
         input_cells: cells.clone(),
         cell_off,
-        cell_reprs,
         memo: HashMap::new(),
     };
     // A small batch keeps live temporaries well under the 26 homes.
@@ -2312,19 +2278,19 @@ fn compile_with<A: GraphArith>(
     let t_lower = t_lower.elapsed();
 
     // Roots -> a PACKED output buffer, booleans first (not a line each).
-    let kind_of = |v: &Option<Value>| -> Result<RootKind> {
+    let kind_of = |v: &Option<Value>| -> Result<Ty> {
         Ok(match v {
-            Some(Value::Num(_)) => RootKind::Num,
-            Some(Value::Ival(_)) => RootKind::Ival,
-            Some(Value::Bool(_)) => RootKind::Bool,
+            Some(Value::Num(_)) => Ty::Num,
+            Some(Value::Ival(_)) => Ty::Ival,
+            Some(Value::Bool(_)) => Ty::Bool,
             None => bail!("a root was never lowered"),
         })
     };
-    let kinds_first: Vec<RootKind> = roots.iter().map(|r| kind_of(&lo.vals[*r as usize])).collect::<Result<_>>()?;
+    let kinds_first: Vec<Ty> = roots.iter().map(|r| kind_of(&lo.vals[*r as usize])).collect::<Result<_>>()?;
     let mut root_offsets: Vec<u32> = vec![0; roots.len()];
     let mut next = 0u32;
     for (ri, k) in kinds_first.iter().enumerate() {
-        if *k == RootKind::Bool {
+        if *k == Ty::Bool {
             root_offsets[ri] = next;
             next += 4;
         }
@@ -2332,33 +2298,33 @@ fn compile_with<A: GraphArith>(
     next = next.div_ceil(64) * 64;
     for (ri, k) in kinds_first.iter().enumerate() {
         match k {
-            RootKind::Num => {
+            Ty::Num => {
                 root_offsets[ri] = next;
                 next += 64;
             }
-            RootKind::Ival => {
+            Ty::Ival => {
                 root_offsets[ri] = next;
                 next += 128;
             }
-            RootKind::Bool => {}
+            Ty::Bool | Ty::UBool => {}
         }
     }
     let out_bytes = next.max(64);
-    let mut root_kinds: Vec<RootKind> = Vec::with_capacity(roots.len());
+    let mut root_kinds: Vec<Ty> = Vec::with_capacity(roots.len());
     for (ri, r) in roots.iter().enumerate() {
         let base = root_offsets[ri];
         let kind = match lo.vals[*r as usize] {
             Some(Value::Num(n)) => {
                 let src = lo.num_src(n);
                 lo.insts.push(Inst::Store { off: base, src });
-                RootKind::Num
+                Ty::Num
             }
             Some(Value::Ival(iv)) => {
                 for (half, nv) in iv.iter().enumerate() {
                     let src = lo.num_src(*nv);
                     lo.insts.push(Inst::Store { off: base + half as u32 * 64, src });
                 }
-                RootKind::Ival
+                Ty::Ival
             }
             Some(Value::Bool(b)) => {
                 let val = lo.mask_reg(b[0]);
@@ -2370,7 +2336,7 @@ fn compile_with<A: GraphArith>(
                     lo.insts.push(Inst::StoreMask { off: base, src: val });
                     lo.insts.push(Inst::StoreMask { off: base + 2, src: known });
                 }
-                RootKind::Bool
+                Ty::Bool
             }
             None => bail!("root {} was never lowered", r),
         };

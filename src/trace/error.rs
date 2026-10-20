@@ -20,7 +20,7 @@
 //! error. A fork's VALIDITY owns nothing: a row that does not read a
 //! fragment's value is the right row for an unenumerated part too.
 
-use crate::transpile::graph::{NodeId, Op};
+use crate::transpile::graph::{Cut, NodeId, Op};
 
 use super::domain::Symbolic;
 use crate::transpile::garith::GraphArith;
@@ -168,14 +168,10 @@ fn own_error<A: GraphArith>(d: &mut Symbolic<A>, n: NodeId) -> Option<NodeId> {
     // make every floor of the player's position after a `move` a runtime check.
     let own = match op {
         Op::Flr if d.abstract_beneath_lane_ops(a?) && !within_one_integer(d, a?) => undecided(d, n),
-        Op::Split(k) | Op::SplitInt(k) if d.abstract_beneath_lane_ops(a?) => {
+        // A fork's coverage: the lane spans at most its arity's cells.
+        Op::Fork(cut, k) if d.abstract_beneath_lane_ops(a?) => {
             let ways = d.graph.fork_ways(k);
-            let covered = d.graph.fold(Op::SplitOk(ways), vec![a?]);
-            d.graph.fold(Op::Not, vec![covered])
-        }
-        Op::RSplit(k) if d.abstract_beneath_lane_ops(a?) => {
-            let ways = d.graph.fork_ways(k);
-            let covered = d.graph.fold(Op::RSplitOk(ways), vec![a?]);
+            let covered = d.graph.fold(Op::ForkOk(cut.grid(), ways), vec![a?]);
             d.graph.fold(Op::Not, vec![covered])
         }
         // Only where a LANE can hold `c` both ways (`Symbolic::lane_undecidable`):
@@ -212,7 +208,7 @@ fn own_error<A: GraphArith>(d: &mut Symbolic<A>, n: NodeId) -> Option<NodeId> {
 fn within_one_integer<A: GraphArith>(d: &Symbolic<A>, n: NodeId) -> bool {
     let node = d.graph.get(n);
     match node.op {
-        Op::Split(_) => true,
+        Op::Fork(Cut::Floors, _) => true,
         Op::Const(lo, hi) => A::num_eq(A::flr(A::from_lit(lo)), A::flr(A::from_lit(hi))),
         Op::Sel => within_one_integer(d, node.args[1]) && within_one_integer(d, node.args[2]),
         _ => !d.abstract_beneath_lane_ops(n),
@@ -232,7 +228,7 @@ mod tests {
 
     fn cell(d: &mut Symbolic, i: u32, interval: bool) -> NodeId {
         if interval {
-            d.ival_cells.insert(i);
+            d.graph.set_cell_kind(i, crate::transpile::graph::Ty::Ival);
             d.forget_intervals();
         }
         d.graph.leaf(Op::Cell(i))
@@ -325,9 +321,9 @@ mod tests {
         let mut d = Symbolic::default();
         d.graph.set_fork_ways(0, 2);
         let x = cell(&mut d, 0, true);
-        let v = d.graph.fold(Op::Split(0), vec![x]);
+        let v = d.graph.fold(Op::Fork(Cut::Floors, 0), vec![x]);
         let e = of(&mut d, &[v]);
-        let ok = d.graph.fold(Op::SplitOk(2), vec![x]);
+        let ok = d.graph.fold(Op::ForkOk(Cut::Floors, 2), vec![x]);
         assert_eq!(e, d.graph.fold(Op::Not, vec![ok]));
         // `both_values`' fork: of the literal [0, 1], two parts always cover.
         let b = d.both_values("test");
@@ -340,7 +336,7 @@ mod tests {
         let mut d = Symbolic::default();
         d.graph.set_fork_ways(0, 2);
         let x = cell(&mut d, 0, true);
-        let frag = d.graph.fold(Op::Split(0), vec![x]);
+        let frag = d.graph.fold(Op::Fork(Cut::Floors, 0), vec![x]);
         let f = d.graph.fold(Op::Flr, vec![frag]);
         // Only the fork's coverage: the floor itself owns nothing.
         assert_eq!(of(&mut d, &[f]), of(&mut d, &[frag]));
@@ -351,7 +347,7 @@ mod tests {
         let mut d = Symbolic::default();
         d.graph.set_fork_ways(0, 2);
         let rem = cell(&mut d, 0, true);
-        let frag = d.graph.fold(Op::Split(0), vec![rem]);
+        let frag = d.graph.fold(Op::Fork(Cut::Floors, 0), vec![rem]);
         let amount = d.graph.fold(Op::Flr, vec![frag]);
         let x = cell(&mut d, 1, false);
         let moved = d.graph.fold(Op::Add, vec![x, amount]);
@@ -484,7 +480,7 @@ mod tests {
         let mut d = Symbolic::default();
         d.graph.set_fork_ways(0, 2);
         let x = cell(&mut d, 0, true);
-        let valid = d.graph.fold(Op::SplitValid(0), vec![x]);
+        let valid = d.graph.fold(Op::ForkValid(Cut::Floors, 0), vec![x]);
         let e = of(&mut d, &[valid]);
         assert_eq!(d.graph.get(e).op, Op::ConstBool(false));
     }

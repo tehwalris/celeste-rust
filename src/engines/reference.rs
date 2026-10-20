@@ -661,7 +661,6 @@ fn check_agreement<A: crate::transpile::garith::GraphArith>(rt2: &Rt2<A::Num>, f
     use celeste_engine::exact::exact_rows;
     use celeste_engine::runtime2::Col;
     let cache = crate::compiled::collision_cache(room);
-    let ids = crate::compiled::ids();
     for lane in 0..rt2.width {
         let (reference, _) = from_block(rt2, lane, fn_info, base)?;
         let mut a: Rt2<A::Num> = to_block(&reference, room)?;
@@ -692,7 +691,7 @@ fn check_agreement<A: crate::transpile::garith::GraphArith>(rt2: &Rt2<A::Num>, f
         );
         a.canonical();
         b.canonical();
-        ensure!(exact_rows(&a, ids) == exact_rows(&b, ids), "lane {lane}: the reference's block and the tracer's key differently");
+        ensure!(exact_rows(&a) == exact_rows(&b), "lane {lane}: the reference's block and the tracer's key differently");
     }
     Ok(())
 }
@@ -754,7 +753,7 @@ mod tests {
     fn inputs_agreeing_on_the_buttons_read_make_the_same_successors() {
         let inputs = crate::concrete::read_inputs("tas/room_1_0_exit_frame_99.txt").expect("the exit's inputs");
         let mut eng = RefEngine::new(&Default::default()).expect("ref engine");
-        let exact = |bs: Vec<Rt2>| -> Vec<(celeste_engine::exact::ExactRow, u32)> { bs.iter().map(|b| (celeste_engine::exact::exact_rows(b, crate::compiled::ids()).swap_remove(0), crate::search::pos_graph::block_cells(&b).expect("cells")[0])).collect() };
+        let exact = |bs: Vec<Rt2>| -> Vec<(celeste_engine::exact::ExactRow, u32)> { bs.iter().map(|b| (celeste_engine::exact::exact_rows(b).swap_remove(0), crate::search::pos_graph::block_cells(&b).expect("cells")[0])).collect() };
         let mut row = eng.initial().expect("initial state");
         let (mut runs, mut checked) = (0, 0);
         for (f, &byte) in inputs.iter().enumerate() {
@@ -795,7 +794,7 @@ mod tests {
                     let mut w = b.clone_block();
                     crate::frame::widen_rt2_to(&mut w, level);
                     w.canonical();
-                    (celeste_engine::exact::exact_rows(&w, crate::compiled::ids()).swap_remove(0), crate::search::pos_graph::block_cells(&w).expect("cells")[0])
+                    (celeste_engine::exact::exact_rows(&w).swap_remove(0), crate::search::pos_graph::block_cells(&w).expect("cells")[0])
                 })
                 .collect()
         };

@@ -6,7 +6,8 @@
 use anyhow::{anyhow, bail, Result};
 
 use crate::transpile::graph::NodeId;
-use crate::transpile::kernel::ColTy;
+use crate::transpile::kernel::Roots;
+use crate::transpile::graph::Ty;
 
 use super::domain::{Domain, Symbolic};
 use crate::transpile::garith::GraphArith;
@@ -23,7 +24,7 @@ pub struct FrameOut<A: GraphArith = Fixed> {
     pub error: NodeId,
     /// Every scalar reachable from the globals, by path, with the KIND the
     /// tracer knows (not re-derivable: a `Cell` or `Sel` can be either).
-    pub fields: Vec<(Path, NodeId, ColTy)>,
+    pub fields: Vec<(Path, NodeId, Ty)>,
     /// Slots DEAD at the frame boundary: the six button cells and the shared
     /// output unknown. The tracer runs `__reset_button_states()` at the START
     /// (production at the end), so recording these dead makes the boundaries
@@ -49,15 +50,10 @@ pub struct FrameOut<A: GraphArith = Fixed> {
 }
 
 impl<A: GraphArith> FrameOut<A> {
-    /// What the outcome computes, in a kernel body's order: its stored
-    /// fields, guard and error, then (`with_arc`) its transfer roots.
-    pub fn roots(&self, with_arc: bool) -> Vec<NodeId> {
-        let mut r: Vec<NodeId> = self.fields.iter().map(|f| f.1).collect();
-        r.extend([self.guard, self.error]);
-        if with_arc {
-            r.extend(&self.arc);
-        }
-        r
+    /// What the outcome computes: its stored fields, guard (`live`), error
+    /// and transfer roots.
+    pub fn roots(&self) -> Roots {
+        Roots { fields: self.fields.iter().map(|f| f.1).collect(), live: self.guard, error: self.error, arc: self.arc.clone() }
     }
 }
 
@@ -107,7 +103,7 @@ pub struct Frame<A: GraphArith = Fixed> {
 fn out_fields<A: GraphArith>(
     st: &State<Symbolic<A>>,
     d: &Symbolic<A>,
-) -> Result<(Vec<(Path, NodeId, ColTy)>, Vec<Path>)> {
+) -> Result<(Vec<(Path, NodeId, Ty)>, Vec<Path>)> {
     let mut out = Vec::new();
     let mut ubool = Vec::new();
     // A near level's floor `state`s are an interval column in every outcome.
@@ -129,10 +125,10 @@ fn out_fields<A: GraphArith>(
         // a number would be an unchecked narrowing.
         let (n, ty) = match iface::get(st, &p).unwrap() {
             Value::Num(n) => {
-                let ty = if d.is_interval(&n) || ival_always.contains(&p) { ColTy::Ival } else { ColTy::Num };
+                let ty = if d.is_interval(&n) || ival_always.contains(&p) { Ty::Ival } else { Ty::Num };
                 (n, ty)
             }
-            Value::Bool(n) => (n, ColTy::Bool),
+            Value::Bool(n) => (n, Ty::Bool),
             _ => unreachable!("scalars only yields scalars"),
         };
         out.push((p, n, ty));
@@ -297,7 +293,7 @@ fn trace<'a, A: GraphArith>(it: &mut Interp<'a, Symbolic<A>>, chunks: &'a super:
     // an outcome computes: its stored fields, guard and transfer roots (the
     // remainder before the widening stores no field, and an overflow there
     // would be a wrong transfer).
-    let roots: Vec<Vec<NodeId>> = outs.iter().map(|o| o.roots(true)).collect();
+    let roots: Vec<Vec<NodeId>> = outs.iter().map(|o| o.roots().flat()).collect();
     let derived = super::error::for_outcomes(&mut it.d, &roots);
     // A PIN DISCONNECTS its input: nothing the outcomes compute - values,
     // guards, transfers, derived errors - may read a pinned input; only the
@@ -350,6 +346,9 @@ fn finish_outcome<A: GraphArith>(
     cache: &std::sync::Arc<celeste_core::collision_cache::CollisionCache>,
 ) -> Result<FrameOut<A>> {
     s.gc();
+    // Integer keys as a block holds them: a state traced from the outcome's
+    // block names its slots alike.
+    super::block::dense_ints(&mut s)?;
     // Absent-as-zero fields: shape, not precision, so every level.
     super::widen::materialize_absent_fields(&mut s, &mut it.d)?;
     // The transfer roots: the remainder read BEFORE the widenings.
@@ -463,7 +462,7 @@ mod tests {
         for (d, b) in buttons.iter().zip(bits) {
             cfg[*d as usize] = *b as u8;
         }
-        let roots: Vec<NodeId> = f.outs.iter().flat_map(|o| o.roots(false)).collect();
+        let roots: Vec<NodeId> = f.outs.iter().flat_map(|o| o.fields.iter().map(|x| x.1).chain([o.guard, o.error])).collect();
         let need = g.reachable(&roots);
         let mut out = g.like();
         let map = g.specialize_subset_into(&cfg, Some(&need), &mut out);
@@ -686,11 +685,11 @@ end
     /// trace once, evaluate at each concrete limit against the hand answer.
     #[test]
     fn break_leaves_a_loop_whose_bound_is_symbolic() {
-        // `unroll_bound` keys on SOURCE TEXT: the cart's `abs(amount)`.
+        // The loop's unroll bound is its annotation, as in the cart.
         let src = "
 function f(amount)
   local n = 0
-  for i=0,abs(amount) do
+  for i=0,abs(amount) do --@unroll 8
     if i >= 2 then break end
     n = n + 1
   end

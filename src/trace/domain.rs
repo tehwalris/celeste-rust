@@ -9,7 +9,7 @@ use anyhow::{bail, Result};
 
 use celeste_core::arith::{Arithmetic, Fixed};
 use crate::transpile::garith::GraphArith;
-use crate::transpile::graph::{Graph, NodeId, Op};
+use crate::transpile::graph::{Cut, Graph, NodeId, Op, Ty, Unknown};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Arith {
@@ -101,55 +101,18 @@ impl Cmp {
     }
 }
 
-/// Which op family carries a fork (the memo's second key): `Floors` and
-/// `Ints` over one value resolve differently and may not share a choice.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-pub enum ForkKind {
-    Floors,
-    Ints,
-    Rounds,
-}
-
 /// The origin of the forks `Domain::unknown_bool` mints: the six buttons, in
 /// `__reset_button_states`' order.
 pub const UNKNOWN_BOOL_ORIGIN: &str = "__new_unknown_boolean";
 
-/// HOW a fork partitions its value's set into configurations.
-pub enum Partition {
-    /// Cut an interval at the fork grid's cell edges (`Split` -> `Frag`), so
-    /// `flr` of each is one number.
-    Floors { ways: u8 },
-    /// Cut an interval of whole numbers into the numbers, each EXACT
-    /// (`SplitInt` -> `IntFrag`). `memo` false keeps two forks of one node
-    /// independent (`p_jump`/`p_dash` both fork `[0, 1<<16]`).
-    Ints { ways: u8, memo: bool },
-    /// Cut an interval where `flr(x + 1/2)` changes, at the arithmetic's
-    /// exact cut points (`RSplit` -> `RFrag`): a double's round fork
-    /// (`Domain::fork_round`).
-    Rounds { ways: u8 },
-}
-
-impl Partition {
-    fn kind(&self) -> ForkKind {
-        match self {
-            Partition::Floors { .. } => ForkKind::Floors,
-            Partition::Ints { .. } => ForkKind::Ints,
-            Partition::Rounds { .. } => ForkKind::Rounds,
-        }
-    }
-
-    fn ways(&self) -> u8 {
-        match self {
-            Partition::Floors { ways } | Partition::Ints { ways, .. } | Partition::Rounds { ways } => *ways,
-        }
-    }
-
-    fn memoized(&self) -> bool {
-        match self {
-            Partition::Floors { .. } | Partition::Rounds { .. } => true,
-            Partition::Ints { memo, .. } => *memo,
-        }
-    }
+/// HOW a fork partitions its value's set into configurations: cut as `cut`
+/// says (`Op::Fork` -> `Op::Frag`), into `ways` fragments. `memo` false keeps
+/// two forks of one node independent (`p_jump`/`p_dash` both fork `[0,
+/// 1<<16]` into its whole numbers).
+pub struct Partition {
+    pub cut: Cut,
+    pub ways: u8,
+    pub memo: bool,
 }
 
 /// What a fork hands back: this configuration's fragment, which lanes fall in
@@ -194,11 +157,11 @@ pub trait Domain: Clone + Default {
     fn sel_num(&mut self, c: &Self::Bool, t: &Self::Num, f: &Self::Num) -> Self::Num;
     fn sel_bool(&mut self, c: &Self::Bool, t: &Self::Bool, f: &Self::Bool) -> Self::Bool;
 
-    /// `mget(x, y)` with coordinates unknown at trace time (`zn_mget`).
+    /// `mget(x, y)` with coordinates unknown at trace time (a call-out).
     fn mget(&mut self, x: &Self::Num, y: &Self::Num) -> Result<Self::Num>;
 
     /// `tile_flag_at(x, y, w, h, flag)` with coordinates unknown at trace
-    /// time: a primitive (`zn_tile_flag_at`), since the Lua's scan bounds
+    /// time: a primitive (a call-out), since the Lua's scan bounds
     /// derive from x and y. The caller folds the known case.
     fn tile_flag_at(
         &mut self,
@@ -238,23 +201,17 @@ pub trait Domain: Clone + Default {
         false
     }
 
-    /// Fork at `flr` (`__split_by_flr`): `flr` of an interval is not a
+    /// Fork an interval at `cut`'s grid: `__split_by_flr` (`Cut::Floors`), or
+    /// `__split_by_round` (`Cut::Rounds`) where its fragments are NOT the floor
+    /// fork's of `x + 1/2` shifted back (doubles: `x + 1/2 - 1/2` rounds;
+    /// 16.16 shifts instead, in `Interp`). `flr` of an interval is not a
     /// function, so the fragment is a choice of arity `ways`. Returns the
-    /// restricted value and which lanes fall in it; the identity on exact values.
-    fn fork_flr(&mut self, v: &Self::Num, _ways: u8) -> (Self::Num, Self::Bool) {
-        (v.clone(), self.boolean(true))
-    }
+    /// restricted value and which lanes fall in it.
+    fn split(&mut self, cut: Cut, v: &Self::Num, ways: u8) -> Result<(Self::Num, Self::Bool)>;
 
-    /// Fork at `flr(x + 1/2)` (`__split_by_round`) where the fragments are NOT
-    /// the floor fork's of `x + 1/2` shifted back (doubles: `x + 1/2 - 1/2`
-    /// rounds; 16.16 shifts instead, in `Interp`): `fork_flr`'s twin, at the
-    /// exact cut points. Called on intervals only.
-    fn fork_round(&mut self, v: &Self::Num, _ways: u8) -> Result<(Self::Num, Self::Bool)> {
-        bail!("__split_by_round of {v:?}: this domain has no exact round fork")
-    }
-
-    /// The arity of `fork_round` on `v` (`flr_ways`' twin).
-    fn round_ways(&mut self, _v: &Self::Num) -> u8 {
+    /// The arity of `split` on `v`: `MOVE_WAYS`, or with a known static range
+    /// the most grid cells one piece crosses (`ForkOk` checks).
+    fn split_ways(&mut self, _cut: Cut, _v: &Self::Num) -> u8 {
         MOVE_WAYS
     }
 
@@ -262,11 +219,6 @@ pub trait Domain: Clone + Default {
     /// where `at` holds; its error holds only there.
     fn evaluated_at(&mut self, _n: &Self::Num, _at: &Self::Bool) {}
 
-    /// The arity of `__split_by_flr` on `v`: `MOVE_WAYS`, or with a known
-    /// static range the most grid cells one piece crosses (`SplitOk` checks).
-    fn flr_ways(&mut self, _v: &Self::Num) -> u8 {
-        MOVE_WAYS
-    }
 
     /// The join of a merge on a condition NO LANE can decide, with arms every
     /// lane holds alike: the hull of two literals, or the unknown number.
@@ -294,10 +246,6 @@ pub trait Domain: Clone + Default {
         false
     }
 
-    /// The next comparisons read a COUNTDOWN (the interpreter's hint,
-    /// `widen::countdown_fields`): an unknown number there mints a countdown
-    /// atom also with the fly fruit unknown, where it may be the fruit's.
-    fn set_countdown_hint(&mut self, _on: bool) {}
 
     /// `__split_by_flr` of a literal interval: its integer fragments, run as
     /// separate trace states and rejoined when the call returns; with
@@ -325,15 +273,6 @@ pub trait Domain: Clone + Default {
         None
     }
 
-}
-
-/// The tag of a countdown's atom id (`Symbolic::countdown_atom`).
-const COUNTDOWN_ATOM: u32 = 1 << 31;
-
-/// Is atom id `k` a countdown's (three-valued)? `u32::MAX` is the shared
-/// output unknown (`Symbolic::unknown_bool_output`), not an atom.
-fn is_countdown_atom(k: u32) -> bool {
-    k != u32::MAX && k & COUNTDOWN_ATOM != 0
 }
 
 /// How many atoms an escaping value may read before its fork is left
@@ -394,14 +333,13 @@ pub struct Symbolic<A: GraphArith = Fixed> {
     pub build_trace: bool,
     /// FORK choices handed out this frame (the fork ids), buttons included.
     pub forks: u8,
-    /// `flr_ways` takes a static range's full width (level -1, whose speed
+    /// `split_ways` takes a static range's full width (level -1, whose speed
     /// is a range at every node).
     pub uncapped_ways: bool,
     /// The level traced (`widening::TABLE`'s entries it applies, in and out).
     pub level: celeste_engine::widening::Level,
     /// How many `Op::UnknownBool` atoms this frame handed out.
     pub unknown_atoms: u32,
-    countdown_hint: bool,
     /// `escaped_atom`'s memo, cleared with `unknown_atoms` (ids restart).
     pub escaped: rustc_hash::FxHashMap<NodeId, NodeId>,
     /// What each `both_values` fork was made for (`--build-trace`).
@@ -431,13 +369,9 @@ pub struct Symbolic<A: GraphArith = Fixed> {
     /// Fork choices handed out THIS FRAME by `(value, kind)`: a second fork
     /// of one value reuses the first's choice instead of an empty dimension.
     /// Cleared with `forks`.
-    fork_memo: std::collections::HashMap<(NodeId, ForkKind), (u8, (NodeId, NodeId))>,
-    /// Input cells holding an INTERVAL (`rem.x`/`rem.y`); a value is an
-    /// interval exactly when computed from one.
-    pub ival_cells: std::collections::BTreeSet<u32>,
-    /// `is_interval`'s memo. This and the three below depend on `ival_cells`
-    /// (dropped by `forget_intervals`).
-    ival_memo: std::cell::RefCell<rustc_hash::FxHashMap<NodeId, bool>>,
+    fork_memo: std::collections::HashMap<(NodeId, Cut), (u8, (NodeId, NodeId))>,
+    /// These three depend on the input cells' types (the graph's
+    /// `cell_kind`; dropped by `forget_intervals`).
     undecidable_memo: std::cell::RefCell<rustc_hash::FxHashMap<NodeId, bool>>,
     beneath_memo: std::cell::RefCell<rustc_hash::FxHashMap<NodeId, bool>>,
     /// `may_answers`'s memo: `(may_true, may_false)`.
@@ -464,9 +398,8 @@ impl<A: GraphArith> Symbolic<A> {
         self.range_memo.clear();
     }
 
-    /// `ival_cells` changed: `is_interval`'s memo no longer holds.
+    /// The input cells' types changed: the memos reading them no longer hold.
     pub fn forget_intervals(&mut self) {
-        self.ival_memo.get_mut().clear();
         self.undecidable_memo.get_mut().clear();
         self.beneath_memo.get_mut().clear();
         self.may_memo.get_mut().clear();
@@ -496,8 +429,7 @@ impl<A: GraphArith> Symbolic<A> {
                 Op::Flr => false,
                 Op::Known => false,
                 // Validity/coverage masks: per-lane comparisons.
-                Op::SplitValid(_) | Op::SplitOk(_) | Op::FragOk(_) | Op::NoWrap => false,
-                Op::RSplitValid(_) | Op::RSplitOk(_) | Op::RFragOk(_) => false,
+                Op::ForkValid(..) | Op::ForkOk(..) | Op::FragOk(..) | Op::NoWrap => false,
                 // A pin's check on the raw input.
                 Op::Same => false,
                 Op::ConstBool(_) => false,
@@ -522,12 +454,13 @@ impl<A: GraphArith> Symbolic<A> {
             let r = match node.op {
                 // A lane decides these whatever their operands.
                 Op::Flr | Op::TileFlagAt | Op::Mget => false,
-                Op::Cell(c) => d.ival_cells.contains(&c),
+                Op::Cell(_) => d.graph.ty(n) == Ty::Ival,
                 Op::Const(lo, hi) => lo != hi,
                 Op::Span => true,
-                Op::UnknownNum | Op::UnknownBool(_) => true,
-                Op::Split(_) | Op::Frag(_) | Op::RSplit(_) | Op::RFrag(_) => true,
-                Op::SplitInt(_) | Op::IntFrag(_) | Op::Lo | Op::Hi => false,
+                Op::UnknownNum { .. } | Op::UnknownBool(_) => true,
+                // An `Ints` fragment is one exact number.
+                Op::Fork(Cut::Ints, _) | Op::Frag(Cut::Ints, _) | Op::Lo | Op::Hi => false,
+                Op::Fork(..) | Op::Frag(..) => true,
                 Op::ConstBool(_) | Op::Known | Op::NoWrap => false,
                 // THE CONDITION DOES NOT MAKE THE RESULT A SET: `Sel(c, 5, 7)`
                 // is one of two numbers, chosen by forking `c` (the opposite of
@@ -578,12 +511,18 @@ impl<A: GraphArith> Symbolic<A> {
         }
     }
 
-    pub fn unknown_num(&mut self) -> NodeId {
-        self.graph.leaf(Op::UnknownNum)
+    /// THE unknown number (`countdown`: a countdown's, `Op::UnknownNum`).
+    pub fn unknown_num(&mut self, countdown: bool) -> NodeId {
+        self.graph.leaf(Op::UnknownNum { countdown })
     }
 
     fn is_unknown_num(&self, n: NodeId) -> bool {
-        matches!(self.graph.get(n).op, Op::UnknownNum)
+        matches!(self.graph.get(n).op, Op::UnknownNum { .. })
+    }
+
+    /// Is any of `ns` a countdown's unknown number?
+    fn countdown_unknown(&self, ns: &[NodeId]) -> bool {
+        ns.iter().any(|n| matches!(self.graph.get(*n).op, Op::UnknownNum { countdown: true }))
     }
 
     /// `n` as `Sel(c, t, f)` with an arm the unknown number (a countdown reset
@@ -594,7 +533,7 @@ impl<A: GraphArith> Symbolic<A> {
         fn holds<A: GraphArith>(g: &Graph<A>, n: NodeId) -> bool {
             let node = g.get(n);
             match node.op {
-                Op::UnknownNum => true,
+                Op::UnknownNum { .. } => true,
                 Op::Sel => holds(g, node.args[1]) || holds(g, node.args[2]),
                 _ => false,
             }
@@ -685,7 +624,7 @@ impl<A: GraphArith> Symbolic<A> {
 
     /// Does any of `ns` read an unknown number or boolean atom?
     fn reads_unknown(&self, ns: &[NodeId]) -> bool {
-        self.graph.cone(ns).into_iter().any(|n| matches!(self.graph.get(n).op, Op::UnknownNum | Op::UnknownBool(_)))
+        self.graph.cone(ns).into_iter().any(|n| matches!(self.graph.get(n).op, Op::UnknownNum { .. } | Op::UnknownBool(_)))
     }
 
     /// `a - r` where `a` is `r + c`: `c` EXACTLY, also under a select's arms
@@ -762,7 +701,7 @@ impl<A: GraphArith> Symbolic<A> {
                 let v = A::from_lit(lo);
                 A::num_eq(A::flr(v), v)
             }
-            Op::Flr | Op::IntFrag(_) => true,
+            Op::Flr | Op::Frag(Cut::Ints, _) => true,
             Op::Restrict(..) if self.integral_inputs.contains(&n) => true,
             Op::Add | Op::Sub | Op::Neg | Op::Abs | Op::Min | Op::Max => all(&node.args),
             Op::Sel => all(&node.args[1..]),
@@ -790,11 +729,11 @@ impl<A: GraphArith> Symbolic<A> {
 
     /// A boolean every lane holds in BOTH values (buttons, held trails,
     /// escaped atoms): an unmemoized `Ints` fork of `[0, 1]` with no validity,
-    /// so `SplitOk(2)` folds true and the fragments to `0` and `1`.
+    /// so `ForkOk(2)` folds true and the fragments to `0` and `1`.
     pub fn both_values(&mut self, origin: &str) -> NodeId {
         let (zero, one) = (A::lit(A::from_i16(0)), A::lit(A::from_i16(1)));
         let choices = self.graph.leaf(Op::Const(zero, one));
-        let f = self.fork(&choices, Partition::Ints { ways: 2, memo: false }, origin);
+        let f = self.fork(&choices, Partition { cut: Cut::Ints, ways: 2, memo: false }, origin);
         let zero = self.graph.leaf(Op::Const(zero, zero));
         self.graph.fold(Op::Gt, vec![f.value, zero])
     }
@@ -806,35 +745,23 @@ impl<A: GraphArith> Symbolic<A> {
     /// THE fork: partition `v`'s set, mint a choice dimension, and hand back
     /// this configuration's piece and its lanes. Every fork comes through here.
     fn fork(&mut self, v: &NodeId, p: Partition, origin: &str) -> Fork {
-        let kind = p.kind();
         // Already forked this value this frame (hash-consed)? Reuse the choice.
-        if p.memoized() {
-            if let Some(hit) = self.fork_memo.get(&(*v, kind)) {
+        if p.memo {
+            if let Some(hit) = self.fork_memo.get(&(*v, p.cut)) {
                 let (d, out) = *hit;
-                // RAISED, not set: each site's `SplitOk` bounds its own lanes.
-                self.graph.set_fork_ways(d, p.ways());
+                // RAISED, not set: each site's `ForkOk` bounds its own lanes.
+                self.graph.set_fork_ways(d, p.ways);
                 return Fork { value: out.0, valid: out.1, id: d };
             }
         }
         let d = self.forks;
         self.forks += 1;
         self.fork_origins.push((d, origin.to_string()));
-        let (value, valid) = match &p {
-            Partition::Floors { ways } => {
-                self.graph.set_fork_ways(d, *ways);
-                (self.graph.fold(Op::Split(d), vec![*v]), self.graph.fold(Op::SplitValid(d), vec![*v]))
-            }
-            Partition::Ints { ways, .. } => {
-                self.graph.set_fork_ways(d, *ways);
-                (self.graph.fold(Op::SplitInt(d), vec![*v]), self.graph.fold(Op::SplitValid(d), vec![*v]))
-            }
-            Partition::Rounds { ways } => {
-                self.graph.set_fork_ways(d, *ways);
-                (self.graph.fold(Op::RSplit(d), vec![*v]), self.graph.fold(Op::RSplitValid(d), vec![*v]))
-            }
-        };
-        if p.memoized() {
-            self.fork_memo.insert((*v, kind), (d, (value, valid)));
+        self.graph.set_fork_ways(d, p.ways);
+        let value = self.graph.fold(Op::Fork(p.cut, d), vec![*v]);
+        let valid = self.graph.fold(Op::ForkValid(p.cut.grid(), d), vec![*v]);
+        if p.memo {
+            self.fork_memo.insert((*v, p.cut), (d, (value, valid)));
         }
         Fork { value, valid, id: d }
     }
@@ -843,12 +770,12 @@ impl<A: GraphArith> Symbolic<A> {
     /// stored as `AV::UBool`. Nothing in the frame reads an output, so sharing
     /// correlates nothing; inputs and comparisons take fresh atoms.
     pub fn unknown_bool_output(&mut self) -> NodeId {
-        self.graph.leaf(Op::UnknownBool(u32::MAX))
+        self.graph.leaf(Op::UnknownBool(Unknown::Output))
     }
 
     /// Is `b` the shared output unknown (`unknown_bool_output`)?
     pub fn is_unknown_output(&self, b: NodeId) -> bool {
-        matches!(self.graph.get(b).op, Op::UnknownBool(u32::MAX))
+        matches!(self.graph.get(b).op, Op::UnknownBool(Unknown::Output))
     }
 
     /// `root` with `subst`'s nodes replaced and everything above re-folded.
@@ -878,8 +805,7 @@ impl<A: GraphArith> Symbolic<A> {
     pub fn unknown_bool_atom(&mut self) -> NodeId {
         let k = self.unknown_atoms;
         self.unknown_atoms += 1;
-        assert!(k < COUNTDOWN_ATOM, "atom ids ran into the countdown tag");
-        self.graph.leaf(Op::UnknownBool(k))
+        self.graph.leaf(Op::UnknownBool(Unknown::Atom(k)))
     }
 
     /// A COUNTDOWN's atom: a comparison of the unknown number where it is a
@@ -891,13 +817,12 @@ impl<A: GraphArith> Symbolic<A> {
     fn countdown_atom(&mut self) -> NodeId {
         let k = self.unknown_atoms;
         self.unknown_atoms += 1;
-        assert!(k < COUNTDOWN_ATOM - 1, "atom ids overflow into the countdown tag");
-        self.graph.leaf(Op::UnknownBool(COUNTDOWN_ATOM | k))
+        self.graph.leaf(Op::UnknownBool(Unknown::Countdown(k)))
     }
 
     /// Does no lane's data reach `n` - no input cell or fork?
     pub fn lane_independent(&mut self, n: NodeId) -> bool {
-        let dependent = |op: &Op<A>| matches!(op, Op::Cell(_) | Op::Split(_) | Op::SplitValid(_) | Op::SplitInt(_) | Op::RSplit(_) | Op::RSplitValid(_)).then_some(true);
+        let dependent = |op: &Op<A>| matches!(op, Op::Cell(_) | Op::Fork(..) | Op::ForkValid(..)).then_some(true);
         !cone_any(&self.graph, &mut self.lane_memo, n, dependent)
     }
 
@@ -936,21 +861,22 @@ impl<A: GraphArith> Symbolic<A> {
 
     /// The steps every operation on `args` takes first, in order: constants
     /// fold, so what the heap depends on stays concrete; the unknown number
-    /// makes `unknown`; an operand selecting the unknown number on some lanes
-    /// distributes the operation over its arms (`unknown_select`). `None` where
-    /// none applies.
+    /// makes `unknown` (told whether an operand is a countdown's); an operand
+    /// selecting the unknown number on some lanes distributes the operation
+    /// over its arms (`unknown_select`). `None` where none applies.
     fn prologue(
         &mut self,
         args: &[NodeId],
         point: impl FnOnce(&mut Self, &[A::Num]) -> Result<NodeId>,
-        unknown: impl FnOnce(&mut Self) -> NodeId,
+        unknown: impl FnOnce(&mut Self, bool) -> NodeId,
         again: impl Fn(&mut Self, &[NodeId]) -> Result<NodeId>,
     ) -> Result<Option<NodeId>> {
         if let Some(xs) = args.iter().map(|a| self.as_point(*a)).collect::<Option<Vec<_>>>() {
             return point(self, &xs).map(Some);
         }
         if args.iter().any(|a| self.is_unknown_num(*a)) {
-            return Ok(Some(unknown(self)));
+            let countdown = self.countdown_unknown(args);
+            return Ok(Some(unknown(self, countdown)));
         }
         for (k, a) in args.iter().enumerate() {
             if let Some((c, t, f)) = self.unknown_select(*a) {
@@ -1009,9 +935,9 @@ impl<A: GraphArith> Domain for Symbolic<A> {
     }
     fn fun1(&mut self, f: Fun1, a: &NodeId) -> Result<NodeId> {
         // `sin` of anything is in [-1, 1]; other builtins of unknown: unknown.
-        let unknown = |d: &mut Self| match f {
+        let unknown = |d: &mut Self, countdown: bool| match f {
             Fun1::Sin => d.graph.leaf(Op::Const(A::lit(A::from_i16(-1)), A::lit(A::from_i16(1)))),
-            _ => d.unknown_num(),
+            _ => d.unknown_num(countdown),
         };
         if let Some(n) = self.prologue(&[*a], |d, x| Ok(d.konst(fold_fun1::<A>(f, x[0])?)), unknown, |d, x| d.fun1(f, &x[0]))? {
             return Ok(n);
@@ -1037,8 +963,9 @@ impl<A: GraphArith> Domain for Symbolic<A> {
         Ok(self.graph.fold(f.into(), vec![*a, *b]))
     }
     fn compare(&mut self, op: Cmp, a: &NodeId, b: &NodeId) -> Result<NodeId> {
-        // With an unknown number nothing is decided.
-        let unknown = |d: &mut Self| if d.countdown_hint || !d.level.fruit { d.countdown_atom() } else { d.unknown_bool_atom() };
+        // With an unknown number nothing is decided: a countdown's atom where
+        // the number is a countdown's, or nothing else is unknown.
+        let unknown = |d: &mut Self, countdown: bool| if countdown || !d.level.fruit { d.countdown_atom() } else { d.unknown_bool_atom() };
         let point = |d: &mut Self, x: &[A::Num]| Ok(d.graph.leaf(Op::ConstBool(fold_compare::<A>(op, x[0], x[1]))));
         if let Some(n) = self.prologue(&[*a, *b], point, unknown, |d, x| d.compare(op, &x[0], &x[1]))? {
             return Ok(n);
@@ -1104,84 +1031,41 @@ impl<A: GraphArith> Domain for Symbolic<A> {
     fn node_count(&self) -> usize {
         self.graph.len()
     }
-    /// Is this value an interval? A type rule, the same as `lower`'s
-    /// `Repr::wide` (a select is one when an ARM is; `flr` and cart lookups
-    /// never are), or lowering fails.
+    /// Is this value an interval? Its lane type (`Graph::ty`).
     fn is_interval(&self, v: &NodeId) -> bool {
-        fn go<A: GraphArith>(g: &Graph<A>, ival: &std::collections::BTreeSet<u32>, memo: &mut rustc_hash::FxHashMap<NodeId, bool>, n: NodeId) -> bool {
-            if let Some(b) = memo.get(&n) {
-                return *b;
+        self.graph.ty(*v) == Ty::Ival
+    }
+
+
+    /// A literal interval is refused at the rounds: every lane would take
+    /// each fragment (the interpreter splits a literal first:
+    /// `literal_fragments`).
+    fn split(&mut self, cut: Cut, v: &NodeId, ways: u8) -> Result<(NodeId, NodeId)> {
+        let origin = match cut {
+            Cut::Floors => "a floor fork (`move`)",
+            Cut::Rounds => {
+                if let Op::Const(lo, hi) = self.graph.get(*v).op {
+                    bail!("__split_by_round of the literal [{}, {}] as a per-lane fork", A::show(A::from_lit(lo)), A::show(A::from_lit(hi)));
+                }
+                "a round fork (`move`)"
             }
-            let node = g.get(n);
-            let a = &node.args;
-            let any = |memo: &mut rustc_hash::FxHashMap<NodeId, bool>, xs: &[NodeId]| {
-                xs.iter().any(|x| go(g, ival, memo, *x))
-            };
-            let r = match node.op {
-                Op::Cell(c) => ival.contains(&c),
-                Op::Const(lo, hi) => lo != hi,
-                Op::Split(_) | Op::RSplit(_) => true,
-                // An exact whole number per configuration.
-                Op::SplitInt(_) | Op::Lo | Op::Hi => false,
-                // A span's bounds differ (`fold` collapses a literal span).
-                Op::Span => true,
-                Op::Add | Op::Sub | Op::Mul | Op::Div | Op::Rem | Op::Neg | Op::Abs
-                | Op::Min | Op::Max | Op::Restrict(..) => any(memo, a),
-                // The CONDITION does not make the result an interval.
-                Op::Sel => any(memo, &a[1..]),
-                // Exact where the lane survives (else its own error).
-                Op::Flr => false,
-                // `fun1` replaces `sin` of an interval with its range.
-                Op::Sin => any(memo, a),
-                _ => false,
-            };
-            memo.insert(n, r);
-            r
-        }
-        // No early-out on empty `ival_cells`: widenings write literal intervals.
-        go(&self.graph, &self.ival_cells, &mut self.ival_memo.borrow_mut(), *v)
-    }
-
-    fn fork_flr(&mut self, v: &NodeId, ways: u8) -> (NodeId, NodeId) {
-        let f = self.fork(v, Partition::Floors { ways }, "a floor fork (`move`)");
-        (f.value, f.valid)
-    }
-
-    /// A literal interval is refused: every lane would take each fragment
-    /// (the interpreter splits a literal first: `literal_fragments`).
-    fn fork_round(&mut self, v: &NodeId, ways: u8) -> Result<(NodeId, NodeId)> {
-        if let Op::Const(lo, hi) = self.graph.get(*v).op {
-            bail!("__split_by_round of the literal [{}, {}] as a per-lane fork", A::show(A::from_lit(lo)), A::show(A::from_lit(hi)));
-        }
-        let f = self.fork(v, Partition::Rounds { ways }, "a round fork (`move`)");
+            Cut::Ints => bail!("a split cuts at the floors or the rounds, not the whole numbers"),
+        };
+        let f = self.fork(v, Partition { cut, ways, memo: true }, origin);
         Ok((f.value, f.valid))
     }
 
-    /// `flr_ways`, counting the values of `flr(x + 1/2)`.
-    fn round_ways(&mut self, v: &NodeId) -> u8 {
-        if !self.has_ranges() {
-            return MOVE_WAYS;
-        }
-        match self.range_of(*v) {
-            Some(ps) => {
-                let w = A::rounds_spanned(&ps, self.uncapped_ways);
-                (if self.uncapped_ways { w } else { w.min(MOVE_WAYS as i64) }) as u8
-            }
-            None => MOVE_WAYS,
-        }
-    }
-
-    fn flr_ways(&mut self, v: &NodeId) -> u8 {
+    fn split_ways(&mut self, cut: Cut, v: &NodeId) -> u8 {
         // Only restrictions know a static range.
         if !self.has_ranges() {
             return MOVE_WAYS;
         }
         // At most `MOVE_WAYS`: the static range covers ALL lanes, but one lane
-        // spans at most that many floors (too small declines via `SplitOk`). Level
+        // spans at most that many cells (too small declines via `ForkOk`). Level
         // -1 takes the HULL: its lanes are ranges.
         match self.range_of(*v) {
             Some(ps) => {
-                let w = A::floors_spanned(&ps, self.uncapped_ways);
+                let w = A::spanned(cut.grid(), &ps, self.uncapped_ways);
                 (if self.uncapped_ways { w } else { w.min(MOVE_WAYS as i64) }) as u8
             }
             None => MOVE_WAYS,
@@ -1210,7 +1094,8 @@ impl<A: GraphArith> Domain for Symbolic<A> {
             return Some(*t);
         }
         if self.is_unknown_num(*t) || self.is_unknown_num(*f) {
-            return Some(self.unknown_num());
+            let countdown = self.countdown_unknown(&[*t, *f]);
+            return Some(self.unknown_num(countdown));
         }
         match (self.graph.get(*t).op.clone(), self.graph.get(*f).op.clone()) {
             (Op::Const(a0, a1), Op::Const(b0, b1)) => Some(self.graph.leaf(Op::Const(lit_min::<A>(a0, b0), lit_max::<A>(a1, b1)))),
@@ -1233,13 +1118,9 @@ impl<A: GraphArith> Domain for Symbolic<A> {
             return false;
         }
         cone_any(&self.graph, &mut self.atom_memo, *c, |op| match op {
-            Op::UnknownBool(k) => Some(!is_countdown_atom(*k)),
+            Op::UnknownBool(k) => Some(!matches!(k, Unknown::Countdown(_))),
             _ => None,
         })
-    }
-
-    fn set_countdown_hint(&mut self, on: bool) {
-        self.countdown_hint = on;
     }
 
     fn reads_merge_refused(&mut self, c: &NodeId) -> bool {
@@ -1294,9 +1175,9 @@ impl<A: GraphArith> Domain for Symbolic<A> {
         // lane: the fork's coverage would decline them all).
         let atoms: Vec<NodeId> = self.graph.cone(&[*b])
             .into_iter()
-            .filter(|n| matches!(self.graph.get(*n).op, Op::UnknownBool(k) if is_countdown_atom(k) || (k >= since && k != u32::MAX)))
+            .filter(|n| matches!(self.graph.get(*n).op, Op::UnknownBool(Unknown::Countdown(_))) || matches!(self.graph.get(*n).op, Op::UnknownBool(Unknown::Atom(k)) if k >= since))
             .collect();
-        if !atoms.iter().any(|n| matches!(self.graph.get(*n).op, Op::UnknownBool(k) if !is_countdown_atom(k))) {
+        if !atoms.iter().any(|n| matches!(self.graph.get(*n).op, Op::UnknownBool(Unknown::Atom(_)))) {
             return None;
         }
         let name = origin(self);
@@ -1434,26 +1315,25 @@ mod tests {
     /// THE ROUND FORK (doubles): `rem + ox` of an interval remainder, forked
     /// at `flr(x + 1/2)`, resolves per configuration to the reference engine's
     /// fragment bit for bit, valid exactly where the reference has that many,
-    /// and `RSplitOk` says whether a lane takes at most `ways` values. Around
+    /// and `ForkOk(Rounds)` says whether a lane takes at most `ways` values. Around
     /// the cut below 1, where `0.5 - 2^-54 + 0.5` rounds up.
     #[test]
     fn a_round_fork_resolves_to_the_reference_fragments() {
-        use crate::transpile::graph::{CellKind, Val, OPEN};
+        use crate::transpile::graph::{Val, OPEN};
         use celeste_core::arith::Float;
         use celeste_core::lua_f64::{LuaF64, LuaF64Interval};
         let f = |v: f64| LuaF64::new(v).expect("finite");
         let ways = 3u8;
         for ox in [0.0, 0.3, 1.0, -1.7, 2.5, 0.5f64.next_down()] {
             let mut d = Symbolic::<Float>::default();
-            d.ival_cells.insert(0);
+            d.graph.set_cell_kind(0, Ty::Ival);
             d.forget_intervals();
-            d.graph.set_cell_kind(0, CellKind::Ival);
             let x = d.graph.leaf(Op::Cell(0));
             let k = d.num(f(ox));
             let y = d.arith(Arith::Add, &x, &k).expect("add");
-            let (v, valid) = d.fork_round(&y, ways).expect("a round fork");
+            let (v, valid) = d.split(Cut::Rounds, &y, ways).expect("a round fork");
             let fork = d.forks - 1;
-            let covered = d.graph.fold(Op::RSplitOk(ways), vec![y]);
+            let covered = d.graph.fold(Op::ForkOk(Cut::Rounds, ways), vec![y]);
             for (lo, hi) in [(-0.5, 0.5f64.next_down()), (-0.5, -0.5), (0.2, 0.4), (0.5f64.next_down(), 0.5), (-2.25, 1.75), (0.0, 0.0)] {
                 let iv = LuaF64Interval::new(f(lo), f(hi));
                 let cells = std::collections::HashMap::from([(0u32, Val::<Float>::Num(iv))]);
@@ -1465,11 +1345,11 @@ mod tests {
                     let mut g = d.graph.like();
                     let map = d.graph.specialize_subset_into(&splits, None, &mut g);
                     // Strict, a lane spanning more values than the fork's
-                    // arity is an error of the evaluation (as `SplitOk`).
+                    // arity is an error of the evaluation (as `ForkOk`).
                     let vals = match g.eval(&cells) {
                         Ok(vals) => vals,
                         Err(e) => {
-                            assert!(n > ways as u32 && format!("{e}").contains("RSplitOk"), "ox {ox} [{lo}, {hi}] c {c}: {e}");
+                            assert!(n > ways as u32 && format!("{e}").contains("ForkOk"), "ox {ox} [{lo}, {hi}] c {c}: {e}");
                             continue;
                         }
                     };
@@ -1528,10 +1408,10 @@ mod tests {
         let wall = d.graph.fold(Op::Sel, vec![gt, neg, inner]);
         let moved = d.graph.fold(Op::Add, vec![rem, wall]);
         let operand = d.graph.fold(Op::Add, vec![half, moved]);
-        assert_eq!(d.flr_ways(&operand), 2, "a kernel lane takes one piece");
+        assert_eq!(d.split_ways(Cut::Floors, &operand), 2, "a kernel lane takes one piece");
         d.uncapped_ways = true;
         d.range_memo.clear();
-        assert_eq!(d.flr_ways(&operand), 5, "level -1 joins the pieces: floors -2..=2");
+        assert_eq!(d.split_ways(Cut::Floors, &operand), 5, "level -1 joins the pieces: floors -2..=2");
     }
 
     /// The FORK TRIGGER's contract on hand-built graphs.
@@ -1540,7 +1420,7 @@ mod tests {
         let mut d = Symbolic::<celeste_core::arith::Fixed>::default();
         let ival = d.graph.leaf(Op::Cell(0));
         let exact = d.graph.leaf(Op::Cell(1));
-        d.ival_cells.insert(0);
+        d.graph.set_cell_kind(0, Ty::Ival);
         d.forget_intervals();
         let zero = d.graph.leaf(Op::Const(0, 0));
 
@@ -1587,14 +1467,14 @@ mod tests {
         let mut d = Symbolic::<celeste_core::arith::Fixed>::default();
         let c = d.graph.leaf(Op::Cell(0));
         let (sixty, one, zero) = (d.num(p(60)), d.num(p(1)), d.num(p(0)));
-        let u = d.unknown_num();
+        let u = d.unknown_num(false);
         let delay = d.sel_num(&c, &sixty, &u);
         let less = d.arith(Arith::Sub, &delay, &one).unwrap();
         let fifty_nine = d.num(p(59));
         assert_eq!(less, d.sel_num(&c, &fifty_nine, &u));
         let done = d.compare(Cmp::Le, &less, &zero).unwrap();
         let node = d.graph.get(done).clone();
-        assert!(d.graph.cone(&[done]).iter().all(|n| d.graph.get(*n).op != Op::UnknownNum), "{node:?}");
+        assert!(d.graph.cone(&[done]).iter().all(|n| !matches!(d.graph.get(*n).op, Op::UnknownNum { .. })), "{node:?}");
         assert!(d.graph.cone(&[done]).iter().any(|n| matches!(d.graph.get(*n).op, Op::UnknownBool(_))), "the unknown lanes: an atom");
     }
 

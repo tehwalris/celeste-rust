@@ -22,7 +22,7 @@ use celeste_core::arith::EngineNum;
 use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
 
-use crate::runtime2::{mix64, BoundaryIds, Cell2, Rt2, AV, P8, POS_WHOLE};
+use crate::runtime2::{mix64, Cell2, Rt2, AV, P8, POS_WHOLE};
 
 /// A packed key: (bits 64..127, bits 0..63). Bit 127 tags a PROVISIONAL key.
 pub type Key = (u64, u64);
@@ -451,8 +451,8 @@ pub struct ShapeRecord {
 }
 
 impl ShapeRecord {
-    pub fn of<N: EngineNum>(rt2: &Rt2<N>, ids: &BoundaryIds) -> ShapeRecord {
-        ShapeRecord { hash: rt2.shape_hash, sig: shape_sig(rt2), pos: rt2.position_cells(ids) }
+    pub fn of<N: EngineNum>(rt2: &Rt2<N>) -> ShapeRecord {
+        ShapeRecord { hash: rt2.shape_hash, sig: shape_sig(rt2), pos: rt2.position_cells() }
     }
 }
 
@@ -819,10 +819,10 @@ impl<N: EngineNum> KeySpace<N> {
     /// Every row's key of a CANONICAL block: packed where every code is in the
     /// dictionaries, else its exact content. A block whose shape is known must
     /// have its signature.
-    pub fn row_keys(&self, rt2: &Rt2<N>, ids: &BoundaryIds) -> Vec<RowKey<N>> {
+    pub fn row_keys(&self, rt2: &Rt2<N>) -> Vec<RowKey<N>> {
         let Some(s) = self.shapes.get(&rt2.shape_hash) else {
             // An unknown shape: every field is missing.
-            let rec = ShapeRecord::of(rt2, ids);
+            let rec = ShapeRecord::of(rt2);
             let s = ShapeKeys::<N>::new(rec);
             return (0..rt2.width)
                 .map(|lane| RowKey::Miss(MissKey { shape: rt2.shape_hash, partial: (0, 0), missing: s.value_cells().map(|c| (c, s.code_at(rt2, c, lane))).collect() }))
@@ -852,8 +852,8 @@ impl<N: EngineNum> KeySpace<N> {
 
     /// Every row's key of a CANONICAL block, `None` where a code is missing
     /// (no state of the tree is that row).
-    pub fn lookup_keys(&self, rt2: &Rt2<N>, ids: &BoundaryIds) -> Vec<Option<Key>> {
-        self.row_keys(rt2, ids)
+    pub fn lookup_keys(&self, rt2: &Rt2<N>) -> Vec<Option<Key>> {
+        self.row_keys(rt2)
             .into_iter()
             .map(|r| match r {
                 RowKey::Hit(k) => Some(k),
@@ -864,16 +864,16 @@ impl<N: EngineNum> KeySpace<N> {
 
     /// Add every code of the rows of `blocks` (CANONICAL) the dictionaries
     /// lack - per field SORTED - and their shapes: frame 0's seeding.
-    pub fn absorb(&mut self, blocks: &[&Rt2<N>], ids: &BoundaryIds) -> KeyAdditions<N> {
+    pub fn absorb(&mut self, blocks: &[&Rt2<N>]) -> KeyAdditions<N> {
         let mut adds = KeyAdditions::default();
         let mut shapes: Vec<&Rt2<N>> = blocks.to_vec();
         shapes.sort_by_key(|b| b.shape_hash);
         for b in &shapes {
-            self.add_shape(&ShapeRecord::of(b, ids), &mut adds);
+            self.add_shape(&ShapeRecord::of(b), &mut adds);
         }
         let mut new: std::collections::BTreeMap<(u64, u32), std::collections::BTreeSet<Code<N>>> = Default::default();
         for b in blocks {
-            for r in self.row_keys(b, ids) {
+            for r in self.row_keys(b) {
                 if let RowKey::Miss(m) = r {
                     for (c, code) in m.missing {
                         new.entry((m.shape, c)).or_default().insert(code);
@@ -961,7 +961,7 @@ pub type ExactRow = Box<[u8]>;
 /// one name is FATAL).
 static SIGS: std::sync::OnceLock<Mutex<FxHashMap<u64, std::sync::Arc<Vec<u32>>>>> = std::sync::OnceLock::new();
 
-pub fn exact_rows<N: EngineNum>(rt2: &Rt2<N>, ids: &BoundaryIds) -> Vec<ExactRow> {
+pub fn exact_rows<N: EngineNum>(rt2: &Rt2<N>) -> Vec<ExactRow> {
     let sig = shape_sig(rt2);
     {
         let mut g = SIGS.get_or_init(Default::default).lock().expect("the shape registry");
@@ -972,7 +972,7 @@ pub fn exact_rows<N: EngineNum>(rt2: &Rt2<N>, ids: &BoundaryIds) -> Vec<ExactRow
             }
         }
     }
-    let pos = rt2.position_cells(ids);
+    let pos = rt2.position_cells();
     let cells: Vec<u32> = (0..rt2.structure.len() as u32).filter(|&c| matches!(rt2.structure[c as usize], Cell2::Val)).collect();
     (0..rt2.width)
         .map(|lane| {

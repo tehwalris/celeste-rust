@@ -1,7 +1,7 @@
 //! A state as the walk sees it: which scalars are STATE (`state_paths`, what
-//! a trace symbolizes), its constants, and `blank`/`rebase` (every
-//! non-frozen scalar is symbolized at a frame's start, so two states of one
-//! shape trace identically).
+//! a trace symbolizes), its constants, and `blank` (every non-frozen scalar
+//! is symbolized at a frame's start, so two states of one shape trace
+//! identically: the walk's representatives hold them blanked).
 //!
 //! FROZEN (program constants, not symbolized): `types` and the prototypes it
 //! holds (a symbolic `type.tile` would make `load_room` try every type for
@@ -91,103 +91,6 @@ pub fn blank<A: GraphArith>(st: &mut State<Symbolic<A>>, d: &mut Symbolic<A>) ->
     // frame's outputs.
     st.guard = d.boolean(true);
     st.ended = d.boolean(false);
-    Ok(())
-}
-
-/// Every number and boolean in the heap - its tables' and its closure scopes'
-/// - that is a constant, by node: what `rebase` re-makes in another arena.
-pub fn heap_constants<A: GraphArith>(st: &State<Symbolic<A>>, d: &Symbolic<A>) -> std::collections::HashMap<u32, iface::Conc<A>> {
-    use super::domain::Domain;
-    let mut out = std::collections::HashMap::new();
-    let mut note = |v: &Value<Symbolic<A>>| match v {
-        Value::Num(n) => {
-            if let Some(c) = d.as_const(n) {
-                out.insert(*n, iface::Conc::Num(c));
-            }
-        }
-        Value::Bool(b) => {
-            if let Some(c) = d.decide(b) {
-                out.insert(*b, iface::Conc::Bool(c));
-            }
-        }
-        _ => {}
-    };
-    for tab in st.heap.tables.values() {
-        for v in tab.hash.values().chain(tab.arr.iter()).chain(tab.ints.values()) {
-            note(v);
-        }
-    }
-    for sc in st.heap.scopes.values() {
-        for v in sc.vars.values() {
-            note(v);
-        }
-    }
-    out
-}
-
-/// Move a walk's representative state into another tracer's arena: the
-/// slots `blank` rewrites blanked, every other scalar re-made from
-/// `constants` (`heap_constants` in the source arena); a table scalar that is
-/// neither refuses, a closure scope's is blanked.
-pub fn rebase<A: GraphArith>(st: &mut State<Symbolic<A>>, d: &mut Symbolic<A>, constants: &std::collections::HashMap<u32, iface::Conc<A>>) -> Result<()> {
-    // Where `blank` writes: each state path's (table, last step).
-    let mut blanked: std::collections::BTreeSet<(u32, Step)> = Default::default();
-    for p in state_paths(st)? {
-        let Some((last, parent)) = p.split_last() else { continue };
-        if let Some(Value::Table(t)) = iface::get(st, &parent.to_vec()) {
-            blanked.insert((t, last.clone()));
-        }
-    }
-    let remake = |d: &mut Symbolic<A>, at: &dyn Fn() -> String, v: &mut Value<Symbolic<A>>| -> Result<()> {
-        let (n, is_num) = match v {
-            Value::Num(n) => (*n, true),
-            Value::Bool(b) => (*b, false),
-            _ => return Ok(()),
-        };
-        *v = match (constants.get(&n), is_num) {
-            (Some(iface::Conc::Num(c)), true) => Value::Num(d.num(*c)),
-            (Some(iface::Conc::Bool(c)), false) => Value::Bool(d.boolean(*c)),
-            _ => anyhow::bail!("rebasing a walk state: {} holds node {n}, neither a constant nor a slot `blank` rewrites", at()),
-        };
-        Ok(())
-    };
-    for (t, tab) in st.heap.tables.iter_mut() {
-        for (k, v) in tab.hash.iter_mut() {
-            if !blanked.contains(&(*t, Step::Key(k.clone()))) {
-                remake(d, &|| format!("table {t} [{k:?}]"), v)?;
-            }
-        }
-        for (i, v) in tab.arr.iter_mut().enumerate() {
-            if !blanked.contains(&(*t, Step::Idx(i))) {
-                remake(d, &|| format!("table {t} [{i}]"), v)?;
-            }
-        }
-        for (i, v) in tab.ints.iter_mut() {
-            if !blanked.contains(&(*t, Step::Int(*i))) {
-                remake(d, &|| format!("table {t} [int {i}]"), v)?;
-            }
-        }
-    }
-    // A closure scope can hold a non-constant (the spawn position
-    // `init_object` captured, a node of the previous frame). Nothing reads
-    // it again (the methods read `obj`), so it is blanked like `guard`.
-    for sc in st.heap.scopes.values_mut() {
-        for v in sc.vars.values_mut() {
-            let (n, is_num) = match v {
-                Value::Num(n) => (*n, true),
-                Value::Bool(b) => (*b, false),
-                _ => continue,
-            };
-            *v = match (constants.get(&n), is_num) {
-                (Some(iface::Conc::Num(c)), true) => Value::Num(d.num(*c)),
-                (Some(iface::Conc::Bool(c)), false) => Value::Bool(d.boolean(*c)),
-                (_, true) => Value::Num(d.int(0)),
-                (_, false) => Value::Bool(d.boolean(false)),
-            };
-        }
-    }
-    blank(st, d)?;
-    st.path.clear();
     Ok(())
 }
 

@@ -65,8 +65,8 @@ over ~30 s and wait for it with a Monitor until-loop; do not poll.
 
 Unit tests are kept only for the basics:
 
-- PICO-8 and doubles arithmetic (`pico8_num`, `lua_f64`, the lane
-  primitives in `celeste_engine::kernel`), with overflow raising;
+- PICO-8 and doubles arithmetic (`pico8_num`, `lua_f64`, and the
+  kernels against both, `transpile::asm::tests`), with overflow raising;
 - the data structures: key packing (`exact`), the visited set and its
   packed tables, region sets, bundles, edge and frame files;
 - the arcs' set operations and the backward and reach DP against their

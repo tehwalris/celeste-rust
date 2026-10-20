@@ -209,8 +209,8 @@ same-length variant valid in both.
 
 A cargo workspace; the dependency order is load-bearing: `celeste-core`
 (numbers, the arithmetic trait, cart, collision) and `celeste-names`
-(frozen tables) <- `celeste-engine` (`Rt2` blocks, exact keys, lane
-primitives, the widening table) <- `celeste-rust` (`src/frame.rs` the
+(frozen tables) <- `celeste-engine` (`Rt2` blocks, exact keys, the
+widening table) <- `celeste-rust` (`src/frame.rs` the
 forward, `src/storage/`, `src/search/` the backward, the concrete search
 and level -1, `src/trace/` the tracer, `src/engines/` the reference
 engine, `src/transpile/` graph IR and assembler, `src/compiled/` the kernel

@@ -664,7 +664,7 @@ function init_object(type,x,y)
 	obj.move_x=function(amount,start)
 		if obj.solids then
 			local step = sign(amount)
-			for i=start,abs(amount) do
+			for i=start,abs(amount) do --@unroll 8
 				if not obj.is_solid(step,0) then
 					obj.x = obj.x + (step)
 				else
@@ -681,7 +681,7 @@ function init_object(type,x,y)
 	obj.move_y=function(amount)
 		if obj.solids then
 			local step = sign(amount)
-			for i=0,abs(amount) do
+			for i=0,abs(amount) do --@unroll 8
 	 		if not obj.is_solid(0,step) then
 					obj.y = obj.y + (step)
 				else
@@ -866,8 +866,8 @@ function ice_at(x,y,w,h)
 end
 
 function tile_flag_at(x,y,w,h,flag)
- for i=max(0,flr(x/8)),min(15,(x+w-1)/8) do
- 	for j=max(0,flr(y/8)),min(15,(y+h-1)/8) do
+ for i=max(0,flr(x/8)),min(15,(x+w-1)/8) do --@unroll 3
+ 	for j=max(0,flr(y/8)),min(15,(y+h-1)/8) do --@unroll 3
  		if fget(tile_at(i,j),flag) then
  			return true
  		end
@@ -881,8 +881,8 @@ function tile_at(x,y)
 end
 
 function spikes_at(x,y,w,h,xspd,yspd)
- for i=max(0,flr(x/8)),min(15,(x+w-1)/8) do
- 	for j=max(0,flr(y/8)),min(15,(y+h-1)/8) do
+ for i=max(0,flr(x/8)),min(15,(x+w-1)/8) do --@unroll 3
+ 	for j=max(0,flr(y/8)),min(15,(y+h-1)/8) do --@unroll 3
  	 local tile=tile_at(i,j)
  	 if tile==17 and ((y+h-1)%8>=6 or y+h==j*8+8) and yspd>=0 then
  	  return true

@@ -32,7 +32,7 @@ hold. One frame from a node:
    fork's arity is the hull's width, level -1 only).
 2. **Copy the cone** of every outcome's `live`, error, position and fields:
    a button fork stands for its whole literal; `Known(..)` is true (this
-   evaluator joins undecided selects, which is sound); `SplitOk` is checked.
+   evaluator joins undecided selects, which is sound); `ForkOk` is checked.
 3. **Specialize** per fork configuration: the move amount is one number, so
    pixel steps and collisions are exact at an exact position.
 4. **Evaluate** over the ranges (`Graph::eval_narrow_top_in`): an outcome
@@ -134,7 +134,7 @@ fingerprints).
 
 ## Limits
 
-- `unroll_bound("abs(amount)") = 8` caps S at 7.
+- `move`'s loops are unrolled 8 times (`--@unroll 8` in the cart), which caps S at 7.
 - Deaths are modelled only through the respawn's d.
 - No condition refinement: counters (`freeze`, `djump`, `dash_time`,
   `grace`, the springs' `delay`) go to the full range.

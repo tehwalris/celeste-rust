@@ -22,28 +22,20 @@ use celeste_core::arith::EngineNum;
 use celeste_engine::exact::{Code, FieldDict, MissKey, ShapeKeys};
 use celeste_engine::runtime2::{Rt2, P8};
 
-use super::{AsmKernel, KernelLanes, RootKind};
+use super::{AsmKernel, KernelLanes};
+use crate::transpile::graph::Ty;
 use crate::search::rem::Capture;
 use crate::storage::unit::lanes_of;
 
 /// One per-row field of a key: its cell (the shape's dictionary), output
-/// slot and how the slot reads as a code.
+/// slot, its type and whether it is a position coordinate (its code
+/// `exact::Code::pos`).
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub(super) struct KeyField {
     pub cell: u32,
     root: usize,
-    read: KeyRead,
-}
-
-/// How a key field's slot becomes its code (a position coordinate's:
-/// `exact::Code::pos`).
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
-enum KeyRead {
-    Num,
-    Ival,
-    Bool,
-    PosNum,
-    PosIval,
+    ty: Ty,
+    pos: bool,
 }
 
 /// 16 lanes of 128-bit keys (or a field's placed bits in them) as two
@@ -102,16 +94,9 @@ fn bool_same(v: u16, k: u16, r: usize, of: u16) -> u16 {
 impl KeyField {
     /// `pos`: the cell is a position coordinate (`Rt2::position_cells`),
     /// which keys without its whole pixels.
-    pub(super) fn new(cell: u32, root: usize, kind: RootKind, pos: bool) -> Result<KeyField> {
-        let read = match (kind, pos) {
-            (RootKind::Num, false) => KeyRead::Num,
-            (RootKind::Ival, false) => KeyRead::Ival,
-            (RootKind::Bool, false) => KeyRead::Bool,
-            (RootKind::Num, true) => KeyRead::PosNum,
-            (RootKind::Ival, true) => KeyRead::PosIval,
-            (RootKind::Bool, true) => anyhow::bail!("position cell {cell} is a boolean output: its row would have no cell"),
-        };
-        Ok(KeyField { cell, root, read })
+    pub(super) fn new(cell: u32, root: usize, ty: Ty, pos: bool) -> Result<KeyField> {
+        anyhow::ensure!(!(pos && ty.is_bool()), "position cell {cell} is a boolean output: its row would have no cell");
+        Ok(KeyField { cell, root, ty: if ty.is_bool() { Ty::Bool } else { ty }, pos })
     }
 
     /// The `(lo, hi)` code words of every lane of a number field (a
@@ -119,22 +104,22 @@ impl KeyField {
     #[inline]
     fn num_words<N: KernelLanes>(&self, buf: &[u8], half: usize) -> ([N::Raw; 16], [N::Raw; 16]) {
         let base = self.root;
-        match self.read {
-            KeyRead::Num => {
+        match (self.ty, self.pos) {
+            (Ty::Num, false) => {
                 let w = N::col(buf, half, base);
                 (w, w)
             }
-            KeyRead::Ival => (N::col(buf, half, base), N::col(buf, half, base + 64)),
-            KeyRead::PosNum => {
+            (Ty::Ival, false) => (N::col(buf, half, base), N::col(buf, half, base + 64)),
+            (Ty::Num, true) => {
                 let w = N::col(buf, half, base).map(|x| N::pos_words(x, x).0);
                 (w, w)
             }
-            KeyRead::PosIval => {
+            (Ty::Ival, true) => {
                 let (lo, hi) = (N::col(buf, half, base), N::col(buf, half, base + 64));
                 let p: [(N::Raw, N::Raw); 16] = std::array::from_fn(|i| N::pos_words(lo[i], hi[i]));
                 (p.map(|w| w.0), p.map(|w| w.1))
             }
-            KeyRead::Bool => unreachable!("a boolean field has no number words"),
+            (Ty::Bool | Ty::UBool, _) => unreachable!("a boolean field has no number words"),
         }
     }
 
@@ -144,7 +129,7 @@ impl KeyField {
     /// code, a big one probed once per distinct value among the lanes.
     #[inline]
     fn eval<N: KernelLanes>(&self, buf: &[u8], half: usize, d: &FieldDict<N>, need: u16, placed: &mut Placed) -> u16 {
-        if self.read == KeyRead::Bool {
+        if self.ty == Ty::Bool {
             let (v, k) = N::masks(buf, half, self.root);
             let mut miss = 0u16;
             for (tri, lanes) in [(0, need & k & !v), (1, need & k & v), (2, need & !k)] {
@@ -192,15 +177,15 @@ impl KeyField {
             let (a, b) = N::pos_words(lo, hi);
             Code::num(a, b)
         };
-        match self.read {
-            KeyRead::Num => Code::num(w(base), w(base)),
-            KeyRead::Ival => Code::num(w(base), w(base + 64)),
-            KeyRead::Bool => {
+        match (self.ty, self.pos) {
+            (Ty::Num, false) => Code::num(w(base), w(base)),
+            (Ty::Ival, false) => Code::num(w(base), w(base + 64)),
+            (Ty::Bool | Ty::UBool, _) => {
                 let (v, k) = N::masks(buf, half, base);
                 Code::boolean((k >> i & 1 == 1).then_some(v >> i & 1 == 1))
             }
-            KeyRead::PosNum => pos(w(base), w(base)),
-            KeyRead::PosIval => pos(w(base), w(base + 64)),
+            (Ty::Num, true) => pos(w(base), w(base)),
+            (Ty::Ival, true) => pos(w(base), w(base + 64)),
         }
     }
 }
@@ -216,14 +201,14 @@ pub(crate) type RawWords<N = P8> = [<N as EngineNum>::Raw; RAW_WORDS];
 /// fin as (offset, kind); `fin`: the outcome ends with a player.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub(super) struct ArcSlots {
-    pub roots: [(usize, RootKind); 2 * crate::trace::frame::ARC_AXIS_ROOTS],
+    pub roots: [(usize, Ty); 2 * crate::trace::frame::ARC_AXIS_ROOTS],
     pub fin: bool,
 }
 
 impl ArcSlots {
     /// The roots the transfer reads (without a `fin`, not the fin roots).
     #[inline]
-    fn read_roots(&self) -> impl Iterator<Item = (usize, (usize, RootKind))> + '_ {
+    fn read_roots(&self) -> impl Iterator<Item = (usize, (usize, Ty))> + '_ {
         let fin = self.fin;
         self.roots.iter().copied().enumerate().filter(move |(k, _)| fin || k % crate::trace::frame::ARC_AXIS_ROOTS != 4)
     }
@@ -236,9 +221,9 @@ impl ArcSlots {
         let mut out = [N::Raw::default(); RAW_WORDS];
         for (k, (off, kind)) in self.read_roots() {
             let (lo, hi) = match kind {
-                RootKind::Num => (w(off), w(off)),
-                RootKind::Ival => (w(off), w(off + 64)),
-                RootKind::Bool => {
+                Ty::Num => (w(off), w(off)),
+                Ty::Ival => (w(off), w(off + 64)),
+                Ty::Bool | Ty::UBool => {
                     let (v, known) = N::masks(buf, half, off);
                     (N::Raw::from((v >> i & 1) as u32), N::Raw::from((known >> i & 1) as u32))
                 }
@@ -257,15 +242,15 @@ impl ArcSlots {
         let mut m = of;
         for (_, (off, kind)) in self.read_roots() {
             m = match kind {
-                RootKind::Num => {
+                Ty::Num => {
                     let c = N::col(buf, half, off);
                     m & N::eq_lanes(&c, c[r])
                 }
-                RootKind::Ival => {
+                Ty::Ival => {
                     let (lo, hi) = (N::col(buf, half, off), N::col(buf, half, off + 64));
                     m & N::eq_lanes(&lo, lo[r]) & N::eq_lanes(&hi, hi[r])
                 }
-                RootKind::Bool => {
+                Ty::Bool | Ty::UBool => {
                     let (v, k) = N::masks(buf, half, off);
                     bool_same(v, k, r, m)
                 }
@@ -288,7 +273,7 @@ impl ArcSlots {
             let base = a * crate::trace::frame::ARC_AXIS_ROOTS;
             let pair = |k: usize| (num(words[2 * (base + k)]), num(words[2 * (base + k) + 1]));
             assert!(
-                self.roots[base].1 == RootKind::Bool && words[2 * base + 1] == one,
+                self.roots[base].1 == Ty::Bool && words[2 * base + 1] == one,
                 "arc edges: shape {:#x} outcome {outcome} lane {lane}: axis {a}'s `took` is not a decided boolean",
                 chunk.shape_hash
             );

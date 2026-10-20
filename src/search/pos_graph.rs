@@ -81,7 +81,7 @@ pub(crate) fn whole_range_col<N: EngineNum>(rt2: &Rt2<N>, cell: u32) -> Option<V
 /// The block's player object (`player`, else `player_spawn`): one per
 /// block, its lanes share structure.
 pub(crate) fn player_object<N: EngineNum>(rt2: &Rt2<N>) -> Option<u32> {
-    rt2.position_object(crate::compiled::ids())
+    rt2.position_object()
 }
 
 /// Per-lane cell of a block (`room.x`/`room.y` must be numbers; no player or

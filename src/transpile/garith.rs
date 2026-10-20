@@ -5,7 +5,7 @@
 //! (`refdomain`) exactly.
 //!
 //! - the FORK GRID: the integer floors a `move` fork's fragments are cut
-//!   at (`Split`, `Frag`, `FragOk`, `SplitOk`, `IntFrag`);
+//!   at (`Op::Fork` and its family, `Cut`);
 //! - `NoWrap`, an operation's own error: 16.16's result left the range
 //!   (the console wraps or saturates); a double's is not finite;
 //! - `min`/`max`'s symmetry: LuaJIT returns the second argument on a tie,
@@ -20,7 +20,7 @@ use celeste_core::arith::{Arithmetic, Fixed, Float};
 use celeste_core::lua_f64::{LuaF64, LuaF64Interval};
 use celeste_core::pico8_num::{Pico8Num, Pico8NumInterval};
 
-use super::graph::{one_operand, Graph, NodeId, Op};
+use super::graph::{one_operand, Cut, Graph, NodeId, Op};
 
 pub trait GraphArith: Arithmetic<Num: celeste_core::arith::EngineNum<A = Self>> {
     const MINMAX_COMMUTE: bool;
@@ -32,19 +32,34 @@ pub trait GraphArith: Arithmetic<Num: celeste_core::arith::EngineNum<A = Self>> 
     const EQ_IS_IDENTITY: bool;
     type Pieces: Clone + Debug + PartialEq + Default + Send;
 
-    /// `SplitOk(n)` of the literal interval `[lo, hi]`, in the kernel's own
-    /// arithmetic.
+    /// `ForkOk(Floors, n)` of the literal interval `[lo, hi]`, in the
+    /// kernel's own arithmetic.
     fn lit_split_ok(lo: Self::Lit, hi: Self::Lit, n: u8) -> bool;
     fn lit_int_frag(lo: Self::Lit, c: u8) -> Self::Lit;
-    /// `IntFrag(c)` over `iv`: fragment `c`'s low end, exact (`lenient`: its
-    /// hull over the lanes `iv` covers).
-    fn ev_int_frag(iv: Self::Ival, c: u8, lenient: bool) -> Self::Ival;
-    /// `SplitOk(ways)` over `iv`: does it span at most `ways` floors?
-    fn ev_split_ok(iv: Self::Ival, ways: u8) -> bool;
-    fn ev_frag_cells(iv: Self::Ival) -> i64;
-    /// Fragment `c` of `iv`: its part in the `c`-th floor from its low end's
-    /// (`c` at most `ev_frag_cells`).
-    fn ev_frag(iv: Self::Ival, c: u8) -> Self::Ival;
+    /// An `Ints` fork's fragment `c` over `iv`: the low end of its part in
+    /// the `c`-th floor, exact (`lenient`: its hull over the lanes `iv`
+    /// covers).
+    fn int_fragment(iv: Self::Ival, c: u8, lenient: bool) -> Self::Ival;
+
+    /// The cells of `cut`'s grid `iv` spans past its low end's (`i64::MAX`
+    /// past counting): fragment `c` is reached iff `c <= cells`.
+    fn cells(cut: Cut, iv: Self::Ival) -> i64 {
+        let n = match cut.grid() {
+            Cut::Rounds => Self::rounds(iv).ok().flatten(),
+            _ => Self::floors(iv),
+        };
+        n.map_or(i64::MAX, |k| k as i64 - 1)
+    }
+
+    /// Fragment `c` of `iv` (reached), cut as `cut` says: its part in the
+    /// `c`-th cell (`Ints`: `int_fragment`).
+    fn fragment(cut: Cut, iv: Self::Ival, c: u8, lenient: bool) -> anyhow::Result<Self::Ival> {
+        Ok(match cut {
+            Cut::Floors => Self::floor_fragment(iv, c as u32),
+            Cut::Ints => Self::int_fragment(iv, c, lenient),
+            Cut::Rounds => Self::round_fragment(iv, c as u32)?,
+        })
+    }
     /// `NoWrap(x)` decided at a fold, where it can be (`None`: it stays).
     fn fold_no_wrap(g: &Graph<Self>, x: NodeId) -> Option<bool>;
     /// `abs` of `x` (`defined`: a lane where it fails is in error, so the
@@ -63,11 +78,9 @@ pub trait GraphArith: Arithmetic<Num: celeste_core::arith::EngineNum<A = Self>> 
     /// Does the range keep every value inside the arithmetic (no overflow:
     /// `trace::error`)?
     fn bounded(p: &Self::Pieces) -> bool;
-    /// The most floors a piece spans (`uncapped`: the hull's), at least 1.
-    fn floors_spanned(p: &Self::Pieces, uncapped: bool) -> i64;
-    /// `floors_spanned`'s twin for the values of `flr(x + 1/2)` (the round
-    /// fork's arity).
-    fn rounds_spanned(p: &Self::Pieces, uncapped: bool) -> i64;
+    /// The most cells of `grid` (the floors, the values of `flr(x + 1/2)`)
+    /// a piece spans (`uncapped`: the hull's), at least 1: a fork's arity.
+    fn spanned(grid: Cut, p: &Self::Pieces, uncapped: bool) -> i64;
     /// The whole numbers the pieces' hull spans.
     fn floor_hull(p: &Self::Pieces) -> Option<(i64, i64)>;
     /// The pieces' hull as literals (`None`: outside the arithmetic).
@@ -174,7 +187,7 @@ impl GraphArith for Fixed {
         (lo as i64).max(base).clamp(i32::MIN as i64, i32::MAX as i64) as i32
     }
 
-    fn ev_int_frag(iv: Pico8NumInterval, c: u8, lenient: bool) -> Pico8NumInterval {
+    fn int_fragment(iv: Pico8NumInterval, c: u8, lenient: bool) -> Pico8NumInterval {
         let (step, mask) = grid();
         let gflr = |p: Pico8Num| p.as_raw_u32() as i32 as i64 & mask as i64;
         let (fl, fh) = (gflr(iv.low), gflr(iv.high));
@@ -188,29 +201,6 @@ impl GraphArith for Fixed {
         } else {
             Pico8NumInterval::new(Pico8Num::from_raw(lo), Pico8Num::from_raw(lo))
         }
-    }
-
-    fn ev_split_ok(iv: Pico8NumInterval, ways: u8) -> bool {
-        let step = GRID_STEP as i64;
-        let floor = |v: Pico8Num| (v.as_raw_u32() as i32 as i64).div_euclid(step) * step;
-        floor(iv.high) <= floor(iv.low) + (ways as i64 - 1) * step
-    }
-
-    fn ev_frag_cells(iv: Pico8NumInterval) -> i64 {
-        let (step, mask) = grid();
-        let gflr = |p: Pico8Num| Pico8Num::from_raw(p.as_raw_u32() as i32 & mask);
-        let (fl, fh) = (gflr(iv.low), gflr(iv.high));
-        // Cells spanned minus one, in i64 (a full-range hull overflows).
-        (fh.as_raw_u32() as i32 as i64 - fl.as_raw_u32() as i32 as i64) / step as i64
-    }
-
-    fn ev_frag(iv: Pico8NumInterval, c: u8) -> Pico8NumInterval {
-        let (step, mask) = grid();
-        let fl = (iv.low.as_raw_u32() as i32 & mask) as i64;
-        let base = fl + c as i64 * step as i64;
-        let lo = (iv.low.as_raw_u32() as i32 as i64).max(base);
-        let hi = (iv.high.as_raw_u32() as i32 as i64).min(base + step as i64 - 1);
-        Pico8NumInterval::new(Pico8Num::from_raw(lo as i32), Pico8Num::from_raw(hi as i32))
     }
 
     // No-wrap of anything but `+ - * /`, negation and `abs` holds (as in
@@ -357,7 +347,7 @@ impl GraphArith for Fixed {
                 Some(vec![(a[0].0, b[b.len() - 1].1)])
             }
             // A fragment lies within its operand.
-            Op::Split(_) | Op::SplitInt(_) | Op::Frag(_) | Op::IntFrag(_) | Op::RSplit(_) | Op::RFrag(_) => rec(memo, 0),
+            Op::Fork(..) | Op::Frag(..) => rec(memo, 0),
             // A lane's end, over the lanes (see `eval`'s `Lo`).
             Op::Lo | Op::Hi => {
                 let low = matches!(op, Op::Lo);
@@ -394,14 +384,17 @@ impl GraphArith for Fixed {
         p.iter().all(|&(lo, hi)| lo >= i32::MIN as i64 && hi <= i32::MAX as i64)
     }
 
-    fn floors_spanned(ps: &Pieces, uncapped: bool) -> i64 {
-        let sh = 16;
+    /// The floors: `raw >> 16`; the values of `flr(x + 1/2)`: `(raw + 1/2)
+    /// >> 16`, exactly.
+    fn spanned(grid: Cut, ps: &Pieces, uncapped: bool) -> i64 {
+        let half = if grid == Cut::Rounds { 0x8000 } else { 0 };
+        let r = |v: i64| (v + half) >> 16;
         let w = if uncapped {
-            let lo = ps.iter().map(|p| p.0 >> sh).min().unwrap_or(0);
-            let hi = ps.iter().map(|p| p.1 >> sh).max().unwrap_or(0);
+            let lo = ps.iter().map(|p| r(p.0)).min().unwrap_or(0);
+            let hi = ps.iter().map(|p| r(p.1)).max().unwrap_or(0);
             (hi - lo + 1).min(i64::from(u8::MAX))
         } else {
-            ps.iter().map(|p| (p.1 >> sh) - (p.0 >> sh) + 1).max().unwrap_or(1)
+            ps.iter().map(|p| r(p.1) - r(p.0) + 1).max().unwrap_or(1)
         };
         w.max(1)
     }
@@ -415,19 +408,6 @@ impl GraphArith for Fixed {
     fn lit_hull(ps: &Pieces) -> Option<(i32, i32)> {
         let (lo, hi) = (ps.iter().map(|p| p.0).min()?, ps.iter().map(|p| p.1).max()?);
         Some((i32::try_from(lo).ok()?, i32::try_from(hi).ok()?))
-    }
-
-    /// `flr(x + 1/2)` is `(raw + 1/2) >> 16`, exactly.
-    fn rounds_spanned(ps: &Pieces, uncapped: bool) -> i64 {
-        let r = |v: i64| (v + 0x8000) >> 16;
-        let w = if uncapped {
-            let lo = ps.iter().map(|p| r(p.0)).min().unwrap_or(0);
-            let hi = ps.iter().map(|p| r(p.1)).max().unwrap_or(0);
-            (hi - lo + 1).min(i64::from(u8::MAX))
-        } else {
-            ps.iter().map(|p| r(p.1) - r(p.0) + 1).max().unwrap_or(1)
-        };
-        w.max(1)
     }
 
     fn lit_raw_fixed(lo: i32, hi: i32) -> Option<(i32, i32)> {
@@ -483,7 +463,7 @@ fn normalize_float(mut v: FloatPieces) -> Option<FloatPieces> {
     Some(out)
 }
 
-/// `IntFrag(c)` of a value: fragment `c`'s low end, the floor `c` integers
+/// An `Ints` fragment `c` of a value: its low end, the floor `c` integers
 /// above `v`'s, at least `v` (the cart's `max`, as the reference takes it).
 fn int_frag_low(v: LuaF64, c: u8) -> LuaF64 {
     let base = LuaF64::new(v.value().floor() + c as f64).expect("a floor near a finite double is finite");
@@ -497,14 +477,14 @@ impl GraphArith for Float {
     type Pieces = FloatPieces;
 
     fn lit_split_ok(lo: u64, hi: u64, n: u8) -> bool {
-        Self::ev_split_ok(LuaF64Interval::new(Float::from_lit(lo), Float::from_lit(hi)), n)
+        Self::cells(Cut::Floors, LuaF64Interval::new(Float::from_lit(lo), Float::from_lit(hi))) < n as i64
     }
 
     fn lit_int_frag(lo: u64, c: u8) -> u64 {
         Float::lit(int_frag_low(Float::from_lit(lo), c))
     }
 
-    fn ev_int_frag(iv: LuaF64Interval, c: u8, lenient: bool) -> LuaF64Interval {
+    fn int_fragment(iv: LuaF64Interval, c: u8, lenient: bool) -> LuaF64Interval {
         let l = int_frag_low(iv.lo, c);
         if lenient {
             let h = int_frag_low(iv.hi, c).lua_max(l);
@@ -512,26 +492,6 @@ impl GraphArith for Float {
         } else {
             LuaF64Interval::point(l)
         }
-    }
-
-    fn ev_split_ok(iv: LuaF64Interval, ways: u8) -> bool {
-        iv.hi.value().floor() - iv.lo.value().floor() <= (ways as f64 - 1.0)
-    }
-
-    fn ev_frag_cells(iv: LuaF64Interval) -> i64 {
-        let d = iv.hi.value().floor() - iv.lo.value().floor();
-        if d >= i64::MAX as f64 {
-            i64::MAX
-        } else {
-            d as i64
-        }
-    }
-
-    /// The reference's fragment (`LuaF64Interval::floor_fragment`), bit for
-    /// bit: its ends are the cart's `max`/`min` of the operand's and the
-    /// floor's, so a `-0` end against the floor `0` takes the floor's.
-    fn ev_frag(iv: LuaF64Interval, c: u8) -> LuaF64Interval {
-        iv.floor_fragment(c as u32)
     }
 
     /// A double's `NoWrap` is "finite": undecided exactly where the
@@ -645,7 +605,7 @@ impl GraphArith for Float {
                 let (a, b) = (rec(memo, 0)?, rec(memo, 1)?);
                 Some(vec![(a[0].0, b[b.len() - 1].1)])
             }
-            Op::Split(_) | Op::SplitInt(_) | Op::Frag(_) | Op::IntFrag(_) | Op::RSplit(_) | Op::RFrag(_) => rec(memo, 0),
+            Op::Fork(..) | Op::Frag(..) => rec(memo, 0),
             Op::Lo | Op::Hi => {
                 let low = matches!(op, Op::Lo);
                 let arg = g.get(args[0]).clone();
@@ -682,13 +642,17 @@ impl GraphArith for Float {
         p.iter().all(|&(lo, hi)| lo.is_finite() && hi.is_finite())
     }
 
-    fn floors_spanned(ps: &FloatPieces, uncapped: bool) -> i64 {
+    /// The floors; the values of `flr(fl(x + 1/2))`, monotone in `x`
+    /// (`LuaF64Interval::rounds`).
+    fn spanned(grid: Cut, ps: &FloatPieces, uncapped: bool) -> i64 {
+        let half = if grid == Cut::Rounds { 0.5 } else { 0.0 };
+        let r = |v: f64| (v + half).floor();
         let w = if uncapped {
-            let lo = ps.iter().map(|p| p.0.floor()).fold(f64::INFINITY, f64::min);
-            let hi = ps.iter().map(|p| p.1.floor()).fold(f64::NEG_INFINITY, f64::max);
+            let lo = ps.iter().map(|p| r(p.0)).fold(f64::INFINITY, f64::min);
+            let hi = ps.iter().map(|p| r(p.1)).fold(f64::NEG_INFINITY, f64::max);
             (hi - lo + 1.0).min(u8::MAX as f64)
         } else {
-            ps.iter().map(|p| p.1.floor() - p.0.floor() + 1.0).fold(1.0, f64::max)
+            ps.iter().map(|p| r(p.1) - r(p.0) + 1.0).fold(1.0, f64::max)
         };
         (w as i64).max(1)
     }
@@ -703,19 +667,6 @@ impl GraphArith for Float {
         let lo = LuaF64::new(ps.iter().map(|q| q.0).reduce(f64::min)?)?;
         let hi = LuaF64::new(ps.iter().map(|q| q.1).reduce(f64::max)?)?;
         Some((Float::lit(lo), Float::lit(hi)))
-    }
-
-    /// `flr(fl(x + 1/2))`, monotone in `x` (`LuaF64Interval::rounds`).
-    fn rounds_spanned(ps: &FloatPieces, uncapped: bool) -> i64 {
-        let r = |v: f64| (v + 0.5).floor();
-        let w = if uncapped {
-            let lo = ps.iter().map(|p| r(p.0)).fold(f64::INFINITY, f64::min);
-            let hi = ps.iter().map(|p| r(p.1)).fold(f64::NEG_INFINITY, f64::max);
-            (hi - lo + 1.0).min(u8::MAX as f64)
-        } else {
-            ps.iter().map(|p| r(p.1) - r(p.0) + 1.0).fold(1.0, f64::max)
-        };
-        (w as i64).max(1)
     }
 
     fn lit_raw_fixed(_lo: u64, _hi: u64) -> Option<(i32, i32)> {

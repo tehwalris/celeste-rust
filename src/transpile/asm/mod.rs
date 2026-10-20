@@ -1,18 +1,18 @@
 //! The AVX-512 assembly backend: a traced kernel graph is compiled to GAS
 //! text (`codegen`), assembled with gcc and loaded with `dlopen` (`jit`).
 //! Ops it does not vectorise inline go through call-outs (`callout`).
-//! `tests` checks every op bit-exact against the Rust lane primitives.
+//! `tests` checks every op, in both arithmetics, bit for bit against the
+//! arithmetic's own scalar operations.
 
 mod callout;
 mod codegen;
 mod jit;
 
 pub use callout::{AsmCtx, CollisionEnv};
-pub use codegen::{compile, AsmArith, CellRepr, Compiled, RootKind};
+pub use codegen::{compile, AsmArith, Compiled};
 pub use jit::{assemble, check_mxcsr, KernelFn, Loaded};
 
 use anyhow::Result;
-use std::collections::HashMap;
 use std::path::PathBuf;
 
 /// What an assembly is built with: `trace` (`--build-trace`: the build's
@@ -25,28 +25,17 @@ pub struct AsmOptions {
 }
 
 /// Compile `roots` of `g` to assembly, assemble it, and load it. Returns
-/// the layout metadata and the loaded function. All input cells numeric;
-/// use `compile_and_load_reprs` when a cell is bool.
+/// the layout metadata (each input cell's by its type in `g`) and the
+/// loaded function.
 pub fn compile_and_load<A: AsmArith>(
     g: &crate::transpile::graph::Graph<A>,
     roots: &[crate::transpile::graph::NodeId],
     tag: &str,
-) -> Result<(Compiled, Loaded)> {
-    compile_and_load_reprs(g, roots, tag, &HashMap::new(), AsmOptions::default())
-}
-
-/// `compile_and_load` with an explicit per-cell input repr (a cell absent
-/// from `cell_reprs` is `Num`).
-pub fn compile_and_load_reprs<A: AsmArith>(
-    g: &crate::transpile::graph::Graph<A>,
-    roots: &[crate::transpile::graph::NodeId],
-    tag: &str,
-    cell_reprs: &HashMap<u32, CellRepr>,
     opts: AsmOptions,
 ) -> Result<(Compiled, Loaded)> {
     let sym = format!("kernel_{tag}");
     let t0 = std::time::Instant::now();
-    let mut compiled = compile(g, roots, &sym, cell_reprs, opts)?;
+    let mut compiled = compile(g, roots, &sym, opts)?;
     let t_compile = t0.elapsed();
     let t1 = std::time::Instant::now();
     let so: PathBuf = assemble(&compiled.asm, tag)?;
@@ -71,5 +60,3 @@ pub fn compile_and_load_reprs<A: AsmArith>(
 
 #[cfg(test)]
 mod tests;
-#[cfg(test)]
-mod tests_float;

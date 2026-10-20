@@ -165,10 +165,8 @@ fn inherently_bool<A: GraphArith>(op: &Op<A>) -> bool {
             | Op::And
             | Op::Or
             | Op::Known
-            | Op::SplitValid(_)
-            | Op::SplitOk(_)
-            | Op::RSplitValid(_)
-            | Op::RSplitOk(_)
+            | Op::ForkValid(..)
+            | Op::ForkOk(..)
             | Op::Same
             | Op::NoWrap
             | Op::Lt

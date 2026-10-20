@@ -2,9 +2,10 @@
 //! `Div`/`Rem`/`Sin` and the collision look-ups `Mget`/`TileFlagAt` - are a
 //! `call` through a function pointer in `AsmCtx`, the kernel's third
 //! argument. Operands are marshalled through a stack buffer and the wrappers
-//! invoke the exact `celeste_engine::kernel` primitive, so the result is
-//! bit-identical by construction. The emitted code saves and restores the
-//! registers live across the call (`codegen::call_saves`).
+//! compute the arithmetic's own operation lane by lane (`Pico8Num`'s
+//! saturating `/`, `%` and `sin`; `LuaF64::lua_sin`; the map), so the result
+//! is the scalar operation's by construction. The emitted code saves and
+//! restores the registers live across the call (`codegen::call_saves`).
 //!
 //! The doubles' kernels (8 `f64` lanes) call their own: the tools' `sin`
 //! (`LuaF64::lua_sin`, glibc's `sin`, lane by lane) and the collision
@@ -16,20 +17,21 @@ use celeste_core::cart_data::CART;
 use celeste_core::collision_cache::CollisionCache;
 use celeste_core::lua_f64::LuaF64;
 use celeste_core::pico8_num::Pico8Num as P8;
-use celeste_engine::kernel::{
-    zn_div, zn_mget, zn_rem, zn_sin, zn_tile_flag_at, zn_tile_flag_at_lanes, ZN,
-};
 
+/// 16.16's lanes a call-out reads: one zmm of `i32`s.
+const LANES: usize = 16;
+
+/// Lane `i` of a 16.16 column.
 #[inline]
-unsafe fn load_zn(p: *const i32) -> ZN {
-    ZN::from_array(std::array::from_fn(|i| P8::from_raw(*p.add(i))))
+unsafe fn num(p: *const i32, i: usize) -> P8 {
+    P8::from_raw(*p.add(i))
 }
+
+/// A whole number of a 16.16 lane (the traced cart never makes a fraction
+/// where one is read: a coordinate, a box, a flag).
 #[inline]
-unsafe fn store_zn(p: *mut i32, z: ZN) {
-    let a = z.to_array();
-    for i in 0..16 {
-        *p.add(i) = a[i].as_raw_u32() as i32;
-    }
+fn whole16(v: P8, what: &str) -> i16 {
+    v.as_i16().unwrap_or_else(|| panic!("{what}: {v:?} is not an integer"))
 }
 
 /// The room's collision cache the collision wrappers query (the map is
@@ -39,20 +41,48 @@ pub struct CollisionEnv<'a> {
     pub cache: &'a CollisionCache,
 }
 
+impl CollisionEnv<'_> {
+    /// `tile_flag_at` with one box for every lane: the precomputed map for
+    /// the flag and box where there is one (`CollisionCache::flag_map`),
+    /// else the scan. Bit `l` of the mask is lane `l`'s answer.
+    fn tile_flags(&self, w: i16, h: i16, flag: i16, lanes: impl Iterator<Item = (i16, i16)>) -> u16 {
+        let map = self.cache.flag_map(w, h, flag);
+        let scan = |x: i16, y: i16| self.cache.flag_at(x, y, w, h, flag).expect("tile_flag_at");
+        lanes.enumerate().fold(0u16, |m, (l, (x, y))| {
+            let hit = match &map {
+                Some((map, dx, dy)) => map.get(x + dx, y + dy).unwrap_or_else(|| scan(x, y)),
+                None => scan(x, y),
+            };
+            m | (hit as u16) << l
+        })
+    }
+}
+
 pub unsafe extern "C" fn co_div(out: *mut i32, a: *const i32, b: *const i32) {
-    store_zn(out, zn_div(load_zn(a), load_zn(b)));
+    for i in 0..LANES {
+        *out.add(i) = num(a, i).saturating_div(num(b, i)).as_raw_u32() as i32;
+    }
 }
 pub unsafe extern "C" fn co_rem(out: *mut i32, a: *const i32, b: *const i32) {
-    store_zn(out, zn_rem(load_zn(a), load_zn(b)));
+    for i in 0..LANES {
+        *out.add(i) = (num(a, i) % num(b, i)).as_raw_u32() as i32;
+    }
 }
 pub unsafe extern "C" fn co_sin(out: *mut i32, a: *const i32) {
-    store_zn(out, zn_sin(load_zn(a)));
+    for i in 0..LANES {
+        *out.add(i) = num(a, i).pico8_sin().as_raw_u32() as i32;
+    }
 }
+/// `mget`, per lane: 0 outside the map (as PICO-8; a branch-free kernel
+/// reads there on lanes that do not take the iteration).
 pub unsafe extern "C" fn co_mget(_env: *const c_void, out: *mut i32, x: *const i32, y: *const i32) {
-    store_zn(out, zn_mget(load_zn(x), load_zn(y)));
+    for i in 0..LANES {
+        let tile = CART.mget_whole(whole16(num(x, i), "mget: x"), whole16(num(y, i), "mget: y"));
+        *out.add(i) = P8::from_i16(tile as i16).as_raw_u32() as i32;
+    }
 }
-/// `tile_flag_at` with a UNIFORM box (`w`/`h`/`flag` scalars). Writes the
-/// 16-bit `val` mask to `*out_mask` (known is all-ones).
+/// `tile_flag_at` with a UNIFORM box (`w`/`h`/`flag` raw 16.16 scalars).
+/// Writes the 16-bit `val` mask to `*out_mask` (known is all-ones).
 pub unsafe extern "C" fn co_tile_flag(
     env: *const c_void,
     out_mask: *mut u16,
@@ -63,17 +93,13 @@ pub unsafe extern "C" fn co_tile_flag(
     flag: i32,
 ) {
     let env = &*(env as *const CollisionEnv);
-    let zb = zn_tile_flag_at(
-        env.cache,
-        load_zn(x),
-        load_zn(y),
-        P8::from_raw(w),
-        P8::from_raw(h),
-        P8::from_raw(flag),
-    );
-    *out_mask = zb.val;
+    let (w, h, flag) = (whole16(P8::from_raw(w), "tile_flag_at: w"), whole16(P8::from_raw(h), "tile_flag_at: h"), whole16(P8::from_raw(flag), "tile_flag_at: flag"));
+    let lanes = (0..LANES).map(|i| (whole16(num(x, i), "tile_flag_at: x"), whole16(num(y, i), "tile_flag_at: y")));
+    *out_mask = env.tile_flags(w, h, flag, lanes);
 }
-/// `tile_flag_at` with a PER-LANE box (`w`/`h` are columns).
+/// `tile_flag_at` with a PER-LANE box (`w`/`h` are columns; in the frame an
+/// object is created its hitbox depends on whether `type.init` replaced the
+/// default 8x8): always the scan, the precomputed maps being keyed by the box.
 pub unsafe extern "C" fn co_tile_flag_lanes(
     env: *const c_void,
     out_mask: *mut u16,
@@ -84,15 +110,16 @@ pub unsafe extern "C" fn co_tile_flag_lanes(
     flag: i32,
 ) {
     let env = &*(env as *const CollisionEnv);
-    let zb = zn_tile_flag_at_lanes(
-        env.cache,
-        load_zn(x),
-        load_zn(y),
-        load_zn(w),
-        load_zn(h),
-        P8::from_raw(flag),
-    );
-    *out_mask = zb.val;
+    let flag = whole16(P8::from_raw(flag), "tile_flag_at: flag");
+    let mut m = 0u16;
+    for i in 0..LANES {
+        let (xi, yi) = (whole16(num(x, i), "tile_flag_at: x"), whole16(num(y, i), "tile_flag_at: y"));
+        let (wi, hi) = (whole16(num(w, i), "tile_flag_at: w"), whole16(num(h, i), "tile_flag_at: h"));
+        if env.cache.flag_at(xi, yi, wi, hi, flag).expect("tile_flag_at") {
+            m |= 1 << i;
+        }
+    }
+    *out_mask = m;
 }
 
 /// The doubles' lanes a call-out reads.
@@ -123,10 +150,8 @@ pub unsafe extern "C" fn co_fmget(_env: *const c_void, out: *mut f64, x: *const 
 /// `co_tile_flag`'s, on whole-number coordinates. Writes the 8-lane mask.
 pub unsafe extern "C" fn co_ftile_flag(env: *const c_void, out_mask: *mut u8, x: *const f64, y: *const f64, w: i32, h: i32, flag: i32) {
     let env = &*(env as *const CollisionEnv);
-    let (xs, ys): ([i16; 16], [i16; 16]) = (std::array::from_fn(|i| if i < F_LANES { whole(x, i, "tile_flag_at x") } else { 0 }), std::array::from_fn(|i| if i < F_LANES { whole(y, i, "tile_flag_at y") } else { 0 }));
-    let (xz, yz) = (ZN::from_array(xs.map(P8::from_i16)), ZN::from_array(ys.map(P8::from_i16)));
-    let zb = zn_tile_flag_at(env.cache, xz, yz, P8::from_i16(w as i16), P8::from_i16(h as i16), P8::from_i16(flag as i16));
-    *out_mask = (zb.val & 0xff) as u8;
+    let lanes = (0..F_LANES).map(|i| (whole(x, i, "tile_flag_at x"), whole(y, i, "tile_flag_at y")));
+    *out_mask = env.tile_flags(w as i16, h as i16, flag as i16, lanes) as u8;
 }
 /// `tile_flag_at` with a PER-LANE box.
 pub unsafe extern "C" fn co_ftile_flag_lanes(env: *const c_void, out_mask: *mut u8, x: *const f64, y: *const f64, w: *const f64, h: *const f64, flag: i32) {

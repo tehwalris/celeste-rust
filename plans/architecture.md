@@ -38,8 +38,7 @@ crates/celeste-core     numbers (Pico8Num 16.16, LuaF64, the Arith trait),     d
                         cart data, collision cache, builtins
 crates/celeste-names    FROZEN name tables (FIELD_NAMES order = canonical       deps: -
                         field order; append only)
-crates/celeste-engine   Rt2 blocks, exact keys, lane primitives, the            deps: core, names
-                        widening table
+crates/celeste-engine   Rt2 blocks, exact keys, the widening table          deps: core, names
 celeste-rust (src/)
   frame.rs              the forward (ForwardState: start, resume, extend),
                         trees (grow_tree, TreeFilter), wins, MarkFilter
@@ -149,7 +148,7 @@ own_error(n) or OR(error(args))`, where it was evaluated:
 |---|---|
 | `Flr(x)` | the span covers more than one integer |
 | `Sel(c, t, f)` | `c` lane-undecidable and not known |
-| a fork fragment (`Split`, `SplitInt`; a double's round fork `RSplit`) | the lane spans more parts than enumerated |
+| a fork (`Fork`, of the floors, the whole numbers or a double's rounds) | the lane spans more parts than enumerated (`ForkOk`) |
 | an unrolled loop | its condition still holds after the bound |
 | an operation that can leave the arithmetic's range (`GraphArith::range_error`: 16.16's `+ - * /`, neg, `abs`; the doubles' `+ - * / %`) | `NoWrap`: the exact result left the range (16.16's would wrap or saturate, a double's would not be finite); skipped where static ranges bound it, at most two compares when one operand is a literal |
 | a widening | the slot's containment (`widen::SlotErrors`) |
@@ -169,7 +168,11 @@ fallback to the interpreter.
 
 **The lattice walk** (`trace::walk::room_constant_lattice`) walks (shape,
 region) nodes from the start in parallel rounds, traced against the
-round's lattice snapshot. A region (`--region px,S`, default 16 px, S <= 7
+round's lattice snapshot. A shape is its block's shape hash, the kernels'
+key; its representative is a one-lane block (its own scalars blanked, every
+other one a constant), and a trace starts from its `from_block`: the heap
+the reference engine reads. A frame's outcomes hold integer keys as a
+block does (`block::dense_ints`). A region (`--region px,S`, default 16 px, S <= 7
 because `move`'s loop is unrolled for `|amount| <= 8`) bounds the player's
 whole-pixel x/y, remainder and speed, all checked per lane. A row outside
 every region has no kernel and stops the run.
@@ -475,8 +478,6 @@ verification surface behind it:
 - **Absent-as-zero** fields (a fall floor's or spring's missing `delay`):
   exact modulo raises, guarded syntactically (`cart::check_absent_fields`);
   the clean form, a nil-or-number column, would re-pin everything.
-- **Countdowns are recognized by field name** in the interpreter (the
-  list comes from the widening table).
 - **With `p`, an overlapped floor stores its computed value** because an
   owe failed for unproven reasons; spurious states the concrete search
   refutes.

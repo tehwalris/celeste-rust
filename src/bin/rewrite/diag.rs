@@ -331,7 +331,7 @@ pub fn trajectory(cfg: &Settings, a: TrajectoryArgs) -> Result<()> {
                         }
                     }
                     // Deduplicated on the EXACT state.
-                    let mut exact = celeste_engine::exact::exact_rows(&block, celeste_rust::compiled::ids()).swap_remove(0).into_vec();
+                    let mut exact = celeste_engine::exact::exact_rows(&block).swap_remove(0).into_vec();
                     exact.extend_from_slice(&cell.to_le_bytes());
                     if !seen.insert(exact.into_boxed_slice()) {
                         continue;
