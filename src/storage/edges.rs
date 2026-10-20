@@ -21,7 +21,8 @@ use celeste_core::pico8_num::Pico8Num as P8;
 
 /// The global transfer table: every distinct pair the tree's edges carry,
 /// its id its position; `edges/xfer.bin` (`Rem::encode_pair` each), its
-/// trusted length in `done.txt` (pairs past it are a killed wave's).
+/// trusted length the tree record's trust marker's (`record::done`: pairs
+/// past it are a killed wave's).
 #[derive(Clone)]
 pub struct XferTable<N: Rem = P8> {
     pub(crate) pairs: Vec<N::Pair>,
@@ -85,24 +86,6 @@ impl PairIndex {
         self.slots[i] = id + 1;
         self.n += 1;
     }
-
-    /// The ids from `first` on renumbered (`perm`: per id less `first`, its
-    /// new id less `first`): each one's slot found by its pair, the rest kept.
-    fn renumber<N: Rem>(&mut self, pairs: &[N::Pair], first: usize, perm: &[u32]) {
-        let m = self.slots.len() - 1;
-        let at: Vec<usize> = (first..pairs.len())
-            .map(|id| {
-                let mut i = N::pair_hash(&pairs[id]) as usize & m;
-                while self.slots[i] != id as u32 + 1 {
-                    i = (i + 1) & m;
-                }
-                i
-            })
-            .collect();
-        for (k, i) in at.into_iter().enumerate() {
-            self.slots[i] = first as u32 + perm[k] + 1;
-        }
-    }
 }
 
 fn xfer_path(dir: &Path) -> PathBuf {
@@ -110,8 +93,8 @@ fn xfer_path(dir: &Path) -> PathBuf {
 }
 
 impl<N: Rem> XferTable<N> {
-    /// The tree's table (`dir` = `<level>/edges`) as its done marker trusts
-    /// it; empty without one.
+    /// The tree's table (`dir`: the level's tree) as its trust marker
+    /// trusts it; empty without one.
     pub(crate) fn load(dir: &Path) -> Result<Self> {
         let pairs = Self::load_pairs(dir)?;
         let mut index = PairIndex::default();
@@ -123,12 +106,13 @@ impl<N: Rem> XferTable<N> {
 
     /// The pairs alone, as `load` reads them (no index: a big tree has ~4M).
     pub(crate) fn load_pairs(dir: &Path) -> Result<Vec<N::Pair>> {
-        let n = match read_done(dir)? {
+        let n = match super::record::done(dir)? {
             Some(d) => d.xfers,
             None => 0,
         };
-        let b = if n > 0 { std::fs::read(xfer_path(dir)).with_context(|| xfer_path(dir).display().to_string())? } else { Vec::new() };
-        ensure!(b.len() >= n * N::PAIR_BYTES, "{}: {} pairs, {} trusted", xfer_path(dir).display(), b.len() / N::PAIR_BYTES, n);
+        let p = xfer_path(&dir.join("edges"));
+        let b = if n > 0 { std::fs::read(&p).with_context(|| p.display().to_string())? } else { Vec::new() };
+        ensure!(b.len() >= n * N::PAIR_BYTES, "{}: {} pairs, {} trusted", p.display(), b.len() / N::PAIR_BYTES, n);
         Ok(b[..n * N::PAIR_BYTES].chunks_exact(N::PAIR_BYTES).map(N::decode_pair).collect())
     }
 
@@ -151,8 +135,9 @@ impl<N: Rem> XferTable<N> {
     }
 
     /// The workers' NEW pairs (`tails`: what each worker's table gained
-    /// since its last merge) merged in, in value order; per tail its pairs'
-    /// ids, PROVISIONAL until the wave's end (`canonical`).
+    /// since its last merge: a slice's) merged in, in value order; per tail
+    /// its pairs' ids. Final: the pairs first met in a slice are a function
+    /// of the frame, so their ids are.
     pub(crate) fn merge(&mut self, tails: &[&[N::Pair]]) -> Vec<Vec<u32>> {
         let mut new: Vec<N::Pair> = tails.iter().flat_map(|t| t.iter()).filter(|p| self.index.find::<N>(&self.pairs, p).is_none()).copied().collect();
         new.sort_unstable();
@@ -166,30 +151,6 @@ impl<N: Rem> XferTable<N> {
             self.index.insert::<N>(&self.pairs, self.pairs.len() as u32 - 1);
         }
         tails.iter().map(|t| t.iter().map(|p| self.index.find::<N>(&self.pairs, p).expect("a merged pair")).collect()).collect()
-    }
-
-    /// The pairs from `first` on (a wave's) in CANONICAL order: by the edges
-    /// the frame recorded with each (`counts[id - first]`), most first, then
-    /// by content - a function of the frame alone, the frequent transfers
-    /// with the short varints (~3% smaller edge files). Returns per old id
-    /// less `first` its new one (`None`: in order already); ids below stay.
-    pub(crate) fn canonical(&mut self, first: usize, counts: &[u64]) -> Option<Vec<u32>> {
-        let new = &self.pairs[first..];
-        assert_eq!(counts.len(), new.len(), "a count per new transfer");
-        let mut order: Vec<u32> = (0..new.len() as u32).collect();
-        order.sort_unstable_by(|&a, &b| counts[b as usize].cmp(&counts[a as usize]).then_with(|| new[a as usize].cmp(&new[b as usize])));
-        if order.iter().enumerate().all(|(i, &o)| i as u32 == o) {
-            return None;
-        }
-        let mut perm = vec![0u32; new.len()];
-        for (to, &from) in order.iter().enumerate() {
-            perm[from as usize] = to as u32;
-        }
-        let sorted: Vec<N::Pair> = order.iter().map(|&i| new[i as usize]).collect();
-        self.index.renumber::<N>(&self.pairs, first, &perm);
-        self.pairs.truncate(first);
-        self.pairs.extend(sorted);
-        Some(perm)
     }
 
     /// Write the pairs merged since the last flush past the trusted length
@@ -397,35 +358,79 @@ impl Decoder {
     }
 }
 
-/// A level's recorded graph up to a horizon, mapped: per frame its edge
-/// file (none past a dead frontier), and the global transfer table.
-pub struct EdgeStore<N: Rem = P8> {
+/// A level's edge files, mapped: per frame its file (none past a dead
+/// frontier, and none at frame 0: nothing leads into it). The forward
+/// holds one, a frame added as it is trusted (the re-pushes read it).
+#[derive(Default)]
+pub(crate) struct EdgeFiles {
     frames: Vec<Option<EdgeFile>>,
+}
+
+impl EdgeFiles {
+    /// Frames `1..=last`'s files under `dir` (`<level>/edges`).
+    pub(crate) fn open(dir: &Path, last: u32) -> Result<Self> {
+        let mut files = EdgeFiles { frames: vec![None] };
+        for f in 1..=last {
+            files.add_frame(dir, f)?;
+        }
+        Ok(files)
+    }
+
+    /// Frame `frame`'s file (the next), if it exists.
+    pub(crate) fn add_frame(&mut self, dir: &Path, frame: u32) -> Result<()> {
+        if self.frames.is_empty() {
+            self.frames.push(None);
+        }
+        ensure!(self.frames.len() as u32 == frame, "the edge file of frame {frame} added after {} frames", self.frames.len());
+        let p = file_path(dir, frame);
+        self.frames.push(if p.exists() { Some(EdgeFile::open(&p, frame)?) } else { None });
+        Ok(())
+    }
+
+    fn file(&self, frame: u32) -> Option<&EdgeFile> {
+        self.frames.get(frame as usize).and_then(|x| x.as_ref())
+    }
+
+    /// Target region `region`'s segments at frame `frame`.
+    pub(crate) fn segments(&self, frame: u32, region: u32) -> Vec<SegRef<'_>> {
+        self.file(frame).into_iter().flat_map(|f| f.segs_of(region).iter().map(move |h| f.seg(h))).collect()
+    }
+
+    /// The target regions holding edges that leave source region `source`
+    /// at frame `frame` (the out-edge lookup), sorted, distinct.
+    pub(crate) fn targets_of(&self, frame: u32, source: u32) -> Vec<u32> {
+        let mut v: Vec<u32> = self.file(frame).into_iter().flat_map(|f| f.targets().get(&source).into_iter().flatten().copied()).collect();
+        v.sort_unstable();
+        v.dedup();
+        v
+    }
+}
+
+/// A level's recorded graph up to a horizon, mapped: its edge files and the
+/// global transfer table.
+pub struct EdgeStore<N: Rem = P8> {
+    files: EdgeFiles,
     xfers: Vec<N::Pair>,
     pub edges: u64,
     pub(crate) bytes: u64,
 }
 
 impl<N: Rem> EdgeStore<N> {
-    /// Map frames `1..=horizon`'s edge files under `dir` (`<level>/edges`).
+    /// Map frames `1..=horizon`'s edge files of the tree in `dir` (a
+    /// level's), its transfers as its record trusts them.
     pub fn open(dir: &Path, horizon: u32) -> Result<Self> {
-        let mut frames: Vec<Option<EdgeFile>> = vec![None];
+        let files = EdgeFiles::open(&dir.join("edges"), horizon)?;
         let (mut edges, mut bytes) = (0u64, 0u64);
-        for f in 1..=horizon {
-            let p = file_path(dir, f);
-            let file = if p.exists() { Some(EdgeFile::open(&p, f)?) } else { None };
-            if let Some(file) = &file {
-                edges += file.head.segs.iter().map(|s| s.edges).sum::<u64>();
-                bytes += file.file.len();
-            }
-            frames.push(file);
+        for file in files.frames.iter().flatten() {
+            edges += file.head.segs.iter().map(|s| s.edges).sum::<u64>();
+            bytes += file.file.len();
         }
         let xfers = XferTable::<N>::load_pairs(dir)?;
-        Ok(EdgeStore { frames, xfers, edges, bytes })
+        Ok(EdgeStore { files, xfers, edges, bytes })
     }
 
     fn file(&self, frame: u32) -> Option<&EdgeFile> {
-        self.frames.get(frame as usize).and_then(|x| x.as_ref())
+        self.files.file(frame)
     }
 
     pub fn pair(&self, xfer: u32) -> Option<N::Pair> {
@@ -443,7 +448,7 @@ impl<N: Rem> EdgeStore<N> {
     /// Per target region the first frame with edges into it.
     pub(crate) fn first_frames(&self) -> FxHashMap<u32, u32> {
         let mut m: FxHashMap<u32, u32> = FxHashMap::default();
-        for (f, file) in self.frames.iter().enumerate().rev() {
+        for (f, file) in self.files.frames.iter().enumerate().rev() {
             for h in file.iter().flat_map(|x| &x.head.segs) {
                 m.insert(h.region, f as u32);
             }
@@ -461,7 +466,7 @@ impl<N: Rem> EdgeStore<N> {
     }
 
     pub(crate) fn segments(&self, frame: u32, region: u32) -> Vec<SegRef<'_>> {
-        self.file(frame).into_iter().flat_map(|f| f.segs_of(region).iter().map(move |h| f.seg(h))).collect()
+        self.files.segments(frame, region)
     }
 
     /// Every segment of frame `frame`, by region.
@@ -474,10 +479,7 @@ impl<N: Rem> EdgeStore<N> {
     /// The target regions holding edges that leave source region `source`
     /// at frame `frame` (the out-edge lookup), sorted, distinct.
     pub(crate) fn targets_of(&self, frame: u32, source: u32) -> Vec<u32> {
-        let mut v: Vec<u32> = self.file(frame).into_iter().flat_map(|f| f.targets().get(&source).into_iter().flatten().copied()).collect();
-        v.sort_unstable();
-        v.dedup();
-        v
+        self.files.targets_of(frame, source)
     }
 
     /// Every edge of frame `frame`, each segment's folded into an
@@ -541,45 +543,6 @@ impl<N: Rem> EdgeStore<N> {
     }
 }
 
-/// THE TREE'S ONE TRUST MARKER (`<level>/edges/done.txt`): the last frame
-/// whose files are all complete - its frame, hull, edge and out files, all
-/// written before it - and the transfer table's trusted
-/// length. A frame past it is a killed run's (`resume` discards it).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct Done {
-    pub(crate) frame: u32,
-    pub(crate) xfers: usize,
-}
-
-fn read_done(dir: &Path) -> Result<Option<Done>> {
-    let p = dir.join("done.txt");
-    let s = match std::fs::read_to_string(&p) {
-        Ok(s) => s,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(e).with_context(|| p.display().to_string()),
-    };
-    let w: Vec<&str> = s.split_whitespace().collect();
-    let bad = || anyhow::anyhow!("{}: not a done marker: {s:?}", p.display());
-    match w[..] {
-        [frame, "xfers", n] => Ok(Some(Done { frame: frame.parse().map_err(|_| bad())?, xfers: n.parse().map_err(|_| bad())? })),
-        _ => Err(bad()),
-    }
-}
-
-/// The last frame whose files are complete; `None`: no marker.
-pub(crate) fn done_frame(dir: &Path) -> Option<u32> {
-    read_done(dir).ok().flatten().map(|d| d.frame)
-}
-
-/// Trust frame `frame` and the first `xfers` transfers: the frame's LAST write.
-pub(crate) fn set_done(dir: &Path, frame: u32, xfers: usize) -> Result<()> {
-    std::fs::create_dir_all(dir)?;
-    let tmp = dir.join("done.tmp");
-    std::fs::write(&tmp, format!("{frame} xfers {xfers}\n"))?;
-    std::fs::rename(&tmp, dir.join("done.txt"))?;
-    Ok(())
-}
-
 /// The frame an edge file's name is of (`f{frame}.bin`): the digits after
 /// the `f`, however many (the names pad to 3: `f1000.bin` is frame 1000).
 pub(crate) fn frame_of_name(name: &str) -> Option<u32> {
@@ -629,20 +592,22 @@ pub(crate) fn segments_of(edges: &[(Sk, Sk, u32)]) -> Result<(Vec<Segment>, Vec<
 }
 
 /// A tree's edge files from edges `(source, target, global transfer)` per
-/// frame and its transfer table `pairs` (the backward's tests).
+/// frame and its transfer table `pairs`, under the level's tree `dir`, its
+/// record trusting them (the backward's tests).
 #[cfg(test)]
 pub(crate) fn write_test_edges(dir: &Path, frames: &[(u32, Vec<(Sk, Sk, u32)>)], pairs: &[crate::search::arc_edges::Pair]) -> Result<()> {
+    let edges = dir.join("edges");
     let mut xt = XferTable::<P8>::default();
     xt.merge(&[pairs]);
-    xt.flush(dir)?;
+    xt.flush(&edges)?;
     ensure!(xt.pairs.len() == pairs.len(), "the test's transfer pairs are not distinct");
     let mut last = 0;
-    for (frame, edges) in frames {
-        let (segs, sources) = segments_of(edges)?;
-        write_file(&file_path(dir, *frame), *frame, segs, sources, None)?;
+    for (frame, es) in frames {
+        let (segs, sources) = segments_of(es)?;
+        write_file(&file_path(&edges, *frame), *frame, segs, sources, None)?;
         last = last.max(*frame);
     }
-    set_done(dir, last, pairs.len())
+    super::record::set_done(dir, last, pairs.len())
 }
 
 #[cfg(test)]
@@ -650,31 +615,25 @@ mod tests {
     use super::*;
     use crate::search::arc_edges::Pair;
 
-    /// A wave's new transfers get their CANONICAL ids (by edge count, then
-    /// content): the permutation, the table and its index agree, the older
-    /// ids stay, and a table in order is left alone.
+    /// A slice's new transfers get their final ids at its merge, in value
+    /// order after every pair before; a pair held keeps its id; the ids
+    /// returned name the pairs, and the index finds them.
     #[test]
-    fn a_waves_new_transfers_are_numbered_by_count_and_content() {
+    fn a_slices_new_transfers_get_final_ids_in_value_order() {
         let pair = |v: i32| {
             let ax = crate::search::arc_edges::AxisXfer { lo: 0, hi: 1 << 16, tag: 0, val: v };
             (ax, ax)
         };
         let mut t = XferTable::<P8>::default();
         t.merge(&[&[pair(5), pair(1)]]);
-        assert_eq!(t.canonical(0, &[2, 2]), None, "one merge is in order");
-        let first = t.pairs.len();
         // Two slices: the second meets smaller pairs (and one already held).
         let ids_a = t.merge(&[&[pair(9), pair(7)], &[pair(8)]]);
         let ids_b = t.merge(&[&[pair(3), pair(5)]]);
-        // Met as 7, 8, 9, 3; 9 the most edges, 7 and 3 tied.
-        let perm = t.canonical(first, &[1, 0, 5, 1]).expect("out of order");
-        assert_eq!(t.pairs, [1, 5, 9, 3, 7, 8].map(pair));
-        let id = |x: u32| if (x as usize) < first { x } else { first as u32 + perm[x as usize - first] };
+        assert_eq!(t.pairs, [1, 5, 7, 8, 9, 3].map(pair));
         for (p, x) in [pair(9), pair(7), pair(8), pair(3), pair(5)].iter().zip(ids_a.concat().into_iter().chain(ids_b.concat())) {
-            assert_eq!(t.pairs[id(x) as usize], *p);
-            assert_eq!(t.index.find::<P8>(&t.pairs, p), Some(id(x)));
+            assert_eq!(t.pairs[x as usize], *p);
+            assert_eq!(t.index.find::<P8>(&t.pairs, p), Some(x));
         }
-        assert_eq!(t.canonical(first, &[5, 1, 1, 0]), None, "in order already");
     }
 
     /// Edge file names past frame 999 (split frame: step 1000 is frame 500).
@@ -685,19 +644,19 @@ mod tests {
             let name = p.file_name().and_then(|s| s.to_str()).expect("a name");
             assert_eq!(frame_of_name(name), Some(frame), "{name}");
         }
-        for name in ["done.txt", "xfer.bin", "f.bin", "fx12.bin", "f12x.bin"] {
+        for name in ["xfer.bin", "f.bin", "fx12.bin", "f12x.bin"] {
             assert_eq!(frame_of_name(name), None, "{name}");
         }
         let dir = std::env::temp_dir().join(format!("celeste-edge-names-{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("tmp");
-        for f in ["f999.bin", "f1000.bin", "f1000.tmp", "f0998.bin", "done.txt"] {
+        for f in ["f999.bin", "f1000.bin", "f1000.tmp", "f0998.bin", "xfer.bin"] {
             std::fs::write(dir.join(f), b"").expect("write");
         }
         discard_after(&dir, 999).expect("discard");
         let mut left: Vec<String> = std::fs::read_dir(&dir).expect("ls").map(|e| e.expect("e").file_name().to_string_lossy().into_owned()).collect();
         left.sort();
         std::fs::remove_dir_all(&dir).expect("cleanup");
-        assert_eq!(left, ["done.txt", "f0998.bin", "f999.bin"]);
+        assert_eq!(left, ["f0998.bin", "f999.bin", "xfer.bin"]);
     }
 
     /// A frame's edges come back from its file: every edge by a scan, a

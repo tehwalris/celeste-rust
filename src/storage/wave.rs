@@ -1,7 +1,8 @@
 //! THE WAVE: one frame of the hull forward (plans/architecture.md "The
 //! forward: hulls and storage"): NEW states through the kernels (`unit`),
-//! OLD ones re-pushed, region jobs (`route`) overlapping the units, the
-//! frame's end. A function of the frame (pushes merge order-free).
+//! OLD ones re-pushed along their recorded edges (read by target: a unit a
+//! segment), region jobs (`route`) overlapping the units, the frame's end.
+//! A function of the frame (pushes merge order-free).
 
 use crate::search::hull::{AccOf, HullOf};
 use anyhow::{anyhow, ensure, Result};
@@ -169,18 +170,21 @@ fn unit_lanes(lanes: u64) -> usize {
 
 /// A KERNEL unit: whole entries of one shape of the new layer (at most
 /// `unit_lanes` + 63 states) and its first state's place; a RE-PUSH unit:
-/// whole entries of the `layer`th list of old states.
+/// for the `layer`th list of old states, whole segments `(target region,
+/// segment)` of the edge file of the layer's next frame (`frame`), about
+/// `REPUSH_UNIT` bundles.
 enum UnitSpec {
     Kernel { entries: std::ops::Range<usize>, state: usize, lanes: u32 },
-    Repush { layer: usize, entries: std::ops::Range<usize>, states: usize },
+    Repush { layer: usize, frame: u32, segs: Vec<(u32, u32)>, bundles: usize },
 }
 
 impl UnitSpec {
-    /// The states it runs (its weight in a slice).
+    /// Its weight in a slice: the states it runs; a re-push unit's bundles
+    /// as the lanes that emit as many (`REPUSH_PER_LANE`).
     fn lanes(&self) -> usize {
         match self {
             UnitSpec::Kernel { lanes, .. } => *lanes as usize,
-            UnitSpec::Repush { states, .. } => *states,
+            UnitSpec::Repush { bundles, .. } => bundles.div_ceil(REPUSH_PER_LANE),
         }
     }
 }
@@ -213,25 +217,56 @@ fn units_of<N: Rem>(layer: &Layer<N>, unit: usize) -> Vec<UnitSpec> {
     out
 }
 
-/// States per RE-PUSH unit (whole entries: up to 63 more); it runs no kernel.
-const REPUSH_UNIT: usize = 1 << 14;
+/// Bundles per RE-PUSH unit (whole segments: one more may pass it).
+const REPUSH_UNIT: usize = 1 << 16;
 
-fn repush_units_of<N: Rem>(by: &ByLayer<N>) -> Vec<UnitSpec> {
+/// A re-push unit's bundles per slice lane: about what a kernel lane emits
+/// (26 at r62h57's f56), so a slice holds about as many records either way.
+const REPUSH_PER_LANE: usize = 32;
+
+/// The RE-PUSH units: per layer of old states, the segments of every target
+/// region their source regions reach at the layer's next frame (the edge
+/// file's source index), in order, cut into units of whole segments.
+fn repush_units_of<N: Rem>(by: &ByLayer<N>, files: &super::edges::EdgeFiles) -> Vec<UnitSpec> {
     let mut out = Vec::new();
     for (layer, old) in by.iter().enumerate() {
-        let n = old.entries.len();
-        let first = |e: usize| old.entries.get(e).map_or(old.len(), |x| x.first as usize);
-        let mut a = 0usize;
-        while a < n {
-            let mut b = a + 1;
-            while b < n && first(b) - first(a) < REPUSH_UNIT {
-                b += 1;
+        let frame = old.layer as u32 + 1;
+        let mut sources: Vec<u32> = old.entries.iter().map(|e| e.region).collect();
+        sources.dedup();
+        let mut targets: Vec<u32> = sources.iter().flat_map(|&r| files.targets_of(frame, r)).collect();
+        targets.sort_unstable();
+        targets.dedup();
+        let (mut segs, mut bundles) = (Vec::new(), 0usize);
+        for t in targets {
+            for (k, seg) in files.segments(frame, t).iter().enumerate() {
+                segs.push((t, k as u32));
+                bundles += seg.bundles as usize;
+                if bundles >= REPUSH_UNIT {
+                    out.push(UnitSpec::Repush { layer, frame, segs: std::mem::take(&mut segs), bundles });
+                    bundles = 0;
+                }
             }
-            out.push(UnitSpec::Repush { layer, entries: a..b, states: first(b) - first(a) });
-            a = b;
+        }
+        if !segs.is_empty() {
+            out.push(UnitSpec::Repush { layer, frame, segs, bundles });
         }
     }
     out
+}
+
+/// Per layer of old states, its entries by (shape, key): their regions and
+/// entry numbers (what a re-push unit looks its bundles' sources up in).
+fn grown_index<N: Rem>(by: &ByLayer<N>) -> Vec<rustc_hash2::FxHashMap<(u32, Key), Vec<(u32, u32)>>> {
+    let slots = GEOMETRY.slots;
+    by.iter()
+        .map(|old| {
+            let mut m: rustc_hash2::FxHashMap<(u32, Key), Vec<(u32, u32)>> = Default::default();
+            for (i, e) in old.entries.iter().enumerate() {
+                m.entry((e.region / slots, e.key)).or_default().push((e.region, i as u32));
+            }
+            m
+        })
+        .collect()
 }
 
 /// Input lanes per SLICE (slices cut the segments): units run at most two
@@ -266,8 +301,9 @@ pub(crate) struct WaveCtx<'a, N: Rem = P8> {
     pub(crate) frame: u32,
     /// The level's `edges/` dir: edges are recorded only with one.
     pub(crate) edges_dir: Option<&'a std::path::Path>,
-    /// The tree's out-edges (`None`: a frontier without old states).
-    pub(crate) outs: Option<&'a super::out::OutStore>,
+    /// The tree's edge files (the re-pushes read them; `None`: a frontier
+    /// without old states).
+    pub(crate) edges: Option<&'a super::edges::EdgeFiles>,
     /// The forward's skeletons, registered by the emissions: the next layer's.
     pub(crate) skeletons: &'a Skeletons<N>,
     /// The tree's ceiling (its level -1 horizon), for `frame::not_expanded`.
@@ -331,9 +367,8 @@ fn run_unit<N: Rem>(engine: &dyn FrameStep<N>, u: u32, entries: std::ops::Range<
 
 /// The wave's units and slices over a frontier.
 struct Plan {
+    /// The kernel units, then the re-push units.
     units: Vec<UnitSpec>,
-    /// The kernel units' (the first `n_kernel`; re-push units after).
-    n_kernel: usize,
     slices: Vec<std::ops::Range<usize>>,
     /// Per unit its slice.
     slice_of: Vec<u32>,
@@ -342,17 +377,18 @@ struct Plan {
 }
 
 impl Plan {
-    fn of<N: Rem>(front: &Frontier<N>) -> Plan {
+    fn of<N: Rem>(front: &Frontier<N>, files: Option<&super::edges::EdgeFiles>) -> Plan {
         let layer = &front.new;
         let mut units = units_of(layer, unit_lanes(layer.states()));
-        let n_kernel = units.len();
-        units.extend(repush_units_of(&front.old));
+        if let Some(files) = files {
+            units.extend(repush_units_of(&front.old, files));
+        }
         let slices = slices_of(&units);
         let mut slice_of = vec![0u32; units.len()];
         for (k, r) in slices.iter().enumerate() {
             slice_of[r.clone()].fill(k as u32);
         }
-        Plan { units, n_kernel, slices, slice_of, starts: layer.set.entry_starts() }
+        Plan { units, slices, slice_of, starts: layer.set.entry_starts() }
     }
 }
 
@@ -368,8 +404,11 @@ struct Shared<'a, N: Rem> {
     visited: &'a VisitedSet<N>,
     /// The tree's shapes by index (the frontier's).
     shapes: &'a [u64],
-    out_blocks: &'a [std::sync::Mutex<Vec<OutBlock>>],
-    outs: Option<&'a super::out::OutStore>,
+    /// The tree's edge files, the old states by key (`grown_index`), the
+    /// tree's transfers (the re-pushes').
+    files: Option<&'a super::edges::EdgeFiles>,
+    index: &'a [rustc_hash2::FxHashMap<(u32, Key), Vec<(u32, u32)>>],
+    base: &'a XferTable<N>,
     spool: Option<&'a super::scratch::Scratch>,
     record: bool,
     /// The tree's transfers before the frame (new ones from here).
@@ -397,7 +436,6 @@ fn worker<N: Rem>(sh: &Shared<N>, sink: &mut UnitSink<N>, sc: &mut super::route:
     let mut idle_spins = 0u32;
     let mut us = UnitScratch::default();
     let mut rs = RepushScratch::default();
-    let mut z: Option<zstd::bulk::Compressor<'static>> = None;
     loop {
         if pipe.failed.load(Ordering::Acquire) {
             stop.1 = true;
@@ -431,21 +469,11 @@ fn worker<N: Rem>(sh: &Shared<N>, sink: &mut UnitSink<N>, sc: &mut super::route:
             match &plan.units[u] {
                 UnitSpec::Kernel { entries, state, .. } => {
                     run_unit(sh.engine, u as u32, entries.clone(), *state, &sh.front.new, &sh.front.hulls, &plan.starts, sh.shapes, sink, &mut us, frame - 1, sh.ceiling, sh.s)?;
-                    let to = sink.stats.tick_start();
-                    let mut v = Vec::new();
-                    for (raw, prov) in sink.take_out_blocks() {
-                        v.push(if prov {
-                            OutBlock::Raw(raw)
-                        } else {
-                            OutBlock::Sealed(super::out::Sealed::of::<N>(&raw, z.get_or_insert_with(|| zstd::bulk::Compressor::new(1).expect("a zstd compressor")))?.map(|x| x.spill(sh.spool)).transpose()?)
-                        });
-                    }
-                    *sh.out_blocks[u].lock().expect("an out block") = v;
-                    sink.stats.tick(S::PhOutBlocks, to);
                 }
-                UnitSpec::Repush { layer, entries, .. } => {
+                UnitSpec::Repush { layer, frame: f, segs, .. } => {
                     let tr = sink.stats.tick_start();
-                    let n = run_repush(u as u32, &sh.front.old[*layer], entries.clone(), sh.outs.expect("checked above"), sink, &mut rs)?;
+                    let files = sh.files.expect("re-push units without the tree's edge files");
+                    let n = run_repush(u as u32, &sh.front.old[*layer], &sh.index[*layer], files, *f, segs, sh.visited, sh.base, sink, &mut rs)?;
                     sink.stats.add(S::RepushEdges, n);
                     sink.stats.tick(S::PhRepush, tr);
                 }
@@ -471,7 +499,7 @@ fn worker<N: Rem>(sh: &Shared<N>, sink: &mut UnitSink<N>, sc: &mut super::route:
     }
     crate::compiled::dispatch::fold_hits();
     stop.1 = true;
-    for (k, n) in [S::RepushBlocks, S::RepushRaw, S::RepushEntries, S::RepushRead].into_iter().zip(rs.read) {
+    for (k, n) in [S::RepushSegments, S::RepushRaw, S::RepushRecords, S::RepushGrown].into_iter().zip(rs.read) {
         sink.stats.add(k, n);
     }
     Ok(())
@@ -481,12 +509,8 @@ fn worker<N: Rem>(sh: &Shared<N>, sink: &mut UnitSink<N>, sc: &mut super::route:
 struct Piped<N: Rem> {
     /// Per route its state (touched states, segments).
     states: Vec<RouteState<N>>,
-    /// The frame's new transfers (global ids from the table's length on),
-    /// and the edges recorded with each.
+    /// The frame's new transfers (global ids from the table's length on).
     fresh: XferTable<N>,
-    xfer_counts: Vec<u64>,
-    /// The kernel units' out blocks.
-    out_blocks: Vec<std::sync::Mutex<Vec<OutBlock>>>,
     /// The workers' stats, merged.
     stats: Stats,
 }
@@ -495,7 +519,7 @@ struct Piped<N: Rem> {
 /// one sink each (`UnitSink`), no barrier but its end; then the workers'
 /// transfers and stats collected.
 #[allow(clippy::too_many_arguments)]
-fn pipeline<N: Rem>(engine: &dyn FrameStep<N>, front: &Frontier<N>, plan: &Plan, visited: &VisitedSet<N>, base: &XferTable<N>, skeletons: &Skeletons<N>, prov: &Provisional<N>, filters: Filters<N>, frame: u32, outs: Option<&super::out::OutStore>, spool: Option<&super::scratch::Scratch>, record: bool, ceiling: Option<u32>) -> Result<Piped<N>> {
+fn pipeline<N: Rem>(engine: &dyn FrameStep<N>, front: &Frontier<N>, plan: &Plan, visited: &VisitedSet<N>, base: &XferTable<N>, skeletons: &Skeletons<N>, prov: &Provisional<N>, filters: Filters<N>, frame: u32, files: Option<&super::edges::EdgeFiles>, spool: Option<&super::scratch::Scratch>, record: bool, ceiling: Option<u32>) -> Result<Piped<N>> {
     let (level, s) = (engine.level(), &engine.settings());
     let workers = s.threads();
     let routes = Routes::default();
@@ -503,9 +527,7 @@ fn pipeline<N: Rem>(engine: &dyn FrameStep<N>, front: &Frontier<N>, plan: &Plan,
     // frame's end; the gather numbers the workers' new pairs (`Gather::fresh`).
     let xtabs: Vec<std::sync::RwLock<Vec<N::Pair>>> = (0..workers).map(|_| Default::default()).collect();
     let xfers_before = base.pairs.len();
-    let mut sinks: Vec<UnitSink<N>> = (0..workers).map(|w| UnitSink::new(visited, &routes, skeletons, prov, filters, frame, level, w as u32, base, &xtabs[w], record, s)).collect();
-    // Per kernel unit its out block (raw while a target key is provisional).
-    let out_blocks: Vec<std::sync::Mutex<Vec<OutBlock>>> = (0..plan.n_kernel).map(|_| Default::default()).collect();
+    let mut sinks: Vec<UnitSink<N>> = (0..workers).map(|w| UnitSink::new(visited, &routes, skeletons, prov, filters, frame, level, w as u32, base, &xtabs[w], s)).collect();
     let mut scratch: Vec<super::route::JobScratch> = (0..workers).map(|_| super::route::JobScratch::default()).collect();
     let pipe: Pipe<N> = Pipe {
         xtabs: &xtabs,
@@ -521,7 +543,8 @@ fn pipeline<N: Rem>(engine: &dyn FrameStep<N>, front: &Frontier<N>, plan: &Plan,
         failed: std::sync::atomic::AtomicBool::new(false),
     };
     let shapes: Vec<u64> = visited.shapes().to_vec();
-    let sh = Shared { engine, s, frame, plan, front, pipe: &pipe, routes: &routes, visited, shapes: &shapes, out_blocks: &out_blocks, outs, spool, record, xfers_before: xfers_before as u32, ceiling };
+    let index = grown_index(&front.old);
+    let sh = Shared { engine, s, frame, plan, front, pipe: &pipe, routes: &routes, visited, shapes: &shapes, files, index: &index, base, spool, record, xfers_before: xfers_before as u32, ceiling };
     std::thread::scope(|scope| -> Result<()> {
         let handles: Vec<_> = sinks
             .iter_mut()
@@ -551,25 +574,19 @@ fn pipeline<N: Rem>(engine: &dyn FrameStep<N>, front: &Frontier<N>, plan: &Plan,
         crate::metrics::mem_phase(&format!("f{frame} units and region jobs"));
     }
     let Pipe { gather, states, .. } = pipe;
-    let Gather { fresh, remaps, .. } = gather.into_inner().expect("the gather");
+    let Gather { fresh, .. } = gather.into_inner().expect("the gather");
     let states: Vec<RouteState<N>> = states
         .into_inner()
         .expect("the routes")
         .into_iter()
         .map(|a| std::sync::Arc::try_unwrap(a).map_err(|_| anyhow::anyhow!("a route still shared")).and_then(|m| m.into_inner().map_err(|_| anyhow::anyhow!("a route lock poisoned"))))
         .collect::<Result<_>>()?;
-    let mut xfer_counts = vec![0u64; fresh.pairs.len()];
     let mut stats = Stats::default();
-    for (sink, remap) in sinks.iter_mut().zip(&remaps) {
-        for (&n, &g) in sink.xfer_counts().iter().zip(remap) {
-            if g as usize >= xfers_before {
-                xfer_counts[g as usize - xfers_before] += n;
-            }
-        }
+    for sink in &mut sinks {
         sink.finish();
         stats.merge(&sink.stats);
     }
-    Ok(Piped { states, fresh, xfer_counts, out_blocks, stats })
+    Ok(Piped { states, fresh, stats })
 }
 
 /// The new shapes of `states` numbered (in hash order): a route's with
@@ -638,32 +655,6 @@ fn seal<N: Rem>(states: &mut [RouteState<N>], regions: &[Option<u32>], finals: &
     Ok(new)
 }
 
-/// THE OUT FILE, on a thread of its own beside the frame's end
-/// (provisional blocks with final keys): its bytes.
-fn out_file_writer<N: Rem>(path: std::path::PathBuf, frame: u32, out_blocks: Vec<std::sync::Mutex<Vec<OutBlock>>>, finals: std::sync::Arc<FxHashMap<Key, Key>>, spool: Option<std::sync::Arc<super::scratch::Scratch>>, threads: usize) -> Result<std::thread::JoinHandle<Result<u64>>> {
-    Ok(std::thread::Builder::new().name("out file".into()).spawn(move || -> Result<u64> {
-        let blocks = par_map(&out_blocks, threads, |b| -> Result<Vec<super::out::Sealed>> {
-            let mut out = Vec::new();
-            for x in std::mem::take(&mut *b.lock().expect("an out block")) {
-                match x {
-                    OutBlock::Sealed(x) => out.extend(x),
-                    OutBlock::Raw(raw) => {
-                        let mut fixed = Vec::new();
-                        super::out::fixup::<N>(&raw, &finals, &mut fixed)?;
-                        out.extend(super::out::Sealed::of::<N>(&fixed, &mut zstd::bulk::Compressor::new(1)?)?);
-                    }
-                }
-            }
-            Ok(out)
-        });
-        let mut all: Vec<super::out::Sealed> = Vec::new();
-        for b in blocks {
-            all.extend(b?);
-        }
-        super::out::write(&path, frame, &all, spool.as_deref())
-    })?)
-}
-
 /// A route's segments for the edge file: its jobs' (final once sealed,
 /// by (0, slice)) and its waited ones (by slice).
 type RouteSegs = (u32, Vec<((u8, u32), super::edges::Segment)>, Vec<(u32, super::edges::Segment)>);
@@ -672,12 +663,11 @@ type RouteSegs = (u32, Vec<((u8, u32), super::edges::Segment)>, Vec<(u32, super:
 /// transfers flushed, the waited segments made final (`route::reencode`,
 /// one job each), every route's in slice order; its bytes.
 #[allow(clippy::too_many_arguments)]
-fn edge_file_writer<N: Rem>(dir: std::path::PathBuf, frame: u32, flush: super::edges::Flush, routes_segs: Vec<RouteSegs>, src_index: Vec<(u32, Vec<u32>)>, renumber: Option<(u32, Vec<u32>)>, finals: std::sync::Arc<FxHashMap<Key, Key>>, spool: Option<std::sync::Arc<super::scratch::Scratch>>, threads: usize) -> Result<std::thread::JoinHandle<Result<u64>>> {
+fn edge_file_writer<N: Rem>(dir: std::path::PathBuf, frame: u32, flush: super::edges::Flush, routes_segs: Vec<RouteSegs>, src_index: Vec<(u32, Vec<u32>)>, finals: std::sync::Arc<FxHashMap<Key, Key>>, spool: Option<std::sync::Arc<super::scratch::Scratch>>, threads: usize) -> Result<std::thread::JoinHandle<Result<u64>>> {
     Ok(std::thread::Builder::new().name("edge file".into()).spawn(move || -> Result<u64> {
         flush.write(&dir)?;
-        let renumber = renumber.as_ref().map(|(first, perm)| super::route::Renumber { first: *first, perm });
         let waited: Vec<(usize, u32, &super::edges::Segment)> = routes_segs.iter().enumerate().flat_map(|(k, r)| r.2.iter().map(move |(slice, seg)| (k, *slice, seg))).collect();
-        let again = par_map(&waited, threads, |&(k, _, seg)| super::route::reencode(seg, routes_segs[k].0, &finals, renumber.as_ref(), &mut super::bundle::Encoder::default(), &mut zstd::bulk::Compressor::new(1)?));
+        let again = par_map(&waited, threads, |&(k, _, seg)| super::route::reencode(seg, routes_segs[k].0, &finals, &mut super::bundle::Encoder::default(), &mut zstd::bulk::Compressor::new(1)?));
         let mut per: Vec<Vec<((u8, u32), super::edges::Segment)>> = (0..routes_segs.len()).map(|_| Vec::new()).collect();
         for (&(k, slice, _), seg) in waited.iter().zip(again) {
             per[k].push(((1, slice), seg?));
@@ -743,12 +733,11 @@ fn next_layer<N: Rem>(new: Vec<super::route::Sealed<N>>, frame: u32, threads: us
 
 /// ONE FORWARD FRAME: frame `cx.frame` from `front` (grown the frame before):
 /// the pipeline (`pipeline`), then the frame's end - keys made final, new
-/// shapes numbered, transfers numbered canonically, the routes sealed, the
-/// edge and out files written beside, the ladder's filter, the visited set
-/// absorbing, the next layer and its wins.
+/// shapes numbered, the routes sealed, the edge file written beside, the
+/// ladder's filter, the visited set absorbing, the next layer and its wins.
 pub(crate) fn run_wave<N: Rem>(engine: &dyn FrameStep<N>, front: Frontier<N>, cx: WaveCtx<N>) -> Result<Wave<N>> {
     use std::time::Instant;
-    let WaveCtx { visited, xfers, filters, frame, edges_dir, outs, skeletons, ceiling } = cx;
+    let WaveCtx { visited, xfers, filters, frame, edges_dir, edges, skeletons, ceiling } = cx;
     // A platforms-unknown level knows only `PLATFORM_WORLD_FRAMES` worlds.
     let (level, s) = (engine.level(), &engine.settings());
     let game_frame = s.clock().frame_of(frame);
@@ -759,14 +748,11 @@ pub(crate) fn run_wave<N: Rem>(engine: &dyn FrameStep<N>, front: Frontier<N>, cx
     );
     ensure!(frame > 0, "a wave makes frame 1 on");
     ensure!(front.hulls.len() as u64 == front.new.states(), "frame {frame}: {} hulls for the frontier's {} new states", front.hulls.len(), front.new.states());
-    ensure!(outs.is_some() || front.old.is_empty(), "frame {frame}: old states to re-push without the tree's out-edges");
+    ensure!(edges.is_some() || front.old.is_empty(), "frame {frame}: old states to re-push without the tree's edge files");
     let t_warm = Instant::now();
     engine.warm();
-    if let Some(m) = filters.minus_one {
-        let _ = m.table(s);
-    }
     if t_warm.elapsed().as_secs_f64() > 0.5 {
-        eprintln!("[warm] f{frame}: engine and level -1 table built in {:.1} s, before the wave", t_warm.elapsed().as_secs_f64());
+        eprintln!("[warm] f{frame}: engine built in {:.1} s, before the wave", t_warm.elapsed().as_secs_f64());
     }
     // What the last frame's end and checkpoint freed back to the OS before
     // the wave's threads (new heaps) allocate: kept, it adds to the peak.
@@ -778,7 +764,7 @@ pub(crate) fn run_wave<N: Rem>(engine: &dyn FrameStep<N>, front: Frontier<N>, cx
     st.set(S::OldIn, front.old_states() as u64);
     st.set_gb(S::RssStart, crate::metrics::current_rss_gb());
     let record = edges_dir.is_some();
-    // The out blocks and segments wait in the SPOOL, not in memory.
+    // The segments wait in the SPOOL, not in memory.
     let spool: Option<std::sync::Arc<super::scratch::Scratch>> = match edges_dir {
         Some(dir) => {
             std::fs::create_dir_all(dir)?;
@@ -786,14 +772,13 @@ pub(crate) fn run_wave<N: Rem>(engine: &dyn FrameStep<N>, front: Frontier<N>, cx
         }
         None => None,
     };
-    let plan = Plan::of(&front);
+    let plan = Plan::of(&front, edges);
     let prov = Provisional::default();
     if s.diag.phases {
         crate::metrics::mem_phase(&format!("f{frame} start"));
     }
     let t_pipeline = Instant::now();
-    let xfers_before = xfers.pairs.len();
-    let Piped { mut states, fresh, xfer_counts, out_blocks, stats } = pipeline(engine, &front, &plan, visited, xfers, skeletons, &prov, filters, frame, outs, spool.as_deref(), record, ceiling)?;
+    let Piped { mut states, fresh, stats } = pipeline(engine, &front, &plan, visited, xfers, skeletons, &prov, filters, frame, edges, spool.as_deref(), record, ceiling)?;
     st.add_time(S::Wave, t_pipeline.elapsed());
     st.merge(&stats);
     st.set_idle(workers);
@@ -813,10 +798,6 @@ pub(crate) fn run_wave<N: Rem>(engine: &dyn FrameStep<N>, front: Frontier<N>, cx
     let mut lap = Lap::start();
     let finals = std::sync::Arc::new(finalize_keys(visited, &states, &prov, &mut adds));
     st.lap(S::EndKeys, &mut lap);
-    let out_file = match edges_dir {
-        Some(dir) => Some(out_file_writer::<N>(super::out::path(dir, frame), frame, out_blocks, finals.clone(), spool.clone(), s.threads())?),
-        None => None,
-    };
     drop(prov);
     st.set(S::KeyBits, visited.keys.max_bits() as u64);
     st.set(S::KeyCodes, visited.keys.codes() as u64);
@@ -825,9 +806,6 @@ pub(crate) fn run_wave<N: Rem>(engine: &dyn FrameStep<N>, front: Frontier<N>, cx
     let regions: Vec<Option<u32>> = states.iter().map(|r| visited.region(r.shape, r.slot)).collect();
     st.set(S::Pushes, states.iter().map(|r| r.pushes).sum());
     st.set(S::Touched, states.iter().map(|r| r.touched.len() as u64).sum());
-    // The frame's new transfers in canonical order (by their edges, then
-    // content), whatever the slices that met them first.
-    let perm = xfers.canonical(xfers_before, &xfer_counts);
     let mut new = seal(&mut states, &regions, &finals, visited, frame, workers)?;
     // The routes' touched tables, freed off their (exited) threads: back now.
     collect_freed();
@@ -855,7 +833,7 @@ pub(crate) fn run_wave<N: Rem>(engine: &dyn FrameStep<N>, front: Frontier<N>, cx
         routes_segs.push((region, r.segs, r.prov));
     }
     let edge_file = match edges_dir {
-        Some(dir) => Some(edge_file_writer::<N>(dir.to_path_buf(), frame, xfers.take_flush(), routes_segs, src_index, perm.map(|p| (xfers_before as u32, p)), finals.clone(), spool.clone(), s.threads())?),
+        Some(dir) => Some(edge_file_writer::<N>(dir.to_path_buf(), frame, xfers.take_flush(), routes_segs, src_index, finals.clone(), spool.clone(), s.threads())?),
         None => None,
     };
     if let Some(f) = filters.marks {
@@ -894,10 +872,6 @@ pub(crate) fn run_wave<N: Rem>(engine: &dyn FrameStep<N>, front: Frontier<N>, cx
     if let Some(h) = edge_file {
         st.set(S::EdgeBytes, h.join().map_err(|_| anyhow!("frame {frame}: the edge file's writer panicked"))??);
         st.lap(S::EndEdgeFile, &mut lap);
-    }
-    if let Some(h) = out_file {
-        st.set(S::OutBytes, h.join().map_err(|_| anyhow!("frame {frame}: the out file's writer panicked"))??);
-        st.lap(S::EndOutFile, &mut lap);
     }
     st.tick(S::PhEnd, tl);
     collect_freed();
@@ -1026,157 +1000,98 @@ impl<N: Rem> CellAccs<N> {
 }
 
 struct RepushScratch<N: Rem> {
-    dec: Option<zstd::bulk::Decompressor<'static>>,
-    raw: Vec<u8>,
+    /// The segment decoder.
+    dec: super::edges::Decoder,
     accs: CellAccs<N>,
-    /// Per block target its unit target (`u32::MAX`: none yet), per block
-    /// route its cells level -1 drops at the frame (`None`: not yet asked).
+    /// Per segment target its unit target (`u32::MAX`: none yet).
     t_of: Vec<u32>,
-    late: Vec<Option<u64>>,
-    /// Pushes by (hull, last pushed hull, the block's transfer index).
+    /// Pushes by (hull, last pushed hull, transfer).
     cache: crate::search::hull::PushCache<N>,
-    /// Out blocks read, their raw bytes, their entries, the entries
-    /// re-pushed (`S::RepushBlocks` on).
+    /// Segments read, their raw bytes, their edge records, the records whose
+    /// source (shape, key) is an old state's (`S::RepushSegments` on).
     read: [u64; 4],
 }
 
 impl<N: Rem> Default for RepushScratch<N> {
     fn default() -> Self {
-        RepushScratch { dec: None, raw: Vec::new(), accs: CellAccs::default(), t_of: Vec::new(), late: Vec::new(), cache: Default::default(), read: [0; 4] }
+        RepushScratch { dec: Default::default(), accs: CellAccs::default(), t_of: Vec::new(), cache: Default::default(), read: [0; 4] }
     }
 }
 
-/// ONE RE-PUSH UNIT: old states `entries` of `layer` push their grown hulls
-/// along their OUT-EDGES (layer + 1's out file) where an image grows
-/// (`Hull::push_grown`), level -1 dropping as at an emission. Returns the
-/// edges looked at.
+/// ONE RE-PUSH UNIT: segments `segs` (target region, its segment) of the
+/// edge file of `layer`'s next frame `frame`, each read whole; their edges
+/// from the layer's old states (`index`) push the grown hulls
+/// (`Hull::push_grown`: only where an image grows), level -1 dropping as at
+/// an emission. The pushes merge order-free, so it pushes what a read by
+/// source would. Returns the edges looked at.
+#[allow(clippy::too_many_arguments)]
 #[inline(never)]
-fn run_repush<N: Rem>(u: u32, layer: &OldLayer<N>, entries: std::ops::Range<usize>, outs: &super::out::OutStore, sink: &mut UnitSink<'_, N>, sc: &mut RepushScratch<N>) -> Result<u64> {
-    use super::bundle::{source_cell, source_cells, TO_NONE};
-    use std::cell::Cell;
+fn run_repush<N: Rem>(u: u32, layer: &OldLayer<N>, index: &rustc_hash2::FxHashMap<(u32, Key), Vec<(u32, u32)>>, files: &super::edges::EdgeFiles, frame: u32, segs: &[(u32, u32)], visited: &VisitedSet<N>, base: &XferTable<N>, sink: &mut UnitSink<'_, N>, sc: &mut RepushScratch<N>) -> Result<u64> {
+    use super::bundle::source_cell;
     let geo = GEOMETRY;
-    let none_slot = geo.no_cell_slot();
     sink.begin(u);
     sc.accs.clear();
-    let old = &layer.entries[entries];
-    let (Some(first), Some(last)) = (old.first(), old.last()) else { return Ok(0) };
-    let f = layer.layer as u32 + 1;
-    let file = outs.file(f).ok_or_else(|| anyhow!("re-push unit {u}: no out-edges of frame {f}"))?;
-    let (lo, hi) = ((first.region, first.key), (last.region, last.key));
-    let dec = sc.dec.get_or_insert_with(|| zstd::bulk::Decompressor::new().expect("a zstd decompressor"));
     let mut edges = 0u64;
-    let cursor = Cell::new(0usize);
-    // The entry being read: its first old state, and its old cells.
-    let entry = Cell::new((0usize, 0u64));
-    // A bundle's edges out of old states: (source cell, target cell).
-    let mut pairs_of = [(0u8, 0u8); 64];
-    let wanted = Cell::new(0u64);
-    for bi in file.blocks(lo, hi) {
-        // A block none of the unit's states is in is not read.
-        let (bf, bl) = file.range(bi);
-        let k = old.partition_point(|o| (o.region, o.key) < bf);
-        if old.get(k).is_none_or(|o| (o.region, o.key) > bl) {
+    for &(region, k) in segs {
+        let all = files.segments(frame, region);
+        let seg = &all[k as usize];
+        let blk = sc.dec.open(seg)?;
+        sc.read[0] += 1;
+        sc.read[1] += seg.raw as u64;
+        let cands: Vec<Option<&[(u32, u32)]>> = blk.sources.iter().map(|&(sh, k)| index.get(&(sh, k)).map(Vec::as_slice)).collect();
+        if cands.iter().all(Option::is_none) {
             continue;
         }
-        file.block(bi, dec, &mut sc.raw)?;
-        let blk = super::out::Block::<N>::open(&sc.raw)?;
-        sc.read[0] += 1;
-        sc.read[1] += sc.raw.len() as u64;
-        sc.read[2] += blk.len() as u64;
-        let routes: Vec<u32> = blk.routes.iter().map(|&(shape, slot)| sink.route(shape, slot)).collect();
-        let pairs: Vec<crate::search::rem::Xfer<N>> = blk.pairs.iter().map(N::xfer).collect();
-        sc.t_of.clear();
-        sc.t_of.resize(blk.targets.len(), u32::MAX);
-        sc.late.clear();
-        sc.late.resize(blk.routes.len(), None);
-        let (accs, t_of, late, cache) = (&mut sc.accs, &mut sc.t_of, &mut sc.late, &mut sc.cache);
-        cache.next_epoch();
-        let mut bad = false;
-        blk.entries(
-            |region, key| {
-                let mut c = cursor.get();
-                while c < old.len() && (old[c].region, old[c].key) < (region, key) {
-                    c += 1;
+        let (t_shape, t_slot) = (visited.shape_hash(region / geo.slots), region % geo.slots);
+        let none_slot = geo.no_cell_slot();
+        // The route: asked at the first push (a route is one pushed into).
+        let mut route = None;
+        let dropped = (0..64u32).filter(|&c| (t_slot != none_slot || c == 0) && sink.minus_one_drop(t_shape, geo.cell(t_slot, c))).fold(0u64, |a, c| a | 1u64 << c);
+        let (accs, cache, t_of) = (&mut sc.accs, &mut sc.cache, &mut sc.t_of);
+        let (mut seen, mut used) = (0u64, 0u64);
+        t_of.clear();
+        t_of.resize(blk.t_keys.len(), u32::MAX);
+        blk.records(|r| {
+            seen += 1;
+            let Some(cs) = cands[r.s as usize] else { return };
+            used += 1;
+            let shape = blk.sources[r.s as usize].0;
+            let mut m = r.mask & !dropped;
+            while m != 0 {
+                let c = m.trailing_zeros();
+                m &= m - 1;
+                let s_cell = source_cell(geo.cell(t_slot, c), r.o);
+                let (s_slot, s_local) = geo.slot_local(s_cell);
+                let s_region = super::region_of(&geo, shape, s_slot);
+                let Some(&(_, ei)) = cs.iter().find(|x| x.0 == s_region) else { continue };
+                let e = layer.entries[ei as usize];
+                if e.cells >> s_local & 1 == 0 {
+                    continue;
                 }
-                cursor.set(c);
-                if c < old.len() && (old[c].region, old[c].key) == (region, key) {
-                    entry.set((old[c].first as usize, old[c].cells));
-                    wanted.set(wanted.get() + 1);
-                    true
-                } else {
-                    false
-                }
-            },
-            |region, _, it| {
-                let (a, cells) = entry.get();
-                let s_slot = region % geo.slots;
-                for ob in it {
-                    let (Some(&(r, t_key)), Some(xfer)) = (blk.targets.get(ob.t as usize), pairs.get(ob.x as usize)) else {
-                        bad = true;
-                        return;
-                    };
-                    let ((shape, t_slot), route) = (blk.routes[r as usize], routes[r as usize]);
-                    let dropped = *late[r as usize].get_or_insert_with(|| (0..64u32).filter(|&c| (t_slot != none_slot || c == 0) && sink.minus_one_drop(shape, geo.cell(t_slot, c))).fold(0u64, |a, c| a | 1u64 << c));
-                    let m = ob.mask & !dropped;
-                    if m == 0 {
-                        continue;
+                edges += 1;
+                let [hull, was] = &layer.hulls[e.first as usize + (e.cells & ((1u64 << s_local) - 1)).count_ones() as usize];
+                let Some(acc) = cache.get(hull, was, r.x, || {
+                    let xfer = N::xfer(&base.pairs[r.x as usize]);
+                    let mut a = AccOf::<N>::default();
+                    hull.push_grown(was, &xfer, &mut a).then_some(a)
+                }) else {
+                    continue;
+                };
+                let t = match t_of[r.t as usize] {
+                    u32::MAX => {
+                        let route = *route.get_or_insert_with(|| sink.route(t_shape, t_slot));
+                        let t = accs.target(route, blk.t_keys[r.t as usize]);
+                        t_of[r.t as usize] = t;
+                        t
                     }
-                    // Target cells shifted to their sources, else cell by cell.
-                    let mut n = 0usize;
-                    if ob.o < TO_NONE && t_slot != none_slot && s_slot != none_slot {
-                        let Some((src, k)) = source_cells(t_slot, s_slot, ob.o, m) else {
-                            bad = true;
-                            return;
-                        };
-                        let mut live = src & cells;
-                        while live != 0 {
-                            let s = live.trailing_zeros();
-                            live &= live - 1;
-                            pairs_of[n] = (s as u8, (s as i32 - k) as u8);
-                            n += 1;
-                        }
-                    } else {
-                        let mut mm = m;
-                        while mm != 0 {
-                            let c = mm.trailing_zeros();
-                            mm &= mm - 1;
-                            let (slot, s) = geo.slot_local(source_cell(geo.cell(t_slot, c), ob.o));
-                            if slot != s_slot {
-                                bad = true;
-                                return;
-                            }
-                            if cells >> s & 1 != 0 {
-                                pairs_of[n] = (s as u8, c as u8);
-                                n += 1;
-                            }
-                        }
-                    }
-                    edges += n as u64;
-                    for &(s, c) in &pairs_of[..n] {
-                        // Old states of an entry are by cell: a cell's rank among them.
-                        let [hull, was] = &layer.hulls[a + (cells & ((1u64 << s) - 1)).count_ones() as usize];
-                        let Some(acc) = cache.get(hull, was, ob.x, || {
-                            let mut a = AccOf::<N>::default();
-                            hull.push_grown(was, xfer, &mut a).then_some(a)
-                        }) else {
-                            continue;
-                        };
-                        let t = match t_of[ob.t as usize] {
-                            u32::MAX => {
-                                let t = accs.target(route, t_key);
-                                t_of[ob.t as usize] = t;
-                                t
-                            }
-                            t => t,
-                        };
-                        accs.merge(t, c as u32, &acc);
-                    }
-                }
-            },
-        )?;
-        ensure!(!bad, "re-push unit {u}: an out block's bundle names a target or transfer past its tables, or a source cell outside its entry's region");
+                    t => t,
+                };
+                accs.merge(t, c, &acc);
+            }
+        })?;
+        sc.read[2] += seen;
+        sc.read[3] += used;
     }
-    sc.read[3] += wanted.get();
     sink.repush_chunks(&sc.accs.targets, &sc.accs.runs, &sc.accs.slots);
     Ok(edges)
 }
@@ -1249,12 +1164,6 @@ fn layer_wins<N: Rem>(visited: &VisitedSet<N>, next: &Layer<N>, frame: u32, s: &
         out.extend(p?);
     }
     Ok(out)
-}
-
-/// A kernel unit's out block: compressed, or raw until its keys are final.
-enum OutBlock {
-    Sealed(Option<super::out::Sealed>),
-    Raw(Vec<u8>),
 }
 
 /// A region job: one route's chunks of one slice (in unit order), its remaps.
@@ -1506,7 +1415,7 @@ pub fn one_frame<N: Rem>(engine: &dyn FrameStep<N>, rows: Vec<Rt2<N>>, frame: u3
     let s = engine.settings();
     let start = seed(&mut visited, &rows, HullOf::<N>::full(), &s)?.frontier();
     visited.forget_states();
-    let cx = WaveCtx { visited: &mut visited, xfers: &mut xfers, filters: Filters::default(), frame, edges_dir: None, outs: None, skeletons: &skeletons, ceiling: None };
+    let cx = WaveCtx { visited: &mut visited, xfers: &mut xfers, filters: Filters::default(), frame, edges_dir: None, edges: None, skeletons: &skeletons, ceiling: None };
     let wave = run_wave(engine, start, cx)?;
     Ok(super::layer::decode_states(&wave.next, &visited.keys, visited.shapes(), usize::MAX, &|_| true)?.into_iter().map(|(_, rt2)| rt2).collect())
 }
@@ -1547,8 +1456,7 @@ mod tests {
         }
     }
 
-    /// An `OldLayer` gives back its states, whole and by range; its re-push
-    /// units are whole entries of `REPUSH_UNIT` states or more (but the last).
+    /// An `OldLayer` gives back its states, whole and by range.
     #[test]
     fn an_old_layer_gives_back_its_states() {
         let mut v = 7u64;
@@ -1575,18 +1483,5 @@ mod tests {
         for r in [0..0, 0..1, 3..4, 100..2000, 17..olds.len(), olds.len() - 1..olds.len()] {
             assert_eq!(l.range(r.clone()).collect::<Vec<_>>(), olds[r.clone()], "range {r:?}");
         }
-        // The units: REPUSH_UNIT states, then the last one's entry whole.
-        let units = repush_units_of(&vec![l.clone()]);
-        let mut a = 0usize;
-        for u in &units {
-            let UnitSpec::Repush { layer: 0, states, .. } = u else { panic!("a re-push unit") };
-            let mut b = (a + REPUSH_UNIT).min(olds.len());
-            while b < olds.len() && (olds[b].sk.region, olds[b].sk.key) == (olds[b - 1].sk.region, olds[b - 1].sk.key) {
-                b += 1;
-            }
-            assert_eq!(*states, b - a);
-            a = b;
-        }
-        assert_eq!(a, olds.len());
     }
 }

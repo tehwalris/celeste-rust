@@ -17,11 +17,10 @@
 #                                      (./check.sh fixtures: all big)
 #   tools/fixtures.sh list
 #
-# A level -1 fixture keeps the table it was built under (NAME/l1-table.bin,
-# --l1-table): the table cache is keyed on the binary, so every rebuild of
-# the binary would rebuild the table (`bench frame` refuses another). One
-# built from other sources than the checkout's is reported, not rebuilt: its
-# content is pinned.
+# A level -1 fixture holds the table it was built under, as every filtered
+# tree does (NAME/l1-table.bin, beside its record): a frame check reads the
+# tree's table, whatever binary runs it. One built from other sources than
+# the checkout's is reported, not rebuilt: its content is pinned.
 # Env: BIN (default $CARGO_TARGET_DIR/quick/rewrite), CELESTE_FIXTURES.
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -73,10 +72,10 @@ BIG="r62h57"
 # formats and the order of its transfer table (a mismatch is STALE), and
 # the sources (reported only). A frame check encodes the fixture's
 # transfers by their ids in `xfer.bin`, so its edge bytes follow the
-# table's order: a frame's new transfers are numbered CANONICALLY (by their
-# edges in the frame, then content: `edges::XferTable::canonical`).
+# table's order: a frame's new transfers are numbered at each slice's
+# GATHER (the pairs first met in the slice, by content: `XferTable::merge`).
 formats() {
-    echo "checkpoint $(grep -o 'FORMAT_VERSION: u32 = [0-9]*' src/storage/file.rs | grep -o '[0-9]*$') edges $(grep -o '^const VERSION: u32 = [0-9]*' src/storage/edges.rs | grep -o '[0-9]*$') settings $(grep -o '^pub const VERSION: u32 = [0-9]*' src/settings.rs | grep -o '[0-9]*$') xfers canonical"
+    echo "checkpoint $(grep -o 'FORMAT_VERSION: u32 = [0-9]*' src/storage/file.rs | grep -o '[0-9]*$') edges $(grep -o '^const VERSION: u32 = [0-9]*' src/storage/edges.rs | grep -o '[0-9]*$') settings $(grep -o '^pub const VERSION: u32 = [0-9]*' src/settings.rs | grep -o '[0-9]*$') xfers gather"
 }
 sources() {
     { git ls-files -s src crates lua cart Cargo.lock; git diff HEAD -- src crates lua cart Cargo.lock; } | sha1sum | cut -c1-16
@@ -106,7 +105,7 @@ build() {
     # A forward's directory is its tree, a search's holds its levels' trees.
     local into=--tree
     [[ $CMD == search* ]] && into=--search-dir
-    ./safe-run.sh --memory "$MEM" -- "$B" $CMD $FLAGS --l1-table "$tmp/l1-table.bin" $into "$tmp" > "$tmp/build.out" 2> "$tmp/build.log" \
+    ./safe-run.sh --memory "$MEM" -- "$B" $CMD $FLAGS $into "$tmp" > "$tmp/build.out" 2> "$tmp/build.log" \
         || { echo "[fixtures] $name: the build FAILED (see $tmp/build.log)" >&2; exit 1; }
     fingerprint "$tmp" > "$tmp/ckhash.txt"
     if [[ $mode == verify && ! -f $PINS/$name.ckhash ]]; then

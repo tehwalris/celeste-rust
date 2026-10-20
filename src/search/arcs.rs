@@ -4,7 +4,9 @@
 //! the point `r + 32768` of `0..CIRCLE`; a set is sorted, disjoint,
 //! non-adjacent half-open segments (an arc across the wrap is two). The
 //! two-axis `Region` is generic over the `Circle` (16.16's `Fixed16`, the
-//! doubles' `rem_f64::Doubles`); the pull is exact on both.
+//! doubles' `rem_f64::Doubles`), and so is an edge's `Transfer`, one model
+//! for both: a guard and a MONOTONE action or a constant; the pull is
+//! exact on both.
 
 /// Points on the circle: 1 px in raw 16.16 units.
 pub(crate) const CIRCLE: u32 = 1 << 16;
@@ -25,13 +27,15 @@ pub struct Seg<P = u32> {
     pub(crate) hi: P,
 }
 
-/// A CIRCLE of remainder points (`Rem::C`): points, stored words, transfers.
+/// A CIRCLE of remainder points (`Rem::C`): points, stored words, and the
+/// MONOTONE maps its transfers act by.
 pub trait Circle: Copy + std::fmt::Debug + Default + PartialEq + Eq + PartialOrd + Ord + std::hash::Hash + Send + Sync + 'static {
     type P: Copy + Ord + std::hash::Hash + std::fmt::Debug + Default + Send + Sync + 'static;
     /// A stored point or count (arena words, hull bounds), in point order.
     type W: Copy + Ord + std::hash::Hash + std::fmt::Debug + Default + Send + Sync + 'static;
-    /// One axis's transfer: a guard and an action.
-    type Act: Copy + std::fmt::Debug + PartialEq + Send + Sync + 'static;
+    /// A transfer's monotone action: 16.16's a translation, the doubles'
+    /// `r -> fl(fl(r + ox) - k)`.
+    type Mono: Copy + std::fmt::Debug + PartialEq + Eq + std::hash::Hash + Send + Sync + 'static;
     /// The points are `0..SIZE`.
     const SIZE: Self::P;
     const MAX_SEGS: usize;
@@ -55,35 +59,110 @@ pub trait Circle: Copy + std::fmt::Debug + Default + PartialEq + Eq + PartialOrd
     /// Are a hull's four words equal (`PushCache::get`)? 16.16's in one
     /// 8-byte compare; the doubles' word by word (a miss differs early).
     fn same4(a: [Self::W; 4], b: [Self::W; 4]) -> bool;
-    /// The points an edge's axis takes.
-    fn guard(a: &Self::Act) -> Seg<Self::P>;
-    /// The point a constant action sends every point to.
-    fn const_point(a: &Self::Act) -> Option<Self::P>;
-    /// The IMAGE of `s`'s points inside the guard: exact for 16.16; for a
-    /// monotone action the interval between its ends' images (a superset:
-    /// sound where it is used, the pushes of `hull` and `reach`).
-    fn image(a: &Self::Act, s: Seg<Self::P>, f: impl FnMut(Seg<Self::P>));
-    /// The PREIMAGE of `s` under a non-constant action: the points of the
-    /// guard it maps into `s`, EXACTLY.
-    fn preimage(a: &Self::Act, s: Seg<Self::P>, f: impl FnMut(Seg<Self::P>));
+    /// The image of a guard's point `p` under `m` (inside the circle: the
+    /// decode checked it).
+    fn apply(m: &Self::Mono, p: Self::P) -> Self::P;
+    /// The points of guard `g` that `m` maps into `s`, EXACTLY (`m` is
+    /// monotone: one segment).
+    fn pull_mono(m: &Self::Mono, g: Seg<Self::P>, s: Seg<Self::P>) -> Option<Seg<Self::P>>;
+    /// `a` CORRUPTED, to check a check (`rewrite check arcs --fault
+    /// action`): its images moved (guard `g`).
+    fn fault(a: &Act<Self>, g: Seg<Self::P>) -> Act<Self>;
     /// A segment as one word of the gate's fingerprints (`backward::gate_w_hash`).
     fn seg_word(s: Seg<Self::P>) -> u64;
     /// A point in the middle of `s` (a probe).
     fn mid(s: Seg<Self::P>) -> Self::P;
-    fn kind(a: &Self::Act) -> &'static str;
-    /// `a` CORRUPTED, to check a check (`rewrite check arcs --fault`): its
-    /// guard's lowest point dropped (`guard`), or its image moved.
-    fn faulty(a: &Self::Act, guard: bool) -> Self::Act;
 }
 
-/// 16.16's circle: 65536 points, its transfers rotations or constants.
+/// What a frame does to one axis's remainder along an edge.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Act<C: Circle> {
+    /// A monotone map of the guard into the circle.
+    Mono(C::Mono),
+    /// `rem := c` (a collision resets it): the point `c` of the circle.
+    Const(C::P),
+}
+
+/// ONE AXIS OF AN EDGE (`Rem::xfer`): the remainders that take it (its
+/// GUARD: one piece of the circle, never wrapping) and what it does to
+/// them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct Transfer<C: Circle = Fixed16> {
+    pub(crate) guard: Seg<C::P>,
+    pub(crate) act: Act<C>,
+}
+
+impl<C: Circle> Transfer<C> {
+    /// The point a constant action sends every point to.
+    #[inline]
+    pub(crate) fn const_point(&self) -> Option<C::P> {
+        match self.act {
+            Act::Const(c) => Some(c),
+            Act::Mono(_) => None,
+        }
+    }
+
+    /// Does it take point `p`?
+    #[inline]
+    pub(crate) fn takes(&self, p: C::P) -> bool {
+        self.guard.lo <= p && p < self.guard.hi
+    }
+
+    /// The IMAGE of `s`'s points inside the guard (`None`: none): the
+    /// interval between its ends' images (the action is monotone) - exact
+    /// for 16.16's translations, a superset for the doubles' (sound where
+    /// it is used, the pushes of `hull` and `reach`).
+    #[inline]
+    pub(crate) fn image(&self, s: Seg<C::P>) -> Option<Seg<C::P>> {
+        let c = clip(s, self.guard)?;
+        Some(match &self.act {
+            Act::Mono(m) => Seg { lo: C::apply(m, c.lo), hi: C::next(C::apply(m, C::prev(c.hi))) },
+            Act::Const(p) => Seg { lo: *p, hi: C::next(*p) },
+        })
+    }
+
+    /// The PREIMAGE of `s`: the points of the guard it takes into `s`,
+    /// EXACTLY (a constant's: its whole guard where `s` holds its point).
+    #[inline]
+    pub(crate) fn pull(&self, s: Seg<C::P>) -> Option<Seg<C::P>> {
+        match &self.act {
+            Act::Mono(m) => C::pull_mono(m, self.guard, s),
+            Act::Const(c) => (s.lo <= *c && *c < s.hi).then_some(self.guard),
+        }
+    }
+
+    pub(crate) fn kind(&self) -> &'static str {
+        match self.act {
+            Act::Mono(_) => "mono",
+            Act::Const(_) => "const",
+        }
+    }
+
+    /// CORRUPTED, to check a check (`rewrite check arcs --fault`): its
+    /// guard's lowest point dropped (`guard`), or its images moved.
+    pub(crate) fn faulty(&self, guard: bool) -> Self {
+        let mut t = *self;
+        if guard {
+            if C::next(t.guard.lo) < t.guard.hi {
+                t.guard.lo = C::next(t.guard.lo);
+            }
+        } else {
+            t.act = C::fault(&t.act, t.guard);
+        }
+        t
+    }
+}
+
+/// 16.16's circle: 65536 points, its transfers translations (`rem += ox`
+/// less the amount: the guard is one floor's, so its image never wraps) or
+/// constants.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Fixed16;
 
 impl Circle for Fixed16 {
     type P = u32;
     type W = u16;
-    type Act = Transfer;
+    type Mono = i32;
     const SIZE: u32 = CIRCLE;
     const MAX_SEGS: usize = MAX_SEGS;
     #[inline]
@@ -135,38 +214,21 @@ impl Circle for Fixed16 {
         a == b
     }
     #[inline]
-    fn guard(a: &Transfer) -> Seg {
-        a.guard
+    fn apply(d: &i32, p: u32) -> u32 {
+        (p as i32 + d) as u32
     }
     #[inline]
-    fn const_point(a: &Transfer) -> Option<u32> {
-        match a.action {
-            Action::Const(c) => Some(c),
-            Action::Rotate(_) => None,
-        }
+    fn pull_mono(d: &i32, g: Seg, s: Seg) -> Option<Seg> {
+        let lo = (s.lo as i64 - *d as i64).max(g.lo as i64);
+        let hi = (s.hi as i64 - *d as i64).min(g.hi as i64);
+        (lo < hi).then(|| Seg { lo: lo as u32, hi: hi as u32 })
     }
-    #[inline]
-    fn image(a: &Transfer, s: Seg, mut f: impl FnMut(Seg)) {
-        if let Some(c) = clip(s, a.guard) {
-            match a.action {
-                Action::Rotate(v) => rot_seg(c, v.rem_euclid(CIRCLE as i32) as u32, f),
-                Action::Const(p) => f(Seg { lo: p, hi: p + 1 }),
-            }
-        }
-    }
-    #[inline]
-    fn preimage(a: &Transfer, s: Seg, mut f: impl FnMut(Seg)) {
-        match a.action {
-            Action::Rotate(v) => rot_seg(s, (-(v as i64)).rem_euclid(CIRCLE as i64) as u32, |r| {
-                if let Some(c) = clip(r, a.guard) {
-                    f(c);
-                }
-            }),
-            Action::Const(c) => {
-                if s.lo <= c && c < s.hi {
-                    f(a.guard);
-                }
-            }
+    /// A translation by one more point (one less at the circle's top), a
+    /// constant moved by one point.
+    fn fault(a: &Act<Fixed16>, g: Seg) -> Act<Fixed16> {
+        match *a {
+            Act::Mono(d) => Act::Mono(if g.hi as i64 + d as i64 + 1 <= CIRCLE as i64 { d + 1 } else { d - 1 }),
+            Act::Const(c) => Act::Const((c + 1) % CIRCLE),
         }
     }
     #[inline]
@@ -175,167 +237,6 @@ impl Circle for Fixed16 {
     }
     fn mid(s: Seg) -> u32 {
         (s.lo + s.hi) / 2
-    }
-    fn kind(a: &Transfer) -> &'static str {
-        match a.action {
-            Action::Rotate(_) => "rotate",
-            Action::Const(_) => "const",
-        }
-    }
-    fn faulty(a: &Transfer, guard: bool) -> Transfer {
-        let mut t = *a;
-        if guard {
-            t.guard.lo = (t.guard.lo + 1).min(t.guard.hi - 1);
-        } else {
-            t.action = match t.action {
-                Action::Rotate(v) => Action::Rotate(v + 1),
-                Action::Const(c) => Action::Const((c + 1) % CIRCLE),
-            };
-        }
-        t
-    }
-}
-
-/// A union of segments: sorted, disjoint, not touching (the tests' model of
-/// the arcs, which `Region` and the actions are checked against).
-#[cfg(test)]
-#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
-pub(crate) struct Set(pub(crate) Vec<Seg>);
-
-#[cfg(test)]
-impl Set {
-    pub(crate) fn empty() -> Self {
-        Set(Vec::new())
-    }
-    pub(crate) fn full() -> Self {
-        Set(vec![Seg { lo: 0, hi: CIRCLE }])
-    }
-    pub(crate) fn point(p: u32) -> Self {
-        Set(vec![Seg { lo: p, hi: p + 1 }])
-    }
-    pub(crate) fn seg(lo: u32, hi: u32) -> Self {
-        if lo >= hi {
-            Set::empty()
-        } else {
-            Set(vec![Seg { lo, hi }])
-        }
-    }
-    pub(crate) fn is_empty(&self) -> bool {
-        self.0.is_empty()
-    }
-    pub(crate) fn contains(&self, p: u32) -> bool {
-        self.0.iter().any(|s| s.lo <= p && p < s.hi)
-    }
-    /// Normalize: sort, merge overlapping and touching segments.
-    fn norm(mut v: Vec<Seg>) -> Set {
-        v.retain(|s| s.lo < s.hi);
-        v.sort();
-        let mut out: Vec<Seg> = Vec::with_capacity(v.len());
-        for s in v {
-            match out.last_mut() {
-                Some(l) if s.lo <= l.hi => l.hi = l.hi.max(s.hi),
-                _ => out.push(s),
-            }
-        }
-        Set(out)
-    }
-    pub(crate) fn intersect(&self, o: &Set) -> Set {
-        let mut out = Vec::new();
-        for a in &self.0 {
-            for b in &o.0 {
-                let (lo, hi) = (a.lo.max(b.lo), a.hi.min(b.hi));
-                if lo < hi {
-                    out.push(Seg { lo, hi });
-                }
-            }
-        }
-        Set::norm(out)
-    }
-    /// The set rotated by `v` raw units (`p -> (p + v) mod CIRCLE`).
-    pub(crate) fn rotate(&self, v: i32) -> Set {
-        let d = v.rem_euclid(CIRCLE as i32) as u32;
-        let mut out = Vec::new();
-        for &s in &self.0 {
-            rot_seg(s, d, |r| out.push(r));
-        }
-        Set::norm(out)
-    }
-    /// Arcs: segments, the two touching the wrap counted as one.
-    pub(crate) fn arcs(&self) -> usize {
-        let n = self.0.len();
-        if n >= 2 && self.0[0].lo == 0 && self.0[n - 1].hi == CIRCLE {
-            n - 1
-        } else {
-            n
-        }
-    }
-}
-
-/// What a frame does to one axis's remainder along an edge.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub(crate) enum Action {
-    /// `rem := rem + v (mod 1)`, raw `v`.
-    Rotate(i32),
-    /// `rem := c` (a collision resets it): the point `c` of the circle.
-    Const(u32),
-}
-
-#[cfg(test)]
-impl Action {
-    /// The image of `s` (already inside the edge's guard).
-    pub(crate) fn image(self, s: &Set) -> Set {
-        match self {
-            Action::Rotate(v) => s.rotate(v),
-            Action::Const(c) => {
-                if s.is_empty() {
-                    Set::empty()
-                } else {
-                    Set::point(c)
-                }
-            }
-        }
-    }
-    /// The preimage of `s`: every point the action takes into `s`.
-    pub(crate) fn preimage(self, s: &Set) -> Set {
-        match self {
-            Action::Rotate(v) => s.rotate(-v),
-            Action::Const(c) => {
-                if s.contains(c) {
-                    Set::full()
-                } else {
-                    Set::empty()
-                }
-            }
-        }
-    }
-}
-
-/// One axis of an edge: the remainders that take it (one piece of the
-/// circle, never wrapping) and what it does to them.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct Transfer {
-    pub(crate) guard: Seg,
-    pub(crate) action: Action,
-}
-
-#[cfg(test)]
-impl Transfer {
-    pub(crate) fn takes(&self, p: u32) -> bool {
-        self.guard.lo <= p && p < self.guard.hi
-    }
-}
-
-/// The pieces a speed `v` (raw) cuts the circle into: `rem + v + 1/2` below
-/// the next integer, and the rest (one piece for whole pixels).
-#[cfg(test)]
-pub(crate) fn pieces(v: i32) -> Vec<Set> {
-    // u = p - 32768 + v + 32768 = p + v; the amount steps where p + v is a
-    // multiple of CIRCLE, at p = (-v) mod CIRCLE.
-    let cut = (-v).rem_euclid(CIRCLE as i32) as u32;
-    if cut == 0 {
-        vec![Set::full()]
-    } else {
-        vec![Set::seg(0, cut), Set::seg(cut, CIRCLE)]
     }
 }
 
@@ -384,19 +285,6 @@ pub(crate) struct Region<C: Circle = Fixed16> {
     xs: Vec<Stored<C::W>>,
 }
 
-/// `s` rotated by `d` (already in `0..CIRCLE`): one or two segments.
-fn rot_seg(s: Seg, d: u32, mut f: impl FnMut(Seg)) {
-    let (lo, hi) = (s.lo + d, s.hi + d);
-    if hi <= CIRCLE {
-        f(Seg { lo, hi });
-    } else if lo >= CIRCLE {
-        f(Seg { lo: lo - CIRCLE, hi: hi - CIRCLE });
-    } else {
-        f(Seg { lo, hi: CIRCLE });
-        f(Seg { lo: 0, hi: hi - CIRCLE });
-    }
-}
-
 #[inline]
 pub(super) fn clip<P: Ord + Copy>(s: Seg<P>, g: Seg<P>) -> Option<Seg<P>> {
     let (lo, hi) = (s.lo.max(g.lo), s.hi.min(g.hi));
@@ -430,7 +318,7 @@ impl<C: Circle> Region<C> {
         self.as_ref().pieces(out)
     }
     #[cfg(test)]
-    pub(crate) fn push(&self, x: C::Act, y: C::Act, out: &mut Vec<Piece<C::P>>) {
+    pub(crate) fn push(&self, x: Transfer<C>, y: Transfer<C>, out: &mut Vec<Piece<C::P>>) {
         self.as_ref().push(x, y, out)
     }
     #[cfg(test)]
@@ -438,7 +326,7 @@ impl<C: Circle> Region<C> {
         self.as_ref().clip_into(p, out)
     }
     #[cfg(test)]
-    pub(crate) fn pull(&self, x: C::Act, y: C::Act, out: &mut Vec<Piece<C::P>>) {
+    pub(crate) fn pull(&self, x: Transfer<C>, y: Transfer<C>, out: &mut Vec<Piece<C::P>>) {
         self.as_ref().pull(x, y, out)
     }
     /// The union of `pieces`, canonical (one sweep over y). `pieces` is
@@ -550,18 +438,18 @@ impl<'a, C: Circle> RegionRef<'a, C> {
         self.slab_at(y).is_some_and(|xs| Self::holds(xs, x))
     }
     /// The IMAGE under one edge, into `out`: the points inside its guards,
-    /// moved by its actions (`Circle::image`).
-    pub(crate) fn push(self, x: C::Act, y: C::Act, out: &mut Vec<Piece<C::P>>) {
+    /// moved by its actions (`Transfer::image`).
+    pub(crate) fn push(self, x: Transfer<C>, y: Transfer<C>, out: &mut Vec<Piece<C::P>>) {
         let mut ximg: Vec<Seg<C::P>> = Vec::new();
         for (ys, xs) in self.slabs() {
             ximg.clear();
-            for s in xs {
-                C::image(&x, s, |r| ximg.push(r));
-            }
+            ximg.extend(xs.filter_map(|s| x.image(s)));
             if ximg.is_empty() {
                 continue;
             }
-            C::image(&y, ys, |r| out.extend(ximg.iter().map(|&xr| Piece { y: r, x: xr })));
+            if let Some(r) = y.image(ys) {
+                out.extend(ximg.iter().map(|&xr| Piece { y: r, x: xr }));
+            }
         }
     }
     /// `p` intersected with `self`, as pieces appended to `out`.
@@ -576,30 +464,28 @@ impl<'a, C: Circle> RegionRef<'a, C> {
         }
     }
     /// The PREIMAGE under one edge, into `out`: the points inside its guards
-    /// it takes into `self` (`Circle::preimage`; a constant axis takes its
+    /// it takes into `self` (`Transfer::pull`; a constant axis takes its
     /// whole guard where `self` holds its point).
-    pub(crate) fn pull(self, x: C::Act, y: C::Act, out: &mut Vec<Piece<C::P>>) {
-        let emit_x = |ys: Seg<C::P>, xs: &[Stored<C::W>], out: &mut Vec<Piece<C::P>>| match C::const_point(&x) {
-            None => {
-                for s in xs {
-                    C::preimage(&x, s.seg::<C>(), |c| out.push(Piece { y: ys, x: c }));
-                }
-            }
+    pub(crate) fn pull(self, x: Transfer<C>, y: Transfer<C>, out: &mut Vec<Piece<C::P>>) {
+        let emit_x = |ys: Seg<C::P>, xs: &[Stored<C::W>], out: &mut Vec<Piece<C::P>>| match x.const_point() {
+            None => out.extend(xs.iter().filter_map(|s| x.pull(s.seg::<C>())).map(|c| Piece { y: ys, x: c })),
             Some(c) => {
                 if Self::holds(xs, c) {
-                    out.push(Piece { y: ys, x: C::guard(&x) });
+                    out.push(Piece { y: ys, x: x.guard });
                 }
             }
         };
-        match C::const_point(&y) {
+        match y.const_point() {
             None => {
                 for (ys, xs) in self.stored() {
-                    C::preimage(&y, ys, |c| emit_x(c, xs, out));
+                    if let Some(c) = y.pull(ys) {
+                        emit_x(c, xs, out);
+                    }
                 }
             }
             Some(c) => {
                 if let Some(xs) = self.slab_at(c) {
-                    emit_x(C::guard(&y), xs, out);
+                    emit_x(y.guard, xs, out);
                 }
             }
         }
@@ -779,29 +665,6 @@ mod tests {
         std::fs::remove_dir(&dir).unwrap();
     }
 
-    #[test]
-    fn a_rotation_wraps_and_an_intersection_cuts() {
-        let s = Set::seg(60000, 65000);
-        let r = s.rotate(1000);
-        assert_eq!(r, Set(vec![Seg { lo: 0, hi: 464 }, Seg { lo: 61000, hi: 65536 }]));
-        assert_eq!(r.arcs(), 1, "one arc across the wrap");
-        assert_eq!(r.rotate(-1000), s);
-        assert_eq!(r.intersect(&Set::seg(0, 100)), Set::seg(0, 100));
-    }
-
-    #[test]
-    fn a_speed_cuts_the_circle_where_the_amount_steps() {
-        // v = 0.6 px: rem + 0.6 + 1/2 reaches 1 at rem = -0.1.
-        let v = 39322;
-        let p = pieces(v);
-        assert_eq!(p.len(), 2);
-        let cut = p[1].0[0].lo as i32 - 32768;
-        let amount = |rem: i32| (rem + v + 32768).div_euclid(65536);
-        assert_eq!(amount(cut - 1), 0);
-        assert_eq!(amount(cut), 1);
-        assert_eq!(pieces(65536).len(), 1, "a whole pixel cuts nothing");
-    }
-
     fn lcg(s: &mut u64) -> u32 {
         *s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
         (*s >> 33) as u32
@@ -837,23 +700,29 @@ mod tests {
             rev.reverse();
             assert_eq!(Region::<Fixed16>::from_pieces(&mut rev, &mut Vec::new()), r);
             // pull: a point p is in the result iff the guards take it and its image is in r.
-            let act = |s: &mut u64| if lcg(s) % 4 == 0 { Action::Const(lcg(s) % CIRCLE) } else { Action::Rotate((lcg(s) % CIRCLE) as i32 - 32768) };
-            let (tx, ty) = (Transfer { guard: seg(&mut s), action: act(&mut s) }, Transfer { guard: seg(&mut s), action: act(&mut s) });
+            // A translation keeping its guard inside the circle, or a constant.
+            let transfer = |s: &mut u64| {
+                let guard = seg(s);
+                let room = (CIRCLE - guard.hi + guard.lo) as i64 + 1;
+                let act = if lcg(s) % 4 == 0 { Act::Const(lcg(s) % CIRCLE) } else { Act::Mono((lcg(s) as i64 % room - guard.lo as i64) as i32) };
+                Transfer { guard, act }
+            };
+            let (tx, ty) = (transfer(&mut s), transfer(&mut s));
             let mut out = Vec::new();
             r.pull(tx, ty, &mut out);
             let pr = Region::<Fixed16>::from_pieces(&mut out, &mut Vec::new());
             let mut pp: Vec<u32> = probes.iter().flat_map(|&v| {
-                let back = |a: Action| match a {
-                    Action::Rotate(d) => (v as i64 - d as i64).rem_euclid(CIRCLE as i64) as u32,
-                    Action::Const(_) => v,
+                let back = |t: Transfer| match t.act {
+                    Act::Mono(d) => (v as i64 - d as i64).clamp(0, CIRCLE as i64 - 1) as u32,
+                    Act::Const(_) => v,
                 };
-                [v, back(tx.action), back(ty.action)]
+                [v, back(tx), back(ty)]
             }).chain([tx.guard.lo, tx.guard.hi - 1, ty.guard.lo, ty.guard.hi - 1]).collect();
             pp.sort_unstable();
             pp.dedup();
             for &x in &pp {
                 for &y in &pp {
-                    let want = tx.takes(x) && ty.takes(y) && r.contains(apply(tx.action, x), apply(ty.action, y));
+                    let want = tx.takes(x) && ty.takes(y) && r.contains(apply(tx, x), apply(ty, y));
                     assert_eq!(pr.contains(x, y), want, "pull at ({x}, {y})");
                 }
             }
@@ -866,7 +735,7 @@ mod tests {
             for &x in &pp {
                 for &y in &pp {
                     if tx.takes(x) && ty.takes(y) && r.contains(x, y) {
-                        assert!(img.contains(apply(tx.action, x), apply(ty.action, y)), "push misses the image of ({x}, {y})");
+                        assert!(img.contains(apply(tx, x), apply(ty, y)), "push misses the image of ({x}, {y})");
                     }
                 }
             }
@@ -894,11 +763,4 @@ mod tests {
         }
     }
 
-    #[test]
-    fn a_collision_maps_everything_to_a_point_and_back() {
-        let a = Action::Const(point(0));
-        assert_eq!(a.image(&Set::seg(5, 9)), Set::point(32768));
-        assert_eq!(a.preimage(&Set::point(32768)), Set::full());
-        assert!(a.preimage(&Set::seg(0, 10)).is_empty());
-    }
 }

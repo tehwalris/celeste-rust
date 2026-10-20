@@ -34,9 +34,7 @@
 //! Anything else is REFUSED, FATAL in the forward: the record would be an
 //! unchecked claim about the remainder.
 
-use super::arcs::{self, Action, Seg, Transfer, CIRCLE};
-#[cfg(test)]
-use super::arcs::Set;
+use super::arcs::{self, Act, Seg, Transfer, CIRCLE};
 
 const HALF: i64 = 32768;
 const ONE: i64 = 65536;
@@ -62,18 +60,21 @@ pub struct AxisXfer {
 }
 
 impl AxisXfer {
-    #[cfg(test)]
-    pub(crate) fn guard(&self) -> Set {
-        Set::seg(self.lo, self.hi)
-    }
-    pub(crate) fn action(&self) -> Action {
-        match self.tag {
-            0 => Action::Rotate(self.val),
-            _ => Action::Const(self.val as u32),
-        }
-    }
+    /// As the pushes and pulls read it: a ROTATION by `val` as the
+    /// translation it is on the guard (the guard is one floor's: its image
+    /// never wraps - checked, FATAL otherwise), or the constant point.
+    #[inline]
     pub(crate) fn transfer(&self) -> Transfer {
-        Transfer { guard: Seg { lo: self.lo, hi: self.hi }, action: self.action() }
+        let guard = Seg { lo: self.lo, hi: self.hi };
+        let act = match self.tag {
+            0 => {
+                let d = if self.lo as i64 + self.val as i64 >= CIRCLE as i64 { self.val - CIRCLE as i32 } else { self.val };
+                assert!(self.lo as i64 + d as i64 >= 0 && self.hi as i64 + d as i64 <= CIRCLE as i64, "a transfer whose image wraps: {self:?}");
+                Act::Mono(d)
+            }
+            _ => Act::Const(self.val as u32),
+        };
+        Transfer { guard, act }
     }
     fn rotate(lo: u32, hi: u32, v: i64) -> Self {
         AxisXfer { lo, hi, tag: 0, val: v.rem_euclid(ONE) as i32 }
@@ -213,12 +214,12 @@ mod tests {
                     assert!(frag.0 <= v && v <= frag.1, "ox {ox}: rem {rem} is in the guard but not the fragment");
                     let amount = v.div_euclid(65536);
                     let out = v - 32768 - amount * 65536;
-                    assert_eq!(x.action().image(&Set::point(p)), Set::point(arcs::point(out)), "ox {ox} rem {rem}");
+                    assert_eq!(x.transfer().image(Seg { lo: p, hi: p + 1 }), Some(Seg { lo: arcs::point(out), hi: arcs::point(out) + 1 }), "ox {ox} rem {rem}");
                 }
                 // A collision instead: the constant.
                 let c = decode_axis(&split(ox, frag, Some((0, 0)))).unwrap();
                 if image != (0, 0) {
-                    assert_eq!(c.action(), Action::Const(arcs::point(0)));
+                    assert_eq!(c.transfer().act, Act::Const(arcs::point(0)));
                 }
                 assert_eq!((c.lo, c.hi), (x.lo, x.hi));
             }
@@ -232,7 +233,7 @@ mod tests {
         let ox = 65536 + 1;
         let x = decode_axis(&split(ox, (131072, 131072), Some((-32768, -32768)))).unwrap();
         assert_eq!((x.lo, x.hi), (65535, 65536));
-        assert_eq!(x.action().image(&x.guard()), Set::point(0));
+        assert_eq!(x.transfer().image(x.transfer().guard), Some(Seg { lo: 0, hi: 1 }));
     }
 
     /// A platform's carry blocked by a wall set `rem.x = 0` (and `spd.x =
@@ -242,12 +243,12 @@ mod tests {
     fn a_remainder_set_before_the_move_is_a_constant_from_the_whole_circle() {
         let set = RawAxis { took: true, pre: (32768, 32768), frag: (32768, 32768), ox: (0, 0), fin: Some((0, 0)) };
         let x = decode_axis(&set).unwrap();
-        assert_eq!(x.transfer(), Transfer { guard: Seg { lo: 0, hi: CIRCLE }, action: Action::Const(arcs::point(0)) });
+        assert_eq!(x.transfer(), Transfer { guard: Seg { lo: 0, hi: CIRCLE }, act: Act::Const(arcs::point(0)) });
         // With a speed: the point is the set remainder plus the speed plus 1/2.
         let moved = RawAxis { took: true, pre: (32768 + 13107, 32768 + 13107), frag: (32768 + 13107, 32768 + 13107), ox: (13107, 13107), fin: Some((13107, 13107)) };
-        assert_eq!(decode_axis(&moved).unwrap().action(), Action::Const(arcs::point(13107)));
+        assert_eq!(decode_axis(&moved).unwrap().transfer().act, Act::Const(arcs::point(13107)));
         // A death after it: the whole circle, into the dummy coordinate.
-        assert_eq!(decode_axis(&RawAxis { fin: None, ..set }).unwrap().guard(), Set::full());
+        assert_eq!(decode_axis(&RawAxis { fin: None, ..set }).unwrap().transfer().guard, Seg { lo: 0, hi: CIRCLE });
         // Not a remainder, a fragment off the point, a final remainder not a point.
         assert!(decode_axis(&RawAxis { pre: (100_000, 100_000), frag: (100_000, 100_000), ..set }).is_err());
         assert!(decode_axis(&RawAxis { frag: (0, 0), ..set }).is_err());
@@ -257,11 +258,11 @@ mod tests {
     #[test]
     fn no_split_is_identity_or_a_new_player() {
         let none = RawAxis { took: false, pre: (0, 0), frag: (0, 0), ox: (0, 0), fin: Some((-32768, 32767)) };
-        assert_eq!(decode_axis(&none).unwrap().transfer(), Transfer { guard: Seg { lo: 0, hi: CIRCLE }, action: Action::Rotate(0) });
+        assert_eq!(decode_axis(&none).unwrap().transfer(), Transfer { guard: Seg { lo: 0, hi: CIRCLE }, act: Act::Mono(0) });
         let born = RawAxis { fin: Some((0, 0)), ..none };
-        assert_eq!(decode_axis(&born).unwrap().action(), Action::Const(32768));
+        assert_eq!(decode_axis(&born).unwrap().transfer().act, Act::Const(32768));
         let gone = RawAxis { fin: None, ..none };
-        assert_eq!(decode_axis(&gone).unwrap().guard(), Set::full());
+        assert_eq!(decode_axis(&gone).unwrap().transfer().guard, Seg { lo: 0, hi: CIRCLE });
         assert!(decode_axis(&RawAxis { fin: Some((0, 5)), ..none }).is_err());
     }
 

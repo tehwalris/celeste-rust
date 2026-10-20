@@ -46,7 +46,7 @@ impl<N: Rem> Hulls<N> {
     pub(crate) fn open(dir: &std::path::Path, horizon: u32, s: &crate::settings::Settings) -> anyhow::Result<Self> {
         let tree = crate::storage::layer::Tree::<N>::open(dir, horizon)?;
         let (visited, ..) = crate::frame::restore_visited::<N>(dir, horizon, s.room, s.threads())?;
-        let edges = crate::storage::edges::EdgeStore::<N>::open(&dir.join("edges"), horizon)?;
+        let edges = crate::storage::edges::EdgeStore::<N>::open(&dir, horizon)?;
         let starts: Vec<Sk> = tree.layer(0, None, s.threads())?.0.states_iter().collect();
         anyhow::ensure!(starts.len() == 1, "{}: {} states at frame 0", dir.display(), starts.len());
         Ok(Hulls { tree, visited, edges, start: starts[0] })
@@ -64,8 +64,9 @@ pub(super) struct Pruning<'a, N: Rem = P8> {
     pub(crate) start: Option<u32>,
     /// This level's reached nodes (the next level's filter), if it has one.
     pub(crate) reached: Option<&'a Visited<N>>,
-    /// The level -1 filter the tree was built under (`TreeFilter::of_tree`).
-    pub(crate) minus_one: Option<crate::frame::MinusOne>,
+    /// The level -1 filter the tree was built under, with the tree's table
+    /// (`TreeFilter::of_tree`).
+    pub(crate) minus_one: Option<crate::frame::L1>,
     /// The tree's directory, for the report (read on a miss).
     pub(crate) dir: &'a std::path::Path,
     /// The hull forward's claim, checked at every step (`Route::hulls`).
@@ -84,7 +85,7 @@ pub(super) fn check<N: KernelLanes>(route: &Route<N>, p: &Pruning<N>) -> anyhow:
         return Ok(None);
     };
     let frame = clock.frame_of(*exit);
-    let l1 = p.minus_one.map(|m| (m.h, m.table(p.side.s)));
+    let l1 = p.minus_one.map(|m| (m.h, m.table));
     // Per step and state: the first check it fails (`None`: it passes), and
     // where the tree holds it (with `hulls`: its state and remainder).
     let mut verdicts: Vec<Vec<Option<Miss>>> = Vec::with_capacity(run.layers.len());

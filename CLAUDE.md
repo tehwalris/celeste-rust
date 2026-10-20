@@ -93,7 +93,7 @@ latter.
 - **Make misuse loud, keep knobs few.** Settings are command-line flags,
   never environment variables: a binary refuses any `CELESTE_*` variable.
   They are parsed once into `settings::Settings` and PASSED (no globals). A
-  tree records the settings that change it (`<level>/settings.txt`) and
+  tree records the settings that change it (`<level>/tree.txt`) and
   refuses a run under others (`--override-settings` passes only
   `--region`); a run's flags never default to the record. A command that
   only READS a finished tree takes its settings from the record and refuses

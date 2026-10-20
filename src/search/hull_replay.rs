@@ -27,7 +27,7 @@ pub fn replay<N: Rem>(dir: &std::path::Path, to: u32, threads: usize) -> Result<
     let start = crate::search::rem::start_hull::<N>();
     // The recorded graph: out-edges by source (target, transfer).
     let tree = Tree::<N>::open(dir, to)?;
-    let store = EdgeStore::<N>::open(&dir.join("edges"), to)?;
+    let store = EdgeStore::<N>::open(&dir, to)?;
     let xfers: Vec<crate::search::rem::Xfer<N>> = store.pairs().iter().map(N::xfer).collect();
     let mut succ: FxHashMap<Sk, Vec<(Sk, u32)>> = FxHashMap::default();
     let mut out = vec![Frame::default()];

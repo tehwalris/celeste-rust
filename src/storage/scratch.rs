@@ -1,7 +1,7 @@
 //! SCRATCH FILES: created and at once unlinked - nothing is left behind,
 //! whatever ends the process - their bytes page cache the kernel can
 //! reclaim, not anonymous memory. The one primitive behind the frame's
-//! SPOOL (the compressed blocks - out blocks, edge segments - the wave makes
+//! SPOOL (the compressed edge segments the wave makes
 //! long before the frame's end writes them: appended by any thread, read
 //! back by place) and the arc phase's spills (`backward`: W's varints and
 //! runs; `arcs::RegionArena`: its sealed set chunks), written, then mapped.

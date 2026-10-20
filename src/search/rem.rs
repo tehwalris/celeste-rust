@@ -55,7 +55,7 @@ pub trait Rem: EngineNum {
 }
 
 /// A pair as the pushes and pulls read it: per axis the circle's transfer.
-pub(crate) type Xfer<N> = (<<N as Rem>::C as Circle>::Act, <<N as Rem>::C as Circle>::Act);
+pub(crate) type Xfer<N> = (Transfer<<N as Rem>::C>, Transfer<<N as Rem>::C>);
 
 /// A point of `N`'s circle.
 pub(crate) type Point<N> = <<N as Rem>::C as Circle>::P;
@@ -85,16 +85,13 @@ pub(crate) fn holds<N: Rem>(h: &HullOf<N>, x: N, y: N) -> bool {
 /// Does an edge of transfer `p` take the remainder `from` and end at `to`
 /// (`None`: no player at the frame's end; any action)?
 pub(crate) fn maps<N: Rem>(p: &N::Pair, from: (N, N), to: Option<(N, N)>) -> bool {
-    let axis = |a: &<N::C as Circle>::Act, f: N, t: Option<N>| {
+    let axis = |a: &Transfer<N::C>, f: N, t: Option<N>| {
         let Some(f) = N::point(f) else { return false };
-        let g = N::C::guard(a);
-        if !(g.lo <= f && f < g.hi) {
+        if !a.takes(f) {
             return false;
         }
         let Some(t) = t else { return true };
-        let mut image = None;
-        N::C::image(a, Seg { lo: f, hi: N::C::next(f) }, |s| image = Some(s));
-        N::point(t).is_some_and(|t| image == Some(Seg { lo: t, hi: N::C::next(t) }))
+        N::point(t).is_some_and(|t| a.image(Seg { lo: f, hi: N::C::next(f) }) == Some(Seg { lo: t, hi: N::C::next(t) }))
     };
     let (tx, ty) = N::xfer(p);
     axis(&tx, from.0, to.map(|t| t.0)) && axis(&ty, from.1, to.map(|t| t.1))
@@ -113,6 +110,7 @@ impl Rem for P8 {
         };
         Ok((axis(x, "x")?, axis(y, "y")?))
     }
+    #[inline]
     fn xfer(p: &Pair) -> (Transfer, Transfer) {
         (p.0.transfer(), p.1.transfer())
     }
@@ -146,8 +144,9 @@ impl Rem for LuaF64 {
         let axis = |c: &Capture<LuaF64>, name: &str| rem_f64::decode_axis(c).map_err(|e| format!("axis {name} ({c:?}): {e}"));
         Ok((axis(x, "x")?, axis(y, "y")?))
     }
-    fn xfer(p: &rem_f64::Pair) -> rem_f64::Pair {
-        *p
+    #[inline]
+    fn xfer(p: &rem_f64::Pair) -> Xfer<LuaF64> {
+        (p.0.transfer(), p.1.transfer())
     }
     fn point(v: LuaF64) -> Option<u64> {
         rem_f64::index(v.value())

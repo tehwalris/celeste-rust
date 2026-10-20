@@ -36,7 +36,7 @@ pub struct CkhashArgs {
     #[arg(long)]
     edges: bool,
     /// Also fingerprint each frame's FRONTIER (`h{frame} count hash`,
-    /// its hull file): every state whose remainder hull grew there, by
+    /// its frame file's): every state whose remainder hull grew there, by
     /// its (shape, key, cell), layer and hull.
     #[arg(long)]
     hulls: bool,
@@ -104,7 +104,7 @@ pub fn ckhash(run: &Settings, a: CkhashArgs) -> Result<()> {
     if let Some(frame) = dump_edges {
         let tree = Tree::<P8>::open(dir, to)?;
         let content = tree.space.content_hash();
-        let eg = celeste_rust::storage::edges::EdgeStore::<P8>::open(&dir.join("edges"), to)?;
+        let eg = celeste_rust::storage::edges::EdgeStore::<P8>::open(&dir, to)?;
         let node = |s: Sk| content.state(tree.shapes[s.shape(&geo) as usize], s.key, s.cell(&geo));
         for e in eg.edges_at(frame, cfg.threads())? {
             eprintln!("edge {:016x} {:016x} {:?}", node(e.dst), node(e.src), eg.pair(e.xfer));

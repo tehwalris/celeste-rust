@@ -79,7 +79,8 @@ One axis, one frame: `r1 = fl(r + ox)`, `k = floor(fl(r1 + 0.5))`,
   into trace states (`Domain::literal_fragments`), as a literal floor fork.
 - A transfer is `Mono(ox, k)` (`r -> fl(fl(r + ox) - k)`) or `Const`, on a
   guard (an order-interval of doubles) found exactly by bisection with the
-  operation. It is monotone, not a rotation. A point is a double's
+  operation. It is monotone, as 16.16's translations are (`arcs::Transfer`:
+  one model, `Circle::Mono` the arithmetic's). A point is a double's
   total-order key; W is exact in the remainder, as in fixed: the PULL of a
   segment is a segment, computed exactly.
 - The forward is the HULL forward (option (b)): a state's remainders as an

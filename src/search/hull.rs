@@ -14,7 +14,7 @@
 //! holding the union when the union fits in half the circle (its largest
 //! gap, longer than half, holds a cut), and a superset otherwise.
 
-use super::arcs::{clip, Circle, Fixed16, Seg};
+use super::arcs::{clip, Circle, Fixed16, Seg, Transfer};
 #[cfg(test)]
 use super::arcs::{Piece, Region};
 use super::rem::Rem;
@@ -152,7 +152,7 @@ impl<C: Circle> Hull<C> {
     /// points inside the guard, moved by the action. Whether it pushed (not
     /// where either guard misses the arc: a box with an empty side is empty).
     #[inline]
-    pub(crate) fn push(&self, t: &(C::Act, C::Act), acc: &mut HullAcc<C>) -> bool {
+    pub(crate) fn push(&self, t: &(Transfer<C>, Transfer<C>), acc: &mut HullAcc<C>) -> bool {
         let mut xs = [Seg::default(); 4];
         let nx = image(self.x, &t.0, &mut xs);
         if nx == 0 {
@@ -179,13 +179,13 @@ impl<C: Circle> Hull<C> {
     /// or an axis not sent to a constant (its point either way) meets more of
     /// the guard.
     #[inline]
-    pub(crate) fn push_grown(&self, was: &Hull<C>, t: &(C::Act, C::Act), acc: &mut HullAcc<C>) -> bool {
+    pub(crate) fn push_grown(&self, was: &Hull<C>, t: &(Transfer<C>, Transfer<C>), acc: &mut HullAcc<C>) -> bool {
         let (nx, ny) = (meet(self.x, &t.0), meet(self.y, &t.1));
         if nx == 0 || ny == 0 {
             return false;
         }
         let (ox, oy) = (meet(was.x, &t.0), meet(was.y, &t.1));
-        let grows = |a: &C::Act, n: u64, o: u64| C::const_point(a).is_none() && n != o;
+        let grows = |a: &Transfer<C>, n: u64, o: u64| a.const_point().is_none() && n != o;
         if ox != 0 && oy != 0 && !grows(&t.0, nx, ox) && !grows(&t.1, ny, oy) {
             return false;
         }
@@ -219,10 +219,10 @@ impl<C: Circle> Hull<C> {
 
 /// The points of arc `a` inside the guard of `t`.
 #[inline]
-fn meet<C: Circle>(a: Arc<C>, t: &C::Act) -> u64 {
+fn meet<C: Circle>(a: Arc<C>, t: &Transfer<C>) -> u64 {
     let mut n = 0;
     a.segs(|s| {
-        if let Some(c) = clip(s, C::guard(t)) {
+        if let Some(c) = clip(s, t.guard) {
             n += C::wide(c.hi) - C::wide(c.lo);
         }
     });
@@ -231,47 +231,37 @@ fn meet<C: Circle>(a: Arc<C>, t: &C::Act) -> u64 {
 
 /// The image of arc `a` under `t` into `out`; its count (0: guard missed).
 #[inline]
-fn image<C: Circle>(a: Arc<C>, t: &C::Act, out: &mut [Seg<C::P>; 4]) -> usize {
+fn image<C: Circle>(a: Arc<C>, t: &Transfer<C>, out: &mut [Seg<C::P>; 4]) -> usize {
     let mut n = 0usize;
     a.segs(|s| {
-        C::image(t, s, |i| {
+        if let Some(i) = t.image(s) {
             out[n] = i;
             n += 1;
-        })
+        }
     });
     n
 }
 
 /// A direct-mapped cache `(hull, the hull it last pushed, transfer id) ->
 /// the push` (`None`: nothing): sources share hulls and transfers, and a
-/// push depends on nothing else. A new `epoch` when the ids change meaning.
+/// push depends on nothing else.
 pub(crate) struct PushCache<N: Rem = P8> {
     slots: Vec<Slot<N::C>>,
-    epoch: u32,
 }
 
-/// `(hull, last pushed hull, transfer, epoch, push)`.
-type Slot<C> = (Hull<C>, Hull<C>, u32, u32, Option<HullAcc<C>>);
+/// `(hull, last pushed hull, transfer, push)`.
+type Slot<C> = (Hull<C>, Hull<C>, u32, Option<HullAcc<C>>);
 
 /// Entries of a `PushCache` (a power of two).
 const PUSH_CACHE: usize = 1 << 11;
 
 impl<N: Rem> Default for PushCache<N> {
     fn default() -> Self {
-        PushCache { slots: vec![(Hull::default(), Hull::default(), u32::MAX, u32::MAX, None); PUSH_CACHE], epoch: 0 }
+        PushCache { slots: vec![(Hull::default(), Hull::default(), u32::MAX, None); PUSH_CACHE] }
     }
 }
 
 impl<N: Rem> PushCache<N> {
-    /// The transfer ids change meaning from here.
-    pub(crate) fn next_epoch(&mut self) {
-        self.epoch = self.epoch.wrapping_add(1);
-        if self.epoch == u32::MAX {
-            self.slots.fill((Hull::default(), Hull::default(), u32::MAX, u32::MAX, None));
-            self.epoch = 0;
-        }
-    }
-
     /// The push of `h` (`was`: its last pushed hull; itself for a hull
     /// pushed the first time) along transfer `x`, `f()` on a miss.
     #[inline]
@@ -279,11 +269,11 @@ impl<N: Rem> PushCache<N> {
         let (a, b) = (h.hash(), was.hash());
         let k = ((a ^ b.rotate_left(29) ^ (x as u64) << 45).wrapping_mul(0x9e37_79b9_7f4a_7c15) >> (64 - PUSH_CACHE.trailing_zeros())) as usize;
         let e = &mut self.slots[k];
-        if (e.0, e.1, e.2, e.3) == (*h, *was, x, self.epoch) {
-            return e.4;
+        if (e.0, e.1, e.2) == (*h, *was, x) {
+            return e.3;
         }
         let r = f();
-        *e = (*h, *was, x, self.epoch, r);
+        *e = (*h, *was, x, r);
         r
     }
 }
@@ -383,7 +373,7 @@ impl<C: Circle> HullAcc<C> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::search::arcs::{Action, Transfer, CIRCLE};
+    use crate::search::arcs::{Act, Transfer, CIRCLE};
 
     fn lcg(s: &mut u64) -> u32 {
         *s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
@@ -407,8 +397,10 @@ mod tests {
             2 => Seg { lo: a, hi: CIRCLE },
             _ => Seg { lo: a.min(b), hi: a.max(b) + 1 },
         };
-        let action = if lcg(s) % 4 == 0 { Action::Const(lcg(s) % CIRCLE) } else { Action::Rotate((lcg(s) % CIRCLE) as i32 - 32768) };
-        Transfer { guard, action }
+        // A translation keeping the guard inside the circle.
+        let room = (CIRCLE - guard.hi + guard.lo) as i64 + 1;
+        let act = if lcg(s) % 4 == 0 { Act::Const(lcg(s) % CIRCLE) } else { Act::Mono((lcg(s) as i64 % room - guard.lo as i64) as i32) };
+        Transfer { guard, act }
     }
 
     /// Probes: the arcs' ends and neighbours, and random points.

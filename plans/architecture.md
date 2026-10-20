@@ -43,7 +43,7 @@ celeste-rust (src/)
   frame.rs              the forward (ForwardState: start, resume, extend),
                         trees (grow_tree, TreeFilter), wins, MarkFilter
   storage/              the visited set, the wave, the region phase, the
-                        frame/hull/edge/out files (one container: file;
+                        frame/hull/edge files (one container: file;
                         their varints and keys: codec), decode, bench
   search/               driver (the search's levels, each level's arc
                         phase), backward (W, the optimum), reach (inside W;
@@ -254,9 +254,12 @@ pushes into one target accumulate order-free (`HullAcc`: two charts per
 axis, cut at 0 and 1/2, merged by min/max). The frontier of frame t is
 every state whose hull GREW at t: NEW states run the kernels (the only
 expansion a state ever gets; its edges are recorded at its layer + 1);
-GROWN ones re-push their grown hull along their stored out-edges
-(`wave::run_repush`, only where the image grows). Level -1 acts at every
-push. A full hull is not stored and grows no more.
+GROWN ones re-push their grown hull along their recorded edges
+(`wave::run_repush`, only where the image grows), read by TARGET: a re-push
+unit is whole segments of the edge file of the state's layer + 1, their
+records looked up by source (the file's source index names the target
+regions to read).
+Level -1 acts at every push. A full hull is not stored and grows no more.
 
 Sound by induction: a concrete path at state p with remainder r at frame t
 finds p in the tree with layer <= t and r in its hull, and its successor
@@ -287,37 +290,43 @@ wave.
 - per emission the unit's sink drops level -1's rows, keys the row and ORs
   it into a BUNDLE (source key, transfer, offset, target key -> target
   cells) keyed by the target's ROUTE (shape, region slot);
-- a unit ends as per-route CHUNKS with their pushes, and an OUT block,
-  spooled (`storage::spool`). Re-push units make pushes only;
-- a finished slice's chunks become REGION JOBS (`route::run_route`): the
-  pushes merged into the route's touched states, the bundles encoded into
-  a zstd segment of the frame's edge file. The region phase overlaps the
-  kernels.
+- a unit ends as per-route CHUNKS with their pushes. Re-push units make
+  pushes only;
+- a finished slice is GATHERED: the transfers first met in it get their
+  final ids (by content, after every earlier slice's: a function of the
+  frame); its chunks become REGION JOBS (`route::run_route`): the pushes
+  merged into the route's touched states, the bundles encoded into a zstd
+  segment of the frame's edge file (one with a provisional target key
+  waits for the frame's end). The region phase overlaps the kernels.
 
 **The frame's end**: provisional keys made final, new shapes numbered,
-transfers numbered canonically (by the frame's edge count, then content),
 each route SEALED against the visited set (new, grown, or nothing), the
 ladder's filter applied, everything merged into the visited set
-(`absorb`). Then the FRAME FILE (`frames/f{F}.bin`: per region the new
-entries' keys, masks and win masks; the shapes' skeletons), the HULL FILE
-(`hulls/f{F}.bin`), the edge and out files, and last
-`done.txt`. Frame and hull files are read back and compared with the
-forward's state (fatal on a difference). The DECODE GUARD checks a shape's
-first emitted row per worker and wave against its decode.
+(`absorb`). Then the FRAME FILE (`frames/f{F}.bin`, one a frame: per
+region the new entries' keys, masks and win masks; the frame's FRONTIER -
+the new states' hulls, the grown states with their layers and hulls; the
+shapes' skeletons), the edge file, and last the record's trust marker
+(`done`). The frame
+file is read back and compared with the forward's state (fatal on a
+difference). The DECODE GUARD checks a shape's first emitted row per
+worker and wave against its decode.
 
-**Resume** rebuilds the visited set from the frame files, replays the hull
-files, and takes the last hull file as the frontier. A search resumes by
+**Resume** rebuilds the visited set from the frame files, replays their
+frontiers, and takes the last one as the frontier. A search resumes by
 rerunning the same command. The result is a function of the frame, not of
 scheduling: every file is byte-identical at any thread count and over a
 resume.
 
-**Per-tree records**: `settings.txt` (the settings that change the tree,
-the level included; a run under others is refused, `--override-settings`
-passes only `--region`), `level_minus_one.txt` (the filter: `off` or H, S
-and the table's fingerprint; a tree serves horizons up to H and is never
-raised past it), `filtered_for.txt` (a ladder level's marks, horizon and
-filter), `forward.tsv` (per-frame stats), `done.txt` (the one trust
-marker: the frame and the transfer table's trusted length).
+**The tree's record** (`storage::record`, `<level>/tree.txt`, one
+`key value` line each, rewritten whole and atomically): the settings that
+change the tree, the level included (a run under others is refused,
+`--override-settings` passes only `--region`); `level_minus_one` (the
+filter: `off` or H, S and the table's fingerprint; a tree serves horizons
+up to H and is never raised past it; the TABLE itself is `l1-table.bin`
+beside it, which every reader and extension of the tree uses, whatever
+binary); `filtered_for` (a ladder level's marks, horizon and filter);
+`done` (the one trust marker: the frame and the transfer table's trusted
+length). Beside it, `forward.tsv` (per-frame stats).
 
 ## The recorded graph
 
@@ -341,11 +350,15 @@ Per axis one frame does `rem += ox + 1/2; amount = flr(rem); rem -= 1/2 +
 amount`, then steps `|amount| + 1` pixels (a blocked step sets `rem = 0`).
 Mod 1 that is a ROTATION by `ox`, cut at one point. So for a remainder-free
 node and an input, the circle splits into two pieces; in each the frame
-does one discrete thing and maps the remainder by a rotation, or to a
-constant on a collision. The transfer is captured where the tracer forks
-`__split_by_flr` on the player's own `rem` (`arc_edges`): guard = the
-piece, action = rotation or `Const(fin)`; identity on an axis without a
-split. A second player split on an axis in one path is refused (and cannot
+does one discrete thing and TRANSLATES the remainder (the piece is one
+floor's: its image never wraps), or maps it to a constant on a collision.
+The transfer is captured where the tracer forks `__split_by_flr` on the
+player's own `rem` (`arc_edges`): guard = the piece, action = the
+translation or `Const(fin)`; identity on an axis without a split. One
+model for both arithmetics (`arcs::Transfer`): a guard and a MONOTONE
+action (16.16's translation, the doubles' `Mono(ox, k)`) or a constant;
+the tree's table keeps 16.16's as the rotation it is mod 1
+(`arc_edges::AxisXfer`, converted at load and checked not to wrap). A second player split on an axis in one path is refused (and cannot
 happen: `move` is the only splitter). A platform carry blocked by a wall
 sets `rem.x = 0` before the move: a split of one point, decoded as a
 constant. A body without transfer roots is refused at the kernel build.

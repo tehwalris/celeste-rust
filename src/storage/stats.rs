@@ -73,16 +73,15 @@ registry! {
     AbsorbKept "absorb_kept" Count AbsorbKept;
     AbsorbDecoded "absorb_decoded" Count AbsorbDecoded;
     AbsorbMade "absorb_made" Count AbsorbMade;
-    // The re-pushes' out blocks: read, their raw bytes, entries, entries re-pushed.
-    RepushBlocks "repush_blocks" Count RepushBlocks;
+    // The re-pushes' edge segments: read, their raw bytes, their records,
+    // the records whose source (shape, key) is an old state's.
+    RepushSegments "repush_segments" Count RepushSegments;
     RepushRaw "repush_raw_gb" Bytes RepushRaw;
-    RepushEntries "repush_entries" Count RepushEntries;
-    RepushRead "repush_read" Count RepushRead;
+    RepushRecords "repush_records" Count RepushRecords;
+    RepushGrown "repush_grown" Count RepushGrown;
     // The files written.
     EdgeBytes "edge_gb" Bytes EdgeBytes;
-    OutBytes "out_gb" Bytes OutBytes;
     FrameBytes "frame_gb" Bytes FrameBytes;
-    HullBytes "hull_gb" Bytes HullBytes;
     // Walls: the wave, the frame's end, the checkpoint, the frame.
     Wave "wave_ms" Wall Emissions;
     WaveIdle "wave_idle_pct" Count WaveIdle;
@@ -97,12 +96,9 @@ registry! {
     EndLayer "end_layer_ms" Wall Grown;
     EndWins "end_wins_ms" Wall Kept;
     EndEdgeFile "end_edge_file_ms" Wall Edges;
-    EndOutFile "end_out_file_ms" Wall Edges;
-    // The checkpoint's steps.
-    CkptFrame "ckpt_frame_file_ms" Wall Kept;
-    CkptFrameCheck "ckpt_frame_check_ms" Wall Kept;
-    CkptHull "ckpt_hull_file_ms" Wall LanesOut;
-    CkptHullCheck "ckpt_hull_check_ms" Wall LanesOut;
+    // The checkpoint's steps: the frame file written, read back.
+    CkptFile "ckpt_file_ms" Wall LanesOut;
+    CkptCheck "ckpt_check_ms" Wall LanesOut;
     // Worker time: busy, in region jobs, the seal's parts.
     Busy "busy_worker_ms" Work Busy;
     Regions "regions_worker_ms" Work Pushes;
@@ -119,7 +115,6 @@ registry! {
     PhEmit "emit_s" Ticks Emissions;
     PhUnit "unit_s" Ticks LanesIn;
     PhUnitEnd "unit_end_s" Ticks Emissions;
-    PhOutBlocks "out_blocks_s" Ticks Edges;
     PhRepush "repush_s" Ticks RepushEdges;
     PhRegions "regions_s" Ticks Pushes;
     PhGather "gather_s" Ticks PhGather;

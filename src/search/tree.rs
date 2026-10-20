@@ -1,6 +1,6 @@
 //! A FINISHED TREE as the commands that read one open it: its settings and
 //! level from its record (`Settings::of_tree`, never the command line), its
-//! last finished frame (`done.txt`, the forward's trust marker).
+//! last finished frame (the record's trust marker, `record::done`).
 
 use std::path::{Path, PathBuf};
 
@@ -11,8 +11,7 @@ use crate::settings::Settings;
 
 pub struct TreeDir {
     pub dir: PathBuf,
-    /// The tree's settings, with the run's own (threads, diagnostics,
-    /// `--l1-table`).
+    /// The tree's settings, with the run's own (threads, diagnostics).
     pub settings: Settings,
     pub level: Level,
     /// The last finished frame (search step).
@@ -23,7 +22,7 @@ impl TreeDir {
     /// The tree in `dir`, the run's own settings from `run`.
     pub fn open(dir: &Path, run: &Settings) -> Result<TreeDir> {
         let (settings, level) = Settings::of_tree(dir, run)?;
-        let last = crate::storage::edges::done_frame(&dir.join("edges")).ok_or_else(|| anyhow::anyhow!("{}: no finished frame", dir.display()))?;
+        let last = crate::storage::record::done_frame(dir).ok_or_else(|| anyhow::anyhow!("{}: no finished frame", dir.display()))?;
         Ok(TreeDir { dir: dir.to_path_buf(), settings, level, last })
     }
 

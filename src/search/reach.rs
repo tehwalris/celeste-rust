@@ -474,7 +474,7 @@ mod tests {
                     }
                     for e in edges.iter().filter(|e| e.0 == i) {
                         if e.2.takes(p.0) && e.3.takes(p.1) {
-                            let q = (apply(e.2.action, p.0), apply(e.3.action, p.1));
+                            let q = (apply(e.2, p.0), apply(e.3, p.1));
                             if inside(t + 1, e.1, q) {
                                 next.insert((e.1, q));
                                 want[w.index(sid(e.1)).expect("inside W") as usize] = t + 1;

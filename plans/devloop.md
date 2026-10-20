@@ -15,7 +15,7 @@ byte-identical, or re-pins them on evidence.
 - **The fixture frames' fingerprints**: the `f`, `h` and `e` lines (new
   states, frontier hulls, edges, by content) of single frames, 16.16 and
   float (t1, big), and their `b` lines (the bytes of every file the frame
-  wrote: frame, hull, edge and out files). The fixtures themselves are rebuilt from scratch against
+  wrote: frame and edge files). The fixtures themselves are rebuilt from scratch against
   their pins by `./check.sh fixtures`.
 - **The room (1,0) gates** (t2): the f0-f44 `ckhash` (states, edges and
   hulls), and the arc gate. The arc gate pins the marks, W at every frame
@@ -68,7 +68,7 @@ Unit tests are kept only for the basics:
 - PICO-8 and doubles arithmetic (`pico8_num`, `lua_f64`, and the
   kernels against both, `transpile::asm::tests`), with overflow raising;
 - the data structures: key packing (`exact`), the visited set and its
-  packed tables, region sets, bundles, edge, hull, frame and out files;
+  packed tables, region sets, bundles, edge and frame files;
 - the arcs' set operations and the backward and reach DP against their
   definitions (`arcs`, `arc_edges`, `backward`, `reach`, `hull`, `rem_f64`);
 - what no pin reaches. These cover the tracer's and the codegen's edge
@@ -222,10 +222,12 @@ are never committed.
   so: `STALE ... REBUILDING`.
 - One built from other sources is only reported. A fixture is an INPUT,
   pinned by its fingerprint.
-- Transfer ids are canonical (`edges::XferTable::canonical`), so a frame
-  check's edge bytes are a function of the search.
-- Level -1 fixtures keep their table (`NAME/l1-table.bin`; `bench frame`
-  refuses another).
+- Transfer ids are final at each slice's gather (`XferTable::merge`: a
+  function of the frame), so a frame check's edge bytes are a function of
+  the search.
+- Level -1 fixtures hold their table, as every filtered tree does
+  (`NAME/l1-table.bin`, its fingerprint in the record): a frame check uses
+  it, whatever binary.
 - Fixtures are shared by every checkout and READ-ONLY (`ensure` makes them
   so): a step that writes into one fails. Scratch is the run's own:
   `bench frame`'s `/var/tmp/celeste-bench-frame-PID` (removed after), and
@@ -272,5 +274,5 @@ then the tiers' `--pin`.
   split ~20-40 s). That is most of t1's and t2's time. A kernel cache keyed
   on the binary would cut both.
 - **A frame check meets no new transfer** (`ForwardState::at` loads the
-  whole table). The canonical numbering of a frame's new transfers is
-  checked by the full forwards (t2, `fixtures`).
+  whole table). The numbering of a frame's new transfers is checked by
+  the full forwards (t2, `fixtures`).
