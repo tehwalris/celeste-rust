@@ -14,7 +14,7 @@
 //! What a block keeps of a state: the `GLOBAL_NAMES` globals and the
 //! `FIELD_NAMES` fields (`from_block` restores the dropped builtins from its
 //! base state); integer keys past an array part as a dense array with
-//! explicit nils; a closure's captures, tables only. The buttons are
+//! explicit nils (a frame's outcomes hold them so, `dense_ints`); a closure's captures, tables only. The buttons are
 //! written `UBool`, as the kernels write them; `from_block` reads a `UBool`
 //! button as a placeholder `false` (overwritten before it is read) and
 //! returns any other unknown boolean for the driver to fork.
@@ -30,7 +30,7 @@ use celeste_names as gen;
 
 use crate::builtins::BUILTIN_NAMES;
 use crate::trace::domain::Domain;
-use crate::trace::heap::{BodyId, ClosureId, Heap, TableId, Value};
+use crate::trace::heap::{BodyId, ClosureId, Heap, Table, TableId, Value};
 use crate::trace::state::State;
 
 pub const BUTTON_GLOBAL: &str = "__button_states";
@@ -87,6 +87,38 @@ pub fn skeleton<D: Domain, N: EngineNum>(st: &State<D>, cache: Arc<CollisionCach
     to_rt2(st, cache, |_| Ok(AV::Nil), |_| Ok(AV::Nil))
 }
 
+/// A table's array part as a block holds it: integer keys past it
+/// (`got_fruit[1 + level_index()]` on an empty table) at their places in a
+/// dense array with explicit nils.
+fn dense<D: Domain>(t: TableId, table: &Table<D>) -> Result<Vec<Value<D>>> {
+    if table.ints.is_empty() {
+        return Ok(table.arr.to_vec());
+    }
+    ensure!(table.hash.is_empty(), "table #{t} has integer keys and named fields");
+    let lo = *table.ints.keys().next().expect("non-empty");
+    let top = *table.ints.keys().next_back().expect("non-empty");
+    ensure!(lo >= 1, "table #{t} has a non-positive integer key: it has no place in a dense array part");
+    let mut arr = table.arr.to_vec();
+    arr.resize(top as usize, Value::Nil);
+    for (k, v) in &table.ints {
+        arr[*k as usize - 1] = v.clone();
+    }
+    Ok(arr)
+}
+
+/// Every table of `st` with integer keys past its array part made the dense
+/// array a block holds (`dense`): a frame's outcome, so a state traced from
+/// its block (`from_block`) names every slot as the state itself does.
+pub fn dense_ints<D: Domain>(st: &mut State<D>) -> Result<()> {
+    for (t, table) in st.heap.tables.iter_mut() {
+        if !table.ints.is_empty() {
+            table.arr = dense(*t, table)?;
+            table.ints.clear();
+        }
+    }
+    Ok(())
+}
+
 struct ToRt2<'a, D: Domain, E: EngineNum, N, B> {
     st: &'a State<D>,
     rt2: Rt2<E>,
@@ -141,22 +173,7 @@ where
         let st = self.st;
         let table = &st.heap.tables[&t];
         // A table is an object OR an array to the engine, never both.
-        // Integer keys past the array part (`got_fruit[1 + level_index()]` on
-        // an empty table) become a dense array with explicit nils.
-        let arr: Vec<Value<D>> = if table.ints.is_empty() {
-            table.arr.to_vec()
-        } else {
-            ensure!(table.hash.is_empty(), "table #{t} has integer keys and named fields");
-            let lo = *table.ints.keys().next().expect("non-empty");
-            let top = *table.ints.keys().next_back().expect("non-empty");
-            ensure!(lo >= 1, "table #{t} has a non-positive integer key: it has no place in a dense array part");
-            let mut arr = table.arr.to_vec();
-            arr.resize(top as usize, Value::Nil);
-            for (k, v) in &table.ints {
-                arr[*k as usize - 1] = v.clone();
-            }
-            arr
-        };
+        let arr = dense(t, table)?;
         ensure!(table.hash.is_empty() || arr.is_empty(), "table #{t} has both named and array parts");
         let button = Some(t) == self.buttons;
         // An EMPTY table has no kind yet: `Unk`, not an object with no fields

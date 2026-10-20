@@ -168,7 +168,11 @@ fallback to the interpreter.
 
 **The lattice walk** (`trace::walk::room_constant_lattice`) walks (shape,
 region) nodes from the start in parallel rounds, traced against the
-round's lattice snapshot. A region (`--region px,S`, default 16 px, S <= 7
+round's lattice snapshot. A shape is its block's shape hash, the kernels'
+key; its representative is a one-lane block (its own scalars blanked, every
+other one a constant), and a trace starts from its `from_block`: the heap
+the reference engine reads. A frame's outcomes hold integer keys as a
+block does (`block::dense_ints`). A region (`--region px,S`, default 16 px, S <= 7
 because `move`'s loop is unrolled for `|amount| <= 8`) bounds the player's
 whole-pixel x/y, remainder and speed, all checked per lane. A row outside
 every region has no kernel and stops the run.

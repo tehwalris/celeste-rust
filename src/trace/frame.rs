@@ -346,6 +346,9 @@ fn finish_outcome<A: GraphArith>(
     cache: &std::sync::Arc<celeste_core::collision_cache::CollisionCache>,
 ) -> Result<FrameOut<A>> {
     s.gc();
+    // Integer keys as a block holds them: a state traced from the outcome's
+    // block names its slots alike.
+    super::block::dense_ints(&mut s)?;
     // Absent-as-zero fields: shape, not precision, so every level.
     super::widen::materialize_absent_fields(&mut s, &mut it.d)?;
     // The transfer roots: the remainder read BEFORE the widenings.
