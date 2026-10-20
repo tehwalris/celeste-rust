@@ -12,7 +12,6 @@
 //! those lanes. Booleans are compared on both planes (`val` and `known`) on
 //! every lane: the oracle spells out the planes' Kleene formulas.
 
-use std::collections::HashMap;
 use std::os::raw::c_void;
 
 use celeste_core::arith::{Arithmetic, EngineNum, Fixed, Float};
@@ -22,8 +21,8 @@ use celeste_core::lua_f64::LuaF64;
 use celeste_core::pico8_num::Pico8Num as P8;
 
 use crate::compiled::asm_kernel::KernelLanes;
-use crate::transpile::asm::{compile, compile_and_load_reprs, AsmArith, AsmCtx, AsmOptions, CellRepr, CollisionEnv, Compiled, Loaded, RootKind};
-use crate::transpile::graph::{one_operand, Graph, NodeId, Op};
+use crate::transpile::asm::{compile, compile_and_load, AsmArith, AsmCtx, AsmOptions, CollisionEnv, Compiled, Loaded};
+use crate::transpile::graph::{one_operand, Graph, NodeId, Op, Ty, Unknown};
 
 /// A tiny deterministic PRNG (splitmix64), so the tests need no `rand`.
 struct Lcg(u64);
@@ -438,25 +437,8 @@ fn lane_value<A: TestArith>(g: &Graph<A>, out: &[Option<V<A>>], id: NodeId, row:
     })
 }
 
-/// A cell's input layout: an interval where some lane holds one.
-fn reprs_of<A: Arithmetic>(rows: &[Vec<In<A>>]) -> HashMap<u32, CellRepr> {
-    let mut reprs = HashMap::new();
-    for row in rows {
-        for (c, v) in row.iter().enumerate() {
-            let r = match v {
-                In::N(_) => continue,
-                In::I(..) => CellRepr::Ival,
-                In::B(_) => CellRepr::Bool,
-                In::U(..) => CellRepr::UBool,
-            };
-            reprs.insert(c as u32, r);
-        }
-    }
-    reprs
-}
-
-fn build<A: TestArith>(g: &Graph<A>, roots: &[NodeId], reprs: &HashMap<u32, CellRepr>, tag: &str) -> (Compiled, Loaded) {
-    compile_and_load_reprs(g, roots, tag, reprs, AsmOptions::default()).expect("compile and load")
+fn build<A: TestArith>(g: &Graph<A>, roots: &[NodeId], tag: &str) -> (Compiled, Loaded) {
+    compile_and_load(g, roots, tag, AsmOptions::default()).expect("compile and load")
 }
 
 /// Run up to sixteen lanes (`rows[j]`: lane `j`'s cells; unused lanes repeat
@@ -474,17 +456,17 @@ fn run<A: TestArith>(c: &Compiled, l: &Loaded, rows: &[Vec<In<A>>], env: Option<
         for j in 0..16 {
             let put = |buf: &mut Vec<u8>, at: usize, v: A::Num| A::Num::put(buf, ib, at, j, v.raw());
             match (c.input_reprs[ci], row(j)[*cell as usize]) {
-                (CellRepr::Num, In::N(x)) => put(&mut inbuf, off, x),
-                (CellRepr::Ival, In::I(lo, hi)) => {
+                (Ty::Num, In::N(x)) => put(&mut inbuf, off, x),
+                (Ty::Ival, In::I(lo, hi)) => {
                     put(&mut inbuf, off, lo);
                     put(&mut inbuf, off + 64, hi);
                 }
-                (CellRepr::Ival, In::N(x)) => {
+                (Ty::Ival, In::N(x)) => {
                     put(&mut inbuf, off, x);
                     put(&mut inbuf, off + 64, x);
                 }
-                (CellRepr::Bool, In::B(b)) => val |= (b as u16) << j,
-                (CellRepr::UBool, In::U(v, k)) => {
+                (Ty::Bool, In::B(b)) => val |= (b as u16) << j,
+                (Ty::UBool, In::U(v, k)) => {
                     val |= (v as u16) << j;
                     known |= (k as u16) << j;
                 }
@@ -492,9 +474,9 @@ fn run<A: TestArith>(c: &Compiled, l: &Loaded, rows: &[Vec<In<A>>], env: Option<
             }
         }
         match c.input_reprs[ci] {
-            CellRepr::Bool => A::Num::put_masks(&mut inbuf, ib, off, val, None),
-            CellRepr::UBool => A::Num::put_masks(&mut inbuf, ib, off, val, Some(known)),
-            CellRepr::Num | CellRepr::Ival => {}
+            Ty::Bool => A::Num::put_masks(&mut inbuf, ib, off, val, None),
+            Ty::UBool => A::Num::put_masks(&mut inbuf, ib, off, val, Some(known)),
+            Ty::Num | Ty::Ival => {}
         }
     }
     A::Num::before_call();
@@ -507,9 +489,9 @@ fn run<A: TestArith>(c: &Compiled, l: &Loaded, rows: &[Vec<In<A>>], env: Option<
                 .map(|r| {
                     let o = c.root_offsets[r] as usize;
                     match c.root_kinds[r] {
-                        RootKind::Num => Out::N(A::Num::lane(&out, ob, o, j)),
-                        RootKind::Ival => Out::I(A::Num::lane(&out, ob, o, j), A::Num::lane(&out, ob, o + 64, j)),
-                        RootKind::Bool => {
+                        Ty::Num => Out::N(A::Num::lane(&out, ob, o, j)),
+                        Ty::Ival => Out::I(A::Num::lane(&out, ob, o, j), A::Num::lane(&out, ob, o + 64, j)),
+                        Ty::Bool | Ty::UBool => {
                             let (val, known) = A::Num::masks(&out, ob, o);
                             Out::B(val >> j & 1 == 1, known >> j & 1 == 1)
                         }
@@ -539,7 +521,7 @@ where
 /// every root's slot against the oracle wherever it is defined. Returns the
 /// oracle's root values per row (for a test's own coverage counts).
 fn check<A: TestArith>(g: &Graph<A>, roots: &[NodeId], rows: &[Vec<In<A>>], env: Option<&CollisionEnv>, tag: &str) -> Vec<Vec<Option<V<A>>>> {
-    let (c, l) = build(g, roots, &reprs_of(rows), tag);
+    let (c, l) = build(g, roots, tag);
     let mut compared = 0usize;
     let mut wants = Vec::with_capacity(rows.len());
     for chunk in rows.chunks(16) {
@@ -580,9 +562,15 @@ fn intervals<A: TestArith>() -> Vec<(A::Num, A::Num)> {
     out
 }
 
-/// A graph over cells `0..n`.
-fn cells<A: TestArith>(g: &mut Graph<A>, n: u32) -> Vec<NodeId> {
-    (0..n).map(|c| g.leaf(Op::Cell(c))).collect()
+/// Cells `0..`, of the types `tys`.
+fn cells<A: TestArith>(g: &mut Graph<A>, tys: &[Ty]) -> Vec<NodeId> {
+    g.set_cell_kinds(tys.iter().enumerate().map(|(c, t)| (c as u32, *t)));
+    (0..tys.len() as u32).map(|c| g.leaf(Op::Cell(c))).collect()
+}
+
+/// A number's type, or an interval's (`wide`).
+fn num_or_ival(wide: bool) -> Ty {
+    if wide { Ty::Ival } else { Ty::Num }
 }
 
 fn lit<A: TestArith>(g: &mut Graph<A>, v: A::Num) -> NodeId {
@@ -609,7 +597,7 @@ macro_rules! both {
 fn sums_differences_and_extremes<A: TestArith>() {
     for wide in [false, true] {
         let mut g = Graph::<A>::default();
-        let c = cells(&mut g, 2);
+        let c = cells(&mut g, &[num_or_ival(wide); 2]);
         let mut roots = Vec::new();
         for op in [Op::Add, Op::Sub, Op::Min, Op::Max] {
             let r = g.add(op.clone(), vec![c[0], c[1]]);
@@ -638,7 +626,7 @@ both!(sums_differences_and_extremes, sums_differences_and_extremes_fixed, sums_d
 fn unary_operations<A: TestArith>() {
     for wide in [false, true] {
         let mut g = Graph::<A>::default();
-        let x = cells(&mut g, 1)[0];
+        let x = cells(&mut g, &[num_or_ival(wide)])[0];
         let (neg, abs, flr) = (g.add(Op::Neg, vec![x]), g.add(Op::Abs, vec![x]), g.add(Op::Flr, vec![x]));
         let mut roots = vec![neg, abs, flr, g.add(Op::NoWrap, vec![neg]), g.add(Op::NoWrap, vec![abs]), g.add(Op::Known, vec![flr])];
         if !wide {
@@ -662,7 +650,7 @@ fn comparisons<A: TestArith>() {
     let ops = [Op::Lt, Op::Le, Op::Gt, Op::Ge, Op::Eq];
     for (wide_x, wide_y) in [(false, false), (true, true), (true, false)] {
         let mut g = Graph::<A>::default();
-        let c = cells(&mut g, 2);
+        let c = cells(&mut g, &[num_or_ival(wide_x), num_or_ival(wide_y)]);
         let mut roots: Vec<NodeId> = ops.iter().map(|o| g.add(o.clone(), vec![c[0], c[1]])).collect();
         roots.extend(ops.iter().map(|o| g.add(o.clone(), vec![c[1], c[0]])));
         if !wide_x && !A::EQ_IS_IDENTITY {
@@ -686,7 +674,7 @@ both!(comparisons, comparisons_fixed, comparisons_float);
 fn products_and_quotients_by_a_literal<A: TestArith>() {
     for wide in [false, true] {
         let mut g = Graph::<A>::default();
-        let x = cells(&mut g, 1)[0];
+        let x = cells(&mut g, &[num_or_ival(wide)])[0];
         let mut roots = Vec::new();
         for k in A::factors(wide) {
             let kn = lit(&mut g, k);
@@ -716,12 +704,12 @@ both!(products_and_quotients_by_a_literal, products_and_quotients_by_a_literal_f
 /// planes, not only on the known lanes.
 fn the_boolean_layer_is_bit_exact<A: TestArith>() {
     let mut g = Graph::<A>::default();
-    let c = cells(&mut g, 4);
+    let c = cells(&mut g, &[Ty::UBool, Ty::Bool, Ty::Num, Ty::Num]);
     let (u, b, x, y) = (c[0], c[1], c[2], c[3]);
     let cmp = g.add(Op::Lt, vec![x, y]);
     let t = g.leaf(Op::ConstBool(true));
     let f = g.leaf(Op::ConstBool(false));
-    let k = g.leaf(Op::UnknownBool(0));
+    let k = g.leaf(Op::UnknownBool(Unknown::Atom(0)));
     let leaves = [u, b, cmp, t, f, k];
     let mut roots = Vec::new();
     for &p in &leaves {
@@ -750,7 +738,7 @@ both!(the_boolean_layer_is_bit_exact, the_boolean_layer_is_bit_exact_fixed, the_
 /// points, and (16.16) the top floors, where the grid wraps.
 fn fork_fragments<A: TestArith>() {
     let mut g = Graph::<A>::default();
-    let x = cells(&mut g, 1)[0];
+    let x = cells(&mut g, &[Ty::Ival])[0];
     let ways = 3u8;
     let mut roots = Vec::new();
     for c in 0..ways {
@@ -794,9 +782,9 @@ both!(fork_fragments, fork_fragments_fixed, fork_fragments_float);
 /// on a lane holding the literal, wraps included.
 fn a_literals_split_ok_folds_to_the_kernels<A: TestArith>() {
     let mut g = Graph::<A>::default();
-    let x = cells(&mut g, 1)[0];
+    let x = cells(&mut g, &[Ty::Ival])[0];
     let roots: Vec<NodeId> = (1..=4).map(|w| g.add(Op::SplitOk(w), vec![x])).collect();
-    let (c, l) = build(&g, &roots, &HashMap::from([(0, CellRepr::Ival)]), "litsplit");
+    let (c, l) = build(&g, &roots, "litsplit");
     let lits = intervals::<A>();
     for chunk in lits.chunks(16) {
         let rows: Vec<Vec<In<A>>> = chunk.iter().map(|(lo, hi)| vec![In::I(*lo, *hi)]).collect();
@@ -819,7 +807,7 @@ fn collision_lookups<A: TestArith>() {
     let cache = CollisionCache::new(1, 0);
     let env = CollisionEnv { cache: &cache };
     let mut g = Graph::<A>::default();
-    let c = cells(&mut g, 4);
+    let c = cells(&mut g, &[Ty::Num; 4]);
     let (w8, h6, flag0) = (lit(&mut g, A::from_i16(8)), lit(&mut g, A::from_i16(6)), lit(&mut g, A::from_i16(0)));
     let m = g.add(Op::Mget, vec![c[0], c[1]]);
     let roots = vec![
@@ -851,10 +839,10 @@ fn the_ice_map_is_the_tile_scan<A: TestArith>() {
         })
     };
     let mut g = Graph::<A>::default();
-    let c = cells(&mut g, 2);
+    let c = cells(&mut g, &[Ty::Num; 2]);
     let (w, h, flag) = (lit(&mut g, A::from_i16(6)), lit(&mut g, A::from_i16(5)), lit(&mut g, A::from_i16(4)));
     let roots = vec![g.add(Op::TileFlagAt, vec![c[0], c[1], w, h, flag])];
-    let (k, l) = build(&g, &roots, &HashMap::new(), "ice");
+    let (k, l) = build(&g, &roots, "ice");
     let mut hits = 0;
     for y in -8..136i16 {
         for xs in (-8..136i16).collect::<Vec<_>>().chunks(16) {
@@ -877,7 +865,7 @@ both!(the_ice_map_is_the_tile_scan, the_ice_map_is_the_tile_scan_fixed, the_ice_
 fn input_representations<A: TestArith>() {
     let mut rng = Lcg(0x600d_cafe);
     let mut g = Graph::<A>::default();
-    let c = cells(&mut g, 5);
+    let c = cells(&mut g, &[Ty::Num, Ty::Bool, Ty::Num, Ty::UBool, Ty::Ival]);
     let (num, bool_, num2, ubool, ival) = (c[0], c[1], c[2], c[3], c[4]);
     let notb = g.add(Op::Not, vec![bool_]);
     let sum = g.add(Op::Add, vec![ival, num]);
@@ -900,8 +888,8 @@ fn input_representations<A: TestArith>() {
         })
         .collect();
     check(&g, &roots, &rows, None, "inputs");
-    let (k, _) = build(&g, &roots, &reprs_of(&rows), "inputs");
-    use RootKind::{Bool as B, Ival as I, Num as N};
+    let (k, _) = build(&g, &roots, "inputs");
+    use Ty::{Bool as B, Ival as I, Num as N};
     assert_eq!(k.root_kinds, vec![N, N, B, B, B, B, I, N, I]);
     assert_eq!(k.input_cells, vec![0, 1, 2, 3, 4]);
     assert_eq!(k.input_offsets, vec![0, 64, 128, 192, 256]);
@@ -947,7 +935,7 @@ fn scalar_overflow_is_at_most_two_compares() {
     let roots: Vec<NodeId> = ops.iter().chain(&oks).copied().collect();
     // One compare per distinct bound a literal form puts on `x`, and one
     // sign test per two-cell `+`/`-`; nothing else compares.
-    let text = compile(&g, &roots, "scalarovf", &HashMap::new(), Default::default()).expect("compile").asm;
+    let text = compile(&g, &roots, "scalarovf", Default::default()).expect("compile").asm;
     let compares = text.lines().filter(|l| l.trim_start().starts_with("vpcmpd")).count();
     let mut bounds = std::collections::BTreeSet::new();
     for &o in &ops {
@@ -985,7 +973,7 @@ fn scalar_overflow_is_at_most_two_compares() {
 #[test]
 fn interval_overflow_declines() {
     let mut g = Graph::new();
-    let (civ, cnum) = (g.leaf(Op::Cell(0)), g.leaf(Op::Cell(1)));
+    let (civ, cnum) = (cells(&mut g, &[Ty::Ival, Ty::Num])[0], g.leaf(Op::Cell(1)));
     let add = g.add(Op::Add, vec![civ, cnum]);
     let sub = g.add(Op::Sub, vec![civ, cnum]);
     let neg = g.add(Op::Neg, vec![civ]);
@@ -1032,7 +1020,7 @@ fn interval_overflow_declines() {
 fn interval_scale_and_divide_overflow_is_one_compare_a_bound() {
     let fits = |g: &Graph, x: NodeId| one_operand(g, x).expect("one operand").fits.expect("fits somewhere");
     let mut g = Graph::new();
-    let civ = g.leaf(Op::Cell(0));
+    let civ = cells(&mut g, &[Ty::Ival])[0];
     // (op, raw literal, the literal first, can wrap)
     let forms: [(Op, i32, bool, bool); 10] = [
         (Op::Mul, 0x2_0000, false, true),
@@ -1053,8 +1041,7 @@ fn interval_scale_and_divide_overflow_is_one_compare_a_bound() {
     }
     let oks: Vec<NodeId> = ops.iter().map(|&x| g.add(Op::NoWrap, vec![x])).collect();
     let roots: Vec<NodeId> = ops.iter().chain(&oks).copied().collect();
-    let reprs = HashMap::from([(0u32, CellRepr::Ival)]);
-    let text = compile(&g, &roots, "ivalscale", &reprs, Default::default()).expect("compile").asm;
+    let text = compile(&g, &roots, "ivalscale", Default::default()).expect("compile").asm;
     let compares = text.lines().filter(|l| l.trim_start().starts_with("vpcmpd")).count();
     // One per distinct bound a literal can cross (`*2` and `/0.5` share
     // theirs, `*1.00002` and `/0.99998` their low one), none for the rest.
@@ -1108,7 +1095,7 @@ fn inline_div_rem_by_a_power_of_two_is_pico8s() {
         let c = g.leaf(Op::Const(d, d));
         roots.push(g.add(Op::Rem, vec![x, c]));
     }
-    let text = compile(&g, &roots, "pow2", &HashMap::new(), Default::default()).expect("compile").asm;
+    let text = compile(&g, &roots, "pow2", Default::default()).expect("compile").asm;
     assert!(!text.contains("call"), "a power-of-two divisor is inline");
     let mut edges: Vec<i32> = vec![i32::MIN, i32::MIN + 1, i32::MAX, i32::MAX - 1, 0, 1, -1];
     for k in 0..31 {
@@ -1160,7 +1147,7 @@ fn a_call_out_preserves_what_is_live_across_it() {
     let q = g.add(Op::Div, vec![before, three]); // a call-out, after `before`
     let n = g.add(Op::Neg, vec![q]); // reads ZERO after the call
     let roots = vec![g.add(Op::Add, vec![before, n]), before];
-    let text = compile(&g, &roots, "livecall", &HashMap::new(), Default::default()).expect("compile").asm;
+    let text = compile(&g, &roots, "livecall", Default::default()).expect("compile").asm;
     // Stores to the stack: the call's two arguments and the saves.
     let stores = text.lines().filter(|l| l.contains("vmovdqu64 %zmm") && l.contains("(%rsp)")).count();
     assert!(text.contains("call") && (3..32).contains(&stores), "{stores} stack stores around the call");
@@ -1185,7 +1172,7 @@ fn values_held_across_a_run_of_calls_survive_it() {
         })
         .collect();
     let roots: Vec<NodeId> = held.iter().chain(&qs).copied().collect();
-    let text = compile(&g, &roots, "callrun", &HashMap::new(), Default::default()).expect("compile").asm;
+    let text = compile(&g, &roots, "callrun", Default::default()).expect("compile").asm;
     assert_eq!(text.matches("call *%rax").count(), 8, "eight call-outs");
     let mut rng = Lcg(0x5a7e_0a11);
     let rows: Vec<Vec<In<Fixed>>> = (0..256).map(|_| (0..8).map(|_| In::N(Fixed::random(&mut rng, true))).collect()).collect();
@@ -1214,7 +1201,7 @@ fn rematerialized_constants_under_pressure_are_exact() {
         let ge = g.add(Op::Ge, vec![cs[i], min]);
         roots.push(g.add(Op::Sel, vec![ge, ks[(i + 5) % ks.len()], s]));
     }
-    let text = compile(&g, &roots, "remat", &HashMap::new(), Default::default()).expect("compile").asm;
+    let text = compile(&g, &roots, "remat", Default::default()).expect("compile").asm;
     let consts = text.lines().filter(|l| l.contains("vpbroadcastd") || l.contains("vpternlogd $0xff") || l.trim_start().starts_with("vpxord")).count();
     assert!(text.contains("(%rsp)") && consts > ks.len(), "the test needs spilled constants: {consts} materializations");
     let mut rng = Lcg(0x4e3a_7a7e);
@@ -1230,7 +1217,7 @@ fn rematerialized_constants_under_pressure_are_exact() {
 fn float_products_and_quotients_of_two_cells() {
     for wide in [false, true] {
         let mut g = Graph::<Float>::default();
-        let c = cells(&mut g, 2);
+        let c = cells(&mut g, &[num_or_ival(wide); 2]);
         let mut roots = Vec::new();
         for op in [Op::Mul, Op::Div].into_iter().chain((!wide).then_some(Op::Rem)) {
             let r = g.add(op, vec![c[0], c[1]]);
@@ -1250,7 +1237,7 @@ fn float_products_and_quotients_of_two_cells() {
 #[test]
 fn float_min_max_take_the_second_argument_on_a_tie() {
     let mut g = Graph::<Float>::default();
-    let c = cells(&mut g, 2);
+    let c = cells(&mut g, &[Ty::Num; 2]);
     let roots = vec![g.add(Op::Min, vec![c[0], c[1]]), g.add(Op::Max, vec![c[0], c[1]])];
     let z = |v: f64| In::N(LuaF64::new(v).expect("finite"));
     let wants = check(&g, &roots, &[vec![z(0.0), z(-0.0)], vec![z(-0.0), z(0.0)]], None, "ftie");
@@ -1266,7 +1253,7 @@ fn float_min_max_take_the_second_argument_on_a_tie() {
 #[test]
 fn float_literals_and_rounding_are_the_carts() {
     let mut g = Graph::<Float>::default();
-    let c = cells(&mut g, 2);
+    let c = cells(&mut g, &[Ty::Num; 2]);
     let tenth = lit(&mut g, LuaF64::new(0.1).expect("finite"));
     let p = g.add(Op::Mul, vec![c[0], c[1]]);
     let roots = vec![g.add(Op::Add, vec![c[0], tenth]), g.add(Op::Add, vec![p, tenth])];

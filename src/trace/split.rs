@@ -704,19 +704,6 @@ fn three_valued<A: GraphArith>(d: &mut Symbolic<A>, root: NodeId) -> NodeId {
     if !nodes.iter().any(|n| undecided(d, *n)) {
         return root;
     }
-    // Booleans typed bottom-up from what each node IS, never from readers.
-    let mut boolean: rustc_hash::FxHashSet<NodeId> = Default::default();
-    for &n in &nodes {
-        let node = d.graph.get(n);
-        let b = match node.op {
-            Op::Sel => boolean.contains(&node.args[1]) || boolean.contains(&node.args[2]),
-            Op::Cell(c) => d.graph.cell_kind(c) == crate::transpile::graph::CellKind::Bool,
-            ref o => is_bool_op(o),
-        };
-        if b {
-            boolean.insert(n);
-        }
-    }
     let mut map: rustc_hash::FxHashMap<NodeId, NodeId> = Default::default();
     // What undecided selects reach transitively, and those numbers' exact
     // per-arm values.
@@ -738,7 +725,7 @@ fn three_valued<A: GraphArith>(d: &mut Symbolic<A>, root: NodeId) -> NodeId {
         // decided select into an undecided one.
         let new = if sel_undecided {
             let (c, x, y) = (a[0], a[1], a[2]);
-            if boolean.contains(&n) {
+            if d.graph.ty(n).is_bool() {
                 let nc = d.graph.fold(Op::Not, vec![c]);
                 let tx = d.graph.fold(Op::And, vec![c, x]);
                 let fy = d.graph.fold(Op::And, vec![nc, y]);
@@ -758,19 +745,19 @@ fn three_valued<A: GraphArith>(d: &mut Symbolic<A>, root: NodeId) -> NodeId {
                 let hull = d.graph.fold(Op::Span, vec![lo, hi]);
                 d.graph.fold(Op::Sel, vec![decided, picked, hull])
             }
-        } else if exact_only(d, &op, &args) && args.iter().any(|x| affected.contains(x) && !boolean.contains(x) && !is_bool_op(&d.graph.get(*x).op)) {
+        } else if d.graph.exact_operands_only(&op, &args) && args.iter().any(|x| numeric(d, &affected, *x)) {
             // An exact-only op reading a hull: distributed over the arm
             // combinations (Kleene join / hull); past `ARMS`, the weakest value.
             let mut combos: Option<Vec<(NodeId, Vec<NodeId>)>> = Some(vec![(yes, Vec::new())]);
             for (k, x) in args.iter().enumerate() {
-                let alts = if affected.contains(x) && !boolean.contains(x) && !is_bool_op(&d.graph.get(*x).op) {
-                    arms(d, *x, &map, &affected, &boolean, &mut arms_memo)
+                let alts = if numeric(d, &affected, *x) {
+                    arms(d, *x, &map, &affected, &mut arms_memo)
                 } else {
                     Some(vec![(yes, a[k])])
                 };
                 combos = arm_product(d, combos, alts);
             }
-            let boolean_op = is_bool_op(&op);
+            let boolean_op = d.graph.ty(n).is_bool();
             match combos {
                 Some(cs) if boolean_op => {
                     let mut out = d.graph.leaf(Op::ConstBool(false));
@@ -834,27 +821,9 @@ fn arm_product<A: GraphArith>(d: &mut Symbolic<A>, combos: Option<Vec<(NodeId, V
 
 const ARMS: usize = 64;
 
-/// Ops the kernel computes on exact operands only (`asm::codegen`'s
-/// `as_num`); `Mul`/`Div` also take an interval times a positive literal.
-fn exact_only<A: GraphArith>(d: &Symbolic<A>, op: &crate::transpile::graph::Op<A>, args: &[NodeId]) -> bool {
-    use crate::transpile::graph::Op;
-    let pos = |n: NodeId| matches!(d.graph.get(n).op, Op::Const(lo, hi) if lo == hi && A::lt(A::from_i16(0), A::from_lit(lo)));
-    match op {
-        Op::TileFlagAt | Op::Mget | Op::Rem | Op::Sin => true,
-        Op::Mul => !(pos(args[0]) || pos(args[1])),
-        Op::Div => !pos(args[1]),
-        _ => false,
-    }
-}
-
-fn is_bool_op<A: GraphArith>(op: &crate::transpile::graph::Op<A>) -> bool {
-    use crate::transpile::graph::Op;
-    matches!(
-        op,
-        Op::Lt | Op::Le | Op::Gt | Op::Ge | Op::Eq | Op::Not | Op::And | Op::Or | Op::Known | Op::ConstBool(_) | Op::UnknownBool(_) | Op::TileFlagAt
-            | Op::SplitValid(_) | Op::SplitOk(_) | Op::FragOk(_) | Op::NoWrap
-            | Op::RSplitValid(_) | Op::RSplitOk(_) | Op::RFragOk(_) | Op::Same
-    )
+/// A number an undecided select reaches (`three_valued`'s `affected`).
+fn numeric<A: GraphArith>(d: &Symbolic<A>, affected: &rustc_hash::FxHashSet<NodeId>, x: NodeId) -> bool {
+    affected.contains(&x) && !d.graph.ty(x).is_bool()
 }
 
 fn hull_of<A: GraphArith>(d: &mut Symbolic<A>, vals: &[NodeId]) -> NodeId {
@@ -875,7 +844,6 @@ fn arms<A: GraphArith>(
     n: NodeId,
     map: &rustc_hash::FxHashMap<NodeId, NodeId>,
     affected: &rustc_hash::FxHashSet<NodeId>,
-    boolean: &rustc_hash::FxHashSet<NodeId>,
     memo: &mut rustc_hash::FxHashMap<NodeId, Option<Vec<(NodeId, NodeId)>>>,
 ) -> Option<Vec<(NodeId, NodeId)>> {
     use crate::transpile::graph::Op;
@@ -887,14 +855,13 @@ fn arms<A: GraphArith>(
         let node = d.graph.get(n);
         (node.op.clone(), node.args.clone())
     };
-    let numeric = |d: &Symbolic<A>, x: NodeId| affected.contains(&x) && !boolean.contains(&x) && !is_bool_op(&d.graph.get(x).op);
     let out = if !affected.contains(&n) {
         Some(vec![(yes, *map.get(&n).unwrap_or(&n))])
     } else if op == Op::Sel && (d.lane_undecidable(args[0]) || d.lane_undecidable(*map.get(&args[0]).unwrap_or(&args[0]))) {
         // Undecided as rewritten too: an arm per answer.
         let c = *map.get(&args[0]).unwrap_or(&args[0]);
         let nc = d.graph.fold(Op::Not, vec![c]);
-        match (arms(d, args[1], map, affected, boolean, memo), arms(d, args[2], map, affected, boolean, memo)) {
+        match (arms(d, args[1], map, affected, memo), arms(d, args[2], map, affected, memo)) {
             (Some(t), Some(f)) if t.len() + f.len() <= ARMS => {
                 let mut v = Vec::with_capacity(t.len() + f.len());
                 for (k, x) in t {
@@ -910,7 +877,7 @@ fn arms<A: GraphArith>(
     } else {
         let mut combos: Option<Vec<(NodeId, Vec<NodeId>)>> = Some(vec![(yes, Vec::new())]);
         for x in &args {
-            let alts = if numeric(d, *x) { arms(d, *x, map, affected, boolean, memo) } else { Some(vec![(yes, *map.get(x).unwrap_or(x))]) };
+            let alts = if numeric(d, affected, *x) { arms(d, *x, map, affected, memo) } else { Some(vec![(yes, *map.get(x).unwrap_or(x))]) };
             combos = arm_product(d, combos, alts);
         }
         combos.map(|cs| cs.into_iter().map(|(c, vs)| (c, d.graph.fold(op.clone(), vs))).collect())

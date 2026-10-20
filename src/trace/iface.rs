@@ -11,7 +11,7 @@ use anyhow::{anyhow, bail, Result};
 use celeste_core::arith::Fixed;
 
 use crate::transpile::garith::GraphArith;
-use crate::transpile::graph::Op;
+use crate::transpile::graph::{Op, Ty};
 
 use super::domain::{Domain, Symbolic};
 use super::heap::Value;
@@ -152,10 +152,6 @@ pub struct Iface<A: GraphArith = Fixed> {
     pub slots: Vec<Path>,
     pub init: Vec<Conc<A>>,
     pub pins: Vec<(usize, Conc<A>)>,
-    /// Parallel to `slots`: a number slot holds an INTERVAL (`init` still
-    /// records a point), a boolean slot may be unknown in a lane (an `ival` /
-    /// `ubool` input).
-    pub ival: Vec<bool>,
 }
 
 /// Replace every scalar under `roots` with a fresh `Op::Cell` leaf, and
@@ -163,7 +159,9 @@ pub struct Iface<A: GraphArith = Fixed> {
 /// heap staying concrete (`btn(k_left)` indexes with a global). A slot
 /// reached twice gets one cell; cells are numbered in root order. `pin`
 /// holds slots at the CALLER's value, so the trace folds through the
-/// constant; the cell is read only by its `Op::Pin` check.
+/// constant; the cell is read only by its `Op::Pin` check. Each cell's type
+/// is recorded in the graph (`Graph::cell_kind`): an `ival` number slot an
+/// interval, an `ival` boolean slot one a lane may hold unknown.
 pub fn symbolize<A: GraphArith>(
     d: &mut Symbolic<A>,
     st: &mut State<Symbolic<A>>,
@@ -190,11 +188,11 @@ pub fn symbolize<A: GraphArith>(
         }
         pins.push((i, *c));
     }
-    let mut init = Vec::new();
-    for (i, p) in slots.iter().enumerate() {
-        let pinned = pins.iter().find(|(j, _)| *j == i).map(|(_, c)| *c);
-        let cell = d.graph.leaf(Op::Cell(i as u32));
-        let held: Conc<A> = match get(st, p).unwrap() {
+    // What each slot holds, and so its cell's type: an `ival` number slot an
+    // interval, an `ival` boolean slot one a lane may hold unknown.
+    let mut held: Vec<Conc<A>> = Vec::with_capacity(slots.len());
+    for p in &slots {
+        held.push(match get(st, p).unwrap() {
             Value::Num(n) => Conc::Num(
                 d.as_const(&n)
                     .ok_or_else(|| anyhow!("{} was already symbolic", show(p)))?,
@@ -204,7 +202,30 @@ pub fn symbolize<A: GraphArith>(
                     .ok_or_else(|| anyhow!("{} was already symbolic", show(p)))?,
             ),
             other => bail!("{} is {:?}, not a scalar", show(p), other),
+        });
+    }
+    d.graph.set_cell_kinds(held.iter().zip(&slots).enumerate().map(|(i, (c, p))| {
+        let kind = match (c, ival.contains(p)) {
+            (Conc::Bool(_), false) => Ty::Bool,
+            (Conc::Bool(_), true) => Ty::UBool,
+            (Conc::Num(_), true) => Ty::Ival,
+            (Conc::Num(_), false) => Ty::Num,
         };
+        (i as u32, kind)
+    }));
+    let mut init = Vec::new();
+    for (i, (p, held)) in slots.iter().zip(held).enumerate() {
+        let pinned = pins.iter().find(|(j, _)| *j == i).map(|(_, c)| *c);
+        // A slot two paths reach is one slot: the second sees the first's cell.
+        let symbolic = match get(st, p) {
+            Some(Value::Num(n)) => d.as_const(&n).is_none(),
+            Some(Value::Bool(b)) => d.decide(&b).is_none(),
+            _ => false,
+        };
+        if symbolic {
+            bail!("{} was already symbolic", show(p));
+        }
+        let cell = d.graph.leaf(Op::Cell(i as u32));
         let (c, new) = match (pinned, held) {
             (Some(Conc::Num(v)), Conc::Num(_)) => {
                 let n = d.num(v);
@@ -218,26 +239,9 @@ pub fn symbolize<A: GraphArith>(
             (None, Conc::Num(v)) => (Conc::Num(v), Value::Num(cell)),
             (None, Conc::Bool(v)) => (Conc::Bool(v), Value::Bool(cell)),
         };
-        d.graph.set_cell_kind(
-            i as u32,
-            match (&c, ival.contains(p)) {
-                (Conc::Bool(_), _) => crate::transpile::graph::CellKind::Bool,
-                (_, true) => crate::transpile::graph::CellKind::Ival,
-                (Conc::Num(_), _) => crate::transpile::graph::CellKind::Num,
-            },
-        );
         init.push(c);
         set(st, p, new)?;
     }
-    let ival: Vec<bool> = slots.iter().map(|p| ival.contains(p)).collect();
-    // Only NUMBER slots in `ival` are interval cells.
-    d.ival_cells = ival
-        .iter()
-        .zip(&init)
-        .enumerate()
-        .filter(|(_, (b, c))| **b && matches!(c, Conc::Num(_)))
-        .map(|(i, _)| i as u32)
-        .collect();
     d.forget_intervals();
-    Ok(Iface { slots, init, pins, ival })
+    Ok(Iface { slots, init, pins })
 }

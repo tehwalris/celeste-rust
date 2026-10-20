@@ -29,17 +29,10 @@ impl<A: GraphArith> Emit<A> {
     }
 }
 
-/// An output column's engine type: `ZN`, `ZI` or `ZB`.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum ColTy {
-    Num,
-    Ival,
-    Bool,
-}
-
 pub(crate) struct OutField<A: GraphArith = Fixed> {
     pub(crate) cell: u32,
-    pub(crate) ty: ColTy,
+    /// The column's type (an interval column may hold a point).
+    pub(crate) ty: super::graph::Ty,
     /// The graph node this cell ends the frame holding.
     pub(crate) node: NodeId,
     /// A field stored as a uniform value no graph constant names (the unknown

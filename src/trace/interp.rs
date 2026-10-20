@@ -1980,7 +1980,7 @@ mod tests {
         );
         let mut d = Symbolic::<celeste_core::arith::Fixed>::default();
         // An interval input: a lane can hold `input > 0` both ways.
-        d.ival_cells.insert(1);
+        d.graph.set_cell_kind(1, crate::transpile::graph::Ty::Ival);
         d.forget_intervals();
         let sym = d.graph.leaf(Op::Cell(1));
         let mut it = Interp::new(d);

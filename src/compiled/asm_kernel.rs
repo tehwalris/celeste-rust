@@ -15,7 +15,8 @@ use celeste_engine::exact::{Code, KeySpace, Provisional, ShapeRecord};
 use celeste_engine::runtime2::{Col, Rt2, AV};
 use celeste_engine::slots::reshape;
 
-use crate::transpile::asm::{AsmCtx, CellRepr, CollisionEnv, Compiled, Loaded, RootKind};
+use crate::transpile::asm::{AsmCtx, CollisionEnv, Compiled, Loaded};
+use crate::transpile::graph::Ty;
 use crate::transpile::graph::Room;
 
 mod emit;
@@ -29,7 +30,7 @@ struct AsmField {
     cell: usize,
     /// The root's byte offset in the output buffer.
     off: usize,
-    kind: RootKind,
+    kind: Ty,
     /// A boolean an output widening may write UNKNOWN; any other undecided
     /// boolean is a branch on an unknown no premise declined: fatal.
     may_unknown: bool,
@@ -63,12 +64,12 @@ struct DupRef {
 /// equality mask computed at most once a slice (`DupMemo`).
 #[derive(Default)]
 struct DupPairs {
-    pairs: Vec<(usize, usize, RootKind)>,
-    index: HashMap<(usize, usize, RootKind), u32>,
+    pairs: Vec<(usize, usize, Ty)>,
+    index: HashMap<(usize, usize, Ty), u32>,
 }
 
 impl DupPairs {
-    fn id(&mut self, p: (usize, usize, RootKind)) -> u32 {
+    fn id(&mut self, p: (usize, usize, Ty)) -> u32 {
         let n = self.pairs.len() as u32;
         *self.index.entry(p).or_insert_with(|| {
             self.pairs.push(p);
@@ -110,9 +111,9 @@ impl DupMemo {
         }
         let (a, b, kind) = pairs.pairs[p];
         let m = match kind {
-            RootKind::Num => N::eq_slots(buf, half, a, b),
-            RootKind::Ival => N::eq_slots(buf, half, a, b) & N::eq_slots(buf, half, a + 64, b + 64),
-            RootKind::Bool => {
+            Ty::Num => N::eq_slots(buf, half, a, b),
+            Ty::Ival => N::eq_slots(buf, half, a, b) & N::eq_slots(buf, half, a + 64, b + 64),
+            Ty::Bool | Ty::UBool => {
                 let ((va, ka), (vb, kb)) = (N::masks(buf, half, a), N::masks(buf, half, b));
                 !((va ^ vb) | (ka ^ kb))
             }
@@ -583,13 +584,13 @@ impl<N: KernelLanes> AsmKernel<N> {
                     for l in 0..16 {
                         let v = col.at(lane(l));
                         match repr {
-                            CellRepr::Num => N::put(buf, half, off, l, num_raw(v)),
-                            CellRepr::Ival => {
+                            Ty::Num => N::put(buf, half, off, l, num_raw(v)),
+                            Ty::Ival => {
                                 let (a, b) = ival_raw(v);
                                 N::put(buf, half, off, l, a);
                                 N::put(buf, half, off + 64, l, b);
                             }
-                            CellRepr::Bool | CellRepr::UBool => unreachable!("bool inputs are Bool/BoolU/UBool/UBoolU views"),
+                            Ty::Bool | Ty::UBool => unreachable!("bool inputs are Bool/BoolU/UBool/UBoolU views"),
                         }
                     }
                 }
@@ -665,10 +666,10 @@ impl<N: KernelLanes> BodyCols<N> {
             };
             written[ci] = true;
             match (f.kind, &proto.cols[ci].1) {
-                (RootKind::Num, TCol::Num(_)) => num.push((ci, f.off)),
-                (RootKind::Ival, TCol::Ival(_)) => ival.push((ci, f.off)),
-                (RootKind::Num, TCol::Ival(_)) => num_as_ival.push((ci, f.off)),
-                (RootKind::Bool, TCol::Bool(_)) => bool_.push((ci, f.off, f.may_unknown)),
+                (Ty::Num, TCol::Num(_)) => num.push((ci, f.off)),
+                (Ty::Ival, TCol::Ival(_)) => ival.push((ci, f.off)),
+                (Ty::Num, TCol::Ival(_)) => num_as_ival.push((ci, f.off)),
+                (Ty::Bool, TCol::Bool(_)) => bool_.push((ci, f.off, f.may_unknown)),
                 (k, _) => anyhow::bail!("body field cell {} kind {:?} disagrees with the shape's column", f.cell, k),
             }
         }
@@ -756,32 +757,32 @@ enum InputView<'c, N: EngineNum = P8> {
     IvalU(N::Raw, N::Raw),
     Bool(&'c [AV<N>]),
     BoolU(u16),
-    /// A maybe-unknown bool (`CellRepr::UBool`), per lane or uniform.
+    /// A maybe-unknown bool (`Ty::UBool`), per lane or uniform.
     UBool(&'c [AV<N>]),
     UBoolU(u16, u16),
-    Any(&'c Col<N>, CellRepr),
+    Any(&'c Col<N>, Ty),
 }
 
 impl<'c, N: EngineNum> InputView<'c, N> {
-    fn of(col: &'c Col<N>, repr: CellRepr) -> Result<Self, String> {
+    fn of(col: &'c Col<N>, repr: Ty) -> Result<Self, String> {
         Ok(match (repr, col) {
-            (CellRepr::Num, Col::N(v)) => InputView::Num(v),
-            (CellRepr::Num, Col::U(AV::Num(n))) => InputView::NumU(n.raw()),
-            (CellRepr::Ival, Col::I(v)) => InputView::Ival(v),
-            (CellRepr::Ival, Col::N(v)) => InputView::IvalOfNum(v),
-            (CellRepr::Ival, Col::U(AV::Ival(a, b))) => InputView::IvalU(a.raw(), b.raw()),
-            (CellRepr::Ival, Col::U(AV::Num(n))) => InputView::IvalU(n.raw(), n.raw()),
-            (CellRepr::Bool, Col::V(v)) => InputView::Bool(v),
-            (CellRepr::Bool, Col::U(v)) => match v {
+            (Ty::Num, Col::N(v)) => InputView::Num(v),
+            (Ty::Num, Col::U(AV::Num(n))) => InputView::NumU(n.raw()),
+            (Ty::Ival, Col::I(v)) => InputView::Ival(v),
+            (Ty::Ival, Col::N(v)) => InputView::IvalOfNum(v),
+            (Ty::Ival, Col::U(AV::Ival(a, b))) => InputView::IvalU(a.raw(), b.raw()),
+            (Ty::Ival, Col::U(AV::Num(n))) => InputView::IvalU(n.raw(), n.raw()),
+            (Ty::Bool, Col::V(v)) => InputView::Bool(v),
+            (Ty::Bool, Col::U(v)) => match v {
                 AV::Bool(b) => InputView::BoolU(if *b { 0xffff } else { 0 }),
                 // DECIDED only: an unknown packed as false drops the true arm.
                 other => return Err(format!("ASM bool input column holds {other:?}: a kernel reads a boolean the block does not decide")),
             },
-            (CellRepr::Bool, other) => return Err(format!("ASM bool input column is {other:?}")),
-            (CellRepr::UBool, Col::V(v)) => InputView::UBool(v),
-            (CellRepr::UBool, Col::U(AV::Bool(b))) => InputView::UBoolU(if *b { 0xffff } else { 0 }, 0xffff),
-            (CellRepr::UBool, Col::U(AV::UBool)) => InputView::UBoolU(0, 0),
-            (CellRepr::UBool, other) => return Err(format!("ASM maybe-unknown bool input column is {other:?}")),
+            (Ty::Bool, other) => return Err(format!("ASM bool input column is {other:?}")),
+            (Ty::UBool, Col::V(v)) => InputView::UBool(v),
+            (Ty::UBool, Col::U(AV::Bool(b))) => InputView::UBoolU(if *b { 0xffff } else { 0 }, 0xffff),
+            (Ty::UBool, Col::U(AV::UBool)) => InputView::UBoolU(0, 0),
+            (Ty::UBool, other) => return Err(format!("ASM maybe-unknown bool input column is {other:?}")),
             (repr, other) => InputView::Any(other, repr),
         })
     }
@@ -1013,28 +1014,21 @@ impl<N: KernelLanes> Registry<N> {
     }
 }
 
-/// The kind of a typed column (or of a uniform value one could hold).
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum Kind {
-    Num,
-    Ival,
-    Bool,
-}
-
-fn kind_of<N: EngineNum>(col: &Col<N>) -> Option<Kind> {
+/// The type of a typed column (or of a uniform value one could hold).
+fn kind_of<N: EngineNum>(col: &Col<N>) -> Option<Ty> {
     match col {
-        Col::N(_) | Col::U(AV::Num(_)) => Some(Kind::Num),
-        Col::I(_) | Col::U(AV::Ival(..)) => Some(Kind::Ival),
-        Col::V(_) | Col::U(AV::Bool(_)) | Col::U(AV::UBool) => Some(Kind::Bool),
+        Col::N(_) | Col::U(AV::Num(_)) => Some(Ty::Num),
+        Col::I(_) | Col::U(AV::Ival(..)) => Some(Ty::Ival),
+        Col::V(_) | Col::U(AV::Bool(_)) | Col::U(AV::UBool) => Some(Ty::Bool),
         _ => None,
     }
 }
 
-fn typed<N: EngineNum>(kind: Kind) -> Col<N> {
+fn typed<N: EngineNum>(kind: Ty) -> Col<N> {
     match kind {
-        Kind::Num => Col::N(Vec::new()),
-        Kind::Ival => Col::I(Vec::new()),
-        Kind::Bool => Col::V(Vec::new()),
+        Ty::Num => Col::N(Vec::new()),
+        Ty::Ival => Col::I(Vec::new()),
+        Ty::Bool | Ty::UBool => Col::V(Vec::new()),
     }
 }
 
@@ -1064,7 +1058,7 @@ fn unify<N: KernelLanes>(by_shape: &mut HashMap<(u64, Option<Region>), AsmKernel
                         let (ka, kb) = (kind_of(a), kind_of(b));
                         let k = match (ka, kb) {
                             (Some(x), Some(y)) if x == y => x,
-                            (Some(Kind::Num), Some(Kind::Ival)) | (Some(Kind::Ival), Some(Kind::Num)) => Kind::Ival,
+                            (Some(Ty::Num), Some(Ty::Ival)) | (Some(Ty::Ival), Some(Ty::Num)) => Ty::Ival,
                             _ => anyhow::bail!(
                                 "shape {:#x} cell {c}: outcomes disagree on a cell that cannot be a typed column ({a:?} vs {b:?})",
                                 t.shape_hash
@@ -1132,9 +1126,7 @@ fn build_one_shape<N: KernelLanes>(r: &crate::trace::lower::LoweredFrame<N::Arit
     let shape = r.frame.in_rt2.shape_hash_of();
     let room = Room { cache: r.cache.clone() };
     let t_fuse = std::time::Instant::now();
-    let (fused, bodies, flat_roots, reprs) =
-        crate::trace::lower::asm_fused_from(&r.bound, &r.lowered.spec)
-            .with_context(|| format!("fusing shape {si} (hash {shape:#x})"))?;
+    let (fused, bodies, flat_roots) = crate::trace::lower::asm_fused_from(&r.lowered.spec);
     // One output SLOT per DISTINCT root node; `slot_of[k]` for root k.
     let mut slot_of: Vec<usize> = Vec::with_capacity(flat_roots.len());
     let mut distinct: Vec<crate::transpile::graph::NodeId> = Vec::new();
@@ -1152,13 +1144,7 @@ fn build_one_shape<N: KernelLanes>(r: &crate::trace::lower::LoweredFrame<N::Arit
     let flat_roots = distinct;
     crate::transpile::lower::build_add(7, t_fuse);
     let t_asm = std::time::Instant::now();
-    let (compiled, loaded) = crate::transpile::asm::compile_and_load_reprs(
-        &fused,
-        &flat_roots,
-        &format!("k{shape:016x}{tag}"),
-        &reprs,
-        build.asm,
-    )
+    let (compiled, loaded) = crate::transpile::asm::compile_and_load(&fused, &flat_roots, &format!("k{shape:016x}{tag}"), build.asm)
     .with_context(|| format!("assembling shape {si} (hash {shape:#x})"))?;
     crate::transpile::lower::build_add(8, t_asm);
 
@@ -1167,7 +1153,7 @@ fn build_one_shape<N: KernelLanes>(r: &crate::trace::lower::LoweredFrame<N::Arit
         let mut out = vec![false; fused.len()];
         for n in 0..fused.len() {
             let node = fused.get(n as crate::transpile::graph::NodeId);
-            out[n] = node.op == crate::transpile::graph::Op::UnknownBool(u32::MAX) || node.args.iter().any(|a| out[*a as usize]);
+            out[n] = node.op == crate::transpile::graph::Op::UnknownBool(crate::transpile::graph::Unknown::Output) || node.args.iter().any(|a| out[*a as usize]);
         }
         out
     };
@@ -1313,7 +1299,7 @@ fn dup_refs(bodies: &mut [AsmBody], reads: &[emit::BodyReads]) -> DupPairs {
                 continue;
             }
             assert_eq!(a.fields.len(), b.fields.len(), "two bodies of one outcome");
-            let mut pairs: Vec<(usize, usize, RootKind)> = Vec::new();
+            let mut pairs: Vec<(usize, usize, Ty)> = Vec::new();
             let mut ok = true;
             for (fa, fb) in a.fields.iter().zip(&b.fields) {
                 assert_eq!(fa.cell, fb.cell, "two bodies of one outcome");
@@ -1366,7 +1352,7 @@ fn pos_sources<N: EngineNum>(template: &Rt2<N>, fields: &[AsmField]) -> Result<O
         if let Some(f) = fields.iter().find(|f| f.cell == cell as usize) {
             // An interval's cell is its low corner (at a number's offset).
             return Ok(match f.kind {
-                RootKind::Num | RootKind::Ival => Some(PosSrc::Root(f.off)),
+                Ty::Num | Ty::Ival => Some(PosSrc::Root(f.off)),
                 _ => None,
             });
         }
@@ -1410,9 +1396,9 @@ fn acc_template<N: KernelLanes>(r: &crate::trace::lower::LoweredFrame<N::Arith>,
             inits.push((
                 cell,
                 match f.ty {
-                    crate::transpile::kernel::ColTy::Num => ColInit::EmptyNum,
-                    crate::transpile::kernel::ColTy::Bool => ColInit::EmptyBool,
-                    crate::transpile::kernel::ColTy::Ival => ColInit::EmptyIval,
+                    Ty::Num => ColInit::EmptyNum,
+                    Ty::Bool | Ty::UBool => ColInit::EmptyBool,
+                    Ty::Ival => ColInit::EmptyIval,
                 },
             ));
         }

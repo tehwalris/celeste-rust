@@ -272,7 +272,7 @@ impl Lower<'_, Float> {
     /// structure: decided true, decided false, else unknown), as
     /// `refdomain`'s `compare` decides it.
     fn compare(&mut self, op: &Op<Float>, a: [NodeId; 2]) -> Result<Value> {
-        if self.dom(a[0]) == 2 || self.dom(a[1]) == 2 {
+        if self.wide(a[0]) || self.wide(a[1]) {
             let (x, y) = (self.as_ival(a[0])?, self.as_ival(a[1])?);
             let (x, y) = (self.ival_regs(x), self.ival_regs(y));
             let (t, f) = match op {
@@ -318,7 +318,7 @@ impl Lower<'_, Float> {
         }
         let node = self.g.get(id);
         let a = node.args.clone();
-        let wide = |l: &Self, k: usize| l.dom(a[k]) == 2;
+        let wide = |l: &Self, k: usize| l.wide(a[k]);
         let val = match &node.op {
             Op::Const(lo, hi) => {
                 if lo == hi {
@@ -329,19 +329,19 @@ impl Lower<'_, Float> {
             }
             Op::Cell(c) => {
                 let off = *self.cell_off.get(c).expect("input cell offset assigned before lowering");
-                match self.cell_reprs.get(c).copied().unwrap_or(CellRepr::Num) {
-                    CellRepr::Num => Value::Num(NumVal::Reg(self.pure(Key::Load(off), move |d| Inst::Load { dst: d, off }))),
-                    CellRepr::Bool => {
+                match self.g.cell_kind(*c) {
+                    Ty::Num => Value::Num(NumVal::Reg(self.pure(Key::Load(off), move |d| Inst::Load { dst: d, off }))),
+                    Ty::Bool => {
                         let v = self.pure(Key::LoadMask8(off), move |d| Inst::LoadMask8 { dst: d, off });
                         Value::Bool([MaskVal::Reg(v), MaskVal::Const(true)])
                     }
-                    CellRepr::UBool => {
+                    Ty::UBool => {
                         let known_off = off + 2;
                         let v = self.pure(Key::LoadMask8(off), move |d| Inst::LoadMask8 { dst: d, off });
                         let kn = self.pure(Key::LoadMask8(known_off), move |d| Inst::LoadMask8 { dst: d, off: known_off });
                         Value::Bool([MaskVal::Reg(v), MaskVal::Reg(kn)])
                     }
-                    CellRepr::Ival => {
+                    Ty::Ival => {
                         let hi_off = off + 64;
                         let lo = self.pure(Key::Load(off), move |d| Inst::Load { dst: d, off });
                         let hi = self.pure(Key::Load(hi_off), move |d| Inst::Load { dst: d, off: hi_off });
@@ -457,7 +457,7 @@ impl Lower<'_, Float> {
             }
             op @ (Op::Lt | Op::Le | Op::Gt | Op::Ge) => self.compare(op, [a[0], a[1]])?,
             Op::Eq => {
-                if self.dom(a[0]) == 1 {
+                if self.g.ty(a[0]).is_bool() {
                     let (p, q) = (self.as_bool(a[0])?, self.as_bool(a[1])?);
                     // val = ~(pv ^ qv), known = pk & qk
                     let x = self.m_xor(p[0], q[0]);
@@ -499,7 +499,7 @@ impl Lower<'_, Float> {
                 // (`refdomain`'s `floor_span`).
                 if let Op::Flr = self.g.get(inner).op {
                     let src = self.g.get(inner).args[0];
-                    if self.dom(src) == 2 {
+                    if self.wide(src) {
                         let x = self.as_ival(src)?;
                         let x = self.ival_regs(x);
                         let (fl, fh) = (self.floor(x[0]), self.floor(x[1]));
@@ -508,19 +508,19 @@ impl Lower<'_, Float> {
                         return Ok(());
                     }
                 }
-                match self.dom(inner) {
-                    1 => {
+                match self.g.ty(inner) {
+                    Ty::Bool | Ty::UBool => {
                         let b = self.as_bool(inner)?;
                         Value::Bool([b[1], MaskVal::Const(true)])
                     }
                     // A number is decided where its ends are one value's bits
                     // (`Graph::eval`'s `as_point`).
-                    2 => {
+                    Ty::Ival => {
                         let x = self.as_ival(inner)?;
                         let x = self.ival_regs(x);
                         Value::Bool([MaskVal::Reg(self.same_bits(x[0], x[1])), MaskVal::Const(true)])
                     }
-                    _ => Value::Bool([MaskVal::Const(true), MaskVal::Const(true)]),
+                    Ty::Num => Value::Bool([MaskVal::Const(true), MaskVal::Const(true)]),
                 }
             }
             // The floor fork, resolved.

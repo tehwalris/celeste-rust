@@ -116,12 +116,8 @@ pub fn renumber_cells<A: GraphArith>(
 
     let mut out = g.like();
     // The kinds follow the cells to their engine numbers.
-    let kinds: Vec<(u32, crate::transpile::graph::CellKind)> = g.cell_kinds().collect();
-    for (c, k) in kinds {
-        if let Some(&e) = canon.get(c as usize) {
-            out.set_cell_kind(e, k);
-        }
-    }
+    let kinds: Vec<(u32, crate::transpile::graph::Ty)> = g.cell_kinds().filter_map(|(c, k)| Some((*canon.get(c as usize)?, k))).collect();
+    out.set_cell_kinds(kinds);
     let mut map: Vec<NodeId> = Vec::with_capacity(g.len());
     for id in 0..g.len() {
         if !live[id] {

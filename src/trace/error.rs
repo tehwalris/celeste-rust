@@ -232,7 +232,7 @@ mod tests {
 
     fn cell(d: &mut Symbolic, i: u32, interval: bool) -> NodeId {
         if interval {
-            d.ival_cells.insert(i);
+            d.graph.set_cell_kind(i, crate::transpile::graph::Ty::Ival);
             d.forget_intervals();
         }
         d.graph.leaf(Op::Cell(i))

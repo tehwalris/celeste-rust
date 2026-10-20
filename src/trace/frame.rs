@@ -6,7 +6,7 @@
 use anyhow::{anyhow, bail, Result};
 
 use crate::transpile::graph::NodeId;
-use crate::transpile::kernel::ColTy;
+use crate::transpile::graph::Ty;
 
 use super::domain::{Domain, Symbolic};
 use crate::transpile::garith::GraphArith;
@@ -23,7 +23,7 @@ pub struct FrameOut<A: GraphArith = Fixed> {
     pub error: NodeId,
     /// Every scalar reachable from the globals, by path, with the KIND the
     /// tracer knows (not re-derivable: a `Cell` or `Sel` can be either).
-    pub fields: Vec<(Path, NodeId, ColTy)>,
+    pub fields: Vec<(Path, NodeId, Ty)>,
     /// Slots DEAD at the frame boundary: the six button cells and the shared
     /// output unknown. The tracer runs `__reset_button_states()` at the START
     /// (production at the end), so recording these dead makes the boundaries
@@ -107,7 +107,7 @@ pub struct Frame<A: GraphArith = Fixed> {
 fn out_fields<A: GraphArith>(
     st: &State<Symbolic<A>>,
     d: &Symbolic<A>,
-) -> Result<(Vec<(Path, NodeId, ColTy)>, Vec<Path>)> {
+) -> Result<(Vec<(Path, NodeId, Ty)>, Vec<Path>)> {
     let mut out = Vec::new();
     let mut ubool = Vec::new();
     // A near level's floor `state`s are an interval column in every outcome.
@@ -129,10 +129,10 @@ fn out_fields<A: GraphArith>(
         // a number would be an unchecked narrowing.
         let (n, ty) = match iface::get(st, &p).unwrap() {
             Value::Num(n) => {
-                let ty = if d.is_interval(&n) || ival_always.contains(&p) { ColTy::Ival } else { ColTy::Num };
+                let ty = if d.is_interval(&n) || ival_always.contains(&p) { Ty::Ival } else { Ty::Num };
                 (n, ty)
             }
-            Value::Bool(n) => (n, ColTy::Bool),
+            Value::Bool(n) => (n, Ty::Bool),
             _ => unreachable!("scalars only yields scalars"),
         };
         out.push((p, n, ty));

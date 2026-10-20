@@ -49,7 +49,7 @@ pub(crate) fn seed_cells<A: GraphArith>(g: &Graph<A>) -> HashMap<u32, Val<A>> {
     let mut cells: HashMap<u32, Val<A>> = HashMap::new();
     for id in 0..g.len() {
         if let Op::Cell(c) = g.get(id as NodeId).op {
-            let v = if g.cell_kind(c) == super::graph::CellKind::Bool { Val::Bool(None) } else { full };
+            let v = if g.cell_kind(c).is_bool() { Val::Bool(None) } else { full };
             cells.insert(c, v);
         }
     }

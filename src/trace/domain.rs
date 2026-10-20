@@ -9,7 +9,7 @@ use anyhow::{bail, Result};
 
 use celeste_core::arith::{Arithmetic, Fixed};
 use crate::transpile::garith::GraphArith;
-use crate::transpile::graph::{Graph, NodeId, Op};
+use crate::transpile::graph::{Graph, NodeId, Op, Ty, Unknown};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Arith {
@@ -327,15 +327,6 @@ pub trait Domain: Clone + Default {
 
 }
 
-/// The tag of a countdown's atom id (`Symbolic::countdown_atom`).
-const COUNTDOWN_ATOM: u32 = 1 << 31;
-
-/// Is atom id `k` a countdown's (three-valued)? `u32::MAX` is the shared
-/// output unknown (`Symbolic::unknown_bool_output`), not an atom.
-fn is_countdown_atom(k: u32) -> bool {
-    k != u32::MAX && k & COUNTDOWN_ATOM != 0
-}
-
 /// How many atoms an escaping value may read before its fork is left
 /// unrestricted (the restriction enumerates their assignments).
 const ESCAPE_ATOMS: usize = 6;
@@ -432,12 +423,8 @@ pub struct Symbolic<A: GraphArith = Fixed> {
     /// of one value reuses the first's choice instead of an empty dimension.
     /// Cleared with `forks`.
     fork_memo: std::collections::HashMap<(NodeId, ForkKind), (u8, (NodeId, NodeId))>,
-    /// Input cells holding an INTERVAL (`rem.x`/`rem.y`); a value is an
-    /// interval exactly when computed from one.
-    pub ival_cells: std::collections::BTreeSet<u32>,
-    /// `is_interval`'s memo. This and the three below depend on `ival_cells`
-    /// (dropped by `forget_intervals`).
-    ival_memo: std::cell::RefCell<rustc_hash::FxHashMap<NodeId, bool>>,
+    /// These three depend on the input cells' types (the graph's
+    /// `cell_kind`; dropped by `forget_intervals`).
     undecidable_memo: std::cell::RefCell<rustc_hash::FxHashMap<NodeId, bool>>,
     beneath_memo: std::cell::RefCell<rustc_hash::FxHashMap<NodeId, bool>>,
     /// `may_answers`'s memo: `(may_true, may_false)`.
@@ -464,9 +451,8 @@ impl<A: GraphArith> Symbolic<A> {
         self.range_memo.clear();
     }
 
-    /// `ival_cells` changed: `is_interval`'s memo no longer holds.
+    /// The input cells' types changed: the memos reading them no longer hold.
     pub fn forget_intervals(&mut self) {
-        self.ival_memo.get_mut().clear();
         self.undecidable_memo.get_mut().clear();
         self.beneath_memo.get_mut().clear();
         self.may_memo.get_mut().clear();
@@ -522,7 +508,7 @@ impl<A: GraphArith> Symbolic<A> {
             let r = match node.op {
                 // A lane decides these whatever their operands.
                 Op::Flr | Op::TileFlagAt | Op::Mget => false,
-                Op::Cell(c) => d.ival_cells.contains(&c),
+                Op::Cell(_) => d.graph.ty(n) == Ty::Ival,
                 Op::Const(lo, hi) => lo != hi,
                 Op::Span => true,
                 Op::UnknownNum | Op::UnknownBool(_) => true,
@@ -843,12 +829,12 @@ impl<A: GraphArith> Symbolic<A> {
     /// stored as `AV::UBool`. Nothing in the frame reads an output, so sharing
     /// correlates nothing; inputs and comparisons take fresh atoms.
     pub fn unknown_bool_output(&mut self) -> NodeId {
-        self.graph.leaf(Op::UnknownBool(u32::MAX))
+        self.graph.leaf(Op::UnknownBool(Unknown::Output))
     }
 
     /// Is `b` the shared output unknown (`unknown_bool_output`)?
     pub fn is_unknown_output(&self, b: NodeId) -> bool {
-        matches!(self.graph.get(b).op, Op::UnknownBool(u32::MAX))
+        matches!(self.graph.get(b).op, Op::UnknownBool(Unknown::Output))
     }
 
     /// `root` with `subst`'s nodes replaced and everything above re-folded.
@@ -878,8 +864,7 @@ impl<A: GraphArith> Symbolic<A> {
     pub fn unknown_bool_atom(&mut self) -> NodeId {
         let k = self.unknown_atoms;
         self.unknown_atoms += 1;
-        assert!(k < COUNTDOWN_ATOM, "atom ids ran into the countdown tag");
-        self.graph.leaf(Op::UnknownBool(k))
+        self.graph.leaf(Op::UnknownBool(Unknown::Atom(k)))
     }
 
     /// A COUNTDOWN's atom: a comparison of the unknown number where it is a
@@ -891,8 +876,7 @@ impl<A: GraphArith> Symbolic<A> {
     fn countdown_atom(&mut self) -> NodeId {
         let k = self.unknown_atoms;
         self.unknown_atoms += 1;
-        assert!(k < COUNTDOWN_ATOM - 1, "atom ids overflow into the countdown tag");
-        self.graph.leaf(Op::UnknownBool(COUNTDOWN_ATOM | k))
+        self.graph.leaf(Op::UnknownBool(Unknown::Countdown(k)))
     }
 
     /// Does no lane's data reach `n` - no input cell or fork?
@@ -1104,43 +1088,11 @@ impl<A: GraphArith> Domain for Symbolic<A> {
     fn node_count(&self) -> usize {
         self.graph.len()
     }
-    /// Is this value an interval? A type rule, the same as `lower`'s
-    /// `Repr::wide` (a select is one when an ARM is; `flr` and cart lookups
-    /// never are), or lowering fails.
+    /// Is this value an interval? Its lane type (`Graph::ty`).
     fn is_interval(&self, v: &NodeId) -> bool {
-        fn go<A: GraphArith>(g: &Graph<A>, ival: &std::collections::BTreeSet<u32>, memo: &mut rustc_hash::FxHashMap<NodeId, bool>, n: NodeId) -> bool {
-            if let Some(b) = memo.get(&n) {
-                return *b;
-            }
-            let node = g.get(n);
-            let a = &node.args;
-            let any = |memo: &mut rustc_hash::FxHashMap<NodeId, bool>, xs: &[NodeId]| {
-                xs.iter().any(|x| go(g, ival, memo, *x))
-            };
-            let r = match node.op {
-                Op::Cell(c) => ival.contains(&c),
-                Op::Const(lo, hi) => lo != hi,
-                Op::Split(_) | Op::RSplit(_) => true,
-                // An exact whole number per configuration.
-                Op::SplitInt(_) | Op::Lo | Op::Hi => false,
-                // A span's bounds differ (`fold` collapses a literal span).
-                Op::Span => true,
-                Op::Add | Op::Sub | Op::Mul | Op::Div | Op::Rem | Op::Neg | Op::Abs
-                | Op::Min | Op::Max | Op::Restrict(..) => any(memo, a),
-                // The CONDITION does not make the result an interval.
-                Op::Sel => any(memo, &a[1..]),
-                // Exact where the lane survives (else its own error).
-                Op::Flr => false,
-                // `fun1` replaces `sin` of an interval with its range.
-                Op::Sin => any(memo, a),
-                _ => false,
-            };
-            memo.insert(n, r);
-            r
-        }
-        // No early-out on empty `ival_cells`: widenings write literal intervals.
-        go(&self.graph, &self.ival_cells, &mut self.ival_memo.borrow_mut(), *v)
+        self.graph.ty(*v) == Ty::Ival
     }
+
 
     fn fork_flr(&mut self, v: &NodeId, ways: u8) -> (NodeId, NodeId) {
         let f = self.fork(v, Partition::Floors { ways }, "a floor fork (`move`)");
@@ -1233,7 +1185,7 @@ impl<A: GraphArith> Domain for Symbolic<A> {
             return false;
         }
         cone_any(&self.graph, &mut self.atom_memo, *c, |op| match op {
-            Op::UnknownBool(k) => Some(!is_countdown_atom(*k)),
+            Op::UnknownBool(k) => Some(!matches!(k, Unknown::Countdown(_))),
             _ => None,
         })
     }
@@ -1294,9 +1246,9 @@ impl<A: GraphArith> Domain for Symbolic<A> {
         // lane: the fork's coverage would decline them all).
         let atoms: Vec<NodeId> = self.graph.cone(&[*b])
             .into_iter()
-            .filter(|n| matches!(self.graph.get(*n).op, Op::UnknownBool(k) if is_countdown_atom(k) || (k >= since && k != u32::MAX)))
+            .filter(|n| matches!(self.graph.get(*n).op, Op::UnknownBool(Unknown::Countdown(_))) || matches!(self.graph.get(*n).op, Op::UnknownBool(Unknown::Atom(k)) if k >= since))
             .collect();
-        if !atoms.iter().any(|n| matches!(self.graph.get(*n).op, Op::UnknownBool(k) if !is_countdown_atom(k))) {
+        if !atoms.iter().any(|n| matches!(self.graph.get(*n).op, Op::UnknownBool(Unknown::Atom(_)))) {
             return None;
         }
         let name = origin(self);
@@ -1438,16 +1390,15 @@ mod tests {
     /// the cut below 1, where `0.5 - 2^-54 + 0.5` rounds up.
     #[test]
     fn a_round_fork_resolves_to_the_reference_fragments() {
-        use crate::transpile::graph::{CellKind, Val, OPEN};
+        use crate::transpile::graph::{Val, OPEN};
         use celeste_core::arith::Float;
         use celeste_core::lua_f64::{LuaF64, LuaF64Interval};
         let f = |v: f64| LuaF64::new(v).expect("finite");
         let ways = 3u8;
         for ox in [0.0, 0.3, 1.0, -1.7, 2.5, 0.5f64.next_down()] {
             let mut d = Symbolic::<Float>::default();
-            d.ival_cells.insert(0);
+            d.graph.set_cell_kind(0, Ty::Ival);
             d.forget_intervals();
-            d.graph.set_cell_kind(0, CellKind::Ival);
             let x = d.graph.leaf(Op::Cell(0));
             let k = d.num(f(ox));
             let y = d.arith(Arith::Add, &x, &k).expect("add");
@@ -1540,7 +1491,7 @@ mod tests {
         let mut d = Symbolic::<celeste_core::arith::Fixed>::default();
         let ival = d.graph.leaf(Op::Cell(0));
         let exact = d.graph.leaf(Op::Cell(1));
-        d.ival_cells.insert(0);
+        d.graph.set_cell_kind(0, Ty::Ival);
         d.forget_intervals();
         let zero = d.graph.leaf(Op::Const(0, 0));
 

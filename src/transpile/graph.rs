@@ -138,8 +138,8 @@ pub enum Op<A: Arithmetic = Fixed> {
     /// Tri-state OR: a decided `true` wins (its own node so `a or b` and
     /// `b or a` intern alike).
     Or,
-    /// An UNDECIDED boolean, the same in every lane; the index separates sites.
-    UnknownBool(u32),
+    /// An UNDECIDED boolean, the same in every lane (`Unknown`: which one).
+    UnknownBool(Unknown),
 
     /// `Sel(cond, then, else)`, in every width.
     Sel,
@@ -194,30 +194,62 @@ pub enum Op<A: Arithmetic = Fixed> {
     Same,
 }
 
+/// Which undecided boolean an `Op::UnknownBool` is.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum Unknown {
+    /// A fresh atom of this frame (`Symbolic::unknown_bool_atom`), by the
+    /// order minted.
+    Atom(u32),
+    /// A countdown's comparison (`Symbolic::countdown_atom`): three-valued,
+    /// never a merge refusal or an escape fork. Numbered with the atoms.
+    Countdown(u32),
+    /// THE unknown an output widening writes (`Symbolic::unknown_bool_output`),
+    /// one node, stored as `AV::UBool`.
+    Output,
+}
+
+/// A lane's value type: what a node computes on one lane, and how a cell or
+/// a root is laid out in a kernel's buffers (`asm::codegen`).
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum Ty {
+    Num,
+    /// An interval: its two ends.
+    Ival,
+    /// A boolean: its `val` plane, and a `known` plane (all-ones for an input).
+    Bool,
+    /// A boolean INPUT a lane may hold unknown: its `known` plane is read.
+    UBool,
+}
+
+impl Ty {
+    pub fn is_bool(self) -> bool {
+        matches!(self, Ty::Bool | Ty::UBool)
+    }
+}
+
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub struct Node<A: Arithmetic = Fixed> {
     pub op: Op<A>,
     pub args: Vec<NodeId>,
 }
 
-/// A hash-consed arena: same op over same operand ids is the same node.
+/// A hash-consed arena: same op over same operand ids is the same node. A
+/// TYPED one: each node's lane type (`Ty`), from its op's signature
+/// (`Graph::type_of`) and, for a cell, the cell's recorded kind.
 #[derive(Default, Clone)]
 pub struct Graph<A: GraphArith = Fixed> {
     nodes: Vec<Node<A>>,
+    /// Parallel to `nodes`: each node's lane type.
+    tys: Vec<Ty>,
     /// rustc-hash 2 (1.1's Fx made probing dominate). Never iterated.
     intern: rustc_hash2::FxHashMap<Node<A>, NodeId>,
     /// Per fork `d`, its fragment count (absent = 2).
     fork_ways: Vec<u8>,
-    /// Each input cell's KIND, recorded where made and carried through every
-    /// rebuild: the evaluator's weakest value for it.
-    cell_kinds: rustc_hash::FxHashMap<u32, CellKind>,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum CellKind {
-    Num,
-    Ival,
-    Bool,
+    /// Each input cell's type, recorded where made and carried through every
+    /// rebuild (undeclared: a number). A tracer's arena renumbers its cells
+    /// every frame (`iface::symbolize`), so a kind may change: the nodes are
+    /// retyped.
+    cell_kinds: rustc_hash::FxHashMap<u32, Ty>,
 }
 
 /// The most fragments one fork can have (a byte names a fragment).
@@ -244,17 +276,91 @@ impl<A: GraphArith> Graph<A> {
         }
     }
 
-    pub fn set_cell_kind(&mut self, cell: u32, kind: CellKind) {
-        self.cell_kinds.insert(cell, kind);
+    pub fn set_cell_kind(&mut self, cell: u32, kind: Ty) {
+        self.set_cell_kinds([(cell, kind)]);
     }
 
-    /// The recorded kind of `cell` (undeclared: a number).
-    pub fn cell_kind(&self, cell: u32) -> CellKind {
-        self.cell_kinds.get(&cell).copied().unwrap_or(CellKind::Num)
+    /// Record cells' types; where one changes, every node is retyped (one
+    /// pass: operands precede their readers).
+    pub fn set_cell_kinds(&mut self, kinds: impl IntoIterator<Item = (u32, Ty)>) {
+        let mut changed = false;
+        for (c, k) in kinds {
+            changed |= self.cell_kind(c) != k;
+            self.cell_kinds.insert(c, k);
+        }
+        if changed {
+            for i in 0..self.nodes.len() {
+                self.tys[i] = self.type_of(&self.nodes[i].op, &self.nodes[i].args);
+            }
+        }
     }
 
-    pub fn cell_kinds(&self) -> impl Iterator<Item = (u32, CellKind)> + '_ {
+    /// The recorded type of `cell` (undeclared: a number).
+    pub fn cell_kind(&self, cell: u32) -> Ty {
+        self.cell_kinds.get(&cell).copied().unwrap_or(Ty::Num)
+    }
+
+    pub fn cell_kinds(&self) -> impl Iterator<Item = (u32, Ty)> + '_ {
         self.cell_kinds.iter().map(|(c, k)| (*c, *k))
+    }
+
+    /// Node `n`'s lane type.
+    pub fn ty(&self, n: NodeId) -> Ty {
+        self.tys[n as usize]
+    }
+
+    /// THE OP SIGNATURES: the lane type of `op` over operands `args`. A
+    /// boolean from a comparison, a connective, a premise or a validity; an
+    /// interval from a literal interval, a span, an interval input, a fork's
+    /// unresolved value or a floor or round fragment; an exact number from a
+    /// floor, an integer fragment, an interval's end or a map read; an
+    /// arithmetic operation is an interval where an operand is (a select:
+    /// an ARM - the condition does not make the result one).
+    fn type_of(&self, op: &Op<A>, args: &[NodeId]) -> Ty {
+        let wide = |xs: &[NodeId]| if xs.iter().any(|a| self.tys[*a as usize] == Ty::Ival) { Ty::Ival } else { Ty::Num };
+        match op {
+            Op::Const(lo, hi) if lo == hi => Ty::Num,
+            Op::Const(..) => Ty::Ival,
+            Op::Cell(c) => self.cell_kind(*c),
+            Op::ConstBool(_)
+            | Op::UnknownBool(_)
+            | Op::Lt
+            | Op::Le
+            | Op::Gt
+            | Op::Ge
+            | Op::Eq
+            | Op::Same
+            | Op::Not
+            | Op::And
+            | Op::Or
+            | Op::Known
+            | Op::NoWrap
+            | Op::TileFlagAt
+            | Op::SplitValid(_)
+            | Op::FragOk(_)
+            | Op::SplitOk(_)
+            | Op::RSplitValid(_)
+            | Op::RFragOk(_)
+            | Op::RSplitOk(_) => Ty::Bool,
+            Op::Split(_) | Op::RSplit(_) | Op::Frag(_) | Op::RFrag(_) | Op::Span => Ty::Ival,
+            Op::SplitInt(_) | Op::IntFrag(_) | Op::Lo | Op::Hi | Op::Flr | Op::Mget | Op::UnknownNum | Op::Pin(_) => Ty::Num,
+            Op::Add | Op::Sub | Op::Mul | Op::Div | Op::Rem | Op::Neg | Op::Abs | Op::Min | Op::Max | Op::Sin | Op::Restrict(..) => wide(args),
+            Op::Sel if self.tys[args[1] as usize].is_bool() || self.tys[args[2] as usize].is_bool() => Ty::Bool,
+            Op::Sel => wide(&args[1..]),
+        }
+    }
+
+    /// Does the kernel compute `op` over `args` on EXACT operands only
+    /// (`asm::codegen` takes a number's operand as `as_num`)? `Mul`/`Div`
+    /// also take an interval times (over) a positive literal.
+    pub fn exact_operands_only(&self, op: &Op<A>, args: &[NodeId]) -> bool {
+        let pos = |n: NodeId| matches!(self.get(n).op, Op::Const(lo, hi) if lo == hi && A::lt(A::from_i16(0), A::from_lit(lo)));
+        match op {
+            Op::TileFlagAt | Op::Mget | Op::Rem | Op::Sin => true,
+            Op::Mul => !(pos(args[0]) || pos(args[1])),
+            Op::Div => !pos(args[1]),
+            _ => false,
+        }
     }
 
     /// Forget every fork's arity: a new frame's forks restart at 0.
@@ -282,7 +388,9 @@ impl<A: GraphArith> Graph<A> {
             return *id;
         }
         let id = self.nodes.len() as NodeId;
+        let ty = self.type_of(&node.op, &node.args);
         self.nodes.push(node.clone());
+        self.tys.push(ty);
         self.intern.insert(node, id);
         id
     }
