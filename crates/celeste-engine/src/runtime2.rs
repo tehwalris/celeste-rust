@@ -222,6 +222,36 @@ pub fn collapse_uniform<N: Copy + PartialEq>(c: Col<N>) -> Col<N> {
     }
 }
 
+/// Each name table's names as a shape's signature spells them: a name's
+/// FNV-1a hash, distinct within its table (checked once), so a signature
+/// is as exact as the names themselves and independent of where a name
+/// sits in its table.
+struct NameCodes {
+    fields: Vec<u32>,
+    globals: Vec<u32>,
+    fns: Vec<u32>,
+    builtins: Vec<u32>,
+}
+
+fn name_codes() -> &'static NameCodes {
+    static C: std::sync::OnceLock<NameCodes> = std::sync::OnceLock::new();
+    C.get_or_init(|| {
+        let codes = |what: &str, names: &[&str]| -> Vec<u32> {
+            let fnv = |n: &str| n.bytes().fold(0x811c_9dc5u32, |h, b| (h ^ b as u32).wrapping_mul(0x0100_0193));
+            let out: Vec<u32> = names.iter().map(|n| fnv(n)).collect();
+            let distinct: std::collections::HashSet<u32> = out.iter().copied().collect();
+            assert!(distinct.len() == out.len(), "two {what} names share a signature code");
+            out
+        };
+        NameCodes {
+            fields: codes("field", celeste_names::FIELD_NAMES),
+            globals: codes("global", celeste_names::GLOBAL_NAMES),
+            fns: codes("function", celeste_names::gen::FN_NAMES),
+            builtins: codes("builtin", &celeste_core::builtins::BUILTIN_NAMES),
+        }
+    })
+}
+
 impl<N: Arithmetic> Rt2<N> {
     pub fn empty(
         width: usize,
@@ -347,43 +377,56 @@ impl<N: Arithmetic> Rt2<N> {
         }
     }
 
-    /// The shape key: a hash of the (canonical) structure and globals.
-    pub fn shape_hash_of(&self) -> u64 {
-        use std::hash::Hasher;
-        let mut h = rustc_hash::FxHasher::default();
+    /// THE SHAPE'S SIGNATURE, word by word (`exact::shape_sig` collects it,
+    /// `shape_hash_of` hashes it): every cell in canonical order by kind, a
+    /// field, function or builtin by its NAME's code (`NameCodes`); then the
+    /// globals PRESENT, each by its name's code and its cell. A shape's
+    /// identity is the names it holds, so appending a name to a table moves
+    /// no shape (an absent global is not in it).
+    pub fn shape_words(&self, mut w: impl FnMut(u32)) {
+        let c = name_codes();
         for cell in &self.structure {
             match cell {
-                Cell2::Val => h.write_u8(1),
+                Cell2::Val => w(1),
                 Cell2::Obj(fields) => {
-                    h.write_u8(2);
-                    h.write_usize(fields.len());
+                    w(2);
+                    w(fields.len() as u32);
                     for (k, t) in fields {
-                        h.write_u32(*k);
-                        h.write_u32(*t);
+                        w(c.fields[*k as usize]);
+                        w(*t);
                     }
                 }
                 Cell2::Arr(items) => {
-                    h.write_u8(3);
-                    h.write_usize(items.len());
-                    for t in items {
-                        h.write_u32(*t);
-                    }
+                    w(3);
+                    w(items.len() as u32);
+                    items.iter().for_each(|t| w(*t));
                 }
-                Cell2::Unk => h.write_u8(4),
+                Cell2::Unk => w(4),
                 Cell2::Clo(f, caps) => {
-                    h.write_u8(5);
-                    h.write_u32(*f);
-                    h.write_usize(caps.len());
+                    w(5);
+                    w(c.fns[*f as usize]);
+                    w(caps.len() as u32);
                 }
                 Cell2::Bi(b) => {
-                    h.write_u8(6);
-                    h.write_u32(*b);
+                    w(6);
+                    w(c.builtins[*b as usize]);
                 }
             }
         }
-        for g in self.globals.iter() {
-            h.write_u32(*g);
+        w(u32::MAX);
+        for (g, &cell) in self.globals.iter().enumerate() {
+            if cell != NONE {
+                w(c.globals[g]);
+                w(cell);
+            }
         }
+    }
+
+    /// The shape key: a hash of the signature (`shape_words`).
+    pub fn shape_hash_of(&self) -> u64 {
+        use std::hash::Hasher;
+        let mut h = rustc_hash::FxHasher::default();
+        self.shape_words(|x| h.write_u32(x));
         h.finish()
     }
 

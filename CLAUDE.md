@@ -106,9 +106,12 @@ latter.
   dominated the history), nor `ui/dist`, `ui/node_modules` or exported UI
   data. **Never commit an unsubmitted or teased route** (witness, golden
   or upload): those live outside the repo.
-- `crates/celeste-names/src/gen.rs` is FROZEN, not generated: `FIELD_NAMES`'
-  order is the canonical field order keys and shape hashes depend on. New
-  names may be APPENDED by hand, never inserted. Its `GLOBAL_NAMES` include
+- `crates/celeste-names/src/gen.rs` is FROZEN, not generated, and
+  APPEND-ONLY. A shape's identity is the names it holds
+  (`Rt2::shape_words`: fields, functions and builtins by name, the globals
+  present), so appending a name moves no hash; but `GLOBAL_NAMES`' order is
+  the canonical cell order (the walk from the globals), so a reordering or
+  an insertion is a different search. Its `GLOBAL_NAMES` include
   `cart::NATIVE`'s unimplemented builtins (`__widen_rem`, `__new_vector`,
   `__split_at`): every block carries them, so removing one changes every
   shape hash.

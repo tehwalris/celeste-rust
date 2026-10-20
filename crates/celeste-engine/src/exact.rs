@@ -414,30 +414,12 @@ impl<N: Arithmetic> FieldDict<N> {
     }
 }
 
-/// A shape's SIGNATURE: exactly what `Rt2::shape_hash_of` hashes, so two
-/// structures under one hash are told apart (a collision is fatal).
+/// A shape's SIGNATURE: exactly what `Rt2::shape_hash_of` hashes
+/// (`Rt2::shape_words`), so two structures under one hash are told apart
+/// (a collision is fatal).
 pub fn shape_sig<N: Arithmetic>(rt2: &Rt2<N>) -> Vec<u32> {
-    let mut s = Vec::with_capacity(rt2.structure.len() * 2 + rt2.globals.len() + 1);
-    for cell in &rt2.structure {
-        match cell {
-            Cell2::Val => s.push(1),
-            Cell2::Obj(fields) => {
-                s.extend([2, fields.len() as u32]);
-                for (k, t) in fields {
-                    s.extend([*k, *t]);
-                }
-            }
-            Cell2::Arr(items) => {
-                s.extend([3, items.len() as u32]);
-                s.extend(items.iter().copied());
-            }
-            Cell2::Unk => s.push(4),
-            Cell2::Clo(f, caps) => s.extend([5, *f, caps.len() as u32]),
-            Cell2::Bi(b) => s.extend([6, *b]),
-        }
-    }
-    s.push(u32::MAX);
-    s.extend(rt2.globals.iter().copied());
+    let mut s = Vec::with_capacity(rt2.structure.len() * 2 + 16);
+    rt2.shape_words(|w| s.push(w));
     s
 }
 
@@ -1006,6 +988,25 @@ pub fn exact_rows<N: Arithmetic>(rt2: &Rt2<N>) -> Vec<ExactRow> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A shape's identity is the names it holds: an absent global (a name
+    /// appended to `GLOBAL_NAMES`, which no block holds yet) is not in its
+    /// signature, so it moves no hash.
+    #[test]
+    fn an_absent_global_is_not_in_a_shapes_identity() {
+        use crate::runtime2::{Col, NONE};
+        let cache = std::sync::Arc::new(celeste_core::collision_cache::CollisionCache::new(1, 0));
+        let mut b = Rt2::<P8>::empty(1, celeste_names::GLOBAL_NAMES.len(), celeste_names::STRINGS, cache);
+        let x = celeste_names::field_id("x").expect("a field `x`");
+        b.structure = vec![Cell2::Val, Cell2::Obj(vec![(x, 2)]), Cell2::Val];
+        b.cols = vec![Col::U(AV::Ptr(1)), Col::U(AV::Nil), Col::U(AV::Num(P8::from_i16(3)))];
+        b.globals[celeste_names::global_id("objects").expect("a global `objects`") as usize] = 0;
+        b.canonicalize_ids();
+        let (hash, sig) = (b.shape_hash_of(), shape_sig(&b));
+        b.globals.push(NONE);
+        assert_eq!((b.shape_hash_of(), shape_sig(&b)), (hash, sig.clone()), "an appended, absent global moves the shape");
+        assert!(sig.len() < celeste_names::GLOBAL_NAMES.len(), "the signature lists the globals present, not every slot");
+    }
 
     fn n(x: i32) -> Code {
         Code::num(x as u32, x as u32)

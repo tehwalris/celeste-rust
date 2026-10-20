@@ -34,10 +34,10 @@ widen a field without something EXACT that refutes it").
 A cargo workspace. The dependency order is load-bearing.
 
 ```
-crates/celeste-core     numbers (Pico8Num 16.16, LuaF64, the Arith trait),     deps: -
+crates/celeste-core     numbers (Pico8Num 16.16, LuaF64: `Arithmetic`),       deps: -
                         cart data, collision cache, builtins
-crates/celeste-names    FROZEN name tables (FIELD_NAMES order = canonical       deps: -
-                        field order; append only)
+crates/celeste-names    FROZEN name tables (GLOBAL_NAMES order = canonical      deps: -
+                        cell order; append only)
 crates/celeste-engine   Rt2 blocks, exact keys, the widening table          deps: core, names
 celeste-rust (src/)
   frame.rs              the forward (ForwardState: start, resume, extend),
@@ -211,9 +211,12 @@ the key PROVISIONAL until the frame's end appends the new codes sorted.
 
 The key holds NO POSITION: the position object's x/y contribute only their
 part past the cell's whole pixel (`Code::pos`). States sharing all but the
-position share a key, which is what a storage entry is. FIELD_NAMES' order
-feeds the shape hash and the cell numbering: a reordering is a different
-search. A shape's hash is its name; its signature is stored and compared.
+position share a key, which is what a storage entry is. A shape's hash is
+its name, and its signature (`Rt2::shape_words`) is stored and compared:
+every cell by kind, a field, function or builtin by its NAME, then the
+globals PRESENT, so appending a name to a table moves nothing.
+GLOBAL_NAMES' order is the cell numbering (the walk from the globals): a
+reordering is a different search.
 The concrete search compares whole states, never keys.
 
 ## The room's start
