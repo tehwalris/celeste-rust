@@ -64,7 +64,6 @@ pub(crate) struct FwdLine {
     pub(crate) own_ms: u64,
     pub(crate) own_idle: u32,
     pub(crate) ckpt_ms: u64,
-    pub(crate) pos_ms: u64,
     pub(crate) total_ms: u64,
     pub(crate) rss_gb: f64,
 }
@@ -191,7 +190,7 @@ fn read_forward_stats(dir: &Path) -> Result<Vec<FwdLine>> {
     let mut lines = text.lines();
     let header: Vec<&str> = lines.next().unwrap_or("").split('\t').collect();
     let col = |name: &str| header.iter().position(|h| *h == name).with_context(|| format!("{}: no column {name:?}", path.display()));
-    let c: Vec<usize> = ["frame", "entries_in", "lanes_in", "lanes_raw", "lanes_kept", "entries_out", "lanes_out", "visited", "wave_ms", "wave_idle_pct", "layer_ms", "ckpt_ms", "pos_ms", "total_ms", "rss_end_gb"]
+    let c: Vec<usize> = ["frame", "entries_in", "lanes_in", "lanes_raw", "lanes_kept", "entries_out", "lanes_out", "visited", "wave_ms", "wave_idle_pct", "layer_ms", "ckpt_ms", "total_ms", "rss_end_gb"]
         .iter()
         .map(|n| col(n))
         .collect::<Result<_>>()?;
@@ -220,9 +219,8 @@ fn read_forward_stats(dir: &Path) -> Result<Vec<FwdLine>> {
                 own_ms: n(10)?,
                 own_idle: 0,
                 ckpt_ms: n(11)?,
-                pos_ms: n(12)?,
-                total_ms: n(13)?,
-                rss_gb: x(14)?,
+                total_ms: n(12)?,
+                rss_gb: x(13)?,
             },
         );
     }
@@ -447,16 +445,19 @@ struct RegionBlocks {
 
 /// One storage region counted into `sums`, frame by frame: each block
 /// decoded, merged with the marked sets' rows at its cells, and unmapped.
-fn count_region<N: celeste_core::arith::EngineNum>(tree: &Tree<N>, rb: &RegionBlocks, sets: &[MarkedSet], sums: &[std::sync::Mutex<FrameSums>]) -> Result<()> {
+/// Does the region hold a win?
+fn count_region<N: celeste_core::arith::EngineNum>(tree: &Tree<N>, rb: &RegionBlocks, sets: &[MarkedSet], sums: &[std::sync::Mutex<FrameSums>]) -> Result<bool> {
     let geo = crate::storage::GEOMETRY;
     let (shape, slot) = (tree.shape_of(rb.region)?, rb.region % geo.slots);
     let locals = if slot == geo.no_cell_slot() { 1 } else { u64::MAX };
     let rows: Vec<CellRows> = sets.iter().map(|m| CellRows::of(m, shape, slot, locals)).collect();
+    let mut won = false;
     for &(f, bi) in &rb.blocks {
         let file = tree.frames[f].as_ref().expect("a frame with a region block");
         let e = file.region(bi).with_context(|| format!("{} region {}", file.path().display(), rb.region))?;
         file.release_region(bi)?;
         let (mut states, mut wins, mut held) = ([0u32; 64], [0u32; 64], 0u64);
+        won |= !e.wins.is_empty();
         for &m in &e.masks {
             held |= m;
             for local in bits(m) {
@@ -485,7 +486,38 @@ fn count_region<N: celeste_core::arith::EngineNum>(tree: &Tree<N>, rb: &RegionBl
     for (m, r) in sets.iter().zip(&rows) {
         r.release(&m.m)?;
     }
-    Ok(())
+    Ok(won)
+}
+
+/// Per cell of the regions `regions` (the win states'), the cells its
+/// recorded in-edges leave from, over every frame of the tree in `dir`
+/// through `last`; sorted.
+fn sources_into<N: crate::search::rem::Rem>(dir: &Path, last: u32, regions: &[u32], threads: usize) -> Result<FxHashMap<u32, Vec<u32>>> {
+    let geo = crate::storage::GEOMETRY;
+    let store = crate::storage::edges::EdgeStore::<N>::open(&dir.join("edges"), last)?;
+    let frames: Vec<u32> = (1..=last).collect();
+    let parts = crate::par::Pool::new(threads).map_with(
+        frames.len(),
+        || Ok(crate::storage::edges::Decoder::default()),
+        |dec, k| {
+            let mut pairs: Vec<(u32, u32)> = Vec::new();
+            for &r in regions {
+                for seg in store.segments(frames[k], r) {
+                    dec.bundles(&seg, |b| crate::storage::edges::expand(&geo, r, &b, |src, dst| pairs.push((dst.cell(&geo), src.cell(&geo)))))?;
+                }
+            }
+            Ok(pairs)
+        },
+    )?;
+    let mut by: FxHashMap<u32, Vec<u32>> = FxHashMap::default();
+    for (dst, src) in parts.into_iter().flatten() {
+        by.entry(dst).or_default().push(src);
+    }
+    for v in by.values_mut() {
+        v.sort_unstable();
+        v.dedup();
+    }
+    Ok(by)
 }
 
 /// Per-cell sums `(cell, n)` ascending; a count past u32 is an error.
@@ -497,16 +529,11 @@ fn sparse(m: FxHashMap<u32, u64>) -> Result<Sparse> {
 
 /// One level directory, the largest region first: per frame its states and
 /// wins per cell, and `[k]`: per frame, set `k`'s marked states per cell.
-fn read_tree<N: celeste_core::arith::EngineNum>(dir: &Path, sets: &[MarkedSet], threads: usize) -> Result<(LevelData, Vec<Vec<Sparse>>)> {
+fn read_tree<N: crate::search::rem::Rem>(dir: &Path, sets: &[MarkedSet], threads: usize) -> Result<(LevelData, Vec<Vec<Sparse>>)> {
     let n = last_frame(dir).map_or(0, |l| l as usize + 1);
-    // The pos graph, to draw wins where the player left from (below). An
-    // absent graph draws wins in place; an unloadable one is an error.
-    let graph_path = dir.join("posgraph.bin");
-    let graph = if graph_path.exists() {
-        Some(crate::search::pos_graph::PosGraph::load(&graph_path).with_context(|| format!("loading {}", graph_path.display()))?)
-    } else {
-        None
-    };
+    // Per win cell the cells its in-edges leave from, to draw wins where the
+    // player left from (below).
+    let mut graph: FxHashMap<u32, Vec<u32>> = FxHashMap::default();
     let sums: Vec<std::sync::Mutex<FrameSums>> =
         (0..n).map(|_| std::sync::Mutex::new(FrameSums { cells: Default::default(), wins: Default::default(), marked: vec![Default::default(); sets.len()] })).collect();
     if n > 0 {
@@ -521,20 +548,26 @@ fn read_tree<N: celeste_core::arith::EngineNum>(dir: &Path, sets: &[MarkedSet], 
         }
         let mut regions: Vec<RegionBlocks> = by_region.into_values().collect();
         regions.sort_unstable_by_key(|r| (std::cmp::Reverse(r.states), r.region));
-        crate::par::Pool::new(threads).map(regions.len(), |i| count_region(&tree, &regions[i], sets, &sums))?;
+        let won = crate::par::Pool::new(threads).map(regions.len(), |i| count_region(&tree, &regions[i], sets, &sums))?;
+        let mut win_regions: Vec<u32> = regions.iter().zip(won).filter(|x| x.1).map(|x| x.0.region).collect();
+        win_regions.sort_unstable();
+        graph = sources_into::<N>(dir, n as u32 - 1, &win_regions, threads)?;
     }
     let mut frames: Vec<(Sparse, Sparse)> = Vec::with_capacity(n);
     let mut layers: Vec<Vec<Sparse>> = vec![Vec::with_capacity(n); sets.len()];
     for s in sums {
         let FrameSums { mut cells, mut wins, marked } = s.into_inner().unwrap();
         // A won state's cell is in the NEXT room: draw it where its player
-        // LEFT from, the pos-graph source with the most states at the
-        // previous frame. States and wins move whole: totals are unchanged.
-        if let (Some(g), Some((prev, _))) = (graph.as_ref(), frames.last()) {
+        // LEFT from, the in-edges' source cell (any frame's) with the most
+        // states at the previous frame. States and wins move whole: totals
+        // are unchanged.
+        if let Some((prev, _)) = frames.last() {
             let prev: &Sparse = prev;
             let busiest = |win: u32| -> Option<u32> {
-                g.sources(win)
-                    .iter()
+                graph
+                    .get(&win)
+                    .into_iter()
+                    .flatten()
                     .filter_map(|&s| prev.binary_search_by_key(&s, |&(c, _)| c).ok().map(|i| prev[i]))
                     .max_by_key(|&(c, n)| (n, std::cmp::Reverse(c)))
                     .map(|(c, _)| c)
@@ -1021,7 +1054,7 @@ mod tests {
         let ms = std::time::Duration::from_millis;
         let row = |f: u32, kept: usize| {
             let st = crate::frame::FrameStats { lanes_kept: kept, wave_idle: 0.94, t_wave: ms(7), rss_end: 1.28, ..Default::default() };
-            crate::frame::forward_stats_row(f, &st, ms(1), ms(2), ms(11), 4)
+            crate::frame::forward_stats_row(f, &st, ms(1), ms(11), 4)
         };
         for (f, kept) in [(1, 10), (2, 20), (2, 21), (3, 30)] {
             crate::frame::append_forward_stats(&dir, &row(f, kept)).unwrap();

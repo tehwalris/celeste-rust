@@ -9,7 +9,7 @@
 //! `route::reencode`): a function of the search, not of slice order.
 
 use anyhow::{ensure, Context, Result};
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
@@ -510,6 +510,19 @@ impl<N: Rem> EdgeStore<N> {
         )
     }
 
+    /// The distinct `(source cell, target cell)` pairs of frame `frame`'s
+    /// edges (`Sk::cell`: the player's position cell, `NO_CELL` without one).
+    pub(crate) fn cell_pairs(&self, frame: u32, threads: usize) -> Result<FxHashSet<(u32, u32)>> {
+        let geo = GEOMETRY;
+        let mut all = FxHashSet::default();
+        for part in self.par_scan(frame, threads, FxHashSet::default, |acc, e| {
+            acc.insert((e.src.cell(&geo), e.dst.cell(&geo)));
+        })? {
+            all.extend(part);
+        }
+        Ok(all)
+    }
+
     /// Every edge of frame `frame`, as a list, sorted.
     pub fn edges_at(&self, frame: u32, threads: usize) -> Result<Vec<Edge>> {
         let mut v: Vec<Edge> = self.par_scan(frame, threads, Vec::new, |v, e| v.push(e))?.into_iter().flatten().collect();
@@ -536,8 +549,8 @@ impl<N: Rem> EdgeStore<N> {
 }
 
 /// THE TREE'S ONE TRUST MARKER (`<level>/edges/done.txt`): the last frame
-/// whose files are all complete - its frame, hull, edge and out files and
-/// the pos graph, all written before it - and the transfer table's trusted
+/// whose files are all complete - its frame, hull, edge and out files, all
+/// written before it - and the transfer table's trusted
 /// length. A frame past it is a killed run's (`resume` discards it).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Done {

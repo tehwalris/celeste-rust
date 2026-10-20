@@ -1,5 +1,5 @@
 //! THE TREE FILES' ONE CONTAINER (frame, hull, edge and out files; value
-//! files: the marks, the pos graph): a 4-byte magic (the file's kind, in
+//! files: the marks): a 4-byte magic (the file's kind, in
 //! its arithmetic: `magic`), a u32 version (`FORMAT_VERSION`; the edge
 //! files' their own), the header's length (u64; both little-endian), the
 //! header (bincode 1), then the BLOCKS back to back, zstd -1, placed by the
@@ -170,7 +170,7 @@ fn header_len(b: &[u8], magic: [u8; 4], version: u32, path: &Path, what: &str) -
     Ok(n)
 }
 
-/// Save a value (the marks, the pos graph): a file of no block.
+/// Save a value (the marks): a file of no block.
 pub(crate) fn save_value<T: Serialize>(path: &Path, value: &T) -> Result<()> {
     write(path, *VALUE, FORMAT_VERSION, value, |_| Ok(())).map(drop)
 }

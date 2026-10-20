@@ -19,7 +19,7 @@ pub enum Command {
     /// ONE FORWARD FRAME of a tree, F -> F+1, repeatably.
     ///
     /// The forward as it stood after `--frame` F (`ForwardState::at`: the
-    /// tree's visited set, transfers, level -1 filter and pos graph at F;
+    /// tree's visited set, transfers and level -1 filter at F;
     /// later frames ignored) runs the wave of F+1 `--reps` times, the edges
     /// into a scratch dir. Prints (stdout, the same every rep, else an
     /// error) `ckhash`'s lines for F+1 - `f{F+1}` of the new states,
@@ -63,7 +63,7 @@ pub struct FrameArgs {
     #[arg(long)]
     pub metrics: Option<PathBuf>,
     /// Checkpoint each rep's frame as the forward does (the frame file
-    /// and the hull file, each read back and checked; the pos graph),
+    /// and the hull file, each read back and checked),
     /// into the scratch dir, timed; prints the `b{F+1}` line (needs
     /// `--edges`).
     #[arg(long)]
@@ -129,7 +129,7 @@ where
     let t_kernels = t.elapsed().as_secs_f64();
     eprintln!("[bench] kernels built: rss {:.2} GB", celeste_rust::metrics::current_rss_gb());
     let t = std::time::Instant::now();
-    let mut st = celeste_rust::frame::ForwardState::<N>::at(dir, frame, true, level, cfg)?;
+    let mut st = celeste_rust::frame::ForwardState::<N>::at(dir, frame, level, cfg)?;
     eprintln!(
         "[bench] kernels built in {t_kernels:.2} s; f{frame} loaded in {:.2} s: {} lanes in {} entries ({:.3} GB, {:.2} B a state) and {} old states, visited {} states in {} entries ({:.3} GB, {:.2} B a state); {} threads; rss {:.2} GB",
         t.elapsed().as_secs_f64(),
@@ -172,7 +172,7 @@ where
             w.wave_idle * 100.0,
             ms(w.t_regions),
             ms(w.t_layer),
-            ckpt.map_or(String::new(), |(c, pos)| format!(" checkpoint {:.0}", ms(c.t.iter().sum::<std::time::Duration>() + pos))),
+            ckpt.map_or(String::new(), |c| format!(" checkpoint {:.0}", ms(c.t.iter().sum::<std::time::Duration>()))),
             ms(t_all),
             w.lanes_in,
             w.old_in,

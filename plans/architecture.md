@@ -51,9 +51,10 @@ celeste-rust (src/)
                         exact), concrete (the concrete search; dual: over
                         pairs), known, arcs, hull, rem (+ rem_f64),
                         arc_edges, arc_check, hull_replay, tree (a finished
-                        tree opened), pos_graph, result, ui_export, inspect,
-                        level_minus_one (the cost-to-go table, its one
-                        builder), robust (a float witness against the libm)
+                        tree opened), pos_graph (the player-position
+                        cells), result, ui_export, inspect, level_minus_one
+                        (the cost-to-go table, its one builder), robust (a
+                        float witness against the libm)
   trace/                the tracer: interp, state, heap, domain (Symbolic) and
                         refdomain (RefDomain), frame (one frame traced), split
                         (the split pass), widen, error, walk (the lattice
@@ -296,7 +297,7 @@ each route SEALED against the visited set (new, grown, or nothing), the
 ladder's filter applied, everything merged into the visited set
 (`absorb`). Then the FRAME FILE (`frames/f{F}.bin`: per region the new
 entries' keys, masks and win masks; the shapes' skeletons), the HULL FILE
-(`hulls/f{F}.bin`), the edge and out files, the pos graph, and last
+(`hulls/f{F}.bin`), the edge and out files, and last
 `done.txt`. Frame and hull files are read back and compared with the
 forward's state (fatal on a difference). The DECODE GUARD checks a shape's
 first emitted row per worker and wave against its decode.
@@ -427,10 +428,10 @@ own W, for the shortest run valid in both (plans/float.md).
 The check ladder is `./check.sh t0|t1|t2|big` (plans/devloop.md). The
 verification surface behind it:
 
-- **The pinned room (1,0) gates** (`gates/`): each frame's states and
-  hulls f0-f44 (`ckhash --hulls`), the pos graph, the arc search at a
-  synthetic win (W's support and fingerprint per frame, optimum 33, the
-  witness), their float twins and the dual gate.
+- **The pinned room (1,0) gates** (`gates/`): each frame's states, edges
+  (with their transfers) and hulls f0-f44 (`ckhash --edges --hulls`), the
+  arc search at a synthetic win (W's support and fingerprint per frame,
+  optimum 33, the witness), their float twins and the dual gate.
 - **The known-route check** (`search::known`): `search --prefer FILE` and
   `rewrite check known` step a known solution through the reference engine
   and FAIL at the first pruning step that drops it: level -1, the ladder's

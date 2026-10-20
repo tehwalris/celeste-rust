@@ -70,11 +70,11 @@ impl EdgeHashes {
     }
 }
 
-/// One `bench frame` rep for `print_cost` (`ckpt`: the checkpoint's steps
-/// and the pos graph's wall, with `--checkpoint`; `load`: at its start).
+/// One `bench frame` rep for `print_cost` (`ckpt`: the checkpoint's steps,
+/// with `--checkpoint`; `load`: at its start).
 pub struct Rep {
     pub stats: crate::frame::FrameStats,
-    pub ckpt: Option<(crate::frame::Checkpointed, std::time::Duration)>,
+    pub ckpt: Option<crate::frame::Checkpointed>,
     pub workers: usize,
     pub wall: std::time::Duration,
     pub load: f64,
@@ -222,7 +222,7 @@ pub fn print_cost(frame: u32, reps: &[Rep]) {
     let new_states = n(|s| s.lanes_kept as f64);
     let frontier_out = n(|s| (s.lanes_kept + s.grown) as f64);
     let edges = n(|s| s.edge_records as f64);
-    let ckpt_total = |r: &Rep| r.ckpt.map_or(0.0, |(c, pos)| c.t.iter().map(|&d| dur(d)).sum::<f64>() + dur(pos));
+    let ckpt_total = |r: &Rep| r.ckpt.map_or(0.0, |c| c.t.iter().map(|&d| dur(d)).sum::<f64>());
     line("frame (wave + end + checkpoint)", col(&|r| dur(r.stats.t_wave) + dur(r.stats.t_layer) + ckpt_total(r)), Some(("new state", new_states.clone())));
     line("  wave (units and region jobs)", col(&|r| dur(r.stats.t_wave)), Some(("emission", emissions.clone())));
     line("  frame end", col(&|r| dur(r.stats.t_layer)), Some(("new state", new_states.clone())));
@@ -270,9 +270,8 @@ pub fn print_cost(frame: u32, reps: &[Rep]) {
     if r0.ckpt.is_some() {
         let per_ckpt = [new_states.clone(), new_states.clone(), frontier_out.clone(), frontier_out.clone()];
         for (k, (name, per)) in crate::frame::CKPT_STEPS.iter().zip(per_ckpt).enumerate() {
-            steps.push(Line { label: format!("checkpoint: {name}"), secs: col(&|r| r.ckpt.map_or(0.0, |c| dur(c.0.t[k]))), per: Some(("state", per)), counts: Some(reps.iter().map(|r| r.ckpt.map_or([0; 4], |c| c.0.counts[k])).collect()) });
+            steps.push(Line { label: format!("checkpoint: {name}"), secs: col(&|r| r.ckpt.map_or(0.0, |c| dur(c.t[k]))), per: Some(("state", per)), counts: Some(reps.iter().map(|r| r.ckpt.map_or([0; 4], |c| c.counts[k])).collect()) });
         }
-        steps.push(Line { label: "checkpoint: pos graph".into(), secs: col(&|r| r.ckpt.map_or(0.0, |c| dur(c.1))), per: None, counts: None });
     }
     let mm = |v: &[f64]| (v.iter().copied().fold(f64::INFINITY, f64::min), v.iter().copied().fold(f64::NEG_INFINITY, f64::max));
     let per_text = |l: &Line| match &l.per {
@@ -342,7 +341,7 @@ pub fn print_cost(frame: u32, reps: &[Rep]) {
         );
     }
     let gb = |b: u64| b as f64 / 1e9;
-    let (fb, hb) = r0.ckpt.map_or((0, 0), |c| (c.0.frame_bytes, c.0.hull_bytes));
+    let (fb, hb) = r0.ckpt.map_or((0, 0), |c| (c.frame_bytes, c.hull_bytes));
     eprintln!(
         "[cost] bytes written: edge file {:.3} GB, out file {:.3} GB, frame file {:.3} GB, hull file {:.3} GB | anonymous RSS start {:.2} wave {:.2} end {:.2} GB, peak (VmHWM) {:.2} GB",
         gb(s.edge_bytes),

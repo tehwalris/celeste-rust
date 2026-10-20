@@ -1971,9 +1971,13 @@ pub fn probe(root: &FsPath, opts: &Opts, s: &crate::settings::Settings) -> Resul
         say!(rep, "{:4} {line}", ty as i32 * 8)?;
     }
 
-    // The soundness check against the recorded transitions.
-    use crate::search::pos_graph::{cell_xy, PosGraph, CELL_COUNT, NO_CELL};
-    let pg = PosGraph::load(&crate::frame::pos_graph_path(&opts.level_dir))?;
+    // The soundness check against the recorded transitions: every edge of
+    // the tree, as (source cell, target cell).
+    use crate::search::pos_graph::{cell_xy, NO_CELL};
+    let pairs = match s.arith {
+        crate::settings::Arith::Fixed => recorded_cell_pairs::<celeste_engine::runtime2::P8>(&opts.level_dir, opts.threads)?,
+        crate::settings::Arith::Float(_) => recorded_cell_pairs::<celeste_core::lua_f64::LuaF64>(&opts.level_dir, opts.threads)?,
+    };
     let mut pos_edges: HashSet<(i16, i16, i16, i16)> = HashSet::new();
     let mut exit_src: HashSet<(i16, i16)> = HashSet::new();
     for w in chain.windows(2) {
@@ -1991,32 +1995,30 @@ pub fn probe(root: &FsPath, opts: &Opts, s: &crate::settings::Settings) -> Resul
     }
     let xy_of = |c: u32| -> (i16, i16) { if c == NO_CELL { (NONE, NONE) } else { cell_xy(c).map(|(x, y)| (x as i16, y as i16)).expect("a grid cell") } };
     let (mut checked, mut crossings, mut deaths, mut bad) = (0u64, 0u64, 0u64, Vec::new());
-    for d in 0..CELL_COUNT as u32 {
-        let (dx, dy) = xy_of(d);
-        for &s in pg.sources(d) {
-            let (sx, sy) = xy_of(s);
-            if sx != NONE && sx >= 128 {
-                continue;
+    for &(s, d) in &pairs {
+        let ((sx, sy), (dx, dy)) = (xy_of(s), xy_of(d));
+        if sx != NONE && sx >= 128 {
+            continue;
+        }
+        // A death or a respawn: not modelled (dead ends).
+        if sx == NONE || dx == NONE {
+            deaths += 1;
+            continue;
+        }
+        if dx >= 128 {
+            crossings += 1;
+            if !exit_src.contains(&(sx, sy)) {
+                bad.push(format!("({sx}, {sy}) -> exit"));
             }
-            // A death or a respawn: not modelled (dead ends).
-            if sx == NONE || dx == NONE {
-                deaths += 1;
-                continue;
-            }
-            if dx != NONE && dx >= 128 {
-                crossings += 1;
-                if !exit_src.contains(&(sx, sy)) {
-                    bad.push(format!("({sx}, {sy}) -> exit"));
-                }
-                continue;
-            }
-            checked += 1;
-            if !pos_edges.contains(&(sx, sy, dx, dy)) {
-                bad.push(format!("({sx}, {sy}) -> ({dx}, {dy})"));
-            }
+            continue;
+        }
+        checked += 1;
+        if !pos_edges.contains(&(sx, sy, dx, dy)) {
+            bad.push(format!("({sx}, {sy}) -> ({dx}, {dy})"));
         }
     }
-    say!(rep, "\nsoundness vs {}: {} recorded pairs, {checked} in the room checked, {crossings} crossings checked, {deaths} deaths and respawns not modelled; {} VIOLATIONS", opts.level_dir.display(), pg.pairs(), bad.len())?;
+    bad.sort();
+    say!(rep, "\nsoundness vs {}: {} recorded (source cell, target cell) pairs, {checked} in the room checked, {crossings} crossings checked, {deaths} deaths and respawns not modelled; {} VIOLATIONS", opts.level_dir.display(), pairs.len(), bad.len())?;
     for b in bad.iter().take(20) {
         say!(rep, "  not allowed: {b}")?;
     }
@@ -2027,6 +2029,20 @@ pub fn probe(root: &FsPath, opts: &Opts, s: &crate::settings::Settings) -> Resul
     }
     say!(rep, "\ntotal {:.1} s", t_all.elapsed().as_secs_f64())?;
     Ok(rep)
+}
+
+/// Every recorded edge of the tree in `dir` (through its last trusted
+/// frame) as a `(source cell, target cell)` pair, once.
+fn recorded_cell_pairs<N: crate::search::rem::Rem>(dir: &FsPath, threads: usize) -> Result<Vec<(u32, u32)>> {
+    let last = crate::storage::edges::done_frame(&dir.join("edges")).ok_or_else(|| anyhow!("{}: no finished frame", dir.display()))?;
+    let store = crate::storage::edges::EdgeStore::<N>::open(&dir.join("edges"), last)?;
+    let mut all: rustc_hash::FxHashSet<(u32, u32)> = Default::default();
+    for f in 1..=last {
+        all.extend(store.cell_pairs(f, threads)?);
+    }
+    let mut v: Vec<(u32, u32)> = all.into_iter().collect();
+    v.sort_unstable();
+    Ok(v)
 }
 
 /// `probe`'s comparison with a level-0 tree: per frame, what the filter

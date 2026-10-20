@@ -148,8 +148,8 @@ hover a chart for the crosshair readout. Log / linear y.
 **Time** (`#time`) - the waterfall: x is time (the log's per-frame and
 per-iteration totals laid end to end after the kernel prebuild; the log
 has no wall clock), rows are horizon → level → phase → every frame /
-iteration as a column split into emit / own / checkpoint / pos-graph (a
-forward frame) or parallel / serial (a backward iteration). Drag across
+iteration as a column split into emit / own / checkpoint (a forward
+frame) or parallel / serial (a backward iteration). Drag across
 the overview strip or the waterfall to zoom to a span, pinch or scroll
 to zoom, tap a block for its numbers (a horizon / level / phase block
 also zooms to itself), "back" pops the previous span, double-tap resets.

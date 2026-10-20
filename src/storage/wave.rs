@@ -272,7 +272,6 @@ fn idle_fraction(wall: std::time::Duration, workers: usize, busy: std::time::Dur
 pub(crate) struct WaveCtx<'a, N: Rem = P8> {
     pub(crate) visited: &'a mut VisitedSet<N>,
     pub(crate) xfers: &'a mut XferTable<N>,
-    pub(crate) pos: Option<&'a crate::search::pos_graph::PosObserver>,
     pub(crate) filters: Filters<'a, N>,
     pub(crate) frame: u32,
     /// The level's `edges/` dir: edges are recorded only with one.
@@ -344,7 +343,7 @@ fn run_unit<N: Rem>(engine: &dyn FrameStep<N>, u: u32, entries: std::ops::Range<
 /// ONE FORWARD FRAME: frame `cx.frame` from `front` (grown the frame before).
 pub(crate) fn run_wave<N: Rem>(engine: &dyn FrameStep<N>, front: Frontier<N>, cx: WaveCtx<N>) -> Result<Wave<N>> {
     use std::time::Instant;
-    let WaveCtx { visited, xfers, pos, filters, frame, edges_dir, outs, skeletons, ceiling } = cx;
+    let WaveCtx { visited, xfers, filters, frame, edges_dir, outs, skeletons, ceiling } = cx;
     // A platforms-unknown level knows only `PLATFORM_WORLD_FRAMES` worlds.
     let (level, s) = (engine.level(), &engine.settings());
     let game_frame = s.clock().frame_of(frame);
@@ -398,7 +397,7 @@ pub(crate) fn run_wave<N: Rem>(engine: &dyn FrameStep<N>, front: Frontier<N>, cx
     let xtabs: Vec<std::sync::RwLock<Vec<N::Pair>>> = (0..workers).map(|_| Default::default()).collect();
     let xfers_before = xfers.pairs.len();
     let base: &XferTable<N> = xfers;
-    let mut sinks: Vec<UnitSink<N>> = (0..workers).map(|w| UnitSink::new(visited, &routes, skeletons, &prov, filters, frame, level, w as u32, base, &xtabs[w], pos.is_some(), record, s)).collect();
+    let mut sinks: Vec<UnitSink<N>> = (0..workers).map(|w| UnitSink::new(visited, &routes, skeletons, &prov, filters, frame, level, w as u32, base, &xtabs[w], record, s)).collect();
     // Per kernel unit its out block (raw while a target key is provisional).
     let mut out_blocks: Vec<std::sync::Mutex<Vec<OutBlock>>> = (0..n_kernel).map(|_| Default::default()).collect();
     let repushed = std::sync::atomic::AtomicU64::new(0);
@@ -606,7 +605,7 @@ pub(crate) fn run_wave<N: Rem>(engine: &dyn FrameStep<N>, front: Frontier<N>, cx
             let b = k.alloc_bytes();
             [a[0] + b[0], a[1] + b[1], a[2] + b[2], a[3] + b[3]]
         });
-        let sk = sinks.iter().fold([0usize; 5], |a, k| {
+        let sk = sinks.iter().fold([0usize; 4], |a, k| {
             let b = k.alloc_bytes();
             std::array::from_fn(|i| a[i] + b[i])
         });
@@ -638,7 +637,7 @@ pub(crate) fn run_wave<N: Rem>(engine: &dyn FrameStep<N>, front: Frontier<N>, cx
             tb.iter().sum::<usize>() as f64 / ts.max(1) as f64
         );
         eprintln!(
-            "[wavemem] f{frame}: frontier {:.3} GB ({} entries, {} old states), visited {:.3} GB ({} entries), transfers {:.3}, the out store's index {:.3}, the routes' touched states {:.3}, provisional bundles {:.3}, segments {:.3}, out blocks {:.3}, spooled {:.3}, chunks in flight at most {:.3}, sinks {:.3} (bundles {:.3}, lane hulls {:.3}, pos pairs {:.3}, transfers {:.3}: {x_all} met, at most {x_max} a worker, rest {:.3}), region scratch {:.3} (bundles {:.3}, encoder {:.3}, raw {:.3}, rest {:.3}) GB; anon {:.2} GB",
+            "[wavemem] f{frame}: frontier {:.3} GB ({} entries, {} old states), visited {:.3} GB ({} entries), transfers {:.3}, the out store's index {:.3}, the routes' touched states {:.3}, provisional bundles {:.3}, segments {:.3}, out blocks {:.3}, spooled {:.3}, chunks in flight at most {:.3}, sinks {:.3} (bundles {:.3}, lane hulls {:.3}, transfers {:.3}: {x_all} met, at most {x_max} a worker, rest {:.3}), region scratch {:.3} (bundles {:.3}, encoder {:.3}, raw {:.3}, rest {:.3}) GB; anon {:.2} GB",
             gb(st.frontier_bytes),
             st.entries_in,
             st.old_in,
@@ -657,7 +656,6 @@ pub(crate) fn run_wave<N: Rem>(engine: &dyn FrameStep<N>, front: Frontier<N>, cx
             gb(sk[1]),
             gb(sk[2]),
             gb(sk[3]),
-            gb(sk[4]),
             gb(sc.iter().sum()),
             gb(sc[0]),
             gb(sc[1]),
@@ -677,9 +675,6 @@ pub(crate) fn run_wave<N: Rem>(engine: &dyn FrameStep<N>, front: Frontier<N>, cx
     for sink in &mut sinks {
         sink.finish();
         st.lanes_raw += sink.emitted as usize;
-        if let Some(p) = pos {
-            p.record_pairs(sink.pos_pairs());
-        }
     }
     st.units = n_units;
     drop(sinks);
@@ -1575,7 +1570,7 @@ pub fn one_frame<N: Rem>(engine: &dyn FrameStep<N>, rows: Vec<Block<N>>, frame: 
     let s = engine.settings();
     let start = seed(&mut visited, &rows, HullOf::<N>::full(), &s)?.frontier();
     visited.forget_states();
-    let cx = WaveCtx { visited: &mut visited, xfers: &mut xfers, pos: None, filters: Filters::default(), frame, edges_dir: None, outs: None, skeletons: &skeletons, ceiling: None };
+    let cx = WaveCtx { visited: &mut visited, xfers: &mut xfers, filters: Filters::default(), frame, edges_dir: None, outs: None, skeletons: &skeletons, ceiling: None };
     let wave = run_wave(engine, start, cx)?;
     Ok(super::layer::decode_states(&wave.next, &visited.keys, visited.shapes(), usize::MAX, &|_| true)?.into_iter().map(|(_, rt2)| Block::from_rt2(rt2)).collect())
 }

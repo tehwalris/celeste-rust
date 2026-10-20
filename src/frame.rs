@@ -678,7 +678,6 @@ pub struct ForwardState<N: Rem = P8> {
     /// and the shapes whose skeleton a frame file holds.
     skeletons: crate::storage::decode::Skeletons<N>,
     persisted: rustc_hash::FxHashSet<u64>,
-    observer: Option<crate::search::pos_graph::PosObserver>,
     /// The last frame computed (and checkpointed).
     pub(crate) frames: u32,
     /// The first frame a lane won, if any so far.
@@ -694,8 +693,6 @@ pub struct ForwardResult {
     pub win_frame: Option<u32>,
     /// The last checkpointed frame.
     pub frames: u32,
-    /// The position graph, when recording was on (the posgraph gate).
-    pub pos_graph: Option<crate::search::pos_graph::PosGraph>,
 }
 
 /// What a checkpoint wrote, and its steps' walls (`CKPT_STEPS`).
@@ -746,7 +743,7 @@ impl<N: Rem> ForwardState<N> {
     /// Frame 0: `initial` into an empty visited set and checkpointed, each
     /// with the start's hull; the tree is filtered by `minus_one` and
     /// widened at `level` (both recorded, with the settings `s`).
-    pub(crate) fn start(initial: Vec<Block<N>>, dir: &std::path::Path, record: bool, minus_one: Option<MinusOne>, level: crate::abstraction::Level, s: &crate::settings::Settings) -> Result<Self> {
+    pub(crate) fn start(initial: Vec<Block<N>>, dir: &std::path::Path, minus_one: Option<MinusOne>, level: crate::abstraction::Level, s: &crate::settings::Settings) -> Result<Self> {
         // A fresh tree keeps nothing a killed run left (stale edge files).
         for sub in ["frames", "edges", "hulls"] {
             let p = dir.join(sub);
@@ -765,21 +762,16 @@ impl<N: Rem> ForwardState<N> {
         let mut visited = crate::storage::visited::VisitedSet::<N>::new(crate::storage::GEOMETRY);
         let seeded = crate::storage::wave::seed(&mut visited, &initial, crate::search::rem::start_hull::<N>(), s)?;
         let won = checkpoint(dir, 0, &seeded, &[], s)?.won;
-        let observer = record.then(crate::search::pos_graph::PosObserver::default);
-        // An (empty) graph from the start: every tree with frames has one.
-        if let Some(o) = observer.as_ref() {
-            save_pos_graph(dir, &o.snapshot())?;
-        }
         let edges_dir = dir.join("edges");
         crate::storage::edges::set_done(&edges_dir, 0, 0)?;
         let outs = crate::storage::out::OutStore::open(&edges_dir, 0)?;
-        Ok(ForwardState { frontier: seeded.frontier(), visited, xfers: Default::default(), outs, skeletons: Default::default(), persisted: Default::default(), observer, frames: 0, win_frame: won.then_some(0), filter: Some(filter), spent: false })
+        Ok(ForwardState { frontier: seeded.frontier(), visited, xfers: Default::default(), outs, skeletons: Default::default(), persisted: Default::default(), frames: 0, win_frame: won.then_some(0), filter: Some(filter), spent: false })
     }
 
     /// The forward as its checkpoint tree left it (`None`: no tree); extending
     /// it matches extending the original. Refused at another `level` than
     /// the tree's, or under other settings `s` than its.
-    pub(crate) fn resume(dir: &std::path::Path, record: bool, level: crate::abstraction::Level, s: &crate::settings::Settings) -> Result<Option<Self>> {
+    pub(crate) fn resume(dir: &std::path::Path, level: crate::abstraction::Level, s: &crate::settings::Settings) -> Result<Option<Self>> {
         let Some(mut last) = crate::storage::layer::last_frame(dir) else { return Ok(None) };
         let t = std::time::Instant::now();
         // Trust only frames whose files are complete (at most one lost).
@@ -794,7 +786,7 @@ impl<N: Rem> ForwardState<N> {
             last = done;
         }
         crate::storage::edges::discard_after(&edges_dir, last)?;
-        let st = Self::at(dir, last, record, level, s)?;
+        let st = Self::at(dir, last, level, s)?;
         eprintln!(
             "[resume] {}: f{last} ({} new states in {} entries, {} old), visited {} states in {} entries, first win {:?}, level -1 {:?}, {:.1} s",
             dir.display(),
@@ -814,7 +806,7 @@ impl<N: Rem> ForwardState<N> {
     /// READ-ONLY: later frames are ignored, not discarded (`resume` discards
     /// them first), so `bench_wave` from here is the real forward's frame
     /// `last + 1`. Refused under other settings or at another `level`.
-    pub fn at(dir: &std::path::Path, last: u32, record: bool, level: crate::abstraction::Level, s: &crate::settings::Settings) -> Result<Self> {
+    pub fn at(dir: &std::path::Path, last: u32, level: crate::abstraction::Level, s: &crate::settings::Settings) -> Result<Self> {
         s.check(dir, level)?;
         let edges_dir = dir.join("edges");
         let filter = TreeFilter::read(dir)?;
@@ -822,15 +814,7 @@ impl<N: Rem> ForwardState<N> {
         let persisted = skeletons.shapes().into_iter().collect();
         let xfers = crate::storage::edges::XferTable::<N>::load(&edges_dir)?;
         let outs = crate::storage::out::OutStore::open(&edges_dir, last)?;
-        let observer = if record {
-            let path = pos_graph_path(dir);
-            let graph = crate::search::pos_graph::PosGraph::load(&path)
-                .with_context(|| format!("resuming {}: no pos graph at {}", dir.display(), path.display()))?;
-            Some(crate::search::pos_graph::PosObserver::from_graph(&graph))
-        } else {
-            None
-        };
-        Ok(ForwardState { frontier, visited, xfers, outs, skeletons, persisted, observer, frames: last, win_frame, filter, spent: false })
+        Ok(ForwardState { frontier, visited, xfers, outs, skeletons, persisted, frames: last, win_frame, filter, spent: false })
     }
 
     pub fn visited_len(&self) -> usize {
@@ -886,7 +870,6 @@ impl<N: Rem> ForwardState<N> {
         let cx = crate::storage::wave::WaveCtx {
             visited: &mut visited,
             xfers: &mut xfers,
-            pos: self.observer.as_ref(),
             filters: Filters { marks: None, minus_one },
             frame: self.frames + 1,
             edges_dir,
@@ -899,16 +882,10 @@ impl<N: Rem> ForwardState<N> {
         Ok((wave, visited, xfers))
     }
 
-    /// `extend`'s checkpoint of a `bench_wave`'s `wave` into `dir`, then the
-    /// pos graph saved: the checkpoint's steps and the pos graph's wall.
-    pub fn bench_checkpoint(&self, wave: &crate::storage::wave::Wave<N>, dir: &std::path::Path, s: &crate::settings::Settings) -> Result<(Checkpointed, std::time::Duration)> {
+    /// `extend`'s checkpoint of a `bench_wave`'s `wave` into `dir`.
+    pub fn bench_checkpoint(&self, wave: &crate::storage::wave::Wave<N>, dir: &std::path::Path, s: &crate::settings::Settings) -> Result<Checkpointed> {
         let emitted = self.skeletons.records(|h| self.persisted.contains(&h) || wave.next.skeletons.contains_key(&h));
-        let c = checkpoint(dir, self.frames + 1, wave, &emitted, s)?;
-        let t = std::time::Instant::now();
-        if let Some(o) = self.observer.as_ref() {
-            save_pos_graph(dir, &o.snapshot())?;
-        }
-        Ok((c, t.elapsed()))
+        checkpoint(dir, self.frames + 1, wave, &emitted, s)
     }
 
     /// Compute and checkpoint frames `frames+1 ..= to` under the tree's
@@ -937,7 +914,6 @@ impl<N: Rem> ForwardState<N> {
             let cx = crate::storage::wave::WaveCtx {
                 visited: &mut self.visited,
                 xfers: &mut self.xfers,
-                pos: self.observer.as_ref(),
                 filters,
                 frame,
                 edges_dir: Some(&edges_dir),
@@ -955,15 +931,10 @@ impl<N: Rem> ForwardState<N> {
             let won = checkpoint(dir, frame, &wave, &emitted, s)?.won;
             self.persisted.extend(self.skeletons.shapes());
             let t_ckpt = t.elapsed();
-            let t = std::time::Instant::now();
-            if let Some(o) = self.observer.as_ref() {
-                save_pos_graph(dir, &o.snapshot())?;
-            }
-            let t_pos = t.elapsed();
             // The frame's LAST write: every file above is trusted from here.
             crate::storage::edges::set_done(&edges_dir, frame, self.xfers.pairs.len())?;
             self.outs.add_frame(&edges_dir, frame)?;
-            log_frame(dir, frame, &wave.stats, t_ckpt, t_pos, t_frame.elapsed(), self.visited_len())?;
+            log_frame(dir, frame, &wave.stats, t_ckpt, t_frame.elapsed(), self.visited_len())?;
             ensure_disk_space(dir, &mut last_free)?;
             self.frames = frame;
             if won && self.win_frame.is_none() {
@@ -973,11 +944,6 @@ impl<N: Rem> ForwardState<N> {
             self.frontier = wave.frontier();
         }
         Ok(())
-    }
-
-    /// The position graph recorded so far (None when not recording).
-    pub(crate) fn pos_graph(&self) -> Option<crate::search::pos_graph::PosGraph> {
-        self.observer.as_ref().map(|o| o.snapshot())
     }
 }
 
@@ -1031,29 +997,17 @@ pub fn grow_tree<N: Rem>(
     }
     if let Some(first_win) = complete {
         eprintln!("[forward] {}: the tree reaches step {to}", dir.display());
-        let pos_graph = crate::search::pos_graph::PosGraph::load(&pos_graph_path(dir)).ok();
-        return Ok(ForwardResult { win_frame: first_win, frames: to, pos_graph });
+        return Ok(ForwardResult { win_frame: first_win, frames: to });
     }
     let engine = engine()?;
     anyhow::ensure!(engine.level() == level, "the forward's engine is at {}, the tree at {level}", engine.level());
     anyhow::ensure!(*engine.settings() == *s, "the forward's engine runs under other settings than the tree's");
-    let mut st = match ForwardState::<N>::resume(dir, true, level, s)? {
+    let mut st = match ForwardState::<N>::resume(dir, level, s)? {
         Some(st) => st,
-        None => ForwardState::start(initial()?, dir, true, want, level, s)?,
+        None => ForwardState::start(initial()?, dir, want, level, s)?,
     };
     st.extend(engine.as_ref(), dir, to, marks)?;
-    Ok(ForwardResult { win_frame: st.win_frame, frames: st.frames, pos_graph: st.pos_graph() })
-}
-
-/// Persist the position graph (atomically), every frame BEFORE its done
-/// marker, so it covers every trusted frame; a frame discarded after a
-/// crash adds its edges again when it is rerun.
-fn save_pos_graph(dir: &std::path::Path, graph: &crate::search::pos_graph::PosGraph) -> Result<()> {
-    graph.save(&pos_graph_path(dir))
-}
-
-pub(crate) fn pos_graph_path(dir: &std::path::Path) -> std::path::PathBuf {
-    dir.join("posgraph.bin")
+    Ok(ForwardResult { win_frame: st.win_frame, frames: st.frames })
 }
 
 /// A fresh forward from `initial` to `max_frames` (the tests' driver).
@@ -1063,11 +1017,10 @@ pub(crate) fn forward_run<N: Rem>(
     initial: Vec<Block<N>>,
     dir: &std::path::Path,
     max_frames: u32,
-    record: bool,
 ) -> Result<ForwardResult> {
-    let mut st = ForwardState::start(initial, dir, record, None, engine.level(), &engine.settings())?;
+    let mut st = ForwardState::start(initial, dir, None, engine.level(), &engine.settings())?;
     st.extend(engine, dir, max_frames, None)?;
-    Ok(ForwardResult { win_frame: st.win_frame, frames: st.frames, pos_graph: st.pos_graph() })
+    Ok(ForwardResult { win_frame: st.win_frame, frames: st.frames })
 }
 
 /// The free disk the forward keeps, GB (`ensure_disk_space`).
@@ -1105,14 +1058,13 @@ fn log_frame(
     frame: u32,
     st: &FrameStats,
     t_ckpt: std::time::Duration,
-    t_pos: std::time::Duration,
     t_total: std::time::Duration,
     visited: usize,
 ) -> Result<()> {
     let ms = |d: std::time::Duration| d.as_secs_f64() * 1e3;
     eprintln!(
         "[fwd] f{frame:03} in {}/{} old {} raw {} re-pushed {} pushes {} touched {} kept {} grown {} out {}/{} visited {} | \
-         wave {:.0} (idle {:.0}%, regions {:.0} worker-ms) layer {:.0} ckpt {:.0} pos {:.0} total {:.0} ms | \
+         wave {:.0} (idle {:.0}%, regions {:.0} worker-ms) layer {:.0} ckpt {:.0} total {:.0} ms | \
          units {} slices {} routes {} edges {} bundles {} ({:.3} B; out {:.3} B) | \
          in {:.2} visited {:.2} GB rss start {:.2} wave {:.2} end {:.2} peak {:.2} GB (anon; file {:.2}) | \
          keys {} bits, {} codes (+{})",
@@ -1133,7 +1085,6 @@ fn log_frame(
         ms(st.t_regions),
         ms(st.t_layer),
         ms(t_ckpt),
-        ms(t_pos),
         ms(t_total),
         st.units,
         st.slices,
@@ -1157,9 +1108,8 @@ fn log_frame(
     crate::metrics::record("fwd.regions", st.t_regions);
     crate::metrics::record("fwd.layer", st.t_layer);
     crate::metrics::record("fwd.checkpoint", t_ckpt);
-    crate::metrics::record("fwd.posgraph", t_pos);
     crate::metrics::record("fwd.frame", t_total);
-    append_forward_stats(dir, &forward_stats_row(frame, st, t_ckpt, t_pos, t_total, visited))
+    append_forward_stats(dir, &forward_stats_row(frame, st, t_ckpt, t_total, visited))
 }
 
 /// One frame's row of the tree's forward record (`FORWARD_STATS`): (column,
@@ -1168,7 +1118,6 @@ pub(crate) fn forward_stats_row(
     frame: u32,
     st: &FrameStats,
     t_ckpt: std::time::Duration,
-    t_pos: std::time::Duration,
     t_total: std::time::Duration,
     visited: usize,
 ) -> Vec<(&'static str, String)> {
@@ -1192,7 +1141,6 @@ pub(crate) fn forward_stats_row(
         ("regions_worker_ms", format!("{:.0}", ms(st.t_regions))),
         ("layer_ms", format!("{:.0}", ms(st.t_layer))),
         ("ckpt_ms", format!("{:.0}", ms(t_ckpt))),
-        ("pos_ms", format!("{:.0}", ms(t_pos))),
         ("total_ms", format!("{:.0}", ms(t_total))),
         ("edges", st.edge_records.to_string()),
         ("rss_start_gb", format!("{:.2}", st.rss_start)),
@@ -1529,7 +1477,7 @@ mod tests {
         let (routes, skeletons) = (crate::storage::route::Routes::default(), crate::storage::decode::Skeletons::default());
         let prov = celeste_engine::exact::Provisional::default();
         let (base, xtab) = (crate::storage::edges::XferTable::default(), Default::default());
-        let mut sink = crate::storage::unit::UnitSink::new(&visited, &routes, &skeletons, &prov, Filters::default(), 1, level, 0, &base, &xtab, false, false, s);
+        let mut sink = crate::storage::unit::UnitSink::new(&visited, &routes, &skeletons, &prov, Filters::default(), 1, level, 0, &base, &xtab, false, s);
         sink.begin(0);
         let si = sink.push_source(0, (0, 0));
         sink.push_lane(si, cells[0], Hull::full());
@@ -1572,7 +1520,7 @@ mod tests {
             std::fs::create_dir_all(f.parent().unwrap()).expect("mkdir");
             std::fs::write(f, b"stale").expect("write");
         }
-        ForwardState::start(init, dir, true, None, Level::EXACT, &s).expect("start");
+        ForwardState::start(init, dir, None, Level::EXACT, &s).expect("start");
         for f in &stale {
             assert!(!f.exists(), "{} survived a fresh start", f.display());
         }
@@ -1608,9 +1556,9 @@ mod tests {
         };
         let (wide, hull) = (base.join("widened"), base.join("hull"));
         WIDEN.store(true, Ordering::Relaxed);
-        ForwardState::start(init(), &wide, true, None, level, &s).expect("start").extend(&e, &wide, to, None).expect("widened");
+        ForwardState::start(init(), &wide, None, level, &s).expect("start").extend(&e, &wide, to, None).expect("widened");
         WIDEN.store(false, Ordering::Relaxed);
-        ForwardState::start(init(), &hull, true, None, level, &s).expect("start").extend(&e, &hull, to, None).expect("hull");
+        ForwardState::start(init(), &hull, None, level, &s).expect("start").extend(&e, &hull, to, None).expect("hull");
         let t = crate::storage::layer::Tree::<P8>::open(&wide, to).expect("tree");
         let lines: Vec<String> = (0..=to).map(|f| { let (n, acc) = t.layer(f, None, 4).expect("layer").0.content_fingerprint(&t.space, &t.shapes).expect("fp"); format!("f{f:03} {n} {acc:016x}") }).collect();
         let pinned = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/gates/ckhash_room10_f000-044_widened.txt")).expect("the gate");
@@ -1628,7 +1576,7 @@ mod tests {
         }
         assert!(n_hull < n_wide, "{n_hull} hull states, {n_wide} widened: the hulls cut nothing");
         // The exact reach, inside the hull tree's states and hulls.
-        let st = ForwardState::<P8>::at(&hull, to, false, level, &s).expect("at");
+        let st = ForwardState::<P8>::at(&hull, to, level, &s).expect("at");
         let tree = crate::storage::layer::Tree::<P8>::open(&hull, to).expect("tree");
         let layers: Vec<Layer> = (0..=to).map(|f| tree.layer(f, None, 4).expect("layer").0).collect();
         let p0 = crate::search::rem::start_point::<P8>();
@@ -1712,13 +1660,13 @@ mod tests {
         let init = start_blocks(&s);
         let e = RefFrameStep::<P8>::new(&s, Level::EXACT).expect("engines");
         let frontier = |st: &ForwardState| -> (Vec<(u32, (u64, u64), u64)>, Vec<Hull>, crate::storage::wave::ByLayer) { (st.frontier.new.iter().collect(), st.frontier.hulls.clone(), st.frontier.old.clone()) };
-        let mut st = ForwardState::start(init, &dir, true, None, Level::EXACT, &s).expect("start");
+        let mut st = ForwardState::start(init, &dir, None, Level::EXACT, &s).expect("start");
         for b in crate::storage::layer::decode_states(&st.frontier.new, &st.visited.keys, st.visited.shapes(), usize::MAX, &|_| true).expect("decode") {
             assert!(not_expanded(&Block::from_rt2(b.1), 0, None, &s).expect("not expanded").iter().all(|&x| x), "frame 0: the berry is lost");
         }
         for to in 0..=3 {
             st.extend(&e, &dir, to, None).expect("extend");
-            let resumed = ForwardState::at(&dir, st.frames, true, Level::EXACT, &s).expect("at");
+            let resumed = ForwardState::at(&dir, st.frames, Level::EXACT, &s).expect("at");
             assert_eq!(frontier(&st), frontier(&resumed), "f{}: the resume's frontier is not the forward's", st.frames);
             assert_eq!(st.win_frame, resumed.win_frame, "f{}: the first win", st.frames);
         }
@@ -1728,8 +1676,7 @@ mod tests {
 
     /// A run killed after a frame's files but before its done marker
     /// resumes to the uninterrupted tree: the frame is discarded and rerun,
-    /// the pos graph (saved before the marker) covers it, the transfers past
-    /// the trusted length are overwritten. The one marker holds the frame
+    /// the transfers past the trusted length are overwritten. The one marker holds the frame
     /// and the transfer count; nothing else claims trust.
     #[test]
     #[ignore = "slow, ./check.sh t2 runs it: room (1,0)'s kernels and three forwards, ~25 CPU-s"]
@@ -1744,8 +1691,8 @@ mod tests {
         let start = RefEngine::new(&s).expect("engine").initial().expect("init");
         let init = || vec![Block::canonical(start.clone_block()).expect("block")];
         let ends = 30;
-        ForwardState::start(init(), &a, true, None, level, &s).expect("start").extend(&e, &a, ends, None).expect("extend");
-        let mut st = ForwardState::start(init(), &b, true, None, level, &s).expect("start");
+        ForwardState::start(init(), &a, None, level, &s).expect("start").extend(&e, &a, ends, None).expect("extend");
+        let mut st = ForwardState::start(init(), &b, None, level, &s).expect("start");
         st.extend(&e, &b, ends - 1, None).expect("extend");
         let marker = std::fs::read_to_string(b.join("edges/done.txt")).expect("done");
         assert_eq!(marker, format!("{} xfers {}\n", ends - 1, st.xfers.pairs.len()));
@@ -1753,11 +1700,9 @@ mod tests {
         // Killed just before frame `ends`' marker.
         std::fs::write(b.join("edges/done.txt"), &marker).expect("rewind the marker");
         for d in [&a, &b] {
-            for stale in ["edges/xfer.len", "posgraph.frame"] {
-                assert!(!d.join(stale).exists(), "{stale}: a second marker");
-            }
+            assert!(!d.join("edges/xfer.len").exists(), "a second marker");
         }
-        let mut st = ForwardState::resume(&b, true, level, &s).expect("resume").expect("a tree");
+        let mut st = ForwardState::resume(&b, level, &s).expect("resume").expect("a tree");
         assert_eq!(st.frames, ends - 1, "the untrusted frame is discarded");
         st.extend(&e, &b, ends, None).expect("rerun");
         for f in 0..=ends {
@@ -1765,7 +1710,7 @@ mod tests {
             assert_eq!(keys(&a), keys(&b), "f{f}");
         }
         assert!(st.xfers.pairs.len() > 1, "transfers recorded");
-        for file in ["edges/done.txt", "edges/xfer.bin", "posgraph.bin", "settings.txt"] {
+        for file in ["edges/done.txt", "edges/xfer.bin", "settings.txt"] {
             assert_eq!(std::fs::read(a.join(file)).expect("a"), std::fs::read(b.join(file)).expect("b"), "{file}");
         }
         let _ = std::fs::remove_dir_all(&base);
@@ -1785,21 +1730,19 @@ mod tests {
         };
         let keyset = |frame: u32| content(dir, frame);
 
-        forward_run(&RefFrameStep::<P8>::new(&s, Level::EXACT).expect("engines"), start_blocks(&s), dir, 4, true).expect("fresh");
+        forward_run(&RefFrameStep::<P8>::new(&s, Level::EXACT).expect("engines"), start_blocks(&s), dir, 4).expect("fresh");
         let fresh4 = keyset(4);
         assert!(fresh4.0 > 0, "fresh frame 4 empty");
 
         // The same run extended one frame at a time.
         {
             let e = RefFrameStep::<P8>::new(&s, Level::EXACT).expect("engines");
-            let mut st = ForwardState::start(start_blocks(&s), dir, true, None, Level::EXACT, &s).expect("start");
-            assert!(pos_graph_path(dir).exists(), "start must leave a graph beside f0");
+            let mut st = ForwardState::start(start_blocks(&s), dir, None, Level::EXACT, &s).expect("start");
             for to in 1..=4 {
                 st.extend(&e, dir, to, None).expect("extend");
                 assert_eq!(st.frames, to);
                 assert_eq!(crate::storage::edges::done_frame(&dir.join("edges")), Some(to), "frame {to} trusted");
             }
-            assert!(st.pos_graph().is_some());
         }
         let extended4 = keyset(4);
         assert_eq!(fresh4, extended4, "extension diverged from fresh at frame 4");
@@ -1809,10 +1752,10 @@ mod tests {
         let fresh_dir = &std::path::PathBuf::from(format!("/var/tmp/celeste-frame-rebuild-resume-test-fresh6-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(fresh_dir);
         std::fs::create_dir_all(fresh_dir).expect("mkdir");
-        forward_run(&RefFrameStep::<P8>::new(&s, Level::EXACT).expect("engines"), start_blocks(&s), fresh_dir, 6, true).expect("fresh 6");
+        forward_run(&RefFrameStep::<P8>::new(&s, Level::EXACT).expect("engines"), start_blocks(&s), fresh_dir, 6).expect("fresh 6");
         {
             let e = RefFrameStep::<P8>::new(&s, Level::EXACT).expect("engines");
-            let mut st = ForwardState::resume(dir, true, Level::EXACT, &s).expect("resume").expect("a tree to resume");
+            let mut st = ForwardState::resume(dir, Level::EXACT, &s).expect("resume").expect("a tree to resume");
             assert_eq!(st.frames, 4);
             let visited_before = st.visited_len();
             st.extend(&e, dir, 6, None).expect("extend resumed");
@@ -1956,7 +1899,7 @@ mod tests {
         // Unsplit, frame by frame: 1 state a frame through the spawn, then these.
         let unsplit: Vec<(u32, usize)> = (0..24).map(|f| (f, 1)).chain([(24, 27), (25, 191), (26, 676), (27, 1883), (28, 4514)]).collect();
         let last = unsplit.last().unwrap().0;
-        forward_run(&engine, init, dir, 2 * last, false).expect("split forward");
+        forward_run(&engine, init, dir, 2 * last).expect("split forward");
         let tree = crate::storage::layer::Tree::<P8>::open(dir, 2 * last).expect("the tree");
         for (f, want) in unsplit {
             let got = tree.states(2 * f) as usize;

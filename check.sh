@@ -275,11 +275,11 @@ t2_platforms() {
     step widen-r60s widen60
 }
 
-# The three pinned room (1,0) oracles (CLAUDE.md "Gates").
+# The pinned room (1,0) oracles (CLAUDE.md "Gates"): the forward's states,
+# edges (with their transfers) and hulls f0-f44, and the arc gate.
 gate10_forward() {
     ./safe-run.sh --memory "$MEM" -- "$B" forward --to 44 --room 1,0 --checkpoint-dir "$C/t2/g10" > "$C/t2/g10.out" || return 1
-    grep '^posgraph' "$C/t2/g10.out" | diff gates/posgraph_room10_f044.txt - >&2 || return 1
-    ./safe-run.sh --memory "$MEM" -- "$B" ckhash --tree "$C/t2/g10" --to 44 --hulls | diff gates/ckhash_room10_f000-044.txt - >&2
+    ./safe-run.sh --memory "$MEM" -- "$B" ckhash --tree "$C/t2/g10" --to 44 --edges --hulls | diff gates/ckhash_room10_f000-044.txt - >&2
 }
 gate10_arc() {
     ./safe-run.sh --memory "$MEM" -- "$B" search --to 35 --win-at 9,101 --checkpoint-dir "$C/t2/arc10" --prefer gates/known_room10_win9-101.txt --save-marks "$C/t2/arc10-marks" > "$C/t2/arc10.out" || return 1
@@ -288,8 +288,7 @@ gate10_arc() {
 # The same oracles in float (`--arith float`, plans/float.md).
 gate10f_forward() {
     ./safe-run.sh --memory "$MEM" -- "$B" forward --arith float --to 44 --room 1,0 --checkpoint-dir "$C/t2/g10f" > "$C/t2/g10f.out" || return 1
-    grep '^posgraph' "$C/t2/g10f.out" | diff gates/float_posgraph_room10_f044.txt - >&2 || return 1
-    ./safe-run.sh --memory "$MEM" -- "$B" ckhash --tree "$C/t2/g10f" --to 44 --hulls | diff gates/float_ckhash_room10_f000-044.txt - >&2
+    ./safe-run.sh --memory "$MEM" -- "$B" ckhash --tree "$C/t2/g10f" --to 44 --edges --hulls | diff gates/float_ckhash_room10_f000-044.txt - >&2
 }
 gate10f_arc() {
     ./safe-run.sh --memory "$MEM" -- "$B" search --arith float --to 35 --win-at 9,101 --checkpoint-dir "$C/t2/arc10f" --prefer gates/known_room10_win9-101.txt --save-marks "$C/t2/arc10f-marks" > "$C/t2/arc10f.out" || return 1
@@ -323,7 +322,7 @@ del r["wall_s"]
 for h in r["horizons"]:
     for l in h["levels"]:
         for f in l["fwd"]:
-            for k in ["emit_ms", "emit_idle", "own_ms", "own_idle", "ckpt_ms", "pos_ms", "total_ms", "rss_gb"]:
+            for k in ["emit_ms", "emit_idle", "own_ms", "own_idle", "ckpt_ms", "total_ms", "rss_gb"]:
                 del f[k]
 print(json.dumps(r, sort_keys=True))' "$C/t2/ui-$d/run.json" | sha256sum | sed "s|-\$|ui-$d/run.json (no timings)|"
     done > "$C/t2/export-ui.sha256"

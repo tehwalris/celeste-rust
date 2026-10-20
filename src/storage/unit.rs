@@ -137,8 +137,6 @@ const VERDICT_BATCH: usize = 1024;
 
 /// Entries of `UnitSink::xfer_id_raw`'s cache.
 const XFER_CACHE: usize = 1 << 12;
-/// Entries of `UnitSink::pos_edge`'s cache (a power of two).
-const POS_RECENT: usize = 1 << 10;
 /// Entries of `UnitSink::src_seen` (a power of two).
 const SRC_SEEN: usize = 1 << 8;
 
@@ -264,12 +262,6 @@ pub struct UnitSink<'a, N: Rem = P8> {
     out_parts: super::out::Parts<N>,
     /// The unit's transfers' ranks by pair (`out_parts_of`).
     x_rank: FxHashMap<u32, u32>,
-    /// Record the pos graph's edges.
-    pub(crate) edges_on: bool,
-    /// The distinct pos-graph edges this worker produced, and the ones met
-    /// recently (direct-mapped: a slice's lanes repeat their edges).
-    pos_edges: FxHashSet<(u32, u32)>,
-    pos_recent: Vec<(u32, u32)>,
     /// Emissions past level -1 (each one a record).
     pub(crate) emitted: u64,
     /// The shapes this worker noted (`note_shape`), registered
@@ -305,7 +297,6 @@ impl<'a, N: Rem> UnitSink<'a, N> {
         worker: u32,
         base: &'a super::edges::XferTable<N>,
         xfer_tab: &'a std::sync::RwLock<Vec<N::Pair>>,
-        edges_on: bool,
         record_out: bool,
         s: &crate::settings::Settings,
     ) -> Self {
@@ -359,9 +350,6 @@ impl<'a, N: Rem> UnitSink<'a, N> {
             out_blocks: Vec::new(),
             out_parts: Default::default(),
             x_rank: Default::default(),
-            edges_on,
-            pos_edges: Default::default(),
-            pos_recent: Vec::new(),
             emitted: 0,
             noted: Default::default(),
             registered: Default::default(),
@@ -371,13 +359,12 @@ impl<'a, N: Rem> UnitSink<'a, N> {
         }
     }
 
-    /// Bytes held (`[wavemem]`): bundles, hulls, pos pairs, transfers, rest.
-    pub(crate) fn alloc_bytes(&self) -> [usize; 5] {
+    /// Bytes held (`[wavemem]`): bundles, hulls, transfers, rest.
+    pub(crate) fn alloc_bytes(&self) -> [usize; 4] {
         use std::mem::size_of;
         [
             self.bundles.alloc_bytes(),
             size_of::<HullOf<N>>() * self.hulls.capacity() + 4 * self.src_first.capacity() + 20 * self.entry_next.capacity() + size_of::<AccOf<N>>() * self.push_slots.capacity() + 4 * self.push_offs.capacity(),
-            9 * self.pos_edges.capacity() + 8 * self.pos_recent.capacity(),
             (size_of::<N::Pair>() + 8) * self.xfer_ids.capacity()
                 + size_of::<crate::search::rem::Xfer<N>>() * self.xfer_pairs.capacity()
                 + 8 * self.xfer_counts.capacity()
@@ -557,35 +544,6 @@ impl<'a, N: Rem> UnitSink<'a, N> {
             }
         }
         dropped
-    }
-
-    /// The pos-graph edges of a slice's lanes `need` (unit lanes `lanes`),
-    /// emitted or dropped: a set, so once per cell column, not per body.
-    #[inline]
-    pub(crate) fn pos_edges(&mut self, cells: &[u32; 16], need: u16, lanes: &[usize]) {
-        if self.edges_on {
-            for i in lanes_of(need) {
-                self.pos_edge(lanes[i], cells[i]);
-            }
-        }
-    }
-
-    /// The pos-graph edge from unit lane `lane`'s cell into `cell`.
-    #[inline]
-    fn pos_edge(&mut self, lane: usize, cell: u32) {
-        let e = (self.lanes[lane].1, cell);
-        if self.pos_recent.is_empty() {
-            self.pos_recent = vec![(u32::MAX, u32::MAX); POS_RECENT];
-        }
-        let slot = ((e.0 as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15) ^ (e.1 as u64).wrapping_mul(0xc2b2_ae3d_27d4_eb4f)) >> (64 - POS_RECENT.trailing_zeros());
-        if self.pos_recent[slot as usize] != e {
-            self.pos_recent[slot as usize] = e;
-            self.pos_edges.insert(e);
-        }
-    }
-
-    pub(crate) fn pos_pairs(&self) -> impl Iterator<Item = (u32, u32)> + '_ {
-        self.pos_edges.iter().copied()
     }
 
     /// `xfer_id` through a direct-mapped raw -> id cache: few distinct
@@ -856,14 +814,11 @@ impl<'a, N: Rem> UnitSink<'a, N> {
     }
 
     /// The reference engine's emission: one row from unit lane `lane`
-    /// (stored widened: `row_key`) by transfer `pair`, and its pos-graph edge.
+    /// (stored widened: `row_key`) by transfer `pair`.
     /// Its skeleton is `decode::reference_skeleton`: a reference row's
     /// columns follow its values, not a kernel's template.
     pub(crate) fn emit_row(&mut self, row: &Rt2<N>, lane: usize, cell: u32, pair: N::Pair) -> Result<()> {
         debug_assert_eq!(row.width, 1);
-        if self.edges_on {
-            self.pos_edge(lane, cell);
-        }
         if self.minus_one_drop(row.shape_hash, cell) {
             return Ok(());
         }

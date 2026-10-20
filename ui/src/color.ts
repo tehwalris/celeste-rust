@@ -157,6 +157,6 @@ export const movingColor: RGB = oklch(0.75, 0.22, 345);
 /** Phase colors for the waterfall: forward and backward are the first two
  *  categorical slots; their splits are ordinal steps of the same hue. */
 export const phaseColor = { fwd: slots[0], bwd: slots[1] };
-export const fwdSplit = { emit: "#3987e5", own: "#6da7ec", ckpt: "#1c5cab", pos: "#9ec5f4" };
+export const fwdSplit = { emit: "#3987e5", own: "#6da7ec", ckpt: "#1c5cab" };
 export const bwdSplit = { load: "#ef8a5f", par: "#d95926" };
 export const prebuildColor = "#898781";

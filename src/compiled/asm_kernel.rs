@@ -2,7 +2,7 @@
 //! assemble each (shape, region)'s fused fork-free graph, and dispatch
 //! chunks to it. The APPEND step emits each `live & !error` lane at the
 //! boundary: canonical structure, its row key exactly as
-//! `Rt2::boundary_finish` (`--key-check`), its pos-graph edge and transfer.
+//! `Rt2::boundary_finish` (`--key-check`), its cell and transfer.
 
 use std::collections::HashMap;
 use std::os::raw::c_void;
