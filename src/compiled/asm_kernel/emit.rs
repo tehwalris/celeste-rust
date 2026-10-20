@@ -34,8 +34,20 @@ use crate::storage::unit::lanes_of;
 pub(super) struct KeyField {
     pub cell: u32,
     root: usize,
-    ty: Ty,
-    pos: bool,
+    read: Read,
+}
+
+/// How a key field's slot reads as its code: its type and, for a number,
+/// whether it is a position coordinate, as ONE discriminant. The reads
+/// match it per field per slice; matching `(Ty, bool)` there cost 0.15% of
+/// a bench frame's instructions.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+enum Read {
+    Num,
+    Ival,
+    Bool,
+    PosNum,
+    PosIval,
 }
 
 /// 16 lanes of 128-bit keys (or a field's placed bits in them) as two
@@ -95,8 +107,15 @@ impl KeyField {
     /// `pos`: the cell is a position coordinate (`Rt2::position_cells`),
     /// which keys without its whole pixels.
     pub(super) fn new(cell: u32, root: usize, ty: Ty, pos: bool) -> Result<KeyField> {
-        anyhow::ensure!(!(pos && ty.is_bool()), "position cell {cell} is a boolean output: its row would have no cell");
-        Ok(KeyField { cell, root, ty: if ty.is_bool() { Ty::Bool } else { ty }, pos })
+        let read = match (ty, pos) {
+            (Ty::Num, false) => Read::Num,
+            (Ty::Ival, false) => Read::Ival,
+            (Ty::Bool | Ty::UBool, false) => Read::Bool,
+            (Ty::Num, true) => Read::PosNum,
+            (Ty::Ival, true) => Read::PosIval,
+            (Ty::Bool | Ty::UBool, true) => anyhow::bail!("position cell {cell} is a boolean output: its row would have no cell"),
+        };
+        Ok(KeyField { cell, root, read })
     }
 
     /// The `(lo, hi)` code words of every lane of a number field (a
@@ -104,22 +123,22 @@ impl KeyField {
     #[inline]
     fn num_words<N: KernelLanes>(&self, buf: &[u8], half: usize) -> ([N::Raw; 16], [N::Raw; 16]) {
         let base = self.root;
-        match (self.ty, self.pos) {
-            (Ty::Num, false) => {
+        match self.read {
+            Read::Num => {
                 let w = N::col(buf, half, base);
                 (w, w)
             }
-            (Ty::Ival, false) => (N::col(buf, half, base), N::col(buf, half, base + 64)),
-            (Ty::Num, true) => {
+            Read::Ival => (N::col(buf, half, base), N::col(buf, half, base + 64)),
+            Read::PosNum => {
                 let w = N::col(buf, half, base).map(|x| N::pos_words(x, x).0);
                 (w, w)
             }
-            (Ty::Ival, true) => {
+            Read::PosIval => {
                 let (lo, hi) = (N::col(buf, half, base), N::col(buf, half, base + 64));
                 let p: [(N::Raw, N::Raw); 16] = std::array::from_fn(|i| N::pos_words(lo[i], hi[i]));
                 (p.map(|w| w.0), p.map(|w| w.1))
             }
-            (Ty::Bool | Ty::UBool, _) => unreachable!("a boolean field has no number words"),
+            Read::Bool => unreachable!("a boolean field has no number words"),
         }
     }
 
@@ -129,7 +148,7 @@ impl KeyField {
     /// code, a big one probed once per distinct value among the lanes.
     #[inline]
     fn eval<N: KernelLanes>(&self, buf: &[u8], half: usize, d: &FieldDict<N>, need: u16, placed: &mut Placed) -> u16 {
-        if self.ty == Ty::Bool {
+        if self.read == Read::Bool {
             let (v, k) = N::masks(buf, half, self.root);
             let mut miss = 0u16;
             for (tri, lanes) in [(0, need & k & !v), (1, need & k & v), (2, need & !k)] {
@@ -177,15 +196,15 @@ impl KeyField {
             let (a, b) = N::pos_words(lo, hi);
             Code::num(a, b)
         };
-        match (self.ty, self.pos) {
-            (Ty::Num, false) => Code::num(w(base), w(base)),
-            (Ty::Ival, false) => Code::num(w(base), w(base + 64)),
-            (Ty::Bool | Ty::UBool, _) => {
+        match self.read {
+            Read::Num => Code::num(w(base), w(base)),
+            Read::Ival => Code::num(w(base), w(base + 64)),
+            Read::Bool => {
                 let (v, k) = N::masks(buf, half, base);
                 Code::boolean((k >> i & 1 == 1).then_some(v >> i & 1 == 1))
             }
-            (Ty::Num, true) => pos(w(base), w(base)),
-            (Ty::Ival, true) => pos(w(base), w(base + 64)),
+            Read::PosNum => pos(w(base), w(base)),
+            Read::PosIval => pos(w(base), w(base + 64)),
         }
     }
 }
