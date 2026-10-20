@@ -307,7 +307,7 @@ struct Table<'a, A: GraphArith> {
     lw: &'a LatticeWalk<A>,
     room: Room,
     room0: (i16, i16),
-    /// `--hundred`: a successor that leaves the berry behind is no exit.
+    /// 100% (`Category::hundred`): a successor that leaves the berry behind is no exit.
     hundred: bool,
     spd_px: i16,
     shapes: Vec<Shape<A>>,
@@ -1634,7 +1634,7 @@ fn build<A: GraphArith>(spd_px: i32, threads: usize, rep: &mut String, s: &crate
         lw: &lw,
         room: Room { cache: lw.cache.clone() },
         room0,
-        hundred: s.hundred,
+        hundred: s.category.hundred(),
         spd_px,
         shapes: Vec::new(),
         by_key: HashMap::new(),

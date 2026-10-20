@@ -245,7 +245,7 @@ common:
 # In the float tools' doubles (Celia's start and seeds by default).
 ./safe-run.sh -- ./target/release/rewrite search --arith float --room 7,0 ...
 # THE DUAL SEARCH: the shortest file valid in both arithmetics (plans/float.md).
-./safe-run.sh --memory 40G -- ./target/release/rewrite dual --room 0,3 --gemskip --hundred \
+./safe-run.sh --memory 40G -- ./target/release/rewrite dual --room 0,3 --category gemskip100 \
     --loading-jank 1 --level r0sxhn,r0sxh --level-minus-one 150,5 --to 150 --checkpoint-dir DIR
 # A known solution against every pruning step of a finished search (its
 # settings, levels and horizon from its records).

@@ -319,7 +319,9 @@ mod tests {
         let s = crate::settings::Settings {
             arith: crate::settings::Arith::Float(tool),
             room: (x.parse()?, y.parse()?),
-            gemskip: field("gemskip")? == "1",
+            // The run's dash count is all its replay depends on (the
+            // manifest's categories include our own `random0`, ...).
+            category: if field("gemskip")? == "1" { crate::settings::Category::GemskipAny } else { crate::settings::Category::Any },
             // The tool's run: always seeded (every seed 0 without a list).
             balloon_seeds: Some(if seeds == "-" { String::new() } else { seeds.to_string() }),
             loading_jank,
@@ -351,18 +353,12 @@ mod tests {
     /// none before the last input.
     fn exits_in_fixed_point(path: &std::path::Path, cat: &str, level: i16) -> Result<()> {
         use crate::engines::reference::RefEngine;
-        let (gemskip, rest) = cat.strip_prefix("gemskip").map_or((false, cat), |r| (true, r));
-        let (hundred, nodiag) = match rest {
-            "any" => (false, false),
-            "100" => (true, false),
-            "nodiag" => (false, true),
-            other => bail!("{}: category {other:?}", path.display()),
-        };
+        let category = cat.parse().map_err(|e| anyhow!("{}: {e}", path.display()))?;
         let text = std::fs::read_to_string(path).with_context(|| path.display().to_string())?;
         let (seeds, body) = text.trim().strip_prefix('[').and_then(|t| t.split_once(']')).ok_or_else(|| anyhow!("{}: not [seeds]inputs", path.display()))?;
         let inputs: Vec<u8> = body.split(',').map(|v| v.trim().parse()).collect::<Result<_, _>>()?;
         let room = ((level - 1) % 8, (level - 1) / 8);
-        let s = crate::settings::Settings { room, gemskip, hundred, nodiag, balloon_seeds: Some(seeds.to_string()), ..Default::default() };
+        let s = crate::settings::Settings { room, category, balloon_seeds: Some(seeds.to_string()), ..Default::default() };
         let mut eng = RefEngine::new(&s)?;
         let mut sts = vec![eng.start_state().clone()];
         let at = |st: &State<RefDomain>| (iface::get(st, &[iface::key("room"), iface::key("x")]), iface::get(st, &[iface::key("room"), iface::key("y")]));

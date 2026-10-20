@@ -63,7 +63,7 @@ const EXAMPLES: &str = "Examples:
   # A room with objects, level -1 filtered at the horizon, a category, the real-play entry
   # (plans/results.md \"How to run a room\"); --prefer FILE checks a known route too:
   ./safe-run.sh -- target/release/rewrite search --room X,Y --level r0sxhn --ceiling C \\
-      --level-minus-one C,5 [--hundred | --nodiag | --gemskip] [--loading-jank J] --checkpoint-dir DIR
+      --level-minus-one C,5 [--category CAT] [--loading-jank J] --checkpoint-dir DIR
   # The objects ladder where r0sxhn's bound is loose (room (7,0): 80 against 84):
   ./safe-run.sh -- target/release/rewrite search --room 7,0 --level r0sxhn,r0sxh \\
       --level-minus-one 84,5 --ceiling 84 --checkpoint-dir DIR
@@ -171,9 +171,12 @@ enum Command {
     ExportUi(ExportUiArgs),
     /// The room (`--room`) as the tools need it, as JSON on stdout.
     ///
-    /// Its level and its objects in creation order (the original cart's:
+    /// Its level, its objects in creation order (the original cart's:
     /// tile, tile position, type, whether the minimal cart has it, whether a
-    /// TAS file's `[seeds]` list runs over it).
+    /// TAS file's `[seeds]` list runs over it), and what `--category`
+    /// means: whether a win needs the berry (`hundred`), which dash starts
+    /// are forbidden (`nodiag`, `onlydiag`), one dash past the orb
+    /// (`gemskip`).
     Room,
     /// The start states real play can enter the room with, as JSON on stdout.
     ///
@@ -524,7 +527,9 @@ fn main() -> Result<()> {
         Command::Room => {
             let objects = celeste_rust::trace::cart::room_objects(cfg.room);
             let level = celeste_rust::game_runner::level_index(cfg.room.0, cfg.room.1) + 1;
-            println!("{}", serde_json::json!({ "room": cfg.room, "level": level, "objects": objects }));
+            let c = cfg.category;
+            let category = serde_json::json!({ "name": c.to_string(), "hundred": c.hundred(), "nodiag": c.nodiag(), "onlydiag": c.onlydiag(), "gemskip": c.gemskip() });
+            println!("{}", serde_json::json!({ "room": cfg.room, "level": level, "objects": objects, "category": category }));
             Ok(())
         }
         Command::Starts => {

@@ -61,8 +61,8 @@ fruit only weakens d).
   extended only under its own filter, and a larger horizon builds the tree
   again (a dropped push leaves hulls smaller and states later, so the
   frames depend on H throughout).
-- `--hundred`: an exit that certainly leaves the berry behind has no
-  successor in the table.
+- 100% (`--category 100`, `gemskip100`): an exit that certainly leaves
+  the berry behind has no successor in the table.
 
 The table is horizon-independent: one per room and settings.
 

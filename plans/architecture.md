@@ -399,10 +399,12 @@ both shrink with H.
 
 **Win conditions**: the room exit (including the wrap from a row's last
 room); the summit's flag rect; the orb room's exit WITH the orb (or bare
-under `--gemskip`); `--hundred`: the exit with the berry; `--win-at`, a
-synthetic win for experiments. Rooms past (5,2) start with two dashes
-(one under `--gemskip`). `--nodiag`/`--onlydiag` make the forbidden dash
-arm raise, so it is no move, exactly.
+in the gemskip categories); in 100% and gemskip 100%, the exit with the
+berry; `--win-at`, a synthetic win for experiments. Rooms past (5,2) start
+with two dashes (one in the gemskip categories). The category is
+`--category` in the tasdatabase's names (`settings::Category`): nodiag,
+gemskipnodiag and onlydiag make the forbidden dash arm raise, so it is no
+move, exactly.
 
 **The split frame** (`--split-frame`, rooms (6,0), (6,1)): `_update` as two
 steps around the player's move; kernels shrink ~10-20x with identical
@@ -492,7 +494,7 @@ plans/refactor.md: `git show c4dd3241:plans/refactor.md`).
     `forward`) and `--tree` (the commands that read one).
   - The tracer beyond its audit: one trace for every level (today each
     level re-traces), the split pass replaced. These change behaviour.
-  - `--onlydiag` has no run yet (kept by Philippe); `--override-settings`
+  - `--category onlydiag` has no run yet (kept by Philippe); `--override-settings`
     passes `--region` only.
 - Dropped, with the reason:
   - Folding `widen::within` into `GraphArith::pieces_of` (the audit's

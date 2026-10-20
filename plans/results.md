@@ -83,8 +83,8 @@ frame of slack in (7,0), where the objects ladder takes over.
 
 ## No Diagonal Dashes (2026-10-04 .. 10-08; every improvement submitted)
 
-`--nodiag`: the cart's diagonal dash arm raises, so a diagonal dash start
-is no move, exactly, in the kernels and the reference alike. References:
+`--category nodiag`: the cart's diagonal dash arm raises, so a diagonal
+dash start is no move, exactly, in the kernels and the reference alike. References:
 the community nodiag TAS at the room's any% offset. Levels `r0sxhn,r0sxh`
 with level -1 at the reference unless said; "bounds" are the arc bounds per
 level; witnesses `tas/room_X_Y_nodiag_frame_N.txt`, uploads
@@ -123,8 +123,8 @@ chain (re-searched from the real-play starts J 3 and J 4: 113 both).
 
 ## 100% (2026-10-08 .. 10-09)
 
-`--hundred`: the exit counts only with the room's berry taken (an unknown
-`got_fruit` at a coarse level counts as taken; the concrete search
+`--category 100`: the exit counts only with the room's berry taken (an
+unknown `got_fruit` at a coarse level counts as taken; the concrete search
 decides). Two exact cuts made rooms fit: a row whose berry is lost is not
 expanded (`frame::berry_lost`), and level -1 drops exits that leave the
 berry behind. Runs `--ceiling REF`, level -1 at (REF, 5),
@@ -160,10 +160,10 @@ ahead). Withdrawn (`tas/invalid`); 67f is the real-play optimum.
 
 ## Gemskip (2026-10-08 .. 10-16)
 
-`--gemskip`: the orb room (5,2) is won by its bare exit and every later
-room starts with ONE dash (the replay's `--one-dash`, UCT's `UCT_DASHES=1`).
-gemskip nodiag adds `--nodiag`, gemskip 100% `--hundred`. Levels
-`r0sxhn,r0sxh` unless said; "OPTIMAL" = the last level's arc bound equals
+`--category gemskipany`: the orb room (5,2) is won by its bare exit and
+every later room starts with ONE dash (the replay's `--one-dash`, UCT's
+`UCT_DASHES=1`). `gemskipnodiag` adds nodiag's rule, `gemskip100` 100%'s.
+Levels `r0sxhn,r0sxh` unless said; "OPTIMAL" = the last level's arc bound equals
 the witness's frame. Witnesses `tas/room_X_Y_gemskip*_frame_N.txt`,
 uploads `tas/tasdatabase/gemskip*/upload/`.
 
@@ -244,7 +244,7 @@ room alone and misses it; Celia models it.
 ```bash
 ./safe-run.sh -- ./target/release/rewrite search --room X,Y --level r0sxhn,r0sxh \
     --level-minus-one C,5 --ceiling C --checkpoint-dir DIR --prefer tas/FILE.txt \
-    [--hundred | --nodiag | --gemskip] [--loading-jank J] [--concrete-balloon-seeds S]
+    [--category CAT] [--loading-jank J] [--concrete-balloon-seeds S]
 ```
 
 - The level: `r0sx` without objects; `r0sxhn` with springs, fall floors,

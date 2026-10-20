@@ -31,7 +31,7 @@ PINS=gates/fixtures
 # Every build's memory cap (safe-run.sh), as check.sh's.
 MEM=20G
 
-L1_62="--hundred --loading-jank 2 --level-minus-one 94,5"
+L1_62="--category 100 --loading-jank 2 --level-minus-one 94,5"
 # NAME -> FLAGS (the settings) | ROOM | COMMAND | TREE (the level dir under
 # the fixture) | LAST (the tree's last frame).
 spec() {

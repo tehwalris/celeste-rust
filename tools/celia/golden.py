@@ -52,7 +52,9 @@ def celia(level, path, cat, trace):
 
 def jank(room, cat):
     """The J of Celia's IL load into `room` (None: the first room)."""
-    args = [REWRITE, "starts", "--room", f"{room[0]},{room[1]}"] + (["--gemskip"] if categories.one_dash(cat) else [])
+    # The start depends on the dash count alone (the manifest's categories
+    # include our own: random0, witness-...).
+    args = [REWRITE, "starts", "--room", f"{room[0]},{room[1]}", "--category", "gemskipany" if categories.one_dash(cat) else "any"]
     out = subprocess.run([f"{ROOT}/safe-run.sh", "--memory", "4G", "--"] + args, capture_output=True, text=True, check=True, cwd=ROOT)
     return json.loads(out.stdout.strip().splitlines()[-1])["celia"]
 

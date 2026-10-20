@@ -850,7 +850,7 @@ mod tests {
     #[test]
     #[ignore = "slow, ./check.sh t2 runs it: the reference along room (6,2)'s route, ~30 CPU-s"]
     fn pinning_the_fly_fruits_motion_keeps_the_projected_successors() {
-        let settings = crate::settings::Settings { room: (6, 2), hundred: true, loading_jank: Some(2), ..Default::default() };
+        let settings = crate::settings::Settings { room: (6, 2), category: crate::settings::Category::Hundred, loading_jank: Some(2), ..Default::default() };
         let (with, pinned, full) = pins_keep_the_projected_successors(settings, "tas/room_6_2_hundred_frame_93.txt", 5, true, "r0sxhf", "fly_fruit");
         assert!(with >= 8, "only {with} sampled states have the fly fruit");
         assert!(4 * pinned < full, "pinning saved little: {pinned} leaves against {full}");

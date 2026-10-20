@@ -38,7 +38,7 @@ pub fn apply_start_room(game_lua: &str, s: &crate::settings::Settings) -> Result
     let (x, y) = s.room;
     // The orb sets `max_djump=2` for the rest of the game; a later room
     // must start as a play-through reaches it, with the orb taken.
-    let orb = if level_index(x, y) > ORB_LEVEL && !s.gemskip { "max_djump=2 " } else { "" };
+    let orb = if level_index(x, y) > ORB_LEVEL && !s.category.gemskip() { "max_djump=2 " } else { "" };
     Ok(game_lua.replacen(PAT, &format!("{}load_room({}, {})", orb, x, y), 1))
 }
 

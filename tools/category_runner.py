@@ -25,7 +25,7 @@ Per job:
  1. the reference: the community TAS replayed in the ORIGINAL cart behind the
     room's prologue (the earliest offset around `offset` that exits);
  2. `rewrite search --ceiling REF --prefer <the community TAS>` with the
-    category's mode (--nodiag / --onlydiag / --gemskip / --hundred) and
+    category (`--category`, the database's name) and
     the level -1 filter if `l1` (retried without it if its table refuses);
     `--to H` instead with a job's "to"; its outcome is its `result.json`;
  3. our witness replayed in the original cart (must exit at the optimum; no
@@ -150,7 +150,7 @@ def run(job, outdir, binary):
     open(prefer, "w").write(",".join(map(str, [0] * prologue + dbin)))
     # 2. the search
     def search(l1):
-        flags = categories.search_flags(cat) + job_flags(job)
+        flags = ["--category", cat] + job_flags(job)
         flags += ["--loading-jank", str(jank) if jank else "none"]
         # The concrete steps under the community file's balloon seeds ([]: 0):
         # the witness is then one real run under them.
@@ -223,7 +223,8 @@ def run(job, outdir, binary):
         return {**res, "status": "search only: another start class of the room (the widened optimum is the least)"}
     open(os.path.join(jd, "witness.txt"), "w").write(",".join(map(str, ours)))
     # 3. verification in the original cart
-    hundred = categories.hundred(cat)
+    rules = rooms.rules(cat, binary)
+    hundred = rules["hundred"]
     # The search steps a chest's last shake as every draw (`rnd` is an
     # interval; only the balloons are seeded), so its witness may take the
     # berry where the file's chest seed does not put it: then the other
@@ -253,9 +254,9 @@ def run(job, outdir, binary):
         res["berry"] = berry
     # The dashes as the cart started them (its own dash branch, `dash DIR`).
     started = [fr for fr in fs if fr.dash and (e is None or fr.f <= e)]
-    if categories.nodiag(cat):
+    if rules["nodiag"]:
         res["diagonal_dashes"] = [fr.f for fr in started if fr.dash in pico8.DIAGONAL]
-    if categories.onlydiag(cat):
+    if rules["onlydiag"]:
         res["straight_dashes"] = [fr.f for fr in started if fr.dash not in pico8.DIAGONAL]
     lead = next((i for i, b in enumerate(ours) if b), len(ours))
     res["first_input"] = lead
@@ -379,7 +380,7 @@ def expand(job, cache, binary):
         if j is None:
             cache[key] = [{**job, "jank": "none"}]
         else:
-            st = rooms.starts(room, categories.search_flags(job["cat"]) + ["--balloon-seeds", "0"], binary)
+            st = rooms.starts(room, ["--category", job["cat"], "--balloon-seeds", "0"], binary)
             classes = st["classes"]
             others = [{**job, "jank": c[0], "tag": job.get("tag", "") + f"-J{c[0]}", "search_only": True} for c in classes if j not in c]
             cache[key] = [{**job, "jank": j, "jank_classes": classes, "celia_jank": st["celia"]}] + others

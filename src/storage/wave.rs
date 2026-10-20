@@ -1602,8 +1602,8 @@ mod tests {
     fn frame_zero_is_the_start_where_its_view_is_not() {
         let ids = crate::compiled::ids();
         let cases = [
-            Settings { room: (2, 0), hundred: true, ..Default::default() },
-            Settings { room: (0, 3), hundred: true, gemskip: true, loading_jank: Some(1), ..Default::default() },
+            Settings { room: (2, 0), category: crate::settings::Category::Hundred, ..Default::default() },
+            Settings { room: (0, 3), category: crate::settings::Category::Gemskip100, loading_jank: Some(1), ..Default::default() },
             Settings { room: (7, 0), loading_jank: Some(1), ..Default::default() },
         ];
         for s in cases {

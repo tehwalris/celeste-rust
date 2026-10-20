@@ -1,4 +1,6 @@
-"""Levels and rooms; a room's objects and starts as Rust knows them."""
+"""Levels and rooms; a room's objects and starts, and a category's rules, as
+Rust knows them."""
+import functools
 import json
 import subprocess
 
@@ -36,6 +38,14 @@ def objects(room, binary=REWRITE):
     """`rewrite room`: the room's objects in creation order (the original
     cart's), each {tile, tx, ty, kind, minimal, seeded}."""
     return _ask(["room", "--room", text(room)], binary)["objects"]
+
+
+@functools.lru_cache(maxsize=None)
+def rules(cat, binary=REWRITE):
+    """What the category means to the search (`rewrite room --category`):
+    {name, hundred (a win needs the berry), nodiag, onlydiag (the dash
+    starts forbidden), gemskip (one dash past the orb)}."""
+    return _ask(["room", "--category", cat], binary)["category"]
 
 
 def seed_slots(room, binary=REWRITE):

@@ -147,7 +147,7 @@ def check_start(cat, level, binary):
     j = entry_jank(cat, level)
     _, _, ref = parse(chain(cat, level, [], [0], 1))
     rx, ry = room_of(level)
-    flags = ["--room", f"{rx},{ry}", "--loading-jank", str(j) if j else "none", "--balloon-seeds", "0"] + (["--gemskip"] if categories.one_dash(cat) else [])
+    flags = ["--room", f"{rx},{ry}", "--loading-jank", str(j) if j else "none", "--balloon-seeds", "0", "--category", cat]
     root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     ours = subprocess.run([os.path.join(root, "safe-run.sh"), "--", binary, "run", "-i", "0", "--dump-start"] + flags, capture_output=True, text=True, cwd=root, check=True).stdout.splitlines()
     skip = ("room_title", "message", "flag")
@@ -212,7 +212,7 @@ def main():
             print("    (not compared, one cart only: " + ", ".join(only) + ")")
         sys.exit(1 if diffs else 0)
     if a.feasible:
-        st = rooms.starts(room_of(a.level), categories.search_flags(a.cat) + ["--balloon-seeds", "0"], a.feasible)
+        st = rooms.starts(room_of(a.level), ["--category", a.cat, "--balloon-seeds", "0"], a.feasible)
         print(f"level {a.level}: feasible J {st['feasible']}, start classes {st['classes']}, Celia's J {st['celia']}")
         return
     if a.entry_jank:

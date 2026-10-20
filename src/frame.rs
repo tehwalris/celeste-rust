@@ -180,7 +180,7 @@ fn room_is<N: EngineNum>(rt2: &Rt2<N>, (wx, wy): (i16, i16)) -> Result<Vec<bool>
 /// and in a 100% run the room's berry taken.
 pub fn wins_of<N: EngineNum>(rt2: &Rt2<N>, s: &crate::settings::Settings) -> Result<Vec<bool>> {
     let mut wins = reaches_win(rt2, s)?;
-    if s.hundred {
+    if s.category.hundred() {
         for (e, b) in wins.iter_mut().zip(got_fruit(rt2, s.room)?) {
             *e &= b;
         }
@@ -253,7 +253,7 @@ pub fn berry_lost<N: EngineNum>(rt2: &Rt2<N>, s: &crate::settings::Settings) -> 
     let lanes = rt2.width;
     let ids = crate::compiled::ids();
     let sources = [ids.g_fruit, ids.g_fly_fruit, ids.g_key, ids.g_chest, ids.g_fake_wall];
-    if !s.hundred || sources.iter().any(|&g| !rt2.objects_of_type(ids, g).is_empty()) {
+    if !s.category.hundred() || sources.iter().any(|&g| !rt2.objects_of_type(ids, g).is_empty()) {
         return Ok(vec![false; lanes]);
     }
     Ok(got_fruit(rt2, s.room)?.into_iter().map(|taken| !taken).collect())
@@ -291,7 +291,7 @@ pub fn not_expanded<N: EngineNum>(b: &Rt2<N>, frame: u32, ceiling: Option<u32>, 
 /// (`max_djump == 2`): later levels are played with the second dash.
 pub fn orb_required(s: &crate::settings::Settings) -> bool {
     let (x, y) = s.room;
-    crate::game_runner::level_index(x, y) == crate::game_runner::ORB_LEVEL && !s.gemskip
+    crate::game_runner::level_index(x, y) == crate::game_runner::ORB_LEVEL && !s.category.gemskip()
 }
 
 /// THE LEVEL -1 FILTER (`--level-minus-one H,S`, `h` in steps): a row is
@@ -1651,7 +1651,7 @@ mod tests {
     /// berry: every row's berry is lost from frame 0 on.
     #[test]
     fn a_resume_expands_what_the_uninterrupted_forward_expands() {
-        let s = Settings { hundred: true, ..Default::default() };
+        let s = Settings { category: crate::settings::Category::Hundred, ..Default::default() };
         let dir = std::env::temp_dir().join(format!("celeste-resume-frontier-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let init = start_blocks(&s);
