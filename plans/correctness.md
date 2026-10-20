@@ -16,6 +16,12 @@ settled here. Evidence is file:line at develop 19869c5d.
   cuts, each with its projection, its tree-record line and its horizon);
   `check known` iterates it, so it is complete by construction.
 
+- Unblocks native level -1 (assessment, 2026-10-20): feasible but a design
+  decision: per-shape inductive ranges carried by the kernels, a loud
+  widen-and-retrace path for declined lanes, and a position-only level whose
+  backward computes distances; about -1,000 lines net; every level -1 result
+  re-verified. The known-route check must cover it first (this item).
+
 ## C2. The orb deadline: a hand-derived bound nothing checks
 - `ORB_MIN_FRAMES_AFTER_CHEST = 70` (frame.rs:284-286): "61 paused + 8 until
   the orb is collectable + 10 frozen = 79, taken as 70". No test derives or
