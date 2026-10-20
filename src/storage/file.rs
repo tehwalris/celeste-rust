@@ -20,8 +20,8 @@ pub(crate) const FORMAT_VERSION: u32 = 22;
 const VALUE: &[u8; 4] = b"C8TB";
 
 /// A tree file's magic in arithmetic `N`: 16.16's as it is, the doubles'
-/// last byte `EngineNum::FILE_TAG`.
-pub(crate) fn magic<N: celeste_core::arith::EngineNum>(m: &[u8; 4]) -> [u8; 4] {
+/// last byte `Arithmetic::FILE_TAG`.
+pub(crate) fn magic<N: celeste_core::arith::Arithmetic>(m: &[u8; 4]) -> [u8; 4] {
     match N::FILE_TAG {
         0 => *m,
         t => [m[0], m[1], m[2], t],

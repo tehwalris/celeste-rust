@@ -29,7 +29,7 @@ use std::path::{Path as FsPath, PathBuf};
 
 use anyhow::{anyhow, bail, ensure, Result};
 
-use celeste_core::arith::{Arithmetic, EngineNum, Fixed, Float};
+use celeste_core::arith::{Arithmetic, Fixed, Float};
 
 use crate::trace::domain::{Domain, Symbolic};
 use crate::trace::heap::Value;
@@ -53,19 +53,19 @@ macro_rules! say {
 
 /// An inclusive range in the TOTAL order (a double's `-0` below `0`), so a
 /// range holds its lanes' bits, not only their values.
-type Range<A> = (<A as Arithmetic>::Num, <A as Arithmetic>::Num);
+type Range<A> = (A, A);
 
 /// The range every object's `rem` is seeded with and must stay in.
 fn rem_range<A: GraphArith>() -> Range<A> {
-    celeste_engine::widening::range::<A::Num>(celeste_engine::widening::REM.0, celeste_engine::widening::REM.1)
+    celeste_engine::widening::range::<A>(celeste_engine::widening::REM.0, celeste_engine::widening::REM.1)
 }
 
 /// `a < b` in the total order (exact: every value is an exact double).
-fn below<N: EngineNum>(a: N, b: N) -> bool {
+fn below<N: Arithmetic>(a: N, b: N) -> bool {
     a.to_f64().total_cmp(&b.to_f64()).is_lt()
 }
 
-fn least<N: EngineNum>(a: N, b: N) -> N {
+fn least<N: Arithmetic>(a: N, b: N) -> N {
     if below(b, a) {
         b
     } else {
@@ -73,7 +73,7 @@ fn least<N: EngineNum>(a: N, b: N) -> N {
     }
 }
 
-fn most<N: EngineNum>(a: N, b: N) -> N {
+fn most<N: Arithmetic>(a: N, b: N) -> N {
     if below(a, b) {
         b
     } else {
@@ -112,9 +112,9 @@ pub struct Opts {
 /// What flowed into one input slot of a shape, joined over the edges.
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum Obs<A: GraphArith> {
-    Num(A::Num, A::Num),
+    Num(A, A),
     /// A LITERAL interval every lane holds (an `rnd` draw), not a hull.
-    Lit(A::Num, A::Num),
+    Lit(A, A),
     Bool { f: bool, t: bool, u: bool },
 }
 
@@ -146,7 +146,7 @@ impl<A: GraphArith> Obs<A> {
     }
 }
 
-fn px<N: EngineNum>(v: N) -> f64 {
+fn px<N: Arithmetic>(v: N) -> f64 {
     v.to_f64()
 }
 
@@ -204,8 +204,8 @@ enum Seed<A: GraphArith> {
     Pin(Conc<A>),
     /// The located object's `x` / `y`: the node's pixel, or its lattice pin
     /// (the bits every lane holds; a pixel's value box holds `-0` too).
-    X(Option<A::Num>),
-    Y(Option<A::Num>),
+    X(Option<A>),
+    Y(Option<A>),
     Range(Path),
     Unknown,
 }
@@ -2090,7 +2090,7 @@ fn recorded_cell_pairs<N: crate::search::rem::Rem>(dir: &FsPath, threads: usize)
 
 /// `probe`'s comparison with a level-0 tree: per frame, what the filter
 /// would drop, and the marked states it calls too late.
-fn compare_with_tree<N: EngineNum>(opts: &Opts, by_hash: &HashMap<u64, usize>, g1: &Graph1, sound: &[u32], rep: &mut String) -> Result<()> {
+fn compare_with_tree<N: Arithmetic>(opts: &Opts, by_hash: &HashMap<u64, usize>, g1: &Graph1, sound: &[u32], rep: &mut String) -> Result<()> {
     use crate::search::pos_graph::{cell_xy, NO_CELL};
     let xy_of = |c: u32| -> (i16, i16) { if c == NO_CELL { (NONE, NONE) } else { cell_xy(c).map(|(x, y)| (x as i16, y as i16)).expect("a grid cell") } };
     let marks = match &opts.marks {

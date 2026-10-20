@@ -12,10 +12,10 @@ use celeste_engine::runtime2::Rt2;
 use super::concrete::exact_state;
 use super::rem::Rem;
 use crate::frame::wins_of;
-use celeste_core::arith::EngineNum;
+use celeste_core::arith::Arithmetic;
 
 /// The states of a replay, per search step.
-pub(crate) struct Replay<N: EngineNum> {
+pub(crate) struct Replay<N: Arithmetic> {
     /// Per step up to the step before the exit, its states, each with its
     /// FIRST parent (the index of the state in the step before it was first
     /// made from; the start's is 0).

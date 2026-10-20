@@ -7,7 +7,7 @@ use std::fmt::Debug;
 use std::hash::Hash;
 
 use anyhow::Result;
-use celeste_core::arith::{Arithmetic, EngineNum};
+use celeste_core::arith::Arithmetic;
 use celeste_core::lua_f64::LuaF64;
 use celeste_core::pico8_num::Pico8Num as P8;
 
@@ -31,7 +31,7 @@ pub struct Capture<N> {
     pub(crate) fin: Option<(N, N)>,
 }
 
-pub trait Rem: EngineNum {
+pub trait Rem: Arithmetic {
     /// An edge's transfer pair as the tree's table records it.
     type Pair: Copy + Debug + PartialEq + Eq + Hash + PartialOrd + Ord + Send + Sync + 'static;
     /// The circle the remainders are points of (hulls, the arcs' sets).
@@ -44,7 +44,7 @@ pub trait Rem: EngineNum {
     fn transfer(x: &Capture<Self>, y: &Capture<Self>) -> Result<Self::Pair, String>;
     fn xfer(p: &Self::Pair) -> Xfer<Self>;
     /// A remainder as a point of the circle (`None`: not in `[-1/2, 1/2)`).
-    fn point(v: Self) -> Option<Point<Self>>;
+    fn rem_point(v: Self) -> Option<Point<Self>>;
     /// The remainder at point `p` (`point`'s inverse).
     fn at_point(p: Point<Self>) -> Self;
     /// Append `p`'s `PAIR_BYTES`.
@@ -63,7 +63,7 @@ pub(crate) type Point<N> = <<N as Rem>::C as Circle>::P;
 /// The start's remainder point: the room's load has no player yet, so any
 /// point stands for it - the point of 0.
 pub(crate) fn start_point<N: Rem>() -> (Point<N>, Point<N>) {
-    let p = N::point(<N::A as Arithmetic>::from_i16(0)).expect("0 is a remainder");
+    let p = N::rem_point(N::from_i16(0)).expect("0 is a remainder");
     (p, p)
 }
 
@@ -79,19 +79,19 @@ pub(crate) fn start_hull<N: Rem>() -> HullOf<N> {
 
 /// Does hull `h` hold the remainder `(x, y)`?
 pub(crate) fn holds<N: Rem>(h: &HullOf<N>, x: N, y: N) -> bool {
-    N::point(x).zip(N::point(y)).is_some_and(|(x, y)| h.contains(x, y))
+    N::rem_point(x).zip(N::rem_point(y)).is_some_and(|(x, y)| h.contains(x, y))
 }
 
 /// Does an edge of transfer `p` take the remainder `from` and end at `to`
 /// (`None`: no player at the frame's end; any action)?
 pub(crate) fn maps<N: Rem>(p: &N::Pair, from: (N, N), to: Option<(N, N)>) -> bool {
     let axis = |a: &Transfer<N::C>, f: N, t: Option<N>| {
-        let Some(f) = N::point(f) else { return false };
+        let Some(f) = N::rem_point(f) else { return false };
         if !a.takes(f) {
             return false;
         }
         let Some(t) = t else { return true };
-        N::point(t).is_some_and(|t| a.image(Seg { lo: f, hi: N::C::next(f) }) == Some(Seg { lo: t, hi: N::C::next(t) }))
+        N::rem_point(t).is_some_and(|t| a.image(Seg { lo: f, hi: N::C::next(f) }) == Some(Seg { lo: t, hi: N::C::next(t) }))
     };
     let (tx, ty) = N::xfer(p);
     axis(&tx, from.0, to.map(|t| t.0)) && axis(&ty, from.1, to.map(|t| t.1))
@@ -114,7 +114,7 @@ impl Rem for P8 {
     fn xfer(p: &Pair) -> (Transfer, Transfer) {
         (p.0.transfer(), p.1.transfer())
     }
-    fn point(v: P8) -> Option<u32> {
+    fn rem_point(v: P8) -> Option<u32> {
         let r = v.as_raw_u32() as i32;
         (-32768..32768).contains(&r).then(|| super::arcs::point(r))
     }
@@ -148,7 +148,7 @@ impl Rem for LuaF64 {
     fn xfer(p: &rem_f64::Pair) -> Xfer<LuaF64> {
         (p.0.transfer(), p.1.transfer())
     }
-    fn point(v: LuaF64) -> Option<u64> {
+    fn rem_point(v: LuaF64) -> Option<u64> {
         rem_f64::index(v.value())
     }
     fn at_point(p: u64) -> LuaF64 {

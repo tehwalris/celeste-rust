@@ -459,7 +459,7 @@ struct RegionBlocks {
 /// One storage region counted into `sums`, frame by frame: each block
 /// decoded, merged with the marked sets' rows at its cells, and unmapped.
 /// Does the region hold a win?
-fn count_region<N: celeste_core::arith::EngineNum>(tree: &Tree<N>, rb: &RegionBlocks, sets: &[MarkedSet], sums: &[std::sync::Mutex<FrameSums>]) -> Result<bool> {
+fn count_region<N: celeste_core::arith::Arithmetic>(tree: &Tree<N>, rb: &RegionBlocks, sets: &[MarkedSet], sums: &[std::sync::Mutex<FrameSums>]) -> Result<bool> {
     let geo = crate::storage::GEOMETRY;
     let (shape, slot) = (tree.shape_of(rb.region)?, rb.region % geo.slots);
     let locals = if slot == geo.no_cell_slot() { 1 } else { u64::MAX };

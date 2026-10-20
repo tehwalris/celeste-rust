@@ -236,15 +236,15 @@ pub(crate) fn rerun<N: celeste_rust::search::rem::Rem>(engine: &dyn FrameStep<N>
 /// `check ref` in arithmetic `A`, its kernels `K`.
 fn ref_check<K, A>(t: &TreeDir, a: &RefArgs) -> Result<()>
 where
-    K: FrameStep<A::Num> + KernelsNew,
+    K: FrameStep<A> + KernelsNew,
     A: celeste_rust::transpile::garith::GraphArith,
-    A::Num: Rem,
+    A: Rem,
 {
     let (cfg, level) = (&t.settings, t.level);
     let kernels = K::new(cfg, level)?;
     kernels.warm();
     // Every candidate state, then `samples` evenly spaced.
-    let (tree, frame, all) = a.rows.states::<A::Num>(t)?;
+    let (tree, frame, all) = a.rows.states::<A>(t)?;
     let geo = celeste_rust::storage::GEOMETRY;
     let picked: Vec<Sk> = match a.row {
         Some(r) => vec![*all.get(r).ok_or_else(|| anyhow::anyhow!("--row {r}: step {frame} has {} states", all.len()))?],
@@ -262,7 +262,7 @@ where
         let at = where_(sk.cell(&geo));
         let id = sk.show();
         let mut alike = 0;
-        let mut agree = |reference: &celeste_rust::engines::reference::ReferenceEngine<A>, b: &Rt2<A::Num>| -> Result<()> {
+        let mut agree = |reference: &celeste_rust::engines::reference::ReferenceEngine<A>, b: &Rt2<A>| -> Result<()> {
             reference.check_agreement(b).map_err(|e| e.context(format!("state {id} at {at}: the one converter")))?;
             alike += b.width;
             Ok(())

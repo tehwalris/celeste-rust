@@ -6,7 +6,7 @@
 
 use std::sync::Arc;
 
-use celeste_core::arith::EngineNum;
+use celeste_core::arith::Arithmetic;
 use celeste_core::collision_cache::CollisionCache;
 use celeste_core::pico8_num::Pico8Num;
 use serde::{Deserialize, Serialize};
@@ -222,7 +222,7 @@ pub fn collapse_uniform<N: Copy + PartialEq>(c: Col<N>) -> Col<N> {
     }
 }
 
-impl<N: EngineNum> Rt2<N> {
+impl<N: Arithmetic> Rt2<N> {
     pub fn empty(
         width: usize,
         globals_len: usize,
@@ -246,7 +246,7 @@ impl<N: EngineNum> Rt2<N> {
 }
 
 
-impl<N: EngineNum> Rt2<N> {
+impl<N: Arithmetic> Rt2<N> {
     /// The cell a table-valued global points at, if any.
     pub fn global_target(&self, g: u32) -> Option<u32> {
         let cell = self.globals[g as usize];
@@ -610,7 +610,7 @@ impl<N: EngineNum> Rt2<N> {
 
 }
 
-impl<N: EngineNum> Rt2<N> {
+impl<N: Arithmetic> Rt2<N> {
     /// The BOUNDARY: level-0 widenings, canonical renumbering (the GC) and
     /// the shape hash, lanes kept.
     pub fn boundary_canonicalize(&mut self) {

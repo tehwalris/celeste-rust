@@ -88,7 +88,7 @@ pub fn run<N: Rem>(o: &Opts) -> Result<()> {
     // it never stored).
     let space = &tree.space;
     // Every successor of `row` at remainder `rem` over all 64 inputs.
-    let successors = |eng: &mut ReferenceEngine<N::A>, row: &Rt2<N>, rem: (Point<N>, Point<N>)| -> Result<(Vec<Succ<N>>, u64)> {
+    let successors = |eng: &mut ReferenceEngine<N>, row: &Rt2<N>, rem: (Point<N>, Point<N>)| -> Result<(Vec<Succ<N>>, u64)> {
         // As the kernels read it: projected onto the level (the start row is
         // stored exact), then the probe's remainder.
         let mut rt2 = row.clone_block();
@@ -113,7 +113,7 @@ pub fn run<N: Rem>(o: &Opts) -> Result<()> {
                     Some((cx, cy)) => {
                         let at = |c: usize| -> Result<Point<N>> {
                             match blk.cols[c].at(0) {
-                                AV::Num(n) => N::point(n).ok_or_else(|| anyhow!("check arcs: a remainder {n:?} outside [-1/2, 1/2)")),
+                                AV::Num(n) => N::rem_point(n).ok_or_else(|| anyhow!("check arcs: a remainder {n:?} outside [-1/2, 1/2)")),
                                 other => anyhow::bail!("check arcs: a concrete remainder expected, got {other:?}"),
                             }
                         };
@@ -134,7 +134,7 @@ pub fn run<N: Rem>(o: &Opts) -> Result<()> {
             Some(other) => anyhow::bail!("--fault {other}: `action` or `guard`"),
         })
     };
-    let check = |eng: &mut ReferenceEngine<N::A>, frame: u32, r: &Rec<N>, recs: &[Rec<N>]| -> Result<Sampled> {
+    let check = |eng: &mut ReferenceEngine<N>, frame: u32, r: &Rec<N>, recs: &[Rec<N>]| -> Result<Sampled> {
         let mut o = Sampled::default();
         let src = r.src;
         let src_row = row_of(src)?;
@@ -235,7 +235,7 @@ pub fn run<N: Rem>(o: &Opts) -> Result<()> {
         let done: Vec<Sampled> = crate::par::Pool::new(workers).map_with(
             picked.len(),
             || {
-                let mut eng = ReferenceEngine::<N::A>::new(cfg)?;
+                let mut eng = ReferenceEngine::<N>::new(cfg)?;
                 if let Some(cap) = o.path_cap {
                     eng.set_path_cap(cap);
                 }

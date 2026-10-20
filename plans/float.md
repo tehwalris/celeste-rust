@@ -55,8 +55,8 @@ keyed through `concrete::lookup_view`, as fixed does under
 
 ## The parameter
 
-A compile-time choice: `celeste_core::arith::Arithmetic` (`Fixed`,
-`Float`), its numbers `EngineNum` (`Pico8Num`, `LuaF64`: a code is the raw
+A compile-time choice: `celeste_core::arith::Arithmetic`, on the number
+type itself (`Fixed` is `Pico8Num`, `Float` is `LuaF64`; a code is the raw
 bits, `u64` for a double), the graph's rules `transpile::garith::GraphArith`,
 the kernels' lanes `compiled::KernelLanes`, the remainder model
 `search::rem::Rem` (`P8`, `LuaF64`: the transfers), the circle its points

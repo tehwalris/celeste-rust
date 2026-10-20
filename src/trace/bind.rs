@@ -8,7 +8,7 @@
 
 use anyhow::{anyhow, bail, Result};
 
-use celeste_core::arith::EngineNum;
+use celeste_core::arith::Arithmetic;
 use celeste_engine::runtime2::{Cell2, Rt2};
 
 use crate::transpile::garith::GraphArith;
@@ -17,11 +17,11 @@ use celeste_engine::slots;
 use super::iface::{show, Path, Step};
 
 /// The canonical cell id a traced path names in this block.
-pub fn resolve<N: EngineNum>(rt2: &Rt2<N>, p: &[Step]) -> Result<u32> {
+pub fn resolve<N: Arithmetic>(rt2: &Rt2<N>, p: &[Step]) -> Result<u32> {
     slots::resolve_steps(rt2, p).map_err(|e| anyhow!("{}", e))
 }
 
-fn kind<N: EngineNum>(c: &Cell2<N>) -> &'static str {
+fn kind<N: Arithmetic>(c: &Cell2<N>) -> &'static str {
     match c {
         Cell2::Val => "value",
         Cell2::Obj(_) => "object",
@@ -141,7 +141,7 @@ pub fn renumber_cells<A: GraphArith>(
 /// Resolve a whole interface, naming the path that failed - and REFUSE if
 /// two paths land on one cell (two outputs in one column: a silently
 /// well-formed wrong block; `iface::scalars` yields one path per slot).
-pub fn resolve_all<N: EngineNum>(rt2: &Rt2<N>, paths: &[Path]) -> Result<Vec<u32>> {
+pub fn resolve_all<N: Arithmetic>(rt2: &Rt2<N>, paths: &[Path]) -> Result<Vec<u32>> {
     let cells: Vec<u32> = paths
         .iter()
         .map(|p| resolve(rt2, p).map_err(|e| anyhow!("{}: {:#}", show(p), e)))

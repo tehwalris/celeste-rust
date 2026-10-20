@@ -49,7 +49,7 @@ pub struct FrameOutcome<A: GraphArith = Fixed> {
     pub roots: Roots,
     /// Fields stored as the UNKNOWN NUMBER, with that value: off the key's
     /// per-lane fold (`OutField::widen_uniform`).
-    pub widen: Vec<(u32, celeste_engine::runtime2::AV<A::Num>)>,
+    pub widen: Vec<(u32, celeste_engine::runtime2::AV<A>)>,
     /// Does the outcome have a player at its end (its `fin` transfer roots
     /// are real: `frame::FrameOut::arc_fin`)?
     pub arc_fin: bool,
@@ -101,7 +101,7 @@ pub fn bind<A: GraphArith>(f: &crate::trace::frame::Frame<A>, g: &Graph<A>) -> R
     let mut outcomes = Vec::with_capacity(f.outs.len());
     for o in &f.outs {
         let mut roots = o.roots().map(|n| map[n as usize]);
-        let mut widen: Vec<(u32, AV<A::Num>)> = Vec::new();
+        let mut widen: Vec<(u32, AV<A>)> = Vec::new();
         for (i, r) in roots.fields.iter_mut().enumerate() {
             if matches!(graph.get(*r).op, crate::transpile::graph::Op::UnknownNum { .. }) {
                 *r = placeholder;

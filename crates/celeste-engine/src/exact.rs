@@ -18,7 +18,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
-use celeste_core::arith::EngineNum;
+use celeste_core::arith::Arithmetic;
 use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
 
@@ -60,22 +60,22 @@ fn of_key(k: Key) -> u128 {
 /// A value's exact code, ordered (kind, a, b). Numbers and intervals are
 /// kind 0 with their raw bounds (a point is `a == b`: `Num(n)` and
 /// `Ival(n, n)` are one code, as producers disagree on column types); the
-/// raws are the arithmetic's (`EngineNum::Raw`).
+/// raws are the arithmetic's (`Arithmetic::Raw`).
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Serialize, Deserialize)]
 #[serde(bound = "")]
-pub struct Code<N: EngineNum = P8> {
+pub struct Code<N: Arithmetic = P8> {
     pub kind: u8,
     pub a: N::Raw,
     pub b: N::Raw,
 }
 
-impl<N: EngineNum> PartialOrd for Code<N> {
+impl<N: Arithmetic> PartialOrd for Code<N> {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
         Some(self.cmp(other))
     }
 }
 
-impl<N: EngineNum> Ord for Code<N> {
+impl<N: Arithmetic> Ord for Code<N> {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
         (self.kind, self.a, self.b).cmp(&(other.kind, other.a, other.b))
     }
@@ -92,11 +92,11 @@ const K_NILPTR: u8 = 7;
 
 /// A non-number code's `u32` (a string, a pointer, a boolean).
 #[inline]
-fn small<N: EngineNum>(r: N::Raw) -> u32 {
+fn small<N: Arithmetic>(r: N::Raw) -> u32 {
     r.try_into().ok().expect("a non-number code's word is a u32")
 }
 
-impl<N: EngineNum> Code<N> {
+impl<N: Arithmetic> Code<N> {
     #[inline]
     pub const fn num(lo: N::Raw, hi: N::Raw) -> Code<N> {
         Code { kind: K_NUM, a: lo, b: hi }
@@ -187,7 +187,7 @@ fn bits_for(n: usize) -> u32 {
 
 /// One field's dictionary and its bits in the shape's key.
 #[derive(Clone, Debug)]
-pub struct FieldDict<N: EngineNum = P8> {
+pub struct FieldDict<N: Arithmetic = P8> {
     codes: Vec<Code<N>>,
     /// Numbers: an open-addressing table, each slot holding its index's
     /// PLACED bits (`place`, kept current as runs are added).
@@ -212,19 +212,19 @@ const SMALL: usize = 4;
 
 /// A number's slot: its word, index + 1 (0: empty) and placed bits.
 #[derive(Clone, Copy, Debug)]
-struct NumSlot<N: EngineNum> {
+struct NumSlot<N: Arithmetic> {
     word: N::Word,
     idx1: u32,
     placed: u128,
 }
 
-impl<N: EngineNum> Default for NumSlot<N> {
+impl<N: Arithmetic> Default for NumSlot<N> {
     fn default() -> Self {
         NumSlot { word: Default::default(), idx1: 0, placed: 0 }
     }
 }
 
-impl<N: EngineNum> FieldDict<N> {
+impl<N: Arithmetic> FieldDict<N> {
     fn new() -> Self {
         FieldDict {
             codes: Vec::new(),
@@ -416,7 +416,7 @@ impl<N: EngineNum> FieldDict<N> {
 
 /// A shape's SIGNATURE: exactly what `Rt2::shape_hash_of` hashes, so two
 /// structures under one hash are told apart (a collision is fatal).
-pub fn shape_sig<N: EngineNum>(rt2: &Rt2<N>) -> Vec<u32> {
+pub fn shape_sig<N: Arithmetic>(rt2: &Rt2<N>) -> Vec<u32> {
     let mut s = Vec::with_capacity(rt2.structure.len() * 2 + rt2.globals.len() + 1);
     for cell in &rt2.structure {
         match cell {
@@ -451,20 +451,20 @@ pub struct ShapeRecord {
 }
 
 impl ShapeRecord {
-    pub fn of<N: EngineNum>(rt2: &Rt2<N>) -> ShapeRecord {
+    pub fn of<N: Arithmetic>(rt2: &Rt2<N>) -> ShapeRecord {
         ShapeRecord { hash: rt2.shape_hash, sig: shape_sig(rt2), pos: rt2.position_cells() }
     }
 }
 
 /// One shape's dictionaries (by cell; `None` for a cell that is not a value).
 #[derive(Clone, Debug)]
-pub struct ShapeKeys<N: EngineNum = P8> {
+pub struct ShapeKeys<N: Arithmetic = P8> {
     pub record: ShapeRecord,
     fields: Vec<Option<FieldDict<N>>>,
     next_bit: u32,
 }
 
-impl<N: EngineNum> ShapeKeys<N> {
+impl<N: Arithmetic> ShapeKeys<N> {
     fn new(record: ShapeRecord) -> ShapeKeys<N> {
         // The signature names each cell's kind: a `Val` is a lone 1.
         let mut fields = Vec::new();
@@ -547,7 +547,7 @@ pub struct ContentHash {
 
 impl ContentHash {
     #[inline]
-    fn code_hash<N: EngineNum>(cell: u32, c: Code<N>) -> u64 {
+    fn code_hash<N: Arithmetic>(cell: u32, c: Code<N>) -> u64 {
         mix64(mix64((cell as u64) << 8 | c.kind as u64) ^ N::fold(c.word()))
     }
 
@@ -575,7 +575,7 @@ impl ContentHash {
 /// A row's key against a key space: packed, or (a code is missing) its
 /// exact content.
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
-pub enum RowKey<N: EngineNum = P8> {
+pub enum RowKey<N: Arithmetic = P8> {
     Hit(Key),
     Miss(MissKey<N>),
 }
@@ -584,7 +584,7 @@ pub enum RowKey<N: EngineNum = P8> {
 /// fields that hit and the (cell, code) of those that missed, by cell.
 #[derive(Clone, PartialEq, Eq, Hash, Debug, Serialize, Deserialize)]
 #[serde(bound = "")]
-pub struct MissKey<N: EngineNum = P8> {
+pub struct MissKey<N: Arithmetic = P8> {
     pub shape: u64,
     pub partial: Key,
     pub missing: Vec<(u32, Code<N>)>,
@@ -594,7 +594,7 @@ pub struct MissKey<N: EngineNum = P8> {
 /// (with their places). Recorded per frame; a replay is order-free.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(bound = "")]
-pub struct KeyAdditions<N: EngineNum = P8> {
+pub struct KeyAdditions<N: Arithmetic = P8> {
     pub shapes: Vec<ShapeRecord>,
     /// `(shape, cell, index, code)`.
     pub codes: Vec<(u64, u32, u32, Code<N>)>,
@@ -602,13 +602,13 @@ pub struct KeyAdditions<N: EngineNum = P8> {
     pub runs: Vec<(u64, u32, u32, u8, u8)>,
 }
 
-impl<N: EngineNum> Default for KeyAdditions<N> {
+impl<N: Arithmetic> Default for KeyAdditions<N> {
     fn default() -> Self {
         KeyAdditions { shapes: Vec::new(), codes: Vec::new(), runs: Vec::new() }
     }
 }
 
-impl<N: EngineNum> KeyAdditions<N> {
+impl<N: Arithmetic> KeyAdditions<N> {
     pub fn is_empty(&self) -> bool {
         self.shapes.is_empty() && self.codes.is_empty() && self.runs.is_empty()
     }
@@ -624,19 +624,19 @@ impl<N: EngineNum> KeyAdditions<N> {
 static GEN: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone, Debug)]
-pub struct KeySpace<N: EngineNum = P8> {
+pub struct KeySpace<N: Arithmetic = P8> {
     shapes: FxHashMap<u64, ShapeKeys<N>>,
     run_counts: FxHashMap<(u64, u32), u32>,
     gen: u64,
 }
 
-impl<N: EngineNum> Default for KeySpace<N> {
+impl<N: Arithmetic> Default for KeySpace<N> {
     fn default() -> Self {
         KeySpace { shapes: Default::default(), run_counts: Default::default(), gen: GEN.fetch_add(1, Ordering::Relaxed) }
     }
 }
 
-impl<N: EngineNum> KeySpace<N> {
+impl<N: Arithmetic> KeySpace<N> {
     pub fn new() -> Self {
         Self::default()
     }
@@ -899,18 +899,18 @@ const PROV_SHARDS: usize = 256;
 /// A wave's PROVISIONAL keys: each distinct miss content interned to
 /// `PROVISIONAL | shard << 32` (high word), local number (low word). Ids
 /// depend on scheduling; the translation turns them into final keys.
-pub struct Provisional<N: EngineNum = P8> {
+pub struct Provisional<N: Arithmetic = P8> {
     shards: Vec<Mutex<(FxHashMap<MissKey<N>, u32>, Vec<MissKey<N>>)>>,
     shapes: Mutex<FxHashMap<u64, ShapeRecord>>,
 }
 
-impl<N: EngineNum> Default for Provisional<N> {
+impl<N: Arithmetic> Default for Provisional<N> {
     fn default() -> Self {
         Provisional { shards: (0..PROV_SHARDS).map(|_| Default::default()).collect(), shapes: Default::default() }
     }
 }
 
-impl<N: EngineNum> Provisional<N> {
+impl<N: Arithmetic> Provisional<N> {
     /// A shape the key space lacks, which misses are made of.
     pub fn note_shape(&self, r: &ShapeRecord) {
         let mut g = self.shapes.lock().expect("the provisional shapes");
@@ -961,7 +961,7 @@ pub type ExactRow = Box<[u8]>;
 /// one name is FATAL).
 static SIGS: std::sync::OnceLock<Mutex<FxHashMap<u64, std::sync::Arc<Vec<u32>>>>> = std::sync::OnceLock::new();
 
-pub fn exact_rows<N: EngineNum>(rt2: &Rt2<N>) -> Vec<ExactRow> {
+pub fn exact_rows<N: Arithmetic>(rt2: &Rt2<N>) -> Vec<ExactRow> {
     let sig = shape_sig(rt2);
     {
         let mut g = SIGS.get_or_init(Default::default).lock().expect("the shape registry");

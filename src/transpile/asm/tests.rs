@@ -14,14 +14,13 @@
 
 use std::os::raw::c_void;
 
-use celeste_core::arith::{Arithmetic, EngineNum, Fixed, Float};
+use celeste_core::arith::{Arithmetic, Fixed, Float};
 use celeste_core::cart_data::CART;
 use celeste_core::collision_cache::CollisionCache;
 use celeste_core::lua_f64::LuaF64;
 use celeste_core::pico8_num::Pico8Num as P8;
 
 use crate::compiled::asm_kernel::KernelLanes;
-use crate::transpile::garith::GraphArith;
 use crate::transpile::asm::{compile, compile_and_load, AsmCtx, AsmOptions, CollisionEnv, Compiled, Loaded};
 use crate::transpile::graph::{one_operand, Cut, Graph, NodeId, Op, Ty, Unknown};
 
@@ -48,16 +47,16 @@ impl Lcg {
 /// answer is not an operation of the arithmetic. 16.16's grid is the raw
 /// `i32`, which wraps past the top floor; there the fork's premise
 /// (`ForkOk`) is false, so the lane declines.
-trait TestArith: GraphArith<Num: KernelLanes<Arith = Self>> {
+trait TestArith: KernelLanes {
     /// Numbers every operation is tried on: zeros, both signs, the range's
     /// ends and the operations' thresholds, cut points, random values.
-    fn specials() -> Vec<Self::Num>;
+    fn specials() -> Vec<Self>;
     /// A random number; `small`: well inside the range (a sum of two fits).
-    fn random(rng: &mut Lcg, small: bool) -> Self::Num;
+    fn random(rng: &mut Lcg, small: bool) -> Self;
     /// Literals a product or quotient is tried with (`positive`: only those).
-    fn factors(positive: bool) -> Vec<Self::Num>;
+    fn factors(positive: bool) -> Vec<Self>;
     /// Does the fork grid reach floor `c` above `lo`'s inside the range?
-    fn grid_ok(lo: Self::Num, c: u8) -> bool;
+    fn grid_ok(lo: Self, c: u8) -> bool;
     /// `ForkOk(Floors, ways)`: the lane spans at most `ways` floors and the grid
     /// reaches them.
     fn split_ok(i: Self::Ival, ways: u8) -> bool;
@@ -172,9 +171,9 @@ impl TestArith for Float {
 /// A lane's input cell.
 #[derive(Clone, Copy, Debug)]
 enum In<A: Arithmetic> {
-    N(A::Num),
+    N(A),
     /// An interval, `lo <= hi`.
-    I(A::Num, A::Num),
+    I(A, A),
     B(bool),
     /// A maybe-unknown boolean: `(val, known)`.
     U(bool, bool),
@@ -183,7 +182,7 @@ enum In<A: Arithmetic> {
 /// A node's value on one lane.
 #[derive(Clone, Copy, Debug)]
 enum V<A: Arithmetic> {
-    N(A::Num),
+    N(A),
     I(A::Ival),
     /// `(val, known)`: both planes' bits, `val` meaningful on unknown lanes
     /// too (the kernels' representation).
@@ -206,7 +205,7 @@ fn as_ival<A: Arithmetic>(v: V<A>) -> A::Ival {
     }
 }
 
-fn as_point<A: Arithmetic>(v: V<A>) -> A::Num {
+fn as_point<A: Arithmetic>(v: V<A>) -> A {
     match v {
         V::N(x) => x,
         other => panic!("{other:?} where a number was needed"),
@@ -444,7 +443,7 @@ fn build<A: TestArith>(g: &Graph<A>, roots: &[NodeId], tag: &str) -> (Compiled, 
 
 /// Run up to sixteen lanes (`rows[j]`: lane `j`'s cells; unused lanes repeat
 /// lane 0); per lane, per root, its slot.
-fn run<A: TestArith>(c: &Compiled, l: &Loaded, rows: &[Vec<In<A>>], env: Option<&CollisionEnv>) -> Vec<Vec<Out<<A::Num as EngineNum>::Raw>>> {
+fn run<A: TestArith>(c: &Compiled, l: &Loaded, rows: &[Vec<In<A>>], env: Option<&CollisionEnv>) -> Vec<Vec<Out<A::Raw>>> {
     assert!(!rows.is_empty() && rows.len() <= 16);
     let halves = if c.halves { 2 } else { 1 };
     let (ib, ob) = (c.input_bytes as usize, c.out_bytes as usize);
@@ -455,7 +454,7 @@ fn run<A: TestArith>(c: &Compiled, l: &Loaded, rows: &[Vec<In<A>>], env: Option<
         let off = c.input_offsets[ci] as usize;
         let (mut val, mut known) = (0u16, 0u16);
         for j in 0..16 {
-            let put = |buf: &mut Vec<u8>, at: usize, v: A::Num| A::Num::put(buf, ib, at, j, v.raw());
+            let put = |buf: &mut Vec<u8>, at: usize, v: A| A::put(buf, ib, at, j, v.raw());
             match (c.input_reprs[ci], row(j)[*cell as usize]) {
                 (Ty::Num, In::N(x)) => put(&mut inbuf, off, x),
                 (Ty::Ival, In::I(lo, hi)) => {
@@ -475,12 +474,12 @@ fn run<A: TestArith>(c: &Compiled, l: &Loaded, rows: &[Vec<In<A>>], env: Option<
             }
         }
         match c.input_reprs[ci] {
-            Ty::Bool => A::Num::put_masks(&mut inbuf, ib, off, val, None),
-            Ty::UBool => A::Num::put_masks(&mut inbuf, ib, off, val, Some(known)),
+            Ty::Bool => A::put_masks(&mut inbuf, ib, off, val, None),
+            Ty::UBool => A::put_masks(&mut inbuf, ib, off, val, Some(known)),
             Ty::Num | Ty::Ival => {}
         }
     }
-    A::Num::before_call();
+    A::before_call();
     let ctx = AsmCtx::new(env.map_or(std::ptr::null(), |e| e as *const CollisionEnv as *const c_void));
     // SAFETY: the buffers have the layout `c` states (`halves` of each).
     unsafe { (l.func)(inbuf.as_ptr(), out.as_mut_ptr(), &ctx as *const AsmCtx as *const c_void) };
@@ -490,10 +489,10 @@ fn run<A: TestArith>(c: &Compiled, l: &Loaded, rows: &[Vec<In<A>>], env: Option<
                 .map(|r| {
                     let o = c.root_offsets[r] as usize;
                     match c.root_kinds[r] {
-                        Ty::Num => Out::N(A::Num::lane(&out, ob, o, j)),
-                        Ty::Ival => Out::I(A::Num::lane(&out, ob, o, j), A::Num::lane(&out, ob, o + 64, j)),
+                        Ty::Num => Out::N(A::lane(&out, ob, o, j)),
+                        Ty::Ival => Out::I(A::lane(&out, ob, o, j), A::lane(&out, ob, o + 64, j)),
                         Ty::Bool | Ty::UBool => {
-                            let (val, known) = A::Num::masks(&out, ob, o);
+                            let (val, known) = A::masks(&out, ob, o);
                             Out::B(val >> j & 1 == 1, known >> j & 1 == 1)
                         }
                     }
@@ -504,9 +503,9 @@ fn run<A: TestArith>(c: &Compiled, l: &Loaded, rows: &[Vec<In<A>>], env: Option<
 }
 
 /// Does a root's slot hold the oracle's value?
-fn agrees<A: Arithmetic>(got: Out<<A::Num as EngineNum>::Raw>, want: V<A>) -> bool
+fn agrees<A: Arithmetic>(got: Out<A::Raw>, want: V<A>) -> bool
 where
-    A::Num: EngineNum,
+    A: Arithmetic,
 {
     match (got, want) {
         (Out::N(r), V::N(x)) => r == x.raw(),
@@ -550,7 +549,7 @@ fn pairs<T: Copy>(xs: &[T], step: usize) -> Vec<(T, T)> {
 
 /// Intervals from the specials: points, ordered pairs, and the arithmetic's
 /// zero both ways.
-fn intervals<A: TestArith>() -> Vec<(A::Num, A::Num)> {
+fn intervals<A: TestArith>() -> Vec<(A, A)> {
     let sp = A::specials();
     let zero = A::from_i16(0);
     let mut out = vec![(zero, zero), (A::neg(zero).expect("-0"), zero)];
@@ -574,7 +573,7 @@ fn num_or_ival(wide: bool) -> Ty {
     if wide { Ty::Ival } else { Ty::Num }
 }
 
-fn lit<A: TestArith>(g: &mut Graph<A>, v: A::Num) -> NodeId {
+fn lit<A: TestArith>(g: &mut Graph<A>, v: A) -> NodeId {
     let l = A::lit(v);
     g.leaf(Op::Const(l, l))
 }
@@ -657,8 +656,8 @@ fn comparisons<A: TestArith>() {
         if !wide_x && !A::EQ_IS_IDENTITY {
             roots.push(g.add(Op::Same, vec![c[0], c[1]]));
         }
-        let num = |v: A::Num| In::N(v);
-        let ival = |(lo, hi): (A::Num, A::Num)| In::I(lo, hi);
+        let num = |v: A| In::N(v);
+        let ival = |(lo, hi): (A, A)| In::I(lo, hi);
         let rows: Vec<Vec<In<A>>> = match (wide_x, wide_y) {
             (false, false) => pairs(&A::specials(), 1).into_iter().map(|(a, b)| vec![num(a), num(b)]).collect(),
             (true, true) => pairs(&intervals::<A>(), 5).into_iter().map(|(a, b)| vec![ival(a), ival(b)]).collect(),
@@ -761,7 +760,7 @@ fn fork_fragments<A: TestArith>() {
     roots.push(g.add(Op::Known, vec![flr]));
     // Spans of up to four floors from every special, kept where they fit.
     let quarter = A::div(A::from_i16(1), A::from_i16(4)).expect("1/4");
-    let spans: Vec<A::Num> = [0, 1, 2, 3, 5, 7, 9, 12, 15].iter().map(|q| A::mul(A::from_i16(*q), quarter).expect("q/4")).collect();
+    let spans: Vec<A> = [0, 1, 2, 3, 5, 7, 9, 12, 15].iter().map(|q| A::mul(A::from_i16(*q), quarter).expect("q/4")).collect();
     let mut rows: Vec<Vec<In<A>>> = Vec::new();
     for lo in A::specials() {
         for s in &spans {

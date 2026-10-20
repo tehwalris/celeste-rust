@@ -45,7 +45,7 @@ impl RegionGrid {
     fn bounds<A: GraphArith>(&self, pl: &super::iface::Path, r: Region) -> InputRanges<A> {
         const ONE: i32 = 1 << 16;
         let lit = |raw: i32| A::lit(A::from_fixed_raw(raw));
-        let (rlo, rhi) = celeste_engine::widening::range::<A::Num>(celeste_engine::widening::REM.0, celeste_engine::widening::REM.1);
+        let (rlo, rhi) = celeste_engine::widening::range::<A>(celeste_engine::widening::REM.0, celeste_engine::widening::REM.1);
         let rem = (A::lit(rlo), A::lit(rhi));
         let field = |fs: &[&str]| super::widen::field(pl, fs);
         let (x0, y0) = (r.ix as i32 * self.px, r.iy as i32 * self.px);
@@ -75,7 +75,7 @@ pub type WalkNode = (ShapeKey, Option<Region>);
 
 /// The shape key of a state (its skeleton's shape hash).
 pub fn shape_key<A: GraphArith>(st: &super::state::State<super::domain::Symbolic<A>>, cache: std::sync::Arc<celeste_core::collision_cache::CollisionCache>) -> Result<ShapeKey> {
-    Ok(super::block::skeleton::<_, A::Num>(st, cache)?.shape_hash)
+    Ok(super::block::skeleton::<_, A>(st, cache)?.shape_hash)
 }
 
 /// The walk's REPRESENTATIVES: a shape's state as a one-lane block
@@ -88,7 +88,7 @@ struct Reps<A: GraphArith> {
     /// The boot state: the builtins a block drops.
     base: super::state::State<super::domain::Symbolic<A>>,
     cache: std::sync::Arc<celeste_core::collision_cache::CollisionCache>,
-    blocks: std::collections::BTreeMap<ShapeKey, celeste_engine::runtime2::Rt2<A::Num>>,
+    blocks: std::collections::BTreeMap<ShapeKey, celeste_engine::runtime2::Rt2<A>>,
 }
 
 impl<A: GraphArith> Reps<A> {
@@ -97,7 +97,7 @@ impl<A: GraphArith> Reps<A> {
     }
 
     /// `st` as a representative (`blanked`: its state paths 0 or false).
-    fn block(&self, st: &super::state::State<super::domain::Symbolic<A>>, d: &mut super::domain::Symbolic<A>, blanked: bool) -> Result<celeste_engine::runtime2::Rt2<A::Num>> {
+    fn block(&self, st: &super::state::State<super::domain::Symbolic<A>>, d: &mut super::domain::Symbolic<A>, blanked: bool) -> Result<celeste_engine::runtime2::Rt2<A>> {
         use super::domain::Domain as _;
         use celeste_engine::runtime2::AV;
         let mut st = st.clone();
@@ -114,7 +114,7 @@ impl<A: GraphArith> Reps<A> {
     }
 
     /// A representative as a state in `d`'s arena.
-    fn state(&self, rep: &celeste_engine::runtime2::Rt2<A::Num>, d: &mut super::domain::Symbolic<A>) -> Result<super::state::State<super::domain::Symbolic<A>>> {
+    fn state(&self, rep: &celeste_engine::runtime2::Rt2<A>, d: &mut super::domain::Symbolic<A>) -> Result<super::state::State<super::domain::Symbolic<A>>> {
         let (st, unknown) = super::block::from_block(d, rep, 0, &self.fn_info, &self.base)?;
         anyhow::ensure!(unknown.is_empty(), "a representative holds unknown booleans: {unknown:?}");
         Ok(st)
@@ -308,7 +308,7 @@ fn next_entry<A: GraphArith>(reps: &Reps<A>, d: &mut super::domain::Symbolic<A>,
 }
 
 /// A numeric field's hull per path (raw 16.16, inclusive).
-type Hull<A> = std::collections::BTreeMap<super::iface::Path, (<A as Arithmetic>::Num, <A as Arithmetic>::Num)>;
+type Hull<A> = std::collections::BTreeMap<super::iface::Path, (A, A)>;
 
 /// The no-player phase's hulls over every state explored (the start's chain
 /// and each respawn's exploration), per shape and the spawn object's. A
@@ -340,7 +340,7 @@ impl<A: GraphArith> NoPlayer<A> {
         };
         let fruit_objs = if fruit { super::widen::objects_of_type(st, "fly_fruit") } else { Vec::new() };
         let spawn_objs = super::widen::objects_of_type(st, "player_spawn");
-        let join = |h: &mut Hull<A>, p: super::iface::Path, r: A::Num| {
+        let join = |h: &mut Hull<A>, p: super::iface::Path, r: A| {
             let e = h.entry(p).or_insert((r, r));
             *e = (if A::lt(r, e.0) { r } else { e.0 }, if A::lt(e.1, r) { r } else { e.1 });
         };
@@ -401,7 +401,7 @@ impl<A: GraphArith> NoPlayer<A> {
 
     /// Each shape's bounds and the spawn object's, for the log.
     fn show(&self) -> Vec<String> {
-        let show = |h: &Hull<A>, unknown: &std::collections::BTreeSet<super::iface::Path>| h.iter().filter(|(p, (lo, hi))| A::lt(*lo, *hi) && !unknown.contains(*p)).map(|(p, (a, b))| format!("{} [{:.2}, {:.2}]", super::iface::show(p), celeste_core::arith::EngineNum::to_f64(*a), celeste_core::arith::EngineNum::to_f64(*b))).collect::<Vec<_>>();
+        let show = |h: &Hull<A>, unknown: &std::collections::BTreeSet<super::iface::Path>| h.iter().filter(|(p, (lo, hi))| A::lt(*lo, *hi) && !unknown.contains(*p)).map(|(p, (a, b))| format!("{} [{:.2}, {:.2}]", super::iface::show(p), celeste_core::arith::Arithmetic::to_f64(*a), celeste_core::arith::Arithmetic::to_f64(*b))).collect::<Vec<_>>();
         let mut out: Vec<String> = self.shapes.iter().enumerate().map(|(i, (_, h, unknown))| format!("[walk] no-player shape {i} ranges: {:?}", show(h, unknown))).collect();
         out.push(format!("[walk] the spawn object's ranges: {:?}", show(&self.spawn, &self.spawn_unknown)));
         out
@@ -827,7 +827,7 @@ struct WalkOutcome<A: GraphArith = Fixed> {
     ival: Vec<super::iface::Path>,
     regions: Vec<Option<Region>>,
     /// The outcome as its shape's representative.
-    rep: celeste_engine::runtime2::Rt2<A::Num>,
+    rep: celeste_engine::runtime2::Rt2<A>,
     /// A RESPAWN entry (a state of the no-player phase from a node outside
     /// it: the room reloaded after a death), its constants at the level
     /// (`explore_no_player` pins them).

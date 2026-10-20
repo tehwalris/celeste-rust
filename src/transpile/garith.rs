@@ -22,7 +22,7 @@ use celeste_core::pico8_num::{Pico8Num, Pico8NumInterval};
 
 use super::graph::{one_operand, Cut, Graph, NodeId, Op};
 
-pub trait GraphArith: Arithmetic<Num: celeste_core::arith::EngineNum<A = Self>> {
+pub trait GraphArith: Arithmetic {
     const MINMAX_COMMUTE: bool;
     /// Is addition exact, so `(x - r) + r` is `x` and `(r + c) - r` is `c`
     /// wherever the ranges bound them (16.16: yes; doubles round)?
@@ -122,7 +122,7 @@ pub trait GraphArith: Arithmetic<Num: celeste_core::arith::EngineNum<A = Self>> 
     /// Is `v` the only number of its VALUE, so a box whose ends are `v`
     /// holds `v`'s bits on every lane (`ival`'s point fold)? A double's
     /// zero is not: `-0 == 0`, and a lane of `-0` lies in `[0, 0]`.
-    fn alone_in_its_value(v: Self::Num) -> bool;
+    fn alone_in_its_value(v: Self) -> bool;
     /// The kernel computing `roots` of `g`, as assembly (`transpile::asm`:
     /// the arithmetic's lowering of each node and its lane layout).
     fn compile_kernel(g: &Graph<Self>, roots: &[NodeId], sym: &str, opts: super::asm::AsmOptions) -> anyhow::Result<super::asm::Compiled>;
@@ -137,8 +137,7 @@ pub trait GraphArith: Arithmetic<Num: celeste_core::arith::EngineNum<A = Self>> 
 /// alone in its value, a double's zero both zeros. An input a compile-time
 /// decision pins to a value (a pixel, a platform's `x`) is pinned to this: a
 /// comparison cannot tell `-0` from `0`, a quotient can.
-pub fn value_box<A: GraphArith>(v: A::Num) -> A::Ival {
-    use celeste_core::arith::EngineNum;
+pub fn value_box<A: GraphArith>(v: A) -> A::Ival {
     if A::alone_in_its_value(v) {
         return A::point(v);
     }
@@ -357,7 +356,7 @@ fn pieces_under<A: GraphArith>(g: &Graph<A>, memo: &mut HashMap<NodeId, Option<P
 /// and through select arms on `x op k` (`k` a literal) with what each
 /// answer says about `x` (so a wrap `x < -16 ? 128 : ...` is bounded).
 /// `false` if unsure.
-pub fn within<A: GraphArith>(g: &Graph<A>, v: NodeId, lo: A::Num, hi: A::Num) -> bool {
+pub fn within<A: GraphArith>(g: &Graph<A>, v: NodeId, lo: A, hi: A) -> bool {
     let (lo, hi) = (A::end(A::lit(lo)), A::end(A::lit(hi)));
     within_under(g, v, (lo, hi), &mut Vec::new())
 }
@@ -410,7 +409,7 @@ fn comparison_facts<A: GraphArith>(g: &Graph<A>, c: NodeId) -> Option<(NodeId, (
         ),
         _ => return None,
     };
-    let end = |v: A::Num| A::end(A::lit(v));
+    let end = |v: A| A::end(A::lit(v));
     let pred = end(A::below(k)?);
     let succ = end(A::below(A::neg(k)?).and_then(A::neg)?);
     let (k, (min, max)) = (end(k), (A::End::MIN, A::End::MAX));

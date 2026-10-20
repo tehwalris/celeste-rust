@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use celeste_core::arith::EngineNum;
+use celeste_core::arith::Arithmetic;
 use celeste_engine::exact::{Key, KeyAdditions, KeySpace};
 use celeste_engine::runtime2::{mix64, Cell2, Col, Rt2, P8};
 
@@ -24,19 +24,19 @@ use super::set::{PlainTable, RegionSet};
 use super::{Sk, GEOMETRY};
 
 #[derive(Clone)]
-pub struct Layer<N: EngineNum = P8> {
+pub struct Layer<N: Arithmetic = P8> {
     pub(crate) set: RegionSet,
     /// Per shape (hash) its skeleton (`SkelRecord::rt2`).
     pub(crate) skeletons: FxHashMap<u64, Arc<Rt2<N>>>,
 }
 
-impl<N: EngineNum> Default for Layer<N> {
+impl<N: Arithmetic> Default for Layer<N> {
     fn default() -> Self {
         Layer { set: RegionSet::default(), skeletons: FxHashMap::default() }
     }
 }
 
-impl<N: EngineNum> Layer<N> {
+impl<N: Arithmetic> Layer<N> {
     /// Append region `region`'s entries (after every region held; keys
     /// ascending, masks non-empty: checked).
     pub(crate) fn push_region(&mut self, region: u32, keys: &[Key], masks: &[u64]) -> Result<()> {
@@ -124,7 +124,7 @@ pub(crate) struct SkelRecord<N = P8> {
     pub(crate) numeric: Vec<(u32, u8)>,
 }
 
-impl<N: EngineNum> SkelRecord<N> {
+impl<N: Arithmetic> SkelRecord<N> {
     /// The skeleton of `rt2`'s shape (its values are not read).
     pub(crate) fn of(rt2: &Rt2<N>) -> Result<SkelRecord<N>> {
         for cell in &rt2.structure {
@@ -202,7 +202,7 @@ pub(crate) struct RegionIndex {
 
 #[derive(Serialize, Deserialize, Debug)]
 #[serde(bound = "")]
-pub(crate) struct FrameHeader<N: EngineNum = P8> {
+pub(crate) struct FrameHeader<N: Arithmetic = P8> {
     pub(crate) frame: u32,
     /// The storage region side the tree is built with.
     pub(crate) side: u32,
@@ -221,7 +221,7 @@ pub(crate) struct FrameHeader<N: EngineNum = P8> {
     pub(crate) frontier: Vec<super::hulls::Block>,
 }
 
-impl<N: EngineNum> FrameHeader<N> {
+impl<N: Arithmetic> FrameHeader<N> {
     pub(crate) fn states(&self) -> u64 {
         self.regions.iter().map(|r| r.states as u64).sum()
     }
@@ -232,7 +232,7 @@ impl<N: EngineNum> FrameHeader<N> {
 }
 
 /// What a frame file holds besides its states.
-pub(crate) struct FrameMeta<'a, N: EngineNum = P8> {
+pub(crate) struct FrameMeta<'a, N: Arithmetic = P8> {
     pub(crate) frame: u32,
     pub(crate) shapes: &'a [(u32, u64)],
     pub(crate) keys: &'a KeyAdditions<N>,
@@ -358,14 +358,14 @@ pub(crate) fn write_frame<N: crate::search::rem::Rem, R: super::hulls::Runs<N> +
     })
 }
 
-pub(crate) struct FrameFile<N: EngineNum = P8> {
+pub(crate) struct FrameFile<N: Arithmetic = P8> {
     file: Mapped,
     pub(crate) header: FrameHeader<N>,
 }
 
-impl<N: EngineNum> FrameFile<N> {
+impl<N: Arithmetic> FrameFile<N> {
     pub(crate) fn open(path: &Path) -> Result<Self> {
-        let file = Mapped::open(path, file::magic::<N>(MAGIC), FORMAT_VERSION, &format!("a frame file of the {} arithmetic", <N::A as celeste_core::arith::Arithmetic>::NAME))?;
+        let file = Mapped::open(path, file::magic::<N>(MAGIC), FORMAT_VERSION, &format!("a frame file of the {} arithmetic", N::NAME))?;
         let header: FrameHeader<N> = file.header()?;
         ensure!(header.side == GEOMETRY.side, "{}: built with storage regions of {} cells, this process uses {}", path.display(), header.side, GEOMETRY.side);
         file.ends_at(header.frontier.last().map(|b| b.at).or(header.regions.last().map(|r| r.at)).map_or(0, |at| at.end()))?;
@@ -479,7 +479,7 @@ pub(crate) fn check_frame_file<N: crate::search::rem::Rem, R: super::hulls::Runs
 /// A TREE's frame files through a frame: its codebooks (the shapes by
 /// index, the key space: every file's additions, any order) and each
 /// frame's file (none past a dead frontier: those frames are empty).
-pub struct Tree<N: EngineNum = P8> {
+pub struct Tree<N: Arithmetic = P8> {
     pub(crate) dir: PathBuf,
     pub(crate) last: u32,
     pub(crate) frames: Vec<Option<FrameFile<N>>>,
@@ -487,7 +487,7 @@ pub struct Tree<N: EngineNum = P8> {
     pub space: KeySpace<N>,
 }
 
-impl<N: EngineNum> Tree<N> {
+impl<N: Arithmetic> Tree<N> {
     /// The tree in `dir` through frame `last`.
     pub fn open(dir: &Path, last: u32) -> Result<Tree<N>> {
         let mut frames: Vec<Option<FrameFile<N>>> = Vec::with_capacity(last as usize + 1);
@@ -601,7 +601,7 @@ impl<N: EngineNum> Tree<N> {
 
 /// `layer`'s states (those `keep` admits) DECODED: per shape, chunks of at
 /// most `chunk` states and their rows, in the layer's order.
-pub(crate) fn decode_states<N: EngineNum>(layer: &Layer<N>, space: &KeySpace<N>, shapes: &[u64], chunk: usize, keep: &dyn Fn(Sk) -> bool) -> Result<Vec<(Vec<Sk>, Rt2<N>)>> {
+pub(crate) fn decode_states<N: Arithmetic>(layer: &Layer<N>, space: &KeySpace<N>, shapes: &[u64], chunk: usize, keep: &dyn Fn(Sk) -> bool) -> Result<Vec<(Vec<Sk>, Rt2<N>)>> {
     let geo = GEOMETRY;
     let mut out = Vec::new();
     let mut cur: Vec<Sk> = Vec::new();

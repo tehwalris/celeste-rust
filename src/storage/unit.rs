@@ -5,7 +5,7 @@
 
 use crate::search::hull::{AccOf, HullOf};
 use anyhow::Result;
-use celeste_core::arith::EngineNum;
+use celeste_core::arith::Arithmetic;
 use celeste_core::pico8_num::Pico8Num as P8;
 use celeste_engine::runtime2::{Col, Rt2, AV};
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -19,7 +19,7 @@ use celeste_engine::exact::{is_provisional, KeySpace, Provisional, RowKey};
 
 /// A typed varying column of buffered rows: raw words, (low, high) pairs,
 /// or a byte per bool (0 false, 1 true, 2 unknown).
-pub(crate) enum TCol<N: EngineNum = P8> {
+pub(crate) enum TCol<N: Arithmetic = P8> {
     Num(Vec<N::Raw>),
     Ival(Vec<(N::Raw, N::Raw)>),
     Bool(Vec<u8>),
@@ -27,7 +27,7 @@ pub(crate) enum TCol<N: EngineNum = P8> {
 
 /// Rows of one shape, columnar over its skeleton, buffered only to be looked
 /// at: the coarser level's verdicts, the key check, the decode guard.
-pub(crate) struct RowBuf<N: EngineNum = P8> {
+pub(crate) struct RowBuf<N: Arithmetic = P8> {
     pub(crate) shape: u64,
     skeleton: Rt2<N>,
     /// `(cell, column)` per varying cell, in the kernel's order.
@@ -36,7 +36,7 @@ pub(crate) struct RowBuf<N: EngineNum = P8> {
     pub(crate) cells: Vec<u32>,
 }
 
-impl<N: EngineNum> RowBuf<N> {
+impl<N: Arithmetic> RowBuf<N> {
     pub(crate) fn new(skeleton: Rt2<N>) -> Self {
         let cols = skeleton
             .cols
@@ -124,7 +124,7 @@ impl<N: EngineNum> RowBuf<N> {
 
 /// The number of a buffered raw word (a buffer's own: always one).
 #[inline]
-fn num<N: EngineNum>(r: N::Raw) -> N {
+fn num<N: Arithmetic>(r: N::Raw) -> N {
     N::from_raw(r).expect("a buffered word is a number")
 }
 
@@ -338,7 +338,7 @@ impl<'a, N: Rem> Xfers<'a, N> {
     fn id_raw(&mut self, worker: u32, words: &crate::compiled::asm_kernel::RawWords<N>, decode: impl FnOnce(&crate::compiled::asm_kernel::RawWords<N>) -> N::Pair) -> u32 {
         let mut h = 0u64;
         for pair in words.chunks_exact(2) {
-            // 16.16's word is `lo << 32 | hi` (`EngineNum::word`, `fold`).
+            // 16.16's word is `lo << 32 | hi` (`Arithmetic::word`, `fold`).
             h = (h ^ N::fold(N::word(pair[0], pair[1]))).wrapping_mul(0x9e37_79b9_7f4a_7c15).rotate_left(29);
         }
         let slot = (h as usize) & (XFER_CACHE - 1);

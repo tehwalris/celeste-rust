@@ -49,7 +49,7 @@ pub fn key(k: &str) -> Step {
 /// A scalar outside any domain: what a slot concretely holds.
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum Conc<A: GraphArith = Fixed> {
-    Num(A::Num),
+    Num(A),
     Bool(bool),
 }
 

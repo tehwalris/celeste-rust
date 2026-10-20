@@ -253,7 +253,7 @@ fn hull_claim<N: Rem>(b: &Rt2<N>, s: u32, sk: Option<Sk>, from: Option<Held<N>>,
         return Ok(Err(Miss { forward: true, lost: true, what: format!("NOT IN THE TREE by step {s} ({node})") }));
     };
     let r = rem_raw(b)?;
-    let zero = <N::A as celeste_core::arith::Arithmetic>::from_i16(0);
+    let zero = N::from_i16(0);
     let (x, y) = r.unwrap_or((zero, zero));
     // (A full hull is not stored: it holds every remainder.)
     if let Some(info) = h.visited.state(sk.region, sk.key, sk.local as u32) {

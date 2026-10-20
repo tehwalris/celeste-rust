@@ -241,7 +241,7 @@ fn run_levels<N: KernelLanes>(
             }
         }
         let engine = || -> Result<Box<dyn crate::frame::FrameStep<N>>> { Ok(Box::new(crate::compiled::Kernels::<N>::new(cfg, lvl)?)) };
-        let initial = || -> Result<Vec<Rt2<N>>> { Ok(vec![crate::engines::reference::ReferenceEngine::<N::A>::new(cfg)?.initial()?.canonicalized()]) };
+        let initial = || -> Result<Vec<Rt2<N>>> { Ok(vec![crate::engines::reference::ReferenceEngine::<N>::new(cfg)?.initial()?.canonicalized()]) };
         let first_win = crate::frame::grow_tree(&dir, steps, want, filter.as_ref(), lvl, engine, initial, cfg)?.win_frame;
         let forward_s = t.elapsed().as_secs_f64();
         // `f` counts search steps.

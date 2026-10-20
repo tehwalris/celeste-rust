@@ -3,7 +3,7 @@
 //! `RefEngine::step`.
 
 use anyhow::{anyhow, Context, Result};
-use celeste_core::arith::{Arithmetic, EngineNum};
+use celeste_core::arith::Arithmetic;
 use celeste_engine::runtime2::{Rt2, AV};
 
 use crate::engines::reference::ReferenceEngine;
@@ -55,7 +55,7 @@ pub fn read_inputs(spec: &str) -> Result<Vec<u8>> {
 
 /// The objects of type `name` (a global type table) in `objects`, in array
 /// order, as cells of a one-row block.
-pub fn objects_of_type<N: EngineNum>(rt2: &Rt2<N>, name: &str) -> Vec<u32> {
+pub fn objects_of_type<N: Arithmetic>(rt2: &Rt2<N>, name: &str) -> Vec<u32> {
     match celeste_names::global_id(name) {
         Some(g) => rt2.objects_of_type(g),
         None => Vec::new(),
@@ -64,7 +64,7 @@ pub fn objects_of_type<N: EngineNum>(rt2: &Rt2<N>, name: &str) -> Vec<u32> {
 
 /// The number at `path` (field names, e.g. `["spd", "x"]`) below the object
 /// cell `obj` of a one-row block; `None` if absent or not a number.
-pub fn num_at<N: EngineNum>(rt2: &Rt2<N>, obj: u32, path: &[&str]) -> Option<N> {
+pub fn num_at<N: Arithmetic>(rt2: &Rt2<N>, obj: u32, path: &[&str]) -> Option<N> {
     let mut cell = obj;
     for (i, name) in path.iter().enumerate() {
         let c = rt2.obj_field_cell(cell, celeste_names::field_id(name)?)?;
@@ -84,7 +84,7 @@ pub const WORLD_FIELDS: usize = 6;
 
 /// A room's platform worlds (`platform_worlds`): per world, per platform,
 /// its `WORLD_FIELDS`.
-pub struct PlatformWorlds<A: Arithmetic>(pub Vec<Vec<[A::Num; WORLD_FIELDS]>>);
+pub struct PlatformWorlds<A: Arithmetic>(pub Vec<Vec<[A; WORLD_FIELDS]>>);
 
 /// THE PLATFORM WORLDS of the start room: every arrangement of its moving
 /// platforms in the first `frames` frames (`WORLD_FIELDS` per platform, in
@@ -98,11 +98,10 @@ pub struct PlatformWorlds<A: Arithmetic>(pub Vec<Vec<[A::Num; WORLD_FIELDS]>>);
 /// engine runs the platforms (a double's `0.65` moves them otherwise).
 pub fn platform_worlds<A: Arithmetic>(frames: usize, s: &crate::settings::Settings) -> Result<PlatformWorlds<A>>
 where
-    A::Num: EngineNum<A = A>,
 {
     let mut eng = ReferenceEngine::<A>::new(s)?;
     let mut state = eng.initial()?;
-    let mut seen: rustc_hash::FxHashSet<Vec<[A::Num; WORLD_FIELDS]>> = Default::default();
+    let mut seen: rustc_hash::FxHashSet<Vec<[A; WORLD_FIELDS]>> = Default::default();
     let mut worlds = Vec::new();
     for _ in 0..=frames {
         let mut world = Vec::new();

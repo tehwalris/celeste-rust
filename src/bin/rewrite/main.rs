@@ -336,7 +336,7 @@ impl Rows {
 
     /// The tree to the frame, the frame, and its states (of the cell) in the
     /// tree's order (by region, key, cell).
-    pub(crate) fn states<N: celeste_core::arith::EngineNum>(&self, t: &TreeDir) -> Result<(Tree<N>, u32, Vec<Sk>)> {
+    pub(crate) fn states<N: celeste_core::arith::Arithmetic>(&self, t: &TreeDir) -> Result<(Tree<N>, u32, Vec<Sk>)> {
         let (frame, cell) = self.of(t)?;
         let tree = Tree::<N>::open(&t.dir, frame)?;
         let geo = celeste_rust::storage::GEOMETRY;

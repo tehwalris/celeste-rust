@@ -114,7 +114,7 @@ mod tests {
     #[test]
     fn a_zero_box_folds_to_a_constant_only_where_zero_has_one_sign() {
         use celeste_core::arith::Float;
-        fn min_of_zero_and<A: GraphArith>(lo: A::Num, hi: A::Num) -> bool {
+        fn min_of_zero_and<A: GraphArith>(lo: A, hi: A) -> bool {
             let mut g = Graph::<A>::default();
             let x = g.leaf(Op::Cell(0));
             let x = g.add(Op::Restrict(A::lit(lo), A::lit(hi)), vec![x]);

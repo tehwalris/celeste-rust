@@ -15,7 +15,7 @@
 //! one; `Skeletons::check_decodes`) and on the start (`check_piece`).
 
 use anyhow::{anyhow, ensure, Context, Result};
-use celeste_core::arith::EngineNum;
+use celeste_core::arith::Arithmetic;
 use celeste_core::pico8_num::Pico8Num as P8;
 
 use celeste_engine::exact::{Code, FieldDict, Key, KeySpace};
@@ -26,7 +26,7 @@ use crate::search::pos_graph::{cell_xy, room_offset, NO_CELL};
 /// The rows `(key, cell)` of `skel`'s shape as a block (`skel`'s values
 /// unread). A run of one key's rows differs only in position: codes are
 /// looked up once a run, a column stays uniform until a run differs.
-pub(crate) fn decode_rows<N: EngineNum>(keys: &KeySpace<N>, skel: &Rt2<N>, rows: &[(Key, u32)]) -> Result<Rt2<N>> {
+pub(crate) fn decode_rows<N: Arithmetic>(keys: &KeySpace<N>, skel: &Rt2<N>, rows: &[(Key, u32)]) -> Result<Rt2<N>> {
     let s = keys.shape(skel.shape_hash).ok_or_else(|| anyhow!("decode: shape {:016x} is not in the key space", skel.shape_hash))?;
     let n = rows.len();
     ensure!(n > 0, "decode: no rows");
@@ -149,13 +149,13 @@ impl<T: Copy + PartialEq> ColB<T> {
 
 /// A value cell's column in the making, by its `Repr` (`Other`: `N` if
 /// every row holds a number, `I` if an interval, else `V`).
-enum Builder<N: EngineNum> {
+enum Builder<N: Arithmetic> {
     Num(ColB<N>),
     Ival(ColB<(N, N)>),
     Other(ColB<AV<N>>),
 }
 
-impl<N: EngineNum> Builder<N> {
+impl<N: Arithmetic> Builder<N> {
     fn new(repr: Repr, n: usize) -> Builder<N> {
         match repr {
             Repr::Num => Builder::Num(ColB::new(n)),
@@ -246,15 +246,15 @@ impl Repr {
 /// template, `asm_kernel::unify`, or a `reference_skeleton`), as its
 /// `layer::SkelRecord` and that record's block. Another record under one
 /// shape (it would decode otherwise) is FATAL.
-pub(crate) struct Skeletons<N: EngineNum = P8>(std::sync::RwLock<rustc_hash::FxHashMap<u64, (super::layer::SkelRecord<N>, std::sync::Arc<Rt2<N>>)>>);
+pub(crate) struct Skeletons<N: Arithmetic = P8>(std::sync::RwLock<rustc_hash::FxHashMap<u64, (super::layer::SkelRecord<N>, std::sync::Arc<Rt2<N>>)>>);
 
-impl<N: EngineNum> Default for Skeletons<N> {
+impl<N: Arithmetic> Default for Skeletons<N> {
     fn default() -> Self {
         Skeletons(Default::default())
     }
 }
 
-impl<N: EngineNum> Skeletons<N> {
+impl<N: Arithmetic> Skeletons<N> {
     /// Register `skel` for its shape (checked against the shape's).
     pub(crate) fn register(&self, skel: &Rt2<N>) -> Result<()> {
         let rec = super::layer::SkelRecord::of(skel)?;
@@ -306,7 +306,7 @@ impl<N: EngineNum> Skeletons<N> {
 }
 
 /// A reference row's skeleton: every value cell left to the decode (`Other`).
-pub(crate) fn reference_skeleton<N: EngineNum>(row: &Rt2<N>) -> Rt2<N> {
+pub(crate) fn reference_skeleton<N: Arithmetic>(row: &Rt2<N>) -> Rt2<N> {
     let mut b = celeste_engine::slots::reshape(row, 0);
     b.cols = row.structure.iter().zip(&row.cols).map(|(cell, c)| if matches!(cell, Cell2::Val) { Col::V(Vec::new()) } else { Col::U(c.at(0)) }).collect();
     b.shape_hash = row.shape_hash;
@@ -316,7 +316,7 @@ pub(crate) fn reference_skeleton<N: EngineNum>(row: &Rt2<N>) -> Rt2<N> {
 /// THE GUARD on the start's rows (`wave::seed`): they decode to exactly
 /// themselves, representation included, and no per-row column holds one
 /// value throughout (a load collapses it: `collapse_uniform`).
-pub(crate) fn check_piece<N: EngineNum>(keys: &KeySpace<N>, rt2: &Rt2<N>, cells: &[u32]) -> Result<()> {
+pub(crate) fn check_piece<N: Arithmetic>(keys: &KeySpace<N>, rt2: &Rt2<N>, cells: &[u32]) -> Result<()> {
     const CHUNK: usize = 1 << 15;
     ensure!(rt2.row_keys.len() == rt2.width && cells.len() == rt2.width, "check_piece: a block without its keys or cells");
     let lossy = |what: String| anyhow!("ROWS FROM KEYS: a piece of shape {:016x} does not decode from its keys and cells ({what}); its rows would be stored lossy", rt2.shape_hash);

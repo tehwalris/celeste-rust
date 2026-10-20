@@ -37,7 +37,7 @@ fn joinable<D: Domain>(a: &Value<D>, b: &Value<D>) -> bool {
 }
 
 /// A number of the domain's arithmetic, outside the domain.
-type Num<D> = <<D as Domain>::A as Arithmetic>::Num;
+type Num<D> = <D as Domain>::A;
 
 /// One or more `(state, thing)` outcomes; expressions return these too.
 pub type Multi<D, T> = Vec<(State<D>, T)>;

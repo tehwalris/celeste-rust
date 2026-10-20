@@ -28,10 +28,10 @@ pub enum Val<A: Arithmetic = Fixed> {
 }
 
 impl<A: Arithmetic> Val<A> {
-    pub fn exact_num(n: A::Num) -> Self {
+    pub fn exact_num(n: A) -> Self {
         Val::Num(A::point(n))
     }
-    fn as_exact(self) -> Option<A::Num> {
+    fn as_exact(self) -> Option<A> {
         match self {
             Val::Num(i) => A::as_point(i),
             Val::Bool(_) => None,
@@ -958,7 +958,7 @@ impl<A: GraphArith> Graph<A> {
                 // `min`/`max`, its tie rule included).
                 Op::Min | Op::Max => {
                     let ((xl, xh), (yl, yh)) = (A::bounds(a!(0).as_num("MinMax")?), A::bounds(a!(1).as_num("MinMax")?));
-                    let pick = |p: A::Num, q: A::Num| if matches!(node.op, Op::Min) { A::min(p, q) } else { A::max(p, q) };
+                    let pick = |p: A, q: A| if matches!(node.op, Op::Min) { A::min(p, q) } else { A::max(p, q) };
                     Val::Num(A::ival(pick(xl, yl), pick(xh, yh)))
                 }
                 // A tile against a literal, decided by the SET of tiles.
@@ -1028,7 +1028,7 @@ impl<A: GraphArith> Graph<A> {
                         tiles.insert(i as NodeId, set);
                         return Ok(set.hull());
                     };
-                    let whole = |v: A::Num, what: &str| A::as_i16(v).ok_or_else(|| anyhow!("mget: {what} is not an integer"));
+                    let whole = |v: A, what: &str| A::as_i16(v).ok_or_else(|| anyhow!("mget: {what} is not an integer"));
                     let t = CART.mget_whole(whole(xp, "x")?, whole(yp, "y")?);
                     Val::exact_num(A::from_i16(t as i16))
                 }
@@ -1167,7 +1167,7 @@ impl<A: GraphArith> Graph<A> {
         }
         let ((al, ah), (bl, bh)) = (A::bounds(x.as_num("compare")?), A::bounds(y.as_num("compare")?));
         // Decided iff the answer is the same for every pair in the boxes.
-        let all = |f: &dyn Fn(A::Num, A::Num) -> bool| -> Option<bool> {
+        let all = |f: &dyn Fn(A, A) -> bool| -> Option<bool> {
             let corners = [f(al, bl), f(al, bh), f(ah, bl), f(ah, bh)];
             // Order comparisons: corners bound the box; equality needs disjointness.
             if corners.iter().all(|c| *c) {
@@ -1242,7 +1242,7 @@ impl TileSet {
     }
 
     /// `mget == k` over the set: false if no tile is `k`, true if every one is.
-    fn eq<A: Arithmetic>(&self, k: A::Num) -> Option<bool> {
+    fn eq<A: Arithmetic>(&self, k: A) -> Option<bool> {
         let t = A::as_i16(k).filter(|t| (0..256).contains(t)).map(|t| t as usize);
         match t {
             Some(t) if self.contains(t) => (self.0.iter().map(|w| w.count_ones()).sum::<u32>() == 1).then_some(true),
@@ -1794,7 +1794,7 @@ mod tests {
 
 /// `Graph::fold`'s literal arithmetic: the exact result, or a panic naming
 /// the operation (`fold` cannot return an error; see there).
-fn checked<A: Arithmetic>(op: &str, r: Option<A::Num>, x: A::Num, y: A::Num) -> A::Num {
+fn checked<A: Arithmetic>(op: &str, r: Option<A>, x: A, y: A) -> A {
     r.unwrap_or_else(|| {
         panic!(
             "constant fold overflow: {op} of the literals {} and {} leaves {} (overflow is an error)",

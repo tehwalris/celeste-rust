@@ -7,7 +7,7 @@
 
 use anyhow::{Context, Result};
 
-use celeste_core::arith::{Arithmetic, EngineNum};
+use celeste_core::arith::Arithmetic;
 use celeste_engine::runtime2::{Rt2, P8};
 
 use crate::search::rem::Rem;
@@ -56,7 +56,7 @@ fn summit_flag((rx, ry): (i16, i16)) -> Option<(i16, i16, i16, i16)> {
 }
 
 /// Per lane: has it left the start room, or met the `win_rect`?
-pub(crate) fn exits_of<N: EngineNum>(rt2: &Rt2<N>, s: &crate::settings::Settings) -> Result<Vec<bool>> {
+pub(crate) fn exits_of<N: Arithmetic>(rt2: &Rt2<N>, s: &crate::settings::Settings) -> Result<Vec<bool>> {
     let ids = crate::compiled::ids();
     let lanes = rt2.width;
     if let Some((txl, txh, tyl, tyh)) = win_rect(s) {
@@ -82,7 +82,7 @@ pub(crate) fn exits_of<N: EngineNum>(rt2: &Rt2<N>, s: &crate::settings::Settings
 }
 
 /// Per lane: is the `room` global (`room.x`, `room.y`) = `(wx, wy)`?
-fn room_is<N: EngineNum>(rt2: &Rt2<N>, (wx, wy): (i16, i16)) -> Result<Vec<bool>> {
+fn room_is<N: Arithmetic>(rt2: &Rt2<N>, (wx, wy): (i16, i16)) -> Result<Vec<bool>> {
     use celeste_engine::runtime2::{Col, AV};
     let ids = crate::compiled::ids();
     let lanes = rt2.width;
@@ -90,7 +90,7 @@ fn room_is<N: EngineNum>(rt2: &Rt2<N>, (wx, wy): (i16, i16)) -> Result<Vec<bool>
         .global_target(ids.g_room)
         .ok_or_else(|| anyhow::anyhow!("wins: no `room` global"))?;
     let is = |f: u32, name: &str, want: i16| -> Result<Vec<bool>> {
-        let want = <N::A as Arithmetic>::from_i16(want);
+        let want = N::from_i16(want);
         let c = rt2.obj_field_cell(room, f).ok_or_else(|| anyhow::anyhow!("wins: room table has no {name} field"))?;
         Ok(match &rt2.cols[c as usize] {
             Col::U(AV::Num(n)) => vec![*n == want; lanes],
@@ -105,7 +105,7 @@ fn room_is<N: EngineNum>(rt2: &Rt2<N>, (wx, wy): (i16, i16)) -> Result<Vec<bool>
 
 /// Per lane: on the win target? The exit, plus the orb in the orb room,
 /// and in a 100% run the room's berry taken.
-pub fn wins_of<N: EngineNum>(rt2: &Rt2<N>, s: &crate::settings::Settings) -> Result<Vec<bool>> {
+pub fn wins_of<N: Arithmetic>(rt2: &Rt2<N>, s: &crate::settings::Settings) -> Result<Vec<bool>> {
     let mut wins = reaches_win(rt2, s)?;
     if s.category.hundred() {
         for (e, b) in wins.iter_mut().zip(got_fruit(rt2, s.room)?) {
@@ -116,7 +116,7 @@ pub fn wins_of<N: EngineNum>(rt2: &Rt2<N>, s: &crate::settings::Settings) -> Res
 }
 
 /// `wins_of` without its 100% condition.
-fn reaches_win<N: EngineNum>(rt2: &Rt2<N>, s: &crate::settings::Settings) -> Result<Vec<bool>> {
+fn reaches_win<N: Arithmetic>(rt2: &Rt2<N>, s: &crate::settings::Settings) -> Result<Vec<bool>> {
     use celeste_engine::runtime2::AV;
     let exits = exits_of(rt2, s)?;
     if win_rect(s).is_some() || !orb_required(s) {
@@ -126,7 +126,7 @@ fn reaches_win<N: EngineNum>(rt2: &Rt2<N>, s: &crate::settings::Settings) -> Res
     let has_orb: Vec<bool> = {
         let c = rt2.globals[ids.g_max_djump as usize];
         anyhow::ensure!(c != celeste_engine::runtime2::NONE, "wins: no `max_djump` global");
-        let two = <N::A as Arithmetic>::from_i16(2);
+        let two = N::from_i16(2);
         (0..lanes).map(|l| rt2.cols[c as usize].at(l) == AV::Num(two)).collect()
     };
     Ok(exits.iter().zip(&has_orb).map(|(e, o)| *e && *o).collect())
@@ -135,7 +135,7 @@ fn reaches_win<N: EngineNum>(rt2: &Rt2<N>, s: &crate::settings::Settings) -> Res
 /// Per lane: is start room `(x, y)`'s berry taken (`got_fruit[1 +
 /// level_index()]`, nil-padded)? An unknown (a coarse level) counts as
 /// taken: a win there over-approximates, and the exact level decides.
-pub(crate) fn got_fruit<N: EngineNum>(rt2: &Rt2<N>, (x, y): (i16, i16)) -> Result<Vec<bool>> {
+pub(crate) fn got_fruit<N: Arithmetic>(rt2: &Rt2<N>, (x, y): (i16, i16)) -> Result<Vec<bool>> {
     use celeste_engine::runtime2::{Cell2, Col, AV};
     let lanes = rt2.width;
     let g = celeste_names::gen::global_id("got_fruit").expect("`got_fruit` is a global name");
@@ -157,7 +157,7 @@ pub(crate) const ORB_MIN_FRAMES_AFTER_CHEST: u32 = 70;
 
 /// Per lane in the orb room: is the chest still CLOSED too late to win by
 /// `horizon` (the ceiling)? Such rows are not expanded.
-pub(crate) fn orb_deadline_skip<N: EngineNum>(rt2: &Rt2<N>, frame: u32, horizon: u32) -> Vec<bool> {
+pub(crate) fn orb_deadline_skip<N: Arithmetic>(rt2: &Rt2<N>, frame: u32, horizon: u32) -> Vec<bool> {
     use celeste_engine::runtime2::AV;
     let lanes = rt2.width;
     if frame + 1 + ORB_MIN_FRAMES_AFTER_CHEST <= horizon {
@@ -168,7 +168,7 @@ pub(crate) fn orb_deadline_skip<N: EngineNum>(rt2: &Rt2<N>, frame: u32, horizon:
         return vec![false; lanes];
     };
     let Some(c) = rt2.obj_field_cell(chest, ids.f_state) else { return vec![false; lanes] };
-    let zero = <N::A as Arithmetic>::from_i16(0);
+    let zero = N::from_i16(0);
     (0..lanes).map(|l| rt2.cols[c as usize].at(l) == AV::Num(zero)).collect()
 }
 
@@ -176,7 +176,7 @@ pub(crate) fn orb_deadline_skip<N: EngineNum>(rt2: &Rt2<N>, frame: u32, horizon:
 /// taken (`got_fruit` false, not unknown) and nothing left that holds or
 /// drops it - the fruit, the fly fruit (gone once it flew off), the key and
 /// its chest, a fake wall. Exact: every state the row stands for is lost.
-pub(crate) fn berry_lost<N: EngineNum>(rt2: &Rt2<N>, s: &crate::settings::Settings) -> Result<Vec<bool>> {
+pub(crate) fn berry_lost<N: Arithmetic>(rt2: &Rt2<N>, s: &crate::settings::Settings) -> Result<Vec<bool>> {
     let lanes = rt2.width;
     let ids = crate::compiled::ids();
     let sources = [ids.g_fruit, ids.g_fly_fruit, ids.g_key, ids.g_chest, ids.g_fake_wall];
@@ -194,7 +194,7 @@ pub(crate) fn berry_lost<N: EngineNum>(rt2: &Rt2<N>, s: &crate::settings::Settin
 /// rows' layer; `ceiling`: the tree's level -1 horizon. A state not
 /// expanded has no edges, so it is never re-pushed; one expanded is
 /// re-pushed whatever the orb's deadline says later: sound, less pruned.
-pub(crate) fn not_expanded<N: EngineNum>(b: &Rt2<N>, frame: u32, ceiling: Option<u32>, s: &crate::settings::Settings) -> Result<Vec<bool>> {
+pub(crate) fn not_expanded<N: Arithmetic>(b: &Rt2<N>, frame: u32, ceiling: Option<u32>, s: &crate::settings::Settings) -> Result<Vec<bool>> {
     let mut skip = exits_of(b, s)?;
     // Under a win rectangle a row that LEFT the room is no win, and its
     // shape has no kernel.
@@ -249,21 +249,21 @@ pub(crate) struct L1 {
 }
 
 /// What a forward filters by.
-pub(crate) struct Filters<'a, N: EngineNum = P8> {
+pub(crate) struct Filters<'a, N: Arithmetic = P8> {
     /// The coarser level's arc marks (the objects ladder).
     pub(crate) marks: Option<&'a MarkFilter<'a, N>>,
     pub(crate) minus_one: Option<L1>,
 }
 
-impl<N: EngineNum> Clone for Filters<'_, N> {
+impl<N: Arithmetic> Clone for Filters<'_, N> {
     fn clone(&self) -> Self {
         *self
     }
 }
 
-impl<N: EngineNum> Copy for Filters<'_, N> {}
+impl<N: Arithmetic> Copy for Filters<'_, N> {}
 
-impl<N: EngineNum> Default for Filters<'_, N> {
+impl<N: Arithmetic> Default for Filters<'_, N> {
     fn default() -> Self {
         Filters { marks: None, minus_one: None }
     }
@@ -275,13 +275,13 @@ impl<N: EngineNum> Default for Filters<'_, N> {
 /// coarse node winning from t with r (coarse over-approximates, r exact).
 /// The projection is keyed in the COARSE tree's key space (the marks'): a
 /// code it lacks is a state the coarse tree never reached.
-pub struct MarkFilter<'a, N: EngineNum = P8> {
+pub struct MarkFilter<'a, N: Arithmetic = P8> {
     marked: &'a Visited<N>,
     coarser: crate::abstraction::Level,
     clock: crate::settings::Clock,
 }
 
-impl<'a, N: EngineNum> MarkFilter<'a, N> {
+impl<'a, N: Arithmetic> MarkFilter<'a, N> {
     pub(crate) fn new(marked: &'a Visited<N>, coarser: crate::abstraction::Level, clock: crate::settings::Clock) -> Self {
         MarkFilter { marked, coarser, clock }
     }
@@ -313,13 +313,13 @@ impl<'a, N: EngineNum> MarkFilter<'a, N> {
 
 
 /// `rt2` projected IN PLACE onto `level`, as its kernels would store it.
-pub fn widen_rt2_to<N: EngineNum>(rt2: &mut Rt2<N>, level: crate::abstraction::Level) {
+pub fn widen_rt2_to<N: Arithmetic>(rt2: &mut Rt2<N>, level: crate::abstraction::Level) {
     rt2.widen_to(level);
 }
 
 /// Each lane's `(shape, key, cell)` at the `coarser` level (its node there)
 /// in the key space `keys` (`None`: a code the space lacks - no node).
-pub(crate) fn widened_keys<N: EngineNum>(
+pub(crate) fn widened_keys<N: Arithmetic>(
     rt2: &Rt2<N>,
     coarser: crate::abstraction::Level,
     keys: &celeste_engine::exact::KeySpace<N>,
@@ -941,7 +941,7 @@ pub(crate) fn mark_row(shape: u64, key: (u64, u64), cell: u32, deadline: u16, ho
 
 /// A marks file (`Visited::save`) from its rows, in any order, each state
 /// once, with the key space its keys are in.
-pub(crate) fn save_marks<N: EngineNum>(path: &std::path::Path, mut rows: Vec<MarkRow>, horizon: u32, keys: &celeste_engine::exact::KeySpace<N>) -> Result<()> {
+pub(crate) fn save_marks<N: Arithmetic>(path: &std::path::Path, mut rows: Vec<MarkRow>, horizon: u32, keys: &celeste_engine::exact::KeySpace<N>) -> Result<()> {
     rows.sort_unstable();
     crate::storage::file::save_value(path, &(rows, horizon, keys.to_additions()))
 }
@@ -955,20 +955,20 @@ pub(crate) fn load_marks(path: &std::path::Path) -> Result<(Vec<MarkRow>, u32, c
 /// An in-memory set of states `(shape, cell, key)` (a level's MARKED states
 /// or a diagnostic's), saved as a marks file; its keys are in the key space
 /// of the tree it names.
-pub(crate) struct Visited<N: EngineNum = P8> {
+pub(crate) struct Visited<N: Arithmetic = P8> {
     /// Sharded by (shape, cell); each key maps to its DEADLINE, the last frame
     /// from which it still wins by the horizon (`u16::MAX`: none).
     shards: rustc_hash::FxHashMap<(u64, u32), rustc_hash::FxHashMap<(u64, u64), u16>>,
     keys: celeste_engine::exact::KeySpace<N>,
 }
 
-impl<N: EngineNum> Default for Visited<N> {
+impl<N: Arithmetic> Default for Visited<N> {
     fn default() -> Self {
         Visited { shards: Default::default(), keys: Default::default() }
     }
 }
 
-impl<N: EngineNum> Visited<N> {
+impl<N: Arithmetic> Visited<N> {
     /// An empty set over the key space `keys`.
     pub(crate) fn new(keys: celeste_engine::exact::KeySpace<N>) -> Self {
         Visited { shards: Default::default(), keys }
@@ -1060,7 +1060,7 @@ impl Visited {
 }
 
 /// The first win of a tree complete through `horizon`; `None` if it is not.
-pub(crate) fn tree_first_win_through<N: EngineNum>(dir: &std::path::Path, horizon: u32) -> Result<Option<Option<u32>>> {
+pub(crate) fn tree_first_win_through<N: Arithmetic>(dir: &std::path::Path, horizon: u32) -> Result<Option<Option<u32>>> {
     let done = crate::storage::record::done_frame(dir);
     if done.is_none_or(|d| d < horizon) || !crate::storage::layer::frame_exists(dir, horizon) {
         return Ok(None);

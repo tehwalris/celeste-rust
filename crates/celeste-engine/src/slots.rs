@@ -10,7 +10,7 @@
 //! walk dereferences BETWEEN steps but not at the end: the last step lands
 //! on the `Val` cell holding the scalar, the cell a kernel reads and writes.
 
-use celeste_core::arith::EngineNum;
+use celeste_core::arith::Arithmetic;
 
 use crate::runtime2::{Cell2, Col, Rt2, AV, NONE};
 
@@ -33,7 +33,7 @@ pub enum Step {
 /// is already a table is returned unchanged, so this is idempotent.
 /// (The global `objects` and the array it points at both answer to the
 /// name `objects`; callers comparing ids need to pick one.)
-pub fn deref<N: EngineNum>(rt2: &Rt2<N>, cell: u32) -> Result<u32, String> {
+pub fn deref<N: Arithmetic>(rt2: &Rt2<N>, cell: u32) -> Result<u32, String> {
     match (&rt2.structure[cell as usize], &rt2.cols[cell as usize]) {
         (Cell2::Val, Col::U(AV::Ptr(t))) => Ok(*t),
         (Cell2::Val, Col::V(vs)) => {
@@ -55,7 +55,7 @@ pub fn deref<N: EngineNum>(rt2: &Rt2<N>, cell: u32) -> Result<u32, String> {
 }
 
 /// The canonical cell id a path names in this block.
-pub fn resolve_steps<N: EngineNum>(rt2: &Rt2<N>, p: &[Step]) -> Result<u32, String> {
+pub fn resolve_steps<N: Arithmetic>(rt2: &Rt2<N>, p: &[Step]) -> Result<u32, String> {
     let mut cur: Option<u32> = None;
     for step in p {
         cur = Some(match (cur, step) {
@@ -126,7 +126,7 @@ fn kind<N>(c: &Cell2<N>) -> &'static str {
 /// Structure, globals and pointer columns (what a shape determines) carry
 /// over; every other value cell starts `AV::Nil`. Not a clone: `Rt2` is
 /// deliberately not `Clone`, and the values are dropped on purpose.
-pub fn reshape<N: EngineNum>(src: &Rt2<N>, width: usize) -> Rt2<N> {
+pub fn reshape<N: Arithmetic>(src: &Rt2<N>, width: usize) -> Rt2<N> {
     let mut b = Rt2::empty(
         width,
         src.globals.len(),

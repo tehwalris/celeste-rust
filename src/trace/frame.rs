@@ -36,7 +36,7 @@ pub struct FrameOut<A: GraphArith = Fixed> {
     /// The ENGINE structure of this outcome's end state, and the cell each of
     /// `fields`/`ubool` lands on: NOT comparable with `Frame::in_cells` unless
     /// the shape was kept.
-    pub rt2: celeste_engine::runtime2::Rt2<A::Num>,
+    pub rt2: celeste_engine::runtime2::Rt2<A>,
     pub cells: Vec<u32>,
     pub ubool_cells: Vec<u32>,
     /// The state itself, so a shape walk can step forward from it.
@@ -95,7 +95,7 @@ pub struct Frame<A: GraphArith = Fixed> {
     /// engine's numbering for `Op::Cell(i)`.
     pub in_cells: Vec<u32>,
     /// The engine structure of that state, the block shape a kernel runs on.
-    pub in_rt2: celeste_engine::runtime2::Rt2<A::Num>,
+    pub in_rt2: celeste_engine::runtime2::Rt2<A>,
 }
 
 /// Every scalar the frame ends with, as graph nodes, split into data and the

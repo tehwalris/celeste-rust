@@ -9,7 +9,7 @@
 //! witness, the same at any thread count (chunks merge in order).
 
 use anyhow::{ensure, Result};
-use celeste_core::arith::{Arithmetic, EngineNum};
+use celeste_core::arith::Arithmetic;
 use celeste_engine::exact::{ExactRow, KeySpace};
 use celeste_engine::runtime2::Rt2;
 use rustc_hash::FxHashSet;
@@ -290,7 +290,7 @@ impl<N: Rem> Side<'_, N> {
 pub(super) struct Single<'s, 'a, N: Rem>(pub &'s Side<'a, N>);
 
 impl<N: Rem> Concrete for Single<'_, '_, N> {
-    type Engine = ReferenceEngine<N::A>;
+    type Engine = ReferenceEngine<N>;
     type State = Rt2<N>;
     type Key = ExactRow;
     type Label = u32;
@@ -391,7 +391,7 @@ impl<'w, C: Circle> NodeKeys<'w, C> {
 
 /// A concrete state's node key at `level` (`lookup_view`, widened) in the
 /// tree's key space (`None`: a code the tree never stored - no node).
-pub(super) fn lookup_keys<N: EngineNum>(b: &Rt2<N>, level: Level, seeded: bool, keys: &KeySpace<N>) -> Result<(u64, Vec<Option<(u64, u64)>>, Vec<u32>)> {
+pub(super) fn lookup_keys<N: Arithmetic>(b: &Rt2<N>, level: Level, seeded: bool, keys: &KeySpace<N>) -> Result<(u64, Vec<Option<(u64, u64)>>, Vec<u32>)> {
     if !seeded {
         return crate::frame::widened_keys(b, level, keys);
     }
@@ -400,7 +400,7 @@ pub(super) fn lookup_keys<N: EngineNum>(b: &Rt2<N>, level: Level, seeded: bool, 
 
 /// A concrete state's EXACT identity: canonical bytes (`exact::exact_rows`)
 /// and cell, never the widened key (sharing it need not share a fate).
-pub(super) fn exact_state<N: EngineNum>(b: &Rt2<N>, cell: u32) -> ExactRow {
+pub(super) fn exact_state<N: Arithmetic>(b: &Rt2<N>, cell: u32) -> ExactRow {
     let mut v = celeste_engine::exact::exact_rows(b).swap_remove(0).into_vec();
     v.extend_from_slice(&cell.to_le_bytes());
     v.into_boxed_slice()
@@ -410,7 +410,7 @@ pub(super) fn exact_state<N: EngineNum>(b: &Rt2<N>, cell: u32) -> ExactRow {
 /// seeded balloons, each balloon's phase (a number) and `y` (a point) mapped
 /// to the tree's phase `[0, 1)` and bob `y` `[start - 2, start + 2]`, so its
 /// key is the node that over-approximates the state.
-pub(super) fn lookup_view<N: EngineNum>(row: &Rt2<N>, seeded: bool) -> Result<Rt2<N>> {
+pub(super) fn lookup_view<N: Arithmetic>(row: &Rt2<N>, seeded: bool) -> Result<Rt2<N>> {
     use celeste_engine::runtime2::{Col, AV};
     use celeste_engine::widening::{BALLOON_BOB_RAW, BALLOON_PERIOD_RAW};
     let mut rt2 = row.clone_block();
@@ -418,13 +418,13 @@ pub(super) fn lookup_view<N: EngineNum>(row: &Rt2<N>, seeded: bool) -> Result<Rt
         return Ok(rt2);
     }
     let ids = crate::compiled::ids();
-    let num = <N::A as Arithmetic>::from_fixed_raw;
+    let num = N::from_fixed_raw;
     for obj in rt2.objects_of_type(ids.g_balloon) {
         let (Some(oc), Some(yc), Some(sc)) = (rt2.obj_field_cell(obj, ids.f_offset), rt2.obj_field_cell(obj, ids.f_y), rt2.obj_field_cell(obj, ids.f_start)) else { continue };
         let AV::Num(start) = rt2.cols[sc as usize].at(0) else { anyhow::bail!("a balloon's `start` is not a number") };
         let bob = |f: fn(N, N) -> Option<N>| f(start, num(BALLOON_BOB_RAW)).ok_or_else(|| anyhow::anyhow!("a balloon's bob out of range"));
         rt2.cols[oc as usize] = Col::U(AV::Ival(num(0), num(BALLOON_PERIOD_RAW)));
-        rt2.cols[yc as usize] = Col::U(AV::Ival(bob(<N::A as Arithmetic>::sub)?, bob(<N::A as Arithmetic>::add)?));
+        rt2.cols[yc as usize] = Col::U(AV::Ival(bob(N::sub)?, bob(N::add)?));
     }
     Ok(rt2)
 }
@@ -444,7 +444,7 @@ pub(crate) fn rem_raw<N: Rem>(rt2: &Rt2<N>) -> Result<Option<(N, N)>> {
 /// A concrete state's remainder as a torus point (no player: the start's).
 pub(crate) fn rem_of<N: Rem>(rt2: &Rt2<N>) -> Result<(Point<N>, Point<N>)> {
     let Some((x, y)) = rem_raw(rt2)? else { return Ok(super::rem::start_point::<N>()) };
-    let at = |n: N| N::point(n).ok_or_else(|| anyhow::anyhow!("a remainder {n:?} outside [-1/2, 1/2)"));
+    let at = |n: N| N::rem_point(n).ok_or_else(|| anyhow::anyhow!("a remainder {n:?} outside [-1/2, 1/2)"));
     Ok((at(x)?, at(y)?))
 }
 
@@ -452,9 +452,9 @@ pub(crate) fn rem_of<N: Rem>(rt2: &Rt2<N>) -> Result<(Point<N>, Point<N>)> {
 /// whether they run seeded (`Settings::concrete`): seeds fix the balloons'
 /// phases, so a run is one real run, while the tree and W keep the phase an
 /// interval, sound for every seed (`lookup_view`).
-pub(super) fn concrete_engines<N: Rem>(n: usize, run: &Settings) -> Result<(Vec<ReferenceEngine<N::A>>, bool)> {
+pub(super) fn concrete_engines<N: Rem>(n: usize, run: &Settings) -> Result<(Vec<ReferenceEngine<N>>, bool)> {
     let (s, seeded) = run.concrete();
-    let engines = (0..n).map(|_| ReferenceEngine::<N::A>::new(&s)).collect::<Result<Vec<_>>>()?;
+    let engines = (0..n).map(|_| ReferenceEngine::<N>::new(&s)).collect::<Result<Vec<_>>>()?;
     Ok((engines, seeded))
 }
 

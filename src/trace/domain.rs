@@ -129,7 +129,7 @@ pub trait Domain: Clone + Default {
     type Num: Clone + Debug + PartialEq;
     type Bool: Clone + Debug + PartialEq;
 
-    fn num(&mut self, v: <Self::A as Arithmetic>::Num) -> Self::Num;
+    fn num(&mut self, v: Self::A) -> Self::Num;
     fn int(&mut self, k: i16) -> Self::Num {
         self.num(Self::A::from_i16(k))
     }
@@ -176,7 +176,7 @@ pub trait Domain: Clone + Default {
     fn unknown_bool(&mut self) -> Result<Self::Bool>;
 
     /// A number known only to lie in `[lo, hi]` (`rnd`).
-    fn range_num(&mut self, lo: <Self::A as Arithmetic>::Num, hi: <Self::A as Arithmetic>::Num) -> Result<Self::Num>;
+    fn range_num(&mut self, lo: Self::A, hi: Self::A) -> Result<Self::Num>;
 
     fn node_count(&self) -> usize {
         0
@@ -184,7 +184,7 @@ pub trait Domain: Clone + Default {
 
     /// A number this value definitely is. Needed where the HEAP depends on it
     /// (index, key, loop bound); unknown is a refusal.
-    fn as_const(&self, v: &Self::Num) -> Option<<Self::A as Arithmetic>::Num>;
+    fn as_const(&self, v: &Self::Num) -> Option<Self::A>;
 
     /// What this number IS, for a message: its value where known.
     fn describe(&self, v: &Self::Num) -> String;
@@ -287,7 +287,7 @@ fn overflow<A: Arithmetic>(what: String) -> anyhow::Error {
 }
 
 /// `op` of two constants: the exact result, or `overflow`.
-fn fold_arith<A: Arithmetic>(op: Arith, a: A::Num, b: A::Num) -> Result<A::Num> {
+fn fold_arith<A: Arithmetic>(op: Arith, a: A, b: A) -> Result<A> {
     let (r, sym) = match op {
         Arith::Add => (A::add(a, b), "+"),
         Arith::Sub => (A::sub(a, b), "-"),
@@ -299,7 +299,7 @@ fn fold_arith<A: Arithmetic>(op: Arith, a: A::Num, b: A::Num) -> Result<A::Num> 
 }
 
 /// `f` of a constant, as `fold_arith`.
-fn fold_fun1<A: Arithmetic>(f: Fun1, a: A::Num) -> Result<A::Num> {
+fn fold_fun1<A: Arithmetic>(f: Fun1, a: A) -> Result<A> {
     Ok(match f {
         Fun1::Neg => A::neg(a).ok_or_else(|| overflow::<A>(format!("-{}", A::show(a))))?,
         Fun1::Abs => A::abs(a).ok_or_else(|| overflow::<A>(format!("abs({})", A::show(a))))?,
@@ -308,14 +308,14 @@ fn fold_fun1<A: Arithmetic>(f: Fun1, a: A::Num) -> Result<A::Num> {
     })
 }
 
-fn fold_fun2<A: Arithmetic>(f: Fun2, a: A::Num, b: A::Num) -> A::Num {
+fn fold_fun2<A: Arithmetic>(f: Fun2, a: A, b: A) -> A {
     match f {
         Fun2::Min => A::min(a, b),
         Fun2::Max => A::max(a, b),
     }
 }
 
-fn fold_compare<A: Arithmetic>(op: Cmp, a: A::Num, b: A::Num) -> bool {
+fn fold_compare<A: Arithmetic>(op: Cmp, a: A, b: A) -> bool {
     match op {
         Cmp::Lt => A::lt(a, b),
         Cmp::Le => A::le(a, b),
@@ -867,7 +867,7 @@ impl<A: GraphArith> Symbolic<A> {
     fn prologue(
         &mut self,
         args: &[NodeId],
-        point: impl FnOnce(&mut Self, &[A::Num]) -> Result<NodeId>,
+        point: impl FnOnce(&mut Self, &[A]) -> Result<NodeId>,
         unknown: impl FnOnce(&mut Self, bool) -> NodeId,
         again: impl Fn(&mut Self, &[NodeId]) -> Result<NodeId>,
     ) -> Result<Option<NodeId>> {
@@ -891,11 +891,11 @@ impl<A: GraphArith> Symbolic<A> {
         Ok(None)
     }
 
-    fn konst(&mut self, v: A::Num) -> NodeId {
+    fn konst(&mut self, v: A) -> NodeId {
         let l = A::lit(v);
         self.graph.leaf(Op::Const(l, l))
     }
-    fn as_point(&self, n: NodeId) -> Option<A::Num> {
+    fn as_point(&self, n: NodeId) -> Option<A> {
         match self.graph.get(n).op {
             Op::Const(lo, hi) if lo == hi => Some(A::from_lit(lo)),
             _ => None,
@@ -908,7 +908,7 @@ impl<A: GraphArith> Domain for Symbolic<A> {
     type Num = NodeId;
     type Bool = NodeId;
 
-    fn num(&mut self, v: A::Num) -> NodeId {
+    fn num(&mut self, v: A) -> NodeId {
         self.konst(v)
     }
     fn boolean(&mut self, b: bool) -> NodeId {
@@ -966,7 +966,7 @@ impl<A: GraphArith> Domain for Symbolic<A> {
         // With an unknown number nothing is decided: a countdown's atom where
         // the number is a countdown's, or nothing else is unknown.
         let unknown = |d: &mut Self, countdown: bool| if countdown || !d.level.fruit { d.countdown_atom() } else { d.unknown_bool_atom() };
-        let point = |d: &mut Self, x: &[A::Num]| Ok(d.graph.leaf(Op::ConstBool(fold_compare::<A>(op, x[0], x[1]))));
+        let point = |d: &mut Self, x: &[A]| Ok(d.graph.leaf(Op::ConstBool(fold_compare::<A>(op, x[0], x[1]))));
         if let Some(n) = self.prologue(&[*a, *b], point, unknown, |d, x| d.compare(op, &x[0], &x[1]))? {
             return Ok(n);
         }
@@ -1021,7 +1021,7 @@ impl<A: GraphArith> Domain for Symbolic<A> {
     ) -> Result<NodeId> {
         Ok(self.graph.fold(Op::TileFlagAt, vec![*x, *y, *w, *h, *flag]))
     }
-    fn range_num(&mut self, lo: A::Num, hi: A::Num) -> Result<NodeId> {
+    fn range_num(&mut self, lo: A, hi: A) -> Result<NodeId> {
         Ok(self.graph.leaf(Op::Const(A::lit(lo), A::lit(hi))))
     }
     /// A button: a fork both of whose configurations every lane takes.
@@ -1245,7 +1245,7 @@ impl<A: GraphArith> Domain for Symbolic<A> {
         Ok(self.unknown_bool_atom())
     }
 
-    fn as_const(&self, v: &NodeId) -> Option<A::Num> {
+    fn as_const(&self, v: &NodeId) -> Option<A> {
         self.as_point(*v)
     }
 

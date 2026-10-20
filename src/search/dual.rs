@@ -74,7 +74,7 @@ struct Pairs<'a, X: Rem, F: Rem> {
 }
 
 impl<X: Rem, F: Rem> Concrete for Pairs<'_, X, F> {
-    type Engine = (ReferenceEngine<X::A>, ReferenceEngine<F::A>);
+    type Engine = (ReferenceEngine<X>, ReferenceEngine<F>);
     type State = Pair<X, F>;
     type Key = Key;
     type Label = bool;

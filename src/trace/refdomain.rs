@@ -121,7 +121,7 @@ impl<A: Arithmetic> Domain for RefDomain<A> {
     type Num = A::Ival;
     type Bool = bool;
 
-    fn num(&mut self, v: A::Num) -> A::Ival {
+    fn num(&mut self, v: A) -> A::Ival {
         A::point(v)
     }
     fn boolean(&mut self, b: bool) -> bool {
@@ -244,11 +244,11 @@ impl<A: Arithmetic> Domain for RefDomain<A> {
         Ok(self.cursor.choose(2) == 1)
     }
 
-    fn range_num(&mut self, lo: A::Num, hi: A::Num) -> Result<A::Ival> {
+    fn range_num(&mut self, lo: A, hi: A) -> Result<A::Ival> {
         Ok(A::ival(lo, hi))
     }
 
-    fn as_const(&self, v: &A::Ival) -> Option<A::Num> {
+    fn as_const(&self, v: &A::Ival) -> Option<A> {
         A::as_point(*v)
     }
 

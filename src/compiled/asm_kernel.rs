@@ -9,7 +9,7 @@ use std::os::raw::c_void;
 
 use anyhow::{Context, Result};
 
-use celeste_core::arith::{Arithmetic, EngineNum};
+use celeste_core::arith::Arithmetic;
 use celeste_core::pico8_num::Pico8Num as P8;
 use celeste_engine::exact::{Code, KeySpace, Provisional, ShapeRecord};
 use celeste_engine::runtime2::{Col, Rt2, AV};
@@ -140,7 +140,7 @@ impl DupRef {
 }
 
 /// An accumulator column: a uniform constant or an empty typed vector.
-enum ColInit<N: EngineNum = P8> {
+enum ColInit<N: Arithmetic = P8> {
     Uniform(AV<N>),
     EmptyNum,
     EmptyBool,
@@ -149,7 +149,7 @@ enum ColInit<N: EngineNum = P8> {
 
 /// A per-outcome accumulator recipe (skeleton, column inits, the boundary's
 /// constants), so the append emits rows already at the boundary.
-struct AccTemplate<N: EngineNum = P8> {
+struct AccTemplate<N: Arithmetic = P8> {
     skeleton: Rt2<N>,
     inits: Vec<(usize, ColInit<N>)>,
     shape_hash: u64,
@@ -165,7 +165,7 @@ struct AccTemplate<N: EngineNum = P8> {
     union: std::sync::Arc<Rt2<N>>,
 }
 
-impl<N: EngineNum> AccTemplate<N> {
+impl<N: Arithmetic> AccTemplate<N> {
     fn build(&self) -> Rt2<N> {
         let mut b = reshape(&self.skeleton, 0);
         for (c, init) in &self.inits {
@@ -214,7 +214,7 @@ struct AsmKernel<N: KernelLanes = P8> {
     body_cols: Vec<BodyCols<N>>,
     /// The fused graph, roots and room for `explain_error`; empty unless
     /// `--kernel-explain` (`BuildOptions::keep_graphs`; gigabytes per set).
-    fused: crate::transpile::graph::Graph<N::A>,
+    fused: crate::transpile::graph::Graph<N>,
     flat_roots: Vec<crate::transpile::graph::NodeId>,
     room: Room,
     fused_nodes: usize,
@@ -370,15 +370,9 @@ impl<N: KernelLanes> AsmKernel<N> {
     /// On a decline: print the `error` disjuncts not false for `lane`.
     fn explain_error(&self, chunk: &Rt2<N>, lane: usize, error_node: crate::transpile::graph::NodeId) {
         use crate::transpile::graph::{Op, Val};
-        let mut cells: std::collections::HashMap<u32, Val<N::A>> = Default::default();
+        let mut cells: std::collections::HashMap<u32, Val<N>> = Default::default();
         for &cell in &self.compiled.input_cells {
-            let v = match chunk.cols[cell as usize].at(lane) {
-                AV::Num(p) => Val::Num(<N::A as Arithmetic>::point(p)),
-                AV::Ival(a, b) => Val::Num(<N::A as Arithmetic>::ival(a, b)),
-                AV::Bool(b) => Val::Bool(Some(b)),
-                AV::UBool => Val::Bool(None),
-                _ => continue,
-            };
+            let v = match chunk.cols[cell as usize].at(lane) {AV::Num(p) => Val::Num(N::point(p)), AV::Ival(a, b) => Val::Num(N::ival(a, b)), AV::Bool(b) => Val::Bool(Some(b)), AV::UBool => Val::Bool(None), _ => continue};
             cells.insert(cell, v);
         }
         let vals = match self.fused.eval(&cells, Eval::NarrowTop, Some(&self.room)) {
@@ -642,7 +636,7 @@ impl<N: KernelLanes> Scratch<N> {
 }
 
 /// A body's roots by kind with their union columns, plus its uniform cells.
-struct BodyCols<N: EngineNum = P8> {
+struct BodyCols<N: Arithmetic = P8> {
     num: Vec<(usize, usize)>,
     ival: Vec<(usize, usize)>,
     /// A NUMBER root into a union `Ival` column, stored `[v, v]`.
@@ -749,7 +743,7 @@ impl<N: KernelLanes> BodyCols<N> {
 }
 
 /// One input column of a call, resolved to what the packer copies from.
-enum InputView<'c, N: EngineNum = P8> {
+enum InputView<'c, N: Arithmetic = P8> {
     Num(&'c [N]),
     NumU(N::Raw),
     Ival(&'c [(N, N)]),
@@ -763,7 +757,7 @@ enum InputView<'c, N: EngineNum = P8> {
     Any(&'c Col<N>, Ty),
 }
 
-impl<'c, N: EngineNum> InputView<'c, N> {
+impl<'c, N: Arithmetic> InputView<'c, N> {
     fn of(col: &'c Col<N>, repr: Ty) -> Result<Self, String> {
         Ok(match (repr, col) {
             (Ty::Num, Col::N(v)) => InputView::Num(v),
@@ -835,7 +829,7 @@ pub(crate) fn key_check<N: crate::search::rem::Rem>(slot: &crate::storage::unit:
 /// `--key-check` on a block the forward STORES (a layer's piece,
 /// `storage::wave::gather_layer`): the boundary over a copy keeps its shape
 /// and structure, and the key space keys its rows as stored.
-pub(crate) fn key_check_block<N: celeste_core::arith::EngineNum>(blk: &Rt2<N>, keys: &KeySpace<N>) {
+pub(crate) fn key_check_block<N: celeste_core::arith::Arithmetic>(blk: &Rt2<N>, keys: &KeySpace<N>) {
     let mut b = blk.clone_block();
     b.boundary_canonicalize();
     let got: Vec<Option<(u64, u64)>> = keys.lookup_keys(&b);
@@ -851,14 +845,14 @@ pub(crate) fn key_check_block<N: celeste_core::arith::EngineNum>(blk: &Rt2<N>, k
     );
 }
 
-fn num_raw<N: EngineNum>(av: AV<N>) -> N::Raw {
+fn num_raw<N: Arithmetic>(av: AV<N>) -> N::Raw {
     match av {
         AV::Num(p) => p.raw(),
         other => panic!("ASM num input got {other:?}"),
     }
 }
 
-fn ival_raw<N: EngineNum>(av: AV<N>) -> (N::Raw, N::Raw) {
+fn ival_raw<N: Arithmetic>(av: AV<N>) -> (N::Raw, N::Raw) {
     match av {
         AV::Ival(a, b) => (a.raw(), b.raw()),
         AV::Num(p) => (p.raw(), p.raw()),
@@ -976,7 +970,7 @@ impl<N: KernelLanes> Registry<N> {
         };
         let build = &build;
         let t_trace = std::time::Instant::now();
-        let refs = crate::trace::lower::lattice_kernel_refs::<N::A>(opts, s)
+        let refs = crate::trace::lower::lattice_kernel_refs::<N>(opts, s)
             .context("retracing the start room for ASM kernels")?;
         let trace_s = t_trace.elapsed().as_secs_f64();
         let t_asm = std::time::Instant::now();
@@ -1015,7 +1009,7 @@ impl<N: KernelLanes> Registry<N> {
 }
 
 /// The type of a typed column (or of a uniform value one could hold).
-fn kind_of<N: EngineNum>(col: &Col<N>) -> Option<Ty> {
+fn kind_of<N: Arithmetic>(col: &Col<N>) -> Option<Ty> {
     match col {
         Col::N(_) | Col::U(AV::Num(_)) => Some(Ty::Num),
         Col::I(_) | Col::U(AV::Ival(..)) => Some(Ty::Ival),
@@ -1024,7 +1018,7 @@ fn kind_of<N: EngineNum>(col: &Col<N>) -> Option<Ty> {
     }
 }
 
-fn typed<N: EngineNum>(kind: Ty) -> Col<N> {
+fn typed<N: Arithmetic>(kind: Ty) -> Col<N> {
     match kind {
         Ty::Num => Col::N(Vec::new()),
         Ty::Ival => Col::I(Vec::new()),
@@ -1122,7 +1116,7 @@ fn apply_union<N: KernelLanes>(kernel: &mut AsmKernel<N>, unions: &HashMap<u64, 
 
 /// Assemble ONE frame (gcc + dlopen) and map its bodies onto output slots;
 /// `tag` distinguishes a shape's region kernels.
-fn build_one_shape<N: KernelLanes>(r: &crate::trace::lower::LoweredFrame<N::A>, si: usize, tag: &str, build: &BuildOptions) -> Result<(u64, AsmKernel<N>)> {
+fn build_one_shape<N: KernelLanes>(r: &crate::trace::lower::LoweredFrame<N>, si: usize, tag: &str, build: &BuildOptions) -> Result<(u64, AsmKernel<N>)> {
     let shape = r.frame.in_rt2.shape_hash_of();
     let room = Room { cache: r.cache.clone() };
     let t_fuse = std::time::Instant::now();
@@ -1328,7 +1322,7 @@ fn dup_refs(bodies: &mut [AsmBody], reads: &[emit::BodyReads]) -> DupPairs {
 
 /// Where a body's rows get player and room `x`/`y`; `None` (`NO_CELL`)
 /// without a numeric player position, as `pos_graph::block_cells`.
-fn pos_sources<N: EngineNum>(template: &Rt2<N>, fields: &[AsmField]) -> Result<Option<[PosSrc; 4]>> {
+fn pos_sources<N: Arithmetic>(template: &Rt2<N>, fields: &[AsmField]) -> Result<Option<[PosSrc; 4]>> {
     let ids = crate::compiled::ids();
     let Some(obj) = crate::search::pos_graph::player_object(template) else {
         return Ok(None);
@@ -1371,7 +1365,7 @@ fn pos_sources<N: EngineNum>(template: &Rt2<N>, fields: &[AsmField]) -> Result<O
 
 /// The accumulator recipe for one outcome, with `shape_hash` and its key's
 /// uniform fields.
-fn acc_template<N: KernelLanes>(r: &crate::trace::lower::LoweredFrame<N::A>, oi: usize) -> Result<AccTemplate<N>> {
+fn acc_template<N: KernelLanes>(r: &crate::trace::lower::LoweredFrame<N>, oi: usize) -> Result<AccTemplate<N>> {
     // Canonical: `block::skeleton` ends in `Rt2::canonicalize_ids`.
     let skeleton = reshape(&r.frame.outs[oi].rt2, 0);
     let shape_hash = skeleton.shape_hash_of();
@@ -1546,7 +1540,7 @@ fn build_registry_for_level<N: KernelLanes>(level: crate::abstraction::Level, s:
         .expect("asm-kernel builder panicked");
     match built {
         Ok(reg) => {
-            eprintln!("ASM kernels ENABLED ({level}, {}): {} start-room shapes assembled", <N::A as Arithmetic>::NAME, reg.len());
+            eprintln!("ASM kernels ENABLED ({level}, {}): {} start-room shapes assembled", N::NAME, reg.len());
             reg
         }
         Err(e) => panic!("building ASM kernels for {level}: {e:#}"),

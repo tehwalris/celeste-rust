@@ -38,12 +38,12 @@ pub(crate) struct OutField<A: GraphArith = Fixed> {
     /// A field stored as a uniform value no graph constant names (the unknown
     /// number): the key takes it from the constant key prefix, so it is off the
     /// per-lane fold (or the folded key disagrees with `b.row_keys`).
-    pub(crate) widen_uniform: Option<celeste_engine::runtime2::AV<A::Num>>,
+    pub(crate) widen_uniform: Option<celeste_engine::runtime2::AV<A>>,
     /// The `AV` this cell holds in every row, when every body of the outcome
     /// writes the same compile-time constant: written once as `Col::U`, skipped
     /// by the dedup fold. The boundary must key by THIS value (the traced
     /// skeleton leaves every scalar `Nil`).
-    pub(crate) konst_av: Option<celeste_engine::runtime2::AV<A::Num>>,
+    pub(crate) konst_av: Option<celeste_engine::runtime2::AV<A>>,
 }
 
 pub(crate) struct OutFields<A: GraphArith = Fixed> {

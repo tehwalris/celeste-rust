@@ -24,7 +24,7 @@ use std::sync::Arc;
 
 use anyhow::{anyhow, bail, ensure, Result};
 use celeste_core::collision_cache::CollisionCache;
-use celeste_core::arith::{Arithmetic, EngineNum};
+use celeste_core::arith::Arithmetic;
 use celeste_engine::runtime2::{Cell2, Col, Rt2, AV, NONE};
 use celeste_names as gen;
 
@@ -38,7 +38,7 @@ pub const BUTTON_GLOBAL: &str = "__button_states";
 /// The block of `st`, one lane: its structure, and its values by `num` and
 /// `boolean` (the domain's part). Canonical cell order, its shape hash set,
 /// no row keys.
-pub fn to_rt2<D: Domain, N: EngineNum>(
+pub fn to_rt2<D: Domain, N: Arithmetic>(
     st: &State<D>,
     cache: Arc<CollisionCache>,
     num: impl Fn(&D::Num) -> Result<AV<N>>,
@@ -83,7 +83,7 @@ pub fn to_rt2<D: Domain, N: EngineNum>(
 /// The tracer's block of `st`: its shape, every number and boolean `Nil`
 /// (the kernels compute them). What a traced frame's input and outcomes bind
 /// against.
-pub fn skeleton<D: Domain, N: EngineNum>(st: &State<D>, cache: Arc<CollisionCache>) -> Result<Rt2<N>> {
+pub fn skeleton<D: Domain, N: Arithmetic>(st: &State<D>, cache: Arc<CollisionCache>) -> Result<Rt2<N>> {
     to_rt2(st, cache, |_| Ok(AV::Nil), |_| Ok(AV::Nil))
 }
 
@@ -119,7 +119,7 @@ pub fn dense_ints<D: Domain>(st: &mut State<D>) -> Result<()> {
     Ok(())
 }
 
-struct ToRt2<'a, D: Domain, E: EngineNum, N, B> {
+struct ToRt2<'a, D: Domain, E: Arithmetic, N, B> {
     st: &'a State<D>,
     rt2: Rt2<E>,
     tables: HashMap<TableId, u32>,
@@ -130,7 +130,7 @@ struct ToRt2<'a, D: Domain, E: EngineNum, N, B> {
     boolean: B,
 }
 
-impl<D: Domain, E: EngineNum, N, B> ToRt2<'_, D, E, N, B>
+impl<D: Domain, E: Arithmetic, N, B> ToRt2<'_, D, E, N, B>
 where
     N: Fn(&D::Num) -> Result<AV<E>>,
     B: Fn(&D::Bool) -> Result<AV<E>>,
@@ -245,7 +245,7 @@ pub fn fn_info_of<D: Domain>(base: &State<D>) -> Result<FnInfo> {
 /// Lane `lane` of a block as a state in domain `d` (plus the builtins of
 /// `base`'s globals, which a block drops), and its unknown-boolean fields
 /// except the buttons, for the driver to fork.
-pub fn from_block<N: EngineNum, D: Domain<A = N::A>, E: Domain>(
+pub fn from_block<N: Arithmetic, D: Domain<A = N>, E: Domain>(
     d: &mut D,
     rt2: &Rt2<N>,
     lane: usize,
@@ -291,7 +291,7 @@ pub fn from_block<N: EngineNum, D: Domain<A = N::A>, E: Domain>(
     Ok((st, unknown))
 }
 
-struct FromBlock<'a, N: EngineNum, D: Domain> {
+struct FromBlock<'a, N: Arithmetic, D: Domain> {
     d: &'a mut D,
     rt2: &'a Rt2<N>,
     lane: usize,
@@ -301,7 +301,7 @@ struct FromBlock<'a, N: EngineNum, D: Domain> {
     unknown: Vec<(TableId, String)>,
 }
 
-impl<N: EngineNum, D: Domain<A = N::A>> FromBlock<'_, N, D> {
+impl<N: Arithmetic, D: Domain<A = N>> FromBlock<'_, N, D> {
     fn is_unknown(&self, cell: u32) -> bool {
         matches!(self.rt2.structure[cell as usize], Cell2::Val) && self.rt2.cols[cell as usize].at(self.lane) == AV::UBool
     }
@@ -319,7 +319,7 @@ impl<N: EngineNum, D: Domain<A = N::A>> FromBlock<'_, N, D> {
             AV::Ival(lo, hi) => Value::Num(self.d.range_num(lo, hi)?),
             // The whole range; a straddling comparison forks.
             AV::UNum => {
-                let (lo, hi) = <N::A as Arithmetic>::bounds(<N::A as Arithmetic>::unknown());
+                let (lo, hi) = N::bounds(N::unknown());
                 Value::Num(self.d.range_num(lo, hi)?)
             }
             AV::Bool(b) => Value::Bool(self.d.boolean(b)),

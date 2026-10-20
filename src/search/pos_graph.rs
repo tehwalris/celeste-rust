@@ -5,7 +5,7 @@
 
 use anyhow::{anyhow, Result};
 
-use celeste_core::arith::EngineNum;
+use celeste_core::arith::Arithmetic;
 use celeste_engine::runtime2::{Col, Rt2, AV};
 
 /// Side of the position grid, in pixels: the start room plus a room's width
@@ -42,7 +42,7 @@ pub fn cell_xy(cell: u32) -> Option<(i32, i32)> {
 /// A numeric column's whole parts per lane (`None` if a lane is neither a
 /// number nor an interval). An INTERVAL's cell is its low corner: ONE rule,
 /// shared with the kernel's `pos_sources`.
-pub(crate) fn whole_i16_col<N: EngineNum>(rt2: &Rt2<N>, cell: u32) -> Option<Vec<i16>> {
+pub(crate) fn whole_i16_col<N: Arithmetic>(rt2: &Rt2<N>, cell: u32) -> Option<Vec<i16>> {
     match &rt2.cols[cell as usize] {
         Col::U(AV::Num(n)) => Some(vec![n.whole_i16()?; rt2.width]),
         Col::U(AV::Ival(a, _)) => Some(vec![a.whole_i16()?; rt2.width]),
@@ -62,7 +62,7 @@ pub(crate) fn whole_i16_col<N: EngineNum>(rt2: &Rt2<N>, cell: u32) -> Option<Vec
 
 /// A position column's whole-pixel RANGE per lane (`None` if a lane is
 /// neither number nor interval), for the win tests.
-pub(crate) fn whole_range_col<N: EngineNum>(rt2: &Rt2<N>, cell: u32) -> Option<Vec<(i16, i16)>> {
+pub(crate) fn whole_range_col<N: Arithmetic>(rt2: &Rt2<N>, cell: u32) -> Option<Vec<(i16, i16)>> {
     let one = |v: AV<N>| -> Option<(i16, i16)> {
         match v {
             AV::Num(n) => Some((n.whole_i16()?, n.whole_i16()?)),
@@ -80,13 +80,13 @@ pub(crate) fn whole_range_col<N: EngineNum>(rt2: &Rt2<N>, cell: u32) -> Option<V
 
 /// The block's player object (`player`, else `player_spawn`): one per
 /// block, its lanes share structure.
-pub(crate) fn player_object<N: EngineNum>(rt2: &Rt2<N>) -> Option<u32> {
+pub(crate) fn player_object<N: Arithmetic>(rt2: &Rt2<N>) -> Option<u32> {
     rt2.position_object()
 }
 
 /// Per-lane cell of a block (`room.x`/`room.y` must be numbers; no player or
 /// a non-numeric position: `NO_CELL`); the start room is its cache's.
-pub fn block_cells<N: EngineNum>(rt2: &Rt2<N>) -> Result<Vec<u32>> {
+pub fn block_cells<N: Arithmetic>(rt2: &Rt2<N>) -> Result<Vec<u32>> {
     let ids = crate::compiled::ids();
     let start = (rt2.cache.room_x, rt2.cache.room_y);
     let lanes = rt2.width;

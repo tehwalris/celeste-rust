@@ -7,7 +7,7 @@
 //! state, and a leaf a block, through the one converter (`trace::block`).
 
 use anyhow::{bail, ensure, Result};
-use celeste_core::arith::{Arithmetic, EngineNum, Fixed, Float};
+use celeste_core::arith::{Arithmetic, Fixed, Float};
 use celeste_core::pico8_num::Pico8Num;
 use celeste_engine::runtime2::{Rt2, AV};
 use full_moon::ast;
@@ -94,17 +94,16 @@ impl<A: Arithmetic> ReferenceEngine<A> {
 
 impl<A: Arithmetic> ReferenceEngine<A>
 where
-    A::Num: EngineNum<A = A>,
 {
     /// The room's start as a one-row block, without keys.
-    pub fn initial(&self) -> Result<Rt2<A::Num>> {
+    pub fn initial(&self) -> Result<Rt2<A>> {
         to_block(&self.base, self.settings.room)
     }
 
     /// One CONCRETE frame of row 0 of `row` under input `byte`: every leaf,
     /// keyed. It forks only where no input decides (`rnd`); unknown fields of
     /// the row are read as their placeholder, not forked.
-    pub fn step(&mut self, row: &Rt2<A::Num>, byte: u8) -> Result<Vec<Rt2<A::Num>>> {
+    pub fn step(&mut self, row: &Rt2<A>, byte: u8) -> Result<Vec<Rt2<A>>> {
         Ok(self.step_reads(row, byte)?.0)
     }
 
@@ -113,7 +112,7 @@ where
     /// of the buttons read alone - the output writes every button `UBool`
     /// (`block::to_rt2`) - so an input that agrees with `byte` on the mask has
     /// the same successors.
-    fn step_reads(&mut self, row: &Rt2<A::Num>, byte: u8) -> Result<(Vec<Rt2<A::Num>>, u8)> {
+    fn step_reads(&mut self, row: &Rt2<A>, byte: u8) -> Result<(Vec<Rt2<A>>, u8)> {
         let (mut st, _) = from_block(row, 0, &self.fn_info, &self.base)?;
         let (leaves, mask) = self.under_buttons(&mut st, byte, &[], Level::EXACT)?;
         Ok((self.blocks(&leaves)?, mask))
@@ -129,21 +128,21 @@ where
         Ok((leaves.map_err(|e| e.context(ran_from(st, Some(byte))))?, mask))
     }
 
-    fn blocks(&self, leaves: &[State<RefDomain<A>>]) -> Result<Vec<Rt2<A::Num>>> {
+    fn blocks(&self, leaves: &[State<RefDomain<A>>]) -> Result<Vec<Rt2<A>>> {
         leaves.iter().map(|l| Ok(to_block(l, self.settings.room)?.canonicalized())).collect()
     }
 
     /// One whole GAME frame: `step` once, or under the split frame
     /// (`Settings::clock`) its two parts, both under `byte` (the
     /// buttons are the frame's; part a reads none). Every leaf of both.
-    pub fn frame(&mut self, row: &Rt2<A::Num>, byte: u8) -> Result<Vec<Rt2<A::Num>>> {
+    pub fn frame(&mut self, row: &Rt2<A>, byte: u8) -> Result<Vec<Rt2<A>>> {
         Ok(self.frame_reads(row, byte)?.0)
     }
 
     /// `frame`, and the buttons it read (`step_reads`; the union over its
     /// steps and their leaves): every input that agrees with `byte` there
     /// has the same successors, so the concrete search runs one of them.
-    pub fn frame_reads(&mut self, row: &Rt2<A::Num>, byte: u8) -> Result<(Vec<Rt2<A::Num>>, u8)> {
+    pub fn frame_reads(&mut self, row: &Rt2<A>, byte: u8) -> Result<(Vec<Rt2<A>>, u8)> {
         let (mut out, mut mask) = self.step_reads(row, byte)?;
         for _ in 1..self.settings.clock().per_frame {
             let mut next = Vec::new();
@@ -169,13 +168,13 @@ where
     /// fruit level the fly fruit's `spd.y` and `rem.y` are 0
     /// (`pin_fly_fruit_motion`), at a near level a floor isolated from the
     /// player is in state 0 (`pin_isolated_floors`).
-    pub fn step_at(&mut self, row: &Rt2<A::Num>, byte: u8, level: Level) -> Result<(Vec<Rt2<A::Num>>, u8)> {
+    pub fn step_at(&mut self, row: &Rt2<A>, byte: u8, level: Level) -> Result<(Vec<Rt2<A>>, u8)> {
         self.step_at_pinned(row, byte, level, true)
     }
 
     /// `step_at`, the pins (`pin_fly_fruit_motion`, `pin_isolated_floors`)
     /// optional: the test compares the two.
-    fn step_at_pinned(&mut self, row: &Rt2<A::Num>, byte: u8, level: Level, pin: bool) -> Result<(Vec<Rt2<A::Num>>, u8)> {
+    fn step_at_pinned(&mut self, row: &Rt2<A>, byte: u8, level: Level, pin: bool) -> Result<(Vec<Rt2<A>>, u8)> {
         let (mut st, mut unknown) = from_block(row, 0, &self.fn_info, &self.base)?;
         let mut pinned_floors = false;
         if level.floors_near {
@@ -210,7 +209,7 @@ where
     }
 
     /// `step` where the frame must not fork.
-    pub fn step_one(&mut self, row: &Rt2<A::Num>, byte: u8) -> Result<Rt2<A::Num>> {
+    pub fn step_one(&mut self, row: &Rt2<A>, byte: u8) -> Result<Rt2<A>> {
         let mut out = self.step(row, byte)?;
         ensure!(out.len() == 1, "concrete frame produced {} leaves (expected exactly 1)", out.len());
         Ok(out.remove(0))
@@ -219,14 +218,14 @@ where
 
 impl<A: Arithmetic> ReferenceEngine<A>
 where
-    A::Num: Rem<A = A>,
+    A: Rem,
 {
     /// One frame of lane `lane` at the engine's level: every fork leaf (the
     /// buttons and each unknown boolean of the row forked per path), each with
     /// its remainder TRANSFER - the interpreter's arc capture, as the tracer
     /// captures it for the kernels, decoded by the arithmetic's decoder
     /// (`Rem::transfer`; a refusal is fatal, as theirs).
-    pub fn run_lane(&mut self, block: &Rt2<A::Num>, lane: usize) -> Result<Vec<(Rt2<A::Num>, <A::Num as Rem>::Pair)>> {
+    pub fn run_lane(&mut self, block: &Rt2<A>, lane: usize) -> Result<Vec<(Rt2<A>, <A as Rem>::Pair)>> {
         let (mut st, unknown) = from_block(block, lane, &self.fn_info, &self.base)?;
         let zero = A::point(A::from_i16(0));
         let none = || ArcAxis { took: false, pre: zero, frag: zero, ox: zero };
@@ -238,7 +237,7 @@ where
         leaves
             .iter()
             .map(|l| {
-                let pair = transfer_of::<A::Num>(l).map_err(|e| e.context(ran_from(&st, None)))?;
+                let pair = transfer_of::<A>(l).map_err(|e| e.context(ran_from(&st, None)))?;
                 Ok((to_block(l, self.settings.room)?.canonicalized(), pair))
             })
             .collect()
@@ -247,18 +246,18 @@ where
 
 impl<A: crate::transpile::garith::GraphArith> ReferenceEngine<A> {
     /// The one converter agrees across the two sides on every lane of `row`.
-    pub fn check_agreement(&self, row: &Rt2<A::Num>) -> Result<()> {
+    pub fn check_agreement(&self, row: &Rt2<A>) -> Result<()> {
         check_agreement::<A>(row, &self.fn_info, &self.base, self.settings.room)
     }
 }
 
 /// A leaf's remainder transfer: its arc capture and the player's remainder
 /// at the frame's end (before any widening), decoded (`Rem::transfer`).
-fn transfer_of<N: Rem>(leaf: &State<RefDomain<N::A>>) -> Result<N::Pair> {
+fn transfer_of<N: Rem>(leaf: &State<RefDomain<N>>) -> Result<N::Pair> {
     let axes = leaf.arc.as_deref().ok_or_else(|| anyhow::anyhow!("arc capture: a leaf without one"))?;
     let players = objects_of_type(leaf, "player");
     ensure!(players.len() <= 1, "arc capture: {} player objects at the frame's end", players.len());
-    let ends = |v: &<N::A as Arithmetic>::Ival| <N::A as Arithmetic>::bounds(*v);
+    let ends = |v: &N::Ival| N::bounds(*v);
     let axis = |k: usize| -> Result<Capture<N>> {
         let a = &axes[k];
         let fin = match players.first() {
@@ -324,9 +323,9 @@ const OTHERS_FAR: f64 = 16.0;
 /// error `e` (Knuth's TwoSum; `s + e` is the difference exactly). 16.16's
 /// values are doubles whose differences are exact (`e = 0`), so this is
 /// its raw comparison.
-fn distance_cmp<A: Arithmetic>(a: A::Num, b: A::Num, d: f64) -> std::cmp::Ordering
+fn distance_cmp<A: Arithmetic>(a: A, b: A, d: f64) -> std::cmp::Ordering
 where
-    A::Num: EngineNum,
+    A: Arithmetic,
 {
     let (x, y) = (a.to_f64(), b.to_f64());
     let (x, y) = if x >= y { (x, y) } else { (y, x) };
@@ -341,17 +340,17 @@ where
 }
 
 /// `|a - b| >= d`, exactly.
-fn far<A: Arithmetic>(a: A::Num, b: A::Num, d: f64) -> bool
+fn far<A: Arithmetic>(a: A, b: A, d: f64) -> bool
 where
-    A::Num: EngineNum,
+    A: Arithmetic,
 {
     distance_cmp::<A>(a, b, d) != std::cmp::Ordering::Less
 }
 
 /// `|a - b| <= d`, exactly.
-fn within<A: Arithmetic>(a: A::Num, b: A::Num, d: f64) -> bool
+fn within<A: Arithmetic>(a: A, b: A, d: f64) -> bool
 where
-    A::Num: EngineNum,
+    A: Arithmetic,
 {
     distance_cmp::<A>(a, b, d) != std::cmp::Ordering::Greater
 }
@@ -375,7 +374,7 @@ fn ran_from<A: Arithmetic>(st: &State<RefDomain<A>>, byte: Option<u8>) -> String
 }
 
 /// The positions of every player and player spawn, concrete.
-fn players<A: Arithmetic>(st: &State<RefDomain<A>>) -> Result<Vec<(A::Num, A::Num)>> {
+fn players<A: Arithmetic>(st: &State<RefDomain<A>>) -> Result<Vec<(A, A)>> {
     let mut out = Vec::new();
     for ty in ["player", "player_spawn"] {
         for o in objects_of_type(st, ty) {
@@ -386,7 +385,7 @@ fn players<A: Arithmetic>(st: &State<RefDomain<A>>) -> Result<Vec<(A::Num, A::Nu
 }
 
 /// An object's `(x, y)`, when both are points.
-fn position<A: Arithmetic>(st: &State<RefDomain<A>>, obj: &iface::Path) -> Result<Option<(A::Num, A::Num)>> {
+fn position<A: Arithmetic>(st: &State<RefDomain<A>>, obj: &iface::Path) -> Result<Option<(A, A)>> {
     let num = |f: &str| match iface::get(st, &field(obj, &[f])) {
         Some(Value::Num(v)) => Ok(A::as_point(v)),
         other => Err(anyhow::anyhow!("{}.{f}: not a number: {other:?}", iface::show(obj))),
@@ -409,7 +408,7 @@ fn position<A: Arithmetic>(st: &State<RefDomain<A>>, obj: &iface::Path) -> Resul
 /// `PLAYER_STEP` on the leaves.
 fn pin_isolated_floors<A: Arithmetic>(st: &mut State<RefDomain<A>>) -> Result<bool>
 where
-    A::Num: EngineNum,
+    A: Arithmetic,
 {
     let ppos = players(st)?;
     let floors = objects_of_type(st, "fall_floor");
@@ -428,7 +427,7 @@ where
             others.push(position(st, &o)?);
         }
     }
-    let apart = |a: (A::Num, A::Num), b: (A::Num, A::Num), d: f64| far::<A>(a.0, b.0, d) || far::<A>(a.1, b.1, d);
+    let apart = |a: (A, A), b: (A, A), d: f64| far::<A>(a.0, b.0, d) || far::<A>(a.1, b.1, d);
     let mut any = false;
     for f in &floors {
         let ps = field(f, &["state"]);
@@ -451,7 +450,7 @@ where
 /// --reference`): one engine a worker, every fork leaf one row with its
 /// source lane's cell and its transfer - so its tree is the kernels'.
 pub struct RefFrameStep<N: Rem = Pico8Num> {
-    engines: Vec<std::sync::Mutex<ReferenceEngine<N::A>>>,
+    engines: Vec<std::sync::Mutex<ReferenceEngine<N>>>,
     level: Level,
     settings: std::sync::Arc<crate::settings::Settings>,
 }
@@ -459,13 +458,13 @@ pub struct RefFrameStep<N: Rem = Pico8Num> {
 impl<N: Rem> RefFrameStep<N> {
     /// `s.threads()` engines at `level`.
     pub fn new(s: &crate::settings::Settings, level: Level) -> Result<Self> {
-        let engines = (0..s.threads().max(1)).map(|_| Ok(std::sync::Mutex::new(ReferenceEngine::<N::A>::new(s)?.at_level(level)))).collect::<Result<_>>()?;
+        let engines = (0..s.threads().max(1)).map(|_| Ok(std::sync::Mutex::new(ReferenceEngine::<N>::new(s)?.at_level(level)))).collect::<Result<_>>()?;
         Ok(RefFrameStep { engines, level, settings: std::sync::Arc::new(s.clone()) })
     }
 
     /// An engine no other worker holds (there are as many as workers; a
     /// caller past them waits on one).
-    fn engine(&self) -> std::sync::MutexGuard<'_, ReferenceEngine<N::A>> {
+    fn engine(&self) -> std::sync::MutexGuard<'_, ReferenceEngine<N>> {
         let start = {
             use std::hash::{Hash, Hasher};
             let mut h = rustc_hash::FxHasher::default();
@@ -609,13 +608,13 @@ fn concretize_near_floors<A: Arithmetic>(st: &mut State<RefDomain<A>>, d: &mut R
 /// Lane `lane` of a block as a reference state of the block's arithmetic
 /// (plus the base state's builtins), and its unknown-boolean fields except
 /// the buttons, for the driver to fork (`block::from_block`).
-pub fn from_block<N: EngineNum>(
+pub fn from_block<N: Arithmetic>(
     rt2: &Rt2<N>,
     lane: usize,
     fn_info: &FnInfo,
-    base: &State<RefDomain<N::A>>,
-) -> Result<(State<RefDomain<N::A>>, Vec<(TableId, String)>)> {
-    block::from_block(&mut RefDomain::<N::A>::new(), rt2, lane, fn_info, base)
+    base: &State<RefDomain<N>>,
+) -> Result<(State<RefDomain<N>>, Vec<(TableId, String)>)> {
+    block::from_block(&mut RefDomain::<N>::new(), rt2, lane, fn_info, base)
 }
 
 /// Set the six buttons of a reference state from an input byte (bit 0 left,
@@ -633,15 +632,15 @@ pub fn set_buttons<A: celeste_core::arith::Arithmetic>(st: &mut State<RefDomain<
 
 /// A reference state as a one-lane block (no row keys); `room`: the search's
 /// start room (the block's collision cache).
-pub fn to_block<N: EngineNum>(st: &State<RefDomain<N::A>>, room: (i16, i16)) -> Result<Rt2<N>> {
+pub fn to_block<N: Arithmetic>(st: &State<RefDomain<N>>, room: (i16, i16)) -> Result<Rt2<N>> {
     block::to_rt2(
         st,
         crate::compiled::collision_cache(room),
         |iv| {
-            Ok(match <N::A as Arithmetic>::as_point(*iv) {
+            Ok(match N::as_point(*iv) {
                 Some(n) => AV::Num(n),
                 None => {
-                    let (lo, hi) = <N::A as Arithmetic>::bounds(*iv);
+                    let (lo, hi) = N::bounds(*iv);
                     AV::Ival(lo, hi)
                 }
             })
@@ -654,7 +653,7 @@ pub fn to_block<N: EngineNum>(st: &State<RefDomain<N::A>>, room: (i16, i16)) -> 
 /// reference's domain and into the tracer's, converts back to ONE block -
 /// the same structure, shape, values and exact key - and the tracer's
 /// skeleton of it (what its kernels bind) has that shape.
-fn check_agreement<A: crate::transpile::garith::GraphArith>(rt2: &Rt2<A::Num>, fn_info: &FnInfo, base: &State<RefDomain<A>>, room: (i16, i16)) -> Result<()> {
+fn check_agreement<A: crate::transpile::garith::GraphArith>(rt2: &Rt2<A>, fn_info: &FnInfo, base: &State<RefDomain<A>>, room: (i16, i16)) -> Result<()> {
     use crate::trace::block::{skeleton, to_rt2};
     use crate::trace::domain::Symbolic;
     use crate::transpile::graph::{NodeId, Op};
@@ -663,7 +662,7 @@ fn check_agreement<A: crate::transpile::garith::GraphArith>(rt2: &Rt2<A::Num>, f
     let cache = crate::compiled::collision_cache(room);
     for lane in 0..rt2.width {
         let (reference, _) = from_block(rt2, lane, fn_info, base)?;
-        let mut a: Rt2<A::Num> = to_block(&reference, room)?;
+        let mut a: Rt2<A> = to_block(&reference, room)?;
         let mut d = Symbolic::<A>::default();
         let (traced, _) = block::from_block(&mut d, rt2, lane, fn_info, base)?;
         let g = &d.graph;
@@ -677,14 +676,14 @@ fn check_agreement<A: crate::transpile::garith::GraphArith>(rt2: &Rt2<A::Num>, f
             ref other => bail!("lane {lane}: a traced boolean {other:?}, not a constant"),
         };
         let mut b = to_rt2(&traced, cache.clone(), num, boolean)?;
-        let s = skeleton::<_, A::Num>(&traced, cache.clone())?;
-        let first = |x: &Rt2<A::Num>, y: &Rt2<A::Num>| (0..x.structure.len().max(y.structure.len())).find(|&c| x.structure.get(c) != y.structure.get(c) || x.cols.get(c) != y.cols.get(c));
+        let s = skeleton::<_, A>(&traced, cache.clone())?;
+        let first = |x: &Rt2<A>, y: &Rt2<A>| (0..x.structure.len().max(y.structure.len())).find(|&c| x.structure.get(c) != y.structure.get(c) || x.cols.get(c) != y.cols.get(c));
         ensure!(
             a.structure == b.structure && a.cols == b.cols && a.globals == b.globals && a.strings == b.strings,
             "lane {lane}: the reference's block and the tracer's differ, first at cell {:?}",
             first(&a, &b)
         );
-        let pointers = |x: &Rt2<A::Num>| -> Vec<Option<AV<A::Num>>> { x.cols.iter().map(|c| matches!(c, Col::U(AV::Ptr(_))).then(|| c.at(0))).collect() };
+        let pointers = |x: &Rt2<A>| -> Vec<Option<AV<A>>> { x.cols.iter().map(|c| matches!(c, Col::U(AV::Ptr(_))).then(|| c.at(0))).collect() };
         ensure!(
             s.structure == a.structure && s.globals == a.globals && pointers(&s) == pointers(&a) && s.shape_hash == a.shape_hash,
             "lane {lane}: the tracer's skeleton is not the reference block's shape"

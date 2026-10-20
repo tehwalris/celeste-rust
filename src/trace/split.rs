@@ -276,7 +276,7 @@ impl PointSet {
 /// each outcome's pixels (`position_guard`).
 pub struct Points<A: GraphArith = Fixed> {
     /// Per world, the value of each platform cell: `(cell, x)`.
-    worlds: Vec<Vec<(u32, A::Num)>>,
+    worlds: Vec<Vec<(u32, A)>>,
     platform: rustc_hash::FxHashSet<u32>,
     /// The player's input `x`/`y`: cell, node, the region's first pixel and
     /// count. `None` without a player.
@@ -344,7 +344,7 @@ impl<A: GraphArith> Points<A> {
         let root = map[&c] as usize;
         // Every cell at its weakest; a bounded input narrows at its `Restrict`.
         let base = crate::transpile::ival::seed_cells(&g);
-        let value = |v: A::Num| Val::<A>::Num(crate::transpile::garith::value_box::<A>(v));
+        let value = |v: A| Val::<A>::Num(crate::transpile::garith::value_box::<A>(v));
         let pixel = |p: i16, i: usize| value(A::from_i16(p + i as i16));
         let eval = |cells: &std::collections::HashMap<u32, Val<A>>| -> Option<bool> {
             let v = g.eval(cells, Eval::Lenient, room);

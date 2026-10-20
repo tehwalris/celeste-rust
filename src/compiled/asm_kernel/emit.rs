@@ -18,7 +18,7 @@ use std::collections::HashMap;
 
 use anyhow::Result;
 
-use celeste_core::arith::EngineNum;
+use celeste_core::arith::Arithmetic;
 use celeste_engine::exact::{Code, FieldDict, MissKey, ShapeKeys};
 use celeste_engine::runtime2::{Rt2, P8};
 
@@ -195,7 +195,7 @@ impl KeyField {
 /// a fin root, `fin = Some((0, 0))` with one), and `UnitSink::xfer_id_raw`'s
 /// cache is keyed on them.
 pub(crate) const RAW_WORDS: usize = 4 * crate::trace::frame::ARC_AXIS_ROOTS + 1;
-pub(crate) type RawWords<N = P8> = [<N as EngineNum>::Raw; RAW_WORDS];
+pub(crate) type RawWords<N = P8> = [<N as Arithmetic>::Raw; RAW_WORDS];
 
 /// A body's transfer roots (`FrameOut::arc`): per axis took, pre, frag, ox,
 /// fin as (offset, kind); `fin`: the outcome ends with a player.
@@ -325,18 +325,18 @@ fn cells_of<N: KernelLanes>(set: &PosSet, buf: &[u8], half: usize, need: u16, st
 
 /// An outcome's uniform fields in a key space: the packed codes that hit,
 /// the `(cell, code)` of those that miss.
-pub(super) struct PartKey<N: EngineNum = P8> {
+pub(super) struct PartKey<N: Arithmetic = P8> {
     pub key: u128,
     pub missing: Vec<(u32, Code<N>)>,
 }
 
-impl<N: EngineNum> Default for PartKey<N> {
+impl<N: Arithmetic> Default for PartKey<N> {
     fn default() -> Self {
         PartKey { key: 0, missing: Vec::new() }
     }
 }
 
-impl<N: EngineNum> PartKey<N> {
+impl<N: Arithmetic> PartKey<N> {
     /// `t`'s uniform fields in `sk` (`None`: a shape the key space lacks),
     /// the template's signature checked against the key space's.
     pub(super) fn of(t: &super::AccTemplate<N>, sk: Option<&ShapeKeys<N>>) -> PartKey<N> {
@@ -489,7 +489,7 @@ thread_local! {
 }
 
 /// What a slice's emission reads besides the kernel's outputs.
-pub(super) struct Slice<'a, N: EngineNum = P8> {
+pub(super) struct Slice<'a, N: Arithmetic = P8> {
     pub chunk: &'a Rt2<N>,
     pub lanes: &'a [usize],
     pub buf: &'a [u8],

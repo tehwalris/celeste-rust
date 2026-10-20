@@ -18,7 +18,7 @@
 //! What a table entry cannot say is a HOOK (`Hook`), named in its entry and
 //! documented where it is implemented.
 
-use celeste_core::arith::{Arithmetic, EngineNum};
+use celeste_core::arith::Arithmetic;
 
 use crate::runtime2::{collapse_uniform, names, Col, Rt2, AV, NONE};
 
@@ -271,18 +271,18 @@ pub const FLOOR_HITBOX: [i16; 4] = [0, 0, 8, 8];
 /// The cart's `floor.collide(player, 0, 0)` solved for the player: OPEN
 /// windows `(lo, hi)` for `x` and `y`; `None` where one leaves the 16.16
 /// range (never: a floor's position is its map tile's).
-pub fn floor_player_window<N: EngineNum>(floor: (N, N)) -> Option<[(N, N); 2]> {
+pub fn floor_player_window<N: Arithmetic>(floor: (N, N)) -> Option<[(N, N); 2]> {
     let [px, py, pw, ph] = PLAYER_HITBOX;
     let [fx, fy, fw, fh] = FLOOR_HITBOX;
-    let at = |base: N, d: i16| <N::A as Arithmetic>::add(base, <N::A as Arithmetic>::from_i16(d));
+    let at = |base: N, d: i16| N::add(base, N::from_i16(d));
     Some([(at(floor.0, fx - px - pw)?, at(floor.0, fx + fw - px)?), (at(floor.1, fy - py - ph)?, at(floor.1, fy + fh - py)?)])
 }
 
 /// Does a player in ranges `x`, `y` CERTAINLY overlap? A straddling range
 /// does not (the floor stays widened, the safe side). Shared with the tracer.
-pub fn player_overlaps_floor<N: EngineNum>(window: [(N, N); 2], x: (N, N), y: (N, N)) -> bool {
+pub fn player_overlaps_floor<N: Arithmetic>(window: [(N, N); 2], x: (N, N), y: (N, N)) -> bool {
     let [(xlo, xhi), (ylo, yhi)] = window;
-    let lt = <N::A as Arithmetic>::lt;
+    let lt = N::lt;
     lt(xlo, x.0) && lt(x.1, xhi) && lt(ylo, y.0) && lt(y.1, yhi)
 }
 
@@ -677,18 +677,18 @@ fn span<N: Copy>(v: AV<N>) -> Option<(N, N)> {
 
 /// A table constant (raw 16.16) in arithmetic `N`, exactly (every 16.16
 /// value is a double).
-pub fn constant<N: EngineNum>(raw: i32) -> N {
-    <N::A as Arithmetic>::from_fixed_raw(raw)
+pub fn constant<N: Arithmetic>(raw: i32) -> N {
+    N::from_fixed_raw(raw)
 }
 
 /// A stored range's ends in `N`. `REM` is the HALF-OPEN remainder
 /// [-1/2, 1/2): its last value is the arithmetic's last below 1/2 (16.16's
 /// `1/2 - 2^-16`, a double's `pred(1/2)`); every other range is its
 /// inclusive ends.
-pub fn range<N: EngineNum>(lo: i32, hi: i32) -> (N, N) {
+pub fn range<N: Arithmetic>(lo: i32, hi: i32) -> (N, N) {
     if (lo, hi) == REM {
         let half = constant::<N>(REM.1 + 1);
-        (constant(lo), <N::A as Arithmetic>::below(half).expect("a value below 1/2"))
+        (constant(lo), N::below(half).expect("a value below 1/2"))
     } else {
         (constant(lo), constant(hi))
     }
@@ -730,7 +730,7 @@ pub trait Widener {
     type Val;
     /// What a widening owes, as the target records it.
     type Owed: Clone;
-    type N: EngineNum;
+    type N: Arithmetic;
 
     fn instances(&mut self, ei: usize) -> anyhow::Result<Vec<Self::Instance>>;
     /// Slot `k` of the instance (`None`: absent).
@@ -828,7 +828,7 @@ pub fn widen_level<W: Widener>(w: &mut W, level: Level) -> anyhow::Result<()> {
     Ok(())
 }
 
-impl<N: EngineNum> Rt2<N> {
+impl<N: Arithmetic> Rt2<N> {
     /// A level's widenings (`TABLE`, `widen_level`), as its kernels bake them
     /// (`trace::widen`), so a finer row can be looked up as the level's
     /// node. Each asserts what its entry owes.
@@ -868,7 +868,7 @@ impl<N: EngineNum> Rt2<N> {
 
 /// The block side: a slot is a cell, a value a column; what is owed is
 /// asserted per lane.
-impl<N: EngineNum> Widener for Rt2<N> {
+impl<N: Arithmetic> Widener for Rt2<N> {
     type Instance = Option<u32>;
     type Place = u32;
     type Val = Col<N>;
@@ -908,7 +908,7 @@ impl<N: EngineNum> Widener for Rt2<N> {
         })
     }
     fn at_least(&mut self, ei: usize, c: &u32, m: N) -> anyhow::Result<Col<N>> {
-        let max = |n: N| <N::A as Arithmetic>::max(n, m);
+        let max = |n: N| N::max(n, m);
         let at_least = |v: AV<N>| match v {
             AV::Num(n) => Ok(AV::Num(max(n))),
             AV::Ival(a, b) => Ok(AV::Ival(max(a), max(b))),
@@ -921,20 +921,20 @@ impl<N: EngineNum> Widener for Rt2<N> {
         })
     }
     fn owe_inside(&mut self, ei: usize, c: &u32, lo: N, hi: N) -> anyhow::Result<Option<()>> {
-        let le = <N::A as Arithmetic>::le;
+        let le = N::le;
         self.check_lanes(ei, *c, "outside the widening", |v| span(v).is_some_and(|(a, b)| le(lo, a) && le(b, hi)))?;
         Ok(None)
     }
     fn band(&mut self, ei: usize, k: usize, at: &Option<u32>, c: &u32, r: N) -> anyhow::Result<(Option<()>, Col<N>)> {
         let name = TABLE[ei].name;
-        let le = <N::A as Arithmetic>::le;
+        let le = N::le;
         let f = resolved()[ei].around[k].expect("a band's centre field");
         let obj = at.ok_or_else(|| anyhow::anyhow!("widening {name:?}: a band is around an object's field"))?;
         let centre = self.obj_field_cell(obj, f).ok_or_else(|| anyhow::anyhow!("widening {name:?}: no band centre"))?;
         let mut band = Vec::with_capacity(self.width);
         for lane in 0..self.width {
             let (lo, hi) = match self.cols[centre as usize].at(lane) {
-                AV::Num(s) => match (<N::A as Arithmetic>::sub(s, r), <N::A as Arithmetic>::add(s, r)) {
+                AV::Num(s) => match (N::sub(s, r), N::add(s, r)) {
                     (Some(lo), Some(hi)) => (lo, hi),
                     _ => anyhow::bail!("widening {name:?}: lane {lane}'s band {s:?} +- {r:?} leaves the arithmetic's range"),
                 },
@@ -950,8 +950,8 @@ impl<N: EngineNum> Widener for Rt2<N> {
         Ok((0..self.width).all(|lane| matches!(self.cols[*c as usize].at(lane), AV::Num(_))))
     }
     fn owe_width(&mut self, ei: usize, c: &u32, period: N) -> anyhow::Result<()> {
-        let le = <N::A as Arithmetic>::le;
-        self.check_lanes(ei, *c, "not a full period", |v| matches!(v, AV::Ival(lo, hi) if <N::A as Arithmetic>::sub(hi, lo).is_some_and(|w| le(period, w))))
+        let le = N::le;
+        self.check_lanes(ei, *c, "not a full period", |v| matches!(v, AV::Ival(lo, hi) if N::sub(hi, lo).is_some_and(|w| le(period, w))))
     }
     fn same(&mut self, ei: usize, c: &u32, twin: &u32) -> anyhow::Result<()> {
         let s = &TABLE[ei].slots;
@@ -966,13 +966,13 @@ impl<N: EngineNum> Widener for Rt2<N> {
     }
 }
 
-impl<N: EngineNum> Rt2<N> {
+impl<N: Arithmetic> Rt2<N> {
     /// `Hook::NearFloor` on blocks (`trace::widen::widen_near_floors`): `state`
     /// and `collideable` widened except where a player certainly overlaps the
     /// floor (kept as they are: the kernels store the cart's invariant there, or
     /// with `p` the computed value - either is what a concrete row holds).
     fn widen_near_floors(&mut self, r: &Resolved) {
-        let le = <N::A as Arithmetic>::le;
+        let le = N::le;
         let (slo, shi) = range::<N>(FLOOR_STATE_RANGE.0, FLOOR_STATE_RANGE.1);
         let span_of = |v: AV<N>, what: &str| span(v).unwrap_or_else(|| panic!("near floor widening: {what} is {v:?}"));
         let players: Vec<(u32, u32)> = self

@@ -8,7 +8,6 @@
 
 use anyhow::{anyhow, bail, Result};
 
-use celeste_core::arith::EngineNum;
 use celeste_engine::widening::{range, widen_level, Holds, Lit, Widener, TABLE};
 use celeste_engine::widening::{floor_player_window, Entry, Flag, Hook, Input, Level, Slot, Stored, Target, FLOOR_HITBOX, PLATFORM_PATH, PLAYER_HITBOX, REM};
 
@@ -116,7 +115,7 @@ fn countdown(e: &Entry, s: &Slot) -> bool {
 /// A table RANGE `[lo, hi]` (raw 16.16) as one graph literal, as the block
 /// side stores it (`widening::range`: `REM` is half-open).
 fn ival<A: GraphArith>(d: &mut Symbolic<A>, lo: i32, hi: i32) -> NodeId {
-    let (lo, hi) = range::<A::Num>(lo, hi);
+    let (lo, hi) = range::<A>(lo, hi);
     d.graph.leaf(Op::Const(A::lit(lo), A::lit(hi)))
 }
 
@@ -170,7 +169,7 @@ impl<A: GraphArith> Widener for Out<'_, A> {
     type Place = Path;
     type Val = Value<Symbolic<A>>;
     type Owed = NodeId;
-    type N = A::Num;
+    type N = A;
 
     fn instances(&mut self, ei: usize) -> Result<Vec<Path>> {
         Ok(match TABLE[ei].target {
@@ -197,7 +196,7 @@ impl<A: GraphArith> Widener for Out<'_, A> {
             },
         }
     }
-    fn value(&mut self, v: Lit<A::Num>) -> Value<Symbolic<A>> {
+    fn value(&mut self, v: Lit<A>) -> Value<Symbolic<A>> {
         match v {
             Lit::Ival(lo, hi) => Value::Num(self.d.graph.leaf(Op::Const(A::lit(lo), A::lit(hi)))),
             Lit::Num(n) => Value::Num(self.d.num(n)),
@@ -206,12 +205,12 @@ impl<A: GraphArith> Widener for Out<'_, A> {
             Lit::UnknownBool => Value::Bool(self.d.unknown_bool_output()),
         }
     }
-    fn at_least(&mut self, ei: usize, p: &Path, m: A::Num) -> Result<Value<Symbolic<A>>> {
+    fn at_least(&mut self, ei: usize, p: &Path, m: A) -> Result<Value<Symbolic<A>>> {
         let v = self.num(ei, p)?;
         let m = self.d.num(m);
         Ok(Value::Num(self.d.fun2(super::domain::Fun2::Max, &v, &m)?))
     }
-    fn owe_inside(&mut self, ei: usize, p: &Path, lo: A::Num, hi: A::Num) -> Result<Option<NodeId>> {
+    fn owe_inside(&mut self, ei: usize, p: &Path, lo: A, hi: A) -> Result<Option<NodeId>> {
         let v = self.num(ei, p)?;
         let owed = contain(self.d, v, (lo, hi));
         if let Some(h) = owed {
@@ -220,7 +219,7 @@ impl<A: GraphArith> Widener for Out<'_, A> {
         Ok(owed)
     }
     /// The centre a shape's constant: the band a literal.
-    fn band(&mut self, ei: usize, k: usize, at: &Path, p: &Path, r: A::Num) -> Result<(Option<NodeId>, Value<Symbolic<A>>)> {
+    fn band(&mut self, ei: usize, k: usize, at: &Path, p: &Path, r: A) -> Result<(Option<NodeId>, Value<Symbolic<A>>)> {
         let Stored::Band { around, .. } = TABLE[ei].slots[k].stored else { bail!("widening {:?}: slot {k} is not a band", TABLE[ei].name) };
         let sp = field(at, &[around]);
         let Some(Value::Num(centre)) = iface::get(self.st, &sp) else { bail!("{}: not a number", iface::show(&sp)) };
@@ -234,7 +233,7 @@ impl<A: GraphArith> Widener for Out<'_, A> {
         let v = self.num(ei, p)?;
         Ok(!self.d.is_interval(&v))
     }
-    fn owe_width(&mut self, ei: usize, p: &Path, period: A::Num) -> Result<NodeId> {
+    fn owe_width(&mut self, ei: usize, p: &Path, period: A) -> Result<NodeId> {
         let v = self.num(ei, p)?;
         let g = &mut self.d.graph;
         let (lo, hi) = (g.fold(Op::Lo, vec![v]), g.fold(Op::Hi, vec![v]));
@@ -264,7 +263,7 @@ impl<A: GraphArith> Widener for Out<'_, A> {
     }
 }
 
-fn bounds_inside<A: GraphArith>(d: &mut Symbolic<A>, v: NodeId, lo: A::Num, hi: A::Num) -> NodeId {
+fn bounds_inside<A: GraphArith>(d: &mut Symbolic<A>, v: NodeId, lo: A, hi: A) -> NodeId {
     let (lo, hi) = (A::lit(lo), A::lit(hi));
     let (klo, khi) = (d.graph.leaf(Op::Const(lo, lo)), d.graph.leaf(Op::Const(hi, hi)));
     let (vlo, vhi) = (d.graph.fold(Op::Lo, vec![v]), d.graph.fold(Op::Hi, vec![v]));
@@ -275,7 +274,7 @@ fn bounds_inside<A: GraphArith>(d: &mut Symbolic<A>, v: NodeId, lo: A::Num, hi: 
 
 /// `v` in `[lo, hi]`: `None` if proved statically (`within`), else the
 /// per-lane condition.
-fn contain<A: GraphArith>(d: &mut Symbolic<A>, v: NodeId, (lo, hi): (A::Num, A::Num)) -> Option<NodeId> {
+fn contain<A: GraphArith>(d: &mut Symbolic<A>, v: NodeId, (lo, hi): (A, A)) -> Option<NodeId> {
     if within(&d.graph, v, lo, hi) {
         return None;
     }
@@ -322,7 +321,7 @@ pub fn read_inputs<A: GraphArith>(st: &mut State<Symbolic<A>>, d: &mut Symbolic<
 /// platform's `rem.x`): pinned to it (`Op::Pin`, the input disconnected, its
 /// check `v` inside the literal), unless the graph proves it inside.
 fn pin_literal<A: GraphArith>(d: &mut Symbolic<A>, v: NodeId, lo: i32, hi: i32) {
-    let (l, h) = range::<A::Num>(lo, hi);
+    let (l, h) = range::<A>(lo, hi);
     if !within(&d.graph, v, l, h) {
         d.pin(v, crate::transpile::graph::Pinned::Num(A::lit(l), A::lit(h)));
     }
@@ -350,8 +349,8 @@ fn read_slot<A: GraphArith>(st: &mut State<Symbolic<A>>, d: &mut Symbolic<A>, e:
 }
 
 /// An object's `(x, y)`: constants, floors and springs never move.
-fn position<A: GraphArith>(st: &State<Symbolic<A>>, d: &Symbolic<A>, obj: &Path) -> Result<(A::Num, A::Num)> {
-    let get = |f: &str| -> Result<A::Num> {
+fn position<A: GraphArith>(st: &State<Symbolic<A>>, d: &Symbolic<A>, obj: &Path) -> Result<(A, A)> {
+    let get = |f: &str| -> Result<A> {
         let p = field(obj, &[f]);
         match iface::get(st, &p) {
             Some(Value::Num(v)) => d.as_const(&v).ok_or_else(|| anyhow::anyhow!("{}: not a constant", iface::show(&p))),
@@ -448,7 +447,7 @@ fn widen_near_floors<A: GraphArith>(st: &mut State<Symbolic<A>>, d: &mut Symboli
         let [(xlo, xhi), (ylo, yhi)] = floor_player_window(at).ok_or_else(|| anyhow!("{}: a fall floor at {at:?}: its window leaves the arithmetic's range", iface::show(&obj)))?;
         // `lo < v < hi` for every value a lane may hold (straddling is no
         // overlap, the safe side), as `widening::player_overlaps_floor`.
-        let inside = |d: &mut Symbolic<A>, v: NodeId, lo: A::Num, hi: A::Num| -> Result<NodeId> {
+        let inside = |d: &mut Symbolic<A>, v: NodeId, lo: A, hi: A| -> Result<NodeId> {
             let (a, b) = if d.is_interval(&v) { (d.graph.fold(Op::Lo, vec![v]), d.graph.fold(Op::Hi, vec![v])) } else { (v, v) };
             let (klo, khi) = (d.num(lo), d.num(hi));
             let above = d.compare(Cmp::Gt, &a, &klo)?;
@@ -465,7 +464,7 @@ fn widen_near_floors<A: GraphArith>(st: &mut State<Symbolic<A>>, d: &mut Symboli
             overlap = d.or(&overlap, &both);
             if mid {
                 let [(dxlo, dxhi), (dylo, dyhi)] = PLAYER_PROBE;
-                let shift = |v: A::Num, by: i16| A::add(v, A::from_i16(by)).ok_or_else(|| anyhow!("{}: the probe window {v:?} + {by} leaves the arithmetic's range", iface::show(&obj)));
+                let shift = |v: A, by: i16| A::add(v, A::from_i16(by)).ok_or_else(|| anyhow!("{}: the probe window {v:?} + {by} leaves the arithmetic's range", iface::show(&obj)));
                 let x = inside(d, px, shift(xlo, dxlo)?, shift(xhi, dxhi)?)?;
                 let y = inside(d, py, shift(ylo, dylo)?, shift(yhi, dyhi)?)?;
                 let both = d.and(&x, &y);
@@ -473,7 +472,7 @@ fn widen_near_floors<A: GraphArith>(st: &mut State<Symbolic<A>>, d: &mut Symboli
             }
         }
         let Some(Value::Num(state)) = iface::get(st, ps) else { bail!("{}: not a number", iface::show(ps)) };
-        if let Some(holds) = contain(d, state, range::<A::Num>(slo, shi)) {
+        if let Some(holds) = contain(d, state, range::<A>(slo, shi)) {
             let held = d.or(&overlap, &holds);
             owe(errs, d, ps, held);
         }
@@ -526,7 +525,7 @@ pub fn platform_inputs<A: GraphArith>(st: &mut State<Symbolic<A>>, d: &mut Symbo
     let platforms = objects_of_type(st, "platform");
     let first = worlds.first().ok_or_else(|| anyhow::anyhow!("no platform world"))?;
     anyhow::ensure!(first.len() == platforms.len(), "a platform world has {} platforms, the state {}", first.len(), platforms.len());
-    fn konst<A: GraphArith>(st: &State<Symbolic<A>>, d: &Symbolic<A>, p: &Path) -> Result<A::Num> {
+    fn konst<A: GraphArith>(st: &State<Symbolic<A>>, d: &Symbolic<A>, p: &Path) -> Result<A> {
         match iface::get(st, p) {
             Some(Value::Num(n)) => match d.graph.get(n).op {
                 Op::Const(a, b) if a == b => Ok(A::from_lit(a)),
@@ -548,8 +547,8 @@ pub fn platform_inputs<A: GraphArith>(st: &mut State<Symbolic<A>>, d: &mut Symbo
         // Its distinct moving speeds (by bits; a double's `-0` would not
         // be moving either).
         let zero = A::from_i16(0);
-        let moving: Vec<A::Num> = {
-            let mut v: Vec<A::Num> = Vec::new();
+        let moving: Vec<A> = {
+            let mut v: Vec<A> = Vec::new();
             for s in worlds.iter().map(|w| w[j][3]).filter(|s| !A::num_eq(*s, zero)) {
                 if !v.contains(&s) {
                     v.push(s);
@@ -573,7 +572,7 @@ pub fn platform_inputs<A: GraphArith>(st: &mut State<Symbolic<A>>, d: &mut Symbo
                 // The hull in the total order (`-0` below `0`), as an
                 // interval's ends are.
                 let speeds = || worlds.iter().map(|w| w[j][3]);
-                let order = |a: &A::Num, b: &A::Num| a.to_f64().total_cmp(&b.to_f64());
+                let order = |a: &A, b: &A| a.to_f64().total_cmp(&b.to_f64());
                 let lo = speeds().min_by(order).expect("a world");
                 let hi = speeds().max_by(order).expect("a world");
                 let r = d.restrict(sv, A::lit(lo), A::lit(hi));

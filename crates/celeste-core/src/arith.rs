@@ -17,9 +17,13 @@ use anyhow::Result;
 use crate::lua_f64::{LuaF64, LuaF64Interval};
 use crate::pico8_num::{Pico8Num, Pico8NumInterval};
 
-pub trait Arithmetic: 'static + Copy + Default + Debug + Send + Sync + PartialEq + Eq + Hash {
-    /// A number. `Eq` and `Hash` are BIT identity (dedup and keys).
-    type Num: Copy + Debug + PartialEq + Eq + Hash + Send + Sync + 'static;
+/// THE ARITHMETIC, on its number type (`Fixed`: `Pico8Num`, `Float`:
+/// `LuaF64`). `Eq` and `Hash` are BIT identity (dedup and keys). Also how
+/// the engine STORES a number - in blocks, codes and dictionaries, with its
+/// raw bits: the blocks and the key space are generic over it
+/// (`runtime2::Rt2<N>`, `exact::Code<N>`), so a tree of one arithmetic and a
+/// block of the other are different types.
+pub trait Arithmetic: 'static + Copy + Default + Debug + Send + Sync + PartialEq + Eq + Hash + serde::Serialize + serde::de::DeserializeOwned {
     /// A closed interval of numbers (the reference domain's value).
     type Ival: Copy + Debug + PartialEq + Eq + Hash + Send + Sync + 'static;
     /// A number as the kernels' graph IR stores a literal
@@ -34,53 +38,53 @@ pub trait Arithmetic: 'static + Copy + Default + Debug + Send + Sync + PartialEq
     /// 1/2`, shifted back exactly (16.16: yes; doubles: `+ 1/2` rounds)?
     const ROUND_BY_SHIFTED_FLOOR: bool;
 
-    fn from_i16(v: i16) -> Self::Num;
+    fn from_i16(v: i16) -> Self;
     /// A number as a graph literal, and back (`Lit`).
-    fn lit(v: Self::Num) -> Self::Lit;
-    fn from_lit(l: Self::Lit) -> Self::Num;
+    fn lit(v: Self) -> Self::Lit;
+    fn from_lit(l: Self::Lit) -> Self;
     /// The value as an `i16`, where it is an integer in range.
-    fn as_i16(v: Self::Num) -> Option<i16>;
+    fn as_i16(v: Self) -> Option<i16>;
     /// A cart literal, as the arithmetic's console or tool reads it.
-    fn parse_literal(text: &str) -> Result<Self::Num>;
+    fn parse_literal(text: &str) -> Result<Self>;
 
-    fn add(a: Self::Num, b: Self::Num) -> Option<Self::Num>;
-    fn sub(a: Self::Num, b: Self::Num) -> Option<Self::Num>;
-    fn mul(a: Self::Num, b: Self::Num) -> Option<Self::Num>;
-    fn div(a: Self::Num, b: Self::Num) -> Option<Self::Num>;
+    fn add(a: Self, b: Self) -> Option<Self>;
+    fn sub(a: Self, b: Self) -> Option<Self>;
+    fn mul(a: Self, b: Self) -> Option<Self>;
+    fn div(a: Self, b: Self) -> Option<Self>;
     /// The cart's `%`.
-    fn rem(a: Self::Num, b: Self::Num) -> Option<Self::Num>;
-    fn neg(a: Self::Num) -> Option<Self::Num>;
-    fn abs(a: Self::Num) -> Option<Self::Num>;
-    fn flr(a: Self::Num) -> Self::Num;
+    fn rem(a: Self, b: Self) -> Option<Self>;
+    fn neg(a: Self) -> Option<Self>;
+    fn abs(a: Self) -> Option<Self>;
+    fn flr(a: Self) -> Self;
     /// The cart's `sin` (in turns, inverted).
-    fn sin(a: Self::Num) -> Option<Self::Num>;
-    fn min(a: Self::Num, b: Self::Num) -> Self::Num;
-    fn max(a: Self::Num, b: Self::Num) -> Self::Num;
-    fn lt(a: Self::Num, b: Self::Num) -> bool;
-    fn le(a: Self::Num, b: Self::Num) -> bool;
+    fn sin(a: Self) -> Option<Self>;
+    fn min(a: Self, b: Self) -> Self;
+    fn max(a: Self, b: Self) -> Self;
+    fn lt(a: Self, b: Self) -> bool;
+    fn le(a: Self, b: Self) -> bool;
     /// The cart's `==` on numbers.
-    fn num_eq(a: Self::Num, b: Self::Num) -> bool;
+    fn num_eq(a: Self, b: Self) -> bool;
     /// The largest value `rnd(x)` returns (`x > 0`): just below `x`.
-    fn rnd_top(x: Self::Num) -> Option<Self::Num>;
+    fn rnd_top(x: Self) -> Option<Self>;
     /// The largest number below `x`.
-    fn below(x: Self::Num) -> Option<Self::Num>;
+    fn below(x: Self) -> Option<Self>;
     /// A 16.16 constant (raw), exactly (every one is a double).
-    fn from_fixed_raw(raw: i32) -> Self::Num;
+    fn from_fixed_raw(raw: i32) -> Self;
     /// The number's bits (identity: a dedup key).
-    fn bits(v: Self::Num) -> u64;
+    fn bits(v: Self) -> u64;
     /// The number of these bits (`bits`' inverse), if they are one.
-    fn from_bits(b: u64) -> Option<Self::Num>;
-    fn show(v: Self::Num) -> String;
+    fn from_bits(b: u64) -> Option<Self>;
+    fn show(v: Self) -> String;
     /// A number as the console's `printh` prints it.
-    fn printh(v: Self::Num) -> Result<String>;
+    fn printh(v: Self) -> Result<String>;
     /// A number's exact bits (the probes' `__hex`).
-    fn hex(v: Self::Num) -> String;
+    fn hex(v: Self) -> String;
 
-    fn point(v: Self::Num) -> Self::Ival;
+    fn point(v: Self) -> Self::Ival;
     /// `[lo, hi]`, `lo <= hi`.
-    fn ival(lo: Self::Num, hi: Self::Num) -> Self::Ival;
-    fn bounds(i: Self::Ival) -> (Self::Num, Self::Num);
-    fn as_point(i: Self::Ival) -> Option<Self::Num>;
+    fn ival(lo: Self, hi: Self) -> Self::Ival;
+    fn bounds(i: Self::Ival) -> (Self, Self);
+    fn as_point(i: Self::Ival) -> Option<Self>;
     /// The unknown number: every value (an operation on it stays unknown).
     fn unknown() -> Self::Ival;
     fn ival_add(a: Self::Ival, b: Self::Ival) -> Option<Self::Ival>;
@@ -100,6 +104,35 @@ pub trait Arithmetic: 'static + Copy + Default + Debug + Send + Sync + PartialEq
     /// rounds(i)`): `__split_by_round`'s fragments, its cut points exact in
     /// the arithmetic.
     fn round_fragment(i: Self::Ival, k: u32) -> Result<Self::Ival>;
+
+    // How the engine stores a number.
+    /// The bits a code holds: 16.16's `u32` word, a double's `u64`.
+    type Raw: Copy + Debug + PartialEq + Eq + PartialOrd + Ord + Hash + Default + Send + Sync + From<u32> + TryInto<u32> + serde::Serialize + serde::de::DeserializeOwned + 'static;
+    /// A number interval's dictionary word: its two raws, packed.
+    type Word: Copy + Debug + PartialEq + Eq + Hash + Default + Send + Sync + 'static;
+    /// The last byte of a tree file's magic (16.16: 0, doubles: `f`): a
+    /// tree of one arithmetic is never read as the other's.
+    const FILE_TAG: u8;
+    fn raw(self) -> Self::Raw;
+    /// `raw`'s inverse; `None` for bits no number of the arithmetic has.
+    fn from_raw(r: Self::Raw) -> Option<Self>;
+    fn word(lo: Self::Raw, hi: Self::Raw) -> Self::Word;
+    /// A word folded to 64 bits (a hash table's slot, a fingerprint's
+    /// input): 16.16's word itself.
+    fn fold(w: Self::Word) -> u64;
+    /// A raw's little-endian bytes onto `out` (a state's exact bytes).
+    fn push_raw(r: Self::Raw, out: &mut Vec<u8>);
+    /// The whole part, as the position cells read it (`floor`, 16.16's
+    /// integer bits): `None` outside `i16`.
+    fn whole_i16(self) -> Option<i16>;
+    /// The value as an `f64`, exactly (16.16 and doubles both fit).
+    fn to_f64(self) -> f64;
+    /// A position's code part: the value less `whole` whole pixels (the cell
+    /// holds those), exactly.
+    fn less_whole(self, whole: i16) -> Self::Raw;
+    /// `less_whole`'s inverse: the raw of a code part `r` plus `whole`
+    /// whole pixels.
+    fn plus_whole(r: Self::Raw, whole: i32) -> Self::Raw;
 }
 
 /// PICO-8's 16.16 fixed point: the real game.
@@ -112,7 +145,6 @@ type P8 = Pico8Num;
 type Iv = Pico8NumInterval;
 
 impl Arithmetic for Fixed {
-    type Num = P8;
     type Ival = Iv;
     type Lit = i32;
     const NAME: &'static str = "fixed";
@@ -268,13 +300,42 @@ impl Arithmetic for Fixed {
         let clamp = |v: i64| P8::from_raw(v.clamp(i32::MIN as i64, i32::MAX as i64) as i32);
         Ok(Iv::new(i.low.max(clamp(lo)), i.high.min(clamp(hi))))
     }
+    type Raw = u32;
+    type Word = u64;
+    const FILE_TAG: u8 = 0;
+    fn raw(self) -> u32 {
+        self.as_raw_u32()
+    }
+    fn from_raw(r: u32) -> Option<P8> {
+        Some(P8::from_raw(r as i32))
+    }
+    fn word(lo: u32, hi: u32) -> u64 {
+        (lo as u64) << 32 | hi as u64
+    }
+    fn fold(w: u64) -> u64 {
+        w
+    }
+    fn push_raw(r: u32, out: &mut Vec<u8>) {
+        out.extend_from_slice(&r.to_le_bytes());
+    }
+    fn to_f64(self) -> f64 {
+        self.as_raw_u32() as i32 as f64 / 65536.0
+    }
+    fn whole_i16(self) -> Option<i16> {
+        Some(self.whole_part_as_i16())
+    }
+    fn less_whole(self, whole: i16) -> u32 {
+        self.as_raw_u32().wrapping_sub((whole as i32 as u32) << 16)
+    }
+    fn plus_whole(r: u32, whole: i32) -> u32 {
+        r.wrapping_add((whole as u32) << 16)
+    }
 }
 
 type F = LuaF64;
 type FI = LuaF64Interval;
 
 impl Arithmetic for Float {
-    type Num = F;
     type Ival = FI;
     type Lit = u64;
     const NAME: &'static str = "float";
@@ -413,79 +474,6 @@ impl Arithmetic for Float {
     fn round_fragment(i: FI, k: u32) -> Result<FI> {
         i.round_fragment(k)
     }
-}
-
-/// A number as the engine STORES it - in blocks, codes and dictionaries:
-/// the arithmetic's `Num` with its raw bits. The blocks and the key space
-/// are generic over it (`runtime2::Rt2<N>`, `exact::Code<N>`), so a tree of
-/// one arithmetic and a block of the other are different types.
-pub trait EngineNum: Copy + Debug + PartialEq + Eq + Hash + Send + Sync + serde::Serialize + serde::de::DeserializeOwned + 'static {
-    type A: Arithmetic<Num = Self>;
-    /// The bits a code holds: 16.16's `u32` word, a double's `u64`.
-    type Raw: Copy + Debug + PartialEq + Eq + PartialOrd + Ord + Hash + Default + Send + Sync + From<u32> + TryInto<u32> + serde::Serialize + serde::de::DeserializeOwned + 'static;
-    /// A number interval's dictionary word: its two raws, packed.
-    type Word: Copy + Debug + PartialEq + Eq + Hash + Default + Send + Sync + 'static;
-    /// The last byte of a tree file's magic (16.16: 0, doubles: `f`): a
-    /// tree of one arithmetic is never read as the other's.
-    const FILE_TAG: u8;
-    fn raw(self) -> Self::Raw;
-    /// `raw`'s inverse; `None` for bits no number of the arithmetic has.
-    fn from_raw(r: Self::Raw) -> Option<Self>;
-    fn word(lo: Self::Raw, hi: Self::Raw) -> Self::Word;
-    /// A word folded to 64 bits (a hash table's slot, a fingerprint's
-    /// input): 16.16's word itself.
-    fn fold(w: Self::Word) -> u64;
-    /// A raw's little-endian bytes onto `out` (a state's exact bytes).
-    fn push_raw(r: Self::Raw, out: &mut Vec<u8>);
-    /// The whole part, as the position cells read it (`floor`, 16.16's
-    /// integer bits): `None` outside `i16`.
-    fn whole_i16(self) -> Option<i16>;
-    /// The value as an `f64`, exactly (16.16 and doubles both fit).
-    fn to_f64(self) -> f64;
-    /// A position's code part: the value less `whole` whole pixels (the cell
-    /// holds those), exactly.
-    fn less_whole(self, whole: i16) -> Self::Raw;
-    /// `less_whole`'s inverse: the raw of a code part `r` plus `whole`
-    /// whole pixels.
-    fn plus_whole(r: Self::Raw, whole: i32) -> Self::Raw;
-}
-
-impl EngineNum for P8 {
-    type A = Fixed;
-    type Raw = u32;
-    type Word = u64;
-    const FILE_TAG: u8 = 0;
-    fn raw(self) -> u32 {
-        self.as_raw_u32()
-    }
-    fn from_raw(r: u32) -> Option<P8> {
-        Some(P8::from_raw(r as i32))
-    }
-    fn word(lo: u32, hi: u32) -> u64 {
-        (lo as u64) << 32 | hi as u64
-    }
-    fn fold(w: u64) -> u64 {
-        w
-    }
-    fn push_raw(r: u32, out: &mut Vec<u8>) {
-        out.extend_from_slice(&r.to_le_bytes());
-    }
-    fn to_f64(self) -> f64 {
-        self.as_raw_u32() as i32 as f64 / 65536.0
-    }
-    fn whole_i16(self) -> Option<i16> {
-        Some(self.whole_part_as_i16())
-    }
-    fn less_whole(self, whole: i16) -> u32 {
-        self.as_raw_u32().wrapping_sub((whole as i32 as u32) << 16)
-    }
-    fn plus_whole(r: u32, whole: i32) -> u32 {
-        r.wrapping_add((whole as u32) << 16)
-    }
-}
-
-impl EngineNum for F {
-    type A = Float;
     type Raw = u64;
     type Word = u128;
     const FILE_TAG: u8 = b'f';
@@ -522,6 +510,9 @@ impl EngineNum for F {
         (f64::from_bits(r) + whole as f64).to_bits()
     }
 }
+
+
+
 
 #[cfg(test)]
 mod tests {
