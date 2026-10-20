@@ -8,7 +8,7 @@ use std::collections::BTreeMap;
 use celeste_core::arith::Fixed;
 
 use super::garith::GraphArith;
-use super::graph::{Graph, NodeId, Op};
+use super::graph::{Eval, Graph, NodeId, Op};
 use super::kernel::{Body, Emit, OutFields, Roots};
 
 pub(crate) const BUILD_PHASES: [&str; 9] = [
@@ -268,11 +268,7 @@ pub(crate) fn specialize_frame<A: GraphArith>(
         // Or-tree the interval evaluator decided true.
         if trace {
             let cells = crate::transpile::ival::seed_cells(&sp);
-            let vals = match room {
-                Some(r) => sp.eval_fold_in(&cells, r),
-                None => sp.eval_lenient(&cells),
-            }
-            .expect("lenient eval");
+            let vals = sp.eval(&cells, Eval::Fold, room).expect("the fold's eval");
             let mut shown = 0;
             for c in &cands {
                 let (error, live) = (c.roots.error, c.roots.live);

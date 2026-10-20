@@ -736,7 +736,7 @@ mod tests {
     use crate::trace::cart;
     use crate::trace::interp::Interp;
     use crate::trace::frame::trace_frame;
-    use crate::transpile::graph::Val;
+    use crate::transpile::graph::{Eval, Val};
     use std::collections::HashMap;
 
     fn canonical(st: &State<Symbolic>, p: &Path) -> Option<Val> {
@@ -805,7 +805,7 @@ mod tests {
                 .enumerate()
                 .map(|(i, p)| (i as u32, canonical(&st, p).unwrap_or_else(|| panic!("{} is no dead slot", iface::show(p)))))
                 .collect();
-            let at_stored = g.eval_lenient(&stored).expect("eval");
+            let at_stored = g.eval(&stored, Eval::Lenient, None).expect("eval");
             for (r, w) in roots_in.iter().zip(&what) {
                 // Down to the cells, but not through an overflow check, which
                 // must hold at the stored constants instead.

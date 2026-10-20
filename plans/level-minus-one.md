@@ -35,7 +35,7 @@ hold. One frame from a node:
    evaluator joins undecided selects, which is sound); `ForkOk` is checked.
 3. **Specialize** per fork configuration: the move amount is one number, so
    pixel steps and collisions are exact at an exact position.
-4. **Evaluate** over the ranges (`Graph::eval_narrow_top_in`): an outcome
+4. **Evaluate** over the ranges (`Graph::eval`, `Eval::NarrowTop`): an outcome
    whose `live` is not definitely false is a successor at the cells its
    position hull covers; one in another room is the EXIT; the error must be
    false on every live outcome.

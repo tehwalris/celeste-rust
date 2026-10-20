@@ -408,7 +408,7 @@ fn finish_outcome<A: GraphArith>(
 mod tests {
     use super::*;
     use crate::trace::cart;
-    use crate::transpile::graph::{Graph, Val};
+    use crate::transpile::graph::{Eval, Graph, Val};
 
     /// Input cells `cells` (in `Iface` order) as exact values.
     fn exact(cells: &[Conc]) -> std::collections::HashMap<u32, Val> {
@@ -501,7 +501,7 @@ mod tests {
         let (g, map) = at_buttons(&it.d.graph, &f, &[false; 6]).expect("the six buttons");
         let room = crate::transpile::graph::Room { cache: it.cache.clone().expect("cache") };
         let ok_at = |cells: &[Conc]| -> bool {
-            let v = g.eval_in(&exact(cells), &room).expect("the frame at a point");
+            let v = g.eval(&exact(cells), Eval::Exact, Some(&room)).expect("the frame at a point");
             let live: Vec<&FrameOut> = f.outs.iter().filter(|o| v[map[o.guard as usize] as usize] == Val::Bool(Some(true))).collect();
             assert_eq!(live.len(), 1, "exactly one outcome claims a lane");
             v[map[live[0].error as usize] as usize] == Val::Bool(Some(false))
@@ -710,7 +710,7 @@ end
         // 100 is past the unroll bound on purpose: after `break` it is moot.
 
         for a in [0i16, 1, 2, 3, 5, 8, 100] {
-            let v = it.d.graph.eval(&exact(&[Conc::Num(crate::pico8_num::Pico8Num::from_i16(a))])).expect("the graph at a point");
+            let v = it.d.graph.eval(&exact(&[Conc::Num(crate::pico8_num::Pico8Num::from_i16(a))]), Eval::Exact, None).expect("the graph at a point");
             let want = (a + 1).min(2);
             assert_eq!(v[node as usize], Val::exact_num(crate::pico8_num::Pico8Num::from_i16(want)), "amount = {a}");
             assert_eq!(v[st.ended as usize], Val::Bool(Some(false)), "amount = {a}: the trace declined");

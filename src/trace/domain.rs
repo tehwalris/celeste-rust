@@ -9,7 +9,7 @@ use anyhow::{bail, Result};
 
 use celeste_core::arith::{Arithmetic, Fixed};
 use crate::transpile::garith::GraphArith;
-use crate::transpile::graph::{Cut, Graph, NodeId, Op, Ty, Unknown};
+use crate::transpile::graph::{Cut, Eval, Graph, NodeId, Op, Ty, Unknown};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Arith {
@@ -845,7 +845,7 @@ impl<A: GraphArith> Symbolic<A> {
         let mut g = Graph::<A>::default();
         let leaves: Vec<NodeId> = lits.iter().map(|(lo, hi)| g.leaf(Op::Const(*lo, *hi))).collect();
         let n = g.add(op.clone(), leaves);
-        g.eval(&std::collections::HashMap::new()).ok().map(|v| v[n as usize])
+        g.eval(&std::collections::HashMap::new(), Eval::Exact, None).ok().map(|v| v[n as usize])
     }
 
     /// `eval_literal`'s number as a literal node.
@@ -1346,7 +1346,7 @@ mod tests {
                     let map = d.graph.specialize_subset_into(&splits, None, &mut g);
                     // Strict, a lane spanning more values than the fork's
                     // arity is an error of the evaluation (as `ForkOk`).
-                    let vals = match g.eval(&cells) {
+                    let vals = match g.eval(&cells, Eval::Exact, None) {
                         Ok(vals) => vals,
                         Err(e) => {
                             assert!(n > ways as u32 && format!("{e}").contains("ForkOk"), "ox {ox} [{lo}, {hi}] c {c}: {e}");
@@ -1493,7 +1493,7 @@ mod tests {
                 let k = d.graph.leaf(Op::Const(one, one));
                 let eq = d.graph.fold(Op::Eq, vec![x, k]);
                 let (t, f) = d.may_answers(eq);
-                let v = d.graph.eval(&Default::default()).unwrap();
+                let v = d.graph.eval(&Default::default(), Eval::Exact, None).unwrap();
                 let b = |n: NodeId| match v[n as usize] {
                     Val::Bool(b) => b,
                     Val::Num(_) => panic!("a number"),

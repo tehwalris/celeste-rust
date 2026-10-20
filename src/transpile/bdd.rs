@@ -581,7 +581,7 @@ mod tests {
         simplify_local(g, roots, LOCAL_CAP, LOCAL_EXPAND)
     }
 
-    use super::super::graph::Val;
+    use super::super::graph::{Eval, Val};
 
     fn n(v: i16) -> Pico8Num {
         Pico8Num::from_i16(v)
@@ -619,7 +619,7 @@ mod tests {
                         (1u32, Val::Bool(b1)),
                         (2u32, Val::Bool(b2)),
                     ]);
-                    let out = g.eval(&cells).unwrap();
+                    let out = g.eval(&cells, Eval::Exact, None).unwrap();
                     for (merged, anc) in &pairs {
                         let (m, a) = (out[*merged as usize], out[*anc as usize]);
                         match (m, a) {
@@ -860,8 +860,8 @@ mod tests {
                                     (10u32, Val::Num(i0)),
                                     (11u32, Val::Num(i1)),
                                 ]);
-                                let before = g.eval(&cells).unwrap();
-                                let after = out.eval(&cells).unwrap();
+                                let before = g.eval(&cells, Eval::Exact, None).unwrap();
+                                let after = out.eval(&cells, Eval::Exact, None).unwrap();
                                 for (r, m) in roots.iter().zip(mapped.iter()) {
                                     let (x, y) =
                                         (before[*r as usize], after[*m as usize]);

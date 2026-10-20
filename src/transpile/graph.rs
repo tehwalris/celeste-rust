@@ -53,6 +53,25 @@ impl<A: Arithmetic> Val<A> {
 
 pub type NodeId = u32;
 
+/// How `Graph::eval` reads what it cannot compute exactly.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Eval {
+    /// Every node exact, or an error (inputs at points).
+    Exact,
+    /// Over hulls (lanes): a fork's operand covers it, an undecided check is
+    /// unknown, an unmodelled node TOP for its kind (sound; the same match as
+    /// `Exact`, so the two cannot diverge).
+    Lenient,
+    /// `Lenient`, `mget` over interval coordinates read as the SET of tiles
+    /// the rectangle holds (`TileSet::over`), and `defined` (`eval_full`):
+    /// the interval fold (`transpile::ival`).
+    Fold,
+    /// Forks resolved via `Frag`, an unmodelled node (`Mget`, roomless
+    /// `TileFlagAt`) TOP, and `defined`: level -1 takes the kernels' premises
+    /// as holding.
+    NarrowTop,
+}
+
 /// In a `splits` vector: leave this fork standing.
 pub const OPEN: u8 = u8::MAX;
 
@@ -268,9 +287,6 @@ pub struct Graph<A: GraphArith = Fixed> {
 
 /// The most fragments one fork can have (a byte names a fragment).
 pub const MAX_WAYS: usize = 255;
-
-/// `Graph::eval_full`'s `defined`.
-const DEFINED: bool = true;
 
 impl Graph<Fixed> {
     /// An empty 16.16 graph (`Graph::<A>::default()` in another arithmetic).
@@ -761,63 +777,14 @@ impl<A: GraphArith> Graph<A> {
         opposite && nx.args == ny.args
     }
 
-    /// Evaluate every node from the input cells in one forward pass: exact or
-    /// an error.
-    pub fn eval(&self, cells: &HashMap<u32, Val<A>>) -> Result<Vec<Val<A>>> {
-        self.eval_inner(cells, false, true, None)
+    /// Evaluate every node from the input cells in one forward pass, as
+    /// `mode` says (`room`: the map, for `mget` and `tile_flag_at`).
+    pub fn eval(&self, cells: &HashMap<u32, Val<A>>, mode: Eval, room: Option<&Room>) -> Result<Vec<Val<A>>> {
+        let (lenient, defined) = (matches!(mode, Eval::Lenient | Eval::Fold), matches!(mode, Eval::Fold | Eval::NarrowTop));
+        self.eval_full(cells, lenient, mode == Eval::Exact, room, mode == Eval::Fold, defined)
     }
 
-    /// `eval` with the map: `mget` and `tile_flag_at` of exact coordinates.
-    pub fn eval_in(&self, cells: &HashMap<u32, Val<A>>, room: &Room) -> Result<Vec<Val<A>>> {
-        self.eval_inner(cells, false, true, Some(room))
-    }
-
-    /// As `eval`, but an unmodelled node is TOP for its kind (sound) instead of
-    /// an error (the same match, so the two cannot diverge).
-    pub fn eval_lenient(&self, cells: &HashMap<u32, Val<A>>) -> Result<Vec<Val<A>>> {
-        self.eval_inner(cells, true, false, None)
-    }
-
-    /// `eval_lenient` with the map, deciding `TileFlagAt`.
-    pub fn eval_lenient_in(&self, cells: &HashMap<u32, Val<A>>, room: &Room) -> Result<Vec<Val<A>>> {
-        self.eval_inner(cells, true, false, Some(room))
-    }
-
-    /// `eval_lenient_in` that also reads `mget` over INTERVAL coordinates as the
-    /// SET of tiles the rectangle holds (`TileSet::over`) and evaluates
-    /// `DEFINED` (below): the interval fold's evaluator (`transpile::ival`).
-    pub fn eval_fold_in(&self, cells: &HashMap<u32, Val<A>>, room: &Room) -> Result<Vec<Val<A>>> {
-        self.eval_full(cells, true, false, Some(room), true, DEFINED)
-    }
-
-    /// `eval_fold_in` without a room (no `mget`, `TileFlagAt` TOP).
-    pub fn eval_fold(&self, cells: &HashMap<u32, Val<A>>) -> Result<Vec<Val<A>>> {
-        self.eval_full(cells, true, false, None, false, DEFINED)
-    }
-
-    /// Forks resolved via `Frag`; an unmodelled node (`Mget`, roomless
-    /// `TileFlagAt`) is TOP. `DEFINED`: level -1 takes the kernels'
-    /// premises as holding.
-    pub fn eval_narrow_top_in(&self, cells: &HashMap<u32, Val<A>>, room: &Room) -> Result<Vec<Val<A>>> {
-        self.eval_full(cells, false, false, Some(room), false, DEFINED)
-    }
-
-    /// `eval_narrow_top_in` without a room, for bare arithmetic sub-DAGs.
-    pub fn eval_narrow_top(&self, cells: &HashMap<u32, Val<A>>) -> Result<Vec<Val<A>>> {
-        self.eval_full(cells, false, false, None, false, DEFINED)
-    }
-
-    fn eval_inner(
-        &self,
-        cells: &HashMap<u32, Val<A>>,
-        frag_lenient: bool,
-        strict_err: bool,
-        room: Option<&Room>,
-    ) -> Result<Vec<Val<A>>> {
-        self.eval_full(cells, frag_lenient, strict_err, room, false, !DEFINED)
-    }
-
-    /// `defined` (`DEFINED`): an operation's value need cover only the lanes
+    /// `defined` (`Eval::Fold`, `Eval::NarrowTop`): an operation's value need cover only the lanes
     /// where it is DEFINED (`abs` of a hull holding MIN is `[0, MAX]`, the MIN
     /// lane in error). Sound where that error is charged to whatever reads the
     /// value: once the outcomes' errors are derived and are roots of the graph
@@ -1318,7 +1285,7 @@ mod tests {
         let k = g.leaf(Op::Const(n(3).as_raw_u32() as i32, n(3).as_raw_u32() as i32));
         let sum = g.add(Op::Add, vec![a, k]);
         let cells = HashMap::from([(1u32, Val::exact_num(n(4)))]);
-        let out = g.eval(&cells).unwrap();
+        let out = g.eval(&cells, Eval::Exact, None).unwrap();
         assert_eq!(out[sum as usize], Val::exact_num(n(7)));
     }
 
@@ -1333,13 +1300,13 @@ mod tests {
             (1u32, Val::Num(Pico8NumInterval::new(n(0), n(10)))),
             (2u32, Val::Num(Pico8NumInterval::new(n(5), n(15)))),
         ]);
-        assert_eq!(g.eval(&cells).unwrap()[lt as usize], Val::Bool(None));
+        assert_eq!(g.eval(&cells, Eval::Exact, None).unwrap()[lt as usize], Val::Bool(None));
         // Disjoint boxes decide it.
         let cells = HashMap::from([
             (1u32, Val::Num(Pico8NumInterval::new(n(0), n(3)))),
             (2u32, Val::Num(Pico8NumInterval::new(n(5), n(15)))),
         ]);
-        assert_eq!(g.eval(&cells).unwrap()[lt as usize], Val::Bool(Some(true)));
+        assert_eq!(g.eval(&cells, Eval::Exact, None).unwrap()[lt as usize], Val::Bool(Some(true)));
     }
 
     #[test]
@@ -1356,13 +1323,13 @@ mod tests {
 
         // Decided condition: the lane is valid and picks an arm.
         let cells = HashMap::from([(1u32, Val::Bool(Some(true)))]);
-        let out = g.eval(&cells).unwrap();
+        let out = g.eval(&cells, Eval::Exact, None).unwrap();
         assert_eq!(out[valid as usize], Val::Bool(Some(true)));
         assert_eq!(out[sel as usize], Val::exact_num(n(1)));
 
         // Undecided: the lane is INVALID, and the value is the sound join.
         let cells = HashMap::from([(1u32, Val::Bool(None))]);
-        let out = g.eval(&cells).unwrap();
+        let out = g.eval(&cells, Eval::Exact, None).unwrap();
         assert_eq!(out[valid as usize], Val::Bool(Some(false)));
         assert_eq!(
             out[sel as usize],
@@ -1378,7 +1345,7 @@ mod tests {
         let and = g.add(Op::And, vec![a, b]);
         // false AND unknown is FALSE, not unknown.
         let cells = HashMap::from([(1u32, Val::Bool(Some(false))), (2u32, Val::Bool(None))]);
-        assert_eq!(g.eval(&cells).unwrap()[and as usize], Val::Bool(Some(false)));
+        assert_eq!(g.eval(&cells, Eval::Exact, None).unwrap()[and as usize], Val::Bool(Some(false)));
     }
 
     #[test]
@@ -1457,7 +1424,7 @@ mod tests {
                                 (10u32, Val::Num(i0)),
                                 (11u32, Val::Num(i1)),
                             ]);
-                            let out = g.eval(&cells).expect("every op in the pool evaluates");
+                            let out = g.eval(&cells, Eval::Exact, None).expect("every op in the pool evaluates");
                             for (f, p) in &pairs {
                                 assert_eq!(
                                     out[*f as usize],
@@ -1641,7 +1608,7 @@ mod tests {
             (1u32, Val::Num(Pico8NumInterval::new(n(0), n(10)))),
             (2u32, Val::Num(Pico8NumInterval::new(n(2), n(3)))),
         ]);
-        let err = g.eval(&cells).unwrap_err().to_string();
+        let err = g.eval(&cells, Eval::Exact, None).unwrap_err().to_string();
         assert!(err.contains("not modelled"), "unexpected error: {}", err);
     }
 
@@ -1689,7 +1656,7 @@ mod tests {
                 assert_eq!(g.get(nw).op == Op::ConstBool(true), everywhere, "{op:?} {k:#x}: decided iff every value fits");
                 let at = |a: i32, b: i32| {
                     let cells = HashMap::from([(0u32, Val::Num(Pico8NumInterval::new(p(a), p(b))))]);
-                    g.eval_lenient(&cells).expect("lenient")[nw as usize]
+                    g.eval(&cells, Eval::Lenient, None).expect("lenient")[nw as usize]
                 };
                 assert_eq!(at(lo, hi), Val::Bool(Some(true)), "{op:?} {k:#x}: the whole fitting range");
                 if lo > i32::MIN {
@@ -1699,7 +1666,7 @@ mod tests {
                     assert_eq!(at(lo, hi + 1), Val::Bool(None), "{op:?} {k:#x}: one past the high end");
                     // A point past it: the operation itself is the error.
                     let cells = HashMap::from([(0u32, Val::exact_num(p(hi + 1)))]);
-                    assert!(g.eval(&cells).unwrap_err().to_string().contains("wrapped"), "{op:?} {k:#x}");
+                    assert!(g.eval(&cells, Eval::Exact, None).unwrap_err().to_string().contains("wrapped"), "{op:?} {k:#x}");
                 }
                 checked_forms += !everywhere as usize;
             }
@@ -1813,7 +1780,7 @@ mod tests {
         let one = g.leaf(Op::Const(1 << 16, 1 << 16));
         let le = g.add(Op::Le, vec![hi, one]);
         let hull = Val::Num(Pico8NumInterval::new(Pico8Num::from_raw(0), Pico8Num::from_raw(3 << 16)));
-        let vals = g.eval_lenient(&HashMap::from([(0u32, hull)])).expect("eval");
+        let vals = g.eval(&HashMap::from([(0u32, hull)]), Eval::Lenient, None).expect("eval");
         assert_eq!(vals[hi as usize], hull, "Hi of a hull is the hull");
         assert_eq!(vals[le as usize], Val::Bool(None), "a lane [0, 0.5] has Hi <= 1, a lane [2, 3] does not");
         let r = g.add(Op::Restrict(0, 3 << 16), vec![v]);

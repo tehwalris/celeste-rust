@@ -8,7 +8,7 @@ use anyhow::{anyhow, Result};
 use super::domain::{Domain, Symbolic};
 use super::frame::FrameOut;
 use crate::transpile::garith::GraphArith;
-use crate::transpile::graph::NodeId;
+use crate::transpile::graph::{Eval, NodeId};
 use celeste_core::arith::Fixed;
 
 /// An outcome's row as `Waiting` indexes it: its shape class and its fields.
@@ -347,10 +347,7 @@ impl<A: GraphArith> Points<A> {
         let value = |v: A::Num| Val::<A>::Num(crate::transpile::garith::value_box::<A>(v));
         let pixel = |p: i16, i: usize| value(A::from_i16(p + i as i16));
         let eval = |cells: &std::collections::HashMap<u32, Val<A>>| -> Option<bool> {
-            let v = match room {
-                Some(r) => g.eval_lenient_in(cells, r),
-                None => g.eval_lenient(cells),
-            };
+            let v = g.eval(cells, Eval::Lenient, room);
             match v.ok()?.get(root) {
                 Some(Val::Bool(b)) => *b,
                 _ => None,

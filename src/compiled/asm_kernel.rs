@@ -17,7 +17,7 @@ use celeste_engine::slots::reshape;
 
 use crate::transpile::asm::{AsmCtx, CollisionEnv, Compiled, Loaded};
 use crate::transpile::graph::Ty;
-use crate::transpile::graph::Room;
+use crate::transpile::graph::{Eval, Room};
 
 mod emit;
 mod lanes;
@@ -381,7 +381,7 @@ impl<N: KernelLanes> AsmKernel<N> {
             };
             cells.insert(cell, v);
         }
-        let vals = match self.fused.eval_narrow_top_in(&cells, &self.room) {
+        let vals = match self.fused.eval(&cells, Eval::NarrowTop, Some(&self.room)) {
             Ok(v) => v,
             Err(e) => {
                 eprintln!("[kernel]   (graph evaluation failed: {e:#})");

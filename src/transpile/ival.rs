@@ -17,7 +17,7 @@ use std::collections::HashMap;
 use anyhow::Result;
 
 use super::garith::GraphArith;
-use super::graph::{Graph, NodeId, Op, Room, Val};
+use super::graph::{Eval, Graph, NodeId, Op, Room, Val};
 
 /// The image of a node `fold` did not reach.
 pub use super::bdd::UNREACHABLE;
@@ -67,10 +67,7 @@ pub fn fold_into<A: GraphArith>(
 ) -> Result<(Vec<NodeId>, Stats)> {
     let need = g.reachable(roots);
     let cells = seed_cells(g);
-    let vals = match room {
-        Some(r) => g.eval_fold_in(&cells, r)?,
-        None => g.eval_fold(&cells)?,
-    };
+    let vals = g.eval(&cells, Eval::Fold, room)?;
     let mut map: Vec<NodeId> = vec![UNREACHABLE; g.len()];
     let mut st = Stats {
         before: need.iter().filter(|x| **x).count(),
@@ -300,8 +297,8 @@ mod tests {
                             for i in i0..i0 + w {
                                 for j in j0..j0 + h {
                                     let cells = HashMap::from([(0u32, Val::exact_num(Pico8Num::from_i16(i))), (1u32, Val::exact_num(Pico8Num::from_i16(j)))]);
-                                    let before = g.eval_lenient_in(&cells, &room).expect("before")[r as usize];
-                                    let after = out.eval_lenient_in(&cells, &room).expect("after")[map[r as usize] as usize];
+                                    let before = g.eval(&cells, Eval::Lenient, Some(&room)).expect("before")[r as usize];
+                                    let after = out.eval(&cells, Eval::Lenient, Some(&room)).expect("after")[map[r as usize] as usize];
                                     assert_eq!(before, after, "room ({rx},{ry}) tile {k} lane ({i},{j})");
                                     assert_eq!(before, Val::Bool(Some(tile(i, j) == k)));
                                 }
@@ -403,8 +400,8 @@ mod tests {
                     cells.insert(0, Val::exact_num(Pico8Num::from_i16(i)));
                     cells.insert(1, Val::exact_num(Pico8Num::from_i16(j)));
                     cells.insert(2, Val::Bool(Some(bv)));
-                    let before = g.eval_lenient(&cells).expect("before");
-                    let after = out.eval_lenient(&cells).expect("after");
+                    let before = g.eval(&cells, Eval::Lenient, None).expect("before");
+                    let after = out.eval(&cells, Eval::Lenient, None).expect("after");
                     for r in &roots {
                         assert_eq!(
                             before[*r as usize],
