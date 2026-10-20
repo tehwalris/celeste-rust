@@ -18,7 +18,7 @@ use crate::KernelsNew;
 pub enum Command {
     /// ONE FORWARD FRAME of a tree, F -> F+1, repeatably.
     ///
-    /// The forward as it stood after `--frame` F (`ForwardState::at`: the
+    /// The forward as it stood after `--step` F (`ForwardState::at`: the
     /// tree's visited set, transfers and level -1 filter at F;
     /// later frames ignored) runs the wave of F+1 `--reps` times, the edges
     /// into a scratch dir. Prints (stdout, the same every rep, else an
@@ -27,14 +27,15 @@ pub enum Command {
     /// `--checkpoint` `b{F+1}` over the bytes of the frame's files - so a
     /// tree extended past F checks it; per rep (stderr) the wave, the
     /// frame's end walls and the workers' phases; `kernel lanes: ... missed
-    /// 0`. With `--metrics FILE`, the EXACT metrics of the first rep (kernel
-    /// census and dynamic instructions, lanes, emissions, states, edges:
-    /// `tools/metrics_diff.py` compares them with a pinned file); the same
-    /// at every `--threads`.
+    /// 0`. Its PINS: `--expect FILE` (the lines, those of the kinds this run
+    /// prints) and `--metrics FILE` (the first rep's EXACT metrics: kernel
+    /// census and dynamic instructions, lanes, emissions, states, edges; the
+    /// same at every `--threads`), each compared and every difference
+    /// shown, or written with `--pin`.
     Frame(FrameArgs),
     /// ONE BACKWARD FRAME of the arc phase, W_F from W_{F+1}, repeatably.
     ///
-    /// A finished search tree's edge files to `--horizon` opened (timed),
+    /// A finished search tree's edge files to `--steps` opened (timed),
     /// the winning sets pushed down to `W_{F+1}`, then `W_F` from them
     /// `--reps` times from a copy. Prints (stdout) `W_F`'s fingerprint as
     /// the arc gate's line (`[gate] hH W fF count hash`, over each node's
@@ -45,12 +46,12 @@ pub enum Command {
 
 #[derive(clap::Args)]
 pub struct FrameArgs {
-    /// The tree (a forward's checkpoint dir, or a search's `levelNN`).
+    /// The tree (a forward's `--tree`, or a search's `levelNN`).
     #[arg(long)]
     tree: PathBuf,
-    /// The frame F to run F -> F+1 from (default: the tree's last).
+    /// The step F to run F -> F+1 from (default: the tree's last).
     #[arg(long)]
-    frame: Option<u32>,
+    step: Option<u32>,
     /// Run the wave this many times, each from a copy (every rep's lines must
     /// agree).
     #[arg(long, default_value_t = 1)]
@@ -59,9 +60,18 @@ pub struct FrameArgs {
     /// cleared per rep), as the search's forward does.
     #[arg(long)]
     edges: bool,
-    /// Write the first rep's exact metrics to this file (`compiled::mix`).
+    /// The first rep's exact metrics (`compiled::mix`) must be this pinned
+    /// file's (with `--pin`: written to it).
     #[arg(long)]
     pub metrics: Option<PathBuf>,
+    /// The printed lines must be this pinned file's lines of their kinds
+    /// (with `--pin`: written to it).
+    #[arg(long)]
+    expect: Option<PathBuf>,
+    /// Write `--expect` and `--metrics` instead of comparing (a re-pin: only
+    /// on evidence, said in the commit).
+    #[arg(long)]
+    pin: bool,
     /// Checkpoint each rep's frame as the forward does (the frame file,
     /// read back and checked),
     /// into the scratch dir, timed; prints the `b{F+1}` line (needs
@@ -75,13 +85,13 @@ pub struct BackwardArgs {
     /// A search's tree (its `levelNN`: `frames/`, `edges/` under it).
     #[arg(long)]
     tree: PathBuf,
-    /// The search's horizon, in steps (default: the tree's last frame); the
-    /// graph and the winning sets are built for it.
+    /// The search's horizon, in steps (default: the tree's last); the graph
+    /// and the winning sets are built for it.
     #[arg(long)]
-    horizon: Option<u32>,
-    /// The frame F whose winning sets are computed (from F+1's).
+    steps: Option<u32>,
+    /// The step F whose winning sets are computed (from F+1's).
     #[arg(long)]
-    frame: u32,
+    step: u32,
     /// Compute W_F this many times, each from a copy.
     #[arg(long, default_value_t = 1)]
     reps: usize,
@@ -102,10 +112,10 @@ pub fn run(run: &Settings, c: Command) -> Result<()> {
         }
         Command::Backward(a) => {
             let t = TreeDir::open(&a.tree, run)?;
-            let horizon = t.frame(a.horizon)?;
+            let horizon = t.frame(a.steps)?;
             match t.settings.arith {
-                Arith::Fixed => bench_backward::<P8>(&t, horizon, a.frame, a.reps),
-                Arith::Float(_) => bench_backward::<LuaF64>(&t, horizon, a.frame, a.reps),
+                Arith::Fixed => bench_backward::<P8>(&t, horizon, a.step, a.reps),
+                Arith::Float(_) => bench_backward::<LuaF64>(&t, horizon, a.step, a.reps),
             }
         }
     }
@@ -122,7 +132,9 @@ where
     let (cfg, level, dir) = (&t.settings, t.level, &t.dir);
     let (edges, checkpoint, reps) = (a.edges, a.checkpoint, a.reps);
     anyhow::ensure!(!checkpoint || edges, "--checkpoint needs --edges (the frame's files as the forward writes them)");
-    let frame = t.frame(a.frame)?;
+    anyhow::ensure!(!a.pin || (a.expect.is_some() || a.metrics.is_some()), "--pin writes --expect and --metrics: give one");
+    anyhow::ensure!(!a.pin || a.expect.is_none() || checkpoint, "--pin --expect: a pin holds every line (--edges --checkpoint)");
+    let frame = t.frame(a.step)?;
     let engine = K::new(cfg, level)?;
     let t = std::time::Instant::now();
     engine.warm();
@@ -197,8 +209,7 @@ where
                 let slices: u64 = kernels.iter().map(|k| k.1).sum();
                 let insts: u64 = kernels.iter().map(|(_, n, c)| n * c.get("insts").copied().unwrap_or(0)).sum();
                 eprintln!("[bench] kernels: {insts} dynamic instructions over {slices} slices ({} a slice; call-outs' callees aside)", insts.checked_div(slices).unwrap_or(0));
-                let text = frame_metrics(cfg.room, level, frame, &costs[0].stats, &ks);
-                std::fs::write(path, text).with_context(|| path.display().to_string())?;
+                pinned(path, &frame_metrics(cfg.room, level, frame, &costs[0].stats, &ks), a.pin, metrics_moves)?;
             }
             celeste_rust::compiled::mix::reset_slices();
         }
@@ -207,7 +218,90 @@ where
     let ks = take_kernel_stats();
     anyhow::ensure!(ks.missed == 0, "KERNEL COVERAGE GAP: {} lanes missed", ks.missed);
     celeste_rust::storage::bench::print_cost(frame + 1, &costs);
+    if let (Some(path), Some(out)) = (&a.expect, &lines) {
+        pinned(path, out, a.pin, line_moves)?;
+    }
     Ok(())
+}
+
+/// A PIN: `got` against the file at `path` (`moves`: every difference, as
+/// lines; none passes), or written there (`pin`).
+fn pinned(path: &std::path::Path, got: &str, pin: bool, moves: fn(&str, &str) -> Vec<String>) -> Result<()> {
+    if pin {
+        std::fs::write(path, got).with_context(|| path.display().to_string())?;
+        eprintln!("[bench] re-pinned {}", path.display());
+        return Ok(());
+    }
+    let want = std::fs::read_to_string(path).with_context(|| format!("{}: the pin (--pin writes it)", path.display()))?;
+    let moved = moves(&want, got);
+    anyhow::ensure!(moved.is_empty(), "{}: not as pinned (re-pin with --pin only on evidence):\n{}", path.display(), moved.join("\n"));
+    Ok(())
+}
+
+/// The printed lines against the pinned ones of their kinds (a line's
+/// first letter: `f`, `h`, `e`, `b`).
+fn line_moves(want: &str, got: &str) -> Vec<String> {
+    let kinds: Vec<char> = got.lines().filter_map(|l| l.chars().next()).collect();
+    let want: Vec<&str> = want.lines().filter(|l| l.chars().next().is_some_and(|c| kinds.contains(&c))).collect();
+    let got: Vec<&str> = got.lines().collect();
+    if want == got {
+        return Vec::new();
+    }
+    want.iter().map(|l| format!("  pinned {l}")).chain(got.iter().map(|l| format!("  now    {l}"))).collect()
+}
+
+/// The exact metrics against the pinned ones: every key that moved, with
+/// its change, and per kernel (`k.<sym>.*`) the ones that came, went or
+/// changed, the largest moves first.
+fn metrics_moves(want: &str, got: &str) -> Vec<String> {
+    use std::collections::{BTreeMap, BTreeSet};
+    let load = |t: &str| -> (Vec<String>, BTreeMap<String, i64>) {
+        let (mut head, mut vals) = (Vec::new(), BTreeMap::new());
+        for l in t.lines() {
+            match l.rsplit_once(' ').and_then(|(k, v)| Some((k, v.parse::<i64>().ok()?))) {
+                Some((k, v)) if !l.starts_with('#') => {
+                    vals.insert(k.to_string(), v);
+                }
+                _ => head.push(l.to_string()),
+            }
+        }
+        (head, vals)
+    };
+    let ((ha, a), (hb, b)) = (load(want), load(got));
+    let pct = |x: i64, y: i64| if x == 0 { if y == 0 { "0%".to_string() } else { "new".to_string() } } else { format!("{:+.2}%", 100.0 * (y - x) as f64 / x as f64) };
+    let show = |v: Option<&i64>| v.map_or("-".to_string(), i64::to_string);
+    let mut out = Vec::new();
+    if ha != hb {
+        out.push(format!("  header: {ha:?} -> {hb:?}"));
+    }
+    let keys: BTreeSet<&String> = a.keys().chain(b.keys()).collect();
+    for k in keys.iter().filter(|k| !k.starts_with("k.")) {
+        let (x, y) = (a.get(*k), b.get(*k));
+        if x != y {
+            let change = match (x, y) {
+                (Some(x), Some(y)) => pct(*x, *y),
+                (None, _) => "added".to_string(),
+                (_, None) => "removed".to_string(),
+            };
+            out.push(format!("  {k:<40} {:>14} -> {:>14}  {change}", show(x), show(y)));
+        }
+    }
+    let syms = |d: &BTreeMap<String, i64>| -> BTreeSet<String> { d.keys().filter_map(|k| k.strip_prefix("k.")).filter_map(|k| k.split('.').next()).map(str::to_string).collect() };
+    let (sa, sb) = (syms(&a), syms(&b));
+    let mut moved: Vec<(i64, &String)> = keys.iter().filter(|k| k.strip_prefix("k.").and_then(|r| r.split('.').next()).is_some_and(|s| sa.contains(s) && sb.contains(s))).filter(|k| a.get(**k) != b.get(**k)).map(|k| ((b.get(*k).copied().unwrap_or(0) - a.get(*k).copied().unwrap_or(0)).abs(), *k)).collect();
+    let (gone, came): (Vec<&String>, Vec<&String>) = (sa.difference(&sb).collect(), sb.difference(&sa).collect());
+    if !gone.is_empty() || !came.is_empty() || !moved.is_empty() {
+        let changed: BTreeSet<&str> = moved.iter().filter_map(|(_, k)| k.split('.').nth(1)).collect();
+        out.push(format!("  kernels that ran: {} gone, {} new, {} changed", gone.len(), came.len(), changed.len()));
+        moved.sort_by(|x, y| y.cmp(x));
+        for (_, k) in moved.iter().take(12) {
+            let (x, y) = (a.get(*k).copied().unwrap_or(0), b.get(*k).copied().unwrap_or(0));
+            out.push(format!("    {k:<54} {x} -> {y}  {}", pct(x, y)));
+        }
+        out.extend(gone.iter().take(5).map(|s| format!("    gone: {s}")));
+        out.extend(came.iter().take(5).map(|s| format!("    new:  {s}")));
+    }
+    out
 }
 
 /// A run's own scratch dir, `/var/tmp/celeste-NAME-PID` (on disk: a frame's
@@ -238,7 +332,7 @@ impl Drop for Scratch {
 /// for `horizon`.
 fn bench_backward<N: Rem>(tree: &TreeDir, horizon: u32, frame: u32, reps: usize) -> Result<()> {
     let cfg = &tree.settings;
-    anyhow::ensure!(frame < horizon, "--frame {frame}: below the horizon {horizon}");
+    anyhow::ensure!(frame < horizon, "--step {frame}: below the horizon {horizon}");
     let t = std::time::Instant::now();
     let seeds = celeste_rust::search::backward::Seeds::<N>::load(&tree.dir, horizon)?;
     let content = seeds.space.content_hash();

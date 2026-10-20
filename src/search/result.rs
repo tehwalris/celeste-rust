@@ -1,4 +1,4 @@
-//! `<checkpoint-dir>/result.json`: what `rewrite search` decided, as a
+//! `<search-dir>/result.json`: what `rewrite search` decided, as a
 //! record, so nothing parses its log (the category runner, `export-ui`).
 //! Written at every outcome, before the exit code says it; a run's start
 //! removes the previous run's.
@@ -36,7 +36,7 @@ pub enum Verdict {
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct LevelResult {
     pub spec: String,
-    /// Its tree, under the checkpoint dir (`level00`).
+    /// Its tree, under the search's directory (`level00`).
     pub dir: String,
     /// The forward's wall time in this run (0 for a reused tree), seconds.
     pub(crate) forward_s: f64,
@@ -97,7 +97,7 @@ impl SearchResult {
 
     pub(crate) fn read(checkpoint_dir: &Path) -> Result<Self> {
         let p = path(checkpoint_dir);
-        let text = std::fs::read_to_string(&p).with_context(|| format!("reading {} (a `rewrite search` checkpoint dir records its result there)", p.display()))?;
+        let text = std::fs::read_to_string(&p).with_context(|| format!("reading {} (a `rewrite search` directory records its result there)", p.display()))?;
         let r: SearchResult = serde_json::from_str(&text).with_context(|| format!("parsing {}", p.display()))?;
         anyhow::ensure!(r.format == FORMAT, "{}: format {}, this binary reads {FORMAT}", p.display(), r.format);
         Ok(r)

@@ -1,4 +1,4 @@
--- EXACT state traces from UniversalClassicTas (UCT_EXACT=FILE), the float
+-- EXACT state traces from UniversalClassicTas (validate.sh --exact FILE), the float
 -- oracle's ground truth (plans/float.md).
 --
 -- Replaces love.run with a deterministic loop (one update and one draw per
@@ -64,7 +64,7 @@ local function bits(kp)
 end
 
 function E.install(drv)
-  local file = assert(io.open(os.getenv("UCT_EXACT"), "w"))
+  local file = assert(io.open(require("driver_opts").exact, "w"))
   local n = 0
   local input, kf = -1, 0
   -- The sounds of the current update (`psfx`: the original cart plays 1 on

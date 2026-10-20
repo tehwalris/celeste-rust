@@ -18,7 +18,7 @@ use super::backward::Winning;
 use super::arcs::Circle;
 use super::rem::{Point, Rem};
 use crate::abstraction::Level;
-use crate::frame::{wins_of, Block};
+use crate::frame::wins_of;
 use crate::settings::{Clock, Settings};
 use crate::storage::{Sk, GEOMETRY};
 use crate::engines::reference::ReferenceEngine;
@@ -272,15 +272,15 @@ pub(super) struct Side<'a, N: Rem> {
 
 impl<N: Rem> Side<'_, N> {
     /// Does `b` win (the room's win, `wins_of`)?
-    pub(crate) fn wins(&self, b: &Block<N>) -> Result<bool> {
-        Ok(wins_of(b.rt2(), self.s)?.iter().any(|&x| x))
+    pub(crate) fn wins(&self, b: &Rt2<N>) -> Result<bool> {
+        Ok(wins_of(b, self.s)?.iter().any(|&x| x))
     }
 
     /// Is `b` a node whose W at step `t` holds its exact remainder?
-    pub(crate) fn inside(&self, b: &Block<N>, t: u32) -> Result<bool> {
+    pub(crate) fn inside(&self, b: &Rt2<N>, t: u32) -> Result<bool> {
         let (shape, nk, cells) = lookup_keys(b, self.level, self.seeded, self.keys)?;
         let Some(i) = self.node.get(shape, nk[0], cells[0]) else { return Ok(false) };
-        let q = rem_of::<N>(b.rt2())?;
+        let q = rem_of::<N>(b)?;
         Ok(self.w.at(t, i).is_some_and(|r| r.contains(q.0, q.1)))
     }
 }
@@ -301,9 +301,9 @@ impl<N: Rem> Concrete for Single<'_, '_, N> {
     }
 
     fn start(&self, eng: &mut Self::Engine) -> Result<(Rt2<N>, u32)> {
-        let start = Block::canonical(eng.initial()?)?;
-        let cell = start.positions()?[0];
-        Ok((start.into_rt2(), cell))
+        let start = eng.initial()?.canonicalized();
+        let cell = crate::search::pos_graph::block_cells(&start)?[0];
+        Ok((start, cell))
     }
 
     fn successors(&self, eng: &mut Self::Engine, st: &Rt2<N>, byte: u8, t: u32, known: &dyn Fn(&ExactRow) -> bool, steps: &mut u64) -> Result<(Vec<Next<Self>>, u8)> {
@@ -311,7 +311,7 @@ impl<N: Rem> Concrete for Single<'_, '_, N> {
         let mut out = Vec::new();
         for b in succ {
             *steps += 1;
-            let cell = b.positions()?[0];
+            let cell = crate::search::pos_graph::block_cells(&b)?[0];
             if self.0.wins(&b)? {
                 out.push(Next::Win(cell));
                 continue;
@@ -320,7 +320,7 @@ impl<N: Rem> Concrete for Single<'_, '_, N> {
             if known(&exact) || !self.0.inside(&b, t)? {
                 continue;
             }
-            out.push(Next::State(b.into_rt2(), exact, cell));
+            out.push(Next::State(b, exact, cell));
         }
         Ok((out, read))
     }
@@ -391,17 +391,17 @@ impl<'w, C: Circle> NodeKeys<'w, C> {
 
 /// A concrete state's node key at `level` (`lookup_view`, widened) in the
 /// tree's key space (`None`: a code the tree never stored - no node).
-pub(super) fn lookup_keys<N: EngineNum>(b: &Block<N>, level: Level, seeded: bool, keys: &KeySpace<N>) -> Result<(u64, Vec<Option<(u64, u64)>>, Vec<u32>)> {
+pub(super) fn lookup_keys<N: EngineNum>(b: &Rt2<N>, level: Level, seeded: bool, keys: &KeySpace<N>) -> Result<(u64, Vec<Option<(u64, u64)>>, Vec<u32>)> {
     if !seeded {
         return crate::frame::widened_keys(b, level, keys);
     }
-    crate::frame::widened_keys_rt2(&lookup_view(b.rt2(), seeded)?, level, keys)
+    crate::frame::widened_keys(&lookup_view(b, seeded)?, level, keys)
 }
 
 /// A concrete state's EXACT identity: canonical bytes (`exact::exact_rows`)
 /// and cell, never the widened key (sharing it need not share a fate).
-pub(super) fn exact_state<N: EngineNum>(b: &Block<N>, cell: u32) -> ExactRow {
-    let mut v = celeste_engine::exact::exact_rows(b.rt2(), crate::compiled::ids()).swap_remove(0).into_vec();
+pub(super) fn exact_state<N: EngineNum>(b: &Rt2<N>, cell: u32) -> ExactRow {
+    let mut v = celeste_engine::exact::exact_rows(b, crate::compiled::ids()).swap_remove(0).into_vec();
     v.extend_from_slice(&cell.to_le_bytes());
     v.into_boxed_slice()
 }

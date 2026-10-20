@@ -52,12 +52,27 @@ pub fn run(cfg: &Settings, a: Args) -> Result<()> {
         let byte = inputs.get(f as usize - 1).copied().unwrap_or(0);
         let mut out = eng.frame(&state, byte)?;
         anyhow::ensure!(out.len() == 1, "frame {f}: {} leaves (an `rnd` fork: give the balloons' seeds)", out.len());
-        state = out.remove(0).into_rt2();
+        state = out.remove(0);
         print_frame(&state, f, byte);
         if let Some(t) = &object {
             print_object(&state, t);
         }
     }
+    Ok(())
+}
+
+#[derive(clap::Args)]
+pub struct WitnessArgs {
+    /// The witness: comma-separated input bytes, or a `tas/` file, from the
+    /// room's load.
+    #[arg(long)]
+    inputs: String,
+}
+
+/// `witness`: `concrete::witness` of the inputs, as JSON on stdout.
+pub fn witness(cfg: &Settings, a: WitnessArgs) -> Result<()> {
+    let inputs = celeste_rust::concrete::read_inputs(&a.inputs)?;
+    println!("{}", serde_json::to_string(&celeste_rust::concrete::witness(&inputs, cfg)?)?);
     Ok(())
 }
 

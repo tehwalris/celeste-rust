@@ -1,4 +1,4 @@
--- EXACT state traces from Celia (CELIA_EXACT=FILE), the float oracle's second
+-- EXACT state traces from Celia (validate.sh --exact FILE), the float oracle's second
 -- ground truth (plans/float.md), in tools/uct/exact.lua's
 -- format: after every cctas step of the playback (driver.lua's "wait"
 -- phase), before the clean save's seek rewinds the exit away,
@@ -50,7 +50,7 @@ function E.install(drv)
   love.math.setRandomSeed(1)
   math.randomseed(1)
   E.drv = drv
-  E.file = assert(io.open(os.getenv("CELIA_EXACT"), "w"))
+  E.file = assert(io.open(require("celia_opts").exact, "w"))
   E.n = 0
 end
 

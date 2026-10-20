@@ -22,7 +22,7 @@ use std::path::{Path, PathBuf};
 /// The record's format: a tree without one, or with another, is refused
 /// where its settings are checked (tools/fixtures.sh rebuilds its fixtures
 /// on a change).
-pub const VERSION: u32 = 1;
+pub const VERSION: u32 = 2;
 
 /// The game's arithmetic (`--arith`): 16.16, or the float tools' doubles
 /// with the tool (which decides the room's start and the seeds' meaning).
@@ -56,6 +56,63 @@ impl std::fmt::Display for Arith {
     }
 }
 
+/// THE CATEGORY (`--category`), as the tasdatabase names it: what wins a
+/// room (100%: the exit with the berry), which dash starts are moves
+/// (nodiag: no diagonal one, onlydiag: only diagonal ones; the forbidden
+/// arm raises, so it is no move, exactly) and the dashes past the orb
+/// (gemskip: the orb room won without the orb, one dash after it).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+pub enum Category {
+    #[value(name = "any")]
+    Any,
+    #[value(name = "100")]
+    Hundred,
+    #[value(name = "nodiag")]
+    Nodiag,
+    #[value(name = "onlydiag")]
+    Onlydiag,
+    #[value(name = "gemskipany")]
+    GemskipAny,
+    #[value(name = "gemskip100")]
+    Gemskip100,
+    #[value(name = "gemskipnodiag")]
+    GemskipNodiag,
+}
+
+impl Category {
+    /// A room is won only with its berry taken.
+    pub fn hundred(self) -> bool {
+        matches!(self, Category::Hundred | Category::Gemskip100)
+    }
+    /// A dash may not start diagonal.
+    pub fn nodiag(self) -> bool {
+        matches!(self, Category::Nodiag | Category::GemskipNodiag)
+    }
+    /// A dash must start diagonal.
+    pub fn onlydiag(self) -> bool {
+        self == Category::Onlydiag
+    }
+    /// The orb room won without the orb; one dash after it.
+    pub fn gemskip(self) -> bool {
+        matches!(self, Category::GemskipAny | Category::Gemskip100 | Category::GemskipNodiag)
+    }
+}
+
+impl std::str::FromStr for Category {
+    type Err = String;
+    /// A category by its tasdatabase name (as `--category` takes it).
+    fn from_str(s: &str) -> std::result::Result<Self, String> {
+        <Category as clap::ValueEnum>::from_str(s, false).map_err(|_| format!("{s:?} is not a category the search models (any, 100, nodiag, onlydiag, gemskipany, gemskip100, gemskipnodiag)"))
+    }
+}
+
+impl std::fmt::Display for Category {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        use clap::ValueEnum;
+        f.write_str(self.to_possible_value().expect("no variant is skipped").get_name())
+    }
+}
+
 /// THE FLAGS (every binary flattens them; `global`: given anywhere on a
 /// `rewrite` command line), and the run's settings.
 #[derive(clap::Args, Clone, Debug, PartialEq, Eq)]
@@ -83,19 +140,12 @@ pub struct Settings {
     /// or `off`.
     #[arg(long, global = true, default_value = "16,6", value_parser = parse_region)]
     pub region: std::option::Option<(i32, i32)>,
-    /// 100%: a room is won only with its berry taken.
-    #[arg(long, global = true)]
-    pub hundred: bool,
-    /// No Diagonal Dashes: a dash may not start diagonal.
-    #[arg(long, global = true)]
-    pub nodiag: bool,
-    /// Only Diagonal Dashes: a dash must start diagonal (the straight and
-    /// facing-only dash arms raise).
-    #[arg(long, global = true)]
-    pub onlydiag: bool,
-    /// The gemskip categories: the orb room won without the orb, one dash after it.
-    #[arg(long, global = true)]
-    pub gemskip: bool,
+    /// The category, as the tasdatabase names it (`Category`): `100` and
+    /// `gemskip100` win a room only with its berry, `nodiag` and
+    /// `gemskipnodiag` forbid a diagonal dash start, `onlydiag` a straight
+    /// one, the `gemskip` ones skip the orb (one dash after it).
+    #[arg(long, global = true, default_value = "any")]
+    pub category: Category,
     /// The room as real play enters it: its loading frame from object J
     /// (pico8_diff/chain.py), or `none` (the IL load).
     #[arg(long, global = true, default_value = "none", value_parser = parse_jank)]
@@ -104,10 +154,9 @@ pub struct Settings {
     #[arg(long, global = true, default_value = "none", value_parser = parse_seeds)]
     pub balloon_seeds: std::option::Option<String>,
     // NOT recorded.
-    /// The level -1 filter "H,S": H in SEARCH STEPS (2 a game frame under
-    /// --split-frame, where the search's --to/--ceiling count frames;
-    /// `Clock`), S the table's speed bound (the tree records it as
-    /// `frame::TreeFilter`).
+    /// The level -1 filter "H,S": H in game frames (the search's horizon),
+    /// S the table's speed bound (the tree records it, H in steps, as
+    /// `frame::TreeFilter`: `minus_one`).
     #[arg(long, global = true, value_parser = parse_minus_one)]
     pub level_minus_one: Option<(u32, i32)>,
     /// The balloons' phases of the concrete phase only (a tasdatabase file's
@@ -127,6 +176,13 @@ pub struct Settings {
     /// balloons, level) is still refused. A tree without a record is refused.
     #[arg(long, global = true)]
     pub override_settings: bool,
+    /// The start room's CHESTS seeded by `--balloon-seeds` too, in 16.16,
+    /// as the TAS tools seed them (each one's last shake draws its seed + 1:
+    /// `trace::cart::tool_seeds`): a tool file replayed as the tools play it
+    /// (`concrete::witness`). Not a flag, and never a tree's (`write`
+    /// refuses it).
+    #[arg(skip)]
+    pub seed_chests: bool,
     #[command(flatten)]
     pub diag: Diagnostics,
 }
@@ -202,10 +258,7 @@ impl Settings {
             row("win_at", none(self.win_at.map(|(x0, x1, y0, y1)| format!("{x0}..{x1},{y0}..{y1}"))), true),
             switch("split_frame", self.split_frame, true),
             row("region", none(self.region.map(|(px, s)| format!("{px},{s}"))), true),
-            switch("hundred", self.hundred, true),
-            switch("nodiag", self.nodiag, true),
-            switch("onlydiag", self.onlydiag, true),
-            switch("gemskip", self.gemskip, true),
+            row("category", self.category.to_string(), true),
             row("loading_jank", none(self.loading_jank.map(|j| j.to_string())), true),
             row("balloon_seeds", none(self.balloon_seeds.clone()), true),
             row("arith", self.arith.to_string(), true),
@@ -228,7 +281,6 @@ impl Settings {
             let side = crate::storage::GEOMETRY.side as i32;
             anyhow::ensure!(px % side == 0, "--region {px},..: a kernel region must hold whole storage regions ({side} px)");
         }
-        anyhow::ensure!(!(self.nodiag && self.onlydiag), "--nodiag and --onlydiag exclude each other");
         anyhow::ensure!(
             !(self.arith == Arith::Float(FloatTool::Uct) && self.loading_jank.is_some()),
             "--arith float-uct loads a room alone: no --loading-jank (Celia models the jank: --arith float)"
@@ -291,9 +343,10 @@ impl Settings {
         self.region.map(|(px, speed)| crate::trace::walk::RegionGrid { px, speed })
     }
 
-    /// The run's level -1 filter (`--level-minus-one H,S`), if given.
+    /// The run's level -1 filter (`--level-minus-one H,S`), if given: H in
+    /// search steps (`Clock`).
     pub fn minus_one(&self) -> Option<crate::frame::MinusOne> {
-        self.level_minus_one.map(|(h, speed)| crate::frame::MinusOne { h, speed })
+        self.level_minus_one.map(|(h, speed)| crate::frame::MinusOne { h: self.clock().steps(h), speed })
     }
 
     /// The record's lines, `(key, value)`, in a fixed order: what changes a
@@ -328,6 +381,7 @@ impl Settings {
 
     /// Record these, for a tree widened at `level`, as the tree's (atomic).
     pub fn write(&self, dir: &Path, level: crate::abstraction::Level) -> Result<()> {
+        anyhow::ensure!(!self.seed_chests, "{}: a tree is never searched with its chests seeded (a witness replay's setting)", dir.display());
         std::fs::create_dir_all(dir)?;
         let tmp = dir.join("settings.tmp");
         std::fs::write(&tmp, self.text(&level.to_string()))?;
@@ -354,8 +408,14 @@ impl Settings {
         }
         let flags = Flags::try_parse_from(&args).map_err(|e| anyhow::anyhow!("{}: the record does not read back: {e}", path(dir).display()))?;
         let level = crate::abstraction::Level::parse(rec.get("level").with_context(|| format!("{}: the record names no level", path(dir).display()))?).map_err(|e| anyhow::anyhow!(e))?;
+        // The filter's H, recorded in steps, as `--level-minus-one` takes it
+        // (frames).
+        let per_frame = flags.s.clock().per_frame;
         let minus_one = match crate::frame::TreeFilter::read(dir)? {
-            Some(crate::frame::TreeFilter::MinusOne { m, .. }) => Some((m.h, m.speed)),
+            Some(crate::frame::TreeFilter::MinusOne { m, .. }) => {
+                anyhow::ensure!(m.h % per_frame == 0, "{}: the level -1 horizon {} steps is no whole frame", dir.display(), m.h);
+                Some((m.h / per_frame, m.speed))
+            }
             Some(crate::frame::TreeFilter::Off) => None,
             None => anyhow::bail!("{}: no level -1 record (a tree from before records)", dir.display()),
         };
@@ -384,10 +444,7 @@ impl Settings {
             .filter(|(k, v)| rec.get(k) != Some(&v.as_str()))
             .map(|(k, v)| (*k, format!("{k}: the tree's {}, this run's {v}", rec.get(k).copied().unwrap_or("(missing)"))))
             .collect();
-        // `storage_region 8`: an old record's line for the fixed side
-        // (`storage::GEOMETRY`); any other side is refused.
-        let legacy = |k: &str| k == "storage_region" && rec.get(k) == Some(&"8");
-        diffs.extend(rec.keys().filter(|k| !mine.iter().any(|(m, _)| m == *k) && !legacy(k)).map(|k| (*k, format!("{k}: in the tree's record, not a setting"))));
+        diffs.extend(rec.keys().filter(|k| !mine.iter().any(|(m, _)| m == *k)).map(|k| (*k, format!("{k}: in the tree's record, not a setting"))));
         if diffs.is_empty() {
             return Ok(());
         }
@@ -570,43 +627,39 @@ pub fn duplicate_flags(cmd: &clap::Command) -> Vec<String> {
 }
 
 /// A binary's first step: refuse every `CELESTE_*` variable in the
-/// environment, naming the flag that replaced each (a stale script must not
-/// run with its knobs silently ignored). `CELESTE_FIXTURES` (read by
+/// environment (a stale script must not run with its knobs silently
+/// ignored; settings are flags). `CELESTE_FIXTURES` (read by
 /// tools/fixtures.sh only) is allowed.
 pub fn refuse_env() -> Result<()> {
-    const MOVED: &[(&str, &str)] = &[
-        ("CELESTE_START_ROOM", "--room X,Y"),
-        ("CELESTE_WIN_AT_XY", "--win-at"),
-        ("CELESTE_SPLIT_FRAME", "--split-frame"),
-        ("CELESTE_REGION", "--region"),
-        ("CELESTE_HUNDRED", "--hundred"),
-        ("CELESTE_NODIAG", "--nodiag"),
-        ("CELESTE_ONLYDIAG", "--onlydiag"),
-        ("CELESTE_GEMSKIP", "--gemskip"),
-        ("CELESTE_LOADING_JANK", "--loading-jank"),
-        ("CELESTE_BALLOON_SEEDS", "--balloon-seeds"),
-        ("CELESTE_CONCRETE_BALLOON_SEEDS", "--concrete-balloon-seeds"),
-        ("CELESTE_LEVEL_MINUS_ONE", "--level-minus-one H,S"),
-        ("CELESTE_TRIM_ROWS", "nothing: frame files hold keys, never rows (plans/architecture.md)"),
-        ("CELESTE_THREADS", "--threads"),
-        ("CELESTE_L1_TABLE", "--l1-table"),
-        ("CELESTE_KERNEL_KEY_CHECK", "--key-check"),
-        ("CELESTE_KERNEL_EXPLAIN", "--kernel-explain"),
-        ("CELESTE_KERNEL_METRICS", "bench frame --metrics"),
-        ("CELESTE_BUILD_TRACE", "--build-trace"),
-        ("CELESTE_PHASES", "--phases"),
-    ];
-    let mut bad: Vec<String> = std::env::vars_os()
-        .filter_map(|(k, _)| k.to_str().map(str::to_string))
-        .filter(|k| k.starts_with("CELESTE_") && k != "CELESTE_FIXTURES")
-        .map(|k| match MOVED.iter().find(|m| m.0 == k) {
-            Some((_, flag)) => format!("{k}: now the flag {flag}"),
-            None => format!("{k}: no such setting (the flags: --help)"),
-        })
-        .collect();
+    let mut bad: Vec<String> = std::env::vars_os().filter_map(|(k, _)| k.to_str().map(str::to_string)).filter(|k| k.starts_with("CELESTE_") && k != "CELESTE_FIXTURES").collect();
     bad.sort();
-    anyhow::ensure!(bad.is_empty(), "the environment sets CELESTE_* variables; settings are flags:\n  {}", bad.join("\n  "));
+    anyhow::ensure!(bad.is_empty(), "the environment sets {}: settings are flags (--help)", bad.join(", "));
     Ok(())
+}
+
+/// A binary's second step: refuse to run without a MEMORY CAP - a finite
+/// `memory.max` on the process's cgroup or an ancestor's (cgroup v2), what
+/// `./safe-run.sh` gives it (CLAUDE.md "Running safely": an uncapped run
+/// once took the machine down). Checked at run time, so no script can
+/// forget the wrapper.
+pub fn refuse_uncapped() -> Result<()> {
+    let own = std::fs::read_to_string("/proc/self/cgroup").context("reading /proc/self/cgroup (the memory cap's cgroup)")?;
+    capped(&own, Path::new("/sys/fs/cgroup"))
+}
+
+/// `refuse_uncapped` of a `/proc/self/cgroup` text over the cgroup tree at
+/// `root`.
+fn capped(own: &str, root: &Path) -> Result<()> {
+    let path = own.lines().find_map(|l| l.strip_prefix("0::")).with_context(|| format!("no cgroup v2 line in /proc/self/cgroup ({own:?}): the memory cap cannot be checked"))?;
+    let mut dir = Some(Path::new(path));
+    while let Some(d) = dir {
+        let max = std::fs::read_to_string(root.join(d.strip_prefix("/").unwrap_or(d)).join("memory.max")).unwrap_or_default();
+        if max.trim().parse::<u64>().is_ok() {
+            return Ok(());
+        }
+        dir = d.parent();
+    }
+    anyhow::bail!("no memory cap: cgroup {path} and every ancestor have memory.max `max`. Run it under ./safe-run.sh (CLAUDE.md \"Running safely\")")
 }
 
 /// A binary's settings from its flags (the environment refused), logged:
@@ -615,6 +668,7 @@ pub fn refuse_env() -> Result<()> {
 /// float` (it would run fixed under a float flag).
 pub fn startup(args: &Settings, float: bool, adjust: impl FnOnce(&mut Settings)) -> Result<Settings> {
     refuse_env()?;
+    refuse_uncapped()?;
     let mut s = args.clone().resolved()?;
     anyhow::ensure!(float || s.arith == Arith::Fixed, "--arith {}: this command runs in fixed only so far (plans/float.md, Open gaps)", s.arith);
     adjust(&mut s);
@@ -629,9 +683,10 @@ pub fn startup(args: &Settings, float: bool, adjust: impl FnOnce(&mut Settings))
 /// game frame is `per_frame` search steps - 2 under `--split-frame` (part a
 /// up to and including the player's move, part b the rest; step `2k` ends
 /// frame `k`), else 1. Steps are the internal unit: the tree and its
-/// files, the edges, W, the marks, level -1's `H` and the tree commands'
-/// `--to`/`--frame` count them (a mid-frame state is a node of its own).
-/// The search's horizon (`--to`, `--ceiling`), its bounds, witnesses and
+/// files, the edges, W, the marks and level -1's recorded `H` count them
+/// (a mid-frame state is a node of its own), as the flags named so do
+/// (`--steps`, `--step`, `--from-step`, `--to-step`). The search's horizon
+/// (`--frames`), `--level-minus-one`'s `H`, its bounds, witnesses and
 /// `result.json` count frames. Every conversion is here.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Clock {
@@ -676,9 +731,25 @@ mod tests {
     #[test]
     fn flags_make_the_settings() {
         assert_eq!(parse(&[]).expect("defaults"), Settings::default());
-        let s = parse(&["--room", "6,2", "--hundred", "--loading-jank", "2", "--level-minus-one", "94,5", "--win-at", "8..10,64"]).expect("flags");
-        assert_eq!((s.room, s.hundred, s.loading_jank, s.level_minus_one, s.win_at), ((6, 2), true, Some(2), Some((94, 5)), Some((8, 10, 64, 64))));
-        for bad in [&["--room", "6"][..], &["--region", "16,9"], &["--nodiag", "--onlydiag"], &["--loading-jank", "0"], &["--win-at", "9..8,1"], &["--threads", "0"], &["--region", "12,6"]] {
+        let s = parse(&["--room", "6,2", "--category", "100", "--loading-jank", "2", "--level-minus-one", "94,5", "--win-at", "8..10,64"]).expect("flags");
+        assert_eq!((s.room, s.category, s.loading_jank, s.level_minus_one, s.win_at), ((6, 2), Category::Hundred, Some(2), Some((94, 5)), Some((8, 10, 64, 64))));
+        // Every category by its tasdatabase name, and what it means.
+        let rules = |c: &str| {
+            let c = parse(&["--category", c]).expect("a category").category;
+            (c.to_string(), c.hundred(), c.nodiag(), c.onlydiag(), c.gemskip())
+        };
+        for (name, hundred, nodiag, onlydiag, gemskip) in [
+            ("any", false, false, false, false),
+            ("100", true, false, false, false),
+            ("nodiag", false, true, false, false),
+            ("onlydiag", false, false, true, false),
+            ("gemskipany", false, false, false, true),
+            ("gemskip100", true, false, false, true),
+            ("gemskipnodiag", false, true, false, true),
+        ] {
+            assert_eq!(rules(name), (name.to_string(), hundred, nodiag, onlydiag, gemskip));
+        }
+        for bad in [&["--room", "6"][..], &["--region", "16,9"], &["--category", "hundred"], &["--category", "mindashes"], &["--hundred"], &["--loading-jank", "0"], &["--win-at", "9..8,1"], &["--threads", "0"], &["--region", "12,6"]] {
             assert!(parse(bad).is_err(), "{bad:?}");
         }
         assert_eq!(parse(&["--region", "off"]).expect("off").region, None);
@@ -703,8 +774,8 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("celeste-settings-back-{}", std::process::id()));
         let lvl = crate::abstraction::Level::parse("r0sxhf").expect("a level");
         let run = Settings { threads: Some(3), diag: Diagnostics { key_check: true, ..Default::default() }, ..Settings::default() };
-        let all = Settings { room: (6, 2), win_at: Some((8, 10, 64, 64)), split_frame: true, region: None, hundred: true, nodiag: true, gemskip: true, loading_jank: Some(2), balloon_seeds: Some("0,1".into()), ..run.clone() };
-        let float = Settings { arith: Arith::Float(FloatTool::Uct), loading_jank: None, onlydiag: true, nodiag: false, ..all.clone() };
+        let all = Settings { room: (6, 2), win_at: Some((8, 10, 64, 64)), split_frame: true, region: None, category: Category::GemskipNodiag, loading_jank: Some(2), balloon_seeds: Some("0,1".into()), ..run.clone() };
+        let float = Settings { arith: Arith::Float(FloatTool::Uct), loading_jank: None, category: Category::Onlydiag, ..all.clone() };
         for s in [Settings { threads: Some(3), ..run.clone() }, all, float] {
             let _ = std::fs::remove_dir_all(&dir);
             s.write(&dir, lvl).expect("write");
@@ -712,7 +783,38 @@ mod tests {
             let (back, level) = Settings::of_tree(&dir, &run).expect("read back");
             assert_eq!((back, level), (s, lvl));
         }
+        // Level -1's H: frames on the command line, steps in the record (two
+        // a frame under the split frame).
+        let split = Settings { split_frame: true, level_minus_one: Some((84, 5)), ..run.clone() };
+        assert_eq!(split.minus_one().map(|m| (m.h, m.speed)), Some((168, 5)));
         let _ = std::fs::remove_dir_all(&dir);
+        split.write(&dir, lvl).expect("write");
+        for (record, back) in [("h 168 speed 5 table 0\n", Ok(Some((84, 5)))), ("h 167 speed 5 table 0\n", Err("no whole frame"))] {
+            std::fs::write(dir.join("level_minus_one.txt"), record).expect("the filter's record");
+            match (Settings::of_tree(&dir, &run), back) {
+                (Ok((s, _)), Ok(want)) => assert_eq!(s.level_minus_one, want),
+                (Err(e), Err(why)) => assert!(e.to_string().contains(why), "{e}"),
+                (got, want) => panic!("{record:?}: {:?}, wanted {want:?}", got.map(|(s, _)| s.level_minus_one)),
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A process runs only under a memory cap: its cgroup's, or an
+    /// ancestor's, finite `memory.max`.
+    #[test]
+    fn a_run_without_a_memory_cap_is_refused() {
+        let root = std::env::temp_dir().join(format!("celeste-cgroup-{}", std::process::id()));
+        let scope = root.join("user.slice/run.scope");
+        std::fs::create_dir_all(&scope).expect("mkdir");
+        let own = "0::/user.slice/run.scope\n";
+        for (slice, run, ok) in [("max", "max", false), ("max", "2147483648", true), ("8589934592", "max", true)] {
+            std::fs::write(root.join("user.slice/memory.max"), format!("{slice}\n")).expect("write");
+            std::fs::write(scope.join("memory.max"), format!("{run}\n")).expect("write");
+            assert_eq!(capped(own, &root).is_ok(), ok, "slice {slice}, scope {run}");
+        }
+        assert!(capped("1:name=systemd:/x\n", &root).is_err(), "no cgroup v2 line");
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// The record round-trips; every differing setting is named; a tree
@@ -723,16 +825,16 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("mkdir");
         let lvl = |l: &str| crate::abstraction::Level::parse(l).expect("a level");
-        let sample = Settings { room: (6, 2), hundred: true, loading_jank: Some(2), ..Settings::default() };
+        let sample = Settings { room: (6, 2), category: Category::Hundred, loading_jank: Some(2), ..Settings::default() };
         let e = sample.check(&dir, lvl("r0sxhf")).expect_err("no record");
         assert!(e.to_string().contains("records no settings"), "{e}");
         std::fs::write(path(&dir), sample.text("r0sxhf")).expect("write");
         sample.check(&dir, lvl("r0sxhf")).expect("the same settings");
         let harmless = Settings { threads: Some(3), level_minus_one: Some((94, 5)), diag: Diagnostics { key_check: true, ..Default::default() }, ..sample.clone() };
         harmless.check(&dir, lvl("r0sxhf")).expect("threads, level -1 and diagnostics are not a tree's settings");
-        let other = Settings { hundred: false, split_frame: true, win_at: Some((8, 8, 64, 64)), ..sample.clone() };
+        let other = Settings { category: Category::Any, split_frame: true, win_at: Some((8, 8, 64, 64)), ..sample.clone() };
         let e = other.check(&dir, lvl("r0sxh")).expect_err("other settings").to_string();
-        for k in ["hundred: the tree's 1, this run's 0", "split_frame: the tree's 0, this run's 1", "win_at: the tree's none, this run's 8..8,64..64", "level: the tree's r0sxhf, this run's r0sxh"] {
+        for k in ["category: the tree's 100, this run's any", "split_frame: the tree's 0, this run's 1", "win_at: the tree's none, this run's 8..8,64..64", "level: the tree's r0sxhf, this run's r0sxh"] {
             assert!(e.contains(k), "{k} not in {e}");
         }
         assert!(!e.contains("room:"), "{e}");
@@ -754,14 +856,12 @@ mod tests {
         let e = grid.check(&dir, lvl("r0sxhf")).expect_err("another grid, no override").to_string();
         assert!(e.contains("region: the tree's 16,6, this run's none") && e.contains("--override-settings proceeds"), "{e}");
         Settings { override_settings: true, ..grid.clone() }.check(&dir, lvl("r0sxhf")).expect("the grid overridden");
-        let e = Settings { override_settings: true, hundred: false, ..grid }.check(&dir, lvl("r0sxhf")).expect_err("a category is not overridable").to_string();
-        assert!(e.contains("hundred: the tree's 1, this run's 0") && e.contains("region:"), "{e}");
-        // A record from before the storage side was fixed: `storage_region 8`
-        // is accepted, another side is not.
-        for (side, ok) in [("8", true), ("16", false)] {
-            std::fs::write(path(&dir), format!("{}storage_region {side}\n", sample.text("r0sxhf"))).expect("write");
-            assert_eq!(sample.check(&dir, lvl("r0sxhf")).is_ok(), ok, "storage_region {side}");
-        }
+        let e = Settings { override_settings: true, category: Category::Any, ..grid }.check(&dir, lvl("r0sxhf")).expect_err("a category is not overridable").to_string();
+        assert!(e.contains("category: the tree's 100, this run's any") && e.contains("region:"), "{e}");
+        // A line that is no setting is refused.
+        std::fs::write(path(&dir), format!("{}storage_region 8\n", sample.text("r0sxhf"))).expect("write");
+        let e = sample.check(&dir, lvl("r0sxhf")).expect_err("an unknown line").to_string();
+        assert!(e.contains("storage_region: in the tree's record, not a setting"), "{e}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

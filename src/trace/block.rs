@@ -37,7 +37,7 @@ pub const BUTTON_GLOBAL: &str = "__button_states";
 
 /// The block of `st`, one lane: its structure, and its values by `num` and
 /// `boolean` (the domain's part). Canonical cell order, its shape hash set,
-/// no row keys (`frame::Block::canonical` makes them).
+/// no row keys.
 pub fn to_rt2<D: Domain, N: EngineNum>(
     st: &State<D>,
     cache: Arc<CollisionCache>,

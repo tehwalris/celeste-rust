@@ -1,4 +1,4 @@
--- Frame capture for the headless Celia driver (CELIA_CAPTURE=DIR), in
+-- Frame capture for the headless Celia driver (validate.sh --capture DIR), in
 -- tools/uct/capture.lua's output format, so tools/compare_video.py (--tool
 -- celia) renders either. A frames.jsonl record's input is the one the step
 -- consumed (-1 before the player is active), its keypress_frame the input's
@@ -47,7 +47,7 @@ function C.install(drv)
   love.math.setRandomSeed(1)
   math.randomseed(1)
   C.drv = drv
-  C.dir = os.getenv("CELIA_CAPTURE")
+  C.dir = require("celia_opts").capture
   C.bin = assert(io.open(C.dir .. "/frames.bin", "wb"))
   C.meta = assert(io.open(C.dir .. "/frames.jsonl", "w"))
   C.layers = {love.graphics.newCanvas(128, 128), love.graphics.newCanvas(128, 128), love.graphics.newCanvas(128, 128)}

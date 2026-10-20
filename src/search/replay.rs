@@ -7,10 +7,11 @@
 //! (`level_minus_one::check_route`) and the robustness report (`robust`).
 
 use anyhow::Result;
+use celeste_engine::runtime2::Rt2;
 
 use super::concrete::exact_state;
 use super::rem::Rem;
-use crate::frame::{wins_of, Block};
+use crate::frame::wins_of;
 use celeste_core::arith::EngineNum;
 
 /// The states of a replay, per search step.
@@ -18,12 +19,12 @@ pub(crate) struct Replay<N: EngineNum> {
     /// Per step up to the step before the exit, its states, each with its
     /// FIRST parent (the index of the state in the step before it was first
     /// made from; the start's is 0).
-    pub(crate) layers: Vec<Vec<(u32, Block<N>)>>,
+    pub(crate) layers: Vec<Vec<(u32, Rt2<N>)>>,
     /// Per step, the parents dedup dropped: `(state, another parent)`.
     pub(crate) merged: Vec<Vec<(u32, u32)>>,
     /// The step a leaf first wins at, and the winning leaves with their
     /// parents (`None`: no win by the horizon or the inputs' end).
-    pub(crate) exit: Option<(u32, Vec<(u32, Block<N>)>)>,
+    pub(crate) exit: Option<(u32, Vec<(u32, Rt2<N>)>)>,
     /// Whether the run is seeded (`Settings::concrete`).
     pub(crate) seeded: bool,
 }
@@ -35,7 +36,7 @@ impl<N: Rem> Replay<N> {
         let clock = s.clock();
         let (mut engines, seeded) = super::concrete::concrete_engines::<N>(1, s)?;
         let eng = &mut engines[0];
-        let mut layers: Vec<Vec<(u32, Block<N>)>> = vec![vec![(0, Block::canonical(eng.initial()?)?)]];
+        let mut layers: Vec<Vec<(u32, Rt2<N>)>> = vec![vec![(0, eng.initial()?.canonicalized())]];
         let mut merged: Vec<Vec<(u32, u32)>> = vec![Vec::new()];
         let last = horizon.unwrap_or(clock.steps(inputs.len() as u32));
         for step in 0..last {
@@ -44,12 +45,12 @@ impl<N: Rem> Replay<N> {
             let (mut next, mut more, mut won) = (Vec::new(), Vec::new(), Vec::new());
             let mut seen: rustc_hash::FxHashMap<celeste_engine::exact::ExactRow, u32> = Default::default();
             for (p, (_, b)) in layers.last().expect("the start").iter().enumerate() {
-                for c in eng.step(b.rt2(), byte)? {
-                    if wins_of(c.rt2(), s)?.iter().any(|&x| x) {
+                for c in eng.step(b, byte)? {
+                    if wins_of(&c, s)?.iter().any(|&x| x) {
                         won.push((p as u32, c));
                         continue;
                     }
-                    match seen.entry(exact_state(&c, c.positions()?[0])) {
+                    match seen.entry(exact_state(&c, crate::search::pos_graph::block_cells(&c)?[0])) {
                         std::collections::hash_map::Entry::Occupied(e) => more.push((*e.get(), p as u32)),
                         std::collections::hash_map::Entry::Vacant(e) => {
                             e.insert(next.len() as u32);

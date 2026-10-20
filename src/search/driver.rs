@@ -8,6 +8,7 @@ use std::path::Path;
 
 use anyhow::Result;
 use celeste_core::lua_f64::LuaF64;
+use celeste_engine::runtime2::Rt2;
 use celeste_core::pico8_num::Pico8Num as P8;
 
 use super::backward::{backward, gate_w_hash, optimum, Seeds, Winning, BLOCK};
@@ -17,7 +18,7 @@ use super::rem::{start_point, Rem};
 use super::result::{DualResult, LevelResult, SearchResult, Verdict};
 use crate::abstraction::Level;
 use crate::compiled::KernelLanes;
-use crate::frame::{Block, MarkFilter, Visited};
+use crate::frame::{MarkFilter, Visited};
 use crate::settings::{Arith, Settings};
 
 pub struct SearchSpec<'a> {
@@ -29,7 +30,7 @@ pub struct SearchSpec<'a> {
     /// (`--ceiling`: a refutation, or no witness by it, is an error).
     pub horizon: u32,
     pub ceiling: bool,
-    /// The checkpoint dir: level i's tree in `level{i:02}/` (a dual search's
+    /// The search's directory: level i's tree in `level{i:02}/` (a dual search's
     /// under `fixed/` and `float/`), the witness and `result.json`.
     pub dir: &'a Path,
     /// Stop at the arc bound (`--no-witness`).
@@ -118,7 +119,7 @@ fn single<N: KernelLanes>(spec: &SearchSpec, levels: &[Level], res: &mut SearchR
     let win_at = s.win_at.map_or(String::new(), |(x0, x1, y0, y1)| format!(" --win-at {},{}", r(x0, x1), r(y0, y1)));
     let last = res.levels.last().expect("a level");
     let header = format!(
-        "# Room ({room}): the concrete witness of `rewrite search --level {} --to {}`{win_at}.\n\
+        "# Room ({room}): the concrete witness of `rewrite search --level {} --frames {}`{win_at}.\n\
          # Arc bound f{} (level {}, {}); no concrete win before f{} inside the winning sets (exhaustive).\n\
          # A balloon room's win may hold for some `rnd` draws only: replay with seeds.\n",
         spec.level,
@@ -167,7 +168,7 @@ fn dual(spec: &SearchSpec, float: &Settings, levels: &[Level], res: &mut SearchR
     super::dual::replay::<P8, LuaF64>(&w, cfg, float)?;
     let f = w.inputs.len();
     let header = format!(
-        "# Room ({room}): the DUAL witness of `rewrite dual --level {} --to {horizon}`: {} exits on frame {f} (the count, Philippe's rule (b)), real play (16.16) on frame {}.\n\
+        "# Room ({room}): the DUAL witness of `rewrite dual --level {} --frames {horizon}`: {} exits on frame {f} (the count, Philippe's rule (b)), real play (16.16) on frame {}.\n\
          # Dual bound f{bound} (fixed f{bx}, float f{bf}); no dual win before f{f} inside both halves' winning sets (exhaustive).\n\
          # A balloon room's real-play exit may hold for some `rnd` draws only.\n",
         spec.level, float.arith, w.fixed_exit
@@ -240,7 +241,7 @@ fn run_levels<N: KernelLanes>(
             }
         }
         let engine = || -> Result<Box<dyn crate::frame::FrameStep<N>>> { Ok(Box::new(crate::compiled::Kernels::<N>::new(cfg, lvl)?)) };
-        let initial = || -> Result<Vec<Block<N>>> { Ok(vec![Block::canonical(crate::engines::reference::ReferenceEngine::<N::A>::new(cfg)?.initial()?)?]) };
+        let initial = || -> Result<Vec<Rt2<N>>> { Ok(vec![crate::engines::reference::ReferenceEngine::<N::A>::new(cfg)?.initial()?.canonicalized()]) };
         let first_win = crate::frame::grow_tree(&dir, steps, want, filter.as_ref(), lvl, engine, initial, cfg)?.win_frame;
         let forward_s = t.elapsed().as_secs_f64();
         // `f` counts search steps.

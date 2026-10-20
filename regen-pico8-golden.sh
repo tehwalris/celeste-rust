@@ -3,12 +3,16 @@
 # REAL PICO-8. Needs a PICO-8 install; the golden files are checked in so
 # that the tests run without one.
 #
+#   ./regen-pico8-golden.sh [--pico8 BIN]   (default ~/pico-8/pico8)
+#
 # READ THE DIFF before committing. A change here means the model's
 # reference moved, which is a much bigger deal than a test going red.
 set -euo pipefail
-P8="${PICO8:-$HOME/pico-8/pico8}"
+P8=$HOME/pico-8/pico8
+if [[ ${1:-} == --pico8 ]]; then P8=$2; shift 2; fi
+[[ $# -eq 0 ]] || { echo "usage: ./regen-pico8-golden.sh [--pico8 BIN]" >&2; exit 2; }
 if [ ! -x "$P8" ]; then
-    echo "no PICO-8 at $P8 (set PICO8=/path/to/pico8)" >&2
+    echo "no PICO-8 at $P8 (--pico8 /path/to/pico8)" >&2
     exit 1
 fi
 tmp="$(mktemp -d)"

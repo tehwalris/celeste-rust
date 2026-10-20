@@ -6,6 +6,7 @@
 
 use crate::search::hull::{AccOf, HullOf};
 use anyhow::{anyhow, ensure, Result};
+use celeste_engine::runtime2::Rt2;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use rustc_hash::FxHashMap;
@@ -19,7 +20,7 @@ use super::unit::UnitSink;
 use super::visited::{Key, VisitedSet};
 use super::{Sk, GEOMETRY};
 use super::stats::{Lap, Stats, S};
-use crate::frame::{Block, Filters, FrameStep};
+use crate::frame::{Filters, FrameStep};
 use crate::search::rem::Rem;
 use celeste_core::pico8_num::Pico8Num as P8;
 use celeste_engine::exact::{Code, KeyAdditions, MissKey, Provisional};
@@ -349,11 +350,10 @@ fn run_unit<N: Rem>(engine: &dyn FrameStep<N>, u: u32, entries: std::ops::Range<
     sink.sources_done();
     let shape = *shapes.get((region / geo.slots) as usize).ok_or_else(|| anyhow!("a frontier region of no shape"))?;
     let skel = layer.skeletons.get(&shape).ok_or_else(|| anyhow!("ROWS FROM KEYS: the frontier holds no skeleton of shape {shape:016x}"))?;
-    let rt2 = super::decode::decode_rows(sink.keys(), skel, &sc.rows)?;
-    let block = Block::from_rt2(rt2);
+    let block = super::decode::decode_rows(sink.keys(), skel, &sc.rows)?;
     let skip = crate::frame::not_expanded(&block, layer_frame, ceiling, s)?;
     sc.live.clear();
-    sc.live.extend((0..block.lanes()).filter(|&l| !skip[l]));
+    sc.live.extend((0..block.width).filter(|&l| !skip[l]));
     sink.stats.tick(S::PhDecode, t_dec);
     // A unit of exits only (the frame after a win) runs no kernel: their
     // shapes have none.
@@ -1327,12 +1327,12 @@ pub(crate) fn par_map<T: Sync, R: Send>(items: &[T], threads: usize, f: impl Fn(
 /// `trace::walk`) - and nothing looks the start up by projection
 /// (`backward::Seeds::load`, `known::Pruning::start`). Each row must decode
 /// to itself (`check_piece`).
-pub(crate) fn seed<N: Rem>(visited: &mut VisitedSet<N>, blocks: &[Block<N>], start: HullOf<N>, s: &crate::settings::Settings) -> Result<Wave<N>> {
+pub(crate) fn seed<N: Rem>(visited: &mut VisitedSet<N>, blocks: &[Rt2<N>], start: HullOf<N>, s: &crate::settings::Settings) -> Result<Wave<N>> {
     let geo = visited.geo;
     let ids = crate::compiled::ids();
     let mut canon: Vec<celeste_engine::runtime2::Rt2<N>> = Vec::with_capacity(blocks.len());
     for b in blocks {
-        let mut r = b.rt2().clone_block();
+        let mut r = b.clone_block();
         r.canonical();
         canon.push(r);
     }
@@ -1412,7 +1412,7 @@ pub(crate) fn seed<N: Rem>(visited: &mut VisitedSet<N>, blocks: &[Block<N>], sta
 /// ONE FRAME of `rows` (widened to the engine's level) against an EMPTY
 /// tree: every successor new, a row's own too (the seeds are forgotten once
 /// keyed); the whole circle as their hulls. The successors, with their keys.
-pub fn one_frame<N: Rem>(engine: &dyn FrameStep<N>, rows: Vec<Block<N>>, frame: u32) -> Result<Vec<Block<N>>> {
+pub fn one_frame<N: Rem>(engine: &dyn FrameStep<N>, rows: Vec<Rt2<N>>, frame: u32) -> Result<Vec<Rt2<N>>> {
     let mut visited = VisitedSet::<N>::new(super::GEOMETRY);
     let mut xfers = XferTable::<N>::default();
     let skeletons = Skeletons::<N>::default();
@@ -1421,7 +1421,7 @@ pub fn one_frame<N: Rem>(engine: &dyn FrameStep<N>, rows: Vec<Block<N>>, frame: 
     visited.forget_states();
     let cx = WaveCtx { visited: &mut visited, xfers: &mut xfers, filters: Filters::default(), frame, edges_dir: None, edges: None, skeletons: &skeletons, ceiling: None };
     let wave = run_wave(engine, start, cx)?;
-    Ok(super::layer::decode_states(&wave.next, &visited.keys, visited.shapes(), usize::MAX, &|_| true)?.into_iter().map(|(_, rt2)| Block::from_rt2(rt2)).collect())
+    Ok(super::layer::decode_states(&wave.next, &visited.keys, visited.shapes(), usize::MAX, &|_| true)?.into_iter().map(|(_, rt2)| rt2).collect())
 }
 
 #[cfg(test)]
@@ -1437,16 +1437,16 @@ mod tests {
     fn frame_zero_is_the_start_where_its_view_is_not() {
         let ids = crate::compiled::ids();
         let cases = [
-            Settings { room: (2, 0), hundred: true, ..Default::default() },
-            Settings { room: (0, 3), hundred: true, gemskip: true, loading_jank: Some(1), ..Default::default() },
+            Settings { room: (2, 0), category: crate::settings::Category::Hundred, ..Default::default() },
+            Settings { room: (0, 3), category: crate::settings::Category::Gemskip100, loading_jank: Some(1), ..Default::default() },
             Settings { room: (7, 0), loading_jank: Some(1), ..Default::default() },
         ];
         for s in cases {
-            let start = Block::canonical(crate::engines::reference::RefEngine::new(&s).expect("engine").initial().expect("start")).expect("block");
-            let mut view = start.rt2().clone_block();
+            let start = crate::engines::reference::RefEngine::new(&s).expect("engine").initial().expect("start").canonicalized();
+            let mut view = start.clone_block();
             crate::frame::widen_rt2_to(&mut view, crate::abstraction::Level::EXACT);
             view.canonical();
-            assert_ne!(celeste_engine::exact::exact_rows(&view, ids), celeste_engine::exact::exact_rows(start.rt2(), ids), "room {:?}: the start is its own view", s.room);
+            assert_ne!(celeste_engine::exact::exact_rows(&view, ids), celeste_engine::exact::exact_rows(&start, ids), "room {:?}: the start is its own view", s.room);
             let mut visited = VisitedSet::new(GEOMETRY);
             let wave = seed(&mut visited, std::slice::from_ref(&start), Hull::full(), &s).unwrap_or_else(|e| panic!("room {:?}: frame 0: {e:#}", s.room));
             let decoded = super::super::layer::decode_states(&wave.next, &visited.keys, visited.shapes(), usize::MAX, &|_| true).expect("decode");
@@ -1454,7 +1454,7 @@ mod tests {
             assert_eq!(sks.len(), 1, "room {:?}: frame 0 is one state", s.room);
             assert_eq!(
                 (celeste_engine::exact::exact_rows(row, ids), sks[0].cell(&GEOMETRY)),
-                (celeste_engine::exact::exact_rows(start.rt2(), ids), start.positions().expect("cell")[0]),
+                (celeste_engine::exact::exact_rows(&start, ids), crate::search::pos_graph::block_cells(&start).expect("cell")[0]),
                 "room {:?}: frame 0 is not the start",
                 s.room
             );

@@ -7,7 +7,7 @@
 use anyhow::Result;
 use celeste_engine::runtime2::Rt2;
 use celeste_rust::abstraction::Level;
-use celeste_rust::frame::{widen_rt2_to, wins_of, Block, FrameStep};
+use celeste_rust::frame::{widen_rt2_to, wins_of, FrameStep};
 use celeste_rust::search::inspect::{brief, cell_names, project_all, project_onto, project_row, Proj};
 use celeste_rust::search::rem::Rem;
 use celeste_rust::search::tree::TreeDir;
@@ -24,7 +24,7 @@ use crate::{where_, KernelsNew, Rows};
 pub enum Command {
     /// THE KERNELS AGAINST THE REFERENCE ENGINE, row by row.
     ///
-    /// `--samples` stored rows of `--frame` (`--row N`: the N-th alone),
+    /// `--samples` stored rows of `--step` (`--row N`: the N-th alone),
     /// each one step through the tree level's kernels and through
     /// `RefEngine`, both projected onto the level and compared by named
     /// fields. A reference successor the kernels miss is a SOUNDNESS gap; a
@@ -47,7 +47,7 @@ pub enum Command {
     Arcs(ArcsArgs),
     /// THE WIDENING TABLE'S TWO SIDES AGREE (`celeste_engine::widening`).
     ///
-    /// Every row stored at `--frame` (widened in the kernels' graph) is a
+    /// Every row stored at `--step` (widened in the kernels' graph) is a
     /// fixed point of the block side's widening at the tree's level
     /// (`Rt2::widen_to`), compared exactly, and so is every row the kernels
     /// emit from `--emitted` of them (evenly spaced). A row the block side
@@ -65,7 +65,7 @@ pub enum Command {
     /// remainder (whole frames only), and at every frame boundary project
     /// onto an arc-graph node whose W holds its exact remainder, reached (at
     /// a level that filters the next) - per level, the arc phase rerun over
-    /// `<checkpoint-dir>/level{i:02}` as `search` ran it, without the
+    /// `<search-dir>/level{i:02}` as `search` ran it, without the
     /// concrete search. Exits non-zero on the first check that drops it,
     /// with the step, the node and the state (and, where the tree lost it,
     /// the kernels' successors of its state a frame before).
@@ -81,7 +81,7 @@ pub enum Command {
 
 #[derive(clap::Args)]
 pub struct RefArgs {
-    /// The tree (a forward's checkpoint dir, or a search's `levelNN`).
+    /// The tree (a forward's `--tree`, or a search's `levelNN`).
     #[arg(long)]
     tree: PathBuf,
     #[command(flatten)]
@@ -108,15 +108,15 @@ pub struct RefArgs {
 
 #[derive(clap::Args)]
 pub struct ArcsArgs {
-    /// The tree (a forward's checkpoint dir, or a search's `levelNN`).
+    /// The tree (a forward's `--tree`, or a search's `levelNN`).
     #[arg(long)]
     tree: PathBuf,
-    /// The first frame whose records are checked.
+    /// The first step whose records are checked.
     #[arg(long, default_value_t = 1)]
-    from: u32,
-    /// The last frame whose records are checked (default: the tree's last).
+    from_step: u32,
+    /// The last step whose records are checked (default: the tree's last).
     #[arg(long)]
-    to: Option<u32>,
+    to_step: Option<u32>,
     /// Records sampled per frame.
     #[arg(long, default_value_t = 20)]
     samples: usize,
@@ -135,12 +135,12 @@ pub struct ArcsArgs {
 
 #[derive(clap::Args)]
 pub struct WidenArgs {
-    /// The tree (a forward's checkpoint dir, or a search's `levelNN`).
+    /// The tree (a forward's `--tree`, or a search's `levelNN`).
     #[arg(long)]
     tree: PathBuf,
     /// The step whose stored rows are checked (default: the tree's last).
     #[arg(long)]
-    frame: Option<u32>,
+    step: Option<u32>,
     /// Also run this many of the rows (evenly spaced) through the kernels and
     /// check what they emit.
     #[arg(long, default_value_t = 0)]
@@ -149,27 +149,27 @@ pub struct WidenArgs {
 
 #[derive(clap::Args)]
 pub struct KnownArgs {
-    /// The search's checkpoint dir (its `result.json` and `level{i:02}`
-    /// trees; a dual search's half: `DIR/fixed` or `DIR/float`).
+    /// The search's directory (its `result.json` and `level{i:02}` trees;
+    /// a dual search's half: `DIR/fixed` or `DIR/float`).
     #[arg(long)]
-    checkpoint_dir: PathBuf,
+    search_dir: PathBuf,
     /// The known solution: a `tas/` file or a comma list of input bytes,
     /// the spawn prologue included.
     #[arg(long)]
     inputs: String,
-    /// The search's horizon in frames (default: its `result.json`'s).
+    /// The search's horizon in game frames (default: its `result.json`'s).
     #[arg(long)]
-    horizon: Option<u32>,
+    frames: Option<u32>,
 }
 
 #[derive(clap::Args)]
 pub struct ReplayArgs {
-    /// The tree (a forward's checkpoint dir, or a search's `levelNN`).
+    /// The tree (a forward's `--tree`, or a search's `levelNN`).
     #[arg(long)]
     tree: PathBuf,
-    /// The last frame replayed (default: the tree's last).
+    /// The last step replayed (default: the tree's last).
     #[arg(long)]
-    to: Option<u32>,
+    steps: Option<u32>,
 }
 
 /// `check ...` under the run's settings `run`.
@@ -184,7 +184,7 @@ pub fn run(run: &Settings, c: Command) -> Result<()> {
         }
         Command::Arcs(a) => {
             let t = TreeDir::open(&a.tree, run)?;
-            let o = celeste_rust::search::arc_check::Opts { dir: &t.dir, from: a.from, to: t.frame(a.to)?, samples: a.samples, level: t.level, fault: a.fault.as_deref(), path_cap: a.path_cap, settings: &t.settings };
+            let o = celeste_rust::search::arc_check::Opts { dir: &t.dir, from: a.from_step, to: t.frame(a.to_step)?, samples: a.samples, level: t.level, fault: a.fault.as_deref(), path_cap: a.path_cap, settings: &t.settings };
             match t.settings.arith {
                 Arith::Fixed => celeste_rust::search::arc_check::run::<P8>(&o),
                 Arith::Float(_) => celeste_rust::search::arc_check::run::<LuaF64>(&o),
@@ -192,7 +192,7 @@ pub fn run(run: &Settings, c: Command) -> Result<()> {
         }
         Command::Widen(a) => {
             let t = TreeDir::open(&a.tree, run)?;
-            let frame = t.frame(a.frame)?;
+            let frame = t.frame(a.step)?;
             match t.settings.arith {
                 Arith::Fixed => widen_check::<celeste_rust::compiled::FrameEngine, P8>(&t, frame, a.emitted),
                 Arith::Float(_) => widen_check::<celeste_rust::compiled::FloatKernels, LuaF64>(&t, frame, a.emitted),
@@ -200,12 +200,12 @@ pub fn run(run: &Settings, c: Command) -> Result<()> {
         }
         Command::Known(a) => {
             let inputs = celeste_rust::concrete::read_inputs(&a.inputs)?;
-            celeste_rust::search::check_known(&a.checkpoint_dir, &inputs, a.horizon, run)
+            celeste_rust::search::check_known(&a.search_dir, &inputs, a.frames, run)
         }
         Command::Replay(a) => {
             use celeste_rust::search::hull_replay::replay;
             let t = TreeDir::open(&a.tree, run)?;
-            let to = t.frame(a.to)?;
+            let to = t.frame(a.steps)?;
             let tm = std::time::Instant::now();
             let frames = match t.settings.arith {
                 Arith::Fixed => replay::<P8>(&t.dir, to, t.settings.threads())?,
@@ -224,11 +224,11 @@ pub fn run(run: &Settings, c: Command) -> Result<()> {
 /// Every row of `rt2` (of layer `layer`) through ONE forward frame of
 /// `engine` (an empty visited set, no filter): the successors and whether
 /// one wins.
-pub(crate) fn rerun<N: celeste_rust::search::rem::Rem>(engine: &dyn FrameStep<N>, rt2: Rt2<N>, layer: u32) -> Result<(Vec<Block<N>>, bool)> {
-    let next = celeste_rust::storage::wave::one_frame(engine, vec![Block::from_rt2(rt2)], layer + 1)?;
+pub(crate) fn rerun<N: celeste_rust::search::rem::Rem>(engine: &dyn FrameStep<N>, rt2: Rt2<N>, layer: u32) -> Result<(Vec<Rt2<N>>, bool)> {
+    let next = celeste_rust::storage::wave::one_frame(engine, vec![rt2], layer + 1)?;
     let mut won = false;
     for b in &next {
-        won |= wins_of(b.rt2(), &engine.settings())?.contains(&true);
+        won |= wins_of(b, &engine.settings())?.contains(&true);
     }
     Ok((next, won))
 }
@@ -276,17 +276,17 @@ where
         if a.row.is_some() {
             shown += &format!("    the row: {}\n", me.iter().map(|(k, v)| format!("{k}={v}")).collect::<Vec<_>>().join(" "));
         }
-        for b in next {
-            agree(reference, b.rt2())?;
+        for mut b in next {
+            agree(reference, &b)?;
             if a.row.is_some() {
-                let (cells, names) = (celeste_rust::search::pos_graph::block_cells(b.rt2())?, cell_names(b.rt2(), ids));
-                for i in 0..b.rt2().width {
-                    let p = project_row(b.rt2(), &names, i as u32, &[]);
+                let (cells, names) = (celeste_rust::search::pos_graph::block_cells(&b)?, cell_names(&b, ids));
+                for i in 0..b.width {
+                    let p = project_row(&b, &names, i as u32, &[]);
                     let changed: Vec<String> = p.iter().filter(|(k, v)| me.get(*k) != Some(*v)).map(|(k, v)| format!("{k}={v}")).collect();
                     shown += &format!("    -> {} {}\n", where_(cells[i]), changed.join(" "));
                 }
             }
-            kset.extend(project_onto(&mut b.into_rt2(), level));
+            kset.extend(project_onto(&mut b, level));
         }
         // The reference engine's, from the row projected onto the level.
         let mut input = rt2.clone_block();
@@ -298,9 +298,9 @@ where
             }
             other => other?,
         };
-        for (leaf, _) in leaves {
-            agree(reference, leaf.rt2())?;
-            rset.extend(project_onto(&mut leaf.into_rt2(), level));
+        for (mut leaf, _) in leaves {
+            agree(reference, &leaf)?;
+            rset.extend(project_onto(&mut leaf, level));
         }
         let missing: Vec<&Proj> = rset.difference(&kset).collect();
         let extra: Vec<&Proj> = kset.difference(&rset).collect();
@@ -402,8 +402,8 @@ where
             let mut rt2 = blocks[bi].1.clone_block();
             rt2.retain_lanes(&[r]);
             for b in rerun(&kernels, rt2, frame)?.0 {
-                emitted_rows += b.lanes();
-                moved += check(b.rt2(), "emitted", moved);
+                emitted_rows += b.width;
+                moved += check(&b, "emitted", moved);
             }
         }
     }

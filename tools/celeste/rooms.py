@@ -1,4 +1,6 @@
-"""Levels and rooms; a room's objects and starts as Rust knows them."""
+"""Levels and rooms; a room's objects and starts, and a category's rules, as
+Rust knows them."""
+import functools
 import json
 import subprocess
 
@@ -6,7 +8,8 @@ from . import REWRITE, ROOT
 
 
 def room_of(level):
-    """The cart's level (1-based, `TAS<level>.tas`) -> its room (x, y)."""
+    """The tasdatabase's level (1-based, `TAS<level>.tas`: the cart's
+    `level_index() + 1`, `rewrite room`'s `level`) -> its room (x, y)."""
     return ((level - 1) % 8, (level - 1) // 8)
 
 
@@ -38,14 +41,33 @@ def objects(room, binary=REWRITE):
     return _ask(["room", "--room", text(room)], binary)["objects"]
 
 
+@functools.lru_cache(maxsize=None)
+def rules(cat, binary=REWRITE):
+    """What the category means to the search (`rewrite room --category`):
+    {name, hundred (a win needs the berry), nodiag, onlydiag (the dash
+    starts forbidden), gemskip (one dash past the orb)}."""
+    return _ask(["room", "--category", cat], binary)["category"]
+
+
 def seed_slots(room, binary=REWRITE):
     """The kinds (`balloon`, `chest`) a `[seeds]` list runs over, in order."""
     return [o["kind"] for o in objects(room, binary) if o["seeded"]]
 
 
+def witness(room, inputs, seeds, cat, jank, binary=REWRITE):
+    """`rewrite witness`: `inputs` (from the room's load) replayed on the
+    minimal cart under the `[seeds]` list `seeds` (balloons and chests, as
+    the tools seed them) from the loading frame of object `jank`: {exit,
+    canonical (the jump bit kept only where a jump fires),
+    chest_seed_variants (the seed lists to try where the berry is the
+    win's)}."""
+    return _ask(["witness", "--room", text(room), "--category", cat, "--loading-jank", str(jank) if jank else "none",
+                 f"--balloon-seeds={','.join(seeds) or '0'}", "--inputs", ",".join(map(str, inputs))], binary)
+
+
 def starts(room, flags, binary=REWRITE):
-    """`rewrite starts`: every loading-frame J a play of the previous room
+    """`rewrite room`'s starts: every loading-frame J a play of the previous room
     can enter `room` with (`feasible`), grouped by the start state they give
     (`classes`), and Celia's IL-load J (`celia`). `flags`: the search's
     settings (the category, `--balloon-seeds`)."""
-    return _ask(["starts", "--room", text(room)] + flags, binary)
+    return _ask(["room", "--room", text(room)] + flags, binary)

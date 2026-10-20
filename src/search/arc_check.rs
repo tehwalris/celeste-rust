@@ -13,7 +13,7 @@ use celeste_engine::runtime2::{Col, Rt2, AV};
 use super::arcs::{Circle, Seg, Transfer};
 use super::rem::{Point, Rem, Xfer};
 use crate::abstraction::Level;
-use crate::frame::{widen_rt2_to, widened_keys, Block};
+use crate::frame::{widen_rt2_to, widened_keys};
 use crate::storage::edges::EdgeStore;
 use crate::storage::layer::Tree;
 use crate::storage::Sk;
@@ -80,18 +80,18 @@ pub fn run<N: Rem>(o: &Opts) -> Result<()> {
     let rem_cells = |rt2: &Rt2<N>| rt2.player_xy_cells(ids, ids.f_rem);
     // One stored state's row, as a one-lane block.
     let tree = Tree::<N>::open(dir, to)?;
-    let row_of = |s: Sk| -> Result<Block<N>> {
+    let row_of = |s: Sk| -> Result<Rt2<N>> {
         let f = tree.layer_of(s, to)?.ok_or_else(|| anyhow!("state {}: in no frame through f{to}", s.show()))?;
-        Ok(Block::from_rt2(tree.row(f, s, cfg.room)?))
+        Ok(tree.row(f, s, cfg.room)?)
     };
     // The tree's key space: projections keyed as its rows (`None`: a code
     // it never stored).
     let space = &tree.space;
     // Every successor of `row` at remainder `rem` over all 64 inputs.
-    let successors = |eng: &mut ReferenceEngine<N::A>, row: &Block<N>, rem: (Point<N>, Point<N>)| -> Result<(Vec<Succ<N>>, u64)> {
+    let successors = |eng: &mut ReferenceEngine<N::A>, row: &Rt2<N>, rem: (Point<N>, Point<N>)| -> Result<(Vec<Succ<N>>, u64)> {
         // As the kernels read it: projected onto the level (the start row is
         // stored exact), then the probe's remainder.
-        let mut rt2 = row.rt2().clone_block();
+        let mut rt2 = row.clone_block();
         widen_rt2_to(&mut rt2, level);
         if let Some((cx, cy)) = rem_cells(&rt2) {
             rt2.cols[cx] = Col::U(AV::Num(N::at_point(rem.0)));
@@ -109,10 +109,10 @@ pub fn run<N: Rem>(o: &Opts) -> Result<()> {
             ran.push((b, read));
             for blk in blocks {
                 steps += 1;
-                let q = match rem_cells(blk.rt2()) {
+                let q = match rem_cells(&blk) {
                     Some((cx, cy)) => {
                         let at = |c: usize| -> Result<Point<N>> {
-                            match blk.rt2().cols[c].at(0) {
+                            match blk.cols[c].at(0) {
                                 AV::Num(n) => N::point(n).ok_or_else(|| anyhow!("check arcs: a remainder {n:?} outside [-1/2, 1/2)")),
                                 other => anyhow::bail!("check arcs: a concrete remainder expected, got {other:?}"),
                             }
@@ -144,7 +144,7 @@ pub fn run<N: Rem>(o: &Opts) -> Result<()> {
         let (gx, gy) = (r.t.0.guard, r.t.1.guard);
         let pair: Vec<&Rec<N>> = recs.iter().filter(|q| q.target == r.target && q.src == src).collect();
         let in_union = |x: Point<N>, y: Point<N>| pair.iter().any(|q| image_of::<N::C>(&q.t.0, x).is_some() && image_of::<N::C>(&q.t.1, y).is_some());
-        let has_player = rem_cells(src_row.rt2()).is_some();
+        let has_player = rem_cells(&src_row).is_some();
         if !has_player {
             o.no_player += 1;
         }

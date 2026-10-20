@@ -4,26 +4,58 @@
 # UniversalClassicTas does not) headlessly: go to the level as a user does
 # (F, with Celia's default loading jank), load TAS<level>.tas (Shift+W),
 # clean-save it (U), and print whether it finished and Celia's frame count.
-#   tools/celia/validate.sh LEVEL FILE.tas [more LEVEL FILE pairs...]
+#
+#   tools/celia/validate.sh [OPTIONS] LEVEL FILE.tas [more LEVEL FILE pairs...]
+#
+#   --dashes N       max_djump (the gemskip categories: 1)
+#   --jank-offset K  Celia's loading-jank offset (default 0: key A)
+#   --fixp           Celia's --fixp: 16.16 fixed point instead of Lua doubles
+#   --capture DIR    (one LEVEL FILE pair) also write every played frame to
+#                    DIR (capture.lua; tools/compare_video.py --tool celia
+#                    renders them)
+#   --exact FILE     (one LEVEL FILE pair) also write the cart's exact state
+#                    after every step of the playback to FILE (exact.lua, in
+#                    tools/uct/exact.lua's format: the float oracle's second
+#                    ground truth)
+#   --trace          per-frame "[trace]" lines (the objects)
+#   --log            all of LOVE's output
+#   --celia DIR      the Celia clone (default ~/src/github.com/gonengazit/Celia)
+#   --love BIN       LOVE 11.x (default /var/tmp/love/squashfs-root/AppRun)
+#
 # The file format is UniversalClassicTas's ("[seeds]i1,i2,...", the first
 # input on the player's first frame): Celia reads and writes the same files.
 # A playback that DIES before the exit is a failure (driver.lua).
 # Output, one line per file (tools/celeste/love.py parses "STATUS, N"):
 #   level L FILE: finished, Nf -> SAVED     or    level L FILE: DID NOT FINISH (...), 0f
-# Env: CELIA_DASHES (max_djump: the gemskip categories 1); CELIA_JANK_OFFSET
-#      (Celia's key-A offset, default 0); CELIA_FIXP=1 (Celia's --fixp: 16.16
-#      fixed point instead of Lua doubles); CELIA_TRACE=1 (per-frame objects);
-#      CELIA_LOG=1 (all of LOVE's output); CELIA (clone, default
-#      ~/src/github.com/gonengazit/Celia), LOVE (default /var/tmp/love/squashfs-root/AppRun).
-# CELIA_CAPTURE=DIR (one LEVEL FILE pair): also write every played frame to
-# DIR (capture.lua; tools/compare_video.py --tool celia renders them).
-# CELIA_EXACT=FILE (one LEVEL FILE pair): also write the cart's exact state
-# after every step of the playback to FILE (exact.lua, in
-# tools/uct/exact.lua's format: the float oracle's second ground truth).
 # Each run has its own LOVE save identity (no clash with a concurrent run).
+# The options reach the game's Lua through RUN/game/celia_opts.lua, written
+# here per pair.
 set -e
-CELIA=${CELIA:-$HOME/src/github.com/gonengazit/Celia}
-LOVE=${LOVE:-/var/tmp/love/squashfs-root/AppRun}
+# The knobs are the flags above: an environment that still sets one is refused.
+if env | grep -qE '^(CELIA|LOVE|CELIA_[A-Z_]+)='; then
+  echo "validate.sh: CELIA_* / CELIA / LOVE in the environment: these are flags now (see the header)" >&2; exit 2
+fi
+CELIA=$HOME/src/github.com/gonengazit/Celia
+LOVE=/var/tmp/love/squashfs-root/AppRun
+DASHES=nil; JANK=nil; FIXP=""; CAPTURE=nil; EXACT=nil; TRACE=false; LOG=""
+# A Lua string literal of $1.
+lua_str() { printf '"%s"' "$(printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g')"; }
+while [[ $# -gt 0 && $1 == --* ]]; do
+  case $1 in
+    --dashes) [[ ${2:-} =~ ^[0-9]$ ]] || { echo "validate.sh: --dashes N, not ${2:-nothing}" >&2; exit 2; }; DASHES=$2; shift 2 ;;
+    --jank-offset) [[ ${2:-} =~ ^-?[0-9]+$ ]] || { echo "validate.sh: --jank-offset K, not ${2:-nothing}" >&2; exit 2; }; JANK=$2; shift 2 ;;
+    --fixp) FIXP=--fixp; shift ;;
+    --capture) CAPTURE=$(lua_str "$2"); shift 2 ;;
+    --exact) EXACT=$(lua_str "$2"); shift 2 ;;
+    --trace) TRACE=true; shift ;;
+    --log) LOG=1; shift ;;
+    --celia) CELIA=$2; shift 2 ;;
+    --love) LOVE=$2; shift 2 ;;
+    *) echo "validate.sh: unknown option $1 (see the header)" >&2; exit 2 ;;
+  esac
+done
+[[ $# -ge 2 && $(( $# % 2 )) -eq 0 ]] || { echo "usage: tools/celia/validate.sh [OPTIONS] LEVEL FILE.tas [LEVEL FILE...]" >&2; exit 2; }
+(( $# == 2 )) || [[ $CAPTURE == nil && $EXACT == nil ]] || { echo "validate.sh: --capture and --exact take one LEVEL FILE pair" >&2; exit 2; }
 RUN=$(mktemp -d)
 ID=celia-validate-$(basename "$RUN")
 SAVE=$HOME/.local/share/love/$ID
@@ -37,14 +69,15 @@ cp "$(dirname "$0")/capture.lua" "$RUN/game/celia_capture.lua"
 cp "$(dirname "$0")/exact.lua" "$RUN/game/celia_exact.lua"
 cat >> "$RUN/game/main.lua" <<'HOOK'
 
-if os.getenv("CELIA_LEVEL") then
+if love.filesystem.getInfo("celia_opts.lua") then
   -- A Lua error quits at once (LOVE's own handler shows it and waits).
   love.errorhandler = function(msg) print("[celia] LUA ERROR: " .. tostring(msg) .. "\n" .. debug.traceback()); os.exit(3) end
+  local opts = require("celia_opts")
   local drv = require("celia_driver")
   local orig_update = love.update
-  local cap = os.getenv("CELIA_CAPTURE") and require("celia_capture")
+  local cap = opts.capture and require("celia_capture")
   if cap then cap.install(drv) end
-  local exact = os.getenv("CELIA_EXACT") and require("celia_exact")
+  local exact = opts.exact and require("celia_exact")
   if exact then exact.install(drv) end
   love.update = function(dt)
     if cap and tastool then cap.wrap(tastool) end
@@ -53,15 +86,15 @@ if os.getenv("CELIA_LEVEL") then
   end
 end
 HOOK
-fixp=""
-[ -n "$CELIA_FIXP" ] && fixp="--fixp"
 mkdir -p "$SAVE/celeste"
 while [ $# -ge 2 ]; do
   lvl=$1; f=$2; shift 2
+  [[ $lvl =~ ^[0-9]+$ ]] || { echo "validate.sh: level $lvl is not a number" >&2; exit 2; }
+  echo "return {level = $lvl, dashes = $DASHES, jank_offset = $JANK, capture = $CAPTURE, exact = $EXACT, trace = $TRACE}" > "$RUN/game/celia_opts.lua"
   cp "$f" "$SAVE/celeste/TAS$lvl.tas"
-  log=$(cd "$RUN" && CELIA_LEVEL=$lvl SDL_VIDEODRIVER=offscreen SDL_AUDIODRIVER=dummy ALSOFT_DRIVERS=null timeout 300 "$LOVE" game $fixp cctas celeste.p8 2>&1 || true)
-  if [ -n "$CELIA_TRACE" ]; then echo "$log" | grep '^\[trace\]' || true; fi
-  if [ -n "$CELIA_LOG" ]; then echo "$log"; fi
+  log=$(cd "$RUN" && SDL_VIDEODRIVER=offscreen SDL_AUDIODRIVER=dummy ALSOFT_DRIVERS=null timeout 300 "$LOVE" game $FIXP cctas celeste.p8 2>&1 || true)
+  if [ "$TRACE" = true ]; then echo "$log" | grep '^\[trace\]' || true; fi
+  if [ -n "$LOG" ]; then echo "$log"; fi
   echo "$log" | grep '^\[celia\] level' | sed "s|^|# |" || true
   fin=$(echo "$log" | grep -o '\[celia\] FINISHED [0-9]*f' | grep -o '[0-9]*' | head -1 || true)
   bad=$(echo "$log" | grep -o '\[celia\] \(DIED\|TIMEOUT\|ERROR\|LUA ERROR\).*' | head -1 | sed 's/^\[celia\] //' || true)

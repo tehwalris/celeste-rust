@@ -108,7 +108,7 @@ pub(crate) fn bits(mut m: u64) -> impl Iterator<Item = u32> {
 
 /// A SHAPE'S SKELETON as the storage keeps it: everything of a shape's rows
 /// their keys do not say - structure with closure captures, globals,
-/// strings, prints, the non-value cells' uniform columns, and per value
+/// strings, the non-value cells' uniform columns, and per value
 /// cell how its column holds numbers (`Repr`: the code merges `Num(n)` and
 /// `Ival(n, n)`). Equal records decode every key alike.
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
@@ -117,7 +117,6 @@ pub(crate) struct SkelRecord<N = P8> {
     pub(crate) structure: Vec<Cell2<N>>,
     pub(crate) globals: Vec<u32>,
     pub(crate) strings: Vec<String>,
-    pub(crate) prints: Vec<String>,
     /// The cells that are not values, with their (uniform) columns.
     pub(crate) others: Vec<(u32, Col<N>)>,
     /// The value cells whose columns hold numbers (0) or intervals (1); the
@@ -146,7 +145,7 @@ impl<N: EngineNum> SkelRecord<N> {
                 Repr::Other => {}
             }
         }
-        Ok(SkelRecord { shape_hash: rt2.shape_hash, structure: rt2.structure.clone(), globals: rt2.globals.clone(), strings: rt2.strings.clone(), prints: rt2.prints.clone(), others, numeric })
+        Ok(SkelRecord { shape_hash: rt2.shape_hash, structure: rt2.structure.clone(), globals: rt2.globals.clone(), strings: rt2.strings.clone(), others, numeric })
     }
 
     /// The skeleton as an empty block over `cache` (a room's).
@@ -155,7 +154,6 @@ impl<N: EngineNum> SkelRecord<N> {
         rt2.structure = self.structure.clone();
         rt2.globals = self.globals.clone();
         rt2.strings = self.strings.clone();
-        rt2.prints = self.prints.clone();
         rt2.shape_hash = self.shape_hash;
         rt2.cols = vec![Repr::Other.empty(); self.structure.len()];
         for (c, col) in &self.others {
