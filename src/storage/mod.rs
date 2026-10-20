@@ -20,6 +20,7 @@ pub(crate) mod out;
 pub(crate) mod route;
 pub(crate) mod set;
 pub(crate) mod spool;
+pub mod stats;
 pub(crate) mod unit;
 pub(crate) mod visited;
 pub mod wave;

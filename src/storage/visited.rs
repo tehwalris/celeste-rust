@@ -252,54 +252,6 @@ impl<N: Rem> VisitedSet<N> {
         self.set.alloc_bytes()
     }
 
-    /// The stored hulls' and layers' statistics (`[memory]`, a diagnostic;
-    /// distinct hulls counted up to `cap`).
-    pub(crate) fn hull_stats(&self, cap: usize) -> Result<String> {
-        let mut by: FxHashMap<u64, u64> = FxHashMap::default();
-        let (mut states, mut over, mut one_layer, mut entries) = (0u64, false, 0u64, 0u64);
-        let mut layers = vec![0u64; 1 << 16];
-        for (_, t) in self.set.tables() {
-            t.for_each_packed::<N>(|_, _, _, run| {
-                if run.is_empty() {
-                    return;
-                }
-                entries += 1;
-                one_layer += run.iter().all(|i| i.layer == run[0].layer) as u64;
-                for i in run {
-                    states += 1;
-                    layers[i.layer as usize] += 1;
-                    // Mixed: FxHash leaves a word's high half out of the low
-                    // bits a table indexes by (the y arc). (A float hull's
-                    // hash is not the hull: distinct counted by hash.)
-                    let w = celeste_engine::runtime2::mix64(i.hull.hash());
-                    if by.len() < cap || by.contains_key(&w) {
-                        *by.entry(w).or_default() += 1;
-                    } else {
-                        over = true;
-                    }
-                }
-            })?;
-        }
-        let mut counts: Vec<u64> = by.values().copied().collect();
-        counts.sort_unstable_by(|a, b| b.cmp(a));
-        let top = |k: usize| counts.iter().take(k).sum::<u64>() as f64 / states.max(1) as f64 * 100.0;
-        Ok(format!(
-            "{states} stored hulls: {}{} distinct, the top 256 cover {:.1}%, 4096 {:.1}%, 65536 {:.1}%; {} distinct layers; {one_layer} of {entries} entries hold one layer",
-            if over { ">" } else { "" },
-            by.len(),
-            top(256),
-            top(4096),
-            top(65536),
-            layers.iter().filter(|&&c| c > 0).count()
-        ))
-    }
-
-    /// Its bytes by part (`[memory]`): the packed blocks (keys, masks,
-    /// layers and hulls, zstd), the block and region lists, the key space.
-    pub(crate) fn census(&self) -> Vec<(&'static str, usize)> {
-        let s = self.set.bytes();
-        vec![("visited: packed blocks (keys, cells, layers, hulls)", s[0]), ("visited: block and region lists", s[1] + s[2]), ("key space", self.keys.alloc_bytes())]
-    }
 }
 
 #[cfg(test)]

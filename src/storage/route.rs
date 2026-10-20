@@ -161,19 +161,6 @@ impl<N: Rem> Touched<N> {
         Ok((keys, self.slots))
     }
 
-    pub(crate) fn alloc_bytes(&self) -> usize {
-        self.bytes().iter().sum()
-    }
-
-    /// Bytes held (`[wavemem]`): index, keys, live slots, dead or spare.
-    pub(crate) fn bytes(&self) -> [usize; 4] {
-        let slot = std::mem::size_of::<AccOf<N>>();
-        [self.index.capacity() * 4, self.keys.capacity() * std::mem::size_of::<TouchedKey>(), self.states * slot, (self.slots.capacity() - self.states) * slot]
-    }
-
-    pub(crate) fn key_count(&self) -> usize {
-        self.keys.len()
-    }
 }
 
 /// The wave's routes: (shape, region slot) -> a dense id, made as the units
@@ -305,10 +292,6 @@ fn ub_hash(t_key: Key, b: &Ub) -> u64 {
 }
 
 impl UnitBundles {
-    pub(crate) fn alloc_bytes(&self) -> usize {
-        let b = 16 + std::mem::size_of::<Ub>();
-        self.buckets.iter().map(|x| x.1.capacity() * b).sum::<usize>() + self.spare.iter().map(|v| v.capacity() * b).sum::<usize>() + 4 * self.slots.capacity() + 24 * self.t_idx.capacity()
-    }
 
     pub(crate) fn clear(&mut self) {
         let mut room: usize = self.spare.iter().map(Vec::capacity).sum();
@@ -483,24 +466,6 @@ impl Scratch {
         }
     }
 
-    /// Bytes held (`[wavemem]`): the job's bundles, encoder, raw block, rest.
-    pub(crate) fn alloc_bytes(&self) -> [usize; 4] {
-        [std::mem::size_of::<bundle::Tb>() * self.tbs.capacity() + std::mem::size_of::<Bundle>() * self.prov.capacity(), self.enc.alloc_bytes(), self.raw.capacity(), 4 * (self.e_of.capacity() + self.s_of.capacity()) + 32 * self.s_idx.capacity() + 24 * self.s_list.capacity() + 9 * self.t_loc.capacity() + 16 * self.t_keys.capacity()]
-    }
-}
-
-impl<N: Rem> Chunk<N> {
-    /// Bytes it holds (its unit's shared sources not counted).
-    pub(crate) fn alloc_bytes(&self) -> usize {
-        24 * self.targets.capacity() + std::mem::size_of::<(u32, u8, AccOf<N>)>() * self.pushes.capacity() + std::mem::size_of::<Ub>() * self.bundles.capacity() + 4 * self.src_regions.capacity()
-    }
-}
-
-impl<N: Rem> RouteState<N> {
-    /// Bytes held: touched table, waiting bundles, segments.
-    pub(crate) fn alloc_bytes(&self) -> [usize; 3] {
-        [self.touched.alloc_bytes() + 24 * self.prov_keys.capacity(), self.prov.iter().map(|s| s.1.bytes.held()).sum::<usize>(), self.segs.iter().map(|s| s.1.bytes.held()).sum::<usize>()]
-    }
 }
 
 impl Default for Scratch {
@@ -624,14 +589,10 @@ pub(crate) struct Sealed<N: Rem = P8> {
     pub(crate) table: RegionTable,
     pub(crate) hulls: Vec<HullOf<N>>,
     pub(crate) grown: Vec<super::wave::Old<N>>,
-    /// The states compared; times to sort, compare (summed), make the table.
-    pub(crate) touched: usize,
+    /// Times to sort, compare (summed), make the table.
     pub(crate) t: [std::time::Duration; 3],
     /// The bundles that waited (their segments, bundles: `reencode`).
     pub(crate) waited: (usize, u64),
-    /// The held states compared: full (no hull stored) and by AGE (frame less
-    /// layer: 1, 2-3, 4-7, 8-15, 16-31, 32+); the grown ones by age.
-    pub(crate) held_by_age: [[u64; 7]; 2],
 }
 
 /// The frame's new transfers' canonical ids (`edges::XferTable::
@@ -661,17 +622,15 @@ pub(crate) fn seal_sort<N: Rem>(st: &mut RouteState<N>, region: u32, finals: &Fx
     }
     let final_key = |k: Key| if is_provisional(k) { finals.get(&k).copied().ok_or_else(|| anyhow::anyhow!("a provisional key without its final key")) } else { Ok(k) };
     let t = std::time::Instant::now();
-    let n_touched = st.touched.len();
     let (touched, accs) = std::mem::take(&mut st.touched).into_sorted(final_key)?;
     let waited = (st.prov.len(), st.prov.iter().map(|x| x.1.bundles as u64).sum());
-    Ok(Touch { region, touched, accs, n_touched, waited, t_sort: t.elapsed() })
+    Ok(Touch { region, touched, accs, waited, t_sort: t.elapsed() })
 }
 
 pub(crate) struct Touch<N: Rem = P8> {
     pub(crate) region: u32,
     pub(crate) touched: Vec<TouchedKey>,
     pub(crate) accs: Vec<AccOf<N>>,
-    n_touched: usize,
     waited: (usize, u64),
     t_sort: std::time::Duration,
 }
@@ -679,24 +638,22 @@ pub(crate) struct Touch<N: Rem = P8> {
 /// Touched keys a seal part takes.
 pub(crate) const SEAL_PART: usize = 1 << 15;
 
-/// A `seal_part`: its new states (keys, cells, hulls), grown, held by age.
+/// A `seal_part`: its new states (keys, cells, hulls), grown.
 pub(crate) struct SealPart<N: Rem = P8> {
     keys: Vec<Key>,
     masks: Vec<u64>,
     hulls: Vec<HullOf<N>>,
     grown: Vec<super::wave::Old<N>>,
-    held_by_age: [[u64; 7]; 2],
     t: std::time::Duration,
 }
 
 /// The touched keys `part` COMPARED with the visited set's region (a
 /// `Cursor`, each block decoded once): a state it lacks NEW, a hull grown GREW.
-pub(crate) fn seal_part<N: Rem>(touch: &Touch<N>, part: std::ops::Range<usize>, frame: u32, visited: &VisitedSet<N>) -> Result<SealPart<N>> {
+pub(crate) fn seal_part<N: Rem>(touch: &Touch<N>, part: std::ops::Range<usize>, visited: &VisitedSet<N>) -> Result<SealPart<N>> {
     let t = std::time::Instant::now();
     let (region, accs) = (touch.region, &touch.accs);
     let (mut keys, mut masks, mut hulls): (Vec<Key>, Vec<u64>, Vec<HullOf<N>>) = (Vec::new(), Vec::new(), Vec::new());
     let mut grown: Vec<super::wave::Old<N>> = Vec::new();
-    let mut held_by_age = [[0u64; 7]; 2];
     let mut cursor = visited.table(region).map(RegionTable::cursor::<N>);
     for &TouchedKey { key, cells, start } in &touch.touched[part] {
         let entry = match cursor.as_mut() {
@@ -716,29 +673,16 @@ pub(crate) fn seal_part<N: Rem>(touch: &Touch<N>, part: std::ops::Range<usize>, 
                 continue;
             }
             // No hull stored: it is FULL, and grows no more.
-            let Some(StateInfo { hull, layer }) = entry.as_ref().and_then(|e| e.info(c)) else {
-                held_by_age[0][0] += 1;
-                continue;
-            };
-            let age = |l: u16| match frame.saturating_sub(l as u32) {
-                0..=1 => 1,
-                2..=3 => 2,
-                4..=7 => 3,
-                8..=15 => 4,
-                16..=31 => 5,
-                _ => 6,
-            };
-            held_by_age[0][age(layer)] += 1;
+            let Some(StateInfo { hull, layer }) = entry.as_ref().and_then(|e| e.info(c)) else { continue };
             let mut a = acc;
             a.add_hull(&hull);
             let h = a.hull().expect("a hull holds points");
             if h != hull {
                 grown.push(super::wave::Old { sk: Sk { region, key, local: c as u8 }, layer, hull: h, was: hull });
-                held_by_age[1][age(layer)] += 1;
             }
         }
     }
-    Ok(SealPart { keys, masks, hulls, grown, held_by_age, t: t.elapsed() })
+    Ok(SealPart { keys, masks, hulls, grown, t: t.elapsed() })
 }
 
 /// A route's SEALED states from its parts (in order): the new ones by key
@@ -747,20 +691,16 @@ pub(crate) fn sealed<N: Rem>(touch: Touch<N>, parts: Vec<SealPart<N>>) -> Result
     let t = std::time::Instant::now();
     let n = |f: fn(&SealPart<N>) -> usize| parts.iter().map(f).sum::<usize>();
     let (mut keys, mut masks, mut hulls, mut grown) = (Vec::with_capacity(n(|p| p.keys.len())), Vec::with_capacity(n(|p| p.keys.len())), Vec::with_capacity(n(|p| p.hulls.len())), Vec::with_capacity(n(|p| p.grown.len())));
-    let mut held_by_age = [[0u64; 7]; 2];
     let mut t_compare = std::time::Duration::ZERO;
     for p in parts {
         keys.extend(p.keys);
         masks.extend(p.masks);
         hulls.extend(p.hulls);
         grown.extend(p.grown);
-        for (a, b) in held_by_age.iter_mut().flatten().zip(p.held_by_age.iter().flatten()) {
-            *a += b;
-        }
         t_compare += p.t;
     }
     let table = RegionTable::from_sorted(&keys, &masks)?;
-    Ok(Sealed { region: touch.region, table, hulls, grown, touched: touch.n_touched, t: [touch.t_sort, t_compare, t.elapsed()], waited: touch.waited, held_by_age })
+    Ok(Sealed { region: touch.region, table, hulls, grown, t: [touch.t_sort, t_compare, t.elapsed()], waited: touch.waited })
 }
 
 /// A WAITED segment re-encoded for `region` with final keys and transfer ids

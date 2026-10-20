@@ -173,13 +173,15 @@ region phase, the frame end, the checkpoint.
 `rewrite bench frame --edges --checkpoint --reps N` runs frame F -> F+1 of a
 fixture tree (`ForwardState::at`). It prints the pins: the `f`, `h` and `e`
 lines and `b` (the bytes of every file the frame wrote). Every rep must
-agree. Its stderr `[cost]` lines give:
+agree. Its stderr renders the frame's statistics (`storage::stats`, one
+registry: the `[fwd]` line's and `forward.tsv`'s too): per rep a `[bench]
+rep` line, and the `[cost]` report: per time (walls, worker times, and
+with `--phases` the wave's worker-seconds by phase) its min and max over
+the reps, its share of the wave's budget, its hardware counts and its cost
+per element; the counts, the bytes written and the resident sets.
 
-- the wall split (wave, frame end, checkpoint);
-- the wave's worker-seconds by phase, with per-element costs;
-- the bytes written and the anonymous RSS.
-
-`--phases`' `[mem]` and `[wavemem]` lines break memory down.
+`--phases`' `[mem]` lines sample the anonymous resident set and the live
+heap at the phases' boundaries.
 
 ```bash
 tools/fwd_bench.sh make NAME F -- --room X,Y --level LEVEL [--level-minus-one H,S --l1-table T] ...  # a forward to F in $FWD_BENCH/NAME

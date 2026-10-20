@@ -1053,8 +1053,16 @@ mod tests {
         assert!(read_forward_stats(&dir).unwrap().is_empty(), "a tree from before the record");
         let ms = std::time::Duration::from_millis;
         let row = |f: u32, kept: usize| {
-            let st = crate::frame::FrameStats { lanes_kept: kept, wave_idle: 0.94, t_wave: ms(7), rss_end: 1.28, ..Default::default() };
-            crate::frame::forward_stats_row(f, &st, ms(1), ms(11), 4)
+            use crate::storage::stats::S;
+            let mut st = crate::storage::stats::Stats::default();
+            st.set(S::Kept, kept as u64);
+            st.set(S::WaveIdle, 94);
+            st.add_time(S::Wave, ms(7));
+            st.set_gb(S::RssEnd, 1.28);
+            st.add_time(S::Ckpt, ms(1));
+            st.add_time(S::Total, ms(11));
+            st.set(S::Visited, 4);
+            crate::frame::forward_stats_row(f, &st)
         };
         for (f, kept) in [(1, 10), (2, 20), (2, 21), (3, 30)] {
             crate::frame::append_forward_stats(&dir, &row(f, kept)).unwrap();

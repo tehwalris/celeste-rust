@@ -310,10 +310,6 @@ impl Encoder {
         }
     }
 
-    /// Bytes its buffers hold (`--phases`' `[wavemem]`).
-    pub(crate) fn alloc_bytes(&self) -> usize {
-        4 * (self.t_rank.capacity() + self.tids.capacity() + self.s_perm.capacity() + self.item_g.capacity() + self.at.capacity()) + 8 * self.st.capacity() + 20 * self.groups.capacity() + 24 * self.gid.capacity()
-    }
 }
 
 const _: () = assert!(matches!(ORDER, [F::M, F::O, F::X, F::S, F::T]), "Encoder groups ORDER's fields");

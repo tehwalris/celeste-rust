@@ -234,7 +234,8 @@ pub struct UnitSink<'a, N: Rem = P8> {
     /// `--key-check`: every emission's row, checked in batches (`check_rows`).
     key_check: bool,
     check: Vec<RowBuf<N>>,
-    pub(crate) phases: bool,
+    /// The worker's statistics (merged at the frame's end).
+    pub(crate) stats: super::stats::Stats,
     /// The level -1 table of `filters.minus_one`, resolved once.
     l1: Option<&'static crate::search::level_minus_one::CostToGo>,
     drop_last: Option<((u64, u32), bool)>,
@@ -262,8 +263,6 @@ pub struct UnitSink<'a, N: Rem = P8> {
     out_parts: super::out::Parts<N>,
     /// The unit's transfers' ranks by pair (`out_parts_of`).
     x_rank: FxHashMap<u32, u32>,
-    /// Emissions past level -1 (each one a record).
-    pub(crate) emitted: u64,
     /// The shapes this worker noted (`note_shape`), registered
     /// (`Skeletons`) and checked this frame (the decode guard).
     noted: FxHashSet<u64>,
@@ -334,7 +333,7 @@ impl<'a, N: Rem> UnitSink<'a, N> {
             disallowed: false,
             key_check: s.diag.key_check,
             check: Vec::new(),
-            phases: s.diag.phases,
+            stats: super::stats::Stats::new(s.diag.phases),
             l1,
             drop_last: None,
             base,
@@ -350,33 +349,12 @@ impl<'a, N: Rem> UnitSink<'a, N> {
             out_blocks: Vec::new(),
             out_parts: Default::default(),
             x_rank: Default::default(),
-            emitted: 0,
             noted: Default::default(),
             registered: Default::default(),
             guarded: Default::default(),
             reference: false,
             last_shape: 0,
         }
-    }
-
-    /// Bytes held (`[wavemem]`): bundles, hulls, transfers, rest.
-    pub(crate) fn alloc_bytes(&self) -> [usize; 4] {
-        use std::mem::size_of;
-        [
-            self.bundles.alloc_bytes(),
-            size_of::<HullOf<N>>() * self.hulls.capacity() + 4 * self.src_first.capacity() + 20 * self.entry_next.capacity() + size_of::<AccOf<N>>() * self.push_slots.capacity() + 4 * self.push_offs.capacity(),
-            (size_of::<N::Pair>() + 8) * self.xfer_ids.capacity()
-                + size_of::<crate::search::rem::Xfer<N>>() * self.xfer_pairs.capacity()
-                + 8 * self.xfer_counts.capacity()
-                + size_of::<N::Pair>() * self.xfer_tab.read().expect("a transfer table").capacity()
-                + 8 * self.x_rank.capacity()
-                + size_of::<(crate::compiled::asm_kernel::RawWords<N>, u32)>() * self.xfer_cache.capacity(),
-            24 * (self.srcs.capacity() + self.unit_sources.capacity())
-                + 4 * self.src_local.capacity()
-                + 8 * self.lanes.capacity()
-                + 32 * self.src_idx.capacity()
-                + self.outbox.iter().map(|c| c.alloc_bytes()).sum::<usize>(),
-        ]
     }
 
     /// The tree's key space (read-only during the wave).
@@ -668,7 +646,7 @@ impl<'a, N: Rem> UnitSink<'a, N> {
         if take == 0 {
             return Ok(());
         }
-        self.emitted += take.count_ones() as u64;
+        self.stats.add(super::stats::S::Emissions, take.count_ones() as u64);
         // A shape's first emission (this worker, this wave): its skeleton
         // registered, and THE DECODE GUARD - its row is what its key and
         // cell decode to. Looked at only when the shape is not the last's.
@@ -931,7 +909,7 @@ impl<'a, N: Rem> UnitSink<'a, N> {
     /// The unit is over: its rows checked, its last verdicts decided (refused
     /// targets' records go), its buckets the chunks of their routes.
     pub(crate) fn end(&mut self) -> Result<()> {
-        let t = crate::frame::phases::start(self.phases);
+        let t = self.stats.tick_start();
         for i in 0..self.check.len() {
             if self.check[i].rows() > 0 {
                 self.check_rows(i)?;
@@ -971,7 +949,7 @@ impl<'a, N: Rem> UnitSink<'a, N> {
                 self.out_parts = Default::default();
             }
         }
-        crate::frame::phases::add(crate::frame::phases::END_UNIT, t);
+        self.stats.tick(super::stats::S::PhUnitEnd, t);
         Ok(())
     }
 

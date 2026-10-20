@@ -568,16 +568,12 @@ impl OutFile {
 
 /// A tree's out files, by frame (none at frame 0: nothing leads into it).
 #[derive(Default)]
-pub struct OutStore {
+pub(crate) struct OutStore {
     frames: Vec<Option<OutFile>>,
     pub(crate) bytes: u64,
 }
 
 impl OutStore {
-    /// Bytes its indices hold: only the file list (headers are read in place).
-    pub(crate) fn index_bytes(&self) -> usize {
-        self.frames.capacity() * std::mem::size_of::<Option<OutFile>>()
-    }
 
     /// Frames `1..=horizon`'s out files under `edges_dir`.
     pub(crate) fn open(edges_dir: &Path, horizon: u32) -> Result<Self> {

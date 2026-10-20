@@ -40,6 +40,7 @@ impl Spool {
         self.file.read_exact_at(buf, s.at).context("reading the frame's spool")
     }
 
+    #[cfg(test)]
     pub(crate) fn bytes(&self) -> u64 {
         self.end.load(Ordering::Relaxed)
     }
@@ -57,13 +58,6 @@ impl Body {
         match self {
             Body::Mem(v) => v.len(),
             Body::Spool(s) => s.len as usize,
-        }
-    }
-    /// Bytes it holds in memory.
-    pub(crate) fn held(&self) -> usize {
-        match self {
-            Body::Mem(v) => v.capacity(),
-            Body::Spool(_) => 0,
         }
     }
     /// Into `spool`, if there is one.
@@ -99,7 +93,7 @@ mod tests {
         assert_eq!(sp.bytes(), blocks.iter().map(|b| b.len() as u64).sum::<u64>());
         let mut buf = Vec::new();
         for (b, body) in blocks.iter().zip(&bodies) {
-            assert_eq!((body.len(), body.held()), (b.len(), 0));
+            assert_eq!(body.len(), b.len());
             assert!(body.with(Some(&sp), &mut buf, |x| x == &b[..]).unwrap());
         }
         assert!(Body::Spool(Spooled { at: 0, len: 1 }).with(None, &mut buf, |_| ()).is_err(), "no spool, no bytes");

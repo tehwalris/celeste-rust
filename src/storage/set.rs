@@ -242,7 +242,7 @@ pub(crate) struct Change<N: Rem = P8> {
 pub(crate) struct Upserted {
     pub(crate) added: u64,
     pub(crate) held_new: u64,
-    /// Blocks kept as they were, decoded, and made (`--phases`' `[absorb]`).
+    /// Blocks kept as they were, decoded, and made (`stats::S::AbsorbKept` on).
     pub(crate) kept: u64,
     pub(crate) decoded: u64,
     pub(crate) made: u64,
@@ -484,18 +484,6 @@ impl RegionTable {
         Cursor { blocks: self.blocks(), b: 0, loaded: usize::MAX, i: 0, rows: Rows::default(), raw: Vec::new() }
     }
 
-    /// Every entry of a packed table: `f(key, cells, bare cells, infos)`.
-    pub(crate) fn for_each_packed<N: Rem>(&self, mut f: impl FnMut(Key, u64, u64, &[StateInfo<N>])) -> Result<()> {
-        let (mut rows, mut raw) = (Rows::<N>::default(), Vec::new());
-        for b in self.blocks() {
-            rows.decode(b, &mut raw)?;
-            for i in 0..rows.len() {
-                f(narrow(rows.keys[i]), rows.masks[i], rows.bare[i], rows.infos_of(i));
-            }
-        }
-        Ok(())
-    }
-
     fn chunk_keys(ws: impl Iterator<Item = u128>, kw: usize) -> Vec<Vec<u8>> {
         let mut out: Vec<Vec<u8>> = Vec::new();
         let mut cur: Vec<u8> = Vec::new();
@@ -553,7 +541,7 @@ impl RegionTable {
         Ok(n)
     }
 
-    /// Bytes allocated (`[memory]`): a plain table's keys (with their
+    /// Bytes allocated (`bench frame`'s load line): a plain table's keys (with their
     /// chunks' room) and masks, a packed table's blocks (zstd), the lists.
     pub(crate) fn bytes(&self) -> [usize; 3] {
         match &self.form {
@@ -910,9 +898,6 @@ mod tests {
             }
             let (&(k, c), &i) = model.iter().nth(model.len() / 2).unwrap();
             assert_eq!(t.lookup_info::<P8>(narrow(k), c as u32).map(|x| x.1), Some(i));
-            let mut walked = 0u64;
-            t.for_each_packed::<P8>(|_, m, _, _| walked += m.count_ones() as u64).unwrap();
-            assert_eq!(walked, model.len() as u64);
         }
         // Changes in the first block alone: every other block kept as it
         // was (the same allocation).

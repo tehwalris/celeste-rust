@@ -36,13 +36,6 @@ impl<N: Rem> Default for XferTable<N> {
     }
 }
 
-impl<N: Rem> XferTable<N> {
-    /// Bytes held: the pairs, the index.
-    pub(crate) fn bytes(&self) -> [usize; 2] {
-        [self.pairs.capacity() * std::mem::size_of::<N::Pair>(), self.index.slots.capacity() * 4]
-    }
-}
-
 /// A pair's id by content: open addressing over `u32` slots (`id + 1`; 0
 /// empty) of ids into the table's pairs, linear probing, at most 3/4 full:
 /// ~6 B a pair (a hash map of pairs: ~37).
