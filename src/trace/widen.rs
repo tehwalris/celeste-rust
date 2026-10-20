@@ -9,7 +9,7 @@
 use anyhow::{anyhow, bail, Result};
 
 use celeste_core::arith::EngineNum;
-use celeste_engine::widening::{constant, range};
+use celeste_engine::widening::{range, widen_level, Holds, Lit, Widener, TABLE};
 use celeste_engine::widening::{floor_player_window, Entry, Flag, Hook, Input, Level, Slot, Stored, Target, FLOOR_HITBOX, PLATFORM_PATH, PLAYER_HITBOX, REM};
 
 use super::domain::{Domain, Symbolic};
@@ -120,11 +120,6 @@ fn ival<A: GraphArith>(d: &mut Symbolic<A>, lo: i32, hi: i32) -> NodeId {
     d.graph.leaf(Op::Const(A::lit(lo), A::lit(hi)))
 }
 
-fn ival_of<A: GraphArith>(d: &mut Symbolic<A>, lo: i32, hi: i32) -> NodeId {
-    let (lo, hi) = (A::lit(constant::<A::Num>(lo)), A::lit(constant::<A::Num>(hi)));
-    d.graph.leaf(Op::Const(lo, hi))
-}
-
 /// What the output widenings OWE: per widened slot, the condition that the
 /// replaced value was inside what it wrote; a lane where one fails declines.
 pub type SlotErrors = Vec<(Path, NodeId)>;
@@ -140,112 +135,133 @@ pub fn mid_frame<D: Domain>(st: &State<D>) -> bool {
 }
 
 /// Apply the tracer's level's entries (`TABLE`, in order) to `st` at the
-/// frame's end: each slot written as its entry stores it, the containment
-/// it owes returned per slot. `AbsentAsZero` is `materialize_absent_fields`'.
+/// frame's end (`widening::widen_level`, the block side's interpreter): each
+/// slot written as its entry stores it, the containment it owes returned per
+/// slot. `AbsentAsZero` is `materialize_absent_fields`'.
 pub fn widen<A: GraphArith>(st: &mut State<Symbolic<A>>, d: &mut Symbolic<A>) -> Result<SlotErrors> {
-    let mut errs = SlotErrors::new();
-    let mid = mid_frame(st);
-    for e in d.level.entries() {
-        match e.hook {
-            Some(Hook::NearFloor) => widen_near_floors(st, d, e, &mut errs, mid)?,
-            _ => widen_entry(st, d, e, &mut errs)?,
-        }
-    }
-    Ok(errs)
+    let (level, mid) = (d.level, mid_frame(st));
+    let mut out = Out { st, d, errs: SlotErrors::new(), mid };
+    widen_level(&mut out, level)?;
+    Ok(out.errs)
 }
 
-fn widen_entry<A: GraphArith>(st: &mut State<Symbolic<A>>, d: &mut Symbolic<A>, e: &Entry, errs: &mut SlotErrors) -> Result<()> {
-    for paths in entry_paths(st, e) {
-        // Per slot so far: its value before the widening, and what it owed.
-        let mut seen: Vec<(Option<Value<Symbolic<A>>>, Option<NodeId>)> = Vec::new();
-        for (s, p) in e.slots.iter().zip(&paths) {
-            let old = iface::get(st, p);
-            let Some(old_v) = old.clone() else {
-                anyhow::ensure!(s.optional, "{}: widening {:?} has no such slot", iface::show(p), e.name);
-                seen.push((None, None));
-                continue;
-            };
-            let num = || match &old_v {
-                Value::Num(n) => Ok(*n),
-                _ => Err(anyhow::anyhow!("{}: not a number (widening {:?})", iface::show(p), e.name)),
-            };
-            let mut owed = None;
-            let new = match s.stored {
-                Stored::Range { lo, hi } => {
-                    owed = contain(d, num()?, range::<A::Num>(lo, hi));
-                    if let Some(h) = owed {
-                        owe(errs, d, p, h);
-                    }
-                    Value::Num(ival(d, lo, hi))
-                }
-                // A constant centre (a shape's constant): a literal range.
-                Stored::Band { around, radius } => {
-                    let sp = field(&p[..p.len() - 1].to_vec(), &[around]);
-                    let Some(Value::Num(centre)) = iface::get(st, &sp) else { bail!("{}: not a number", iface::show(&sp)) };
-                    let Some(c) = d.as_const(&centre) else { bail!("{}: not a constant", iface::show(&sp)) };
-                    // As the block side: `s - radius`, `s + radius` in the arithmetic.
-                    let r = constant::<A::Num>(radius);
-                    let (Some(lo), Some(hi)) = (A::sub(c, r), A::add(c, r)) else {
-                        bail!("{}: the band {c:?} +- {radius:#x} leaves {}", iface::show(p), A::RANGE_NOTE)
-                    };
-                    owed = contain(d, num()?, (lo, hi));
-                    if let Some(h) = owed {
-                        owe(errs, d, p, h);
-                    }
-                    Value::Num(d.graph.leaf(Op::Const(A::lit(lo), A::lit(hi))))
-                }
-                Stored::Phase { lo, hi } => Value::Num(ival_of(d, lo, hi)),
-                Stored::AtLeast(k) => {
-                    let v = num()?;
-                    let k = d.num(constant::<A::Num>(k));
-                    Value::Num(d.fun2(super::domain::Fun2::Max, &v, &k)?)
-                }
-                Stored::UnknownNum => {
-                    num()?;
-                    Value::Num(d.unknown_num(countdown(e, s)))
-                }
-                Stored::UnknownBool => {
-                    let Value::Bool(_) = old_v else { bail!("{}: not a boolean (widening {:?})", iface::show(p), e.name) };
-                    Value::Bool(d.unknown_bool_output())
-                }
-                Stored::Num(k) => Value::Num(d.num(constant::<A::Num>(k))),
-                Stored::Bool(b) => Value::Bool(d.boolean(b)),
-                Stored::FullPeriod(period) => {
-                    let v = num()?;
-                    if !d.is_interval(&v) {
-                        seen.push((old, None));
-                        continue;
-                    }
-                    let (lo, hi) = (d.graph.fold(Op::Lo, vec![v]), d.graph.fold(Op::Hi, vec![v]));
-                    let width = d.graph.fold(Op::Sub, vec![hi, lo]);
-                    let k = A::lit(constant::<A::Num>(period));
-                    let full_period = d.graph.leaf(Op::Const(k, k));
-                    let full = d.graph.fold(Op::Ge, vec![width, full_period]);
-                    owe(errs, d, p, full);
-                    Value::Num(ival_of(d, 0, period))
-                }
-                // Its twin's stored value; owed: its twin's obligation, the
-                // two being one node at every frame's end.
-                Stored::SameAs(other) => {
-                    let j = e.slots.iter().position(|t| t.field == [other]).expect("SameAs names a slot of its entry");
-                    let (twin_old, twin_owed) = seen[j].clone();
-                    anyhow::ensure!(twin_old == Some(old_v.clone()), "{}: not its `{other}` at the frame's end (widening {:?})", iface::show(p), e.name);
-                    owed = twin_owed;
-                    if let Some(h) = owed {
-                        owe(errs, d, p, h);
-                    }
-                    iface::get(st, &paths[j]).expect("the twin, widened")
-                }
-                Stored::AbsentAsZero => {
-                    seen.push((old, None));
-                    continue;
-                }
-            };
-            iface::set(st, p, new)?;
-            seen.push((old, owed));
+/// The tracer as `widen_level`'s target: a slot is a path of the state, a
+/// value the tracer's, what a widening owes the node of its per-lane
+/// condition (`SlotErrors`).
+struct Out<'a, A: GraphArith> {
+    st: &'a mut State<Symbolic<A>>,
+    d: &'a mut Symbolic<A>,
+    errs: SlotErrors,
+    /// Mid split frame (`mid_frame`).
+    mid: bool,
+}
+
+impl<A: GraphArith> Out<'_, A> {
+    fn num(&self, ei: usize, p: &Path) -> Result<NodeId> {
+        match iface::get(self.st, p) {
+            Some(Value::Num(n)) => Ok(n),
+            _ => bail!("{}: not a number (widening {:?})", iface::show(p), TABLE[ei].name),
         }
     }
-    Ok(())
+}
+
+impl<A: GraphArith> Widener for Out<'_, A> {
+    type Instance = Path;
+    type Place = Path;
+    type Val = Value<Symbolic<A>>;
+    type Owed = NodeId;
+    type N = A::Num;
+
+    fn instances(&mut self, ei: usize) -> Result<Vec<Path>> {
+        Ok(match TABLE[ei].target {
+            Target::Objects(ty) => objects_of_type(self.st, ty),
+            Target::Globals => vec![Vec::new()],
+        })
+    }
+    fn slot(&mut self, ei: usize, at: &Path, k: usize) -> Result<Option<Path>> {
+        let p = field(at, TABLE[ei].slots[k].field);
+        Ok(iface::get(self.st, &p).is_some().then_some(p))
+    }
+    fn read(&mut self, p: &Path) -> Value<Symbolic<A>> {
+        iface::get(self.st, p).expect("a present slot")
+    }
+    fn write(&mut self, p: &Path, v: Value<Symbolic<A>>) -> Result<()> {
+        iface::set(self.st, p, v)
+    }
+    fn check(&mut self, ei: usize, p: &Path, holds: Holds) -> Result<()> {
+        match holds {
+            Holds::Number | Holds::NumberOrUnknown => self.num(ei, p).map(|_| ()),
+            Holds::Boolean => match iface::get(self.st, p) {
+                Some(Value::Bool(_)) => Ok(()),
+                _ => bail!("{}: not a boolean (widening {:?})", iface::show(p), TABLE[ei].name),
+            },
+        }
+    }
+    fn value(&mut self, v: Lit<A::Num>) -> Value<Symbolic<A>> {
+        match v {
+            Lit::Ival(lo, hi) => Value::Num(self.d.graph.leaf(Op::Const(A::lit(lo), A::lit(hi)))),
+            Lit::Num(n) => Value::Num(self.d.num(n)),
+            Lit::Bool(b) => Value::Bool(self.d.boolean(b)),
+            Lit::UnknownNum { countdown } => Value::Num(self.d.unknown_num(countdown)),
+            Lit::UnknownBool => Value::Bool(self.d.unknown_bool_output()),
+        }
+    }
+    fn at_least(&mut self, ei: usize, p: &Path, m: A::Num) -> Result<Value<Symbolic<A>>> {
+        let v = self.num(ei, p)?;
+        let m = self.d.num(m);
+        Ok(Value::Num(self.d.fun2(super::domain::Fun2::Max, &v, &m)?))
+    }
+    fn owe_inside(&mut self, ei: usize, p: &Path, lo: A::Num, hi: A::Num) -> Result<Option<NodeId>> {
+        let v = self.num(ei, p)?;
+        let owed = contain(self.d, v, (lo, hi));
+        if let Some(h) = owed {
+            owe(&mut self.errs, self.d, p, h);
+        }
+        Ok(owed)
+    }
+    /// The centre a shape's constant: the band a literal.
+    fn band(&mut self, ei: usize, k: usize, at: &Path, p: &Path, r: A::Num) -> Result<(Option<NodeId>, Value<Symbolic<A>>)> {
+        let Stored::Band { around, .. } = TABLE[ei].slots[k].stored else { bail!("widening {:?}: slot {k} is not a band", TABLE[ei].name) };
+        let sp = field(at, &[around]);
+        let Some(Value::Num(centre)) = iface::get(self.st, &sp) else { bail!("{}: not a number", iface::show(&sp)) };
+        let Some(c) = self.d.as_const(&centre) else { bail!("{}: not a constant", iface::show(&sp)) };
+        // As the block side: `s - radius`, `s + radius` in the arithmetic.
+        let (Some(lo), Some(hi)) = (A::sub(c, r), A::add(c, r)) else { bail!("{}: the band {c:?} +- {r:?} leaves {}", iface::show(p), A::RANGE_NOTE) };
+        let owed = self.owe_inside(ei, p, lo, hi)?;
+        Ok((owed, self.value(Lit::Ival(lo, hi))))
+    }
+    fn exact(&mut self, ei: usize, p: &Path) -> Result<bool> {
+        let v = self.num(ei, p)?;
+        Ok(!self.d.is_interval(&v))
+    }
+    fn owe_width(&mut self, ei: usize, p: &Path, period: A::Num) -> Result<NodeId> {
+        let v = self.num(ei, p)?;
+        let g = &mut self.d.graph;
+        let (lo, hi) = (g.fold(Op::Lo, vec![v]), g.fold(Op::Hi, vec![v]));
+        let width = g.fold(Op::Sub, vec![hi, lo]);
+        let k = A::lit(period);
+        let full_period = g.leaf(Op::Const(k, k));
+        let full = g.fold(Op::Ge, vec![width, full_period]);
+        owe(&mut self.errs, self.d, p, full);
+        Ok(full)
+    }
+    fn same(&mut self, ei: usize, p: &Path, twin: &Path) -> Result<()> {
+        anyhow::ensure!(
+            iface::get(self.st, p) == iface::get(self.st, twin),
+            "{}: not {} at the frame's end (widening {:?})",
+            iface::show(p),
+            iface::show(twin),
+            TABLE[ei].name
+        );
+        Ok(())
+    }
+    /// The two being one node at every frame's end.
+    fn reowe(&mut self, p: &Path, h: NodeId) {
+        owe(&mut self.errs, self.d, p, h);
+    }
+    fn near_floors(&mut self, ei: usize) -> Result<()> {
+        widen_near_floors(self.st, self.d, &TABLE[ei], &mut self.errs, self.mid)
+    }
 }
 
 fn bounds_inside<A: GraphArith>(d: &mut Symbolic<A>, v: NodeId, lo: A::Num, hi: A::Num) -> NodeId {

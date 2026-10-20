@@ -1,7 +1,8 @@
 //! THE WIDENING TABLE: every field a level stores as something other than
 //! its exact value, what it stores, what that owes, and why it is sound.
 //!
-//! One declarative table (`TABLE`), interpreted twice: the tracer turns each
+//! One declarative table (`TABLE`), its output side interpreted ONCE
+//! (`widen_level`) against two targets (`Widener`): the tracer turns each
 //! entry into graph ops and owed errors at the frame's end (`trace::widen`),
 //! and the block side evaluates the same entry over columns
 //! (`Rt2::widen_to`: the concrete search's node lookup, the objects ladder's
@@ -693,59 +694,146 @@ pub fn range<N: EngineNum>(lo: i32, hi: i32) -> (N, N) {
     }
 }
 
+/// What a slot must hold before an entry overwrites it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Holds {
+    Number,
+    /// A number, or (blocks) the unknown one.
+    NumberOrUnknown,
+    Boolean,
+}
+
+/// A value an entry writes.
+#[derive(Clone, Copy, Debug)]
+pub enum Lit<N> {
+    /// `[lo, hi]`.
+    Ival(N, N),
+    Num(N),
+    Bool(bool),
+    /// The unknown number (`countdown`: a countdown's).
+    UnknownNum { countdown: bool },
+    UnknownBool,
+}
+
+/// A TARGET of the table's output side (`widen_level`): the block side
+/// (`Rt2`, below) or the tracer's state and graph (`trace::widen`). The
+/// interpreter decides what each `Stored` checks, owes and writes, and in
+/// which order (the tracer's node order follows it); a target says what a
+/// value, a check and an obligation are in its terms. `ei` is the entry's
+/// index in `TABLE`. An `Err` is a modelling surprise (the tracer refuses;
+/// the block side panics).
+pub trait Widener {
+    /// An instance of an entry's target (an object; the globals).
+    type Instance;
+    /// Where a slot lives.
+    type Place;
+    type Val;
+    /// What a widening owes, as the target records it.
+    type Owed: Clone;
+    type N: EngineNum;
+
+    fn instances(&mut self, ei: usize) -> anyhow::Result<Vec<Self::Instance>>;
+    /// Slot `k` of the instance (`None`: absent).
+    fn slot(&mut self, ei: usize, at: &Self::Instance, k: usize) -> anyhow::Result<Option<Self::Place>>;
+    fn read(&mut self, p: &Self::Place) -> Self::Val;
+    fn write(&mut self, p: &Self::Place, v: Self::Val) -> anyhow::Result<()>;
+    fn check(&mut self, ei: usize, p: &Self::Place, holds: Holds) -> anyhow::Result<()>;
+    fn value(&mut self, v: Lit<Self::N>) -> Self::Val;
+    /// `max(v, m)` of the slot's number, the cart's (a double's tie, `-0`
+    /// against `0`, gives `m`).
+    fn at_least(&mut self, ei: usize, p: &Self::Place, m: Self::N) -> anyhow::Result<Self::Val>;
+    /// Owe the slot's number inside `[lo, hi]` (`None`: proved).
+    fn owe_inside(&mut self, ei: usize, p: &Self::Place, lo: Self::N, hi: Self::N) -> anyhow::Result<Option<Self::Owed>>;
+    /// Slot `k`'s `Band` (`radius` around the instance's constant field
+    /// `around`), owed as `owe_inside`; and the band.
+    fn band(&mut self, ei: usize, k: usize, at: &Self::Instance, p: &Self::Place, radius: Self::N) -> anyhow::Result<(Option<Self::Owed>, Self::Val)>;
+    /// Is the slot's number a point on every lane?
+    fn exact(&mut self, ei: usize, p: &Self::Place) -> anyhow::Result<bool>;
+    /// Owe the slot's width at least `period`.
+    fn owe_width(&mut self, ei: usize, p: &Self::Place, period: Self::N) -> anyhow::Result<Self::Owed>;
+    /// A `SameAs` slot is its twin, both before widening.
+    fn same(&mut self, ei: usize, p: &Self::Place, twin: &Self::Place) -> anyhow::Result<()>;
+    /// Owe the twin's obligation again, at a `SameAs` slot.
+    fn reowe(&mut self, p: &Self::Place, owed: Self::Owed);
+    /// `Hook::NearFloor`, per side (they differ mid split frame and with the
+    /// platforms unknown; their comments).
+    fn near_floors(&mut self, ei: usize) -> anyhow::Result<()>;
+}
+
+/// THE OUTPUT SIDE, both targets: `level`'s entries (`TABLE`, in order)
+/// applied to `w`, per instance, per slot in order.
+pub fn widen_level<W: Widener>(w: &mut W, level: Level) -> anyhow::Result<()> {
+    type Step<W> = (Option<<W as Widener>::Owed>, Option<<W as Widener>::Val>);
+    /// A slot checked, then overwritten by a literal.
+    fn checked<W: Widener>(w: &mut W, ei: usize, p: &W::Place, holds: Holds, v: Lit<W::N>) -> anyhow::Result<Step<W>> {
+        w.check(ei, p, holds)?;
+        Ok((None, Some(w.value(v))))
+    }
+    for (ei, e) in TABLE.iter().enumerate().filter(|(_, e)| level.has(e.flag)) {
+        if e.hook == Some(Hook::NearFloor) {
+            w.near_floors(ei)?;
+            continue;
+        }
+        let twin = |other: &str| e.slots.iter().position(|t| t.field == [other]).expect("SameAs names a slot of its entry");
+        for at in w.instances(ei)? {
+            let places: Vec<Option<W::Place>> = (0..e.slots.len()).map(|k| w.slot(ei, &at, k)).collect::<anyhow::Result<_>>()?;
+            let present = |k: usize| places[k].as_ref().ok_or_else(|| anyhow::anyhow!("widening {:?}: no `{}`", e.name, e.slots[k].field.join(".")));
+            for (k, s) in e.slots.iter().enumerate() {
+                if let (Stored::SameAs(other), Some(p)) = (s.stored, &places[k]) {
+                    w.same(ei, p, present(twin(other))?)?;
+                }
+            }
+            // Per slot, what it owes (a `SameAs` owes its twin's).
+            let mut owed: Vec<Option<W::Owed>> = Vec::with_capacity(e.slots.len());
+            for (k, s) in e.slots.iter().enumerate() {
+                let Some(p) = &places[k] else {
+                    anyhow::ensure!(s.optional, "widening {:?}: no `{}`", e.name, s.field.join("."));
+                    owed.push(None);
+                    continue;
+                };
+                let (o, new): Step<W> = match s.stored {
+                    Stored::Range { lo, hi } => {
+                        let (lo, hi) = range::<W::N>(lo, hi);
+                        (w.owe_inside(ei, p, lo, hi)?, Some(w.value(Lit::Ival(lo, hi))))
+                    }
+                    Stored::Band { radius, .. } => {
+                        let (o, v) = w.band(ei, k, &at, p, constant(radius))?;
+                        (o, Some(v))
+                    }
+                    Stored::AtLeast(m) => (None, Some(w.at_least(ei, p, constant(m))?)),
+                    Stored::FullPeriod(_) if w.exact(ei, p)? => (None, None),
+                    Stored::FullPeriod(period) => (Some(w.owe_width(ei, p, constant(period))?), Some(w.value(Lit::Ival(constant(0), constant(period))))),
+                    Stored::SameAs(other) => {
+                        let j = twin(other);
+                        if let Some(o) = &owed[j] {
+                            w.reowe(p, o.clone());
+                        }
+                        // Widened before: the twin comes first in its entry.
+                        (owed[j].clone(), Some(w.read(present(j)?)))
+                    }
+                    Stored::AbsentAsZero => (None, None),
+                    Stored::Phase { lo, hi } => checked(w, ei, p, Holds::Number, Lit::Ival(constant(lo), constant(hi)))?,
+                    Stored::UnknownNum => checked(w, ei, p, Holds::NumberOrUnknown, Lit::UnknownNum { countdown: e.flag == Flag::Near })?,
+                    Stored::UnknownBool => checked(w, ei, p, Holds::Boolean, Lit::UnknownBool)?,
+                    Stored::Num(n) => checked(w, ei, p, Holds::Number, Lit::Num(constant(n)))?,
+                    Stored::Bool(b) => checked(w, ei, p, Holds::Boolean, Lit::Bool(b))?,
+                };
+                if let Some(v) = new {
+                    w.write(p, v)?;
+                }
+                owed.push(o);
+            }
+        }
+    }
+    Ok(())
+}
+
 impl<N: EngineNum> Rt2<N> {
-    /// A level's widenings (`TABLE`), as its kernels bake them
+    /// A level's widenings (`TABLE`, `widen_level`), as its kernels bake them
     /// (`trace::widen`), so a finer row can be looked up as the level's
     /// node. Each asserts what its entry owes.
     pub fn widen_to(&mut self, level: Level) {
-        for (e, r) in TABLE.iter().zip(resolved()) {
-            if !level.has(e.flag) {
-                continue;
-            }
-            if e.hook == Some(Hook::NearFloor) {
-                self.widen_near_floors(r);
-                continue;
-            }
-            let bases: Vec<Option<u32>> = match r.ty {
-                Some(ty) => self.objects_of_type(ty).into_iter().map(Some).collect(),
-                None => vec![None],
-            };
-            for base in bases {
-                // A `SameAs` slot equals its twin BEFORE either is widened.
-                for (k, s) in e.slots.iter().enumerate() {
-                    if let Stored::SameAs(other) = s.stored {
-                        let j = e.slots.iter().position(|t| t.field == [other]).expect("SameAs names a slot of its entry");
-                        let (a, b) = (self.slot_cell(base, &r.fields[k]), self.slot_cell(base, &r.fields[j]));
-                        let (Some(a), Some(b)) = (a, b) else { panic!("widening {:?}: no `{}` or `{other}`", e.name, s.field.join(".")) };
-                        assert!(
-                            (0..self.width).all(|lane| self.cols[a as usize].at(lane) == self.cols[b as usize].at(lane)),
-                            "widening {:?}: a row where `{}` is not `{other}`",
-                            e.name,
-                            s.field.join(".")
-                        );
-                    }
-                }
-                for (k, s) in e.slots.iter().enumerate() {
-                    let cell = self.slot_cell(base, &r.fields[k]);
-                    let Some(c) = cell else {
-                        assert!(s.optional, "widening {:?}: no `{}`", e.name, s.field.join("."));
-                        continue;
-                    };
-                    let around = r.around[k].map(|f| {
-                        let obj = base.expect("a band is around an object's field");
-                        self.obj_field_cell(obj, f).unwrap_or_else(|| panic!("widening {:?}: no band centre", e.name))
-                    });
-                    let same = match s.stored {
-                        Stored::SameAs(other) => {
-                            let j = e.slots.iter().position(|t| t.field == [other]).expect("SameAs names a slot of its entry");
-                            Some(self.slot_cell(base, &r.fields[j]).expect("SameAs's slot"))
-                        }
-                        _ => None,
-                    };
-                    self.widen_cell(e.name, s, c, around, same);
-                }
-            }
-        }
+        widen_level(self, level).unwrap_or_else(|e| panic!("{e:#}"));
     }
 
     /// The cell of a slot: `field` below the object `base`, else from the
@@ -768,97 +856,117 @@ impl<N: EngineNum> Rt2<N> {
         Some(cell)
     }
 
-    /// Every lane of cell `c` satisfies `ok`, or panic naming the entry.
-    fn check_lanes(&self, name: &str, c: u32, what: &str, ok: impl Fn(AV<N>) -> bool) {
+    /// Every lane of cell `c` satisfies `ok`, or an error naming the entry.
+    fn check_lanes(&self, ei: usize, c: u32, what: &str, ok: impl Fn(AV<N>) -> bool) -> anyhow::Result<()> {
         for lane in 0..self.width {
             let v = self.cols[c as usize].at(lane);
-            assert!(ok(v), "widening {name:?}: lane {lane} holds {v:?}, {what}");
+            anyhow::ensure!(ok(v), "widening {:?}: lane {lane} holds {v:?}, {what}", TABLE[ei].name);
+        }
+        Ok(())
+    }
+}
+
+/// The block side: a slot is a cell, a value a column; what is owed is
+/// asserted per lane.
+impl<N: EngineNum> Widener for Rt2<N> {
+    type Instance = Option<u32>;
+    type Place = u32;
+    type Val = Col<N>;
+    type Owed = ();
+    type N = N;
+
+    fn instances(&mut self, ei: usize) -> anyhow::Result<Vec<Option<u32>>> {
+        Ok(match resolved()[ei].ty {
+            Some(ty) => self.objects_of_type(ty).into_iter().map(Some).collect(),
+            None => vec![None],
+        })
+    }
+    fn slot(&mut self, ei: usize, at: &Option<u32>, k: usize) -> anyhow::Result<Option<u32>> {
+        Ok(self.slot_cell(*at, &resolved()[ei].fields[k]))
+    }
+    fn read(&mut self, c: &u32) -> Col<N> {
+        self.cols[*c as usize].clone()
+    }
+    fn write(&mut self, c: &u32, v: Col<N>) -> anyhow::Result<()> {
+        self.cols[*c as usize] = v;
+        Ok(())
+    }
+    fn check(&mut self, ei: usize, c: &u32, holds: Holds) -> anyhow::Result<()> {
+        match holds {
+            Holds::Number => self.check_lanes(ei, *c, "not a number", |v| span(v).is_some()),
+            Holds::NumberOrUnknown => self.check_lanes(ei, *c, "not a number", |v| span(v).is_some() || v == AV::UNum),
+            Holds::Boolean => self.check_lanes(ei, *c, "not a boolean", |v| matches!(v, AV::Bool(_) | AV::UBool)),
         }
     }
-
-    /// One slot's stored value written into cell `c` (`around`: a band's
-    /// centre cell; `same`: a `SameAs`'s cell, before it was widened).
-    fn widen_cell(&mut self, name: &str, s: &Slot, c: u32, around: Option<u32>, same: Option<u32>) {
-        let le = <N::A as Arithmetic>::le;
-        let inside = |lo: N, hi: N| move |v: AV<N>| span(v).is_some_and(|(a, b)| le(lo, a) && le(b, hi));
-        let numeric = |v: AV<N>| span(v).is_some();
-        let new = match s.stored {
-            Stored::Range { lo, hi, .. } => {
-                let (lo, hi) = range::<N>(lo, hi);
-                self.check_lanes(name, c, "outside the widening", inside(lo, hi));
-                Col::U(AV::Ival(lo, hi))
-            }
-            Stored::Band { radius, .. } => {
-                let centre = around.expect("a band's centre");
-                let r = constant::<N>(radius);
-                let band: Vec<(N, N)> = (0..self.width)
-                    .map(|lane| match self.cols[centre as usize].at(lane) {
-                        AV::Num(s) => match (<N::A as Arithmetic>::sub(s, r), <N::A as Arithmetic>::add(s, r)) {
-                            (Some(lo), Some(hi)) => (lo, hi),
-                            _ => panic!("widening {name:?}: lane {lane}'s band {s:?} +- {r:?} leaves the arithmetic's range"),
-                        },
-                        other => panic!("widening {name:?}: the band's centre is {other:?}"),
-                    })
-                    .collect();
-                for (lane, &(lo, hi)) in band.iter().enumerate() {
-                    let v = self.cols[c as usize].at(lane);
-                    assert!(inside(lo, hi)(v), "widening {name:?}: lane {lane} holds {v:?}, outside the band [{lo:?}, {hi:?}]");
-                }
-                collapse_uniform(Col::I(band))
-            }
-            Stored::Phase { lo, hi } => {
-                self.check_lanes(name, c, "not a number", numeric);
-                Col::U(AV::Ival(constant(lo), constant(hi)))
-            }
-            Stored::AtLeast(k) => {
-                let k = constant::<N>(k);
-                // `max(v, k)`, the cart's (`trace::widen` bakes `Op::Max(v,
-                // k)`; a double's tie, `-0` against `0`, gives `k`).
-                let max = |n: N| <N::A as Arithmetic>::max(n, k);
-                let at_least = |v: AV<N>| match v {
-                    AV::Num(n) => AV::Num(max(n)),
-                    AV::Ival(a, b) => AV::Ival(max(a), max(b)),
-                    other => panic!("widening {name:?}: {other:?} is not a number"),
-                };
-                match &self.cols[c as usize] {
-                    Col::U(v) => Col::U(at_least(*v)),
-                    Col::N(vs) => Col::N(vs.iter().map(|n| max(*n)).collect()),
-                    col => collapse_uniform(crate::runtime2::compress_num_v((0..self.width).map(|l| at_least(col.at(l))).collect())),
-                }
-            }
-            Stored::UnknownNum => {
-                self.check_lanes(name, c, "not a number", |v| numeric(v) || v == AV::UNum);
-                Col::U(AV::UNum)
-            }
-            Stored::UnknownBool => {
-                self.check_lanes(name, c, "not a boolean", |v| matches!(v, AV::Bool(_) | AV::UBool));
-                Col::U(AV::UBool)
-            }
-            Stored::Num(k) => {
-                self.check_lanes(name, c, "not a number", numeric);
-                Col::U(AV::Num(constant(k)))
-            }
-            Stored::Bool(b) => {
-                self.check_lanes(name, c, "not a boolean", |v| matches!(v, AV::Bool(_) | AV::UBool));
-                Col::U(AV::Bool(b))
-            }
-            Stored::FullPeriod(p) => {
-                if (0..self.width).all(|lane| matches!(self.cols[c as usize].at(lane), AV::Num(_))) {
-                    return;
-                }
-                let width = constant::<N>(p);
-                let full = |v: AV<N>| matches!(v, AV::Ival(lo, hi) if <N::A as Arithmetic>::sub(hi, lo).is_some_and(|w| le(width, w)));
-                self.check_lanes(name, c, "not a full period", full);
-                Col::U(AV::Ival(constant(0), width))
-            }
-            // Checked equal before the entry (`widen_to`); the twin's slot
-            // comes first in its entry, so it is widened already.
-            Stored::SameAs(_) => self.cols[same.expect("SameAs's cell") as usize].clone(),
-            Stored::AbsentAsZero => return,
-        };
-        self.cols[c as usize] = new;
+    fn value(&mut self, v: Lit<N>) -> Col<N> {
+        Col::U(match v {
+            Lit::Ival(lo, hi) => AV::Ival(lo, hi),
+            Lit::Num(n) => AV::Num(n),
+            Lit::Bool(b) => AV::Bool(b),
+            Lit::UnknownNum { .. } => AV::UNum,
+            Lit::UnknownBool => AV::UBool,
+        })
     }
+    fn at_least(&mut self, ei: usize, c: &u32, m: N) -> anyhow::Result<Col<N>> {
+        let max = |n: N| <N::A as Arithmetic>::max(n, m);
+        let at_least = |v: AV<N>| match v {
+            AV::Num(n) => Ok(AV::Num(max(n))),
+            AV::Ival(a, b) => Ok(AV::Ival(max(a), max(b))),
+            other => Err(anyhow::anyhow!("widening {:?}: {other:?} is not a number", TABLE[ei].name)),
+        };
+        Ok(match &self.cols[*c as usize] {
+            Col::U(v) => Col::U(at_least(*v)?),
+            Col::N(vs) => Col::N(vs.iter().map(|n| max(*n)).collect()),
+            col => collapse_uniform(crate::runtime2::compress_num_v((0..self.width).map(|l| at_least(col.at(l))).collect::<anyhow::Result<_>>()?)),
+        })
+    }
+    fn owe_inside(&mut self, ei: usize, c: &u32, lo: N, hi: N) -> anyhow::Result<Option<()>> {
+        let le = <N::A as Arithmetic>::le;
+        self.check_lanes(ei, *c, "outside the widening", |v| span(v).is_some_and(|(a, b)| le(lo, a) && le(b, hi)))?;
+        Ok(None)
+    }
+    fn band(&mut self, ei: usize, k: usize, at: &Option<u32>, c: &u32, r: N) -> anyhow::Result<(Option<()>, Col<N>)> {
+        let name = TABLE[ei].name;
+        let le = <N::A as Arithmetic>::le;
+        let f = resolved()[ei].around[k].expect("a band's centre field");
+        let obj = at.ok_or_else(|| anyhow::anyhow!("widening {name:?}: a band is around an object's field"))?;
+        let centre = self.obj_field_cell(obj, f).ok_or_else(|| anyhow::anyhow!("widening {name:?}: no band centre"))?;
+        let mut band = Vec::with_capacity(self.width);
+        for lane in 0..self.width {
+            let (lo, hi) = match self.cols[centre as usize].at(lane) {
+                AV::Num(s) => match (<N::A as Arithmetic>::sub(s, r), <N::A as Arithmetic>::add(s, r)) {
+                    (Some(lo), Some(hi)) => (lo, hi),
+                    _ => anyhow::bail!("widening {name:?}: lane {lane}'s band {s:?} +- {r:?} leaves the arithmetic's range"),
+                },
+                other => anyhow::bail!("widening {name:?}: the band's centre is {other:?}"),
+            };
+            let v = self.cols[*c as usize].at(lane);
+            anyhow::ensure!(span(v).is_some_and(|(a, b)| le(lo, a) && le(b, hi)), "widening {name:?}: lane {lane} holds {v:?}, outside the band [{lo:?}, {hi:?}]");
+            band.push((lo, hi));
+        }
+        Ok((None, collapse_uniform(Col::I(band))))
+    }
+    fn exact(&mut self, _ei: usize, c: &u32) -> anyhow::Result<bool> {
+        Ok((0..self.width).all(|lane| matches!(self.cols[*c as usize].at(lane), AV::Num(_))))
+    }
+    fn owe_width(&mut self, ei: usize, c: &u32, period: N) -> anyhow::Result<()> {
+        let le = <N::A as Arithmetic>::le;
+        self.check_lanes(ei, *c, "not a full period", |v| matches!(v, AV::Ival(lo, hi) if <N::A as Arithmetic>::sub(hi, lo).is_some_and(|w| le(period, w))))
+    }
+    fn same(&mut self, ei: usize, c: &u32, twin: &u32) -> anyhow::Result<()> {
+        let s = &TABLE[ei].slots;
+        let at = |c: u32| (0..self.width).map(|lane| self.cols[c as usize].at(lane)).collect::<Vec<_>>();
+        anyhow::ensure!(at(*c) == at(*twin), "widening {:?}: a row where a `SameAs` slot ({}) is not its twin", TABLE[ei].name, s.iter().map(|s| s.field.join(".")).collect::<Vec<_>>().join(", "));
+        Ok(())
+    }
+    fn reowe(&mut self, _c: &u32, _owed: ()) {}
+    fn near_floors(&mut self, ei: usize) -> anyhow::Result<()> {
+        self.widen_near_floors(&resolved()[ei]);
+        Ok(())
+    }
+}
 
+impl<N: EngineNum> Rt2<N> {
     /// `Hook::NearFloor` on blocks (`trace::widen::widen_near_floors`): `state`
     /// and `collideable` widened except where a player certainly overlaps the
     /// floor (kept as they are: the kernels store the cart's invariant there, or
