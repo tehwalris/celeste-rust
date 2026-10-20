@@ -16,7 +16,7 @@ use super::domain::{Domain, Symbolic};
 use super::heap::Value;
 use super::iface::{self, Path, Step};
 use super::state::State;
-use crate::transpile::garith::GraphArith;
+use crate::transpile::garith::{within, GraphArith};
 use crate::transpile::graph::{NodeId, Op};
 
 /// Write every `Stored::AbsentAsZero` field an object lacks as the number 0
@@ -276,7 +276,7 @@ fn bounds_inside<A: GraphArith>(d: &mut Symbolic<A>, v: NodeId, lo: A::Num, hi: 
 /// `v` in `[lo, hi]`: `None` if proved statically (`within`), else the
 /// per-lane condition.
 fn contain<A: GraphArith>(d: &mut Symbolic<A>, v: NodeId, (lo, hi): (A::Num, A::Num)) -> Option<NodeId> {
-    if within(d, v, (lo.to_f64(), hi.to_f64()), &mut Vec::new()) {
+    if within(&d.graph, v, lo, hi) {
         return None;
     }
     Some(bounds_inside(d, v, lo, hi))
@@ -323,7 +323,7 @@ pub fn read_inputs<A: GraphArith>(st: &mut State<Symbolic<A>>, d: &mut Symbolic<
 /// check `v` inside the literal), unless the graph proves it inside.
 fn pin_literal<A: GraphArith>(d: &mut Symbolic<A>, v: NodeId, lo: i32, hi: i32) {
     let (l, h) = range::<A::Num>(lo, hi);
-    if !within(d, v, (l.to_f64(), h.to_f64()), &mut Vec::new()) {
+    if !within(&d.graph, v, l, h) {
         d.pin(v, crate::transpile::graph::Pinned::Num(A::lit(l), A::lit(h)));
     }
 }
@@ -599,134 +599,6 @@ pub fn platform_inputs<A: GraphArith>(st: &mut State<Symbolic<A>>, d: &mut Symbo
     }
     d.platform_cells = cells.into_iter().map(|c| c.expect("every world platform matched")).collect();
     Ok(obligations)
-}
-
-/// A static range of a value, as exact doubles (16.16's values and a
-/// double's both are; infinite ends unbounded). `f64` arithmetic on it is
-/// EXACT for 16.16 and the doubles' own rounding for `Float` (`fl` is
-/// monotone, so `fl(a + b)` over ranges lies between the ends' sums).
-type RangeF64 = (f64, f64);
-
-/// Does `v` provably lie in `[lo, hi]`? Through select arms and under
-/// point-split branches with what they say about the compared value (so a
-/// wrap `x < -16 ? 128 : ...` is bounded). Static; `false` if unsure.
-fn within<A: GraphArith>(d: &Symbolic<A>, v: NodeId, (lo, hi): RangeF64, facts: &mut Vec<(NodeId, f64, f64)>) -> bool {
-    // Its own bounds first: the enclosing branch may bound a select whole.
-    if let Some((a, b)) = bounds(d, v, facts) {
-        if lo <= a && b <= hi {
-            return true;
-        }
-    }
-    let node = d.graph.get(v);
-    if let Op::Sel = node.op {
-        let (c, t, f) = (node.args[0], node.args[1], node.args[2]);
-        // A select on `x op k`: each arm with what its answer says about `x`.
-        if let Some((x, yes, no)) = comparison_facts(d, c) {
-            facts.push((x, yes.0, yes.1));
-            let a = within(d, t, (lo, hi), facts);
-            facts.pop();
-            facts.push((x, no.0, no.1));
-            let b = within(d, f, (lo, hi), facts);
-            facts.pop();
-            return a && b;
-        }
-        return within(d, t, (lo, hi), facts) && within(d, f, (lo, hi), facts);
-    }
-    match bounds(d, v, facts) {
-        Some((a, b)) => lo <= a && b <= hi,
-        None => false,
-    }
-}
-
-/// `c` as `x op k` (`k` a literal point, either side): `x` and its range
-/// `(when true, when false)`; `k`'s neighbours are the arithmetic's
-/// (`Arithmetic::below`, and above as `-below(-k)`).
-fn comparison_facts<A: GraphArith>(d: &Symbolic<A>, c: NodeId) -> Option<(NodeId, RangeF64, RangeF64)> {
-    let node = d.graph.get(c);
-    let point = |n: NodeId| match d.graph.get(n).op {
-        Op::Const(a, b) if a == b => Some(A::from_lit(a)),
-        _ => None,
-    };
-    if !matches!(node.op, Op::Lt | Op::Le | Op::Gt | Op::Ge) {
-        return None;
-    }
-    // `k op x` is `x op' k` with the operator mirrored.
-    let (x, k, op) = match (point(node.args[0]), point(node.args[1])) {
-        (None, Some(k)) => (node.args[0], k, node.op.clone()),
-        (Some(k), None) => (
-            node.args[1],
-            k,
-            match node.op {
-                Op::Lt => Op::Gt,
-                Op::Le => Op::Ge,
-                Op::Gt => Op::Lt,
-                _ => Op::Le,
-            },
-        ),
-        _ => return None,
-    };
-    let pred = A::below(k)?.to_f64();
-    let succ = A::below(A::neg(k)?).and_then(A::neg)?.to_f64();
-    let (k, inf) = (k.to_f64(), f64::INFINITY);
-    let (yes, no) = match op {
-        Op::Lt => ((-inf, pred), (k, inf)),
-        Op::Le => ((-inf, k), (succ, inf)),
-        Op::Gt => ((succ, inf), (-inf, k)),
-        _ => ((k, inf), (-inf, pred)),
-    };
-    Some((x, yes, no))
-}
-
-/// A static range of `n` (literals, a bounded input such as a platform's
-/// `x`, sums and differences), narrowed by the enclosing branches.
-fn bounds<A: GraphArith>(d: &Symbolic<A>, n: NodeId, facts: &[(NodeId, f64, f64)]) -> Option<RangeF64> {
-    let node = d.graph.get(n);
-    let num = |l: A::Lit| A::from_lit(l).to_f64();
-    let structural = || -> Option<RangeF64> {
-        Some(match node.op {
-            Op::Const(a, b) => (num(a), num(b)),
-            Op::Sel => {
-                let (a, b) = (bounds(d, node.args[1], facts)?, bounds(d, node.args[2], facts)?);
-                (a.0.min(b.0), a.1.max(b.1))
-            }
-            Op::Flr => {
-                let a = bounds(d, node.args[0], facts)?;
-                (a.0.floor(), a.1.floor())
-            }
-            // A fork's fragment lies inside its operand.
-            Op::Fork(..) | Op::Frag(..) => bounds(d, node.args[0], facts)?,
-            Op::Add => {
-                let (a, b) = (bounds(d, node.args[0], facts)?, bounds(d, node.args[1], facts)?);
-                (a.0 + b.0, a.1 + b.1)
-            }
-            Op::Sub => {
-                let (a, b) = (bounds(d, node.args[0], facts)?, bounds(d, node.args[1], facts)?);
-                (a.0 - b.1, a.1 - b.0)
-            }
-            // A bounded input (`Op::Restrict`; as `GraphArith::pieces_of`).
-            Op::Restrict(lo, hi) => {
-                let (lo, hi) = (num(lo), num(hi));
-                match bounds(d, node.args[0], facts) {
-                    Some(a) if a.0.max(lo) <= a.1.min(hi) => (a.0.max(lo), a.1.min(hi)),
-                    Some(a) => a,
-                    None => (lo, hi),
-                }
-            }
-            _ => return None,
-        })
-    };
-    // From its structure, else only from the enclosing branches.
-    let mut r = match structural() {
-        Some(r) => r,
-        None if facts.iter().any(|f| f.0 == n) => (f64::NEG_INFINITY, f64::INFINITY),
-        None => return None,
-    };
-    for &(m, flo, fhi) in facts {
-        if m == n {
-            r = (r.0.max(flo), r.1.min(fhi));
-        }
-    }
-    Some(r)
 }
 
 #[cfg(test)]

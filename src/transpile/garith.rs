@@ -82,7 +82,7 @@ pub trait GraphArith: Arithmetic<Num: celeste_core::arith::EngineNum<A = Self>> 
     /// The static range of `n` from the restrictions (`None`: unknown, never
     /// wrong). `memo` is valid for one graph.
     fn pieces_of(g: &Graph<Self>, memo: &mut HashMap<NodeId, Option<Pieces<Self>>>, n: NodeId) -> Option<Pieces<Self>> {
-        pieces_of(g, memo, n)
+        pieces_under(g, memo, n, &[])
     }
     /// Does every pair of pieces of `x` and `y` give comparison `op` (an
     /// `Op::Lt`..`Op::Eq`) one answer?
@@ -176,6 +176,9 @@ pub const MAX_PIECES: usize = 64;
 /// lane's.
 pub trait End: Copy + PartialOrd + Debug + Send + std::ops::Add<Output = Self> + std::ops::Sub<Output = Self> + std::ops::Neg<Output = Self> {
     const ZERO: Self;
+    /// The arithmetic's least and greatest values.
+    const MIN: Self;
+    const MAX: Self;
     /// Inside the arithmetic (16.16's `i32` raws; the finite doubles).
     fn valid(self) -> bool;
     /// Does a piece starting at `lo` join one ending at `hi` (16.16: also
@@ -213,8 +216,15 @@ fn normalize<E: End>(mut v: Vec<(E, E)>) -> Option<Vec<(E, E)>> {
     Some(out)
 }
 
-/// `GraphArith::pieces_of`, once for both arithmetics.
-fn pieces_of<A: GraphArith>(g: &Graph<A>, memo: &mut HashMap<NodeId, Option<Pieces<A>>>, n: NodeId) -> Option<Pieces<A>> {
+/// What a branch says about a value: node `.0` lies in `[.1, .2]`.
+pub type Fact<A> = (NodeId, <A as GraphArith>::End, <A as GraphArith>::End);
+
+/// `GraphArith::pieces_of` (no `facts`), once for both arithmetics; under
+/// `facts`, each node a fact names is narrowed to it (a node with no range
+/// of its own takes the fact's), and a node no lane reaches (contradicting
+/// facts, or an operand that is) is the empty range. `memo` is valid for
+/// one graph and one set of facts.
+fn pieces_under<A: GraphArith>(g: &Graph<A>, memo: &mut HashMap<NodeId, Option<Pieces<A>>>, n: NodeId, facts: &[Fact<A>]) -> Option<Pieces<A>> {
     if let Some(r) = memo.get(&n) {
         return r.clone();
     }
@@ -224,8 +234,9 @@ fn pieces_of<A: GraphArith>(g: &Graph<A>, memo: &mut HashMap<NodeId, Option<Piec
         Op::Const(lo, hi) if lo == hi => Some(A::end(lo)),
         _ => None,
     };
-    let rec = |memo: &mut HashMap<NodeId, Option<Pieces<A>>>, k: usize| pieces_of(g, memo, args[k]);
-    let r: Option<Pieces<A>> = match op {
+    let rec = |memo: &mut HashMap<NodeId, Option<Pieces<A>>>, k: usize| pieces_under(g, memo, args[k], facts);
+    let unreached = !facts.is_empty() && !matches!(op, Op::Sel) && (0..args.len()).any(|k| rec(memo, k).is_some_and(|p| p.is_empty()));
+    let r: Option<Pieces<A>> = if unreached { Some(Vec::new()) } else { match op {
         Op::Const(lo, hi) => Some(vec![(A::end(lo), A::end(hi))]),
         // The assumed range (as `eval`): its own error makes it a fact.
         Op::Restrict(lo, hi) => {
@@ -302,7 +313,11 @@ fn pieces_of<A: GraphArith>(g: &Graph<A>, memo: &mut HashMap<NodeId, Option<Piec
             _ => {
                 let (mut a, b) = (rec(memo, 1)?, rec(memo, 2)?);
                 a.extend(b);
-                normalize(a)
+                if a.is_empty() {
+                    Some(a)
+                } else {
+                    normalize(a)
+                }
             }
         },
         Op::Span => {
@@ -316,7 +331,7 @@ fn pieces_of<A: GraphArith>(g: &Graph<A>, memo: &mut HashMap<NodeId, Option<Piec
             let low = matches!(op, Op::Lo);
             let arg = g.get(args[0]).clone();
             match arg.op {
-                Op::Span => pieces_of(g, memo, arg.args[if low { 0 } else { 1 }]),
+                Op::Span => pieces_under(g, memo, arg.args[if low { 0 } else { 1 }], facts),
                 Op::Const(l, h) => {
                     let v = A::end(if low { l } else { h });
                     Some(vec![(v, v)])
@@ -325,9 +340,83 @@ fn pieces_of<A: GraphArith>(g: &Graph<A>, memo: &mut HashMap<NodeId, Option<Piec
             }
         }
         _ => None,
-    };
+    } };
+    let mut r = r;
+    for &(_, lo, hi) in facts.iter().filter(|f| f.0 == n) {
+        let p = r.unwrap_or_else(|| vec![(A::End::MIN, A::End::MAX)]);
+        r = Some(p.into_iter().map(|(a, b)| (a.most(lo), b.least(hi))).filter(|(a, b)| a <= b).collect());
+    }
     memo.insert(n, r.clone());
     r
+}
+
+/// Does `v` provably lie in `[lo, hi]`? Its static range (`pieces_of`),
+/// and through select arms on `x op k` (`k` a literal) with what each
+/// answer says about `x` (so a wrap `x < -16 ? 128 : ...` is bounded).
+/// `false` if unsure.
+pub fn within<A: GraphArith>(g: &Graph<A>, v: NodeId, lo: A::Num, hi: A::Num) -> bool {
+    let (lo, hi) = (A::end(A::lit(lo)), A::end(A::lit(hi)));
+    within_under(g, v, (lo, hi), &mut Vec::new())
+}
+
+fn within_under<A: GraphArith>(g: &Graph<A>, v: NodeId, (lo, hi): (A::End, A::End), facts: &mut Vec<Fact<A>>) -> bool {
+    if pieces_under(g, &mut HashMap::new(), v, facts).is_some_and(|p| p.iter().all(|&(a, b)| lo <= a && b <= hi)) {
+        return true;
+    }
+    let node = g.get(v);
+    if node.op != Op::Sel {
+        return false;
+    }
+    let (c, t, f) = (node.args[0], node.args[1], node.args[2]);
+    let Some((x, yes, no)) = comparison_facts(g, c) else {
+        return within_under(g, t, (lo, hi), facts) && within_under(g, f, (lo, hi), facts);
+    };
+    facts.push((x, yes.0, yes.1));
+    let a = within_under(g, t, (lo, hi), facts);
+    facts.pop();
+    facts.push((x, no.0, no.1));
+    let b = within_under(g, f, (lo, hi), facts);
+    facts.pop();
+    a && b
+}
+
+/// `c` as `x op k` (`k` a literal point, either side): `x` and its range
+/// `(when true, when false)`; `k`'s neighbours are the arithmetic's
+/// (`Arithmetic::below`, and above as `-below(-k)`).
+fn comparison_facts<A: GraphArith>(g: &Graph<A>, c: NodeId) -> Option<(NodeId, (A::End, A::End), (A::End, A::End))> {
+    let node = g.get(c);
+    let point = |n: NodeId| match g.get(n).op {
+        Op::Const(a, b) if a == b => Some(A::from_lit(a)),
+        _ => None,
+    };
+    if !matches!(node.op, Op::Lt | Op::Le | Op::Gt | Op::Ge) {
+        return None;
+    }
+    // `k op x` is `x op' k` with the operator mirrored.
+    let (x, k, op) = match (point(node.args[0]), point(node.args[1])) {
+        (None, Some(k)) => (node.args[0], k, node.op.clone()),
+        (Some(k), None) => (
+            node.args[1],
+            k,
+            match node.op {
+                Op::Lt => Op::Gt,
+                Op::Le => Op::Ge,
+                Op::Gt => Op::Lt,
+                _ => Op::Le,
+            },
+        ),
+        _ => return None,
+    };
+    let end = |v: A::Num| A::end(A::lit(v));
+    let pred = end(A::below(k)?);
+    let succ = end(A::below(A::neg(k)?).and_then(A::neg)?);
+    let (k, (min, max)) = (end(k), (A::End::MIN, A::End::MAX));
+    Some(match op {
+        Op::Lt => (x, (min, pred), (k, max)),
+        Op::Le => (x, (min, k), (succ, max)),
+        Op::Gt => (x, (succ, max), (min, k)),
+        _ => (x, (k, max), (min, pred)),
+    })
 }
 
 // 16.16.
@@ -335,8 +424,10 @@ fn pieces_of<A: GraphArith>(g: &Graph<A>, memo: &mut HashMap<NodeId, Option<Piec
 /// 16.16's raw value, exact and unwrapped.
 impl End for i64 {
     const ZERO: i64 = 0;
+    const MIN: i64 = i32::MIN as i64;
+    const MAX: i64 = i32::MAX as i64;
     fn valid(self) -> bool {
-        (i32::MIN as i64..=i32::MAX as i64).contains(&self)
+        (<i64 as End>::MIN..=<i64 as End>::MAX).contains(&self)
     }
     fn joins(lo: i64, hi: i64) -> bool {
         lo <= hi + 1
@@ -500,6 +591,8 @@ fn decide_pairs<P: Copy>(xs: &[P], ys: &[P], one: impl Fn(P, P) -> Option<bool>)
 /// A double's value.
 impl End for f64 {
     const ZERO: f64 = 0.0;
+    const MIN: f64 = f64::MIN;
+    const MAX: f64 = f64::MAX;
     fn valid(self) -> bool {
         self.is_finite()
     }
