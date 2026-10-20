@@ -14,52 +14,6 @@ use crate::search::rem::Rem;
 use crate::storage::stats::{Lap, Stats, S};
 use crate::storage::wave::Frontier;
 
-/// A columnar batch of lanes of one shape (the kernels' `Rt2`), with its
-/// key column where it was decoded from keys.
-pub struct Block<N: EngineNum = P8> {
-    rt2: Rt2<N>,
-}
-
-impl<N: EngineNum> Block<N> {
-    pub fn from_rt2(rt2: Rt2<N>) -> Self {
-        assert!(
-            rt2.row_keys.is_empty() || rt2.row_keys.len() == rt2.width,
-            "block with a partial key column ({} keys for {} lanes)",
-            rt2.row_keys.len(),
-            rt2.width
-        );
-        Block { rt2 }
-    }
-
-    /// A reference-engine block made CANONICAL (ids, shape hash), no keys.
-    pub fn canonical(mut rt2: Rt2<N>) -> Result<Self> {
-        rt2.canonical();
-        Ok(Block { rt2 })
-    }
-
-    pub fn into_rt2(self) -> Rt2<N> {
-        self.rt2
-    }
-
-    pub fn rt2(&self) -> &Rt2<N> {
-        &self.rt2
-    }
-
-    /// The player-position cell per lane.
-    pub fn positions(&self) -> Result<Vec<u32>> {
-        crate::search::pos_graph::block_cells(&self.rt2)
-    }
-
-    /// `exits_of`: a superset of the wins.
-    pub(crate) fn exits(&self, s: &crate::settings::Settings) -> Result<Vec<bool>> {
-        exits_of(&self.rt2, s)
-    }
-
-    pub fn lanes(&self) -> usize {
-        self.rt2.width
-    }
-}
-
 /// The summit's level index: no exit, it ends at the flag (`summit_flag`).
 pub(crate) const SUMMIT_LEVEL: i16 = 30;
 
@@ -153,7 +107,7 @@ fn room_is<N: EngineNum>(rt2: &Rt2<N>, (wx, wy): (i16, i16)) -> Result<Vec<bool>
 /// and in a 100% run the room's berry taken.
 pub fn wins_of<N: EngineNum>(rt2: &Rt2<N>, s: &crate::settings::Settings) -> Result<Vec<bool>> {
     let mut wins = reaches_win(rt2, s)?;
-    if s.hundred {
+    if s.category.hundred() {
         for (e, b) in wins.iter_mut().zip(got_fruit(rt2, s.room)?) {
             *e &= b;
         }
@@ -226,7 +180,7 @@ pub(crate) fn berry_lost<N: EngineNum>(rt2: &Rt2<N>, s: &crate::settings::Settin
     let lanes = rt2.width;
     let ids = crate::compiled::ids();
     let sources = [ids.g_fruit, ids.g_fly_fruit, ids.g_key, ids.g_chest, ids.g_fake_wall];
-    if !s.hundred || sources.iter().any(|&g| !rt2.objects_of_type(g).is_empty()) {
+    if !s.category.hundred() || sources.iter().any(|&g| !rt2.objects_of_type(g).is_empty()) {
         return Ok(vec![false; lanes]);
     }
     Ok(got_fruit(rt2, s.room)?.into_iter().map(|taken| !taken).collect())
@@ -240,20 +194,20 @@ pub(crate) fn berry_lost<N: EngineNum>(rt2: &Rt2<N>, s: &crate::settings::Settin
 /// rows' layer; `ceiling`: the tree's level -1 horizon. A state not
 /// expanded has no edges, so it is never re-pushed; one expanded is
 /// re-pushed whatever the orb's deadline says later: sound, less pruned.
-pub(crate) fn not_expanded<N: EngineNum>(b: &Block<N>, frame: u32, ceiling: Option<u32>, s: &crate::settings::Settings) -> Result<Vec<bool>> {
-    let mut skip = b.exits(s)?;
+pub(crate) fn not_expanded<N: EngineNum>(b: &Rt2<N>, frame: u32, ceiling: Option<u32>, s: &crate::settings::Settings) -> Result<Vec<bool>> {
+    let mut skip = exits_of(b, s)?;
     // Under a win rectangle a row that LEFT the room is no win, and its
     // shape has no kernel.
     if win_rect(s).is_some() {
-        for (w, here) in skip.iter_mut().zip(room_is(b.rt2(), s.room)?) {
+        for (w, here) in skip.iter_mut().zip(room_is(b, s.room)?) {
             *w |= !here;
         }
     }
-    for (w, lost) in skip.iter_mut().zip(berry_lost(b.rt2(), s)?) {
+    for (w, lost) in skip.iter_mut().zip(berry_lost(b, s)?) {
         *w |= lost;
     }
     if let (true, Some(h)) = (orb_required(s), ceiling) {
-        for (w, late) in skip.iter_mut().zip(orb_deadline_skip(b.rt2(), frame, h)) {
+        for (w, late) in skip.iter_mut().zip(orb_deadline_skip(b, frame, h)) {
             *w |= late;
         }
     }
@@ -264,7 +218,7 @@ pub(crate) fn not_expanded<N: EngineNum>(b: &Block<N>, frame: u32, ceiling: Opti
 /// (`max_djump == 2`): later levels are played with the second dash.
 pub(crate) fn orb_required(s: &crate::settings::Settings) -> bool {
     let (x, y) = s.room;
-    crate::game_runner::level_index(x, y) == crate::game_runner::ORB_LEVEL && !s.gemskip
+    crate::game_runner::level_index(x, y) == crate::game_runner::ORB_LEVEL && !s.category.gemskip()
 }
 
 /// THE LEVEL -1 FILTER (`--level-minus-one H,S`, `h` in steps): a row is
@@ -355,7 +309,7 @@ impl<'a, N: EngineNum> MarkFilter<'a, N> {
     /// Per lane of `rt2`, its projection's deadline at the coarser level
     /// (`None`: not marked there).
     pub(crate) fn deadlines(&self, rt2: &Rt2<N>) -> Result<Vec<Option<u16>>> {
-        let (shape, keys, cells) = widened_keys_rt2(rt2, self.coarser, self.marked.keys())?;
+        let (shape, keys, cells) = widened_keys(rt2, self.coarser, self.marked.keys())?;
         Ok(keys.iter().zip(&cells).map(|(k, &c)| k.and_then(|k| self.marked.deadline(shape, k, c))).collect())
     }
 
@@ -364,23 +318,15 @@ impl<'a, N: EngineNum> MarkFilter<'a, N> {
     }
 }
 
-/// Each lane's `(shape, key, cell)` at the `coarser` level (its node there)
-/// in the key space `keys` (`None`: a code the space lacks - no node).
-pub(crate) fn widened_keys<N: EngineNum>(
-    block: &Block<N>,
-    coarser: crate::abstraction::Level,
-    keys: &celeste_engine::exact::KeySpace<N>,
-) -> Result<(u64, Vec<Option<(u64, u64)>>, Vec<u32>)> {
-    widened_keys_rt2(&block.rt2, coarser, keys)
-}
 
 /// `rt2` projected IN PLACE onto `level`, as its kernels would store it.
 pub fn widen_rt2_to<N: EngineNum>(rt2: &mut Rt2<N>, level: crate::abstraction::Level) {
     rt2.widen_to(level);
 }
 
-/// `widened_keys` of an `Rt2`.
-pub(crate) fn widened_keys_rt2<N: EngineNum>(
+/// Each lane's `(shape, key, cell)` at the `coarser` level (its node there)
+/// in the key space `keys` (`None`: a code the space lacks - no node).
+pub(crate) fn widened_keys<N: EngineNum>(
     rt2: &Rt2<N>,
     coarser: crate::abstraction::Level,
     keys: &celeste_engine::exact::KeySpace<N>,
@@ -402,7 +348,7 @@ pub(crate) fn widened_keys_rt2<N: EngineNum>(
 pub trait FrameStep<N: Rem = P8>: Sync {
     /// One frame of `lanes` of `block` into `sink`; called concurrently on
     /// disjoint ranges (scratch in the sink or behind a lock).
-    fn run(&self, block: &Block<N>, cell_in: &[u32], lanes: &[usize], sink: &mut crate::storage::unit::UnitSink<N>) -> Result<()>;
+    fn run(&self, block: &Rt2<N>, cell_in: &[u32], lanes: &[usize], sink: &mut crate::storage::unit::UnitSink<N>) -> Result<()>;
 
     /// Build what the engine builds on first use (the kernels) before a
     /// wave's clock starts: inside the wave every worker would wait on the
@@ -580,7 +526,7 @@ impl<N: Rem> ForwardState<N> {
     /// Frame 0: `initial` into an empty visited set and checkpointed, each
     /// with the start's hull; the tree is filtered by `minus_one` and
     /// widened at `level` (both recorded, with the settings `s`).
-    pub(crate) fn start(initial: Vec<Block<N>>, dir: &std::path::Path, minus_one: Option<MinusOne>, level: crate::abstraction::Level, s: &crate::settings::Settings) -> Result<Self> {
+    pub(crate) fn start(initial: Vec<Rt2<N>>, dir: &std::path::Path, minus_one: Option<MinusOne>, level: crate::abstraction::Level, s: &crate::settings::Settings) -> Result<Self> {
         // A fresh tree keeps nothing a killed run left (stale edge files).
         for sub in ["frames", "edges", "hulls"] {
             let p = dir.join(sub);
@@ -594,7 +540,7 @@ impl<N: Rem> ForwardState<N> {
         // The start has no player yet (`rem::start_point`'s premise):
         // `seed` keys it as it is, so a player's remainder would be stored
         // exact where every other state holds it widened, beside its hull.
-        anyhow::ensure!(initial.iter().all(|b| b.rt2().player_objects().is_empty()), "frame 0: an initial row holds a player, whose remainder the start's hull does not describe");
+        anyhow::ensure!(initial.iter().all(|b| b.player_objects().is_empty()), "frame 0: an initial row holds a player, whose remainder the start's hull does not describe");
         let mut visited = crate::storage::visited::VisitedSet::<N>::new(crate::storage::GEOMETRY);
         let seeded = crate::storage::wave::seed(&mut visited, &initial, crate::search::rem::start_hull::<N>(), s)?;
         checkpoint(dir, 0, &seeded, &[], s, &mut Stats::default())?;
@@ -761,7 +707,7 @@ pub fn grow_tree<N: Rem>(
     marks: Option<&MarkFilter<N>>,
     level: crate::abstraction::Level,
     engine: impl FnOnce() -> Result<Box<dyn FrameStep<N>>>,
-    initial: impl FnOnce() -> Result<Vec<Block<N>>>,
+    initial: impl FnOnce() -> Result<Vec<Rt2<N>>>,
     s: &crate::settings::Settings,
 ) -> Result<ForwardResult> {
     if crate::storage::layer::frame_exists(dir, 0) {
@@ -812,7 +758,7 @@ pub fn grow_tree<N: Rem>(
 #[cfg(test)]
 pub(crate) fn forward_run<N: Rem>(
     engine: &dyn FrameStep<N>,
-    initial: Vec<Block<N>>,
+    initial: Vec<Rt2<N>>,
     dir: &std::path::Path,
     max_frames: u32,
 ) -> Result<ForwardResult> {
@@ -1167,8 +1113,8 @@ mod tests {
     use celeste_engine::runtime2::{Col, AV};
 
     /// The start room's initial block.
-    fn start_blocks(s: &Settings) -> Vec<Block> {
-        vec![Block::canonical(RefEngine::new(s).expect("ref engine").initial().expect("initial state")).expect("block")]
+    fn start_blocks(s: &Settings) -> Vec<Rt2> {
+        vec![RefEngine::new(s).expect("ref engine").initial().expect("initial state").canonicalized()]
     }
 
     /// The start's row a few frames after the player appears (standing, at
@@ -1178,7 +1124,7 @@ mod tests {
         let mut row = reference.initial().expect("initial state");
         let mut after = 0;
         while after < 3 {
-            row = reference.step_one(&row, 0).expect("frame").into_rt2();
+            row = reference.step_one(&row, 0).expect("frame");
             if !row.player_objects().is_empty() {
                 after += 1;
             }
@@ -1209,7 +1155,7 @@ mod tests {
         let block = start_blocks(&s).pop().expect("a block");
         let coarse = Level::parse("r0sxh").expect("level");
         // The coarse key space holds the projection's codes.
-        let mut w = block.rt2().clone_block();
+        let mut w = block.clone_block();
         widen_rt2_to(&mut w, coarse);
         w.canonical();
         let mut space = celeste_engine::exact::KeySpace::new();
@@ -1218,11 +1164,11 @@ mod tests {
         let mut marked = Visited::new(space.clone());
         marked.insert_until(shape, keys[0].expect("keyed"), cells[0], 5);
         let f = MarkFilter::new(&marked, coarse, crate::settings::Clock { per_frame: 1 });
-        assert_eq!(f.allowed(block.rt2(), 5).expect("filter"), vec![true], "at the deadline");
-        assert_eq!(f.allowed(block.rt2(), 6).expect("filter"), vec![false], "past it");
-        assert_eq!(MarkFilter::new(&Visited::new(Default::default()), coarse, crate::settings::Clock { per_frame: 1 }).allowed(block.rt2(), 0).expect("filter"), vec![false], "a key space without its codes");
+        assert_eq!(f.allowed(&block, 5).expect("filter"), vec![true], "at the deadline");
+        assert_eq!(f.allowed(&block, 6).expect("filter"), vec![false], "past it");
+        assert_eq!(MarkFilter::new(&Visited::new(Default::default()), coarse, crate::settings::Clock { per_frame: 1 }).allowed(&block, 0).expect("filter"), vec![false], "a key space without its codes");
         let empty = Visited::new(space);
-        assert_eq!(MarkFilter::new(&empty, coarse, crate::settings::Clock { per_frame: 1 }).allowed(block.rt2(), 0).expect("filter"), vec![false], "not marked");
+        assert_eq!(MarkFilter::new(&empty, coarse, crate::settings::Clock { per_frame: 1 }).allowed(&block, 0).expect("filter"), vec![false], "not marked");
     }
 
     /// A fresh forward keeps none of a killed run's files.
@@ -1371,7 +1317,7 @@ mod tests {
     /// berry: every row's berry is lost from frame 0 on.
     #[test]
     fn a_resume_expands_what_the_uninterrupted_forward_expands() {
-        let s = Settings { hundred: true, ..Default::default() };
+        let s = Settings { category: crate::settings::Category::Hundred, ..Default::default() };
         let dir = std::env::temp_dir().join(format!("celeste-resume-frontier-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let init = start_blocks(&s);
@@ -1379,7 +1325,7 @@ mod tests {
         let frontier = |st: &ForwardState| -> (Vec<(u32, (u64, u64), u64)>, Vec<Hull>, crate::storage::wave::ByLayer) { (st.frontier.new.iter().collect(), st.frontier.hulls.clone(), st.frontier.old.clone()) };
         let mut st = ForwardState::start(init, &dir, None, Level::EXACT, &s).expect("start");
         for b in crate::storage::layer::decode_states(&st.frontier.new, &st.visited.keys, st.visited.shapes(), usize::MAX, &|_| true).expect("decode") {
-            assert!(not_expanded(&Block::from_rt2(b.1), 0, None, &s).expect("not expanded").iter().all(|&x| x), "frame 0: the berry is lost");
+            assert!(not_expanded(&b.1, 0, None, &s).expect("not expanded").iter().all(|&x| x), "frame 0: the berry is lost");
         }
         for to in 0..=3 {
             st.extend(&e, &dir, to, None).expect("extend");
@@ -1406,7 +1352,7 @@ mod tests {
         let level = Level::parse("r0sxh").expect("level");
         let e = crate::compiled::FrameEngine::new(&s, level).expect("kernels");
         let start = RefEngine::new(&s).expect("engine").initial().expect("init");
-        let init = || vec![Block::canonical(start.clone_block()).expect("block")];
+        let init = || vec![start.clone_block().canonicalized()];
         let ends = 30;
         ForwardState::start(init(), &a, None, level, &s).expect("start").extend(&e, &a, ends, None).expect("extend");
         let mut st = ForwardState::start(init(), &b, None, level, &s).expect("start");
@@ -1592,9 +1538,9 @@ mod tests {
         let mut st = reference.initial().expect("initial state");
         for (i, &b) in inputs.iter().enumerate() {
             let next = reference.step_one(&st, b).expect("one concrete successor");
-            let won = wins_of(next.rt2(), &s).expect("wins")[0];
+            let won = wins_of(&next, &s).expect("wins")[0];
             assert_eq!(won, i + 1 == 55, "frame {}: won {won}", i + 1);
-            st = next.into_rt2();
+            st = next;
         }
     }
 

@@ -10,14 +10,14 @@ loading jank and its own seeds; plans/float.md).
     tools/celia/golden.py local all                our LOCAL witnesses (tools/uct/golden.py)
 
 Per file: played in Celia with the exact trace (exact.lua via validate.sh:
-CELIA_EXACT), its buffered jumps re-timed from Celia's own run and checked
+--exact), its buffered jumps re-timed from Celia's own run and checked
 as tools/uct/golden.py does (its `canonical`; Celia's start is not UCT's,
 so neither is the run). The trace, the draw-only objects dropped, goes to
 gates/celia/CAT_LEVEL.trace.zst and a line to gates/celia/manifest.txt:
 
     CAT LEVEL room=X,Y seeds=S1,S2|- gemskip=0|1 jank=J|- updates=N celia=STATUS retimed=K
 
-J is the loading jank of Celia's IL load (`rewrite starts`' `celia`; `-`:
+J is the loading jank of Celia's IL load (`rewrite room`'s `celia`; `-`:
 the first room, which has none). The test (`trace::oracle::tests`) replays
 every line through the float reference engine under `--arith float
 --loading-jank J`. A file UCT or Celia errors on is skipped.
@@ -42,17 +42,17 @@ REWRITE = os.path.join(ROOT, "target", "quick", "rewrite")
 
 
 def celia(level, path, cat, trace):
-    env = dict(os.environ, CELIA_EXACT=trace)
-    if categories.one_dash(cat):
-        env["CELIA_DASHES"] = "1"
-    out = subprocess.run([f"{ROOT}/safe-run.sh", "--memory", "4G", "--", f"{HERE}/validate.sh", str(level), path], capture_output=True, text=True, env=env, cwd=ROOT)
+    dashes = ["--dashes", "1"] if categories.one_dash(cat) else []
+    out = subprocess.run([f"{ROOT}/safe-run.sh", "--memory", "4G", "--", f"{HERE}/validate.sh", "--exact", trace] + dashes + [str(level), path], capture_output=True, text=True, cwd=ROOT)
     line = [l for l in out.stdout.splitlines() if l.startswith(f"level {level} ")]
     return line[-1].split(": ", 1)[1].split(",")[0] if line else f"no result ({out.returncode})"
 
 
 def jank(room, cat):
     """The J of Celia's IL load into `room` (None: the first room)."""
-    args = [REWRITE, "starts", "--room", f"{room[0]},{room[1]}"] + (["--gemskip"] if categories.one_dash(cat) else [])
+    # The start depends on the dash count alone (the manifest's categories
+    # include our own: random0, witness-...).
+    args = [REWRITE, "room", "--room", f"{room[0]},{room[1]}", "--category", "gemskipany" if categories.one_dash(cat) else "any"]
     out = subprocess.run([f"{ROOT}/safe-run.sh", "--memory", "4G", "--"] + args, capture_output=True, text=True, check=True, cwd=ROOT)
     return json.loads(out.stdout.strip().splitlines()[-1])["celia"]
 

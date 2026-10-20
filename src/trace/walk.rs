@@ -457,7 +457,7 @@ mod tests {
     #[ignore = "slow, ./check.sh t2 runs it: room (0,3)'s lattice walk, ~40 CPU-s"]
     fn a_respawn_after_the_loading_jank_is_inside_its_shapes_bounds() {
         use super::super::{iface, shapes, widen};
-        let s = crate::settings::Settings { room: (0, 3), hundred: true, gemskip: true, loading_jank: Some(1), ..Default::default() };
+        let s = crate::settings::Settings { room: (0, 3), category: crate::settings::Category::Gemskip100, loading_jank: Some(1), ..Default::default() };
         let opts = crate::abstraction::Level::parse("r0sxh").expect("level");
         let only: Vec<super::Region> = (0..8).flat_map(|ix| (5..8).map(move |iy| super::Region { ix, iy })).collect();
         let lw: super::LatticeWalk = super::room_constant_lattice(opts, &super::Walk { settings: &s, only: Some(&only) }).unwrap_or_else(|e| panic!("{e:#}"));

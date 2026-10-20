@@ -307,7 +307,7 @@ struct Table<'a, A: GraphArith> {
     lw: &'a LatticeWalk<A>,
     room: Room,
     room0: (i16, i16),
-    /// `--hundred`: a successor that leaves the berry behind is no exit.
+    /// 100% (`Category::hundred`): a successor that leaves the berry behind is no exit.
     hundred: bool,
     spd_px: i16,
     shapes: Vec<Shape<A>>,
@@ -1633,7 +1633,7 @@ fn build<A: GraphArith>(spd_px: i32, threads: usize, rep: &mut String, s: &crate
         lw: &lw,
         room: Room { cache: lw.cache.clone() },
         room0,
-        hundred: s.hundred,
+        hundred: s.category.hundred(),
         spd_px,
         shapes: Vec::new(),
         by_key: HashMap::new(),
@@ -1949,8 +1949,8 @@ pub fn check_route<N: crate::search::rem::Rem>(inputs: &[u8], horizon: u32, spd:
     for (f, layer) in run.layers.iter().enumerate() {
         let mut line = Vec::new();
         for ((_, b), &on) in layer.iter().zip(&on[f]) {
-            let shape = b.rt2().shape_hash_of();
-            for cell in block_cells(b.rt2())? {
+            let shape = b.shape_hash_of();
+            for cell in block_cells(b)? {
                 let at = cell_xy(cell);
                 match table.d_of(shape, cell) {
                     None => {

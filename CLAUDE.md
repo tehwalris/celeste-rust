@@ -125,8 +125,9 @@ is reading material only.
 
 Use `./safe-run.sh` for EVERYTHING that builds or runs - cargo, nextest,
 the binaries, benches, the search - including commands issued by
-subagents and by scripts (the `scripts_wrapped` test fails on a script
-line that is not wrapped). It runs the command in a systemd scope with a
+subagents and by scripts (the `rewrite` binary and one-cargo.sh refuse to
+run without a memory cap: `settings::refuse_uncapped`). It runs the
+command in a systemd scope with a
 memory cap (default 60G, `--memory 85G` to raise it for one run), so a
 blowup kills the process, not the machine (2026-08-24: 120 GB outside the
 wrapper took the whole session down).
@@ -139,8 +140,8 @@ wrapper took the whole session down).
   build directory: a second build waits and says so).
 - Background anything over ~30 s and wait with a Monitor until-loop; do
   not poll.
-- Checkpoints go on DISK (`/var/tmp/celeste-checkpoints`, the default
-  `--checkpoint-dir`), never under /tmp. A big room's trees are tens of
+- Trees go on DISK (`/var/tmp/celeste-checkpoints`, the default
+  `--search-dir` and `--tree`), never under /tmp. A big room's trees are tens of
   GB: check `df` first.
 - Reading memory: the `[fwd]` line's `rss` is the ANONYMOUS resident set;
   `file` is mapped files (reclaimable); `peak` is `VmHWM`, both together.
@@ -150,7 +151,7 @@ wrapper took the whole session down).
 
 ## Checking a change
 
-`./check.sh TIER`. What each tier runs and pins, the fixtures, the
+`./check.sh TIER...` (e.g. `./check.sh t0 t1 t2 big`). What each tier runs and pins, the fixtures, the
 instruction budget and re-pinning: plans/devloop.md. The contract is the
 black-box pins (the fixture frames, the room (1,0) gates, the objects
 ladder, float and dual, the reference-engine checks, the instruction
@@ -158,7 +159,7 @@ budget): a change keeps them byte-identical, or re-pins them on evidence.
 
 | tier | when | wall |
 |---|---|---|
-| inner loop | while editing: `./one-cargo.sh cargo check --all-targets`, `./one-cargo.sh cargo nextest run <filter>` | 1 s, ~7 s |
+| inner loop | while editing: `./safe-run.sh -- ./one-cargo.sh cargo check --all-targets`, `... cargo nextest run <filter>` | 1 s, ~7 s |
 | `t0` | before every commit: the unit tests | ~3 s (+ the test build) |
 | `t1` | after any change to the forward, kernels, tracer or storage: single frames, fixed and float | ~35 s |
 | `t2` | before handing a change over: end to end, and the slow tests | ~55 s |
@@ -193,11 +194,11 @@ runner sets it and searches the other feasible J's too).
 
 ```bash
 tools/uct/check_uploads.py [--cat CAT] FILE.tas...   # IL, UCT, Celia, chain, BOOT chain -> VALID/INVALID
-tools/celia/validate.sh LEVEL FILE.tas               # Celia headless (CELIA_DASHES=1 gemskip, CELIA_FIXP=1 fixed point)
+tools/celia/validate.sh [--dashes 1] [--fixp] LEVEL FILE.tas   # Celia headless (gemskip: one dash; 16.16)
 pico8_diff/chain.py CAT LEVEL FILE --boot            # real PICO-8 from 100m with the database's files
 pico8_diff/chain.py CAT LEVEL FILE --modes           # IL / jank / chain entry states diffed field by field
 pico8_diff/chain.py CAT LEVEL x --check-start target/quick/rewrite   # the search's start vs the boot chain
-target/quick/rewrite starts --room X,Y [category] --balloon-seeds 0   # every J and its start class
+target/quick/rewrite room --room X,Y [--category C] --balloon-seeds 0   # every J and its start class
 ```
 
 The boot chain is the verdict; a passing UCT run is not. Our result is the
@@ -228,32 +229,32 @@ check --help`: the checks of a tree; `rewrite bench --help`; `rewrite l1
 --help`: the level -1 table, its probe and check). The settings flags
 (`--room`, the category, `--level-minus-one`, `--threads`, ...) are shared
 by every command; a command that
-reads a finished tree (`--tree DIR`, or a search's `--checkpoint-dir`)
-takes them from the tree's records instead and refuses them. The most
-common:
+reads a finished tree (`--tree DIR`, or a search's `--search-dir`)
+takes them from the tree's records instead and refuses them. UNITS are in
+the flag names: `--frames` counts game frames (the search's horizon,
+`--level-minus-one`'s H), `--steps`/`--step` a tree's search steps (two a
+frame under `--split-frame`: `settings::Clock`). The most common:
 
 ```bash
-# THE SEARCH: --ceiling H for a known solution (a refutation or no witness
-# is an error), --to H otherwise. Witness: DIR/witness_frame_F.txt; outcome:
-# DIR/result.json. UNITS: the search's --to/--ceiling count frames; a tree,
-# `forward --to` and --level-minus-one's H count search steps (2 a frame
-# under --split-frame: H = 2C; `settings::Clock`).
-./safe-run.sh -- ./target/release/rewrite search --room 1,0 --ceiling 99 --checkpoint-dir DIR
+# THE SEARCH to --frames H; --ceiling: H is a known solution's (a
+# refutation or no witness is an error). Witness: DIR/witness_frame_F.txt;
+# outcome: DIR/result.json.
+./safe-run.sh -- ./target/release/rewrite search --room 1,0 --frames 99 --ceiling --search-dir DIR
 # An object room with the objects ladder, level -1 and the known route checked.
 ./safe-run.sh -- ./target/release/rewrite search --room 7,0 --level r0sxhn,r0sxh \
-    --level-minus-one 84,5 --ceiling 84 --checkpoint-dir DIR --prefer tas/FILE.txt
+    --level-minus-one 84,5 --frames 84 --ceiling --search-dir DIR --prefer tas/FILE.txt
 # In the float tools' doubles (Celia's start and seeds by default).
 ./safe-run.sh -- ./target/release/rewrite search --arith float --room 7,0 ...
 # THE DUAL SEARCH: the shortest file valid in both arithmetics (plans/float.md).
-./safe-run.sh --memory 40G -- ./target/release/rewrite dual --room 0,3 --gemskip --hundred \
-    --loading-jank 1 --level r0sxhn,r0sxh --level-minus-one 150,5 --to 150 --checkpoint-dir DIR
+./safe-run.sh --memory 40G -- ./target/release/rewrite dual --room 0,3 --category gemskip100 \
+    --loading-jank 1 --level r0sxhn,r0sxh --level-minus-one 150,5 --frames 150 --search-dir DIR
 # A known solution against every pruning step of a finished search (its
 # settings, levels and horizon from its records).
-./safe-run.sh -- ./target/quick/rewrite check known --checkpoint-dir DIR --inputs tas/FILE.txt
+./safe-run.sh -- ./target/quick/rewrite check known --search-dir DIR --inputs tas/FILE.txt
 # One forward at one level; then its fingerprint (a command that reads a
 # tree takes its settings from the tree's records: no --room, --level, ...).
-./safe-run.sh -- ./target/release/rewrite forward --to 44 --room 1,0 --checkpoint-dir DIR
-./safe-run.sh -- ./target/quick/rewrite ckhash --tree DIR --to 44
+./safe-run.sh -- ./target/release/rewrite forward --steps 44 --room 1,0 --tree DIR
+./safe-run.sh -- ./target/quick/rewrite ckhash --tree DIR --steps 44
 # A float witness against a nudged libm `sin`.
 ./safe-run.sh -- ./target/quick/rewrite robust --arith float --room X,Y [category] --inputs FILE
 # On a real PICO-8, headless (--lua .../celeste_ocaml/celeste.lua --begin-game: the original cart).

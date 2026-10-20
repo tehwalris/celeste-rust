@@ -83,8 +83,8 @@ frame of slack in (7,0), where the objects ladder takes over.
 
 ## No Diagonal Dashes (2026-10-04 .. 10-08; every improvement submitted)
 
-`--nodiag`: the cart's diagonal dash arm raises, so a diagonal dash start
-is no move, exactly, in the kernels and the reference alike. References:
+`--category nodiag`: the cart's diagonal dash arm raises, so a diagonal
+dash start is no move, exactly, in the kernels and the reference alike. References:
 the community nodiag TAS at the room's any% offset. Levels `r0sxhn,r0sxh`
 with level -1 at the reference unless said; "bounds" are the arc bounds per
 level; witnesses `tas/room_X_Y_nodiag_frame_N.txt`, uploads
@@ -123,8 +123,8 @@ chain (re-searched from the real-play starts J 3 and J 4: 113 both).
 
 ## 100% (2026-10-08 .. 10-09)
 
-`--hundred`: the exit counts only with the room's berry taken (an unknown
-`got_fruit` at a coarse level counts as taken; the concrete search
+`--category 100`: the exit counts only with the room's berry taken (an
+unknown `got_fruit` at a coarse level counts as taken; the concrete search
 decides). Two exact cuts made rooms fit: a row whose berry is lost is not
 expanded (`frame::berry_lost`), and level -1 drops exits that leave the
 berry behind. Runs `--ceiling REF`, level -1 at (REF, 5),
@@ -160,10 +160,10 @@ ahead). Withdrawn (`tas/invalid`); 67f is the real-play optimum.
 
 ## Gemskip (2026-10-08 .. 10-16)
 
-`--gemskip`: the orb room (5,2) is won by its bare exit and every later
-room starts with ONE dash (the replay's `--one-dash`, UCT's `UCT_DASHES=1`).
-gemskip nodiag adds `--nodiag`, gemskip 100% `--hundred`. Levels
-`r0sxhn,r0sxh` unless said; "OPTIMAL" = the last level's arc bound equals
+`--category gemskipany`: the orb room (5,2) is won by its bare exit and
+every later room starts with ONE dash (the replay's `--one-dash`, the
+tools' `validate.sh --dashes 1`). `gemskipnodiag` adds nodiag's rule,
+`gemskip100` 100%'s. Levels `r0sxhn,r0sxh` unless said; "OPTIMAL" = the last level's arc bound equals
 the witness's frame. Witnesses `tas/room_X_Y_gemskip*_frame_N.txt`,
 uploads `tas/tasdatabase/gemskip*/upload/`.
 
@@ -210,7 +210,7 @@ room alone and misses it; Celia models it.
   lowers J. Only J moves objects across the categories' boot chains; no
   held button carries over; `freeze` at entry may be 2 (it freezes every
   object alike).
-- The search takes the start as a set of J classes (`rewrite starts`); the
+- The search takes the start as a set of J classes (`rewrite room`); the
   runner runs the boot chain's J (its witness carries the upload) and one
   search per other class.
 - **Celia's J is not always the boot chain's**: it counts the previous
@@ -243,21 +243,20 @@ room alone and misses it; Celia models it.
 
 ```bash
 ./safe-run.sh -- ./target/release/rewrite search --room X,Y --level r0sxhn,r0sxh \
-    --level-minus-one C,5 --ceiling C --checkpoint-dir DIR --prefer tas/FILE.txt \
-    [--hundred | --nodiag | --gemskip] [--loading-jank J] [--concrete-balloon-seeds S]
+    --level-minus-one C,5 --frames C --ceiling --search-dir DIR --prefer tas/FILE.txt \
+    [--category CAT] [--loading-jank J] [--concrete-balloon-seeds S]
 ```
 
 - The level: `r0sx` without objects; `r0sxhn` with springs, fall floors,
   balloons, key and chest; `f` for a fly fruit, `p` for platforms
   (`r0sxhnp`; level -1 refuses `p`). `--split-frame` where the kernels are
-  too big ((6,0), (6,1)): `--ceiling` stays in frames, level -1's H is in
-  steps (2 x C).
+  too big ((6,0), (6,1)): `--frames` and level -1's H stay in frames.
 - **The ladder** where the level-0 bound is well below the reference; down
   to `r0sxh` (and `r0sx`) the arc bound is the answer, so a lower horizon
   is refuted by the arcs and a higher one finds the witness at the bound.
   Count up from the bound on the kept level-0 tree.
-- `--ceiling C` is a known solution: a refutation or no witness is an
-  error. Without one, `--to H` with H generous.
+- `--frames C --ceiling`: C is a known solution's, so a refutation or no
+  witness is an error. Without one, `--frames H` with H generous.
 - `tools/category_runner.py` runs a category end to end: the real-play
   start classes, the search with `--prefer` the community file, the
   original-cart replay, UCT and Celia, one upload file.

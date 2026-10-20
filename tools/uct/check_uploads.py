@@ -52,7 +52,7 @@ def check(path, nudge, cat, binary=REWRITE):
     cat = cat_of(path, cat)
     level = tasdb.level_of_file(path)
     room = rooms.room_of(level)
-    hundred = categories.hundred(cat)
+    hundred = rooms.rules(cat, binary)["hundred"]
     seeds, inputs = tasdb.parse(open(path).read())
     ours = len(inputs) - 1
     db = [e for e in tasdb.entries(cat) if e.get("file") == tasdb.file_of_level(level)]

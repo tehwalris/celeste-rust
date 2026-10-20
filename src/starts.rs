@@ -1,4 +1,4 @@
-//! The start states real play can enter a room with (`rewrite starts`):
+//! The start states real play can enter a room with (`rewrite room`):
 //! the room's LOADING FRAME runs its objects' updates from the leaving
 //! player's index J (`--loading-jank J`, `trace::cart`), and J depends on
 //! how the previous room was played. Every J a play of the previous room can
@@ -67,7 +67,7 @@ pub fn celia_jank(room: (i16, i16)) -> Result<Option<usize>> {
 /// The starts of `s.room` under settings `s` (the category, the balloon
 /// seeds; `--loading-jank` is what this enumerates, so refused).
 pub fn starts(s: &crate::settings::Settings) -> Result<Starts> {
-    anyhow::ensure!(s.loading_jank.is_none(), "rewrite starts enumerates the loading jank: no --loading-jank");
+    anyhow::ensure!(s.loading_jank.is_none(), "rewrite room enumerates the room's starts: no --loading-jank");
     let level = crate::game_runner::level_index(s.room.0, s.room.1) + 1;
     let Some(prev) = previous(s.room) else {
         return Ok(Starts { room: s.room, level, previous: None, previous_objects: Vec::new(), spawn_frame: None, feasible: Vec::new(), classes: Vec::new(), celia: None });
@@ -79,7 +79,7 @@ pub fn starts(s: &crate::settings::Settings) -> Result<Starts> {
     // plus the room title if it is still up and the spawn's smoke if it can
     // be: only when the exit can come that soon, bounded by the spawn's own
     // frames and the climb at the region's speed bound.
-    let speed = s.region_grid().context("rewrite starts: the climb is bounded by the region's speed (--region px,S)")?.speed as u32;
+    let speed = s.region_grid().context("rewrite room: the starts' climb is bounded by the region's speed (--region px,S)")?.speed as u32;
     let k = objs.len();
     let d = objs.iter().filter(|o| DESTROYABLE.contains(&o.tile)).count();
     let spawn_y = objs.iter().find(|o| o.kind == "player_spawn").with_context(|| format!("room {prev:?} has no spawn"))?.ty as u32 * 8;
@@ -96,9 +96,9 @@ pub fn starts(s: &crate::settings::Settings) -> Result<Starts> {
     let mut classes: Vec<(celeste_engine::exact::ExactRow, u32, Vec<usize>)> = Vec::new();
     for &j in &feasible {
         let sj = crate::settings::Settings { loading_jank: Some(j), ..s.clone() };
-        let b = crate::frame::Block::canonical(RefEngine::new(&sj)?.initial()?)?;
-        let row = celeste_engine::exact::exact_rows(b.rt2()).swap_remove(0);
-        let cell = b.positions()?[0];
+        let b = RefEngine::new(&sj)?.initial()?.canonicalized();
+        let row = celeste_engine::exact::exact_rows(&b).swap_remove(0);
+        let cell = crate::search::pos_graph::block_cells(&b)?[0];
         match classes.iter_mut().find(|(r, c, _)| *r == row && *c == cell) {
             Some((_, _, js)) => js.push(j),
             None => classes.push((row, cell, vec![j])),
@@ -125,7 +125,7 @@ fn spawn_frame(s: &crate::settings::Settings, room: (i16, i16)) -> Result<u32> {
     for f in 1..=120 {
         let mut next = eng.frame(&state, 0)?;
         anyhow::ensure!(next.len() == 1, "room {room:?} frame {f}: {} leaves without input (seed its balloons: --balloon-seeds)", next.len());
-        state = next.remove(0).into_rt2();
+        state = next.remove(0);
         if !crate::concrete::objects_of_type(&state, "player").is_empty() {
             return Ok(f);
         }

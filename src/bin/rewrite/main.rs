@@ -7,9 +7,9 @@
 
 use anyhow::Result;
 use celeste_core::lua_f64::LuaF64;
-use celeste_engine::runtime2::P8;
+use celeste_engine::runtime2::{Rt2, P8};
 use celeste_rust::abstraction::Level;
-use celeste_rust::frame::{Block, FrameStep};
+use celeste_rust::frame::FrameStep;
 use celeste_rust::search::inspect::parse_xy;
 use celeste_rust::search::tree::TreeDir;
 use celeste_rust::settings::{Arith, Settings};
@@ -39,7 +39,7 @@ const LONG_ABOUT: &str = "The abstract TAS search for PICO-8 Celeste, and its di
 (abstract states, every edge with its remainder transfer), the backward over
 the rotation graph (an exact-in-the-remainder lower bound), then the
 exhaustive concrete search inside its winning sets. Its first concrete win is
-the optimum; the witness goes to <checkpoint-dir>/witness_frame_F.txt.
+the optimum; the witness goes to <search-dir>/witness_frame_F.txt.
 
 THE SETTINGS are the flags below (Options), given anywhere on the line. A
 tree records the ones that change it (<level dir>/settings.txt) and refuses a
@@ -50,28 +50,29 @@ from the tree's record instead, and refuses them on its command line.
 environment variables are refused. Run everything under ./safe-run.sh (a
 memory cap).
 
-UNITS: a game frame is one search step, or two under --split-frame. The
-search's horizon (search/dual --to, --ceiling) and its results count FRAMES;
-a tree counts STEPS - forward --to, --level-minus-one's H, and the tree
-commands' --to and --frame (`settings::Clock`).
+UNITS are in the flag names: --frames counts game frames (the search's
+horizon, its results, --level-minus-one's H), --steps and --step a tree's
+search steps (two a frame under --split-frame: `settings::Clock`). A tree
+is --tree DIR, a search's directory (its levels' trees under it)
+--search-dir DIR.
 
-Checking a change: ./check.sh t0|t1|t2|big (plans/devloop.md).";
+Checking a change: ./check.sh t0 t1 t2 big (plans/devloop.md).";
 
 const EXAMPLES: &str = "Examples:
   # A room's optimum, a known solution's length as the horizon:
-  ./safe-run.sh -- target/release/rewrite search --room 1,0 --ceiling 99 --checkpoint-dir DIR
+  ./safe-run.sh -- target/release/rewrite search --room 1,0 --frames 99 --ceiling --search-dir DIR
   # A room with objects, level -1 filtered at the horizon, a category, the real-play entry
   # (plans/results.md \"How to run a room\"); --prefer FILE checks a known route too:
-  ./safe-run.sh -- target/release/rewrite search --room X,Y --level r0sxhn --ceiling C \\
-      --level-minus-one C,5 [--hundred | --nodiag | --gemskip] [--loading-jank J] --checkpoint-dir DIR
+  ./safe-run.sh -- target/release/rewrite search --room X,Y --level r0sxhn --frames C --ceiling \\
+      --level-minus-one C,5 [--category CAT] [--loading-jank J] --search-dir DIR
   # The objects ladder where r0sxhn's bound is loose (room (7,0): 80 against 84):
   ./safe-run.sh -- target/release/rewrite search --room 7,0 --level r0sxhn,r0sxh \\
-      --level-minus-one 84,5 --ceiling 84 --checkpoint-dir DIR
+      --level-minus-one 84,5 --frames 84 --ceiling --search-dir DIR
   # One forward and its fingerprint (the room (1,0) gate):
-  ./safe-run.sh -- target/quick/rewrite forward --room 1,0 --to 44 --checkpoint-dir D
-  target/quick/rewrite ckhash --tree D --to 44 --edges
+  ./safe-run.sh -- target/quick/rewrite forward --room 1,0 --steps 44 --tree D
+  target/quick/rewrite ckhash --tree D --steps 44 --edges
   # A known route against a finished search's pruning:
-  ./safe-run.sh -- target/quick/rewrite check known --checkpoint-dir DIR --inputs tas/FILE.txt
+  ./safe-run.sh -- target/quick/rewrite check known --search-dir DIR --inputs tas/FILE.txt
   # Help on one command:
   target/quick/rewrite search --help";
 
@@ -95,20 +96,20 @@ enum Command {
     /// from the wins, whose optimum is a LOWER BOUND on the game's (no win
     /// refutes the horizon). At the LAST level, the concrete search inside
     /// the winning sets: its first win is the optimum, its inputs written to
-    /// `<checkpoint-dir>/witness_frame_F.txt`. The verdict goes to
-    /// `<checkpoint-dir>/result.json` before the exit code says it.
+    /// `<search-dir>/witness_frame_F.txt`. The verdict goes to
+    /// `<search-dir>/result.json` before the exit code says it.
     Search(SearchArgs),
     /// THE DUAL SEARCH (`search::dual`): the shortest file valid in BOTH arithmetics.
     ///
     /// Rule (b): the float tool's exit is the count, and real play (16.16,
     /// from `--loading-jank`) must have left by then. Each half runs its
-    /// levels to the same horizon, under `<checkpoint-dir>/fixed` and
+    /// levels to the same horizon, under `<search-dir>/fixed` and
     /// `/float`; then the concrete search over pairs of states, each half
     /// inside its own winning sets, from the larger arc bound. The global
     /// settings are the fixed half's (no `--arith float`); `--float-half`
     /// picks the float tool, which starts from its own IL load (Celia's jank
     /// unless `--float-loading-jank`). The witness, replayed in both
-    /// arithmetics, goes to `<checkpoint-dir>/witness_frame_F.txt`, the
+    /// arithmetics, goes to `<search-dir>/witness_frame_F.txt`, the
     /// outcome to `result.json`.
     Dual(DualArgs),
     /// ONE forward at ONE level, as the search runs it, with the per-frame
@@ -130,17 +131,17 @@ enum Command {
     /// THE BENCHMARKS of a finished tree: one forward or backward frame.
     #[command(subcommand)]
     Bench(bench::Command),
-    /// DIAGNOSTIC: a tree's states at `--frame`, COUNTED per shape.
+    /// DIAGNOSTIC: a tree's states at `--step`, COUNTED per shape.
     ///
     /// Per shape: its rows, every varying column's distinct values (capped
     /// at `--cap`) with the rows holding an interval or an unknown bool,
     /// and its distinct (spd.x, spd.y) pairs; with `--cell x,y` that player
     /// position's rows only, and the values of a column with few. With
-    /// `--erase` or `--cell`, whether they SATURATE: every `--every` frames
+    /// `--erase` or `--cell`, whether they SATURATE: every `--every` steps
     /// from 0, the new states, and the distinct ones (new, and so far) with
     /// the cells under an `--erase` prefix left out. With `--cells K`, the K
-    /// positions with the most states through `--frame` (their new states
-    /// in its last 12 frames), and every position's new states at `--frame`
+    /// positions with the most states through `--step` (their new states
+    /// in its last 12 steps), and every position's new states at `--step`
     /// as a share of its states.
     Census(diag::CensusArgs),
     /// A concrete input sequence that follows a TRAJECTORY of player positions.
@@ -171,18 +172,26 @@ enum Command {
     ExportUi(ExportUiArgs),
     /// The room (`--room`) as the tools need it, as JSON on stdout.
     ///
-    /// Its level and its objects in creation order (the original cart's:
+    /// Its level; its objects in creation order (the original cart's:
     /// tile, tile position, type, whether the minimal cart has it, whether a
-    /// TAS file's `[seeds]` list runs over it).
+    /// TAS file's `[seeds]` list runs over it); what `--category` means:
+    /// whether a win needs the berry (`hundred`), which dash starts are
+    /// forbidden (`nodiag`, `onlydiag`), one dash past the orb (`gemskip`);
+    /// and the START STATES real play can enter it with (`starts`): every
+    /// loading-frame J a play of the previous room can give (`feasible`),
+    /// the J's grouped by the exact start state they make (`classes`: one
+    /// search per class) and the J of Celia's IL load (`celia`). Give the
+    /// search's settings (the category; `--balloon-seeds` for a room with
+    /// balloons), not `--loading-jank` (what it enumerates).
     Room,
-    /// The start states real play can enter the room with, as JSON on stdout.
-    ///
-    /// Every loading-frame J a play of the previous room can give, the J's
-    /// grouped by the exact start state they make (one search per class),
-    /// and the J of Celia's IL load (`starts`). Give the search's settings
-    /// (the category; `--balloon-seeds` for a room with balloons), not
-    /// `--loading-jank`.
-    Starts,
+    /// A WITNESS as the tools need it (`concrete::witness`), as JSON on
+    /// stdout: `--inputs` replayed on the reference engine (the minimal
+    /// cart) from the room's start, its balloons and chests seeded by
+    /// `--balloon-seeds` as the TAS tools seed them: the frame it leaves
+    /// the room (`exit`), the inputs with the jump bit kept only where a
+    /// jump fires (`canonical`), and in a 100% category the chest seed
+    /// lists to try (`chest_seed_variants`).
+    Witness(run::WitnessArgs),
 }
 
 impl Command {
@@ -194,22 +203,22 @@ impl Command {
 
 #[derive(clap::Args)]
 pub struct SearchArgs {
-    /// The horizon in FRAMES (also under --split-frame): every frame up to
-    /// it is searched.
+    /// The horizon in game frames (two steps each under --split-frame):
+    /// every frame up to it is searched.
     #[arg(long)]
-    to: Option<u32>,
-    /// A KNOWN solution's frame (a replayed TAS) as the horizon, in FRAMES:
-    /// a refutation, or no concrete witness by it, is an error.
+    frames: u32,
+    /// The horizon is a KNOWN solution's frame (a replayed TAS): a
+    /// refutation, or no concrete witness by it, is an error.
     #[arg(long)]
-    ceiling: Option<u32>,
+    ceiling: bool,
     /// The levels (`Level::parse`), comma-separated, coarsest first:
     /// `r0sx` for a room without objects, `r0sxhn` with objects,
     /// `r0sxhn,r0sxh` for an exact-objects level filtered by the abstract one.
     #[arg(long, default_value = "r0sx")]
     level: String,
-    /// The checkpoint dir: level i's tree goes to `level{i:02}/` under it.
+    /// The search's directory: level i's tree goes to `level{i:02}/` under it.
     #[arg(long, default_value = DEFAULT_CHECKPOINT_DIR)]
-    checkpoint_dir: String,
+    search_dir: String,
     /// Stop at the arc bound (no concrete search).
     #[arg(long)]
     no_witness: bool,
@@ -232,16 +241,17 @@ pub struct SearchArgs {
 
 #[derive(clap::Args)]
 pub struct DualArgs {
-    /// The horizon in FRAMES (as `search --to`).
+    /// The horizon in game frames (as `search --frames`).
     #[arg(long)]
-    to: Option<u32>,
-    /// A KNOWN dual run's frame (FRAMES): a refutation, or no dual witness by it, is an error.
+    frames: u32,
+    /// The horizon is a KNOWN dual run's frame: a refutation, or no dual
+    /// witness by it, is an error.
     #[arg(long)]
-    ceiling: Option<u32>,
+    ceiling: bool,
     #[arg(long, default_value = "r0sx")]
     level: String,
     #[arg(long, default_value = DEFAULT_CHECKPOINT_DIR)]
-    checkpoint_dir: String,
+    search_dir: String,
     /// Stop at the dual bound (no concrete search).
     #[arg(long)]
     no_witness: bool,
@@ -262,16 +272,16 @@ pub struct DualArgs {
 
 #[derive(clap::Args)]
 pub struct ForwardArgs {
-    /// The last tree frame to compute, in SEARCH STEPS (2 a game frame
-    /// under --split-frame; `settings::Clock`).
+    /// The tree's last step to compute (two a game frame under
+    /// --split-frame; `settings::Clock`).
     #[arg(long)]
-    to: u32,
+    steps: u32,
     /// The level (`Level::parse`, e.g. `r0sxhn`).
     #[arg(long, value_parser = Level::parse, default_value = "r0sx")]
     level: Level,
-    /// Checkpoint dir (frames land under it).
+    /// The tree (its files land under it).
     #[arg(long, default_value = DEFAULT_CHECKPOINT_DIR)]
-    checkpoint_dir: String,
+    tree: String,
     /// Run the REFERENCE engine instead of the kernels: `ckhash` of the
     /// two trees must agree. Slow. Not at platforms-unknown (`p`) levels.
     #[arg(long)]
@@ -280,9 +290,9 @@ pub struct ForwardArgs {
 
 #[derive(clap::Args)]
 pub struct ExportUiArgs {
-    /// A `rewrite search` checkpoint dir (`result.json`, `level00/`, ...).
+    /// A `rewrite search`'s directory (`result.json`, `level00/`, ...).
     #[arg(long, default_value = DEFAULT_CHECKPOINT_DIR)]
-    checkpoint_dir: String,
+    search_dir: String,
     /// Output directory (the UI serves it as `data/`).
     #[arg(long, default_value = "/var/tmp/celeste-ui/data")]
     out: String,
@@ -309,10 +319,10 @@ pub struct ExportUiArgs {
 /// (its states, first reached there) and optionally one player position.
 #[derive(clap::Args)]
 pub(crate) struct Rows {
-    /// The frame (search step) whose states, first reached there, are read
-    /// (default: the tree's last).
+    /// The tree step whose states, first reached there, are read (default:
+    /// the tree's last).
     #[arg(long)]
-    frame: Option<u32>,
+    step: Option<u32>,
     /// Only the states at player position "x,y".
     #[arg(long, value_parser = parse_xy)]
     cell: Option<(i32, i32)>,
@@ -321,7 +331,7 @@ pub(crate) struct Rows {
 impl Rows {
     /// The frame, and the player cell (`None`: every cell).
     pub(crate) fn of(&self, t: &TreeDir) -> Result<(u32, Option<u32>)> {
-        Ok((t.frame(self.frame)?, self.cell.map(cell_at).transpose()?))
+        Ok((t.frame(self.step)?, self.cell.map(cell_at).transpose()?))
     }
 
     /// The tree to the frame, the frame, and its states (of the cell) in the
@@ -359,13 +369,6 @@ pub(crate) trait KernelsNew: Sized {
 impl<N: celeste_rust::compiled::KernelLanes> KernelsNew for celeste_rust::compiled::Kernels<N> {
     fn new(cfg: &celeste_rust::settings::Settings, level: Level) -> Result<Self> {
         celeste_rust::compiled::Kernels::<N>::new(cfg, level)
-    }
-}
-/// A search's horizon in frames (`--to H` or `--ceiling H`).
-fn horizon_of(to: Option<u32>, ceiling: Option<u32>) -> Result<u32> {
-    match (ceiling, to) {
-        (Some(h), None) | (None, Some(h)) => Ok(h),
-        _ => anyhow::bail!("give the horizon: --to H, or --ceiling H for a known solution"),
     }
 }
 /// `search` and `dual` (`float`: the float half's settings): `search::run`,
@@ -413,7 +416,7 @@ fn report(res: &celeste_rust::search::result::SearchResult, dir: &std::path::Pat
     Ok(())
 }
 /// `rewrite forward` in arithmetic `N`: the tree at `dir` grown (or
-/// resumed) to frame `to` by `engine` from `initial`; its first win, wall
+/// resumed) to step `to` by `engine` from `initial`; its first win, wall
 /// time and position graph printed.
 fn forward<N: celeste_rust::search::rem::Rem>(
     dir: &std::path::Path,
@@ -421,7 +424,7 @@ fn forward<N: celeste_rust::search::rem::Rem>(
     level: Level,
     cfg: &celeste_rust::settings::Settings,
     engine: Box<dyn FrameStep<N>>,
-    initial: impl FnOnce() -> Result<Vec<Block<N>>>,
+    initial: impl FnOnce() -> Result<Vec<Rt2<N>>>,
 ) -> Result<()> {
     let t = std::time::Instant::now();
     // Resumed or started (`grow_tree`).
@@ -471,7 +474,7 @@ fn main() -> Result<()> {
         }
     })?;
     match cli.command {
-        Command::Search(a) => search(&cfg, None, horizon_of(a.to, a.ceiling)?, a.ceiling.is_some(), &a.level, &a.checkpoint_dir, a.no_witness, a.save_marks.as_deref(), a.prefer.as_deref()),
+        Command::Search(a) => search(&cfg, None, a.frames, a.ceiling, &a.level, &a.search_dir, a.no_witness, a.save_marks.as_deref(), a.prefer.as_deref()),
         Command::Dual(a) => {
             let tool = match a.float_half.as_str() {
                 "celia" => celeste_rust::settings::FloatTool::Celia,
@@ -479,26 +482,27 @@ fn main() -> Result<()> {
                 t => anyhow::bail!("--float-half: `celia` or `uct`, not {t:?}"),
             };
             let float = cfg.float_half(tool, a.float_loading_jank)?;
-            search(&cfg, Some(&float), horizon_of(a.to, a.ceiling)?, a.ceiling.is_some(), &a.level, &a.checkpoint_dir, a.no_witness, a.save_marks.as_deref(), a.prefer.as_deref())
+            search(&cfg, Some(&float), a.frames, a.ceiling, &a.level, &a.search_dir, a.no_witness, a.save_marks.as_deref(), a.prefer.as_deref())
         }
         Command::Forward(a) => {
             let t = std::time::Instant::now();
-            let (dir, level, reference) = (std::path::Path::new(&a.checkpoint_dir), a.level, a.reference);
+            let (dir, level, reference) = (std::path::Path::new(&a.tree), a.level, a.reference);
             let what = if reference { ", REFERENCE engine" } else { "" };
             match cfg.arith {
                 Arith::Fixed => {
                     let engine: Box<dyn FrameStep> = if reference { Box::new(celeste_rust::engines::reference::RefFrameStep::<P8>::new(&cfg, level)?) } else { Box::new(celeste_rust::compiled::FrameEngine::new(&cfg, level)?) };
                     eprintln!("[fwd] engine up in {:.2} s ({level}{what})", t.elapsed().as_secs_f64());
-                    forward(dir, a.to, level, &cfg, engine, || Ok(vec![Block::canonical(RefEngine::new(&cfg)?.initial()?)?]))
+                    forward(dir, a.steps, level, &cfg, engine, || Ok(vec![RefEngine::new(&cfg)?.initial()?.canonicalized()]))
                 }
                 Arith::Float(_) => {
                     let engine: Box<dyn FrameStep<LuaF64>> = if reference { Box::new(celeste_rust::engines::reference::RefFrameStep::<LuaF64>::new(&cfg, level)?) } else { Box::new(celeste_rust::compiled::FloatKernels::new(&cfg, level)?) };
                     eprintln!("[fwd] engine up in {:.2} s ({level}{what}, {})", t.elapsed().as_secs_f64(), cfg.arith);
-                    forward(dir, a.to, level, &cfg, engine, || Ok(vec![Block::canonical(FloatRefEngine::new(&cfg)?.initial()?)?]))
+                    forward(dir, a.steps, level, &cfg, engine, || Ok(vec![FloatRefEngine::new(&cfg)?.initial()?.canonicalized()]))
                 }
             }
         }
         Command::Run(a) => run::run(&cfg, a),
+        Command::Witness(a) => run::witness(&cfg, a),
         Command::Ckhash(a) => diag::ckhash(&cfg, a),
         Command::Check(c) => check::run(&cfg, c),
         Command::Bench(c) => bench::run(&cfg, c),
@@ -507,7 +511,7 @@ fn main() -> Result<()> {
         Command::Robust(a) => diag::robust(&cfg, a),
         Command::L1(c) => l1::run(&cfg, c),
         Command::ExportUi(a) => celeste_rust::search::ui_export::export(
-            std::path::Path::new(&a.checkpoint_dir),
+            std::path::Path::new(&a.search_dir),
             std::path::Path::new(&a.out),
             cfg.threads(),
             a.arc.as_deref().map(std::path::Path::new),
@@ -518,13 +522,11 @@ fn main() -> Result<()> {
             },
         ),
         Command::Room => {
-            let objects = celeste_rust::trace::cart::room_objects(cfg.room);
-            let level = celeste_rust::game_runner::level_index(cfg.room.0, cfg.room.1) + 1;
-            println!("{}", serde_json::json!({ "room": cfg.room, "level": level, "objects": objects }));
-            Ok(())
-        }
-        Command::Starts => {
-            println!("{}", serde_json::to_string(&celeste_rust::starts::starts(&cfg)?)?);
+            let mut room = serde_json::to_value(celeste_rust::starts::starts(&cfg)?)?;
+            let c = cfg.category;
+            room["objects"] = serde_json::to_value(celeste_rust::trace::cart::room_objects(cfg.room))?;
+            room["category"] = serde_json::json!({ "name": c.to_string(), "hundred": c.hundred(), "nodiag": c.nodiag(), "onlydiag": c.onlydiag(), "gemskip": c.gemskip() });
+            println!("{room}");
             Ok(())
         }
     }

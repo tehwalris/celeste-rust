@@ -13,7 +13,6 @@ use celeste_engine::runtime2::{Rt2, AV};
 use full_moon::ast;
 
 use crate::abstraction::Level;
-use crate::frame::Block;
 use crate::search::rem::{Capture, Rem};
 use crate::trace::block::{self, fn_info_of, FnInfo, BUTTON_GLOBAL};
 use crate::trace::heap::{TableId, Value};
@@ -105,7 +104,7 @@ where
     /// One CONCRETE frame of row 0 of `row` under input `byte`: every leaf,
     /// keyed. It forks only where no input decides (`rnd`); unknown fields of
     /// the row are read as their placeholder, not forked.
-    pub fn step(&mut self, row: &Rt2<A::Num>, byte: u8) -> Result<Vec<Block<A::Num>>> {
+    pub fn step(&mut self, row: &Rt2<A::Num>, byte: u8) -> Result<Vec<Rt2<A::Num>>> {
         Ok(self.step_reads(row, byte)?.0)
     }
 
@@ -114,7 +113,7 @@ where
     /// of the buttons read alone - the output writes every button `UBool`
     /// (`block::to_rt2`) - so an input that agrees with `byte` on the mask has
     /// the same successors.
-    fn step_reads(&mut self, row: &Rt2<A::Num>, byte: u8) -> Result<(Vec<Block<A::Num>>, u8)> {
+    fn step_reads(&mut self, row: &Rt2<A::Num>, byte: u8) -> Result<(Vec<Rt2<A::Num>>, u8)> {
         let (mut st, _) = from_block(row, 0, &self.fn_info, &self.base)?;
         let (leaves, mask) = self.under_buttons(&mut st, byte, &[], Level::EXACT)?;
         Ok((self.blocks(&leaves)?, mask))
@@ -130,26 +129,26 @@ where
         Ok((leaves.map_err(|e| e.context(ran_from(st, Some(byte))))?, mask))
     }
 
-    fn blocks(&self, leaves: &[State<RefDomain<A>>]) -> Result<Vec<Block<A::Num>>> {
-        leaves.iter().map(|l| Block::canonical(to_block(l, self.settings.room)?)).collect()
+    fn blocks(&self, leaves: &[State<RefDomain<A>>]) -> Result<Vec<Rt2<A::Num>>> {
+        leaves.iter().map(|l| Ok(to_block(l, self.settings.room)?.canonicalized())).collect()
     }
 
     /// One whole GAME frame: `step` once, or under the split frame
     /// (`Settings::clock`) its two parts, both under `byte` (the
     /// buttons are the frame's; part a reads none). Every leaf of both.
-    pub fn frame(&mut self, row: &Rt2<A::Num>, byte: u8) -> Result<Vec<Block<A::Num>>> {
+    pub fn frame(&mut self, row: &Rt2<A::Num>, byte: u8) -> Result<Vec<Rt2<A::Num>>> {
         Ok(self.frame_reads(row, byte)?.0)
     }
 
     /// `frame`, and the buttons it read (`step_reads`; the union over its
     /// steps and their leaves): every input that agrees with `byte` there
     /// has the same successors, so the concrete search runs one of them.
-    pub fn frame_reads(&mut self, row: &Rt2<A::Num>, byte: u8) -> Result<(Vec<Block<A::Num>>, u8)> {
+    pub fn frame_reads(&mut self, row: &Rt2<A::Num>, byte: u8) -> Result<(Vec<Rt2<A::Num>>, u8)> {
         let (mut out, mut mask) = self.step_reads(row, byte)?;
         for _ in 1..self.settings.clock().per_frame {
             let mut next = Vec::new();
             for b in &out {
-                let (o, m) = self.step_reads(b.rt2(), byte)?;
+                let (o, m) = self.step_reads(b, byte)?;
                 next.extend(o);
                 mask |= m;
             }
@@ -170,13 +169,13 @@ where
     /// fruit level the fly fruit's `spd.y` and `rem.y` are 0
     /// (`pin_fly_fruit_motion`), at a near level a floor isolated from the
     /// player is in state 0 (`pin_isolated_floors`).
-    pub fn step_at(&mut self, row: &Rt2<A::Num>, byte: u8, level: Level) -> Result<(Vec<Block<A::Num>>, u8)> {
+    pub fn step_at(&mut self, row: &Rt2<A::Num>, byte: u8, level: Level) -> Result<(Vec<Rt2<A::Num>>, u8)> {
         self.step_at_pinned(row, byte, level, true)
     }
 
     /// `step_at`, the pins (`pin_fly_fruit_motion`, `pin_isolated_floors`)
     /// optional: the test compares the two.
-    fn step_at_pinned(&mut self, row: &Rt2<A::Num>, byte: u8, level: Level, pin: bool) -> Result<(Vec<Block<A::Num>>, u8)> {
+    fn step_at_pinned(&mut self, row: &Rt2<A::Num>, byte: u8, level: Level, pin: bool) -> Result<(Vec<Rt2<A::Num>>, u8)> {
         let (mut st, mut unknown) = from_block(row, 0, &self.fn_info, &self.base)?;
         let mut pinned_floors = false;
         if level.floors_near {
@@ -211,7 +210,7 @@ where
     }
 
     /// `step` where the frame must not fork.
-    pub fn step_one(&mut self, row: &Rt2<A::Num>, byte: u8) -> Result<Block<A::Num>> {
+    pub fn step_one(&mut self, row: &Rt2<A::Num>, byte: u8) -> Result<Rt2<A::Num>> {
         let mut out = self.step(row, byte)?;
         ensure!(out.len() == 1, "concrete frame produced {} leaves (expected exactly 1)", out.len());
         Ok(out.remove(0))
@@ -227,7 +226,7 @@ where
     /// its remainder TRANSFER - the interpreter's arc capture, as the tracer
     /// captures it for the kernels, decoded by the arithmetic's decoder
     /// (`Rem::transfer`; a refusal is fatal, as theirs).
-    pub fn run_lane(&mut self, block: &Rt2<A::Num>, lane: usize) -> Result<Vec<(Block<A::Num>, <A::Num as Rem>::Pair)>> {
+    pub fn run_lane(&mut self, block: &Rt2<A::Num>, lane: usize) -> Result<Vec<(Rt2<A::Num>, <A::Num as Rem>::Pair)>> {
         let (mut st, unknown) = from_block(block, lane, &self.fn_info, &self.base)?;
         let zero = A::point(A::from_i16(0));
         let none = || ArcAxis { took: false, pre: zero, frag: zero, ox: zero };
@@ -240,7 +239,7 @@ where
             .iter()
             .map(|l| {
                 let pair = transfer_of::<A::Num>(l).map_err(|e| e.context(ran_from(&st, None)))?;
-                Ok((Block::canonical(to_block(l, self.settings.room)?)?, pair))
+                Ok((to_block(l, self.settings.room)?.canonicalized(), pair))
             })
             .collect()
     }
@@ -483,7 +482,7 @@ impl<N: Rem> RefFrameStep<N> {
 impl<N: Rem> crate::frame::FrameStep<N> for RefFrameStep<N> {
     fn run(
         &self,
-        block: &Block<N>,
+        block: &Rt2<N>,
         _cell_in: &[u32],
         lanes: &[usize],
         sink: &mut crate::storage::unit::UnitSink<N>,
@@ -493,10 +492,10 @@ impl<N: Rem> crate::frame::FrameStep<N> for RefFrameStep<N> {
         // once would be gigabytes).
         let n = self.engines.len();
         for chunk in lanes.chunks(4 * n) {
-            let rows = crate::storage::wave::par_map(chunk, n, |&lane| self.engine().run_lane(block.rt2(), lane));
+            let rows = crate::storage::wave::par_map(chunk, n, |&lane| self.engine().run_lane(block, lane));
             for (&lane, rows) in chunk.iter().zip(rows) {
                 for (b, pair) in rows? {
-                    sink.emit_row(b.rt2(), lane, b.positions()?[0], pair)?;
+                    sink.emit_row(&b, lane, crate::search::pos_graph::block_cells(&b)?[0], pair)?;
                 }
             }
         }
@@ -754,7 +753,7 @@ mod tests {
     fn inputs_agreeing_on_the_buttons_read_make_the_same_successors() {
         let inputs = crate::concrete::read_inputs("tas/room_1_0_exit_frame_99.txt").expect("the exit's inputs");
         let mut eng = RefEngine::new(&Default::default()).expect("ref engine");
-        let exact = |bs: Vec<Block>| -> Vec<(celeste_engine::exact::ExactRow, u32)> { bs.iter().map(|b| (celeste_engine::exact::exact_rows(b.rt2()).swap_remove(0), b.positions().expect("cells")[0])).collect() };
+        let exact = |bs: Vec<Rt2>| -> Vec<(celeste_engine::exact::ExactRow, u32)> { bs.iter().map(|b| (celeste_engine::exact::exact_rows(b).swap_remove(0), crate::search::pos_graph::block_cells(&b).expect("cells")[0])).collect() };
         let mut row = eng.initial().expect("initial state");
         let (mut runs, mut checked) = (0, 0);
         for (f, &byte) in inputs.iter().enumerate() {
@@ -772,7 +771,7 @@ mod tests {
                 }
                 runs += ran.len();
             }
-            row = eng.step_one(&row, byte).expect("frame").into_rt2();
+            row = eng.step_one(&row, byte).expect("frame");
         }
         // The point of it: most inputs are repeats (the spawn and freeze
         // frames read no button; up/down only matter where a dash starts).
@@ -789,10 +788,10 @@ mod tests {
         let inputs = crate::concrete::read_inputs(route).expect("the route's inputs");
         let mut eng = RefEngine::new(&settings).expect("ref engine");
         // The projections compared EXACTLY (their canonical bytes).
-        let projected = |bs: &[Block]| -> std::collections::BTreeSet<(celeste_engine::exact::ExactRow, u32)> {
+        let projected = |bs: &[Rt2]| -> std::collections::BTreeSet<(celeste_engine::exact::ExactRow, u32)> {
             bs.iter()
                 .map(|b| {
-                    let mut w = b.rt2().clone_block();
+                    let mut w = b.clone_block();
                     crate::frame::widen_rt2_to(&mut w, level);
                     w.canonical();
                     (celeste_engine::exact::exact_rows(&w).swap_remove(0), crate::search::pos_graph::block_cells(&w).expect("cells")[0])
@@ -813,7 +812,7 @@ mod tests {
                 }
                 sampled.push((f, abs));
             }
-            row = eng.step_one(&row, byte).expect("frame").into_rt2();
+            row = eng.step_one(&row, byte).expect("frame");
         }
         let (leaves_pinned, leaves_full) = crate::par::Pool::new(16)
             .map_with(
@@ -850,7 +849,7 @@ mod tests {
     #[test]
     #[ignore = "slow, ./check.sh t2 runs it: the reference along room (6,2)'s route, ~30 CPU-s"]
     fn pinning_the_fly_fruits_motion_keeps_the_projected_successors() {
-        let settings = crate::settings::Settings { room: (6, 2), hundred: true, loading_jank: Some(2), ..Default::default() };
+        let settings = crate::settings::Settings { room: (6, 2), category: crate::settings::Category::Hundred, loading_jank: Some(2), ..Default::default() };
         let (with, pinned, full) = pins_keep_the_projected_successors(settings, "tas/room_6_2_hundred_frame_93.txt", 5, true, "r0sxhf", "fly_fruit");
         assert!(with >= 8, "only {with} sampled states have the fly fruit");
         assert!(4 * pinned < full, "pinning saved little: {pinned} leaves against {full}");

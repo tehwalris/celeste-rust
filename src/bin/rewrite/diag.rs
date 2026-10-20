@@ -19,13 +19,13 @@ use crate::{prefixes, where_, Rows};
 
 #[derive(clap::Args)]
 pub struct CkhashArgs {
-    /// The tree (a forward's checkpoint dir, or a search's `levelNN`).
+    /// The tree (a forward's `--tree`, or a search's `levelNN`).
     #[arg(long)]
     tree: PathBuf,
-    /// The last frame fingerprinted (default: the tree's last).
+    /// The last step fingerprinted (default: the tree's last).
     #[arg(long)]
-    to: Option<u32>,
-    /// Also list the N most populated player positions at frame `to`
+    steps: Option<u32>,
+    /// Also list the N most populated player positions at step `steps`
     /// (to pick a synthetic `--win-at` target with real fan-out).
     #[arg(long)]
     cells: Option<usize>,
@@ -40,15 +40,15 @@ pub struct CkhashArgs {
     /// its (shape, key, cell), layer and hull.
     #[arg(long)]
     hulls: bool,
-    /// With `--edges`: print frame F's edges (target, source, transfer)
-    /// on stderr, to diff two trees' edges at the frame whose line differs.
+    /// With `--edges`: print step S's edges (target, source, transfer) on
+    /// stderr, to diff two trees' edges at the step whose line differs.
     #[arg(long)]
     dump_edges: Option<u32>,
 }
 
 #[derive(clap::Args)]
 pub struct CensusArgs {
-    /// The tree (a forward's checkpoint dir, or a search's `levelNN`).
+    /// The tree (a forward's `--tree`, or a search's `levelNN`).
     #[arg(long)]
     tree: PathBuf,
     #[command(flatten)]
@@ -60,7 +60,7 @@ pub struct CensusArgs {
     /// `spd.,rem.,player[3].dash`).
     #[arg(long)]
     erase: Option<String>,
-    /// The saturation every this many frames.
+    /// The saturation every this many steps.
     #[arg(long, default_value_t = 4)]
     every: u32,
     /// The player positions with the most states, this many.
@@ -88,7 +88,7 @@ pub struct RobustArgs {
 
 pub fn ckhash(run: &Settings, a: CkhashArgs) -> Result<()> {
     let t = TreeDir::open(&a.tree, run)?;
-    let (dir, to, cfg) = (&t.dir, t.frame(a.to)?, &t.settings);
+    let (dir, to, cfg) = (&t.dir, t.frame(a.steps)?, &t.settings);
     let (top_cells, edges, hulls, dump_edges) = (a.cells, a.edges, a.hulls, a.dump_edges);
     let lines = match cfg.arith {
         Arith::Fixed => celeste_rust::storage::fingerprint::<P8>(dir, to, edges, hulls, cfg.threads())?,
@@ -322,7 +322,7 @@ pub fn trajectory(cfg: &Settings, a: TrajectoryArgs) -> Result<()> {
                 // the real-PICO-8 replay settles it.
                 for block in eng.step(st, byte)? {
                     tried += 1;
-                    let cell = block.positions()?[0];
+                    let cell = celeste_rust::search::pos_graph::block_cells(&block)?[0];
                     let pos = celeste_rust::search::pos_graph::cell_xy(cell);
                     if let Some(w) = want {
                         if pos != Some(*w) {
@@ -331,19 +331,19 @@ pub fn trajectory(cfg: &Settings, a: TrajectoryArgs) -> Result<()> {
                         }
                     }
                     // Deduplicated on the EXACT state.
-                    let mut exact = celeste_engine::exact::exact_rows(block.rt2()).swap_remove(0).into_vec();
+                    let mut exact = celeste_engine::exact::exact_rows(&block).swap_remove(0).into_vec();
                     exact.extend_from_slice(&cell.to_le_bytes());
                     if !seen.insert(exact.into_boxed_slice()) {
                         continue;
                     }
                     let mut p = path.clone();
                     p.push(byte);
-                    if stop_at_win && wins_of(block.rt2(), &cfg)?.iter().any(|&w| w) {
+                    if stop_at_win && wins_of(&block, &cfg)?.iter().any(|&w| w) {
                         println!("[trajectory] WIN at f{f} after {} frames; inputs:", p.len());
                         println!("{}", p.iter().map(|b| b.to_string()).collect::<Vec<_>>().join(","));
                         return Ok(());
                     }
-                    next.push((block.into_rt2(), p));
+                    next.push((block, p));
                 }
             }
         }

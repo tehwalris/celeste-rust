@@ -389,13 +389,12 @@ mod tests {
     #[test]
     #[ignore = "slow, ./check.sh t2 runs it: room (1,0)'s kernels and a forward, ~25 CPU-s"]
     fn the_exact_reach_holds_the_known_route_inside_the_tree() {
-        use crate::frame::Block;
         use crate::engines::reference::RefEngine;
         let s = crate::settings::Settings { win_at: Some((9, 9, 101, 101)), threads: Some(4), ..Default::default() };
         let dir = std::env::temp_dir().join(format!("celeste-reach-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let level = crate::abstraction::Level::parse("r0sxh").expect("level");
-        crate::frame::grow_tree(&dir, 35, None, None, level, || Ok(Box::new(crate::compiled::FrameEngine::new(&s, level)?)), || Ok(vec![Block::canonical(RefEngine::new(&s)?.initial()?)?]), &s).expect("forward");
+        crate::frame::grow_tree(&dir, 35, None, None, level, || Ok(Box::new(crate::compiled::FrameEngine::new(&s, level)?)), || Ok(vec![RefEngine::new(&s)?.initial()?.canonicalized()]), &s).expect("forward");
         let p0 = (super::super::arcs::point(0), super::super::arcs::point(0));
         let tree = crate::storage::layer::Tree::open(&dir, 35).expect("tree");
         let mut per_frame: Vec<Vec<crate::storage::Sk>> = Vec::new();
@@ -417,15 +416,15 @@ mod tests {
         // state at every frame is reached exactly.
         let known = crate::concrete::read_inputs(concat!(env!("CARGO_MANIFEST_DIR"), "/gates/known_room10_win9-101.txt")).expect("known route");
         let mut eng = RefEngine::new(&s).expect("engine");
-        let mut row = Block::canonical(eng.initial().expect("initial")).expect("canonical");
+        let mut row = eng.initial().expect("initial").canonicalized();
         let geo = crate::storage::GEOMETRY;
         for (i, &b) in known.iter().enumerate().take(33) {
-            row = eng.step_one(row.rt2(), b).expect("one successor");
+            row = eng.step_one(&row, b).expect("one successor");
             let t = i + 1;
             let (shape, keys, cells) = crate::frame::widened_keys(&row, level, &tree.space).expect("keys");
             let si = tree.shapes.iter().position(|&h| h == shape).expect("a tree shape") as u32;
             let sk = crate::storage::Sk::at(&geo, si, keys[0].expect("a tree key"), cells[0]);
-            let q = super::super::concrete::rem_of(row.rt2()).expect("rem");
+            let q = super::super::concrete::rem_of(&row).expect("rem");
             let hit = sets[t].iter().find(|c| c.0 == sk).map(|c| c.1.contains(q.0, q.1));
             assert_eq!(hit, Some(true), "f{t}: the known route's state is not reached with its exact remainder");
         }

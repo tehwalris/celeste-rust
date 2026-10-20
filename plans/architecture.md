@@ -224,7 +224,7 @@ room differently: the leaving player calls `next_room()` inside `_update`'s
 the new room's objects from index J on get one update on the loading frame
 (the "loading jank"). `--loading-jank J` patches that into the Lua
 (`trace::cart::apply_loading_frame`; J counts the original cart's objects).
-J depends on how the previous room was played: `rewrite starts` computes
+J depends on how the previous room was played: `rewrite room` computes
 the feasible J's grouped by the exact start state they give, and the
 category runner searches each class. The boot chain on a real PICO-8 is the
 ground truth (`pico8_diff/chain.py --boot`, `--check-start`).
@@ -356,7 +356,7 @@ act" distributes over unions, so the union over all paths is exact.
 
 ## The search
 
-`rewrite search --to H | --ceiling H [--level SPEC[,SPEC...]]`; per level:
+`rewrite search --frames H [--ceiling] [--level SPEC[,SPEC...]]`; per level:
 
 1. **The forward** to H into `<dir>/level{i:02}` (resumed, or reused when
    it reaches H). Won rows are stored and not expanded.
@@ -403,20 +403,22 @@ both shrink with H.
 
 **Win conditions**: the room exit (including the wrap from a row's last
 room); the summit's flag rect; the orb room's exit WITH the orb (or bare
-under `--gemskip`); `--hundred`: the exit with the berry; `--win-at`, a
-synthetic win for experiments. Rooms past (5,2) start with two dashes
-(one under `--gemskip`). `--nodiag`/`--onlydiag` make the forbidden dash
-arm raise, so it is no move, exactly.
+in the gemskip categories); in 100% and gemskip 100%, the exit with the
+berry; `--win-at`, a synthetic win for experiments. Rooms past (5,2) start
+with two dashes (one in the gemskip categories). The category is
+`--category` in the tasdatabase's names (`settings::Category`): nodiag,
+gemskipnodiag and onlydiag make the forbidden dash arm raise, so it is no
+move, exactly.
 
 **The split frame** (`--split-frame`, rooms (6,0), (6,1)): `_update` as two
 steps around the player's move; kernels shrink ~10-20x with identical
 states at frame boundaries. UNITS (`settings::Clock`, where every
 conversion is): STEPS are the internal unit, since a mid-frame state is a
 node of its own (the backward pulls W through it). The tree and its
-files, the edges, W, the marks, level -1's H (`--level-minus-one H,S`:
-`2C` for a horizon of C frames) and the tree commands' `--to`/`--frame`
-(`forward`, `ckhash`, `check`, `bench`, `census`) count steps. The search's
-`--to`/`--ceiling`, its bounds, witnesses and `result.json` count FRAMES;
+files, the edges, W, the marks, level -1's recorded H (`2C` for a horizon
+of C frames) and the flags named so (`forward --steps`, the tree
+commands' `--steps`/`--step`) count steps. The search's `--frames`,
+`--level-minus-one`'s H, its bounds, witnesses and `result.json` count FRAMES;
 the concrete search steps whole frames and looks states up at frame
 boundaries. The ladder filters
 at frame boundaries only (mid-frame rows do not key as the coarser tree's:
@@ -428,7 +430,7 @@ own W, for the shortest run valid in both (plans/float.md).
 
 ## Checks
 
-The check ladder is `./check.sh t0|t1|t2|big` (plans/devloop.md). The
+The check ladder is `./check.sh t0 t1 t2 big` (plans/devloop.md). The
 verification surface behind it:
 
 - **The pinned room (1,0) gates** (`gates/`): each frame's states, edges
@@ -489,12 +491,9 @@ plans/refactor.md: `git show c4dd3241:plans/refactor.md`).
     under `tools/`.
   - The engine crate knows the game (`runtime2::BoundaryIds`,
     `Rt2::player_objects`).
-  - A horizon is spelt `--to` (frames for the search, steps for the tree
-    commands) and `--horizon`; a tree `--checkpoint-dir` (the search,
-    `forward`) and `--tree` (the commands that read one).
   - The tracer beyond its audit: one trace for every level (today each
     level re-traces), the split pass replaced. These change behaviour.
-  - `--onlydiag` has no run yet (kept by Philippe); `--override-settings`
+  - `--category onlydiag` has no run yet (kept by Philippe); `--override-settings`
     passes `--region` only.
 - Dropped, with the reason:
   - Folding `widen::within` into `GraphArith::pieces_of` (the audit's

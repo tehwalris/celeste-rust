@@ -6,14 +6,15 @@ counter and the margin when the new run exits.
 
     tools/compare_video.py LEVEL OLD.tas NEW.tas OUT_PREFIX [--title 2800M]
         [--category "NO DIAGONAL DASHES"] [--old-label "TASDATABASE (GHOST)"] [--new-label OURS]
-        [--slow 4] [--captures DIR] [--stills DIR] [--tool uct|celia]
-Gemskip categories: UCT_DASHES=1 / CELIA_DASHES=1 in the environment (as tools/celeste/love.py sets them).
+        [--slow 4] [--captures DIR] [--stills DIR] [--tool uct|celia] [--dashes 1]
+        [--uct DIR]
+Gemskip categories: --dashes 1 (the tool's dash count, as tools/celeste/love.py gives it).
 
 Writes OUT_PREFIX.mp4 (real time, 30 fps) and OUT_PREFIX_slow.mp4 (the room
 entry at real time, then 1/SLOW speed). Both runs are played headlessly in
-UniversalClassicTas (--tool uct, the default: tools/uct/validate.sh with
-UCT_CAPTURE, see tools/uct/capture.lua) or in Celia (--tool celia:
-tools/celia/validate.sh with CELIA_CAPTURE, tools/celia/capture.lua), so they
+UniversalClassicTas (--tool uct, the default: tools/uct/validate.sh
+--capture, see tools/uct/capture.lua) or in Celia (--tool celia:
+tools/celia/validate.sh --capture, tools/celia/capture.lua), so they
 get that tool's graphics and its balloon seeds from the files. Celia loads
 the room as it does for an IL, with the LOADING JANK that UCT does not model:
 a run that only finishes in real play (moving platforms, 1800m nodiag) needs
@@ -30,7 +31,6 @@ from PIL import Image
 import imageio_ffmpeg
 
 M = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-UCT = os.environ.get("UCT", os.path.expanduser("~/src/github.com/gonengazit/UniversalClassicTas"))
 
 PAL = np.array([
     (0, 0, 0), (29, 43, 83), (126, 37, 83), (0, 135, 81), (171, 82, 54), (95, 87, 79), (194, 195, 199), (255, 241, 232),
@@ -44,10 +44,9 @@ FPS = 30
 GHOST_ALPHA, SMOKE_ALPHA = 0.7, 0.35
 
 
-def capture(tool, level, tas, outdir):
+def capture(tool, level, tas, outdir, dashes):
     os.makedirs(outdir, exist_ok=True)
-    env = dict(os.environ, **{f"{tool.upper()}_CAPTURE": outdir})
-    out = subprocess.run([f"{M}/tools/{tool}/validate.sh", str(level), tas], env=env, capture_output=True, text=True).stdout
+    out = subprocess.run([f"{M}/tools/{tool}/validate.sh", "--capture", outdir] + (["--dashes", str(dashes)] if dashes is not None else []) + [str(level), tas], capture_output=True, text=True).stdout
     print(out.strip())
     if f"level {level} {tas}: finished, " not in out:
         sys.exit(f"{tas}: did not finish in {tool}")
@@ -84,8 +83,8 @@ def load(outdir, tas):
             "frames": frames, "spawn": spawn}
 
 
-def load_font():
-    im = np.array(Image.open(f"{UCT}/CelesteTAS/font.png").convert("RGBA"))
+def load_font(uct):
+    im = np.array(Image.open(f"{uct}/CelesteTAS/font.png").convert("RGBA"))
     sep = (im == im[0, 0]).all(axis=2).all(axis=0)
     glyphs, x = {}, 0
     while x < len(sep):
@@ -242,14 +241,16 @@ def main():
     ap.add_argument("--captures", help="capture directory (reused if present)")
     ap.add_argument("--stills", help="also write PNGs of a few frames here")
     ap.add_argument("--tool", choices=("uct", "celia"), default="uct", help="the TAS tool that plays both runs")
+    ap.add_argument("--dashes", type=int, help="the tool's dash count (the gemskip categories: 1)")
+    ap.add_argument("--uct", default=os.path.expanduser("~/src/github.com/gonengazit/UniversalClassicTas"), help="the UCT clone (its font)")
     args = ap.parse_args()
-    FONT = load_font()
+    FONT = load_font(args.uct)
     cap = args.captures or f"{args.out}_captures"
     runs = {}
     for name, tas in (("old", args.old), ("new", args.new)):
         d = f"{cap}/{name}"
         if not os.path.exists(f"{d}/frames.jsonl"):
-            capture(args.tool, args.level, tas, d)
+            capture(args.tool, args.level, tas, d, args.dashes)
         runs[name] = load(d, tas)
     old, new = runs["old"], runs["new"]
     if old["spawn"] != new["spawn"]:

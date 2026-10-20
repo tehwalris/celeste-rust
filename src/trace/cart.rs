@@ -72,7 +72,6 @@ pub fn sources(s: &crate::settings::Settings) -> Result<String> {
         cart = split_frame(&cart, SPLIT_FRAME_UPDATE)?;
     }
     let mut game = crate::game_runner::apply_start_room(&cart, s)?;
-    anyhow::ensure!(!(s.nodiag && s.onlydiag), "--nodiag and --onlydiag exclude each other");
     static SAID: std::sync::Once = std::sync::Once::new();
     SAID.call_once(|| match s.loading_jank {
         Some(j) => eprintln!("[start] the room as real play enters it: its loading frame from object {j}"),
@@ -81,10 +80,10 @@ pub fn sources(s: &crate::settings::Settings) -> Result<String> {
     if let Some(j) = s.loading_jank {
         game = apply_loading_frame(&game, j, s.room)?;
     }
-    if s.nodiag {
+    if s.category.nodiag() {
         game = forbid_diagonal_dashes(&game)?;
     }
-    if s.onlydiag {
+    if s.category.onlydiag() {
         game = forbid_straight_dashes(&game)?;
     }
     // The balloons' phases where `--balloon-seeds` fixes them; else each
@@ -97,8 +96,12 @@ pub fn sources(s: &crate::settings::Settings) -> Result<String> {
     if let Some(seeds) = &s.balloon_seeds {
         game = fix_balloon_seeds(&game, seeds, s.room)?;
     }
-    if let crate::settings::Arith::Float(tool) = s.arith {
-        game = tool_seeds(&game, s.balloon_seeds.as_deref(), tool, s.room, s.loading_jank.is_some())?;
+    match s.arith {
+        crate::settings::Arith::Float(tool) => game = tool_seeds(&game, s.balloon_seeds.as_deref(), tool, s.room, s.loading_jank.is_some())?,
+        // A tool file's chests in 16.16 (`Settings::seed_chests`): UCT's
+        // seeds (the balloons are `fix_balloon_seeds`'s).
+        crate::settings::Arith::Fixed if s.seed_chests => game = tool_seeds(&game, s.balloon_seeds.as_deref(), crate::settings::FloatTool::Uct, s.room, false)?,
+        crate::settings::Arith::Fixed => {}
     }
     Ok(format!("{BUILTIN_LEVEL_3}\n{BUILTIN_LEVEL_4}\n{game}\n"))
 }
@@ -295,7 +298,7 @@ mod loading_frame_tests {
 /// every level and in the reference engine alike.
 fn forbid_diagonal_dashes(game: &str) -> Result<String> {
     const ARM: &str = "if input~=0 then\n\t\t  \tif v_input~=0 then\n";
-    anyhow::ensure!(game.matches(ARM).count() == 1, "--nodiag: the cart's diagonal dash arm was not found exactly once");
+    anyhow::ensure!(game.matches(ARM).count() == 1, "no diagonal dashes: the cart's diagonal dash arm was not found exactly once");
     Ok(game.replacen(ARM, &format!("{ARM}\t\t   \tlocal nodiag_violation = nil > 0\n"), 1))
 }
 
@@ -309,7 +312,7 @@ fn forbid_straight_dashes(game: &str) -> Result<String> {
     ];
     let mut game = game.to_string();
     for arm in ARMS {
-        anyhow::ensure!(game.matches(arm).count() == 1, "--onlydiag: a dash arm was not found exactly once: {arm:?}");
+        anyhow::ensure!(game.matches(arm).count() == 1, "only diagonal dashes: a dash arm was not found exactly once: {arm:?}");
         let head = &arm[..=arm.find('\n').expect("an arm is two lines")];
         game = game.replacen(arm, &format!("{head}\t\t   \tlocal onlydiag_violation = nil > 0\n{}", &arm[head.len()..]), 1);
     }
@@ -462,14 +465,13 @@ mod tests {
             let mut eng = RefEngine::new(&s).expect("engine");
             let mut row = eng.initial().expect("initial");
             for _ in 0..40 {
-                row = eng.step_one(&row, 0).expect("idle frame").into_rt2();
+                row = eng.step_one(&row, 0).expect("idle frame");
             }
             starts.iter().map(|&b| eng.step(&row, b).expect("dash frame").len()).collect()
         };
-        use crate::settings::Settings;
+        use crate::settings::{Category, Settings};
         assert_eq!(successors(Settings::default()), [1, 1, 1, 1], "any%: every dash start");
-        assert_eq!(successors(Settings { nodiag: true, ..Default::default() }), [0, 1, 1, 1], "nodiag: all but the diagonal");
-        assert_eq!(successors(Settings { onlydiag: true, ..Default::default() }), [1, 0, 0, 0], "onlydiag: the diagonal only");
-        assert!(RefEngine::new(&Settings { nodiag: true, onlydiag: true, ..Default::default() }).is_err(), "both modes at once must be refused");
+        assert_eq!(successors(Settings { category: Category::Nodiag, ..Default::default() }), [0, 1, 1, 1], "nodiag: all but the diagonal");
+        assert_eq!(successors(Settings { category: Category::Onlydiag, ..Default::default() }), [1, 0, 0, 0], "onlydiag: the diagonal only");
     }
 }

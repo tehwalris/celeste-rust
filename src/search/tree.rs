@@ -30,7 +30,7 @@ impl TreeDir {
     /// Frame `f` of the tree (`None`: its last); past the last is refused.
     pub fn frame(&self, f: Option<u32>) -> Result<u32> {
         let f = f.unwrap_or(self.last);
-        anyhow::ensure!(f <= self.last, "{}: frame {f} is past the tree's last finished one, {}", self.dir.display(), self.last);
+        anyhow::ensure!(f <= self.last, "{}: step {f} is past the tree's last finished one, {}", self.dir.display(), self.last);
         Ok(f)
     }
 

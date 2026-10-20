@@ -176,7 +176,7 @@ on the four validation witnesses only; all four are ROBUST.
 
 Every witness is checked in every tool: `tools/uct/check_uploads.py`
 (PICO-8 from the IL load, from the previous room, from the boot; UCT; Celia
-float) and Celia `--fixp` (`CELIA_FIXP=1 tools/celia/validate.sh`); the
+float) and Celia `--fixp` (`tools/celia/validate.sh --fixp`); the
 tool file starts on the player's first frame.
 
 - **nodiag 1800m** (room (1,2), real play J3, Celia J4): the dual optimum

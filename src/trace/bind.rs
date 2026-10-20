@@ -16,21 +16,9 @@ use celeste_engine::slots;
 
 use super::iface::{show, Path, Step};
 
-/// The tracer's path as the engine's: converting keeps ONE implementation
-/// of the walk (`celeste_engine::slots`).
-fn steps(p: &[Step]) -> Vec<slots::PathStep> {
-    p.iter()
-        .map(|s| match s {
-            Step::Key(k) => slots::PathStep::Key(k.clone()),
-            Step::Idx(i) => slots::PathStep::Idx(*i),
-            Step::Int(i) => slots::PathStep::Int(*i),
-        })
-        .collect()
-}
-
 /// The canonical cell id a traced path names in this block.
 pub fn resolve<N: EngineNum>(rt2: &Rt2<N>, p: &[Step]) -> Result<u32> {
-    slots::resolve_steps(rt2, &steps(p)).map_err(|e| anyhow!("{}", e))
+    slots::resolve_steps(rt2, p).map_err(|e| anyhow!("{}", e))
 }
 
 fn kind<N: EngineNum>(c: &Cell2<N>) -> &'static str {

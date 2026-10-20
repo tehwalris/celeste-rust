@@ -147,12 +147,12 @@ impl<N: KernelLanes> Kernels<N> {
 impl<N: KernelLanes> crate::frame::FrameStep<N> for Kernels<N> {
     fn run(
         &self,
-        block: &crate::frame::Block<N>,
+        block: &runtime2::Rt2<N>,
         cell_in: &[u32],
         lanes: &[usize],
         sink: &mut crate::storage::unit::UnitSink<N>,
     ) -> anyhow::Result<()> {
-        self.run_bucket(block.rt2(), cell_in, lanes, sink);
+        self.run_bucket(block, cell_in, lanes, sink);
         Ok(())
     }
 

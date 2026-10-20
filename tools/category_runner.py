@@ -6,28 +6,30 @@ and verify every result end to end.
 
 JOBS.json: a list of {"cat": "nodiag", "room": "0,0", "name": "100m",
 "offset": 27, "levels": "r0sxhn,r0sxh", "l1": true, "mem": "60G"} (optional:
-"flags": more flags for the search, e.g. ["--split-frame"] (an "env" of
-CELESTE_* variables is refused, as the binaries refuse them); "tag";
+"flags": more flags for the search, e.g. ["--split-frame"]; "tag";
 "timeout"; "reuse": a level-0 tree directory, moved in when it exists and moved back
 there when the job ends - so jobs can count horizons up on one kept tree;
-"to": a horizon H instead of the reference - `--to H`, level -1 at H, and a
-refutation is a result (the optimum is above H); "keep_tree": leave the tree
+"to": a horizon H instead of the reference - `--frames H` without
+`--ceiling`, level -1 at H, and a refutation is a result (the optimum is
+above H); "keep_tree": leave the tree
 in OUTDIR for a later job's "reuse"; "witness": a file of our inputs to verify,
-no search); re-read
+no search; "jank": J or "none" instead of the boot chain's); re-read
 before every job, so jobs can be appended while it runs; a job whose key is
-already in OUTDIR/results.jsonl is skipped.
+already in OUTDIR/results.jsonl is skipped. A job with a key not listed here
+is refused (`check_job`).
 
 Per job:
  0. the room's start as real play enters it: its loading frame from object
     J (pico8_diff/chain.py entry_jank: the category's boot chain; a job's
     "jank": J or "none"), for the search (--loading-jank) and every replay;
-    every other start class (`rewrite starts`) a search-only job;
+    every other start class (`rewrite room`'s starts) a search-only job;
  1. the reference: the community TAS replayed in the ORIGINAL cart behind the
     room's prologue (the earliest offset around `offset` that exits);
- 2. `rewrite search --ceiling REF --prefer <the community TAS>` with the
-    category's mode (--nodiag / --onlydiag / --gemskip / --hundred) and
+ 2. `rewrite search --frames REF --ceiling --prefer <the community TAS>` with the
+    category (`--category`, the database's name) and
     the level -1 filter if `l1` (retried without it if its table refuses);
-    `--to H` instead with a job's "to"; its outcome is its `result.json`;
+    `--frames H` without `--ceiling` with a job's "to"; its outcome is its
+    `result.json`;
  3. our witness replayed in the original cart (must exit at the optimum; no
     diagonal dash in a nodiag category, every dash diagonal in an onlydiag
     one, as the cart's own dash branch reports them);
@@ -41,7 +43,6 @@ Results: one JSON line per job in OUTDIR/results.jsonl.
 import argparse
 import json
 import os
-import re
 import shutil
 import subprocess
 import sys
@@ -57,47 +58,41 @@ import check_uploads  # noqa: E402
 UI = "/var/tmp/celeste-ui/data"
 
 
-def job_flags(job):
-    """The job's own search flags; an "env" (CELESTE_* variables) is
-    refused, as the binaries refuse the environment."""
-    if "env" in job:
-        raise SystemExit(f"job {job}: \"env\" is gone (the binaries refuse CELESTE_* variables): give its settings in \"flags\"")
-    return list(job.get("flags", []))
+# A job's keys: what a jobs file gives, and what `expand` adds.
+JOB_KEYS = {"cat", "room", "name", "offset", "levels", "l1", "mem", "flags", "tag", "timeout", "reuse", "to", "keep_tree", "witness", "jank"}
+EXPANDED_KEYS = {"jank_classes", "celia_jank", "search_only"}
+
+
+def check_job(job):
+    """A job from the jobs file, refused with a key it does not know (a
+    typo is not silently ignored).
+
+    >>> check_job({"cat": "100", "room": "4,0", "name": "500m", "offset": 25, "levels": "r0sxh", "flgs": []})
+    Traceback (most recent call last):
+    ...
+    SystemExit: job 100/500m: unknown keys ['flgs'] (the module's doc lists them)
+    """
+    bad = sorted(set(job) - JOB_KEYS)
+    if bad:
+        raise SystemExit(f"job {job.get('cat')}/{job.get('name')}: unknown keys {bad} (the module's doc lists them)")
+    return job
 
 
 def replay_exit(room, inputs, seeds, cat, jank=None):
     """Replay `inputs` in the ORIGINAL cart, the room started as the search
     starts it (its loading frame from object `jank`): the frame the room
-    changes during (None: never), and the frames."""
+    changes during (None: never), and the frames. A replay that fails
+    raises (`pico8.replay`): a crash is never a run that does not exit.
+
+    >>> real, pico8.REPLAY = pico8.REPLAY, "/bin/false"
+    >>> replay_exit("1,0", [0], [], "any")
+    Traceback (most recent call last):
+    ...
+    RuntimeError: the PICO-8 replay failed (exit 1): ''
+    >>> pico8.REPLAY = real
+    """
     fs = pico8.replay(rooms.parse(room), inputs, len(inputs) + 3, seeds, cat, jank)
     return pico8.exit_frame(fs, rooms.parse(room)), fs
-
-
-def chest_seed_variants(room, seeds, binary):
-    """The seed list with each chest's entry replaced by every class of
-    draws: a chest's berry appears at x = start + s, s in [-1, 2), and only
-    which side of a pixel it lies on matters to a whole-pixel player
-    (`rooms.seed_slots`: the objects the list runs over)."""
-    slots = rooms.seed_slots(rooms.parse(room), binary)
-    vals = list(seeds) + ["0"] * (len(slots) - len(seeds))
-    return [vals[:i] + [s] + vals[i + 1:] for i, kind in enumerate(slots) if kind == "chest" for s in ["-1", "-0.5", "0", "0.5", "1", "1.5"] if vals[i] != s]
-
-
-def canon_jumps(room, inputs, seeds, cat, jank=None):
-    """Keep the jump bit only where a jump FIRES in the minimal cart (the
-    search's model). The original cart buffers a press for 4 frames (jbuffer),
-    so a press that does nothing in the minimal cart - one copied from a
-    community TAS by --prefer - can fire later there. With every press firing
-    at once, the buffer never holds one: the same route in both carts. The
-    minimal cart is replayed under the file's balloon seeds (without them a
-    balloon room's run diverges and keeps a press)."""
-    spd_y = {fr.f: fr.spd_y for fr in pico8.replay(rooms.parse(room), inputs, len(inputs) + 1, seeds, cat, jank, original=False)}
-    canon, prev = [], 0
-    for i, b in enumerate(inputs):
-        fired = b & 16 and not prev & 16 and spd_y.get(i + 1) == "0xfffe.0000"
-        canon.append((b & ~16) | (16 if fired else 0))
-        prev = b
-    return canon
 
 
 def run(job, outdir, binary):
@@ -150,15 +145,13 @@ def run(job, outdir, binary):
     open(prefer, "w").write(",".join(map(str, [0] * prologue + dbin)))
     # 2. the search
     def search(l1):
-        flags = categories.search_flags(cat) + job_flags(job)
+        flags = ["--category", cat] + list(job.get("flags", []))
         flags += ["--loading-jank", str(jank) if jank else "none"]
         # The concrete steps under the community file's balloon seeds ([]: 0):
         # the witness is then one real run under them.
         flags += [f"--concrete-balloon-seeds={','.join(seeds)}"]
         if l1:
-            # Level -1 counts search steps: two a frame under the split frame.
-            steps = horizon * (2 if "--split-frame" in flags else 1)
-            flags += ["--level-minus-one", f"{steps},5"]
+            flags += ["--level-minus-one", f"{horizon},5"]
         log = os.path.join(jd, "search.log")
         tree = os.path.join(jd, "tree")
         release_tree()
@@ -169,7 +162,7 @@ def run(job, outdir, binary):
         if job.get("reuse") and os.path.isdir(job["reuse"]):
             os.makedirs(tree)
             shutil.move(job["reuse"], os.path.join(tree, "level00"))
-        cmd = [f"{M}/safe-run.sh", "--memory", job.get("mem", "60G"), "--", binary, "search", "--room", room, "--to" if "to" in job else "--ceiling", str(horizon), "--level", job["levels"], "--prefer", prefer, "--save-marks", os.path.join(jd, "marks"), "--checkpoint-dir", tree] + flags
+        cmd = [f"{M}/safe-run.sh", "--memory", job.get("mem", "60G"), "--", binary, "search", "--room", room, "--frames", str(horizon)] + ([] if "to" in job else ["--ceiling"]) + ["--level", job["levels"], "--prefer", prefer, "--save-marks", os.path.join(jd, "marks"), "--search-dir", tree] + flags
         t = time.time()
         with open(log, "w") as f:
             rc = subprocess.run(cmd, stdout=f, stderr=subprocess.STDOUT, cwd=M, timeout=job.get("timeout", 4 * 3600)).returncode
@@ -190,7 +183,7 @@ def run(job, outdir, binary):
 
     drop_tree = lambda: None if keep else release_tree()
     if job.get("witness"):
-        ours = [int(x) for x in re.findall(r"\d+", "".join(l for l in open(job["witness"]) if not l.startswith("#")))]
+        ours = tasdb.ours(open(job["witness"]).read(), job["witness"])
         opt, res["witness_from"] = len(ours), job["witness"]
     else:
         opt = None
@@ -207,7 +200,7 @@ def run(job, outdir, binary):
         res["search_s"] = round(secs)
         res["peak_gb"] = round(rec["peak_gb"], 2) if rec else None
         res["arc_bounds"] = [l["arc_bound"] for l in rec["levels"] if l["arc_bound"] is not None] if rec else []
-        # Under `--to H` a refutation is a result: no win by H at all.
+        # Without `--ceiling` a refutation is a result: no win by H at all.
         if rc == 0 and rec and rec["verdict"] in ("refuted", "no_concrete_win") and "to" in job:
             drop_tree()
             return {**res, "status": f"refuted at {horizon}", "detail": rec["verdict"]}
@@ -223,17 +216,20 @@ def run(job, outdir, binary):
         return {**res, "status": "search only: another start class of the room (the widened optimum is the least)"}
     open(os.path.join(jd, "witness.txt"), "w").write(",".join(map(str, ours)))
     # 3. verification in the original cart
-    hundred = categories.hundred(cat)
+    rules = rooms.rules(cat, binary)
+    hundred = rules["hundred"]
     # The search steps a chest's last shake as every draw (`rnd` is an
     # interval; only the balloons are seeded), so its witness may take the
     # berry where the file's chest seed does not put it: then the other
-    # chest seeds are tried, and the upload carries the one that works.
-    for sd in [seeds] + (chest_seed_variants(room, seeds, binary) if hundred else []):
+    # chest seeds are tried (`rewrite witness`'s, in a 100% category), and
+    # the upload carries the one that works.
+    for sd in [seeds] + rooms.witness(rooms.parse(room), ours, seeds, cat, jank, binary)["chest_seed_variants"]:
         mine, (e, fs) = ours, replay_exit(room, ours, sd, cat, jank)
         if e != opt:
             # A jump press that does nothing in the minimal cart can fire later in
-            # the original (its jump buffer): keep only the presses that fire.
-            canon = canon_jumps(room, ours, sd, cat, jank)
+            # the original (its jump buffer): keep only the presses that fire
+            # (`rewrite witness`).
+            canon = rooms.witness(rooms.parse(room), ours, sd, cat, jank, binary)["canonical"]
             e2, fs2 = replay_exit(room, canon, sd, cat, jank)
             res["jump_canonicalized"] = f"original cart exit {e} -> {e2}"
             if e2 == opt:
@@ -253,9 +249,9 @@ def run(job, outdir, binary):
         res["berry"] = berry
     # The dashes as the cart started them (its own dash branch, `dash DIR`).
     started = [fr for fr in fs if fr.dash and (e is None or fr.f <= e)]
-    if categories.nodiag(cat):
+    if rules["nodiag"]:
         res["diagonal_dashes"] = [fr.f for fr in started if fr.dash in pico8.DIAGONAL]
-    if categories.onlydiag(cat):
+    if rules["onlydiag"]:
         res["straight_dashes"] = [fr.f for fr in started if fr.dash not in pico8.DIAGONAL]
     lead = next((i for i, b in enumerate(ours) if b), len(ours))
     res["first_input"] = lead
@@ -283,12 +279,8 @@ def run(job, outdir, binary):
                 continue
             mine = os.path.join(jd, f"ours-{entry['file']}")
             open(mine, "w").write(tasdb.text(sd, ours[cut:]))
-            # A replay that fails (PICO-8 printed nothing; a chain.py
-            # SystemExit) is this candidate's result, not the runner's end.
-            try:
-                row = check_uploads.check(mine, False, cat, binary)
-            except (Exception, SystemExit) as ex:
-                row = f"check failed: {type(ex).__name__}: {ex}"[:300]
+            # A replay or tool run that fails fails the job (`run_job`).
+            row = check_uploads.check(mine, False, cat, binary)
             tried.append((cut, sd, row))
             if row.endswith("\tVALID"):
                 res["real_play"], res["upload_cut"] = row, cut
@@ -315,7 +307,7 @@ def run(job, outdir, binary):
             rid = f"room{room.replace(',', '')}{cat}"
             # The UI's download IS the upload file.
             dl = ["--download", res["upload"]] if res.get("upload") else []
-            ex = subprocess.run([f"{M}/safe-run.sh", "--", binary, "export-ui", "--checkpoint-dir", os.path.join(jd, "tree"), "--out", f"{UI}/{rid}", "--room", room, "--arc", os.path.join(jd, "marks"), "--witness", f"{paths}/ours.txt", "--reference", f"{paths}/reference.txt"] + dl, cwd=M, capture_output=True, text=True, timeout=3600)
+            ex = subprocess.run([f"{M}/safe-run.sh", "--", binary, "export-ui", "--search-dir", os.path.join(jd, "tree"), "--out", f"{UI}/{rid}", "--arc", os.path.join(jd, "marks"), "--witness", f"{paths}/ours.txt", "--reference", f"{paths}/reference.txt"] + dl, cwd=M, capture_output=True, text=True, timeout=3600)
             if ex.returncode != 0:
                 raise RuntimeError("export-ui: " + ex.stderr.strip().splitlines()[-1] if ex.stderr.strip() else "export-ui failed")
             runs = json.load(open(f"{UI}/runs.json"))
@@ -329,6 +321,23 @@ def run(job, outdir, binary):
             res["ui_error"] = str(ex)[:200]
     drop_tree()
     return res
+
+
+def run_job(job, outdir, binary, run=run):
+    """`run`, where any failure - a replay that crashed or printed nothing,
+    a tool without a result, a chain that cannot run (SystemExit too) -
+    FAILS the job: a `runner error` status, never a result built on a
+    missing one.
+
+    >>> def crashing(job, outdir, binary):
+    ...     raise RuntimeError("the PICO-8 replay failed (exit 1): 'runtime error line 663'")
+    >>> run_job({"cat": "100", "name": "500m"}, "/tmp", "rewrite", crashing)
+    {'key': '100/500m', 'status': "runner error: RuntimeError: the PICO-8 replay failed (exit 1): 'runtime error line 663'"}
+    """
+    try:
+        return run(job, outdir, binary)
+    except (Exception, SystemExit) as ex:
+        return {"key": f"{job['cat']}/{job['name']}{job.get('tag', '')}", "status": f"runner error: {type(ex).__name__}: {ex}"[:300]}
 
 
 def ui_label(room, label, opt, tasn, ref, res):
@@ -365,7 +374,7 @@ def ui_label(room, label, opt, tasn, ref, res):
 def expand(job, cache, binary):
     """A job is run as real play enters its room: its loading frame from the
     J of the category's boot chain (`chain.entry_jank`). Where another play
-    of the previous room gives the room another start (`rewrite starts`:
+    of the previous room gives the room another start (`rewrite room`:
     every feasible J, grouped by the start state), one SEARCH-ONLY job per
     other start, tagged `-J<j>`: the history-WIDENED optimum is the least of
     them all; the main job's witness is valid after the database's previous
@@ -379,7 +388,7 @@ def expand(job, cache, binary):
         if j is None:
             cache[key] = [{**job, "jank": "none"}]
         else:
-            st = rooms.starts(room, categories.search_flags(job["cat"]) + ["--balloon-seeds", "0"], binary)
+            st = rooms.starts(room, ["--category", job["cat"], "--balloon-seeds", "0"], binary)
             classes = st["classes"]
             others = [{**job, "jank": c[0], "tag": job.get("tag", "") + f"-J{c[0]}", "search_only": True} for c in classes if j not in c]
             cache[key] = [{**job, "jank": j, "jank_classes": classes, "celia_jank": st["celia"]}] + others
@@ -392,9 +401,6 @@ def main():
     ap.add_argument("outdir")
     ap.add_argument("--bin", help="the rewrite binary (default OUTDIR/rewrite: a copy, so a rebuild cannot swap it mid-queue)")
     a = ap.parse_args()
-    for var in ("RUNNER_BIN", "CONCRETE_RUN"):
-        if var in os.environ:
-            raise SystemExit(f"category_runner: {var} is gone: --bin PATH (rewrite search, room and starts)")
     outdir = a.outdir
     binary = a.bin or f"{outdir}/rewrite"
     os.makedirs(outdir, exist_ok=True)
@@ -404,7 +410,7 @@ def main():
         done = set()
         if os.path.exists(results):
             done = {json.loads(l)["key"] for l in open(results) if l.strip()}
-        todo = [j for job in json.load(open(a.jobs)) for j in expand(job, cache, binary) if f"{j['cat']}/{j['name']}{j.get('tag', '')}" not in done]
+        todo = [j for job in json.load(open(a.jobs)) for j in expand(check_job(job), cache, binary) if f"{j['cat']}/{j['name']}{j.get('tag', '')}" not in done]
         if not todo:
             print("all jobs done", flush=True)
             return
@@ -416,13 +422,7 @@ def main():
             return
         job = todo[0]
         print(f"[{time.strftime('%H:%M')}] {job['cat']} {job['name']} {job['room']}", flush=True)
-        try:
-            res = run(job, outdir, binary)
-        except (Exception, SystemExit) as ex:
-            # SystemExit too: chain.py and replay.py exit on what they cannot
-            # run, and `except Exception` would end the runner with no
-            # results line.
-            res = {"key": f"{job['cat']}/{job['name']}{job.get('tag', '')}", "status": f"runner error: {type(ex).__name__}: {ex}"[:300]}
+        res = run_job(job, outdir, binary)
         res["end"] = time.strftime("%H:%M")
         with open(results, "a") as f:
             f.write(json.dumps(res) + "\n")

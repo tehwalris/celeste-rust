@@ -1,5 +1,5 @@
 -- Headless driver for Celia's cctas (gonengazit/Celia, the community's
--- current TAS tool): go to level CELIA_LEVEL the way a user does (F, i.e.
+-- current TAS tool): go to level `opts.level` the way a user does (F, i.e.
 -- cctas:next_level, which applies Celia's LOADING JANK: the room's objects
 -- from index `prev_obj_count + offset` on get one update on the loading
 -- frame, as in a real transition), load TAS<level>.tas from the save dir
@@ -9,11 +9,13 @@
 -- "[celia] FINISHED <n>f" is Celia's own count (the clean save's frames,
 -- what the tasdatabase counts: inputs - 1). A death is a failure: "[celia]
 -- DIED ..." (Celia keeps playing after one: the cart restarts the room).
--- Env: CELIA_DASHES (max_djump override, the gemskip categories: 1);
--- CELIA_JANK_OFFSET (Celia's loading-jank offset, default 0: key A);
--- CELIA_TRACE=1: one "[trace]" line per frame of the playback (the player
--- and every object with a phase), to compare with pico8_diff/replay.py.
-local D = {t = 0, phase = "start", n = tonumber(os.getenv("CELIA_LEVEL"))}
+-- `opts` (celia_opts.lua, written by validate.sh from its flags): the
+-- level, `dashes` (max_djump override, the gemskip categories: 1),
+-- `jank_offset` (Celia's loading-jank offset, default 0: key A), `trace`
+-- (one "[trace]" line per frame of the playback: the player and every
+-- object with a phase, to compare with pico8_diff/replay.py).
+local opts = require("celia_opts")
+local D = {t = 0, phase = "start", n = opts.level}
 
 local function name_of(o)
   for k, v in pairs(pico8.cart) do
@@ -42,14 +44,14 @@ function D.tick()
   local tas = D.tas
   if D.t < 5 or tas == nil then return end
   if D.phase == "start" then
-    if os.getenv("CELIA_DASHES") then tas.max_djump_overload = tonumber(os.getenv("CELIA_DASHES")) end
+    if opts.dashes then tas.max_djump_overload = opts.dashes end
     for _ = 1, D.n - 1 do tas:next_level() end
     if tas:get_file_level_index() ~= D.n then
       print("[celia] ERROR: at level " .. tas:get_file_level_index() .. ", wanted " .. D.n)
       love.event.quit(); D.phase = "done"; return
     end
-    if os.getenv("CELIA_JANK_OFFSET") then
-      tas.loading_jank_offset = tonumber(os.getenv("CELIA_JANK_OFFSET"))
+    if opts.jank_offset then
+      tas.loading_jank_offset = opts.jank_offset
       tas:load_level(tas:level_index(), false)
     end
     local cart = pico8.cart
@@ -65,7 +67,7 @@ function D.tick()
     D.phase = "wait"; D.mark = D.t
   elseif D.phase == "wait" then
     local cart = pico8.cart
-    if os.getenv("CELIA_TRACE") then trace() end
+    if opts.trace then trace() end
     local p
     for _, o in pairs(cart.objects) do if o.type == cart.player then p = o end end
     if cart.deaths ~= D.deaths then

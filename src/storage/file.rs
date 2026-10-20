@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 
 /// Bump whenever the meaning or layout of ANY tree content changes (older
 /// trees are refused; what each version changed: git history).
-pub(crate) const FORMAT_VERSION: u32 = 18;
+pub(crate) const FORMAT_VERSION: u32 = 19;
 
 /// The value files' magic.
 const VALUE: &[u8; 4] = b"C8TB";

@@ -27,7 +27,7 @@ use celeste_engine::runtime2::Rt2;
 use super::driver::Arcs;
 use super::concrete::{concrete_engines, dfs_budget, exact_state, Concrete, Next, NodeKeys, Side};
 use super::rem::Rem;
-use crate::frame::Block;
+
 use crate::settings::Settings;
 use crate::engines::reference::ReferenceEngine;
 
@@ -47,7 +47,7 @@ enum Fate {
 }
 
 /// `b`'s fate in half `side` against W at step `t`.
-fn fate<N: Rem>(side: &Side<N>, b: &Block<N>, t: u32) -> Result<Fate> {
+fn fate<N: Rem>(side: &Side<N>, b: &Rt2<N>, t: u32) -> Result<Fate> {
     Ok(if side.wins(b)? {
         Fate::Win
     } else if side.inside(b, t)? {
@@ -87,7 +87,7 @@ impl<X: Rem, F: Rem> Concrete for Pairs<'_, X, F> {
     }
 
     fn start(&self, (ex, ef): &mut Self::Engine) -> Result<(Pair<X, F>, bool)> {
-        Ok((Pair { fixed: Some(Block::canonical(ex.initial()?)?.into_rt2()), float: Block::canonical(ef.initial()?)?.into_rt2() }, false))
+        Ok((Pair { fixed: Some(ex.initial()?.canonicalized()), float: ef.initial()?.canonicalized() }, false))
     }
 
     fn successors(&self, (ex, ef): &mut Self::Engine, p: &Pair<X, F>, byte: u8, t: u32, _: &dyn Fn(&Key) -> bool, steps: &mut u64) -> Result<(Vec<Next<Self>>, u8)> {
@@ -108,9 +108,9 @@ impl<X: Rem, F: Rem> Concrete for Pairs<'_, X, F> {
                         Fate::Win if fixed.iter().any(|(x, _)| x.is_none()) => {}
                         Fate::Win => fixed.push((None, true)),
                         Fate::Inside => {
-                            let cell = b.positions()?[0];
+                            let cell = crate::search::pos_graph::block_cells(&b)?[0];
                             let exact = exact_state(&b, cell);
-                            fixed.push((Some((b.into_rt2(), exact)), false));
+                            fixed.push((Some((b, exact)), false));
                         }
                         Fate::Out => {}
                     }
@@ -133,15 +133,14 @@ impl<X: Rem, F: Rem> Concrete for Pairs<'_, X, F> {
                     }
                 }
                 Fate::Inside => {
-                    let cell = b.positions()?[0];
+                    let cell = crate::search::pos_graph::block_cells(&b)?[0];
                     let exact = exact_state(&b, cell);
-                    let row = b.into_rt2();
                     for (x, fixed_won) in &fixed {
                         let (fixed_row, fixed_key) = match x {
                             Some((r, e)) => (Some(r.clone_block()), Some(e.clone())),
                             None => (None, None),
                         };
-                        out.push(Next::State(Pair { fixed: fixed_row, float: row.clone_block() }, (fixed_key, exact.clone()), *fixed_won));
+                        out.push(Next::State(Pair { fixed: fixed_row, float: b.clone_block() }, (fixed_key, exact.clone()), *fixed_won));
                     }
                 }
             }
@@ -205,11 +204,11 @@ pub(crate) fn path_cells<N: Rem>(inputs: &[u8], s: &Settings) -> Result<Vec<u32>
     let mut cells = Vec::new();
     for (t, &i) in idx.iter().enumerate() {
         if clock.boundary(t as u32) {
-            cells.push(run.layers[t][i].1.positions()?[0]);
+            cells.push(crate::search::pos_graph::block_cells(&run.layers[t][i].1)?[0]);
         }
     }
     ensure!(clock.boundary(*step), "the path wins mid-frame");
-    cells.push(leaf.positions()?[0]);
+    cells.push(crate::search::pos_graph::block_cells(&leaf)?[0]);
     Ok(cells)
 }
 

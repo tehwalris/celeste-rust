@@ -19,6 +19,12 @@ pub fn level_index(x: i16, y: i16) -> i16 {
     x % 8 + y * 8
 }
 
+/// The room of LEVEL `level` (1-based, as the tasdatabase numbers its
+/// files: `TAS<level>.tas`): `level_index`'s inverse.
+pub fn room_of_level(level: i16) -> (i16, i16) {
+    ((level - 1) % 8, (level - 1) / 8)
+}
+
 /// The level whose big chest holds the orb (`max_djump=2`): room (5,2).
 pub const ORB_LEVEL: i16 = 21;
 
@@ -38,7 +44,7 @@ pub fn apply_start_room(game_lua: &str, s: &crate::settings::Settings) -> Result
     let (x, y) = s.room;
     // The orb sets `max_djump=2` for the rest of the game; a later room
     // must start as a play-through reaches it, with the orb taken.
-    let orb = if level_index(x, y) > ORB_LEVEL && !s.gemskip { "max_djump=2 " } else { "" };
+    let orb = if level_index(x, y) > ORB_LEVEL && !s.category.gemskip() { "max_djump=2 " } else { "" };
     Ok(game_lua.replacen(PAT, &format!("{}load_room({}, {})", orb, x, y), 1))
 }
 

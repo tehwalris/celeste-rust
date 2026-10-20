@@ -233,17 +233,17 @@ Room (3,3) at h172:
 
 ```bash
 ./safe-run.sh -- ./target/quick/rewrite search --level-minus-one 172,5 \
-    --checkpoint-dir /var/tmp/arc33-172 --to 172 --room 3,3 --level r0sxhn \
+    --search-dir /var/tmp/arc33-172 --frames 172 --room 3,3 --level r0sxhn \
     --save-marks /var/tmp/arc33-172-ui
-./safe-run.sh -- ./target/quick/rewrite export-ui --checkpoint-dir /var/tmp/arc33-172 \
-    --arc /var/tmp/arc33-172-ui --out /var/tmp/celeste-ui/data/room33arc172 --room 3,3
+./safe-run.sh -- ./target/quick/rewrite export-ui --search-dir /var/tmp/arc33-172 \
+    --arc /var/tmp/arc33-172-ui --out /var/tmp/celeste-ui/data/room33arc172
 # then list it in /var/tmp/celeste-ui/data/runs.json (above)
 ```
 
 Runs exported by the deleted precision ladder (several horizons, `[ladder]`
 logs) still render; the exporter no longer reads their layout.
 
-A run's layout (`run.json` + one binary per horizon/level) is documented
+A run's layout (`run.json`, `timings.json` + one binary per horizon/level) is documented
 at the top of `src/search/ui_export.rs`; `ui/src/data.ts` is its reader,
 with every file fetched as `data/<run>/<file>`. A run that fails to load
 shows an error card with the export command to rerun; a run whose

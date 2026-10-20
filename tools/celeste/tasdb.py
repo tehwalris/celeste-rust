@@ -3,7 +3,9 @@
 A file is `[s1,s2]i1,i2,...`: the `[seeds]` (balloons and chests in
 creation order, `rooms.seed_slots`; UniversalClassicTas `set_seeds`), then
 one input byte per frame from the player's first frame. The database's
-count of a file is its inputs - 1.
+count of a file is its inputs - 1. Our own witnesses (`tas/`) are the
+same without the header: input bytes from the room's load, `#` comment
+lines (Rust's `concrete::parse_tas` reads both).
 """
 import json
 import os
@@ -16,12 +18,24 @@ DB = os.path.expanduser("~/src/github.com/CelesteClassic/tasdatabase")
 
 
 def parse(text):
-    """(seeds as written, inputs) of a file's text; no `[...]`: no seeds."""
+    """(seeds as written, inputs) of a file's text; no `[...]`: no seeds;
+    `#` comment lines skipped."""
+    text = "".join(l for l in text.splitlines(keepends=True) if not l.lstrip().startswith("#"))
     seeds = []
     if "[" in text:
         seeds = [v.strip() for v in text[text.index("[") + 1:text.index("]")].split(",") if v.strip()]
         text = text[text.index("]") + 1:]
     return seeds, [int(x) for x in re.findall(r"\d+", text)]
+
+
+def ours(text, what="the witness"):
+    """Our own witness's inputs (`tas/`, from the room's load): a file with
+    a `[seeds]` header is the database's, whose inputs start at the player's
+    first frame - refused."""
+    body = "".join(l for l in text.splitlines(keepends=True) if not l.lstrip().startswith("#"))
+    if body.lstrip().startswith("["):
+        raise SystemExit(f"{what}: a tasdatabase file ([seeds] header), not ours (inputs from the room's load)")
+    return parse(text)[1]
 
 
 def text(seeds, inputs):

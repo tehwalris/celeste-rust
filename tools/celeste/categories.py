@@ -1,4 +1,6 @@
-"""The tasdatabase categories and what each means to the search and the tools."""
+"""The tasdatabase categories: their labels, their full runs' fallbacks, and
+the dash count the external tools are given. What a category means to the
+search (`--category`, the database's names) is Rust's: `rooms.rules`."""
 
 # The category's name on the UI.
 LABEL = {"nodiag": "No Diagonal Dashes", "gemskipany": "Gemskip any%", "gemskipnodiag": "Gemskip No Diagonal Dashes", "100": "100%", "gemskip100": "Gemskip 100%", "onlydiag": "Only Diagonal Dashes"}
@@ -20,26 +22,9 @@ FALLBACK = {
 
 
 def one_dash(cat):
-    """The gemskip categories skip the orb: one dash throughout."""
+    """The gemskip categories skip the orb: one dash throughout (what
+    PICO-8's replay, UCT and Celia are told)."""
     return cat.startswith("gemskip")
-
-
-def hundred(cat):
-    """The berry is part of the exit."""
-    return cat in ("100", "gemskip100")
-
-
-def nodiag(cat):
-    return "nodiag" in cat
-
-
-def onlydiag(cat):
-    return "onlydiag" in cat
-
-
-def search_flags(cat):
-    """`rewrite search`'s category flags."""
-    return (["--nodiag"] if nodiag(cat) else []) + (["--onlydiag"] if onlydiag(cat) else []) + (["--gemskip"] if one_dash(cat) else []) + (["--hundred"] if hundred(cat) else [])
 
 
 def replay_flags(cat):

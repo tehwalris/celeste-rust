@@ -17,15 +17,7 @@ use super::domain::{Domain, Symbolic};
 use super::heap::Value;
 use super::state::State;
 
-#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug)]
-pub enum Step {
-    Key(String),
-    /// A slot of the ARRAY part, zero-based.
-    Idx(usize),
-    /// An integer key outside the array part (`Table::ints`, not measured by
-    /// `#`), by its Lua key.
-    Int(i16),
-}
+pub use celeste_engine::slots::Step;
 
 pub type Path = Vec<Step>;
 

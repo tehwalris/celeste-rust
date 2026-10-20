@@ -10,7 +10,7 @@ f-th `_update();_draw()` after `_init()`, and the input byte for frame f is
 
     pico8_diff/replay.py tas/room_1_0_exit_frame_100.txt
     pico8_diff/replay.py --inputs 0,0,...,42 [--frames N]
-    PICO8=~/pico-8/pico8 pico8_diff/replay.py ...
+    pico8_diff/replay.py --pico8 ~/pico-8/pico8 ...
 """
 import argparse
 import os
@@ -20,11 +20,8 @@ import sys
 import tempfile
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-
-
-def read_inputs(path):
-    text = "".join(l for l in open(path) if not l.startswith("#"))
-    return [int(x) for x in re.split(r"[,\s]+", text.strip()) if x]
+sys.path.insert(0, os.path.join(ROOT, "tools"))
+from celeste import tasdb  # noqa: E402
 
 
 def hexbytes(path, n):
@@ -119,9 +116,10 @@ def build_cart(inputs, frames, out, lua_path=None, begin_game=False, room=None, 
     flags = hexbytes(os.path.join(ROOT, "cart", "flag-data.txt"), 256)
     prelude = [
         "__begin_game = " + ("true" if begin_game else "false"),
-        # The interpreter's hooks: the interval splitter (identity on a
+        # The interpreter's hooks: the interval splitters (identity on a
         # concrete value) and the state-normalization hint (a no-op).
         "function __split_by_flr(x) return x end",
+        "function __split_by_round(x) return x end",
         "function _hint_normalize() end",
         "__balloon_seeds = " + lua_list(balloon_seeds or []),
         "function __balloon_seed() return deli(__balloon_seeds, 1) or 0 end",
@@ -333,13 +331,37 @@ def build_cart(inputs, frames, out, lua_path=None, begin_game=False, room=None, 
 
 
 class NoCartOutput(RuntimeError):
-    """PICO-8 ran the cart and it printed nothing (`run`)."""
+    """PICO-8 ran the cart and it did not run to its end (`cart_lines`)."""
 
 
-def run(inputs, frames, keep=False, **kw):
-    """Build the cart (`build_cart`'s keywords), run it on PICO-8 headless,
-    return its `@P8@` lines."""
-    pico8 = os.environ.get("PICO8", os.path.expanduser("~/pico-8/pico8"))
+def cart_lines(stdout, stderr, cart):
+    r"""The `@P8@` lines of a run, its `end` line dropped. The driver prints
+    `end` last, always: without it the cart did not run to its end (a
+    runtime error, a halt) and its partial output is no result - raised,
+    not exited, so a caller in the same process (category_runner,
+    check_uploads) fails with it (a SystemExit passes `except Exception`).
+
+    >>> cart_lines("RUNNING: c.p8\n@P8@ f1 room 1,0\n@P8@ end\n", "", "c.p8")
+    ['f1 room 1,0']
+    >>> cart_lines("@P8@ f1 room 1,0\nruntime error line 663\n", "", "c.p8")
+    Traceback (most recent call last):
+    ...
+    replay.NoCartOutput: the cart did not run to its end (c.p8); pico8 said: '@P8@ f1 room 1,0\nruntime error line 663'
+    """
+    lines = [l[len("@P8@ "):] for l in stdout.splitlines() if l.startswith("@P8@ ")]
+    if lines[-1:] != ["end"]:
+        raise NoCartOutput(f"the cart did not run to its end ({cart}); pico8 said: {(stdout[-500:] + stderr[-500:]).strip()!r}")
+    return lines[:-1]
+
+
+PICO8 = os.path.expanduser("~/pico-8/pico8")
+
+
+def run(inputs, frames, keep=False, pico8=PICO8, **kw):
+    """Build the cart (`build_cart`'s keywords), run it on PICO-8 headless
+    (the binary `pico8`), return its `@P8@` lines."""
+    if "PICO8" in os.environ:
+        sys.exit("[replay] PICO8 in the environment: the binary is --pico8 (or run's `pico8`)")
     work = tempfile.mkdtemp(prefix="celeste-replay-")
     cart = os.path.join(work, "replay.p8")
     build_cart(inputs, frames, cart, **kw)
@@ -349,13 +371,7 @@ def run(inputs, frames, keep=False, **kw):
     except subprocess.TimeoutExpired as e:
         # PICO-8 halts on a cart it refuses ("program too large") and waits.
         sys.exit(f"[replay] pico8 timed out; it said: {(e.stdout or b'')[-500:]!r}")
-    lines = [l[len("@P8@ "):] for l in proc.stdout.splitlines() if l.startswith("@P8@ ")]
-    if not lines:
-        # The driver always prints its `end` line: none means the cart did not
-        # run to its end (a runtime error, a halt). Raised, not exited, so a
-        # caller in the same process (category_runner, check_uploads) can
-        # report it: a SystemExit passes `except Exception`.
-        raise NoCartOutput(f"no cart output ({cart}); pico8 said: {(proc.stdout[-500:] + proc.stderr[-500:]).strip()!r}")
+    lines = cart_lines(proc.stdout, proc.stderr, cart)
     if not keep:
         os.remove(cart)
         os.rmdir(work)
@@ -376,23 +392,23 @@ def main():
     ap.add_argument("--jank", type=int, help="the start room's loading frame from object J on (the jank model: a real transition's, Celia's IL load)")
     ap.add_argument("--dump", action="store_true", help="dump the start state (globals, every object's fields) before frame 1")
     ap.add_argument("--trace-objects", action="store_true", help="every object's position, remainder and phase on each frame line")
+    ap.add_argument("--pico8", default=PICO8, help=f"the PICO-8 binary (default {PICO8})")
     args = ap.parse_args()
     if args.inputs:
         inputs = [int(x) for x in args.inputs.split(",")]
     elif args.tas:
-        inputs = read_inputs(args.tas)
+        inputs = tasdb.ours(open(args.tas).read(), args.tas)
     else:
         ap.error("a witness file or --inputs is required")
     room = tuple(int(v) for v in args.room.split(",")) if args.room else None
     seeds = [float(v) for v in args.balloon_seeds.split(",") if v] if args.balloon_seeds is not None else None
     try:
-        lines = run(inputs, args.frames or len(inputs), args.keep, lua_path=args.lua, begin_game=args.begin_game, room=room, balloon_seeds=seeds,
+        lines = run(inputs, args.frames or len(inputs), args.keep, args.pico8, lua_path=args.lua, begin_game=args.begin_game, room=room, balloon_seeds=seeds,
                      one_dash=args.one_dash, jank=args.jank, dump=args.dump, trace_objects=args.trace_objects)
     except NoCartOutput as e:
         sys.exit(f"[replay] {e}")
     for l in lines:
-        if l != "end":
-            print(l)
+        print(l)
 
 
 if __name__ == "__main__":
