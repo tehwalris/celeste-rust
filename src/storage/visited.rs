@@ -9,7 +9,7 @@ use anyhow::Result;
 use rustc_hash::FxHashMap;
 
 use super::set::{Block, Change, PackedTable, PlainTable, RegionSet, Upserted};
-use super::{region_of, Geometry};
+use super::region_of;
 use crate::search::rem::Rem;
 use celeste_core::pico8_num::Pico8Num as P8;
 
@@ -26,7 +26,6 @@ const RUN_BLOCKS: usize = 64;
 /// states (by `storage::region_of`), the key space.
 #[derive(Clone)]
 pub struct VisitedSet<N: Rem = P8> {
-    pub(crate) geo: Geometry,
     pub keys: KeySpace<N>,
     shapes: Vec<u64>,
     shape_idx: FxHashMap<u64, u32>,
@@ -34,8 +33,8 @@ pub struct VisitedSet<N: Rem = P8> {
 }
 
 impl<N: Rem> VisitedSet<N> {
-    pub(crate) fn new(geo: Geometry) -> Self {
-        VisitedSet { geo, keys: KeySpace::new(), shapes: Vec::new(), shape_idx: FxHashMap::default(), set: RegionSet::default() }
+    pub(crate) fn new() -> Self {
+        VisitedSet { keys: KeySpace::new(), shapes: Vec::new(), shape_idx: FxHashMap::default(), set: RegionSet::default() }
     }
 
     /// Forget every state, keeping the key space and the shapes
@@ -82,7 +81,7 @@ impl<N: Rem> VisitedSet<N> {
     /// The region of `(shape, slot)`, if the shape is numbered.
     #[inline]
     pub(crate) fn region(&self, shape: u64, slot: u32) -> Option<u32> {
-        self.shape_index(shape).map(|s| region_of(&self.geo, s, slot))
+        self.shape_index(shape).map(|s| region_of(s, slot))
     }
 
     /// Region `region`'s packed table, if any state is held there.
@@ -123,7 +122,7 @@ impl<N: Rem> VisitedSet<N> {
         type Run = (usize, usize, (Option<Key>, Option<Key>), Vec<Block>);
         let mut runs: Vec<(usize, Run)> = Vec::new();
         for (i, region) in regions.iter().enumerate() {
-            anyhow::ensure!(((region / self.geo.slots) as usize) < self.shapes.len(), "an upserted region {region} of no numbered shape");
+            anyhow::ensure!(((region / crate::storage::cells::SLOTS) as usize) < self.shapes.len(), "an upserted region {region} of no numbered shape");
             let blocks = self.set.table_mut(*region).take_blocks();
             // Runs of blocks, each with the changes from its first key to
             // the next run's (the first from the start, the last to the end).
@@ -264,7 +263,7 @@ mod tests {
     /// the blocks in key order (`PackedTable::of_blocks` checks it).
     #[test]
     fn a_big_region_upserts_run_by_run() {
-        let mut v = VisitedSet::new(super::super::GEOMETRY);
+        let mut v = VisitedSet::new();
         v.add_shape(7);
         let region = 3;
         let info = |x: u64| Some(StateInfo { hull: Hull::from_bytes(&(x & 0x7fff_7fff_7fff_7fff).to_le_bytes()), layer: (x % 100) as u16 });
@@ -306,7 +305,7 @@ mod tests {
         let n = 300 * crate::storage::set::PACK_ENTRIES as u64;
         let held: Vec<Change> = (0..n).map(|k| Change { key: (0, 4 + k * 4), cell: (k % 64) as u8, info: Some(StateInfo { hull: hull(k), layer: (k % 7) as u16 }), new: true }).collect();
         let fresh = || {
-            let mut v = VisitedSet::new(super::super::GEOMETRY);
+            let mut v = VisitedSet::new();
             v.add_shape(7);
             v.upsert_all(vec![(region, held.clone())], 8).unwrap();
             v

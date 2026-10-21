@@ -337,8 +337,7 @@ impl Rows {
     pub(crate) fn states<N: celeste_core::arith::Arithmetic>(&self, t: &TreeDir) -> Result<(Tree<N>, u32, Vec<Sk>)> {
         let (frame, cell) = self.of(t)?;
         let tree = Tree::<N>::open(&t.dir, frame)?;
-        let geo = celeste_rust::storage::GEOMETRY;
-        let all: Vec<Sk> = tree.layer(frame, None, t.settings.threads())?.0.states_iter().filter(|s| cell.is_none_or(|c| s.cell(&geo) == c)).collect();
+        let all: Vec<Sk> = tree.layer(frame, None, t.settings.threads())?.0.states_iter().filter(|s| cell.is_none_or(|c| s.cell() == c)).collect();
         anyhow::ensure!(!all.is_empty(), "{}: no states at step {frame}{}", t.dir.display(), self.cell.map_or(String::new(), |(x, y)| format!(" at ({x}, {y})")));
         Ok((tree, frame, all))
     }

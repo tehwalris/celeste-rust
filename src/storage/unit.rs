@@ -211,7 +211,7 @@ impl<N: Rem> Sources<N> {
 
     #[inline]
     fn push_source(&mut self, region: u32, key: Key) -> u32 {
-        let s = (region / super::GEOMETRY.slots, key);
+        let s = (region / crate::storage::cells::SLOTS, key);
         let n = self.unit_sources.len() as u32;
         let k = *self.src_idx.entry(s).or_insert(n);
         if k == n {
@@ -230,14 +230,13 @@ impl<N: Rem> Sources<N> {
 
     /// The sources and lanes are in: the lanes by source and cell.
     fn done(&mut self) {
-        let geo = super::GEOMETRY;
         self.src_first.clear();
         self.src_first.resize(self.unit_sources.len(), u32::MAX);
         self.entry_next.clear();
         self.entry_next.resize(self.srcs.len(), (u32::MAX, 0, 0, 0));
         // Lanes of an entry are consecutive, its cells ascending.
         for (lane, &(entry, cell)) in self.lanes.iter().enumerate() {
-            let (slot, local) = geo.slot_local(cell);
+            let (slot, local) = crate::storage::cells::slot_local(cell);
             let x = &mut self.entry_next[entry as usize];
             if x.2 == 0 {
                 (x.1, x.3) = (slot, lane as u32);
@@ -254,7 +253,7 @@ impl<N: Rem> Sources<N> {
     /// The lane of source `s` at `cell` (of unit `unit`).
     #[inline]
     fn lane(&self, unit: u32, s: u32, cell: u32) -> usize {
-        let (slot, local) = super::GEOMETRY.slot_local(cell);
+        let (slot, local) = crate::storage::cells::slot_local(cell);
         let mut e = self.src_first[s as usize];
         while e != u32::MAX {
             let (next, sl, mask, lane) = self.entry_next[e as usize];
@@ -272,8 +271,7 @@ impl<N: Rem> Sources<N> {
     #[inline]
     fn by_entry(&self, unit: u32, slot: u32, b: &super::route::Ub, mut f: impl FnMut(u32, u64, Option<i32>)) {
         use super::bundle::{shift_into, source_cell, TO_NONE};
-        let geo = super::GEOMETRY;
-        let none = geo.no_cell_slot();
+        let none = crate::storage::cells::NO_CELL_SLOT;
         if b.o < TO_NONE && slot != none {
             let mut left = b.mask;
             let mut e = self.src_first[b.s as usize];
@@ -292,7 +290,7 @@ impl<N: Rem> Sources<N> {
             return;
         }
         for c in super::layer::bits(b.mask) {
-            let s_slot = geo.slot_local(source_cell(geo.cell(slot, c), b.o)).0;
+            let s_slot = crate::storage::cells::slot_local(source_cell(crate::storage::cells::cell(slot, c), b.o)).0;
             let mut e = self.src_first[b.s as usize];
             while e != u32::MAX && self.entry_next[e as usize].1 != s_slot {
                 e = self.entry_next[e as usize].0;
@@ -504,7 +502,6 @@ impl<N: Rem> Pusher<N> {
     /// hull)`, the cells nothing reached left out.
     #[inline(never)]
     fn pushes(&mut self, src: &Sources<N>, xfers: &Xfers<N>, unit: u32, slot: u32, targets: &[(Key, u64)], bundles: &[super::route::Ub]) -> Vec<(u32, u8, AccOf<N>)> {
-        let geo = super::GEOMETRY;
         // A slot per target cell reached (a bundle's cells are its target's).
         let (mut slots, mut offs) = (std::mem::take(&mut self.slots), std::mem::take(&mut self.offs));
         offs.clear();
@@ -532,7 +529,7 @@ impl<N: Rem> Pusher<N> {
                     }
                     None => {
                         let c = part.trailing_zeros();
-                        let s = super::bundle::source_cell(geo.cell(slot, c), b.o);
+                        let s = super::bundle::source_cell(crate::storage::cells::cell(slot, c), b.o);
                         edges.push((src.lane(unit, b.s, s) as u32, c as u8));
                     }
                 }
@@ -738,7 +735,7 @@ impl<'a, N: Rem> UnitSink<'a, N> {
         t.cells = *cells;
         for i in lanes_of(need) {
             let cell = cells[i];
-            let (slot, local) = super::GEOMETRY.slot_local(cell);
+            let (slot, local) = crate::storage::cells::slot_local(cell);
             t.route[i] = self.routes.id(shape, slot);
             t.local[i] = local as u8;
             let (entry, s_cell) = self.src.lanes[lanes[i]];

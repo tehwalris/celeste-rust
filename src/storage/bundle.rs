@@ -31,7 +31,6 @@ pub(crate) struct Bundle {
     pub(crate) mask: u64,
 }
 
-const _: () = assert!(super::GEOMETRY.words == 1, "bundles hold a u64 mask: 8 x 8 storage regions");
 
 /// The offset codes: target cell minus source cell, `(dx + 1024) << 11 |
 /// (dy + 1024)`, between two cells (below `TO_NONE`); into `NO_CELL`,
@@ -77,9 +76,8 @@ pub(crate) fn source_cell(t: u32, o: u32) -> u32 {
 /// target cells whose source is in the source region, and `k`; `None`: none.
 #[inline]
 pub(crate) fn shift_into(t_slot: u32, s_slot: u32, o: u32) -> Option<(u64, i32)> {
-    let geo = super::GEOMETRY;
-    debug_assert!(o < TO_NONE && t_slot != geo.no_cell_slot() && s_slot != geo.no_cell_slot());
-    let (side, pr) = (geo.side as i32, geo.per_row);
+    debug_assert!(o < TO_NONE && t_slot != crate::storage::cells::NO_CELL_SLOT && s_slot != crate::storage::cells::NO_CELL_SLOT);
+    let (side, pr) = (crate::storage::cells::SIDE as i32, crate::storage::cells::PER_ROW);
     let (dx, dy) = ((o >> 11) as i32 - 1024, (o & 2047) as i32 - 1024);
     // A source cell is its target cell plus (ddx, ddy) in the regions' grids.
     let ddx = ((t_slot % pr) as i32 - (s_slot % pr) as i32) * side - dx;
@@ -554,32 +552,31 @@ mod tests {
     /// region (the cells `shift_into` names), refused otherwise.
     #[test]
     fn shift_into_shifts_the_grid() {
-        let geo = super::super::GEOMETRY;
         let mut v = 11u64;
         let (mut some, mut none) = (0, 0);
         for _ in 0..20000 {
-            let t_slot = (lcg(&mut v) % (geo.slots as u64 - 1)) as u32;
-            let (rx, ry) = ((t_slot % geo.per_row) as i32, (t_slot / geo.per_row) as i32);
-            let s_slot = ((ry + (lcg(&mut v) % 3) as i32 - 1).clamp(0, geo.per_row as i32 - 1) * geo.per_row as i32 + (rx + (lcg(&mut v) % 3) as i32 - 1).clamp(0, geo.per_row as i32 - 1)) as u32;
+            let t_slot = (lcg(&mut v) % (crate::storage::cells::SLOTS as u64 - 1)) as u32;
+            let (rx, ry) = ((t_slot % crate::storage::cells::PER_ROW) as i32, (t_slot / crate::storage::cells::PER_ROW) as i32);
+            let s_slot = ((ry + (lcg(&mut v) % 3) as i32 - 1).clamp(0, crate::storage::cells::PER_ROW as i32 - 1) * crate::storage::cells::PER_ROW as i32 + (rx + (lcg(&mut v) % 3) as i32 - 1).clamp(0, crate::storage::cells::PER_ROW as i32 - 1)) as u32;
             let (dx, dy) = ((lcg(&mut v) % 17) as i32 - 8, (lcg(&mut v) % 17) as i32 - 8);
             let o = ((dx + 1024) as u32) << 11 | (dy + 1024) as u32;
             let mut mask = lcg(&mut v) & lcg(&mut v) & lcg(&mut v);
             if lcg(&mut v) % 2 == 0 {
                 // Only the cells whose source is in the region.
-                mask &= (0..64u32).filter(|&c| geo.slot_local(source_cell(geo.cell(t_slot, c), o)).0 == s_slot).fold(0, |m, c| m | 1u64 << c);
+                mask &= (0..64u32).filter(|&c| crate::storage::cells::slot_local(source_cell(crate::storage::cells::cell(t_slot, c), o)).0 == s_slot).fold(0, |m, c| m | 1u64 << c);
             }
             if mask == 0 {
                 continue;
             }
             let each: Option<u64> = (0..64u32).filter(|&c| mask >> c & 1 != 0).try_fold(0u64, |m, c| {
-                let (slot, local) = geo.slot_local(source_cell(geo.cell(t_slot, c), o));
+                let (slot, local) = crate::storage::cells::slot_local(source_cell(crate::storage::cells::cell(t_slot, c), o));
                 (slot == s_slot).then_some(m | 1u64 << local)
             });
             match shift_into(t_slot, s_slot, o).filter(|&(inside, _)| mask & !inside == 0).map(|(_, k)| (shift(mask, k), k)) {
                 Some((src, k)) => {
                     assert_eq!(Some(src), each, "slots {t_slot} {s_slot} offset ({dx}, {dy}) mask {mask:x}");
                     for c in (0..64u32).filter(|&c| mask >> c & 1 != 0) {
-                        assert_eq!(geo.slot_local(source_cell(geo.cell(t_slot, c), o)).1 as i32, c as i32 + k);
+                        assert_eq!(crate::storage::cells::slot_local(source_cell(crate::storage::cells::cell(t_slot, c), o)).1 as i32, c as i32 + k);
                     }
                     some += 1;
                 }

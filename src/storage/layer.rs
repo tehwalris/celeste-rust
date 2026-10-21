@@ -21,7 +21,7 @@ use super::codec::{get_varint, get_varint128, narrow, put_varint, put_varint128,
 use super::file::{self, At, Mapped, FORMAT_VERSION};
 use super::decode::Repr;
 use super::set::{PlainTable, RegionSet};
-use super::{Sk, GEOMETRY};
+use super::Sk;
 
 #[derive(Clone)]
 pub struct Layer<N: Arithmetic = P8> {
@@ -41,7 +41,7 @@ impl<N: Arithmetic> Layer<N> {
     /// ascending, masks non-empty: checked).
     pub(crate) fn push_region(&mut self, region: u32, keys: &[Key], masks: &[u64]) -> Result<()> {
         ensure!(masks.iter().all(|&m| m != 0), "region {region}: an entry without cells");
-        ensure!(region % GEOMETRY.slots != GEOMETRY.no_cell_slot() || masks.iter().all(|&m| m == 1), "region {region} (no player): a cell past 0");
+        ensure!(region % crate::storage::cells::SLOTS != crate::storage::cells::NO_CELL_SLOT || masks.iter().all(|&m| m == 1), "region {region} (no player): a cell past 0");
         self.set.push(region, PlainTable::from_sorted(keys, masks)?)
     }
 
@@ -76,13 +76,12 @@ impl<N: Arithmetic> Layer<N> {
     /// CONTENT hashes (any dictionary order). `shapes`: the tree's by index.
     pub fn content_fingerprint(&self, space: &KeySpace<N>, shapes: &[u64]) -> Result<(u64, u64)> {
         let content = space.content_hash();
-        let geo = GEOMETRY;
         let (mut n, mut acc) = (0u64, 0u64);
         for (region, key, mask) in self.iter() {
-            let shape = *shapes.get((region / geo.slots) as usize).ok_or_else(|| anyhow!("region {region} of no shape"))?;
+            let shape = *shapes.get((region / crate::storage::cells::SLOTS) as usize).ok_or_else(|| anyhow!("region {region} of no shape"))?;
             let kh = content.key(shape, key);
             for local in bits(mask) {
-                acc = acc.wrapping_add(mix64(kh ^ (geo.cell(region % geo.slots, local) as u64) << 1));
+                acc = acc.wrapping_add(mix64(kh ^ (crate::storage::cells::cell(region % crate::storage::cells::SLOTS, local) as u64) << 1));
                 n += 1;
             }
         }
@@ -204,8 +203,6 @@ pub(crate) struct RegionIndex {
 #[serde(bound = "")]
 pub(crate) struct FrameHeader<N: Arithmetic = P8> {
     pub(crate) frame: u32,
-    /// The storage region side the tree is built with.
-    pub(crate) side: u32,
     /// `(index, hash)` of the shapes numbered here.
     pub(crate) shapes: Vec<(u32, u64)>,
     pub(crate) keys: KeyAdditions<N>,
@@ -347,7 +344,7 @@ pub(crate) fn write_frame<N: crate::search::rem::Rem>(path: &Path, meta: &FrameM
     for (b, at) in frontier.iter_mut().zip(ats) {
         b.0.at = at;
     }
-    let header = FrameHeader { frame: meta.frame, side: GEOMETRY.side, shapes: meta.shapes.to_vec(), keys: meta.keys.clone(), skeletons, emitted: meta.emitted.to_vec(), regions: index, frontier: frontier.iter().map(|b| b.0).collect() };
+    let header = FrameHeader { frame: meta.frame, shapes: meta.shapes.to_vec(), keys: meta.keys.clone(), skeletons, emitted: meta.emitted.to_vec(), regions: index, frontier: frontier.iter().map(|b| b.0).collect() };
     file::write(path, file::magic::<N>(MAGIC), FORMAT_VERSION, &header, |f| {
         for (z, _) in &blocks {
             f.write_all(z)?;
@@ -368,7 +365,6 @@ impl<N: Arithmetic> FrameFile<N> {
     pub(crate) fn open(path: &Path) -> Result<Self> {
         let file = Mapped::open(path, file::magic::<N>(MAGIC), FORMAT_VERSION, &format!("a frame file of the {} arithmetic", N::NAME))?;
         let header: FrameHeader<N> = file.header()?;
-        ensure!(header.side == GEOMETRY.side, "{}: built with storage regions of {} cells, this process uses {}", path.display(), header.side, GEOMETRY.side);
         file.ends_at(header.frontier.last().map(|b| b.at).or(header.regions.last().map(|r| r.at)).map_or(0, |at| at.end()))?;
         Ok(FrameFile { file, header })
     }
@@ -543,19 +539,19 @@ impl<N: Arithmetic> Tree<N> {
     }
 
     pub(crate) fn shape_of(&self, region: u32) -> Result<u64> {
-        self.shapes.get((region / GEOMETRY.slots) as usize).copied().ok_or_else(|| anyhow!("{}: region {region} of no shape", self.dir.display()))
+        self.shapes.get((region / crate::storage::cells::SLOTS) as usize).copied().ok_or_else(|| anyhow!("{}: region {region} of no shape", self.dir.display()))
     }
 
     /// A state as `(shape, key, cell)`.
     #[cfg(test)]
     pub(crate) fn state(&self, s: Sk) -> Result<(u64, Key, u32)> {
-        Ok((self.shape_of(s.region)?, s.key, s.cell(&GEOMETRY)))
+        Ok((self.shape_of(s.region)?, s.key, s.cell()))
     }
 
     /// A state of `shape` with `key` at `cell`, if the tree numbers the shape.
     pub(crate) fn sk(&self, shape: u64, key: Key, cell: u32) -> Option<Sk> {
         let i = self.shapes.iter().position(|&h| h == shape)?;
-        Some(Sk::at(&GEOMETRY, i as u32, key, cell))
+        Some(Sk::at(i as u32, key, cell))
     }
 
     /// The cells of `(region, key)` frame `f` holds, reading that region only.
@@ -594,14 +590,13 @@ impl<N: Arithmetic> Tree<N> {
         ensure!(self.mask_at(f, s.region, s.key)? >> s.local & 1 == 1, "{}: frame {f} does not hold state {}", self.dir.display(), s.show());
         let shape = self.shape_of(s.region)?;
         let skel = self.skeleton(f, shape, room)?;
-        super::decode::decode_rows(&self.space, &skel, &[(s.key, s.cell(&GEOMETRY))])
+        super::decode::decode_rows(&self.space, &skel, &[(s.key, s.cell())])
     }
 }
 
 /// `layer`'s states (those `keep` admits) DECODED: per shape, chunks of at
 /// most `chunk` states and their rows, in the layer's order.
 pub(crate) fn decode_states<N: Arithmetic>(layer: &Layer<N>, space: &KeySpace<N>, shapes: &[u64], chunk: usize, keep: &dyn Fn(Sk) -> bool) -> Result<Vec<(Vec<Sk>, Rt2<N>)>> {
-    let geo = GEOMETRY;
     let mut out = Vec::new();
     let mut cur: Vec<Sk> = Vec::new();
     let mut cur_shape: Option<u32> = None;
@@ -609,7 +604,7 @@ pub(crate) fn decode_states<N: Arithmetic>(layer: &Layer<N>, space: &KeySpace<N>
         let Some(si) = shape.filter(|_| !cur.is_empty()) else { return Ok(()) };
         let h = *shapes.get(si as usize).ok_or_else(|| anyhow!("shape index {si} of no shape"))?;
         let skel = layer.skeletons.get(&h).ok_or_else(|| anyhow!("no skeleton of shape {h:016x}"))?;
-        let rows: Vec<(Key, u32)> = cur.iter().map(|s| (s.key, s.cell(&geo))).collect();
+        let rows: Vec<(Key, u32)> = cur.iter().map(|s| (s.key, s.cell())).collect();
         out.push((std::mem::take(cur), super::decode::decode_rows(space, skel, &rows)?));
         Ok(())
     };
@@ -617,7 +612,7 @@ pub(crate) fn decode_states<N: Arithmetic>(layer: &Layer<N>, space: &KeySpace<N>
         if !keep(s) {
             continue;
         }
-        let si = s.shape(&geo);
+        let si = s.shape();
         if cur_shape != Some(si) || cur.len() >= chunk {
             flush(&mut cur, cur_shape, &mut out)?;
             cur_shape = Some(si);

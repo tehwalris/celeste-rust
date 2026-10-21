@@ -140,7 +140,7 @@ pub fn run<N: Rem>(o: &Opts) -> Result<()> {
         let src_row = row_of(src)?;
         // The target by what it is (a hull tree records edges into states
         // it reaches later or never: not every target has a frame).
-        let target = (tree.shape_of(r.target.region)?, Some(r.target.key), r.target.cell(&crate::storage::GEOMETRY));
+        let target = (tree.shape_of(r.target.region)?, Some(r.target.key), r.target.cell());
         let (gx, gy) = (r.t.0.guard, r.t.1.guard);
         let pair: Vec<&Rec<N>> = recs.iter().filter(|q| q.target == r.target && q.src == src).collect();
         let in_union = |x: Point<N>, y: Point<N>| pair.iter().any(|q| image_of::<N::C>(&q.t.0, x).is_some() && image_of::<N::C>(&q.t.1, y).is_some());

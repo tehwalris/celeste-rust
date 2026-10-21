@@ -515,7 +515,7 @@ impl<N: Rem> ForwardState<N> {
         // `seed` keys it as it is, so a player's remainder would be stored
         // exact where every other state holds it widened, beside its hull.
         anyhow::ensure!(initial.iter().all(|b| b.player_objects().is_empty()), "frame 0: an initial row holds a player, whose remainder the start's hull does not describe");
-        let mut visited = crate::storage::visited::VisitedSet::<N>::new(crate::storage::GEOMETRY);
+        let mut visited = crate::storage::visited::VisitedSet::<N>::new();
         let seeded = crate::storage::wave::seed(&mut visited, &initial, crate::search::rem::start_hull::<N>(), s)?;
         checkpoint(dir, 0, &seeded, &[], s, &mut Stats::default())?;
         let won = !seeded.wins.is_empty();
@@ -810,9 +810,8 @@ const RESUME_CHANGES: usize = 1 << 25;
 #[allow(clippy::type_complexity)]
 pub(crate) fn restore_visited<N: Rem>(dir: &std::path::Path, last: u32, room: (i16, i16), threads: usize) -> Result<(crate::storage::visited::VisitedSet<N>, Option<u32>, Frontier<N>, crate::storage::decode::Skeletons<N>)> {
     use crate::storage::set::Change;
-    let geo = crate::storage::GEOMETRY;
     let tree = crate::storage::layer::Tree::<N>::open(dir, last)?;
-    let mut visited = crate::storage::visited::VisitedSet::<N>::new(geo);
+    let mut visited = crate::storage::visited::VisitedSet::<N>::new();
     for (i, &h) in tree.shapes.iter().enumerate() {
         visited.restore_shape(i as u32, h)?;
     }
@@ -1087,7 +1086,7 @@ mod tests {
     /// Does `registry` run `r`'s one lane (else its kernel declines)?
     fn kernel_runs(registry: &Registry<P8>, r: &Rt2, level: Level, s: &Settings) -> bool {
         let cells = crate::storage::cells::block_cells(r).expect("cells");
-        let visited = crate::storage::visited::VisitedSet::new(crate::storage::GEOMETRY);
+        let visited = crate::storage::visited::VisitedSet::new();
         let (routes, skeletons) = (crate::storage::route::Routes::default(), crate::storage::decode::Skeletons::default());
         let prov = celeste_engine::exact::Provisional::default();
         let (base, xtab) = (crate::storage::edges::XferTable::default(), Default::default());

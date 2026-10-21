@@ -2093,7 +2093,6 @@ fn compare_with_tree<N: Arithmetic>(opts: &Opts, by_hash: &HashMap<u64, usize>, 
         None => None,
     };
     let tree = crate::storage::layer::Tree::<N>::open(&opts.level_dir, opts.to)?;
-    let geo = crate::storage::GEOMETRY;
     say!(rep, "\nframe | states | too late (f + d > {}) | no exit path | death (kept) | left the room | other shape | not in the table | marked | MARKED TOO LATE", opts.ceiling)?;
     let mut samples: BTreeSet<String> = BTreeSet::new();
     for f in opts.from..=opts.to {
@@ -2102,7 +2101,7 @@ fn compare_with_tree<N: Arithmetic>(opts: &Opts, by_hash: &HashMap<u64, usize>, 
         let mut by_cell: std::collections::BTreeMap<(u64, u32), Vec<(u64, u64)>> = Default::default();
         let (layer, _) = tree.layer(f, None, 1)?;
         for s in layer.states_iter() {
-            by_cell.entry((tree.shape_of(s.region)?, s.cell(&geo))).or_default().push(s.key);
+            by_cell.entry((tree.shape_of(s.region)?, s.cell())).or_default().push(s.key);
         }
         let mut shapes: Vec<u64> = by_cell.keys().map(|k| k.0).collect();
         shapes.dedup();

@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 
 use super::bundle::{self, Bundle};
 use super::file::{self, At, Mapped};
-use super::{Geometry, Sk, GEOMETRY};
+use super::Sk;
 use crate::search::rem::Rem;
 use celeste_core::pico8_num::Pico8Num as P8;
 
@@ -323,14 +323,14 @@ pub struct Edge {
 
 /// The edges of bundle `b` of target region `region`: `f(source, target)` each.
 #[inline]
-pub(crate) fn expand(geo: &Geometry, region: u32, b: &Bundle, mut f: impl FnMut(Sk, Sk)) {
-    let slot = region % geo.slots;
+pub(crate) fn expand(region: u32, b: &Bundle, mut f: impl FnMut(Sk, Sk)) {
+    let slot = region % crate::storage::cells::SLOTS;
     let mut m = b.mask;
     while m != 0 {
         let c = m.trailing_zeros();
         m &= m - 1;
-        let s_cell = bundle::source_cell(geo.cell(slot, c), b.o);
-        f(Sk::at(geo, b.s_shape, b.s_key, s_cell), Sk { region, key: b.t_key, local: c as u8 });
+        let s_cell = bundle::source_cell(crate::storage::cells::cell(slot, c), b.o);
+        f(Sk::at(b.s_shape, b.s_key, s_cell), Sk { region, key: b.t_key, local: c as u8 });
     }
 }
 
@@ -484,8 +484,7 @@ impl<N: Rem> EdgeStore<N> {
     /// Every edge of frame `frame`, each segment's folded into an
     /// accumulator of its own (`init()`); the accumulators, by segment.
     pub(crate) fn par_scan<A: Send>(&self, frame: u32, threads: usize, init: impl Fn() -> A + Sync, f: impl Fn(&mut A, Edge) + Sync) -> Result<Vec<A>> {
-        let geo = GEOMETRY;
-        self.par_blocks(frame, threads, init, |acc, region, blk| blk.bundles(|b| expand(&geo, region, &b, |src, dst| f(acc, Edge { src, dst, xfer: b.x }))))
+        self.par_blocks(frame, threads, init, |acc, region, blk| blk.bundles(|b| expand(region, &b, |src, dst| f(acc, Edge { src, dst, xfer: b.x }))))
     }
 
     /// Every segment of frame `frame` opened and folded (`f(acc, target
@@ -507,10 +506,9 @@ impl<N: Rem> EdgeStore<N> {
     /// The distinct `(source cell, target cell)` pairs of frame `frame`'s
     /// edges (`Sk::cell`: the player's position cell, `NO_CELL` without one).
     pub(crate) fn cell_pairs(&self, frame: u32, threads: usize) -> Result<FxHashSet<(u32, u32)>> {
-        let geo = GEOMETRY;
         let mut all = FxHashSet::default();
         for part in self.par_scan(frame, threads, FxHashSet::default, |acc, e| {
-            acc.insert((e.src.cell(&geo), e.dst.cell(&geo)));
+            acc.insert((e.src.cell(), e.dst.cell()));
         })? {
             all.extend(part);
         }
@@ -527,14 +525,13 @@ impl<N: Rem> EdgeStore<N> {
     /// The in-edges recorded at frame `frame` of `target` (sources of layer
     /// `frame - 1`): its region's segments decoded.
     pub(crate) fn preds_at(&self, target: Sk, frame: u32) -> Result<Vec<(Sk, u32)>> {
-        let geo = GEOMETRY;
         let mut out = Vec::new();
         let mut dec = Decoder::default();
         for s in self.segments(frame, target.region) {
             dec.bundles(&s, |b| {
                 if b.t_key == target.key && b.mask >> target.local & 1 == 1 {
-                    let s_cell = bundle::source_cell(geo.cell(target.region % geo.slots, target.local as u32), b.o);
-                    out.push((Sk::at(&geo, b.s_shape, b.s_key, s_cell), b.x));
+                    let s_cell = bundle::source_cell(crate::storage::cells::cell(target.region % crate::storage::cells::SLOTS, target.local as u32), b.o);
+                    out.push((Sk::at(b.s_shape, b.s_key, s_cell), b.x));
                 }
             })?;
         }
@@ -571,12 +568,11 @@ pub(crate) fn discard_after(dir: &Path, last: u32) -> Result<()> {
 /// segments of one frame and its source index.
 #[cfg(test)]
 pub(crate) fn segments_of(edges: &[(Sk, Sk, u32)]) -> Result<(Vec<Segment>, Vec<(u32, Vec<u32>)>)> {
-    let geo = GEOMETRY;
     let mut by: std::collections::BTreeMap<u32, rustc_hash2::FxHashMap<(u32, super::visited::Key, u32, u32, super::visited::Key), u64>> = Default::default();
     let mut sources: std::collections::BTreeMap<u32, Vec<u32>> = Default::default();
     for &(s, t, x) in edges {
-        let o = bundle::offset(s.cell(&geo), t.cell(&geo));
-        *by.entry(t.region).or_default().entry((s.shape(&geo), s.key, x, o, t.key)).or_default() |= 1u64 << t.local;
+        let o = bundle::offset(s.cell(), t.cell());
+        *by.entry(t.region).or_default().entry((s.shape(), s.key, x, o, t.key)).or_default() |= 1u64 << t.local;
         sources.entry(t.region).or_default().push(s.region);
     }
     let mut z = super::file::compressor()?;
@@ -662,9 +658,8 @@ mod tests {
     #[test]
     fn a_frames_edges_come_back() {
         let dir = crate::testutil::TestDir::new("storage-edges");
-        let geo = GEOMETRY;
         let cell = |x: i32, y: i32| crate::storage::cells::cell_of(x, y).unwrap();
-        let st = |shape: u32, k: u64, c: u32| Sk::at(&geo, shape, (0, k), c);
+        let st = |shape: u32, k: u64, c: u32| Sk::at(shape, (0, k), c);
         let a = st(0, 5, cell(3, 4));
         let b = st(0, 5, cell(4, 4));
         let t1 = st(1, 9, cell(5, 4));

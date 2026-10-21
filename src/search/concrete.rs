@@ -20,7 +20,7 @@ use super::rem::{Point, Rem};
 use crate::abstraction::Level;
 use crate::frame::wins_of;
 use crate::settings::{Clock, Settings};
-use crate::storage::{Sk, GEOMETRY};
+use crate::storage::Sk;
 use crate::engines::reference::ReferenceEngine;
 
 /// What the concrete search steps (`Single`, `dual::Pairs`): engines (one a
@@ -369,7 +369,6 @@ pub(super) fn concrete_search<N: Rem>(side: &Side<'_, N>, horizon: u32, bound: u
 /// the tree's shapes are listed.
 pub(crate) struct NodeKeys<'w, C: Circle = super::arcs::Fixed16> {
     w: &'w Winning<C>,
-    geo: crate::storage::Geometry,
     /// Shape hash -> shape index, sorted.
     shapes: Vec<(u64, u32)>,
 }
@@ -380,12 +379,12 @@ impl<'w, C: Circle> NodeKeys<'w, C> {
         let mut by: Vec<(u64, u32)> = shapes.iter().enumerate().map(|(i, &h)| (h, i as u32)).collect();
         by.sort_unstable();
         ensure!(by.windows(2).all(|p| p[0].0 != p[1].0), "a shape with two indices");
-        Ok(NodeKeys { w, geo: GEOMETRY, shapes: by })
+        Ok(NodeKeys { w, shapes: by })
     }
     pub(super) fn get(&self, shape: u64, key: Option<(u64, u64)>, cell: u32) -> Option<u32> {
         let key = key?;
         let k = self.shapes.binary_search_by_key(&shape, |s| s.0).ok()?;
-        self.w.index(Sk::at(&self.geo, self.shapes[k].1, key, cell))
+        self.w.index(Sk::at(self.shapes[k].1, key, cell))
     }
 }
 

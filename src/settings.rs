@@ -292,7 +292,7 @@ impl Settings {
     /// jank by default its IL load's.
     pub fn resolved(mut self) -> Result<Settings> {
         if let Some((px, _)) = self.region {
-            let side = crate::storage::GEOMETRY.side as i32;
+            let side = crate::storage::cells::SIDE as i32;
             anyhow::ensure!(px % side == 0, "--region {px},..: a kernel region must hold whole storage regions ({side} px)");
         }
         anyhow::ensure!(

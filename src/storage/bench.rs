@@ -39,10 +39,9 @@ impl EdgeHashes {
     /// Frame `frame`'s `(count, sum of terms)` (`shapes`: the tree's by index).
     pub(crate) fn frame<N: crate::search::rem::Rem>(&self, store: &super::edges::EdgeStore<N>, frame: u32, content: &celeste_engine::exact::ContentHash, shapes: &[u64], threads: usize) -> Result<(u64, u64)> {
         let mix = celeste_engine::runtime2::mix64;
-        let geo = super::GEOMETRY;
         let parts = store.par_blocks(frame, threads, || (0u64, 0u64), |(n, acc), region, blk| {
-            let slot = region % geo.slots;
-            let t_shape = *shapes.get((region / geo.slots) as usize).context("a target region of no shape")?;
+            let slot = region % crate::storage::cells::SLOTS;
+            let t_shape = *shapes.get((region / crate::storage::cells::SLOTS) as usize).context("a target region of no shape")?;
             let th: Vec<u64> = blk.t_keys.iter().map(|&k| content.key(t_shape, k)).collect();
             let sh: Vec<u64> = blk.sources.iter().map(|&(s, k)| shapes.get(s as usize).map(|&h| content.key(h, k))).collect::<Option<_>>().context("a source of no shape")?;
             let mut bad = false;
@@ -55,7 +54,7 @@ impl EdgeHashes {
                 while m != 0 {
                     let c = m.trailing_zeros();
                     m &= m - 1;
-                    let tc = geo.cell(slot, c);
+                    let tc = crate::storage::cells::cell(slot, c);
                     let sc = super::bundle::source_cell(tc, r.o);
                     let t = mix(th[r.t as usize] ^ (tc as u64) << 1);
                     let s = mix(sh[r.s as usize] ^ (sc as u64) << 1);

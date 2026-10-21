@@ -13,11 +13,10 @@ use anyhow::{anyhow, ensure, Result};
 
 use super::codec::{get_varint, get_varint128, narrow, put_varint, put_varint128, wide};
 use super::visited::Key;
-use super::{Sk, GEOMETRY};
+use super::Sk;
 use crate::search::rem::Rem;
 use celeste_core::pico8_num::Pico8Num as P8;
 
-const _: () = assert!(GEOMETRY.words == 1, "a set holds a u64 mask an entry: 8 x 8 storage regions");
 
 /// The bytes key `w` needs (at least 1).
 #[inline]

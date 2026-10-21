@@ -18,7 +18,7 @@ use super::layer::{bits, Layer};
 use super::route::{Chunk, RegionCtx, RouteState, Routes};
 use super::unit::UnitSink;
 use super::visited::{Key, VisitedSet};
-use super::{Sk, GEOMETRY};
+use super::Sk;
 use super::stats::{Lap, Stats, S};
 use crate::frame::{Filters, FrameStep};
 use crate::search::rem::Rem;
@@ -178,7 +178,7 @@ impl UnitSpec {
 
 /// Units of about `unit` lanes, never across a shape (entries set-wide).
 fn units_of<N: Rem>(layer: &Layer<N>, unit: usize) -> Vec<UnitSpec> {
-    let slots = GEOMETRY.slots;
+    let slots = crate::storage::cells::SLOTS;
     let mut out = Vec::new();
     let mut cur: Option<(u32, usize, usize, u32)> = None;
     let (mut e, mut st) = (0usize, 0usize);
@@ -244,7 +244,7 @@ fn repush_units_of<N: Rem>(by: &ByLayer<N>, files: &super::edges::EdgeFiles) -> 
 /// Per layer of old states, its entries by (shape, key): their regions and
 /// entry numbers (what a re-push unit looks its bundles' sources up in).
 fn grown_index<N: Rem>(by: &ByLayer<N>) -> Vec<rustc_hash2::FxHashMap<(u32, Key), Vec<(u32, u32)>>> {
-    let slots = GEOMETRY.slots;
+    let slots = crate::storage::cells::SLOTS;
     by.iter()
         .map(|old| {
             let mut m: rustc_hash2::FxHashMap<(u32, Key), Vec<(u32, u32)>> = Default::default();
@@ -309,7 +309,6 @@ struct UnitScratch {
 /// out, the rest through the engine with their hulls.
 #[allow(clippy::too_many_arguments)]
 fn run_unit<N: Rem>(engine: &dyn FrameStep<N>, u: u32, entries: std::ops::Range<usize>, state: usize, layer: &Layer<N>, hulls: &[HullOf<N>], starts: &[usize], shapes: &[u64], sink: &mut UnitSink<'_, N>, sc: &mut UnitScratch, layer_frame: u32, ceiling: Option<u32>, s: &crate::settings::Settings) -> Result<()> {
-    let geo = GEOMETRY;
     let t_dec = sink.stats.tick_start();
     sink.begin(u);
     sc.rows.clear();
@@ -328,7 +327,7 @@ fn run_unit<N: Rem>(engine: &dyn FrameStep<N>, u: u32, entries: std::ops::Range<
         local += 1;
         let si = sink.push_source(region, key);
         for local in bits(mask) {
-            let cell = geo.cell(region % geo.slots, local);
+            let cell = crate::storage::cells::cell(region % crate::storage::cells::SLOTS, local);
             sc.rows.push((key, cell));
             sc.cells.push(cell);
             sink.push_lane(si, cell, *hulls.get(state).ok_or_else(|| anyhow!("unit {u}: a state past the layer's hulls"))?);
@@ -336,7 +335,7 @@ fn run_unit<N: Rem>(engine: &dyn FrameStep<N>, u: u32, entries: std::ops::Range<
         }
     }
     sink.sources_done();
-    let shape = *shapes.get((region / geo.slots) as usize).ok_or_else(|| anyhow!("a frontier region of no shape"))?;
+    let shape = *shapes.get((region / crate::storage::cells::SLOTS) as usize).ok_or_else(|| anyhow!("a frontier region of no shape"))?;
     let skel = layer.skeletons.get(&shape).ok_or_else(|| anyhow!("ROWS FROM KEYS: the frontier holds no skeleton of shape {shape:016x}"))?;
     let block = super::decode::decode_rows(sink.keys(), skel, &sc.rows)?;
     let skip = crate::frame::not_expanded(&block, layer_frame, ceiling, s)?;
@@ -836,7 +835,7 @@ pub(crate) fn run_wave<N: Rem>(engine: &dyn FrameStep<N>, front: Frontier<N>, cx
     collect_freed();
     st.lap(S::EndAbsorb, &mut lap);
     let mut next = next_layer(new, frame, s.threads())?;
-    let mut shapes_in: Vec<u32> = next.new.set.tables().iter().map(|(r, _)| r / GEOMETRY.slots).collect();
+    let mut shapes_in: Vec<u32> = next.new.set.tables().iter().map(|(r, _)| r / crate::storage::cells::SLOTS).collect();
     shapes_in.dedup();
     for si in shapes_in {
         let h = visited.shape_hash(si);
@@ -873,17 +872,16 @@ pub(crate) fn run_wave<N: Rem>(engine: &dyn FrameStep<N>, front: Frontier<N>, cx
 /// states: a re-push reaches a state along an edge recorded earlier, whose
 /// verdict does not hold now; every state kept is checked at this frame.
 fn mark_filter<N: Rem>(sealed: &mut [super::route::Sealed<N>], f: &crate::frame::MarkFilter<N>, visited: &VisitedSet<N>, skeletons: &Skeletons<N>, frame: u32) -> Result<()> {
-    let geo = GEOMETRY;
     for sl in sealed.iter_mut() {
-        let shape = visited.shape_hash(sl.region / geo.slots);
-        let slot = sl.region % geo.slots;
+        let shape = visited.shape_hash(sl.region / crate::storage::cells::SLOTS);
+        let slot = sl.region % crate::storage::cells::SLOTS;
         let skel = skeletons.get(shape)?;
         // The region's kept states, new then grown.
         let mut rows: Vec<(Key, u32)> = Vec::new();
         for (key, mask) in sl.table.iter() {
-            rows.extend(bits(mask).map(|c| (key, geo.cell(slot, c))));
+            rows.extend(bits(mask).map(|c| (key, crate::storage::cells::cell(slot, c))));
         }
-        rows.extend(sl.grown.iter().map(|g| (g.sk.key, geo.cell(slot, g.sk.local as u32))));
+        rows.extend(sl.grown.iter().map(|g| (g.sk.key, crate::storage::cells::cell(slot, g.sk.local as u32))));
         if rows.is_empty() {
             continue;
         }
@@ -1011,7 +1009,6 @@ impl<N: Rem> Default for RepushScratch<N> {
 #[inline(never)]
 fn run_repush<N: Rem>(u: u32, layer: &OldLayer<N>, index: &rustc_hash2::FxHashMap<(u32, Key), Vec<(u32, u32)>>, files: &super::edges::EdgeFiles, frame: u32, segs: &[(u32, u32)], visited: &VisitedSet<N>, base: &XferTable<N>, sink: &mut UnitSink<'_, N>, sc: &mut RepushScratch<N>) -> Result<u64> {
     use super::bundle::source_cell;
-    let geo = GEOMETRY;
     sink.begin(u);
     sc.accs.clear();
     let mut edges = 0u64;
@@ -1025,11 +1022,11 @@ fn run_repush<N: Rem>(u: u32, layer: &OldLayer<N>, index: &rustc_hash2::FxHashMa
         if cands.iter().all(Option::is_none) {
             continue;
         }
-        let (t_shape, t_slot) = (visited.shape_hash(region / geo.slots), region % geo.slots);
-        let none_slot = geo.no_cell_slot();
+        let (t_shape, t_slot) = (visited.shape_hash(region / crate::storage::cells::SLOTS), region % crate::storage::cells::SLOTS);
+        let none_slot = crate::storage::cells::NO_CELL_SLOT;
         // The route: asked at the first push (a route is one pushed into).
         let mut route = None;
-        let dropped = (0..64u32).filter(|&c| (t_slot != none_slot || c == 0) && sink.minus_one_drop(t_shape, geo.cell(t_slot, c))).fold(0u64, |a, c| a | 1u64 << c);
+        let dropped = (0..64u32).filter(|&c| (t_slot != none_slot || c == 0) && sink.minus_one_drop(t_shape, crate::storage::cells::cell(t_slot, c))).fold(0u64, |a, c| a | 1u64 << c);
         let (accs, cache, t_of) = (&mut sc.accs, &mut sc.cache, &mut sc.t_of);
         let (mut seen, mut used) = (0u64, 0u64);
         t_of.clear();
@@ -1043,9 +1040,9 @@ fn run_repush<N: Rem>(u: u32, layer: &OldLayer<N>, index: &rustc_hash2::FxHashMa
             while m != 0 {
                 let c = m.trailing_zeros();
                 m &= m - 1;
-                let s_cell = source_cell(geo.cell(t_slot, c), r.o);
-                let (s_slot, s_local) = geo.slot_local(s_cell);
-                let s_region = super::region_of(&geo, shape, s_slot);
+                let s_cell = source_cell(crate::storage::cells::cell(t_slot, c), r.o);
+                let (s_slot, s_local) = crate::storage::cells::slot_local(s_cell);
+                let s_region = super::region_of(shape, s_slot);
                 let Some(&(_, ei)) = cs.iter().find(|x| x.0 == s_region) else { continue };
                 let e = layer.entries[ei as usize];
                 if e.cells >> s_local & 1 == 0 {
@@ -1092,7 +1089,6 @@ const WIN_CHUNK: u32 = 1 << 12;
 /// The new layer's WINS: per entry of `next` (ascending) its win cells.
 /// `--key-check`: each decoded row's key is the boundary's, position its cell.
 fn layer_wins<N: Rem>(visited: &VisitedSet<N>, next: &Layer<N>, frame: u32, s: &crate::settings::Settings) -> Result<Vec<(u32, u64)>> {
-    let geo = GEOMETRY;
     let tables = next.set.tables();
     let starts = next.set.entry_starts();
     // Chunks of a table's entries: (table, entries).
@@ -1112,15 +1108,15 @@ fn layer_wins<N: Rem>(visited: &VisitedSet<N>, next: &Layer<N>, frame: u32, s: &
     }
     let parts = par_map(&chunks, s.threads(), |(ti, rg)| -> Result<Vec<(u32, u64)>> {
         let (region, t) = (tables[*ti].0, &tables[*ti].1);
-        let shape = visited.shape_hash(region / geo.slots);
+        let shape = visited.shape_hash(region / crate::storage::cells::SLOTS);
         let skel = next.skeletons.get(&shape).ok_or_else(|| anyhow!("no skeleton of shape {shape:016x}"))?;
-        let slot = region % geo.slots;
+        let slot = region % crate::storage::cells::SLOTS;
         let mut rows: Vec<(Key, u32)> = Vec::with_capacity(WIN_CHUNK as usize + 64);
         let mut at: Vec<(u32, u32)> = Vec::with_capacity(WIN_CHUNK as usize + 64);
         for e in rg.clone() {
             let (key, mask) = (t.key(e), t.mask(e));
             for local in bits(mask) {
-                rows.push((key, geo.cell(slot, local)));
+                rows.push((key, crate::storage::cells::cell(slot, local)));
                 at.push((starts[*ti] as u32 + e, local));
             }
         }
@@ -1308,7 +1304,6 @@ pub(crate) fn par_map<T: Sync, R: Send>(items: &[T], threads: usize, f: impl Fn(
 /// (`backward::Seeds::load`, `known::Pruning::start`). Each row must decode
 /// to itself (`check_piece`).
 pub(crate) fn seed<N: Rem>(visited: &mut VisitedSet<N>, blocks: &[Rt2<N>], start: HullOf<N>, s: &crate::settings::Settings) -> Result<Wave<N>> {
-    let geo = visited.geo;
     let mut canon: Vec<celeste_engine::runtime2::Rt2<N>> = Vec::with_capacity(blocks.len());
     for b in blocks {
         let mut r = b.clone_block();
@@ -1337,7 +1332,7 @@ pub(crate) fn seed<N: Rem>(visited: &mut VisitedSet<N>, blocks: &[Rt2<N>], start
         skels.insert(r.shape_hash, rec);
         let si = visited.shape_index(r.shape_hash).expect("numbered above");
         for ((&k, &c), w) in keys.iter().zip(&cells).zip(crate::frame::wins_of(r, s)?) {
-            states.push((Sk::at(&geo, si, k, c), w));
+            states.push((Sk::at(si, k, c), w));
         }
     }
     states.sort_unstable();
@@ -1392,7 +1387,7 @@ pub(crate) fn seed<N: Rem>(visited: &mut VisitedSet<N>, blocks: &[Rt2<N>], start
 /// tree: every successor new, a row's own too (the seeds are forgotten once
 /// keyed); the whole circle as their hulls. The successors, with their keys.
 pub fn one_frame<N: Rem>(engine: &dyn FrameStep<N>, rows: Vec<Rt2<N>>, frame: u32) -> Result<Vec<Rt2<N>>> {
-    let mut visited = VisitedSet::<N>::new(super::GEOMETRY);
+    let mut visited = VisitedSet::<N>::new();
     let mut xfers = XferTable::<N>::default();
     let skeletons = Skeletons::<N>::default();
     let s = engine.settings();
@@ -1425,13 +1420,13 @@ mod tests {
             view.widen_to(crate::abstraction::Level::EXACT);
             view.canonical();
             assert_ne!(celeste_engine::exact::exact_rows(&view), celeste_engine::exact::exact_rows(&start), "room {:?}: the start is its own view", s.room);
-            let mut visited = VisitedSet::new(GEOMETRY);
+            let mut visited = VisitedSet::new();
             let wave = seed(&mut visited, std::slice::from_ref(&start), Hull::full(), &s).unwrap_or_else(|e| panic!("room {:?}: frame 0: {e:#}", s.room));
             let decoded = super::super::layer::decode_states(&wave.frontier.new, &visited.keys, visited.shapes(), usize::MAX, &|_| true).expect("decode");
             let [(sks, row)] = &decoded[..] else { panic!("room {:?}: frame 0 is {} blocks", s.room, decoded.len()) };
             assert_eq!(sks.len(), 1, "room {:?}: frame 0 is one state", s.room);
             assert_eq!(
-                (celeste_engine::exact::exact_rows(row), sks[0].cell(&GEOMETRY)),
+                (celeste_engine::exact::exact_rows(row), sks[0].cell()),
                 (celeste_engine::exact::exact_rows(&start), crate::storage::cells::block_cells(&start).expect("cell")[0]),
                 "room {:?}: frame 0 is not the start",
                 s.room

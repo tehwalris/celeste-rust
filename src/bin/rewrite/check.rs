@@ -231,7 +231,6 @@ where
     kernels.warm();
     // Every candidate state, then `samples` evenly spaced.
     let (tree, frame, all) = a.rows.states::<A>(t)?;
-    let geo = celeste_rust::storage::GEOMETRY;
     let picked: Vec<Sk> = match a.row {
         Some(r) => vec![*all.get(r).ok_or_else(|| anyhow::anyhow!("--row {r}: step {frame} has {} states", all.len()))?],
         None => {
@@ -245,7 +244,7 @@ where
     // skipped over the path cap, lanes converted alike).
     let one = |reference: &mut celeste_rust::engines::reference::ReferenceEngine<A>, sk: Sk| -> Result<(String, usize, usize, usize, usize)> {
         let rt2 = tree.row(frame, sk, cfg.room)?;
-        let at = where_(sk.cell(&geo));
+        let at = where_(sk.cell());
         let id = sk.show();
         let mut alike = 0;
         let mut agree = |reference: &celeste_rust::engines::reference::ReferenceEngine<A>, b: &Rt2<A>| -> Result<()> {

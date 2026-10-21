@@ -278,7 +278,7 @@ depend on its horizon throughout.
 region). No state has a number, in memory or on disk.
 
 **One state set** (`storage::set`): per storage region (8 x 8 cells,
-`storage::GEOMETRY`, nested in a kernel region; `NO_CELL` one more region
+`storage::cells::SIDE`, nested in a kernel region; `NO_CELL` one more region
 per shape) a table of ENTRIES, an exact key and a u64 cell mask, sorted by
 key. Two forms: PLAIN (arrays: the frontier, a frame read back, the next
 layer) and PACKED (zstd blocks of ~1024 entries with each state's layer and

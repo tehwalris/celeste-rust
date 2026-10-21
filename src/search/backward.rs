@@ -16,7 +16,7 @@ use crate::storage::codec::{get_sk, get_varint, put_sk, put_varint};
 use crate::storage::edges::EdgeStore;
 use crate::storage::scratch::Words;
 use crate::storage::stats::Lap;
-use crate::storage::{Sk, GEOMETRY};
+use crate::storage::Sk;
 use rustc_hash::FxHashMap;
 
 const SK_MAX: Sk = Sk { region: u32::MAX, key: (u64::MAX, u64::MAX), local: u8::MAX };
@@ -510,7 +510,6 @@ impl<'a, N: Rem> Backward<'a, N> {
     fn read_round(&self, items: &[(usize, u32, usize, usize)], start: usize) -> anyhow::Result<(Vec<(Vec<Emit>, ArcStats)>, usize)> {
         use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
         let (cur, changed, store, budget) = (&self.cur, &self.changed, self.store, self.round_emits);
-        let geo = GEOMETRY;
         let total = items.last().map_or(0, |x| x.0);
         let (next, held) = (AtomicUsize::new(start), AtomicUsize::new(0));
         let parts: Vec<anyhow::Result<(Vec<Emit>, ArcStats)>> = std::thread::scope(|sc| {
@@ -538,7 +537,7 @@ impl<'a, N: Rem> Backward<'a, N> {
                                 targets.push((n.id.key, n.id.local, n.set));
                             }
                             let before = emits.len();
-                            let slot = region % geo.slots;
+                            let slot = region % crate::storage::cells::SLOTS;
                             stats.add(A::Opens, 1);
                             for seg in store.segments(f, region) {
                                 stats.add(A::Segments, 1);
@@ -568,8 +567,8 @@ impl<'a, N: Rem> Backward<'a, N> {
                                         hit &= hit - 1;
                                         let set = targets[at as usize..].iter().find(|x| x.1 as u32 == c).expect("a changed cell").2;
                                         let (s_shape, s_key) = sources[r.s as usize];
-                                        let s_cell = crate::storage::bundle::source_cell(geo.cell(slot, c), r.o);
-                                        emits.push(Emit { p: Sk::at(&geo, s_shape, s_key, s_cell), set, xfer: r.x, layer: (f - 1) as u16 });
+                                        let s_cell = crate::storage::bundle::source_cell(crate::storage::cells::cell(slot, c), r.o);
+                                        emits.push(Emit { p: Sk::at(s_shape, s_key, s_cell), set, xfer: r.x, layer: (f - 1) as u16 });
                                     }
                                 })?;
                             }
@@ -1009,8 +1008,7 @@ impl<N: Rem> Seeds<N> {
 
     /// A state's `(shape, key, cell)`.
     pub fn state(&self, s: Sk) -> (u64, (u64, u64), u32) {
-        let geo = GEOMETRY;
-        (self.shapes[s.shape(&geo) as usize], s.key, s.cell(&geo))
+        (self.shapes[s.shape() as usize], s.key, s.cell())
     }
 }
 

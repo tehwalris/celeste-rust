@@ -197,11 +197,10 @@ pub(crate) fn read<N: Rem>(file: &Mapped, blocks: &[Block], threads: usize) -> R
 pub fn fingerprint<N: Rem>(states: impl Iterator<Item = Grown<N>>, space: &celeste_engine::exact::KeySpace<N>, shapes: &[u64]) -> Result<(u64, u64)> {
     use celeste_engine::runtime2::mix64;
     let content = space.content_hash();
-    let geo = super::GEOMETRY;
     let (mut n, mut acc) = (0u64, 0u64);
     for Grown { sk: s, layer, hull: h } in states {
-        let shape = *shapes.get(s.shape(&geo) as usize).ok_or_else(|| anyhow::anyhow!("a frontier state of no shape"))?;
-        let node = content.state(shape, s.key, s.cell(&geo));
+        let shape = *shapes.get(s.shape() as usize).ok_or_else(|| anyhow::anyhow!("a frontier state of no shape"))?;
+        let node = content.state(shape, s.key, s.cell());
         let tag = mix64(h.hash() ^ (layer as u64).rotate_left(48));
         acc = acc.wrapping_add(mix64(node ^ tag.rotate_left(17)));
         n += 1;

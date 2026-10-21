@@ -13,18 +13,17 @@ use super::arcs::{Circle, Piece, Region, RegionRef, Seg};
 use super::backward::Winning;
 use super::rem::{Point, Rem, Xfer};
 use crate::storage::edges::EdgeStore;
-use crate::storage::{Sk, GEOMETRY};
+use crate::storage::Sk;
 use celeste_core::pico8_num::Pico8Num as P8;
 
 /// The out-edges recorded at `frame` of `sources` (layer `frame - 1`):
 /// `(k, target, transfer)` for `sources[k]`, read from the target regions
 /// the frame's index names for the sources' regions.
 fn out_edges<N: Rem>(store: &EdgeStore<N>, frame: u32, sources: &[Sk], threads: usize) -> anyhow::Result<Vec<(usize, Sk, u32)>> {
-    let geo = GEOMETRY;
     let mut wanted: rustc_hash2::FxHashMap<(u32, (u64, u64)), Vec<(u32, usize)>> = Default::default();
     let mut regions: Vec<u32> = Vec::new();
     for (k, s) in sources.iter().enumerate() {
-        wanted.entry((s.shape(&geo), s.key)).or_default().push((s.cell(&geo), k));
+        wanted.entry((s.shape(), s.key)).or_default().push((s.cell(), k));
         regions.push(s.region);
     }
     regions.sort_unstable();
@@ -38,8 +37,8 @@ fn out_edges<N: Rem>(store: &EdgeStore<N>, frame: u32, sources: &[Sk], threads: 
         for seg in store.segments(frame, region) {
             dec.bundles(&seg, |b| {
                 let Some(cands) = wanted.get(&(b.s_shape, b.s_key)) else { return };
-                crate::storage::edges::expand(&geo, region, &b, |src, dst| {
-                    let c = src.cell(&geo);
+                crate::storage::edges::expand(region, &b, |src, dst| {
+                    let c = src.cell();
                     for &(wc, k) in cands {
                         if wc == c {
                             out.push((k, dst, b.x));
@@ -416,13 +415,12 @@ mod tests {
         let known = crate::concrete::read_inputs(concat!(env!("CARGO_MANIFEST_DIR"), "/gates/known_room10_win9-101.txt")).expect("known route");
         let mut eng = RefEngine::new(&s).expect("engine");
         let mut row = eng.initial().expect("initial").canonicalized();
-        let geo = crate::storage::GEOMETRY;
         for (i, &b) in known.iter().enumerate().take(33) {
             row = eng.step_one(&row, b).expect("one successor");
             let t = i + 1;
             let (shape, keys, cells) = crate::frame::widened_keys(&row, level, &tree.space).expect("keys");
             let si = tree.shapes.iter().position(|&h| h == shape).expect("a tree shape") as u32;
-            let sk = crate::storage::Sk::at(&geo, si, keys[0].expect("a tree key"), cells[0]);
+            let sk = crate::storage::Sk::at(si, keys[0].expect("a tree key"), cells[0]);
             let q = super::super::concrete::rem_of(&row).expect("rem");
             let hit = sets[t].iter().find(|c| c.0 == sk).map(|c| c.1.as_ref().contains(q.0, q.1));
             assert_eq!(hit, Some(true), "f{t}: the known route's state is not reached with its exact remainder");
