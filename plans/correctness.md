@@ -31,6 +31,8 @@ settled here. Evidence is file:line at develop 19869c5d.
   (sound, but arbitrary coupling).
 - To do: check the bound with the reference engine (or derive it), and give
   the cut its own horizon (the search's).
+- It also mixes units: the cut compares steps with frames (frame.rs:160-163);
+  sound today only because the orb room is not split-frame.
 
 ## C3. Room (2,1): the split frame reaches FEWER states than unsplit at `p`
 - Noted in architecture.md ("unexplained"). Fewer states is the direction a
@@ -61,6 +63,27 @@ settled here. Evidence is file:line at develop 19869c5d.
   and the minimal cart side by side (every room, many inputs, state per frame
   modulo the handled differences), so the minimal cart and the native
   builtins are checked, not trusted.
+
+## C5. Verification gaps at the object and platform levels
+- At `p` the reference engine refuses to run (engines/reference.rs:539): the
+  platform kernels are checked only against regression pins.
+- At `n`, `check ref` and `check arcs` skip most rows over the reference's
+  path cap; room (7,0) `check arcs` is an open issue.
+- Proposals: a reachable-sample soundness check at every level (audit
+  architecture.md M3: concrete states from playouts, the concrete search and
+  known routes, stepped exactly, projected, held against the tree's edges and
+  hulls); concrete members in place of `step_at`'s pins (audit
+  kernel-pipeline.md K10).
+
+## C6. Closure captures are not part of a state's exact identity
+- `shape_sig`/`shape_hash_of` hash a closure's function id and capture COUNT
+  (exact.rs:435, runtime2.rs:391-395); `exact_rows` reads only `Val` cells
+  (exact.rs:964-1000): capture targets are hashed nowhere.
+- Fixed by structure today (the converter refuses non-table captures; "every
+  capture in this cart is the owning object", trace/block.rs:198-205), and the
+  forward's `Skeletons::register` would catch a mismatch, but the concrete and
+  dual searches dedup on `ExactRow` without that check.
+- To do: assert in `trace::block` that a capture IS the closure's owner.
 
 ## C7. HIGH: the jump buffer is removed, so the search MISSES real states
 - The original buffers a jump press for 4 updates (orig 136-142, 211-212);
@@ -113,6 +136,19 @@ settled here. Evidence is file:line at develop 19869c5d.
   breaks the boot chain, only the IL start is searched, which may not be a
   real start (MISSES).
 
+## C10. Smaller items
+- `rnd` is a free interval per call (stated best-case caveat); the original
+  also consumes the stream in removed code (clouds, particles, smoke's
+  `maybe()`, wall-slide `rnd(10)`, camera shake).
+- `rewrite starts` bounds the climb at 6 px a frame (safe today by margin).
+- Latent builtin issues: native `tile_flag_at` reads the boot room's
+  collision cache, not the live room; number literals parsed by decimal
+  truncation (all 15 fractional cart literals match bit for bit today).
+- A frame is always `_update();_draw()` (PICO-8 skips draws over the CPU
+  budget): suspected safe.
+- Tooling: pico8_diff/replay.py cannot run the minimal cart on PICO-8 since
+  f3123072 (no `__split_by_round` stub); fails loudly.
+
 ## C11. Balloon seeds: PICO-8 verification hands them out in another order
 - pico8_diff/replay.py assigns a file's `[seeds]` in POP order (balloons at
   the load, chests when opened); Rust's `--balloon-seeds`
@@ -123,7 +159,7 @@ settled here. Evidence is file:line at develop 19869c5d.
 - To do: settle which order the tasdatabase's tools (Celia, UCT) define, make
   the replay match, and re-verify the (3,3) and (5,3) uploads.
 
-## C12. Tooling degraded silently (fixed on branch simp-f, landing)
+## C12. Tooling degraded silently (FIXED, landed 4633008e)
 - Since f3123072 (2026-10-15) replay.py lacked the minimal cart's
   `__split_by_round` hook: every minimal-cart PICO-8 replay crashed, and the
   category runner's `canon_jumps` silently dropped every jump press
@@ -172,40 +208,10 @@ settled here. Evidence is file:line at develop 19869c5d.
   is reported UNSOUND past mid-route (loud; fix `clock.steps(a.frames)`).
 - `l1 probe` reads a tree with the command line's settings instead of the
   tree's record: a wrong `--room` silently probes the wrong room.
+- The `= P8` type defaults let fixed-only code run on float trees by
+  omission: `Visited::load` exists only for 16.16 (frame.rs:1037-1051) and
+  `l1 probe --marks` calls it on any tree (level_minus_one.rs:2089), decoding a
+  float key space as 16.16. Remove the defaults so the arithmetic is explicit.
 - `--override-settings` exists only for `--region`, but `--region off` also
   turns off the no-player exploration (walk.rs:526-529): either the grid does
   not change a tree (then don't record it) or overriding it is unsound.
-
-## C10. Smaller items
-- `rnd` is a free interval per call (stated best-case caveat); the original
-  also consumes the stream in removed code (clouds, particles, smoke's
-  `maybe()`, wall-slide `rnd(10)`, camera shake).
-- `rewrite starts` bounds the climb at 6 px a frame (safe today by margin).
-- Latent builtin issues: native `tile_flag_at` reads the boot room's
-  collision cache, not the live room; number literals parsed by decimal
-  truncation (all 15 fractional cart literals match bit for bit today).
-- A frame is always `_update();_draw()` (PICO-8 skips draws over the CPU
-  budget): suspected safe.
-- Tooling: pico8_diff/replay.py cannot run the minimal cart on PICO-8 since
-  f3123072 (no `__split_by_round` stub); fails loudly.
-
-## C5. Verification gaps at the object and platform levels
-- At `p` the reference engine refuses to run (engines/reference.rs:539): the
-  platform kernels are checked only against regression pins.
-- At `n`, `check ref` and `check arcs` skip most rows over the reference's
-  path cap; room (7,0) `check arcs` is an open issue.
-- Proposals: a reachable-sample soundness check at every level (audit
-  architecture.md M3: concrete states from playouts, the concrete search and
-  known routes, stepped exactly, projected, held against the tree's edges and
-  hulls); concrete members in place of `step_at`'s pins (audit
-  kernel-pipeline.md K10).
-
-## C6. Closure captures are not part of a state's exact identity
-- `shape_sig`/`shape_hash_of` hash a closure's function id and capture COUNT
-  (exact.rs:435, runtime2.rs:391-395); `exact_rows` reads only `Val` cells
-  (exact.rs:964-1000): capture targets are hashed nowhere.
-- Fixed by structure today (the converter refuses non-table captures; "every
-  capture in this cart is the owning object", trace/block.rs:198-205), and the
-  forward's `Skeletons::register` would catch a mismatch, but the concrete and
-  dual searches dedup on `ExactRow` without that check.
-- To do: assert in `trace::block` that a capture IS the closure's owner.
