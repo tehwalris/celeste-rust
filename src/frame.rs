@@ -475,9 +475,9 @@ fn checkpoint<N: Rem>(dir: &std::path::Path, frame: u32, wave: &crate::storage::
     let mut lap = Lap::start();
     let path = layer::frame_path(dir, frame);
     let meta = layer::FrameMeta { frame, shapes: &wave.shapes, keys: &wave.keys, emitted };
-    stats.set(S::FrameBytes, layer::write_frame(&path, &meta, &wave.next, &wave.wins, &wave.hulls, &wave.grown[..], s.threads())?);
+    stats.set(S::FrameBytes, layer::write_frame(&path, &meta, &wave.frontier, &wave.wins, s.threads())?);
     stats.lap(S::CkptFile, &mut lap);
-    layer::check_frame_file(&path, &wave.next, &wave.wins, &wave.hulls, &wave.grown[..], s.threads())?;
+    layer::check_frame_file(&path, &wave.frontier, &wave.wins, s.threads())?;
     stats.lap(S::CkptCheck, &mut lap);
     stats.set(S::Ckpt, stats.get(S::CkptFile) + stats.get(S::CkptCheck));
     Ok(())
@@ -515,7 +515,7 @@ impl<N: Rem> ForwardState<N> {
         checkpoint(dir, 0, &seeded, &[], s, &mut Stats::default())?;
         let won = !seeded.wins.is_empty();
         crate::storage::record::set_done(dir, 0, 0)?;
-        Ok(ForwardState { frontier: seeded.frontier(), visited, xfers: Default::default(), edges: Default::default(), skeletons: Default::default(), persisted: Default::default(), frames: 0, win_frame: won.then_some(0), l1 })
+        Ok(ForwardState { frontier: seeded.frontier, visited, xfers: Default::default(), edges: Default::default(), skeletons: Default::default(), persisted: Default::default(), frames: 0, win_frame: won.then_some(0), l1 })
     }
 
     /// The forward as its checkpoint tree left it (`None`: no tree); extending
@@ -605,7 +605,7 @@ impl<N: Rem> ForwardState<N> {
         if let Some(dir) = ckpt {
             // The skeletons first emitted here, of shapes the frame holds
             // no state of: a later re-push may reach one (`FrameHeader::emitted`).
-            let emitted = self.skeletons.records(|h| self.persisted.contains(&h) || wave.next.skeletons.contains_key(&h));
+            let emitted = self.skeletons.records(|h| self.persisted.contains(&h) || wave.frontier.new.skeletons.contains_key(&h));
             checkpoint(dir, frame, &wave, &emitted, s, &mut stats)?;
             self.persisted.extend(self.skeletons.shapes());
         }
@@ -613,7 +613,7 @@ impl<N: Rem> ForwardState<N> {
             self.win_frame = Some(frame);
         }
         self.frames = frame;
-        self.frontier = wave.frontier();
+        self.frontier = wave.frontier;
         stats.set(S::Visited, self.visited.len() as u64);
         stats.add_time(S::Total, t.elapsed());
         stats.set_gb(S::Peak, crate::metrics::peak_rss_gb());
@@ -870,7 +870,7 @@ pub(crate) fn restore_visited<N: Rem>(dir: &std::path::Path, last: u32, room: (i
             // set before its growth.
             flush(&mut pending, &mut visited, &mut held)?;
             // Read by region, each region's walked with its states sorted.
-            let mut by: Vec<(u32, crate::storage::visited::Key, u8, usize)> = grown.iter().enumerate().map(|(i, g)| (g.0.region, g.0.key, g.0.local, i)).collect();
+            let mut by: Vec<(u32, crate::storage::visited::Key, u8, usize)> = grown.iter().enumerate().map(|(i, g)| (g.sk.region, g.sk.key, g.sk.local, i)).collect();
             by.sort_unstable();
             let mut was: Vec<Option<StateInfo<N>>> = vec![None; grown.len()];
             for run in by.chunk_by(|a, b| a.0 == b.0) {
@@ -881,13 +881,13 @@ pub(crate) fn restore_visited<N: Rem>(dir: &std::path::Path, last: u32, room: (i
                 }
             }
             let mut old: crate::storage::wave::ByLayer<N> = Vec::new();
-            for (&(sk, layer, hull), was) in grown.iter().zip(was) {
+            for (&crate::storage::hulls::Grown { sk, layer, hull }, was) in grown.iter().zip(was) {
                 anyhow::ensure!(layer < f16, "{}: a grown state of layer {layer} in frame {f}'s hulls", dir.display());
                 let i = was.ok_or_else(|| anyhow::anyhow!("{}: an old state of frame {f}'s frontier without a hull before", dir.display()))?;
                 anyhow::ensure!(i.layer == layer, "{}: an old state's layer {layer} in frame {f}'s hulls, {} before", dir.display(), i.layer);
                 if old.last().is_none_or(|x| x.layer != layer) {
                     // Each layer's room exactly (the grown states are by layer).
-                    let n = grown.partition_point(|g| g.1 <= layer) - grown.partition_point(|g| g.1 < layer);
+                    let n = grown.partition_point(|g| g.layer <= layer) - grown.partition_point(|g| g.layer < layer);
                     old.push(crate::storage::wave::OldLayer::new(layer, n));
                 }
                 old.last_mut().expect("pushed").push(&crate::storage::wave::Old { sk, layer, hull, was: i.hull });
@@ -895,7 +895,7 @@ pub(crate) fn restore_visited<N: Rem>(dir: &std::path::Path, last: u32, room: (i
             frontier = Frontier { new: layer, hulls: hulls.clone(), old };
         }
         // The grown ones: older states.
-        for &(sk, layer, hull) in &grown {
+        for &crate::storage::hulls::Grown { sk, layer, hull } in &grown {
             pending.entry(sk.region).or_default().push(Change { key: sk.key, cell: sk.local, info: Some(StateInfo { hull, layer }), new: false });
         }
         if f == last || pending.values().map(Vec::len).sum::<usize>() >= RESUME_CHANGES {

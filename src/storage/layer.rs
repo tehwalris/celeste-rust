@@ -300,13 +300,14 @@ fn decode_region(raw: &[u8]) -> Result<RegionEntries> {
     Ok(RegionEntries { keys, masks, wins })
 }
 
-/// WRITE a frame file: `layer`'s states with their win masks (`wins`:
-/// sorted entry indices of `layer` with a win, and the win cells), its
-/// skeletons, what the frame added to the codebooks, and its frontier (the
-/// new states' `hulls` in their order, the grown states in `grown`:
-/// `hulls::encode`). Returns its bytes.
-pub(crate) fn write_frame<N: crate::search::rem::Rem, R: super::hulls::Runs<N> + ?Sized>(path: &Path, meta: &FrameMeta<N>, layer: &Layer<N>, wins: &[(u32, u64)], hulls: &[crate::search::hull::HullOf<N>], grown: &R, threads: usize) -> Result<u64> {
-    ensure!(layer.states() == hulls.len() as u64, "write_frame: {} new states, {} hulls", layer.states(), hulls.len());
+/// WRITE a frame file: its frontier `front` - the new states (the file's
+/// states) with their win masks (`wins`: sorted entry indices of
+/// `front.new` with a win, and the win cells), skeletons and hulls, the
+/// grown states (`hulls::encode`) - and what the frame added to the
+/// codebooks. Returns its bytes.
+pub(crate) fn write_frame<N: crate::search::rem::Rem>(path: &Path, meta: &FrameMeta<N>, front: &super::wave::Frontier<N>, wins: &[(u32, u64)], threads: usize) -> Result<u64> {
+    let layer = &front.new;
+    ensure!(layer.states() == front.hulls.len() as u64, "write_frame: {} new states, {} hulls", layer.states(), front.hulls.len());
     ensure!(wins.windows(2).all(|w| w[0].0 < w[1].0), "write_frame: wins not by entry");
     let tables = layer.set.tables();
     let starts = layer.set.entry_starts();
@@ -332,7 +333,7 @@ pub(crate) fn write_frame<N: crate::search::rem::Rem, R: super::hulls::Runs<N> +
         encode_region(&keys, &masks, &w, &mut raw);
         Ok((file::compress(&raw, z)?, raw.len()))
     })?;
-    let mut frontier = super::hulls::encode(hulls, grown, threads).with_context(|| path.display().to_string())?;
+    let mut frontier = super::hulls::encode(front, threads).with_context(|| path.display().to_string())?;
     let mut ats = At::place(blocks.iter().map(|b| (b.0.len(), b.1)).chain(frontier.iter().map(|b| (b.1.len(), b.2)))).into_iter();
     let index: Vec<RegionIndex> = tables
         .iter()
@@ -441,19 +442,17 @@ impl<N: crate::search::rem::Rem> FrameFile<N> {
     /// (`new`: this file's layer) first.
     pub(crate) fn frontier_states(&self, new: &Layer<N>, threads: usize) -> Result<Vec<super::hulls::Grown<N>>> {
         let (hulls, grown) = self.frontier(threads)?;
-        let layer = u16::try_from(self.header.frame).context("a frame past u16")?;
-        let mut out: Vec<super::hulls::Grown<N>> = new.states_iter().zip(&hulls).map(|(s, &h)| (s, layer, h)).collect();
-        out.extend(grown);
-        Ok(out)
+        Ok(super::hulls::frontier_states(new, &hulls, self.header.frame, grown.into_iter()).collect())
     }
 }
 
 /// THE COMPLETE STORAGE CHECK of a frame file just written: read back,
-/// region by region, its states are exactly `layer`'s (its regions, every
-/// entry's key and cells) and its wins `wins`, its frontier `hulls` and
-/// `grown` (`hulls::check`). FATAL otherwise: the frame would resume as
-/// another set than the forward expands.
-pub(crate) fn check_frame_file<N: crate::search::rem::Rem, R: super::hulls::Runs<N> + ?Sized>(path: &Path, layer: &Layer<N>, wins: &[(u32, u64)], hulls: &[crate::search::hull::HullOf<N>], grown: &R, threads: usize) -> Result<()> {
+/// region by region, its states are exactly `front.new`'s (its regions,
+/// every entry's key and cells) and its wins `wins`, its frontier `front`'s
+/// (`hulls::check`). FATAL otherwise: the frame would resume as another set
+/// than the forward expands.
+pub(crate) fn check_frame_file<N: crate::search::rem::Rem>(path: &Path, front: &super::wave::Frontier<N>, wins: &[(u32, u64)], threads: usize) -> Result<()> {
+    let layer = &front.new;
     let f = FrameFile::<N>::open(path)?;
     let tables = layer.set.tables();
     let starts = layer.set.entry_starts();
@@ -473,7 +472,7 @@ pub(crate) fn check_frame_file<N: crate::search::rem::Rem, R: super::hulls::Runs
     });
     parts.into_iter().collect::<Result<Vec<()>>>()?;
     ensure!(f.header.states() == layer.states(), differ(format!("{} states in memory, {} in the header", layer.states(), f.header.states())));
-    super::hulls::check(&f.file, &f.header.frontier, hulls, grown, threads)
+    super::hulls::check(&f.file, &f.header.frontier, front, threads)
 }
 
 /// A TREE's frame files through a frame: its codebooks (the shapes by
@@ -650,11 +649,12 @@ mod tests {
     /// A frame file round-trips its states and wins and its frontier: wide
     /// keys, several regions and layers, a key with several cells, frontier
     /// blocks of both kinds past their sizes (the storage check passes);
-    /// unsorted grown states are refused, another hull fails the check.
+    /// old layers out of order are refused, another hull fails the check.
     #[test]
     fn frame_files_round_trip() {
-        use crate::search::hull::{Arc as HArc, Hull};
         use super::super::hulls::{Grown, GROWN_BLOCK, NEW_BLOCK};
+        use super::super::wave::{Frontier, Old, OldLayer};
+        use crate::search::hull::{Arc as HArc, Hull};
         let dir = std::env::temp_dir().join(format!("celeste-layer-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let a = layer_of(&[(3, (0, 5), 0b1011), (3, (0, 9), 1 << 63), (3, (1 << 40, 2), 7), (70, (0, 1), 1), (4095, (5, 5), 0xffff_0000)]);
@@ -665,21 +665,32 @@ mod tests {
         let st = |region: u32, key: (u64, u64), local: u8| Sk { region, key, local };
         let h = |a: u16, b: u16| Hull { x: HArc { start: a, last: b }, y: HArc { start: b, last: a } };
         let hulls: Vec<Hull> = (0..a.states() as u32).map(|i| h(i as u16, (i * 7) as u16)).collect();
-        let mut grown = vec![(st(3, (0, 5), 0), 0, h(1, 2)), (st(3, (0, 5), 9), 0, h(65535, 0)), (st(3, (1 << 40, 1), 1), 0, h(3, 65535)), (st(70, (0, 0), 63), 2, h(0, 0)), (st(4096, (u64::MAX, u64::MAX), 5), 2, h(9, 9)), (st(5, (0, 1), 5), 6, h(9, 9))];
+        let g = |sk: Sk, layer: u16, hull: Hull| Grown { sk, layer, hull };
+        let mut grown = vec![g(st(3, (0, 5), 0), 0, h(1, 2)), g(st(3, (0, 5), 9), 0, h(65535, 0)), g(st(3, (1 << 40, 1), 1), 0, h(3, 65535)), g(st(70, (0, 0), 63), 2, h(0, 0)), g(st(4096, (u64::MAX, u64::MAX), 5), 2, h(9, 9)), g(st(5, (0, 1), 5), 6, h(9, 9))];
         let mut v = 1u64;
         let mut big: Vec<Grown> = (0..GROWN_BLOCK as u64 * 2 + 77)
             .map(|i| {
                 v = v.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-                (st((v >> 50) as u32, (v >> 7, v), (v % 64) as u8), (i / 5000) as u16 + 7, h(v as u16, (v >> 16) as u16))
+                g(st((v >> 50) as u32, (v >> 7, v), (v % 64) as u8), (i / 5000) as u16 + 7, h(v as u16, (v >> 16) as u16))
             })
             .collect();
-        big.sort_unstable_by_key(|g| (g.1, g.0));
-        big.dedup_by_key(|g| (g.1, g.0));
+        big.sort_unstable_by_key(|g| (g.layer, g.sk));
+        big.dedup_by_key(|g| (g.layer, g.sk));
         grown.extend(big);
-        // In runs, cut anywhere.
-        let runs: Vec<&[Grown]> = vec![&grown[..2], &[], &grown[2..9], &grown[9..]];
-        write_frame(&p, &meta, &a, &wins, &hulls, &runs[..], 3).unwrap();
-        check_frame_file(&p, &a, &wins, &hulls, &runs[..], 2).unwrap();
+        // The grown states as a frontier's old layers (their `was` unwritten).
+        let by_layer = |gs: &[Grown]| -> Vec<OldLayer> {
+            let mut by: Vec<OldLayer> = Vec::new();
+            for x in gs {
+                if by.last().is_none_or(|l| l.layer != x.layer) {
+                    by.push(OldLayer::new(x.layer, 0));
+                }
+                by.last_mut().unwrap().push(&Old { sk: x.sk, layer: x.layer, hull: x.hull, was: h(0, 0) });
+            }
+            by
+        };
+        let front = Frontier { new: a.clone(), hulls: hulls.clone(), old: by_layer(&grown) };
+        write_frame(&p, &meta, &front, &wins, 3).unwrap();
+        check_frame_file(&p, &front, &wins, 2).unwrap();
         let f = FrameFile::<P8>::open(&p).unwrap();
         assert_eq!(f.header.states(), a.states());
         assert_eq!(f.header.wins(), 2);
@@ -687,15 +698,17 @@ mod tests {
         assert_eq!((back.iter().collect::<Vec<_>>(), w), (a.iter().collect::<Vec<_>>(), wins.clone()));
         assert_eq!(f.frontier(2).unwrap(), (hulls.clone(), grown.clone()));
         let mut moved = grown.clone();
-        moved[5].2 = h(1, 1);
-        assert!(check_frame_file(&p, &a, &wins, &hulls, &[&moved[..2], &[], &moved[2..9], &moved[9..]][..], 2).is_err(), "another hull");
-        assert!(write_frame(&p, &meta, &a, &wins, &hulls, &[&[grown[1], grown[0]][..]][..], 2).is_err(), "unsorted");
-        assert!(write_frame(&p, &meta, &a, &wins, &hulls, &[&grown[1..2], &grown[0..1]][..], 2).is_err(), "runs unsorted");
+        moved[5].hull = h(1, 1);
+        assert!(check_frame_file(&p, &Frontier { old: by_layer(&moved), ..front.clone() }, &wins, 2).is_err(), "another hull");
+        let mut swapped = by_layer(&grown);
+        swapped.swap(0, 1);
+        assert!(write_frame(&p, &meta, &Frontier { old: swapped, ..front.clone() }, &wins, 2).is_err(), "layers unsorted");
         // The new states' hulls past a block.
         let many = layer_of(&(0..(NEW_BLOCK as u64 + 5) / 64 + 1).map(|k| (9, (0, k), u64::MAX)).collect::<Vec<_>>());
         let mh: Vec<Hull> = (0..many.states() as u32).map(|i| h(i as u16, 3)).collect();
-        write_frame(&p, &meta, &many, &[], &mh, &[] as &[&[Grown]], 2).unwrap();
-        check_frame_file(&p, &many, &[], &mh, &[] as &[&[Grown]], 2).unwrap();
+        let front = Frontier { new: many, hulls: mh.clone(), old: Vec::new() };
+        write_frame(&p, &meta, &front, &[], 2).unwrap();
+        check_frame_file(&p, &front, &[], 2).unwrap();
         assert_eq!(FrameFile::<P8>::open(&p).unwrap().frontier(3).unwrap(), (mh, Vec::new()));
         std::fs::remove_dir_all(&dir).unwrap();
     }

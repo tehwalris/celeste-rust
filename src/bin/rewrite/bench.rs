@@ -178,7 +178,7 @@ where
         let (visited, front) = (s.visited(), s.frontier());
         let (n, acc) = front.new.content_fingerprint(&visited.keys, visited.shapes())?;
         let mut out = format!("f{:03} {n} {acc:016x}\n", frame + 1);
-        let (nh, ah) = celeste_rust::storage::hulls::fingerprint(front.hull_states(frame + 1), &visited.keys, visited.shapes())?;
+        let (nh, ah) = celeste_rust::storage::hulls::fingerprint(front.states(frame + 1), &visited.keys, visited.shapes())?;
         out += &format!("h{:03} {nh} {ah:016x}\n", frame + 1);
         if edges {
             let (n, acc) = celeste_rust::storage::bench::edge_fingerprint(scratch, frame + 1, s.xfers(), visited, cfg.threads())?;
