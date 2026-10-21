@@ -150,8 +150,7 @@ mod tests {
     /// repeated key or a bare line is refused.
     #[test]
     fn a_record_reads_back_and_refuses_another_format() {
-        let dir = std::env::temp_dir().join(format!("celeste-record-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let dir = crate::testutil::TestDir::new("record");
         assert_eq!(Record::read(&dir).expect("none"), None);
         assert_eq!(done(&dir).expect("none"), None);
         let mut rec = Record::default();
@@ -168,6 +167,5 @@ mod tests {
             std::fs::write(path(&dir), &bad).expect("write");
             assert!(Record::read(&dir).is_err(), "{bad:?} is refused");
         }
-        std::fs::remove_dir_all(&dir).expect("clean up");
     }
 }

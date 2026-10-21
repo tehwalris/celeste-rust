@@ -650,7 +650,7 @@ fn edge_file_writer<N: Rem>(dir: std::path::PathBuf, frame: u32, flush: super::e
     Ok(std::thread::Builder::new().name("edge file".into()).spawn(move || -> Result<u64> {
         flush.write(&dir)?;
         let waited: Vec<(usize, u32, &super::edges::Segment)> = routes_segs.iter().enumerate().flat_map(|(k, r)| r.2.iter().map(move |(slice, seg)| (k, *slice, seg))).collect();
-        let again = par_map(&waited, threads, |&(k, _, seg)| super::route::reencode(seg, routes_segs[k].0, &finals, &mut super::bundle::Encoder::default(), &mut zstd::bulk::Compressor::new(1)?));
+        let again = par_map(&waited, threads, |&(k, _, seg)| super::route::reencode(seg, routes_segs[k].0, &finals, &mut super::bundle::Encoder::default(), &mut super::file::compressor()?));
         let mut per: Vec<Vec<((u8, u32), super::edges::Segment)>> = (0..routes_segs.len()).map(|_| Vec::new()).collect();
         for (&(k, slice, _), seg) in waited.iter().zip(again) {
             per[k].push(((1, slice), seg?));
@@ -1443,10 +1443,7 @@ mod tests {
     #[test]
     fn an_old_layer_gives_back_its_states() {
         let mut v = 7u64;
-        let mut next = move || {
-            v = v.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-            v >> 11
-        };
+        let mut next = move || crate::testutil::lcg(&mut v) >> 11;
         let hull = |x: u64| Hull::from_bytes(&(x & 0x7fff_7fff_7fff_7fff).to_le_bytes());
         let mut olds: Vec<Old> = (0..60_000)
             .map(|_| {

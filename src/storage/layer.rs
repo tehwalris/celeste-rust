@@ -324,7 +324,7 @@ pub(crate) fn write_frame<N: crate::search::rem::Rem>(path: &Path, meta: &FrameM
         win_at.push(a..wi);
     }
     ensure!(wi == wins.len(), "write_frame: a win past the layer");
-    let blocks: Vec<(Vec<u8>, usize)> = crate::par::Pool::new(threads).map_with(tables.len(), || Ok(zstd::bulk::Compressor::new(1)?), |z, i| {
+    let blocks: Vec<(Vec<u8>, usize)> = crate::par::Pool::new(threads).map_with(tables.len(), || Ok(super::file::compressor()?), |z, i| {
         let t = &tables[i].1;
         let w: Vec<(u32, u64)> = wins[win_at[i].clone()].iter().map(|&(e, m)| (e - starts[i] as u32, m)).collect();
         let keys: Vec<Key> = t.iter().map(|x| x.0).collect();
@@ -655,8 +655,7 @@ mod tests {
         use super::super::hulls::{Grown, GROWN_BLOCK, NEW_BLOCK};
         use super::super::wave::{Frontier, Old, OldLayer};
         use crate::search::hull::{Arc as HArc, Hull};
-        let dir = std::env::temp_dir().join(format!("celeste-layer-test-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let dir = crate::testutil::TestDir::new("layer-test");
         let a = layer_of(&[(3, (0, 5), 0b1011), (3, (0, 9), 1 << 63), (3, (1 << 40, 2), 7), (70, (0, 1), 1), (4095, (5, 5), 0xffff_0000)]);
         let wins = vec![(1u32, 1u64 << 63), (4, 0x0001_0000)];
         let adds = KeyAdditions::default();
@@ -670,7 +669,7 @@ mod tests {
         let mut v = 1u64;
         let mut big: Vec<Grown> = (0..GROWN_BLOCK as u64 * 2 + 77)
             .map(|i| {
-                v = v.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                crate::testutil::lcg(&mut v);
                 g(st((v >> 50) as u32, (v >> 7, v), (v % 64) as u8), (i / 5000) as u16 + 7, h(v as u16, (v >> 16) as u16))
             })
             .collect();
@@ -710,6 +709,5 @@ mod tests {
         write_frame(&p, &meta, &front, &[], 2).unwrap();
         check_frame_file(&p, &front, &[], 2).unwrap();
         assert_eq!(FrameFile::<P8>::open(&p).unwrap().frontier(3).unwrap(), (mh, Vec::new()));
-        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

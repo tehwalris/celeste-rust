@@ -140,16 +140,10 @@ const XFER_CACHE: usize = 1 << 12;
 /// Entries of `UnitSink::src_seen` (a power of two).
 const SRC_SEEN: usize = 1 << 8;
 
-/// The lanes of a slice mask, lowest first.
+/// The lanes of a slice mask, lowest first (`layer::bits`).
 #[inline]
-pub(crate) fn lanes_of(mut m: u16) -> impl Iterator<Item = usize> {
-    std::iter::from_fn(move || {
-        (m != 0).then(|| {
-            let i = m.trailing_zeros() as usize;
-            m &= m - 1;
-            i
-        })
-    })
+pub(crate) fn lanes_of(m: u16) -> impl Iterator<Item = usize> {
+    super::layer::bits(m as u64).map(|i| i as usize)
 }
 
 /// A slice's TARGETS in one cell column of one shape (once per column, not
@@ -297,10 +291,7 @@ impl<N: Rem> Sources<N> {
             assert!(left == 0, "unit {unit}: a bundle's source cells in no entry of the unit");
             return;
         }
-        let mut m = b.mask;
-        while m != 0 {
-            let c = m.trailing_zeros();
-            m &= m - 1;
+        for c in super::layer::bits(b.mask) {
             let s_slot = geo.slot_local(source_cell(geo.cell(slot, c), b.o)).0;
             let mut e = self.src_first[b.s as usize];
             while e != u32::MAX && self.entry_next[e as usize].1 != s_slot {
@@ -562,10 +553,7 @@ impl<N: Rem> Pusher<N> {
         let mut out: Vec<(u32, u8, AccOf<N>)> = Vec::with_capacity(n as usize);
         let mut at = 0usize;
         for (t, &(_, m)) in targets.iter().enumerate() {
-            let mut c = m;
-            while c != 0 {
-                let k = c.trailing_zeros();
-                c &= c - 1;
+            for k in super::layer::bits(m) {
                 if !slots[at].is_empty() {
                     out.push((t as u32, k as u8, slots[at]));
                 }

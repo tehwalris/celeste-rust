@@ -112,7 +112,7 @@ mod tests {
     /// (the runner reads them by name).
     #[test]
     fn a_result_round_trips() {
-        let dir = std::env::temp_dir().join(format!("celeste-result-{}", std::process::id()));
+        let dir = crate::testutil::TestDir::new("result");
         std::fs::create_dir_all(&dir).unwrap();
         let r = SearchResult {
             format: FORMAT,
@@ -138,6 +138,5 @@ mod tests {
         let d = SearchResult { dual: Some(DualResult { float: "float-celia".into(), float_loading_jank: Some(1), fixed_exit: Some(115) }), ..r };
         d.write(&dir).unwrap();
         assert_eq!(SearchResult::read(&dir).unwrap(), d);
-        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

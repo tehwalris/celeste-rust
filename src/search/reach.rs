@@ -391,8 +391,7 @@ mod tests {
     fn the_exact_reach_holds_the_known_route_inside_the_tree() {
         use crate::engines::reference::RefEngine;
         let s = crate::settings::Settings { win_at: Some((9, 9, 101, 101)), threads: Some(4), ..Default::default() };
-        let dir = std::env::temp_dir().join(format!("celeste-reach-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let dir = crate::testutil::TestDir::new("reach");
         let level = crate::abstraction::Level::parse("r0sxh").expect("level");
         crate::frame::grow_tree(&dir, 35, None, None, level, || Ok(Box::new(crate::compiled::FrameEngine::new(&s, level)?)), || Ok(vec![RefEngine::new(&s)?.initial()?.canonicalized()]), &s).expect("forward");
         let p0 = (super::super::arcs::point(0), super::super::arcs::point(0));
@@ -435,7 +434,6 @@ mod tests {
         // Exact reach is a subset of the tree's states, and here a strict one.
         let tree_states: u64 = (0..=35).map(|f| tree.states(f)).sum();
         assert!((last.len() as u64) < tree_states, "{} states reached exactly of the tree's {tree_states}", last.len());
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// `inside_w` against the points themselves: from one start point every

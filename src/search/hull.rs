@@ -376,8 +376,7 @@ mod tests {
     use crate::search::arcs::{Act, Transfer, CIRCLE};
 
     fn lcg(s: &mut u64) -> u32 {
-        *s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-        (*s >> 33) as u32
+        (crate::testutil::lcg(s) >> 33) as u32
     }
 
     fn arc(s: &mut u64) -> Arc {

@@ -2186,8 +2186,7 @@ mod tests {
     /// must not move it).
     #[test]
     fn a_trees_table_reads_back_under_its_fingerprint() {
-        let dir = std::env::temp_dir().join(format!("celeste-l1-tree-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let dir = crate::testutil::TestDir::new("l1-tree");
         let d: rustc_hash::FxHashMap<(u64, i16, i16), u32> = [((7, 3, -4), 12), ((7, 3, 5), u32::MAX), ((0x9e37_79b9_7f4a_7c15, -16, 140), 0)].into_iter().collect();
         let t = CostToGo { d: d.clone(), start_d: 49 };
         assert_eq!(t.fingerprint(), 0x8475_2014_f2ed_1e20);
@@ -2197,7 +2196,6 @@ mod tests {
         assert!(tree_table(&dir, t.fingerprint() ^ 1).is_err(), "another fingerprint than the record's");
         let back = tree_table(&dir, t.fingerprint()).expect("the tree's table");
         assert_eq!((&back.d, back.start_d), (&t.d, t.start_d));
-        std::fs::remove_dir_all(&dir).expect("clean up");
     }
 
     fn num(lo: i32, hi: i32) -> Val {

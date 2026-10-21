@@ -16,6 +16,8 @@ pub mod transpile;
 
 #[cfg(test)]
 mod conventions;
+#[cfg(test)]
+mod testutil;
 
 // The leaf types live in `celeste-core` (so the engine crates can use them);
 // re-exported here so `celeste_rust::pico8_num` etc. resolve.

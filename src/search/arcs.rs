@@ -640,12 +640,7 @@ mod tests {
         // Random regions (a few pieces each), pushed into arenas with small
         // chunks - kept in memory, and spilled to files - read back equal.
         let mut rng = 0x9e37_79b9_7f4a_7c15u64;
-        let mut next = move |n: u32| {
-            rng ^= rng << 13;
-            rng ^= rng >> 7;
-            rng ^= rng << 17;
-            (rng % n as u64) as u32
-        };
+        let mut next = move |n: u32| (crate::testutil::xorshift(&mut rng) % n as u64) as u32;
         let mut regions = Vec::new();
         let mut scratch = Vec::new();
         for _ in 0..500 {
@@ -658,7 +653,7 @@ mod tests {
             regions.push(Region::<Fixed16>::from_pieces(&mut pieces, &mut scratch));
         }
         regions.push(Region::default());
-        let dir = std::env::temp_dir().join(format!("arena-test-{}", std::process::id()));
+        let dir = crate::testutil::TestDir::new("arena-test");
         std::fs::create_dir_all(&dir).unwrap();
         for spill in [false, true] {
             let mut a = RegionArena { chunk: 64, ..RegionArena::default() };
@@ -678,8 +673,7 @@ mod tests {
     }
 
     fn lcg(s: &mut u64) -> u32 {
-        *s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-        (*s >> 33) as u32
+        (crate::testutil::lcg(s) >> 33) as u32
     }
 
     /// The canonical sweep against the plain union of pieces, and `pull`

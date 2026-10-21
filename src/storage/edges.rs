@@ -579,7 +579,7 @@ pub(crate) fn segments_of(edges: &[(Sk, Sk, u32)]) -> Result<(Vec<Segment>, Vec<
         *by.entry(t.region).or_default().entry((s.shape(&geo), s.key, x, o, t.key)).or_default() |= 1u64 << t.local;
         sources.entry(t.region).or_default().push(s.region);
     }
-    let mut z = zstd::bulk::Compressor::new(1)?;
+    let mut z = super::file::compressor()?;
     let mut raw = Vec::new();
     let mut enc = bundle::Encoder::default();
     let mut segs = Vec::new();
@@ -646,7 +646,7 @@ mod tests {
         for name in ["xfer.bin", "f.bin", "fx12.bin", "f12x.bin"] {
             assert_eq!(frame_of_name(name), None, "{name}");
         }
-        let dir = std::env::temp_dir().join(format!("celeste-edge-names-{}", std::process::id()));
+        let dir = crate::testutil::TestDir::new("edge-names");
         std::fs::create_dir_all(&dir).expect("tmp");
         for f in ["f999.bin", "f1000.bin", "f1000.tmp", "f0998.bin", "xfer.bin"] {
             std::fs::write(dir.join(f), b"").expect("write");
@@ -654,7 +654,6 @@ mod tests {
         discard_after(&dir, 999).expect("discard");
         let mut left: Vec<String> = std::fs::read_dir(&dir).expect("ls").map(|e| e.expect("e").file_name().to_string_lossy().into_owned()).collect();
         left.sort();
-        std::fs::remove_dir_all(&dir).expect("cleanup");
         assert_eq!(left, ["f0998.bin", "f999.bin", "xfer.bin"]);
     }
 
@@ -662,8 +661,7 @@ mod tests {
     /// target's in-edges by `preds_at`, the out-edge index by source region.
     #[test]
     fn a_frames_edges_come_back() {
-        let dir = std::env::temp_dir().join(format!("celeste-storage-edges-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let dir = crate::testutil::TestDir::new("storage-edges");
         let geo = GEOMETRY;
         let cell = |x: i32, y: i32| crate::storage::cells::cell_of(x, y).unwrap();
         let st = |shape: u32, k: u64, c: u32| Sk::at(&geo, shape, (0, k), c);
@@ -702,6 +700,5 @@ mod tests {
         });
         assert_eq!(store.targets_of(4, t1.region), vec![none.region]);
         assert_eq!(store.regions(4).len(), 3);
-        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

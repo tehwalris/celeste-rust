@@ -540,8 +540,7 @@ mod tests {
     #[ignore = "slow, ./check.sh t2 runs it: room (1,0)'s kernels in both arithmetics, three searches at two thread counts, ~60 CPU-s"]
     fn the_breadth_first_searches_are_pinned() {
         super::super::concrete::NO_DFS.store(true, std::sync::atomic::Ordering::Relaxed);
-        let base = std::env::temp_dir().join(format!("celeste-bfs-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&base);
+        let base = crate::testutil::TestDir::new("bfs");
         let mut runs: Vec<String> = Vec::new();
         for threads in [3, 32] {
             let fixed = Settings { win_at: Some((9, 9, 101, 101)), threads: Some(threads), ..Settings::default() };
@@ -565,6 +564,5 @@ mod tests {
             std::fs::write(pin, &runs[0]).expect("write the pin");
         }
         assert_eq!(std::fs::read_to_string(pin).expect("the pin (CELESTE_REGENERATE=1 writes it)"), runs[0], "the breadth-first searches moved (gates/bfs_room10_win9-101_h35.txt)");
-        let _ = std::fs::remove_dir_all(&base);
     }
 }

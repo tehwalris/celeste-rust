@@ -110,10 +110,8 @@ impl<N: Rem> Touched<N> {
         let next = mask | add;
         let at = self.slots.len();
         grow(&mut self.slots, next.count_ones() as usize);
-        let mut m = next;
-        while m != 0 {
-            let c = m.trailing_zeros() as u8;
-            m &= m - 1;
+        for c in super::layer::bits(next) {
+            let c = c as u8;
             self.slots.push(if mask >> c & 1 == 1 { self.slots[start as usize + rank(mask, c)] } else { AccOf::<N>::default() });
         }
         for &(c, ref a) in cells {
@@ -381,10 +379,7 @@ impl UnitBundles {
             for &(t_key, mut u) in &v[..n] {
                 let mut m = u.mask;
                 if let Some(drop) = drop {
-                    let mut c = m;
-                    while c != 0 {
-                        let cell = c.trailing_zeros();
-                        c &= c - 1;
+                    for cell in super::layer::bits(m) {
                         if drop(route, t_key, cell) {
                             m &= !(1u64 << cell);
                         }
@@ -479,7 +474,7 @@ impl Default for JobScratch {
             tbs: Vec::new(),
             enc: bundle::Encoder::default(),
             raw: Vec::new(),
-            z: zstd::bulk::Compressor::new(1).expect("a zstd compressor"),
+            z: super::file::compressor().expect("a zstd compressor"),
         }
     }
 }

@@ -56,6 +56,11 @@ impl At {
     }
 }
 
+/// The tree files' zstd context (level 1: "zstd -1").
+pub(crate) fn compressor() -> Result<zstd::bulk::Compressor<'static>> {
+    Ok(zstd::bulk::Compressor::new(1)?)
+}
+
 /// zstd -1 of a raw block, shrunk to its size (the compressor's buffer is
 /// the raw bound: held to the frame's end, segments took 5x their bytes).
 pub(crate) fn compress(raw: &[u8], z: &mut zstd::bulk::Compressor<'static>) -> Result<Vec<u8>> {

@@ -424,10 +424,8 @@ fn count_marked(m: &MarksMap, rows: &CellRows, keys: &[Key], masks: &[u64]) -> [
         if live == 0 {
             break;
         }
-        let mut cells = mask & live;
-        while cells != 0 {
-            let l = cells.trailing_zeros() as usize;
-            cells &= cells - 1;
+        for l in crate::storage::layer::bits(mask & live) {
+            let l = l as usize;
             let i = gallop(lo[l], hi[l], |i| m.key(i) < *key);
             lo[l] = i;
             if i < hi[l] && m.key(i) == *key {
@@ -987,7 +985,7 @@ mod tests {
     #[test]
     fn marks_files_merge_with_a_regions_keys() {
         let geo = crate::storage::GEOMETRY;
-        let dir = std::env::temp_dir().join(format!("celeste-ui-marks-{}", std::process::id()));
+        let dir = crate::testutil::TestDir::new("ui-marks");
         std::fs::create_dir_all(&dir).unwrap();
         let save = |name: &str, rows: &[((u64, u64), u32, u64, u16)]| {
             let mut v = crate::frame::Visited::new(Default::default());
@@ -1015,12 +1013,7 @@ mod tests {
 
         // Random regions of two shapes over three slots against the set.
         let mut x = 0x9e3779b97f4a7c15u64;
-        let mut rnd = move || {
-            x ^= x << 13;
-            x ^= x >> 7;
-            x ^= x << 17;
-            x
-        };
+        let mut rnd = move || crate::testutil::xorshift(&mut x);
         let mut regions = Vec::new();
         let mut rows = Vec::new();
         for shape in [3u64, 11] {
@@ -1055,14 +1048,12 @@ mod tests {
         let rows: Vec<crate::frame::MarkRow> = vec![(7, 3, 5, 6, 0), (7, 3, 1, 2, 0)];
         crate::storage::file::save_value(&bad, &(rows, 9u32, celeste_engine::exact::KeySpace::<celeste_engine::runtime2::P8>::default().to_additions())).unwrap();
         assert!(scan_marks(MarksMap::open(&bad).unwrap(), &bad, 2).is_err());
-        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     /// The forward's record reads back: a rerun frame's last row wins.
     #[test]
     fn a_trees_forward_record_reads_back() {
-        let dir = std::env::temp_dir().join(format!("celeste-ui-fwd-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let dir = crate::testutil::TestDir::new("ui-fwd");
         std::fs::create_dir_all(&dir).unwrap();
         assert!(read_forward_stats(&dir).unwrap().is_empty(), "a tree from before the record");
         let ms = std::time::Duration::from_millis;
@@ -1085,14 +1076,13 @@ mod tests {
         assert_eq!(got.iter().map(|l| (l.f, l.kept)).collect::<Vec<_>>(), vec![(1, 10), (2, 21), (3, 30)]);
         let t = &got[0].times;
         assert_eq!((t.emit_ms, t.emit_idle, t.ckpt_ms, t.total_ms, got[0].visited, t.rss_gb), (7, 94, 1, 11, 4, 1.28));
-        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     /// The search's `witness.txt` and a labelled path file with dashes that
     /// ends at the exit both read; a skipped frame does not.
     #[test]
     fn witness_and_reference_files_read() {
-        let dir = std::env::temp_dir().join(format!("celeste-ui-witness-{}", std::process::id()));
+        let dir = crate::testutil::TestDir::new("ui-witness");
         std::fs::create_dir_all(&dir).unwrap();
         let read = |text: &str| {
             let p = dir.join("w.txt");
@@ -1106,6 +1096,5 @@ mod tests {
         assert_eq!((r.label.as_str(), r.path.len(), r.dashes), ("TAS29 (community)", 3, vec![(2, "R".to_string())]));
         assert!(read("inputs 0,34\n0 - -\n2 8 96\n").is_err(), "frames are consecutive from 0");
         assert!(read("inputs 0,34\nprologue 1\n0 - -\n").is_err(), "an unknown line");
-        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

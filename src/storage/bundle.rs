@@ -527,8 +527,7 @@ mod tests {
     use super::*;
 
     fn lcg(v: &mut u64) -> u64 {
-        *v = v.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-        *v >> 11
+        crate::testutil::lcg(v) >> 11
     }
 
     /// Offsets round-trip between cells, into and out of `NO_CELL`, and in
@@ -610,7 +609,7 @@ mod tests {
         bundles.sort_unstable();
         bundles.dedup_by_key(|b| (b.s_shape, b.s_key, b.x, b.o, b.t_key));
         let orders = [ORDER, [F::S, F::X, F::O, F::T, F::M], [F::T, F::S, F::X, F::O, F::M]];
-        let mut z = zstd::bulk::Compressor::new(1).unwrap();
+        let mut z = super::super::file::compressor().unwrap();
         let mut d = zstd::bulk::Decompressor::new().unwrap();
         for order in orders {
             let mut raw = Vec::new();

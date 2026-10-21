@@ -1039,12 +1039,7 @@ pub(crate) mod tests {
     #[test]
     fn seek_finds_what_the_linear_walk_finds() {
         let mut x = 0x9e37_79b9_7f4a_7c15u64;
-        let mut rnd = |n: u64| {
-            x ^= x << 13;
-            x ^= x >> 7;
-            x ^= x << 17;
-            x % n
-        };
+        let mut rnd = |n: u64| crate::testutil::xorshift(&mut x) % n;
         for len in [0usize, 1, 2, 3, 7, 64, 1000] {
             let mut v: Vec<((u64, u64), u8, u32)> = (0..len).map(|_| ((rnd(3), rnd(200)), 0, 0)).collect();
             v.sort_unstable();
@@ -1060,10 +1055,7 @@ pub(crate) mod tests {
 
     /// A deterministic `r(m)` in `0..m` from `seed`.
     pub(crate) fn rng(mut s: u64) -> impl FnMut(u32) -> u32 {
-        move |m| {
-            s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-            ((s >> 33) as u32) % m
-        }
+        move |m| ((crate::testutil::lcg(&mut s) >> 33) as u32) % m
     }
 
     /// A transfer's image of a point of its guard.
@@ -1093,7 +1085,7 @@ pub(crate) mod tests {
     /// `layers[src] + 1` (so `layers[dst] <= layers[src] + 1`); the wins'
     /// out-edges are dropped, as the forward never expands a win.
     pub(crate) struct TestTree {
-        dir: std::path::PathBuf,
+        dir: crate::testutil::TestDir,
         layers: Vec<u32>,
         wins: Vec<u32>,
     }
@@ -1102,8 +1094,7 @@ pub(crate) mod tests {
         pub(crate) fn new(name: &str, layers: Vec<u32>, edges: &[(u32, u32, Transfer, Transfer)], wins: Vec<u32>) -> Self {
             use std::sync::atomic::{AtomicU32, Ordering};
             static SEQ: AtomicU32 = AtomicU32::new(0);
-            let dir = std::env::temp_dir().join(format!("celeste-arcdp-{name}-{}-{}", std::process::id(), SEQ.fetch_add(1, Ordering::Relaxed)));
-            let _ = std::fs::remove_dir_all(&dir);
+            let dir = crate::testutil::TestDir::new(&format!("arcdp-{name}-{}", SEQ.fetch_add(1, Ordering::Relaxed)));
             let mut pairs: Vec<crate::search::arc_edges::Pair> = edges.iter().map(|e| (axis(e.2), axis(e.3))).collect();
             pairs.sort_unstable();
             pairs.dedup();
@@ -1133,12 +1124,6 @@ pub(crate) mod tests {
             let mut v: Vec<Sk> = self.wins.iter().map(|&k| sid(k)).collect();
             v.sort_unstable();
             v
-        }
-    }
-
-    impl Drop for TestTree {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.dir);
         }
     }
 

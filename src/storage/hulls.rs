@@ -133,7 +133,7 @@ pub(crate) fn encode<N: Rem>(front: &Frontier<N>, threads: usize) -> Result<Vec<
     // Per block its bytes, and a grown block's sorted states' first and last
     // (`None`: unsorted).
     type Made = (Vec<u8>, usize, Option<Option<((u16, Sk), (u16, Sk))>>);
-    let blocks: Vec<Made> = crate::par::Pool::new(threads).map_with(cuts.len(), || Ok(zstd::bulk::Compressor::new(1)?), |z, c| {
+    let blocks: Vec<Made> = crate::par::Pool::new(threads).map_with(cuts.len(), || Ok(super::file::compressor()?), |z, c| {
         let (g, i, r) = &cuts[c];
         let (raw, ends) = if *g {
             let v = grown_of(front, *i, r.clone());

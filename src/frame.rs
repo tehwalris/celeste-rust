@@ -1156,8 +1156,7 @@ mod tests {
         use crate::search::hull::WIDEN;
         use std::sync::atomic::Ordering;
         let s = Settings { threads: Some(8), ..Default::default() };
-        let base = std::env::temp_dir().join(format!("celeste-hull-between-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&base);
+        let base = crate::testutil::TestDir::new("hull-between");
         let level = Level::parse("r0sx").expect("level");
         let e = crate::compiled::FrameEngine::new(&s, level).expect("kernels");
         let init = || start_blocks(&s);
@@ -1215,7 +1214,6 @@ mod tests {
         .expect("reach");
         assert!(checked > 1000, "{checked} reached states checked");
         eprintln!("[hull] f0-f{to}: {n_hull} hull states, {n_wide} widened, {checked} exactly reached (state, frame)s inside the hulls");
-        let _ = std::fs::remove_dir_all(&base);
     }
 
     /// A tree's level -1 line round-trips; without one, or garbled, it is an
@@ -1223,8 +1221,7 @@ mod tests {
     /// refused.
     #[test]
     fn a_trees_level_minus_one_record_round_trips() {
-        let dir = std::env::temp_dir().join(format!("celeste-tree-filter-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let dir = crate::testutil::TestDir::new("tree-filter");
         let set = |v: &str| crate::storage::record::update(&dir, TreeL1::KEY, v).expect("write");
         assert!(TreeL1::recorded(&dir).is_err(), "no record: unknown");
         assert!(TreeL1::read(&dir).is_err(), "a check refuses an unknown filter");
@@ -1241,7 +1238,6 @@ mod tests {
         assert!(TreeL1::recorded(&dir).is_err(), "a bare horizon is an error");
         set("h 3 speed");
         assert!(TreeL1::recorded(&dir).is_err(), "a garbled line is an error");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A marks file round-trips deadlines (none comes back as the horizon).
@@ -1274,8 +1270,7 @@ mod tests {
     #[test]
     fn a_resume_expands_what_the_uninterrupted_forward_expands() {
         let s = Settings { category: crate::settings::Category::Hundred, ..Default::default() };
-        let dir = std::env::temp_dir().join(format!("celeste-resume-frontier-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let dir = crate::testutil::TestDir::new("resume-frontier");
         let init = start_blocks(&s);
         let e = RefFrameStep::<P8>::new(&s, Level::EXACT).expect("engines");
         let frontier = |st: &ForwardState| -> (Vec<(u32, (u64, u64), u64)>, Vec<Hull>, crate::storage::wave::ByLayer) { (st.frontier.new.iter().collect(), st.frontier.hulls.clone(), st.frontier.old.clone()) };
@@ -1290,7 +1285,6 @@ mod tests {
             assert_eq!(st.win_frame, resumed.win_frame, "f{}: the first win", st.frames);
         }
         assert_eq!(st.frames, 1, "nothing expanded past frame 0");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A run killed after a frame's files but before its done marker
@@ -1301,9 +1295,8 @@ mod tests {
     #[ignore = "slow, ./check.sh t2 runs it: room (1,0)'s kernels and three forwards, ~25 CPU-s"]
     fn a_frame_killed_before_its_done_marker_is_rerun() {
         let s = Settings::default();
-        let base = std::env::temp_dir().join(format!("celeste-done-marker-{}", std::process::id()));
+        let base = crate::testutil::TestDir::new("done-marker");
         let (a, b) = (base.join("uninterrupted"), base.join("killed"));
-        let _ = std::fs::remove_dir_all(&base);
         // The kernels (they record transfers), past the spawn.
         let level = Level::parse("r0sxh").expect("level");
         let e = crate::compiled::FrameEngine::new(&s, level).expect("kernels");
@@ -1333,7 +1326,6 @@ mod tests {
         for file in ["edges/xfer.bin", crate::storage::record::FILE] {
             assert_eq!(std::fs::read(a.join(file)).expect("a"), std::fs::read(b.join(file)).expect("b"), "{file}");
         }
-        let _ = std::fs::remove_dir_all(&base);
     }
 
     /// Extending frame by frame and resuming reproduce a fresh run's key sets.
